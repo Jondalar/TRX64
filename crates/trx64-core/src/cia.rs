@@ -516,6 +516,23 @@ impl Cia {
         }
     }
 
+    /// IRQ-line level: asserted when any latched ICR flag is also enabled in the
+    /// mask (= VICE summary bit7 condition). Drives the C64 IRQ/NMI line on the
+    /// FullBus. Pure read of the current latched state — the caller advances the
+    /// timers (via `update_to`/`tick`) before polling so the flags are current.
+    #[inline]
+    pub fn irq_asserted(&self) -> bool {
+        (self.irqflags & self.regs[CIA_ICR] & 0x1f) != 0
+    }
+
+    /// Advance both timers to `rclk` so a subsequent `irq_asserted()` reflects any
+    /// underflow that occurred up to that clock — used by the FullBus to sample the
+    /// IRQ line at an instruction boundary without performing a register access.
+    #[inline]
+    pub fn update_to(&mut self, rclk: u64, tab: &[u16; CIAT_TABLEN]) {
+        self.update_both(rclk, tab);
+    }
+
     /// Peek a register without side effects (for snapshot / state readers).
     pub fn peek(&self, addr: u16) -> u8 {
         let a = (addr & 0xf) as usize;

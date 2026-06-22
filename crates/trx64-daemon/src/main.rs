@@ -120,12 +120,24 @@ fn run_cycle_budget(session: &mut Session, budget: u64) {
     // record filter then yields an EMPTY trace for a vic-only domain set (the
     // oracle's vic channel has no producer), and the normal cpu/memory frames
     // when those domains are requested.
+    // FULL-MACHINE path (ADR-021): when the session has NOT been CPU-isolated
+    // by a monitor inject, it is the assembled full-C64 boot (session/create →
+    // session/run from the KERNAL reset vector). Route to the FullBus run loop
+    // (PLA banking + per-cycle VIC + both CIAs + cross-chip IRQ/NMI + drive
+    // catch-up). The isolated gates always inject first, so they keep their
+    // FlatRam/CiaBus/VicBus paths untouched.
+    let full_machine = session.machine.full_assembled && !session.injected;
+
     let Some((channels, need_header, meta_json)) = session.trace.as_ref().map(|t| {
         (TraceChannels::from_domains(&t.domains), t.buf.is_empty(), t.meta_json.clone())
     }) else {
         // No active trace: run untraced.
         let mut obs = NullSink;
-        session.machine.run_for(budget, &mut obs);
+        if full_machine {
+            session.machine.run_for_full(budget, &mut obs, |_, _, _, _, _, _, _| {});
+        } else {
+            session.machine.run_for(budget, &mut obs);
+        }
         return;
     };
     // First run after start: write the file header into the buffer.
@@ -140,7 +152,19 @@ fn run_cycle_budget(session: &mut Session, budget: u64) {
     // Accumulate events from this run, then append to the persistent buffer.
     let mut obs = TracingObserver::with_channels(FrameSink::events_only(), channels);
 
-    if drive_cpu_active {
+    if full_machine {
+        // FULL-MACHINE traced run (boot-trace-short: c64-cpu + memory domains).
+        // Drive PC samples are emitted only if the drive8-cpu channel is active.
+        let mut steps: Vec<(u16, u8, u8, u8, u8, u8, u64)> = Vec::new();
+        session.machine.run_for_full(budget, &mut obs, |pc, a, x, y, sp, p, drv_clk| {
+            steps.push((pc, a, x, y, sp, p, drv_clk));
+        });
+        if drive_cpu_active {
+            for (pc, a, x, y, sp, p, drv_clk) in steps {
+                obs.emit_drive_step(pc, a, x, y, sp, p, drv_clk);
+            }
+        }
+    } else if drive_cpu_active {
         // drive8-cpu domain: run C64 + drive together, sampling drive PC per
         // C64 instruction boundary (ADR-015/ADR-012 isolation gate).
         // Collect steps first (avoids double-borrow of obs), then emit.
@@ -194,6 +218,8 @@ fn run_monitor(session: &mut Session, command: &str) -> Result<String, String> {
                 return Err("wr: need >=1 byte value ($00-$FF)".into());
             }
             session.machine.poke(addr, &bytes);
+            // A monitor inject marks this session CPU-ISOLATED (not the full boot).
+            session.injected = true;
             Ok(format!("wrote {} byte(s) @ ${:04X} (cpu)", bytes.len(), addr))
         }
         "r" | "registers" => {
@@ -230,6 +256,8 @@ fn run_monitor(session: &mut Session, command: &str) -> Result<String, String> {
                 }
                 // Keep the legacy snapshot in sync for session/state readers.
                 session.machine.sync_after_monitor();
+                // A register-set (notably `r pc=`) marks this session isolated.
+                session.injected = true;
                 Ok(format!("set {}", done.join(" ")))
             } else {
                 let c = &session.machine.cpu6510;
@@ -319,9 +347,29 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             let st = state.lock().unwrap();
             let machine = &st.session.machine;
             let cpu = &machine.cpu;
+            // VIC state snapshot (= TS session/state vic block). Computed from the
+            // VIC register file + CIA2 PA (VIC bank). screen/chargen/bitmap ptrs
+            // derive from $D018; mode from $D011/$D016; border/bg from $D020/$D021.
+            let v = |off: u8| machine.vic.read_reg(off);
+            let d011 = v(0x11);
+            let d016 = v(0x16);
+            let d018 = v(0x18);
+            let mode = ((d011 >> 5) & 3) | (((d016 >> 4) & 1) << 2);
+            let screen_ptr = (((d018 >> 4) & 0xf) as u64) << 10;
+            let chargen_ptr = (((d018 >> 1) & 7) as u64) << 11;
+            let bitmap_ptr = if d018 & 8 != 0 { 0x2000u64 } else { 0 };
+            // VIC bank = (cia2 PRA & DDRA & 3) ^ 3.
+            let cia2_pra = machine.cia2.peek(0xdd00);
+            let cia2_ddra = machine.cia2.peek(0xdd02);
+            let bank = ((cia2_pra & cia2_ddra & 3) ^ 3) as u64;
+            // Vectors: banked reads of $FFFE/$FFFA (KERNAL) + RAM $0314/$0318.
+            let rd16 = |a: u16| -> u64 {
+                machine.read_full(a) as u64 | ((machine.read_full(a.wrapping_add(1)) as u64) << 8)
+            };
+            let sid_regs: Vec<u64> = machine.sid_regs[0..25].iter().map(|b| *b as u64).collect();
             Response::ok(id, json!({
                 "c64Cycles": machine.clk,
-                "driveCycles": 0,
+                "driveCycles": machine.drive8.drive_clk,
                 "mode": "true-drive",
                 "runState": "paused",
                 "cpu": {
@@ -332,7 +380,26 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                     "sp": cpu.sp as u64,
                     "flags": cpu.p as u64,
                     "cycles": cpu.cycles
-                }
+                },
+                "vic": {
+                    "rasterLine": machine.vic.raster_line as u64,
+                    "rasterCycle": machine.vic.raster_cycle as u64,
+                    "mode": mode as u64,
+                    "bank": bank,
+                    "screenPtr": screen_ptr,
+                    "chargenPtr": chargen_ptr,
+                    "bitmapPtr": bitmap_ptr,
+                    "border": (v(0x20) & 0xf) as u64,
+                    "background": (v(0x21) & 0xf) as u64
+                },
+                "flow": { "focus": "auto", "current": "main", "stack": [] },
+                "vectors": {
+                    "irq": rd16(0xfffe),
+                    "nmi": rd16(0xfffa),
+                    "cinv": rd16(0x0314),
+                    "cbinv": rd16(0x0318)
+                },
+                "sid": { "regs": sid_regs, "streaming": false }
             }))
         }
 

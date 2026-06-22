@@ -87,7 +87,39 @@ pub struct Cpu6510 {
     at_boundary: bool,
     inst: Option<Inst>,
     interrupt_dispatched_this_cycle: bool,
+
+    // ── Interrupt-line / delay pipeline (= VICE interrupt_cpu_status, ported
+    //    from interrupt-cpu-status.ts). Inert on the CPU-isolated FlatRam bus
+    //    (no chip ever asserts a line), active on the FullBus where CIA1/VIC →
+    //    IRQ and CIA2 → NMI. The full machine sets the level lines each cycle
+    //    via [`set_irq_line`] / [`set_nmi_line`]; the CPU samples them at the
+    //    instruction boundary with the canonical 2-cycle hardware latency.
+    /// IRQ level asserted by any source (CIA1 ∨ VIC). Sticky until cleared.
+    irq_level: bool,
+    /// NMI level asserted by any source (CIA2). Edge-latched into `nmi_pending`.
+    nmi_level: bool,
+    prev_nmi_level: bool,
+    /// Edge-latched NMI request (sticky until the CPU acknowledges it).
+    nmi_pending: bool,
+    /// Master clk at which the IRQ line went high (CLOCK_MAX = not asserted).
+    irq_clk: u64,
+    nmi_clk: u64,
+    /// Per-cycle delay counters (VICE irq_delay_cycles / nmi_delay_cycles).
+    irq_delay_cycles: u32,
+    nmi_delay_cycles: u32,
+    /// OPINFO flag of the last fetched opcode: bit9 = DISABLES_IRQ (SEI/PLP path)
+    /// so an IRQ pending BEFORE an SEI is still taken on the following boundary.
+    last_opcode_disables_irq: bool,
+    /// True once an interrupt source has ever been wired (selects the active
+    /// boundary-dispatch path). FlatRam never sets this, so the isolated gate
+    /// keeps the pure opcode-fetch boundary.
+    irq_wired: bool,
 }
+
+/// VICE interrupt.h sentinel for "not asserted".
+const CLOCK_MAX: u64 = u64::MAX;
+/// VICE INTERRUPT_DELAY (mainc64cpu.c) — 2-cycle hardware latency.
+const INTERRUPT_DELAY: u32 = 2;
 
 impl Default for Cpu6510 {
     fn default() -> Self {
@@ -105,6 +137,16 @@ impl Default for Cpu6510 {
             at_boundary: true,
             inst: None,
             interrupt_dispatched_this_cycle: false,
+            irq_level: false,
+            nmi_level: false,
+            prev_nmi_level: false,
+            nmi_pending: false,
+            irq_clk: CLOCK_MAX,
+            nmi_clk: CLOCK_MAX,
+            irq_delay_cycles: 0,
+            nmi_delay_cycles: 0,
+            last_opcode_disables_irq: false,
+            irq_wired: false,
         }
     }
 }
@@ -212,6 +254,18 @@ impl Cpu6510 {
         self.inst = None;
         self.jammed = false;
         self.reg_pc = pc;
+        // Interrupt pipeline: deassert all lines, clear delay counters. (Does
+        // NOT clear `irq_wired` — that is a one-way "machine has IRQ sources"
+        // latch the FullBus sets; the CPU-isolated reset path never sets it.)
+        self.irq_level = false;
+        self.nmi_level = false;
+        self.prev_nmi_level = false;
+        self.nmi_pending = false;
+        self.irq_clk = CLOCK_MAX;
+        self.nmi_clk = CLOCK_MAX;
+        self.irq_delay_cycles = 0;
+        self.nmi_delay_cycles = 0;
+        self.last_opcode_disables_irq = false;
     }
 
     // -------- CLK_INC tick (c64cpusc.c:47) --------
@@ -220,8 +274,86 @@ impl Cpu6510 {
     // bus `bus.tick()` is a no-op, so the CPU-isolated gate is unaffected.
     #[inline]
     fn tick<B: Bus>(&mut self, bus: &mut B) {
+        // VICE CLK_INC / interrupt_delay (mainc64cpu.c:97-110): bump the IRQ/NMI
+        // delay counters BEFORE clk++ when the assert clk is already in the past.
+        // Gated on `irq_wired` so the FlatRam-isolated CPU is byte-identical.
+        if self.irq_wired {
+            if self.irq_clk <= self.clk {
+                self.irq_delay_cycles += 1;
+            }
+            if self.nmi_clk <= self.clk {
+                self.nmi_delay_cycles += 1;
+            }
+        }
         self.clk = self.clk.wrapping_add(1);
         bus.tick();
+    }
+
+    // ── Interrupt-line control (FullBus → CPU) ──────────────────────────────
+    /// Assert/deassert the level IRQ line (CIA1 ∨ VIC). Mirrors VICE
+    /// `interrupt_set_irq`: a rising edge stamps `irq_clk` + resets the delay
+    /// counter; a falling edge clears the level. Marks the CPU IRQ-wired.
+    #[inline]
+    pub fn set_irq_line(&mut self, asserted: bool) {
+        self.irq_wired = true;
+        if asserted {
+            if !self.irq_level {
+                self.irq_level = true;
+                self.irq_clk = self.clk;
+                self.irq_delay_cycles = 0;
+            }
+        } else if self.irq_level {
+            self.irq_level = false;
+            self.irq_clk = CLOCK_MAX;
+        }
+    }
+
+    /// Assert/deassert the NMI line (CIA2). NMI is edge-triggered: a rising edge
+    /// stamps `nmi_clk` + latches `nmi_pending` (sticky until acknowledged).
+    #[inline]
+    pub fn set_nmi_line(&mut self, asserted: bool) {
+        self.irq_wired = true;
+        self.nmi_level = asserted;
+    }
+
+    /// True when the I flag masks IRQs (for the FullBus to gate its own level OR).
+    #[inline]
+    pub fn interrupts_disabled(&self) -> bool {
+        self.reg_p & P_INTERRUPT != 0
+    }
+
+    /// VICE DO_INTERRUPT (6510dtvcore.c:354-407): the 7-cycle hardware interrupt
+    /// entry shared by IRQ ($FFFE) and NMI ($FFFA). 2 dummy reads at PC, push
+    /// PCH/PCL/P (B clear — hardware interrupt, not BRK), 2 vector reads; sets I,
+    /// jumps to the vector. Every cycle ends in `tick()` so the VIC/CIA advance in
+    /// lockstep through the entry. Leaves the CPU at an instruction boundary.
+    fn service_interrupt<B: Bus, O: Observer>(&mut self, bus: &mut B, obs: &mut O, vector: u16) {
+        obs.on_interrupt(vector, self.clk);
+        // Cycles 1-2: two dummy reads at PC (x64sc SKIP_CYCLE=0).
+        self.load_dummy(bus, obs, self.reg_pc);
+        self.tick(bus);
+        self.load_dummy(bus, obs, self.reg_pc);
+        self.tick(bus);
+        // Cycles 3-5: push PCH, PCL, P with B (0x10) cleared.
+        let next_pc = self.reg_pc;
+        self.push_byte(bus, obs, (next_pc >> 8) as u8);
+        self.tick(bus);
+        self.push_byte(bus, obs, (next_pc & 0xff) as u8);
+        self.tick(bus);
+        self.push_byte(bus, obs, self.flags() & !0x10);
+        self.tick(bus);
+        // Cycles 6-7: vector read.
+        let lo = self.load_read(bus, obs, vector) as u16;
+        self.tick(bus);
+        let hi = self.load_read(bus, obs, vector.wrapping_add(1)) as u16;
+        self.tick(bus);
+        // Set I, jump.
+        self.reg_p |= P_INTERRUPT;
+        self.reg_pc = lo | (hi << 8);
+        self.at_boundary = true;
+        self.inst = None;
+        // A serviced IRQ no longer "disables IRQ" for the next boundary.
+        self.last_opcode_disables_irq = false;
     }
 
     // -------- per-cycle entry (= executeCycle) --------
@@ -242,11 +374,56 @@ impl Cpu6510 {
     }
 
     fn start_instruction_cycle<B: Bus, O: Observer>(&mut self, bus: &mut B, obs: &mut O) {
-        // Isolated gate: no NMI/IRQ source asserts, so DO_INTERRUPT is never
-        // entered. Opcode fetch only.
+        // ── Interrupt dispatch at the opcode boundary (= cpu65xx-vice.ts
+        //    startInstructionCycle, NMI > IRQ > opcode-fetch). Only when the
+        //    machine has wired an interrupt source; otherwise (FlatRam-isolated
+        //    gate) this is skipped entirely and the path is byte-identical.
+        if self.irq_wired {
+            // NMI edge detection (rising edge latches nmi_pending).
+            let nmi_level = self.nmi_level;
+            if nmi_level && !self.prev_nmi_level {
+                self.nmi_pending = true;
+                self.nmi_clk = self.clk;
+                self.nmi_delay_cycles = 0;
+            }
+            self.prev_nmi_level = nmi_level;
+
+            // NMI first (precedence over IRQ). 2-cycle delay; BRK suppresses
+            // NMI for one opcode (handled by lastOpcodeInfo — our BRK path is
+            // separate microcode, so the boundary after BRK still samples).
+            if self.nmi_pending && self.nmi_delay_cycles >= INTERRUPT_DELAY {
+                self.nmi_pending = false;
+                self.nmi_clk = CLOCK_MAX;
+                self.service_interrupt(bus, obs, 0xfffa);
+                self.interrupt_dispatched_this_cycle = true;
+                return;
+            }
+            // IRQ: level-gated by the I flag (unless the last opcode was an
+            // I-clearing one), delay-gated by the 2-cycle latency.
+            let delay = if self.last_opcode_disables_irq {
+                INTERRUPT_DELAY + 1
+            } else {
+                INTERRUPT_DELAY
+            };
+            if self.irq_level
+                && self.irq_delay_cycles >= delay
+                && (self.reg_p & P_INTERRUPT == 0)
+            {
+                self.service_interrupt(bus, obs, 0xfffe);
+                self.interrupt_dispatched_this_cycle = true;
+                return;
+            }
+        }
+
+        // Opcode fetch.
         let pc_fetch = self.reg_pc;
         let opcode = self.load_fetch(bus, obs, pc_fetch);
         self.reg_pc = self.reg_pc.wrapping_add(1);
+        // Track whether this opcode delays IRQ acknowledgement past its own end
+        // (SEI/CLI/PLP/RTI — VICE OPINFO_DISABLES_IRQ): an IRQ pending BEFORE the
+        // opcode is still serviced on the boundary AFTER it. We approximate VICE's
+        // OPINFO by opcode value.
+        self.last_opcode_disables_irq = matches!(opcode, 0x78 | 0x58 | 0x28 | 0x40);
 
         let entry = MICROCODE_TABLE[opcode as usize];
         match entry {

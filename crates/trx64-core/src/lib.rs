@@ -12,12 +12,14 @@ use std::path::Path;
 pub mod cia;
 pub mod cpu;
 pub mod drive;
+pub mod full;
 pub mod tables;
 pub mod vic;
 
 pub use cia::Cia;
 pub use cpu::{Bus, Cpu6510};
 pub use drive::Drive1541;
+pub use full::{FullBus, MemConfig};
 pub use vic::VicII;
 
 /// Zero-cost observation hook, inlined into the core step loop.
@@ -253,6 +255,31 @@ pub struct Machine {
     /// wiring to the C64 in Phase 1. Ticked by `run_for_drive_sampled` when the
     /// `drive8-cpu` trace domain is active.
     pub drive8: Drive1541,
+
+    // ── Full-machine (FullBus) state (ADR-021) ──────────────────────────────
+    /// BASIC ROM in a SEPARATE array (the RAM under $A000-$BFFF keeps its DRAM
+    /// power-on fill, which the trace `old` byte + writes-through-ROM read).
+    pub basic_rom: Box<[u8; 0x2000]>,
+    /// KERNAL ROM, separate (RAM under $E000-$FFFF keeps its fill).
+    pub kernal_rom: Box<[u8; 0x2000]>,
+    /// CHARGEN ROM, separate (mapped into $D000-$DFFF when CHAREN low).
+    pub char_rom: Box<[u8; 0x1000]>,
+    /// I/O register shadow ($D000-$DFFF) — open-bus reads + color RAM low nibble.
+    pub io_shadow: Box<[u8; 0x1000]>,
+    /// SID register shadow ($D400-$D418) — write store for parity.
+    pub sid_regs: [u8; 32],
+    /// CPU-port latches ($00 direction / $01 value). Power-on $2F / $37.
+    pub port_dir: u8,
+    pub port_data: u8,
+    /// Live PLA memconfig (recomputed on $00/$01 writes).
+    pub memconfig: MemConfig,
+    /// Pre-built 32-entry memconfig table (no-cart C64).
+    pub memconfig_table: [MemConfig; 32],
+    /// Whether the full machine is using separate ROM arrays (FullBus assembled).
+    /// When true, `boot_from_dir` loads ROMs into the separate arrays AND leaves
+    /// the DRAM fill under the ROM windows; when false (legacy), ROMs are copied
+    /// into `ram` for the isolated FlatRam/CiaBus/VicBus gates.
+    pub full_assembled: bool,
 }
 
 /// ROM load error.
@@ -292,6 +319,16 @@ impl Machine {
             cia2: Cia::new(),
             cia_table: cia::new_table(),
             drive8: Drive1541::new(),
+            basic_rom: Box::new([0u8; 0x2000]),
+            kernal_rom: Box::new([0u8; 0x2000]),
+            char_rom: Box::new([0u8; 0x1000]),
+            io_shadow: Box::new([0u8; 0x1000]),
+            sid_regs: [0u8; 32],
+            port_dir: 0x2f,
+            port_data: 0x37,
+            memconfig: full::build_memconfig_table()[0x1f],
+            memconfig_table: full::build_memconfig_table(),
+            full_assembled: false,
         }
     }
 
@@ -308,36 +345,37 @@ impl Machine {
         self.clk = self.cpu6510.clk;
     }
 
-    /// Load 8 KiB KERNAL ROM into $E000-$FFFF.
+    /// Load 8 KiB KERNAL ROM into $E000-$FFFF (flat RAM for iso buses) AND the
+    /// separate `kernal_rom` array (for FullBus banked reads).
     pub fn load_kernal(&mut self, path: &Path) -> Result<(), RomError> {
         let data = std::fs::read(path)?;
         if data.len() != 0x2000 {
             return Err(RomError::BadSize(data.len(), 0x2000));
         }
         self.ram[0xE000..=0xFFFF].copy_from_slice(&data);
+        self.kernal_rom.copy_from_slice(&data);
         Ok(())
     }
 
-    /// Load 8 KiB BASIC ROM into $A000-$BFFF.
+    /// Load 8 KiB BASIC ROM into $A000-$BFFF (flat RAM) AND `basic_rom`.
     pub fn load_basic(&mut self, path: &Path) -> Result<(), RomError> {
         let data = std::fs::read(path)?;
         if data.len() != 0x2000 {
             return Err(RomError::BadSize(data.len(), 0x2000));
         }
         self.ram[0xA000..=0xBFFF].copy_from_slice(&data);
+        self.basic_rom.copy_from_slice(&data);
         Ok(())
     }
 
-    /// Load 4 KiB CHARGEN ROM. Stored separately; not mapped into the flat RAM
-    /// array for now (character ROM is banked out of CPU space). We keep it for
-    /// future VIC-II reads.
+    /// Load 4 KiB CHARGEN ROM into the separate `char_rom` array (mapped into
+    /// $D000-$DFFF by the FullBus when CHAREN is low).
     pub fn load_chargen(&mut self, path: &Path) -> Result<(), RomError> {
         let data = std::fs::read(path)?;
         if data.len() != 0x1000 {
             return Err(RomError::BadSize(data.len(), 0x1000));
         }
-        // Chargen is not in the CPU flat map; nothing to copy for now.
-        let _ = data;
+        self.char_rom.copy_from_slice(&data);
         Ok(())
     }
 
@@ -361,9 +399,22 @@ impl Machine {
         let hi = self.ram[0xFFFC + 1] as u16;
         let pc = lo | (hi << 8);
         self.cpu6510.reset_to(pc);
-        // VICE power-on default P also sets I (bit 2). reset_to leaves P=$20;
-        // set I to match a cold reset boundary (the isolated gate disables IRQs).
-        self.cpu6510.reg_p |= 0x04;
+        // ADR-011 RESOLVED (integration): the C64/VICE 6510 power-on leaves
+        // P = $20 (P_UNUSED only) — the I flag is NOT set by reset. The KERNAL
+        // reset routine's own `SEI` at $FCE4 sets I. The full-boot trace[0]
+        // (LDX #$FF @ $FCE2) records reg_p = $20; forcing I here produced $24.
+        // (The earlier `reg_p |= 0x04` was a CPU-isolated convenience — but the
+        // CPU-isolated gates inject PC via `set_pc`, never `cold_reset`, so they
+        // are unaffected by dropping it.)
+        // CPU-port power-on latches: $00=$2F (DDR), $01=$37 (port) — boot config
+        // 31 (BASIC+IO+KERNAL). These drive the FullBus banking; the actual RAM[0]/
+        // [1] mirror is written by `prepare_full_boot` (only on the full-machine
+        // path) so the CPU/chip-ISOLATED gates keep zero-page $00/$01 at the power-
+        // on DRAM fill (their exercisers were recorded against that).
+        self.port_dir = 0x2f;
+        self.port_data = 0x37;
+        let port = (!self.port_dir | self.port_data) & 0x07;
+        self.memconfig = self.memconfig_table[(port | 0x18) as usize & 0x1f];
         self.sync_snapshot();
     }
 
@@ -387,6 +438,49 @@ impl Machine {
         self.sync_snapshot();
     }
 
+    /// Side-effect-free banked read through the current PLA config (for
+    /// session/state vectors). RAM / BASIC / KERNAL / CHARGEN / IO per memconfig;
+    /// I/O reads use the register PEEK (no IRQ-latch clears), color RAM low
+    /// nibble + $F0 open bus. Reads $00/$01 as the latched port.
+    pub fn read_full(&self, addr: u16) -> u8 {
+        match addr {
+            0x0000 => self.port_dir,
+            0x0001 => self.port_data,
+            0x0002..=0x9fff => self.ram[addr as usize],
+            0xa000..=0xbfff => {
+                if self.memconfig.basic {
+                    self.basic_rom[(addr as usize) - 0xa000]
+                } else {
+                    self.ram[addr as usize]
+                }
+            }
+            0xc000..=0xcfff => self.ram[addr as usize],
+            0xd000..=0xdfff => {
+                if self.memconfig.io {
+                    match addr {
+                        0xd000..=0xd3ff => self.vic.read_reg(addr as u8),
+                        0xd400..=0xd7ff => self.sid_regs[(addr as usize - 0xd400) & 0x1f],
+                        0xd800..=0xdbff => (self.io_shadow[(addr as usize) - 0xd000] & 0x0f) | 0xf0,
+                        0xdc00..=0xdcff => self.cia1.peek(addr),
+                        0xdd00..=0xddff => self.cia2.peek(addr),
+                        _ => self.io_shadow[(addr as usize) - 0xd000],
+                    }
+                } else if self.memconfig.char_rom {
+                    self.char_rom[(addr as usize) - 0xd000]
+                } else {
+                    self.ram[addr as usize]
+                }
+            }
+            0xe000..=0xffff => {
+                if self.memconfig.kernal {
+                    self.kernal_rom[(addr as usize) - 0xe000]
+                } else {
+                    self.ram[addr as usize]
+                }
+            }
+        }
+    }
+
     /// Run a cycle budget against an arbitrary observer (= TS session/run with a
     /// tracing sink). Instruction-stepped, identical budget semantics to
     /// `run_for`. Returns the post-run cycle count.
@@ -407,6 +501,9 @@ impl Machine {
         self.load_kernal(&rom_dir.join("kernal-901227-03.bin"))?;
         self.load_basic(&rom_dir.join("basic-901226-01.bin"))?;
         self.load_chargen(&rom_dir.join("chargen-901225-01.bin"))?;
+        // Full machine assembled: ROMs are also in the separate arrays now, and
+        // the FullBus is available via run_for_full*.
+        self.full_assembled = true;
         self.cold_reset();
         // Drive ROM: non-fatal — if absent the drive runs with zeroed ROM
         // (bus open; CPU will JAM immediately, which is a valid isolated state).
@@ -460,6 +557,104 @@ impl Machine {
             executed += 1;
         }
         drop(bus);
+        self.sync_snapshot();
+    }
+
+    /// FULL-MACHINE run (= TS integrated-session `runFor` over the assembled
+    /// FullBus). Per C64 instruction: catch up the drive to the C64 clock BEFORE,
+    /// refresh the cross-chip interrupt lines (CIA1 ∨ VIC → IRQ; CIA2 → NMI),
+    /// run a whole instruction with the VIC ticked per cycle + both CIAs in
+    /// lockstep + the CPU sampling the IRQ/NMI lines at the boundary, then catch
+    /// up the drive AFTER and sample its PC (deduplicated). Budget/cap semantics
+    /// identical to [`run_for_capped`].
+    ///
+    /// `on_drive_step`: deduplicated drive-PC sample (for the drive8-cpu domain).
+    pub fn run_for_full<O: Observer, F>(&mut self, budget: u64, obs: &mut O, on_drive_step: F)
+    where
+        F: FnMut(u16, u8, u8, u8, u8, u8, u64),
+    {
+        let max_instructions = budget.div_ceil(2) + 1000;
+        self.run_for_full_capped(budget, max_instructions, obs, on_drive_step);
+    }
+
+    /// FULL-MACHINE run with an explicit instruction cap.
+    pub fn run_for_full_capped<O: Observer, F>(
+        &mut self,
+        budget: u64,
+        max_instructions: u64,
+        obs: &mut O,
+        mut on_drive_step: F,
+    ) where
+        F: FnMut(u16, u8, u8, u8, u8, u8, u64),
+    {
+        let start = self.cpu6510.clk;
+        let mut executed: u64 = 0;
+        let table = self.cia_table.clone();
+        // Seed CIA clocks from the live CPU clk so timer state machines run from
+        // the right rclk.
+        self.cia1.clk = self.cpu6510.clk;
+        self.cia2.clk = self.cpu6510.clk;
+        loop {
+            if self.cpu6510.clk.wrapping_sub(start) >= budget {
+                break;
+            }
+            if executed >= max_instructions {
+                break;
+            }
+            // Drive catches up to the current C64 clock BEFORE the instruction
+            // (= integrated-session.ts:898 catchUpDrive). Advances the drive's
+            // own clock via the PAL sync_factor.
+            let c64_clk_before = self.cpu6510.clk;
+
+            // Refresh cross-chip interrupt lines at the boundary: advance both
+            // CIA timers to the current clk so any underflow latches its ICR flag,
+            // then OR the level sources onto the CPU lines.
+            self.cia1.update_to(self.cpu6510.clk, &table);
+            self.cia2.update_to(self.cpu6510.clk, &table);
+            let irq = self.cia1.irq_asserted() || self.vic.irq_line;
+            self.cpu6510.set_irq_line(irq);
+            self.cpu6510.set_nmi_line(self.cia2.irq_asserted());
+
+            // Run a whole instruction over the FullBus (VIC ticked per cycle +
+            // CIAs in lockstep + IRQ/NMI sampled at the boundary).
+            {
+                let mut bus = full::FullBus {
+                    ram: &mut self.ram,
+                    basic_rom: &self.basic_rom,
+                    kernal_rom: &self.kernal_rom,
+                    char_rom: &self.char_rom,
+                    io: &mut self.io_shadow,
+                    vic: &mut self.vic,
+                    cia1: &mut self.cia1,
+                    cia2: &mut self.cia2,
+                    cia_table: &table,
+                    sid_regs: &mut self.sid_regs,
+                    config: self.memconfig,
+                    memconfig_table: &self.memconfig_table,
+                    port_dir: self.port_dir,
+                    port_data: self.port_data,
+                    clk: self.cpu6510.clk,
+                };
+                loop {
+                    self.cpu6510.execute_cycle(&mut bus, obs);
+                    if self.cpu6510.is_at_boundary() {
+                        break;
+                    }
+                }
+                // Persist bus-mutated banking/port state back to the Machine.
+                self.memconfig = bus.config;
+                self.port_dir = bus.port_dir;
+                self.port_data = bus.port_data;
+            }
+
+            // Drive catches up to the NEW C64 clock AFTER the instruction.
+            let c64_cycles = self.cpu6510.clk.wrapping_sub(c64_clk_before);
+            self.drive8.run_cycles(c64_cycles);
+            if let Some((pc, a, x, y, sp, p, drv_clk)) = self.drive8.sample_pc_change() {
+                on_drive_step(pc, a, x, y, sp, p, drv_clk);
+            }
+            executed += 1;
+        }
         self.sync_snapshot();
     }
 

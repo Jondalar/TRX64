@@ -11,6 +11,12 @@ pub struct Session {
     pub machine: Machine,
     /// Sessions boot PAUSED — no autonomous tick loop (idle-safe, Spec 744.3).
     pub running: bool,
+    /// True once a CPU-isolated `monitor/exec` inject (`wr` / `r pc=`) has run.
+    /// Distinguishes the CPU/chip-ISOLATED gates (which inject a program + set PC,
+    /// then run on FlatRam/CiaBus/VicBus) from the FULL-MACHINE boot scenarios
+    /// (session/create → session/run straight from the KERNAL reset vector, run
+    /// on the assembled FullBus). False at boot ⇒ full-machine run path.
+    pub injected: bool,
     /// Active trace: sibling `.c64retrace` path + accumulated meta. When set,
     /// session/run streams CpuStep/RAM_WRITE/IO_WRITE frames into a FrameSink and
     /// flushes to this path. `None` = no trace.
@@ -42,6 +48,7 @@ impl Session {
             id: id.into(),
             machine: Machine::new(),
             running: false,
+            injected: false,
             trace: None,
         }
     }
