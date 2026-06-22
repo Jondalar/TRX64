@@ -580,7 +580,24 @@ impl Machine {
         let max_instructions = budget.div_ceil(2) + 1000;
         let start = self.cpu6510.clk;
         let mut executed: u64 = 0;
-        let mut bus = FlatRam { mem: &mut self.ram };
+        // The drive catches up to the C64's main-clock at each C64 instruction
+        // boundary. In the TS oracle that C64 is the FULL integrated session, so the
+        // per-instruction retire clock the drive catches up to must match it cycle for
+        // cycle — otherwise the catch-up targets, and hence the sampled drive_clk
+        // values, drift out of phase. We run the C64 over the same CIA-isolated bus
+        // the validated `c64-cpu` gate uses (run_for_cia): it reproduces the TS C64
+        // cadence exactly. (The VIC bus is NOT used here — its isolated raster phase
+        // badlines at lines the boot ROM does not, perturbing the catch-up clock.)
+        let table = self.cia_table.clone();
+        self.cia1.clk = self.cpu6510.clk;
+        self.cia2.clk = self.cpu6510.clk;
+        let mut bus = CiaBus {
+            mem: &mut self.ram,
+            cia1: &mut self.cia1,
+            cia2: &mut self.cia2,
+            table: &table,
+            clk: self.cpu6510.clk,
+        };
         loop {
             if self.cpu6510.clk.wrapping_sub(start) >= budget {
                 break;
@@ -595,7 +612,8 @@ impl Machine {
                     break;
                 }
             }
-            // Drive advances the same number of cycles as the C64 instruction took.
+            // Drive advances by this C64 instruction's cycle cost, scaled by the PAL
+            // sync factor.
             let c64_cycles = self.cpu6510.clk.wrapping_sub(c64_clk_before);
             self.drive8.run_cycles(c64_cycles);
             // Sample drive PC (deduplicated).
