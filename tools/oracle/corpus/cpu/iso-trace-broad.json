@@ -1,0 +1,14 @@
+{
+  "name": "iso-trace-broad",
+  "slice": "cpu",
+  "trace": true,
+  "steps": [
+    { "method": "session/create", "params": { "pal": true }, "capture": true, "label": "create" },
+    { "method": "monitor/exec", "params": { "session_id": "$sessionId", "command": "wr 0800 78 18 38 B8 D8 F8 D8 A9 12 AA A8 A2 F0 9A BA 8A 98 A9 0F 85 10 E6 10 C6 10 06 10 46 10 26 10 66 10 A9 80 8D 00 05 0E 00 05 EE 00 05 A2 04 B5 10 95 20 BD 00 05 9D 10 05 A9 00 85 30 A9 06 85 31 A0 02 A9 AB 91 30 B1 30 A2 00 81 30 A1 30 A9 50 69 50 E9 20 29 0F 09 F0 49 FF C9 00 E0 00 C0 02 24 10 A7 10 87 12 07 10 27 10 47 10 67 10 C7 10 E7 10 0B 0F 4B 0F 6B 0F CB 01 EB 01 80 00 04 10 1A F8 A9 15 69 27 E9 12 D8 4C 89 08" }, "capture": true, "label": "inject" },
+    { "method": "monitor/exec", "params": { "session_id": "$sessionId", "command": "r pc=0800" }, "capture": true, "label": "setpc" },
+    { "method": "trace/start_domains", "params": { "session_id": "$sessionId", "domains": ["c64-cpu", "memory"] }, "capture": true, "label": "trace-start" },
+    { "method": "session/run", "params": { "session_id": "$sessionId", "cycles": 3000 }, "capture": true, "label": "run" },
+    { "method": "trace/run/stop", "params": { "session_id": "$sessionId", "wait_index": true }, "label": "trace-stop" },
+    { "method": "trace/run/status", "params": { "session_id": "$sessionId" }, "capture": true, "label": "trace-status" }
+  ]
+}

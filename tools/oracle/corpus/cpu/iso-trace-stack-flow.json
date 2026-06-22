@@ -1,0 +1,14 @@
+{
+  "name": "iso-trace-stack-flow",
+  "slice": "cpu",
+  "trace": true,
+  "steps": [
+    { "method": "session/create", "params": { "pal": true }, "capture": true, "label": "create" },
+    { "method": "monitor/exec", "params": { "session_id": "$sessionId", "command": "wr 0800 78 A9 99 48 A9 00 68 38 08 18 28 20 40 08 A0 03 88 D0 FD 4C 13 08 EA EA EA EA EA EA EA EA EA EA EA EA EA EA EA EA EA EA EA EA EA EA EA EA EA EA EA EA EA EA EA EA EA EA EA EA EA EA EA EA EA EA E8 E8 60" }, "capture": true, "label": "inject" },
+    { "method": "monitor/exec", "params": { "session_id": "$sessionId", "command": "r pc=0800" }, "capture": true, "label": "setpc" },
+    { "method": "trace/start_domains", "params": { "session_id": "$sessionId", "domains": ["c64-cpu", "memory"] }, "capture": true, "label": "trace-start" },
+    { "method": "session/run", "params": { "session_id": "$sessionId", "cycles": 2000 }, "capture": true, "label": "run" },
+    { "method": "trace/run/stop", "params": { "session_id": "$sessionId", "wait_index": true }, "label": "trace-stop" },
+    { "method": "trace/run/status", "params": { "session_id": "$sessionId" }, "capture": true, "label": "trace-status" }
+  ]
+}
