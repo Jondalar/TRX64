@@ -16,13 +16,17 @@
     "drive-iec",
     "iec-bus"
   ],
-  "note": "MILESTONE: full-machine boot-trace-short BYTE-EXACT (incl IEC). Next: protocol-surface [sonnet] (50+ WS methods on the working machine). Then snapshot-vsf. Corner gaps tracked: drive-via2, cia-cascade.",
+  "note": "protocol-surface [sonnet]: implement the 50+ WS methods on the working FullBus machine. Defer framebuffer-dependent (screenshot/render/export-video) -> need vic-render. Diff response parity vs TS.",
   "updated": "2026-06-22T22:05:00Z",
   "followups": [
     "drive-via2 (ADR-025, +2 driveCycles)",
     "cia-cascade (ADR-017, now IEC-unblocked)"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "protocol-surface",
+    "model": "sonnet",
+    "started": "2026-06-22T22:05:00Z"
+  },
   "stage2_items": [
     "protocol-surface",
     "snapshot-vsf"
