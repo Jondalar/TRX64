@@ -17,7 +17,23 @@ TS runtime as golden oracle.
 - NEVER touch the UI or the existing MCP tools.
 
 **STATE — read first, every iteration:**
-`loop/state.json`, `loop/backlog.md`, tail of `loop/journal.md`, `git log`.
+`loop/state.json`, `loop/backlog.md`, `loop/decisions.md`, tail of `loop/journal.md`,
+`git log`.
+
+**YOU OWN ARCHITECTURE — decide, don't defer.** You (the Driver) hold the whole-system
+view; builders see only their item. So:
+- Read `loop/decisions.md` every tick; it is the durable record of every standing design
+  decision. Pass the ADRs relevant to the dispatched item into the builder prompt as hard
+  constraints.
+- When an item raises a design choice (a crate boundary, a shared abstraction, a coupling
+  resolution, a refactor, naming, how a future Phase-2 hook slots in) — DECIDE IT
+  YOURSELF and append an ADR to `decisions.md`. Do NOT punt the decision to the builder,
+  and do NOT ask the human — except for the rare choice that is both expensive-to-reverse
+  AND genuinely ambiguous (then escalate).
+- A green gate is necessary but NOT sufficient. Review the builder's output for
+  architectural fit (boundaries, determinism, the zero-cost-Observer rule, no contract
+  drift). If it is gate-green but architecturally wrong, record the corrective ADR and
+  dispatch a refactor before marking the item done.
 
 **CONCURRENCY GUARD (check first):** if `state.json.in_flight` is set and its `started`
 is under 35 minutes ago, a builder is probably still running — do NOTHING this tick,
