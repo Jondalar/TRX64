@@ -51,7 +51,9 @@ long builder.
    `[model: X]` tag as the `model` override (cheap-first). Stage 1 in an isolated
    worktree. Give it the TS source as spec and the item's corpus slice. Tell the
    builder to use `rtk`-prefixed commands (cargo/git/tsc) per CLAUDE.md, but read the
-   TS spec RAW (no rtk filtering on spec reads).
+   TS spec RAW (no rtk filtering on spec reads). Builders must NOT edit `loop/` files
+   (state/backlog/journal/decisions/loop-prompt) — the Driver owns those; the builder
+   reports back and the Driver records.
 3. Run the ORACLE: identical WS command-seq against TS-daemon + TRX64; diff WS
    responses + `.c64retrace`; obtain first-divergence (cycle, field, expected-vs-got).
 4. GREEN → commit, mark item `done`, advance.

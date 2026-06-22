@@ -143,3 +143,18 @@ GATE GREEN: all 4 VIC corpus scenarios (corpus/vic/: iso-vic-probe, -raster, -ba
 OPEN: none in VIC scope. boot-trace-short (P-flag, ADR-011) + boot-basic-ready (driveCycles)
 remain RED — both integration/full-boot items, not VIC. Pixel draw-cycle/framebuffer
 intentionally not ported (never reaches the trace; ADR-015).
+
+## 2026-06-22 — DRIVER: vic-ii accepted + merged
+
+Confirmation gate re-run INDEPENDENTLY: 4 VIC scenarios (iso-vic-probe/-raster/-badline-irq/
+-sprites) GREEN + CPU regression (iso-trace-broad, iso-loads-alu) GREEN — no regression.
+Arch-fit verified: vic.rs in trx64-core, pure/sync (no async/rand/time), Bus trait gained
+default-no-op tick()+check_ba_before_read (FlatRam unaffected → CPU gates stay green; VicBus
+overrides). Blessed the builder's ADR-015 (TS vic trace channel is RESERVED/no producer →
+parity = empty vic trace + c64Cycles via badline BA-low stealing) and ADR-016 (VIC↔CPU
+coupling via Bus hooks). Merged vic-ii → main (ff), deleted branch.
+
+PROCESS NOTE: the vic-ii builder edited loop/ files (backlog/journal/decisions) — Driver-owned.
+Content was correct so kept; tightened loop-prompt so future builders don't touch loop/.
+
+Advancing to `cia` [opus]. stage1_remaining: [drive-iec].
