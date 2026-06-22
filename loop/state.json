@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": 2,
-  "current_item": "protocol-surface",
+  "current_item": "integration",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -15,15 +15,19 @@
     "cia",
     "drive-iec"
   ],
-  "note": "STAGE 1 COMPLETE (vic-ii+cia+drive-iec). Stage 2 serial: protocol-surface [sonnet] next. Followups: cia-cascade, ADR-011 reset-P-flag (both at integration).",
-  "updated": "2026-06-22T20:18:00Z",
+  "note": "Stage 2 REORDERED (ADR-021): integration [opus] FIRST = assemble full machine bus + boot + resolve deferred gaps. Then protocol-surface, snapshot-vsf.",
+  "updated": "2026-06-22T20:45:00Z",
   "followups": [
     "cia-cascade"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "integration",
+    "model": "opus",
+    "started": "2026-06-22T20:45:00Z"
+  },
   "stage2_items": [
+    "integration",
     "protocol-surface",
-    "snapshot-vsf",
-    "integration"
+    "snapshot-vsf"
   ]
 }

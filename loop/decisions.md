@@ -208,3 +208,15 @@ the CiaBus (same cadence as the c64-cpu gate), seeded with the 1-cycle C64 power
 offset; the drive 6502 powers on SP=0 (not $FF), drive-only.
 **Why:** Cycle-exact drive boot without regressing the C64 cpu/vic/cia gates (all verified
 GREEN). Confirms ADR-010's Bus decoupling scales to a second CPU instance.
+
+## ADR-021 — Stage 2 reordered: integration FIRST (the keystone)
+**Context:** Stage 1 built each chip on an ISOLATED chip-specific Bus (ADR-012); there is
+no assembled full-machine bus yet. Most of the 50+ WS methods (monitor_memory/registers/
+disasm, run_prg, step/until, breakpoints) and snapshot/VSF need the REAL assembled C64
+(PLA $00/$01 banking, RAM/ROM/VIC/CIA/colorRAM/IO routing, cross-chip IRQ, full boot).
+**Decision:** Reorder Stage 2 to `integration` → `protocol-surface` → `snapshot-vsf`.
+Integration assembles the full machine and is where the deferred gaps converge: ADR-011
+(reset P-flag), ADR-017 (cia-cascade alarm scheduler), full-session boot trace parity
+(boot-basic-ready, boot-trace-short), and deeper VIA/GCR + IEC handshaking.
+**Why:** protocol-surface + snapshot are thin polish ON the assembled machine; building
+them first would stub against a machine that can't boot. Integration is the keystone.
