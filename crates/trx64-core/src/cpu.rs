@@ -224,7 +224,7 @@ impl Cpu6510 {
                 // TS illegal path passes b1=0, b2=0 on this first emit.
                 obs.on_instruction(
                     pc_fetch, opcode, 0, 0, self.reg_a, self.reg_x, self.reg_y, self.reg_sp,
-                    self.flags(), self.clk,
+                    self.reg_p, self.clk,
                 );
             }
             Some(entry) => {
@@ -234,7 +234,7 @@ impl Cpu6510 {
                     self.execute_final_op(bus, obs, &mut fs);
                     obs.on_instruction(
                         pc_fetch, opcode, (fs.operand_lo & 0xff) as u8, (fs.operand_hi & 0xff) as u8,
-                        self.reg_a, self.reg_x, self.reg_y, self.reg_sp, self.flags(), self.clk,
+                        self.reg_a, self.reg_x, self.reg_y, self.reg_sp, self.reg_p, self.clk,
                     );
                     return;
                 }
@@ -264,7 +264,7 @@ impl Cpu6510 {
             self.inst = None;
             obs.on_instruction(
                 prev_pc, opcode_byte, b1, b2, self.reg_a, self.reg_x, self.reg_y, self.reg_sp,
-                self.flags(), self.clk,
+                self.reg_p, self.clk,
             );
         } else {
             self.inst = Some(inst);
