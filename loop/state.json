@@ -16,14 +16,15 @@
     "drive-iec"
   ],
   "note": "iec-bus [opus]: C64 CIA2 PA $DD00 <-> 1541 VIA1 IEC pins (wired-AND, ATN-ACK, push-flush catch-up). Unblocks boot-trace beyond trace[79] + driveCycles.",
-  "updated": "2026-06-22T21:18:00Z",
+  "updated": "2026-06-22T21:49:00Z",
   "followups": [
     "cia-cascade"
   ],
   "in_flight": {
     "item": "iec-bus",
     "model": "opus",
-    "started": "2026-06-22T21:18:00Z"
+    "started": "2026-06-22T21:49:00Z",
+    "note": "opus alive: 2 IEC commits landed (CIA2 PA<->VIA1 PB, drive PB folds lines), full.rs edited 8min ago. Defer."
   },
   "stage2_items": [
     "iec-bus",
