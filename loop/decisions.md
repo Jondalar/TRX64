@@ -284,3 +284,17 @@ NOT_IMPLEMENTED (ADR-019, no faking) because they need subsystems TRX64 lacks.
   daemon-side delegations — lower priority (MCP trace_store_* reads duckdb files directly).
 - vsf/* → the existing `snapshot-vsf` item.
 **Why:** Each deferred group is a real subsystem; honest carve-outs keep the gate truthful.
+
+## ADR-027 — snapshot-vsf done (round-trip parity); vsf.rs-in-core tolerated
+**Context:** snapshot-vsf — VSF save/load + native snapshot.
+**Decision (accepted, gates GREEN):** vsf.rs save_vsf/load_vsf (9 modules in VICE order,
+x64sc-vs-c64re auto-detect); 8/9 module bodies byte-size-identical to TS; behavioral gate
+= session/state byte-identical before-save/after-load/after-post-restore-run (round-trip),
+both vsf scenarios GREEN, no regression. Native snapshot = Session::take_snapshot/restore
+over Machine::clone (full drive state, Phase-2 ready). MINOR ARCH-DEBT: vsf.rs landed in
+trx64-core not trx64-session (against ADR-002) — but it is PURE (no async/io; file ops in
+the daemon), self-contained, no hot-path/dep impact. Tolerated; may move to session later.
+The DRIVECPU VSF module is a 0-byte stub vs TS's 2461-byte drive blob (TS documents its own
+as a stub too) — folds into `drive-via2` (full drive internal state).
+**Why:** The behavioral contract (restored state) is what matters; byte-parity on the
+deferred drive blob is out of scope here.

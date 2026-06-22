@@ -1,7 +1,7 @@
 {
   "phase": 1,
-  "stage": 2,
-  "current_item": "snapshot-vsf",
+  "stage": "followups",
+  "current_item": "media",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -15,26 +15,21 @@
     "cia",
     "drive-iec",
     "iec-bus",
-    "protocol-surface"
-  ],
-  "note": "snapshot-vsf [sonnet]: VSF save/load interop (VICE/TS session-vsf format) + native fast snapshot (Machine is Clone). vsf/save + vsf/load WS methods.",
-  "updated": "2026-06-22T22:35:00Z",
-  "followups": [
-    "vic-render (framebuffer+screenshot, ADR-026)",
-    "media (ADR-026)",
-    "daemon-trace-query (ADR-026)",
-    "drive-via2 (ADR-025)",
-    "cia-cascade (ADR-017)",
-    "sid (audio, Phase 1.5)"
-  ],
-  "in_flight": {
-    "item": "snapshot-vsf",
-    "model": "sonnet",
-    "started": "2026-06-22T22:35:00Z"
-  },
-  "stage2_items": [
+    "protocol-surface",
     "snapshot-vsf"
   ],
+  "note": "PLANNED Phase-1 scope COMPLETE (9 items: oracle..snapshot-vsf). Now follow-ups: media [sonnet] next (disk mount/swap — foundational for loading programs / the cracking workflow), then vic-render (screenshot), daemon-trace-query, drive-via2, cia-cascade, sid.",
+  "updated": "2026-06-23T00:50:00Z",
+  "followups": [
+    "media (disk mount/swap — load programs)",
+    "vic-render (framebuffer+screenshot)",
+    "daemon-trace-query",
+    "drive-via2",
+    "cia-cascade",
+    "sid"
+  ],
+  "in_flight": null,
+  "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
   ]

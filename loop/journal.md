@@ -259,3 +259,17 @@ clean (only daemon/main.rs; core untouched, ADR-002). Good TS findings (stepInto
 instructionsElapsed==cyclesElapsed; listBreakpoints mutates specs; continue doesn't bump
 frame). ADR-026: carved deferred groups into vic-render / media / daemon-trace-query.
 Merged → main. done: 8 items. Next: snapshot-vsf.
+
+## 2026-06-23 — DRIVER: snapshot-vsf done — PLANNED PHASE-1 SCOPE COMPLETE
+
+Sonnet builder: vsf.rs (save_vsf/load_vsf, 9 modules VICE-order, x64sc/c64re auto-detect)
++ native snapshot (Session::take/restore over Machine::clone). Confirmation gate INDEPENDENT:
+2 vsf scenarios GREEN (round-trip: session/state byte-identical before-save/after-load/
+after-run vs TS) + regression GREEN. 8/9 VSF module bodies byte-size-identical. ADR-027
+(vsf.rs-in-core minor arch-debt tolerated; DRIVECPU 0-byte stub → drive-via2). Merged.
+
+** PLANNED PHASE-1 SCOPE COMPLETE ** — 9 items: oracle-harness, core-substrate, cpu-6510,
+vic-ii, cia, drive-iec, iec-bus, protocol-surface, snapshot-vsf. The full C64 boots
+byte-exact, answers the WS core contract, snapshots/restores. Remaining = tracked
+follow-ups (completeness/corner/polish): media → vic-render (screenshot) → daemon-trace-
+query → drive-via2 → cia-cascade → sid. Advancing to `media` [sonnet].
