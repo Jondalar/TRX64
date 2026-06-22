@@ -19,8 +19,8 @@
     "snapshot-vsf",
     "media"
   ],
-  "note": "media (WS surface) done. Next: vic-render [opus] — VIC pixel framebuffer + session/screenshot/render_screen (user-requested). Then daemon-trace-query, drive-via2 (the keystone corner: fixes +2 driveCycles AND enables disk-load AND DRIVECPU vsf), cia-cascade, sid.",
-  "updated": "2026-06-23T01:20:00Z",
+  "note": "vic-render [opus]: VIC pixel draw-cycle -> RGBA framebuffer + session/screenshot/render_screen/vic-inspect. Gate on PIXEL parity (decode PNG to RGBA, not PNG-container bytes).",
+  "updated": "2026-06-22T23:35:00Z",
   "followups": [
     "vic-render (framebuffer+screenshot)",
     "daemon-trace-query",
@@ -28,7 +28,11 @@
     "cia-cascade",
     "sid"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "vic-render",
+    "model": "opus",
+    "started": "2026-06-22T23:35:00Z"
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
