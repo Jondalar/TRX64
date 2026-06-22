@@ -280,6 +280,10 @@ pub struct Machine {
     /// the DRAM fill under the ROM windows; when false (legacy), ROMs are copied
     /// into `ram` for the isolated FlatRam/CiaBus/VicBus gates.
     pub full_assembled: bool,
+    /// Last CIA2 port-A OUTPUT byte pushed to $DD00 (IEC / VIC bank). Persists
+    /// across instructions so the FullBus only re-pushes on an actual change.
+    /// Power-on: DDRA=0 → output=$FF.
+    pub cia2_pa_out: u8,
 }
 
 /// ROM load error.
@@ -329,6 +333,7 @@ impl Machine {
             memconfig: full::build_memconfig_table()[0x1f],
             memconfig_table: full::build_memconfig_table(),
             full_assembled: false,
+            cia2_pa_out: 0xff,
         }
     }
 
@@ -634,6 +639,8 @@ impl Machine {
                     port_dir: self.port_dir,
                     port_data: self.port_data,
                     clk: self.cpu6510.clk,
+                    cia2_pa_out: self.cia2_pa_out,
+                    side_effects: Vec::new(),
                 };
                 loop {
                     self.cpu6510.execute_cycle(&mut bus, obs);
@@ -645,6 +652,7 @@ impl Machine {
                 self.memconfig = bus.config;
                 self.port_dir = bus.port_dir;
                 self.port_data = bus.port_data;
+                self.cia2_pa_out = bus.cia2_pa_out;
             }
 
             // Drive catches up to the NEW C64 clock AFTER the instruction.

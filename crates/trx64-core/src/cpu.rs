@@ -50,6 +50,17 @@ pub trait Bus {
     fn check_ba_before_read(&mut self) -> u32 {
         0
     }
+
+    /// Take + clear any SIDE-EFFECT bus writes produced by the immediately-
+    /// preceding `write()` (= TS chip callbacks that re-write the bus, e.g. CIA2's
+    /// `iecWrite` → `c64Write($DD00, …)` when the port-A output changes on a
+    /// $DD00/$DD02 store). Returned as `(addr, value, old)` in the order the TS
+    /// emits them (BEFORE the originating store's own trace record); the CPU
+    /// `store` emits these via the observer so the `.c64retrace` byte-matches.
+    /// Default empty — FlatRam/CiaBus/VicBus have no such side-effects, so the
+    /// isolated gates are byte-identical + pay no cost.
+    #[inline]
+    fn take_side_effect_writes(&mut self, _out: &mut Vec<(u16, u8, u8)>) {}
 }
 
 /// In-flight instruction microcode state (= TS `InstructionState`).
@@ -219,6 +230,14 @@ impl Cpu6510 {
         // record the mutation surface (= TS store() captures oldValue before write).
         let old = bus.read(addr);
         bus.write(addr, value);
+        // Side-effect writes from chip callbacks (e.g. CIA2 port-A output → $DD00)
+        // are emitted BEFORE the originating store's own record, matching the TS
+        // `iecWrite`-then-store order. No-op on the isolated buses.
+        let mut se: Vec<(u16, u8, u8)> = Vec::new();
+        bus.take_side_effect_writes(&mut se);
+        for (a, v, o) in se {
+            obs.on_bus(BusKind::Write, a, v, self.reg_pc, self.clk, o);
+        }
         obs.on_bus(BusKind::Write, addr, value, self.reg_pc, self.clk, old);
     }
 

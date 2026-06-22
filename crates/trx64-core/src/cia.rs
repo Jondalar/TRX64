@@ -516,6 +516,18 @@ impl Cia {
         }
     }
 
+    /// Composed port-A OUTPUT byte (= VICE cia store port-A `byte = (PRA & DDRA) |
+    /// (~DDRA)`, input pins float/pull HIGH). On CIA2 this drives the IEC bus +
+    /// VIC bank ($DD00); a change is pushed onto the bus as a $DD00 write (the TS
+    /// `iecWrite` callback → c64Write(0xDD00, or, …)). Modelled here so the FullBus
+    /// can re-emit that side-effect write into the trace.
+    #[inline]
+    pub fn pa_output(&self) -> u8 {
+        let pra = self.regs[CIA_PRA];
+        let ddra = self.regs[CIA_DDRA];
+        (pra & ddra) | !ddra
+    }
+
     /// IRQ-line level: asserted when any latched ICR flag is also enabled in the
     /// mask (= VICE summary bit7 condition). Drives the C64 IRQ/NMI line on the
     /// FullBus. Pure read of the current latched state — the caller advances the

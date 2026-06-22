@@ -86,6 +86,14 @@ pub struct FullBus<'a> {
     pub port_data: u8,
     /// Master clock, advanced by `tick` (shared with CPU + CIAs).
     pub clk: u64,
+    /// Last CIA2 port-A OUTPUT byte pushed to $DD00 (= IEC/VIC-bank). A write to
+    /// $DD00/$DD02 that changes the composed output re-pushes it as a $DD00 bus
+    /// write (TS `iecWrite`). Seeded from the live CIA2 PA output so the FIRST
+    /// change is detected correctly.
+    pub cia2_pa_out: u8,
+    /// Side-effect writes queued by the immediately-preceding `write()`
+    /// (`(addr, value, old)`), drained by the CPU `store` into the trace.
+    pub side_effects: Vec<(u16, u8, u8)>,
 }
 
 impl<'a> FullBus<'a> {
@@ -157,7 +165,26 @@ impl<'a> FullBus<'a> {
             }
             0xd800..=0xdbff => { /* color RAM: shadow already stored above */ }
             0xdc00..=0xdcff => self.cia1.write(addr, value, self.clk, self.cia_table),
-            0xdd00..=0xddff => self.cia2.write(addr, value, self.clk, self.cia_table),
+            0xdd00..=0xddff => {
+                self.cia2.write(addr, value, self.clk, self.cia_table);
+                // CIA2 port-A output drives the IEC bus + VIC bank. A $DD00 (PRA)
+                // or $DD02 (DDRA) write that changes the composed output re-pushes
+                // it to $DD00 (= TS iecWrite → c64Write($DD00, or)). The push is
+                // recorded BEFORE the originating store's own trace record.
+                let reg = (addr & 0xf) as usize;
+                if reg == crate::cia::CIA_PRA || reg == crate::cia::CIA_DDRA {
+                    let new_out = self.cia2.pa_output();
+                    if new_out != self.cia2_pa_out {
+                        // The $DD00 IO shadow becomes the new output; `old` = prior
+                        // shadow at $DD00 (the trace old byte for an IO write is
+                        // omitted anyway — hasOld=0 for $D000-$DFFF — so 0 is fine).
+                        let old = self.io[0xdd00 - 0xd000];
+                        self.io[0xdd00 - 0xd000] = new_out;
+                        self.cia2_pa_out = new_out;
+                        self.side_effects.push((0xdd00, new_out, old));
+                    }
+                }
+            }
             _ => { /* cart IO (none) */ }
         }
     }
@@ -250,5 +277,12 @@ impl<'a> Bus for FullBus<'a> {
             self.cia2.clk = self.clk;
         }
         stolen
+    }
+
+    #[inline]
+    fn take_side_effect_writes(&mut self, out: &mut Vec<(u16, u8, u8)>) {
+        if !self.side_effects.is_empty() {
+            out.append(&mut self.side_effects);
+        }
     }
 }
