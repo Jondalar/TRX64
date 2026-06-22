@@ -21,7 +21,7 @@ use crate::{cpu::{Bus, Cpu6510}, NullSink, Observer, RomError};
 /// reads. The isolation gate does not need timer IRQ delivery.
 #[derive(Clone)]
 pub struct Via6522 {
-    pub regs: [u8; 16],
+    regs: [u8; 16],
 }
 
 impl Via6522 {
@@ -230,6 +230,8 @@ impl Drive1541 {
         // VICE viacore_reset (viacore.c:382-385) clears port data/ddr regs 0..3.
         // The drive VIA1 PB/DDRB must start at 0 (all inputs, ORB latch 0) so the
         // IEC read_prb formula sees the right DDRB before the ROM programs $1802.
+        // (VIA2 — the disk-controller VIA — is left as the 0xFF stub: its timer/PCR/
+        // handshake reads are a separate subsystem outside the IEC-bus scope.)
         self.via1.regs[0] = 0; // VIA1 ORB ($1800)
         self.via1.regs[2] = 0; // VIA1 DDRB ($1802)
         // Seed the sync accumulator with the C64 power-on reset cycles the drive's

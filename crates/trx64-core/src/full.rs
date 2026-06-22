@@ -148,10 +148,21 @@ impl<'a> FullBus<'a> {
     /// each $DD00 read/write instant.
     #[inline]
     fn iec_push_flush(&mut self) {
+        self.iec_push_flush_to(self.clk);
+    }
+
+    /// Push-flush the drive to an explicit C64-clock target. VICE passes
+    /// `maincpu_clk` on a $DD00 READ (iecbus_cpu_read_conf1) but
+    /// `maincpu_clk + !write_offset` = `maincpu_clk + 1` on a $DD00 WRITE
+    /// (iecbus_cpu_write_conf1, x64sc write_offset=0 — c64cia2.c:162). The extra
+    /// cycle on writes shifts the drive's sampling instant by one C64 cycle, which
+    /// the IEC handshake timing depends on.
+    #[inline]
+    fn iec_push_flush_to(&mut self, target: u64) {
         // Feed the drive the current bus state so a `$1800` PB read during its
         // catch-up run sees the live C64-driven CLK/DATA/ATN lines.
         self.drive.iec_drv_port = self.iec.drv_port;
-        self.drive_c64_ref = self.drive.catch_up_to(self.clk, self.drive_c64_ref);
+        self.drive_c64_ref = self.drive.catch_up_to(target, self.drive_c64_ref);
         let pb_out = self.drive.via1_pb_iec_output();
         self.iec.drive_store_pb(pb_out);
     }
@@ -231,8 +242,9 @@ impl<'a> FullBus<'a> {
                         // IEC: drive the wired-AND bus from the new CIA2 PA output.
                         // VICE iecbus_cpu_write_conf1 order: push-flush drive to the
                         // write instant FIRST, then iec_update_cpu_bus(~PA), ATN edge
-                        // → drive VIA1 CA1, recompute drv_bus[8], update ports.
-                        self.iec_push_flush();
+                        // → drive VIA1 CA1, recompute drv_bus[8], update ports. The
+                        // write instant is maincpu_clk + 1 (x64sc write_offset=0).
+                        self.iec_push_flush_to(self.clk + 1);
                         let _atn_edge = self.iec.c64_store_dd00((!new_out) & 0xff);
                         // ATN-edge → drive VIA1 CA1 signal is not yet modelled (the
                         // TRX64 drive VIA1 is a register stub without CA1/IRQ); the
