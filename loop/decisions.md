@@ -309,3 +309,18 @@ drive VIA2 + GCR read path → tracked `drive-via2`. crt attach returns explicit
 fake). The recurring boot-basic-ready driveCycles +2 is the same drive-via2 gap, confirmed
 pre-existing in every sweep — NOT a regression.
 **Why:** The mount/attach surface is independent of GCR read; the byte-stream needs VIA2.
+
+## ADR-029 — vic-render done: pixel-exact screenshot via custom RGBA gate
+**Context:** VIC pixel framebuffer + session/screenshot. The standard oracle diffs WS
+response values, but a screenshot is a base64 PNG dataUrl — PNG zlib output differs
+between encoders, so a byte-diff spuriously REDs. (dataUrl is in the oracle's volatile
+whitelist → standard compare wouldn't check pixels at all.)
+**Decision (accepted, gate GREEN):** a custom render runner (tools/oracle/corpus/render/
+capture.mjs + png.mjs) boots both daemons to the steady BASIC-ready screen, decodes both
+PNGs to RGBA, compares PIXELS. Independently re-verified: pixel-identical 384×272 (0 of
+104448 differ). render.rs (pure renderer, Colodore palette verbatim) in trx64-core; png
+encode + base64 in trx64-daemon (ADR-002). session/screenshot + runtime/render_screen
+(scale 1/2/4) + vic/inspect wired. Standard text mode is pixel-gated; multicolor/ECM/
+bitmap implemented-but-not-gated, sprites unrendered → `vic-sprites-modes` follow-up.
+**Why:** Pixel parity needs decoded-RGBA comparison, not container bytes — a legitimate
+gate extension. The user-requested screenshot now works, pixel-exact.

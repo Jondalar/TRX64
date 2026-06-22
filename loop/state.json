@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "vic-render",
+  "current_item": "drive-via2",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -17,22 +17,19 @@
     "iec-bus",
     "protocol-surface",
     "snapshot-vsf",
-    "media"
+    "media",
+    "vic-render"
   ],
-  "note": "vic-render [opus]: VIC pixel draw-cycle -> RGBA framebuffer + session/screenshot/render_screen/vic-inspect. Gate on PIXEL parity (decode PNG to RGBA, not PNG-container bytes).",
-  "updated": "2026-06-22T23:35:00Z",
+  "note": "vic-render done — pixel-exact BASIC-ready screenshot (session/screenshot works). Next: drive-via2 [opus] — the high-leverage corner (unblocks driveCycles +2 AND disk program-load AND DRIVECPU vsf at once).",
+  "updated": "2026-06-23T01:55:00Z",
   "followups": [
-    "vic-render (framebuffer+screenshot)",
+    "drive-via2 (KEYSTONE corner: fixes +2 driveCycles + disk-load + DRIVECPU vsf)",
     "daemon-trace-query",
-    "drive-via2 (also fixes driveCycles +2 + disk load + DRIVECPU vsf)",
+    "vic-sprites-modes (sprites + gate multicolor/bitmap/ECM/fine-scroll)",
     "cia-cascade",
     "sid"
   ],
-  "in_flight": {
-    "item": "vic-render",
-    "model": "opus",
-    "started": "2026-06-22T23:35:00Z"
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"

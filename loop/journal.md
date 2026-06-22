@@ -285,3 +285,17 @@ drive-via2; crt → explicit error). Merged. done: 10 items.
 NOTE: drive-via2 is becoming the keystone corner — it unblocks THREE things at once:
 the recurring driveCycles +2, real disk program-load, and the DRIVECPU vsf module.
 Advancing to vic-render [opus] (framebuffer + screenshot, user-requested); drive-via2 after.
+
+## 2026-06-23 — DRIVER: vic-render done — pixel-exact screenshot
+
+Opus builder: VIC pixel draw-cycle → RGBA framebuffer (render.rs, Colodore palette
+verbatim), standard text mode pixel-exact. session/screenshot {dataUrl,width,height} +
+render_screen (scale 1/2/4) + vic/inspect wired. Custom render gate (capture.mjs+png.mjs:
+decode PNG→RGBA, compare pixels — PNG container bytes aren't comparable). Driver INDEPENDENT
+re-verify: re-recorded TS golden, compared TRX64 → pixel-identical 384×272 (0/104448 differ).
+Arch: render.rs pure in core, png crate in daemon (ADR-002). 49 core tests. Regression
+GREEN except pre-existing driveCycles +2. ADR-029. Merged. done: 11 items.
+
+Sprites + multicolor/bitmap/ECM/fine-scroll gating → vic-sprites-modes follow-up.
+Advancing to drive-via2 [opus] — the high-leverage corner (driveCycles +2 + disk-load +
+DRIVECPU vsf, all one subsystem).
