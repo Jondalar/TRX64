@@ -41,6 +41,12 @@ just exit. Set `in_flight {item, started}` right before dispatching a builder; c
 (set null) after the gate completes. This stops a 30-min tick from double-dispatching a
 long builder.
 
+PAST the 35-min window, do NOT blindly re-dispatch — a long opus builder can stay alive
+well past 35 min. First check it is actually DEAD: `git status -s` for uncommitted WIP +
+`stat` the mtime of crates/*.rs. If any crate file was edited in the last few minutes,
+the builder is ALIVE — bump `in_flight.started` to now and DEFER. Only re-dispatch when
+there is no recent edit AND no new commit AND no completion notification.
+
 **EACH ITERATION:**
 1. Read state. Pick the next actionable item per the sequencing rules:
    - Stage 0 SERIAL: `oracle-harness` → `core-substrate` → `cpu-6510`.
