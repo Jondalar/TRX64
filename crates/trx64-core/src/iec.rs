@@ -31,6 +31,9 @@ pub struct IecCore {
     pub drv_bus_8: u8,
     /// Raw drive VIA1 PB output, inverted (= ~ORB-out) — VICE iecbus.drv_data[8].
     pub drv_data_8: u8,
+    /// Effective bus state the DRIVE reads (wired to VIA1 PB inputs) — VICE
+    /// iecbus.drv_port. bit0=DATA_IN, bit2=CLK_IN, bit7=ATN. Power-on 0x85.
+    pub drv_port: u8,
     /// ATN edge-detect latch (VICE iecbus.c iec_old_atn). cpu_bus&0x10 of last write.
     pub iec_old_atn: u8,
 }
@@ -50,6 +53,7 @@ impl IecCore {
             cpu_port: 0xff,
             drv_bus_8: 0xff,
             drv_data_8: 0xff,
+            drv_port: 0x85,
             iec_old_atn: 0x10,
         }
     }
@@ -62,11 +66,20 @@ impl IecCore {
             (((d << 2) & 0x80) | ((d << 2) & 0x40) | ((d << 1) & 0x10)) & 0xff;
     }
 
-    /// `iec_update_ports` (c64iec.c:126-138): AND-fold cpu_bus with every drv_bus.
-    /// Only unit 8 is non-0xff in the baseline, so the fold is cpu_bus & drv_bus_8.
+    /// `iec_update_ports` (c64iec.c:126-138): AND-fold cpu_bus with every drv_bus
+    /// (only unit 8 is non-0xff here), then derive `drv_port` (what the drive's
+    /// VIA1 PB reads):
+    ///   drv_port = ((cpu_port>>4)&0x04)   // CLK line (cpu_port bit6) → PB2 CLK_IN
+    ///            | (cpu_port>>7)           // DATA line (cpu_port bit7) → PB0 DATA_IN
+    ///            | ((cpu_bus<<3)&0x80)     // ATN intent (cpu_bus bit4) → PB7 ATN_IN
+    /// ATN comes from raw cpu_bus (C64-driven only), NOT the post-AND cpu_port.
     #[inline]
     pub fn update_ports(&mut self) {
         self.cpu_port = (self.cpu_bus & self.drv_bus_8) & 0xff;
+        self.drv_port = (((self.cpu_port >> 4) & 0x04)
+            | (self.cpu_port >> 7)
+            | ((self.cpu_bus << 3) & 0x80))
+            & 0xff;
     }
 
     /// `drv_bus[unit]` recomputation for a type-1541 drive (iecbus.c:281-285).

@@ -44,6 +44,23 @@ struct DriveBus<'a> {
     rom: &'a [u8; 0x8000],
     via1: &'a mut Via6522,
     via2: &'a mut Via6522,
+    /// Live IEC bus state at the VIA1 PB inputs (= iecbus.drv_port). Read by a
+    /// `$1800` PB access so the drive's idle loop sees the C64-driven CLK/DATA/ATN.
+    drv_port: u8,
+}
+
+impl<'a> DriveBus<'a> {
+    /// VIA1 PB ($1800) read = via1d1541.c read_prb:
+    ///   tmp  = (drv_port ^ 0x85) | 0x1a | driveid   (unit 8 → driveid 0)
+    ///   byte = (PRB & DDRB) | (tmp & ~DDRB)
+    /// Output bits (DDRB=1) read the ORB latch; input bits (DDRB=0) read the bus.
+    #[inline]
+    fn via1_read_pb(&self) -> u8 {
+        let prb = self.via1.regs[0];
+        let ddrb = self.via1.regs[2];
+        let tmp = ((self.drv_port ^ 0x85) | 0x1a) & 0xff; // driveid 0 for unit 8
+        ((prb & ddrb) | (tmp & !ddrb)) & 0xff
+    }
 }
 
 impl<'a> Bus for DriveBus<'a> {
@@ -53,6 +70,10 @@ impl<'a> Bus for DriveBus<'a> {
             0x0000..=0x7FFF => {
                 // VIA1: $1800-$1BFF (mirror every $400)
                 if (0x1800..=0x1BFF).contains(&addr) {
+                    // PB ($1800, reg 0) carries the IEC input lines.
+                    if (addr & 0x0F) == 0 {
+                        return self.via1_read_pb();
+                    }
                     return self.via1.read(addr);
                 }
                 // VIA2: $1C00-$1FFF
@@ -112,6 +133,11 @@ pub struct Drive1541 {
     /// Absolute drive clock the CPU may run up to (VICE `cpu->stop_clk`). The drive
     /// 6502 executes whole instructions while `cpu.clk < stop_clk`.
     stop_clk: u64,
+    /// Effective IEC bus state the drive reads at its VIA1 PB inputs (= VICE
+    /// iecbus.drv_port: bit0=DATA_IN, bit2=CLK_IN, bit7=ATN). Refreshed by the
+    /// FullBus push-flush before the drive runs, so a `read $1800` reflects the
+    /// live C64-driven IEC lines. Power-on 0x85 (all released).
+    pub iec_drv_port: u8,
     /// Pending 6502 hardware-reset sequence. VICE fires `cpu_reset` (drivecpu.c:165)
     /// from the 6510 core's IK_RESET dispatch on the FIRST execute round, which sets
     /// `clk_ptr = 6` (the ~6-cycle reset sequence the chip consumes before the first
@@ -157,6 +183,7 @@ impl Drive1541 {
             sync_accum: 0,
             stop_clk: 0,
             reset_pending: true,
+            iec_drv_port: 0x85,
         }
     }
 
@@ -199,6 +226,12 @@ impl Drive1541 {
         self.sync_accum = 0;
         self.reset_pending = true;
         self.last_sample_pc = None;
+        self.iec_drv_port = 0x85;
+        // VICE viacore_reset (viacore.c:382-385) clears port data/ddr regs 0..3.
+        // The drive VIA1 PB/DDRB must start at 0 (all inputs, ORB latch 0) so the
+        // IEC read_prb formula sees the right DDRB before the ROM programs $1802.
+        self.via1.regs[0] = 0; // VIA1 ORB ($1800)
+        self.via1.regs[2] = 0; // VIA1 DDRB ($1802)
         // Seed the sync accumulator with the C64 power-on reset cycles the drive's
         // catch-up clock observes in TS (see C64_RESET_DRIVE_OFFSET). This shifts the
         // whole drive_clk schedule into phase with the golden without touching the
@@ -297,6 +330,7 @@ impl Drive1541 {
             rom: &self.rom,
             via1: &mut self.via1,
             via2: &mut self.via2,
+            drv_port: self.iec_drv_port,
         };
         // Run whole instructions while the drive clock is behind the stop target
         // (VICE drivecpu.c:393 — `while (*clk_ptr < stop_clk)`). The reset sequence
@@ -368,6 +402,7 @@ mod tests {
                 rom: &d.rom,
                 via1: &mut d.via1,
                 via2: &mut d.via2,
+                drv_port: 0x85,
             };
             bus.write(0x0010, 0xAB);
             assert_eq!(bus.read(0x0810), 0xAB, "$0810 should mirror $0010");
@@ -378,15 +413,25 @@ mod tests {
     #[test]
     fn drive_bus_via_stub() {
         let mut d = Drive1541::new();
+        d.via1.regs[2] = 0; // VIA1 DDRB = 0 (all inputs), as after cold_reset
         let mut bus = DriveBus {
             ram: &mut d.ram,
             rom: &d.rom,
             via1: &mut d.via1,
             via2: &mut d.via2,
+            drv_port: 0x85,
         };
-        // VIA1 at $1800 — write then read back via register stub
-        bus.write(0x1800, 0x42);
-        assert_eq!(bus.read(0x1800), 0x42);
+        // VIA1 PB ($1800, reg 0) now applies the IEC read_prb formula:
+        //   byte = (PRB & DDRB) | (tmp & ~DDRB), tmp = (drv_port ^ 0x85)|0x1a.
+        // With DDRB=0 (reset) the read returns tmp = (0x85^0x85)|0x1a = 0x1a.
+        bus.write(0x1800, 0x42); // sets ORB latch (no effect with DDRB=0)
+        assert_eq!(bus.read(0x1800), 0x1a, "$1800 PB read = IEC tmp with DDRB=0");
+        // Drive all bits as outputs → read returns the ORB latch verbatim.
+        bus.write(0x1802, 0xff); // DDRB = all outputs
+        assert_eq!(bus.read(0x1800), 0x42, "$1800 PB read = ORB latch when DDRB=$FF");
+        // Other VIA1 registers keep the plain stub.
+        bus.write(0x1801, 0x33);
+        assert_eq!(bus.read(0x1801), 0x33);
         // VIA2 at $1C00
         bus.write(0x1C01, 0x55);
         assert_eq!(bus.read(0x1C01), 0x55);
@@ -402,6 +447,7 @@ mod tests {
             rom: &d.rom,
             via1: &mut d.via1,
             via2: &mut d.via2,
+            drv_port: 0x85,
         };
         assert_eq!(bus.read(0xC010), 0xEA);
     }

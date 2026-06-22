@@ -148,6 +148,9 @@ impl<'a> FullBus<'a> {
     /// each $DD00 read/write instant.
     #[inline]
     fn iec_push_flush(&mut self) {
+        // Feed the drive the current bus state so a `$1800` PB read during its
+        // catch-up run sees the live C64-driven CLK/DATA/ATN lines.
+        self.drive.iec_drv_port = self.iec.drv_port;
         self.drive_c64_ref = self.drive.catch_up_to(self.clk, self.drive_c64_ref);
         let pb_out = self.drive.via1_pb_iec_output();
         self.iec.drive_store_pb(pb_out);
