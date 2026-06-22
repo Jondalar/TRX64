@@ -48,10 +48,17 @@ one-line first-divergence). Driver model: `sonnet`. Verifier model: `haiku`.
       check_ba_before_read (FlatRam unaffected → all CPU gates stay GREEN). 4 VIC
       corpus gates GREEN (iso-vic-probe/-raster/-badline-irq/-sprites), 33 core tests,
       no CPU regression. Pixel draw-cycle out of scope (never reaches trace).
-- [ ] `cia` — todo — `[model: opus]` — CIA1/CIA2 timers A/B, TOD, interrupt flags
-      (timing edges are subtle).
+- [x] `cia` — **done (core)** — `[model: opus]` — cycle-exact CIA1/CIA2 (verbatim VICE
+      MOS6526 port: Ciat 8192-entry transition table) in trx64-core (cia.rs). 4 gates
+      GREEN: timer A one-shot, timer B + continuous TA, TOD (BCD/AM-PM/latch), ICR
+      mask+summary+read-clear. 38 core tests, no CPU/VIC regression. Found+fixed ADR-018
+      (trace always 0x11). Cascade deferred → cia-cascade (ADR-017).
 - [ ] `drive-iec` — todo — `[model: sonnet]` — drive 6510 + VIA x2 + GCR + IEC bus;
       load works. (Escalates to opus if GCR/IEC timing diverges.)
+- [ ] `cia-cascade` — todo — `[model: opus]` — chained timers (TB counts TA underflows)
+      byte-exact. Needs the VICE maincpu alarm scheduler (ta_alarm/tb_alarm + IFR
+      pipeline). Divergence: iso-cia-cascade trace[43] @cycle 89 exp=2 got=3 (ADR-017).
+      Best done alongside `integration` (shared alarm framework). Rebuild the scenario.
 
 ## Stage 2 — serial
 

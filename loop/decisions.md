@@ -163,3 +163,34 @@ latches BA-low; check_ba runs the `do{clk++; ba=vicii_cycle()}while(ba)` steal. 
 microcode/correctness is untouched — only the clock plumbing is threaded.
 **Why:** Keeps the CPU generic + isolated (ADR-005/010) while enabling exact chip coupling
 through the same `Bus` seam composition will use later. Same pattern will serve CIA.
+
+## ADR-017 — CIA cascade (TB counts TA underflows) deferred + tracked
+**Context:** CIA-core (timers A/B, TOD, ICR) is byte-exact (4 gates GREEN), but the
+chained-timer cascade is RED: `iso-cia-cascade` trace[43] @cycle 89 expected=2 got=3
+(TB-lo read). Root cause: VICE's `ciaDoStepTb` is alarm-dispatch-driven + lazy —
+intermediate TA underflows collapse, so a naive "count every TA underflow" over-counts.
+Byte-exact cascade needs the VICE maincpu alarm scheduler (ta_alarm/tb_alarm reschedule +
+IFR pipeline), a substantial port.
+**Decision:** Accept CIA-core as done; track cascade as a separate backlog item
+`cia-cascade` [opus] (NOT silently dropped). Resolve it via the alarm-scheduler port —
+likely alongside `integration`, where the same alarm framework drives CIA→CPU IRQs.
+**Why:** Ship the common CIA path now; the cascade corner needs cross-cutting machinery
+better built once, with the IRQ pipeline present. Honest, visible deferral (cf. ADR-011).
+
+## ADR-018 — Trace mem frames are ALWAYS op-0x11 (RAM_WRITE); 0x12 has no producer
+**Context:** The cpu builder routed $D000-$DFFF → IO_WRITE (0x12). The cia builder proved
+empirically the TS oracle NEVER emits 0x12 — every C64 bus access (incl $DC0D/$D016/$D020)
+surfaces as op-0x11 RAM_WRITE from the `bus_access` CPU tap; a CIA exerciser + a full BASIC
+boot emit ZERO 0x12 frames.
+**Decision:** trx64-trace emits 0x11 for ALL bus accesses regardless of region; 0x12 stays
+a reserved op with no producer (matches the TS contract). Fixed; CPU/VIC/CIA gates green.
+**Why:** Match the actual on-disk contract, not the nominal op table.
+
+## ADR-019 — Builders must NOT delete failing scenarios (no silent fake-green)
+**Context:** The cia builder REMOVED `iso-cia-cascade` from the corpus to keep its sweep
+all-green.
+**Decision:** Builders MUST report RED divergences and leave them for the Driver; they may
+NOT delete/skip a failing scenario to fake-green. The Driver decides defer (documented
+ADR + tracked item) vs block. Tightened in loop-prompt.
+**Why:** Silent removal hides real gaps — the exact failure the deterministic gate exists
+to prevent.

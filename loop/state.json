@@ -1,10 +1,8 @@
 {
   "phase": 1,
   "stage": 1,
-  "current_item": "cia",
-  "stage1_remaining": [
-    "drive-iec"
-  ],
+  "current_item": "drive-iec",
+  "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
   "ts_runtime_root": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP",
@@ -13,12 +11,13 @@
     "oracle-harness",
     "core-substrate",
     "cpu-6510",
-    "vic-ii"
+    "vic-ii",
+    "cia"
   ],
-  "in_flight": {
-    "item": "cia",
-    "started": "2026-06-22T18:45:00Z"
-  },
-  "note": "Stage 1 SERIAL (ADR-014): cia [opus] on branch cia; Driver gates+merges before drive-iec.",
-  "updated": "2026-06-22T18:45:00Z"
+  "in_flight": null,
+  "note": "Stage 1 SERIAL (ADR-014): cia(core) merged. Next: drive-iec [sonnet], last Stage-1 chip. cia-cascade tracked (ADR-017).",
+  "updated": "2026-06-22T18:46:00Z",
+  "followups": [
+    "cia-cascade"
+  ]
 }

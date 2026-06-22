@@ -53,7 +53,9 @@ long builder.
    builder to use `rtk`-prefixed commands (cargo/git/tsc) per CLAUDE.md, but read the
    TS spec RAW (no rtk filtering on spec reads). Builders must NOT edit `loop/` files
    (state/backlog/journal/decisions/loop-prompt) — the Driver owns those; the builder
-   reports back and the Driver records.
+   reports back and the Driver records. Builders may NOT delete/skip a failing oracle
+   scenario to make a sweep green (ADR-019) — they report the RED divergence; the Driver
+   decides defer (documented ADR + tracked item) vs block.
 3. Run the ORACLE: identical WS command-seq against TS-daemon + TRX64; diff WS
    responses + `.c64retrace`; obtain first-divergence (cycle, field, expected-vs-got).
 4. GREEN → commit, mark item `done`, advance.
