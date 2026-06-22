@@ -776,8 +776,26 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         }
 
         "session/screenshot" => {
-            Response::err(id, -32001,
-                "NOT_IMPLEMENTED: session/screenshot requires VIC framebuffer (vic-render future item)")
+            let st = state.lock().unwrap();
+            let (url, w, h) = render_screenshot(&st.session.machine, 1);
+            Response::ok(id, json!({ "dataUrl": url, "width": w, "height": h }))
+        }
+
+        "runtime/render_screen" => {
+            // Pixel-art upscale: scale 1/2/4 nearest-neighbour. Returns the same
+            // {dataUrl,width,height} envelope as session/screenshot.
+            let scale = req
+                .params
+                .get("scale")
+                .and_then(|v| v.as_u64())
+                .map(|s| s as usize)
+                .unwrap_or(1);
+            if !matches!(scale, 1 | 2 | 4) {
+                return Response::err(id, -32602, "runtime/render_screen: scale must be 1, 2, or 4");
+            }
+            let st = state.lock().unwrap();
+            let (url, w, h) = render_screenshot(&st.session.machine, scale);
+            Response::ok(id, json!({ "dataUrl": url, "width": w, "height": h, "scale": scale }))
         }
 
         // CPU-isolated inject + register-set monitor (subset: wr, r, r reg=val).
@@ -1578,11 +1596,61 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             Response::ok(id, status)
         }
 
-        // ── vic/* — NOT_IMPLEMENTED ───────────────────────────────────────────
+        // ── vic/inspect — frozen render descriptor + pixel resolve ────────────
+
+        "vic/inspect" => {
+            let st = state.lock().unwrap();
+            let m = &st.session.machine;
+            let v = |off: u8| m.vic.read_reg(off);
+            let d011 = v(0x11);
+            let d016 = v(0x16);
+            let d018 = v(0x18);
+            let bank_base = m.vic_bank_base() as u64;
+            let mode_bits = ((d011 >> 5) & 3) | (((d016 >> 4) & 1) << 2);
+            let mode_name = match (d011 & 0x40 != 0, d011 & 0x20 != 0, d016 & 0x10 != 0) {
+                (false, false, false) => "text",
+                (false, false, true) => "multicolor-text",
+                (true, false, false) => "ecm",
+                (false, true, false) => "bitmap",
+                (false, true, true) => "multicolor-bitmap",
+                _ => "invalid",
+            };
+            let screen = bank_base + (((d018 >> 4) & 0xf) as u64) << 10;
+            let charset = bank_base + (((d018 >> 1) & 7) as u64) << 11;
+            let bitmap = bank_base + if d018 & 8 != 0 { 0x2000u64 } else { 0 };
+            // Optional pixel resolve (display coords 0..319 × 0..199).
+            let pixel = match (
+                req.params.get("x").and_then(|v| v.as_u64()),
+                req.params.get("y").and_then(|v| v.as_u64()),
+            ) {
+                (Some(x), Some(y)) if x < 320 && y < 200 => {
+                    let (_w, _h, rgba) = m.render_canvas_rgba();
+                    // Display origin in the 384×272 canvas is (32, 35).
+                    let cx = 32 + x as usize;
+                    let cy = 35 + y as usize;
+                    let off = (cy * trx64_core::render::CANVAS_W + cx) * 4;
+                    json!({ "x": x, "y": y, "rgba": [rgba[off], rgba[off+1], rgba[off+2], rgba[off+3]] })
+                }
+                _ => serde_json::Value::Null,
+            };
+            Response::ok(id, json!({
+                "mode": mode_bits,
+                "modeName": mode_name,
+                "bank": bank_base,
+                "screen": screen,
+                "charset": charset,
+                "bitmap": bitmap,
+                "border": (v(0x20) & 0xf) as u64,
+                "background": (v(0x21) & 0xf) as u64,
+                "width": trx64_core::render::CANVAS_W,
+                "height": trx64_core::render::CANVAS_H,
+                "pixel": pixel
+            }))
+        }
 
         m if m.starts_with("vic/") => {
             Response::err(id, -32001,
-                format!("NOT_IMPLEMENTED: {m}: VIC framebuffer not yet available"))
+                format!("NOT_IMPLEMENTED: {m}: not in vic-render scope"))
         }
 
         // ── checkpoint/*, recorder/*, vsf/*, trace/read, debug/memory_access_map ─
@@ -1712,6 +1780,81 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
         i += 4;
     }
     Ok(out)
+}
+
+/// Standard base64 encode (no line wrapping), for the screenshot data URL.
+fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    let mut chunks = data.chunks_exact(3);
+    for c in &mut chunks {
+        let n = (c[0] as u32) << 16 | (c[1] as u32) << 8 | c[2] as u32;
+        out.push(T[(n >> 18) as usize & 0x3f] as char);
+        out.push(T[(n >> 12) as usize & 0x3f] as char);
+        out.push(T[(n >> 6) as usize & 0x3f] as char);
+        out.push(T[n as usize & 0x3f] as char);
+    }
+    let rem = chunks.remainder();
+    match rem.len() {
+        1 => {
+            let n = (rem[0] as u32) << 16;
+            out.push(T[(n >> 18) as usize & 0x3f] as char);
+            out.push(T[(n >> 12) as usize & 0x3f] as char);
+            out.push('=');
+            out.push('=');
+        }
+        2 => {
+            let n = (rem[0] as u32) << 16 | (rem[1] as u32) << 8;
+            out.push(T[(n >> 18) as usize & 0x3f] as char);
+            out.push(T[(n >> 12) as usize & 0x3f] as char);
+            out.push(T[(n >> 6) as usize & 0x3f] as char);
+            out.push('=');
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Encode an RGBA buffer to PNG bytes (8-bit RGBA, no interlace). The exact zlib
+/// bytes differ from Node's encoder, so the render gate compares decoded PIXELS,
+/// never PNG-container bytes.
+fn rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut buf, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("png header");
+        writer.write_image_data(rgba).expect("png data");
+    }
+    buf
+}
+
+/// Render the session's frozen display, scaled by `scale` (1/2/4), to a PNG data
+/// URL. Returns (dataUrl, width, height).
+fn render_screenshot(machine: &trx64_core::Machine, scale: usize) -> (String, u32, u32) {
+    let scale = scale.max(1);
+    let (w, h, rgba) = machine.render_canvas_rgba();
+    let (ow, oh, out) = if scale == 1 {
+        (w, h, rgba)
+    } else {
+        let ow = w * scale;
+        let oh = h * scale;
+        let mut out = vec![0u8; ow * oh * 4];
+        for y in 0..oh {
+            let sy = y / scale;
+            for x in 0..ow {
+                let sx = x / scale;
+                let si = (sy * w + sx) * 4;
+                let di = (y * ow + x) * 4;
+                out[di..di + 4].copy_from_slice(&rgba[si..si + 4]);
+            }
+        }
+        (ow, oh, out)
+    };
+    let png = rgba_to_png(ow as u32, oh as u32, &out);
+    let url = format!("data:image/png;base64,{}", base64_encode(&png));
+    (url, ow as u32, oh as u32)
 }
 
 // ── Connection handler ────────────────────────────────────────────────────────

@@ -1,0 +1,19 @@
+{
+  "name": "render-boot-basic-ready",
+  "slice": "render",
+  "kind": "pixel-parity",
+  "description": "VIC pixel-render parity gate: boot to the deterministic BASIC-ready screen (border light-blue, background blue, '**** COMMODORE 64 BASIC V2 ****' / 'READY.' + cursor), screenshot via the WS session/screenshot method, and PIXEL-diff the decoded RGBA against the TS oracle golden PNG. NOT a PNG-container byte diff (zlib output differs between the Rust `png` crate and Node's encoder, which would spuriously RED) — both PNGs are decoded to raw RGBA and compared pixel-for-pixel.",
+  "bootCycles": 3000000,
+  "canvas": { "width": 384, "height": 272 },
+  "displayWindow": { "x": 32, "y": 35, "width": 320, "height": 200 },
+  "golden": "boot-basic-ready.golden.png",
+  "run": {
+    "record": "node corpus/render/capture.mjs golden",
+    "compare": "node corpus/render/capture.mjs compare"
+  },
+  "steps": [
+    { "method": "session/create", "params": { "pal": true }, "label": "create" },
+    { "method": "session/run", "params": { "session_id": "$sessionId", "cycles": 3000000 }, "label": "boot" },
+    { "method": "session/screenshot", "params": { "session_id": "$sessionId" }, "label": "screenshot" }
+  ]
+}
