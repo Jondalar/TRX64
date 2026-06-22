@@ -1,0 +1,14 @@
+{
+  "name": "iso-cia-tod",
+  "slice": "cia",
+  "trace": true,
+  "steps": [
+    { "method": "session/create", "params": { "pal": true }, "capture": true, "label": "create" },
+    { "method": "monitor/exec", "params": { "session_id": "$sessionId", "command": "wr 0800 78 A9 12 8D 0B DC A9 34 8D 0A DC A9 56 8D 09 DC A9 09 8D 08 DC AD 0B DC 8D 00 02 AD 0A DC 8D 01 02 AD 09 DC 8D 02 02 AD 08 DC 8D 03 02 4C 2D 08" }, "capture": true, "label": "inject" },
+    { "method": "monitor/exec", "params": { "session_id": "$sessionId", "command": "r pc=0800" }, "capture": true, "label": "setpc" },
+    { "method": "trace/start_domains", "params": { "session_id": "$sessionId", "domains": ["c64-cpu", "memory"] }, "capture": true, "label": "trace-start" },
+    { "method": "session/run", "params": { "session_id": "$sessionId", "cycles": 2000 }, "capture": true, "label": "run" },
+    { "method": "trace/run/stop", "params": { "session_id": "$sessionId", "wait_index": true }, "label": "trace-stop" },
+    { "method": "trace/run/status", "params": { "session_id": "$sessionId" }, "capture": true, "label": "trace-status" }
+  ]
+}

@@ -345,33 +345,49 @@ impl Cia {
     /// on each underflow. The cascade (TB counting TA underflows) is handled by
     /// feeding TA underflow count into TB via single_step before TB's own update.
     fn update_ta(&mut self, rclk: u64, tab: &[u16; CIAT_TABLEN]) {
+        // When TB is in cascade mode (counts TA underflows), TA must be advanced
+        // cycle-by-cycle so each TA underflow can inject a single-step into TB at
+        // its exact clock — and this must hold no matter WHICH access drives the TA
+        // update (a $DC04 TA read, an ICR read, a TB read, …), so every TA underflow
+        // cascades. Outside cascade mode TA advances with warp counting (O(1)).
+        if self.tb_cascade() {
+            while self.ta.clk < rclk {
+                let c = self.ta.clk + 1;
+                let n_ta = self.ta.update(c, tab);
+                if n_ta > 0 {
+                    self.irqflags |= CIA_IM_TA;
+                    for _ in 0..n_ta {
+                        self.tb.single_step();
+                        let n_tb = self.tb.update(self.tb.clk + 1, tab);
+                        if n_tb > 0 {
+                            self.irqflags |= CIA_IM_TB;
+                        }
+                    }
+                }
+            }
+            return;
+        }
         let n = self.ta.update(rclk, tab);
         if n > 0 {
             self.irqflags |= CIA_IM_TA;
         }
     }
 
-    fn update_tb(&mut self, rclk: u64, tab: &[u16; CIAT_TABLEN]) {
-        // CRB bit6 set + START ⇒ TB counts TA underflows: bring TA current first,
-        // then single-step TB per TA underflow (VICE cia_update_tb + do_step_tb).
-        if (self.regs[CIA_CRB] & (CIA_CRB_INMODE_TA | CIA_CR_START))
+    /// True when TB is in count-TA-underflow (cascade) mode and running.
+    #[inline]
+    fn tb_cascade(&self) -> bool {
+        (self.regs[CIA_CRB] & (CIA_CRB_INMODE_TA | CIA_CR_START))
             == (CIA_CRB_INMODE_TA | CIA_CR_START)
-        {
-            let n_ta = self.ta.update(rclk, tab);
-            if n_ta > 0 {
-                self.irqflags |= CIA_IM_TA;
-            }
-            for _ in 0..n_ta {
-                self.tb.single_step();
-                let n = self.tb.update(self.tb.clk + 1, tab);
-                if n > 0 {
-                    self.irqflags |= CIA_IM_TB;
-                }
-            }
-            // Keep TB's clk aligned to rclk even when no step occurred.
-            let n = self.tb.update(rclk, tab);
-            if n > 0 {
-                self.irqflags |= CIA_IM_TB;
+    }
+
+    fn update_tb(&mut self, rclk: u64, tab: &[u16; CIAT_TABLEN]) {
+        // In cascade mode TB is driven by TA underflows (handled inside update_ta),
+        // not phi2 — so advancing TA also cascades into TB. We then snap TB's own
+        // clk forward to rclk (no phi2 counting). Outside cascade, TB runs on phi2.
+        if self.tb_cascade() {
+            self.update_ta(rclk, tab);
+            if self.tb.clk < rclk {
+                self.tb.clk = rclk;
             }
             return;
         }
@@ -379,6 +395,14 @@ impl Cia {
         if n > 0 {
             self.irqflags |= CIA_IM_TB;
         }
+    }
+
+    /// Advance both timers to `rclk`. TA underflows cascade into TB automatically
+    /// inside update_ta when cascade mode is active; otherwise the two are
+    /// independent. Idempotent: a timer already at rclk is untouched.
+    fn update_both(&mut self, rclk: u64, tab: &[u16; CIAT_TABLEN]) {
+        self.update_ta(rclk, tab);
+        self.update_tb(rclk, tab);
     }
 
     /// Advance both timers to the current clk (used by the per-cycle tick when no
@@ -419,8 +443,7 @@ impl Cia {
             }
             CIA_TOD_TEN | CIA_TOD_SEC | CIA_TOD_MIN | CIA_TOD_HR => self.tod_read(a),
             CIA_ICR => {
-                self.update_ta(rclk, tab);
-                self.update_tb(rclk, tab);
+                self.update_both(rclk, tab);
                 // ICR read returns the latch (low 5 bits) + summary bit7, then
                 // clears the latch (read-clears). VICE old "slow" 6526:
                 // result = irqflags; irqflags &= CIA_IM_SET (then SET cleared by
@@ -460,13 +483,10 @@ impl Cia {
                 self.tb.set_latch_hi(value);
             }
             CIA_TOD_TEN | CIA_TOD_SEC | CIA_TOD_MIN | CIA_TOD_HR => {
-                // Stage-1 TOD: store as BCD into the register file (alarm vs clock
-                // by CRB bit7 not yet split — the gate exercises the clock set/read).
-                self.regs[a] = value;
+                self.tod_store(a, value);
             }
             CIA_ICR => {
-                self.update_ta(rclk, tab);
-                self.update_tb(rclk, tab);
+                self.update_both(rclk, tab);
                 // Mask set/clear: bit7 set ⇒ OR in (value & 0x7f); else clear those.
                 if value & CIA_IM_SET != 0 {
                     self.regs[CIA_ICR] |= value & 0x1f;
@@ -509,22 +529,42 @@ impl Cia {
         }
     }
 
-    // ── TOD (Stage-1) ──────────────────────────────────────────────────────────
+    // ── TOD (Stage-1: clock set + latched read; CRB-bit7 alarm split + the
+    //    50/60 Hz tick are out of scope for the masked isolation gate) ───────────
+
+    /// VICE todStore (cia-tod.ts): addr-specific BCD masking + AM/PM flip on HR 12,
+    /// + clock stop on HR write / restart on TEN write. CRB-bit7 (alarm-vs-clock)
+    /// is not split here — the gate writes the clock registers.
+    fn tod_store(&mut self, a: usize, byte: u8) {
+        let mut v = byte;
+        if a == CIA_TOD_HR {
+            v &= 0x9f;
+            // Flip AM/PM when writing hour 12 (clock, not alarm).
+            if (v & 0x1f) == 0x12 {
+                v ^= 0x80;
+            }
+        } else if a == CIA_TOD_MIN || a == CIA_TOD_SEC {
+            v &= 0x7f;
+        } else if a == CIA_TOD_TEN {
+            v &= 0x0f;
+        }
+        self.regs[a] = v;
+    }
+
+    /// VICE todRead (cia-tod.ts): the first read while unlatched snapshots all 4
+    /// registers; reading HR latches (subsequent reads return the snapshot),
+    /// reading TEN releases the latch.
     fn tod_read(&mut self, a: usize) -> u8 {
-        // VICE latching: reading HR latches the whole TOD; reading 10ths releases.
-        if a == CIA_TOD_HR && !self.tod_latched {
-            self.tod_latched = true;
+        if !self.tod_latched {
             self.tod_latch.copy_from_slice(&self.regs[CIA_TOD_TEN..=CIA_TOD_HR]);
         }
-        let v = if self.tod_latched {
-            self.tod_latch[a - CIA_TOD_TEN]
-        } else {
-            self.regs[a]
-        };
         if a == CIA_TOD_TEN {
             self.tod_latched = false;
         }
-        v
+        if a == CIA_TOD_HR {
+            self.tod_latched = true;
+        }
+        self.tod_latch[a - CIA_TOD_TEN]
     }
 }
 
@@ -578,5 +618,41 @@ mod tests {
         // Read-clears: a second read returns no TA flag.
         let icr2 = c.read(0xdc0d, 51, &t);
         assert_eq!(icr2 & CIA_IM_TA, 0, "ICR read clears the latch");
+    }
+
+    #[test]
+    fn tod_hr_am_pm_flip_and_latched_read() {
+        let t = tab();
+        let mut c = Cia::new();
+        // Writing hour 12 (BCD $12) flips the AM/PM bit ⇒ stored $92.
+        c.write(0xdc0b, 0x12, 0, &t); // HR
+        c.write(0xdc0a, 0x34, 0, &t); // MIN
+        c.write(0xdc09, 0x56, 0, &t); // SEC
+        c.write(0xdc08, 0x09, 0, &t); // TEN
+        assert_eq!(c.read(0xdc0b, 10, &t), 0x92, "HR 12 sets PM bit");
+        assert_eq!(c.read(0xdc0a, 11, &t), 0x34, "latched MIN");
+        assert_eq!(c.read(0xdc09, 12, &t), 0x56, "latched SEC");
+        assert_eq!(c.read(0xdc08, 13, &t), 0x09, "TEN read releases latch");
+    }
+
+    #[test]
+    fn icr_summary_bit_only_when_source_enabled() {
+        let t = tab();
+        let mut c = Cia::new();
+        // Enable TA in the mask (SET|TA), one-shot TA, force an underflow.
+        c.write(0xdc0d, CIA_IM_SET | CIA_IM_TA, 0, &t);
+        c.write(0xdc04, 0x04, 0, &t);
+        c.write(0xdc05, 0x00, 0, &t);
+        c.write(0xdc0e, CIA_CR_FORCE_LOAD | CIA_CR_RUNMODE_ONE_SHOT | CIA_CR_START, 0, &t);
+        let icr = c.read(0xdc0d, 40, &t);
+        assert_eq!(icr, CIA_IM_SET | CIA_IM_TA, "enabled TA ⇒ flag + summary bit7");
+
+        // Disable TA in the mask; latch the flag again — no summary bit this time.
+        c.write(0xdc0d, CIA_IM_TA, 0, &t); // no SET ⇒ clear enable
+        c.write(0xdc04, 0x04, 0, &t);
+        c.write(0xdc05, 0x00, 0, &t);
+        c.write(0xdc0e, CIA_CR_FORCE_LOAD | CIA_CR_RUNMODE_ONE_SHOT | CIA_CR_START, 0, &t);
+        let icr2 = c.read(0xdc0d, 80, &t);
+        assert_eq!(icr2, CIA_IM_TA, "disabled TA ⇒ flag set, no summary bit7");
     }
 }
