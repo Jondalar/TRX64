@@ -16,3 +16,30 @@ decisions. The loop reads the tail of this for recent context after a reset.
 - Phases hard-separated. Phase 1 = parity drop-in, verified by trace-diff vs TS oracle.
 - Loop is context-stateless / disk-stateful: survives token resets, resume from state.json.
 - Next: build `oracle-harness` (Stage 0, current item). Without it no builder can verify.
+
+## 2026-06-22 — oracle-harness: mechanism proven end-to-end
+
+Built `tools/oracle/` (TS, type:module): ws-client (JSON-RPC 2.0 text frames; binary
+frames ignored — not needed for run+register+trace), diff (first-divergence, volatile-
+key whitelist), scenario format with `$sessionId` threading, trace-decode (byte-exact
+.c64retrace per binary-format.ts v2), oracle CLI (record/compare). Typechecks.
+
+VALIDATED against a live TS daemon (tsx source mode, port 4399, scratch project):
+- WS + sessionId threading: `boot-basic-ready` golden recorded, session/state read
+  (pc=$FD7E a=$AB after 2M-cycle boot). ✓
+- byte-exact trace decode: `boot-trace-short` → 23283 records, cpu+ram families,
+  v2 mem frame (access=$81 write+old-present, old decoded), cycles monotonic. ✓
+- compare engine: fires precise RED with first-divergence + exit 1. ✓
+
+Exact protocol/format facts captured (see this commit's code): launch via
+`tsx src/runtime/headless/daemon/run.ts --project <dir> --port N`; methods
+session/create, session/run{session_id,cycles}, session/state, trace/start_domains
+(returns outputPath=.duckdb; the .c64retrace is the sibling, the product authority),
+trace/run/stop{wait_index:true}. Magic "C64RETR1", header + per-op fixed frames.
+
+OPEN — determinism/isolation (blocks calling oracle-harness done): the daemon has ONE
+long-lived default session; c64Cycles + absolute trace cycles accumulate across runs,
+so goldens aren't reproducible on a reused daemon (compare self-test went RED on
+$.create.c64Cycles). Fix before the gate is trustworthy: hermetic daemon lifecycle
+(spawn fresh TS/TRX64 daemon per scenario on an ephemeral port, teardown after) OR a
+clean cold-reset before each scenario. Decision pending.

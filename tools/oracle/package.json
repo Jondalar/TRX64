@@ -1,0 +1,23 @@
+{
+  "name": "trx64-oracle",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Protocol-level differential test harness: TS runtime (golden) vs TRX64.",
+  "bin": { "trx64-oracle": "src/oracle.ts" },
+  "scripts": {
+    "oracle": "tsx src/oracle.ts",
+    "record": "tsx src/oracle.ts record",
+    "compare": "tsx src/oracle.ts compare",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.12",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

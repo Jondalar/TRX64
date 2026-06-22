@@ -1,0 +1,9 @@
+{
+  "name": "boot-basic-ready",
+  "slice": "cpu",
+  "steps": [
+    { "method": "session/create", "params": { "pal": true }, "capture": true, "label": "create" },
+    { "method": "session/run", "params": { "session_id": "$sessionId", "cycles": 2000000 }, "label": "boot" },
+    { "method": "session/state", "params": { "session_id": "$sessionId" }, "capture": true, "label": "state-after-boot" }
+  ]
+}

@@ -11,6 +11,12 @@ Status: `todo` | `wip` | `done` | `blocked`
 - [ ] `oracle-harness` — **wip** — differential rig (see tools/oracle/README.md):
       replay identical WS command-seq against TS-daemon + TRX64, diff responses +
       traces, emit first-divergence. Curate PRG corpus. THE prerequisite.
+      - [x] WS JSON-RPC client + sessionId threading + record/compare CLI (validated)
+      - [x] byte-exact .c64retrace decoder (validated: 23283 records, v2 mem frames)
+      - [x] first-divergence diff engine, responses + traces (validated, fires RED)
+      - [ ] **scenario isolation** — hermetic fresh daemon per run (or cold-reset) so
+            c64Cycles / absolute trace cycles are reproducible. Blocks `done`.
+      - [ ] grow corpus slices (cpu/vic/cia/drive/full) beyond the two boot smoke tests
 - [ ] `core-substrate` — todo — Machine struct, bus, PLA/$00-$01 mapping, ROM load,
       daemon shell binds 4312 and answers `ping` identically.
 - [ ] `cpu-6510` — todo — microcode, all legal + illegal opcodes, IRQ/NMI timing.
