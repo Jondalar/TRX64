@@ -213,3 +213,19 @@ Done so far: oracle-harness, core-substrate, cpu-6510, vic-ii, cia, drive-iec.
 Advancing to STAGE 2: protocol-surface [sonnet] → snapshot-vsf [sonnet] → integration
 [opus]. Tracked gaps for integration: cia-cascade (ADR-017), reset P-flag (ADR-011),
 boot-path full-session parity, deeper VIA/GCR + IEC handshaking.
+
+## 2026-06-22 — DRIVER: integration KEYSTONE landed (FullBus + full boot byte-exact)
+
+Opus integration builder assembled FullBus (full.rs): PLA $00/$01 banking, full routing,
+per-cycle VIC+CIA, cross-chip IRQ pipeline (CIA1∨VIC→IRQ, CIA2→NMI; 2-cyc delay + 7-cyc
+DO_INTERRUPT). Confirmation gate INDEPENDENT: full regression GREEN (iso cpu/vic/cia +
+drive-boot-idle), NO regression. boot-basic-ready CPU/VIC/vectors/SID byte-exact after 2M
+cycles (flags=$27 → IRQ-driven KERNAL ran); ADR-011 RESOLVED (reset P=$20); boot-trace-
+short byte-exact through trace[78]. ADR-022 recorded.
+
+ONLY remaining boot divergence (ADR-023): C64↔1541 IEC wiring — boot-trace-short trace[79]
+LDA $DD00 exp 64→71 got 7; driveCycles +2. $DD00 bits 6/7 (IEC CLK/DATA from drive) not
+connected. Carved out as `iec-bus` [opus]. Merged integration → main (ff), deleted branch.
+
+Phase 1 core is essentially complete — the machine boots correctly. Remaining: iec-bus,
+then integration-deep (full boot trace + cia-cascade), protocol-surface, snapshot-vsf.

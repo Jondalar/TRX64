@@ -82,7 +82,7 @@ vic/cia integration) by implementing `Bus`, without touching the CPU.
 **Why:** Clean separation; lets the CPU be gate-isolated now and composed into the full
 machine later; supports Phase-2 COW forks (the bus is swappable per instance).
 
-## ADR-011 — Reset P-flag divergence is deferred to integration (open)
+## ADR-011 — Reset P-flag divergence — RESOLVED (integration)
 **Context:** cpu-6510 isolated cold-reset sets I (P=$24); the full-KERNAL-boot trace
 shows P=$20 at the first traced instruction (`boot-trace-short` trace[0].p 32 vs 36).
 **Decision:** NOT a CPU defect (isolated gates are byte-exact). Leave it open; resolve
@@ -220,3 +220,28 @@ Integration assembles the full machine and is where the deferred gaps converge: 
 (boot-basic-ready, boot-trace-short), and deeper VIA/GCR + IEC handshaking.
 **Why:** protocol-surface + snapshot are thin polish ON the assembled machine; building
 them first would stub against a machine that can't boot. Integration is the keystone.
+
+## ADR-022 — FullBus assembled; full-C64 boot byte-exact to BASIC ready
+**Context:** integration's keystone — compose the isolated chips into a real C64.
+**Decision (blessed, gates GREEN + no regression):** `full.rs` `FullBus` = 32-entry PLA
+memconfig on $00/$01, RAM/BASIC/IO|CHARGEN/KERNAL routing, ROMs in separate arrays (RAM
+under ROM keeps DRAM fill for trace `old`), VIC+CIA per-cycle tick, cross-chip IRQ
+(CIA1∨VIC→IRQ, CIA2→NMI) via a faithful VICE interrupt pipeline (2-cycle delay counters,
+7-cycle DO_INTERRUPT). New `Bus::take_side_effect_writes` hook (default no-op → isolated
+gates untouched) models the CIA2 PA→$DD00 re-push. Daemon routes full-boot sessions to
+`run_for_full`; iso scenarios still inject → their FlatRam/CiaBus/VicBus paths stay
+byte-identical. RESULT: boot-basic-ready CPU/VIC/vectors/SID byte-exact after 2M cycles
+(flags=$27 proves the IRQ-driven KERNAL path ran); ADR-011 RESOLVED (reset P=$20);
+boot-trace-short byte-exact through trace[78].
+**Why:** The machine now boots correctly — Phase 1's core is essentially complete.
+
+## ADR-023 — Remaining boot divergence = C64↔1541 IEC bus wiring (own item)
+**Context:** The ONLY remaining boot divergence: boot-trace-short trace[79] LDA $DD00
+exp 64→71 got 7, and boot-basic-ready driveCycles +2 — both are $DD00 bits 6/7 (IEC
+CLK/DATA driven by the drive), not yet connected.
+**Decision:** Carve out `iec-bus` [opus]: wire C64 CIA2 PA $DD00 ↔ 1541 VIA1 IEC pins —
+wired-AND line folding (ATN/CLK/DATA), ATN-ACK, push-flush drive catch-up on $DD00
+read/write. This unblocks deep boot-trace parity + driveCycles. integration resumes after
+(deep boot-trace-short, then ADR-017 cia-cascade). cia-cascade was not reached (IEC gap
+blocks the trace first).
+**Why:** A substantial stateful subsystem deserving its own gated item, not a half-build.

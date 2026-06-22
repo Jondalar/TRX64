@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": 2,
-  "current_item": "integration",
+  "current_item": "iec-bus",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -15,19 +15,19 @@
     "cia",
     "drive-iec"
   ],
-  "note": "Stage 2 REORDERED (ADR-021): integration [opus] FIRST = assemble full machine bus + boot + resolve deferred gaps. Then protocol-surface, snapshot-vsf.",
-  "updated": "2026-06-22T20:45:00Z",
+  "note": "KEYSTONE landed: FullBus assembled, full C64 boots byte-exact to BASIC ready (CPU/VIC/vectors/SID), ADR-011 resolved, boot-trace byte-exact through trace[78]. Next: iec-bus [opus] (C64<->1541 IEC wiring, the ONLY remaining boot divergence). Then integration-deep (boot-trace full + cia-cascade), protocol-surface, snapshot-vsf.",
+  "updated": "2026-06-22T21:14:00Z",
   "followups": [
     "cia-cascade"
   ],
-  "in_flight": {
-    "item": "integration",
-    "model": "opus",
-    "started": "2026-06-22T20:45:00Z"
-  },
+  "in_flight": null,
   "stage2_items": [
-    "integration",
+    "iec-bus",
+    "integration-deep",
     "protocol-surface",
     "snapshot-vsf"
+  ],
+  "resolved": [
+    "ADR-011 reset-P-flag"
   ]
 }
