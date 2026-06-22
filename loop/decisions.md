@@ -64,3 +64,28 @@ integration is green. Existing tools stay frozen.
 **Decision:** All loop state lives on disk (state.json, backlog.md, journal.md, THIS
 file) + git. Each tick assumes fresh context. Being killed mid-work is normal.
 **Why:** Survives token resets and session restarts; resume = read disk.
+
+## ADR-009 — Builders work on a per-item branch; Driver merges after gate
+**Context:** The cpu-6510 builder committed on a `cpu-6510` branch (8 commits) rather
+than main.
+**Decision:** Adopt this for ALL items (not just Stage-1 worktrees): each builder works
+on a per-item branch `<item>`; the Driver runs the confirmation gate + architecture-fit
+check, then fast-forward/merges to `main` and deletes the branch. main stays green.
+**Why:** Atomic accept; the gate guards what reaches main; clean Stage-1 parallelism.
+
+## ADR-010 — The CPU is generic over a `Bus` trait
+**Context:** The cpu-6510 builder made the 6510 generic over a `Bus` trait (it ran on a
+flat-64K-RAM bus for the CPU-isolated gate).
+**Decision:** Bless it. The 6510 stays decoupled from the memory map via `Bus`. Flat RAM
+now; the full PLA/banked/$00-$01 + I/O bus is supplied later (core-substrate growth +
+vic/cia integration) by implementing `Bus`, without touching the CPU.
+**Why:** Clean separation; lets the CPU be gate-isolated now and composed into the full
+machine later; supports Phase-2 COW forks (the bus is swappable per instance).
+
+## ADR-011 — Reset P-flag divergence is deferred to integration (open)
+**Context:** cpu-6510 isolated cold-reset sets I (P=$24); the full-KERNAL-boot trace
+shows P=$20 at the first traced instruction (`boot-trace-short` trace[0].p 32 vs 36).
+**Decision:** NOT a CPU defect (isolated gates are byte-exact). Leave it open; resolve
+when the boot path + CIA/VIC are assembled (the `integration` item), where the real
+reset-sequence + first-instruction-trace timing is reproduced.
+**Why:** Can't reconcile boot-reset timing before the chips that drive it exist.

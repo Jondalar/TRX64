@@ -28,9 +28,13 @@ one-line first-divergence). Driver model: `sonnet`. Verifier model: `haiku`.
       tokio-tungstenite) binds --port, WS JSON-RPC 2.0, answers ping + session/create +
       session/run(stub) + session/state. GATE GREEN: compare-vs-trx64 → create matched,
       RED only on $.state-after-boot.c64Cycles (execution = cpu-6510's job). Built sonnet.
-- [ ] `cpu-6510` — todo — `[model: opus]` — microcode, all legal + illegal opcodes,
-      IRQ/NMI timing. Gate: diff-clean on CPU corpus (boot trace is already a strong
-      slice; add illegal-opcode exercisers). **Unblocks Stage 1.**
+- [x] `cpu-6510` — **done** — `[model: opus]` — cycle-exact 6510 in trx64-core (generic
+      over `Bus` trait): all legal + illegal opcodes, BCD, RMW dummy-writes, branch/page
+      timing, addressing modes, JAM. CPU-ISOLATED gate via monitor/exec inject+run (SEI,
+      flat RAM). 8 oracle gates GREEN; confirmation re-run GREEN on iso-trace-broad (1083
+      records byte-identical), iso-loads-alu, iso-trace-bcd-illegal. Arch-fit verified
+      (core pure/sync, Observer generic). Open: reset P-flag at boot → ADR-011 (integration).
+      **Stage 1 unblocked.**
 
 ## Stage 1 — parallel (worktree-isolated, on the stable CPU clock)
 

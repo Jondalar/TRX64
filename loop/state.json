@@ -1,12 +1,14 @@
 {
   "phase": 1,
-  "stage": 0,
-  "current_item": "cpu-6510",
+  "stage": 1,
+  "current_item": null,
+  "stage1_items": ["vic-ii", "cia", "drive-iec"],
   "retry_count": 0,
   "max_retries": 4,
   "ts_runtime_root": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP",
   "ts_spec_root": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/src/runtime",
-  "done": ["oracle-harness", "core-substrate"],
-  "in_flight": { "item": "cpu-6510", "started": "2026-06-22T16:48:46Z" },
-  "updated": "2026-06-22T16:48:46Z"
+  "done": ["oracle-harness", "core-substrate", "cpu-6510"],
+  "in_flight": null,
+  "note": "Stage 1 is parallel: next tick dispatches vic-ii|cia|drive-iec in worktrees (ADR-009 per-item branch), sets in_flight to the set.",
+  "updated": "2026-06-22T17:18:00Z"
 }

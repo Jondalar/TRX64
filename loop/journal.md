@@ -82,3 +82,29 @@ builder -> build -> daemon answers -> gate -> precise RED.
 
 core-substrate meets its DoD. Advancing to cpu-6510 [opus]. Pre-flight complete; arming
 the cron (30-min interval) next.
+
+## 2026-06-22 — cpu-6510 DONE (opus builder, ~30 min)
+
+Cycle-exact 6510 in trx64-core, generic over a new `Bus` trait. ALL opcode groups
+byte-exact vs TS oracle: loads/stores/transfers, ALU incl BCD carry/borrow edges, RMW
+(dummy-write-old), branches (taken/page-cross/not-taken timing), stack/flow, all
+addressing modes incl page-cross, illegals (SLO/RLA/SRE/RRA/DCP/ISB/LAX/SAX/ANC/ALR/ARR/
+AXS/SBC-imm/NOP-variants/JAM). 18 unit tests + 8 oracle gates green.
+
+Isolation (ADR-005): inject+run both daemons identically over WS — session/create →
+monitor/exec "wr <addr> <bytes>" → monitor/exec "r pc=" → session/run {cycles}. Flat 64K
+RAM bus, no VIC/CIA/banking, IRQ structure inert. Empirical find: VICE power-on DRAM fill
+= 64-byte alternating blocks (addr & 0x40 ? 0xFF : 0x00). CpuStep p = raw reg_p (N/Z in
+caches), not composite flags().
+
+DRIVER confirmation: re-ran the gate independently — GREEN on iso-trace-broad (1083
+records byte-identical), iso-loads-alu, iso-trace-bcd-illegal. Arch-fit verified: CPU in
+trx64-core (1816 LOC), no async/rand/SystemTime, Observer stays generic, daemon only
+wires monitor/exec. Recorded ADR-009 (per-item branch + Driver merge), ADR-010 (Bus
+trait), ADR-011 (reset P-flag deferred to integration). Merged cpu-6510 → main (ff).
+
+OPEN (ADR-011): boot-trace-short RED trace[0].p 32 vs 36 — reset P-flag $20 vs $24,
+full-boot-path only, resolve at integration. NOT a CPU defect.
+
+Advancing to STAGE 1 (parallel): vic-ii [opus] ∥ cia [opus] ∥ drive-iec [sonnet],
+worktree-isolated. Next tick dispatches the set.
