@@ -1,0 +1,10 @@
+{
+  "name": "iso-loads-alu",
+  "slice": "cpu",
+  "steps": [
+    { "method": "session/create", "params": { "pal": true }, "capture": true, "label": "create" },
+    { "method": "monitor/exec", "params": { "session_id": "$sessionId", "command": "wr 0800 78 A2 00 A9 41 9D 00 04 E8 E0 10 D0 F6 4C 0D 08" }, "capture": true, "label": "inject" },
+    { "method": "monitor/exec", "params": { "session_id": "$sessionId", "command": "r pc=0800" }, "capture": true, "label": "setpc" },
+    { "method": "session/run", "params": { "session_id": "$sessionId", "cycles": 2000 }, "capture": true, "label": "run" }
+  ]
+}

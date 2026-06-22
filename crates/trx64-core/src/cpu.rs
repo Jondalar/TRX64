@@ -125,34 +125,38 @@ impl Cpu6510 {
     #[inline]
     fn load_fetch<B: Bus, O: Observer>(&mut self, bus: &mut B, obs: &mut O, addr: u16) -> u8 {
         let v = self.load(bus, obs, addr);
-        obs.on_bus(BusKind::Fetch, addr, v);
+        obs.on_bus(BusKind::Fetch, addr, v, self.reg_pc, self.clk, 0);
         v
     }
 
     #[inline]
     fn load_read<B: Bus, O: Observer>(&mut self, bus: &mut B, obs: &mut O, addr: u16) -> u8 {
         let v = self.load(bus, obs, addr);
-        obs.on_bus(BusKind::Read, addr, v);
+        obs.on_bus(BusKind::Read, addr, v, self.reg_pc, self.clk, 0);
         v
     }
 
     #[inline]
     fn load_dummy<B: Bus, O: Observer>(&mut self, bus: &mut B, obs: &mut O, addr: u16) -> u8 {
         let v = self.load(bus, obs, addr);
-        obs.on_bus(BusKind::DummyRead, addr, v);
+        obs.on_bus(BusKind::DummyRead, addr, v, self.reg_pc, self.clk, 0);
         v
     }
 
     #[inline]
     fn store<B: Bus, O: Observer>(&mut self, bus: &mut B, obs: &mut O, addr: u16, value: u8) {
+        // Pre-read the old value (side-effect-free on flat RAM) so the trace can
+        // record the mutation surface (= TS store() captures oldValue before write).
+        let old = bus.read(addr);
         bus.write(addr, value);
-        obs.on_bus(BusKind::Write, addr, value);
+        obs.on_bus(BusKind::Write, addr, value, self.reg_pc, self.clk, old);
     }
 
     #[inline]
     fn store_dummy<B: Bus, O: Observer>(&mut self, bus: &mut B, obs: &mut O, addr: u16, value: u8) {
+        let old = bus.read(addr);
         bus.write(addr, value);
-        obs.on_bus(BusKind::DummyWrite, addr, value);
+        obs.on_bus(BusKind::DummyWrite, addr, value, self.reg_pc, self.clk, old);
     }
 
     fn push_byte<B: Bus, O: Observer>(&mut self, bus: &mut B, obs: &mut O, v: u8) {

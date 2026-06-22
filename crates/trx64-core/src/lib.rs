@@ -38,7 +38,10 @@ pub trait Observer {
         p: u8,
         clk: u64,
     );
-    fn on_bus(&mut self, kind: BusKind, addr: u16, value: u8);
+    /// Fired on every bus access. `pc` = live CPU reg_pc at the access; `clk` =
+    /// CPU master clock at the access (= TS `BusEvent.cycle`). `old` = pre-write
+    /// byte at `addr` for WRITE events (Spec 753 mutation surface), else 0.
+    fn on_bus(&mut self, kind: BusKind, addr: u16, value: u8, pc: u16, clk: u64, old: u8);
     fn on_interrupt(&mut self, vector: u16, clk: u64);
 }
 
@@ -71,7 +74,7 @@ impl Observer for NullSink {
     ) {
     }
     #[inline(always)]
-    fn on_bus(&mut self, _: BusKind, _: u16, _: u8) {}
+    fn on_bus(&mut self, _: BusKind, _: u16, _: u8, _: u16, _: u64, _: u8) {}
     #[inline(always)]
     fn on_interrupt(&mut self, _: u16, _: u64) {}
 }
@@ -232,6 +235,19 @@ impl Machine {
     pub fn set_pc(&mut self, pc: u16) {
         self.cpu6510.reg_pc = pc;
         self.cpu.pc = pc;
+    }
+
+    /// Refresh the legacy `cpu`/`clk` snapshot after monitor register edits.
+    pub fn sync_after_monitor(&mut self) {
+        self.sync_snapshot();
+    }
+
+    /// Run a cycle budget against an arbitrary observer (= TS session/run with a
+    /// tracing sink). Instruction-stepped, identical budget semantics to
+    /// `run_for`. Returns the post-run cycle count.
+    pub fn run_for_with<O: Observer>(&mut self, budget: u64, obs: &mut O) -> u64 {
+        self.run_for(budget, obs);
+        self.clk
     }
 
     /// Load all three standard C64 ROMs from `rom_dir` and perform a cold reset.

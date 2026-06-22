@@ -11,6 +11,25 @@ pub struct Session {
     pub machine: Machine,
     /// Sessions boot PAUSED — no autonomous tick loop (idle-safe, Spec 744.3).
     pub running: bool,
+    /// Active trace: sibling `.c64retrace` path + accumulated meta. When set,
+    /// session/run streams CpuStep/RAM_WRITE/IO_WRITE frames into a FrameSink and
+    /// flushes to this path. `None` = no trace.
+    pub trace: Option<TraceState>,
+}
+
+/// Trace bookkeeping for an active `.c64retrace` capture.
+pub struct TraceState {
+    /// Absolute `.c64retrace` path (sibling of the `.duckdb` outputPath).
+    pub retrace_path: std::path::PathBuf,
+    /// JSON meta string embedded in the file header.
+    pub meta_json: String,
+    /// Cycle at which the trace started (= TS cycleStart).
+    pub cycle_start: u64,
+    /// Accumulated frame buffer (header + events), flushed at trace/run/stop.
+    pub buf: Vec<u8>,
+    /// runId for status replies.
+    pub run_id: String,
+    pub event_count: u64,
 }
 
 impl Session {
@@ -19,6 +38,7 @@ impl Session {
             id: id.into(),
             machine: Machine::new(),
             running: false,
+            trace: None,
         }
     }
 

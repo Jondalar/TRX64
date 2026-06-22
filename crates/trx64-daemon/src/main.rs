@@ -23,7 +23,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
-use trx64_session::Session;
+use trx64_core::NullSink;
+use trx64_session::{Session, TraceState};
+use trx64_trace::{FrameSink, TracingObserver};
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -100,6 +102,146 @@ fn rom_dir() -> PathBuf {
     PathBuf::from(root).join("resources").join("roms")
 }
 
+// ── CPU-isolated run + monitor + trace helpers ────────────────────────────────
+
+/// Default sibling `.duckdb` output path under a temp runtime dir.
+fn default_trace_output(session_id: &str) -> PathBuf {
+    std::env::temp_dir()
+        .join("trx64-runtime")
+        .join(session_id)
+        .join("live.duckdb")
+}
+
+/// Run a cycle budget (= TS session/run). Instruction-stepped: execute whole
+/// instructions until `clk - start >= budget`. Streams trace frames if active.
+fn run_cycle_budget(session: &mut Session, budget: u64) {
+    if let Some(tstate) = session.trace.as_mut() {
+        // First run after start: write the file header into the buffer.
+        if tstate.buf.is_empty() {
+            tstate.buf = FrameSink::with_header(&tstate.meta_json).buf;
+        }
+        // Accumulate events from this run, then append to the persistent buffer.
+        let mut obs = TracingObserver::new(FrameSink::events_only());
+        session.machine.run_for_with(budget, &mut obs);
+        tstate.event_count += obs.event_count;
+        tstate.buf.extend_from_slice(&obs.into_buf());
+    } else {
+        let mut obs = NullSink;
+        session.machine.run_for(budget, &mut obs);
+    }
+}
+
+/// Minimal VICE-style monitor: supports `wr [lens] <addr> <bytes..>`, `r`,
+/// `r reg=val ...`. Enough to inject a program + set PC, CPU-isolated.
+fn run_monitor(session: &mut Session, command: &str) -> Result<String, String> {
+    let toks: Vec<&str> = command.split_whitespace().collect();
+    if toks.is_empty() {
+        return Ok(String::new());
+    }
+    let op = toks[0].to_ascii_lowercase();
+    match op.as_str() {
+        "wr" => {
+            // wr [lens] <addr> <byte..>  (lens optional; we accept & ignore it)
+            let mut i = 1;
+            if matches!(toks.get(i), Some(&("cpu" | "ram" | "io"))) {
+                i += 1;
+            }
+            let addr = parse_hex(toks.get(i).copied().ok_or("wr: missing addr")?)
+                .ok_or("wr: bad addr")? as u16;
+            i += 1;
+            let bytes: Result<Vec<u8>, String> = toks[i..]
+                .iter()
+                .map(|t| parse_hex(t).map(|v| v as u8).ok_or_else(|| format!("wr: bad byte {t}")))
+                .collect();
+            let bytes = bytes?;
+            if bytes.is_empty() {
+                return Err("wr: need >=1 byte value ($00-$FF)".into());
+            }
+            session.machine.poke(addr, &bytes);
+            Ok(format!("wrote {} byte(s) @ ${:04X} (cpu)", bytes.len(), addr))
+        }
+        "r" | "registers" => {
+            let sets: Vec<&str> = toks[1..].iter().copied().filter(|t| t.contains('=')).collect();
+            if !sets.is_empty() {
+                let mut done = Vec::new();
+                for pair in sets {
+                    let mut it = pair.splitn(2, '=');
+                    let reg = it.next().unwrap_or("").to_ascii_lowercase();
+                    let val_s = it.next().unwrap_or("");
+                    let v = match parse_hex(val_s) {
+                        Some(v) => v,
+                        None => {
+                            done.push(format!("bad {pair}"));
+                            continue;
+                        }
+                    };
+                    let c = &mut session.machine.cpu6510;
+                    match reg.as_str() {
+                        "a" | "ac" => { c.reg_a = v as u8; done.push(format!("a=${:02X}", v as u8)); }
+                        "x" | "xr" => { c.reg_x = v as u8; done.push(format!("x=${:02X}", v as u8)); }
+                        "y" | "yr" => { c.reg_y = v as u8; done.push(format!("y=${:02X}", v as u8)); }
+                        "sp" => { c.reg_sp = v as u8; done.push(format!("sp=${:02X}", v as u8)); }
+                        "pc" => { c.reg_pc = v as u16; done.push(format!("pc=${:04X}", v as u16)); }
+                        "p" | "fl" | "flags" => {
+                            // set_flags is private; emulate via PLP-style decompose.
+                            c.reg_p = (v as u8) & !0xa2; // clear N,Z from reg_p
+                            c.flag_n = (v as u8) & 0x80;
+                            c.flag_z = if (v as u8) & 0x02 != 0 { 0 } else { 1 };
+                            done.push(format!("fl=${:02X}", v as u8));
+                        }
+                        _ => done.push(format!("unknown reg '{reg}'")),
+                    }
+                }
+                // Keep the legacy snapshot in sync for session/state readers.
+                session.machine.sync_after_monitor();
+                Ok(format!("set {}", done.join(" ")))
+            } else {
+                let c = &session.machine.cpu6510;
+                Ok(format!(
+                    "  ADDR AC XR YR SP NV-BDIZC\n.;{:04X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                    c.reg_pc, c.reg_a, c.reg_x, c.reg_y, c.reg_sp, c.flags()
+                ))
+            }
+        }
+        _ => Err(format!("monitor: unsupported command '{op}'")),
+    }
+}
+
+/// Parse a hex token (optional leading `$`).
+fn parse_hex(tok: &str) -> Option<u32> {
+    let t = tok.strip_prefix('$').unwrap_or(tok);
+    u32::from_str_radix(t, 16).ok()
+}
+
+/// Flush the active trace to its `.c64retrace` path; returns (run, status) JSON.
+fn finalize_trace(session: &mut Session) -> (Value, Value) {
+    match session.trace.take() {
+        None => (Value::Null, json!({ "active": false })),
+        Some(t) => {
+            // If no run happened (empty buf), still write a header-only file.
+            let bytes = if t.buf.is_empty() {
+                FrameSink::with_header(&t.meta_json).buf
+            } else {
+                t.buf
+            };
+            if let Some(parent) = t.retrace_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let bytes_written = bytes.len();
+            let _ = std::fs::write(&t.retrace_path, &bytes);
+            (
+                json!({
+                    "runId": t.run_id,
+                    "definitionId": "live-capture",
+                    "eventCount": t.event_count,
+                    "bytesWritten": bytes_written,
+                }),
+                json!({ "active": false, "binary": true }),
+            )
+        }
+    }
+}
+
 // ── RPC method dispatch ───────────────────────────────────────────────────────
 
 fn dispatch(req: Request, state: &SharedState) -> Response {
@@ -126,9 +268,15 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         }
 
         "session/run" => {
-            // STUB: do not emulate; machine state is unchanged.
-            // Real execution is the cpu-6510 loop item.
-            Response::ok(id, json!({ "state": null }))
+            let mut st = state.lock().unwrap();
+            let cycles = req
+                .params
+                .get("cycles")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(19705);
+            run_cycle_budget(&mut st.session, cycles);
+            // TS normal-completion result = { c64Cycles } only.
+            Response::ok(id, json!({ "c64Cycles": st.session.machine.clk }))
         }
 
         "session/state" => {
@@ -150,6 +298,97 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                     "cycles": cpu.cycles
                 }
             }))
+        }
+
+        // CPU-isolated inject + register-set monitor (subset: wr, r, r reg=val).
+        "monitor/exec" => {
+            let mut st = state.lock().unwrap();
+            let cmd = req
+                .params
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            match run_monitor(&mut st.session, &cmd) {
+                Ok(out) => Response::ok(id, json!({ "output": out })),
+                Err(e) => Response::ok(id, json!({ "error": e })),
+            }
+        }
+
+        // Start a CPU/memory trace; returns outputPath (.duckdb). The product
+        // authority is the sibling .c64retrace, written at trace/run/stop.
+        "trace/start_domains" => {
+            let mut st = state.lock().unwrap();
+            let output = req
+                .params
+                .get("output")
+                .and_then(|v| v.as_str())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| default_trace_output(&st.session.id));
+            let retrace = output.with_extension("c64retrace");
+            let cycle_start = st.session.machine.clk;
+            let run_id = format!("run_live-capture_{}", cycle_start);
+            let domains: Vec<String> = req
+                .params
+                .get("domains")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|d| d.as_str().map(String::from)).collect())
+                .unwrap_or_else(|| vec!["c64-cpu".into(), "memory".into()]);
+            // Meta JSON embedded in the .c64retrace header. The oracle does not
+            // diff header meta (volatile), so only the shape must be sane.
+            let meta_json = serde_json::to_string(&json!({
+                "runId": run_id,
+                "defId": "live-capture",
+                "defVersion": 1,
+                "defName": "live-capture",
+                "defJson": "",
+                "domains": domains,
+                "cycleStart": cycle_start,
+                "createdAt": "",
+            }))
+            .unwrap_or_default();
+            st.session.trace = Some(TraceState {
+                retrace_path: retrace,
+                meta_json,
+                cycle_start,
+                buf: Vec::new(),
+                run_id: run_id.clone(),
+                event_count: 0,
+            });
+            Response::ok(id, json!({
+                "run": {
+                    "runId": run_id,
+                    "definitionId": "live-capture",
+                    "definitionVersion": 1,
+                    "cycleStart": cycle_start,
+                    "marks": [],
+                    "eventCount": 0,
+                    "bytesWritten": 0
+                },
+                "outputPath": output.to_string_lossy(),
+                "domains": domains
+            }))
+        }
+
+        "trace/run/stop" => {
+            let mut st = state.lock().unwrap();
+            let status = finalize_trace(&mut st.session);
+            Response::ok(id, json!({ "run": status.0, "status": status.1 }))
+        }
+
+        "trace/run/status" => {
+            let st = state.lock().unwrap();
+            let status = match &st.session.trace {
+                Some(t) => json!({
+                    "active": true,
+                    "runId": t.run_id,
+                    "eventCount": t.event_count,
+                    "binary": true,
+                    "retracePath": t.retrace_path.to_string_lossy(),
+                }),
+                None => json!({ "active": false }),
+            };
+            Response::ok(id, status)
         }
 
         other => {

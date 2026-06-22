@@ -1,13 +1,21 @@
 //! trx64-trace — binary TraceOp encoder.
 //!
-//! Writes `.c64retrace` frames byte-identical to the TS `binary-log-writer`
-//! (the immovable trace format = the conformance oracle). Implements
-//! [`trx64_core::Observer`], so the core stays agnostic to the sink format.
+//! Writes `.c64retrace` frames byte-identical to the TS `binary-format.ts` /
+//! `binary-log-writer.ts` (the immovable trace format = the conformance oracle).
+//! Implements [`trx64_core::Observer`], so the core stays agnostic to the sink.
+//!
+//! On-disk layout (little-endian), authoritative per binary-format.ts:
+//!   FileHeader := MAGIC(8) version(u16) flags(u16) metaLen(u32) metaJson(metaLen)
+//!   CPU_STEP (0x10): op(1) cycle(f64) pc(u16) opcode(u8) a x y sp p b1 b2   = 19 bytes
+//!   RAM/IO_WRITE (0x11/0x12): op(1) cycle(f64) addr(u16) value(u8) pc(u16)
+//!       access(u8, bit0=r/w, bit7=hasOld) oldValue(u8)                      = 16 bytes
+//!
+//! access/oldValue (Spec 753): WRITE records carry the pre-write value for RAM
+//! (addr in $0002..$D000); reads and I/O-window writes omit it (hasOld=0).
 
 use trx64_core::{BusKind, Observer};
 
-/// TraceOp opcodes — MUST match TS `binary-format.ts` SIZE table (the contract).
-/// Frame layout is little-endian, fixed payload per op (10–18 bytes).
+/// TraceOp opcodes — MUST match TS `binary-format.ts` (the contract).
 #[repr(u8)]
 #[derive(Clone, Copy, Debug)]
 pub enum TraceOp {
@@ -18,36 +26,145 @@ pub enum TraceOp {
     IecLine = 0x23,
 }
 
-/// Forensic firehose sink: encodes events little-endian into pooled chunks, drained
-/// to `.c64retrace`. ~985k events/s, zero-alloc hot path (no per-event allocation).
+pub const MAGIC: &[u8; 8] = b"C64RETR1";
+pub const FORMAT_VERSION: u16 = 2;
+
+pub const ACCESS_READ: u8 = 0;
+pub const ACCESS_WRITE: u8 = 1;
+
+/// Forensic firehose sink: encodes events little-endian into a growable buffer.
 pub struct FrameSink {
-    /// TODO(loop): replace with pooled 1 MiB chunks + async drain, matching
-    /// binary-log-writer.ts (POOL_TARGET, CHUNK_BYTES, flip/drain at pause boundary).
     pub buf: Vec<u8>,
 }
 
 impl FrameSink {
-    pub fn new() -> Self {
-        Self { buf: Vec::new() }
+    /// Create a sink with the file header already written, capturing `meta` JSON.
+    pub fn with_header(meta_json: &str) -> Self {
+        let mut buf = Vec::with_capacity(1 << 16);
+        buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes()); // flags
+        let meta = meta_json.as_bytes();
+        buf.extend_from_slice(&(meta.len() as u32).to_le_bytes());
+        buf.extend_from_slice(meta);
+        Self { buf }
+    }
+
+    /// Create a header-less sink (events appended to an existing file's stream).
+    pub fn events_only() -> Self {
+        Self { buf: Vec::with_capacity(1 << 16) }
+    }
+
+    #[inline]
+    fn write_cpu_step(
+        &mut self,
+        cycle: u64,
+        pc: u16,
+        opcode: u8,
+        a: u8,
+        x: u8,
+        y: u8,
+        sp: u8,
+        p: u8,
+        b1: u8,
+        b2: u8,
+    ) {
+        self.buf.push(TraceOp::CpuStep as u8);
+        self.buf.extend_from_slice(&(cycle as f64).to_le_bytes());
+        self.buf.extend_from_slice(&pc.to_le_bytes());
+        self.buf.push(opcode);
+        self.buf.push(a);
+        self.buf.push(x);
+        self.buf.push(y);
+        self.buf.push(sp);
+        self.buf.push(p);
+        self.buf.push(b1);
+        self.buf.push(b2);
+    }
+
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn write_mem_access(
+        &mut self,
+        op: TraceOp,
+        cycle: u64,
+        addr: u16,
+        value: u8,
+        pc: u16,
+        access: u8,
+        old: Option<u8>,
+    ) {
+        self.buf.push(op as u8);
+        self.buf.extend_from_slice(&(cycle as f64).to_le_bytes());
+        self.buf.extend_from_slice(&addr.to_le_bytes());
+        self.buf.push(value);
+        self.buf.extend_from_slice(&pc.to_le_bytes());
+        let has_old = old.is_some();
+        self.buf.push((access & 0x7f) | if has_old { 0x80 } else { 0 });
+        self.buf.push(old.unwrap_or(0));
     }
 }
 
-impl Default for FrameSink {
-    fn default() -> Self {
-        Self::new()
+/// Streaming trace observer: encodes CpuStep + RAM/IO mem-access frames as the
+/// CPU executes. Bus events carry the live reg_pc + clk + pre-write old byte so
+/// each record is stamped exactly as the TS writer does.
+pub struct TracingObserver {
+    pub sink: FrameSink,
+    pub event_count: u64,
+}
+
+impl TracingObserver {
+    pub fn new(sink: FrameSink) -> Self {
+        Self { sink, event_count: 0 }
+    }
+    pub fn into_buf(self) -> Vec<u8> {
+        self.sink.buf
     }
 }
 
-impl Observer for FrameSink {
-    fn on_instruction(&mut self, _pc: u16, _opcode: u8, _a: u8, _x: u8, _y: u8, _sp: u8, _p: u8, _clk: u64) {
-        // TODO(loop): encode CpuStep frame (op + cycle:f64 + pc + opcode + regs + b1/b2).
+impl Observer for TracingObserver {
+    fn on_instruction(
+        &mut self,
+        pc: u16,
+        opcode: u8,
+        b1: u8,
+        b2: u8,
+        a: u8,
+        x: u8,
+        y: u8,
+        sp: u8,
+        p: u8,
+        clk: u64,
+    ) {
+        self.sink.write_cpu_step(clk, pc, opcode, a, x, y, sp, p, b1, b2);
+        self.event_count += 1;
     }
 
-    fn on_bus(&mut self, _kind: BusKind, _addr: u16, _value: u8) {
-        // TODO(loop): encode RamWrite (0x11) / IoWrite (0x12) frame.
+    fn on_bus(&mut self, kind: BusKind, addr: u16, value: u8, pc: u16, clk: u64, old: u8) {
+        // integrated-session.ts forwards only WRITE + READ to the producer;
+        // FETCH and DUMMY_* are NOT emitted to the trace. The op byte
+        // distinguishes read vs write.
+        let access = match kind {
+            BusKind::Write => ACCESS_WRITE,
+            BusKind::Read => ACCESS_READ,
+            _ => return,
+        };
+        // I/O window = $D000..$DFFF -> IO_WRITE (0x12); else RAM_WRITE (0x11).
+        let op = if (0xd000..0xe000).contains(&addr) {
+            TraceOp::IoWrite
+        } else {
+            TraceOp::RamWrite
+        };
+        // oldValue: only for RAM writes in the side-effect-free window
+        // ($0002..$D000). Reads + I/O writes omit it (Spec 753).
+        let old_opt = if access == ACCESS_WRITE && (0x0002..0xd000).contains(&addr) {
+            Some(old)
+        } else {
+            None
+        };
+        self.sink.write_mem_access(op, clk, addr, value, pc, access, old_opt);
+        self.event_count += 1;
     }
 
-    fn on_interrupt(&mut self, _vector: u16, _clk: u64) {
-        // TODO(loop): irq channel.
-    }
+    fn on_interrupt(&mut self, _vector: u16, _clk: u64) {}
 }
