@@ -24,13 +24,17 @@ TS runtime as golden oracle.
    - Stage 0 SERIAL: `oracle-harness` → `core-substrate` → `cpu-6510`.
    - Stage 1 PARALLEL (worktrees) only AFTER cpu green: `vic-ii` | `cia` | `drive-iec`.
    - Stage 2 SERIAL: `protocol-surface` → `snapshot-vsf` → `integration`. SID last.
-2. Dispatch the matching specialist builder (Stage 1 in an isolated worktree). Give it
-   the TS source as spec and the item's corpus slice.
+2. Dispatch the matching specialist builder via the Agent tool with the item's
+   `[model: X]` tag as the `model` override (cheap-first). Stage 1 in an isolated
+   worktree. Give it the TS source as spec and the item's corpus slice. Tell the
+   builder to use `rtk`-prefixed commands (cargo/git/tsc) per CLAUDE.md, but read the
+   TS spec RAW (no rtk filtering on spec reads).
 3. Run the ORACLE: identical WS command-seq against TS-daemon + TRX64; diff WS
    responses + `.c64retrace`; obtain first-divergence (cycle, field, expected-vs-got).
 4. GREEN → commit, mark item `done`, advance.
    RED → write first-divergence to journal, feed back to builder, retry ≤ max_retries.
-     Exhausted / genuinely blocked:
+     Exhausted on the tagged model → re-dispatch the SAME item ONCE on `opus`.
+     Still exhausted / genuinely blocked:
        - Stage 0 block → escalate to human + halt (everything depends on the CPU clock).
        - Stage 1 block → park item `blocked`, continue an independent sibling item.
 5. Write `state.json` + `journal.md`, commit. ALWAYS before exit.
