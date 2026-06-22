@@ -14,9 +14,12 @@
     "vic-ii",
     "cia"
   ],
-  "in_flight": null,
-  "note": "Stage 1 SERIAL (ADR-014): cia(core) merged. Next: drive-iec [sonnet], last Stage-1 chip. cia-cascade tracked (ADR-017).",
-  "updated": "2026-06-22T18:46:00Z",
+  "in_flight": {
+    "item": "drive-iec",
+    "started": "2026-06-22T19:15:00Z"
+  },
+  "note": "Stage 1 SERIAL (ADR-014): drive-iec [sonnet] on branch drive-iec; last Stage-1 chip.",
+  "updated": "2026-06-22T19:15:00Z",
   "followups": [
     "cia-cascade"
   ]
