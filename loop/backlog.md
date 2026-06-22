@@ -82,3 +82,9 @@ one-line first-divergence). Driver model: `sonnet`. Verifier model: `haiku`.
 ---
 Phase 2 (warp · parallel · explore/overlay mutation-search) starts only after
 Phase 1 integration is green. Tracked separately when we get there.
+
+## Stage 2 follow-ups (tracked corner gaps)
+
+- [x] `iec-bus` — **done** — `[model: opus]` — C64<->1541 IEC wired (iec.rs wired-AND fold + ATN-ack + push-flush catch-up). boot-trace-short FULLY byte-exact; full regression GREEN (ADR-024).
+- [ ] `drive-via2` — todo — `[model: opus]` — 1541 disk-controller VIA2 computed reads (PCR/timer/handshake). driveCycles +2; diverges at drive PC $F266 LDA $1C0C after 203087 byte-exact records (ADR-025). Low priority.
+- [ ] `cia-cascade` — todo — `[model: opus]` — chained timers via VICE alarm scheduler (ADR-017), now IEC-unblocked.

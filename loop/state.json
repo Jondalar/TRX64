@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": 2,
-  "current_item": "iec-bus",
+  "current_item": "protocol-surface",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -13,22 +13,17 @@
     "cpu-6510",
     "vic-ii",
     "cia",
-    "drive-iec"
+    "drive-iec",
+    "iec-bus"
   ],
-  "note": "iec-bus [opus]: C64 CIA2 PA $DD00 <-> 1541 VIA1 IEC pins (wired-AND, ATN-ACK, push-flush catch-up). Unblocks boot-trace beyond trace[79] + driveCycles.",
-  "updated": "2026-06-22T21:49:00Z",
+  "note": "MILESTONE: full-machine boot-trace-short BYTE-EXACT (incl IEC). Next: protocol-surface [sonnet] (50+ WS methods on the working machine). Then snapshot-vsf. Corner gaps tracked: drive-via2, cia-cascade.",
+  "updated": "2026-06-22T22:05:00Z",
   "followups": [
-    "cia-cascade"
+    "drive-via2 (ADR-025, +2 driveCycles)",
+    "cia-cascade (ADR-017, now IEC-unblocked)"
   ],
-  "in_flight": {
-    "item": "iec-bus",
-    "model": "opus",
-    "started": "2026-06-22T21:49:00Z",
-    "note": "opus alive: 2 IEC commits landed (CIA2 PA<->VIA1 PB, drive PB folds lines), full.rs edited 8min ago. Defer."
-  },
+  "in_flight": null,
   "stage2_items": [
-    "iec-bus",
-    "integration-deep",
     "protocol-surface",
     "snapshot-vsf"
   ],

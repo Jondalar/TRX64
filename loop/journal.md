@@ -229,3 +229,21 @@ connected. Carved out as `iec-bus` [opus]. Merged integration → main (ff), del
 
 Phase 1 core is essentially complete — the machine boots correctly. Remaining: iec-bus,
 then integration-deep (full boot trace + cia-cascade), protocol-surface, snapshot-vsf.
+
+## 2026-06-22 — DRIVER: iec-bus done — FULL-MACHINE BOOT TRACE BYTE-EXACT
+
+Opus iec-bus builder wired C64<->1541 IEC (iec.rs IecCore: VICE wired-AND fold, ATN-ack,
+push-flush drive catch-up; FullBus $DD00 read/write + read-side-effect record; drive VIA1
+PB read_prb formula). Confirmation gate INDEPENDENT: **boot-trace-short FULLY GREEN** (was
+RED at trace[79]) — the assembled full C64 boot trace now matches VICE byte-for-byte incl
+IEC. Full regression GREEN (iso cpu/vic/cia + drive-boot-idle); boot-basic-ready CPU/VIC/
+c64Cycles byte-exact. ADR-024 recorded. Merged iec-bus -> main (ff).
+
+Residual: boot-basic-ready driveCycles +2 — diagnosed (ADR-025) as the drive disk-
+controller VIA2 (PC $F266 LDA $1C0C, byte-exact for 203087 records first), a SEPARATE
+subsystem, IEC-independent. Carved out as drive-via2 [opus], low priority.
+
+Phase-1 emulation parity is essentially PROVEN (full boot trace byte-exact). done: 7
+items. Advancing to protocol-surface [sonnet] — the 50+ WS methods on the now-working
+machine (the drop-in completeness). Then snapshot-vsf. Corner gaps tracked: drive-via2,
+cia-cascade.

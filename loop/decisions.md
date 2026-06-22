@@ -245,3 +245,26 @@ read/write. This unblocks deep boot-trace parity + driveCycles. integration resu
 (deep boot-trace-short, then ADR-017 cia-cascade). cia-cascade was not reached (IEC gap
 blocks the trace first).
 **Why:** A substantial stateful subsystem deserving its own gated item, not a half-build.
+
+## ADR-024 — C64↔1541 IEC serial bus wired (boot-trace-short byte-exact)
+**Context:** iec-bus — the last full-boot divergence (trace[79] $DD00 read).
+**Decision (blessed, GREEN + no regression):** `iec.rs` IecCore = 1:1 VICE wired-AND fold
+(cpu_port = cpu_bus & drv_bus; ATN-acknowledge auto-pulls DATA), FullBus $DD00 read
+composes folded CLK/DATA in + emits the iecReadPins indirection record (read-side-effect
+path in cpu.rs), $DD00 write push-flushes + drives cpu_bus, and a push-flush drive
+catch-up (catch_up_to) advances the drive 6502 to the exact C64 clk on each $DD00 access.
+Drive VIA1 PB read applies the via1d1541 read_prb formula. RESULT: boot-trace-short FULLY
+byte-exact; full regression GREEN; boot-basic-ready CPU/VIC/c64Cycles byte-exact.
+**Why:** Full-machine boot trace now matches VICE byte-for-byte — Phase-1 emulation parity
+proven on a real assembled-machine trace.
+
+## ADR-025 — driveCycles +2 = drive disk-controller VIA2 (own item drive-via2)
+**Context:** boot-basic-ready driveCycles 2029941 vs 2029939 (+2), IEC-independent
+(present since the keystone). Traced precisely: drive-cpu PC+regs byte-exact for 203087
+records, then drive PC $F266 `LDA $1C0C` reads VIA2 PCR — TRX64's VIA2 is a 0xFF stub;
+VICE returns computed PCR/timer/handshake reads.
+**Decision:** Carve out `drive-via2` [opus] (model the 1541 disk-controller VIA2 computed
+reads). It is the bus the drive-boot-idle gate depends on, so model it carefully without
+regressing. Tracked, low priority (corner; boots + traces correctly without it).
+**Why:** A distinct subsystem, well-diagnosed; not worth risking the green drive gates by
+speculative modelling under the IEC item.
