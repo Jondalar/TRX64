@@ -17,8 +17,8 @@
     "iec-bus",
     "protocol-surface"
   ],
-  "note": "protocol-surface core done (WS methods GREEN). Next: snapshot-vsf [sonnet]. Then the carved follow-ups (vic-render incl screenshot, media, daemon-trace-query, drive-via2, cia-cascade, sid).",
-  "updated": "2026-06-23T00:00:00Z",
+  "note": "snapshot-vsf [sonnet]: VSF save/load interop (VICE/TS session-vsf format) + native fast snapshot (Machine is Clone). vsf/save + vsf/load WS methods.",
+  "updated": "2026-06-22T22:35:00Z",
   "followups": [
     "vic-render (framebuffer+screenshot, ADR-026)",
     "media (ADR-026)",
@@ -27,7 +27,11 @@
     "cia-cascade (ADR-017)",
     "sid (audio, Phase 1.5)"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "snapshot-vsf",
+    "model": "sonnet",
+    "started": "2026-06-22T22:35:00Z"
+  },
   "stage2_items": [
     "snapshot-vsf"
   ],
