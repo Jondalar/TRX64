@@ -13,6 +13,7 @@ pub mod cia;
 pub mod cpu;
 pub mod drive;
 pub mod full;
+pub mod iec;
 pub mod tables;
 pub mod vic;
 
@@ -20,6 +21,7 @@ pub use cia::Cia;
 pub use cpu::{Bus, Cpu6510};
 pub use drive::Drive1541;
 pub use full::{FullBus, MemConfig};
+pub use iec::IecCore;
 pub use vic::VicII;
 
 /// Zero-cost observation hook, inlined into the core step loop.
@@ -284,6 +286,14 @@ pub struct Machine {
     /// across instructions so the FullBus only re-pushes on an actual change.
     /// Power-on: DDRA=0 → output=$FF.
     pub cia2_pa_out: u8,
+    /// IEC serial-bus wired-AND core (C64 CIA2 PA ↔ 1541 VIA1 PB). Persists across
+    /// instructions; borrowed into the FullBus each instruction (ADR-021 IEC wiring).
+    pub iec: IecCore,
+    /// Monotonic C64-clock reference the drive has been advanced up to. The
+    /// push-flush catch-up advances the drive by `clk - drive_c64_ref` before
+    /// sampling/applying the IEC lines on a $DD00 access (= VICE
+    /// drive_cpu_execute_one/all at the exact C64 read/write instant).
+    pub drive_c64_ref: u64,
 }
 
 /// ROM load error.
@@ -334,6 +344,8 @@ impl Machine {
             memconfig_table: full::build_memconfig_table(),
             full_assembled: false,
             cia2_pa_out: 0xff,
+            iec: IecCore::new(),
+            drive_c64_ref: 0,
         }
     }
 
@@ -420,6 +432,10 @@ impl Machine {
         self.port_data = 0x37;
         let port = (!self.port_dir | self.port_data) & 0x07;
         self.memconfig = self.memconfig_table[(port | 0x18) as usize & 0x1f];
+        // IEC bus: power-on released (= installCia2 seeds iecWrite(0xff, 0x3f)).
+        self.iec = IecCore::new();
+        self.cia2_pa_out = 0xff;
+        self.drive_c64_ref = 0;
         self.sync_snapshot();
     }
 
@@ -641,6 +657,10 @@ impl Machine {
                     clk: self.cpu6510.clk,
                     cia2_pa_out: self.cia2_pa_out,
                     side_effects: Vec::new(),
+                    read_side_effects: Vec::new(),
+                    drive: &mut self.drive8,
+                    iec: &mut self.iec,
+                    drive_c64_ref: self.drive_c64_ref,
                 };
                 loop {
                     self.cpu6510.execute_cycle(&mut bus, obs);
@@ -653,11 +673,16 @@ impl Machine {
                 self.port_dir = bus.port_dir;
                 self.port_data = bus.port_data;
                 self.cia2_pa_out = bus.cia2_pa_out;
+                // Persist the push-flush reference (the drive may have been advanced
+                // mid-instruction by a $DD00 access inside the FullBus).
+                self.drive_c64_ref = bus.drive_c64_ref;
             }
+            let _ = c64_clk_before;
 
-            // Drive catches up to the NEW C64 clock AFTER the instruction.
-            let c64_cycles = self.cpu6510.clk.wrapping_sub(c64_clk_before);
-            self.drive8.run_cycles(c64_cycles);
+            // Drive catches up to the NEW C64 clock AFTER the instruction (= TS
+            // afterCycleSync / catchUpDrive to the post-instruction clk). A $DD00
+            // access already pushed it part-way; this finishes the slice.
+            self.drive_c64_ref = self.drive8.catch_up_to(self.cpu6510.clk, self.drive_c64_ref);
             if let Some((pc, a, x, y, sp, p, drv_clk)) = self.drive8.sample_pc_change() {
                 on_drive_step(pc, a, x, y, sp, p, drv_clk);
             }

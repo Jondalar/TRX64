@@ -21,7 +21,7 @@ use crate::{cpu::{Bus, Cpu6510}, NullSink, Observer, RomError};
 /// reads. The isolation gate does not need timer IRQ delivery.
 #[derive(Clone)]
 pub struct Via6522 {
-    regs: [u8; 16],
+    pub regs: [u8; 16],
 }
 
 impl Via6522 {
@@ -259,6 +259,17 @@ impl Drive1541 {
         }
     }
 
+    /// Composed VIA1 PB output byte driving the IEC bus (= viacore VIA_PRB store
+    /// `out = ORB | ~DDRB`). Output bits (DDRB=1) carry the ORB latch; input bits
+    /// (DDRB=0) float HIGH. The IEC core inverts this to `drv_data[8]`. PB1=DATA_OUT,
+    /// PB3=CLK_OUT, PB4=ATN_ACK (active-low after the 7406 / wired-AND inversion).
+    #[inline]
+    pub fn via1_pb_iec_output(&self) -> u8 {
+        let orb = self.via1.regs[0];
+        let ddrb = self.via1.regs[2];
+        (orb | !ddrb) & 0xff
+    }
+
     /// Reset PC from the ROM vector (re-read). Returns the resolved PC.
     pub fn reset_pc(&self) -> u16 {
         let lo = self.rom[0x7FFC] as u16;
@@ -297,6 +308,18 @@ impl Drive1541 {
             Self::step_instruction(&mut self.cpu, &mut self.reset_pending, &mut bus, &mut obs);
         }
         self.drive_clk = self.cpu.clk;
+    }
+
+    /// Advance the drive to an ABSOLUTE C64-clock target (VICE
+    /// drive_cpu_execute_one/all at the $DD00 read/write instant). `c64_ref` is the
+    /// C64 clock the drive was last advanced up to; returns the new reference (=
+    /// `c64_clk`). A monotonic no-op when `c64_clk <= c64_ref`.
+    #[inline]
+    pub fn catch_up_to(&mut self, c64_clk: u64, c64_ref: u64) -> u64 {
+        if c64_clk > c64_ref {
+            self.run_cycles(c64_clk - c64_ref);
+        }
+        c64_clk
     }
 
     /// Sample the current drive PC for the drive8-cpu trace domain.

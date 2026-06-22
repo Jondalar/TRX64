@@ -94,6 +94,17 @@ pub struct FullBus<'a> {
     /// Side-effect writes queued by the immediately-preceding `write()`
     /// (`(addr, value, old)`), drained by the CPU `store` into the trace.
     pub side_effects: Vec<(u16, u8, u8)>,
+    /// Side-effect reads queued by the immediately-preceding `read()`
+    /// (`(addr, value)`), drained by the CPU `load_read` into the trace. Carries
+    /// the IEC `iecReadPins` indirection record on a CIA2 PA ($DD00) read.
+    pub read_side_effects: Vec<(u16, u8)>,
+    /// The 1541 drive — borrowed so a $DD00 access can push-flush it to the exact
+    /// C64 clock before sampling/applying the IEC lines (cross-domain sync).
+    pub drive: &'a mut crate::drive::Drive1541,
+    /// IEC wired-AND core (C64 CIA2 PA ↔ drive VIA1 PB), borrowed from the Machine.
+    pub iec: &'a mut crate::iec::IecCore,
+    /// Monotonic C64-clock the drive has been advanced up to (push-flush reference).
+    pub drive_c64_ref: u64,
 }
 
 impl<'a> FullBus<'a> {
@@ -130,6 +141,18 @@ impl<'a> FullBus<'a> {
         retval
     }
 
+    /// Push-flush the drive to the current C64 `clk`, then refresh the IEC core's
+    /// drive-side contribution from the drive's live VIA1 PB output and re-fold the
+    /// bus. Mirrors VICE `drive_cpu_execute_{one,all}(clock)` followed by the
+    /// drv_data[8]/drv_bus[8]/cpu_port recompute that the kernel overlay performs at
+    /// each $DD00 read/write instant.
+    #[inline]
+    fn iec_push_flush(&mut self) {
+        self.drive_c64_ref = self.drive.catch_up_to(self.clk, self.drive_c64_ref);
+        let pb_out = self.drive.via1_pb_iec_output();
+        self.iec.drive_store_pb(pb_out);
+    }
+
     /// I/O read dispatch ($D000-$DFFF, IO config). Mirrors memory-bus.ts read().
     #[inline]
     fn io_read(&mut self, addr: u16) -> u8 {
@@ -147,7 +170,27 @@ impl<'a> FullBus<'a> {
                 (v & 0x0f) | 0xf0
             }
             0xdc00..=0xdcff => self.cia1.read(addr, self.clk, self.cia_table),
-            0xdd00..=0xddff => self.cia2.read(addr, self.clk, self.cia_table),
+            0xdd00..=0xddff => {
+                // CIA2 register 0 = port A ($DD00) carries the IEC input lines on
+                // bits 6/7. VICE read_ciapa: value = ((PRA|~DDRA)&0x3f) |
+                // iecbus_callback_read(clk). The callback push-flushes the drive,
+                // re-folds the wired-AND bus, and returns the cached cpu_port —
+                // and (via iecReadPins → c64Read($DD00) → emitC64Access) emits an
+                // EXTRA bus-access read record of cpu_port BEFORE the CPU's own
+                // load record. We reproduce both: the indirection record (queued as
+                // a read side-effect) and the composed PA byte.
+                if (addr & 0xf) == crate::cia::CIA_PRA as u16 {
+                    self.iec_push_flush();
+                    let pins = self.iec.cpu_port;
+                    // iecReadPins indirection record (= emitC64Access read at $DD00).
+                    self.read_side_effects.push((0xdd00, pins));
+                    let pra = self.cia2.peek(0xdd00);
+                    let ddra = self.cia2.peek(0xdd02);
+                    (((pra | !ddra) & 0x3f) | pins) & 0xff
+                } else {
+                    self.cia2.read(addr, self.clk, self.cia_table)
+                }
+            }
             // $DE00-$DFFF (cart IO, no cart) → open-bus shadow.
             _ => self.io[(addr as usize) - 0xd000],
         }
@@ -182,6 +225,17 @@ impl<'a> FullBus<'a> {
                         self.io[0xdd00 - 0xd000] = new_out;
                         self.cia2_pa_out = new_out;
                         self.side_effects.push((0xdd00, new_out, old));
+                        // IEC: drive the wired-AND bus from the new CIA2 PA output.
+                        // VICE iecbus_cpu_write_conf1 order: push-flush drive to the
+                        // write instant FIRST, then iec_update_cpu_bus(~PA), ATN edge
+                        // → drive VIA1 CA1, recompute drv_bus[8], update ports.
+                        self.iec_push_flush();
+                        let _atn_edge = self.iec.c64_store_dd00((!new_out) & 0xff);
+                        // ATN-edge → drive VIA1 CA1 signal is not yet modelled (the
+                        // TRX64 drive VIA1 is a register stub without CA1/IRQ); the
+                        // hardware ATN-acknowledge (drive auto-pulls DATA) is already
+                        // folded by recompute_drv_bus's cpu_bus term inside
+                        // c64_store_dd00, so the bus LINE state is correct.
                     }
                 }
             }
@@ -283,6 +337,13 @@ impl<'a> Bus for FullBus<'a> {
     fn take_side_effect_writes(&mut self, out: &mut Vec<(u16, u8, u8)>) {
         if !self.side_effects.is_empty() {
             out.append(&mut self.side_effects);
+        }
+    }
+
+    #[inline]
+    fn take_side_effect_reads(&mut self, out: &mut Vec<(u16, u8)>) {
+        if !self.read_side_effects.is_empty() {
+            out.append(&mut self.read_side_effects);
         }
     }
 }

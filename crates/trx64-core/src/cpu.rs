@@ -61,6 +61,15 @@ pub trait Bus {
     /// isolated gates are byte-identical + pay no cost.
     #[inline]
     fn take_side_effect_writes(&mut self, _out: &mut Vec<(u16, u8, u8)>) {}
+
+    /// Take + clear any SIDE-EFFECT bus READS produced by the immediately-preceding
+    /// `read()` (= TS chip callbacks that re-read the bus, e.g. CIA2's `readPa`
+    /// calling `iecReadPins` → `c64Read($DD00)`, which emits an extra
+    /// `emitC64Access` read record for the folded IEC `cpu_port`). Returned as
+    /// `(addr, value)` in the order the TS emits them (BEFORE the originating load's
+    /// own trace record). Default empty — isolated buses have no such side-effects.
+    #[inline]
+    fn take_side_effect_reads(&mut self, _out: &mut Vec<(u16, u8)>) {}
 }
 
 /// In-flight instruction microcode state (= TS `InstructionState`).
@@ -213,6 +222,14 @@ impl Cpu6510 {
     #[inline]
     fn load_read<B: Bus, O: Observer>(&mut self, bus: &mut B, obs: &mut O, addr: u16) -> u8 {
         let v = self.load(bus, obs, addr);
+        // Side-effect reads queued by the chip read callback (e.g. CIA2 PA read →
+        // IEC `iecReadPins` indirection) are emitted BEFORE this load's own record,
+        // matching the TS `emitC64Access`-then-CPU-read order. No-op on isolated buses.
+        let mut se: Vec<(u16, u8)> = Vec::new();
+        bus.take_side_effect_reads(&mut se);
+        for (a, val) in se {
+            obs.on_bus(BusKind::Read, a, val, self.reg_pc, self.clk, 0);
+        }
         obs.on_bus(BusKind::Read, addr, v, self.reg_pc, self.clk, 0);
         v
     }
