@@ -12,6 +12,10 @@ export const VOLATILE_KEYS = new Set<string>([
   "path",
   "out_path",
   "output_path",
+  "outputPath",
+  "evidenceRef",
+  "createdAt",
+  "overheadMs",
   "updated",
   "dataUrl", // PNG base64 — compared structurally elsewhere, not byte-equal
   "tmp",

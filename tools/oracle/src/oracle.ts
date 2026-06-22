@@ -14,6 +14,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { connect } from "./ws-client.js";
 import { diffResponses, diffTraces, formatDivergence, type Divergence } from "./diff.js";
 import { decodeTrace } from "./trace-decode.js";
+import { spawnDaemon, type DaemonKind } from "./daemon.js";
 import type { Scenario, Golden } from "./scenario.js";
 
 /** Deep-substitute the literal "$sessionId" placeholder in step params. */
@@ -35,8 +36,6 @@ function pickString(obj: unknown, key: string): string | undefined {
   }
   return undefined;
 }
-
-const DEFAULT_GOLDEN = process.env.C64RE_RUNTIME_ENDPOINT ?? "ws://127.0.0.1:4312";
 
 function arg(flag: string): string | undefined {
   const i = process.argv.indexOf(flag);
@@ -84,22 +83,35 @@ function goldenPath(scnPath: string): string {
 
 async function cmdRecord(scnPath: string): Promise<number> {
   const scn = loadScenario(scnPath);
-  const endpoint = arg("--endpoint") ?? DEFAULT_GOLDEN;
-  const golden = await replay(endpoint, scn);
-  writeFileSync(goldenPath(scnPath), JSON.stringify(golden, null, 2));
-  console.log(`recorded golden: ${goldenPath(scnPath)} (${golden.responses.length} captured)`);
-  return 0;
+  // Hermetic: spawn a fresh TS daemon unless an explicit endpoint is given (debug).
+  const explicit = arg("--endpoint");
+  const daemon = explicit ? null : await spawnDaemon("ts");
+  const endpoint = explicit ?? daemon!.endpoint;
+  try {
+    const golden = await replay(endpoint, scn);
+    writeFileSync(goldenPath(scnPath), JSON.stringify(golden, null, 2));
+    console.log(`recorded golden: ${goldenPath(scnPath)} (${golden.responses.length} captured)`);
+    return 0;
+  } finally {
+    daemon?.stop();
+  }
 }
 
 async function cmdCompare(scnPath: string): Promise<number> {
   const scn = loadScenario(scnPath);
-  const candidate = arg("--candidate");
-  if (!candidate) {
-    console.error("compare requires --candidate ws://...");
-    return 2;
-  }
   const golden = JSON.parse(readFileSync(goldenPath(scnPath), "utf8")) as Golden;
-  const cand = await replay(candidate, scn);
+  // Hermetic: spawn a fresh candidate daemon (default TRX64; --candidate-kind ts for
+  // a TS-vs-TS self-test) unless an explicit --candidate endpoint is given (debug).
+  const explicit = arg("--candidate");
+  const kind = (arg("--candidate-kind") as DaemonKind) ?? "trx64";
+  const daemon = explicit ? null : await spawnDaemon(kind);
+  const endpoint = explicit ?? daemon!.endpoint;
+  let cand: Golden;
+  try {
+    cand = await replay(endpoint, scn);
+  } finally {
+    daemon?.stop();
+  }
 
   let firstDiv: Divergence | null = null;
   const n = Math.min(golden.responses.length, cand.responses.length);

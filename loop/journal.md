@@ -43,3 +43,22 @@ so goldens aren't reproducible on a reused daemon (compare self-test went RED on
 $.create.c64Cycles). Fix before the gate is trustworthy: hermetic daemon lifecycle
 (spawn fresh TS/TRX64 daemon per scenario on an ephemeral port, teardown after) OR a
 clean cold-reset before each scenario. Decision pending.
+
+## 2026-06-22 — oracle-harness: determinism gate GREEN (loop-ready)
+
+Chose (a) hermetic. Added `daemon.ts`: spawn a fresh daemon (ts | trx64) on an
+ephemeral free port with a throwaway tmp project dir, readiness-poll via WS connect +
+ping, teardown = SIGTERM the process group + rm tmp. record/compare now spawn their own
+daemon (explicit --endpoint/--candidate still works for debug; --candidate-kind ts for
+a TS-vs-TS self-test). Volatile keys extended: outputPath, evidenceRef, createdAt,
+overheadMs.
+
+PROOF: record (fresh TS) then compare vs a SECOND fresh TS -> GREEN, exit 0. Two
+independent cold-reset daemons produce byte-identical responses + 50k-cycle trace. No
+daemon leaks after teardown.
+
+=> oracle-harness MECHANISM done, gate trustworthy. Corpus is still two boot smoke
+tests; it grows per-subsystem inside each builder's item (cpu builder writes cpu
+exercisers + records goldens before porting, etc.). Advancing to `core-substrate`:
+first point where compare-vs-trx64 actually runs (expect RED until the daemon binds +
+answers ping/session/create).
