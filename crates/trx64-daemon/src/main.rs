@@ -139,6 +139,11 @@ fn run_cycle_budget(session: &mut Session, budget: u64) {
     let mut obs = TracingObserver::with_channels(FrameSink::events_only(), channels);
     if vic_active {
         session.machine.run_for_vic(budget, &mut obs);
+    } else if channels.mem {
+        // memory domain (no vic): route through the CIA-isolated bus so $DC00-$DDFF
+        // accesses hit the cycle-exact 6526 chips. Behaves identically to flat RAM
+        // for every non-CIA address, so plain CPU exercisers are unaffected.
+        session.machine.run_for_cia(budget, &mut obs);
     } else {
         session.machine.run_for_with(budget, &mut obs);
     }

@@ -217,14 +217,19 @@ impl Observer for TracingObserver {
             BusKind::Read => ACCESS_READ,
             _ => return,
         };
-        // I/O window = $D000..$DFFF -> IO_WRITE (0x12); else RAM_WRITE (0x11).
-        let op = if (0xd000..0xe000).contains(&addr) {
-            TraceOp::IoWrite
-        } else {
-            TraceOp::RamWrite
-        };
-        // oldValue: only for RAM writes in the side-effect-free window
-        // ($0002..$D000). Reads + I/O writes omit it (Spec 753).
+        // EMPIRICAL (ADR-015-style, CIA gate): the TS oracle's binary trace is
+        // produced by the `bus_access` CPU per-access tap (Spec 142), which emits
+        // op 0x11 (RAM_WRITE) for EVERY C64 access regardless of region — including
+        // the $D000-$DFFF I/O window (VIC/SID/CIA1/CIA2). The op-0x12 (IO_WRITE)
+        // code is a RESERVED opcode with NO live producer in this build: a CIA
+        // exerciser ($DC00-$DDFF reads+writes) and even a full BASIC boot emit
+        // ZERO io frames — $D016/$DC0D/$DD0D all come through as op 0x11. So we
+        // emit RAM_WRITE for all bus accesses; routing $Dxxx → IoWrite diverged at
+        // the first $DC04 write (trace[2].family expected="ram" got="io").
+        let op = TraceOp::RamWrite;
+        // oldValue: the TS writer carries the pre-write byte ONLY for writes in the
+        // side-effect-free RAM window ($0002..$D000). Reads and I/O-window writes
+        // ($D000-$DFFF) omit it (hasOld=0 ⇒ access byte 0x01, old=0) — Spec 753.
         let old_opt = if access == ACCESS_WRITE && (0x0002..0xd000).contains(&addr) {
             Some(old)
         } else {

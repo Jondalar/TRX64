@@ -9,10 +9,12 @@
 
 use std::path::Path;
 
+pub mod cia;
 pub mod cpu;
 pub mod tables;
 pub mod vic;
 
+pub use cia::Cia;
 pub use cpu::{Bus, Cpu6510};
 pub use vic::VicII;
 
@@ -168,6 +170,59 @@ impl<'a> Bus for VicBus<'a> {
     }
 }
 
+/// CIA-isolated bus (ADR-012): routes $DC00-$DCFF (CIA1) + $DD00-$DDFF (CIA2) to
+/// the two 6526 chips, and flat 64K RAM everywhere else. The CIAs are CLOCK-DRIVEN:
+/// `clk` is advanced once per CPU master cycle by `Bus::tick` and used as the rclk
+/// for every CIA register access (READ_OFFSET = write_offset = 0 on C64SC, so a
+/// read/write at CPU cycle N runs the timer state machine forward to N). No PLA
+/// banking, no VIC/SID, no $00/$01 port — exactly the chip-isolation gate the
+/// CPU-isolated exerciser (SEI; program timers, count down, read $DCxx) needs.
+pub struct CiaBus<'a> {
+    pub mem: &'a mut [u8; 0x10000],
+    pub cia1: &'a mut crate::cia::Cia,
+    pub cia2: &'a mut crate::cia::Cia,
+    pub table: &'a [u16; crate::cia::CIAT_TABLEN],
+    /// Master clock shared with the CPU: equals the CPU's `self.clk` at each access
+    /// because both advance one-per-cycle from the same start and `tick()` fires
+    /// at the END of each CPU cycle (after the cycle's bus access).
+    pub clk: u64,
+}
+
+impl<'a> Bus for CiaBus<'a> {
+    #[inline]
+    fn read(&mut self, addr: u16) -> u8 {
+        if (0xdc00..0xdd00).contains(&addr) {
+            self.cia1.read(addr, self.clk, self.table)
+        } else if (0xdd00..0xde00).contains(&addr) {
+            self.cia2.read(addr, self.clk, self.table)
+        } else {
+            self.mem[addr as usize]
+        }
+    }
+    #[inline]
+    fn write(&mut self, addr: u16, value: u8) {
+        if (0xdc00..0xdd00).contains(&addr) {
+            self.cia1.write(addr, value, self.clk, self.table);
+        } else if (0xdd00..0xde00).contains(&addr) {
+            self.cia2.write(addr, value, self.clk, self.table);
+        } else {
+            self.mem[addr as usize] = value;
+        }
+    }
+    /// One CIA master cycle per CPU master cycle. The CIAs' own `clk` is the bus
+    /// `clk`; both advance in lockstep with the CPU. We keep the per-chip prescaler
+    /// (TOD) advancing but the timer state machines run lazily on access (warp
+    /// counting), so this is O(1).
+    #[inline]
+    fn tick(&mut self) {
+        self.clk = self.clk.wrapping_add(1);
+        self.cia1.clk = self.clk;
+        self.cia2.clk = self.clk;
+        self.cia1.tick(self.table);
+        self.cia2.tick(self.table);
+    }
+}
+
 /// Full mutable machine state (~75 KiB headless).
 ///
 /// `Clone` is intentional and load-bearing: a clone is the cheap COW fork base for
@@ -185,6 +240,13 @@ pub struct Machine {
     /// VIC-isolated run path (`run_for_vic*`). Raster/badline/BA advance off the
     /// CPU clock regardless of CPU execution (ADR-012 isolation gate).
     pub vic: VicII,
+    /// Cycle-exact CIA1 ($DC00-$DCFF). CLOCK-DRIVEN via the CIA-isolated run path
+    /// (`run_for_cia*`); timers advance lazily to the CPU clk on register access.
+    pub cia1: Cia,
+    /// Cycle-exact CIA2 ($DD00-$DDFF).
+    pub cia2: Cia,
+    /// Shared CIA timer transition table (Arc → cheap to clone with the Machine).
+    pub cia_table: cia::CiaTable,
 }
 
 /// ROM load error.
@@ -220,6 +282,9 @@ impl Machine {
             cpu6510: Cpu6510::new(),
             cpu: Cpu::default(),
             vic: VicII::new(),
+            cia1: Cia::new(),
+            cia2: Cia::new(),
+            cia_table: cia::new_table(),
         }
     }
 
@@ -417,6 +482,57 @@ impl Machine {
             }
             // Step a whole instruction; the VIC ticks per master cycle via the
             // bus hooks (Bus::tick) and steals read cycles via check_ba_before_read.
+            loop {
+                self.cpu6510.execute_cycle(&mut bus, obs);
+                if self.cpu6510.is_at_boundary() {
+                    break;
+                }
+            }
+            executed += 1;
+        }
+        drop(bus);
+        self.sync_snapshot();
+    }
+
+    /// CIA-isolated run (= TS session/run with both CIAs ticked per CPU cycle).
+    /// Same budget / instruction-cap semantics as [`run_for`], but the bus is the
+    /// [`CiaBus`] ($DC00-$DCFF → CIA1, $DD00-$DDFF → CIA2). The CIAs are
+    /// CLOCK-DRIVEN through the `Bus::tick` hook the CPU calls per master cycle, and
+    /// each register access runs the timer state machine forward to the current clk
+    /// (rclk = clk, C64SC offsets = 0) — the cycle-exact CIA↔CPU coupling.
+    pub fn run_for_cia<O: Observer>(&mut self, budget: u64, obs: &mut O) {
+        let max_instructions = budget.div_ceil(2) + 1000;
+        self.run_for_cia_capped(budget, max_instructions, obs);
+    }
+
+    /// CIA-isolated run with an explicit instruction cap (see [`run_for_capped`]).
+    pub fn run_for_cia_capped<O: Observer>(
+        &mut self,
+        budget: u64,
+        max_instructions: u64,
+        obs: &mut O,
+    ) {
+        let start = self.cpu6510.clk;
+        let mut executed: u64 = 0;
+        let table = self.cia_table.clone();
+        // The CIAs share the CPU master clock: seed the bus clk from the live CPU
+        // clk so a read/write at CPU cycle N runs the timer to exactly N.
+        self.cia1.clk = self.cpu6510.clk;
+        self.cia2.clk = self.cpu6510.clk;
+        let mut bus = CiaBus {
+            mem: &mut self.ram,
+            cia1: &mut self.cia1,
+            cia2: &mut self.cia2,
+            table: &table,
+            clk: self.cpu6510.clk,
+        };
+        loop {
+            if self.cpu6510.clk.wrapping_sub(start) >= budget {
+                break;
+            }
+            if executed >= max_instructions {
+                break;
+            }
             loop {
                 self.cpu6510.execute_cycle(&mut bus, obs);
                 if self.cpu6510.is_at_boundary() {
