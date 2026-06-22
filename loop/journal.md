@@ -193,3 +193,23 @@ TRX64 ticks the drive 1:1 with C64 cycles; VICE applies the PAL sync_factor
 DRIVER DECISION: not a defer (well-diagnosed, bounded fix) and not fake-green. Escalate
 to OPUS per ADR-006 (hard timing + regression risk: reset_to is shared with the C64 CPU
 gates, which inject PC and must NOT regress). Continue on branch drive-iec.
+
+## 2026-06-22 — DRIVER: drive-iec accepted (opus) — STAGE 1 COMPLETE
+
+Opus fix (548e2da) resolved the drive-clk divergence: drive-boot-idle GREEN, all 701
+records byte-exact. Three drive-boot-local phase fixes (ADR-020): atomic reset+first-op
+dispatch (+6), PAL sync_factor 66517 (anti-drift), C64 catch-up over CiaBus + SP=0.
+reset_to() stays C64-safe — verified.
+
+DRIVER confirmation: re-ran the gate independently — drive-boot-idle + FULL regression
+(iso-trace-broad, iso-loads-alu, iso-vic-badline-irq/-sprites, iso-cia-ta-oneshot/-tod/
+-icr) ALL GREEN, 42 core tests. No regression. Arch-fit: drive.rs in core, pure/sync.
+The opus builder verified (via stash) the 2 still-RED scenarios (boot-basic-ready,
+boot-trace-short) were pre-existing at the escalation baseline — out-of-scope full-session
+integration items, NOT regressions. Merged drive-iec → main (ff), deleted branch.
+
+** STAGE 1 COMPLETE ** — vic-ii + cia + drive-iec all byte-exact in isolation.
+Done so far: oracle-harness, core-substrate, cpu-6510, vic-ii, cia, drive-iec.
+Advancing to STAGE 2: protocol-surface [sonnet] → snapshot-vsf [sonnet] → integration
+[opus]. Tracked gaps for integration: cia-cascade (ADR-017), reset P-flag (ADR-011),
+boot-path full-session parity, deeper VIA/GCR + IEC handshaking.

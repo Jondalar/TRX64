@@ -53,8 +53,12 @@ one-line first-divergence). Driver model: `sonnet`. Verifier model: `haiku`.
       GREEN: timer A one-shot, timer B + continuous TA, TOD (BCD/AM-PM/latch), ICR
       mask+summary+read-clear. 38 core tests, no CPU/VIC regression. Found+fixed ADR-018
       (trace always 0x11). Cascade deferred → cia-cascade (ADR-017).
-- [ ] `drive-iec` — todo — `[model: sonnet]` — drive 6510 + VIA x2 + GCR + IEC bus;
-      load works. (Escalates to opus if GCR/IEC timing diverges.)
+- [x] `drive-iec` — **done** — `[model: sonnet→opus]` — 1541 drive 6502 (reuses Cpu6510
+      over DriveBus) boots $EAA0 from dos1541 ROM; drive8-cpu trace byte-exact (701
+      records). Sonnet got PC/regs exact; escalated to opus (ADR-006) for cycle alignment
+      → ADR-020 (atomic reset+first-opcode dispatch, PAL sync_factor 66517, drive-boot-
+      local). drive-boot-idle GREEN + full CPU/VIC/CIA regression GREEN, 42 core tests.
+      VIA/GCR are stubs (idle boot only); deeper VIA/GCR + IEC handshaking → integration.
 - [ ] `cia-cascade` — todo — `[model: opus]` — chained timers (TB counts TA underflows)
       byte-exact. Needs the VICE maincpu alarm scheduler (ta_alarm/tb_alarm + IFR
       pipeline). Divergence: iso-cia-cascade trace[43] @cycle 89 exp=2 got=3 (ADR-017).

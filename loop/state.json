@@ -1,9 +1,9 @@
 {
   "phase": 1,
-  "stage": 1,
-  "current_item": "drive-iec",
+  "stage": 2,
+  "current_item": "protocol-surface",
   "stage1_remaining": [],
-  "retry_count": 1,
+  "retry_count": 0,
   "max_retries": 4,
   "ts_runtime_root": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP",
   "ts_spec_root": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/src/runtime",
@@ -12,17 +12,18 @@
     "core-substrate",
     "cpu-6510",
     "vic-ii",
-    "cia"
+    "cia",
+    "drive-iec"
   ],
-  "in_flight": {
-    "item": "drive-iec",
-    "model": "opus",
-    "started": "2026-06-22T20:15:00Z",
-    "note": "opus alive (drive.rs edited <1min ago, compiles). Long fix in progress; staleness window bumped. Check mtime before re-dispatch."
-  },
-  "note": "drive-iec escalated to opus (constant +6 drive-clk offset: unmodeled 6502 reset seq + missing PAL sync_factor). Continue branch drive-iec; do not regress C64 gates.",
-  "updated": "2026-06-22T20:15:00Z",
+  "note": "STAGE 1 COMPLETE (vic-ii+cia+drive-iec). Stage 2 serial: protocol-surface [sonnet] next. Followups: cia-cascade, ADR-011 reset-P-flag (both at integration).",
+  "updated": "2026-06-22T20:18:00Z",
   "followups": [
     "cia-cascade"
+  ],
+  "in_flight": null,
+  "stage2_items": [
+    "protocol-surface",
+    "snapshot-vsf",
+    "integration"
   ]
 }

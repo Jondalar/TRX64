@@ -194,3 +194,17 @@ NOT delete/skip a failing scenario to fake-green. The Driver decides defer (docu
 ADR + tracked item) vs block. Tightened in loop-prompt.
 **Why:** Silent removal hides real gaps — the exact failure the deterministic gate exists
 to prevent.
+
+## ADR-020 — Drive (1541) timing model: drive-boot-local, reset_to() stays C64-safe
+**Context:** drive-iec's drive-cpu cycle column was off by a constant +6 then would drift.
+**Decision (blessed from the opus fix, gates GREEN):** model three drive-boot-local phase
+effects WITHOUT touching the shared Cpu6510::reset_to() in any C64-affecting way:
+(1) VICE dispatches the drive 6510 reset + first opcode ATOMICALLY (clk 0→6→first instr,
+never stops at $EAA0) — fold the 6-cycle reset cost into the drive's first instruction;
+(2) PAL drive sync_factor = floor(65536·1e6/985248) = 66517 via a fixed-point accumulator
+(drive runs whole instructions while clk < stop_clk) — prevents drift (golden ends @3050,
+matched); (3) the drive catches up to the C64 master clock per C64 instruction, run over
+the CiaBus (same cadence as the c64-cpu gate), seeded with the 1-cycle C64 power-on reset
+offset; the drive 6502 powers on SP=0 (not $FF), drive-only.
+**Why:** Cycle-exact drive boot without regressing the C64 cpu/vic/cia gates (all verified
+GREEN). Confirms ADR-010's Bus decoupling scales to a second CPU instance.
