@@ -23,11 +23,11 @@ one-line first-divergence). Driver model: `sonnet`. Verifier model: `haiku`.
       - [x] first-divergence diff engine, responses + traces (validated, fires RED)
       - [x] hermetic daemon lifecycle — TS-vs-TS self-test GREEN, deterministic
       - [~] corpus grows per-subsystem inside each builder item (ongoing, not a blocker)
-- [ ] `core-substrate` — todo — `[model: sonnet]` — Machine struct + 64K RAM + ROM
-      load (resources/roms), PLA/$00-$01 mapping, reset (pc from $FFFC). Daemon binds
-      --port, speaks WS JSON-RPC 2.0, answers `ping` + `session/create` + `session/state`
-      with TS-shaped responses. session/run may stub (no real exec yet). Gate: compare
-      -vs-trx64 matches on ping/create SHAPE (RED on executed state is expected here).
+- [x] `core-substrate` — **done** — `[model: sonnet]` — Machine + 64K RAM + ROM load
+      (kernal/basic/chargen), cold reset (pc=$FCE2 from $FFFC). Daemon (tokio +
+      tokio-tungstenite) binds --port, WS JSON-RPC 2.0, answers ping + session/create +
+      session/run(stub) + session/state. GATE GREEN: compare-vs-trx64 → create matched,
+      RED only on $.state-after-boot.c64Cycles (execution = cpu-6510's job). Built sonnet.
 - [ ] `cpu-6510` — todo — `[model: opus]` — microcode, all legal + illegal opcodes,
       IRQ/NMI timing. Gate: diff-clean on CPU corpus (boot trace is already a strong
       slice; add illegal-opcode exercisers). **Unblocks Stage 1.**

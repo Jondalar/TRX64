@@ -62,3 +62,23 @@ tests; it grows per-subsystem inside each builder's item (cpu builder writes cpu
 exercisers + records goldens before porting, etc.). Advancing to `core-substrate`:
 first point where compare-vs-trx64 actually runs (expect RED until the daemon binds +
 answers ping/session/create).
+
+## 2026-06-22 — core-substrate done + loop dry-run GREEN (mechanics proven)
+
+Wired model routing (per-item [model:] tags, cheap-first + escalate-to-opus). Adopted
+rtk (project CLAUDE.md, user-authorized) for token discipline.
+
+DRY RUN — dispatched a `core-substrate` builder on SONNET (tests cheap routing). It
+built: trx64-core Cpu + ROM load (kernal/basic/chargen) + cold_reset (pc=$FCE2 from
+$FFFC); trx64-session boot(); trx64-daemon = tokio + tokio-tungstenite WS JSON-RPC 2.0
+answering ping / session/create / session/run(stub) / session/state. rtk cargo build
+clean (2 warnings).
+
+GATE ran end-to-end vs the real TRX64 daemon (hermetic spawn):
+  [boot-basic-ready] RED $.state-after-boot.c64Cycles: expected=2000000 got=0
+=> session/create MATCHED (both cold-reset pc=64738), ping ok, precise first-divergence
+on execution (correct — cpu-6510's job), no crash, no leaks. Full loop mechanic proven:
+builder -> build -> daemon answers -> gate -> precise RED.
+
+core-substrate meets its DoD. Advancing to cpu-6510 [opus]. Pre-flight complete; arming
+the cron (30-min interval) next.

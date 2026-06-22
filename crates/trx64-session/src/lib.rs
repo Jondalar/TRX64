@@ -21,6 +21,11 @@ impl Session {
             running: false,
         }
     }
+
+    /// Boot the session: load ROMs from `rom_dir` and cold-reset the machine.
+    pub fn boot(&mut self, rom_dir: &std::path::Path) -> Result<(), trx64_core::RomError> {
+        self.machine.boot_from_dir(rom_dir)
+    }
 }
 
 /// Phase-2 mutation-search primitive (sketch — built after Phase-1 parity is green).

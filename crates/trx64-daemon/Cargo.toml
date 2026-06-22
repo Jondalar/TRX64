@@ -12,3 +12,15 @@ path = "src/main.rs"
 trx64-core = { path = "../trx64-core" }
 trx64-trace = { path = "../trx64-trace" }
 trx64-session = { path = "../trx64-session" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+# WebSocket
+tokio-tungstenite = { version = "0.24", features = [] }
+# JSON
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# CLI args
+clap = { version = "4", features = ["derive"] }
+# Futures
+futures-util = "0.3"

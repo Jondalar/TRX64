@@ -1,11 +1,11 @@
 {
   "phase": 1,
   "stage": 0,
-  "current_item": "core-substrate",
+  "current_item": "cpu-6510",
   "retry_count": 0,
   "max_retries": 4,
   "ts_runtime_root": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP",
   "ts_spec_root": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/src/runtime",
-  "done": ["oracle-harness"],
+  "done": ["oracle-harness", "core-substrate"],
   "updated": "2026-06-22"
 }
