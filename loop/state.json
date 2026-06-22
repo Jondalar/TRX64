@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": 2,
-  "current_item": "protocol-surface",
+  "current_item": "snapshot-vsf",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -14,21 +14,21 @@
     "vic-ii",
     "cia",
     "drive-iec",
-    "iec-bus"
+    "iec-bus",
+    "protocol-surface"
   ],
-  "note": "protocol-surface [sonnet]: implement the 50+ WS methods on the working FullBus machine. Defer framebuffer-dependent (screenshot/render/export-video) -> need vic-render. Diff response parity vs TS.",
-  "updated": "2026-06-22T22:05:00Z",
+  "note": "protocol-surface core done (WS methods GREEN). Next: snapshot-vsf [sonnet]. Then the carved follow-ups (vic-render incl screenshot, media, daemon-trace-query, drive-via2, cia-cascade, sid).",
+  "updated": "2026-06-23T00:00:00Z",
   "followups": [
-    "drive-via2 (ADR-025, +2 driveCycles)",
-    "cia-cascade (ADR-017, now IEC-unblocked)"
+    "vic-render (framebuffer+screenshot, ADR-026)",
+    "media (ADR-026)",
+    "daemon-trace-query (ADR-026)",
+    "drive-via2 (ADR-025)",
+    "cia-cascade (ADR-017)",
+    "sid (audio, Phase 1.5)"
   ],
-  "in_flight": {
-    "item": "protocol-surface",
-    "model": "sonnet",
-    "started": "2026-06-22T22:05:00Z"
-  },
+  "in_flight": null,
   "stage2_items": [
-    "protocol-surface",
     "snapshot-vsf"
   ],
   "resolved": [

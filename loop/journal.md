@@ -247,3 +247,15 @@ Phase-1 emulation parity is essentially PROVEN (full boot trace byte-exact). don
 items. Advancing to protocol-surface [sonnet] — the 50+ WS methods on the now-working
 machine (the drop-in completeness). Then snapshot-vsf. Corner gaps tracked: drive-via2,
 cia-cascade.
+
+## 2026-06-23 — DRIVER: protocol-surface (core) done
+
+Sonnet builder added ~40 WS methods to daemon main.rs (604→1250): inspection
+(monitorRegisters/Memory/Disasm, status), stepping (stepInto/Over/until, breakpoints,
+run_prg), lifecycle (debug/run|pause|continue|step, break_*, mark, port-race, crash-log).
+Honest NOT_IMPLEMENTED (ADR-019) for framebuffer + duckdb + media + vsf methods.
+Confirmation gate INDEPENDENT: 5 protocol scenarios GREEN + full regression GREEN. Arch
+clean (only daemon/main.rs; core untouched, ADR-002). Good TS findings (stepInto void;
+instructionsElapsed==cyclesElapsed; listBreakpoints mutates specs; continue doesn't bump
+frame). ADR-026: carved deferred groups into vic-render / media / daemon-trace-query.
+Merged → main. done: 8 items. Next: snapshot-vsf.

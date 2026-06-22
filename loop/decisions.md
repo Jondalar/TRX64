@@ -268,3 +268,19 @@ reads). It is the bus the drive-boot-idle gate depends on, so model it carefully
 regressing. Tracked, low priority (corner; boots + traces correctly without it).
 **Why:** A distinct subsystem, well-diagnosed; not worth risking the green drive gates by
 speculative modelling under the IEC item.
+
+## ADR-026 — protocol-surface core done; deferred method-groups carved into items
+**Context:** protocol-surface implemented the machine-backed + lifecycle WS methods
+(inspection: monitorRegisters/Memory/Disasm, status; stepping: stepInto/Over/until,
+breakpoints, run_prg; lifecycle: debug/run|pause|continue|step, break_*, mark, port-race,
+crash-log) — 5 protocol scenarios GREEN, no regression. Some methods were honestly
+NOT_IMPLEMENTED (ADR-019, no faking) because they need subsystems TRX64 lacks.
+**Decision:** Accept protocol-surface (core). Carve the deferred groups into tracked items:
+- `vic-render` [opus] — VIC pixel framebuffer → session/screenshot, runtime/render_screen,
+  vic/inspect/*, export screenshot/video. (Also the user-requested screenshot capability.)
+- `media` [sonnet] — media/ingress mount/eject/swap, swap_disk_and_continue (disk media).
+- `daemon-trace-query` [sonnet] — duckdb-backed daemon methods (trace/read, checkpoint/*,
+  recorder/*, memory_access_map). The query LAYER stays TS (ADR-001); these are the
+  daemon-side delegations — lower priority (MCP trace_store_* reads duckdb files directly).
+- vsf/* → the existing `snapshot-vsf` item.
+**Why:** Each deferred group is a real subsystem; honest carve-outs keep the gate truthful.
