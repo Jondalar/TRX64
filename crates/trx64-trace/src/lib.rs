@@ -23,6 +23,7 @@ pub enum TraceOp {
     CpuStep = 0x10,
     RamWrite = 0x11,
     IoWrite = 0x12,
+    VicRegWrite = 0x20,
     IecLine = 0x23,
 }
 
@@ -82,6 +83,23 @@ impl FrameSink {
         self.buf.push(b2);
     }
 
+    /// Encode a VIC_REG_WRITE frame (op 0x20, 13 bytes total: op + cycle f64 +
+    /// rasterY u16 + kind u8 + value u8) — byte-identical to TS
+    /// binary-format.ts `encodeVicEvent`. kind = VIC_KIND_CODE
+    /// (1=raster,2=mode,3=irq,4=badline).
+    ///
+    /// RESERVED in practice: the TS oracle's vic channel has no live producer, so
+    /// a parity trace never contains these. Provided for binary-format
+    /// completeness + future machine-integration use.
+    #[inline]
+    pub fn write_vic_event(&mut self, cycle: u64, raster_y: u16, kind: u8, value: u8) {
+        self.buf.push(TraceOp::VicRegWrite as u8);
+        self.buf.extend_from_slice(&(cycle as f64).to_le_bytes());
+        self.buf.extend_from_slice(&raster_y.to_le_bytes());
+        self.buf.push(kind);
+        self.buf.push(value);
+    }
+
     #[inline]
     #[allow(clippy::too_many_arguments)]
     fn write_mem_access(
@@ -105,17 +123,61 @@ impl FrameSink {
     }
 }
 
+/// Active trace channels, derived from the requested trace domains exactly like
+/// TS `domainsToChannels` (trace-definition.ts): c64-cpu→cpu, memory→bus_access
+/// (+io), vic→vic, iec→iec, sid→sid. A record is emitted ONLY if its channel is
+/// enabled. This is the load-bearing parity rule for chip-isolated traces: a
+/// vic-domain trace enables ONLY the `vic` channel, which has no producer, so
+/// the trace is empty — byte-identical to the TS oracle.
+#[derive(Clone, Copy, Debug)]
+pub struct TraceChannels {
+    /// `cpu` channel — emits CPU_STEP (0x10).
+    pub cpu: bool,
+    /// `bus_access` + `io` channels — emit RAM_WRITE (0x11) / IO_WRITE (0x12).
+    pub mem: bool,
+    /// `vic` channel — emits VIC_REG_WRITE (0x20). NO live producer (reserved).
+    pub vic: bool,
+}
+
+impl TraceChannels {
+    /// Map trace domains → channels (= TS domainsToChannels).
+    pub fn from_domains<S: AsRef<str>>(domains: &[S]) -> Self {
+        let mut c = TraceChannels { cpu: false, mem: false, vic: false };
+        for d in domains {
+            match d.as_ref() {
+                "c64-cpu" => c.cpu = true,
+                "memory" => c.mem = true,
+                "vic" | "c64-vic" => c.vic = true,
+                _ => {}
+            }
+        }
+        c
+    }
+
+    /// Default capture set (no domains given) = cpu + memory (TS daemon default).
+    pub fn default_cpu_mem() -> Self {
+        TraceChannels { cpu: true, mem: true, vic: true }
+    }
+}
+
 /// Streaming trace observer: encodes CpuStep + RAM/IO mem-access frames as the
-/// CPU executes. Bus events carry the live reg_pc + clk + pre-write old byte so
-/// each record is stamped exactly as the TS writer does.
+/// CPU executes, FILTERED by the active [`TraceChannels`]. Bus events carry the
+/// live reg_pc + clk + pre-write old byte so each record is stamped exactly as
+/// the TS writer does.
 pub struct TracingObserver {
     pub sink: FrameSink,
     pub event_count: u64,
+    pub channels: TraceChannels,
 }
 
 impl TracingObserver {
+    /// New observer capturing cpu + memory (the daemon default).
     pub fn new(sink: FrameSink) -> Self {
-        Self { sink, event_count: 0 }
+        Self { sink, event_count: 0, channels: TraceChannels::default_cpu_mem() }
+    }
+    /// New observer capturing only the given channels.
+    pub fn with_channels(sink: FrameSink, channels: TraceChannels) -> Self {
+        Self { sink, event_count: 0, channels }
     }
     pub fn into_buf(self) -> Vec<u8> {
         self.sink.buf
@@ -136,11 +198,17 @@ impl Observer for TracingObserver {
         p: u8,
         clk: u64,
     ) {
+        if !self.channels.cpu {
+            return;
+        }
         self.sink.write_cpu_step(clk, pc, opcode, a, x, y, sp, p, b1, b2);
         self.event_count += 1;
     }
 
     fn on_bus(&mut self, kind: BusKind, addr: u16, value: u8, pc: u16, clk: u64, old: u8) {
+        if !self.channels.mem {
+            return;
+        }
         // integrated-session.ts forwards only WRITE + READ to the producer;
         // FETCH and DUMMY_* are NOT emitted to the trace. The op byte
         // distinguishes read vs write.

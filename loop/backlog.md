@@ -38,8 +38,16 @@ one-line first-divergence). Driver model: `sonnet`. Verifier model: `haiku`.
 
 ## Stage 1 — parallel (worktree-isolated, on the stable CPU clock)
 
-- [ ] `vic-ii` — todo — `[model: opus]` — literal port. Badlines, BA-low, DMA, sprites.
-      Risk sink, expect the most iterations. Diff-clean on VIC corpus slice.
+- [x] `vic-ii` — **done** — `[model: opus]` — cycle-exact VIC-II (6569 PAL) in
+      trx64-core (vic.rs), ticked per CPU master cycle via VicBus ($D000-$D3FF→VIC).
+      Raster timing, badlines, sticky allow_bad_lines, BA-low cycle-stealing
+      (vicii_steal_cycles), sprite DMA, 9-bit raster IRQ. KEY: the TS `vic` trace
+      channel is RESERVED (no producer → empty trace, verified) — so the gate proves
+      (1) byte-identical empty vic trace + (2) c64Cycles matching TS via the badline
+      BA-low CPU read-stall (ADR-015/016). Bus trait gained default-no-op tick()+
+      check_ba_before_read (FlatRam unaffected → all CPU gates stay GREEN). 4 VIC
+      corpus gates GREEN (iso-vic-probe/-raster/-badline-irq/-sprites), 33 core tests,
+      no CPU regression. Pixel draw-cycle out of scope (never reaches trace).
 - [ ] `cia` — todo — `[model: opus]` — CIA1/CIA2 timers A/B, TOD, interrupt flags
       (timing edges are subtle).
 - [ ] `drive-iec` — todo — `[model: sonnet]` — drive 6510 + VIA x2 + GCR + IEC bus;

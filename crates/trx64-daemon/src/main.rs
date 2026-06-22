@@ -25,7 +25,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use trx64_core::NullSink;
 use trx64_session::{Session, TraceState};
-use trx64_trace::{FrameSink, TracingObserver};
+use trx64_trace::{FrameSink, TraceChannels, TracingObserver};
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -115,19 +115,36 @@ fn default_trace_output(session_id: &str) -> PathBuf {
 /// Run a cycle budget (= TS session/run). Instruction-stepped: execute whole
 /// instructions until `clk - start >= budget`. Streams trace frames if active.
 fn run_cycle_budget(session: &mut Session, budget: u64) {
-    if let Some(tstate) = session.trace.as_mut() {
-        // First run after start: write the file header into the buffer.
-        if tstate.buf.is_empty() {
-            tstate.buf = FrameSink::with_header(&tstate.meta_json).buf;
-        }
-        // Accumulate events from this run, then append to the persistent buffer.
-        let mut obs = TracingObserver::new(FrameSink::events_only());
-        session.machine.run_for_with(budget, &mut obs);
-        tstate.event_count += obs.event_count;
-        tstate.buf.extend_from_slice(&obs.into_buf());
-    } else {
+    // Domain → channel mapping (= TS domainsToChannels). When the vic domain is
+    // active the VIC must be ticked per CPU cycle (VIC-isolated run path); the
+    // record filter then yields an EMPTY trace for a vic-only domain set (the
+    // oracle's vic channel has no producer), and the normal cpu/memory frames
+    // when those domains are requested.
+    let Some((channels, need_header, meta_json)) = session.trace.as_ref().map(|t| {
+        (TraceChannels::from_domains(&t.domains), t.buf.is_empty(), t.meta_json.clone())
+    }) else {
+        // No active trace: run untraced.
         let mut obs = NullSink;
         session.machine.run_for(budget, &mut obs);
+        return;
+    };
+    // First run after start: write the file header into the buffer.
+    if need_header {
+        if let Some(t) = session.trace.as_mut() {
+            t.buf = FrameSink::with_header(&meta_json).buf;
+        }
+    }
+    let vic_active = channels.vic;
+    // Accumulate events from this run, then append to the persistent buffer.
+    let mut obs = TracingObserver::with_channels(FrameSink::events_only(), channels);
+    if vic_active {
+        session.machine.run_for_vic(budget, &mut obs);
+    } else {
+        session.machine.run_for_with(budget, &mut obs);
+    }
+    if let Some(t) = session.trace.as_mut() {
+        t.event_count += obs.event_count;
+        t.buf.extend_from_slice(&obs.into_buf());
     }
 }
 
@@ -354,6 +371,7 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 buf: Vec::new(),
                 run_id: run_id.clone(),
                 event_count: 0,
+                domains: domains.clone(),
             });
             Response::ok(id, json!({
                 "run": {

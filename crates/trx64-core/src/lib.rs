@@ -11,8 +11,10 @@ use std::path::Path;
 
 pub mod cpu;
 pub mod tables;
+pub mod vic;
 
 pub use cpu::{Bus, Cpu6510};
+pub use vic::VicII;
 
 /// Zero-cost observation hook, inlined into the core step loop.
 ///
@@ -43,6 +45,17 @@ pub trait Observer {
     /// byte at `addr` for WRITE events (Spec 753 mutation surface), else 0.
     fn on_bus(&mut self, kind: BusKind, addr: u16, value: u8, pc: u16, clk: u64, old: u8);
     fn on_interrupt(&mut self, vector: u16, clk: u64);
+    /// Fired when the VIC observes a register write that the TS `vic` trace
+    /// channel would tag (raster/mode/irq). `clk` = master clock at the write,
+    /// `raster_y` = VIC raster line at that cycle, `kind` = VIC_KIND_CODE
+    /// (1=raster,2=mode,3=irq,4=badline), `value` = byte written.
+    ///
+    /// NOTE: the TS oracle's vic channel has NO live producer, so a parity sink
+    /// MUST NOT emit these into the gate trace (the golden vic trace is empty).
+    /// The hook exists for binary-format completeness + future integration; the
+    /// default is a no-op and the daemon's domain filter never enables it.
+    #[inline]
+    fn on_vic_reg(&mut self, _clk: u64, _raster_y: u16, _kind: u8, _value: u8) {}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,6 +126,48 @@ impl<'a> Bus for FlatRam<'a> {
     }
 }
 
+/// VIC-isolated bus (ADR-012): routes $D000-$D3FF to the VIC-II register file
+/// (the VIC mirrors every $40 bytes across the 1 KiB I/O block) and flat 64K RAM
+/// everywhere else. No PLA banking, no CIA, no $00/$01 port — exactly the
+/// chip-isolation gate the CPU-isolated exerciser (SEI; minimal loop + VIC
+/// register writes) needs. The VIC itself is CLOCK-DRIVEN and ticked once per
+/// CPU master cycle by the Machine run loop, NOT by bus accesses.
+pub struct VicBus<'a> {
+    pub mem: &'a mut [u8; 0x10000],
+    pub vic: &'a mut crate::vic::VicII,
+}
+
+impl<'a> Bus for VicBus<'a> {
+    #[inline]
+    fn read(&mut self, addr: u16) -> u8 {
+        if (0xd000..0xd400).contains(&addr) {
+            self.vic.read_reg(addr as u8)
+        } else {
+            self.mem[addr as usize]
+        }
+    }
+    #[inline]
+    fn write(&mut self, addr: u16, value: u8) {
+        if (0xd000..0xd400).contains(&addr) {
+            self.vic.write_reg(addr as u8, value);
+        } else {
+            self.mem[addr as usize] = value;
+        }
+    }
+    /// One VIC master cycle per CPU master cycle (= c64ViciiCycle hook). Latches
+    /// BA-low into the VIC's ba_low_flag for the next read-stall.
+    #[inline]
+    fn tick(&mut self) {
+        self.vic.tick();
+    }
+    /// VICE check_ba(): stall the CPU read while BA is low (badline / sprite DMA),
+    /// stealing cycles + advancing the VIC. Returns the stolen-cycle count.
+    #[inline]
+    fn check_ba_before_read(&mut self) -> u32 {
+        self.vic.steal_cycles()
+    }
+}
+
 /// Full mutable machine state (~75 KiB headless).
 ///
 /// `Clone` is intentional and load-bearing: a clone is the cheap COW fork base for
@@ -126,6 +181,10 @@ pub struct Machine {
     pub cpu6510: Cpu6510,
     /// Legacy register-snapshot view kept in sync for daemon readers.
     pub cpu: Cpu,
+    /// Cycle-exact VIC-II. CLOCK-DRIVEN: ticked once per CPU master cycle by the
+    /// VIC-isolated run path (`run_for_vic*`). Raster/badline/BA advance off the
+    /// CPU clock regardless of CPU execution (ADR-012 isolation gate).
+    pub vic: VicII,
 }
 
 /// ROM load error.
@@ -160,6 +219,7 @@ impl Machine {
             clk: 0,
             cpu6510: Cpu6510::new(),
             cpu: Cpu::default(),
+            vic: VicII::new(),
         }
     }
 
@@ -313,6 +373,50 @@ impl Machine {
             // loop body (stepC64Instruction + i++) on a halted CPU. This is
             // load-bearing: a JAM-terminated exerciser then trips the
             // instruction cap (ceil(budget/2)+1000) at the same cycle the TS does.
+            loop {
+                self.cpu6510.execute_cycle(&mut bus, obs);
+                if self.cpu6510.is_at_boundary() {
+                    break;
+                }
+            }
+            executed += 1;
+        }
+        drop(bus);
+        self.sync_snapshot();
+    }
+
+    /// VIC-isolated run (= TS session/run with the VIC ticked per CPU cycle).
+    /// Identical budget/instruction-cap semantics to [`run_for`], but the bus is
+    /// the [`VicBus`] ($D000-$D3FF → VIC) and the VIC is CLOCK-DRIVEN through the
+    /// `Bus::tick` / `Bus::check_ba_before_read` hooks the CPU calls per master
+    /// cycle: the VIC advances once per CPU cycle and STEALS read cycles when BA
+    /// is low (badline c-access / sprite DMA), so c64Cycles ends exactly as the
+    /// TS daemon's (whose CPU stalls the same way — vicii_steal_cycles). This is
+    /// the cycle-exact VIC↔CPU coupling.
+    pub fn run_for_vic<O: Observer>(&mut self, budget: u64, obs: &mut O) {
+        let max_instructions = budget.div_ceil(2) + 1000;
+        self.run_for_vic_capped(budget, max_instructions, obs);
+    }
+
+    /// VIC-isolated run with an explicit instruction cap (see [`run_for_capped`]).
+    pub fn run_for_vic_capped<O: Observer>(
+        &mut self,
+        budget: u64,
+        max_instructions: u64,
+        obs: &mut O,
+    ) {
+        let start = self.cpu6510.clk;
+        let mut executed: u64 = 0;
+        let mut bus = VicBus { mem: &mut self.ram, vic: &mut self.vic };
+        loop {
+            if self.cpu6510.clk.wrapping_sub(start) >= budget {
+                break;
+            }
+            if executed >= max_instructions {
+                break;
+            }
+            // Step a whole instruction; the VIC ticks per master cycle via the
+            // bus hooks (Bus::tick) and steals read cycles via check_ba_before_read.
             loop {
                 self.cpu6510.execute_cycle(&mut bus, obs);
                 if self.cpu6510.is_at_boundary() {

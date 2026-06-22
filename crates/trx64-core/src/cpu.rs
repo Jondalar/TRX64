@@ -29,6 +29,27 @@ const P_CARRY: u8 = 0x01;
 pub trait Bus {
     fn read(&mut self, addr: u16) -> u8;
     fn write(&mut self, addr: u16, value: u8);
+
+    /// Per-master-cycle clock tick for clock-driven chips on the bus (VIC-II).
+    /// Called once from [`Cpu6510::tick`] for EVERY master cycle the CPU advances
+    /// (incl. taken-branch / page-cross / RMW-dummy extra cycles). The VIC-routing
+    /// bus advances the VIC here and latches BA-low. Default no-op, so the plain
+    /// CPU-isolated RAM bus is untouched. (= cpu65xx-vice.ts tick() → c64ViciiCycle.)
+    #[inline]
+    fn tick(&mut self) {}
+
+    /// VICE check_ba() / vicii_steal_cycles read-stall (mainc64cpu.c / vicii-
+    /// cycle.c:628). Called from [`Cpu6510::load`] BEFORE every CPU READ. If VIC
+    /// BA is low (a badline c-access / sprite-DMA window), the VIC STEALS the bus:
+    /// the CPU is stalled `do { clk++; baLow = vicii_cycle(); } while (baLow)`.
+    /// Returns the number of stall cycles consumed (each of which also advanced
+    /// the VIC). The CPU adds these to its clock. Default 0 (no stall). Writes do
+    /// NOT stall (this is called only from load()). This is the cycle-exact
+    /// VIC↔CPU coupling that shifts instruction timing on badlines.
+    #[inline]
+    fn check_ba_before_read(&mut self) -> u32 {
+        0
+    }
 }
 
 /// In-flight instruction microcode state (= TS `InstructionState`).
@@ -119,6 +140,13 @@ impl Cpu6510 {
     // -------- bus primitives --------
     #[inline]
     fn load<B: Bus, O: Observer>(&mut self, bus: &mut B, _obs: &mut O, addr: u16) -> u8 {
+        // VICE check_ba(): a VIC badline / sprite-DMA BA-low window stalls the CPU
+        // before a read, stealing bus cycles (and advancing the VIC). On the plain
+        // RAM bus this is a no-op (returns 0).
+        let stalls = bus.check_ba_before_read();
+        if stalls != 0 {
+            self.clk = self.clk.wrapping_add(stalls as u64);
+        }
         bus.read(addr)
     }
 
@@ -187,16 +215,19 @@ impl Cpu6510 {
     }
 
     // -------- CLK_INC tick (c64cpusc.c:47) --------
-    // Isolated gate: no alarm context, no VIC hook. tick() is just clk++.
+    // Every master-cycle increment ticks the bus's clock-driven chips (VIC-II)
+    // once, mirroring cpu65xx-vice.ts tick() → c64ViciiCycle. On the plain RAM
+    // bus `bus.tick()` is a no-op, so the CPU-isolated gate is unaffected.
     #[inline]
-    fn tick(&mut self) {
+    fn tick<B: Bus>(&mut self, bus: &mut B) {
         self.clk = self.clk.wrapping_add(1);
+        bus.tick();
     }
 
     // -------- per-cycle entry (= executeCycle) --------
     pub fn execute_cycle<B: Bus, O: Observer>(&mut self, bus: &mut B, obs: &mut O) {
         if self.jammed {
-            self.tick();
+            self.tick(bus);
             return;
         }
         self.interrupt_dispatched_this_cycle = false;
@@ -206,7 +237,7 @@ impl Cpu6510 {
             self.continue_instruction_cycle(bus, obs);
         }
         if !self.interrupt_dispatched_this_cycle {
-            self.tick();
+            self.tick(bus);
         }
     }
 
@@ -363,7 +394,7 @@ impl Cpu6510 {
                 s.ea = ea;
                 if (base & 0xff00) != (ea & 0xff00) {
                     self.load_dummy(bus, obs, (base & 0xff00) | (ea & 0xff));
-                    self.tick();
+                    self.tick(bus);
                 }
                 s.fetched_value = self.load_read(bus, obs, ea);
             }
@@ -373,7 +404,7 @@ impl Cpu6510 {
                 s.ea = ea;
                 if (base & 0xff00) != (ea & 0xff00) {
                     self.load_dummy(bus, obs, (base & 0xff00) | (ea & 0xff));
-                    self.tick();
+                    self.tick(bus);
                 }
                 s.fetched_value = self.load_read(bus, obs, ea);
             }
@@ -486,14 +517,14 @@ impl Cpu6510 {
             "pha" | "php" => {}
             "pla" => { self.reg_a = s.fetched_value; self.update_nz(self.reg_a); }
             "plp" => { self.set_flags(s.fetched_value & !0x10); }
-            "bcc" => { if self.reg_p & P_CARRY == 0 { self.take_branch(obs, s.operand_lo as u8); } }
-            "bcs" => { if self.reg_p & P_CARRY != 0 { self.take_branch(obs, s.operand_lo as u8); } }
-            "bne" => { if self.flag_z != 0 { self.take_branch(obs, s.operand_lo as u8); } }
-            "beq" => { if self.flag_z == 0 { self.take_branch(obs, s.operand_lo as u8); } }
-            "bpl" => { if self.flag_n & 0x80 == 0 { self.take_branch(obs, s.operand_lo as u8); } }
-            "bmi" => { if self.flag_n & 0x80 != 0 { self.take_branch(obs, s.operand_lo as u8); } }
-            "bvc" => { if self.reg_p & P_OVERFLOW == 0 { self.take_branch(obs, s.operand_lo as u8); } }
-            "bvs" => { if self.reg_p & P_OVERFLOW != 0 { self.take_branch(obs, s.operand_lo as u8); } }
+            "bcc" => { if self.reg_p & P_CARRY == 0 { self.take_branch(bus, obs, s.operand_lo as u8); } }
+            "bcs" => { if self.reg_p & P_CARRY != 0 { self.take_branch(bus, obs, s.operand_lo as u8); } }
+            "bne" => { if self.flag_z != 0 { self.take_branch(bus, obs, s.operand_lo as u8); } }
+            "beq" => { if self.flag_z == 0 { self.take_branch(bus, obs, s.operand_lo as u8); } }
+            "bpl" => { if self.flag_n & 0x80 == 0 { self.take_branch(bus, obs, s.operand_lo as u8); } }
+            "bmi" => { if self.flag_n & 0x80 != 0 { self.take_branch(bus, obs, s.operand_lo as u8); } }
+            "bvc" => { if self.reg_p & P_OVERFLOW == 0 { self.take_branch(bus, obs, s.operand_lo as u8); } }
+            "bvs" => { if self.reg_p & P_OVERFLOW != 0 { self.take_branch(bus, obs, s.operand_lo as u8); } }
             "jmp" => { if mode == "abs" { self.reg_pc = s.ea; } }
             "jsr" => { self.reg_pc = s.operand_lo | (s.operand_hi << 8); }
             "rts" => { self.reg_pc = self.reg_pc.wrapping_add(1); }
@@ -553,13 +584,13 @@ impl Cpu6510 {
         self.store(bus, obs, s.ea, v);
     }
 
-    fn take_branch<O: Observer>(&mut self, _obs: &mut O, offset: u8) {
+    fn take_branch<B: Bus, O: Observer>(&mut self, bus: &mut B, _obs: &mut O, offset: u8) {
         let signed = offset as i8 as i16;
         let old_pc = self.reg_pc;
         self.reg_pc = (self.reg_pc as i16).wrapping_add(signed) as u16;
-        self.tick(); // branch taken = +1 cycle
+        self.tick(bus); // branch taken = +1 cycle
         if (old_pc & 0xff00) != (self.reg_pc & 0xff00) {
-            self.tick(); // page cross = +1
+            self.tick(bus); // page cross = +1
         }
     }
 

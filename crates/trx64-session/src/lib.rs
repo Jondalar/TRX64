@@ -30,6 +30,10 @@ pub struct TraceState {
     /// runId for status replies.
     pub run_id: String,
     pub event_count: u64,
+    /// Domains requested for this trace (= TS trace/start_domains domains). The
+    /// daemon maps these → channels to filter which records are emitted, and
+    /// whether the VIC must be ticked (vic domain → VIC-isolated run path).
+    pub domains: Vec<String>,
 }
 
 impl Session {

@@ -126,3 +126,40 @@ ADR-012 (each chip verified against its own domain via a chip-specific Bus) STIL
 **Why:** No worktree support; serial avoids merge conflicts on shared plumbing and is
 more robust for unattended overnight operation; fits one-iteration-per-tick. Revisit
 parallel if WorktreeCreate hooks get configured.
+
+## ADR-015 — The VIC trace channel is RESERVED: the gate proves the empty trace + cycle coupling
+**Context:** The vic-ii builder was tasked to verify a cycle-exact VIC-II "byte-for-byte
+on the VIC trace domain." Investigation of the TS oracle (the immovable spec) found the
+`vic` trace channel has SCHEMA + encoder + decoder + kind-codes (VIC_REG_WRITE 0x20,
+{raster:1,mode:2,irq:3,badline:4}) but NO LIVE PRODUCER: nothing calls `publish("vic",…)`
+(tickLitVic advances raster/framebuffer but emits no trace event). Verified empirically —
+a vic-domain `.c64retrace` over a full PAL frame with VIC-register writes yields ZERO
+records (binary-format.ts §"RESERVED … never emitted").
+**Decision:** The VIC parity gate is therefore TWO facts, both now GREEN: (1) the vic-domain
+trace is byte-identically EMPTY, and (2) `session/run` `c64Cycles` matches the TS daemon —
+which requires the cycle-exact VIC↔CPU coupling (badline + sprite-DMA BA-low STEALS read
+cycles via `vicii_steal_cycles`), since that shifts CPU instruction timing. The VIC core
+(raster/badline/BA/sprite-DMA) is built cycle-exact in trx64-core and ticked once per CPU
+master cycle; the daemon honors the domain→channel filter (= TS `domainsToChannels`) so a
+vic-only domain enables only the producer-less `vic` channel (empty), while cpu/memory
+domains are unaffected. A VIC_REG_WRITE encoder + `Observer::on_vic_reg` hook exist for
+binary-format completeness + future integration, but are NEVER emitted into a parity trace.
+Pixel draw-cycle / framebuffer is OUT of scope (it never reaches the trace).
+**Why:** The oracle is ground truth (ADR-004). Matching it byte-for-byte means reproducing
+its reserved-channel reality, not inventing VIC trace records the spec never emits. The
+real, verifiable VIC correctness surface is the cycle coupling (badline cycle-stealing),
+which the gate DOES exercise via `c64Cycles`.
+
+## ADR-016 — The `Bus` trait gains per-cycle `tick()` + `check_ba_before_read()` (VIC coupling)
+**Context:** Cycle-exact VIC↔CPU coupling needs the VIC ticked once per CPU master cycle
+and the CPU read-stalled while VIC BA is low (badline/sprite DMA) — VICE
+cpu65xx-vice.ts `tick()`→c64ViciiCycle and `load()`→checkBaBeforeRead/vicii_steal_cycles.
+**Decision:** Extend the `Bus` trait (ADR-010) with two DEFAULT-NO-OP hooks: `tick(&mut)`
+(called from `Cpu6510::tick` for every master cycle) and `check_ba_before_read(&mut)->u32`
+(called from `Cpu6510::load` before every read, returns stolen-cycle count). FlatRam keeps
+the defaults, so the CPU-isolated gate is byte-identical (all CPU gates stay GREEN). The
+`VicBus` ($D000-$D3FF→VIC, flat RAM elsewhere) overrides both: tick advances the VIC +
+latches BA-low; check_ba runs the `do{clk++; ba=vicii_cycle()}while(ba)` steal. The 6510
+microcode/correctness is untouched — only the clock plumbing is threaded.
+**Why:** Keeps the CPU generic + isolated (ADR-005/010) while enabling exact chip coupling
+through the same `Bus` seam composition will use later. Same pattern will serve CIA.

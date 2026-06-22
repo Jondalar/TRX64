@@ -108,3 +108,38 @@ full-boot-path only, resolve at integration. NOT a CPU defect.
 
 Advancing to STAGE 1 (parallel): vic-ii [opus] ∥ cia [opus] ∥ drive-iec [sonnet],
 worktree-isolated. Next tick dispatches the set.
+
+## 2026-06-22 — vic-ii: cycle-exact VIC-II + badline cycle-stealing, GATE GREEN
+
+Built cycle-exact VIC-II (6569 PAL) in trx64-core (`vic.rs`), ticked once per CPU master
+cycle, gated CPU-isolated via a `VicBus` ($D000-$D3FF→VIC, flat RAM elsewhere).
+
+DECISIVE FINDING (ADR-015): the TS oracle's `vic` trace channel has schema+encoder+decoder
++kind-codes but NO LIVE PRODUCER — nothing calls publish("vic",…). Verified empirically: a
+vic-domain .c64retrace over a full PAL frame = ZERO records. So VIC parity = (1) empty vic
+trace + (2) c64Cycles matching TS, which forced the real work: the badline / sprite-DMA
+BA-low CPU read-stall (vicii_steal_cycles), since it shifts CPU instruction timing.
+
+Built incrementally (raster→badline/BA→DMA→sprites):
+- raster counter (63cyc/line, 312 lines PAL), reg file $D000-$D02E, $D011/$D012 9-bit raster
+  IRQ compare (edge-triggered raster_irq_triggered), $D019 write-1-to-clear, IRQ line level.
+- badline detection ((line&7)==ysmooth && allow_bad_lines && 0x30..0xf7), sticky
+  allow_bad_lines (DEN on first_dma_line), BA-low BaFetch window raster_cycle 12..54.
+- sprite DMA turn-on (cycle 55/56, Y==line, enabled), sprite-fetch BA window.
+- VIC↔CPU coupling (ADR-016): Bus trait gained default-no-op tick()+check_ba_before_read();
+  Cpu6510::tick→bus.tick (per master cycle), Cpu6510::load→bus.check_ba_before_read (steal).
+  FlatRam keeps defaults → every CPU gate stays byte-identical. VicBus does the steal loop.
+- tick() reordered to VICE vicii_cycle() exact order (raster_cycle++ FIRST, then line wrap
+  at cyc 0, allow_bad_lines, badline, edge raster IRQ, sprite DMA, BA) — this fixed the last
+  off-by-1/2 c64Cycles divergences.
+- trx64-trace: VIC_REG_WRITE (0x20, 13 bytes) encoder + TraceChannels (domains→channels =
+  TS domainsToChannels) record filter; daemon trace/start_domains stores domains, run path
+  uses run_for_vic + channel filter (vic-only → empty trace; cpu/memory unchanged).
+
+GATE GREEN: all 4 VIC corpus scenarios (corpus/vic/: iso-vic-probe, -raster, -badline-irq,
+-sprites) — byte-identical responses + empty vic trace + exact c64Cycles. NO CPU regression
+(7 CPU gates GREEN). 33 core unit tests pass. clippy clean (only pre-existing-pattern warns).
+
+OPEN: none in VIC scope. boot-trace-short (P-flag, ADR-011) + boot-basic-ready (driveCycles)
+remain RED — both integration/full-boot items, not VIC. Pixel draw-cycle/framebuffer
+intentionally not ported (never reaches the trace; ADR-015).
