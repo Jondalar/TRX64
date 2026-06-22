@@ -212,15 +212,15 @@ impl Machine {
     /// Cold reset: read the reset vector from $FFFC/$FFFD (KERNAL must be loaded)
     /// and set PC. All other registers set to power-on defaults.
     /// Apply the VICE power-on DRAM fill pattern (= memory-bus.ts reset +
-    /// applyRamFillPattern). Empirically verified against the live runtime's
-    /// trace oldValue: 128-byte alternating blocks, $0000-$007F = $00,
-    /// $0080-$00FF = $FF, $0100-$017F = $00, $0180-$01FF = $FF, ... i.e.
-    /// `((addr >> 7) & 1) ? 0xFF : 0x00`. This is the oldValue/read source for
-    /// the trace, so it must be byte-exact. ROM regions are overwritten by the
-    /// ROM loads afterward.
+    /// applyRamFillPattern, `value_invert=64`). Empirically verified against the
+    /// live runtime's trace oldValue: 64-byte alternating blocks —
+    /// $00xx-$003F = $00, $0040-$007F = $FF, $0080-$00BF = $00, $00C0-$00FF =
+    /// $FF, ... i.e. `(addr & 0x40) ? 0xFF : 0x00`. This is the oldValue/read
+    /// source for the trace, so it must be byte-exact. ROM regions are
+    /// overwritten by the ROM loads afterward.
     pub fn fill_power_on_ram(&mut self) {
         for addr in 0..0x10000usize {
-            self.ram[addr] = if (addr >> 7) & 1 != 0 { 0xFF } else { 0x00 };
+            self.ram[addr] = if addr & 0x40 != 0 { 0xFF } else { 0x00 };
         }
     }
 
