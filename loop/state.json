@@ -7,5 +7,6 @@
   "ts_runtime_root": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP",
   "ts_spec_root": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/src/runtime",
   "done": ["oracle-harness", "core-substrate"],
-  "updated": "2026-06-22"
+  "in_flight": { "item": "cpu-6510", "started": "2026-06-22T16:48:46Z" },
+  "updated": "2026-06-22T16:48:46Z"
 }

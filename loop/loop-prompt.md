@@ -19,6 +19,12 @@ TS runtime as golden oracle.
 **STATE — read first, every iteration:**
 `loop/state.json`, `loop/backlog.md`, tail of `loop/journal.md`, `git log`.
 
+**CONCURRENCY GUARD (check first):** if `state.json.in_flight` is set and its `started`
+is under 35 minutes ago, a builder is probably still running — do NOTHING this tick,
+just exit. Set `in_flight {item, started}` right before dispatching a builder; clear it
+(set null) after the gate completes. This stops a 30-min tick from double-dispatching a
+long builder.
+
 **EACH ITERATION:**
 1. Read state. Pick the next actionable item per the sequencing rules:
    - Stage 0 SERIAL: `oracle-harness` → `core-substrate` → `cpu-6510`.
