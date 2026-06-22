@@ -16,6 +16,7 @@ pub mod full;
 pub mod iec;
 pub mod tables;
 pub mod vic;
+pub mod vsf;
 
 pub use cia::Cia;
 pub use cpu::{Bus, Cpu6510};

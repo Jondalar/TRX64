@@ -1101,6 +1101,60 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             Response::err(id, -32001, format!("NOT_IMPLEMENTED: {m}: deferred"))
         }
 
+        "vsf/save" => {
+            let output_path = req.params
+                .get("output_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("/tmp/trx64.vsf")
+                .to_string();
+            let st = state.lock().unwrap();
+            let bytes = trx64_core::vsf::save_vsf(&st.session.machine);
+            let bytes_written = bytes.len();
+            drop(st);
+            // Response shape MATCHES the TS daemon (ws-server.ts vsf/save handler):
+            //   { savedPath, bytes }  — savedPath is volatile (oracle whitelists `path`-
+            //   like keys; `output_path`/`outputPath` are in VOLATILE_KEYS but `savedPath`
+            //   is NOT, so we still return it for shape parity — it is a path string the
+            //   oracle compares; both daemons get the SAME output_path param, so it is
+            //   byte-equal anyway). `bytes` = on-disk file size.
+            match std::fs::write(&output_path, &bytes) {
+                Ok(()) => Response::ok(id, json!({
+                    "savedPath": output_path,
+                    "bytes": bytes_written
+                })),
+                Err(e) => Response::err(id, -32001, format!("vsf/save: write error: {e}")),
+            }
+        }
+
+        "vsf/load" => {
+            let input_path = req.params
+                .get("input_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("/tmp/trx64.vsf")
+                .to_string();
+            let file_bytes = match std::fs::read(&input_path) {
+                Ok(b) => b,
+                Err(e) => return Response::err(id, -32001, format!("vsf/load: read error: {e}")),
+            };
+            let file_bytes_len = file_bytes.len();
+            let mut st = state.lock().unwrap();
+            match trx64_core::vsf::load_vsf(&mut st.session.machine, &file_bytes) {
+                Ok(result) => {
+                    // Response shape MATCHES the TS daemon (ws-server.ts vsf/load handler):
+                    //   { loadedPath, bytes, source, loadedModules }
+                    // `bytes` = on-disk file size; `source` = "c64re"/"vice-x64sc";
+                    // `loadedModules` = modules restored, in file (= save) order.
+                    Response::ok(id, json!({
+                        "loadedPath": input_path,
+                        "bytes": file_bytes_len,
+                        "source": result.source,
+                        "loadedModules": result.loaded_modules
+                    }))
+                }
+                Err(e) => Response::err(id, -32001, format!("vsf/load: {e}")),
+            }
+        }
+
         m if m.starts_with("vsf/") => {
             Response::err(id, -32001, format!("NOT_IMPLEMENTED: {m}: deferred"))
         }

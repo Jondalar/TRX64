@@ -1,0 +1,14 @@
+{
+  "name": "vsf-save-load-roundtrip",
+  "slice": "full",
+  "steps": [
+    { "method": "session/create", "params": { "pal": true }, "capture": false },
+    { "method": "session/run", "params": { "session_id": "$sessionId", "cycles": 50000 }, "capture": false },
+    { "method": "session/state", "params": { "session_id": "$sessionId" }, "capture": true, "label": "state-before-save" },
+    { "method": "vsf/save", "params": { "session_id": "$sessionId", "output_path": "/tmp/trx64-vsf-test.vsf" }, "capture": false, "label": "vsf-save" },
+    { "method": "vsf/load", "params": { "session_id": "$sessionId", "input_path": "/tmp/trx64-vsf-test.vsf" }, "capture": false, "label": "vsf-load" },
+    { "method": "session/state", "params": { "session_id": "$sessionId" }, "capture": true, "label": "state-after-load" },
+    { "method": "session/run", "params": { "session_id": "$sessionId", "cycles": 10000 }, "capture": false },
+    { "method": "session/state", "params": { "session_id": "$sessionId" }, "capture": true, "label": "state-after-run" }
+  ]
+}

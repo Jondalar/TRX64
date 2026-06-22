@@ -57,6 +57,17 @@ impl Session {
     pub fn boot(&mut self, rom_dir: &std::path::Path) -> Result<(), trx64_core::RomError> {
         self.machine.boot_from_dir(rom_dir)
     }
+
+    /// Native fast snapshot: clone the Machine (ADR-002).
+    /// Zero-copy for Phase-2 COW forks.
+    pub fn take_snapshot(&self) -> Machine {
+        self.machine.clone()
+    }
+
+    /// Restore from a native snapshot.
+    pub fn restore_snapshot(&mut self, snap: Machine) {
+        self.machine = snap;
+    }
 }
 
 /// Phase-2 mutation-search primitive (sketch — built after Phase-1 parity is green).

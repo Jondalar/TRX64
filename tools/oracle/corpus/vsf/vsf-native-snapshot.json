@@ -1,0 +1,14 @@
+{
+  "name": "vsf-native-snapshot",
+  "slice": "full",
+  "steps": [
+    { "method": "session/create", "params": { "pal": true }, "capture": false },
+    { "method": "session/run", "params": { "session_id": "$sessionId", "cycles": 100000 }, "capture": false },
+    { "method": "session/state", "params": { "session_id": "$sessionId" }, "capture": true, "label": "state-before" },
+    { "method": "vsf/save", "params": { "session_id": "$sessionId", "output_path": "/tmp/trx64-native-snap.vsf" }, "capture": false, "label": "save" },
+    { "method": "vsf/load", "params": { "session_id": "$sessionId", "input_path": "/tmp/trx64-native-snap.vsf" }, "capture": false, "label": "load" },
+    { "method": "session/state", "params": { "session_id": "$sessionId" }, "capture": true, "label": "state-restored" },
+    { "method": "session/run", "params": { "session_id": "$sessionId", "cycles": 20000 }, "capture": false },
+    { "method": "session/state", "params": { "session_id": "$sessionId" }, "capture": true, "label": "state-after-run" }
+  ]
+}
