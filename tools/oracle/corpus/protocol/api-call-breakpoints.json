@@ -1,0 +1,12 @@
+{
+  "name": "api-call-breakpoints",
+  "slice": "cpu",
+  "steps": [
+    { "method": "session/create", "params": { "pal": true }, "capture": false, "label": "create" },
+    { "method": "session/run", "params": { "session_id": "$sessionId", "cycles": 50000 }, "label": "boot" },
+    { "method": "api/call", "params": { "session_id": "$sessionId", "method": "addPcBreakpoint", "args": ["bp-1", 64738, "halt"] }, "capture": true, "label": "add-bp" },
+    { "method": "api/call", "params": { "session_id": "$sessionId", "method": "listBreakpoints", "args": [] }, "capture": true, "label": "list-bps" },
+    { "method": "api/call", "params": { "session_id": "$sessionId", "method": "removeBreakpoint", "args": ["bp-1"] }, "capture": true, "label": "remove-bp" },
+    { "method": "api/call", "params": { "session_id": "$sessionId", "method": "listBreakpoints", "args": [] }, "capture": true, "label": "list-bps-empty" }
+  ]
+}

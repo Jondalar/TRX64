@@ -1,0 +1,12 @@
+{
+  "name": "api-call-stepping",
+  "slice": "cpu",
+  "steps": [
+    { "method": "session/create", "params": { "pal": true }, "capture": false, "label": "create" },
+    { "method": "session/run", "params": { "session_id": "$sessionId", "cycles": 50000 }, "label": "boot" },
+    { "method": "api/call", "params": { "session_id": "$sessionId", "method": "monitorRegisters", "args": [] }, "capture": true, "label": "regs-before" },
+    { "method": "api/call", "params": { "session_id": "$sessionId", "method": "stepInto", "args": [] }, "capture": true, "label": "step-into" },
+    { "method": "api/call", "params": { "session_id": "$sessionId", "method": "stepOver", "args": [] }, "capture": true, "label": "step-over" },
+    { "method": "api/call", "params": { "session_id": "$sessionId", "method": "monitorRegisters", "args": [] }, "capture": true, "label": "regs-after" }
+  ]
+}

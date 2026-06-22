@@ -1,0 +1,12 @@
+{
+  "name": "api-call-monitor",
+  "slice": "cpu",
+  "steps": [
+    { "method": "session/create", "params": { "pal": true }, "capture": false, "label": "create" },
+    { "method": "session/run", "params": { "session_id": "$sessionId", "cycles": 50000 }, "label": "boot" },
+    { "method": "api/call", "params": { "session_id": "$sessionId", "method": "monitorRegisters", "args": [] }, "capture": true, "label": "registers" },
+    { "method": "api/call", "params": { "session_id": "$sessionId", "method": "monitorMemory", "args": [65280, 65295] }, "capture": true, "label": "memory-io-bank" },
+    { "method": "api/call", "params": { "session_id": "$sessionId", "method": "monitorDisasm", "args": [64738, 5] }, "capture": true, "label": "disasm-reset" },
+    { "method": "api/call", "params": { "session_id": "$sessionId", "method": "status", "args": [] }, "capture": true, "label": "status" }
+  ]
+}

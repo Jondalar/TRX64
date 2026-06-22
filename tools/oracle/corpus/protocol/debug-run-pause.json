@@ -1,0 +1,10 @@
+{
+  "name": "debug-run-pause",
+  "slice": "cpu",
+  "steps": [
+    { "method": "session/create", "params": { "pal": true }, "capture": false, "label": "create" },
+    { "method": "debug/pause", "params": { "session_id": "$sessionId", "source": "llm" }, "capture": true, "label": "pause" },
+    { "method": "debug/continue", "params": { "session_id": "$sessionId", "source": "llm" }, "capture": true, "label": "continue" },
+    { "method": "debug/run", "params": { "session_id": "$sessionId", "source": "llm" }, "capture": false, "label": "run" }
+  ]
+}

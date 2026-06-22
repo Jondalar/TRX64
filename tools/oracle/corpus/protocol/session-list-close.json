@@ -1,0 +1,9 @@
+{
+  "name": "session-list-close",
+  "slice": "cpu",
+  "steps": [
+    { "method": "session/create", "params": { "pal": true }, "capture": false, "label": "create" },
+    { "method": "session/list", "params": {}, "capture": true, "label": "list" },
+    { "method": "session/close", "params": { "session_id": "$sessionId" }, "capture": true, "label": "close" }
+  ]
+}
