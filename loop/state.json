@@ -2,13 +2,23 @@
   "phase": 1,
   "stage": 1,
   "current_item": "cia",
-  "stage1_remaining": ["drive-iec"],
+  "stage1_remaining": [
+    "drive-iec"
+  ],
   "retry_count": 0,
   "max_retries": 4,
   "ts_runtime_root": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP",
   "ts_spec_root": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/src/runtime",
-  "done": ["oracle-harness", "core-substrate", "cpu-6510", "vic-ii"],
-  "in_flight": null,
-  "note": "Stage 1 SERIAL (ADR-014): vic-ii merged. Next tick dispatches cia [opus] on branch cia. Builders must NOT edit loop/ files (driver owns).",
-  "updated": "2026-06-22T18:16:00Z"
+  "done": [
+    "oracle-harness",
+    "core-substrate",
+    "cpu-6510",
+    "vic-ii"
+  ],
+  "in_flight": {
+    "item": "cia",
+    "started": "2026-06-22T18:45:00Z"
+  },
+  "note": "Stage 1 SERIAL (ADR-014): cia [opus] on branch cia; Driver gates+merges before drive-iec.",
+  "updated": "2026-06-22T18:45:00Z"
 }
