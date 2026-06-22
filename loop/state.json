@@ -1,14 +1,14 @@
 {
   "phase": 1,
   "stage": 1,
-  "current_item": null,
-  "stage1_items": ["vic-ii", "cia", "drive-iec"],
+  "current_item": "vic-ii",
+  "stage1_remaining": ["cia", "drive-iec"],
   "retry_count": 0,
   "max_retries": 4,
   "ts_runtime_root": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP",
   "ts_spec_root": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/src/runtime",
   "done": ["oracle-harness", "core-substrate", "cpu-6510"],
-  "in_flight": { "items": ["vic-ii", "cia", "drive-iec"], "started": "2026-06-22T17:45:42Z" },
-  "note": "Stage 1 parallel builders dispatched in worktrees (ADR-009/012/013). Defer ticks until they return; Driver merges each green chip to main.",
-  "updated": "2026-06-22T17:45:42Z"
+  "in_flight": { "item": "vic-ii", "started": "2026-06-22T17:46:00Z" },
+  "note": "Stage 1 SERIAL (ADR-014): vic-ii on branch vic-ii; Driver gates + merges before cia, then drive-iec.",
+  "updated": "2026-06-22T17:46:00Z"
 }

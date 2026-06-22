@@ -111,3 +111,18 @@ would otherwise test the MAIN binary, not its own changes.
 **Decision:** Every worktree-isolated builder MUST export
 `TRX64_DAEMON_BIN=<its-worktree>/target/debug/trx64-daemon` before running the oracle.
 **Why:** The gate must verify the builder's own work, not stale main.
+
+## ADR-014 — Stage 1 runs SERIALLY (one chip per iteration), not parallel worktrees
+**Context:** The Agent tool's worktree isolation is unavailable here — the session was
+"not a git repository" at startup (git init happened after), and no WorktreeCreate hooks
+are configured. Also the three chips share thin plumbing (trx64-trace frame writers,
+daemon trace-domain wiring, core Machine/Bus glue).
+**Decision:** Build Stage 1 SERIALLY — one chip per iteration (vic-ii, then cia, then
+drive-iec), each on a per-chip branch in the main working dir (ADR-009 preserved),
+gated + merged to main before the next starts. This SUPERSEDES the parallel-worktree
+execution of ADR-012/ADR-013 (ADR-013's per-worktree TRX64_DAEMON_BIN is now moot — the
+oracle uses the main binary, which IS the builder's). The isolation-GATE principle of
+ADR-012 (each chip verified against its own domain via a chip-specific Bus) STILL HOLDS.
+**Why:** No worktree support; serial avoids merge conflicts on shared plumbing and is
+more robust for unattended overnight operation; fits one-iteration-per-tick. Revisit
+parallel if WorktreeCreate hooks get configured.

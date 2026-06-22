@@ -44,7 +44,8 @@ long builder.
 **EACH ITERATION:**
 1. Read state. Pick the next actionable item per the sequencing rules:
    - Stage 0 SERIAL: `oracle-harness` → `core-substrate` → `cpu-6510`.
-   - Stage 1 PARALLEL (worktrees) only AFTER cpu green: `vic-ii` | `cia` | `drive-iec`.
+   - Stage 1 SERIAL (one chip per iteration, per-chip branch on main — worktree
+     isolation unavailable, ADR-014) after cpu green: `vic-ii` → `cia` → `drive-iec`.
    - Stage 2 SERIAL: `protocol-surface` → `snapshot-vsf` → `integration`. SID last.
 2. Dispatch the matching specialist builder via the Agent tool with the item's
    `[model: X]` tag as the `model` override (cheap-first). Stage 1 in an isolated
