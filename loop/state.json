@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "media",
+  "current_item": "vic-render",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -16,23 +16,19 @@
     "drive-iec",
     "iec-bus",
     "protocol-surface",
-    "snapshot-vsf"
+    "snapshot-vsf",
+    "media"
   ],
-  "note": "media [sonnet]: media/ingress mount/eject/swap + swap_disk_and_continue WS methods, attach D64/G64 to drive model. Gate = response parity vs TS (actual load-from-disk needs drive-via2+GCR, still stub).",
-  "updated": "2026-06-22T23:05:00Z",
+  "note": "media (WS surface) done. Next: vic-render [opus] — VIC pixel framebuffer + session/screenshot/render_screen (user-requested). Then daemon-trace-query, drive-via2 (the keystone corner: fixes +2 driveCycles AND enables disk-load AND DRIVECPU vsf), cia-cascade, sid.",
+  "updated": "2026-06-23T01:20:00Z",
   "followups": [
-    "media (disk mount/swap — load programs)",
     "vic-render (framebuffer+screenshot)",
     "daemon-trace-query",
-    "drive-via2",
+    "drive-via2 (also fixes driveCycles +2 + disk load + DRIVECPU vsf)",
     "cia-cascade",
     "sid"
   ],
-  "in_flight": {
-    "item": "media",
-    "model": "sonnet",
-    "started": "2026-06-22T23:05:00Z"
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"

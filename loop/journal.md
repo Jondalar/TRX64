@@ -273,3 +273,15 @@ vic-ii, cia, drive-iec, iec-bus, protocol-surface, snapshot-vsf. The full C64 bo
 byte-exact, answers the WS core contract, snapshots/restores. Remaining = tracked
 follow-ups (completeness/corner/polish): media → vic-render (screenshot) → daemon-trace-
 query → drive-via2 → cia-cascade → sid. Advancing to `media` [sonnet].
+
+## 2026-06-23 — DRIVER: media (WS surface) done
+
+Sonnet builder: 8 media methods response-parity vs TS (ingress/mount/swap/unmount/persist/
+list_paths/browse/swap_disk_and_continue); D64/G64 attach (DiskImage + SHA256, diskPath
+reflected; additive, no timing touched). Confirmation gate INDEPENDENT: 4 media scenarios
+GREEN + regression GREEN; sha2/hex deps in daemon, core clean. ADR-028 (load-from-disk →
+drive-via2; crt → explicit error). Merged. done: 10 items.
+
+NOTE: drive-via2 is becoming the keystone corner — it unblocks THREE things at once:
+the recurring driveCycles +2, real disk program-load, and the DRIVECPU vsf module.
+Advancing to vic-render [opus] (framebuffer + screenshot, user-requested); drive-via2 after.

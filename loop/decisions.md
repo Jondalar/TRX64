@@ -298,3 +298,14 @@ The DRIVECPU VSF module is a 0-byte stub vs TS's 2461-byte drive blob (TS docume
 as a stub too) — folds into `drive-via2` (full drive internal state).
 **Why:** The behavioral contract (restored state) is what matters; byte-parity on the
 deferred drive blob is out of scope here.
+
+## ADR-028 — media WS surface done; load-from-disk blocked on drive-via2
+**Context:** media item — disk mount/swap/browse/persist + swap_disk_and_continue.
+**Decision (accepted, gates GREEN):** 8 media methods response-parity vs TS (4 scenarios
+GREEN). D64/G64 attach = DiskImage on Drive1541 + real SHA256 (sha2/hex deps in daemon,
+core clean); diskPath reflected in session/create+list; additive in drive.rs (no timing
+touched); cold_reset clears disk (VICE-faithful). A real LOAD"*",8 byte-load needs the
+drive VIA2 + GCR read path → tracked `drive-via2`. crt attach returns explicit error (no
+fake). The recurring boot-basic-ready driveCycles +2 is the same drive-via2 gap, confirmed
+pre-existing in every sweep — NOT a regression.
+**Why:** The mount/attach surface is independent of GCR read; the byte-stream needs VIA2.
