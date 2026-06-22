@@ -1,0 +1,10 @@
+{
+  "name": "iso-loops-cycles",
+  "slice": "cpu",
+  "steps": [
+    { "method": "session/create", "params": { "pal": true }, "capture": true, "label": "create" },
+    { "method": "monitor/exec", "params": { "session_id": "$sessionId", "command": "wr 0800 78 A9 00 85 10 85 11 A2 00 E6 10 D0 02 E6 11 9D F0 04 E8 E0 20 D0 F3 A9 00 85 30 A9 07 85 31 A0 00 98 91 30 C8 C0 80 D0 F9 02" }, "capture": true, "label": "inject" },
+    { "method": "monitor/exec", "params": { "session_id": "$sessionId", "command": "r pc=0800" }, "capture": true, "label": "setpc" },
+    { "method": "session/run", "params": { "session_id": "$sessionId", "cycles": 5000 }, "capture": true, "label": "run-cap" }
+  ]
+}

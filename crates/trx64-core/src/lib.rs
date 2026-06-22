@@ -284,28 +284,42 @@ impl Machine {
         self.clk = self.cpu6510.clk;
     }
 
-    /// Run a CYCLE budget, instruction-stepped (= TS `runFor` with a cycle
-    /// budget): execute whole instructions until `clk - start >= budget`. This
-    /// matches the TS session/run semantics, so c64Cycles ends identically.
+    /// Run a CYCLE budget, instruction-stepped (= TS session/run). Convenience
+    /// wrapper that applies the TS instruction cap `ceil(budget/2) + 1000`, so a
+    /// tight loop stops on the instruction cap exactly as the TS daemon does.
     pub fn run_for<O: Observer>(&mut self, budget: u64, obs: &mut O) {
+        let max_instructions = budget.div_ceil(2) + 1000;
+        self.run_for_capped(budget, max_instructions, obs);
+    }
+
+    /// Run until EITHER `clk - start >= budget` OR `max_instructions` whole
+    /// instructions have retired — the FIRST to trip wins (= TS
+    /// `runFor(maxInstructions, { cycleBudget })`). The budget check happens at
+    /// instruction boundaries, so c64Cycles ends identically to the TS daemon.
+    pub fn run_for_capped<O: Observer>(&mut self, budget: u64, max_instructions: u64, obs: &mut O) {
         let start = self.cpu6510.clk;
+        let mut executed: u64 = 0;
         let mut bus = FlatRam { mem: &mut self.ram };
         loop {
             if self.cpu6510.clk.wrapping_sub(start) >= budget {
                 break;
             }
-            if self.cpu6510.is_jammed() {
-                // JAM still burns cycles; run to budget so c64Cycles matches.
-                self.cpu6510.execute_cycle(&mut bus, obs);
-                continue;
+            if executed >= max_instructions {
+                break;
             }
-            // Step a whole instruction (one fetch boundary to the next).
+            // Step a whole instruction (one fetch boundary to the next). A
+            // jammed CPU stays at boundary, so this runs exactly one cycle and
+            // still counts as one instruction-step — matching the TS `runFor`
+            // loop body (stepC64Instruction + i++) on a halted CPU. This is
+            // load-bearing: a JAM-terminated exerciser then trips the
+            // instruction cap (ceil(budget/2)+1000) at the same cycle the TS does.
             loop {
                 self.cpu6510.execute_cycle(&mut bus, obs);
                 if self.cpu6510.is_at_boundary() {
                     break;
                 }
             }
+            executed += 1;
         }
         drop(bus);
         self.sync_snapshot();
