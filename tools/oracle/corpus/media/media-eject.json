@@ -1,0 +1,11 @@
+{
+  "name": "media-eject",
+  "slice": "drive",
+  "steps": [
+    {"method": "session/create", "params": {"pal": true}, "capture": false, "label": "create"},
+    {"method": "media/ingress", "params": {"session_id": "$sessionId", "kind": "disk", "path": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/POLARBEAR.d64"}, "capture": false, "label": "mount"},
+    {"method": "session/list", "params": {}, "capture": true, "label": "list-mounted"},
+    {"method": "media/ingress", "params": {"session_id": "$sessionId", "kind": "eject", "role": "drive8"}, "capture": true, "label": "eject"},
+    {"method": "session/list", "params": {}, "capture": true, "label": "list-ejected"}
+  ]
+}

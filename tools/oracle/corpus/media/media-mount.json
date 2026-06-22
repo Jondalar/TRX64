@@ -1,0 +1,9 @@
+{
+  "name": "media-mount",
+  "slice": "drive",
+  "steps": [
+    {"method": "session/create", "params": {"pal": true}, "capture": false, "label": "create"},
+    {"method": "media/ingress", "params": {"session_id": "$sessionId", "kind": "disk", "path": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/POLARBEAR.d64"}, "capture": true, "label": "mount"},
+    {"method": "session/list", "params": {}, "capture": true, "label": "list-after-mount"}
+  ]
+}

@@ -17,6 +17,24 @@
 
 use crate::{cpu::{Bus, Cpu6510}, NullSink, Observer, RomError};
 
+/// Disk image kind — D64 (standard 1541 format) or G64 (GCR nibble dump).
+#[derive(Clone, Debug)]
+pub enum DiskKind {
+    D64,
+    G64,
+}
+
+/// In-memory disk image attached to a drive. The GCR read path is out of scope
+/// (ADR-012 isolation gate); this struct only stores the raw bytes for media
+/// mount / persist / SHA256 parity.
+#[derive(Clone)]
+pub struct DiskImage {
+    pub kind: DiskKind,
+    pub bytes: Vec<u8>,
+    pub backing_path: Option<String>,
+    pub read_only: bool,
+}
+
 /// Minimal 6522 VIA stub: register file (16 bytes), returns 0xFF on uninitialized
 /// reads. The isolation gate does not need timer IRQ delivery.
 #[derive(Clone)]
@@ -144,6 +162,8 @@ pub struct Drive1541 {
     /// opcode fetch). We model that lazily, on the first cycle the drive runs, so the
     /// shared `Cpu6510::reset_to()` stays untouched (C64 CPU/VIC/CIA gates unaffected).
     reset_pending: bool,
+    /// Attached disk image (None = no disk in drive).
+    pub disk: Option<DiskImage>,
 }
 
 /// PAL drive sync factor (VICE drivesync.c:53-62 `drive_set_machine_parameter`):
@@ -184,6 +204,7 @@ impl Drive1541 {
             stop_clk: 0,
             reset_pending: true,
             iec_drv_port: 0x85,
+            disk: None,
         }
     }
 
@@ -239,6 +260,8 @@ impl Drive1541 {
         // whole drive_clk schedule into phase with the golden without touching the
         // shared C64 reset path.
         self.advance_stop_clk(C64_RESET_DRIVE_OFFSET);
+        // A real 1541 loses its disk on power cycle. Don't preserve disk across reset.
+        self.disk = None;
     }
 
     /// Advance the drive's `stop_clk` target by `c64_cycles` of main-CPU time,
@@ -356,6 +379,21 @@ impl Drive1541 {
             self.run_cycles(c64_clk - c64_ref);
         }
         c64_clk
+    }
+
+    /// Attach a disk image to this drive (replaces any existing disk).
+    pub fn attach_disk(&mut self, image: DiskImage) {
+        self.disk = Some(image);
+    }
+
+    /// Detach (eject) the disk from this drive.
+    pub fn detach_disk(&mut self) {
+        self.disk = None;
+    }
+
+    /// Get a reference to the currently attached disk image, if any.
+    pub fn get_attached_disk(&self) -> Option<&DiskImage> {
+        self.disk.as_ref()
     }
 
     /// Sample the current drive PC for the drive8-cpu trace domain.

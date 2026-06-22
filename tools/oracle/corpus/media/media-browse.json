@@ -1,0 +1,8 @@
+{
+  "name": "media-browse",
+  "slice": "cpu",
+  "steps": [
+    {"method": "media/list_paths", "params": {}, "capture": true, "label": "list-paths"},
+    {"method": "media/browse", "params": {"path": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples"}, "capture": true, "label": "browse"}
+  ]
+}

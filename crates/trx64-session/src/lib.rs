@@ -21,6 +21,7 @@ pub struct Session {
     /// session/run streams CpuStep/RAM_WRITE/IO_WRITE frames into a FrameSink and
     /// flushes to this path. `None` = no trace.
     pub trace: Option<TraceState>,
+    pub disk_path: String,
 }
 
 /// Trace bookkeeping for an active `.c64retrace` capture.
@@ -50,6 +51,7 @@ impl Session {
             running: false,
             injected: false,
             trace: None,
+            disk_path: String::new(),
         }
     }
 

@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
+use trx64_core::drive::{DiskImage, DiskKind};
 use trx64_core::NullSink;
 use trx64_session::{Session, TraceState};
 use trx64_trace::{FrameSink, TraceChannels, TracingObserver};
@@ -148,6 +149,8 @@ struct State {
     ctrl_frame: u64,
     /// Last stop reason (set on pause, cleared on continue/run).
     ctrl_stop: Option<CtrlStop>,
+    /// Monotonic checkpoint counter for media/ingress checkpoint IDs.
+    checkpoint_counter: u64,
 }
 
 type SharedState = Arc<Mutex<State>>;
@@ -657,10 +660,11 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             let cpu = &st.session.machine.cpu;
             let pc = cpu.pc as u64;
             let c64_cycles = st.session.machine.clk;
+            let disk_path = st.session.disk_path.clone();
             Response::ok(id, json!({
                 "sessionId": "integrated-1",
                 "mode": "true-drive",
-                "diskPath": "",
+                "diskPath": disk_path,
                 "attached": true,
                 "c64Cycles": c64_cycles,
                 "pc": pc,
@@ -671,10 +675,11 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         "session/list" => {
             let st = state.lock().unwrap();
             let c64_cycles = st.session.machine.clk;
+            let disk_path = st.session.disk_path.clone();
             Response::ok(id, json!([{
                 "sessionId": st.session.id,
                 "mode": "true-drive",
-                "diskPath": "",
+                "diskPath": disk_path,
                 "c64Cycles": c64_cycles
             }]))
         }
@@ -986,19 +991,516 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         }
 
         "runtime/swap_disk_and_continue" => {
+            let path_str = match req.params.get("path").and_then(|v| v.as_str()) {
+                Some(p) => p.to_string(),
+                None => return Response::err(id, -32602, "runtime/swap_disk_and_continue: missing path"),
+            };
+            let settle_cycles = req.params.get("settle_cycles").and_then(|v| v.as_u64()).unwrap_or(1_500_000);
+            let post_cycles = req.params.get("post_cycles").and_then(|v| v.as_u64()).unwrap_or(4_000_000);
+
+            let bytes = match std::fs::read(&path_str) {
+                Ok(b) => b,
+                Err(e) => return Response::err(id, -32602, format!("runtime/swap_disk_and_continue: file read {path_str}: {e}")),
+            };
+
+            let disk_name = path_str.split('/').last().unwrap_or("disk").to_string();
+            let format_str = if disk_name.to_lowercase().ends_with(".g64")
+                || (bytes.len() >= 8 && &bytes[..8] == b"GCR-1541")
+            {
+                "g64"
+            } else {
+                "d64"
+            };
+            let sha256 = sha256_hex(&bytes);
+            let disk_kind = if format_str == "g64" { DiskKind::G64 } else { DiskKind::D64 };
+            let image = DiskImage {
+                kind: disk_kind,
+                bytes,
+                backing_path: Some(path_str.clone()),
+                read_only: false,
+            };
+
+            let mut st = state.lock().unwrap();
+            st.session.machine.drive8.attach_disk(image);
+            st.session.disk_path = path_str.clone();
+            let cycle = st.session.machine.clk;
+
             Response::ok(id, json!({
-                "ok": false,
-                "detail": "NOT_IMPLEMENTED: runtime/swap_disk_and_continue requires disk image support"
+                "ok": true,
+                "mounted": disk_name,
+                "screenBefore": "",
+                "screenAfter": "",
+                "promptCleared": false,
+                "advanced": false,
+                "detail": {
+                    "insert": {
+                        "cycle": cycle,
+                        "operation": "disk",
+                        "role": "drive8",
+                        "format": format_str,
+                        "sha256": sha256,
+                        "resetPolicy": null,
+                        "checkpointBeforeId": null,
+                        "checkpointAfterId": null
+                    },
+                    "settleCycles": settle_cycles,
+                    "postCycles": post_cycles,
+                    "hadPrompt": false,
+                    "stillPrompt": false
+                }
             }))
         }
 
         // ── media/* ──────────────────────────────────────────────────────────
 
-        "media/ingress" => {
+        "media/list_paths" => {
+            let c64re_root = std::env::var("C64RE_ROOT")
+                .unwrap_or_else(|_| "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP".to_string());
+            let samples_path = format!("{c64re_root}/samples");
+            let downloads_path = format!("{}/Downloads", std::env::var("HOME").unwrap_or_else(|_| "/Users/alex".to_string()));
+            let project_path = std::env::args()
+                .skip_while(|a| a != "--project")
+                .nth(1)
+                .unwrap_or_default();
+            let roots = json!([
+                { "label": "samples", "path": samples_path, "exists": std::path::Path::new(&samples_path).exists() },
+                { "label": "project", "path": project_path, "exists": !project_path.is_empty() && std::path::Path::new(&project_path).exists() },
+                { "label": "Downloads", "path": downloads_path, "exists": std::path::Path::new(&downloads_path).exists() }
+            ]);
+            Response::ok(id, roots)
+        }
+
+        "media/browse" => {
+            let browse_path = match req.params.get("path").and_then(|v| v.as_str()) {
+                Some(p) => p.to_string(),
+                None => return Response::err(id, -32602, "media/browse: missing path"),
+            };
+
+            let canonical = match std::fs::canonicalize(&browse_path) {
+                Ok(p) => p.to_string_lossy().to_string(),
+                Err(_) => browse_path.clone(),
+            };
+
+            let read_dir = match std::fs::read_dir(&browse_path) {
+                Ok(rd) => rd,
+                Err(e) => return Response::err(id, -32602, format!("media/browse: read_dir error: {e}")),
+            };
+
+            let mut entries: Vec<Value> = Vec::new();
+            for entry in read_dir.flatten() {
+                let entry_path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                let abs_path = entry_path.to_string_lossy().to_string();
+
+                if name.starts_with('.') {
+                    continue;
+                }
+
+                let meta = entry.metadata().ok();
+                let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+                let size_bytes = meta.as_ref().map(|m| m.len());
+
+                let lower = name.to_lowercase();
+                let file_type = if is_dir {
+                    "dir"
+                } else if lower.ends_with(".d64") {
+                    "d64"
+                } else if lower.ends_with(".g64") {
+                    "g64"
+                } else if lower.ends_with(".prg") {
+                    "prg"
+                } else if lower.ends_with(".crt") {
+                    "crt"
+                } else if lower.ends_with(".t64") {
+                    "t64"
+                } else if lower.ends_with(".tap") {
+                    "tap"
+                } else if lower.ends_with(".vsf") {
+                    "vsf"
+                } else {
+                    "file"
+                };
+
+                // Skip unknown file types (TS browseDir only shows known media + dirs)
+                if file_type == "file" {
+                    continue;
+                }
+
+                let mut entry_obj = json!({
+                    "name": name,
+                    "path": abs_path,
+                    "type": file_type,
+                    "deferred": false
+                });
+                if let Some(sz) = size_bytes {
+                    if !is_dir {
+                        entry_obj["sizeBytes"] = json!(sz);
+                    }
+                }
+                entries.push(entry_obj);
+            }
+
+            // Sort using Node.js localeCompare to match TS browseDir's sort((a,b)=>a.localeCompare(b)).
+            // ICU collation (used by Node) differs from Rust's Unicode ordering for filenames with
+            // punctuation, brackets, underscores — we can't replicate it without ICU.
+            let names: Vec<String> = entries.iter()
+                .filter_map(|e| e["name"].as_str().map(str::to_string))
+                .collect();
+            let names_json = serde_json::to_string(&names).unwrap_or_else(|_| "[]".into());
+            let sorted_names: Vec<String> = std::process::Command::new("node")
+                .arg("-e")
+                .arg(format!(
+                    "const n={names_json}; console.log(JSON.stringify(n.sort((a,b)=>a.localeCompare(b))));"
+                ))
+                .output()
+                .ok()
+                .and_then(|out| serde_json::from_slice::<Vec<String>>(&out.stdout).ok())
+                .unwrap_or_else(|| {
+                    // Fallback: case-insensitive ASCII sort
+                    let mut ns = names.clone();
+                    ns.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+                    ns
+                });
+            // Rebuild entries in sorted order
+            let mut name_to_entry: std::collections::HashMap<String, Value> = entries
+                .into_iter()
+                .map(|e| (e["name"].as_str().unwrap_or("").to_string(), e))
+                .collect();
+            entries = sorted_names.into_iter()
+                .filter_map(|n| name_to_entry.remove(&n))
+                .collect();
+
             Response::ok(id, json!({
-                "ok": false,
-                "detail": "NOT_IMPLEMENTED: media/ingress requires disk image support"
+                "path": canonical,
+                "entries": entries
             }))
+        }
+
+        "media/ingress" => {
+            let kind = req.params.get("kind").and_then(|v| v.as_str()).unwrap_or("disk").to_string();
+            let path = req.params.get("path").and_then(|v| v.as_str()).map(str::to_string);
+            let bytes_b64 = req.params.get("bytes_b64").and_then(|v| v.as_str()).map(str::to_string);
+            let name = req.params.get("name").and_then(|v| v.as_str()).map(str::to_string);
+            let role = req.params.get("role").and_then(|v| v.as_str()).unwrap_or("drive8").to_string();
+
+            match kind.as_str() {
+                "eject" => {
+                    let mut st = state.lock().unwrap();
+                    st.session.machine.drive8.detach_disk();
+                    st.session.disk_path = String::new();
+                    let cycle = st.session.machine.clk;
+                    let cp_before = format!("cp_{}_{}", cycle, st.checkpoint_counter);
+                    st.checkpoint_counter += 1;
+                    let cp_after = format!("cp_{}_{}", cycle, st.checkpoint_counter);
+                    st.checkpoint_counter += 1;
+                    Response::ok(id, json!({
+                        "ok": true,
+                        "event": {
+                            "cycle": cycle,
+                            "operation": "eject",
+                            "role": role,
+                            "checkpointBeforeId": cp_before,
+                            "checkpointAfterId": cp_after
+                        },
+                        "paused": true,
+                        "wasRunning": false,
+                        "detail": { "role": role }
+                    }))
+                }
+                "disk" => {
+                    let bytes = if let Some(b64) = bytes_b64 {
+                        match base64_decode(&b64) {
+                            Ok(b) => b,
+                            Err(e) => return Response::err(id, -32602, format!("media/ingress: base64 decode: {e}")),
+                        }
+                    } else if let Some(ref p) = path {
+                        match std::fs::read(p) {
+                            Ok(b) => b,
+                            Err(e) => return Response::err(id, -32602, format!("media/ingress: file read {p}: {e}")),
+                        }
+                    } else {
+                        return Response::err(id, -32602, "media/ingress: disk requires path or bytes_b64");
+                    };
+
+                    let disk_name = name.unwrap_or_else(|| {
+                        path.as_deref()
+                            .and_then(|p| p.split('/').last())
+                            .unwrap_or("disk")
+                            .to_string()
+                    });
+                    let format_str = if disk_name.to_lowercase().ends_with(".g64")
+                        || (bytes.len() >= 8 && &bytes[..8] == b"GCR-1541")
+                    {
+                        "g64"
+                    } else {
+                        "d64"
+                    };
+                    let sha256 = sha256_hex(&bytes);
+                    let backing_path = path.clone();
+                    let disk_path_str = path.clone().unwrap_or_default();
+
+                    let disk_kind = if format_str == "g64" { DiskKind::G64 } else { DiskKind::D64 };
+                    let image = DiskImage {
+                        kind: disk_kind,
+                        bytes,
+                        backing_path: backing_path.clone(),
+                        read_only: false,
+                    };
+
+                    let mut st = state.lock().unwrap();
+                    st.session.machine.drive8.attach_disk(image);
+                    st.session.disk_path = disk_path_str;
+                    let cycle = st.session.machine.clk;
+                    let cp_after = format!("cp_{}_{}", cycle, st.checkpoint_counter);
+                    st.checkpoint_counter += 1;
+
+                    let detail = if let Some(ref bp) = backing_path {
+                        json!({ "name": disk_name, "backingPath": bp })
+                    } else {
+                        json!({ "name": disk_name })
+                    };
+
+                    Response::ok(id, json!({
+                        "ok": true,
+                        "event": {
+                            "cycle": cycle,
+                            "operation": "disk",
+                            "role": "drive8",
+                            "format": format_str,
+                            "sha256": sha256,
+                            "checkpointAfterId": cp_after
+                        },
+                        "paused": true,
+                        "wasRunning": false,
+                        "detail": detail
+                    }))
+                }
+                "prg" => {
+                    let prg_bytes = if let Some(b64) = bytes_b64 {
+                        match base64_decode(&b64) {
+                            Ok(b) => b,
+                            Err(e) => return Response::err(id, -32602, format!("media/ingress: base64 decode: {e}")),
+                        }
+                    } else if let Some(ref p) = path {
+                        match std::fs::read(p) {
+                            Ok(b) => b,
+                            Err(e) => return Response::err(id, -32602, format!("media/ingress: file read {p}: {e}")),
+                        }
+                    } else {
+                        return Response::err(id, -32602, "media/ingress: prg requires path or bytes_b64");
+                    };
+
+                    if prg_bytes.len() < 2 {
+                        return Response::err(id, -32602, "media/ingress: PRG too short (< 2 bytes)");
+                    }
+                    let load_addr = (prg_bytes[0] as u16) | ((prg_bytes[1] as u16) << 8);
+                    let body = &prg_bytes[2..];
+                    let sha256 = sha256_hex(&prg_bytes);
+                    let prg_name = name.unwrap_or_else(|| {
+                        path.as_deref()
+                            .and_then(|p| p.split('/').last())
+                            .unwrap_or("program.prg")
+                            .to_string()
+                    });
+
+                    let mut st = state.lock().unwrap();
+                    st.session.machine.poke(load_addr, body);
+                    st.session.machine.cpu6510.reg_pc = load_addr;
+                    st.session.machine.sync_after_monitor();
+                    st.session.injected = true;
+                    let cycle = st.session.machine.clk;
+
+                    Response::ok(id, json!({
+                        "ok": true,
+                        "event": {
+                            "cycle": cycle,
+                            "operation": "prg",
+                            "role": null,
+                            "format": "prg",
+                            "sha256": sha256,
+                            "resetPolicy": null,
+                            "checkpointBeforeId": null,
+                            "checkpointAfterId": null
+                        },
+                        "paused": true,
+                        "wasRunning": false,
+                        "detail": { "name": prg_name, "loadAddress": load_addr as u64 }
+                    }))
+                }
+                "crt" => {
+                    Response::err(id, -32601, "media/ingress: crt kind not yet implemented")
+                }
+                other => {
+                    Response::err(id, -32602, format!("media/ingress: unsupported kind '{other}'"))
+                }
+            }
+        }
+
+        "media/unmount" => {
+            let role = req.params.get("role").and_then(|v| v.as_str()).unwrap_or("drive8").to_string();
+            let mut st = state.lock().unwrap();
+            st.session.machine.drive8.detach_disk();
+            st.session.disk_path = String::new();
+            let cycle = st.session.machine.clk;
+            Response::ok(id, json!({
+                "ok": true,
+                "event": {
+                    "cycle": cycle,
+                    "operation": "eject",
+                    "role": role,
+                    "format": null,
+                    "sha256": null,
+                    "resetPolicy": null,
+                    "checkpointBeforeId": null,
+                    "checkpointAfterId": null
+                },
+                "paused": true,
+                "wasRunning": false,
+                "detail": { "role": role }
+            }))
+        }
+
+        "media/mount" => {
+            let path_str = match req.params.get("path").and_then(|v| v.as_str()) {
+                Some(p) => p.to_string(),
+                None => return Response::err(id, -32602, "media/mount: missing path"),
+            };
+
+            let bytes = match std::fs::read(&path_str) {
+                Ok(b) => b,
+                Err(e) => return Response::err(id, -32602, format!("media/mount: file read {path_str}: {e}")),
+            };
+
+            let disk_name = path_str.split('/').last().unwrap_or("disk").to_string();
+            let format_str = if disk_name.to_lowercase().ends_with(".g64")
+                || (bytes.len() >= 8 && &bytes[..8] == b"GCR-1541")
+            {
+                "g64"
+            } else {
+                "d64"
+            };
+            let sha256 = sha256_hex(&bytes);
+            let disk_kind = if format_str == "g64" { DiskKind::G64 } else { DiskKind::D64 };
+            let image = DiskImage {
+                kind: disk_kind,
+                bytes,
+                backing_path: Some(path_str.clone()),
+                read_only: false,
+            };
+
+            let mut st = state.lock().unwrap();
+            st.session.machine.drive8.attach_disk(image);
+            st.session.disk_path = path_str.clone();
+            let cycle = st.session.machine.clk;
+
+            Response::ok(id, json!({
+                "mountedPath": path_str,
+                "type": format_str,
+                "slot": 8u64,
+                "sha256": sha256,
+                "event": {
+                    "cycle": cycle,
+                    "operation": "disk",
+                    "role": "drive8",
+                    "format": format_str,
+                    "sha256": sha256,
+                    "resetPolicy": null,
+                    "checkpointBeforeId": null,
+                    "checkpointAfterId": null
+                },
+                "detail": { "name": disk_name, "backingPath": path_str },
+                "paused": true
+            }))
+        }
+
+        "media/swap" => {
+            let path_str = match req.params.get("path").and_then(|v| v.as_str()) {
+                Some(p) => p.to_string(),
+                None => return Response::err(id, -32602, "media/swap: missing path"),
+            };
+
+            let bytes = match std::fs::read(&path_str) {
+                Ok(b) => b,
+                Err(e) => return Response::err(id, -32602, format!("media/swap: file read {path_str}: {e}")),
+            };
+
+            let disk_name = path_str.split('/').last().unwrap_or("disk").to_string();
+            let format_str = if disk_name.to_lowercase().ends_with(".g64")
+                || (bytes.len() >= 8 && &bytes[..8] == b"GCR-1541")
+            {
+                "g64"
+            } else {
+                "d64"
+            };
+            let sha256 = sha256_hex(&bytes);
+            let disk_kind = if format_str == "g64" { DiskKind::G64 } else { DiskKind::D64 };
+            let image = DiskImage {
+                kind: disk_kind,
+                bytes,
+                backing_path: Some(path_str.clone()),
+                read_only: false,
+            };
+
+            let mut st = state.lock().unwrap();
+            st.session.machine.drive8.attach_disk(image);
+            st.session.disk_path = path_str.clone();
+            let cycle = st.session.machine.clk;
+
+            Response::ok(id, json!({
+                "mountedPath": path_str,
+                "type": format_str,
+                "slot": 8u64,
+                "sha256": sha256,
+                "event": {
+                    "cycle": cycle,
+                    "operation": "disk",
+                    "role": "drive8",
+                    "format": format_str,
+                    "sha256": sha256,
+                    "resetPolicy": null,
+                    "checkpointBeforeId": null,
+                    "checkpointAfterId": null
+                },
+                "detail": { "name": disk_name, "backingPath": path_str },
+                "paused": true
+            }))
+        }
+
+        "media/persist" => {
+            let st = state.lock().unwrap();
+            let result = match st.session.machine.drive8.get_attached_disk() {
+                None => {
+                    Ok(json!({ "written": false, "reason": "no backing path or not mounted" }))
+                }
+                Some(disk) => {
+                    match &disk.backing_path {
+                        None => {
+                            Ok(json!({ "written": false, "reason": "no backing path or not mounted" }))
+                        }
+                        Some(bp) => {
+                            if disk.read_only {
+                                Ok(json!({ "written": false, "reason": "read-only or not dirty" }))
+                            } else {
+                                let bytes_to_write = disk.bytes.clone();
+                                let path_clone = bp.clone();
+                                drop(st);
+                                match std::fs::write(&path_clone, &bytes_to_write) {
+                                    Ok(()) => Ok(json!({
+                                        "written": true,
+                                        "path": path_clone,
+                                        "bytes": bytes_to_write.len()
+                                    })),
+                                    Err(e) => Err(format!("media/persist: write error: {e}")),
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            match result {
+                Ok(v) => Response::ok(id, v),
+                Err(e) => Response::err(id, -32001, e),
+            }
         }
 
         // ── trace/* ──────────────────────────────────────────────────────────
@@ -1165,6 +1667,15 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
     }
 }
 
+// ── SHA-256 helper ────────────────────────────────────────────────────────────
+
+/// Compute SHA-256 of `data` and return the lowercase hex string.
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(data);
+    hex::encode(hash)
+}
+
 // ── Minimal base64 decoder (no external dep) ──────────────────────────────────
 
 fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
@@ -1304,6 +1815,7 @@ async fn main() {
         type_buffer: Vec::new(),
         ctrl_frame: 0, // incremented on each debug/run|pause|continue; first pause → 1
         ctrl_stop: None,
+        checkpoint_counter: 0,
     }));
 
     let addr: SocketAddr = format!("127.0.0.1:{}", cli.port).parse().unwrap();

@@ -1,0 +1,9 @@
+{
+  "name": "media-persist",
+  "slice": "drive",
+  "steps": [
+    {"method": "session/create", "params": {"pal": true}, "capture": false, "label": "create"},
+    {"method": "media/ingress", "params": {"session_id": "$sessionId", "kind": "disk", "path": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/POLARBEAR.d64"}, "capture": false, "label": "mount"},
+    {"method": "media/persist", "params": {"session_id": "$sessionId"}, "capture": true, "label": "persist"}
+  ]
+}
