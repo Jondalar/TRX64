@@ -174,3 +174,22 @@ got=3) + ADR-019 (builders must not delete failing scenarios) + a tracked backlo
 
 Merged cia → main (ff), deleted branch. done += cia. Advancing to `drive-iec` [sonnet] —
 last Stage-1 chip. cia-cascade tracked for later (alongside integration).
+
+## 2026-06-22 — drive-iec: sonnet RED, escalating to opus
+
+Sonnet builder (commit 73a805b on branch drive-iec): drive 6502 over DriveBus boots
+$EAA0 from dos1541-325302-01+901229-05.bin (16KB, same ROM as TS), VIA1/2 stubs, memory
+map per VICE memiec.ts. ADR-015 finding: TS drive8-cpu = SAMPLED DRIVE_CPU_STEP (0x30)
+per C64 instruction boundary, dedup by consecutive PC, opcode/b1/b2 always 0; 701 records
+/ 3004 cyc. JSON responses GREEN. ADR-019 followed (scenario kept, committed RED).
+
+FIRST DIVERGENCE (precise): trace[0].cycle exp=8 got=2 — PC + regs MATCH (pc=$EAA1,
+sp=0, p=$24), only the drive-clk cycle column is a CONSTANT +6 off. Root cause:
+Cpu6510::reset_to() sets clk=0 and fires the first boundary immediately, skipping the
+~7-cycle 6502 hardware reset sequence that VICE models for the drive boot. Secondary:
+TRX64 ticks the drive 1:1 with C64 cycles; VICE applies the PAL sync_factor
+(drive_cycles ≈ floor(c64·66504/65536)) — sub-cycle now, drifts on long runs.
+
+DRIVER DECISION: not a defer (well-diagnosed, bounded fix) and not fake-green. Escalate
+to OPUS per ADR-006 (hard timing + regression risk: reset_to is shared with the C64 CPU
+gates, which inject PC and must NOT regress). Continue on branch drive-iec.
