@@ -135,9 +135,23 @@ fn run_cycle_budget(session: &mut Session, budget: u64) {
         }
     }
     let vic_active = channels.vic;
+    let drive_cpu_active = channels.drive_cpu;
+
     // Accumulate events from this run, then append to the persistent buffer.
     let mut obs = TracingObserver::with_channels(FrameSink::events_only(), channels);
-    if vic_active {
+
+    if drive_cpu_active {
+        // drive8-cpu domain: run C64 + drive together, sampling drive PC per
+        // C64 instruction boundary (ADR-015/ADR-012 isolation gate).
+        // Collect steps first (avoids double-borrow of obs), then emit.
+        let mut steps: Vec<(u16, u8, u8, u8, u8, u8, u64)> = Vec::new();
+        session.machine.run_for_drive_sampled(budget, &mut obs, |pc, a, x, y, sp, p, drv_clk| {
+            steps.push((pc, a, x, y, sp, p, drv_clk));
+        });
+        for (pc, a, x, y, sp, p, drv_clk) in steps {
+            obs.emit_drive_step(pc, a, x, y, sp, p, drv_clk);
+        }
+    } else if vic_active {
         session.machine.run_for_vic(budget, &mut obs);
     } else if channels.mem {
         // memory domain (no vic): route through the CIA-isolated bus so $DC00-$DDFF

@@ -6,9 +6,11 @@
 //!
 //! On-disk layout (little-endian), authoritative per binary-format.ts:
 //!   FileHeader := MAGIC(8) version(u16) flags(u16) metaLen(u32) metaJson(metaLen)
-//!   CPU_STEP (0x10): op(1) cycle(f64) pc(u16) opcode(u8) a x y sp p b1 b2   = 19 bytes
+//!   CPU_STEP (0x10):        op(1) cycle(f64) pc(u16) opcode(u8) a x y sp p b1 b2  = 19 bytes
 //!   RAM/IO_WRITE (0x11/0x12): op(1) cycle(f64) addr(u16) value(u8) pc(u16)
-//!       access(u8, bit0=r/w, bit7=hasOld) oldValue(u8)                      = 16 bytes
+//!       access(u8, bit0=r/w, bit7=hasOld) oldValue(u8)                            = 16 bytes
+//!   DRIVE_CPU_STEP (0x30):  same layout as CPU_STEP — 19 bytes total
+//!   DRIVE_RAM_WRITE (0x31): same layout as RAM_WRITE — 16 bytes total
 //!
 //! access/oldValue (Spec 753): WRITE records carry the pre-write value for RAM
 //! (addr in $0002..$D000); reads and I/O-window writes omit it (hasOld=0).
@@ -25,6 +27,10 @@ pub enum TraceOp {
     IoWrite = 0x12,
     VicRegWrite = 0x20,
     IecLine = 0x23,
+    /// Drive 1541 CPU instruction retire (op 0x30 — binary-format.ts DRIVE_CPU_STEP).
+    DriveCpuStep = 0x30,
+    /// Drive 1541 memory bus access (op 0x31 — binary-format.ts DRIVE_RAM_WRITE).
+    DriveRamWrite = 0x31,
 }
 
 pub const MAGIC: &[u8; 8] = b"C64RETR1";
@@ -83,6 +89,37 @@ impl FrameSink {
         self.buf.push(b2);
     }
 
+    /// Encode a DRIVE_CPU_STEP (0x30) record — same layout as CPU_STEP (0x10).
+    ///
+    /// Emitted by the `drive8-cpu` trace domain (sampled at C64 instruction
+    /// boundaries, deduplicated by PC). The `opcode`/`b1`/`b2` fields are 0 in
+    /// the sampled path (the TS oracle does not observe per-instruction operands
+    /// from the drive; see integrated-session.ts:855 ADR-015 note).
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_drive_cpu_step(
+        &mut self,
+        cycle: u64,
+        pc: u16,
+        a: u8,
+        x: u8,
+        y: u8,
+        sp: u8,
+        p: u8,
+    ) {
+        self.buf.push(TraceOp::DriveCpuStep as u8);
+        self.buf.extend_from_slice(&(cycle as f64).to_le_bytes());
+        self.buf.extend_from_slice(&pc.to_le_bytes());
+        self.buf.push(0); // opcode: not observable in sampled mode
+        self.buf.push(a);
+        self.buf.push(x);
+        self.buf.push(y);
+        self.buf.push(sp);
+        self.buf.push(p);
+        self.buf.push(0); // b1: not observable
+        self.buf.push(0); // b2: not observable
+    }
+
     /// Encode a VIC_REG_WRITE frame (op 0x20, 13 bytes total: op + cycle f64 +
     /// rasterY u16 + kind u8 + value u8) — byte-identical to TS
     /// binary-format.ts `encodeVicEvent`. kind = VIC_KIND_CODE
@@ -125,10 +162,8 @@ impl FrameSink {
 
 /// Active trace channels, derived from the requested trace domains exactly like
 /// TS `domainsToChannels` (trace-definition.ts): c64-cpu→cpu, memory→bus_access
-/// (+io), vic→vic, iec→iec, sid→sid. A record is emitted ONLY if its channel is
-/// enabled. This is the load-bearing parity rule for chip-isolated traces: a
-/// vic-domain trace enables ONLY the `vic` channel, which has no producer, so
-/// the trace is empty — byte-identical to the TS oracle.
+/// (+io), vic→vic, iec→iec, drive8-cpu→drive_cpu. A record is emitted ONLY if
+/// its channel is enabled.
 #[derive(Clone, Copy, Debug)]
 pub struct TraceChannels {
     /// `cpu` channel — emits CPU_STEP (0x10).
@@ -137,17 +172,21 @@ pub struct TraceChannels {
     pub mem: bool,
     /// `vic` channel — emits VIC_REG_WRITE (0x20). NO live producer (reserved).
     pub vic: bool,
+    /// `drive_pc` channel — emits DRIVE_CPU_STEP (0x30). Activated by "drive8-cpu"
+    /// domain. Sampled at C64 instruction boundaries, deduplicated by PC.
+    pub drive_cpu: bool,
 }
 
 impl TraceChannels {
     /// Map trace domains → channels (= TS domainsToChannels).
     pub fn from_domains<S: AsRef<str>>(domains: &[S]) -> Self {
-        let mut c = TraceChannels { cpu: false, mem: false, vic: false };
+        let mut c = TraceChannels { cpu: false, mem: false, vic: false, drive_cpu: false };
         for d in domains {
             match d.as_ref() {
                 "c64-cpu" => c.cpu = true,
                 "memory" => c.mem = true,
                 "vic" | "c64-vic" => c.vic = true,
+                "drive8-cpu" => c.drive_cpu = true,
                 _ => {}
             }
         }
@@ -156,7 +195,7 @@ impl TraceChannels {
 
     /// Default capture set (no domains given) = cpu + memory (TS daemon default).
     pub fn default_cpu_mem() -> Self {
-        TraceChannels { cpu: true, mem: true, vic: true }
+        TraceChannels { cpu: true, mem: true, vic: true, drive_cpu: false }
     }
 }
 
@@ -181,6 +220,17 @@ impl TracingObserver {
     }
     pub fn into_buf(self) -> Vec<u8> {
         self.sink.buf
+    }
+
+    /// Emit a DRIVE_CPU_STEP record directly (called from the daemon's drive-sampled
+    /// run loop, not via the Observer trait — the drive CPU runs with NullSink).
+    #[inline]
+    pub fn emit_drive_step(&mut self, pc: u16, a: u8, x: u8, y: u8, sp: u8, p: u8, drv_clk: u64) {
+        if !self.channels.drive_cpu {
+            return;
+        }
+        self.sink.write_drive_cpu_step(drv_clk, pc, a, x, y, sp, p);
+        self.event_count += 1;
     }
 }
 

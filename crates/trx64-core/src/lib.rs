@@ -11,11 +11,13 @@ use std::path::Path;
 
 pub mod cia;
 pub mod cpu;
+pub mod drive;
 pub mod tables;
 pub mod vic;
 
 pub use cia::Cia;
 pub use cpu::{Bus, Cpu6510};
+pub use drive::Drive1541;
 pub use vic::VicII;
 
 /// Zero-cost observation hook, inlined into the core step loop.
@@ -247,6 +249,10 @@ pub struct Machine {
     pub cia2: Cia,
     /// Shared CIA timer transition table (Arc → cheap to clone with the Machine).
     pub cia_table: cia::CiaTable,
+    /// 1541 floppy drive (isolation gate: ADR-012). Booted from DOS ROM, no IEC
+    /// wiring to the C64 in Phase 1. Ticked by `run_for_drive_sampled` when the
+    /// `drive8-cpu` trace domain is active.
+    pub drive8: Drive1541,
 }
 
 /// ROM load error.
@@ -285,6 +291,7 @@ impl Machine {
             cia1: Cia::new(),
             cia2: Cia::new(),
             cia_table: cia::new_table(),
+            drive8: Drive1541::new(),
         }
     }
 
@@ -389,9 +396,11 @@ impl Machine {
     }
 
     /// Load all three standard C64 ROMs from `rom_dir` and perform a cold reset.
+    /// Also loads the 1541 DOS ROM for the drive8 emulator (non-fatal if absent).
     ///
     /// Expected filenames (matching the bundled ROMs):
     ///   kernal-901227-03.bin, basic-901226-01.bin, chargen-901225-01.bin
+    ///   dos1541-325302-01+901229-05.bin (or 1541.bin alias) — drive ROM
     pub fn boot_from_dir(&mut self, rom_dir: &Path) -> Result<(), RomError> {
         // Power-on DRAM fill FIRST, then ROM loads overwrite their windows.
         self.fill_power_on_ram();
@@ -399,6 +408,10 @@ impl Machine {
         self.load_basic(&rom_dir.join("basic-901226-01.bin"))?;
         self.load_chargen(&rom_dir.join("chargen-901225-01.bin"))?;
         self.cold_reset();
+        // Drive ROM: non-fatal — if absent the drive runs with zeroed ROM
+        // (bus open; CPU will JAM immediately, which is a valid isolated state).
+        let _ = self.drive8.load_rom(rom_dir);
+        self.drive8.cold_reset();
         Ok(())
     }
 
@@ -538,6 +551,56 @@ impl Machine {
                 if self.cpu6510.is_at_boundary() {
                     break;
                 }
+            }
+            executed += 1;
+        }
+        drop(bus);
+        self.sync_snapshot();
+    }
+
+    /// Drive-sampled run for the `drive8-cpu` trace domain.
+    ///
+    /// Mirrors the TS `sampleDrivePc()` pattern (integrated-session.ts:845-868 /
+    /// ADR-015): the drive 6502 advances proportionally to the C64 CPU, then at
+    /// each C64 instruction boundary the drive PC is sampled. Only when the PC
+    /// differs from the previous sample is `on_drive_step` called — this is the
+    /// sampled/deduplicated stream the TS oracle emits for `drive8-cpu`.
+    ///
+    /// Drive sync ratio: 1541 PAL clock ≈ C64 PAL clock (both ~985 kHz), so we
+    /// run the drive for the same number of cycles as the C64 per C64 instruction
+    /// (drive_budget = instruction_cycles_just_elapsed). This is the "sync_factor
+    /// ≈ 1" approximation that matches the TS catchUpDrive behaviour.
+    ///
+    /// `on_drive_step`: called on each deduplicated PC sample with
+    ///   (pc, a, x, y, sp, p, drive_clk).
+    pub fn run_for_drive_sampled<O: Observer, F>(&mut self, budget: u64, obs: &mut O, mut on_drive_step: F)
+    where
+        F: FnMut(u16, u8, u8, u8, u8, u8, u64),
+    {
+        let max_instructions = budget.div_ceil(2) + 1000;
+        let start = self.cpu6510.clk;
+        let mut executed: u64 = 0;
+        let mut bus = FlatRam { mem: &mut self.ram };
+        loop {
+            if self.cpu6510.clk.wrapping_sub(start) >= budget {
+                break;
+            }
+            if executed >= max_instructions {
+                break;
+            }
+            let c64_clk_before = self.cpu6510.clk;
+            loop {
+                self.cpu6510.execute_cycle(&mut bus, obs);
+                if self.cpu6510.is_at_boundary() {
+                    break;
+                }
+            }
+            // Drive advances the same number of cycles as the C64 instruction took.
+            let c64_cycles = self.cpu6510.clk.wrapping_sub(c64_clk_before);
+            self.drive8.run_cycles(c64_cycles);
+            // Sample drive PC (deduplicated).
+            if let Some((pc, a, x, y, sp, p, drv_clk)) = self.drive8.sample_pc_change() {
+                on_drive_step(pc, a, x, y, sp, p, drv_clk);
             }
             executed += 1;
         }
