@@ -89,3 +89,25 @@ shows P=$20 at the first traced instruction (`boot-trace-short` trace[0].p 32 vs
 when the boot path + CIA/VIC are assembled (the `integration` item), where the real
 reset-sequence + first-instruction-trace timing is reproduced.
 **Why:** Can't reconcile boot-reset timing before the chips that drive it exist.
+
+## ADR-012 — Stage-1 chips are gated in ISOLATION, not via the full machine bus
+**Context:** vic-ii / cia / drive-iec all need to sit on a memory bus + be ticked per CPU
+cycle. If each required the full PLA/banked machine bus + cross-chip IRQ wiring, the three
+builders couldn't run in parallel and would collide on shared substrate.
+**Decision:** Each Stage-1 chip is built in `trx64-core` and gated in ISOLATION (like the
+CPU, ADR-005): a chip-specific `Bus` impl that routes ONLY that chip's I/O range (VIC
+$D000-$D3FF, CIA1/2 $DC00-$DDFF) + flat RAM elsewhere; the chip ticked per CPU cycle; a
+CPU-isolated exerciser (SEI) that programs/reads it; verified by trace-diff on the chip's
+own domain (vic / cia / drive-cpu). VIC/CIA are clock-driven so a minimal CPU loop
+suffices. The drive is gated on its own drive-cpu domain. Do NOT build the full machine
+bus, PLA banking, or cross-chip IRQ in Stage 1 — that is the `integration` item (Stage 2).
+**Why:** Keeps the three builders parallel + independent; composition via `Bus` (ADR-010)
+happens once, later, with all chips present.
+
+## ADR-013 — Worktree builders point the oracle at their OWN binary
+**Context:** The oracle's `daemon.ts` spawns `TRX64_DAEMON_BIN` (defaults to the MAIN
+repo's `target/debug/trx64-daemon`). A builder in a git worktree that runs the oracle
+would otherwise test the MAIN binary, not its own changes.
+**Decision:** Every worktree-isolated builder MUST export
+`TRX64_DAEMON_BIN=<its-worktree>/target/debug/trx64-daemon` before running the oracle.
+**Why:** The gate must verify the builder's own work, not stale main.

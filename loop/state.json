@@ -8,7 +8,7 @@
   "ts_runtime_root": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP",
   "ts_spec_root": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/src/runtime",
   "done": ["oracle-harness", "core-substrate", "cpu-6510"],
-  "in_flight": null,
-  "note": "Stage 1 is parallel: next tick dispatches vic-ii|cia|drive-iec in worktrees (ADR-009 per-item branch), sets in_flight to the set.",
-  "updated": "2026-06-22T17:18:00Z"
+  "in_flight": { "items": ["vic-ii", "cia", "drive-iec"], "started": "2026-06-22T17:45:42Z" },
+  "note": "Stage 1 parallel builders dispatched in worktrees (ADR-009/012/013). Defer ticks until they return; Driver merges each green chip to main.",
+  "updated": "2026-06-22T17:45:42Z"
 }
