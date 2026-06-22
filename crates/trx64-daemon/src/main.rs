@@ -252,7 +252,7 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         }
 
         "session/create" => {
-            let mut st = state.lock().unwrap();
+            let st = state.lock().unwrap();
             let cpu = &st.session.machine.cpu;
             let pc = cpu.pc as u64;
             let c64_cycles = st.session.machine.clk;
