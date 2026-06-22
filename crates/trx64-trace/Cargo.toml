@@ -1,0 +1,8 @@
+[package]
+name = "trx64-trace"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+trx64-core = { path = "../trx64-core" }

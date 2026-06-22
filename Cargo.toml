@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/trx64-core",
+    "crates/trx64-trace",
+    "crates/trx64-session",
+    "crates/trx64-daemon",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.0.1"
+license = "MIT"
+
+# TRX64 — Rust drop-in for the C64ReverseEngineeringMCP headless runtime.
+# Phase 1: behavior-identical replacement of the Node daemon behind ws://127.0.0.1:4312,
+# verified by trace-diff against the TS runtime as golden oracle.

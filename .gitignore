@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+node_modules/
+*.duckdb
+*.c64retrace
+tools/oracle/corpus/**/*.out
+.DS_Store
