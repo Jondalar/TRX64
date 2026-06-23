@@ -29,13 +29,17 @@
     "vic-sprites-modes",
     "cia-cascade"
   ],
-  "note": "cia-cascade done (ADR-017 closed) — CIA fully byte-exact. 20 items. Next: drive-watchdog-phase [opus] — closes the drive-boot-deep known-RED (3rd T1 watchdog IRQ +2). Phase-lead still ESCALATED to user (a/b/c). After watchdog: daemon-trace-query, sid-audio.",
-  "updated": "2026-06-23T10:10:00Z",
+  "note": "drive-watchdog-phase [opus]: close drive-boot-deep known-RED. 3rd VIA2 T1 watchdog IRQ fires 2 drive-cycles early (trace[212703] @cyc 1048810 vs got 1048808). Diagnosed: inter-re-arm t1zero spacing 15000 vs instruction period 14998 = +2 (FULL_CYCLE_2) phase error in the VIA2 T1 free-run reschedule. Trace-diff VIA2 T1 reschedule vs TS at the 3rd $F99F STA $1C05 re-arm.",
+  "updated": "2026-06-23T10:20:00Z",
   "followups": [
     "daemon-trace-query",
     "sid-audio"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "drive-watchdog-phase",
+    "model": "opus",
+    "started": "2026-06-23T10:20:00Z"
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
