@@ -377,3 +377,19 @@ producer (no trace.publish("sid"); SID writes appear as op-0x11). DEFERRED to Ph
 PCM audio / reSID sample gen / WAV export, voices 1+2 osc advance, ring-mod/hard-sync/filter.
 **Why:** Register + osc/env read behavior is the trace-relevant contract; audio is a
 separate Phase-1.5 concern. ALL CORE CHIPS (CPU/VIC/CIA/SID/VIA1+2/Drive) now modelled.
+
+## ADR-032 — GCR encoding + mount byte-exact; sector-read/LOAD → drive-load
+**Context:** drive-gcr — GCR read path → disk LOAD.
+**Decision (PARTIAL accept, gates GREEN):** MERGE milestone 1 — gcr.rs ports VICE gcr.c +
+D64 track build; a mounted D64 encodes to a byte-identical GCR bitstream (8 parity tests,
+SHA-256 matches TS per speed zone). disk-mount-idle GREEN (drive trace byte-exact with a
+D64 mounted), no regression. rotation.rs (rotation_1541_simple) wires the rotating GCR
+stream into VIA2 (PRA=GCR_read, PRB7=SYNC, byte_ready→V-flag) — the read path ENGAGES
+(motor/head/SYNC/byte-assembly all work) but the live sector read returns status $03 (SYNC)
+not $01. CARVE the rest into `drive-load` [opus] with the precise diagnosis:
+(1) the set_ca2 byte-ready→SO-overflow flush on the PCR CA2 edge + per-cycle drivecpu_rotate
+cadence so the SO edge lands at the controller's exact sampling instant ($F556 read loop —
+needs a drive-cpu trace cross-check); (2) the ATN→VIA1 CA1 IRQ (DOS attention $FE67→$E85B)
+— VIA1 lacks CA1. Both well-characterized; documented in tests/drive_sector_read.rs (kept).
+**Why:** The encoding + mount are real, byte-exact, regression-free value; the cycle-exact
+GCR controller sampling + CA1/CA2 handshake is a deep focused subsystem of its own.

@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "drive-gcr",
+  "current_item": "drive-load",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -20,24 +20,20 @@
     "media",
     "vic-render",
     "drive-via2",
-    "sid"
+    "sid",
+    "drive-gcr (encoding+mount)"
   ],
-  "note": "drive-gcr [opus]: GCR bitstream (D64->GCR) + rotating disk + byte-ready via VIA2 + DOS sector read + full IEC LOAD handshaking. Gate = mount sample D64 + LOAD + program-in-RAM parity vs TS. Large, likely multi-iteration.",
-  "updated": "2026-06-23T01:49:00Z",
+  "note": "drive-gcr partial: GCR encoding + D64 mount byte-exact (disk-mount-idle GREEN). Read/LOAD carved to drive-load [opus] (precise diagnosis: set_ca2 SO cadence at $F556 + ATN->VIA1 CA1 IRQ). Next: drive-load.",
+  "updated": "2026-06-23T02:00:00Z",
   "followups": [
-    "drive-gcr (GCR read → disk LOAD; high value for cracking)",
+    "drive-load (sector-read CA2/SO cadence + ATN CA1 IRQ -> real LOAD)",
     "daemon-trace-query",
     "vic-sprites-modes",
     "cia-cascade",
     "drive-watchdog-phase",
-    "sid-audio (Phase 1.5: reSID PCM/WAV)"
+    "sid-audio (Phase 1.5)"
   ],
-  "in_flight": {
-    "item": "drive-gcr",
-    "model": "opus",
-    "started": "2026-06-23T01:49:00Z",
-    "note": "opus alive 30min (drive.rs edited <1min ago, sector-read test added). Milestone 1 (GCR encoder) committed; on milestone 2 (sector read). Defer."
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"

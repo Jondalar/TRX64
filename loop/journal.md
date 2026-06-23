@@ -324,3 +324,16 @@ re-confirmed (sid trace reserved/no producer). Audio PCM/reSID → Phase 1.5. AD
 ** ALL CORE CHIPS MODELLED + BYTE-EXACT ** — CPU, VIC-II, CIA1/2, SID, VIA1/2, 1541 drive.
 done: 13 items. Advancing to drive-gcr [opus] — GCR read path → real disk LOAD (now
 unblocked by VIA2; the enabler for loading actual programs / the Phase-2 cracking workflow).
+
+## 2026-06-23 — DRIVER: drive-gcr partial (GCR encoding + mount byte-exact)
+
+Opus builder: milestone 1 GCR encoding byte-exact (gcr.rs, D64→GCR, SHA256 matches TS, 8
+parity tests) + disk-mount-idle GREEN (drive trace with D64 mounted byte-exact). rotation.rs
+wires the rotating stream into VIA2; read path ENGAGES (motor/head/SYNC/byte-assembly) but
+the live sector read returns status $03 not $01. Confirmation gate INDEPENDENT: GCR parity
+tests pass, disk-mount-idle + regression GREEN, no regression. ADR-032.
+
+MERGED the byte-exact encoding+mount increment. Carved the read/LOAD into drive-load [opus]
+with precise diagnosis: (1) set_ca2 byte-ready→SO cadence on PCR CA2 edge + drivecpu_rotate
+per-cycle ($F556 read loop, needs drive-cpu trace cross-check); (2) ATN→VIA1 CA1 IRQ (DOS
+attention; VIA1 lacks CA1). Advancing to drive-load.
