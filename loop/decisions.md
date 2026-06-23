@@ -687,3 +687,21 @@ BLOCKED (now very precisely characterized: upstream of track-1, directory/IEC/se
 clean followups. User decides: 6th armed attempt on the upstream lead (querying the saved ref trace), vs
 accept as a precisely-bounded known-RED, vs user-led.
 **Why:** The armed approach works but is slow; the user (deep $DD00/IEC domain) should weigh the 6th pass.
+
+## ADR-048 — scramble-gold behavioral gate ROOT-CAUSED the custom-loader stall (corrects ADR-047)
+**Context:** built the c64re-style behavioral gate (TS-vs-TRX64 stage screenshots) for the scramble custom loader.
+**Finding (RED, root-caused, visually verified by Driver):** at 30M post-RUN — TS golden shows the FULL
+"SCRAMBLE INFINITY" multicolor-bitmap TITLE screen; TRX64 shows "ENTERING SCRAMBLE SYSTEM" + an EMPTY
+progress bar on grey, FROZEN byte-identical 30M→120M (the bar never fills). NOT the renderer (render gates
+GREEN, the bar frame is pixel-clean); NOT the first-file load (KERNAL serial load tracks the golden to a few
+bytes). THE SPLIT: the first file loads via KERNAL serial routines (works); the title artwork loads AFTER RUN
+by the game's own custom $DD00 bit-bang loader — and THAT wedges on TRX64.
+**CORRECTS ADR-047:** the cycle-exact `scramble-load-progress` phase lead is NOT a cosmetic sample-boundary
+artifact — it is the UPSTREAM CAUSE of a real functional stall. The KERNAL tolerates the sub-byte $DD00 phase
+skew; the tighter custom $DD00 loop does NOT. The behavioral gate ELEVATED the cycle-exact gate from "nitpick"
+to "documented functional gap with a concrete visual repro."
+**Fix target:** the post-RUN custom $DD00 bit-bang loader drive/IEC timing — localize with a drive-cpu trace
+taken right after RUN where TRX64's bar stops advancing, find the first divergent $DD00/drive event. The
+scramble-gold gate (tools/oracle/corpus/render/scramble-gold.mjs) is the permanent behavioral acid test.
+**Why:** The custom loader — the user's hardest case + whole point — genuinely does not run yet; the gate now
+proves it + pins the cause.

@@ -530,3 +530,15 @@ phase. end4 RED is a sample-boundary effect. 5 theories now falsified. Probes-on
 Parked the phase-lead BLOCKED, now precisely localized (upstream of track-1). Routing the loop to
 daemon-trace-query → sid-audio. Escalated: user decides on a 6th armed pass (measure drive-track-1-read-job
 START anchored to LOAD keypress, in both runtimes) vs accept as a bounded known-RED.
+
+## 2026-06-23 — DRIVER: scramble-gold behavioral gate ROOT-CAUSED the custom-loader stall (ADR-048)
+
+The user's reframe (recycle the c64re gold-gate as TS-vs-TRX64 behavioral diff) WORKED. Built scramble-gold.mjs.
+RESULT (visually verified): TS golden @ 30M = full SCRAMBLE INFINITY title screen; TRX64 = "ENTERING SCRAMBLE
+SYSTEM" + EMPTY loader bar, FROZEN 30M-120M. The custom $DD00 bit-bang loader (loads title artwork AFTER RUN)
+WEDGES on TRX64. NOT renderer, NOT first-file load. CORRECTS ADR-047: the cycle-exact phase lead is the UPSTREAM
+CAUSE of a real stall, not a sample-boundary artifact — KERNAL tolerates the skew, the tight $DD00 loop doesn't.
+ADR-048. Merged the behavioral gate (permanent acid test). done: 22 items.
+
+Next: dd00-loader-stall — drive-cpu trace right after RUN, first divergent $DD00/drive event. User's $DD00 domain
++ his offered VICE trace now key. ESCALATED with a concrete visual repro.
