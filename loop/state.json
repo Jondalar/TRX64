@@ -27,14 +27,14 @@
     "disk-load-e2e (keyboard matrix)"
   ],
   "note": "disk-load-e2e: keyboard matrix done (session/type real now). LOAD blocked at LISTEN->TALK turnaround -> iec-talk-turnaround [opus] (drive not engaging as talker after ATN-release; $EE67/$EBFF). Disk onion: via2->gcr->load->[serial-diag]->read-engine->keyboard->talk-turnaround.",
-  "updated": "2026-06-23T05:05:00Z",
+  "updated": "2026-06-23T05:10:00Z",
   "followups": [
     "daemon-trace-query",
     "vic-sprites-modes",
     "cia-cascade",
     "drive-watchdog-phase",
     "sid-audio",
-    "custom-loader-gate (the acid test: $DD00 bitbang + VIC sync, after standard LOAD lands)"
+    "custom-loader-gate [opus] — ACID TEST: scramble_infinity.d64 ($DD00 bitbang + VIC raster sync, the user-flagged hardest case). Standard LOAD lands the bootstrap, then the loaded code installs the custom $DD00 loader for the bulk. Trace-diff vs TS catches 1-cycle desync."
   ],
   "in_flight": null,
   "stage2_items": [],
@@ -43,5 +43,6 @@
   ],
   "known_red": [
     "drive-boot-deep (tracked → drive-watchdog-phase, NOT a regression)"
-  ]
+  ],
+  "custom_loader_test_disk": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/scramble_infinity.d64"
 }
