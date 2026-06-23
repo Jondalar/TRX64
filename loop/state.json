@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "cia-cascade",
+  "current_item": "drive-watchdog-phase",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -26,20 +26,16 @@
     "drive-read-engine",
     "disk-load-e2e (keyboard matrix)",
     "iec-crossdomain-sync (STANDARD LOAD complete)",
-    "vic-sprites-modes"
+    "vic-sprites-modes",
+    "cia-cascade"
   ],
-  "note": "cia-cascade [opus] (ADR-017): chained timers (TB counts TA underflows) byte-exact. The cia builder simplified per-cycle model over-counts (orig div iso-cia-cascade trace[43] cyc 89 exp=2 got=3); VICE ciaDoStepTb is alarm-dispatch-driven + lazy. Port the VICE maincpu alarm scheduler (ta_alarm/tb_alarm reschedule + IFR pipeline). Reconstruct iso-cia-cascade scenario. Keep iso-cia-ta-oneshot/-tb-continuous/-tod/-icr GREEN.",
-  "updated": "2026-06-23T09:50:00Z",
+  "note": "cia-cascade done (ADR-017 closed) — CIA fully byte-exact. 20 items. Next: drive-watchdog-phase [opus] — closes the drive-boot-deep known-RED (3rd T1 watchdog IRQ +2). Phase-lead still ESCALATED to user (a/b/c). After watchdog: daemon-trace-query, sid-audio.",
+  "updated": "2026-06-23T10:10:00Z",
   "followups": [
     "daemon-trace-query",
-    "drive-watchdog-phase",
     "sid-audio"
   ],
-  "in_flight": {
-    "item": "cia-cascade",
-    "model": "opus",
-    "started": "2026-06-23T09:50:00Z"
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"

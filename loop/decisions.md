@@ -585,3 +585,16 @@ UNCHANGED so no iso-* gate is affected. 20 render scenarios GREEN (verified subs
 boot + boot-trace + api-call-monitor + 70 cargo tests). Renderer in core (pure); PNG/WS in daemon.
 **Why:** The VIC renderer is now complete + pixel-exact (sprites + all modes + scroll) — the full
 visual foundation for Phase-2 frame-hash probes (the user-flagged custom-loader visual checks).
+
+## ADR-043 — cia-cascade done: ADR-017 closed, CIA fully byte-exact
+**Context:** the long-tracked chained-timer corner (TB counts TA underflows). The cia builder's
+per-cycle model over-counted (ADR-017).
+**Decision (accepted, GREEN + no regression):** Ported VICE's lazy alarm-driven cascade into
+cia.rs — `Ciat::set_alarm` walks the 8192-entry transition table to predict the EXACT next-
+underflow clk; `ta_alarmclk`/`tb_alarmclk`; update_ta dispatches each predicted TA-underflow
+alarm <= rclk via `intta` (counts + reschedules + in cascade mode calls update_tb + do_step_tb);
+the TB decrement is realised LAZILY by TB's next ciat_update, so intermediate TA underflows
+collapse exactly as VICE collapses them. Re-arm alarms after every timer-mutating write.
+iso-cia-cascade (reconstructed) + -irq + -oneshot all GREEN; the 4 existing CIA gates + boot-
+trace-short stay GREEN; 71 core tests. ADR-017 CLOSED.
+**Why:** The CIA is now fully byte-exact (timers/TOD/ICR/cascade) — the last CIA gap is gone.

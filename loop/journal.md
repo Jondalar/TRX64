@@ -478,3 +478,14 @@ trace + api-call-monitor all GREEN, 70 cargo tests pass, no regression. ADR-042.
 
 The VIC renderer is now complete + pixel-exact — the full visual foundation for Phase-2 frame-hash
 probes. done: 19 items. Advancing to cia-cascade [opus]. (Phase-lead still escalated to user.)
+
+## 2026-06-23 — DRIVER: cia-cascade done — ADR-017 closed, CIA fully byte-exact
+
+Opus builder ported VICE's lazy alarm-driven cascade (Ciat::set_alarm predicts next-underflow
+clk; lazy TB decrement collapses intermediate TA underflows). iso-cia-cascade (reconstructed) +
+-irq + -oneshot GREEN. Confirmation gate INDEPENDENT: all 3 cascade variants + the 4 existing CIA
+gates + boot-trace-short GREEN, 71 tests, no regression. ADR-043. Merged. The CIA is now fully
+byte-exact (timers/TOD/ICR/cascade) — one of the earliest deferred gaps (ADR-017) closed.
+
+done: 20 items. Advancing to drive-watchdog-phase [opus] (closes the drive-boot-deep known-RED).
+Phase-lead still escalated to user.
