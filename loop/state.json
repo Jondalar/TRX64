@@ -23,7 +23,7 @@
     "sid"
   ],
   "note": "drive-gcr [opus]: GCR bitstream (D64->GCR) + rotating disk + byte-ready via VIA2 + DOS sector read + full IEC LOAD handshaking. Gate = mount sample D64 + LOAD + program-in-RAM parity vs TS. Large, likely multi-iteration.",
-  "updated": "2026-06-23T01:20:00Z",
+  "updated": "2026-06-23T01:49:00Z",
   "followups": [
     "drive-gcr (GCR read → disk LOAD; high value for cracking)",
     "daemon-trace-query",
@@ -35,7 +35,8 @@
   "in_flight": {
     "item": "drive-gcr",
     "model": "opus",
-    "started": "2026-06-23T01:20:00Z"
+    "started": "2026-06-23T01:49:00Z",
+    "note": "opus alive 30min (drive.rs edited <1min ago, sector-read test added). Milestone 1 (GCR encoder) committed; on milestone 2 (sector read). Defer."
   },
   "stage2_items": [],
   "resolved": [
