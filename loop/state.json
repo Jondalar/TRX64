@@ -32,14 +32,15 @@
     "scramble-gold"
   ],
   "note": "dd00-loader-stall H1 test (post-workflow ADR-049). Phase-skew FALSIFIED; bug = mutual write-path fold deadlock (C64 $04E2 waits CLK; drive $0402 never asserts). Test H1: remove the extra drive_store_pb refold in iec_push_flush_to (full.rs:167), single fold = VICE iecbus_cpu_write_conf1. Fast in-crate harness ($05FD climb). H3 fallback: diff drive-PC stream vs c64re reference (up 4312).",
-  "updated": "2026-06-23T14:55:00Z",
+  "updated": "2026-06-23T15:34:00Z",
   "followups": [
     "sid-audio"
   ],
   "in_flight": {
     "item": "dd00-loader-stall",
     "model": "opus",
-    "started": "2026-06-23T14:55:00Z"
+    "started": "2026-06-23T15:34:00Z",
+    "note": "H1 FALSIFIED (write-path single fold bit-identical — committed 9e49e35). H3 localizing the deadlock to DRIVE CLK-RELEASE (the drive $0402 loop / why it never asserts CLK). Builder alive (no completion notification; H3 = c64re WS calls, not local edits). Defer."
   },
   "stage2_items": [],
   "resolved": [
