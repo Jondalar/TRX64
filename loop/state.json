@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "drive-seek-phase",
+  "current_item": "daemon-trace-query",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -30,17 +30,12 @@
     "cia-cascade",
     "drive-watchdog-phase"
   ],
-  "note": "drive-seek-phase [opus] ARMED: close the ~17-20k rotational-phase lead at transfer start (scramble-load-progress RED). ADR-041: narrowed to seek/step + GCR head-advance at sector-lock. ADR-045 spec keys: C64RE Spec 218 (stepInward off-by-one past track 35) + Spec 612 (write_offset per-instance, viacore:529). Check drive head-stepping + write_offset; trace-diff drive-clk+gcr_head_offset at sector-header-lock vs TS.",
-  "updated": "2026-06-23T11:35:00Z",
+  "note": "drive-seek-phase: 4th theory, Spec 218 disproved for scramble (seek correct). Real fidelity progress merged (store_prb rotate + #1083, zero regression). Lead narrowed to the rotation accum-carry at the track-1 lock; needs ONE measurement (TS drive_clk+offset at track-1 sync — c64re runtime). ESCALATED. Loop routes to daemon-trace-query, then sid-audio. Phase-lead = the only known-RED, BLOCKED awaiting user steer.",
+  "updated": "2026-06-23T11:55:00Z",
   "followups": [
-    "daemon-trace-query",
     "sid-audio"
   ],
-  "in_flight": {
-    "item": "drive-seek-phase",
-    "model": "opus",
-    "started": "2026-06-23T11:35:00Z"
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
@@ -49,5 +44,7 @@
     "scramble-load-progress (drive-seek-phase: custom-loader phase-lead)"
   ],
   "custom_loader_test_disk": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/scramble_infinity.d64",
-  "blocked": []
+  "blocked": [
+    "drive-seek-phase (custom-loader phase-lead): ~17-20k rotational-phase lead at track-1 sector-lock; 4 theories falsified; narrowed to rotation_1541_simple accum-carry / rotate_disk clk-granularity; NEEDS the TS drive_clk+head-offset at track-1 first sync (c64re runtime can provide); ESCALATED (ADR-046)"
+  ]
 }

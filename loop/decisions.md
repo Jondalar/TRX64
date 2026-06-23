@@ -635,3 +635,30 @@ in a cleaner abstraction" class Spec 612 warns about (just IRQ-delay, not write_
 phase-lead is very likely a drive head-stepping / seek-timing OR write_offset boundary divergence — NOT
 blind anymore.
 **Why:** The TS team already walked this exact path; reuse their root cause + doctrine.
+
+## ADR-046 — drive-seek-phase: 4th theory; Spec 218 disproved for scramble; ESCALATED w/ the one measurement
+**Context:** the custom-loader phase-lead (~17-20k cyc, scramble-load-progress RED), armed with Spec 218.
+**Outcome:** (1) FIDELITY PROGRESS MERGED (zero regression, 7/7 drive+boot gates GREEN): two genuine VICE
+store_prb C-indirections the port had dropped — `rotation_rotate_disk` at the TOP of store_prb (advance
+head + rotation_last_clk to current clk before stepper/speed/motor) + bug #1083 motor-on-edge second
+drive_move_head + the exact store_prb sequence (rotate→stepper→speed→motor). Genuine drive-model
+correctness. (2) Spec 218 head-stepping DISPROVED for scramble: SCRAMBLE lives at track 1 sector 0; the
+head correctly bumps from track 18 (ht36) to track 1 (ht2) via 36 half-steps and lands EXACTLY on ht=2 —
+the seek is right (Spec 218's stepInward-past-track-35 was an extended-track-G64 issue; scramble seeks
+inward). The store_prb fix produced a byte-identical end4 → the lead is NOT in the seek/store_prb path.
+**Narrowed precisely (4th theory's data):** the lead is the ROTATIONAL PHASE at the track-1 sector LOCK.
+TRX64 locks the first track-1 SYNC at drive_clk=7901947, gcr_head_offset=33595 bits (byte ~4199 of the
+7692-byte track), zone 3. Most likely: `rotation_1541_simple` accum-carry chunking (the `accum % rpmscale`
+fractional carry is order-sensitive) vs the exact set of clk points at which `rotate_disk` is invoked
+(VICE rotates on additional VIA2 paths — store_pra/$1C01, set_cb2 — TRX64 may sample at different clk
+granularity).
+**THE ONE MEASUREMENT NEEDED:** the TS-side drive_clk + head-offset at the IDENTICAL track-1 first sync.
+The golden TS daemon doesn't expose drive head state — BUT the user's c64re runtime (mcp__c64-re__runtime_*)
+DOES (deep-RE, exposes drive state). 
+**Decision:** ESCALATE. 4 theories tested, each falsified by trace-diff but each leaving the drive model
+genuinely more accurate. NOT a 5th blind attempt. Park the phase-lead BLOCKED; route the loop to the
+remaining clean followups (daemon-trace-query, sid-audio) until the user steers: (a) drive the c64re runtime
+to get the track-1-lock drive_clk+offset measurement, then arm a 5th attempt with it; (b) user looks at the
+narrowed diagnosis; (c) leave it.
+**Why:** The problem is precisely localized; the next step is a specific measurement the user's own deep-RE
+tooling provides — higher leverage than another blind opus pass.

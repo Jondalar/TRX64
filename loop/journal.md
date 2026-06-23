@@ -504,3 +504,16 @@ USER STEER (ADR-045): read the C64RE specs — Spec 218 = the EXACT custom-loade
 root cause stepInward off-by-one past track 35 (matches ADR-041's seek/step narrowing); Spec 612 =
 write_offset per-instance boundary doctrine. Arming the next phase-lead attempt (drive-seek-phase) with
 these — no longer blind. Advancing to drive-seek-phase.
+
+## 2026-06-23 — DRIVER: drive-seek-phase — 4th theory; fidelity merged; phase-lead ESCALATED
+
+Spec 218 DISPROVED for scramble (seek is correct: SCRAMBLE @ track 1, head lands ht=2). Merged real
+fidelity (2 VICE store_prb behaviors: rotate-at-top + #1083; zero regression, 7/7 drive+boot gates GREEN).
+The lead is the rotational PHASE at the track-1 sector-lock (TRX64 locks first track-1 SYNC @ drive_clk
+7901947, gcr_head_offset 33595 bits) — likely the rotation_1541_simple accum-carry / rotate_disk clk-
+granularity. ADR-046.
+
+4 theories falsified, each leaving the model more accurate. ESCALATED — the next step needs the TS-side
+drive_clk+head-offset at the identical track-1 sync, which the user's c64re runtime exposes (the golden TS
+daemon doesn't). Parked the phase-lead BLOCKED; routing the loop to daemon-trace-query → sid-audio.
+Asked: (a) drive c64re to get the measurement + arm attempt 5, (b) user looks, (c) leave it.
