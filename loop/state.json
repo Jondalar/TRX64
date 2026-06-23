@@ -28,7 +28,7 @@
     "iec-crossdomain-sync (STANDARD LOAD complete)"
   ],
   "note": "custom-loader-gate [opus] ACID TEST: scramble_infinity.d64 — boot it (LOAD bootstrap -> custom $DD00 loader), trace-diff vs TS over the load + custom-loader run. Tests cycle-exact $DD00 bitbang + VIC sync (the user-flagged hardest case). Cross-domain sync (just fixed) is the foundation.",
-  "updated": "2026-06-23T06:34:00Z",
+  "updated": "2026-06-23T06:49:00Z",
   "followups": [
     "daemon-trace-query",
     "vic-sprites-modes",
@@ -39,8 +39,8 @@
   "in_flight": {
     "item": "custom-loader-gate",
     "model": "opus",
-    "started": "2026-06-23T06:34:00Z",
-    "note": "opus alive 30min: heavy exploration of scramble boot (4 probe scenarios, last ~7min ago). Analysis-heavy (real game custom loader). No production code yet. Defer; watch mtime next tick."
+    "started": "2026-06-23T06:49:00Z",
+    "note": "opus alive ~45min: deep scramble exploration, 6 probe scenarios, no production code yet. Acid test (real game custom loader) — may return as a precise DIAGNOSIS rather than green. Defer; if next tick still no code/commit + stale mtime, assess for stall."
   },
   "stage2_items": [],
   "resolved": [
