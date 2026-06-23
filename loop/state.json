@@ -31,8 +31,8 @@
     "drive-watchdog-phase",
     "scramble-gold"
   ],
-  "note": "dd00-via2-byteready workflow: complicated-engine FALSIFIED (no-op). ROOT CAUSE (ADR-051): the drive HEAD lands on EMPTY half-track 3 (vs reference ht4 real data) — an accumulated rotate_disk per-poll PHASE drift under direct-poll makes TRX64 decode a wrong byte -> wrong stepper phase -> head to empty track -> no SYNC -> no CLK release. rotation_1541_simple is byte-identical to TS; the drift is the per-poll CALL phase. Next: dd00-headphase-diff — diff TRX64 vs the saved reference trace (/tmp/scramble_ref_head.duckdb) at the FIRST divergent $1CF0 poll. ESCALATED to user (10 attempts, his GCR/loader domain).",
-  "updated": "2026-06-23T16:38:00Z",
+  "note": "LOOP STOPPED by user (cron a06c4701 deleted, c64re daemon killed). 22 items done; full byte-exact C64 + pixel-exact renderer + standard disk LOAD. ONE known-RED: scramble custom $DD00 loader (root-caused ADR-051: head lands on empty half-track 3 via accumulated rotate_disk per-poll phase drift; rotation_1541_simple byte-identical to TS; reference per-poll trace saved /tmp/scramble_ref_head.duckdb). Resume: current_item dd00-headphase-diff (diff first divergent $1CF0 poll vs reference).",
+  "updated": "2026-06-23T16:42:00Z",
   "followups": [
     "sid-audio"
   ],
@@ -47,5 +47,6 @@
   "custom_loader_test_disk": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/scramble_infinity.d64",
   "blocked": [
     "drive-seek-phase (custom-loader phase-lead): ~12-20k C64-cycle lead UPSTREAM of track-1 read (boot/seek/directory/IEC-filename phase) — rotation FALSIFIED by c64re measurement (track-1 lock at identical byte). 5 theories down. Ref trace saved tmp/scramble-track1-measure.duckdb. ESCALATED (ADR-047)"
-  ]
+  ],
+  "loop_status": "STOPPED by user 2026-06-23"
 }
