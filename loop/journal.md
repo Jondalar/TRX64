@@ -365,3 +365,18 @@ trace-parity ≠ functional correctness. Re-framed the LOAD blocker as drive-rea
 which MUST gate on JOB-STATUS ($01) + sector bytes, cross-checking the drive-cpu trace at
 $F556. Owning the misdiagnosis; routing to the actually-failing layer. Advancing to
 drive-read-engine.
+
+## 2026-06-23 — DRIVER: drive-read-engine — GCR sector read $03→$01 CRACKED
+
+Opus builder found + fixed the disk-LOAD root cause: the attach_clk spin-up window was
+cleared only by PRA reads, but the DOS find-sync loop $F562 polls SYNC via PRB only →
+attach_clk never cleared → never sees SYNC → watchdog → $03. Fix (rotation.rs): drop the
+spin-up window on ANY rotation access after DRIVE_ATTACH_DELAY. RESULT: T18S0 read → JOB
+STATUS $01, $0300 byte-identical to the D64 (0/256). Confirmation gate INDEPENDENT:
+disk-read-byteexact GREEN + gcr_sync_probe ($01+SYNC) + full regression GREEN, no regression.
+ADR-035. Merged. The drive now READS DISK SECTORS BYTE-EXACT.
+
+This was the right gate at last (functional job-status + sector bytes, not just trace).
+All disk-LOAD pieces now work individually (read engine + IEC serial + ATN + GCR). End-to-end
+LOAD"$"→$0801 still pending integration → next item disk-load-e2e [opus] (the payoff: assert
+the program lands in C64 RAM byte-exact).

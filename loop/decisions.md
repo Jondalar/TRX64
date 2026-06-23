@@ -426,3 +426,21 @@ read JOB still fails — trace-parity ≠ functional correctness. drive-read-eng
 the JOB STATUS ($01) + the read sector bytes, not just the drive-cpu trace, and cross-check
 the drive-cpu trace at $F556 vs the TS oracle to localize the byte-latch divergence.
 **Why:** Own the misdiagnosis; route the work to the actually-failing layer with the right gate.
+
+## ADR-035 — drive-read-engine: GCR sector read $03→$01 ROOT CAUSE cracked
+**Context:** the disk-LOAD root blocker — sector read returned $03 (SYNC) not $01.
+**Decision (accepted, GREEN + byte-exact):** Root cause found: rotation_sync_found()
+returned 0x80 (no-sync) while attach_clk != 0 (the 1.8M-cycle DRIVE_ATTACH_DELAY spin-up
+window). VICE clears attach_clk only in rotation_byte_read (PRA/$1C01), getting away with
+it because real jobs issue a PRA read during setup — but the 1541 DOS find-sync loop $F562
+(BIT $1C00 / BMI) polls SYNC via PRB ONLY, so attach_clk never cleared → never sees SYNC →
+$1805 watchdog → $03. FIX (rotation.rs): after DRIVE_ATTACH_DELAY elapses, drop the spin-up
+window on ANY rotation access (PRB included) — physical reality (disk is up to speed
+regardless of which VIA register is sampled). Within the delay nothing changes → byte-exact
+mount/idle unaffected. RESULT: T18S0 directory read → JOB STATUS $01, $0300 buffer byte-
+identical to the D64 (0/256 diffs). disk-read-byteexact GREEN, no regression. Functional
+gate (status $01 + sector bytes) in drive_sector_read.rs since the oracle has no WS surface
+to read DRIVE RAM.
+**Why:** Cracked the deepest layer of the disk onion via the right (functional) gate.
+END-TO-END LOAD still pending: with read-engine + IEC-serial both working, the full
+LOAD"$"→$0801 is the integration payoff → next item disk-load-e2e.
