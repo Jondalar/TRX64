@@ -639,3 +639,191 @@ fn iec_drive_lost_window() {
     let cmdbuf: Vec<u8> = (0x0200..0x0210).map(|a| m.drive8.drive_ram_read(a)).collect();
     eprintln!("drive cmd buffer $0200: {:02X?}", cmdbuf);
 }
+
+/// Measure the rotational phase at the FIRST track-1 SYNC lock, mirroring the
+/// corpus `disk/scramble-load-progress.json` driving sequence EXACTLY so the
+/// numbers are comparable to the c64re/TS reference:
+///   mount-before-boot, 2M + 2M boot, type LOAD"*",8,1 (hold/gap 80000),
+///   then run while sampling the drive PC.
+///
+/// The 1541 DOS find-sync loop is at $F562 `BIT $1C00` / $F565 `BMI $F55D`;
+/// it falls through to $F567 `LDA $1C01` the instant SYNC is detected. We log:
+///   - every half-track change (the seek 18->1) with its drive_clk
+///   - the FIRST $F567 (sync lock) AFTER the head reaches track 1 (halftrack 2),
+///     with drive_clk, gcr_head_offset, speed_zone, and the GCR byte read.
+///
+/// c64re/TS reference (measured live): head settles on track 1 at drive_clk
+/// ~5243192, first track-1 sync lock (drive $F567) at drive_clk 5354260
+/// => settle->lock delta ~111068 drive cycles.
+#[test]
+#[ignore = "rotational-phase measurement; run explicitly with --ignored"]
+fn track1_sync_phase_probe() {
+    if !roms_present() {
+        eprintln!("skip: ROMs absent");
+        return;
+    }
+    let d64 = match std::fs::read(SAMPLE) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("skip: sample disk absent");
+            return;
+        }
+    };
+    let mut m = Machine::new();
+    m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+    // Corpus order: mount at cycle 0 (before any run).
+    m.drive8.attach_disk(DiskImage {
+        kind: DiskKind::D64,
+        bytes: d64.clone(),
+        backing_path: Some(SAMPLE.to_string()),
+        read_only: false,
+    });
+    let mut sink = NullSink;
+    // boot-1 + boot-2 (2M + 2M) — exactly as the corpus scenario.
+    m.run_for_full(2_000_000, &mut sink, |_, _, _, _, _, _, _| {});
+    m.run_for_full(2_000_000, &mut sink, |_, _, _, _, _, _, _| {});
+    // type-load: LOAD"*",8,1\r with corpus hold/gap = 80000.
+    m.keyboard
+        .type_text(m.cpu6510.clk, "LOAD\"*\",8,1\r", 80_000, 80_000);
+
+    // Step in fine chunks, after each chunk inspecting the live rotation state.
+    // We detect (a) every half-track transition with its drive_clk and (b) the
+    // first $F567 sync-lock that occurs while the head is on track 1 (halftrack 2),
+    // capturing the head offset at that instant.
+    let mut prev_ht: u32 = m.drive8.rotation.current_half_track;
+    let mut last_step_clk: Option<u64> = None; // drive_clk of the final 18->1 step
+    let mut step_log: Vec<(u32, u64)> = Vec::new();
+    // Track whether the current fine chunk saw an F567 (sync lock).
+    let mut lock_clk_offset: Option<(u64, u32, usize, u8)> = None; // (clk, head_off, zone, gcr_read)
+
+    // Run boot/seek window coarsely until the head is on track 1, logging steps.
+    let mut total = 0u64;
+    while total < 8_000_000 && m.drive8.rotation.current_half_track != 2 {
+        m.run_for_full(20_000, &mut sink, |_, _, _, _, _, _, _| {});
+        total += 20_000;
+        let ht = m.drive8.rotation.current_half_track;
+        if ht != prev_ht {
+            step_log.push((ht, m.drive8.drive_clk));
+            last_step_clk = Some(m.drive8.drive_clk);
+            prev_ht = ht;
+        }
+    }
+    let settle_clk = m.drive8.drive_clk;
+    let settle_off = m.drive8.rotation.gcr_head_offset;
+
+    // Now step finely watching for the first F567 while on track 1.
+    let mut sawf567 = false;
+    let mut budget_after = 0u64;
+    while !sawf567 && budget_after < 2_000_000 {
+        let mut hit = false;
+        m.run_for_full(50, &mut sink, |pc, _, _, _, _, _, _| {
+            if pc == 0xF567 {
+                hit = true;
+            }
+        });
+        budget_after += 50;
+        if hit && m.drive8.rotation.current_half_track == 2 {
+            lock_clk_offset = Some((
+                m.drive8.drive_clk,
+                m.drive8.rotation.gcr_head_offset,
+                m.drive8.rotation.speed_zone,
+                m.drive8.rotation.gcr_read,
+            ));
+            sawf567 = true;
+        }
+    }
+
+    eprintln!("== TRX64 track-1 rotational-phase probe ==");
+    eprintln!("seek steps (halftrack, drive_clk):");
+    for (ht, c) in &step_log {
+        eprintln!("  ht={} (track {}) drive_clk={}", ht, ht / 2, c);
+    }
+    eprintln!(
+        "head SETTLED on track1: drive_clk~{} head_offset={} bits (byte ~{}) last_step_clk={:?}",
+        settle_clk, settle_off, settle_off / 8, last_step_clk
+    );
+    if let Some((clk, off, zone, gcr)) = lock_clk_offset {
+        let lc = last_step_clk.unwrap_or(settle_clk);
+        eprintln!(
+            "FIRST track-1 SYNC LOCK: drive_clk={} head_offset={} bits (byte ~{}) zone={} gcr_read=${:02X}",
+            clk, off, off / 8, zone, gcr
+        );
+        eprintln!(
+            "  settle->lock delta = {} drive cycles (c64re/TS ref = ~111068)",
+            clk.wrapping_sub(lc)
+        );
+    } else {
+        eprintln!("FIRST track-1 SYNC LOCK: not captured within budget");
+    }
+}
+
+/// Direct gate-quantity probe: replicate the corpus scenario C64-cycle checkpoints
+/// EXACTLY and report $AE/$AF at each L1..L8 (4M boot + 8x1M), plus the precise
+/// C64 cycle at which $AE first becomes non-zero (first data byte deposited).
+///
+/// Golden (TS): end1..end4 = [0,0]; end5=[131,9]; => $AE first moves in (8M,9M].
+#[test]
+#[ignore = "gate-quantity $AE progression probe; run explicitly with --ignored"]
+fn ae_progress_probe() {
+    if !roms_present() {
+        eprintln!("skip: ROMs absent");
+        return;
+    }
+    let d64 = match std::fs::read(SAMPLE) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("skip: sample disk absent");
+            return;
+        }
+    };
+    let mut m = Machine::new();
+    m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+    m.drive8.attach_disk(DiskImage {
+        kind: DiskKind::D64,
+        bytes: d64.clone(),
+        backing_path: Some(SAMPLE.to_string()),
+        read_only: false,
+    });
+    let mut sink = NullSink;
+    m.run_for_full(2_000_000, &mut sink, |_, _, _, _, _, _, _| {});
+    m.run_for_full(2_000_000, &mut sink, |_, _, _, _, _, _, _| {});
+    m.keyboard
+        .type_text(m.cpu6510.clk, "LOAD\"*\",8,1\r", 80_000, 80_000);
+
+    let mut first_move: Option<u64> = None;
+    // Fine chunks; tighten near the 8M boundary to pin first_move precisely.
+    let mut next_label_at = 5_000_000u64; // L1 = 4M boot + 1M
+    let mut label = 1;
+    eprintln!("== TRX64 $AE/$AF progression (corpus checkpoints) ==");
+    loop {
+        let before = m.cpu6510.clk;
+        // Fine 2k chunks in the 7.9M-8.1M window to pin the first move precisely.
+        let chunk = if m.cpu6510.clk >= 7_900_000 && m.cpu6510.clk < 8_100_000 {
+            2_000
+        } else {
+            50_000
+        };
+        m.run_for_full(chunk, &mut sink, |_, _, _, _, _, _, _| {});
+        let ae = m.read_full(0x00AE);
+        let af = m.read_full(0x00AF);
+        if first_move.is_none() && (ae != 0 || af != 0) {
+            first_move = Some(m.cpu6510.clk);
+        }
+        if m.cpu6510.clk >= next_label_at && label <= 8 {
+            eprintln!(
+                "  end{} (C64 clk {}): $AE/$AF = [{}, {}]",
+                label, m.cpu6510.clk, ae, af
+            );
+            label += 1;
+            next_label_at += 1_000_000;
+        }
+        let _ = before;
+        if m.cpu6510.clk >= 13_000_000 {
+            break;
+        }
+    }
+    eprintln!(
+        "FIRST $AE/$AF move at C64 clk = {:?}  (golden: between 8M and 9M)",
+        first_move
+    );
+}
