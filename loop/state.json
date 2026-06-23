@@ -32,15 +32,16 @@
     "scramble-gold"
   ],
   "note": "dd00-loader-stall WORKFLOW (ultracode/xhigh): 6 parallel VICE-C-vs-TRX64 source-diff agents (iecbus/cia2-pa/via1d/iec-glue/ciacore-edges/crossdomain) + c64re reference-trace agent -> synthesize root cause -> fix+verify (scramble-gold bar-fill + full regression), commits to branch dd00-loader-stall. VICE src at /Users/alex/Development/C64/Tools/vice/vice/src. c64re ref up 4312.",
-  "updated": "2026-06-23T14:08:00Z",
+  "updated": "2026-06-23T14:34:00Z",
   "followups": [
     "sid-audio"
   ],
   "in_flight": {
     "item": "dd00-loader-stall",
     "model": "workflow",
-    "started": "2026-06-23T14:08:00Z",
-    "workflow": "wtdhh0z9v"
+    "started": "2026-06-23T14:34:00Z",
+    "workflow": "wtdhh0z9v",
+    "note": "WORKFLOW wtdhh0z9v ~27min: Diff+Trace phases done, in Synthesize/Fix (xhigh). Commits land only in the final Fix phase. Multi-phase orchestration — legit longer. Defer."
   },
   "stage2_items": [],
   "resolved": [
