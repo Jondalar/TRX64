@@ -789,6 +789,7 @@ impl Machine {
             // then re-fold the drive's PB output into the IEC core for the next
             // instruction's $DD00 reads.
             self.drive8.iec_drv_port = self.iec.drv_port;
+            self.drive8.iec_cpu_bus = self.iec.cpu_bus;
             self.drive_c64_ref = self.drive8.catch_up_to(self.cpu6510.clk, self.drive_c64_ref);
             self.iec.drive_store_pb(self.drive8.via1_pb_iec_output());
             if let Some((pc, a, x, y, sp, p, drv_clk)) = self.drive8.sample_pc_change() {

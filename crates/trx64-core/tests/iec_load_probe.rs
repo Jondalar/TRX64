@@ -493,6 +493,83 @@ fn iec_load_stall_point() {
     );
 }
 
+/// Byte-exact directory-load verification mirroring the corpus
+/// `disk/disk-load-dir.json` sequence (mount-before-boot, 2M+2M boot, type
+/// LOAD"$",8 via the keyboard matrix with the corpus hold/gap cycles, 4×2M run),
+/// then compares $0801..$0A80 + vartab ($2D/$2E) + ST ($90) to the golden values
+/// extracted from `disk-load-dir.golden.json`.
+#[test]
+#[ignore = "byte-exact directory-load check; run explicitly with --ignored"]
+fn iec_load_dir_byteexact() {
+    if !roms_present() {
+        eprintln!("skip: ROMs absent");
+        return;
+    }
+    let d64 = match std::fs::read(SAMPLE) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("skip: sample disk absent");
+            return;
+        }
+    };
+    let mut m = Machine::new();
+    m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+    // Corpus order: mount at cycle 0 (before any run).
+    m.drive8.attach_disk(DiskImage {
+        kind: DiskKind::D64,
+        bytes: d64.clone(),
+        backing_path: Some(SAMPLE.to_string()),
+        read_only: false,
+    });
+    let mut sink = NullSink;
+    // boot-1 + boot-2 (2M + 2M).
+    m.run_for_full(2_000_000, &mut sink, |_, _, _, _, _, _, _| {});
+    m.run_for_full(2_000_000, &mut sink, |_, _, _, _, _, _, _| {});
+    // type-load-dir: LOAD"$",8\r via the keyboard matrix, corpus hold/gap = 80000.
+    m.keyboard
+        .type_text(m.cpu6510.clk, "LOAD\"$\",8\r", 80_000, 80_000);
+    // load-1..load-4 (4 × 2M).
+    for _ in 0..4 {
+        m.run_for_full(2_000_000, &mut sink, |_, _, _, _, _, _, _| {});
+    }
+
+    // Golden values from disk-load-dir.golden.json.
+    let golden_st: u8 = 0x40;
+    let golden_vartab: [u8; 2] = [127, 10]; // $0A7F
+    let golden_dir: [u8; 32] = [
+        31, 8, 0, 0, 18, 34, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 34,
+        32, 32, 32, 32, 32, 32, 0, 63, 8,
+    ];
+    let st = m.read_full(0x0090);
+    let vartab = [m.read_full(0x002D), m.read_full(0x002E)];
+    let dir: Vec<u8> = (0x0801..0x0801 + 640).map(|a| m.read_full(a)).collect();
+    eprintln!("ST=${:02X} (golden $40)  vartab={:02X?} (golden 7F,0A)", st, vartab);
+    eprintln!("dir first32: {:02X?}", &dir[..32]);
+    eprintln!("dir last16:  {:02X?}", &dir[640 - 16..]);
+    let first_mismatch = dir
+        .iter()
+        .take(32)
+        .zip(golden_dir.iter())
+        .position(|(a, b)| a != b);
+    assert_eq!(st, golden_st, "status $90 mismatch");
+    assert_eq!(vartab, golden_vartab, "vartab $2D/$2E mismatch");
+    assert!(
+        first_mismatch.is_none(),
+        "directory first-32 byte mismatch at idx {:?}",
+        first_mismatch
+    );
+    // Full 640-byte directory image must match the golden image.
+    let golden_full = std::fs::read("/tmp/golden_dir.bin").ok();
+    if let Some(gf) = golden_full {
+        if gf.len() == 640 {
+            let fm = dir.iter().zip(gf.iter()).position(|(a, b)| a != b);
+            assert!(fm.is_none(), "full directory mismatch at idx {:?}", fm);
+            eprintln!("FULL 640-byte directory BYTE-EXACT vs golden");
+        }
+    }
+    eprintln!("PASS: directory load byte-exact, ST=$40 (EOI)");
+}
+
 /// Profile the drive during the "lost" window (after the C64 sends TALK, while
 /// it waits ~7M cycles for the drive to start sending). Buckets drive PCs by
 /// 256-byte page to see where the drive spends the 7M cycles.

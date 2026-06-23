@@ -166,8 +166,12 @@ impl<'a> FullBus<'a> {
     #[inline]
     fn iec_push_flush_to(&mut self, target: u64) {
         // Feed the drive the current bus state so a `$1800` PB read during its
-        // catch-up run sees the live C64-driven CLK/DATA/ATN lines.
+        // catch-up run sees the live C64-driven CLK/DATA/ATN lines. Also feed the
+        // C64-side intent (cpu_bus) — constant across this catch-up — so a `$1800`
+        // STORE inside the run re-folds the wired-AND and the drive sees its own
+        // CLK/DATA pull on the next read (= via1d1541.c store_prb cross-domain sync).
         self.drive.iec_drv_port = self.iec.drv_port;
+        self.drive.iec_cpu_bus = self.iec.cpu_bus;
         self.drive_c64_ref = self.drive.catch_up_to(target, self.drive_c64_ref);
         let pb_out = self.drive.via1_pb_iec_output();
         self.iec.drive_store_pb(pb_out);

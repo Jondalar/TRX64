@@ -485,7 +485,12 @@ struct DriveBus<'a> {
     via2: &'a mut Via6522,
     /// Live IEC bus state at the VIA1 PB inputs (= iecbus.drv_port). Read by a
     /// `$1800` PB access so the drive's idle loop sees the C64-driven CLK/DATA/ATN.
+    /// MUTATED by a `$1800` store: the drive re-folds the wired-AND against the
+    /// fixed `cpu_bus` so its own pull on CLK/DATA is visible to its next read.
     drv_port: u8,
+    /// C64-side IEC intent (= iecbus.cpu_bus), constant across this catch-up run.
+    /// Used to re-fold `drv_port` after each `$1800` store (= via1d1541 store_prb).
+    cpu_bus: u8,
     /// Drive-CPU clock at the current bus access (= rclk for the VIA2 timer).
     /// Kept in step with `cpu.clk` by the run loop before each cycle.
     clk: u64,
@@ -726,8 +731,27 @@ impl<'a> Bus for DriveBus<'a> {
         match addr {
             0x0000..=0x7FFF => {
                 if (0x1800..=0x1BFF).contains(&addr) {
+                    // Composed VIA1 PB output before the store (= VICE p_oldpb).
+                    let reg = addr & 0x0f;
+                    let old_pb = (self.via1.regs[0] | !self.via1.regs[2]) & 0xff;
                     self.via1.run_alarms(self.clk);
                     self.via1.write(addr, val, self.clk);
+                    // via1d1541.c store_prb: a PB/DDRB write that CHANGES the drive's
+                    // composed IEC output re-folds the wired-AND bus against the fixed
+                    // C64 cpu_bus, so the drive's NEXT `$1800` read sees its own
+                    // CLK/DATA pull. This is the cross-domain fix: without it the drive
+                    // samples a STALE drv_port snapshot across a multi-instruction
+                    // catch-up run and misreads its own / the C64's line at the byte
+                    // handshake ($E95C isr01: `and #datin / bne frmerx`), falsely
+                    // aborting the directory talk-send at byte 11. VICE gates store_prb
+                    // on `byte != p_oldpb` (via1d1541.c:219) — so an ORB write with the
+                    // bit as an INPUT (DDRB=0, output unchanged) does NOT re-fold.
+                    if reg == 0 || reg == 2 {
+                        let new_pb = (self.via1.regs[0] | !self.via1.regs[2]) & 0xff;
+                        if new_pb != old_pb {
+                            self.drv_port = crate::iec::fold_drv_port(self.cpu_bus, new_pb);
+                        }
+                    }
                     return;
                 }
                 if (0x1C00..=0x1FFF).contains(&addr) {
@@ -783,6 +807,14 @@ pub struct Drive1541 {
     /// FullBus push-flush before the drive runs, so a `read $1800` reflects the
     /// live C64-driven IEC lines. Power-on 0x85 (all released).
     pub iec_drv_port: u8,
+    /// C64-side IEC intent (= VICE iecbus.cpu_bus: bit4=ATN, bit6=CLK, bit7=DATA),
+    /// constant across a single drive catch-up run (the C64 only mutates it on a
+    /// $DD00 write, which push-flushes the drive first). Refreshed by the FullBus
+    /// push-flush alongside `iec_drv_port`. A `$1800` store inside the catch-up run
+    /// re-folds the wired-AND bus against THIS fixed `cpu_bus` so the drive's next
+    /// `$1800` read reflects its own pull (= via1d1541.c store_prb). Power-on 0xff
+    /// (all released).
+    pub iec_cpu_bus: u8,
     /// Pending 6502 hardware-reset sequence. VICE fires `cpu_reset` (drivecpu.c:165)
     /// from the 6510 core's IK_RESET dispatch on the FIRST execute round, which sets
     /// `clk_ptr = 6` (the ~6-cycle reset sequence the chip consumes before the first
@@ -834,6 +866,7 @@ impl Drive1541 {
             stop_clk: 0,
             reset_pending: true,
             iec_drv_port: 0x85,
+            iec_cpu_bus: 0xff,
             disk: None,
             rotation: Rotation::new(),
         }
@@ -879,6 +912,7 @@ impl Drive1541 {
         self.reset_pending = true;
         self.last_sample_pc = None;
         self.iec_drv_port = 0x85;
+        self.iec_cpu_bus = 0xff;
         // VICE viacore_reset (viacore.c:378-439) for both VIAs: clear port/ddr
         // and control regs, latch timers to power-on, clear IFR/IER. VIA1's PB/
         // DDRB start at 0 (all inputs, ORB latch 0) so the IEC read_prb formula
@@ -1074,6 +1108,7 @@ impl Drive1541 {
             via1: &mut self.via1,
             via2: &mut self.via2,
             drv_port: self.iec_drv_port,
+            cpu_bus: self.iec_cpu_bus,
             clk: self.cpu.clk,
             via2_ports,
             rotation: &mut self.rotation,
@@ -1190,6 +1225,7 @@ mod tests {
                 via1: &mut d.via1,
                 via2: &mut d.via2,
                 drv_port: 0x85,
+                cpu_bus: 0xff,
                 clk: 0,
                 via2_ports: Via2Ports::default(),
                 rotation: &mut d.rotation,
@@ -1211,6 +1247,7 @@ mod tests {
             via1: &mut d.via1,
             via2: &mut d.via2,
             drv_port: 0x85,
+            cpu_bus: 0xff,
             clk: 0,
             via2_ports: Via2Ports::default(),
             rotation: &mut d.rotation,
@@ -1243,6 +1280,7 @@ mod tests {
             via1: &mut d.via1,
             via2: &mut d.via2,
             drv_port: 0x85,
+            cpu_bus: 0xff,
             clk: 0,
             via2_ports: Via2Ports::default(),
             rotation: &mut d.rotation,
@@ -1287,6 +1325,7 @@ mod tests {
             via1: &mut d.via1,
             via2: &mut d.via2,
             drv_port: 0x85,
+            cpu_bus: 0xff,
             clk: 0,
             via2_ports: Via2Ports::default(),
             rotation: &mut d.rotation,

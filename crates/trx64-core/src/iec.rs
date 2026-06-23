@@ -19,6 +19,33 @@
 //!   cpu_port: AND-fold of cpu_bus + all drv_bus; bit6=CLK line, bit7=DATA line.
 //!   drv_data[8] = ~(drive VIA1 PB output): bit1=DATA_OUT, bit3=CLK_OUT, bit4=ATN_ACK.
 
+/// Re-fold the wired-AND bus from the drive's CURRENT VIA1 PB output against a
+/// FIXED C64-side `cpu_bus`, returning the `drv_port` byte the drive reads at its
+/// VIA1 PB inputs (= VICE iecbus.drv_port: bit0=DATA_IN, bit2=CLK_IN, bit7=ATN).
+///
+/// This is the pure-function shape of `via1d1541.c store_prb` (lines 229-241): when
+/// the drive changes its OWN IEC output mid-run (a `$1800` store), VICE immediately
+/// recomputes `drv_bus[8]`, `cpu_port` and `drv_port` so the drive's NEXT `$1800`
+/// read reflects its own pull on the shared wired-AND line. The C64-side `cpu_bus`
+/// is constant across a single drive catch-up (the C64 only changes it on a $DD00
+/// write, which push-flushes the drive first), so a fixed `cpu_bus` is exact.
+///
+/// `pb_out` is the drive's composed VIA1 PB output `(ORB | ~DDRB)`.
+#[inline]
+pub fn fold_drv_port(cpu_bus: u8, pb_out: u8) -> u8 {
+    let dd = (!pb_out) as u32; // drv_data = ~pb_out (iecbus.c:229)
+    // drv_bus[8] (iecbus.c:230-232).
+    let term1 = (dd << 3) & 0x40;
+    let xor = ((!dd) ^ (cpu_bus as u32)) & 0xffff_ffff;
+    let shifted = (xor << 3) & 0xffff_ffff;
+    let term2 = (dd << 6) & shifted & 0x80;
+    let drv_bus = ((term1 | term2) & 0xff) as u8;
+    // cpu_port = cpu_bus & drv_bus[8] (single-drive AND-fold).
+    let cpu_port = cpu_bus & drv_bus;
+    // drv_port (iecbus.c:239-241).
+    (((cpu_port >> 4) & 0x04) | (cpu_port >> 7) | ((cpu_bus << 3) & 0x80)) & 0xff
+}
+
 /// IEC bus core state (unit-8 baseline). Lives on the `Machine`, borrowed into the
 /// `FullBus` for the duration of each instruction.
 #[derive(Clone, Copy, Debug)]
