@@ -31,12 +31,16 @@
     "drive-watchdog-phase",
     "scramble-gold"
   ],
-  "note": "scramble-gold DONE (behavioral gate built + root-caused). The custom $DD00 loader STALLS on TRX64 (visual repro: empty loader bar frozen vs TS title screen). ADR-048 corrects ADR-047: the phase lead is the CAUSE, not cosmetic. 22 items. Next: dd00-loader-stall — trace the post-RUN $DD00 loop, find first divergent drive/IEC event. User domain ($DD00) + his VICE trace now KEY. ESCALATED.",
-  "updated": "2026-06-23T13:40:00Z",
+  "note": "dd00-loader-stall [opus] ARMED (option b). c64re reference runtime UP on 4312. The post-RUN custom $DD00 bit-bang loader STALLS (bar never fills, frozen 30M-120M; scramble-gold visual repro). Builder traces the post-RUN $DD00 bar-fill loop in BOTH c64re-reference + TRX64, finds the FIRST divergent drive/IEC event where TRX64s bar stops, fixes the $DD00/drive timing. Gate: scramble-gold loaderbar progresses toward the title (bar fills). User VICE trace (option a) pending as independent HW ground-truth.",
+  "updated": "2026-06-23T13:52:00Z",
   "followups": [
     "sid-audio"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "dd00-loader-stall",
+    "model": "opus",
+    "started": "2026-06-23T13:52:00Z"
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
