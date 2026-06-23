@@ -31,12 +31,17 @@
     "drive-watchdog-phase",
     "scramble-gold"
   ],
-  "note": "dd00-loader-stall: H1 (IEC write-path fold) FALSIFIED+merged (VICE-faithful single fold, bit-identical, regression-clean) + fast probes. ROOT CAUSE found (ADR-050): drive VIA2 byte-ready/SYNC/T1 coupling under direct CPU poll (drive $0402 loop polls $1F05 T1C-H + $1CF0 PRB-SYNC; reference advances to $07Ax send, TRX64 stalls). Next: dd00-via2-byteready [opus] — diff TRX64-vs-c64re VIA2 T1+byte-ready/SYNC presentation at $0402. c64re ref + fast probes ready. 22 items.",
-  "updated": "2026-06-23T15:45:00Z",
+  "note": "dd00-via2-byteready WORKFLOW (ultracode): the drive $0402 loop polls VIA2 T1C-H ($1F05) + PRB bit7 SYNC ($1CF0) directly; reference advances to $0260->$07Ax send, TRX64 stalls. Parallel: reference-advance trace (c64re) + VICE-vs-TRX64 diff of via2d.c/viacore.c (VIA2 T1) + rotation.c (GCR byte-ready/SYNC/SO) + drive.c (byte-ready->SO AND PRB-readable coupling) -> synthesize -> fix (fast probe $05FD climb + regression).",
+  "updated": "2026-06-23T15:51:00Z",
   "followups": [
     "sid-audio"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "dd00-via2-byteready",
+    "model": "workflow",
+    "started": "2026-06-23T15:51:00Z",
+    "workflow": "pending"
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
