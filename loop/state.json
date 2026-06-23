@@ -25,7 +25,7 @@
     "drive-load (controller+ATN+read-stream)"
   ],
   "note": "drive-read-engine [opus]: fix GCR sector read $03->$01. Data byte-exact + SYNC present but sector-assembly fails. Cross-check drive-cpu trace at $F556 vs TS to localize byte-latch/sync divergence. GATE ON JOB-STATUS + sector bytes (not trace).",
-  "updated": "2026-06-23T03:20:00Z",
+  "updated": "2026-06-23T03:49:00Z",
   "followups": [
     "daemon-trace-query",
     "vic-sprites-modes",
@@ -36,7 +36,8 @@
   "in_flight": {
     "item": "drive-read-engine",
     "model": "opus",
-    "started": "2026-06-23T03:20:00Z"
+    "started": "2026-06-23T03:49:00Z",
+    "note": "opus alive 30min: in fix phase (rotation.rs byte-latch staged, disk-read-byteexact functional gate added). Deep $03 sync/latch fix. Defer."
   },
   "stage2_items": [],
   "resolved": [
