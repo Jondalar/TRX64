@@ -77,3 +77,47 @@ Scenarios (all GREEN, 384×272):
   border WINDOW from the CONTENT origin (`content_y0 = 48 + YSCROLL`,
   `content_x0 = 136 + XSCROLL`); in-row uncovered gaps fill background ($D021),
   the idle region above/below the 25-row band fills BLACK (verified vs TS).
+
+## scramble-gold — the custom-loader BEHAVIORAL acid test (`scramble-gold.mjs`)
+
+`scramble_infinity.d64` ships a custom **$DD00 (CIA2) serial loader**. The only
+remaining RED on this title, the cycle-exact `scramble-load-progress` trace gate,
+is a sample-boundary phase artifact (ADR-047: the rotation engine + track-1
+sync-lock are bit-identical to the c64re reference). That gate never proves the
+loader actually **LOADS, RUNS, and RENDERS** — only this one does.
+
+This is the c64re team's BEHAVIORAL proof (`scripts/diff-scramble-vs-vice.mjs` +
+`scripts/probe-scramble-stages.mjs` in the C64RE repo, which diff stage
+screenshots vs VICE) **recycled as a TS-vs-TRX64 differential**. It drives the
+SAME sequence on BOTH hermetic daemons over the WS protocol and pixel-diffs the
+384×272 framebuffers at each stage:
+
+1. `session/create` (pal) → boot ~5M cyc → `media/ingress` the scramble `.d64`
+   (kind:disk) → settle 2M.
+2. `session/type` `LOAD"*",8,1\r` → run 60M (custom loader takes over $DD00).
+3. `session/type` `RUN\r` → settle per-stage budget → `session/screenshot`.
+4. Decode both PNGs to RGBA, PIXEL-diff (same `png.mjs` infra as the render gate).
+
+Stages (cumulative settle, mirroring the probe's `captureStage` budgets):
+
+- **loaderbar** — 30M settle after RUN; the custom loader's raster bar. The
+  headline result: GREEN here ⇒ the $DD00 loader renders pixel-exact on TRX64.
+- **credits** — +150M; deeper into the loader / credits screen.
+- **post-space** — `session/type " "` then +60M; first frame after leaving credits.
+
+```
+cd tools/oracle
+node corpus/render/scramble-gold.mjs              # all stages
+node corpus/render/scramble-gold.mjs loaderbar    # one stage (runs the prefix to reach it)
+node corpus/render/scramble-gold.mjs loaderbar --dump   # on RED, write both PNGs + a diff mask
+```
+
+**GREEN** = stage pixel-identical TS-vs-TRX64 → the custom loader runs correctly;
+the cycle-exact `scramble-load-progress` stands as a documented sample-boundary
+known-RED, not a functional gap. **RED** = the real behavioral loader bug — the
+runner reports the first divergent stage, the divergent bounding box, a
+per-region histogram (BORDER / display top/middle/bottom third), and with
+`--dump` writes `scramble-gold-out/scramble-<stage>-{ts-golden,trx64}.png` plus a
+`-diffmask-384x272.rgba` (raw RGBA, differing pixels white) for visual triage.
+
+> Env overrides: `SCRAMBLE_D64`, `C64RE_ROOT`, `TRX64_DAEMON_BIN`.
