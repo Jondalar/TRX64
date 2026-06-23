@@ -1,0 +1,52 @@
+{
+  "name": "disk-load-dir",
+  "slice": "full",
+  "trace": false,
+  "steps": [
+    {
+      "method": "session/create",
+      "params": { "pal": true },
+      "capture": true,
+      "label": "create"
+    },
+    {
+      "method": "media/ingress",
+      "params": {
+        "session_id": "$sessionId",
+        "kind": "disk",
+        "path": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/scramble_infinity.d64"
+      },
+      "capture": true,
+      "label": "mount"
+    },
+    { "method": "session/run", "params": { "session_id": "$sessionId", "cycles": 2000000 }, "label": "boot-1" },
+    { "method": "session/run", "params": { "session_id": "$sessionId", "cycles": 2000000 }, "label": "boot-2" },
+    {
+      "method": "session/type",
+      "params": { "session_id": "$sessionId", "text": "LOAD\"$\",8\r", "hold_cycles": 80000, "gap_cycles": 80000 },
+      "label": "type-load-dir"
+    },
+    { "method": "session/run", "params": { "session_id": "$sessionId", "cycles": 2000000 }, "label": "load-1" },
+    { "method": "session/run", "params": { "session_id": "$sessionId", "cycles": 2000000 }, "label": "load-2" },
+    { "method": "session/run", "params": { "session_id": "$sessionId", "cycles": 2000000 }, "label": "load-3" },
+    { "method": "session/run", "params": { "session_id": "$sessionId", "cycles": 2000000 }, "label": "load-4" },
+    {
+      "method": "api/call",
+      "params": { "session_id": "$sessionId", "method": "monitorMemory", "args": [144, 144] },
+      "capture": true,
+      "label": "status-90"
+    },
+    {
+      "method": "api/call",
+      "params": { "session_id": "$sessionId", "method": "monitorMemory", "args": [45, 46] },
+      "capture": true,
+      "label": "vartab-2d"
+    },
+    {
+      "method": "api/call",
+      "params": { "session_id": "$sessionId", "method": "monitorMemory", "args": [2049, 2688] },
+      "capture": true,
+      "label": "ram-0801-dir"
+    }
+  ]
+}

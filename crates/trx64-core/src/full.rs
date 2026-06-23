@@ -106,6 +106,9 @@ pub struct FullBus<'a> {
     pub drive: &'a mut crate::drive::Drive1541,
     /// IEC wired-AND core (C64 CIA2 PA ↔ drive VIA1 PB), borrowed from the Machine.
     pub iec: &'a mut crate::iec::IecCore,
+    /// Keyboard matrix (CIA1 PA column drive ↔ PB row read). Read on a $DC01
+    /// access to inject queued `session/type` key presses.
+    pub keyboard: &'a crate::keyboard::KeyboardMatrix,
     /// Monotonic C64-clock the drive has been advanced up to (push-flush reference).
     pub drive_c64_ref: u64,
 }
@@ -189,7 +192,26 @@ impl<'a> FullBus<'a> {
                 let v = self.io[(addr as usize) - 0xd000];
                 (v & 0x0f) | 0xf0
             }
-            0xdc00..=0xdcff => self.cia1.read(addr, self.clk, self.cia_table),
+            0xdc00..=0xdcff => {
+                // CIA1 PB ($DC01) carries the keyboard ROW lines. VICE
+                // c64cia1.c:425-431 read_ciapb: byte = (val & (PRB|~DDRB)) |
+                // (DDRB & PRB), then ANDed with joystick-port-1 (none here).
+                // `val` = keyboard row pull-down for the PA column drive
+                // (paOut = PRA|~DDRA). KERNAL programs DDRB=0 so this collapses
+                // to `val`, but we compute the full formula for fidelity.
+                if (addr & 0xf) == crate::cia::CIA_PRB as u16 {
+                    let pra = self.cia1.peek(0xdc00);
+                    let ddra = self.cia1.peek(0xdc02);
+                    let prb = self.cia1.peek(0xdc01);
+                    let ddrb = self.cia1.peek(0xdc03);
+                    let pa_out = (pra | !ddra) & 0xff;
+                    let val = self.keyboard.read_rows_for_pa(self.clk, pa_out);
+                    let val_out_hi = ddrb & prb;
+                    (val & ((prb | !ddrb) & 0xff)) | val_out_hi
+                } else {
+                    self.cia1.read(addr, self.clk, self.cia_table)
+                }
+            }
             0xdd00..=0xddff => {
                 // CIA2 register 0 = port A ($DD00) carries the IEC input lines on
                 // bits 6/7. VICE read_ciapa: value = ((PRA|~DDRA)&0x3f) |

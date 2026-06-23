@@ -15,6 +15,7 @@ pub mod drive;
 pub mod full;
 pub mod gcr;
 pub mod iec;
+pub mod keyboard;
 pub mod rotation;
 pub mod render;
 pub mod sid;
@@ -347,6 +348,9 @@ pub struct Machine {
     /// IEC serial-bus wired-AND core (C64 CIA2 PA ↔ 1541 VIA1 PB). Persists across
     /// instructions; borrowed into the FullBus each instruction (ADR-021 IEC wiring).
     pub iec: IecCore,
+    /// Keyboard matrix (CIA1 PA column drive ↔ PB row read). Holds queued timed
+    /// key presses from `session/type`; read by the FullBus on a $DC01 access.
+    pub keyboard: crate::keyboard::KeyboardMatrix,
     /// Monotonic C64-clock reference the drive has been advanced up to. The
     /// push-flush catch-up advances the drive by `clk - drive_c64_ref` before
     /// sampling/applying the IEC lines on a $DD00 access (= VICE
@@ -404,6 +408,7 @@ impl Machine {
             full_assembled: false,
             cia2_pa_out: 0xff,
             iec: IecCore::new(),
+            keyboard: crate::keyboard::KeyboardMatrix::new(),
             drive_c64_ref: 0,
         }
     }
@@ -493,6 +498,7 @@ impl Machine {
         self.memconfig = self.memconfig_table[(port | 0x18) as usize & 0x1f];
         // IEC bus: power-on released (= installCia2 seeds iecWrite(0xff, 0x3f)).
         self.iec = IecCore::new();
+        self.keyboard.clear();
         self.cia2_pa_out = 0xff;
         self.drive_c64_ref = 0;
         // SID: reset register file + voice state to power-on defaults.
@@ -753,6 +759,7 @@ impl Machine {
                     read_side_effects: Vec::new(),
                     drive: &mut self.drive8,
                     iec: &mut self.iec,
+                    keyboard: &self.keyboard,
                     drive_c64_ref: self.drive_c64_ref,
                 };
                 loop {

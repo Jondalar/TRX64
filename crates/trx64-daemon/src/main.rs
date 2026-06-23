@@ -821,12 +821,38 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         }
 
         "session/type" => {
-            let st = state.lock().unwrap();
+            // PETSCII keyboard input. Mirrors the TS ws-server "session/type":
+            // s.typeText(text, hold_cycles ?? 80_000, gap_cycles ?? 80_000) then
+            // returns { c64Cycles: cpu.cycles, queued: text.length }. Key events
+            // are queued into the matrix relative to the CURRENT cpu clock; the
+            // FullBus reads them on each $DC01 access as the KERNAL scans.
+            let mut st = state.lock().unwrap();
+            let text = req
+                .params
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let hold = req
+                .params
+                .get("hold_cycles")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(80_000);
+            let gap = req
+                .params
+                .get("gap_cycles")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(80_000);
+            let now = st.session.machine.cpu6510.clk;
+            st.session.machine.keyboard.type_text(now, &text, hold, gap);
             let c64_cycles = st.session.machine.clk;
-            // Stub: no real keyboard emulation.
+            // `queued` = source character count (TS `text?.length`), counting
+            // UTF-16 code units; our ASCII command strings make chars().count()
+            // equal to the JS .length.
+            let queued = text.chars().count() as u64;
             Response::ok(id, json!({
                 "c64Cycles": c64_cycles,
-                "queued": 0
+                "queued": queued
             }))
         }
 
