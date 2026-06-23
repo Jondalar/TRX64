@@ -21,8 +21,8 @@
     "vic-render",
     "drive-via2"
   ],
-  "note": "MILESTONE: boot-basic-ready FULLY GREEN — the whole main suite is byte-exact. drive-via2 done. Next: sid [sonnet]. NOTE drive-boot-deep is a tracked KNOWN-RED (drive-watchdog-phase), not a regression — ignore it in sweeps.",
-  "updated": "2026-06-23T00:45:00Z",
+  "note": "sid [sonnet]: model SID 6581 osc/envelope so $D41B(osc3)/$D41C(env3) computed reads match. Empirically check SID trace producer (ADR-015). Audio PCM/reSID = Phase 1.5 (deferred).",
+  "updated": "2026-06-23T00:51:00Z",
   "followups": [
     "sid (audio chip)",
     "drive-gcr (disk LOAD — high value for cracking)",
@@ -31,7 +31,11 @@
     "cia-cascade",
     "drive-watchdog-phase (3rd watchdog +2)"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "sid",
+    "model": "sonnet",
+    "started": "2026-06-23T00:51:00Z"
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
