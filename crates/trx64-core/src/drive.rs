@@ -15,7 +15,14 @@
 //! ROM layout: the 16 KB dos1541 file is placed at rom[0x4000..0x8000].
 //! Reset vector $FFFC/$FFFD = rom[0x7FFC]/rom[0x7FFD] = file offset 0x3FFC/0x3FFD.
 
-use crate::{cpu::{Bus, Cpu6510}, gcr::GcrImage, rotation::Rotation, NullSink, Observer, RomError};
+use crate::{
+    drive_6510core::{
+        drive_6510core_execute, DriveCore6510, DriveCore6510Bus, IntStatus, IK_RESET,
+    },
+    gcr::GcrImage,
+    rotation::Rotation,
+    RomError,
+};
 
 /// Disk image kind — D64 (standard 1541 format) or G64 (GCR nibble dump).
 #[derive(Clone, Debug)]
@@ -67,6 +74,16 @@ const VIA_ACR_T2_COUNTPB6: u8 = 0x20;
 
 /// VICE viacore.c:216 `FULL_CYCLE_2` — the 2-cycle reload overhead of T1.
 const FULL_CYCLE_2: u64 = 2;
+
+/// VICE per-VIA-instance `write_offset` (Spec 612 PL-6; viacore.c:529 / via2d.c
+/// viacore_setup_context). A VIA STORE on the drive sees `rclk = clk_ptr - 1`:
+/// the 6510 core does the store cycle's `CLK_ADD` BEFORE the store, so the
+/// register/timer/IFR/IRQ logic must subtract that one cycle to land on the
+/// pre-increment rclk VICE writes at. READS keep `read_offset = 0`. The rotation
+/// effects (rotate_disk / set_ca2 / store_prb) instead read the FULL `clk_ptr`
+/// (rotation.c reads `clk_ptr.value` directly), so only the viacore register
+/// path gets the `-1`. Both drive VIAs use `write_offset = 1`.
+const VIA_WRITE_OFFSET: u64 = 1;
 
 /// Real 6522 VIA timer core (port of vice/src/core/viacore.c, scoped to the
 /// 1541 drive's VIA2 needs: T1 free-run/one-shot, T2 timer, IFR/IER, computed
@@ -488,9 +505,18 @@ struct DriveBus<'a> {
     /// C64-side IEC intent (= iecbus.cpu_bus), constant across this catch-up run.
     /// Used to re-fold `drv_port` after each `$1800` store (= via1d1541 store_prb).
     cpu_bus: u8,
-    /// Drive-CPU clock at the current bus access (= rclk for the VIA2 timer).
-    /// Kept in step with `cpu.clk` by the run loop before each cycle.
-    clk: u64,
+    /// Live drive-CPU clock pointer (= VICE `via_context->clk_ptr`, Spec 612). The
+    /// verbatim drive 6510 core advances `DriveCore6510.clk` between bus accesses
+    /// via CLK_ADD; the VIA `rclk` for a register read/write and a timer-alarm
+    /// catch-up must be that exact live clock at the access instant, NOT a stale
+    /// snapshot. We thread it as a raw `*const u64` to `core.clk` — disjoint from
+    /// the bus's borrowed RAM/ROM/VIA/rotation fields, read-only, single-threaded
+    /// (the core invokes the bus synchronously), so there is no aliasing hazard.
+    /// This is the literal `clk_ptr` indirection VICE keeps per VIA instance.
+    /// It is `*mut` because the `cpu_reset` hook writes `*clk_ptr = 6` (VICE
+    /// drivecpu.c:165 `drv->clk_ptr->value = 6`) — the 6-cycle reset sequence —
+    /// exactly as VICE mutates the shared drive clock from the reset dispatch.
+    clk_ptr: *mut u64,
     /// Disk-controller port inputs supplied to VIA2 PRA/PRB reads (fallback when
     /// no disk is mounted — the static "no rotating disk" defaults).
     via2_ports: Via2Ports,
@@ -509,6 +535,26 @@ struct DriveBus<'a> {
 }
 
 impl<'a> DriveBus<'a> {
+    /// Live drive clock at the current access (= `*clk_ptr`). See `clk_ptr`.
+    #[inline]
+    fn clk(&self) -> u64 {
+        // SAFETY: `clk_ptr` points at `Drive1541.core.clk`, a field disjoint from
+        // every field this bus borrows. The read is synchronous inside a bus call
+        // the core itself invoked, single-threaded, and never aliases a live `&mut`
+        // to that same u64 at the instant of the read.
+        unsafe { *self.clk_ptr }
+    }
+
+    /// Write the live drive clock (= VICE `drv->clk_ptr->value = n`). Used ONLY by
+    /// the `cpu_reset` hook to seed the 6-cycle reset sequence. See `clk_ptr`.
+    #[inline]
+    fn set_clk(&mut self, v: u64) {
+        // SAFETY: same disjoint-field reasoning as `clk`. The write happens inside
+        // `cpu_reset` (the DO_INTERRUPT IK_RESET dispatch), at which instant the
+        // core is not concurrently writing `core.clk` (it is between CLK_ADD steps).
+        unsafe { *self.clk_ptr = v };
+    }
+
     /// VIA1 PB pin input = via1d1541.c read_prb IEC `tmp`:
     ///   tmp = (drv_port ^ 0x85) | 0x1a | driveid   (unit 8 → driveid 0)
     /// Fed to the generic 6522 PRB read as `prb_pin`, which then applies
@@ -526,22 +572,6 @@ impl<'a> DriveBus<'a> {
         Via2Ports { pra_pin: 0xff, prb_pin: self.via1_iec_tmp() }
     }
 
-    /// The drive 6502's IRQ pin is the wired-OR of the VIA1 and VIA2 IRQ lines
-    /// (both 6522 IRQ outputs share the single CPU IRQ pin). VICE routes both VIA
-    /// `set_int` calls into the same `int_status`, so the CPU samples their OR.
-    /// Returns `(active, stamp)`: active iff either VIA asserts; the stamp is the
-    /// earliest active edge (the instant the combined line first rose).
-    #[inline]
-    fn combined_irq(&self) -> (bool, u64) {
-        let active = self.via1.irq_active || self.via2.irq_active;
-        if !active {
-            return (false, u64::MAX);
-        }
-        let s1 = if self.via1.irq_active { self.via1.irq_stamp } else { u64::MAX };
-        let s2 = if self.via2.irq_active { self.via2.irq_stamp } else { u64::MAX };
-        (true, s1.min(s2))
-    }
-
     /// VIA2 port inputs for a PRA/PRB read. When a disk is mounted the rotating
     /// model is advanced to `clk` first (via2d read_pra → rotation_byte_read /
     /// read_prb → rotation_rotate_disk) and supplies PRA = GCR_read, PRB =
@@ -554,15 +584,16 @@ impl<'a> DriveBus<'a> {
             // drive_writeprotect_sense, which clears attach_clk on the PRB/WPS path).
             // Only the path actually being read runs its spin-up-window clear, so
             // attach_clk advances exactly as VICE's does.
+            let clk = self.clk();
             if for_pra {
-                self.rotation.byte_read(self.clk);
+                self.rotation.byte_read(clk);
                 Via2Ports {
                     pra_pin: self.rotation.pra_pin(),
                     prb_pin: self.via2_ports.prb_pin,
                 }
             } else {
-                self.rotation.rotate_disk(self.clk);
-                let prb = self.rotation.prb_pin(self.clk);
+                self.rotation.rotate_disk(clk);
+                let prb = self.rotation.prb_pin(clk);
                 Via2Ports { pra_pin: self.rotation.pra_pin(), prb_pin: prb }
             }
         } else {
@@ -587,7 +618,8 @@ impl<'a> DriveBus<'a> {
         // leaves the head one inter-sector gap out of phase at sector-lock (the
         // ~17-20k-cycle transfer-start phase LEAD; ADR-040/041). Matches the TS
         // port's store_prb (vice1541/via2d.ts:394-395).
-        self.rotation.rotate_disk(self.clk);
+        let clk = self.clk();
+        self.rotation.rotate_disk(clk);
 
         let r = &mut self.rotation;
         // Stepper PB0-1, gated by motor PB2 (via2d.c:255-313). Computed from the
@@ -620,7 +652,7 @@ impl<'a> DriveBus<'a> {
             r.byte_ready_active =
                 (r.byte_ready_active & !crate::rotation::BRA_MOTOR_ON) | now_motor;
             if now_motor != 0 {
-                r.begins(self.clk);
+                r.begins(clk);
             } else if r.byte_ready_edge != 0 {
                 self.pending_set_overflow = true;
                 r.byte_ready_edge = 0;
@@ -657,6 +689,7 @@ impl<'a> DriveBus<'a> {
         if self.rotation.image.is_none() {
             return;
         }
+        let clk = self.clk();
         // ── set_ca2 (via2d.c:72-93), dispatched by viacore from the PCR store ──
         // VICE viacore.c:786 derives ca2_out_state from the new PCR CA2 mode:
         //   (pcr & 0x0e) == 0x0c (LOW_OUTPUT)  → 0
@@ -668,7 +701,7 @@ impl<'a> DriveBus<'a> {
         if new_ca2 != curr {
             // set_ca2: rotate, latch the new byte-ready-active bit, and on the
             // low→high re-enable flush any pending byte-ready edge into V.
-            self.rotation.rotate_disk(self.clk);
+            self.rotation.rotate_disk(clk);
             self.rotation.byte_ready_active =
                 (self.rotation.byte_ready_active & !crate::rotation::BRA_BYTE_READY)
                     | (new_ca2 << 1);
@@ -681,7 +714,7 @@ impl<'a> DriveBus<'a> {
         }
         // ── via2d_update_pcr (via2d.c:165-178), via store_pcr after set_ca2 ──
         let r = &mut self.rotation;
-        r.rotate_disk(self.clk);
+        r.rotate_disk(clk);
         r.read_write_mode = pcrval & 0x20 != 0;
         // PCR bit1 → BRA_BYTE_READY in byte_ready_active (matches the set_ca2 latch
         // above for the LOW/HIGH output modes the DOS uses).
@@ -694,26 +727,64 @@ impl<'a> DriveBus<'a> {
     }
 }
 
-impl<'a> Bus for DriveBus<'a> {
-    /// One drive master-cycle: advance the bus clock in lockstep with the CPU
-    /// (= FullBus::tick, full.rs:327) and run the VIA2 timer alarms so an IFR
-    /// underflow latches at the exact cycle it occurs. The drive CPU samples the
-    /// resulting IRQ line at its next instruction boundary.
+impl<'a> DriveCore6510Bus for DriveBus<'a> {
+    /// PROCESS_ALARMS hook (6510core.c:139-146). VICE dispatches the VIA timer
+    /// alarms up to `clk` here; the alarm callback raises the IFR and stamps the
+    /// IRQ line. We run BOTH VIA alarm sets up to `clk` so an IFR underflow latches
+    /// at the exact cycle it occurs (the per-VIA `irq_stamp` is the precise
+    /// underflow rclk). The combined line is re-sampled into the core's IntStatus
+    /// by the run loop at each instruction boundary (= where the drive 6510 core
+    /// consults it). `clk` is the live `core.clk` the core passes in.
     #[inline]
-    fn tick(&mut self) {
-        self.clk = self.clk.wrapping_add(1);
-        self.via1.run_alarms(self.clk);
-        self.via2.run_alarms(self.clk);
-        // NOTE: the rotating disk is advanced lazily — at VIA2 port accesses
-        // (read_pra/read_prb → rotation_byte_read/rotate_disk) and at the
-        // BVS/BVC/PHP/CLV opcodes (the byte-ready/SO handshake) — exactly where
-        // VICE's drive 6510 core consults it, NOT per cycle. Advancing per cycle
-        // would over-run the head between the BVC edge and the LDA $1C01 that
-        // reads the latched byte.
+    fn process_alarms(&mut self, clk: u64) {
+        self.via1.run_alarms(clk);
+        self.via2.run_alarms(clk);
+    }
+
+    /// drivecpu_rotate (drivecpu.c:423-433): advance the rotating GCR head to the
+    /// live drive clock. Called by the core at the BVC/BVS/PHP opcodes and by
+    /// LOCAL_SET_OVERFLOW(0) (CLV / ADC/SBC/ARR decimal-V-clear) — exactly where
+    /// VICE consults the byte-ready handshake, NOT per cycle.
+    #[inline]
+    fn rotate(&mut self) {
+        if self.rotation.image.is_some() {
+            let clk = self.clk();
+            self.rotation.rotate_disk(clk);
+        }
+    }
+
+    /// drivecpu_byte_ready (drivecpu.c:423-433): the GCR byte-ready rising-edge
+    /// flag the core folds into the V flag (SET_OVERFLOW) at BVC/BVS/PHP. Non-zero
+    /// `byte_ready_edge` ⇒ a fresh byte latched since the last consult.
+    #[inline]
+    fn byte_ready(&mut self) -> bool {
+        self.rotation.byte_ready_edge != 0
+    }
+
+    /// drivecpu_byte_ready_egde_clear (sic, drivecpu.c:423-433): clear the
+    /// byte-ready rising-edge flag once consumed.
+    #[inline]
+    fn byte_ready_edge_clear(&mut self) {
+        self.rotation.byte_ready_edge = 0;
+    }
+
+    /// cpu_reset (drivecpu.c:165-184): the drive 6502 hardware-reset sequence. VICE
+    /// sets `drv->clk_ptr->value = 6` (the ~6 cycles the chip burns before the
+    /// first opcode fetch) — we mutate the shared drive clock through `clk_ptr` to
+    /// the same effect. The DO_INTERRUPT IK_RESET path that called us then pulls
+    /// the reset vector ($FFFC/$FFFD) and JUMPs there, so the reset and the first
+    /// opcode (SEI) are atomic within one execute call (first sampled record
+    /// $EAA1@8, the atomic reset+SEI). The VIAs are reset by `cold_reset` (= VICE
+    /// drive_reset → viacore_reset); a disk, if any, is dropped there too, so no
+    /// rotation_reset is needed here for the boot path.
+    #[inline]
+    fn cpu_reset(&mut self) {
+        self.set_clk(DRIVE_RESET_CYCLES);
     }
 
     #[inline]
     fn read(&mut self, addr: u16) -> u8 {
+        let clk = self.clk();
         match addr {
             0x0000..=0x7FFF => {
                 // VIA1: $1800-$1BFF (mirror every $400) — real 6522. PB carries
@@ -723,15 +794,15 @@ impl<'a> Bus for DriveBus<'a> {
                 // last-written byte.
                 if (0x1800..=0x1BFF).contains(&addr) {
                     let ports = self.via1_ports();
-                    self.via1.run_alarms(self.clk);
-                    return self.via1.read(addr, self.clk, ports);
+                    self.via1.run_alarms(clk);
+                    return self.via1.read(addr, clk, ports);
                 }
                 // VIA2: $1C00-$1FFF — real 6522 timer/IFR/IER/PCR model. PRA
                 // ($1C01) / PRB ($1C00) port reads sample the rotating disk: PRA
                 // = GCR_read, PRB bit7 = SYNC. A PRA read advances the model and
                 // clears byte_ready_level (via2d read_pra/read_prb).
                 if (0x1C00..=0x1FFF).contains(&addr) {
-                    self.via2.run_alarms(self.clk);
+                    self.via2.run_alarms(clk);
                     let reg = addr & 0x0f;
                     let ports = if reg == 1 || reg == 15 {
                         let p = self.via2_ports_live(true);
@@ -744,7 +815,7 @@ impl<'a> Bus for DriveBus<'a> {
                     } else {
                         self.via2_ports
                     };
-                    return self.via2.read(addr, self.clk, ports);
+                    return self.via2.read(addr, clk, ports);
                 }
                 // RAM mirrors: $0000-$07FF and all mirrors up to $7FFF
                 self.ram[(addr & 0x07FF) as usize]
@@ -757,14 +828,21 @@ impl<'a> Bus for DriveBus<'a> {
 
     #[inline]
     fn write(&mut self, addr: u16, val: u8) {
+        let clk = self.clk();
+        // VIA register STORE rclk = clk_ptr - write_offset (= clk - 1, Spec 612):
+        // the 6510 core's store-cycle CLK_ADD ran before the store, so the viacore
+        // register/timer/IFR/IRQ logic lands one cycle earlier than the live clk.
+        // The rotation side-effects (store_prb / store_pcr) keep the FULL `clk`
+        // (rotation.c reads clk_ptr directly), so they read `self.clk()` themselves.
+        let wclk = clk.wrapping_sub(VIA_WRITE_OFFSET);
         match addr {
             0x0000..=0x7FFF => {
                 if (0x1800..=0x1BFF).contains(&addr) {
                     // Composed VIA1 PB output before the store (= VICE p_oldpb).
                     let reg = addr & 0x0f;
                     let old_pb = (self.via1.regs[0] | !self.via1.regs[2]) & 0xff;
-                    self.via1.run_alarms(self.clk);
-                    self.via1.write(addr, val, self.clk);
+                    self.via1.run_alarms(wclk);
+                    self.via1.write(addr, val, wclk);
                     // via1d1541.c store_prb: a PB/DDRB write that CHANGES the drive's
                     // composed IEC output re-folds the wired-AND bus against the fixed
                     // C64 cpu_bus, so the drive's NEXT `$1800` read sees its own
@@ -784,11 +862,11 @@ impl<'a> Bus for DriveBus<'a> {
                     return;
                 }
                 if (0x1C00..=0x1FFF).contains(&addr) {
-                    self.via2.run_alarms(self.clk);
+                    self.via2.run_alarms(wclk);
                     let reg = addr & 0x0f;
                     // Prior PB output (ORB|~DDRB) for the stepper/motor edge detect.
                     let old_pb = self.via2_pb_output();
-                    self.via2.write(addr, val, self.clk);
+                    self.via2.write(addr, val, wclk);
                     // store_prb side-effects: stepper / motor / LED / speed-zone.
                     if reg == 0 {
                         let new_pb = self.via2_pb_output();
@@ -815,7 +893,15 @@ impl<'a> Bus for DriveBus<'a> {
 /// for Phase-2 COW forks.
 #[derive(Clone)]
 pub struct Drive1541 {
-    pub cpu: Cpu6510,
+    /// The drive's DEDICATED verbatim 6502 core (drive_6510core.rs — the 1:1 port
+    /// of VICE's 6510core.c DRIVE_CPU build). Replaces the shared C64 `Cpu6510`:
+    /// the rotate / byte-ready / SET_OVERFLOW hooks are woven INTO the opcodes at
+    /// the exact cycle, so the drive CPU is cycle-identical to VICE.
+    pub core: DriveCore6510,
+    /// Interrupt status mirror the verbatim core dispatches against (irq_clk /
+    /// global_pending_int / IK_*). The combined VIA1∨VIA2 IRQ line is fed in via
+    /// `int.set_irq` at each instruction boundary.
+    pub int: IntStatus,
     ram: Box<[u8; 0x800]>,
     rom: Box<[u8; 0x8000]>,
     via1: Via6522,
@@ -884,7 +970,8 @@ const C64_RESET_DRIVE_OFFSET: u64 = 1;
 impl Drive1541 {
     pub fn new() -> Self {
         Self {
-            cpu: Cpu6510::new(),
+            core: DriveCore6510::new(),
+            int: IntStatus::new(),
             ram: Box::new([0u8; 0x800]),
             rom: Box::new([0u8; 0x8000]),
             via1: Via6522::new(),
@@ -916,25 +1003,28 @@ impl Drive1541 {
         Ok(())
     }
 
-    /// Reset the drive 6502: read reset vector from $FFFC/$FFFD (in ROM) and
-    /// set PC. Sets I flag (IRQ disabled) to match real 1541 power-on.
+    /// Cold-reset the drive 6502 (VICE drivecpu_reset, drivecpu.c:193-211). Unlike
+    /// the old shared-CPU path, the reset is NOT applied by pre-loading PC here:
+    /// the verbatim core dispatches it through its IK_RESET path on the FIRST
+    /// `drive_6510core_execute` call (the prologue sees `global_pending_int &
+    /// IK_RESET`, runs `cpu_reset` → clk=6, then `load_addr($FFFC)` + JUMP). That
+    /// reset and the first opcode (SEI) are atomic within one execute call, so the
+    /// first sampled record is $EAA1@8 (not a spurious $EAA0@6) — exactly VICE.
     pub fn cold_reset(&mut self) {
-        let lo = self.rom[0x7FFC] as u16;
-        let hi = self.rom[0x7FFD] as u16;
-        let pc = lo | (hi << 8);
-        self.cpu.reset_to(pc);
-        self.cpu.reg_p |= 0x04; // I flag
-        // The drive 6502 powers on with SP=0 (drivecpu.ts:459 — cpu_regs init
-        // `{ pc:0, ac:0, xr:0, yr:0, sp:0, flags:0 }`), and the VICE drive reset
-        // dispatch (drive_6510core.ts:2105-2113) does NOT push (unlike an IRQ), so SP
-        // stays 0 through boot until the ROM's own TXS. The shared `reset_to()` seeds
-        // SP=$FF for the C64; override it here so the drive matches VICE byte-exact.
-        self.cpu.reg_sp = 0;
-        // VICE drivecpu_reset (drivecpu.c:193-211): clk = 0, stop_clk = 0,
-        // last_clk = maincpu_clk (= 0 at cold boot). The +6 reset-sequence cost is
-        // applied lazily by `step_instruction` on the first run cycle, matching the
-        // IK_RESET dispatch order in VICE's 6510 core (drivecpu.c:165 cpu_reset).
-        self.cpu.clk = 0;
+        // Power-on register state (drivecpu cpu_regs init `{pc,ac,xr,yr,sp,flags=0}`,
+        // sp=0). The drive 6502 powers on with SP=0; the IK_RESET dispatch does NOT
+        // push (unlike an IRQ), so SP stays 0 through boot until the ROM's own TXS.
+        self.core = DriveCore6510::new();
+        // VICE drivecpu_reset: clk = 0, stop_clk = 0, last_clk = maincpu_clk (= 0 at
+        // cold boot). The +6 reset-sequence cost is applied by the IK_RESET dispatch
+        // (cpu_reset → clk=6) on the first run cycle, NOT here.
+        self.core.clk = 0;
+        // Reset the interrupt status to power-on (CLOCK_MAX sentinels, no pending)
+        // and arm IK_RESET so the core's first execute dispatches the hardware reset
+        // (= VICE interrupt_cpu_status_reset + interrupt_trigger_reset, the latter
+        // setting `global_pending_int |= IK_RESET` — vice1541-facade.ts:659).
+        self.int = IntStatus::new();
+        self.int.global_pending_int |= IK_RESET;
         self.drive_clk = 0;
         self.stop_clk = 0;
         self.sync_accum = 0;
@@ -978,122 +1068,25 @@ impl Drive1541 {
         }
     }
 
-    /// Execute one whole drive 6502 instruction over an already-borrowed bus,
-    /// folding in the pending hardware reset cost on the very first call.
+    /// Feed the combined VIA1∨VIA2 IRQ line into the verbatim core's `IntStatus`
+    /// at the precise per-source rclk, mirroring VICE's `update_myviairq_rclk →
+    /// set_int → interrupt_set_irq(int_status, int_num, level, rclk)` for each VIA.
+    /// VIA1 is int_num 0, VIA2 is int_num 1 (both wired into the single drive CPU
+    /// IRQ pin). `IntStatus::set_irq` stamps `irq_clk` only on the `nirq` 0→1 edge
+    /// (first source) and arms the IK_IRQPEND tail (`irq_pending_clk = rclk + 3`)
+    /// on the final deassert — exactly VICE.
     ///
-    /// VICE's drive 6510 core runs ONE opcode per `drive_6510core_execute` call, and
-    /// the IK_RESET dispatch (drivecpu.c:165 `cpu_reset` → clk=6, JUMP $FFFC) happens
-    /// in the SAME call body as the opcode fetch+execute (drive_6510core.ts:1672-1733).
-    /// So the reset sequence and the first instruction (SEI) are atomic: the drive
-    /// goes 0 → reset(clk=6) → SEI(clk=8, PC=$EAA1) without ever stopping at $EAA0.
-    /// Modelling them as one step is what makes the first sampled record $EAA1@8
-    /// instead of a spurious $EAA0@6.
-    ///
-    /// Free function (not `&mut self`) so the caller can keep `DriveBus` borrowed
-    /// from `self.ram/rom/via*` while we mutate `self.cpu` — the two are disjoint.
+    /// The rclk passed per source: on an ASSERT, the VIA's `irq_stamp` (the precise
+    /// underflow / CA1-edge rclk its own `update_irq` recorded); on a DEASSERT, the
+    /// live drive clock `now` (VICE clears the flag at the access rclk, which the
+    /// boundary clock equals or just trails — and `irq_stamp` is the inactive
+    /// `u64::MAX` sentinel there, which would overflow `rclk + 3`).
     #[inline]
-    fn step_instruction<O: Observer>(
-        cpu: &mut Cpu6510,
-        reset_pending: &mut bool,
-        bus: &mut DriveBus,
-        obs: &mut O,
-    ) {
-        if *reset_pending {
-            *reset_pending = false;
-            // cpu_reset: the 6502 reset sequence consumes 6 cycles before the first
-            // opcode of the same execute call runs.
-            cpu.clk = DRIVE_RESET_CYCLES;
-        }
-        // Keep the bus clock aligned with the CPU before the instruction begins
-        // (the reset fold-in above may have jumped cpu.clk). Run any VIA2 alarms
-        // already due as of this clock, then present the IRQ line to the CPU so
-        // it is sampled at the opcode-fetch boundary (= VICE PROCESS_ALARMS then
-        // interrupt_check_irq_delay at the fetch — drive_6510core.ts:1660/1682).
-        bus.clk = cpu.clk;
-        bus.via1.run_alarms(bus.clk);
-        bus.via2.run_alarms(bus.clk);
-        let (irq, stamp) = bus.combined_irq();
-        cpu.set_irq_line_at(irq, stamp);
-        // Byte-ready (SO) → drive 6502 V flag. VICE's drive 6510 core consults the
-        // GCR byte-ready edge at the BVS/BVC/PHP opcodes (drive_6510core.ts:1753 /
-        // 1839 / case 0x08): `rotate; if (byte_ready_edge) { clear edge;
-        // SET_OVERFLOW(1) }` — this is the $F556 `BVC *` read-loop handshake. We
-        // reproduce it at the opcode-fetch boundary for exactly those opcodes,
-        // keeping the shared cpu.rs opcode table untouched (C64 gates unaffected).
-        if bus.rotation.image.is_some() {
-            // Peek the opcode without side effects (PC is always in ROM/RAM during
-            // drive execution, never IO).
-            let pc = cpu.reg_pc;
-            let op = if pc >= 0x8000 {
-                bus.rom[(pc & 0x7FFF) as usize]
-            } else {
-                bus.ram[(pc & 0x07FF) as usize]
-            };
-            // The rotate samples the rotational position at the SAME absolute drive
-            // clk VICE/TS samples it (drive_6510core.ts). The Rust peek runs at the
-            // instruction-start clk `S` (= bus.clk, before the opcode/operand fetch),
-            // whereas the TS rotates from the post-fetch clk `S+2` (CLK_ADD(2)):
-            //   - BVC/BVS: TS does `CLK_ADD(-1); rotate; CLK_ADD(1)` → rotate at S+1.
-            //   - PHP/CLV: TS rotates at the case body (no -1) → S+2.
-            // We omitted that offset (rotated at S), making the byte-ready edge land
-            // ~1-2 drive cycles early — tolerated by the SO-driven standard DOS read
-            // but NOT by a tight direct-poll custom loader (the per-byte phase drifts
-            // and the decoded byte → stepper phase → head track diverges).
-            match op {
-                // BVC / BVS: V-flag read cycle = S+1.
-                0x50 | 0x70 => {
-                    bus.rotation.rotate_disk(bus.clk.wrapping_add(1));
-                    if bus.rotation.byte_ready_edge != 0 {
-                        bus.rotation.byte_ready_edge = 0;
-                        cpu.reg_p |= 0x40; // P_OVERFLOW
-                    }
-                }
-                // PHP: rotate at the case-body clk (no -1) = S+2.
-                0x08 => {
-                    bus.rotation.rotate_disk(bus.clk.wrapping_add(2));
-                    if bus.rotation.byte_ready_edge != 0 {
-                        bus.rotation.byte_ready_edge = 0;
-                        cpu.reg_p |= 0x40; // P_OVERFLOW
-                    }
-                }
-                // CLV: LOCAL_SET_OVERFLOW(0) → rotate + clear the byte-ready edge
-                // (drive_6510core.ts:486-493) at the case-body clk = S+2.
-                0xB8 => {
-                    bus.rotation.rotate_disk(bus.clk.wrapping_add(2));
-                    bus.rotation.byte_ready_edge = 0;
-                }
-                _ => {}
-            }
-        }
-        loop {
-            cpu.execute_cycle(bus, obs);
-            // drive_cpu_set_overflow flush: a VIA2 store side-effect (set_ca2 on the
-            // PCR CA2 low→high edge / store_prb motor-off) latched a byte-ready→V
-            // request this cycle. VICE pushes it straight into the drive CPU's P
-            // register from the store; fold it in here at the same cycle boundary.
-            if bus.pending_set_overflow {
-                bus.pending_set_overflow = false;
-                cpu.reg_p |= 0x40; // P_OVERFLOW
-            }
-            if cpu.is_at_boundary() {
-                // VICE folds the IRQ/NMI entry into the same execute call as the
-                // first handler opcode (drive_6510core.ts:1682 DO_INTERRUPT then
-                // fetch). So if this boundary is a freshly-dispatched interrupt,
-                // do NOT stop — refresh the line and run the first handler
-                // instruction in the same step, leaving PC past the bare vector.
-                if cpu.interrupt_just_dispatched() {
-                    let (irq, stamp) = bus.combined_irq();
-                    cpu.set_irq_line_at(irq, stamp);
-                    continue;
-                }
-                break;
-            }
-            // Mid-instruction: a VIA1/VIA2 register access or the per-cycle tick may
-            // have raised/cleared the IFR. Refresh the IRQ line so a multi-cycle
-            // opcode still has the right line state for the next boundary.
-            let (irq, stamp) = bus.combined_irq();
-            cpu.set_irq_line_at(irq, stamp);
-        }
+    fn refresh_irq_line(int: &mut IntStatus, via1: &Via6522, via2: &Via6522, now: u64) {
+        let s1 = if via1.irq_active { via1.irq_stamp } else { now };
+        let s2 = if via2.irq_active { via2.irq_stamp } else { now };
+        int.set_irq(0, via1.irq_active, s1);
+        int.set_irq(1, via2.irq_active, s2);
     }
 
     /// Composed VIA1 PB output byte driving the IEC bus (= viacore VIA_PRB store
@@ -1135,15 +1128,24 @@ impl Drive1541 {
     /// The drive 1541 runs at ~1 MHz while the C64 PAL clock is 985_248 Hz, so VICE
     /// scales main-CPU cycles into drive cycles through the fixed-point `sync_factor`
     /// accumulator (`advance_stop_clk`) rather than 1:1. The drive 6502 then executes
-    /// whole instructions while `cpu.clk < stop_clk`. The first run also consumes the
-    /// 6-cycle reset sequence (folded into `step_instruction`).
-    ///
-    /// Uses `NullSink` — the sampling approach (not per-instruction firehose) is
-    /// handled externally by `sample_pc_change`.
+    /// whole instructions while `core.clk < stop_clk` (drivecpu.c:393). The first run
+    /// also consumes the 6-cycle reset sequence — but, unlike the old shared-CPU path,
+    /// that is now dispatched by the verbatim core's IK_RESET path (cpu_reset → clk=6
+    /// + JMP $FFFC), folded into the first execute call exactly like drivecpu.c.
     pub fn run_cycles(&mut self, n: u64) {
         // Advance the drive-clock target for this slice of main-CPU time.
         self.advance_stop_clk(n);
-        let mut obs = NullSink;
+        // Disjoint split-borrow of `self`: `core`/`int`/`reset_pending` go to the
+        // verbatim execute call; the rest (RAM/ROM/VIA/rotation/IEC) to the bus.
+        let core = &mut self.core;
+        let int = &mut self.int;
+        let reset_pending = &mut self.reset_pending;
+        // The bus reads the live drive clock through `clk_ptr` (= VICE clk_ptr,
+        // Spec 612): the verbatim core advances `core.clk` via CLK_ADD between bus
+        // accesses, so the VIA rclk for a register read/write or a timer-alarm
+        // catch-up must be that exact clock at the access instant. `clk_ptr` is also
+        // written by the `cpu_reset` hook (`*clk_ptr = 6`).
+        let clk_ptr: *mut u64 = &mut core.clk;
         // Disk-controller port inputs for VIA2 PRA/PRB when NO disk is mounted —
         // the static "no rotating disk" defaults (sync=0, writeable, GCR floats
         // high) which reproduce the idle/IRQ stream. With a disk the rotating
@@ -1156,21 +1158,44 @@ impl Drive1541 {
             via2: &mut self.via2,
             drv_port: self.iec_drv_port,
             cpu_bus: self.iec_cpu_bus,
-            clk: self.cpu.clk,
+            clk_ptr,
             via2_ports,
             rotation: &mut self.rotation,
             pending_set_overflow: false,
         };
         // Run whole instructions while the drive clock is behind the stop target
-        // (VICE drivecpu.c:393 — `while (*clk_ptr < stop_clk)`). The reset sequence
-        // is folded into the first instruction (see step_drive_instruction): VICE's
-        // 6510 core dispatches IK_RESET and the first opcode in the SAME execute call,
-        // so once `reset_pending` is armed the first `step_drive_instruction` always
-        // runs even when `stop_clk` is still small — matching VICE's atomic reset+SEI.
-        while self.reset_pending || self.cpu.clk < self.stop_clk {
-            Self::step_instruction(&mut self.cpu, &mut self.reset_pending, &mut bus, &mut obs);
+        // (VICE drivecpu.c:393 — `while (*clk_ptr < stop_clk)`). Once `reset_pending`
+        // is armed the first execute always runs even when `stop_clk` is still small
+        // — VICE's 6510 core dispatches IK_RESET (and the first opcode, SEI) in the
+        // SAME execute call, so the atomic reset+SEI lands regardless of stop_clk.
+        while *reset_pending || core.clk < self.stop_clk {
+            *reset_pending = false;
+            // Sample the combined VIA1∨VIA2 IRQ line into the core's IntStatus at
+            // the instruction boundary, BEFORE the execute call's prologue dispatch
+            // (= VICE: the VIA alarm `set_int` has already stamped int_status by the
+            // time DO_INTERRUPT's interrupt_check_irq_delay reads it). The VIAs'
+            // alarms were brought up to `core.clk` by the prior step's PROCESS_ALARMS
+            // and by every bus access.
+            bus.via1.run_alarms(core.clk);
+            bus.via2.run_alarms(core.clk);
+            Self::refresh_irq_line(int, bus.via1, bus.via2, core.clk);
+
+            // One whole drive instruction (or one interrupt/reset dispatch) on the
+            // verbatim core. The rotate/byte-ready/SET_OVERFLOW hooks are woven into
+            // the opcodes (BVC/BVS/PHP/CLV), so the SO handshake is exact.
+            drive_6510core_execute(core, &mut bus, int);
+
+            // drive_cpu_set_overflow flush: a VIA2 store side-effect (set_ca2 on the
+            // PCR CA2 low→high edge / store_prb motor-off) latched a byte-ready→V
+            // request during this instruction. VICE pushes it straight into the
+            // drive CPU's P register from the store; fold it in at the instruction
+            // boundary (the store completed within this execute call).
+            if bus.pending_set_overflow {
+                bus.pending_set_overflow = false;
+                core.reg_p |= 0x40; // P_OVERFLOW
+            }
         }
-        self.drive_clk = self.cpu.clk;
+        self.drive_clk = core.clk;
     }
 
     /// Advance the drive to an ABSOLUTE C64-clock target (VICE
@@ -1234,18 +1259,18 @@ impl Drive1541 {
     ///
     /// Returns `(pc, a, x, y, sp, p, drive_clk)` on change, `None` if unchanged.
     pub fn sample_pc_change(&mut self) -> Option<(u16, u8, u8, u8, u8, u8, u64)> {
-        let pc = self.cpu.reg_pc;
+        let pc = self.core.reg_pc;
         if self.last_sample_pc == Some(pc) {
             return None;
         }
         self.last_sample_pc = Some(pc);
         Some((
             pc,
-            self.cpu.reg_a,
-            self.cpu.reg_x,
-            self.cpu.reg_y,
-            self.cpu.reg_sp,
-            self.cpu.flags(),
+            self.core.reg_a,
+            self.core.reg_x,
+            self.core.reg_y,
+            self.core.reg_sp,
+            self.core.status(), // composite P (= LOCAL_STATUS, flag_n/flag_z folded in)
             self.drive_clk,
         ))
     }
@@ -1264,6 +1289,7 @@ mod tests {
     #[test]
     fn drive_bus_ram_mirror() {
         let mut d = Drive1541::new();
+        let mut clk: u64 = 0;
         // Write via base address, read via mirror
         {
             let mut bus = DriveBus {
@@ -1273,7 +1299,7 @@ mod tests {
                 via2: &mut d.via2,
                 drv_port: 0x85,
                 cpu_bus: 0xff,
-                clk: 0,
+                clk_ptr: &mut clk,
                 via2_ports: Via2Ports::default(),
                 rotation: &mut d.rotation,
                 pending_set_overflow: false,
@@ -1288,6 +1314,7 @@ mod tests {
     fn drive_bus_via1_iec_pb() {
         let mut d = Drive1541::new();
         d.via1.reset(0); // DDRA=DDRB=0 (all inputs), ORB/ORA=0
+        let mut clk: u64 = 0;
         let mut bus = DriveBus {
             ram: &mut d.ram,
             rom: &d.rom,
@@ -1295,7 +1322,7 @@ mod tests {
             via2: &mut d.via2,
             drv_port: 0x85,
             cpu_bus: 0xff,
-            clk: 0,
+            clk_ptr: &mut clk,
             via2_ports: Via2Ports::default(),
             rotation: &mut d.rotation,
             pending_set_overflow: false,
@@ -1321,6 +1348,7 @@ mod tests {
         // boot init at $F263 LDA $1C0C expects — fixes boot-basic-ready +2).
         let mut d = Drive1541::new();
         d.via2.reset(0);
+        let mut clk: u64 = 0;
         let mut bus = DriveBus {
             ram: &mut d.ram,
             rom: &d.rom,
@@ -1328,7 +1356,7 @@ mod tests {
             via2: &mut d.via2,
             drv_port: 0x85,
             cpu_bus: 0xff,
-            clk: 0,
+            clk_ptr: &mut clk,
             via2_ports: Via2Ports::default(),
             rotation: &mut d.rotation,
             pending_set_overflow: false,
@@ -1366,6 +1394,7 @@ mod tests {
         let mut d = Drive1541::new();
         // Place a sentinel in the ROM region
         d.rom[0x4010] = 0xEA; // NOP at CPU $C010
+        let mut clk: u64 = 0;
         let mut bus = DriveBus {
             ram: &mut d.ram,
             rom: &d.rom,
@@ -1373,7 +1402,7 @@ mod tests {
             via2: &mut d.via2,
             drv_port: 0x85,
             cpu_bus: 0xff,
-            clk: 0,
+            clk_ptr: &mut clk,
             via2_ports: Via2Ports::default(),
             rotation: &mut d.rotation,
             pending_set_overflow: false,
@@ -1384,13 +1413,13 @@ mod tests {
     #[test]
     fn sample_pc_change_deduplicates() {
         let mut d = Drive1541::new();
-        d.cpu.reg_pc = 0xEA00;
+        d.core.reg_pc = 0xEA00;
         // First call always returns Some
         assert!(d.sample_pc_change().is_some());
         // Second call with same PC returns None
         assert!(d.sample_pc_change().is_none());
         // Change PC → Some again
-        d.cpu.reg_pc = 0xEA10;
+        d.core.reg_pc = 0xEA10;
         assert!(d.sample_pc_change().is_some());
     }
 }

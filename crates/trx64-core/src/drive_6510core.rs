@@ -107,9 +107,20 @@ const LXA_MAGIC: u8 = 0xee;
 // interrupt.c interrupt_ack_irq/_nmi/_reset) are methods on it.
 // =============================================================================
 
+/// "irrelevant" sentinel for an inactive irq_clk / nmi_clk / irq_pending_clk
+/// (interrupt-cpu-status.ts:32 `CLOCK_MAX = Number.MAX_SAFE_INTEGER`; here the
+/// u64 max). An interrupt is only honoured when `clk >= irq_clk + INTERRUPT_DELAY`,
+/// so a MAX sentinel can never satisfy the check while no source asserts.
+pub const CLOCK_MAX: u64 = u64::MAX;
+
+/// Number of independent IRQ sources the drive's int status multiplexes
+/// (interrupt.h pending_int[]): the 1541 wires VIA1 (int_num 0) and VIA2
+/// (int_num 1) into the single CPU IRQ pin, so `nirq` counts both.
+pub const DRIVE_NUM_INT_SOURCES: usize = 2;
+
 /// Interrupt status mirror. PORT OF: vice/src/interrupt.h:55-129
 /// (interrupt_cpu_status_s subset used by 6510core.c). ts:188-195
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct IntStatus {
     pub irq_clk: u64,
     pub nmi_clk: u64,
@@ -119,9 +130,73 @@ pub struct IntStatus {
     /// DriveCore6510.last_opcode_info by SET_LAST_OPCODE et al. (ts:530-538).
     pub last_opcode_info_ptr: u32,
     pub nnmi: u32,
+    /// interrupt.h:74-80 — per-source asserted-line bitmask (pending_int[]).
+    /// Index = int_num (0=VIA1, 1=VIA2). Tracks IK_IRQ per source so `nirq`
+    /// counts edges correctly when two sources overlap.
+    pub pending_int: [u32; DRIVE_NUM_INT_SOURCES],
+    /// interrupt.h `nirq` — how many sources currently assert IRQ. `irq_clk` is
+    /// stamped only on the 0→1 transition (interrupt-cpu-status.ts:116-127).
+    pub nirq: u32,
+}
+
+impl Default for IntStatus {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl IntStatus {
+    /// Power-on / reset state: clocks at the CLOCK_MAX "inactive" sentinel, no
+    /// pending interrupts (interrupt_cpu_status_reset, interrupt.c).
+    pub fn new() -> Self {
+        IntStatus {
+            irq_clk: CLOCK_MAX,
+            nmi_clk: CLOCK_MAX,
+            irq_pending_clk: CLOCK_MAX,
+            global_pending_int: IK_NONE,
+            last_opcode_info_ptr: 0,
+            nnmi: 0,
+            pending_int: [IK_NONE; DRIVE_NUM_INT_SOURCES],
+            nirq: 0,
+        }
+    }
+
+    /// PORT OF: vice/src/interrupt.h:141-196 (interrupt_set_irq) — the per-source
+    /// IRQ-line setter the VIA `set_int` calls (via update_myviairq_rclk) with the
+    /// precise underflow/level rclk. `int_num` selects the source (0=VIA1, 1=VIA2);
+    /// `value` is the new level; `rclk` is the stamp clock. Mirrors
+    /// interrupt-cpu-status.ts:109-140 exactly: `irq_clk` is set ONLY on the
+    /// `nirq` 0→1 edge (first source to assert), and on the final deassert
+    /// `irq_pending_clk = rclk + 3` arms the IK_IRQPEND tail. The drive has no DMA
+    /// cycle-stealing (`last_stolen_cycles_clk <= rclk` always holds), so the
+    /// `fixup_int_clk` branch never fires.
+    #[inline]
+    pub fn set_irq(&mut self, int_num: usize, value: bool, rclk: u64) {
+        if int_num >= self.pending_int.len() {
+            return;
+        }
+        if value {
+            if self.pending_int[int_num] & IK_IRQ == 0 {
+                self.pending_int[int_num] |= IK_IRQ;
+                if self.nirq == 0 {
+                    self.global_pending_int |= IK_IRQ | IK_IRQPEND;
+                    self.irq_pending_clk = CLOCK_MAX;
+                    self.irq_clk = rclk;
+                }
+                self.nirq += 1;
+            }
+        } else if self.pending_int[int_num] & IK_IRQ != 0 {
+            if self.nirq > 0 {
+                self.pending_int[int_num] &= !IK_IRQ;
+                self.nirq -= 1;
+                if self.nirq == 0 {
+                    self.global_pending_int &= !IK_IRQ;
+                    self.irq_pending_clk = rclk + 3;
+                }
+            }
+        }
+    }
+
     /// PORT OF: vice/src/interrupt.c interrupt_ack_irq. ts:228
     #[inline]
     pub fn interrupt_ack_irq(&mut self) {
@@ -149,18 +224,58 @@ impl IntStatus {
 // IntStatus by ref + the clk. PORT OF: vice/src/drive/drivecpu.c:303-355.
 // =============================================================================
 
-/// PORT OF: vice/src/drive/drivecpu.c:329-355 (interrupt_check_irq_delay).
-/// In VICE this honours the INTERRUPT_DELAY window vs irq_clk. ts:246-249
+/// PORT OF: vice/src/drive/drivecpu.h:34-38 — OPINFO_NUMBER(opinfo) = low byte
+/// (the opcode of the last-executed instruction). drivetypes.ts:328-334.
+const OPINFO_NUMBER_MSK: u32 = 0xff;
 #[inline]
-fn interrupt_check_irq_delay(int_status: &IntStatus, clk: u64) -> bool {
-    clk >= int_status.irq_clk + INTERRUPT_DELAY
+fn opinfo_number(opinfo: u32) -> u32 {
+    opinfo & OPINFO_NUMBER_MSK
 }
 
-/// PORT OF: vice/src/drive/drivecpu.c:303-328 (interrupt_check_nmi_delay).
-/// ts:246-249
+/// PORT OF: vice/src/drive/drivecpu.c:327-351 (interrupt_check_irq_delay, inline
+/// static — drivecpu.ts:1224-1243). NOT the simplified window check: the full
+/// VICE logic honours the per-opcode interrupt-latency modifiers that make the
+/// drive watchdog IRQ enter cycle-for-cycle with VICE.
+///   1. `irq_clk = f.irq_clk + INTERRUPT_DELAY`.
+///   2. A taken-no-page-cross branch (OPINFO_DELAYS_INTERRUPT, set by BRANCH at
+///      6510core.c:991) delays the IRQ by ONE extra cycle → `irq_clk++`.
+///   3. If `cpu_clk >= irq_clk`: take the IRQ UNLESS the last opcode ENABLES_IRQ
+///      (an I-clearing CLI/PLP/RTI — OPINFO_ENABLES_IRQ), in which case the IRQ is
+///      deferred a FULL instruction by latching `IK_IRQPEND` (the CPU runs one more
+///      opcode before honouring the IRQ). This mutates `int_status`.
+/// Returns true iff the IRQ should be dispatched on THIS instruction.
+#[inline]
+fn interrupt_check_irq_delay(int_status: &mut IntStatus, clk: u64) -> bool {
+    let mut irq_clk = int_status.irq_clk + INTERRUPT_DELAY;
+    if opinfo_delays_interrupt(int_status.last_opcode_info_ptr) != 0 {
+        irq_clk += 1;
+    }
+    if clk >= irq_clk {
+        if opinfo_enables_irq(int_status.last_opcode_info_ptr) == 0 {
+            return true;
+        } else {
+            int_status.global_pending_int |= IK_IRQPEND;
+        }
+    }
+    false
+}
+
+/// PORT OF: vice/src/drive/drivecpu.c:303-325 (interrupt_check_nmi_delay, inline
+/// static — drivecpu.ts:1197-1219). The full VICE logic:
+///   1. `nmi_clk = f.nmi_clk + INTERRUPT_DELAY`.
+///   2. BRK (opcode 0x00) defers the NMI by one opcode → return 0.
+///   3. A taken-no-page-cross branch (OPINFO_DELAYS_INTERRUPT) delays it one cycle.
+///   4. Take the NMI iff `cpu_clk >= nmi_clk`.
 #[inline]
 fn interrupt_check_nmi_delay(int_status: &IntStatus, clk: u64) -> bool {
-    clk >= int_status.nmi_clk + INTERRUPT_DELAY
+    let mut nmi_clk = int_status.nmi_clk + INTERRUPT_DELAY;
+    if opinfo_number(int_status.last_opcode_info_ptr) == 0x00 {
+        return false;
+    }
+    if opinfo_delays_interrupt(int_status.last_opcode_info_ptr) != 0 {
+        nmi_clk += 1;
+    }
+    clk >= nmi_clk
 }
 
 // =============================================================================
@@ -1817,12 +1932,15 @@ impl<'a, B: DriveCore6510Bus> Exec<'a, B> {
         let mut handler_vector: u16 = 0xfffe; // ts:2059
 
         if ik & (IK_IRQ | IK_IRQPEND | IK_NMI) != 0 {
-            let nmi_now = (ik & IK_NMI) != 0
-                && interrupt_check_nmi_delay(self.int, self.core.clk);
-            let irq_now = (ik & (IK_IRQ | IK_IRQPEND)) != 0
+            let clk = self.core.clk;
+            let nmi_now = (ik & IK_NMI) != 0 && interrupt_check_nmi_delay(self.int, clk);
+            // Evaluate the I-flag / DISABLES_IRQ gate BEFORE the delay check so the
+            // `&mut self.int` borrow inside interrupt_check_irq_delay does not clash
+            // with the immutable `self.core` reads (disjoint fields, sequenced here).
+            let irq_gate = (ik & (IK_IRQ | IK_IRQPEND)) != 0
                 && (!self.local_interrupt()
-                    || opinfo_disables_irq(self.core.last_opcode_info) != 0)
-                && interrupt_check_irq_delay(self.int, self.core.clk);
+                    || opinfo_disables_irq(self.core.last_opcode_info) != 0);
+            let irq_now = irq_gate && interrupt_check_irq_delay(self.int, clk);
             if nmi_now || irq_now {
                 if NMI_CYCLES == 7 {
                     self.fetch_param_dummy(self.core.reg_pc);
