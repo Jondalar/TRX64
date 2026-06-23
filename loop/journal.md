@@ -561,3 +561,14 @@ c64re drive-PC diff) found the ROOT CAUSE: the drive $0402 loop polls VIA2 PRB b
 reference advances to the bit-bang send ($07Ax), TRX64 stalls -> CLK never releases -> C64 deadlock. The bug
 is the VIA2 byte-ready/SYNC/T1 rotation coupling under direct-poll (standard DOS uses byte-ready->SO which
 works). ADR-050. 8 attempts on the wrong layers; finally exact. Next: dd00-via2-byteready.
+
+## 2026-06-23 — DRIVER: VIA2 workflow — complicated-engine falsified; head lands on EMPTY track (ADR-051)
+
+2nd ultracode workflow (6 agents). No fix (synthesis falsified, zero regression, clean tree). FALSIFIED the
+complicated-rotation-engine theory (write-only path, never activates; rotation_1541_simple is byte-identical
+to TS). ROOT CAUSE (live reference): TRX64's drive head ends on EMPTY half-track 3 (vs reference ht4 real
+data) — an accumulated rotate_disk per-poll PHASE drift under the direct-poll $0402 loop makes TRX64 decode a
+wrong byte -> wrong stepper phase -> head steps to empty track -> never finds SYNC -> never releases CLK. The
+drift is the per-poll CALL phase (rotation_last_clk whole-cycle anchoring), NOT the engine. ADR-051. Reference
+trace saved /tmp/scramble_ref_head.duckdb. Next: dd00-headphase-diff (first divergent poll). ESCALATED (10
+attempts; user GCR/loader domain).

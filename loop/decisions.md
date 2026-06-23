@@ -757,3 +757,32 @@ VIA2/rotation byte-ready/SYNC/T1 coupling divergence TRX64's drive doesn't advan
 presentation at the $0402 loop — why the reference advances to $07Ax send + TRX64 stalls.
 **Why:** 6 phase-skew attempts + 2 IEC-fold attempts all chased the wrong layer; the live-reference drive-PC
 diff finally pinned it to the DRIVE's VIA2/GCR-read coupling under direct-poll — the deepest case, now exact.
+
+## ADR-051 — VIA2 workflow: complicated-engine FALSIFIED; root cause = drive HEAD lands on EMPTY half-track
+**Context:** dd00-via2-byteready via a 6-agent ultracode workflow (reference-advance trace + VICE-C diff of
+via2d.c/rotation.c/drive.c byte-ready-SO + synthesize + fix). No fix applied (synthesis falsified by live
+reference; zero regression; clean tree).
+**FALSIFIED:** "port the complicated rotation engine (rotation_1541_gcr / so_delay / BUS_READ_DELAY)" — that
+path only activates on a DISK WRITE; ZERO write-mode transitions in the scenario. BOTH reference and TRX64
+use rotation_1541_simple EXCLUSIVELY, and TRX64's rotation_1541_simple is BYTE-FOR-BYTE identical to the TS
+port (SYNC mask, last_read_data, byte_ready_edge all verified). The PRB/SYNC fold + T1 readout + byte-ready->SO
+are byte-exact (why std DOS read is byte-exact — it is SO/edge-driven + phase-tolerant).
+**ACTUAL ROOT CAUSE (newly confirmed via live c64re reference):** the drive HEAD TRAJECTORY diverges. TRX64's
+head ends on HALF-TRACK 3 (track 1.5 = zero-filled empty inter-track, SYNC IMPOSSIBLE); the reference head ends
+on HALF-TRACK 4 (track 2, real GCR data). Proof: reference VIA2 PB ORB $1C00=$AA (PB0-1=10 = stepper phase 2 =
+ht4); TRX64 wrote $F5 (PB0-1=01 = phase 1 = stepped 4->3). The loader's stepper-output byte is COMPUTED from
+DECODED GCR data; both run identical stepper code, so the divergence is UPSTREAM in the decoded byte stream.
+Mechanism: an accumulated rotate_disk per-poll PHASE drift in the direct-poll $0402 loop (LDA $1CF0/BMI advances
+the head once per poll via rotate_disk with rotation_last_clk WHOLE-CYCLE anchoring + no cycle-exact bus/SO
+delay). Over thousands of direct polls the per-poll SYNC/byte window drifts vs the reference, TRX64 decodes a
+DIFFERENT byte, the loader branches into ROM ($EC1x) instead of the RAM decode/send ($06xx hot path), writes the
+WRONG stepper phase -> head lands on empty ht3 -> never finds SYNC -> never releases CLK -> bar never fills.
+TRX64 is NOT permanently stuck at $0402 (escapes $0408->$040A 271x, reaches send $07Ax + ROM $EC1x) — it just
+reads the wrong data and steps to the wrong track.
+**NEXT (diagnostic, cheap):** diff TRX64's per-poll head-offset/decoded-byte vs the reference at the FIRST
+divergent $1CF0 poll. Reference trace SAVED: /tmp/scramble_ref_head.duckdb (drive-PC hot at $0402-$0408 find-sync
++ $06BD-$06EF decode/send; TRX64 hot at $07Ax+$EC1x ROM). That pins the exact poll where the rotate_disk phase
+first drifts -> THEN fix the per-poll phase (bit-cell-exact) WITHIN rotation_1541_simple's call, NOT a new engine.
+**Why:** 10 attempts; the bug is finally a CONCRETE, near-physical symptom (head on an empty track from an
+accumulated per-poll decode-phase drift), with an exact empirical validation path. This is the user's deepest
+domain (custom $DD00 loader + GCR timing).

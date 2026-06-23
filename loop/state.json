@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "dd00-via2-byteready",
+  "current_item": "dd00-headphase-diff",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -31,17 +31,12 @@
     "drive-watchdog-phase",
     "scramble-gold"
   ],
-  "note": "dd00-via2-byteready WORKFLOW (ultracode): the drive $0402 loop polls VIA2 T1C-H ($1F05) + PRB bit7 SYNC ($1CF0) directly; reference advances to $0260->$07Ax send, TRX64 stalls. Parallel: reference-advance trace (c64re) + VICE-vs-TRX64 diff of via2d.c/viacore.c (VIA2 T1) + rotation.c (GCR byte-ready/SYNC/SO) + drive.c (byte-ready->SO AND PRB-readable coupling) -> synthesize -> fix (fast probe $05FD climb + regression).",
-  "updated": "2026-06-23T15:51:00Z",
+  "note": "dd00-via2-byteready workflow: complicated-engine FALSIFIED (no-op). ROOT CAUSE (ADR-051): the drive HEAD lands on EMPTY half-track 3 (vs reference ht4 real data) — an accumulated rotate_disk per-poll PHASE drift under direct-poll makes TRX64 decode a wrong byte -> wrong stepper phase -> head to empty track -> no SYNC -> no CLK release. rotation_1541_simple is byte-identical to TS; the drift is the per-poll CALL phase. Next: dd00-headphase-diff — diff TRX64 vs the saved reference trace (/tmp/scramble_ref_head.duckdb) at the FIRST divergent $1CF0 poll. ESCALATED to user (10 attempts, his GCR/loader domain).",
+  "updated": "2026-06-23T16:38:00Z",
   "followups": [
     "sid-audio"
   ],
-  "in_flight": {
-    "item": "dd00-via2-byteready",
-    "model": "workflow",
-    "started": "2026-06-23T15:51:00Z",
-    "workflow": "pending"
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
