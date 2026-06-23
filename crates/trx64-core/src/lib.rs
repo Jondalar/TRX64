@@ -12,6 +12,7 @@ use std::path::Path;
 pub mod cia;
 pub mod cpu;
 pub mod drive;
+pub mod drive_6510core;
 pub mod full;
 pub mod gcr;
 pub mod iec;
