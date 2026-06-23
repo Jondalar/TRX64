@@ -299,3 +299,16 @@ GREEN except pre-existing driveCycles +2. ADR-029. Merged. done: 11 items.
 Sprites + multicolor/bitmap/ECM/fine-scroll gating → vic-sprites-modes follow-up.
 Advancing to drive-via2 [opus] — the high-leverage corner (driveCycles +2 + disk-load +
 DRIVECPU vsf, all one subsystem).
+
+## 2026-06-23 — DRIVER: drive-via2 done — boot-basic-ready FULLY GREEN (main suite byte-exact)
+
+Opus builder modelled drive VIA2 as a real 6522 (T1/T2/IFR/IER/PCR + IRQ delivery via
+additive cpu.rs set_irq_line_at). Confirmation gate INDEPENDENT: boot-basic-ready FULLY
+GREEN (driveCycles 2029939, +2 gone) AND no C64 regression (boot-trace-short + iso cpu/vic/
+cia + drive-boot-idle all GREEN — cpu.rs change is additive, C64 path untouched). ADR-030.
+Merged. done: 12 items. THE LAST PERSISTENT RED OF THE MAIN SUITE IS GONE.
+
+The builder added a deeper drive-boot-deep gate that finds the NEXT corner: 3rd T1 watchdog
+IRQ +2 (trace[212703] cyc 1048810 vs 1048808) — needs a VICE drive-cpu cycle cross-check →
+tracked drive-watchdog-phase (drive-boot-deep is a KNOWN-RED, not a regression). GCR disk-
+load → tracked drive-gcr. Advancing to sid [sonnet].

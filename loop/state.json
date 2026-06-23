@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "drive-via2",
+  "current_item": "sid",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -18,25 +18,25 @@
     "protocol-surface",
     "snapshot-vsf",
     "media",
-    "vic-render"
+    "vic-render",
+    "drive-via2"
   ],
-  "note": "drive-via2 [opus]: model 1541 disk-controller VIA2 (viacore computed reads PCR/timer/IFR/handshake) + GCR. Fixes driveCycles +2 (boot-basic-ready full GREEN), unblocks disk program-load + DRIVECPU vsf.",
-  "updated": "2026-06-23T00:34:00Z",
+  "note": "MILESTONE: boot-basic-ready FULLY GREEN — the whole main suite is byte-exact. drive-via2 done. Next: sid [sonnet]. NOTE drive-boot-deep is a tracked KNOWN-RED (drive-watchdog-phase), not a regression — ignore it in sweeps.",
+  "updated": "2026-06-23T00:45:00Z",
   "followups": [
-    "drive-via2 (KEYSTONE corner: fixes +2 driveCycles + disk-load + DRIVECPU vsf)",
+    "sid (audio chip)",
+    "drive-gcr (disk LOAD — high value for cracking)",
     "daemon-trace-query",
-    "vic-sprites-modes (sprites + gate multicolor/bitmap/ECM/fine-scroll)",
+    "vic-sprites-modes",
     "cia-cascade",
-    "sid"
+    "drive-watchdog-phase (3rd watchdog +2)"
   ],
-  "in_flight": {
-    "item": "drive-via2",
-    "model": "opus",
-    "started": "2026-06-23T00:34:00Z",
-    "note": "opus alive 30min, very active (drive.rs edited 10s ago), no green commit yet — subtle VIA2 6522 work. Defer."
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
+  ],
+  "known_red": [
+    "drive-boot-deep (tracked → drive-watchdog-phase, NOT a regression)"
   ]
 }

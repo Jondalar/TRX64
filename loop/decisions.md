@@ -324,3 +324,18 @@ encode + base64 in trx64-daemon (ADR-002). session/screenshot + runtime/render_s
 bitmap implemented-but-not-gated, sprites unrendered → `vic-sprites-modes` follow-up.
 **Why:** Pixel parity needs decoded-RGBA comparison, not container bytes — a legitimate
 gate extension. The user-requested screenshot now works, pixel-exact.
+
+## ADR-030 — drive VIA2 modelled; boot-basic-ready FULLY GREEN (main suite byte-exact)
+**Context:** the keystone corner — VIA2 0xFF stub caused driveCycles +2.
+**Decision (accepted, GREEN + no regression):** VIA2 ($1C00) modelled as a real MOS 6522
+(T1/T2 timers + latch/reload anchors, IFR/IER + IRQ-line, ACR/PCR, computed port reads)
+in drive.rs, ported from viacore.ts; VIA1 also routed through the real 6522. cpu.rs gained
+`set_irq_line_at(asserted, stamp_clk)` + `interrupt_just_dispatched()` — ADDITIVE (the drive
+VIA fires IRQ from a sub-instruction clk; the C64 path keeps using set_irq_line, so NO C64
+regression — boot-trace-short + all iso gates stay byte-exact). RESULT: boot-basic-ready
+FULLY GREEN (driveCycles 2029939, +2 gone) — the main suite is now entirely byte-exact.
+Two new tracked follow-ups: `drive-watchdog-phase` (drive-boot-deep RED trace[212703] cyc
+1048810 vs 1048808 — 3rd T1 watchdog IRQ +2, needs a VICE drive-cpu cycle cross-check) and
+`drive-gcr` (GCR read path for real disk LOAD; not started, no-disk defaults sufficed here).
+**Why:** Mandated gate met (boot-basic-ready GREEN, no regression); the deeper corner is a
+distinct, well-characterized timing artifact for a dedicated item.
