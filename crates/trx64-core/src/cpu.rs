@@ -195,6 +195,15 @@ impl Cpu6510 {
     pub fn is_at_boundary(&self) -> bool {
         self.at_boundary
     }
+    /// True if the cycle just executed was a hardware-interrupt dispatch (the
+    /// 7-cycle IRQ/NMI entry). VICE's drive 6510 core runs the interrupt entry
+    /// AND the first handler opcode in the SAME `drivecpu_execute` iteration, so
+    /// the drive never settles on the bare vector PC. The drive step loop uses
+    /// this to fold the entry into the following instruction (matching the
+    /// existing reset+SEI fold-in) so the sampled-PC stream omits the vector.
+    pub fn interrupt_just_dispatched(&self) -> bool {
+        self.interrupt_dispatched_this_cycle
+    }
     pub fn is_jammed(&self) -> bool {
         self.jammed
     }
@@ -337,6 +346,35 @@ impl Cpu6510 {
                 self.irq_level = true;
                 self.irq_clk = self.clk;
                 self.irq_delay_cycles = 0;
+            }
+        } else if self.irq_level {
+            self.irq_level = false;
+            self.irq_clk = CLOCK_MAX;
+        }
+    }
+
+    /// Assert/deassert the level IRQ line, stamping `irq_clk` at an EXPLICIT
+    /// clock rather than the live `self.clk`. Mirrors VICE `interrupt_set_irq(
+    /// int_status, int_num, value, rclk)` (interrupt-cpu-status.ts:122
+    /// `this.irqClk = cpuClk`) where the VIA timer-zero alarm passes the precise
+    /// underflow rclk (= `t1zero + 1`). The drive VIA2 fires its T1 IRQ from a
+    /// sub-instruction clock instant; the boundary-stamping `set_irq_line` would
+    /// pin `irq_clk` to the wrong (later) cycle. The per-cycle `tick()` delay
+    /// counter then accrues `clk - irq_clk` exactly, so the boundary check
+    /// `irq_delay_cycles >= INTERRUPT_DELAY` resolves to VICE's
+    /// `cpu_clk >= irq_clk + INTERRUPT_DELAY`. Seeds the delay counter with the
+    /// cycles already elapsed since `stamp_clk` so a stamp in the past is honoured.
+    #[inline]
+    pub fn set_irq_line_at(&mut self, asserted: bool, stamp_clk: u64) {
+        self.irq_wired = true;
+        if asserted {
+            if !self.irq_level {
+                self.irq_level = true;
+                self.irq_clk = stamp_clk;
+                // Account for cycles already elapsed since the stamp instant so
+                // the boundary check matches VICE's direct clock comparison even
+                // when the alarm is processed a cycle or two after `stamp_clk`.
+                self.irq_delay_cycles = self.clk.saturating_sub(stamp_clk) as u32;
             }
         } else if self.irq_level {
             self.irq_level = false;
