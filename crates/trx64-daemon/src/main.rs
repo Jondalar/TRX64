@@ -1619,16 +1619,23 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 event_count: 0,
                 domains: domains.clone(),
             });
+            // Echo the mounted media's SHA in the run descriptor (TS oracle parity:
+            // a trace started with a disk attached carries `run.media.sha256`).
+            let mut run = json!({
+                "runId": run_id,
+                "definitionId": "live-capture",
+                "definitionVersion": 1,
+                "cycleStart": cycle_start,
+                "marks": [],
+                "eventCount": 0,
+                "bytesWritten": 0
+            });
+            if let Some(disk) = st.session.machine.drive8.get_attached_disk() {
+                let sha = sha256_hex(&disk.bytes);
+                run["media"] = json!({ "sha256": sha });
+            }
             Response::ok(id, json!({
-                "run": {
-                    "runId": run_id,
-                    "definitionId": "live-capture",
-                    "definitionVersion": 1,
-                    "cycleStart": cycle_start,
-                    "marks": [],
-                    "eventCount": 0,
-                    "bytesWritten": 0
-                },
+                "run": run,
                 "outputPath": output.to_string_lossy(),
                 "domains": domains
             }))
