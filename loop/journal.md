@@ -517,3 +517,16 @@ granularity. ADR-046.
 drive_clk+head-offset at the identical track-1 sync, which the user's c64re runtime exposes (the golden TS
 daemon doesn't). Parked the phase-lead BLOCKED; routing the loop to daemon-trace-query → sid-audio.
 Asked: (a) drive c64re to get the measurement + arm attempt 5, (b) user looks, (c) leave it.
+
+## 2026-06-23 — DRIVER: ARMED measurement — rotation FALSIFIED, lead is UPSTREAM (ADR-047)
+
+The armed 5th attempt (live c64re reference) delivered the decisive measurement: TRX64 locks the first
+track-1 SYNC at the IDENTICAL disk byte (~4199, zone 3) as the reference, and rotation_1541_simple is
+bit-for-bit identical to TS. The rotation-phase hypothesis (4th/5th theory) is FALSIFIED by direct
+measurement. The ~12-20k C64-cycle lead is UPSTREAM of the track-1 read — boot/seek/directory/IEC-filename
+phase. end4 RED is a sample-boundary effect. 5 theories now falsified. Probes-only commit, no regression
+(39/40). Ref trace saved (tmp/scramble-track1-measure.duckdb, 7.5M events). ADR-047.
+
+Parked the phase-lead BLOCKED, now precisely localized (upstream of track-1). Routing the loop to
+daemon-trace-query → sid-audio. Escalated: user decides on a 6th armed pass (measure drive-track-1-read-job
+START anchored to LOAD keypress, in both runtimes) vs accept as a bounded known-RED.

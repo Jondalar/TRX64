@@ -662,3 +662,28 @@ to get the track-1-lock drive_clk+offset measurement, then arm a 5th attempt wit
 narrowed diagnosis; (c) leave it.
 **Why:** The problem is precisely localized; the next step is a specific measurement the user's own deep-RE
 tooling provides — higher leverage than another blind opus pass.
+
+## ADR-047 — ARMED measurement: rotation-phase FALSIFIED; lead is UPSTREAM of track-1
+**Context:** drive-seek-phase v5, armed with the live c64re reference runtime (user chose a).
+**The decisive measurement (probes committed, no production change, 39/40 regression — only target RED):**
+Drove the c64re reference (boot → LOAD"*",8,1), located the 1541 DOS find-sync ($F562 BIT $1C00 / BMI →
+$F567 LDA $1C01), pinned the first track-1 SYNC lock. RESULT: TRX64 locks the first track-1 SYNC at the
+SAME disk byte (~4199, zone 3) as the reference. `rotation_1541_simple` is BIT-FOR-BIT identical to TS
+(1000-cyc chunking, accum % rpmscale carry, rpmscale=1_000_000, ROT_SPEED_BPS, DRIVE_SYNC_FACTOR_PAL=66517,
+per-instr catch-up). **The rotation accum-carry is NOT the divergence — the 4th/5th rotation-phase theory
+is FALSIFIED by direct measurement.**
+**Where it actually is:** the ~12-20k C64-cycle lead accumulates UPSTREAM of the track-1 read — the
+boot/seek/directory/IEC-filename-transfer phase. TRX64 deposits the first data byte at C64 clk 7988284
+(~12k cyc BEFORE the 8M end4 sample); golden after 8M. The track-1 sync lock lands on the identical byte,
+so it is NOT the rotation/read. The end4 RED is a SAMPLE-BOUNDARY effect (the lead tips first-byte arrival
+to the wrong side of the exact-8M checkpoint).
+**Theories now falsified (5):** rate-skew, attach_clk, store_prb-rotate, head-stepping, rotation-accum-carry.
+**Next measurement (untested):** the C64-cycle at which the drive BEGINS the track-1 read job, anchored to
+the LOAD keypress, in BOTH runtimes — the ~12-20k delta is in the directory-read / IEC-filename-transfer /
+seek-START phase. The reference trace is saved at tmp/scramble-track1-measure.duckdb (7.5M events, queryable).
+**Decision:** ESCALATE again with the decisive new localization. Each armed measurement narrows precisely +
+leaves the model more accurate (no regression), but converges slowly (5 theories). Park the phase-lead
+BLOCKED (now very precisely characterized: upstream of track-1, directory/IEC/seek phase). Loop routes to
+clean followups. User decides: 6th armed attempt on the upstream lead (querying the saved ref trace), vs
+accept as a precisely-bounded known-RED, vs user-led.
+**Why:** The armed approach works but is slow; the user (deep $DD00/IEC domain) should weigh the 6th pass.

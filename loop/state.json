@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "drive-seek-phase",
+  "current_item": "daemon-trace-query",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -30,17 +30,12 @@
     "cia-cascade",
     "drive-watchdog-phase"
   ],
-  "note": "ARMED 5th attempt (user chose a). c64re runtime UP on ws://127.0.0.1:4312 (session integrated-1, scramble mounted, drive8-cpu/iec trace streaming). TRX64 locks track-1 first SYNC at drive_clk=7901947, gcr_head_offset=33595, zone 3. Builder drives the live c64re for the TS-side track-1-lock measurement (drive_clk+offset) + fixes the rotation_1541_simple accum-carry / rotate_disk clk-granularity. Gate scramble-load-progress RED->GREEN.",
-  "updated": "2026-06-23T12:34:00Z",
+  "note": "ARMED measurement DECISIVE (ADR-047): rotation-phase falsified — TRX64 locks track-1 SYNC at the IDENTICAL disk byte as c64re ref; rotation engine bit-identical to TS. The ~12-20k lead is UPSTREAM (directory/IEC-filename/seek-start). 5 theories down. Ref trace saved + queryable. Phase-lead parked BLOCKED, precisely localized. Loop routes to daemon-trace-query -> sid-audio. User to decide on a 6th armed pass.",
+  "updated": "2026-06-23T12:40:00Z",
   "followups": [
     "sid-audio"
   ],
-  "in_flight": {
-    "item": "drive-seek-phase",
-    "model": "opus",
-    "started": "2026-06-23T12:34:00Z",
-    "note": "opus alive 30min: ARMED measurement underway — 85MB c64re trace captured (scramble boot+load on the reference runtime), correlating in TRX64 (iec_load_probe edited ~2min ago). No production commit yet — measure+correlate phase, then the rotation fix. Defer."
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
@@ -50,6 +45,6 @@
   ],
   "custom_loader_test_disk": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/scramble_infinity.d64",
   "blocked": [
-    "drive-seek-phase (custom-loader phase-lead): ~17-20k rotational-phase lead at track-1 sector-lock; 4 theories falsified; narrowed to rotation_1541_simple accum-carry / rotate_disk clk-granularity; NEEDS the TS drive_clk+head-offset at track-1 first sync (c64re runtime can provide); ESCALATED (ADR-046)"
+    "drive-seek-phase (custom-loader phase-lead): ~12-20k C64-cycle lead UPSTREAM of track-1 read (boot/seek/directory/IEC-filename phase) — rotation FALSIFIED by c64re measurement (track-1 lock at identical byte). 5 theories down. Ref trace saved tmp/scramble-track1-measure.duckdb. ESCALATED (ADR-047)"
   ]
 }
