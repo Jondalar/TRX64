@@ -27,15 +27,19 @@
     "disk-load-e2e (keyboard matrix)",
     "iec-crossdomain-sync (STANDARD LOAD complete)"
   ],
-  "note": "STANDARD LOAD complete + byte-exact (improvement merged: spec-faithful drive_writeprotect_sense, ADR-035 hack removed). Custom-loader phase-lead ESCALATED to user (3 theories falsified, his $DD00 domain) — parked BLOCKED. Loop routes to clean followups: vic-sprites-modes [opus] next (default; user may redirect to the phase-lead).",
-  "updated": "2026-06-23T08:25:00Z",
+  "note": "vic-sprites-modes [opus]: render hardware sprites (pos/color/multicolor/priority/X-Y-expand) + gate the non-text VIC modes (multicolor-text/ECM/standard+multicolor bitmap, XSCROLL/YSCROLL fine-scroll) that vic-render implemented-but-didnt-gate. Pixel-parity via the render harness (capture.mjs/png.mjs). NOTE: phase-lead still ESCALATED to user (a/b/c).",
+  "updated": "2026-06-23T08:35:00Z",
   "followups": [
     "daemon-trace-query",
     "cia-cascade",
     "drive-watchdog-phase",
     "sid-audio"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "vic-sprites-modes",
+    "model": "opus",
+    "started": "2026-06-23T08:35:00Z"
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
