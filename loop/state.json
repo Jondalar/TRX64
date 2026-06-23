@@ -20,8 +20,8 @@
     "media",
     "vic-render"
   ],
-  "note": "vic-render done — pixel-exact BASIC-ready screenshot (session/screenshot works). Next: drive-via2 [opus] — the high-leverage corner (unblocks driveCycles +2 AND disk program-load AND DRIVECPU vsf at once).",
-  "updated": "2026-06-23T01:55:00Z",
+  "note": "drive-via2 [opus]: model 1541 disk-controller VIA2 (viacore computed reads PCR/timer/IFR/handshake) + GCR. Fixes driveCycles +2 (boot-basic-ready full GREEN), unblocks disk program-load + DRIVECPU vsf.",
+  "updated": "2026-06-23T00:05:00Z",
   "followups": [
     "drive-via2 (KEYSTONE corner: fixes +2 driveCycles + disk-load + DRIVECPU vsf)",
     "daemon-trace-query",
@@ -29,7 +29,11 @@
     "cia-cascade",
     "sid"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "drive-via2",
+    "model": "opus",
+    "started": "2026-06-23T00:05:00Z"
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
