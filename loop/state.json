@@ -30,7 +30,7 @@
     "cia-cascade"
   ],
   "note": "drive-watchdog-phase [opus]: close drive-boot-deep known-RED. 3rd VIA2 T1 watchdog IRQ fires 2 drive-cycles early (trace[212703] @cyc 1048810 vs got 1048808). Diagnosed: inter-re-arm t1zero spacing 15000 vs instruction period 14998 = +2 (FULL_CYCLE_2) phase error in the VIA2 T1 free-run reschedule. Trace-diff VIA2 T1 reschedule vs TS at the 3rd $F99F STA $1C05 re-arm.",
-  "updated": "2026-06-23T10:20:00Z",
+  "updated": "2026-06-23T10:49:00Z",
   "followups": [
     "daemon-trace-query",
     "sid-audio"
@@ -38,7 +38,8 @@
   "in_flight": {
     "item": "drive-watchdog-phase",
     "model": "opus",
-    "started": "2026-06-23T10:20:00Z"
+    "started": "2026-06-23T10:49:00Z",
+    "note": "opus alive 30min: T1 phase debug (drive.rs+cpu.rs+wdbg test+.bak backup, edited <1min). No commit yet. Watch cpu.rs regression at gate. Defer. If returns unsolved, re-dispatch with write_offset insight (viacore:529)."
   },
   "stage2_items": [],
   "resolved": [
