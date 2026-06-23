@@ -26,8 +26,8 @@
     "drive-read-engine",
     "disk-load-e2e (keyboard matrix)"
   ],
-  "note": "KEYSTONE root cause found (ADR-037): IEC cross-domain sampling skew — drive samples stale C64 DATA snapshot mid-bitbang (refreshed only on C64 $DD00 access). Underlies BOTH standard LOAD (byte 11 abort, drive $E961) AND custom loaders. Next: iec-crossdomain-sync [opus] — bidirectional cycle-exact cross-domain sync. THE heart of the IEC story.",
-  "updated": "2026-06-23T05:30:00Z",
+  "note": "iec-crossdomain-sync [opus] KEYSTONE: drive must see C64 IEC lines at the DRIVE clk when polling $1800 (not a snapshot refreshed only on C64 $DD00 access). Bidirectional cycle-exact cross-domain sync. Fix site full.rs iec_push_flush_to + drive.rs $1800. TS drive-trace diff at clk 4945495-4945509. Unblocks LOAD + custom loaders.",
+  "updated": "2026-06-23T05:35:00Z",
   "followups": [
     "daemon-trace-query",
     "vic-sprites-modes",
@@ -36,7 +36,11 @@
     "sid-audio",
     "custom-loader-gate [opus] — ACID TEST: scramble_infinity.d64 ($DD00 bitbang + VIC raster sync, the user-flagged hardest case). Standard LOAD lands the bootstrap, then the loaded code installs the custom $DD00 loader for the bulk. Trace-diff vs TS catches 1-cycle desync."
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "iec-crossdomain-sync",
+    "model": "opus",
+    "started": "2026-06-23T05:35:00Z"
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
