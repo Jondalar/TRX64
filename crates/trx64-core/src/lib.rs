@@ -15,6 +15,7 @@ pub mod drive;
 pub mod full;
 pub mod gcr;
 pub mod iec;
+pub mod rotation;
 pub mod render;
 pub mod sid;
 pub mod tables;
