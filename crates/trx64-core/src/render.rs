@@ -59,6 +59,12 @@ pub const DISPLAY_Y0_24: usize = 55;
 pub const DISPLAY_W: usize = 320;
 pub const DISPLAY_H: usize = 200;
 
+/// Draw-buffer X of sprite X-coordinate 0 (CALIBRATED vs the TS oracle: a sprite
+/// with X register `sx` lands its leftmost pixel at canvas X `sx + 8`, and canvas
+/// X 0 = dbuf X 104, so dbuf X = sx + 8 + 104 = sx + 112). Equivalently sprite
+/// X 24 ($18) = display col 0 = dbuf X 136 = the left display edge.
+pub const SPRITE_DBUF_X0: usize = 112;
+
 // ── Screenshot crop (= renderLiteralPortRgba, integrated-session.ts) ───────────
 /// VICE x64sc PAL canvas: X = dbuf[104..488] (384 px, balanced 32 L/R borders),
 /// Y = fb[16..288] (272 px, first displayed PAL line = 16).
@@ -162,7 +168,17 @@ impl<'a> RenderInput<'a> {
 /// Border colour fills everywhere outside the display window; inside, each char /
 /// bitmap cell is rendered per the active mode. Returns the index buffer.
 pub fn render_index_buffer(inp: &RenderInput) -> Vec<u8> {
+    let (fb, _fg) = render_index_and_fg(inp);
+    fb
+}
+
+/// Build the colour-index buffer AND a parallel "foreground" mask (one byte per
+/// pixel: 1 if the graphics pixel has priority over a low-priority sprite, i.e.
+/// `px & 0x2` in the VICE draw-cycle). The mask drives sprite-to-background
+/// priority and sprite-background collisions. Border pixels are foreground=0.
+fn render_index_and_fg(inp: &RenderInput) -> (Vec<u8>, Vec<u8>) {
     let mut fb = vec![0u8; FB_W * FB_H];
+    let mut fg = vec![0u8; FB_W * FB_H];
     let border = inp.reg(0x20) & 0x0f;
     fb.fill(border);
 
@@ -175,7 +191,7 @@ pub fn render_index_buffer(inp: &RenderInput) -> Vec<u8> {
 
     // Display blanked (DEN=0): the whole window is border colour — nothing drawn.
     if !den {
-        return fb;
+        return (fb, fg);
     }
 
     // Vertical display window (RSEL): 25 rows from line 51, or 24 rows from 55.
@@ -207,13 +223,14 @@ pub fn render_index_buffer(inp: &RenderInput) -> Vec<u8> {
                 let vm_index = trow * 40 + col;
                 let screen_byte = inp.ram[screen_base.wrapping_add(vm_index as u16) as usize];
                 let color = inp.color_ram[vm_index & 0x3ff] & 0x0f;
-                let px = pixels_for_cell(
+                let (px, pri) = pixels_for_cell(
                     inp, mode, screen_byte, color, sub, col, trow, char_base, bitmap_base,
                     bg0, bg1, bg2, bg3,
                 );
                 let base = row_off + col * 8;
                 for (i, &c) in px.iter().enumerate() {
                     fb[base + i] = c;
+                    fg[base + i] = pri[i] as u8;
                 }
             }
         }
@@ -230,14 +247,133 @@ pub fn render_index_buffer(inp: &RenderInput) -> Vec<u8> {
             for i in 0..8 {
                 fb[lo + i] = border;
                 fb[lo + DISPLAY_W - 1 - i] = border;
+                fg[lo + i] = 0;
+                fg[lo + DISPLAY_W - 1 - i] = 0;
             }
         }
     }
 
-    fb
+    // Sprites are painted on top of the graphics, honouring per-sprite priority
+    // ($D01B) against the foreground mask and sprite-sprite priority (lower
+    // sprite number wins). Border colour stays untouched where no sprite pixel.
+    render_sprites(inp, &mut fb, &fg);
+
+    (fb, fg)
 }
 
-/// Render the 8 horizontal pixels of one character/bitmap cell row.
+/// Paint the 8 hardware sprites onto the draw buffer. Calibrated against the TS
+/// oracle (per-cycle literal port): a sprite with X register value `sx` lands its
+/// leftmost pixel at draw-buffer column `sx + SPRITE_DBUF_X0`, and its first row
+/// at draw-buffer line `sy + 1` (where `sy` is the $D001+2s Y register). Each
+/// sprite is 24 px wide (×2 with X-expand) and 21 rows tall (×2 with Y-expand).
+///
+/// Priority: for sprite `s`, when its priority bit ($D01B bit s) is set AND the
+/// underlying graphics pixel is foreground (`fg[..]==1`), the sprite pixel is
+/// hidden. Among sprites, the LOWEST-numbered sprite with an opaque pixel wins
+/// (matches the VICE draw_sprites `for s = 7..0` last-write-lowest semantics).
+fn render_sprites(inp: &RenderInput, fb: &mut [u8], fg: &[u8]) {
+    let enable = inp.reg(0x15);
+    if enable == 0 {
+        return;
+    }
+    let x_msb = inp.reg(0x10);
+    let y_exp = inp.reg(0x17);
+    let pri = inp.reg(0x1b);
+    let mcm = inp.reg(0x1c);
+    let x_exp = inp.reg(0x1d);
+    let mc0 = inp.reg(0x25) & 0x0f; // $D025 sprite multicolor 0
+    let mc1 = inp.reg(0x26) & 0x0f; // $D026 sprite multicolor 1
+    let screen_base = inp.screen_base();
+
+    // Build, per draw-buffer pixel touched, the winning sprite's colour. We paint
+    // sprites from highest number (7) down to lowest (0) so the lowest overwrites
+    // — exactly the priority order the VICE port produces. The per-pixel hide test
+    // against the foreground mask uses the *graphics* fg, evaluated per pixel.
+    for s in (0..8usize).rev() {
+        let m = 1u8 << s;
+        if enable & m == 0 {
+            continue;
+        }
+        let sx = inp.reg(0x00 + 2 * s as u8) as usize | (((x_msb >> s) & 1) as usize) << 8;
+        let sy = inp.reg(0x01 + 2 * s as u8) as usize;
+        let col = inp.reg(0x27 + s as u8) & 0x0f; // $D027+s sprite colour
+        let is_mc = mcm & m != 0;
+        let is_xe = x_exp & m != 0;
+        let is_ye = y_exp & m != 0;
+        let spri = pri & m != 0; // sprite is BEHIND foreground graphics when set
+
+        // Sprite data pointer: screen RAM $3F8+s (in the VIC bank), ×64.
+        let ptr = inp.ram[screen_base.wrapping_add(0x3f8 + s as u16) as usize] as u16;
+        let data_base = ptr.wrapping_mul(64);
+
+        let dbuf_x0 = sx + SPRITE_DBUF_X0;
+        let height = if is_ye { 42 } else { 21 };
+
+        for row in 0..height {
+            let data_row = if is_ye { row / 2 } else { row };
+            let line = sy + 1 + row;
+            if line >= FB_H {
+                break;
+            }
+            // Three data bytes per row: 24 source pixels, MSB-first.
+            let b0 = inp.vic_read(data_base.wrapping_add((data_row * 3) as u16));
+            let b1 = inp.vic_read(data_base.wrapping_add((data_row * 3 + 1) as u16));
+            let b2 = inp.vic_read(data_base.wrapping_add((data_row * 3 + 2) as u16));
+            let bits24 = ((b0 as u32) << 16) | ((b1 as u32) << 8) | b2 as u32;
+
+            if is_mc {
+                // 12 multicolor pixels of 2 source-px width (×2 again with X-exp).
+                for p in 0..12usize {
+                    let val = (bits24 >> (22 - p * 2)) & 0x03;
+                    let c = match val {
+                        0 => continue, // transparent
+                        1 => mc0,
+                        2 => col,
+                        _ => mc1,
+                    };
+                    let pxw = if is_xe { 4 } else { 2 };
+                    let px0 = dbuf_x0 + p * pxw;
+                    for k in 0..pxw {
+                        put_sprite_px(fb, fg, line, px0 + k, c, spri);
+                    }
+                }
+            } else {
+                // 24 hires pixels of 1 source-px width (×2 with X-exp).
+                for p in 0..24usize {
+                    if (bits24 >> (23 - p)) & 1 == 0 {
+                        continue; // transparent
+                    }
+                    let pxw = if is_xe { 2 } else { 1 };
+                    let px0 = dbuf_x0 + p * pxw;
+                    for k in 0..pxw {
+                        put_sprite_px(fb, fg, line, px0 + k, col, spri);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Write one sprite pixel at draw-buffer (line,x), unless it is hidden behind a
+/// foreground graphics pixel because the sprite has low priority (`spri`=true and
+/// the underlying graphics pixel is foreground). Out-of-range columns are ignored.
+#[inline]
+fn put_sprite_px(fb: &mut [u8], fg: &[u8], line: usize, x: usize, color: u8, spri: bool) {
+    if x >= FB_W {
+        return;
+    }
+    let off = line * FB_W + x;
+    if spri && fg[off] != 0 {
+        return; // foreground graphics wins over a low-priority sprite
+    }
+    fb[off] = color;
+}
+
+/// Render the 8 horizontal pixels of one character/bitmap cell row. Returns the
+/// 8 colour indices AND the 8 per-pixel *foreground* flags (= VICE `px & 0x2`:
+/// true for graphics pixels with priority over a low-priority sprite). In hires
+/// modes a set bit is foreground; in multicolor modes bit-pairs 10/11 are
+/// foreground while 00/01 are background.
 #[allow(clippy::too_many_arguments)]
 fn pixels_for_cell(
     inp: &RenderInput,
@@ -253,43 +389,48 @@ fn pixels_for_cell(
     bg1: u8,
     bg2: u8,
     bg3: u8,
-) -> [u8; 8] {
+) -> ([u8; 8], [bool; 8]) {
+    let mut out = [0u8; 8];
+    let mut fg = [false; 8];
     match mode {
         VicMode::StandardText => {
             // Char ROM row: (char<<3 | sub). FG = colour RAM, BG = $D021. MSB left.
             let row = inp.vic_read(char_base.wrapping_add(((screen_byte as u16) << 3) + sub as u16));
-            let mut out = [0u8; 8];
             for i in 0..8 {
-                out[i] = if row & (0x80 >> i) != 0 { color } else { bg0 };
+                let set = row & (0x80 >> i) != 0;
+                out[i] = if set { color } else { bg0 };
+                fg[i] = set;
             }
-            out
         }
         VicMode::MulticolorText => {
             let row = inp.vic_read(char_base.wrapping_add(((screen_byte as u16) << 3) + sub as u16));
-            let mut out = [0u8; 8];
             if color & 0x08 == 0 {
                 // Colour RAM bit3 = 0 → this cell is hi-res (standard text) with
                 // the low 3 bits as foreground.
-                let fg = color & 0x07;
+                let cfg = color & 0x07;
                 for i in 0..8 {
-                    out[i] = if row & (0x80 >> i) != 0 { fg } else { bg0 };
+                    let set = row & (0x80 >> i) != 0;
+                    out[i] = if set { cfg } else { bg0 };
+                    fg[i] = set;
                 }
             } else {
-                // Multicolor: 4 double-wide pixels from bit pairs.
-                let fg = color & 0x07;
+                // Multicolor: 4 double-wide pixels from bit pairs. 10/11 = fg.
+                let cfg = color & 0x07;
                 for p in 0..4 {
                     let bits = (row >> (6 - p * 2)) & 0x03;
                     let c = match bits {
                         0 => bg0,
                         1 => bg1,
                         2 => bg2,
-                        _ => fg,
+                        _ => cfg,
                     };
+                    let is_fg = bits & 0x02 != 0;
                     out[p * 2] = c;
                     out[p * 2 + 1] = c;
+                    fg[p * 2] = is_fg;
+                    fg[p * 2 + 1] = is_fg;
                 }
             }
-            out
         }
         VicMode::Ecm => {
             // ECM: char code low 6 bits index the glyph; bits 6-7 select bg0..bg3.
@@ -301,11 +442,11 @@ fn pixels_for_cell(
                 2 => bg2,
                 _ => bg3,
             };
-            let mut out = [0u8; 8];
             for i in 0..8 {
-                out[i] = if row & (0x80 >> i) != 0 { color } else { bg };
+                let set = row & (0x80 >> i) != 0;
+                out[i] = if set { color } else { bg };
+                fg[i] = set;
             }
-            out
         }
         VicMode::StandardBitmap => {
             // Bitmap byte: base + trow*320 + col*8 + sub. Bit=1 → upper nibble of
@@ -315,13 +456,13 @@ fn pixels_for_cell(
                 .wrapping_add((col as u16) * 8)
                 .wrapping_add(sub as u16);
             let row = inp.vic_read(addr);
-            let fg = (screen_byte >> 4) & 0x0f;
+            let fgc = (screen_byte >> 4) & 0x0f;
             let bg = screen_byte & 0x0f;
-            let mut out = [0u8; 8];
             for i in 0..8 {
-                out[i] = if row & (0x80 >> i) != 0 { fg } else { bg };
+                let set = row & (0x80 >> i) != 0;
+                out[i] = if set { fgc } else { bg };
+                fg[i] = set;
             }
-            out
         }
         VicMode::MulticolorBitmap => {
             let addr = bitmap_base
@@ -333,7 +474,6 @@ fn pixels_for_cell(
             let c01 = (screen_byte >> 4) & 0x0f;
             let c10 = screen_byte & 0x0f;
             let c11 = color & 0x0f;
-            let mut out = [0u8; 8];
             for p in 0..4 {
                 let bits = (row >> (6 - p * 2)) & 0x03;
                 let c = match bits {
@@ -342,13 +482,16 @@ fn pixels_for_cell(
                     2 => c10,
                     _ => c11,
                 };
+                let is_fg = bits & 0x02 != 0;
                 out[p * 2] = c;
                 out[p * 2 + 1] = c;
+                fg[p * 2] = is_fg;
+                fg[p * 2 + 1] = is_fg;
             }
-            out
         }
-        VicMode::Invalid => [0u8; 8],
+        VicMode::Invalid => {}
     }
+    (out, fg)
 }
 
 /// Crop the internal index buffer to the VICE PAL screenshot canvas and convert
@@ -467,5 +610,32 @@ mod tests {
         let base = 51 * FB_W + DISPLAY_X0;
         let got: Vec<u8> = (0..8).map(|i| fb[base + i]).collect();
         assert_eq!(got, vec![1, 6, 1, 6, 6, 6, 6, 1], "MSB-left fg/bg per glyph row");
+    }
+}
+
+#[cfg(test)]
+mod sprite_tests {
+    use super::*;
+    #[test]
+    fn solid_sprite_paints_at_calibrated_pos() {
+        let mut ram = [0x20u8; 0x10000];
+        // sprite ptr at $07F8 = $0D, data $0340 solid $FF
+        ram[0x07f8] = 0x0d;
+        for i in 0..63 { ram[0x0340 + i] = 0xff; }
+        let char_rom = [0u8; 0x1000];
+        let color_ram = [14u8; 0x0400];
+        let mut regs = [0u8; 0x40];
+        regs[0x11] = 0x1b; regs[0x16] = 0xc8; regs[0x18] = 0x14;
+        regs[0x20] = 14; regs[0x21] = 6;
+        regs[0x00] = 0x60; regs[0x01] = 0x60; // X=96 Y=96
+        regs[0x15] = 0x01; // enable
+        regs[0x27] = 2;    // red
+        let inp = RenderInput { regs: &regs, ram: &ram, char_rom: &char_rom, color_ram: &color_ram, bank_base: 0 };
+        let fb = render_index_buffer(&inp);
+        // expect red (2) at dbuf (line = 0x60+1 = 97, x = 0x60+112 = 208)
+        let off = 97 * FB_W + 208;
+        assert_eq!(fb[off], 2, "sprite top-left red");
+        assert_eq!(fb[97 * FB_W + 208 + 23], 2, "sprite right edge red");
+        assert_eq!(fb[(97 + 20) * FB_W + 208], 2, "sprite bottom red");
     }
 }

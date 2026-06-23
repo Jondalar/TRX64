@@ -516,6 +516,43 @@ impl Machine {
         }
     }
 
+    /// Poke through the I/O space (= `wr io` lens). Routes each byte the way a
+    /// CPU store with I/O mapped would: $D000-$D3FF → VIC registers, $D400-$D7FF
+    /// → SID register file, $D800-$DBFF → colour-RAM nibble (the I/O shadow),
+    /// $DC00-$DCFF / $DD00-$DDFF → CIA1 / CIA2, everything else in $D000-$DFFF →
+    /// the I/O shadow. This lets a render scenario program the VIC + colour RAM on
+    /// the CPU-isolated (flat-bus) inject path, where ordinary `STA $D0xx` would
+    /// land in RAM instead of the chip. Out-of-range addresses fall back to RAM.
+    pub fn poke_io(&mut self, addr: u16, bytes: &[u8]) {
+        for (i, b) in bytes.iter().enumerate() {
+            let a = addr.wrapping_add(i as u16);
+            match a {
+                0xd000..=0xd3ff => self.vic.write_reg(a as u8, *b),
+                0xd400..=0xd7ff => {
+                    let reg = (a as usize - 0xd400) & 0x1f;
+                    self.sid_regs[reg] = *b;
+                    self.sid.write(reg, *b, &self.sid_regs);
+                }
+                0xd800..=0xdbff => {
+                    // Colour RAM: only the low nibble is stored, in the I/O shadow.
+                    self.io_shadow[(a as usize) - 0xd000] = *b & 0x0f;
+                }
+                0xdc00..=0xdcff => {
+                    let clk = self.cpu6510.clk;
+                    let tab = self.cia_table.clone();
+                    self.cia1.write(a, *b, clk, &tab);
+                }
+                0xdd00..=0xddff => {
+                    let clk = self.cpu6510.clk;
+                    let tab = self.cia_table.clone();
+                    self.cia2.write(a, *b, clk, &tab);
+                }
+                0xd000..=0xdfff => self.io_shadow[(a as usize) - 0xd000] = *b,
+                _ => self.ram[a as usize] = *b,
+            }
+        }
+    }
+
     /// Set the program counter (CPU-isolated: no boot, atomic PC write).
     pub fn set_pc(&mut self, pc: u16) {
         self.cpu6510.reg_pc = pc;

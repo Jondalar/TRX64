@@ -270,6 +270,9 @@ fn run_monitor(session: &mut Session, command: &str) -> Result<String, String> {
     match op.as_str() {
         "wr" => {
             let mut i = 1;
+            // Optional lens: `io` routes the write through the I/O space (VIC /
+            // SID / colour-RAM / CIA) instead of flat RAM. `cpu`/`ram` = RAM.
+            let io_lens = matches!(toks.get(i), Some(&"io"));
             if matches!(toks.get(i), Some(&("cpu" | "ram" | "io"))) {
                 i += 1;
             }
@@ -284,9 +287,14 @@ fn run_monitor(session: &mut Session, command: &str) -> Result<String, String> {
             if bytes.is_empty() {
                 return Err("wr: need >=1 byte value ($00-$FF)".into());
             }
-            session.machine.poke(addr, &bytes);
+            if io_lens {
+                session.machine.poke_io(addr, &bytes);
+            } else {
+                session.machine.poke(addr, &bytes);
+            }
             session.injected = true;
-            Ok(format!("wrote {} byte(s) @ ${:04X} (cpu)", bytes.len(), addr))
+            let lens = if io_lens { "io" } else { "cpu" };
+            Ok(format!("wrote {} byte(s) @ ${:04X} ({lens})", bytes.len(), addr))
         }
         "r" | "registers" => {
             let sets: Vec<&str> = toks[1..].iter().copied().filter(|t| t.contains('=')).collect();
