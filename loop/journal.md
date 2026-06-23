@@ -452,3 +452,18 @@ The loop self-corrected a wrong ADR via trace-diff. Re-framed as drive-rotation-
 match VICE attach_clk (PRA-only) + preserve find-sync via elapsed-since-attach (no PRB mutation),
 gate scramble-load-progress RED->GREEN without regressing the $03 find-sync (drive-read-byteexact).
 Advancing to drive-rotation-phase.
+
+## 2026-06-23 — DRIVER: drive-rotation-phase — improvement merged + phase-lead ESCALATED
+
+ADR-040 FALSIFIED (3rd theory down). The ~17-20k phase lead is NOT attach_clk/SYNC-visibility
+(shifting unmask +400k → 0 effect; unmask is ~5M cyc before the read job) NOR rate-skew. Narrowed
+to the read-job's rotational position at sector-lock (seek/step or GCR head-advance). BUT a genuine
+improvement landed: the ADR-035 attach_clk hack replaced by VICE-faithful drive_writeprotect_sense
+(WPS-via-PRB unmask) — removes the deviation, ZERO regression (all $03/find-sync + boot + disk-load-
+dir GREEN). Confirmation gate INDEPENDENT: confirmed. ADR-041. Merged.
+
+DRIVER CALL: the phase-lead has resisted 3 opus theories — ESCALATED to the user (his flagged
+$DD00/IEC-timing domain; diminishing returns from blind opus; diagnosis now sharp). Standard LOAD
+works (end-state byte-exact); only custom loaders need the cycle-exact phase. Parked the custom-
+loader chain BLOCKED; routing the loop to clean followups (vic-sprites-modes) by default until the
+user steers. Asked a/b/c (one more focused attempt vs route-away vs user-led).

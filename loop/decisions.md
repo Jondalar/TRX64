@@ -547,3 +547,26 @@ disk-read-engage MUST stay GREEN (the $03 find-sync must not regress). Confirm t
 via a drive-clk diff at the rotate_disk first-call instant before changing it.
 **Why:** The loop self-corrected a wrong ADR via trace-diff investigation. The true blocker is one
 focused rotational-phase fix, on the same ground as drive-read-engine (ADR-035).
+
+## ADR-041 — ADR-040 falsified too; ADR-035 hack removed (improvement); phase-lead ESCALATED
+**Context:** drive-rotation-phase tested the ADR-040 attach_clk theory.
+**Outcome:** (1) IMPROVEMENT MERGED: the ADR-035 attach_clk hack (clear inside rotate_disk on
+any access) is REPLACED by VICE's actual mechanism — `drive_writeprotect_sense` (drive.ts:1661-
+1698) clears attach_clk after DRIVE_ATTACH_DELAY via the PRB read path (WPS bit); the DOS $F562
+find-sync polls PB7/SYNC + PB4/WPS together via PRB, so SYNC unmasks with no PRA read — spec-
+faithful, removes the deviation, ZERO regression (all $03/find-sync gates + full sweep GREEN).
+(2) ADR-040 FALSIFIED: the ~17-20k phase lead is NOT attach_clk/SYNC-visibility — decisive
+experiment: shifting the SYNC-unmask by +17k AND +400k (two revolutions) moved transfer-start by
+EXACTLY 0 (the unmask happens ~5M cyc before the read job). Combined with ADR-040's falsification
+of the rate-skew theory, BOTH prior root-cause theories are dead.
+**Remaining (narrowed): the read-job's ROTATIONAL POSITION at sector-lock** — the seek/step timing
+to the target track, or the GCR head-advance — places the head ~one inter-sector gap early. Next
+investigation: instrument drive-clk + gcr_head_offset at the instant the read job first locks the
+target sector's header, TRX64 vs TS.
+**Decision:** ESCALATE to the user. This phase-lead has now resisted 3 opus theories (rate / attach_
+clk, both falsified by trace-diff); it is the user's flagged hardest domain ($DD00/IEC timing).
+Standard LOAD works (end-state byte-exact) — only cycle-exact custom loaders need this. Park the
+custom-loader chain as BLOCKED-tracked; route the loop to clean followups (default) until the user
+steers (one more focused opus attempt on seek/step+head-advance, vs a dedicated session).
+**Why:** 3 falsified theories on one sub-cycle lead = diminishing returns from blind opus; the user's
+domain expertise + a fresh look is the higher-leverage path. The diagnosis is now sharp enough to hand off.

@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "drive-rotation-phase",
+  "current_item": "vic-sprites-modes",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -27,22 +27,15 @@
     "disk-load-e2e (keyboard matrix)",
     "iec-crossdomain-sync (STANDARD LOAD complete)"
   ],
-  "note": "drive-rotation-phase [opus]: fix the ~17k-cycle rotational-phase lead (ADR-040). Match VICE attach_clk clearing (PRA/$1C01-only, not PRB poll) WHILE preserving the $03 find-sync fix via elapsed-since-attach (no rotation_last_clk/attach_clk mutation from PRB). DUAL GATE: scramble-load-progress RED->GREEN AND drive-read-byteexact/disk-read-engage stay GREEN.",
-  "updated": "2026-06-23T08:19:00Z",
+  "note": "STANDARD LOAD complete + byte-exact (improvement merged: spec-faithful drive_writeprotect_sense, ADR-035 hack removed). Custom-loader phase-lead ESCALATED to user (3 theories falsified, his $DD00 domain) — parked BLOCKED. Loop routes to clean followups: vic-sprites-modes [opus] next (default; user may redirect to the phase-lead).",
+  "updated": "2026-06-23T08:25:00Z",
   "followups": [
-    "custom-loader-gate (acid test — reachable after iec-serial-rate)",
     "daemon-trace-query",
-    "vic-sprites-modes",
     "cia-cascade",
     "drive-watchdog-phase",
     "sid-audio"
   ],
-  "in_flight": {
-    "item": "drive-rotation-phase",
-    "model": "opus",
-    "started": "2026-06-23T08:19:00Z",
-    "note": "opus alive 30min: committed 93dca10 (VICE drive_writeprotect_sense attach_clk clear — the exact mechanism). Tree clean, testing dual gate. Defer."
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
@@ -51,5 +44,8 @@
     "drive-boot-deep (drive-watchdog-phase)",
     "scramble-load-progress (iec-serial-rate, serial-load rate skew)"
   ],
-  "custom_loader_test_disk": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/scramble_infinity.d64"
+  "custom_loader_test_disk": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/scramble_infinity.d64",
+  "blocked": [
+    "disk-load-phase-lead (custom loader): ~17-20k rotational-phase lead at sector-lock; 3 opus theories falsified (rate, attach_clk); narrowed to seek/step + GCR head-advance; ESCALATED to user (ADR-041)"
+  ]
 }
