@@ -203,13 +203,14 @@ impl Rotation {
 
     /// rotation_byte_read (rotation.c:1145-1165): the VIA2 PRA-read entry. During
     /// the attach-settle window force `GCR_read = 0`; otherwise rotate the disk.
+    /// Byte-exact with VICE: in the expired-window branch it clears `attach_clk`
+    /// and returns WITHOUT rotating (the rotate happens on the *next* access).
     pub fn byte_read(&mut self, clk: u64) {
         if self.attach_clk != 0 {
             if clk.wrapping_sub(self.attach_clk) < DRIVE_ATTACH_DELAY {
                 self.gcr_read = 0;
             } else {
                 self.attach_clk = 0;
-                self.rotate_disk(clk);
             }
         } else {
             self.rotate_disk(clk);
@@ -232,9 +233,23 @@ impl Rotation {
 
     /// rotation_rotate_disk (rotation.c:1106-1125): motor gate, then the simple
     /// engine (D64). Wobble is a no-op (factor/frequency 0).
+    ///
+    /// Spin-up window: VICE clears `attach_clk` only in `rotation_byte_read`
+    /// (the PRA read), so a drive that ONLY polls PB7/SYNC (PRB, the $F562 find-
+    /// sync loop) before ever reading $1C01 would keep `attach_clk` set and never
+    /// see SYNC. On real hardware the disk is up to speed once `DRIVE_ATTACH_DELAY`
+    /// has elapsed regardless of which register the controller samples — VICE only
+    /// gets away with the PRA-only clear because a real job ALWAYS issues a PRA
+    /// read during head/job setup first. We mirror the physical reality: once the
+    /// spin-up delay has expired, drop the window here too so a PRB-only sync poll
+    /// reads a live disk. Within the delay nothing changes (sync_found still 0x80),
+    /// so the byte-exact mount/idle traces are unaffected.
     pub fn rotate_disk(&mut self, clk: u64) {
         if self.byte_ready_active & BRA_MOTOR_ON == 0 {
             return;
+        }
+        if self.attach_clk != 0 && clk.wrapping_sub(self.attach_clk) >= DRIVE_ATTACH_DELAY {
+            self.attach_clk = 0;
         }
         self.rotation_1541_simple(clk);
     }

@@ -1,4 +1,4 @@
-//! Milestone 2 (partial): the GCR read path is engaged by the live DOS controller.
+//! Milestone 2 (COMPLETE): byte-exact GCR sector read through the live DOS controller.
 //!
 //! Boots the 1541 drive standalone (DOS ROM), mounts a D64, then pokes the DOS
 //! job queue directly — $00 = $80 (READ buffer 0), $06/$07 = track/sector — to
@@ -6,36 +6,34 @@
 //! 1541 job-queue trick; the IRQ-driven controller picks up the job regardless
 //! of IEC activity).
 //!
-//! WHAT THIS GATES (green): the rotating-disk model + VIA2 wiring is live enough
-//! that the DOS controller PICKS UP the read job, spins the motor, advances the
-//! head over the GCR bitstream, and runs to a definite job completion (the job
-//! code at $00 is replaced by a status code), rather than hanging. This exercises
-//! the whole new path: D64→GCR encode, head rotation, VIA2 PRA (GCR_read) / PRB7
+//! WHAT THIS GATES (green): the FULL read engine. The DOS controller picks up the
+//! read job, spins the motor, finds the data SYNC, reads the GCR header + data,
+//! GCR-decodes them, and completes with JOB STATUS $01 (CBMDOS_FDC_ERR_OK). The
+//! decoded sector buffer at $0300 is byte-identical to the D64 image. Exercises
+//! the whole path: D64→GCR encode, head rotation, VIA2 PRA (GCR_read) / PRB7
 //! (SYNC) reads, the stepper/motor/speed-zone store_prb side-effects, and the
 //! byte-ready (SO) → drive-CPU V-flag handshake.
 //!
-//! KNOWN DIVERGENCE (full byte-exact sector read — milestone 2 complete):
-//!   The controller currently completes the read job with status $03
-//!   (CBMDOS_FDC_ERR_SYNC) instead of $01 (OK). First-divergence analysis:
-//!     - The D64→GCR encode is byte-exact vs the TS oracle (gcr_d64_parity test).
-//!     - The simple rotation engine streams correct GCR in isolation: SYNC is
-//!       detected (last_read_data==0x3ff) and full bytes assemble with the
-//!       byte-ready edge firing (rotation.rs unit tests).
-//!     - In the live controller the byte-ready (SO) edge never reaches a
-//!       BVS/BVC/PHP opcode, and the controller's SYNC poll of $1C00/PB7 advances
-//!       the head ~96 bit-cells between consecutive reads (~400 drive cycles
-//!       apart), wide enough to skip the ~31-bit-cell sync window where
-//!       last_read_data==0x3ff. The 1541's GCR sync/byte detection is driven by
-//!       the controller's byte-ready cadence, which the lazy at-VIA2-access /
-//!       at-BVC rotation advance does not yet reproduce at the right granularity.
-//!     The missing piece is the set_ca2-style byte-ready→overflow flush on the
-//!     PCR CA2 edge (via2d.c:207-222 set_ca2 → drive_cpu_set_overflow) and the
-//!     per-cycle drivecpu_rotate cadence the 6510 core uses, so the SO edge lands
-//!     at the controller's exact sampling instant. Closing it needs a drive-CPU
-//!     trace cross-check against the TS oracle at the $F556 read loop.
+//! ROOT-CAUSE FIX (ADR drive-read-engine):
+//!   The previous $03 (CBMDOS_FDC_ERR_SYNC) failure was NOT a GCR-data or cadence
+//!   bug. `rotation_sync_found` returns 0x80 (no-sync) while `attach_clk != 0`
+//!   (the spin-up settle window). VICE clears `attach_clk` ONLY in
+//!   `rotation_byte_read` (the PRA / $1C01 read) once `DRIVE_ATTACH_DELAY`
+//!   (1.8M cycles) elapses — it gets away with this because a real drive ALWAYS
+//!   issues a PRA read during head/job setup before the $F556 find-sync loop. The
+//!   1541 DOS find-sync loop ($F562 `BIT $1C00` / `BMI`) polls PB7/SYNC via PRB
+//!   ONLY, so a drive that has never read $1C01 keeps `attach_clk` set forever and
+//!   never sees SYNC → spins out the $1805 watchdog → $03. The fix (rotation.rs
+//!   `rotate_disk`) drops the spin-up window once the delay has expired on ANY
+//!   rotation access, matching the physical reality (the disk is up to speed
+//!   regardless of which VIA register is sampled). Within the delay nothing
+//!   changes, so the byte-exact mount/idle drive-cpu traces are unaffected.
 //!
-//! This test asserts the reachable milestone and records the divergence; it does
-//! not assert the (not-yet-byte-exact) full sector contents.
+//! DISK-ID PRIME: the job-queue trick bypasses the DOS `Initialize` command that
+//! normally caches the disk ID at $12/$13 from the BAM. Without it the header
+//! verify ($F3F9 `CMP $16`) compares the freshly-read header ID against an
+//! uninitialised $12/$13 → $0B (CBMDOS_FDC_ERR_ID). We prime $12/$13 with the
+//! disk ID (the post-Initialize state) so the verify exercises a REAL match.
 
 use trx64_core::drive::{DiskImage, DiskKind, Drive1541};
 use std::path::Path;
@@ -45,8 +43,23 @@ const ROM_DIR: &str =
 const SAMPLE: &str =
     "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/scramble_infinity.d64";
 
+/// D64 linear byte offset of track 18, sector 0 (zones 21/19/18/17 sectors/track).
+fn d64_t18s0_off() -> usize {
+    let spt: Vec<usize> = std::iter::repeat(21usize)
+        .take(17)
+        .chain(std::iter::repeat(19).take(7))
+        .chain(std::iter::repeat(18).take(6))
+        .chain(std::iter::repeat(17).take(5))
+        .collect();
+    let mut off = 0;
+    for t in 1..18 {
+        off += spt[t - 1] * 256;
+    }
+    off
+}
+
 #[test]
-fn drive_engages_gcr_read_path_via_job_queue() {
+fn drive_reads_t18s0_byte_exact_status_ok() {
     let rom_dir = Path::new(ROM_DIR);
     if !rom_dir.join("dos1541-325302-01+901229-05.bin").exists()
         && !rom_dir.join("1541.bin").exists()
@@ -56,11 +69,11 @@ fn drive_engages_gcr_read_path_via_job_queue() {
     }
     let d64 = match std::fs::read(SAMPLE) {
         Ok(b) => b,
-        Err(_) => {
-            eprintln!("skip: sample disk absent");
-            return;
-        }
+        Err(_) => { eprintln!("skip: sample disk absent"); return; }
     };
+    let off = d64_t18s0_off();
+    let id1 = d64[off + 0xA2];
+    let id2 = d64[off + 0xA3];
 
     let mut drive = Drive1541::new();
     drive.load_rom(rom_dir).expect("load DOS ROM");
@@ -81,8 +94,13 @@ fn drive_engages_gcr_read_path_via_job_queue() {
         drive.rotation.image.is_some(),
         "mounting a D64 must populate the rotating GCR image"
     );
-    // Let the attach-settle window pass.
+    // Let the attach spin-up window pass (DRIVE_ATTACH_DELAY = 1.8M cycles).
     drive.run_cycles(2_000_000);
+
+    // Prime the cached disk ID at $12/$13 (the post-Initialize state) so the
+    // header verify compares against a real match instead of a stale $0B.
+    drive.drive_ram_write(0x0012, id1);
+    drive.drive_ram_write(0x0013, id2);
 
     // Track 18, sector 0 (the BAM) — always present.
     drive.drive_ram_write(0x0006, 18);
@@ -93,20 +111,15 @@ fn drive_engages_gcr_read_path_via_job_queue() {
 
     // Run the controller until the job completes (status replaces the job code).
     let mut status = 0x80u8;
-    for _ in 0..40 {
-        drive.run_cycles(250_000);
+    for _ in 0..200 {
+        drive.run_cycles(100_000);
         status = drive.drive_ram_read(0x0000);
         if status < 0x80 {
             break;
         }
     }
 
-    // Reachable milestone: the job ran to completion (no hang) and the disk
-    // controller engaged the rotating-GCR path (motor on, head advanced).
-    assert!(
-        status < 0x80,
-        "controller did not complete the read job: $00 = {status:#04x} (still a job code)"
-    );
+    // The read PATH ran: motor on, head advanced over the GCR bitstream.
     assert_ne!(
         drive.rotation.byte_ready_active & trx64_core::rotation::BRA_MOTOR_ON,
         0,
@@ -121,9 +134,22 @@ fn drive_engages_gcr_read_path_via_job_queue() {
         "the head should be at track 18 (half-track 36) for this read"
     );
 
-    // Document the current status: $01 = full byte-exact read achieved; anything
-    // else is the known SYNC-cadence divergence above. We accept any definite
-    // completion here (the read PATH is exercised); a follow-up will tighten this
-    // to status == 0x01 + byte-exact $0300 once the SO cadence matches the oracle.
-    eprintln!("drive sector-read job completed with status {status:#04x} (0x01 = OK)");
+    // FUNCTIONAL GATE: the job completes with $01 (OK)...
+    assert_eq!(
+        status, 0x01,
+        "read job must complete with status $01 (CBMDOS_FDC_ERR_OK), got {status:#04x}"
+    );
+
+    // ...and the decoded sector buffer at $0300 is byte-identical to the D64.
+    let mut readback = [0u8; 256];
+    for (i, b) in readback.iter_mut().enumerate() {
+        *b = drive.drive_ram_read(0x0300 + i as u16);
+    }
+    let expect = &d64[off..off + 256];
+    assert_eq!(
+        &readback[..],
+        expect,
+        "decoded sector $0300 must be byte-identical to D64 track-18 sector-0"
+    );
+    eprintln!("drive sector-read job completed with status {status:#04x} (0x01 = OK), sector byte-exact");
 }

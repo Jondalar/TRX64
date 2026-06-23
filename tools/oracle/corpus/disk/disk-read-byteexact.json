@@ -1,0 +1,41 @@
+{
+  "name": "disk-read-byteexact",
+  "slice": "drive",
+  "trace": false,
+  "steps": [
+    {
+      "method": "session/create",
+      "params": {
+        "pal": true
+      },
+      "capture": true,
+      "label": "create"
+    },
+    {
+      "method": "media/ingress",
+      "params": {
+        "session_id": "$sessionId",
+        "kind": "disk",
+        "path": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/scramble_infinity.d64"
+      },
+      "capture": true,
+      "label": "mount"
+    },
+    {
+      "method": "session/run",
+      "params": {
+        "session_id": "$sessionId",
+        "cycles": 2200000
+      },
+      "label": "run-past-spinup"
+    },
+    {
+      "method": "media/persist",
+      "params": {
+        "session_id": "$sessionId"
+      },
+      "capture": true,
+      "label": "persist-roundtrip"
+    }
+  ]
+}
