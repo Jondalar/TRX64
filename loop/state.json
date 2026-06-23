@@ -24,8 +24,8 @@
     "drive-gcr (encoding+mount)",
     "drive-load (controller+ATN+read-stream)"
   ],
-  "note": "drive-load done (both diagnosed pieces correct, drive-cpu GCR read byte-exact: disk-read-engage GREEN). Full LOAD blocks on iec-serial [opus] (bit-level IEC transfer, $EEA9 CLK-poll). Next: iec-serial — the last layer of the disk-LOAD onion.",
-  "updated": "2026-06-23T02:45:00Z",
+  "note": "iec-serial [opus]: bit-level IEC serial byte-transfer under TALK/LISTEN. C64 KERNAL CLK-poll $EEA9 waits for drive per-bit CLK (VIA1 PB3->IEC CLK); fix the cycle-exact per-bit CLK/DATA cadence so a byte completes -> LOAD lands program in RAM.",
+  "updated": "2026-06-23T02:50:00Z",
   "followups": [
     "iec-serial (bit-level CLK/DATA transfer under TALK/LISTEN -> finally lands LOAD)",
     "daemon-trace-query",
@@ -34,7 +34,11 @@
     "drive-watchdog-phase",
     "sid-audio"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "iec-serial",
+    "model": "opus",
+    "started": "2026-06-23T02:50:00Z"
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
