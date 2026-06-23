@@ -410,3 +410,19 @@ drive's per-bit CLK (VIA1 PB3→IEC CLK) transition; C64 times out ST=$42. Disti
 byte-ready cadence + ATN attention IRQ (both now correct).
 **Why:** Each disk-LOAD layer is byte-exact-verified as it lands; the per-bit IEC serial
 protocol timing is the final, distinct subsystem.
+
+## ADR-034 — iec-serial misdiagnosis corrected; LOAD blocker = drive-read-engine
+**Context:** I carved `iec-serial` as the LOAD blocker (C64 spinning at $EEA9). The builder
+investigated and CORRECTED it: the IEC bit-serial layer WORKS (filename LISTEN completes,
+TALK sent, the drive runs its receive/send bit-loops). The real blocker is one layer LOWER.
+**Decision:** The LOAD blocker is the **GCR read engine**: after TALK, the drive dispatches
+a track-18 (directory) read job that returns status **$03 (FDC SYNC)** not $01 — so it never
+has file data to send and the C64 times out (ST=$42). The GCR DATA is byte-exact
+(gcr_d64_parity passes) and SYNC is present (10 ones), but the controller does not assemble
+a byte-exact SECTOR. Re-frame as `drive-read-engine` [opus]: fix the sync/byte-latch path vs
+the $F556 timer-driven read so a sector read returns $01 with byte-exact bytes.
+**KEY GATE-GAP LEARNING:** `disk-read-engage` is byte-exact on the drive-cpu TRACE yet the
+read JOB still fails — trace-parity ≠ functional correctness. drive-read-engine MUST gate on
+the JOB STATUS ($01) + the read sector bytes, not just the drive-cpu trace, and cross-check
+the drive-cpu trace at $F556 vs the TS oracle to localize the byte-latch divergence.
+**Why:** Own the misdiagnosis; route the work to the actually-failing layer with the right gate.

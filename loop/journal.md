@@ -350,3 +350,18 @@ blocks on a THIRD subsystem (precisely located): the bit-level IEC serial transf
 LISTEN — C64 spins in KERNAL CLK-poll $EEA9 (256010×) for the drive's per-bit CLK transition;
 ST=$42 timeout. Carved to iec-serial [opus] — the last layer of the disk-LOAD onion.
 Advancing to iec-serial.
+
+## 2026-06-23 — DRIVER: iec-serial = diagnosis correction (my misdiagnosis owned)
+
+I had carved iec-serial as the LOAD blocker. The opus builder CORRECTED it: the IEC bit-
+serial layer WORKS (LISTEN completes, TALK sent, bit-loops run). Real blocker is one layer
+lower — the GCR read engine: track-18 read job returns $03 (SYNC) not $01, so no file data
+to send, C64 times out ST=$42. GCR data byte-exact + SYNC present, but the controller doesn't
+assemble a byte-exact sector. Builder committed only observability probes (#[ignore]'d), no
+production change, regression GREEN. ADR-034.
+
+KEY LEARNING: disk-read-engage is byte-exact on the drive-cpu TRACE yet the read JOB fails —
+trace-parity ≠ functional correctness. Re-framed the LOAD blocker as drive-read-engine [opus],
+which MUST gate on JOB-STATUS ($01) + sector bytes, cross-checking the drive-cpu trace at
+$F556. Owning the misdiagnosis; routing to the actually-failing layer. Advancing to
+drive-read-engine.
