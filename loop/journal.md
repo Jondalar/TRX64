@@ -467,3 +467,14 @@ $DD00/IEC-timing domain; diminishing returns from blind opus; diagnosis now shar
 works (end-state byte-exact); only custom loaders need the cycle-exact phase. Parked the custom-
 loader chain BLOCKED; routing the loop to clean followups (vic-sprites-modes) by default until the
 user steers. Asked a/b/c (one more focused attempt vs route-away vs user-led).
+
+## 2026-06-23 — DRIVER: vic-sprites-modes done — VIC renderer fully pixel-exact
+
+Opus builder: all 8 HW sprites pixel-exact (hires/multicolor/expand/MSB/priority), all graphics
+modes (multicolor-text/bitmap/ECM) pixel-gated, fine-scroll + 38/24-col border edges pixel-exact
+(border window decoupled from content origin). New `wr io` lens (poke_io); default `wr` unchanged.
+Confirmation gate INDEPENDENT: render subset (sprites/priority/mode/scroll) + render-boot + boot-
+trace + api-call-monitor all GREEN, 70 cargo tests pass, no regression. ADR-042. Merged.
+
+The VIC renderer is now complete + pixel-exact — the full visual foundation for Phase-2 frame-hash
+probes. done: 19 items. Advancing to cia-cascade [opus]. (Phase-lead still escalated to user.)

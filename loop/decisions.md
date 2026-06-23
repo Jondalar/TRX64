@@ -570,3 +570,18 @@ custom-loader chain as BLOCKED-tracked; route the loop to clean followups (defau
 steers (one more focused opus attempt on seek/step+head-advance, vs a dedicated session).
 **Why:** 3 falsified theories on one sub-cycle lead = diminishing returns from blind opus; the user's
 domain expertise + a fresh look is the higher-leverage path. The diagnosis is now sharp enough to hand off.
+
+## ADR-042 — vic-sprites-modes done: VIC renderer fully pixel-exact
+**Context:** vic-render did standard text; sprites + non-text modes + fine-scroll were unguarded.
+**Decision (accepted, GREEN + no regression):** render_sprites (render.rs) renders all 8 HW
+sprites pixel-exact vs TS — hires/multicolor, X/Y/XY expand, X-MSB ($D010), sprite-sprite +
+sprite-bg priority (per-pixel foreground mask = VICE px&0x2). The graphics modes (multicolor-
+text, standard+multicolor bitmap, ECM) pixel-gated (color logic already matched). Fine-scroll
+geometry rewritten: border WINDOW decoupled from CONTENT origin (content_y0=48+YSCROLL,
+content_x0=136+XSCROLL, clip to window); 38-col/24-row/XSCROLL/YSCROLL all pixel-exact (key:
+in-row XSCROLL gap fills $D021 background, idle region above/below fills black). New `wr io`
+monitor lens → Machine::poke_io (lib.rs) for VIC programming; the default `wr` lens is
+UNCHANGED so no iso-* gate is affected. 20 render scenarios GREEN (verified subset + render-
+boot + boot-trace + api-call-monitor + 70 cargo tests). Renderer in core (pure); PNG/WS in daemon.
+**Why:** The VIC renderer is now complete + pixel-exact (sprites + all modes + scroll) — the full
+visual foundation for Phase-2 frame-hash probes (the user-flagged custom-loader visual checks).

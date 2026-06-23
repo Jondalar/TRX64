@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "vic-sprites-modes",
+  "current_item": "cia-cascade",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -25,22 +25,17 @@
     "drive-load (controller+ATN+read-stream)",
     "drive-read-engine",
     "disk-load-e2e (keyboard matrix)",
-    "iec-crossdomain-sync (STANDARD LOAD complete)"
+    "iec-crossdomain-sync (STANDARD LOAD complete)",
+    "vic-sprites-modes"
   ],
-  "note": "vic-sprites-modes [opus]: render hardware sprites (pos/color/multicolor/priority/X-Y-expand) + gate the non-text VIC modes (multicolor-text/ECM/standard+multicolor bitmap, XSCROLL/YSCROLL fine-scroll) that vic-render implemented-but-didnt-gate. Pixel-parity via the render harness (capture.mjs/png.mjs). NOTE: phase-lead still ESCALATED to user (a/b/c).",
-  "updated": "2026-06-23T09:34:00Z",
+  "note": "vic-sprites-modes done — VIC renderer fully pixel-exact (sprites + all modes + fine-scroll). 19 items. Next: cia-cascade [opus] (chained timers via VICE alarm scheduler, ADR-017). Phase-lead still ESCALATED to user (a/b/c, blocked).",
+  "updated": "2026-06-23T09:40:00Z",
   "followups": [
     "daemon-trace-query",
-    "cia-cascade",
     "drive-watchdog-phase",
     "sid-audio"
   ],
-  "in_flight": {
-    "item": "vic-sprites-modes",
-    "model": "opus",
-    "started": "2026-06-23T09:34:00Z",
-    "note": "opus alive: 2 green commits (sprites pixel-exact + fine-scroll/border). Tree clean, render.rs idle ~11min — running mode gates or wrapping up. Defer."
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
