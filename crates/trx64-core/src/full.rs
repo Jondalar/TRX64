@@ -165,6 +165,26 @@ impl<'a> FullBus<'a> {
     /// the IEC handshake timing depends on.
     #[inline]
     fn iec_push_flush_to(&mut self, target: u64) {
+        self.iec_catch_up_to(target);
+        // READ path (and end-of-instruction): a full re-fold publishes the live
+        // `cpu_port` the C64 reads at $DD00 bits 6/7 (= VICE iecbus_cpu_read_conf1
+        // returning the freshly-folded cpu_port). The cpu_bus is unchanged here, so
+        // this single fold against the current cpu_bus is exact.
+        let pb_out = self.drive.via1_pb_iec_output();
+        self.iec.drive_store_pb(pb_out);
+    }
+
+    /// Catch the drive up to `target` and refresh `drv_data_8` from its live VIA1
+    /// PB output WITHOUT folding the wired-AND bus. The WRITE path uses this: it
+    /// must re-read the drive pull (the catch-up's `$1800` stores never propagate
+    /// `drv_data_8` into the shared IEC core in TRX64), but the wired-AND fold is
+    /// then performed exactly ONCE by `c64_store_dd00` against the NEW cpu_bus —
+    /// matching VICE `iecbus_cpu_write_conf1` (execute_one → update_cpu_bus →
+    /// ATN-edge → single drv_bus recompute → update_ports). The extra fold that
+    /// `iec_push_flush_to` performs against the OLD pre-write cpu_bus is what
+    /// transiently wedged the $04E2 BIT $DD00 / BVC handshake loop.
+    #[inline]
+    fn iec_catch_up_to(&mut self, target: u64) {
         // Feed the drive the current bus state so a `$1800` PB read during its
         // catch-up run sees the live C64-driven CLK/DATA/ATN lines. Also feed the
         // C64-side intent (cpu_bus) — constant across this catch-up — so a `$1800`
@@ -174,7 +194,7 @@ impl<'a> FullBus<'a> {
         self.drive.iec_cpu_bus = self.iec.cpu_bus;
         self.drive_c64_ref = self.drive.catch_up_to(target, self.drive_c64_ref);
         let pb_out = self.drive.via1_pb_iec_output();
-        self.iec.drive_store_pb(pb_out);
+        self.iec.drive_set_data_no_fold(pb_out);
     }
 
     /// I/O read dispatch ($D000-$DFFF, IO config). Mirrors memory-bus.ts read().
@@ -274,11 +294,14 @@ impl<'a> FullBus<'a> {
                         self.cia2_pa_out = new_out;
                         self.side_effects.push((0xdd00, new_out, old));
                         // IEC: drive the wired-AND bus from the new CIA2 PA output.
-                        // VICE iecbus_cpu_write_conf1 order: push-flush drive to the
-                        // write instant FIRST, then iec_update_cpu_bus(~PA), ATN edge
-                        // → drive VIA1 CA1, recompute drv_bus[8], update ports. The
+                        // VICE iecbus_cpu_write_conf1 order: execute_one(drive catch-up)
+                        // to the write instant FIRST, then iec_update_cpu_bus(~PA), ATN
+                        // edge → drive VIA1 CA1, recompute drv_bus[8], update ports — a
+                        // SINGLE fold against the NEW cpu_bus. We catch the drive up and
+                        // refresh drv_data_8 from its live PB (no fold here), then let
+                        // `c64_store_dd00` perform that one authoritative fold. The
                         // write instant is maincpu_clk + 1 (x64sc write_offset=0).
-                        self.iec_push_flush_to(self.clk + 1);
+                        self.iec_catch_up_to(self.clk + 1);
                         let atn_edge = self.iec.c64_store_dd00((!new_out) & 0xff);
                         // ATN-edge → drive VIA1 CA1: the C64 driving ATN raises the
                         // drive's attention IRQ (DOS $FE67 → $E85B). VICE

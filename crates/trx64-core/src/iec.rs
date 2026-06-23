@@ -133,6 +133,23 @@ impl IecCore {
         self.update_ports();
     }
 
+    /// Refresh `drv_data_8` from the drive's CURRENT VIA1 PB output WITHOUT folding
+    /// the wired-AND bus or updating ports. Used on the C64 $DD00 WRITE path: in
+    /// TRX64 the drive's VIA1 is separate from the shared IEC core, so the catch-up
+    /// run's `$1800` stores never propagate `drv_data_8` here — we must re-read it
+    /// so the upcoming `c64_store_dd00` recompute folds against the LIVE drive pull.
+    /// But unlike `drive_store_pb`, this does NOT itself recompute_drv_bus /
+    /// update_ports against the OLD (pre-write) cpu_bus — that extra stale fold can
+    /// publish a transient/wrong CLK or DATA the C64's tight $04E2 BIT $DD00 / BVC
+    /// loop latches, wedging the handshake. VICE `iecbus_cpu_write_conf1` performs a
+    /// SINGLE fold (drv_bus recompute → update_ports) AFTER `iec_update_cpu_bus`,
+    /// against the NEW cpu_bus only. `c64_store_dd00` reproduces exactly that single
+    /// fold, so we leave the fold to it.
+    #[inline]
+    pub fn drive_set_data_no_fold(&mut self, pb_out: u8) {
+        self.drv_data_8 = (!pb_out) & 0xff;
+    }
+
     /// C64 stores $DD00 PA (= iecbus_cpu_write_conf1). `data` = INVERTED PA byte.
     /// Returns `Some(atn_high)` when the ATN line edge flipped (for VIA1 CA1
     /// signalling); `None` if ATN unchanged. Mutation order matches VICE:

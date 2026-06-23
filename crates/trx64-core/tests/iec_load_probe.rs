@@ -827,3 +827,307 @@ fn ae_progress_probe() {
         first_move
     );
 }
+
+/// H1 probe — the post-RUN custom $DD00 bit-bang loader bar fill.
+///
+/// Replicates the post-LOAD RUN scenario: mount-before-boot, 2M+2M boot, type
+/// `LOAD"*",8,1\r`, run to let the loader load, then type `RUN\r` and run while
+/// sampling the loader-progress bar at $05FD. On the real machine (and the c64re
+/// reference) the bar climbs past its post-LOAD ~$20 as the custom loader pulls
+/// bytes over $DD00. The bug: a mutual stuck-value handshake deadlock — the C64
+/// spins `$04E2 BIT $DD00 / BVC $04E2` reading a constant $8A (CLK_in=0 forever)
+/// while the drive spins `$0402-$0408` and never asserts CLK. The bar never moves.
+///
+/// This test reports: $05FD over time, whether the C64 PC ever escapes the $04E2
+/// spin, and whether the drive PC ever escapes the $0402 spin. Used to validate
+/// H1 (the write-path extra-refold fix).
+#[test]
+#[ignore = "H1 $DD00 loader bar-fill probe; run explicitly with --ignored"]
+fn dd00_loader_bar_probe() {
+    if !roms_present() {
+        eprintln!("skip: ROMs absent");
+        return;
+    }
+    let d64 = match std::fs::read(SAMPLE) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("skip: sample disk absent");
+            return;
+        }
+    };
+    let mut m = Machine::new();
+    m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+    m.drive8.attach_disk(DiskImage {
+        kind: DiskKind::D64,
+        bytes: d64.clone(),
+        backing_path: Some(SAMPLE.to_string()),
+        read_only: false,
+    });
+    let mut sink = NullSink;
+    // boot-1 + boot-2 (2M + 2M).
+    m.run_for_full(2_000_000, &mut sink, |_, _, _, _, _, _, _| {});
+    m.run_for_full(2_000_000, &mut sink, |_, _, _, _, _, _, _| {});
+    // type-load: LOAD"*",8,1\r with corpus hold/gap = 80000.
+    m.keyboard
+        .type_text(m.cpu6510.clk, "LOAD\"*\",8,1\r", 80_000, 80_000);
+
+    // Run the KERNAL LOAD to completion (it deposits the loader stub). Generous
+    // budget: the directory/file load takes ~10M cycles.
+    for _ in 0..12 {
+        m.run_for_full(2_000_000, &mut sink, |_, _, _, _, _, _, _| {});
+    }
+    let st_after_load = m.read_full(0x0090);
+    let bar_after_load = m.read_full(0x05FD);
+    let txttab = m.read_full(0x002B) as u16 | ((m.read_full(0x002C) as u16) << 8);
+    let vartab = m.read_full(0x002D) as u16 | ((m.read_full(0x002E) as u16) << 8);
+    eprintln!(
+        "post-LOAD: ST=${:02X} bar($05FD)=${:02X} TXTTAB=${:04X} VARTAB=${:04X} c64clk={}",
+        st_after_load, bar_after_load, txttab, vartab, m.cpu6510.clk
+    );
+
+    // Type RUN\r to start the loaded program (the custom $DD00 loader).
+    m.keyboard.type_text(m.cpu6510.clk, "RUN\r", 80_000, 80_000);
+
+    // Run while sampling the bar + spin escapes.
+    let mut max_bar = bar_after_load;
+    let mut bar_samples: Vec<(u64, u8)> = Vec::new();
+    let mut last_bar = bar_after_load;
+    let mut steps = 0u64;
+    let max_steps = 30_000_000u64;
+    // Drive PC histogram in the post-RUN window; count cycles in vs out of the
+    // $0402-$0408 deadlock spin to distinguish a true fill from a stuck loop.
+    use std::collections::HashMap;
+    let mut drive_pc_hist: HashMap<u16, u64> = HashMap::new();
+    let mut c64_pc_hist: HashMap<u16, u64> = HashMap::new();
+    let mut drive_in_spin = 0u64;
+    let mut drive_out_spin = 0u64;
+    // Track time since RUN typed for window framing.
+    let run_clk = m.cpu6510.clk;
+    let chunk = 5_000u64;
+    while steps < max_steps {
+        m.run_for_full(chunk, &mut sink, |pc, _, _, _, _, _, _| {
+            *drive_pc_hist.entry(pc).or_insert(0) += 1;
+            if (0x0402..=0x0408).contains(&pc) {
+                drive_in_spin += 1;
+            } else {
+                drive_out_spin += 1;
+            }
+        });
+        steps += chunk;
+        let pc = m.cpu6510.reg_pc;
+        *c64_pc_hist.entry(pc).or_insert(0) += 1;
+        let bar = m.read_full(0x05FD);
+        if bar != last_bar {
+            bar_samples.push((m.cpu6510.clk - run_clk, bar));
+            last_bar = bar;
+        }
+        // A genuine fill is a smooth climb (bar in a small ascending range),
+        // NOT a single jump to $FF (the stuck/garbage value). Track the max
+        // sane bar value (anything < $F0; the real bar fills $20..~$50).
+        if bar > max_bar && bar < 0xF0 {
+            max_bar = bar;
+        }
+        // Stop early once the bar has clearly + smoothly climbed (success).
+        if max_bar > bar_after_load.wrapping_add(8) && bar_samples.len() > 6 {
+            eprintln!("bar climbing — early stop");
+            break;
+        }
+    }
+    let drive_total = drive_in_spin + drive_out_spin;
+    let spin_pct = if drive_total > 0 {
+        100.0 * drive_in_spin as f64 / drive_total as f64
+    } else {
+        0.0
+    };
+
+    eprintln!("== H1 $DD00 loader bar-fill probe ==");
+    eprintln!(
+        "post-LOAD bar=${:02X}  MAX bar=${:02X}  delta={}",
+        bar_after_load,
+        max_bar,
+        max_bar.wrapping_sub(bar_after_load)
+    );
+    eprintln!("bar changes (clk-since-RUN, bar): {:02X?}", bar_samples);
+    eprintln!(
+        "drive in $0402-$0408 spin: {} cyc ({:.1}%)  out: {} cyc",
+        drive_in_spin, spin_pct, drive_out_spin
+    );
+    eprintln!(
+        "final: c64_pc=${:04X} drv_pc(top)  cpu_port=${:02X} drv_port=${:02X} drvPB=${:02X}",
+        m.cpu6510.reg_pc,
+        m.iec.cpu_port,
+        m.iec.drv_port,
+        m.drive8.via1_pb_iec_output()
+    );
+    let mut dtop: Vec<_> = drive_pc_hist.iter().collect();
+    dtop.sort_by(|a, b| b.1.cmp(a.1));
+    eprintln!("== top drive PCs post-RUN ==");
+    for (pc, n) in dtop.iter().take(12) {
+        eprintln!("  ${:04X}: {}", pc, n);
+    }
+    let mut ctop: Vec<_> = c64_pc_hist.iter().collect();
+    ctop.sort_by(|a, b| b.1.cmp(a.1));
+    eprintln!("== top C64 boundary PCs post-RUN ==");
+    for (pc, n) in ctop.iter().take(12) {
+        eprintln!("  ${:04X}: {}", pc, n);
+    }
+    // The H1 success criterion: the bar climbs smoothly past post-LOAD AND the
+    // drive spends meaningful time OUT of the $0402-$0408 deadlock spin.
+    if max_bar > bar_after_load.wrapping_add(4) && spin_pct < 90.0 {
+        eprintln!("RESULT: BAR CLIMBED + drive escaped — H1 candidate WORKS");
+    } else {
+        eprintln!(
+            "RESULT: BAR STUCK (max=${:02X}, drive {:.0}% in spin) — deadlock persists",
+            max_bar, spin_pct
+        );
+    }
+}
+
+/// H3 decode probe — disassemble + decode the deadlocked post-RUN custom loader
+/// on BOTH sides, with the live drive X/A register at the $0402-$0408 spin, so we
+/// can identify exactly which VIA bit the drive polls and what TRX64 presents.
+///
+/// Drives the same post-LOAD → RUN scenario, runs into the stall, then dumps:
+///   - the drive loader code bytes at $0400-$0420 (the $0402-$0408 spin),
+///   - the live drive A/X/Y at the spin (captured at the last $0402 hit),
+///   - the drive zero-page pointers it dereferences ($11/$12, $3B/$3C),
+///   - the C64 loader code bytes at $04E0-$04F0 (the $04E2 BIT $DD00 / BVC spin),
+///   - the live IEC line state: C64 cpu_port (what $DD00 reads), drive drv_port +
+///     drive VIA1 PB output, and the decoded CLK/DATA/ATN levels both sides see.
+#[test]
+#[ignore = "H3 deadlock decode probe; run explicitly with --ignored"]
+fn dd00_loader_decode_probe() {
+    if !roms_present() {
+        eprintln!("skip: ROMs absent");
+        return;
+    }
+    let d64 = match std::fs::read(SAMPLE) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("skip: sample disk absent");
+            return;
+        }
+    };
+    let mut m = Machine::new();
+    m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+    m.drive8.attach_disk(DiskImage {
+        kind: DiskKind::D64,
+        bytes: d64.clone(),
+        backing_path: Some(SAMPLE.to_string()),
+        read_only: false,
+    });
+    let mut sink = NullSink;
+    m.run_for_full(2_000_000, &mut sink, |_, _, _, _, _, _, _| {});
+    m.run_for_full(2_000_000, &mut sink, |_, _, _, _, _, _, _| {});
+    m.keyboard
+        .type_text(m.cpu6510.clk, "LOAD\"*\",8,1\r", 80_000, 80_000);
+    for _ in 0..12 {
+        m.run_for_full(2_000_000, &mut sink, |_, _, _, _, _, _, _| {});
+    }
+    m.keyboard.type_text(m.cpu6510.clk, "RUN\r", 80_000, 80_000);
+
+    // Run into the stall, capturing the live drive A/X/Y the last time the drive
+    // PC is in the $0402-$0408 spin, plus the C64 cpu_port history at $DD00.
+    let mut spin_a = 0u8;
+    let mut spin_x = 0u8;
+    let mut spin_y = 0u8;
+    let mut spin_pc = 0u16;
+    // Count how many distinct A values the drive's `LDA ($11,X)` ($1CF0=VIA2 PRB)
+    // produces while spinning, and whether VIA2 PRB bit7 (SYNC) ever clears.
+    let mut drive_escapes_0408 = 0u64; // $0408 -> $040A (bit7 clear)
+    let mut prev_dpc = 0u16;
+    let mut sync_clear_seen = false;
+    let mut steps = 0u64;
+    let max_steps = 16_000_000u64;
+    let chunk = 50_000u64;
+    while steps < max_steps {
+        m.run_for_full(chunk, &mut sink, |pc, a, x, y, _, _, _| {
+            if (0x0402..=0x0408).contains(&pc) {
+                spin_pc = pc;
+                spin_a = a;
+                spin_x = x;
+                spin_y = y;
+                // At $0408 (BMI), A holds VIA2 PRB; bit7 clear => byte/sync ready.
+                if pc == 0x0408 && a & 0x80 == 0 {
+                    sync_clear_seen = true;
+                }
+            }
+            // $0408 -> $040A means BMI fell through (escaped the read spin).
+            if prev_dpc == 0x0408 && pc == 0x040A {
+                drive_escapes_0408 += 1;
+            }
+            prev_dpc = pc;
+        });
+        steps += chunk;
+        // Stop once we are deep into the stall (C64 pinned at the BVC spin).
+        if steps > 8_000_000 && (0x04E2..=0x04E5).contains(&m.cpu6510.reg_pc) {
+            break;
+        }
+    }
+
+    eprintln!("== H3 deadlock decode probe ==");
+    eprintln!(
+        "C64 stall PC=${:04X}   drive spin PC=${:04X} A=${:02X} X=${:02X} Y=${:02X}",
+        m.cpu6510.reg_pc, spin_pc, spin_a, spin_x, spin_y
+    );
+    eprintln!(
+        "drive escaped $0408->$040A (byte ready): {} times  |  VIA2 PRB bit7(SYNC) ever clear: {}",
+        drive_escapes_0408, sync_clear_seen
+    );
+    // Drive loader bytes $0400-$0420.
+    let drv_code: Vec<u8> = (0x0400..0x0420).map(|a| m.drive8.drive_ram_read(a)).collect();
+    eprintln!("drive $0400-$041F: {:02X?}", drv_code);
+    // Drive ZP pointers the loop dereferences.
+    let dr = |a: u16| m.drive8.drive_ram_read(a);
+    eprintln!(
+        "drive ZP: $11/$12=${:02X}{:02X}  $3B/$3C=${:02X}{:02X}  $00..$0F={:02X?}",
+        dr(0x12), dr(0x11), dr(0x3C), dr(0x3B),
+        (0x00..0x10).map(dr).collect::<Vec<_>>()
+    );
+    // With X=$FE the (zp,X) indexing wraps: ($3B,X)->ZP[$39], ($11,X)->ZP[$0F].
+    let x = spin_x;
+    let z1 = (0x3Bu8.wrapping_add(x)) as u16; // ($3B,X) base
+    let z2 = (0x11u8.wrapping_add(x)) as u16; // ($11,X) base
+    let p1 = dr(z1) as u16 | ((dr(z1 + 1) as u16) << 8);
+    let p2 = dr(z2) as u16 | ((dr(z2 + 1) as u16) << 8);
+    eprintln!(
+        "indexed: ($3B,X)->ZP[${:02X}/{:02X}]=>${:04X}  ($11,X)->ZP[${:02X}/{:02X}]=>${:04X}",
+        z1, z1 + 1, p1, z2, z2 + 1, p2
+    );
+    eprintln!(
+        "  *($3B,X)=${:04X} -> ${:02X}   *($11,X)=${:04X} -> ${:02X}  (BMI tests bit7 of the latter)",
+        p1, dr(p1), p2, dr(p2)
+    );
+    // Drive VIA1 ($1800) regs — what the drive's loop actually reads for CLK/DATA.
+    eprintln!(
+        "drive VIA1 PB-out=${:02X}  iec.drv_port=${:02X}  iec.drv_data_8=${:02X}  iec.drv_bus_8=${:02X}",
+        m.drive8.via1_pb_iec_output(), m.iec.drv_port, m.iec.drv_data_8, m.iec.drv_bus_8
+    );
+    // C64 loader bytes $04E0-$04F0 (the BIT $DD00 / BVC spin).
+    let c64_code: Vec<u8> = (0x04E0..0x04F0).map(|a| m.read_full(a)).collect();
+    eprintln!("C64 $04E0-$04EF: {:02X?}", c64_code);
+    // Live IEC line decode. cpu_port bit6=CLK, bit7=DATA (the C64 reads at $DD00
+    // bits 6/7). drv_port bit0=DATA_IN, bit2=CLK_IN, bit7=ATN.
+    let cp = m.iec.cpu_port;
+    let dp = m.iec.drv_port;
+    let cb = m.iec.cpu_bus;
+    eprintln!(
+        "IEC: cpu_port=${:02X} [CLK_in(b6)={} DATA_in(b7)={}]  cpu_bus=${:02X} [ATN(b4)={} CLK_out(b6)={} DATA_out(b7)={}]",
+        cp,
+        if cp & 0x40 != 0 { 1 } else { 0 },
+        if cp & 0x80 != 0 { 1 } else { 0 },
+        cb,
+        if cb & 0x10 != 0 { 1 } else { 0 },
+        if cb & 0x40 != 0 { 1 } else { 0 },
+        if cb & 0x80 != 0 { 1 } else { 0 },
+    );
+    eprintln!(
+        "IEC: drv_port=${:02X} [DATA_in(b0)={} CLK_in(b2)={} ATN(b7)={}]",
+        dp,
+        if dp & 0x01 != 0 { 1 } else { 0 },
+        if dp & 0x04 != 0 { 1 } else { 0 },
+        if dp & 0x80 != 0 { 1 } else { 0 },
+    );
+    // What the C64 actually reads at $DD00 right now (raw byte).
+    eprintln!("C64 $DD00 read = ${:02X}  bar $05FD=${:02X}", m.read_full(0xDD00), m.read_full(0x05FD));
+}
