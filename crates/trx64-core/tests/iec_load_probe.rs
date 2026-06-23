@@ -63,7 +63,7 @@ fn iec_load_probe() {
     m.run_for_full(500_000, &mut sink, |_, _, _, _, _, _, _| {});
 
     // Inject LOAD"*",8 + RETURN  →  L O A D " * " , 8 RETURN
-    inject_keys(&mut m, b"LOAD\"*\",8\r");
+    inject_keys(&mut m, b"LOAD\"$\",8\r");
 
     // Run with instrumentation. Sample at instruction boundaries via a PC
     // histogram of the most-visited PCs, plus the IEC line snapshot.
@@ -156,7 +156,7 @@ fn iec_load_trace() {
         read_only: false,
     });
     m.run_for_full(500_000, &mut sink, |_, _, _, _, _, _, _| {});
-    inject_keys(&mut m, b"LOAD\"*\",8\r");
+    inject_keys(&mut m, b"LOAD\"$\",8\r");
 
     // Step one instruction at a time. Log transitions of the C64 PC region of
     // interest + IEC lines + drive PC. Stop after a bounded number of logged
@@ -235,7 +235,7 @@ fn iec_drive_talk_trace() {
         read_only: false,
     });
     m.run_for_full(500_000, &mut sink, |_, _, _, _, _, _, _| {});
-    inject_keys(&mut m, b"LOAD\"*\",8\r");
+    inject_keys(&mut m, b"LOAD\"$\",8\r");
 
     // Run up to ~clk where TALK is sent (~+540k from here), capturing every
     // distinct drive PC after the C64 reaches $ED09 (TALK). We log distinct
@@ -314,7 +314,7 @@ fn iec_drive_send_reached() {
         read_only: false,
     });
     m.run_for_full(500_000, &mut sink, |_, _, _, _, _, _, _| {});
-    inject_keys(&mut m, b"LOAD\"*\",8\r");
+    inject_keys(&mut m, b"LOAD\"$\",8\r");
 
     let mut send_hits = 0u64; // drive in $E909-$E999
     let mut sendloop_hits = 0u64; // drive in $E95C-$E985 (bit loop)
@@ -349,6 +349,150 @@ fn iec_drive_send_reached() {
     );
 }
 
+/// Track forward LOAD progress: watch the C64 store-pointer ($AE/$AF) advance as
+/// directory bytes land, find the LAST advance (where progress stalls), and dump
+/// the exact line state + both PCs at the stall. Pinpoints the deadlocking byte.
+#[test]
+#[ignore = "diagnostic probe for the IEC/GCR LOAD path; run explicitly with --ignored"]
+fn iec_load_stall_point() {
+    if !roms_present() {
+        eprintln!("skip: ROMs absent");
+        return;
+    }
+    let d64 = match std::fs::read(SAMPLE) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("skip: sample disk absent");
+            return;
+        }
+    };
+    let mut m = Machine::new();
+    m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+    let mut sink = NullSink;
+    m.run_for_full(2_500_000, &mut sink, |_, _, _, _, _, _, _| {});
+    m.drive8.attach_disk(DiskImage {
+        kind: DiskKind::D64,
+        bytes: d64.clone(),
+        backing_path: Some(SAMPLE.to_string()),
+        read_only: false,
+    });
+    m.run_for_full(500_000, &mut sink, |_, _, _, _, _, _, _| {});
+    inject_keys(&mut m, b"LOAD\"$\",8\r");
+
+    // Watch the C64 LOAD store-pointer $AE/$AF (LDTND/EAL — the address the LOAD
+    // routine writes each received byte to). Track its max + the clk of the last
+    // advance. Also count bytes received via ACPTR ($EE13 entries).
+    let mut last_ptr = 0u16;
+    let mut max_ptr = 0u16;
+    let mut last_advance_clk = 0u64;
+    let mut acptr_entries = 0u64;
+    let mut prev_pc = 0u16;
+    let mut steps = 0u64;
+    let max_steps = 20_000_000u64;
+    let mut last_drive_pc = 0u16;
+    // Ring of distinct-consecutive drive PCs around the stall.
+    // (drv_pc, clk, c64_pc, cpu_port, drv_port)
+    let mut ring: Vec<(u16, u64, u16, u8, u8)> = Vec::new();
+    // Count drive ATN-service ($E85B) and ATN-IRQ ($FE7A) entries, bucketed
+    // before vs after the stall onset (~5.0M).
+    let mut e85b_before = 0u64;
+    let mut e85b_after = 0u64;
+    let mut fe7a_before = 0u64;
+    let mut fe7a_after = 0u64;
+    let mut prev_dpc = 0u16;
+    // $E999 = send-abort to idle. $E992 = got-next-byte (continue). The single
+    // $E999 hit marks the cycle the drive falsely aborts the directory talk-send.
+    let mut e999_clks: Vec<u64> = Vec::new();
+    let mut last_e992_clk = 0u64;
+    while steps < max_steps {
+        let before = m.cpu6510.clk < 4_960_000;
+        let mut hit_e999 = false;
+        let mut hit_e992 = false;
+        m.run_for_full(1, &mut sink, |pc, _, _, _, _, _, _| {
+            last_drive_pc = pc;
+            if pc == 0xE85B && prev_dpc != 0xE85B {
+                if before { e85b_before += 1 } else { e85b_after += 1 }
+            }
+            if pc == 0xFE7A && prev_dpc != 0xFE7A {
+                if before { fe7a_before += 1 } else { fe7a_after += 1 }
+            }
+            if pc == 0xE999 { hit_e999 = true; }
+            if pc == 0xE992 { hit_e992 = true; }
+            prev_dpc = pc;
+        });
+        steps += 1;
+        if hit_e999 {
+            e999_clks.push(m.cpu6510.clk);
+        }
+        if hit_e992 {
+            last_e992_clk = m.cpu6510.clk;
+        }
+        let pc = m.cpu6510.reg_pc;
+        if pc == 0xEE13 && prev_pc != 0xEE13 {
+            acptr_entries += 1;
+        }
+        prev_pc = pc;
+        // Fixed window around the abort (clk 4945507).
+        if m.cpu6510.clk > 4_944_500 && m.cpu6510.clk < 4_946_500
+            && ring.last().map(|x| x.0) != Some(last_drive_pc) {
+            ring.push((last_drive_pc, m.cpu6510.clk, m.cpu6510.reg_pc, m.iec.cpu_port, m.iec.drv_port));
+        }
+        // Progress metric = bytes received via ACPTR. Record clk of last new byte.
+        if acptr_entries != last_ptr as u64 {
+            last_advance_clk = m.cpu6510.clk;
+            last_ptr = acptr_entries as u16;
+            max_ptr = acptr_entries as u16;
+        }
+        // Stop when we've gone 3M cycles past the last received byte (stalled).
+        if last_advance_clk != 0 && m.cpu6510.clk - last_advance_clk > 3_000_000 {
+            break;
+        }
+    }
+    eprintln!(
+        "ATN-service $E85B: before={} after={}  | ATN-IRQ $FE7A: before={} after={}",
+        e85b_before, e85b_after, fe7a_before, fe7a_after
+    );
+    eprintln!(
+        "send-abort $E999 count={} first_few={:?} last_continue $E992@clk={}",
+        e999_clks.len(),
+        e999_clks.iter().take(5).collect::<Vec<_>>(),
+        last_e992_clk
+    );
+    eprintln!("== drive PC trail around stall (drv@clk c64=.. cp=.. dp=..) ==");
+    for (pc, c, c64, cp, dp) in ring.iter() {
+        eprintln!("  drv={:04X}@{} c64={:04X} cp={:02X} dp={:02X}", pc, c, c64, cp, dp);
+    }
+    eprintln!(
+        "max store-ptr $AE/$AF=${:04X} last-advance@clk={} acptr_entries={} stall_clk={}",
+        max_ptr, last_advance_clk, acptr_entries, m.cpu6510.clk
+    );
+    eprintln!(
+        "STALL state: c64_pc=${:04X} drv_pc=${:04X} cpu_port={:02X} drv_port={:02X} drvPB={:02X} ST=${:02X}",
+        m.cpu6510.reg_pc, last_drive_pc, m.iec.cpu_port, m.iec.drv_port,
+        m.drive8.via1_pb_iec_output(), m.read_full(0x0090)
+    );
+    eprintln!(
+        "bytes landed @ $0801..$0830: {:02X?}",
+        (0x0801..0x0830).map(|a| m.read_full(a)).collect::<Vec<_>>()
+    );
+    // Drive-side serial state: talk/listen flags + channel/buffer status.
+    let dr = |a: u16| m.drive8.drive_ram_read(a);
+    eprintln!(
+        "drive flags: $79(listen)={:02X} $7A(talk)={:02X} $7C(atn-svc)={:02X} $7D={:02X} $82(chan)={:02X} $83={:02X} $84={:02X} $F8={:02X}",
+        dr(0x79), dr(0x7A), dr(0x7C), dr(0x7D), dr(0x82), dr(0x83), dr(0x84), dr(0xF8)
+    );
+    eprintln!(
+        "drive chan status $F2..$F9: {:02X?}  buffers $00..$0E: {:02X?}",
+        (0xF2..0xFA).map(dr).collect::<Vec<_>>(),
+        (0x00..0x0F).map(dr).collect::<Vec<_>>()
+    );
+    // VIA1 (IEC) regs: PB output ($1800), DDR, PCR/IFR/IER for CA1(ATN) state.
+    eprintln!(
+        "drive VIA1: PB-out={:02X} drv_port-in(via_iec_tmp)={:02X}",
+        m.drive8.via1_pb_iec_output(), m.iec.drv_port
+    );
+}
+
 /// Profile the drive during the "lost" window (after the C64 sends TALK, while
 /// it waits ~7M cycles for the drive to start sending). Buckets drive PCs by
 /// 256-byte page to see where the drive spends the 7M cycles.
@@ -377,7 +521,7 @@ fn iec_drive_lost_window() {
         read_only: false,
     });
     m.run_for_full(500_000, &mut sink, |_, _, _, _, _, _, _| {});
-    inject_keys(&mut m, b"LOAD\"*\",8\r");
+    inject_keys(&mut m, b"LOAD\"$\",8\r");
 
     use std::collections::HashMap;
     let mut page_counts: HashMap<u16, u64> = HashMap::new();
