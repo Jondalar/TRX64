@@ -28,7 +28,7 @@
     "iec-crossdomain-sync (STANDARD LOAD complete)"
   ],
   "note": "vic-sprites-modes [opus]: render hardware sprites (pos/color/multicolor/priority/X-Y-expand) + gate the non-text VIC modes (multicolor-text/ECM/standard+multicolor bitmap, XSCROLL/YSCROLL fine-scroll) that vic-render implemented-but-didnt-gate. Pixel-parity via the render harness (capture.mjs/png.mjs). NOTE: phase-lead still ESCALATED to user (a/b/c).",
-  "updated": "2026-06-23T09:04:00Z",
+  "updated": "2026-06-23T09:34:00Z",
   "followups": [
     "daemon-trace-query",
     "cia-cascade",
@@ -38,8 +38,8 @@
   "in_flight": {
     "item": "vic-sprites-modes",
     "model": "opus",
-    "started": "2026-06-23T09:04:00Z",
-    "note": "opus alive 30min: render.rs/lib/daemon (sprite pipeline) + render scenarios edited ~5min ago. No green commit yet — building full sprite pipeline + multi-mode pixel tests. Defer."
+    "started": "2026-06-23T09:34:00Z",
+    "note": "opus alive: 2 green commits (sprites pixel-exact + fine-scroll/border). Tree clean, render.rs idle ~11min — running mode gates or wrapping up. Defer."
   },
   "stage2_items": [],
   "resolved": [
