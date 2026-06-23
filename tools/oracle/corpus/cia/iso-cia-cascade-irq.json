@@ -1,0 +1,14 @@
+{
+  "name": "iso-cia-cascade-irq",
+  "slice": "cia",
+  "trace": true,
+  "steps": [
+    { "method": "session/create", "params": { "pal": true }, "capture": true, "label": "create" },
+    { "method": "monitor/exec", "params": { "session_id": "$sessionId", "command": "wr 0800 78 A9 83 8D 0D DC A9 03 8D 04 DC A9 00 8D 05 DC A9 02 8D 06 DC A9 00 8D 07 DC A9 11 8D 0E DC A9 51 8D 0F DC EA EA EA EA EA EA EA EA AD 06 DC 8D 00 02 AD 07 DC 8D 01 02 AD 0D DC 8D 02 02 EA EA EA EA EA EA EA EA AD 06 DC 8D 03 02 AD 07 DC 8D 04 02 AD 0D DC 8D 05 02 EA EA EA EA EA EA EA EA AD 06 DC 8D 06 02 AD 0F DC 8D 07 02 AD 0D DC 8D 08 02 4C 72 08" }, "capture": true, "label": "inject" },
+    { "method": "monitor/exec", "params": { "session_id": "$sessionId", "command": "r pc=0800" }, "capture": true, "label": "setpc" },
+    { "method": "trace/start_domains", "params": { "session_id": "$sessionId", "domains": ["c64-cpu", "memory"] }, "capture": true, "label": "trace-start" },
+    { "method": "session/run", "params": { "session_id": "$sessionId", "cycles": 2000 }, "capture": true, "label": "run" },
+    { "method": "trace/run/stop", "params": { "session_id": "$sessionId", "wait_index": true }, "label": "trace-stop" },
+    { "method": "trace/run/status", "params": { "session_id": "$sessionId" }, "capture": true, "label": "trace-status" }
+  ]
+}

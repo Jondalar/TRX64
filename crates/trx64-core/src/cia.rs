@@ -70,6 +70,9 @@ pub const CIA_IM_FLG: u8 = 0x10;
 /// Size of the CIA timer transition table (8192 states × 2).
 pub const CIAT_TABLEN: usize = 2 << 13; // 16384
 
+/// VICE CLOCK_MAX / Spec-743 monotonic "never fires" alarm sentinel.
+pub const CLOCK_NEVER: u64 = u64::MAX;
+
 /// Shared, immutable CIA timer transition table. Built once, shared by every
 /// `Cia` via an `Arc` so Machine clones (Phase-2 COW forks) stay cheap.
 pub type CiaTable = std::sync::Arc<[u16; CIAT_TABLEN]>;
@@ -271,6 +274,75 @@ impl Ciat {
         }
     }
 
+    /// VICE ciat_set_alarm (ciatimer.h:155-228) — predict the EXACT clock of the
+    /// next underflow without mutating timer state. Returns the absolute clk of the
+    /// next underflow, or `CLOCK_NEVER` (u64::MAX) when the timer is stopped / will
+    /// never fire. Walks local copies of (aclk, cnt, t) using the shared transition
+    /// table, so the prediction is cycle-exact (port of ciat.ts `setAlarm`).
+    pub fn set_alarm(&self, tab: &[u16; CIAT_TABLEN]) -> u64 {
+        let mut aclk: u64 = self.clk;
+        let mut cnt: u16 = self.cnt;
+        let mut t: u16 = self.state;
+
+        loop {
+            // Warp counting (ciatimer.h:168-179): pipeline settled ⇒ underflow at
+            // aclk + cnt.
+            if (t
+                & (CIAT_CR_START
+                    | CIAT_CR_FLOAD
+                    | CIAT_LOAD1
+                    | CIAT_PHI2IN
+                    | CIAT_COUNT2
+                    | CIAT_COUNT3
+                    | CIAT_COUNT
+                    | CIAT_LOAD))
+                == (CIAT_CR_START | CIAT_PHI2IN | CIAT_COUNT2 | CIAT_COUNT3 | CIAT_COUNT)
+                && (((t & CIAT_CR_ONESHOT) != 0
+                    && (t & CIAT_ONESHOT0) != 0
+                    && (t & CIAT_ONESHOT) != 0)
+                    || ((t & CIAT_CR_ONESHOT) == 0
+                        && (t & CIAT_ONESHOT0) == 0
+                        && (t & CIAT_ONESHOT) == 0))
+            {
+                return aclk + cnt as u64;
+            }
+            // Warp stopped (ciatimer.h:181-188): nothing pending ⇒ never fires.
+            else if (t & (CIAT_COUNT2 | CIAT_COUNT3 | CIAT_COUNT)) == 0
+                && ((t & CIAT_CR_START) == 0 || (t & (CIAT_PHI2IN | CIAT_STEP)) == 0)
+                && (((t & CIAT_CR_ONESHOT) != 0
+                    && (t & CIAT_ONESHOT0) != 0
+                    && (t & CIAT_ONESHOT) != 0)
+                    || ((t & CIAT_CR_ONESHOT) == 0
+                        && (t & CIAT_ONESHOT0) == 0
+                        && (t & CIAT_ONESHOT) == 0))
+            {
+                return CLOCK_NEVER;
+            }
+            // Step one cycle (ciatimer.h:191-198).
+            else {
+                if cnt != 0 && (t & CIAT_COUNT3) != 0 {
+                    cnt = cnt.wrapping_sub(1);
+                }
+                t = tab[t as usize];
+                aclk += 1;
+            }
+
+            // Underflow (ciatimer.h:200-203).
+            if cnt == 0 && (t & CIAT_COUNT3) != 0 {
+                return aclk;
+            }
+            // Reload (ciatimer.h:205-207).
+            if (t & CIAT_LOAD) != 0 {
+                cnt = self.latch;
+                t &= !CIAT_COUNT3;
+            }
+            // Oneshot stop (ciatimer.h:209-212).
+            if (t & CIAT_OUT) != 0 && (t & (CIAT_ONESHOT | CIAT_ONESHOT0)) != 0 {
+                t &= !(CIAT_CR_START | CIAT_COUNT2);
+            }
+        }
+    }
+
     /// VICE ciat_set_latchhi.
     pub fn set_latch_hi(&mut self, byte: u8) {
         self.latch = (self.latch & 0xff) | ((byte as u16) << 8);
@@ -319,6 +391,11 @@ pub struct Cia {
     /// unlatches, so an in-progress read is coherent.
     pub tod_latched: bool,
     pub tod_latch: [u8; 4],
+    /// Cached "next underflow clk" for the TA / TB alarms (= VICE ta_alarmclk /
+    /// tb_alarmclk). `CLOCK_NEVER` when the timer is stopped / will never fire.
+    /// Drives the lazy alarm-dispatch cascade (TB counts TA underflows).
+    pub ta_alarmclk: u64,
+    pub tb_alarmclk: u64,
 }
 
 impl Default for Cia {
@@ -332,6 +409,8 @@ impl Default for Cia {
             tod_prescaler: 0,
             tod_latched: false,
             tod_latch: [0u8; 4],
+            ta_alarmclk: CLOCK_NEVER,
+            tb_alarmclk: CLOCK_NEVER,
         }
     }
 }
@@ -341,35 +420,99 @@ impl Cia {
         Self::default()
     }
 
-    /// VICE cia_update_ta/tb wrappers: run the timer to `rclk`, latch the ICR flag
-    /// on each underflow. The cascade (TB counting TA underflows) is handled by
-    /// feeding TA underflow count into TB via single_step before TB's own update.
-    fn update_ta(&mut self, rclk: u64, tab: &[u16; CIAT_TABLEN]) {
-        // When TB is in cascade mode (counts TA underflows), TA must be advanced
-        // cycle-by-cycle so each TA underflow can inject a single-step into TB at
-        // its exact clock — and this must hold no matter WHICH access drives the TA
-        // update (a $DC04 TA read, an ICR read, a TB read, …), so every TA underflow
-        // cascades. Outside cascade mode TA advances with warp counting (O(1)).
-        if self.tb_cascade() {
-            while self.ta.clk < rclk {
-                let c = self.ta.clk + 1;
-                let n_ta = self.ta.update(c, tab);
-                if n_ta > 0 {
-                    self.irqflags |= CIA_IM_TA;
-                    for _ in 0..n_ta {
-                        self.tb.single_step();
-                        let n_tb = self.tb.update(self.tb.clk + 1, tab);
-                        if n_tb > 0 {
-                            self.irqflags |= CIA_IM_TB;
-                        }
-                    }
-                }
-            }
-            return;
-        }
+    // ── Alarm-driven timer cascade (port of VICE ciacore.c) ────────────────────
+    //
+    // VICE drives the CIA from the maincpu alarm context: ta_alarm/tb_alarm fire
+    // at the EXACT predicted underflow clk (`ciat_set_alarm`), and the alarm
+    // callbacks reschedule themselves. Timer B's count-TA-underflow (cascade) mode
+    // is lazy: a TA underflow does not decrement TB on the spot — `ciacore_intta`
+    // sets TB's STEP bit (`ciaDoStepTb`/`ciat_single_step`), and TB only counts
+    // that step when its own `ciat_update` next advances at least one cycle. So
+    // intermediate TA underflows between TB-relevant updates collapse exactly the
+    // way VICE collapses them. The previous per-cycle model over/under-counted
+    // because it forced one TB cycle per TA underflow regardless of alignment.
+    //
+    // We replicate the alarm dispatch with `ta_alarmclk` as the driver: an update
+    // to `rclk` repeatedly fires the next pending TA underflow alarm (≤ rclk),
+    // each fire stepping TB, then settles TA/TB to `rclk`.
+
+    /// VICE ciat_set_alarm wrapper for TA — store predicted underflow clk + cache.
+    fn ciat_set_alarm_ta(&mut self, tab: &[u16; CIAT_TABLEN]) {
+        self.ta_alarmclk = self.ta.set_alarm(tab);
+    }
+
+    /// VICE ciat_set_alarm wrapper for TB.
+    fn ciat_set_alarm_tb(&mut self, tab: &[u16; CIAT_TABLEN]) {
+        self.tb_alarmclk = self.tb.set_alarm(tab);
+    }
+
+    /// VICE cia_do_update_ta (ciacore.c:250-258) — advance TA to rclk, latch IM_TA.
+    fn do_update_ta(&mut self, rclk: u64, tab: &[u16; CIAT_TABLEN]) {
         let n = self.ta.update(rclk, tab);
         if n > 0 {
             self.irqflags |= CIA_IM_TA;
+        }
+    }
+
+    /// VICE cia_do_update_tb (ciacore.c:260-275) — advance TB to rclk, latch IM_TB.
+    fn do_update_tb(&mut self, rclk: u64, tab: &[u16; CIAT_TABLEN]) {
+        let n = self.tb.update(rclk, tab);
+        if n > 0 {
+            self.irqflags |= CIA_IM_TB;
+        }
+    }
+
+    /// VICE cia_do_step_tb (ciacore.c:277-285) — set TB's STEP bit (cascade). The
+    /// decrement is realised lazily by the next `tb.update`.
+    fn do_step_tb(&mut self) {
+        self.tb.single_step();
+    }
+
+    /// VICE ciacore_intta (ciacore.c:1458-1515) — the TA underflow alarm callback.
+    /// Counts the TA underflow at `rclk`, reschedules the TA alarm, and (in cascade
+    /// mode) updates + single-steps TB at this exact clk.
+    fn intta(&mut self, rclk: u64, tab: &[u16; CIAT_TABLEN]) {
+        self.do_update_ta(rclk, tab);
+        // ciat_ack_alarm — the alarm just fired; recompute below.
+        self.ta_alarmclk = CLOCK_NEVER;
+
+        // Re-arm if TA is still running (continuous phi2). We always re-predict so
+        // the next underflow keeps driving the cascade (VICE's `need` includes
+        // CRB INMODE_TA). For the masked isolation gate TA runs continuously.
+        if self.ta.is_running() {
+            self.ciat_set_alarm_ta(tab);
+        }
+
+        // Cascade Timer B (count-TA-underflow mode): update TB to this clk (consuming
+        // any prior STEP), then set a fresh STEP for THIS underflow.
+        if self.tb_cascade() {
+            self.update_tb(rclk, tab);
+            self.do_step_tb();
+        }
+    }
+
+    /// VICE cia_update_ta (ciacore.c:291-315) — dispatch all TA underflow alarms up
+    /// to `rclk`, then settle TA to `rclk`.
+    fn update_ta(&mut self, rclk: u64, tab: &[u16; CIAT_TABLEN]) {
+        // Lazily arm the alarm if it was never predicted (e.g. fresh after a CRA
+        // start). A stopped timer yields CLOCK_NEVER and the loop is skipped.
+        if self.ta_alarmclk == CLOCK_NEVER && self.ta.is_running() {
+            self.ciat_set_alarm_ta(tab);
+        }
+        let mut last_tmp: u64 = CLOCK_NEVER;
+        while self.ta_alarmclk <= rclk && self.ta_alarmclk != CLOCK_NEVER {
+            let aclk = self.ta_alarmclk;
+            self.intta(aclk, tab);
+            last_tmp = aclk;
+            // Guard against a non-advancing prediction (defensive; VICE always
+            // reschedules strictly forward).
+            if self.ta_alarmclk == aclk {
+                self.ta_alarmclk = CLOCK_NEVER;
+                break;
+            }
+        }
+        if last_tmp != rclk {
+            self.do_update_ta(rclk, tab);
         }
     }
 
@@ -380,25 +523,20 @@ impl Cia {
             == (CIA_CRB_INMODE_TA | CIA_CR_START)
     }
 
+    /// VICE cia_update_tb (ciacore.c:317-344). In cascade mode TB is driven by TA
+    /// underflows, so we first run TA's alarm dispatch to `rclk`; TB then settles
+    /// to `rclk` consuming any STEP. Outside cascade, TB runs on its own phi2 alarm.
     fn update_tb(&mut self, rclk: u64, tab: &[u16; CIAT_TABLEN]) {
-        // In cascade mode TB is driven by TA underflows (handled inside update_ta),
-        // not phi2 — so advancing TA also cascades into TB. We then snap TB's own
-        // clk forward to rclk (no phi2 counting). Outside cascade, TB runs on phi2.
         if self.tb_cascade() {
             self.update_ta(rclk, tab);
-            if self.tb.clk < rclk {
-                self.tb.clk = rclk;
-            }
-            return;
         }
-        let n = self.tb.update(rclk, tab);
-        if n > 0 {
-            self.irqflags |= CIA_IM_TB;
-        }
+        // Settle TB to rclk. In cascade mode there is no TB phi2 alarm, so this just
+        // advances TB to rclk consuming a pending STEP into at most one decrement.
+        self.do_update_tb(rclk, tab);
     }
 
     /// Advance both timers to `rclk`. TA underflows cascade into TB automatically
-    /// inside update_ta when cascade mode is active; otherwise the two are
+    /// inside update_ta/update_tb when cascade mode is active; otherwise the two are
     /// independent. Idempotent: a timer already at rclk is untouched.
     fn update_both(&mut self, rclk: u64, tab: &[u16; CIAT_TABLEN]) {
         self.update_ta(rclk, tab);
@@ -469,18 +607,22 @@ impl Cia {
             CIA_TAL => {
                 self.update_ta(rclk, tab);
                 self.ta.set_latch_lo(value);
+                self.ciat_set_alarm_ta(tab);
             }
             CIA_TAH => {
                 self.update_ta(rclk, tab);
                 self.ta.set_latch_hi(value);
+                self.ciat_set_alarm_ta(tab);
             }
             CIA_TBL => {
                 self.update_tb(rclk, tab);
                 self.tb.set_latch_lo(value);
+                self.ciat_set_alarm_tb(tab);
             }
             CIA_TBH => {
                 self.update_tb(rclk, tab);
                 self.tb.set_latch_hi(value);
+                self.ciat_set_alarm_tb(tab);
             }
             CIA_TOD_TEN | CIA_TOD_SEC | CIA_TOD_MIN | CIA_TOD_HR => {
                 self.tod_store(a, value);
@@ -493,22 +635,31 @@ impl Cia {
                 } else {
                     self.regs[CIA_ICR] &= !(value & 0x1f);
                 }
+                // VICE re-arms both timer alarms when their mask bit is set.
+                self.ciat_set_alarm_ta(tab);
+                self.ciat_set_alarm_tb(tab);
             }
             CIA_CRA => {
                 self.update_ta(rclk, tab);
                 self.ta.set_ctrl(value);
                 // Bit4 (force load) is a strobe — not stored (regs keeps v & 0xef).
                 self.regs[CIA_CRA] = value & 0xef;
+                self.ciat_set_alarm_ta(tab);
             }
             CIA_CRB => {
+                // VICE CRB store updates TA first (cascade), then TB.
+                self.update_ta(rclk, tab);
                 self.update_tb(rclk, tab);
                 if value & CIA_CRB_INMODE_TA != 0 {
                     // Count-TA mode: TB step source is the STEP bit, not phi2.
                     self.tb.set_ctrl(value | 0x20);
+                    // Re-arm TA alarm so it drives the cascade.
+                    self.ciat_set_alarm_ta(tab);
                 } else {
                     self.tb.set_ctrl(value);
                 }
                 self.regs[CIA_CRB] = value & 0xef;
+                self.ciat_set_alarm_tb(tab);
             }
             _ => {
                 self.regs[a] = value;
@@ -619,6 +770,32 @@ mod tests {
         // Read the timer some cycles later — it must have counted down.
         let lo = c.read(0xdc04, 13, &t);
         assert!(lo < 0x10, "TA must count down from 0x10, got 0x{lo:02X}");
+    }
+
+    /// Cascade (ADR-017): TB in count-TA-underflow mode counts LAZILY — a
+    /// continuous TA (latch=3) underflowing every 4 cycles must NOT decrement TB on
+    /// every underflow if TB isn't sampled. Mirrors the iso-cia-cascade gate: with
+    /// TA latch=$0003, TB latch=$00FF, TB-lo sampled at the gate's exact clocks
+    /// (57 / 105 / 153) the byte-exact TS oracle returns $FB / $EF / $E3
+    /// (251 / 239 / 227). The old per-cycle model over-/under-counted here.
+    #[test]
+    fn cascade_tb_counts_ta_underflows_lazily() {
+        let t = tab();
+        let mut c = Cia::new();
+        // Match the gate's write clocks (write_offset 0). TA latch=$0003.
+        c.write(0xdc04, 0x03, 7, &t);
+        c.write(0xdc05, 0x00, 13, &t);
+        // TB latch=$00FF.
+        c.write(0xdc06, 0xff, 19, &t);
+        c.write(0xdc07, 0x00, 25, &t);
+        // CRA = FORCE_LOAD | START (continuous TA).
+        c.write(0xdc0e, CIA_CR_FORCE_LOAD | CIA_CR_START, 31, &t);
+        // CRB = FORCE_LOAD | INMODE_TA | START (continuous TB, count TA underflows).
+        c.write(0xdc0f, CIA_CR_FORCE_LOAD | CIA_CRB_INMODE_TA | CIA_CR_START, 37, &t);
+        // Sample TB-lo at the gate's read clocks. Lazy counting ⇒ 251 / 239 / 227.
+        assert_eq!(c.read(0xdc06, 57, &t), 0xfb, "TB-lo @clk57 must be $FB (251)");
+        assert_eq!(c.read(0xdc06, 105, &t), 0xef, "TB-lo @clk105 must be $EF (239)");
+        assert_eq!(c.read(0xdc06, 153, &t), 0xe3, "TB-lo @clk153 must be $E3 (227)");
     }
 
     #[test]
