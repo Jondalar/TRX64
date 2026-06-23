@@ -121,3 +121,54 @@ per-region histogram (BORDER / display top/middle/bottom third), and with
 `-diffmask-384x272.rgba` (raw RGBA, differing pixels white) for visual triage.
 
 > Env overrides: `SCRAMBLE_D64`, `C64RE_ROOT`, `TRX64_DAEMON_BIN`.
+
+### Result of the first run (2026-06-23) — RED, root-caused to the POST-RUN custom loader
+
+The `loaderbar` stage is **RED** (57124 / 104448 px differ). The two dumped
+framebuffers tell the story precisely:
+
+- **TS golden @ 30M post-RUN** — the full title screen: the multicolor-bitmap
+  "SCRAMBLE INFINITY" artwork, "Graphics 12", "v1.2", "Ready Joy 2".
+- **TRX64 @ 30M post-RUN** — the loader bar: "ENTERING SCRAMBLE SYSTEM" + an
+  **empty** progress bar on a grey screen. A sweep (`scramble-gold-probe.mjs`)
+  shows the TRX64 frame is **byte-identical from 30M to 120M post-RUN** — the
+  machine is FROZEN on the loader bar; the bar never fills.
+
+This is **NOT a renderer bug** (every render gate is GREEN, and the loader-bar
+frame itself renders pixel-clean) and **NOT a first-file load failure**: the
+`scramble-load-progress` $AE/$AF probe shows the **first file loads correctly on
+TRX64**, tracking the golden to within a handful of bytes (the known cycle-exact
+phase lead):
+
+| checkpoint | TS golden $AE/$AF | TRX64 $AE/$AF |
+|---|---|---|
+| end5 | $097F | $098C |
+| end6 | $0B1F | $0B1F |
+| end7 | $0CB3 | $0CBC |
+| end8 | $0E41 | $0E49 |
+
+The first file (loaded via the **KERNAL** serial routines) completes. The
+**title artwork is loaded AFTER `RUN` by the game's own custom $DD00 bit-bang
+loader** — and THAT is where TRX64 wedges. The custom loader paints its bar then
+makes no further progress, so the title never appears. This is the same
+underlying $DD00/drive timing the cycle-exact `scramble-load-progress` flags: the
+KERNAL tolerates the sub-byte phase skew, the tighter custom loop does not.
+
+**Fix target** (drive/IEC, NOT renderer): the post-RUN custom $DD00 loader's
+serial handshake/timing — localise the first divergent drive/IEC event with the
+trace tooling (`scramble-load-progress` + a drive-cpu trace) right after `RUN`,
+where TRX64's bar stops advancing. The screenshot harness has done its job: it
+proved the loader RUNS + RENDERS up to the bar, isolated the stall to the
+post-RUN custom-loader stage (not boot, not first-file load, not the renderer),
+and points the fix at the drive serial timing.
+
+### Diagnostic companion — `scramble-gold-probe.mjs`
+
+Not a gate: drives ONE daemon through boot→load→RUN and screenshots at a sweep of
+post-RUN cycle checkpoints, to locate the loader stage each machine is in at a
+given cycle (used to prove the TRX64 freeze above).
+
+```
+node corpus/render/scramble-gold-probe.mjs trx64 30 45 60 90 120
+node corpus/render/scramble-gold-probe.mjs ts 8 16 24
+```
