@@ -56,6 +56,18 @@ pub const DISPLAY_X0: usize = 136;
 pub const DISPLAY_Y0: usize = 51;
 /// 24-row top start line (RSEL=0). VICII_24ROW_START_LINE 0x37 = 55.
 pub const DISPLAY_Y0_24: usize = 55;
+/// 25-row bottom stop line (exclusive). VICII_25ROW_STOP_LINE 0xFB = 251.
+pub const V_STOP_25: usize = 251;
+/// 24-row bottom stop line (exclusive). VICII_24ROW_STOP_LINE 0xF7 = 247.
+pub const V_STOP_24: usize = 247;
+/// First DMA / badline raster line (VICII_FIRST_DMA_LINE 0x30 = 48). The content
+/// origin line is this + YSCROLL (the first badline at or after DMA start).
+pub const VICII_FIRST_DMA_LINE: usize = 48;
+/// 38-column (CSEL=0) main-border inset: 7 px on the left, 9 px on the right
+/// (40-col window is 320 px; 38-col is 304 px → 16 px trimmed, 7 L + 9 R), matching
+/// VICE's draw_border8 CSEL=0 path / the 0x1F..0x14F vs 0x18..0x158 X comparisons.
+pub const CSEL0_INSET_L: usize = 7;
+pub const CSEL0_INSET_R: usize = 9;
 pub const DISPLAY_W: usize = 320;
 pub const DISPLAY_H: usize = 200;
 
@@ -194,13 +206,38 @@ fn render_index_and_fg(inp: &RenderInput) -> (Vec<u8>, Vec<u8>) {
         return (fb, fg);
     }
 
-    // Vertical display window (RSEL): 25 rows from line 51, or 24 rows from 55.
-    let disp_y0 = if rsel { DISPLAY_Y0 } else { DISPLAY_Y0_24 };
-    let disp_rows = if rsel { 25 } else { 24 };
-    // Horizontal display window (CSEL): 40 cols from dbuf X 136, or 38 cols
-    // inset by 8 px (one cycle) on each side. The graphics still render full
-    // 40 cols; the main-border flip-flop simply overpaints the 8-px margins.
-    let disp_x0 = DISPLAY_X0;
+    // ── Display geometry: the main-border window and the content origin are
+    // INDEPENDENT (this is what makes fine scroll work).
+    //
+    // Vertical border WINDOW (the lines where graphics, not border, can show):
+    //   RSEL=1 → [VICII_25ROW_START_LINE, STOP) = [51, 251)
+    //   RSEL=0 → [VICII_24ROW_START_LINE, STOP) = [55, 247)
+    // Horizontal border WINDOW (draw-buffer X where graphics can show):
+    //   CSEL=1 → [136, 456) (= DISPLAY_X0 .. +320)
+    //   CSEL=0 → inset 7 px left / 9 px right → [143, 447)
+    //
+    // CONTENT origin — where char/bitmap row 0, column 0, sub-row 0 is emitted —
+    // is set by the fine-scroll registers, NOT by RSEL/CSEL:
+    //   content_y0 = VICII_FIRST_DMA_LINE (48) + YSCROLL  (boot YSCROLL=3 → 51)
+    //   content_x0 = DISPLAY_X0 (136) + XSCROLL           (boot XSCROLL=0 → 136)
+    // The 25×40 grid is rendered from that origin, then CLIPPED to the border
+    // window; lines/columns outside the window keep the border colour. For the
+    // boot defaults (RSEL=1 CSEL=1 YSCROLL=3 XSCROLL=0) origin == window start, so
+    // this reduces to the previously-calibrated geometry.
+    let yscroll = (d011 & 0x07) as usize;
+    let xscroll = (d016 & 0x07) as usize;
+    let (win_top, win_bot) = if rsel {
+        (DISPLAY_Y0, V_STOP_25)
+    } else {
+        (DISPLAY_Y0_24, V_STOP_24)
+    };
+    let (win_left, win_right) = if csel {
+        (DISPLAY_X0, DISPLAY_X0 + DISPLAY_W) // [136, 456)
+    } else {
+        (DISPLAY_X0 + CSEL0_INSET_L, DISPLAY_X0 + DISPLAY_W - CSEL0_INSET_R) // [143, 447)
+    };
+    let content_y0 = VICII_FIRST_DMA_LINE + yscroll;
+    let content_x0 = DISPLAY_X0 + xscroll;
 
     let bg0 = inp.reg(0x21) & 0x0f;
     let bg1 = inp.reg(0x22) & 0x0f;
@@ -211,14 +248,34 @@ fn render_index_and_fg(inp: &RenderInput) -> (Vec<u8>, Vec<u8>) {
     let char_base = inp.char_base();
     let bitmap_base = inp.bitmap_base();
 
-    // 25 text rows × 8 raster lines. Always iterate 40 cols; border overlay handles CSEL.
-    for trow in 0..disp_rows {
+    // Pre-fill the border WINDOW interior before drawing content. Two distinct
+    // idle fills (verified against the TS oracle for fine scroll):
+    //  • Window lines WITHIN the 25-row content band [content_y0, +200): the VIC
+    //    is in display state, so an uncovered in-row pixel (the left XSCROLL gap)
+    //    shows the BACKGROUND colour ($D021).
+    //  • Window lines OUTSIDE the content band but still inside the vertical border
+    //    window (the YSCROLL gap above/below the rows): the VIC is in IDLE state
+    //    and outputs BLACK (index 0), NOT the background colour.
+    let band_top = content_y0;
+    let band_bot = content_y0 + DISPLAY_H;
+    for line in win_top..win_bot.min(FB_H) {
+        let in_band = line >= band_top && line < band_bot;
+        let fillc = if in_band { bg0 } else { 0 };
+        let lo = line * FB_W;
+        for x in win_left..win_right {
+            fb[lo + x] = fillc;
+        }
+    }
+
+    // 25 text rows × 8 raster lines, drawn from the content origin and clipped to
+    // the border window. Always 40 columns wide.
+    for trow in 0..25usize {
         for sub in 0..8usize {
-            let line = disp_y0 + trow * 8 + sub;
-            if line >= FB_H {
-                continue;
+            let line = content_y0 + trow * 8 + sub;
+            if line >= FB_H || line < win_top || line >= win_bot {
+                continue; // outside the vertical border window → border colour
             }
-            let row_off = line * FB_W + disp_x0;
+            let row_off = line * FB_W + content_x0;
             for col in 0..40usize {
                 let vm_index = trow * 40 + col;
                 let screen_byte = inp.ram[screen_base.wrapping_add(vm_index as u16) as usize];
@@ -229,26 +286,13 @@ fn render_index_and_fg(inp: &RenderInput) -> (Vec<u8>, Vec<u8>) {
                 );
                 let base = row_off + col * 8;
                 for (i, &c) in px.iter().enumerate() {
+                    let x = content_x0 + col * 8 + i;
+                    if x < win_left || x >= win_right {
+                        continue; // outside the horizontal border window
+                    }
                     fb[base + i] = c;
                     fg[base + i] = pri[i] as u8;
                 }
-            }
-        }
-    }
-
-    // Main-border overlay for the 38-col / 24-row sub-windows (CSEL=0 / RSEL=0).
-    // VICE flips the main border in at the narrower comparison; the simplest exact
-    // reproduction is to overpaint the trimmed margins with border colour.
-    if !csel {
-        // 38-col: trim 8 px (7+1 per VICE draw_border8 csel=0 path → net one cycle)
-        // each side of the 320-px window.
-        for line in disp_y0..(disp_y0 + disp_rows * 8).min(FB_H) {
-            let lo = line * FB_W + disp_x0;
-            for i in 0..8 {
-                fb[lo + i] = border;
-                fb[lo + DISPLAY_W - 1 - i] = border;
-                fg[lo + i] = 0;
-                fg[lo + DISPLAY_W - 1 - i] = 0;
             }
         }
     }

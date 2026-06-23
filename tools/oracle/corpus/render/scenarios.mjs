@@ -164,8 +164,12 @@ function scene38Col() { return { setup: [wr(0xd016, 0xc0)] }; } // CSEL=0 XSCROL
 function scene24Row() { return { setup: [wr(0xd011, 0x13)] }; } // DEN=1 RSEL=0 YSCROLL=3
 // Fine X scroll = 5.
 function sceneXScroll() { return { setup: [wr(0xd016, 0xcd)] }; } // CSEL=1 XSCROLL=5
-// Fine Y scroll = 1.
+// Fine Y scroll = 1 (content scrolls UP 2 px → idle-black gap at the window bottom).
 function sceneYScroll() { return { setup: [wr(0xd011, 0x19)] }; } // DEN=1 RSEL=1 YSCROLL=1
+// Fine Y scroll = 5 (content scrolls DOWN 2 px → idle-black gap at the window top).
+function sceneYScrollDown() { return { setup: [wr(0xd011, 0x1d)] }; } // DEN=1 RSEL=1 YSCROLL=5
+// Fine X scroll = 7 (max) — content shifts right 7 px, bg gap at the window left.
+function sceneXScrollMax() { return { setup: [wr(0xd016, 0xcf)] }; } // CSEL=1 XSCROLL=7
 
 // ── scenario registry ─────────────────────────────────────────────────────────
 export const SCENARIOS = {
@@ -219,5 +223,7 @@ export const SCENARIOS = {
   "edge-38col": scene38Col,
   "edge-24row": scene24Row,
   "edge-xscroll": sceneXScroll,
+  "edge-xscroll-max": sceneXScrollMax,
   "edge-yscroll": sceneYScroll,
+  "edge-yscroll-down": sceneYScrollDown,
 };

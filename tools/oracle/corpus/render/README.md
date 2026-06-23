@@ -46,3 +46,34 @@ cd tools/oracle
 node corpus/render/capture.mjs golden     # (re)record the TS golden PNG
 node corpus/render/capture.mjs compare     # GREEN/RED pixel parity vs golden
 ```
+
+## Sprite + graphics-mode + fine-scroll scenarios (`scene.mjs` / `scenarios.mjs` / `compare.mjs`)
+
+Beyond the static boot screen, a scenario harness pixel-diffs the VIC in
+non-default states. Each scenario programs the VIC + screen/colour/sprite RAM
+**directly via the monitor `wr io` lens** (no CPU program needed): on the TS
+oracle `wr` runs the banked CPU write with real I/O effects; on TRX64 the `io`
+lens routes through `Machine::poke_io` to the VIC chip / colour RAM. The TS run
+then elapses ≥1 frame on a **parked CPU** (`JMP self`) so its frame accumulator
+re-renders the new register state without the cursor blinking; TRX64's
+state-renderer reads the registers directly. Both screenshots are decoded to RGBA
+and pixel-diffed.
+
+```
+node corpus/render/compare.mjs                 # run ALL scenarios
+node corpus/render/compare.mjs sprite-hires …  # run named scenarios
+```
+
+Scenarios (all GREEN, 384×272):
+
+- **sprites** — `sprite-hires`, `-stripe`, `-xexp`, `-yexp`, `-xyexp`,
+  `-multicolor`, `-mc-xexp`, `-msb` (X>255), `-priority-sprite` (sprite-sprite,
+  lower # wins), `-behind-fg` / `-front-fg` ($D01B sprite-to-background priority).
+- **graphics modes** — `mode-multicolor-text`, `mode-standard-bitmap`,
+  `mode-multicolor-bitmap`, `mode-ecm`.
+- **border / fine-scroll edges** — `edge-38col` (CSEL=0, 7 L / 9 R inset),
+  `edge-24row` (RSEL=0), `edge-xscroll` / `edge-xscroll-max` (XSCROLL),
+  `edge-yscroll` / `edge-yscroll-down` (YSCROLL). The renderer decouples the
+  border WINDOW from the CONTENT origin (`content_y0 = 48 + YSCROLL`,
+  `content_x0 = 136 + XSCROLL`); in-row uncovered gaps fill background ($D021),
+  the idle region above/below the 25-row band fills BLACK (verified vs TS).
