@@ -25,8 +25,8 @@
     "drive-load (controller+ATN+read-stream)",
     "drive-read-engine"
   ],
-  "note": "MILESTONE: drive reads disk sectors byte-exact (status $01) — root of disk-LOAD onion cracked. All pieces (read engine + IEC serial + ATN + GCR) now work individually. Next: disk-load-e2e [opus] — run mount+LOAD end-to-end, assert program in $0801 byte-exact. The payoff.",
-  "updated": "2026-06-23T04:00:00Z",
+  "note": "disk-load-e2e [opus]: real end-to-end LOAD via full DOS flow (not job-poke). mount D64 -> LOAD\"$\" or LOAD\"*\",8 -> program/dir in C64 RAM $0801 byte-exact vs TS. Gate via oracle monitor_memory (C64 RAM is WS-readable). All pieces now work individually.",
+  "updated": "2026-06-23T04:05:00Z",
   "followups": [
     "daemon-trace-query",
     "vic-sprites-modes",
@@ -34,7 +34,11 @@
     "drive-watchdog-phase",
     "sid-audio"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "disk-load-e2e",
+    "model": "opus",
+    "started": "2026-06-23T04:05:00Z"
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
