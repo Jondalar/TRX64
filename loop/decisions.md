@@ -444,3 +444,20 @@ to read DRIVE RAM.
 **Why:** Cracked the deepest layer of the disk onion via the right (functional) gate.
 END-TO-END LOAD still pending: with read-engine + IEC-serial both working, the full
 LOAD"$"→$0801 is the integration payoff → next item disk-load-e2e.
+
+## ADR-036 — keyboard matrix done (session/type was a stub); LOAD → iec-talk-turnaround
+**Context:** disk-load-e2e — real end-to-end LOAD. Found that session/type was a pure STUB
+(no keyboard emulation) — so no LOAD command could ever be typed.
+**Decision (accepted, GREEN + no regression):** Ported the CIA1 keyboard matrix to the core
+(keyboard.rs: 8×8 matrix, PETSCII type_text w/ auto-SHIFT, exact readRowsForPa; full.rs
+$DC01 read via the VICE read_ciapb formula, regression-safe — collapses to raw read with no
+keys queued; KeyboardMatrix on Machine, cleared on cold_reset). session/type now really queues
+keys. PROVEN: typing LOAD"$",8 → FA=$8 (KERNAL parses, addresses device 8, drive DOS runs
+OPEN + directory-search). Regression GREEN. Carve the remaining LOAD blocker into
+`iec-talk-turnaround` [opus]: the LISTEN→TALK turnaround deadlocks (~C64 cyc 16.8M) — C64
+spins ACPTR $EE67 (wait talker CLK-low), drive returns to $EBFF/$EC00 idle instead of entering
+talk-send + pulling CLK; IEC lines cpu_port=$C0, drv_port=$85. Hypothesis: drive doesn't latch
+"addressed-to-TALK" across the ATN-release turnaround (EOI/turnaround cadence or missed TALK
+latch when ATN drops after the OPEN directory job). Keyboard/IEC/GCR all verified, not implicated.
+**Why:** Keyboard is a real, broadly-useful prerequisite (any typed input); the TALK turnaround
+is the next precisely-localized cycle-exact handshake.

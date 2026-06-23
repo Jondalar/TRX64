@@ -380,3 +380,18 @@ This was the right gate at last (functional job-status + sector bytes, not just 
 All disk-LOAD pieces now work individually (read engine + IEC serial + ATN + GCR). End-to-end
 LOAD"$"→$0801 still pending integration → next item disk-load-e2e [opus] (the payoff: assert
 the program lands in C64 RAM byte-exact).
+
+## 2026-06-23 — DRIVER: disk-load-e2e — keyboard matrix (session/type was a stub!)
+
+Opus builder found session/type was a pure STUB — no real LOAD could be typed. Ported the
+CIA1 keyboard matrix (keyboard.rs, PETSCII, exact readRowsForPa; $DC01 via read_ciapb,
+regression-safe). PROVEN: typing LOAD"$",8 → FA=$8, drive DOS runs OPEN + directory-search.
+Confirmation gate INDEPENDENT: regression GREEN (boot-basic-ready/-trace, cia, drive, disk-
+read-byteexact — keyboard collapses to raw read with no keys). ADR-036. Merged.
+
+LOAD blocker localized to the LISTEN→TALK turnaround: after TALK + ATN-release the two CPUs
+deadlock (~16.8M cyc) — C64 spins ACPTR $EE67 waiting for talker CLK, drive returns to
+$EBFF/$EC00 idle instead of talk-send. Drive doesn't latch "addressed-to-TALK" across ATN-
+release. Carved to iec-talk-turnaround [opus]. Keyboard/IEC/GCR all verified green.
+Advancing to iec-talk-turnaround. (Custom-loader $DD00-bitbang gate tracked as the eventual
+acid test — user-flagged as the hardest case, where $DD00 + VIC couple.)
