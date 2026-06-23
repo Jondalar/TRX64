@@ -27,8 +27,8 @@
     "disk-load-e2e (keyboard matrix)",
     "iec-crossdomain-sync (STANDARD LOAD complete)"
   ],
-  "note": "ADR-039 CORRECTED by ADR-040: blocker is a one-time ~17k-cycle rotational-PHASE lead at transfer start (NOT a rate skew), from the ADR-035 attach_clk-clear deviation (clears on PRB poll vs VICE PRA-only). Next: drive-rotation-phase [opus] — match VICE attach_clk (PRA-only) + keep find-sync via elapsed-since-attach. Gate scramble-load-progress + dont regress $03 find-sync.",
-  "updated": "2026-06-23T07:35:00Z",
+  "note": "drive-rotation-phase [opus]: fix the ~17k-cycle rotational-phase lead (ADR-040). Match VICE attach_clk clearing (PRA/$1C01-only, not PRB poll) WHILE preserving the $03 find-sync fix via elapsed-since-attach (no rotation_last_clk/attach_clk mutation from PRB). DUAL GATE: scramble-load-progress RED->GREEN AND drive-read-byteexact/disk-read-engage stay GREEN.",
+  "updated": "2026-06-23T07:50:00Z",
   "followups": [
     "custom-loader-gate (acid test — reachable after iec-serial-rate)",
     "daemon-trace-query",
@@ -37,7 +37,11 @@
     "drive-watchdog-phase",
     "sid-audio"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "drive-rotation-phase",
+    "model": "opus",
+    "started": "2026-06-23T07:50:00Z"
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
