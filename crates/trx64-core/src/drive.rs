@@ -578,23 +578,38 @@ impl<'a> DriveBus<'a> {
         if self.rotation.image.is_none() {
             return;
         }
+        // VICE via2d.c:210 — rotation_rotate_disk(drv) is the FIRST thing store_prb
+        // does, BEFORE the stepper/speed-zone/motor logic. This advances the GCR
+        // head offset (and rotation_last_clk) to the current clk so that a
+        // subsequent step's set_half_track head-offset rescale operates on the
+        // up-to-date rotational position — and so the motor-on re-anchor (`begins`)
+        // doesn't drop the elapsed head-advance since the last rotate. Omitting it
+        // leaves the head one inter-sector gap out of phase at sector-lock (the
+        // ~17-20k-cycle transfer-start phase LEAD; ADR-040/041). Matches the TS
+        // port's store_prb (vice1541/via2d.ts:394-395).
+        self.rotation.rotate_disk(self.clk);
+
         let r = &mut self.rotation;
-        // Speed zone (density) PB5-6 — only on change.
-        if (old_pb ^ new_pb) & 0x60 != 0 {
-            r.speed_zone_set(((new_pb >> 5) & 0x3) as usize);
+        // Stepper PB0-1, gated by motor PB2 (via2d.c:255-313). Computed from the
+        // current half-track BEFORE any move so the bug#1083 motor-on retrigger
+        // below can reuse new/old stepper positions.
+        let track_number = r.current_half_track.wrapping_sub(2);
+        let new_stepper = (new_pb & 3) as i32;
+        let old_stepper = (track_number & 3) as i32;
+        let mut step_count = (new_stepper - old_stepper) & 3;
+        if step_count == 3 {
+            step_count = -1;
         }
-        // Stepper PB0-1, gated by motor PB2 (via2d.c:422-443).
         if new_pb & 0x04 != 0 {
-            let track_number = r.current_half_track.wrapping_sub(2);
-            let new_stepper = (new_pb & 3) as i32;
-            let old_stepper = (track_number & 3) as i32;
-            let mut step_count = (new_stepper - old_stepper) & 3;
-            if step_count == 3 {
-                step_count = -1;
-            }
+            // via2d.c:307 — ±1 gate at this FIRST call site only.
             if step_count == 1 || step_count == -1 {
                 r.move_head(step_count);
             }
+        }
+        // Speed zone (density) PB5-6 — only on change (via2d.c:321-323, AFTER
+        // the stepper, BEFORE the motor-on/off transition).
+        if (old_pb ^ new_pb) & 0x60 != 0 {
+            r.speed_zone_set(((new_pb >> 5) & 0x3) as usize);
         }
         // Motor on/off edge (via2d.c:325-352): mirror PB2 into byte_ready_active.
         // On motor-off, flush a pending byte-ready edge into V (drive_cpu_set_overflow,
@@ -609,6 +624,13 @@ impl<'a> DriveBus<'a> {
             } else if r.byte_ready_edge != 0 {
                 self.pending_set_overflow = true;
                 r.byte_ready_edge = 0;
+            }
+            // VICE via2d.c:338-351 (bug #1083 "Primitive 7 Sins" workaround): on a
+            // motor-on edge, if the stepper position changed AND motor is now on,
+            // call drive_move_head a SECOND time WITHOUT the ±1 gate (drive_move_head
+            // handles the ±2 opposite-coil case). Matches vice1541/via2d.ts:478-482.
+            if new_stepper != old_stepper && new_pb & 0x04 != 0 {
+                r.move_head(step_count);
             }
         }
         // VICE via2d.c:354 — byte_ready_level cleared last on a PB store.
