@@ -705,3 +705,31 @@ taken right after RUN where TRX64's bar stops advancing, find the first divergen
 scramble-gold gate (tools/oracle/corpus/render/scramble-gold.mjs) is the permanent behavioral acid test.
 **Why:** The custom loader — the user's hardest case + whole point — genuinely does not run yet; the gate now
 proves it + pins the cause.
+
+## ADR-049 — ultracode workflow: phase-skew theory FALSIFIED; bug is a write-path fold deadlock (H1)
+**Context:** dd00-loader-stall via a 9-agent ultracode workflow (6 parallel VICE-C-vs-TRX64 source-diffs of
+each $DD00/IEC path + c64re reference-trace + synthesize + fix-verify). 31 candidate divergences.
+**Outcome (no fix applied — zero regression, nothing fudged, working tree clean):**
+- The PHASE-SKEW direction (6 prior attempts) is DEFINITIVELY FALSIFIED: DRIVE_SYNC_FACTOR_PAL=66517 is
+  VICE-correct (drivesync.c floor(65536*1e6/985248); 66504 regresses drive-boot-idle/deep AND still wedges);
+  the drive-reset origin is already correct (drive-boot-idle GREEN, first boundary at cycle 8).
+- BUG RE-CHARACTERIZED: a MUTUAL STUCK-VALUE HANDSHAKE DEADLOCK, not a sub-cycle drift. C64 spins
+  $04E2 BIT $DD00 / $04E5 BVC reading a constant $8A (bit6=CLK_in=0) — waits for the drive to pull CLK low;
+  the DRIVE spins $0402-$0408 and never asserts CLK. Two-sided wait, neither breaks.
+- VERIFIED VICE-faithful (eliminated): IecCore fold/read_prb/via1_pb_iec_output, write push-flush+ATN-CA1
+  order, +1 write offset. One INACTIVE-here fidelity gap: via1_pb_iec_output omits VICE's PB7-toggle override
+  (viacore.c:720, ACR&T1_PB7) — VIA1 ACR=$00 at the wedge so value-neutral; fix separately for fidelity.
+**Ranked hypotheses (next):**
+- H1 [highest]: WRITE-path extra refold. TRX64 iec_push_flush_to (full.rs:167) calls
+  drive_store_pb(via1_pb_iec_output()) — refolding drv_bus/ports from the drive's CURRENT PB using the OLD
+  (pre-write) cpu_bus — BEFORE c64_store_dd00 updates cpu_bus + the ATN-CA1 edge. VICE iecbus_cpu_write_conf1
+  does NOT refold from the drive PB inside the write (single fold). The stale-cpu_bus refold may publish a
+  transient CLK/DATA the tight loop latches. FIX: write-path catch_up only, let c64_store_dd00's
+  recompute_drv_bus(from drv_data_8) be the single fold = VICE-exact.
+- H2: CA1 edge stamped 1 cycle off vs the drive's last executed cycle.
+- H3 [definitive fallback]: diff the post-RUN drive-PC stream TRX64-vs-c64re-reference (the reference is NOT
+  stuck at $04E2) — the first divergent drive-PC is the true first-divergence the analysis never had.
+**Fast harness:** in-crate (Machine boot -> attach D64 -> type LOAD/RUN -> run_for_full, watch read_full(0x05FD)
+climb past post-LOAD $20 = bar filling), ~10-30s vs the >10min WS gate (which times out here).
+**Why:** The workflow killed a 6-attempt dead-end + delivered a precise, VICE-grounded, testable fix (H1) +
+a fast iteration loop. THIS is the value of the parallel multi-perspective attack.

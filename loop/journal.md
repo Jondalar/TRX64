@@ -542,3 +542,12 @@ ADR-048. Merged the behavioral gate (permanent acid test). done: 22 items.
 
 Next: dd00-loader-stall — drive-cpu trace right after RUN, first divergent $DD00/drive event. User's $DD00 domain
 + his offered VICE trace now key. ESCALATED with a concrete visual repro.
+
+## 2026-06-23 — DRIVER: ultracode workflow falsifies phase-skew; bug is a write-path fold deadlock (ADR-049)
+
+9-agent workflow (parallel VICE-C source-diff + c64re trace + synth + fix). No fix (synthesized root cause
+falsified, zero regression, nothing fudged). BUT killed the 6-attempt phase-skew dead-end (sync_factor is
+VICE-correct; origin already fixed) and RE-CHARACTERIZED the bug: a MUTUAL stuck-value handshake deadlock
+(C64 $04E2 BIT $DD00/BVC waits for CLK; drive $0402-$0408 never asserts). Top fix H1: the extra write-path
+drive_store_pb refold in iec_push_flush_to (full.rs:167) vs VICE's single fold (iecbus_cpu_write_conf1).
+Fast in-crate harness ($05FD climb). Dispatching the H1 test.

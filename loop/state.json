@@ -31,17 +31,15 @@
     "drive-watchdog-phase",
     "scramble-gold"
   ],
-  "note": "dd00-loader-stall WORKFLOW (ultracode/xhigh): 6 parallel VICE-C-vs-TRX64 source-diff agents (iecbus/cia2-pa/via1d/iec-glue/ciacore-edges/crossdomain) + c64re reference-trace agent -> synthesize root cause -> fix+verify (scramble-gold bar-fill + full regression), commits to branch dd00-loader-stall. VICE src at /Users/alex/Development/C64/Tools/vice/vice/src. c64re ref up 4312.",
-  "updated": "2026-06-23T14:34:00Z",
+  "note": "dd00-loader-stall H1 test (post-workflow ADR-049). Phase-skew FALSIFIED; bug = mutual write-path fold deadlock (C64 $04E2 waits CLK; drive $0402 never asserts). Test H1: remove the extra drive_store_pb refold in iec_push_flush_to (full.rs:167), single fold = VICE iecbus_cpu_write_conf1. Fast in-crate harness ($05FD climb). H3 fallback: diff drive-PC stream vs c64re reference (up 4312).",
+  "updated": "2026-06-23T14:55:00Z",
   "followups": [
     "sid-audio"
   ],
   "in_flight": {
     "item": "dd00-loader-stall",
-    "model": "workflow",
-    "started": "2026-06-23T14:34:00Z",
-    "workflow": "wtdhh0z9v",
-    "note": "WORKFLOW wtdhh0z9v ~27min: Diff+Trace phases done, in Synthesize/Fix (xhigh). Commits land only in the final Fix phase. Multi-phase orchestration — legit longer. Defer."
+    "model": "opus",
+    "started": "2026-06-23T14:55:00Z"
   },
   "stage2_items": [],
   "resolved": [
