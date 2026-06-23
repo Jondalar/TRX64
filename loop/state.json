@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "dd00-loader-stall",
+  "current_item": "dd00-via2-byteready",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -31,23 +31,18 @@
     "drive-watchdog-phase",
     "scramble-gold"
   ],
-  "note": "dd00-loader-stall H1 test (post-workflow ADR-049). Phase-skew FALSIFIED; bug = mutual write-path fold deadlock (C64 $04E2 waits CLK; drive $0402 never asserts). Test H1: remove the extra drive_store_pb refold in iec_push_flush_to (full.rs:167), single fold = VICE iecbus_cpu_write_conf1. Fast in-crate harness ($05FD climb). H3 fallback: diff drive-PC stream vs c64re reference (up 4312).",
-  "updated": "2026-06-23T15:34:00Z",
+  "note": "dd00-loader-stall: H1 (IEC write-path fold) FALSIFIED+merged (VICE-faithful single fold, bit-identical, regression-clean) + fast probes. ROOT CAUSE found (ADR-050): drive VIA2 byte-ready/SYNC/T1 coupling under direct CPU poll (drive $0402 loop polls $1F05 T1C-H + $1CF0 PRB-SYNC; reference advances to $07Ax send, TRX64 stalls). Next: dd00-via2-byteready [opus] — diff TRX64-vs-c64re VIA2 T1+byte-ready/SYNC presentation at $0402. c64re ref + fast probes ready. 22 items.",
+  "updated": "2026-06-23T15:45:00Z",
   "followups": [
     "sid-audio"
   ],
-  "in_flight": {
-    "item": "dd00-loader-stall",
-    "model": "opus",
-    "started": "2026-06-23T15:34:00Z",
-    "note": "H1 FALSIFIED (write-path single fold bit-identical — committed 9e49e35). H3 localizing the deadlock to DRIVE CLK-RELEASE (the drive $0402 loop / why it never asserts CLK). Builder alive (no completion notification; H3 = c64re WS calls, not local edits). Defer."
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
   ],
   "known_red": [
-    "scramble-load-progress + scramble-gold loaderbar: the post-RUN custom $DD00 bit-bang loader STALLS (bar never fills, frozen 30M-120M; TS reaches the title screen). The cycle-exact phase lead is the CAUSE (ADR-048). Fix = post-RUN $DD00 drive/IEC timing, traced right after RUN."
+    "scramble custom $DD00 loader STALL (scramble-load-progress + scramble-gold loaderbar): drive $0402 loop polls VIA2 PRB bit7(SYNC)+T1 directly, never advances to the bit-bang send ($07Ax) -> never releases CLK -> C64 $04E2 deadlock. Root cause = VIA2 byte-ready/SYNC/T1 rotation coupling under DIRECT POLL (ADR-050). NOT IEC, NOT phase-skew (8 attempts falsified)."
   ],
   "custom_loader_test_disk": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/scramble_infinity.d64",
   "blocked": [

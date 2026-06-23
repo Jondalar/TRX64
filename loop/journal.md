@@ -551,3 +551,13 @@ VICE-correct; origin already fixed) and RE-CHARACTERIZED the bug: a MUTUAL stuck
 (C64 $04E2 BIT $DD00/BVC waits for CLK; drive $0402-$0408 never asserts). Top fix H1: the extra write-path
 drive_store_pb refold in iec_push_flush_to (full.rs:167) vs VICE's single fold (iecbus_cpu_write_conf1).
 Fast in-crate harness ($05FD climb). Dispatching the H1 test.
+
+## 2026-06-23 — DRIVER: H1 falsified+merged; stall root-caused to VIA2 byte-ready (ADR-050)
+
+H1 (IEC write-path single fold) FALSIFIED — bit-identical to baseline (the C64 spin is pure reads). Merged
+anyway: VICE-faithful (removes a non-VICE double-fold), regression-clean (scramble-load-file/disk-load-dir/
+disk-read-byteexact/-engage/drive-boot-deep/boot-trace-short all GREEN) + 2 fast in-crate probes. H3 (live
+c64re drive-PC diff) found the ROOT CAUSE: the drive $0402 loop polls VIA2 PRB bit7(SYNC)+T1 DIRECTLY; the
+reference advances to the bit-bang send ($07Ax), TRX64 stalls -> CLK never releases -> C64 deadlock. The bug
+is the VIA2 byte-ready/SYNC/T1 rotation coupling under direct-poll (standard DOS uses byte-ready->SO which
+works). ADR-050. 8 attempts on the wrong layers; finally exact. Next: dd00-via2-byteready.
