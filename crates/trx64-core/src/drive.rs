@@ -552,12 +552,22 @@ impl<'a> DriveBus<'a> {
     #[inline]
     fn via2_ports_live(&mut self, for_pra: bool) -> Via2Ports {
         if self.rotation.image.is_some() {
+            // VICE-exact: read_pra → rotation_byte_read (clears attach_clk on the
+            // PRA path); read_prb → rotation_rotate_disk THEN prb_pin (sync_found +
+            // drive_writeprotect_sense, which clears attach_clk on the PRB/WPS path).
+            // Only the path actually being read runs its spin-up-window clear, so
+            // attach_clk advances exactly as VICE's does.
             if for_pra {
                 self.rotation.byte_read(self.clk);
+                Via2Ports {
+                    pra_pin: self.rotation.pra_pin(),
+                    prb_pin: self.via2_ports.prb_pin,
+                }
             } else {
                 self.rotation.rotate_disk(self.clk);
+                let prb = self.rotation.prb_pin(self.clk);
+                Via2Ports { pra_pin: self.rotation.pra_pin(), prb_pin: prb }
             }
-            Via2Ports { pra_pin: self.rotation.pra_pin(), prb_pin: self.rotation.prb_pin() }
         } else {
             self.via2_ports
         }

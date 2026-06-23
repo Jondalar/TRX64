@@ -76,7 +76,13 @@ pub struct Rotation {
     pub byte_ready_edge: u8,
     /// Byte-ready level (`byte_ready_level`).
     pub byte_ready_level: u8,
-    /// Clock the disk was attached (settle window). 0 = settled.
+    /// Clock the disk was attached (spin-up settle window). 0 = settled.
+    ///
+    /// Byte-exact with VICE: cleared once `DRIVE_ATTACH_DELAY` has elapsed by
+    /// either the PRA path ([`byte_read`] → `rotation_byte_read`) or the PRB/WPS
+    /// path ([`writeprotect_sense`] → `drive_writeprotect_sense`). `rotate_disk`
+    /// (the bare SYNC poll) never touches it. Gates SYNC visibility ([`sync_found`])
+    /// and `byte_read`'s `GCR_read = 0` forcing.
     pub attach_clk: u64,
     /// Encoded GCR image (per half-track). `None` = no disk.
     pub image: Option<GcrImage>,
@@ -219,6 +225,13 @@ impl Rotation {
 
     /// rotation_sync_found (rotation.c:1134-1143): PB7 SYNC sense. 0x80 = not
     /// found (also forced while writing or during attach settle); 0 = sync.
+    ///
+    /// VICE-exact: SYNC is masked while the spin-up window is still open
+    /// (`attach_clk != 0`). The ADR-035 find-sync fix is achieved NOT by changing
+    /// this gate but by clearing `attach_clk` on the PRB path the way VICE does —
+    /// through `drive_writeprotect_sense`, which `read_prb` calls for the WPS bit
+    /// and which clears `attach_clk` once `DRIVE_ATTACH_DELAY` has elapsed. See
+    /// [`writeprotect_sense`] and [`prb_pin`].
     #[inline]
     pub fn sync_found(&self) -> u8 {
         if !self.read_write_mode || self.attach_clk != 0 {
@@ -234,22 +247,14 @@ impl Rotation {
     /// rotation_rotate_disk (rotation.c:1106-1125): motor gate, then the simple
     /// engine (D64). Wobble is a no-op (factor/frequency 0).
     ///
-    /// Spin-up window: VICE clears `attach_clk` only in `rotation_byte_read`
-    /// (the PRA read), so a drive that ONLY polls PB7/SYNC (PRB, the $F562 find-
-    /// sync loop) before ever reading $1C01 would keep `attach_clk` set and never
-    /// see SYNC. On real hardware the disk is up to speed once `DRIVE_ATTACH_DELAY`
-    /// has elapsed regardless of which register the controller samples — VICE only
-    /// gets away with the PRA-only clear because a real job ALWAYS issues a PRA
-    /// read during head/job setup first. We mirror the physical reality: once the
-    /// spin-up delay has expired, drop the window here too so a PRB-only sync poll
-    /// reads a live disk. Within the delay nothing changes (sync_found still 0x80),
-    /// so the byte-exact mount/idle traces are unaffected.
+    /// VICE-EXACT: this path only checks the motor and runs the engine — it NEVER
+    /// touches `attach_clk`. The spin-up window is cleared on the PRA path
+    /// ([`byte_read`]) and the PRB/WPS path ([`writeprotect_sense`]) exactly as
+    /// VICE's `rotation_byte_read` / `drive_writeprotect_sense` do, so the
+    /// rotational phase matches VICE bit-for-bit.
     pub fn rotate_disk(&mut self, clk: u64) {
         if self.byte_ready_active & BRA_MOTOR_ON == 0 {
             return;
-        }
-        if self.attach_clk != 0 && clk.wrapping_sub(self.attach_clk) >= DRIVE_ATTACH_DELAY {
-            self.attach_clk = 0;
         }
         self.rotation_1541_simple(clk);
     }
@@ -352,12 +357,44 @@ impl Rotation {
         self.gcr_read
     }
 
+    /// drive_writeprotect_sense (drive-writeprotect.c:34-75): the WPS bit, AND the
+    /// spin-up-window `attach_clk` clear. Returns 0x10 = write-enabled / 0x00 =
+    /// write-protected.
+    ///
+    /// This is the VICE-exact home of the ADR-035 find-sync fix: `read_prb` calls
+    /// this for the WPS bit on EVERY PB read, and it clears `attach_clk` once
+    /// `DRIVE_ATTACH_DELAY` has elapsed. So the DOS $F562 find-sync loop (which
+    /// polls PB7/SYNC and PB4/WPS together via PRB) clears `attach_clk` here —
+    /// unmasking SYNC — without any PRA read. The clear runs AFTER `sync_found` in
+    /// the `read_prb` sequence (rotate → sync_found → writeprotect_sense), so the
+    /// unmask takes effect on the NEXT poll. This replaces the ADR-035 deviation
+    /// (clearing `attach_clk` inside `rotate_disk`) with VICE's actual mechanism;
+    /// note the unmask happens at ~1.8M drive-clk, long before any read job, so it
+    /// is decoupled from the load's rotational phase (verified by probe). Only the
+    /// attach branch is modelled — a plain mounted D64 has no detach/attach_detach
+    /// window.
+    pub fn writeprotect_sense(&mut self, clk: u64) -> u8 {
+        if self.attach_clk != 0 {
+            if clk.wrapping_sub(self.attach_clk) < DRIVE_ATTACH_DELAY {
+                return 0x0;
+            }
+            self.attach_clk = 0;
+        }
+        if !self.gcr_image_loaded {
+            return 0x10;
+        }
+        0x10 // mounted D64 is writeable (read_only out of scope here)
+    }
+
     /// VIA2 PRB pin input default (DDRB=0): `sync | wps | 0x6f` (via2d read_prb).
-    /// `wps` = 0x10 when writeable (a plain mounted D64 is writeable).
+    ///
+    /// VICE-EXACT ORDER (via2d.c read_prb): `sync_found` is sampled FIRST (while
+    /// `attach_clk` may still be set → 0x80), THEN `writeprotect_sense` clears the
+    /// spin-up window. The clear therefore unmasks SYNC only on the following poll.
     #[inline]
-    pub fn prb_pin(&self) -> u8 {
+    pub fn prb_pin(&mut self, clk: u64) -> u8 {
         let sync = self.sync_found();
-        let wps = 0x10; // writeable
+        let wps = self.writeprotect_sense(clk);
         sync | wps | 0x6f
     }
 }
@@ -424,11 +461,12 @@ mod tests {
     fn prb_pin_layout() {
         let mut r = Rotation::new();
         r.read_write_mode = true;
+        r.attach_clk = 0; // settled — SYNC visible
         r.last_read_data = 0; // not sync
         // sync(0x80) | wps(0x10) | 0x6f = 0xff
-        assert_eq!(r.prb_pin(), 0xff);
+        assert_eq!(r.prb_pin(0), 0xff);
         // When sync found (last_read_data == 0x3ff), PB7 clears → 0x7f.
         r.last_read_data = 0x3ff;
-        assert_eq!(r.prb_pin(), 0x7f);
+        assert_eq!(r.prb_pin(0), 0x7f);
     }
 }
