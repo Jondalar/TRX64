@@ -26,7 +26,7 @@
     "drive-read-engine"
   ],
   "note": "disk-load-e2e [opus]: real end-to-end LOAD via full DOS flow (not job-poke). mount D64 -> LOAD\"$\" or LOAD\"*\",8 -> program/dir in C64 RAM $0801 byte-exact vs TS. Gate via oracle monitor_memory (C64 RAM is WS-readable). All pieces now work individually.",
-  "updated": "2026-06-23T04:05:00Z",
+  "updated": "2026-06-23T04:34:00Z",
   "followups": [
     "daemon-trace-query",
     "vic-sprites-modes",
@@ -37,7 +37,8 @@
   "in_flight": {
     "item": "disk-load-e2e",
     "model": "opus",
-    "started": "2026-06-23T04:05:00Z"
+    "started": "2026-06-23T04:34:00Z",
+    "note": "opus alive 30min: e2e LOAD integration (keyboard.rs + disk-load-dir, edited <1min ago). No green commit yet — deep cross-subsystem integration. Defer."
   },
   "stage2_items": [],
   "resolved": [
