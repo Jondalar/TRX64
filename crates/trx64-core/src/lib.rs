@@ -13,6 +13,7 @@ pub mod cia;
 pub mod cpu;
 pub mod drive;
 pub mod full;
+pub mod gcr;
 pub mod iec;
 pub mod render;
 pub mod sid;
