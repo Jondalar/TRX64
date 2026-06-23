@@ -339,3 +339,41 @@ Two new tracked follow-ups: `drive-watchdog-phase` (drive-boot-deep RED trace[21
 `drive-gcr` (GCR read path for real disk LOAD; not started, no-disk defaults sufficed here).
 **Why:** Mandated gate met (boot-basic-ready GREEN, no regression); the deeper corner is a
 distinct, well-characterized timing artifact for a dedicated item.
+
+## ADR-031 — SID 6581 osc/env model done; sid domain RESERVED (no live producer)
+**Context:** sid builder — model SID 6581 oscillator + envelope so computed reads
+($D41B osc3, $D41C env3) match the TS oracle; verify whether the `sid` trace channel
+has a live producer (ADR-015 pattern).
+**Decision (accepted, GREEN + no regression):** `sid.rs` in trx64-core implements the SID
+6581 B-level model 1:1 ported from TS `headless/sid/sid.ts` (Spec 151): 3-voice oscillator
+phase advance (24-bit phase, NSHIFT(rv,16) LFSR noise), waveform-aware osc3 readback
+(triangle/sawtooth/pulse/noise, combined AND), per-voice ADSR state machine with PAL
+rate table, $D41B (osc3) / $D41C (env3) computed reads, $D419/$D41A → 0x80 (POT
+unconnected default). Ticked wall-clock batch per instruction (matching TS
+`sid.tick(totalCycles)` in integrated-session.ts:946). `Sid6581` added to `Machine` (Clone
+for Phase-2 COW forks); FullBus SID read now routes $D41B/$D41C through `sid.read()`
+instead of stub shadow; `SidBus` isolation gate added. `sid` domain routes to `run_for_sid`
+in daemon; sid `TraceChannels` field added (no frames emitted).
+EMPIRICAL FINDING (ADR-015 repeat): `sid` channel is RESERVED with NO live producer —
+confirmed by grepping TS source: no `trace.publish("sid", ...)` anywhere; SID writes appear
+as op-0x11 RAM_WRITE from the CPU bus tap only (same as all other I/O). The `writeTrace`
+callback on `Sid6581` is an audio-recorder hook, not a trace sink. `SID_REG_WRITE = 0x22`
+exists in binary-format.ts but is never emitted. PCM audio output (reSID/WAV) is Phase-1.5,
+OUT OF SCOPE. RESULT: iso-sid-osc3-env3 GREEN (osc3=0x01, env3=0x01 match TS oracle at
+2000 cycles); full 20-scenario regression sweep GREEN (0 regressions).
+`monitor/exec "m"` memory dump added to daemon (TS monitor-shell.ts format: 32-byte rows,
+96-char padded hex, ASCII chars); VSF `load_sid` resets internal voice state on restore.
+**Why:** The SID is the last core chip; ADR-015 empirical check prevents implementing a
+channel producer the spec never had. osc3/env3 computed reads now match the TS oracle.
+
+## ADR-031 — sid done (osc3/env3 byte-exact); audio PCM → Phase 1.5
+**Context:** last core chip — SID 6581.
+**Decision (accepted, GREEN + no regression):** sid.rs models the 3-voice oscillator
+(24-bit phase, LFSR noise, waveform-aware $D41B osc3 readback) + per-voice ADSR ($D41C
+env3), POT defaults; Sid6581 in Machine (Clone), SidBus isolation gate, FullBus routes
+$D41B/$D41C through sid.read() (additive — boot-basic-ready stays GREEN). iso-sid-osc3-env3
+GREEN, regression GREEN. ADR-015 re-confirmed: the `sid` trace channel is RESERVED/no
+producer (no trace.publish("sid"); SID writes appear as op-0x11). DEFERRED to Phase 1.5:
+PCM audio / reSID sample gen / WAV export, voices 1+2 osc advance, ring-mod/hard-sync/filter.
+**Why:** Register + osc/env read behavior is the trace-relevant contract; audio is a
+separate Phase-1.5 concern. ALL CORE CHIPS (CPU/VIC/CIA/SID/VIA1+2/Drive) now modelled.

@@ -312,3 +312,15 @@ The builder added a deeper drive-boot-deep gate that finds the NEXT corner: 3rd 
 IRQ +2 (trace[212703] cyc 1048810 vs 1048808) — needs a VICE drive-cpu cycle cross-check →
 tracked drive-watchdog-phase (drive-boot-deep is a KNOWN-RED, not a regression). GCR disk-
 load → tracked drive-gcr. Advancing to sid [sonnet].
+
+## 2026-06-23 — DRIVER: sid done — ALL CORE CHIPS byte-exact
+
+Sonnet builder: SID 6581 osc (24-bit phase, LFSR noise, waveform osc3) + ADSR env3 in
+sid.rs; FullBus routes $D41B/$D41C through sid.read() (additive). Confirmation gate
+INDEPENDENT: iso-sid-osc3-env3 GREEN + full regression GREEN (boot-basic-ready, boot-trace-
+short, iso vic/cia, drive-boot-idle, render-boot pixel-identical) — no regression. ADR-015
+re-confirmed (sid trace reserved/no producer). Audio PCM/reSID → Phase 1.5. ADR-031. Merged.
+
+** ALL CORE CHIPS MODELLED + BYTE-EXACT ** — CPU, VIC-II, CIA1/2, SID, VIA1/2, 1541 drive.
+done: 13 items. Advancing to drive-gcr [opus] — GCR read path → real disk LOAD (now
+unblocked by VIA2; the enabler for loading actual programs / the Phase-2 cracking workflow).
