@@ -31,14 +31,15 @@
     "drive-watchdog-phase"
   ],
   "note": "ARMED 5th attempt (user chose a). c64re runtime UP on ws://127.0.0.1:4312 (session integrated-1, scramble mounted, drive8-cpu/iec trace streaming). TRX64 locks track-1 first SYNC at drive_clk=7901947, gcr_head_offset=33595, zone 3. Builder drives the live c64re for the TS-side track-1-lock measurement (drive_clk+offset) + fixes the rotation_1541_simple accum-carry / rotate_disk clk-granularity. Gate scramble-load-progress RED->GREEN.",
-  "updated": "2026-06-23T12:05:00Z",
+  "updated": "2026-06-23T12:34:00Z",
   "followups": [
     "sid-audio"
   ],
   "in_flight": {
     "item": "drive-seek-phase",
     "model": "opus",
-    "started": "2026-06-23T12:05:00Z"
+    "started": "2026-06-23T12:34:00Z",
+    "note": "opus alive 30min: ARMED measurement underway — 85MB c64re trace captured (scramble boot+load on the reference runtime), correlating in TRX64 (iec_load_probe edited ~2min ago). No production commit yet — measure+correlate phase, then the rotation fix. Defer."
   },
   "stage2_items": [],
   "resolved": [
