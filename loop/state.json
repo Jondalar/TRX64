@@ -24,8 +24,8 @@
     "drive-gcr (encoding+mount)",
     "drive-load (controller+ATN+read-stream)"
   ],
-  "note": "iec-serial was a DIAGNOSIS (IEC serial works; not a feature). LOAD blocker re-framed as drive-read-engine [opus]: GCR read job returns $03 not $01 — fix sync/byte-latch vs $F556. GATE ON JOB-STATUS not just trace (disk-read-engage trace passed but job fails). Disk-LOAD chain so far: drive-via2->drive-gcr->drive-load->[iec-serial diag]->drive-read-engine.",
-  "updated": "2026-06-23T03:10:00Z",
+  "note": "drive-read-engine [opus]: fix GCR sector read $03->$01. Data byte-exact + SYNC present but sector-assembly fails. Cross-check drive-cpu trace at $F556 vs TS to localize byte-latch/sync divergence. GATE ON JOB-STATUS + sector bytes (not trace).",
+  "updated": "2026-06-23T03:20:00Z",
   "followups": [
     "daemon-trace-query",
     "vic-sprites-modes",
@@ -33,7 +33,11 @@
     "drive-watchdog-phase",
     "sid-audio"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "drive-read-engine",
+    "model": "opus",
+    "started": "2026-06-23T03:20:00Z"
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
