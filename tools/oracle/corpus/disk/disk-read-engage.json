@@ -1,0 +1,60 @@
+{
+  "name": "disk-read-engage",
+  "slice": "drive",
+  "trace": true,
+  "steps": [
+    {
+      "method": "session/create",
+      "params": {
+        "pal": true
+      },
+      "capture": true,
+      "label": "create"
+    },
+    {
+      "method": "media/ingress",
+      "params": {
+        "session_id": "$sessionId",
+        "kind": "disk",
+        "path": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/scramble_infinity.d64"
+      },
+      "capture": true,
+      "label": "mount"
+    },
+    {
+      "method": "trace/start_domains",
+      "params": {
+        "session_id": "$sessionId",
+        "domains": [
+          "drive8-cpu"
+        ]
+      },
+      "capture": true,
+      "label": "trace-start"
+    },
+    {
+      "method": "session/run",
+      "params": {
+        "session_id": "$sessionId",
+        "cycles": 100000
+      },
+      "label": "run"
+    },
+    {
+      "method": "trace/run/stop",
+      "params": {
+        "session_id": "$sessionId",
+        "wait_index": true
+      },
+      "label": "trace-stop"
+    },
+    {
+      "method": "trace/run/status",
+      "params": {
+        "session_id": "$sessionId"
+      },
+      "capture": true,
+      "label": "trace-status"
+    }
+  ]
+}
