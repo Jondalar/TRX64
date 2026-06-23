@@ -22,8 +22,8 @@
     "drive-via2",
     "sid"
   ],
-  "note": "ALL CORE CHIPS byte-exact (CPU/VIC/CIA/SID/VIA1+2/Drive). sid done. Next: drive-gcr [opus] — GCR read path → real disk LOAD (the cracking-workflow enabler, now unblocked by VIA2). Then completeness/corner reste.",
-  "updated": "2026-06-23T01:10:00Z",
+  "note": "drive-gcr [opus]: GCR bitstream (D64->GCR) + rotating disk + byte-ready via VIA2 + DOS sector read + full IEC LOAD handshaking. Gate = mount sample D64 + LOAD + program-in-RAM parity vs TS. Large, likely multi-iteration.",
+  "updated": "2026-06-23T01:20:00Z",
   "followups": [
     "drive-gcr (GCR read → disk LOAD; high value for cracking)",
     "daemon-trace-query",
@@ -32,7 +32,11 @@
     "drive-watchdog-phase",
     "sid-audio (Phase 1.5: reSID PCM/WAV)"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "drive-gcr",
+    "model": "opus",
+    "started": "2026-06-23T01:20:00Z"
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
