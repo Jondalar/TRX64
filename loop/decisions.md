@@ -786,3 +786,23 @@ first drifts -> THEN fix the per-poll phase (bit-cell-exact) WITHIN rotation_154
 **Why:** 10 attempts; the bug is finally a CONCRETE, near-physical symptom (head on an empty track from an
 accumulated per-poll decode-phase drift), with an exact empirical validation path. This is the user's deepest
 domain (custom $DD00 loader + GCR timing).
+
+## ADR-052 — BVC/BVS/PHP/CLV drive SO-rotate clk fidelity fix (Rust omitted TS CLK_ADD(-1))
+**Context:** manual Rust-vs-TS source-diff (user method) of the drive 6510 SO-opcode rotate timing.
+**Found divergence:** drive.rs step_instruction did the byte-ready/SO rotate (BVC/BVS/PHP/CLV) at the
+opcode-FETCH boundary at `bus.clk` (= instruction-start clk S), omitting the TS/VICE clk offset:
+drive_6510core.ts fetches opcode+operand (CLK_ADD(2) → case body at S+2), then BVC/BVS do
+`CLK_ADD(-1); rotate; CLK_ADD(1)` → rotate at S+1; PHP/CLV rotate at the case body S+2. The Rust
+rotated all four at S (1-2 drive cycles early), shifting the byte-ready edge.
+**Fix:** rotate BVC/BVS at `bus.clk+1`, PHP/CLV at `bus.clk+2` — matching the TS sample clk.
+**Result:** regression-clean — scramble-load-file, disk-read-byteexact, drive-boot-deep, disk-load-dir
+GREEN; unit tests pass. A faithful TS-matching fidelity correction.
+**NOT the scramble fix:** the dd00_loader_bar probe is BYTE-IDENTICAL with/without the fix (bar stuck $20,
+drive 87% in the $0402 spin) — the custom loader NEVER executes a SO opcode; it polls VIA2 directly
+(LDA ($3B,X) BMI on $1CF0/SYNC, $1F05/T1). So this corrects a real latent divergence (any BVC-byte-ready
+custom loader) but the scramble stall is elsewhere.
+**Remaining suspect (last un-diffed Rust-specific layer):** the cross-domain catch-up model — full.rs
+push-flush-on-$DD00-access (iec_catch_up_to / drive.catch_up_to) vs the TS continuous interleave. The
+tight $04E2 BIT $DD00 / BVC loop touches $DD00 every ~6 cycles → very frequent catch-ups; a per-catch-up
+phase the KERNAL load (rarer $DD00) tolerates but the bit-bang loop may not. CIA/IEC/rotation-engine/
+call-sites/SO-path all verified faithful or not-in-loader-path.

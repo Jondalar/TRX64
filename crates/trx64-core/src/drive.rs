@@ -1029,19 +1029,37 @@ impl Drive1541 {
             } else {
                 bus.ram[(pc & 0x07FF) as usize]
             };
+            // The rotate samples the rotational position at the SAME absolute drive
+            // clk VICE/TS samples it (drive_6510core.ts). The Rust peek runs at the
+            // instruction-start clk `S` (= bus.clk, before the opcode/operand fetch),
+            // whereas the TS rotates from the post-fetch clk `S+2` (CLK_ADD(2)):
+            //   - BVC/BVS: TS does `CLK_ADD(-1); rotate; CLK_ADD(1)` → rotate at S+1.
+            //   - PHP/CLV: TS rotates at the case body (no -1) → S+2.
+            // We omitted that offset (rotated at S), making the byte-ready edge land
+            // ~1-2 drive cycles early — tolerated by the SO-driven standard DOS read
+            // but NOT by a tight direct-poll custom loader (the per-byte phase drifts
+            // and the decoded byte → stepper phase → head track diverges).
             match op {
-                // BVC / BVS / PHP: rotate + byte-ready edge → V flag.
-                0x50 | 0x70 | 0x08 => {
-                    bus.rotation.rotate_disk(bus.clk);
+                // BVC / BVS: V-flag read cycle = S+1.
+                0x50 | 0x70 => {
+                    bus.rotation.rotate_disk(bus.clk.wrapping_add(1));
+                    if bus.rotation.byte_ready_edge != 0 {
+                        bus.rotation.byte_ready_edge = 0;
+                        cpu.reg_p |= 0x40; // P_OVERFLOW
+                    }
+                }
+                // PHP: rotate at the case-body clk (no -1) = S+2.
+                0x08 => {
+                    bus.rotation.rotate_disk(bus.clk.wrapping_add(2));
                     if bus.rotation.byte_ready_edge != 0 {
                         bus.rotation.byte_ready_edge = 0;
                         cpu.reg_p |= 0x40; // P_OVERFLOW
                     }
                 }
                 // CLV: LOCAL_SET_OVERFLOW(0) → rotate + clear the byte-ready edge
-                // (drive_6510core.ts:486-493) so the next byte re-arms cleanly.
+                // (drive_6510core.ts:486-493) at the case-body clk = S+2.
                 0xB8 => {
-                    bus.rotation.rotate_disk(bus.clk);
+                    bus.rotation.rotate_disk(bus.clk.wrapping_add(2));
                     bus.rotation.byte_ready_edge = 0;
                 }
                 _ => {}
