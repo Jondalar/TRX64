@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "iec-crossdomain-sync",
+  "current_item": "custom-loader-gate",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -24,23 +24,19 @@
     "drive-gcr (encoding+mount)",
     "drive-load (controller+ATN+read-stream)",
     "drive-read-engine",
-    "disk-load-e2e (keyboard matrix)"
+    "disk-load-e2e (keyboard matrix)",
+    "iec-crossdomain-sync (STANDARD LOAD complete)"
   ],
-  "note": "iec-crossdomain-sync [opus] KEYSTONE: drive must see C64 IEC lines at the DRIVE clk when polling $1800 (not a snapshot refreshed only on C64 $DD00 access). Bidirectional cycle-exact cross-domain sync. Fix site full.rs iec_push_flush_to + drive.rs $1800. TS drive-trace diff at clk 4945495-4945509. Unblocks LOAD + custom loaders.",
-  "updated": "2026-06-23T05:35:00Z",
+  "note": "MILESTONE: STANDARD LOAD COMPLETE — LOAD\"$\",8 byte-exact (disk-load-dir GREEN), cross-domain IEC sync cycle-exact. Next: custom-loader-gate [opus] on scramble_infinity.d64 — the ACID TEST (user-pinned): LOAD\"*\",8 bootstrap -> custom $DD00 loader (now reachable, same cross-domain model). Trace-diff vs TS.",
+  "updated": "2026-06-23T05:50:00Z",
   "followups": [
     "daemon-trace-query",
     "vic-sprites-modes",
     "cia-cascade",
     "drive-watchdog-phase",
-    "sid-audio",
-    "custom-loader-gate [opus] — ACID TEST: scramble_infinity.d64 ($DD00 bitbang + VIC raster sync, the user-flagged hardest case). Standard LOAD lands the bootstrap, then the loaded code installs the custom $DD00 loader for the bulk. Trace-diff vs TS catches 1-cycle desync."
+    "sid-audio"
   ],
-  "in_flight": {
-    "item": "iec-crossdomain-sync",
-    "model": "opus",
-    "started": "2026-06-23T05:35:00Z"
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"

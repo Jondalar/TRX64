@@ -410,3 +410,17 @@ IEC. Carved iec-crossdomain-sync [opus]: bidirectional cycle-exact cross-domain 
 C64 lines at the drive's clk when it polls $1800), via a TS drive-cpu trace diff at 4945495–
 4945509. Fix site: full.rs iec_push_flush_to + drive.rs $1800 read. Advancing to it — the heart
 of the IEC story the user cares most about.
+
+## 2026-06-23 — DRIVER: STANDARD LOAD COMPLETE (iec-crossdomain-sync GREEN)
+
+Keystone done. Root cause confirmed + fixed: drive snapshotted drv_port once per flush, so its
+own $1800 pulls were invisible to later reads. Fix (VICE via1d1541 store_prb): a $1800 PB/DDRB
+store that changes the composed PB output re-folds drv_port (output-change-gated → idle/boot
+untouched); cpu_bus threaded to the drive. Confirmation gate INDEPENDENT (the builder couldn't
+run the oracle): disk-load-dir GREEN — LOAD"$",8 lands the 640-byte directory byte-exact + EOI;
+full regression GREEN, no regression. ADR-038. Merged.
+
+** STANDARD LOAD COMPLETE ** — the disk-LOAD onion is fully peeled (via2→gcr→load→read-engine→
+keyboard→crossdomain-sync), every layer byte-exact. The cross-domain IEC model is now cycle-
+exact — the SAME model custom-loader $DD00 bitbang needs. Advancing to custom-loader-gate [opus]
+on scramble_infinity.d64 — the user-pinned ACID TEST, now reachable.

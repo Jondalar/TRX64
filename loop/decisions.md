@@ -483,3 +483,22 @@ DRIVE's clk when it polls $1800). Fix site: full.rs iec_push_flush_to + drive.rs
 DATA-sample instant. Must not regress bytes 1–10 or the GREEN disk gates.
 **Why:** The current lazy snapshot model is too coarse for cycle-tight IEC bit-bang. Fixing it
 cycle-exactly is the prerequisite for both LOAD completion and custom loaders.
+
+## ADR-038 — STANDARD LOAD COMPLETE: IEC cross-domain sync cycle-exact (keystone done)
+**Context:** the keystone — fix the cross-domain sampling skew (ADR-037) so the drive sees
+its own + the C64's IEC pulls cycle-exactly.
+**Decision (accepted, GREEN + no regression):** Root cause confirmed: drv_port was snapshotted
+ONCE at flush start and held constant through the drive's multi-instruction catch-up, so the
+drive's OWN $1800 PB pulls were invisible to its subsequent $1800 reads (drv_port folds the
+wired-AND cpu_port = cpu_bus & drv_bus, which includes the drive's contribution). FIX (mirrors
+VICE via1d1541.c store_prb / TS via1d1541.ts): a drive $1800 PB/DDRB store that CHANGES the
+composed PB output (gated on byte != p_oldpb, matching VICE) immediately re-folds drv_port via
+new pure fn iec::fold_drv_port(cpu_bus, pb_out); cpu_bus threaded to the drive (Drive1541.
+iec_cpu_bus) at both push-flush sites. The output-change gate leaves idle/boot snapshot behavior
+untouched (no regression). RESULT: disk-load-dir GREEN — LOAD"$",8 lands the full 640-byte
+directory in $0801 byte-identical to TS, vartab=$0A7F, ST=$40 (EOI); the false $E999 send-abort
+is gone; C64 returns cleanly to BASIC. Full regression GREEN (boot/drive/disk/cia/sid). 69 core
+tests pass.
+**Why:** STANDARD LOAD is complete. This cross-domain model is the SAME one custom-loader $DD00
+bitbang relies on — so the user's acid test (scramble) is now reachable. Disk-LOAD onion fully
+peeled: via2→gcr→load→read-engine→keyboard→crossdomain-sync.
