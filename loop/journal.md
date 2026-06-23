@@ -489,3 +489,18 @@ byte-exact (timers/TOD/ICR/cascade) — one of the earliest deferred gaps (ADR-0
 
 done: 20 items. Advancing to drive-watchdog-phase [opus] (closes the drive-boot-deep known-RED).
 Phase-lead still escalated to user.
+
+## 2026-06-23 — DRIVER: drive-watchdog-phase done — drive-boot-deep GREEN (IRQ-dispatch fidelity)
+
+ADR-030 MISATTRIBUTED — not a timer-phase bug. drive-boot-deep's 3rd watchdog IRQ +2 was a drive-6502
+IRQ-DISPATCH-LATENCY gap. Fixed two unmodelled VICE interrupt_check_irq_delay behaviors in shared
+cpu.rs (OPINFO_DELAYS_INTERRUPT branch-delay + OPINFO_ENABLES_IRQ CLI-defer-full-instruction) + the
+daemon's 100k-cycle TRACE_DRAIN chunking. Confirmation gate INDEPENDENT + comprehensive: drive-boot-deep
++ full C64-IRQ regression (boot-trace-short/boot-basic-ready/iso-trace-broad/vic-badline-irq/cia/cascade)
++ disk all GREEN, workspace tests green — ZERO regression from the shared cpu.rs change. scramble-load-
+file BONUS-flipped GREEN. ADR-044. Merged. Global IRQ-dispatch fidelity improved.
+
+USER STEER (ADR-045): read the C64RE specs — Spec 218 = the EXACT custom-loader stall the TS team hit,
+root cause stepInward off-by-one past track 35 (matches ADR-041's seek/step narrowing); Spec 612 =
+write_offset per-instance boundary doctrine. Arming the next phase-lead attempt (drive-seek-phase) with
+these — no longer blind. Advancing to drive-seek-phase.

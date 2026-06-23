@@ -598,3 +598,40 @@ collapse exactly as VICE collapses them. Re-arm alarms after every timer-mutatin
 iso-cia-cascade (reconstructed) + -irq + -oneshot all GREEN; the 4 existing CIA gates + boot-
 trace-short stay GREEN; 71 core tests. ADR-017 CLOSED.
 **Why:** The CIA is now fully byte-exact (timers/TOD/ICR/cascade) — the last CIA gap is gone.
+
+## ADR-044 — drive-watchdog-phase done: drive-boot-deep GREEN; root cause = IRQ-dispatch latency
+**Context:** the drive-boot-deep KNOWN-RED (3rd VIA2 T1 watchdog IRQ +2). ADR-030 attributed it to a
+T1 free-run reload PHASE bug.
+**Decision (accepted, GREEN + ZERO regression):** ADR-030 was a MISATTRIBUTION — the timer schedule
+(t1zero = rclk+1+tal) was already correct (testing +FULL_CYCLE_2 broke IRQ#1). The early IRQ was a
+drive-6502 IRQ-DISPATCH-LATENCY gap. Fixed two unmodelled VICE `interrupt_check_irq_delay` behaviors
+in the SHARED cpu.rs: (1) OPINFO_DELAYS_INTERRUPT — a taken branch w/o page-cross delays the next
+IRQ/NMI 1 cycle (6510core BRANCH macro); (2) OPINFO_ENABLES_IRQ — after an I-clearing opcode
+(CLI/PLP/RTI, 1→0) with an IRQ cycle-ready, VICE defers dispatch a FULL instruction (IK_IRQPEND).
+All 68 watchdog IRQ-entry cycles then matched. + daemon trace-chunking: replay the TS golden's
+100k-cycle TRACE_DRAIN segmentation (each runFor break overshoots ~1 instr, ~37 cyc over 20 segs).
+Independent comprehensive gate: drive-boot-deep + boot-trace-short + boot-basic-ready + iso-trace-broad
++ iso-vic-badline-irq + iso-cia/cascade + disk-load-dir + disk-read-byteexact ALL GREEN; workspace
+tests green. BONUS: scramble-load-file flipped GREEN. This is a global CPU IRQ-dispatch FIDELITY
+improvement (the shared change helps the C64 too).
+**Why:** The interrupt-dispatch boundary was the real divergence — the same "VICE C-indirection lost
+in a cleaner abstraction" class Spec 612 warns about (just IRQ-delay, not write_offset). known_red now
+= only scramble-load-progress (the custom-loader phase-lead).
+
+## ADR-045 — C64RE specs are the KEY for the phase-lead (user steer)
+**Context:** user pointed to the C64RE specs — "we had this there too" — re the custom-loader phase-lead.
+**Findings (durable references for the next phase-lead attempt):**
+- **Spec 218** (specs/_archive/218-motm-tx3-tx4-bit-level-divergence.md, CLOSED): the TS team hit the
+  EXACT custom-fastloader stall (MoTM LOAD"*",8,1, $DD00 bitbang). ROOT CAUSE: `stepInward` off-by-one
+  let the drive head step PAST track 35 (mechanical stop) on G64 extended tracks → GCR shifter bound to
+  the wrong track → no-SYNC → loader stalls. FIX: cap stepInward at the track-35 mechanical stop. This
+  MATCHES ADR-041's narrowing of the phase-lead to "seek/step + GCR head-advance at sector-lock."
+- **Spec 612** (1541 Port Fidelity Rules): every VICE C-indirection (alarm ctx, write_offset, clk_ptr/
+  rmw_flag refs) that a "cleaner" port replaced → boundary divergence. PL-6: write_offset is PER-VIA-
+  INSTANCE, not hardcoded. viacore.ts:529 `rclk = clk_ptr - write_offset` feeds BOTH the VIA T1 alarm
+  clk AND the $DD00 cross-domain callback (`rclk + (write_offset?0:1)`).
+**Decision:** Arm the next phase-lead attempt (`drive-seek-phase`) with Spec 218 (head-stepping/track-35)
++ Spec 612 (write_offset per-instance) + the $4000→W425C→$1800/$DD00 transaction-diff playbook. The
+phase-lead is very likely a drive head-stepping / seek-timing OR write_offset boundary divergence — NOT
+blind anymore.
+**Why:** The TS team already walked this exact path; reuse their root cause + doctrine.

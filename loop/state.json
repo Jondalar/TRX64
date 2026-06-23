@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "drive-watchdog-phase",
+  "current_item": "drive-seek-phase",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -27,30 +27,23 @@
     "disk-load-e2e (keyboard matrix)",
     "iec-crossdomain-sync (STANDARD LOAD complete)",
     "vic-sprites-modes",
-    "cia-cascade"
+    "cia-cascade",
+    "drive-watchdog-phase"
   ],
-  "note": "drive-watchdog-phase [opus]: close drive-boot-deep known-RED. 3rd VIA2 T1 watchdog IRQ fires 2 drive-cycles early (trace[212703] @cyc 1048810 vs got 1048808). Diagnosed: inter-re-arm t1zero spacing 15000 vs instruction period 14998 = +2 (FULL_CYCLE_2) phase error in the VIA2 T1 free-run reschedule. Trace-diff VIA2 T1 reschedule vs TS at the 3rd $F99F STA $1C05 re-arm.",
-  "updated": "2026-06-23T10:49:00Z",
+  "note": "drive-watchdog-phase done (drive-boot-deep GREEN; root cause was IRQ-dispatch latency in cpu.rs, NOT timer-phase — global IRQ fidelity improved, zero C64 regression; scramble-load-file bonus-GREEN). 21 items. Next: drive-seek-phase [opus] — the custom-loader phase-lead, NOW ARMED with C64RE Spec 218 (stepInward/track-35) + Spec 612 (write_offset per-instance) per user steer (ADR-045).",
+  "updated": "2026-06-23T11:10:00Z",
   "followups": [
     "daemon-trace-query",
     "sid-audio"
   ],
-  "in_flight": {
-    "item": "drive-watchdog-phase",
-    "model": "opus",
-    "started": "2026-06-23T10:49:00Z",
-    "note": "opus alive 30min: T1 phase debug (drive.rs+cpu.rs+wdbg test+.bak backup, edited <1min). No commit yet. Watch cpu.rs regression at gate. Defer. If returns unsolved, re-dispatch with write_offset insight (viacore:529)."
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
   ],
   "known_red": [
-    "drive-boot-deep (drive-watchdog-phase)",
-    "scramble-load-progress (iec-serial-rate, serial-load rate skew)"
+    "scramble-load-progress (drive-seek-phase: custom-loader phase-lead)"
   ],
   "custom_loader_test_disk": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/scramble_infinity.d64",
-  "blocked": [
-    "disk-load-phase-lead (custom loader): ~17-20k rotational-phase lead at sector-lock; 3 opus theories falsified (rate, attach_clk); narrowed to seek/step + GCR head-advance; ESCALATED to user (ADR-041)"
-  ]
+  "blocked": []
 }
