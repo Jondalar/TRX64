@@ -395,3 +395,18 @@ $EBFF/$EC00 idle instead of talk-send. Drive doesn't latch "addressed-to-TALK" a
 release. Carved to iec-talk-turnaround [opus]. Keyboard/IEC/GCR all verified green.
 Advancing to iec-talk-turnaround. (Custom-loader $DD00-bitbang gate tracked as the eventual
 acid test — user-flagged as the hardest case, where $DD00 + VIC couple.)
+
+## 2026-06-23 — DRIVER: iec-talk-turnaround = ROOT CAUSE (IEC cross-domain sampling skew)
+
+Test-only probe (no production change), regression GREEN. REFINED the diagnosis: the
+turnaround + first 10 directory bytes are byte-exact (drive DOES engage as talker). Real
+blocker root-caused (ADR-037): cross-domain sampling SKEW — the drive reads the C64 IEC lines
+from a snapshot refreshed only on C64 $DD00 access; mid-bitbang the drive runs ahead and at clk
+4945505 (drive $E961) samples a STALE C64 DATA → aborts the talk-send → C64 hangs ACPTR $EE67.
+
+THIS IS THE KEYSTONE: it underlies BOTH standard LOAD AND the custom-loader $DD00 bitbang (the
+user-flagged hardest case — same class). The current lazy snapshot is too coarse for cycle-tight
+IEC. Carved iec-crossdomain-sync [opus]: bidirectional cycle-exact cross-domain sync (drive sees
+C64 lines at the drive's clk when it polls $1800), via a TS drive-cpu trace diff at 4945495–
+4945509. Fix site: full.rs iec_push_flush_to + drive.rs $1800 read. Advancing to it — the heart
+of the IEC story the user cares most about.

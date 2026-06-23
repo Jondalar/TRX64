@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "iec-talk-turnaround",
+  "current_item": "iec-crossdomain-sync",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -26,8 +26,8 @@
     "drive-read-engine",
     "disk-load-e2e (keyboard matrix)"
   ],
-  "note": "iec-talk-turnaround [opus]: drive must latch addressed-to-TALK across ATN-release + enter talk-send (pull CLK). C64 spins ACPTR $EE67; drive sits at $EBFF/$EC00 idle. Fix the drive DOS attention/turnaround so it engages as talker -> directory bytes flow to $0801.",
-  "updated": "2026-06-23T05:05:00Z",
+  "note": "KEYSTONE root cause found (ADR-037): IEC cross-domain sampling skew — drive samples stale C64 DATA snapshot mid-bitbang (refreshed only on C64 $DD00 access). Underlies BOTH standard LOAD (byte 11 abort, drive $E961) AND custom loaders. Next: iec-crossdomain-sync [opus] — bidirectional cycle-exact cross-domain sync. THE heart of the IEC story.",
+  "updated": "2026-06-23T05:30:00Z",
   "followups": [
     "daemon-trace-query",
     "vic-sprites-modes",
@@ -36,11 +36,7 @@
     "sid-audio",
     "custom-loader-gate [opus] — ACID TEST: scramble_infinity.d64 ($DD00 bitbang + VIC raster sync, the user-flagged hardest case). Standard LOAD lands the bootstrap, then the loaded code installs the custom $DD00 loader for the bulk. Trace-diff vs TS catches 1-cycle desync."
   ],
-  "in_flight": {
-    "item": "iec-talk-turnaround",
-    "model": "opus",
-    "started": "2026-06-23T05:05:00Z"
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"

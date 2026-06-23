@@ -461,3 +461,25 @@ talk-send + pulling CLK; IEC lines cpu_port=$C0, drv_port=$85. Hypothesis: drive
 latch when ATN drops after the OPEN directory job). Keyboard/IEC/GCR all verified, not implicated.
 **Why:** Keyboard is a real, broadly-useful prerequisite (any typed input); the TALK turnaround
 is the next precisely-localized cycle-exact handshake.
+
+## ADR-037 — LOAD/custom-loader root cause: IEC cross-domain sampling skew (KEYSTONE)
+**Context:** iec-talk-turnaround REFINED the diagnosis (test-only probe, no production change):
+the LISTEN→TALK turnaround + the first 10 directory bytes transfer BYTE-EXACT (the drive does
+engage as talker). The real blocker is one byte-boundary later.
+**The root cause (precise):** cross-domain sampling SKEW. The drive reads the C64's IEC lines
+(CLK/DATA/ATN) from the `iec_drv_port` snapshot in full.rs::iec_push_flush_to, which is refreshed
+ONLY on a C64 $DD00 access. During a tight bit-bang the drive runs MANY instructions per C64
+$DD00 read, so at clk 4945505 (drive PC=$E961, `BNE $E999`) it samples a STALE C64 DATA value
+(released) right where the C64's DATA output is mid-transition → the drive misreads it as
+stop/EOI and aborts the talk-send → C64 hangs in ACPTR $EE67. Final stall: cpu_port=$C0,
+drv_port=$85, $7A(talk)=$01.
+**Decision:** This is THE keystone of the whole IEC story — it underlies BOTH the remaining
+standard-LOAD blocker AND the custom-loader $DD00 bitbang (the user-flagged hardest case; same
+class). Carve `iec-crossdomain-sync` [opus]: make the drive see the C64's IEC line state at the
+cycle-exact instant it samples — bidirectional cross-domain catch-up (the existing push-flush
+syncs drive→C64-clk on $DD00 access; the missing piece is the drive's view of C64 lines at the
+DRIVE's clk when it polls $1800). Fix site: full.rs iec_push_flush_to + drive.rs $1800 read
+(~line 690). Approach: TS-oracle drive-cpu trace diff at clk 4945495–4945509 to find VICE's exact
+DATA-sample instant. Must not regress bytes 1–10 or the GREEN disk gates.
+**Why:** The current lazy snapshot model is too coarse for cycle-tight IEC bit-bang. Fixing it
+cycle-exactly is the prerequisite for both LOAD completion and custom loaders.
