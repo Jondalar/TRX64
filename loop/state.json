@@ -32,14 +32,15 @@
     "scramble-gold"
   ],
   "note": "dd00-loader-stall [opus] ARMED (option b). c64re reference runtime UP on 4312. The post-RUN custom $DD00 bit-bang loader STALLS (bar never fills, frozen 30M-120M; scramble-gold visual repro). Builder traces the post-RUN $DD00 bar-fill loop in BOTH c64re-reference + TRX64, finds the FIRST divergent drive/IEC event where TRX64s bar stops, fixes the $DD00/drive timing. Gate: scramble-gold loaderbar progresses toward the title (bar fills). User VICE trace (option a) pending as independent HW ground-truth.",
-  "updated": "2026-06-23T13:52:00Z",
+  "updated": "2026-06-23T13:55:00Z",
   "followups": [
     "sid-audio"
   ],
   "in_flight": {
     "item": "dd00-loader-stall",
     "model": "opus",
-    "started": "2026-06-23T13:52:00Z"
+    "started": "2026-06-23T13:55:00Z",
+    "note": "dd00-loader-stall [opus] re-dispatched SOURCE-DIFF PRIMARY (user steer): diff TRX64 iec.rs/cia.rs/$DD00 path vs VICE C sources at /Users/alex/Development/C64/Tools/vice/src (iecbus/iecbus.c, c64/c64cia2.c, core/ciacore.c, drive/iec/via1d1541.c, drive/iec/iec.c). Find the ported-wrong $DD00/IEC handshake logic that stalls the tight custom loop. c64re ref (4312) + scramble-gold repro to confirm the bar fills."
   },
   "stage2_items": [],
   "resolved": [
