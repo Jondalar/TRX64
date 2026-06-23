@@ -733,3 +733,27 @@ each $DD00/IEC path + c64re reference-trace + synthesize + fix-verify). 31 candi
 climb past post-LOAD $20 = bar filling), ~10-30s vs the >10min WS gate (which times out here).
 **Why:** The workflow killed a 6-attempt dead-end + delivered a precise, VICE-grounded, testable fix (H1) +
 a fast iteration loop. THIS is the value of the parallel multi-perspective attack.
+
+## ADR-050 — H1 falsified; ROOT CAUSE found: drive VIA2 byte-ready/SYNC/T1 coupling under direct-poll
+**Context:** dd00-loader-stall H1 test + H3 reference-diff (live c64re).
+**H1 (write-path single fold) FALSIFIED:** implemented the VICE-faithful single fold (split iec_push_flush_to
+into a read-path fold + write-path iec_catch_up_to with drive_set_data_no_fold; the $DD00 write now lets
+c64_store_dd00 do the SINGLE wired-AND fold vs the NEW cpu_bus, matching iecbus_cpu_write_conf1 — TRX64 had
+double-folded). Result: BIT-IDENTICAL to baseline (the C64 spin is pure reads; the write fold gives the same
+final state when cpu_bus is unchanged). Regression-clean (71 tests, dir-load byte-exact). KEPT as a fidelity
+correction (removes a non-VICE double-fold).
+**H3 ROOT CAUSE (concrete, via live c64re reference diff):** the deadlock is NOT IEC. The drive's custom-loader
+$0402 loop (LDA ($3B,X)/BEQ / LDA ($11,X)/BMI $0402, X=$FE) polls VIA2 disk-controller registers DIRECTLY:
+($3B,X)→$1F05 = VIA2 T1C-H (timer1 high), ($11,X)→$1CF0 = VIA2 PRB, BMI tests bit7 = SYNC. It is a GCR-read /
+byte-ready / SYNC wait on VIA2 ($1C00), NOT an IEC line. The c64re REFERENCE drive cycles $0402↔$0260 ($1C05
+T1 wait)↔$07Ax (bit-bang SEND)↔$EC1x ROM and reaches the CLK-toggle send. TRX64 stays PINNED in $0402-$0408
+(1.5M cyc), NEVER drives the send → drive PB stays $FD (PB3=1 = CLK held LOW) → the C64's $04E2 BIT $DD00 / BVC
+(waits bit6=CLK_in HIGH) spins forever. The IEC fold is CORRECT (PB3=1 ⇒ CLK low ⇒ cpu_port bit6=0 is right).
+**The real bug:** the VIA2-timer (T1 $1F05/$1C05) + byte-ready/SYNC (PRB bit7 $1CF0) coupling in the rotation
+model, UNDER DIRECT CPU POLLING. The standard DOS read works (dir-load byte-exact) because it uses
+byte-ready→SO (set_overflow/V); this custom loader polls VIA2 PRB bit7 + T1 directly in a CPU loop, exposing a
+VIA2/rotation byte-ready/SYNC/T1 coupling divergence TRX64's drive doesn't advance through. Fast probes added
+(dd00_loader_bar_probe, dd00_loader_decode_probe). NEXT: diff TRX64-vs-c64re VIA2 T1 + byte-ready/SYNC
+presentation at the $0402 loop — why the reference advances to $07Ax send + TRX64 stalls.
+**Why:** 6 phase-skew attempts + 2 IEC-fold attempts all chased the wrong layer; the live-reference drive-PC
+diff finally pinned it to the DRIVE's VIA2/GCR-read coupling under direct-poll — the deepest case, now exact.
