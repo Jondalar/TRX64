@@ -27,8 +27,8 @@
     "disk-load-e2e (keyboard matrix)",
     "iec-crossdomain-sync (STANDARD LOAD complete)"
   ],
-  "note": "MILESTONE: STANDARD LOAD COMPLETE — LOAD\"$\",8 byte-exact (disk-load-dir GREEN), cross-domain IEC sync cycle-exact. Next: custom-loader-gate [opus] on scramble_infinity.d64 — the ACID TEST (user-pinned): LOAD\"*\",8 bootstrap -> custom $DD00 loader (now reachable, same cross-domain model). Trace-diff vs TS.",
-  "updated": "2026-06-23T05:50:00Z",
+  "note": "custom-loader-gate [opus] ACID TEST: scramble_infinity.d64 — boot it (LOAD bootstrap -> custom $DD00 loader), trace-diff vs TS over the load + custom-loader run. Tests cycle-exact $DD00 bitbang + VIC sync (the user-flagged hardest case). Cross-domain sync (just fixed) is the foundation.",
+  "updated": "2026-06-23T06:05:00Z",
   "followups": [
     "daemon-trace-query",
     "vic-sprites-modes",
@@ -36,7 +36,11 @@
     "drive-watchdog-phase",
     "sid-audio"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "custom-loader-gate",
+    "model": "opus",
+    "started": "2026-06-23T06:05:00Z"
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
