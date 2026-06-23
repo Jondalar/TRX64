@@ -27,8 +27,8 @@
     "disk-load-e2e (keyboard matrix)",
     "iec-crossdomain-sync (STANDARD LOAD complete)"
   ],
-  "note": "Acid test surfaced the precise blocker: standard serial-load RATE skew ~2.5% (TRX64 ahead, $AE/end4 at 8M). scramble-load-file GREEN (file load byte-exact). Next: iec-serial-rate [opus] — close the per-byte serial cadence vs CIA1-Timer-A. Then custom $DD00 loader reachable. THIS is the user-flagged $DD00+timing crux.",
-  "updated": "2026-06-23T07:10:00Z",
+  "note": "iec-serial-rate [opus]: close ~2.5% (~26 cyc/byte) per-byte serial-load rate skew (TRX64 ahead). Trace-diff the per-byte serial transfer (drive-cpu + C64-cpu) vs TS to find the inter-byte cycle drift. Gate: scramble-load-progress RED->GREEN. Then custom $DD00 loader reachable.",
+  "updated": "2026-06-23T07:20:00Z",
   "followups": [
     "custom-loader-gate (acid test — reachable after iec-serial-rate)",
     "daemon-trace-query",
@@ -37,7 +37,11 @@
     "drive-watchdog-phase",
     "sid-audio"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "iec-serial-rate",
+    "model": "opus",
+    "started": "2026-06-23T07:20:00Z"
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
