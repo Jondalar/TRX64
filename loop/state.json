@@ -28,14 +28,18 @@
     "iec-crossdomain-sync (STANDARD LOAD complete)",
     "vic-sprites-modes"
   ],
-  "note": "vic-sprites-modes done — VIC renderer fully pixel-exact (sprites + all modes + fine-scroll). 19 items. Next: cia-cascade [opus] (chained timers via VICE alarm scheduler, ADR-017). Phase-lead still ESCALATED to user (a/b/c, blocked).",
-  "updated": "2026-06-23T09:40:00Z",
+  "note": "cia-cascade [opus] (ADR-017): chained timers (TB counts TA underflows) byte-exact. The cia builder simplified per-cycle model over-counts (orig div iso-cia-cascade trace[43] cyc 89 exp=2 got=3); VICE ciaDoStepTb is alarm-dispatch-driven + lazy. Port the VICE maincpu alarm scheduler (ta_alarm/tb_alarm reschedule + IFR pipeline). Reconstruct iso-cia-cascade scenario. Keep iso-cia-ta-oneshot/-tb-continuous/-tod/-icr GREEN.",
+  "updated": "2026-06-23T09:50:00Z",
   "followups": [
     "daemon-trace-query",
     "drive-watchdog-phase",
     "sid-audio"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "cia-cascade",
+    "model": "opus",
+    "started": "2026-06-23T09:50:00Z"
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
