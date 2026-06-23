@@ -211,36 +211,52 @@ fn run_cycle_budget(session: &mut Session, budget: u64) {
     // Accumulate events from this run, then append to the persistent buffer.
     let mut obs = TracingObserver::with_channels(FrameSink::events_only(), channels);
 
-    if full_machine {
-        let mut steps: Vec<(u16, u8, u8, u8, u8, u8, u64)> = Vec::new();
-        session.machine.run_for_full(budget, &mut obs, |pc, a, x, y, sp, p, drv_clk| {
-            steps.push((pc, a, x, y, sp, p, drv_clk));
-        });
-        if drive_cpu_active {
+    // TRACE_DRAIN chunking (= TS ws-server.ts session/run): when a trace is
+    // active AND the budget exceeds 100k cycles, the golden runs the budget in
+    // 100k-cycle SEGMENTS (producer-side backpressure for the trace worker). Each
+    // segment is a separate `runFor` whose `clk - start >= seg` break resets per
+    // segment, so each segment overshoots by up to one instruction and the
+    // overshoot ACCUMULATES across segments. A single-pass run would overshoot
+    // only once, ending a few drive cycles short — diverging from the golden at
+    // the run tail (drive-boot-deep: ~8 trailing sampled records). Match the
+    // golden by replaying the same 100k segmentation here.
+    const TRACE_DRAIN_CYCLES: u64 = 100_000;
+    let mut remaining = budget;
+    while remaining != 0 {
+        let seg = remaining.min(TRACE_DRAIN_CYCLES);
+        remaining -= seg;
+
+        if full_machine {
+            let mut steps: Vec<(u16, u8, u8, u8, u8, u8, u64)> = Vec::new();
+            session.machine.run_for_full(seg, &mut obs, |pc, a, x, y, sp, p, drv_clk| {
+                steps.push((pc, a, x, y, sp, p, drv_clk));
+            });
+            if drive_cpu_active {
+                for (pc, a, x, y, sp, p, drv_clk) in steps {
+                    obs.emit_drive_step(pc, a, x, y, sp, p, drv_clk);
+                }
+            }
+        } else if drive_cpu_active {
+            let mut steps: Vec<(u16, u8, u8, u8, u8, u8, u64)> = Vec::new();
+            session.machine.run_for_drive_sampled(seg, &mut obs, |pc, a, x, y, sp, p, drv_clk| {
+                steps.push((pc, a, x, y, sp, p, drv_clk));
+            });
             for (pc, a, x, y, sp, p, drv_clk) in steps {
                 obs.emit_drive_step(pc, a, x, y, sp, p, drv_clk);
             }
+        } else if vic_active {
+            session.machine.run_for_vic(seg, &mut obs);
+        } else if channels.sid {
+            // SID isolation gate: routes $D400-$D7FF to the SID 6581 model.
+            // The `sid` domain has NO live trace producer (reserved, like vic —
+            // ADR-015 pattern); SID writes appear as op-0x11 RAM_WRITE from the
+            // CPU bus tap. The cpu/memory channels are co-enabled by `sid` domain.
+            session.machine.run_for_sid(seg, &mut obs);
+        } else if channels.mem {
+            session.machine.run_for_cia(seg, &mut obs);
+        } else {
+            session.machine.run_for_with(seg, &mut obs);
         }
-    } else if drive_cpu_active {
-        let mut steps: Vec<(u16, u8, u8, u8, u8, u8, u64)> = Vec::new();
-        session.machine.run_for_drive_sampled(budget, &mut obs, |pc, a, x, y, sp, p, drv_clk| {
-            steps.push((pc, a, x, y, sp, p, drv_clk));
-        });
-        for (pc, a, x, y, sp, p, drv_clk) in steps {
-            obs.emit_drive_step(pc, a, x, y, sp, p, drv_clk);
-        }
-    } else if vic_active {
-        session.machine.run_for_vic(budget, &mut obs);
-    } else if channels.sid {
-        // SID isolation gate: routes $D400-$D7FF to the SID 6581 model.
-        // The `sid` domain has NO live trace producer (reserved, like vic —
-        // ADR-015 pattern); SID writes appear as op-0x11 RAM_WRITE from the
-        // CPU bus tap. The cpu/memory channels are co-enabled by `sid` domain.
-        session.machine.run_for_sid(budget, &mut obs);
-    } else if channels.mem {
-        session.machine.run_for_cia(budget, &mut obs);
-    } else {
-        session.machine.run_for_with(budget, &mut obs);
     }
     if let Some(t) = session.trace.as_mut() {
         t.event_count += obs.event_count;

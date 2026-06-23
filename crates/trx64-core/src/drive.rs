@@ -270,20 +270,17 @@ impl Via6522 {
     /// before each VIA register access and before each drive-CPU IRQ sample so
     /// the IFR/IRQ state is current as of `clk`.
     ///
-    /// KNOWN RESIDUAL DIVERGENCE (drive-boot-deep, ~drive cycle 1.05M): this
-    /// model is byte-exact for the first TWO watchdog T1 IRQs but the THIRD T1
-    /// underflow lands 2 drive cycles early (candidate t1zero 1048795 vs golden
-    /// 1048797 — surfacing as `$FE68` IRQ entry @1048808 vs @1048810). The
-    /// $F99F watchdog `STA $1C05` re-arm stores at byte-identical instruction
-    /// boundaries to the golden (verified: $F99F→$F9A2 cycles match), and the
-    /// re-arm `t1zero = store_clk + 1 + tal` is correct for the boot arm and the
-    /// first re-arm, but the golden's third underflow is +2 — i.e. golden's
-    /// inter-re-arm t1zero spacing is 15000 while the matching instruction
-    /// period is 14998. The +2 is exactly FULL_CYCLE_2 and almost certainly
-    /// reflects a VICE free-run reload phase the eager `t1zero += full_cycle`
-    /// below does not reproduce when a free-run underflow falls between two
-    /// watchdog re-arms. Resolving it needs a VICE cross-check of the exact
-    /// t1reload anchor at the re-arm; the spec port alone is insufficient.
+    /// The T1 `t1zero` schedule (store re-arm `rclk+1+tal`, free-run reschedule
+    /// `t1zero += full_cycle`) is a faithful port of viacore.c and is byte-exact
+    /// against the golden for the full drive-boot-deep watchdog cadence. The
+    /// drive-boot-deep KNOWN-RED that historically surfaced here (the 3rd watchdog
+    /// T1 IRQ firing 2 drive cycles early) was NOT a timer bug at all — the timer
+    /// schedule was already correct. It was a drive-6502 IRQ-dispatch latency gap:
+    /// VICE's `interrupt_check_irq_delay` (drivecpu.c) delays the IRQ one extra
+    /// cycle after a taken-no-page-cross branch (OPINFO_DELAYS_INTERRUPT) and
+    /// defers it a full instruction after an I-clearing opcode (OPINFO_ENABLES_IRQ
+    /// → IK_IRQPEND). Both are now modelled in `cpu.rs`, which restored byte-exact
+    /// watchdog-IRQ entry cycles and let the early-firing diagnosis fall away.
     fn run_alarms(&mut self, clk: u64) {
         // T1 zero (viacore_t1_zero_alarm viacore.c:1306-1342).
         while self.t1_active && clk >= self.t1zero {

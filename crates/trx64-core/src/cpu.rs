@@ -130,6 +130,28 @@ pub struct Cpu6510 {
     /// OPINFO flag of the last fetched opcode: bit9 = DISABLES_IRQ (SEI/PLP path)
     /// so an IRQ pending BEFORE an SEI is still taken on the following boundary.
     last_opcode_disables_irq: bool,
+    /// VICE OPINFO_DELAYS_INTERRUPT: a branch TAKEN with NO page-cross delays the
+    /// IRQ/NMI by one extra cycle (6510core.c BRANCH macro → OPCODE_DELAYS_INTERRUPT;
+    /// interrupt_check_irq_delay bumps `irq_clk` by +1). Latched by `take_branch`
+    /// for the taken-no-pagecross case, consumed at the next boundary's IRQ/NMI
+    /// dispatch decision, then cleared on the next opcode fetch.
+    last_opcode_delays_irq: bool,
+    /// VICE OPINFO_ENABLES_IRQ: the last opcode cleared the I flag from 1→0
+    /// (CLI / PLP / RTI). When an IRQ is already pending and cycle-ready, VICE
+    /// does NOT take it on this boundary but defers a full instruction
+    /// (IK_IRQPEND). Set when the I-clearing transition is observed, cleared on
+    /// the next opcode fetch.
+    last_opcode_enables_irq: bool,
+    /// IK_IRQPEND latch: an IRQ was cycle-ready right after an ENABLES_IRQ opcode,
+    /// so its dispatch was deferred one instruction. The next boundary takes it
+    /// unconditionally (once the I flag is clear).
+    irq_pend_deferred: bool,
+    /// I-flag value captured at the start of the current opcode, to detect the
+    /// 1→0 enable transition for `last_opcode_enables_irq`.
+    irq_flag_at_fetch: bool,
+    /// The current opcode is one that CAN clear I (CLI 0x58 / PLP 0x28 / RTI 0x40).
+    /// Combined with the I 1→0 transition to resolve `last_opcode_enables_irq`.
+    last_opcode_could_enable_irq: bool,
     /// True once an interrupt source has ever been wired (selects the active
     /// boundary-dispatch path). FlatRam never sets this, so the isolated gate
     /// keeps the pure opcode-fetch boundary.
@@ -166,6 +188,11 @@ impl Default for Cpu6510 {
             irq_delay_cycles: 0,
             nmi_delay_cycles: 0,
             last_opcode_disables_irq: false,
+            last_opcode_delays_irq: false,
+            last_opcode_enables_irq: false,
+            irq_pend_deferred: false,
+            irq_flag_at_fetch: false,
+            last_opcode_could_enable_irq: false,
             irq_wired: false,
         }
     }
@@ -453,6 +480,13 @@ impl Cpu6510 {
         //    machine has wired an interrupt source; otherwise (FlatRam-isolated
         //    gate) this is skipped entirely and the path is byte-identical.
         if self.irq_wired {
+            // Resolve OPINFO_ENABLES_IRQ for the just-completed opcode: it enabled
+            // IRQs iff it was an I-clearing opcode (CLI/PLP/RTI) AND the I flag was
+            // SET at its fetch but is CLEAR now (a real 1→0 transition). VICE only
+            // sets ENABLES_IRQ on that transition (CLI macro: `if (LOCAL_INTERRUPT())`).
+            self.last_opcode_enables_irq =
+                self.last_opcode_could_enable_irq && self.irq_flag_at_fetch && (self.reg_p & P_INTERRUPT == 0);
+
             // NMI edge detection (rising edge latches nmi_pending).
             let nmi_level = self.nmi_level;
             if nmi_level && !self.prev_nmi_level {
@@ -465,7 +499,10 @@ impl Cpu6510 {
             // NMI first (precedence over IRQ). 2-cycle delay; BRK suppresses
             // NMI for one opcode (handled by lastOpcodeInfo — our BRK path is
             // separate microcode, so the boundary after BRK still samples).
-            if self.nmi_pending && self.nmi_delay_cycles >= INTERRUPT_DELAY {
+            // A taken-no-pagecross branch (last opcode) also delays the NMI by one
+            // extra cycle (VICE interrupt_check_nmi_delay bumps nmi_clk by +1).
+            let nmi_delay = INTERRUPT_DELAY + if self.last_opcode_delays_irq { 1 } else { 0 };
+            if self.nmi_pending && self.nmi_delay_cycles >= nmi_delay {
                 self.nmi_pending = false;
                 self.nmi_clk = CLOCK_MAX;
                 self.service_interrupt(bus, obs, 0xfffa);
@@ -474,15 +511,34 @@ impl Cpu6510 {
             }
             // IRQ: level-gated by the I flag (unless the last opcode was an
             // I-clearing one), delay-gated by the 2-cycle latency.
-            let delay = if self.last_opcode_disables_irq {
-                INTERRUPT_DELAY + 1
-            } else {
-                INTERRUPT_DELAY
-            };
-            if self.irq_level
-                && self.irq_delay_cycles >= delay
+            let mut delay = INTERRUPT_DELAY;
+            if self.last_opcode_disables_irq {
+                delay += 1;
+            }
+            // VICE interrupt_check_irq_delay: a taken-no-pagecross branch (last
+            // opcode) bumps irq_clk by +1, i.e. one extra cycle of IRQ latency.
+            if self.last_opcode_delays_irq {
+                delay += 1;
+            }
+            // VICE OPINFO_ENABLES_IRQ defer (interrupt_check_irq_delay): when the
+            // cycle delay is already met but the LAST opcode just enabled IRQs
+            // (CLI/PLP clearing I, RTI restoring I=0), the dispatch is deferred a
+            // full instruction (IK_IRQPEND) — NOT just one cycle. The +1-cycle
+            // bump above is too weak when the IRQ fired several cycles before the
+            // I-clearing opcode (`irq_delay_cycles` is then already large). Latch a
+            // pending-dispatch so the NEXT boundary takes it after exactly one more
+            // opcode executes, matching VICE's IK_IRQPEND hand-off.
+            let cycle_ready =
+                self.irq_level && self.irq_delay_cycles >= delay && (self.reg_p & P_INTERRUPT == 0);
+            if cycle_ready && self.last_opcode_enables_irq && !self.irq_pend_deferred {
+                // Defer exactly one instruction: arm the pending latch, do NOT
+                // dispatch on this boundary.
+                self.irq_pend_deferred = true;
+            } else if self.irq_level
                 && (self.reg_p & P_INTERRUPT == 0)
+                && (cycle_ready || self.irq_pend_deferred)
             {
+                self.irq_pend_deferred = false;
                 self.service_interrupt(bus, obs, 0xfffe);
                 self.interrupt_dispatched_this_cycle = true;
                 return;
@@ -498,6 +554,17 @@ impl Cpu6510 {
         // opcode is still serviced on the boundary AFTER it. We approximate VICE's
         // OPINFO by opcode value.
         self.last_opcode_disables_irq = matches!(opcode, 0x78 | 0x58 | 0x28 | 0x40);
+        // Capture the I-clearing-opcode predicate + the I flag BEFORE the opcode
+        // runs, so the next boundary can resolve OPINFO_ENABLES_IRQ (the 1→0
+        // transition). CLI/PLP/RTI can clear I; the actual transition is checked
+        // at the boundary in `start_instruction_cycle`.
+        self.last_opcode_could_enable_irq = matches!(opcode, 0x58 | 0x28 | 0x40);
+        self.irq_flag_at_fetch = self.reg_p & P_INTERRUPT != 0;
+        // The branch-delays-interrupt flag is a one-opcode latch: a fresh opcode
+        // fetch clears it (it only delays the dispatch on the boundary immediately
+        // after the taken branch). `take_branch` re-sets it for this opcode if it
+        // is itself a taken-no-pagecross branch.
+        self.last_opcode_delays_irq = false;
 
         let entry = MICROCODE_TABLE[opcode as usize];
         match entry {
@@ -842,6 +909,12 @@ impl Cpu6510 {
         self.tick(bus); // branch taken = +1 cycle
         if (old_pc & 0xff00) != (self.reg_pc & 0xff00) {
             self.tick(bus); // page cross = +1
+        } else {
+            // VICE 6510core.c BRANCH macro: a TAKEN branch with NO page-cross sets
+            // OPCODE_DELAYS_INTERRUPT → the next IRQ/NMI is delayed one extra cycle
+            // (interrupt_check_irq_delay bumps irq_clk by +1). Page-crossing taken
+            // branches do NOT delay (the extra fetch cycle absorbs the slack).
+            self.last_opcode_delays_irq = true;
         }
     }
 
