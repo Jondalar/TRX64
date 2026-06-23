@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "daemon-trace-query",
+  "current_item": "drive-seek-phase",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -30,12 +30,16 @@
     "cia-cascade",
     "drive-watchdog-phase"
   ],
-  "note": "drive-seek-phase: 4th theory, Spec 218 disproved for scramble (seek correct). Real fidelity progress merged (store_prb rotate + #1083, zero regression). Lead narrowed to the rotation accum-carry at the track-1 lock; needs ONE measurement (TS drive_clk+offset at track-1 sync — c64re runtime). ESCALATED. Loop routes to daemon-trace-query, then sid-audio. Phase-lead = the only known-RED, BLOCKED awaiting user steer.",
-  "updated": "2026-06-23T11:55:00Z",
+  "note": "ARMED 5th attempt (user chose a). c64re runtime UP on ws://127.0.0.1:4312 (session integrated-1, scramble mounted, drive8-cpu/iec trace streaming). TRX64 locks track-1 first SYNC at drive_clk=7901947, gcr_head_offset=33595, zone 3. Builder drives the live c64re for the TS-side track-1-lock measurement (drive_clk+offset) + fixes the rotation_1541_simple accum-carry / rotate_disk clk-granularity. Gate scramble-load-progress RED->GREEN.",
+  "updated": "2026-06-23T12:05:00Z",
   "followups": [
     "sid-audio"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "drive-seek-phase",
+    "model": "opus",
+    "started": "2026-06-23T12:05:00Z"
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
