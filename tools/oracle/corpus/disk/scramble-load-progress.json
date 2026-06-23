@@ -1,0 +1,232 @@
+{
+  "name": "scramble-load-progress",
+  "slice": "full",
+  "trace": false,
+  "steps": [
+    {
+      "method": "session/create",
+      "params": {
+        "pal": true
+      },
+      "capture": true,
+      "label": "create"
+    },
+    {
+      "method": "media/ingress",
+      "params": {
+        "session_id": "$sessionId",
+        "kind": "disk",
+        "path": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/scramble_infinity.d64"
+      },
+      "capture": true,
+      "label": "mount"
+    },
+    {
+      "method": "session/run",
+      "params": {
+        "session_id": "$sessionId",
+        "cycles": 2000000
+      },
+      "label": "boot-1"
+    },
+    {
+      "method": "session/run",
+      "params": {
+        "session_id": "$sessionId",
+        "cycles": 2000000
+      },
+      "label": "boot-2"
+    },
+    {
+      "method": "session/type",
+      "params": {
+        "session_id": "$sessionId",
+        "text": "LOAD\"*\",8,1\r",
+        "hold_cycles": 80000,
+        "gap_cycles": 80000
+      },
+      "label": "type-load"
+    },
+    {
+      "method": "session/run",
+      "params": {
+        "session_id": "$sessionId",
+        "cycles": 1000000
+      },
+      "label": "L1"
+    },
+    {
+      "method": "api/call",
+      "params": {
+        "session_id": "$sessionId",
+        "method": "monitorMemory",
+        "args": [
+          174,
+          175
+        ]
+      },
+      "capture": true,
+      "label": "end1"
+    },
+    {
+      "method": "session/run",
+      "params": {
+        "session_id": "$sessionId",
+        "cycles": 1000000
+      },
+      "label": "L2"
+    },
+    {
+      "method": "api/call",
+      "params": {
+        "session_id": "$sessionId",
+        "method": "monitorMemory",
+        "args": [
+          174,
+          175
+        ]
+      },
+      "capture": true,
+      "label": "end2"
+    },
+    {
+      "method": "session/run",
+      "params": {
+        "session_id": "$sessionId",
+        "cycles": 1000000
+      },
+      "label": "L3"
+    },
+    {
+      "method": "api/call",
+      "params": {
+        "session_id": "$sessionId",
+        "method": "monitorMemory",
+        "args": [
+          174,
+          175
+        ]
+      },
+      "capture": true,
+      "label": "end3"
+    },
+    {
+      "method": "session/run",
+      "params": {
+        "session_id": "$sessionId",
+        "cycles": 1000000
+      },
+      "label": "L4"
+    },
+    {
+      "method": "api/call",
+      "params": {
+        "session_id": "$sessionId",
+        "method": "monitorMemory",
+        "args": [
+          174,
+          175
+        ]
+      },
+      "capture": true,
+      "label": "end4"
+    },
+    {
+      "method": "session/run",
+      "params": {
+        "session_id": "$sessionId",
+        "cycles": 1000000
+      },
+      "label": "L5"
+    },
+    {
+      "method": "api/call",
+      "params": {
+        "session_id": "$sessionId",
+        "method": "monitorMemory",
+        "args": [
+          174,
+          175
+        ]
+      },
+      "capture": true,
+      "label": "end5"
+    },
+    {
+      "method": "session/run",
+      "params": {
+        "session_id": "$sessionId",
+        "cycles": 1000000
+      },
+      "label": "L6"
+    },
+    {
+      "method": "api/call",
+      "params": {
+        "session_id": "$sessionId",
+        "method": "monitorMemory",
+        "args": [
+          174,
+          175
+        ]
+      },
+      "capture": true,
+      "label": "end6"
+    },
+    {
+      "method": "session/run",
+      "params": {
+        "session_id": "$sessionId",
+        "cycles": 1000000
+      },
+      "label": "L7"
+    },
+    {
+      "method": "api/call",
+      "params": {
+        "session_id": "$sessionId",
+        "method": "monitorMemory",
+        "args": [
+          174,
+          175
+        ]
+      },
+      "capture": true,
+      "label": "end7"
+    },
+    {
+      "method": "session/run",
+      "params": {
+        "session_id": "$sessionId",
+        "cycles": 1000000
+      },
+      "label": "L8"
+    },
+    {
+      "method": "api/call",
+      "params": {
+        "session_id": "$sessionId",
+        "method": "monitorMemory",
+        "args": [
+          174,
+          175
+        ]
+      },
+      "capture": true,
+      "label": "end8"
+    },
+    {
+      "method": "api/call",
+      "params": {
+        "session_id": "$sessionId",
+        "method": "monitorMemory",
+        "args": [
+          2049,
+          3648
+        ]
+      },
+      "capture": true,
+      "label": "loaded-region"
+    }
+  ]
+}
