@@ -31,14 +31,15 @@
     "drive-watchdog-phase"
   ],
   "note": "scramble-gold [opus] (user steer): recycle the c64re gold-gate APPROACH as a TS-vs-TRX64 behavioral differential. Both daemons speak WS + both render pixel-exact. Drive both through the full scramble load (mount + type LOAD + type RUN + run to loaderbar ~30M) + screenshot + pixel-diff. GREEN loaderbar = custom $DD00 loader runs pixel-exact (the real acid test). Replaces the cycle-exact end4 nitpick (scramble-load-progress, sample-boundary artifact). If it DIVERGES -> the REAL custom-loader bug (behavioral, fixable).",
-  "updated": "2026-06-23T13:05:00Z",
+  "updated": "2026-06-23T13:35:00Z",
   "followups": [
     "sid-audio"
   ],
   "in_flight": {
     "item": "scramble-gold",
     "model": "opus",
-    "started": "2026-06-23T13:05:00Z"
+    "started": "2026-06-23T13:35:00Z",
+    "note": "opus alive 30min: harness committed (ddaad9f), gate ran (scramble-gold-out/ PNGs ~6min ago), added scramble-gold-probe.mjs — actively investigating (capturing stages or chasing a loaderbar divergence = the real custom-loader bug). Defer."
   },
   "stage2_items": [],
   "resolved": [
