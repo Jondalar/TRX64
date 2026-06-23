@@ -482,6 +482,13 @@ struct DriveBus<'a> {
     /// PRB bit7 (SYNC), the stepper/motor/speed-zone from store_prb, and the
     /// byte-ready (SO) handshake consumed by the drive CPU's V flag.
     rotation: &'a mut Rotation,
+    /// Pending `drive_cpu_set_overflow` request raised by a VIA2 store side-effect
+    /// (set_ca2 on the PCR CA2 edge / store_prb on the motor edge — via2d.c
+    /// set_ca2 → drive_cpu_set_overflow, store_prb motor branch). VICE delivers the
+    /// byte-ready→V flush straight into the drive CPU's P register from the store;
+    /// the bus borrow can't touch `cpu`, so we latch it here and `step_instruction`
+    /// folds it into `reg_p` after the store cycle completes. `true` ⇒ set V.
+    pending_set_overflow: bool,
 }
 
 impl<'a> DriveBus<'a> {
@@ -546,7 +553,9 @@ impl<'a> DriveBus<'a> {
                 r.move_head(step_count);
             }
         }
-        // Motor on/off edge (via2d.c:452-470): mirror PB2 into byte_ready_active.
+        // Motor on/off edge (via2d.c:325-352): mirror PB2 into byte_ready_active.
+        // On motor-off, flush a pending byte-ready edge into V (drive_cpu_set_overflow,
+        // via2d.c:343-348); on motor-on, re-anchor the rotation clock.
         let was_motor = r.byte_ready_active & crate::rotation::BRA_MOTOR_ON;
         let now_motor = new_pb & crate::rotation::BRA_MOTOR_ON;
         if was_motor != now_motor {
@@ -554,8 +563,13 @@ impl<'a> DriveBus<'a> {
                 (r.byte_ready_active & !crate::rotation::BRA_MOTOR_ON) | now_motor;
             if now_motor != 0 {
                 r.begins(self.clk);
+            } else if r.byte_ready_edge != 0 {
+                self.pending_set_overflow = true;
+                r.byte_ready_edge = 0;
             }
         }
+        // VICE via2d.c:354 — byte_ready_level cleared last on a PB store.
+        self.rotation.byte_ready_level = 0;
     }
 
     /// Composed VIA2 PB output (`ORB | ~DDRB`) — the value the motor/stepper/LED/
@@ -567,16 +581,45 @@ impl<'a> DriveBus<'a> {
         (orb | !ddrb) & 0xff
     }
 
-    /// via2d_update_pcr (via2d.c:165-178) on a $1C0C store: bit5 = read(1)/write(0)
-    /// mode, bit1 = byte-ready-active enable. Applied after the generic latch.
+    /// VIA2 $1C0C (PCR) store side-effects, in VICE dispatch order. viacore_store
+    /// (viacore.c:786) on a PCR write first recomputes `ca2_out_state` from the new
+    /// PCR CA2 mode and calls `set_ca2` (via2d.c:72-93), THEN runs `store_pcr` →
+    /// `via2d_update_pcr` (via2d.c:165-178). Both touch the byte-ready-enable bit of
+    /// `byte_ready_active`; the set_ca2 call additionally flushes a pending
+    /// byte-ready edge into the drive CPU's overflow flag on the CA2 low→high edge —
+    /// the $F556 read-loop handshake. `for_pcr` carries the raw stored PCR byte.
     fn via2_store_pcr_effects(&mut self, pcrval: u8) {
         if self.rotation.image.is_none() {
             return;
         }
+        // ── set_ca2 (via2d.c:72-93), dispatched by viacore from the PCR store ──
+        // VICE viacore.c:786 derives ca2_out_state from the new PCR CA2 mode:
+        //   (pcr & 0x0e) == 0x0c (LOW_OUTPUT)  → 0
+        //   (pcr & 0x0e) == 0x0e (HIGH_OUTPUT) → 1
+        //   else (input / handshake / pulse)   → 1
+        let ca2_low = (pcrval & 0x0e) == 0x0c;
+        let new_ca2: u8 = if ca2_low { 0 } else { 1 };
+        let curr = (self.rotation.byte_ready_active >> 1) & 1;
+        if new_ca2 != curr {
+            // set_ca2: rotate, latch the new byte-ready-active bit, and on the
+            // low→high re-enable flush any pending byte-ready edge into V.
+            self.rotation.rotate_disk(self.clk);
+            self.rotation.byte_ready_active =
+                (self.rotation.byte_ready_active & !crate::rotation::BRA_BYTE_READY)
+                    | (new_ca2 << 1);
+            if self.rotation.byte_ready_edge != 0 {
+                // drive_cpu_set_overflow(dc): set the drive 6502 V flag. The bus
+                // borrow can't reach `cpu`; latch the request for step_instruction.
+                self.pending_set_overflow = true;
+                self.rotation.byte_ready_edge = 0;
+            }
+        }
+        // ── via2d_update_pcr (via2d.c:165-178), via store_pcr after set_ca2 ──
         let r = &mut self.rotation;
         r.rotate_disk(self.clk);
         r.read_write_mode = pcrval & 0x20 != 0;
-        // PCR bit1 → BRA_BYTE_READY in byte_ready_active.
+        // PCR bit1 → BRA_BYTE_READY in byte_ready_active (matches the set_ca2 latch
+        // above for the LOW/HIGH output modes the DOS uses).
         let pcr_br = (pcrval & crate::rotation::BRA_BYTE_READY) != 0;
         if pcr_br {
             r.byte_ready_active |= crate::rotation::BRA_BYTE_READY;
@@ -909,6 +952,14 @@ impl Drive1541 {
         }
         loop {
             cpu.execute_cycle(bus, obs);
+            // drive_cpu_set_overflow flush: a VIA2 store side-effect (set_ca2 on the
+            // PCR CA2 low→high edge / store_prb motor-off) latched a byte-ready→V
+            // request this cycle. VICE pushes it straight into the drive CPU's P
+            // register from the store; fold it in here at the same cycle boundary.
+            if bus.pending_set_overflow {
+                bus.pending_set_overflow = false;
+                cpu.reg_p |= 0x40; // P_OVERFLOW
+            }
             if cpu.is_at_boundary() {
                 // VICE folds the IRQ/NMI entry into the same execute call as the
                 // first handler opcode (drive_6510core.ts:1682 DO_INTERRUPT then
@@ -975,6 +1026,7 @@ impl Drive1541 {
             clk: self.cpu.clk,
             via2_ports,
             rotation: &mut self.rotation,
+            pending_set_overflow: false,
         };
         // Run whole instructions while the drive clock is behind the stop target
         // (VICE drivecpu.c:393 — `while (*clk_ptr < stop_clk)`). The reset sequence
@@ -1090,6 +1142,7 @@ mod tests {
                 clk: 0,
                 via2_ports: Via2Ports::default(),
                 rotation: &mut d.rotation,
+                pending_set_overflow: false,
             };
             bus.write(0x0010, 0xAB);
             assert_eq!(bus.read(0x0810), 0xAB, "$0810 should mirror $0010");
@@ -1110,6 +1163,7 @@ mod tests {
             clk: 0,
             via2_ports: Via2Ports::default(),
             rotation: &mut d.rotation,
+            pending_set_overflow: false,
         };
         // VIA1 PB ($1800) read = 6522 PRB read with prb_pin = IEC tmp:
         //   byte = (tmp & ~DDRB) | (PRB & DDRB), tmp = (drv_port ^ 0x85)|0x1a.
@@ -1141,6 +1195,7 @@ mod tests {
             clk: 0,
             via2_ports: Via2Ports::default(),
             rotation: &mut d.rotation,
+            pending_set_overflow: false,
         };
         assert_eq!(bus.read(0x1C0C), 0x00, "$1C0C PCR reads 0x00 after reset");
         bus.write(0x1C0C, 0xEE);
@@ -1184,6 +1239,7 @@ mod tests {
             clk: 0,
             via2_ports: Via2Ports::default(),
             rotation: &mut d.rotation,
+            pending_set_overflow: false,
         };
         assert_eq!(bus.read(0xC010), 0xEA);
     }
