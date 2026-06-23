@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "iec-serial-rate",
+  "current_item": "drive-rotation-phase",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -27,8 +27,8 @@
     "disk-load-e2e (keyboard matrix)",
     "iec-crossdomain-sync (STANDARD LOAD complete)"
   ],
-  "note": "iec-serial-rate [opus]: close ~2.5% (~26 cyc/byte) per-byte serial-load rate skew (TRX64 ahead). Trace-diff the per-byte serial transfer (drive-cpu + C64-cpu) vs TS to find the inter-byte cycle drift. Gate: scramble-load-progress RED->GREEN. Then custom $DD00 loader reachable.",
-  "updated": "2026-06-23T07:20:00Z",
+  "note": "ADR-039 CORRECTED by ADR-040: blocker is a one-time ~17k-cycle rotational-PHASE lead at transfer start (NOT a rate skew), from the ADR-035 attach_clk-clear deviation (clears on PRB poll vs VICE PRA-only). Next: drive-rotation-phase [opus] — match VICE attach_clk (PRA-only) + keep find-sync via elapsed-since-attach. Gate scramble-load-progress + dont regress $03 find-sync.",
+  "updated": "2026-06-23T07:35:00Z",
   "followups": [
     "custom-loader-gate (acid test — reachable after iec-serial-rate)",
     "daemon-trace-query",
@@ -37,11 +37,7 @@
     "drive-watchdog-phase",
     "sid-audio"
   ],
-  "in_flight": {
-    "item": "iec-serial-rate",
-    "model": "opus",
-    "started": "2026-06-23T07:20:00Z"
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"

@@ -523,3 +523,27 @@ loader become reachable byte-exact (custom-loader-gate remains the eventual goal
 **Why:** This is EXACTLY the $DD00+timing class the user flagged as the TS-core's most expensive —
 the acid test surfaced it precisely, one layer before the custom loader. 2 tracked known-REDs now:
 drive-boot-deep + scramble-load-progress.
+
+## ADR-040 — CORRECTION of ADR-039: blocker is a rotational-PHASE lead, not a rate skew
+**Context:** iec-serial-rate investigated the scramble-load-progress RED. It DISPROVED ADR-039.
+**Corrected diagnosis (no fix committed — confident diagnosis, fix deferred to avoid re-breaking
+standard LOAD):**
+- The per-byte serial RATE is IDENTICAL to TS (~2437 vs ~2429 cyc/byte, noise; lead does NOT grow).
+  ADR-039's "~2.5% accumulating rate skew" is WRONG.
+- The real divergence is a ONE-TIME ~17,000-cycle PHASE LEAD at transfer start: TRX64 begins the
+  data byte-stream at C64-clk ≈3.988M, TS at ≈4.005M; thereafter lockstep (constant +8/+9 byte
+  offset). scramble-load-progress `end4` (0 vs 4) catches exactly this checkpoint.
+- ~17k ≈ one inter-sector gap. The drive finds its target sector ~one gap EARLY because the head's
+  ROTATIONAL PHASE at job-issue differs by a constant — and that traces to the ADR-035 deviation:
+  TRX64 clears `attach_clk` inside rotate_disk on ANY rotation access (incl. PRB/SYNC polls),
+  whereas VICE/TS clears it ONLY in rotation_byte_read (PRA/$1C01). That deviation was needed to
+  fix the $03 find-sync hang, but it starts the disk rotating at a different clk → constant phase
+  lead. Bit-rate constants, IEC core, and the sync-factor accumulator were verified 1:1 with TS.
+**Decision:** Re-frame as `drive-rotation-phase` [opus]: make attach_clk clearing match VICE
+(PRA-only) while preserving the find-sync fix differently (gate sync-visibility on elapsed-since-
+attach WITHOUT mutating rotation_last_clk/attach_clk from the PRB poll), so the rotational phase at
+transfer start matches TS. GATE: scramble-load-progress RED→GREEN AND drive-read-byteexact /
+disk-read-engage MUST stay GREEN (the $03 find-sync must not regress). Confirm the exact phase delta
+via a drive-clk diff at the rotate_disk first-call instant before changing it.
+**Why:** The loop self-corrected a wrong ADR via trace-diff investigation. The true blocker is one
+focused rotational-phase fix, on the same ground as drive-read-engine (ADR-035).

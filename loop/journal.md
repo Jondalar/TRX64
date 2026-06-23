@@ -438,3 +438,17 @@ point. Corpus-only, no regression. ADR-039. Merged.
 
 This is EXACTLY the user-flagged $DD00+timing crux (TS-core's most expensive). The acid test
 surfaced it one layer before the custom loader. Carved iec-serial-rate [opus]. Advancing to it.
+
+## 2026-06-23 — DRIVER: iec-serial-rate = diagnosis correction (ADR-040 corrects ADR-039)
+
+The opus builder DISPROVED ADR-039 (no fix committed, clean tree). The per-byte serial RATE is
+identical to TS; the blocker is a ONE-TIME ~17k-cycle rotational-PHASE lead at transfer start
+(TRX64 begins data at 3.988M vs TS 4.005M, then lockstep). ~17k ≈ one inter-sector gap: the drive
+finds the target sector one gap early because its head ROTATIONAL PHASE at job-issue differs by a
+constant — traced to the ADR-035 attach_clk deviation (TRX64 clears on PRB poll; VICE only on PRA/
+$1C01). The $03 find-sync fix introduced the phase offset. Bit-rate/IEC/sync-accumulator all 1:1.
+
+The loop self-corrected a wrong ADR via trace-diff. Re-framed as drive-rotation-phase [opus]:
+match VICE attach_clk (PRA-only) + preserve find-sync via elapsed-since-attach (no PRB mutation),
+gate scramble-load-progress RED->GREEN without regressing the $03 find-sync (drive-read-byteexact).
+Advancing to drive-rotation-phase.
