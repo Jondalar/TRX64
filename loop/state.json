@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "drive-load",
+  "current_item": "iec-serial",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -21,24 +21,20 @@
     "vic-render",
     "drive-via2",
     "sid",
-    "drive-gcr (encoding+mount)"
+    "drive-gcr (encoding+mount)",
+    "drive-load (controller+ATN+read-stream)"
   ],
-  "note": "drive-load [opus]: close the GCR controller sampling — (1) set_ca2 byte-ready->SO cadence on PCR CA2 + drivecpu_rotate per-cycle ($F556), (2) ATN->VIA1 CA1 IRQ. -> sector read status $01 -> full LOAD program-in-RAM parity vs TS.",
-  "updated": "2026-06-23T02:34:00Z",
+  "note": "drive-load done (both diagnosed pieces correct, drive-cpu GCR read byte-exact: disk-read-engage GREEN). Full LOAD blocks on iec-serial [opus] (bit-level IEC transfer, $EEA9 CLK-poll). Next: iec-serial — the last layer of the disk-LOAD onion.",
+  "updated": "2026-06-23T02:45:00Z",
   "followups": [
-    "drive-load (sector-read CA2/SO cadence + ATN CA1 IRQ -> real LOAD)",
+    "iec-serial (bit-level CLK/DATA transfer under TALK/LISTEN -> finally lands LOAD)",
     "daemon-trace-query",
     "vic-sprites-modes",
     "cia-cascade",
     "drive-watchdog-phase",
-    "sid-audio (Phase 1.5)"
+    "sid-audio"
   ],
-  "in_flight": {
-    "item": "drive-load",
-    "model": "opus",
-    "started": "2026-06-23T02:34:00Z",
-    "note": "opus alive 30min: BOTH diagnosed pieces committed (set_ca2 SO flush + ATN CA1 IRQ), now testing sector-read (disk-read-engage). Defer."
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"

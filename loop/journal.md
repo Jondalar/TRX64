@@ -337,3 +337,16 @@ MERGED the byte-exact encoding+mount increment. Carved the read/LOAD into drive-
 with precise diagnosis: (1) set_ca2 byte-ready→SO cadence on PCR CA2 edge + drivecpu_rotate
 per-cycle ($F556 read loop, needs drive-cpu trace cross-check); (2) ATN→VIA1 CA1 IRQ (DOS
 attention; VIA1 lacks CA1). Advancing to drive-load.
+
+## 2026-06-23 — DRIVER: drive-load — byte-exact GCR read stream (both diagnosed pieces correct)
+
+Opus builder solved BOTH ADR-032 diagnosed pieces: set_ca2 byte-ready→SO flush + ATN→VIA1
+CA1 IRQ (+combined drive IRQ). Confirmation gate INDEPENDENT: disk-read-engage GREEN (drive-
+cpu GCR read stream byte-exact, 20176 records) + full regression GREEN incl boot-basic-ready/
+-trace (V-flag/IRQ changes are drive-scoped, no C64 regression). ADR-033. Merged.
+
+The drive now reads byte-exact, responds to ATN, seeks, reaches send-byte. Full program-LOAD
+blocks on a THIRD subsystem (precisely located): the bit-level IEC serial transfer under TALK/
+LISTEN — C64 spins in KERNAL CLK-poll $EEA9 (256010×) for the drive's per-bit CLK transition;
+ST=$42 timeout. Carved to iec-serial [opus] — the last layer of the disk-LOAD onion.
+Advancing to iec-serial.

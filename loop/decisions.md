@@ -393,3 +393,20 @@ needs a drive-cpu trace cross-check); (2) the ATN→VIA1 CA1 IRQ (DOS attention 
 — VIA1 lacks CA1. Both well-characterized; documented in tests/drive_sector_read.rs (kept).
 **Why:** The encoding + mount are real, byte-exact, regression-free value; the cycle-exact
 GCR controller sampling + CA1/CA2 handshake is a deep focused subsystem of its own.
+
+## ADR-033 — drive-load: byte-exact GCR read stream; full LOAD → iec-serial
+**Context:** drive-load — close the GCR controller sampling + ATN, reach a real LOAD.
+**Decision (accepted, gates GREEN):** BOTH diagnosed pieces from ADR-032 are now correct
+and merged: (1) set_ca2 byte-ready→drive-CPU SO-overflow flush on PCR CA2 (via2_store_pcr/
+prb_effects, latched in DriveBus.pending_set_overflow, folded by step_instruction); (2)
+ATN→VIA1 CA1 IRQ (Via6522::signal_ca1 + Drive1541::atn_edge_to_via1_ca1, wired from
+c64_store_dd00) + combined VIA1∨VIA2 drive IRQ. RESULT: the drive-cpu GCR read stream is
+BYTE-EXACT (disk-read-engage GREEN, 20176 records vs TS); the drive reaches sync, decodes
+headers, responds to ATN, seeks, reaches send-byte. No regression (boot-basic-ready/-trace,
+drive-boot-idle, cia all GREEN — the changes are drive-scoped). The FULL program-LOAD blocks
+on a THIRD subsystem → `iec-serial` [opus]: the bit-level IEC serial-transfer handshake under
+TALK/LISTEN — the C64 spins in KERNAL serial-receive CLK-poll $EEA9 (256010×) waiting for the
+drive's per-bit CLK (VIA1 PB3→IEC CLK) transition; C64 times out ST=$42. Distinct from the
+byte-ready cadence + ATN attention IRQ (both now correct).
+**Why:** Each disk-LOAD layer is byte-exact-verified as it lands; the per-bit IEC serial
+protocol timing is the final, distinct subsystem.
