@@ -424,3 +424,17 @@ full regression GREEN, no regression. ADR-038. Merged.
 keyboard→crossdomain-sync), every layer byte-exact. The cross-domain IEC model is now cycle-
 exact — the SAME model custom-loader $DD00 bitbang needs. Advancing to custom-loader-gate [opus]
 on scramble_infinity.d64 — the user-pinned ACID TEST, now reachable.
+
+## 2026-06-23 — DRIVER: custom-loader acid test — file-load GREEN + serial-rate-skew diagnosis
+
+custom-loader-gate (corpus-only): NEW GREEN scramble-load-file — LOAD"*",8,1 lands the 7747-byte
+SCRAMBLE bootstrap byte-exact (file-search + sector-link-chain path proven). Boot decoded:
+LOAD"*",8,1 + RUN → $080D bank-out → ZP loader (CIA1 Timer A) → $4000 custom $DD00 bitbang.
+Custom loader NOT reached — blocked by SERIAL-LOAD RATE SKEW: TRX64 ~2.5% AHEAD per-byte, first
+div ~8.0M cyc (scramble-load-progress RED: end4 0 vs 4). End-state converges byte-exact (not
+corrupting), but cadence fast — fatal to cycle-exact custom loaders, tolerated by handshaked LOAD.
+Confirmation gate INDEPENDENT: scramble-load-file GREEN, scramble-load-progress RED at the doc'd
+point. Corpus-only, no regression. ADR-039. Merged.
+
+This is EXACTLY the user-flagged $DD00+timing crux (TS-core's most expensive). The acid test
+surfaced it one layer before the custom loader. Carved iec-serial-rate [opus]. Advancing to it.

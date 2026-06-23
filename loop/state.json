@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "custom-loader-gate",
+  "current_item": "iec-serial-rate",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -27,27 +27,24 @@
     "disk-load-e2e (keyboard matrix)",
     "iec-crossdomain-sync (STANDARD LOAD complete)"
   ],
-  "note": "custom-loader-gate [opus] ACID TEST: scramble_infinity.d64 — boot it (LOAD bootstrap -> custom $DD00 loader), trace-diff vs TS over the load + custom-loader run. Tests cycle-exact $DD00 bitbang + VIC sync (the user-flagged hardest case). Cross-domain sync (just fixed) is the foundation.",
-  "updated": "2026-06-23T07:05:00Z",
+  "note": "Acid test surfaced the precise blocker: standard serial-load RATE skew ~2.5% (TRX64 ahead, $AE/end4 at 8M). scramble-load-file GREEN (file load byte-exact). Next: iec-serial-rate [opus] — close the per-byte serial cadence vs CIA1-Timer-A. Then custom $DD00 loader reachable. THIS is the user-flagged $DD00+timing crux.",
+  "updated": "2026-06-23T07:10:00Z",
   "followups": [
+    "custom-loader-gate (acid test — reachable after iec-serial-rate)",
     "daemon-trace-query",
     "vic-sprites-modes",
     "cia-cascade",
     "drive-watchdog-phase",
     "sid-audio"
   ],
-  "in_flight": {
-    "item": "custom-loader-gate",
-    "model": "opus",
-    "started": "2026-06-23T07:05:00Z",
-    "note": "opus alive ~60min: narrowing the skew (_skew-pin, scramble-load-progress scenarios; cleaned old probes). No production commit yet — hardest open-ended item (real game custom loader). Alive (scenarios changing). Let it cook; completion will bring a fix OR a precise diagnosis."
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
   ],
   "known_red": [
-    "drive-boot-deep (tracked → drive-watchdog-phase, NOT a regression)"
+    "drive-boot-deep (drive-watchdog-phase)",
+    "scramble-load-progress (iec-serial-rate, serial-load rate skew)"
   ],
   "custom_loader_test_disk": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/scramble_infinity.d64"
 }

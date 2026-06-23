@@ -502,3 +502,24 @@ tests pass.
 **Why:** STANDARD LOAD is complete. This cross-domain model is the SAME one custom-loader $DD00
 bitbang relies on — so the user's acid test (scramble) is now reachable. Disk-LOAD onion fully
 peeled: via2→gcr→load→read-engine→keyboard→crossdomain-sync.
+
+## ADR-039 — custom-loader acid test: file-load GREEN; blocker = serial-load RATE skew
+**Context:** custom-loader-gate on scramble_infinity.d64 (user-pinned acid test). Corpus-only
+(no crate code) — a proving gate + a precise diagnosis.
+**Findings:** (1) NEW GREEN `scramble-load-file`: LOAD"*",8,1 file-search + sector-link-chain
+lands the 7747-byte SCRAMBLE bootstrap at $0801 byte-exact vs TS (ST=$00) — the FILE load path
+proven (distinct from the already-green directory path). Boot = LOAD"*",8,1 + RUN (SYS 2061 →
+$080D banks out KERNAL, ZP loader times vs CIA1 Timer A, JMP $4000 = the custom $DD00 bitbang).
+(2) The custom loader is NOT reached — blocked upstream by a SERIAL-LOAD RATE SKEW: TRX64's
+per-byte serial cadence runs ~2.5% (~200k cyc) AHEAD of TS; first divergence ~8.0M cyc
+(scramble-load-progress RED: end4[0] 0 vs 4 / $AE=$00 vs $05). The END STATE converges byte-exact
+(file-load green → NOT corrupting), but the per-byte CADENCE is fast. A handshaked KERNAL load
+tolerates this; a cycle-exact $DD00 bitbang raster-synced to the VIC does NOT. The short directory
+load doesn't accumulate enough serial cycles to expose it; the 7747-byte file load does.
+**Decision:** Carve `iec-serial-rate` [opus]: close the ~2.5% per-byte serial-load rate skew (the
+KERNAL serial-receive loop's per-byte IEC bit-timing / CIA1-Timer-A interaction). Gate: flip
+scramble-load-progress RED→GREEN ($AE cadence matches TS at 8M). Then RUN + the custom $DD00
+loader become reachable byte-exact (custom-loader-gate remains the eventual goal).
+**Why:** This is EXACTLY the $DD00+timing class the user flagged as the TS-core's most expensive —
+the acid test surfaced it precisely, one layer before the custom loader. 2 tracked known-REDs now:
+drive-boot-deep + scramble-load-progress.
