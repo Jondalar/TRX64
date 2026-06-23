@@ -23,6 +23,7 @@
 
 use crate::cia::{Cia, CIAT_TABLEN};
 use crate::cpu::Bus;
+use crate::sid::Sid6581;
 use crate::vic::VicII;
 
 /// One pre-built memconfig entry (= memory-bus.ts MemConfigEntry, no-cart slice).
@@ -76,8 +77,10 @@ pub struct FullBus<'a> {
     pub cia1: &'a mut Cia,
     pub cia2: &'a mut Cia,
     pub cia_table: &'a [u16; CIAT_TABLEN],
-    /// 25-byte SID register shadow ($D400-$D418) — write-only store for parity.
+    /// 32-byte SID register shadow ($D400-$D41F) — write-only store for parity.
     pub sid_regs: &'a mut [u8; 32],
+    /// SID 6581 oscillator + envelope state machine (for $D41B osc3 / $D41C env3).
+    pub sid: &'a mut Sid6581,
     /// Live memconfig (selected by $00/$01 writes).
     pub config: MemConfig,
     pub memconfig_table: &'a [MemConfig; 32],
@@ -173,10 +176,13 @@ impl<'a> FullBus<'a> {
         match addr {
             0xd000..=0xd3ff => self.vic.read_reg(addr as u8),
             0xd400..=0xd7ff => {
-                // SID: 32-byte register mirror every $20. Reads are mostly open
-                // bus / write-only; return the shadow (regs 0x19/0x1a/0x1b/0x1c
-                // would be live on real HW — out of scope, shadow suffices).
-                self.sid_regs[(addr as usize - 0xd400) & 0x1f]
+                // SID: 32-byte register mirror every $20.
+                // $D419/$D41A (POT X/Y) → 0x80 (unconnected default).
+                // $D41B (OSC3) → voice-3 oscillator output MSB (live computed).
+                // $D41C (ENV3) → voice-3 envelope value (live computed).
+                // All other registers: write-only shadow byte (B-level round-trip).
+                let reg = (addr as usize - 0xd400) & 0x1f;
+                self.sid.read(reg, self.sid_regs)
             }
             0xd800..=0xdbff => {
                 // Color RAM: low nibble stored in `io` shadow, high nibble open bus ($F0).
@@ -218,7 +224,9 @@ impl<'a> FullBus<'a> {
         match addr {
             0xd000..=0xd3ff => self.vic.write_reg(addr as u8, value),
             0xd400..=0xd7ff => {
-                self.sid_regs[(addr as usize - 0xd400) & 0x1f] = value;
+                let reg = (addr as usize - 0xd400) & 0x1f;
+                self.sid_regs[reg] = value;
+                self.sid.write(reg, value, self.sid_regs);
             }
             0xd800..=0xdbff => { /* color RAM: shadow already stored above */ }
             0xdc00..=0xdcff => self.cia1.write(addr, value, self.clk, self.cia_table),

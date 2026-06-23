@@ -162,8 +162,14 @@ impl FrameSink {
 
 /// Active trace channels, derived from the requested trace domains exactly like
 /// TS `domainsToChannels` (trace-definition.ts): c64-cpu→cpu, memory→bus_access
-/// (+io), vic→vic, iec→iec, drive8-cpu→drive_cpu. A record is emitted ONLY if
-/// its channel is enabled.
+/// (+io), vic→vic, iec→iec, sid→sid, drive8-cpu→drive_cpu. A record is emitted
+/// ONLY if its channel is enabled.
+///
+/// NOTE (ADR-015-style empirical finding): the `sid` channel is RESERVED with
+/// NO live producer in the TS oracle — confirmed by tracing a SID exerciser:
+/// SID register writes appear only as op-0x11 RAM_WRITE from the CPU bus tap,
+/// never as op-0x22 SID_REG_WRITE. The `sid` field here only selects the SID
+/// isolation bus for the run; no SID trace frames are ever emitted.
 #[derive(Clone, Copy, Debug)]
 pub struct TraceChannels {
     /// `cpu` channel — emits CPU_STEP (0x10).
@@ -172,6 +178,10 @@ pub struct TraceChannels {
     pub mem: bool,
     /// `vic` channel — emits VIC_REG_WRITE (0x20). NO live producer (reserved).
     pub vic: bool,
+    /// `sid` channel — RESERVED, NO live producer. Activates the SID isolation
+    /// bus so the exerciser runs against the SID model, but op-0x22 is never
+    /// emitted. The `sid` domain also enables `cpu` + `memory` channels.
+    pub sid: bool,
     /// `drive_pc` channel — emits DRIVE_CPU_STEP (0x30). Activated by "drive8-cpu"
     /// domain. Sampled at C64 instruction boundaries, deduplicated by PC.
     pub drive_cpu: bool,
@@ -180,12 +190,13 @@ pub struct TraceChannels {
 impl TraceChannels {
     /// Map trace domains → channels (= TS domainsToChannels).
     pub fn from_domains<S: AsRef<str>>(domains: &[S]) -> Self {
-        let mut c = TraceChannels { cpu: false, mem: false, vic: false, drive_cpu: false };
+        let mut c = TraceChannels { cpu: false, mem: false, vic: false, sid: false, drive_cpu: false };
         for d in domains {
             match d.as_ref() {
                 "c64-cpu" => c.cpu = true,
                 "memory" => c.mem = true,
                 "vic" | "c64-vic" => c.vic = true,
+                "sid" => { c.sid = true; c.cpu = true; c.mem = true; }
                 "drive8-cpu" => c.drive_cpu = true,
                 _ => {}
             }
@@ -195,7 +206,7 @@ impl TraceChannels {
 
     /// Default capture set (no domains given) = cpu + memory (TS daemon default).
     pub fn default_cpu_mem() -> Self {
-        TraceChannels { cpu: true, mem: true, vic: true, drive_cpu: false }
+        TraceChannels { cpu: true, mem: true, vic: true, sid: false, drive_cpu: false }
     }
 }
 

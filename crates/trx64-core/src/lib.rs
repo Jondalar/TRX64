@@ -15,6 +15,7 @@ pub mod drive;
 pub mod full;
 pub mod iec;
 pub mod render;
+pub mod sid;
 pub mod tables;
 pub mod vic;
 pub mod vsf;
@@ -24,6 +25,7 @@ pub use cpu::{Bus, Cpu6510};
 pub use drive::Drive1541;
 pub use full::{FullBus, MemConfig};
 pub use iec::IecCore;
+pub use sid::Sid6581;
 pub use vic::VicII;
 
 /// Zero-cost observation hook, inlined into the core step loop.
@@ -231,6 +233,53 @@ impl<'a> Bus for CiaBus<'a> {
     }
 }
 
+/// SID-isolated bus (chip-isolation gate, ADR-012): routes $D400-$D7FF to the
+/// SID 6581 (32-byte register tile repeated every $20 bytes across the 1 KiB
+/// block) and flat 64K RAM everywhere else. The SID is CLOCK-DRIVEN via the
+/// `Bus::tick` hook: `tick` advances the SID state machine per master cycle.
+/// Used by the CPU-isolated SID exerciser (SEI) that programs a voice (freq +
+/// waveform + ADSR gate), runs N cycles, and reads $D41B/$D41C.
+pub struct SidBus<'a> {
+    pub mem: &'a mut [u8; 0x10000],
+    pub sid: &'a mut crate::sid::Sid6581,
+    pub sid_regs: &'a mut [u8; 32],
+    /// Master clock (advanced by `tick`); passed to SID but not consumed here
+    /// (SID is stateful enough via tick count).
+    pub clk: u64,
+}
+
+impl<'a> Bus for SidBus<'a> {
+    #[inline]
+    fn read(&mut self, addr: u16) -> u8 {
+        if (0xd400..0xd800).contains(&addr) {
+            let reg = (addr as usize - 0xd400) & 0x1f;
+            self.sid.read(reg, self.sid_regs)
+        } else {
+            self.mem[addr as usize]
+        }
+    }
+    #[inline]
+    fn write(&mut self, addr: u16, value: u8) {
+        if (0xd400..0xd800).contains(&addr) {
+            let reg = (addr as usize - 0xd400) & 0x1f;
+            self.sid_regs[reg] = value;
+            self.sid.write(reg, value, self.sid_regs);
+        } else {
+            self.mem[addr as usize] = value;
+        }
+    }
+    /// One SID master cycle per CPU master cycle — batch-tick is done in the
+    /// run loops by calling `sid.tick(instruction_cycles, &sid_regs)` at the
+    /// instruction boundary (same pattern as the TS integrated-session.ts).
+    /// The per-cycle `tick` hook is intentionally a no-op here: the SID model
+    /// is advanced instruction-batch (matching the TS wall-clock tick), not
+    /// cycle-by-cycle. This avoids O(N) inner-loop overhead in the hot path.
+    #[inline]
+    fn tick(&mut self) {
+        self.clk = self.clk.wrapping_add(1);
+    }
+}
+
 /// Full mutable machine state (~75 KiB headless).
 ///
 /// `Clone` is intentional and load-bearing: a clone is the cheap COW fork base for
@@ -270,8 +319,13 @@ pub struct Machine {
     pub char_rom: Box<[u8; 0x1000]>,
     /// I/O register shadow ($D000-$DFFF) — open-bus reads + color RAM low nibble.
     pub io_shadow: Box<[u8; 0x1000]>,
-    /// SID register shadow ($D400-$D418) — write store for parity.
+    /// SID register shadow ($D400-$D41F) — write store for parity reads and
+    /// as the register file backing the `sid` voice state machine.
     pub sid_regs: [u8; 32],
+    /// SID 6581 oscillator + envelope state machine (osc3/env3 computed reads).
+    /// Ticked per instruction in `run_for_full` and `run_for_sid*` paths.
+    /// The register file lives in `sid_regs`; this struct holds internal state.
+    pub sid: Sid6581,
     /// CPU-port latches ($00 direction / $01 value). Power-on $2F / $37.
     pub port_dir: u8,
     pub port_data: u8,
@@ -340,6 +394,7 @@ impl Machine {
             char_rom: Box::new([0u8; 0x1000]),
             io_shadow: Box::new([0u8; 0x1000]),
             sid_regs: [0u8; 32],
+            sid: Sid6581::new(),
             port_dir: 0x2f,
             port_data: 0x37,
             memconfig: full::build_memconfig_table()[0x1f],
@@ -438,6 +493,9 @@ impl Machine {
         self.iec = IecCore::new();
         self.cia2_pa_out = 0xff;
         self.drive_c64_ref = 0;
+        // SID: reset register file + voice state to power-on defaults.
+        self.sid_regs = [0u8; 32];
+        self.sid.reset();
         self.sync_snapshot();
     }
 
@@ -682,6 +740,7 @@ impl Machine {
                     cia2: &mut self.cia2,
                     cia_table: &table,
                     sid_regs: &mut self.sid_regs,
+                    sid: &mut self.sid,
                     config: self.memconfig,
                     memconfig_table: &self.memconfig_table,
                     port_dir: self.port_dir,
@@ -709,7 +768,10 @@ impl Machine {
                 // mid-instruction by a $DD00 access inside the FullBus).
                 self.drive_c64_ref = bus.drive_c64_ref;
             }
-            let _ = c64_clk_before;
+            // Tick SID by this instruction's cycle cost — wall-clock batch tick
+            // matching TS integrated-session.ts:946 `sid.tick(totalCycles)`.
+            let instruction_cycles = self.cpu6510.clk.wrapping_sub(c64_clk_before);
+            self.sid.tick(instruction_cycles, &self.sid_regs);
 
             // Drive catches up to the NEW C64 clock AFTER the instruction (= TS
             // afterCycleSync / catchUpDrive to the post-instruction clk). A $DD00
@@ -817,6 +879,58 @@ impl Machine {
                     break;
                 }
             }
+            executed += 1;
+        }
+        drop(bus);
+        self.sync_snapshot();
+    }
+
+    /// SID-isolated run for the `sid` chip-isolation gate (ADR-012).
+    ///
+    /// Routes $D400-$D7FF to the SID 6581 (register file + osc/env model);
+    /// flat RAM everywhere else; interrupts disabled by the exerciser (SEI).
+    /// The SID is ticked instruction-batch (same as the TS integrated-session
+    /// wall-clock tick): after each whole instruction the SID advances by the
+    /// instruction's cycle cost. Budget / instruction-cap semantics identical
+    /// to [`run_for_capped`].
+    pub fn run_for_sid<O: Observer>(&mut self, budget: u64, obs: &mut O) {
+        let max_instructions = budget.div_ceil(2) + 1000;
+        self.run_for_sid_capped(budget, max_instructions, obs);
+    }
+
+    /// SID-isolated run with an explicit instruction cap.
+    pub fn run_for_sid_capped<O: Observer>(
+        &mut self,
+        budget: u64,
+        max_instructions: u64,
+        obs: &mut O,
+    ) {
+        let start = self.cpu6510.clk;
+        let mut executed: u64 = 0;
+        let mut bus = SidBus {
+            mem: &mut self.ram,
+            sid: &mut self.sid,
+            sid_regs: &mut self.sid_regs,
+            clk: self.cpu6510.clk,
+        };
+        loop {
+            if self.cpu6510.clk.wrapping_sub(start) >= budget {
+                break;
+            }
+            if executed >= max_instructions {
+                break;
+            }
+            let clk_before = self.cpu6510.clk;
+            loop {
+                self.cpu6510.execute_cycle(&mut bus, obs);
+                if self.cpu6510.is_at_boundary() {
+                    break;
+                }
+            }
+            // Tick SID by this instruction's cycle cost (wall-clock batch tick,
+            // matching TS integrated-session.ts:946 `sid.tick(totalCycles)`).
+            let instruction_cycles = self.cpu6510.clk.wrapping_sub(clk_before);
+            bus.sid.tick(instruction_cycles, bus.sid_regs);
             executed += 1;
         }
         drop(bus);

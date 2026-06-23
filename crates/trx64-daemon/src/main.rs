@@ -231,6 +231,12 @@ fn run_cycle_budget(session: &mut Session, budget: u64) {
         }
     } else if vic_active {
         session.machine.run_for_vic(budget, &mut obs);
+    } else if channels.sid {
+        // SID isolation gate: routes $D400-$D7FF to the SID 6581 model.
+        // The `sid` domain has NO live trace producer (reserved, like vic —
+        // ADR-015 pattern); SID writes appear as op-0x11 RAM_WRITE from the
+        // CPU bus tap. The cpu/memory channels are co-enabled by `sid` domain.
+        session.machine.run_for_sid(budget, &mut obs);
     } else if channels.mem {
         session.machine.run_for_cia(budget, &mut obs);
     } else {
@@ -323,6 +329,59 @@ fn run_monitor(session: &mut Session, command: &str) -> Result<String, String> {
                     c.reg_pc, c.reg_a, c.reg_x, c.reg_y, c.reg_sp, c.flags()
                 ))
             }
+        }
+        "m" | "mb" | "mem" => {
+            // `m [lens] <addr_lo> [<addr_hi>]` — memory dump.
+            //
+            // TS monitor-shell.ts format: rows of 32 bytes starting at
+            // (addr & ~0x1f), hex section padEnd(96), then "  " + ascii.
+            //   ">C:XXXX  HH HH HH...   ...."
+            //   row starts at (start & ~0x1f); a row shows up to 32 bytes.
+            let mut i = 1;
+            // Skip optional lens token (cpu/ram/rom/io).
+            if matches!(toks.get(i), Some(&("cpu" | "ram" | "rom" | "io" | "cart"))) {
+                i += 1;
+            }
+            let addr_lo = parse_hex(toks.get(i).copied().ok_or("m: missing addr")?)
+                .ok_or("m: bad addr")? as u16;
+            i += 1;
+            let addr_hi = toks
+                .get(i)
+                .and_then(|t| parse_hex(t))
+                .map(|v| v as u16)
+                .unwrap_or(addr_lo);
+            let row_start = addr_lo & !0x1f_u16; // 32-byte aligned row
+            // Build one row (may be partial if addr_hi < row_start+31).
+            let mut hex_bytes: Vec<String> = Vec::new();
+            let mut ascii = String::new();
+            let mut col = 0u32;
+            let mut a = row_start;
+            loop {
+                if a >= addr_lo && a <= addr_hi {
+                    let b = session.machine.ram[a as usize];
+                    hex_bytes.push(format!("{:02X}", b));
+                    ascii.push(if b >= 0x20 && b < 0x7f { b as char } else { '.' });
+                } else {
+                    // Before start or after end in the row window: skip (don't show).
+                    // TS does: for j in 0..32 { if a+j <= end { push byte } }
+                    // so we only push bytes that are within [start, end].
+                    // But for bytes in [row_start, addr_lo) they are NOT pushed.
+                    // The padEnd(96) pads the WHOLE row slot, so missing leading bytes
+                    // also consume their 3-char slot (they appear as spaces).
+                    // However, when addr_lo is row-aligned (e.g. 0x0200 = 0x0200 & ~0x1f)
+                    // there are no pre-bytes. Handle gracefully by inserting empty.
+                }
+                col += 1;
+                if col >= 32 || a == addr_hi { break; }
+                if a == 0xffff { break; }
+                a = a.wrapping_add(1);
+            }
+            // For partial rows, we only push the bytes in [addr_lo..=addr_hi].
+            // The TS format pads `bytes.join(" ")` to 96 chars regardless.
+            let hex_str = hex_bytes.join(" ");
+            // Pad to exactly 96 chars (32×3 = 96).
+            let hex_padded = format!("{:<96}", hex_str);
+            Ok(format!(">C:{:04X}  {}  {}", row_start, hex_padded, ascii))
         }
         _ => Err(format!("monitor: unsupported command '{op}'")),
     }

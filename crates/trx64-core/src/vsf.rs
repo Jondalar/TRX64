@@ -361,6 +361,10 @@ fn load_sid(machine: &mut Machine, data: &[u8]) -> Result<(), String> {
         return Err(format!("SID: expected 32 bytes, got {}", data.len()));
     }
     machine.sid_regs[0..32].copy_from_slice(&data[0..32]);
+    // Reset internal voice state — the VSF module is register-file-only (32 bytes);
+    // transient oscillator/envelope state is not persisted. Clear to power-on defaults
+    // so the SID re-initializes from the restored register file on the next writes.
+    machine.sid.reset();
     Ok(())
 }
 
