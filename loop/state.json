@@ -30,13 +30,17 @@
     "cia-cascade",
     "drive-watchdog-phase"
   ],
-  "note": "drive-watchdog-phase done (drive-boot-deep GREEN; root cause was IRQ-dispatch latency in cpu.rs, NOT timer-phase — global IRQ fidelity improved, zero C64 regression; scramble-load-file bonus-GREEN). 21 items. Next: drive-seek-phase [opus] — the custom-loader phase-lead, NOW ARMED with C64RE Spec 218 (stepInward/track-35) + Spec 612 (write_offset per-instance) per user steer (ADR-045).",
-  "updated": "2026-06-23T11:10:00Z",
+  "note": "drive-seek-phase [opus] ARMED: close the ~17-20k rotational-phase lead at transfer start (scramble-load-progress RED). ADR-041: narrowed to seek/step + GCR head-advance at sector-lock. ADR-045 spec keys: C64RE Spec 218 (stepInward off-by-one past track 35) + Spec 612 (write_offset per-instance, viacore:529). Check drive head-stepping + write_offset; trace-diff drive-clk+gcr_head_offset at sector-header-lock vs TS.",
+  "updated": "2026-06-23T11:35:00Z",
   "followups": [
     "daemon-trace-query",
     "sid-audio"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "drive-seek-phase",
+    "model": "opus",
+    "started": "2026-06-23T11:35:00Z"
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
