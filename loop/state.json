@@ -26,8 +26,8 @@
     "drive-read-engine",
     "disk-load-e2e (keyboard matrix)"
   ],
-  "note": "disk-load-e2e: keyboard matrix done (session/type real now). LOAD blocked at LISTEN->TALK turnaround -> iec-talk-turnaround [opus] (drive not engaging as talker after ATN-release; $EE67/$EBFF). Disk onion: via2->gcr->load->[serial-diag]->read-engine->keyboard->talk-turnaround.",
-  "updated": "2026-06-23T05:10:00Z",
+  "note": "iec-talk-turnaround [opus]: drive must latch addressed-to-TALK across ATN-release + enter talk-send (pull CLK). C64 spins ACPTR $EE67; drive sits at $EBFF/$EC00 idle. Fix the drive DOS attention/turnaround so it engages as talker -> directory bytes flow to $0801.",
+  "updated": "2026-06-23T05:05:00Z",
   "followups": [
     "daemon-trace-query",
     "vic-sprites-modes",
@@ -36,7 +36,11 @@
     "sid-audio",
     "custom-loader-gate [opus] — ACID TEST: scramble_infinity.d64 ($DD00 bitbang + VIC raster sync, the user-flagged hardest case). Standard LOAD lands the bootstrap, then the loaded code installs the custom $DD00 loader for the bulk. Trace-diff vs TS catches 1-cycle desync."
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "iec-talk-turnaround",
+    "model": "opus",
+    "started": "2026-06-23T05:05:00Z"
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
