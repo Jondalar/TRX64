@@ -28,7 +28,7 @@
     "iec-crossdomain-sync (STANDARD LOAD complete)"
   ],
   "note": "drive-rotation-phase [opus]: fix the ~17k-cycle rotational-phase lead (ADR-040). Match VICE attach_clk clearing (PRA/$1C01-only, not PRB poll) WHILE preserving the $03 find-sync fix via elapsed-since-attach (no rotation_last_clk/attach_clk mutation from PRB). DUAL GATE: scramble-load-progress RED->GREEN AND drive-read-byteexact/disk-read-engage stay GREEN.",
-  "updated": "2026-06-23T07:50:00Z",
+  "updated": "2026-06-23T08:19:00Z",
   "followups": [
     "custom-loader-gate (acid test — reachable after iec-serial-rate)",
     "daemon-trace-query",
@@ -40,7 +40,8 @@
   "in_flight": {
     "item": "drive-rotation-phase",
     "model": "opus",
-    "started": "2026-06-23T07:50:00Z"
+    "started": "2026-06-23T08:19:00Z",
+    "note": "opus alive 30min: committed 93dca10 (VICE drive_writeprotect_sense attach_clk clear — the exact mechanism). Tree clean, testing dual gate. Defer."
   },
   "stage2_items": [],
   "resolved": [
