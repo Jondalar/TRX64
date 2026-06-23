@@ -253,12 +253,18 @@ impl<'a> FullBus<'a> {
                         // → drive VIA1 CA1, recompute drv_bus[8], update ports. The
                         // write instant is maincpu_clk + 1 (x64sc write_offset=0).
                         self.iec_push_flush_to(self.clk + 1);
-                        let _atn_edge = self.iec.c64_store_dd00((!new_out) & 0xff);
-                        // ATN-edge → drive VIA1 CA1 signal is not yet modelled (the
-                        // TRX64 drive VIA1 is a register stub without CA1/IRQ); the
-                        // hardware ATN-acknowledge (drive auto-pulls DATA) is already
-                        // folded by recompute_drv_bus's cpu_bus term inside
-                        // c64_store_dd00, so the bus LINE state is correct.
+                        let atn_edge = self.iec.c64_store_dd00((!new_out) & 0xff);
+                        // ATN-edge → drive VIA1 CA1: the C64 driving ATN raises the
+                        // drive's attention IRQ (DOS $FE67 → $E85B). VICE
+                        // iecbus_cpu_write_conf1 signals VIA1 CA1 right after the
+                        // ATN-edge detect, before the drv_bus recompute. We stamp it at
+                        // the drive clock the push-flush just reached. The hardware
+                        // ATN-acknowledge (drive auto-pulls DATA) is already folded by
+                        // recompute_drv_bus's cpu_bus term inside c64_store_dd00.
+                        if let Some(atn_high) = atn_edge {
+                            let dclk = self.drive.drive_clk;
+                            self.drive.atn_edge_to_via1_ca1(atn_high, dclk);
+                        }
                     }
                 }
             }

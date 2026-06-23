@@ -249,6 +249,21 @@ impl Via6522 {
         }
     }
 
+    /// viacore_signal(VIA_SIG_CA1, edge) (viacore.c:441-490): the external CA1
+    /// input edge. On the 1541 VIA1, CA1 is tied to the IEC ATN line so the C64
+    /// driving ATN raises the drive's attention IRQ. Raise IFR CA1 (0x02) only when
+    /// the edge polarity matches the PCR CA1-control bit (PCR bit0): VICE
+    /// `if ((edge?1:0) == (PCR & VIA_PCR_CA1_CONTROL))`. `edge` is 1 = rising,
+    /// 0 = falling. The CA2-toggle and latching sub-paths are not used by VIA1 here.
+    #[inline]
+    fn signal_ca1(&mut self, edge: u8, rclk: u64) {
+        let pcr_ctrl = self.regs[VIA_PCR] & 0x01;
+        if (if edge != 0 { 1 } else { 0 }) == pcr_ctrl {
+            self.ifr |= 0x02; // VIA_IM_CA1
+            self.update_irq(rclk);
+        }
+    }
+
     /// Run any timer underflows that are due at or before `clk` (= VICE alarm
     /// dispatch for the T1-zero / T2-zero alarms). Raises IFR bits and stamps
     /// the IRQ line at the precise underflow rclk (`zero + 1`). Must be invoked
@@ -509,6 +524,22 @@ impl<'a> DriveBus<'a> {
         Via2Ports { pra_pin: 0xff, prb_pin: self.via1_iec_tmp() }
     }
 
+    /// The drive 6502's IRQ pin is the wired-OR of the VIA1 and VIA2 IRQ lines
+    /// (both 6522 IRQ outputs share the single CPU IRQ pin). VICE routes both VIA
+    /// `set_int` calls into the same `int_status`, so the CPU samples their OR.
+    /// Returns `(active, stamp)`: active iff either VIA asserts; the stamp is the
+    /// earliest active edge (the instant the combined line first rose).
+    #[inline]
+    fn combined_irq(&self) -> (bool, u64) {
+        let active = self.via1.irq_active || self.via2.irq_active;
+        if !active {
+            return (false, u64::MAX);
+        }
+        let s1 = if self.via1.irq_active { self.via1.irq_stamp } else { u64::MAX };
+        let s2 = if self.via2.irq_active { self.via2.irq_stamp } else { u64::MAX };
+        (true, s1.min(s2))
+    }
+
     /// VIA2 port inputs for a PRA/PRB read. When a disk is mounted the rotating
     /// model is advanced to `clk` first (via2d read_pra → rotation_byte_read /
     /// read_prb → rotation_rotate_disk) and supplies PRA = GCR_read, PRB =
@@ -637,6 +668,7 @@ impl<'a> Bus for DriveBus<'a> {
     #[inline]
     fn tick(&mut self) {
         self.clk = self.clk.wrapping_add(1);
+        self.via1.run_alarms(self.clk);
         self.via2.run_alarms(self.clk);
         // NOTE: the rotating disk is advanced lazily — at VIA2 port accesses
         // (read_pra/read_prb → rotation_byte_read/rotate_disk) and at the
@@ -915,8 +947,10 @@ impl Drive1541 {
         // it is sampled at the opcode-fetch boundary (= VICE PROCESS_ALARMS then
         // interrupt_check_irq_delay at the fetch — drive_6510core.ts:1660/1682).
         bus.clk = cpu.clk;
+        bus.via1.run_alarms(bus.clk);
         bus.via2.run_alarms(bus.clk);
-        cpu.set_irq_line_at(bus.via2.irq_active, bus.via2.irq_stamp);
+        let (irq, stamp) = bus.combined_irq();
+        cpu.set_irq_line_at(irq, stamp);
         // Byte-ready (SO) → drive 6502 V flag. VICE's drive 6510 core consults the
         // GCR byte-ready edge at the BVS/BVC/PHP opcodes (drive_6510core.ts:1753 /
         // 1839 / case 0x08): `rotate; if (byte_ready_edge) { clear edge;
@@ -967,15 +1001,17 @@ impl Drive1541 {
                 // do NOT stop — refresh the line and run the first handler
                 // instruction in the same step, leaving PC past the bare vector.
                 if cpu.interrupt_just_dispatched() {
-                    cpu.set_irq_line_at(bus.via2.irq_active, bus.via2.irq_stamp);
+                    let (irq, stamp) = bus.combined_irq();
+                    cpu.set_irq_line_at(irq, stamp);
                     continue;
                 }
                 break;
             }
-            // Mid-instruction: a VIA2 register access or the per-cycle tick may
+            // Mid-instruction: a VIA1/VIA2 register access or the per-cycle tick may
             // have raised/cleared the IFR. Refresh the IRQ line so a multi-cycle
             // opcode still has the right line state for the next boundary.
-            cpu.set_irq_line_at(bus.via2.irq_active, bus.via2.irq_stamp);
+            let (irq, stamp) = bus.combined_irq();
+            cpu.set_irq_line_at(irq, stamp);
         }
     }
 
@@ -988,6 +1024,21 @@ impl Drive1541 {
         let orb = self.via1.regs[0];
         let ddrb = self.via1.regs[2];
         (orb | !ddrb) & 0xff
+    }
+
+    /// Deliver an IEC ATN-line edge to the drive's VIA1 CA1 input (= VICE
+    /// iecbus.c:440-446: `viacore_signal(via1d1541, VIA_SIG_CA1,
+    /// iec_old_atn ? 0 : VIA_SIG_RISE)`, where `iec_old_atn = cpu_bus & 0x10` is the
+    /// NEW ATN line state). The C64 asserting ATN drives the drive's attention IRQ
+    /// (DOS $FE67 → $E85B handler) via VIA1 CA1. `atn_high` is the new ATN line level
+    /// (the `Some(..)` returned by `IecCore::c64_store_dd00`): VICE signals a CA1
+    /// RISE when ATN is now LOW (`atn_high == false`), a FALL when ATN is now HIGH.
+    /// `clk` is the drive clock the edge is stamped at (the push-flush target).
+    #[inline]
+    pub fn atn_edge_to_via1_ca1(&mut self, atn_high: bool, clk: u64) {
+        let edge: u8 = if atn_high { 0 } else { 1 }; // FALL when high, RISE when low
+        self.via1.run_alarms(clk);
+        self.via1.signal_ca1(edge, clk);
     }
 
     /// Reset PC from the ROM vector (re-read). Returns the resolved PC.
