@@ -49,7 +49,14 @@ pub const DEFAULT_CHECKPOINT_RING_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
 /// media blobs, content-addressed into the pool on capture, rehydrated on restore.
 /// Order is irrelevant. (TRX64's checkpoint tree carries `driveDiskImage`,
 /// `cartBytes`, `cartFlash` exactly — c64re_snapshot.rs:899-902.)
-const POOLED_BLOB_SLOTS: [&str; 3] = ["driveDiskImage", "cartBytes", "cartFlash"];
+///
+/// `_ringDriveDiskBytes` is a TRX64-private extra slot: the in-memory ring carries
+/// no container `mediaPayloads` (unlike the `.c64re` dump), so the clean disk image
+/// needed to RE-ATTACH the drive on restore rides the checkpoint tree itself. It is
+/// pooled here exactly like the c64re media slots so identical disks across
+/// checkpoints are stored once (an unchanged disk over a rewind ring = one copy).
+const POOLED_BLOB_SLOTS: [&str; 4] =
+    ["driveDiskImage", "cartBytes", "cartFlash", "_ringDriveDiskBytes"];
 
 /// runtime-checkpoint-ring.ts:46-58 — public, payload-free view of a ring entry.
 #[derive(Debug, Clone, PartialEq)]

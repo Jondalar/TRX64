@@ -171,6 +171,21 @@ struct State {
     ctrl_stop: Option<CtrlStop>,
     /// Monotonic checkpoint counter for media/ingress checkpoint IDs.
     checkpoint_counter: u64,
+    /// Spec 705.B — the always-on bounded in-memory checkpoint ring (rewind /
+    /// time-travel). Transient, in-memory only; zero-cost until the first
+    /// `checkpoint/*` (or ring-riding `vic/inspect/*`) method captures into it.
+    /// Owned per-daemon (the daemon holds one session — the c64re controller's
+    /// per-session `checkpointRing`).
+    checkpoint_ring: trx64_core::checkpoint_ring::RuntimeCheckpointRing,
+    /// Spec 710 — promoted VIC-inspect evidence (frozen findings), keyed nowhere
+    /// (single session). The c64re `inspectEvidence` map; survives ring reuse,
+    /// lost on session close.
+    inspect_evidence: Vec<Value>,
+    /// Spec 710.4 — VIC-provenance capture toggle (the c64re
+    /// `session.setVicProvenanceCapture`). TRX64 captures no provenance sidecar
+    /// yet, so this flag is stored for the wire contract only (inert until the
+    /// vic-inspect/provenance engine lands).
+    vic_provenance_enabled: bool,
     /// Declarative trace definitions (Spec 708), keyed by definition id. These are
     /// opaque JSON objects validated by [`validate_trace_definition`]; the daemon
     /// stores them per-session exactly like the TS controller's `traceDefinitions`
@@ -1975,25 +1990,7 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         // pacing is the constant PAL pacing the TS reports for an unpaced session.
         "debug/state" => {
             let st = state.lock().unwrap();
-            let bps = st.breakpoints.list_vice_json();
-            let c = &st.session.machine.cpu6510;
-            let pc = c.reg_pc as u64;
-            let cycles = st.session.machine.clk;
-            let run_state = if st.session.running { "running" } else { "paused" };
-            let stop = match &st.ctrl_stop {
-                Some(s) => json!({ "reason": s.reason, "pc": s.pc as u64, "cycles": s.cycles }),
-                None => Value::Null,
-            };
-            Response::ok(id, json!({
-                "runState": run_state,
-                "pacing": { "mode": "pal", "ratio": 1 },
-                "pc": pc,
-                "cycles": cycles,
-                "frame": st.ctrl_frame,
-                "breakpoints": bps,
-                "stop": stop,
-                "controlOwner": "llm"
-            }))
+            Response::ok(id, build_debug_state(&st))
         }
 
         "debug/break_add" => {
@@ -2794,15 +2791,53 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             }))
         }
 
+        // ── Spec 710 — granular vic/inspect/* (rides the 705.B checkpoint ring) ──
+        // The ring-only / state-only methods (close, evidence, provenance) are
+        // 1:1 with c64re. The pixel-resolution methods (open, at, region,
+        // at_capture, origin, promote) additionally need the vic-inspect engine
+        // (buildVicInspectSnapshot / resolveVisibleNodeAt / resolveVisualOrigin /
+        // assembleInspectEvidence) which is NOT yet ported to trx64-core — they
+        // are deferred individually below with the missing-module reason.
+
+        // vic/inspect/provenance — toggle VIC-provenance capture. { enabled }.
+        // c64re reads `enabled !== false` (default true). TRX64 stores the flag for
+        // the wire contract; it is inert until the provenance engine lands.
+        "vic/inspect/provenance" => {
+            let enabled = req.params.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+            let mut st = state.lock().unwrap();
+            st.vic_provenance_enabled = enabled;
+            Response::ok(id, json!({ "enabled": enabled }))
+        }
+
+        // vic/inspect/close — unpin the inspected checkpoint. { ok, stats }.
+        "vic/inspect/close" => {
+            let mut st = state.lock().unwrap();
+            if let Some(cp_id) = req.params.get("checkpoint_id").and_then(|v| v.as_str()) {
+                if !cp_id.is_empty() {
+                    st.checkpoint_ring.unpin(cp_id);
+                }
+            }
+            let stats = st.checkpoint_ring.stats().to_json();
+            Response::ok(id, json!({ "ok": true, "stats": stats }))
+        }
+
+        // vic/inspect/evidence — the promoted-evidence list for the session.
+        "vic/inspect/evidence" => {
+            let st = state.lock().unwrap();
+            Response::ok(id, json!({ "evidence": st.inspect_evidence.clone() }))
+        }
+
         m if m.starts_with("vic/inspect/") => {
-            // The granular vic/inspect/{open,at,region,close,promote,origin,
-            // evidence,provenance,at_capture} ride the 705.B checkpoint ring +
-            // the inspect snapshot/provenance + asset-origin modules — none of
-            // which exist in trx64-core yet (ring is the explicitly-deferred heavy
-            // infra; the inspect module is a new primitive). The collapsed
-            // "vic/inspect" above serves the immediate frozen-pixel resolve.
+            // open / at / region / at_capture / origin / promote: these resolve
+            // pixel→node graphs and asset origins from a checkpoint. They ride the
+            // ring (capture/pin/restoreSnapshot — DONE), but ALSO need the
+            // vic-inspect engine (buildVicInspectSnapshot, resolveVisibleNodeAt,
+            // resolveVisibleRegion, resolveVisualOrigin, assembleInspectEvidence)
+            // — a new primitive not yet in trx64-core. Deferred until it lands.
+            // The collapsed "vic/inspect" above serves the immediate frozen-pixel
+            // resolve in the meantime.
             Response::err(id, -32001,
-                format!("NOT_IMPLEMENTED: {m}: needs the checkpoint-ring + vic-inspect/provenance modules (next batch)"))
+                format!("NOT_IMPLEMENTED: {m}: rides the ring (ready) but needs the vic-inspect node/origin engine (buildVicInspectSnapshot/resolveVisibleNodeAt/resolveVisualOrigin) — not yet ported"))
         }
 
         m if m.starts_with("vic/") => {
@@ -2820,8 +2855,127 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             Response::err(id, -32001, "NOT_IMPLEMENTED: trace/read: deferred")
         }
 
+        // ── Spec 705.B — checkpoint ring (rewind / time-travel) ──────────────
+        // 1:1 with the c64re ws-server.ts checkpoint/* handlers + the
+        // RuntimeCheckpointRing. The ring is per-daemon (= the c64re controller's
+        // per-session ring). `frame` = the controller frame counter (ctrl_frame),
+        // `cycles` = the master clock. Capture/restore ride the SAME path as
+        // snapshot/dump+undump (capture_live_checkpoint / restore_live_checkpoint).
+
+        // checkpoint/list — { checkpoints: RuntimeCheckpointRef[], stats }.
+        "checkpoint/list" => {
+            let st = state.lock().unwrap();
+            let checkpoints: Vec<Value> =
+                st.checkpoint_ring.list().iter().map(|r| r.to_json()).collect();
+            let stats = st.checkpoint_ring.stats().to_json();
+            Response::ok(id, json!({ "checkpoints": checkpoints, "stats": stats }))
+        }
+
+        // checkpoint/capture — captures the live machine + pushes to the ring.
+        // { ref: RuntimeCheckpointRef, stats }.
+        "checkpoint/capture" => {
+            let mut st = state.lock().unwrap();
+            let frame = st.ctrl_frame;
+            let cycles = st.session.machine.c64_core.clk;
+            let cp = capture_live_checkpoint(&mut st.session);
+            match st.checkpoint_ring.capture(cp, frame, cycles) {
+                Ok(r) => {
+                    let stats = st.checkpoint_ring.stats().to_json();
+                    Response::ok(id, json!({ "ref": r.to_json(), "stats": stats }))
+                }
+                Err(e) => Response::err(id, -32001, format!("checkpoint/capture: {e}")),
+            }
+        }
+
+        // checkpoint/pin — { ref, stats }; errors on unknown id (= c64re throw).
+        "checkpoint/pin" => {
+            let cp_id = match req.params.get("id").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return Response::err(id, -32602, "checkpoint/pin: id required"),
+            };
+            let mut st = state.lock().unwrap();
+            match st.checkpoint_ring.pin(&cp_id) {
+                Some(r) => {
+                    let stats = st.checkpoint_ring.stats().to_json();
+                    Response::ok(id, json!({ "ref": r.to_json(), "stats": stats }))
+                }
+                None => Response::err(id, -32001, format!("checkpoint/pin: unknown id {cp_id}")),
+            }
+        }
+
+        // checkpoint/unpin — { ref, stats }; errors on unknown id.
+        "checkpoint/unpin" => {
+            let cp_id = match req.params.get("id").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return Response::err(id, -32602, "checkpoint/unpin: id required"),
+            };
+            let mut st = state.lock().unwrap();
+            match st.checkpoint_ring.unpin(&cp_id) {
+                Some(r) => {
+                    let stats = st.checkpoint_ring.stats().to_json();
+                    Response::ok(id, json!({ "ref": r.to_json(), "stats": stats }))
+                }
+                None => Response::err(id, -32001, format!("checkpoint/unpin: unknown id {cp_id}")),
+            }
+        }
+
+        // checkpoint/clear — { stats }.
+        "checkpoint/clear" => {
+            let mut st = state.lock().unwrap();
+            st.checkpoint_ring.clear();
+            let stats = st.checkpoint_ring.stats().to_json();
+            Response::ok(id, json!({ "stats": stats }))
+        }
+
+        // checkpoint/restore — restore a ring entry into the live machine.
+        // Params: { id, then?: "pause"|"run"|"keep", render?: bool }.
+        // Response: { restored: RuntimeCheckpointRef, state: <debug state> }.
+        // then==="run": pin the restored anchor + truncate future anchors (Spec 761).
+        "checkpoint/restore" => {
+            let cp_id = match req.params.get("id").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return Response::err(id, -32602, "checkpoint/restore: id required"),
+            };
+            let then = req.params.get("then").and_then(|v| v.as_str());
+            let intent = match then {
+                Some("pause") | Some("run") | Some("keep") => then,
+                _ => None,
+            };
+            let mut st = state.lock().unwrap();
+            // Resolve the stored payload (rehydrated media) + its ref.
+            let snapshot = match st.checkpoint_ring.restore_snapshot(&cp_id) {
+                Some(s) => s,
+                None => {
+                    return Response::err(id, -32001, format!("checkpoint/restore: unknown id {cp_id}"))
+                }
+            };
+            if let Err(e) = restore_live_checkpoint(&mut st.session, &snapshot) {
+                return Response::err(id, -32001, format!("checkpoint/restore: {e}"));
+            }
+            let restored = st.checkpoint_ring.get(&cp_id).map(|r| r.to_json());
+            // then==="run": this is a new timeline — pin the anchor + drop the future.
+            if intent == Some("run") {
+                st.checkpoint_ring.pin(&cp_id);
+                st.checkpoint_ring.truncate_after(&cp_id, true);
+                st.session.running = true;
+            } else {
+                st.session.running = false;
+            }
+            // A restore is a control discontinuity (= a pause/seek): advance the
+            // controller frame + clear the last stop, mirroring the undump/reset path.
+            st.ctrl_frame += 1;
+            st.ctrl_stop = None;
+            let machine_state = build_debug_state(&st);
+            Response::ok(id, json!({
+                "restored": restored,
+                "state": machine_state,
+            }))
+        }
+
         m if m.starts_with("checkpoint/") => {
-            Response::err(id, -32001, format!("NOT_IMPLEMENTED: {m}: deferred"))
+            // checkpoint/thumbnails needs the per-checkpoint VIC filmstrip render
+            // (controller.filmstrip()) — a present-capture path not yet in trx64.
+            Response::err(id, -32001, format!("NOT_IMPLEMENTED: {m}: deferred (needs the filmstrip/present-capture path)"))
         }
 
         m if m.starts_with("recorder/") => {
@@ -3139,6 +3293,125 @@ fn gather_native_media_inputs(
     out
 }
 
+/// The `debug/state` controller-state object (= c64re `controller.state()`), built
+/// from the live `State`. Shared by `debug/state` and `checkpoint/restore`'s
+/// `state` field so both report the identical shape.
+fn build_debug_state(st: &State) -> Value {
+    let bps = st.breakpoints.list_vice_json();
+    let pc = st.session.machine.cpu6510.reg_pc as u64;
+    let cycles = st.session.machine.clk;
+    let run_state = if st.session.running { "running" } else { "paused" };
+    let stop = match &st.ctrl_stop {
+        Some(s) => json!({ "reason": s.reason, "pc": s.pc as u64, "cycles": s.cycles }),
+        None => Value::Null,
+    };
+    json!({
+        "runState": run_state,
+        "pacing": { "mode": "pal", "ratio": 1 },
+        "pc": pc,
+        "cycles": cycles,
+        "frame": st.ctrl_frame,
+        "breakpoints": bps,
+        "stop": stop,
+        "controlOwner": "llm"
+    })
+}
+
+// ── Checkpoint-ring capture/restore of the LIVE machine ──────────────────────────
+//
+// These factor the snapshot/dump + snapshot/undump core (drive blobs, disk
+// re-attach, full RuntimeCheckpoint capture/restore) so a `checkpoint/*` ring
+// capture/restore rides the EXACT same path as the `.c64re` snapshot — the ring
+// just keeps the resulting checkpoint Value in memory instead of on disk.
+
+/// Capture the live machine into a self-contained RuntimeCheckpoint Value, with the
+/// attached drive8 disk EMBEDDED in the `driveDiskImage` blob so a later restore can
+/// re-attach it (matching snapshot/dump). Mirrors c64re `controller.captureCheckpoint`
+/// → `ring.capture(kernel.snapshot(), frame, cycles)`.
+fn capture_live_checkpoint(session: &mut Session) -> Value {
+    // Disk path/format for the checkpoint `media` metadata (= snapshot/dump).
+    let (disk_path, disk_format) = match session.machine.drive8.get_attached_disk() {
+        Some(d) => (
+            d.backing_path.clone().unwrap_or_default(),
+            match d.kind {
+                DiskKind::G64 => "g64",
+                DiskKind::D64 => "d64",
+            }
+            .to_string(),
+        ),
+        None => (String::new(), String::new()),
+    };
+    // The attached disk's clean bytes ride as the `driveDiskImage` pooled blob so a
+    // ring restore re-establishes the media without a sidecar file. (snapshot/dump
+    // embeds these in the .c64re mediaPayloads; the in-memory ring embeds them in
+    // the checkpoint tree, which the disk pool then dedups across entries.)
+    let attached_disk_bytes = session
+        .machine
+        .drive8
+        .get_attached_disk()
+        .map(|d| d.bytes.clone());
+    // Drive blobs (drive1541 core + GCRIMAGE0 overlay), captured from the live drive.
+    let drive1541_blob =
+        trx64_core::drive_snapshot::capture_drive1541(&mut session.machine.drive8);
+    let drive_disk_blob =
+        trx64_core::drive_snapshot::capture_drive_disk_image(&session.machine.drive8);
+    let mut cp = trx64_core::c64re_snapshot::capture_runtime_checkpoint(
+        &session.machine,
+        &disk_path,
+        &disk_format,
+        Some(&drive1541_blob),
+        drive_disk_blob.as_deref(),
+    );
+    // Embed the clean disk bytes as `driveDiskImage` so the ring's content-addressed
+    // pool dedups them and a restore re-attaches the disk before restoring the drive
+    // GCR overlay (the drive_snapshot `driveDiskImage` field holds the MUTABLE GCR
+    // overlay, captured above; here we additionally carry the clean image to re-attach).
+    if let Some(bytes) = attached_disk_bytes {
+        // The GCR overlay (drive_disk_blob) already rode `driveDiskImage`; the clean
+        // image rides a sibling field consumed only by the ring restore. Keep the
+        // c64re `driveDiskImage` semantics untouched (mutable GCR overlay) and stash
+        // the re-attach image under `_ringDriveDiskBytes` (a TRX64-private ring slot,
+        // ignored by restore_runtime_checkpoint, consumed by restore_live_checkpoint).
+        cp["_ringDriveDiskBytes"] = trx64_core::native_snapshot::ta_u8(&bytes);
+    }
+    cp
+}
+
+/// Restore the live machine from a ring checkpoint Value (re-attaching the embedded
+/// drive8 disk first, then `restore_runtime_checkpoint`). Mirrors snapshot/undump.
+/// Returns Ok(()) on success. Leaves the session paused (a restore is a pause point).
+fn restore_live_checkpoint(session: &mut Session, cp: &Value) -> Result<(), String> {
+    // Re-attach the embedded clean disk image FIRST (so the drive's GCR baseline is
+    // present before restore_runtime_checkpoint overlays the mutable GCR content).
+    if let Some(bytes) = cp
+        .get("_ringDriveDiskBytes")
+        .and_then(trx64_core::native_snapshot::ta_u8_decode)
+    {
+        // Recover the disk kind/path from the checkpoint media metadata.
+        let format = cp
+            .get("media")
+            .and_then(|mm| mm.get("imageFormat"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let kind = if format == "d64" { DiskKind::D64 } else { DiskKind::G64 };
+        let backing_path = cp
+            .get("media")
+            .and_then(|mm| mm.get("diskPath"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        session.machine.drive8.attach_disk(DiskImage {
+            kind,
+            bytes,
+            backing_path,
+            read_only: false,
+        });
+    }
+    trx64_core::c64re_snapshot::restore_runtime_checkpoint(&mut session.machine, cp)?;
+    session.running = false;
+    Ok(())
+}
+
 // ── SHA-256 helper ────────────────────────────────────────────────────────────
 
 /// Compute SHA-256 of `data` and return the lowercase hex string.
@@ -3399,6 +3672,9 @@ async fn main() {
         ctrl_frame: 0, // incremented on each debug/run|pause|continue; first pause → 1
         ctrl_stop: None,
         checkpoint_counter: 0,
+        checkpoint_ring: trx64_core::checkpoint_ring::RuntimeCheckpointRing::new(),
+        inspect_evidence: Vec::new(),
+        vic_provenance_enabled: false,
         trace_definitions: std::collections::HashMap::new(),
     }));
 
@@ -3456,6 +3732,9 @@ mod batch1_tests {
             ctrl_frame: 0,
             ctrl_stop: None,
             checkpoint_counter: 0,
+            checkpoint_ring: trx64_core::checkpoint_ring::RuntimeCheckpointRing::new(),
+            inspect_evidence: Vec::new(),
+            vic_provenance_enabled: false,
             trace_definitions: std::collections::HashMap::new(),
         }))
     }
@@ -3799,5 +4078,136 @@ mod batch1_tests {
         assert_eq!(e.code, -32602);
         let e2 = call_err(&st, "session/key_up", json!({}));
         assert_eq!(e2.code, -32602);
+    }
+
+    // ── Spec 705.B — checkpoint ring behavioral + wire-shape gates ────────────
+
+    #[test]
+    fn checkpoint_ring_create_list_restore_roundtrip() {
+        // BEHAVIORAL: capture at state T → mutate → restore → state is back at T.
+        let st = make_state();
+        let dir = std::env::temp_dir().join("trx64-checkpoint-ring-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let prg = dir.join("body.prg");
+        std::fs::write(&prg, [0x00u8, 0xc0, 0xa9, 0x2a, 0x60]).unwrap(); // $C000: LDA #$2A; RTS
+        call(&st, "session/load_prg", json!({ "prg_path": prg.to_string_lossy() }));
+
+        // Capture pre-state.
+        let pre_pc = st.lock().unwrap().session.machine.c64_core.reg_pc;
+        assert_eq!(st.lock().unwrap().session.machine.read_full(0xc000), 0xa9);
+
+        // checkpoint/capture → { ref: {id, frame, cycles, pinned, byteSize, createdAtMs}, stats }.
+        let cap = call(&st, "checkpoint/capture", json!({ "session_id": "integrated-1" }));
+        let cp_id = cap["ref"]["id"].as_str().unwrap().to_string();
+        assert!(cp_id.starts_with("cp_"), "id is cp_<frame>_<seq>: {cp_id}");
+        assert_eq!(cap["ref"]["pinned"], json!(false));
+        // byteSize = RAM (65536) + 2 framebuffers (2*162240): TRX64's
+        // capture_runtime_checkpoint always captures the present framebuffers
+        // (the c64re EXPLICIT-capture path; the auto-cadence omitFramebuffer path
+        // is not used here). = 390016.
+        assert_eq!(cap["ref"]["byteSize"], json!(390016));
+        assert_eq!(cap["stats"]["count"], json!(1));
+        assert_eq!(cap["stats"]["slotBytes"], json!(65536));
+
+        // checkpoint/list → the ref is present (oldest-first).
+        let lst = call(&st, "checkpoint/list", json!({ "session_id": "integrated-1" }));
+        assert_eq!(lst["checkpoints"].as_array().unwrap().len(), 1);
+        assert_eq!(lst["checkpoints"][0]["id"], json!(cp_id));
+
+        // Mutate the live machine AFTER capture.
+        {
+            let mut g = st.lock().unwrap();
+            g.session.machine.c64_core.reg_pc = 0x1234;
+            g.session.machine.ram[0xc000] = 0xff;
+            g.session.machine.sync_after_monitor();
+        }
+
+        // checkpoint/restore (rewind) → state back at T.
+        let res = call(&st, "checkpoint/restore", json!({ "session_id": "integrated-1", "id": cp_id }));
+        assert_eq!(res["restored"]["id"], json!(cp_id));
+        assert_eq!(res["state"]["runState"], json!("paused"));
+        {
+            let g = st.lock().unwrap();
+            assert_eq!(g.session.machine.c64_core.reg_pc, pre_pc, "PC rewound");
+            assert_eq!(g.session.machine.read_full(0xc000), 0xa9, "RAM rewound");
+        }
+    }
+
+    #[test]
+    fn checkpoint_ring_n_checkpoints_rewind_to_each() {
+        // Ring of N: capture distinct RAM states, rewind to each, each matches.
+        let st = make_state();
+        let mut ids = Vec::new();
+        let mut want = Vec::new();
+        for i in 0u8..5 {
+            {
+                let mut g = st.lock().unwrap();
+                g.session.machine.ram[0x0400] = 0x10 + i;
+                g.session.machine.c64_core.reg_a = 0x20 + i;
+                g.session.machine.sync_after_monitor();
+            }
+            let cap = call(&st, "checkpoint/capture", json!({ "session_id": "integrated-1" }));
+            ids.push(cap["ref"]["id"].as_str().unwrap().to_string());
+            want.push((0x10 + i, 0x20 + i));
+        }
+        assert_eq!(call(&st, "checkpoint/list", json!({}))["checkpoints"].as_array().unwrap().len(), 5);
+        // Rewind to each (out of order) and verify.
+        for &idx in &[2usize, 0, 4, 1, 3] {
+            call(&st, "checkpoint/restore", json!({ "id": ids[idx] }));
+            let g = st.lock().unwrap();
+            assert_eq!(g.session.machine.ram[0x0400], want[idx].0, "ram@{idx}");
+            assert_eq!(g.session.machine.c64_core.reg_a, want[idx].1, "a@{idx}");
+        }
+    }
+
+    #[test]
+    fn checkpoint_pin_unpin_clear_shapes() {
+        let st = make_state();
+        let cp_id = call(&st, "checkpoint/capture", json!({}))["ref"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // pin → ref.pinned == true, stats.pinnedCount == 1.
+        let p = call(&st, "checkpoint/pin", json!({ "id": cp_id }));
+        assert_eq!(p["ref"]["pinned"], json!(true));
+        assert_eq!(p["stats"]["pinnedCount"], json!(1));
+        // unpin → ref.pinned == false.
+        let u = call(&st, "checkpoint/unpin", json!({ "id": cp_id }));
+        assert_eq!(u["ref"]["pinned"], json!(false));
+        assert_eq!(u["stats"]["pinnedCount"], json!(0));
+        // unknown id → error.
+        assert_eq!(call_err(&st, "checkpoint/pin", json!({ "id": "nope" })).code, -32001);
+        // clear → { stats } with count 0.
+        let c = call(&st, "checkpoint/clear", json!({}));
+        assert_eq!(c["stats"]["count"], json!(0));
+        assert_eq!(call(&st, "checkpoint/list", json!({}))["checkpoints"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn checkpoint_capture_requires_no_params_id_required_on_pin() {
+        let st = make_state();
+        assert_eq!(call_err(&st, "checkpoint/pin", json!({})).code, -32602);
+        assert_eq!(call_err(&st, "checkpoint/unpin", json!({})).code, -32602);
+        assert_eq!(call_err(&st, "checkpoint/restore", json!({})).code, -32602);
+    }
+
+    #[test]
+    fn vic_inspect_ring_methods_shapes() {
+        let st = make_state();
+        // provenance toggle.
+        assert_eq!(call(&st, "vic/inspect/provenance", json!({ "enabled": true }))["enabled"], json!(true));
+        assert_eq!(call(&st, "vic/inspect/provenance", json!({ "enabled": false }))["enabled"], json!(false));
+        // default (omitted) → true.
+        assert_eq!(call(&st, "vic/inspect/provenance", json!({}))["enabled"], json!(true));
+        // evidence — empty list initially.
+        assert_eq!(call(&st, "vic/inspect/evidence", json!({}))["evidence"], json!([]));
+        // close — { ok, stats }; unpins a (here-unknown) checkpoint harmlessly.
+        let c = call(&st, "vic/inspect/close", json!({ "checkpoint_id": "x" }));
+        assert_eq!(c["ok"], json!(true));
+        assert!(c["stats"]["count"].is_u64());
+        // the engine-dependent ones stay deferred.
+        for m in ["vic/inspect/region", "vic/inspect/origin", "vic/inspect/at_capture"] {
+            assert_eq!(call_err(&st, m, json!({})).code, -32001);
+        }
     }
 }
