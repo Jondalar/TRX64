@@ -716,3 +716,10 @@ protocol-surface.
 13 no-new-primitive methods (trace/definition, session/*, debug/state, snapshot/dump|undump), live-diffed 1:1
 vs a real c64re daemon (caught a load_prg bug). 140 tests, byte-exact green, core untouched. Skipped key_down/up
 + vic/inspect (need primitives). Next: RuntimeController A/V push (enables ws-av-tap).
+
+## 2026-06-24 — DRIVER: RuntimeController A/V push (ADR-073) — ws-av-tap taps TRX64 real-time
+
+Daemon A/V binary push (fmt-1 indexed video + s16le audio) matching ws-av-tap 1:1, singleton StreamHub, 50fps
+real-time pacing, gated --stream (off=byte-exact). End-to-end traces/trx64_av_tap.mp4 (25s, h264+reSID audio).
+142 tests, byte-exact green. Caveat: user ws-av-tap --rec hangs on ffmpeg 8.1.1 fifo (tap-side). Next:
+protocol-surface b2.

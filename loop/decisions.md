@@ -1157,3 +1157,22 @@ None off-stream). CAVEAT: the user's ws-av-tap.mjs --rec ffmpeg-fifo path hangs 
 8.1.1 (reproduces with the daemon GONE → tap-side quirk, not the push); the daemon's stream is correct — an
 offline-mux recorder (tools/av_file_recorder.mjs) produces the clean .mp4. The raw streams ws-av-tap receives
 are valid; only its own fifo finalization stalls.
+
+## ADR-073 — RuntimeController A/V binary push: ws-av-tap can now tap TRX64 (real-time recording)
+Closed the RuntimeController parity gap. Daemon-side live A/V binary push matching ws-av-tap's decode 1:1
+(read the decoder ws-av-tap.mjs + the encoder c64re ws-server.ts): envelope [type:u8][seq:u32 LE]; BIN_VIC=0x01
+= fmt-1 PALETTE-INDEXED (NOT raw RGBA — the tap's decodeVic only accepts fmt 1) [w:384][h:272][fmt=1][rsvd]
+[cycle:u32][48B colodore palette][w*h indices&0x0f]; BIN_AUDIO=0x02 = s16le stereo 44100 (reSID mono->dup).
+render.rs render_canvas_indices() (fmt-1 indexed crop, additive). streaming.rs: build_vic_frame/build_audio_msg
++ singleton StreamHub (ONE pacing loop drives the singleton machine, broadcasts to subscribers, 1:1 c64re;
+epoch-anchored sleep holds ~50fps real-time; the !Send SidAudioEngine on a dedicated thread, the Send
+write_trace hook captures only (addr,value)). main.rs: all outbound funnels through one mpsc->writer task.
+TRIGGER: auto-subscribe a connecting client (the tap sends nothing), GATED behind --stream / TRX64_STREAM=1,
+OFF by default — essential: auto-push perturbed the byte-exact oracle (connect -> machine advance); gated off,
+the command-driven oracle gets hub=None, no advance on connect.
+RESULT: end-to-end traces/trx64_av_tap.mp4 — 384x272 h264 + 44100 stereo aac, 25.0s REAL-TIME (~50 v+a fps),
+audio NOT silent (live reSID tune). 142 tests pass; drive-boot-deep + oracle byte-exact GREEN with --stream off
+(the 4 pre-existing REDs byte-identical on the pre-A/V baseline = zero new divergence). CAVEAT: the user's
+ws-av-tap.mjs --rec ffmpeg-fifo hangs at moov-write on ffmpeg 8.1.1 (reproduces with the daemon GONE = a tap-
+side fifo-finalization quirk, NOT the push); the streams are valid (offline mux via tools/av_file_recorder.mjs
+produces a clean mp4). NEXT: protocol-surface b2 (key_down/up held-key + vic/inspect), snapshot-vsf, integration.
