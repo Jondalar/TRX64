@@ -723,3 +723,8 @@ Daemon A/V binary push (fmt-1 indexed video + s16le audio) matching ws-av-tap 1:
 real-time pacing, gated --stream (off=byte-exact). End-to-end traces/trx64_av_tap.mp4 (25s, h264+reSID audio).
 142 tests, byte-exact green. Caveat: user ws-av-tap --rec hangs on ffmpeg 8.1.1 fifo (tap-side). Next:
 protocol-surface b2.
+
+## 2026-06-24 — DRIVER: protocol-surface b2 held-key (ADR-074)
+
+keyboard.rs live_pressed held set (1:1 c64re), key_down/up/release_keys/input_status, additive (byte-identical
+when nothing held). 150 tests, byte-exact green. Next: snapshot-vsf cross-runtime codec.

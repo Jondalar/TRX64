@@ -1176,3 +1176,14 @@ audio NOT silent (live reSID tune). 142 tests pass; drive-boot-deep + oracle byt
 ws-av-tap.mjs --rec ffmpeg-fifo hangs at moov-write on ffmpeg 8.1.1 (reproduces with the daemon GONE = a tap-
 side fifo-finalization quirk, NOT the push); the streams are valid (offline mux via tools/av_file_recorder.mjs
 produces a clean mp4). NEXT: protocol-surface b2 (key_down/up held-key + vic/inspect), snapshot-vsf, integration.
+
+## ADR-074 — protocol-surface b2: held-key input (key_down/up/release_keys/input_status)
+Added the held-key primitive (c64re Spec 310 livePressed model). keyboard.rs: live_pressed Vec<String> held set
+(1:1 c64re livePressed, insertion-order) parallel to the timed-event queue; key_down/key_up/release_keys/
+pressed_keys (= setKeyDown/setKeyUp/releaseAllLive/livePressedKeys); read_rows_for_pa folds BOTH the cycle-gated
+timed events AND the held set into the active-low row mask (additive). Key table already byte-identical to
+c64re KEY_MATRIX (no extension). Daemon: session/key_down|key_up|release_keys wired + input_status reports
+pressed_keys (was [] in b1); wire shapes 1:1 c64re ws-server.ts. RESULT: 150 tests pass, byte-exact GREEN; an
+exhaustive test (no_held_keys_is_byte_identical_to_events_only) proves read_rows_for_pa is byte-identical to the
+events-only path when nothing held (additive). 9 core + 28 daemon round-trip tests. Enables interactive input
+(with --stream A/V: drive a game live). NEXT: snapshot-vsf (.c64re cross-runtime codec).
