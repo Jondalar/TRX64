@@ -38,12 +38,16 @@
     "drive-1to1-viacore"
   ],
   "note": "1:1 port WORKS (ADR-058): viacore.ts->viacore.rs (VIA2), byte-exact, scramble advanced end4->end6. Continue 1:1 port of distilled drive classes. Next: rotation.ts -> rotation.rs 1:1 (the disk byte-ready/SYNC the custom loader polls; rotation.rs 472 vs TS 928 = distilled). Then via1d/iecbus/drivecpu 1:1.",
-  "updated": "2026-06-24T06:22:28Z",
+  "updated": "2026-06-24T06:22:52Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "drive-1to1-rotation",
+    "model": "opus",
+    "started": "2026-06-24T06:22:52Z"
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
