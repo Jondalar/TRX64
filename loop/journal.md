@@ -628,3 +628,11 @@ viacore-backed Via1dBackend; deleted the distilled Via6522 (both VIAs now 1:1 vi
 past end6 (end6/7/8 EXACT). Bar climbs $20->$7E, drive escapes spin. VISUAL: the SCRAMBLE INFINITY title
 renders ~90% clean (was complete noise). All byte-exact gates + 91 tests GREEN. The 1:1-port directive cracked
 the custom loader. Residual: end5 off-by-1 (a few garbled blocks). Next: drivecpu.ts 1:1.
+
+## 2026-06-24 — DRIVER: scramble sprites fixed — TITLE RENDERS CLEAN (ADR-062); acid test DONE
+
+User caught it: the garbage was sprites. render.rs render_sprites read sprite data without the VIC bank base
+(bank-3 scramble read bank-0 junk). One-line fix (bank_base + ptr*64). Title renders clean: 96.64% pixel,
+bitmap 99.68%, sprites clean. The scramble custom $DD00 loader acid test is DONE — verbatim cores + 1:1
+drive-class ports (viacore/rotation/iecbus/via1) + ATN-IRQ fix + sprite-bank fix. Next: the 7-game gate, then
+a Rust-vs-TS perf compare (user plan).

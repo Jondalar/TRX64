@@ -929,3 +929,20 @@ iec::fold_drv_port shim — both VIAs now on the 1:1 viacore. RESULT (THE BREAKT
 All byte-exact gates GREEN, 91 tests. The 1:1-port-the-distilled-classes directive (viacore/rotation/iecbus/
 via1) cracked the custom loader. NEXT: the residual end5 off-by-1 — likely drivecpu.ts (the cross-domain
 catch-up, still distilled in full.rs/drive.rs catch_up_to) OR a 1-cycle sample-phase. Then the 7-game gate.
+
+## ADR-062 — scramble sprites fixed: render_sprites missing VIC bank base; TITLE RENDERS CLEAN
+User observed the residual garbled blocks were SPRITES. Verdict: a RENDER bug, not loader data. render.rs
+render_sprites read the sprite-data block WITHOUT the VIC bank base — `data_base = ptr*64` instead of
+`bank_base + ptr*64`. scramble runs in VIC bank 3 ($C000); pointer $48 → VIC reads $C000+$48*64=$D200 (clean
+MC sprite), but render.rs read bank-0 $1200 (junk) → garbled SCRAMBLE logo + center sprites. The bitmap
+rendered fine (its base already included the bank). Fix (render.rs:411): data_base = inp.bank_base + ptr*64,
+exactly like screen_base/char_base/bitmap_base. Citation: c64re vicii-fetch.ts (fetch_phi2 + vbank_phi2 =
+CIA2-derived bank) / VICE vicii.vbank. The MC 2-bit→colour mapping was already correct.
+RESULT: scramble TITLE RENDERS CLEAN — 96.64% pixel-match overall, bitmap region 99.68% identical, sprites
+clean. (Residual ~15% confined to the animated top logo band = $D011-per-frame raster-split animation phase,
+a static-single-frame-render limitation, NOT a bug — compared frozen in the $D011=$3B bitmap phase.) Fix is a
+no-op for bank 0 (collision/sprite gates unaffected). 91 tests, render gates GREEN.
+THE SCRAMBLE CUSTOM $DD00 LOADER ACID TEST IS DONE: the verbatim cores (drive/C64-CPU/VIC) + the 1:1 drive-class
+ports (viacore/rotation/iecbus/via1) + the ATN-IRQ dispatch fix + this sprite bank fix = the custom loader
+loads + RUNs + renders the clean title. NEXT (user plan): the 7-game gate (diverse .g64/GCR/half-track
+loaders — rotation 1:1 added the GCR engine the distilled lacked), then a Rust-vs-TS performance compare.
