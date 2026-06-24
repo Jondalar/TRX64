@@ -1275,3 +1275,15 @@ exact; N=5 out-of-order each matches). CROSS-RUNTIME wire shapes match c64re BYT
 list, restore state[8 keys], pin/unpin, provenance, close, evidence, clear). 189 tests, byte-exact GREEN,
 additive. DEFERRED follow-ups: vic-inspect-engine (6 methods), checkpoint/thumbnails. NEXT: recorder/scenario
 (unblocked).
+
+## ADR-081 — flash-cart writable tier: Flash040 + M93C86 + EasyFlash/GMOD2/MegaByter (parallel worktree)
+First PARALLEL-worktree merge. flash040.rs = the 13-state AMD Am29F040 FSM (1:1 VICE flash040core.c + c64re),
+lazy erase-busy (clk threaded from FullBus.clk, no tick). m93c86.rs = the MicroWire serial EEPROM (1:1
+m93c86.ts/VICE). cart.rs writable mappers: EasyFlash (2x flash + bank/mode + EAPI + crt re-pack), GMOD2 (flash
++ M93C86 EEPROM), MegaByter. read/peek now &mut self + clk (flash reads mutate); writable_image/crt_image/
+is_writable_dirty. GMOD3/MegaCart = Unsupported (different chip families). EVIDENCE: EasyFlash boots
+(AccoladeComics CRT reached_cart + frame), GMOD2 boots (yeti_mountain); flash write-back proven (program->
+readback, sector/chip erase, EEPROM round-trip, writable_image persistence). 192 tests, scramble drive gate +
+19 cart_mapper_gate + MagicDesk-still-boots GREEN (the &mut read path didn't disturb no-cart/read-only).
+Merged to main CLEAN (no conflicts — file-disjoint from checkpoint-ring). drive-write-back + recorder/scenario
+still running in parallel.
