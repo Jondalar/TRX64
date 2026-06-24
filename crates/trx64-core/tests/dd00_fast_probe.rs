@@ -169,24 +169,36 @@ fn dd00_fast_probe() {
         sink.cap_instr = true;
         sink.cap_target = 1_500_000;
         sink.armed = true;
-        // Capture the DRIVE PC stream (pc + drive_clk) in the divergence clk window
-        // so we can compare the drive phase against the reference drive_pc channel
-        // (reference divergence: C64-cycle 36544945, drive at PC $EC12-$EC44).
-        let mut drv_trace: Vec<(u16, u64)> = Vec::new();
+        // Capture the drive PB output (CLK/DATA the drive drives) + the C64-visible
+        // cpu_port at each C64 instruction boundary, in the divergence window, to see
+        // exactly when the drive asserts DATA vs when the C64 reads it.
+        let mut pb_trace: Vec<(u64, u16, u8, u8, u16)> = Vec::new();
+        let mut last_pb = 0xFFu8;
         let mut guard = 0u64;
         while sink.instrs.len() < sink.cap_target && guard < 12_000_000 {
-            m.run_for_full(1, &mut sink, |pc, _a, _x, _y, _sp, _p, dclk| {
-                if (25_894_000..=25_896_500).contains(&dclk) && drv_trace.len() < 120 {
-                    drv_trace.push((pc, dclk));
-                }
+            let mut dpc = 0u16;
+            m.run_for_full(1, &mut sink, |pc, _a, _x, _y, _sp, _p, _dclk| {
+                dpc = pc;
             });
+            let c64clk = m.cpu6510.clk;
+            if (25_895_700..=25_896_100).contains(&c64clk) {
+                let pb = m.drive8.via1_pb_iec_output();
+                if pb != last_pb || pb_trace.len() < 80 {
+                    pb_trace.push((c64clk, m.cpu6510.reg_pc, pb, m.iec.cpu_port, dpc));
+                }
+                last_pb = pb;
+            }
             guard += 1;
         }
         sink.cap_instr = false;
         sink.armed = false;
-        eprintln!("== TRX64 DRIVE PC stream in divergence window (pc, drive_clk) ==");
-        for (pc, dclk) in drv_trace.iter() {
-            eprintln!("  drvPC=${pc:04X} drive_clk={dclk}");
+        eprintln!("== TRX64 drive PB + cpu_port at C64-instr boundaries (divergence window) ==");
+        eprintln!("   (PB bit1=DATA_OUT bit3=CLK_OUT; cpu_port bit6=CLKin bit7=DATAin)");
+        for (c64clk, c64pc, pb, cp, dpc) in pb_trace.iter() {
+            eprintln!(
+                "  c64clk={c64clk} C64pc=${c64pc:04X} drvPC=${dpc:04X} PB=${pb:02X}(DATAo={} CLKo={}) cpu_port=${cp:02X}(CLKin={} DATAin={})",
+                (pb >> 1) & 1, (pb >> 3) & 1, (cp >> 6) & 1, (cp >> 7) & 1
+            );
         }
         let line: Vec<String> = sink
             .instrs
