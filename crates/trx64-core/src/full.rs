@@ -419,6 +419,17 @@ impl<'a> FullBus<'a> {
         }
     }
 
+    /// VIC bank base from CIA2 port-A bits 0-1 (= Machine::vic_bank_base):
+    /// `bank = 3 - (PA & DDRA & 3); base = bank * $4000`. Used by the per-cycle
+    /// VIC fetch view (tick/check_ba) + the static collision recompute.
+    #[inline]
+    pub(crate) fn vic_bank_base(&self) -> u16 {
+        let pra = self.cia2.peek(0xdd00);
+        let ddra = self.cia2.peek(0xdd02);
+        let bank = ((pra & ddra & 0x03) ^ 0x03) as u16;
+        bank.wrapping_mul(0x4000)
+    }
+
     /// Recompute the $D01E/$D01F collision latches from the current frozen state
     /// and merge them into the VIC (firing the collision IRQ on the 0→nonzero
     /// edge). Called when the CPU reads $D01E/$D01F so a polled collision register
@@ -704,10 +715,20 @@ impl<'a> Bus for FullBus<'a> {
     }
 
     /// One VIC master cycle per CPU master cycle (= c64ViciiCycle hook); advance
-    /// the shared master clock + both CIAs' clk in lockstep.
+    /// the shared master clock + both CIAs' clk in lockstep. The VIC reads its
+    /// per-cycle fetches through a `VicMemView` over the bus's RAM / CHARGEN /
+    /// colour-RAM ($D800 IO shadow) / live VIC bank (built inline so the borrow
+    /// checker sees disjoint field borrows vs `&mut self.vic`).
     #[inline]
     fn tick(&mut self) {
-        self.vic.tick();
+        let vbank = self.vic_bank_base();
+        let view = crate::vic::VicMemView {
+            ram: self.ram,
+            char_rom: Some(self.char_rom),
+            color_ram: &self.io[0x0800..0x0c00],
+            vbank,
+        };
+        self.vic.tick(&view);
         self.clk = self.clk.wrapping_add(1);
         self.cia1.clk = self.clk;
         self.cia2.clk = self.clk;
@@ -721,7 +742,14 @@ impl<'a> Bus for FullBus<'a> {
     /// CIA timers stay phase-aligned with the stretched CPU read).
     #[inline]
     fn check_ba_before_read(&mut self) -> u32 {
-        let stolen = self.vic.steal_cycles();
+        let vbank = self.vic_bank_base();
+        let view = crate::vic::VicMemView {
+            ram: self.ram,
+            char_rom: Some(self.char_rom),
+            color_ram: &self.io[0x0800..0x0c00],
+            vbank,
+        };
+        let stolen = self.vic.steal_cycles(&view);
         if stolen != 0 {
             self.clk = self.clk.wrapping_add(stolen as u64);
             self.cia1.clk = self.clk;

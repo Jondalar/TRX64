@@ -27,6 +27,7 @@ pub mod resid_ffi;
 pub mod sid;
 pub mod tables;
 pub mod vic;
+pub mod vic_draw;
 pub mod viacore;
 pub mod vsf;
 
@@ -188,16 +189,30 @@ impl<'a> Bus for VicBus<'a> {
         }
     }
     /// One VIC master cycle per CPU master cycle (= c64ViciiCycle hook). Latches
-    /// BA-low into the VIC's ba_low_flag for the next read-stall.
+    /// BA-low into the VIC's ba_low_flag for the next read-stall. The VIC reads its
+    /// per-cycle fetches through a flat-RAM `VicMemView` (no CHARGEN overlay on the
+    /// chip-isolated bus; colour RAM = the $D800 slice of flat RAM; bank 0).
     #[inline]
     fn tick(&mut self) {
-        self.vic.tick();
+        let view = crate::vic::VicMemView {
+            ram: self.mem,
+            char_rom: None,
+            color_ram: &self.mem[0xd800..0xdc00],
+            vbank: 0,
+        };
+        self.vic.tick(&view);
     }
     /// VICE check_ba(): stall the CPU read while BA is low (badline / sprite DMA),
     /// stealing cycles + advancing the VIC. Returns the stolen-cycle count.
     #[inline]
     fn check_ba_before_read(&mut self) -> u32 {
-        self.vic.steal_cycles()
+        let view = crate::vic::VicMemView {
+            ram: self.mem,
+            char_rom: None,
+            color_ram: &self.mem[0xd800..0xdc00],
+            vbank: 0,
+        };
+        self.vic.steal_cycles(&view)
     }
 }
 

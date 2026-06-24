@@ -245,7 +245,14 @@ impl<'a, 'o, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, O> {
     /// core's authoritative clk rather than self-incrementing the FullBus clock).
     #[inline]
     fn vic_cycle(&mut self, clk: u64) {
-        self.fb.vic.tick();
+        let vbank = self.fb.vic_bank_base();
+        let view = crate::vic::VicMemView {
+            ram: self.fb.ram,
+            char_rom: Some(self.fb.char_rom),
+            color_ram: &self.fb.io[0x0800..0x0c00],
+            vbank,
+        };
+        self.fb.vic.tick(&view);
         self.fb.clk = clk;
         self.fb.cia1.clk = clk;
         self.fb.cia2.clk = clk;
