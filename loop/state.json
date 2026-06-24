@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "audio-media-batch (WS, mechanical)",
+  "current_item": "audio-media-batch",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -61,12 +61,17 @@
     "recorder-scenario"
   ],
   "note": "recorder/scenario merged (ADR-083). Main tree BACK ON main (clean, flash+drive+checkpoint+recorder all integrated). Remaining sequential tail: audio/media/batch WS, vic-inspect-engine (6 methods), checkpoint/thumbnails, integration.",
-  "updated": "2026-06-24T19:55:25Z",
+  "updated": "2026-06-24T19:57:04Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "audio-media-batch",
+    "model": "opus",
+    "started": "2026-06-24T19:57:04Z",
+    "note": "WS coverage: audio/* + media/events|recent + batch/* methods. Mechanical 1:1 handler ports to existing primitives: reSID/SidAudioEngine for audio, the media layer for media/events, a batch-of-WS-calls executor for batch. Main tree, sequential."
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
