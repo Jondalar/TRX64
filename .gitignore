@@ -3,6 +3,8 @@
 node_modules/
 *.duckdb
 *.c64retrace
+/traces/
+*.ppm
 tools/oracle/corpus/**/*.out
 # scratch goldens — non-deterministic until scenario isolation lands; regenerate locally
 tools/oracle/corpus/**/*.golden.json

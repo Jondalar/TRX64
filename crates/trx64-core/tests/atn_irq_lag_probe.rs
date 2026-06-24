@@ -233,16 +233,31 @@ fn scramble_run_trace() {
             (0x0400..0x0410).map(|a| m.read_full(a)).collect::<Vec<_>>()
         );
 
-        // Run the loader long enough for the depack + title to render, sampling the
-        // VIC border/bg colour ($D020/$D021) and the C64 PC region for liveness.
+        // Run the loader, rendering snapshots at several time points (the reference
+        // renders a CLEAN title ~8M cycles after RUN, so check early + late).
         let mut last_d020 = m.read_full(0xD020);
         let mut d020_changes = 0u64;
-        for _ in 0..40 {
+        for shot in 0..40 {
             m.run_for_full(1_000_000, &mut sink, |_, _, _, _, _, _, _| {});
             let d020 = m.read_full(0xD020);
             if d020 != last_d020 {
                 d020_changes += 1;
                 last_d020 = d020;
+            }
+            // Snapshot frames at +5M, +8M, +12M, +20M after RUN.
+            if [5, 8, 12, 20].contains(&(shot + 1)) {
+                let (w, h, rgba) = m.render_canvas_rgba();
+                let mut dc = std::collections::HashSet::new();
+                for px in rgba.chunks(4) {
+                    dc.insert((px[0], px[1], px[2]));
+                }
+                let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+                for px in rgba.chunks(4) {
+                    ppm.extend_from_slice(&px[..3]);
+                }
+                let p = format!("/Users/alex/Development/C64/Tools/TRX64/traces/scramble_trx64_+{}M.ppm", shot + 1);
+                std::fs::write(&p, &ppm).ok();
+                eprintln!("  snapshot +{}M: PC=${:04X} D011=${:02X} distinct_colors={}", shot + 1, m.cpu6510.reg_pc, m.read_full(0xD011), dc.len());
             }
         }
         eprintln!(
