@@ -1187,3 +1187,19 @@ pressed_keys (was [] in b1); wire shapes 1:1 c64re ws-server.ts. RESULT: 150 tes
 exhaustive test (no_held_keys_is_byte_identical_to_events_only) proves read_rows_for_pa is byte-identical to the
 events-only path when nothing held (additive). 9 core + 28 daemon round-trip tests. Enables interactive input
 (with --stream A/V: drive a game live). NEXT: snapshot-vsf (.c64re cross-runtime codec).
+
+## ADR-075 — snapshot interop scope: c64re-own VSF (A) + read real-VICE; defer real-VICE write
+The snapshot-vsf VERIFY found 3 incompatible formats: (1) c64re snapshot/dump|undump = .c64re container
+(magic C64RESNP + gzip-JSON RuntimeCheckpoint + media) = the checkpoint-ring item (later); (2) c64re vsf/
+save|load = c64re's OWN simplified VSF (module-mapping.ts: "C64\0", null-term names, MAINCPU 11B, C64MEM
+65550B, CIA 48B, SID 32B, VIC-II 108B) — TRX64's vsf.rs ALREADY mirrors this; (3) real VICE x64sc .vsf
+(16B-padded names, "C64SC", MAINCPU 103B, CIA 77B, SID 36B+SIDEXTENDED, VIC-II 123,415B full-pipeline blob,
+DRIVE8/DRIVECPU0/...) — c64re only READS it (loadViceVsf, partial), never writes; TRX64 currently REJECTS it.
+The fork can't be served by one writer. DRIVER DECISION (justified by feature-complete-VS-C64RE + the WS-swap
+drop-in goal): the c64re drop-in exchanges c64re's OWN formats, so:
+- OPTION A (c64re-own VSF interop): DO IT — drop-in-relevant + small (field-parity vs module-mapping.ts +
+  round-trip vs a live c64re daemon both directions).
+- READ real VICE .vsf: DO IT — zero-downside + matches c64re's own loadViceVsf capability = part of parity.
+- WRITE real VICE .vsf (option B write): DEFER — needs the off-limits 123KB VIC-IISC pipeline blob + drive
+  internals, AND c64re itself never writes real-VICE VSF, so it is NOT part of c64re parity (a "beyond c64re"
+  optional extra). The .c64re container (snapshot/dump interop) is the separate checkpoint-ring item.
