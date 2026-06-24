@@ -3,5 +3,11 @@ name = "trx64-core"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+# build.rs compiles the vendored GPL reSID C++ (vendor/resid/) + the c64re
+# flat-C shim into a static lib that the audio tier FFIs (see src/resid_ffi.rs).
+build = "build.rs"
 
 [dependencies]
+
+[build-dependencies]
+cc = "1"
