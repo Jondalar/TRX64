@@ -3213,6 +3213,9 @@ fn mapper_type_str(t: trx64_core::cart::MapperType) -> &'static str {
         Ocean => "ocean",
         MagicDesk => "magicdesk",
         MagicDesk16 => "magicdesk16",
+        EasyFlash => "easyflash",
+        Gmod2 => "gmod2",
+        MegaByter => "megabyter",
         Unsupported => "cartridge",
     }
 }

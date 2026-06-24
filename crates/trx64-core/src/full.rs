@@ -249,6 +249,10 @@ impl<'a> FullBus<'a> {
             cartridge_attached: self.cartridge.is_some(),
             cartridge_exrom: lines.map(|l| l.exrom),
             cartridge_game: lines.map(|l| l.game),
+            // GMOD2's IO1 read mixes the EEPROM DO bit with open-bus low bits; the
+            // stock C64 float bus is 0xFF here (= open_bus()). Read-only mappers
+            // ignore phi1.
+            phi1: 0xff,
         }
     }
 
@@ -550,21 +554,30 @@ impl<'a> FullBus<'a> {
     /// Consult the attached cartridge mapper's read window (ts:
     /// `this.cartridge?.read(normalized, this.getBankInfo())`). None ⇒ no cart or
     /// the mapper does not handle this address (falls through to RAM / open-bus).
+    /// `&mut self` + `self.clk` for the writable flash tier (flash reads advance
+    /// the command FSM / latch DQ status / catch the erase alarm up); the
+    /// read-only mappers ignore both and do a pure array index.
     #[inline]
-    fn cart_read(&self, addr: u16) -> Option<u8> {
+    fn cart_read(&mut self, addr: u16) -> Option<u8> {
         let bi = self.get_bank_info();
-        self.cartridge.as_ref().and_then(|c| c.read(addr, &bi))
+        let clk = self.clk;
+        match self.cartridge.as_mut() {
+            Some(c) => c.read(addr, &bi, clk),
+            None => None,
+        }
     }
 
     /// Drive a write through the cartridge mapper (ts:
     /// `this.cartridge?.write(normalized, byte, bankInfo)`). Returns whether the
     /// cart CONSUMED the write (true ⇒ does not fall through to RAM). `bank_info`
-    /// is computed BEFORE the mutable borrow (it only needs the live lines).
+    /// is computed BEFORE the mutable borrow (it only needs the live lines); `clk`
+    /// drives the flash erase-alarm schedule.
     #[inline]
     fn cart_write(&mut self, addr: u16, value: u8) -> bool {
         let bi = self.get_bank_info();
+        let clk = self.clk;
         match self.cartridge.as_mut() {
-            Some(c) => c.write(addr, value, &bi),
+            Some(c) => c.write(addr, value, &bi, clk),
             None => false,
         }
     }

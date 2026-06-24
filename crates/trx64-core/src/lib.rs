@@ -19,11 +19,13 @@ pub mod cpu;
 pub mod drive;
 pub mod drive_6510core;
 pub mod drive_snapshot;
+pub mod flash040;
 pub mod full;
 pub mod full_sc;
 pub mod gcr;
 pub mod iec;
 pub mod keyboard;
+pub mod m93c86;
 pub mod native_snapshot;
 pub mod rotation;
 pub mod render;
@@ -674,8 +676,12 @@ impl Machine {
                     cartridge_attached: true,
                     cartridge_exrom: Some(cart.get_lines().exrom),
                     cartridge_game: Some(cart.get_lines().game),
+                    phi1: 0xff,
                 };
-                if let Some(v) = cart.read(addr, &bi) {
+                // peek (side-effect-free): a reset-vector fetch must NOT advance
+                // the flash command FSM (the flash is in READ state at reset, so
+                // peek returns the same raw ROMH byte the bus read would).
+                if let Some(v) = cart.peek(addr, &bi) {
                     return v;
                 }
             }
