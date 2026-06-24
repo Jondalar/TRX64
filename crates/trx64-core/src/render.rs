@@ -407,9 +407,17 @@ fn render_sprites(inp: &RenderInput, fb: &mut [u8], fg: &[u8], mut sprmask: Opti
         let is_ye = y_exp & m != 0;
         let spri = pri & m != 0; // sprite is BEHIND foreground graphics when set
 
-        // Sprite data pointer: screen RAM $3F8+s (in the VIC bank), ×64.
+        // Sprite data pointer: screen RAM $3F8+s (in the VIC bank), ×64. The
+        // resulting address is BANK-RELATIVE — the VIC bank base must be OR-ed back
+        // in, exactly like the screen/char/bitmap bases. PORT OF: c64re
+        // vicii-fetch.ts:141/159/299 `fetch_phi2((sprite.pointer << 6) + mc)` where
+        // `fetch_phi2` (vicii-fetch.ts:103) does `addr = (addr + vbank_phi2) & mask`
+        // and `vbank_phi2` (vicii.ts:58) = the CIA2-derived bank base
+        // (0/$4000/$8000/$C000). VICE: vicii-fetch.c sprite fetch via `vicii.vbank`.
+        // WITHOUT this, a non-zero VIC bank (scramble runs in bank 3 = $C000) reads
+        // sprite data from the wrong $0000-bank address → garbled sprites.
         let ptr = inp.ram[screen_base.wrapping_add(0x3f8 + s as u16) as usize] as u16;
-        let data_base = ptr.wrapping_mul(64);
+        let data_base = inp.bank_base.wrapping_add(ptr.wrapping_mul(64));
 
         let dbuf_x0 = sx + SPRITE_DBUF_X0;
         let height = if is_ye { 42 } else { 21 };
