@@ -1628,16 +1628,24 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         }
 
         // session/input_status — UI inspector read of pressed keys + joystick bits
-        // (ws-server.ts:1486). TRX64's keyboard is a timed-event queue (no held-key
-        // set / pressed query) and has no joystick model, so pressed is empty and
-        // both joysticks read released. Shape matches the TS `{ pressed, joystick1,
-        // joystick2 }`.
+        // (ws-server.ts:1486). Reports the held-key set via pressed_keys() (Spec
+        // 310, batch 2). TRX64 has no joystick model, so both joysticks read
+        // released. Shape matches the TS `{ pressed, joystick1, joystick2 }`.
         "session/input_status" => {
+            let st = state.lock().unwrap();
+            let pressed: Vec<Value> = st
+                .session
+                .machine
+                .keyboard
+                .pressed_keys()
+                .into_iter()
+                .map(Value::String)
+                .collect();
             let released = json!({
                 "up": false, "down": false, "left": false, "right": false, "fire": false
             });
             Response::ok(id, json!({
-                "pressed": Value::Array(Vec::new()),
+                "pressed": Value::Array(pressed),
                 "joystick1": released,
                 "joystick2": released
             }))
@@ -1648,19 +1656,56 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         // (PRG header = 2-byte LE load addr), and returns
         // { loadAddress, endAddress, bytesLoaded, path }. Load-only: does NOT set PC
         // or autostart (that is runtime/run_prg).
-        // session/key_down|key_up|release_keys — DEFERRED to a later batch. The
-        // c64re model (keyDown/keyUp/pressedKeys/releaseAllKeys) is a STATEFUL
-        // held-key set: a key stays pressed until an explicit release and the set
-        // is queryable. TRX64's KeyboardMatrix is purely a TIMED-EVENT queue
-        // (type_text schedules [start,end) windows; read_rows_for_pa gates on the
-        // cycle) with no held-key set and no pressed-query. A faithful port needs a
-        // NEW core primitive (held-key state + a pressed_keys() accessor on
-        // KeyboardMatrix) — out of scope for this no-new-primitive batch.
-        "session/key_down" | "session/key_up" | "session/release_keys" => {
-            Response::err(id, -32001, format!(
-                "NOT_IMPLEMENTED: {}: needs a held-key set + pressed-query primitive on KeyboardMatrix (next batch)",
-                req.method
-            ))
+        // session/key_down — Spec 310 live keyboard passthrough (ws-server.ts:1443).
+        // Marks `key` held on the matrix until an explicit release; returns the
+        // current held set. `key` is a c64re key id (e.g. "A", "L_SHIFT",
+        // "RUN_STOP" — same names as session/type's matrix). Shape: TS
+        // `{ ok: true, pressed: s.pressedKeys() }`.
+        "session/key_down" => {
+            let key = match req.params.get("key").and_then(|v| v.as_str()) {
+                Some(k) => k.to_string(),
+                None => return Response::err(id, -32602, "session/key_down: key required"),
+            };
+            let mut st = state.lock().unwrap();
+            st.session.machine.keyboard.key_down(&key);
+            let pressed: Vec<Value> = st
+                .session
+                .machine
+                .keyboard
+                .pressed_keys()
+                .into_iter()
+                .map(Value::String)
+                .collect();
+            Response::ok(id, json!({ "ok": true, "pressed": pressed }))
+        }
+
+        // session/key_up — release a single held key (ws-server.ts:1449).
+        // Returns the remaining held set. Shape: TS `{ ok: true, pressed }`.
+        "session/key_up" => {
+            let key = match req.params.get("key").and_then(|v| v.as_str()) {
+                Some(k) => k.to_string(),
+                None => return Response::err(id, -32602, "session/key_up: key required"),
+            };
+            let mut st = state.lock().unwrap();
+            st.session.machine.keyboard.key_up(&key);
+            let pressed: Vec<Value> = st
+                .session
+                .machine
+                .keyboard
+                .pressed_keys()
+                .into_iter()
+                .map(Value::String)
+                .collect();
+            Response::ok(id, json!({ "ok": true, "pressed": pressed }))
+        }
+
+        // session/release_keys — release all held keys (ws-server.ts:1455). The TS
+        // also clears joystick state on release-all (focus-loss policy); TRX64 has
+        // no joystick model so that is a no-op here. Shape: TS `{ ok: true }`.
+        "session/release_keys" => {
+            let mut st = state.lock().unwrap();
+            st.session.machine.keyboard.release_keys();
+            Response::ok(id, json!({ "ok": true }))
         }
 
         "session/load_prg" => {
@@ -3520,15 +3565,79 @@ mod batch1_tests {
     #[test]
     fn deferred_methods_report_not_implemented() {
         let st = make_state();
-        for m in ["session/key_down", "session/key_up", "session/release_keys"] {
-            let e = call_err(&st, m, json!({ "key": "A" }));
-            assert_eq!(e.code, -32001);
-            assert!(e.message.contains("NOT_IMPLEMENTED"));
-        }
         for m in ["vic/inspect/open", "vic/inspect/at", "vic/inspect/promote"] {
             let e = call_err(&st, m, json!({}));
             assert_eq!(e.code, -32001);
             assert!(e.message.contains("NOT_IMPLEMENTED"));
         }
+    }
+
+    #[test]
+    fn key_down_up_release_roundtrip_and_input_status() {
+        // Spec 310 live-keyboard wire shape (ws-server.ts:1443-1494).
+        let st = make_state();
+        // Initially nothing held.
+        assert_eq!(call(&st, "session/input_status", json!({}))["pressed"], json!([]));
+
+        // key_down → { ok: true, pressed: ["A"] }.
+        let d = call(&st, "session/key_down", json!({ "key": "A" }));
+        assert_eq!(d["ok"], json!(true));
+        assert_eq!(d["pressed"], json!(["A"]));
+
+        // A second held key extends the set (insertion order preserved).
+        let d2 = call(&st, "session/key_down", json!({ "key": "L_SHIFT" }));
+        assert_eq!(d2["pressed"], json!(["A", "L_SHIFT"]));
+
+        // input_status reflects the held set + released joysticks.
+        let inp = call(&st, "session/input_status", json!({}));
+        assert_eq!(inp["pressed"], json!(["A", "L_SHIFT"]));
+        for joy in ["joystick1", "joystick2"] {
+            for bit in ["up", "down", "left", "right", "fire"] {
+                assert_eq!(inp[joy][bit], json!(false), "{joy}.{bit}");
+            }
+        }
+
+        // The held keys actually pull their matrix rows: both 'A' (col1 row2)
+        // and 'L_SHIFT' (col1 row7) live on col1, so a CIA1 PA read driving col1
+        // low must see BOTH row2 and row7 cleared (active-low).
+        {
+            let g = st.lock().unwrap();
+            let now = g.session.machine.cpu6510.clk;
+            let pa_col1 = 0xff & !(1u8 << 1);
+            let mask = g.session.machine.keyboard.read_rows_for_pa(now, pa_col1);
+            assert_eq!(mask, 0xff & !(1 << 2) & !(1 << 7), "held A+L_SHIFT pull row2+row7 on col1");
+        }
+
+        // key_up removes just that key → { ok: true, pressed: ["L_SHIFT"] }.
+        let u = call(&st, "session/key_up", json!({ "key": "A" }));
+        assert_eq!(u["ok"], json!(true));
+        assert_eq!(u["pressed"], json!(["L_SHIFT"]));
+
+        // After key_up('A') the matrix no longer pulls row2, but L_SHIFT (still
+        // held, col1 row7) keeps row7 pulled.
+        {
+            let g = st.lock().unwrap();
+            let now = g.session.machine.cpu6510.clk;
+            let pa_col1 = 0xff & !(1u8 << 1);
+            assert_eq!(
+                g.session.machine.keyboard.read_rows_for_pa(now, pa_col1),
+                0xff & !(1 << 7),
+                "A released, L_SHIFT still held"
+            );
+        }
+
+        // release_keys clears everything → { ok: true } and empty status.
+        let r = call(&st, "session/release_keys", json!({}));
+        assert_eq!(r["ok"], json!(true));
+        assert_eq!(call(&st, "session/input_status", json!({}))["pressed"], json!([]));
+    }
+
+    #[test]
+    fn key_down_requires_key_param() {
+        let st = make_state();
+        let e = call_err(&st, "session/key_down", json!({}));
+        assert_eq!(e.code, -32602);
+        let e2 = call_err(&st, "session/key_up", json!({}));
+        assert_eq!(e2.code, -32602);
     }
 }
