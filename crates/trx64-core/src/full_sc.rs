@@ -290,6 +290,16 @@ impl<'a, 'o, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, O> {
         self.cur_op = (pc, op);
         self.fetched = true;
     }
+
+    /// Interrupt-serviced hook — forwards the verbatim core's DO_INTERRUPT
+    /// vector-selection event into the [`Observer`]. This is the ONLY producer of
+    /// `Observer::on_interrupt` on the full SC path (the CPU-isolated `cpu.rs`
+    /// path fires it directly from `service_interrupt`). Stamped with the
+    /// (vector, clk) the core chose (= cpu65xx-vice.ts onInterruptServiced).
+    #[inline]
+    fn on_interrupt(&mut self, vector: u16, clk: u64) {
+        self.obs.on_interrupt(vector, clk);
+    }
 }
 
 /// Drive the C64 verbatim SC core for one whole instruction (plus any pending

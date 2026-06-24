@@ -550,6 +550,16 @@ pub trait C64Core6510Bus {
     /// Tracing hook (debug_maincpu, dtv:1828). Default no-op.
     #[inline]
     fn debug_maincpu(&mut self, _pc: u16, _clk: u64, _op: u8, _p1: u8, _p2hi: u8) {}
+
+    /// Interrupt-serviced observability hook. PORT OF: cpu65xx-vice.ts
+    /// doInterrupt's `this.onInterruptServiced?.(vector, this.clk)` — fired at the
+    /// TOP of the NMI branch (vector $FFFA, ts:642) and the IRQ branch (vector
+    /// $FFFE, ts:666), AFTER the delay-gate test selected the vector but BEFORE the
+    /// 7-cycle entry runs. Pure callback: it must NOT touch CPU/clk/int state (the
+    /// `?.` in the TS is a tracing optional). Default no-op so the implementor's
+    /// `Observer.on_interrupt` is the only producer (the daemon's full SC path).
+    #[inline]
+    fn on_interrupt(&mut self, _vector: u16, _clk: u64) {}
 }
 
 // =============================================================================
@@ -2158,6 +2168,10 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
             let clk = self.core.clk;
             let nmi_now = (ik & IK_NMI) != 0 && interrupt_check_nmi_delay(self.int, clk);
             if nmi_now {
+                // Observability: fire BEFORE the ack + 7-cycle entry, vector
+                // $FFFA (= cpu65xx-vice.ts:642 onInterruptServiced(0xfffa, clk)).
+                // Pure callback — does not alter CPU/clk/int state.
+                self.bus.on_interrupt(0xfffa, clk);
                 self.int.interrupt_ack_nmi();
                 // !SKIP_CYCLE: two dummy reads of reg_pc.
                 self.load_dummy(self.core.reg_pc);
@@ -2187,6 +2201,10 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
                         || opinfo_disables_irq(self.core.last_opcode_info) != 0);
                 let irq_now = irq_gate && interrupt_check_irq_delay(self.int, clk);
                 if irq_now {
+                    // Observability: fire BEFORE the ack + DO_IRQBRK entry,
+                    // vector $FFFE (= cpu65xx-vice.ts:666
+                    // onInterruptServiced(0xfffe, clk)). Pure callback.
+                    self.bus.on_interrupt(0xfffe, clk);
                     self.int.interrupt_ack_irq();
                     self.load_dummy(self.core.reg_pc);
                     self.clk_inc();
