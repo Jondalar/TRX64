@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "sprite-render-verbatim",
+  "current_item": "rund-machen: Phase0 tick hooks (then breakpoints + WS surface)",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -45,20 +45,16 @@
     "perf-compare",
     "cartridge",
     "sid-resid",
-    "av-recording-mp4"
+    "av-recording-mp4",
+    "sprite-render-verbatim"
   ],
-  "note": "reSID DONE/ACCEPTED (ADR-068+068b): config verified TS-identical (filter OFF), audio good, <=5 LSB bound accepted. Cartridge + SID both complete. PENDING user steer: sprite-render-verbatim (the static-render -> per-cycle/per-line sprite draw for multiplexing + border). Other rund-machen items: Phase0 tick hooks, breakpoints, WS surface.",
-  "updated": "2026-06-24T13:20:56Z",
+  "note": "VERBATIM PER-CYCLE RENDER DONE (ADR-069): render gates 22/22 pixel-identical, byte-exact GREEN, scramble multiplexed logo + border sprites CLEAN (0-diff). The renderer is now verbatim (last so-aehnlich piece). maniac=black (slow loader, not render). NEXT autonomous rund-machen: Phase0 tick hooks (on_interrupt in do_interrupt + run-loop breakpoint param/abort + on_access bus gate, per ADR-066), then breakpoint policy layer, then WS surface coverage.",
+  "updated": "2026-06-24T14:00:19Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": {
-    "item": "sprite-render-verbatim",
-    "model": "opus",
-    "started": "2026-06-24T13:20:56Z",
-    "note": "opus ~49min: per-cycle draw + wiring committed (11903c2/7238c43/97ad4ed). Now adapting the render-gate (sweep a frame) + daemon render readout to the per-cycle framebuffer. Alive (commit 9min ago, files edited <1min). WATCH: builder touched tools/oracle/corpus/render/_probe.mjs - scrutinize at merge (render-gate harness adapt, must not weaken the gate)."
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"

@@ -1066,3 +1066,24 @@ gain 0.97), clock 985248, sr 44100, emit cadence floor(cycles*sr/clk). NOTHING t
 already off, settings already match the TS exactly. User: "dann ist ok, lass, committe das so, das reicht für
 jetzt mit dem reSID." reSID is DONE/ACCEPTED: bound the vendored C++ via cc-FFI, byte-deterministic, iso-sid
 byte-exact GREEN, config TS-identical, audio agrees with c64re within the inaudible <=5 LSB libm bound (ADR-068).
+
+## ADR-069 — verbatim per-cycle VIC draw: render.rs static -> vicii-draw-cycle in the tick (sprites/multiplexer/border)
+USER STEER: the last "so ähnlich" -> "wie vice" piece. render.rs was a STATIC single-pass frame render (drew
+once from final regs) -> sprite multiplexers (scramble's SCRAMBLE logo: 8 HW sprites reprogrammed per raster-
+IRQ) + border sprites + mid-line raster effects collapsed = garbled. FIX: new vic_draw.rs = 1:1 port of
+vicii-draw-cycle.ts (draw_graphics/draw_graphics8, draw_sprites/draw_sprites8 + trigger/mc-bits/data/xpos,
+draw_border8, draw_colors_6569/8 + update_cregs, vicii_draw_cycle) on the lagged cycle_flags_pipe; + per-cycle
+content fetches in vic.rs (vicii_fetch_graphics/idle/sprite_pointer/sprite_dma/refresh/matrix + sprite_dma_
+cycle_0/2, 6569 fetch-magic) feeding gbuf/vbuf/cbuf/sprite[].data. VIC accumulates a 520x312 framebuffer as
+the raster sweeps, double-buffered (dbuf->displayed swap at frame start); render_canvas_rgba returns the swept
+buffer. render.rs static single-pass replaced.
+RESULT: render gates 22/22 PIXEL-IDENTICAL (boot + 11 sprite scenarios + 4 gfx modes + 6 scroll/border). Byte-
+exact CPU/VIC/drive gates GREEN, no regression (VIC state-computation unchanged; daemon io_injected distinguishes
+render-inject [wr io -> full VIC-ticked] from cpu-inject [wr -> CPU-only] so iso gates stay byte-exact; the
+render-gate harness scene.mjs sweeps a frame for TRX64 too). scramble's multiplexed SCRAMBLE logo + border
+sprites render CLEAN (logo region rows 0-59 = 0 differing pixels vs ref; scramble_sprite_probe 0/104448 pixel-
+identical). maniac = black (slow G64 loader doesn't finish in 100M cyc — loader-speed, NOT a render bug). 86
+lib tests GREEN. The 4 pre-existing REDs (iso-vic-badline-irq/sprites/probe, scramble-load-progress) unchanged.
+(Note: a stray fork committed redundant commits on the branch; tree correct + all gates pass.)
+THE RENDERER IS NOW VERBATIM PER-CYCLE — the last so-aehnlich->wie-vice conversion. CPU/VIC-cycle/drive/render
+all verbatim VICE now. NEXT (rund machen): Phase0 tick hooks + breakpoints + WS surface (autonomous).

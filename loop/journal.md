@@ -690,3 +690,10 @@ User asked if reSID filters were on. Verified the config is line-for-line identi
 enable_filter(0), 6581, external on, RESAMPLE, gain 0.97, etc.) — nothing to change. User: ok, leave it, reSID
 done. Cartridge + SID complete. Pending: sprite-render-verbatim (user steer). No A/B builder dispatched (user
 said leave it).
+
+## 2026-06-24 — DRIVER: verbatim per-cycle VIC draw (ADR-069) — scramble logo CLEAN
+
+render.rs static -> vic_draw.rs 1:1 vicii-draw-cycle into the per-cycle tick. Render gates 22/22 pixel-
+identical, byte-exact GREEN, scramble multiplexed SCRAMBLE logo + border sprites render clean (0-diff). The
+renderer is now verbatim per-cycle (last so-aehnlich->wie-vice piece). maniac=black (slow loader). Next
+autonomous: Phase0 tick hooks + breakpoints + WS surface.
