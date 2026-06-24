@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "ESCALATED-dd00-fast-transfer",
+  "current_item": "dd00-fast-transfer",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -37,12 +37,16 @@
     "render-verbatim"
   ],
   "note": "render-verbatim DONE (ADR-056): $D01E/$D01F sprite collision + collision IRQ verbatim, gameplay-critical gap closed, zero regression. The ONE remaining blocker is the ESCALATED cross-domain IEC coupling (dd00-fast-transfer/ADR-055, foundational+risky) for the scramble custom loader — awaiting user decision (a) do it / (b) done already / (c) leave. All other behavioral work complete.",
-  "updated": "2026-06-24T04:41:10Z",
+  "updated": "2026-06-24T04:51:18Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "dd00-fast-transfer",
+    "model": "opus",
+    "started": "2026-06-24T04:51:18Z"
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
