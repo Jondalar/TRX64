@@ -32,6 +32,7 @@ pub mod tables;
 pub mod vic;
 pub mod vic_draw;
 pub mod viacore;
+pub mod vice_snapshot_stream;
 pub mod vsf;
 
 pub use cia::Cia;
