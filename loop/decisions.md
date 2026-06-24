@@ -1020,3 +1020,17 @@ deferred follow-up.
 OPEN USER DECISION: reSID approach — (a) cc-crate FFI of the vendored GPL C++ reSID (1:1, byte-identical audio
 + 705 state snapshot, but adds a C++ build dep + GPL boundary), (b) pure-Rust reSID port (clean deps, large/
 error-prone, no oracle leverage), (c) the simpler TS-SID. Recommended (a). Awaiting user steer; NOT building yet.
+
+## ADR-067 — cartridge read-only tier: 1:1 cartridge.ts; a real MagicDesk CRT boots
+Built cartridge/CRT support (read-only mapper tier) 1:1 from cartridge.ts + memory-bus.ts (+ VICE c64/cart/).
+New cart.rs: parse_crt ("C64 CARTRIDGE" sig + CHIP-packet walk), infer_mapper_type (VICE hw-type->mapper),
+CartMapper trait, Normal(8k/16k/ultimax)/MagicDesk/MagicDesk16/Ocean mappers. full.rs: MemConfig Bank8/BankA/
+BankE enums + build_memconfig_table 1:1, pla_config_changed folds cart EXROM/GAME (no-cart = port|0x18 byte-
+identical), read/write cart consults ($8000/$A000/$E000 + ultimax open-bus + $DE00 IO). lib.rs: attach_cart_
+from_bytes/detach, cold_reset resets cart FIRST then reads $FFFC through the banked map (ultimax re-vector).
+Cartridge is a per-access bus hook, NOT clocked — no tick plumbing. full_sc.rs unchanged.
+RESULT: no-cart byte-exact gates GREEN (drive-boot-deep confirmed; the memconfig refactor derives the old
+booleans so no-cart is identical), 108 tests. BEHAVIORAL: im3_MAGICDESK.crt boots — reached_cart=true, PC in
+cart ROML $8050, decrunches to RAM, 5-color frame renders. 13 unit tests (parse + 4 mappers + EXROM/GAME +
+unsupported-flash + state roundtrip). Flash/EasyFlash tier (Flash040/EAPI/m93c86) = deferred follow-up
+(out of scope). NEXT: SID reSID audio (cc-FFI the vendored C++, user-chosen).

@@ -670,3 +670,9 @@ Mapped TS core architecture. Monitor=separate (TRX64 already correct). obs/bk/tr
 gated (TRX64 has trace-hook via monomorphized Observer; bk/watchpoints not wired, on_interrupt dead in full
 path). Plan: Phase0 tiny hooks -> cartridge read-only || breakpoints -> SID-audio || monitor/WS. One open user
 decision: reSID approach (cc-FFI C++ vs pure-Rust vs TS-SID). No build dispatched — planning/discussion phase.
+
+## 2026-06-24 — DRIVER: cartridge read-only tier (ADR-067) — MagicDesk CRT boots
+
+cart.rs 1:1 cartridge.ts (parse_crt + CartMapper + Normal/MagicDesk/MagicDesk16/Ocean). full.rs memconfig
+enums + pla cart-line fold (no-cart byte-identical). lib.rs attach + ultimax reset. no-cart gates GREEN, 108
+tests. im3_MAGICDESK.crt boots (reached_cart, ROML exec, frame renders). Flash tier deferred. Next: SID reSID.
