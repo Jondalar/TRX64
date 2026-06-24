@@ -391,7 +391,10 @@ impl Sid6581 {
                 }
                 ADSR_ATTACK => {
                     let rate = ATTACK_CYCLES[vc.attack as usize & 0xf];
-                    let need = rate - vc.cycle_accum;
+                    // saturating: the program can shrink the rate nibble mid-envelope
+                    // so `rate < cycle_accum`; the boundary is then already passed
+                    // (need=0 → step fires now), never an underflow.
+                    let need = rate.saturating_sub(vc.cycle_accum);
                     if cycles < need {
                         vc.cycle_accum += cycles;
                         return;
@@ -409,7 +412,7 @@ impl Sid6581 {
                 }
                 ADSR_DECAY => {
                     let rate = decay_release_cycles(vc.decay);
-                    let need = rate - vc.cycle_accum;
+                    let need = rate.saturating_sub(vc.cycle_accum);
                     if cycles < need {
                         vc.cycle_accum += cycles;
                         return;
@@ -426,7 +429,7 @@ impl Sid6581 {
                 }
                 ADSR_RELEASE => {
                     let rate = decay_release_cycles(vc.release);
-                    let need = rate - vc.cycle_accum;
+                    let need = rate.saturating_sub(vc.cycle_accum);
                     if cycles < need {
                         vc.cycle_accum += cycles;
                         return;
