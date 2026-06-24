@@ -36,12 +36,16 @@
     "dd00-atn-irq"
   ],
   "note": "dd00-atn-irq DONE (ADR-054): IK_IRQ ack bug fixed -> custom loader RUNS, title layout renders (was BASIC fallback). Next: dd00-fast-transfer — the 2-bit $DD00 fast-transfer CLK/DATA bit-sampling (corrupt bitmap bytes). c64re ref trace saved traces/scramble_run_ref.duckdb.",
-  "updated": "2026-06-24T03:02:34Z",
+  "updated": "2026-06-24T03:05:58Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "dd00-fast-transfer",
+    "model": "opus",
+    "started": "2026-06-24T03:05:58Z"
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
