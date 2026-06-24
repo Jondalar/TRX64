@@ -10,6 +10,7 @@
 use std::path::Path;
 
 pub mod c64_6510core;
+pub mod cart;
 pub mod cia;
 pub mod cpu;
 pub mod drive;
