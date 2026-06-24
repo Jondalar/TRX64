@@ -630,7 +630,9 @@ fn run_debug_control(id: Value, st: &mut State, frame: u64, is_continue: bool) -
             st.notify.broadcast("debug/breakpoint_hit", json!({
                 "session_id": st.session.id,
                 "pc": run.pc as u64,
-                "num": bp_num.map(|n| n as u64),
+                // bpNumForAddr (runtime-controller.ts:238) returns 0 (NOT null) when
+                // no numbered breakpoint matches the halt address — match that.
+                "num": bp_num.unwrap_or(0) as u64,
                 "cycles": cycles,
                 "registers": registers,
             }));
