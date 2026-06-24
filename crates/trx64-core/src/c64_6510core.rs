@@ -53,6 +53,16 @@
 #![allow(clippy::collapsible_else_if)]
 #![allow(clippy::collapsible_if)]
 #![allow(dead_code)]
+// The following are deliberate VICE-shape choices kept for line-by-line parity
+// with 6510dtvcore.c — clippy's rewrites would obscure the C correspondence.
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::no_effect)]
+#![allow(clippy::needless_late_init)]
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::enum_variant_names)]
+#![allow(clippy::manual_range_contains)]
+#![allow(clippy::identity_op)]
+#![allow(clippy::precedence)]
 
 // =============================================================================
 // SECTION A — Constants.
@@ -2627,5 +2637,214 @@ fn decode_and_execute<B: C64Core6510Bus>(ex: &mut Exec<B>, p0: u8, p1: u8, p2: u
         0xfd => ex.sbc_g(p1, p2, 3, AbsX),             // SBC $nnnn,X
         0xfe => ex.inc(p1, p2, 3, AbsXRmw, SAbsXRmw),   // INC $nnnn,X
         0xff => ex.isb(p1, p2, 3, AbsXRmw, SAbsXRmw),   // ISB $nnnn,X
+    }
+}
+
+// =============================================================================
+// SECTION L — #[cfg(test)] smoke test.
+//
+// A flat 64 KB RAM bus implementing C64Core6510Bus with a no-op VIC (vic_cycle
+// records nothing, check_ba steals 0 cycles). Proves: a few normal instructions
+// execute with the right register/PC/cycle results, and the SHX ($9e) illegal
+// opcode is fully cycle-stepped and models the SET_ABS_SH_I value + the mispaged
+// BA-low dummy read + the page-cross target — the exact gap the audit found in
+// the microcode-pattern cpu.rs.
+// =============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Flat-RAM test bus. Records the sequence of (kind, addr) accesses so the
+    /// SH* dummy-read + final store can be asserted at the exact cycle/address.
+    struct RamBus {
+        ram: Box<[u8; 0x10000]>,
+        /// ('R'/'r'(dummy)/'W'/'w'(dummy), addr) trace.
+        trace: Vec<(char, u16, u8)>,
+    }
+    impl RamBus {
+        fn new() -> Self {
+            RamBus { ram: Box::new([0u8; 0x10000]), trace: Vec::new() }
+        }
+    }
+    impl C64Core6510Bus for RamBus {
+        fn read_raw(&mut self, a: u16) -> u8 {
+            let v = self.ram[a as usize];
+            self.trace.push(('R', a, v));
+            v
+        }
+        fn write_raw(&mut self, a: u16, v: u8) {
+            self.ram[a as usize] = v;
+            self.trace.push(('W', a, v));
+        }
+        fn read_raw_dummy(&mut self, a: u16) -> u8 {
+            let v = self.ram[a as usize];
+            self.trace.push(('r', a, v));
+            v
+        }
+        fn write_raw_dummy(&mut self, a: u16, v: u8) {
+            // VICE STORE_DUMMY writes the (old) value to the address (the dummy
+            // RMW write-back), then the real STORE follows. For flat RAM the net
+            // effect is old-then-new = the new value.
+            self.ram[a as usize] = v;
+            self.trace.push(('w', a, v));
+        }
+        // No VIC steal in the test.
+        fn check_ba(&mut self, _loi: &mut u32, _ba_low: bool) -> u64 {
+            0
+        }
+        fn vic_cycle(&mut self, _clk: u64) {}
+    }
+
+    /// Run exactly one instruction.
+    fn step(core: &mut C64Core6510, bus: &mut RamBus, int: &mut IntStatus) -> i32 {
+        bus.trace.clear();
+        c64_6510core_execute(core, bus, int)
+    }
+
+    #[test]
+    fn smoke_basic_instructions() {
+        let mut core = C64Core6510::new();
+        let mut bus = RamBus::new();
+        let mut int = IntStatus::new();
+
+        // Program at $1000:  A2 42      LDX #$42
+        //                    8E 00 20   STX $2000
+        //                    E8         INX
+        bus.ram[0x1000] = 0xa2;
+        bus.ram[0x1001] = 0x42;
+        bus.ram[0x1002] = 0x8e;
+        bus.ram[0x1003] = 0x00;
+        bus.ram[0x1004] = 0x20;
+        bus.ram[0x1005] = 0xe8;
+        core.reg_pc = 0x1000;
+        let clk0 = core.clk;
+
+        // LDX #$42 — 2 cycles.
+        step(&mut core, &mut bus, &mut int);
+        assert_eq!(core.reg_x, 0x42, "LDX loaded X");
+        assert_eq!(core.reg_pc, 0x1002, "LDX advanced PC by 2");
+        assert_eq!(core.clk - clk0, 2, "LDX took 2 cycles");
+        assert_eq!(core.flag_n, 0x42, "N flag cache = value");
+        let clk1 = core.clk;
+
+        // STX $2000 — 4 cycles, stores $42.
+        step(&mut core, &mut bus, &mut int);
+        assert_eq!(bus.ram[0x2000], 0x42, "STX stored X to $2000");
+        assert_eq!(core.reg_pc, 0x1005, "STX advanced PC by 3");
+        assert_eq!(core.clk - clk1, 4, "STX abs took 4 cycles");
+        let clk2 = core.clk;
+
+        // INX — 2 cycles, X becomes $43.
+        step(&mut core, &mut bus, &mut int);
+        assert_eq!(core.reg_x, 0x43, "INX incremented X");
+        assert_eq!(core.clk - clk2, 2, "INX took 2 cycles");
+    }
+
+    /// SHX $nnnn,Y ($9e) — the illegal opcode the audit flagged. Proves the
+    /// SET_ABS_SH_I model: value = X & ((addr_hi)+1), the mispaged BA-low dummy
+    /// read at ((addr+Y)&0xff)|(addr&0xff00), and the page-cross target.
+    #[test]
+    fn smoke_shx_page_cross_corruption() {
+        let mut core = C64Core6510::new();
+        let mut bus = RamBus::new();
+        let mut int = IntStatus::new();
+
+        // 9E FF 30   SHX $30FF,Y   with Y = $02, X = $ff.
+        // addr = $30FF; addr+Y = $3101 (page cross $30 -> $31).
+        // value stored = X & ((addr>>8)+1) = $ff & ($30+1=$31) = $31.
+        // page-cross dummy read at ((addr+Y)&0xff)|(addr&0xff00) = $01 | $3000 = $3001.
+        // target = ((addr+Y)&0xff) | (value<<8) = $01 | ($31<<8) = $3101.
+        bus.ram[0x1000] = 0x9e;
+        bus.ram[0x1001] = 0xff;
+        bus.ram[0x1002] = 0x30;
+        core.reg_pc = 0x1000;
+        core.reg_x = 0xff;
+        core.reg_y = 0x02;
+        let clk0 = core.clk;
+
+        step(&mut core, &mut bus, &mut int);
+
+        // 5 cycles: opcode + 2 operand fetches + BA-low dummy + store.
+        assert_eq!(core.clk - clk0, 5, "SHX abs,Y took 5 cycles");
+        assert_eq!(core.reg_pc, 0x1003, "SHX advanced PC by 3");
+
+        // The mispaged BA-low dummy read happened at $3001 (NOT $3101).
+        let dummy = bus.trace.iter().find(|(k, _, _)| *k == 'r' || *k == 'R');
+        let dummy_addr = bus
+            .trace
+            .iter()
+            .filter(|(k, _, _)| *k == 'r')
+            .map(|(_, a, _)| *a)
+            .last()
+            .expect("SHX emitted a dummy read");
+        assert_eq!(dummy_addr, 0x3001, "SHX mispaged BA-low dummy read at $3001");
+        let _ = dummy;
+
+        // The final store: value $31 at target $3101.
+        let store = bus
+            .trace
+            .iter()
+            .find(|(k, _, _)| *k == 'W')
+            .expect("SHX emitted a store");
+        assert_eq!(store.1, 0x3101, "SHX target = $3101 (page-cross carried)");
+        assert_eq!(store.2, 0x31, "SHX value = X & ((addr_hi)+1) = $31");
+        assert_eq!(bus.ram[0x3101], 0x31, "SHX wrote $31 to $3101");
+    }
+
+    /// SHX with NO page cross — value still X & (hi+1), target is the plain
+    /// addr+Y, and the dummy read sits in the SAME page (no corruption visible
+    /// in the target, only the AND in the value).
+    #[test]
+    fn smoke_shx_no_page_cross() {
+        let mut core = C64Core6510::new();
+        let mut bus = RamBus::new();
+        let mut int = IntStatus::new();
+
+        // 9E 00 30   SHX $3000,Y   Y=$05, X=$ff.
+        // addr = $3000; addr+Y = $3005 (no cross). value = $ff & $31 = $31.
+        // target = $3005. dummy read at ($05)|($3000) = $3005.
+        bus.ram[0x1000] = 0x9e;
+        bus.ram[0x1001] = 0x00;
+        bus.ram[0x1002] = 0x30;
+        core.reg_pc = 0x1000;
+        core.reg_x = 0xff;
+        core.reg_y = 0x05;
+
+        step(&mut core, &mut bus, &mut int);
+
+        let store = bus.trace.iter().find(|(k, _, _)| *k == 'W').unwrap();
+        assert_eq!(store.1, 0x3005, "no-cross target = $3005");
+        assert_eq!(store.2, 0x31, "no-cross value = X & (hi+1) = $31");
+    }
+
+    /// A taken branch emits the dummy read of reg_pc and (on no page cross) sets
+    /// DELAYS_INTERRUPT — the branch-dummy gap the audit found.
+    #[test]
+    fn smoke_branch_dummy_and_delay() {
+        let mut core = C64Core6510::new();
+        let mut bus = RamBus::new();
+        let mut int = IntStatus::new();
+
+        // At $1000: F0 02  BEQ +2  (taken, no page cross -> dummy + DELAYS_INTERRUPT).
+        bus.ram[0x1000] = 0xf0;
+        bus.ram[0x1001] = 0x02;
+        core.reg_pc = 0x1000;
+        core.flag_z = 0; // Z set (LOCAL_ZERO() true) so BEQ is taken.
+        let clk0 = core.clk;
+
+        step(&mut core, &mut bus, &mut int);
+
+        assert_eq!(core.reg_pc, 0x1004, "BEQ +2 -> PC = $1000+2+2");
+        assert_eq!(core.clk - clk0, 3, "taken same-page branch = 3 cycles");
+        // A dummy read of the branch's reg_pc ($1002) occurred.
+        assert!(
+            bus.trace.iter().any(|(k, a, _)| *k == 'r' && *a == 0x1002),
+            "taken branch emitted the reg_pc dummy read"
+        );
+        // DELAYS_INTERRUPT set (no page cross).
+        assert!(
+            opinfo_delays_interrupt(core.last_opcode_info) != 0,
+            "same-page taken branch set DELAYS_INTERRUPT"
+        );
     }
 }
