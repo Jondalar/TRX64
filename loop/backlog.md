@@ -98,7 +98,8 @@ Phase 1 integration is green. Tracked separately when we get there.
 - [x] protocol-surface b1 — 13 WS methods (ADR-072)
 - [x] RuntimeController A/V push / ws-av-tap (ADR-073)
 - [ ] protocol-surface b2 — key_down/up held-key (running)
-- [ ] snapshot-vsf — .c64re cross-runtime codec
+- [ ] snapshot-vsf — c64re-own VSF (A) + read real-VICE (ADR-075)
+- [ ] snapshot-c64re-container — .c64re dump/undump (C64RESNP + gzip-JSON RuntimeCheckpoint + media), round-trip vs c64re [user: 100% feature-complete]
 - [ ] checkpoint-ring (705.B) — unblocks 7 checkpoint methods + granular vic/inspect + scenario/recorder
 - [ ] recorder/* + runtime/scenario_* WS
 - [ ] audio/* + media/events|recent + batch/* WS

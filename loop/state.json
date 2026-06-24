@@ -54,7 +54,7 @@
     "protocol-surface-b2"
   ],
   "note": "held-key DONE (ADR-074): key_down/up/release_keys/input_status, additive byte-exact, 150 tests. NEXT: snapshot-vsf = port c64re snapshot codec so TRX64 reads/writes c64re-compatible snapshots (TRX64 vsf is its own format; cross-runtime .c64re exchange needs the codec). Foundational for the checkpoint-ring next.",
-  "updated": "2026-06-24T16:57:08Z",
+  "updated": "2026-06-24T17:13:00Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
@@ -78,5 +78,5 @@
   ],
   "loop_status": "RUNNING",
   "bar": "BEHAVIORAL parity with c64re (renders games/demos, .g64 1541 loaders, the 7-game gate). Match c64re, not exceed it.",
-  "scope_note": "FEATURE-COMPLETE = FULL parity vs c64re TS runtime, INCLUDING the writable tiers (user confirmed c64re writes flash back). Queue: protocol-surface-b2 (running) -> snapshot-vsf -> checkpoint-ring (705.B, unblocks 7 checkpoint methods + granular vic/inspect + scenario/recorder) -> recorder/scenario -> audio/media/batch WS -> FLASH-CART WRITABLE TIER (Flash040+EAPI+m93c86+writable EasyFlash/GMOD/MegaCart, ~1500 LOC) -> DRIVE WRITE-BACK (.g64/.d64 write, fsimage_gcr_write_half_track) -> integration corpus. The writable tiers are IN scope, not optional."
+  "scope_note": "FEATURE-COMPLETE = 100% vs c64re TS runtime. EXPLICIT (user): the .c64re snapshot/dump|undump container IS in scope (magic C64RESNP + gzip-JSON RuntimeCheckpoint + media, round-trip vs c64re), as its own item right after snapshot-vsf. Full queue: snapshot-vsf(A+readVICE, running) -> .c64re-container (dump/undump) -> checkpoint-ring (705.B rewind + 7 checkpoint methods + granular vic/inspect) -> recorder/scenario -> audio/media/batch WS -> flash-cart WRITABLE -> drive WRITE-BACK -> integration. ALL in. 100%."
 }
