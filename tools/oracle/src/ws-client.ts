@@ -7,6 +7,10 @@ import { WebSocket } from "ws";
 
 export interface RpcClient {
   call(method: string, params?: Record<string, unknown>): Promise<unknown>;
+  /** Register a server-PUSH notification listener (id-less JSON-RPC frame), e.g.
+   *  "debug/breakpoint_hit". Returns an unsubscribe fn. Used by the integration
+   *  harness to prove a breakpoint actually fires its notification. */
+  onNotify(handler: (method: string, params: unknown) => void): () => void;
   close(): void;
 }
 
@@ -18,17 +22,24 @@ interface Pending {
 export async function connect(endpoint: string, timeoutMs = 60_000): Promise<RpcClient> {
   const ws = new WebSocket(endpoint);
   const pending = new Map<number, Pending>();
+  const notifyHandlers = new Set<(method: string, params: unknown) => void>();
   let nextId = 1;
 
   ws.on("message", (data, isBinary) => {
     if (isBinary) return; // screenshot/stream frame — not used by the oracle
-    let msg: { id?: number; result?: unknown; error?: { message?: string } };
+    let msg: { id?: number; method?: string; params?: unknown; result?: unknown; error?: { message?: string } };
     try {
       msg = JSON.parse(data.toString());
     } catch {
       return;
     }
-    if (typeof msg.id !== "number") return; // notification
+    if (typeof msg.id !== "number") {
+      // server-PUSH notification (no id) — fan out to listeners.
+      if (typeof msg.method === "string") {
+        for (const h of notifyHandlers) h(msg.method, msg.params);
+      }
+      return;
+    }
     const p = pending.get(msg.id);
     if (!p) return;
     pending.delete(msg.id);
@@ -62,6 +73,10 @@ export async function connect(endpoint: string, timeoutMs = 60_000): Promise<Rpc
         });
         ws.send(payload);
       });
+    },
+    onNotify(handler) {
+      notifyHandlers.add(handler);
+      return () => notifyHandlers.delete(handler);
     },
     close() {
       ws.close();

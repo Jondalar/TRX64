@@ -1,6 +1,7 @@
 /target
 **/*.rs.bk
 node_modules/
+tools/oracle/dist/
 *.duckdb
 *.c64retrace
 /traces/
