@@ -55,7 +55,7 @@
     "snapshot-vsf"
   ],
   "note": "snapshot-vsf DONE (ADR-076): c64re-own VSF byte-parity round-trip both ways + read real-VICE (motm.vsf loads+renders game menu). 152 tests, 7/7 gate. NEXT: .c64re container (snapshot/dump|undump = magic C64RESNP + format-ver + sha256 + gzip(JSON RuntimeCheckpoint) + embedded media; round-trip vs c64re) - source native-snapshot.ts. Then checkpoint-ring.",
-  "updated": "2026-06-24T17:31:49Z",
+  "updated": "2026-06-24T17:36:35Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
@@ -63,8 +63,8 @@
   "in_flight": {
     "item": "snapshot-c64re-container",
     "model": "opus",
-    "started": "2026-06-24T17:31:49Z",
-    "note": "Port the .c64re container (native-snapshot.ts): magic C64RESNP + format-version + sha256(payload) + gzip(JSON RuntimeCheckpoint) + embedded media. Wire daemon snapshot/dump -> write .c64re, snapshot/undump -> read it (b1 used raw vsf; switch to the container). Round-trip vs c64re daemon both directions. The inner VSF is done (ADR-076, byte-identical). Add flate2/sha2/serde_json deps."
+    "started": "2026-06-24T17:36:35Z",
+    "note": "BLOCKED on user decision: .c64re payload scope A (within-TRX64 VSF-in-container) vs B (full RuntimeCheckpoint cross-runtime = a 2nd snapshot model + drive-blob + literal-VIC, additive state-serialization of drive/vic). Builder surfaced + paused. Awaiting user A/B + constraint-relaxation OK for B. Loop paused on this item per Driver promise."
   },
   "stage2_items": [],
   "resolved": [
