@@ -320,6 +320,261 @@ impl GcrImage {
 
         GcrImage { tracks }
     }
+
+    /// Build the GCR image from a raw `.g64` (GCR-1541) image — a 1:1 port of the
+    /// VICE G64 attach path: `disk_image_read_image` → `fsimage_read_gcr_image`
+    /// → `fsimage_gcr_read_half_track` → `fsimage_gcr_seek_half_track`
+    /// (`fsimage_gcr.ts:296-427`, VICE `fsimage-gcr.c:53-174`).
+    ///
+    /// `bytes` is the whole `.g64` file. The header's byte-9 `num_half_tracks`
+    /// is `max_half_tracks` (G64 probe, VICE `fsimage-probe.c:501-502`); every
+    /// slot `0..max_half_tracks` is filled from the image's offset table, and the
+    /// remaining slots up to the rotation engine's [`DRIVE_HALFTRACKS_1541`] are
+    /// 0x00-filled at the canonical raw track size (the `else` empty-track branch
+    /// of `fsimage_read_gcr_image`, `fsimage_gcr.ts:316-321`).
+    ///
+    /// The resulting `tracks[i]` array indexes identically to [`from_d64`]: slot
+    /// `i` holds G64 half-track `i` (= VICE `image.gcr.tracks[i]`, populated via
+    /// `fsimage_gcr_read_half_track(image, i + 2, ...)`), so the rotation engine's
+    /// `tracks[current_half_track - 2]` access is byte-for-byte equivalent.
+    ///
+    /// [`from_d64`]: GcrImage::from_d64
+    pub fn from_g64(bytes: &[u8]) -> Self {
+        // VICE attach allocates a 1541 disk_image_t (image->type = G64,
+        // image->max_half_tracks = header[9]). We mirror that here: the in-memory
+        // `fd` is the raw file slice, indexed positionally by util_fpread.
+        let image = G64Image { fd: bytes };
+
+        // The rotation engine reads `tracks[current_half_track - 2]` with
+        // current_half_track ∈ [2, 84]; only the first DRIVE_HALFTRACKS_1541 (84)
+        // slots are ever consulted, matching from_d64's array length. VICE keeps
+        // MAX_GCR_TRACKS (168) slots; the upper 84 are the canonical empty fill
+        // and are never read on a 1541, so we materialise only the 84 we need.
+        let mut tracks: Vec<GcrTrack> = (0..DRIVE_HALFTRACKS_1541)
+            .map(|_| GcrTrack { data: Vec::new(), size: 0 })
+            .collect();
+
+        // max_half_tracks for a 1541 G64 = header[9]. If the header is malformed
+        // the seek helper rejects it and every slot falls through to the empty
+        // fill (VICE behaviour: read returns -1 only on the per-track call, but
+        // the seek-failure path here yields an empty 0x55 track per VICE's
+        // offset==0 branch). We read it once up front.
+        let max_half_tracks = g64_num_half_tracks(&image);
+
+        // PORT OF: fsimage_read_gcr_image (fsimage_gcr.ts:301-324).
+        let mut half_track: usize = 0;
+        while half_track < DRIVE_HALFTRACKS_1541 {
+            // ts:307-311 — free existing track (no-op here; freshly allocated).
+            tracks[half_track].data = Vec::new();
+            tracks[half_track].size = 0;
+
+            if half_track < max_half_tracks {
+                // ts:314 — fsimage_gcr_read_half_track(image, half_track + 2, tracks[half_track]).
+                fsimage_gcr_read_half_track(&image, half_track + 2, &mut tracks[half_track]);
+            } else {
+                // ts:316-321 — empty tracks for non-existing tracks (0x00 fill).
+                let size = disk_image_raw_track_size_g64((half_track >> 1) as u32);
+                tracks[half_track].size = size;
+                tracks[half_track].data = vec![0u8; size];
+            }
+            half_track += 1;
+        }
+
+        GcrImage { tracks }
+    }
+}
+
+// ── G64 image (GCR-1541) loading — 1:1 port of fsimage_gcr.ts ────────────────
+//
+// PORT OF: vice/src/diskimage/fsimage-gcr.c (G64 read path) via the TS oracle
+// `fsimage_gcr.ts`. The TS in-memory `FILE_t` (buf/length/cursor) collapses to a
+// borrowed `&[u8]` here: every read in the G64 load path is positional
+// (`util_fpread`), so no cursor is needed — `fseek`/`fread`/`ftell` are only used
+// by the *write*/extend path, which is out of scope for read-only mounting.
+
+/// PORT OF: fsimage_gcr.ts FILE_t (ISO C99 `FILE *` equivalent) reduced to the
+/// read-only positional surface the G64 load path needs.
+struct G64Image<'a> {
+    /// VICE `fsimage->fd` — the raw .g64 file bytes.
+    fd: &'a [u8],
+}
+
+/// PORT OF: fsimage_gcr.ts:124-128 (util_fpread, vice/src/util.c). pread(2)-style
+/// positional read. Returns `Some(slice)` (offset+size in range) or `None` (VICE
+/// `-1`).
+#[inline]
+fn util_fpread<'a>(image: &G64Image<'a>, size: usize, offset: usize) -> Option<&'a [u8]> {
+    let end = offset.checked_add(size)?;
+    if end > image.fd.len() {
+        return None;
+    }
+    Some(&image.fd[offset..end])
+}
+
+/// PORT OF: fsimage_gcr.ts:146-148 (util_le_buf_to_word, vice/src/util.c).
+#[inline]
+fn util_le_buf_to_word(buf: &[u8], off: usize) -> u16 {
+    let lo = *buf.get(off).unwrap_or(&0) as u16;
+    let hi = *buf.get(off + 1).unwrap_or(&0) as u16;
+    lo | (hi << 8)
+}
+
+/// PORT OF: fsimage_gcr.ts:151-159 (util_le_buf_to_dword, vice/src/util.c).
+#[inline]
+fn util_le_buf_to_dword(buf: &[u8], off: usize) -> u32 {
+    let b0 = *buf.get(off).unwrap_or(&0) as u32;
+    let b1 = *buf.get(off + 1).unwrap_or(&0) as u32;
+    let b2 = *buf.get(off + 2).unwrap_or(&0) as u32;
+    let b3 = *buf.get(off + 3).unwrap_or(&0) as u32;
+    b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+/// PORT OF: fsimage_gcr.ts:256-258 (gcr_image_header_expected_1541) — "GCR-1541\0".
+const GCR_IMAGE_HEADER_EXPECTED_1541: [u8; 9] =
+    [0x47, 0x43, 0x52, 0x2d, 0x31, 0x35, 0x34, 0x31, 0x00];
+
+/// PORT OF: fsimage_gcr.ts:261-263 (gcr_image_header_expected_1571) — "GCR-1571\0".
+const GCR_IMAGE_HEADER_EXPECTED_1571: [u8; 9] =
+    [0x47, 0x43, 0x52, 0x2d, 0x31, 0x35, 0x37, 0x31, 0x00];
+
+/// PORT OF: fsimage_gcr.ts:267-274 (memcmp) — lexicographic compare of `n` bytes.
+#[inline]
+fn memcmp(a: &[u8], b: &[u8], n: usize) -> i32 {
+    for i in 0..n {
+        let av = *a.get(i).unwrap_or(&0) as i32;
+        let bv = *b.get(i).unwrap_or(&0) as i32;
+        if av != bv {
+            return av - bv;
+        }
+    }
+    0
+}
+
+/// PORT OF: fsimage_gcr.ts:206-227 (disk_image_speed_map) — G64 branch only
+/// (same map as D64/D67/P64). Speed zone 0..3 for a 0-based track number.
+#[inline]
+fn disk_image_speed_map_g64(track: u32) -> usize {
+    ((track < 31) as usize) + ((track < 25) as usize) + ((track < 18) as usize)
+}
+
+/// PORT OF: fsimage_gcr.ts:230-246 (disk_image_raw_track_size) — G64 branch.
+/// Raw GCR track size (bytes) for a 0-based track number (half_track >> 1).
+#[inline]
+fn disk_image_raw_track_size_g64(track: u32) -> usize {
+    RAW_TRACK_SIZE_D64[disk_image_speed_map_g64(track)]
+}
+
+/// Header byte-9 `num_half_tracks` = VICE `image->max_half_tracks` for a G64
+/// (`fsimage-probe.c:501-502`). Validates the "GCR-1541"/"GCR-1571" magic; on any
+/// header error returns 0 so every slot takes the canonical empty-fill branch.
+fn g64_num_half_tracks(image: &G64Image) -> usize {
+    let buf = match util_fpread(image, 12, 0) {
+        Some(b) => b,
+        None => return 0,
+    };
+    if memcmp(&GCR_IMAGE_HEADER_EXPECTED_1541, buf, GCR_IMAGE_HEADER_EXPECTED_1541.len()) != 0
+        && memcmp(&GCR_IMAGE_HEADER_EXPECTED_1571, buf, GCR_IMAGE_HEADER_EXPECTED_1571.len()) != 0
+    {
+        return 0;
+    }
+    let n = buf[9] as usize;
+    // ts:354 — Too many half tracks. (MAX_GCR_TRACKS = 168 in VICE.)
+    if n > G64_MAX_GCR_TRACKS {
+        return 0;
+    }
+    n
+}
+
+/// PORT OF: drivetypes.ts:196 (MAX_GCR_TRACKS = 168). The 1571-capacity ceiling
+/// VICE validates `num_half_tracks` against in `fsimage_gcr_seek_half_track`.
+const G64_MAX_GCR_TRACKS: usize = 168;
+
+/// PORT OF: fsimage_gcr.ts:331-368 (fsimage_gcr_seek_half_track,
+/// vice/src/fsimage-gcr.c:79-120). Static in VICE. Returns the file offset of the
+/// half-track's data block (`> 0`), `0` (no data → empty track), or `-1` (error)
+/// as an `i64`. `max_track_length` is the out-param (TS wrapper object).
+fn fsimage_gcr_seek_half_track(
+    image: &G64Image,
+    half_track: usize,
+    max_track_length: &mut u16,
+) -> i64 {
+    // ts:343 — util_fpread(fd, buf, 12, 0).
+    let buf = match util_fpread(image, 12, 0) {
+        Some(b) => b,
+        None => return -1, // "Could not read GCR disk image." / no fd.
+    };
+    // ts:347-351 — header magic check (1541 or 1571).
+    if memcmp(&GCR_IMAGE_HEADER_EXPECTED_1541, buf, GCR_IMAGE_HEADER_EXPECTED_1541.len()) != 0
+        && memcmp(&GCR_IMAGE_HEADER_EXPECTED_1571, buf, GCR_IMAGE_HEADER_EXPECTED_1571.len()) != 0
+    {
+        return -1; // "Unexpected GCR header found."
+    }
+    // ts:353-357 — num_half_tracks = buf[9]; reject > MAX_GCR_TRACKS.
+    let num_half_tracks = buf[9] as usize;
+    if num_half_tracks > G64_MAX_GCR_TRACKS {
+        return -1; // "Too many half tracks."
+    }
+    // ts:359 — max_track_length = util_le_buf_to_word(buf, 10).
+    *max_track_length = util_le_buf_to_word(buf, 10);
+
+    // ts:362-366 — entry = util_fpread(fd, 4, 12 + (half_track - 2) * 4).
+    let entry = match util_fpread(image, 4, 12 + (half_track - 2) * 4) {
+        Some(e) => e,
+        None => return -1, // "Could not read GCR disk image."
+    };
+    // ts:367 — return util_le_buf_to_dword(entry).
+    util_le_buf_to_dword(entry, 0) as i64
+}
+
+/// PORT OF: fsimage_gcr.ts:374-427 (fsimage_gcr_read_half_track,
+/// vice/src/fsimage-gcr.c:125-174). Read an entire GCR half-track into `raw`. For
+/// an `offset == 0` entry the buffer is the canonical raw track size, 0x55-filled.
+fn fsimage_gcr_read_half_track(image: &G64Image, half_track: usize, raw: &mut GcrTrack) -> i32 {
+    // ts:383-384 — raw.data = null; raw.size = 0.
+    raw.data = Vec::new();
+    raw.size = 0;
+
+    let mut max_track_length: u16 = 0;
+    // ts:388 — offset = fsimage_gcr_seek_half_track(...).
+    let offset = fsimage_gcr_seek_half_track(image, half_track, &mut max_track_length);
+
+    // ts:390-392 — if (offset < 0) return -1.
+    if offset < 0 {
+        return -1;
+    }
+
+    if offset != 0 {
+        let offset = offset as usize;
+        // ts:396 — util_fpread(fd, buf, 2, offset).
+        let len_buf = match util_fpread(image, 2, offset) {
+            Some(b) => b,
+            None => return -1, // "Could not read GCR disk image."
+        };
+        // ts:401 — track_len = util_le_buf_to_word(buf).
+        let track_len = util_le_buf_to_word(len_buf, 0) as usize;
+
+        // ts:403-406 — reject track_len < 1 || > max_track_length.
+        if track_len < 1 || track_len > max_track_length as usize {
+            return -1; // "Track field length %u is not supported."
+        }
+
+        // ts:408-409 — raw.data = lib_calloc(1, track_len); raw.size = track_len.
+        // ts:416-420 — fseek(offset+2) + fread(track_len). The VICE fread reads
+        // the bytes immediately after the 2-byte length; we read the same slice
+        // positionally.
+        let data = match util_fpread(image, track_len, offset + 2) {
+            Some(d) => d.to_vec(),
+            None => return -1, // "Could not read GCR disk image."
+        };
+        raw.data = data;
+        raw.size = track_len;
+    } else {
+        // ts:422-424 — empty track: raw_track_size, 0x55-filled.
+        let size = disk_image_raw_track_size_g64((half_track >> 1) as u32);
+        raw.size = size;
+        raw.data = vec![0x55u8; size];
+    }
+    0
 }
 
 /// For track numbers beyond the D64's 35 the speed-zone formula still maps into
@@ -418,5 +673,97 @@ mod tests {
         assert!(img.tracks[1].data.iter().all(|&b| b == 0));
         // The data track has a 0xff sync run somewhere (non-empty encode).
         assert!(img.tracks[0].data.windows(5).any(|w| w == [0xff; 5]));
+    }
+
+    /// Build a minimal synthetic .g64 with the GCR-1541 header, a populated
+    /// half-track 0 (= slot 0 / track 1), an empty (offset 0) half-track 2, and
+    /// confirm the parse: header magic, num_half_tracks, the populated track's
+    /// length + bytes, and the empty-track 0x55 fill at the canonical raw size.
+    #[test]
+    fn from_g64_parses_synthetic_header_and_tracks() {
+        // num_half_tracks = 4, max_track_length = 7928 (matches the real samples).
+        let num_half_tracks: u8 = 4;
+        let max_track_length: u16 = 7928;
+        // Offset table: 4 entries; data block placed right after both tables.
+        // Header(12) + offset-table(4*4) + speed-table(4*4) = 12 + 16 + 16 = 44.
+        let data_off: u32 = 44;
+        let track0_len: u16 = 16; // small synthetic track
+        let track0_bytes: Vec<u8> = (0..track0_len as u8).map(|b| b ^ 0x3c).collect();
+
+        let mut g64: Vec<u8> = Vec::new();
+        // Header: "GCR-1541\0".
+        g64.extend_from_slice(&GCR_IMAGE_HEADER_EXPECTED_1541);
+        // byte 9: num_half_tracks.
+        g64.push(num_half_tracks);
+        // bytes 10-11: max_track_length (LE).
+        g64.extend_from_slice(&max_track_length.to_le_bytes());
+        // Offset table (4 × u32 LE): slot 0 populated, slots 1..3 empty (0).
+        g64.extend_from_slice(&data_off.to_le_bytes());
+        g64.extend_from_slice(&0u32.to_le_bytes());
+        g64.extend_from_slice(&0u32.to_le_bytes());
+        g64.extend_from_slice(&0u32.to_le_bytes());
+        // Speed-zone table (4 × u32 LE) — values irrelevant to read.
+        for _ in 0..4 {
+            g64.extend_from_slice(&3u32.to_le_bytes());
+        }
+        // Data block at data_off: 2-byte track length + the raw GCR bytes.
+        assert_eq!(g64.len(), data_off as usize);
+        g64.extend_from_slice(&track0_len.to_le_bytes());
+        g64.extend_from_slice(&track0_bytes);
+
+        let img = GcrImage::from_g64(&g64);
+        assert_eq!(img.tracks.len(), DRIVE_HALFTRACKS_1541);
+
+        // Slot 0 (half-track 0 / track 1): populated with track0_len bytes.
+        assert_eq!(img.tracks[0].size, track0_len as usize);
+        assert_eq!(img.tracks[0].data, track0_bytes);
+
+        // Slot 1 (offset-table entry 0): empty (offset 0) → canonical raw size,
+        // 0x55-filled. half_track >> 1 = (1+2)>>1... — entry 1 has offset 0, so
+        // its raw size uses (half_track) >> 1 where half_track = slot+2 = 3 → 1.
+        // raw_track_size for track 1 (zone 3) = 7692.
+        assert_eq!(img.tracks[1].size, 7692);
+        assert!(img.tracks[1].data.iter().all(|&b| b == 0x55));
+
+        // Slots >= num_half_tracks (4): empty-fill branch (0x00) at raw size.
+        assert!(img.tracks[4].size > 0);
+        assert!(img.tracks[4].data.iter().all(|&b| b == 0x00));
+    }
+
+    /// A malformed/non-G64 buffer yields an all-empty image (no panic): every slot
+    /// takes the canonical empty-fill branch.
+    #[test]
+    fn from_g64_rejects_bad_header_gracefully() {
+        let junk = vec![0u8; 64];
+        let img = GcrImage::from_g64(&junk);
+        assert_eq!(img.tracks.len(), DRIVE_HALFTRACKS_1541);
+        // num_half_tracks rejected → all slots take the empty (0x00) fill path.
+        assert!(img.tracks.iter().all(|t| t.size > 0));
+        assert!(img.tracks[0].data.iter().all(|&b| b == 0x00));
+    }
+
+    /// Load a real .g64 sample (if present) and sanity-check the parse: slot 0
+    /// (track 1) and slot 34 (track 18) are populated with plausible GCR data,
+    /// and a 0xff sync run exists (real disks always have sync marks).
+    #[test]
+    fn from_g64_real_sample_motm() {
+        let path = "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/motm.g64";
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(_) => return, // skip without sample
+        };
+        // Header: byte 9 = 84 half-tracks.
+        assert_eq!(bytes[9], 84, "motm.g64 has 84 half-tracks");
+        let img = GcrImage::from_g64(&bytes);
+        assert_eq!(img.tracks.len(), DRIVE_HALFTRACKS_1541);
+        // Slot 0 (track 1) populated, plausible track size (zone-3 ≈ 7692).
+        assert!(img.tracks[0].size > 6000 && img.tracks[0].size <= 7928);
+        // Slot 34 (track 18 — the directory track) populated.
+        assert!(img.tracks[34].size > 6000 && img.tracks[34].size <= 7928);
+        // Real GCR has 0xff sync runs on the directory track.
+        assert!(
+            img.tracks[34].data.windows(5).any(|w| w == [0xff; 5]),
+            "track 18 must contain a 0xff sync run"
+        );
     }
 }

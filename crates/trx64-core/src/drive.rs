@@ -796,12 +796,17 @@ impl Drive1541 {
 
     /// Attach a disk image to this drive (replaces any existing disk). For a D64
     /// the raw bytes are encoded to the per-track GCR bitstream and handed to the
-    /// rotating-disk model, parking the head at track 18. G64 GCR-stream mounting
-    /// is not yet wired (the rotating model only reads the simple/D64 path), so a
-    /// G64 attaches the raw image for media parity but leaves the GCR path empty.
+    /// rotating-disk model, parking the head at track 18. For a G64 the raw GCR
+    /// nibble dump is parsed by `GcrImage::from_g64` (1:1 port of the VICE
+    /// `fsimage_read_gcr_image` G64 path) into the same per-half-track array the
+    /// D64 encoder produces, so the rotation engine reads it identically —
+    /// including half-tracks + copy-protection.
     pub fn attach_disk(&mut self, image: DiskImage) {
-        if matches!(image.kind, DiskKind::D64) {
-            let gcr = GcrImage::from_d64(&image.bytes);
+        let gcr = match image.kind {
+            DiskKind::D64 => Some(GcrImage::from_d64(&image.bytes)),
+            DiskKind::G64 => Some(GcrImage::from_g64(&image.bytes)),
+        };
+        if let Some(gcr) = gcr {
             self.rotation.attach(gcr, self.drive_clk);
         }
         self.disk = Some(image);
