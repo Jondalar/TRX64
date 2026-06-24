@@ -64,7 +64,7 @@
     "ws-notifications-tail"
   ],
   "note": "vic-inspect merged+done (ADR-085, vic/inspect 9/9). maniac char-select confirmed (user, 600M). NEXT: ws-notifications-tail (broadcast-push + checkpoint/thumbnails), then integration.",
-  "updated": "2026-06-24T22:05:56Z",
+  "updated": "2026-06-24T22:50:51Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
@@ -72,8 +72,8 @@
   "in_flight": {
     "item": "integration",
     "model": "opus",
-    "started": "2026-06-24T22:05:56Z",
-    "note": "opus ~46min: e2e capstone harness committed (86d0c3b) + refinements (0bcb152: reach-running detection, single-boot reuse, --self mode, <1min ago). 8 e2e daemon/node procs running the corpus validation. Alive."
+    "started": "2026-06-24T22:50:51Z",
+    "note": "opus ~45min: 6 commits, report written (integration-report.md 5KB), finalizing scorecard (902e4e8 9min ago: gameplay IS daemon-reachable). Final validation run. Near done."
   },
   "stage2_items": [],
   "resolved": [
