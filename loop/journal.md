@@ -757,3 +757,8 @@ drive-write-back running. Next main-tree: recorder/scenario.
 
 recorder/* 6 + scenario_* 5, determinism proven, 225 tests. PARALLELIZATION (flash+drive+recorder) all merged
 clean via worktrees; main tree restored to main. 51 done. Next sequential: audio/media/batch WS.
+
+## 2026-06-24 — DRIVER: audio/media/batch WS (ADR-084) — 9 methods full parity
+
+audio/* 3/3 (export byte-identical to c64re), media/* 9/9, batch/* 3/3. 255 tests, byte-exact green. Broadcast
+notifications (audio/flush, batch/progress) = small follow-up on the push hub. Next: vic-inspect-engine.

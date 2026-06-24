@@ -1316,3 +1316,15 @@ tests pass, byte-exact GREEN. Deferred: cart medium gen-gate (disk wired; cart r
 joystick scenario inputs (no joystick model). PARALLELIZATION COMPLETE: flash + drive + recorder all merged
 clean (file-disjoint via worktrees); main tree restored to main. Remaining sequential tail: audio/media/batch
 WS, vic-inspect-engine (6 methods), checkpoint/thumbnails, integration.
+
+## ADR-084 — audio/media/batch WS: 9 methods (full parity); broadcast notifications = small follow-up
+audio/* 3/3 (export verified BYTE-IDENTICAL to live c64re: samples 2205/bytes 8864; start/stop ACK the singleton
+hub A/V stream), media/* now 9/9 (added events log + recent; shapes verified live), batch/* 3/3 (in-process
+batch registry runs scenarios sequentially; live round-trip verified). Daemon-only additive (main.rs +689/-55).
+255 tests, byte-exact GREEN. 2 intentional value/timing deviations (keys/types 1:1): audio/stop returns false
+(singleton stream, not per-session), batch/start returns status:done synchronously (single-threaded, no worker
+pool / no batch/progress push). SKIPPED: audio/flush + batch/progress — these are c64re BROADCAST notifications
+(this.broadcast server-push), not callable handlers; TRX64's dispatch(req,&state) is pure request/response.
+NOTE/FOLLOW-UP: the broadcast/push channel (audio/flush, batch/progress, debug/breakpoint_hit push) is a small
+addable item — the hub/writer-task (ADR-073) already does binary push; a generic JSON-notification push would
+complete it. NEXT: vic-inspect-engine (the 6 deferred vic/inspect methods + the node/origin/evidence engine).
