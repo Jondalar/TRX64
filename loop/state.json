@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "g64-mounting",
+  "current_item": "seven-game-gate",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -39,19 +39,16 @@
     "drive-1to1-rotation",
     "drive-1to1-iecbus",
     "drive-1to1-via1",
-    "scramble-sprites"
+    "scramble-sprites",
+    "g64-mounting"
   ],
-  "note": "SCRAMBLE DONE (ADR-062): custom $DD00 loader loads+runs+renders the clean title (96.64% pixel, sprites fixed via VIC-bank-base). The acid test passes. NEXT (user plan): seven-game-gate (run the 7 games through TRX64, diverse .g64/GCR/half-track loaders), then Rust-vs-TS perf compare.",
-  "updated": "2026-06-24T08:28:10Z",
+  "note": "G64 mounting done (ADR-063): all 20 .g64 mount, motm GCR read proven, D64 byte-exact. NOW the 7-game gate: run each game (scramble/polarbear/motm/california/green_beret/impossible2/ninja/maniac) on TRX64 vs c64re, canary criterion = reaches running game state. Then perf compare.",
+  "updated": "2026-06-24T08:56:59Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": {
-    "item": "g64-mounting",
-    "model": "opus",
-    "started": "2026-06-24T08:28:10Z"
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"

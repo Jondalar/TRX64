@@ -636,3 +636,9 @@ User caught it: the garbage was sprites. render.rs render_sprites read sprite da
 bitmap 99.68%, sprites clean. The scramble custom $DD00 loader acid test is DONE — verbatim cores + 1:1
 drive-class ports (viacore/rotation/iecbus/via1) + ATN-IRQ fix + sprite-bank fix. Next: the 7-game gate, then
 a Rust-vs-TS perf compare (user plan).
+
+## 2026-06-24 — DRIVER: G64 mounting (ADR-063) — .g64 GCR/half-track images load + read
+
+GcrImage::from_g64 1:1 (fsimage_gcr.ts + driveimage.ts + VICE). All 20 .g64 mount; motm GCR read proven
+(finds SYNC, DOS GCR loop + custom loader, seeks tracks — not sync-never-found). Matches c64re. D64 byte-exact
+all GREEN, 95 tests. NEXT: the 7-game gate (now unblocked), then perf compare.

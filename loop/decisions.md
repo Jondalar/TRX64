@@ -946,3 +946,18 @@ THE SCRAMBLE CUSTOM $DD00 LOADER ACID TEST IS DONE: the verbatim cores (drive/C6
 ports (viacore/rotation/iecbus/via1) + the ATN-IRQ dispatch fix + this sprite bank fix = the custom loader
 loads + RUNs + renders the clean title. NEXT (user plan): the 7-game gate (diverse .g64/GCR/half-track
 loaders — rotation 1:1 added the GCR engine the distilled lacked), then a Rust-vs-TS performance compare.
+
+## ADR-063 — G64 mounting: GcrImage::from_g64 1:1 (GCR/half-track images load + read)
+7-game-gate prerequisite. .g64 mounting was a STUB (only from_d64). 1:1-ported the VICE G64 loader
+(fsimage_gcr.ts + driveimage.ts + VICE fsimage-gcr.c): fsimage_read_gcr_image, fsimage_gcr_read_half_track,
+fsimage_gcr_seek_half_track (GCR-1541 magic, header[9]=num_half_tracks, the 84-slot offset table at
+12+(ht-2)*4, the speed-map), util_le_buf_to_*, disk_image_raw_track_size — verbatim names/offsets into
+gcr.rs::from_g64; wired drive.rs attach_disk for DiskKind::G64. Half-track slot indexing byte-identical to
+from_d64 so the 1:1 rotation_1541_gcr engine reads it unchanged. from_d64 NOT touched.
+RESULT: all 20 sample .g64 mount (84 half-tracks); motm.g64 GCR read PROVEN (drive finds SYNC, ~45K bytes,
+1.74M cyc in the DOS GCR read loop + custom RAM loader, seeks T18->T26 — not the pre-port sync-never-found).
+Matches c64re behavior (motm via standard LOAD"*" streams custom GCR screen-off on BOTH — needs its protected
+loader for the title). D64 byte-exact gates ALL GREEN (from_d64 untouched), 95 tests, clippy-clean. Write-back
+(fsimage_gcr_write_half_track) intentionally not ported (read-only mount, out of scope).
+NEXT: the 7-game gate — run each game (canary criterion: LOAD"*",8,1+RUN -> PC sustains a game-code RAM
+address = loader ran + game running) on TRX64 vs c64re. Then the Rust-vs-TS perf compare (user plan).
