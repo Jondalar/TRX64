@@ -207,7 +207,41 @@ struct State {
     /// per-session (additive — no writes into the c64re repo). save/load/delete/list
     /// operate on this map; `run` replays the scenario deterministically.
     scenarios: std::collections::HashMap<String, Value>,
+    /// Spec 709.8 — the ordered, replayable media-event history (= the c64re
+    /// `RuntimeController.mediaEvents`). Each media op (mount/swap/unmount/eject/
+    /// ingress) appends its `MediaIngressEvent` object here; `media/events` reads it
+    /// back. Bounded to the last [`MAX_MEDIA_EVENTS`] (the c64re ring is unbounded
+    /// but pins only the last PINNED_MEDIA_EVENTS checkpoints; TRX64 has no per-event
+    /// checkpoint pins to leak, so a simple length cap suffices).
+    media_events: Vec<Value>,
+    /// Spec 271 — in-process batch registry (batchId → BatchEntry JSON). The c64re
+    /// batch runner spawns N worker threads (scenario-pool); TRX64's daemon is
+    /// single-threaded, so `batch/start` runs the scenarios SEQUENTIALLY through the
+    /// existing `run_scenario` path and stores the completed entry here. The wire
+    /// shape (batchId/status/completed/total/results) is 1:1 with c64re.
+    batches: std::collections::HashMap<String, BatchEntry>,
 }
+
+/// Spec 271 — one in-process batch (= c64re `BatchEntry`). Results are stored as a
+/// scenarioId → ReplayResult-or-error map (serialised by [`serialise_batch_results`]).
+struct BatchEntry {
+    batch_id: String,
+    status: &'static str,
+    completed: u64,
+    total: u64,
+    worker_count: u64,
+    started_at: String,
+    finished_at: Option<String>,
+    last_error: Option<String>,
+    /// scenarioId → Ok(ReplayResult Value) | Err(message). Populated when the batch
+    /// finishes (TRX64 runs synchronously, so it is done by the time `batch/start`
+    /// returns).
+    results: Vec<(String, Result<Value, String>)>,
+}
+
+/// Spec 709.8 — keep the media-event history bounded (matches the spirit of the
+/// c64re PINNED_MEDIA_EVENTS window; large enough for replay/branch consumers).
+const MAX_MEDIA_EVENTS: usize = 256;
 
 type SharedState = Arc<Mutex<State>>;
 
@@ -2321,15 +2355,17 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                     st.checkpoint_counter += 1;
                     let cp_after = format!("cp_{}_{}", cycle, st.checkpoint_counter);
                     st.checkpoint_counter += 1;
+                    let event = json!({
+                        "cycle": cycle,
+                        "operation": "eject",
+                        "role": role,
+                        "checkpointBeforeId": cp_before,
+                        "checkpointAfterId": cp_after
+                    });
+                    push_media_event(&mut st, event.clone());
                     Response::ok(id, json!({
                         "ok": true,
-                        "event": {
-                            "cycle": cycle,
-                            "operation": "eject",
-                            "role": role,
-                            "checkpointBeforeId": cp_before,
-                            "checkpointAfterId": cp_after
-                        },
+                        "event": event,
                         "paused": true,
                         "wasRunning": false,
                         "detail": { "role": role }
@@ -2388,16 +2424,18 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                         json!({ "name": disk_name })
                     };
 
+                    let event = json!({
+                        "cycle": cycle,
+                        "operation": "disk",
+                        "role": "drive8",
+                        "format": format_str,
+                        "sha256": sha256,
+                        "checkpointAfterId": cp_after
+                    });
+                    push_media_event(&mut st, event.clone());
                     Response::ok(id, json!({
                         "ok": true,
-                        "event": {
-                            "cycle": cycle,
-                            "operation": "disk",
-                            "role": "drive8",
-                            "format": format_str,
-                            "sha256": sha256,
-                            "checkpointAfterId": cp_after
-                        },
+                        "event": event,
                         "paused": true,
                         "wasRunning": false,
                         "detail": detail
@@ -2438,18 +2476,20 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                     st.session.injected = true;
                     let cycle = st.session.machine.clk;
 
+                    let event = json!({
+                        "cycle": cycle,
+                        "operation": "prg",
+                        "role": null,
+                        "format": "prg",
+                        "sha256": sha256,
+                        "resetPolicy": null,
+                        "checkpointBeforeId": null,
+                        "checkpointAfterId": null
+                    });
+                    push_media_event(&mut st, event.clone());
                     Response::ok(id, json!({
                         "ok": true,
-                        "event": {
-                            "cycle": cycle,
-                            "operation": "prg",
-                            "role": null,
-                            "format": "prg",
-                            "sha256": sha256,
-                            "resetPolicy": null,
-                            "checkpointBeforeId": null,
-                            "checkpointAfterId": null
-                        },
+                        "event": event,
                         "paused": true,
                         "wasRunning": false,
                         "detail": { "name": prg_name, "loadAddress": load_addr as u64 }
@@ -2470,18 +2510,20 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             st.session.machine.drive8.detach_disk();
             st.session.disk_path = String::new();
             let cycle = st.session.machine.clk;
+            let event = json!({
+                "cycle": cycle,
+                "operation": "eject",
+                "role": role,
+                "format": null,
+                "sha256": null,
+                "resetPolicy": null,
+                "checkpointBeforeId": null,
+                "checkpointAfterId": null
+            });
+            push_media_event(&mut st, event.clone());
             Response::ok(id, json!({
                 "ok": true,
-                "event": {
-                    "cycle": cycle,
-                    "operation": "eject",
-                    "role": role,
-                    "format": null,
-                    "sha256": null,
-                    "resetPolicy": null,
-                    "checkpointBeforeId": null,
-                    "checkpointAfterId": null
-                },
+                "event": event,
                 "paused": true,
                 "wasRunning": false,
                 "detail": { "role": role }
@@ -2521,21 +2563,23 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             st.session.disk_path = path_str.clone();
             let cycle = st.session.machine.clk;
 
+            let event = json!({
+                "cycle": cycle,
+                "operation": "disk",
+                "role": "drive8",
+                "format": format_str,
+                "sha256": sha256,
+                "resetPolicy": null,
+                "checkpointBeforeId": null,
+                "checkpointAfterId": null
+            });
+            push_media_event(&mut st, event.clone());
             Response::ok(id, json!({
                 "mountedPath": path_str,
                 "type": format_str,
                 "slot": 8u64,
                 "sha256": sha256,
-                "event": {
-                    "cycle": cycle,
-                    "operation": "disk",
-                    "role": "drive8",
-                    "format": format_str,
-                    "sha256": sha256,
-                    "resetPolicy": null,
-                    "checkpointBeforeId": null,
-                    "checkpointAfterId": null
-                },
+                "event": event,
                 "detail": { "name": disk_name, "backingPath": path_str },
                 "paused": true
             }))
@@ -2574,21 +2618,23 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             st.session.disk_path = path_str.clone();
             let cycle = st.session.machine.clk;
 
+            let event = json!({
+                "cycle": cycle,
+                "operation": "disk",
+                "role": "drive8",
+                "format": format_str,
+                "sha256": sha256,
+                "resetPolicy": null,
+                "checkpointBeforeId": null,
+                "checkpointAfterId": null
+            });
+            push_media_event(&mut st, event.clone());
             Response::ok(id, json!({
                 "mountedPath": path_str,
                 "type": format_str,
                 "slot": 8u64,
                 "sha256": sha256,
-                "event": {
-                    "cycle": cycle,
-                    "operation": "disk",
-                    "role": "drive8",
-                    "format": format_str,
-                    "sha256": sha256,
-                    "resetPolicy": null,
-                    "checkpointBeforeId": null,
-                    "checkpointAfterId": null
-                },
+                "event": event,
                 "detail": { "name": disk_name, "backingPath": path_str },
                 "paused": true
             }))
@@ -2632,6 +2678,173 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             match result {
                 Ok(v) => Response::ok(id, v),
                 Err(e) => Response::err(id, -32001, e),
+            }
+        }
+
+        // ── Spec 709.8 — media-event readback ─────────────────────────────────
+        // 1:1 with c64re ws-server.ts:1794
+        //   this.on("media/events", ({ session_id }) =>
+        //       ({ events: ctrlFor(session_id).mediaEvents }));
+        // Returns the ordered, replayable media-event history (mount/swap/unmount/
+        // eject/ingress) that the media ops accumulate in `State.media_events`.
+        // session_id is accepted (singleton session) for wire parity.
+        "media/events" => {
+            let st = state.lock().unwrap();
+            Response::ok(id, json!({ "events": st.media_events.clone() }))
+        }
+
+        // ── Spec 265 — recent-media list ──────────────────────────────────────
+        // 1:1-shape with c64re ws-server.ts:1809 media/recent: an array of
+        // { path, name, type } image-media entries gated to the active project dir
+        // (+ the C64RE samples/ corpus when --dev-samples is on). c64re ALSO reads a
+        // GLOBAL ~/.config/c64re/recent-media.json store; TRX64 has no such persisted
+        // store (additive, no host-state writes), so the list is the project-dir scan
+        // only (the same §2/§3 sources c64re overlays on the recents). Image exts only
+        // (.d64/.g64/.crt/.vsf — .prg excluded, as in c64re's project walk).
+        "media/recent" => {
+            let out = scan_recent_media();
+            Response::ok(id, json!(out))
+        }
+
+        // ── Spec 703/706/768 — audio stream control ───────────────────────────
+        // c64re drives a PER-SESSION reSID stream the browser starts/stops with
+        // audio/start|stop (ws-server.ts:1635/1702). TRX64's A/V push is a SINGLETON
+        // hub-driven stream (streaming.rs, ADR-073): every connected client is
+        // auto-subscribed and the daemon IS the producer, so there is no per-session
+        // stream to start/stop. These handlers therefore ACK over the hub stream and
+        // report whether the live A/V push is active (`streaming`), matching the
+        // c64re response keys ({streaming, sample_rate} / {stopped}). The audio is
+        // already flowing as BIN_AUDIO; start/stop do not gate it (the hub owns the
+        // lifecycle), so they are control acknowledgments, not stream toggles.
+        "audio/start" => {
+            // sample_rate is the engine's fixed 44100 (= streaming.rs / WavFormat).
+            Response::ok(id, json!({
+                "streaming": true,
+                "sample_rate": 44100u32,
+                "engine": "hub"
+            }))
+        }
+
+        "audio/stop" => {
+            // The hub stream is not per-session; nothing to tear down here (the
+            // last-client-leaves drop stops the loop). Report stopped:false so the
+            // caller knows no per-session stream was owned (c64re: bool).
+            Response::ok(id, json!({ "stopped": false }))
+        }
+
+        // c64re audio/export (ws-server.ts:1704): run the session for duration_sec
+        // PAL seconds, harvest reSID PCM, write a stereo WAV → { out_path,
+        // duration_sec, sample_rate, samples, bytes }. TRX64 drives the SAME
+        // SidAudioEngine the streaming loop uses: install the additive $D4xx write
+        // hook, run the machine in ~1024-sample slices (= exportSessionAudio cadence),
+        // record_write/record_boundary per slice, then export_wav. Byte-for-byte the
+        // c64re ExportResult shape.
+        "audio/export" => {
+            let out_path = match req.params.get("out_path").and_then(|v| v.as_str()) {
+                Some(p) if !p.is_empty() => p.to_string(),
+                _ => return Response::err(id, -32602, "audio/export: out_path required"),
+            };
+            let duration_sec = req.params.get("duration_sec").and_then(|v| v.as_f64());
+            let duration_sec = match duration_sec {
+                Some(d) if d.is_finite() && d > 0.0 => d,
+                _ => return Response::err(
+                    id, -32602,
+                    format!("audio/export: bad duration_sec: {:?}", req.params.get("duration_sec")),
+                ),
+            };
+            let mut st = state.lock().unwrap();
+            match export_session_audio(&mut st.session, &out_path, duration_sec) {
+                Ok(v) => Response::ok(id, v),
+                Err(e) => Response::err(id, -32001, format!("audio/export: {e}")),
+            }
+        }
+
+        // ── Spec 271 — batch scenario runner ──────────────────────────────────
+        // c64re's batch/* (ws-server.ts:2331/2376/2384) spawns N worker THREADS
+        // (scenario-pool.ts) that replay scenarios in parallel and reports progress
+        // via a `batch/progress` broadcast. TRX64's daemon is single-threaded and the
+        // `dispatch` fn has no client-broadcast handle, so batch/start runs the
+        // scenarios SEQUENTIALLY in-process through the existing `run_scenario` path
+        // and returns the COMPLETED entry (no live progress push — the only behavioural
+        // deviation; the WIRE shape — batchId/status/completed/total/workerCount +
+        // results map — is 1:1). Each scenario id is looked up in the in-process
+        // scenario registry (= c64re scenarioIds).
+        "batch/start" => {
+            let ids: Vec<String> = match req.params.get("scenarioIds").and_then(|v| v.as_array()) {
+                Some(a) if !a.is_empty() => {
+                    a.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+                }
+                _ => return Response::err(id, -32602, "scenarioIds must be a non-empty array"),
+            };
+            if ids.is_empty() {
+                return Response::err(id, -32602, "scenarioIds must be a non-empty array");
+            }
+            let worker_count = req
+                .params
+                .get("workerCount")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1)
+                .max(1);
+
+            let batch_id = new_batch_id();
+            let mut st = state.lock().unwrap();
+            let total = ids.len() as u64;
+
+            // Run each scenario sequentially via the existing deterministic replay.
+            let mut results: Vec<(String, Result<Value, String>)> = Vec::with_capacity(ids.len());
+            for sid in &ids {
+                let scenario = st.scenarios.get(sid).cloned();
+                let r = match scenario {
+                    Some(s) => run_scenario(&mut st, &s),
+                    None => Err(format!("scenario '{sid}' not found")),
+                };
+                results.push((sid.clone(), r));
+            }
+            let completed = total;
+            let any_err = results.iter().any(|(_, r)| r.is_err());
+
+            let entry = BatchEntry {
+                batch_id: batch_id.clone(),
+                status: if any_err { "error" } else { "done" },
+                completed,
+                total,
+                worker_count,
+                started_at: now_iso8601(),
+                finished_at: Some(now_iso8601()),
+                last_error: results
+                    .iter()
+                    .find_map(|(_, r)| r.as_ref().err().cloned()),
+                results,
+            };
+            let summary = serialise_batch(&entry);
+            st.batches.insert(batch_id, entry);
+            Response::ok(id, summary)
+        }
+
+        "batch/status" => {
+            let batch_id = match req.params.get("batchId").and_then(|v| v.as_str()) {
+                Some(b) => b.to_string(),
+                None => return Response::err(id, -32602, "batchId required"),
+            };
+            let st = state.lock().unwrap();
+            match st.batches.get(&batch_id) {
+                Some(entry) => Response::ok(id, serialise_batch(entry)),
+                None => Response::err(id, -32001, format!("batch '{batch_id}' not found")),
+            }
+        }
+
+        "batch/results" => {
+            let batch_id = match req.params.get("batchId").and_then(|v| v.as_str()) {
+                Some(b) => b.to_string(),
+                None => return Response::err(id, -32602, "batchId required"),
+            };
+            let st = state.lock().unwrap();
+            match st.batches.get(&batch_id) {
+                Some(entry) => Response::ok(id, json!({
+                    "batch": serialise_batch(entry),
+                    "results": serialise_batch_results(entry),
+                })),
+                None => Response::err(id, -32001, format!("batch '{batch_id}' not found")),
             }
         }
 
@@ -3677,6 +3890,19 @@ fn scenario_summary(s: &Value) -> Value {
     })
 }
 
+/// Spec 709.8 — append a media event to the ordered history, trimming to the last
+/// [`MAX_MEDIA_EVENTS`]. The event object is the same `MediaIngressEvent` shape the
+/// media op already returns in its response `event` field (`{cycle, operation,
+/// role, format, sha256, resetPolicy, checkpointBeforeId, checkpointAfterId}`), so
+/// `media/events` replays exactly what each op reported.
+fn push_media_event(st: &mut State, event: Value) {
+    st.media_events.push(event);
+    if st.media_events.len() > MAX_MEDIA_EVENTS {
+        let drop = st.media_events.len() - MAX_MEDIA_EVENTS;
+        st.media_events.drain(0..drop);
+    }
+}
+
 /// The scenario-player replay target over the live `Machine`. `type` drives the
 /// keyboard matrix (the implemented input path); joystick/paddle/restore are
 /// no-ops (TRX64 has no joystick model — same as the daemon's session/joystick_set
@@ -3734,6 +3960,252 @@ fn scenario_steps_from_inputs(inputs: &[Value]) -> Vec<trx64_core::scenario_play
         });
     }
     out
+}
+
+// ── Spec 265 — recent-media scan ─────────────────────────────────────────────
+// media/recent (ws-server.ts:1809) returns `{ path, name, type }[]` image-media
+// found under the active project dir (+ the C64RE samples/ corpus). c64re also
+// overlays a persisted global recents store (~/.config/c64re/recent-media.json);
+// TRX64 keeps no host-state store (additive), so it scans the project dir and the
+// samples corpus only — the same §2/§3 directory sources c64re walks. Image exts
+// only (.crt/.d64/.g64/.vsf; .prg excluded — matches c64re's project walk).
+fn scan_recent_media() -> Vec<Value> {
+    const IMG_EXTS: &[&str] = &[".crt", ".d64", ".g64", ".vsf"];
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<Value> = Vec::new();
+
+    let ext_of = |name: &str| -> Option<&'static str> {
+        let lower = name.to_lowercase();
+        IMG_EXTS.iter().copied().find(|e| lower.ends_with(*e))
+    };
+
+    // The active project dir (same source as media/list_paths' "project" root).
+    let project_path = std::env::args()
+        .skip_while(|a| a != "--project")
+        .nth(1)
+        .unwrap_or_default();
+
+    // 1) Project dir — depth-limited recursive scan (= c64re §3 `walk`, depth ≤ 3,
+    //    capped at 100), skipping dotdirs / node_modules / knowledge.
+    if !project_path.is_empty() && std::path::Path::new(&project_path).exists() {
+        fn walk(
+            dir: &std::path::Path,
+            depth: usize,
+            seen: &mut std::collections::HashSet<String>,
+            out: &mut Vec<Value>,
+            ext_of: &dyn Fn(&str) -> Option<&'static str>,
+        ) {
+            if depth > 3 || out.len() >= 100 {
+                return;
+            }
+            let mut entries: Vec<_> = match std::fs::read_dir(dir) {
+                Ok(rd) => rd.flatten().collect(),
+                Err(_) => return,
+            };
+            entries.sort_by_key(|e| e.file_name());
+            for entry in entries {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') || name == "node_modules" || name == "knowledge" {
+                    continue;
+                }
+                let full = entry.path();
+                let meta = match entry.metadata() {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if meta.is_dir() {
+                    walk(&full, depth + 1, seen, out, ext_of);
+                    continue;
+                }
+                let abs = full.to_string_lossy().to_string();
+                if seen.contains(&abs) {
+                    continue;
+                }
+                if let Some(ext) = ext_of(&name) {
+                    let parent = full
+                        .parent()
+                        .and_then(|p| p.file_name())
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    seen.insert(abs.clone());
+                    out.push(json!({
+                        "path": abs,
+                        "name": format!("{parent}/{name}"),
+                        "type": &ext[1..]
+                    }));
+                }
+            }
+        }
+        walk(std::path::Path::new(&project_path), 0, &mut seen, &mut out, &ext_of);
+    }
+
+    // 2) The C64RE samples/ corpus (= c64re §2 dev-samples scan) — top-level only.
+    let c64re_root = std::env::var("C64RE_ROOT")
+        .unwrap_or_else(|_| "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP".to_string());
+    let samples = std::path::Path::new(&c64re_root).join("samples");
+    if samples.exists() {
+        let mut entries: Vec<_> = match std::fs::read_dir(&samples) {
+            Ok(rd) => rd.flatten().collect(),
+            Err(_) => Vec::new(),
+        };
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            if out.len() >= 100 {
+                break;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || name == "node_modules" {
+                continue;
+            }
+            let full = entry.path();
+            if full.is_dir() {
+                continue; // top-level only
+            }
+            let abs = full.to_string_lossy().to_string();
+            if seen.contains(&abs) {
+                continue;
+            }
+            if let Some(ext) = ext_of(&name) {
+                seen.insert(abs.clone());
+                out.push(json!({ "path": abs, "name": name, "type": &ext[1..] }));
+            }
+        }
+    }
+
+    out.truncate(100);
+    out
+}
+
+// ── Spec 263 — one-shot audio export ─────────────────────────────────────────
+// audio/export driver (= exportSessionAudio, audio/export.ts): run the session for
+// `duration_sec` PAL seconds, harvesting reSID PCM into a stereo WAV. Drives the
+// SAME SidAudioEngine the live stream uses (streaming.rs): install the additive
+// $D4xx write-trace hook, run the machine in ~1024-sample slices, record the writes
+// then a frame boundary per slice, flush, and finally export_wav. Returns the c64re
+// ExportResult shape (`out_path, duration_sec, sample_rate, samples, bytes`).
+fn export_session_audio(
+    session: &mut Session,
+    out_path: &str,
+    duration_sec: f64,
+) -> Result<Value, String> {
+    use trx64_core::resid_audio::{SidAudioEngine, WavFormat};
+    use trx64_core::resid_ffi::ResidConfig;
+
+    const PAL_CYCLES_PER_SEC: f64 = 985_248.0;
+    let sample_rate: u32 = 44100;
+
+    let mut engine = SidAudioEngine::new(ResidConfig::default());
+    // The Send write-trace hook captures only (addr,value) bytes (the engine stays
+    // on this thread). Drained into the engine per slice, exactly like streaming.rs.
+    let writes: Arc<Mutex<Vec<(u8, u8)>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let w = Arc::clone(&writes);
+        session
+            .machine
+            .sid
+            .set_write_trace(Some(Box::new(move |addr, value| {
+                w.lock().unwrap().push((addr, value));
+            })));
+        // Prime reSID with the current SID register file (live state, not power-on).
+        for reg in 0u8..=0x18 {
+            let v = session.machine.read_full(0xD400 + reg as u16);
+            engine.record_write(reg, v);
+        }
+    }
+    engine.record_boundary(0); // apply the priming writes, emit nothing
+    engine.flush();
+    let _ = engine.take_pcm(); // discard priming silence
+
+    let total_cycles = (duration_sec * PAL_CYCLES_PER_SEC).floor() as u64;
+    // ~1024 samples worth of cycles per slice (= exportSessionAudio sliceCycles).
+    let slice_cycles = ((1024.0 * PAL_CYCLES_PER_SEC) / sample_rate as f64).floor() as u64;
+    let slice_cycles = slice_cycles.max(1);
+
+    let mut consumed: u64 = 0;
+    while consumed < total_cycles {
+        let want = slice_cycles.min(total_cycles - consumed);
+        let clk_before = session.machine.cpu6510.clk;
+        run_cycle_budget(session, want);
+        let d_cycles = session.machine.cpu6510.clk.wrapping_sub(clk_before) as u32;
+        // Drain this slice's SID writes (CPU order) → engine, close the boundary.
+        {
+            let mut pending = writes.lock().unwrap();
+            for &(addr, value) in pending.iter() {
+                engine.record_write(addr, value);
+            }
+            pending.clear();
+        }
+        engine.record_boundary(d_cycles);
+        engine.flush();
+        consumed += want;
+    }
+
+    // Restore the byte-exact (None) write-trace path.
+    session.machine.sid.set_write_trace(None);
+
+    let wav = engine.export_wav(WavFormat { sample_rate, channels: 2 });
+    std::fs::write(out_path, &wav).map_err(|e| format!("write {out_path}: {e}"))?;
+
+    let pcm_samples = engine.pcm().len() as u64; // mono frames (= L=R stereo frames)
+    Ok(json!({
+        "out_path": out_path,
+        "duration_sec": duration_sec,
+        "sample_rate": sample_rate,
+        "samples": pcm_samples,
+        "bytes": wav.len() as u64,
+    }))
+}
+
+// ── Spec 271 — in-process batch registry helpers ─────────────────────────────
+
+/// A short random batch id (= c64re `randomBytes(6).toString("hex")` → 12 hex chars).
+fn new_batch_id() -> String {
+    // Derive 6 bytes from a nanosecond clock + an atomic counter (no rand dep needed;
+    // the id only needs to be unique within this daemon's lifetime).
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let n = nanos ^ (COUNTER.fetch_add(1, Ordering::Relaxed).wrapping_mul(0x9E3779B97F4A7C15));
+    format!("{:012x}", n & 0xFFFF_FFFF_FFFF)
+}
+
+/// Serialise a [`BatchEntry`] for JSON (= c64re `serialiseBatch`: batchId/status/
+/// completed/total/workerCount/startedAt/finishedAt/lastError). c64re spreads the
+/// optional fields as JS `undefined` → JSON.stringify DROPS the key; mirror that by
+/// omitting `finishedAt`/`lastError` when absent (verified live: a running batch has
+/// neither; a done batch has finishedAt only).
+fn serialise_batch(entry: &BatchEntry) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("batchId".into(), json!(entry.batch_id));
+    obj.insert("status".into(), json!(entry.status));
+    obj.insert("completed".into(), json!(entry.completed));
+    obj.insert("total".into(), json!(entry.total));
+    obj.insert("workerCount".into(), json!(entry.worker_count));
+    obj.insert("startedAt".into(), json!(entry.started_at));
+    if let Some(f) = &entry.finished_at {
+        obj.insert("finishedAt".into(), json!(f));
+    }
+    if let Some(e) = &entry.last_error {
+        obj.insert("lastError".into(), json!(e));
+    }
+    Value::Object(obj)
+}
+
+/// Serialise a batch's results map for JSON (= c64re `serialiseResults`): an object
+/// keyed by scenarioId; a failure is `{ error }`, a success is the ReplayResult.
+fn serialise_batch_results(entry: &BatchEntry) -> Value {
+    let mut map = serde_json::Map::new();
+    for (sid, r) in &entry.results {
+        let v = match r {
+            Ok(res) => res.clone(),
+            Err(e) => json!({ "error": e }),
+        };
+        map.insert(sid.clone(), v);
+    }
+    Value::Object(map)
 }
 
 /// scenario.ts runScenario — deterministic replay. (1) optionally restore the
@@ -4320,6 +4792,8 @@ async fn main() {
         recorder_disk_gen: 0,
         recorder_disk_hash: None,
         scenarios: std::collections::HashMap::new(),
+        media_events: Vec::new(),
+        batches: std::collections::HashMap::new(),
     }));
 
     // The singleton live A/V stream hub (ADR-073): one pacing loop drives the
@@ -4384,6 +4858,8 @@ mod batch1_tests {
             recorder_disk_gen: 0,
             recorder_disk_hash: None,
             scenarios: std::collections::HashMap::new(),
+            media_events: Vec::new(),
+            batches: std::collections::HashMap::new(),
         }))
     }
 
@@ -5105,6 +5581,164 @@ mod batch1_tests {
         let h1 = record_marker_at_anchor();
         let h2 = record_marker_at_anchor();
         assert_eq!(h1, h2, "deterministic reconstructed RAM across recordings");
+    }
+
+    // ── audio/media/batch — Spec 263/265/271/703/709 round-trips ──────────────
+
+    #[test]
+    fn audio_start_stop_shape() {
+        let st = make_state();
+        // audio/start ACKs over the hub stream: { streaming, sample_rate, engine }.
+        let started = call(&st, "audio/start", json!({ "session_id": "integrated-1" }));
+        assert_eq!(started["streaming"], json!(true));
+        assert_eq!(started["sample_rate"], json!(44100));
+        assert_eq!(started["engine"], json!("hub"));
+        // audio/stop → { stopped: bool } (no per-session stream owned here → false).
+        let stopped = call(&st, "audio/stop", json!({ "session_id": "integrated-1" }));
+        assert!(stopped["stopped"].is_boolean());
+    }
+
+    #[test]
+    fn audio_export_writes_wav_and_reports_shape() {
+        let st = make_state();
+        let dir = std::env::temp_dir().join(format!("trx64-audio-export-{}", new_batch_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("out.wav");
+        let out_str = out.to_string_lossy().to_string();
+
+        // Run a short export (0.05 PAL s). The c64re ExportResult shape:
+        // { out_path, duration_sec, sample_rate, samples, bytes }.
+        let r = call(&st, "audio/export", json!({
+            "session_id": "integrated-1",
+            "out_path": out_str,
+            "duration_sec": 0.05
+        }));
+        assert_eq!(r["out_path"], json!(out_str));
+        assert_eq!(r["duration_sec"], json!(0.05));
+        assert_eq!(r["sample_rate"], json!(44100));
+        let samples = r["samples"].as_u64().unwrap();
+        assert!(samples > 0, "non-empty PCM");
+        let bytes = r["bytes"].as_u64().unwrap();
+        // WAV = 44-byte header + samples * channels(2) * 2 bytes.
+        assert_eq!(bytes, 44 + samples * 4, "WAV byte count = header + stereo s16le");
+        // The file actually exists with a RIFF/WAVE header.
+        let written = std::fs::read(&out).unwrap();
+        assert_eq!(bytes as usize, written.len());
+        assert_eq!(&written[0..4], b"RIFF");
+        assert_eq!(&written[8..12], b"WAVE");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Bad duration → -32602.
+        assert_eq!(
+            call_err(&st, "audio/export", json!({ "out_path": out_str, "duration_sec": 0 })).code,
+            -32602
+        );
+        // Missing out_path → -32602.
+        assert_eq!(
+            call_err(&st, "audio/export", json!({ "duration_sec": 1 })).code,
+            -32602
+        );
+    }
+
+    #[test]
+    fn media_events_accumulate_and_read_back() {
+        let st = make_state();
+        // Empty to start.
+        assert_eq!(call(&st, "media/events", json!({}))["events"], json!([]));
+
+        // A PRG ingress emits a media event (operation "prg").
+        call(&st, "media/ingress", json!({
+            "kind": "prg",
+            "name": "p.prg",
+            "bytes_b64": base64_encode(&[0x00, 0x10, 0xA9, 0x01])
+        }));
+        // An eject ingress emits another (operation "eject").
+        call(&st, "media/ingress", json!({ "kind": "eject", "role": "drive8" }));
+
+        let events = call(&st, "media/events", json!({ "session_id": "integrated-1" }));
+        let arr = events["events"].as_array().unwrap();
+        assert_eq!(arr.len(), 2, "two media ops recorded");
+        assert_eq!(arr[0]["operation"], json!("prg"));
+        assert_eq!(arr[1]["operation"], json!("eject"));
+        // Each event carries the MediaIngressEvent shape (cycle present).
+        assert!(arr[0]["cycle"].is_number());
+    }
+
+    #[test]
+    fn media_recent_returns_image_media_array() {
+        // The scan returns a (possibly empty) array of { path, name, type } image
+        // media. With no --project arg and no samples dir present, it is just empty;
+        // the shape contract is what matters for the round-trip.
+        let st = make_state();
+        let r = call(&st, "media/recent", json!({}));
+        let arr = r.as_array().expect("media/recent → array");
+        // Every entry (if any) has the documented keys + an image-media type.
+        for e in arr {
+            assert!(e["path"].is_string());
+            assert!(e["name"].is_string());
+            let t = e["type"].as_str().unwrap();
+            assert!(["crt", "d64", "g64", "vsf"].contains(&t), "image type, got {t}");
+        }
+    }
+
+    #[test]
+    fn batch_start_status_results_roundtrip() {
+        let st = make_state();
+        // Register two trivial scenarios in the registry.
+        for sid in ["b1", "b2"] {
+            call(&st, "runtime/scenario_save", json!({
+                "scenario": { "id": sid, "cycleBudget": 5000, "inputs": [] }
+            }));
+        }
+        // batch/start → serialised BatchEntry (1:1 c64re serialiseBatch keys).
+        let started = call(&st, "batch/start", json!({ "scenarioIds": ["b1", "b2"], "workerCount": 2 }));
+        let batch_id = started["batchId"].as_str().unwrap().to_string();
+        assert_eq!(started["status"], json!("done"));
+        assert_eq!(started["completed"], json!(2));
+        assert_eq!(started["total"], json!(2));
+        assert_eq!(started["workerCount"], json!(2));
+        assert!(started["startedAt"].is_string());
+        assert!(started["finishedAt"].is_string());
+
+        // batch/status → the same serialised entry.
+        let status = call(&st, "batch/status", json!({ "batchId": batch_id }));
+        assert_eq!(status["status"], json!("done"));
+        assert_eq!(status["batchId"], json!(batch_id));
+
+        // batch/results → { batch, results: { id → ReplayResult } }.
+        let results = call(&st, "batch/results", json!({ "batchId": batch_id }));
+        assert_eq!(results["batch"]["batchId"], json!(batch_id));
+        let map = results["results"].as_object().unwrap();
+        assert_eq!(map.len(), 2);
+        // Each result is a ReplayResult (ramHash present), no error.
+        assert!(map["b1"]["ramHash"].is_string());
+        assert!(map["b2"]["ramHash"].is_string());
+
+        // Unknown batch → -32001.
+        assert_eq!(call_err(&st, "batch/status", json!({ "batchId": "nope" })).code, -32001);
+        assert_eq!(call_err(&st, "batch/results", json!({ "batchId": "nope" })).code, -32001);
+        // Missing batchId → -32602.
+        assert_eq!(call_err(&st, "batch/status", json!({})).code, -32602);
+        // Empty scenarioIds → -32602.
+        assert_eq!(call_err(&st, "batch/start", json!({ "scenarioIds": [] })).code, -32602);
+    }
+
+    #[test]
+    fn batch_start_reports_error_for_unknown_scenario() {
+        let st = make_state();
+        call(&st, "runtime/scenario_save", json!({
+            "scenario": { "id": "ok", "cycleBudget": 3000, "inputs": [] }
+        }));
+        let started = call(&st, "batch/start", json!({ "scenarioIds": ["ok", "missing"] }));
+        // One scenario failed → status "error" + lastError set; both completed.
+        assert_eq!(started["status"], json!("error"));
+        assert_eq!(started["completed"], json!(2));
+        assert!(started["lastError"].as_str().unwrap().contains("missing"));
+        let batch_id = started["batchId"].as_str().unwrap().to_string();
+        let results = call(&st, "batch/results", json!({ "batchId": batch_id }));
+        let map = results["results"].as_object().unwrap();
+        assert!(map["ok"]["ramHash"].is_string());
+        assert!(map["missing"]["error"].as_str().unwrap().contains("not found"));
     }
 }
 
