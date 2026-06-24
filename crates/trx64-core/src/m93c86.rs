@@ -11,6 +11,10 @@
 //! Write/erase require a prior EWEN (write-enable). The data layout is
 //! `m93c86_data[addr << 1]` / `+ 1` (16-bit words split into 2 bytes).
 
+// Verbatim 1:1 port: keep the source structure (collapsible-if chains, masks).
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::identity_op)]
+
 const M93C86_SIZE: usize = 2048;
 
 // command codes (VICE #defines / ts:14-16).

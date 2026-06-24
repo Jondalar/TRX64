@@ -1242,9 +1242,9 @@ impl CartMapper for Gmod2Mapper {
 }
 
 /// ts:1060-1137 — MegabyterMapper. Protovision MegaByter: 1MB MX29F800CB flash
-/// (128×8K banks, ROML only). IO1 ($DE00): addr bit1 → register_02 (mode bits 0-1
-/// + LED bit7), else register_00 (ROM bank & 0x7f). Mode → 8K/16K/RAM(off)/ULTIMAX.
-/// Flash read AND programmed at ROML $8000-$9FFF; no ROMH.
+/// (128×8K banks, ROML only). IO1 ($DE00): addr bit1 → register_02 (mode in bits
+/// 0..1, LED in bit7), else register_00 (ROM bank & 0x7f). Mode selects
+/// 8K/16K/RAM(off)/ULTIMAX. Flash read AND programmed at ROML $8000-$9FFF; no ROMH.
 #[derive(Clone)]
 pub struct MegabyterMapper {
     register00: u8, // bank

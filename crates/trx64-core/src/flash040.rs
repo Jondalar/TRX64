@@ -19,6 +19,13 @@
 //! through the call instead — the FullBus already has `self.clk` at every
 //! access, so no stored closure is needed).
 
+// Verbatim 1:1 port: the `& 0xff` / `(1 << x) & 0xff` masks document the VICE
+// uint8_t semantics and are kept even where Rust's u8 makes them redundant.
+#![allow(clippy::identity_op)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::collapsible_else_if)]
+
 /// ts:537-543 / vice:51-67 — flash_types_s row. One of these parametrizes the
 /// core so EasyFlash (TYPE_B), GMOD2 (TYPE_NORMAL), C64MegaCart (TYPE_160) and
 /// MegaByter (MX29F800CB) share one faithful implementation.
