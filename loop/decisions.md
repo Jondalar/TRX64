@@ -1203,3 +1203,16 @@ drop-in goal): the c64re drop-in exchanges c64re's OWN formats, so:
 - WRITE real VICE .vsf (option B write): DEFER — needs the off-limits 123KB VIC-IISC pipeline blob + drive
   internals, AND c64re itself never writes real-VICE VSF, so it is NOT part of c64re parity (a "beyond c64re"
   optional extra). The .c64re container (snapshot/dump interop) is the separate checkpoint-ring item.
+
+## ADR-076 — snapshot-vsf: c64re-own VSF byte-parity (round-trip both ways) + read real-VICE (motm resumes)
+(A) c64re-own VSF: fixed 9 CIA byte-diffs (old_pa/pb=0xff per VICE bug#1143, the model byte at off40,
+ta/tb_alarmclk = CLOCK_NEVER when stopped not clk+cnt; load reads read_clk@33). ALL 9 machine-state modules now
+byte-identical to c64re (MAINCPU/C64MEM/CIA1/CIA2/SID/IECBUS/VIC-II/KEYBOARD); DRIVECPU = the deferred opaque
+blob (both tolerate). Fixed a resume bug: load_maincpu now seeds BOTH cpu6510 AND the verbatim c64_core (the
+full machine runs on c64_core; sync only flows c64_core->cpu6510, so a restored PC needs the c64_core seed).
+LIVE round-trip vs c64re daemon BOTH ways: TRX64-save->c64re-load resumes (PC=$e5cd), c64re-save->TRX64-load
+resumes (PC=$e5cf). (READ) real VICE x64sc .vsf: load_vice_vsf parses the 58B header/16B-padded-names/size-
+incl-22B-header framing + C64MEM/MAINCPU(v1.4)/CIA1/CIA2(v2.5)/SID(v1.5)/VIC-II-head; skips the 123KB VIC-IISC
+pipeline blob + drive modules (documented). samples/motm.vsf LOADS + renders the game's coherent menu screen
+(sprites, no garbage, PC=$a892 HIRAM=0 game-in-RAM); LastNinjaRemix_Start4000.vsf also resumes. 152 tests pass,
+seven_game_gate 7/7, byte-exact GREEN. Deferred (per ADR-075): real-VICE WRITE + the .c64re container (NEXT).

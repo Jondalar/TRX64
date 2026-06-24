@@ -728,3 +728,9 @@ protocol-surface b2.
 
 keyboard.rs live_pressed held set (1:1 c64re), key_down/up/release_keys/input_status, additive (byte-identical
 when nothing held). 150 tests, byte-exact green. Next: snapshot-vsf cross-runtime codec.
+
+## 2026-06-24 — DRIVER: snapshot-vsf (ADR-076) — VSF byte-parity both ways + real-VICE read (motm resumes)
+
+c64re-own VSF: 9 CIA byte-diffs fixed, all machine-state modules byte-identical, live round-trip both ways vs
+c64re daemon. Real-VICE read: motm.vsf loads + renders the game menu (resume bug fixed - seed c64_core). 152
+tests, 7/7 gate, byte-exact green. Next: .c64re container (dump/undump).

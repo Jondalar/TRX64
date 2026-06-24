@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "snapshot-vsf",
+  "current_item": "snapshot-c64re-container (.c64re dump/undump)",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -51,20 +51,16 @@
     "breakpoint-policy-layer",
     "protocol-surface-b1",
     "runtime-controller-av-push",
-    "protocol-surface-b2"
+    "protocol-surface-b2",
+    "snapshot-vsf"
   ],
-  "note": "held-key DONE (ADR-074): key_down/up/release_keys/input_status, additive byte-exact, 150 tests. NEXT: snapshot-vsf = port c64re snapshot codec so TRX64 reads/writes c64re-compatible snapshots (TRX64 vsf is its own format; cross-runtime .c64re exchange needs the codec). Foundational for the checkpoint-ring next.",
-  "updated": "2026-06-24T17:13:00Z",
+  "note": "snapshot-vsf DONE (ADR-076): c64re-own VSF byte-parity round-trip both ways + read real-VICE (motm.vsf loads+renders game menu). 152 tests, 7/7 gate. NEXT: .c64re container (snapshot/dump|undump = magic C64RESNP + format-ver + sha256 + gzip(JSON RuntimeCheckpoint) + embedded media; round-trip vs c64re) - source native-snapshot.ts. Then checkpoint-ring.",
+  "updated": "2026-06-24T17:31:27Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": {
-    "item": "snapshot-vsf",
-    "model": "opus",
-    "started": "2026-06-24T16:57:08Z",
-    "note": "ADR-075 decision: Option A (c64re-own VSF parity) + read real-VICE (drop the reject, parse machine-state modules), defer real-VICE write. Re-dispatch with the decided scope."
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
