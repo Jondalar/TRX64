@@ -64,7 +64,7 @@
     "ws-notifications-tail"
   ],
   "note": "vic-inspect merged+done (ADR-085, vic/inspect 9/9). maniac char-select confirmed (user, 600M). NEXT: ws-notifications-tail (broadcast-push + checkpoint/thumbnails), then integration.",
-  "updated": "2026-06-24T21:19:10Z",
+  "updated": "2026-06-24T22:05:56Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
@@ -72,8 +72,8 @@
   "in_flight": {
     "item": "integration",
     "model": "opus",
-    "started": "2026-06-24T21:19:10Z",
-    "note": "The LAST item. Full PRG-corpus end-to-end validation: run a broad corpus of PRGs/games through the TRX64 daemon (load/run/render/WS responses) + verify behavioral parity with c64re. The feature-complete-vs-TS proof at scale."
+    "started": "2026-06-24T22:05:56Z",
+    "note": "opus ~46min: e2e capstone harness committed (86d0c3b) + refinements (0bcb152: reach-running detection, single-boot reuse, --self mode, <1min ago). 8 e2e daemon/node procs running the corpus validation. Alive."
   },
   "stage2_items": [],
   "resolved": [
