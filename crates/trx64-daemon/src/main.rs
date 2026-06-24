@@ -1637,6 +1637,21 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         // (PRG header = 2-byte LE load addr), and returns
         // { loadAddress, endAddress, bytesLoaded, path }. Load-only: does NOT set PC
         // or autostart (that is runtime/run_prg).
+        // session/key_down|key_up|release_keys — DEFERRED to a later batch. The
+        // c64re model (keyDown/keyUp/pressedKeys/releaseAllKeys) is a STATEFUL
+        // held-key set: a key stays pressed until an explicit release and the set
+        // is queryable. TRX64's KeyboardMatrix is purely a TIMED-EVENT queue
+        // (type_text schedules [start,end) windows; read_rows_for_pa gates on the
+        // cycle) with no held-key set and no pressed-query. A faithful port needs a
+        // NEW core primitive (held-key state + a pressed_keys() accessor on
+        // KeyboardMatrix) — out of scope for this no-new-primitive batch.
+        "session/key_down" | "session/key_up" | "session/release_keys" => {
+            Response::err(id, -32001, format!(
+                "NOT_IMPLEMENTED: {}: needs a held-key set + pressed-query primitive on KeyboardMatrix (next batch)",
+                req.method
+            ))
+        }
+
         "session/load_prg" => {
             let prg_path = match req.params.get("prg_path").and_then(|v| v.as_str()) {
                 Some(p) => p.to_string(),
@@ -2717,6 +2732,17 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 "height": trx64_core::render::CANVAS_H,
                 "pixel": pixel
             }))
+        }
+
+        m if m.starts_with("vic/inspect/") => {
+            // The granular vic/inspect/{open,at,region,close,promote,origin,
+            // evidence,provenance,at_capture} ride the 705.B checkpoint ring +
+            // the inspect snapshot/provenance + asset-origin modules — none of
+            // which exist in trx64-core yet (ring is the explicitly-deferred heavy
+            // infra; the inspect module is a new primitive). The collapsed
+            // "vic/inspect" above serves the immediate frozen-pixel resolve.
+            Response::err(id, -32001,
+                format!("NOT_IMPLEMENTED: {m}: needs the checkpoint-ring + vic-inspect/provenance modules (next batch)"))
         }
 
         m if m.starts_with("vic/") => {
