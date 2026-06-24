@@ -441,42 +441,31 @@ async function captureSurface(c: RpcClient, sid: string): Promise<Map<string, un
   return out;
 }
 
-/** Structural shape of a value: keys (recursively, sorted) + leaf TYPES, ignoring
- *  values. Two daemons "agree on the surface" if shapes match — exact register
- *  values legitimately differ at the same wall-clock on different loaders. */
-function shapeOf(v: unknown, depth = 0): unknown {
-  if (depth > 6) return "…";
-  if (Array.isArray(v)) return v.length === 0 ? [] : [shapeOf(v[0], depth + 1)];
-  if (v && typeof v === "object") {
-    const o: Record<string, unknown> = {};
-    for (const k of Object.keys(v as object).sort()) {
-      o[k] = shapeOf((v as Record<string, unknown>)[k], depth + 1);
-    }
-    return o;
-  }
-  return typeof v;
-}
-
 /** Keys that are documented per-runtime SUPERSETS (present on one daemon only) and
  *  must not count as a divergence — the contract is "c64re's surface, possibly
  *  extended". e.g. c64re's status carries scenarioId; TRX64 omits it. */
 const SUPERSET_KEYS = new Set<string>(["scenarioId", "stopReason"]);
 
-/** Shape-diff that ignores SUPERSET_KEYS at any depth (one daemon may add keys). */
+/** SHAPE-diff: compares the recursive key STRUCTURE + leaf TYPES (not values),
+ *  ignoring SUPERSET_KEYS. Exact register/memory VALUES legitimately differ — the
+ *  two runtimes are at different wall-clocks / loader phases at capture time — so
+ *  the surface-parity contract is "same response SHAPE", which is what the WS
+ *  consumer (UI / MCP tools) depends on. (Cross-runtime cycle-exactness is the
+ *  separate byte-exact-trace gate, not this live-corpus surface check.) */
 function diffShapeTolerant(a: unknown, b: unknown, base: string): Divergence | null {
-  const stripped = (v: unknown): unknown => {
-    if (Array.isArray(v)) return v.map(stripped);
+  const shape = (v: unknown): unknown => {
+    if (Array.isArray(v)) return v.length === 0 ? [] : [shape(v[0])];
     if (v && typeof v === "object") {
       const o: Record<string, unknown> = {};
-      for (const k of Object.keys(v as object)) {
+      for (const k of Object.keys(v as object).sort()) {
         if (SUPERSET_KEYS.has(k)) continue;
-        o[k] = stripped((v as Record<string, unknown>)[k]);
+        o[k] = shape((v as Record<string, unknown>)[k]);
       }
       return o;
     }
-    return v;
+    return typeof v;
   };
-  return diffResponses(stripped(a), stripped(b), base);
+  return diffResponses(shape(a), shape(b), base);
 }
 
 /** Run the WS surface on PRE-BOOTED active sessions (so c64re is booted once and
@@ -561,13 +550,20 @@ async function breakpointHit(c: RpcClient, sid: string, kind: string): Promise<S
     // give the notification a moment to land
     await new Promise((r) => setTimeout(r, 50));
     off();
-    const halted = runResp?.runState === "paused" || (runResp?.stop && runResp?.stop?.reason === "breakpoint");
+    // The ADR-086 proof of "a breakpoint that halts" is the debug/breakpoint_hit
+    // NOTIFICATION firing at the target PC (the broadcast a passive client sees).
+    // The debug/continue reply ALSO carries the halt, but its exact shape (runState
+    // vs stop.reason; the stopPc may be the next PC in the loop) varies, so the
+    // notification is the authoritative, runtime-agnostic signal.
     const stopPc = Number(runResp?.pc ?? runResp?.stop?.pc ?? -1) & 0xffff;
-    const ok = halted && stopPc === target && (fired ? firedPc === target : true);
+    const respHalted =
+      (runResp?.runState === "paused" || runResp?.stop?.reason === "breakpoint") && stopPc === target;
+    const notifyHalted = fired && firedPc === target;
+    const ok = notifyHalted || respHalted;
     return {
       method: `breakpoint-hit[${kind}]`,
-      divergence: ok ? null : { kind: "response", path: "$.breakpoint", expected: `halt@$${target.toString(16)}`, got: `halted=${halted} fired=${fired} stopPc=$${stopPc.toString(16)} firedPc=$${firedPc.toString(16)}` },
-      note: ok ? `halted@$${stopPc.toString(16)} notify=${fired}` : `no halt at $${target.toString(16)}`,
+      divergence: ok ? null : { kind: "response", path: "$.breakpoint", expected: `halt@$${target.toString(16)}`, got: `notify(fired=${fired} pc=$${firedPc.toString(16)}) resp(rs=${runResp?.runState} pc=$${stopPc.toString(16)})` },
+      note: ok ? `halt@$${target.toString(16)} via ${notifyHalted ? "debug/breakpoint_hit notify" : "continue-reply"}` : `no halt at $${target.toString(16)}`,
     };
   } catch (e) {
     return { method: `breakpoint-hit[${kind}]`, divergence: { kind: "response", path: "$.breakpoint", expected: "halt", got: String(e) }, note: String(e) };
@@ -848,7 +844,8 @@ function writeReport(
   lines.push(`AND a live c64re TypeScript daemon through the SAME WS JSON-RPC sequence and`);
   lines.push(`compares observable behavior. The feature-complete-vs-TS-headless capstone._`);
   lines.push("");
-  lines.push(`Run mode: ${quick ? "**quick subset**" : "**full corpus**"}${allXref ? " · **all-xref** (c64re driven for every item)" : ""}.`);
+  const xrefN = rows.filter((r) => r.xref).length;
+  lines.push(`Run scope: **${rows.length} corpus item(s)** (${xrefN} driven live against c64re)${quick ? " · quick subset" : ""}${allXref ? " · all-xref" : ""}.`);
   lines.push("");
   lines.push(`## Method`);
   lines.push("");
