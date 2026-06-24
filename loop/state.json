@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "drive-1to1-drivecpu",
+  "current_item": "scramble-sprites",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -41,12 +41,16 @@
     "drive-1to1-via1"
   ],
   "note": "BREAKTHROUGH (ADR-061): VIA1 1:1 -> scramble custom loader WORKS, title renders ~90% clean (was noise). end6/7/8 exact. Residual: end5 off-by-1 (a few garbled blocks). Next: drivecpu.ts 1:1 (the last distilled drive class = the cross-domain catch-up; likely the end5 sample-phase residual). Then 7-game gate.",
-  "updated": "2026-06-24T07:54:58Z",
+  "updated": "2026-06-24T07:56:40Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "scramble-sprites",
+    "model": "opus",
+    "started": "2026-06-24T07:56:40Z"
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
