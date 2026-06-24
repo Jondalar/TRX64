@@ -914,3 +914,18 @@ vs the distilled baseline) the distilled IEC bus was ALREADY faithful. So end6 i
 NEXT: the drive's VIA1 is still the DISTILLED Via6522 (only VIA2 was 1:1-ported to viacore). VIA1 owns the
 ATN-CA1 IRQ entry + the PB IEC bit-bang timing the custom-loader handshake depends on — the likely end6 blocker.
 Port via1d1541.ts -> a viacore-backed VIA1 (like VIA2). Then drivecpu.ts (the cross-domain catch-up) if needed.
+
+## ADR-061 — via1d1541.ts → 1:1 VIA1 (viacore-backed): SCRAMBLE CUSTOM LOADER WORKS, title renders
+VIA1 was the scramble blocker (it was the last distilled Via6522; owns the ATN-CA1 IRQ + the PB CLK/DATA/ATN
+IEC bit-bang the custom $DD00 loader's handshake depends on). 1:1-ported via1d1541.ts -> Via1dBackend on the
+merged 1:1 viacore (store/read PRB IEC fold, read_prb tmp=(drv_port^0x85)|0x1a|driveid, CA1=ATN IRQ via
+viacore_signal, ATN-acknowledge). Deleted the distilled Via6522 (VIA1+VIA2) + Via2Ports + signal_ca1 +
+iec::fold_drv_port shim — both VIAs now on the 1:1 viacore. RESULT (THE BREAKTHROUGH):
+- scramble-load-progress moved PAST end6: end6 [31,11] EXACT (was stuck 31 vs 33), end7 [179,12] EXACT, end8
+  [65,14] EXACT. (Residual: end5 [132,9] vs [131,9] off-by-1 — "mid-block sample phase".)
+- dd00_loader_bar_probe: BAR CLIMBED to $7E (was stuck $20), drive escapes the $0402 spin (8.1% vs ~100%).
+- VISUAL: scramble renders the SCRAMBLE INFINITY title (~90% clean — spaceship/badge/v1.2/artwork all render;
+  a few residual garbled blocks = the end5 off-by-1). From complete noise -> the title.
+All byte-exact gates GREEN, 91 tests. The 1:1-port-the-distilled-classes directive (viacore/rotation/iecbus/
+via1) cracked the custom loader. NEXT: the residual end5 off-by-1 — likely drivecpu.ts (the cross-domain
+catch-up, still distilled in full.rs/drive.rs catch_up_to) OR a 1-cycle sample-phase. Then the 7-game gate.

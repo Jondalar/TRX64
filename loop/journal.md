@@ -620,3 +620,11 @@ iec.rs 171->903, 1:1 iecbus.ts + c64iec.ts. 2 bugs the byte-exact gates caught (
 invert). All gates + 91 tests GREEN. scramble unchanged end6 -> builder PROVED the distilled IEC was already
 faithful (byte-identical fingerprint). end6 is VIA1 (still distilled Via6522; owns ATN-CA1 IRQ + PB bit-bang).
 Next: via1d1541.ts 1:1 (viacore-backed VIA1).
+
+## 2026-06-24 — DRIVER: VIA1 1:1 — SCRAMBLE CUSTOM LOADER WORKS, title renders (ADR-061)
+
+VIA1 was the blocker (last distilled Via6522; the ATN-CA1 IRQ + PB IEC bit-bang). 1:1-ported via1d1541.ts ->
+viacore-backed Via1dBackend; deleted the distilled Via6522 (both VIAs now 1:1 viacore). scramble-load-progress
+past end6 (end6/7/8 EXACT). Bar climbs $20->$7E, drive escapes spin. VISUAL: the SCRAMBLE INFINITY title
+renders ~90% clean (was complete noise). All byte-exact gates + 91 tests GREEN. The 1:1-port directive cracked
+the custom loader. Residual: end5 off-by-1 (a few garbled blocks). Next: drivecpu.ts 1:1.

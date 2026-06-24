@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "drive-1to1-via1",
+  "current_item": "drive-1to1-drivecpu",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -37,26 +37,23 @@
     "render-verbatim",
     "drive-1to1-viacore",
     "drive-1to1-rotation",
-    "drive-1to1-iecbus"
+    "drive-1to1-iecbus",
+    "drive-1to1-via1"
   ],
-  "note": "iecbus 1:1 done (ADR-060, byte-exact, 2 bugs fixed, distilled was already faithful). end6 is VIA1 (still distilled Via6522; only VIA2 was 1:1-ported). Next: via1d1541.ts -> viacore-backed VIA1 1:1 (owns ATN-CA1 IRQ + PB IEC bit-bang timing = the handshake = likely end6 blocker).",
-  "updated": "2026-06-24T07:32:19Z",
+  "note": "BREAKTHROUGH (ADR-061): VIA1 1:1 -> scramble custom loader WORKS, title renders ~90% clean (was noise). end6/7/8 exact. Residual: end5 off-by-1 (a few garbled blocks). Next: drivecpu.ts 1:1 (the last distilled drive class = the cross-domain catch-up; likely the end5 sample-phase residual). Then 7-game gate.",
+  "updated": "2026-06-24T07:54:58Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": {
-    "item": "drive-1to1-via1",
-    "model": "opus",
-    "started": "2026-06-24T07:32:19Z"
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
   ],
   "known_red": [
-    "scramble: custom $DD00 loader RUNS + title LAYOUT renders, but the 2-bit fast-transfer bitmap DATA is corrupt (bit-sampling timing) — next item dd00-fast-transfer",
-    "iso-vic c64Cycles +1/+3: VICE-accurate, behaviorally harmless (ADR-053)"
+    "scramble: custom $DD00 loader WORKS + title renders ~90% clean (ADR-061); residual end5 off-by-1 (mid-block sample phase) = a few garbled blocks. Next dd00-residual / drivecpu 1:1.",
+    "iso-vic c64Cycles +1/+3: VICE-accurate, pre-existing, harmless (ADR-053)"
   ],
   "custom_loader_test_disk": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/scramble_infinity.d64",
   "blocked": [
