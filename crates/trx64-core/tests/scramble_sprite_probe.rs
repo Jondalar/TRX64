@@ -80,40 +80,38 @@ fn scramble_sprite_probe() {
         return;
     }
 
-    // RUN. The title comes up after the fast loader; sweep cycle marks so we can
-    // find the STABLE title window (bank/D018 + a small PPM at each), because the
-    // game advances past the title later (different bank → full-screen garble).
+    // RUN. The title comes up after the fast loader. The title is an ANIMATED
+    // raster-IRQ screen: the game reprograms $D011 per frame (BMM bitmap $3B for
+    // the picture, ECM/text $54/$5B during the logo raster split). A static
+    // single-frame render is only meaningful when frozen in the bitmap-mode phase
+    // ($D011=$3B) — that is exactly how the c64re reference screenshot was taken.
+    // So: run ~10M cycles to settle the title, then step until $D011 == $3B (the
+    // stable multicolor-bitmap title frame) before dumping the framebuffer.
     inject_keys(&mut m, b"RUN\r");
     let run_clk = m.cpu6510.clk;
     let trace_root = format!("{}/../../traces", env!("CARGO_MANIFEST_DIR"));
-    // Marks (cycles after RUN) to probe.
-    let marks: [u64; 12] = [
-        5_000_000, 8_000_000, 10_000_000, 12_000_000, 14_000_000, 16_000_000, 18_000_000,
-        20_000_000, 24_000_000, 28_000_000, 34_000_000, 40_000_000,
-    ];
-    let mut next = 0usize;
-    let mut budget = 0u64;
-    while next < marks.len() {
+    // Settle the title.
+    for _ in 0..100 {
         m.run_for_full(100_000, &mut obs, |_, _, _, _, _, _, _| {});
-        budget += 100_000;
-        if budget >= marks[next] {
-            let bb = m.vic_bank_base();
-            let d018 = m.vic.regs[0x18];
-            let d011 = m.vic.regs[0x11];
-            let en = m.vic.regs[0x15];
-            eprintln!(
-                "  +{:>9} clk={} PC=${:04X} bank=${bb:04X} D018=${d018:02X} D011=${d011:02X} D015=${en:02X}",
-                marks[next], m.cpu6510.clk, m.cpu6510.reg_pc
-            );
-            let (w, h, rgba) = m.render_canvas_rgba();
-            let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
-            for px in rgba.chunks_exact(4) {
-                ppm.extend_from_slice(&px[..3]);
-            }
-            std::fs::write(format!("{trace_root}/scramble_mark_{:02}M.ppm", marks[next] / 1_000_000), &ppm).ok();
-            next += 1;
+    }
+    // Step until the VIC is in the bitmap-mode title phase ($D011=$3B), bank $C000,
+    // sprites enabled — the stable, comparable frame.
+    let mut found = false;
+    for _ in 0..2_000_000 {
+        m.run_for_full(1, &mut obs, |_, _, _, _, _, _, _| {});
+        if m.vic.regs[0x11] == 0x3b && m.vic_bank_base() == 0xC000 && m.vic.regs[0x15] != 0 {
+            found = true;
+            break;
         }
     }
+    eprintln!(
+        "title frame: found_bitmap_phase={found} clk={} (+{} after RUN) D011=${:02X} bank=${:04X} D015=${:02X}",
+        m.cpu6510.clk,
+        m.cpu6510.clk - run_clk,
+        m.vic.regs[0x11],
+        m.vic_bank_base(),
+        m.vic.regs[0x15]
+    );
     eprintln!("after RUN: PC=${:04X} clk={} (+{} after RUN)", m.cpu6510.reg_pc, m.cpu6510.clk, m.cpu6510.clk - run_clk);
 
     // ── VIC config ──────────────────────────────────────────────────────────
@@ -185,10 +183,7 @@ fn scramble_sprite_probe() {
         ppm.push(px[1]);
         ppm.push(px[2]);
     }
-    let out = format!(
-        "{}/../../traces/scramble_sprite_probe.ppm",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    let out = format!("{trace_root}/scramble_sprite_probe.ppm");
     std::fs::write(&out, &ppm).expect("write ppm");
-    eprintln!("wrote framebuffer {w}x{h} to {out}");
+    eprintln!("wrote title framebuffer {w}x{h} to {out}");
 }
