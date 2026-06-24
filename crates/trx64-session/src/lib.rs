@@ -17,6 +17,13 @@ pub struct Session {
     /// (session/create → session/run straight from the KERNAL reset vector, run
     /// on the assembled FullBus). False at boot ⇒ full-machine run path.
     pub injected: bool,
+    /// True once a `wr io` (I/O-lens) inject has run — i.e. a render scenario that
+    /// programmed the VIC/colour-RAM via `Machine::poke_io` and then runs a parked
+    /// frame to SWEEP the per-cycle renderer. Unlike `injected` (which routes the
+    /// run onto the chip-ISOLATED bus for cycle-exact CPU gates), an io-inject
+    /// still needs the FULL VIC-ticked machine so the per-cycle draw accumulates
+    /// the displayed frame. So: io_injected ⇒ keep the full-machine run path.
+    pub io_injected: bool,
     /// Active trace: sibling `.c64retrace` path + accumulated meta. When set,
     /// session/run streams CpuStep/RAM_WRITE/IO_WRITE frames into a FrameSink and
     /// flushes to this path. `None` = no trace.
@@ -50,6 +57,7 @@ impl Session {
             machine: Machine::new(),
             running: false,
             injected: false,
+            io_injected: false,
             trace: None,
             disk_path: String::new(),
         }
