@@ -2742,6 +2742,78 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             Response::err(id, -32001, format!("NOT_IMPLEMENTED: {m}: deferred"))
         }
 
+        // ── Spec 707 — native snapshot dump/undump ───────────────────────────
+        // c64re writes a `.c64re` container (checkpoint ring + embedded media +
+        // sha-integrity). TRX64 has neither the ring nor that codec, so the FILE
+        // BYTES are TRX64's own vsf (a dump→undump round-trips WITHIN TRX64). The
+        // WIRE SHAPE matches c64re's DumpResult/UndumpResult 1:1 (snapshot-
+        // persistence.ts) — the file format is an implementation detail behind the
+        // identical JSON contract. `media[]` is gathered from the live attached
+        // disk/cart exactly like c64re's gatherMedia (role/format/sourceName/
+        // sha256/bytes). NOTE: a .c64re written by c64re is NOT readable here and
+        // vice-versa (different container) — cross-runtime snapshot exchange is a
+        // later batch (needs the native-snapshot codec primitive).
+        "snapshot/dump" => {
+            let path = match req.params.get("path").and_then(|v| v.as_str()) {
+                Some(p) => p.to_string(),
+                None => return Response::err(id, -32602, "snapshot/dump: path required"),
+            };
+            let st = state.lock().unwrap();
+            let bytes = trx64_core::vsf::save_vsf(&st.session.machine);
+            let cycle = st.session.machine.clk;
+            let pc = st.session.machine.cpu6510.reg_pc as u64;
+            let media = gather_snapshot_media(&st.session);
+            let breakpoints = st.breakpoints.entries.len() as u64;
+            drop(st);
+            if let Some(parent) = std::path::Path::new(&path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::write(&path, &bytes) {
+                Ok(()) => Response::ok(id, json!({
+                    "path": path,
+                    "cycle": cycle,
+                    "pc": pc,
+                    "machine": "c64-pal",
+                    "media": media,
+                    "fileBytes": bytes.len() as u64,
+                    "breakpoints": breakpoints
+                })),
+                Err(e) => Response::err(id, -32001, format!("snapshot/dump: write error: {e}")),
+            }
+        }
+
+        "snapshot/undump" => {
+            let path = match req.params.get("path").and_then(|v| v.as_str()) {
+                Some(p) => p.to_string(),
+                None => return Response::err(id, -32602, "snapshot/undump: path required"),
+            };
+            let file_bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => return Response::err(id, -32001, format!("snapshot/undump: cannot read {path}: {e}")),
+            };
+            let mut st = state.lock().unwrap();
+            match trx64_core::vsf::load_vsf(&mut st.session.machine, &file_bytes) {
+                Ok(_) => {
+                    let cycle = st.session.machine.clk;
+                    let pc = st.session.machine.cpu6510.reg_pc as u64;
+                    let media = gather_snapshot_media(&st.session);
+                    let breakpoints = st.breakpoints.entries.len() as u64;
+                    // An undump is a restore → the session is paused.
+                    st.session.running = false;
+                    Response::ok(id, json!({
+                        "path": path,
+                        "cycle": cycle,
+                        "pc": pc,
+                        "machine": "c64-pal",
+                        "media": media,
+                        "breakpoints": breakpoints,
+                        "paused": true
+                    }))
+                }
+                Err(e) => Response::err(id, -32001, format!("snapshot/undump: {e}")),
+            }
+        }
+
         "vsf/save" => {
             let output_path = req.params
                 .get("output_path")
@@ -2822,6 +2894,45 @@ fn mapper_type_str(t: trx64_core::cart::MapperType) -> &'static str {
         MagicDesk16 => "magicdesk16",
         Unsupported => "cartridge",
     }
+}
+
+// ── Snapshot media gather (= c64re gatherMedia → SnapshotMediaSummary[]) ──────
+
+/// Build the snapshot `media[]` array from the session's live attached media,
+/// matching c64re's gatherMedia (snapshot-persistence.ts): the drive8 disk
+/// (role "drive8") and any attached cartridge (role "cartridge"), each
+/// `{ role, format, sourceName, sha256, bytes }`.
+fn gather_snapshot_media(session: &Session) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    let m = &session.machine;
+    if let Some(disk) = m.drive8.get_attached_disk() {
+        let format = match disk.kind {
+            DiskKind::G64 => "g64",
+            DiskKind::D64 => "d64",
+        };
+        let source_name = disk
+            .backing_path
+            .as_ref()
+            .and_then(|p| p.rsplit('/').next())
+            .map(String::from);
+        out.push(json!({
+            "role": "drive8",
+            "format": format,
+            "sourceName": source_name,
+            "sha256": sha256_hex(&disk.bytes),
+            "bytes": disk.bytes.len() as u64
+        }));
+    }
+    if let Some(img) = m.cartridge_image.as_ref() {
+        out.push(json!({
+            "role": "cartridge",
+            "format": "crt",
+            "sourceName": img.name.clone(),
+            "sha256": sha256_hex(&img.raw_bytes),
+            "bytes": img.raw_bytes.len() as u64
+        }));
+    }
+    out
 }
 
 // ── SHA-256 helper ────────────────────────────────────────────────────────────
