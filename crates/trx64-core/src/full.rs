@@ -201,7 +201,20 @@ impl<'a> FullBus<'a> {
     #[inline]
     fn io_read(&mut self, addr: u16) -> u8 {
         match addr {
-            0xd000..=0xd3ff => self.vic.read_reg(addr as u8),
+            0xd000..=0xd3ff => {
+                // $D01E (sprite-sprite) / $D01F (sprite-background) collision
+                // registers (mirrored every $40): compute the live collision
+                // latches from the current frozen state, fire the collision IRQ on
+                // the 0→nonzero edge, then read-clear (read_reg_mut). Every other
+                // VIC register is an ordinary register read.
+                match (addr as u8) & 0x3f {
+                    0x1e | 0x1f => {
+                        self.recompute_collisions();
+                        self.vic.read_reg_mut(addr as u8)
+                    }
+                    _ => self.vic.read_reg(addr as u8),
+                }
+            }
             0xd400..=0xd7ff => {
                 // SID: 32-byte register mirror every $20.
                 // $D419/$D41A (POT X/Y) → 0x80 (unconnected default).
@@ -260,6 +273,38 @@ impl<'a> FullBus<'a> {
             // $DE00-$DFFF (cart IO, no cart) → open-bus shadow.
             _ => self.io[(addr as usize) - 0xd000],
         }
+    }
+
+    /// Recompute the $D01E/$D01F collision latches from the current frozen state
+    /// and merge them into the VIC (firing the collision IRQ on the 0→nonzero
+    /// edge). Called when the CPU reads $D01E/$D01F so a polled collision register
+    /// reflects the rendered sprite/graphics overlap of the current frame.
+    ///
+    /// The masks are produced by the static pixel renderer (`render_collisions`),
+    /// the same source the screenshot pipeline uses, so the collision bits are
+    /// pixel-consistent with the displayed frame. `apply_collisions` ports the
+    /// VICE edge-trigger (vicii-cycle.c:407-433) verbatim.
+    fn recompute_collisions(&mut self) {
+        // Colour RAM low nibbles live in the I/O shadow at $D800-$DBFF.
+        let mut color_ram = [0u8; 0x0400];
+        for (i, c) in color_ram.iter_mut().enumerate() {
+            *c = self.io[0x0800 + i] & 0x0f;
+        }
+        // VIC bank base from CIA2 port-A bits 0-1 (= Machine::vic_bank_base).
+        let pra = self.cia2.peek(0xdd00);
+        let ddra = self.cia2.peek(0xdd02);
+        let bank = ((pra & ddra & 0x03) ^ 0x03) as u16;
+        let bank_base = bank.wrapping_mul(0x4000);
+
+        let inp = crate::render::RenderInput {
+            regs: &self.vic.regs,
+            ram: self.ram,
+            char_rom: self.char_rom,
+            color_ram: &color_ram,
+            bank_base,
+        };
+        let (ss, sb) = crate::render::render_collisions(&inp);
+        self.vic.apply_collisions(ss, sb);
     }
 
     /// I/O write dispatch ($D000-$DFFF, IO config).

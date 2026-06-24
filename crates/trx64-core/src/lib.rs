@@ -159,7 +159,16 @@ impl<'a> Bus for VicBus<'a> {
     #[inline]
     fn read(&mut self, addr: u16) -> u8 {
         if (0xd000..0xd400).contains(&addr) {
-            self.vic.read_reg(addr as u8)
+            // $D01E/$D01F (mirrored every $40): recompute the collision latches
+            // from the frozen state (fire the collision IRQ on the 0→nonzero
+            // edge) then read-clear. Other VIC registers: ordinary read.
+            match (addr as u8) & 0x3f {
+                0x1e | 0x1f => {
+                    self.recompute_collisions();
+                    self.vic.read_reg_mut(addr as u8)
+                }
+                _ => self.vic.read_reg(addr as u8),
+            }
         } else {
             self.mem[addr as usize]
         }
@@ -183,6 +192,29 @@ impl<'a> Bus for VicBus<'a> {
     #[inline]
     fn check_ba_before_read(&mut self) -> u32 {
         self.vic.steal_cycles()
+    }
+}
+
+impl<'a> VicBus<'a> {
+    /// Recompute the $D01E/$D01F collision latches from the frozen state and merge
+    /// them into the VIC (firing the collision IRQ on the 0→nonzero edge). On the
+    /// chip-isolated bus everything (incl. colour RAM) is flat RAM; colour RAM low
+    /// nibbles read from $D800-$DBFF, no CHARGEN shadow (char_rom zeroed), bank 0.
+    fn recompute_collisions(&mut self) {
+        let mut color_ram = [0u8; 0x0400];
+        for (i, c) in color_ram.iter_mut().enumerate() {
+            *c = self.mem[0xd800 + i] & 0x0f;
+        }
+        let char_rom = [0u8; 0x1000];
+        let inp = render::RenderInput {
+            regs: &self.vic.regs,
+            ram: self.mem,
+            char_rom: &char_rom,
+            color_ram: &color_ram,
+            bank_base: 0,
+        };
+        let (ss, sb) = render::render_collisions(&inp);
+        self.vic.apply_collisions(ss, sb);
     }
 }
 
@@ -688,6 +720,33 @@ impl Machine {
             bank_base: self.vic_bank_base(),
         };
         render::render_canvas_rgba(&inp)
+    }
+
+    /// Compute the $D01E (sprite-sprite) / $D01F (sprite-background) collision
+    /// registers for the current frozen display and merge them into the VIC,
+    /// firing the collision IRQ on the 0→nonzero edge (verbatim VICE
+    /// vicii-cycle.c:407-433). Returns the freshly-rendered `(ss, sb)` masks. The
+    /// merged latches are read-cleared by a subsequent $D01E/$D01F read.
+    ///
+    /// The full-machine run loop calls this implicitly when the CPU reads
+    /// $D01E/$D01F (FullBus::recompute_collisions); this public entry lets the
+    /// daemon/session populate the latches for a direct register peek/snapshot.
+    pub fn recompute_collisions(&mut self) -> (u8, u8) {
+        let mut color_ram = [0u8; 0x0400];
+        for (i, c) in color_ram.iter_mut().enumerate() {
+            *c = self.io_shadow[0x0800 + i] & 0x0f;
+        }
+        let bank_base = self.vic_bank_base();
+        let inp = render::RenderInput {
+            regs: &self.vic.regs,
+            ram: &self.ram,
+            char_rom: &self.char_rom,
+            color_ram: &color_ram,
+            bank_base,
+        };
+        let (ss, sb) = render::render_collisions(&inp);
+        self.vic.apply_collisions(ss, sb);
+        (ss, sb)
     }
 
     /// Run a cycle budget against an arbitrary observer (= TS session/run with a

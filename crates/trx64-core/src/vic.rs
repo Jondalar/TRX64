@@ -953,8 +953,14 @@ impl VicII {
             }
             _ => {}
         }
-        // vicii-cycle.c:427-433 — collision IRQs (collisions never set at this
-        // timing level, but the gate is reproduced for structure).
+        // vicii-cycle.c:427-433 — collision IRQs. In VICE these fire on the
+        // 0→nonzero edge produced by `vicii_draw_cycle()` SETTING the collision
+        // bits between the `can_*` capture (start of cycle) and this check. This
+        // static-render port has no per-cycle pixel pipeline, so the collision
+        // bits are computed by `render::render_collisions` and merged via
+        // `apply_collisions` (which reproduces this exact edge-trigger). Here the
+        // bits are unchanged within `tick()` (`vicii_draw_cycle` is the deferred
+        // renderer), so the edge can never form — left as the verbatim structure.
         let can_sprite_sprite = self.sprite_sprite_collisions == 0;
         let can_sprite_background = self.sprite_background_collisions == 0;
         if can_sprite_sprite && self.sprite_sprite_collisions != 0 {
@@ -1402,6 +1408,38 @@ impl VicII {
         };
         self.last_bus_phi2 = value;
         value
+    }
+
+    /// Merge freshly-computed collision masks (from the static pixel renderer,
+    /// `render::render_collisions`) into the $D01E/$D01F latches and fire the
+    /// collision IRQs on the 0→nonzero edge.
+    ///
+    /// PORT OF: vicii-cycle.c:407-433 (the `can_sprite_*` capture →
+    /// `vicii_draw_cycle()` sets the bits → IRQ-on-edge). VICE captures
+    /// `can_sprite_sprite = (collisions == 0)` BEFORE the draw cycle accumulates
+    /// new collision bits, then fires `vicii_irq_sscoll_set()` /
+    /// `vicii_irq_sbcoll_set()` iff the register WAS zero and is now non-zero.
+    /// Here the static renderer plays the role of `vicii_draw_cycle()`: we OR the
+    /// rendered masks into the latches (collisions are sticky / read-cleared) and
+    /// reproduce the identical edge trigger. Idempotent: re-merging the same masks
+    /// fires no new IRQ (no fresh 0→nonzero edge).
+    pub fn apply_collisions(&mut self, sprite_sprite: u8, sprite_background: u8) {
+        // vicii-cycle.c:407-408 — capture "was zero" BEFORE merging.
+        let can_sprite_sprite = self.sprite_sprite_collisions == 0;
+        let can_sprite_background = self.sprite_background_collisions == 0;
+
+        // The renderer's `vicii_draw_cycle()` equivalent: accumulate (|=) the new
+        // collision bits into the sticky latches.
+        self.sprite_sprite_collisions |= sprite_sprite;
+        self.sprite_background_collisions |= sprite_background;
+
+        // vicii-cycle.c:428-433 — IRQ on the 0→nonzero edge.
+        if can_sprite_sprite && self.sprite_sprite_collisions != 0 {
+            self.vicii_irq_sscoll_set();
+        }
+        if can_sprite_background && self.sprite_background_collisions != 0 {
+            self.vicii_irq_sbcoll_set();
+        }
     }
 }
 

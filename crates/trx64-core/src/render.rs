@@ -300,9 +300,64 @@ fn render_index_and_fg(inp: &RenderInput) -> (Vec<u8>, Vec<u8>) {
     // Sprites are painted on top of the graphics, honouring per-sprite priority
     // ($D01B) against the foreground mask and sprite-sprite priority (lower
     // sprite number wins). Border colour stays untouched where no sprite pixel.
-    render_sprites(inp, &mut fb, &fg);
+    render_sprites(inp, &mut fb, &fg, None);
 
     (fb, fg)
+}
+
+/// Compute the sprite-sprite ($D01E) and sprite-background ($D01F) collision
+/// registers for the current frozen machine state, WITHOUT touching the pixel
+/// output. Returns `(sprite_sprite, sprite_background)` collision bitmasks.
+///
+/// VERBATIM port of the gate-authority collision computation
+/// (c64re/vic/literal/vicii-draw-cycle.ts:444-482 `draw_sprites`, which mirrors
+/// VICE viciisc draw_sprites / the `sprline` per-pixel sprite-opacity mask in
+/// vicii-sprites.c:381-384). Per draw-buffer pixel `i`:
+///   * `collision_mask` = bitmask of sprites that have an OPAQUE pixel at `i`
+///     (multicolor: pixel-reg != 0; hires: a set data bit). VICE's `sprline[i]`.
+///   * sprite-background ($D01F): a foreground graphics pixel under any opaque
+///     sprite pixel sets `sprite_background_collisions |= collision_mask`
+///     (vicii-draw-cycle.ts:474-476 / vicii-sprites.c:598 `sprmsk & collmsk`).
+///   * sprite-sprite ($D01E): 2+ opaque sprites at the same pixel sets
+///     `sprite_sprite_collisions |= collision_mask`
+///     (vicii-draw-cycle.ts:480-482 `collision_mask & (collision_mask - 1)`).
+/// The "foreground" pixel `pixel_pri` is the VICE `px & 0x2` graphics-priority
+/// mask = the `fg` plane built by `render_index_and_fg`.
+///
+/// Collisions are computed across the WHOLE 520×312 draw buffer (the off-screen
+/// border columns/lines included), matching VICE/TS which accumulate collisions
+/// for every drawn sprite pixel regardless of the screenshot crop — games read
+/// these for hit detection that does not depend on the visible window.
+pub fn render_collisions(inp: &RenderInput) -> (u8, u8) {
+    // Reuse the exact graphics foreground mask the pixel renderer builds (so the
+    // sprite-background priority test is identical). DEN=0 / blanked: no fg.
+    let (_fb, fg) = render_index_and_fg(inp);
+
+    // Per draw-buffer pixel: the bitmask of sprites that have an opaque pixel
+    // there (= VICE `sprline[]`). We paint a throwaway colour buffer so the
+    // existing sprite-pixel emission (transparency, MC vs hires) is reused 1:1.
+    let mut sprmask = vec![0u8; FB_W * FB_H];
+    let mut scratch = vec![0u8; FB_W * FB_H];
+    render_sprites(inp, &mut scratch, &fg, Some(&mut sprmask));
+
+    // Accumulate the two collision latches per pixel (vicii-draw-cycle.ts:454-482).
+    let mut ss: u8 = 0;
+    let mut sb: u8 = 0;
+    for i in 0..FB_W * FB_H {
+        let collision_mask = sprmask[i];
+        if collision_mask == 0 {
+            continue;
+        }
+        // sprite-background: a foreground graphics pixel under any sprite pixel.
+        if fg[i] != 0 {
+            sb |= collision_mask;
+        }
+        // sprite-sprite: 2+ sprites opaque at this pixel.
+        if collision_mask & collision_mask.wrapping_sub(1) != 0 {
+            ss |= collision_mask;
+        }
+    }
+    (ss, sb)
 }
 
 /// Paint the 8 hardware sprites onto the draw buffer. Calibrated against the TS
@@ -315,7 +370,13 @@ fn render_index_and_fg(inp: &RenderInput) -> (Vec<u8>, Vec<u8>) {
 /// underlying graphics pixel is foreground (`fg[..]==1`), the sprite pixel is
 /// hidden. Among sprites, the LOWEST-numbered sprite with an opaque pixel wins
 /// (matches the VICE draw_sprites `for s = 7..0` last-write-lowest semantics).
-fn render_sprites(inp: &RenderInput, fb: &mut [u8], fg: &[u8]) {
+///
+/// `sprmask`, when `Some`, receives a per-draw-buffer-pixel bitmask of which
+/// sprites have an OPAQUE pixel at that position (VICE `sprline[]`), recorded for
+/// EVERY opaque sprite pixel regardless of the priority hide test (collisions are
+/// detected even when a sprite is hidden behind foreground graphics — VICE
+/// accumulates `sprline` independently of the visible-pixel decision).
+fn render_sprites(inp: &RenderInput, fb: &mut [u8], fg: &[u8], mut sprmask: Option<&mut [u8]>) {
     let enable = inp.reg(0x15);
     if enable == 0 {
         return;
@@ -379,6 +440,7 @@ fn render_sprites(inp: &RenderInput, fb: &mut [u8], fg: &[u8]) {
                     let px0 = dbuf_x0 + p * pxw;
                     for k in 0..pxw {
                         put_sprite_px(fb, fg, line, px0 + k, c, spri);
+                        record_sprmask(sprmask.as_deref_mut(), line, px0 + k, m);
                     }
                 }
             } else {
@@ -391,6 +453,7 @@ fn render_sprites(inp: &RenderInput, fb: &mut [u8], fg: &[u8]) {
                     let px0 = dbuf_x0 + p * pxw;
                     for k in 0..pxw {
                         put_sprite_px(fb, fg, line, px0 + k, col, spri);
+                        record_sprmask(sprmask.as_deref_mut(), line, px0 + k, m);
                     }
                 }
             }
@@ -411,6 +474,19 @@ fn put_sprite_px(fb: &mut [u8], fg: &[u8], line: usize, x: usize, color: u8, spr
         return; // foreground graphics wins over a low-priority sprite
     }
     fb[off] = color;
+}
+
+/// Record sprite `m`'s opaque pixel into the per-pixel sprite-opacity mask
+/// (VICE `sprline[]`). Independent of priority hiding — collisions latch even for
+/// pixels hidden behind foreground graphics. Out-of-range columns are ignored.
+#[inline]
+fn record_sprmask(sprmask: Option<&mut [u8]>, line: usize, x: usize, m: u8) {
+    if x >= FB_W {
+        return;
+    }
+    if let Some(mask) = sprmask {
+        mask[line * FB_W + x] |= m;
+    }
 }
 
 /// Render the 8 horizontal pixels of one character/bitmap cell row. Returns the
@@ -681,5 +757,75 @@ mod sprite_tests {
         assert_eq!(fb[off], 2, "sprite top-left red");
         assert_eq!(fb[97 * FB_W + 208 + 23], 2, "sprite right edge red");
         assert_eq!(fb[(97 + 20) * FB_W + 208], 2, "sprite bottom red");
+    }
+
+    /// Two overlapping solid sprites over a blank background (no foreground
+    /// graphics) → sprite-sprite collision ($D01E) sets both sprites' bits;
+    /// sprite-background ($D01F) stays clear. (gate-authority
+    /// vicii-draw-cycle.ts:480-482 `collision_mask & (collision_mask - 1)`.)
+    #[test]
+    fn two_overlapping_sprites_set_sprite_sprite_collision() {
+        let mut ram = [0x20u8; 0x10000];
+        // sprite 0 + sprite 1 share data $0D ($0340 solid $FF).
+        ram[0x07f8] = 0x0d; // sprite 0 ptr
+        ram[0x07f9] = 0x0d; // sprite 1 ptr
+        for i in 0..63 {
+            ram[0x0340 + i] = 0xff;
+        }
+        let char_rom = [0u8; 0x1000]; // space glyph = all-zero rows → no fg
+        let color_ram = [14u8; 0x0400];
+        let mut regs = [0u8; 0x40];
+        regs[0x11] = 0x1b;
+        regs[0x16] = 0xc8;
+        regs[0x18] = 0x14;
+        regs[0x20] = 14;
+        regs[0x21] = 6;
+        // sprites 0 and 1 at the SAME position → fully overlapping.
+        regs[0x00] = 0x60; // sprite0 X=96
+        regs[0x01] = 0x60; // sprite0 Y=96
+        regs[0x02] = 0x60; // sprite1 X=96
+        regs[0x03] = 0x60; // sprite1 Y=96
+        regs[0x15] = 0x03; // enable 0+1
+        regs[0x27] = 2; // sprite0 red
+        regs[0x28] = 7; // sprite1 yellow
+        let inp = RenderInput { regs: &regs, ram: &ram, char_rom: &char_rom, color_ram: &color_ram, bank_base: 0 };
+        let (ss, sb) = render_collisions(&inp);
+        assert_eq!(ss, 0x03, "sprite-sprite $D01E = bits 0+1 (overlap)");
+        assert_eq!(sb, 0x00, "sprite-background $D01F = 0 (blank background)");
+    }
+
+    /// A solid sprite drawn over a foreground char glyph → sprite-background
+    /// collision ($D01F) sets that sprite's bit; with only one sprite present,
+    /// sprite-sprite ($D01E) stays clear. (vicii-draw-cycle.ts:474-476.)
+    #[test]
+    fn sprite_over_foreground_char_sets_sprite_background_collision() {
+        let mut ram = [0x20u8; 0x10000];
+        ram[0x07f8] = 0x0d; // sprite 0 ptr
+        for i in 0..63 {
+            ram[0x0340 + i] = 0xff;
+        }
+        // Put a fully-set glyph (char code 1, all rows $FF) at the screen cell the
+        // sprite covers. Display char (trow,col)=(0,0) → dbuf X[136,144) line[51,59).
+        // sprite0 at X=24 ($18) Y=50 → dbuf X 136, first row line 51 → overlaps it.
+        ram[0x0400] = 1; // screen[0,0] = char code 1
+        let mut char_rom = [0u8; 0x1000];
+        for r in 0..8 {
+            char_rom[8 + r] = 0xff; // char 1 = solid → every pixel foreground
+        }
+        let color_ram = [1u8; 0x0400]; // white fg
+        let mut regs = [0u8; 0x40];
+        regs[0x11] = 0x1b;
+        regs[0x16] = 0xc8;
+        regs[0x18] = 0x14;
+        regs[0x20] = 14;
+        regs[0x21] = 6;
+        regs[0x00] = 0x18; // sprite0 X=24 → dbuf X 136 (= display col 0)
+        regs[0x01] = 0x32; // sprite0 Y=50 → first row line 51 (= display row 0)
+        regs[0x15] = 0x01; // enable sprite 0
+        regs[0x27] = 2; // red
+        let inp = RenderInput { regs: &regs, ram: &ram, char_rom: &char_rom, color_ram: &color_ram, bank_base: 0 };
+        let (ss, sb) = render_collisions(&inp);
+        assert_eq!(sb, 0x01, "sprite-background $D01F = bit 0 (sprite over fg char)");
+        assert_eq!(ss, 0x00, "sprite-sprite $D01E = 0 (single sprite)");
     }
 }
