@@ -867,6 +867,7 @@ impl Machine {
                     core_clk,
                     fetch: None,
                     cur_op: (self.c64_core.reg_pc, 0),
+                    fetched: false,
                 };
                 full_sc::execute_one(&mut self.c64_core, &mut bus, &mut self.c64_int);
                 // Persist bus-mutated banking/port state back to the Machine.

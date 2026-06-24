@@ -65,6 +65,13 @@ pub struct FullScBus<'a, 'o, O: Observer> {
     /// the data read for read-ops, leaving the live `reg_pc` stale at the access.
     /// `(opcode_pc, opcode)`.
     pub cur_op: (u16, u8),
+    /// True once `debug_maincpu` has fired for THIS execute call's opcode (i.e. the
+    /// opcode body is running). Bus accesses BEFORE this (the prologue's pending
+    /// IRQ/NMI/RESET dispatch — the dummy reads, stack pushes of PCH/PCL/P, and the
+    /// vector reads) use the LIVE reg_pc directly (= cpu.rs `service_interrupt`,
+    /// which pushed `self.reg_pc` — the return address). After the fetch, the body
+    /// accesses use the post-fetch synthetic pc (`opcode_pc + 1 + OPERAND_BYTES`).
+    pub fetched: bool,
 }
 
 impl<'a, 'o, O: Observer> FullScBus<'a, 'o, O> {
@@ -89,6 +96,13 @@ impl<'a, 'o, O: Observer> FullScBus<'a, 'o, O> {
         // itself invoked; single-threaded; never aliased by a live `&mut` to that
         // same u16 at the instant of the read.
         let live = unsafe { *self.core_pc };
+        // Pre-fetch phase (the prologue's interrupt/reset dispatch): the live
+        // reg_pc is the value cpu.rs pushed/read with (the return address), so use
+        // it directly. The opcode-body synthetic only applies once the instruction's
+        // opcode has been fetched.
+        if !self.fetched {
+            return live;
+        }
         let (opcode_pc, opcode) = self.cur_op;
         if live == opcode_pc {
             opcode_pc.wrapping_add(1 + OPERAND_BYTES[opcode as usize] as u16)
@@ -267,6 +281,7 @@ impl<'a, 'o, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, O> {
     fn debug_maincpu(&mut self, pc: u16, clk: u64, op: u8, p1: u8, p2hi: u8) {
         self.fetch = Some((pc, op, p1, p2hi, clk));
         self.cur_op = (pc, op);
+        self.fetched = true;
     }
 }
 
