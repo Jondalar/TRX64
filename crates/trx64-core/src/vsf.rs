@@ -196,8 +196,9 @@ fn ser_vicii(machine: &Machine) -> Vec<u8> {
     // regs[80]: vic.regs is [u8; 0x40] = 64 bytes; pad to 80 with zeros.
     data.extend_from_slice(&vic.regs[0..64]);
     data.extend_from_slice(&[0u8; 16]); // pad to 80
-    // irq_status: $D019 value (low 4 bits)
-    data.push(vic.regs[0x19] & 0x0f);
+    // irq_status: the VIC IRQ latch (low 4 bits). The verbatim viciisc VIC keeps
+    // this in a dedicated `irq_status` field (not regs[0x19]).
+    data.push(vic.irq_status & 0x0f);
     // raster_irq_line: 2 LE
     push_u16_le(&mut data, vic.raster_irq_line);
     // raster_irq_clk: 4 LE (internal, not tracked — use 0)
@@ -399,8 +400,14 @@ fn load_vicii(machine: &mut Machine, data: &[u8]) -> Result<(), String> {
     let vic = &mut machine.vic;
     // regs[80]: first 64 map to vic.regs; bytes 64..80 are VSF-only extended regs.
     vic.regs[0..64].copy_from_slice(&data[0..64]);
-    // irq_status at offset 80 — restore to regs[0x19].
-    vic.regs[0x19] = data[80] & 0x0f;
+    // irq_status at offset 80 — restore to the dedicated VIC IRQ latch field and
+    // recompute the output line level (matching vicii_irq_set_line). The mask
+    // ($D01A) is in regs[0x1a] (restored above from data[0..64]).
+    vic.irq_status = data[80] & 0x0f;
+    vic.irq_line = (vic.irq_status & vic.regs[0x1a] & 0x0f) != 0;
+    if vic.irq_line {
+        vic.irq_status |= 0x80;
+    }
     // raster_irq_line at offset 81 (2 LE).
     if let Some(ril) = read_u16_le(data, 81) {
         vic.raster_irq_line = ril;
