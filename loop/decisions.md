@@ -1132,3 +1132,28 @@ NOT_IMPLEMENTED): session/key_down|up|release_keys (needs a held-key SET on Keyb
 queue today), granular vic/inspect/* (rides the 705.B checkpoint ring + a vic-inspect provenance module).
 NEXT: the RuntimeController A/V binary push (BIN 0x01 RGBA + BIN 0x02 s16le, paced) -> enables ws-av-tap real-
 time recording (user asked for it earlier; now unblocked since audio+breakpoints are done).
+
+## ADR-073 — live A/V binary push for ws-av-tap (RuntimeController parity, daemon-only)
+Ported c64re ws-server.ts's per-frame binary push 1:1 so the user's read-only ws-av-tap.mjs taps TRX64 →
+ffmpeg → .mp4. WIRE (matched byte-for-byte vs BOTH ws-av-tap's decoder AND c64re's encoder): envelope
+[type:u8][seq:u32 LE] + payload; BIN_VIC=0x01 = [w:u16][h:u16][fmt:u8=1][rsvd:u8=0][cycle:u32][48B colodore
+palette][w*h indices &0x0f] — fmt 1 PALETTE-INDEXED (NOT raw RGBA; ws-av-tap's decodeVic only accepts fmt 1),
+384×272, cycle = C64 CPU cycle (not frame#); BIN_AUDIO=0x02 = raw s16le STEREO 44.1k (reSID mono duplicated
+L/R). streaming.rs: build_vic_frame/build_audio_msg + a SINGLETON StreamHub — ONE pacing loop drives the
+singleton machine, broadcasts to all subscribers (1:1 c64re: one loop, broadcast to all clients). Per frame:
+run_for_full(19656) → render_canvas_indices() (new core fn, fmt-1 crop = render_canvas_rgba crop un-palettized)
++ drain the additive SID write_trace hook → engine.emit → take_pcm; epoch-anchored sleep holds ~50fps real-time.
+The !Send SidAudioEngine lives on a dedicated OS thread; the Send hook captures only a (addr,value) buffer
+(verbatim scramble_av_record harness). TRIGGER: c64re relies on the browser's debug/run+audio/start; the tap
+sends nothing, so the daemon auto-subscribes a connecting client — but GATED behind --stream (or TRX64_STREAM=1),
+OFF by default, so the command-driven oracle sees NO machine-advance-on-connect (byte-exact preserved). VALIDATED
+end-to-end: --stream daemon + boot driver (mount scramble_infinity.d64 → LOAD"*",8,1 → RUN → title) + a passive
+read-only recorder (identical decode to ws-av-tap) → traces/trx64_av_tap.mp4 = ffprobe 384×272 h264 + 44.1k
+stereo aac, 25s real-time (steady ~50 frames/s video+audio), audio NOT silent (peak 17802/32767, mean −23 dB).
+GATES: 37/41 oracle GREEN, the 4 REDs (scramble-load-progress end5, iso-vic-badline-irq/probe/sprites cycle
+gaps) are PRE-EXISTING (byte-identical on the pre-A/V baseline 864fd07 = vic.rs cycle gaps + custom-loader
+phase-lead, both out of scope). cargo test 142 pass. Core render/audio paths untouched (SID write_trace stays
+None off-stream). CAVEAT: the user's ws-av-tap.mjs --rec ffmpeg-fifo path hangs at moov-write on this ffmpeg
+8.1.1 (reproduces with the daemon GONE → tap-side quirk, not the push); the daemon's stream is correct — an
+offline-mux recorder (tools/av_file_recorder.mjs) produces the clean .mp4. The raw streams ws-av-tap receives
+are valid; only its own fifo finalization stalls.

@@ -43,6 +43,15 @@ struct Cli {
     /// Project path (stored, not used for routing in Phase 1).
     #[arg(long, default_value = "")]
     project: String,
+
+    /// Enable the live A/V binary push (ADR-073): in this mode a connecting client
+    /// (e.g. the read-only `ws-av-tap.mjs`) is subscribed to a singleton pacing
+    /// loop that runs the machine in real-time (~50 fps PAL) and pushes BIN_VIC +
+    /// BIN_AUDIO per frame. OFF by default so the byte-exact oracle (which spawns
+    /// command-driven, deterministic daemons) sees NO machine advance on connect.
+    /// Also enabled by setting `TRX64_STREAM=1`.
+    #[arg(long, default_value_t = false)]
+    stream: bool,
 }
 
 // ── JSON-RPC 2.0 wire types ───────────────────────────────────────────────────
@@ -3091,7 +3100,12 @@ fn render_screenshot(machine: &trx64_core::Machine, scale: usize) -> (String, u3
 
 // ── Connection handler ────────────────────────────────────────────────────────
 
-async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: SharedState) {
+async fn handle_connection(
+    stream: TcpStream,
+    addr: SocketAddr,
+    state: SharedState,
+    hub: Option<Arc<streaming::StreamHub>>,
+) {
     let ws = match accept_async(stream).await {
         Ok(ws) => ws,
         Err(e) => {
@@ -3120,9 +3134,14 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: SharedSta
         }
     });
 
-    // Auto-start the live A/V stream for this client (held until disconnect). The
-    // handle owns the streaming thread; dropping it on return signals stop + joins.
-    let _stream = streaming::spawn_stream(Arc::clone(&state), out_tx.clone());
+    // Subscribe this client to the SINGLETON live A/V stream IFF the daemon was
+    // launched with --stream (the hub starts the one streaming loop on the first
+    // subscriber, stops it when the last leaves). ws-av-tap is read-only, so it
+    // receives the push purely by connecting. Held until disconnect; dropping the
+    // guard unsubscribes (+ stops the loop if last). When streaming is OFF (the
+    // oracle's command-driven daemons), the machine never auto-advances on connect,
+    // so the byte-exact gates are unperturbed.
+    let _stream = hub.as_ref().map(|h| h.subscribe(out_tx.clone()));
 
     while let Some(msg) = rx.next().await {
         let msg = match msg {
@@ -3220,6 +3239,19 @@ async fn main() {
         trace_definitions: std::collections::HashMap::new(),
     }));
 
+    // The singleton live A/V stream hub (ADR-073): one pacing loop drives the
+    // singleton machine and broadcasts BIN_VIC/BIN_AUDIO to all connected clients.
+    // Only created when --stream (or TRX64_STREAM=1) is set; otherwise None, so a
+    // connecting client never triggers an auto-run (byte-exact oracle stays clean).
+    let streaming_on =
+        cli.stream || matches!(env::var("TRX64_STREAM").ok().as_deref(), Some("1") | Some("true"));
+    let hub: Option<Arc<streaming::StreamHub>> = if streaming_on {
+        eprintln!("[trx64] live A/V push ENABLED (--stream): clients are auto-subscribed at ~50fps");
+        Some(streaming::StreamHub::new(Arc::clone(&state)))
+    } else {
+        None
+    };
+
     let addr: SocketAddr = format!("127.0.0.1:{}", cli.port).parse().unwrap();
     let listener = TcpListener::bind(addr).await.expect("failed to bind");
     eprintln!("[trx64] listening on ws://{addr}");
@@ -3228,8 +3260,9 @@ async fn main() {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 let state = Arc::clone(&state);
+                let hub = hub.clone();
                 tokio::spawn(async move {
-                    handle_connection(stream, peer, state).await;
+                    handle_connection(stream, peer, state, hub).await;
                 });
             }
             Err(e) => {

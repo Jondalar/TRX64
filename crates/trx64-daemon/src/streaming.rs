@@ -108,52 +108,114 @@ pub fn build_audio_msg(seq: u32, mono: &[i16]) -> Vec<u8> {
     buf
 }
 
-/// Handle to a running streaming loop. Dropping (or calling [`stop`](Self::stop))
-/// signals the loop thread to exit and clears the SID audio hook.
-pub struct StreamHandle {
-    stop: Arc<AtomicBool>,
+/// A registered subscriber: one connected client's outbound channel + a unique id.
+struct Subscriber {
+    id: u64,
+    out: UnboundedSender<Message>,
+}
+
+/// The SINGLETON broadcaster. There is exactly ONE streaming loop driving the
+/// (singleton) machine, regardless of how many clients connect — matching c64re's
+/// model (one pacing loop, `broadcastFrame`/`broadcastAudioWire` to all clients).
+/// Each connection [`subscribe`](StreamHub::subscribe)s its outbound channel; the
+/// loop pushes every BIN_VIC/BIN_AUDIO to all live subscribers, pruning closed
+/// ones. The loop starts lazily on the FIRST subscriber and STOPS (releasing the
+/// machine + clearing the SID hook) when the LAST one leaves.
+pub struct StreamHub {
+    inner: Mutex<HubInner>,
+    state: SharedState,
+}
+
+struct HubInner {
+    subscribers: Vec<Subscriber>,
+    next_id: u64,
+    /// The running loop's stop flag (Some while a loop thread is alive).
+    stop: Option<Arc<AtomicBool>>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
-impl StreamHandle {
-    /// Signal the loop to stop and join the thread.
-    pub fn stop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(j) = self.join.take() {
+impl StreamHub {
+    pub fn new(state: SharedState) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(HubInner {
+                subscribers: Vec::new(),
+                next_id: 1,
+                stop: None,
+                join: None,
+            }),
+            state,
+        })
+    }
+
+    /// Register a client's outbound channel. Starts the loop if it's the first
+    /// subscriber. Returns a [`StreamSub`] guard that unsubscribes on drop (and
+    /// stops the loop when the last client leaves).
+    pub fn subscribe(self: &Arc<Self>, out: UnboundedSender<Message>) -> StreamSub {
+        let mut inner = self.inner.lock().unwrap();
+        let id = inner.next_id;
+        inner.next_id += 1;
+        inner.subscribers.push(Subscriber { id, out });
+        // First subscriber → start the loop.
+        if inner.stop.is_none() {
+            let stop = Arc::new(AtomicBool::new(false));
+            let hub = Arc::clone(self);
+            let stop_thread = Arc::clone(&stop);
+            let join = std::thread::Builder::new()
+                .name("trx64-av-stream".into())
+                .spawn(move || stream_loop(hub, stop_thread))
+                .expect("spawn av-stream thread");
+            inner.stop = Some(stop);
+            inner.join = Some(join);
+        }
+        StreamSub { hub: Arc::clone(self), id }
+    }
+
+    /// Broadcast a binary message to all live subscribers; prune any whose channel
+    /// has closed (client gone). Returns the number of live subscribers after pruning.
+    fn broadcast(&self, msg: Message) -> usize {
+        let mut inner = self.inner.lock().unwrap();
+        inner.subscribers.retain(|s| s.out.send(msg.clone()).is_ok());
+        inner.subscribers.len()
+    }
+
+    fn unsubscribe(&self, id: u64) {
+        // Take the loop thread to join OUTSIDE the lock (the loop also locks `inner`
+        // via broadcast → joining under the lock would deadlock).
+        let to_join = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.subscribers.retain(|s| s.id != id);
+            if inner.subscribers.is_empty() {
+                if let Some(stop) = inner.stop.take() {
+                    stop.store(true, Ordering::SeqCst);
+                }
+                inner.join.take()
+            } else {
+                None
+            }
+        };
+        if let Some(j) = to_join {
             let _ = j.join();
         }
     }
 }
 
-impl Drop for StreamHandle {
+/// Per-connection subscription guard. Dropping it unsubscribes; the last drop
+/// stops the singleton loop.
+pub struct StreamSub {
+    hub: Arc<StreamHub>,
+    id: u64,
+}
+
+impl Drop for StreamSub {
     fn drop(&mut self) {
-        self.stop();
+        self.hub.unsubscribe(self.id);
     }
 }
 
-/// Spawn the per-connection streaming loop. Returns a handle; while it lives the
-/// loop runs one PAL frame, renders + drains audio, pushes BIN_VIC + BIN_AUDIO
-/// down `out`, then sleeps to hold real-time (~50 fps). It exits when `out` closes
-/// (the client disconnected), when [`StreamHandle::stop`] is called, or on the
-/// internal stop flag.
-///
-/// The loop owns the `SidAudioEngine` locally (it is `!Send`). It locks the shared
-/// `State` only for the brief window of running+rendering each frame, so other
-/// JSON-RPC requests on the connection still interleave between frames.
-pub fn spawn_stream(state: SharedState, out: UnboundedSender<Message>) -> StreamHandle {
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_thread = Arc::clone(&stop);
-
-    let join = std::thread::Builder::new()
-        .name("trx64-av-stream".into())
-        .spawn(move || stream_loop(state, out, stop_thread))
-        .expect("spawn av-stream thread");
-
-    StreamHandle { stop, join: Some(join) }
-}
-
 /// The streaming loop body. Runs on a dedicated OS thread (owns the reSID engine).
-fn stream_loop(state: SharedState, out: UnboundedSender<Message>, stop: Arc<AtomicBool>) {
+/// Pushes each frame's BIN_VIC + BIN_AUDIO to ALL of the hub's subscribers.
+fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
+    let state = hub.state.clone();
     // ── reSID audio engine (owned on this thread; !Send) + the Send write hook ──
     let mut engine = SidAudioEngine::new(ResidConfig::default());
     let writes: Arc<Mutex<Vec<(u8, u8)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -187,7 +249,7 @@ fn stream_loop(state: SharedState, out: UnboundedSender<Message>, stop: Arc<Atom
     let mut frames_since_epoch: u32 = 0;
 
     loop {
-        if stop.load(Ordering::SeqCst) || out.is_closed() {
+        if stop.load(Ordering::SeqCst) {
             break;
         }
 
@@ -235,15 +297,12 @@ fn stream_loop(state: SharedState, out: UnboundedSender<Message>, stop: Arc<Atom
             (vic, audio)
         };
 
-        // ── Push BIN_VIC then BIN_AUDIO. A closed channel = client gone → exit. ──
-        if out.send(Message::Binary(vic_msg.into())).is_err() {
-            break;
-        }
+        // ── Broadcast BIN_VIC then BIN_AUDIO to all live subscribers. When the
+        // last client leaves, `unsubscribe` flips `stop` and we exit at the top. ──
+        hub.broadcast(Message::Binary(vic_msg.into()));
         frame_seq = frame_seq.wrapping_add(1);
         if let Some(audio) = audio_msg {
-            if out.send(Message::Binary(audio.into())).is_err() {
-                break;
-            }
+            hub.broadcast(Message::Binary(audio.into()));
             audio_seq = audio_seq.wrapping_add(1);
         }
 
@@ -262,7 +321,8 @@ fn stream_loop(state: SharedState, out: UnboundedSender<Message>, stop: Arc<Atom
     }
 
     // ── Teardown: clear the SID hook so the byte-exact (None) path is restored. ──
-    if let Ok(mut st) = state.lock() {
+    let teardown = state.lock();
+    if let Ok(mut st) = teardown {
         st.session.machine.sid.set_write_trace(None);
     }
 }
