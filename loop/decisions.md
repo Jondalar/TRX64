@@ -1344,3 +1344,18 @@ identical on main = unchanged). NOT ported: the J2 derived_asset trace-chain (no
 runtime_generated paths complete). No live-c64re diff (no vic/inspect oracle corpus; wire-shape locked via unit
 tests vs ws-server.ts). NEXT: the WS-notification tail (broadcast-push: audio/flush+batch/progress+debug/
 breakpoint_hit on the hub) + checkpoint/thumbnails, then integration.
+
+## ADR-086 — WS notification surface: broadcast-push + checkpoint/thumbnails (the WS tail)
+NotifyHub (streaming.rs) = 1:1 of c64re's this.broadcast (ws-server.ts:258) — a JSON-RPC notification {jsonrpc,
+method,params} with NO id, fanned to all clients over the SAME mpsc->writer channel that carries responses + the
+BIN A/V frames (ADR-073). Unlike the --stream-gated StreamHub, NotifyHub is always in State (works for command-
+driven oracle daemons). Wired 3 broadcasts: debug/breakpoint_hit {session_id,pc,num,cycles,registers[VICE
+registerDump]} (+ debug/observer_hit for load/store watchpoints) from run_debug_control at the ADR-071 halt;
+batch/progress {batchId,completed,total,currentId} + terminal done/error per scenario; audio/flush {session_id}
+on audio-timeline discontinuity (reset/restore/undump). checkpoint/thumbnails {thumbnails:[{id,cycles,frame,
+pinned,width,height,palette:b64,indices:b64}]} rendered from each ring checkpoint's stored vicPresentation fb
+(96x68 downscale + COLODORE palette, 1:1 makeCheckpointThumbnail — more faithful than c64re's live-only grab).
+57 daemon tests (7 new), byte-exact ALL GREEN (seven_game incl g8_maniac@600M, iso_vic, vsf, resid, iec_load).
+Daemon-only (streaming.rs+main.rs). NotifyHub trivially supports the other c64re broadcasts (debug/running|paused
+|stopped, session/frame_available, media/cart_persisted) — each a one-line broadcast() if a later task wants them.
+NEXT + LAST: integration (full PRG-corpus end-to-end validation) -> feature-complete-vs-TS-headless.

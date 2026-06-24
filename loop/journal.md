@@ -775,3 +775,8 @@ User asked to run maniac longer to its menu. Added GATE_BUDGET env override to s
 unchanged). At 600M cycles maniac renders its CHARACTER-SELECT MENU cleanly (logo + START + 7 portraits +
 selection box; 6 colors, 679/1000 chars). Was NOT a render bug — the slow G64 standard-serial multi-file loader
 just needed more time (black at 100M = mid-load). Confirms renderer + loader correct.
+
+## 2026-06-24 — DRIVER: WS notification surface (ADR-086) — broadcast-push + thumbnails
+
+NotifyHub 1:1 c64re broadcast; debug/breakpoint_hit + batch/progress + audio/flush wired; checkpoint/thumbnails.
+57 daemon tests, byte-exact all green. Only integration left. Next: integration (the LAST item).

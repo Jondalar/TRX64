@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "ws-notifications-tail",
+  "current_item": "integration",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -60,19 +60,20 @@
     "drive-write-back",
     "recorder-scenario",
     "audio-media-batch",
-    "vic-inspect-engine"
+    "vic-inspect-engine",
+    "ws-notifications-tail"
   ],
   "note": "vic-inspect merged+done (ADR-085, vic/inspect 9/9). maniac char-select confirmed (user, 600M). NEXT: ws-notifications-tail (broadcast-push + checkpoint/thumbnails), then integration.",
-  "updated": "2026-06-24T20:51:01Z",
+  "updated": "2026-06-24T21:19:10Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
   "in_flight": {
-    "item": "ws-notifications-tail",
+    "item": "integration",
     "model": "opus",
-    "started": "2026-06-24T20:51:01Z",
-    "note": "broadcast-push channel on the hub/writer-task + checkpoint/thumbnails. Wire audio/flush + batch/progress + debug/breakpoint_hit as server-push notifications 1:1 with c64re broadcast; render checkpoint/thumbnails filmstrip. Daemon + hub, additive."
+    "started": "2026-06-24T21:19:10Z",
+    "note": "The LAST item. Full PRG-corpus end-to-end validation: run a broad corpus of PRGs/games through the TRX64 daemon (load/run/render/WS responses) + verify behavioral parity with c64re. The feature-complete-vs-TS proof at scale."
   },
   "stage2_items": [],
   "resolved": [

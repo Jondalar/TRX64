@@ -25,7 +25,7 @@ Stand: 47 done, ~278 commits. Legend: ✅ done · 🔄 in progress · ⬜ open
 - [x] audio/* (3) + media/* (9) + batch/* (3) WS  (mechanisch)
 - [x] **Flash-Cart writable** (Flash040+M93C86, EasyFlash/GMOD2 booten) — Flash040 + EAPI + m93c86 + EasyFlash/GMOD/MegaCart  (~1.5 KLOC, groß)
 - [x] **Drive write-back** (.g64/.d64 persist, D64+G64 round-trip) — .g64/.d64 schreiben (fsimage_gcr_write_half_track)
-- [ ] integration — breiter PRG-Corpus end-to-end Validierung
+- [ ] 🔄 integration — breiter PRG-Corpus end-to-end Validierung
 
 ## Grob
 ~85% durch. Offen: 1× läuft (checkpoint-ring) + 5 Items. Davon 2 groß (checkpoint-ring, flash-write), Rest mechanisch/mittel.
