@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "(explicit plan complete — awaiting user steer)",
+  "current_item": "cartridge-sid-parity (planning via arch-map)",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -45,12 +45,17 @@
     "perf-compare"
   ],
   "note": "EXPLICIT PLAN COMPLETE: scramble custom-loader acid test + 7-game gate 7/7 + perf compare (~8-10x) all DONE. Loop focus chain (dd00-atn-irq->scramble->render->7-game) fully done. Stale backlog cleaned (cia-cascade, drive-via2 were already done). Remaining backlog = broader drop-in surface (protocol-surface, snapshot-vsf, integration, sid) — NOT user-prioritized; not auto-launching (Not eager). Awaiting user direction for the next phase.",
-  "updated": "2026-06-24T10:37:38Z",
+  "updated": "2026-06-24T10:51:37Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "ts-core-architecture-map",
+    "model": "workflow",
+    "started": "2026-06-24T10:51:37Z",
+    "note": "read-only arch-map workflow (wf_c4858a98-4bc): 7 subsystem mappers + synthesis. Answers user arch Qs (monitor core-or-separate; obs/bk/trace as tick hooks) + scopes cartridge/SID/parity. NEW PHASE: user steered to cartridge+SID+feature-parity-with-TS. NO auto-build, plan feeds discussion first."
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
