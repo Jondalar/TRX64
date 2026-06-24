@@ -403,3 +403,278 @@ fn behavioral_magicdesk_boots_into_cart() {
         eprintln!("PASS (cart executed; frame still blank in budget — decrunch in progress).");
     }
 }
+
+// ── WRITABLE FLASH TIER: program/erase/EEPROM round-trips + write-back ────────
+
+/// Build a minimal EasyFlash CRT (hw=32). `banks` chips: each (bank, load, data).
+/// EasyFlash boots ultimax (exrom=1, game=0) so the reset vector is in ROMH.
+fn build_easyflash_crt(chips: &[(u16, u16, Vec<u8>)]) -> Vec<u8> {
+    build_crt(32, 1, 0, "EF", chips)
+}
+
+/// Drive the AMD AM29F040B byte-program command sequence through the EasyFlash
+/// mapper's flash-low chip (ROML window, ultimax mode): AA→55→A0→<addr,data>.
+/// The mapper write hook stores to flash ONLY in ultimax; EasyFlash boots
+/// ultimax (register_02=0 → memconfig ULTIMAX), so $8000-$9FFF writes program
+/// the low flash. The magic addresses ($555/$2AA) live in the low 11 bits, so a
+/// store to $8000|magic hits the chip's magic1/2 in bank 0.
+#[test]
+fn easyflash_flash_program_then_readback() {
+    // Bank 0: ROML + ROMH both 0xFF (erased flash). One 16K chip ($8000, 0x4000)
+    // gives bank 0 ROML+ROMH; that's the simplest 2-chip-equivalent layout.
+    let mut bank0 = vec![0xffu8; 0x4000];
+    // Put a reset vector in ROMH so the (unused-here) boot would be valid.
+    bank0[0x3ffc] = 0x00;
+    bank0[0x3ffd] = 0x80;
+    let crt = build_easyflash_crt(&[(0, 0x8000, bank0)]);
+    let (_img, mut m) = load_cartridge_from_bytes(&crt, "EF", None).unwrap();
+    assert_eq!(m.mapper_type(), MapperType::EasyFlash);
+
+    // EasyFlash boots ultimax: register_02 = 0 → exrom=1, game=0.
+    assert_eq!(m.get_lines().exrom, 1);
+    assert_eq!(m.get_lines().game, 0);
+
+    // Program 0x42 into ROML offset 0x100 (bank 0). The AMD sequence addresses use
+    // the magic offsets in the $8000 window: $8000|0x555 = $8555, $8000|0x2AA=$82AA.
+    assert!(m.write(0x8555, 0xaa, &bi(), 10));
+    assert!(m.write(0x82aa, 0x55, &bi(), 11));
+    assert!(m.write(0x8555, 0xa0, &bi(), 12)); // byte-program command
+    assert!(m.write(0x8100, 0x42, &bi(), 13)); // program 0x42 at ROML $0100
+    // Readback through the bus read path (FSM is back in READ → array byte).
+    assert_eq!(m.read(0x8100, &bi(), 14), Some(0x42));
+    assert!(m.is_writable_dirty(), "flash must report dirty after a program");
+
+    // Program a second byte to prove the chip stays writable.
+    assert!(m.write(0x8555, 0xaa, &bi(), 20));
+    assert!(m.write(0x82aa, 0x55, &bi(), 21));
+    assert!(m.write(0x8555, 0xa0, &bi(), 22));
+    assert!(m.write(0x8101, 0x99, &bi(), 23));
+    assert_eq!(m.read(0x8101, &bi(), 24), Some(0x99));
+
+    // The writable image carries the programmed bytes (lo flash, offset 0x100/0x101).
+    let img = m.writable_image(25).expect("EasyFlash has a writable image");
+    assert_eq!(img[0x100], 0x42);
+    assert_eq!(img[0x101], 0x99);
+}
+
+/// EasyFlash sector erase via the AMD 6-write sequence (AA 55 80 AA 55 30) wipes
+/// the sector to 0xFF after the lazy erase-alarm window elapses.
+#[test]
+fn easyflash_sector_erase_lazy_clk() {
+    // Bank 0 ROML pre-filled with 0x00 so we can see the erase to 0xFF.
+    let mut bank0 = vec![0x00u8; 0x4000];
+    bank0[0x3ffc] = 0x00;
+    bank0[0x3ffd] = 0x80;
+    let crt = build_easyflash_crt(&[(0, 0x8000, bank0)]);
+    let (_img, mut m) = load_cartridge_from_bytes(&crt, "EF", None).unwrap();
+
+    // Sector-erase command sequence at clk 0 (sector 0 = $00000-$0FFFF).
+    m.write(0x8555, 0xaa, &bi(), 0);
+    m.write(0x82aa, 0x55, &bi(), 0);
+    m.write(0x8555, 0x80, &bi(), 0);
+    m.write(0x8555, 0xaa, &bi(), 0);
+    m.write(0x82aa, 0x55, &bi(), 0);
+    m.write(0x8000, 0x30, &bi(), 0); // sector 0 erase armed
+    // A read well past the timeout (50) + sector cycles (1_000_000) catches the
+    // lazy alarm up → sector 0 wiped to 0xFF.
+    let _ = m.read(0x9000, &bi(), 2_000_000);
+    assert_eq!(m.read(0x8000, &bi(), 2_000_001), Some(0xff));
+    assert_eq!(m.read(0x9fff, &bi(), 2_000_002), Some(0xff));
+}
+
+/// EasyFlash $DE00 bank register + $DE02 mode register drive banking + the
+/// EXROM/GAME lines. VICE easyflash_memconfig is indexed by register_02&7 =
+/// (mode<<2)|(!exrom<<1)|game (jumper in bit3). So register_02=2 → !exrom=1,
+/// game=0 → 16K (exrom=0,game=0); register_02=0 → ultimax (boot).
+#[test]
+fn easyflash_bank_and_mode_register() {
+    // 2 banks; bank N ROML[0] = N.
+    let chips: Vec<(u16, u16, Vec<u8>)> = (0..2u16)
+        .map(|n| {
+            let mut d = vec![0xffu8; 0x2000];
+            d[0] = n as u8;
+            (n, 0x8000, d)
+        })
+        .collect();
+    let crt = build_easyflash_crt(&chips);
+    let (_img, mut m) = load_cartridge_from_bytes(&crt, "EF", None).unwrap();
+
+    // Boot: register_02 = 0 → ultimax (exrom=1, game=0).
+    assert_eq!(m.get_lines().exrom, 1);
+    assert_eq!(m.get_lines().game, 0);
+    // $DE02 = 2 → memconfig index 2 = 16K game (exrom=0, game=0).
+    assert!(m.write(0xde02, 0x02, &bi(), 0));
+    assert_eq!(m.get_lines().exrom, 0);
+    assert_eq!(m.get_lines().game, 0);
+    // $DE00 bank = 1 → ROML[0] reads 1.
+    assert!(m.write(0xde00, 0x01, &bi(), 0));
+    assert_eq!(m.read(0x8000, &bi(), 0), Some(1));
+    // $DE04 mirrors $DE00 (addr & 2 == 0); $DE06 mirrors $DE02 (addr & 2).
+    assert!(m.write(0xde04, 0x00, &bi(), 0)); // bank 0
+    assert_eq!(m.read(0x8000, &bi(), 0), Some(0));
+}
+
+/// GMOD2 M93C86 EEPROM write-then-read round-trip through the mapper's IO1
+/// ($DE00) serial protocol: a full EWEN + WRITE + READ shift sequence persists
+/// a 16-bit word and reads it back on the EEPROM DO bit (IO1 read bit 7).
+#[test]
+fn gmod2_eeprom_write_read_roundtrip() {
+    let crt = build_crt(60, 0, 1, "G2", &[(0, 0x8000, vec![0xffu8; 0x2000])]);
+    let (_img, mut m) = load_cartridge_from_bytes(&crt, "G2", None).unwrap();
+    assert_eq!(m.mapper_type(), MapperType::Gmod2);
+
+    // GMOD2 IO1 ($DE00): bit6 = EEPROM CS, bit5 = CLK, bit4 = DI. The cart bank is
+    // bits 0-5 (CS bit6 also selects cmode). We drive CS=1 (bit6) so cmode=off,
+    // then clock the serial command in. Helper: write a $DE00 byte = base | lines.
+    // CS=1 keeps the EEPROM selected; pulse CLK (bit5) high then low per bit; DI
+    // is bit4.
+    let mut io1 = |m: &mut Box<dyn trx64_core::cart::CartMapper>, cs: u8, clk: u8, di: u8| {
+        let v = (cs << 6) | (clk << 5) | (di << 4);
+        m.write(0xde00, v, &bi(), 0);
+    };
+    // Shift one bit MSB-first: set DI with CLK low, then raise CLK, then lower.
+    let mut shift = |m: &mut Box<dyn trx64_core::cart::CartMapper>, di: u8| {
+        io1(m, 1, 0, di);
+        io1(m, 1, 1, di);
+        io1(m, 1, 0, di);
+    };
+
+    // Deassert then assert CS to reset the input shiftreg.
+    io1(&mut m, 0, 0, 0);
+    io1(&mut m, 1, 0, 0);
+    // EWEN = start(1) 00 11 + pad to 13 clocks.
+    for b in [1u8, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0] {
+        shift(&mut m, b);
+    }
+    // New command: deassert/reassert CS.
+    io1(&mut m, 0, 0, 0);
+    io1(&mut m, 1, 0, 0);
+    // WRITE: start(1) 01 + 10-bit addr (0x004) + 16-bit data (0x5AA5) = 29 clocks.
+    let mut wbits = vec![1u8, 0, 1];
+    for i in (0..10).rev() {
+        wbits.push(((0x004u32 >> i) & 1) as u8);
+    }
+    for i in (0..16).rev() {
+        wbits.push(((0x5AA5u32 >> i) & 1) as u8);
+    }
+    for b in wbits {
+        shift(&mut m, b);
+    }
+    // Falling CS commits the write.
+    io1(&mut m, 0, 0, 0);
+    assert!(m.is_writable_dirty(), "GMOD2 EEPROM must be dirty after a write");
+
+    // READ back: start(1) 10 + 10-bit addr (0x004) = 13 clocks → CMDREADDUMMY.
+    io1(&mut m, 1, 0, 0);
+    let mut rbits = vec![1u8, 1, 0];
+    for i in (0..10).rev() {
+        rbits.push(((0x004u32 >> i) & 1) as u8);
+    }
+    for b in rbits {
+        shift(&mut m, b);
+    }
+    // Clock out 16 data bits; each IO1 read returns DO in bit 7 (CS asserted).
+    let mut word: u32 = 0;
+    for _ in 0..16 {
+        io1(&mut m, 1, 1, 0); // rising CLK shifts the next bit out
+        let dout = (m.read(0xde00, &bi(), 0).unwrap() >> 7) & 1;
+        word = (word << 1) | dout as u32;
+        io1(&mut m, 1, 0, 0); // falling CLK
+    }
+    assert_eq!(word, 0x5AA5, "EEPROM read-back must match the written word");
+
+    // The writable image carries the EEPROM bytes after the flash array.
+    let img = m.writable_image(0).expect("GMOD2 has a writable image");
+    // flash = 64 banks * 0x2000 = 0x80000; EEPROM word 0x004 at byte 0x008/0x009.
+    assert_eq!(img[0x80000 + (0x004 << 1)], 0x5A);
+    assert_eq!(img[0x80000 + (0x004 << 1) + 1], 0xA5);
+}
+
+/// EasyFlash write-back: program a byte, snapshot the writable image, load it into
+/// a fresh mapper, and confirm the programmed byte persisted (the save survives a
+/// detach/reattach via the image).
+#[test]
+fn easyflash_writeback_persists_across_image_roundtrip() {
+    let mut bank0 = vec![0xffu8; 0x4000];
+    bank0[0x3ffc] = 0x00;
+    bank0[0x3ffd] = 0x80;
+    let crt = build_easyflash_crt(&[(0, 0x8000, bank0)]);
+    let (_img, mut m) = load_cartridge_from_bytes(&crt, "EF", None).unwrap();
+    // Program 0x37 at ROML $0042.
+    m.write(0x8555, 0xaa, &bi(), 0);
+    m.write(0x82aa, 0x55, &bi(), 0);
+    m.write(0x8555, 0xa0, &bi(), 0);
+    m.write(0x8042, 0x37, &bi(), 0);
+    let saved = m.writable_image(0).expect("image");
+
+    // Fresh mapper from the same CRT (blank flash), then load the saved image.
+    let (_img2, mut m2) = load_cartridge_from_bytes(&crt, "EF", None).unwrap();
+    assert_eq!(m2.read(0x8042, &bi(), 0), Some(0xff)); // blank before load
+    m2.set_writable_image(&saved);
+    assert_eq!(m2.read(0x8042, &bi(), 0), Some(0x37)); // persisted after load
+}
+
+// ── BEHAVIORAL: a real EasyFlash CRT boots into the cart (ROM-gated) ──────────
+
+const EF_SAMPLE: &str =
+    "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/AccoladeComics_TRX+1D_EF.crt";
+
+#[test]
+#[ignore = "needs ROMs + the AccoladeComics_TRX+1D_EF.crt sample; run with --ignored"]
+fn behavioral_easyflash_boots_into_cart() {
+    use std::path::Path;
+    use trx64_core::{Machine, NullSink};
+
+    if !Path::new(ROM_DIR).join("kernal-901227-03.bin").exists() {
+        eprintln!("SKIP: ROMs absent");
+        return;
+    }
+    let crt = match std::fs::read(EF_SAMPLE) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("SKIP: {EF_SAMPLE} absent");
+            return;
+        }
+    };
+
+    let mut m = Machine::new();
+    m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+    let (name, ty) = m.attach_cart_from_bytes(&crt, "EF").expect("attach CRT");
+    eprintln!("attached: {name} ({ty:?})");
+    assert_eq!(ty, MapperType::EasyFlash);
+    m.cold_reset();
+
+    // EasyFlash boots ultimax: the $FFFC reset vector comes from the cart's ROMH
+    // (hi flash), so the machine reboots INTO the cart. Run a budget and record
+    // whether the CPU ever executes inside a cart window ($8000-$9FFF ROML or the
+    // ultimax $E000-$FFFF ROMH), and whether a non-blank frame paints.
+    let mut sink = NullSink;
+    let mut reached_cart = false;
+    let mut max_colors = 0usize;
+    for _ in 0..200 {
+        m.run_for_full(50_000, &mut sink, |_, _, _, _, _, _, _| {});
+        let pc = m.cpu.pc;
+        if (0x8000..=0x9fff).contains(&pc) || (0xe000..=0xffff).contains(&pc) {
+            reached_cart = true;
+        }
+        let (_w, _h, rgba) = m.render_canvas_rgba();
+        let mut colors = std::collections::HashSet::new();
+        for px in rgba.chunks_exact(4) {
+            colors.insert((px[0], px[1], px[2]));
+        }
+        max_colors = max_colors.max(colors.len());
+    }
+    eprintln!(
+        "reached_cart={reached_cart} max_distinct_colors={max_colors} final_pc=${:04X}",
+        m.cpu.pc
+    );
+    assert!(
+        reached_cart,
+        "CPU never executed inside a cart window — the machine did not boot into the EasyFlash cart"
+    );
+    if max_colors > 1 {
+        eprintln!("PASS: EasyFlash executed + a non-blank frame rendered.");
+    } else {
+        eprintln!("PASS (EasyFlash executed; frame still blank in budget).");
+    }
+}
