@@ -62,12 +62,17 @@
     "audio-media-batch"
   ],
   "note": "audio/media/batch DONE (ADR-084): 9 methods full parity, 255 tests. Broadcast push (audio/flush+batch/progress+debug/breakpoint_hit) = small follow-up on the hub. NEXT: vic-inspect-engine = the 6 deferred vic/inspect methods (open/at/region/at_capture/origin/promote) + the node/origin/evidence engine (buildVicInspectSnapshot/resolveVisibleNodeAt/resolveVisualOrigin/assembleInspectEvidence) on the checkpoint ring. Then checkpoint/thumbnails, broadcast-push, integration.",
-  "updated": "2026-06-24T20:19:03Z",
+  "updated": "2026-06-24T20:21:09Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "vic-inspect-engine",
+    "model": "opus",
+    "started": "2026-06-24T20:06:00Z",
+    "note": "in_flight omitted at dispatch last tick - corrected. Builder a62901f running, reading c64re vic-inspect engine source (no commits yet ~15min = read phase for the semantic node/origin engine)."
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
