@@ -1231,3 +1231,18 @@ behavior is wrong -> back out). This is "effectively a second snapshot model" �
 serialization as the VSF modules, plus the drive blob + literal-VIC), built incrementally. The container framing
 (magic C64RESNP + ver + sha256(gzBody) + gzip(JSON {manifest,checkpoint,mediaPayloads})) is trivial; the payload
 shapes are the work.
+
+## ADR-078 — .c64re full RuntimeCheckpoint (B): cross-runtime PROVEN for the full C64 state; drive blob remains
+Implemented the .c64re native runtime-snapshot (Option B, ADR-077) 1:1 with the c64re TS runtime. CROSS-RUNTIME
+ROUND-TRIP PROVEN BOTH WAYS for the complete C64 state vs a live c64re daemon: TRX64-dump -> c64re snapshot/
+undump restores (pc/cycle/regs), c64re-dump -> TRX64 undump restores byte-identical CPU regs + resumes. New:
+native_snapshot.rs (container C64RESNP + ver + sha256 + gzip + the $ta typed-array JSON codec), c64re_snapshot.rs
+(the RuntimeCheckpoint structs + capture/restore: cpu/ram/cia1/cia2/sid/iec/cpuIntStatus/vic[full
+LiteralVicSnapshot+DrawCycle pipeline]/vicPresentation[2x 520x312 fb]/keyboard/media all 1:1), additive c64re_*
+snapshot accessors on sid.rs + vic.rs (read-only, no logic change), vice_snapshot_stream.rs (the VICE module-
+stream framing = the part-4 foundation), daemon snapshot/dump|undump now write/read the .c64re container.
+173 tests pass, all byte-exact gates GREEN (additive serialization). REMAINING: cp.drive1541 = null — the VICE
+drive snapshot-module blob (DRIVE+DRIVECPU+VIA1+VIA2+GCRIMAGE, ~1.6 KLOC byte-exact) is NOT ported; the builder
+shipped the foundation but correctly did NOT ship a guessed partial blob (would corrupt c64re's drive read).
+So the full C64 state is cross-runtime; drive resume is the follow-up (snapshot-drive-blob). NEXT: snapshot-
+drive-blob (port drive_snapshot/drivecpu_snapshot/viacore_snapshot x2/GCRIMAGE on vice_snapshot_stream.rs).

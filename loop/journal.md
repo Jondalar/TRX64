@@ -734,3 +734,9 @@ when nothing held). 150 tests, byte-exact green. Next: snapshot-vsf cross-runtim
 c64re-own VSF: 9 CIA byte-diffs fixed, all machine-state modules byte-identical, live round-trip both ways vs
 c64re daemon. Real-VICE read: motm.vsf loads + renders the game menu (resume bug fixed - seed c64_core). 152
 tests, 7/7 gate, byte-exact green. Next: .c64re container (dump/undump).
+
+## 2026-06-24 — DRIVER: .c64re full RuntimeCheckpoint (ADR-078) — cross-runtime C64 state both ways
+
+native_snapshot.rs + c64re_snapshot.rs + vice_snapshot_stream.rs + daemon. Cross-runtime round-trip PROVEN both
+ways for the full C64 state vs live c64re (TRX64-dump->c64re-undump + c64re-dump->TRX64-undump, byte-identical
+regs). 173 tests, byte-exact green. Remaining: cp.drive1541 blob (snapshot-drive-blob). Next: that.

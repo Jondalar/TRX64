@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "snapshot-c64re-container",
+  "current_item": "snapshot-drive-blob (cp.drive1541 VICE drive snapshot module)",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -52,20 +52,16 @@
     "protocol-surface-b1",
     "runtime-controller-av-push",
     "protocol-surface-b2",
-    "snapshot-vsf"
+    "snapshot-vsf",
+    "snapshot-c64re-container"
   ],
-  "note": "snapshot-vsf DONE (ADR-076): c64re-own VSF byte-parity round-trip both ways + read real-VICE (motm.vsf loads+renders game menu). 152 tests, 7/7 gate. NEXT: .c64re container (snapshot/dump|undump = magic C64RESNP + format-ver + sha256 + gzip(JSON RuntimeCheckpoint) + embedded media; round-trip vs c64re) - source native-snapshot.ts. Then checkpoint-ring.",
-  "updated": "2026-06-24T17:44:02Z",
+  "note": ".c64re container DONE (ADR-078): cross-runtime proven both ways for the full C64 state (TRX64<->c64re), 173 tests, byte-exact. REMAINING: cp.drive1541 blob (DRIVE/DRIVECPU/VIA1/VIA2/GCRIMAGE ~1.6 KLOC on vice_snapshot_stream.rs foundation) for cross-runtime drive resume. Then: checkpoint-ring, recorder/scenario, audio/media/batch, flash-write, drive-write, integration.",
+  "updated": "2026-06-24T18:15:15Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": {
-    "item": "snapshot-c64re-container",
-    "model": "opus",
-    "started": "2026-06-24T17:44:02Z",
-    "note": "Option B (ADR-077): full RuntimeCheckpoint .c64re, Rust 1:1 with TS, cross-runtime both ways. Container framing + cp.cpu/ram/cia/sid/iec/intstatus/alarms (C64-side, have state) + cp.vic LiteralVicSnapshot + cp.drive1541 VICE drive blob. Additive drive/VIC state-serialization allowed (logic unchanged, byte-exact gates guard). Incremental."
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
