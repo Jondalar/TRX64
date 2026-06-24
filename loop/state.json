@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "av-recording-mp4",
+  "current_item": "sprite-render-verbatim (static render -> per-cycle/per-line sprite draw)",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -44,20 +44,16 @@
     "seven-game-gate",
     "perf-compare",
     "cartridge",
-    "sid-resid"
+    "sid-resid",
+    "av-recording-mp4"
   ],
-  "note": "SID reSID DONE (ADR-068): bound the vendored C++ via cc-FFI, byte-deterministic, iso-sid byte-exact GREEN, 113 tests. Audio agrees with c64re within <=5 LSB (emscripten-musl vs macOS libm table-rounding, root-caused, inaudible). Cartridge+SID both done. Remaining parity: Phase0 tick hooks + breakpoints + WS surface (rund machen). OPEN: accept libm bound vs chase byte-identity.",
-  "updated": "2026-06-24T12:07:09Z",
+  "note": "USER FINDING: render.rs is a STATIC single-pass renderer (sprites drawn once at final regs) -> scramble sprite-multiplexer + border-sprites collapse = garbled logo (ADR-062 only fixed the data address). Maniac: gate did not reach its char-select screen (slow loader) - needs longer run to judge. mp4 audio recording done (scramble_trx64.mp4, 120s, reSID tune plays). NEXT: verbatim sprite render (per-cycle vicii-draw-cycle into the tick, OR per-line register snapshot) to fix multiplexing + border. Awaiting user scope steer.",
+  "updated": "2026-06-24T12:20:15Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": {
-    "item": "av-recording-mp4",
-    "model": "opus",
-    "started": "2026-06-24T12:07:09Z",
-    "note": "in-crate scramble A/V recording -> scramble_trx64.mp4 (2min, render.rs frames + reSID audio, ffmpeg mux). For user to evaluate the reSID audio bound. ws-av-tap needs the unbuilt daemon A/V push (parity follow-up)."
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
