@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "drive-1to1-viacore",
+  "current_item": "drive-1to1-rotation",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -34,19 +34,16 @@
     "c64-verbatim-cpu",
     "vic-verbatim",
     "dd00-atn-irq",
-    "render-verbatim"
+    "render-verbatim",
+    "drive-1to1-viacore"
   ],
-  "note": "USER DIRECTIVE: the Rust drive layer is distilled (2553 lines) not a 1:1 port of the TS classes (7719). Port the TS drive classes 1:1 (viacore.ts/via1d/via2d/rotation.ts/iecbus.ts/drivecpu.ts), verbatim, no adaptation/type-changes/adapted-fns. Start: viacore.ts -> viacore.rs + VIA2 (the $EC3F LDA $1C00 read-value divergence). The drive 6510 core is already 1:1 (byte-exact). Byte-exact disk gates = safety net.",
-  "updated": "2026-06-24T05:44:32Z",
+  "note": "1:1 port WORKS (ADR-058): viacore.ts->viacore.rs (VIA2), byte-exact, scramble advanced end4->end6. Continue 1:1 port of distilled drive classes. Next: rotation.ts -> rotation.rs 1:1 (the disk byte-ready/SYNC the custom loader polls; rotation.rs 472 vs TS 928 = distilled). Then via1d/iecbus/drivecpu 1:1.",
+  "updated": "2026-06-24T06:22:28Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": {
-    "item": "drive-1to1-viacore",
-    "model": "opus",
-    "started": "2026-06-24T05:44:32Z"
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"

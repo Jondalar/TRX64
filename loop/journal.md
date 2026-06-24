@@ -599,3 +599,10 @@ gameplay (7-game-gate). + Invalid-mode fg/priority mask. cargo test 90 passed, r
 pixel-exact (read-only side state). full.rs/lib.rs = collision read-routing only (not the escalated
 cross-domain coupling). The ONE remaining blocker: the cross-domain IEC coupling (dd00-fast-transfer/ADR-055)
 for the scramble custom loader — escalated, awaiting user.
+
+## 2026-06-24 — DRIVER: 1:1 port works — viacore.ts→viacore.rs; scramble end4→end6 (ADR-058)
+
+User directive (the lesson): port the TS drive classes 1:1, not distill. Did viacore.rs (1881, 1:1 viacore.ts
++ alarm-context.ts + via2d.ts) — the AlarmContext the distilled version lacked. VIA2 wired; distilled Via6522
+VIA2 path deleted. drive-boot-deep byte-exact (VIA2-IRQ faithful) + all gates + 90 tests GREEN. scramble
+ADVANCED: divergence end4→end6 (2 checkpoints further). The 1:1 approach confirmed. Next: rotation.ts 1:1.

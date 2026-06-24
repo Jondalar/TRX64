@@ -875,3 +875,22 @@ read-clear is real; the full per-cycle pixel pipeline is a future refinement onl
 partial-collision timing.
 STATUS: render gameplay-critical gap closed. The ONE remaining blocker = the escalated cross-domain IEC
 coupling (dd00-fast-transfer / ADR-055) for the scramble custom $DD00 loader — awaiting user go.
+
+## ADR-058 — 1:1 port works: viacore.ts → viacore.rs (VIA2); scramble advanced end4→end6
+USER DIRECTIVE (the lesson, same as CPU/VIC): the c64re emulator only got correct when the VICE classes were
+rebuilt 1:1; TRX64's drive layer is DISTILLED (drive.rs/rotation.rs/iec.rs/full.rs = 2553 lines) vs the TS
+classes (viacore/via1d/via2d/rotation/iecbus/drivecpu = 7719 lines). Port the TS drive classes 1:1, no
+adaptation/type-changes/adapted-fns. First: viacore.rs (1881 lines) = 1:1 viacore.ts + alarm-context.ts +
+via2d.ts (every viacore_* fn verbatim with ts: tags, the AlarmContext the distilled version LACKED, the
+Via2dBackend store/read/stepper/motor/SYNC). VIA2 wired to it; the distilled Via6522 VIA2 path + adapted
+helpers (via2_ports_live / via2_store_prb_effects / via2_store_pcr_effects / via2_pb_output) DELETED. VIA1
+stays on the old path this step.
+RESULT: all byte-exact gates GREEN (drive-boot-deep byte-exact = the VIA2 timer/IFR watchdog IRQ faithful),
+90 tests. And scramble ADVANCED — scramble-load-progress first divergence moved end4 ($AE 0 vs 4) → end6 (31
+vs 33), 2 checkpoints further; end-state still byte-exact (scramble-load-file GREEN). The 1:1 approach is
+confirmed: the distilled drive layer was the cause, the 1:1 ports fix it incrementally.
+NEXT (continue the 1:1 port of the remaining distilled classes): rotation.ts (rotation.rs 472 vs TS 928 — the
+disk byte-ready/SYNC the custom loader polls), then via1d1541.ts (VIA1 → viacore), iecbus.ts (iec.rs 171 vs TS
+899), drivecpu.ts (the cross-domain catch-up — no Rust 1:1 counterpart yet). Each byte-exact validated, each
+advances scramble. (Pre-existing REDs unchanged: iso-vic-badline-irq/-sprites/-probe = VIC-cycle gaps vic.rs;
+a clippy error in sid.rs is pre-existing.)
