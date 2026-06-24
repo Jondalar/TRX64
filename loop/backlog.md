@@ -76,7 +76,7 @@ one-line first-divergence). Driver model: `sonnet`. Verifier model: `haiku`.
 
 ## Deferred
 
-- [ ] `sid` — todo — `[model: sonnet]` — audio, not in cycle-trace path. Port last /
+- [x] `sid` (DONE: reSID cc-FFI, ADR-068) — todo — `[model: sonnet]` — audio, not in cycle-trace path. Port last /
       Phase 1.5.
 
 ---

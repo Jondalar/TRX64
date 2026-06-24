@@ -697,3 +697,9 @@ render.rs static -> vic_draw.rs 1:1 vicii-draw-cycle into the per-cycle tick. Re
 identical, byte-exact GREEN, scramble multiplexed SCRAMBLE logo + border sprites render clean (0-diff). The
 renderer is now verbatim per-cycle (last so-aehnlich->wie-vice piece). maniac=black (slow loader). Next
 autonomous: Phase0 tick hooks + breakpoints + WS surface.
+
+## 2026-06-24 — DRIVER: Phase0 observability tick hooks (ADR-070); builder stalled, Driver merged
+
+3 hooks: on_interrupt in the full SC path, run-loop breakpoints + RunStop enum, on_access watch gate. All
+zero-cost-when-off, byte-exact GREEN. 3 hook tests pass (on_interrupt 15x, breakpoint halt, access-watch halt).
+Builder stalled on a slow gate-suite run; Driver validated + merged. Next: breakpoint policy layer.

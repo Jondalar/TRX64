@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "phase0-tick-hooks",
+  "current_item": "breakpoint-policy-layer (ObserverRegistry + cond-AST)",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -46,20 +46,16 @@
     "cartridge",
     "sid-resid",
     "av-recording-mp4",
-    "sprite-render-verbatim"
+    "sprite-render-verbatim",
+    "phase0-tick-hooks"
   ],
-  "note": "VERBATIM PER-CYCLE RENDER DONE (ADR-069): render gates 22/22 pixel-identical, byte-exact GREEN, scramble multiplexed logo + border sprites CLEAN (0-diff). The renderer is now verbatim (last so-aehnlich piece). maniac=black (slow loader, not render). NEXT autonomous rund-machen: Phase0 tick hooks (on_interrupt in do_interrupt + run-loop breakpoint param/abort + on_access bus gate, per ADR-066), then breakpoint policy layer, then WS surface coverage.",
-  "updated": "2026-06-24T14:05:46Z",
+  "note": "Phase0 hooks DONE (ADR-070): on_interrupt full-path + run-loop breakpoints/RunStop + on_access watch, all zero-cost-when-off, byte-exact GREEN, 3 hook tests pass. NEXT: breakpoint policy layer (ObserverRegistry + cond-AST over the new hooks, daemon-side) -> then protocol-surface (WS) -> snapshot-vsf -> integration. (sid backlog item is STALE - reSID done, remove.)",
+  "updated": "2026-06-24T14:54:14Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": {
-    "item": "phase0-tick-hooks",
-    "model": "opus",
-    "started": "2026-06-24T14:05:46Z",
-    "note": "Phase0 tick hooks (ADR-066): on_interrupt fire in c64_6510core::do_interrupt (full-path interrupt-serviced edge, ~15 LOC), run-loop abort-reason enum + optional breakpoints param + exec-watch/halt checks (~50 LOC, port integrated-session.ts:973-992), on_access bus watch gate at FullScBus read_raw/write_raw (~30 LOC, port cpu65xx-vice.ts:468/495). All zero-cost when off (None) -> byte-exact gates must stay GREEN."
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"

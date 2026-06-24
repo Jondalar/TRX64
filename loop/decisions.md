@@ -1087,3 +1087,16 @@ lib tests GREEN. The 4 pre-existing REDs (iso-vic-badline-irq/sprites/probe, scr
 (Note: a stray fork committed redundant commits on the branch; tree correct + all gates pass.)
 THE RENDERER IS NOW VERBATIM PER-CYCLE — the last so-aehnlich->wie-vice conversion. CPU/VIC-cycle/drive/render
 all verbatim VICE now. NEXT (rund machen): Phase0 tick hooks + breakpoints + WS surface (autonomous).
+
+## ADR-070 — Phase0 observability tick hooks (on_interrupt full-path + run-loop breakpoints + on_access watch)
+The 3 missing hook points from ADR-066, the foundation for breakpoints/watchpoints. (1) on_interrupt now fires
+in the FULL SC path: c64_6510core::do_interrupt forwards (vector,clk) into obs.on_interrupt at the IRQ/NMI
+vector choice (was dead — only cpu.rs iso-path fired it). (2) run_for_capped/run_for_full_capped gained an
+optional breakpoints (HashSet<u16>) + exec_watch gate + a RunStop enum {Completed, Breakpoint(pc), CycleBudget,
+Observer}: PC-break checked before execute_one, halt_requested after. (3) full_sc.rs read_raw/write_raw gained
+the on_access watch gate (Option access-watch table + on_access->halt, port cpu65xx-vice.ts:468/495), null-when-
+idle. All zero-cost when off (None + NullSink -> monomorphized away). Builder STALLED on a slow gate-suite run
+(blocked ~29min); Driver took over, validated, merged. RESULT: all 3 hooks WORK (tick_hooks_probe: on_interrupt
+fired 15x@$FFFE in the full path; breakpoint halted at $FCE2+$EA31; access-watch on $01FF -> RunStop::Observer)
++ byte-exact gates GREEN (drive-boot-deep, render-boot-basic-ready — zero-cost when off, no regression). The
+POLICY (conditions/actions/hit-counts) is the NEXT item (breakpoint policy layer / ObserverRegistry).
