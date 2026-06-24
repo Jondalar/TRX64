@@ -894,3 +894,12 @@ disk byte-ready/SYNC the custom loader polls), then via1d1541.ts (VIA1 → viaco
 899), drivecpu.ts (the cross-domain catch-up — no Rust 1:1 counterpart yet). Each byte-exact validated, each
 advances scramble. (Pre-existing REDs unchanged: iso-vic-badline-irq/-sprites/-probe = VIC-cycle gaps vic.rs;
 a clippy error in sid.rs is pre-existing.)
+
+## ADR-059 — rotation.ts → rotation.rs 1:1 (byte-exact; scramble unchanged end6 → divergence is IEC-side)
+Continued the 1:1 port of the distilled drive classes. rotation.rs rewritten as a 1:1 port of rotation.ts
+(full VICE rotation.c engine, ~committed 53ac4c3). Byte-exact: drive-boot-deep + disk-read-byteexact GREEN.
+But scramble-load-progress UNCHANGED at end6 (31 vs 33) — so the distilled rotation was already behaviorally
+~equivalent; the end6 divergence is NOT in the disk-read/rotation but in the IEC-handshake side. Merged anyway
+(it is now a faithful 1:1 port, per the directive; removes a distilled approximation). NEXT: iecbus.ts (iec.rs
+171 vs TS 899 — the MOST distilled, the C64<->drive IEC wired-AND bus) — the likely end6 blocker; then
+via1d1541.ts (VIA1 → viacore) + drivecpu.ts (the cross-domain catch-up, no Rust 1:1 counterpart yet).

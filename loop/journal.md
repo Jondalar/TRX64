@@ -606,3 +606,10 @@ User directive (the lesson): port the TS drive classes 1:1, not distill. Did via
 + alarm-context.ts + via2d.ts) — the AlarmContext the distilled version lacked. VIA2 wired; distilled Via6522
 VIA2 path deleted. drive-boot-deep byte-exact (VIA2-IRQ faithful) + all gates + 90 tests GREEN. scramble
 ADVANCED: divergence end4→end6 (2 checkpoints further). The 1:1 approach confirmed. Next: rotation.ts 1:1.
+
+## 2026-06-24 — DRIVER: rotation.ts→rotation.rs 1:1 (ADR-059); end6 divergence is IEC-side
+
+rotation.rs now a 1:1 port of rotation.ts (full rotation.c engine). Byte-exact (drive-boot-deep +
+disk-read-byteexact GREEN). scramble unchanged at end6 -> the divergence is NOT disk/rotation, it's the IEC
+handshake (iecbus/via1/drivecpu still distilled). Merged (faithful 1:1 per directive). Next: iecbus.ts 1:1
+(iec.rs 171 vs TS 899 = most distilled).
