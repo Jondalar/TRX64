@@ -199,9 +199,12 @@ fn write_drive_module(drive: &mut Drive1541, s: &mut SnapshotT) {
     // parallel_cable (unit.parallel_cable) — 0 = DRIVE_PC_NONE.
     s.smw_b(&mut m, 0);
     s.smw_b(&mut m, (r.read_only & 0xff) as u8);
-    // rotation_table_ptr[unr] — the speed/density table index. TRX64 derives the
-    // active table from `frequency`; emit it so the round-trip restores `frequency`.
-    s.smw_dw(&mut m, r.frequency as u32);
+    // rotation_table_ptr[unr] — VICE rotation_table_get writes `speed_zone` here
+    // (rotation.ts:273 / rotation.c:153), NOT `frequency`. (`snap_speed_zone` below
+    // carries the same value; on restore rotation_table_set sets speed_zone from
+    // this field, then snap_speed_zone overwrites it — so this slot MUST be
+    // speed_zone for byte-exact wire parity.)
+    s.smw_dw(&mut m, r.speed_zone as u32);
     s.smw_dw(&mut m, DRIVE_TYPE_1541);
 
     // snap_* rotation fields.
@@ -293,7 +296,10 @@ fn read_drive_module(
     let _idling_method = rb!();
     let _parallel_cable = rb!();
     let read_only = rb!();
-    let rotation_table_ptr = rdw!();
+    // rotation_table_ptr = speed_zone (rotation.ts:322 sets speed_zone from it,
+    // then snap_speed_zone below overwrites — so this leading copy is redundant;
+    // consumed for byte-exact wire position, the snap_speed_zone value wins).
+    let _rotation_table_ptr = rdw!();
     let _type = rdw!();
 
     let accum = rdw!();
@@ -335,7 +341,8 @@ fn read_drive_module(
     r.gcr_read = gcr_read;
     r.gcr_write_value = gcr_write_value;
     r.read_only = read_only as i32;
-    r.frequency = rotation_table_ptr as usize;
+    // `frequency` (1x/2x toggle) is NOT in the VICE DRIVE module — it is derived
+    // live from the speed-zone density and left untouched on restore.
 
     r.accum = accum;
     r.rotation_last_clk = rotation_last_clk;
