@@ -1,6 +1,6 @@
 # TRX64 — Feature-Complete vs c64re TS Headless
 
-Stand: 47 done, ~278 commits. Legend: ✅ done · 🔄 in progress · ⬜ open
+Stand: 48 done, ~281 commits. Legend: ✅ done · 🔄 in progress · ⬜ open
 
 ## Kern — verbatim VICE (✅ komplett + bewiesen)
 - [x] CPU 6510 — x64sc SC core (verbatim)
@@ -25,7 +25,9 @@ Stand: 47 done, ~278 commits. Legend: ✅ done · 🔄 in progress · ⬜ open
 - [x] audio/* (3) + media/* (9) + batch/* (3) WS  (mechanisch)
 - [x] **Flash-Cart writable** (Flash040+M93C86, EasyFlash/GMOD2 booten) — Flash040 + EAPI + m93c86 + EasyFlash/GMOD/MegaCart  (~1.5 KLOC, groß)
 - [x] **Drive write-back** (.g64/.d64 persist, D64+G64 round-trip) — .g64/.d64 schreiben (fsimage_gcr_write_half_track)
-- [ ] 🔄 integration — breiter PRG-Corpus end-to-end Validierung
+- [x] **integration** — breiter Corpus end-to-end Cross-Runtime-Validierung (`tools/oracle/src/integration.ts`): treibt TRX64-Daemon + live c64re-Daemon durch dieselbe WS-Sequenz; 3 Achsen (Corpus boot+mount+LOAD+RUN→game-live · WS-Surface auf laufendem Programm: screenshot/monitor/checkpoint-rewind/breakpoint_hit/audio · Cross-Runtime .c64re-Snapshot dump↔undump beide Richtungen). Self-test GREEN (11/11 surface, 2/2 snapshot); Report `docs/integration-report.md`.
 
 ## Grob
-~85% durch. Offen: 1× läuft (checkpoint-ring) + 5 Items. Davon 2 groß (checkpoint-ring, flash-write), Rest mechanisch/mittel.
+Feature-complete-vs-TS-Capstone (integration) erreicht: TRX64-Daemon ≡ c64re-Daemon
+über die WS-Surface, inkl. Cross-Runtime-.c64re-Snapshot auf einem laufenden Programm
+(beide Richtungen). Byte-exakte Gates GREEN (269 passed), 7-Spiele-Gate 7/7.

@@ -272,7 +272,7 @@ async function driveCorpusItem(c: RpcClient, item: CorpusItem): Promise<RunOutco
     // Run until BASIC READY returns (= load complete, a stub to RUN) OR the
     // (fast)loader goes live in game RAM (sustained) OR the load cap. A loader
     // that runs straight in RAM never returns to READY — break early on game-PC.
-    const loadCap = (await cycles(c, sid)) + (item.loadCap ?? 70 * PAL_HZ);
+    const loadCap = (await cycles(c, sid)) + (item.loadCap ?? 45 * PAL_HZ);
     while ((await cycles(c, sid)) < loadCap) {
       await runCycles(c, sid, 2_000_000);
       const p = await pc(c, sid);
