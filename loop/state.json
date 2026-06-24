@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "integration",
+  "current_item": "FEATURE-COMPLETE vs c64re TS headless",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -61,20 +61,16 @@
     "recorder-scenario",
     "audio-media-batch",
     "vic-inspect-engine",
-    "ws-notifications-tail"
+    "ws-notifications-tail",
+    "integration"
   ],
-  "note": "vic-inspect merged+done (ADR-085, vic/inspect 9/9). maniac char-select confirmed (user, 600M). NEXT: ws-notifications-tail (broadcast-push + checkpoint/thumbnails), then integration.",
-  "updated": "2026-06-24T22:50:51Z",
+  "note": "FEATURE-COMPLETE (ADR-087): integration capstone GREEN (WS 11/11, cross-runtime snapshot 2/2 live, 7-game gate broad authority). All queue items done. Optional follow-ups remaining (beyond TS parity): real-VICE VSF WRITE, the J2 derived_asset trace-chain, vic/inspect oracle goldens, the other c64re broadcasts (debug/running|paused|stopped etc).",
+  "updated": "2026-06-24T22:58:12Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": {
-    "item": "integration",
-    "model": "opus",
-    "started": "2026-06-24T22:50:51Z",
-    "note": "opus ~45min: 6 commits, report written (integration-report.md 5KB), finalizing scorecard (902e4e8 9min ago: gameplay IS daemon-reachable). Final validation run. Near done."
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
@@ -89,5 +85,6 @@
   "loop_status": "RUNNING",
   "bar": "BEHAVIORAL parity with c64re (renders games/demos, .g64 1541 loaders, the 7-game gate). Match c64re, not exceed it.",
   "scope_note": "FEATURE-COMPLETE = 100% vs c64re TS runtime. EXPLICIT (user): the .c64re snapshot/dump|undump container IS in scope (magic C64RESNP + gzip-JSON RuntimeCheckpoint + media, round-trip vs c64re), as its own item right after snapshot-vsf. Full queue: snapshot-vsf(A+readVICE, running) -> .c64re-container (dump/undump) -> checkpoint-ring (705.B rewind + 7 checkpoint methods + granular vic/inspect) -> recorder/scenario -> audio/media/batch WS -> flash-cart WRITABLE -> drive WRITE-BACK -> integration. ALL in. 100%.",
-  "parallel": []
+  "parallel": [],
+  "feature_complete": true
 }

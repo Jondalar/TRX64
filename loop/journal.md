@@ -780,3 +780,10 @@ just needed more time (black at 100M = mid-load). Confirms renderer + loader cor
 
 NotifyHub 1:1 c64re broadcast; debug/breakpoint_hit + batch/progress + audio/flush wired; checkpoint/thumbnails.
 57 daemon tests, byte-exact all green. Only integration left. Next: integration (the LAST item).
+
+## 2026-06-25 — DRIVER: integration capstone GREEN -> FEATURE-COMPLETE (ADR-087)
+
+Cross-runtime e2e: WS-surface 11/11, snapshot round-trip 2/2 live, corpus reach-running, c64re xref parity (7-
+game gate = broad authority). oracle.ts untouched (additive harness). byte-exact green. TRX64 is FEATURE-
+COMPLETE vs c64re TS headless: verbatim cores + cartridge(r+flash-w) + drive-write + reSID + full WS surface +
+.c64re 100% cross-runtime + observability + A/V tap. 55 items, ~8-10x faster.

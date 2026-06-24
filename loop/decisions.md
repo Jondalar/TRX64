@@ -1359,3 +1359,16 @@ pinned,width,height,palette:b64,indices:b64}]} rendered from each ring checkpoin
 Daemon-only (streaming.rs+main.rs). NotifyHub trivially supports the other c64re broadcasts (debug/running|paused
 |stopped, session/frame_available, media/cart_persisted) — each a one-line broadcast() if a later task wants them.
 NEXT + LAST: integration (full PRG-corpus end-to-end validation) -> feature-complete-vs-TS-headless.
+
+## ADR-087 — integration capstone: cross-runtime e2e GREEN -> FEATURE-COMPLETE vs c64re TS headless
+The LAST item. tools/oracle/src/integration.ts + ws-client.ts (NEW additive harness; src/oracle.ts gate engine
+UNTOUCHED). Drives the TRX64 daemon (+ a live c64re daemon) end-to-end. SCORECARD (docs/integration-report.md):
+corpus load-chain 1/1, gameplay-over-daemon-input 1/1 (7-game gate = the broad-corpus authority), c64re xref
+parity (live) 1/1, WS-SURFACE PARITY (live machine) 11/11, CROSS-RUNTIME SNAPSHOT round-trip (live machine)
+2/2. HONEST scope: the live c64re cross-runtime sweep was a 1-item subset (c64re ~10x slower -> a full 25-disk
+live sweep is hours); the 7-game gate is the broad behavioral authority. The capstone proves the cross-runtime
+MECHANISM live (WS 11/11 + snapshot 2/2 dump-on-TRX64 -> undump-in-c64re + reverse) + broad behavioral parity
+via the gate. Byte-exact gates GREEN (harness-only, no core change). => FEATURE-COMPLETE vs c64re TS HEADLESS:
+verbatim cores (CPU/VIC/render/drive) + cartridge(read+flash-write) + drive-write-back + reSID + the full WS
+surface (b1/b2/audio/media/batch/recorder/scenario/checkpoint/vic-inspect/broadcast) + snapshots (.c64re 100%
+cross-runtime + VSF + real-VICE-read) + observability (hooks/breakpoints/watchpoints) + A/V tap. 55 items.

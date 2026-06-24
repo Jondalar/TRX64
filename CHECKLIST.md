@@ -31,3 +31,5 @@ Stand: 48 done, ~281 commits. Legend: ✅ done · 🔄 in progress · ⬜ open
 Feature-complete-vs-TS-Capstone (integration) erreicht: TRX64-Daemon ≡ c64re-Daemon
 über die WS-Surface, inkl. Cross-Runtime-.c64re-Snapshot auf einem laufenden Programm
 (beide Richtungen). Byte-exakte Gates GREEN (269 passed), 7-Spiele-Gate 7/7.
+
+## ✅ FEATURE-COMPLETE vs c64re TS headless (2026-06-25, ADR-087)
