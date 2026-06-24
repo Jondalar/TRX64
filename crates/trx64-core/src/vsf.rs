@@ -16,7 +16,7 @@
 //!   VIC-II    108 bytes
 //!   KEYBOARD  6 bytes
 
-use crate::cia::{CIA_ICR, CIA_PRA, CIA_PRB};
+use crate::cia::CIA_ICR;
 use crate::Machine;
 
 // ── VSF header constants ──────────────────────────────────────────────────────
@@ -116,11 +116,38 @@ fn ser_c64mem(machine: &Machine) -> Vec<u8> {
     data
 }
 
-/// CIA module (48 bytes).
-/// c_cia[16] + irqflags[1] + ack_irqflags[1] + new_irqflags[1] + irq_enabled[1]
-/// + rdi[4 LE] + ifr_clock[4 LE] + ifr_delay[1] + tat[1] + tbt[1]
-/// + old_pa[1] + old_pb[1] + read_clk[4 LE] + read_offset[1] + last_read[1]
-/// + write_offset[1] + model[1] + ta_alarmclk[4 LE] + tb_alarmclk[4 LE]
+/// CIA module (48 bytes) — 1:1 with c64re module-mapping.ts `serializeCia`.
+///
+/// Field order + offsets (module-mapping.ts lines 256-288):
+///   c_cia[16]        0..15
+///   irqflags         16
+///   ack_irqflags     17
+///   new_irqflags     18
+///   irq_enabled      19
+///   rdi[4 LE]        20..23
+///   ifr_clock[4 LE]  24..27
+///   ifr_delay        28
+///   tat              29
+///   tbt              30
+///   old_pa           31
+///   old_pb           32
+///   read_clk[4 LE]   33..36
+///   read_offset      37
+///   last_read        38
+///   write_offset     39
+///   model            40
+///   ta_alarmclk[4]   41..44
+///   tb_alarmclk[4]   45..48 (only 45..47 fit — the c64re TS `new Uint8Array(48)`
+///                            silently drops the 48th byte; we replicate that
+///                            exact truncation so the bytes round-trip 1:1.)
+///
+/// `old_pa`/`old_pb` = 0xff at reset (VICE bug #1143 — cia6526-vice.ts:416-418;
+/// the last byte sent to the port backend, which powers up all-high, NOT the
+/// register value). TRX64's `Cia` does not separately track the last port output,
+/// so we emit 0xff to match c64re; on load c64re re-derives it on the first port
+/// access, so it is non-load-bearing for resume.
+/// `model` = 0 (CIA_MODEL_6526, cia6526-vice.ts:169/364 default — the session's
+/// CIA1/CIA2 use the default model).
 fn ser_cia(cia: &crate::cia::Cia, clk: u64) -> Vec<u8> {
     let mut data = Vec::with_capacity(48);
     // c_cia[16] = register file
@@ -142,19 +169,25 @@ fn ser_cia(cia: &crate::cia::Cia, clk: u64) -> Vec<u8> {
     data.push(cia.ta.is_running() as u8);
     // tbt = 1 if TB running
     data.push(cia.tb.is_running() as u8);
-    // old_pa, old_pb
-    data.push(cia.regs[CIA_PRA]);
-    data.push(cia.regs[CIA_PRB]);
+    // old_pa, old_pb = 0xff (VICE bug #1143; cia6526-vice.ts:416-418).
+    data.push(0xff);
+    data.push(0xff);
     // read_clk = clk as u32
     push_u32_le(&mut data, clk as u32);
-    // read_offset, last_read, write_offset (3 bytes; model dropped to hit 48)
+    // read_offset, last_read, write_offset
     data.push(0u8);
     data.push(0u8);
+    data.push(0u8); // write_offset = 0 (C64SC; cia6526-vice.ts:235)
+    // model = 0 (CIA_MODEL_6526).
     data.push(0u8);
-    // ta_alarmclk = (ta.clk + ta.cnt as u64) as u32
-    push_u32_le(&mut data, (cia.ta.clk + cia.ta.cnt as u64) as u32);
-    // tb_alarmclk = (tb.clk + tb.cnt as u64) as u32
-    push_u32_le(&mut data, (cia.tb.clk + cia.tb.cnt as u64) as u32);
+    // ta_alarmclk = the cached next-underflow clk (CLOCK_NEVER=0xffff_ffff_ffff_ffff
+    // when stopped). Low 32 bits, matching c64re's `ta_alarmclk` u32 write.
+    push_u32_le(&mut data, cia.ta_alarmclk as u32);
+    // tb_alarmclk — its 4th byte (data[48]) is dropped: the c64re TS buffer is 48
+    // bytes, so writeU32LE at off 45 only stores indices 45..47. We push 4 bytes
+    // then truncate the Vec back to 48 to match byte-for-byte.
+    push_u32_le(&mut data, cia.tb_alarmclk as u32);
+    data.truncate(48);
     debug_assert_eq!(data.len(), 48);
     data
 }
@@ -308,8 +341,27 @@ fn load_maincpu(machine: &mut Machine, data: &[u8]) -> Result<(), String> {
 
     // Restore clock (wrapping u32 → u64; we just use it as-is since VSF
     // has no high bits — the absolute clock is not preserved across save/load).
-    if let Some(cycles32) = read_u32_le(data, 7) {
-        cpu.clk = cycles32 as u64;
+    let cycles = read_u32_le(data, 7).map(|c| c as u64);
+    if let Some(c) = cycles {
+        cpu.clk = c;
+    }
+
+    // ── Seed the VERBATIM SC core (`c64_core`) — the PRODUCTION full-machine CPU
+    // that `run_for_full*` executes against (lib.rs:1127 reads `c64_core.reg_pc`).
+    // The legacy `sync` path only flows c64_core → cpu6510 (sync_snapshot_sc), so
+    // a restore that touched ONLY cpu6510 would be ignored the moment the session
+    // resumes (the next run reads the stale c64_core PC). Mirror every register +
+    // the composite status + the clock into c64_core so the resume continues from
+    // the restored CPU state. ──
+    let core = &mut machine.c64_core;
+    core.reg_pc = pc;
+    core.reg_a = a;
+    core.reg_x = x;
+    core.reg_y = y;
+    core.reg_sp = sp;
+    core.set_status_composite(flags);
+    if let Some(c) = cycles {
+        core.clk = c;
     }
     Ok(())
 }
@@ -331,30 +383,56 @@ fn load_cia(cia: &mut crate::cia::Cia, data: &[u8], name: &str) -> Result<(), St
     if data.len() < 48 {
         return Err(format!("{name}: expected 48 bytes, got {}", data.len()));
     }
-    // c_cia[16] = register file
+    // c_cia[16] = register file (offsets 0..15).
     cia.regs[0..16].copy_from_slice(&data[0..16]);
-    // irqflags
+    // irqflags (offset 16).
     cia.irqflags = data[16];
-    // irq_enabled (index 19 in module, data[19])
-    // Restore CIA ICR mask from irq_enabled byte.
+    // irq_enabled (offset 19) → ICR mask.
     cia.regs[CIA_ICR] = data[19];
-    // Restore timer A latch from TA lo/hi registers.
+    // Restore timer A/B latches from the TAL/TAH/TBL/TBH registers.
     let tal = cia.regs[crate::cia::CIA_TAL] as u16;
     let tah = cia.regs[crate::cia::CIA_TAH] as u16;
     cia.ta.latch = tal | (tah << 8);
     cia.ta.cnt = cia.ta.latch;
-    // Restore timer B latch from TB lo/hi registers.
     let tbl = cia.regs[crate::cia::CIA_TBL] as u16;
     let tbh = cia.regs[crate::cia::CIA_TBH] as u16;
     cia.tb.latch = tbl | (tbh << 8);
     cia.tb.cnt = cia.tb.latch;
-    // Restore CIA clock from read_clk (bytes 36..40).
-    if let Some(clk32) = read_u32_le(data, 36) {
+    // Restore CIA clock from read_clk (offsets 33..36).
+    if let Some(clk32) = read_u32_le(data, 33) {
         cia.clk = clk32 as u64;
         cia.ta.clk = clk32 as u64;
         cia.tb.clk = clk32 as u64;
     }
+    // Restore cached alarm clocks (offsets 41..44 = ta_alarmclk; 45..47 = the
+    // truncated tb_alarmclk — its top byte was dropped on save to match c64re's
+    // 48-byte buffer). 0xffff_ffff (CLOCK_NEVER low word) ⇒ map to the full u64
+    // CLOCK_NEVER so the alarm-dispatch cascade treats the timer as stopped.
+    if let Some(ta32) = read_u32_le(data, 41) {
+        cia.ta_alarmclk = widen_alarmclk(ta32);
+    }
+    // tb_alarmclk: only 3 bytes survive (45..47); reconstruct as if the 4th byte
+    // were the save-time truncation. We read the 3 available bytes and treat
+    // 0x00ff_ffff (= a stopped timer whose top byte was lost) as CLOCK_NEVER too.
+    let tb_lo24 = (data[45] as u32) | ((data[46] as u32) << 8) | ((data[47] as u32) << 16);
+    cia.tb_alarmclk = if tb_lo24 == 0x00ff_ffff {
+        crate::cia::CLOCK_NEVER
+    } else {
+        tb_lo24 as u64
+    };
     Ok(())
+}
+
+/// Widen a 32-bit alarm clock read from a VSF CIA module to the engine's u64
+/// alarm clock. A value of 0xffff_ffff (= the low word of CLOCK_NEVER, written
+/// when the timer is stopped) maps to the full u64 CLOCK_NEVER.
+#[inline]
+fn widen_alarmclk(v32: u32) -> u64 {
+    if v32 == 0xffff_ffff {
+        crate::cia::CLOCK_NEVER
+    } else {
+        v32 as u64
+    }
 }
 
 fn load_sid(machine: &mut Machine, data: &[u8]) -> Result<(), String> {
