@@ -23,10 +23,19 @@
 //! `ViaContext` owns its own [`AlarmContext`]. Alarm callbacks are dispatched by
 //! [`AlarmId`] back into the right `viacore_*` function.
 
+// These lints fire on DELIBERATE 1:1 fidelity choices: the TS keeps `if (LOW)
+// {..} else if (HIGH) {true} else {true}` and OR-pattern `case` fall-throughs
+// verbatim (viacore.ts). Collapsing/range-folding them would diverge from the
+// proven TS shape — the whole point of this port is byte-for-byte fidelity.
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::collapsible_else_if)]
 #![allow(clippy::collapsible_if)]
 #![allow(clippy::manual_range_contains)]
+#![allow(clippy::if_same_then_else)]
+#![allow(clippy::manual_range_patterns)]
+// `(v & 0x0e) == 0x0e` (VIA_PCR_CA2_HIGH_OUTPUT) is the verbatim TS test; clippy
+// reads `v & mask == mask` as an extreme-element comparison (false positive).
+#![allow(clippy::absurd_extreme_comparisons)]
 
 // =============================================================================
 // Register file indices — drivetypes.ts:209-226 (via.h:35-55)
