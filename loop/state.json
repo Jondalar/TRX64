@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "perf-compare",
+  "current_item": "(explicit plan complete — awaiting user steer)",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -44,8 +44,8 @@
     "seven-game-gate",
     "perf-compare"
   ],
-  "note": "perf compare DONE (ADR-065): TRX64 Rust ~8-10× the c64re TS core on the PRODUCTION path (node on dist, NOT tsx). pure 13.4 vs 1.37 MHz=9.8x; disk 11.2 vs 1.39=8.1x. The 200x was a tsx artifact (user caught it). User plan complete: scramble + 7-game gate + perf.",
-  "updated": "2026-06-24T10:32:30Z",
+  "note": "EXPLICIT PLAN COMPLETE: scramble custom-loader acid test + 7-game gate 7/7 + perf compare (~8-10x) all DONE. Loop focus chain (dd00-atn-irq->scramble->render->7-game) fully done. Stale backlog cleaned (cia-cascade, drive-via2 were already done). Remaining backlog = broader drop-in surface (protocol-surface, snapshot-vsf, integration, sid) — NOT user-prioritized; not auto-launching (Not eager). Awaiting user direction for the next phase.",
+  "updated": "2026-06-24T10:37:38Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"

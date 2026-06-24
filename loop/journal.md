@@ -656,3 +656,10 @@ User caught the bogus 200×: c64re ships as compiled dist/ run by node (ui.sh ->
 tsx is ~22× slower (0.061 MHz). Real production numbers: c64re pure 1.37 MHz / disk 1.39 MHz vs TRX64 13.4 /
 11.2 MHz = 9.8× / 8.1×. Headline: ~8-10× (an order of magnitude). Both verbatim true-drive. docs/perf-compare.md
 + bench/c64re_dist_bench.mjs (node-on-dist). User plan (scramble + 7-game gate + perf) complete.
+
+## 2026-06-24 — DRIVER: explicit plan COMPLETE; loop awaiting steer
+
+scramble acid test + 7-game gate 7/7 + perf compare (~8-10x) all done. Loop focus chain fully complete. Stale
+backlog cleaned (cia-cascade = cia.rs lazy alarm cascade already done; drive-via2 = viacore 1:1 already done).
+Remaining backlog (protocol-surface, snapshot-vsf, integration, sid) is broader drop-in-surface work, not
+user-prioritized — NOT auto-dispatching (Not eager). No builder dispatched this tick. Awaiting user direction.

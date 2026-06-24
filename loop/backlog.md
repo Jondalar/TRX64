@@ -59,7 +59,7 @@ one-line first-divergence). Driver model: `sonnet`. Verifier model: `haiku`.
       → ADR-020 (atomic reset+first-opcode dispatch, PAL sync_factor 66517, drive-boot-
       local). drive-boot-idle GREEN + full CPU/VIC/CIA regression GREEN, 42 core tests.
       VIA/GCR are stubs (idle boot only); deeper VIA/GCR + IEC handshaking → integration.
-- [ ] `cia-cascade` — todo — `[model: opus]` — chained timers (TB counts TA underflows)
+- [x] `cia-cascade` (DONE: cia.rs lazy alarm cascade, port of ciacore.c) — todo — `[model: opus]` — chained timers (TB counts TA underflows)
       byte-exact. Needs the VICE maincpu alarm scheduler (ta_alarm/tb_alarm + IFR
       pipeline). Divergence: iso-cia-cascade trace[43] @cycle 89 exp=2 got=3 (ADR-017).
       Best done alongside `integration` (shared alarm framework). Rebuild the scenario.
@@ -86,5 +86,5 @@ Phase 1 integration is green. Tracked separately when we get there.
 ## Stage 2 follow-ups (tracked corner gaps)
 
 - [x] `iec-bus` — **done** — `[model: opus]` — C64<->1541 IEC wired (iec.rs wired-AND fold + ATN-ack + push-flush catch-up). boot-trace-short FULLY byte-exact; full regression GREEN (ADR-024).
-- [ ] `drive-via2` — todo — `[model: opus]` — 1541 disk-controller VIA2 computed reads (PCR/timer/handshake). driveCycles +2; diverges at drive PC $F266 LDA $1C0C after 203087 byte-exact records (ADR-025). Low priority.
-- [ ] `cia-cascade` — todo — `[model: opus]` — chained timers via VICE alarm scheduler (ADR-017), now IEC-unblocked.
+- [x] `drive-via2` (DONE: viacore.rs 1:1 VIA2 port, ADR-058) — todo — `[model: opus]` — 1541 disk-controller VIA2 computed reads (PCR/timer/handshake). driveCycles +2; diverges at drive PC $F266 LDA $1C0C after 203087 byte-exact records (ADR-025). Low priority.
+- [x] `cia-cascade` (DONE: cia.rs lazy alarm cascade, port of ciacore.c) — todo — `[model: opus]` — chained timers via VICE alarm scheduler (ADR-017), now IEC-unblocked.
