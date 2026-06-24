@@ -37,6 +37,7 @@ pub mod sid;
 pub mod tables;
 pub mod vic;
 pub mod vic_draw;
+pub mod vic_inspect;
 pub mod viacore;
 pub mod vice_snapshot_stream;
 pub mod vsf;
