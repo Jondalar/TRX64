@@ -191,6 +191,22 @@ struct State {
     /// stores them per-session exactly like the TS controller's `traceDefinitions`
     /// map. No core primitive — a definition is pure data until a run taps it.
     trace_definitions: std::collections::HashMap<String, Value>,
+    /// Spec 766.5 — the runtime recorder (off-thread scrub history). `None` until
+    /// `recorder/start` creates it; the c64re controller lazily creates it at
+    /// power-on. The daemon is single-threaded so the recorder owns its store
+    /// directly (no worker thread). Records anchors via `recorder/capture`.
+    recorder: Option<trx64_core::recorder::runtime_recorder::RuntimeRecorder>,
+    /// Spec 766.5 — last disk content generation shipped to the recorder. TRX64 has
+    /// no drive `diskWriteGeneration` facade (the worktree builders own the drive),
+    /// so the recorder derives a content generation from the attached disk bytes:
+    /// this counter bumps each time the disk image hash changes between captures.
+    recorder_disk_gen: i32,
+    recorder_disk_hash: Option<String>,
+    /// Spec 231/268 — in-process scenario registry (id → Scenario JSON). The c64re
+    /// registry is file-backed (samples/ + project dir); TRX64 keeps it in-memory
+    /// per-session (additive — no writes into the c64re repo). save/load/delete/list
+    /// operate on this map; `run` replays the scenario deterministically.
+    scenarios: std::collections::HashMap<String, Value>,
 }
 
 type SharedState = Arc<Mutex<State>>;
@@ -2985,6 +3001,155 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             Response::err(id, -32001, format!("NOT_IMPLEMENTED: {m}: deferred (needs the filmstrip/present-capture path)"))
         }
 
+        // ── Spec 766.5 — runtime recorder (off-thread scrub history) ─────────
+        // 1:1 with the c64re ws-server.ts recorder/* handlers + the RuntimeRecorder.
+        // c64re creates the recorder lazily at power-on and exposes recorder/status
+        // |list|dump. TRX64's single-threaded daemon has no autocapture loop, so it
+        // adds recorder/start|stop (explicit lifecycle) + recorder/capture (the
+        // explicit anchor touchpoint that the c64re 0.5 s timer drives implicitly).
+        // status/list/dump shapes are identical to c64re.
+
+        // recorder/start — create the recorder + capture an initial anchor.
+        // { active: true, stats }.
+        "recorder/start" => {
+            let mut st = state.lock().unwrap();
+            if st.recorder.is_none() {
+                st.recorder = Some(
+                    trx64_core::recorder::runtime_recorder::RuntimeRecorder::with_defaults(),
+                );
+                st.recorder_disk_gen = 0;
+                st.recorder_disk_hash = None;
+            }
+            // Capture the first anchor so a status/list right after start is non-empty.
+            capture_anchor_now(&mut st);
+            let stats = st.recorder.as_ref().unwrap().stats().to_json();
+            Response::ok(id, json!({ "active": true, "stats": stats }))
+        }
+
+        // recorder/stop — dispose the recorder. { active: false }.
+        "recorder/stop" => {
+            let mut st = state.lock().unwrap();
+            st.recorder = None;
+            st.recorder_disk_gen = 0;
+            st.recorder_disk_hash = None;
+            Response::ok(id, json!({ "active": false }))
+        }
+
+        // recorder/capture — explicit anchor touchpoint (TRX64 has no 0.5 s timer).
+        // Records one CORE-ONLY anchor + gen-gated media. { active, seq?, stats }.
+        "recorder/capture" => {
+            let mut st = state.lock().unwrap();
+            if st.recorder.is_none() {
+                return Response::ok(id, json!({ "active": false }));
+            }
+            let seq = capture_anchor_now(&mut st);
+            let stats = st.recorder.as_ref().unwrap().stats().to_json();
+            Response::ok(id, json!({ "active": true, "seq": seq, "stats": stats }))
+        }
+
+        // recorder/status — { active, stats?, produced?, mediumShipped? }.
+        // ws-server.ts:1079-1083.
+        "recorder/status" => {
+            let st = state.lock().unwrap();
+            match &st.recorder {
+                None => Response::ok(id, json!({ "active": false })),
+                Some(r) => Response::ok(id, json!({
+                    "active": true,
+                    "stats": r.stats().to_json(),
+                    "produced": r.produced,
+                    "mediumShipped": r.medium_shipped,
+                })),
+            }
+        }
+
+        // recorder/list — { active, anchors: RecorderAnchorRef[] }.
+        // ws-server.ts:1084-1088.
+        "recorder/list" => {
+            let st = state.lock().unwrap();
+            match &st.recorder {
+                None => Response::ok(id, json!({ "active": false, "anchors": [] })),
+                Some(r) => {
+                    let anchors: Vec<Value> = r.list().iter().map(|a| a.to_json()).collect();
+                    Response::ok(id, json!({ "active": true, "anchors": anchors }))
+                }
+            }
+        }
+
+        // recorder/dump — reconstruct anchor `seq` into a full restorable
+        // checkpoint, write it as a native .c64re snapshot, return DumpResult
+        // (identical shape to snapshot/dump). ws-server.ts:1089-1093 +
+        // snapshot-persistence.ts dumpRecorderAnchorSnapshot.
+        "recorder/dump" => {
+            let seq = match req.params.get("seq").and_then(|v| v.as_u64()) {
+                Some(s) => s,
+                None => return Response::err(id, -32602, "recorder/dump: seq required"),
+            };
+            let path = match req.params.get("path").and_then(|v| v.as_str()) {
+                Some(p) if !p.is_empty() => p.to_string(),
+                _ => return Response::err(id, -32602, "recorder/dump: path required"),
+            };
+            let st = state.lock().unwrap();
+            let recorder = match &st.recorder {
+                Some(r) => r,
+                None => return Response::err(id, -32001, "recorder/dump: recorder not active"),
+            };
+            // Reconstruct the full payload (core anchor + re-injected media).
+            let (anchor_ref, schema_version, payload) = match recorder.reconstruct(seq) {
+                Some(t) => t,
+                None => return Response::err(id, -32001, format!(
+                    "recorder/dump: anchor seq {seq} was evicted or its medium is no longer retained"
+                )),
+            };
+            let cycle = anchor_ref.cycle as i64;
+            let pc = payload
+                .get("cpu")
+                .and_then(|c| c.get("pc"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as i64;
+            // Embedded media: the reconstructed disk image rides as a drive8 input.
+            let media_inputs = gather_recorder_media_inputs(&payload, &st.session);
+            let media_summary: Vec<Value> = media_inputs
+                .iter()
+                .map(|m| json!({
+                    "role": m.role,
+                    "format": m.format,
+                    "sourceName": m.source_name,
+                    "sha256": m.sha256.clone().unwrap_or_default(),
+                    "bytes": m.bytes.as_ref().map(|b| b.len()).unwrap_or(0) as u64,
+                }))
+                .collect();
+            let breakpoints = st.breakpoints.entries.len() as u64;
+            drop(st);
+
+            let bytes = trx64_core::native_snapshot::write_native_snapshot(
+                trx64_core::native_snapshot::WriteNativeSnapshotArgs {
+                    checkpoint: payload,
+                    schema_version: schema_version as i64,
+                    media: media_inputs,
+                    runtime_version: "trx64-runtime/1".to_string(),
+                    machine_model: "c64-pal".to_string(),
+                    provenance: Some(json!({ "checkpointId": format!("recorder:{seq}") })),
+                    pc,
+                    cycle,
+                },
+            );
+            if let Some(parent) = std::path::Path::new(&path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::write(&path, &bytes) {
+                Ok(()) => Response::ok(id, json!({
+                    "path": path,
+                    "cycle": cycle as u64,
+                    "pc": pc as u64,
+                    "machine": "c64-pal",
+                    "media": media_summary,
+                    "fileBytes": bytes.len() as u64,
+                    "breakpoints": breakpoints
+                })),
+                Err(e) => Response::err(id, -32001, format!("recorder/dump: write error: {e}")),
+            }
+        }
+
         m if m.starts_with("recorder/") => {
             Response::err(id, -32001, format!("NOT_IMPLEMENTED: {m}: deferred"))
         }
@@ -3204,6 +3369,104 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             Response::err(id, -32001, format!("NOT_IMPLEMENTED: {m}: deferred"))
         }
 
+        // ── Spec 231/268 — deterministic scenario replay + registry ──────────
+        // 1:1 with the c64re ws-server.ts runtime/scenario_* handlers. The c64re
+        // registry is file-backed (samples/ + project dir); TRX64 keeps an in-
+        // process per-session registry (additive — never writes into the c64re
+        // repo). `scenario_run` replays a scenario deterministically: restore the
+        // start snapshot, feed the recorded inputs at their cycles (the scenario
+        // player), run cycleBudget cycles, then hash the end RAM. A re-run on the
+        // same build hashes identically — the determinism contract (Spec 231).
+
+        // runtime/scenario_list — registry summaries.
+        // c64re: listScenarios() → ScenarioSummary[]. ws-server.ts:1922-1925.
+        "runtime/scenario_list" => {
+            let st = state.lock().unwrap();
+            let mut list: Vec<Value> = st
+                .scenarios
+                .values()
+                .map(scenario_summary)
+                .collect();
+            // Stable order by id for deterministic listings.
+            list.sort_by(|a, b| {
+                a.get("id").and_then(|v| v.as_str()).unwrap_or("")
+                    .cmp(b.get("id").and_then(|v| v.as_str()).unwrap_or(""))
+            });
+            Response::ok(id, json!(list))
+        }
+
+        // runtime/scenario_save — store a scenario object. c64re: saveScenario() →
+        // { filePath }. ws-server.ts:1927-1931. TRX64 keeps it in memory and
+        // returns the registry key as `id` (no file path).
+        "runtime/scenario_save" => {
+            let scenario = match req.params.get("scenario") {
+                Some(s) if s.is_object() => s.clone(),
+                _ => return Response::err(id, -32602, "scenario object required"),
+            };
+            let sid = match scenario.get("id").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return Response::err(id, -32602, "scenario.id required"),
+            };
+            let mut saved = scenario.clone();
+            saved["savedAt"] = json!(now_iso8601());
+            let mut st = state.lock().unwrap();
+            st.scenarios.insert(sid.clone(), saved);
+            Response::ok(id, json!({ "id": sid }))
+        }
+
+        // runtime/scenario_delete — { deleted: bool }. ws-server.ts:1933-1938.
+        "runtime/scenario_delete" => {
+            let sid = match req.params.get("id").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => return Response::err(id, -32602, "id required"),
+            };
+            let mut st = state.lock().unwrap();
+            let deleted = st.scenarios.remove(&sid).is_some();
+            Response::ok(id, json!({ "deleted": deleted }))
+        }
+
+        // runtime/scenario_load — the full stored scenario. c64re: loadScenario()
+        // → SavedScenario (throws if not found). ws-server.ts:2306-2312.
+        "runtime/scenario_load" => {
+            let sid = match req.params.get("id").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => return Response::err(id, -32602, "id required"),
+            };
+            let st = state.lock().unwrap();
+            match st.scenarios.get(&sid) {
+                Some(s) => Response::ok(id, s.clone()),
+                None => Response::err(id, -32001, format!("scenario '{sid}' not found")),
+            }
+        }
+
+        // runtime/scenario_run — deterministic replay. c64re: loadScenario() then
+        // runScenario() → ReplayResult. ws-server.ts:2314-2327 + scenario.ts
+        // runScenario. Accepts either { id } (load from the registry) or an inline
+        // { scenario } object.
+        "runtime/scenario_run" => {
+            let mut st = state.lock().unwrap();
+            let scenario = if let Some(s) = req.params.get("scenario").filter(|s| s.is_object()) {
+                s.clone()
+            } else {
+                let sid = match req.params.get("id").and_then(|v| v.as_str()) {
+                    Some(s) => s.to_string(),
+                    None => return Response::err(id, -32602, "id or scenario required"),
+                };
+                match st.scenarios.get(&sid) {
+                    Some(s) => s.clone(),
+                    None => return Response::err(id, -32001, format!("scenario '{sid}' not found")),
+                }
+            };
+            match run_scenario(&mut st, &scenario) {
+                Ok(result) => Response::ok(id, result),
+                Err(e) => Response::err(id, -32001, format!("scenario_run: {e}")),
+            }
+        }
+
+        m if m.starts_with("runtime/scenario") => {
+            Response::err(id, -32601, format!("Method not found: {m}"))
+        }
+
         other => {
             Response::err(id, -32601, format!("Method not found: {other}"))
         }
@@ -3305,6 +3568,283 @@ fn gather_native_media_inputs(
         });
     }
     out
+}
+
+/// Spec 766.5 — capture one recorder anchor from the live machine: build the
+/// core-only anchor payload + the live media descriptors, then hand them to the
+/// recorder. Returns the new anchor seq (`None` if the recorder is inactive). The
+/// `wallMs`/`cycle`/`schemaVersion` come from the live machine like c64re's
+/// captureAnchor call (runtime-controller.ts:848-851).
+fn capture_anchor_now(st: &mut State) -> Option<u64> {
+    if st.recorder.is_none() {
+        return None;
+    }
+    let payload = capture_recorder_anchor_payload(&mut st.session);
+    let cycle = st.session.machine.c64_core.clk as f64;
+    let wall_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as f64)
+        .unwrap_or(0.0);
+    let schema_version = trx64_core::c64re_snapshot::RUNTIME_CHECKPOINT_SCHEMA_VERSION as i32;
+    // Borrow the disk-gen bookkeeping out, build media, then put it back (the
+    // descriptor closures capture the disk bytes by value, so no live borrow leaks).
+    let mut disk_gen = st.recorder_disk_gen;
+    let mut disk_hash = st.recorder_disk_hash.take();
+    let media = build_recorder_media(&st.session, &mut disk_gen, &mut disk_hash);
+    st.recorder_disk_gen = disk_gen;
+    st.recorder_disk_hash = disk_hash;
+    let recorder = st.recorder.as_mut().unwrap();
+    recorder.capture_anchor(&payload, cycle, wall_ms, schema_version, &media);
+    // The just-captured anchor is the newest in the store.
+    recorder.list().last().map(|a| a.seq)
+}
+
+/// Spec 766.5 — build the native-snapshot media inputs for a reconstructed
+/// recorder anchor. The reconstructed payload carries `driveDiskImage` (re-injected
+/// from the medium store) when the anchor referenced a disk; embed it as a drive8
+/// input so the dumped .c64re re-attaches the disk on undump (matching
+/// snapshot/dump's drive8 input). The disk format/sourceName come from the anchor's
+/// `media` metadata, falling back to the live session.
+fn gather_recorder_media_inputs(
+    payload: &Value,
+    session: &Session,
+) -> Vec<trx64_core::native_snapshot::NativeSnapshotMediaInput> {
+    use trx64_core::native_snapshot::NativeSnapshotMediaInput;
+    let mut out = Vec::new();
+    if let Some(bytes) = payload
+        .get("driveDiskImage")
+        .and_then(trx64_core::native_snapshot::ta_u8_decode)
+    {
+        if !bytes.is_empty() {
+            // Format/source from the anchor metadata, then the live disk.
+            let format = payload
+                .get("media")
+                .and_then(|mm| mm.get("imageFormat"))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .or_else(|| {
+                    session.machine.drive8.get_attached_disk().map(|d| {
+                        match d.kind {
+                            DiskKind::G64 => "g64",
+                            DiskKind::D64 => "d64",
+                        }
+                        .to_string()
+                    })
+                })
+                .unwrap_or_else(|| "g64".to_string());
+            let source_name = payload
+                .get("media")
+                .and_then(|mm| mm.get("diskPath"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .and_then(|p| p.rsplit('/').next())
+                .map(String::from);
+            out.push(NativeSnapshotMediaInput {
+                role: "drive8".to_string(),
+                format,
+                source_name,
+                bytes: Some(bytes),
+                sha256: None,
+            });
+        }
+    }
+    out
+}
+
+// ── Spec 231/268 — scenario registry + deterministic replay ──────────────────
+
+/// A short ISO-8601 UTC timestamp for the scenario `savedAt` field (no chrono dep).
+fn now_iso8601() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Minimal "epoch:<secs>" stamp — the field is opaque metadata (c64re uses an
+    // ISO string; the exact format is not part of the replay contract).
+    format!("epoch:{secs}")
+}
+
+/// scenario-registry.ts:62-73 — `summarise`: the light listing view of a stored
+/// scenario `{ id, diskPath, mode, cycleBudget, inputCount, savedAt }`.
+fn scenario_summary(s: &Value) -> Value {
+    json!({
+        "id": s.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+        "diskPath": s.get("diskPath").and_then(|v| v.as_str()).unwrap_or(""),
+        "mode": s.get("mode").and_then(|v| v.as_str()).unwrap_or("true-drive"),
+        "cycleBudget": s.get("cycleBudget").and_then(|v| v.as_u64()).unwrap_or(0),
+        "inputCount": s.get("inputs").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0) as u64,
+        "savedAt": s.get("savedAt").and_then(|v| v.as_str()).unwrap_or(""),
+    })
+}
+
+/// The scenario-player replay target over the live `Machine`. `type` drives the
+/// keyboard matrix (the implemented input path); joystick/paddle/restore are
+/// no-ops (TRX64 has no joystick model — same as the daemon's session/joystick_set
+/// stub). `run_for` advances the machine `cycleBudget` cycles (composite macros).
+struct MachineScenarioTarget<'a> {
+    session: &'a mut Session,
+}
+
+impl<'a> trx64_core::scenario_player::ScenarioTarget for MachineScenarioTarget<'a> {
+    fn type_text(&mut self, text: &str) {
+        // scenario-player.ts:75 — typeText(text, 80_000, 80_000). Queue relative to
+        // the current machine clock so the KERNAL scans the key as it runs.
+        let now = self.session.machine.cpu6510.clk;
+        self.session.machine.keyboard.type_text(now, text, 80_000, 80_000);
+    }
+    fn set_joystick1(&mut self, _state: trx64_core::scenario_player::JoystickState) {}
+    fn set_joystick2(&mut self, _state: trx64_core::scenario_player::JoystickState) {}
+    fn set_paddle(&mut self, _idx: u8, _value: i64) {}
+    fn trigger_restore_nmi(&mut self) {}
+    fn run_for(&mut self, cycles: u64) {
+        run_cycle_budget(self.session, cycles);
+    }
+}
+
+/// Translate a `Scenario.inputs` array (scenario.ts ScenarioInputEvent:
+/// `{ atCycle, kind: "keyboard"|"joystick1"|"joystick2", payload }`) into the
+/// scenario-player's `ScenarioStep`s. Keyboard payload = the text string; joystick
+/// payload = a JoystickState partial object (`{ up?, down?, left?, right?, fire? }`).
+fn scenario_steps_from_inputs(inputs: &[Value]) -> Vec<trx64_core::scenario_player::ScenarioStep> {
+    use trx64_core::scenario_player::{JoystickState, ScenarioStep, ScenarioStepKind};
+    let joy = |p: &Value| JoystickState {
+        up: p.get("up").and_then(|v| v.as_bool()).unwrap_or(false),
+        down: p.get("down").and_then(|v| v.as_bool()).unwrap_or(false),
+        left: p.get("left").and_then(|v| v.as_bool()).unwrap_or(false),
+        right: p.get("right").and_then(|v| v.as_bool()).unwrap_or(false),
+        fire: p.get("fire").and_then(|v| v.as_bool()).unwrap_or(false),
+    };
+    let mut out = Vec::new();
+    for ev in inputs {
+        let at_cycle = ev.get("atCycle").and_then(|v| v.as_u64());
+        let kind = ev.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        let payload = ev.get("payload").cloned().unwrap_or(Value::Null);
+        let step_kind = match kind {
+            "keyboard" => ScenarioStepKind::Type {
+                text: payload.as_str().map(String::from).unwrap_or_default(),
+            },
+            "joystick1" => ScenarioStepKind::Joy1 { state: joy(&payload) },
+            "joystick2" => ScenarioStepKind::Joy2 { state: joy(&payload) },
+            _ => continue, // unknown input kind → skip (forward-compatible)
+        };
+        out.push(ScenarioStep {
+            at_cycle,
+            at_frame: None,
+            kind: step_kind,
+        });
+    }
+    out
+}
+
+/// scenario.ts runScenario — deterministic replay. (1) optionally restore the
+/// start snapshot, (2) feed the recorded inputs at their cycles via the scenario
+/// player, (3) run `cycleBudget` cycles, (4) hash the end RAM + report cyclesRan.
+/// Returns a ReplayResult-shaped object (`ramHash`, `cyclesRan`, plus the start/end
+/// PC + cycle for cross-checking). A re-run on the same build hashes identically.
+fn run_scenario(st: &mut State, scenario: &Value) -> Result<Value, String> {
+    use trx64_core::scenario_player::ScenarioPlayer;
+
+    // (1) Restore the start snapshot if one is provided. `startSnapshot` may be a
+    // file path string (a .c64re container) or omitted (replay from the live
+    // machine — TRX64's session is already booted). Inline base64 bytes are also
+    // accepted (the c64re registry stores them base64).
+    if let Some(start) = scenario.get("startSnapshot") {
+        if let Some(path) = start.as_str() {
+            if !path.is_empty() {
+                let file_bytes = std::fs::read(path)
+                    .map_err(|e| format!("cannot read startSnapshot {path}: {e}"))?;
+                let read = trx64_core::native_snapshot::read_native_snapshot(&file_bytes)?;
+                // Re-attach embedded drive8 media, then restore the checkpoint.
+                for rm in &read.media {
+                    if rm.reference.role != "drive8" {
+                        continue;
+                    }
+                    if let Some(bytes) = &rm.bytes {
+                        let kind = if rm.reference.format == "d64" {
+                            DiskKind::D64
+                        } else {
+                            DiskKind::G64
+                        };
+                        st.session.machine.drive8.attach_disk(DiskImage {
+                            kind,
+                            bytes: bytes.clone(),
+                            backing_path: rm.reference.source_name.clone(),
+                            read_only: false,
+                        });
+                    }
+                }
+                trx64_core::c64re_snapshot::restore_runtime_checkpoint(
+                    &mut st.session.machine,
+                    &read.checkpoint,
+                )?;
+            }
+        }
+    }
+
+    // (2) Build the scenario player from the inputs (sorted by cycle internally).
+    let inputs = scenario
+        .get("inputs")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let steps = scenario_steps_from_inputs(&inputs);
+    let mut player = ScenarioPlayer::new(steps, None);
+
+    // (3) Run cycleBudget cycles from the current clock, firing inputs at their
+    // cycles. Run in segments bounded by the next due input (scenario.ts:123-146).
+    let cycle_budget = scenario
+        .get("cycleBudget")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let start_clk = st.session.machine.cpu6510.clk;
+    let start_pc = st.session.machine.cpu6510.reg_pc as u64;
+    let end_clk = start_clk.saturating_add(cycle_budget);
+
+    let mut target = MachineScenarioTarget {
+        session: &mut st.session,
+    };
+    loop {
+        let now = target.session.machine.cpu6510.clk;
+        // Fire any due inputs as of `now`.
+        player.tick(&mut target, now);
+        if now >= end_clk {
+            break;
+        }
+        // Run up to the next due input (or the budget end), whichever is sooner.
+        let next_due = player.next_due_cycle().unwrap_or(end_clk).max(now);
+        let run_until = next_due.min(end_clk);
+        let to_run = run_until.saturating_sub(now);
+        if to_run == 0 {
+            // A due input at `now` was just fired; if none remain, finish the budget.
+            if player.remaining() == 0 {
+                let rest = end_clk.saturating_sub(now);
+                if rest == 0 {
+                    break;
+                }
+                run_cycle_budget(target.session, rest);
+            }
+            continue;
+        }
+        run_cycle_budget(target.session, to_run);
+    }
+    // Fire any inputs that landed exactly at the end.
+    let final_now = target.session.machine.cpu6510.clk;
+    player.tick(&mut target, final_now);
+
+    // (4) Hash the end RAM (scenario.ts:165 — sha256(c64Bus.ram)).
+    let end_clk_actual = st.session.machine.cpu6510.clk;
+    let end_pc = st.session.machine.cpu6510.reg_pc as u64;
+    let ram_hash = sha256_hex(&st.session.machine.ram[..]);
+    let cycles_ran = end_clk_actual.saturating_sub(start_clk);
+
+    Ok(json!({
+        "ramHash": ram_hash,
+        "cyclesRan": cycles_ran,
+        "startCycle": start_clk,
+        "endCycle": end_clk_actual,
+        "startPc": start_pc,
+        "endPc": end_pc,
+    }))
 }
 
 /// The `debug/state` controller-state object (= c64re `controller.state()`), built
@@ -3424,6 +3964,92 @@ fn restore_live_checkpoint(session: &mut Session, cp: &Value) -> Result<(), Stri
     trx64_core::c64re_snapshot::restore_runtime_checkpoint(&mut session.machine, cp)?;
     session.running = false;
     Ok(())
+}
+
+// ── Spec 766.5 — recorder anchor capture ──────────────────────────────────────
+//
+// The c64re controller feeds the recorder a CORE-ONLY anchor (omitMedia) at the
+// 0.5 s autocapture cadence: the disk GCR / cart bytes ride the recorder's
+// separate gen-gated MEDIUM stream, not the per-anchor snapshot (runtime-
+// controller.ts:846-852). TRX64 has no per-frame autocapture loop, so the daemon
+// drives a capture explicitly (recorder/capture) — the same observable touchpoint,
+// minus the background timer. This builds the core anchor payload (the
+// RuntimeCheckpoint tree WITHOUT the embedded media blobs) + the live disk media
+// descriptor, and hands them to `RuntimeRecorder::capture_anchor`.
+
+/// Build a CORE-ONLY checkpoint payload (the omitMedia anchor): the full
+/// RuntimeCheckpoint tree with the large media blobs (driveDiskImage / cart bytes)
+/// NULLED — those ride the recorder's gen-gated medium stream. The small cart
+/// bank/control state still rides the anchor's `media` metadata (c64re semantics).
+fn capture_recorder_anchor_payload(session: &mut Session) -> Value {
+    let (disk_path, disk_format) = match session.machine.drive8.get_attached_disk() {
+        Some(d) => (
+            d.backing_path.clone().unwrap_or_default(),
+            match d.kind {
+                DiskKind::G64 => "g64",
+                DiskKind::D64 => "d64",
+            }
+            .to_string(),
+        ),
+        None => (String::new(), String::new()),
+    };
+    // Pass no drive blobs → the checkpoint tree omits the big GCR/disk overlay; the
+    // disk image rides the recorder's medium stream instead (gen-gated).
+    let mut cp = trx64_core::c64re_snapshot::capture_runtime_checkpoint(
+        &session.machine,
+        &disk_path,
+        &disk_format,
+        None,
+        None,
+    );
+    // Null any large media slots the checkpoint may carry (omitMedia anchor).
+    for slot in ["driveDiskImage", "cartBytes", "cartFlash"] {
+        if cp.get(slot).is_some() {
+            cp[slot] = Value::Null;
+        }
+    }
+    // omitFramebuffer (runtime-controller.ts:839/847): the two VIC framebuffers
+    // (~317 KiB) are a DERIVABLE shadow — regenerated by re-sim on scrub/dump
+    // (Spec 765 §8). Null them so the per-anchor codec body stays small (the
+    // BUG-049 discipline: the anchor is RAM + chip state, not framebuffers). Without
+    // this the codec body exceeds the recorder ring's anchor slot.
+    if let Some(vp) = cp.get_mut("vicPresentation") {
+        for fb in ["literalPortFb", "literalPortFbStable"] {
+            if vp.get(fb).is_some() {
+                vp[fb] = Value::Null;
+            }
+        }
+    }
+    cp
+}
+
+/// Build the live medium descriptors for the recorder gen-gate. Currently the
+/// attached drive8 disk: its content generation bumps when the image bytes hash
+/// changes (TRX64 has no `diskWriteGeneration` facade — the worktree builders own
+/// the drive — so the hash IS the gen surrogate). The cart medium is deferred
+/// (cart writable-generation is owned by the flash worktree builder).
+fn build_recorder_media(
+    session: &Session,
+    disk_gen: &mut i32,
+    disk_hash: &mut Option<String>,
+) -> Vec<trx64_core::recorder::medium_source::MediumDescriptor> {
+    use trx64_core::recorder::medium_source::{MediumDescriptor, MediumKind};
+    let mut out = Vec::new();
+    if let Some(disk) = session.machine.drive8.get_attached_disk() {
+        let bytes = disk.bytes.clone();
+        let hash = sha256_hex(&bytes);
+        // Bump the generation iff the disk content changed since the last capture.
+        if disk_hash.as_deref() != Some(hash.as_str()) {
+            *disk_gen += 1;
+            *disk_hash = Some(hash);
+        }
+        out.push(MediumDescriptor {
+            kind: MediumKind::Disk,
+            generation: *disk_gen,
+            get_bytes: Box::new(move || Some(bytes.clone())),
+        });
+    }
+    out
 }
 
 // ── SHA-256 helper ────────────────────────────────────────────────────────────
@@ -3690,6 +4316,10 @@ async fn main() {
         inspect_evidence: Vec::new(),
         vic_provenance_enabled: false,
         trace_definitions: std::collections::HashMap::new(),
+        recorder: None,
+        recorder_disk_gen: 0,
+        recorder_disk_hash: None,
+        scenarios: std::collections::HashMap::new(),
     }));
 
     // The singleton live A/V stream hub (ADR-073): one pacing loop drives the
@@ -3750,6 +4380,10 @@ mod batch1_tests {
             inspect_evidence: Vec::new(),
             vic_provenance_enabled: false,
             trace_definitions: std::collections::HashMap::new(),
+            recorder: None,
+            recorder_disk_gen: 0,
+            recorder_disk_hash: None,
+            scenarios: std::collections::HashMap::new(),
         }))
     }
 
@@ -4224,4 +4858,253 @@ mod batch1_tests {
             assert_eq!(call_err(&st, m, json!({})).code, -32001);
         }
     }
+
+    // ── Spec 766.5 — recorder WS surface (wire-shape parity vs c64re) ─────────
+
+    #[test]
+    fn recorder_status_inactive_then_start_capture_list() {
+        let st = make_state();
+        // Before start: { active: false } (ws-server.ts:1081).
+        let s = call(&st, "recorder/status", json!({}));
+        assert_eq!(s["active"], json!(false));
+        let l = call(&st, "recorder/list", json!({}));
+        assert_eq!(l["active"], json!(false));
+        assert_eq!(l["anchors"], json!([]));
+
+        // start → active, captures the first anchor; stats roll up from the store.
+        let start = call(&st, "recorder/start", json!({}));
+        assert_eq!(start["active"], json!(true));
+        assert!(start["stats"]["anchorCount"].as_u64().unwrap() >= 1);
+
+        // status → produced/mediumShipped + the RecorderStats shape (camelCase).
+        let s2 = call(&st, "recorder/status", json!({}));
+        assert_eq!(s2["active"], json!(true));
+        assert!(s2["produced"].as_u64().unwrap() >= 1);
+        for k in ["anchorCount", "oldestCycle", "newestCycle", "slabBytes", "slabUsed", "evicted", "mediumDisk", "mediumCart", "dropped"] {
+            assert!(s2["stats"].get(k).is_some(), "stats.{k} present");
+        }
+
+        // capture → a second anchor with a new seq.
+        let cap = call(&st, "recorder/capture", json!({}));
+        assert_eq!(cap["active"], json!(true));
+        assert!(cap["seq"].is_u64());
+
+        // list → RecorderAnchorRef[] (seq/cycle/wallMs/diskGen/cartGen/schemaVersion).
+        let l2 = call(&st, "recorder/list", json!({}));
+        assert_eq!(l2["active"], json!(true));
+        let anchors = l2["anchors"].as_array().unwrap();
+        assert!(anchors.len() >= 2);
+        for k in ["seq", "cycle", "wallMs", "diskGen", "cartGen", "schemaVersion"] {
+            assert!(anchors[0].get(k).is_some(), "anchor.{k} present");
+        }
+    }
+
+    #[test]
+    fn recorder_dump_reconstructs_anchor_to_native_snapshot() {
+        let st = make_state();
+        call(&st, "recorder/start", json!({}));
+        // The start anchor is seq 0.
+        let dir = std::env::temp_dir().join("trx64-rec-test");
+        let path = dir.join("anchor0.c64re");
+        let path_s = path.to_str().unwrap();
+        let dump = call(&st, "recorder/dump", json!({ "seq": 0, "path": path_s }));
+        // DumpResult shape (identical to snapshot/dump).
+        assert_eq!(dump["path"], json!(path_s));
+        assert_eq!(dump["machine"], json!("c64-pal"));
+        assert!(dump["fileBytes"].as_u64().unwrap() > 0);
+        assert!(dump["media"].is_array());
+        // The file was written and is a readable native snapshot.
+        let bytes = std::fs::read(path_s).unwrap();
+        assert!(trx64_core::native_snapshot::read_native_snapshot(&bytes).is_ok());
+        let _ = std::fs::remove_file(path_s);
+    }
+
+    #[test]
+    fn recorder_dump_errors_on_unknown_seq_and_missing_params() {
+        let st = make_state();
+        call(&st, "recorder/start", json!({}));
+        // Unknown seq (evicted / never existed) → -32001.
+        assert_eq!(
+            call_err(&st, "recorder/dump", json!({ "seq": 9999, "path": "/tmp/x.c64re" })).code,
+            -32001
+        );
+        // Missing params → -32602.
+        assert_eq!(call_err(&st, "recorder/dump", json!({ "path": "/tmp/x" })).code, -32602);
+        assert_eq!(call_err(&st, "recorder/dump", json!({ "seq": 0 })).code, -32602);
+    }
+
+    #[test]
+    fn recorder_stop_clears_active() {
+        let st = make_state();
+        call(&st, "recorder/start", json!({}));
+        let stop = call(&st, "recorder/stop", json!({}));
+        assert_eq!(stop["active"], json!(false));
+        assert_eq!(call(&st, "recorder/status", json!({}))["active"], json!(false));
+        // capture while inactive is a no-op { active: false }.
+        assert_eq!(call(&st, "recorder/capture", json!({}))["active"], json!(false));
+    }
+
+    // ── Spec 231/268 — scenario registry + replay (wire-shape parity) ─────────
+
+    #[test]
+    fn scenario_save_list_load_delete_roundtrip() {
+        let st = make_state();
+        // Empty registry.
+        assert_eq!(call(&st, "runtime/scenario_list", json!({})), json!([]));
+        // save → { id }.
+        let scenario = json!({
+            "id": "boot-test",
+            "diskPath": "/x/disk.g64",
+            "mode": "true-drive",
+            "cycleBudget": 50000,
+            "inputs": [
+                { "atCycle": 1000, "kind": "keyboard", "payload": "LOAD" }
+            ]
+        });
+        let saved = call(&st, "runtime/scenario_save", json!({ "scenario": scenario }));
+        assert_eq!(saved["id"], json!("boot-test"));
+        // list → ScenarioSummary[] (id/diskPath/mode/cycleBudget/inputCount/savedAt).
+        let list = call(&st, "runtime/scenario_list", json!({}));
+        let arr = list.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], json!("boot-test"));
+        assert_eq!(arr[0]["inputCount"], json!(1));
+        assert_eq!(arr[0]["cycleBudget"], json!(50000));
+        // load → the full stored scenario.
+        let loaded = call(&st, "runtime/scenario_load", json!({ "id": "boot-test" }));
+        assert_eq!(loaded["diskPath"], json!("/x/disk.g64"));
+        assert!(loaded["savedAt"].is_string());
+        // load unknown → -32001.
+        assert_eq!(call_err(&st, "runtime/scenario_load", json!({ "id": "nope" })).code, -32001);
+        // delete → { deleted: true }, then false.
+        assert_eq!(call(&st, "runtime/scenario_delete", json!({ "id": "boot-test" }))["deleted"], json!(true));
+        assert_eq!(call(&st, "runtime/scenario_delete", json!({ "id": "boot-test" }))["deleted"], json!(false));
+        assert_eq!(call(&st, "runtime/scenario_list", json!({})), json!([]));
+    }
+
+    #[test]
+    fn scenario_run_is_deterministic_and_reports_ram_hash() {
+        // Replay against the blank (no-ROM) machine: run a fixed cycle budget with
+        // a couple of keyboard inputs at cycles, hash the end RAM. Two runs from the
+        // same start state must hash identically (Spec 231 determinism).
+        let scenario = json!({
+            "id": "det",
+            "cycleBudget": 20000,
+            "inputs": [
+                { "atCycle": 5000, "kind": "keyboard", "payload": "A" },
+                { "atCycle": 9000, "kind": "joystick1", "payload": { "fire": true } }
+            ]
+        });
+        let run_once = || {
+            let st = make_state();
+            call(&st, "runtime/scenario_run", json!({ "scenario": scenario }))
+        };
+        let r1 = run_once();
+        let r2 = run_once();
+        assert_eq!(r1["ramHash"], r2["ramHash"], "deterministic RAM hash");
+        assert!(r1["ramHash"].as_str().unwrap().len() == 64, "sha256 hex");
+        assert_eq!(r1["cyclesRan"], r2["cyclesRan"]);
+        // The run advanced the clock by ~cycleBudget.
+        assert!(r1["cyclesRan"].as_u64().unwrap() >= 20000);
+        // start/end PC + cycle present for cross-checking.
+        for k in ["startCycle", "endCycle", "startPc", "endPc"] {
+            assert!(r1.get(k).is_some(), "{k} present");
+        }
+    }
+
+    #[test]
+    fn scenario_run_by_id_from_registry() {
+        let st = make_state();
+        let scenario = json!({
+            "id": "reg-run",
+            "cycleBudget": 10000,
+            "inputs": []
+        });
+        call(&st, "runtime/scenario_save", json!({ "scenario": scenario }));
+        let r = call(&st, "runtime/scenario_run", json!({ "id": "reg-run" }));
+        assert!(r["ramHash"].is_string());
+        assert!(r["cyclesRan"].as_u64().unwrap() >= 10000);
+        // unknown id → -32001.
+        assert_eq!(call_err(&st, "runtime/scenario_run", json!({ "id": "nope" })).code, -32001);
+    }
+
+    /// End-to-end record → SEEK round-trip: record anchors at distinct machine
+    /// states (different RAM marker + cycle), then RECONSTRUCT an earlier anchor and
+    /// RESTORE it through the checkpoint path — the machine must land back at THAT
+    /// anchor's captured RAM marker (seek via anchor lands at the checkpoint). This
+    /// proves the recorder's anchors are faithful, restorable scrub points.
+    #[test]
+    fn record_then_seek_via_anchor_lands_at_that_state() {
+        let st = make_state();
+        call(&st, "recorder/start", json!({})); // anchor seq 0 (marker 0x00 @ $4000)
+
+        // Stamp a marker in RAM, advance the clock, capture anchor seq 1.
+        {
+            let mut g = st.lock().unwrap();
+            g.session.machine.poke(0x4000, &[0xAA]);
+            run_cycle_budget(&mut g.session, 5000);
+        }
+        let cap1 = call(&st, "recorder/capture", json!({}));
+        let seq1 = cap1["seq"].as_u64().unwrap();
+        let cycle1 = {
+            let g = st.lock().unwrap();
+            g.recorder.as_ref().unwrap().list().last().unwrap().cycle
+        };
+
+        // Change the marker + advance further, capture anchor seq 2.
+        {
+            let mut g = st.lock().unwrap();
+            g.session.machine.poke(0x4000, &[0xBB]);
+            run_cycle_budget(&mut g.session, 5000);
+        }
+        call(&st, "recorder/capture", json!({}));
+
+        // Sanity: live RAM now holds the LATEST marker.
+        assert_eq!(st.lock().unwrap().session.machine.read_full(0x4000), 0xBB);
+
+        // SEEK: reconstruct anchor seq1 (marker 0xAA) and restore it. The machine
+        // must revert to the 0xAA marker + the seq1 capture cycle — i.e. it lands
+        // exactly at that earlier anchor, not the live state.
+        {
+            let mut g = st.lock().unwrap();
+            let (_, _, payload) = g.recorder.as_ref().unwrap().reconstruct(seq1).unwrap();
+            restore_live_checkpoint(&mut g.session, &payload).unwrap();
+            assert_eq!(
+                g.session.machine.read_full(0x4000), 0xAA,
+                "seek landed at the seq1 anchor's RAM marker"
+            );
+            assert_eq!(
+                g.session.machine.c64_core.clk as f64, cycle1,
+                "seek landed at the seq1 anchor's captured cycle"
+            );
+        }
+    }
+
+    /// Record → REPLAY determinism: two independent recordings of the SAME input
+    /// schedule, reconstructed at the same anchor, yield byte-identical RAM. The
+    /// recorder's anchors are deterministic w.r.t. the input stream.
+    #[test]
+    fn record_replay_is_deterministic_across_runs() {
+        let record_marker_at_anchor = || {
+            let st = make_state();
+            call(&st, "recorder/start", json!({}));
+            {
+                let mut g = st.lock().unwrap();
+                // Deterministic mutation: a fixed marker + a fixed run budget.
+                g.session.machine.poke(0x5000, &[0x42]);
+                run_cycle_budget(&mut g.session, 7000);
+            }
+            let cap = call(&st, "recorder/capture", json!({}));
+            let seq = cap["seq"].as_u64().unwrap();
+            let g = st.lock().unwrap();
+            let (_, _, payload) = g.recorder.as_ref().unwrap().reconstruct(seq).unwrap();
+            // Hash the reconstructed RAM blob (the byte-exact replay artifact).
+            let ram = trx64_core::native_snapshot::ta_u8_decode(&payload["ram"]).unwrap();
+            sha256_hex(&ram)
+        };
+        let h1 = record_marker_at_anchor();
+        let h2 = record_marker_at_anchor();
+        assert_eq!(h1, h2, "deterministic reconstructed RAM across recordings");
+    }
 }
+
