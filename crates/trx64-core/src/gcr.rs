@@ -766,4 +766,87 @@ mod tests {
             "track 18 must contain a 0xff sync run"
         );
     }
+
+    /// Scan every .g64 in the sample library and confirm each parses cleanly:
+    /// 84 half-tracks, populated data tracks, and a 0xff sync run on the
+    /// directory track (track 18). This is the parser-breadth check behind the
+    /// 7-game .g64 milestone — every game image must at least MOUNT.
+    #[test]
+    fn from_g64_scans_all_samples() {
+        let dir = "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples";
+        let rd = match std::fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(_) => return, // skip without sample dir
+        };
+        let mut scanned = 0usize;
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("g64") {
+                continue;
+            }
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let name = path.file_name().unwrap().to_string_lossy();
+
+            // Header magic must be GCR-1541 (the 1541 case we support).
+            assert_eq!(
+                &bytes[0..9],
+                &GCR_IMAGE_HEADER_EXPECTED_1541[..],
+                "{name}: GCR-1541 magic"
+            );
+            let num_ht = bytes[9] as usize;
+            assert!(num_ht >= 1 && num_ht <= G64_MAX_GCR_TRACKS, "{name}: num_half_tracks");
+
+            let img = GcrImage::from_g64(&bytes);
+            assert_eq!(img.tracks.len(), DRIVE_HALFTRACKS_1541, "{name}: 84 slots");
+
+            // Track 1 (slot 0) and track 18 (slot 34) must be populated with a
+            // plausible raw size and a GCR SYNC mark. SYNC on a 1541 is a run of
+            // >= 10 consecutive 1-bits in the bit stream (the hardware SYNC
+            // detector / VICE rotation_1541_gcr) — NOT necessarily 5 whole 0xff
+            // bytes, since the mark is rarely byte-aligned. (motm.g64's directory
+            // happens to be byte-aligned; many protected track-1 sync marks are
+            // not, so a byte-windowed [0xff;5] check would wrongly reject them.)
+            for &(slot, label) in &[(0usize, "track1"), (34usize, "track18")] {
+                let t = &img.tracks[slot];
+                assert!(
+                    t.size > 5000 && t.size <= 8000,
+                    "{name}: {label} raw size plausible (got {})",
+                    t.size
+                );
+                assert!(
+                    max_sync_bit_run(&t.data) >= 10,
+                    "{name}: {label} has a GCR SYNC mark (>=10 consecutive 1-bits)"
+                );
+            }
+            scanned += 1;
+        }
+        eprintln!("from_g64 scanned {scanned} .g64 sample images — all mount cleanly");
+        // If the sample dir exists it should have several .g64 games.
+        if scanned > 0 {
+            assert!(scanned >= 5, "expected several .g64 samples, scanned {scanned}");
+        }
+    }
+
+    /// Longest run of consecutive 1-bits in a GCR byte stream (MSB-first) — the
+    /// SYNC criterion the 1541 hardware uses (>= 10 ones).
+    fn max_sync_bit_run(data: &[u8]) -> u32 {
+        let mut run: u32 = 0;
+        let mut best: u32 = 0;
+        for &byte in data {
+            for i in (0..8).rev() {
+                if (byte >> i) & 1 != 0 {
+                    run += 1;
+                    if run > best {
+                        best = run;
+                    }
+                } else {
+                    run = 0;
+                }
+            }
+        }
+        best
+    }
 }
