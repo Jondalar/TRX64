@@ -212,7 +212,10 @@ impl AlarmContext {
                 Alarm::new(),
             ],
             pending_alarms: vec![
-                PendingAlarm { alarm: AlarmId::T1Zero, clk: 0 };
+                PendingAlarm {
+                    alarm: AlarmId::T1Zero,
+                    clk: 0
+                };
                 ALARM_CONTEXT_MAX_PENDING_ALARMS
             ],
             num_pending_alarms: 0,
@@ -285,7 +288,10 @@ impl AlarmContext {
                 // alarm_log_too_many_alarms — return without scheduling.
                 return;
             }
-            self.pending_alarms[new_idx] = PendingAlarm { alarm: id, clk: cpu_clk };
+            self.pending_alarms[new_idx] = PendingAlarm {
+                alarm: id,
+                clk: cpu_clk,
+            };
             self.num_pending_alarms += 1;
             if cpu_clk < self.next_pending_alarm_clk {
                 self.next_pending_alarm_clk = cpu_clk;
@@ -296,9 +302,7 @@ impl AlarmContext {
             // Already pending: modify.
             let idx = idx as usize;
             self.pending_alarms[idx].clk = cpu_clk;
-            if self.next_pending_alarm_clk > cpu_clk
-                || idx as i32 == self.next_pending_alarm_idx
-            {
+            if self.next_pending_alarm_clk > cpu_clk || idx as i32 == self.next_pending_alarm_idx {
                 self.update_next_pending();
             }
         }
@@ -613,7 +617,11 @@ pub fn update_myviairq_rclk(ctx: &mut ViaContext, backend: &mut dyn ViaBackend, 
     backend.set_int(
         ctx,
         ctx.int_num,
-        if (ctx.ifr & ctx.ier & 0x7f) != 0 { 1 } else { 0 },
+        if (ctx.ifr & ctx.ier & 0x7f) != 0 {
+            1
+        } else {
+            0
+        },
         rclk,
     );
 }
@@ -747,7 +755,8 @@ fn setup_shifting(ctx: &mut ViaContext, rclk: u64) {
         VIA_ACR_SR_IN_PHI2 | VIA_ACR_SR_OUT_PHI2 => {
             if ctx.shift_state == FINISHED_SHIFTING {
                 ctx.shift_state = START_SHIFTING;
-                ctx.alarm_context.alarm_set(AlarmId::Phi2Sr, (rclk + 1) & 0xffff_ffff);
+                ctx.alarm_context
+                    .alarm_set(AlarmId::Phi2Sr, (rclk + 1) & 0xffff_ffff);
             }
         }
         VIA_ACR_SR_OUT_FREE_T2 => {
@@ -1415,7 +1424,11 @@ pub fn viacore_t2_zero_alarm(ctx: &mut ViaContext, backend: &mut dyn ViaBackend,
 }
 
 // PORT OF: viacore.ts:1107-1149 (viacore_t2_underflow_alarm)
-pub fn viacore_t2_underflow_alarm(ctx: &mut ViaContext, _backend: &mut dyn ViaBackend, offset: u64) {
+pub fn viacore_t2_underflow_alarm(
+    ctx: &mut ViaContext,
+    _backend: &mut dyn ViaBackend,
+    offset: u64,
+) {
     let rclk = ctx.clk.wrapping_sub(offset) & 0xffff_ffff;
     // TS: `let next_alarm = 0;` then every branch reassigns (viacore.ts:1113).
     #[allow(unused_assignments)]
@@ -1590,17 +1603,56 @@ pub fn viacore_init(ctx: &mut ViaContext) {
 // via `ctx.prv.drive` (= the rotation model) and `ctx.context` (= the IntStatus for
 // set_int). One method per VICE `static` fn, same name, same body.
 
-use crate::drive_6510core::IntStatus;
 use crate::rotation::{Rotation, BRA_MOTOR_ON};
 
 // PORT OF: via2d.ts:196-197 (DRIVE_SOUND_MOTOR_ON / DRIVE_SOUND_MOTOR_OFF)
 const DRIVE_SOUND_MOTOR_ON: u32 = 1;
 const DRIVE_SOUND_MOTOR_OFF: u32 = 0;
 
+/// IRQ-line mirror written by the VIA2 `set_int` hook. VICE's set_int calls
+/// `interrupt_set_irq(int_status, int_num, value, rclk)` directly, but the drive
+/// executor holds `&mut IntStatus` while the bus runs, so the backend records the
+/// line LEVEL + rclk here and the drive run loop replays it into
+/// `IntStatus::set_irq(1, active, stamp)` at the instruction boundary. The
+/// `set()` edge logic IS VICE's interrupt_set_irq: stamp `irq_clk` on the 0→1
+/// edge, drop to the inactive sentinel on the final deassert.
+#[derive(Clone, Copy, Debug)]
+pub struct Via2Irq {
+    pub active: bool,
+    pub stamp: u64,
+}
+
+impl Via2Irq {
+    pub fn new() -> Self {
+        Via2Irq {
+            active: false,
+            stamp: u64::MAX,
+        }
+    }
+    #[inline]
+    pub fn set(&mut self, value: bool, rclk: u64) {
+        if value {
+            if !self.active {
+                self.active = true;
+                self.stamp = rclk;
+            }
+        } else if self.active {
+            self.active = false;
+            self.stamp = u64::MAX;
+        }
+    }
+}
+
+impl Default for Via2Irq {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// VIA2 backend (= `drive_t` + diskunit context the via2d hooks reach). Holds the
-/// rotation model (`ctx.prv.drive`), the drive number, the IntStatus pointer
-/// (`ctx.context.cpu.int_status`), and the pending set-overflow latch
-/// (`drive_cpu_set_overflow` flush). Built per drive-bus run.
+/// rotation model (`ctx.prv.drive`), the drive number, the IRQ-line mirror
+/// (`ctx.context.cpu.int_status` — see [`Via2Irq`]), and the pending set-overflow
+/// latch (`drive_cpu_set_overflow` flush). Built per VIA2 access.
 pub struct Via2dBackend<'a> {
     /// `ctx.prv.drive` — the rotating GCR disk model. `None` ⇒ no disk mounted
     /// (the TS keeps `drv` live but pre-mount our rotation has `image == None`;
@@ -1608,8 +1660,8 @@ pub struct Via2dBackend<'a> {
     pub drive: &'a mut Rotation,
     /// `via2p.number` — the drive unit number (speed-zone set arg).
     pub number: usize,
-    /// `ctx.context.cpu.int_status` — set_int target (interrupt_set_irq).
-    pub int: &'a mut IntStatus,
+    /// `ctx.context.cpu.int_status` — set_int target (interrupt_set_irq mirror).
+    pub irq: &'a mut Via2Irq,
     /// drive_cpu_set_overflow latch — folded into the drive 6502 V flag by the
     /// run loop after the store completes (the bus borrow can't reach `cpu`).
     pub pending_set_overflow: bool,
@@ -1661,11 +1713,11 @@ impl<'a> ViaBackend for Via2dBackend<'a> {
     }
 
     // PORT OF: via2d.ts:241-258 (set_int)
-    fn set_int(&mut self, ctx: &ViaContext, _int_num: u32, value: u32, rclk: u64) {
+    fn set_int(&mut self, _ctx: &ViaContext, _int_num: u32, value: u32, rclk: u64) {
         // VICE: interrupt_set_irq(dc->cpu->int_status, int_num, value, rclk).
-        // The drive's VIA2 is int_num 1 (VIA1 = 0). The IntStatus per-source
-        // index is fixed by the drive wire-up, so use ctx.int_num.
-        self.int.set_irq(ctx.int_num as usize, value != 0, rclk);
+        // The drive's VIA2 is int_num 1; the mirror replays into IntStatus::set_irq
+        // at the instruction boundary (the executor holds &mut IntStatus here).
+        self.irq.set(value != 0, rclk);
     }
 
     // PORT OF: via2d.ts:265-275 (restore_int) — no-op for headless.
@@ -1801,7 +1853,11 @@ impl<'a> ViaBackend for Via2dBackend<'a> {
         let clk = ctx.clk;
         self.drive.rotate_disk(clk);
         let sync = self.drive.sync_found(); // already 0 or 0x80
-        let wps = if self.drive_writeprotect_sense(clk) { 0x10 } else { 0 };
+        let wps = if self.drive_writeprotect_sense(clk) {
+            0x10
+        } else {
+            0
+        };
         let ddrb = ctx.via[VIA_DDRB];
         let prb = ctx.via[VIA_PRB];
         let byte = (((sync | wps | 0x6f) & !ddrb) | (prb & ddrb)) & 0xff;

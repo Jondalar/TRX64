@@ -21,6 +21,7 @@ use crate::{
     },
     gcr::GcrImage,
     rotation::Rotation,
+    viacore::{self, Via2Irq, Via2dBackend, ViaContext},
     RomError,
 };
 
@@ -151,7 +152,10 @@ impl Default for Via2Ports {
         //   read_pra GCR_read → 0 with no image, but DDRA=0 so PRA reads the pin
         //     which the ROM treats as the floating data bus.
         // PRB pin = sync(0x80) | wps(0x10) | 0x6f = 0xFF.
-        Self { pra_pin: 0xff, prb_pin: 0xff }
+        Self {
+            pra_pin: 0xff,
+            prb_pin: 0xff,
+        }
     }
 }
 
@@ -496,7 +500,12 @@ struct DriveBus<'a> {
     ram: &'a mut [u8; 0x800],
     rom: &'a [u8; 0x8000],
     via1: &'a mut Via6522,
-    via2: &'a mut Via6522,
+    /// VIA2 — the 1:1-ported viacore `ViaContext` (viacore.rs). Its disk-controller
+    /// hooks dispatch through a `Via2dBackend` built on the fly from `rotation` +
+    /// `via2_irq` + `pending_set_overflow`.
+    via2: &'a mut ViaContext,
+    /// VIA2 IRQ-line mirror (the viacore `set_int` sink — see `viacore::Via2Irq`).
+    via2_irq: &'a mut Via2Irq,
     /// Live IEC bus state at the VIA1 PB inputs (= iecbus.drv_port). Read by a
     /// `$1800` PB access so the drive's idle loop sees the C64-driven CLK/DATA/ATN.
     /// MUTATED by a `$1800` store: the drive re-folds the wired-AND against the
@@ -517,13 +526,11 @@ struct DriveBus<'a> {
     /// drivecpu.c:165 `drv->clk_ptr->value = 6`) — the 6-cycle reset sequence —
     /// exactly as VICE mutates the shared drive clock from the reset dispatch.
     clk_ptr: *mut u64,
-    /// Disk-controller port inputs supplied to VIA2 PRA/PRB reads (fallback when
-    /// no disk is mounted — the static "no rotating disk" defaults).
-    via2_ports: Via2Ports,
-    /// The rotating GCR disk model. `image == None` ⇒ no disk; VIA2 falls back to
-    /// the static `via2_ports`. When a D64 is mounted this drives PRA (GCR_read),
-    /// PRB bit7 (SYNC), the stepper/motor/speed-zone from store_prb, and the
-    /// byte-ready (SO) handshake consumed by the drive CPU's V flag.
+    /// The rotating GCR disk model. `image == None` ⇒ no disk; the VIA2 read_pra/
+    /// read_prb hooks then return 0xff (= the old static "no rotating disk"
+    /// defaults). When a D64 is mounted this drives PRA (GCR_read), PRB bit7
+    /// (SYNC), the stepper/motor/speed-zone from store_prb, and the byte-ready
+    /// (SO) handshake consumed by the drive CPU's V flag.
     rotation: &'a mut Rotation,
     /// Pending `drive_cpu_set_overflow` request raised by a VIA2 store side-effect
     /// (set_ca2 on the PCR CA2 edge / store_prb on the motor edge — via2d.c
@@ -569,161 +576,58 @@ impl<'a> DriveBus<'a> {
     /// PA floats high (the drive does not read a meaningful PA on VIA1).
     #[inline]
     fn via1_ports(&self) -> Via2Ports {
-        Via2Ports { pra_pin: 0xff, prb_pin: self.via1_iec_tmp() }
+        Via2Ports {
+            pra_pin: 0xff,
+            prb_pin: self.via1_iec_tmp(),
+        }
     }
 
-    /// VIA2 port inputs for a PRA/PRB read. When a disk is mounted the rotating
-    /// model is advanced to `clk` first (via2d read_pra → rotation_byte_read /
-    /// read_prb → rotation_rotate_disk) and supplies PRA = GCR_read, PRB =
-    /// (sync | wps | 0x6f). With no disk, the static defaults.
+    /// Build the VIA2 disk-controller backend (via2d.ts) from the bus's borrowed
+    /// rotation / IRQ-mirror / set-overflow fields, run `f` (a viacore entry), and
+    /// flush the backend's `pending_set_overflow` back. `self.via2.clk` is synced
+    /// to the live drive clock first — this IS VICE's `clk_ptr->value` indirection.
+    /// `has_image` mirrors the TS `if (!drv) return` guard (no disk ⇒ hooks skip).
     #[inline]
-    fn via2_ports_live(&mut self, for_pra: bool) -> Via2Ports {
-        if self.rotation.image.is_some() {
-            // VICE-exact: read_pra → rotation_byte_read (clears attach_clk on the
-            // PRA path); read_prb → rotation_rotate_disk THEN prb_pin (sync_found +
-            // drive_writeprotect_sense, which clears attach_clk on the PRB/WPS path).
-            // Only the path actually being read runs its spin-up-window clear, so
-            // attach_clk advances exactly as VICE's does.
-            let clk = self.clk();
-            if for_pra {
-                self.rotation.byte_read(clk);
-                Via2Ports {
-                    pra_pin: self.rotation.pra_pin(),
-                    prb_pin: self.via2_ports.prb_pin,
-                }
-            } else {
-                self.rotation.rotate_disk(clk);
-                let prb = self.rotation.prb_pin(clk);
-                Via2Ports { pra_pin: self.rotation.pra_pin(), prb_pin: prb }
-            }
-        } else {
-            self.via2_ports
+    fn via2_with_backend<R>(
+        &mut self,
+        f: impl FnOnce(&mut ViaContext, &mut Via2dBackend) -> R,
+    ) -> R {
+        self.via2.clk = self.clk();
+        let has_image = self.rotation.image.is_some();
+        let mut backend = Via2dBackend {
+            drive: self.rotation,
+            number: 0,
+            irq: self.via2_irq,
+            pending_set_overflow: false,
+            has_image,
+        };
+        let r = f(self.via2, &mut backend);
+        if backend.pending_set_overflow {
+            self.pending_set_overflow = true;
         }
+        r
     }
 
-    /// via2d store_prb side-effects (via2d.c:382-487): LED (PB3), stepper (PB0-1
-    /// gated by motor PB2), motor-on (PB2 → byte_ready_active), speed-zone
-    /// (PB5-6). Applied AFTER the generic 6522 latches the ORB, using the new
-    /// composed output byte. `old_pb` is the prior PB output (for edge detects).
-    fn via2_store_prb_effects(&mut self, old_pb: u8, new_pb: u8) {
-        if self.rotation.image.is_none() {
-            return;
-        }
-        // VICE via2d.c:210 — rotation_rotate_disk(drv) is the FIRST thing store_prb
-        // does, BEFORE the stepper/speed-zone/motor logic. This advances the GCR
-        // head offset (and rotation_last_clk) to the current clk so that a
-        // subsequent step's set_half_track head-offset rescale operates on the
-        // up-to-date rotational position — and so the motor-on re-anchor (`begins`)
-        // doesn't drop the elapsed head-advance since the last rotate. Omitting it
-        // leaves the head one inter-sector gap out of phase at sector-lock (the
-        // ~17-20k-cycle transfer-start phase LEAD; ADR-040/041). Matches the TS
-        // port's store_prb (vice1541/via2d.ts:394-395).
-        let clk = self.clk();
-        self.rotation.rotate_disk(clk);
-
-        let r = &mut self.rotation;
-        // Stepper PB0-1, gated by motor PB2 (via2d.c:255-313). Computed from the
-        // current half-track BEFORE any move so the bug#1083 motor-on retrigger
-        // below can reuse new/old stepper positions.
-        let track_number = r.current_half_track.wrapping_sub(2);
-        let new_stepper = (new_pb & 3) as i32;
-        let old_stepper = (track_number & 3) as i32;
-        let mut step_count = (new_stepper - old_stepper) & 3;
-        if step_count == 3 {
-            step_count = -1;
-        }
-        if new_pb & 0x04 != 0 {
-            // via2d.c:307 — ±1 gate at this FIRST call site only.
-            if step_count == 1 || step_count == -1 {
-                r.move_head(step_count);
-            }
-        }
-        // Speed zone (density) PB5-6 — only on change (via2d.c:321-323, AFTER
-        // the stepper, BEFORE the motor-on/off transition).
-        if (old_pb ^ new_pb) & 0x60 != 0 {
-            r.speed_zone_set(((new_pb >> 5) & 0x3) as usize);
-        }
-        // Motor on/off edge (via2d.c:325-352): mirror PB2 into byte_ready_active.
-        // On motor-off, flush a pending byte-ready edge into V (drive_cpu_set_overflow,
-        // via2d.c:343-348); on motor-on, re-anchor the rotation clock.
-        let was_motor = r.byte_ready_active & crate::rotation::BRA_MOTOR_ON;
-        let now_motor = new_pb & crate::rotation::BRA_MOTOR_ON;
-        if was_motor != now_motor {
-            r.byte_ready_active =
-                (r.byte_ready_active & !crate::rotation::BRA_MOTOR_ON) | now_motor;
-            if now_motor != 0 {
-                r.begins(clk);
-            } else if r.byte_ready_edge != 0 {
-                self.pending_set_overflow = true;
-                r.byte_ready_edge = 0;
-            }
-            // VICE via2d.c:338-351 (bug #1083 "Primitive 7 Sins" workaround): on a
-            // motor-on edge, if the stepper position changed AND motor is now on,
-            // call drive_move_head a SECOND time WITHOUT the ±1 gate (drive_move_head
-            // handles the ±2 opposite-coil case). Matches vice1541/via2d.ts:478-482.
-            if new_stepper != old_stepper && new_pb & 0x04 != 0 {
-                r.move_head(step_count);
-            }
-        }
-        // VICE via2d.c:354 — byte_ready_level cleared last on a PB store.
-        self.rotation.byte_ready_level = 0;
-    }
-
-    /// Composed VIA2 PB output (`ORB | ~DDRB`) — the value the motor/stepper/LED/
-    /// speed-zone pins see (output bits = ORB, input bits float high).
+    /// Dispatch any VIA2 alarms due at/before `clk` (= viacore run_pending_alarms,
+    /// the PROCESS_ALARMS path). The alarm callbacks update IFR + the IRQ mirror.
     #[inline]
-    fn via2_pb_output(&self) -> u8 {
-        let orb = self.via2.regs[0];
-        let ddrb = self.via2.regs[2];
-        (orb | !ddrb) & 0xff
+    fn via2_run_alarms(&mut self, clk: u64) {
+        self.via2.clk = clk;
+        self.via2_with_backend(|ctx, b| viacore::run_pending_alarms(ctx, b, clk, 0));
     }
 
-    /// VIA2 $1C0C (PCR) store side-effects, in VICE dispatch order. viacore_store
-    /// (viacore.c:786) on a PCR write first recomputes `ca2_out_state` from the new
-    /// PCR CA2 mode and calls `set_ca2` (via2d.c:72-93), THEN runs `store_pcr` →
-    /// `via2d_update_pcr` (via2d.c:165-178). Both touch the byte-ready-enable bit of
-    /// `byte_ready_active`; the set_ca2 call additionally flushes a pending
-    /// byte-ready edge into the drive CPU's overflow flag on the CA2 low→high edge —
-    /// the $F556 read-loop handshake. `for_pcr` carries the raw stored PCR byte.
-    fn via2_store_pcr_effects(&mut self, pcrval: u8) {
-        if self.rotation.image.is_none() {
-            return;
-        }
-        let clk = self.clk();
-        // ── set_ca2 (via2d.c:72-93), dispatched by viacore from the PCR store ──
-        // VICE viacore.c:786 derives ca2_out_state from the new PCR CA2 mode:
-        //   (pcr & 0x0e) == 0x0c (LOW_OUTPUT)  → 0
-        //   (pcr & 0x0e) == 0x0e (HIGH_OUTPUT) → 1
-        //   else (input / handshake / pulse)   → 1
-        let ca2_low = (pcrval & 0x0e) == 0x0c;
-        let new_ca2: u8 = if ca2_low { 0 } else { 1 };
-        let curr = (self.rotation.byte_ready_active >> 1) & 1;
-        if new_ca2 != curr {
-            // set_ca2: rotate, latch the new byte-ready-active bit, and on the
-            // low→high re-enable flush any pending byte-ready edge into V.
-            self.rotation.rotate_disk(clk);
-            self.rotation.byte_ready_active =
-                (self.rotation.byte_ready_active & !crate::rotation::BRA_BYTE_READY)
-                    | (new_ca2 << 1);
-            if self.rotation.byte_ready_edge != 0 {
-                // drive_cpu_set_overflow(dc): set the drive 6502 V flag. The bus
-                // borrow can't reach `cpu`; latch the request for step_instruction.
-                self.pending_set_overflow = true;
-                self.rotation.byte_ready_edge = 0;
-            }
-        }
-        // ── via2d_update_pcr (via2d.c:165-178), via store_pcr after set_ca2 ──
-        let r = &mut self.rotation;
-        r.rotate_disk(clk);
-        r.read_write_mode = pcrval & 0x20 != 0;
-        // PCR bit1 → BRA_BYTE_READY in byte_ready_active (matches the set_ca2 latch
-        // above for the LOW/HIGH output modes the DOS uses).
-        let pcr_br = (pcrval & crate::rotation::BRA_BYTE_READY) != 0;
-        if pcr_br {
-            r.byte_ready_active |= crate::rotation::BRA_BYTE_READY;
-        } else {
-            r.byte_ready_active &= !crate::rotation::BRA_BYTE_READY;
-        }
+    /// VIA2 register store (= viacore_store via the via2d backend). The viacore
+    /// applies its own `write_offset` (= 1) so rclk = clk - 1; the rotation
+    /// side-effects (store_prb / store_pcr) read the FULL clk via `ctx.clk`.
+    #[inline]
+    fn via2_store(&mut self, addr: u16, val: u8) {
+        self.via2_with_backend(|ctx, b| viacore::viacore_store(ctx, b, addr, val));
+    }
+
+    /// VIA2 register read (= viacore_read via the via2d backend).
+    #[inline]
+    fn via2_read(&mut self, addr: u16) -> u8 {
+        self.via2_with_backend(|ctx, b| viacore::viacore_read(ctx, b, addr))
     }
 }
 
@@ -738,7 +642,7 @@ impl<'a> DriveCore6510Bus for DriveBus<'a> {
     #[inline]
     fn process_alarms(&mut self, clk: u64) {
         self.via1.run_alarms(clk);
-        self.via2.run_alarms(clk);
+        self.via2_run_alarms(clk);
     }
 
     /// drivecpu_rotate (drivecpu.c:423-433): advance the rotating GCR head to the
@@ -797,32 +701,18 @@ impl<'a> DriveCore6510Bus for DriveBus<'a> {
                     self.via1.run_alarms(clk);
                     return self.via1.read(addr, clk, ports);
                 }
-                // VIA2: $1C00-$1FFF — real 6522 timer/IFR/IER/PCR model. PRA
-                // ($1C01) / PRB ($1C00) port reads sample the rotating disk: PRA
-                // = GCR_read, PRB bit7 = SYNC. A PRA read advances the model and
-                // clears byte_ready_level (via2d read_pra/read_prb).
+                // VIA2: $1C00-$1FFF — the 1:1-ported viacore (viacore.rs). PRA
+                // ($1C01) / PRB ($1C00) reads sample the rotating disk through the
+                // via2d read_pra/read_prb hooks (GCR_read / sync | wps | 0x6f) and
+                // clear byte_ready_level inside the backend. viacore_read dispatches
+                // any due alarms itself (rclk = clk) for PRB/timer/IFR regs.
                 if (0x1C00..=0x1FFF).contains(&addr) {
-                    self.via2.run_alarms(clk);
-                    let reg = addr & 0x0f;
-                    let ports = if reg == 1 || reg == 15 {
-                        let p = self.via2_ports_live(true);
-                        self.rotation.byte_ready_level = 0;
-                        p
-                    } else if reg == 0 {
-                        let p = self.via2_ports_live(false);
-                        self.rotation.byte_ready_level = 0;
-                        p
-                    } else {
-                        self.via2_ports
-                    };
-                    return self.via2.read(addr, clk, ports);
+                    return self.via2_read(addr);
                 }
                 // RAM mirrors: $0000-$07FF and all mirrors up to $7FFF
                 self.ram[(addr & 0x07FF) as usize]
             }
-            0x8000..=0xFFFF => {
-                self.rom[(addr & 0x7FFF) as usize]
-            }
+            0x8000..=0xFFFF => self.rom[(addr & 0x7FFF) as usize],
         }
     }
 
@@ -862,19 +752,12 @@ impl<'a> DriveCore6510Bus for DriveBus<'a> {
                     return;
                 }
                 if (0x1C00..=0x1FFF).contains(&addr) {
-                    self.via2.run_alarms(wclk);
-                    let reg = addr & 0x0f;
-                    // Prior PB output (ORB|~DDRB) for the stepper/motor edge detect.
-                    let old_pb = self.via2_pb_output();
-                    self.via2.write(addr, val, wclk);
-                    // store_prb side-effects: stepper / motor / LED / speed-zone.
-                    if reg == 0 {
-                        let new_pb = self.via2_pb_output();
-                        self.via2_store_prb_effects(old_pb, new_pb);
-                    } else if reg == 0x0c {
-                        // store_pcr → via2d_update_pcr (read/write mode + byte-ready).
-                        self.via2_store_pcr_effects(val);
-                    }
+                    // viacore_store applies its own write_offset (= 1) so rclk =
+                    // ctx.clk - 1 for the register/timer/IFR/IRQ logic, while the
+                    // store_prb/store_pcr rotation hooks read the FULL ctx.clk —
+                    // exactly the Spec 612 split. The stepper/motor/speed-zone/
+                    // byte-ready side-effects run inside the via2d backend hooks.
+                    self.via2_store(addr, val);
                     return;
                 }
                 // RAM mirrors — write to the base 2 KB
@@ -905,7 +788,14 @@ pub struct Drive1541 {
     ram: Box<[u8; 0x800]>,
     rom: Box<[u8; 0x8000]>,
     via1: Via6522,
-    via2: Via6522,
+    /// VIA2 — the 1:1-ported viacore `ViaContext` (viacore.rs). Replaces the
+    /// distilled `Via6522` for VIA2: the disk-controller hooks (stepper/motor/
+    /// SYNC/byte-ready) run through `Via2dBackend` exactly as via2d.ts does.
+    via2: ViaContext,
+    /// VIA2 IRQ-line mirror (see `viacore::Via2Irq`): the viacore `set_int` hook
+    /// records the line level + rclk here; the run loop replays it into
+    /// `int.set_irq(1, ..)` at the instruction boundary.
+    via2_irq: Via2Irq,
     /// Monotonic drive clock (mirrors cpu.clk after each run).
     pub drive_clk: u64,
     /// Last sampled PC for drive8-cpu deduplication (sampleDrivePc pattern).
@@ -943,6 +833,26 @@ pub struct Drive1541 {
     pub rotation: Rotation,
 }
 
+/// Build a powered-on VIA2 `ViaContext` (via2d.ts:625-696 via2d_setup_context +
+/// via2d.ts:612-618 via2d_init). Seeds the calloc-zero struct, runs
+/// `viacore_setup_context` (power-on register latches, write_offset=1, external
+/// cb1/cb2 high), then `viacore_init` (the 5 timer alarms). Sets `int_num = 1`
+/// (the drive VIA2 is interrupt source 1; VIA1 is 0) and the VICE names. The
+/// VIA2 is then cold-reset by `cold_reset()` via `viacore_reset`.
+fn new_via2_ctx() -> ViaContext {
+    let mut via = ViaContext::new();
+    // via2d.ts:709-710 — myname / my_module_name (drive unit 8 → number 0).
+    via.myname = Some("Drive0Via2".to_string());
+    via.my_module_name = Some("VIA2D0".to_string());
+    viacore::viacore_setup_context(&mut via);
+    // via2d.ts:718 — via->irq_line = IK_IRQ = 2.
+    via.irq_line = 2;
+    // via2d.ts:729 — via->int_num. The drive wires VIA2 to IntStatus source 1.
+    via.int_num = 1;
+    viacore::viacore_init(&mut via);
+    via
+}
+
 /// PAL drive sync factor (VICE drivesync.c:53-62 `drive_set_machine_parameter`):
 ///   sync_factor = floor(65536 * 1_000_000 / cycles_per_sec)
 /// with the C64 PAL clock cycles_per_sec = 985_248 (vice1541-facade.ts:319). The
@@ -975,7 +885,8 @@ impl Drive1541 {
             ram: Box::new([0u8; 0x800]),
             rom: Box::new([0u8; 0x8000]),
             via1: Via6522::new(),
-            via2: Via6522::new(),
+            via2: new_via2_ctx(),
+            via2_irq: Via2Irq::new(),
             drive_clk: 0,
             last_sample_pc: None,
             sync_accum: 0,
@@ -1038,7 +949,24 @@ impl Drive1541 {
         // sees the right DDRB before the ROM programs $1802; VIA2's PCR → 0 so the
         // boot $1C0C read returns 0x00 as VICE does. Anchored at reset clock (0).
         self.via1.reset(0);
-        self.via2.reset(0);
+        // VIA2: re-seed a fresh power-on ViaContext, then viacore_reset at clk 0.
+        // A fresh ctx clears any leftover alarm schedule / IFR / latches; the
+        // viacore_reset then re-latches the timers and clears IFR/IER exactly as
+        // VICE drive_reset → viacore_reset does (the via2d `reset` hook sets the
+        // LED; no behavioural impact here). The IRQ mirror is cleared too.
+        self.via2 = new_via2_ctx();
+        self.via2_irq = Via2Irq::new();
+        {
+            self.via2.clk = 0;
+            let mut backend = Via2dBackend {
+                drive: &mut self.rotation,
+                number: 0,
+                irq: &mut self.via2_irq,
+                pending_set_overflow: false,
+                has_image: false,
+            };
+            viacore::viacore_reset(&mut self.via2, &mut backend);
+        }
         // Seed the sync accumulator with the C64 power-on reset cycles the drive's
         // catch-up clock observes in TS (see C64_RESET_DRIVE_OFFSET). This shifts the
         // whole drive_clk schedule into phase with the golden without touching the
@@ -1082,11 +1010,11 @@ impl Drive1541 {
     /// boundary clock equals or just trails — and `irq_stamp` is the inactive
     /// `u64::MAX` sentinel there, which would overflow `rclk + 3`).
     #[inline]
-    fn refresh_irq_line(int: &mut IntStatus, via1: &Via6522, via2: &Via6522, now: u64) {
+    fn refresh_irq_line(int: &mut IntStatus, via1: &Via6522, via2_irq: &Via2Irq, now: u64) {
         let s1 = if via1.irq_active { via1.irq_stamp } else { now };
-        let s2 = if via2.irq_active { via2.irq_stamp } else { now };
+        let s2 = if via2_irq.active { via2_irq.stamp } else { now };
         int.set_irq(0, via1.irq_active, s1);
-        int.set_irq(1, via2.irq_active, s2);
+        int.set_irq(1, via2_irq.active, s2);
     }
 
     /// Composed VIA1 PB output byte driving the IEC bus (= viacore VIA_PRB store
@@ -1159,20 +1087,15 @@ impl Drive1541 {
         // catch-up must be that exact clock at the access instant. `clk_ptr` is also
         // written by the `cpu_reset` hook (`*clk_ptr = 6`).
         let clk_ptr: *mut u64 = &mut core.clk;
-        // Disk-controller port inputs for VIA2 PRA/PRB when NO disk is mounted —
-        // the static "no rotating disk" defaults (sync=0, writeable, GCR floats
-        // high) which reproduce the idle/IRQ stream. With a disk the rotating
-        // model supplies these instead.
-        let via2_ports = Via2Ports::default();
         let mut bus = DriveBus {
             ram: &mut self.ram,
             rom: &self.rom,
             via1: &mut self.via1,
             via2: &mut self.via2,
+            via2_irq: &mut self.via2_irq,
             drv_port: self.iec_drv_port,
             cpu_bus: self.iec_cpu_bus,
             clk_ptr,
-            via2_ports,
             rotation: &mut self.rotation,
             pending_set_overflow: false,
         };
@@ -1190,8 +1113,8 @@ impl Drive1541 {
             // alarms were brought up to `core.clk` by the prior step's PROCESS_ALARMS
             // and by every bus access.
             bus.via1.run_alarms(core.clk);
-            bus.via2.run_alarms(core.clk);
-            Self::refresh_irq_line(int, bus.via1, bus.via2, core.clk);
+            bus.via2_run_alarms(core.clk);
+            Self::refresh_irq_line(int, bus.via1, bus.via2_irq, core.clk);
 
             // One whole drive instruction (or one interrupt/reset dispatch) on the
             // verbatim core. The rotate/byte-ready/SET_OVERFLOW hooks are woven into
@@ -1310,10 +1233,10 @@ mod tests {
                 rom: &d.rom,
                 via1: &mut d.via1,
                 via2: &mut d.via2,
+                via2_irq: &mut d.via2_irq,
                 drv_port: 0x85,
                 cpu_bus: 0xff,
                 clk_ptr: &mut clk,
-                via2_ports: Via2Ports::default(),
                 rotation: &mut d.rotation,
                 pending_set_overflow: false,
             };
@@ -1333,10 +1256,10 @@ mod tests {
             rom: &d.rom,
             via1: &mut d.via1,
             via2: &mut d.via2,
+            via2_irq: &mut d.via2_irq,
             drv_port: 0x85,
             cpu_bus: 0xff,
             clk_ptr: &mut clk,
-            via2_ports: Via2Ports::default(),
             rotation: &mut d.rotation,
             pending_set_overflow: false,
         };
@@ -1344,62 +1267,139 @@ mod tests {
         //   byte = (tmp & ~DDRB) | (PRB & DDRB), tmp = (drv_port ^ 0x85)|0x1a.
         // With DDRB=0 (reset) the read returns tmp = (0x85^0x85)|0x1a = 0x1a.
         bus.write(0x1800, 0x42); // sets ORB latch (no effect with DDRB=0)
-        assert_eq!(bus.read(0x1800), 0x1a, "$1800 PB read = IEC tmp with DDRB=0");
+        assert_eq!(
+            bus.read(0x1800),
+            0x1a,
+            "$1800 PB read = IEC tmp with DDRB=0"
+        );
         // Drive all bits as outputs → read returns the ORB latch verbatim.
         bus.write(0x1802, 0xff); // DDRB = all outputs
-        assert_eq!(bus.read(0x1800), 0x42, "$1800 PB read = ORB latch when DDRB=$FF");
+        assert_eq!(
+            bus.read(0x1800),
+            0x42,
+            "$1800 PB read = ORB latch when DDRB=$FF"
+        );
         // VIA1 PRA ($1801): with DDRA=0xFF it reads back the stored ORA latch.
         bus.write(0x1803, 0xff); // DDRA = all outputs
         bus.write(0x1801, 0x33);
-        assert_eq!(bus.read(0x1801), 0x33, "$1801 PRA reads ORA latch with DDRA=$FF");
+        assert_eq!(
+            bus.read(0x1801),
+            0x33,
+            "$1801 PRA reads ORA latch with DDRA=$FF"
+        );
     }
 
     #[test]
     fn drive_bus_via2_pcr_readback() {
-        // VIA2 PCR ($1C0C) is a real 6522 register: it reads back the stored
-        // value, NOT the old 0xFF stub. After reset PCR = 0x00 (the byte the
-        // boot init at $F263 LDA $1C0C expects — fixes boot-basic-ready +2).
+        // VIA2 PCR ($1C0C) is a real 6522 register (viacore.rs): it reads back the
+        // stored value, NOT the old 0xFF stub. After power-on PCR = 0x00 (the byte
+        // the boot init at $F263 LDA $1C0C expects — fixes boot-basic-ready +2).
         let mut d = Drive1541::new();
-        d.via2.reset(0);
         let mut clk: u64 = 0;
         let mut bus = DriveBus {
             ram: &mut d.ram,
             rom: &d.rom,
             via1: &mut d.via1,
             via2: &mut d.via2,
+            via2_irq: &mut d.via2_irq,
             drv_port: 0x85,
             cpu_bus: 0xff,
             clk_ptr: &mut clk,
-            via2_ports: Via2Ports::default(),
             rotation: &mut d.rotation,
             pending_set_overflow: false,
         };
-        assert_eq!(bus.read(0x1C0C), 0x00, "$1C0C PCR reads 0x00 after reset");
+        assert_eq!(
+            bus.read(0x1C0C),
+            0x00,
+            "$1C0C PCR reads 0x00 after power-on"
+        );
         bus.write(0x1C0C, 0xEE);
-        assert_eq!(bus.read(0x1C0C), 0xEE, "$1C0C PCR reads back the stored value");
+        assert_eq!(
+            bus.read(0x1C0C),
+            0xEE,
+            "$1C0C PCR reads back the stored value"
+        );
     }
 
     #[test]
     fn drive_via2_t1_underflow_raises_irq() {
-        // Program VIA2 T1 (latch $0010) free-run + enable the T1 IRQ, then run
-        // the timer past the underflow and assert the IRQ line goes active with
-        // the IFR T1 bit set — the mechanism behind the periodic drive IRQ.
-        let mut via = Via6522::new();
-        via.reset(0);
-        via.write(0x1C0B, VIA_ACR_T1_FREE_RUN, 10); // ACR: T1 free-run
-        via.write(0x1C06, 0x10, 11); // T1LL = 0x10
-        via.write(0x1C07, 0x00, 12); // T1LH = 0x00
-        via.write(0x1C0E, 0xC0, 13); // IER: enable T1 (bit7 set + T1 bit)
-        via.write(0x1C05, 0x00, 14); // T1CH write starts the timer (tal=0x0010)
-        assert!(!via.irq_active, "no IRQ before underflow");
-        via.run_alarms(14 + 0x10 + 4); // past t1zero
-        assert!(via.irq_active, "T1 underflow asserts the IRQ line");
-        assert_ne!(via.ifr & VIA_IM_T1, 0, "IFR T1 flag set");
+        // Program VIA2 T1 (latch $0010) free-run + enable the T1 IRQ, then run the
+        // timer past the underflow and assert the IRQ line goes active with the IFR
+        // T1 bit set — the mechanism behind the periodic drive IRQ. Exercises the
+        // 1:1-ported viacore (ViaContext) + a no-disk Via2dBackend driving the IRQ
+        // mirror. The store offset (write_offset=1) makes rclk = clk - 1.
+        use crate::viacore::{
+            self as vc, Via2Irq, Via2dBackend, ViaContext, VIA_ACR_T1_FREE_RUN, VIA_IM_T1,
+        };
+        let mut ctx = new_via2_ctx();
+        let mut irq = Via2Irq::new();
+        let mut rot = Rotation::new();
+        // Power-on viacore_reset at clk 0.
+        ctx.clk = 0;
+        {
+            let mut b = Via2dBackend {
+                drive: &mut rot,
+                number: 0,
+                irq: &mut irq,
+                pending_set_overflow: false,
+                has_image: false,
+            };
+            vc::viacore_reset(&mut ctx, &mut b);
+        }
+        // Helper: store / read at clk through a fresh no-disk backend.
+        let store =
+            |ctx: &mut ViaContext, irq: &mut Via2Irq, rot: &mut Rotation, addr, val, clk| {
+                ctx.clk = clk;
+                let mut b = Via2dBackend {
+                    drive: rot,
+                    number: 0,
+                    irq,
+                    pending_set_overflow: false,
+                    has_image: false,
+                };
+                vc::viacore_store(ctx, &mut b, addr, val);
+            };
+        store(
+            &mut ctx,
+            &mut irq,
+            &mut rot,
+            0x1C0B,
+            VIA_ACR_T1_FREE_RUN,
+            10,
+        ); // ACR: T1 free-run
+        store(&mut ctx, &mut irq, &mut rot, 0x1C06, 0x10, 11); // T1LL = 0x10
+        store(&mut ctx, &mut irq, &mut rot, 0x1C07, 0x00, 12); // T1LH = 0x00
+        store(&mut ctx, &mut irq, &mut rot, 0x1C0E, 0xC0, 13); // IER: enable T1
+        store(&mut ctx, &mut irq, &mut rot, 0x1C05, 0x00, 14); // T1CH write starts the timer
+        assert!(!irq.active, "no IRQ before underflow");
+        // Dispatch alarms past t1zero.
+        {
+            ctx.clk = 14 + 0x10 + 4;
+            let mut b = Via2dBackend {
+                drive: &mut rot,
+                number: 0,
+                irq: &mut irq,
+                pending_set_overflow: false,
+                has_image: false,
+            };
+            vc::run_pending_alarms(&mut ctx, &mut b, 14 + 0x10 + 4, 0);
+        }
+        assert!(irq.active, "T1 underflow asserts the IRQ line");
+        assert_ne!(ctx.ifr & VIA_IM_T1, 0, "IFR T1 flag set");
         // Reading T1CL ($1C04) clears the T1 flag and drops the line.
-        via.run_alarms(14 + 0x10 + 5);
-        let _ = via.read(0x1C04, 14 + 0x10 + 5, Via2Ports::default());
-        assert_eq!(via.ifr & VIA_IM_T1, 0, "reading T1CL clears the T1 flag");
-        assert!(!via.irq_active, "IRQ line drops once IFR T1 cleared");
+        {
+            ctx.clk = 14 + 0x10 + 5;
+            let mut b = Via2dBackend {
+                drive: &mut rot,
+                number: 0,
+                irq: &mut irq,
+                pending_set_overflow: false,
+                has_image: false,
+            };
+            let _ = vc::viacore_read(&mut ctx, &mut b, 0x1C04);
+        }
+        assert_eq!(ctx.ifr & VIA_IM_T1, 0, "reading T1CL clears the T1 flag");
+        assert!(!irq.active, "IRQ line drops once IFR T1 cleared");
     }
 
     #[test]
@@ -1413,10 +1413,10 @@ mod tests {
             rom: &d.rom,
             via1: &mut d.via1,
             via2: &mut d.via2,
+            via2_irq: &mut d.via2_irq,
             drv_port: 0x85,
             cpu_bus: 0xff,
             clk_ptr: &mut clk,
-            via2_ports: Via2Ports::default(),
             rotation: &mut d.rotation,
             pending_set_overflow: false,
         };
