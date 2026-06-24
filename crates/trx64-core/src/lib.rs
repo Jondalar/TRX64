@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 pub mod c64_6510core;
+pub mod c64re_snapshot;
 pub mod cart;
 pub mod cia;
 pub mod cpu;

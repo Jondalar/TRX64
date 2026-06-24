@@ -258,6 +258,49 @@ impl Sid6581 {
         }
     }
 
+    // ── .c64re native snapshot (additive — ADR-077) ──────────────────────────
+    //
+    // Reads/writes the private per-voice state into/out of the c64re
+    // `SidSnapshot.voices` shape (sid.ts:170-177). Pure state I/O — the byte-exact
+    // fastsid register engine is unchanged. `gateflip` is always 0 at a snapshot
+    // boundary (TRX64 acts on the GATE edge immediately at the V_CTRL write, like
+    // the TS does — sid.ts:381 `vc.gateflip = 0`), so it is emitted as 0.
+
+    /// Read voice `i` into the c64re `SidSnapshot.voices[i]` field tuple.
+    /// Order matches sid.ts:170-176:
+    /// (f, fs, pw, noise, wt_select, attack, decay, sustain, release, sync,
+    ///  adsrm, adsr_value, cycle_accum, gateflip, prev_gate, rv).
+    #[allow(clippy::type_complexity)]
+    pub fn c64re_voice(&self, i: usize) -> (u32, u32, u32, u8, u8, u8, u8, u8, u8, u8, u8, u8, u32, u8, u8, u32) {
+        let v = &self.voices[i];
+        (
+            v.f, v.fs, v.pw,
+            v.noise as u8, v.wt_select,
+            v.attack, v.decay, v.sustain, v.release,
+            v.sync as u8,
+            v.adsrm, v.adsr_value, v.cycle_accum,
+            0, // gateflip — always 0 at a boundary
+            v.prev_gate as u8, v.rv,
+        )
+    }
+
+    /// Restore voice `i` from the c64re `SidSnapshot.voices[i]` field tuple.
+    #[allow(clippy::too_many_arguments)]
+    pub fn c64re_set_voice(
+        &mut self, i: usize,
+        f: u32, fs: u32, pw: u32, noise: u8, wt_select: u8,
+        attack: u8, decay: u8, sustain: u8, release: u8, sync: u8,
+        adsrm: u8, adsr_value: u8, cycle_accum: u32, _gateflip: u8, prev_gate: u8, rv: u32,
+    ) {
+        let v = &mut self.voices[i];
+        v.f = f; v.fs = fs; v.pw = pw;
+        v.noise = noise != 0; v.wt_select = wt_select;
+        v.attack = attack; v.decay = decay; v.sustain = sustain; v.release = release;
+        v.sync = sync != 0;
+        v.adsrm = adsrm; v.adsr_value = adsr_value; v.cycle_accum = cycle_accum;
+        v.prev_gate = prev_gate != 0; v.rv = rv;
+    }
+
     // ── Tick (per-instruction wall-clock batch advance) ───────────────────────
 
     /// Advance SID state by `cycles` master-clock cycles.

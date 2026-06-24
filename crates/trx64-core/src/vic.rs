@@ -919,6 +919,121 @@ impl VicII {
         v
     }
 
+    // ── .c64re native snapshot: draw-cycle pipeline (additive — ADR-077) ──────
+    //
+    // Reads/writes the `pub(crate)` draw-cycle pipeline statics into/out of the
+    // c64re `DrawCycleSnapshot` shape (vicii-draw-cycle.ts:100-121). Pure state
+    // I/O — the per-cycle draw logic is unchanged. The Uint8Array/Uint32Array
+    // fields ride as `{ $ta }` nodes (sbuf_reg/sbuf_pixel_reg/render_buffer/
+    // pri_buffer/pixel_buffer/cregs) to match c64re's container encoding.
+    pub fn c64re_draw_cycle_capture(&self) -> crate::c64re_snapshot::DrawCycleSnapshot {
+        use crate::native_snapshot::{ta_u32, ta_u8};
+        crate::c64re_snapshot::DrawCycleSnapshot {
+            gbuf_pipe0_reg: self.gbuf_pipe0_reg as i64,
+            cbuf_pipe0_reg: self.cbuf_pipe0_reg as i64,
+            vbuf_pipe0_reg: self.vbuf_pipe0_reg as i64,
+            gbuf_pipe1_reg: self.gbuf_pipe1_reg as i64,
+            cbuf_pipe1_reg: self.cbuf_pipe1_reg as i64,
+            vbuf_pipe1_reg: self.vbuf_pipe1_reg as i64,
+            xscroll_pipe: self.xscroll_pipe as i64,
+            vmode11_pipe: self.vmode11_pipe as i64,
+            vmode16_pipe: self.vmode16_pipe as i64,
+            vmode16_pipe2: self.vmode16_pipe2 as i64,
+            gbuf_reg: self.gbuf_reg as i64,
+            gbuf_mc_flop: self.gbuf_mc_flop as i64,
+            gbuf_pixel_reg: self.gbuf_pixel_reg as i64,
+            cbuf_reg: self.cbuf_reg as i64,
+            vbuf_reg: self.vbuf_reg as i64,
+            dmli: self.dmli as i64,
+            sprite_x_pipe: self.sprite_x_pipe.iter().map(|&x| x as i64).collect(),
+            sprite_pri_bits: self.sprite_pri_bits as i64,
+            sprite_mc_bits: self.sprite_mc_bits as i64,
+            sprite_expx_bits: self.sprite_expx_bits as i64,
+            sprite_pending_bits: self.sprite_pending_bits as i64,
+            sprite_active_bits: self.sprite_active_bits as i64,
+            sprite_halt_bits: self.sprite_halt_bits as i64,
+            sbuf_reg: ta_u32(&self.sbuf_reg),
+            sbuf_pixel_reg: ta_u8(&self.sbuf_pixel_reg),
+            sbuf_expx_flops: self.sbuf_expx_flops as i64,
+            sbuf_mc_flops: self.sbuf_mc_flops as i64,
+            border_state: self.border_state as i64,
+            render_buffer: ta_u8(&self.render_buffer),
+            pri_buffer: ta_u8(&self.pri_buffer),
+            pixel_buffer: ta_u8(&self.pixel_buffer),
+            cregs: ta_u8(&self.cregs),
+            // c64re draw-cycle keeps last_color_reg/value as its OWN module statics
+            // (draw_last_color_reg/value in TRX64), distinct from vicii.last_color_*.
+            last_color_reg: self.draw_last_color_reg as i64,
+            last_color_value: self.draw_last_color_value as i64,
+            cycle_flags_pipe: self.cycle_flags_pipe as i64,
+        }
+    }
+
+    pub fn c64re_draw_cycle_restore(&mut self, s: &crate::c64re_snapshot::DrawCycleSnapshot) {
+        use crate::native_snapshot::{ta_u32_decode, ta_u8_decode};
+        self.gbuf_pipe0_reg = s.gbuf_pipe0_reg as u8;
+        self.cbuf_pipe0_reg = s.cbuf_pipe0_reg as u8;
+        self.vbuf_pipe0_reg = s.vbuf_pipe0_reg as u8;
+        self.gbuf_pipe1_reg = s.gbuf_pipe1_reg as u8;
+        self.cbuf_pipe1_reg = s.cbuf_pipe1_reg as u8;
+        self.vbuf_pipe1_reg = s.vbuf_pipe1_reg as u8;
+        self.xscroll_pipe = s.xscroll_pipe as u8;
+        self.vmode11_pipe = s.vmode11_pipe as u8;
+        self.vmode16_pipe = s.vmode16_pipe as u8;
+        self.vmode16_pipe2 = s.vmode16_pipe2 as u8;
+        self.gbuf_reg = s.gbuf_reg as u8;
+        self.gbuf_mc_flop = s.gbuf_mc_flop as u8;
+        self.gbuf_pixel_reg = s.gbuf_pixel_reg as u8;
+        self.cbuf_reg = s.cbuf_reg as u8;
+        self.vbuf_reg = s.vbuf_reg as u8;
+        self.dmli = s.dmli as usize;
+        for (i, &x) in s.sprite_x_pipe.iter().enumerate().take(NUM_SPRITES) {
+            self.sprite_x_pipe[i] = x as u16;
+        }
+        self.sprite_pri_bits = s.sprite_pri_bits as u8;
+        self.sprite_mc_bits = s.sprite_mc_bits as u8;
+        self.sprite_expx_bits = s.sprite_expx_bits as u8;
+        self.sprite_pending_bits = s.sprite_pending_bits as u8;
+        self.sprite_active_bits = s.sprite_active_bits as u8;
+        self.sprite_halt_bits = s.sprite_halt_bits as u8;
+        if let Some(w) = ta_u32_decode(&s.sbuf_reg) {
+            for (i, &x) in w.iter().enumerate().take(NUM_SPRITES) {
+                self.sbuf_reg[i] = x;
+            }
+        }
+        if let Some(b) = ta_u8_decode(&s.sbuf_pixel_reg) {
+            for (i, &x) in b.iter().enumerate().take(NUM_SPRITES) {
+                self.sbuf_pixel_reg[i] = x;
+            }
+        }
+        self.sbuf_expx_flops = s.sbuf_expx_flops as u8;
+        self.sbuf_mc_flops = s.sbuf_mc_flops as u8;
+        self.border_state = s.border_state as u8;
+        if let Some(b) = ta_u8_decode(&s.render_buffer) {
+            for (i, &x) in b.iter().enumerate().take(8) {
+                self.render_buffer[i] = x;
+            }
+        }
+        if let Some(b) = ta_u8_decode(&s.pri_buffer) {
+            for (i, &x) in b.iter().enumerate().take(8) {
+                self.pri_buffer[i] = x;
+            }
+        }
+        if let Some(b) = ta_u8_decode(&s.pixel_buffer) {
+            for (i, &x) in b.iter().enumerate().take(8) {
+                self.pixel_buffer[i] = x;
+            }
+        }
+        if let Some(b) = ta_u8_decode(&s.cregs) {
+            for (i, &x) in b.iter().enumerate().take(0x2f) {
+                self.cregs[i] = x;
+            }
+        }
+        self.draw_last_color_reg = s.last_color_reg as u8;
+        self.draw_last_color_value = s.last_color_value as u8;
+        self.cycle_flags_pipe = s.cycle_flags_pipe as u32;
+    }
+
     /// Classify a $D000-$D02E register offset into a VIC trace kind, matching the
     /// TS producer's `kind` tagging. $D012/$D011 → raster, $D016/$D018 → mode,
     /// $D019/$D01A → irq. Returns None otherwise.
