@@ -1100,3 +1100,21 @@ idle. All zero-cost when off (None + NullSink -> monomorphized away). Builder ST
 fired 15x@$FFFE in the full path; breakpoint halted at $FCE2+$EA31; access-watch on $01FF -> RunStop::Observer)
 + byte-exact gates GREEN (drive-boot-deep, render-boot-basic-ready — zero-cost when off, no regression). The
 POLICY (conditions/actions/hit-counts) is the NEXT item (breakpoint policy layer / ObserverRegistry).
+
+## ADR-071 — breakpoint/watchpoint policy layer: 1:1 ObserverRegistry over the Phase0 hooks
+Built the breakpoint POLICY (the EXISTING WS debug methods were inert — stored a bp list, drove nothing). New
+trx64-daemon/src/observers.rs (~640 LOC + 340 tests) = 1:1 port of c64re monitor-observers.ts: cond-AST
+(CondNode + parse_cond recursive-descent + eval_node over CondEnv {a,x,y,pc,sp,fl,rl,val,addr,cy}, JS-truthiness),
+ObserverRegistry (add/remove/enabled/ignore/list, rebuild() -> exec_watch[0x10000]+access_watch[0x10000] presence
+tables, on_exec/on_access, matches (cond+ignore+hit gate), fire (break/log/mark/cmd/trace actions), the log ring),
++ impl trx64_core::Observer forwarding on_access -> halt_requested. Daemon: run_until_break segment-runs
+run_for_full_capped_dbg with the bp HashSet + access-watch armed + the registry as Observer; debug/run|continue
+self-halt + return runState:paused + stop:{reason,pc,cycles,breakpointId}; continue steps past the sitting bp;
+until consults the bp SET; listBreakpoints reports REAL hitCount + ignoreRemaining. trx64-core stays observer-
+agnostic; zero-cost when no observers armed (None gates, NullSink). Wire shape unchanged.
+RESULT: 129 tests passed / 0 failed (116 baseline + 13 new), ZERO regression vs base. 13 behavioral GREEN
+(PC-bp halts+counts, store-watchpoint halts, conditional bp gates on the cond-AST, ignore-count N -> 3rd hit,
+until reaches target, + cond parse/eval/rebuild). drive-boot-deep byte-exact GREEN (daemon-only, core untouched).
+CAVEAT: resid_oracle::gate_a_native_byte_identical flakes ONLY under parallel test scheduling (resid FFI is a
+module-global singleton -> contends); passes isolated + serialized (--test-threads=1). Not this work's path.
+TODO: mark the resid tests serial so the parallel suite is clean. NEXT: protocol-surface (WS method coverage).

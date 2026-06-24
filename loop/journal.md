@@ -703,3 +703,10 @@ autonomous: Phase0 tick hooks + breakpoints + WS surface.
 3 hooks: on_interrupt in the full SC path, run-loop breakpoints + RunStop enum, on_access watch gate. All
 zero-cost-when-off, byte-exact GREEN. 3 hook tests pass (on_interrupt 15x, breakpoint halt, access-watch halt).
 Builder stalled on a slow gate-suite run; Driver validated + merged. Next: breakpoint policy layer.
+
+## 2026-06-24 — DRIVER: breakpoint/watchpoint policy layer (ADR-071)
+
+observers.rs 1:1 monitor-observers.ts (cond-AST + ObserverRegistry) over the Phase0 hooks; daemon debug/run|
+continue|until|watchpoints|conditional now FUNCTION. 129 tests, 13 behavioral green, zero regression, drive-boot
+byte-exact. Caveat: resid_oracle flakes under parallel scheduling (FFI singleton) - mark serial. Next:
+protocol-surface.
