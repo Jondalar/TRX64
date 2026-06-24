@@ -109,6 +109,11 @@ struct ApiBpEntry {
     action: String,
     enabled: bool,
     hit_limit: Option<u32>,
+    /// `ignore <id> <n>` — skip the first N hits (VICE semantics, mirrored into
+    /// the registry observer's `ignore_left`).
+    ignore_count: u32,
+    /// Real hit count, copied back from the registry after each run.
+    hit_count: u64,
 }
 
 struct Breakpoints {
@@ -144,6 +149,9 @@ struct CtrlStop {
 struct State {
     session: Session,
     breakpoints: Breakpoints,
+    /// The breakpoint/watchpoint POLICY (cond-AST, hit/ignore, watch tables).
+    /// Re-synced from `breakpoints` before each run; drives the core's debug gates.
+    observers: observers::ObserverRegistry,
     /// Queued PETSCII chars for session/type (stub, count tracked only).
     #[allow(dead_code)]
     type_buffer: Vec<u8>,
@@ -290,6 +298,373 @@ fn step_one_instruction(session: &mut Session) {
         session.machine.run_for_full_capped(999_999, 1, &mut obs, |_, _, _, _, _, _, _| {});
     } else {
         session.machine.run_for_capped(999_999, 1, &mut obs);
+    }
+}
+
+/// The result of a breakpoint/watchpoint-gated run ([`run_until_break`]).
+struct BreakRun {
+    /// True if a break/watchpoint actually halted the run (vs budget exhaustion).
+    halted: bool,
+    /// Stop reason matching `RuntimeStopInfo.reason` (types.ts): "breakpoint"
+    /// for an exec hit, "observer" for a load/store watchpoint hit.
+    reason: &'static str,
+    /// The observer name that fired (for breakpointId resolution).
+    which: Option<String>,
+    pc: u16,
+    cycles_elapsed: u64,
+}
+
+/// Whether the current bp surface needs the breakpoint/observer driver at all.
+fn observers_armed(reg: &observers::ObserverRegistry) -> bool {
+    reg.exec_active || reg.access_armed()
+}
+
+/// Re-sync the [`ObserverRegistry`] from the daemon's breakpoint surfaces
+/// (`api_entries` string-ids + numbered `entries`), preserving each observer's
+/// accumulated `hits` / remaining `ignore_left`. The registry is the run-time
+/// SOURCE OF TRUTH the core's debug gates consult; the bp lists are the wire-shape
+/// CRUD store. After a run, [`writeback_hits`] copies the real hit counts back.
+fn sync_observers(bp: &Breakpoints, reg: &mut observers::ObserverRegistry) {
+    // Snapshot current live counts so a rebuild doesn't reset them.
+    let prior: std::collections::HashMap<String, (u64, u64)> = reg
+        .list()
+        .iter()
+        .map(|o| (o.name.clone(), (o.hits, o.ignore_left)))
+        .collect();
+    reg.clear();
+    // String-id breakpoints (addPcBreakpoint / mem watchpoints).
+    for e in &bp.api_entries {
+        if !e.enabled {
+            continue;
+        }
+        let (trigger, lo, hi, cond_src) = parse_api_bp(e);
+        let action = if e.action == "log" {
+            observers::ObsAction::Log
+        } else {
+            observers::ObsAction::Break
+        };
+        let _ = reg.add(observers::ObsSpec {
+            name: e.id.clone(),
+            trigger,
+            lo,
+            hi,
+            cond_src,
+            action,
+            log_exprs: None,
+            cmd_src: None,
+            mark_label: None,
+            trace_scope: None,
+        });
+        // Restore live counts (default: fresh hits=0, ignore_left=ignore_count).
+        let (hits, ignore_left) = prior
+            .get(&e.id)
+            .copied()
+            .unwrap_or((e.hit_count, e.ignore_count as u64));
+        reg.set_counts(&e.id, hits, ignore_left);
+    }
+    // Numbered exec breakpoints (debug/break_add).
+    for e in &bp.entries {
+        if !e.enabled {
+            continue;
+        }
+        let name = format!("bp#{}", e.num);
+        let _ = reg.add(observers::ObsSpec {
+            name: name.clone(),
+            trigger: observers::ObsTrigger::Exec,
+            lo: e.pc,
+            hi: e.pc,
+            cond_src: None,
+            action: observers::ObsAction::Break,
+            log_exprs: None,
+            cmd_src: None,
+            mark_label: None,
+            trace_scope: None,
+        });
+        let (hits, ignore_left) = prior.get(&name).copied().unwrap_or((0, 0));
+        reg.set_counts(&name, hits, ignore_left);
+    }
+}
+
+/// Decode an [`ApiBpEntry`] into an observer trigger/range/cond. The `action`
+/// field overloads as the watchpoint kind: "watch_read"/"watch_write"/"watch"
+/// arm load/store observers; an `action` of the form "cond:<expr>" carries a
+/// raw condition (the daemon's compact way to express a conditional bp over the
+/// existing wire). Default = an exec breakpoint at the single PC.
+fn parse_api_bp(e: &ApiBpEntry) -> (observers::ObsTrigger, u16, u16, Option<String>) {
+    if let Some(expr) = e.action.strip_prefix("cond:") {
+        return (
+            observers::ObsTrigger::Exec,
+            e.pc,
+            e.pc,
+            Some(expr.to_string()),
+        );
+    }
+    match e.action.as_str() {
+        "watch_read" | "load" => (observers::ObsTrigger::Load, e.pc, e.pc, None),
+        "watch_write" | "store" => (observers::ObsTrigger::Store, e.pc, e.pc, None),
+        "watch" => {
+            // A read+write watch can't be one observer (single trigger); model it as
+            // a store watch (the common debugging case). A separate load observer can
+            // be added with action "watch_read" if needed.
+            (observers::ObsTrigger::Store, e.pc, e.pc, None)
+        }
+        _ => (observers::ObsTrigger::Exec, e.pc, e.pc, None),
+    }
+}
+
+/// Copy the real hit counts back from the registry into the daemon's bp surface
+/// after a run, so `listBreakpoints` / `debug/break_list` report the true counts.
+fn writeback_hits(bp: &mut Breakpoints, reg: &observers::ObserverRegistry) {
+    for e in bp.api_entries.iter_mut() {
+        if let Some(o) = reg.get(&e.id) {
+            e.hit_count = o.hits;
+        }
+    }
+}
+
+/// Default cycle budget for a synchronous breakpoint-gated run (the daemon is
+/// request/response; a real autonomous loop would be unbounded, so we cap at a
+/// generous ~10 frames of PAL cycles — enough to reach any boot-time bp).
+const DEBUG_RUN_BUDGET: u64 = 10_000_000;
+
+/// Drive `debug/run` / `debug/continue`. When breakpoints/watchpoints are armed,
+/// SEGMENT-RUN the machine until one trips (or the budget exhausts) and return the
+/// real stop info. When none are armed, preserve the historical immediate
+/// `running` return (no advance) so the zero-cost / no-debug contract is unchanged.
+fn run_debug_control(id: Value, st: &mut State, frame: u64, is_continue: bool) -> Response {
+    {
+        let State { breakpoints, observers: reg, .. } = &mut *st;
+        sync_observers(breakpoints, reg);
+    }
+
+    if !observers_armed(&st.observers) {
+        // No debug gate: historical behavior — report running, machine unchanged.
+        let bps = st.breakpoints.list_vice_json();
+        let pc = st.session.machine.c64_core.reg_pc as u64;
+        let cycles = st.session.machine.clk;
+        return Response::ok(id, json!({
+            "runState": "running",
+            "pacing": { "mode": "pal", "ratio": 1 },
+            "pc": pc,
+            "cycles": cycles,
+            "frame": frame,
+            "breakpoints": bps,
+            "stop": null,
+            "controlOwner": "llm"
+        }));
+    }
+
+    // Continuing FROM a breakpoint: advance one instruction past the current PC
+    // first, so the boundary check doesn't immediately re-trip the same bp.
+    if is_continue {
+        step_one_instruction(&mut st.session);
+    }
+
+    // Split the borrow of `st` so the registry can be passed as the core observer
+    // while the session runs; scope it so the fields free up afterward.
+    let run = {
+        let State { session, observers: reg, .. } = &mut *st;
+        run_until_break(session, reg, DEBUG_RUN_BUDGET)
+    };
+    {
+        let State { breakpoints, observers: reg, .. } = &mut *st;
+        writeback_hits(breakpoints, reg);
+    }
+
+    let bps = st.breakpoints.list_vice_json();
+    let cycles = st.session.machine.clk;
+    if run.halted {
+        st.session.running = false;
+        // Resolve a numeric breakpointId from the numbered bp store by PC, if any.
+        let bp_num = st
+            .breakpoints
+            .entries
+            .iter()
+            .find(|e| e.pc == run.pc)
+            .map(|e| e.num);
+        st.ctrl_stop = Some(CtrlStop { reason: "breakpoint", pc: run.pc, cycles });
+        let mut stop = json!({
+            "reason": run.reason,
+            "pc": run.pc as u64,
+            "cycles": cycles,
+        });
+        if let Some(n) = bp_num {
+            stop["breakpointId"] = json!(n as u64);
+        }
+        if let Some(name) = run.which {
+            stop["breakpoint"] = json!(name);
+        }
+        Response::ok(id, json!({
+            "runState": "paused",
+            "pacing": { "mode": "pal", "ratio": 1 },
+            "pc": run.pc as u64,
+            "cycles": cycles,
+            "frame": frame,
+            "breakpoints": bps,
+            "stop": stop,
+            "controlOwner": "llm"
+        }))
+    } else {
+        // Budget exhausted without a hit: the machine advanced; report running.
+        let pc = st.session.machine.c64_core.reg_pc as u64;
+        Response::ok(id, json!({
+            "runState": "running",
+            "pacing": { "mode": "pal", "ratio": 1 },
+            "pc": pc,
+            "cycles": cycles,
+            "frame": frame,
+            "breakpoints": bps,
+            "stop": null,
+            "controlOwner": "llm"
+        }))
+    }
+}
+
+/// SEGMENT-RUN the machine with the registry driving the core's debug gates,
+/// self-halting at the first REAL breakpoint/watchpoint (cond true + not ignored).
+///
+/// 1:1 with the c64re run model: the exec breakpoint SET is armed in the core
+/// (halts AT the PC before execute, VICE break-on-exec); the registry's `on_exec`
+/// then applies the cond + ignore-count + hit-count gate, and on a non-match the
+/// driver steps ONE instruction past the PC and resumes (so a conditional bp that
+/// evaluates false does not wedge). Load/store watchpoints arm the core's
+/// `access_watch` table; the registry's `on_access` sets `halt_requested`, honored
+/// at the next boundary (RunStop::Observer).
+fn run_until_break(
+    session: &mut Session,
+    reg: &mut observers::ObserverRegistry,
+    cycle_budget: u64,
+) -> BreakRun {
+    let full_machine =
+        session.machine.full_assembled && (!session.injected || session.io_injected);
+    let start_clk = session.machine.clk;
+    reg.clear_halt();
+
+    let bp_set = reg.exec_breakpoint_set();
+    // An access observer with a condition needs an exact per-instruction env
+    // (the cond may read a/x/y/pc). Single-step those segments so the env the
+    // registry sees at on_access time is the at-access CPU state; unconditional
+    // watchpoints (the common case) run in full segments.
+    let access_needs_step = reg
+        .list()
+        .iter()
+        .any(|o| o.enabled && o.trigger != observers::ObsTrigger::Exec && o.cond.is_some());
+    let seg_cap: u64 = if access_needs_step { 1 } else { u64::MAX };
+
+    loop {
+        let elapsed = session.machine.clk.wrapping_sub(start_clk);
+        if elapsed >= cycle_budget {
+            return BreakRun {
+                halted: false,
+                reason: "budget",
+                which: None,
+                pc: session.machine.c64_core.reg_pc,
+                cycles_elapsed: elapsed,
+            };
+        }
+        let seg_budget = (cycle_budget - elapsed).min(if seg_cap == u64::MAX {
+            cycle_budget
+        } else {
+            seg_cap.max(1)
+        });
+        let max_instr = if seg_cap == 1 { 1 } else { seg_budget.div_ceil(2) + 1000 };
+
+        // Refresh the env from the current (segment-start) CPU + raster state so
+        // exec/access conditions eval against it.
+        reg.set_env(observers::CpuSnapshot::from_machine(&session.machine));
+
+        let access_watch = reg.access_watch_owned();
+        let aw_ref = access_watch.as_deref();
+        let bp_ref = bp_set.as_ref();
+
+        let stop = if full_machine {
+            session.machine.run_for_full_capped_dbg(
+                seg_budget,
+                max_instr,
+                bp_ref,
+                None,
+                aw_ref,
+                reg,
+                |_, _, _, _, _, _, _| {},
+            )
+        } else {
+            // CPU-isolated path (no full machine). The dbg entry point lives on the
+            // full SC path only; for the isolated path we step + check the bp set
+            // manually so isolated gates still get exec breakpoints.
+            run_isolated_segment(&mut session.machine, bp_ref, max_instr)
+        };
+
+        match stop {
+            trx64_core::RunStop::Breakpoint(pc) => {
+                // Core halted AT pc, before executing it. Apply the cond/ignore gate.
+                reg.set_env(observers::CpuSnapshot::from_machine(&session.machine));
+                let real = reg.on_exec(pc);
+                if real {
+                    let which = reg.last_halt.as_ref().map(|h| h.name.clone());
+                    return BreakRun {
+                        halted: true,
+                        reason: "breakpoint",
+                        which,
+                        pc,
+                        cycles_elapsed: session.machine.clk.wrapping_sub(start_clk),
+                    };
+                }
+                // Cond false or ignored: step one instruction PAST the bp PC so the
+                // boundary check doesn't re-trip on the same PC, then resume.
+                step_one_instruction(session);
+            }
+            trx64_core::RunStop::Observer => {
+                // A watchpoint requested the halt during the last instruction.
+                let which = reg.last_halt.as_ref().map(|h| h.name.clone());
+                let pc = session.machine.c64_core.reg_pc;
+                return BreakRun {
+                    halted: true,
+                    reason: "observer",
+                    which,
+                    pc,
+                    cycles_elapsed: session.machine.clk.wrapping_sub(start_clk),
+                };
+            }
+            trx64_core::RunStop::CycleBudget | trx64_core::RunStop::Completed => {
+                // Segment finished without a hit; loop re-checks the total budget.
+                if seg_cap != u64::MAX && session.machine.clk == start_clk {
+                    // Defensive: a 0-cycle segment (shouldn't happen) — bail.
+                    return BreakRun {
+                        halted: false,
+                        reason: "budget",
+                        which: None,
+                        pc: session.machine.c64_core.reg_pc,
+                        cycles_elapsed: 0,
+                    };
+                }
+            }
+        }
+    }
+}
+
+/// CPU-isolated exec-breakpoint segment (the full SC dbg entry point is full-machine
+/// only). Steps single instructions, checking the bp set BEFORE each — matching the
+/// full path's break-AT-pc-before-execute semantics. Watchpoints are not supported
+/// on the isolated path (no bus gate there); only the exec bp set is honored.
+fn run_isolated_segment(
+    machine: &mut trx64_core::Machine,
+    bp_set: Option<&std::collections::HashSet<u16>>,
+    max_instr: u64,
+) -> trx64_core::RunStop {
+    let mut obs = NullSink;
+    let mut executed = 0u64;
+    loop {
+        if executed >= max_instr {
+            return trx64_core::RunStop::CycleBudget;
+        }
+        let pc = machine.cpu6510.reg_pc;
+        if let Some(bps) = bp_set {
+            if bps.contains(&pc) {
+                return trx64_core::RunStop::Breakpoint(pc);
+            }
+        }
+        machine.run_for_capped(999_999, 1, &mut obs);
+        executed += 1;
     }
 }
 
@@ -656,26 +1031,43 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState) -> Response
             let cycle_budget: u64 = 10_000_000;
             let mut st = state.lock().unwrap();
             let start_clk = st.session.machine.clk;
-            let mut instructions_elapsed: u64 = 0;
-            let mut budget_exhausted = false;
-            let mut halted = false;
 
-            loop {
-                let current_clk = st.session.machine.clk;
-                if current_clk.wrapping_sub(start_clk) >= cycle_budget {
-                    budget_exhausted = true;
-                    break;
-                }
-                step_one_instruction(&mut st.session);
-                instructions_elapsed += 1;
-                if st.session.machine.cpu6510.reg_pc == target_addr {
-                    halted = true;
-                    break;
-                }
+            // `until <addr>` runs until the target PC OR any armed breakpoint trips
+            // (consults the bp SET, not just the single target — Spec 754 + VICE
+            // `until`). Mirror the standing bp surface into the registry, then add
+            // the ephemeral target as a temporary exec observer, drive the segment
+            // run, and remove the ephemeral after.
+            {
+                let State { breakpoints, observers: reg, .. } = &mut *st;
+                sync_observers(breakpoints, reg);
             }
+            let _ = st.observers.add(observers::ObsSpec {
+                name: "__until__".to_string(),
+                trigger: observers::ObsTrigger::Exec,
+                lo: target_addr,
+                hi: target_addr,
+                cond_src: None,
+                action: observers::ObsAction::Break,
+                log_exprs: None,
+                cmd_src: None,
+                mark_label: None,
+                trace_scope: None,
+            });
+            let run = {
+                let State { session, observers: reg, .. } = &mut *st;
+                run_until_break(session, reg, cycle_budget)
+            };
+            {
+                let State { breakpoints, observers: reg, .. } = &mut *st;
+                writeback_hits(breakpoints, reg);
+            }
+            st.observers.remove("__until__");
 
-            let final_pc = st.session.machine.cpu6510.reg_pc;
-            let cycles_elapsed = st.session.machine.clk.wrapping_sub(start_clk);
+            let halted = run.halted;
+            let budget_exhausted = !run.halted;
+            let final_pc = st.session.machine.c64_core.reg_pc;
+            let cycles_elapsed = run.cycles_elapsed;
+            let _ = start_clk;
             // TS _instrCount() == cpu.cycles, so instructionsElapsed == cyclesElapsed.
             Response::ok(id, json!({
                 "halted": halted,
@@ -699,6 +1091,8 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState) -> Response
                 action,
                 enabled: true,
                 hit_limit: None,
+                ignore_count: 0,
+                hit_count: 0,
             });
             Response::ok(id, json!(bp_id))
         }
@@ -707,13 +1101,18 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState) -> Response
             // TS BreakpointManager.list() returns specs with hitCount and _ignoreRemaining set on add().
             let st = state.lock().unwrap();
             let list: Vec<Value> = st.breakpoints.api_entries.iter().map(|e| {
+                // Report the REAL hit count + remaining ignore from the registry
+                // observer (falls back to the bp-surface mirror when no run yet).
+                let (hits, ignore_rem) = st.observers.get(&e.id)
+                    .map(|o| (o.hits, o.ignore_left))
+                    .unwrap_or((e.hit_count, e.ignore_count as u64));
                 let mut obj = json!({
                     "id": e.id,
                     "predicate": { "kind": "pc", "pc": e.pc as u64 },
                     "action": e.action,
                     "enabled": e.enabled,
-                    "hitCount": 0u64,
-                    "_ignoreRemaining": 0u64
+                    "hitCount": hits,
+                    "_ignoreRemaining": ignore_rem
                 });
                 if let Some(hl) = e.hit_limit {
                     obj["hitLimit"] = json!(hl);
@@ -953,20 +1352,7 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             st.ctrl_stop = None;
             st.ctrl_frame += 1;
             let frame = st.ctrl_frame;
-            let bps = st.breakpoints.list_vice_json();
-            let c = &st.session.machine.cpu6510;
-            let pc = c.reg_pc as u64;
-            let cycles = st.session.machine.clk;
-            Response::ok(id, json!({
-                "runState": "running",
-                "pacing": { "mode": "pal", "ratio": 1 },
-                "pc": pc,
-                "cycles": cycles,
-                "frame": frame,
-                "breakpoints": bps,
-                "stop": null,
-                "controlOwner": "llm"
-            }))
+            run_debug_control(id, &mut st, frame, false)
         }
 
         "debug/pause" => {
@@ -998,20 +1384,9 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             st.ctrl_stop = None;
             // TS: continue does not increment frame (stays at pause frame).
             let frame = st.ctrl_frame;
-            let bps = st.breakpoints.list_vice_json();
-            let c = &st.session.machine.cpu6510;
-            let pc = c.reg_pc as u64;
-            let cycles = st.session.machine.clk;
-            Response::ok(id, json!({
-                "runState": "running",
-                "pacing": { "mode": "pal", "ratio": 1 },
-                "pc": pc,
-                "cycles": cycles,
-                "frame": frame,
-                "breakpoints": bps,
-                "stop": null,
-                "controlOwner": "llm"
-            }))
+            // A continue from a breakpoint must STEP PAST the current PC first
+            // (else the boundary check re-trips the same bp immediately).
+            run_debug_control(id, &mut st, frame, true)
         }
 
         "debug/step" => {
@@ -2094,6 +2469,7 @@ async fn main() {
     let state: SharedState = Arc::new(Mutex::new(State {
         session,
         breakpoints: Breakpoints::new(),
+        observers: observers::ObserverRegistry::new(),
         type_buffer: Vec::new(),
         ctrl_frame: 0, // incremented on each debug/run|pause|continue; first pause → 1
         ctrl_stop: None,

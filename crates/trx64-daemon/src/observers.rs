@@ -21,6 +21,13 @@
 //! registry fills the `exec_watch[0x10000]` + `access_watch[0x10000]` presence
 //! tables the core's debug run loop consumes, and implements the core
 //! `trx64_core::Observer` trait so its `on_access` forwards the halt decision.
+//!
+//! This is the COMPLETE 1:1 port of the TS registry — some of its surface
+//! (set_enabled/set_ignore, the `mark`/`cmd`/`trace` side-effect drains, the log
+//! ring) is ported for fidelity but not yet routed to a WS method, hence the
+//! module-level dead-code allow.
+
+#![allow(dead_code)]
 
 use std::collections::HashSet;
 
@@ -579,6 +586,44 @@ impl ObserverRegistry {
     /// Look up a single observer by name (for hitCount reporting).
     pub fn get(&self, name: &str) -> Option<&Observer> {
         self.observers.iter().find(|o| o.name == name)
+    }
+
+    /// Restore the live `hits` / `ignore_left` counters for an observer after a
+    /// rebuild (the daemon mirrors them from its bp surface so a re-sync does not
+    /// reset the accumulated hit count). No-op if the observer is absent.
+    pub fn set_counts(&mut self, name: &str, hits: u64, ignore_left: u64) {
+        if let Some(o) = self.observers.iter_mut().find(|o| o.name == name) {
+            o.hits = hits;
+            o.ignore_left = ignore_left;
+        }
+    }
+
+    /// Clear all observers (full re-sync from the daemon's bp surface).
+    pub fn clear(&mut self) {
+        self.observers.clear();
+        self.rebuild();
+    }
+
+    /// Reset the per-run halt latch (called before each run segment chain).
+    pub fn clear_halt(&mut self) {
+        self.halt_requested = false;
+        self.last_halt = None;
+    }
+
+    /// Is any load/store observer armed? (Decides whether to pass the access-watch
+    /// table to the core — `None` keeps the hot path zero-cost.)
+    pub fn access_armed(&self) -> bool {
+        self.access_active
+    }
+
+    /// A standalone owned copy of the access-watch presence table, for the core's
+    /// `access_watch` gate (passed separately from `&mut self` as `obs`, so the
+    /// borrows don't conflict). `None` when no load/store observer is armed.
+    pub fn access_watch_owned(&self) -> Option<Box<[u8; 0x10000]>> {
+        if !self.access_active {
+            return None;
+        }
+        Some(self.access_watch.clone())
     }
 
     /// ts:180 — `get active(): boolean` — any enabled observer.
