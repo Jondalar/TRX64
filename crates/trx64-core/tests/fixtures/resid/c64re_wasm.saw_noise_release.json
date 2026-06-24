@@ -1,0 +1,21 @@
+{
+  "clock": 985248,
+  "sampleRate": 44100,
+  "method": "RESAMPLE",
+  "model": "6581",
+  "filter": false,
+  "filterBias": 0.5,
+  "externalFilter": true,
+  "voiceMask": 7,
+  "passband": 19845,
+  "gain": 0.97,
+  "frameCycles": 19656,
+  "frames": {
+    "saw": 40,
+    "noise": 20,
+    "release": 20
+  },
+  "sampleCount": 70384,
+  "byteCount": 140768,
+  "fnv1a": "92e102b6"
+}
