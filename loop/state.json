@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "dd00-atn-irq",
+  "current_item": "dd00-fast-transfer",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -32,27 +32,23 @@
     "scramble-gold",
     "drive-verbatim-cpu",
     "c64-verbatim-cpu",
-    "vic-verbatim"
+    "vic-verbatim",
+    "dd00-atn-irq"
   ],
-  "note": "NEW DIRECTION (ADR-053): bar = behavioral parity with c64re. Verbatim cores DONE (drive+C64-CPU+VIC-II, merged). Next: dd00-atn-irq - fix the ~7-cycle drive ATN-IRQ cross-domain stamping lag (full.rs:atn_edge_to_via1_ca1 vs the c64re reference) that desyncs the scramble $DD00 loader. Then re-test scramble behaviorally. Then render-verbatim + the 7-game gate.",
-  "updated": "2026-06-24T02:50:53Z",
+  "note": "dd00-atn-irq DONE (ADR-054): IK_IRQ ack bug fixed -> custom loader RUNS, title layout renders (was BASIC fallback). Next: dd00-fast-transfer — the 2-bit $DD00 fast-transfer CLK/DATA bit-sampling (corrupt bitmap bytes). c64re ref trace saved traces/scramble_run_ref.duckdb.",
+  "updated": "2026-06-24T03:02:34Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": {
-    "item": "dd00-atn-irq",
-    "model": "opus",
-    "started": "2026-06-24T02:50:53Z",
-    "note": "opus ~30min: committed 0a4f5e7 (drive interrupt_ack_irq IK_IRQ bug — ATN-service never dispatched). Iterating. WIP sid.rs (out-of-scope, watch/revert at gate). Defer."
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
   ],
   "known_red": [
-    "scramble custom $DD00 loader: does not render yet (BASIC fallback); pinned blocker = drive ATN-IRQ cross-domain stamping ~7-cyc lag (full.rs)",
-    "iso-vic c64Cycles +1/+3 vs c64re: VICE-accurate BA-steal cycles c64re microcode CPU skips - behaviorally harmless, do NOT match the oracle (ADR-053)"
+    "scramble: custom $DD00 loader RUNS + title LAYOUT renders, but the 2-bit fast-transfer bitmap DATA is corrupt (bit-sampling timing) — next item dd00-fast-transfer",
+    "iso-vic c64Cycles +1/+3: VICE-accurate, behaviorally harmless (ADR-053)"
   ],
   "custom_loader_test_disk": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/scramble_infinity.d64",
   "blocked": [

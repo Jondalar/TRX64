@@ -581,3 +581,12 @@ for the pattern-engine approximations the audit found. drive-boot-deep + C64 gat
 c64Cycles +1/+3 (VICE-accurate steal cycles c64re's microcode CPU skips — harmless). scramble still doesn't
 render (BASIC fallback); pinned blocker = the ~7-cyc drive ATN-IRQ cross-domain stamping lag (full.rs).
 Loop ON. Next: dd00-atn-irq.
+
+## 2026-06-24 — DRIVER: dd00-atn-irq DONE — custom loader RUNS, title layout renders (ADR-054)
+
+The "7-cyc lag" was a misdiagnosis. Real bug: drive interrupt_ack_irq cleared IK_IRQ (level bit) -> with 2
+sources asserted (VIA2 watchdog + VIA1 ATN) nirq stuck, ATN-service IRQ never dispatched. Fixed per VICE
+interrupt.h (clear IK_IRQPEND only) + SID ADSR saturating_sub. Zero regression (drive-boot-deep + 4 gates
+GREEN, 85 tests). BEHAVIORAL: scramble custom $DD00 loader now RUNS — VIC multicolor bitmap, title LAYOUT
+renders (border/bg = c64re) — from BASIC fallback. Bitmap DATA still corrupt (2-bit fast-transfer bit
+sampling). Screenshots sent to user. Next: dd00-fast-transfer.

@@ -822,3 +822,19 @@ Remaining for scramble: the drive ATN-IRQ cross-domain stamping (~7-cycle lag, f
 desyncs the $DD00 bit-bang loader — the pinned blocker (current item dd00-atn-irq).
 Remaining for the 7-game gate: render.rs is still an approximation (no sprite collision $D01E/$D01F, no
 grey-dot) — needed for gameplay, not for rendering a title/loader. Separate item render-verbatim.
+
+## ADR-054 — dd00-atn-irq: ATN-service IRQ never dispatched (IK_IRQ ack bug); scramble loader now RUNS
+The "~7-cycle ATN stamping lag" was a misdiagnosis. ROOT CAUSE: drive `interrupt_ack_irq`
+(drive_6510core.rs:202) cleared IK_IRQ (the IRQ LEVEL bit) on every ack. VICE interrupt.h:284-289 clears
+ONLY IK_IRQPEND + parks irq_pending_clk=CLOCK_MAX; IK_IRQ tracks nirq>0 and is cleared solely by
+interrupt_set_irq when the last source deasserts. With two drive sources asserted (VIA2 T1 watchdog +
+VIA1 CA1 ATN-edge), acking one left nirq=2 stuck, global_pending_int permanently lost IK_IRQ → the ATN
+attention-service IRQ was never dispatched → drive parked in $EC12 idle, C64 held ATN at $EEAC forever.
+Fix: clear only IK_IRQPEND. + a SID ADSR `rate - cycle_accum` underflow → saturating_sub (sid.rs) once the
+loader programs the SID. Both VICE-faithful, zero regression (drive-boot-deep + all byte-exact gates GREEN).
+RESULT (behavioral, visible): the custom $DD00 loader now RUNS — drive uploads its fast-loader to $0400-06CA,
+VIC enters multicolor bitmap, the title LAYOUT renders (border/bg $FC = c64re). From BASIC-fallback to the
+title structure. NOT yet pixel-clean: the bulk bitmap DATA from the custom 2-bit $DD00 fast transfer is
+corrupt (garbled bitmap, correct structure). NEXT BLOCKER (dd00-fast-transfer): the sub-cycle CLK/DATA
+sampling timing in the 2-bit fast loader — bytes wrong while drive($0402-08/$07xx) + C64($04xx/$94xx) run in
+lockstep. Reference traces saved: traces/scramble_run_ref.duckdb (c64re), traces/scramble_ref_screen1.png.
