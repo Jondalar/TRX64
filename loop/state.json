@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "protocol-surface (WS method coverage ~54/91)",
+  "current_item": "protocol-surface-b1",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -51,12 +51,17 @@
     "breakpoint-policy-layer"
   ],
   "note": "Breakpoint policy DONE (ADR-071): ObserverRegistry 1:1 over Phase0 hooks, debug/run|continue|until|watchpoints|conditional all work, 129 tests, zero regression. NEXT: protocol-surface (~54/91 missing WS methods, mechanical 1:1 handler ports) -> snapshot-vsf -> integration. Known flake: resid_oracle gate_a under parallel scheduling (FFI singleton) - mark serial as a cleanup.",
-  "updated": "2026-06-24T15:26:36Z",
+  "updated": "2026-06-24T15:27:11Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "protocol-surface-b1",
+    "model": "opus",
+    "started": "2026-06-24T15:27:11Z",
+    "note": "WS protocol surface batch 1: the mechanical 1:1 handler ports that need no new primitives (session/reset, load_prg, key_down/up, release_keys, joystick_clear, input_status, drive_status, cart_status, drive_power, debug/state, snapshot/dump|undump, granular vic/inspect/*, trace/definition|validate|put|list). Map each to existing Machine/session/trace/vsf primitives, wire shape 1:1 with c64re. Heavier (RuntimeController/checkpoint/recorder/scenario/batch/audio) = later batch."
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
