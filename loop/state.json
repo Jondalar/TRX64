@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "sprite-render-verbatim (awaiting user scope steer)",
+  "current_item": "sprite-render-verbatim",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -48,12 +48,17 @@
     "av-recording-mp4"
   ],
   "note": "reSID DONE/ACCEPTED (ADR-068+068b): config verified TS-identical (filter OFF), audio good, <=5 LSB bound accepted. Cartridge + SID both complete. PENDING user steer: sprite-render-verbatim (the static-render -> per-cycle/per-line sprite draw for multiplexing + border). Other rund-machen items: Phase0 tick hooks, breakpoints, WS surface.",
-  "updated": "2026-06-24T12:28:39Z",
+  "updated": "2026-06-24T12:31:34Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "sprite-render-verbatim",
+    "model": "opus",
+    "started": "2026-06-24T12:31:34Z",
+    "note": "USER STEER: verbatim per-cycle draw. Port vicii-draw-cycle into the per-cycle tick (replace static render.rs). Fix sprite multiplexer + border + raster-splits. The last so-aehnlich -> wie-vice conversion."
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
