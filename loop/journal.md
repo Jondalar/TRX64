@@ -683,3 +683,10 @@ cc-FFI'd the vendored GPL reSID C++. write_trace hook (only core change), audio 
 (Gate A); vs c64re WASM within <=5 LSB (Gate B) — root-caused to emscripten-musl vs macOS libm table-rounding,
 inaudible, c64re-probe-705-style bound. iso-sid byte-exact GREEN, 113 tests, C++ builds clean. Cartridge+SID
 done. Open user decision: accept the libm bound vs chase true byte-identity. Next: Phase0 hooks + breakpoints + WS.
+
+## 2026-06-24 — DRIVER: reSID ACCEPTED (ADR-068b) — config verified TS-identical, filter OFF
+
+User asked if reSID filters were on. Verified the config is line-for-line identical to the TS (filter OFF via
+enable_filter(0), 6581, external on, RESAMPLE, gain 0.97, etc.) — nothing to change. User: ok, leave it, reSID
+done. Cartridge + SID complete. Pending: sprite-render-verbatim (user steer). No A/B builder dispatched (user
+said leave it).

@@ -1056,3 +1056,13 @@ GATES: iso-sid-osc3-env3 byte-exact GREEN (fresh daemon), drive-boot-deep GREEN,
 an exclusive singleton (the shim has one global SID).
 OPEN USER DECISION: accept the <=5 LSB libm-rounding bound (inaudible, c64re-probe-705-style), OR chase true
 WASM-byte-identity (build reSID against musl libm / precompute tables) as a follow-up.
+
+## ADR-068b — reSID audio ACCEPTED (config verified TS-identical, filter OFF)
+User listened to the scramble mp4. Audio "ist gut". Asked if the reSID filters were on (they should be off).
+VERIFIED: TRX64's reSID config (resid_ffi.rs ResidConfig::default + configure()) is LINE-FOR-LINE identical to
+the TS resid-wasm-engine.ts configure(): chip_model=6581, enable_filter(0) [SID filter OFF, BUG-049 follow-on],
+adjust_filter_bias(0.5), enable_external_filter(1), set_voice_mask(0x07), set_sampling(RESAMPLE, sr*90/200,
+gain 0.97), clock 985248, sr 44100, emit cadence floor(cycles*sr/clk). NOTHING to change — the SID filter is
+already off, settings already match the TS exactly. User: "dann ist ok, lass, committe das so, das reicht für
+jetzt mit dem reSID." reSID is DONE/ACCEPTED: bound the vendored C++ via cc-FFI, byte-deterministic, iso-sid
+byte-exact GREEN, config TS-identical, audio agrees with c64re within the inaudible <=5 LSB libm bound (ADR-068).

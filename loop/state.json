@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "resid-audio-ab",
+  "current_item": "sprite-render-verbatim (awaiting user scope steer)",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -47,18 +47,13 @@
     "sid-resid",
     "av-recording-mp4"
   ],
-  "note": "USER FINDING: render.rs is a STATIC single-pass renderer (sprites drawn once at final regs) -> scramble sprite-multiplexer + border-sprites collapse = garbled logo (ADR-062 only fixed the data address). Maniac: gate did not reach its char-select screen (slow loader) - needs longer run to judge. mp4 audio recording done (scramble_trx64.mp4, 120s, reSID tune plays). NEXT: verbatim sprite render (per-cycle vicii-draw-cycle into the tick, OR per-line register snapshot) to fix multiplexing + border. Awaiting user scope steer.",
-  "updated": "2026-06-24T12:28:01Z",
+  "note": "reSID DONE/ACCEPTED (ADR-068+068b): config verified TS-identical (filter OFF), audio good, <=5 LSB bound accepted. Cartridge + SID both complete. PENDING user steer: sprite-render-verbatim (the static-render -> per-cycle/per-line sprite draw for multiplexing + border). Other rund-machen items: Phase0 tick hooks, breakpoints, WS surface.",
+  "updated": "2026-06-24T12:28:39Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": {
-    "item": "resid-audio-ab",
-    "model": "opus",
-    "started": "2026-06-24T12:28:01Z",
-    "note": "reSID config verified TS-identical (filter OFF). Produce A/B WAVs (c64re TS reSID vs TRX64 reSID, same scramble window) + numeric diff for user to listen. If audibly differ, find+fix; else config confirmed + report it was perception/recording-path."
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
