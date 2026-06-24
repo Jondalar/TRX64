@@ -161,6 +161,11 @@ struct State {
     ctrl_stop: Option<CtrlStop>,
     /// Monotonic checkpoint counter for media/ingress checkpoint IDs.
     checkpoint_counter: u64,
+    /// Declarative trace definitions (Spec 708), keyed by definition id. These are
+    /// opaque JSON objects validated by [`validate_trace_definition`]; the daemon
+    /// stores them per-session exactly like the TS controller's `traceDefinitions`
+    /// map. No core primitive — a definition is pure data until a run taps it.
+    trace_definitions: std::collections::HashMap<String, Value>,
 }
 
 type SharedState = Arc<Mutex<State>>;
@@ -841,6 +846,303 @@ fn finalize_trace(session: &mut Session) -> (Value, Value) {
             )
         }
     }
+}
+
+// ── Spec 708 trace-definition validation (1:1 port of trace-definition.ts) ─────
+
+/// Domains the validator accepts (= TS `DOMAINS`).
+const TRACE_DOMAINS: &[&str] =
+    &["c64-cpu", "drive8-cpu", "iec", "vic", "sid", "memory"];
+
+/// A 0..=0xFFFF integer check (= TS `u16`).
+fn is_u16(v: &Value) -> bool {
+    matches!(v.as_i64(), Some(n) if (0..=0xffff).contains(&n)) && v.is_i64() == v.as_i64().is_some()
+}
+
+/// 1:1 port of `validateTraceDefinition` (trace-definition.ts:73). Pure; returns
+/// the full error list (no throw). Result shape `{ ok, errors }` matches the TS.
+fn validate_trace_definition(def: &Value) -> (bool, Vec<String>) {
+    let mut e: Vec<String> = Vec::new();
+    if !def.is_object() {
+        return (false, vec!["definition is not an object".into()]);
+    }
+    let get = |k: &str| def.get(k);
+
+    match get("id").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => {}
+        _ => e.push("id: required non-empty string".into()),
+    }
+    match get("version") {
+        Some(v) if v.is_i64() && v.as_i64().map(|n| n >= 1).unwrap_or(false) => {}
+        _ => e.push("version: integer >= 1".into()),
+    }
+    match get("name").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => {}
+        _ => e.push("name: required non-empty string".into()),
+    }
+
+    let domains = get("domains").and_then(|v| v.as_array());
+    match domains {
+        Some(arr) if !arr.is_empty() => {
+            for d in arr {
+                if let Some(s) = d.as_str() {
+                    if !TRACE_DOMAINS.contains(&s) {
+                        e.push(format!("domains: unknown \"{s}\""));
+                    }
+                } else {
+                    e.push(format!("domains: unknown \"{d}\""));
+                }
+            }
+        }
+        _ => e.push("domains: at least one".into()),
+    }
+
+    let triggers = get("triggers").and_then(|v| v.as_array());
+    match triggers {
+        Some(arr) if !arr.is_empty() => {
+            for (i, t) in arr.iter().enumerate() {
+                e.extend(validate_trace_trigger(t, i));
+            }
+        }
+        _ => e.push("triggers: at least one".into()),
+    }
+
+    let captures = get("captures").and_then(|v| v.as_array());
+    match captures {
+        Some(arr) if !arr.is_empty() => {
+            for (i, c) in arr.iter().enumerate() {
+                e.extend(validate_trace_capture(c, i));
+            }
+        }
+        _ => e.push("captures: at least one".into()),
+    }
+
+    match get("retention").and_then(|v| v.as_str()) {
+        Some("transient") | Some("evidence") => {}
+        _ => e.push("retention: \"transient\" | \"evidence\"".into()),
+    }
+
+    if let Some(cp) = get("checkpointPolicy") {
+        if !cp.is_null() {
+            match cp.as_str() {
+                Some("on-trigger") => e.push(
+                    "checkpointPolicy: \"on-trigger\" not yet supported — use \"at-start\" or \"at-stop\""
+                        .into(),
+                ),
+                Some("none") | Some("at-start") | Some("at-stop") => {}
+                _ => e.push("checkpointPolicy: none | at-start | at-stop".into()),
+            }
+        }
+    }
+
+    // §708.7 coverage: every capture/trigger that needs a domain must declare it.
+    if let (Some(doms), Some(caps)) = (domains, captures) {
+        let dset: std::collections::HashSet<&str> =
+            doms.iter().filter_map(|v| v.as_str()).collect();
+        for (i, c) in caps.iter().enumerate() {
+            if let Some(need) = capture_requires_domain(c) {
+                if !dset.contains(need) {
+                    let kind = c.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                    e.push(format!(
+                        "captures[{i}]: \"{kind}\" requires domain \"{need}\" in domains"
+                    ));
+                }
+            }
+        }
+    }
+    if let (Some(doms), Some(trigs)) = (domains, triggers) {
+        let dset: std::collections::HashSet<&str> =
+            doms.iter().filter_map(|v| v.as_str()).collect();
+        for (i, t) in trigs.iter().enumerate() {
+            if let Some(need) = trigger_requires_domain(t) {
+                if !dset.contains(need) {
+                    let kind = t.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                    e.push(format!(
+                        "triggers[{i}]: \"{kind}\" requires domain \"{need}\" in domains"
+                    ));
+                }
+            }
+        }
+    }
+
+    if let Some(stop) = get("stop") {
+        if !stop.is_null() {
+            let kind = stop.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            if !["cycle-budget", "event-count", "manual"].contains(&kind) {
+                e.push("stop.kind invalid".into());
+            }
+            if (kind == "cycle-budget" || kind == "event-count")
+                && !matches!(stop.get("value").and_then(|v| v.as_f64()), Some(n) if n > 0.0)
+            {
+                e.push(format!("stop.value: positive number for {kind}"));
+            }
+        }
+    }
+
+    (e.is_empty(), e)
+}
+
+/// 1:1 port of `validateTrigger` (trace-definition.ts:126).
+fn validate_trace_trigger(t: &Value, i: usize) -> Vec<String> {
+    let p = format!("triggers[{i}]");
+    let kind = t.get("kind").and_then(|v| v.as_str());
+    match kind {
+        Some("pc-range") => {
+            let mut out = Vec::new();
+            let dom = t.get("domain").and_then(|v| v.as_str());
+            if dom != Some("c64-cpu") && dom != Some("drive8-cpu") {
+                out.push(format!("{p}.domain: c64-cpu | drive8-cpu"));
+            }
+            let from = t.get("from");
+            let to = t.get("to");
+            let ok = from.map(is_u16).unwrap_or(false)
+                && to.map(is_u16).unwrap_or(false)
+                && from.and_then(|f| f.as_i64()) <= to.and_then(|tv| tv.as_i64());
+            if !ok {
+                out.push(format!("{p}: from/to must be 0..$FFFF with from<=to"));
+            }
+            out
+        }
+        Some("mem-access") => {
+            let mut out = Vec::new();
+            let access = t.get("access").and_then(|v| v.as_str()).unwrap_or("");
+            if !["read", "write", "any"].contains(&access) {
+                out.push(format!("{p}.access: read | write | any"));
+            }
+            let from = t.get("from");
+            let to = t.get("to");
+            let ok = from.map(is_u16).unwrap_or(false)
+                && to.map(is_u16).unwrap_or(false)
+                && from.and_then(|f| f.as_i64()) <= to.and_then(|tv| tv.as_i64());
+            if !ok {
+                out.push(format!("{p}: from/to must be 0..$FFFF with from<=to"));
+            }
+            out
+        }
+        Some("iec-transition") => {
+            let line = t.get("line");
+            match line.and_then(|v| v.as_str()) {
+                None => vec![],
+                Some(l) if ["atn", "clk", "data"].contains(&l) => vec![],
+                _ if line.map(|v| v.is_null()).unwrap_or(true) => vec![],
+                _ => vec![format!("{p}.line: atn | clk | data")],
+            }
+        }
+        Some("raster-window") => {
+            let from = t.get("fromLine").and_then(|v| v.as_i64());
+            let to = t.get("toLine").and_then(|v| v.as_i64());
+            if matches!((from, to), (Some(f), Some(tv)) if f <= tv) {
+                vec![]
+            } else {
+                vec![format!("{p}: fromLine<=toLine integers")]
+            }
+        }
+        Some("monitor-stop") => vec![format!(
+            "{p}: \"monitor-stop\" trigger not supported — no runtime event semantics; use pc-range / mem-access / raster-window"
+        )],
+        Some("manual-mark") => vec![format!(
+            "{p}: \"manual-mark\" trigger not supported — record marks via trace/run/mark, not as a capture trigger"
+        )],
+        other => vec![format!(
+            "{p}: unknown trigger kind \"{}\"",
+            other.unwrap_or("")
+        )],
+    }
+}
+
+/// 1:1 port of `validateCapture` (trace-definition.ts:155).
+fn validate_trace_capture(c: &Value, i: usize) -> Vec<String> {
+    let p = format!("captures[{i}]");
+    match c.get("kind").and_then(|v| v.as_str()) {
+        Some("cpu-row") => {
+            let dom = c.get("domain").and_then(|v| v.as_str());
+            if dom == Some("c64-cpu") || dom == Some("drive8-cpu") {
+                vec![]
+            } else {
+                vec![format!("{p}.domain: c64-cpu | drive8-cpu")]
+            }
+        }
+        Some("mem-row") | Some("iec-row") | Some("vic-row") | Some("checkpoint-ref") => vec![],
+        other => vec![format!("{p}: unknown capture kind \"{}\"", other.unwrap_or(""))],
+    }
+}
+
+/// 1:1 port of `captureRequiresDomain` (trace-definition.ts:169).
+fn capture_requires_domain(c: &Value) -> Option<&'static str> {
+    match c.get("kind").and_then(|v| v.as_str()) {
+        Some("cpu-row") => Some(
+            if c.get("domain").and_then(|v| v.as_str()) == Some("drive8-cpu") {
+                "drive8-cpu"
+            } else {
+                "c64-cpu"
+            },
+        ),
+        Some("mem-row") => Some("memory"),
+        Some("iec-row") => Some("iec"),
+        Some("vic-row") => Some("vic"),
+        _ => None,
+    }
+}
+
+/// 1:1 port of `triggerRequiresDomain` (trace-definition.ts:181).
+fn trigger_requires_domain(t: &Value) -> Option<&'static str> {
+    match t.get("kind").and_then(|v| v.as_str()) {
+        Some("pc-range") => Some(
+            if t.get("domain").and_then(|v| v.as_str()) == Some("drive8-cpu") {
+                "drive8-cpu"
+            } else {
+                "c64-cpu"
+            },
+        ),
+        Some("mem-access") => Some("memory"),
+        Some("iec-transition") => Some("iec"),
+        Some("raster-window") => Some("vic"),
+        _ => None,
+    }
+}
+
+/// 1:1 port of `slugTraceId` (trace-definition.ts:192): kebab-case from a name.
+fn slug_trace_id(name: &str) -> String {
+    let lower = name.to_lowercase();
+    // Collapse any run of non-[a-z0-9] into a single '-'.
+    let mut slug = String::new();
+    let mut prev_dash = false;
+    for ch in lower.chars() {
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
+            slug.push(ch);
+            prev_dash = false;
+        } else if !prev_dash {
+            slug.push('-');
+            prev_dash = true;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    let slug: String = slug.chars().take(48).collect();
+    if slug.is_empty() {
+        // TS: `trace-${Date.now().toString(36)}`.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        format!("trace-{}", radix36(now))
+    } else {
+        slug
+    }
+}
+
+/// base-36 of a u128 (= JS `Number.toString(36)`), lowercase.
+fn radix36(mut n: u128) -> String {
+    if n == 0 {
+        return "0".into();
+    }
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut buf = Vec::new();
+    while n > 0 {
+        buf.push(DIGITS[(n % 36) as usize]);
+        n /= 36;
+    }
+    buf.reverse();
+    String::from_utf8(buf).unwrap()
 }
 
 // ── 6502 disassembler ─────────────────────────────────────────────────────────
@@ -2089,6 +2391,48 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             }))
         }
 
+        // ── Spec 708 — declarative trace definitions (validate / put / list) ──
+        // Pure data + a per-session map; no core primitive. Shapes match the TS
+        // ws-server.ts handlers (trace/definition/{validate,put,list}) 1:1.
+
+        "trace/definition/validate" => {
+            let def = req.params.get("definition").cloned().unwrap_or(Value::Null);
+            let (ok, errors) = validate_trace_definition(&def);
+            Response::ok(id, json!({ "ok": ok, "errors": errors }))
+        }
+
+        "trace/definition/put" => {
+            let def = req.params.get("definition").cloned().unwrap_or(Value::Null);
+            let (ok, errors) = validate_trace_definition(&def);
+            if !ok {
+                // TS: `return { ok: false, errors }` (NOT an RPC error).
+                return Response::ok(id, json!({ "ok": false, "errors": errors }));
+            }
+            // TS: `id = definition.id || slugTraceId(definition.name)`.
+            let explicit_id = def.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+            let def_id = match explicit_id {
+                Some(s) => s.to_string(),
+                None => {
+                    let name = def.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    slug_trace_id(name)
+                }
+            };
+            // Store the definition with its resolved id (`{ ...definition, id }`).
+            let mut stored = def.clone();
+            if let Some(obj) = stored.as_object_mut() {
+                obj.insert("id".to_string(), json!(def_id));
+            }
+            let mut st = state.lock().unwrap();
+            st.trace_definitions.insert(def_id.clone(), stored);
+            Response::ok(id, json!({ "ok": true, "id": def_id }))
+        }
+
+        "trace/definition/list" => {
+            let st = state.lock().unwrap();
+            let definitions: Vec<Value> = st.trace_definitions.values().cloned().collect();
+            Response::ok(id, json!({ "definitions": definitions }))
+        }
+
         "trace/run/stop" => {
             let mut st = state.lock().unwrap();
             let status = finalize_trace(&mut st.session);
@@ -2474,6 +2818,7 @@ async fn main() {
         ctrl_frame: 0, // incremented on each debug/run|pause|continue; first pause → 1
         ctrl_stop: None,
         checkpoint_counter: 0,
+        trace_definitions: std::collections::HashMap::new(),
     }));
 
     let addr: SocketAddr = format!("127.0.0.1:{}", cli.port).parse().unwrap();
