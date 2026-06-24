@@ -101,7 +101,9 @@ pub fn build_memconfig_table() -> [MemConfig; 32] {
         // ts:996 — Ultimax mode: GAME=0 AND EXROM=1.
         let ultimax = !game && exrom;
 
-        // ts:998-1000 — bank8.
+        // ts:998-1000 — bank8 (kept as two separate conditions verbatim with the
+        // TS `if (ultimax) ...; else if (loram && hiram && !exrom) ...`).
+        #[allow(clippy::if_same_then_else)]
         let bank8 = if ultimax {
             Bank8::CartLo
         } else if loram && hiram && !exrom {

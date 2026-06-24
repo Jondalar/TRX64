@@ -249,7 +249,7 @@ pub fn parse_crt(
     mapper_type: Option<MapperType>,
 ) -> Result<ParsedCartridgeImage, CrtError> {
     // ts:157-159
-    if data.len() < 16 || &data[0..16] != &CRT_SIGNATURE[..] {
+    if data.len() < 16 || data[0..16] != CRT_SIGNATURE[..] {
         return Err(CrtError::NotCrt);
     }
     // ts:160-166
