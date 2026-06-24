@@ -838,3 +838,22 @@ title structure. NOT yet pixel-clean: the bulk bitmap DATA from the custom 2-bit
 corrupt (garbled bitmap, correct structure). NEXT BLOCKER (dd00-fast-transfer): the sub-cycle CLK/DATA
 sampling timing in the 2-bit fast loader — bytes wrong while drive($0402-08/$07xx) + C64($04xx/$94xx) run in
 lockstep. Reference traces saved: traces/scramble_run_ref.duckdb (c64re), traces/scramble_ref_screen1.png.
+
+## ADR-055 — fast-transfer root cause = cross-domain IEC coupling granularity (the LAST approximation)
+The scramble custom 2-bit $DD00 fast-transfer delivers corrupt bytes. Diagnosed to the exact first divergence:
+the C64 pc/a/x/y stream is byte-identical to the c64re reference for 323,841 instructions, then diverges in
+the KERNAL serial debounce $EEA9 (LDA $DD00 / CMP $DD00 / BNE — loop until two reads agree): the reference
+takes 2 iterations (sees a sub-cycle line transition between the two reads), TRX64 takes 1 (the drive
+asserted DATA one protocol-step early). The drive runs ahead; later the custom $04xx bit-bang transfer
+($04E2 BIT $DD00 / BVC, where timing IS the data) corrupts -> noise bitmap.
+ROOT CAUSE (the last "so ähnlich" layer, NOW that drive/C64-CPU/VIC are verbatim): the cross-domain IEC
+coupling. TRX64 couples via BATCH-SNAPSHOT (full.rs iec_catch_up_to freezes iec_drv_port for the whole drive
+batch; lib.rs:893 per-instruction drive catch-up; the C64 frozen during the drive batch + vice-versa), so
+neither debounce loop sees a mid-batch line transition. VICE keeps ONE shared iecbus (iecbus.c
+iecbus_cpu_read_conf1 -> drive_cpu_execute_all; via1d1541.c store_prb updates cpu_port at the store's EXACT
+drive-clock), cycle-stepped, so two closely-spaced reads STRADDLE a transition + the debounce loops.
+THE FIX (foundational, NOT surgical): finer cross-domain interleaving — cycle-stepped drive<->C64 around IEC
+accesses (re-fold the shared bus per drive cycle in the handshake windows), matching VICE's single-iecbus
+sub-cycle transition timing. Touches lib.rs/full.rs/drive.rs (the cross-domain run loop) + the byte-exact gate
+paths — risky. Tested off-by-N read-path phase shifts (+1/-1): divergence index unchanged (not a fixed offset).
+ESCALATED to user (foundational + risky decision). Diagnostic probe merged (dd00_fast_probe.rs). All gates GREEN.
