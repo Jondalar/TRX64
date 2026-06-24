@@ -391,6 +391,15 @@ fn sprite_bounds_at(cp: &Value, ram: &[u8], snap: &VicInspectSnapshot, x: i64, y
     None
 }
 
+/// vic-inspect.ts:112-161 — `resolveNodeAt(cp, x, y, provenance?)` public entry.
+/// DISPLAY-area coords (x in [0,320), y in [0,200)). Used by `vic/inspect/at_capture`
+/// (which sends display-area pixels, unlike `at`/`region` which send visible-frame).
+pub fn resolve_node_at_display(cp: &Value, x: i64, y: i64, provenance: Option<&Value>) -> VisualNode {
+    let ram = decode_ram(cp).unwrap_or_default();
+    let prov = parse_provenance(provenance);
+    resolve_node_at(cp, &ram, x, y, &prov)
+}
+
 /// vic-inspect.ts:112-161 — `resolveNodeAt(cp, x, y, provenance?)`. Display-area.
 fn resolve_node_at(cp: &Value, ram: &[u8], x: i64, y: i64, provenance: &[ProvenanceLine]) -> VisualNode {
     let snap = build_vic_inspect_snapshot(cp);

@@ -3063,17 +3063,231 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             Response::ok(id, json!({ "evidence": st.inspect_evidence.clone() }))
         }
 
+        // vic/inspect/open — §2.2: freeze (capture provenance), capture+pin the
+        // inspected checkpoint, return the shared record + the UI geometry contract.
+        // ws-server.ts:1119-1133. The returned checkpointId + snapshot are the
+        // SHARED record 711/712 also bind to.
+        "vic/inspect/open" => {
+            let mut st = state.lock().unwrap();
+            // §2.2 + 710.6c — if running, freeze first (no provenance sidecar in
+            // TRX64 yet, so this is just a pause); then capture+pin.
+            st.session.running = false;
+            let frame = st.ctrl_frame;
+            let cycles = st.session.machine.c64_core.clk;
+            let cp = capture_live_checkpoint(&mut st.session);
+            let r = match st.checkpoint_ring.capture(cp, frame, cycles) {
+                Ok(r) => r,
+                Err(e) => return Response::err(id, -32001, format!("vic/inspect/open: {e}")),
+            };
+            st.checkpoint_ring.pin(&r.id);
+            // restore_snapshot → the stored RuntimeCheckpoint tree (rehydrated media).
+            let snapshot = match st.checkpoint_ring.restore_snapshot(&r.id) {
+                Some(s) => s,
+                None => return Response::err(id, -32001, "vic/inspect/open: capture vanished from ring"),
+            };
+            let frame_snap = trx64_core::vic_inspect::build_vic_inspect_snapshot(&snapshot).to_json();
+            let provenance = snapshot.get("vicProvenance").cloned().filter(|p| !p.is_null());
+            let run_state = if st.session.running { "running" } else { "paused" };
+            Response::ok(id, json!({
+                "checkpointId": r.id,
+                "frame": frame_snap,
+                "provenance": provenance,
+                "runState": run_state,
+                "geometry": {
+                    "visible": { "width": trx64_core::vic_inspect::VISIBLE_FRAME_W, "height": trx64_core::vic_inspect::VISIBLE_FRAME_H },
+                    "displayOrigin": { "x": trx64_core::vic_inspect::DISPLAY_ORIGIN_X, "y": trx64_core::vic_inspect::DISPLAY_ORIGIN_Y },
+                    "cell": { "w": 8, "h": 8, "cols": 40, "rows": 25 },
+                },
+            }))
+        }
+
+        // vic/inspect/at — resolve a VISIBLE-frame pixel (0..384 × 0..272) to its
+        // node. ws-server.ts:1135-1139. { node }.
+        "vic/inspect/at" => {
+            let cp_id = match req.params.get("checkpoint_id").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return Response::err(id, -32602, "vic/inspect/at: checkpoint_id required"),
+            };
+            let x = req.params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = req.params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let st = state.lock().unwrap();
+            let cp = match cp_for_inspect(&st, &cp_id) {
+                Ok(cp) => cp,
+                Err(e) => return Response::err(id, -32001, e),
+            };
+            let prov = cp.get("vicProvenance").cloned().filter(|p| !p.is_null());
+            let node = trx64_core::vic_inspect::resolve_visible_node_at(&cp, x, y, prov.as_ref());
+            Response::ok(id, json!({ "node": node.to_json() }))
+        }
+
+        // vic/inspect/region — resolve a VISIBLE-frame region to distinct nodes.
+        // ws-server.ts:1140-1145. { nodes }.
+        "vic/inspect/region" => {
+            let cp_id = match req.params.get("checkpoint_id").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return Response::err(id, -32602, "vic/inspect/region: checkpoint_id required"),
+            };
+            let region = match req.params.get("region") {
+                Some(r) if r.is_object() => {
+                    let g = |k: &str| r.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    (g("x"), g("y"), g("width"), g("height"))
+                }
+                _ => return Response::err(id, -32602, "vic/inspect/region: region required"),
+            };
+            let st = state.lock().unwrap();
+            let cp = match cp_for_inspect(&st, &cp_id) {
+                Ok(cp) => cp,
+                Err(e) => return Response::err(id, -32001, e),
+            };
+            let prov = cp.get("vicProvenance").cloned().filter(|p| !p.is_null());
+            let nodes = trx64_core::vic_inspect::resolve_visible_region(&cp, region, prov.as_ref());
+            Response::ok(id, json!({ "nodes": nodes.iter().map(|n| n.to_json()).collect::<Vec<_>>() }))
+        }
+
+        // vic/inspect/at_capture — frozen-pixel provenance. Captures+pins a
+        // checkpoint if none given, then resolves the node (DISPLAY-area coords).
+        // ws-server.ts:793-811. { checkpointId, frame, node, hasProvenance }.
+        "vic/inspect/at_capture" => {
+            let x = req.params.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
+            let y = req.params.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
+            let given = req.params.get("checkpoint_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let mut st = state.lock().unwrap();
+            let cp_id = match given {
+                Some(s) if !s.is_empty() => s,
+                _ => {
+                    // capture + pin a fresh checkpoint (the in-process tool's behaviour).
+                    st.session.running = false;
+                    let frame = st.ctrl_frame;
+                    let cycles = st.session.machine.c64_core.clk;
+                    let cp = capture_live_checkpoint(&mut st.session);
+                    let r = match st.checkpoint_ring.capture(cp, frame, cycles) {
+                        Ok(r) => r,
+                        Err(e) => return Response::err(id, -32001, format!("vic/inspect/at_capture: {e}")),
+                    };
+                    st.checkpoint_ring.pin(&r.id);
+                    r.id
+                }
+            };
+            let cp = match cp_for_inspect(&st, &cp_id) {
+                Ok(cp) => cp,
+                Err(e) => return Response::err(id, -32001, e),
+            };
+            let frame_snap = trx64_core::vic_inspect::build_vic_inspect_snapshot(&cp).to_json();
+            let prov = cp.get("vicProvenance").cloned().filter(|p| !p.is_null());
+            let node = trx64_core::vic_inspect::resolve_node_at_display(&cp, x, y, prov.as_ref());
+            Response::ok(id, json!({
+                "checkpointId": cp_id,
+                "frame": frame_snap,
+                "node": node.to_json(),
+                "hasProvenance": prov.is_some(),
+            }))
+        }
+
+        // vic/inspect/origin — Spec 721 Live Visual-Origin Join: resolve a frozen
+        // visible node to its ORIGIN (exact byte-hash asset match) + knowledge.
+        // ws-server.ts:1190-1201. { node, classification, result, knowledge, medium }.
+        "vic/inspect/origin" => {
+            let cp_id = match req.params.get("checkpoint_id").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return Response::err(id, -32602, "vic/inspect/origin: checkpoint_id required"),
+            };
+            let x = req.params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = req.params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let st = state.lock().unwrap();
+            let cp = match cp_for_inspect(&st, &cp_id) {
+                Ok(cp) => cp,
+                Err(e) => return Response::err(id, -32001, e),
+            };
+            let prov = cp.get("vicProvenance").cloned().filter(|p| !p.is_null());
+            let node = trx64_core::vic_inspect::resolve_visible_node_at(&cp, x, y, prov.as_ref());
+            // Spec 721 — extract AssetCandidates from the mounted medium (sprite/
+            // charset/bitmap block hashes). No medium → empty set → honest
+            // runtime_generated (same as c64re with nothing mounted / no match).
+            let (candidates, medium_ref) = match st.session.machine.drive8.get_attached_disk() {
+                Some(d) if !d.bytes.is_empty() => {
+                    let kind = match d.kind {
+                        trx64_core::drive::DiskKind::G64 => "g64",
+                        trx64_core::drive::DiskKind::D64 => "d64",
+                    };
+                    (
+                        trx64_core::vic_inspect::extract_asset_candidates(&d.bytes, "session", Some(kind)),
+                        Some(kind.to_string()),
+                    )
+                }
+                _ => (Vec::new(), None),
+            };
+            let cand_count = candidates.len();
+            let (result, knowledge) =
+                trx64_core::vic_inspect::resolve_visual_origin(&cp, &node, &candidates, "session");
+            let classification = result.get("classification").cloned().unwrap_or(Value::Null);
+            Response::ok(id, json!({
+                "node": node.to_json(),
+                "classification": classification,
+                "result": result,
+                "knowledge": knowledge,
+                "medium": { "ref": medium_ref, "candidateCount": cand_count },
+            }))
+        }
+
+        // vic/inspect/promote — Spec 710.5: assemble + store a shared evidence
+        // record (checkpoint + media identity + optional trace mark + resolved
+        // nodes). points/region are VISIBLE-frame coords. ws-server.ts:1154-1168.
+        "vic/inspect/promote" => {
+            let cp_id = match req.params.get("checkpoint_id").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return Response::err(id, -32602, "vic/inspect/promote: checkpoint_id required"),
+            };
+            let points: Vec<(f64, f64)> = req
+                .params
+                .get("points")
+                .and_then(|p| p.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|p| {
+                            (
+                                p.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                                p.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let region = req.params.get("region").filter(|r| r.is_object()).map(|r| {
+                let g = |k: &str| r.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                (g("x"), g("y"), g("width"), g("height"))
+            });
+            let trace_mark_id = req.params.get("trace_mark_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let name = req.params.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let notes = req.params.get("notes").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let mut st = state.lock().unwrap();
+            let cp = match cp_for_inspect(&st, &cp_id) {
+                Ok(cp) => cp,
+                Err(e) => return Response::err(id, -32001, e),
+            };
+            let prov = cp.get("vicProvenance").cloned().filter(|p| !p.is_null());
+            let evidence = trx64_core::vic_inspect::assemble_inspect_evidence(
+                &cp,
+                &cp_id,
+                &points,
+                region,
+                trace_mark_id.as_deref(),
+                None,
+                None,
+                prov.as_ref(),
+            );
+            // ws-server.ts:1163 — tag with name/notes/promotedAtMs.
+            let mut tagged = evidence;
+            tagged["name"] = name.map(Value::String).unwrap_or(Value::Null);
+            tagged["notes"] = notes.map(Value::String).unwrap_or(Value::Null);
+            tagged["promotedAtMs"] = json!(now_ms());
+            st.inspect_evidence.push(tagged.clone());
+            let count = st.inspect_evidence.len();
+            Response::ok(id, json!({ "evidence": tagged, "count": count }))
+        }
+
         m if m.starts_with("vic/inspect/") => {
-            // open / at / region / at_capture / origin / promote: these resolve
-            // pixel→node graphs and asset origins from a checkpoint. They ride the
-            // ring (capture/pin/restoreSnapshot — DONE), but ALSO need the
-            // vic-inspect engine (buildVicInspectSnapshot, resolveVisibleNodeAt,
-            // resolveVisibleRegion, resolveVisualOrigin, assembleInspectEvidence)
-            // — a new primitive not yet in trx64-core. Deferred until it lands.
-            // The collapsed "vic/inspect" above serves the immediate frozen-pixel
-            // resolve in the meantime.
             Response::err(id, -32001,
-                format!("NOT_IMPLEMENTED: {m}: rides the ring (ready) but needs the vic-inspect node/origin engine (buildVicInspectSnapshot/resolveVisibleNodeAt/resolveVisualOrigin) — not yet ported"))
+                format!("NOT_IMPLEMENTED: {m}: unknown vic/inspect/* method"))
         }
 
         m if m.starts_with("vic/") => {
@@ -4350,6 +4564,31 @@ fn build_debug_state(st: &State) -> Value {
 // capture/restore rides the EXACT same path as the `.c64re` snapshot — the ring
 // just keeps the resulting checkpoint Value in memory instead of on disk.
 
+/// Spec 710 — `cpForInspect` (ws-server.ts:1106-1111): the stored RuntimeCheckpoint
+/// tree for `id` (rehydrated media), erroring when the id is unknown or the entry
+/// has no VIC/RAM. The vic-inspect engine reads `cp.vic.regs/color_ram`, `cp.ram`,
+/// `cp.cia2.c_cia` off this tree.
+fn cp_for_inspect(st: &State, id: &str) -> Result<Value, String> {
+    let cp = st
+        .checkpoint_ring
+        .restore_snapshot(id)
+        .ok_or_else(|| format!("vic/inspect: unknown checkpoint {id}"))?;
+    let has_vic = cp.get("vic").map(|v| !v.is_null()).unwrap_or(false);
+    let has_ram = cp.get("ram").map(|v| !v.is_null()).unwrap_or(false);
+    if !has_vic || !has_ram {
+        return Err(format!("vic/inspect: unknown or empty checkpoint {id}"));
+    }
+    Ok(cp)
+}
+
+/// Wall-clock ms since epoch (ws-server.ts `Date.now()` for `promotedAtMs`).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Capture the live machine into a self-contained RuntimeCheckpoint Value, with the
 /// attached drive8 disk EMBEDDED in the `driveDiskImage` blob so a later restore can
 /// re-attach it (matching snapshot/dump). Mirrors c64re `controller.captureCheckpoint`
@@ -5128,7 +5367,10 @@ mod batch1_tests {
     #[test]
     fn deferred_methods_report_not_implemented() {
         let st = make_state();
-        for m in ["vic/inspect/open", "vic/inspect/at", "vic/inspect/promote"] {
+        // The vic/inspect/* engine methods are now implemented (see
+        // vic_inspect_engine_open_at_region_origin_promote). What remains deferred:
+        // the present-capture filmstrip + the trace/access-map readers.
+        for m in ["checkpoint/thumbnails", "trace/read", "debug/memory_access_map"] {
             let e = call_err(&st, m, json!({}));
             assert_eq!(e.code, -32001);
             assert!(e.message.contains("NOT_IMPLEMENTED"));
@@ -5329,10 +5571,94 @@ mod batch1_tests {
         let c = call(&st, "vic/inspect/close", json!({ "checkpoint_id": "x" }));
         assert_eq!(c["ok"], json!(true));
         assert!(c["stats"]["count"].is_u64());
-        // the engine-dependent ones stay deferred.
-        for m in ["vic/inspect/region", "vic/inspect/origin", "vic/inspect/at_capture"] {
-            assert_eq!(call_err(&st, m, json!({})).code, -32001);
+        // the engine-dependent ones require checkpoint_id (param error, not deferred).
+        for m in ["vic/inspect/at", "vic/inspect/region", "vic/inspect/origin", "vic/inspect/promote"] {
+            assert_eq!(call_err(&st, m, json!({})).code, -32602);
         }
+    }
+
+    #[test]
+    fn vic_inspect_engine_open_at_region_origin_promote() {
+        // Spec 710/721 — the 6 engine methods over a blank (no-ROM) machine: the
+        // resolver reads whatever VIC regs/RAM are present (regs all zero →
+        // standard_text; CIA2 PA=0 → bank 3 = $C000; d018=0 → screen $C000). Shapes
+        // are 1:1 with c64re ws-server.ts.
+        let st = make_state();
+
+        // open — capture + pin the inspected checkpoint; the SHARED record + geometry.
+        let o = call(&st, "vic/inspect/open", json!({}));
+        let cp_id = o["checkpointId"].as_str().expect("checkpointId").to_string();
+        assert!(cp_id.starts_with("cp_"));
+        assert_eq!(o["frame"]["mode"], json!("standard_text"));
+        assert_eq!(o["frame"]["bankBase"], json!(0xC000));
+        assert_eq!(o["frame"]["screenBase"], json!(0xC000));
+        assert_eq!(o["frame"]["displayWidth"], json!(320));
+        assert_eq!(o["frame"]["colorBase"], json!(0xd800));
+        assert_eq!(o["geometry"]["visible"]["width"], json!(384));
+        assert_eq!(o["geometry"]["displayOrigin"], json!({ "x": 32, "y": 35 }));
+        assert_eq!(o["geometry"]["cell"], json!({ "w": 8, "h": 8, "cols": 40, "rows": 25 }));
+        assert_eq!(o["runState"], json!("paused"));
+
+        // at — a VISIBLE-frame pixel inside the display window → text_cell node.
+        // display (4,4) → visible (36, 39).
+        let at = call(&st, "vic/inspect/at", json!({ "checkpoint_id": cp_id, "x": 36, "y": 39 }));
+        assert_eq!(at["node"]["type"], json!("text_cell"));
+        assert_eq!(at["node"]["mode"], json!("standard_text"));
+        assert_eq!(at["node"]["cell"], json!({ "col": 0, "row": 0, "index": 0 }));
+        // screen RAM ref @ $C000 (bank 3, d018=0), charset ref present.
+        let refs = at["node"]["refs"].as_array().unwrap();
+        assert!(refs.iter().any(|r| r["kind"] == "screen_ram" && r["addr"] == 0xC000));
+        assert!(refs.iter().any(|r| r["kind"] == "charset"));
+
+        // a VISIBLE-frame pixel in the open border → border node.
+        let border = call(&st, "vic/inspect/at", json!({ "checkpoint_id": cp_id, "x": 5, "y": 5 }));
+        assert_eq!(border["node"]["type"], json!("border"));
+        assert_eq!(border["node"]["refs"][0]["addr"], json!(0xd020));
+
+        // region — VISIBLE-frame region → distinct nodes (here all text_cell index 0,
+        // deduped to one + possibly a border node).
+        let reg = call(&st, "vic/inspect/region", json!({
+            "checkpoint_id": cp_id, "region": { "x": 36, "y": 39, "width": 16, "height": 16 }
+        }));
+        let nodes = reg["nodes"].as_array().unwrap();
+        assert!(!nodes.is_empty());
+        assert!(nodes.iter().all(|n| n["type"].is_string()));
+
+        // at_capture — DISPLAY-area coords; reuses the open checkpoint.
+        let ac = call(&st, "vic/inspect/at_capture", json!({ "checkpoint_id": cp_id, "x": 4, "y": 4 }));
+        assert_eq!(ac["checkpointId"], json!(cp_id));
+        assert_eq!(ac["node"]["type"], json!("text_cell"));
+        assert_eq!(ac["hasProvenance"], json!(false));
+        assert_eq!(ac["frame"]["mode"], json!("standard_text"));
+
+        // origin — no medium mounted → honest runtime_generated + the knowledge chain.
+        let org = call(&st, "vic/inspect/origin", json!({ "checkpoint_id": cp_id, "x": 36, "y": 39 }));
+        assert_eq!(org["classification"], json!("runtime_generated"));
+        assert_eq!(org["result"]["classification"], json!("runtime_generated"));
+        assert_eq!(org["knowledge"]["classification"], json!("runtime_generated"));
+        assert_eq!(org["medium"]["ref"], Value::Null);
+        assert_eq!(org["medium"]["candidateCount"], json!(0));
+        // VisualElement → MemoryRange relation always present.
+        assert_eq!(org["knowledge"]["relations"][0]["relation"], json!("maps-to"));
+
+        // promote — assemble + store the shared evidence record; evidence list grows.
+        let pr = call(&st, "vic/inspect/promote", json!({
+            "checkpoint_id": cp_id, "points": [{ "x": 36, "y": 39 }], "name": "cell0", "notes": "test"
+        }));
+        assert_eq!(pr["count"], json!(1));
+        assert_eq!(pr["evidence"]["checkpointId"], json!(cp_id));
+        assert_eq!(pr["evidence"]["name"], json!("cell0"));
+        assert_eq!(pr["evidence"]["notes"], json!("test"));
+        assert!(pr["evidence"]["promotedAtMs"].is_u64());
+        let sel = pr["evidence"]["selectedNodes"].as_array().unwrap();
+        assert_eq!(sel.len(), 1);
+        assert_eq!(sel[0]["type"], json!("text_cell"));
+        // evidence — now returns the promoted record.
+        let ev = call(&st, "vic/inspect/evidence", json!({}));
+        assert_eq!(ev["evidence"].as_array().unwrap().len(), 1);
+
+        // unknown checkpoint → error.
+        assert_eq!(call_err(&st, "vic/inspect/at", json!({ "checkpoint_id": "nope", "x": 36, "y": 39 })).code, -32001);
     }
 
     // ── Spec 766.5 — recorder WS surface (wire-shape parity vs c64re) ─────────
