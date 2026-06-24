@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "dd00-fast-transfer",
+  "current_item": "ESCALATED-dd00-fast-transfer",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -35,18 +35,13 @@
     "vic-verbatim",
     "dd00-atn-irq"
   ],
-  "note": "dd00-atn-irq DONE (ADR-054): IK_IRQ ack bug fixed -> custom loader RUNS, title layout renders (was BASIC fallback). Next: dd00-fast-transfer — the 2-bit $DD00 fast-transfer CLK/DATA bit-sampling (corrupt bitmap bytes). c64re ref trace saved traces/scramble_run_ref.duckdb.",
-  "updated": "2026-06-24T04:05:50Z",
+  "note": "dd00-fast-transfer: NO fix (foundational). Root = cross-domain IEC coupling is batch-snapshot, not VICE cycle-stepped single-iecbus -> debounce loops cant see sub-cycle transitions -> custom loader bit-bang data corrupts. The LAST so-aehnlich layer. Fix = cycle-stepped cross-domain IEC interleave (risky, touches byte-exact paths). ESCALATED to user. Loop can route to render-verbatim (independent) meanwhile.",
+  "updated": "2026-06-24T04:08:46Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": {
-    "item": "dd00-fast-transfer",
-    "model": "opus",
-    "started": "2026-06-24T04:05:50Z",
-    "note": "opus ~30min: 3 commits, probe pinned first divergence = KERNAL $EEA9 debounce; full.rs edited ~4min ago (the cross-domain fix in progress). Defer."
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
@@ -57,7 +52,7 @@
   ],
   "custom_loader_test_disk": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/scramble_infinity.d64",
   "blocked": [
-    "drive-seek-phase (custom-loader phase-lead): ~12-20k C64-cycle lead UPSTREAM of track-1 read (boot/seek/directory/IEC-filename phase) — rotation FALSIFIED by c64re measurement (track-1 lock at identical byte). 5 theories down. Ref trace saved tmp/scramble-track1-measure.duckdb. ESCALATED (ADR-047)"
+    "dd00-fast-transfer: scramble custom 2-bit $DD00 transfer corrupt. Root = cross-domain IEC coupling granularity (batch-snapshot vs VICE cycle-stepped single-iecbus). First div: KERNAL $EEA9 debounce, 1 iter vs ref 2 (instr 323841). Fix is FOUNDATIONAL (cycle-stepped drive<->C64 around IEC, full.rs/lib.rs/drive.rs) - ESCALATED (ADR-055)"
   ],
   "loop_status": "RUNNING",
   "bar": "BEHAVIORAL parity with c64re (renders games/demos, .g64 1541 loaders, the 7-game gate). Match c64re, not exceed it."
