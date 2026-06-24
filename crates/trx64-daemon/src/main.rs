@@ -1605,7 +1605,101 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         }
 
         "session/joystick_set" => {
+            // TRX64 has no joystick model (full.rs:366 — "none here"); accept the
+            // bits and no-op, matching the TS `{ ok: true }` shape.
             Response::ok(id, json!({ "ok": true }))
+        }
+
+        "session/joystick_clear" => {
+            // No joystick model → clearing is a no-op. Shape matches ws-server.ts
+            // session/joystick_clear `{ ok: true }`.
+            Response::ok(id, json!({ "ok": true }))
+        }
+
+        // session/input_status — UI inspector read of pressed keys + joystick bits
+        // (ws-server.ts:1486). TRX64's keyboard is a timed-event queue (no held-key
+        // set / pressed query) and has no joystick model, so pressed is empty and
+        // both joysticks read released. Shape matches the TS `{ pressed, joystick1,
+        // joystick2 }`.
+        "session/input_status" => {
+            let released = json!({
+                "up": false, "down": false, "left": false, "right": false, "fire": false
+            });
+            Response::ok(id, json!({
+                "pressed": Value::Array(Vec::new()),
+                "joystick1": released,
+                "joystick2": released
+            }))
+        }
+
+        // session/load_prg — inject a PRG into RAM (ws-server.ts:761 →
+        // loadPrgIntoRam). Reads the local file, writes the body at the load address
+        // (PRG header = 2-byte LE load addr), and returns
+        // { loadAddress, endAddress, bytesLoaded, path }. Load-only: does NOT set PC
+        // or autostart (that is runtime/run_prg).
+        "session/load_prg" => {
+            let prg_path = match req.params.get("prg_path").and_then(|v| v.as_str()) {
+                Some(p) => p.to_string(),
+                None => return Response::err(id, -32602, "session/load_prg: prg_path required"),
+            };
+            let bytes = match std::fs::read(&prg_path) {
+                Ok(b) => b,
+                Err(e) => return Response::err(id, -32602, format!("session/load_prg: read {prg_path}: {e}")),
+            };
+            if bytes.len() < 2 {
+                return Response::err(id, -32602, "session/load_prg: PRG too short (need 2-byte header)");
+            }
+            // Honor an explicit load_address override; else the PRG's own header.
+            let load_address = req
+                .params
+                .get("load_address")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u16)
+                .unwrap_or_else(|| (bytes[0] as u16) | ((bytes[1] as u16) << 8));
+            let body = &bytes[2..];
+            let mut st = state.lock().unwrap();
+            st.session.machine.poke(load_address, body);
+            st.session.machine.sync_after_monitor();
+            let end_address = load_address.wrapping_add(body.len() as u16);
+            Response::ok(id, json!({
+                "loadAddress": load_address as u64,
+                "endAddress": end_address as u64,
+                "bytesLoaded": body.len() as u64,
+                "path": prg_path
+            }))
+        }
+
+        // session/reset — RuntimeController re-init (ws-server.ts:1392). mode:"soft"
+        // = warm (RAM preserved), else cold. TRX64 has only cold_reset() (RAM is
+        // preserved — it does NOT power-on-fill), so "soft" maps to cold_reset() and
+        // a full cold power-cycle additionally fills power-on RAM. Both run the
+        // KERNAL to READY (5M cycles, matching the TS runFor). Returns
+        // { c64Cycles, pc, mode }.
+        "session/reset" => {
+            let mode = req.params.get("mode").and_then(|v| v.as_str()).unwrap_or("cold");
+            let mut st = state.lock().unwrap();
+            if mode == "soft" {
+                // Warm = HW RESET line, RAM preserved.
+                st.session.machine.cold_reset();
+            } else {
+                // Cold power-cycle = fresh DRAM fill, then reset.
+                st.session.machine.fill_power_on_ram();
+                st.session.machine.cold_reset();
+                st.session.machine.drive8.cold_reset();
+            }
+            st.session.machine.keyboard.clear();
+            run_cycle_budget(&mut st.session, 5_000_000);
+            let out_mode = if mode == "soft" { "soft" } else { "cold" };
+            let pc = st.session.machine.cpu6510.reg_pc as u64;
+            let cycles = st.session.machine.clk;
+            // A reset is a control discontinuity — clear stop + advance the frame.
+            st.ctrl_stop = None;
+            st.ctrl_frame += 1;
+            Response::ok(id, json!({
+                "c64Cycles": cycles,
+                "pc": pc,
+                "mode": out_mode
+            }))
         }
 
         "session/screenshot" => {
@@ -1705,6 +1799,33 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 "sp": c.reg_sp as u64,
                 "flags": c.flags() as u64,
                 "cycles": st.session.machine.clk
+            }))
+        }
+
+        // debug/state — the RuntimeController.state() snapshot (runtime-controller.ts
+        // :344). Read-only: reports the CURRENT run/pause state, pacing, pc/cycles,
+        // controller frame, breakpoints, and last stop. TRX64 has no pacing loop, so
+        // pacing is the constant PAL pacing the TS reports for an unpaced session.
+        "debug/state" => {
+            let st = state.lock().unwrap();
+            let bps = st.breakpoints.list_vice_json();
+            let c = &st.session.machine.cpu6510;
+            let pc = c.reg_pc as u64;
+            let cycles = st.session.machine.clk;
+            let run_state = if st.session.running { "running" } else { "paused" };
+            let stop = match &st.ctrl_stop {
+                Some(s) => json!({ "reason": s.reason, "pc": s.pc as u64, "cycles": s.cycles }),
+                None => Value::Null,
+            };
+            Response::ok(id, json!({
+                "runState": run_state,
+                "pacing": { "mode": "pal", "ratio": 1 },
+                "pc": pc,
+                "cycles": cycles,
+                "frame": st.ctrl_frame,
+                "breakpoints": bps,
+                "stop": stop,
+                "controlOwner": "llm"
             }))
         }
 
