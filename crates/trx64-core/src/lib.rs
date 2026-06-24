@@ -675,8 +675,12 @@ impl Machine {
                     cartridge_attached: true,
                     cartridge_exrom: Some(cart.get_lines().exrom),
                     cartridge_game: Some(cart.get_lines().game),
+                    phi1: 0xff,
                 };
-                if let Some(v) = cart.read(addr, &bi) {
+                // peek (side-effect-free): a reset-vector fetch must NOT advance
+                // the flash command FSM (the flash is in READ state at reset, so
+                // peek returns the same raw ROMH byte the bus read would).
+                if let Some(v) = cart.peek(addr, &bi) {
                     return v;
                 }
             }

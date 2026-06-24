@@ -61,6 +61,7 @@ fn bi() -> BankInfo {
         cartridge_attached: true,
         cartridge_exrom: None,
         cartridge_game: None,
+        phi1: 0xff,
     }
 }
 
@@ -151,27 +152,27 @@ fn magicdesk_banking_and_lines() {
     // Boot: bank 0, enabled → exrom=0, game=1 (8K), ROML[0]==0.
     assert_eq!(m.get_lines().exrom, 0);
     assert_eq!(m.get_lines().game, 1);
-    assert_eq!(m.read(0x8000, &bi()), Some(0));
+    assert_eq!(m.read(0x8000, &bi(), 0), Some(0));
     // ROMH@A000 not visible for MagicDesk.
-    assert_eq!(m.read(0xa000, &bi()), None);
+    assert_eq!(m.read(0xa000, &bi(), 0), None);
 
     // Write bank 2 via $DE00 (bit7 clear → enabled). bankmask for 4 banks = 0x03.
-    assert!(m.write(0xde00, 2, &bi()));
-    assert_eq!(m.read(0x8000, &bi()), Some(2));
+    assert!(m.write(0xde00, 2, &bi(), 0));
+    assert_eq!(m.read(0x8000, &bi(), 0), Some(2));
     assert_eq!(m.get_lines().exrom, 0);
 
     // bit7 set → cart disabled → exrom=1, game=1 (lines released).
-    assert!(m.write(0xde00, 0x80, &bi()));
+    assert!(m.write(0xde00, 0x80, &bi(), 0));
     assert_eq!(m.get_lines().exrom, 1);
     assert_eq!(m.get_lines().game, 1);
 
     // reset → bank 0, regval 0, enabled.
     m.reset();
     assert_eq!(m.get_lines().exrom, 0);
-    assert_eq!(m.read(0x8000, &bi()), Some(0));
+    assert_eq!(m.read(0x8000, &bi(), 0), Some(0));
 
     // A write outside $DE00-$DEFF is not consumed.
-    assert!(!m.write(0x8000, 0xff, &bi()));
+    assert!(!m.write(0x8000, 0xff, &bi(), 0));
 }
 
 #[test]
@@ -186,10 +187,10 @@ fn magicdesk16_maps_roml_and_romh() {
     // enabled → 16K game (exrom=0, game=0).
     assert_eq!(m.get_lines().exrom, 0);
     assert_eq!(m.get_lines().game, 0);
-    assert_eq!(m.read(0x8000, &bi()), Some(0x10));
-    assert_eq!(m.read(0xa000, &bi()), Some(0x20));
+    assert_eq!(m.read(0x8000, &bi(), 0), Some(0x10));
+    assert_eq!(m.read(0xa000, &bi(), 0), Some(0x20));
     // disable → exrom=1, game=1.
-    assert!(m.write(0xde00, 0x80, &bi()));
+    assert!(m.write(0xde00, 0x80, &bi(), 0));
     assert_eq!(m.get_lines().game, 1);
 }
 
@@ -208,12 +209,12 @@ fn ocean_8k_vs_16k_mirror() {
     assert_eq!(m.mapper_type(), MapperType::Ocean);
     // not 512KB → 16K game (exrom=0, game=0), and $A000 mirrors $8000's ROML bank.
     assert_eq!(m.get_lines().game, 0);
-    assert_eq!(m.read(0x8000, &bi()), Some(0x40)); // bank 0 ROML
-    assert_eq!(m.read(0xa000, &bi()), Some(0x40)); // 16K mirror of the SAME bank
+    assert_eq!(m.read(0x8000, &bi(), 0), Some(0x40)); // bank 0 ROML
+    assert_eq!(m.read(0xa000, &bi(), 0), Some(0x40)); // 16K mirror of the SAME bank
     // bank-select bank 1 via $DE00.
-    assert!(m.write(0xde00, 1, &bi()));
-    assert_eq!(m.read(0x8000, &bi()), Some(0x41));
-    assert_eq!(m.read(0xa000, &bi()), Some(0x41));
+    assert!(m.write(0xde00, 1, &bi(), 0));
+    assert_eq!(m.read(0x8000, &bi(), 0), Some(0x41));
+    assert_eq!(m.read(0xa000, &bi(), 0), Some(0x41));
 }
 
 #[test]
@@ -223,9 +224,9 @@ fn normal_8k_static_lines() {
     assert_eq!(m.mapper_type(), MapperType::Normal8k);
     assert_eq!(m.get_lines().exrom, 0);
     assert_eq!(m.get_lines().game, 1);
-    assert_eq!(m.read(0x8000, &bi()), Some(0x99));
+    assert_eq!(m.read(0x8000, &bi(), 0), Some(0x99));
     // A $DE00 write is never consumed by a normal cart.
-    assert!(!m.write(0xde00, 5, &bi()));
+    assert!(!m.write(0xde00, 5, &bi(), 0));
 }
 
 #[test]
@@ -237,18 +238,35 @@ fn ultimax_maps_romh_e000_not_a000() {
     let (_img, mut m) = load_cartridge_from_bytes(&crt, "U", None).unwrap();
     assert_eq!(m.mapper_type(), MapperType::Ultimax);
     // ROMH at $E000-$FFFF, NOT $A000.
-    assert_eq!(m.read(0xa000, &bi()), None);
-    assert_eq!(m.read(0xfffc, &bi()), Some(0x00));
-    assert_eq!(m.read(0xfffd, &bi()), Some(0xf0));
+    assert_eq!(m.read(0xa000, &bi(), 0), None);
+    assert_eq!(m.read(0xfffc, &bi(), 0), Some(0x00));
+    assert_eq!(m.read(0xfffd, &bi(), 0), Some(0xf0));
 }
 
 #[test]
-fn unsupported_flash_families_error() {
-    // hw=32 (EasyFlash) parses but yields no read-only mapper.
-    let crt = build_crt(32, 1, 0, "EF", &[(0, 0x8000, vec![0u8; 0x2000])]);
+fn unsupported_serial_families_error() {
+    // hw=62 (GMOD3, SPI flash) still yields no mapper in this tier.
+    let crt = build_crt(62, 1, 0, "G3", &[(0, 0x8000, vec![0u8; 0x2000])]);
     let img = parse_crt(&crt, "x", None).unwrap();
     assert_eq!(img.mapper_type, MapperType::Unsupported);
-    assert!(load_cartridge_from_bytes(&crt, "EF", None).is_err());
+    assert!(load_cartridge_from_bytes(&crt, "G3", None).is_err());
+}
+
+#[test]
+fn easyflash_gmod2_megabyter_build_writable_mappers() {
+    // hw=32 (EasyFlash), 60 (GMOD2), 86 (MegaByter) now build the WRITABLE tier.
+    let ef = build_crt(32, 1, 0, "EF", &[(0, 0x8000, vec![0u8; 0x2000])]);
+    let (img, m) = load_cartridge_from_bytes(&ef, "EF", None).expect("EasyFlash builds");
+    assert_eq!(img.mapper_type, MapperType::EasyFlash);
+    assert_eq!(m.mapper_type(), MapperType::EasyFlash);
+
+    let g2 = build_crt(60, 0, 1, "G2", &[(0, 0x8000, vec![0u8; 0x2000])]);
+    let (_i, m2) = load_cartridge_from_bytes(&g2, "G2", None).expect("GMOD2 builds");
+    assert_eq!(m2.mapper_type(), MapperType::Gmod2);
+
+    let mb = build_crt(86, 0, 1, "MB", &[(0, 0x8000, vec![0u8; 0x2000])]);
+    let (_i, m3) = load_cartridge_from_bytes(&mb, "MB", None).expect("MegaByter builds");
+    assert_eq!(m3.mapper_type(), MapperType::MegaByter);
 }
 
 #[test]
@@ -257,14 +275,14 @@ fn state_roundtrip() {
         (0..4u16).map(|n| (n, 0x8000, vec![n as u8; 0x2000])).collect();
     let crt = build_crt(19, 0, 1, "MD", &chips);
     let (_img, mut m) = load_cartridge_from_bytes(&crt, "MD", None).unwrap();
-    m.write(0xde00, 3, &bi());
+    m.write(0xde00, 3, &bi(), 0);
     let st: CartState = m.get_state();
     assert_eq!(st.current_bank, 3);
     assert_eq!(st.control_register, Some(3));
     // Fresh mapper, restore state → same live bank.
     let (_i2, mut m2) = load_cartridge_from_bytes(&crt, "MD", None).unwrap();
     m2.set_state(st);
-    assert_eq!(m2.read(0x8000, &bi()), Some(3));
+    assert_eq!(m2.read(0x8000, &bi(), 0), Some(3));
 }
 
 // ── Machine-level: memconfig / PLA lines with a cart attached ──────────────────

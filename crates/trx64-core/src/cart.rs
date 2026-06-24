@@ -11,14 +11,25 @@
 //!     readU16Be/readU32Be (ts:265-271), mapperFromImage (ts:120-154).
 //!   types.ts: HeadlessBankInfo (ts:11-22), HeadlessCartridgeMapperType (ts:40-52).
 //!
-//! Scope: READ-ONLY mappers only (Normal 8K/16K/Ultimax, Magic Desk, Magic
-//! Desk 16, Ocean). The flash/EEPROM/serial tier (EasyFlash, MegaByter, GMOD2/3,
-//! C64MegaCart) is OUT OF SCOPE (ADR-066) — those CRT hardware types parse but
-//! produce no mapper.
+//! Scope: the READ-ONLY mappers (Normal 8K/16K/Ultimax, Magic Desk, Magic
+//! Desk 16, Ocean) PLUS the WRITABLE flash/EEPROM tier (EasyFlash, GMOD2,
+//! MegaByter) — flash carts that write back. The writable mappers (ts:829-1137)
+//! own a `Flash040` (flash040.rs) and, for GMOD2, an `M93c86` EEPROM (m93c86.rs);
+//! a flash command sequence (AA/55/A0/...) programs/erases the flash array, and
+//! the written image persists in the mapper (exposed via `writable_image`).
 //!
 //! In BOTH the TS oracle and VICE the cartridge is a PER-MEMORY-ACCESS bus hook,
 //! NOT a clocked device (no `cartridge.tick()`): the mapper is consulted
-//! synchronously from the FullBus `read()`/`write()` (full.rs). So no tick.
+//! synchronously from the FullBus `read()`/`write()` (full.rs). The flash erase
+//! busy-window / DQ6 toggle need a clock, modelled LAZILY: the live maincpu_clk
+//! is THREADED INTO `read`/`write`/`peek` (the bus passes `self.clk`), and the
+//! flash catches its erase alarm up on the next access at-or-after the due clk.
+//! (c64re's TS wired a `()->clk` closure; the Rust port passes the value through
+//! the call, which fits the FullBus where `self.clk` is live at every access.)
+//!
+//! NOTE: `read`/`peek` take `&mut self` (flash reads advance the command FSM,
+//! latch last_read, toggle DQ status, and catch the erase alarm up). The
+//! read-only mappers ignore the new `clk` arg and stay byte-identical.
 
 use std::collections::BTreeMap;
 
@@ -32,9 +43,12 @@ pub enum MapperType {
     MagicDesk,
     MagicDesk16,
     Ocean,
-    /// A CRT hardware-type that maps to a flash/serial family (EasyFlash,
-    /// MegaByter, GMOD2/3, C64MegaCart). Parsed but NOT built into a mapper in
-    /// this read-only tier.
+    /// Writable flash mappers (the WRITABLE tier).
+    EasyFlash, // CARTRIDGE_EASYFLASH (hw 0x20)
+    Gmod2,     // CARTRIDGE_GMOD2 (hw 0x3c) — flash + M93C86 EEPROM
+    MegaByter, // CARTRIDGE_MEGABYTER (hw 0x56) — MX29F800CB flash, ROML only
+    /// A CRT hardware-type that maps to a serial/SPI family not yet built
+    /// (GMOD3 SPI-flash, C64MegaCart). Parsed but produces no mapper.
     Unsupported,
 }
 
@@ -87,6 +101,10 @@ pub struct BankInfo {
     pub cartridge_attached: bool,
     pub cartridge_exrom: Option<u8>,
     pub cartridge_game: Option<u8>,
+    /// The live phi1 float-bus byte (= memory-bus.ts openBusProvider / VICE
+    /// vicii_read_phi1()). GMOD2's IO1 read mixes the EEPROM DO bit (bit 7) with
+    /// open-bus low bits; the read-only mappers ignore this. No-cart bus → 0xFF.
+    pub phi1: u8,
 }
 
 /// ts:34-37 — HeadlessCartridgeLines: the EXROM/GAME expansion-port lines (each a
@@ -100,10 +118,26 @@ pub struct CartLines {
 /// Persistable mapper continuation state (ts:54+ HeadlessCartridgeState subset
 /// the read-only tier round-trips: currentBank + controlRegister). Used by
 /// get_state/set_state for VSF/checkpoint parity.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct CartState {
     pub current_bank: u16,
     pub control_register: Option<u8>,
+    /// Writable-tier continuation (= HeadlessCartridgeState flash fields). Present
+    /// only for the flash mappers; None for the read-only tier. The flash DATA is
+    /// NOT here (it rides in the separate writable image) — only the command-FSM
+    /// continuation + EEPROM serial state + the EasyFlash jumper/IO2-RAM.
+    pub flash: Option<FlashCartState>,
+}
+
+/// The writable mapper continuation (small; the flash array itself is the
+/// separate writable image). Captured for VSF/checkpoint parity.
+#[derive(Clone, Default)]
+pub struct FlashCartState {
+    pub flash_lo: Option<crate::flash040::Flash040SnapState>,
+    pub flash_hi: Option<crate::flash040::Flash040SnapState>,
+    pub eeprom: Option<crate::m93c86::M93c86SnapState>,
+    pub easyflash_jumper: u8,
+    pub easyflash_ram: Vec<u8>, // 256 bytes IO2 RAM
 }
 
 /// ts:39-107 — HeadlessCartridgeMapper. The bus depends on read/write/peek,
@@ -117,17 +151,18 @@ pub trait CartMapper: Send {
     fn mapper_type(&self) -> MapperType;
     /// ts:45 getLines(): the EXROM/GAME lines for the live bank/mode.
     fn get_lines(&self) -> CartLines;
-    /// ts:46 read(address, bankInfo): the ROM-window byte, or None ⇒ not handled
-    /// (the bus falls back to RAM / open-bus).
-    fn read(&self, address: u16, bank_info: &BankInfo) -> Option<u8>;
-    /// ts:55 peek(address, bankInfo): side-effect-free read (== read for the
-    /// read-only tier — pure array index, no command/latch mutation).
-    fn peek(&self, address: u16, bank_info: &BankInfo) -> Option<u8> {
-        self.read(address, bank_info)
-    }
-    /// ts:59 write(address, value, bankInfo) → consumed? true = the cart handled
-    /// the write (does NOT fall through to RAM); false = pass to RAM underneath.
-    fn write(&mut self, address: u16, value: u8, bank_info: &BankInfo) -> bool;
+    /// ts:46 read(address, bankInfo, clk): the ROM-window byte, or None ⇒ not
+    /// handled (the bus falls back to RAM / open-bus). `&mut self` + `clk` because
+    /// the flash read advances the command FSM / latches DQ status / catches the
+    /// erase alarm up; the read-only mappers ignore `clk` and do a pure index.
+    fn read(&mut self, address: u16, bank_info: &BankInfo, clk: u64) -> Option<u8>;
+    /// ts:55 peek(address, bankInfo): side-effect-free read. For flash this is the
+    /// raw array byte (no command/DQ mutation); for the read-only tier == read.
+    fn peek(&self, address: u16, bank_info: &BankInfo) -> Option<u8>;
+    /// ts:59 write(address, value, bankInfo, clk) → consumed? true = the cart
+    /// handled the write (does NOT fall through to RAM); false = pass to RAM
+    /// underneath. `clk` drives the flash erase-alarm schedule.
+    fn write(&mut self, address: u16, value: u8, bank_info: &BankInfo, clk: u64) -> bool;
     /// ts:106/420 reset(): the expansion-port RESET line — bank + mode/control
     /// return to the boot config so GAME/EXROM re-vector $FFFC from the cart.
     fn reset(&mut self);
@@ -137,6 +172,34 @@ pub trait CartMapper: Send {
     /// `dyn` trait object is not `Clone` directly). Each read-only mapper's state
     /// is small (bank + register + the cloned bank ROM map), so this is cheap.
     fn clone_box(&self) -> Box<dyn CartMapper>;
+
+    // ── Writable tier (flash/EEPROM) — default no-op for the read-only mappers ──
+
+    /// Whether this mapper's flash/EEPROM has been mutated since attach (= the TS
+    /// isWritableDirty). Read-only mappers are never dirty.
+    fn is_writable_dirty(&self) -> bool {
+        false
+    }
+    /// A monotonic mutation counter (flash + EEPROM generations) for an
+    /// auto-persist debounce (= the TS writableGeneration).
+    fn writable_generation(&self) -> u64 {
+        0
+    }
+    /// The live writable image (flash array + any EEPROM), for snapshot /
+    /// write-back. None ⇒ this mapper has no writable backing (read-only tier).
+    /// `clk` so the flash catches its erase alarm up before serializing.
+    fn writable_image(&mut self, _clk: u64) -> Option<Vec<u8>> {
+        None
+    }
+    /// Load a previously-saved writable image (flash + EEPROM) back into the
+    /// mapper. No-op for the read-only tier.
+    fn set_writable_image(&mut self, _bytes: &[u8]) {}
+    /// Re-pack the live flash back into the original `.crt` structure (preserving
+    /// header / CHIP packets / load addresses; only data changes) for write-back
+    /// to a `.crt` file. None ⇒ unsupported. `clk` to catch the erase alarm up.
+    fn crt_image(&mut self, _clk: u64) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 impl Clone for Box<dyn CartMapper> {
@@ -203,12 +266,13 @@ fn infer_mapper_type(
         5 => Some(MapperType::Ocean),       // ts:244-245
         19 => Some(MapperType::MagicDesk),  // ts:246-247 CARTRIDGE_MAGIC_DESK
         85 => Some(MapperType::MagicDesk16), // ts:248-249 CARTRIDGE_MAGIC_DESK_16
-        // ts:250-259 — flash/serial families: parse but unsupported in this tier.
-        86 => Some(MapperType::Unsupported), // megabyter
-        60 => Some(MapperType::Unsupported), // gmod2
+        // ts:250-259 — flash/serial families. The WRITABLE tier now builds these:
+        32 => Some(MapperType::EasyFlash),  // CARTRIDGE_EASYFLASH
+        60 => Some(MapperType::Gmod2),      // CARTRIDGE_GMOD2 (flash + M93C86)
+        86 => Some(MapperType::MegaByter),  // CARTRIDGE_MEGABYTER (MX29F800CB)
+        // serial/SPI families not yet built (GMOD3 SPI-flash, C64MegaCart).
         61 => Some(MapperType::Unsupported), // c64megacart
         62 => Some(MapperType::Unsupported), // gmod3
-        32 => Some(MapperType::Unsupported), // easyflash
         _ => None,                           // ts:260-261
     }
 }
@@ -343,6 +407,29 @@ fn total_image_bytes(image: &ParsedCartridgeImage) -> u32 {
     (highest + 1) * 0x2000
 }
 
+/// ts:285-302 — buildLinearChipData: lay the per-bank ROM windows out into one
+/// linear flash array (bank b at `b * 0x2000`), 0xFF-padding absent banks. The
+/// `selector` picks ROML (lo flash) or ROMH (hi flash) from each bank; `bank_count`
+/// is the device's bank capacity (so a partially-populated flash is full size).
+fn build_linear_chip_data(
+    image: &ParsedCartridgeImage,
+    selector: impl Fn(&CrtBank) -> Option<&[u8; 0x2000]>,
+    bank_count: usize,
+) -> Vec<u8> {
+    let highest = image.banks.keys().copied().fold(0u16, u16::max) as usize;
+    let total_banks = bank_count.max(highest + 1);
+    let mut result = vec![0xffu8; total_banks * 0x2000];
+    for (&bank_number, bank) in image.banks.iter() {
+        if let Some(segment) = selector(bank) {
+            let off = (bank_number as usize) * 0x2000;
+            if off + 0x2000 <= result.len() {
+                result[off..off + 0x2000].copy_from_slice(segment);
+            }
+        }
+    }
+    result
+}
+
 // ── BaseMapper + the read-only mapper families ──────────────────────────────
 
 /// ts:320-421 — BaseMapper. The shared bank store + the pure-array-index read.
@@ -429,11 +516,14 @@ impl CartMapper for NormalMapper {
     fn get_lines(&self) -> CartLines {
         CartLines { exrom: self.base.exrom, game: self.base.game }
     }
-    fn read(&self, address: u16, _bank_info: &BankInfo) -> Option<u8> {
+    fn read(&mut self, address: u16, _bank_info: &BankInfo, _clk: u64) -> Option<u8> {
+        self.base.read(address)
+    }
+    fn peek(&self, address: u16, _bank_info: &BankInfo) -> Option<u8> {
         self.base.read(address)
     }
     /// ts:383-388 — BaseMapper.write: never consumes.
-    fn write(&mut self, _address: u16, _value: u8, _bank_info: &BankInfo) -> bool {
+    fn write(&mut self, _address: u16, _value: u8, _bank_info: &BankInfo, _clk: u64) -> bool {
         false
     }
     /// ts:420 — reset to bank 0 (static lines).
@@ -441,7 +531,7 @@ impl CartMapper for NormalMapper {
         self.base.current_bank = 0;
     }
     fn get_state(&self) -> CartState {
-        CartState { current_bank: self.base.current_bank, control_register: None }
+        CartState { current_bank: self.base.current_bank, control_register: None, flash: None }
     }
     fn set_state(&mut self, state: CartState) {
         self.base.current_bank = state.current_bank & 0xff;
@@ -487,11 +577,14 @@ impl CartMapper for MagicDeskMapper {
             CartLines { exrom: 0, game: 1 }
         }
     }
-    fn read(&self, address: u16, _bank_info: &BankInfo) -> Option<u8> {
+    fn read(&mut self, address: u16, _bank_info: &BankInfo, _clk: u64) -> Option<u8> {
+        self.base.read(address)
+    }
+    fn peek(&self, address: u16, _bank_info: &BankInfo) -> Option<u8> {
         self.base.read(address)
     }
     /// ts:443-450 — IO1 store sets regval + currentBank, consumes.
-    fn write(&mut self, address: u16, value: u8, _bank_info: &BankInfo) -> bool {
+    fn write(&mut self, address: u16, value: u8, _bank_info: &BankInfo, _clk: u64) -> bool {
         if (0xde00..=0xdeff).contains(&address) {
             self.regval = value & (0x80 | self.bankmask as u8);
             self.base.current_bank = (value & self.bankmask as u8) as u16;
@@ -505,7 +598,7 @@ impl CartMapper for MagicDeskMapper {
         self.regval = 0;
     }
     fn get_state(&self) -> CartState {
-        CartState { current_bank: self.base.current_bank, control_register: Some(self.regval) }
+        CartState { current_bank: self.base.current_bank, control_register: Some(self.regval), flash: None }
     }
     fn set_state(&mut self, state: CartState) {
         self.base.current_bank = state.current_bank & 0xff;
@@ -550,11 +643,14 @@ impl CartMapper for MagicDesk16Mapper {
             CartLines { exrom: 0, game: 0 }
         }
     }
-    fn read(&self, address: u16, _bank_info: &BankInfo) -> Option<u8> {
+    fn read(&mut self, address: u16, _bank_info: &BankInfo, _clk: u64) -> Option<u8> {
+        self.base.read(address)
+    }
+    fn peek(&self, address: u16, _bank_info: &BankInfo) -> Option<u8> {
         self.base.read(address)
     }
     /// ts:466-473.
-    fn write(&mut self, address: u16, value: u8, _bank_info: &BankInfo) -> bool {
+    fn write(&mut self, address: u16, value: u8, _bank_info: &BankInfo, _clk: u64) -> bool {
         if (0xde00..=0xdeff).contains(&address) {
             self.regval = value & (0x80 | self.bankmask as u8);
             self.base.current_bank = (value & self.bankmask as u8) as u16;
@@ -568,7 +664,7 @@ impl CartMapper for MagicDesk16Mapper {
         self.regval = 0;
     }
     fn get_state(&self) -> CartState {
-        CartState { current_bank: self.base.current_bank, control_register: Some(self.regval) }
+        CartState { current_bank: self.base.current_bank, control_register: Some(self.regval), flash: None }
     }
     fn set_state(&mut self, state: CartState) {
         self.base.current_bank = state.current_bank & 0xff;
@@ -601,6 +697,21 @@ impl OceanMapper {
             base: Base::new(image),
         }
     }
+
+    /// ts:502-509 — own read: ROML at $8000-$9FFF; the 16K mirror reads the SAME
+    /// 8K ROML bank at $A000-$BFFF (ocean.c romh_read). Ignores the Base
+    /// visibility predicates (verbatim — the TS OceanMapper overrides read()).
+    fn ocean_read(&self, address: u16) -> Option<u8> {
+        let bank = self.base.banks.get(&self.base.current_bank)?;
+        let roml = bank.roml.as_ref()?;
+        if (0x8000..=0x9fff).contains(&address) {
+            return Some(roml[(address - 0x8000) as usize]);
+        }
+        if !self.is_8k && (0xa000..=0xbfff).contains(&address) {
+            return Some(roml[(address - 0xa000) as usize]);
+        }
+        None
+    }
 }
 
 impl CartMapper for OceanMapper {
@@ -618,19 +729,14 @@ impl CartMapper for OceanMapper {
     /// ts:502-509 — own read: ROML at $8000-$9FFF; the 16K mirror reads the SAME
     /// 8K ROML bank at $A000-$BFFF (ocean.c romh_read). Note: ignores the Base
     /// visibility predicates (verbatim — the TS OceanMapper overrides read()).
-    fn read(&self, address: u16, _bank_info: &BankInfo) -> Option<u8> {
-        let bank = self.base.banks.get(&self.base.current_bank)?;
-        let roml = bank.roml.as_ref()?;
-        if (0x8000..=0x9fff).contains(&address) {
-            return Some(roml[(address - 0x8000) as usize]);
-        }
-        if !self.is_8k && (0xa000..=0xbfff).contains(&address) {
-            return Some(roml[(address - 0xa000) as usize]);
-        }
-        None
+    fn read(&mut self, address: u16, _bank_info: &BankInfo, _clk: u64) -> Option<u8> {
+        self.ocean_read(address)
+    }
+    fn peek(&self, address: u16, _bank_info: &BankInfo) -> Option<u8> {
+        self.ocean_read(address)
     }
     /// ts:491-498.
-    fn write(&mut self, address: u16, value: u8, _bank_info: &BankInfo) -> bool {
+    fn write(&mut self, address: u16, value: u8, _bank_info: &BankInfo, _clk: u64) -> bool {
         if (0xde00..=0xdeff).contains(&address) {
             self.regval = value;
             self.base.current_bank = (value as u16) & self.io1_mask & 0x3f;
@@ -644,7 +750,7 @@ impl CartMapper for OceanMapper {
         self.regval = 0;
     }
     fn get_state(&self) -> CartState {
-        CartState { current_bank: self.base.current_bank, control_register: Some(self.regval) }
+        CartState { current_bank: self.base.current_bank, control_register: Some(self.regval), flash: None }
     }
     fn set_state(&mut self, state: CartState) {
         self.base.current_bank = state.current_bank & 0xff;
@@ -655,9 +761,609 @@ impl CartMapper for OceanMapper {
     }
 }
 
-/// ts:120-154 — mapperFromImage: build the concrete read-only mapper for a parsed
-/// image. The flash/serial families (Unsupported) yield `Err` — this tier does
-/// not implement them.
+// ── WRITABLE flash tier ──────────────────────────────────────────────────────
+
+use crate::flash040::{Flash040, FLASH040B, FLASH040_NORMAL, FLASH800_CB};
+use crate::m93c86::M93c86;
+
+/// resolveRelativeOffset (ts:281-283): the $2000-window offset of `address`.
+#[inline]
+fn resolve_relative_offset(base: u16, address: u16) -> u32 {
+    ((address.wrapping_sub(base)) & 0x1fff) as u32
+}
+
+/// ts:822-825 / easyflash.c — easyflash_memconfig[(jumper<<3)|(register_02 & 7)]
+/// → CMODE (0=8k, 1=16k, 2=RAM/off, 3=ultimax).
+const EASYFLASH_MEMCONFIG: [u8; 16] = [
+    3, 3, 1, 1, 2, 3, 0, 1, // jumper off
+    2, 3, 0, 1, 2, 3, 0, 1, // jumper on
+];
+
+/// ts:826-827 — the 4 EasyFlash modes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EasyFlashMode {
+    M8k,
+    M16k,
+    Off,
+    Ultimax,
+}
+
+/// VICE eapiam29f040[768] — the EAPI replacement block. On attach, if the cart's
+/// romh bank-0 $1800 (= $B800) holds the "eapi" signature, VICE replaces the
+/// cart's EAPI with this known-good implementation (cart EAPIs vary / assume
+/// real-HW timing; the replacement drives this flash040 port correctly).
+/// Verbatim from c64re eapi-am29f040.ts (= VICE src/c64/cart/easyflash.c).
+#[rustfmt::skip]
+const EAPI_AM29F040: [u8; 768] = [
+    0x65,0x61,0x70,0x69,0xc1,0x4d,0x2f,0xcd,0x32,0x39,0xc6,0x30,0x34,0x30,0x20,0xd6,0x31,0x2e,0x34,0x00,0x08,0x78,0xa5,0x4b,0x48,0xa5,0x4c,0x48,0xa9,0x60,0x85,0x4b,0x20,0x4b,0x00,0xba,0xbd,0x00,0x01,0x85,0x4c,0xca,0xbd,0x00,0x01,0x85,0x4b,0x18,0x90,0x70,0x4c,0x67,0x01,0x4c,0xa4,0x01,0x4c,0x39,0x02,0x4c,0x40,0x02,0x4c,0x44,0x02,0x4c,0x4e,0x02,0x4c,0x58,0x02,0x4c,0x8e,0x02,0x4c,0xd9,0x02,0x4c,0xd9,0x02,0x8d,0x02,0xde,0xa9,0xaa,0x8d,0x55,0x85,0xa9,0x55,0x8d,0xaa,0x82,0xa9,0xa0,0x8d,0x55,0x85,0xad,0xf2,0xdf,0x8d,0x00,0xde,0xa9,0x00,0x8d,0xff,0xff,0xa2,0x07,0x8e,0x02,0xde,0x60,0x8d,0x02,0xde,0xa9,0xaa,0x8d,0x55,0xe5,0xa9,0x55,0x8d,0xaa,0xe2,0xa9,0xa0,0x8d,0x55,0xe5,0xd0,0xdb,0xa2,0x55,0x8e,0xe3,0xdf,0x8c,0xe4,0xdf,0xa2,0x85,0x8e,0x02,0xde,0x8d,0xff,0xff,0x4c,0xbb,0xdf,0xad,0xff,0xff,0x60,0xcd,0xff,0xff,0x60,0xa2,0x6f,0xa0,0x7f,0xb1,0x4b,0x9d,0x80,0xdf,0xdd,0x80,0xdf,0xd0,0x21,0x88,0xca,0x10,0xf2,0xa2,0x00,0xe8,0x18,0xbd,0x80,0xdf,0x65,0x4b,0x9d,0x80,0xdf,0xe8,0xbd,0x80,0xdf,0x65,0x4c,0x9d,0x80,0xdf,0xe8,0xe0,0x1e,0xd0,0xe8,0x18,0x90,0x06,0xa9,0x01,0x8d,0xb9,0xdf,0x38,0x68,0x85,0x4c,0x68,0x85,0x4b,0xb0,0x48,0xa9,0xaa,0xa0,0xe5,0x20,0xd5,0xdf,0xa0,0x85,0x20,0xd5,0xdf,0xa9,0x55,0xa2,0xaa,0xa0,0xe2,0x20,0xd7,0xdf,0xa2,0xaa,0xa0,0x82,0x20,0xd7,0xdf,0xa9,0x90,0xa0,0xe5,0x20,0xd5,0xdf,0xa0,0x85,0x20,0xd5,0xdf,0xad,0x00,0xa0,0x8d,0xf1,0xdf,0xae,0x01,0xa0,0x8e,0xb9,0xdf,0xc9,0x01,0xd0,0x06,0xe0,0xa4,0xd0,0x02,0xf0,0x0c,0xc9,0x20,0xd0,0x39,0xe0,0xe2,0xd0,0x35,0xf0,0x02,0xb0,0x50,0xad,0x00,0x80,0xae,0x01,0x80,0xc9,0x01,0xd0,0x06,0xe0,0xa4,0xd0,0x02,0xf0,0x08,0xc9,0x20,0xd0,0x19,0xe0,0xe2,0xd0,0x15,0xa0,0x3f,0x8c,0x00,0xde,0xae,0x02,0x80,0xd0,0x13,0xae,0x02,0xa0,0xd0,0x12,0x88,0x10,0xf0,0x18,0x90,0x12,0xa9,0x02,0xd0,0x0a,0xa9,0x03,0xd0,0x06,0xa9,0x04,0xd0,0x02,0xa9,0x05,0x8d,0xb9,0xdf,0x38,0xa9,0x00,0x8d,0x00,0xde,0xa0,0xe0,0xa9,0xf0,0x20,0xd7,0xdf,0xa0,0x80,0x20,0xd7,0xdf,0xad,0xb9,0xdf,0xb0,0x08,0xae,0xf1,0xdf,0xa0,0x40,0x28,0x18,0x60,0x28,0x38,0x60,0x8d,0xb7,0xdf,0x8e,0xb9,0xdf,0x8e,0xed,0xdf,0x8c,0xba,0xdf,0x08,0x78,0x98,0x29,0xbf,0x8d,0xee,0xdf,0xa9,0x00,0x8d,0x00,0xde,0xa9,0x85,0xc0,0xe0,0x90,0x05,0x20,0xc1,0xdf,0xb0,0x03,0x20,0x9e,0xdf,0xa2,0x14,0x20,0xec,0xdf,0xf0,0x06,0xca,0xd0,0xf8,0x18,0x90,0x63,0xad,0xf2,0xdf,0x8d,0x00,0xde,0x18,0x90,0x72,0x8d,0xb7,0xdf,0x8e,0xb9,0xdf,0x8c,0xba,0xdf,0x08,0x78,0x98,0xc0,0x80,0xf0,0x04,0xa0,0xe0,0xa9,0xa0,0x8d,0xee,0xdf,0xc8,0xc8,0xc8,0xc8,0xc8,0xa9,0xaa,0x20,0xd5,0xdf,0xa9,0x55,0xa2,0xaa,0x88,0x88,0x88,0x20,0xd7,0xdf,0xa9,0x80,0xc8,0xc8,0xc8,0x20,0xd5,0xdf,0xa9,0xaa,0x20,0xd5,0xdf,0xa9,0x55,0xa2,0xaa,0x88,0x88,0x88,0x20,0xd7,0xdf,0xad,0xb7,0xdf,0x8d,0x00,0xde,0xa2,0x00,0x8e,0xed,0xdf,0x88,0x88,0xa9,0x30,0x20,0xd7,0xdf,0xa9,0xff,0xaa,0xa8,0xd0,0x24,0xad,0xf2,0xdf,0x8d,0x00,0xde,0xa0,0x80,0xa9,0xf0,0x20,0xd7,0xdf,0xa0,0xe0,0xa9,0xf0,0x20,0xd7,0xdf,0x28,0x38,0xb0,0x02,0x28,0x18,0xac,0xba,0xdf,0xae,0xb9,0xdf,0xad,0xb7,0xdf,0x60,0x20,0xec,0xdf,0xf0,0x09,0xca,0xd0,0xf8,0x88,0xd0,0xf5,0x18,0x90,0xce,0xad,0xf2,0xdf,0x8d,0x00,0xde,0x18,0x90,0xdd,0x8d,0xf2,0xdf,0x8d,0x00,0xde,0x60,0xad,0xf2,0xdf,0x60,0x8d,0xf3,0xdf,0x8e,0xe9,0xdf,0x8c,0xea,0xdf,0x60,0x8e,0xf4,0xdf,0x8c,0xf5,0xdf,0x8d,0xf6,0xdf,0x60,0xad,0xf2,0xdf,0x8d,0x00,0xde,0x20,0xe8,0xdf,0x8d,0xb7,0xdf,0x8e,0xf0,0xdf,0x8c,0xf1,0xdf,0xa9,0x00,0x8d,0xba,0xdf,0xf0,0x3b,0xad,0xf4,0xdf,0xd0,0x10,0xad,0xf5,0xdf,0xd0,0x08,0xad,0xf6,0xdf,0xf0,0x0b,0xce,0xf6,0xdf,0xce,0xf5,0xdf,0xce,0xf4,0xdf,0x90,0x45,0x38,0xb0,0x42,0x8d,0xb7,0xdf,0x8e,0xf0,0xdf,0x8c,0xf1,0xdf,0xae,0xe9,0xdf,0xad,0xea,0xdf,0xc9,0xa0,0x90,0x02,0x09,0x40,0xa8,0xad,0xb7,0xdf,0x20,0x80,0xdf,0xb0,0x24,0xee,0xe9,0xdf,0xd0,0x19,0xee,0xea,0xdf,0xad,0xf3,0xdf,0x29,0xe0,0xcd,0xea,0xdf,0xd0,0x0c,0xad,0xf3,0xdf,0x0a,0x0a,0x0a,0x8d,0xea,0xdf,0xee,0xf2,0xdf,0x18,0xad,0xba,0xdf,0xf0,0xa1,0xac,0xf1,0xdf,0xae,0xf0,0xdf,0xad,0xb7,0xdf,0x60,0xff,0xff,0xff,0xff,
+];
+
+/// ts:829-1052 — EasyFlashMapper. 1MB cart = 2 × AM29F040B flash chips (lo = the
+/// 64 ROML banks, hi = the 64 ROMH banks). IO1 ($DE00) decodes `addr & 2`:
+/// even = bank register (& 0x3f), odd = mode register (& 0x87). IO2 ($DF00) is a
+/// 256-byte RAM. The memconfig table selects 8k/16k/off/ultimax from the mode
+/// register + jumper. Flash is PROGRAMMED only in ultimax ($8000→lo, $E000→hi).
+#[derive(Clone)]
+pub struct EasyFlashMapper {
+    image: ParsedCartridgeImage,
+    current_bank: u16,
+    register02: u8, // VICE easyflash_register_02 (& 0x87)
+    jumper: u8,
+    io_ram: [u8; 256], // VICE easyflash_ram ($DF00 IO2)
+    lo_flash: Flash040,
+    hi_flash: Flash040,
+}
+
+impl EasyFlashMapper {
+    pub fn new(image: &ParsedCartridgeImage) -> Self {
+        let lo_data = build_linear_chip_data(image, |b| b.roml.as_ref(), 64);
+        let mut hi_data = build_linear_chip_data(
+            image,
+            |b| b.romh_a000.as_ref().or(b.romh_e000.as_ref()),
+            64,
+        );
+        // ts:840-849 — if the EAPI signature "eapi" is in hi bank-0 $1800, replace
+        // the cart's EAPI with VICE's known-good eapiam29f040 block.
+        if hi_data.len() >= 0x1800 + 768
+            && hi_data[0x1800] == 0x65
+            && hi_data[0x1801] == 0x61
+            && hi_data[0x1802] == 0x70
+            && hi_data[0x1803] == 0x69
+        {
+            hi_data[0x1800..0x1800 + 768].copy_from_slice(&EAPI_AM29F040);
+        }
+        let mut io_ram = [0u8; 256];
+        // ts:852-855 — easyflash_powerup IO2 RAM pattern: FF 00 00 FF FF 00 00 FF...
+        for (i, slot) in io_ram.iter_mut().enumerate() {
+            *slot = if (((i + 1) >> 1) & 1) != 0 { 0x00 } else { 0xff };
+        }
+        EasyFlashMapper {
+            image: image.clone(),
+            current_bank: 0,
+            register02: 0,
+            jumper: 0,
+            io_ram,
+            lo_flash: Flash040::new(lo_data, "easyflash-lo", FLASH040B),
+            hi_flash: Flash040::new(hi_data, "easyflash-hi", FLASH040B),
+        }
+    }
+
+    /// ts:865-870 — the flash offset for a ROM-window address in the current bank.
+    fn chip_offset(&self, address: u16) -> u32 {
+        let relative = if address >= 0xe000 {
+            resolve_relative_offset(0xe000, address)
+        } else if address >= 0xa000 {
+            resolve_relative_offset(0xa000, address)
+        } else {
+            resolve_relative_offset(0x8000, address)
+        };
+        ((self.current_bank as u32) << 13) | relative
+    }
+
+    /// ts:872-875 — the live memconfig mode.
+    fn current_mode(&self) -> EasyFlashMode {
+        let cmode = EASYFLASH_MEMCONFIG
+            [(((self.jumper << 3) | (self.register02 & 0x07)) & 0x0f) as usize];
+        match cmode {
+            0 => EasyFlashMode::M8k,
+            1 => EasyFlashMode::M16k,
+            3 => EasyFlashMode::Ultimax,
+            _ => EasyFlashMode::Off,
+        }
+    }
+}
+
+impl CartMapper for EasyFlashMapper {
+    fn mapper_type(&self) -> MapperType {
+        MapperType::EasyFlash
+    }
+    /// ts:877-884 — lines per the current memconfig mode.
+    fn get_lines(&self) -> CartLines {
+        match self.current_mode() {
+            EasyFlashMode::Off => CartLines { exrom: 1, game: 1 },
+            EasyFlashMode::Ultimax => CartLines { exrom: 1, game: 0 },
+            EasyFlashMode::M8k => CartLines { exrom: 0, game: 1 },
+            EasyFlashMode::M16k => CartLines { exrom: 0, game: 0 },
+        }
+    }
+    /// ts:971-978 — read: IO2 RAM + the flash windows (the bus PLA-gates which
+    /// window it calls; the mapper responds purely by address).
+    fn read(&mut self, address: u16, _bank_info: &BankInfo, clk: u64) -> Option<u8> {
+        if (0xdf00..=0xdfff).contains(&address) {
+            return Some(self.io_ram[(address & 0xff) as usize]); // IO2 RAM
+        }
+        let offset = self.chip_offset(address);
+        if (0x8000..=0x9fff).contains(&address) {
+            return Some(self.lo_flash.read(offset, clk)); // ROML
+        }
+        if (0xa000..=0xbfff).contains(&address) {
+            return Some(self.hi_flash.read(offset, clk)); // ROMH @ $A000 (16k)
+        }
+        if (0xe000..=0xffff).contains(&address) {
+            return Some(self.hi_flash.read(offset, clk)); // ROMH @ $E000 (ultimax)
+        }
+        None
+    }
+    /// ts:983-996 — side-effect-free peek (flash array byte, IO RAM, register
+    /// shadows). IO1 reads the write-only register shadow (monitor lane).
+    fn peek(&self, address: u16, _bank_info: &BankInfo) -> Option<u8> {
+        if (0xde00..=0xdeff).contains(&address) {
+            return Some(if address & 2 != 0 { self.register02 } else { self.current_bank as u8 });
+        }
+        if (0xdf00..=0xdfff).contains(&address) {
+            return Some(self.io_ram[(address & 0xff) as usize]);
+        }
+        let offset = self.chip_offset(address);
+        if (0x8000..=0x9fff).contains(&address) {
+            return Some(self.lo_flash.peek(offset));
+        }
+        if (0xa000..=0xbfff).contains(&address) {
+            return Some(self.hi_flash.peek(offset));
+        }
+        if (0xe000..=0xffff).contains(&address) {
+            return Some(self.hi_flash.peek(offset));
+        }
+        None
+    }
+    /// ts:1008-1033 — write: IO1 bank/mode registers, IO2 RAM, and flash
+    /// programming (ONLY in ultimax: $8000→lo, $E000→hi).
+    fn write(&mut self, address: u16, value: u8, _bank_info: &BankInfo, clk: u64) -> bool {
+        if (0xde00..=0xdeff).contains(&address) {
+            if address & 2 != 0 {
+                self.register02 = value & 0x87;
+            } else {
+                self.current_bank = (value & 0x3f) as u16;
+            }
+            return true;
+        }
+        if (0xdf00..=0xdfff).contains(&address) {
+            self.io_ram[(address & 0xff) as usize] = value;
+            return true;
+        }
+        if self.current_mode() == EasyFlashMode::Ultimax {
+            let offset = self.chip_offset(address);
+            if (0x8000..=0x9fff).contains(&address) {
+                self.lo_flash.store(offset, value, clk);
+                return true;
+            }
+            if (0xe000..=0xffff).contains(&address) {
+                self.hi_flash.store(offset, value, clk);
+                return true;
+            }
+        }
+        false
+    }
+    /// ts:1051 — reset: register_02 = 0 (memconfig[jumper<<3] = ULTIMAX so $FFFC
+    /// re-vectors INTO the cart). Bank + jumper + IO2 RAM + flash DATA preserved.
+    fn reset(&mut self) {
+        self.current_bank = 0;
+        self.register02 = 0x00;
+    }
+    fn get_state(&self) -> CartState {
+        let mut lo = self.lo_flash.clone();
+        let mut hi = self.hi_flash.clone();
+        CartState {
+            current_bank: self.current_bank,
+            control_register: Some(self.register02),
+            flash: Some(FlashCartState {
+                flash_lo: Some(lo.snapshot_state(0)),
+                flash_hi: Some(hi.snapshot_state(0)),
+                eeprom: None,
+                easyflash_jumper: self.jumper,
+                easyflash_ram: self.io_ram.to_vec(),
+            }),
+        }
+    }
+    fn set_state(&mut self, state: CartState) {
+        self.current_bank = state.current_bank & 0x3f;
+        self.register02 = state.control_register.unwrap_or(0) & 0x87;
+        if let Some(f) = &state.flash {
+            self.jumper = f.easyflash_jumper & 1;
+            if f.easyflash_ram.len() >= 256 {
+                self.io_ram.copy_from_slice(&f.easyflash_ram[..256]);
+            }
+            if let Some(s) = &f.flash_lo {
+                self.lo_flash.restore_state(s);
+            }
+            if let Some(s) = &f.flash_hi {
+                self.hi_flash.restore_state(s);
+            }
+        }
+    }
+    fn clone_box(&self) -> Box<dyn CartMapper> {
+        Box::new(self.clone())
+    }
+    fn is_writable_dirty(&self) -> bool {
+        self.lo_flash.is_dirty() || self.hi_flash.is_dirty()
+    }
+    fn writable_generation(&self) -> u64 {
+        self.lo_flash.writable_generation() + self.hi_flash.writable_generation()
+    }
+    /// ts:913-920 — writable image = lo flash array ++ hi flash array.
+    fn writable_image(&mut self, clk: u64) -> Option<Vec<u8>> {
+        let lo = self.lo_flash.get_data(clk).to_vec();
+        let hi = self.hi_flash.get_data(clk).to_vec();
+        let mut out = Vec::with_capacity(lo.len() + hi.len());
+        out.extend_from_slice(&lo);
+        out.extend_from_slice(&hi);
+        Some(out)
+    }
+    fn set_writable_image(&mut self, bytes: &[u8]) {
+        let lo_len = self.lo_flash.data.len();
+        self.lo_flash.load_data(&bytes[..bytes.len().min(lo_len)]);
+        if bytes.len() > lo_len {
+            self.hi_flash.load_data(&bytes[lo_len..]);
+        }
+    }
+    /// ts:933-964 — re-pack the live flash into the original .crt structure
+    /// (header / CHIP packets / load addresses preserved, only data changes).
+    fn crt_image(&mut self, clk: u64) -> Option<Vec<u8>> {
+        let orig = &self.image.raw_bytes;
+        if orig.len() < 0x40 {
+            return None;
+        }
+        let mut out = orig.clone();
+        let lo = self.lo_flash.get_data(clk).to_vec();
+        let hi = self.hi_flash.get_data(clk).to_vec();
+        let header_len = read_u32_be(&out, 0x10) as usize;
+        let mut offset = header_len;
+        while offset + 0x10 <= out.len() {
+            if out.get(offset..offset + 4) != Some(b"CHIP") {
+                break;
+            }
+            let packet_len = read_u32_be(&out, offset + 4) as usize;
+            let bank = read_u16_be(&out, offset + 10) as usize;
+            let load_address = read_u16_be(&out, offset + 12);
+            let size = read_u16_be(&out, offset + 14) as usize;
+            let data_off = offset + 16;
+            let bank_off = bank << 13;
+            let first = size.min(0x2000);
+            let src = if load_address == 0x8000 { &lo } else { &hi };
+            if bank_off + first <= src.len() && data_off + first <= out.len() {
+                out[data_off..data_off + first]
+                    .copy_from_slice(&src[bank_off..bank_off + first]);
+            }
+            // 16K chip ($8000 carrying ROML+ROMH): second 8K from hiFlash.
+            if load_address == 0x8000 && size > 0x2000 {
+                let second = size - 0x2000;
+                if bank_off + second <= hi.len() && data_off + 0x2000 + second <= out.len() {
+                    out[data_off + 0x2000..data_off + 0x2000 + second]
+                        .copy_from_slice(&hi[bank_off..bank_off + second]);
+                }
+            }
+            offset += packet_len;
+        }
+        Some(out)
+    }
+}
+
+/// ts:1148-1291 — Gmod2Mapper. 512KB AM29F040 flash (64×8K banks) + M93C86 serial
+/// EEPROM. IO1 ($DE00) store: bits 0-5 = ROM bank; bits 7-6 select cmode
+/// (0xc0=ULTIMAX, b6=0 → 8K, b6=1(b7=0) → off); bit 6 = EEPROM CS, bit 4 = DI,
+/// bit 5 = CLK. IO1 read: CS ? (eeprom.read_data()<<7)|phi1(0x7f) : phi1. Flash
+/// is READ at $8000 in 8K mode; PROGRAMMED in ULTIMAX ($8000/$E000).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Gmod2Cmode {
+    M8k,
+    Off,
+    Ultimax,
+}
+
+#[derive(Clone)]
+pub struct Gmod2Mapper {
+    current_bank: u16,
+    register: u8,
+    cmode: Gmod2Cmode,
+    eeprom_cs: u8,
+    eeprom_data: u8,
+    eeprom_clock: u8,
+    flash: Flash040,
+    eeprom: M93c86,
+}
+
+impl Gmod2Mapper {
+    pub fn new(image: &ParsedCartridgeImage) -> Self {
+        Gmod2Mapper {
+            current_bank: 0,
+            register: 0,
+            cmode: Gmod2Cmode::M8k,
+            eeprom_cs: 0,
+            eeprom_data: 0,
+            eeprom_clock: 0,
+            flash: Flash040::new(
+                build_linear_chip_data(image, |b| b.roml.as_ref(), 64),
+                "gmod2",
+                FLASH040_NORMAL,
+            ),
+            eeprom: M93c86::new(),
+        }
+    }
+
+    /// ts:1167-1169 — (addr & 0x1fff) + (bank << 13).
+    fn flash_offset(&self, address: u16) -> u32 {
+        ((address & 0x1fff) as u32) + ((self.current_bank as u32) << 13)
+    }
+}
+
+impl CartMapper for Gmod2Mapper {
+    fn mapper_type(&self) -> MapperType {
+        MapperType::Gmod2
+    }
+    /// ts:1171-1177 — lines per cmode.
+    fn get_lines(&self) -> CartLines {
+        match self.cmode {
+            Gmod2Cmode::M8k => CartLines { exrom: 0, game: 1 },
+            Gmod2Cmode::Ultimax => CartLines { exrom: 1, game: 0 },
+            Gmod2Cmode::Off => CartLines { exrom: 1, game: 1 },
+        }
+    }
+    /// ts:1188-1201 — read: IO1 EEPROM (CS ? DO<<7|phi1 : phi1); ROML flash in 8K.
+    fn read(&mut self, address: u16, bank_info: &BankInfo, clk: u64) -> Option<u8> {
+        if (0xde00..=0xdeff).contains(&address) {
+            let phi1 = bank_info.phi1;
+            return Some(if self.eeprom_cs != 0 {
+                ((self.eeprom.read_data() & 1) << 7) | (phi1 & 0x7f)
+            } else {
+                phi1
+            });
+        }
+        if self.cmode == Gmod2Cmode::M8k && (0x8000..=0x9fff).contains(&address) {
+            return Some(self.flash.read(self.flash_offset(address), clk));
+        }
+        None
+    }
+    /// ts:1209-1215 — peek: IO1 → open-bus (don't clock the EEPROM); flash array.
+    fn peek(&self, address: u16, _bank_info: &BankInfo) -> Option<u8> {
+        if (0xde00..=0xdeff).contains(&address) {
+            return None; // → bus open-bus (EEPROM read_data advances the FSM)
+        }
+        if self.cmode == Gmod2Cmode::M8k && (0x8000..=0x9fff).contains(&address) {
+            return Some(self.flash.peek(self.flash_offset(address)));
+        }
+        None
+    }
+    /// ts:1217-1242 — write: IO1 bank/cmode + EEPROM lines; flash program in ultimax.
+    fn write(&mut self, address: u16, value: u8, _bank_info: &BankInfo, clk: u64) -> bool {
+        if (0xde00..=0xdeff).contains(&address) {
+            self.register = value;
+            self.current_bank = (value & 0x3f) as u16;
+            if (value & 0xc0) == 0xc0 {
+                self.cmode = Gmod2Cmode::Ultimax;
+            } else if (value & 0x40) == 0x00 {
+                self.cmode = Gmod2Cmode::M8k;
+            } else {
+                self.cmode = Gmod2Cmode::Off;
+            }
+            self.eeprom_cs = (value >> 6) & 1;
+            self.eeprom_data = (value >> 4) & 1;
+            self.eeprom_clock = (value >> 5) & 1;
+            self.eeprom.write_select(self.eeprom_cs);
+            if self.eeprom_cs != 0 {
+                self.eeprom.write_data(self.eeprom_data);
+                self.eeprom.write_clock(self.eeprom_clock);
+            }
+            return true;
+        }
+        if self.cmode == Gmod2Cmode::Ultimax
+            && ((0x8000..=0x9fff).contains(&address) || (0xe000..=0xffff).contains(&address))
+        {
+            self.flash.store(self.flash_offset(address), value, clk);
+            return true;
+        }
+        false
+    }
+    /// ts:1284-1290 — reset: 8K mode, EEPROM CS 0. Flash DATA preserved.
+    fn reset(&mut self) {
+        self.current_bank = 0;
+        self.register = 0;
+        self.cmode = Gmod2Cmode::M8k;
+        self.eeprom_cs = 0;
+        self.eeprom.write_select(0);
+    }
+    fn get_state(&self) -> CartState {
+        let mut flash = self.flash.clone();
+        CartState {
+            current_bank: self.current_bank,
+            control_register: Some(self.register),
+            flash: Some(FlashCartState {
+                flash_lo: Some(flash.snapshot_state(0)),
+                flash_hi: None,
+                eeprom: Some(self.eeprom.snapshot_state()),
+                easyflash_jumper: 0,
+                easyflash_ram: Vec::new(),
+            }),
+        }
+    }
+    fn set_state(&mut self, state: CartState) {
+        self.register = state.control_register.unwrap_or(0);
+        self.current_bank = state.current_bank & 0x3f;
+        if (self.register & 0xc0) == 0xc0 {
+            self.cmode = Gmod2Cmode::Ultimax;
+        } else if (self.register & 0x40) == 0x00 {
+            self.cmode = Gmod2Cmode::M8k;
+        } else {
+            self.cmode = Gmod2Cmode::Off;
+        }
+        self.eeprom_cs = (self.register >> 6) & 1;
+        if let Some(f) = &state.flash {
+            if let Some(s) = &f.flash_lo {
+                self.flash.restore_state(s);
+            }
+            if let Some(s) = &f.eeprom {
+                self.eeprom.restore_state(s);
+            }
+        }
+    }
+    fn clone_box(&self) -> Box<dyn CartMapper> {
+        Box::new(self.clone())
+    }
+    fn is_writable_dirty(&self) -> bool {
+        self.flash.is_dirty() || self.eeprom.is_dirty()
+    }
+    fn writable_generation(&self) -> u64 {
+        self.flash.writable_generation() + self.eeprom.writable_generation()
+    }
+    /// ts:1270-1275 — writable image = flash array ++ EEPROM 2KB.
+    fn writable_image(&mut self, clk: u64) -> Option<Vec<u8>> {
+        let flash = self.flash.get_data(clk).to_vec();
+        let eeprom = self.eeprom.get_data().to_vec();
+        let mut out = Vec::with_capacity(flash.len() + eeprom.len());
+        out.extend_from_slice(&flash);
+        out.extend_from_slice(&eeprom);
+        Some(out)
+    }
+    fn set_writable_image(&mut self, bytes: &[u8]) {
+        let flash_len = self.flash.data.len();
+        self.flash.load_data(&bytes[..bytes.len().min(flash_len)]);
+        if bytes.len() > flash_len {
+            self.eeprom.load_data(&bytes[flash_len..]);
+        }
+    }
+}
+
+/// ts:1060-1137 — MegabyterMapper. Protovision MegaByter: 1MB MX29F800CB flash
+/// (128×8K banks, ROML only). IO1 ($DE00): addr bit1 → register_02 (mode bits 0-1
+/// + LED bit7), else register_00 (ROM bank & 0x7f). Mode → 8K/16K/RAM(off)/ULTIMAX.
+/// Flash read AND programmed at ROML $8000-$9FFF; no ROMH.
+#[derive(Clone)]
+pub struct MegabyterMapper {
+    register00: u8, // bank
+    register02: u8, // mode (bits 0-1) + LED (bit 7)
+    flash: Flash040,
+}
+
+impl MegabyterMapper {
+    pub fn new(image: &ParsedCartridgeImage) -> Self {
+        MegabyterMapper {
+            register00: 0,
+            register02: 0,
+            flash: Flash040::new(
+                build_linear_chip_data(image, |b| b.roml.as_ref(), 128),
+                "megabyter",
+                FLASH800_CB,
+            ),
+        }
+    }
+    fn flash_offset(&self, address: u16) -> u32 {
+        ((self.register00 as u32) * 0x2000) + ((address & 0x1fff) as u32)
+    }
+}
+
+impl CartMapper for MegabyterMapper {
+    fn mapper_type(&self) -> MapperType {
+        MapperType::MegaByter
+    }
+    /// ts:1073-1080 — lines per register_02 mode bits.
+    fn get_lines(&self) -> CartLines {
+        match self.register02 & 0x03 {
+            0x00 => CartLines { exrom: 0, game: 1 }, // 8K
+            0x01 => CartLines { exrom: 0, game: 0 }, // 16K
+            0x02 => CartLines { exrom: 1, game: 1 }, // RAM (off)
+            _ => CartLines { exrom: 1, game: 0 },    // ULTIMAX
+        }
+    }
+    /// ts:1082-1085 — read: ROML flash only.
+    fn read(&mut self, address: u16, _bank_info: &BankInfo, clk: u64) -> Option<u8> {
+        if (0x8000..=0x9fff).contains(&address) {
+            return Some(self.flash.read(self.flash_offset(address), clk));
+        }
+        None
+    }
+    /// ts:1088-1091 — peek the ROML flash window.
+    fn peek(&self, address: u16, _bank_info: &BankInfo) -> Option<u8> {
+        if (0x8000..=0x9fff).contains(&address) {
+            return Some(self.flash.peek(self.flash_offset(address)));
+        }
+        None
+    }
+    /// ts:1093-1110 — write: IO1 bank/mode; flash program only in ultimax.
+    fn write(&mut self, address: u16, value: u8, _bank_info: &BankInfo, clk: u64) -> bool {
+        if (0xde00..=0xdeff).contains(&address) {
+            if address & 2 != 0 {
+                self.register02 = value & 0x83;
+            } else {
+                self.register00 = value & 0x7f;
+            }
+            return true;
+        }
+        if (0x8000..=0x9fff).contains(&address) {
+            if (self.register02 & 0x03) == 0x03 {
+                self.flash.store(self.flash_offset(address), value, clk);
+                return true;
+            }
+            return false;
+        }
+        false
+    }
+    /// ts:1136 — reset: bank 0, mode 0 (8K game). Flash DATA preserved.
+    fn reset(&mut self) {
+        self.register00 = 0;
+        self.register02 = 0;
+    }
+    fn get_state(&self) -> CartState {
+        let mut flash = self.flash.clone();
+        CartState {
+            current_bank: self.register00 as u16,
+            control_register: Some(self.register02),
+            flash: Some(FlashCartState {
+                flash_lo: Some(flash.snapshot_state(0)),
+                flash_hi: None,
+                eeprom: None,
+                easyflash_jumper: 0,
+                easyflash_ram: Vec::new(),
+            }),
+        }
+    }
+    fn set_state(&mut self, state: CartState) {
+        self.register00 = (state.current_bank & 0x7f) as u8;
+        self.register02 = state.control_register.unwrap_or(0) & 0x83;
+        if let Some(f) = &state.flash {
+            if let Some(s) = &f.flash_lo {
+                self.flash.restore_state(s);
+            }
+        }
+    }
+    fn clone_box(&self) -> Box<dyn CartMapper> {
+        Box::new(self.clone())
+    }
+    fn is_writable_dirty(&self) -> bool {
+        self.flash.is_dirty()
+    }
+    fn writable_generation(&self) -> u64 {
+        self.flash.writable_generation()
+    }
+    fn writable_image(&mut self, clk: u64) -> Option<Vec<u8>> {
+        Some(self.flash.get_data(clk).to_vec())
+    }
+    fn set_writable_image(&mut self, bytes: &[u8]) {
+        self.flash.load_data(bytes);
+    }
+}
+
+/// ts:120-154 — mapperFromImage: build the concrete mapper for a parsed image.
+/// The read-only families build their banked mapper; the writable flash families
+/// (EasyFlash, GMOD2, MegaByter) build their flash + EEPROM mapper; the remaining
+/// serial/SPI families (GMOD3, C64MegaCart) yield `Err`.
 pub fn mapper_from_image(
     image: &ParsedCartridgeImage,
 ) -> Result<Box<dyn CartMapper>, CrtError> {
@@ -668,6 +1374,9 @@ pub fn mapper_from_image(
         MapperType::MagicDesk => Ok(Box::new(MagicDeskMapper::new(image))),
         MapperType::MagicDesk16 => Ok(Box::new(MagicDesk16Mapper::new(image))),
         MapperType::Ocean => Ok(Box::new(OceanMapper::new(image))),
+        MapperType::EasyFlash => Ok(Box::new(EasyFlashMapper::new(image))),
+        MapperType::Gmod2 => Ok(Box::new(Gmod2Mapper::new(image))),
+        MapperType::MegaByter => Ok(Box::new(MegabyterMapper::new(image))),
         MapperType::Unsupported => Err(CrtError::Unsupported(MapperType::Unsupported)),
     }
 }
