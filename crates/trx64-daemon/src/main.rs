@@ -185,7 +185,14 @@ fn default_trace_output(session_id: &str) -> PathBuf {
 /// Run a cycle budget (= TS session/run). Instruction-stepped: execute whole
 /// instructions until `clk - start >= budget`. Streams trace frames if active.
 fn run_cycle_budget(session: &mut Session, budget: u64) {
-    let full_machine = session.machine.full_assembled && !session.injected;
+    // Run the full VIC-ticked machine whenever ROMs are assembled — even after a
+    // direct memory injection (`wr`/`poke`/PRG-load). The per-cycle VIC renderer
+    // (vic_draw.rs) builds the displayed frame by SWEEPING the raster, so the VIC
+    // MUST tick for a screenshot to reflect injected register/RAM state; the prior
+    // `&& !session.injected` CPU-only path left `displayed` un-swept (the old static
+    // state-renderer read registers directly and needed no run). A non-assembled
+    // machine (flat-RAM CPU exerciser) still uses the CPU-only `run_for`.
+    let full_machine = session.machine.full_assembled;
 
     let Some((channels, need_header, meta_json)) = session.trace.as_ref().map(|t| {
         (TraceChannels::from_domains(&t.domains), t.buf.is_empty(), t.meta_json.clone())
@@ -266,7 +273,14 @@ fn run_cycle_budget(session: &mut Session, budget: u64) {
 
 /// Step exactly one instruction (for stepInto / stepOver / until loops).
 fn step_one_instruction(session: &mut Session) {
-    let full_machine = session.machine.full_assembled && !session.injected;
+    // Run the full VIC-ticked machine whenever ROMs are assembled — even after a
+    // direct memory injection (`wr`/`poke`/PRG-load). The per-cycle VIC renderer
+    // (vic_draw.rs) builds the displayed frame by SWEEPING the raster, so the VIC
+    // MUST tick for a screenshot to reflect injected register/RAM state; the prior
+    // `&& !session.injected` CPU-only path left `displayed` un-swept (the old static
+    // state-renderer read registers directly and needed no run). A non-assembled
+    // machine (flat-RAM CPU exerciser) still uses the CPU-only `run_for`.
+    let full_machine = session.machine.full_assembled;
     let mut obs = NullSink;
     if full_machine {
         session.machine.run_for_full_capped(999_999, 1, &mut obs, |_, _, _, _, _, _, _| {});
