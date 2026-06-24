@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "breakpoint-policy-layer (ObserverRegistry + cond-AST)",
+  "current_item": "breakpoint-policy-layer",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -50,12 +50,17 @@
     "phase0-tick-hooks"
   ],
   "note": "Phase0 hooks DONE (ADR-070): on_interrupt full-path + run-loop breakpoints/RunStop + on_access watch, all zero-cost-when-off, byte-exact GREEN, 3 hook tests pass. NEXT: breakpoint policy layer (ObserverRegistry + cond-AST over the new hooks, daemon-side) -> then protocol-surface (WS) -> snapshot-vsf -> integration. (sid backlog item is STALE - reSID done, remove.)",
-  "updated": "2026-06-24T14:54:14Z",
+  "updated": "2026-06-24T15:05:43Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "breakpoint-policy-layer",
+    "model": "opus",
+    "started": "2026-06-24T15:05:43Z",
+    "note": "Port c64re ObserverRegistry (Observer struct + CondNode AST + parseCond/evalNode + rebuild filling the watch tables + onExec/onAccess + hit/ignore + actions) over the Phase0 hooks. Wire daemon: debug/run|continue segment-run + self-halt at breakpoints, until consults the bp set, real hitCount. ~440 LOC, daemon-side policy; core stays observer-agnostic."
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
