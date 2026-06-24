@@ -55,7 +55,7 @@
     "snapshot-vsf"
   ],
   "note": "snapshot-vsf DONE (ADR-076): c64re-own VSF byte-parity round-trip both ways + read real-VICE (motm.vsf loads+renders game menu). 152 tests, 7/7 gate. NEXT: .c64re container (snapshot/dump|undump = magic C64RESNP + format-ver + sha256 + gzip(JSON RuntimeCheckpoint) + embedded media; round-trip vs c64re) - source native-snapshot.ts. Then checkpoint-ring.",
-  "updated": "2026-06-24T17:36:35Z",
+  "updated": "2026-06-24T17:44:02Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
@@ -63,8 +63,8 @@
   "in_flight": {
     "item": "snapshot-c64re-container",
     "model": "opus",
-    "started": "2026-06-24T17:36:35Z",
-    "note": "BLOCKED on user decision: .c64re payload scope A (within-TRX64 VSF-in-container) vs B (full RuntimeCheckpoint cross-runtime = a 2nd snapshot model + drive-blob + literal-VIC, additive state-serialization of drive/vic). Builder surfaced + paused. Awaiting user A/B + constraint-relaxation OK for B. Loop paused on this item per Driver promise."
+    "started": "2026-06-24T17:44:02Z",
+    "note": "Option B (ADR-077): full RuntimeCheckpoint .c64re, Rust 1:1 with TS, cross-runtime both ways. Container framing + cp.cpu/ram/cia/sid/iec/intstatus/alarms (C64-side, have state) + cp.vic LiteralVicSnapshot + cp.drive1541 VICE drive blob. Additive drive/VIC state-serialization allowed (logic unchanged, byte-exact gates guard). Incremental."
   },
   "stage2_items": [],
   "resolved": [
