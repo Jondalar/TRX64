@@ -56,10 +56,11 @@
     "snapshot-c64re-container",
     "snapshot-drive-blob",
     "checkpoint-ring",
-    "flash-cart-writable"
+    "flash-cart-writable",
+    "drive-write-back"
   ],
   "note": "checkpoint-ring DONE (ADR-080): ring + checkpoint/* 6/7 + vic/inspect 3/9, cross-runtime shapes match, 189 tests. Deferred follow-ups: vic-inspect-engine (6 methods), checkpoint/thumbnails. PARALLEL: flash-cart-writable + drive-write-back still in worktrees. Main tree -> next: recorder/scenario (unblocked by checkpoint-ring).",
-  "updated": "2026-06-24T19:45:57Z",
+  "updated": "2026-06-24T19:48:53Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
@@ -84,12 +85,5 @@
   "loop_status": "RUNNING",
   "bar": "BEHAVIORAL parity with c64re (renders games/demos, .g64 1541 loaders, the 7-game gate). Match c64re, not exceed it.",
   "scope_note": "FEATURE-COMPLETE = 100% vs c64re TS runtime. EXPLICIT (user): the .c64re snapshot/dump|undump container IS in scope (magic C64RESNP + gzip-JSON RuntimeCheckpoint + media, round-trip vs c64re), as its own item right after snapshot-vsf. Full queue: snapshot-vsf(A+readVICE, running) -> .c64re-container (dump/undump) -> checkpoint-ring (705.B rewind + 7 checkpoint methods + granular vic/inspect) -> recorder/scenario -> audio/media/batch WS -> flash-cart WRITABLE -> drive WRITE-BACK -> integration. ALL in. 100%.",
-  "parallel": [
-    {
-      "item": "drive-write-back",
-      "worktree": "/Users/alex/Development/C64/Tools/trx64-wt-drive",
-      "branch": "drive-write-back",
-      "started": "2026-06-24T19:21:09Z"
-    }
-  ]
+  "parallel": []
 }

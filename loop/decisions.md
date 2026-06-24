@@ -1287,3 +1287,18 @@ readback, sector/chip erase, EEPROM round-trip, writable_image persistence). 192
 19 cart_mapper_gate + MagicDesk-still-boots GREEN (the &mut read path didn't disturb no-cart/read-only).
 Merged to main CLEAN (no conflicts — file-disjoint from checkpoint-ring). drive-write-back + recorder/scenario
 still running in parallel.
+
+## ADR-082 — drive write-back: .g64/.d64 persist (parallel worktree, clean merge)
+The inverse of from_g64/from_d64 (ADR-063). gcr.rs: the GCR DECODE codec (gcr_convert_gcr_to_4bytes/find_sync/
+decode_block/find_sector_header/read_sector/write_sector, 1:1 gcr.ts/VICE gcr.c) + GcrImage::write_half_track
+(= disk_image_write_half_track): G64 path (fsimage_gcr_write_half_track — offset-table entry + 2B LE length +
+GCR data + zero-pad; EXTEND appends a block at EOF, patches offset+speed tables), D64 path (fsimage_dxx_write_
+half_track — GCR-decode each sector, write 256B at the linear offset). rotation.rs: dirty_half_track tracking +
+drive_gcr_data_writeback(_all); flush boundaries match VICE EXACTLY (move_head flushes before stepping, detach
+before teardown). drive.rs: attach_disk wires disk.bytes as write-back target, flush_disk_writeback mirrors
+dirty tracks back; daemon media/persist + snapshot/dump + trace media-SHA flush before reading disk.bytes (same
+point VICE flushes drive_gcr_data_writeback_all). EVIDENCE both formats: D64 683 sectors byte-exact round-trip,
+G64 write-back + EXTEND (formerly-empty track), read-only rejected; rotation bit-level write_next_bit -> dirty
+-> writeback persists. 184 tests, drive/disk byte-exact gates GREEN (seven_game_gate + scramble + gcr_d64_parity
+incl). Merged to main CLEAN (no conflicts — auto-merged with checkpoint-ring's disjoint drive.rs/rotation.rs
+parts). Only recorder/scenario remains in flight.
