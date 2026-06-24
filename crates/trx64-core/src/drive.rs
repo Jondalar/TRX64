@@ -1100,6 +1100,19 @@ impl Drive1541 {
         (orb | !ddrb) & 0xff
     }
 
+    /// DIAGNOSTIC: snapshot the drive VIA1 IRQ/CA1 state for the ATN-IRQ probe.
+    /// Returns (ifr, ier, pcr, irq_active, irq_stamp).
+    #[doc(hidden)]
+    pub fn via1_irq_debug(&self) -> (u8, u8, u8, bool, u64) {
+        (
+            self.via1.ifr,
+            self.via1.ier,
+            self.via1.regs[VIA_PCR],
+            self.via1.irq_active,
+            self.via1.irq_stamp,
+        )
+    }
+
     /// Deliver an IEC ATN-line edge to the drive's VIA1 CA1 input (= VICE
     /// iecbus.c:440-446: `viacore_signal(via1d1541, VIA_SIG_CA1,
     /// iec_old_atn ? 0 : VIA_SIG_RISE)`, where `iec_old_atn = cpu_bus & 0x10` is the

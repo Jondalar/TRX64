@@ -197,10 +197,24 @@ impl IntStatus {
         }
     }
 
-    /// PORT OF: vice/src/interrupt.c interrupt_ack_irq. ts:228
+    /// PORT OF: vice/src/interrupt.h:284-289 interrupt_ack_irq.
+    ///
+    /// VICE clears ONLY `IK_IRQPEND` here (the one-shot "an IRQ dispatch is due"
+    /// latch) and parks `irq_pending_clk` at the inactive sentinel. It does NOT
+    /// clear `IK_IRQ`: that bit is the IRQ *level*, which tracks `nirq > 0` and is
+    /// cleared solely by `interrupt_set_irq` when the LAST source deasserts
+    /// (`--nirq == 0`). Clearing `IK_IRQ` here was the bug: after the first drive
+    /// IRQ was acknowledged while a second source stayed asserted (`nirq` stuck at
+    /// 2 — e.g. the VIA2 T1 watchdog still pending when the VIA1 CA1 ATN edge
+    /// arrives), `global_pending_int` permanently lost `IK_IRQ` (it only re-arms on
+    /// the `nirq` 0→1 edge, which never recurs), so the prologue's
+    /// `global_pending_int != IK_NONE` test went false and the ATN-service IRQ was
+    /// never dispatched — the drive sat in its $EC12 idle loop while the C64 held
+    /// ATN at $EEAC. Matching VICE (clear IK_IRQPEND only) restores dispatch.
     #[inline]
     pub fn interrupt_ack_irq(&mut self) {
-        self.global_pending_int &= !IK_IRQ;
+        self.global_pending_int &= !IK_IRQPEND;
+        self.irq_pending_clk = CLOCK_MAX;
     }
     /// PORT OF: vice/src/interrupt.c interrupt_ack_nmi. ts:229
     #[inline]
