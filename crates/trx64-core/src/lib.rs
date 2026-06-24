@@ -21,6 +21,7 @@ pub mod full_sc;
 pub mod gcr;
 pub mod iec;
 pub mod keyboard;
+pub mod native_snapshot;
 pub mod rotation;
 pub mod render;
 pub mod resid_audio;

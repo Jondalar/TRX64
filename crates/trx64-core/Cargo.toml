@@ -8,6 +8,15 @@ license.workspace = true
 build = "build.rs"
 
 [dependencies]
+# .c64re native snapshot (additive — ADR-077). The pure cycle/opcode cores are
+# unchanged; these back the structured RuntimeCheckpoint serialization + the
+# binary container framing (magic/version/sha256/gzip + the `$ta` typed-array
+# JSON codec). 1:1 with the c64re TS native-snapshot.ts + runtime-checkpoint.ts.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+flate2 = "1"
+sha2 = "0.10"
+base64 = "0.22"
 
 [build-dependencies]
 cc = "1"
