@@ -663,3 +663,10 @@ scramble acid test + 7-game gate 7/7 + perf compare (~8-10x) all done. Loop focu
 backlog cleaned (cia-cascade = cia.rs lazy alarm cascade already done; drive-via2 = viacore 1:1 already done).
 Remaining backlog (protocol-surface, snapshot-vsf, integration, sid) is broader drop-in-surface work, not
 user-prioritized — NOT auto-dispatching (Not eager). No builder dispatched this tick. Awaiting user direction.
+
+## 2026-06-24 — DRIVER: TS-core arch-map done (ADR-066); cartridge+SID+parity plan; awaiting reSID decision
+
+Mapped TS core architecture. Monitor=separate (TRX64 already correct). obs/bk/trace=tick hooks, 3 granularities,
+gated (TRX64 has trace-hook via monomorphized Observer; bk/watchpoints not wired, on_interrupt dead in full
+path). Plan: Phase0 tiny hooks -> cartridge read-only || breakpoints -> SID-audio || monitor/WS. One open user
+decision: reSID approach (cc-FFI C++ vs pure-Rust vs TS-SID). No build dispatched — planning/discussion phase.

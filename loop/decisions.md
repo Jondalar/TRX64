@@ -992,3 +992,31 @@ verbatim per-cycle x64sc + per-cycle VIC + cycle-stepped drive; the win is nativ
 identical algorithm. Report: docs/perf-compare.md. Bench: tests/perf_bench.rs (Rust) + bench/c64re_dist_bench.mjs
 (node-on-dist — NEVER tsx). All byte-exact gates GREEN (bench is test/doc-only). LESSON: benchmark c64re only
 via node on dist/, never tsx.
+
+## ADR-066 — observability/hook architecture (from the TS-core arch-map) + cartridge/SID/parity plan
+Mapped the c64re TS core architecture to answer the user's two questions + scope cartridge+SID+feature-parity.
+ANSWERS:
+- Monitor = SEPARATE layer on both sides (TS MonitorAPI holds only a session ref; the monitor calls the core,
+  never the reverse). TRX64 already correct: trx64-core (Machine + Observer trait, lib.rs:44) = core;
+  trx64-daemon = the monitor/WS surface. KEEP the split. The only core-crossing piece = the watch-gate hook
+  (the Observer trait — already exists).
+- obs/breakpoints/trace DO run in the tick as HOOKS, at 3 granularities, all GATED (zero-cost when off):
+  per-cycle = only the VIC tick (always-on); per-instruction = breakpoints + cpu-trace firehose (between
+  steps); per-bus-access = watchpoints + bus-trace (in load/store). TRX64 has the TRACE hook right (Observer
+  trait + monomorphized NullSink = compiler ELIDES hooks when off, stronger than TS' boolean gate).
+GAPS: (1) breakpoints/watchpoints NOT wired (debug/run reads the bp list but drives nothing; no access-watch
+table; no haltRequested). (2) on_interrupt is fired in cpu.rs:432 (CPU-iso) but DEAD in the full SC path
+(c64_6510core::do_interrupt never calls it). (3) cartridge ENTIRELY ABSENT (but the hard ultimax 32-entry
+memconfig table is already present, full.rs:45; pla_config_changed hard-codes |0x18). (4) SID core engine is
+DONE+GREEN (fastsid port, sid.rs) — only the AUDIO tier (reSID) is absent. (5) WS surface ~54/91 methods
+missing (mechanical).
+BUILD PLAN: Phase0 tick hooks (on_access bus gate ~30LOC + on_interrupt in do_interrupt ~15LOC + run-loop
+breakpoints param/abort-enum/exec+halt checks ~50LOC — port integrated-session.ts:973-992 + cpu65xx-vice.ts:
+468/495). Then PARALLEL: cartridge read-only tier (new cart.rs: parse_crt + mapper trait + Base/MagicDesk/
+MagicDesk16/Ocean + bus consult + pla fix, ~600-800LOC, VICE-goldenable) || breakpoint policy layer
+(ObserverRegistry + cond-AST, ~440LOC, daemon-side). Then PARALLEL: SID audio (reSID FFI + write-ring + pcm +
+WAV, ~600-800LOC) || monitor completion + WS coverage. Flash-cart tier (Flash040/EAPI/EasyFlash, ~1500LOC) =
+deferred follow-up.
+OPEN USER DECISION: reSID approach — (a) cc-crate FFI of the vendored GPL C++ reSID (1:1, byte-identical audio
++ 705 state snapshot, but adds a C++ build dep + GPL boundary), (b) pure-Rust reSID port (clean deps, large/
+error-prone, no oracle leverage), (c) the simpler TS-SID. Recommended (a). Awaiting user steer; NOT building yet.
