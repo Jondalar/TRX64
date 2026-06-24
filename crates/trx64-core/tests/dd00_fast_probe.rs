@@ -37,37 +37,46 @@ struct Dd00Sink {
     reads: Vec<(u64, u16, u8)>,
     tags: Vec<u32>,
     max: usize,
+    cap_instr: bool,
+    cap_target: usize,
+    instrs: Vec<(u16, u8, u8, u8)>,
 }
 
 impl Observer for Dd00Sink {
     fn on_instruction(
         &mut self,
-        _pc: u16,
+        pc: u16,
         _op: u8,
         _b1: u8,
         _b2: u8,
-        _a: u8,
-        _x: u8,
-        _y: u8,
+        a: u8,
+        x: u8,
+        y: u8,
         _sp: u8,
         _p: u8,
         _clk: u64,
     ) {
+        if self.cap_instr && self.instrs.len() < self.cap_target {
+            self.instrs.push((pc, a, x, y));
+        }
     }
     #[inline]
     fn on_bus(&mut self, kind: BusKind, addr: u16, value: u8, pc: u16, clk: u64, _old: u8) {
         if !self.armed {
             return;
         }
-        // Capture $DD00 reads AND $DD00/$DD02 writes (the C64 driving the IEC lines).
-        let is_dd = addr == 0xdd00 || addr == 0xdd02;
-        let is_rw = matches!(kind, BusKind::Read | BusKind::Write);
-        if is_dd && is_rw && self.reads.len() < self.max {
-            // Encode write vs read in the high bit of a tag stored alongside.
-            let tag = if matches!(kind, BusKind::Write) { 0x10000u32 } else { 0 }
-                | ((addr as u32) << 1);
+        // Capture $DD00 reads from the KERNAL serial debounce loop ($EEA9/$EEAC) and
+        // its callers ($EExx). These are the cross-domain reads that diverge.
+        let is_dd = addr == 0xdd00;
+        let is_r = matches!(kind, BusKind::Read);
+        // TRX64 divergence is near clk ~25895938 (ref 36544945 − offset 10649007).
+        if is_dd
+            && is_r
+            && (0xEE00..=0xEEC0).contains(&pc)
+            && (25_894_000..=25_898_000).contains(&clk)
+        {
             self.reads.push((clk, pc, value));
-            self.tags.push(tag);
+            self.tags.push(0);
         }
     }
     fn on_interrupt(&mut self, _vector: u16, _clk: u64) {}
@@ -90,7 +99,15 @@ fn dd00_fast_probe() {
 
     let mut m = Machine::new();
     m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
-    let mut sink = Dd00Sink { armed: false, reads: Vec::new(), tags: Vec::new(), max: 4000 };
+    let mut sink = Dd00Sink {
+        armed: false,
+        reads: Vec::new(),
+        tags: Vec::new(),
+        max: 4000,
+        cap_instr: false,
+        cap_target: 4000,
+        instrs: Vec::new(),
+    };
 
     // Boot to BASIC ready.
     m.run_for_full(2_500_000, &mut sink, |_, _, _, _, _, _, _| {});
@@ -123,10 +140,70 @@ fn dd00_fast_probe() {
         return;
     }
 
-    // Type RUN, run until the C64 first reaches the $04xx loader loop.
+    // Type RUN, run until the C64 first reaches the loader entry $080D, then capture
+    // the C64 PC+A+X+Y instruction stream for the first ~4000 instructions and dump
+    // it so it can be diffed against the c64re reference (which is byte-deterministic
+    // until the first wrong transferred byte). The FIRST divergent instruction =
+    // the first wrong byte.
     inject_keys(&mut m, b"RUN\r");
     let mut reached = false;
     let run_clk = m.cpu6510.clk;
+    // Step to $080D.
+    let mut at_080d = false;
+    for _ in 0..3_000_000 {
+        m.run_for_full(1, &mut sink, |_, _, _, _, _, _, _| {});
+        if m.cpu6510.reg_pc == 0x080D {
+            at_080d = true;
+            break;
+        }
+    }
+    eprintln!("reached $080D={at_080d} clk={}", m.cpu6510.clk);
+    if at_080d {
+        // Capture a LONG C64 instruction stream (PC only) from $080D so we can diff
+        // the full control-flow against the reference and find the first PC-level
+        // divergence (the harmless transient-A differences are filtered by matching
+        // only the PC stream).
+        // Run to ~instr 323000 (just before the first divergence at idx 323841),
+        // capturing the C64 instruction stream so we can find the divergence index,
+        // AND arm $DD00 capture so we record the KERNAL $EEA9 debounce reads.
+        sink.cap_instr = true;
+        sink.cap_target = 1_500_000;
+        sink.armed = true;
+        // Capture the DRIVE PC stream (pc + drive_clk) in the divergence clk window
+        // so we can compare the drive phase against the reference drive_pc channel
+        // (reference divergence: C64-cycle 36544945, drive at PC $EC12-$EC44).
+        let mut drv_trace: Vec<(u16, u64)> = Vec::new();
+        let mut guard = 0u64;
+        while sink.instrs.len() < sink.cap_target && guard < 12_000_000 {
+            m.run_for_full(1, &mut sink, |pc, _a, _x, _y, _sp, _p, dclk| {
+                if (25_894_000..=25_896_500).contains(&dclk) && drv_trace.len() < 120 {
+                    drv_trace.push((pc, dclk));
+                }
+            });
+            guard += 1;
+        }
+        sink.cap_instr = false;
+        sink.armed = false;
+        eprintln!("== TRX64 DRIVE PC stream in divergence window (pc, drive_clk) ==");
+        for (pc, dclk) in drv_trace.iter() {
+            eprintln!("  drvPC=${pc:04X} drive_clk={dclk}");
+        }
+        let line: Vec<String> = sink
+            .instrs
+            .iter()
+            .map(|(pc, a, x, y)| format!("{pc:04X}:{a:02X}:{x:02X}:{y:02X}"))
+            .collect();
+        std::fs::write("/tmp/trx64_full.txt", line.join("\n")).ok();
+        eprintln!("wrote {} full records to /tmp/trx64_full.txt", sink.instrs.len());
+        // Dump the first $EExx $DD00 debounce reads (the divergence is at the FIRST
+        // $EEA9 read that fails to transition). Show all captured.
+        eprintln!("== KERNAL $EExx $DD00 reads near clk 25.896M (the divergence) ==");
+        for (i, ((clk, pc, val), _t)) in sink.reads.iter().zip(sink.tags.iter()).enumerate() {
+            eprintln!("  [{i}] clk={clk} PC=${pc:04X} $DD00=${val:02X}");
+        }
+        eprintln!("total reads in window: {}", sink.reads.len());
+        return; // stop here — this dump is the focus
+    }
     // Arm $DD00/$DD02 capture across the WHOLE setup so we see the C64 establishing
     // the IEC handshake before $04E2.
     sink.armed = true;
@@ -217,44 +294,7 @@ fn dd00_fast_probe() {
         return;
     }
 
-    // FINE correlated capture: step the C64 one instruction at a time during the
-    // $04E2/$07xx overlap, logging at each step the C64 PC, the C64-visible cpu_port
-    // (CLK_IN=bit6, DATA_IN=bit7), the drive PC, and the drive's VIA1 PB output
-    // (CLK_OUT=bit3, DATA_OUT=bit1). The bug: the drive raises CLK in $07xx but the
-    // C64's $DD00 read never sees CLK_IN high.
     use std::collections::HashMap;
-    eprintln!("== FINE correlated C64/$DD00 vs drive PB (overlap window) ==");
-    let mut steps = 0u64;
-    let mut last_cpu_port = 0xFFu8;
-    let mut last_drv_pb = 0xFFu8;
-    let mut logged = 0u32;
-    while steps < 6000 && logged < 240 {
-        let mut cur_drv_pc = 0u16;
-        m.run_for_full(1, &mut sink, |pc, _, _, _, _, _, _| {
-            cur_drv_pc = pc;
-        });
-        let _ = cur_drv_pc;
-        let cpu_pc = m.cpu6510.reg_pc;
-        let cpu_port = m.iec.cpu_port;
-        let drv_pb = m.drive8.via1_pb_iec_output();
-        let drv_pc = m.drive8.core.reg_pc;
-        if logged < 20 || cpu_port != last_cpu_port || drv_pb != last_drv_pb {
-            let clkin = (cpu_port >> 6) & 1;
-            let datin = (cpu_port >> 7) & 1;
-            let clkout = (drv_pb >> 3) & 1; // 1 = released; the wired-AND inverts
-            let datout = (drv_pb >> 1) & 1;
-            eprintln!(
-                "  clk={} C64pc=${cpu_pc:04X} cpu_port=${cpu_port:02X}(CLKin={clkin} DATAin={datin}) | drvPC=${drv_pc:04X} PB=${drv_pb:02X}(CLKout_rel={clkout} DATAout_rel={datout}) drv_port=${:02X}",
-                m.cpu6510.clk, m.iec.drv_port,
-            );
-            logged += 1;
-        }
-        last_cpu_port = cpu_port;
-        last_drv_pb = drv_pb;
-        steps += 1;
-    }
-    eprintln!("fine capture ended: steps={steps} C64pc=${:04X} drvPC=${:04X}", m.cpu6510.reg_pc, m.drive8.core.reg_pc);
-
     // ARM the $DD00 capture and run the transfer for a bounded window.
     sink.armed = true;
     let arm_clk = m.cpu6510.clk;
