@@ -5013,5 +5013,84 @@ mod batch1_tests {
         // unknown id → -32001.
         assert_eq!(call_err(&st, "runtime/scenario_run", json!({ "id": "nope" })).code, -32001);
     }
+
+    /// End-to-end record → SEEK round-trip: record anchors at distinct machine
+    /// states (different RAM marker + cycle), then RECONSTRUCT an earlier anchor and
+    /// RESTORE it through the checkpoint path — the machine must land back at THAT
+    /// anchor's captured RAM marker (seek via anchor lands at the checkpoint). This
+    /// proves the recorder's anchors are faithful, restorable scrub points.
+    #[test]
+    fn record_then_seek_via_anchor_lands_at_that_state() {
+        let st = make_state();
+        call(&st, "recorder/start", json!({})); // anchor seq 0 (marker 0x00 @ $4000)
+
+        // Stamp a marker in RAM, advance the clock, capture anchor seq 1.
+        {
+            let mut g = st.lock().unwrap();
+            g.session.machine.poke(0x4000, &[0xAA]);
+            run_cycle_budget(&mut g.session, 5000);
+        }
+        let cap1 = call(&st, "recorder/capture", json!({}));
+        let seq1 = cap1["seq"].as_u64().unwrap();
+        let cycle1 = {
+            let g = st.lock().unwrap();
+            g.recorder.as_ref().unwrap().list().last().unwrap().cycle
+        };
+
+        // Change the marker + advance further, capture anchor seq 2.
+        {
+            let mut g = st.lock().unwrap();
+            g.session.machine.poke(0x4000, &[0xBB]);
+            run_cycle_budget(&mut g.session, 5000);
+        }
+        call(&st, "recorder/capture", json!({}));
+
+        // Sanity: live RAM now holds the LATEST marker.
+        assert_eq!(st.lock().unwrap().session.machine.read_full(0x4000), 0xBB);
+
+        // SEEK: reconstruct anchor seq1 (marker 0xAA) and restore it. The machine
+        // must revert to the 0xAA marker + the seq1 capture cycle — i.e. it lands
+        // exactly at that earlier anchor, not the live state.
+        {
+            let mut g = st.lock().unwrap();
+            let (_, _, payload) = g.recorder.as_ref().unwrap().reconstruct(seq1).unwrap();
+            restore_live_checkpoint(&mut g.session, &payload).unwrap();
+            assert_eq!(
+                g.session.machine.read_full(0x4000), 0xAA,
+                "seek landed at the seq1 anchor's RAM marker"
+            );
+            assert_eq!(
+                g.session.machine.c64_core.clk as f64, cycle1,
+                "seek landed at the seq1 anchor's captured cycle"
+            );
+        }
+    }
+
+    /// Record → REPLAY determinism: two independent recordings of the SAME input
+    /// schedule, reconstructed at the same anchor, yield byte-identical RAM. The
+    /// recorder's anchors are deterministic w.r.t. the input stream.
+    #[test]
+    fn record_replay_is_deterministic_across_runs() {
+        let record_marker_at_anchor = || {
+            let st = make_state();
+            call(&st, "recorder/start", json!({}));
+            {
+                let mut g = st.lock().unwrap();
+                // Deterministic mutation: a fixed marker + a fixed run budget.
+                g.session.machine.poke(0x5000, &[0x42]);
+                run_cycle_budget(&mut g.session, 7000);
+            }
+            let cap = call(&st, "recorder/capture", json!({}));
+            let seq = cap["seq"].as_u64().unwrap();
+            let g = st.lock().unwrap();
+            let (_, _, payload) = g.recorder.as_ref().unwrap().reconstruct(seq).unwrap();
+            // Hash the reconstructed RAM blob (the byte-exact replay artifact).
+            let ram = trx64_core::native_snapshot::ta_u8_decode(&payload["ram"]).unwrap();
+            sha256_hex(&ram)
+        };
+        let h1 = record_marker_at_anchor();
+        let h2 = record_marker_at_anchor();
+        assert_eq!(h1, h2, "deterministic reconstructed RAM across recordings");
+    }
 }
 

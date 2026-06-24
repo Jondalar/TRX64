@@ -220,7 +220,17 @@ fn read_value(bytes: &[u8], off: &mut usize) -> Result<Value, String> {
         T_TRUE => Ok(Value::Bool(true)),
         T_DOUBLE => {
             let n = read_f64(bytes, off)?;
-            Ok(serde_json::json!(n))
+            // JS has no int/float distinction (all numbers are f64), but serde_json
+            // does, and downstream readers (restore_runtime_checkpoint) call
+            // `as_i64()` on fields like `schemaVersion`. Decode a WHOLE, in-range
+            // f64 back to a JSON integer so those reads work — mirroring how the TS
+            // value (a plain JS number) was originally an integer. Non-integral or
+            // out-of-range values stay floats.
+            if n.is_finite() && n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
+                Ok(serde_json::json!(n as i64))
+            } else {
+                Ok(serde_json::json!(n))
+            }
         }
         T_STRING => Ok(Value::String(read_str(bytes, off)?)),
         T_ARRAY => {
@@ -278,22 +288,40 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Round-trip a scalar/object/array graph byte-exactly.
+    /// Round-trip a scalar/object/array graph. Whole numbers decode back to JSON
+    /// integers (JS-number semantics — all numbers are f64, but a whole value reads
+    /// as an int so downstream `as_i64()` works); fractional values stay floats.
     #[test]
     fn roundtrip_scalars_and_containers() {
         let mut enc = AnchorEncoder::new();
+        // Use integer literals so the round-trip is exact-equal (whole f64 → i64).
         let v = json!({
-            "a": 1.0,
+            "a": 1,
             "b": true,
             "c": false,
             "d": Value::Null,
             "e": "hello",
-            "f": [1.0, 2.0, 3.0],
+            "f": [1, 2, 3],
             "g": { "nested": "x" },
         });
         let bytes = enc.encode(&v).to_vec();
         let back = decode_anchor(&bytes).unwrap();
         assert_eq!(back, v);
+    }
+
+    /// A fractional number stays a float through the round-trip.
+    #[test]
+    fn roundtrip_fractional_number_stays_float() {
+        let mut enc = AnchorEncoder::new();
+        let v = json!({ "wallMs": 1234.5 });
+        let bytes = enc.encode(&v).to_vec();
+        let back = decode_anchor(&bytes).unwrap();
+        assert_eq!(back["wallMs"].as_f64(), Some(1234.5));
+        // A whole number reads back as an integer (as_i64 works).
+        let v2 = json!({ "schemaVersion": 1 });
+        let b2 = enc.encode(&v2).to_vec();
+        let back2 = decode_anchor(&b2).unwrap();
+        assert_eq!(back2["schemaVersion"].as_i64(), Some(1));
     }
 
     /// A `$ta` Uint8Array node round-trips as T_TYPED.
@@ -313,7 +341,7 @@ mod tests {
     #[test]
     fn reserve_leaves_header_gap() {
         let mut enc = AnchorEncoder::new();
-        let v = json!(42.0);
+        let v = json!(42);
         let with = enc.encode_with_reserve(28, &v).to_vec();
         let plain = {
             let mut e2 = AnchorEncoder::new();
@@ -321,7 +349,7 @@ mod tests {
         };
         assert_eq!(with.len(), 28 + plain.len());
         assert_eq!(&with[28..], &plain[..]);
-        // The codec body after the reserve decodes back to the value.
+        // The codec body after the reserve decodes back to the value (whole → int).
         assert_eq!(decode_anchor(&with[28..]).unwrap(), v);
     }
 
