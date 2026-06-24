@@ -8,13 +8,12 @@
 //
 // Three proof axes (per the work order):
 //
-//   1. CORPUS  — boot + mount + LOAD"*",8,1 + RUN. Outcome CLASS compared TRX64
-//                vs c64re. NOTE: over the WS daemon, the matrix-typed RUN does NOT
-//                launch the scene loaders (KRILL/EPYX/System-3/custom) to gameplay
-//                — uniformly on BOTH runtimes (the LOADED_READY class). That is
-//                itself cross-runtime PARITY. Gameplay is reached only via the
-//                in-process buffer-poke path, which the seven_game_gate (GREEN 7/7)
-//                and proof-canary-disk.mjs already prove for both runtimes.
+//   1. CORPUS  — boot + mount + LOAD"*",8,1 (+ RUN). Outcome CLASS compared TRX64
+//                vs c64re: the PC reaches game RAM (the (fast)loader is live — the
+//                proof-canary bar) OR a title frame renders. The standard-serial
+//                LOAD of a scene loader can take ~30M cycles before the stub
+//                returns to READY; with an adequate budget the loader then goes
+//                live in RAM. Parity = both runtimes reach the same class.
 //   2. WS-SURFACE — on a live, actively-executing machine: session/screenshot,
 //                monitor regs/mem/disasm (api/call), checkpoint capture/restore
 //                (rewind), a breakpoint that halts (debug/breakpoint_hit, ADR-086),
@@ -81,8 +80,8 @@ const CORPUS: CorpusItem[] = [
   // The xref pair (scramble/polarbear) reaches LOADED_READY ~6M cyc post-LOAD on
   // both runtimes; a short runCap keeps the slow c64re leg bounded while still
   // proving the same outcome class. (The gate is the gameplay authority.)
-  { name: "scramble", disk: "scramble_infinity.d64", loader: "krill", xref: true, loadCap: 30 * PAL_HZ, runCap: 15 * PAL_HZ },
-  { name: "polarbear", disk: "POLARBEAR.d64", loader: "custom", xref: true, loadCap: 30 * PAL_HZ, runCap: 15 * PAL_HZ },
+  { name: "scramble", disk: "scramble_infinity.d64", loader: "krill", xref: true, loadCap: 40 * PAL_HZ, runCap: 12 * PAL_HZ },
+  { name: "polarbear", disk: "POLARBEAR.d64", loader: "custom", xref: true, loadCap: 40 * PAL_HZ, runCap: 12 * PAL_HZ },
   { name: "motm", disk: "motm.g64", loader: "custom", runCap: 60 * PAL_HZ },
   { name: "maniac_s1", disk: "maniac_mansion_s1[activision_1987](german)(manual)(!).g64", loader: "custom", runCap: 90 * PAL_HZ },
   { name: "im2", disk: "impossible_mission_ii[epyx_1987](!).g64", loader: "epyx", runCap: 60 * PAL_HZ },
@@ -262,32 +261,25 @@ async function driveCorpusItem(c: RpcClient, item: CorpusItem): Promise<RunOutco
     // LOAD"*",8,1
     await call(c, "session/type", { session_id: sid, text: 'LOAD"*",8,1\r' });
 
-    // Run until BASIC READY returns (load complete) or the load cap.
-    const loadCap = (await cycles(c, sid)) + (item.loadCap ?? 70 * PAL_HZ);
-    let loadReturnedReady = false;
-    while ((await cycles(c, sid)) < loadCap) {
-      await runCycles(c, sid, 2_000_000);
-      if (READY.has(await pc(c, sid))) {
-        loadReturnedReady = true;
-        break;
-      }
-    }
-
-    // RUN
-    await call(c, "session/type", { session_id: sid, text: "RUN\r" });
-
-    // Run until game code is live (sustained 2 samples), sampling colors too.
-    const runCap = (await cycles(c, sid)) + (item.runCap ?? 40 * PAL_HZ);
+    // State accumulated across the whole post-LOAD run.
     let firstHit: number | null = null;
     let reached = false;
     let firstGamePc: number | null = null;
     let bestColors = 0;
-    while ((await cycles(c, sid)) < runCap) {
-      await runCycles(c, sid, 1_000_000);
+    let loadReturnedReady = false;
+    let typedRun = false;
+
+    // Run until BASIC READY returns (= load complete, a stub to RUN) OR the
+    // (fast)loader goes live in game RAM (sustained) OR the load cap. A loader
+    // that runs straight in RAM never returns to READY — break early on game-PC.
+    const loadCap = (await cycles(c, sid)) + (item.loadCap ?? 70 * PAL_HZ);
+    while ((await cycles(c, sid)) < loadCap) {
+      await runCycles(c, sid, 2_000_000);
       const p = await pc(c, sid);
-      // periodic frame sample for color coherence
-      const frame = renderToColors(await call(c, "session/screenshot", { session_id: sid }));
-      if (frame.colors > bestColors) bestColors = frame.colors;
+      if (READY.has(p)) {
+        loadReturnedReady = true;
+        break;
+      }
       if (gameRunning(p)) {
         if (firstGamePc === null) firstGamePc = p;
         if (firstHit !== null) {
@@ -299,6 +291,37 @@ async function driveCorpusItem(c: RpcClient, item: CorpusItem): Promise<RunOutco
         firstHit = null;
       }
     }
+
+    // If the load settled at READY, type RUN to launch the stub.
+    if (loadReturnedReady && !reached) {
+      await call(c, "session/type", { session_id: sid, text: "RUN\r" });
+      typedRun = true;
+    }
+
+    // Run until game code is live (sustained 2 samples), sampling colors. Sample
+    // the framebuffer only every few chunks — the PNG encode is the costly call
+    // on the slow c64re runtime.
+    const runCap = (await cycles(c, sid)) + (item.runCap ?? 40 * PAL_HZ);
+    let chunkIdx = 0;
+    while (!reached && (await cycles(c, sid)) < runCap) {
+      await runCycles(c, sid, 1_000_000);
+      const p = await pc(c, sid);
+      if ((chunkIdx++ & 3) === 0) {
+        const frame = renderToColors(await call(c, "session/screenshot", { session_id: sid }));
+        if (frame.colors > bestColors) bestColors = frame.colors;
+      }
+      if (gameRunning(p)) {
+        if (firstGamePc === null) firstGamePc = p;
+        if (firstHit !== null) {
+          reached = true;
+          break;
+        }
+        firstHit = p;
+      } else {
+        firstHit = null;
+      }
+    }
+    void typedRun;
 
     const finalPc = await pc(c, sid);
     const cyc = await cycles(c, sid);
@@ -313,12 +336,14 @@ async function driveCorpusItem(c: RpcClient, item: CorpusItem): Promise<RunOutco
 }
 
 // ── outcome classification + comparison ────────────────────────────────────────
-// LOADED_READY = LOAD"*",8,1 completed and the machine sits at BASIC READY but the
-// matrix-typed RUN did not launch the game's protected/custom loader to gameplay.
-// This is the UNIFORM daemon-path outcome for the scene-loader disks (KRILL/custom/
-// EPYX/System-3) on BOTH TRX64 AND c64re — the in-process buffer-poke gate
-// (seven_game_gate.rs / proof-canary-disk.mjs) reaches gameplay; the WS matrix
-// path reaches LOADED_READY. It is therefore a valid cross-runtime PARITY class.
+// GAME_LIVE = after LOAD (+RUN if it returned to READY), the PC is sustained in
+//   game RAM — the (fast)loader is live, which is the proof-canary bar.
+// LOADED_READY = LOAD completed to BASIC READY and the game did not (yet) launch
+//   within the run budget (a stub-only program, or a budget too short).
+// Over the WS daemon the standard-serial LOAD of a scene loader can take ~30M
+// cycles before the stub returns to READY; with an adequate loadCap the matrix-
+// typed RUN then launches the loader live in RAM (scramble: READY @~29M, game-PC
+// @~33M). Both runtimes reach the same class for the same disk + budget.
 type OutcomeClass = "GAME_LIVE" | "RENDERED" | "LOADED_READY" | "STUCK" | "ERROR";
 function classify(o: RunOutcome): OutcomeClass {
   if (o.error) return "ERROR";
@@ -344,30 +369,51 @@ interface SurfaceResult {
   note: string;
 }
 
-/** Boot to an ACTIVELY-EXECUTING machine + mount a disk + LOAD"*",8,1 so the
- *  full chain (KERNAL serial, 1541 drive, GCR, VIC raster, CIA timers, IRQs) has
- *  genuinely run and a real program image is resident in RAM. Returns the session
- *  id. This is the substrate for the WS-surface + cross-runtime-snapshot axes.
- *
- *  NOTE: over the WS daemon the matrix-typed RUN does NOT launch these scene
- *  loaders to gameplay (a daemon-input-path property shared by BOTH runtimes —
- *  see the LOADED_READY class), so we do not wait for game-PC here. The machine
- *  is nonetheless a live, deterministically-reached, non-trivial state with disk
- *  media resident — exactly what the snapshot/checkpoint/breakpoint capabilities
- *  must round-trip. Both runtimes reach byte-identical observable state here. */
+/** Boot to a genuinely RUNNING program: boot + mount + LOAD"*",8,1, then run
+ *  until the PC is sustained in game RAM ($0200..$9FFF — the fastloader/game live,
+ *  the proof-canary criterion) OR BASIC READY. Returns the session id. This is the
+ *  substrate for the WS-surface + cross-runtime-snapshot axes — a live, non-trivial,
+ *  deterministically-reached state both runtimes reach identically, with the real
+ *  program image resident in RAM. Stops as soon as game RAM is live so the slow
+ *  c64re leg stays bounded. */
 async function bootToActive(c: RpcClient, item: CorpusItem): Promise<string> {
   const created = await call(c, "session/create", { pal: true });
   const sid: string = created?.sessionId ?? created?.session_id ?? "";
   await runCycles(c, sid, 5_000_000);
   await call(c, "media/mount", { session_id: sid, path: resolvePath(SAMPLES, item.disk) });
   await call(c, "session/type", { session_id: sid, text: 'LOAD"*",8,1\r' });
-  const loadCap = (await cycles(c, sid)) + 50 * PAL_HZ;
-  while ((await cycles(c, sid)) < loadCap) {
-    await runCycles(c, sid, 2_000_000);
-    if (READY.has(await pc(c, sid))) break;
+  // Phase 1: LOAD until the loader is live in RAM (sustained) OR READY returns.
+  const cap1 = (await cycles(c, sid)) + 40 * PAL_HZ;
+  let prevGame = false;
+  let ready = false;
+  let live = false;
+  while ((await cycles(c, sid)) < cap1) {
+    await runCycles(c, sid, 1_000_000);
+    const p = await pc(c, sid);
+    if (gameRunning(p)) {
+      if (prevGame) { live = true; break; }
+      prevGame = true;
+    } else {
+      prevGame = false;
+      if (READY.has(p)) { ready = true; break; }
+    }
+  }
+  // Phase 2: if we settled at READY, type RUN and run until the loader is live.
+  if (ready && !live) {
+    await call(c, "session/type", { session_id: sid, text: "RUN\r" });
+    const cap2 = (await cycles(c, sid)) + 12 * PAL_HZ;
+    prevGame = false;
+    while ((await cycles(c, sid)) < cap2) {
+      await runCycles(c, sid, 1_000_000);
+      const p = await pc(c, sid);
+      if (gameRunning(p)) {
+        if (prevGame) break;
+        prevGame = true;
+      } else prevGame = false;
+    }
   }
   // A short extra run so the machine is mid-execution (IRQ/raster active) at the
-  // moment we snapshot — not paused exactly on the READY-loop boundary.
+  // moment we snapshot — not paused exactly on a loop boundary.
   await runCycles(c, sid, 200_000);
   return sid;
 }
@@ -814,17 +860,16 @@ function writeReport(
   lines.push(`  already established by the focused 7-game gate (\`seven_game_gate.rs\`).`);
   lines.push(`- Both daemons are spawned hermetically (fresh project, ephemeral port) per run.`);
   lines.push("");
-  lines.push(`### Key finding — the daemon input path (cross-runtime symmetric)`);
+  lines.push(`### How "reach running" is judged (proof-canary criterion)`);
   lines.push("");
-  lines.push(`Over the **WS daemon**, the matrix-typed \`RUN\` does NOT launch the scene loaders`);
-  lines.push(`(KRILL / EPYX / System-3 / custom) to gameplay — the machine sits at BASIC READY`);
-  lines.push(`with the program image resident (the \`LOADED_READY\` class). This was verified to`);
-  lines.push(`be **identical on BOTH runtimes**: a live c64re daemon driven through the exact`);
-  lines.push(`same WS sequence reaches the same \`LOADED_READY\` state (scramble: both end in the`);
-  lines.push(`\`$E5CD..$E5D4\` READY loop, 2 colors). Gameplay is reached only via the in-process`);
-  lines.push(`**buffer-poke** path ($0277/$C6); the \`seven_game_gate.rs\` (GREEN **7/7**) and`);
-  lines.push(`c64re's \`proof-canary-disk.mjs\` both prove gameplay there, for both runtimes. The`);
-  lines.push(`LOADED_READY outcome is therefore valid cross-runtime **parity**, not a TRX64 bug.`);
+  lines.push(`A program "reaches running" when, after \`LOAD"*",8,1\`, the PC is sustained in`);
+  lines.push(`game RAM ($0200..$9FFF, outside ROM and the READY/serial stuck loops) — i.e.`);
+  lines.push(`the (fast)loader handed control to live code. For KRILL/EPYX/System-3 loaders`);
+  lines.push(`this is the loader executing in RAM as it pulls the game in; that IS the`);
+  lines.push(`\`seven_game_gate.rs\` / \`proof-canary-disk.mjs\` bar. A program that only loads a`);
+  lines.push(`BASIC stub and idles at READY without launching is the \`LOADED_READY\` class.`);
+  lines.push(`Either way the TRX64 outcome is compared CLASS-for-class against the live c64re`);
+  lines.push(`daemon: parity means the two runtimes reach the SAME class for the same disk.`);
   lines.push("");
   lines.push(`## Scorecard`);
   lines.push("");
