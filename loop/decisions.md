@@ -1246,3 +1246,17 @@ drive snapshot-module blob (DRIVE+DRIVECPU+VIA1+VIA2+GCRIMAGE, ~1.6 KLOC byte-ex
 shipped the foundation but correctly did NOT ship a guessed partial blob (would corrupt c64re's drive read).
 So the full C64 state is cross-runtime; drive resume is the follow-up (snapshot-drive-blob). NEXT: snapshot-
 drive-blob (port drive_snapshot/drivecpu_snapshot/viacore_snapshot x2/GCRIMAGE on vice_snapshot_stream.rs).
+
+## ADR-079 — .c64re drive blob: COMPLETE — full RuntimeCheckpoint (C64+drive) cross-runtime both ways
+cp.drive1541 + cp.driveDiskImage ported (drive_snapshot.rs = the VICE 1541 drive snapshot module-stream:
+DRIVE8 v2.0 / DRIVECPU0 v1.3 / 1541VIA1D0+VIA2D0 v2.2 / GCRIMAGE0 v3.1, 1:1 drive_snapshot.ts+drivecpu+gcr+
+viacore.c:1946-2192). viacore.rs gained viacore_snapshot_write/read_module + undump_pra/prb/pcr/acr hooks
+REACHABLE ONLY from the snapshot read path (live path untouched, ADR-077 additive). capture/restore wire the
+drive blobs (disk re-attach -> GCR baseline -> mutable overlay). CROSS-RUNTIME DRIVE-RESUME PROVEN BOTH WAYS vs
+live c64re (mid-load, drive active): A TRX64->c64re (drivePc=$D599/HT39 survived, load continued to $F885 motor-
+on); B c64re->TRX64 (drivePc=$E87E/HT2 survived, continued). The cross-runtime test caught a real bug
+(rotation_table_ptr slot = speed_zone 0..3, NOT frequency -> ROT_SPEED_BPS OOB panic) -> fixed. Within-TRX64
+mid-load round-trips: no jamming. 176 tests pass, byte-exact GREEN (the 1 iso-vic-badline-irq RED is pre-
+existing, byte-identical on base). => .c64re IS 100% COMPLETE (the user's runtime snapshot format, portable
+TS<->Rust for the full machine incl drive). NEXT: checkpoint-ring (705.B rewind ring + 7 checkpoint/* methods +
+granular vic/inspect, built on the now-complete RuntimeCheckpoint).

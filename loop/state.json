@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "snapshot-drive-blob",
+  "current_item": "checkpoint-ring (705.B)",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -53,20 +53,16 @@
     "runtime-controller-av-push",
     "protocol-surface-b2",
     "snapshot-vsf",
-    "snapshot-c64re-container"
+    "snapshot-c64re-container",
+    "snapshot-drive-blob"
   ],
-  "note": ".c64re container DONE (ADR-078): cross-runtime proven both ways for the full C64 state (TRX64<->c64re), 173 tests, byte-exact. REMAINING: cp.drive1541 blob (DRIVE/DRIVECPU/VIA1/VIA2/GCRIMAGE ~1.6 KLOC on vice_snapshot_stream.rs foundation) for cross-runtime drive resume. Then: checkpoint-ring, recorder/scenario, audio/media/batch, flash-write, drive-write, integration.",
-  "updated": "2026-06-24T18:50:55Z",
+  "note": ".c64re 100% COMPLETE (ADR-079): full RuntimeCheckpoint C64+drive cross-runtime both ways, 176 tests. NEXT: checkpoint-ring (705.B) = the rewind ring of RuntimeCheckpoints + the 7 checkpoint/* WS methods + granular vic/inspect (ride the ring) + foundation for scenario/recorder. Builds on the now-complete RuntimeCheckpoint capture/restore. Then recorder/scenario, audio/media/batch, flash-write, drive-write, integration.",
+  "updated": "2026-06-24T19:04:25Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": {
-    "item": "snapshot-drive-blob",
-    "model": "opus",
-    "started": "2026-06-24T18:50:55Z",
-    "note": "opus ~35min: all 5 drive modules + wiring committed (a79a6ca/eea2cdd/04570ad/79c345d incl GCRIMAGE fix). Validating cross-runtime drive-resume vs c64re + byte-exact. Alive (commit 3min ago)."
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"

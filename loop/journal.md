@@ -740,3 +740,9 @@ tests, 7/7 gate, byte-exact green. Next: .c64re container (dump/undump).
 native_snapshot.rs + c64re_snapshot.rs + vice_snapshot_stream.rs + daemon. Cross-runtime round-trip PROVEN both
 ways for the full C64 state vs live c64re (TRX64-dump->c64re-undump + c64re-dump->TRX64-undump, byte-identical
 regs). 173 tests, byte-exact green. Remaining: cp.drive1541 blob (snapshot-drive-blob). Next: that.
+
+## 2026-06-24 — DRIVER: .c64re drive blob (ADR-079) — 100% COMPLETE cross-runtime
+
+drive_snapshot.rs (DRIVE8/DRIVECPU0/VIA/GCRIMAGE) + viacore_snapshot. Cross-runtime drive-resume proven both
+ways vs c64re (mid-load survives, load continues). .c64re is now 100% (C64+drive portable TS<->Rust). 176
+tests, byte-exact green. Next: checkpoint-ring.
