@@ -41,19 +41,16 @@
     "drive-1to1-via1",
     "scramble-sprites",
     "g64-mounting",
-    "seven-game-gate"
+    "seven-game-gate",
+    "perf-compare"
   ],
-  "note": "7-GAME GATE 7/7 PASS (ADR-064): TRX64 = c64re behavioral parity on real software (scramble/polarbear/motm/greenberet/impossible2/lastninja/maniac; california excluded=no protection track). Verbatim cores + 1:1 drive + G64 + sprite-fix all hold. NEXT (user plan): perf-compare = Rust vs TS core cycles/sec (fixed workload, both release, clean CPU, median).",
-  "updated": "2026-06-24T09:43:03Z",
+  "note": "perf compare DONE (ADR-065): TRX64 Rust ~8-10× the c64re TS core on the PRODUCTION path (node on dist, NOT tsx). pure 13.4 vs 1.37 MHz=9.8x; disk 11.2 vs 1.39=8.1x. The 200x was a tsx artifact (user caught it). User plan complete: scramble + 7-game gate + perf.",
+  "updated": "2026-06-24T10:32:30Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": {
-    "item": "perf-compare",
-    "model": "opus",
-    "started": "2026-06-24T09:43:03Z"
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"

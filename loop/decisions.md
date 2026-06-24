@@ -977,3 +977,18 @@ byte-exact gates GREEN, cargo test 95 passed.
 THE BEHAVIORAL BAR IS MET: TRX64 = c64re on the 7-game proof set. NEXT (user plan): Rust-vs-TS performance
 compare (core cycles/sec, same fixed workload, both release, clean CPU, median K runs + the per-game gate
 wall-clock).
+
+## ADR-065 — perf compare: TRX64 Rust core ~8-10× the c64re TS core (production path)
+Rust-vs-TS core throughput, both run AS SHIPPED. CRITICAL methodology fix (user caught it): c64re ships as
+COMPILED dist/ run by plain `node` (ui.sh -> npm run workspace -> tsc->dist -> node scripts/workspace.mjs), NOT
+tsx. A first pass measured c64re via `npx tsx` and got 0.061 MHz -> a BOGUS ~200× ratio. tsx is ~22× slower
+than node-on-dist (esbuild on-the-fly transpile defeats V8 tier-up). The live UI plays smoothly at ~1.4× real-
+time (50fps), which 0.06× real-time could never do — that contradiction exposed the tsx artifact.
+REAL numbers (node on dist/ vs Rust --release, M4, CPU-clean, same verbatim true-drive path):
+- pure headless: c64re 1.372 MHz (1.39× RT) vs TRX64 13.435 MHz (13.6× RT) = 9.8×.
+- full-system disk (scramble load): c64re 1.388 MHz (1.41× RT) vs TRX64 11.179 MHz (11.3× RT) = 8.1×.
+HEADLINE: TRX64 Rust core is ~8-10× the c64re TS core (an order of magnitude) — NOT 200×. Both run the same
+verbatim per-cycle x64sc + per-cycle VIC + cycle-stepped drive; the win is native/no-GC/monomorphic on the
+identical algorithm. Report: docs/perf-compare.md. Bench: tests/perf_bench.rs (Rust) + bench/c64re_dist_bench.mjs
+(node-on-dist — NEVER tsx). All byte-exact gates GREEN (bench is test/doc-only). LESSON: benchmark c64re only
+via node on dist/, never tsx.

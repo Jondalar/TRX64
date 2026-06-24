@@ -649,3 +649,10 @@ Ran the c64re proof gate on TRX64: 7/7 behavioral parity. scramble/polarbear/mot
 lastninja render titles; maniac reaches game code (slow serial, c64re same). Every .g64 reads real GCR via
 the 1:1 viacore drive. California excluded (no protection track). NO emulator changes needed. 95 tests GREEN.
 The behavioral bar is MET. Next: Rust-vs-TS perf compare.
+
+## 2026-06-24 — DRIVER: perf compare — TRX64 Rust ~8-10× c64re TS (ADR-065)
+
+User caught the bogus 200×: c64re ships as compiled dist/ run by node (ui.sh -> npm run workspace), NOT tsx.
+tsx is ~22× slower (0.061 MHz). Real production numbers: c64re pure 1.37 MHz / disk 1.39 MHz vs TRX64 13.4 /
+11.2 MHz = 9.8× / 8.1×. Headline: ~8-10× (an order of magnitude). Both verbatim true-drive. docs/perf-compare.md
++ bench/c64re_dist_bench.mjs (node-on-dist). User plan (scramble + 7-game gate + perf) complete.
