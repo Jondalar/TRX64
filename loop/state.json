@@ -35,7 +35,7 @@
     "vic-verbatim"
   ],
   "note": "NEW DIRECTION (ADR-053): bar = behavioral parity with c64re. Verbatim cores DONE (drive+C64-CPU+VIC-II, merged). Next: dd00-atn-irq - fix the ~7-cycle drive ATN-IRQ cross-domain stamping lag (full.rs:atn_edge_to_via1_ca1 vs the c64re reference) that desyncs the scramble $DD00 loader. Then re-test scramble behaviorally. Then render-verbatim + the 7-game gate.",
-  "updated": "2026-06-24T02:20:57Z",
+  "updated": "2026-06-24T02:50:53Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
@@ -43,8 +43,8 @@
   "in_flight": {
     "item": "dd00-atn-irq",
     "model": "opus",
-    "started": "2026-06-24T02:20:57Z",
-    "note": "opus alive: atn_irq_lag_probe.rs created ~2min ago, measuring the ATN-IRQ lag (full.rs/iec.rs not yet edited). Defer."
+    "started": "2026-06-24T02:50:53Z",
+    "note": "opus ~30min: committed 0a4f5e7 (drive interrupt_ack_irq IK_IRQ bug — ATN-service never dispatched). Iterating. WIP sid.rs (out-of-scope, watch/revert at gate). Defer."
   },
   "stage2_items": [],
   "resolved": [
