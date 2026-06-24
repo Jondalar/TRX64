@@ -128,6 +128,11 @@ pub const FINISHED_SHIFTING: i32 = 16;
 // =============================================================================
 // PORT OF: viacore.c:216 (#define FULL_CYCLE_2 2)
 const FULL_CYCLE_2: u64 = 2;
+
+// PORT OF: viacore.c:1941-1942 (VIA_DUMP_VER_MAJOR / _MINOR = 2 / 2). The VIA
+// snapshot module version the write/read modules stamp + version-gate.
+const VIA_DUMP_VER_MAJOR: u8 = 2;
+const VIA_DUMP_VER_MINOR: u8 = 2;
 // PORT OF: viacore.c:286 (#define SR_PHI2_FIRST_OFFSET 3)
 const SR_PHI2_FIRST_OFFSET: u64 = 3;
 // PORT OF: viacore.c:287 (#define SR_PHI2_NEXT_OFFSET 1)
@@ -391,6 +396,22 @@ pub trait ViaBackend {
     fn sr_underflow(&mut self, _ctx: &mut ViaContext) {}
     /// reset (via2d.c:423-431). `ctx.reset?.(ctx)`.
     fn reset(&mut self, _ctx: &mut ViaContext) {}
+
+    // ── snapshot undump hooks (viacore_snapshot_read_module) ──────────────────
+    // VICE's `viacore_snapshot_read_module` invokes the per-VIA `undump_pra`,
+    // `undump_prb`, `undump_pcr`, `undump_acr` callbacks (NOT the `store_*`
+    // ones). For via1d1541/via2d most are empty; the non-empty ones re-derive
+    // cached chip/rotation state from the restored register file. Default = the
+    // empty VICE body (matches via2d undump_pra/undump_acr + via1d1541
+    // undump_pra/undump_pcr/undump_acr).
+    /// undump_pra (via2d.c:194-197 empty / via1d1541.c:112-139). Default no-op.
+    fn undump_pra(&mut self, _ctx: &mut ViaContext, _byte: u8) {}
+    /// undump_prb (via2d.c:357-367 / via1d1541.c:181-210). Default no-op.
+    fn undump_prb(&mut self, _ctx: &mut ViaContext, _byte: u8) {}
+    /// undump_pcr (via2d.c:398-405 via2d_update_pcr / via1d1541.c:251-263 #if 0).
+    fn undump_pcr(&mut self, _ctx: &mut ViaContext, _byte: u8) {}
+    /// undump_acr (via2d.c:407-409 empty / via1d1541.c empty). Default no-op.
+    fn undump_acr(&mut self, _ctx: &mut ViaContext, _byte: u8) {}
 }
 
 // =============================================================================
@@ -1556,6 +1577,284 @@ pub fn viacore_cache_cb12_io_status(ctx: &mut ViaContext, backend: &mut dyn ViaB
 }
 
 // =============================================================================
+// viacore_snapshot_write_module / viacore_snapshot_read_module — viacore.c:1946-2192
+// =============================================================================
+//
+// 1:1 PORT of viacore.ts:1424-1732 (viacore_snapshot_write/read_module), which is
+// itself the verbatim port of vice/src/core/viacore.c:1946-2192. The VICE-format
+// module-stream IO (snapshot_module_create / SMW_B / SMR_B / ...) is the
+// `vice_snapshot_stream::SnapshotT` primitive (ADR-078). The undump_* callbacks
+// dispatch through the `ViaBackend` trait (see undump_pra/prb/pcr/acr above). The
+// `my_module_name` / alt names live on the ctx (set by new_via1_ctx/new_via2_ctx).
+//
+// VIA_DUMP_VER_MAJOR / _MINOR = 2 / 2 (viacore.c:1941-1942).
+
+/// viacore.c:1946-2014 — `viacore_snapshot_write_module`. Writes one VIA module
+/// (`ctx.my_module_name`) into `s`. Returns 0 on success, -1 on failure.
+pub fn viacore_snapshot_write_module(
+    ctx: &mut ViaContext,
+    backend: &mut dyn ViaBackend,
+    s: &mut SnapshotT,
+) -> i32 {
+    let rclk = ctx.clk;
+
+    // viacore.c:1953 — run_pending_alarms(rclk, 0).
+    run_pending_alarms(ctx, backend, rclk, 0);
+
+    let name = ctx.my_module_name.clone().unwrap_or_default();
+    let mut m = s.module_create(&name, VIA_DUMP_VER_MAJOR, VIA_DUMP_VER_MINOR);
+
+    let byte4 = ctx.t1_pb7 & 0x80;
+
+    // viacore.c:1965-1992 — base block (v2.0, 22 fields).
+    s.smw_b(&mut m, ctx.via[VIA_PRA]);
+    s.smw_b(&mut m, ctx.via[VIA_DDRA]);
+    s.smw_b(&mut m, ctx.via[VIA_PRB]);
+    s.smw_b(&mut m, ctx.via[VIA_DDRB]);
+    s.smw_w(&mut m, ctx.tal & 0xffff);
+    s.smw_w(&mut m, viacore_t1(ctx, rclk) & 0xffff);
+    s.smw_b(&mut m, ctx.via[VIA_T2LL]);
+    s.smw_b(&mut m, ctx.via[VIA_T2LH]);
+    s.smw_b(&mut m, ctx.t2cl);
+    s.smw_b(&mut m, ctx.t2ch);
+    s.smw_w(&mut m, viacore_t2(ctx, ctx.clk) & 0xffff);
+    s.smw_b(
+        &mut m,
+        (if ctx.t1zero != 0 { 0x80 } else { 0 }) | (if ctx.t2xx00 { 0x40 } else { 0 }),
+    );
+    s.smw_b(&mut m, ctx.via[VIA_SR]);
+    s.smw_b(&mut m, ctx.via[VIA_ACR]);
+    s.smw_b(&mut m, ctx.via[VIA_PCR]);
+    s.smw_b(&mut m, ctx.ifr & 0xff);
+    s.smw_b(&mut m, ctx.ier & 0xff);
+    s.smw_b(&mut m, byte4);
+    // SRHBITS
+    s.smw_b(&mut m, (ctx.shift_state & 0xff) as u8);
+    // CABSTATE — VICE's literal overlapping-bit OR (ported verbatim, NOT "fixed").
+    s.smw_b(
+        &mut m,
+        (if ctx.ca2_out_state { 0x80 } else { 0 })
+            | (if ctx.cb2_out_state { 0x40 } else { 0 })
+            | (if ctx.cb2_in_state { 0x40 } else { 0 })
+            | (if ctx.cb1_in_state { 0x20 } else { 0 })
+            | (if ctx.cb1_out_state { 0x20 } else { 0 }),
+    );
+    s.smw_b(&mut m, ctx.ila);
+    s.smw_b(&mut m, ctx.ilb);
+
+    // viacore.c:1996-2012 — minor version 2 data.
+    let tmpclock = alarm_clk(ctx, AlarmId::T2Underflow);
+    let m2_t2_underflow_alarm = if tmpclock != 0 {
+        ((1 + tmpclock).wrapping_sub(rclk) & 0xff) as u8
+    } else {
+        0
+    };
+    let tmpclock = alarm_clk(ctx, AlarmId::T2Shift);
+    let m2_t2_shift_alarm = if tmpclock != 0 {
+        ((1 + tmpclock).wrapping_sub(rclk) & 0xff) as u8
+    } else {
+        0
+    };
+
+    s.smw_b(&mut m, if ctx.t2_irq_allowed { 1 } else { 0 });
+    s.smw_b(&mut m, m2_t2_underflow_alarm);
+    s.smw_b(&mut m, m2_t2_shift_alarm);
+
+    s.module_close(&m);
+    0
+}
+
+/// viacore.c:2016-2192 — `viacore_snapshot_read_module`. Reads the VIA module
+/// (`my_module_name` / alt1 / alt2) from `s` and re-establishes the chip state.
+/// Returns 0 on success, -1 on failure (missing/incompatible module).
+pub fn viacore_snapshot_read_module(
+    ctx: &mut ViaContext,
+    backend: &mut dyn ViaBackend,
+    s: &mut SnapshotT,
+) -> i32 {
+    let rclk = ctx.clk;
+
+    // viacore.c:2025-2048 — open by primary, else alt1, else alt2.
+    let primary = ctx.my_module_name.clone().unwrap_or_default();
+    let mut opened = s.module_open(&primary);
+    if opened.is_none() {
+        match &ctx.my_module_name_alt1 {
+            None => return -1,
+            Some(alt1) => {
+                opened = s.module_open(&alt1.clone());
+                if opened.is_none() {
+                    match &ctx.my_module_name_alt2 {
+                        None => return -1,
+                        Some(alt2) => {
+                            opened = s.module_open(&alt2.clone());
+                            if opened.is_none() {
+                                return -1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let (m, vmajor, vminor) = opened.unwrap();
+    let _ = m;
+
+    // viacore.c:2050-2060 — version gating.
+    if vmajor != VIA_DUMP_VER_MAJOR {
+        return -1; // SNAPSHOT_MODULE_INCOMPATIBLE
+    }
+    if crate::vice_snapshot_stream::snapshot_version_is_bigger(
+        vmajor,
+        vminor,
+        VIA_DUMP_VER_MAJOR,
+        VIA_DUMP_VER_MINOR,
+    ) {
+        return -1; // SNAPSHOT_MODULE_HIGHER_VERSION
+    }
+
+    // viacore.c:2062-2071 — unset all alarms (always inited in this port).
+    ctx.alarm_context.alarm_unset(AlarmId::T1Zero);
+    ctx.alarm_context.alarm_unset(AlarmId::T2Zero);
+    ctx.alarm_context.alarm_unset(AlarmId::T2Underflow);
+    ctx.alarm_context.alarm_unset(AlarmId::T2Shift);
+    ctx.alarm_context.alarm_unset(AlarmId::Phi2Sr);
+
+    ctx.t1zero = 0;
+    ctx.t2xx00 = false;
+
+    // viacore.c:2075-2098 — base block (22 fields).
+    macro_rules! rb {
+        () => {
+            match s.smr_b() {
+                Some(v) => v,
+                None => return -1,
+            }
+        };
+    }
+    macro_rules! rw {
+        () => {
+            match s.smr_w() {
+                Some(v) => v,
+                None => return -1,
+            }
+        };
+    }
+    ctx.via[VIA_PRA] = rb!();
+    ctx.via[VIA_DDRA] = rb!();
+    ctx.via[VIA_PRB] = rb!();
+    ctx.via[VIA_DDRB] = rb!();
+    let word1 = rw!();
+    let word2 = rw!();
+    ctx.via[VIA_T2LL] = rb!();
+    ctx.via[VIA_T2LH] = rb!();
+    ctx.t2cl = rb!();
+    ctx.t2ch = rb!();
+    let word3 = rw!();
+    let byte1 = rb!();
+    ctx.via[VIA_SR] = rb!();
+    ctx.via[VIA_ACR] = rb!();
+    ctx.via[VIA_PCR] = rb!();
+    let byte2 = rb!();
+    let byte3 = rb!();
+    let byte4 = rb!();
+    let byte5 = rb!(); // SRHBITS
+    let byte6 = rb!(); // CABSTATE
+    ctx.ila = rb!();
+    ctx.ilb = rb!();
+
+    // viacore.c:2127-2140 — minor version 2 data (defaults on short read).
+    let (m2_t2_irq_allowed, m2_t2_underflow_alarm, m2_t2_shift_alarm) =
+        match (s.smr_b(), s.smr_b(), s.smr_b()) {
+            (Some(a), Some(b), Some(c)) => (a, b, c),
+            _ => (1, 0, 0),
+        };
+
+    // viacore.c:2142-2152 — undump PRA / PRB pin outputs + oldpa/oldpb.
+    let byte = (ctx.via[VIA_PRA] | !ctx.via[VIA_DDRA]) & 0xff;
+    backend.undump_pra(ctx, byte);
+    ctx.oldpa = byte;
+
+    let byte = (ctx.via[VIA_PRB] | !ctx.via[VIA_DDRB]) & 0xff;
+    backend.undump_prb(ctx, byte);
+    ctx.oldpb = byte;
+
+    // viacore.c:2154-2160 — T1 latch + reload/zero clocks.
+    ctx.tal = word1;
+    ctx.via[VIA_T1LL] = (ctx.tal & 0xff) as u8;
+    ctx.via[VIA_T1LH] = ((ctx.tal >> 8) & 0xff) as u8;
+
+    // viacore.c:2156-2157 — t1reload = rclk + word2 + FULL_CYCLE_2 (=2; the VICE
+    // `/* 3 */` / `/* 1 */` source comments are stale, the actual adds are 2/0).
+    ctx.t1reload = rclk + (word2 as u64) + FULL_CYCLE_2;
+    ctx.t1zero = rclk + (word2 as u64);
+
+    // word3 is the effective value of T2.
+    ctx.t2zero = rclk + ((word3 & 0xff) as u64);
+    ctx.t2xx00 = true;
+
+    // viacore.c:2168-2186 — re-arm T1/T2 alarms from byte1 + ACR.
+    if byte1 & 0x80 != 0 {
+        ctx.alarm_context.alarm_set(AlarmId::T1Zero, ctx.t1zero);
+    } else {
+        ctx.t1zero = 0;
+    }
+    if byte1 & 0x40 != 0
+        || (ctx.via[VIA_ACR] & 0x1c) == 0x04
+        || (ctx.via[VIA_ACR] & 0x1c) == 0x10
+        || (ctx.via[VIA_ACR] & 0x1c) == 0x14
+    {
+        ctx.alarm_context.alarm_set(AlarmId::T2Zero, ctx.t2zero);
+    } else {
+        ctx.t2zero = rclk + (word3 as u64);
+        ctx.t2xx00 = false;
+    }
+    // FIXME: SR alarm (viacore.c:2188).
+    if (ctx.via[VIA_ACR] & 0x0c) == 0x08 {
+        ctx.alarm_context.alarm_set(AlarmId::Phi2Sr, rclk + 1);
+    }
+
+    // viacore.c:2190-2196 — IFR/IER + IRQ line restore.
+    ctx.ifr = byte2;
+    ctx.ier = byte3;
+    via_restore_int(ctx, backend, (ctx.ifr & ctx.ier & 0x7f) as u32);
+
+    // viacore.c:2198-2206 — t1_pb7 / shift_state / CAB states.
+    ctx.t1_pb7 = byte4 & 0x80;
+    ctx.shift_state = byte5 as i32;
+
+    ctx.ca2_out_state = (byte6 & 0x80) != 0;
+    ctx.cb2_out_state = (byte6 & 0x40) != 0;
+    ctx.cb2_in_state = (byte6 & 0x20) != 0;
+    ctx.cb1_in_state = (byte6 & 0x10) != 0;
+    ctx.cb1_out_state = (byte6 & 0x08) != 0;
+
+    ctx.t2_irq_allowed = m2_t2_irq_allowed != 0;
+
+    if m2_t2_underflow_alarm != 0 {
+        ctx.alarm_context.alarm_set(
+            AlarmId::T2Underflow,
+            rclk + (m2_t2_underflow_alarm as u64) - 1,
+        );
+    }
+    if m2_t2_shift_alarm != 0 {
+        ctx.alarm_context
+            .alarm_set(AlarmId::T2Shift, rclk + (m2_t2_shift_alarm as u64) - 1);
+    }
+
+    // viacore.c:2225-2238 — undump PCR / SR / ACR effects.
+    backend.undump_pcr(ctx, ctx.via[VIA_PCR]);
+    let sr = ctx.via[VIA_SR];
+    backend.store_sr(ctx, sr);
+    backend.undump_acr(ctx, ctx.via[VIA_ACR]);
+
+    viacore_cache_cb12_io_status(ctx, backend);
+
+    0
+}
+
+use crate::vice_snapshot_stream::SnapshotT;
+
+// =============================================================================
 // viacore_setup_context / viacore_init — viacore.ts:1258-1340
 // =============================================================================
 
@@ -1612,7 +1911,7 @@ pub fn viacore_init(ctx: &mut ViaContext) {
 // via `ctx.prv.drive` (= the rotation model) and `ctx.context` (= the IntStatus for
 // set_int). One method per VICE `static` fn, same name, same body.
 
-use crate::rotation::{Rotation, BRA_MOTOR_ON};
+use crate::rotation::{Rotation, BRA_BYTE_READY, BRA_MOTOR_ON};
 
 // PORT OF: via2d.ts:196-197 (DRIVE_SOUND_MOTOR_ON / DRIVE_SOUND_MOTOR_OFF)
 const DRIVE_SOUND_MOTOR_ON: u32 = 1;
@@ -1838,6 +2137,36 @@ impl<'a> ViaBackend for Via2dBackend<'a> {
     // PORT OF: via2d.ts:535-537 (store_t2l) — empty.
     fn store_t2l(&mut self, _ctx: &mut ViaContext, _byte: u8) {}
 
+    // PORT OF: via2d.ts:490-498 (undump_prb — static). LED status (no-op headless)
+    // + speed_zone_set + motor bit on byte_ready_active. NO stepper/begins (that is
+    // store_prb only). The `if (!drv) return` guard maps to has_image.
+    fn undump_prb(&mut self, _ctx: &mut ViaContext, byte: u8) {
+        if !self.has_image {
+            return;
+        }
+        let drv = &mut *self.drive;
+        // drv.led_status = (byte & 0x08) ? 1 : 0 — no led field headless.
+        // rotation_speed_zone_set((byte >> 5) & 0x03, number).
+        drv.speed_zone_set(((byte >> 5) & 0x03) as usize);
+        // drv.byte_ready_active = (bra & ~BRA_MOTOR_ON) | (byte & BRA_MOTOR_ON).
+        drv.byte_ready_active =
+            (drv.byte_ready_active & !BRA_MOTOR_ON) | (byte & BRA_MOTOR_ON);
+    }
+
+    // PORT OF: via2d.ts:514-517 (undump_pcr) → via2d_update_pcr (via2d.ts:339-347).
+    fn undump_pcr(&mut self, ctx: &mut ViaContext, byte: u8) {
+        if !self.has_image {
+            return;
+        }
+        let drv = &mut *self.drive;
+        let bra = drv.byte_ready_active;
+        drv.rotate_disk(ctx.clk);
+        // dptr.read_write_mode = pcrval & 0x20 (TRX64 bool: bit5 set ⇒ read).
+        drv.read_write_mode = (byte & 0x20) != 0;
+        // byte_ready_active = (bra & ~BRA_BYTE_READY) | (pcrval & BRA_BYTE_READY).
+        drv.byte_ready_active = (bra & !BRA_BYTE_READY) | (byte & BRA_BYTE_READY);
+    }
+
     // PORT OF: via2d.ts:563-576 (read_pra)
     fn read_pra(&mut self, ctx: &ViaContext, _addr: usize) -> Option<u8> {
         if !self.has_image {
@@ -2034,6 +2363,32 @@ impl<'a> ViaBackend for Via1dBackend<'a> {
     fn store_sr(&mut self, _ctx: &mut ViaContext, _byte: u8) {}
     // PORT OF: via1d1541.ts:669-671 (store_t2l — static, empty).
     fn store_t2l(&mut self, _ctx: &mut ViaContext, _byte: u8) {}
+
+    // PORT OF: via1d1541.ts:537-572 (undump_prb — static). Identical to store_prb's
+    // iecbus fold but WITHOUT the `byte != p_oldpb` change gate (VICE undump always
+    // folds). iecbus is never null in the 1541 shape. undump_pra/undump_pcr/
+    // undump_acr are empty for VIA1 (trait defaults).
+    fn undump_prb(&mut self, _ctx: &mut ViaContext, byte: u8) {
+        let slot = self.number + 8;
+        // VICE:194 — *drive_data = ~byte;
+        self.iecbus.drv_data[slot] = (!byte) & 0xff;
+        // VICE:195-197 — drv_bus[slot] composite.
+        let dd = self.iecbus.drv_data[slot] as u32;
+        let cpu_bus = self.iecbus.cpu_bus as u32;
+        self.iecbus.drv_bus[slot] =
+            (((dd << 3) & 0x40) | ((dd << 6) & (((!dd) ^ cpu_bus) << 3) & 0x80)) as u8;
+        // VICE:199 — iecbus->cpu_port = iecbus->cpu_bus;
+        self.iecbus.cpu_port = self.iecbus.cpu_bus & 0xff;
+        // VICE:200-202 — AND-reduce drv_bus over units 4..(8+NUM_DISK_UNITS-1).
+        for unit in 4..(8 + IEC_NUM_DISK_UNITS) {
+            self.iecbus.cpu_port = (self.iecbus.cpu_port & self.iecbus.drv_bus[unit]) & 0xff;
+        }
+        // VICE:204-206 — drv_port composite.
+        let cp = self.iecbus.cpu_port as u32;
+        let cb = self.iecbus.cpu_bus as u32;
+        self.iecbus.drv_port =
+            (((cp >> 4) & 0x4) | (cp >> 7) | ((cb << 3) & 0x80)) as u8;
+    }
 
     // PORT OF: via1d1541.ts:687-735 (read_pra — static).
     fn read_pra(&mut self, ctx: &ViaContext, _addr: usize) -> Option<u8> {
