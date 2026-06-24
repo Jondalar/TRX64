@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "snapshot-drive-blob (cp.drive1541 VICE drive snapshot module)",
+  "current_item": "snapshot-drive-blob",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -56,12 +56,17 @@
     "snapshot-c64re-container"
   ],
   "note": ".c64re container DONE (ADR-078): cross-runtime proven both ways for the full C64 state (TRX64<->c64re), 173 tests, byte-exact. REMAINING: cp.drive1541 blob (DRIVE/DRIVECPU/VIA1/VIA2/GCRIMAGE ~1.6 KLOC on vice_snapshot_stream.rs foundation) for cross-runtime drive resume. Then: checkpoint-ring, recorder/scenario, audio/media/batch, flash-write, drive-write, integration.",
-  "updated": "2026-06-24T18:15:15Z",
+  "updated": "2026-06-24T18:15:42Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "snapshot-drive-blob",
+    "model": "opus",
+    "started": "2026-06-24T18:15:42Z",
+    "note": "Port cp.drive1541 = the VICE drive snapshot-module blob (DRIVE/DRIVECPU/VIA1/VIA2/GCRIMAGE) on the vice_snapshot_stream.rs foundation, mapping Drive1541/Rotation/ViaContext/DriveCore6510 state. Wire capture drive1541 arg + undump drive restore. Cross-runtime drive resume vs c64re. Additive (no logic change), byte-exact gates guard. Completes the .c64re to 100% (C64 + drive)."
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
