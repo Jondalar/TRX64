@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "seven-game-gate",
+  "current_item": "g64-mounting",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -42,12 +42,16 @@
     "scramble-sprites"
   ],
   "note": "SCRAMBLE DONE (ADR-062): custom $DD00 loader loads+runs+renders the clean title (96.64% pixel, sprites fixed via VIC-bank-base). The acid test passes. NEXT (user plan): seven-game-gate (run the 7 games through TRX64, diverse .g64/GCR/half-track loaders), then Rust-vs-TS perf compare.",
-  "updated": "2026-06-24T08:25:46Z",
+  "updated": "2026-06-24T08:28:10Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "g64-mounting",
+    "model": "opus",
+    "started": "2026-06-24T08:28:10Z"
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
