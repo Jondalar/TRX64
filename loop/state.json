@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "vic-inspect-engine",
+  "current_item": "ws-notifications-tail",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -59,20 +59,16 @@
     "flash-cart-writable",
     "drive-write-back",
     "recorder-scenario",
-    "audio-media-batch"
+    "audio-media-batch",
+    "vic-inspect-engine"
   ],
-  "note": "audio/media/batch DONE (ADR-084): 9 methods full parity, 255 tests. Broadcast push (audio/flush+batch/progress+debug/breakpoint_hit) = small follow-up on the hub. NEXT: vic-inspect-engine = the 6 deferred vic/inspect methods (open/at/region/at_capture/origin/promote) + the node/origin/evidence engine (buildVicInspectSnapshot/resolveVisibleNodeAt/resolveVisualOrigin/assembleInspectEvidence) on the checkpoint ring. Then checkpoint/thumbnails, broadcast-push, integration.",
-  "updated": "2026-06-24T20:21:09Z",
+  "note": "vic-inspect merged+done (ADR-085, vic/inspect 9/9). maniac char-select confirmed (user, 600M). NEXT: ws-notifications-tail (broadcast-push + checkpoint/thumbnails), then integration.",
+  "updated": "2026-06-24T20:50:12Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": {
-    "item": "vic-inspect-engine",
-    "model": "opus",
-    "started": "2026-06-24T20:06:00Z",
-    "note": "in_flight omitted at dispatch last tick - corrected. Builder a62901f running, reading c64re vic-inspect engine source (no commits yet ~15min = read phase for the semantic node/origin engine)."
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
