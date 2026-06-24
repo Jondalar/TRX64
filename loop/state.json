@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "snapshot-vsf (.c64re cross-runtime snapshot codec)",
+  "current_item": "snapshot-vsf",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -54,12 +54,17 @@
     "protocol-surface-b2"
   ],
   "note": "held-key DONE (ADR-074): key_down/up/release_keys/input_status, additive byte-exact, 150 tests. NEXT: snapshot-vsf = port c64re snapshot codec so TRX64 reads/writes c64re-compatible snapshots (TRX64 vsf is its own format; cross-runtime .c64re exchange needs the codec). Foundational for the checkpoint-ring next.",
-  "updated": "2026-06-24T16:47:48Z",
+  "updated": "2026-06-24T16:48:16Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "snapshot-vsf",
+    "model": "opus",
+    "started": "2026-06-24T16:48:16Z",
+    "note": "Port c64re VSF codec (vsf/vsf-format.ts + vice-vsf-load.ts + per-chip module serializers + drive-vsf) so TRX64 reads/writes VICE-VSF-compatible snapshots that round-trip cross-runtime with c64re. TRX64 vsf is currently its own format. Map TRX64 state <-> the VSF modules (C64MEM/CPU/CIA1/CIA2/VICII/SID/1541). Additive - byte-exact run unchanged."
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
