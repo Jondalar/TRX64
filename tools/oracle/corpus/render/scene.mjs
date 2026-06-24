@@ -110,15 +110,17 @@ const FRAME_CYCLES = 19656;
 
 // Apply a scene's setup. `kind` = "ts" | "trx64".
 //
-// The TS oracle screenshot reflects the LAST per-cycle-rendered frame, so after
-// programming the VIC via `wr io` we must run ≥1 full frame for its literal port
-// to re-render with the new register state — but a free CPU run after boot would
-// also blink the cursor + let the KERNAL touch state, desyncing from TRX64. To
-// keep the frame deterministic we run the VIC ON A HALTED CPU: point the PC at a
-// JMP-self ($60 RTS would unwind; we inject `4C xx xx`) so cycles elapse, the VIC
-// renders, but no KERNAL code runs. TRX64's renderer reads the registers directly
-// and needs no run — and its flat injected bus has no ROM — so for TRX64 we skip
-// the run entirely and screenshot the state-rendered frame.
+// Both renderers reflect the LAST per-cycle-rendered frame, so after programming
+// the VIC via `wr io` we must run ≥1 full frame for the per-cycle pixel pipeline
+// to re-render with the new register state. A free CPU run after boot would blink
+// the cursor + let the KERNAL touch state, so we run the VIC ON A HALTED CPU:
+// point the PC at a JMP-self (`4C xx xx`) in free low RAM so cycles elapse, the
+// VIC sweeps a full frame and accumulates the displayed image, but no KERNAL code
+// runs. This is now done IDENTICALLY on both daemons: TRX64's renderer is the
+// VERBATIM per-cycle draw (vic_draw.rs), which — exactly like the TS literal port
+// — only reflects a register change after the raster sweeps the frame. (Before
+// the per-cycle port TRX64 used a static state-render that read registers directly
+// and could skip the run; that path is gone.)
 export async function applyScene(ws, sid, scene, kind) {
   for (const cmd of scene.setup ?? []) {
     await rpc(ws, "monitor/exec", { session_id: sid, command: cmd });
@@ -130,9 +132,11 @@ export async function applyScene(ws, sid, scene, kind) {
     await rpc(ws, "session/run", { session_id: sid, cycles: scene.runCycles ?? FRAME_CYCLES });
     return;
   }
-  if (scene.setup && scene.setup.length && kind === "ts") {
+  if (scene.setup && scene.setup.length) {
     // Park the CPU on a JMP-self in low RAM so frames elapse without KERNAL code
-    // mutating the screen / cursor. $033C cassette buffer is free here.
+    // mutating the screen / cursor. $033C cassette buffer is free here. Run on
+    // BOTH daemons so each per-cycle renderer sweeps the new register state.
+    void kind;
     await rpc(ws, "monitor/exec", { session_id: sid, command: "wr 033c 4c 3c 03" });
     await rpc(ws, "monitor/exec", { session_id: sid, command: "r pc=033c" });
     await rpc(ws, "session/run", { session_id: sid, cycles: scene.runCycles ?? FRAME_CYCLES * 2 });
