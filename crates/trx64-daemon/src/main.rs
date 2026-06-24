@@ -2579,7 +2579,11 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         }
 
         "media/persist" => {
-            let st = state.lock().unwrap();
+            let mut st = state.lock().unwrap();
+            // Flush any in-flight drive write (dirty GCR track) back into
+            // disk.bytes before persisting — 1:1 with VICE flushing
+            // drive_gcr_data_writeback_all before reading fsimage->fd.
+            st.session.machine.drive8.flush_disk_writeback();
             let result = match st.session.machine.drive8.get_attached_disk() {
                 None => {
                     Ok(json!({ "written": false, "reason": "no backing path or not mounted" }))
@@ -2665,6 +2669,9 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 "eventCount": 0,
                 "bytesWritten": 0
             });
+            // Flush any in-flight drive write so the echoed media SHA reflects
+            // the current image bytes (VICE flushes before reading fsimage->fd).
+            st.session.machine.drive8.flush_disk_writeback();
             if let Some(disk) = st.session.machine.drive8.get_attached_disk() {
                 let sha = sha256_hex(&disk.bytes);
                 run["media"] = json!({ "sha256": sha });
@@ -3005,6 +3012,10 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 None => return Response::err(id, -32602, "snapshot/dump: path required"),
             };
             let mut st = state.lock().unwrap();
+            // Flush any in-flight drive write into disk.bytes so the embedded
+            // media + its SHA in the checkpoint reflect the current image
+            // (VICE flushes drive_gcr_data_writeback_all before snapshotting).
+            st.session.machine.drive8.flush_disk_writeback();
             // Disk path/format for the checkpoint `media` metadata.
             let (disk_path, disk_format) = match st.session.machine.drive8.get_attached_disk() {
                 Some(d) => (

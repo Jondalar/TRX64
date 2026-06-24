@@ -26,10 +26,19 @@ pub const CBMDOS_FDC_ERR_SYNC: u8 = 3;
 pub const CBMDOS_FDC_ERR_NOBLOCK: u8 = 4;
 pub const CBMDOS_FDC_ERR_DCHECK: u8 = 5;
 pub const CBMDOS_FDC_ERR_ID: u8 = 11;
+pub const CBMDOS_FDC_ERR_DRIVE: u8 = 15;
 
 // ── GCR conversion table (gcr.ts:61-66): 4-bit nybble → 5-bit GCR ───────────
 const GCR_CONV_DATA: [u8; 16] = [
     0x0a, 0x0b, 0x12, 0x13, 0x0e, 0x0f, 0x16, 0x17, 0x09, 0x19, 0x1a, 0x1b, 0x0d, 0x1d, 0x1e, 0x15,
+];
+
+/// PORT OF: gcr.ts:70-75 (gcr.c:59-65 From_GCR_conv_data) — 5-bit GCR → 4-bit
+/// nybble (0 = invalid). The inverse of [`GCR_CONV_DATA`], used by the
+/// GCR-decode-on-write (D64 writeback) path.
+const FROM_GCR_CONV_DATA: [u8; 32] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 1, 0, 12, 4, 5, 0, 0, 2, 3, 0, 15, 6, 7, 0, 9, 10, 11, 0, 13,
+    14, 0,
 ];
 
 /// GCR header descriptor (gcr_header_t): the (sector, track, id) tuple encoded
@@ -382,6 +391,453 @@ impl GcrImage {
 
         GcrImage { tracks }
     }
+
+    /// Disk image kind for the write-back dispatch (G64 vs D64). Mirrors VICE
+    /// `image->type` (the only two formats TRX64 mounts).
+    ///
+    /// Serialize the dirty half-track `half_track` (2..=84) back into the raw
+    /// on-disk image `bytes`. 1:1 port of VICE `disk_image_write_half_track`
+    /// (driveimage.ts:228-240) — dispatch on the image type:
+    ///   * G64 → [`write_gcr_half_track`] (fsimage_gcr_write_half_track)
+    ///   * D64 → [`write_dxx_half_track`]  (fsimage_dxx_write_half_track)
+    ///
+    /// `read_only` mirrors `image->read_only`; a read-only image rejects the
+    /// write (returns `-1`), exactly as VICE. Returns 0 on success, -1 on error.
+    pub fn write_half_track(
+        &self,
+        kind: WritebackKind,
+        bytes: &mut Vec<u8>,
+        half_track: usize,
+        read_only: bool,
+    ) -> i32 {
+        let idx = half_track.wrapping_sub(2);
+        let raw = match self.tracks.get(idx) {
+            Some(t) => t,
+            None => return -1,
+        };
+        match kind {
+            WritebackKind::G64 => write_gcr_half_track(bytes, half_track, raw, read_only),
+            WritebackKind::D64 => write_dxx_half_track(bytes, half_track, raw, read_only),
+        }
+    }
+}
+
+/// Image format for the GCR write-back dispatch (= VICE `image->type` subset).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WritebackKind {
+    D64,
+    G64,
+}
+
+// ── GCR decode codec (the GCR→4-byte / sector-decode half of gcr.ts) ─────────
+//
+// PORT OF: vice/src/gcr.c decode path via the TS oracle `gcr.ts`
+// (gcr_convert_GCR_to_4bytes / gcr_find_sync / gcr_decode_block /
+// gcr_find_sector_header / gcr_read_sector). This is the inverse of
+// `gcr_convert_sector_to_gcr` above and is consumed by the D64 write-back
+// (`fsimage_dxx_write_half_track`) to turn a written GCR track back into the
+// 256-byte D64 sectors.
+
+/// gcr_convert_GCR_to_4bytes (gcr.ts:104-125 / gcr.c:87-110): 5 GCR bytes →
+/// 4 raw bytes, written to `dest[dest_off..dest_off+4]`.
+fn gcr_convert_gcr_to_4bytes(source: &[u8], source_off: usize, dest: &mut [u8], dest_off: usize) {
+    // at least 24 bits for shifting into bits 16..20
+    let mut tdest: u32 = source[source_off] as u32;
+    tdest <<= 13;
+    let mut s = source_off;
+    let mut d = dest_off;
+    let mut i = 5;
+    while i < 13 {
+        s += 1;
+        tdest |= (source[s] as u32) << i;
+        // "tdest >> 16" could be optimized to a word-aligned access
+        dest[d] = (FROM_GCR_CONV_DATA[((tdest >> 16) & 0x1f) as usize] << 4) & 0xff;
+        tdest <<= 5;
+        dest[d] |= FROM_GCR_CONV_DATA[((tdest >> 16) & 0x1f) as usize];
+        tdest <<= 5;
+        i += 2;
+        d += 1;
+    }
+}
+
+/// gcr_find_sync (gcr.ts:201-230 / gcr.c:170-203): scan the raw track for a
+/// SYNC mark (>=10 consecutive 1-bits), starting from bit position `p`, looking
+/// at most `s` bits. Returns the bit position of the byte after the sync, or
+/// `-CBMDOS_FDC_ERR_SYNC` if none found.
+fn gcr_find_sync(raw: &GcrTrack, mut p: i64, mut s: i64) -> i64 {
+    if raw.data.is_empty() || raw.size == 0 {
+        return -(CBMDOS_FDC_ERR_SYNC as i64);
+    }
+    let data = &raw.data;
+    let mut w: u32 = 0;
+    let mut b: u32 = ((data[(p >> 3) as usize] as u32) << (p & 7)) & 0xffff;
+    while {
+        let cond = s > 0;
+        s -= 1;
+        cond
+    } {
+        if b & 0x80 != 0 {
+            w = ((w << 1) | 1) & 0xffff;
+        } else if (!w) & 0x3ff != 0 {
+            w = (w << 1) & 0xffff;
+        } else {
+            return p;
+        }
+        if (!p) & 7 != 0 {
+            p += 1;
+            b = (b << 1) & 0xffff;
+        } else {
+            p += 1;
+            if p >= (raw.size as i64) * 8 {
+                p = 0;
+            }
+            b = data[(p >> 3) as usize] as u32;
+        }
+    }
+    -(CBMDOS_FDC_ERR_SYNC as i64)
+}
+
+/// gcr_decode_block (gcr.ts:233-264 / gcr.c:205-232): read `num` GCR groups
+/// (5 bytes each) starting at bit position `p`, decode to `num*4` raw bytes in
+/// `buf`.
+fn gcr_decode_block(raw: &GcrTrack, p: i64, buf: &mut [u8], num: usize) {
+    if raw.data.is_empty() {
+        return;
+    }
+    let data = &raw.data;
+    let end = raw.size;
+    let shift = (p & 7) as u32;
+    let mut offset = (p >> 3) as usize;
+    let mut gcr = [0u8; 5];
+    let mut b: u32 = ((data[offset] as u32) << shift) & 0xffff;
+    let mut buf_off = 0usize;
+    for _ in 0..num {
+        // get 5 bytes of gcr data
+        for j in 0..5 {
+            offset += 1;
+            if offset >= end {
+                offset = 0;
+            }
+            if shift != 0 {
+                gcr[j] = (b | (((data[offset] as u32) << shift) >> 8)) as u8;
+                b = ((data[offset] as u32) << shift) & 0xffff;
+            } else {
+                gcr[j] = (b & 0xff) as u8;
+                b = data[offset] as u32;
+            }
+        }
+        gcr_convert_gcr_to_4bytes(&gcr, 0, buf, buf_off);
+        buf_off += 4;
+    }
+}
+
+/// gcr_find_sector_header (gcr.ts:267-289 / gcr.c:234-261): find the header
+/// block of `sector`. Returns the bit position of the header, or a negative
+/// CBMDOS error code.
+fn gcr_find_sector_header(raw: &GcrTrack, sector: u8) -> i64 {
+    let mut header = [0u8; 4];
+    let mut p: i64 = 0;
+    let mut p2: i64 = -(CBMDOS_FDC_ERR_SYNC as i64);
+    loop {
+        p = gcr_find_sync(raw, p, (raw.size as i64) * 8);
+        if p2 == p {
+            break;
+        }
+        if p2 < 0 {
+            p2 = p;
+        }
+        gcr_decode_block(raw, p, &mut header, 1);
+        if header[0] == 0x08 && header[2] == sector {
+            // Track, checksum or ID's are not checked here.
+            return p;
+        }
+    }
+    if p2 < 0 {
+        return p2;
+    }
+    -(CBMDOS_FDC_ERR_HEADER as i64)
+}
+
+/// gcr_read_sector (gcr.ts:292-325 / gcr.c:263-292): decode `sector` from the
+/// raw GCR track into the 256-byte `data`. Returns CBMDOS_FDC_ERR_OK,
+/// CBMDOS_FDC_ERR_NOBLOCK, CBMDOS_FDC_ERR_DCHECK, or a header/sync error.
+pub fn gcr_read_sector(raw: &GcrTrack, data: &mut [u8], sector: u8) -> u8 {
+    let mut buffer = [0u8; 260];
+
+    let mut p = gcr_find_sector_header(raw, sector);
+    if p < 0 {
+        return (-p) as u8;
+    }
+
+    p = gcr_find_sync(raw, p, 500 * 8);
+    if p < 0 {
+        return (-p) as u8;
+    }
+
+    gcr_decode_block(raw, p, &mut buffer, 65);
+
+    let mut b = buffer[257];
+    for i in 0..256 {
+        data[i] = buffer[i + 1];
+        b ^= data[i];
+    }
+
+    if buffer[0] != 0x07 {
+        return CBMDOS_FDC_ERR_NOBLOCK;
+    }
+
+    if b != 0 {
+        CBMDOS_FDC_ERR_DCHECK
+    } else {
+        CBMDOS_FDC_ERR_OK
+    }
+}
+
+/// gcr_write_sector (gcr.ts:328-393 / gcr.c:294-346): GCR-encode the 256-byte
+/// `data` into the raw GCR track `raw` at `sector`'s data block (the inverse of
+/// [`gcr_read_sector`]). Used both for c64re fidelity and to inject a sector
+/// write into a GCR track at the data-block level (the same bytes the rotation
+/// engine's bit-level `write_next_bit` produces over a full DOS write).
+pub fn gcr_write_sector(raw: &mut GcrTrack, data: &[u8], sector: u8) -> u8 {
+    if raw.data.is_empty() {
+        return CBMDOS_FDC_ERR_DRIVE;
+    }
+    let mut buffer = [0u8; 260];
+    let mut gcr = [0u8; 5];
+
+    let mut p = gcr_find_sector_header(raw, sector);
+    if p < 0 {
+        return (-p) as u8;
+    }
+
+    p = gcr_find_sync(raw, p, 500 * 8);
+    if p < 0 {
+        return (-p) as u8;
+    }
+
+    let shift = (p & 7) as u32;
+    let mut offset = (p >> 3) as usize;
+    let end = raw.size;
+    let rdata = &mut raw.data;
+
+    let mut b: u32 = (rdata[offset] as u32) & (((0xff00u32 >> shift) & 0xff) as u32);
+
+    buffer[0] = 0x07;
+    buffer[1..257].copy_from_slice(&data[..256]);
+    let mut chksum = buffer[1];
+    for i in 2..257 {
+        chksum ^= buffer[i];
+    }
+    buffer[257] = chksum;
+    buffer[258] = 0;
+    buffer[259] = 0;
+
+    let mut buf = 0usize;
+    for _ in 0..65 {
+        gcr_convert_4bytes_to_gcr(&buffer, buf, &mut gcr, 0);
+        buf += 4;
+        for j in 0..5 {
+            if shift != 0 {
+                rdata[offset] = (b | ((gcr[j] as u32) >> shift)) as u8;
+                b = (((gcr[j] as u32) << 8) >> shift) & 0xff;
+            } else {
+                rdata[offset] = gcr[j];
+            }
+            offset += 1;
+            if offset >= end {
+                offset = 0;
+            }
+        }
+    }
+    rdata[offset] = (b | ((rdata[offset] as u32) & (((0xffu32 >> shift) & 0xff) as u32))) as u8;
+
+    CBMDOS_FDC_ERR_OK
+}
+
+// ── GCR write-back: dirty half-track → raw on-disk image bytes ───────────────
+
+/// PORT OF: fsimage_gcr.ts:441-538 (fsimage_gcr_write_half_track,
+/// vice/src/diskimage/fsimage-gcr.c:185-277). Serialize a dirty GCR half-track
+/// back into the raw `.g64` image `bytes`. Reads the track-offset-table entry
+/// for `half_track`; for an `offset == 0` (no-data) entry the image is extended
+/// at EOF and both the offset table and the speed-zone table are patched. The
+/// 2-byte length, the raw GCR data, and the `max_track_length - size` zero
+/// padding are written, exactly mirroring VICE's `fwrite` sequence.
+///
+/// `read_only` mirrors `image->read_only`. Returns 0 on success, -1 on error.
+fn write_gcr_half_track(bytes: &mut Vec<u8>, half_track: usize, raw: &GcrTrack, read_only: bool) -> i32 {
+    let mut extend = 0;
+    let mut buf = [0u8; 4];
+
+    // Read the header fields the writeback needs (offset-table entry,
+    // max_track_length, num_half_tracks) through an immutable view, then drop
+    // it so `bytes` can be borrowed mutably for the writes below.
+    let mut max_track_length: u16 = 0;
+    let (offset_i, num_half_tracks) = {
+        let g64 = G64Image { fd: bytes.as_slice() };
+        // ts:457 — fsimage_gcr_seek_half_track(...).
+        let o = fsimage_gcr_seek_half_track(&g64, half_track, &mut max_track_length);
+        // We need num_half_tracks for the speed-table patch (the seek helper in
+        // this port returns only the offset). Re-read header byte-9 (matches the
+        // `num_half_tracks` out-param VICE's seek fills).
+        (o, g64_num_half_tracks(&g64))
+    };
+    if offset_i < 0 {
+        return -1;
+    }
+
+    // ts:461-464 — read-only rejection.
+    if read_only {
+        return -1;
+    }
+
+    // ts:466-469 — track too long for image.
+    if raw.size > max_track_length as usize {
+        return -1;
+    }
+
+    let mut offset = offset_i as usize;
+    if offset_i == 0 {
+        // ts:471-484 — extend at EOF.
+        offset = bytes.len();
+        extend = 1;
+    }
+
+    // raw.data is never null in this port (Vec); mirror `raw->data != NULL`.
+    // ts:486-487 — 2-byte LE length.
+    util_word_to_le_buf(&mut buf, (raw.size & 0xffff) as u16);
+    if util_fpwrite(bytes, &buf[..2], offset) < 0 {
+        return -1;
+    }
+
+    // ts:499-503 — write the raw GCR data right after the length.
+    if util_fpwrite(bytes, &raw.data[..raw.size], offset + 2) < 0 {
+        return -1;
+    }
+
+    // ts:504-514 — zero-pad the gap up to max_track_length.
+    let gap = max_track_length as i64 - raw.size as i64;
+    if gap > 0 {
+        let padding = vec![0u8; gap as usize];
+        if util_fpwrite(bytes, &padding, offset + 2 + raw.size) < 0 {
+            return -1;
+        }
+    }
+
+    if extend != 0 {
+        // ts:516-528 — patch the offset table + speed-zone table.
+        util_dword_to_le_buf(&mut buf, offset as u32);
+        if util_fpwrite(bytes, &buf, 12 + (half_track - 2) * 4) < 0 {
+            return -1;
+        }
+
+        let speed = disk_image_speed_map_g64((half_track >> 1) as u32) as u32;
+        util_dword_to_le_buf(&mut buf, speed);
+        if util_fpwrite(bytes, &buf, 12 + (half_track - 2 + num_half_tracks) * 4) < 0 {
+            return -1;
+        }
+    }
+
+    // ts:531-535 — fflush (no-op) + hostFlush (the daemon writes `bytes` to the
+    // host file at media/persist).
+    0
+}
+
+/// PORT OF: fsimage_dxx.ts:342-430 (fsimage_dxx_write_half_track,
+/// vice/src/diskimage/fsimage-dxx.c:47-147) for the D64 path. GCR-decode every
+/// sector of the written track via [`gcr_read_sector`] and write the 256-byte
+/// sectors back into the raw `.d64` image `bytes` at the linear sector offset.
+///
+/// The per-sector error-info map (`fsimage.error_info`) is OUT OF SCOPE for a
+/// plain D64 (TRX64 mounts 174848-byte D64s with no error map); VICE only
+/// touches it when `error_info.map != NULL`, which is never the case here, so
+/// the error-map branches are correctly skipped (they are no-ops for a
+/// map-less image, matching VICE's `if (fsimage->error_info.map ...)` guards).
+///
+/// `read_only` mirrors `image->read_only` (rejects the write). The track
+/// `half_track/2` must be in range [1,35]; out-of-range returns -1. Returns 0
+/// on success, -1 on error.
+fn write_dxx_half_track(bytes: &mut [u8], half_track: usize, raw: &GcrTrack, read_only: bool) -> i32 {
+    if read_only {
+        return -1;
+    }
+    let track = (half_track / 2) as u8;
+
+    // disk_image_sector_per_track / disk_image_check_sector (D64).
+    if track < 1 || track > D64_TRACKS {
+        return -1;
+    }
+    let max_sector = d64_sectors_per_track(track);
+    let sectors = match d64_linear_sector(track, 0) {
+        Some(s) => s,
+        None => return -1,
+    };
+
+    // ts:374-399 — decode each sector via gcr_read_sector into a track buffer.
+    let mut buffer = vec![0u8; max_sector as usize * 256];
+    for sector in 0..max_sector {
+        let mut tmp = [0u8; 256];
+        // rf is computed (and would feed the error map) but a map-less plain D64
+        // ignores it — the decoded bytes are always written, matching VICE.
+        let _rf = gcr_read_sector(raw, &mut tmp, sector);
+        let base = sector as usize * 256;
+        buffer[base..base + 256].copy_from_slice(&tmp);
+    }
+
+    // ts:400-406 — write the whole track at the linear sector offset.
+    let offset = sectors * 256;
+    if util_fpwrite_slice(bytes, &buffer, offset) < 0 {
+        return -1;
+    }
+    // ts:407-424 — error-info map writeback skipped (map is null for plain D64).
+    // ts:425-428 — fflush (no-op) + hostFlush (daemon writes at media/persist).
+    0
+}
+
+/// PORT OF: util.c (util_word_to_le_buf) — 16-bit LE store into `buf[0..2]`.
+#[inline]
+fn util_word_to_le_buf(buf: &mut [u8], value: u16) {
+    buf[0] = (value & 0xff) as u8;
+    buf[1] = ((value >> 8) & 0xff) as u8;
+}
+
+/// PORT OF: util.c (util_dword_to_le_buf) — 32-bit LE store into `buf[0..4]`.
+#[inline]
+fn util_dword_to_le_buf(buf: &mut [u8], value: u32) {
+    buf[0] = (value & 0xff) as u8;
+    buf[1] = ((value >> 8) & 0xff) as u8;
+    buf[2] = ((value >> 16) & 0xff) as u8;
+    buf[3] = ((value >> 24) & 0xff) as u8;
+}
+
+/// PORT OF: fsimage_gcr.ts:132-143 / fsimage_dxx.ts:308-312 (util_fpwrite) —
+/// pwrite(2)-style positional write. Returns 0 on success, -1 if the range is
+/// out of bounds. NOTE: unlike the TS in-memory `util_fpwrite` (which
+/// auto-grows the backing for the G64 EXTEND path), the D64 path never extends
+/// (the 174848-byte image already covers all 35 tracks); the G64 EXTEND path
+/// auto-grows the `Vec` here when `offset+size` exceeds the current length.
+#[inline]
+fn util_fpwrite(fd: &mut Vec<u8>, buf: &[u8], offset: usize) -> i32 {
+    let end = offset + buf.len();
+    if end > fd.len() {
+        fd.resize(end, 0);
+    }
+    fd[offset..end].copy_from_slice(buf);
+    0
+}
+
+/// Non-extending positional write into a fixed-size slice (the D64 path — the
+/// image already covers all sectors, so VICE's `util_fpwrite` bounds-check
+/// `offset+size > fd.length` returning -1 applies). Returns 0 on success, -1
+/// if out of bounds.
+#[inline]
+fn util_fpwrite_slice(fd: &mut [u8], buf: &[u8], offset: usize) -> i32 {
+    let end = offset + buf.len();
+    if end > fd.len() {
+        return -1;
+    }
+    fd[offset..end].copy_from_slice(buf);
+    0
 }
 
 // ── G64 image (GCR-1541) loading — 1:1 port of fsimage_gcr.ts ────────────────
@@ -848,5 +1304,258 @@ mod tests {
             }
         }
         best
+    }
+
+    // ── GCR decode + write-back round-trip ───────────────────────────────────
+
+    /// A fully synthetic 35-track D64 with distinct per-sector content so a
+    /// round-trip can be byte-checked. Sector (t,s) byte i = (t ^ s ^ i) & 0xff
+    /// (with a sane BAM disk ID at T18 S0 so from_d64 reads it).
+    fn synthetic_d64() -> Vec<u8> {
+        let mut d = vec![0u8; 683 * 256];
+        for track in 1..=D64_TRACKS {
+            for sector in 0..d64_sectors_per_track(track) {
+                let lin = d64_linear_sector(track, sector).unwrap();
+                let off = lin * 256;
+                for i in 0..256 {
+                    d[off + i] = (track ^ sector ^ (i as u8)) & 0xff;
+                }
+            }
+        }
+        // Disk ID at T18 S0 0xA2/0xA3 (so from_d64's header IDs are stable).
+        let bam = d64_linear_sector(18, 0).unwrap() * 256;
+        d[bam + BAM_ID_1541] = 0x41;
+        d[bam + BAM_ID_1541 + 1] = 0x42;
+        d
+    }
+
+    /// The GCR codec must round-trip every sector of a D64: encode (from_d64) →
+    /// gcr_read_sector → original 256-byte sectors, byte-exact, with no DCHECK.
+    #[test]
+    fn gcr_decode_round_trips_all_d64_sectors() {
+        let d64 = synthetic_d64();
+        let img = GcrImage::from_d64(&d64);
+        for track in 1..=D64_TRACKS {
+            let slot = (track as usize) * 2 - 2;
+            let raw = &img.tracks[slot];
+            for sector in 0..d64_sectors_per_track(track) {
+                let mut decoded = [0u8; 256];
+                let rf = gcr_read_sector(raw, &mut decoded, sector);
+                assert_eq!(
+                    rf, CBMDOS_FDC_ERR_OK,
+                    "T{track} S{sector} must decode OK (rf={rf})"
+                );
+                let lin = d64_linear_sector(track, sector).unwrap();
+                let off = lin * 256;
+                assert_eq!(
+                    &decoded[..],
+                    &d64[off..off + 256],
+                    "T{track} S{sector} round-trip mismatch"
+                );
+            }
+        }
+    }
+
+    /// D64 write-back: inject a new sector into a GCR track via gcr_write_sector
+    /// (the data-block-level equivalent of the rotation engine's bit writes),
+    /// then write_dxx_half_track → the .d64 image bytes carry the new sector.
+    #[test]
+    fn d64_write_back_round_trips_a_sector() {
+        let d64 = synthetic_d64();
+        let mut img = GcrImage::from_d64(&d64);
+        let mut bytes = d64.clone();
+
+        // Write a brand-new payload into T20 S5.
+        let track: u8 = 20;
+        let sector: u8 = 5;
+        let new_sector: Vec<u8> = (0..256).map(|i| (0xC0u16.wrapping_add(i as u16)) as u8).collect();
+
+        let slot = (track as usize) * 2 - 2;
+        // Inject the write into the in-memory GCR track (= what the rotation
+        // engine produces over a DOS write of this sector).
+        let rf = gcr_write_sector(&mut img.tracks[slot], &new_sector, sector);
+        assert_eq!(rf, CBMDOS_FDC_ERR_OK, "gcr_write_sector OK");
+
+        // Serialize the dirty track back into the .d64 image bytes.
+        let half_track = (track as usize) * 2;
+        let res = img.write_half_track(WritebackKind::D64, &mut bytes, half_track, false);
+        assert_eq!(res, 0, "write_half_track OK");
+
+        // The image bytes now carry the new sector at its linear offset.
+        let lin = d64_linear_sector(track, sector).unwrap();
+        let off = lin * 256;
+        assert_eq!(&bytes[off..off + 256], &new_sector[..], "written sector persisted");
+
+        // Every OTHER sector on that track must be UNCHANGED (the writeback
+        // re-encodes the whole track from the decoded GCR — so they must
+        // decode back to the original D64 content).
+        for s in 0..d64_sectors_per_track(track) {
+            if s == sector {
+                continue;
+            }
+            let lin = d64_linear_sector(track, s).unwrap();
+            let off = lin * 256;
+            assert_eq!(
+                &bytes[off..off + 256],
+                &d64[off..off + 256],
+                "T{track} S{s} must be untouched by the writeback"
+            );
+        }
+
+        // Re-parse the mutated image and confirm the new sector decodes back.
+        let img2 = GcrImage::from_d64(&bytes);
+        let mut decoded = [0u8; 256];
+        let rf2 = gcr_read_sector(&img2.tracks[slot], &mut decoded, sector);
+        assert_eq!(rf2, CBMDOS_FDC_ERR_OK);
+        assert_eq!(&decoded[..], &new_sector[..], "re-read after re-mount round-trips");
+
+        // A read-only image must REJECT the write.
+        let mut ro_bytes = d64.clone();
+        assert_eq!(
+            img.write_half_track(WritebackKind::D64, &mut ro_bytes, half_track, true),
+            -1,
+            "read-only rejects writeback"
+        );
+        assert_eq!(ro_bytes, d64, "read-only image untouched");
+    }
+
+    /// G64 write-back: build a real .g64 (from a D64), mutate a populated track's
+    /// GCR bytes, write_half_track → the .g64 byte image (offset table + 2-byte
+    /// length + data) carries the mutation; a re-parse (from_g64) matches.
+    #[test]
+    fn g64_write_back_round_trips_a_track() {
+        // Build a minimal but valid .g64 from a synthetic D64: header + offset
+        // table + speed table + the per-track (len, data) blocks.
+        let d64 = synthetic_d64();
+        let gimg = GcrImage::from_d64(&d64);
+
+        let num_half_tracks: u8 = 84;
+        let max_track_length: u16 = 7928;
+        let mut g64: Vec<u8> = Vec::new();
+        g64.extend_from_slice(&GCR_IMAGE_HEADER_EXPECTED_1541);
+        g64.push(num_half_tracks);
+        g64.extend_from_slice(&max_track_length.to_le_bytes());
+
+        // Reserve the offset table (84 × u32) + speed table (84 × u32).
+        let table_start = g64.len();
+        g64.resize(table_start + (num_half_tracks as usize) * 4 * 2, 0);
+
+        // Lay out each half-track's data block: 2-byte len + max_track_length
+        // bytes (VICE pads to max_track_length). Patch the offset + speed tables.
+        for ht in 0..num_half_tracks as usize {
+            let raw = &gimg.tracks[ht];
+            if raw.size == 0 {
+                continue;
+            }
+            let data_off = g64.len() as u32;
+            // offset-table entry ht.
+            let ote = table_start + ht * 4;
+            g64[ote..ote + 4].copy_from_slice(&data_off.to_le_bytes());
+            // speed-table entry ht.
+            let ste = table_start + (num_half_tracks as usize) * 4 + ht * 4;
+            let speed = disk_image_speed_map_g64((ht >> 1) as u32) as u32;
+            g64[ste..ste + 4].copy_from_slice(&speed.to_le_bytes());
+            // 2-byte length + data padded to max_track_length.
+            g64.extend_from_slice(&(raw.size as u16).to_le_bytes());
+            g64.extend_from_slice(&raw.data[..raw.size]);
+            let pad = max_track_length as usize - raw.size;
+            g64.extend(std::iter::repeat(0u8).take(pad));
+        }
+
+        // Sanity: the .g64 parses, track 1 (slot 0) is populated.
+        let parsed = GcrImage::from_g64(&g64);
+        assert!(parsed.tracks[0].size > 6000);
+        // The parsed track must byte-match the source GCR (no corruption).
+        assert_eq!(parsed.tracks[0].data[..parsed.tracks[0].size], gimg.tracks[0].data[..gimg.tracks[0].size]);
+
+        // Mutate track 1 (slot 0) in the working GCR image: flip the first 16
+        // data bytes (NOT the offset-table — a raw GCR byte mutation, which is
+        // what the rotation engine does at the bit level).
+        let mut img = GcrImage::from_g64(&g64);
+        let slot = 0usize; // half-track 2 / track 1
+        for i in 0..16 {
+            img.tracks[slot].data[i] ^= 0xa5;
+        }
+
+        // Write the dirty half-track back into the .g64 image bytes.
+        let mut bytes = g64.clone();
+        let half_track = slot + 2; // = 2
+        let res = img.write_half_track(WritebackKind::G64, &mut bytes, half_track, false);
+        assert_eq!(res, 0, "G64 write_half_track OK");
+
+        // The .g64 byte image changed only within track 1's data block, and a
+        // re-parse must reflect the mutation byte-for-byte.
+        let img2 = GcrImage::from_g64(&bytes);
+        assert_eq!(
+            img2.tracks[slot].data[..img2.tracks[slot].size],
+            img.tracks[slot].data[..img.tracks[slot].size],
+            "re-parsed G64 track matches the written track"
+        );
+        // And it must DIFFER from the original (the mutation actually landed).
+        assert_ne!(
+            &img2.tracks[slot].data[..16],
+            &parsed.tracks[slot].data[..16],
+            "the mutated bytes persisted"
+        );
+
+        // Read-only rejects.
+        let mut ro = g64.clone();
+        assert_eq!(
+            img.write_half_track(WritebackKind::G64, &mut ro, half_track, true),
+            -1
+        );
+        assert_eq!(ro, g64, "read-only G64 untouched");
+    }
+
+    /// G64 EXTEND path: writing a half-track whose offset-table entry is 0
+    /// (no data block yet) appends a new block at EOF and patches the offset +
+    /// speed tables. A re-parse then finds the formerly-empty track populated.
+    #[test]
+    fn g64_write_back_extends_empty_track() {
+        // A minimal .g64: 4 half-tracks, only slot 0 populated, slots 1..3 empty
+        // (offset-table entries 0). Mirror the existing synthetic-header test.
+        let num_half_tracks: u8 = 4;
+        let max_track_length: u16 = 7928;
+        let data_off: u32 = 44; // 12 + 16 + 16
+        let track0_len: u16 = 32;
+        let track0: Vec<u8> = (0..track0_len as u8).map(|b| b ^ 0x3c).collect();
+
+        let mut g64: Vec<u8> = Vec::new();
+        g64.extend_from_slice(&GCR_IMAGE_HEADER_EXPECTED_1541);
+        g64.push(num_half_tracks);
+        g64.extend_from_slice(&max_track_length.to_le_bytes());
+        g64.extend_from_slice(&data_off.to_le_bytes()); // slot 0 offset
+        g64.extend_from_slice(&0u32.to_le_bytes()); // slot 1 empty
+        g64.extend_from_slice(&0u32.to_le_bytes()); // slot 2 empty
+        g64.extend_from_slice(&0u32.to_le_bytes()); // slot 3 empty
+        for _ in 0..4 {
+            g64.extend_from_slice(&3u32.to_le_bytes()); // speed table
+        }
+        g64.extend_from_slice(&track0_len.to_le_bytes());
+        g64.extend_from_slice(&track0);
+
+        // Now write slot 1 (half-track 3, offset-table entry 1, currently 0).
+        let mut img = GcrImage::from_g64(&g64);
+        // Put a distinctive payload into slot 1 (it parsed as 0x55-filled empty).
+        let new_len = 64usize;
+        img.tracks[1].size = new_len;
+        img.tracks[1].data = (0..new_len as u8).map(|b| b.wrapping_mul(7)).collect();
+
+        let mut bytes = g64.clone();
+        let before_len = bytes.len();
+        let res = img.write_half_track(WritebackKind::G64, &mut bytes, 3, false);
+        assert_eq!(res, 0, "extend write OK");
+        assert!(bytes.len() > before_len, "image extended at EOF");
+
+        // Offset-table entry 1 now points at the appended block.
+        let ote1 = util_le_buf_to_dword(&bytes, 12 + 1 * 4) as usize;
+        assert_eq!(ote1, before_len, "offset table entry 1 = old EOF");
+        // The 2-byte length at that offset = new_len.
+        assert_eq!(util_le_buf_to_word(&bytes, ote1), new_len as u16);
+
+        // Re-parse: slot 1 is now populated with the new payload.
+        let img2 = GcrImage::from_g64(&bytes);
+        assert_eq!(img2.tracks[1].size, new_len);
+        assert_eq!(img2.tracks[1].data, img.tracks[1].data, "extended track round-trips");
     }
 }

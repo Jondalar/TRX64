@@ -36,7 +36,7 @@
 #![allow(clippy::manual_clamp)]
 #![allow(clippy::doc_lazy_continuation)]
 
-use crate::gcr::{GcrImage, GcrTrack, DRIVE_HALFTRACKS_1541};
+use crate::gcr::{GcrImage, GcrTrack, WritebackKind, DRIVE_HALFTRACKS_1541};
 
 // =============================================================================
 // SECTION 1 — header constants (NL-4)
@@ -183,6 +183,21 @@ pub struct Rotation {
     /// drivetypes.ts:603/606 — `image`/`gcr` (= the encoded per-track GCR data).
     /// Models `dptr.gcr` (non-null ⇒ a GCR image attached). `None` = no disk.
     pub image: Option<GcrImage>,
+
+    // ── write-back target (the raw on-disk image bytes) ──────────────────────
+    /// The raw `.g64`/`.d64` image bytes the dirty GCR track is serialized back
+    /// into (= VICE `fsimage->fd`). Mirrors `DiskImage.bytes`; populated at
+    /// [`attach`]. `None` ⇒ no write-back target (the in-memory GCR is the only
+    /// copy, e.g. a snapshot-restored disk before its bytes are wired).
+    pub writeback_bytes: Option<Vec<u8>>,
+    /// Image format for the write-back dispatch (G64 byte serialization vs D64
+    /// sector decode). `None` when `writeback_bytes` is `None`.
+    pub writeback_kind: Option<WritebackKind>,
+    /// The half-track currently marked dirty by [`write_next_bit`] — the head
+    /// position at the time of the write. The flush ([`drive_gcr_data_writeback`])
+    /// serializes THIS half-track (= VICE `drive_gcr_data_writeback` flushing
+    /// `current_half_track` at the moment the head is about to move).
+    pub dirty_half_track: u32,
 }
 
 impl Default for Rotation {
@@ -245,6 +260,9 @@ impl Rotation {
             wobble_amplitude: 0.0,
             read_only: 0,
             image: None,
+            writeback_bytes: None,
+            writeback_kind: None,
+            dirty_half_track: 0,
         }
     }
 
@@ -317,6 +335,11 @@ impl Rotation {
             return;
         }
         self.gcr_dirty_track = 1;
+        // Record WHICH half-track was dirtied so the flush
+        // (`drive_gcr_data_writeback`) serializes the right one. VICE keeps this
+        // implicit via `current_half_track`; we snapshot it here because a write
+        // at the head edge can straddle a step.
+        self.dirty_half_track = self.current_half_track;
         if let Some(trk) = self
             .image
             .as_mut()
@@ -889,11 +912,65 @@ impl Rotation {
     }
 
     /// PORT OF: drive.ts:1231-1242 (drive.c:739-747 drive_move_head). Step the
-    /// head by ±1/±2 half-tracks (writeback + sound hooks are no-ops headless).
+    /// head by ±1/±2 half-tracks. VICE calls `drive_gcr_data_writeback(drive)`
+    /// BEFORE stepping (drive.ts:1235) so any dirty track at the current head
+    /// position is flushed to the image before the head leaves it — we do the
+    /// same here. (`drive_sound_head` is a no-op headless.)
     pub fn move_head(&mut self, step: i32) {
-        // drive_gcr_data_writeback / drive_sound_head — no-ops headless.
+        self.drive_gcr_data_writeback();
         let new = (self.current_half_track as i32 + step).max(2) as u32;
         self.set_half_track(new);
+    }
+
+    /// PORT OF: drive.ts:1253-1367 (drive.c:749-847 drive_gcr_data_writeback) for
+    /// the single-side 1541 G64/D64 path. If the current track is dirty,
+    /// serialize it back into the raw on-disk image bytes via
+    /// [`GcrImage::write_half_track`] and clear the dirty flag.
+    ///
+    /// VICE always writes the requested track for GCR images (no extend needed);
+    /// for D64 it writes the in-range track. TRX64 only mounts 35-track D64s and
+    /// fully-populated G64s, so the extend/ask-dialog branches (D71/D81 doubled
+    /// sides, beyond-image track extension) are never reached and are omitted —
+    /// the requested-track write is the live path. Returns whether a flush ran.
+    pub fn drive_gcr_data_writeback(&mut self) -> bool {
+        // drive.c:759 — `if (drive->image == NULL) return;`
+        if self.image.is_none() {
+            return false;
+        }
+        // drive.c:780 — `if (!drive->GCR_dirty_track) return;`
+        if self.gcr_dirty_track == 0 {
+            return false;
+        }
+
+        // The half-track to flush. VICE uses `current_half_track + side*tmp`;
+        // side is 0 for the 1541, so it is `current_half_track`. We use the
+        // recorded `dirty_half_track` (the head position at write time) which
+        // equals `current_half_track` here (the flush precedes the step).
+        let half_track = self.dirty_half_track as usize;
+
+        // Always clear the dirty flag (matches every VICE return path).
+        self.gcr_dirty_track = 0;
+
+        let (bytes, kind, read_only) = match (
+            self.writeback_bytes.as_mut(),
+            self.writeback_kind,
+        ) {
+            (Some(b), Some(k)) => (b, k, self.read_only != 0),
+            // No write-back target wired (e.g. snapshot-restored disk). The
+            // in-memory GCR already carries the write; nothing to serialize.
+            _ => return false,
+        };
+
+        let image = self.image.as_ref().expect("image present (checked above)");
+        image.write_half_track(kind, bytes, half_track, read_only);
+        true
+    }
+
+    /// Flush ALL pending dirty tracks (= VICE `drive_gcr_data_writeback_all`,
+    /// drive.c:849-870, called at snapshot/detach/exit). For the single 1541
+    /// here there is at most one dirty track, so this is `drive_gcr_data_writeback`.
+    pub fn drive_gcr_data_writeback_all(&mut self) -> bool {
+        self.drive_gcr_data_writeback()
     }
 
     // =========================================================================
@@ -903,11 +980,40 @@ impl Rotation {
     /// Attach a GCR-encoded disk and park the head at track 18 (half-track 36),
     /// selecting that track's GCR buffer. Sets the attach-settle window.
     /// (= driveimage.ts disk_image_attach → drive_set_half_track + attach_clk.)
+    ///
+    /// `writeback` carries the raw on-disk image bytes + format the dirty GCR
+    /// track is serialized back into on a head move / detach / explicit flush
+    /// (= VICE `fsimage->fd` + `image->type`). `None` ⇒ no write-back target
+    /// (the GCR image is the only copy, e.g. a snapshot-restored disk).
     pub fn attach(&mut self, image: GcrImage, clk: u64) {
+        self.attach_with_writeback(image, clk, None);
+    }
+
+    /// [`attach`] with an explicit write-back target (`bytes`, `kind`, `read_only`).
+    /// [`attach`]: Rotation::attach
+    pub fn attach_with_writeback(
+        &mut self,
+        image: GcrImage,
+        clk: u64,
+        writeback: Option<(Vec<u8>, WritebackKind, bool)>,
+    ) {
         self.image = Some(image);
         self.gcr_image_loaded = 1;
         self.gcr_current_track_size = 0;
         self.gcr_head_offset = 0;
+        match writeback {
+            Some((bytes, kind, read_only)) => {
+                self.writeback_bytes = Some(bytes);
+                self.writeback_kind = Some(kind);
+                self.read_only = read_only as i32;
+            }
+            None => {
+                self.writeback_bytes = None;
+                self.writeback_kind = None;
+            }
+        }
+        self.gcr_dirty_track = 0;
+        self.dirty_half_track = 0;
         // Force track (re)selection at the current half-track.
         let ht = self.current_half_track;
         self.current_half_track = 0; // force the != check in set_half_track
@@ -916,12 +1022,36 @@ impl Rotation {
         self.rotation_last_clk = clk;
     }
 
-    /// Detach the disk.
+    /// Detach the disk. VICE's `drive_image_detach` flushes any dirty track
+    /// (`drive_gcr_data_writeback`) BEFORE releasing the GCR buffer
+    /// (driveimage.ts disk_image_detach), so an eject persists a pending write.
     pub fn detach(&mut self) {
+        self.drive_gcr_data_writeback();
         self.image = None;
         self.gcr_image_loaded = 0;
         self.gcr_current_track_size = 0;
         self.gcr_head_offset = 0;
+        self.writeback_bytes = None;
+        self.writeback_kind = None;
+        self.gcr_dirty_track = 0;
+        self.dirty_half_track = 0;
+    }
+
+    /// Take the (possibly mutated) raw on-disk image bytes out for the daemon to
+    /// persist / hash / snapshot. Flushes any pending dirty track first
+    /// (= VICE `drive_gcr_data_writeback_all` before reading `fsimage->fd`), then
+    /// returns a clone of the current image bytes (the write-back target stays
+    /// installed so subsequent writes keep accumulating).
+    pub fn writeback_bytes_synced(&mut self) -> Option<Vec<u8>> {
+        self.drive_gcr_data_writeback_all();
+        self.writeback_bytes.clone()
+    }
+
+    /// True if there is a dirty GCR track pending flush (a write occurred since
+    /// the last writeback).
+    #[inline]
+    pub fn has_dirty_track(&self) -> bool {
+        self.gcr_dirty_track != 0
     }
 
     /// VIA2 PRA pin input = the current `GCR_read` byte (via2d read_pra). The
@@ -1048,5 +1178,130 @@ mod tests {
         // module-doc comment was wrong; the helper itself returned 1_000_000).
         let r = Rotation::new();
         assert_eq!(r.rpmscale(), 1_000_000);
+    }
+
+    // ── write-back wiring ────────────────────────────────────────────────────
+
+    /// A 35-track D64 with distinct per-sector content (so a write-back can be
+    /// byte-checked after re-mount).
+    fn synthetic_d64() -> Vec<u8> {
+        use crate::gcr::{d64_linear_sector, d64_sectors_per_track, D64_TRACKS};
+        let mut d = vec![0u8; 683 * 256];
+        for track in 1..=D64_TRACKS {
+            for sector in 0..d64_sectors_per_track(track) {
+                let off = d64_linear_sector(track, sector).unwrap() * 256;
+                for i in 0..256 {
+                    d[off + i] = (track ^ sector ^ (i as u8)) & 0xff;
+                }
+            }
+        }
+        d
+    }
+
+    /// A bit-level write through the rotation engine sets `gcr_dirty_track`, and
+    /// `drive_gcr_data_writeback` then serializes the dirty half-track back into
+    /// the write-back image bytes — i.e. a drive write persists.
+    #[test]
+    fn rotation_write_marks_dirty_and_writeback_persists() {
+        let d64 = synthetic_d64();
+        let img = GcrImage::from_d64(&d64);
+        let mut r = Rotation::new();
+        r.attach_with_writeback(
+            img,
+            0,
+            Some((d64.clone(), WritebackKind::D64, false)),
+        );
+        r.attach_clk = 0; // settled
+
+        // Nothing dirty yet.
+        assert!(!r.has_dirty_track());
+        assert!(!r.drive_gcr_data_writeback(), "no flush when clean");
+
+        // Drive a single bit-level write at the current head (track 18). This is
+        // exactly what the WRITE-path of the rotation engine calls.
+        r.write_next_bit(1);
+        assert!(r.has_dirty_track(), "write_next_bit set GCR_dirty_track");
+        assert_eq!(r.dirty_half_track, 36, "dirtied the current half-track (T18)");
+
+        // The flush serializes the dirty track and clears the flag.
+        assert!(r.drive_gcr_data_writeback(), "flush ran");
+        assert!(!r.has_dirty_track(), "dirty cleared after flush");
+
+        // The write-back bytes are still a valid 174848-byte D64 (the writeback
+        // re-encoded T18 from its GCR — a single flipped bit may corrupt one
+        // T18 sector's GCR framing, but the image size + all OTHER tracks are
+        // intact, which is the persistence contract we assert here).
+        let bytes = r.writeback_bytes.as_ref().unwrap();
+        assert_eq!(bytes.len(), d64.len(), "image size preserved");
+        // Track 1 (untouched) must be byte-identical to the source.
+        let t1_off = 0;
+        assert_eq!(&bytes[t1_off..t1_off + 256 * 21], &d64[t1_off..t1_off + 256 * 21]);
+    }
+
+    /// A full sector write injected into the GCR track persists round-trip
+    /// through the rotation write-back into the .d64 image and back out on
+    /// re-mount (the behavioral "a sector write reaches the image" proof).
+    #[test]
+    fn rotation_sector_write_round_trips_through_writeback() {
+        use crate::gcr::{d64_linear_sector, gcr_read_sector, gcr_write_sector, CBMDOS_FDC_ERR_OK};
+        let d64 = synthetic_d64();
+        let mut img = GcrImage::from_d64(&d64);
+
+        // New payload for T18 S3 (T18 is the head-parked track).
+        let track: u8 = 18;
+        let sector: u8 = 3;
+        let slot = (track as usize) * 2 - 2;
+        let new_sector: Vec<u8> = (0..256).map(|i| (0x80u16 + i as u16) as u8).collect();
+        assert_eq!(gcr_write_sector(&mut img.tracks[slot], &new_sector, sector), CBMDOS_FDC_ERR_OK);
+
+        let mut r = Rotation::new();
+        r.attach_with_writeback(img, 0, Some((d64.clone(), WritebackKind::D64, false)));
+        r.attach_clk = 0;
+        // Mark dirty as the engine would, at the head (T18 = half-track 36).
+        r.gcr_dirty_track = 1;
+        r.dirty_half_track = 36;
+
+        // Flush + take the synced bytes.
+        let bytes = r.writeback_bytes_synced().expect("writeback bytes");
+        let off = d64_linear_sector(track, sector).unwrap() * 256;
+        assert_eq!(&bytes[off..off + 256], &new_sector[..], "sector write reached the .d64");
+
+        // Re-mount the mutated image → the new sector decodes back.
+        let img2 = GcrImage::from_d64(&bytes);
+        let mut decoded = [0u8; 256];
+        assert_eq!(gcr_read_sector(&img2.tracks[slot], &mut decoded, sector), CBMDOS_FDC_ERR_OK);
+        assert_eq!(&decoded[..], &new_sector[..], "round-trips after re-mount");
+    }
+
+    /// Detach flushes a pending dirty track before releasing the GCR buffer.
+    #[test]
+    fn detach_flushes_pending_write() {
+        let d64 = synthetic_d64();
+        let img = GcrImage::from_d64(&d64);
+        let mut r = Rotation::new();
+        r.attach_with_writeback(img, 0, Some((d64.clone(), WritebackKind::D64, false)));
+        r.attach_clk = 0;
+        r.write_next_bit(0);
+        assert!(r.has_dirty_track());
+        // Detach must flush (clear dirty) before tearing the image down.
+        r.detach();
+        assert!(!r.has_dirty_track(), "detach flushed the dirty track");
+        assert!(r.image.is_none());
+        assert!(r.writeback_bytes.is_none());
+    }
+
+    /// A read-only mount rejects the write-back (the image bytes are untouched).
+    #[test]
+    fn read_only_mount_rejects_writeback() {
+        let d64 = synthetic_d64();
+        let img = GcrImage::from_d64(&d64);
+        let mut r = Rotation::new();
+        r.attach_with_writeback(img, 0, Some((d64.clone(), WritebackKind::D64, true)));
+        r.attach_clk = 0;
+        r.write_next_bit(1);
+        assert!(r.has_dirty_track());
+        r.drive_gcr_data_writeback();
+        // Read-only → write_dxx_half_track returned -1, bytes unchanged.
+        assert_eq!(r.writeback_bytes.as_ref().unwrap(), &d64, "read-only image untouched");
     }
 }
