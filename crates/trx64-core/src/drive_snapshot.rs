@@ -74,11 +74,11 @@ const DRIVE_TYPE_1541: u32 = 1541;
 /// module). The c64re facade reports `MachineVideoStandard = MACHINE_SYNC_PAL = 0`.
 const MACHINE_SYNC_PAL: u32 = 0;
 
-/// GCRIMAGE half-track index offset between VICE (`gcr->tracks[half_track]`,
-/// half-track-indexed, slots 0/1 unused) and TRX64 (`image.tracks[half_track-2]`,
-/// 0-based slot). VICE writes 140 entries `tracks[0..140]`; TRX64 slot `i` = VICE
-/// `tracks[i+2]`.
-const GCR_TRACK_VICE_OFFSET: u32 = 2;
+// GCRIMAGE track indexing: the on-wire entry index IS the 0-based slot index, the
+// SAME in TRX64 and c64re (both store `tracks[slot]` = data for half-track slot+2;
+// c64re fsimage_gcr.ts:314 read_half_track(half_track+2, tracks[half_track])). The
+// c64re drive_snapshot_write_gcrimage_module writes `drive.gcr.tracks[i]` directly
+// — so there is NO half-track offset in the wire format (entry i ↔ tracks[i]).
 
 // =============================================================================
 // drive1541 blob — drive_snapshot_write_module(s, 0, 0) equivalent
@@ -529,15 +529,18 @@ pub fn capture_drive_disk_image(drive: &Drive1541) -> Option<Vec<u8>> {
 
     s.smw_dw(&mut m, num_half_tracks);
 
+    // The on-wire track index IS the 0-based slot index — IDENTICAL in TRX64 and
+    // c64re. Both store `tracks[slot]` = the data for actual half-track `slot + 2`
+    // (TRX64 from_d64 `half_track = track*2-2`; c64re fsimage_gcr.ts:314
+    // `read_half_track(half_track + 2, tracks[half_track])`). The c64re
+    // drive_snapshot_write_gcrimage_module writes `drive.gcr.tracks[i]` directly,
+    // so snapshot entry `i` ↔ TRX64 `image.tracks[i]` with NO offset.
     for i in 0..num_half_tracks {
-        // VICE tracks[i] → TRX64 image.tracks[i - 2]; i in {0,1} = empty.
-        let slot = (i as i64) - (GCR_TRACK_VICE_OFFSET as i64);
-        let trk = if slot >= 0 {
-            img.tracks.get(slot as usize)
-        } else {
-            None
-        };
-        match trk.filter(|t| t.size > 0 && !t.data.is_empty()) {
+        match img
+            .tracks
+            .get(i as usize)
+            .filter(|t| t.size > 0 && !t.data.is_empty())
+        {
             Some(t) => {
                 let track_size = t.size as u32;
                 s.smw_dw(&mut m, track_size);
@@ -575,16 +578,17 @@ pub fn restore_drive_disk_image(drive: &mut Drive1541, blob: &[u8]) -> Result<()
         return Err("drive_snapshot: GCRIMAGE0 num_half_tracks too large".into());
     }
 
-    // Ensure the rotation has a GCR image to overlay onto.
+    // Ensure the rotation has a GCR image to overlay onto. The on-wire track index
+    // IS the 0-based slot index (no offset — see capture_drive_disk_image): entry
+    // `i` ↔ `image.tracks[i]`. Grow the slot vector to cover the written range.
     let img = drive
         .rotation
         .image
         .get_or_insert_with(|| GcrImage { tracks: Vec::new() });
-    // Grow the slot vector to cover the VICE index space we will write.
-    let needed = num_half_tracks.saturating_sub(GCR_TRACK_VICE_OFFSET) as usize;
-    if img.tracks.len() < needed {
-        img.tracks
-            .resize_with(needed, || crate::gcr::GcrTrack { data: Vec::new(), size: 0 });
+    if img.tracks.len() < num_half_tracks as usize {
+        img.tracks.resize_with(num_half_tracks as usize, || {
+            crate::gcr::GcrTrack { data: Vec::new(), size: 0 }
+        });
     }
 
     for i in 0..num_half_tracks {
@@ -594,23 +598,18 @@ pub fn restore_drive_disk_image(drive: &mut Drive1541, blob: &[u8]) -> Result<()
         if track_size > NUM_MAX_MEM_BYTES_TRACK {
             return Err("drive_snapshot: GCRIMAGE0 track_size too large".into());
         }
-        let slot = (i as i64) - (GCR_TRACK_VICE_OFFSET as i64);
         if track_size > 0 {
             let mut data = vec![0u8; track_size as usize];
             if !s.smr_ba(&mut data, track_size as usize) {
                 return Err("drive_snapshot: GCRIMAGE0 truncated (track data)".into());
             }
-            if slot >= 0 {
-                if let Some(t) = img.tracks.get_mut(slot as usize) {
-                    t.data = data;
-                    t.size = track_size as usize;
-                }
+            if let Some(t) = img.tracks.get_mut(i as usize) {
+                t.data = data;
+                t.size = track_size as usize;
             }
-        } else if slot >= 0 {
-            if let Some(t) = img.tracks.get_mut(slot as usize) {
-                t.data = Vec::new();
-                t.size = 0;
-            }
+        } else if let Some(t) = img.tracks.get_mut(i as usize) {
+            t.data = Vec::new();
+            t.size = 0;
         }
     }
     s.module_close(&m);
