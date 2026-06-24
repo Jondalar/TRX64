@@ -746,3 +746,9 @@ regs). 173 tests, byte-exact green. Remaining: cp.drive1541 blob (snapshot-drive
 drive_snapshot.rs (DRIVE8/DRIVECPU0/VIA/GCRIMAGE) + viacore_snapshot. Cross-runtime drive-resume proven both
 ways vs c64re (mid-load survives, load continues). .c64re is now 100% (C64+drive portable TS<->Rust). 176
 tests, byte-exact green. Next: checkpoint-ring.
+
+## 2026-06-24 — DRIVER: checkpoint-ring 705.B (ADR-080) + parallelization started
+
+checkpoint_ring.rs 1:1 RuntimeCheckpointRing, checkpoint/* 6/7 + vic/inspect 3/9, rewind proven, cross-runtime
+shapes match, 189 tests. Deferred: vic-inspect-engine + thumbnails. PARALLEL worktrees: flash-cart-writable +
+drive-write-back running. Next main-tree: recorder/scenario.

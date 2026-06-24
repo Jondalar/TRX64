@@ -1260,3 +1260,18 @@ mid-load round-trips: no jamming. 176 tests pass, byte-exact GREEN (the 1 iso-vi
 existing, byte-identical on base). => .c64re IS 100% COMPLETE (the user's runtime snapshot format, portable
 TS<->Rust for the full machine incl drive). NEXT: checkpoint-ring (705.B rewind ring + 7 checkpoint/* methods +
 granular vic/inspect, built on the now-complete RuntimeCheckpoint).
+
+## ADR-080 — checkpoint-ring (705.B): rewind ring + checkpoint/* 6/7 + vic/inspect 3/9; cross-runtime shapes match
+checkpoint_ring.rs = 1:1 RuntimeCheckpointRing (runtime-checkpoint-ring.ts): RuntimeCheckpointRef{id=cp_{frame}_
+{seq},frame,cycles,pinned,byteSize,createdAtMs}, capacity slotCount=floor(budget/SLOT_BYTES=0x10000) default
+~512, oldest-unpinned-first eviction, capture/pin/unpin/truncateAfter(Spec761)/restore/get/list/clear/stats, the
+SHA-256 content-addressed disk-image pool (Spec 714.4) + a TRX64-private _ringDriveDiskBytes slot. Stores the
+checkpoint serde_json Value per entry (Rust analog; no V8-GC-slab needed) but reproduces the observable policy
+(byteSize formula, capacity, eviction, stats). Reuses capture/restore_runtime_checkpoint (ADR-078/079).
+DAEMON: checkpoint/* 6 of 7 (list/capture/pin/unpin/clear/restore 1:1; thumbnails deferred=filmstrip render).
+vic/inspect/* 3 of 9 (provenance/close/evidence 1:1; open/at/region/at_capture/origin/promote need the unported
+vic-inspect node/origin/evidence engine = next primitive). REWIND proven (capture->mutate->restore = PC/RAM
+exact; N=5 out-of-order each matches). CROSS-RUNTIME wire shapes match c64re BYTE-FOR-BYTE (capture ref/stats,
+list, restore state[8 keys], pin/unpin, provenance, close, evidence, clear). 189 tests, byte-exact GREEN,
+additive. DEFERRED follow-ups: vic-inspect-engine (6 methods), checkpoint/thumbnails. NEXT: recorder/scenario
+(unblocked).
