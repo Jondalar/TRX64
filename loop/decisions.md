@@ -1302,3 +1302,17 @@ G64 write-back + EXTEND (formerly-empty track), read-only rejected; rotation bit
 -> writeback persists. 184 tests, drive/disk byte-exact gates GREEN (seven_game_gate + scramble + gcr_d64_parity
 incl). Merged to main CLEAN (no conflicts — auto-merged with checkpoint-ring's disjoint drive.rs/rotation.rs
 parts). Only recorder/scenario remains in flight.
+
+## ADR-083 — recorder + scenario-player: recorder/* 6 + runtime/scenario_* 5 (parallelization tail)
+1:1 port of c64re recorder (anchor-codec/record/store, recorder-ring, medium-source, runtime-recorder = Spec
+766) + scenario-player (Spec 107/231/268) into crates/trx64-core/src/recorder/ + scenario_player.rs. The TS
+worker-thread + SharedArrayBuffer/seqlock is a V8/thread detail (BUG-049) — TRX64's single-threaded daemon
+ports the OBSERVABLE contract over plain structures (same as checkpoint_ring.rs). WS: recorder/status|list|dump
+(c64re-exact) + start|stop|capture (TRX64-additive, the daemon has no 0.5s autocapture timer) ; runtime/scenario_
+list|save|delete|load|run (c64re-exact). scenario_run = deterministic replay (restore start snapshot -> feed
+inputs at cycles -> run budget -> hash end RAM). DETERMINISM proven: record->seek-via-anchor lands at that
+anchor's exact RAM+cycle; record->replay byte-identical RAM; scenario_run same end-RAM hash across runs. 225
+tests pass, byte-exact GREEN. Deferred: cart medium gen-gate (disk wired; cart ready once the facade lands),
+joystick scenario inputs (no joystick model). PARALLELIZATION COMPLETE: flash + drive + recorder all merged
+clean (file-disjoint via worktrees); main tree restored to main. Remaining sequential tail: audio/media/batch
+WS, vic-inspect-engine (6 methods), checkpoint/thumbnails, integration.

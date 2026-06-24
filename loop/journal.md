@@ -752,3 +752,8 @@ tests, byte-exact green. Next: checkpoint-ring.
 checkpoint_ring.rs 1:1 RuntimeCheckpointRing, checkpoint/* 6/7 + vic/inspect 3/9, rewind proven, cross-runtime
 shapes match, 189 tests. Deferred: vic-inspect-engine + thumbnails. PARALLEL worktrees: flash-cart-writable +
 drive-write-back running. Next main-tree: recorder/scenario.
+
+## 2026-06-24 — DRIVER: recorder/scenario (ADR-083) + parallelization complete
+
+recorder/* 6 + scenario_* 5, determinism proven, 225 tests. PARALLELIZATION (flash+drive+recorder) all merged
+clean via worktrees; main tree restored to main. 51 done. Next sequential: audio/media/batch WS.

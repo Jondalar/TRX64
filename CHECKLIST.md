@@ -21,10 +21,10 @@ Stand: 47 done, ~278 commits. Legend: ✅ done · 🔄 in progress · ⬜ open
 - [x] Snapshots: VSF byte-parity (beide Richtungen) + Real-VICE .vsf lesen
 - [x] **.c64re Runtime-Snapshot — 100% cross-runtime (C64 + Drive, TS↔Rust beide Richtungen)**
 - [x] **checkpoint-ring** (ring + checkpoint/* 6/7 + vic/inspect 3/9) (705.B) — Rewind-Ring + 7 `checkpoint/*`-Methoden + granular `vic/inspect/*`  ← läuft
-- [ ] 🔄 recorder/* + runtime/scenario_* WS  (baut auf checkpoint-ring)
-- [ ] audio/* + media/events|recent + batch/* WS  (mechanisch)
-- [ ] 🔄 **Flash-Cart writable** — Flash040 + EAPI + m93c86 + EasyFlash/GMOD/MegaCart  (~1.5 KLOC, groß)
-- [ ] 🔄 **Drive write-back** — .g64/.d64 schreiben (fsimage_gcr_write_half_track)
+- [x] recorder/* (6) + runtime/scenario_* (5) WS  (baut auf checkpoint-ring)
+- [ ] 🔄 audio/* + media/events|recent + batch/* WS  (mechanisch)
+- [x] **Flash-Cart writable** (Flash040+M93C86, EasyFlash/GMOD2 booten) — Flash040 + EAPI + m93c86 + EasyFlash/GMOD/MegaCart  (~1.5 KLOC, groß)
+- [x] **Drive write-back** (.g64/.d64 persist, D64+G64 round-trip) — .g64/.d64 schreiben (fsimage_gcr_write_half_track)
 - [ ] integration — breiter PRG-Corpus end-to-end Validierung
 
 ## Grob
