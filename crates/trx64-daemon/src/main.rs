@@ -29,6 +29,7 @@ use trx64_session::{Session, TraceState};
 use trx64_trace::{FrameSink, TraceChannels, TracingObserver};
 
 mod observers;
+mod streaming;
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -3102,6 +3103,27 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: SharedSta
     eprintln!("[trx64] client connected: {addr}");
     let (mut tx, mut rx) = ws.split();
 
+    // All outbound messages (JSON-RPC responses AND the live A/V binary push) funnel
+    // through ONE channel → a single writer task drains it to the socket. This lets
+    // the streaming loop (on its own OS thread) and the request loop both write
+    // without contending for `tx`. ws-av-tap is read-only, so without the streaming
+    // loop it would receive nothing; we auto-start the push on connect (the daemon
+    // is the producer — c64re relied on the browser sending debug/run + audio/start).
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+
+    // Writer task: pump the channel to the socket.
+    let writer = tokio::spawn(async move {
+        while let Some(msg) = out_rx.recv().await {
+            if tx.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Auto-start the live A/V stream for this client (held until disconnect). The
+    // handle owns the streaming thread; dropping it on return signals stop + joins.
+    let _stream = streaming::spawn_stream(Arc::clone(&state), out_tx.clone());
+
     while let Some(msg) = rx.next().await {
         let msg = match msg {
             Ok(m) => m,
@@ -3114,7 +3136,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: SharedSta
         let text = match msg {
             Message::Text(t) => t.to_string(),
             Message::Ping(data) => {
-                let _ = tx.send(Message::Pong(data)).await;
+                let _ = out_tx.send(Message::Pong(data));
                 continue;
             }
             Message::Close(_) => break,
@@ -3134,11 +3156,15 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: SharedSta
             format!(r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32603,"message":"Internal serialization error: {e}"}}}}"#)
         });
 
-        if let Err(e) = tx.send(Message::Text(out.into())).await {
-            eprintln!("[trx64] send error to {addr}: {e}");
+        if out_tx.send(Message::Text(out.into())).is_err() {
             break;
         }
     }
+
+    // Drop the stream handle (stop + join the loop) and tear down the writer.
+    drop(_stream);
+    drop(out_tx);
+    writer.abort();
 
     eprintln!("[trx64] client disconnected: {addr}");
 }

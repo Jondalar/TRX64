@@ -882,6 +882,16 @@ impl Machine {
         render::index_buffer_to_canvas_rgba(&self.vic.displayed[..])
     }
 
+    /// Render the displayed frame as raw 4-bit COLOUR INDICES (384×272, one byte
+    /// per pixel, each `& 0x0f`) — the `fmt 1` palette-indexed live-stream source.
+    /// Same per-cycle `displayed` buffer + same crop as [`render_canvas_rgba`],
+    /// but un-palettized (the consumer applies [`render::COLODORE`]). Used by the
+    /// daemon's live A/V WS push (ADR-073); additive, no byte-exact path touched.
+    /// Returns (width, height, indices).
+    pub fn render_canvas_indices(&self) -> (usize, usize, Vec<u8>) {
+        render::index_buffer_to_canvas_indices(&self.vic.displayed[..])
+    }
+
     /// Compute the $D01E (sprite-sprite) / $D01F (sprite-background) collision
     /// registers for the current frozen display and merge them into the VIC,
     /// firing the collision IRQ on the 0→nonzero edge (verbatim VICE

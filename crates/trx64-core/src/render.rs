@@ -694,6 +694,31 @@ pub fn index_buffer_to_canvas_rgba(fb: &[u8]) -> (usize, usize, Vec<u8>) {
     (CANVAS_W, CANVAS_H, rgba)
 }
 
+/// Crop the internal index buffer to the VICE PAL screenshot canvas and return
+/// the raw 4-bit COLOUR INDICES (one byte per pixel, each masked `& 0x0f`) —
+/// NOT palettized. This is the `fmt 1` (palette-indexed) live-stream source: it
+/// matches the TS oracle's `renderLiteralPortIndexed` crop exactly (same origin
+/// (CANVAS_X0, CANVAS_Y0), same 384×272 window, same `& 0x0f`). The 48-byte RGB
+/// palette to pair with it is [`COLODORE`] serialized R,G,B in index order.
+/// Returns (width, height, indices).
+pub fn index_buffer_to_canvas_indices(fb: &[u8]) -> (usize, usize, Vec<u8>) {
+    let mut idx = vec![0u8; CANVAS_W * CANVAS_H];
+    for cy in 0..CANVAS_H {
+        let sy = cy + CANVAS_Y0;
+        if sy >= FB_H {
+            continue;
+        }
+        for cx in 0..CANVAS_W {
+            let sx = cx + CANVAS_X0;
+            if sx >= FB_W {
+                continue;
+            }
+            idx[cy * CANVAS_W + cx] = fb[sy * FB_W + sx] & 0x0f;
+        }
+    }
+    (CANVAS_W, CANVAS_H, idx)
+}
+
 /// One-shot: render a frozen machine state to the VICE PAL canvas RGBA.
 pub fn render_canvas_rgba(inp: &RenderInput) -> (usize, usize, Vec<u8>) {
     let fb = render_index_buffer(inp);
