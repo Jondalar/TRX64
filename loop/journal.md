@@ -762,3 +762,9 @@ clean via worktrees; main tree restored to main. 51 done. Next sequential: audio
 
 audio/* 3/3 (export byte-identical to c64re), media/* 9/9, batch/* 3/3. 255 tests, byte-exact green. Broadcast
 notifications (audio/flush, batch/progress) = small follow-up on the push hub. Next: vic-inspect-engine.
+
+## 2026-06-24 — DRIVER: vic-inspect engine (ADR-085) — vic/inspect 9/9
+
+vic_inspect.rs 1:1 (build_snapshot/resolveVisibleNode/resolveVisualOrigin + asset chain), 6 methods wired,
+behavioral (BASIC + scramble origins correct). 262 tests, byte-exact green. Next: ws-notifications-tail
+(broadcast-push + checkpoint/thumbnails), then integration.

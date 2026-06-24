@@ -1328,3 +1328,19 @@ pool / no batch/progress push). SKIPPED: audio/flush + batch/progress — these 
 NOTE/FOLLOW-UP: the broadcast/push channel (audio/flush, batch/progress, debug/breakpoint_hit push) is a small
 addable item — the hub/writer-task (ADR-073) already does binary push; a generic JSON-notification push would
 complete it. NEXT: vic-inspect-engine (the 6 deferred vic/inspect methods + the node/origin/evidence engine).
+
+## ADR-085 — vic-inspect engine + 6 methods: vic/inspect 9/9 (visual provenance)
+vic_inspect.rs (~1200 lines) = 1:1 port of the c64re inspect engine (vic-inspect.ts + asset-extract/asset-join/
+asset-origin): build_vic_inspect_snapshot (deriveBases/bankBaseOf), resolve_visible_node_at (sprite-first,
+border-aware), resolve_node_at (text/bitmap cells), sprite_bounds_at_visible (frozen regs + multiplexer),
+resolve_visible_region, resolve_node_at_display, assemble_inspect_evidence, + asset origin (extract_asset_
+candidates/match_visual_node_to_asset/asset_join_to_knowledge/resolve_visual_origin). PURE — reads the frozen
+RuntimeCheckpoint (cp.vic.regs/color_ram/cp.ram/cp.cia2), additive, no execution advance. Daemon: the 6 deferred
+vic/inspect methods (open/at/region/at_capture/origin/promote) wired 1:1 (ws-server.ts shapes) + cp_for_inspect
+helper -> vic/inspect now 9/9. BEHAVIORAL: BASIC pixel -> text_cell, origin screen-RAM $0400 -> char-ROM $1100
+(shadow); scramble sprite pixel -> origin ptr $C3F8 -> data $CF80 (= bank $C000|ptr*64, matches scramble_sprite_
+probe). 262 tests, byte-exact GREEN (pre-existing iso-vic-badline-irq/sprites + scramble-progress REDs verified
+identical on main = unchanged). NOT ported: the J2 derived_asset trace-chain (no trace source yet — exact/
+runtime_generated paths complete). No live-c64re diff (no vic/inspect oracle corpus; wire-shape locked via unit
+tests vs ws-server.ts). NEXT: the WS-notification tail (broadcast-push: audio/flush+batch/progress+debug/
+breakpoint_hit on the hub) + checkpoint/thumbnails, then integration.
