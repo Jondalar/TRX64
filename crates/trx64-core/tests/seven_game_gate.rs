@@ -165,7 +165,9 @@ fn run_game(file: &str, kind: DiskKind, name: &str) -> Option<GateResult> {
     let mut best_colors = 0usize;
     let mut best_rgba: Option<Vec<u8>> = None;
     let chunk = 100_000u64;
-    let budget = 100_000_000u64; // ~100s PAL
+    // GATE_BUDGET env override (default 100M ~100s PAL) — lets a slow multi-file
+    // loader (e.g. maniac) run long enough to reach its menu without changing the gate.
+    let budget = std::env::var("GATE_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(100_000_000u64);
     let mut total = 0u64;
     while total < budget {
         m.run_for_full(chunk, &mut sink, |pc, _, _, _, _, _, _| {

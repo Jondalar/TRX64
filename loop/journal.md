@@ -768,3 +768,10 @@ notifications (audio/flush, batch/progress) = small follow-up on the push hub. N
 vic_inspect.rs 1:1 (build_snapshot/resolveVisibleNode/resolveVisualOrigin + asset chain), 6 methods wired,
 behavioral (BASIC + scramble origins correct). 262 tests, byte-exact green. Next: ws-notifications-tail
 (broadcast-push + checkpoint/thumbnails), then integration.
+
+## 2026-06-24 — DRIVER: maniac mansion reaches char-select menu (user request)
+
+User asked to run maniac longer to its menu. Added GATE_BUDGET env override to seven_game_gate.rs (default 100M
+unchanged). At 600M cycles maniac renders its CHARACTER-SELECT MENU cleanly (logo + START + 7 portraits +
+selection box; 6 colors, 679/1000 chars). Was NOT a render bug — the slow G64 standard-serial multi-file loader
+just needed more time (black at 100M = mid-load). Confirms renderer + loader correct.
