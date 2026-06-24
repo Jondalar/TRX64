@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "runtime-controller-av-push (enables ws-av-tap)",
+  "current_item": "runtime-controller-av-push",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -52,12 +52,17 @@
     "protocol-surface-b1"
   ],
   "note": "protocol-surface b1 DONE (ADR-072): 13 WS methods, live-verified 1:1 vs c64re, 140 tests, byte-exact green. NEXT: RuntimeController A/V binary push (pacing loop + BIN 0x01 RGBA frame + BIN 0x02 s16le audio, matching ws-av-tap format) -> enables ws-av-tap real-time recording (user wanted it). Then protocol-surface b2 (key_down/up held-key + vic/inspect), snapshot-vsf codec, integration.",
-  "updated": "2026-06-24T15:54:39Z",
+  "updated": "2026-06-24T15:55:01Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "runtime-controller-av-push",
+    "model": "opus",
+    "started": "2026-06-24T15:55:01Z",
+    "note": "Port c64re RuntimeController A/V binary push: pacing loop (PAL 50fps real-time) + BIN 0x01 RGBA frame (384x272 from render_canvas_rgba) + BIN 0x02 s16le stereo 44.1k audio (from reSID engine) pushed over WS, matching ws-av-tap decode format. Enables ws-av-tap real-time recording vs TRX64."
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
