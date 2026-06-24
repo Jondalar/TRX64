@@ -88,3 +88,20 @@ Phase 1 integration is green. Tracked separately when we get there.
 - [x] `iec-bus` — **done** — `[model: opus]` — C64<->1541 IEC wired (iec.rs wired-AND fold + ATN-ack + push-flush catch-up). boot-trace-short FULLY byte-exact; full regression GREEN (ADR-024).
 - [x] `drive-via2` (DONE: viacore.rs 1:1 VIA2 port, ADR-058) — todo — `[model: opus]` — 1541 disk-controller VIA2 computed reads (PCR/timer/handshake). driveCycles +2; diverges at drive PC $F266 LDA $1C0C after 203087 byte-exact records (ADR-025). Low priority.
 - [x] `cia-cascade` (DONE: cia.rs lazy alarm cascade, port of ciacore.c) — todo — `[model: opus]` — chained timers via VICE alarm scheduler (ADR-017), now IEC-unblocked.
+
+## Feature-complete-vs-TS queue (2026-06-24, writable tiers IN per user)
+- [x] cartridge read-only tier (ADR-067)
+- [x] SID/reSID (ADR-068)
+- [x] per-cycle render (ADR-069)
+- [x] Phase0 tick hooks (ADR-070)
+- [x] breakpoint/watchpoint policy (ADR-071)
+- [x] protocol-surface b1 — 13 WS methods (ADR-072)
+- [x] RuntimeController A/V push / ws-av-tap (ADR-073)
+- [ ] protocol-surface b2 — key_down/up held-key (running)
+- [ ] snapshot-vsf — .c64re cross-runtime codec
+- [ ] checkpoint-ring (705.B) — unblocks 7 checkpoint methods + granular vic/inspect + scenario/recorder
+- [ ] recorder/* + runtime/scenario_* WS
+- [ ] audio/* + media/events|recent + batch/* WS
+- [ ] FLASH-CART WRITABLE TIER — Flash040 + EAPI + m93c86 + writable EasyFlash/GMOD/MegaCart (~1500 LOC)
+- [ ] DRIVE WRITE-BACK — .g64/.d64 write (fsimage_gcr_write_half_track)
+- [ ] integration — full PRG corpus end-to-end
