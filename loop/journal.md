@@ -676,3 +676,10 @@ decision: reSID approach (cc-FFI C++ vs pure-Rust vs TS-SID). No build dispatche
 cart.rs 1:1 cartridge.ts (parse_crt + CartMapper + Normal/MagicDesk/MagicDesk16/Ocean). full.rs memconfig
 enums + pla cart-line fold (no-cart byte-identical). lib.rs attach + ultimax reset. no-cart gates GREEN, 108
 tests. im3_MAGICDESK.crt boots (reached_cart, ROML exec, frame renders). Flash tier deferred. Next: SID reSID.
+
+## 2026-06-24 — DRIVER: SID reSID audio bound in (ADR-068)
+
+cc-FFI'd the vendored GPL reSID C++. write_trace hook (only core change), audio plumbing 1:1. Byte-deterministic
+(Gate A); vs c64re WASM within <=5 LSB (Gate B) — root-caused to emscripten-musl vs macOS libm table-rounding,
+inaudible, c64re-probe-705-style bound. iso-sid byte-exact GREEN, 113 tests, C++ builds clean. Cartridge+SID
+done. Open user decision: accept the libm bound vs chase true byte-identity. Next: Phase0 hooks + breakpoints + WS.

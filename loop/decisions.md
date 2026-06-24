@@ -1034,3 +1034,25 @@ booleans so no-cart is identical), 108 tests. BEHAVIORAL: im3_MAGICDESK.crt boot
 cart ROML $8050, decrunches to RAM, 5-color frame renders. 13 unit tests (parse + 4 mappers + EXROM/GAME +
 unsupported-flash + state roundtrip). Flash/EasyFlash tier (Flash040/EAPI/m93c86) = deferred follow-up
 (out of scope). NEXT: SID reSID audio (cc-FFI the vendored C++, user-chosen).
+
+## ADR-068 — SID reSID audio: cc-FFI the vendored C++; byte-deterministic, c64re-agreement within libm bound
+User chose reSID + said "kannst du das nicht einbinden?" -> bound the SAME vendored GPL reSID C++ via the Rust
+cc crate (build.rs compiles sid/voice/wave/envelope/filter8580new/extfilt/pot/dac/version.cc + resid_shim.cc,
+NEW_8580_FILTER=1, sources in vendor/resid/ + GPL PROVENANCE). FFI'd the shim ABI (resid_write/clock/output/
+read_state/...) in resid_ffi.rs (safe Resid wrapper, emit() = verbatim ResidWasm.emit). write_trace hook on
+Sid6581::write (sid.rs:175, the ONLY core change, zero-cost when None, in-tick fastsid engine untouched).
+Audio plumbing 1:1 from c64re audio/ (resid_audio.rs: SID write-stream + per-frame emit(dCycles) + Int16 PCM +
+WAV). Reuses the per-instruction cycle budget — no new tick hook.
+AUDIO RESULT (honest): NOT exact-byte-identical to c64re's WASM reSID, but bit-accurate within an inaudible,
+ROOT-CAUSED bound: Gate A = TRX64 native reSID is byte-DETERMINISTIC (70384 samples, fnv1a stable); Gate B =
+vs c64re WASM, same sample count, maxAbsDiff=5 LSB (bound 8), 0.015% full-scale. Cause: reSID builds its
+filter + FIR resampler lookup tables at construction via libm (log1p/exp/sin/I0/round); emscripten musl libm
+rounds these transcendentals differently from macOS system libm at the ULP level -> a few (short)round(table)
+entries differ by +-1 -> propagates <=5 LSB. PROVEN not a port bug (same source/shim/config/sample-count) +
+not uninit (ASan clean). Same class of bounded residual c64re's own probe-705 accepts. True byte-identity
+would need building reSID against the same musl libm OR precomputing the tables identically (possible follow-up).
+GATES: iso-sid-osc3-env3 byte-exact GREEN (fresh daemon), drive-boot-deep GREEN, cpu/vic/cia GREEN, cargo test
+113 passed, C++ builds clean. Secondary: added resid_reinit() (placement-new) for fresh-module reset; Resid is
+an exclusive singleton (the shim has one global SID).
+OPEN USER DECISION: accept the <=5 LSB libm-rounding bound (inaudible, c64re-probe-705-style), OR chase true
+WASM-byte-identity (build reSID against musl libm / precompute tables) as a follow-up.
