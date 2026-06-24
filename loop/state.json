@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "checkpoint-ring (705.B)",
+  "current_item": "checkpoint-ring",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -57,12 +57,17 @@
     "snapshot-drive-blob"
   ],
   "note": ".c64re 100% COMPLETE (ADR-079): full RuntimeCheckpoint C64+drive cross-runtime both ways, 176 tests. NEXT: checkpoint-ring (705.B) = the rewind ring of RuntimeCheckpoints + the 7 checkpoint/* WS methods + granular vic/inspect (ride the ring) + foundation for scenario/recorder. Builds on the now-complete RuntimeCheckpoint capture/restore. Then recorder/scenario, audio/media/batch, flash-write, drive-write, integration.",
-  "updated": "2026-06-24T19:04:25Z",
+  "updated": "2026-06-24T19:04:47Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "checkpoint-ring",
+    "model": "opus",
+    "started": "2026-06-24T19:04:47Z",
+    "note": "Port runtime-checkpoint-ring.ts (705.B): the rewind ring of RuntimeCheckpoints (push/get/rewind/evict, cycle-anchored) on the now-complete capture/restore. Wire the 7 checkpoint/* WS methods + the granular vic/inspect/* (which ride the ring). Additive (checkpoints = snapshots, no runtime change), byte-exact gates guard."
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
