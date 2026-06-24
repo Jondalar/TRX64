@@ -829,23 +829,15 @@ impl Machine {
         bank.wrapping_mul(0x4000)
     }
 
-    /// Render the current (frozen) display to the VICE PAL screenshot canvas
-    /// (384×272 RGBA, colodore). Pixel-identical to the TS oracle's
-    /// `renderLiteralPortRgba` for a static screen. Returns (width, height, rgba).
+    /// Render the displayed frame to the VICE PAL screenshot canvas (384×272 RGBA,
+    /// colodore). The image is the VIC's per-cycle-accumulated `displayed` buffer
+    /// (the last COMPLETE frame swept by the raster), cropped + palettized exactly
+    /// like the TS oracle's `renderLiteralPortRgba`. This is the VERBATIM per-cycle
+    /// output: sprite multiplexing, border sprites, and mid-line raster effects all
+    /// render correctly (the prior static single-pass render could not). Returns
+    /// (width, height, rgba).
     pub fn render_canvas_rgba(&self) -> (usize, usize, Vec<u8>) {
-        // Colour RAM low nibbles live in the IO shadow at $D800-$DBFF.
-        let mut color_ram = [0u8; 0x0400];
-        for (i, c) in color_ram.iter_mut().enumerate() {
-            *c = self.io_shadow[0x0800 + i] & 0x0f;
-        }
-        let inp = render::RenderInput {
-            regs: &self.vic.regs,
-            ram: &self.ram,
-            char_rom: &self.char_rom,
-            color_ram: &color_ram,
-            bank_base: self.vic_bank_base(),
-        };
-        render::render_canvas_rgba(&inp)
+        render::index_buffer_to_canvas_rgba(&self.vic.displayed[..])
     }
 
     /// Compute the $D01E (sprite-sprite) / $D01F (sprite-background) collision
