@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "protocol-surface-b2 (key_down/up held-key + remaining WS methods)",
+  "current_item": "protocol-surface-b2",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -53,12 +53,17 @@
     "runtime-controller-av-push"
   ],
   "note": "A/V push DONE (ADR-073): ws-av-tap can tap TRX64 real-time, traces/trx64_av_tap.mp4 (25s, h264+reSID-audio). Gated --stream (off=byte-exact). 142 tests. Caveat: user ws-av-tap --rec hangs on ffmpeg 8.1.1 fifo (tap-side, not the push). NEXT autonomous: protocol-surface b2 (key_down/up needs a held-key SET on KeyboardMatrix + vic/inspect), snapshot-vsf .c64re codec, integration corpus.",
-  "updated": "2026-06-24T16:36:33Z",
+  "updated": "2026-06-24T16:37:15Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "protocol-surface-b2",
+    "model": "opus",
+    "started": "2026-06-24T16:37:15Z",
+    "note": "WS protocol surface b2: add a held-key SET to KeyboardMatrix (c64re pressedKeys model) so session/key_down|key_up|release_keys|input_status work (currently KeyboardMatrix is a timed-event queue, no held set). 1:1 from c64re keyboard model. Additive - type_text path unchanged, byte-exact green. (Defer vic/inspect ring to a checkpoint-infra item.)"
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
