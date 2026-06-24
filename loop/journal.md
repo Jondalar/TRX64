@@ -572,3 +572,12 @@ wrong byte -> wrong stepper phase -> head steps to empty track -> never finds SY
 drift is the per-poll CALL phase (rotation_last_clk whole-cycle anchoring), NOT the engine. ADR-051. Reference
 trace saved /tmp/scramble_ref_head.duckdb. Next: dd00-headphase-diff (first divergent poll). ESCALATED (10
 attempts; user GCR/loader domain).
+
+## 2026-06-24 — DRIVER: bar reframed to behavioral c64re-parity; verbatim cores done (ADR-053)
+
+User: c64re is the bar (behaves like VICE — games/demos/.g64-loaders/7-game-gate). Match it, not exceed.
+Verbatim-core rebuild merged: drive_6510core.rs + c64_6510core.rs(full_sc) + vic.rs — the structural fix
+for the pattern-engine approximations the audit found. drive-boot-deep + C64 gates byte-exact. Known: iso-vic
+c64Cycles +1/+3 (VICE-accurate steal cycles c64re's microcode CPU skips — harmless). scramble still doesn't
+render (BASIC fallback); pinned blocker = the ~7-cyc drive ATN-IRQ cross-domain stamping lag (full.rs).
+Loop ON. Next: dd00-atn-irq.

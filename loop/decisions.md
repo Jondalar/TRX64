@@ -806,3 +806,19 @@ push-flush-on-$DD00-access (iec_catch_up_to / drive.catch_up_to) vs the TS conti
 tight $04E2 BIT $DD00 / BVC loop touches $DD00 every ~6 cycles → very frequent catch-ups; a per-catch-up
 phase the KERNAL load (rarer $DD00) tolerates but the bit-bang loop may not. CIA/IEC/rotation-engine/
 call-sites/SO-path all verified faithful or not-in-loader-path.
+
+## ADR-053 — bar = behavioral parity with c64re; verbatim cores done (drive+C64-CPU+VIC-II)
+User decision: the bar is BEHAVIORAL parity with c64re (behaves like VICE: renders games/demos, runs
+.g64 1541 copy-protection loaders, the 7-game proof gate). TRX64 must MATCH c64re, not exceed it.
+Verbatim-core rebuild DONE (the structural fix for the pattern-engine approximations the audit found):
+- drive_6510core.rs (verbatim VICE 6510core.c drive) — drive-boot-deep byte-exact.
+- c64_6510core.rs + full_sc.rs (verbatim x64sc SC core 6510dtvcore.c) — C64 gates byte-exact.
+- vic.rs (verbatim viciisc per-cycle VIC-II: cycle/BA/badline/IRQ/fetch).
+Known cycle-count delta (NOT a behavior regression): iso-vic c64Cycles +1/+3 vs the c64re golden — the
+verbatim CPU+VIC do the legitimate BA-steal dummy-fetch cycles real VICE does (6510dtvcore FETCH_OPCODE
+under check_ba) that c64re's microcode CPU skips. VIC events identical; only the run-budget total clk
+differs. Behaviorally harmless; do NOT make the VIC wrong vs VICE to match the oracle count.
+Remaining for scramble: the drive ATN-IRQ cross-domain stamping (~7-cycle lag, full.rs:atn_edge_to_via1_ca1)
+desyncs the $DD00 bit-bang loader — the pinned blocker (current item dd00-atn-irq).
+Remaining for the 7-game gate: render.rs is still an approximation (no sprite collision $D01E/$D01F, no
+grey-dot) — needed for gameplay, not for rendering a title/loader. Separate item render-verbatim.

@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "dd00-headphase-diff",
+  "current_item": "dd00-atn-irq",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -29,12 +29,16 @@
     "vic-sprites-modes",
     "cia-cascade",
     "drive-watchdog-phase",
-    "scramble-gold"
+    "scramble-gold",
+    "drive-verbatim-cpu",
+    "c64-verbatim-cpu",
+    "vic-verbatim"
   ],
-  "note": "LOOP STOPPED by user (cron a06c4701 deleted, c64re daemon killed). 22 items done; full byte-exact C64 + pixel-exact renderer + standard disk LOAD. ONE known-RED: scramble custom $DD00 loader (root-caused ADR-051: head lands on empty half-track 3 via accumulated rotate_disk per-poll phase drift; rotation_1541_simple byte-identical to TS; reference per-poll trace saved /tmp/scramble_ref_head.duckdb). Resume: current_item dd00-headphase-diff (diff first divergent $1CF0 poll vs reference).",
-  "updated": "2026-06-23T16:42:00Z",
+  "note": "NEW DIRECTION (ADR-053): bar = behavioral parity with c64re. Verbatim cores DONE (drive+C64-CPU+VIC-II, merged). Next: dd00-atn-irq - fix the ~7-cycle drive ATN-IRQ cross-domain stamping lag (full.rs:atn_edge_to_via1_ca1 vs the c64re reference) that desyncs the scramble $DD00 loader. Then re-test scramble behaviorally. Then render-verbatim + the 7-game gate.",
+  "updated": "2026-06-24T07:05:00Z",
   "followups": [
-    "sid-audio"
+    "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
+    "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
   "in_flight": null,
   "stage2_items": [],
@@ -42,11 +46,13 @@
     "ADR-011 reset-P-flag"
   ],
   "known_red": [
-    "scramble custom $DD00 loader STALL (scramble-load-progress + scramble-gold loaderbar): drive $0402 loop polls VIA2 PRB bit7(SYNC)+T1 directly, never advances to the bit-bang send ($07Ax) -> never releases CLK -> C64 $04E2 deadlock. Root cause = VIA2 byte-ready/SYNC/T1 rotation coupling under DIRECT POLL (ADR-050). NOT IEC, NOT phase-skew (8 attempts falsified)."
+    "scramble custom $DD00 loader: does not render yet (BASIC fallback); pinned blocker = drive ATN-IRQ cross-domain stamping ~7-cyc lag (full.rs)",
+    "iso-vic c64Cycles +1/+3 vs c64re: VICE-accurate BA-steal cycles c64re microcode CPU skips - behaviorally harmless, do NOT match the oracle (ADR-053)"
   ],
   "custom_loader_test_disk": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/scramble_infinity.d64",
   "blocked": [
     "drive-seek-phase (custom-loader phase-lead): ~12-20k C64-cycle lead UPSTREAM of track-1 read (boot/seek/directory/IEC-filename phase) — rotation FALSIFIED by c64re measurement (track-1 lock at identical byte). 5 theories down. Ref trace saved tmp/scramble-track1-measure.duckdb. ESCALATED (ADR-047)"
   ],
-  "loop_status": "STOPPED by user 2026-06-23"
+  "loop_status": "RUNNING",
+  "bar": "BEHAVIORAL parity with c64re (renders games/demos, .g64 1541 loaders, the 7-game gate). Match c64re, not exceed it."
 }
