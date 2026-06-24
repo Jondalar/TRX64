@@ -2850,19 +2850,29 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 Some(p) => p.to_string(),
                 None => return Response::err(id, -32602, "snapshot/dump: path required"),
             };
-            let st = state.lock().unwrap();
-            let m = &st.session.machine;
+            let mut st = state.lock().unwrap();
             // Disk path/format for the checkpoint `media` metadata.
-            let (disk_path, disk_format) = match m.drive8.get_attached_disk() {
+            let (disk_path, disk_format) = match st.session.machine.drive8.get_attached_disk() {
                 Some(d) => (
                     d.backing_path.clone().unwrap_or_default(),
                     match d.kind { DiskKind::G64 => "g64", DiskKind::D64 => "d64" }.to_string(),
                 ),
                 None => (String::new(), String::new()),
             };
-            // The RuntimeCheckpoint payload (drive1541 blob = part 4, null today).
+            // Drive blobs (part 4): the `drive1541` core blob + the `driveDiskImage`
+            // GCRIMAGE0 overlay, captured from the live drive. `drive1541` is built
+            // by drive_snapshot.rs (byte-compatible with c64re's drive1541.snapshot()).
+            let drive1541_blob =
+                trx64_core::drive_snapshot::capture_drive1541(&mut st.session.machine.drive8);
+            let drive_disk_blob =
+                trx64_core::drive_snapshot::capture_drive_disk_image(&st.session.machine.drive8);
+            let m = &st.session.machine;
             let checkpoint = trx64_core::c64re_snapshot::capture_runtime_checkpoint(
-                m, &disk_path, &disk_format, None, None,
+                m,
+                &disk_path,
+                &disk_format,
+                Some(&drive1541_blob),
+                drive_disk_blob.as_deref(),
             );
             let cycle = m.c64_core.clk as i64;
             let pc = m.c64_core.reg_pc as i64;

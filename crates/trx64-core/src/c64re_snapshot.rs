@@ -1004,8 +1004,20 @@ pub fn restore_runtime_checkpoint(
     m.sync_after_monitor();
     m.clk = m.c64_core.clk;
 
-    // Hand back the drive blob (decoded) for the caller's drive restore (part 4/5).
+    // Drive restore (part 4): the `drive1541` core blob (DRIVE8/DRIVECPU0/VIA1/VIA2)
+    // then the `driveDiskImage` GCRIMAGE0 overlay. The caller (daemon) has already
+    // re-attached the embedded disk before this point, so the drive's GCR baseline
+    // is present; `restore_drive_disk_image` overlays the mutable content (§6.1
+    // mutable-wins). A null/absent drive blob leaves the drive at its baseline.
     let drive_blob = cp.get("drive1541").and_then(ta_u8_decode);
+    if let Some(ref blob) = drive_blob {
+        crate::drive_snapshot::restore_drive1541(&mut m.drive8, blob)?;
+    }
+    if let Some(disk_blob) = cp.get("driveDiskImage").and_then(ta_u8_decode) {
+        crate::drive_snapshot::restore_drive_disk_image(&mut m.drive8, &disk_blob)?;
+    }
+
+    // Hand back the decoded `drive1541` blob for the caller's logging/diagnostics.
     Ok(drive_blob)
 }
 
@@ -1102,6 +1114,102 @@ mod tests {
         assert_eq!(m2.c64_core.reg_pc, 0xabcd);
         assert_eq!(m2.ram[0x2000], 0x99);
         assert_eq!(m2.vic.raster_line, 55);
+    }
+
+    #[test]
+    fn drive_blob_through_container_roundtrip() {
+        // Part 4 — the `drive1541` + `driveDiskImage` blobs survive the full
+        // `.c64re` container. Seed recognizable drive state (CPU regs, RAM, rotation
+        // head, a GCR track byte), capture both blobs, run through the container,
+        // restore, and assert the drive resumed (no drive_snapshot_read corruption).
+        use crate::drive::{DiskImage, DiskKind};
+        use crate::gcr::{GcrImage, GcrTrack};
+        use crate::native_snapshot::{
+            read_native_snapshot, write_native_snapshot, WriteNativeSnapshotArgs,
+        };
+
+        let mut m = Machine::new();
+        // Seed drive CPU + RAM.
+        m.drive8.core.reg_pc = 0xf2b0;
+        m.drive8.core.reg_a = 0x37;
+        m.drive8.core.reg_sp = 0xf8;
+        m.drive8.core.clk = 9_876_543;
+        m.drive8.drive_ram_write(0x0050, 0x5a);
+        m.drive8.drive_ram_write(0x07ff, 0xa5);
+
+        // Attach a GCR image directly (no boot needed) + seed a head + track byte.
+        let mut tracks: Vec<GcrTrack> = (0..84)
+            .map(|_| GcrTrack { data: vec![0u8; 7000], size: 7000 })
+            .collect();
+        // Track 18 (half-track 36 → slot 34) gets a marker byte.
+        tracks[34].data[100] = 0xc9;
+        m.drive8.rotation.image = Some(GcrImage { tracks });
+        m.drive8.rotation.gcr_image_loaded = 1;
+        m.drive8.rotation.complicated_image_loaded = 1;
+        m.drive8.rotation.current_half_track = 36;
+        m.drive8.rotation.gcr_current_track_size = 7000;
+        m.drive8.rotation.gcr_head_offset = 1234;
+        // At an instruction boundary the rotation clock tracks the drive clock, so
+        // the VIA undump's rotate_disk advances 0 bits (no head drift on restore).
+        m.drive8.rotation.rotation_last_clk = m.drive8.core.clk;
+        m.drive8.disk = Some(DiskImage {
+            kind: DiskKind::D64,
+            bytes: vec![0u8; 174848],
+            backing_path: None,
+            read_only: false,
+        });
+
+        // Capture both drive blobs + the full checkpoint.
+        let drive1541 = crate::drive_snapshot::capture_drive1541(&mut m.drive8);
+        let disk_blob = crate::drive_snapshot::capture_drive_disk_image(&m.drive8);
+        assert!(disk_blob.is_some(), "GCRIMAGE0 blob present");
+        let cp = capture_runtime_checkpoint(
+            &m,
+            "/tmp/d.d64",
+            "d64",
+            Some(&drive1541),
+            disk_blob.as_deref(),
+        );
+        assert_ne!(cp["drive1541"], serde_json::Value::Null);
+        assert_ne!(cp["driveDiskImage"], serde_json::Value::Null);
+
+        let bytes = write_native_snapshot(WriteNativeSnapshotArgs {
+            checkpoint: cp,
+            schema_version: 1,
+            media: vec![],
+            runtime_version: "trx64/1".into(),
+            machine_model: "c64-pal".into(),
+            provenance: None,
+            pc: 0,
+            cycle: 0,
+        });
+        let r = read_native_snapshot(&bytes).expect("read container");
+
+        // Restore into a fresh machine WITH a baseline disk attached (daemon order:
+        // the embedded media is re-attached before restore_runtime_checkpoint).
+        let mut m2 = Machine::new();
+        m2.drive8.attach_disk(DiskImage {
+            kind: DiskKind::D64,
+            bytes: vec![0u8; 174848],
+            backing_path: None,
+            read_only: false,
+        });
+        restore_runtime_checkpoint(&mut m2, &r.checkpoint).expect("restore");
+
+        // The drive resumed: CPU + RAM + head + the mutable GCR byte survived.
+        assert_eq!(m2.drive8.core.reg_pc, 0xf2b0, "drive PC");
+        assert_eq!(m2.drive8.core.reg_a, 0x37, "drive A");
+        assert_eq!(m2.drive8.core.reg_sp, 0xf8, "drive SP");
+        assert_eq!(m2.drive8.core.clk, 9_876_543, "drive CLK");
+        assert_eq!(m2.drive8.drive_ram_read(0x0050), 0x5a, "drive RAM $50");
+        assert_eq!(m2.drive8.drive_ram_read(0x07ff), 0xa5, "drive RAM $7ff");
+        assert_eq!(m2.drive8.rotation.current_half_track, 36, "head half-track");
+        assert_eq!(m2.drive8.rotation.gcr_head_offset, 1234, "GCR head offset");
+        assert_eq!(
+            m2.drive8.rotation.image.as_ref().unwrap().tracks[34].data[100],
+            0xc9,
+            "mutable GCR track byte survived the round-trip"
+        );
     }
 
     #[test]

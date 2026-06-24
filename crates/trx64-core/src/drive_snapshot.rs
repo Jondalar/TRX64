@@ -99,9 +99,22 @@ pub fn capture_drive1541(drive: &mut Drive1541) -> Vec<u8> {
 /// Returns Ok on success; Err(reason) on a malformed/incompatible blob.
 pub fn restore_drive1541(drive: &mut Drive1541, blob: &[u8]) -> Result<(), String> {
     let mut s = SnapshotT::open_in_memory(blob);
-    read_drive_module(drive, &mut s)?;
+    // VICE drive_snapshot_read_module order: read the DRIVE module rotation fields,
+    // then drivecpu, then VIA — and re-establish the head position (drive_set_
+    // half_track + GCR_head_offset) LAST (drive-snapshot.c:601-620, AFTER the VIA
+    // undump). The VIA2 undump_prb/undump_pcr call rotation_rotate_disk, which would
+    // move the head if applied before; deferring the head set matches VICE exactly.
+    let head = read_drive_module(drive, &mut s)?;
     read_drivecpu_module(drive, &mut s)?;
     read_via_modules(drive, &mut s)?;
+    if let Some((half_track, gcr_head_offset)) = head {
+        // drive_set_half_track re-resolves the active track size + GCR_track_start_ptr.
+        drive.rotation.set_half_track(half_track);
+        // VICE restores GCR_head_offset directly (drive-snapshot.c:440 sets it into
+        // the drive_t; set_half_track only rescales, then the saved value is the
+        // authoritative head position at the snapshot instant).
+        drive.rotation.gcr_head_offset = gcr_head_offset;
+    }
     drive.snapshot_sync_drive_clk();
     Ok(())
 }
@@ -220,7 +233,15 @@ fn write_drive_module(drive: &mut Drive1541, s: &mut SnapshotT) {
     s.module_close(&m);
 }
 
-fn read_drive_module(drive: &mut Drive1541, s: &mut SnapshotT) -> Result<(), String> {
+/// Read the DRIVE8 module into the live rotation. Applies every rotation field
+/// EXCEPT the head position (`current_half_track` / `gcr_head_offset`), which the
+/// caller re-establishes LAST via `set_half_track` (VICE order — after the VIA
+/// undump's rotate). Returns `Some((half_track, gcr_head_offset))` for that final
+/// step, or `None` when the dump carried no true-drive-emulation (has_tde=0).
+fn read_drive_module(
+    drive: &mut Drive1541,
+    s: &mut SnapshotT,
+) -> Result<Option<(u32, u32)>, String> {
     let (m, major, minor) = s
         .module_open("DRIVE8")
         .ok_or("drive_snapshot: DRIVE8 module missing")?;
@@ -255,7 +276,7 @@ fn read_drive_module(drive: &mut Drive1541, s: &mut SnapshotT) -> Result<(), Str
     if has_tde == 0 {
         // No true-drive-emulation in the dump — leave the live drive as-is.
         s.module_close(&m);
-        return Ok(());
+        return Ok(None);
     }
     let _sync_factor = rdw!();
 
@@ -302,19 +323,14 @@ fn read_drive_module(drive: &mut Drive1541, s: &mut SnapshotT) -> Result<(), Str
 
     s.module_close(&m);
 
-    // Apply into the live rotation. The half-track is re-established via
-    // set_half_track (drive_set_half_track on the read path) so the active track
-    // size + GCR_track_start_ptr are re-resolved; the head offset is then
-    // overwritten by the saved value (VICE restores GCR_head_offset directly).
+    // Apply every rotation field EXCEPT the head position (current_half_track +
+    // gcr_head_offset), which the caller re-establishes LAST (VICE order: after the
+    // VIA undump's rotate_disk). side handling (drive-snapshot.c:607-616) is 1571
+    // only; the 1541 keeps side 0, so half_track_word == current_half_track.
     let r = &mut drive.rotation;
-    // side handling (drive-snapshot.c:607-616): 1571 only; 1541 keeps side 0.
-    let half_track = half_track_word;
-    r.set_half_track(half_track);
-
     r.attach_clk = attach_clk;
     r.attach_detach_clk = attach_detach_clk;
     r.byte_ready_level = byte_ready_level;
-    r.gcr_head_offset = gcr_head_offset;
     r.gcr_read = gcr_read;
     r.gcr_write_value = gcr_write_value;
     r.read_only = read_only as i32;
@@ -345,7 +361,7 @@ fn read_drive_module(drive: &mut Drive1541, s: &mut SnapshotT) -> Result<(), Str
     r.byte_ready_edge = byte_ready_edge;
     r.byte_ready_active = byte_ready_active;
 
-    Ok(())
+    Ok(Some((half_track_word, gcr_head_offset)))
 }
 
 // =============================================================================
@@ -601,9 +617,22 @@ pub fn restore_drive_disk_image(drive: &mut Drive1541, blob: &[u8]) -> Result<()
 
     drive.rotation.gcr_image_loaded = 1;
     drive.rotation.complicated_image_loaded = 1;
-    // Re-resolve the active track size for the current head (drive_set_half_track).
-    let ht = drive.rotation.current_half_track;
-    drive.rotation.set_half_track(ht);
+    // Re-resolve the active track size for the current head WITHOUT rescaling the
+    // head offset. The drive1541 blob already restored `current_half_track` +
+    // `gcr_head_offset` via its own drive_set_half_track + the explicit head value;
+    // `set_half_track` here would re-rescale `gcr_head_offset` by the (now-overlaid)
+    // track-size ratio and corrupt it. VICE's drive_snapshot_read_gcrimage_module
+    // likewise only swaps the track buffers — the head is set elsewhere. So just
+    // point `gcr_current_track_size` at the current track's overlaid size.
+    let slot = (drive.rotation.current_half_track as usize).wrapping_sub(2);
+    let cur_size = drive
+        .rotation
+        .image
+        .as_ref()
+        .and_then(|img| img.tracks.get(slot))
+        .map(|t| t.size)
+        .unwrap_or(0);
+    drive.rotation.gcr_current_track_size = cur_size;
 
     Ok(())
 }
