@@ -158,21 +158,58 @@ impl Voice {
 /// that array on every register write and during `read_osc3` / `read_env3`.
 ///
 /// Clone-able with the Machine for Phase-2 COW forks.
-#[derive(Clone, Debug)]
+///
+/// `Clone`/`Debug` are implemented MANUALLY (not derived) because of the
+/// optional `write_trace` audio hook: a `Box<dyn FnMut>` is neither `Clone` nor
+/// `Debug`. The hook is AUDIO-tier transport plumbing, not register state — a
+/// COW fork / byte-exact path legitimately starts with NO audio subscriber, so
+/// `clone()` drops it (→ `None`). This keeps the in-tick fastsid register engine
+/// byte-exact and the hook strictly additive + zero-cost when `None`.
 pub struct Sid6581 {
     pub voices: [Voice; 3],
+    /// Optional AUDIO subscriber, invoked on every register `write(reg, value)`
+    /// (reg already masked to 0x00..0x1f). 1:1 with the TS `sid.ts` `writeTrace`:
+    /// the reSID audio engine subscribes here to feed its write-stream. `None`
+    /// on all trace / byte-exact / snapshot paths (zero cost). Not part of the
+    /// register state — never serialized, dropped on clone.
+    pub write_trace: Option<Box<dyn FnMut(u8, u8) + Send>>,
+}
+
+impl Clone for Sid6581 {
+    /// Clones the register/voice state only; the audio hook is transport-level
+    /// and intentionally NOT carried to the clone (forks start audio-silent).
+    fn clone(&self) -> Self {
+        Self { voices: self.voices.clone(), write_trace: None }
+    }
+}
+
+impl core::fmt::Debug for Sid6581 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Sid6581")
+            .field("voices", &self.voices)
+            .field("write_trace", &self.write_trace.as_ref().map(|_| "Some(<fn>)"))
+            .finish()
+    }
 }
 
 impl Sid6581 {
     /// Create at power-on defaults (voices zeroed, LFSR seeded with NSEED).
     pub fn new() -> Self {
-        Self { voices: [Voice::new(), Voice::new(), Voice::new()] }
+        Self { voices: [Voice::new(), Voice::new(), Voice::new()], write_trace: None }
     }
 
     /// VICE: fastsid_reset() — clear all voice state to power-on defaults.
-    /// Matches the TS sid.ts `reset()` implementation exactly.
+    /// Matches the TS sid.ts `reset()` implementation exactly. The audio hook is
+    /// preserved across reset (it is a subscription, not register state — same
+    /// as the TS `Resid.reset()` keeping its `writeTrace`).
     pub fn reset(&mut self) {
         self.voices = [Voice::new(), Voice::new(), Voice::new()];
+    }
+
+    /// Install (or clear) the AUDIO write-trace subscriber. 1:1 with the TS
+    /// `sid.ts` `set writeTrace`. Additive: `None` ⇒ zero-cost, byte-exact.
+    pub fn set_write_trace(&mut self, hook: Option<Box<dyn FnMut(u8, u8) + Send>>) {
+        self.write_trace = hook;
     }
 
     // ── Register write dispatch ────────────────────────────────────────────────
@@ -187,6 +224,14 @@ impl Sid6581 {
     /// filter/volume registers 0x15-0x18 and read-only 0x19-0x1f are no-ops here
     /// (caller stores the raw byte into the shadow; we model no filter audio).
     pub fn write(&mut self, reg: usize, value: u8, regs: &[u8; 32]) {
+        // AUDIO tier (additive, zero-cost when None): notify the reSID write
+        // stream of EVERY register write, in CPU order — 1:1 with the TS
+        // `sid.ts` writeTrace. reSID needs filter/vol writes too, so this fires
+        // for all regs, before the fastsid voice dispatch below. Does NOT touch
+        // the byte-exact register engine.
+        if let Some(hook) = self.write_trace.as_mut() {
+            hook(reg as u8 & 0x1f, value);
+        }
         match reg {
             0x00..=0x06 => self.apply_voice_write(0, reg, value, regs),
             0x07..=0x0d => self.apply_voice_write(1, reg - 7, value, regs),

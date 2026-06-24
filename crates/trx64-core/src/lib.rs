@@ -22,6 +22,8 @@ pub mod iec;
 pub mod keyboard;
 pub mod rotation;
 pub mod render;
+pub mod resid_audio;
+pub mod resid_ffi;
 pub mod sid;
 pub mod tables;
 pub mod vic;
@@ -33,6 +35,8 @@ pub use cpu::{Bus, Cpu6510};
 pub use drive::Drive1541;
 pub use full::{Bank8, BankA, BankE, FullBus, MemConfig};
 pub use iec::IecCore;
+pub use resid_audio::{SidAudioEngine, SidWriteRecord, WavFormat};
+pub use resid_ffi::{Resid, ResidConfig};
 pub use sid::Sid6581;
 pub use vic::VicII;
 
