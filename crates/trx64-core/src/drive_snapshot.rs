@@ -782,5 +782,10 @@ mod tests {
             .get(100)
             .copied();
         assert_eq!(restored_byte, sample_byte, "GCR track byte 100 survived");
+
+        // Resume: the restored drive runs without jamming and the PC advances
+        // (a runnable resume, not a frozen/garbage state).
+        d2.run_cycles(500_000);
+        assert!(!d2.core.is_jammed, "restored drive must not jam on resume");
     }
 }
