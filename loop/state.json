@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "recorder-scenario (main tree; flash+drive in worktrees)",
+  "current_item": "recorder-scenario",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -58,12 +58,17 @@
     "checkpoint-ring"
   ],
   "note": "checkpoint-ring DONE (ADR-080): ring + checkpoint/* 6/7 + vic/inspect 3/9, cross-runtime shapes match, 189 tests. Deferred follow-ups: vic-inspect-engine (6 methods), checkpoint/thumbnails. PARALLEL: flash-cart-writable + drive-write-back still in worktrees. Main tree -> next: recorder/scenario (unblocked by checkpoint-ring).",
-  "updated": "2026-06-24T19:26:27Z",
+  "updated": "2026-06-24T19:26:47Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "recorder-scenario",
+    "model": "opus",
+    "started": "2026-06-24T19:26:47Z",
+    "note": "recorder/* + runtime/scenario_* WS, 1:1 from recorder/anchor-record.ts + anchor-store.ts + input/scenario-player.ts, on the checkpoint-ring. Main tree. Additive, byte-exact guard."
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
