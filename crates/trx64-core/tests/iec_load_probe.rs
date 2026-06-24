@@ -175,8 +175,8 @@ fn iec_load_trace() {
         let pc = m.cpu6510.reg_pc;
         let serial = (0xED00..=0xEFFF).contains(&pc);
         if serial {
-            let cp = m.iec.cpu_port;
-            let dp = m.iec.drv_port;
+            let cp = m.iec.iecbus.cpu_port;
+            let dp = m.iec.iecbus.drv_port;
             let line = (cp, dp);
             // Log only when entering serial routines OR the line/dpc changed.
             if !in_serial_since || line != prev_line {
@@ -435,7 +435,7 @@ fn iec_load_stall_point() {
         // Fixed window around the abort (clk 4945507).
         if m.cpu6510.clk > 4_944_500 && m.cpu6510.clk < 4_946_500
             && ring.last().map(|x| x.0) != Some(last_drive_pc) {
-            ring.push((last_drive_pc, m.cpu6510.clk, m.cpu6510.reg_pc, m.iec.cpu_port, m.iec.drv_port));
+            ring.push((last_drive_pc, m.cpu6510.clk, m.cpu6510.reg_pc, m.iec.iecbus.cpu_port, m.iec.iecbus.drv_port));
         }
         // Progress metric = bytes received via ACPTR. Record clk of last new byte.
         if acptr_entries != last_ptr as u64 {
@@ -468,7 +468,7 @@ fn iec_load_stall_point() {
     );
     eprintln!(
         "STALL state: c64_pc=${:04X} drv_pc=${:04X} cpu_port={:02X} drv_port={:02X} drvPB={:02X} ST=${:02X}",
-        m.cpu6510.reg_pc, last_drive_pc, m.iec.cpu_port, m.iec.drv_port,
+        m.cpu6510.reg_pc, last_drive_pc, m.iec.iecbus.cpu_port, m.iec.iecbus.drv_port,
         m.drive8.via1_pb_iec_output(), m.read_full(0x0090)
     );
     eprintln!(
@@ -489,7 +489,7 @@ fn iec_load_stall_point() {
     // VIA1 (IEC) regs: PB output ($1800), DDR, PCR/IFR/IER for CA1(ATN) state.
     eprintln!(
         "drive VIA1: PB-out={:02X} drv_port-in(via_iec_tmp)={:02X}",
-        m.drive8.via1_pb_iec_output(), m.iec.drv_port
+        m.drive8.via1_pb_iec_output(), m.iec.iecbus.drv_port
     );
 }
 
@@ -955,8 +955,8 @@ fn dd00_loader_bar_probe() {
     eprintln!(
         "final: c64_pc=${:04X} drv_pc(top)  cpu_port=${:02X} drv_port=${:02X} drvPB=${:02X}",
         m.cpu6510.reg_pc,
-        m.iec.cpu_port,
-        m.iec.drv_port,
+        m.iec.iecbus.cpu_port,
+        m.iec.iecbus.drv_port,
         m.drive8.via1_pb_iec_output()
     );
     let mut dtop: Vec<_> = drive_pc_hist.iter().collect();
@@ -1101,16 +1101,16 @@ fn dd00_loader_decode_probe() {
     // Drive VIA1 ($1800) regs — what the drive's loop actually reads for CLK/DATA.
     eprintln!(
         "drive VIA1 PB-out=${:02X}  iec.drv_port=${:02X}  iec.drv_data_8=${:02X}  iec.drv_bus_8=${:02X}",
-        m.drive8.via1_pb_iec_output(), m.iec.drv_port, m.iec.drv_data_8, m.iec.drv_bus_8
+        m.drive8.via1_pb_iec_output(), m.iec.iecbus.drv_port, m.iec.iecbus.drv_data[8], m.iec.iecbus.drv_bus[8]
     );
     // C64 loader bytes $04E0-$04F0 (the BIT $DD00 / BVC spin).
     let c64_code: Vec<u8> = (0x04E0..0x04F0).map(|a| m.read_full(a)).collect();
     eprintln!("C64 $04E0-$04EF: {:02X?}", c64_code);
     // Live IEC line decode. cpu_port bit6=CLK, bit7=DATA (the C64 reads at $DD00
     // bits 6/7). drv_port bit0=DATA_IN, bit2=CLK_IN, bit7=ATN.
-    let cp = m.iec.cpu_port;
-    let dp = m.iec.drv_port;
-    let cb = m.iec.cpu_bus;
+    let cp = m.iec.iecbus.cpu_port;
+    let dp = m.iec.iecbus.drv_port;
+    let cb = m.iec.iecbus.cpu_bus;
     eprintln!(
         "IEC: cpu_port=${:02X} [CLK_in(b6)={} DATA_in(b7)={}]  cpu_bus=${:02X} [ATN(b4)={} CLK_out(b6)={} DATA_out(b7)={}]",
         cp,

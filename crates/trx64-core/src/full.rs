@@ -170,8 +170,11 @@ impl<'a> FullBus<'a> {
         // `cpu_port` the C64 reads at $DD00 bits 6/7 (= VICE iecbus_cpu_read_conf1
         // returning the freshly-folded cpu_port). The cpu_bus is unchanged here, so
         // this single fold against the current cpu_bus is exact.
+        // VICE via1d1541.c store_prb / iec_drive_write(~byte): the drive's PB
+        // output folds into the bus as `~pb_out` (iec.rs iec_drive_write inverts via
+        // the `~data ^ cpu_bus` formula by receiving the already-inverted byte).
         let pb_out = self.drive.via1_pb_iec_output();
-        self.iec.drive_store_pb(pb_out);
+        self.iec.iec_drive_write((!pb_out) & 0xff, 0);
     }
 
     /// Catch the drive up to `target` and refresh `drv_data_8` from its live VIA1
@@ -190,8 +193,8 @@ impl<'a> FullBus<'a> {
         // C64-side intent (cpu_bus) — constant across this catch-up — so a `$1800`
         // STORE inside the run re-folds the wired-AND and the drive sees its own
         // CLK/DATA pull on the next read (= via1d1541.c store_prb cross-domain sync).
-        self.drive.iec_drv_port = self.iec.drv_port;
-        self.drive.iec_cpu_bus = self.iec.cpu_bus;
+        self.drive.iec_drv_port = self.iec.iecbus.drv_port;
+        self.drive.iec_cpu_bus = self.iec.iecbus.cpu_bus;
         self.drive_c64_ref = self.drive.catch_up_to(target, self.drive_c64_ref);
         let pb_out = self.drive.via1_pb_iec_output();
         self.iec.drive_set_data_no_fold(pb_out);
@@ -260,7 +263,9 @@ impl<'a> FullBus<'a> {
                 // a read side-effect) and the composed PA byte.
                 if (addr & 0xf) == crate::cia::CIA_PRA as u16 {
                     self.iec_push_flush();
-                    let pins = self.iec.cpu_port;
+                    // = iecbus_cpu_read_conf1(clk): returns the freshly-folded
+                    // cpu_port (the drive catch-up was done by iec_push_flush).
+                    let pins = self.iec.iecbus_callback_read(self.clk);
                     // iecReadPins indirection record (= emitC64Access read at $DD00).
                     self.read_side_effects.push((0xdd00, pins));
                     let pra = self.cia2.peek(0xdd00);
@@ -347,17 +352,26 @@ impl<'a> FullBus<'a> {
                         // `c64_store_dd00` perform that one authoritative fold. The
                         // write instant is maincpu_clk + 1 (x64sc write_offset=0).
                         self.iec_catch_up_to(self.clk + 1);
-                        let atn_edge = self.iec.c64_store_dd00((!new_out) & 0xff);
+                        // = (*iecbus_callback_write)(~PA, clk) → iecbus_cpu_write_conf1
+                        // for the single-1541 (Conf1): iec_update_cpu_bus → ATN-edge →
+                        // per-type drv_bus[8] recompute → iec_update_ports. Returns the
+                        // ATN edge(s) to deliver to the drive VIA1 (the inline VICE
+                        // `viacore_signal(via1d1541, VIA_SIG_CA1, ...)`).
+                        let atn_edges = self.iec.iecbus_callback_write((!new_out) & 0xff, self.clk + 1);
                         // ATN-edge → drive VIA1 CA1: the C64 driving ATN raises the
                         // drive's attention IRQ (DOS $FE67 → $E85B). VICE
                         // iecbus_cpu_write_conf1 signals VIA1 CA1 right after the
                         // ATN-edge detect, before the drv_bus recompute. We stamp it at
                         // the drive clock the push-flush just reached. The hardware
                         // ATN-acknowledge (drive auto-pulls DATA) is already folded by
-                        // recompute_drv_bus's cpu_bus term inside c64_store_dd00.
-                        if let Some(atn_high) = atn_edge {
-                            let dclk = self.drive.drive_clk;
-                            self.drive.atn_edge_to_via1_ca1(atn_high, dclk);
+                        // the recompute_drv_bus cpu_bus term inside the conf1 write.
+                        for (_dnr, edge) in atn_edges {
+                            if let crate::iec::AtnEdge::Via1Ca1 { sig } = edge {
+                                let dclk = self.drive.drive_clk;
+                                self.drive.atn_edge_to_via1_ca1(sig, dclk);
+                            }
+                            // Other AtnEdge variants (1581/2000/4000/CMDHD) are
+                            // unreachable in the single-1541 shape (unit 8 = Drive1541).
                         }
                     }
                 }

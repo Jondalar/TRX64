@@ -184,7 +184,7 @@ fn dd00_fast_probe() {
             if (25_895_700..=25_896_100).contains(&c64clk) {
                 let pb = m.drive8.via1_pb_iec_output();
                 if pb != last_pb || pb_trace.len() < 80 {
-                    pb_trace.push((c64clk, m.cpu6510.reg_pc, pb, m.iec.cpu_port, dpc));
+                    pb_trace.push((c64clk, m.cpu6510.reg_pc, pb, m.iec.iecbus.cpu_port, dpc));
                 }
                 last_pb = pb;
             }
@@ -331,9 +331,9 @@ fn dd00_fast_probe() {
         m.drive8.core.reg_pc,
         m.drive8.drive_clk,
         m.drive8.via1_pb_iec_output(),
-        m.iec.cpu_port,
-        m.iec.drv_port,
-        m.iec.cpu_bus,
+        m.iec.iecbus.cpu_port,
+        m.iec.iecbus.drv_port,
+        m.iec.iecbus.cpu_bus,
     );
     // Drive RAM where the fast-loader transfer code was uploaded ($0700-$0730).
     eprintln!(

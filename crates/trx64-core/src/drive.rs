@@ -1042,18 +1042,17 @@ impl Drive1541 {
     }
 
     /// Deliver an IEC ATN-line edge to the drive's VIA1 CA1 input (= VICE
-    /// iecbus.c:440-446: `viacore_signal(via1d1541, VIA_SIG_CA1,
+    /// iecbus.c:264-266: `viacore_signal(unit->via1d1541, VIA_SIG_CA1,
     /// iec_old_atn ? 0 : VIA_SIG_RISE)`, where `iec_old_atn = cpu_bus & 0x10` is the
     /// NEW ATN line state). The C64 asserting ATN drives the drive's attention IRQ
-    /// (DOS $FE67 → $E85B handler) via VIA1 CA1. `atn_high` is the new ATN line level
-    /// (the `Some(..)` returned by `IecCore::c64_store_dd00`): VICE signals a CA1
-    /// RISE when ATN is now LOW (`atn_high == false`), a FALL when ATN is now HIGH.
-    /// `clk` is the drive clock the edge is stamped at (the push-flush target).
+    /// (DOS $FE67 → $E85B handler) via VIA1 CA1. `sig` is the edge code the iecbus
+    /// write-conf1 path computed (`AtnEdge::Via1Ca1 { sig }`): `VIA_SIG_RISE` (1)
+    /// when ATN is now LOW, `0` (no-edge) when ATN is now HIGH — exactly the value
+    /// VICE hands `viacore_signal`. `clk` is the drive clock the edge is stamped at.
     #[inline]
-    pub fn atn_edge_to_via1_ca1(&mut self, atn_high: bool, clk: u64) {
-        let edge: u8 = if atn_high { 0 } else { 1 }; // FALL when high, RISE when low
+    pub fn atn_edge_to_via1_ca1(&mut self, sig: u8, clk: u64) {
         self.via1.run_alarms(clk);
-        self.via1.signal_ca1(edge, clk);
+        self.via1.signal_ca1(sig, clk);
     }
 
     /// Reset PC from the ROM vector (re-read). Returns the resolved PC.

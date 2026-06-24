@@ -206,7 +206,7 @@ fn scramble_run_trace() {
         eprintln!("last drive PC at hang=${:04X}", last_drv_pc);
         eprintln!(
             "loader IEC state: cpu_port=${:02X} drv_port=${:02X} cpu_bus=${:02X} drvPB=${:02X} C64_PC=${:04X}",
-            m.iec.cpu_port, m.iec.drv_port, m.iec.cpu_bus, m.drive8.via1_pb_iec_output(), m.cpu6510.reg_pc
+            m.iec.iecbus.cpu_port, m.iec.iecbus.drv_port, m.iec.iecbus.cpu_bus, m.drive8.via1_pb_iec_output(), m.cpu6510.reg_pc
         );
         let (ifr, ier, pcr, irq_active, irq_stamp) = m.drive8.via1_irq_debug();
         eprintln!(

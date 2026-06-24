@@ -174,14 +174,14 @@ fn ser_drivecpu() -> Vec<u8> {
 /// driveClkReleased, driveDataReleased, driveAtnAckReleased
 fn ser_iecbus(machine: &Machine) -> Vec<u8> {
     let iec = &machine.iec;
-    let c64atn = if (iec.cpu_bus & 0x10) != 0 { 1u8 } else { 0u8 };
-    let c64clk = if (iec.cpu_bus & 0x40) != 0 { 1u8 } else { 0u8 };
-    let c64data = if (iec.cpu_bus & 0x80) != 0 { 1u8 } else { 0u8 };
-    // Drive bus: drv_bus_8 bit6=CLK, bit7=DATA
-    let drv_clk = if (iec.drv_bus_8 & 0x40) != 0 { 1u8 } else { 0u8 };
-    let drv_data = if (iec.drv_bus_8 & 0x80) != 0 { 1u8 } else { 0u8 };
-    // ATN ACK: use drv_data_8 bit4
-    let drv_atn_ack = if (iec.drv_data_8 & 0x10) != 0 { 1u8 } else { 0u8 };
+    let c64atn = if (iec.iecbus.cpu_bus & 0x10) != 0 { 1u8 } else { 0u8 };
+    let c64clk = if (iec.iecbus.cpu_bus & 0x40) != 0 { 1u8 } else { 0u8 };
+    let c64data = if (iec.iecbus.cpu_bus & 0x80) != 0 { 1u8 } else { 0u8 };
+    // Drive bus: drv_bus[8] bit6=CLK, bit7=DATA
+    let drv_clk = if (iec.iecbus.drv_bus[8] & 0x40) != 0 { 1u8 } else { 0u8 };
+    let drv_data = if (iec.iecbus.drv_bus[8] & 0x80) != 0 { 1u8 } else { 0u8 };
+    // ATN ACK: use drv_data[8] bit4
+    let drv_atn_ack = if (iec.iecbus.drv_data[8] & 0x10) != 0 { 1u8 } else { 0u8 };
     vec![c64atn, c64clk, c64data, drv_clk, drv_data, drv_atn_ack]
 }
 
@@ -378,18 +378,18 @@ fn load_iecbus(machine: &mut Machine, data: &[u8]) -> Result<(), String> {
     let clk_released = data[1] != 0;
     let data_released = data[2] != 0;
     let iec = &mut machine.iec;
-    iec.cpu_bus = 0u8
+    iec.iecbus.cpu_bus = 0u8
         | if atn_released { 0x10 } else { 0 }
         | if clk_released { 0x40 } else { 0 }
         | if data_released { 0x80 } else { 0 };
-    // drv_bus_8 from driveClkReleased/driveDataReleased
+    // drv_bus[8] from driveClkReleased/driveDataReleased
     let drv_clk = data[3] != 0;
     let drv_data = data[4] != 0;
-    iec.drv_bus_8 = 0u8
+    iec.iecbus.drv_bus[8] = 0u8
         | if drv_clk { 0x40 } else { 0 }
         | if drv_data { 0x80 } else { 0 };
-    // Update derived ports.
-    iec.update_ports();
+    // Update derived ports (= iec_update_ports / c64iec.c:126-138).
+    iec.iec_update_ports();
     Ok(())
 }
 

@@ -950,10 +950,12 @@ impl Machine {
             // live bus state in first (so the drive's PB reads see the C64 lines),
             // then re-fold the drive's PB output into the IEC core for the next
             // instruction's $DD00 reads.
-            self.drive8.iec_drv_port = self.iec.drv_port;
-            self.drive8.iec_cpu_bus = self.iec.cpu_bus;
+            self.drive8.iec_drv_port = self.iec.iecbus.drv_port;
+            self.drive8.iec_cpu_bus = self.iec.iecbus.cpu_bus;
             self.drive_c64_ref = self.drive8.catch_up_to(self.c64_core.clk, self.drive_c64_ref);
-            self.iec.drive_store_pb(self.drive8.via1_pb_iec_output());
+            // = via1d1541.c store_prb / iec_drive_write(~byte): fold the drive's PB
+            // output (inverted) into the bus + iec_update_ports for the next $DD00 read.
+            self.iec.iec_drive_write((!self.drive8.via1_pb_iec_output()) & 0xff, 0);
             if let Some((pc, a, x, y, sp, p, drv_clk)) = self.drive8.sample_pc_change() {
                 on_drive_step(pc, a, x, y, sp, p, drv_clk);
             }
