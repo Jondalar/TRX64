@@ -19,7 +19,7 @@ use crate::{
     drive_6510core::{
         drive_6510core_execute, DriveCore6510, DriveCore6510Bus, IntStatus, IK_RESET,
     },
-    gcr::GcrImage,
+    gcr::{GcrImage, WritebackKind},
     iec::IecbusT,
     rotation::Rotation,
     viacore::{self, Via1Irq, Via1dBackend, Via2Irq, Via2dBackend, ViaContext},
@@ -802,23 +802,60 @@ impl Drive1541 {
     /// D64 encoder produces, so the rotation engine reads it identically —
     /// including half-tracks + copy-protection.
     pub fn attach_disk(&mut self, image: DiskImage) {
-        let gcr = match image.kind {
-            DiskKind::D64 => Some(GcrImage::from_d64(&image.bytes)),
-            DiskKind::G64 => Some(GcrImage::from_g64(&image.bytes)),
+        let (gcr, wb_kind) = match image.kind {
+            DiskKind::D64 => (Some(GcrImage::from_d64(&image.bytes)), WritebackKind::D64),
+            DiskKind::G64 => (Some(GcrImage::from_g64(&image.bytes)), WritebackKind::G64),
         };
         if let Some(gcr) = gcr {
-            self.rotation.attach(gcr, self.drive_clk);
+            // Wire the raw on-disk image bytes as the write-back target so a
+            // drive write (rotation `write_next_bit` → `gcr_dirty_track`) is
+            // serialized back into the image on head-move / detach / flush
+            // (= VICE `fsimage->fd`). 1:1 with c64re BUG-023 write-through.
+            self.rotation.attach_with_writeback(
+                gcr,
+                self.drive_clk,
+                Some((image.bytes.clone(), wb_kind, image.read_only)),
+            );
         }
         self.disk = Some(image);
     }
 
-    /// Detach (eject) the disk from this drive.
+    /// Detach (eject) the disk from this drive. Flushes any pending dirty track
+    /// back into `disk.bytes` first (VICE `drive_image_detach` →
+    /// `drive_gcr_data_writeback`), so an eject persists a pending write.
     pub fn detach_disk(&mut self) {
+        self.flush_disk_writeback();
         self.disk = None;
         self.rotation.detach();
     }
 
+    /// Flush any pending dirty GCR track back into `self.disk.bytes` (the
+    /// authoritative on-disk image the daemon persists/hashes/snapshots). Mirrors
+    /// VICE `drive_gcr_data_writeback_all` being called before `fsimage->fd` is
+    /// read. Cheap no-op when nothing is dirty. Returns whether bytes changed.
+    pub fn flush_disk_writeback(&mut self) -> bool {
+        if !self.rotation.has_dirty_track() {
+            return false;
+        }
+        // Serialize the dirty track into the rotation's write-back buffer, then
+        // mirror it into the DiskImage the daemon reads.
+        if let Some(synced) = self.rotation.writeback_bytes_synced() {
+            if let Some(disk) = self.disk.as_mut() {
+                disk.bytes = synced;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Get a reference to the currently attached disk image, if any.
+    ///
+    /// This does NOT flush in-flight drive writes (it borrows `&self`). Callers
+    /// that read `disk.bytes` for persist / sha / snapshot MUST call
+    /// [`flush_disk_writeback`] first (the daemon does), mirroring VICE flushing
+    /// `drive_gcr_data_writeback_all` before reading `fsimage->fd`. Metadata-only
+    /// callers (backing path, kind) need no flush.
+    /// [`flush_disk_writeback`]: Drive1541::flush_disk_writeback
     pub fn get_attached_disk(&self) -> Option<&DiskImage> {
         self.disk.as_ref()
     }
