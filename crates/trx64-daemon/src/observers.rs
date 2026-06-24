@@ -931,3 +931,340 @@ impl CoreObserver for ObserverRegistry {
         self.halt_requested
     }
 }
+
+// ============================================================================
+// Behavioral tests — mirror the c64re monitor-observers tests + prove the policy
+// drives the machine end-to-end over the Phase-0 core hooks.
+// ============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use trx64_core::RunStop;
+
+    const ROM_DIR: &str = "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/resources/roms";
+
+    fn roms_present() -> bool {
+        Path::new(ROM_DIR).join("kernal-901227-03.bin").exists()
+    }
+
+    fn booted() -> Machine {
+        let mut m = Machine::new();
+        m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+        m
+    }
+
+    // ---- cond-AST: parse_cond + eval_node ----------------------------------
+
+    #[test]
+    fn parse_cond_numbers_and_ids() {
+        // $hex, %binary, decimal, and the env ids.
+        assert_eq!(parse_cond("$EA31").unwrap(), CondNode::Num(0xEA31));
+        assert_eq!(parse_cond("%1010").unwrap(), CondNode::Num(0b1010));
+        assert_eq!(parse_cond("42").unwrap(), CondNode::Num(42));
+        assert_eq!(parse_cond("a").unwrap(), CondNode::Id(EnvId::A));
+        assert_eq!(parse_cond("PC").unwrap(), CondNode::Id(EnvId::Pc)); // case-insensitive
+    }
+
+    #[test]
+    fn parse_cond_precedence_or_below_and_below_cmp() {
+        // `a == 1 && x == 2 || y == 3` parses as (and || ...) with cmp tightest.
+        let t = parse_cond("a==1 && x==2 || y==3").unwrap();
+        // Top node is OR.
+        match t {
+            CondNode::Bin { op: CondOp::Or, l, r } => {
+                assert!(matches!(*l, CondNode::Bin { op: CondOp::And, .. }));
+                assert!(matches!(*r, CondNode::Bin { op: CondOp::Eq, .. }));
+            }
+            _ => panic!("expected top-level OR"),
+        }
+    }
+
+    #[test]
+    fn parse_cond_parens_and_errors() {
+        assert!(parse_cond("(a == 1)").is_ok());
+        assert!(parse_cond("a == ").is_err()); // unexpected end
+        assert!(parse_cond("(a == 1").is_err()); // missing )
+        assert!(parse_cond("zzz").is_err()); // unknown term
+        assert!(parse_cond("a == 1 1").is_err()); // trailing token
+    }
+
+    #[test]
+    fn eval_node_comparisons_and_logic() {
+        let env = CondEnv { a: 0x42, x: 2, pc: 0xEA31, ..Default::default() };
+        assert_eq!(eval_node(&parse_cond("a == $42").unwrap(), &env), 1);
+        assert_eq!(eval_node(&parse_cond("a != $42").unwrap(), &env), 0);
+        assert_eq!(eval_node(&parse_cond("a > 1 && x < 3").unwrap(), &env), 1);
+        assert_eq!(eval_node(&parse_cond("a < 1 || x == 2").unwrap(), &env), 1);
+        assert_eq!(eval_node(&parse_cond("pc == $EA31").unwrap(), &env), 1);
+        assert_eq!(eval_node(&parse_cond("pc >= $EA00 && pc <= $EAFF").unwrap(), &env), 1);
+    }
+
+    // ---- rebuild() presence tables -----------------------------------------
+
+    #[test]
+    fn rebuild_fills_exec_and_access_tables() {
+        let mut reg = ObserverRegistry::new();
+        reg.add(ObsSpec {
+            name: "bp".into(), trigger: ObsTrigger::Exec, lo: 0x1000, hi: 0x1002,
+            cond_src: None, action: ObsAction::Break, log_exprs: None,
+            cmd_src: None, mark_label: None, trace_scope: None,
+        }).unwrap();
+        reg.add(ObsSpec {
+            name: "wp".into(), trigger: ObsTrigger::Store, lo: 0x2000, hi: 0x2000,
+            cond_src: None, action: ObsAction::Break, log_exprs: None,
+            cmd_src: None, mark_label: None, trace_scope: None,
+        }).unwrap();
+        assert!(reg.exec_active);
+        assert!(reg.access_armed());
+        assert_eq!(reg.exec_watch[0x1000], 1);
+        assert_eq!(reg.exec_watch[0x1002], 1);
+        assert_eq!(reg.exec_watch[0x1003], 0);
+        assert_eq!(reg.access_watch[0x2000], 1);
+        assert_eq!(reg.access_watch[0x2001], 0);
+        // exec breakpoint set carries the range.
+        let set = reg.exec_breakpoint_set().unwrap();
+        assert!(set.contains(&0x1000) && set.contains(&0x1001) && set.contains(&0x1002));
+        // disabling clears it from the table.
+        reg.set_enabled("bp", false);
+        assert!(!reg.exec_active);
+        assert_eq!(reg.exec_watch[0x1000], 0);
+    }
+
+    // ---- on_exec: hit/ignore/cond ------------------------------------------
+
+    #[test]
+    fn on_exec_hit_and_ignore_counts() {
+        let mut reg = ObserverRegistry::new();
+        reg.add(ObsSpec {
+            name: "bp".into(), trigger: ObsTrigger::Exec, lo: 0x1000, hi: 0x1000,
+            cond_src: None, action: ObsAction::Break, log_exprs: None,
+            cmd_src: None, mark_label: None, trace_scope: None,
+        }).unwrap();
+        // ignore the first 2 hits → 3rd is the real halt.
+        reg.set_ignore("bp", 2);
+        reg.set_env(CpuSnapshot::default());
+        assert!(!reg.on_exec(0x1000), "1st (ignored)");
+        assert!(!reg.on_exec(0x1000), "2nd (ignored)");
+        assert!(reg.on_exec(0x1000), "3rd → halt");
+        assert_eq!(reg.get("bp").unwrap().hits, 1, "only the real hit bumps the count");
+    }
+
+    #[test]
+    fn on_exec_conditional_gate() {
+        let mut reg = ObserverRegistry::new();
+        reg.add(ObsSpec {
+            name: "cbp".into(), trigger: ObsTrigger::Exec, lo: 0x2000, hi: 0x2000,
+            cond_src: Some("a == $42".into()), action: ObsAction::Break, log_exprs: None,
+            cmd_src: None, mark_label: None, trace_scope: None,
+        }).unwrap();
+        // a != $42 → no halt, no hit.
+        reg.set_env(CpuSnapshot { a: 0x10, ..Default::default() });
+        assert!(!reg.on_exec(0x2000));
+        assert_eq!(reg.get("cbp").unwrap().hits, 0);
+        // a == $42 → halt + hit.
+        reg.set_env(CpuSnapshot { a: 0x42, ..Default::default() });
+        assert!(reg.on_exec(0x2000));
+        assert_eq!(reg.get("cbp").unwrap().hits, 1);
+    }
+
+    // ---- log action: print + continue (no halt) ----------------------------
+
+    #[test]
+    fn log_action_does_not_halt_and_records() {
+        let mut reg = ObserverRegistry::new();
+        reg.add(ObsSpec {
+            name: "tp".into(), trigger: ObsTrigger::Exec, lo: 0x3000, hi: 0x3000,
+            cond_src: None, action: ObsAction::Log, log_exprs: None,
+            cmd_src: None, mark_label: None, trace_scope: None,
+        }).unwrap();
+        reg.set_env(CpuSnapshot { a: 0x99, pc: 0x3000, ..Default::default() });
+        assert!(!reg.on_exec(0x3000), "log never halts");
+        let lines = reg.drain_pending_log();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("obs tp:"));
+        assert!(lines[0].contains("exec $3000"));
+    }
+
+    // ---- end-to-end driver (mirrors run_until_break) -----------------------
+
+    /// Segment-run a booted machine with the registry driving the core gates,
+    /// halting at the first real breakpoint/watchpoint. Returns (halted, pc).
+    fn drive(m: &mut Machine, reg: &mut ObserverRegistry, budget: u64) -> (bool, u16, &'static str) {
+        let start = m.clk;
+        reg.clear_halt();
+        let bp_set = reg.exec_breakpoint_set();
+        loop {
+            let elapsed = m.clk.wrapping_sub(start);
+            if elapsed >= budget {
+                return (false, m.c64_core.reg_pc, "budget");
+            }
+            reg.set_env(CpuSnapshot::from_machine(m));
+            let aw = reg.access_watch_owned();
+            let stop = m.run_for_full_capped_dbg(
+                budget - elapsed,
+                (budget - elapsed).div_ceil(2) + 1000,
+                bp_set.as_ref(),
+                None,
+                aw.as_deref(),
+                reg,
+                |_, _, _, _, _, _, _| {},
+            );
+            match stop {
+                RunStop::Breakpoint(pc) => {
+                    reg.set_env(CpuSnapshot::from_machine(m));
+                    if reg.on_exec(pc) {
+                        return (true, pc, "breakpoint");
+                    }
+                    // cond false / ignored: step one instr past pc + resume.
+                    let mut null = trx64_core::NullSink;
+                    m.run_for_full_capped(999_999, 1, &mut null, |_, _, _, _, _, _, _| {});
+                }
+                RunStop::Observer => return (true, m.c64_core.reg_pc, "observer"),
+                RunStop::CycleBudget | RunStop::Completed => {}
+            }
+        }
+    }
+
+    /// (a) A PC breakpoint via the registry → the run halts at it, hitCount = 1.
+    #[test]
+    fn e2e_pc_breakpoint_halts_and_counts() {
+        if !roms_present() { eprintln!("ROMs absent; skip"); return; }
+        let mut m = booted();
+        let mut reg = ObserverRegistry::new();
+        // $EA31 = the KERNAL IRQ handler, reached during boot after the first IRQ.
+        reg.add(ObsSpec {
+            name: "irq".into(), trigger: ObsTrigger::Exec, lo: 0xEA31, hi: 0xEA31,
+            cond_src: None, action: ObsAction::Break, log_exprs: None,
+            cmd_src: None, mark_label: None, trace_scope: None,
+        }).unwrap();
+        let (halted, pc, reason) = drive(&mut m, &mut reg, 5_000_000);
+        assert!(halted, "PC breakpoint never halted");
+        assert_eq!(pc, 0xEA31);
+        assert_eq!(reason, "breakpoint");
+        assert_eq!(reg.get("irq").unwrap().hits, 1, "hitCount must increment to 1");
+    }
+
+    /// (b) A STORE watchpoint → halts on the access.
+    #[test]
+    fn e2e_store_watchpoint_halts() {
+        if !roms_present() { eprintln!("ROMs absent; skip"); return; }
+        // Find a low-RAM address the boot writes to (guaranteed hit).
+        let target = {
+            let mut m = booted();
+            let mut reg = ObserverRegistry::new();
+            reg.add(ObsSpec {
+                name: "w".into(), trigger: ObsTrigger::Store, lo: 0x0002, hi: 0x00ff,
+                cond_src: Some("addr == addr".into()), // always-true, log to discover
+                action: ObsAction::Log, log_exprs: None,
+                cmd_src: None, mark_label: None, trace_scope: None,
+            }).unwrap();
+            // run a short window collecting the first store addr from on_access.
+            reg.set_env(CpuSnapshot::from_machine(&m));
+            let aw = reg.access_watch_owned();
+            let mut probe = StoreProbe::default();
+            // Re-run with a plain probe to capture the first write addr.
+            let _ = aw;
+            m.run_for_full_capped_dbg(
+                200_000, 120_000, None, None,
+                Some(&*reg.access_watch), &mut probe, |_, _, _, _, _, _, _| {});
+            probe.first_write.expect("boot wrote no low-RAM byte")
+        };
+        let mut m = booted();
+        let mut reg = ObserverRegistry::new();
+        reg.add(ObsSpec {
+            name: "w".into(), trigger: ObsTrigger::Store, lo: target, hi: target,
+            cond_src: None, action: ObsAction::Break, log_exprs: None,
+            cmd_src: None, mark_label: None, trace_scope: None,
+        }).unwrap();
+        let (halted, _pc, reason) = drive(&mut m, &mut reg, 2_000_000);
+        assert!(halted, "store watchpoint on ${target:04X} never halted");
+        assert_eq!(reason, "observer");
+        assert!(reg.get("w").unwrap().hits >= 1);
+    }
+
+    /// A throwaway core observer that records the first WRITE address (used to
+    /// discover a guaranteed-written boot address for the watchpoint test).
+    #[derive(Default)]
+    struct StoreProbe { first_write: Option<u16> }
+    impl CoreObserver for StoreProbe {
+        #[allow(clippy::too_many_arguments)]
+        fn on_instruction(&mut self, _: u16, _: u8, _: u8, _: u8, _: u8, _: u8, _: u8, _: u8, _: u8, _: u64) {}
+        fn on_bus(&mut self, _: BusKind, _: u16, _: u8, _: u16, _: u64, _: u8) {}
+        fn on_interrupt(&mut self, _: u16, _: u64) {}
+        fn on_access(&mut self, kind: BusKind, addr: u16, _value: u8) -> bool {
+            if kind == BusKind::Write && self.first_write.is_none() {
+                self.first_write = Some(addr);
+            }
+            false
+        }
+    }
+
+    /// (c) A CONDITIONAL breakpoint halts only when the cond is true.
+    #[test]
+    fn e2e_conditional_breakpoint() {
+        if !roms_present() { eprintln!("ROMs absent; skip"); return; }
+        // At $EA31 the IRQ handler runs many times. A cond that is NEVER true must
+        // not halt within the budget; a cond that IS true (pc==$EA31) must halt.
+        let mut m = booted();
+        let mut reg = ObserverRegistry::new();
+        reg.add(ObsSpec {
+            name: "never".into(), trigger: ObsTrigger::Exec, lo: 0xEA31, hi: 0xEA31,
+            cond_src: Some("a == $FF && a == $00".into()), // contradiction → never
+            action: ObsAction::Break, log_exprs: None,
+            cmd_src: None, mark_label: None, trace_scope: None,
+        }).unwrap();
+        let (halted, _pc, _r) = drive(&mut m, &mut reg, 3_000_000);
+        assert!(!halted, "contradiction cond must never halt");
+        assert_eq!(reg.get("never").unwrap().hits, 0);
+
+        // Now a satisfiable cond on the SAME PC: pc == $EA31 (always true there).
+        let mut m2 = booted();
+        let mut reg2 = ObserverRegistry::new();
+        reg2.add(ObsSpec {
+            name: "yes".into(), trigger: ObsTrigger::Exec, lo: 0xEA31, hi: 0xEA31,
+            cond_src: Some("pc == $EA31".into()), action: ObsAction::Break, log_exprs: None,
+            cmd_src: None, mark_label: None, trace_scope: None,
+        }).unwrap();
+        let (halted2, pc2, _r2) = drive(&mut m2, &mut reg2, 5_000_000);
+        assert!(halted2, "satisfiable cond must halt");
+        assert_eq!(pc2, 0xEA31);
+        assert_eq!(reg2.get("yes").unwrap().hits, 1);
+    }
+
+    /// (d) ignore-count N → halts on the (N+1)th hit.
+    #[test]
+    fn e2e_ignore_count_halts_on_nth_plus_one() {
+        if !roms_present() { eprintln!("ROMs absent; skip"); return; }
+        let mut m = booted();
+        let mut reg = ObserverRegistry::new();
+        reg.add(ObsSpec {
+            name: "irq".into(), trigger: ObsTrigger::Exec, lo: 0xEA31, hi: 0xEA31,
+            cond_src: None, action: ObsAction::Break, log_exprs: None,
+            cmd_src: None, mark_label: None, trace_scope: None,
+        }).unwrap();
+        reg.set_ignore("irq", 2); // skip first 2 → halt on the 3rd
+        let (halted, pc, _r) = drive(&mut m, &mut reg, 10_000_000);
+        assert!(halted, "ignore-count bp never halted within budget");
+        assert_eq!(pc, 0xEA31);
+        // hits is bumped ONLY on the real (3rd) trigger → exactly 1.
+        assert_eq!(reg.get("irq").unwrap().hits, 1);
+        assert_eq!(reg.get("irq").unwrap().ignore_left, 0, "ignore fully consumed");
+    }
+
+    /// (e) `until <addr>` reaches the target (modeled as an ephemeral exec bp).
+    #[test]
+    fn e2e_until_reaches_target() {
+        if !roms_present() { eprintln!("ROMs absent; skip"); return; }
+        let mut m = booted();
+        let mut reg = ObserverRegistry::new();
+        reg.add(ObsSpec {
+            name: "__until__".into(), trigger: ObsTrigger::Exec, lo: 0xEA31, hi: 0xEA31,
+            cond_src: None, action: ObsAction::Break, log_exprs: None,
+            cmd_src: None, mark_label: None, trace_scope: None,
+        }).unwrap();
+        let (halted, pc, _r) = drive(&mut m, &mut reg, 5_000_000);
+        assert!(halted, "until $EA31 never reached");
+        assert_eq!(pc, 0xEA31);
+    }
+}
