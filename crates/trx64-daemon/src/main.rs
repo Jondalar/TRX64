@@ -2839,28 +2839,63 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         // sha256/bytes). NOTE: a .c64re written by c64re is NOT readable here and
         // vice-versa (different container) — cross-runtime snapshot exchange is a
         // later batch (needs the native-snapshot codec primitive).
+        // ── Spec 707 / ADR-077 — native `.c64re` snapshot dump/undump ─────────
+        // The FILE is now the real c64re `.c64re` container (magic "C64RESNP" +
+        // sha256(gzip(doc)), doc = { manifest, checkpoint:<RuntimeCheckpoint>,
+        // mediaPayloads }). A live c64re daemon can `snapshot/undump` a TRX64 dump
+        // and TRX64 can undump a c64re dump (the checkpoint shape is 1:1). The WS
+        // response shape stays identical to c64re's DumpResult/UndumpResult.
         "snapshot/dump" => {
             let path = match req.params.get("path").and_then(|v| v.as_str()) {
                 Some(p) => p.to_string(),
                 None => return Response::err(id, -32602, "snapshot/dump: path required"),
             };
             let st = state.lock().unwrap();
-            let bytes = trx64_core::vsf::save_vsf(&st.session.machine);
-            let cycle = st.session.machine.clk;
-            let pc = st.session.machine.cpu6510.reg_pc as u64;
-            let media = gather_snapshot_media(&st.session);
+            let m = &st.session.machine;
+            // Disk path/format for the checkpoint `media` metadata.
+            let (disk_path, disk_format) = match m.drive8.get_attached_disk() {
+                Some(d) => (
+                    d.backing_path.clone().unwrap_or_default(),
+                    match d.kind { DiskKind::G64 => "g64", DiskKind::D64 => "d64" }.to_string(),
+                ),
+                None => (String::new(), String::new()),
+            };
+            // The RuntimeCheckpoint payload (drive1541 blob = part 4, null today).
+            let checkpoint = trx64_core::c64re_snapshot::capture_runtime_checkpoint(
+                m, &disk_path, &disk_format, None, None,
+            );
+            let cycle = m.c64_core.clk as i64;
+            let pc = m.c64_core.reg_pc as i64;
+            // Embedded media inputs (clean disk/cart bytes, role/format/sourceName).
+            let media_inputs = gather_native_media_inputs(&st.session);
+            // The `media` summary for the WS response (role/format/sourceName/
+            // sha256/bytes) — matches c64re's DumpResult.media.
+            let media_summary = gather_snapshot_media(&st.session);
             let breakpoints = st.breakpoints.entries.len() as u64;
             drop(st);
+
+            let bytes = trx64_core::native_snapshot::write_native_snapshot(
+                trx64_core::native_snapshot::WriteNativeSnapshotArgs {
+                    checkpoint,
+                    schema_version: trx64_core::c64re_snapshot::RUNTIME_CHECKPOINT_SCHEMA_VERSION,
+                    media: media_inputs,
+                    runtime_version: "trx64-runtime/1".to_string(),
+                    machine_model: "c64-pal".to_string(),
+                    provenance: None,
+                    pc,
+                    cycle,
+                },
+            );
             if let Some(parent) = std::path::Path::new(&path).parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
             match std::fs::write(&path, &bytes) {
                 Ok(()) => Response::ok(id, json!({
                     "path": path,
-                    "cycle": cycle,
-                    "pc": pc,
+                    "cycle": cycle as u64,
+                    "pc": pc as u64,
                     "machine": "c64-pal",
-                    "media": media,
+                    "media": media_summary,
                     "fileBytes": bytes.len() as u64,
                     "breakpoints": breakpoints
                 })),
@@ -2877,12 +2912,48 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 Ok(b) => b,
                 Err(e) => return Response::err(id, -32001, format!("snapshot/undump: cannot read {path}: {e}")),
             };
+            // Read + validate the container (magic / version / sha256 / media sha).
+            let read = match trx64_core::native_snapshot::read_native_snapshot(&file_bytes) {
+                Ok(r) => r,
+                Err(e) => return Response::err(id, -32001, format!("snapshot/undump: {e}")),
+            };
             let mut st = state.lock().unwrap();
-            match trx64_core::vsf::load_vsf(&mut st.session.machine, &file_bytes) {
-                Ok(_) => {
-                    let cycle = st.session.machine.clk;
-                    let pc = st.session.machine.cpu6510.reg_pc as u64;
-                    let media = gather_snapshot_media(&st.session);
+
+            // Re-establish embedded media FIRST (drive8 disk) so a fresh-session
+            // undump has the disk attached, then restore the checkpoint.
+            let mut media_summary: Vec<Value> = Vec::new();
+            for rm in &read.media {
+                if rm.reference.role != "drive8" { continue; }
+                let bytes = match &rm.bytes {
+                    Some(b) => b.clone(),
+                    None => return Response::err(id, -32001, format!(
+                        "snapshot/undump: media {} has no embedded payload (v1 needs embedded bytes)",
+                        rm.reference.role
+                    )),
+                };
+                let kind = if rm.reference.format == "d64" { DiskKind::D64 } else { DiskKind::G64 };
+                let disk = DiskImage {
+                    kind,
+                    bytes: bytes.clone(),
+                    backing_path: rm.reference.source_name.clone(),
+                    read_only: false,
+                };
+                st.session.machine.drive8.attach_disk(disk);
+                media_summary.push(json!({
+                    "role": rm.reference.role,
+                    "format": rm.reference.format,
+                    "sourceName": rm.reference.source_name,
+                    "sha256": rm.reference.sha256,
+                    "bytes": bytes.len() as u64
+                }));
+            }
+
+            match trx64_core::c64re_snapshot::restore_runtime_checkpoint(
+                &mut st.session.machine, &read.checkpoint,
+            ) {
+                Ok(_drive_blob) => {
+                    let cycle = st.session.machine.c64_core.clk;
+                    let pc = st.session.machine.c64_core.reg_pc as u64;
                     let breakpoints = st.breakpoints.entries.len() as u64;
                     // An undump is a restore → the session is paused.
                     st.session.running = false;
@@ -2890,8 +2961,8 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                         "path": path,
                         "cycle": cycle,
                         "pc": pc,
-                        "machine": "c64-pal",
-                        "media": media,
+                        "machine": read.manifest.machine.model,
+                        "media": media_summary,
                         "breakpoints": breakpoints,
                         "paused": true
                     }))
@@ -3017,6 +3088,43 @@ fn gather_snapshot_media(session: &Session) -> Vec<Value> {
             "sha256": sha256_hex(&img.raw_bytes),
             "bytes": img.raw_bytes.len() as u64
         }));
+    }
+    out
+}
+
+/// Build the embedded-media INPUTS for the `.c64re` container (clean source
+/// bytes per role) — 1:1 with c64re snapshot-persistence.ts `gatherMedia`. The
+/// drive8 disk + any attached cartridge ride as embedded payloads so an undump
+/// (TRX64 or c64re) re-establishes the media. sha256 is computed by the writer.
+fn gather_native_media_inputs(
+    session: &Session,
+) -> Vec<trx64_core::native_snapshot::NativeSnapshotMediaInput> {
+    use trx64_core::native_snapshot::NativeSnapshotMediaInput;
+    let mut out = Vec::new();
+    let m = &session.machine;
+    if let Some(disk) = m.drive8.get_attached_disk() {
+        let format = match disk.kind { DiskKind::G64 => "g64", DiskKind::D64 => "d64" };
+        let source_name = disk
+            .backing_path
+            .as_ref()
+            .and_then(|p| p.rsplit('/').next())
+            .map(String::from);
+        out.push(NativeSnapshotMediaInput {
+            role: "drive8".to_string(),
+            format: format.to_string(),
+            source_name,
+            bytes: Some(disk.bytes.clone()),
+            sha256: None,
+        });
+    }
+    if let Some(img) = m.cartridge_image.as_ref() {
+        out.push(NativeSnapshotMediaInput {
+            role: "cartridge".to_string(),
+            format: "crt".to_string(),
+            source_name: Some(img.name.clone()),
+            bytes: Some(img.raw_bytes.clone()),
+            sha256: None,
+        });
     }
     out
 }
@@ -3548,6 +3656,48 @@ mod batch1_tests {
         assert!(u["media"].is_array());
         assert!(u["breakpoints"].is_u64());
         assert_eq!(u["paused"], json!(true));
+
+        // The on-disk file is a real `.c64re` container (magic "C64RESNP").
+        let raw = std::fs::read(&snap).unwrap();
+        assert_eq!(&raw[0..8], b"C64RESNP", "snapshot file is a .c64re container");
+        assert_eq!(raw[8], 1, "format version 1");
+    }
+
+    #[test]
+    fn snapshot_restores_c64_state_through_container() {
+        // End-to-end: load a PRG, dump → mutate RAM/PC → undump → the dumped
+        // state is restored (proving the .c64re checkpoint carries real state).
+        let st = make_state();
+        let dir = std::env::temp_dir().join("trx64-c64re-state-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let prg = dir.join("body.prg");
+        std::fs::write(&prg, [0x00u8, 0xc0, 0xa9, 0x2a, 0x60]).unwrap(); // $C000: LDA #$2A; RTS
+        call(&st, "session/load_prg", json!({ "prg_path": prg.to_string_lossy() }));
+
+        // Capture the pre-dump RAM/PC.
+        let (pre_pc, pre_byte) = {
+            let g = st.lock().unwrap();
+            (g.session.machine.c64_core.reg_pc, g.session.machine.read_full(0xc000))
+        };
+        assert_eq!(pre_byte, 0xa9);
+
+        let snap = dir.join("state.c64re");
+        call(&st, "snapshot/dump", json!({ "path": snap.to_string_lossy() }));
+
+        // Mutate the live machine AFTER the dump (PC + the loaded body byte).
+        {
+            let mut g = st.lock().unwrap();
+            g.session.machine.c64_core.reg_pc = 0x1234;
+            g.session.machine.ram[0xc000] = 0xff;
+            g.session.machine.sync_after_monitor();
+        }
+
+        // Undump → the dumped state must come back.
+        call(&st, "snapshot/undump", json!({ "path": snap.to_string_lossy() }));
+        let g = st.lock().unwrap();
+        assert_eq!(g.session.machine.c64_core.reg_pc, pre_pc, "PC restored");
+        assert_eq!(g.session.machine.read_full(0xc000), 0xa9, "RAM byte restored");
+        assert!(!g.session.running, "undump leaves the session paused");
     }
 
     #[test]
