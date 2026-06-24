@@ -24,6 +24,7 @@ pub mod render;
 pub mod sid;
 pub mod tables;
 pub mod vic;
+pub mod viacore;
 pub mod vsf;
 
 pub use cia::Cia;
