@@ -35,12 +35,23 @@ use crate::{BusKind, Observer};
 ///   * the live `reg_pc`/`clk` threading (read from the core via raw pointers so
 ///     each bus record is stamped exactly as `cpu.rs` stamped it),
 ///   * the verbatim-core cycle hooks (`vic_cycle` / `check_ba` / `process_alarms`).
-pub struct FullScBus<'a, 'o, O: Observer> {
+pub struct FullScBus<'a, 'o, 'w, O: Observer> {
     /// The assembled bus — all banking / IO / IEC / keyboard dispatch is reused
     /// verbatim from here.
     pub fb: FullBus<'a>,
     /// Trace observer. on_bus is emitted from `read_raw`/`write_raw`.
     pub obs: &'o mut O,
+    /// Per-address access-watch table (Spec 754 §3.3e watchpoint gate). `None`
+    /// when no watchpoint is armed = the single zero-cost branch the TS BUG-049
+    /// zero-idle-cost discipline requires; the `on_access` hook is reached ONLY
+    /// when `Some(w)` AND `w[addr] != 0`. A non-zero entry arms the address; the
+    /// POLICY (conditions/actions) lives outside the core in the observer.
+    pub access_watch: Option<&'w [u8; 0x10000]>,
+    /// Halt-requested latch. Set when a watched READ/WRITE's `on_access` returns
+    /// `true` DURING an instruction; the run loop honors it at the NEXT
+    /// instruction boundary (= TS `obs.haltRequested`, integrated-session.ts:989).
+    /// Never re-enters the CPU mid-instruction.
+    pub halt_requested: bool,
     /// Live `reg_pc` of the executing core (= the `pc` field of every bus record;
     /// `cpu.rs` passed `self.reg_pc`). Read-only raw pointer; the core invokes the
     /// bus synchronously and never holds a live `&mut` to `reg_pc` at the instant a
@@ -74,7 +85,7 @@ pub struct FullScBus<'a, 'o, O: Observer> {
     pub fetched: bool,
 }
 
-impl<'a, 'o, O: Observer> FullScBus<'a, 'o, O> {
+impl<'a, 'o, 'w, O: Observer> FullScBus<'a, 'o, 'w, O> {
     /// The bus-record `pc` field, to the TS/cpu.rs convention: the reg_pc value
     /// cpu.rs had at the access (= opcode_pc + bytes consumed from the instruction
     /// stream). cpu.rs advanced reg_pc DURING the operand fetch, so by the body's
@@ -130,7 +141,7 @@ impl<'a, 'o, O: Observer> FullScBus<'a, 'o, O> {
     }
 }
 
-impl<'a, 'o, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, O> {
+impl<'a, 'o, 'w, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, O> {
     /// LOAD path (mainc64cpu.c:359-363) real read. Reuses [`FullBus`]'s banked
     /// read dispatch EXACTLY, then emits the `on_bus(Read)` record (+ any chip
     /// side-effect reads, e.g. the $DD00 IEC `iecReadPins` indirection, emitted
@@ -148,6 +159,14 @@ impl<'a, 'o, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, O> {
             self.obs.on_bus(BusKind::Read, a, val, pc, clk, 0);
         }
         self.obs.on_bus(BusKind::Read, addr, v, pc, clk, 0);
+        // Spec 754 §3.3e watchpoint gate (= cpu65xx-vice.ts:468 loadRead):
+        // `if (accessWatch && accessWatch[addr]) onObservedAccess("READ", ...)`.
+        // None when no watchpoint armed = a single zero-cost branch.
+        if let Some(w) = self.access_watch {
+            if w[addr as usize] != 0 {
+                self.halt_requested |= self.obs.on_access(BusKind::Read, addr, v);
+            }
+        }
         v
     }
 
@@ -176,6 +195,14 @@ impl<'a, 'o, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, O> {
             self.obs.on_bus(BusKind::Write, a, v, pc, clk, o);
         }
         self.obs.on_bus(BusKind::Write, addr, value, pc, clk, old);
+        // Spec 754 §3.3e watchpoint gate (= cpu65xx-vice.ts:495 store):
+        // `if (accessWatch && accessWatch[addr]) onObservedAccess("WRITE", ...)`.
+        // A hit sets halt_requested; the run loop stops at the next boundary.
+        if let Some(w) = self.access_watch {
+            if w[addr as usize] != 0 {
+                self.halt_requested |= self.obs.on_access(BusKind::Write, addr, value);
+            }
+        }
     }
 
     /// FETCH read (FETCH_OPCODE) — the opcode/operand byte fetch. Reuses the banked

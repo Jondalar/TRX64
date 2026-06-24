@@ -7,6 +7,7 @@
 //! Hot-path rule: the core takes a generic `O: Observer` (monomorphized, zero-cost
 //! when unused). It NEVER calls back into another process per event.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 pub mod c64_6510core;
@@ -70,6 +71,18 @@ pub trait Observer {
     /// byte at `addr` for WRITE events (Spec 753 mutation surface), else 0.
     fn on_bus(&mut self, kind: BusKind, addr: u16, value: u8, pc: u16, clk: u64, old: u8);
     fn on_interrupt(&mut self, vector: u16, clk: u64);
+    /// Watchpoint-access hook. Fired ONLY when a per-address access-watch table is
+    /// armed AND the watched address is hit on a real READ/WRITE (= the TS
+    /// `this.accessWatch[addr] && this.onObservedAccess(...)` gate,
+    /// cpu65xx-vice.ts:468/495). Returns `true` to request a halt; the run loop
+    /// honors it at the NEXT instruction boundary (never re-enters the CPU
+    /// mid-instruction). The POLICY (which addrs, conditions, actions) lives
+    /// OUTSIDE the core; the default returns `false` (observe only, never halt) so
+    /// existing observers compile unchanged and NullSink stays zero-cost.
+    #[inline]
+    fn on_access(&mut self, _kind: BusKind, _addr: u16, _value: u8) -> bool {
+        false
+    }
     /// Fired when the VIC observes a register write that the TS `vic` trace
     /// channel would tag (raster/mode/irq). `clk` = master clock at the write,
     /// `raster_y` = VIC raster line at that cycle, `kind` = VIC_KIND_CODE
@@ -90,6 +103,31 @@ pub enum BusKind {
     Write,
     DummyRead,
     DummyWrite,
+}
+
+/// Why a capped run loop stopped. Mirrors the TS `runFor` return's `aborted`
+/// field (integrated-session.ts:962-995): `undefined` → `Completed`,
+/// `"breakpoint"` → `Breakpoint(pc)`, `"cycle-budget"` → `CycleBudget`,
+/// `"observer"` → `Observer`. `Completed` is the no-debug hot-path result (the
+/// pre-existing `()`-returning entry points map to it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunStop {
+    /// Ran to the cycle budget or instruction cap without tripping a debug gate
+    /// (= TS `aborted` absent). The historical end-of-run for all existing callers.
+    Completed,
+    /// An exec breakpoint at this PC fired at an instruction boundary BEFORE the
+    /// instruction ran (= TS `aborted: "breakpoint"`; VICE break-on-exec). The PC
+    /// is the breakpoint address; the CPU has NOT executed it.
+    Breakpoint(u16),
+    /// The cycle budget tripped at an instruction boundary (= TS
+    /// `aborted: "cycle-budget"`). Distinguished from `Completed` only on the
+    /// debug entry points; the plain entry points fold it into `Completed`.
+    CycleBudget,
+    /// An access-watch `on_access` returned `true` during the last instruction;
+    /// honored at the NEXT boundary (= TS `aborted: "observer"`, post-access
+    /// "at the trigger" state). The CPU is at the instruction boundary AFTER the
+    /// watched access.
+    Observer,
 }
 
 /// No-op observer. Hooks compile away to nothing when tracing is off.
@@ -115,6 +153,10 @@ impl Observer for NullSink {
     fn on_bus(&mut self, _: BusKind, _: u16, _: u8, _: u16, _: u64, _: u8) {}
     #[inline(always)]
     fn on_interrupt(&mut self, _: u16, _: u64) {}
+    #[inline(always)]
+    fn on_access(&mut self, _: BusKind, _: u16, _: u8) -> bool {
+        false
+    }
 }
 
 /// 6510 CPU registers.
@@ -917,16 +959,61 @@ impl Machine {
     /// instructions have retired — the FIRST to trip wins (= TS
     /// `runFor(maxInstructions, { cycleBudget })`). The budget check happens at
     /// instruction boundaries, so c64Cycles ends identically to the TS daemon.
+    ///
+    /// Plain (no-debug) entry point: delegates to [`run_for_capped_dbg`] with no
+    /// breakpoints/watch armed. Monomorphization collapses the `None` gates to the
+    /// historical hot path; the `RunStop` is discarded (always `Completed` /
+    /// `CycleBudget` here). All pre-existing callers stay source-compatible.
     pub fn run_for_capped<O: Observer>(&mut self, budget: u64, max_instructions: u64, obs: &mut O) {
+        self.run_for_capped_dbg(budget, max_instructions, None, None, obs);
+    }
+
+    /// Debug-capable variant of [`run_for_capped`] (CPU-isolated FlatRam bus). Adds
+    /// the exec breakpoint + exec-watch gate at the TOP of the loop body (BEFORE
+    /// execute), returning a [`RunStop`] reason (= TS `runFor`,
+    /// integrated-session.ts:962-995). With `breakpoints`/`exec_watch` both `None`
+    /// the gates compile to nothing and the result is `Completed`/`CycleBudget`,
+    /// identical to the plain path. The access-watch `halt_requested` honoring lives
+    /// in the full-machine path ([`run_for_full_capped_dbg`]) where the SC bus
+    /// carries the per-access watch table.
+    pub fn run_for_capped_dbg<O: Observer>(
+        &mut self,
+        budget: u64,
+        max_instructions: u64,
+        breakpoints: Option<&HashSet<u16>>,
+        exec_watch: Option<&[u8; 0x10000]>,
+        obs: &mut O,
+    ) -> RunStop {
         let start = self.cpu6510.clk;
         let mut executed: u64 = 0;
         let mut bus = FlatRam { mem: &mut self.ram };
+        let mut stop = RunStop::Completed;
         loop {
-            if self.cpu6510.clk.wrapping_sub(start) >= budget {
-                break;
-            }
+            // TOP-of-body checks in the TS order (integrated-session.ts:972-984):
+            // the for-guard (instruction cap) FIRST, then breakpoint → cycle-budget
+            // → exec-watch, all BEFORE execute so a break halts with PC AT the
+            // watched instruction (VICE break-on-exec). `None` ⇒ the breakpoint /
+            // exec-watch branches are elided by the optimizer; the cap + cycle-budget
+            // checks stay exactly where the historical loop had them.
             if executed >= max_instructions {
                 break;
+            }
+            let pc = self.cpu6510.reg_pc;
+            if let Some(bp) = breakpoints {
+                if bp.contains(&pc) {
+                    stop = RunStop::Breakpoint(pc);
+                    break;
+                }
+            }
+            if self.cpu6510.clk.wrapping_sub(start) >= budget {
+                stop = RunStop::CycleBudget;
+                break;
+            }
+            if let Some(w) = exec_watch {
+                if w[pc as usize] != 0 {
+                    stop = RunStop::Observer;
+                    break;
+                }
             }
             // Step a whole instruction (one fetch boundary to the next). A
             // jammed CPU stays at boundary, so this runs exactly one cycle and
@@ -944,6 +1031,7 @@ impl Machine {
         }
         drop(bus);
         self.sync_snapshot();
+        stop
     }
 
     /// FULL-MACHINE run (= TS integrated-session `runFor` over the assembled
@@ -964,28 +1052,84 @@ impl Machine {
     }
 
     /// FULL-MACHINE run with an explicit instruction cap.
+    ///
+    /// Plain (no-debug) entry point: delegates to [`run_for_full_capped_dbg`] with
+    /// no breakpoints/watch armed. All pre-existing callers stay source-compatible;
+    /// the `RunStop` is discarded and the hot path is byte-identical (the `None`
+    /// gates monomorphize away).
     pub fn run_for_full_capped<O: Observer, F>(
         &mut self,
         budget: u64,
         max_instructions: u64,
         obs: &mut O,
-        mut on_drive_step: F,
+        on_drive_step: F,
     ) where
+        F: FnMut(u16, u8, u8, u8, u8, u8, u64),
+    {
+        self.run_for_full_capped_dbg(budget, max_instructions, None, None, None, obs, on_drive_step);
+    }
+
+    /// Debug-capable variant of [`run_for_full_capped`]. Adds three gates, all
+    /// zero-cost when their option is `None` (= TS `runFor`,
+    /// integrated-session.ts:962-995):
+    ///   * `breakpoints` — exec breakpoint set, checked at the instruction boundary
+    ///     BEFORE execute (halts with PC AT the breakpoint; VICE break-on-exec,
+    ///     ts:973).
+    ///   * `exec_watch` — per-PC exec-watch table, same boundary check (ts:982).
+    ///   * `access_watch` — per-address READ/WRITE watch, threaded into the SC bus;
+    ///     a hit during the instruction sets `halt_requested`, honored at the NEXT
+    ///     boundary (ts:989, "at the trigger" post-access state).
+    /// Returns the [`RunStop`] reason. With all three `None` the gates compile to
+    /// nothing and the result is `Completed`/`CycleBudget`, byte-identical to the
+    /// plain path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_for_full_capped_dbg<O: Observer, F>(
+        &mut self,
+        budget: u64,
+        max_instructions: u64,
+        breakpoints: Option<&HashSet<u16>>,
+        exec_watch: Option<&[u8; 0x10000]>,
+        access_watch: Option<&[u8; 0x10000]>,
+        obs: &mut O,
+        mut on_drive_step: F,
+    ) -> RunStop
+    where
         F: FnMut(u16, u8, u8, u8, u8, u8, u64),
     {
         let start = self.c64_core.clk;
         let mut executed: u64 = 0;
         let table = self.cia_table.clone();
+        let mut stop = RunStop::Completed;
         // Seed CIA clocks from the live CPU clk so timer state machines run from
         // the right rclk.
         self.cia1.clk = self.c64_core.clk;
         self.cia2.clk = self.c64_core.clk;
         loop {
-            if self.c64_core.clk.wrapping_sub(start) >= budget {
-                break;
-            }
+            // TOP-of-body checks in the TS order (integrated-session.ts:972-984):
+            // instruction cap (for-guard) FIRST, then breakpoint → cycle-budget →
+            // exec-watch, all BEFORE execute. `None` ⇒ the breakpoint/exec-watch
+            // branches are elided; the cap + cycle-budget checks stay where the
+            // historical loop had them (only their relative order with each other,
+            // which is unobservable — both just break the loop).
             if executed >= max_instructions {
                 break;
+            }
+            let pc = self.c64_core.reg_pc;
+            if let Some(bp) = breakpoints {
+                if bp.contains(&pc) {
+                    stop = RunStop::Breakpoint(pc);
+                    break;
+                }
+            }
+            if self.c64_core.clk.wrapping_sub(start) >= budget {
+                stop = RunStop::CycleBudget;
+                break;
+            }
+            if let Some(w) = exec_watch {
+                if w[pc as usize] != 0 {
+                    stop = RunStop::Observer;
+                    break;
+                }
             }
             // Drive catches up to the current C64 clock BEFORE the instruction
             // (= integrated-session.ts:898 catchUpDrive). Advances the drive's
@@ -1046,8 +1190,17 @@ impl Machine {
                     fetch: None,
                     cur_op: (self.c64_core.reg_pc, 0),
                     fetched: false,
+                    access_watch,
+                    halt_requested: false,
                 };
                 full_sc::execute_one(&mut self.c64_core, &mut bus, &mut self.c64_int);
+                // Honor a watchpoint hit from this instruction at the boundary
+                // (= TS integrated-session.ts:989 obs.haltRequested). Latch the
+                // reason; we still finish the post-instruction drive/SID sync below
+                // so the machine state is consistent, then break after the iteration.
+                if bus.halt_requested {
+                    stop = RunStop::Observer;
+                }
                 // Persist bus-mutated banking/port state back to the Machine.
                 self.memconfig = bus.fb.config;
                 self.port_dir = bus.fb.port_dir;
@@ -1078,8 +1231,16 @@ impl Machine {
                 on_drive_step(pc, a, x, y, sp, p, drv_clk);
             }
             executed += 1;
+            // A watchpoint that hit during this instruction halts NOW, at the
+            // boundary AFTER the post-instruction drive/SID sync (= TS
+            // integrated-session.ts:989-992: haltRequested honored after
+            // stepC64Instruction, with the machine left in the post-access state).
+            if stop == RunStop::Observer {
+                break;
+            }
         }
         self.sync_snapshot_sc();
+        stop
     }
 
     /// VIC-isolated run (= TS session/run with the VIC ticked per CPU cycle).
