@@ -609,7 +609,52 @@ fn pixels_for_cell(
                 fg[p * 2 + 1] = is_fg;
             }
         }
-        VicMode::Invalid => {}
+        VicMode::Invalid => {
+            // Invalid modes (ECM=1 with BMM and/or MCM): VICE/c64re force the
+            // colour to COL_NONE → BLACK, but STILL compute the graphics priority
+            // bit `px & 0x2` from the gbuf data, so sprites clip/collide against
+            // invalid-mode foreground pixels. PORT OF: vicii-draw-cycle.ts:189-280
+            // (`colors[]` rows for ECM=1 are all COL_NONE; `pixel_pri = px & 0x2`
+            // is taken regardless) + vicii-fetch.ts g_fetch_addr (the ECM address
+            // mask `a &= 0x39ff`). The colour stays 0 (black) for every pixel; only
+            // `fg` carries the priority/collision mask.
+            let d011 = inp.reg(0x11);
+            let d016 = inp.reg(0x16);
+            let bmm = d011 & 0x20 != 0;
+            let mcm = d016 & 0x10 != 0;
+            // gbuf address: bitmap (BMM) or char-text, then ECM-masked (& 0x39ff)
+            // within the VIC bank (bank_base added back after the mask, matching
+            // VICE which masks the bank-relative offset).
+            let raw_off = if bmm {
+                // bitmap: (vc<<3 | rc) form == trow*320 + col*8 + sub, plus the
+                // $D018 bit3 bitmap base — i.e. our bitmap_base offset.
+                bitmap_base
+                    .wrapping_add((trow as u16) * 320)
+                    .wrapping_add((col as u16) * 8)
+                    .wrapping_add(sub as u16)
+            } else {
+                // text char: char_base + glyph<<3 + sub.
+                char_base.wrapping_add(((screen_byte as u16) << 3) + sub as u16)
+            };
+            // ECM masks the bank-relative offset; re-add the bank base.
+            let bank_rel = raw_off.wrapping_sub(inp.bank_base) & 0x39ff;
+            let row = inp.vic_read(inp.bank_base.wrapping_add(bank_rel));
+            if mcm {
+                // Multicolor decode: px = top-2-bits per 2px block; fg = px & 0x2.
+                for p in 0..4 {
+                    let bits = (row >> (6 - p * 2)) & 0x03;
+                    let is_fg = bits & 0x02 != 0;
+                    // colour forced black (COL_NONE) — out already 0.
+                    fg[p * 2] = is_fg;
+                    fg[p * 2 + 1] = is_fg;
+                }
+            } else {
+                // Hires decode: px = 3 (bit set) or 0; fg = px & 0x2 = bit set.
+                for i in 0..8 {
+                    fg[i] = row & (0x80 >> i) != 0;
+                }
+            }
+        }
     }
     (out, fg)
 }
@@ -827,5 +872,50 @@ mod sprite_tests {
         let (ss, sb) = render_collisions(&inp);
         assert_eq!(sb, 0x01, "sprite-background $D01F = bit 0 (sprite over fg char)");
         assert_eq!(ss, 0x00, "sprite-sprite $D01E = 0 (single sprite)");
+    }
+
+    /// Invalid VIC mode (ECM=1+BMM=1): the display window renders BLACK, but the
+    /// graphics priority/foreground bit is STILL computed from the bitmap data, so
+    /// a sprite over an invalid-mode foreground pixel registers a sprite-background
+    /// collision ($D01F). (vicii-draw-cycle.ts: ECM=1 rows = COL_NONE but
+    /// `pixel_pri = px & 0x2` is taken regardless.)
+    #[test]
+    fn invalid_mode_renders_black_but_keeps_foreground_for_collision() {
+        let mut ram = [0x00u8; 0x10000];
+        // sprite 0 solid over display cell (0,0).
+        ram[0x07f8] = 0x0d;
+        for i in 0..63 {
+            ram[0x0340 + i] = 0xff;
+        }
+        // Bitmap base $2000 (D018 bit3): solid bitmap byte at cell (0,0) = all-fg.
+        // ECM masks the address with 0x39ff; $2000 & 0x39ff = $2000, so cell (0,0)
+        // sub 0 stays at $2000.
+        for r in 0..8 {
+            ram[0x2000 + r] = 0xff;
+        }
+        let char_rom = [0u8; 0x1000];
+        let color_ram = [1u8; 0x0400];
+        let mut regs = [0u8; 0x40];
+        // ECM=1 (bit6) + BMM=1 (bit5) + DEN=1 (bit4) + RSEL=1 (bit3) + YSCROLL=3
+        regs[0x11] = 0x40 | 0x20 | 0x1b; // = 0x7b
+        regs[0x16] = 0xc8; // MCM=0, CSEL=1
+        regs[0x18] = 0x18; // screen $0400, bitmap $2000
+        regs[0x20] = 14;
+        regs[0x21] = 6;
+        regs[0x00] = 0x18; // sprite0 X=24 → display col 0
+        regs[0x01] = 0x32; // sprite0 Y=50 → display row 0 (line 51)
+        regs[0x15] = 0x01; // enable sprite 0
+        regs[0x27] = 2;
+        let inp = RenderInput { regs: &regs, ram: &ram, char_rom: &char_rom, color_ram: &color_ram, bank_base: 0 };
+        assert_eq!(inp.mode(), VicMode::Invalid, "ECM+BMM = invalid mode");
+        // The cell (0,0) display pixel renders BLACK (index 0).
+        let fb = render_index_buffer(&inp);
+        // line 51, dbuf X 136 is the sprite — check a non-sprite invalid-mode pixel.
+        // The whole display row is black under the bitmap; sample at the right of
+        // the sprite (sprite ends at dbuf 136+24=160) → still black graphics.
+        assert_eq!(fb[51 * FB_W + 170], 0, "invalid-mode graphics pixel is black");
+        // Collision: sprite over the invalid-mode foreground → $D01F bit 0.
+        let (_ss, sb) = render_collisions(&inp);
+        assert_eq!(sb, 0x01, "$D01F bit0: sprite collides with invalid-mode fg");
     }
 }
