@@ -857,3 +857,21 @@ accesses (re-fold the shared bus per drive cycle in the handshake windows), matc
 sub-cycle transition timing. Touches lib.rs/full.rs/drive.rs (the cross-domain run loop) + the byte-exact gate
 paths — risky. Tested off-by-N read-path phase shifts (+1/-1): divergence index unchanged (not a fixed offset).
 ESCALATED to user (foundational + risky decision). Diagnostic probe merged (dd00_fast_probe.rs). All gates GREEN.
+
+## ADR-056 — render-verbatim: sprite collision $D01E/$D01F + collision IRQ (behaviorally-critical gap closed)
+The render audit (ADR-052/053 era) found $D01E (sprite-sprite) + $D01F (sprite-bg) collision registers were
+NEVER computed — games poll these for hit-detection, so gameplay broke (7-game-gate blocker). Now ported
+verbatim: render::render_collisions (vicii-draw-cycle.ts:444-482 / VICE vicii-sprites.c sprline[]) builds the
+per-pixel sprite-opacity mask + sets sprite-sprite (2+ sprites overlap) / sprite-bg (fg graphics px&0x2 under
+a sprite); vic::apply_collisions (vicii-cycle.c:407-433) ORs into the sticky latches + fires the collision IRQ
+on the 0->nonzero edge ($D019 bit2=ss / bit1=sb -> IRQ when unmasked $D01A); $D01E/$D01F read-clear
+(vicii-mem.c). + Invalid VIC modes now keep the fg/priority mask (vicii-draw-cycle.ts:189-280: black output
+unchanged, fg side-plane gains bits so sprites clip/collide vs illegal-mode graphics). cargo test 90 passed
+(+5), render+iso-vic+boot byte/pixel-exact GREEN (collisions are read-only side state). full.rs/lib.rs touched
+only for the $D01E/$D01F read-routing (recompute_collisions) — NOT the escalated cross-domain coupling.
+BEHAVIORAL ADAPTATION (noted): TRX64's static frame-render recomputes the collision masks on $D01E/$D01F read
+(playing vicii_draw_cycle's role) instead of the per-cycle pixel pipeline — collision VALUES are correct +
+read-clear is real; the full per-cycle pixel pipeline is a future refinement only if a game needs mid-frame
+partial-collision timing.
+STATUS: render gameplay-critical gap closed. The ONE remaining blocker = the escalated cross-domain IEC
+coupling (dd00-fast-transfer / ADR-055) for the scramble custom $DD00 loader — awaiting user go.

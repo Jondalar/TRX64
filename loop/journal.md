@@ -590,3 +590,12 @@ interrupt.h (clear IK_IRQPEND only) + SID ADSR saturating_sub. Zero regression (
 GREEN, 85 tests). BEHAVIORAL: scramble custom $DD00 loader now RUNS — VIC multicolor bitmap, title LAYOUT
 renders (border/bg = c64re) — from BASIC fallback. Bitmap DATA still corrupt (2-bit fast-transfer bit
 sampling). Screenshots sent to user. Next: dd00-fast-transfer.
+
+## 2026-06-24 — DRIVER: render-verbatim DONE — sprite collision $D01E/$D01F + IRQ (ADR-056)
+
+Closed the behaviorally-critical renderer gap: sprite-sprite/$D01E + sprite-bg/$D01F collision registers +
+collision IRQ, ported verbatim from vicii-draw-cycle.ts/vicii-cycle.c. Games can now poll collision for
+gameplay (7-game-gate). + Invalid-mode fg/priority mask. cargo test 90 passed, render/iso-vic/boot byte/
+pixel-exact (read-only side state). full.rs/lib.rs = collision read-routing only (not the escalated
+cross-domain coupling). The ONE remaining blocker: the cross-domain IEC coupling (dd00-fast-transfer/ADR-055)
+for the scramble custom loader — escalated, awaiting user.

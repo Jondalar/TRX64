@@ -33,19 +33,16 @@
     "drive-verbatim-cpu",
     "c64-verbatim-cpu",
     "vic-verbatim",
-    "dd00-atn-irq"
+    "dd00-atn-irq",
+    "render-verbatim"
   ],
-  "note": "dd00-fast-transfer: NO fix (foundational). Root = cross-domain IEC coupling is batch-snapshot, not VICE cycle-stepped single-iecbus -> debounce loops cant see sub-cycle transitions -> custom loader bit-bang data corrupts. The LAST so-aehnlich layer. Fix = cycle-stepped cross-domain IEC interleave (risky, touches byte-exact paths). ESCALATED to user. Loop can route to render-verbatim (independent) meanwhile.",
-  "updated": "2026-06-24T04:20:50Z",
+  "note": "render-verbatim DONE (ADR-056): $D01E/$D01F sprite collision + collision IRQ verbatim, gameplay-critical gap closed, zero regression. The ONE remaining blocker is the ESCALATED cross-domain IEC coupling (dd00-fast-transfer/ADR-055, foundational+risky) for the scramble custom loader — awaiting user decision (a) do it / (b) done already / (c) leave. All other behavioral work complete.",
+  "updated": "2026-06-24T04:41:10Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": {
-    "item": "render-verbatim",
-    "model": "opus",
-    "started": "2026-06-24T04:20:50Z"
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
