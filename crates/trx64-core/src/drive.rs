@@ -20,8 +20,9 @@ use crate::{
         drive_6510core_execute, DriveCore6510, DriveCore6510Bus, IntStatus, IK_RESET,
     },
     gcr::GcrImage,
+    iec::IecbusT,
     rotation::Rotation,
-    viacore::{self, Via2Irq, Via2dBackend, ViaContext},
+    viacore::{self, Via1Irq, Via1dBackend, Via2Irq, Via2dBackend, ViaContext},
     RomError,
 };
 
@@ -43,477 +44,35 @@ pub struct DiskImage {
     pub read_only: bool,
 }
 
-// ── 6522 VIA register indices (via.h:35-55) ─────────────────────────────────
-const VIA_PRB: usize = 0;
-const VIA_PRA: usize = 1;
-const VIA_DDRB: usize = 2;
-const VIA_DDRA: usize = 3;
-const VIA_T1CL: usize = 4;
-const VIA_T1CH: usize = 5;
-const VIA_T1LL: usize = 6;
-const VIA_T1LH: usize = 7;
-const VIA_T2CL: usize = 8;
-const VIA_T2LL: usize = 8;
-const VIA_T2CH: usize = 9;
-const VIA_T2LH: usize = 9;
-const VIA_SR: usize = 10;
-const VIA_ACR: usize = 11;
+// ── 6522 VIA register index used by drive.rs (via.h:35-55) ──────────────────
+// The full register-file / IFR / ACR constant set now lives in `viacore.rs`
+// (both drive VIAs run through the 1:1-ported viacore). drive.rs only needs the
+// PCR index for the `via1_irq_debug` diagnostic snapshot.
 const VIA_PCR: usize = 12;
-const VIA_IFR: usize = 13;
-const VIA_IER: usize = 14;
-const VIA_PRA_NHS: usize = 15;
-
-// ── IFR / IER interrupt-mask bits (via.h:59-66) ─────────────────────────────
-const VIA_IM_IRQ: u8 = 0x80;
-const VIA_IM_T1: u8 = 0x40;
-const VIA_IM_T2: u8 = 0x20;
-
-// ── ACR bits (via.h:68-93) ──────────────────────────────────────────────────
-const VIA_ACR_T1_FREE_RUN: u8 = 0x40;
-const VIA_ACR_T1_PB7_USED: u8 = 0x80;
-const VIA_ACR_T2_COUNTPB6: u8 = 0x20;
-
-/// VICE viacore.c:216 `FULL_CYCLE_2` — the 2-cycle reload overhead of T1.
-const FULL_CYCLE_2: u64 = 2;
-
-/// VICE per-VIA-instance `write_offset` (Spec 612 PL-6; viacore.c:529 / via2d.c
-/// viacore_setup_context). A VIA STORE on the drive sees `rclk = clk_ptr - 1`:
-/// the 6510 core does the store cycle's `CLK_ADD` BEFORE the store, so the
-/// register/timer/IFR/IRQ logic must subtract that one cycle to land on the
-/// pre-increment rclk VICE writes at. READS keep `read_offset = 0`. The rotation
-/// effects (rotate_disk / set_ca2 / store_prb) instead read the FULL `clk_ptr`
-/// (rotation.c reads `clk_ptr.value` directly), so only the viacore register
-/// path gets the `-1`. Both drive VIAs use `write_offset = 1`.
-const VIA_WRITE_OFFSET: u64 = 1;
-
-/// Real 6522 VIA timer core (port of vice/src/core/viacore.c, scoped to the
-/// 1541 drive's VIA2 needs: T1 free-run/one-shot, T2 timer, IFR/IER, computed
-/// timer reads, ACR/PCR storage, and the IRQ line `(ifr & ier & 0x7f) != 0`).
-///
-/// VICE drives the timers off an alarm context; this port instead advances
-/// them lazily/eagerly via [`Via6522::run_alarms`] keyed on the drive clock,
-/// which is deterministic and produces the same IFR-raise instants. The CB/CA
-/// handshake, shift register and PB7 toggle paths are not needed for the disk
-/// controller's idle/IRQ behaviour and are omitted (PB7 toggle bookkeeping is
-/// kept minimal). Port reads ($1C00 PRB / $1C01 PRA) are supplied by the
-/// caller through [`Via2Ports`] so the GCR/sync/wps bits stay in the drive.
-#[derive(Clone)]
-pub struct Via6522 {
-    /// 16-byte register file (PRA/PRB/DDR*/timer latches/SR/ACR/PCR/IFR/IER).
-    regs: [u8; 16],
-    /// T1 latch value (`tal` = T1LL | T1LH<<8). viacore.c `ctx.tal`.
-    tal: u16,
-    /// Absolute clock of the next T1 underflow ("zero") — viacore.c `t1zero`.
-    t1zero: u64,
-    /// Absolute clock T1 reloads from latch — viacore.c `t1reload`.
-    t1reload: u64,
-    /// T1 currently counting (a T1CH write armed it). 0 once a one-shot expired.
-    t1_active: bool,
-    /// PB7 toggle output state bit (0x80/0x00) — viacore.c `t1_pb7`.
-    t1_pb7: u8,
-    /// T2 low/high counter bytes — viacore.c `t2cl` / `t2ch`.
-    t2cl: u8,
-    t2ch: u8,
-    /// Absolute clock of the next T2 underflow — viacore.c `t2zero`.
-    t2zero: u64,
-    /// T2 reached the xx00 boundary (the 256-step high decrement window).
-    t2xx00: bool,
-    /// T2 IRQ permitted (latched by a T2CH write) — viacore.c `t2_irq_allowed`.
-    t2_irq_allowed: bool,
-    /// IFR / IER (held outside the register file like viacore.c `ifr`/`ier`).
-    ifr: u8,
-    ier: u8,
-    /// Clock the IRQ line `(ifr&ier&0x7f)` last went active (= the rclk VICE
-    /// stamps into the CPU via update_myviairq_rclk). `u64::MAX` = inactive.
-    pub irq_stamp: u64,
-    /// Whether the IRQ line is currently asserted.
-    pub irq_active: bool,
-}
-
-/// Port-input snapshot the disk controller supplies for a VIA2 PRA/PRB read.
-/// VICE's via2d read_pra/read_prb compute these from the rotating GCR stream;
-/// until the GCR path lands they are static "no disk / no sync" defaults that
-/// reproduce the drive idle/IRQ instruction stream byte-exact.
-#[derive(Clone, Copy)]
-pub struct Via2Ports {
-    /// PRA pin input (GCR read byte). 0xFF with no rotating disk.
-    pub pra_pin: u8,
-    /// PRB pin input = `sync_found | wps | 0x6f` (via2d.c:486-512). With no
-    /// sync and writeable media this is `0 | 0x10 | 0x6f = 0x7f`.
-    pub prb_pin: u8,
-}
-
-impl Default for Via2Ports {
-    fn default() -> Self {
-        // No disk in the drive (boot-basic-ready runs with an empty drive). VICE:
-        //   rotation_sync_found → 0x80 when read_write_mode==0 (read mode, the
-        //     power-on default) regardless of media (rotation.ts:895-901);
-        //   drive_writeprotect_sense → 0x10 with no image (drive.ts:1689-1691);
-        //   read_pra GCR_read → 0 with no image, but DDRA=0 so PRA reads the pin
-        //     which the ROM treats as the floating data bus.
-        // PRB pin = sync(0x80) | wps(0x10) | 0x6f = 0xFF.
-        Self {
-            pra_pin: 0xff,
-            prb_pin: 0xff,
-        }
-    }
-}
-
-impl Via6522 {
-    /// Power-on state (viacore_setup_context viacore.c:1843-1854).
-    fn new() -> Self {
-        let mut regs = [0u8; 16];
-        regs[VIA_T1CL] = 0xff;
-        regs[VIA_T1LL] = 0xff;
-        regs[VIA_T1CH] = 223;
-        regs[VIA_T1LH] = 223;
-        regs[VIA_T2CL] = 0xff;
-        regs[VIA_T2CH] = 0xff;
-        Self {
-            regs,
-            tal: 0xffff,
-            t1zero: 0,
-            t1reload: 0,
-            t1_active: false,
-            t1_pb7: 0x80,
-            t2cl: 0xff,
-            t2ch: 0xff,
-            t2zero: 0,
-            t2xx00: false,
-            t2_irq_allowed: false,
-            ifr: 0,
-            ier: 0,
-            irq_stamp: u64::MAX,
-            irq_active: false,
-        }
-    }
-
-    /// viacore_reset (viacore.c:378-439): clear port/ddr + control regs, latch
-    /// the timers to power-on, clear IFR/IER. Seeds the reload anchors at `clk`.
-    fn reset(&mut self, clk: u64) {
-        for i in 0..4 {
-            self.regs[i] = 0;
-        }
-        for i in 11..16 {
-            self.regs[i] = 0;
-        }
-        self.tal = 0xffff;
-        self.t2cl = 0xff;
-        self.t2ch = 0xff;
-        self.t1reload = clk;
-        self.t2zero = clk;
-        self.ier = 0;
-        self.ifr = 0;
-        self.t1_pb7 = 0x80;
-        self.t1_active = false;
-        self.t2_irq_allowed = false;
-        self.t2xx00 = false;
-        self.irq_stamp = u64::MAX;
-        self.irq_active = false;
-    }
-
-    /// viacore_t1 (viacore.c:265-284): the value the T1 counter would read at
-    /// `rclk` given the latch + reload anchor.
-    #[inline]
-    fn t1_value(&self, rclk: u64) -> u16 {
-        if rclk < self.t1reload {
-            (self.t1reload.wrapping_sub(rclk).wrapping_sub(FULL_CYCLE_2)) as u16
-        } else {
-            let full_cycle = self.tal as u64 + FULL_CYCLE_2;
-            let past = rclk - self.t1reload;
-            let partial = past % full_cycle;
-            (self.tal as u64).wrapping_sub(partial) as u16
-        }
-    }
-
-    /// viacore_t2 (viacore.c:311-331): T2 counter value at `rclk`.
-    #[inline]
-    fn t2_value(&self, rclk: u64) -> u16 {
-        if self.regs[VIA_ACR] & VIA_ACR_T2_COUNTPB6 != 0 {
-            ((self.t2ch as u16) << 8) | self.t2cl as u16
-        } else {
-            let mut t2 = (self.t2zero.wrapping_sub(rclk)) as u16;
-            if self.t2xx00 {
-                t2 = ((self.t2ch as u16) << 8) | (t2 & 0xff);
-            }
-            t2
-        }
-    }
-
-    /// update_via_t1_latch (viacore.c:340-361): roll `t1reload` forward past
-    /// `rclk` and refresh `tal` from the latch registers.
-    #[inline]
-    fn update_t1_latch(&mut self, rclk: u64) {
-        if rclk >= self.t1reload {
-            let full_cycle = self.tal as u64 + FULL_CYCLE_2;
-            let past = rclk - self.t1reload;
-            let nuf = 1 + past / full_cycle;
-            self.t1reload += nuf * full_cycle;
-        }
-        self.tal = (self.regs[VIA_T1LL] as u16) | ((self.regs[VIA_T1LH] as u16) << 8);
-    }
-
-    /// Recompute the IRQ line `(ifr & ier & 0x7f)` and stamp the active clock.
-    /// Mirrors viacore.c update_myviairq_rclk → interrupt_set_irq(rclk): the
-    /// `rclk` becomes the CPU's irq_clk on a fresh rising edge.
-    #[inline]
-    fn update_irq(&mut self, rclk: u64) {
-        let active = (self.ifr & self.ier & 0x7f) != 0;
-        if active {
-            if !self.irq_active {
-                self.irq_active = true;
-                self.irq_stamp = rclk;
-            }
-        } else if self.irq_active {
-            self.irq_active = false;
-            self.irq_stamp = u64::MAX;
-        }
-    }
-
-    /// viacore_signal(VIA_SIG_CA1, edge) (viacore.c:441-490): the external CA1
-    /// input edge. On the 1541 VIA1, CA1 is tied to the IEC ATN line so the C64
-    /// driving ATN raises the drive's attention IRQ. Raise IFR CA1 (0x02) only when
-    /// the edge polarity matches the PCR CA1-control bit (PCR bit0): VICE
-    /// `if ((edge?1:0) == (PCR & VIA_PCR_CA1_CONTROL))`. `edge` is 1 = rising,
-    /// 0 = falling. The CA2-toggle and latching sub-paths are not used by VIA1 here.
-    #[inline]
-    fn signal_ca1(&mut self, edge: u8, rclk: u64) {
-        let pcr_ctrl = self.regs[VIA_PCR] & 0x01;
-        if (if edge != 0 { 1 } else { 0 }) == pcr_ctrl {
-            self.ifr |= 0x02; // VIA_IM_CA1
-            self.update_irq(rclk);
-        }
-    }
-
-    /// Run any timer underflows that are due at or before `clk` (= VICE alarm
-    /// dispatch for the T1-zero / T2-zero alarms). Raises IFR bits and stamps
-    /// the IRQ line at the precise underflow rclk (`zero + 1`). Must be invoked
-    /// before each VIA register access and before each drive-CPU IRQ sample so
-    /// the IFR/IRQ state is current as of `clk`.
-    ///
-    /// The T1 `t1zero` schedule (store re-arm `rclk+1+tal`, free-run reschedule
-    /// `t1zero += full_cycle`) is a faithful port of viacore.c and is byte-exact
-    /// against the golden for the full drive-boot-deep watchdog cadence. The
-    /// drive-boot-deep KNOWN-RED that historically surfaced here (the 3rd watchdog
-    /// T1 IRQ firing 2 drive cycles early) was NOT a timer bug at all — the timer
-    /// schedule was already correct. It was a drive-6502 IRQ-dispatch latency gap:
-    /// VICE's `interrupt_check_irq_delay` (drivecpu.c) delays the IRQ one extra
-    /// cycle after a taken-no-page-cross branch (OPINFO_DELAYS_INTERRUPT) and
-    /// defers it a full instruction after an I-clearing opcode (OPINFO_ENABLES_IRQ
-    /// → IK_IRQPEND). Both are now modelled in `cpu.rs`, which restored byte-exact
-    /// watchdog-IRQ entry cycles and let the early-firing diagnosis fall away.
-    fn run_alarms(&mut self, clk: u64) {
-        // T1 zero (viacore_t1_zero_alarm viacore.c:1306-1342).
-        while self.t1_active && clk >= self.t1zero {
-            let rclk = self.t1zero; // alarm fires at the scheduled zero clock
-            if self.regs[VIA_ACR] & VIA_ACR_T1_FREE_RUN == 0 {
-                // one-shot: stop after this underflow
-                self.t1_active = false;
-            } else {
-                let full_cycle = self.tal as u64 + FULL_CYCLE_2;
-                self.t1zero += full_cycle;
-            }
-            self.t1_pb7 ^= 0x80;
-            self.ifr |= VIA_IM_T1;
-            self.update_irq(rclk + 1);
-        }
-        // T2 zero (viacore_t2_zero_alarm viacore.c:1554-1586). Only the 16-bit
-        // timer mode (ACR T2_COUNTPB6 clear) is modelled — the drive uses T2 as
-        // a plain down-counter; the SR-controlled/free-running shift paths are
-        // out of scope for the disk-controller idle/IRQ behaviour.
-        if self.regs[VIA_ACR] & VIA_ACR_T2_COUNTPB6 == 0 {
-            while self.t2xx00 && clk >= self.t2zero {
-                let rclk = self.t2zero;
-                // low underflow decrements high; IRQ on the high wrap if allowed.
-                self.t2ch = self.t2ch.wrapping_sub(1);
-                if self.t2ch == 0xff && self.t2_irq_allowed {
-                    self.ifr |= VIA_IM_T2;
-                    self.update_irq(rclk);
-                    self.t2_irq_allowed = false;
-                }
-                // schedule the next xx00 boundary 256 cycles on (16-bit mode).
-                if self.t2ch != 0xff {
-                    self.t2zero += 256;
-                } else {
-                    self.t2xx00 = false;
-                }
-            }
-        }
-    }
-
-    /// viacore_read (viacore.c:1032-1214) scoped to VIA2. `clk` is the access
-    /// rclk; `ports` supplies the PRA/PRB pin inputs. Caller MUST `run_alarms`
-    /// up to `clk` first.
-    #[inline]
-    fn read(&mut self, addr: u16, clk: u64, ports: Via2Ports) -> u8 {
-        let a = (addr & 0x0f) as usize;
-        match a {
-            VIA_PRA | VIA_PRA_NHS => {
-                self.ifr &= !0x02; // clear CA1
-                if self.regs[VIA_PCR] & 0x0a != 0x02 {
-                    self.ifr &= !0x01; // clear CA2 unless independent-input
-                }
-                self.update_irq(clk);
-                let ddra = self.regs[VIA_DDRA];
-                ((ports.pra_pin & !ddra) | (self.regs[VIA_PRA] & ddra)) & 0xff
-            }
-            VIA_PRB => {
-                self.ifr &= !0x10; // clear CB1
-                if self.regs[VIA_PCR] & 0xa0 != 0x20 {
-                    self.ifr &= !0x08; // clear CB2
-                }
-                self.update_irq(clk);
-                let ddrb = self.regs[VIA_DDRB];
-                let mut byte = ((ports.prb_pin & !ddrb) | (self.regs[VIA_PRB] & ddrb)) & 0xff;
-                if self.regs[VIA_ACR] & VIA_ACR_T1_PB7_USED != 0 {
-                    byte = (byte & 0x7f) | self.t1_pb7;
-                }
-                byte
-            }
-            VIA_T1CL => {
-                self.ifr &= !VIA_IM_T1;
-                self.update_irq(clk);
-                (self.t1_value(clk) & 0xff) as u8
-            }
-            VIA_T1CH => ((self.t1_value(clk) >> 8) & 0xff) as u8,
-            VIA_T2CL => {
-                self.ifr &= !VIA_IM_T2;
-                self.update_irq(clk);
-                (self.t2_value(clk) & 0xff) as u8
-            }
-            VIA_T2CH => ((self.t2_value(clk) >> 8) & 0xff) as u8,
-            VIA_IFR => {
-                let mut t = self.ifr;
-                if self.ifr & self.ier != 0 {
-                    t |= 0x80;
-                } else {
-                    t &= !0x80;
-                }
-                t
-            }
-            VIA_IER => self.ier | 0x80,
-            // PRB/T1/T2/IFR/IER handled; everything else returns the raw reg
-            // (SR/ACR/PCR/DDR*/T1L*). PCR ($1C0C) reads its stored value — this
-            // is the byte the boot init expects (0x00 after reset).
-            _ => self.regs[a],
-        }
-    }
-
-    /// viacore_store (viacore.c:637-1024) scoped to VIA2. Caller MUST
-    /// `run_alarms` up to `clk` first.
-    #[inline]
-    fn write(&mut self, addr: u16, val: u8, clk: u64) {
-        let a = (addr & 0x0f) as usize;
-        let v = val;
-        match a {
-            VIA_PRA => {
-                self.ifr &= !0x02;
-                if self.regs[VIA_PCR] & 0x0a != 0x02 {
-                    self.ifr &= !0x01;
-                }
-                self.update_irq(clk);
-                self.regs[VIA_PRA_NHS] = v;
-                self.regs[VIA_PRA] = v;
-            }
-            VIA_PRA_NHS => {
-                self.regs[VIA_PRA_NHS] = v;
-                self.regs[VIA_PRA] = v;
-            }
-            VIA_DDRA => self.regs[VIA_DDRA] = v,
-            VIA_PRB => {
-                self.ifr &= !0x10;
-                if self.regs[VIA_PCR] & 0xa0 != 0x20 {
-                    self.ifr &= !0x08;
-                }
-                self.update_irq(clk);
-                self.regs[VIA_PRB] = v;
-            }
-            VIA_DDRB => self.regs[VIA_DDRB] = v,
-            VIA_SR => self.regs[VIA_SR] = v,
-            VIA_T1CL | VIA_T1LL => {
-                self.regs[VIA_T1LL] = v;
-                self.update_t1_latch(clk);
-            }
-            VIA_T1CH => {
-                self.regs[VIA_T1LH] = v;
-                self.update_t1_latch(clk);
-                // Start T1: reload anchors at clk (viacore.c:650-655).
-                self.t1reload = clk + 1 + self.tal as u64 + FULL_CYCLE_2;
-                self.t1zero = clk + 1 + self.tal as u64;
-                self.t1_active = true;
-                self.t1_pb7 = 0;
-                self.ifr &= !VIA_IM_T1;
-                self.update_irq(clk);
-            }
-            VIA_T1LH => {
-                self.regs[VIA_T1LH] = v;
-                self.update_t1_latch(clk);
-                self.ifr &= !VIA_IM_T1;
-                self.update_irq(clk);
-            }
-            VIA_T2LL => self.regs[VIA_T2LL] = v,
-            VIA_T2CH => {
-                self.regs[VIA_T2LH] = v;
-                self.t2cl = self.regs[VIA_T2LL];
-                self.t2ch = v;
-                if self.regs[VIA_ACR] & VIA_ACR_T2_COUNTPB6 == 0 {
-                    // schedule_t2_zero_alarm (viacore.c:557-566) at clk+1.
-                    self.t2zero = (clk + 1) + self.t2cl as u64;
-                    self.t2xx00 = true;
-                }
-                self.ifr &= !VIA_IM_T2;
-                self.update_irq(clk);
-                self.t2_irq_allowed = true;
-            }
-            VIA_IFR => {
-                self.ifr &= !v;
-                self.update_irq(clk);
-            }
-            VIA_IER => {
-                if v & VIA_IM_IRQ != 0 {
-                    self.ier |= v & 0x7f;
-                } else {
-                    self.ier &= !v;
-                }
-                self.update_irq(clk);
-            }
-            VIA_ACR => {
-                // PB7-toggle enable rising edge re-arms the PB7 latch (viacore.c:857).
-                let old = self.regs[VIA_ACR];
-                if (old ^ v) & VIA_ACR_T1_PB7_USED != 0 && v & VIA_ACR_T1_PB7_USED != 0 {
-                    self.t1_pb7 = 0x80;
-                }
-                // T2 mode change (viacore.c:889-925) — the drive keeps T2 in
-                // timer mode (COUNTPB6 clear), so only the PB6-count transition
-                // would need the freeze path; not exercised by the disk
-                // controller, so the stored value is sufficient here.
-                self.regs[VIA_ACR] = v;
-            }
-            VIA_PCR => self.regs[VIA_PCR] = v,
-            _ => self.regs[a] = v,
-        }
-    }
-}
 
 /// Drive 6502 bus (implements cpu::Bus). Borrows from Drive1541 fields.
 struct DriveBus<'a> {
     ram: &'a mut [u8; 0x800],
     rom: &'a [u8; 0x8000],
-    via1: &'a mut Via6522,
+    /// VIA1 — the 1:1-ported viacore `ViaContext` (viacore.rs). Its IEC disk-side
+    /// hooks dispatch through a `Via1dBackend` built on the fly from `via1_iecbus`
+    /// (its `v_iecbus`) + `via1_irq`.
+    via1: &'a mut ViaContext,
+    /// VIA1 IRQ-line mirror (the via1d1541 `set_int` sink — see `viacore::Via1Irq`).
+    via1_irq: &'a mut Via1Irq,
+    /// VIA1's `v_iecbus` — the drive's `IecbusT`. The C64 path has synced `cpu_bus`
+    /// + `drv_port` into it before this run; the `store_prb` hook folds the drive's
+    /// PB output into it (drv_data/drv_bus/cpu_port/drv_port), and `read_prb` reads
+    /// `drv_port`. This IS via1d1541's `iecbus` pointer — the store-time wired-AND
+    /// re-fold the drive sees on its NEXT `$1800` read is performed by store_prb
+    /// directly (no external `fold_drv_port` shim needed).
+    via1_iecbus: &'a mut IecbusT,
     /// VIA2 — the 1:1-ported viacore `ViaContext` (viacore.rs). Its disk-controller
     /// hooks dispatch through a `Via2dBackend` built on the fly from `rotation` +
     /// `via2_irq` + `pending_set_overflow`.
     via2: &'a mut ViaContext,
     /// VIA2 IRQ-line mirror (the viacore `set_int` sink — see `viacore::Via2Irq`).
     via2_irq: &'a mut Via2Irq,
-    /// Live IEC bus state at the VIA1 PB inputs (= iecbus.drv_port). Read by a
-    /// `$1800` PB access so the drive's idle loop sees the C64-driven CLK/DATA/ATN.
-    /// MUTATED by a `$1800` store: the drive re-folds the wired-AND against the
-    /// fixed `cpu_bus` so its own pull on CLK/DATA is visible to its next read.
-    drv_port: u8,
-    /// C64-side IEC intent (= iecbus.cpu_bus), constant across this catch-up run.
-    /// Used to re-fold `drv_port` after each `$1800` store (= via1d1541 store_prb).
-    cpu_bus: u8,
     /// Live drive-CPU clock pointer (= VICE `via_context->clk_ptr`, Spec 612). The
     /// verbatim drive 6510 core advances `DriveCore6510.clk` between bus accesses
     /// via CLK_ADD; the VIA `rclk` for a register read/write and a timer-alarm
@@ -568,18 +127,47 @@ impl<'a> DriveBus<'a> {
     ///   byte = (tmp & ~DDRB) | (PRB & DDRB)
     /// — identical to VICE. Output bits (DDRB=1) read the ORB latch; input bits
     /// (DDRB=0) read the IEC bus.
+
+    /// Build the VIA1 IEC backend (via1d1541.ts) from the bus's borrowed `v_iecbus`
+    /// + IRQ-mirror, sync `via1.clk` to the live drive clock, and run `f` (a viacore
+    /// entry). The `store_prb` hook folds the drive's PB output into the iecbus
+    /// (drv_data/drv_bus/cpu_port/drv_port) so the drive's NEXT `$1800` read (via
+    /// `read_prb` → `drv_port`) sees its own CLK/DATA pull — VICE's `store_prb`
+    /// cross-domain sync, performed inline, no `fold_drv_port` shim.
     #[inline]
-    fn via1_iec_tmp(&self) -> u8 {
-        ((self.drv_port ^ 0x85) | 0x1a) & 0xff // driveid 0 for unit 8
+    fn via1_with_backend<R>(
+        &mut self,
+        f: impl FnOnce(&mut ViaContext, &mut Via1dBackend) -> R,
+    ) -> R {
+        self.via1.clk = self.clk();
+        let mut backend = Via1dBackend {
+            number: 0,
+            iecbus: self.via1_iecbus,
+            irq: self.via1_irq,
+        };
+        f(self.via1, &mut backend)
     }
-    /// Port inputs presented to the IEC VIA1: PB carries the IEC bus `tmp`,
-    /// PA floats high (the drive does not read a meaningful PA on VIA1).
+
+    /// Dispatch any VIA1 alarms due at/before `clk` (= viacore run_pending_alarms,
+    /// the PROCESS_ALARMS path). The alarm callbacks update IFR + the IRQ mirror.
     #[inline]
-    fn via1_ports(&self) -> Via2Ports {
-        Via2Ports {
-            pra_pin: 0xff,
-            prb_pin: self.via1_iec_tmp(),
-        }
+    fn via1_run_alarms(&mut self, clk: u64) {
+        self.via1.clk = clk;
+        self.via1_with_backend(|ctx, b| viacore::run_pending_alarms(ctx, b, clk, 0));
+    }
+
+    /// VIA1 register store (= viacore_store via the via1d1541 backend). The viacore
+    /// applies its own `write_offset` (= 1) so rclk = clk - 1; the `store_prb` IEC
+    /// fold reads the live `ctx.clk`/iecbus state.
+    #[inline]
+    fn via1_store(&mut self, addr: u16, val: u8) {
+        self.via1_with_backend(|ctx, b| viacore::viacore_store(ctx, b, addr, val));
+    }
+
+    /// VIA1 register read (= viacore_read via the via1d1541 backend).
+    #[inline]
+    fn via1_read(&mut self, addr: u16) -> u8 {
+        self.via1_with_backend(|ctx, b| viacore::viacore_read(ctx, b, addr))
     }
 
     /// Build the VIA2 disk-controller backend (via2d.ts) from the bus's borrowed
@@ -641,7 +229,7 @@ impl<'a> DriveCore6510Bus for DriveBus<'a> {
     /// consults it). `clk` is the live `core.clk` the core passes in.
     #[inline]
     fn process_alarms(&mut self, clk: u64) {
-        self.via1.run_alarms(clk);
+        self.via1_run_alarms(clk);
         self.via2_run_alarms(clk);
     }
 
@@ -688,18 +276,16 @@ impl<'a> DriveCore6510Bus for DriveBus<'a> {
 
     #[inline]
     fn read(&mut self, addr: u16) -> u8 {
-        let clk = self.clk();
         match addr {
             0x0000..=0x7FFF => {
-                // VIA1: $1800-$1BFF (mirror every $400) — real 6522. PB carries
-                // the IEC bus lines via the read_prb `tmp` (supplied as prb_pin);
-                // the IFR/IER reads follow 6522 semantics so the drive IRQ handler
-                // ($FE6C LDA $180D) sees the real CA1/timer flags, not a stale
-                // last-written byte.
+                // VIA1: $1800-$1BFF (mirror every $400) — the 1:1-ported viacore
+                // (viacore.rs) driven by the via1d1541 backend. PB ($1800) reads
+                // the IEC bus through `read_prb` (tmp = (drv_port^0x85)|0x1a|driveid);
+                // PRA ($1801) through `read_pra`; IFR/IER follow 6522 semantics so
+                // the drive IRQ handler ($FE6C LDA $180D) sees the real CA1/timer
+                // flags. viacore_read dispatches any due alarms itself (rclk = clk).
                 if (0x1800..=0x1BFF).contains(&addr) {
-                    let ports = self.via1_ports();
-                    self.via1.run_alarms(clk);
-                    return self.via1.read(addr, clk, ports);
+                    return self.via1_read(addr);
                 }
                 // VIA2: $1C00-$1FFF — the 1:1-ported viacore (viacore.rs). PRA
                 // ($1C01) / PRB ($1C00) reads sample the rotating disk through the
@@ -718,37 +304,25 @@ impl<'a> DriveCore6510Bus for DriveBus<'a> {
 
     #[inline]
     fn write(&mut self, addr: u16, val: u8) {
-        let clk = self.clk();
-        // VIA register STORE rclk = clk_ptr - write_offset (= clk - 1, Spec 612):
-        // the 6510 core's store-cycle CLK_ADD ran before the store, so the viacore
-        // register/timer/IFR/IRQ logic lands one cycle earlier than the live clk.
-        // The rotation side-effects (store_prb / store_pcr) keep the FULL `clk`
-        // (rotation.c reads clk_ptr directly), so they read `self.clk()` themselves.
-        let wclk = clk.wrapping_sub(VIA_WRITE_OFFSET);
+        // Both drive VIAs run through the 1:1-ported viacore (viacore_store), which
+        // applies its own per-instance `write_offset` (= 1) so the register/timer/
+        // IFR/IRQ logic lands at rclk = ctx.clk - 1 (Spec 612 PL-6), while the
+        // store_prb/store_pcr port hooks keep the FULL `ctx.clk` (= the live drive
+        // clock the bus syncs into `ctx.clk` via `viaN_with_backend`). The viacore
+        // reads `ctx.clk` itself; no manual rclk subtraction is needed here.
         match addr {
             0x0000..=0x7FFF => {
                 if (0x1800..=0x1BFF).contains(&addr) {
-                    // Composed VIA1 PB output before the store (= VICE p_oldpb).
-                    let reg = addr & 0x0f;
-                    let old_pb = (self.via1.regs[0] | !self.via1.regs[2]) & 0xff;
-                    self.via1.run_alarms(wclk);
-                    self.via1.write(addr, val, wclk);
-                    // via1d1541.c store_prb: a PB/DDRB write that CHANGES the drive's
-                    // composed IEC output re-folds the wired-AND bus against the fixed
-                    // C64 cpu_bus, so the drive's NEXT `$1800` read sees its own
-                    // CLK/DATA pull. This is the cross-domain fix: without it the drive
-                    // samples a STALE drv_port snapshot across a multi-instruction
-                    // catch-up run and misreads its own / the C64's line at the byte
-                    // handshake ($E95C isr01: `and #datin / bne frmerx`), falsely
-                    // aborting the directory talk-send at byte 11. VICE gates store_prb
-                    // on `byte != p_oldpb` (via1d1541.c:219) — so an ORB write with the
-                    // bit as an INPUT (DDRB=0, output unchanged) does NOT re-fold.
-                    if reg == 0 || reg == 2 {
-                        let new_pb = (self.via1.regs[0] | !self.via1.regs[2]) & 0xff;
-                        if new_pb != old_pb {
-                            self.drv_port = crate::iec::fold_drv_port(self.cpu_bus, new_pb);
-                        }
-                    }
+                    // viacore_store applies its own write_offset (= 1) so rclk =
+                    // ctx.clk - 1 for the register/timer/IFR/IRQ logic. The IEC
+                    // side-effect (store_prb) folds the drive's composed PB output
+                    // into the `v_iecbus` (drv_data/drv_bus/cpu_port/drv_port) so the
+                    // drive's NEXT `$1800` read sees its own CLK/DATA pull — this IS
+                    // via1d1541.c store_prb, performed inline by the backend hook
+                    // (no external `fold_drv_port` shim). store_prb is gated on
+                    // `byte != p_oldpb` inside viacore_store/via1d1541, so an ORB
+                    // write that leaves the composed output unchanged does NOT re-fold.
+                    self.via1_store(addr, val);
                     return;
                 }
                 if (0x1C00..=0x1FFF).contains(&addr) {
@@ -787,7 +361,21 @@ pub struct Drive1541 {
     pub int: IntStatus,
     ram: Box<[u8; 0x800]>,
     rom: Box<[u8; 0x8000]>,
-    via1: Via6522,
+    /// VIA1 — the 1:1-ported viacore `ViaContext` (viacore.rs). The IEC disk-side
+    /// hooks (store_prb/read_prb CLK/DATA/ATN_ACK bit-bang, CA1=ATN IRQ) run
+    /// through `Via1dBackend` exactly as via1d1541.ts does. Replaces the distilled
+    /// `Via6522` VIA1.
+    via1: ViaContext,
+    /// VIA1 IRQ-line mirror (see `viacore::Via1Irq`): the via1d1541 `set_int` hook
+    /// records the line level + rclk here; the run loop replays it into
+    /// `int.set_irq(0, ..)` at the instruction boundary (VIA1 = int source 0).
+    via1_irq: Via1Irq,
+    /// VIA1's `v_iecbus` — the drive's owned `IecbusT` (via1d1541.ts:923). The C64
+    /// path syncs `cpu_bus` + `drv_port` into it before each catch-up run; the
+    /// via1d1541 `store_prb` hook folds the drive's PB output into `drv_data[8]` /
+    /// `drv_bus[8]` / `cpu_port` / `drv_port`; `read_prb` reads back `drv_port`.
+    /// After the run the C64 reads `drv_data[8]` to fold into the shared IEC core.
+    via1_iecbus: IecbusT,
     /// VIA2 — the 1:1-ported viacore `ViaContext` (viacore.rs). Replaces the
     /// distilled `Via6522` for VIA2: the disk-controller hooks (stepper/motor/
     /// SYNC/byte-ready) run through `Via2dBackend` exactly as via2d.ts does.
@@ -831,6 +419,30 @@ pub struct Drive1541 {
     /// The rotating GCR disk model (head position, bit-stream, byte-ready). Holds
     /// the per-track GCR bitstream for a mounted D64 (`rotation.image`).
     pub rotation: Rotation,
+}
+
+/// Build a powered-on VIA1 `ViaContext` (via1d1541.ts:805-943
+/// via1d1541_setup_context + via1d1541.ts:790-798 via1d1541_init). Seeds the
+/// calloc-zero struct, runs `viacore_setup_context` (power-on register latches,
+/// write_offset=1, external cb1/cb2 high), then `viacore_init` (the 5 timer
+/// alarms). Sets `int_num = 0` (the drive VIA1 is interrupt source 0; VIA2 is 1)
+/// and the VICE names. The VIA1 is then cold-reset by `cold_reset()` via
+/// `viacore_reset`. The `v_iecbus` pointer is the drive's owned `IecbusT`.
+fn new_via1_ctx() -> ViaContext {
+    let mut via = ViaContext::new();
+    // via1d1541.ts:904-905 — myname / my_module_name (drive unit 8 → number 0).
+    via.myname = Some("1541Drive0Via1".to_string());
+    via.my_module_name = Some("1541VIA1D0".to_string());
+    viacore::viacore_setup_context(&mut via);
+    // via1d1541.ts:911-912 — legacy snapshot module names.
+    via.my_module_name_alt1 = Some("VIA1D0".to_string());
+    via.my_module_name_alt2 = Some("VIA1D1541".to_string());
+    // via1d1541.ts:915 — via->irq_line = IK_IRQ = (1 << 1) = 2.
+    via.irq_line = 2;
+    // The drive wires VIA1 to IntStatus source 0 (VIA2 is source 1).
+    via.int_num = 0;
+    viacore::viacore_init(&mut via);
+    via
 }
 
 /// Build a powered-on VIA2 `ViaContext` (via2d.ts:625-696 via2d_setup_context +
@@ -884,7 +496,9 @@ impl Drive1541 {
             int: IntStatus::new(),
             ram: Box::new([0u8; 0x800]),
             rom: Box::new([0u8; 0x8000]),
-            via1: Via6522::new(),
+            via1: new_via1_ctx(),
+            via1_irq: Via1Irq::new(),
+            via1_iecbus: IecbusT::new_power_on(),
             via2: new_via2_ctx(),
             via2_irq: Via2Irq::new(),
             drive_clk: 0,
@@ -948,7 +562,20 @@ impl Drive1541 {
         // DDRB start at 0 (all inputs, ORB latch 0) so the IEC read_prb formula
         // sees the right DDRB before the ROM programs $1802; VIA2's PCR → 0 so the
         // boot $1C0C read returns 0x00 as VICE does. Anchored at reset clock (0).
-        self.via1.reset(0);
+        // VIA1: re-seed a fresh power-on ViaContext + iecbus + IRQ mirror, then
+        // viacore_reset at clk 0 (same shape as VIA2 below).
+        self.via1 = new_via1_ctx();
+        self.via1_irq = Via1Irq::new();
+        self.via1_iecbus = IecbusT::new_power_on();
+        {
+            self.via1.clk = 0;
+            let mut backend = Via1dBackend {
+                number: 0,
+                iecbus: &mut self.via1_iecbus,
+                irq: &mut self.via1_irq,
+            };
+            viacore::viacore_reset(&mut self.via1, &mut backend);
+        }
         // VIA2: re-seed a fresh power-on ViaContext, then viacore_reset at clk 0.
         // A fresh ctx clears any leftover alarm schedule / IFR / latches; the
         // viacore_reset then re-latches the timers and clears IFR/IER exactly as
@@ -1010,10 +637,10 @@ impl Drive1541 {
     /// boundary clock equals or just trails — and `irq_stamp` is the inactive
     /// `u64::MAX` sentinel there, which would overflow `rclk + 3`).
     #[inline]
-    fn refresh_irq_line(int: &mut IntStatus, via1: &Via6522, via2_irq: &Via2Irq, now: u64) {
-        let s1 = if via1.irq_active { via1.irq_stamp } else { now };
+    fn refresh_irq_line(int: &mut IntStatus, via1_irq: &Via1Irq, via2_irq: &Via2Irq, now: u64) {
+        let s1 = if via1_irq.active { via1_irq.stamp } else { now };
         let s2 = if via2_irq.active { via2_irq.stamp } else { now };
-        int.set_irq(0, via1.irq_active, s1);
+        int.set_irq(0, via1_irq.active, s1);
         int.set_irq(1, via2_irq.active, s2);
     }
 
@@ -1021,11 +648,15 @@ impl Drive1541 {
     /// `out = ORB | ~DDRB`). Output bits (DDRB=1) carry the ORB latch; input bits
     /// (DDRB=0) float HIGH. The IEC core inverts this to `drv_data[8]`. PB1=DATA_OUT,
     /// PB3=CLK_OUT, PB4=ATN_ACK (active-low after the 7406 / wired-AND inversion).
+    ///
+    /// After the 1:1 via1d1541 port, the drive's `store_prb` hook already wrote the
+    /// inverted PB output into `via1_iecbus.drv_data[8]` (= VICE `*drive_data =
+    /// ~byte`). The composed `(ORB | ~DDRB)` output the C64 path folds is therefore
+    /// the un-inverted `~drv_data[8]` — read straight from the iecbus. (Equivalently
+    /// `via1.via[VIA_PRB] | !via1.via[VIA_DDRB]`; both agree once store_prb ran.)
     #[inline]
     pub fn via1_pb_iec_output(&self) -> u8 {
-        let orb = self.via1.regs[0];
-        let ddrb = self.via1.regs[2];
-        (orb | !ddrb) & 0xff
+        (!self.via1_iecbus.drv_data[8]) & 0xff
     }
 
     /// DIAGNOSTIC: snapshot the drive VIA1 IRQ/CA1 state for the ATN-IRQ probe.
@@ -1035,9 +666,9 @@ impl Drive1541 {
         (
             self.via1.ifr,
             self.via1.ier,
-            self.via1.regs[VIA_PCR],
-            self.via1.irq_active,
-            self.via1.irq_stamp,
+            self.via1.via[VIA_PCR],
+            self.via1_irq.active,
+            self.via1_irq.stamp,
         )
     }
 
@@ -1049,10 +680,20 @@ impl Drive1541 {
     /// write-conf1 path computed (`AtnEdge::Via1Ca1 { sig }`): `VIA_SIG_RISE` (1)
     /// when ATN is now LOW, `0` (no-edge) when ATN is now HIGH — exactly the value
     /// VICE hands `viacore_signal`. `clk` is the drive clock the edge is stamped at.
+    ///
+    /// Routed through the 1:1 `viacore_signal(ctx, VIA_SIG_CA1, edge)` via the
+    /// via1d1541 backend — the verbatim CA1-edge → IFR CA1 → IRQ path, replacing
+    /// the distilled `signal_ca1`.
     #[inline]
     pub fn atn_edge_to_via1_ca1(&mut self, sig: u8, clk: u64) {
-        self.via1.run_alarms(clk);
-        self.via1.signal_ca1(sig, clk);
+        self.via1.clk = clk;
+        let mut backend = Via1dBackend {
+            number: 0,
+            iecbus: &mut self.via1_iecbus,
+            irq: &mut self.via1_irq,
+        };
+        viacore::run_pending_alarms(&mut self.via1, &mut backend, clk, 0);
+        viacore::viacore_signal(&mut self.via1, &mut backend, crate::iec::VIA_SIG_CA1, sig);
     }
 
     /// Reset PC from the ROM vector (re-read). Returns the resolved PC.
@@ -1075,6 +716,14 @@ impl Drive1541 {
     pub fn run_cycles(&mut self, n: u64) {
         // Advance the drive-clock target for this slice of main-CPU time.
         self.advance_stop_clk(n);
+        // Sync the C64-side IEC state into the drive's `v_iecbus` (= via1d1541's
+        // `iecbus` pointer) before the run: `cpu_bus` (the C64 intent, constant
+        // across this catch-up) and `drv_port` (the effective drive-input bus the
+        // C64 path folded from the shared IEC core). The drive's `read_prb` reads
+        // `drv_port`; a `$1800` `store_prb` re-folds the wired-AND against this
+        // `cpu_bus` so the drive sees its own CLK/DATA pull on the next read.
+        self.via1_iecbus.cpu_bus = self.iec_cpu_bus;
+        self.via1_iecbus.drv_port = self.iec_drv_port;
         // Disjoint split-borrow of `self`: `core`/`int`/`reset_pending` go to the
         // verbatim execute call; the rest (RAM/ROM/VIA/rotation/IEC) to the bus.
         let core = &mut self.core;
@@ -1090,10 +739,10 @@ impl Drive1541 {
             ram: &mut self.ram,
             rom: &self.rom,
             via1: &mut self.via1,
+            via1_irq: &mut self.via1_irq,
+            via1_iecbus: &mut self.via1_iecbus,
             via2: &mut self.via2,
             via2_irq: &mut self.via2_irq,
-            drv_port: self.iec_drv_port,
-            cpu_bus: self.iec_cpu_bus,
             clk_ptr,
             rotation: &mut self.rotation,
             pending_set_overflow: false,
@@ -1111,9 +760,9 @@ impl Drive1541 {
             // time DO_INTERRUPT's interrupt_check_irq_delay reads it). The VIAs'
             // alarms were brought up to `core.clk` by the prior step's PROCESS_ALARMS
             // and by every bus access.
-            bus.via1.run_alarms(core.clk);
+            bus.via1_run_alarms(core.clk);
             bus.via2_run_alarms(core.clk);
-            Self::refresh_irq_line(int, bus.via1, bus.via2_irq, core.clk);
+            Self::refresh_irq_line(int, bus.via1_irq, bus.via2_irq, core.clk);
 
             // One whole drive instruction (or one interrupt/reset dispatch) on the
             // verbatim core. The rotate/byte-ready/SET_OVERFLOW hooks are woven into
@@ -1231,10 +880,10 @@ mod tests {
                 ram: &mut d.ram,
                 rom: &d.rom,
                 via1: &mut d.via1,
+                via1_irq: &mut d.via1_irq,
+                via1_iecbus: &mut d.via1_iecbus,
                 via2: &mut d.via2,
                 via2_irq: &mut d.via2_irq,
-                drv_port: 0x85,
-                cpu_bus: 0xff,
                 clk_ptr: &mut clk,
                 rotation: &mut d.rotation,
                 pending_set_overflow: false,
@@ -1247,38 +896,50 @@ mod tests {
 
     #[test]
     fn drive_bus_via1_iec_pb() {
+        // VIA1 ($1800) now runs through the 1:1-ported viacore + the via1d1541
+        // backend. PB read = read_prb composite re-folded by viacore:
+        //   tmp = (drv_port ^ 0x85) | 0x1a | driveid, then
+        //   byte = (PRB & DDRB) | (tmp & ~DDRB).
+        // With the power-on iecbus (drv_port = 0x85) and DDRB=0 the read returns
+        // tmp = (0x85^0x85)|0x1a|0 = 0x1a. PRA read (read_pra) = (PRA & DDRA) |
+        // (0xff & ~DDRA).
         let mut d = Drive1541::new();
-        d.via1.reset(0); // DDRA=DDRB=0 (all inputs), ORB/ORA=0
         let mut clk: u64 = 0;
         let mut bus = DriveBus {
             ram: &mut d.ram,
             rom: &d.rom,
             via1: &mut d.via1,
+            via1_irq: &mut d.via1_irq,
+            via1_iecbus: &mut d.via1_iecbus,
             via2: &mut d.via2,
             via2_irq: &mut d.via2_irq,
-            drv_port: 0x85,
-            cpu_bus: 0xff,
             clk_ptr: &mut clk,
             rotation: &mut d.rotation,
             pending_set_overflow: false,
         };
-        // VIA1 PB ($1800) read = 6522 PRB read with prb_pin = IEC tmp:
-        //   byte = (tmp & ~DDRB) | (PRB & DDRB), tmp = (drv_port ^ 0x85)|0x1a.
-        // With DDRB=0 (reset) the read returns tmp = (0x85^0x85)|0x1a = 0x1a.
+        // The FIRST $1800 PB write fires store_prb (composed out 0xff != oldpb 0,
+        // the power-on reset value) and folds the drive's own pull into the iecbus:
+        //   drv_data[8] = ~0xff = 0x00 → drv_bus[8] = 0 → cpu_port = 0 →
+        //   drv_port = ((0>>4)&4)|(0>>7)|((cpu_bus 0xff <<3)&0x80) = 0x80.
+        // read_prb then sees tmp = (0x80 ^ 0x85)|0x1a|0 = 0x1f. (This is the 1:1
+        // via1d1541 store_prb fold — the OLD distilled path skipped the fold when
+        // the composed output was unchanged, leaving drv_port at the 0x85 power-on
+        // and reading 0x1a. The 1:1 port fires on the oldpb=0 first-write edge.)
         bus.write(0x1800, 0x42); // sets ORB latch (no effect with DDRB=0)
         assert_eq!(
             bus.read(0x1800),
-            0x1a,
-            "$1800 PB read = IEC tmp with DDRB=0"
+            0x1f,
+            "$1800 PB read after the first store_prb bus fold (DDRB=0)"
         );
-        // Drive all bits as outputs → read returns the ORB latch verbatim.
+        // Drive all bits as outputs → read returns the ORB latch verbatim
+        // (PRB & DDRB) with DDRB=$FF.
         bus.write(0x1802, 0xff); // DDRB = all outputs
         assert_eq!(
             bus.read(0x1800),
             0x42,
             "$1800 PB read = ORB latch when DDRB=$FF"
         );
-        // VIA1 PRA ($1801): with DDRA=0xFF it reads back the stored ORA latch.
+        // VIA1 PRA ($1801): with DDRA=0xFF read_pra returns the stored ORA latch.
         bus.write(0x1803, 0xff); // DDRA = all outputs
         bus.write(0x1801, 0x33);
         assert_eq!(
@@ -1299,10 +960,10 @@ mod tests {
             ram: &mut d.ram,
             rom: &d.rom,
             via1: &mut d.via1,
+            via1_irq: &mut d.via1_irq,
+            via1_iecbus: &mut d.via1_iecbus,
             via2: &mut d.via2,
             via2_irq: &mut d.via2_irq,
-            drv_port: 0x85,
-            cpu_bus: 0xff,
             clk_ptr: &mut clk,
             rotation: &mut d.rotation,
             pending_set_overflow: false,
@@ -1411,10 +1072,10 @@ mod tests {
             ram: &mut d.ram,
             rom: &d.rom,
             via1: &mut d.via1,
+            via1_irq: &mut d.via1_irq,
+            via1_iecbus: &mut d.via1_iecbus,
             via2: &mut d.via2,
             via2_irq: &mut d.via2_irq,
-            drv_port: 0x85,
-            cpu_bus: 0xff,
             clk_ptr: &mut clk,
             rotation: &mut d.rotation,
             pending_set_overflow: false,

@@ -1879,3 +1879,190 @@ impl<'a> ViaBackend for Via2dBackend<'a> {
         // drv.led_status = 1; drive_update_ui_status() — observation-only.
     }
 }
+
+// =============================================================================
+// VIA1 IEC backend — STRICT 1:1 port of via1d1541.ts
+// =============================================================================
+//
+// PORT OF: src/runtime/headless/vice1541/via1d1541.ts (vice/src/drive/iec/via1d1541.c).
+// The TS installs the same 17 callback fns onto via_context_t; here the same
+// functions are the methods of [`Via1dBackend`], which carries the state the TS
+// reaches via `ctx.prv` (= `drivevia1_context_t`: `number` + the `v_iecbus`
+// pointer) and `ctx.context` (= the IntStatus for set_int). One method per VICE
+// `static` fn, same name, same body, same branch order.
+//
+// The TS `via1p.v_iecbus` is the SHARED `iecbus_t`; in TRX64 the drive holds its
+// own [`IecbusT`] (its `v_iecbus`) whose `cpu_bus` is synced from the C64-side
+// `IecCore` before each catch-up run and whose `drv_port` (after `store_prb`'s
+// fold) is what the drive reads at its VIA1 PB inputs and what the C64 reads back.
+// The backend borrows it as `&mut IecbusT` exactly like the `v_iecbus` pointer.
+
+use crate::iec::{IecbusT, NUM_DISK_UNITS as IEC_NUM_DISK_UNITS};
+
+/// IRQ-line mirror written by the VIA1 `set_int` hook (= [`Via2Irq`] for VIA1).
+/// VICE's set_int calls `interrupt_set_irq(int_status, int_num, value, rclk)`
+/// directly; the drive executor holds `&mut IntStatus` while the bus runs, so the
+/// backend records the line LEVEL + rclk here and the run loop replays it into
+/// `IntStatus::set_irq(0, active, stamp)` (VIA1 is int_num 0) at the instruction
+/// boundary. The edge logic IS VICE's interrupt_set_irq (see [`Via2Irq::set`]).
+#[derive(Clone, Copy, Debug)]
+pub struct Via1Irq {
+    pub active: bool,
+    pub stamp: u64,
+}
+
+impl Via1Irq {
+    pub fn new() -> Self {
+        Via1Irq {
+            active: false,
+            stamp: u64::MAX,
+        }
+    }
+    #[inline]
+    pub fn set(&mut self, value: bool, rclk: u64) {
+        if value {
+            if !self.active {
+                self.active = true;
+                self.stamp = rclk;
+            }
+        } else if self.active {
+            self.active = false;
+            self.stamp = u64::MAX;
+        }
+    }
+}
+
+impl Default for Via1Irq {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// VIA1 backend (= `drivevia1_context_t` + the IntStatus the via1d1541 hooks
+/// reach). Holds `number` (`via1p->number`), the `v_iecbus` pointer (the drive's
+/// [`IecbusT`]), and the IRQ-line mirror (`ctx.context.cpu.int_status` — see
+/// [`Via1Irq`]). Built per VIA1 access.
+pub struct Via1dBackend<'a> {
+    /// `via1p->number` — the drive unit number (0 for unit 8). driveid = (n<<5)&0x60.
+    pub number: usize,
+    /// `via1p->v_iecbus` — the drive's IEC bus struct. `store_prb` / `undump_prb`
+    /// fold the drive's PB output into `drv_data` / `drv_bus` / `cpu_port` /
+    /// `drv_port`; `read_prb` reads `drv_port`. Never `None` in the 1541 shape
+    /// (iecbus is always installed), so the `iec_drive_write` fallback is dead.
+    pub iecbus: &'a mut IecbusT,
+    /// `ctx.context.cpu.int_status` — set_int target (interrupt_set_irq mirror).
+    pub irq: &'a mut Via1Irq,
+}
+
+impl<'a> ViaBackend for Via1dBackend<'a> {
+    // PORT OF: via1d1541.ts:385-387 (set_ca2 — static, empty).
+    fn set_ca2(&mut self, _ctx: &ViaContext, _state: u32) {
+        // VICE: empty body. CA2 not wired on 1541 VIA1.
+    }
+
+    // PORT OF: via1d1541.ts:394-396 (set_cb2 — static, empty).
+    fn set_cb2(&mut self, _ctx: &ViaContext, _state: u32, _offset: u64) {
+        // VICE: empty body. CB2 not wired on 1541 VIA1.
+    }
+
+    // PORT OF: via1d1541.ts:403-414 (set_int — static).
+    fn set_int(&mut self, _ctx: &ViaContext, _int_num: u32, value: u32, rclk: u64) {
+        // VICE:99 — interrupt_set_irq(dc->cpu->int_status, int_num, value, rclk).
+        // The drive's VIA1 is int_num 0; the mirror replays into IntStatus::set_irq
+        // at the instruction boundary (the executor holds &mut IntStatus here).
+        self.irq.set(value != 0, rclk);
+    }
+
+    // PORT OF: via1d1541.ts:421-431 (restore_int — static). No-op for headless.
+    fn restore_int(&mut self, _ctx: &ViaContext, _int_num: u32, _value: u32) {}
+
+    // PORT OF: via1d1541.ts:482-530 (store_pra — static).
+    // The 1541 (default) branch has NO parallel cable installed, so store_pra
+    // takes the `DRIVE_PC_*` switch's empty default and is a no-op. The 1570/1571
+    // and parallel-cable branches are out of scope per Spec 612 §10 (the
+    // single-1541 LOAD path never enters them); modelling them would require a
+    // parallel-cable port. Kept as a no-op matching the reached behaviour.
+    fn store_pra(&mut self, _ctx: &mut ViaContext, _byte: u8, _oldpa: u8, _addr: usize) {
+        // dc.type == DRIVE_TYPE_1541, dc.parallel_cable == DRIVE_PC_NONE → default
+        // case → no action. (1571/parallel branches: §10 out of scope, unreached.)
+    }
+
+    // PORT OF: via1d1541.ts:579-627 (store_prb — static).
+    fn store_prb(&mut self, _ctx: &mut ViaContext, byte: u8, p_oldpb: u8, _addr: usize) {
+        // VICE:219 — gate on change.
+        if byte != p_oldpb {
+            // DEBUG_IEC_DRV_WRITE(byte) — no-op.
+
+            // VICE:50 — `#define iecbus (via1p->v_iecbus)` expanded inline.
+            // iecbus is never null in the 1541 shape (the else branch is dead).
+            let slot = self.number + 8;
+
+            // VICE:229 — *drive_data = ~byte;
+            self.iecbus.drv_data[slot] = (!byte) & 0xff;
+
+            // VICE:230-232 — drv_bus[slot] composite.
+            let dd = self.iecbus.drv_data[slot] as u32;
+            let cpu_bus = self.iecbus.cpu_bus as u32;
+            self.iecbus.drv_bus[slot] =
+                (((dd << 3) & 0x40) | ((dd << 6) & (((!dd) ^ cpu_bus) << 3) & 0x80)) as u8;
+
+            // VICE:234 — iecbus->cpu_port = iecbus->cpu_bus;
+            self.iecbus.cpu_port = self.iecbus.cpu_bus & 0xff;
+            // VICE:235-237 — AND-reduce drv_bus over units 4..(8+NUM_DISK_UNITS-1).
+            for unit in 4..(8 + IEC_NUM_DISK_UNITS) {
+                self.iecbus.cpu_port = (self.iecbus.cpu_port & self.iecbus.drv_bus[unit]) & 0xff;
+            }
+
+            // VICE:239-241 — drv_port composite.
+            let cp = self.iecbus.cpu_port as u32;
+            let cb = self.iecbus.cpu_bus as u32;
+            self.iecbus.drv_port =
+                (((cp >> 4) & 0x4) | (cp >> 7) | ((cb << 3) & 0x80)) as u8;
+
+            // DEBUG_IEC_BUS_WRITE(iecbus->drv_port) — no-op.
+        }
+    }
+
+    // PORT OF: via1d1541.ts:644-647 (store_pcr — static). `return byte;` pass-through.
+    fn store_pcr(&mut self, _ctx: &mut ViaContext, byte: u8, _addr: usize) -> Option<u8> {
+        Some(byte & 0xff)
+    }
+
+    // PORT OF: via1d1541.ts:659-661 (store_acr — static, empty).
+    fn store_acr(&mut self, _ctx: &mut ViaContext, _byte: u8) {}
+    // PORT OF: via1d1541.ts:664-666 (store_sr — static, empty).
+    fn store_sr(&mut self, _ctx: &mut ViaContext, _byte: u8) {}
+    // PORT OF: via1d1541.ts:669-671 (store_t2l — static, empty).
+    fn store_t2l(&mut self, _ctx: &mut ViaContext, _byte: u8) {}
+
+    // PORT OF: via1d1541.ts:687-735 (read_pra — static).
+    fn read_pra(&mut self, ctx: &ViaContext, _addr: usize) -> Option<u8> {
+        // dc.type == DRIVE_TYPE_1541 (not 1570/1571/1571CR) → skip the rotation
+        // branch. dc.parallel_cable == DRIVE_PC_NONE → switch default:
+        // VICE:727-729 — (PRA & DDRA) | (0xff & ~DDRA).
+        let byte = ((ctx.via[VIA_PRA] & ctx.via[VIA_DDRA]) | (0xff & !ctx.via[VIA_DDRA])) & 0xff;
+        Some(byte)
+    }
+
+    // PORT OF: via1d1541.ts:753-783 (read_prb — static).
+    //   Bit 7 ATN_IN | bits 6-5 device-addr switches | bit 4 ATN_ACK_OUT
+    //   bit 3 CLK_OUT | bit 2 CLK_IN | bit 1 DATA_OUT | bit 0 DATA_IN
+    //   IN mask 0xe5, OUT mask 0x1a.
+    fn read_prb(&mut self, ctx: &ViaContext) -> Option<u8> {
+        // VICE:345 — driveid = (via1p->number << 5) & 0x60;
+        let driveid = ((self.number << 5) & 0x60) as u8;
+
+        // iecbus is never null in the 1541 shape (the else fallback is dead).
+        // VICE:348-350.
+        let tmp = ((self.iecbus.drv_port ^ 0x85) | 0x1a | driveid) & 0xff;
+        let byte = ((ctx.via[VIA_PRB] & ctx.via[VIA_DDRB]) | (tmp & !ctx.via[VIA_DDRB])) & 0xff;
+
+        // DEBUG_IEC_DRV_READ / DEBUG_IEC_BUS_READ — no-op.
+        Some(byte)
+    }
+
+    // PORT OF: via1d1541.ts:678-680 (reset — static, empty).
+    fn reset(&mut self, _ctx: &mut ViaContext) {
+        // VICE: empty body. Chip-level reset handled by viacore_reset.
+    }
+}

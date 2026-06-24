@@ -154,6 +154,22 @@ pub struct IecbusT {
     pub iec_fast_1541: u8,
 }
 
+impl IecbusT {
+    /// Power-on `iecbus_t` (= `iecbus_init`, vice iecbus.c:197-203): memset 0xff
+    /// then `drv_port = READ_DATA|READ_CLK|READ_ATN = 0x85`. Used by the drive to
+    /// seed its own `v_iecbus` (the via1d1541 `store_prb`/`read_prb` backend).
+    pub fn new_power_on() -> Self {
+        IecbusT {
+            drv_bus: [0xff; IECBUS_NUM],
+            drv_data: [0xff; IECBUS_NUM],
+            drv_port: IECBUS_DEVICE_READ_DATA | IECBUS_DEVICE_READ_CLK | IECBUS_DEVICE_READ_ATN,
+            cpu_bus: 0xff,
+            cpu_port: 0xff,
+            iec_fast_1541: 0xff,
+        }
+    }
+}
+
 // =============================================================================
 // ts: iecbus.ts:706-723 / iecbus.ts:445-462 (calculate_callback_index dispatch)
 // vice: iecbus.c:432-463 — `iecbus_callback_read/_write` function pointers.
@@ -870,34 +886,7 @@ impl IecbusStatusArraysFacade {
 #[allow(non_upper_case_globals)]
 const IECBUS_STATUS_ARRAYS: IecbusStatusArraysFacade = IecbusStatusArraysFacade;
 
-// =============================================================================
-// fold_drv_port — drive-side mid-run wired-AND re-fold (= the via1d1541.c
-// store_prb cross-domain sync). Kept as a free fn because the drive borrow
-// (drive.rs) calls it without access to the IEC core; it reproduces exactly the
-// `iec_drive_write` → drv_bus[8] formula + the drv_port derive (iec_update_ports)
-// for the single-drive slot, against a FIXED cpu_bus.
-// =============================================================================
-
-/// Re-fold the wired-AND bus from the drive's CURRENT VIA1 PB output against a
-/// FIXED C64-side `cpu_bus`, returning the `drv_port` byte the drive reads at its
-/// VIA1 PB inputs. This is the pure-function shape of VICE `via1d1541.c store_prb`
-/// (lines 222-241, the `iecbus != NULL` branch): `*drive_data = ~byte`, then
-/// `*drive_bus = (((drive_data<<3)&0x40) | ((drive_data<<6) & ((~drive_data ^
-/// cpu_bus)<<3) & 0x80))`, then the `iec_update_ports` cpu_port/drv_port derive for
-/// the single-drive slot. VICE recomputes drv_bus[8]/cpu_port/drv_port immediately
-/// when the drive changes its own IEC output mid-run. `pb_out` = `(ORB | ~DDRB)`,
-/// the RAW composed PB output (`byte` in store_prb) — this fn inverts it to
-/// `drive_data = ~pb_out` exactly like store_prb (NOT pre-inverted by the caller).
-#[inline]
-pub fn fold_drv_port(cpu_bus: u8, pb_out: u8) -> u8 {
-    // store_prb: `*drive_data = ~byte` — invert the raw PB output.
-    let drive_data = (!pb_out) as u32;
-    let cb = cpu_bus as u32;
-    // `*drive_bus = (((drive_data<<3)&0x40) | ((drive_data<<6) & ((~drive_data ^ cpu_bus)<<3) & 0x80))`
-    let inv = (!drive_data) ^ cb;
-    let drv_bus = (((drive_data << 3) & 0x40) | ((drive_data << 6) & (inv << 3) & 0x80)) as u8;
-    // iec_update_ports single-slot fold: cpu_port = cpu_bus & drv_bus[8].
-    let cpu_port = cpu_bus & drv_bus;
-    // drv_port = ((cpu_port>>4)&0x4) | (cpu_port>>7) | ((cpu_bus<<3)&0x80).
-    (((cpu_port as u32 >> 4) & 0x4) | (cpu_port as u32 >> 7) | ((cb << 3) & 0x80)) as u8
-}
+// NOTE: the distilled `fold_drv_port` free-fn (the drive-side mid-run wired-AND
+// re-fold shim) has been REMOVED. With the 1:1 via1d1541 port, the drive's VIA1
+// `store_prb` hook performs that fold inline against its own `v_iecbus` (drv_data/
+// drv_bus/cpu_port/drv_port) exactly as VICE does — no external shim is needed.
