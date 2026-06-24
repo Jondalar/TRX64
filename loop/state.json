@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "seven-game-gate",
+  "current_item": "perf-compare",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -40,20 +40,16 @@
     "drive-1to1-iecbus",
     "drive-1to1-via1",
     "scramble-sprites",
-    "g64-mounting"
+    "g64-mounting",
+    "seven-game-gate"
   ],
-  "note": "G64 mounting done (ADR-063): all 20 .g64 mount, motm GCR read proven, D64 byte-exact. NOW the 7-game gate: run each game (scramble/polarbear/motm/california/green_beret/impossible2/ninja/maniac) on TRX64 vs c64re, canary criterion = reaches running game state. Then perf compare.",
-  "updated": "2026-06-24T09:35:47Z",
+  "note": "7-GAME GATE 7/7 PASS (ADR-064): TRX64 = c64re behavioral parity on real software (scramble/polarbear/motm/greenberet/impossible2/lastninja/maniac; california excluded=no protection track). Verbatim cores + 1:1 drive + G64 + sprite-fix all hold. NEXT (user plan): perf-compare = Rust vs TS core cycles/sec (fixed workload, both release, clean CPU, median).",
+  "updated": "2026-06-24T09:42:17Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": {
-    "item": "seven-game-gate",
-    "model": "opus",
-    "started": "2026-06-24T09:35:47Z",
-    "note": "opus ~38min: gate harness + best-frame capture committed (7a502fd, IRQ-title PASS). Running c64re-vs-TRX64 per-game comparison (MCP, no file edits). Alive. Defer."
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"

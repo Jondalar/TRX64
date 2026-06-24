@@ -961,3 +961,19 @@ loader for the title). D64 byte-exact gates ALL GREEN (from_d64 untouched), 95 t
 (fsimage_gcr_write_half_track) intentionally not ported (read-only mount, out of scope).
 NEXT: the 7-game gate — run each game (canary criterion: LOAD"*",8,1+RUN -> PC sustains a game-code RAM
 address = loader ran + game running) on TRX64 vs c64re. Then the Rust-vs-TS perf compare (user plan).
+
+## ADR-064 — 7-GAME GATE: 7/7 BEHAVIORAL PARITY vs c64re (real software runs)
+The c64re proof gate, now run on TRX64. RESULT: 7/7 PASS — TRX64 runs real disk games with the SAME outcome
+as c64re. scramble (KRILL fastloader .d64), polarbear (custom .d64), motm/green_beret/impossible_mission_ii/
+last_ninja_remix (protected GCR .g64), maniac_mansion (.g64, slow standard-serial — reaches game code $80C1;
+c64re ALSO still in the $EE serial loop at 36.5M cyc = exact parity). 6/7 render full title art; every .g64:
+drive read_gcr=true/sync_found=true/head_advanced=true (the 1:1 viacore drive reads real GCR + half-tracks).
+California Games EXCLUDED (the .g64 dump lacks the EPYX protection track → fails on ANY accurate emulator incl
+c64re — not a valid datapoint). Slow-loader cases (lastninja/maniac) are NOT bugs: the first file comes over
+the standard-KERNAL serial path (slow); c64re does the identical thing — same loop, same reason. NO emulator
+changes needed: the verbatim cores + 1:1 drive-class ports (viacore/rotation/iecbus/via1) + G64 mounting + the
+sprite-bank fix all hold on real software. Harness: tests/seven_game_gate.rs (test-only/additive). All
+byte-exact gates GREEN, cargo test 95 passed.
+THE BEHAVIORAL BAR IS MET: TRX64 = c64re on the 7-game proof set. NEXT (user plan): Rust-vs-TS performance
+compare (core cycles/sec, same fixed workload, both release, clean CPU, median K runs + the per-game gate
+wall-clock).

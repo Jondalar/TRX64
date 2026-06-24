@@ -642,3 +642,10 @@ a Rust-vs-TS perf compare (user plan).
 GcrImage::from_g64 1:1 (fsimage_gcr.ts + driveimage.ts + VICE). All 20 .g64 mount; motm GCR read proven
 (finds SYNC, DOS GCR loop + custom loader, seeks tracks — not sync-never-found). Matches c64re. D64 byte-exact
 all GREEN, 95 tests. NEXT: the 7-game gate (now unblocked), then perf compare.
+
+## 2026-06-24 — DRIVER: 7-GAME GATE 7/7 PASS (ADR-064) — TRX64 = c64re on real software
+
+Ran the c64re proof gate on TRX64: 7/7 behavioral parity. scramble/polarbear/motm/greenberet/impossible2/
+lastninja render titles; maniac reaches game code (slow serial, c64re same). Every .g64 reads real GCR via
+the 1:1 viacore drive. California excluded (no protection track). NO emulator changes needed. 95 tests GREEN.
+The behavioral bar is MET. Next: Rust-vs-TS perf compare.
