@@ -26,40 +26,128 @@ use crate::cpu::Bus;
 use crate::sid::Sid6581;
 use crate::vic::VicII;
 
-/// One pre-built memconfig entry (= memory-bus.ts MemConfigEntry, no-cart slice).
+/// $8000-$9FFF mapping (= memory-bus.ts MemConfigEntry.bank8, ts:62).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Bank8 {
+    Ram,
+    CartLo,
+}
+
+/// $A000-$BFFF mapping (= MemConfigEntry.bankA, ts:64).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BankA {
+    Ram,
+    Basic,
+    CartHi,
+}
+
+/// $E000-$FFFF mapping (= MemConfigEntry.bankE, ts:68).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BankE {
+    Ram,
+    Kernal,
+    CartHiUltimax,
+}
+
+/// One pre-built memconfig entry (= memory-bus.ts MemConfigEntry). The bank8/
+/// bank_a/bank_e enums carry the cartridge windows (cart_lo / cart_hi /
+/// cart_hi_ultimax) exactly like the TS string-enums; the `basic`/`kernal`/`io`/
+/// `char_rom` booleans are KEPT (derived from the enums) so the no-cart read/write
+/// path stays byte-identical to the pre-cart code.
 #[derive(Clone, Copy)]
 pub struct MemConfig {
-    /// $A000-$BFFF maps BASIC ROM.
+    /// $8000-$9FFF: RAM or cart ROML.
+    pub bank8: Bank8,
+    /// $A000-$BFFF: RAM / BASIC / cart ROMH.
+    pub bank_a: BankA,
+    /// $E000-$FFFF: RAM / KERNAL / cart ROMH (ultimax).
+    pub bank_e: BankE,
+    /// $A000-$BFFF maps BASIC ROM (= bank_a == Basic).
     pub basic: bool,
-    /// $E000-$FFFF maps KERNAL ROM.
+    /// $E000-$FFFF maps KERNAL ROM (= bank_e == Kernal).
     pub kernal: bool,
-    /// $D000-$DFFF maps I/O.
+    /// $D000-$DFFF maps I/O (= bankD == io).
     pub io: bool,
-    /// $D000-$DFFF maps CHARGEN ROM (when !io).
+    /// $D000-$DFFF maps CHARGEN ROM (when !io) (= bankD == char).
     pub char_rom: bool,
+    /// True when GAME=0 && EXROM=1 (ultimax board overlay). Drives the open-bus
+    /// windows ($1000-$7FFF, $C000-$CFFF, the $A000/$E000 non-cart-hi fallthrough).
+    pub ultimax: bool,
 }
 
 /// Build the 32-entry memconfig table exactly like memory-bus.ts
-/// `buildMemConfigTable` for the stock no-cart C64 (GAME=EXROM=1 ⇒ never ultimax
-/// for the configs the boot uses). Index = LORAM|HIRAM<<1|CHAREN<<2|EXROM<<3|GAME<<4.
+/// `buildMemConfigTable` (ts:987-1019). Index = LORAM|HIRAM<<1|CHAREN<<2|
+/// EXROM<<3|GAME<<4. The cart windows (cart_lo / cart_hi / cart_hi_ultimax) are
+/// set per ultimax / 16K-cart rules; the booleans are derived so the no-cart path
+/// (EXROM=GAME=1 ⇒ idx 0x18-0x1f, never ultimax, never cart) is byte-identical to
+/// the prior table.
 pub fn build_memconfig_table() -> [MemConfig; 32] {
-    let mut table = [MemConfig { basic: false, kernal: false, io: false, char_rom: false }; 32];
+    let mut table = [MemConfig {
+        bank8: Bank8::Ram,
+        bank_a: BankA::Ram,
+        bank_e: BankE::Ram,
+        basic: false,
+        kernal: false,
+        io: false,
+        char_rom: false,
+        ultimax: false,
+    }; 32];
     for (idx, entry) in table.iter_mut().enumerate() {
         let loram = idx & 0x01 != 0;
         let hiram = idx & 0x02 != 0;
         let charen = idx & 0x04 != 0;
         let exrom = idx & 0x08 != 0;
         let game = idx & 0x10 != 0;
+        // ts:996 — Ultimax mode: GAME=0 AND EXROM=1.
         let ultimax = !game && exrom;
 
-        // bankA — BASIC visible only when LORAM && HIRAM (no cart).
-        let basic = !ultimax && loram && hiram;
-        // bankE — KERNAL visible when HIRAM (no cart).
-        let kernal = !ultimax && hiram;
-        // bankD — IO when (LORAM||HIRAM) && CHAREN; CHAR when (LORAM||HIRAM) && !CHAREN.
-        let io = ultimax || ((loram || hiram) && charen);
+        // ts:998-1000 — bank8.
+        let bank8 = if ultimax {
+            Bank8::CartLo
+        } else if loram && hiram && !exrom {
+            Bank8::CartLo
+        } else {
+            Bank8::Ram
+        };
+
+        // ts:1002-1005 — bankA.
+        let bank_a = if ultimax {
+            BankA::Ram // unmapped in Ultimax
+        } else if loram && hiram && !exrom && !game {
+            BankA::CartHi // 16K cart
+        } else if loram && hiram {
+            BankA::Basic
+        } else {
+            BankA::Ram
+        };
+
+        // ts:1007-1009 — bankD.
+        let io = if ultimax {
+            true // I/O always in Ultimax
+        } else {
+            (loram || hiram) && charen
+        };
         let char_rom = !ultimax && (loram || hiram) && !charen;
-        *entry = MemConfig { basic, kernal, io, char_rom };
+
+        // ts:1011-1012 — bankE.
+        let bank_e = if ultimax {
+            BankE::CartHiUltimax
+        } else if hiram {
+            BankE::Kernal
+        } else {
+            BankE::Ram
+        };
+
+        *entry = MemConfig {
+            bank8,
+            bank_a,
+            bank_e,
+            basic: matches!(bank_a, BankA::Basic),
+            kernal: matches!(bank_e, BankE::Kernal),
+            io,
+            char_rom,
+            ultimax,
+        };
     }
     table
 }
@@ -111,17 +199,55 @@ pub struct FullBus<'a> {
     pub keyboard: &'a crate::keyboard::KeyboardMatrix,
     /// Monotonic C64-clock the drive has been advanced up to (push-flush reference).
     pub drive_c64_ref: u64,
+    /// The attached cartridge mapper (= memory-bus.ts `cartridge`, ts:118), or
+    /// None for the stock no-cart machine. Borrowed `&mut` because a $DE00-$DFFF
+    /// IO write mutates the mapper's bank/control register. The mapper is consulted
+    /// SYNCHRONOUSLY from read()/write() (a per-access bus hook, NOT a clocked
+    /// device — no tick). When None the banking is exactly the pre-cart path.
+    pub cartridge: Option<&'a mut Box<dyn crate::cart::CartMapper>>,
 }
 
 impl<'a> FullBus<'a> {
-    /// Recompute the live memconfig from the $00/$01 latches (= memPlaConfigChanged).
+    /// Recompute the live memconfig from the $00/$01 latches + cartridge EXROM/GAME
+    /// lines (= memory-bus.ts memPlaConfigChanged, ts:854-871, VERBATIM).
     #[inline]
-    fn pla_config_changed(&mut self) {
-        // port = (~dir | data) & 7 — input pins pulled HIGH.
-        let port = (!self.port_dir | self.port_data) & 0x07;
-        // No cart: EXROM=1 (bit3), GAME=1 (bit4).
-        let idx = (port | 0x18) as usize & 0x1f;
+    pub fn pla_config_changed(&mut self) {
+        // ts:855 — port = (~dir | data) & 7 — input pins pulled HIGH.
+        let port = ((!self.port_dir | self.port_data) & 0x07) as usize;
+        let loram = port & 0x01;
+        let hiram = (port >> 1) & 0x01;
+        let charen = (port >> 2) & 0x01;
+        // ts:858-862 — cartridge lines; no cart: EXROM=1, GAME=1 (released).
+        let (exrom, game) = match self.cartridge.as_ref() {
+            Some(c) => {
+                let lines = c.get_lines();
+                ((lines.exrom & 1) as usize, (lines.game & 1) as usize)
+            }
+            None => (1usize, 1usize),
+        };
+        // ts:869 — idx = LORAM | HIRAM<<1 | CHAREN<<2 | EXROM<<3 | GAME<<4.
+        let idx = (loram | (hiram << 1) | (charen << 2) | (exrom << 3) | (game << 4)) & 0x1f;
         self.config = self.memconfig_table[idx];
+    }
+
+    /// ts:237-251 — getBankInfo: the banking-context struct passed to every
+    /// cartridge read/write/peek. The read-only mappers only read
+    /// cpu_port_direction/value (and ignore them for banking), so this is mostly
+    /// carried for 1:1 fidelity.
+    #[inline]
+    fn get_bank_info(&self) -> crate::cart::BankInfo {
+        let lines = self.cartridge.as_ref().map(|c| c.get_lines());
+        crate::cart::BankInfo {
+            cpu_port_direction: self.port_dir,
+            cpu_port_value: self.port_data,
+            basic_visible: self.config.basic,
+            kernal_visible: self.config.kernal,
+            io_visible: self.config.io,
+            char_visible: self.config.char_rom,
+            cartridge_attached: self.cartridge.is_some(),
+            cartridge_exrom: lines.map(|l| l.exrom),
+            cartridge_game: lines.map(|l| l.game),
+        }
     }
 
     /// VICE computeCpuPortDataRead simplified for the no-datasette stock C64
@@ -275,8 +401,19 @@ impl<'a> FullBus<'a> {
                     self.cia2.read(addr, self.clk, self.cia_table)
                 }
             }
-            // $DE00-$DFFF (cart IO, no cart) → open-bus shadow.
-            _ => self.io[(addr as usize) - 0xd000],
+            // $DE00-$DFFF — cart IO1/IO2 (ts:407-410). The cart is consulted ONLY
+            // when I/O is visible (guaranteed: io_read is reached only via the io
+            // branch). Some ⇒ the mapper byte; None (or no cart) ⇒ the open-bus
+            // shadow. The read-only mappers (MagicDesk/Ocean) are write-only here
+            // (no IO read) so they return None ⇒ shadow, byte-identical to no-cart.
+            _ => {
+                if (0xde00..=0xdfff).contains(&addr) {
+                    if let Some(v) = self.cart_read(addr) {
+                        return v;
+                    }
+                }
+                self.io[(addr as usize) - 0xd000]
+            }
         }
     }
 
@@ -376,7 +513,46 @@ impl<'a> FullBus<'a> {
                     }
                 }
             }
-            _ => { /* cart IO (none) */ }
+            // $DE00-$DFFF — cart IO1/IO2 write (ts:572-581). A consumed write can
+            // change EXROM/GAME (the bank/disable register), so re-run the PLA
+            // reconfig. A non-consumed write (or no cart) falls to the io shadow
+            // (already stored at the top of io_write) — byte-identical to no-cart.
+            _ => {
+                if (0xde00..=0xdfff).contains(&addr) && self.cart_write(addr, value) {
+                    self.pla_config_changed();
+                }
+            }
+        }
+    }
+}
+
+impl<'a> FullBus<'a> {
+    /// ts:105 — openBusProvider default `() => 0xff`. The VIC float-bus value the
+    /// ultimax open windows read. (No phi1 source wired in this read-only tier.)
+    #[inline]
+    fn open_bus(&self) -> u8 {
+        0xff
+    }
+
+    /// Consult the attached cartridge mapper's read window (ts:
+    /// `this.cartridge?.read(normalized, this.getBankInfo())`). None ⇒ no cart or
+    /// the mapper does not handle this address (falls through to RAM / open-bus).
+    #[inline]
+    fn cart_read(&self, addr: u16) -> Option<u8> {
+        let bi = self.get_bank_info();
+        self.cartridge.as_ref().and_then(|c| c.read(addr, &bi))
+    }
+
+    /// Drive a write through the cartridge mapper (ts:
+    /// `this.cartridge?.write(normalized, byte, bankInfo)`). Returns whether the
+    /// cart CONSUMED the write (true ⇒ does not fall through to RAM). `bank_info`
+    /// is computed BEFORE the mutable borrow (it only needs the live lines).
+    #[inline]
+    fn cart_write(&mut self, addr: u16, value: u8) -> bool {
+        let bi = self.get_bank_info();
+        match self.cartridge.as_mut() {
+            Some(c) => c.write(addr, value, &bi),
+            None => false,
         }
     }
 }
@@ -387,15 +563,48 @@ impl<'a> Bus for FullBus<'a> {
         match addr {
             0x0000 => self.port_dir,
             0x0001 => self.cpu_port_data_read(),
-            0x0002..=0x9fff => self.ram[addr as usize],
-            0xa000..=0xbfff => {
-                if self.config.basic {
-                    self.basic_rom[(addr as usize) - 0xa000]
+            // $1000-$7FFF — ultimax open bus (board != MAX keeps $0000-$0FFF RAM).
+            // No-cart: ultimax=false ⇒ RAM (byte-identical to the prior path).
+            0x0002..=0x7fff => {
+                if self.config.ultimax && addr >= 0x1000 {
+                    self.open_bus()
                 } else {
                     self.ram[addr as usize]
                 }
             }
-            0xc000..=0xcfff => self.ram[addr as usize],
+            // $8000-$9FFF — ROML when bank8==CartLo (8k/16k/ultimax); else RAM.
+            0x8000..=0x9fff => {
+                if matches!(self.config.bank8, Bank8::CartLo) {
+                    if let Some(v) = self.cart_read(addr) {
+                        return v;
+                    }
+                }
+                self.ram[addr as usize]
+            }
+            // $A000-$BFFF — ts:374-388: cart_hi ⇒ ROMH; basic ⇒ BASIC; ultimax
+            // (non-cart-hi) ⇒ open bus; else RAM.
+            0xa000..=0xbfff => {
+                if matches!(self.config.bank_a, BankA::CartHi) {
+                    if let Some(v) = self.cart_read(addr) {
+                        return v;
+                    }
+                    self.ram[addr as usize]
+                } else if self.config.basic {
+                    self.basic_rom[(addr as usize) - 0xa000]
+                } else if self.config.ultimax {
+                    self.open_bus()
+                } else {
+                    self.ram[addr as usize]
+                }
+            }
+            // $C000-$CFFF — ts:390-401: ultimax ⇒ open bus; else RAM.
+            0xc000..=0xcfff => {
+                if self.config.ultimax {
+                    self.open_bus()
+                } else {
+                    self.ram[addr as usize]
+                }
+            }
             0xd000..=0xdfff => {
                 if self.config.io {
                     self.io_read(addr)
@@ -405,9 +614,16 @@ impl<'a> Bus for FullBus<'a> {
                     self.ram[addr as usize]
                 }
             }
+            // $E000-$FFFF — ts:463-481: KERNAL; else cart_hi_ultimax ⇒ ROMH
+            // (open bus if the mapper returns None); else RAM.
             0xe000..=0xffff => {
                 if self.config.kernal {
                     self.kernal_rom[(addr as usize) - 0xe000]
+                } else if matches!(self.config.bank_e, BankE::CartHiUltimax) {
+                    if let Some(v) = self.cart_read(addr) {
+                        return v;
+                    }
+                    self.open_bus()
                 } else {
                     self.ram[addr as usize]
                 }
@@ -436,10 +652,52 @@ impl<'a> Bus for FullBus<'a> {
                     self.ram[addr as usize] = value;
                 }
             }
-            // ROM windows + all RAM: writes always land in the RAM underneath
-            // (ROM is read-only; the RAM byte beneath stays writable — the trace
-            // `old` byte for $A000-$BFFF reads this RAM, not BASIC ROM).
-            _ => self.ram[addr as usize] = value,
+            // $8000-$9FFF — ts:597-606: bank8==CartLo ⇒ the cart may consume
+            // (flash); read-only mappers return false ⇒ fall to RAM. ROM is
+            // read-only so the RAM byte beneath stays writable (the trace `old`
+            // byte reads this RAM, not the cart ROM).
+            0x8000..=0x9fff => {
+                if matches!(self.config.bank8, Bank8::CartLo) && self.cart_write(addr, value) {
+                    return;
+                }
+                self.ram[addr as usize] = value;
+            }
+            // $A000-$BFFF — ts:610-619: bank_a==CartHi ⇒ cart may consume; the
+            // non-cart-hi ultimax open window drops; otherwise RAM.
+            0xa000..=0xbfff => {
+                if matches!(self.config.bank_a, BankA::CartHi) && self.cart_write(addr, value) {
+                    return;
+                }
+                if !matches!(self.config.bank_a, BankA::CartHi) && self.config.ultimax {
+                    return; // open_bus drop
+                }
+                self.ram[addr as usize] = value;
+            }
+            // $C000-$CFFF — ts:621-626: ultimax open window drops; else RAM.
+            0xc000..=0xcfff => {
+                if self.config.ultimax {
+                    return; // open_bus drop
+                }
+                self.ram[addr as usize] = value;
+            }
+            // $E000-$FFFF — ts:628-635: bank_e==CartHiUltimax ⇒ cart may consume
+            // (flash); otherwise RAM.
+            0xe000..=0xffff => {
+                if matches!(self.config.bank_e, BankE::CartHiUltimax)
+                    && self.cart_write(addr, value)
+                {
+                    return;
+                }
+                self.ram[addr as usize] = value;
+            }
+            // $1000-$7FFF — ts:637-640: ultimax open window drops; else RAM.
+            // $0000-$0FFF + everything else → RAM.
+            _ => {
+                if self.config.ultimax && addr >= 0x1000 {
+                    return; // open_bus drop
+                }
+                self.ram[addr as usize] = value;
+            }
         }
     }
 

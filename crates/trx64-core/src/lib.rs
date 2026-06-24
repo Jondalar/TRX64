@@ -31,7 +31,7 @@ pub mod vsf;
 pub use cia::Cia;
 pub use cpu::{Bus, Cpu6510};
 pub use drive::Drive1541;
-pub use full::{FullBus, MemConfig};
+pub use full::{Bank8, BankA, BankE, FullBus, MemConfig};
 pub use iec::IecCore;
 pub use sid::Sid6581;
 pub use vic::VicII;
@@ -403,6 +403,14 @@ pub struct Machine {
     /// sampling/applying the IEC lines on a $DD00 access (= VICE
     /// drive_cpu_execute_one/all at the exact C64 read/write instant).
     pub drive_c64_ref: u64,
+    /// Attached cartridge mapper (= memory-bus.ts `cartridge`), or None for the
+    /// stock no-cart machine. Borrowed `&mut` into the FullBus each instruction
+    /// (a $DE00 IO write mutates the mapper's bank register, so the change
+    /// persists in-place without an explicit write-back). Set by `attach_cart*`.
+    pub cartridge: Option<Box<dyn crate::cart::CartMapper>>,
+    /// The parsed CRT image backing `cartridge` (name / mapper-type / raw bytes
+    /// for the attach record), or None.
+    pub cartridge_image: Option<crate::cart::ParsedCartridgeImage>,
 }
 
 /// ROM load error.
@@ -459,6 +467,8 @@ impl Machine {
             iec: IecCore::new(),
             keyboard: crate::keyboard::KeyboardMatrix::new(),
             drive_c64_ref: 0,
+            cartridge: None,
+            cartridge_image: None,
         }
     }
 
@@ -556,9 +566,107 @@ impl Machine {
         }
     }
 
+    /// The live PLA memconfig-table index from the CPU-port latches + the attached
+    /// cartridge's EXROM/GAME lines (= memory-bus.ts memPlaConfigChanged index,
+    /// ts:855-869). No cart ⇒ EXROM=GAME=1 ⇒ (port | 0x18), byte-identical to the
+    /// prior hard-coded no-cart index. Used by `cold_reset` (the FullBus has its
+    /// own copy of this in `pla_config_changed`).
+    fn pla_index(&self) -> usize {
+        let port = ((!self.port_dir | self.port_data) & 0x07) as usize;
+        let loram = port & 0x01;
+        let hiram = (port >> 1) & 0x01;
+        let charen = (port >> 2) & 0x01;
+        let (exrom, game) = match self.cartridge.as_ref() {
+            Some(c) => {
+                let l = c.get_lines();
+                ((l.exrom & 1) as usize, (l.game & 1) as usize)
+            }
+            None => (1, 1),
+        };
+        (loram | (hiram << 1) | (charen << 2) | (exrom << 3) | (game << 4)) & 0x1f
+    }
+
+    /// Read a reset-vector byte ($FFFC/$FFFD) through the live banked map so an
+    /// ultimax cart (which maps its ROMH over $E000-$FFFF) re-vectors the boot from
+    /// its own ROM. Mirrors the FullBus $E000-$FFFF read window: KERNAL when the
+    /// config maps it, else the cart's ultimax ROMH, else RAM. No cart / non-ultimax
+    /// ⇒ exactly the KERNAL/RAM byte the prior `self.ram[0xFFFC]` read returned
+    /// (the KERNAL ROM is mirrored into `ram` $E000-$FFFF by load_kernal).
+    fn banked_reset_vector_byte(&self, addr: u16) -> u8 {
+        if self.memconfig.kernal {
+            return self.kernal_rom[(addr as usize) - 0xe000];
+        }
+        if matches!(self.memconfig.bank_e, full::BankE::CartHiUltimax) {
+            if let Some(cart) = self.cartridge.as_ref() {
+                let bi = cart::BankInfo {
+                    cpu_port_direction: self.port_dir,
+                    cpu_port_value: self.port_data,
+                    basic_visible: self.memconfig.basic,
+                    kernal_visible: self.memconfig.kernal,
+                    io_visible: self.memconfig.io,
+                    char_visible: self.memconfig.char_rom,
+                    cartridge_attached: true,
+                    cartridge_exrom: Some(cart.get_lines().exrom),
+                    cartridge_game: Some(cart.get_lines().game),
+                };
+                if let Some(v) = cart.read(addr, &bi) {
+                    return v;
+                }
+            }
+            return 0xff; // open bus
+        }
+        self.ram[addr as usize]
+    }
+
+    /// Attach a cartridge from raw `.crt` bytes (= memory-bus.ts attachCartridge,
+    /// ts:258-275 + loadCartridgeMapperFromBytes ts:114-118). Parses the CRT, builds
+    /// the read-only mapper, stores it on the Machine, then re-runs the PLA reconfig
+    /// so the banking picks up the cart's EXROM/GAME lines. Call BEFORE `cold_reset`
+    /// (or call `cold_reset` after) so the reset vector fetches through the cart.
+    /// Returns the parsed image's display name + mapper type on success.
+    pub fn attach_cart_from_bytes(
+        &mut self,
+        bytes: &[u8],
+        name: &str,
+    ) -> Result<(String, cart::MapperType), cart::CrtError> {
+        let (image, mapper) = cart::load_cartridge_from_bytes(bytes, name, None)?;
+        let result = (image.name.clone(), image.mapper_type);
+        self.cartridge = Some(mapper);
+        self.cartridge_image = Some(image);
+        // ts:274 — re-run the PLA reconfig on attach so the table-driven dispatch
+        // picks up the new EXROM/GAME lines.
+        self.memconfig = self.memconfig_table[self.pla_index()];
+        Ok(result)
+    }
+
+    /// Detach the cartridge (releases EXROM/GAME → no-cart banking).
+    pub fn detach_cart(&mut self) {
+        self.cartridge = None;
+        self.cartridge_image = None;
+        self.memconfig = self.memconfig_table[self.pla_index()];
+    }
+
     pub fn cold_reset(&mut self) {
-        let lo = self.ram[0xFFFC] as u16;
-        let hi = self.ram[0xFFFC + 1] as u16;
+        // CPU-port power-on latches must be set BEFORE the memconfig/vector compute
+        // so the banking is the boot config (set again below for clarity/order with
+        // the rest of the reset, but needed here for the cart-aware memconfig).
+        self.port_dir = 0x2f;
+        self.port_data = 0x37;
+        // Expansion-port RESET line → cartridge reset (= memory-bus.ts reset()
+        // ts:150, BEFORE the PLA recompute + the $FFFC fetch): the cart's bank +
+        // mode/lines return to boot config so an ultimax cart re-vectors $FFFC from
+        // its own ROMH (the machine reboots INTO the cart, like real hardware).
+        if let Some(cart) = self.cartridge.as_mut() {
+            cart.reset();
+        }
+        // Recompute the live memconfig from the port latches + cart EXROM/GAME
+        // lines (= memPlaConfigChanged, ts:854-871). No cart ⇒ idx (port|0x18),
+        // byte-identical to the prior hard-coded no-cart index.
+        self.memconfig = self.memconfig_table[self.pla_index()];
+        // Read the reset vector THROUGH the banked map: an ultimax cart maps its
+        // ROMH over $E000-$FFFF, so $FFFC/$FFFD come from the cart, not RAM.
+        let lo = self.banked_reset_vector_byte(0xFFFC) as u16;
+        let hi = self.banked_reset_vector_byte(0xFFFD) as u16;
         let pc = lo | (hi << 8);
         self.cpu6510.reset_to(pc);
         // Reset the verbatim SC core to the SAME power-on state (full-machine path).
@@ -574,15 +682,12 @@ impl Machine {
         // (The earlier `reg_p |= 0x04` was a CPU-isolated convenience — but the
         // CPU-isolated gates inject PC via `set_pc`, never `cold_reset`, so they
         // are unaffected by dropping it.)
-        // CPU-port power-on latches: $00=$2F (DDR), $01=$37 (port) — boot config
-        // 31 (BASIC+IO+KERNAL). These drive the FullBus banking; the actual RAM[0]/
-        // [1] mirror is written by `prepare_full_boot` (only on the full-machine
-        // path) so the CPU/chip-ISOLATED gates keep zero-page $00/$01 at the power-
-        // on DRAM fill (their exercisers were recorded against that).
-        self.port_dir = 0x2f;
-        self.port_data = 0x37;
-        let port = (!self.port_dir | self.port_data) & 0x07;
-        self.memconfig = self.memconfig_table[(port | 0x18) as usize & 0x1f];
+        // CPU-port power-on latches ($00=$2F DDR, $01=$37 port — boot config 31
+        // BASIC+IO+KERNAL) and the cart-aware memconfig were already set at the top
+        // of cold_reset (before the cart reset + the banked $FFFC vector fetch). The
+        // RAM[0]/[1] mirror is written by `prepare_full_boot` (full-machine path) so
+        // the CPU/chip-ISOLATED gates keep zero-page $00/$01 at the power-on DRAM
+        // fill (their exercisers were recorded against that).
         // IEC bus: power-on released (= installCia2 seeds iecWrite(0xff, 0x3f)).
         self.iec = IecCore::new();
         self.keyboard.clear();
@@ -920,6 +1025,7 @@ impl Machine {
                     iec: &mut self.iec,
                     keyboard: &self.keyboard,
                     drive_c64_ref: self.drive_c64_ref,
+                    cartridge: self.cartridge.as_mut(),
                 };
                 let mut bus = full_sc::FullScBus {
                     fb,

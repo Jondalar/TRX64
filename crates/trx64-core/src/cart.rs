@@ -109,7 +109,11 @@ pub struct CartState {
 /// ts:39-107 — HeadlessCartridgeMapper. The bus depends on read/write/peek,
 /// get_lines, reset, get_state/set_state (the read-only surface; the writable
 /// flash/clock/phi1 hooks are out of scope for this tier).
-pub trait CartMapper {
+///
+/// `Send` supertrait: the daemon owns the `Machine` (which owns the cartridge)
+/// inside an `Arc<Mutex<State>>` moved across tokio tasks, so the trait object
+/// must be `Send`. The read-only mappers are plain owned data ⇒ naturally `Send`.
+pub trait CartMapper: Send {
     fn mapper_type(&self) -> MapperType;
     /// ts:45 getLines(): the EXROM/GAME lines for the live bank/mode.
     fn get_lines(&self) -> CartLines;
@@ -129,6 +133,16 @@ pub trait CartMapper {
     fn reset(&mut self);
     fn get_state(&self) -> CartState;
     fn set_state(&mut self, state: CartState);
+    /// Clone into a fresh box (the `Machine` derives `Clone` for snapshots; a
+    /// `dyn` trait object is not `Clone` directly). Each read-only mapper's state
+    /// is small (bank + register + the cloned bank ROM map), so this is cheap.
+    fn clone_box(&self) -> Box<dyn CartMapper>;
+}
+
+impl Clone for Box<dyn CartMapper> {
+    fn clone(&self) -> Self {
+        self.clone_box()
+    }
 }
 
 // ── parse_crt support ───────────────────────────────────────────────────────
@@ -335,6 +349,7 @@ fn total_image_bytes(image: &ParsedCartridgeImage) -> u32 {
 /// The Rust port folds the TS overridable visibility predicates
 /// (romlVisible/romhA000Visible/romhE000Visible) into a `Visibility` config the
 /// concrete mappers set at construction (Rust has no protected-method override).
+#[derive(Clone)]
 struct Base {
     mapper_type: MapperType,
     exrom: u8,
@@ -389,6 +404,7 @@ impl Base {
 /// ts:423/425/427 — Normal8k / Normal16k / Ultimax: BaseMapper with the only
 /// difference being the ultimax visibility predicates. `control_register` is
 /// always None (no banking register).
+#[derive(Clone)]
 pub struct NormalMapper {
     base: Base,
 }
@@ -430,11 +446,15 @@ impl CartMapper for NormalMapper {
     fn set_state(&mut self, state: CartState) {
         self.base.current_bank = state.current_bank & 0xff;
     }
+    fn clone_box(&self) -> Box<dyn CartMapper> {
+        Box::new(self.clone())
+    }
 }
 
 /// ts:440-459 — MagicDeskMapper. 8K-game banked cart. IO1 ($DE00-$DEFF) store:
 /// bit 7 = disable (EXROM released → cart off), bits 0..6 = ROM bank (& bankmask).
 /// ROML only; $A000-$BFFF stays BASIC. `regval` is the snapshot register.
+#[derive(Clone)]
 pub struct MagicDeskMapper {
     base: Base,
     regval: u8,
@@ -491,10 +511,14 @@ impl CartMapper for MagicDeskMapper {
         self.base.current_bank = state.current_bank & 0xff;
         self.regval = state.control_register.unwrap_or(0);
     }
+    fn clone_box(&self) -> Box<dyn CartMapper> {
+        Box::new(self.clone())
+    }
 }
 
 /// ts:463-482 — MagicDesk16Mapper. 16K-game banked cart. IO1 store: bit 7 =
 /// disable, bits 0..6 = bank; the bank maps to BOTH ROML ($8000) and ROMH ($A000).
+#[derive(Clone)]
 pub struct MagicDesk16Mapper {
     base: Base,
     regval: u8,
@@ -550,11 +574,15 @@ impl CartMapper for MagicDesk16Mapper {
         self.base.current_bank = state.current_bank & 0xff;
         self.regval = state.control_register.unwrap_or(0);
     }
+    fn clone_box(&self) -> Box<dyn CartMapper> {
+        Box::new(self.clone())
+    }
 }
 
 /// ts:487-514 — OceanMapper. Banked cart, 8K bank → ROML. 512KB images use
 /// 8K-game config; every other size uses 16K-game and MIRRORS the same 8K bank to
 /// ROML and ROMH. IO1 store: bank = value & io1_mask & 0x3f. No disable bit.
+#[derive(Clone)]
 pub struct OceanMapper {
     base: Base,
     regval: u8,
@@ -621,6 +649,9 @@ impl CartMapper for OceanMapper {
     fn set_state(&mut self, state: CartState) {
         self.base.current_bank = state.current_bank & 0xff;
         self.regval = state.control_register.unwrap_or(0);
+    }
+    fn clone_box(&self) -> Box<dyn CartMapper> {
+        Box::new(self.clone())
     }
 }
 
