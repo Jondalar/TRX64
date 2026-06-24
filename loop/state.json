@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "dd00-fast-transfer",
+  "current_item": "drive-1to1-viacore",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -36,16 +36,16 @@
     "dd00-atn-irq",
     "render-verbatim"
   ],
-  "note": "render-verbatim DONE (ADR-056): $D01E/$D01F sprite collision + collision IRQ verbatim, gameplay-critical gap closed, zero regression. The ONE remaining blocker is the ESCALATED cross-domain IEC coupling (dd00-fast-transfer/ADR-055, foundational+risky) for the scramble custom loader — awaiting user decision (a) do it / (b) done already / (c) leave. All other behavioral work complete.",
-  "updated": "2026-06-24T04:51:18Z",
+  "note": "USER DIRECTIVE: the Rust drive layer is distilled (2553 lines) not a 1:1 port of the TS classes (7719). Port the TS drive classes 1:1 (viacore.ts/via1d/via2d/rotation.ts/iecbus.ts/drivecpu.ts), verbatim, no adaptation/type-changes/adapted-fns. Start: viacore.ts -> viacore.rs + VIA2 (the $EC3F LDA $1C00 read-value divergence). The drive 6510 core is already 1:1 (byte-exact). Byte-exact disk gates = safety net.",
+  "updated": "2026-06-24T05:44:32Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
   "in_flight": {
-    "item": "dd00-fast-transfer",
+    "item": "drive-1to1-viacore",
     "model": "opus",
-    "started": "2026-06-24T04:51:18Z"
+    "started": "2026-06-24T05:44:32Z"
   },
   "stage2_items": [],
   "resolved": [
