@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "protocol-surface-b1",
+  "current_item": "runtime-controller-av-push (enables ws-av-tap)",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -48,20 +48,16 @@
     "av-recording-mp4",
     "sprite-render-verbatim",
     "phase0-tick-hooks",
-    "breakpoint-policy-layer"
+    "breakpoint-policy-layer",
+    "protocol-surface-b1"
   ],
-  "note": "Breakpoint policy DONE (ADR-071): ObserverRegistry 1:1 over Phase0 hooks, debug/run|continue|until|watchpoints|conditional all work, 129 tests, zero regression. NEXT: protocol-surface (~54/91 missing WS methods, mechanical 1:1 handler ports) -> snapshot-vsf -> integration. Known flake: resid_oracle gate_a under parallel scheduling (FFI singleton) - mark serial as a cleanup.",
-  "updated": "2026-06-24T15:27:11Z",
+  "note": "protocol-surface b1 DONE (ADR-072): 13 WS methods, live-verified 1:1 vs c64re, 140 tests, byte-exact green. NEXT: RuntimeController A/V binary push (pacing loop + BIN 0x01 RGBA frame + BIN 0x02 s16le audio, matching ws-av-tap format) -> enables ws-av-tap real-time recording (user wanted it). Then protocol-surface b2 (key_down/up held-key + vic/inspect), snapshot-vsf codec, integration.",
+  "updated": "2026-06-24T15:54:39Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": {
-    "item": "protocol-surface-b1",
-    "model": "opus",
-    "started": "2026-06-24T15:27:11Z",
-    "note": "WS protocol surface batch 1: the mechanical 1:1 handler ports that need no new primitives (session/reset, load_prg, key_down/up, release_keys, joystick_clear, input_status, drive_status, cart_status, drive_power, debug/state, snapshot/dump|undump, granular vic/inspect/*, trace/definition|validate|put|list). Map each to existing Machine/session/trace/vsf primitives, wire shape 1:1 with c64re. Heavier (RuntimeController/checkpoint/recorder/scenario/batch/audio) = later batch."
-  },
+  "in_flight": null,
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"

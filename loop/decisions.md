@@ -1118,3 +1118,17 @@ until reaches target, + cond parse/eval/rebuild). drive-boot-deep byte-exact GRE
 CAVEAT: resid_oracle::gate_a_native_byte_identical flakes ONLY under parallel test scheduling (resid FFI is a
 module-global singleton -> contends); passes isolated + serialized (--test-threads=1). Not this work's path.
 TODO: mark the resid tests serial so the parallel suite is clean. NEXT: protocol-surface (WS method coverage).
+
+## ADR-072 — protocol-surface batch 1: 13 WS methods, live-verified 1:1 vs c64re
+Ported the no-new-primitive WS methods (daemon-only, main.rs): trace/definition/{validate,put,list} (1:1
+trace-definition.ts validateTraceDefinition + slugTraceId + 708.7 domain-coverage), session/{reset,load_prg,
+joystick_clear,input_status,drive_status,cart_status,drive_power}, debug/state, snapshot/{dump,undump}. Each
+mapped to existing Machine/session/vsf/trace primitives. LIVE-DIFFED vs a running c64re daemon — shapes matched
+1:1; caught + fixed a real bug (load_prg endAddress was one-past-end -> load+len-1). 140 tests passed (+11 new
+round-trip wire-shape tests), all byte-exact GREEN, core untouched. Minor backend-identifier-value diffs (field
+shapes identical): debug/state.controlOwner "llm" vs c64re "human"; drive_power.mode "trx64" vs "vice";
+snapshot bytes are TRX64's vsf (cross-runtime .c64re codec = later). SKIPPED (need new primitives, explicit
+NOT_IMPLEMENTED): session/key_down|up|release_keys (needs a held-key SET on KeyboardMatrix — it's a timed-event
+queue today), granular vic/inspect/* (rides the 705.B checkpoint ring + a vic-inspect provenance module).
+NEXT: the RuntimeController A/V binary push (BIN 0x01 RGBA + BIN 0x02 s16le, paced) -> enables ws-av-tap real-
+time recording (user asked for it earlier; now unblocked since audio+breakpoints are done).

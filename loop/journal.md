@@ -710,3 +710,9 @@ observers.rs 1:1 monitor-observers.ts (cond-AST + ObserverRegistry) over the Pha
 continue|until|watchpoints|conditional now FUNCTION. 129 tests, 13 behavioral green, zero regression, drive-boot
 byte-exact. Caveat: resid_oracle flakes under parallel scheduling (FFI singleton) - mark serial. Next:
 protocol-surface.
+
+## 2026-06-24 — DRIVER: protocol-surface batch 1 (ADR-072) — 13 WS methods, live-verified vs c64re
+
+13 no-new-primitive methods (trace/definition, session/*, debug/state, snapshot/dump|undump), live-diffed 1:1
+vs a real c64re daemon (caught a load_prg bug). 140 tests, byte-exact green, core untouched. Skipped key_down/up
++ vic/inspect (need primitives). Next: RuntimeController A/V push (enables ws-av-tap).
