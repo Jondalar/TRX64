@@ -1216,3 +1216,18 @@ incl-22B-header framing + C64MEM/MAINCPU(v1.4)/CIA1/CIA2(v2.5)/SID(v1.5)/VIC-II-
 pipeline blob + drive modules (documented). samples/motm.vsf LOADS + renders the game's coherent menu screen
 (sprites, no garbage, PC=$a892 HIRAM=0 game-in-RAM); LastNinjaRemix_Start4000.vsf also resumes. 152 tests pass,
 seven_game_gate 7/7, byte-exact GREEN. Deferred (per ADR-075): real-VICE WRITE + the .c64re container (NEXT).
+
+## ADR-077 — .c64re = the runtime snapshot format: FULL RuntimeCheckpoint (Option B), Rust 1:1 with TS
+USER: ".c64re ist unser runtime snapshot (dump) format. Das muss die Rust engine genauso können wie die TS
+runtime." DECISION: Option B — the .c64re container's `checkpoint` payload is the STRUCTURED RuntimeCheckpoint
+(NOT a VSF blob): cp.cpu/ram/cia1/cia2/sid/iec/cpuIntStatus/alarmsMaincpu (C64-side, TRX64 has the state from
+the VSF work) + cp.vic (LiteralVicSnapshot) + cp.vicPresentation (framebuffers) + cp.drive1541 (the VICE drive
+snapshot-module blob — TRX64 stubs 0 bytes today, ADR-027). Build/parse each in c64re's exact per-chip JSON
+shape (the $ta typed-array codec, Cia6526ViceSnapshot, SidSnapshot, LiteralVicSnapshot) so a live c64re daemon
+undumps a TRX64 dump + vice-versa. CONSTRAINT RELAXATION: additive snapshot-SERIALIZATION of the drive + VIC
+state is now IN scope (read their existing state into the RuntimeCheckpoint shapes) — the verbatim cores'
+cycle/opcode LOGIC stays unchanged; the byte-exact gates remain the guard (a snapshot read that changes
+behavior is wrong -> back out). This is "effectively a second snapshot model" — bounded (same kind of state-
+serialization as the VSF modules, plus the drive blob + literal-VIC), built incrementally. The container framing
+(magic C64RESNP + ver + sha256(gzBody) + gzip(JSON {manifest,checkpoint,mediaPayloads})) is trivial; the payload
+shapes are the work.
