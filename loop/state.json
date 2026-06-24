@@ -36,12 +36,16 @@
     "dd00-atn-irq"
   ],
   "note": "dd00-fast-transfer: NO fix (foundational). Root = cross-domain IEC coupling is batch-snapshot, not VICE cycle-stepped single-iecbus -> debounce loops cant see sub-cycle transitions -> custom loader bit-bang data corrupts. The LAST so-aehnlich layer. Fix = cycle-stepped cross-domain IEC interleave (risky, touches byte-exact paths). ESCALATED to user. Loop can route to render-verbatim (independent) meanwhile.",
-  "updated": "2026-06-24T04:08:46Z",
+  "updated": "2026-06-24T04:20:50Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "render-verbatim",
+    "model": "opus",
+    "started": "2026-06-24T04:20:50Z"
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
