@@ -57,7 +57,7 @@
     "snapshot-drive-blob"
   ],
   "note": ".c64re 100% COMPLETE (ADR-079): full RuntimeCheckpoint C64+drive cross-runtime both ways, 176 tests. NEXT: checkpoint-ring (705.B) = the rewind ring of RuntimeCheckpoints + the 7 checkpoint/* WS methods + granular vic/inspect (ride the ring) + foundation for scenario/recorder. Builds on the now-complete RuntimeCheckpoint capture/restore. Then recorder/scenario, audio/media/batch, flash-write, drive-write, integration.",
-  "updated": "2026-06-24T19:04:47Z",
+  "updated": "2026-06-24T19:13:59Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
@@ -81,5 +81,19 @@
   ],
   "loop_status": "RUNNING",
   "bar": "BEHAVIORAL parity with c64re (renders games/demos, .g64 1541 loaders, the 7-game gate). Match c64re, not exceed it.",
-  "scope_note": "FEATURE-COMPLETE = 100% vs c64re TS runtime. EXPLICIT (user): the .c64re snapshot/dump|undump container IS in scope (magic C64RESNP + gzip-JSON RuntimeCheckpoint + media, round-trip vs c64re), as its own item right after snapshot-vsf. Full queue: snapshot-vsf(A+readVICE, running) -> .c64re-container (dump/undump) -> checkpoint-ring (705.B rewind + 7 checkpoint methods + granular vic/inspect) -> recorder/scenario -> audio/media/batch WS -> flash-cart WRITABLE -> drive WRITE-BACK -> integration. ALL in. 100%."
+  "scope_note": "FEATURE-COMPLETE = 100% vs c64re TS runtime. EXPLICIT (user): the .c64re snapshot/dump|undump container IS in scope (magic C64RESNP + gzip-JSON RuntimeCheckpoint + media, round-trip vs c64re), as its own item right after snapshot-vsf. Full queue: snapshot-vsf(A+readVICE, running) -> .c64re-container (dump/undump) -> checkpoint-ring (705.B rewind + 7 checkpoint methods + granular vic/inspect) -> recorder/scenario -> audio/media/batch WS -> flash-cart WRITABLE -> drive WRITE-BACK -> integration. ALL in. 100%.",
+  "parallel": [
+    {
+      "item": "flash-cart-writable",
+      "worktree": "/Users/alex/Development/C64/Tools/trx64-wt-flash",
+      "branch": "flash-cart-writable",
+      "started": "2026-06-24T19:13:59Z"
+    },
+    {
+      "item": "drive-write-back",
+      "worktree": "/Users/alex/Development/C64/Tools/trx64-wt-drive",
+      "branch": "drive-write-back",
+      "started": "2026-06-24T19:13:59Z"
+    }
+  ]
 }
