@@ -823,6 +823,97 @@ impl Drive1541 {
         self.disk.as_ref()
     }
 
+    // ── snapshot accessors (drive_snapshot.rs — additive serialization, ADR-077) ──
+    // The drive's VIA1/VIA2/RAM are private to drive.rs; these `pub(crate)` views
+    // let the VICE drive-snapshot module-stream port (drive_snapshot.rs) read/write
+    // them through the same `Via*dBackend` the live bus builds. No cycle/opcode
+    // logic is touched — these are pure state reads/writes at an instruction
+    // boundary, guarded by the byte-exact gates.
+
+    /// Run `f` over VIA1 with the live `Via1dBackend` (mirrors `DriveBus::
+    /// via1_with_backend`). `via1.clk` is synced to the drive clock first.
+    pub(crate) fn snapshot_via1<R>(
+        &mut self,
+        f: impl FnOnce(&mut ViaContext, &mut Via1dBackend) -> R,
+    ) -> R {
+        self.via1.clk = self.core.clk;
+        let mut backend = Via1dBackend {
+            number: 0,
+            iecbus: &mut self.via1_iecbus,
+            irq: &mut self.via1_irq,
+        };
+        f(&mut self.via1, &mut backend)
+    }
+
+    /// Run `f` over VIA2 with the live `Via2dBackend` (mirrors `DriveBus::
+    /// via2_with_backend`). `via2.clk` is synced to the drive clock first.
+    pub(crate) fn snapshot_via2<R>(
+        &mut self,
+        f: impl FnOnce(&mut ViaContext, &mut Via2dBackend) -> R,
+    ) -> R {
+        self.via2.clk = self.core.clk;
+        let has_image = self.rotation.image.is_some();
+        let mut backend = Via2dBackend {
+            drive: &mut self.rotation,
+            number: 0,
+            irq: &mut self.via2_irq,
+            pending_set_overflow: false,
+            has_image,
+        };
+        f(&mut self.via2, &mut backend)
+    }
+
+    /// Snapshot view of the 2 KB drive RAM (DRIVECPU module ARRAY field).
+    pub(crate) fn snapshot_ram(&self) -> &[u8; 0x800] {
+        &self.ram
+    }
+
+    /// Mutable snapshot view of the 2 KB drive RAM (DRIVECPU restore).
+    pub(crate) fn snapshot_ram_mut(&mut self) -> &mut [u8; 0x800] {
+        &mut self.ram
+    }
+
+    /// Drive-CPU `stop_clk` (VICE `cpu->stop_clk`) for the DRIVECPU module.
+    pub(crate) fn snapshot_stop_clk(&self) -> u64 {
+        self.stop_clk
+    }
+
+    /// Restore the drive-CPU `stop_clk`.
+    pub(crate) fn snapshot_set_stop_clk(&mut self, v: u64) {
+        self.stop_clk = v;
+    }
+
+    /// Drive-sync fixed-point accumulator (VICE `cpu->cycle_accum`).
+    pub(crate) fn snapshot_sync_accum(&self) -> u32 {
+        self.sync_accum
+    }
+
+    /// Restore the drive-sync fixed-point accumulator.
+    pub(crate) fn snapshot_set_sync_accum(&mut self, v: u32) {
+        self.sync_accum = v;
+    }
+
+    /// Re-derive the drive clock mirrors after a DRIVECPU restore (the drive_clk
+    /// shadow follows `core.clk`).
+    pub(crate) fn snapshot_sync_drive_clk(&mut self) {
+        self.drive_clk = self.core.clk;
+    }
+
+    /// Test-only: VIA2 IFR (for the drive_snapshot round-trip test).
+    #[cfg(test)]
+    pub(crate) fn via2_ifr_test(&self) -> u8 {
+        self.via2.ifr
+    }
+
+    /// Test-only: VIA2 PRB/DDRB register bytes.
+    #[cfg(test)]
+    pub(crate) fn via2_prb_ddrb_test(&self) -> (u8, u8) {
+        (
+            self.via2.via[crate::viacore::VIA_PRB],
+            self.via2.via[crate::viacore::VIA_DDRB],
+        )
+    }
+
     /// Read a byte of the drive's 2 KB RAM (mirrored every $800). Used to inspect
     /// the DOS job queue / sector buffers (the decoded sector at $0300) for the
     /// disk-read gate. No side effects.

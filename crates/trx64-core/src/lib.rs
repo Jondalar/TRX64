@@ -17,6 +17,7 @@ pub mod cia;
 pub mod cpu;
 pub mod drive;
 pub mod drive_6510core;
+pub mod drive_snapshot;
 pub mod full;
 pub mod full_sc;
 pub mod gcr;
