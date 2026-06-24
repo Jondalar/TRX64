@@ -903,3 +903,14 @@ But scramble-load-progress UNCHANGED at end6 (31 vs 33) — so the distilled rot
 (it is now a faithful 1:1 port, per the directive; removes a distilled approximation). NEXT: iecbus.ts (iec.rs
 171 vs TS 899 — the MOST distilled, the C64<->drive IEC wired-AND bus) — the likely end6 blocker; then
 via1d1541.ts (VIA1 → viacore) + drivecpu.ts (the cross-domain catch-up, no Rust 1:1 counterpart yet).
+
+## ADR-060 — iecbus.ts → iec.rs 1:1 (byte-exact, 2 bugs fixed); end6 is VIA1 (still distilled)
+iec.rs 171→903, strict 1:1 port of iecbus.ts (full 16-unit iecbus_t + the conf0..3 per-drive-type callbacks
++ ATN-edge + wired-AND fold) + c64iec.ts glue. 2 real bugs the byte-exact gates caught: (1) IecCore::new must
+set TRUEDRIVE + DRIVETYPE for unit 8 (else device nibble 8=NONE -> dead Conf0); (2) fold_drv_port must invert
+~pb_out before the drv_bus formula (wrong on 40960/65536 inputs). All byte-exact gates GREEN + 91 tests.
+But scramble UNCHANGED at end6 — the builder PROVED (0-diff per-call + byte-identical boot+LOAD IEC fingerprint
+vs the distilled baseline) the distilled IEC bus was ALREADY faithful. So end6 is NOT in iecbus/c64iec.
+NEXT: the drive's VIA1 is still the DISTILLED Via6522 (only VIA2 was 1:1-ported to viacore). VIA1 owns the
+ATN-CA1 IRQ entry + the PB IEC bit-bang timing the custom-loader handshake depends on — the likely end6 blocker.
+Port via1d1541.ts -> a viacore-backed VIA1 (like VIA2). Then drivecpu.ts (the cross-domain catch-up) if needed.

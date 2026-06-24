@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "drive-1to1-iecbus",
+  "current_item": "drive-1to1-via1",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -36,18 +36,19 @@
     "dd00-atn-irq",
     "render-verbatim",
     "drive-1to1-viacore",
-    "drive-1to1-rotation"
+    "drive-1to1-rotation",
+    "drive-1to1-iecbus"
   ],
-  "note": "rotation 1:1 done (ADR-059, byte-exact, scramble unchanged end6 -> divergence is IEC-side). Next: iecbus.ts -> iec.rs 1:1 (171 vs TS 899, most distilled, the C64<->drive IEC bus, likely end6 blocker). Then via1d/drivecpu 1:1.",
-  "updated": "2026-06-24T06:56:20Z",
+  "note": "iecbus 1:1 done (ADR-060, byte-exact, 2 bugs fixed, distilled was already faithful). end6 is VIA1 (still distilled Via6522; only VIA2 was 1:1-ported). Next: via1d1541.ts -> viacore-backed VIA1 1:1 (owns ATN-CA1 IRQ + PB IEC bit-bang timing = the handshake = likely end6 blocker).",
+  "updated": "2026-06-24T07:32:19Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
   "in_flight": {
-    "item": "drive-1to1-iecbus",
+    "item": "drive-1to1-via1",
     "model": "opus",
-    "started": "2026-06-24T06:56:20Z"
+    "started": "2026-06-24T07:32:19Z"
   },
   "stage2_items": [],
   "resolved": [

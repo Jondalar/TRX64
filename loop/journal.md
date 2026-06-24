@@ -613,3 +613,10 @@ rotation.rs now a 1:1 port of rotation.ts (full rotation.c engine). Byte-exact (
 disk-read-byteexact GREEN). scramble unchanged at end6 -> the divergence is NOT disk/rotation, it's the IEC
 handshake (iecbus/via1/drivecpu still distilled). Merged (faithful 1:1 per directive). Next: iecbus.ts 1:1
 (iec.rs 171 vs TS 899 = most distilled).
+
+## 2026-06-24 — DRIVER: iecbus.ts→iec.rs 1:1 (ADR-060, 2 bugs fixed); end6 is VIA1
+
+iec.rs 171->903, 1:1 iecbus.ts + c64iec.ts. 2 bugs the byte-exact gates caught (TRUEDRIVE+DRIVETYPE; ~pb_out
+invert). All gates + 91 tests GREEN. scramble unchanged end6 -> builder PROVED the distilled IEC was already
+faithful (byte-identical fingerprint). end6 is VIA1 (still distilled Via6522; owns ATN-CA1 IRQ + PB bit-bang).
+Next: via1d1541.ts 1:1 (viacore-backed VIA1).
