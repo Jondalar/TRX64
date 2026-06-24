@@ -854,9 +854,10 @@ fn finalize_trace(session: &mut Session) -> (Value, Value) {
 const TRACE_DOMAINS: &[&str] =
     &["c64-cpu", "drive8-cpu", "iec", "vic", "sid", "memory"];
 
-/// A 0..=0xFFFF integer check (= TS `u16`).
+/// A 0..=0xFFFF integer check (= TS `u16`: `Number.isInteger(n) && 0<=n<=0xffff`).
+/// A non-integer JSON number (e.g. 1.5) has no `as_i64`, so it is rejected.
 fn is_u16(v: &Value) -> bool {
-    matches!(v.as_i64(), Some(n) if (0..=0xffff).contains(&n)) && v.is_i64() == v.as_i64().is_some()
+    matches!(v.as_i64(), Some(n) if (0..=0xffff).contains(&n))
 }
 
 /// 1:1 port of `validateTraceDefinition` (trace-definition.ts:73). Pure; returns
@@ -3204,6 +3205,266 @@ async fn main() {
             Err(e) => {
                 eprintln!("[trx64] accept error: {e}");
             }
+        }
+    }
+}
+
+// ── Batch-1 round-trip tests (wire-shape parity vs c64re ws-server.ts) ────────
+//
+// These exercise `dispatch()` in-process against a blank (no-ROM) machine and
+// assert the RESPONSE JSON SHAPE matches the c64re handler — field names, types,
+// nesting — so the daemon stays a drop-in for c64re's contract. They do not need
+// ROMs (the new handlers read state / poke RAM / round-trip vsf — none require a
+// booted KERNAL for their shape). The byte-exact behavioural gates live in
+// trx64-core; these are contract-shape tests for the new daemon surface.
+#[cfg(test)]
+mod batch1_tests {
+    use super::*;
+
+    fn make_state() -> SharedState {
+        Arc::new(Mutex::new(State {
+            session: Session::new("integrated-1"),
+            breakpoints: Breakpoints::new(),
+            observers: observers::ObserverRegistry::new(),
+            type_buffer: Vec::new(),
+            ctrl_frame: 0,
+            ctrl_stop: None,
+            checkpoint_counter: 0,
+            trace_definitions: std::collections::HashMap::new(),
+        }))
+    }
+
+    fn call(state: &SharedState, method: &str, params: Value) -> Value {
+        let req = Request {
+            jsonrpc: "2.0".into(),
+            id: json!(1),
+            method: method.into(),
+            params,
+        };
+        let resp = dispatch(req, state);
+        assert!(resp.error.is_none(), "{method}: unexpected error {:?}", resp.error);
+        resp.result.unwrap_or(Value::Null)
+    }
+
+    fn call_err(state: &SharedState, method: &str, params: Value) -> RpcError {
+        let req = Request {
+            jsonrpc: "2.0".into(),
+            id: json!(1),
+            method: method.into(),
+            params,
+        };
+        dispatch(req, state).error.expect("expected an error")
+    }
+
+    #[test]
+    fn trace_definition_validate_ok_and_errors() {
+        let st = make_state();
+        // A minimal valid definition (mirrors trace-definition.ts coverage rules).
+        let def = json!({
+            "id": "t1", "version": 1, "name": "T One",
+            "domains": ["c64-cpu"],
+            "triggers": [{ "kind": "pc-range", "domain": "c64-cpu", "from": 0, "to": 100 }],
+            "captures": [{ "kind": "cpu-row", "domain": "c64-cpu" }],
+            "retention": "transient"
+        });
+        let r = call(&st, "trace/definition/validate", json!({ "definition": def }));
+        assert_eq!(r["ok"], json!(true));
+        assert_eq!(r["errors"], json!([]));
+
+        // Missing required fields → ok:false with an error list.
+        let bad = call(&st, "trace/definition/validate", json!({ "definition": {} }));
+        assert_eq!(bad["ok"], json!(false));
+        assert!(bad["errors"].as_array().unwrap().len() >= 4);
+
+        // Coverage rule: a vic-row capture without a vic domain is rejected.
+        let uncovered = json!({
+            "id": "t2", "version": 1, "name": "u",
+            "domains": ["c64-cpu"],
+            "triggers": [{ "kind": "pc-range", "domain": "c64-cpu", "from": 0, "to": 1 }],
+            "captures": [{ "kind": "vic-row" }],
+            "retention": "transient"
+        });
+        let cov = call(&st, "trace/definition/validate", json!({ "definition": uncovered }));
+        assert_eq!(cov["ok"], json!(false));
+        assert!(cov["errors"].as_array().unwrap().iter().any(|e| e
+            .as_str()
+            .unwrap()
+            .contains("requires domain \"vic\"")));
+    }
+
+    #[test]
+    fn slug_trace_id_matches_ts() {
+        // 1:1 with slugTraceId (trace-definition.ts:192).
+        assert_eq!(slug_trace_id("My Trace!"), "my-trace");
+        assert_eq!(slug_trace_id("  Hello  World  "), "hello-world");
+        assert_eq!(slug_trace_id("ABC_123-x"), "abc-123-x");
+        // Empty/punctuation-only → the `trace-<base36>` fallback.
+        assert!(slug_trace_id("!!!").starts_with("trace-"));
+    }
+
+    #[test]
+    fn trace_definition_put_then_list() {
+        let st = make_state();
+        // c64re validates the definition (which REQUIRES a non-empty id) BEFORE the
+        // `id || slugTraceId(name)` fallback, so a valid put carries an id. The
+        // stored id is `definition.id` (the fallback only fires for an empty id).
+        let def = json!({
+            "id": "my-trace", "version": 1, "name": "My Trace!",
+            "domains": ["memory"],
+            "triggers": [{ "kind": "mem-access", "access": "any", "from": 0, "to": 0xffff }],
+            "captures": [{ "kind": "mem-row" }],
+            "retention": "evidence"
+        });
+        let put = call(&st, "trace/definition/put", json!({ "definition": def }));
+        assert_eq!(put["ok"], json!(true), "put errors: {:?}", put["errors"]);
+        assert_eq!(put["id"], json!("my-trace"));
+
+        let list = call(&st, "trace/definition/list", json!({}));
+        let defs = list["definitions"].as_array().unwrap();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0]["id"], json!("my-trace"));
+        assert_eq!(defs[0]["name"], json!("My Trace!"));
+
+        // An invalid definition → ok:false, NOT an RPC error, and not stored.
+        let bad = call(&st, "trace/definition/put", json!({ "definition": { "name": "x" } }));
+        assert_eq!(bad["ok"], json!(false));
+        assert!(bad["errors"].as_array().unwrap().len() >= 1);
+        let list2 = call(&st, "trace/definition/list", json!({}));
+        assert_eq!(list2["definitions"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn debug_state_shape() {
+        let st = make_state();
+        let r = call(&st, "debug/state", json!({}));
+        assert_eq!(r["runState"], json!("paused"));
+        assert_eq!(r["pacing"]["mode"], json!("pal"));
+        assert_eq!(r["pacing"]["ratio"], json!(1));
+        assert!(r["pc"].is_u64());
+        assert!(r["cycles"].is_u64());
+        assert!(r["frame"].is_u64());
+        assert!(r["breakpoints"].is_array());
+        assert_eq!(r["stop"], Value::Null);
+        assert_eq!(r["controlOwner"], json!("llm"));
+    }
+
+    #[test]
+    fn input_and_joystick_shapes() {
+        let st = make_state();
+        let clr = call(&st, "session/joystick_clear", json!({ "port": 1 }));
+        assert_eq!(clr["ok"], json!(true));
+
+        let inp = call(&st, "session/input_status", json!({}));
+        assert_eq!(inp["pressed"], json!([]));
+        for joy in ["joystick1", "joystick2"] {
+            for bit in ["up", "down", "left", "right", "fire"] {
+                assert_eq!(inp[joy][bit], json!(false), "{joy}.{bit}");
+            }
+        }
+    }
+
+    #[test]
+    fn drive_status_and_power_shapes() {
+        let st = make_state();
+        let s = call(&st, "session/drive_status", json!({}));
+        assert_eq!(s["device"], json!(8));
+        for k in ["ledOn", "ledFlashing", "motorOn"] {
+            assert!(s[k].is_boolean(), "{k}");
+        }
+        for k in ["ledPwm", "halfTrack", "track", "sector", "drivePc"] {
+            assert!(s[k].is_u64(), "{k}");
+        }
+        assert_eq!(s["rwMode"], json!("read"));
+        assert!(s["dd00"]["pra"].is_u64());
+        assert!(s["dd00"]["ddr"].is_u64());
+        assert!(s["transferMode"].is_string());
+
+        let p = call(&st, "session/drive_power", json!({}));
+        assert_eq!(p["device"], json!(8));
+        assert_eq!(p["reinitialized"], json!(true));
+        assert!(p["mode"].is_string());
+    }
+
+    #[test]
+    fn cart_status_null_when_no_cart() {
+        let st = make_state();
+        // No cart attached → null (matches c64re's `return null`).
+        let r = call(&st, "session/cart_status", json!({}));
+        assert_eq!(r, Value::Null);
+    }
+
+    #[test]
+    fn load_prg_writes_ram_and_reports_shape() {
+        let st = make_state();
+        // Write a tiny PRG (load $C000, 3 body bytes) to a temp file.
+        let dir = std::env::temp_dir().join("trx64-batch1-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let prg = dir.join("tiny.prg");
+        // header $00 $C0 = load $C000, body = A9 2A 60 (LDA #$2A; RTS).
+        std::fs::write(&prg, [0x00u8, 0xc0, 0xa9, 0x2a, 0x60]).unwrap();
+        let r = call(
+            &st,
+            "session/load_prg",
+            json!({ "prg_path": prg.to_string_lossy() }),
+        );
+        assert_eq!(r["loadAddress"], json!(0xc000));
+        assert_eq!(r["endAddress"], json!(0xc003));
+        assert_eq!(r["bytesLoaded"], json!(3));
+        assert_eq!(r["path"], json!(prg.to_string_lossy()));
+        // The body landed in RAM.
+        let g = st.lock().unwrap();
+        assert_eq!(g.session.machine.read_full(0xc000), 0xa9);
+        assert_eq!(g.session.machine.read_full(0xc002), 0x60);
+    }
+
+    #[test]
+    fn snapshot_dump_undump_roundtrip_shape() {
+        let st = make_state();
+        let dir = std::env::temp_dir().join("trx64-batch1-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let snap = dir.join("rt.vsf");
+        let d = call(&st, "snapshot/dump", json!({ "path": snap.to_string_lossy() }));
+        assert_eq!(d["machine"], json!("c64-pal"));
+        assert!(d["cycle"].is_u64());
+        assert!(d["pc"].is_u64());
+        assert!(d["media"].is_array());
+        assert!(d["fileBytes"].as_u64().unwrap() > 0);
+        assert!(d["breakpoints"].is_u64());
+        assert!(snap.exists());
+
+        let u = call(&st, "snapshot/undump", json!({ "path": snap.to_string_lossy() }));
+        assert_eq!(u["machine"], json!("c64-pal"));
+        assert!(u["cycle"].is_u64());
+        assert!(u["pc"].is_u64());
+        assert!(u["media"].is_array());
+        assert!(u["breakpoints"].is_u64());
+        assert_eq!(u["paused"], json!(true));
+    }
+
+    #[test]
+    fn session_reset_shape() {
+        let st = make_state();
+        // Cold reset on a blank machine: shape only (no KERNAL to reach READY).
+        let r = call(&st, "session/reset", json!({ "mode": "soft" }));
+        assert_eq!(r["mode"], json!("soft"));
+        assert!(r["c64Cycles"].is_u64());
+        assert!(r["pc"].is_u64());
+        let c = call(&st, "session/reset", json!({}));
+        assert_eq!(c["mode"], json!("cold"));
+    }
+
+    #[test]
+    fn deferred_methods_report_not_implemented() {
+        let st = make_state();
+        for m in ["session/key_down", "session/key_up", "session/release_keys"] {
+            let e = call_err(&st, m, json!({ "key": "A" }));
+            assert_eq!(e.code, -32001);
+            assert!(e.message.contains("NOT_IMPLEMENTED"));
+        }
+        for m in ["vic/inspect/open", "vic/inspect/at", "vic/inspect/promote"] {
+            let e = call_err(&st, m, json!({}));
+            assert_eq!(e.code, -32001);
+            assert!(e.message.contains("NOT_IMPLEMENTED"));
         }
     }
 }
