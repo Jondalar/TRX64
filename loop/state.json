@@ -43,12 +43,16 @@
     "g64-mounting"
   ],
   "note": "G64 mounting done (ADR-063): all 20 .g64 mount, motm GCR read proven, D64 byte-exact. NOW the 7-game gate: run each game (scramble/polarbear/motm/california/green_beret/impossible2/ninja/maniac) on TRX64 vs c64re, canary criterion = reaches running game state. Then perf compare.",
-  "updated": "2026-06-24T08:56:59Z",
+  "updated": "2026-06-24T08:57:48Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
-  "in_flight": null,
+  "in_flight": {
+    "item": "seven-game-gate",
+    "model": "opus",
+    "started": "2026-06-24T08:57:48Z"
+  },
   "stage2_items": [],
   "resolved": [
     "ADR-011 reset-P-flag"
