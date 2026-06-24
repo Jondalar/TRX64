@@ -1676,7 +1676,11 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             let mut st = state.lock().unwrap();
             st.session.machine.poke(load_address, body);
             st.session.machine.sync_after_monitor();
-            let end_address = load_address.wrapping_add(body.len() as u16);
+            // c64re loadPrgIntoRam (integrated-session.ts:885): endAddress is the
+            // address of the LAST byte = (load + len - 1) & 0xFFFF.
+            let end_address = load_address
+                .wrapping_add(body.len() as u16)
+                .wrapping_sub(1);
             Response::ok(id, json!({
                 "loadAddress": load_address as u64,
                 "endAddress": end_address as u64,
@@ -3408,7 +3412,8 @@ mod batch1_tests {
             json!({ "prg_path": prg.to_string_lossy() }),
         );
         assert_eq!(r["loadAddress"], json!(0xc000));
-        assert_eq!(r["endAddress"], json!(0xc003));
+        // endAddress = last byte addr = load + len - 1 (= c64re integrated-session.ts:885).
+        assert_eq!(r["endAddress"], json!(0xc002));
         assert_eq!(r["bytesLoaded"], json!(3));
         assert_eq!(r["path"], json!(prg.to_string_lossy()));
         // The body landed in RAM.
