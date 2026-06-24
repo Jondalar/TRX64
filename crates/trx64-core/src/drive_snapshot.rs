@@ -193,7 +193,8 @@ fn write_drive_module(drive: &mut Drive1541, s: &mut SnapshotT) {
     s.smw_dw(&mut m, r.gcr_head_offset);
     s.smw_b(&mut m, r.gcr_read);
     s.smw_b(&mut m, r.gcr_write_value);
-    // idling_method (unit.idling_method) — 0 = IDLE_SKIP_CYCLES (1541 default).
+    // idling_method (unit.idling_method) — 0 = DRIVE_IDLE_NO_IDLE (the c64re
+    // facade's live value, vice1541-facade.ts:304).
     s.smw_b(&mut m, 0);
     // parallel_cable (unit.parallel_cable) — 0 = DRIVE_PC_NONE.
     s.smw_b(&mut m, 0);
