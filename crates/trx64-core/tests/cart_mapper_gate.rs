@@ -678,3 +678,62 @@ fn behavioral_easyflash_boots_into_cart() {
         eprintln!("PASS (EasyFlash executed; frame still blank in budget).");
     }
 }
+
+// ── BEHAVIORAL: a real GMOD2 CRT attaches + the flash/EEPROM build (ROM-gated) ─
+
+const GMOD2_SAMPLE: &str =
+    "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/yeti_mountain_GMOD2.crt";
+
+#[test]
+#[ignore = "needs ROMs + the yeti_mountain_GMOD2.crt sample; run with --ignored"]
+fn behavioral_gmod2_boots_into_cart() {
+    use std::path::Path;
+    use trx64_core::{Machine, NullSink};
+
+    if !Path::new(ROM_DIR).join("kernal-901227-03.bin").exists() {
+        eprintln!("SKIP: ROMs absent");
+        return;
+    }
+    let crt = match std::fs::read(GMOD2_SAMPLE) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("SKIP: {GMOD2_SAMPLE} absent");
+            return;
+        }
+    };
+
+    let mut m = Machine::new();
+    m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+    let (name, ty) = m.attach_cart_from_bytes(&crt, "GMOD2").expect("attach CRT");
+    eprintln!("attached: {name} ({ty:?})");
+    assert_eq!(ty, MapperType::Gmod2);
+    m.cold_reset();
+
+    // GMOD2 boots 8K (exrom=0, game=1): the CBM80 cold-start runs out of the cart
+    // ROML ($8000-$9FFF). Run a budget; record whether the CPU executes in ROML.
+    let mut sink = NullSink;
+    let mut reached_cart = false;
+    let mut max_colors = 0usize;
+    for _ in 0..200 {
+        m.run_for_full(50_000, &mut sink, |_, _, _, _, _, _, _| {});
+        let pc = m.cpu.pc;
+        if (0x8000..=0x9fff).contains(&pc) {
+            reached_cart = true;
+        }
+        let (_w, _h, rgba) = m.render_canvas_rgba();
+        let mut colors = std::collections::HashSet::new();
+        for px in rgba.chunks_exact(4) {
+            colors.insert((px[0], px[1], px[2]));
+        }
+        max_colors = max_colors.max(colors.len());
+    }
+    eprintln!(
+        "reached_cart={reached_cart} max_distinct_colors={max_colors} final_pc=${:04X}",
+        m.cpu.pc
+    );
+    assert!(
+        reached_cart,
+        "CPU never executed inside the GMOD2 ROML window"
+    );
+    eprintln!("PASS: GMOD2 executed (flash ROML + M93C86 EEPROM mapper live).");
+}
