@@ -784,10 +784,10 @@ async function main(): Promise<number> {
     rsC.close();
 
     // ───────── SCORECARD ─────────
-    // TRX64 corpus completion = reached READY/loaded (not a serial stall or crash):
-    // the load chain (KERNAL serial + 1541 + GCR) ran to completion. Gameplay is
-    // not reachable over the daemon input path (LOADED_READY) — that's the gate's
-    // job. The GREEN gate is the cross-runtime PARITY axes.
+    // trxLoaded = items where the load chain (KERNAL serial + 1541 + GCR) ran to a
+    // healthy state (game-live, rendered, or loaded-to-READY) — not a serial stall
+    // or crash. trxGameplay = items that reached live game code in RAM. The GREEN
+    // gate is the cross-runtime PARITY axes (xref class + surface + snapshot).
     const trxLoaded = rows.filter((r) => r.rsClass !== "STUCK" && r.rsClass !== "ERROR").length;
     const trxGameplay = rows.filter((r) => r.rsClass === "GAME_LIVE" || r.rsClass === "RENDERED").length;
     const xrefRows = rows.filter((r) => r.xref);
