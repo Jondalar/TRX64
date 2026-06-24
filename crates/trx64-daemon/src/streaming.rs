@@ -114,6 +114,91 @@ struct Subscriber {
     out: UnboundedSender<Message>,
 }
 
+// ── Generic JSON-notification push (ws-server.ts:258 `broadcast`) ──────────────
+//
+// `dispatch(req, &state)` is pure request→response and has NO access to a client's
+// outbound channel, so a request handler cannot, on its own, also PUSH a server
+// notification (c64re's `this.broadcast(method, params)`). c64re emits three such
+// notifications from inside handlers — debug/breakpoint_hit (a run halts at a bp),
+// audio/flush (the PCM timeline is discontinuous → flush the worklet ring), and
+// batch/progress (per-scenario during a batch run) — by calling `this.broadcast`,
+// which fans a JSON-RPC NOTIFICATION (no `id`) out to ALL connected clients.
+//
+// The `NotifyHub` is the TRX64 mirror of that fan-out. UNLIKE [`StreamHub`] (gated
+// on `--stream`), it ALWAYS exists: it lives in the shared `State` so any handler
+// can reach it, and every connection registers its `out_tx` (the same mpsc→writer
+// channel that already carries responses + the BIN A/V frames, ADR-073). The
+// notification rides that channel as a `Message::Text` carrying the c64re envelope
+// `{ "jsonrpc": "2.0", "method": <method>, "params": <payload> }` — byte-identical
+// to ws-server.ts:258-260, and with NO `id` field so a client distinguishes a
+// server-push from a request reply exactly as in c64re.
+
+/// The generic notification broadcaster — 1:1 with ws-server.ts's `broadcast`.
+/// Holds every live client's outbound channel; `broadcast(method, payload)` fans a
+/// JSON-RPC notification to all of them, pruning any whose channel has closed.
+#[derive(Default)]
+pub struct NotifyHub {
+    inner: Mutex<NotifyInner>,
+}
+
+#[derive(Default)]
+struct NotifyInner {
+    subscribers: Vec<Subscriber>,
+    next_id: u64,
+}
+
+impl NotifyHub {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Register a client's outbound channel. Returns a guard that unsubscribes on
+    /// drop (mirrors the per-connection `clients` set add/remove in ws-server.ts).
+    pub fn subscribe(self: &Arc<Self>, out: UnboundedSender<Message>) -> NotifySub {
+        let mut inner = self.inner.lock().unwrap();
+        let id = inner.next_id;
+        inner.next_id += 1;
+        inner.subscribers.push(Subscriber { id, out });
+        NotifySub { hub: Arc::clone(self), id }
+    }
+
+    /// Send a JSON-RPC notification (no `id`) to every live client — the exact
+    /// envelope ws-server.ts:259 builds: `{ jsonrpc:"2.0", method, params }`.
+    /// Prunes any subscriber whose channel has closed. Returns the live count.
+    pub fn broadcast(&self, method: &str, payload: serde_json::Value) -> usize {
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": payload,
+        });
+        // Serialize once; clone the cheap `Message` per subscriber.
+        let text = serde_json::to_string(&msg).unwrap_or_else(|_| String::from("{}"));
+        let wire = Message::Text(text.into());
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .subscribers
+            .retain(|s| s.out.send(wire.clone()).is_ok());
+        inner.subscribers.len()
+    }
+
+    fn unsubscribe(&self, id: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.subscribers.retain(|s| s.id != id);
+    }
+}
+
+/// Per-connection notification subscription guard. Dropping it unsubscribes.
+pub struct NotifySub {
+    hub: Arc<NotifyHub>,
+    id: u64,
+}
+
+impl Drop for NotifySub {
+    fn drop(&mut self) {
+        self.hub.unsubscribe(self.id);
+    }
+}
+
 /// The SINGLETON broadcaster. There is exactly ONE streaming loop driving the
 /// (singleton) machine, regardless of how many clients connect — matching c64re's
 /// model (one pacing loop, `broadcastFrame`/`broadcastAudioWire` to all clients).
@@ -353,6 +438,43 @@ mod tests {
         assert_eq!(&p[58..62], &indices);
         // total payload length = 10 + 48 + 4
         assert_eq!(p.len(), 10 + 48 + 4);
+    }
+
+    #[test]
+    fn notify_hub_broadcasts_jsonrpc_notification_envelope() {
+        // A subscribed client receives a JSON-RPC NOTIFICATION (no `id`) carrying
+        // exactly the c64re `broadcast` envelope: { jsonrpc, method, params }.
+        let hub = NotifyHub::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        let _sub = hub.subscribe(tx);
+        let live = hub.broadcast(
+            "debug/breakpoint_hit",
+            serde_json::json!({ "session_id": "integrated-1", "pc": 0xC000, "num": 1 }),
+        );
+        assert_eq!(live, 1);
+        let msg = rx.try_recv().expect("notification enqueued");
+        let text = match msg {
+            Message::Text(t) => t.to_string(),
+            other => panic!("expected text notification, got {other:?}"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["method"], "debug/breakpoint_hit");
+        // A server-push has NO `id` — that is how a client tells it from a reply.
+        assert!(v.get("id").is_none(), "notification must omit id");
+        assert_eq!(v["params"]["session_id"], "integrated-1");
+        assert_eq!(v["params"]["pc"], 0xC000);
+        assert_eq!(v["params"]["num"], 1);
+    }
+
+    #[test]
+    fn notify_hub_prunes_closed_subscribers() {
+        let hub = NotifyHub::new();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        let _sub = hub.subscribe(tx);
+        drop(rx); // client gone → channel closed
+        let live = hub.broadcast("audio/flush", serde_json::json!({ "session_id": "x" }));
+        assert_eq!(live, 0, "closed subscriber is pruned");
     }
 
     #[test]

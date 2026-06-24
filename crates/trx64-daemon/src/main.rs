@@ -220,6 +220,13 @@ struct State {
     /// existing `run_scenario` path and stores the completed entry here. The wire
     /// shape (batchId/status/completed/total/results) is 1:1 with c64re.
     batches: std::collections::HashMap<String, BatchEntry>,
+    /// The generic JSON-notification broadcaster (ws-server.ts:258 `broadcast`).
+    /// `dispatch` is pure request→response; this hub is how a handler ALSO pushes a
+    /// server notification (debug/breakpoint_hit, audio/flush, batch/progress) to
+    /// every connected client. Each connection registers its outbound channel; the
+    /// hub fans a `{jsonrpc,method,params}` notification (no id) to all. Always
+    /// present (unlike the `--stream`-gated A/V `StreamHub`).
+    notify: Arc<streaming::NotifyHub>,
 }
 
 /// Spec 271 — one in-process batch (= c64re `BatchEntry`). Results are stored as a
@@ -502,6 +509,35 @@ fn writeback_hits(bp: &mut Breakpoints, reg: &observers::ObserverRegistry) {
     }
 }
 
+/// The VICE-style register dump line used by the monitor + the breakpoint_hit
+/// broadcast — 1:1 with runtime-controller.ts:116-122 `registerDump`. The flags
+/// column is the `NV-BDIZC` string with each letter UPPERCASE if the flag is set,
+/// lowercase if clear (NOT the raw hex byte the `r` monitor command prints).
+///
+/// Reads `cpu6510` — the daemon's unified register view: the full-machine run path
+/// mirrors `c64_core` into it (`sync_snapshot_sc`), and the isolated path runs ON
+/// it directly, so it reflects the halt CPU regardless of which core executed.
+fn register_dump(session: &Session) -> String {
+    let c = &session.machine.cpu6510;
+    let flags = c.flags();
+    let names = ['N', 'V', '-', 'B', 'D', 'I', 'Z', 'C'];
+    let flags_str: String = names
+        .iter()
+        .enumerate()
+        .map(|(i, &f)| {
+            if (flags >> (7 - i)) & 1 != 0 {
+                f
+            } else {
+                f.to_ascii_lowercase()
+            }
+        })
+        .collect();
+    format!(
+        "  ADDR AC XR YR SP NV-BDIZC\n.;{:04X} {:02X} {:02X} {:02X} {:02X} {}",
+        c.reg_pc, c.reg_a, c.reg_x, c.reg_y, c.reg_sp, flags_str
+    )
+}
+
 /// Default cycle budget for a synchronous breakpoint-gated run (the daemon is
 /// request/response; a real autonomous loop would be unbounded, so we cap at a
 /// generous ~10 frames of PAL cycles — enough to reach any boot-time bp).
@@ -571,8 +607,33 @@ fn run_debug_control(id: Value, st: &mut State, frame: u64, is_continue: bool) -
         if let Some(n) = bp_num {
             stop["breakpointId"] = json!(n as u64);
         }
-        if let Some(name) = run.which {
+        if let Some(name) = &run.which {
             stop["breakpoint"] = json!(name);
+        }
+        // Server-PUSH the halt notification (runtime-controller.ts:755-784). An exec
+        // breakpoint emits `debug/breakpoint_hit` with { session_id, pc, num, cycles,
+        // registers }; a load/store watchpoint emits `debug/observer_hit` with
+        // { session_id, pc, cycles, observer, message, registers }. The push reaches
+        // every connected client (the request reply below is the same halt, but only
+        // the caller sees that — a passive client learns of the halt only via this).
+        let registers = register_dump(&st.session);
+        if run.reason == "observer" {
+            st.notify.broadcast("debug/observer_hit", json!({
+                "session_id": st.session.id,
+                "pc": run.pc as u64,
+                "cycles": cycles,
+                "observer": run.which.clone(),
+                "message": Value::Null,
+                "registers": registers,
+            }));
+        } else {
+            st.notify.broadcast("debug/breakpoint_hit", json!({
+                "session_id": st.session.id,
+                "pc": run.pc as u64,
+                "num": bp_num.map(|n| n as u64),
+                "cycles": cycles,
+                "registers": registers,
+            }));
         }
         Response::ok(id, json!({
             "runState": "paused",
@@ -1835,6 +1896,10 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             // A reset is a control discontinuity — clear stop + advance the frame.
             st.ctrl_stop = None;
             st.ctrl_frame += 1;
+            // A reset is also an AUDIO-timeline discontinuity (reSID re-init): push
+            // `audio/flush` so the client flushes its worklet ring + re-syncs the send
+            // epoch (ws-server.ts:1430 — same mechanism as a checkpoint restore).
+            st.notify.broadcast("audio/flush", json!({ "session_id": st.session.id }));
             Response::ok(id, json!({
                 "c64Cycles": cycles,
                 "pc": pc,
@@ -2762,13 +2827,16 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         // ── Spec 271 — batch scenario runner ──────────────────────────────────
         // c64re's batch/* (ws-server.ts:2331/2376/2384) spawns N worker THREADS
         // (scenario-pool.ts) that replay scenarios in parallel and reports progress
-        // via a `batch/progress` broadcast. TRX64's daemon is single-threaded and the
-        // `dispatch` fn has no client-broadcast handle, so batch/start runs the
-        // scenarios SEQUENTIALLY in-process through the existing `run_scenario` path
-        // and returns the COMPLETED entry (no live progress push — the only behavioural
-        // deviation; the WIRE shape — batchId/status/completed/total/workerCount +
-        // results map — is 1:1). Each scenario id is looked up in the in-process
-        // scenario registry (= c64re scenarioIds).
+        // via a `batch/progress` broadcast. TRX64's daemon is single-threaded, so
+        // batch/start runs the scenarios SEQUENTIALLY in-process through the existing
+        // `run_scenario` path and returns the COMPLETED entry. It NOW also pushes the
+        // same `batch/progress` notification per completed scenario (and the terminal
+        // done/error), via the generic `NotifyHub` — so the live wire matches c64re's
+        // `onProgress` + the final done/error broadcast (the ordering differs only in
+        // that sequential progress is monotonic, never interleaved). The WIRE shape —
+        // batchId/status/completed/total/workerCount + results map, and the progress
+        // envelope { batchId, completed, total, currentId } — is 1:1. Each scenario id
+        // is looked up in the in-process scenario registry (= c64re scenarioIds).
         "batch/start" => {
             let ids: Vec<String> = match req.params.get("scenarioIds").and_then(|v| v.as_array()) {
                 Some(a) if !a.is_empty() => {
@@ -2789,8 +2857,12 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             let batch_id = new_batch_id();
             let mut st = state.lock().unwrap();
             let total = ids.len() as u64;
+            // Clone the notify handle ONCE (the loop mutably borrows `st`, so we can't
+            // touch `st.notify` inside it). Same channel set as every other push.
+            let notify = st.notify.clone();
 
-            // Run each scenario sequentially via the existing deterministic replay.
+            // Run each scenario sequentially via the existing deterministic replay,
+            // pushing `batch/progress` after each one (= c64re's per-scenario onProgress).
             let mut results: Vec<(String, Result<Value, String>)> = Vec::with_capacity(ids.len());
             for sid in &ids {
                 let scenario = st.scenarios.get(sid).cloned();
@@ -2799,9 +2871,34 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                     None => Err(format!("scenario '{sid}' not found")),
                 };
                 results.push((sid.clone(), r));
+                notify.broadcast("batch/progress", json!({
+                    "batchId": batch_id,
+                    "completed": results.len() as u64,
+                    "total": total,
+                    "currentId": sid,
+                }));
             }
             let completed = total;
             let any_err = results.iter().any(|(_, r)| r.is_err());
+            // Terminal progress broadcast (ws-server.ts:2358 / :2366): done or error.
+            if any_err {
+                let err = results
+                    .iter()
+                    .find_map(|(_, r)| r.as_ref().err().cloned())
+                    .unwrap_or_default();
+                notify.broadcast("batch/progress", json!({
+                    "batchId": batch_id,
+                    "status": "error",
+                    "error": err,
+                }));
+            } else {
+                notify.broadcast("batch/progress", json!({
+                    "batchId": batch_id,
+                    "completed": total,
+                    "total": total,
+                    "status": "done",
+                }));
+            }
 
             let entry = BatchEntry {
                 batch_id: batch_id.clone(),
@@ -3415,6 +3512,10 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             // controller frame + clear the last stop, mirroring the undump/reset path.
             st.ctrl_frame += 1;
             st.ctrl_stop = None;
+            // A restore is an AUDIO-timeline discontinuity (the worklet ring now holds
+            // post-restore-stale samples): push `audio/flush` (ws-server.ts:1667/1690
+            // `onRestore` → `this.broadcast("audio/flush", …)`).
+            st.notify.broadcast("audio/flush", json!({ "session_id": st.session.id }));
             let machine_state = build_debug_state(&st);
             Response::ok(id, json!({
                 "restored": restored,
@@ -3422,10 +3523,37 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             }))
         }
 
+        // checkpoint/thumbnails — the scrub filmstrip (ws-server.ts:1028-1037): every
+        // live ring checkpoint with a small palette-indexed thumbnail (id, cycles,
+        // frame, pinned, width, height, palette:b64, indices:b64). c64re grabs each
+        // thumb from the live frame at capture time; TRX64 renders it from the
+        // checkpoint's STORED `vicPresentation` framebuffer (full-capture path),
+        // cropped to the 384×272 canvas + 1/4 downscaled — 1:1 wire shape, and an
+        // entry whose anchor omits the framebuffer simply yields no thumbnail (just
+        // like a c64re checkpoint with no captured thumb is absent from `filmstrip()`).
+        "checkpoint/thumbnails" => {
+            let st = state.lock().unwrap();
+            let refs = st.checkpoint_ring.list();
+            let mut thumbnails: Vec<Value> = Vec::new();
+            for r in &refs {
+                let Some(cp) = st.checkpoint_ring.restore_snapshot(&r.id) else { continue };
+                let Some((w, h, palette, indices)) = checkpoint_thumbnail(&cp) else { continue };
+                thumbnails.push(json!({
+                    "id": r.id,
+                    "cycles": r.cycles,
+                    "frame": r.frame,
+                    "pinned": r.pinned,
+                    "width": w as u64,
+                    "height": h as u64,
+                    "palette": base64_encode(&palette),
+                    "indices": base64_encode(&indices),
+                }));
+            }
+            Response::ok(id, json!({ "thumbnails": thumbnails }))
+        }
+
         m if m.starts_with("checkpoint/") => {
-            // checkpoint/thumbnails needs the per-checkpoint VIC filmstrip render
-            // (controller.filmstrip()) — a present-capture path not yet in trx64.
-            Response::err(id, -32001, format!("NOT_IMPLEMENTED: {m}: deferred (needs the filmstrip/present-capture path)"))
+            Response::err(id, -32601, format!("Method not found: {m}"))
         }
 
         // ── Spec 766.5 — runtime recorder (off-thread scrub history) ─────────
@@ -3724,6 +3852,9 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                     let breakpoints = st.breakpoints.entries.len() as u64;
                     // An undump is a restore → the session is paused.
                     st.session.running = false;
+                    // …and an audio-timeline discontinuity → flush the worklet ring
+                    // (same `onRestore` push as a checkpoint restore, ws-server.ts:1690).
+                    st.notify.broadcast("audio/flush", json!({ "session_id": st.session.id }));
                     Response::ok(id, json!({
                         "path": path,
                         "cycle": cycle,
@@ -4885,6 +5016,54 @@ fn render_screenshot(machine: &trx64_core::Machine, scale: usize) -> (String, u3
     (url, ow as u32, oh as u32)
 }
 
+/// Spec 769.5a — the downscale factor for a scrub-filmstrip thumbnail. 1:1 with
+/// `makeCheckpointThumbnail`'s default (factor 4 → the 384×272 canvas becomes 96×68).
+const THUMB_FACTOR: usize = 4;
+
+/// Build a downscaled palette-indexed thumbnail from a stored checkpoint's
+/// `vicPresentation.literalPortFbStable` framebuffer — the TRX64 mirror of
+/// `makeCheckpointThumbnail` (inspect/checkpoint-thumbnail.ts:30). c64re grabs the
+/// thumbnail from the LIVE frame at capture time (its literal-port VIC is per-cycle
+/// stateful → no pure snapshot→frame fn); TRX64's ring stores the full presentation
+/// framebuffer per checkpoint, so we crop+downscale THAT (more faithful: works for
+/// every ring entry, not just one live at capture). Same crop (the VICE PAL
+/// 384×272 canvas via `index_buffer_to_canvas_indices`), same nearest-neighbour
+/// 1/factor downscale, same { width, height, palette(48 RGB), indices(w*h) } shape.
+/// Returns None if the checkpoint carries no usable presentation framebuffer.
+fn checkpoint_thumbnail(cp: &Value) -> Option<(usize, usize, Vec<u8>, Vec<u8>)> {
+    // The `literalPortFbStable` = the displayed (last fully presented) frame, a
+    // 520×312 colour-index buffer. (Live captures via checkpoint/capture keep it;
+    // omitFramebuffer anchors null it — those simply yield no thumbnail.)
+    let fb_node = cp.get("vicPresentation")?.get("literalPortFbStable")?;
+    let fb = trx64_core::native_snapshot::ta_u8_decode(fb_node)?;
+    if fb.len() < trx64_core::render::FB_W * trx64_core::render::FB_H {
+        return None;
+    }
+    // Crop to the 384×272 VICE PAL canvas (palette-indexed, each & 0x0f) — exactly
+    // the c64re `renderLiteralPortIndexed` crop the live thumbnail samples.
+    let (cw, ch, canvas) = trx64_core::render::index_buffer_to_canvas_indices(&fb);
+    let ow = cw / THUMB_FACTOR;
+    let oh = ch / THUMB_FACTOR;
+    if ow == 0 || oh == 0 {
+        return None;
+    }
+    // Nearest-neighbour 1/factor downscale (checkpoint-thumbnail.ts:37-41).
+    let mut out = vec![0u8; ow * oh];
+    for oy in 0..oh {
+        let sy = oy * THUMB_FACTOR * cw;
+        let orow = oy * ow;
+        for ox in 0..ow {
+            out[orow + ox] = canvas[sy + ox * THUMB_FACTOR];
+        }
+    }
+    // The 48-byte RGB palette to pair with the indices (COLODORE, R,G,B order).
+    let mut palette = Vec::with_capacity(48);
+    for rgb in trx64_core::render::COLODORE.iter() {
+        palette.extend_from_slice(rgb);
+    }
+    Some((ow, oh, palette, out))
+}
+
 // ── Connection handler ────────────────────────────────────────────────────────
 
 async fn handle_connection(
@@ -4930,6 +5109,16 @@ async fn handle_connection(
     // so the byte-exact gates are unperturbed.
     let _stream = hub.as_ref().map(|h| h.subscribe(out_tx.clone()));
 
+    // Register this client's outbound channel with the (always-present) generic
+    // notification hub so handler-driven server pushes (debug/breakpoint_hit,
+    // audio/flush, batch/progress) reach it. The guard unsubscribes on disconnect.
+    // (Unlike the A/V `StreamHub`, this exists with or without --stream, so the
+    // notifications work for the oracle's command-driven daemons too.)
+    let _notify = {
+        let notify = state.lock().unwrap().notify.clone();
+        notify.subscribe(out_tx.clone())
+    };
+
     while let Some(msg) = rx.next().await {
         let msg = match msg {
             Ok(m) => m,
@@ -4967,8 +5156,9 @@ async fn handle_connection(
         }
     }
 
-    // Drop the stream handle (stop + join the loop) and tear down the writer.
+    // Drop the stream + notification handles (unsubscribe) and tear down the writer.
     drop(_stream);
+    drop(_notify);
     drop(out_tx);
     writer.abort();
 
@@ -5033,6 +5223,7 @@ async fn main() {
         scenarios: std::collections::HashMap::new(),
         media_events: Vec::new(),
         batches: std::collections::HashMap::new(),
+        notify: streaming::NotifyHub::new(),
     }));
 
     // The singleton live A/V stream hub (ADR-073): one pacing loop drives the
@@ -5099,7 +5290,40 @@ mod batch1_tests {
             scenarios: std::collections::HashMap::new(),
             media_events: Vec::new(),
             batches: std::collections::HashMap::new(),
+            notify: streaming::NotifyHub::new(),
         }))
+    }
+
+    /// Subscribe a probe channel to a state's NotifyHub (= one connected client) and
+    /// return the receiver so a test can assert which server-push notifications a
+    /// handler enqueued. Drains the JSON-RPC envelope to (method, params) pairs.
+    fn probe_notifications(
+        state: &SharedState,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<tokio_tungstenite::tungstenite::Message> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let hub = state.lock().unwrap().notify.clone();
+        // Leak the guard: the probe stays subscribed for the test's lifetime.
+        std::mem::forget(hub.subscribe(tx));
+        rx
+    }
+
+    /// Drain a probe receiver into (method, params) pairs.
+    fn drain_notifications(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<tokio_tungstenite::tungstenite::Message>,
+    ) -> Vec<(String, Value)> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let tokio_tungstenite::tungstenite::Message::Text(t) = msg {
+                let v: Value = serde_json::from_str(&t).unwrap();
+                assert_eq!(v["jsonrpc"], "2.0", "notification envelope");
+                assert!(v.get("id").is_none(), "a server push carries no id");
+                out.push((
+                    v["method"].as_str().unwrap().to_string(),
+                    v["params"].clone(),
+                ));
+            }
+        }
+        out
     }
 
     fn call(state: &SharedState, method: &str, params: Value) -> Value {
@@ -5367,10 +5591,10 @@ mod batch1_tests {
     #[test]
     fn deferred_methods_report_not_implemented() {
         let st = make_state();
-        // The vic/inspect/* engine methods are now implemented (see
-        // vic_inspect_engine_open_at_region_origin_promote). What remains deferred:
-        // the present-capture filmstrip + the trace/access-map readers.
-        for m in ["checkpoint/thumbnails", "trace/read", "debug/memory_access_map"] {
+        // The vic/inspect/* engine methods AND checkpoint/thumbnails are now
+        // implemented (see checkpoint_thumbnails_render_from_ring_framebuffer). What
+        // remains deferred: the trace/access-map readers.
+        for m in ["trace/read", "debug/memory_access_map"] {
             let e = call_err(&st, m, json!({}));
             assert_eq!(e.code, -32001);
             assert!(e.message.contains("NOT_IMPLEMENTED"));
@@ -6065,6 +6289,189 @@ mod batch1_tests {
         let map = results["results"].as_object().unwrap();
         assert!(map["ok"]["ramHash"].is_string());
         assert!(map["missing"]["error"].as_str().unwrap().contains("not found"));
+    }
+
+    // ── WS server-push notifications (runtime-controller.ts broadcasts) ────────
+
+    #[test]
+    fn debug_run_pushes_breakpoint_hit_notification() {
+        // BEHAVIORAL: a breakpoint set + debug/run → the client receives a
+        // `debug/breakpoint_hit` notification (not just the response) at the halt PC,
+        // with the c64re shape { session_id, pc, num, cycles, registers }.
+        let st = make_state();
+        let mut rx = probe_notifications(&st);
+        // Poke a runnable program at $C000: NOP; NOP; NOP; … (EA), so a numbered
+        // exec breakpoint downstream halts the run. Position the CPU there. The
+        // no-ROM machine runs on the isolated `cpu6510` core, so set its PC.
+        {
+            let mut g = st.lock().unwrap();
+            for off in 0..8u16 {
+                g.session.machine.ram[0xc000 + off as usize] = 0xea; // NOP
+            }
+            g.session.machine.cpu6510.reg_pc = 0xc000;
+            g.session.machine.sync_after_monitor();
+        }
+        // Add a numbered breakpoint at $C003 and run.
+        let added = call(&st, "debug/break_add", json!({ "pc": 0xc003 }));
+        let num = added["num"].as_u64().unwrap();
+        let run = call(&st, "debug/run", json!({}));
+        assert_eq!(run["runState"], json!("paused"), "halted at the bp");
+        assert_eq!(run["pc"], json!(0xc003));
+
+        let notes = drain_notifications(&mut rx);
+        let hit = notes
+            .iter()
+            .find(|(m, _)| m == "debug/breakpoint_hit")
+            .expect("a debug/breakpoint_hit push was enqueued");
+        let p = &hit.1;
+        assert_eq!(p["session_id"], json!("integrated-1"));
+        assert_eq!(p["pc"], json!(0xc003), "halt PC");
+        assert_eq!(p["num"], json!(num), "resolved breakpoint number");
+        assert!(p["cycles"].is_u64(), "carries the cycle count");
+        // registers = the VICE-style dump string (ADDR AC XR YR SP NV-BDIZC).
+        let regs = p["registers"].as_str().unwrap();
+        assert!(regs.contains("ADDR AC XR YR SP NV-BDIZC"), "register dump header");
+        assert!(regs.contains(".;C003"), "dump shows the halt PC");
+    }
+
+    #[test]
+    fn batch_start_pushes_progress_notifications() {
+        // BEHAVIORAL: a batch run emits batch/progress per scenario + a terminal
+        // done broadcast — matching c64re's onProgress + completeBatch broadcast.
+        let st = make_state();
+        let mut rx = probe_notifications(&st);
+        for sid in ["b1", "b2"] {
+            call(&st, "runtime/scenario_save", json!({
+                "scenario": { "id": sid, "cycleBudget": 3000, "inputs": [] }
+            }));
+        }
+        let started = call(&st, "batch/start", json!({ "scenarioIds": ["b1", "b2"] }));
+        let batch_id = started["batchId"].as_str().unwrap().to_string();
+
+        let notes = drain_notifications(&mut rx);
+        let progress: Vec<&(String, Value)> =
+            notes.iter().filter(|(m, _)| m == "batch/progress").collect();
+        // Two per-scenario pushes + one terminal done = 3.
+        assert_eq!(progress.len(), 3, "two scenario + one terminal progress push");
+        // First per-scenario: completed 1/2, currentId b1.
+        assert_eq!(progress[0].1["batchId"], json!(batch_id));
+        assert_eq!(progress[0].1["completed"], json!(1));
+        assert_eq!(progress[0].1["total"], json!(2));
+        assert_eq!(progress[0].1["currentId"], json!("b1"));
+        assert_eq!(progress[1].1["completed"], json!(2));
+        assert_eq!(progress[1].1["currentId"], json!("b2"));
+        // Terminal: status done, completed == total.
+        assert_eq!(progress[2].1["status"], json!("done"));
+        assert_eq!(progress[2].1["completed"], json!(2));
+    }
+
+    #[test]
+    fn batch_start_pushes_error_progress_for_unknown_scenario() {
+        let st = make_state();
+        let mut rx = probe_notifications(&st);
+        call(&st, "runtime/scenario_save", json!({
+            "scenario": { "id": "ok", "cycleBudget": 3000, "inputs": [] }
+        }));
+        call(&st, "batch/start", json!({ "scenarioIds": ["ok", "missing"] }));
+        let notes = drain_notifications(&mut rx);
+        let term = notes
+            .iter()
+            .filter(|(m, _)| m == "batch/progress")
+            .last()
+            .expect("a terminal batch/progress push");
+        assert_eq!(term.1["status"], json!("error"));
+        assert!(term.1["error"].as_str().unwrap().contains("missing"));
+    }
+
+    #[test]
+    fn reset_and_restore_push_audio_flush() {
+        // BEHAVIORAL: an audio-timeline discontinuity (reset / checkpoint restore /
+        // snapshot undump) pushes `audio/flush { session_id }` so the client flushes
+        // its worklet ring (ws-server.ts:1430/1667/1690).
+        let st = make_state();
+        let mut rx = probe_notifications(&st);
+
+        // 1) session/reset.
+        call(&st, "session/reset", json!({ "mode": "soft" }));
+        // 2) capture + restore a checkpoint.
+        let cap = call(&st, "checkpoint/capture", json!({}));
+        let cp_id = cap["ref"]["id"].as_str().unwrap().to_string();
+        call(&st, "checkpoint/restore", json!({ "id": cp_id }));
+
+        let notes = drain_notifications(&mut rx);
+        let flushes: Vec<&(String, Value)> =
+            notes.iter().filter(|(m, _)| m == "audio/flush").collect();
+        assert!(flushes.len() >= 2, "reset + restore each push audio/flush");
+        for (_, p) in &flushes {
+            assert_eq!(p["session_id"], json!("integrated-1"));
+        }
+    }
+
+    #[test]
+    fn checkpoint_thumbnails_render_from_ring_framebuffer() {
+        // BEHAVIORAL: checkpoint/thumbnails returns a small palette-indexed thumbnail
+        // per ring checkpoint, rendered from each checkpoint's stored framebuffer.
+        // Shape 1:1 with ws-server.ts:1028-1037.
+        let st = make_state();
+        // Empty ring → empty thumbnails array.
+        let empty = call(&st, "checkpoint/thumbnails", json!({}));
+        assert_eq!(empty["thumbnails"].as_array().unwrap().len(), 0);
+
+        // Capture two checkpoints (the full-capture path keeps the framebuffer).
+        let id0 = call(&st, "checkpoint/capture", json!({}))["ref"]["id"]
+            .as_str().unwrap().to_string();
+        let id1 = call(&st, "checkpoint/capture", json!({}))["ref"]["id"]
+            .as_str().unwrap().to_string();
+
+        let res = call(&st, "checkpoint/thumbnails", json!({}));
+        let thumbs = res["thumbnails"].as_array().unwrap();
+        assert_eq!(thumbs.len(), 2, "one thumbnail per ring checkpoint");
+        // Ring order = oldest first.
+        assert_eq!(thumbs[0]["id"], json!(id0));
+        assert_eq!(thumbs[1]["id"], json!(id1));
+        for t in thumbs {
+            // 384×272 canvas / factor 4 = 96×68.
+            assert_eq!(t["width"], json!(96));
+            assert_eq!(t["height"], json!(68));
+            assert!(t["cycles"].is_u64());
+            assert!(t["frame"].is_u64());
+            assert_eq!(t["pinned"], json!(false));
+            // palette = 48 RGB bytes (base64) ; indices = width*height (base64).
+            let pal = base64_decode_for_test(t["palette"].as_str().unwrap());
+            assert_eq!(pal.len(), 48, "48-byte RGB palette");
+            let idx = base64_decode_for_test(t["indices"].as_str().unwrap());
+            assert_eq!(idx.len(), 96 * 68, "width*height indices");
+            // All indices are 4-bit colour values.
+            assert!(idx.iter().all(|&b| b < 16), "indices are 0..15");
+        }
+    }
+
+    /// Minimal base64 decoder for the thumbnail test (the daemon only ENCODES).
+    fn base64_decode_for_test(s: &str) -> Vec<u8> {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut rev = [255u8; 256];
+        for (i, &c) in T.iter().enumerate() {
+            rev[c as usize] = i as u8;
+        }
+        let mut bits = 0u32;
+        let mut nbits = 0;
+        let mut out = Vec::new();
+        for &c in s.as_bytes() {
+            if c == b'=' {
+                break;
+            }
+            let v = rev[c as usize];
+            if v == 255 {
+                continue;
+            }
+            bits = (bits << 6) | v as u32;
+            nbits += 6;
+            if nbits >= 8 {
+                nbits -= 8;
+                out.push((bits >> nbits) as u8);
+            }
+        }
+        out
     }
 }
 
