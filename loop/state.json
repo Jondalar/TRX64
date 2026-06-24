@@ -1,7 +1,7 @@
 {
   "phase": 1,
   "stage": "followups",
-  "current_item": "cartridge + sid-resid",
+  "current_item": "cartridge",
   "stage1_remaining": [],
   "retry_count": 0,
   "max_retries": 4,
@@ -45,16 +45,16 @@
     "perf-compare"
   ],
   "note": "ARCH-MAP DONE (ADR-066). Answers: monitor=SEPARATE (TRX64 already correct: Observer trait=core, daemon=monitor surface). obs/bk/trace=tick hooks at 3 granularities, all gated. TRX64 has trace-hook (monomorphized NullSink); MISSING: breakpoints/watchpoints not wired, on_interrupt dead in full SC path. PLAN: Phase0 tiny hooks (on_access bus gate, on_interrupt in do_interrupt, run-loop bp param+abort enum) -> cartridge read-only tier (cart.rs ~600-800LOC, memconfig table already present) || breakpoint policy layer -> SID audio (reSID) || monitor/WS coverage. OPEN DECISION (user's): reSID = cc-FFI C++ (1:1, byte-identical, +C++/GPL build dep) vs pure-Rust vs TS-SID. Awaiting user.",
-  "updated": "2026-06-24T10:57:39Z",
+  "updated": "2026-06-24T10:58:57Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
   ],
   "in_flight": {
-    "item": "cartridge+sid-resid-parallel",
+    "item": "cartridge",
     "model": "opus",
-    "started": "2026-06-24T10:57:39Z",
-    "note": "two parallel worktree builders: cartridge read-only tier + SID reSID audio FFI. user chose reSID cc-FFI binding."
+    "started": "2026-06-24T10:58:57Z",
+    "note": "cartridge read-only tier first (user order). SID reSID queued next (sequential - no worktree isolation available)."
   },
   "stage2_items": [],
   "resolved": [
