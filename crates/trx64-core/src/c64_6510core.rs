@@ -135,11 +135,24 @@ const LXA_RDY_MAGIC: u8 = 0xee;
 // can be satisfied, so a MAX sentinel never fires while no source asserts.
 pub const CLOCK_MAX: u64 = u64::MAX;
 
-/// Number of independent IRQ sources the C64 int status multiplexes
-/// (interrupt.h pending_int[]): the C64 wires CIA1 (IRQ), CIA2 (NMI), VIC-II
-/// (IRQ), cartridge (NMI/IRQ), and RESTORE (NMI). The host registers sources at
-/// init; we size for the standard machine. Index = int_num.
-pub const C64_NUM_INT_SOURCES: usize = 8;
+/// Number of independent interrupt sources the C64 int status multiplexes
+/// (interrupt.h pending_int[]). The stock no-cart C64 wires four: VIC-II (IRQ),
+/// CIA1 (IRQ), CIA2 (NMI), and the RESTORE key (NMI). The host registers sources
+/// at init by `int_num`; the named indices below are the registration order
+/// (VICE registers vicii first, then the CIAs, then restore — but only the count
+/// and per-source independence matter, since `set_irq`/`set_nmi` key off
+/// `int_num` and the global edge is `nirq`/`nnmi` aggregated). Index = int_num.
+pub const C64_NUM_INT_SOURCES: usize = 4;
+
+/// VIC-II raster/sprite IRQ source index (int_num).
+pub const INT_SRC_VIC: usize = 0;
+/// CIA1 timer/TOD/FLAG IRQ source index (int_num).
+pub const INT_SRC_CIA1: usize = 1;
+/// CIA2 timer/TOD/FLAG NMI source index (int_num).
+pub const INT_SRC_CIA2: usize = 2;
+/// RESTORE-key NMI source index (int_num). Inert in the headless machine (no
+/// keyboard RESTORE wired into the NMI line), reserved for completeness.
+pub const INT_SRC_RESTORE: usize = 3;
 
 // SC: REWIND_FETCH_OPCODE is a NO-OP for x64sc (c64cpusc.c:42 `/*clock-=2*/`).
 // We model it as a no-op accordingly.
@@ -457,6 +470,15 @@ pub trait C64Core6510Bus {
     /// PORT OF: mainc64cpu.c:372-380 STORE (raw write tab). reu_dma($ff00) hook
     /// is folded into the implementor.
     fn write_raw(&mut self, addr: u16, value: u8);
+    /// FETCH read raw — the opcode/operand byte fetch (c64cpusc.c FETCH_OPCODE,
+    /// which reads through the separate `_mem_read_tab_ptr` fetch path). Distinct
+    /// from `read_raw` so a tracing implementor can tag it as a FETCH access (which
+    /// VICE / the conformance trace does NOT emit as a bus record, unlike data
+    /// reads). Default delegates to `read_raw` (functionally identical bus access).
+    #[inline]
+    fn read_raw_fetch(&mut self, addr: u16) -> u8 {
+        self.read_raw(addr)
+    }
     /// DUMMY read raw (mainc64cpu.c:365-369 mem_read_check_ba_dummy minus check_ba).
     #[inline]
     fn read_raw_dummy(&mut self, addr: u16) -> u8 {
@@ -603,6 +625,30 @@ impl C64Core6510 {
         }
     }
 
+    /// Reset to a known PC with C64 power-on registers, for the full-machine boot
+    /// path where the host (Machine::cold_reset) reads the reset vector directly
+    /// and seeds the CPU — the reset-vector read is NOT traced and no IK_RESET
+    /// dispatch runs (matching the old Cpu6510::reset_to the boot golden was
+    /// recorded against). a=x=y=0, sp=$FF, P=$20 (UNUSED only; I is set later by
+    /// the KERNAL's own SEI at $FCE4 — the boot trace[0] records P=$20), clk=0.
+    pub fn reset_to(&mut self, pc: u16) {
+        self.reg_a = 0;
+        self.reg_x = 0;
+        self.reg_y = 0;
+        self.reg_sp = 0xff;
+        self.reg_p = P_UNUSED & !(P_ZERO | P_SIGN);
+        self.flag_n = 0;
+        self.flag_z = 1; // Z clear at power-on.
+        self.reg_pc = pc;
+        self.clk = 0;
+        self.bank_base = None;
+        self.bank_start = 0;
+        self.bank_limit = 0;
+        self.last_opcode_info = 0;
+        self.last_opcode_addr = 0;
+        self.is_jammed = false;
+    }
+
     /// Composite P (incl. flag_n/flag_z view). = LOCAL_STATUS() (dtv:128-129).
     #[inline]
     pub fn status(&self) -> u8 {
@@ -640,6 +686,36 @@ const FETCH_TAB: [u8; 256] = [
     /* $D0 */  0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1, 1, 1,
     /* $E0 */  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1,
     /* $F0 */  0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1, 1, 1,
+];
+
+// =============================================================================
+// SECTION F2 — OPERAND_BYTES[opcode] = number of operand bytes (0/1/2).
+//
+// Used by the host trace wrapper to zero `b1`/`b2` for shorter opcodes (the
+// CPU_STEP record carries b1=operand-lo, b2=operand-hi, both 0 when the opcode is
+// implied/accumulator). This is the canonical NMOS 6502 length table (illegals
+// per VICE's decode): implied/accumulator/JAM = 0; immediate/zp/zp,X/zp,Y/
+// (zp,X)/(zp),Y/relative = 1; absolute/abs,X/abs,Y/indirect = 2 (= FETCH_TAB).
+// =============================================================================
+#[rustfmt::skip]
+pub const OPERAND_BYTES: [u8; 256] = [
+    /*       x0 x1 x2 x3 x4 x5 x6 x7 x8 x9 xA xB xC xD xE xF */
+    /* 0x */  0, 1, 0, 1, 1, 1, 1, 1, 0, 1, 0, 1, 2, 2, 2, 2,
+    /* 1x */  1, 1, 0, 1, 1, 1, 1, 1, 0, 2, 0, 2, 2, 2, 2, 2,
+    /* 2x */  2, 1, 0, 1, 1, 1, 1, 1, 0, 1, 0, 1, 2, 2, 2, 2,
+    /* 3x */  1, 1, 0, 1, 1, 1, 1, 1, 0, 2, 0, 2, 2, 2, 2, 2,
+    /* 4x */  0, 1, 0, 1, 1, 1, 1, 1, 0, 1, 0, 1, 2, 2, 2, 2,
+    /* 5x */  1, 1, 0, 1, 1, 1, 1, 1, 0, 2, 0, 2, 2, 2, 2, 2,
+    /* 6x */  0, 1, 0, 1, 1, 1, 1, 1, 0, 1, 0, 1, 2, 2, 2, 2,
+    /* 7x */  1, 1, 0, 1, 1, 1, 1, 1, 0, 2, 0, 2, 2, 2, 2, 2,
+    /* 8x */  1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 2, 2, 2, 2,
+    /* 9x */  1, 1, 0, 1, 1, 1, 1, 1, 0, 2, 0, 2, 2, 2, 2, 2,
+    /* Ax */  1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 2, 2, 2, 2,
+    /* Bx */  1, 1, 0, 1, 1, 1, 1, 1, 0, 2, 0, 2, 2, 2, 2, 2,
+    /* Cx */  1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 2, 2, 2, 2,
+    /* Dx */  1, 1, 0, 1, 1, 1, 1, 1, 0, 2, 0, 2, 2, 2, 2, 2,
+    /* Ex */  1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 2, 2, 2, 2,
+    /* Fx */  1, 1, 0, 1, 1, 1, 1, 1, 0, 2, 0, 2, 2, 2, 2, 2,
 ];
 
 // =============================================================================
@@ -728,6 +804,14 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
         self.check_ba();
         self.bus.read_raw(a)
     }
+    /// FETCH load — the opcode/operand byte fetch (FETCH_OPCODE path). Same
+    /// check_ba + bus access as `load`, but routes through `read_raw_fetch` so a
+    /// tracing implementor tags it as a FETCH (not emitted as a data-bus record).
+    #[inline]
+    fn load_fetch(&mut self, a: u16) -> u8 {
+        self.check_ba();
+        self.bus.read_raw_fetch(a)
+    }
     #[inline]
     fn load_dummy(&mut self, a: u16) -> u8 {
         self.check_ba();
@@ -783,7 +867,12 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
     fn pull(&mut self) -> u8 {
         self.core.reg_sp = self.core.reg_sp.wrapping_add(1);
         self.check_ba();
-        self.bus.read_raw(0x100u16.wrapping_add(self.core.reg_sp as u16))
+        // Stack PULL is a real read whose VALUE is used, but it is NOT emitted as a
+        // data-bus record in the trace contract (cpu.rs popped the stack via a bare
+        // `load` with no on_bus emit). The dummy variant does the real read for the
+        // value and tags it DummyRead (filtered out of the trace). The stack is
+        // always RAM ($0100-$01FF), so dummy vs real has no side-effect difference.
+        self.bus.read_raw_dummy(0x100u16.wrapping_add(self.core.reg_sp as u16))
     }
     #[inline]
     fn stack_peek(&mut self) -> u8 {
@@ -1663,7 +1752,10 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
         self.clk_inc();
         self.push((self.core.reg_pc & 0xff) as u8);
         self.clk_inc();
-        let addr_msb = self.load(self.core.reg_pc);
+        // The target high byte is the instruction's 3rd encoding byte (operand-hi):
+        // a FETCH, not a data read — JSR interleaves the stack pushes between the
+        // lo and hi fetch, so it is read here rather than in FETCH_OPCODE.
+        let addr_msb = self.load_fetch(self.core.reg_pc);
         let dest_addr = (p1 as u16) | ((addr_msb as u16) << 8);
         self.clk_inc();
         self.jump(dest_addr);
@@ -1675,7 +1767,10 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
         self.clk_inc();
         tmp |= (self.pull() as u16) << 8;
         self.clk_inc();
-        self.load(tmp);
+        // The read at the return address is the throwaway cycle (PC is set to
+        // tmp+1) — a DUMMY read in the trace contract (not emitted), matching
+        // cpu.rs's RTS final cycle.
+        self.load_dummy(tmp);
         self.clk_inc();
         tmp = tmp.wrapping_add(1);
         self.jump(tmp);
@@ -2343,15 +2438,15 @@ fn fetch_opcode<B: C64Core6510Bus>(ex: &mut Exec<B>) -> (u8, u8, u16) {
         }
         (ins, lo, p2)
     } else {
-        // Per-byte LOAD path.
-        let ins = ex.load(reg_pc);
+        // Per-byte FETCH path (FETCH_OPCODE — the separate fetch read tab).
+        let ins = ex.load_fetch(reg_pc);
         ex.set_last_opcode(ins as u32);
         ex.clk_inc();
-        let lo = ex.load(reg_pc.wrapping_add(1));
+        let lo = ex.load_fetch(reg_pc.wrapping_add(1));
         let mut p2 = lo as u16;
         ex.clk_inc();
         if FETCH_TAB[ins as usize] != 0 {
-            let hi = ex.load(reg_pc.wrapping_add(2));
+            let hi = ex.load_fetch(reg_pc.wrapping_add(2));
             p2 |= (hi as u16) << 8;
             ex.clk_inc();
         }

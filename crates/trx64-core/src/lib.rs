@@ -15,6 +15,7 @@ pub mod cpu;
 pub mod drive;
 pub mod drive_6510core;
 pub mod full;
+pub mod full_sc;
 pub mod gcr;
 pub mod iec;
 pub mod keyboard;
@@ -294,8 +295,18 @@ pub struct Machine {
     pub ram: Box<[u8; 0x10000]>,
     /// Monotonic cycle counter (CLOCK, never wraps — per Spec 743).
     pub clk: u64,
-    /// Cycle-stepped 6510 (cpu.rs). The flat RAM above is its bus.
+    /// Cycle-stepped 6510 (cpu.rs). The flat RAM above is its bus. Used by the
+    /// CPU/chip-ISOLATED gates (run_for / run_for_cia / run_for_vic / run_for_sid)
+    /// and the inject path — NOT the full machine, which runs on `c64_core`.
     pub cpu6510: Cpu6510,
+    /// VERBATIM x64sc 6510 SC core (c64_6510core.rs). The PRODUCTION full-machine
+    /// C64 CPU: `run_for_full` drives this (NOT `cpu6510`). Threads vic_cycle +
+    /// check_ba + the interrupt-delay counters into every bus access — cycle-exact
+    /// vs VICE where the pattern engine could not be.
+    pub c64_core: c64_6510core::C64Core6510,
+    /// Interrupt status the verbatim core dispatches against (per-source IRQ/NMI
+    /// model). Sources: CIA1=0/VIC=1 → IRQ, CIA2=2/RESTORE=3 → NMI.
+    pub c64_int: c64_6510core::IntStatus,
     /// Legacy register-snapshot view kept in sync for daemon readers.
     pub cpu: Cpu,
     /// Cycle-exact VIC-II. CLOCK-DRIVEN: ticked once per CPU master cycle by the
@@ -391,6 +402,8 @@ impl Machine {
             ram: Box::new([0u8; 0x10000]),
             clk: 0,
             cpu6510: Cpu6510::new(),
+            c64_core: c64_6510core::C64Core6510::new(),
+            c64_int: c64_6510core::IntStatus::new(),
             cpu: Cpu::default(),
             vic: VicII::new(),
             cia1: Cia::new(),
@@ -416,7 +429,7 @@ impl Machine {
     }
 
     /// Mirror the live Cpu6510 register state into the legacy `cpu` snapshot +
-    /// `clk` (the daemon reads from these). Call after any run.
+    /// `clk` (the daemon reads from these). Call after any ISOLATED run.
     fn sync_snapshot(&mut self) {
         self.cpu.pc = self.cpu6510.reg_pc;
         self.cpu.a = self.cpu6510.reg_a;
@@ -426,6 +439,38 @@ impl Machine {
         self.cpu.p = self.cpu6510.flags();
         self.cpu.cycles = self.cpu6510.clk;
         self.clk = self.cpu6510.clk;
+    }
+
+    /// Mirror the live VERBATIM SC core (`c64_core`) register state into the legacy
+    /// `cpu` snapshot + `clk`. Call after a FULL-machine run (run_for_full*). The
+    /// `p` snapshot uses the composite `status()` (= LOCAL_STATUS, flag_n/flag_z
+    /// folded in), matching the daemon's `flags()` semantics.
+    fn sync_snapshot_sc(&mut self) {
+        self.cpu.pc = self.c64_core.reg_pc;
+        self.cpu.a = self.c64_core.reg_a;
+        self.cpu.x = self.c64_core.reg_x;
+        self.cpu.y = self.c64_core.reg_y;
+        self.cpu.sp = self.c64_core.reg_sp;
+        self.cpu.p = self.c64_core.status();
+        self.cpu.cycles = self.c64_core.clk;
+        self.clk = self.c64_core.clk;
+        // Mirror the live SC-core registers into `cpu6510` too, so the daemon's
+        // direct `cpu6510.reg_pc / reg_sp / flags()` reads (session/state, the
+        // step/until loops, the monitor `r` dump) reflect the full-machine CPU
+        // without the daemon needing to know which core ran. The full-machine path
+        // never uses `cpu6510` for execution; this keeps its register view current.
+        self.cpu6510.reg_pc = self.c64_core.reg_pc;
+        self.cpu6510.reg_a = self.c64_core.reg_a;
+        self.cpu6510.reg_x = self.c64_core.reg_x;
+        self.cpu6510.reg_y = self.c64_core.reg_y;
+        self.cpu6510.reg_sp = self.c64_core.reg_sp;
+        // Decompose the composite status into cpu6510's reg_p + flag_n/flag_z
+        // shadow so its `flags()` getter recomposes the same byte.
+        let p = self.c64_core.status();
+        self.cpu6510.reg_p = p & !0xa2; // clear P_SIGN(0x80) | P_ZERO(0x02) shadows
+        self.cpu6510.flag_n = p & 0x80;
+        self.cpu6510.flag_z = if p & 0x02 != 0 { 0 } else { 1 };
+        self.cpu6510.clk = self.c64_core.clk;
     }
 
     /// Load 8 KiB KERNAL ROM into $E000-$FFFF (flat RAM for iso buses) AND the
@@ -482,6 +527,12 @@ impl Machine {
         let hi = self.ram[0xFFFC + 1] as u16;
         let pc = lo | (hi << 8);
         self.cpu6510.reset_to(pc);
+        // Reset the verbatim SC core to the SAME power-on state (full-machine path).
+        // The reset-vector read is performed here (not by an IK_RESET dispatch), so
+        // it is untraced — matching the boot golden, whose first record is the
+        // KERNAL reset entry (LDX #$FF @ $FCE2), not a vector fetch.
+        self.c64_core.reset_to(pc);
+        self.c64_int = c64_6510core::IntStatus::new();
         // ADR-011 RESOLVED (integration): the C64/VICE 6510 power-on leaves
         // P = $20 (P_UNUSED only) — the I flag is NOT set by reset. The KERNAL
         // reset routine's own `SEI` at $FCE4 sets I. The full-boot trace[0]
@@ -745,15 +796,15 @@ impl Machine {
     ) where
         F: FnMut(u16, u8, u8, u8, u8, u8, u64),
     {
-        let start = self.cpu6510.clk;
+        let start = self.c64_core.clk;
         let mut executed: u64 = 0;
         let table = self.cia_table.clone();
         // Seed CIA clocks from the live CPU clk so timer state machines run from
         // the right rclk.
-        self.cia1.clk = self.cpu6510.clk;
-        self.cia2.clk = self.cpu6510.clk;
+        self.cia1.clk = self.c64_core.clk;
+        self.cia2.clk = self.c64_core.clk;
         loop {
-            if self.cpu6510.clk.wrapping_sub(start) >= budget {
+            if self.c64_core.clk.wrapping_sub(start) >= budget {
                 break;
             }
             if executed >= max_instructions {
@@ -762,21 +813,29 @@ impl Machine {
             // Drive catches up to the current C64 clock BEFORE the instruction
             // (= integrated-session.ts:898 catchUpDrive). Advances the drive's
             // own clock via the PAL sync_factor.
-            let c64_clk_before = self.cpu6510.clk;
+            let c64_clk_before = self.c64_core.clk;
 
-            // Refresh cross-chip interrupt lines at the boundary: advance both
-            // CIA timers to the current clk so any underflow latches its ICR flag,
-            // then OR the level sources onto the CPU lines.
-            self.cia1.update_to(self.cpu6510.clk, &table);
-            self.cia2.update_to(self.cpu6510.clk, &table);
-            let irq = self.cia1.irq_asserted() || self.vic.irq_line;
-            self.cpu6510.set_irq_line(irq);
-            self.cpu6510.set_nmi_line(self.cia2.irq_asserted());
+            // Refresh cross-chip interrupt lines at the boundary into the verbatim
+            // core's IntStatus, per-source (= VICE: the CIA/VIC `set_int` has already
+            // stamped int_status by the time DO_INTERRUPT's interrupt_check_*_delay
+            // reads it). Advance both CIA timers to the current clk so any underflow
+            // latches its ICR flag, then route VIC∨CIA1 → IRQ (sources 0/1) and
+            // CIA2 → NMI (source 2), stamped at the boundary clk (= the old
+            // set_irq_line semantics, which stamped at self.clk; the SC core's
+            // set_irq/set_nmi re-stamp only on the nirq/nnmi 0→1 edge).
+            let now = self.c64_core.clk;
+            self.cia1.update_to(now, &table);
+            self.cia2.update_to(now, &table);
+            self.c64_int.set_irq(c64_6510core::INT_SRC_VIC, self.vic.irq_line, now);
+            self.c64_int.set_irq(c64_6510core::INT_SRC_CIA1, self.cia1.irq_asserted(), now);
+            self.c64_int.set_nmi(c64_6510core::INT_SRC_CIA2, self.cia2.irq_asserted(), now);
 
-            // Run a whole instruction over the FullBus (VIC ticked per cycle +
-            // CIAs in lockstep + IRQ/NMI sampled at the boundary).
+            // Run a whole instruction over the SC bus (the verbatim core threads the
+            // VIC tick + BA steal + interrupt-delay counters into every access).
             {
-                let mut bus = full::FullBus {
+                let core_pc: *const u16 = &self.c64_core.reg_pc;
+                let core_clk: *const u64 = &self.c64_core.clk;
+                let fb = full::FullBus {
                     ram: &mut self.ram,
                     basic_rom: &self.basic_rom,
                     kernal_rom: &self.kernal_rom,
@@ -792,7 +851,7 @@ impl Machine {
                     memconfig_table: &self.memconfig_table,
                     port_dir: self.port_dir,
                     port_data: self.port_data,
-                    clk: self.cpu6510.clk,
+                    clk: self.c64_core.clk,
                     cia2_pa_out: self.cia2_pa_out,
                     side_effects: Vec::new(),
                     read_side_effects: Vec::new(),
@@ -801,24 +860,27 @@ impl Machine {
                     keyboard: &self.keyboard,
                     drive_c64_ref: self.drive_c64_ref,
                 };
-                loop {
-                    self.cpu6510.execute_cycle(&mut bus, obs);
-                    if self.cpu6510.is_at_boundary() {
-                        break;
-                    }
-                }
+                let mut bus = full_sc::FullScBus {
+                    fb,
+                    obs,
+                    core_pc,
+                    core_clk,
+                    fetch: None,
+                    cur_op: (self.c64_core.reg_pc, 0),
+                };
+                full_sc::execute_one(&mut self.c64_core, &mut bus, &mut self.c64_int);
                 // Persist bus-mutated banking/port state back to the Machine.
-                self.memconfig = bus.config;
-                self.port_dir = bus.port_dir;
-                self.port_data = bus.port_data;
-                self.cia2_pa_out = bus.cia2_pa_out;
+                self.memconfig = bus.fb.config;
+                self.port_dir = bus.fb.port_dir;
+                self.port_data = bus.fb.port_data;
+                self.cia2_pa_out = bus.fb.cia2_pa_out;
                 // Persist the push-flush reference (the drive may have been advanced
                 // mid-instruction by a $DD00 access inside the FullBus).
-                self.drive_c64_ref = bus.drive_c64_ref;
+                self.drive_c64_ref = bus.fb.drive_c64_ref;
             }
             // Tick SID by this instruction's cycle cost — wall-clock batch tick
             // matching TS integrated-session.ts:946 `sid.tick(totalCycles)`.
-            let instruction_cycles = self.cpu6510.clk.wrapping_sub(c64_clk_before);
+            let instruction_cycles = self.c64_core.clk.wrapping_sub(c64_clk_before);
             self.sid.tick(instruction_cycles, &self.sid_regs);
 
             // Drive catches up to the NEW C64 clock AFTER the instruction (= TS
@@ -829,14 +891,14 @@ impl Machine {
             // instruction's $DD00 reads.
             self.drive8.iec_drv_port = self.iec.drv_port;
             self.drive8.iec_cpu_bus = self.iec.cpu_bus;
-            self.drive_c64_ref = self.drive8.catch_up_to(self.cpu6510.clk, self.drive_c64_ref);
+            self.drive_c64_ref = self.drive8.catch_up_to(self.c64_core.clk, self.drive_c64_ref);
             self.iec.drive_store_pb(self.drive8.via1_pb_iec_output());
             if let Some((pc, a, x, y, sp, p, drv_clk)) = self.drive8.sample_pc_change() {
                 on_drive_step(pc, a, x, y, sp, p, drv_clk);
             }
             executed += 1;
         }
-        self.sync_snapshot();
+        self.sync_snapshot_sc();
     }
 
     /// VIC-isolated run (= TS session/run with the VIC ticked per CPU cycle).
