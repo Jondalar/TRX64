@@ -58,7 +58,7 @@
     "checkpoint-ring"
   ],
   "note": "checkpoint-ring DONE (ADR-080): ring + checkpoint/* 6/7 + vic/inspect 3/9, cross-runtime shapes match, 189 tests. Deferred follow-ups: vic-inspect-engine (6 methods), checkpoint/thumbnails. PARALLEL: flash-cart-writable + drive-write-back still in worktrees. Main tree -> next: recorder/scenario (unblocked by checkpoint-ring).",
-  "updated": "2026-06-24T19:26:47Z",
+  "updated": "2026-06-24T19:36:00Z",
   "followups": [
     "render-verbatim (sprite collision $D01E/$D01F + grey-dot + per-cycle pixel pipeline)",
     "seven-game-gate (behavioral: run the 7 games like c64re)"
@@ -88,13 +88,13 @@
       "item": "flash-cart-writable",
       "worktree": "/Users/alex/Development/C64/Tools/trx64-wt-flash",
       "branch": "flash-cart-writable",
-      "started": "2026-06-24T19:21:09Z"
+      "started": "2026-06-24T19:36:00Z"
     },
     {
       "item": "drive-write-back",
       "worktree": "/Users/alex/Development/C64/Tools/trx64-wt-drive",
       "branch": "drive-write-back",
-      "started": "2026-06-24T19:21:09Z"
+      "started": "2026-06-24T19:36:00Z"
     }
   ]
 }
