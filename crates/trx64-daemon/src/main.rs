@@ -1702,6 +1702,98 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             }))
         }
 
+        // session/drive_status — drive LED/motor/track/PC + IEC bus snapshot
+        // (ws-server.ts:1499). c64re's vice probe lacks a motor flag and approximates
+        // motorOn from the LED; TRX64 is the mirror — the motor bit
+        // (rotation.byte_ready_active & BRA_MOTOR_ON) is public but the LED (VIA2 PB3)
+        // is not, so ledOn is derived from motorOn (DOS lights the LED while the motor
+        // spins — c64re's own stated rationale, inverted). rwMode defaults read.
+        // Shape matches the TS exactly.
+        "session/drive_status" => {
+            use trx64_core::rotation::BRA_MOTOR_ON;
+            let st = state.lock().unwrap();
+            let m = &st.session.machine;
+            let drv = &m.drive8;
+            let half_track = (drv.rotation.current_half_track & 0xff) as u64;
+            let track = half_track / 2;
+            let motor_on = (drv.rotation.byte_ready_active & BRA_MOTOR_ON) != 0;
+            let led_on = motor_on;
+            let led_pwm: u64 = if led_on { 1000 } else { 0 };
+            let drive_pc = drv.core.reg_pc as u64;
+            let c64_pc = m.cpu6510.reg_pc;
+            let dd00pra = m.cia2.peek(0xdd00) as u64;
+            let dd00ddr = m.cia2.peek(0xdd02) as u64;
+            // Transfer-mode heuristic (ws-server.ts:1551): KERNAL serial bands vs
+            // the drive idle wait-loop vs custom.
+            let transfer_mode = if (0xE000..=0xFFFF).contains(&c64_pc) {
+                "kernal"
+            } else if (0xF400..=0xF800).contains(&c64_pc) {
+                "kernal"
+            } else if (0xEBFD..=0xECC0).contains(&drv.core.reg_pc) {
+                "idle"
+            } else {
+                "custom"
+            };
+            Response::ok(id, json!({
+                "device": 8,
+                "ledOn": led_on,
+                "ledFlashing": false,
+                "ledPwm": led_pwm,
+                "motorOn": motor_on,
+                "rwMode": "read",
+                "halfTrack": half_track,
+                "track": track,
+                "sector": 0,
+                "drivePc": drive_pc,
+                "dd00": { "pra": dd00pra, "ddr": dd00ddr },
+                "transferMode": transfer_mode
+            }))
+        }
+
+        // session/cart_status — live cartridge status (ws-server.ts:1581). Returns
+        // null when no cart attached; else { type, bank, activity, booted, sourceName }.
+        // TRX64 has no write-LED generation counter, so activity is "read" when the
+        // cart is mapped (exrom==0 || game==0) else "idle"; booted is false (no
+        // cartBootedFrom tracking). Shape matches the TS.
+        "session/cart_status" => {
+            let st = state.lock().unwrap();
+            let m = &st.session.machine;
+            match m.cartridge.as_ref() {
+                None => Response::ok(id, Value::Null),
+                Some(cart) => {
+                    let type_str = mapper_type_str(cart.mapper_type());
+                    let bank = cart.get_state().current_bank as u64;
+                    let lines = cart.get_lines();
+                    let mapped = lines.exrom == 0 || lines.game == 0;
+                    let activity = if mapped { "read" } else { "idle" };
+                    let source_name = m
+                        .cartridge_image
+                        .as_ref()
+                        .map(|img| img.name.clone());
+                    Response::ok(id, json!({
+                        "type": type_str,
+                        "bank": bank,
+                        "activity": activity,
+                        "booted": false,
+                        "sourceName": source_name
+                    }))
+                }
+            }
+        }
+
+        // session/drive_power — drive 8 cold re-init (ws-server.ts:1620). Single
+        // press = cold reset of the drive 6502 (DOS re-runs power-on init). Returns
+        // { device, reinitialized, mode }.
+        "session/drive_power" => {
+            let mut st = state.lock().unwrap();
+            st.session.machine.drive8.cold_reset();
+            Response::ok(id, json!({
+                "device": 8,
+                "reinitialized": true,
+                "mode": "trx64"
+            }))
+        }
+
         "session/screenshot" => {
             let st = state.lock().unwrap();
             let (url, w, h) = render_screenshot(&st.session.machine, 1);
@@ -2711,6 +2803,24 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         other => {
             Response::err(id, -32601, format!("Method not found: {other}"))
         }
+    }
+}
+
+// ── Cartridge mapper-type → c64re string ──────────────────────────────────────
+
+/// Map a TRX64 [`trx64_core::cart::MapperType`] to the c64re
+/// HeadlessCartridgeMapperType string (cartridge.ts) the cart_status `type` field
+/// carries, so the wire value matches the TS daemon.
+fn mapper_type_str(t: trx64_core::cart::MapperType) -> &'static str {
+    use trx64_core::cart::MapperType::*;
+    match t {
+        Normal8k => "normal_8k",
+        Normal16k => "normal_16k",
+        Ultimax => "ultimax",
+        Ocean => "ocean",
+        MagicDesk => "magicdesk",
+        MagicDesk16 => "magicdesk16",
+        Unsupported => "cartridge",
     }
 }
 
