@@ -726,25 +726,28 @@ pub fn run_pending_alarms(
     offset: u64,
 ) {
     while clk > ctx.alarm_context.next_pending_alarm_clk {
-        // [SAFETY — parity TODO] The 1541 drive viacore still arms alarm deadlines
-        // u32-masked (`& 0xffff_ffff`) while the drive clock (`clk` here = drive
-        // core.clk) is u64-MONOTONIC. BUG-025/Spec-743 removed the u32 masks on the
-        // C64 core but did NOT extend that to the drive viacore. Once the drive clock
-        // crosses 2^32 (long run / warp / a checkpoint-restore over that boundary) the
-        // u32-range deadline is permanently unreachable → this loop "catches up" ~4
-        // billion times while HOLDING the state Mutex → the whole daemon wedges
-        // (observed: pause → scrub → run = dead VM, all WS handlers blocked). Bail on
-        // the impossible gap instead of hanging: the drive VIA alarms stall, but the
-        // C64 + daemon stay alive. REAL FIX = make the drive viacore u64-monotonic
-        // (remove the `& 0xffff_ffff` masks throughout; differential-test vs VICE).
+        // [SAFETY — belt-and-suspenders] FIXED: the drive viacore is now u64-monotonic
+        // — every ABSOLUTE clock/deadline mask (`& 0xffff_ffff`) was removed so alarm
+        // deadlines stay full u64, consistent with the u64-monotonic drive `core.clk`
+        // fed in as `clk` (Spec 743 / BUG-025 extended from the C64 core to the drive
+        // viacore; see `drive_via_alarm_fires_past_2pow32` repro). Previously the drive
+        // armed u32-masked deadlines, so once the drive clock crossed 2^32 a deadline
+        // truncated below `clk` and became permanently unreachable → this loop "caught
+        // up" ~4 billion times while HOLDING the state Mutex → the whole daemon wedged
+        // (pause → scrub → run = dead VM). With the masks gone that is unreachable in
+        // normal operation; this gap-bail is kept as a defensive backstop (e.g. a
+        // corrupt restored snapshot) so a bad deadline stalls the drive VIA alarms
+        // rather than hanging the daemon.
         if clk.wrapping_sub(ctx.alarm_context.next_pending_alarm_clk) > (1u64 << 31) {
             break;
         }
         // alarm.h:131-144 alarm_context_dispatch: fire the cached next-pending
-        // alarm, offset = u32(cpu_clk - next_pending_alarm_clk).
-        let cpu_clk = (clk + offset) & 0xffff_ffff;
+        // alarm. VICE: `alarm_context_dispatch(ctx, clk + offset)` then
+        // `offset = cpu_clk - next_pending_alarm_clk` — both full `CLOCK`
+        // (u64-monotonic), NO mask. Spec 743 drive-viacore u64.
+        let cpu_clk = clk + offset;
         let next_clk = ctx.alarm_context.next_pending_alarm_clk;
-        let off = cpu_clk.wrapping_sub(next_clk) & 0xffff_ffff;
+        let off = cpu_clk.wrapping_sub(next_clk);
         let idx = ctx.alarm_context.next_pending_alarm_idx;
         let id = ctx.alarm_context.pending_alarms[idx as usize].alarm;
         dispatch_alarm(ctx, backend, id, off);
@@ -778,7 +781,9 @@ fn alarm_set_if_not_pending(ctx: &mut ViaContext, id: AlarmId, cpu_clk: u64) {
 
 // PORT OF: viacore.ts:334-346 (schedule_t2_zero_alarm)
 fn schedule_t2_zero_alarm(ctx: &mut ViaContext, rclk: u64) {
-    ctx.t2zero = (rclk + ctx.t2cl as u64) & 0xffff_ffff;
+    // viacore.c:561 `via_context->t2zero = rclk + via_context->t2cl;` — t2zero is
+    // an absolute CLOCK deadline (no mask in VICE). Spec 743 drive-viacore u64.
+    ctx.t2zero = rclk + ctx.t2cl as u64;
     ctx.t2xx00 = true;
     ctx.alarm_context.alarm_unset(AlarmId::T2Underflow);
     ctx.alarm_context.alarm_set(AlarmId::T2Zero, ctx.t2zero);
@@ -799,8 +804,9 @@ fn setup_shifting(ctx: &mut ViaContext, rclk: u64) {
         VIA_ACR_SR_IN_PHI2 | VIA_ACR_SR_OUT_PHI2 => {
             if ctx.shift_state == FINISHED_SHIFTING {
                 ctx.shift_state = START_SHIFTING;
-                ctx.alarm_context
-                    .alarm_set(AlarmId::Phi2Sr, (rclk + 1) & 0xffff_ffff);
+                // viacore.c:622 `alarm_set(phi2_sr_alarm, rclk + 1)` — absolute
+                // CLOCK deadline, no mask. Spec 743 drive-viacore u64.
+                ctx.alarm_context.alarm_set(AlarmId::Phi2Sr, rclk + 1);
             }
         }
         VIA_ACR_SR_OUT_FREE_T2 => {
@@ -943,15 +949,18 @@ pub fn viacore_signal(ctx: &mut ViaContext, backend: &mut dyn ViaBackend, line: 
 // PORT OF: viacore.ts:516-811 (viacore_store)
 pub fn viacore_store(ctx: &mut ViaContext, backend: &mut dyn ViaBackend, addr: u16, byte: u8) {
     if ctx.rmw_flag != 0 {
-        ctx.clk = ctx.clk.wrapping_sub(1) & 0xffff_ffff;
+        // viacore.c:643-647 — `(*(clk_ptr))--; ... (*(clk_ptr))++;`. clk is an
+        // absolute u64-monotonic CLOCK, no mask. Spec 743 drive-viacore u64.
+        ctx.clk = ctx.clk.wrapping_sub(1);
         ctx.rmw_flag = 0;
         let last_read = ctx.last_read;
         viacore_store(ctx, backend, addr, last_read);
-        ctx.clk = ctx.clk.wrapping_add(1) & 0xffff_ffff;
+        ctx.clk = ctx.clk.wrapping_add(1);
     }
 
     // stores have a one-cycle offset if CLK++ happens before store
-    let rclk = ctx.clk.wrapping_sub(ctx.write_offset) & 0xffff_ffff;
+    // viacore.c:649 `rclk = *(clk_ptr) - write_offset;` — absolute CLOCK, no mask.
+    let rclk = ctx.clk.wrapping_sub(ctx.write_offset);
 
     let mut a = (addr & 0xf) as usize;
 
@@ -1063,8 +1072,12 @@ pub fn viacore_store(ctx: &mut ViaContext, backend: &mut dyn ViaBackend, addr: u
         VIA_T1CH => {
             ctx.via[VIA_T1LH] = v;
             update_via_t1_latch(ctx, rclk);
-            ctx.t1reload = (rclk + 1 + ctx.tal as u64 + FULL_CYCLE_2) & 0xffff_ffff;
-            ctx.t1zero = (rclk + 1 + ctx.tal as u64) & 0xffff_ffff;
+            // viacore.c:757-758 — t1reload/t1zero are absolute CLOCK deadlines
+            // (`rclk+1 + tal + FULL_CYCLE_2` / `rclk+1 + tal`), no mask. Spec 743.
+            // viacore.c:757-758 — t1reload/t1zero are absolute CLOCK deadlines
+            // (`rclk+1 + tal + FULL_CYCLE_2` / `rclk+1 + tal`), no mask. Spec 743.
+            ctx.t1reload = rclk + 1 + ctx.tal as u64 + FULL_CYCLE_2;
+            ctx.t1zero = rclk + 1 + ctx.tal as u64;
             ctx.alarm_context.alarm_set(AlarmId::T1Zero, ctx.t1zero);
             ctx.t1_pb7 = 0;
             ctx.ifr &= !VIA_IM_T1;
@@ -1088,7 +1101,9 @@ pub fn viacore_store(ctx: &mut ViaContext, backend: &mut dyn ViaBackend, addr: u
             ctx.t2cl = ctx.via[VIA_T2LL] & 0xff;
             ctx.t2ch = v & 0xff;
             if ctx.via[VIA_ACR] & VIA_ACR_T2_COUNTPB6 == 0 {
-                schedule_t2_zero_alarm(ctx, (rclk + 1) & 0xffff_ffff);
+                // viacore.c:816 `schedule_t2_zero_alarm(.., rclk + 1)` — absolute
+                // CLOCK arg, no mask. Spec 743 drive-viacore u64.
+                schedule_t2_zero_alarm(ctx, rclk + 1);
             }
             ctx.ifr &= !VIA_IM_T2;
             update_myviairq_rclk(ctx, backend, rclk);
@@ -1156,10 +1171,12 @@ pub fn viacore_store(ctx: &mut ViaContext, backend: &mut dyn ViaBackend, addr: u
                     };
                 }
                 VIA_ACR_SR_IN_PHI2 | VIA_ACR_SR_OUT_PHI2 => {
+                    // viacore.c:960 `alarm_set_if_not_pending(phi2_sr_alarm,
+                    // rclk + SR_PHI2_FIRST_OFFSET)` — absolute CLOCK, no mask.
                     alarm_set_if_not_pending(
                         ctx,
                         AlarmId::Phi2Sr,
-                        (rclk + SR_PHI2_FIRST_OFFSET) & 0xffff_ffff,
+                        rclk + SR_PHI2_FIRST_OFFSET,
                     );
                 }
                 VIA_ACR_SR_IN_CB1 | VIA_ACR_SR_OUT_CB1 => {
@@ -1175,7 +1192,9 @@ pub fn viacore_store(ctx: &mut ViaContext, backend: &mut dyn ViaBackend, addr: u
                 let current = viacore_t2(ctx, rclk);
                 ctx.t2cl = (current & 0xff) as u8;
                 ctx.t2ch = ((current >> 8) & 0xff) as u8;
-                schedule_t2_zero_alarm(ctx, (rclk + t2_startup_delay) & 0xffff_ffff);
+                // viacore.c:979 `schedule_t2_zero_alarm(.., rclk + t2_startup_delay)`
+                // — absolute CLOCK arg, no mask. Spec 743 drive-viacore u64.
+                schedule_t2_zero_alarm(ctx, rclk + t2_startup_delay);
             }
 
             ctx.via[a] = v;
@@ -1431,29 +1450,32 @@ pub fn viacore_set_sr(ctx: &mut ViaContext, backend: &mut dyn ViaBackend, data: 
 
 // PORT OF: viacore.ts:1054-1079 (viacore_t1_zero_alarm)
 pub fn viacore_t1_zero_alarm(ctx: &mut ViaContext, backend: &mut dyn ViaBackend, offset: u64) {
-    let rclk = ctx.clk.wrapping_sub(offset) & 0xffff_ffff;
+    // viacore.c:1196 `rclk = *(clk_ptr) - offset;` — absolute CLOCK, no mask. Spec 743.
+    let rclk = ctx.clk.wrapping_sub(offset);
 
     if ctx.via[VIA_ACR] & VIA_ACR_T1_FREE_RUN == 0 {
         // one-shot
         ctx.alarm_context.alarm_unset(AlarmId::T1Zero);
         ctx.t1zero = 0;
     } else {
-        // continuous
+        // continuous — viacore.c:1212 `t1zero += full_cycle;` absolute CLOCK, no mask.
         let full_cycle = ctx.tal as u64 + FULL_CYCLE_2;
-        ctx.t1zero = (ctx.t1zero + full_cycle) & 0xffff_ffff;
+        ctx.t1zero += full_cycle;
         ctx.alarm_context.alarm_set(AlarmId::T1Zero, ctx.t1zero);
     }
 
     ctx.t1_pb7 ^= 0x80;
     ctx.ifr |= VIA_IM_T1;
-    update_myviairq_rclk(ctx, backend, (rclk + 1) & 0xffff_ffff);
+    // viacore.c:1222 `update_myviairq_rclk(.., rclk + 1)` — absolute CLOCK, no mask.
+    update_myviairq_rclk(ctx, backend, rclk + 1);
 }
 
 // PORT OF: viacore.ts:1082-1104 (viacore_t2_zero_alarm)
 pub fn viacore_t2_zero_alarm(ctx: &mut ViaContext, backend: &mut dyn ViaBackend, offset: u64) {
-    let rclk = ctx.clk.wrapping_sub(offset) & 0xffff_ffff;
+    // viacore.c rclk = *(clk_ptr) - offset — absolute CLOCK, no mask. Spec 743.
+    let rclk = ctx.clk.wrapping_sub(offset);
 
-    // T2 low underflow always decreases T2 high
+    // T2 low underflow always decreases T2 high (8-bit register, keep & 0xff)
     ctx.t2ch = ctx.t2ch.wrapping_sub(1) & 0xff;
 
     if ctx.t2ch == 0xff && ctx.t2_irq_allowed {
@@ -1463,8 +1485,9 @@ pub fn viacore_t2_zero_alarm(ctx: &mut ViaContext, backend: &mut dyn ViaBackend,
     }
 
     ctx.alarm_context.alarm_unset(AlarmId::T2Zero);
+    // alarm_set(t2_underflow_alarm, rclk + 1) — absolute CLOCK deadline, no mask.
     ctx.alarm_context
-        .alarm_set(AlarmId::T2Underflow, (rclk + 1) & 0xffff_ffff);
+        .alarm_set(AlarmId::T2Underflow, rclk + 1);
 }
 
 // PORT OF: viacore.ts:1107-1149 (viacore_t2_underflow_alarm)
@@ -1473,7 +1496,8 @@ pub fn viacore_t2_underflow_alarm(
     _backend: &mut dyn ViaBackend,
     offset: u64,
 ) {
-    let rclk = ctx.clk.wrapping_sub(offset) & 0xffff_ffff;
+    // viacore.c rclk = *(clk_ptr) - offset — absolute CLOCK, no mask. Spec 743.
+    let rclk = ctx.clk.wrapping_sub(offset);
     // TS: `let next_alarm = 0;` then every branch reassigns (viacore.ts:1113).
     #[allow(unused_assignments)]
     let mut next_alarm: u64 = 0;
@@ -1482,13 +1506,13 @@ pub fn viacore_t2_underflow_alarm(
         // 8-bit timer (SR-controlled)
         ctx.t2cl = ctx.via[VIA_T2LL] & 0xff;
         next_alarm = ctx.via[VIA_T2LL] as u64 + FULL_CYCLE_2;
-        ctx.alarm_context
-            .alarm_set(AlarmId::T2Shift, (rclk + 1) & 0xffff_ffff);
+        // alarm_set(t2_shift_alarm, rclk + 1) — absolute CLOCK deadline, no mask.
+        ctx.alarm_context.alarm_set(AlarmId::T2Shift, rclk + 1);
     } else if is_sr_free_running(ctx) {
         ctx.t2cl = ctx.via[VIA_T2LL] & 0xff;
         next_alarm = ctx.via[VIA_T2LL] as u64 + FULL_CYCLE_2;
-        ctx.alarm_context
-            .alarm_set(AlarmId::T2Shift, (rclk + 1) & 0xffff_ffff);
+        // alarm_set(t2_shift_alarm, rclk + 1) — absolute CLOCK deadline, no mask.
+        ctx.alarm_context.alarm_set(AlarmId::T2Shift, rclk + 1);
     } else {
         // 16-bit timer mode
         ctx.t2cl = 0xff;
@@ -1496,7 +1520,8 @@ pub fn viacore_t2_underflow_alarm(
     }
 
     if next_alarm != 0 {
-        ctx.t2zero = (ctx.t2zero + next_alarm) & 0xffff_ffff;
+        // t2zero += next_alarm — absolute CLOCK deadline, no mask. Spec 743.
+        ctx.t2zero += next_alarm;
         ctx.t2xx00 = true;
         ctx.alarm_context.alarm_set(AlarmId::T2Zero, ctx.t2zero);
     } else {
@@ -1508,7 +1533,8 @@ pub fn viacore_t2_underflow_alarm(
 
 // PORT OF: viacore.ts:1152-1191 (do_shiftregister)
 fn do_shiftregister(ctx: &mut ViaContext, backend: &mut dyn ViaBackend, offset: u64) {
-    let rclk = ctx.clk.wrapping_sub(offset) & 0xffff_ffff;
+    // viacore.c rclk = *(clk_ptr) - offset — absolute CLOCK, no mask. Spec 743.
+    let rclk = ctx.clk.wrapping_sub(offset);
     if ctx.shift_state >= FINISHED_SHIFTING {
         return;
     }
@@ -1558,10 +1584,12 @@ pub fn viacore_t2_shift_alarm(ctx: &mut ViaContext, backend: &mut dyn ViaBackend
 
 // PORT OF: viacore.ts:1206-1219 (viacore_phi2_sr_alarm)
 pub fn viacore_phi2_sr_alarm(ctx: &mut ViaContext, backend: &mut dyn ViaBackend, offset: u64) {
-    let rclk = ctx.clk.wrapping_sub(offset) & 0xffff_ffff;
+    // viacore.c rclk = *(clk_ptr) - offset — absolute CLOCK, no mask. Spec 743.
+    let rclk = ctx.clk.wrapping_sub(offset);
     do_shiftregister(ctx, backend, offset);
+    // alarm_set(phi2_sr_alarm, rclk + SR_PHI2_NEXT_OFFSET) — absolute CLOCK, no mask.
     ctx.alarm_context
-        .alarm_set(AlarmId::Phi2Sr, (rclk + SR_PHI2_NEXT_OFFSET) & 0xffff_ffff);
+        .alarm_set(AlarmId::Phi2Sr, rclk + SR_PHI2_NEXT_OFFSET);
 }
 
 // =============================================================================

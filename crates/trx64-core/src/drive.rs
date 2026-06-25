@@ -1195,6 +1195,104 @@ mod tests {
         assert!(!irq.active, "IRQ line drops once IFR T1 cleared");
     }
 
+    /// REPRO for the drive-viacore u32-deadline wedge (Spec 743 drive-viacore).
+    ///
+    /// The 1541 drive clock (`core.clk`, fed verbatim into `run_pending_alarms`) is
+    /// u64-MONOTONIC. Before the fix the drive viacore armed alarm DEADLINES
+    /// `& 0xffff_ffff` (u32). Once the drive clock crosses 2^32, the masked deadline
+    /// truncates into the low u32 range and becomes permanently unreachable
+    /// (`next_pending_alarm_clk` ~2^32 below `clk`), so `run_pending_alarms` either
+    /// spins ~4 billion catch-up iterations or trips the safety guard and the alarm
+    /// NEVER fires. This test programs a VIA2 T1 timer with the clock already past
+    /// 2^32 and asserts the alarm both RETURNS and FIRES (no spin, deadline > 2^32).
+    ///
+    /// Before fix: deadline masked into low u32 → safety guard `break`s → no IRQ →
+    /// `irq.active` assertion FAILS (and without the guard, this loop would hang).
+    /// After fix: deadline is full u64 → alarm dispatches → IRQ asserts.
+    #[test]
+    fn drive_via_alarm_fires_past_2pow32() {
+        use crate::viacore::{
+            self as vc, Via2Irq, Via2dBackend, ViaContext, VIA_ACR_T1_FREE_RUN, VIA_IM_T1,
+        };
+        // Base clock already PAST 2^32 — the exact wedge condition from the daemon
+        // (long run / warp / a checkpoint-restore over the 2^32 boundary).
+        const BASE: u64 = 0x1_0000_5000;
+        const LATCH: u64 = 0x10;
+
+        let mut ctx = new_via2_ctx();
+        let mut irq = Via2Irq::new();
+        let mut rot = Rotation::new();
+        // Power-on viacore_reset at the post-2^32 clock.
+        ctx.clk = BASE;
+        {
+            let mut b = Via2dBackend {
+                drive: &mut rot,
+                number: 0,
+                irq: &mut irq,
+                pending_set_overflow: false,
+                has_image: false,
+            };
+            vc::viacore_reset(&mut ctx, &mut b);
+        }
+        let store =
+            |ctx: &mut ViaContext, irq: &mut Via2Irq, rot: &mut Rotation, addr, val, clk| {
+                ctx.clk = clk;
+                let mut b = Via2dBackend {
+                    drive: rot,
+                    number: 0,
+                    irq,
+                    pending_set_overflow: false,
+                    has_image: false,
+                };
+                vc::viacore_store(ctx, &mut b, addr, val);
+            };
+        store(&mut ctx, &mut irq, &mut rot, 0x1C0B, VIA_ACR_T1_FREE_RUN, BASE + 10); // ACR T1 free-run
+        store(&mut ctx, &mut irq, &mut rot, 0x1C06, LATCH as u8, BASE + 11); // T1LL
+        store(&mut ctx, &mut irq, &mut rot, 0x1C07, 0x00, BASE + 12); // T1LH
+        store(&mut ctx, &mut irq, &mut rot, 0x1C0E, 0xC0, BASE + 13); // IER: enable T1
+        store(&mut ctx, &mut irq, &mut rot, 0x1C05, 0x00, BASE + 14); // T1CH arms the timer
+
+        // The armed deadline MUST be full u64 (> 2^32), consistent with the u64 clock.
+        // Before the fix it would be masked into the low u32 range (< 2^32).
+        let deadline = ctx.alarm_context.next_pending_alarm_clk;
+        assert!(
+            deadline > (1u64 << 32),
+            "T1 deadline must stay a full u64 past 2^32 (was {deadline:#x}); a low-u32 \
+             value means an absolute-clock mask survived"
+        );
+        assert!(!irq.active, "no IRQ before the timer underflows");
+
+        // Dispatch alarms with the clock advanced just past the deadline. This MUST
+        // return (no infinite catch-up / no safety-guard bail) AND fire the alarm.
+        let run_clk = BASE + 14 + LATCH + 4;
+        {
+            ctx.clk = run_clk;
+            let mut b = Via2dBackend {
+                drive: &mut rot,
+                number: 0,
+                irq: &mut irq,
+                pending_set_overflow: false,
+                has_image: false,
+            };
+            vc::run_pending_alarms(&mut ctx, &mut b, run_clk, 0);
+        }
+
+        assert!(
+            irq.active,
+            "T1 underflow must assert the IRQ even with the drive clock past 2^32 \
+             (a low-u32 deadline would have been skipped by the safety guard)"
+        );
+        assert_ne!(ctx.ifr & VIA_IM_T1, 0, "IFR T1 flag set past 2^32");
+        // The free-run alarm re-armed itself to the NEXT deadline, also > 2^32 and
+        // ahead of the current clock — i.e. consistent, no permanent stall.
+        let next = ctx.alarm_context.next_pending_alarm_clk;
+        assert!(
+            next > run_clk && next > (1u64 << 32),
+            "re-armed deadline must advance past clk and stay full u64 \
+             (next={next:#x}, clk={run_clk:#x})"
+        );
+    }
+
     #[test]
     fn drive_bus_rom_read() {
         let mut d = Drive1541::new();
