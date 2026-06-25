@@ -46,7 +46,6 @@ use tokio_tungstenite::tungstenite::Message;
 use trx64_core::render::COLODORE;
 use trx64_core::resid_audio::SidAudioEngine;
 use trx64_core::resid_ffi::ResidConfig;
-use trx64_core::NullSink;
 
 use crate::SharedState;
 
@@ -357,14 +356,19 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
         let (vic_msg, audio_msg) = {
             let mut st = state.lock().unwrap();
 
-            let clk_before = st.session.machine.c64_core.clk;
-            {
-                let mut sink = NullSink;
-                st.session
-                    .machine
-                    .run_for_full(if warp { CYC_PER_FRAME * 8 } else { CYC_PER_FRAME }, &mut sink, |_, _, _, _, _, _, _| {});
-            }
-            let d_cycles = st.session.machine.c64_core.clk.wrapping_sub(clk_before) as u32;
+            // BREAKPOINT / OBSERVER / JAM-aware per-frame advance (audit
+            // ws-session-debug-0). The stream loop is the SOLE machine driver under
+            // --stream, so the free-run advance must gate breakpoints/observers/JAM
+            // every frame exactly like the TS controller tick (runtime-controller.ts:
+            // 670-806) — a bare `run_for_full` never halts, so a bp set on the live
+            // machine never stopped it. `stream_debug_gated_advance` does the gated
+            // advance and, on a halt, sets `running=false` (freezes the picture) +
+            // server-PUSHes debug/breakpoint_hit|observer_hit + debug/stopped, then
+            // returns the cycles ACTUALLY advanced (a halt may stop mid-frame, so
+            // audio runs over exactly that window). When no bp/observer is armed it
+            // is the historical plain advance (byte-identical).
+            let budget = if warp { CYC_PER_FRAME * 8 } else { CYC_PER_FRAME };
+            let d_cycles = crate::stream_debug_gated_advance(&mut st, budget);
             let cpu_cycle = st.session.machine.c64_core.clk as u32;
 
             // Audio: drain this frame's writes (CPU order) into the engine, close

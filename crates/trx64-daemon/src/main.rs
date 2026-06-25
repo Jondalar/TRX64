@@ -317,6 +317,12 @@ struct State {
     /// module-level `bankDefaults` / `memCursors` / `disasmCursors` / `sidefxOn`).
     /// The daemon holds one session, so these are single-valued (not per-id maps).
     mon: MonitorState,
+    /// Spec 764 — JAM (KIL) auto-break edge for the per-frame stream driver (=
+    /// runtime-controller.ts:793 `brokeOnJam`). A jammed CPU keeps cycling clk with
+    /// PC frozen, so the free-run advance never aborts on it; the stream loop detects
+    /// the jammed state and drops into the monitor ONCE per episode. Re-armed when the
+    /// jam clears (or on a fresh run()).
+    stream_broke_on_jam: bool,
 }
 
 /// T2.8 — the monitor-shell.ts module-level per-session state, collapsed for the
@@ -1009,6 +1015,161 @@ fn run_debug_control(id: Value, st: &mut State, frame: u64, _is_continue: bool) 
             "controlOwner": control_owner
         }))
     }
+}
+
+/// Advance the machine by `budget` cycles for ONE stream-loop frame, but BREAKPOINT /
+/// OBSERVER / JAM-aware — the per-frame mirror of the TS controller `tick()`
+/// (runtime-controller.ts:670-806). Under `--stream` the stream loop is the SOLE
+/// machine driver; a breakpoint set on a free-RUNNING machine never halted because
+/// the loop advanced with a bare `run_for_full` (no gates). This helper LIFTS the
+/// bp/observer/JAM-halt + broadcast behavior out of the one-shot [`run_debug_control`]
+/// into the per-frame path:
+///
+/// * No breakpoints/watchpoints armed → plain full-machine advance (byte-identical
+///   to the historical `run_for_full`; the gates monomorphize away). This is the
+///   common case, so the no-debug stream is unchanged.
+/// * Armed → [`run_until_break`] self-halts at the first REAL hit; on a hit we set
+///   the session NOT running (freeze the picture), set the stop reason, server-PUSH
+///   `debug/breakpoint_hit`/`debug/observer_hit` AND `debug/stopped` (payload shapes
+///   1:1 with runtime-controller.ts:767/782 and the one-shot above), and drain
+///   observer side-effects — exactly as the one-shot does.
+/// * JAM (Spec 764) — a jammed CPU keeps cycling clk with PC frozen, so neither path
+///   aborts on it; detect it AFTER the advance, halt (running=false) and drop into
+///   the monitor ONCE per episode via `debug/stopped` (reason "jam"), re-arming the
+///   edge when the jam clears (runtime-controller.ts:791-807).
+///
+/// Returns the number of C64 cycles actually advanced this frame, so the caller can
+/// drive audio over exactly the window that ran (a halt may stop mid-frame).
+fn stream_debug_gated_advance(st: &mut State, budget: u64) -> u32 {
+    // Re-sync the observer registry from the bp surfaces (preserving live counts),
+    // exactly like the one-shot run_debug_control entry.
+    {
+        let State { breakpoints, observers: reg, .. } = &mut *st;
+        sync_observers(breakpoints, reg);
+    }
+
+    let clk_before = st.session.machine.c64_core.clk;
+
+    if !observers_armed(&st.observers) {
+        // ── No debug gate: plain full-machine advance (historical stream path). ──
+        let mut sink = NullSink;
+        st.session
+            .machine
+            .run_for_full(budget, &mut sink, |_, _, _, _, _, _, _| {});
+    } else {
+        // runtime-controller.ts:277 stepPastCurrentBreakpoint — if the PC currently
+        // sits ON an enabled exec breakpoint (e.g. we just halted there and the user
+        // resumed by leaving it running), advance one instruction first so this
+        // frame's advance does not immediately re-trip the same address.
+        {
+            let pc = st.session.machine.c64_core.reg_pc;
+            if st.breakpoints.entries.iter().any(|e| e.enabled && e.pc == pc) {
+                step_one_instruction(&mut st.session);
+            }
+        }
+        // ── Armed: bp/observer-gated segment run, self-halting at the first hit. ──
+        let run = {
+            let State { session, observers: reg, .. } = &mut *st;
+            run_until_break(session, reg, budget)
+        };
+        {
+            let State { breakpoints, observers: reg, .. } = &mut *st;
+            writeback_hits(breakpoints, reg);
+        }
+        // Drain observer side-effects accumulated this chunk (runtime-controller.ts:697-725)
+        // on every path (halt + budget-exhausted), matching the one-shot + the TS tick.
+        drain_and_broadcast_observer_log(st);
+
+        if run.halted {
+            // FREEZE: the stream loop gates the advance on `running`, so clearing it
+            // freezes the picture on the last presented frame (and silences audio),
+            // 1:1 with the TS tick setting runState→paused.
+            st.session.running = false;
+            let cycles = st.session.machine.clk;
+            st.ctrl_stop = Some(CtrlStop { reason: "breakpoint", pc: run.pc, cycles });
+            let bp_num = st
+                .breakpoints
+                .entries
+                .iter()
+                .find(|e| e.pc == run.pc)
+                .map(|e| e.num);
+            let mut stop = json!({
+                "reason": run.reason,
+                "pc": run.pc as u64,
+                "cycles": cycles,
+            });
+            if let Some(n) = bp_num {
+                stop["breakpointId"] = json!(n as u64);
+            }
+            if let Some(name) = &run.which {
+                stop["breakpoint"] = json!(name);
+            }
+            let registers = register_dump(&st.session);
+            // The specific hit (exec → breakpoint_hit, watchpoint → observer_hit),
+            // payload 1:1 with runtime-controller.ts:760-781 + the one-shot above.
+            if run.reason == "observer" {
+                st.notify.broadcast("debug/observer_hit", json!({
+                    "session_id": st.session.id,
+                    "pc": run.pc as u64,
+                    "cycles": cycles,
+                    "observer": run.which.clone(),
+                    "message": Value::Null,
+                    "registers": registers.clone(),
+                }));
+            } else {
+                st.notify.broadcast("debug/breakpoint_hit", json!({
+                    "session_id": st.session.id,
+                    "pc": run.pc as u64,
+                    // bpNumForAddr returns 0 (NOT null) when no numbered bp matches.
+                    "num": bp_num.unwrap_or(0) as u64,
+                    "cycles": cycles,
+                    "registers": registers.clone(),
+                }));
+            }
+            // ALSO debug/stopped so a passive UI freezes the run-state on any halt
+            // (runtime-controller.ts:768/782).
+            st.notify.broadcast("debug/stopped", json!({
+                "session_id": st.session.id,
+                "stop": stop,
+                "registers": registers,
+            }));
+            // A bp halt clears the JAM edge (a fresh resume should be able to re-break).
+            st.stream_broke_on_jam = false;
+            return st.session.machine.c64_core.clk.wrapping_sub(clk_before) as u32;
+        }
+    }
+
+    // ── Spec 764 — JAM (KIL) auto-break (runtime-controller.ts:791-807). A jammed
+    // CPU keeps cycling clk with PC frozen, so neither advance path aborts on it.
+    // Detect the jammed state here; halt (a jammed CPU makes no progress) and drop
+    // into the monitor ONCE per episode, re-arming when the jam clears. ──
+    if st.session.machine.c64_core.is_jammed {
+        st.session.running = false;
+        if !st.stream_broke_on_jam {
+            st.stream_broke_on_jam = true;
+            let pc = st.session.machine.c64_core.reg_pc;
+            let cycles = st.session.machine.clk;
+            let opcode = st.session.machine.read_full(pc) & 0xff;
+            st.ctrl_stop = Some(CtrlStop { reason: "jam", pc, cycles });
+            let stop = json!({
+                "reason": "jam",
+                "pc": pc as u64,
+                "cycles": cycles,
+                "opcode": opcode as u64,
+            });
+            let registers = register_dump(&st.session);
+            st.notify.broadcast("debug/stopped", json!({
+                "session_id": st.session.id,
+                "stop": stop,
+                "registers": registers,
+            }));
+        }
+    } else {
+        // Not jammed — re-arm the edge for the next episode.
+        st.stream_broke_on_jam = false;
+    }
+
+    st.session.machine.c64_core.clk.wrapping_sub(clk_before) as u32
 }
 
 /// SEGMENT-RUN the machine with the registry driving the core's debug gates,
@@ -7587,6 +7748,7 @@ async fn main() {
         checkpoint_thumbs: std::collections::HashMap::new(),
         checkpoint_thumb_order: std::collections::VecDeque::new(),
         mon: MonitorState::new(),
+        stream_broke_on_jam: false,
     }));
 
     // The singleton live A/V stream hub (ADR-073): one pacing loop drives the
@@ -7671,6 +7833,7 @@ mod batch1_tests {
             checkpoint_thumbs: std::collections::HashMap::new(),
             checkpoint_thumb_order: std::collections::VecDeque::new(),
             mon: MonitorState::new(),
+            stream_broke_on_jam: false,
         }))
     }
 
