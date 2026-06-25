@@ -99,6 +99,43 @@ const SCRAMBLE_D64 = (() => {
   try { return readFileSync(`${SAMPLES}/scramble_infinity.d64`); } catch { return Buffer.alloc(0); }
 })();
 
+// A minimal, valid EasyFlash .crt (hw type 0x20, EXROM=1/GAME=0 = ultimax boot,
+// 1 × 16K CHIP at bank 0 / load $8000). There is NO .crt in the samples corpus, so a
+// CRT case generates one here. EasyFlash is a WRITABLE mapper (AM29F040B flash), so
+// both daemons treat it as a real live attach + writable-flash target. Mirrors the
+// TRX64 `build_crt_for_test(32, 1, 0, ...)` daemon-test layout: 64-byte header
+// ("C64 CARTRIDGE   " + headerLen 0x40 + ver 0x0100 + hw + exrom + game + 6 rsvd +
+// 32-byte name), then "CHIP" packets (packetLen 0x10+data, type 0, bank, load, size).
+function makeEasyFlashCrt(name = "EF"): Buffer {
+  const hdr = Buffer.alloc(0x40);
+  hdr.write("C64 CARTRIDGE   ", 0, "ascii");
+  hdr.writeUInt32BE(0x40, 0x10);   // header length
+  hdr.writeUInt16BE(0x0100, 0x14); // version
+  hdr.writeUInt16BE(32, 0x16);     // hardware type = 0x20 = EasyFlash
+  hdr.writeUInt8(1, 0x18);         // EXROM (1 = inactive at power; EasyFlash boots ultimax)
+  hdr.writeUInt8(0, 0x19);         // GAME  (0)
+  hdr.write(name, 0x20, "ascii");  // 32-byte cartridge name
+  // Bank 0: 16K of erased flash (0xFF) + a ROMH reset vector ($8000) so a boot is sane.
+  const bank0 = Buffer.alloc(0x4000, 0xff);
+  bank0[0x3ffc] = 0x00; bank0[0x3ffd] = 0x80;
+  const chip = Buffer.alloc(0x10);
+  chip.write("CHIP", 0, "ascii");
+  chip.writeUInt32BE(0x10 + bank0.length, 4); // packet length = header + data
+  chip.writeUInt16BE(0, 8);                    // chip type 0 = ROM/flash
+  chip.writeUInt16BE(0, 10);                   // bank 0
+  chip.writeUInt16BE(0x8000, 12);              // load address
+  chip.writeUInt16BE(bank0.length, 14);        // ROM image size
+  return Buffer.concat([hdr, chip, bank0]);
+}
+const EASYFLASH_CRT = makeEasyFlashCrt();
+
+const SCRAMBLE_D64_B = (() => {
+  // A SECOND seed disk for the recents-ordering case (mount A then B → B newest).
+  // Reuse the scramble image bytes under a different name; the recents store keys on
+  // the (distinct) path, so identical bytes are fine — only the basename/order matter.
+  return SCRAMBLE_D64;
+})();
+
 const CASES: ConfCase[] = [
   // ── P0: ws-session-debug-0 — free-run breakpoint under --stream ────────────
   // Set a breakpoint on the BASIC idle loop ($E5CD, hit every iteration) while the
@@ -169,6 +206,165 @@ const CASES: ConfCase[] = [
         // The just-mounted disk must appear in recents (ingress addRecent).
         recentIncludesMounted: recentArr.some((r) => norm(r?.path) === "fixtureA.d64"),
       };
+    },
+  },
+
+  // ── P1: ws-media-1 — CRT mount routes through the ingress boundary ──────────
+  // (Audit theme T3.) media/mount a .crt. TS's adaptMount routes a CRT through the
+  // SAME ingress as a disk (ingestMedia kind:crt, ws-server.ts:1776-1789): it
+  // captures a before/after checkpoint so the cart attach is replayable. P0-B
+  // (1f533ee) routed the TRX64 CRT mount/swap branches through the ingress too; this
+  // case is the differential REGRESSION GUARD. Signal: mount the generated EasyFlash
+  // .crt and report whether the mount event carries a non-null checkpoint id (the
+  // tell that it went through the checkpointing ingress, not a bare attach).
+  // BOTH runtimes: mountCapturedCheckpoint=true. (Audit ws-media-1.)
+  {
+    id: "ws-media-1",
+    severity: "P1",
+    title: "CRT mount routes through the ingress boundary (checkpoint captured)",
+    spawn: { seedFiles: [{ rel: "fixture.crt", bytes: EASYFLASH_CRT }] },
+    async signal(c, d) {
+      const sid = await liveSession(c);
+      const crtPath = `${d.projectDir}/fixture.crt`;
+      const mountResp = (await c.call("media/mount", { session_id: sid, path: crtPath, slot: 0 })) as any;
+      // A fresh session's first medium is the experiment ROOT — only an after-
+      // checkpoint is captured (before is omitted, no prior medium). So the tell is
+      // checkpointAfterId, exactly as in ws-media-0.
+      const cpId = mountResp?.event?.checkpointAfterId ?? mountResp?.event?.checkpointBeforeId ?? null;
+      return {
+        // Boolean: was the CRT mount routed through the checkpointing ingress?
+        mountCapturedCheckpoint: cpId != null,
+      };
+    },
+  },
+
+  // ── P1: ws-media-8 — media/recent overlays the persisted recents store ──────
+  // (Audit theme T3.) TS's media/recent overlays a GLOBAL persisted recents store
+  // (recent-files.ts getRecent: newest-first, max 10, each carrying a `mountedAt`
+  // timestamp; addRecent stamps it on every ingest) AHEAD of the dir scans
+  // (ws-server.ts:1809-1887). TRX64's scan_recent_media was project+samples dir scan
+  // ONLY (alphabetical, no store, no mountedAt). Fix: maintain a recents store updated
+  // on every mount (newest-first, cap 10, mountedAt), overlaid ahead of the dir scan,
+  // 1:1 with recent-files.ts. Signal: mount disk A then disk B (two seed disks), then
+  // read media/recent — assert the FIRST entry is the most-recently-mounted (B) and
+  // entries carry a mountedAt field. TS: {topIsNewest:true, hasMountedAt:true}; TRX64
+  // (before fix): {false,false}. C64RE_RECENT_FILE points at a per-daemon temp store so
+  // neither runtime touches the user's real recents (and the two daemons can't share).
+  {
+    id: "ws-media-8",
+    severity: "P1",
+    title: "media/recent overlays the persisted recents store (newest-first + mountedAt)",
+    spawn: {
+      seedFiles: [
+        { rel: "diskA.d64", bytes: SCRAMBLE_D64 },
+        { rel: "diskB.d64", bytes: SCRAMBLE_D64_B },
+      ],
+      // Isolate the global recents store per daemon (env applied to BOTH kinds) so
+      // the user's real ~/.config/c64re/recent-media.json is never read or written,
+      // and each daemon starts from an empty store.
+      env: { C64RE_RECENT_FILE: `/tmp/trx64-oracle-recent-${process.pid}-${Date.now()}.json` },
+    },
+    async signal(c, d) {
+      const sid = await liveSession(c);
+      // Mount A first, then B — B is the most-recently-mounted, so it must top recents.
+      await c.call("media/mount", { session_id: sid, path: `${d.projectDir}/diskA.d64`, slot: 8 });
+      await c.call("media/mount", { session_id: sid, path: `${d.projectDir}/diskB.d64`, slot: 8 });
+      const recent = (await c.call("media/recent", {})) as any;
+      const arr: any[] = Array.isArray(recent) ? recent : recent?.recent ?? recent?.result ?? [];
+      const norm = (p: string) => (p ? p.split("/").pop() : p);
+      return {
+        // The most-recently-mounted disk (B) must be the FIRST recents entry.
+        topIsNewest: arr.length > 0 && norm(arr[0]?.path) === "diskB.d64",
+        // Every store-sourced entry carries a mountedAt timestamp (recent-files.ts).
+        hasMountedAt: arr.length > 0 && typeof arr[0]?.mountedAt === "string" && arr[0].mountedAt.length > 0,
+      };
+    },
+  },
+
+  // ── P1: ws-media-14 — cart eject resumes with the LIVE pacing, not pal/1 ─────
+  // (Audit theme T3.) A cartridge eject is a power-cycle that ends RUNNING. TS routes
+  // it through the ingress (checkpoint before/after) and resumes via ctrl.run() with
+  // the LIVE pacing — run() broadcasts debug/running carrying `this.pacing`, which is
+  // whatever set_pacing last selected (e.g. "warp"); ws-server.ts:1799-1807 →
+  // ingress.ts eject + run(). TRX64's cart eject (main.rs media/unmount cart branch)
+  // resumed running but broadcast a HARDCODED {mode:"pal",ratio:1}. Fix: broadcast the
+  // live st.pacing_mode/ratio. Signal: mount a cart, set_pacing warp, collectNotes,
+  // media/unmount the cart, and read {ejectCheckpoint: event.checkpointAfterId != null,
+  // resumePacing: the debug/running broadcast's pacing.mode}. TS: {true,"warp"}; TRX64
+  // (before fix): {true,"pal"} (the checkpoint half is the P0-B regression guard).
+  {
+    id: "ws-media-14",
+    severity: "P1",
+    title: "cart eject resumes with the live pacing (not hardcoded pal/1) + checkpoints",
+    spawn: { seedFiles: [{ rel: "fixture.crt", bytes: EASYFLASH_CRT }] },
+    async signal(c, d) {
+      const sid = await liveSession(c);
+      const crtPath = `${d.projectDir}/fixture.crt`;
+      await c.call("media/mount", { session_id: sid, path: crtPath, slot: 0 });
+      // Select WARP pacing — the eject must resume at THIS pace, not reset to pal.
+      await c.call("session/set_pacing", { session_id: sid, mode: "warp" });
+      const sink = collectNotes(c);
+      const ejectResp = (await c.call("media/unmount", { session_id: sid, slot: 0 })) as any;
+      await sleep(300); // let the debug/running broadcast land
+      sink.off();
+      // The cart-eject power-cycle resumes via a debug/running broadcast carrying the
+      // live pacing (the LAST debug/running pushed during the eject window).
+      const running = sink.notes.filter((n) => n.method === "debug/running");
+      const lastRunning = running[running.length - 1]?.params as any;
+      const cpId = ejectResp?.event?.checkpointAfterId ?? ejectResp?.event?.checkpointBeforeId ?? null;
+      return {
+        // Regression guard (P0-B): the eject is checkpointed (replayable).
+        ejectCheckpoint: cpId != null,
+        // The behavioural signal: the resume keeps the live pacing (warp), not pal.
+        resumePacing: lastRunning?.pacing?.mode ?? null,
+      };
+    },
+  },
+
+  // ── P1: ws-media-3 + background-workers-async-10 — cart auto-persist fires ───
+  // while PAUSED (wall-clock cadence, not run-state-gated). (Audit theme T3.) TS's
+  // cart auto-persist runs on an INDEPENDENT 1 s setInterval (runtime-controller.ts:
+  // 219-226 → maybeAutoPersistCart) that fires regardless of run-state, with a
+  // WALL-CLOCK debounce (Date.now() - settleAt ≥ CART_AUTOPERSIST_DEBOUNCE_MS). So a
+  // flash delta then pause/JAM/bp before the debounce STILL reaches the host .crt.
+  // TRX64 drove the persist ONLY from the stream loop's `if running` block on a FRAME
+  // counter (frame_seq advances only while running), so a dirty-then-pause never
+  // persisted. Fix: drive cart (+disk) auto-persist from a wall-clock cadence that
+  // fires regardless of run-state.
+  //
+  // BLOCKED by the oracle harness (NOT a TRX64 defect): to make the signal differential
+  // the case would have to DIRTY the cart flash through the WS surface (an AM29F040B
+  // AA/55/A0/<addr,data> program sequence routed through the cart mapper's write path),
+  // which no JSON WS method exposes — mem/poke does not reach the mapper write the way
+  // the running CPU does, and running real flash-programming code under the ~4 fps tsx
+  // oracle to a settled+paused state is far heavier than the 240 s gate budget. The fix
+  // is verified DIRECTLY on TRX64 (`ws_media_3_cart_autopersist_fires_while_paused`,
+  // main.rs tests): mount a writable EasyFlash, drive a real byte-program (dirty), PAUSE
+  // the machine (running=false), tick the wall-clock persist cadence past the debounce,
+  // and assert the host .crt FILE bytes changed — proving the persist no longer depends
+  // on the run-state. Re-arm if a WS method to drive a cart-mapper write (or a synthetic
+  // "dirty flash" hook) lands in the oracle.
+  {
+    id: "ws-media-3",
+    severity: "P1",
+    title: "cart flash auto-persist fires while PAUSED (wall-clock cadence, not if-running)",
+    blocked:
+      "Dirtying cart flash needs an AM29F040B program sequence through the mapper write " +
+      "path, which no JSON WS method exposes (mem/poke doesn't reach it) and which is far " +
+      "heavier than the gate budget under the ~4fps tsx oracle. Fix verified DIRECTLY on " +
+      "TRX64: ws_media_3_cart_autopersist_fires_while_paused (dirty flash → PAUSE → tick " +
+      "wall-clock persist cadence past the debounce → host .crt FILE bytes changed).",
+    spawn: { stream: true, seedFiles: [{ rel: "fixture.crt", bytes: EASYFLASH_CRT }] },
+    async signal(c, d) {
+      // Kept intact so the case re-arms once a cart-write WS method exists. This proxy
+      // can only observe the host file size (not a faithful dirty→paused→persist), so
+      // it is NOT a faithful signal — see `blocked`.
+      const sid = await liveSession(c);
+      const crtPath = `${d.projectDir}/fixture.crt`;
+      await c.call("media/mount", { session_id: sid, path: crtPath, slot: 0 });
+      await c.call("debug/pause", { session_id: sid }).catch(() => undefined);
+      await sleep(500);
+      return { hostCrtPresent: existsSync(crtPath) };
     },
   },
 

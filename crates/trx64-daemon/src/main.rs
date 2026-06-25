@@ -218,6 +218,15 @@ struct State {
     /// but pins only the last PINNED_MEDIA_EVENTS checkpoints; TRX64 has no per-event
     /// checkpoint pins to leak, so a simple length cap suffices).
     media_events: Vec<Value>,
+    /// Spec 265 / audit ws-media-8 — the recents store (= the c64re GLOBAL persisted
+    /// recent-media store, recent-files.ts). `add_recent_media` pushes on EVERY mount/
+    /// swap (newest-first, deduped by path, cap [`MAX_RECENT_MEDIA`]), stamping a
+    /// `mountedAt` ISO timestamp. `media/recent` overlays this AHEAD of the project +
+    /// samples dir scans (1:1 with ws-server.ts:1833-1839 §1, recents first). TRX64
+    /// keeps it IN-MEMORY per-daemon (no host-state write into the user's
+    /// ~/.config/c64re store — additive, no shared global side effects), so the
+    /// newest-first ordering + mountedAt overlay match TS without touching real files.
+    recent_media: Vec<RecentMedia>,
     /// Spec 271 — in-process batch registry (batchId → BatchEntry JSON). The c64re
     /// batch runner spawns N worker threads (scenario-pool); TRX64's daemon is
     /// single-threaded, so `batch/start` runs the scenarios SEQUENTIALLY through the
@@ -270,12 +279,14 @@ struct State {
     /// The mapper's monotonic writableGeneration() distinguishes "still being
     /// written" (gen moving → re-arm the settle window) from "settled" (gen stable
     /// for the debounce → write the flash back to the host .crt once via the same
-    /// persist path as eject). DEBOUNCE IS BY FRAME COUNT (not wall-clock), per the
-    /// stream-loop discipline. `cart_ap_seen_gen` = last gen observed;
-    /// `cart_ap_settle_frame` = the stream-loop frame at which it last changed;
+    /// persist path as eject). DEBOUNCE IS WALL-CLOCK ms (audit ws-media-3 /
+    /// background-workers-async-10) — 1:1 with the TS 1 s setInterval + Date.now()
+    /// debounce that fires regardless of run-state, so a dirty-then-pause STILL
+    /// reaches the host file. `cart_ap_seen_gen` = last gen observed;
+    /// `cart_ap_settle_at_ms` = the wall-clock ms at which it last changed;
     /// `cart_ap_done_gen` = the gen already written to the host file.
     cart_ap_seen_gen: u64,
-    cart_ap_settle_frame: u64,
+    cart_ap_settle_at_ms: u64,
     cart_ap_done_gen: u64,
     /// Disk lazy host-file writeback (parity-neutral enhancement — see report). TS
     /// writes the host .d64/.g64 EAGERLY at the GCR-data-writeback commit point
@@ -292,7 +303,7 @@ struct State {
     /// debouncing on the now-stable `disk.bytes` content hash even though the track
     /// is no longer dirty. Cleared after the host file is written.
     disk_ap_pending: bool,
-    disk_ap_settle_frame: u64,
+    disk_ap_settle_at_ms: u64,
     disk_ap_seen_hash: Option<String>,
     disk_ap_done_hash: Option<String>,
     /// Spec 705.B — auto-capture cadence: capture a render-anchor (framebuffer-
@@ -4546,7 +4557,14 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 st.session.machine.cold_reset();
                 st.session.running = true;
                 st.ctrl_stop = None;
-                st.notify.broadcast("debug/running", json!({ "session_id": st.session.id, "pacing": { "mode": "pal", "ratio": 1 } }));
+                // audit ws-media-14 — resume with the LIVE pacing, not hardcoded pal/1.
+                // TS routes a cart eject through the ingress + ctrl.run(), and run()
+                // broadcasts debug/running carrying `this.pacing` (whatever set_pacing
+                // last selected, e.g. "warp"; runtime-controller.ts:282). Hardcoding
+                // pal/1 here reset a warp session to 1× on every cart eject.
+                let session_id = st.session.id.clone();
+                let (mode, ratio) = (st.pacing_mode.clone(), st.pacing_ratio);
+                st.notify.broadcast("debug/running", json!({ "session_id": session_id, "pacing": { "mode": mode, "ratio": ratio } }));
             } else {
                 // Persist the outgoing disk's dirty writes to its host file BEFORE
                 // detach (the data-loss fix — detach_disk only flushes into disk.bytes,
@@ -4629,6 +4647,9 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 };
                 let mt = mapper_type_str(mapper_type).to_string();
                 st.session.cart_path = path_str.clone();
+                // audit ws-media-8 — record the cart in the recents store (newest-first,
+                // mountedAt), 1:1 with TS addRecent on every CRT ingest (ingress.ts:250).
+                add_recent_media(&mut st, &path_str, "crt");
                 st.session.machine.fill_power_on_ram();
                 st.session.machine.cold_reset();
                 let after_id = capture_media_checkpoint(&mut st);
@@ -4637,7 +4658,12 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 let cycle = st.session.machine.clk;
                 st.session.running = true;
                 st.ctrl_stop = None;
-                st.notify.broadcast("debug/running", json!({ "session_id": st.session.id, "pacing": { "mode": "pal", "ratio": 1 } }));
+                // audit ws-media-14 — resume with the LIVE pacing, not hardcoded pal/1
+                // (TS CRT insert resumes via ctrl.run() = `this.pacing`, ws-server.ts
+                // resumeIfRunning:"crt" → runtime-controller.ts:282).
+                let session_id = st.session.id.clone();
+                let (mode, ratio) = (st.pacing_mode.clone(), st.pacing_ratio);
+                st.notify.broadcast("debug/running", json!({ "session_id": session_id, "pacing": { "mode": mode, "ratio": ratio } }));
                 let event = json!({
                     "cycle": cycle, "operation": "crt", "role": Value::Null, "format": "crt",
                     "sha256": sha.clone(), "resetPolicy": "power-cycle",
@@ -4688,6 +4714,10 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             let media_present = st.session.machine.drive8.get_attached_disk().is_some()
                 || st.session.machine.cartridge.is_some();
             let before_id = if media_present { capture_media_checkpoint(&mut st) } else { None };
+            // audit ws-media-8 — record the mounted disk in the recents store (newest-
+            // first, cap 10, mountedAt), 1:1 with TS addRecent (recent-files.ts) on
+            // every ingest, so media/recent overlays it ahead of the dir scan.
+            add_recent_media(&mut st, &path_str, format_str);
             let persisted_outgoing = mount_disk_media(&mut st, image, &path_str);
             let after_id = capture_media_checkpoint(&mut st);
             if let Some(ref b) = before_id { st.checkpoint_ring.pin(b); }
@@ -4756,6 +4786,8 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 };
                 let mt = mapper_type_str(mapper_type).to_string();
                 st.session.cart_path = path_str.clone();
+                // audit ws-media-8 — record the cart in the recents store (see media/mount).
+                add_recent_media(&mut st, &path_str, "crt");
                 st.session.machine.fill_power_on_ram();
                 st.session.machine.cold_reset();
                 let after_id = capture_media_checkpoint(&mut st);
@@ -4764,7 +4796,10 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 let cycle = st.session.machine.clk;
                 st.session.running = true;
                 st.ctrl_stop = None;
-                st.notify.broadcast("debug/running", json!({ "session_id": st.session.id, "pacing": { "mode": "pal", "ratio": 1 } }));
+                // audit ws-media-14 — resume with the LIVE pacing, not hardcoded pal/1.
+                let session_id = st.session.id.clone();
+                let (mode, ratio) = (st.pacing_mode.clone(), st.pacing_ratio);
+                st.notify.broadcast("debug/running", json!({ "session_id": session_id, "pacing": { "mode": mode, "ratio": ratio } }));
                 let event = json!({
                     "cycle": cycle, "operation": "crt", "role": Value::Null, "format": "crt",
                     "sha256": sha.clone(), "resetPolicy": "power-cycle",
@@ -4815,6 +4850,8 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             let media_present = st.session.machine.drive8.get_attached_disk().is_some()
                 || st.session.machine.cartridge.is_some();
             let before_id = if media_present { capture_media_checkpoint(&mut st) } else { None };
+            // audit ws-media-8 — record the swapped-in disk in the recents store.
+            add_recent_media(&mut st, &path_str, format_str);
             let persisted_outgoing = mount_disk_media(&mut st, image, &path_str);
             let after_id = capture_media_checkpoint(&mut st);
             if let Some(ref b) = before_id { st.checkpoint_ring.pin(b); }
@@ -4957,16 +4994,18 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             Response::ok(id, json!({ "events": st.media_events.clone() }))
         }
 
-        // ── Spec 265 — recent-media list ──────────────────────────────────────
+        // ── Spec 265 / audit ws-media-8 — recent-media list ───────────────────
         // 1:1-shape with c64re ws-server.ts:1809 media/recent: an array of
-        // { path, name, type } image-media entries gated to the active project dir
-        // (+ the C64RE samples/ corpus when --dev-samples is on). c64re ALSO reads a
-        // GLOBAL ~/.config/c64re/recent-media.json store; TRX64 has no such persisted
-        // store (additive, no host-state writes), so the list is the project-dir scan
-        // only (the same §2/§3 sources c64re overlays on the recents). Image exts only
-        // (.d64/.g64/.crt/.vsf — .prg excluded, as in c64re's project walk).
+        // { path, name, type, mountedAt } entries — the in-memory recents store
+        // (newest-first, mountedAt) overlaid AHEAD of the project + samples dir scans
+        // (= c64re §1 recents-first, §2 samples, §3 project walk). c64re's recents store
+        // is a GLOBAL ~/.config/c64re/recent-media.json; TRX64 keeps it IN-MEMORY
+        // per-daemon (additive — no host-state writes into the user's config), updated
+        // by add_recent_media on every mount/swap. Image exts only (.d64/.g64/.crt/.vsf
+        // — .prg excluded, as in c64re's project walk).
         "media/recent" => {
-            let out = scan_recent_media();
+            let st = state.lock().unwrap();
+            let out = scan_recent_media(&st.recent_media);
             Response::ok(id, json!(out))
         }
 
@@ -6754,6 +6793,66 @@ fn scenario_summary(s: &Value) -> Value {
     })
 }
 
+/// Spec 265 / audit ws-media-8 — a recents-store entry (= the c64re `RecentEntry`,
+/// recent-files.ts:13-18): the host path, the media type (`d64`/`g64`/`crt`/…), and
+/// an ISO-8601 `mountedAt` timestamp. Kept newest-first in `State.recent_media`.
+#[derive(Clone)]
+struct RecentMedia {
+    path: String,
+    media_type: String,
+    mounted_at: String,
+}
+
+/// Spec 265 — recent-media list cap (= the c64re MAX_RECENT, recent-files.ts:11).
+const MAX_RECENT_MEDIA: usize = 10;
+
+/// A real ISO-8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SS.mmmZ`) for the recents
+/// `mountedAt` field — 1:1 with the c64re `new Date().toISOString()` (recent-files.ts
+/// :51). No chrono dep: compute civil date from the Unix epoch (Howard Hinnant's
+/// days_from_civil inverse). Distinct from `now_iso8601` (the opaque `epoch:<secs>`
+/// scenario stamp) because the recents store mirrors a real client-facing ISO string.
+fn now_iso8601_utc() -> String {
+    let dur = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let total_secs = dur.as_secs() as i64;
+    let millis = dur.subsec_millis();
+    let days = total_secs.div_euclid(86_400);
+    let secs_of_day = total_secs.rem_euclid(86_400);
+    let (hh, mm, ss) = (secs_of_day / 3600, (secs_of_day % 3600) / 60, secs_of_day % 60);
+    // civil_from_days (days since 1970-01-01) → (year, month, day).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{year:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{millis:03}Z",
+    )
+}
+
+/// Spec 265 / audit ws-media-8 — record a just-mounted medium in the recents store
+/// (= the c64re `addRecent`, recent-files.ts:48-60): dedup by path, prepend so the
+/// list stays NEWEST-FIRST, stamp `mountedAt`, trim to [`MAX_RECENT_MEDIA`]. Called on
+/// every disk/cart mount + swap (the TS `addRecent` fires on every ingest).
+fn add_recent_media(st: &mut State, path: &str, media_type: &str) {
+    st.recent_media.retain(|e| e.path != path); // dedup by path (recent-files.ts:49)
+    st.recent_media.insert(
+        0,
+        RecentMedia {
+            path: path.to_string(),
+            media_type: media_type.to_string(),
+            mounted_at: now_iso8601_utc(),
+        },
+    );
+    st.recent_media.truncate(MAX_RECENT_MEDIA);
+}
+
 /// Spec 709.8 — append a media event to the ordered history, trimming to the last
 /// [`MAX_MEDIA_EVENTS`]. The event object is the same `MediaIngressEvent` shape the
 /// media op already returns in its response `event` field (`{cycle, operation,
@@ -6886,13 +6985,17 @@ fn capture_media_checkpoint(st: &mut State) -> Option<String> {
 /// BUG-040 cart auto-persist debounce in stream-loop FRAMES (~50 fps PAL). The TS
 /// debounce is CART_AUTOPERSIST_DEBOUNCE_MS = 5_000 (runtime-controller.ts:100) —
 /// long enough to coalesce an EAPI write/erase burst, short enough that a crash
-/// loses little. ~5 s × ~50 fps ≈ 250 frames. (Frame-count, NOT wall-clock, per
-/// the stream-loop discipline.)
-const CART_AUTOPERSIST_DEBOUNCE_FRAMES: u64 = 250;
-/// Disk lazy-writeback debounce in frames. The same coalescing rationale as the
-/// cart: a drive-write burst (one SAVE) settles before the host .d64/.g64 is
-/// touched once. ~1 s.
-const DISK_AUTOPERSIST_DEBOUNCE_FRAMES: u64 = 50;
+/// loses little. (audit ws-media-3 / background-workers-async-10): WALL-CLOCK ms,
+/// 1:1 with the TS CART_AUTOPERSIST_DEBOUNCE_MS = 5_000 (runtime-controller.ts:100),
+/// NOT a frame count — the TS persist runs on an independent 1 s setInterval that
+/// fires regardless of run-state, so a dirty-then-pause STILL reaches the host file.
+/// A frame counter only advances while running, so it could never persist a paused
+/// machine; a wall-clock debounce fires the same whether running, paused, or jammed.
+const CART_AUTOPERSIST_DEBOUNCE_MS: u64 = 5_000;
+/// Disk lazy-writeback debounce in WALL-CLOCK ms. The same coalescing rationale as
+/// the cart: a drive-write burst (one SAVE) settles before the host .d64/.g64 is
+/// touched once. ~1 s. (Wall-clock, not frame count — fires while paused too.)
+const DISK_AUTOPERSIST_DEBOUNCE_MS: u64 = 1_000;
 /// Spec 705.B auto-capture cadence in frames. The c64re header documents ~25
 /// frames (~0.5 s @ 50 fps PAL — runtime-controller.ts:69-76); the live TS const
 /// is now 50 (1 s, runtime-controller.ts:77). Per this task's explicit "~every
@@ -6900,15 +7003,18 @@ const DISK_AUTOPERSIST_DEBOUNCE_FRAMES: u64 = 50;
 /// "multiple checkpoints accumulate" proof either way).
 const CHECKPOINT_CAPTURE_EVERY_FRAMES: u64 = 25;
 
-/// ITEM 1 — cart auto-persist (.crt lazy writeback). Called once per RUNNING
-/// stream-loop frame. = maybeAutoPersistCart (runtime-controller.ts:493). The
-/// mapper's monotonic writableGeneration() distinguishes "still being written"
-/// (gen moving → re-arm the settle window) from "settled" (gen stable for the
-/// debounce window → write the flash back to the host .crt once via the SAME
-/// persist logic as eject, minus the eject/detach/power-cycle: persist-in-place).
-/// Frame-count debounce. Broadcasts media/cart_persisted {auto:true}. Disable with
-/// C64RE_CART_AUTOPERSIST=0 (eject/explicit persist still work).
-fn stream_maybe_autopersist_cart(st: &mut State, frame: u64) {
+/// ITEM 1 — cart auto-persist (.crt lazy writeback). = maybeAutoPersistCart
+/// (runtime-controller.ts:493). The mapper's monotonic writableGeneration()
+/// distinguishes "still being written" (gen moving → re-arm the settle window) from
+/// "settled" (gen stable for the debounce window → write the flash back to the host
+/// .crt once via the SAME persist logic as eject, minus the eject/detach/power-cycle:
+/// persist-in-place). WALL-CLOCK ms debounce (`now_ms`), NOT a frame count, so it
+/// fires regardless of run-state (audit ws-media-3 / background-workers-async-10):
+/// the TS persist is an independent 1 s setInterval that fires while paused/jammed/
+/// bp-stopped, so a dirty-then-pause STILL reaches the host file. The stream loop
+/// therefore calls this EVERY iteration (running OR paused), not only `if running`.
+/// Broadcasts media/cart_persisted {auto:true}. Disable with C64RE_CART_AUTOPERSIST=0.
+fn stream_maybe_autopersist_cart(st: &mut State, now_ms: u64) {
     if std::env::var("C64RE_CART_AUTOPERSIST").as_deref() == Ok("0") {
         return;
     }
@@ -6925,15 +7031,15 @@ fn stream_maybe_autopersist_cart(st: &mut State, frame: u64) {
     // the settle window and bail (the EAPI burst keeps bumping the gen).
     if gen != st.cart_ap_seen_gen {
         st.cart_ap_seen_gen = gen;
-        st.cart_ap_settle_frame = frame;
+        st.cart_ap_settle_at_ms = now_ms;
         return;
     }
     // runtime-controller.ts:506 — this gen already persisted; nothing to do.
     if gen == st.cart_ap_done_gen {
         return;
     }
-    // runtime-controller.ts:507 — not settled long enough yet.
-    if frame.wrapping_sub(st.cart_ap_settle_frame) < CART_AUTOPERSIST_DEBOUNCE_FRAMES {
+    // runtime-controller.ts:507 — not settled long enough yet (wall-clock ms).
+    if now_ms.saturating_sub(st.cart_ap_settle_at_ms) < CART_AUTOPERSIST_DEBOUNCE_MS {
         return;
     }
     // Settled → write the host .crt via the eject-path persist logic (persist-in-
@@ -6955,18 +7061,18 @@ fn stream_maybe_autopersist_cart(st: &mut State, frame: u64) {
     }
 }
 
-/// ITEM 2 — disk lazy host-file writeback (.d64/.g64). Called once per RUNNING
-/// stream-loop frame. PARITY-NEUTRAL ENHANCEMENT: the c64re TS runtime writes the
-/// host disk file EAGERLY at the GCR-data-writeback commit point (fsimage_dxx.ts:
-/// 428 hostFlush, BUG-023 — VICE's fd IS the real file). TRX64's write-through
-/// (`attach_with_writeback` → `flush_disk_writeback`) only mirrors the dirty track
-/// into the IN-MEMORY `disk.bytes`; the host file is reached only on media/persist
-/// or eject. To give the user the lazily-updated host .d64/.g64 they asked for,
-/// this flushes the dirty track + writes the backing file ONCE the disk content has
-/// settled for the debounce window. Guarded: only when a backing_path exists AND
-/// the disk is writable. Frame-count debounce; content-hash gen (no diskWriteGen
-/// facade in TRX64).
-fn stream_maybe_autopersist_disk(st: &mut State, frame: u64) {
+/// ITEM 2 — disk lazy host-file writeback (.d64/.g64). PARITY-NEUTRAL ENHANCEMENT:
+/// the c64re TS runtime writes the host disk file EAGERLY at the GCR-data-writeback
+/// commit point (fsimage_dxx.ts:428 hostFlush, BUG-023 — VICE's fd IS the real file).
+/// TRX64's write-through (`attach_with_writeback` → `flush_disk_writeback`) only
+/// mirrors the dirty track into the IN-MEMORY `disk.bytes`; the host file is reached
+/// only on media/persist or eject. To give the user the lazily-updated host .d64/.g64
+/// they asked for, this flushes the dirty track + writes the backing file ONCE the disk
+/// content has settled for the debounce window. Guarded: only when a backing_path
+/// exists AND the disk is writable. WALL-CLOCK ms debounce (`now_ms`), so a SAVE then
+/// pause still reaches the host file (audit ws-media-3); content-hash gen (no
+/// diskWriteGen facade in TRX64). Called EVERY stream-loop iteration (running or paused).
+fn stream_maybe_autopersist_disk(st: &mut State, now_ms: u64) {
     // Cheap gate: flush any pending dirty GCR track into `disk.bytes` (VICE
     // drive_gcr_data_writeback_all → fsimage->fd). Returns true ONCE per dirty
     // burst — that arms the debounce; the flag then drops, so on later frames the
@@ -7002,13 +7108,13 @@ fn stream_maybe_autopersist_disk(st: &mut State, frame: u64) {
     // is a burst of track writes; coalesce them into one host write).
     if Some(&hash) != st.disk_ap_seen_hash.as_ref() {
         st.disk_ap_seen_hash = Some(hash);
-        st.disk_ap_settle_frame = frame;
+        st.disk_ap_settle_at_ms = now_ms;
         return;
     }
     if Some(&hash) == st.disk_ap_done_hash.as_ref() {
         return; // already written
     }
-    if frame.wrapping_sub(st.disk_ap_settle_frame) < DISK_AUTOPERSIST_DEBOUNCE_FRAMES {
+    if now_ms.saturating_sub(st.disk_ap_settle_at_ms) < DISK_AUTOPERSIST_DEBOUNCE_MS {
         return;
     }
     // Settled → write the host disk file (= media/persist disk branch, minus the
@@ -7197,7 +7303,7 @@ fn scenario_steps_from_inputs(inputs: &[Value]) -> Vec<trx64_core::scenario_play
 // TRX64 keeps no host-state store (additive), so it scans the project dir and the
 // samples corpus only — the same §2/§3 directory sources c64re walks. Image exts
 // only (.crt/.d64/.g64/.vsf; .prg excluded — matches c64re's project walk).
-fn scan_recent_media() -> Vec<Value> {
+fn scan_recent_media(recent: &[RecentMedia]) -> Vec<Value> {
     const IMG_EXTS: &[&str] = &[".crt", ".d64", ".g64", ".vsf"];
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out: Vec<Value> = Vec::new();
@@ -7212,6 +7318,34 @@ fn scan_recent_media() -> Vec<Value> {
         .skip_while(|a| a != "--project")
         .nth(1)
         .unwrap_or_default();
+
+    // 0) audit ws-media-8 — overlay the persisted recents store FIRST (= c64re §1,
+    //    ws-server.ts:1833-1839): existing recents, NEWEST-FIRST, each carrying its
+    //    `mountedAt` timestamp, ahead of the dir scans below. Skip a recents entry
+    //    whose file no longer exists (recent-files-style staleness, ws-server.ts:1834),
+    //    and dedup so a recents path is not re-listed by the dir scan. The store is
+    //    already newest-first (add_recent_media prepends), so iterate in order.
+    for r in recent {
+        if !std::path::Path::new(&r.path).exists() {
+            continue;
+        }
+        if seen.contains(&r.path) {
+            continue;
+        }
+        let name = std::path::Path::new(&r.path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| r.path.clone());
+        seen.insert(r.path.clone());
+        out.push(json!({
+            "path": r.path,
+            "name": name,
+            "type": r.media_type,
+            // 1:1 with the c64re RecentEntry.mountedAt overlaid by media/recent
+            // (the spread `{ ...r }` carries mountedAt, ws-server.ts:1838).
+            "mountedAt": r.mounted_at,
+        }));
+    }
 
     // 1) Project dir — depth-limited recursive scan (= c64re §3 `walk`, depth ≤ 3,
     //    capped at 100), skipping dotdirs / node_modules / knowledge.
@@ -8187,6 +8321,7 @@ async fn main() {
         recorder_disk_hash: None,
         scenarios: std::collections::HashMap::new(),
         media_events: Vec::new(),
+        recent_media: Vec::new(),
         batches: std::collections::HashMap::new(),
         notify: streaming::NotifyHub::new(),
         streaming_enabled: streaming_on,        pacing_mode: "pal".to_string(),
@@ -8197,10 +8332,10 @@ async fn main() {
         cart_led_gen: 0,
         cart_led_last_write_at: None,
         cart_ap_seen_gen: 0,
-        cart_ap_settle_frame: 0,
+        cart_ap_settle_at_ms: 0,
         cart_ap_done_gen: 0,
         disk_ap_pending: false,
-        disk_ap_settle_frame: 0,
+        disk_ap_settle_at_ms: 0,
         disk_ap_seen_hash: None,
         disk_ap_done_hash: None,
         autocapture_frames_since: 0,
@@ -8273,6 +8408,7 @@ mod batch1_tests {
             recorder_disk_hash: None,
             scenarios: std::collections::HashMap::new(),
             media_events: Vec::new(),
+            recent_media: Vec::new(),
             batches: std::collections::HashMap::new(),
             notify: streaming::NotifyHub::new(),
             streaming_enabled: false,
@@ -8284,10 +8420,10 @@ mod batch1_tests {
             last_trace_path: None,
             last_run_id: None,
             cart_ap_seen_gen: 0,
-            cart_ap_settle_frame: 0,
+            cart_ap_settle_at_ms: 0,
             cart_ap_done_gen: 0,
             disk_ap_pending: false,
-            disk_ap_settle_frame: 0,
+            disk_ap_settle_at_ms: 0,
             disk_ap_seen_hash: None,
             disk_ap_done_hash: None,
             autocapture_frames_since: 0,
@@ -9801,13 +9937,15 @@ mod batch1_tests {
             assert!(cart.writable_generation() > 0, "gen bumped");
         }
 
-        // Run the stream hook frame-by-frame. The gen settles immediately (no
-        // further writes), so after CART_AUTOPERSIST_DEBOUNCE_FRAMES it writes once.
-        // No media/persist call anywhere.
-        let total = CART_AUTOPERSIST_DEBOUNCE_FRAMES + 5;
-        for frame in 0..total {
+        // Run the stream hook with synthetic WALL-CLOCK ms (the debounce is now ms,
+        // not a frame count — audit ws-media-3). First poll at t=0 arms the settle
+        // window; a poll past CART_AUTOPERSIST_DEBOUNCE_MS writes once. No media/persist
+        // call anywhere.
+        {
             let mut st = state.lock().unwrap();
-            stream_maybe_autopersist_cart(&mut st, frame);
+            stream_maybe_autopersist_cart(&mut st, 0); // arm
+            stream_maybe_autopersist_cart(&mut st, 100); // not settled yet
+            stream_maybe_autopersist_cart(&mut st, CART_AUTOPERSIST_DEBOUNCE_MS + 1); // settled → write
         }
 
         let new_bytes = std::fs::read(&crt_path).unwrap();
@@ -9824,6 +9962,76 @@ mod batch1_tests {
             let st = state.lock().unwrap();
             assert_eq!(st.cart_ap_done_gen, st.cart_ap_seen_gen, "settled gen recorded as done");
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// audit ws-media-3 + background-workers-async-10 DIRECT PROOF — cart flash
+    /// auto-persist fires while the machine is PAUSED. The TS persist runs on an
+    /// independent 1 s setInterval that fires regardless of run-state
+    /// (runtime-controller.ts:219-226), so a flash delta then pause/JAM/bp before the
+    /// debounce STILL reaches the host .crt. TRX64 previously drove the persist ONLY
+    /// from the stream loop's `if running` block on a FRAME counter (frame_seq advances
+    /// only while running), so a dirty-then-pause never persisted. This test mounts a
+    /// writable EasyFlash, drives a real byte-program (dirty), sets running=FALSE
+    /// (paused), then ticks the WALL-CLOCK persist cadence past the debounce and
+    /// asserts the host .crt FILE bytes changed — proving the persist no longer depends
+    /// on the run-state. (The gate cannot drive a cart-mapper write over the WS surface,
+    /// so the conformance case ws-media-3 is BLOCKED + this is its direct verification.)
+    #[test]
+    fn ws_media_3_cart_autopersist_fires_while_paused() {
+        let dir = std::env::temp_dir().join(format!("trx64_wsmedia3_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let crt_path = dir.join("ef_paused.crt");
+
+        let mut bank0 = vec![0xffu8; 0x4000];
+        bank0[0x3ffc] = 0x00;
+        bank0[0x3ffd] = 0x80;
+        let crt = build_crt_for_test(32, 1, 0, "EF", &[(0, 0x8000, bank0)]);
+        std::fs::write(&crt_path, &crt).unwrap();
+        let orig_bytes = std::fs::read(&crt_path).unwrap();
+
+        let state = make_state();
+        {
+            let mut st = state.lock().unwrap();
+            st.session.machine.attach_cart_from_bytes(&crt, "EF").expect("attach EF");
+            st.session.cart_path = crt_path.to_string_lossy().to_string();
+            st.session.machine.cold_reset();
+            // Drive a real AM29F040B byte-program → dirty + gen bumped.
+            let bi = bi_for_test();
+            let clk = st.session.machine.clk;
+            let cart = st.session.machine.cartridge.as_mut().expect("cart attached");
+            cart.write(0x8555, 0xaa, &bi, clk);
+            cart.write(0x82aa, 0x55, &bi, clk);
+            cart.write(0x8555, 0xa0, &bi, clk);
+            cart.write(0x8100, 0x42, &bi, clk);
+            assert!(cart.is_writable_dirty(), "dirty after program");
+            // THE KEY PRECONDITION: the machine is PAUSED (running=false). The TS
+            // setInterval persist fires anyway; the TRX64 stream loop now calls the
+            // persist hooks EVERY iteration regardless of run-state, so the host file
+            // must still update. (The pre-fix `if running` path never ran here.)
+            st.session.running = false;
+        }
+
+        // Drive the wall-clock persist cadence (the same call the stream loop now makes
+        // every iteration regardless of run-state). The machine stays PAUSED throughout.
+        {
+            let mut st = state.lock().unwrap();
+            assert!(!st.session.running, "machine is paused for the whole persist window");
+            stream_maybe_autopersist_cart(&mut st, 0); // arm
+            stream_maybe_autopersist_cart(&mut st, CART_AUTOPERSIST_DEBOUNCE_MS + 1); // settled → write
+            assert!(!st.session.running, "still paused after persist (persist must not resume)");
+        }
+
+        let new_bytes = std::fs::read(&crt_path).unwrap();
+        assert_ne!(
+            new_bytes, orig_bytes,
+            "host .crt FILE bytes changed while PAUSED (persist not gated on run-state)"
+        );
+        assert_eq!(
+            new_bytes[0x40 + 0x10 + 0x100], 0x42,
+            "programmed flash byte in host .crt after paused persist"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -9863,13 +10071,15 @@ mod batch1_tests {
             );
         }
 
-        // Run the disk hook. flush_disk_writeback() returns true on the first
-        // running frame (mirrors disk.bytes), then the content-hash settles and
-        // the host file is written once after the debounce.
-        let total = DISK_AUTOPERSIST_DEBOUNCE_FRAMES + 5;
-        for frame in 0..total {
+        // Run the disk hook with synthetic WALL-CLOCK ms (the debounce is now ms, not
+        // a frame count — audit ws-media-3). The first poll flushes the dirty track
+        // into disk.bytes + arms the content-hash settle window; a poll past
+        // DISK_AUTOPERSIST_DEBOUNCE_MS writes the host file once.
+        {
             let mut st = state.lock().unwrap();
-            stream_maybe_autopersist_disk(&mut st, frame);
+            stream_maybe_autopersist_disk(&mut st, 0); // flush + arm
+            stream_maybe_autopersist_disk(&mut st, 10); // settled hash, not aged yet
+            stream_maybe_autopersist_disk(&mut st, DISK_AUTOPERSIST_DEBOUNCE_MS + 1); // → write
         }
 
         let new_bytes = std::fs::read(&d64_path).unwrap();
@@ -9881,6 +10091,39 @@ mod batch1_tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// audit ws-media-8 DIRECT PROOF — the recents store is newest-first, deduped by
+    /// path, carries a mountedAt, and caps at MAX_RECENT_MEDIA. add_recent_media is the
+    /// 1:1 port of recent-files.ts addRecent (prepend + dedup + trim). scan_recent_media
+    /// then overlays it AHEAD of the dir scans, so media/recent[0] is the most-recently
+    /// mounted medium.
+    #[test]
+    fn ws_media_8_recents_store_is_newest_first_with_mountedat() {
+        let state = make_state();
+        {
+            let mut st = state.lock().unwrap();
+            add_recent_media(&mut st, "/p/diskA.d64", "d64");
+            add_recent_media(&mut st, "/p/diskB.d64", "d64");
+            // newest-first: B before A.
+            assert_eq!(st.recent_media[0].path, "/p/diskB.d64");
+            assert_eq!(st.recent_media[1].path, "/p/diskA.d64");
+            assert!(!st.recent_media[0].mounted_at.is_empty(), "mountedAt stamped");
+            // re-mounting A moves it to the FRONT (dedup by path, no duplicate).
+            add_recent_media(&mut st, "/p/diskA.d64", "d64");
+            assert_eq!(st.recent_media[0].path, "/p/diskA.d64");
+            assert_eq!(st.recent_media.len(), 2, "dedup keeps one entry per path");
+            // cap at MAX_RECENT_MEDIA.
+            for i in 0..(MAX_RECENT_MEDIA + 5) {
+                add_recent_media(&mut st, &format!("/p/extra{i}.crt"), "crt");
+            }
+            assert_eq!(st.recent_media.len(), MAX_RECENT_MEDIA, "capped at MAX_RECENT_MEDIA");
+        }
+        // The mountedAt is a real ISO-8601 UTC stamp (YYYY-MM-DDTHH:MM:SS.mmmZ), 1:1
+        // with the c64re new Date().toISOString().
+        let iso = now_iso8601_utc();
+        assert_eq!(iso.len(), 24, "ISO-8601 ms-precision length");
+        assert!(iso.ends_with('Z') && iso.contains('T'), "ISO-8601 shape: {iso}");
     }
 
     /// ITEM 3 PROOF — auto-capture every N frames (filmstrip). Drive the stream

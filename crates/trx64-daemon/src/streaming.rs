@@ -333,6 +333,13 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
     // far behind (>100 ms), re-base the epoch instead of spinning to catch up.
     let mut epoch = Instant::now();
     let mut frames_since_epoch: u32 = 0;
+    // audit ws-media-3 / background-workers-async-10 — a WALL-CLOCK reference for the
+    // media auto-persist cadence. The TS persist runs on an independent 1 s setInterval
+    // with a Date.now() debounce that fires regardless of run-state, so a flash/disk
+    // delta then pause/JAM/bp STILL reaches the host file. TRX64's frame counter only
+    // advances while running, so the persist hooks now debounce on this monotonic
+    // wall-clock instead — and run EVERY loop iteration, not only `if running`.
+    let persist_epoch = Instant::now();
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -351,6 +358,24 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
             let st = state.lock().unwrap();
             (st.session.running, st.pacing_mode == "warp")
         };
+
+        // ── MEDIA AUTO-PERSIST (audit ws-media-3 / background-workers-async-10) ──
+        // Run the cart + disk auto-persist hooks EVERY iteration, REGARDLESS of
+        // run-state, on the wall-clock cadence — 1:1 with the TS independent
+        // setInterval (runtime-controller.ts:219-226) that fires while paused/jammed/
+        // bp-stopped. A flash/disk delta written just before a pause must STILL reach
+        // the host file after the debounce. The loop sleeps one frame per iteration
+        // even when paused, so this polls at ~50 Hz; the gen/hash checks are cheap and
+        // the actual host write is debounced (wall-clock ms), so this is a no-op for a
+        // clean medium. (Previously these ran inside `if running` on a frame counter,
+        // so a dirty-then-pause never persisted.)
+        {
+            let now_ms = persist_epoch.elapsed().as_millis() as u64;
+            let mut st = state.lock().unwrap();
+            crate::stream_maybe_autopersist_cart(&mut st, now_ms);
+            crate::stream_maybe_autopersist_disk(&mut st, now_ms);
+        }
+
         if running {
         // ── Run one PAL frame + render + drain this frame's SID writes ──
         // Lock the shared State only for this window; release before sleeping so
@@ -391,22 +416,20 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
 
             // ── BACKGROUND-LOOP layer (the c64re RuntimeController per-frame
             // behaviors with no WS method — runtime-controller.ts). The stream loop
-            // is the SOLE per-frame driver under --stream, so it hosts them here,
-            // gated on `running` (we're inside the `if running` block already), in
+            // is the SOLE per-frame driver under --stream, so it hosts them here, in
             // the per-frame lock window. The gen/hash checks are CHEAP; only the
-            // actual persist/capture costs, and those are throttled/debounced by
-            // FRAME COUNT (`frame_seq`, which advances only while running). A hook
-            // panic must never kill the stream — but the helpers are total (Err is
-            // swallowed inside), so no extra catch is needed.
-            //   ITEM 1 — cart auto-persist (.crt lazy writeback), BUG-040.
-            //   ITEM 2 — disk auto-persist (.d64/.g64 lazy writeback).
+            // actual capture costs, and that is throttled by FRAME COUNT (`frame_seq`,
+            // which advances only while running). A hook panic must never kill the
+            // stream — but the helpers are total (Err is swallowed inside), so no
+            // extra catch is needed.
             //   ITEM 3 — auto-capture every N frames (filmstrip), Spec 705.B.
+            //   ITEM 4 — recorder auto-feed (below).
+            // The cart/disk auto-persist (ITEMs 1+2) now run ABOVE this block, every
+            // loop iteration regardless of run-state (audit ws-media-3 — a dirty-then-
+            // pause must still persist), so they are NOT repeated here.
             // Skip the autocapture during WARP (8× fast-forward would flood the ring
-            // and isn't the live-scrub use case); persist hooks still run (a settled
-            // save must reach disk regardless of pace).
+            // and isn't the live-scrub use case).
             let frame_no = frame_seq as u64;
-            crate::stream_maybe_autopersist_cart(&mut st, frame_no);
-            crate::stream_maybe_autopersist_disk(&mut st, frame_no);
             if !warp {
                 // Spec 769.5a — pass the JUST-RENDERED live canvas so the auto-capture
                 // can store a downscaled thumbnail keyed by the new checkpoint id
