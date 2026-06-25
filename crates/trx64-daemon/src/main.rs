@@ -3562,6 +3562,14 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             // post-restore-stale samples): push `audio/flush` (ws-server.ts:1667/1690
             // `onRestore` → `this.broadcast("audio/flush", …)`).
             st.notify.broadcast("audio/flush", json!({ "session_id": st.session.id }));
+            // Spec 771.2 — runtime-controller.ts:603 restore() server-PUSHes
+            // debug/checkpoint_restored so every client's canvas refreshes to the
+            // rolled-back frame (Live.tsx:337 grabs a fresh screenshot on it).
+            st.notify.broadcast("debug/checkpoint_restored", json!({
+                "session_id": st.session.id,
+                "ref": cp_id.clone(),
+                "registers": register_dump(&st.session),
+            }));
             let machine_state = build_debug_state(&st);
             Response::ok(id, json!({
                 "restored": restored,
