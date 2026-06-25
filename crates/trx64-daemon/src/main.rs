@@ -2894,12 +2894,66 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         }
 
         "session/create" => {
-            let st = state.lock().unwrap();
+            let mut st = state.lock().unwrap();
             // Spec 744 shared-attach: the singleton machine is constructed at daemon
             // boot, so session/create ALWAYS attaches to the existing machine (mirrors
             // TS runtimeSessions.start → attached=true when a machine is present). The
             // boot-time construct is the only attached=false; clients never observe it.
             let attached = true;
+            // audit ws-session-debug-6 — session/create HONOURS trace_out/trace_domains
+            // (+ device_id/pal/start_track/write_protected). TS (ws-server.ts:608-633):
+            // threads all params; when trace_out is set it opens a session trace
+            // ATOMICALLY via startSessionTrace (binary .c64retrace) so a trace is ACTIVE
+            // right after create, and returns `trace` = {runId, outputPath, domains}.
+            // TRX64 (pre-fix) read NO params and hardcoded trace:null. On a SHARED
+            // ATTACH the device/pal/start_track/write_protected params do NOT reconstruct
+            // the singleton machine (TS attach does not auto-mount/re-cold either — see
+            // the One-Machine-Per-Process contract), so they are accepted as a no-op on
+            // attach; the load-bearing, testable behaviour is the trace.
+            let trace_out = req.params.get("trace_out").and_then(|v| v.as_str());
+            let mut trace_val = Value::Null;
+            if let Some(out_str) = trace_out {
+                // TS: domains default to DEFAULT_TRACE_DOMAINS (["c64-cpu","memory"])
+                // when trace_out is set without explicit trace_domains.
+                let domains: Vec<String> = req
+                    .params
+                    .get("trace_domains")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|d| d.as_str().map(String::from)).collect())
+                    .unwrap_or_else(|| vec!["c64-cpu".into(), "memory".into()]);
+                let output = PathBuf::from(out_str);
+                let retrace = output.with_extension("c64retrace");
+                let cycle_start = st.session.machine.clk;
+                let run_id = format!("run_live-capture_{}", cycle_start);
+                let meta_json = serde_json::to_string(&json!({
+                    "runId": run_id,
+                    "defId": "live-capture",
+                    "defVersion": 1,
+                    "defName": "live-capture",
+                    "defJson": "",
+                    "domains": domains,
+                    "cycleStart": cycle_start,
+                    "createdAt": "",
+                }))
+                .unwrap_or_default();
+                st.session.trace = Some(TraceState {
+                    retrace_path: retrace,
+                    meta_json,
+                    cycle_start,
+                    buf: Vec::new(),
+                    run_id: run_id.clone(),
+                    event_count: 0,
+                    domains: domains.clone(),
+                    marks: Vec::new(),
+                });
+                st.last_run_id = Some(run_id.clone());
+                // TS startSessionTrace returns { runId, outputPath, domains }.
+                trace_val = json!({
+                    "runId": run_id,
+                    "outputPath": out_str,
+                    "domains": domains,
+                });
+            }
             let cpu = &st.session.machine.cpu;
             let pc = cpu.pc as u64;
             let c64_cycles = st.session.machine.clk;
@@ -2911,7 +2965,7 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 "attached": attached,
                 "c64Cycles": c64_cycles,
                 "pc": pc,
-                "trace": null
+                "trace": trace_val
             }))
         }
 
@@ -2940,11 +2994,76 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
 
         "session/run" => {
             let mut st = state.lock().unwrap();
+            // audit ws-session-debug-2 — session/run is a MANUAL/HEADLESS primitive
+            // only; the autonomous loop owns the clock under debug/run. TS throws when
+            // runState==='running' so the two clocks can't double-advance the CPU
+            // (ws-server.ts:842-848). TRX64's `running` flag is the equivalent runState.
+            if st.session.running {
+                return Response::err(
+                    id, -32001,
+                    "session is running under the autonomous loop; use debug/pause before manual session/run",
+                );
+            }
             let cycles = req
                 .params
                 .get("cycles")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(19705);
+
+            // audit ws-session-debug-3 — a manual (paused) session/run HONOURS exec
+            // breakpoints. TS (ws-server.ts:852-901): build the bp set, step PAST a bp
+            // it is sitting on, run the budget WITH the bp set, and on a hit return
+            // early with a breakpoint{pc,num,registers} object. When NONE are armed,
+            // fall through to the historical plain (trace-aware) budget advance so the
+            // no-debug + trace-firehose paths (formats-state-6, background-workers-
+            // async-5) are unchanged.
+            {
+                let State { breakpoints, observers: reg, .. } = &mut *st;
+                sync_observers(breakpoints, reg);
+            }
+            if observers_armed(&st.observers) {
+                // runtime-controller.ts:277 / ws-server.ts:855 — step PAST a bp the PC is
+                // sitting ON so the run doesn't immediately re-trip the same address.
+                {
+                    let pc = st.session.machine.c64_core.reg_pc;
+                    if st.breakpoints.entries.iter().any(|e| e.enabled && e.pc == pc) {
+                        step_one_instruction(&mut st.session);
+                    }
+                }
+                let run = {
+                    let State { session, observers: reg, .. } = &mut *st;
+                    run_until_break(session, reg, cycles)
+                };
+                {
+                    let State { breakpoints, observers: reg, .. } = &mut *st;
+                    writeback_hits(breakpoints, reg);
+                }
+                let cycles_now = st.session.machine.clk;
+                if run.halted {
+                    // bpNumForAddr returns 0 (NOT null) when no numbered bp matches
+                    // (runtime-controller.ts:238) — match the TS reply exactly.
+                    let bp_num = st
+                        .breakpoints
+                        .entries
+                        .iter()
+                        .find(|e| e.pc == run.pc)
+                        .map(|e| e.num)
+                        .unwrap_or(0);
+                    st.ctrl_stop = Some(CtrlStop { reason: "breakpoint", pc: run.pc, cycles: cycles_now });
+                    let registers = register_dump(&st.session);
+                    return Response::ok(id, json!({
+                        "c64Cycles": cycles_now,
+                        "breakpoint": {
+                            "pc": run.pc as u64,
+                            "num": bp_num as u64,
+                            "registers": registers,
+                        },
+                    }));
+                }
+                // Budget exhausted without a hit: report the advanced cycle count.
+                return Response::ok(id, json!({ "c64Cycles": cycles_now }));
+            }
+
             run_cycle_budget(&mut st.session, cycles);
             Response::ok(id, json!({ "c64Cycles": st.session.machine.clk }))
         }
@@ -3443,6 +3562,19 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         // ── debug/* ──────────────────────────────────────────────────────────
 
         "debug/run" => {
+            // audit ws-session-debug-1 — debug/run is ASYNC-SCHEDULED, never blocking.
+            // TS (runtime-controller.ts:262-284 + ws-server.ts:985-991): run() flips
+            // runState→running, pushes debug/running, schedules the loop, and returns
+            // ctrl.state() IMMEDIATELY. A later breakpoint halt is PUSHED via debug/
+            // stopped from the loop — the reply is NEVER the halt. The pre-fix TRX64
+            // called run_debug_control here, which ran an INLINE synchronous
+            // run_until_break (up to DEBUG_RUN_BUDGET=10M cyc) whenever a bp/observer
+            // was armed, so debug/run BLOCKED until the bp hit and could even reply
+            // "paused". The (P0-A) bp/observer/JAM-aware stream loop
+            // (stream_debug_gated_advance) is now the SOLE halt driver: it self-halts at
+            // the first hit + server-PUSHes debug/breakpoint_hit|observer_hit +
+            // debug/stopped, exactly as TS's tick does. So we just transition to running
+            // and return the running state — no inline run.
             let mut st = state.lock().unwrap();
             // T1.2 — Spec 767: read source param, update control_owner, broadcast on change.
             let owner = owner_from_source(&req.params);
@@ -3450,18 +3582,18 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             st.session.running = true;
             st.ctrl_stop = None;
             st.ctrl_frame += 1;
-            let frame = st.ctrl_frame;
             // Spec 771.2 — runtime-controller.ts:282 run() server-PUSHes debug/running
             // at the run transition. Without it the UI never leaves the paused/frozen
             // display (and its keyboard handler, gated on runState==="running", never
-            // attaches → "can't type"). Emit BEFORE run_debug_control so a same-tick
-            // breakpoint halt still emits in TS order (running → breakpoint_hit/stopped).
+            // attaches → "can't type").
             let pacing_snap = json!({ "mode": st.pacing_mode, "ratio": st.pacing_ratio });
             st.notify.broadcast("debug/running", json!({
                 "session_id": st.session.id,
                 "pacing": pacing_snap,
             }));
-            run_debug_control(id, &mut st, frame, false)
+            // Return ctrl.state() immediately (= TS run() → ctrl.state(), runState
+            // "running"). build_debug_state reads the live State (now running).
+            Response::ok(id, build_debug_state(&st))
         }
 
         "debug/pause" => {
@@ -3533,25 +3665,23 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             drain_and_broadcast_observer_log(&mut st);
             let registers = register_dump(&st.session);
             let cycles = st.session.machine.clk;
-            let c = &st.session.machine.cpu6510;
-            let pc = c.reg_pc as u64;
+            let pc = st.session.machine.cpu6510.reg_pc;
+            // runtime-controller.ts:322-323 — step() sets stopInfo = makeStopInfo("step")
+            // and bumps frameCounter, so the returned state().stop / .frame reflect it.
+            st.ctrl_stop = Some(CtrlStop { reason: "step", pc, cycles });
+            st.ctrl_frame += 1;
             // Spec 771.2 — runtime-controller.ts:324 step() server-PUSHes debug/stopped
             // (reason "step") with the register dump.
             st.notify.broadcast("debug/stopped", json!({
                 "session_id": st.session.id,
-                "stop": { "reason": "step", "pc": pc, "cycles": cycles },
+                "stop": { "reason": "step", "pc": pc as u64, "cycles": cycles },
                 "registers": registers,
             }));
-            Response::ok(id, json!({
-                "runState": "paused",
-                "pc": pc,
-                "a": c.reg_a as u64,
-                "x": c.reg_x as u64,
-                "y": c.reg_y as u64,
-                "sp": c.reg_sp as u64,
-                "flags": c.flags() as u64,
-                "cycles": cycles
-            }))
+            // audit ws-session-debug-4 — debug/step returns the FULL controller.state()
+            // shape (runtime-controller.ts:344-363), NOT a flat register dict. TS returns
+            // c.state() = {runState,pacing,pc,cycles,frame,breakpoints,stop,controlOwner}
+            // (ws-server.ts:994-1000). build_debug_state is that exact shape.
+            Response::ok(id, build_debug_state(&st))
         }
 
         // debug/state — the RuntimeController.state() snapshot (runtime-controller.ts
@@ -9381,9 +9511,14 @@ mod batch1_tests {
 
     #[test]
     fn debug_run_pushes_breakpoint_hit_notification() {
-        // BEHAVIORAL: a breakpoint set + debug/run → the client receives a
-        // `debug/breakpoint_hit` notification (not just the response) at the halt PC,
-        // with the c64re shape { session_id, pc, num, cycles, registers }.
+        // BEHAVIORAL: audit ws-session-debug-1 — debug/run is ASYNC-SCHEDULED. It
+        // replies `running` IMMEDIATELY (= TS controller.run() → ctrl.state(), never
+        // blocking) and does NOT run inline; the (P0-A) bp/observer/JAM-aware driver
+        // (`stream_debug_gated_advance`, the SOLE --stream machine driver) self-halts at
+        // the first hit and server-PUSHes `debug/breakpoint_hit` at the halt PC with the
+        // c64re shape { session_id, pc, num, cycles, registers }. This test drives that
+        // production driver directly (no stream loop runs in-process) after the async
+        // debug/run, exactly mirroring the --stream loop.
         let st = make_state();
         let mut rx = probe_notifications(&st);
         // Poke a runnable program at $C000: NOP; NOP; NOP; … (EA), so a numbered
@@ -9400,15 +9535,22 @@ mod batch1_tests {
         // Add a numbered breakpoint at $C003 and run.
         let added = call(&st, "debug/break_add", json!({ "pc": 0xc003 }));
         let num = added["num"].as_u64().unwrap();
+        // debug/run replies 'running' immediately (async contract) — it does NOT halt.
         let run = call(&st, "debug/run", json!({}));
-        assert_eq!(run["runState"], json!("paused"), "halted at the bp");
-        assert_eq!(run["pc"], json!(0xc003));
+        assert_eq!(run["runState"], json!("running"), "debug/run replies running (async)");
+        assert!(run["stop"].is_null(), "no halt inline — the driver halts later");
+        // Drive the production --stream per-frame driver until the bp trips (running
+        // gate is set by debug/run). One PAL frame is far more than the 3 NOPs need.
+        {
+            let mut g = st.lock().unwrap();
+            stream_debug_gated_advance(&mut g, 100_000);
+        }
 
         let notes = drain_notifications(&mut rx);
         let hit = notes
             .iter()
             .find(|(m, _)| m == "debug/breakpoint_hit")
-            .expect("a debug/breakpoint_hit push was enqueued");
+            .expect("a debug/breakpoint_hit push was enqueued by the driver");
         let p = &hit.1;
         assert_eq!(p["session_id"], json!("integrated-1"));
         assert_eq!(p["pc"], json!(0xc003), "halt PC");
@@ -9418,6 +9560,8 @@ mod batch1_tests {
         let regs = p["registers"].as_str().unwrap();
         assert!(regs.contains("ADDR AC XR YR SP NV-BDIZC"), "register dump header");
         assert!(regs.contains(".;C003"), "dump shows the halt PC");
+        // The driver also froze the machine (running=false) on the halt.
+        assert!(!st.lock().unwrap().session.running, "driver freezes on halt");
     }
 
     #[test]

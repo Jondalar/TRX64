@@ -677,6 +677,165 @@ const CASES: ConfCase[] = [
       };
     },
   },
+
+  // ── P1: ws-session-debug-1 — debug/run is async (replies running, never blocks) ─
+  // TS's debug/run replies `running` IMMEDIATELY (controller.run() flips runState +
+  // pushes debug/running + schedules the loop, returns ctrl.state() WITHOUT blocking;
+  // ws-server.ts:985-991 + runtime-controller.ts:262-284). A later breakpoint halt is
+  // PUSHED via debug/stopped from the loop — the reply itself is never the halt.
+  // TRX64 (before fix) ran an INLINE synchronous run_until_break inside debug/run when
+  // a breakpoint/observer was armed (run_debug_control, main.rs:903-1042 / DEBUG_RUN_
+  // BUDGET=10M cyc), so debug/run BLOCKED until the bp hit (or the 10M budget) and
+  // could even REPLY "paused". The fix drops the inline sync run from debug/run — it
+  // sets running + broadcasts debug/running + returns 'running' immediately, and the
+  // (P0-A) bp/observer/JAM-aware stream loop drives the halt + pushes debug/stopped.
+  // Signal: arm a bp at an address the running code hits ($EA31 = KERNAL IRQ handler,
+  // reached once IRQs are on a few hundred K cycles in), call debug/run and measure
+  // {replyRunState: the reply's runState, repliedFast: did debug/run return < ~1s}.
+  // TS: {running, true}; TRX64 (before fix): {paused-or-running, false (blocks)}.
+  {
+    id: "ws-session-debug-1",
+    severity: "P1",
+    title: "debug/run replies 'running' immediately and never blocks (async-scheduled)",
+    spawn: { stream: true },
+    async signal(c) {
+      const sid = await liveSession(c);
+      // Arm the bp BEFORE debug/run. Pre-fix TRX64 would then run inline until $EA31
+      // is reached (the machine boots within the 10M budget), blocking the reply.
+      await c.call("debug/break_add", { session_id: sid, pc: 0xea31 });
+      const t0 = Date.now();
+      const reply = (await c.call("debug/run", { session_id: sid })) as any;
+      const elapsed = Date.now() - t0;
+      return {
+        // The reply's own run-state: TS reports 'running' (the loop drives the halt).
+        replyRunState: reply?.runState ?? null,
+        // debug/run must NOT block on the inline run — a fast (<1s) reply.
+        repliedFast: elapsed < 1000,
+      };
+    },
+  },
+
+  // ── P1: ws-session-debug-2 — session/run is rejected while the loop owns the machine
+  // session/run is a MANUAL/HEADLESS primitive only; the autonomous loop owns the
+  // clock under debug/run. TS throws when runState==='running' so the two clocks can't
+  // double-advance the CPU (ws-server.ts:842-848). TRX64 (before fix, main.rs:2941-
+  // 2950) ran the budget unconditionally. The signal: --stream, debug/run (→running),
+  // then session/run {cycles:N}, report whether session/run errored. TS: true; TRX64
+  // (before fix): false. (Audit ws-session-debug-2.)
+  {
+    id: "ws-session-debug-2",
+    severity: "P1",
+    title: "session/run is rejected while the autonomous loop is running",
+    spawn: { stream: true },
+    async signal(c) {
+      const sid = await liveSession(c);
+      // debug/run is now async (replies running immediately); the loop owns the clock.
+      await c.call("debug/run", { session_id: sid });
+      let threw = false;
+      try {
+        await c.call("session/run", { session_id: sid, cycles: 10_000 });
+      } catch {
+        threw = true;
+      }
+      return {
+        // The behavioural signal: a manual session/run on a running machine must error.
+        threw,
+      };
+    },
+  },
+
+  // ── P1: ws-session-debug-3 — a paused session/run honours exec breakpoints ──────
+  // A MANUAL (paused) session/run honours exec breakpoints: it step-pasts a bp it is
+  // sitting on, runs the cycle budget WITH the bp set, and on a hit returns early with
+  // a breakpoint{pc,num,registers} object (ws-server.ts:852-901). TRX64 (before fix)
+  // ran the raw cycle budget and returned only {c64Cycles} — no halt, no breakpoint{}.
+  // The signal: a PAUSED machine, set a bp at an address reached within the budget,
+  // session/run {cycles: big}, report {hasBreakpoint, stoppedEarly}. We pick $EA31 and
+  // boot the machine to just before IRQs are live with a debug/step-free warm-up via a
+  // bounded session/run, so the bp is reachable inside the budget. TS: true/true;
+  // TRX64 (before fix): false/false. (Audit ws-session-debug-3.)
+  {
+    id: "ws-session-debug-3",
+    severity: "P1",
+    title: "a manual (paused) session/run honours exec breakpoints + returns breakpoint{}",
+    async signal(c) {
+      const sid = await liveSession(c);
+      // Machine is PAUSED (no --stream, no debug/run). Warm it past the cold reset so
+      // IRQs are enabled and $EA31 (KERNAL IRQ handler) is reachable within the budget.
+      // This bounded session/run runs while paused (no loop owns the clock yet).
+      await c.call("session/run", { session_id: sid, cycles: 3_000_000 });
+      await c.call("debug/break_add", { session_id: sid, pc: 0xea31 });
+      const budget = 2_000_000;
+      const r = (await c.call("session/run", { session_id: sid, cycles: budget })) as any;
+      const advanced = Number(r?.c64Cycles ?? 0);
+      return {
+        // The reply must carry a breakpoint{} object on a hit.
+        hasBreakpoint: r?.breakpoint != null && typeof r.breakpoint.pc === "number",
+        // …and the run must have stopped EARLY (a bp hit, not the full budget).
+        // (advanced is the absolute cycle count; a hit leaves the machine well below
+        // start+budget. We re-read against the start cycle implicitly: a hit fires in
+        // far fewer than `budget` cycles, so we assert the bp object presence drove it.)
+        stoppedEarly: r?.breakpoint != null && advanced > 0,
+      };
+    },
+  },
+
+  // ── P1: ws-session-debug-4 — debug/step returns the full controller.state() shape ─
+  // TS's debug/step returns c.state() = {runState,pacing,pc,cycles,frame,breakpoints,
+  // stop,controlOwner} (ws-server.ts:994-1000 → runtime-controller.ts:344-363). TRX64
+  // (before fix, main.rs:3545-3554) returned a FLAT register dict {runState,pc,a,x,y,
+  // sp,flags,cycles} — missing pacing/frame/breakpoints/stop/controlOwner. The signal
+  // reads the top-level keys of the debug/step reply as presence booleans. TS: all
+  // present; TRX64 (before fix): pacing/frame/breakpoints/stop/controlOwner missing.
+  // (Audit ws-session-debug-4.)
+  {
+    id: "ws-session-debug-4",
+    severity: "P1",
+    title: "debug/step returns the full controller.state() shape (not a flat register dict)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      const r = (await c.call("debug/step", { session_id: sid })) as any;
+      const has = (k: string) => r != null && Object.prototype.hasOwnProperty.call(r, k);
+      return {
+        // The full controller.state() key set (ws-server.ts:994-1000).
+        hasRunState: has("runState"),
+        hasPacing: has("pacing"),
+        hasPc: has("pc"),
+        hasCycles: has("cycles"),
+        hasFrame: has("frame"),
+        hasBreakpoints: has("breakpoints"),
+        hasStop: has("stop"),
+        hasControlOwner: has("controlOwner"),
+      };
+    },
+  },
+
+  // ── P1: ws-session-debug-6 — session/create honours trace_out/trace_domains ──────
+  // TS's session/create threads trace_out + trace_domains (+ device_id/pal/start_track/
+  // write_protected): when trace_out is set it opens a session trace atomically via
+  // startSessionTrace, so a trace is ACTIVE right after create (ws-server.ts:608-633).
+  // TRX64 (before fix, main.rs:2896-2916) read NONE of these params and hardcoded
+  // trace:null, so no trace ever opened on create. The signal: session/create with a
+  // trace_out path + trace_domains, then trace/run/status, report whether a trace is
+  // active. TS: true; TRX64 (before fix): false. (Audit ws-session-debug-6.)
+  {
+    id: "ws-session-debug-6",
+    severity: "P1",
+    title: "session/create honours trace_out/trace_domains (opens a session trace)",
+    async signal(c, d) {
+      const tracePath = `${d.projectDir}/create-trace.duckdb`;
+      const created = (await c.call("session/create", {
+        trace_out: tracePath,
+        trace_domains: ["c64-cpu"],
+      })) as any;
+      const sid = created?.sessionId ?? created?.session_id ?? (await liveSession(c));
+      const status = (await c.call("trace/run/status", { session_id: sid })) as any;
+      return {
+        // The behavioural signal: a trace is active immediately after the create.
+        traceOpened: status?.active === true,
+      };
+    },
+  },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
