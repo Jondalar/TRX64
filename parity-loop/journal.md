@@ -66,3 +66,12 @@ daemon-wide wedge (new connections can't even handshake). FIX (next focused sess
 make restore_live_checkpoint restore the drive clock + via1/via2 alarm_context consistently
 (same CLK_BASE), and/or bound run_pending_alarms catch-up. Repro: boot, run a few s (ring
 auto-captures), pause, restore an earlier checkpoint, run.
+
+## 2026-06-25 — scrub/long-run wedge: ROOT FOUND + safety shipped
+sample(wedged daemon) → viacore::run_pending_alarms infinite spin. ROOT: drive viacore
+arms alarm deadlines u32-masked (& 0xffff_ffff) but drive clock is u64-monotonic
+(Spec-743/BUG-025 not extended to the 1541 drive viacore) → drive clk > 2^32 makes the
+deadline unreachable → ~4e9-iter catch-up holding the state Mutex → daemon-wide wedge.
+Shipped a wedge-SAFETY (bail on gap > 2^31). REAL FIX = u64-monotonic viacore (drop the
+~20 u32 masks), differential-tested vs VICE — own focused task. Repro: warp ~9 min (or
+71 min real) to push drive clk past 2^32, then run_pending_alarms spins.
