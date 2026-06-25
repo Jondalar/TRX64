@@ -236,6 +236,15 @@ struct State {
     /// attached=true (attaching to the existing machine). Mirrors c64re one-machine-
     /// per-process semantics (runtimeSessions.start checks listIntegratedSessions[0]).
     session_created: bool,
+    /// T1.3 — current pacing mode (RuntimeController.pacing.mode). One of "pal",
+    /// "warp", "fixed-ratio". Stored here because TRX64 has no autonomous pacing
+    /// loop; session/set_pacing sets it and debug/state reads it back exactly as the
+    /// TS RuntimeController does (build_debug_state mirrors c.state()).
+    pacing_mode: String,
+    /// T1.3 — current pacing ratio (RuntimeController.pacing.ratio). Positive f64;
+    /// defaults to 1.0 (1× PAL speed). Mirrored from TS: `if (ratio && ratio > 0)
+    /// this.pacing.ratio = ratio` (runtime-controller.ts:331).
+    pacing_ratio: f64,
 }
 
 /// Spec 271 — one in-process batch (= c64re `BatchEntry`). Results are stored as a
@@ -567,9 +576,10 @@ fn run_debug_control(id: Value, st: &mut State, frame: u64, is_continue: bool) -
         let bps = st.breakpoints.list_vice_json();
         let pc = st.session.machine.c64_core.reg_pc as u64;
         let cycles = st.session.machine.clk;
+        let (pacing_mode, pacing_ratio) = (st.pacing_mode.clone(), st.pacing_ratio);
         return Response::ok(id, json!({
             "runState": "running",
-            "pacing": { "mode": "pal", "ratio": 1 },
+            "pacing": { "mode": pacing_mode, "ratio": pacing_ratio },
             "pc": pc,
             "cycles": cycles,
             "frame": frame,
@@ -653,9 +663,10 @@ fn run_debug_control(id: Value, st: &mut State, frame: u64, is_continue: bool) -
             "stop": stop.clone(),
             "registers": registers,
         }));
+        let (pacing_mode, pacing_ratio) = (st.pacing_mode.clone(), st.pacing_ratio);
         Response::ok(id, json!({
             "runState": "paused",
-            "pacing": { "mode": "pal", "ratio": 1 },
+            "pacing": { "mode": pacing_mode, "ratio": pacing_ratio },
             "pc": run.pc as u64,
             "cycles": cycles,
             "frame": frame,
@@ -666,9 +677,10 @@ fn run_debug_control(id: Value, st: &mut State, frame: u64, is_continue: bool) -
     } else {
         // Budget exhausted without a hit: the machine advanced; report running.
         let pc = st.session.machine.c64_core.reg_pc as u64;
+        let (pacing_mode, pacing_ratio) = (st.pacing_mode.clone(), st.pacing_ratio);
         Response::ok(id, json!({
             "runState": "running",
-            "pacing": { "mode": "pal", "ratio": 1 },
+            "pacing": { "mode": pacing_mode, "ratio": pacing_ratio },
             "pc": pc,
             "cycles": cycles,
             "frame": frame,
@@ -1938,6 +1950,31 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             }))
         }
 
+        // session/set_pacing — T1.3. TS ws-server.ts:1378.
+        // Validates mode ∈ {"pal","warp","fixed-ratio"} (-32602 on bad mode).
+        // Calls ctrl.setPacing(mode, ratio): stores mode unconditionally; stores ratio
+        // only if it is truthy AND > 0 (mirrors runtime-controller.ts:329-331).
+        // TRX64 has no autonomous pacing loop (no resetPaceEpoch), so we only update
+        // the stored fields in State. Returns build_debug_state (= c.state() shape).
+        "session/set_pacing" => {
+            let mode = match req.params.get("mode").and_then(|v| v.as_str()) {
+                Some(m) => m.to_string(),
+                None => return Response::err(id, -32602, "bad pacing mode: null"),
+            };
+            if !matches!(mode.as_str(), "pal" | "warp" | "fixed-ratio") {
+                return Response::err(id, -32602, format!("bad pacing mode: {mode}"));
+            }
+            let ratio = req.params.get("ratio").and_then(|v| v.as_f64());
+            let mut st = state.lock().unwrap();
+            st.pacing_mode = mode;
+            if let Some(r) = ratio {
+                if r > 0.0 {
+                    st.pacing_ratio = r;
+                }
+            }
+            Response::ok(id, build_debug_state(&st))
+        }
+
         // session/drive_status — drive LED/motor/track/PC + IEC bus snapshot
         // (ws-server.ts:1499). c64re's vice probe lacks a motor flag and approximates
         // motorOn from the LED; TRX64 is the mirror — the motor bit
@@ -2082,9 +2119,10 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             // display (and its keyboard handler, gated on runState==="running", never
             // attaches → "can't type"). Emit BEFORE run_debug_control so a same-tick
             // breakpoint halt still emits in TS order (running → breakpoint_hit/stopped).
+            let pacing_snap = json!({ "mode": st.pacing_mode, "ratio": st.pacing_ratio });
             st.notify.broadcast("debug/running", json!({
                 "session_id": st.session.id,
-                "pacing": { "mode": "pal", "ratio": 1 },
+                "pacing": pacing_snap,
             }));
             run_debug_control(id, &mut st, frame, false)
         }
@@ -2105,9 +2143,10 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 "session_id": st.session.id,
                 "stop": stop_obj.clone(),
             }));
+            let (pacing_mode, pacing_ratio) = (st.pacing_mode.clone(), st.pacing_ratio);
             Response::ok(id, json!({
                 "runState": "paused",
-                "pacing": { "mode": "pal", "ratio": 1 },
+                "pacing": { "mode": pacing_mode, "ratio": pacing_ratio },
                 "pc": pc,
                 "cycles": cycles,
                 "frame": frame,
@@ -2123,9 +2162,10 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             st.ctrl_stop = None;
             // Spec 771.2 — continue() === run() in runtime-controller.ts:287, so it
             // server-PUSHes debug/running too.
+            let pacing_snap = json!({ "mode": st.pacing_mode, "ratio": st.pacing_ratio });
             st.notify.broadcast("debug/running", json!({
                 "session_id": st.session.id,
-                "pacing": { "mode": "pal", "ratio": 1 },
+                "pacing": pacing_snap,
             }));
             // TS: continue does not increment frame (stays at pause frame).
             let frame = st.ctrl_frame;
@@ -4746,9 +4786,11 @@ fn build_debug_state(st: &State) -> Value {
         Some(s) => json!({ "reason": s.reason, "pc": s.pc as u64, "cycles": s.cycles }),
         None => Value::Null,
     };
+    // T1.3: pacing is stored in State (session/set_pacing mutates it); default "pal"/1.
+    // Mirrors TS RuntimeController.state() → { pacing: { ...this.pacing } }.
     json!({
         "runState": run_state,
-        "pacing": { "mode": "pal", "ratio": 1 },
+        "pacing": { "mode": st.pacing_mode, "ratio": st.pacing_ratio },
         "pc": pc,
         "cycles": cycles,
         "frame": st.ctrl_frame,
@@ -5298,6 +5340,8 @@ async fn main() {
         notify: streaming::NotifyHub::new(),
         streaming_enabled: streaming_on,
         session_created: false,
+        pacing_mode: "pal".to_string(),
+        pacing_ratio: 1.0,
     }));
 
     // The singleton live A/V stream hub (ADR-073): one pacing loop drives the
@@ -5365,6 +5409,8 @@ mod batch1_tests {
             notify: streaming::NotifyHub::new(),
             streaming_enabled: false,
             session_created: false,
+            pacing_mode: "pal".to_string(),
+            pacing_ratio: 1.0,
         }))
     }
 
@@ -5505,7 +5551,9 @@ mod batch1_tests {
         let r = call(&st, "debug/state", json!({}));
         assert_eq!(r["runState"], json!("paused"));
         assert_eq!(r["pacing"]["mode"], json!("pal"));
-        assert_eq!(r["pacing"]["ratio"], json!(1));
+        // T1.3: pacing_ratio is stored as f64 (1.0); json!(1) is an integer
+        // literal — compare as f64 to avoid serde_json Number type mismatch.
+        assert_eq!(r["pacing"]["ratio"].as_f64(), Some(1.0));
         assert!(r["pc"].is_u64());
         assert!(r["cycles"].is_u64());
         assert!(r["frame"].is_u64());
