@@ -7,7 +7,12 @@
 
 use std::collections::BTreeMap;
 
-const GOLDEN: &[u8] = include_bytes!("fixtures/vsf/c64re-reset.vsf");
+/// The golden c64re VSF carries copyrighted Commodore ROM data, so it is NOT
+/// tracked in the repo (gitignored). Read it at runtime if present; the test
+/// skips cleanly when it is absent (e.g. a fresh clone).
+fn golden_bytes() -> Option<Vec<u8>> {
+    std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/vsf/c64re-reset.vsf")).ok()
+}
 
 /// Parse a compact-format VSF into (name -> data bytes), in file order.
 fn parse_modules(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
@@ -35,16 +40,21 @@ fn parse_modules(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
 
 #[test]
 fn golden_c64re_roundtrip_diff() {
+    let Some(golden) = golden_bytes() else {
+        eprintln!("SKIP golden_c64re_roundtrip_diff: tests/fixtures/vsf/c64re-reset.vsf absent (copyrighted ROM data, not in repo)");
+        return;
+    };
+    let golden: &[u8] = &golden;
     let mut m = trx64_core::Machine::new();
     // Load the golden c64re VSF into TRX64.
-    let res = trx64_core::vsf::load_vsf(&mut m, GOLDEN).expect("load golden");
+    let res = trx64_core::vsf::load_vsf(&mut m, golden).expect("load golden");
     eprintln!("loaded modules: {:?}", res.loaded_modules);
     eprintln!("ignored modules: {:?}", res.ignored_modules);
     eprintln!("errors: {:?}", res.errors);
 
     // Re-save and diff per module.
     let resaved = trx64_core::vsf::save_vsf(&m);
-    let golden_mods: BTreeMap<_, _> = parse_modules(GOLDEN).into_iter().collect();
+    let golden_mods: BTreeMap<_, _> = parse_modules(golden).into_iter().collect();
     let resaved_mods: BTreeMap<_, _> = parse_modules(&resaved).into_iter().collect();
 
     for (name, gdata) in &golden_mods {

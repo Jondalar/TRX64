@@ -946,9 +946,15 @@ mod tests {
     /// pipeline modules are skipped.
     #[test]
     fn load_real_vice_motm() {
-        const MOTM: &[u8] = include_bytes!("../tests/fixtures/vsf/motm.vsf");
+        // motm.vsf is a copyrighted commercial-game snapshot — NOT tracked in the
+        // repo (gitignored). Read at runtime if present; skip cleanly if absent.
+        let Ok(motm) = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/vsf/motm.vsf")) else {
+            eprintln!("SKIP load_real_vice_motm: tests/fixtures/vsf/motm.vsf absent (copyrighted, not in repo)");
+            return;
+        };
+        let motm: &[u8] = &motm;
         let mut m = Machine::new();
-        let r = load_vsf(&mut m, MOTM).expect("load motm.vsf");
+        let r = load_vsf(&mut m, motm).expect("load motm.vsf");
         assert_eq!(r.source, "vice-x64sc");
         // The machine-state modules we map must all parse.
         for need in ["MAINCPU", "C64MEM", "CIA1", "CIA2", "SID", "VIC-II"] {

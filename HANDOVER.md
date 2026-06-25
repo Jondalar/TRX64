@@ -93,8 +93,10 @@ only for the optional beyond-parity extras.
 - **No `git worktree` auto-isolation** in this harness — parallel file-mutating builders need *manual* `git
   worktree add` (the loop used `/tmp/trx64-mm` merge worktrees; file-disjoint branches merge clean).
 - The 7-game gate `g8_maniac` needs `GATE_BUDGET=600000000` (slow standard-serial multi-file loader).
-- `samples/motm.vsf` (a copyrighted game snapshot) is tracked as a test fixture — **remove before any public
-  push.** Repo `Jondalar/TRX64` is private.
+- The `.vsf` test fixtures (`tests/fixtures/vsf/motm.vsf` = a copyrighted game snapshot, `c64re-reset.vsf` =
+  Commodore ROM data) are **gitignored / untracked** — kept local-only. The two tests that use them
+  (`load_real_vice_motm`, `vsf_parity_probe`) runtime-read + **skip cleanly when absent**, so a fresh clone
+  builds + tests green without them. Repo `Jondalar/TRX64` is private.
 - `resid_oracle` flakes only under parallel test scheduling (the reSID shim is a process-global singleton).
 - Pre-existing harmless REDs: `iso-vic-badline-irq`/`-sprites` (VIC-cycle-count gaps vs the imperfect oracle),
   `scramble-load-progress` end5 (1-byte custom-loader phase residual). Documented; not regressions.

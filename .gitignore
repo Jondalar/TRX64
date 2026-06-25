@@ -10,3 +10,6 @@ tools/oracle/corpus/**/*.out
 # scratch goldens — non-deterministic until scenario isolation lands; regenerate locally
 tools/oracle/corpus/**/*.golden.json
 .DS_Store
+
+# Copyrighted Commodore ROM / commercial-game snapshots — local-only test fixtures, never tracked
+crates/trx64-core/tests/fixtures/vsf/*.vsf
