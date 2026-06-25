@@ -199,6 +199,12 @@ pub struct FullBus<'a> {
     /// Keyboard matrix (CIA1 PA column drive ↔ PB row read). Read on a $DC01
     /// access to inject queued `session/type` key presses.
     pub keyboard: &'a crate::keyboard::KeyboardMatrix,
+    /// Spec 310 / Sprint 93.1 — joystick port 1 (CIA1 PB bits 0-4, active-low),
+    /// folded into the $DC01 PB read. 1:1 with c64re `joystick1`.
+    pub joystick1: crate::keyboard::JoystickState,
+    /// Joystick port 2 (CIA1 PA bits 0-4, active-low), folded into the $DC00 PA
+    /// read. 1:1 with c64re `joystick2`. Copied by value (read-only this cycle).
+    pub joystick2: crate::keyboard::JoystickState,
     /// Monotonic C64-clock the drive has been advanced up to (push-flush reference).
     pub drive_c64_ref: u64,
     /// The attached cartridge mapper (= memory-bus.ts `cartridge`, ts:118), or
@@ -365,13 +371,28 @@ impl<'a> FullBus<'a> {
                 (v & 0x0f) | 0xf0
             }
             0xdc00..=0xdcff => {
-                // CIA1 PB ($DC01) carries the keyboard ROW lines. VICE
-                // c64cia1.c:425-431 read_ciapb: byte = (val & (PRB|~DDRB)) |
-                // (DDRB & PRB), then ANDed with joystick-port-1 (none here).
-                // `val` = keyboard row pull-down for the PA column drive
-                // (paOut = PRA|~DDRA). KERNAL programs DDRB=0 so this collapses
-                // to `val`, but we compute the full formula for fidelity.
-                if (addr & 0xf) == crate::cia::CIA_PRB as u16 {
+                // CIA1 PA ($DC00) carries the keyboard COLUMN drive output AND
+                // joystick port 2 (bits 0-4, active-low). VICE c64cia1.c:337
+                // read_ciapa: byte = (val & (PRA|~DDRA)) & read_joyport_dig(JOY2),
+                // where `val` is the keyboard back-scan (= 0xff in the dominant
+                // case — KERNAL never drives PB columns). c64re cia1.ts:86-92
+                // collapses this to `((PRA | ~DDRA) & joy2) & 0xff`. The joystick
+                // pulls bits LOW via the final AND, regardless of DDR / PR latch.
+                if (addr & 0xf) == crate::cia::CIA_PRA as u16 {
+                    let pra = self.cia1.peek(0xdc00);
+                    let ddra = self.cia1.peek(0xdc02);
+                    let joy = crate::keyboard::joystick_active_low_mask(&self.joystick2);
+                    ((pra | !ddra) & joy) & 0xff
+                }
+                // CIA1 PB ($DC01) carries the keyboard ROW lines AND joystick
+                // port 1 (bits 0-4, active-low). VICE c64cia1.c:425-431 read_ciapb:
+                // byte = (val & (PRB|~DDRB)) | (DDRB & PRB), then ANDed with
+                // joystick-port-1 (read_joyport_dig(JOY1)). `val` = keyboard row
+                // pull-down for the PA column drive (paOut = PRA|~DDRA). KERNAL
+                // programs DDRB=0 so the latch term collapses to `val`, but we
+                // compute the full formula + joy1 AND for fidelity (c64re
+                // cia1.ts:101-112).
+                else if (addr & 0xf) == crate::cia::CIA_PRB as u16 {
                     let pra = self.cia1.peek(0xdc00);
                     let ddra = self.cia1.peek(0xdc02);
                     let prb = self.cia1.peek(0xdc01);
@@ -379,7 +400,8 @@ impl<'a> FullBus<'a> {
                     let pa_out = (pra | !ddra) & 0xff;
                     let val = self.keyboard.read_rows_for_pa(self.clk, pa_out);
                     let val_out_hi = ddrb & prb;
-                    (val & ((prb | !ddrb) & 0xff)) | val_out_hi
+                    let joy_mask = crate::keyboard::joystick_active_low_mask(&self.joystick1);
+                    (((val & ((prb | !ddrb) & 0xff)) | val_out_hi) & joy_mask) & 0xff
                 } else {
                     self.cia1.read(addr, self.clk, self.cia_table)
                 }
@@ -782,6 +804,164 @@ impl<'a> Bus for FullBus<'a> {
     fn take_side_effect_reads(&mut self, out: &mut Vec<(u16, u8)>) {
         if !self.read_side_effects.is_empty() {
             out.append(&mut self.read_side_effects);
+        }
+    }
+}
+
+#[cfg(test)]
+mod joystick_gate_tests {
+    //! T1.7 gate — a game/test that reads CIA1 PA ($DC00) / PB ($DC01) must see
+    //! the joystick bits (active-low). Mirrors c64re cia1.ts readPa/readPb.
+    use super::*;
+    use crate::keyboard::{JoystickState, KeyboardMatrix};
+
+    fn make_bus<'a>(
+        ram: &'a mut [u8; 0x10000],
+        basic: &'a [u8; 0x2000],
+        kernal: &'a [u8; 0x2000],
+        chargen: &'a [u8; 0x1000],
+        io: &'a mut [u8; 0x1000],
+        vic: &'a mut VicII,
+        cia1: &'a mut Cia,
+        cia2: &'a mut Cia,
+        tab: &'a [u16; CIAT_TABLEN],
+        sid_regs: &'a mut [u8; 32],
+        sid: &'a mut Sid6581,
+        mct: &'a [MemConfig; 32],
+        drive: &'a mut crate::drive::Drive1541,
+        iec: &'a mut crate::iec::IecCore,
+        kb: &'a KeyboardMatrix,
+        joy1: JoystickState,
+        joy2: JoystickState,
+    ) -> FullBus<'a> {
+        FullBus {
+            ram,
+            basic_rom: basic,
+            kernal_rom: kernal,
+            char_rom: chargen,
+            io,
+            vic,
+            cia1,
+            cia2,
+            cia_table: tab,
+            sid_regs,
+            sid,
+            config: mct[0x1f],
+            memconfig_table: mct,
+            port_dir: 0x2f,
+            port_data: 0x37,
+            clk: 0,
+            cia2_pa_out: 0xff,
+            side_effects: Vec::new(),
+            read_side_effects: Vec::new(),
+            drive,
+            iec,
+            keyboard: kb,
+            joystick1: joy1,
+            joystick2: joy2,
+            drive_c64_ref: 0,
+            cartridge: None,
+        }
+    }
+
+    #[test]
+    fn dc00_pa_read_sees_joystick2_active_low() {
+        // Port 2 → CIA1 PA ($DC00). DDRA=0 (power-on) ⇒ (PRA|~DDRA)=0xff, then
+        // ANDed with the joy2 active-low mask. c64re cia1.ts:86-92.
+        let mut ram = [0u8; 0x10000];
+        let basic = [0u8; 0x2000];
+        let kernal = [0u8; 0x2000];
+        let chargen = [0u8; 0x1000];
+        let mut io = [0u8; 0x1000];
+        let mut vic = VicII::new();
+        let mut cia1 = Cia::new();
+        let mut cia2 = Cia::new();
+        let tab = crate::cia::new_table();
+        let mut sid_regs = [0u8; 32];
+        let mut sid = Sid6581::new();
+        let mct = build_memconfig_table();
+        let mut drive = crate::drive::Drive1541::new();
+        let mut iec = crate::iec::IecCore::new();
+        let kb = KeyboardMatrix::new();
+
+        // Released: $DC00 reads 0xff (no bit pulled).
+        {
+            let mut bus = make_bus(
+                &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
+                &mut cia2, &tab, &mut sid_regs, &mut sid, &mct, &mut drive, &mut iec,
+                &kb, JoystickState::default(), JoystickState::default(),
+            );
+            assert_eq!(bus.io_read(0xdc00), 0xff, "released joy2 → all PA bits high");
+        }
+        // FIRE pressed: bit4 pulled low → 0xef.
+        {
+            let joy2 = JoystickState { fire: true, ..Default::default() };
+            let mut bus = make_bus(
+                &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
+                &mut cia2, &tab, &mut sid_regs, &mut sid, &mct, &mut drive, &mut iec,
+                &kb, JoystickState::default(), joy2,
+            );
+            assert_eq!(bus.io_read(0xdc00), 0xff & !(1 << 4), "joy2 fire → PA bit4 low");
+        }
+        // UP+LEFT pressed: bits 0+2 pulled low.
+        {
+            let joy2 = JoystickState { up: true, left: true, ..Default::default() };
+            let mut bus = make_bus(
+                &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
+                &mut cia2, &tab, &mut sid_regs, &mut sid, &mct, &mut drive, &mut iec,
+                &kb, JoystickState::default(), joy2,
+            );
+            assert_eq!(bus.io_read(0xdc00), 0xff & !0x05, "joy2 up+left → PA bits 0+2 low");
+        }
+    }
+
+    #[test]
+    fn dc01_pb_read_sees_joystick1_active_low() {
+        // Port 1 → CIA1 PB ($DC01). No keys held ⇒ val=0xff, DDRB=0 ⇒ result =
+        // 0xff & joy1 mask. c64re cia1.ts:101-112.
+        let mut ram = [0u8; 0x10000];
+        let basic = [0u8; 0x2000];
+        let kernal = [0u8; 0x2000];
+        let chargen = [0u8; 0x1000];
+        let mut io = [0u8; 0x1000];
+        let mut vic = VicII::new();
+        let mut cia1 = Cia::new();
+        let mut cia2 = Cia::new();
+        let tab = crate::cia::new_table();
+        let mut sid_regs = [0u8; 32];
+        let mut sid = Sid6581::new();
+        let mct = build_memconfig_table();
+        let mut drive = crate::drive::Drive1541::new();
+        let mut iec = crate::iec::IecCore::new();
+        let kb = KeyboardMatrix::new();
+
+        {
+            let mut bus = make_bus(
+                &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
+                &mut cia2, &tab, &mut sid_regs, &mut sid, &mct, &mut drive, &mut iec,
+                &kb, JoystickState::default(), JoystickState::default(),
+            );
+            assert_eq!(bus.io_read(0xdc01), 0xff, "released joy1 → all PB bits high");
+        }
+        {
+            // RIGHT pressed: bit3 low → 0xf7.
+            let joy1 = JoystickState { right: true, ..Default::default() };
+            let mut bus = make_bus(
+                &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
+                &mut cia2, &tab, &mut sid_regs, &mut sid, &mct, &mut drive, &mut iec,
+                &kb, joy1, JoystickState::default(),
+            );
+            assert_eq!(bus.io_read(0xdc01), 0xff & !(1 << 3), "joy1 right → PB bit3 low");
+        }
+        {
+            // DOWN+FIRE: bits 1+4 low.
+            let joy1 = JoystickState { down: true, fire: true, ..Default::default() };
+            let mut bus = make_bus(
+                &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
+                &mut cia2, &tab, &mut sid_regs, &mut sid, &mct, &mut drive, &mut iec,
+                &kb, joy1, JoystickState::default(),
+            );
+            assert_eq!(bus.io_read(0xdc01), 0xff & !0x12, "joy1 down+fire → PB bits 1+4 low");
         }
     }
 }

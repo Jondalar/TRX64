@@ -25,15 +25,12 @@
 /// scenario-player.ts:34 — default PAL cycles per frame.
 pub const DEFAULT_CYCLES_PER_FRAME: u64 = 19656;
 
-/// scenario-player.ts:22-27 — joystick state (all fields optional / default false).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct JoystickState {
-    pub up: bool,
-    pub down: bool,
-    pub left: bool,
-    pub right: bool,
-    pub fire: bool,
-}
+/// scenario-player.ts:22-27 — joystick state (all fields optional / default
+/// false). Re-export of the canonical `keyboard::JoystickState` (the TS golden
+/// declares `JoystickState` in `peripherals/keyboard.ts` and scenario-player.ts
+/// imports it), so the scenario replay and the live CIA1 joystick model share
+/// one type (no double declaration).
+pub use crate::keyboard::JoystickState;
 
 /// scenario-player.ts:27 — one entry of a composite joystickScript.
 #[derive(Debug, Clone)]

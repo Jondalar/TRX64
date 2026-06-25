@@ -2034,22 +2034,49 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             }))
         }
 
+        // session/joystick_set — virtual joystick state (ws-server.ts:1468). UI
+        // maps WASD+Space → bits and POSTs the resolved port + bits. port==1 sets
+        // joystick1 (CIA1 PB), else joystick2 (CIA1 PA). Mirrors the TS
+        // `setJoystick1/2(state)` (the bits are coerced to bool, default false).
         "session/joystick_set" => {
-            // TRX64 has no joystick model (full.rs:366 — "none here"); accept the
-            // bits and no-op, matching the TS `{ ok: true }` shape.
+            let port = req.params.get("port").and_then(|v| v.as_u64()).unwrap_or(0);
+            let b = |k: &str| req.params.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+            let new_state = trx64_core::keyboard::JoystickState {
+                up: b("up"),
+                down: b("down"),
+                left: b("left"),
+                right: b("right"),
+                fire: b("fire"),
+            };
+            let mut st = state.lock().unwrap();
+            if port == 1 {
+                st.session.machine.joystick1 = new_state;
+            } else {
+                st.session.machine.joystick2 = new_state;
+            }
             Response::ok(id, json!({ "ok": true }))
         }
 
+        // session/joystick_clear — clear one or both joysticks (ws-server.ts:1475).
+        // `port` 1 → joystick1, 2 → joystick2, absent → both. Shape: TS
+        // `{ ok: true }`.
         "session/joystick_clear" => {
-            // No joystick model → clearing is a no-op. Shape matches ws-server.ts
-            // session/joystick_clear `{ ok: true }`.
+            let cleared = trx64_core::keyboard::JoystickState::default();
+            let port = req.params.get("port").and_then(|v| v.as_u64());
+            let mut st = state.lock().unwrap();
+            if port == Some(1) || port.is_none() {
+                st.session.machine.joystick1 = cleared;
+            }
+            if port == Some(2) || port.is_none() {
+                st.session.machine.joystick2 = cleared;
+            }
             Response::ok(id, json!({ "ok": true }))
         }
 
         // session/input_status — UI inspector read of pressed keys + joystick bits
         // (ws-server.ts:1486). Reports the held-key set via pressed_keys() (Spec
-        // 310, batch 2). TRX64 has no joystick model, so both joysticks read
-        // released. Shape matches the TS `{ pressed, joystick1, joystick2 }`.
+        // 310, batch 2) + the LIVE joystick1/joystick2 state. Shape matches the TS
+        // `{ pressed, joystick1, joystick2 }`.
         "session/input_status" => {
             let st = state.lock().unwrap();
             let pressed: Vec<Value> = st
@@ -2060,13 +2087,18 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 .into_iter()
                 .map(Value::String)
                 .collect();
-            let released = json!({
-                "up": false, "down": false, "left": false, "right": false, "fire": false
-            });
+            let joy_json = |j: &trx64_core::keyboard::JoystickState| {
+                json!({
+                    "up": j.up, "down": j.down, "left": j.left,
+                    "right": j.right, "fire": j.fire
+                })
+            };
+            let joystick1 = joy_json(&st.session.machine.joystick1);
+            let joystick2 = joy_json(&st.session.machine.joystick2);
             Response::ok(id, json!({
                 "pressed": Value::Array(pressed),
-                "joystick1": released,
-                "joystick2": released
+                "joystick1": joystick1,
+                "joystick2": joystick2
             }))
         }
 
@@ -2119,11 +2151,13 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         }
 
         // session/release_keys — release all held keys (ws-server.ts:1455). The TS
-        // also clears joystick state on release-all (focus-loss policy); TRX64 has
-        // no joystick model so that is a no-op here. Shape: TS `{ ok: true }`.
+        // also clears BOTH joysticks on release-all (focus-loss policy,
+        // ws-server.ts:1459-1461). Shape: TS `{ ok: true }`.
         "session/release_keys" => {
             let mut st = state.lock().unwrap();
             st.session.machine.keyboard.release_keys();
+            st.session.machine.joystick1 = trx64_core::keyboard::JoystickState::default();
+            st.session.machine.joystick2 = trx64_core::keyboard::JoystickState::default();
             Response::ok(id, json!({ "ok": true }))
         }
 
@@ -4915,9 +4949,9 @@ fn push_media_event(st: &mut State, event: Value) {
 }
 
 /// The scenario-player replay target over the live `Machine`. `type` drives the
-/// keyboard matrix (the implemented input path); joystick/paddle/restore are
-/// no-ops (TRX64 has no joystick model — same as the daemon's session/joystick_set
-/// stub). `run_for` advances the machine `cycleBudget` cycles (composite macros).
+/// keyboard matrix and `set_joystick1/2` drives the live CIA1 joystick model
+/// (port 1 = PB, port 2 = PA); paddle/restore are still no-ops. `run_for`
+/// advances the machine `cycleBudget` cycles (composite macros).
 struct MachineScenarioTarget<'a> {
     session: &'a mut Session,
 }
@@ -4929,8 +4963,16 @@ impl<'a> trx64_core::scenario_player::ScenarioTarget for MachineScenarioTarget<'
         let now = self.session.machine.cpu6510.clk;
         self.session.machine.keyboard.type_text(now, text, 80_000, 80_000);
     }
-    fn set_joystick1(&mut self, _state: trx64_core::scenario_player::JoystickState) {}
-    fn set_joystick2(&mut self, _state: trx64_core::scenario_player::JoystickState) {}
+    fn set_joystick1(&mut self, state: trx64_core::scenario_player::JoystickState) {
+        // scenario-player.ts:78 — session.setJoystick1(state). The scenario
+        // `JoystickState` is now the canonical `keyboard::JoystickState` (re-export),
+        // so it drops straight into the live machine's port 1 (CIA1 PB).
+        self.session.machine.joystick1 = state;
+    }
+    fn set_joystick2(&mut self, state: trx64_core::scenario_player::JoystickState) {
+        // scenario-player.ts:81 — session.setJoystick2(state) → port 2 (CIA1 PA).
+        self.session.machine.joystick2 = state;
+    }
     fn set_paddle(&mut self, _idx: u8, _value: i64) {}
     fn trigger_restore_nmi(&mut self) {}
     fn run_for(&mut self, cycles: u64) {

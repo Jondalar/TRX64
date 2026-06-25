@@ -469,6 +469,14 @@ pub struct Machine {
     /// Keyboard matrix (CIA1 PA column drive ↔ PB row read). Holds queued timed
     /// key presses from `session/type`; read by the FullBus on a $DC01 access.
     pub keyboard: crate::keyboard::KeyboardMatrix,
+    /// Spec 310 / Sprint 93.1 — joystick port 1 (CIA1 PB bits 0-4, active-low) and
+    /// port 2 (CIA1 PA bits 0-4, active-low). 1:1 with the c64re `joystick1` /
+    /// `joystick2` (integrated-session.ts:441-442). The FullBus reads them on a
+    /// $DC00 (port 2) / $DC01 (port 1) access and ANDs the active-low mask into the
+    /// post-DDR latch value (= VICE `read_joyport_dig`). Power-on / reset = all
+    /// released. `session/joystick_set|clear|release_keys` mutate these.
+    pub joystick1: crate::keyboard::JoystickState,
+    pub joystick2: crate::keyboard::JoystickState,
     /// Monotonic C64-clock reference the drive has been advanced up to. The
     /// push-flush catch-up advances the drive by `clk - drive_c64_ref` before
     /// sampling/applying the IEC lines on a $DD00 access (= VICE
@@ -537,6 +545,8 @@ impl Machine {
             cia2_pa_out: 0xff,
             iec: IecCore::new(),
             keyboard: crate::keyboard::KeyboardMatrix::new(),
+            joystick1: crate::keyboard::JoystickState::default(),
+            joystick2: crate::keyboard::JoystickState::default(),
             drive_c64_ref: 0,
             cartridge: None,
             cartridge_image: None,
@@ -766,6 +776,9 @@ impl Machine {
         // IEC bus: power-on released (= installCia2 seeds iecWrite(0xff, 0x3f)).
         self.iec = IecCore::new();
         self.keyboard.clear();
+        // integrated-session.ts:736-743 resetCold wipes joystick state too.
+        self.joystick1 = crate::keyboard::JoystickState::default();
+        self.joystick2 = crate::keyboard::JoystickState::default();
         self.cia2_pa_out = 0xff;
         self.drive_c64_ref = 0;
         // SID: reset register file + voice state to power-on defaults.
@@ -1248,6 +1261,8 @@ impl Machine {
                     drive: &mut self.drive8,
                     iec: &mut self.iec,
                     keyboard: &self.keyboard,
+                    joystick1: self.joystick1,
+                    joystick2: self.joystick2,
                     drive_c64_ref: self.drive_c64_ref,
                     cartridge: self.cartridge.as_mut(),
                 };

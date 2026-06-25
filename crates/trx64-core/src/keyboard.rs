@@ -221,6 +221,55 @@ impl KeyboardMatrix {
     }
 }
 
+// ── Joystick model (Spec 310 / Sprint 93.1) ────────────────────────────────
+//
+// 1:1 PORT of the c64re TS `peripherals/keyboard.ts` joystick backend
+// (keyboard.ts:180-203). Real C64 wires joystick port 2 to CIA1 PA bits 0-4
+// (active-low) and joystick port 1 to CIA1 PB bits 0-4 (active-low). When read,
+// a pulled bit indicates a pressed direction / fire. The session mutates this
+// small state object; the CIA1 PA/PB read backends AND the joystick mask into
+// the post-DDR latch value so the CPU sees the joystick (NOT an override — a
+// digital pull-down ANDed with the latch, per VICE c64cia1.c read_joyport_dig).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JoystickState {
+    pub up: bool,
+    pub down: bool,
+    pub left: bool,
+    pub right: bool,
+    pub fire: bool,
+}
+
+/// keyboard.ts:189-193 — joystick bit positions (active-low when pulled).
+pub const JOY_BIT_UP: u8 = 1 << 0;
+pub const JOY_BIT_DOWN: u8 = 1 << 1;
+pub const JOY_BIT_LEFT: u8 = 1 << 2;
+pub const JOY_BIT_RIGHT: u8 = 1 << 3;
+pub const JOY_BIT_FIRE: u8 = 1 << 4;
+
+/// keyboard.ts:195-203 — `joystickActiveLowMask`. Start from 0xff (all released
+/// = all bits high) and clear a bit for each pressed direction / fire. The CIA1
+/// PA ($DC00, port 2) / PB ($DC01, port 1) read ANDs this mask into the post-DDR
+/// latch value, exactly like VICE `read_joyport_dig`.
+pub fn joystick_active_low_mask(s: &JoystickState) -> u8 {
+    let mut mask: u8 = 0xff;
+    if s.up {
+        mask &= !JOY_BIT_UP;
+    }
+    if s.down {
+        mask &= !JOY_BIT_DOWN;
+    }
+    if s.left {
+        mask &= !JOY_BIT_LEFT;
+    }
+    if s.right {
+        mask &= !JOY_BIT_RIGHT;
+    }
+    if s.fire {
+        mask &= !JOY_BIT_FIRE;
+    }
+    mask & 0xff
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +405,22 @@ mod tests {
         assert!(kb.pressed_keys().is_empty());
         let pa_col1 = 0xff & !(1 << 1);
         assert_eq!(kb.read_rows_for_pa(0, pa_col1), 0xff, "events gone too");
+    }
+
+    #[test]
+    fn joystick_mask_released_is_all_high() {
+        // keyboard.ts:196 — nothing pressed → 0xff (no bits pulled).
+        assert_eq!(joystick_active_low_mask(&JoystickState::default()), 0xff);
+    }
+
+    #[test]
+    fn joystick_mask_pulls_active_low_bits() {
+        // keyboard.ts:189-203 — up=bit0, down=bit1, left=bit2, right=bit3, fire=bit4.
+        let up = JoystickState { up: true, ..Default::default() };
+        assert_eq!(joystick_active_low_mask(&up), 0xff & !JOY_BIT_UP);
+        let fire = JoystickState { fire: true, ..Default::default() };
+        assert_eq!(joystick_active_low_mask(&fire), 0xff & !(1 << 4));
+        let all = JoystickState { up: true, down: true, left: true, right: true, fire: true };
+        assert_eq!(joystick_active_low_mask(&all), 0xff & !0x1f);
     }
 }
