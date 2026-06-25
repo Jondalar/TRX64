@@ -251,6 +251,11 @@ struct State {
     /// (run/pause/continue/step). broadcast `debug/control` on change only (Spec 767
     /// setControlOwner, runtime-controller.ts:338). Signal only; never gates access.
     control_owner: String,
+    /// T2.6 — last finalized trace store path and run id (= TS TraceRunController
+    /// `lastStorePath`/`lastRunId`). Set in finalize_trace; surfaced by trace/current.
+    /// `None` until the first trace is stopped.
+    last_trace_path: Option<String>,
+    last_run_id: Option<String>,
 }
 
 /// Spec 271 — one in-process batch (= c64re `BatchEntry`). Results are stored as a
@@ -1065,8 +1070,10 @@ fn parse_hex(tok: &str) -> Option<u32> {
 }
 
 /// Flush the active trace to its `.c64retrace` path; returns (run, status) JSON.
-fn finalize_trace(session: &mut Session) -> (Value, Value) {
-    match session.trace.take() {
+/// T2.6 — also updates `state.last_trace_path` and `state.last_run_id` (= TS
+/// `TraceRunController.lastStorePath`/`lastRunId`, set in `stop()`).
+fn finalize_trace(st: &mut State) -> (Value, Value) {
+    match st.session.trace.take() {
         None => (Value::Null, json!({ "active": false })),
         Some(t) => {
             let bytes = if t.buf.is_empty() {
@@ -1079,6 +1086,18 @@ fn finalize_trace(session: &mut Session) -> (Value, Value) {
             }
             let bytes_written = bytes.len();
             let _ = std::fs::write(&t.retrace_path, &bytes);
+            // T2.6 — mirror TS TraceRunController.lastStorePath / lastRunId set in stop().
+            // The duckdb path is the sibling of the retrace path (strip .c64retrace → .duckdb).
+            let duckdb_path = {
+                let p = t.retrace_path.to_string_lossy();
+                if p.ends_with(".c64retrace") {
+                    format!("{}.duckdb", &p[..p.len() - ".c64retrace".len()])
+                } else {
+                    p.into_owned()
+                }
+            };
+            st.last_trace_path = Some(duckdb_path);
+            st.last_run_id = Some(t.run_id.clone());
             (
                 json!({
                     "runId": t.run_id,
@@ -3241,7 +3260,10 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 run_id: run_id.clone(),
                 event_count: 0,
                 domains: domains.clone(),
+                marks: Vec::new(),
             });
+            // T2.6 — mirror TS start(): lastRunId set on trace start, survives stop().
+            st.last_run_id = Some(run_id.clone());
             // Echo the mounted media's SHA in the run descriptor (TS oracle parity:
             // a trace started with a disk attached carries `run.media.sha256`).
             let mut run = json!({
@@ -3309,9 +3331,158 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             Response::ok(id, json!({ "definitions": definitions }))
         }
 
+        // T2.6 — start a trace by definition id (ws-server.ts:1230-1238).
+        // Looks up `st.trace_definitions[definition_id]` and reuses the same
+        // TraceState initialisation logic as `trace/start_domains`, substituting the
+        // definition's domains + generating a run_id as TS does:
+        //   `run_${def.id}_${Date.now().toString(36)}`  (trace-run.ts:202)
+        "trace/run/start" => {
+            let definition_id = match req.params.get("definition_id").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => return Response::err(id, -32602, "trace/run/start: definition_id required"),
+            };
+            let mut st = state.lock().unwrap();
+            // Guard: TS throws if already active.
+            if st.session.trace.is_some() {
+                return Response::err(id, -32001,
+                    format!("trace already active on session {} — stop it first (trace/run/stop).", st.session.id));
+            }
+            let def = match st.trace_definitions.get(&definition_id).cloned() {
+                Some(d) => d,
+                None => return Response::err(id, -32001,
+                    format!("trace/run/start: unknown definition \"{definition_id}\"")),
+            };
+            let output = req.params.get("output")
+                .and_then(|v| v.as_str())
+                .map(std::path::PathBuf::from);
+            // TS: `outputPath = resolveSnapshotPath(output ?? "traces/${def.id}_${Date.now().toString(36)}.duckdb")`
+            let now36 = radix36(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+            );
+            let output = output.unwrap_or_else(|| {
+                std::path::PathBuf::from(format!("traces/{}_{}.duckdb", definition_id, now36))
+            });
+            let retrace = output.with_extension("c64retrace");
+            let cycle_start = st.session.machine.clk;
+            // TS: `runId = "run_${def.id}_${Date.now().toString(36)}"` (trace-run.ts:202)
+            let run_id = format!("run_{}_{}", definition_id, now36);
+            let domains: Vec<String> = def
+                .get("domains")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|d| d.as_str().map(String::from)).collect())
+                .unwrap_or_else(|| vec!["c64-cpu".into(), "memory".into()]);
+            let def_version = def.get("version").and_then(|v| v.as_i64()).unwrap_or(1);
+            let def_name = def.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let meta_json = serde_json::to_string(&json!({
+                "runId": run_id,
+                "defId": definition_id,
+                "defVersion": def_version,
+                "defName": def_name,
+                "defJson": serde_json::to_string(&def).unwrap_or_default(),
+                "domains": domains,
+                "cycleStart": cycle_start,
+                "createdAt": "",
+            }))
+            .unwrap_or_default();
+            st.session.trace = Some(TraceState {
+                retrace_path: retrace,
+                meta_json,
+                cycle_start,
+                buf: Vec::new(),
+                run_id: run_id.clone(),
+                event_count: 0,
+                domains: domains.clone(),
+                marks: Vec::new(),
+            });
+            // T2.6 — mirror TS start(): lastRunId set on trace start, survives stop().
+            st.last_run_id = Some(run_id.clone());
+            // Echo the mounted media SHA (same as trace/start_domains).
+            st.session.machine.drive8.flush_disk_writeback();
+            let mut run = json!({
+                "runId": run_id,
+                "definitionId": definition_id,
+                "definitionVersion": def_version,
+                "cycleStart": cycle_start,
+                "marks": [],
+                "eventCount": 0,
+                "bytesWritten": 0
+            });
+            if let Some(disk) = st.session.machine.drive8.get_attached_disk() {
+                let sha = sha256_hex(&disk.bytes);
+                run["media"] = json!({ "sha256": sha });
+            }
+            Response::ok(id, json!({ "run": run }))
+        }
+
+        // T2.6 — push a named marker into the active trace (ws-server.ts:1288-1293).
+        // Mirrors TS: error if no active trace; push (cpu_clk, label) into marks;
+        // return status().  Shape = TraceRunStatus (active:true, runId, eventCount,
+        // marks count, …).
+        "trace/run/mark" => {
+            let label = match req.params.get("label").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return Response::err(id, -32001, "trace/run/mark: label required"),
+            };
+            let mut st = state.lock().unwrap();
+            let clk = st.session.machine.clk;
+            match st.session.trace.as_mut() {
+                None => return Response::err(id, -32001, "no active trace run"),
+                Some(t) => t.marks.push((clk, label)),
+            }
+            // Return trace/run/status shape (mirrors TS `c.traceRun.status()`).
+            let status = match &st.session.trace {
+                Some(t) => json!({
+                    "active": true,
+                    "runId": t.run_id,
+                    "eventCount": t.event_count,
+                    "binary": true,
+                    "marks": t.marks.len() as u64,
+                    "retracePath": t.retrace_path.to_string_lossy(),
+                }),
+                None => json!({ "active": false }),
+            };
+            Response::ok(id, status)
+        }
+
+        // T2.6 — return the last finalized store path + run_id (ws-server.ts:1287).
+        // TS: `ctrlFor(session_id).traceRun.currentStorePath() ?? { path: null }`.
+        // Active trace → path = duckdb output path (active:true).
+        // Finalized trace → path = last_trace_path (active:false, from finalize_trace).
+        // Never started → { path: null }.
+        "trace/current" => {
+            let st = state.lock().unwrap();
+            if let Some(t) = &st.session.trace {
+                // Active trace: derive the .duckdb path from the .c64retrace path.
+                let retrace = t.retrace_path.to_string_lossy();
+                let duckdb_path = if retrace.ends_with(".c64retrace") {
+                    format!("{}.duckdb", &retrace[..retrace.len() - ".c64retrace".len()])
+                } else {
+                    retrace.into_owned()
+                };
+                Response::ok(id, json!({
+                    "path": duckdb_path,
+                    "runId": t.run_id,
+                    "active": true,
+                    "indexing": false
+                }))
+            } else if let (Some(path), Some(run_id)) = (&st.last_trace_path, &st.last_run_id) {
+                Response::ok(id, json!({
+                    "path": path,
+                    "runId": run_id,
+                    "active": false,
+                    "indexing": false
+                }))
+            } else {
+                Response::ok(id, json!({ "path": Value::Null }))
+            }
+        }
+
         "trace/run/stop" => {
             let mut st = state.lock().unwrap();
-            let status = finalize_trace(&mut st.session);
+            let status = finalize_trace(&mut *st);
             Response::ok(id, json!({ "run": status.0, "status": status.1 }))
         }
 
@@ -5538,6 +5709,8 @@ async fn main() {
         pacing_mode: "pal".to_string(),
         pacing_ratio: 1.0,
         control_owner: "human".to_string(),
+        last_trace_path: None,
+        last_run_id: None,
     }));
 
     // The singleton live A/V stream hub (ADR-073): one pacing loop drives the
@@ -5608,6 +5781,8 @@ mod batch1_tests {
             pacing_mode: "pal".to_string(),
             pacing_ratio: 1.0,
             control_owner: "human".to_string(),
+            last_trace_path: None,
+            last_run_id: None,
         }))
     }
 

@@ -48,6 +48,9 @@ pub struct TraceState {
     /// daemon maps these → channels to filter which records are emitted, and
     /// whether the VIC must be ticked (vic domain → VIC-isolated run path).
     pub domains: Vec<String>,
+    /// T2.6 — manual phase markers: (cpu_clk, label). Matches TS `run.marks[]`
+    /// (`trace-run.ts` ActiveRun.run.marks + markCount).
+    pub marks: Vec<(u64, String)>,
 }
 
 impl Session {
