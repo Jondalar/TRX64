@@ -2830,6 +2830,65 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         }
 
         "media/persist" => {
+            let role = req.params.get("role").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+            // T2.5 — role="cartridge": persist the live flash back to the host .crt
+            // and broadcast media/cart_persisted. Mirrors TS ws-server.ts:687-696
+            // (explicit persist) + runtime-controller.ts:512-516 (auto-persist
+            // broadcast). TRX64 has no per-frame auto-persist loop, so the explicit
+            // persist IS the cart-persist trigger; auto:true matches the TS broadcast
+            // shape so UI listeners (which only watch the auto-persist event) fire.
+            if role == "cartridge" {
+                let mut st = state.lock().unwrap();
+                let session_id = st.session.id.clone();
+                // Collect path + crt bytes while holding the lock.
+                let cart_result: Result<(String, Vec<u8>), String> = {
+                    let m = &mut st.session.machine;
+                    let path = m
+                        .cartridge_image
+                        .as_ref()
+                        .map(|img| img.path.clone())
+                        .unwrap_or_default();
+                    if path.is_empty() {
+                        Err("no cartridge attached or no backing file path".to_string())
+                    } else {
+                        match m.cartridge.as_mut().and_then(|c| c.crt_image(m.clk)) {
+                            Some(bytes) => Ok((path, bytes)),
+                            None => Err("mapper cannot re-pack a .crt (read-only or unsupported)".to_string()),
+                        }
+                    }
+                };
+                match cart_result {
+                    Err(reason) => {
+                        return Response::ok(id, json!({ "written": false, "reason": reason }));
+                    }
+                    Ok((path_clone, bytes_to_write)) => {
+                        let notify = st.notify.clone();
+                        drop(st);
+                        match std::fs::write(&path_clone, &bytes_to_write) {
+                            Ok(()) => {
+                                let byte_count = bytes_to_write.len();
+                                // 1:1 with runtime-controller.ts:513-515 broadcast.
+                                notify.broadcast("media/cart_persisted", json!({
+                                    "session_id": session_id,
+                                    "path": path_clone,
+                                    "bytes": byte_count,
+                                    "auto": true
+                                }));
+                                return Response::ok(id, json!({
+                                    "written": true,
+                                    "path": path_clone,
+                                    "bytes": byte_count
+                                }));
+                            }
+                            Err(e) => {
+                                return Response::err(id, -32001, format!("media/persist: cart write error: {e}"));
+                            }
+                        }
+                    }
+                }
+            }
+
             let mut st = state.lock().unwrap();
             // Flush any in-flight drive write (dirty GCR track) back into
             // disk.bytes before persisting — 1:1 with VICE flushing
