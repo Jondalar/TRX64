@@ -774,6 +774,51 @@ impl Machine {
         self.sync_snapshot();
     }
 
+    /// HW RESET line (Reset button / SuperReset / SYS 64738) = warm reset.
+    /// Port of integrated-session.ts `resetWarm` (= `resetCold({ keepRam: true })`,
+    /// ts:776-778 → ts:690-764): re-init the CPU + C64 I/O chips + drive, restore
+    /// default $00/$01 banking + PLA, and re-enter the KERNAL reset routine via the
+    /// $FFFC vector (= $FCE2). KEEPS user RAM — unlike a power-cycle, which fills
+    /// the cold-boot DRAM pattern (`fill_power_on_ram`). Recovers from a running or
+    /// JAMmed game: `cold_reset`'s CPU `reset_to` clears the jammed flag + pending
+    /// IRQ/NMI, and the chip resets below clear an active raster-IRQ / CIA timers
+    /// that would otherwise re-hijack execution (ts:701, ts:719-726). The 1541 disk
+    /// stays mounted; the drive re-runs its ROM (ts:707-708).
+    ///
+    /// TRX64's `cold_reset` already preserves RAM (the DRAM fill lives in
+    /// `boot_from_dir`/`fill_power_on_ram`, not in `cold_reset`), so the warm path =
+    /// `cold_reset`'s banking/CPU/IEC/keyboard/SID/cart re-init PLUS the CIA + VIC +
+    /// drive resets the TS `resetCold` performs (ts:707-708, ts:719-726). RAM is
+    /// untouched throughout.
+    pub fn warm_reset(&mut self) {
+        // Banking restore ($00=$2F/$01=$37 + PLA) + cart reset + $FFFC vector fetch
+        // + CPU/IEC/keyboard/SID re-init, RAM preserved (cold_reset does NOT fill).
+        // = ts:692-694 (resetCpuPortKeepRam) + ts:699/701/730/719 path.
+        self.cold_reset();
+        // ts:724-726 — cold-reset the C64 I/O chips so a 2nd+ reset does not leave
+        // CIA timers / IRQ state or an active VIC raster-IRQ from the previous run
+        // (= the "no cursor / re-hijack after reset" recovery). Fresh power-on chips.
+        self.cia1 = Cia::new();
+        self.cia2 = Cia::new();
+        self.cia1.clk = self.clk;
+        self.cia2.clk = self.clk;
+        self.vic = VicII::new();
+        // ts:707-708 + ts:773 — reset the 1541 in lockstep with the C64. A warm
+        // reset is the C64's RESET line; the drive has its OWN power, so "the 1541
+        // disk stays mounted" (ts:773). TRX64's `Drive1541::cold_reset` drops the
+        // disk (it models a drive POWER-cycle, drive.rs:602-603), so we preserve +
+        // re-attach the image across the reset to match TS: flush any in-flight
+        // write back into the image bytes first, cold-reset the drive (re-runs its
+        // ROM to a known head/track), then re-mount the same disk.
+        self.drive8.flush_disk_writeback();
+        let mounted_disk = self.drive8.disk.take();
+        self.drive8.cold_reset();
+        if let Some(image) = mounted_disk {
+            self.drive8.attach_disk(image);
+        }
+        self.sync_snapshot();
+    }
+
     /// Inject raw bytes into RAM at `addr` (no banking). The CPU-isolated
     /// inject+run primitive: write an exerciser program, set PC, run N cycles.
     pub fn poke(&mut self, addr: u16, bytes: &[u8]) {

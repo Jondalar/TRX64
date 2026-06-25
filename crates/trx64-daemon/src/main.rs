@@ -2164,17 +2164,19 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         }
 
         // session/reset — RuntimeController re-init (ws-server.ts:1392). mode:"soft"
-        // = warm (RAM preserved), else cold. TRX64 has only cold_reset() (RAM is
-        // preserved — it does NOT power-on-fill), so "soft" maps to cold_reset() and
-        // a full cold power-cycle additionally fills power-on RAM. Both run the
-        // KERNAL to READY (5M cycles, matching the TS runFor). Returns
-        // { c64Cycles, pc, mode }.
+        // = warm (HW RESET line, RAM preserved → `resetWarm`, ws-server.ts:1409),
+        // else cold (full power-cycle → `resetCold`, ws-server.ts:1413). The warm
+        // path re-inits CPU + I/O chips + drive and restores $00/$01 banking so the
+        // $FFFC vector reads $FCE2 and the KERNAL reset runs clean — recovering even
+        // from a running/JAMmed game; RAM is preserved. The cold path additionally
+        // fills power-on DRAM + power-cycles the drive. Both run the KERNAL to READY
+        // (5M cycles, matching the TS runFor). Returns { c64Cycles, pc, mode }.
         "session/reset" => {
             let mode = req.params.get("mode").and_then(|v| v.as_str()).unwrap_or("cold");
             let mut st = state.lock().unwrap();
             if mode == "soft" {
-                // Warm = HW RESET line, RAM preserved.
-                st.session.machine.cold_reset();
+                // Warm = HW RESET line, RAM preserved (= resetWarm, ws-server.ts:1409).
+                st.session.machine.warm_reset();
             } else {
                 // Cold power-cycle = fresh DRAM fill, then reset.
                 st.session.machine.fill_power_on_ram();
