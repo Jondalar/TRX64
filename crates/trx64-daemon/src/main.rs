@@ -3409,6 +3409,206 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             }))
         }
 
+        // ── runtime/overlay_run ──────────────────────────────────────────────
+        // Spec 769.2 — code-overlay debug loop: rewind to an anchor checkpoint,
+        // apply RAM patches, run forward, observe. 1:1 with ws-server.ts:938-981.
+        // Repeatable: each call restores fresh (the prior patch is rolled back by
+        // the restore), so the LLM iterates a fix from a fixed point without
+        // rebuild/reboot. RAM-only patches (OQ3). Leaves the machine paused.
+        // Returns { anchorId, applied[], ranCycles, hitPc, reads, registers }.
+        "runtime/overlay_run" => {
+            let anchor_id = req.params.get("anchor_id").and_then(|v| v.as_str()).map(String::from);
+            let anchor_cycle = req.params.get("anchor_cycle").and_then(|v| v.as_u64());
+            let patches: Vec<Value> = req
+                .params
+                .get("patches")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let run_cycles = req.params.get("run_cycles").and_then(|v| v.as_u64()).unwrap_or(0);
+            let until_pc = req.params.get("until_pc").and_then(|v| v.as_u64()).map(|v| (v & 0xffff) as u16);
+
+            let mut st = state.lock().unwrap();
+            let cps = st.checkpoint_ring.list();
+            if cps.is_empty() {
+                return Response::err(id, -32001, "runtime/overlay_run: no checkpoints to anchor on");
+            }
+            // Pick the anchor: explicit id, else nearest at/before anchor_cycle,
+            // else most recent (ws-server.ts:946-954).
+            let chosen: String = if let Some(aid) = anchor_id {
+                aid
+            } else if let Some(cyc) = anchor_cycle {
+                let mut at_before: Option<&trx64_core::checkpoint_ring::RuntimeCheckpointRef> = None;
+                let mut best = &cps[0];
+                let mut best_d = u64::MAX;
+                for c in &cps {
+                    if c.cycles <= cyc && at_before.map(|a| c.cycles > a.cycles).unwrap_or(true) {
+                        at_before = Some(c);
+                    }
+                    let d = c.cycles.abs_diff(cyc);
+                    if d < best_d {
+                        best_d = d;
+                        best = c;
+                    }
+                }
+                at_before.unwrap_or(best).id.clone()
+            } else {
+                cps[cps.len() - 1].id.clone()
+            };
+
+            // Restore the anchor (then: "pause") — same payload-rehydration path as
+            // checkpoint/restore (ws-server.ts:955 ctrl.restoreCheckpoint(id,{then:"pause"})).
+            let snapshot = match st.checkpoint_ring.restore_snapshot(&chosen) {
+                Some(s) => s,
+                None => {
+                    return Response::err(
+                        id,
+                        -32001,
+                        format!("runtime/overlay_run: unknown anchor id {chosen}"),
+                    )
+                }
+            };
+            if let Err(e) = restore_live_checkpoint(&mut st.session, &snapshot) {
+                return Response::err(id, -32001, format!("runtime/overlay_run: {e}"));
+            }
+            // then:"pause" — machine stays paused; advance ctrl frame + clear stop
+            // (a restore is a control discontinuity, like checkpoint/restore).
+            st.session.running = false;
+            st.ctrl_frame += 1;
+            st.ctrl_stop = None;
+
+            // Apply the RAM patches (the overlay). ws-server.ts:957-965 —
+            // s.c64Bus.ram[(addr + i) & 0xffff] = bytes[i] & 0xff.
+            let mut applied: Vec<Value> = vec![];
+            for p in &patches {
+                let addr = (p.get("addr").and_then(|v| v.as_u64()).unwrap_or(0) & 0xffff) as usize;
+                let bytes: Vec<u8> = p
+                    .get("bytes")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().map(|b| (b.as_u64().unwrap_or(0) & 0xff) as u8).collect())
+                    .unwrap_or_default();
+                for (i, &b) in bytes.iter().enumerate() {
+                    st.session.machine.ram[(addr + i) & 0xffff] = b;
+                }
+                applied.push(json!({ "addr": addr as u64, "len": bytes.len() as u64 }));
+            }
+
+            // Run forward (bounded; optional breakpoint at until_pc). ws-server.ts:967-975.
+            let mut hit_pc: Option<u16> = None;
+            if run_cycles > 0 {
+                if let Some(target) = until_pc {
+                    // Mirror the standing bp surface, add the ephemeral until_pc
+                    // exec observer, run, then remove it — same pattern as `until`.
+                    {
+                        let State { breakpoints, observers: reg, .. } = &mut *st;
+                        sync_observers(breakpoints, reg);
+                    }
+                    let _ = st.observers.add(observers::ObsSpec {
+                        name: "__overlay_until__".to_string(),
+                        trigger: observers::ObsTrigger::Exec,
+                        lo: target,
+                        hi: target,
+                        cond_src: None,
+                        action: observers::ObsAction::Break,
+                        log_exprs: None,
+                        cmd_src: None,
+                        mark_label: None,
+                        trace_scope: None,
+                    });
+                    let run = {
+                        let State { session, observers: reg, .. } = &mut *st;
+                        run_until_break(session, reg, run_cycles)
+                    };
+                    {
+                        let State { breakpoints, observers: reg, .. } = &mut *st;
+                        writeback_hits(breakpoints, reg);
+                    }
+                    st.observers.remove("__overlay_until__");
+                    // r.aborted === "breakpoint" → hitPc = r.lastPc.
+                    if run.halted && run.reason == "breakpoint" {
+                        hit_pc = Some(run.pc);
+                    }
+                } else {
+                    run_cycle_budget(&mut st.session, run_cycles);
+                }
+            }
+
+            // Observe: read-back of any patch addr flagged `read` (ws-server.ts:978-980).
+            let mut reads = serde_json::Map::new();
+            for p in &patches {
+                if p.get("read").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    let a = (p.get("addr").and_then(|v| v.as_u64()).unwrap_or(0) & 0xffff) as usize;
+                    let key = format!("${:04x}", a);
+                    reads.insert(key, json!(st.session.machine.ram[a] as u64));
+                }
+            }
+
+            // Registers (ws-server.ts:982 — cpu.cycles == machine clock).
+            let c = &st.session.machine.cpu6510;
+            let registers = json!({
+                "pc": c.reg_pc as u64,
+                "a": c.reg_a as u64,
+                "x": c.reg_x as u64,
+                "y": c.reg_y as u64,
+                "sp": c.reg_sp as u64,
+                "flags": c.flags() as u64,
+                "cycles": st.session.machine.clk,
+            });
+
+            Response::ok(id, json!({
+                "anchorId": chosen,
+                "applied": applied,
+                "ranCycles": run_cycles,
+                "hitPc": hit_pc.map(|v| v as u64),
+                "reads": Value::Object(reads),
+                "registers": registers,
+            }))
+        }
+
+        // ── runtime/snapshot_tree ────────────────────────────────────────────
+        // Spec 268 / 769 — time-travel branch tree. 1:1 with ws-server.ts:1891-1909:
+        // beginRewindSession() builds a FRESH RewindManager (root snapshot + root
+        // branch) and the handle is serialized. Spec 723.2: always true-drive.
+        // Returns { scenarioId, rootBranchId, rootSnapshotId, ringSize, branches }.
+        "runtime/snapshot_tree" => {
+            let st = state.lock().unwrap();
+            let scenario_id = st.session.id.clone();
+            let disk_path = if st.session.disk_path.is_empty() {
+                scenario_id.clone()
+            } else {
+                st.session.disk_path.clone()
+            };
+            let at_cycle = st.session.machine.clk;
+            let rm = trx64_core::rewind::RewindManager::new(&scenario_id, &disk_path, at_cycle, None);
+            Response::ok(id, rm.handle().to_json())
+        }
+
+        // ── runtime/promote_branch ───────────────────────────────────────────
+        // Spec 268 / 769 — 1:1 with ws-server.ts:1911-1922: beginRewindSession()
+        // builds a FRESH RewindManager, then promoteBranch(branch_id). Because each
+        // call mints a new random root id, a caller-supplied branch_id that is not
+        // the freshly-minted root throws "branch <id> not found" — exactly the TS
+        // RewindManager.promoteBranch behaviour (graceful error, never a stub).
+        "runtime/promote_branch" => {
+            let branch_id = match req.params.get("branch_id").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => return Response::err(id, -32602, "runtime/promote_branch: branch_id required"),
+            };
+            let st = state.lock().unwrap();
+            let scenario_id = st.session.id.clone();
+            let disk_path = if st.session.disk_path.is_empty() {
+                scenario_id.clone()
+            } else {
+                st.session.disk_path.clone()
+            };
+            let at_cycle = st.session.machine.clk;
+            let rm = trx64_core::rewind::RewindManager::new(&scenario_id, &disk_path, at_cycle, None);
+            match rm.promote_branch(&branch_id, "true-drive") {
+                Ok(v) => Response::ok(id, v),
+                Err(e) => Response::err(id, -32001, e),
+            }
+        }
+
         "runtime/mark" => {
             let label = req.params.get("label")
                 .and_then(|v| v.as_str())
