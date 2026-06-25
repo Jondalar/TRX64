@@ -2011,8 +2011,9 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         }
 
         // session/drive_power — drive 8 cold re-init (ws-server.ts:1620). Single
-        // press = cold reset of the drive 6502 (DOS re-runs power-on init). Returns
-        // { device, reinitialized, mode }.
+        // press = cold reset of the drive 6502 (DOS re-runs power-on init).
+        // Parity: TS includes "mode" only when reinitialized=true (success path).
+        // TRX64 has no fallback, so always reinitialized=true + mode.
         "session/drive_power" => {
             let mut st = state.lock().unwrap();
             st.session.machine.drive8.cold_reset();
