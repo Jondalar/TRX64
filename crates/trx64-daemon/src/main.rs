@@ -12,6 +12,7 @@
 
 use std::{
     env,
+    fs,
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -4671,8 +4672,8 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         }
 
         // runtime/scenario_save — store a scenario object. c64re: saveScenario() →
-        // { filePath }. ws-server.ts:1927-1931. TRX64 keeps it in memory and
-        // returns the registry key as `id` (no file path).
+        // { filePath }. ws-server.ts:1927-1931. T3.6: add disk persistence + return
+        // both filePath and id (matching TS contract).
         "runtime/scenario_save" => {
             let scenario = match req.params.get("scenario") {
                 Some(s) if s.is_object() => s.clone(),
@@ -4684,12 +4685,41 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             };
             let mut saved = scenario.clone();
             saved["savedAt"] = json!(now_iso8601());
+
+            // Determine target directory: C64RE_PROJECT_DIR/scenarios/ if set, else
+            // we'd use SAMPLES_DIR, but TRX64 doesn't bundle samples — just in-memory.
+            // If no project dir, store in-memory only.
+            let mut file_path_opt = None;
+            if let Ok(project_dir) = env::var("C64RE_PROJECT_DIR") {
+                let scenarios_dir = PathBuf::from(&project_dir).join("scenarios");
+                if let Err(e) = fs::create_dir_all(&scenarios_dir) {
+                    eprintln!("Failed to create scenarios dir: {}", e);
+                } else {
+                    let file_path = scenarios_dir.join(format!("{}.json", sid));
+                    match fs::write(
+                        &file_path,
+                        serde_json::to_string_pretty(&saved).unwrap_or_default()
+                    ) {
+                        Ok(_) => file_path_opt = Some(file_path.to_string_lossy().to_string()),
+                        Err(e) => eprintln!("Failed to write scenario file: {}", e),
+                    }
+                }
+            }
+
             let mut st = state.lock().unwrap();
             st.scenarios.insert(sid.clone(), saved);
-            Response::ok(id, json!({ "id": sid }))
+
+            // Return both id and filePath (matching TS contract).
+            let resp = if let Some(fp) = file_path_opt {
+                json!({ "id": sid, "filePath": fp })
+            } else {
+                json!({ "id": sid })
+            };
+            Response::ok(id, resp)
         }
 
         // runtime/scenario_delete — { deleted: bool }. ws-server.ts:1933-1938.
+        // T3.6: also delete the file on disk if it exists.
         "runtime/scenario_delete" => {
             let sid = match req.params.get("id").and_then(|v| v.as_str()) {
                 Some(s) => s.to_string(),
@@ -4697,6 +4727,15 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             };
             let mut st = state.lock().unwrap();
             let deleted = st.scenarios.remove(&sid).is_some();
+
+            // Also try to delete the file from the project dir if it exists.
+            if let Ok(project_dir) = env::var("C64RE_PROJECT_DIR") {
+                let file_path = PathBuf::from(&project_dir)
+                    .join("scenarios")
+                    .join(format!("{}.json", sid));
+                let _ = fs::remove_file(&file_path);
+            }
+
             Response::ok(id, json!({ "deleted": deleted }))
         }
 
