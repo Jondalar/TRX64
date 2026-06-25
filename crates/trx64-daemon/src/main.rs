@@ -624,7 +624,7 @@ fn run_debug_control(id: Value, st: &mut State, frame: u64, is_continue: bool) -
                 "cycles": cycles,
                 "observer": run.which.clone(),
                 "message": Value::Null,
-                "registers": registers,
+                "registers": registers.clone(),
             }));
         } else {
             st.notify.broadcast("debug/breakpoint_hit", json!({
@@ -634,9 +634,16 @@ fn run_debug_control(id: Value, st: &mut State, frame: u64, is_continue: bool) -
                 // no numbered breakpoint matches the halt address — match that.
                 "num": bp_num.unwrap_or(0) as u64,
                 "cycles": cycles,
-                "registers": registers,
+                "registers": registers.clone(),
             }));
         }
+        // Spec 771.2 — runtime-controller.ts:768/782 ALSO server-PUSHes debug/stopped
+        // alongside the specific hit, so a passive UI freezes the run-state on any halt.
+        st.notify.broadcast("debug/stopped", json!({
+            "session_id": st.session.id,
+            "stop": stop.clone(),
+            "registers": registers,
+        }));
         Response::ok(id, json!({
             "runState": "paused",
             "pacing": { "mode": "pal", "ratio": 1 },
@@ -1654,6 +1661,11 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
 
         "session/state" => {
             let st = state.lock().unwrap();
+            // Spec 771.2 — report the REAL run/pause state + last stop reason (was
+            // hardcoded "paused", which kept the UI's seed poll permanently frozen).
+            // Mirrors session/state in ws-server.ts (runState/stopReason/controlOwner).
+            let run_state = if st.session.running { "running" } else { "paused" };
+            let stop_reason = st.ctrl_stop.as_ref().map(|s| s.reason);
             let machine = &st.session.machine;
             let cpu = &machine.cpu;
             let v = |off: u8| machine.vic.read_reg(off);
@@ -1675,7 +1687,9 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 "c64Cycles": machine.clk,
                 "driveCycles": machine.drive8.drive_clk,
                 "mode": "true-drive",
-                "runState": "paused",
+                "runState": run_state,
+                "stopReason": stop_reason,
+                "controlOwner": "llm",
                 "cpu": {
                     "pc": cpu.pc as u64,
                     "a": cpu.a as u64,
@@ -2047,6 +2061,15 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             st.ctrl_stop = None;
             st.ctrl_frame += 1;
             let frame = st.ctrl_frame;
+            // Spec 771.2 — runtime-controller.ts:282 run() server-PUSHes debug/running
+            // at the run transition. Without it the UI never leaves the paused/frozen
+            // display (and its keyboard handler, gated on runState==="running", never
+            // attaches → "can't type"). Emit BEFORE run_debug_control so a same-tick
+            // breakpoint halt still emits in TS order (running → breakpoint_hit/stopped).
+            st.notify.broadcast("debug/running", json!({
+                "session_id": st.session.id,
+                "pacing": { "mode": "pal", "ratio": 1 },
+            }));
             run_debug_control(id, &mut st, frame, false)
         }
 
@@ -2061,6 +2084,11 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             let cycles = st.session.machine.clk;
             let stop_obj = json!({ "reason": "pause", "pc": pc, "cycles": cycles });
             st.ctrl_stop = Some(CtrlStop { reason: "pause", pc: c.reg_pc, cycles });
+            // Spec 771.2 — runtime-controller.ts:295 pause() server-PUSHes debug/paused.
+            st.notify.broadcast("debug/paused", json!({
+                "session_id": st.session.id,
+                "stop": stop_obj.clone(),
+            }));
             Response::ok(id, json!({
                 "runState": "paused",
                 "pacing": { "mode": "pal", "ratio": 1 },
@@ -2077,6 +2105,12 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             let mut st = state.lock().unwrap();
             st.session.running = true;
             st.ctrl_stop = None;
+            // Spec 771.2 — continue() === run() in runtime-controller.ts:287, so it
+            // server-PUSHes debug/running too.
+            st.notify.broadcast("debug/running", json!({
+                "session_id": st.session.id,
+                "pacing": { "mode": "pal", "ratio": 1 },
+            }));
             // TS: continue does not increment frame (stays at pause frame).
             let frame = st.ctrl_frame;
             // A continue from a breakpoint must STEP PAST the current PC first
@@ -2088,16 +2122,26 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             let mut st = state.lock().unwrap();
             step_one_instruction(&mut st.session);
             st.session.running = false;
+            let registers = register_dump(&st.session);
+            let cycles = st.session.machine.clk;
             let c = &st.session.machine.cpu6510;
+            let pc = c.reg_pc as u64;
+            // Spec 771.2 — runtime-controller.ts:324 step() server-PUSHes debug/stopped
+            // (reason "step") with the register dump.
+            st.notify.broadcast("debug/stopped", json!({
+                "session_id": st.session.id,
+                "stop": { "reason": "step", "pc": pc, "cycles": cycles },
+                "registers": registers,
+            }));
             Response::ok(id, json!({
                 "runState": "paused",
-                "pc": c.reg_pc as u64,
+                "pc": pc,
                 "a": c.reg_a as u64,
                 "x": c.reg_x as u64,
                 "y": c.reg_y as u64,
                 "sp": c.reg_sp as u64,
                 "flags": c.flags() as u64,
-                "cycles": st.session.machine.clk
+                "cycles": cycles
             }))
         }
 
