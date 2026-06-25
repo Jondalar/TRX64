@@ -163,6 +163,20 @@ struct State {
     /// The breakpoint/watchpoint POLICY (cond-AST, hit/ignore, watch tables).
     /// Re-synced from `breakpoints` before each run; drives the core's debug gates.
     observers: observers::ObserverRegistry,
+    /// Spec 754 §3.3e — the persistent store of monitor-DSL observers registered via
+    /// `obs <name> when exec|load|store $ADDR [if <cond>] do break|log|mark|cmd|trace`
+    /// (= the c64re `session.ensureObservers()` registry, which survives across runs).
+    /// `sync_observers` rebuilds the live [`ObserverRegistry`] from the bp surfaces on
+    /// EVERY run, which would wipe DSL registrations — so they are kept HERE and
+    /// re-applied (cloned) onto the registry after the bp-derived ones. `o`/`reg`
+    /// lists them; `ignore <n>` / `obs <name> del` mutate them.
+    dsl_observers: Vec<observers::ObsSpec>,
+    /// Names of DSL observers currently DISABLED via `obs <name> off` (= the c64re
+    /// `Observer.enabled=false`). `ObsSpec` carries no enabled flag (the registry's
+    /// live `Observer` does, always re-armed enabled on `add`), so the disabled intent
+    /// is persisted here and consulted by `sync_observers` (a disabled DSL observer is
+    /// not re-applied). `obs <name> on` clears it; `del` removes the name entirely.
+    dsl_disabled: std::collections::HashSet<String>,
     /// Queued PETSCII chars for session/type (stub, count tracked only).
     #[allow(dead_code)]
     type_buffer: Vec<u8>,
@@ -715,11 +729,17 @@ fn observers_armed(reg: &observers::ObserverRegistry) -> bool {
 }
 
 /// Re-sync the [`ObserverRegistry`] from the daemon's breakpoint surfaces
-/// (`api_entries` string-ids + numbered `entries`), preserving each observer's
-/// accumulated `hits` / remaining `ignore_left`. The registry is the run-time
-/// SOURCE OF TRUTH the core's debug gates consult; the bp lists are the wire-shape
-/// CRUD store. After a run, [`writeback_hits`] copies the real hit counts back.
-fn sync_observers(bp: &Breakpoints, reg: &mut observers::ObserverRegistry) {
+/// (`api_entries` string-ids + numbered `entries`) AND the persistent monitor-DSL
+/// observer store, preserving each observer's accumulated `hits` / remaining
+/// `ignore_left`. The registry is the run-time SOURCE OF TRUTH the core's debug
+/// gates consult; the bp lists + the DSL store are the wire-shape CRUD stores.
+/// After a run, [`writeback_hits`] copies the real hit counts back.
+fn sync_observers(
+    bp: &Breakpoints,
+    dsl: &[observers::ObsSpec],
+    dsl_disabled: &std::collections::HashSet<String>,
+    reg: &mut observers::ObserverRegistry,
+) {
     // Snapshot current live counts so a rebuild doesn't reset them.
     let prior: std::collections::HashMap<String, (u64, u64)> = reg
         .list()
@@ -777,6 +797,25 @@ fn sync_observers(bp: &Breakpoints, reg: &mut observers::ObserverRegistry) {
         });
         let (hits, ignore_left) = prior.get(&name).copied().unwrap_or((0, 0));
         reg.set_counts(&name, hits, ignore_left);
+    }
+    // Spec 754 §3.3e — persistent monitor-DSL observers (`obs … when … do …`). They
+    // survive across runs (the c64re ensureObservers() registry), so re-apply a clone
+    // of each onto the freshly-cleared registry, preserving live hit/ignore counts.
+    // Registered AFTER the bp-derived ones; a same-name DSL observer replaces a
+    // bp-derived one (add() replaces by name — DSL is the explicit, richer spec).
+    for spec in dsl {
+        let name = spec.name.clone();
+        // A DSL observer turned `off` is not re-armed (the c64re Observer.enabled=false).
+        if dsl_disabled.contains(&name) {
+            continue;
+        }
+        let _ = reg.add(spec.clone());
+        // Default for a DSL observer: keep accumulated counts; the `ignore` verb sets
+        // ignore_left on the live registry, mirrored back below — but a fresh rebuild
+        // restores from `prior` so the count is not lost mid-session.
+        if let Some((hits, ignore_left)) = prior.get(&name).copied() {
+            reg.set_counts(&name, hits, ignore_left);
+        }
     }
 }
 
@@ -861,6 +900,9 @@ const DEBUG_RUN_BUDGET: u64 = 10_000_000;
 ///                     `obs mark: "label" (no active trace — ignored)` (no trace).
 ///   • pending_cmds  → one `debug/observer_log` per cmd with the monitor output
 ///                     (synchronous; TS is async but the format is identical).
+///   • pending_trace → `do trace [domains]|off` bracket model (runtime-controller.ts
+///                     :727-753): start/stop a scoped capture via the trace machinery
+///                     + broadcast the lifecycle line.
 ///
 /// Called after every `run_until_break` and after every `step_one_instruction`
 /// so nothing is lost.
@@ -911,6 +953,43 @@ fn drain_and_broadcast_observer_log(st: &mut State) {
             "lines": lines,
         }));
     }
+
+    // 4. pending_trace (runtime-controller.ts:727-753) — `do trace [domains]|off`:
+    //    the bracket model. One observer STARTS a scoped capture, another STOPS it
+    //    (explicit lifecycle). The engine queues each fire into `pending_trace`; here
+    //    we act on it via the SAME trace machinery the monitor `trace on/off` verb
+    //    drives (TraceState + finalize_trace), and broadcast the lifecycle line.
+    let traces = st.observers.drain_pending_trace();
+    for (off, domains, name) in traces {
+        let line = if off {
+            if st.session.trace.is_some() {
+                // Finalize the active trace (= `trace off`).
+                let (run, _status) = finalize_trace(st);
+                let run_id = run.get("runId").and_then(|v| v.as_str()).unwrap_or("");
+                let events = run.get("eventCount").and_then(|v| v.as_u64()).unwrap_or(0);
+                format!("obs {name}: trace off — {run_id} events={events}")
+            } else {
+                format!("obs {name}: trace off (none active — ignored)")
+            }
+        } else if st.session.trace.is_some() {
+            format!("obs {name}: trace start skipped (a trace is already active)")
+        } else {
+            // Start a scoped trace over the requested domains (= `trace on <domains>`).
+            // Reuse the monitor `trace on` arm so the TraceState construction stays 1:1.
+            let cmd = format!("trace on {}", domains.join(" "));
+            match run_monitor(st, &cmd) {
+                Ok(_) => {
+                    let run_id = st.last_run_id.clone().unwrap_or_default();
+                    format!("obs {name}: trace on — {run_id} domains=[{}]", domains.join(","))
+                }
+                Err(e) => format!("obs {name}: trace ERROR {e}"),
+            }
+        };
+        st.notify.broadcast("debug/observer_log", json!({
+            "session_id": session_id,
+            "lines": [line],
+        }));
+    }
 }
 
 /// Drive `debug/run` / `debug/continue`. When breakpoints/watchpoints are armed,
@@ -919,8 +998,8 @@ fn drain_and_broadcast_observer_log(st: &mut State) {
 /// `running` return (no advance) so the zero-cost / no-debug contract is unchanged.
 fn run_debug_control(id: Value, st: &mut State, frame: u64, _is_continue: bool) -> Response {
     {
-        let State { breakpoints, observers: reg, .. } = &mut *st;
-        sync_observers(breakpoints, reg);
+        let State { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } = &mut *st;
+        sync_observers(breakpoints, dsl_observers, dsl_disabled, reg);
     }
 
     if !observers_armed(&st.observers) {
@@ -1085,8 +1164,8 @@ fn stream_debug_gated_advance(st: &mut State, budget: u64) -> u32 {
     // Re-sync the observer registry from the bp surfaces (preserving live counts),
     // exactly like the one-shot run_debug_control entry.
     {
-        let State { breakpoints, observers: reg, .. } = &mut *st;
-        sync_observers(breakpoints, reg);
+        let State { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } = &mut *st;
+        sync_observers(breakpoints, dsl_observers, dsl_disabled, reg);
     }
 
     let clk_before = st.session.machine.c64_core.clk;
@@ -1949,6 +2028,334 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
         }
 
         // ---- Breakpoints: bk | bk <addr> | bk -<addr> | bk clear ------------
+        // ---- Observers (Spec 754 §3.3e) — the full DSL the c64re REPL exposes. ----
+        //   obs <name> when exec|load|store <addr[..end]> [if <cond>] do break|log|mark|cmd|trace
+        //   obs | o                  list registered observers
+        //   obs log                  recent `do log` lines
+        //   obs <name> on|off        enable/disable
+        //   obs <name> del|rm        remove
+        //   ignore <name> [n]        skip the next n triggers
+        // 1:1 with monitor-shell.ts:888-1001 (which dispatches `obs`/`o`/`ignore` —
+        // there is NO `reg` verb, so TRX64 must not add one or it would diverge). The
+        // parsed spec is stored in `st.dsl_observers` (survives the per-run
+        // sync_observers rebuild) and re-applied onto the live registry every run;
+        // `o` / bare `obs` list that store.
+        "obs" | "o" | "ignore" => {
+            // Render one stored observer the way the c64re `fmt` closure does
+            // (monitor-shell.ts:898): `  * name  trigger $lo[..hi] [if cond] do <do>  hits=N`.
+            let fmt_obs = |spec: &observers::ObsSpec,
+                           reg: &observers::ObserverRegistry,
+                           disabled: &std::collections::HashSet<String>|
+             -> String {
+                let live = reg.get(&spec.name);
+                // A disabled DSL observer is absent from the live registry (not re-armed),
+                // so derive `enabled` from the persisted disable-set, not the registry.
+                let enabled = !disabled.contains(&spec.name);
+                let hits = live.map(|o| o.hits).unwrap_or(0);
+                let trig = match spec.trigger {
+                    observers::ObsTrigger::Exec => "exec",
+                    observers::ObsTrigger::Load => "load",
+                    observers::ObsTrigger::Store => "store",
+                };
+                let range = if spec.hi != spec.lo {
+                    format!("${:04X}..${:04X}", spec.lo, spec.hi)
+                } else {
+                    format!("${:04X}", spec.lo)
+                };
+                let cond = spec
+                    .cond_src
+                    .as_ref()
+                    .map(|c| format!(" if {c}"))
+                    .unwrap_or_default();
+                let do_desc = obs_do_desc(spec);
+                format!(
+                    "  {} {}  {} {}{} do {}  hits={}",
+                    if enabled { "*" } else { "o" },
+                    spec.name,
+                    trig,
+                    range,
+                    cond,
+                    do_desc,
+                    hits
+                )
+            };
+
+            // `ignore <name> [n]` — set the per-observer ignore count.
+            if op == "ignore" {
+                let name = match toks.get(1) {
+                    Some(n) => n.clone(),
+                    None => return Err("ignore: usage: ignore <name> [n]".into()),
+                };
+                let n: i64 = toks.get(2).and_then(|t| t.parse().ok()).unwrap_or(1);
+                let found = st.dsl_observers.iter().any(|o| o.name == name);
+                if !found {
+                    return Ok(format!("no observer '{name}'"));
+                }
+                // Mirror onto the live registry so the next run honours it; the count is
+                // preserved across rebuilds via sync_observers' `prior` snapshot.
+                st.observers.set_ignore(&name, n);
+                return Ok(format!("ignore {name}: skip next {n}"));
+            }
+
+            let rest: Vec<String> = toks[1..].to_vec();
+
+            // No args (or bare `reg`/`o`) → LIST.
+            if rest.is_empty() {
+                // sync so the live registry reflects current enabled/hits state.
+                {
+                    let State { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } = &mut *st;
+                    sync_observers(breakpoints, dsl_observers, dsl_disabled, reg);
+                }
+                if st.dsl_observers.is_empty() {
+                    return Ok("no observers (obs <name> when exec|load|store <addr> [if <cond>] do break|log)".into());
+                }
+                let lines: Vec<String> = st
+                    .dsl_observers
+                    .iter()
+                    .map(|s| fmt_obs(s, &st.observers, &st.dsl_disabled))
+                    .collect();
+                return Ok(format!("observers:\n{}", lines.join("\n")));
+            }
+
+            // `obs log` → recent `do log` ring.
+            if rest[0].eq_ignore_ascii_case("log") {
+                let logs = &st.observers.logs;
+                if logs.is_empty() {
+                    return Ok("obs log: (empty)".into());
+                }
+                let start = logs.len().saturating_sub(40);
+                return Ok(logs[start..].join("\n"));
+            }
+
+            let name = rest[0].clone();
+            let sub = rest.get(1).map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+
+            // `obs <name> on|off` — persist the disable intent in `dsl_disabled` so it
+            // survives the per-run sync_observers rebuild; re-sync to apply immediately.
+            if rest.len() == 2 && (sub == "on" || sub == "off") {
+                if !st.dsl_observers.iter().any(|o| o.name == name) {
+                    return Ok(format!("no observer '{name}'"));
+                }
+                if sub == "off" {
+                    st.dsl_disabled.insert(name.clone());
+                } else {
+                    st.dsl_disabled.remove(&name);
+                }
+                {
+                    let State { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } = &mut *st;
+                    sync_observers(breakpoints, dsl_observers, dsl_disabled, reg);
+                }
+                return Ok(format!("obs {name} {sub}"));
+            }
+
+            // `obs <name> del|delete|rm`
+            if rest.len() == 2 && (sub == "del" || sub == "delete" || sub == "rm") {
+                let before = st.dsl_observers.len();
+                st.dsl_observers.retain(|o| o.name != name);
+                if st.dsl_observers.len() != before {
+                    st.observers.remove(&name);
+                    st.dsl_disabled.remove(&name);
+                    return Ok(format!("obs {name} deleted"));
+                }
+                return Ok(format!("no observer '{name}'"));
+            }
+
+            // `obs <name> when exec|load|store <addr[..end]> [if <cond>] do <action> [fields]`
+            let lower: Vec<String> = rest.iter().map(|t| t.to_ascii_lowercase()).collect();
+            let wi = lower.iter().position(|t| t == "when");
+            let di = lower.iter().rposition(|t| t == "do");
+            let ii = lower.iter().position(|t| t == "if");
+            // `when` must be the token right after the name (index 1), and `do` after it.
+            let (wi, di) = match (wi, di) {
+                (Some(wi), Some(di)) if wi == 1 && di > wi => (wi, di),
+                _ => {
+                    return Err(
+                        "obs: usage: obs <name> when exec|load|store <addr[..end]> [if <cond>] do break|log|mark|cmd|trace [a/x/y/$addr ...]"
+                            .into(),
+                    )
+                }
+            };
+            let trig_s = lower[wi + 1].clone();
+            let trigger = match trig_s.as_str() {
+                "exec" => observers::ObsTrigger::Exec,
+                "load" => observers::ObsTrigger::Load,
+                "store" => observers::ObsTrigger::Store,
+                _ => {
+                    return Err(format!(
+                        "obs: trigger must be exec|load|store, got '{}'",
+                        rest.get(wi + 1).cloned().unwrap_or_default()
+                    ))
+                }
+            };
+            let addr_tok = rest.get(wi + 2).cloned().unwrap_or_default();
+            let (lo_s, hi_s) = match addr_tok.split_once("..") {
+                Some((a, b)) => (a.to_string(), Some(b.to_string())),
+                None => (addr_tok.clone(), None),
+            };
+            let lo = match parse_hex(&lo_s) {
+                Some(v) => (v & 0xffff) as u16,
+                None => return Err(format!("obs: bad address '{addr_tok}'")),
+            };
+            let hi = match &hi_s {
+                Some(h) => match parse_hex(h) {
+                    Some(v) => (v & 0xffff) as u16,
+                    None => return Err(format!("obs: bad address '{addr_tok}'")),
+                },
+                None => lo,
+            };
+            let action_s = lower.get(di + 1).cloned().unwrap_or_default();
+            let action = match action_s.as_str() {
+                "break" => observers::ObsAction::Break,
+                "log" => observers::ObsAction::Log,
+                "mark" => observers::ObsAction::Mark,
+                "cmd" => observers::ObsAction::Cmd,
+                "trace" => observers::ObsAction::Trace,
+                _ => {
+                    return Err(format!(
+                        "obs: action must be break|log|mark|cmd|trace, got '{}'",
+                        if action_s.is_empty() { "(none)" } else { &action_s }
+                    ))
+                }
+            };
+            // `*`/`?` reserved for the on/off/del wildcards (monitor-shell.ts:951).
+            if name.contains('*') || name.contains('?') {
+                return Err(format!(
+                    "obs: name can't contain * or ? (reserved for wildcards) — got '{name}'"
+                ));
+            }
+            // cond is the tokens between `if` and `do`.
+            let cond_src = match ii {
+                Some(ii) if ii > wi && ii < di => Some(rest[ii + 1..di].join(" ")),
+                _ => None,
+            };
+            // do-action payloads (the tokens after `do <action>`).
+            let do_toks: Vec<String> = rest[(di + 2).min(rest.len())..].to_vec();
+            let mut log_exprs: Option<Vec<observers::LogExpr>> = None;
+            let mut cmd_src: Option<String> = None;
+            let mut mark_label: Option<String> = None;
+            let mut trace_scope: Option<observers::TraceScope> = None;
+            match action {
+                observers::ObsAction::Log if !do_toks.is_empty() => {
+                    let mut exprs: Vec<observers::LogExpr> = Vec::new();
+                    for t in &do_toks {
+                        let lw = t.to_ascii_lowercase();
+                        let reg = match lw.as_str() {
+                            "a" => Some(observers::RegName::A),
+                            "x" => Some(observers::RegName::X),
+                            "y" => Some(observers::RegName::Y),
+                            "sp" => Some(observers::RegName::Sp),
+                            "pc" => Some(observers::RegName::Pc),
+                            "fl" => Some(observers::RegName::Fl),
+                            _ => None,
+                        };
+                        if let Some(r) = reg {
+                            exprs.push(observers::LogExpr::Reg(r));
+                            continue;
+                        }
+                        let word = lw.ends_with(":w");
+                        let addr_part = if word { &t[..t.len() - 2] } else { t.as_str() };
+                        match parse_hex(addr_part) {
+                            Some(a) => exprs.push(observers::LogExpr::Mem {
+                                addr: (a & 0xffff) as u16,
+                                word,
+                            }),
+                            None => {
+                                return Err(format!(
+                                    "obs: log: bad field '{t}' (use a/x/y/sp/pc/fl or $addr[:w])"
+                                ))
+                            }
+                        }
+                    }
+                    log_exprs = Some(exprs);
+                }
+                observers::ObsAction::Cmd => {
+                    // do cmd "<monitor command>" — quoted command run on each hit.
+                    match quoted_first(&cmd) {
+                        Some(c) if !c.is_empty() => cmd_src = Some(c),
+                        _ => return Err(r#"obs: cmd: usage: ... do cmd "<monitor command>""#.into()),
+                    }
+                }
+                observers::ObsAction::Mark => {
+                    // do mark ["label"] — default label = the observer name.
+                    mark_label = Some(quoted_first(&cmd).unwrap_or_else(|| name.clone()));
+                }
+                observers::ObsAction::Trace => {
+                    // do trace off | do trace [domains...] — bracket model.
+                    let args: Vec<String> = do_toks.iter().map(|t| t.to_ascii_lowercase()).collect();
+                    if args.first().map(|s| s == "off").unwrap_or(false) {
+                        trace_scope = Some(observers::TraceScope { off: true, domains: vec![] });
+                    } else {
+                        const ALL: [&str; 5] = ["c64-cpu", "drive8-cpu", "iec", "vic", "memory"];
+                        if let Some(bad) = args.iter().find(|d| !ALL.contains(&d.as_str())) {
+                            return Err(format!(
+                                "obs: trace: unknown domain '{bad}' (use {} or 'off')",
+                                ALL.join("|")
+                            ));
+                        }
+                        let domains = if args.is_empty() {
+                            vec!["c64-cpu".to_string(), "memory".to_string()]
+                        } else {
+                            args
+                        };
+                        trace_scope = Some(observers::TraceScope { off: false, domains });
+                    }
+                }
+                observers::ObsAction::Break if !do_toks.is_empty() => {
+                    return Err(format!(
+                        "obs: 'break' takes no fields (got '{}')",
+                        do_toks.join(" ")
+                    ));
+                }
+                _ => {}
+            }
+
+            // Validate the condition NOW (so a bad cond errors at registration, like TS).
+            if let Some(src) = &cond_src {
+                if let Err(e) = observers::parse_cond(src) {
+                    return Err(format!("obs: condition: {e}"));
+                }
+            }
+
+            let spec = observers::ObsSpec {
+                name: name.clone(),
+                trigger,
+                lo,
+                hi,
+                cond_src: cond_src.clone(),
+                action,
+                log_exprs: log_exprs.clone(),
+                cmd_src: cmd_src.clone(),
+                mark_label: mark_label.clone(),
+                trace_scope: trace_scope.clone(),
+            };
+            // Replace an existing same-name registration; else append.
+            if let Some(slot) = st.dsl_observers.iter_mut().find(|o| o.name == name) {
+                *slot = spec;
+            } else {
+                st.dsl_observers.push(spec);
+            }
+            // Apply onto the live registry immediately so a running --stream loop arms it
+            // on the next frame (sync_observers re-applies it thereafter).
+            {
+                let State { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } = &mut *st;
+                sync_observers(breakpoints, dsl_observers, dsl_disabled, reg);
+            }
+
+            let trig_str = match trigger {
+                observers::ObsTrigger::Exec => "exec",
+                observers::ObsTrigger::Load => "load",
+                observers::ObsTrigger::Store => "store",
+            };
+            let range = if hi != lo {
+                format!("${lo:04X}..${hi:04X}")
+            } else {
+                format!("${lo:04X}")
+            };
+            let cond_disp = cond_src.map(|c| format!(" if {c}")).unwrap_or_default();
+            let do_disp = obs_do_desc(st.dsl_observers.last().unwrap());
+            return Ok(format!("obs {name}: {trig_str} {range}{cond_disp} do {do_disp}"));
+        }
+
         "bk" | "break" | "b" => {
             let t1 = toks.get(1);
             match t1 {
@@ -2458,6 +2865,48 @@ fn monitor_help_text() -> String {
 
 /// The first double-quoted substring of a command (= the TS
 /// `[...cmd.matchAll(/"([^"]*)"/g)].map(m => m[1])[0]`). `None` when unquoted.
+/// Render the `do <action>` description of an observer spec for the `obs`/`o`/`reg`
+/// list + the registration echo — 1:1 with the c64re `doDesc` (monitor-shell.ts:
+/// 996-1000) and the `fmt` `do ...` segment (monitor-shell.ts:899).
+fn obs_do_desc(spec: &observers::ObsSpec) -> String {
+    match spec.action {
+        observers::ObsAction::Log => match &spec.log_exprs {
+            Some(exprs) if !exprs.is_empty() => {
+                let fields: Vec<String> = exprs
+                    .iter()
+                    .map(|e| match e {
+                        observers::LogExpr::Reg(r) => match r {
+                            observers::RegName::A => "a".into(),
+                            observers::RegName::X => "x".into(),
+                            observers::RegName::Y => "y".into(),
+                            observers::RegName::Sp => "sp".into(),
+                            observers::RegName::Pc => "pc".into(),
+                            observers::RegName::Fl => "fl".into(),
+                        },
+                        observers::LogExpr::Mem { addr, word } => {
+                            format!("${:x}{}", addr, if *word { ":w" } else { "" })
+                        }
+                    })
+                    .collect();
+                format!("log {}", fields.join(" "))
+            }
+            _ => "log".into(),
+        },
+        observers::ObsAction::Cmd => {
+            format!("cmd \"{}\"", spec.cmd_src.clone().unwrap_or_default())
+        }
+        observers::ObsAction::Mark => {
+            format!("mark \"{}\"", spec.mark_label.clone().unwrap_or_default())
+        }
+        observers::ObsAction::Trace => match &spec.trace_scope {
+            Some(ts) if ts.off => "trace off".into(),
+            Some(ts) => format!("trace {}", ts.domains.join(" ")),
+            None => "trace".into(),
+        },
+        observers::ObsAction::Break => "break".into(),
+    }
+}
+
 fn quoted_first(cmd: &str) -> Option<String> {
     let start = cmd.find('"')?;
     let rest = &cmd[start + 1..];
@@ -3028,8 +3477,8 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState) -> Response
             // the ephemeral target as a temporary exec observer, drive the segment
             // run, and remove the ephemeral after.
             {
-                let State { breakpoints, observers: reg, .. } = &mut *st;
-                sync_observers(breakpoints, reg);
+                let State { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } = &mut *st;
+                sync_observers(breakpoints, dsl_observers, dsl_disabled, reg);
             }
             let _ = st.observers.add(observers::ObsSpec {
                 name: "__until__".to_string(),
@@ -3297,8 +3746,8 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             // no-debug + trace-firehose paths (formats-state-6, background-workers-
             // async-5) are unchanged.
             {
-                let State { breakpoints, observers: reg, .. } = &mut *st;
-                sync_observers(breakpoints, reg);
+                let State { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } = &mut *st;
+                sync_observers(breakpoints, dsl_observers, dsl_disabled, reg);
             }
             if observers_armed(&st.observers) {
                 // runtime-controller.ts:277 / ws-server.ts:855 — step PAST a bp the PC is
@@ -4206,8 +4655,8 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                     // Mirror the standing bp surface, add the ephemeral until_pc
                     // exec observer, run, then remove it — same pattern as `until`.
                     {
-                        let State { breakpoints, observers: reg, .. } = &mut *st;
-                        sync_observers(breakpoints, reg);
+                        let State { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } = &mut *st;
+                        sync_observers(breakpoints, dsl_observers, dsl_disabled, reg);
                     }
                     let _ = st.observers.add(observers::ObsSpec {
                         name: "__overlay_until__".to_string(),
@@ -8649,6 +9098,8 @@ async fn main() {
         session,
         breakpoints: Breakpoints::new(),
         observers: observers::ObserverRegistry::new(),
+        dsl_observers: Vec::new(),
+        dsl_disabled: std::collections::HashSet::new(),
         type_buffer: Vec::new(),
         ctrl_frame: 0, // incremented on each debug/run|pause|continue; first pause → 1
         ctrl_stop: None,
@@ -8736,6 +9187,8 @@ mod batch1_tests {
             session: Session::new("integrated-1"),
             breakpoints: Breakpoints::new(),
             observers: observers::ObserverRegistry::new(),
+            dsl_observers: Vec::new(),
+            dsl_disabled: std::collections::HashSet::new(),
             type_buffer: Vec::new(),
             ctrl_frame: 0,
             ctrl_stop: None,

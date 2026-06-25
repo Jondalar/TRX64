@@ -99,6 +99,11 @@ pub struct TraceScope {
 }
 
 /// Spec for `add()` (ts:145 `add(spec: {...})`).
+///
+/// `Clone` so the daemon can keep a persistent store of DSL-registered observers
+/// (`obs when … do …`) that survives the per-run `sync_observers` rebuild — each
+/// run re-applies a clone of every stored spec onto the freshly-cleared registry.
+#[derive(Clone)]
 pub struct ObsSpec {
     pub name: String,
     pub trigger: ObsTrigger,

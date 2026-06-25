@@ -1341,6 +1341,155 @@ const CASES: ConfCase[] = [
       };
     },
   },
+
+  // ── P1: ws-trace-monitor-misc-4 — monitor observer DSL (`obs when … do …`) ────
+  // The monitor REPL advertises the full observer-registration DSL (monitor-shell.ts
+  // :888-1009): `obs <name> when exec|load|store $ADDR [if <cond>] do break|log|mark|
+  // cmd|trace`, plus `o`/`reg` (list) and `ignore` (skip-count). TRX64's run_monitor
+  // had NO arm for these → `obs …` fell through to `unknown command: obs` (the help
+  // LIES, and observers were only settable PC-only via debug/break_add). The observer
+  // ENGINE already existed (observers.rs, the 1:1 port of monitor-observers.ts) — the
+  // gap was the REPL PARSER + the registration path onto it. Fix: parse the DSL in
+  // run_monitor, store it in a persistent per-session list re-applied each run, and
+  // make `o`/`reg` list it / `ignore`/`del`/`on`/`off` mutate it. Signal: register a
+  // `do log` exec observer and (a) assert the verb is recognized (no "unknown
+  // command") AND (b) `o`/`reg` then LIST it (registeredCount>0, the name appears).
+  // TS: {recognized:true, listed:true}; TRX64 (before fix): {false,false}.
+  {
+    id: "ws-trace-monitor-misc-4",
+    severity: "P1",
+    title: "monitor observer DSL `obs when … do …` is parsed + registered (help no longer lies)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      const recognized = (s: string) => !/unknown command/i.test(s);
+      // Register an exec observer at the KERNAL IRQ handler with a `do log` action.
+      const regOut = await exec("obs irqlog when exec $EA31 do log");
+      // List via `o` AND bare `obs` (the two listing forms monitor-shell.ts:888-902
+      // dispatches; `reg` is NOT a monitor verb, so it is not used here). The
+      // registered observer must appear in both.
+      const oOut = await exec("o");
+      const obsListOut = await exec("obs");
+      // registeredCount>0: the listing names our observer (and is not the empty banner).
+      const listed = /irqlog/.test(oOut) && /irqlog/.test(obsListOut) && !/no observers/i.test(oOut);
+      // Clean up so this case leaves no observer armed for later cases sharing the session.
+      await exec("obs irqlog del");
+      return {
+        // First signal: the verb is recognized (the help no longer lies).
+        recognized: recognized(regOut) && recognized(oOut) && recognized(obsListOut),
+        // Semantic: the registered observer is listed by `o`/`obs` (registeredCount>0).
+        listed,
+      };
+    },
+  },
+
+  // ── P1: background-workers-async-3 — `do log` observer fires during free-run ───
+  // A `do log` observer is a VICE tracepoint: it prints + continues (never halts).
+  // TS's per-frame tick drains the observer log ring each chunk and broadcasts
+  // `debug/observer_log` while the machine free-runs (runtime-controller.ts:697-698),
+  // so a `do log` observer armed during a --stream free-run streams log lines every
+  // frame. TRX64 had no observer DSL at all → no `do log` to fire. With the DSL wired
+  // (ws-trace-monitor-misc-4) the observer registers, the bp/observer-gated stream
+  // advance (stream_debug_gated_advance, from P0-A/B2) drives it, and the per-frame
+  // drain (drain_and_broadcast_observer_log) broadcasts `debug/observer_log`. Signal:
+  // arm `obs … when exec $EA31 do log`, start the continuous driver, free-run, and
+  // count the `debug/observer_log` broadcasts. TS: >0 (fires). TRX64 must match.
+  {
+    id: "background-workers-async-3",
+    severity: "P1",
+    title: "`do log` observer fires + broadcasts debug/observer_log during --stream free-run",
+    spawn: { stream: true },
+    async signal(c) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      // Start the continuous --stream driver and wait until the machine has booted to
+      // where $EA31 (KERNAL IRQ handler) is firing every frame (IRQs enabled).
+      await c.call("debug/run", { session_id: sid });
+      await waitRunningBooted(c, sid, 2_500_000, 60_000);
+      // Re-arm the continuous driver if a one-shot left it paused.
+      let st = await state(c, sid);
+      if (st.runState !== "running") await c.call("debug/run", { session_id: sid });
+      // Arm the `do log` tracepoint at the IRQ handler (a free-running hot path).
+      await exec("obs irqtp when exec $EA31 do log");
+      const sink = collectNotes(c);
+      // Re-arm: registering an observer does not pause, but be defensive.
+      st = await state(c, sid);
+      if (st.runState !== "running") await c.call("debug/run", { session_id: sid });
+      await sleep(5000); // the driver hits $EA31 every frame → log broadcasts accrue
+      sink.off();
+      const logBroadcasts = sink.notes.filter(
+        (n) => n.method === "debug/observer_log" || n.method === "debug/observer_hit",
+      ).length;
+      // Clean up the tracepoint.
+      await exec("obs irqtp del");
+      return {
+        // The behavioural signal: a `do log` observer fired during free-run and the
+        // per-frame drain broadcast at least one debug/observer_log (count>0).
+        observerLogFired: logBroadcasts > 0,
+      };
+    },
+  },
+
+  // ── P1: broadcasts-4 — `do trace` observer brackets a scoped capture ──────────
+  // The observer DSL's `do trace [domains]|off` action is the bracket model: one
+  // observer STARTS a scoped capture, another STOPS it (explicit lifecycle), and each
+  // fire broadcasts a `debug/observer_log` lifecycle line (runtime-controller.ts
+  // :727-753). The engine (observers.rs) already queues each `do trace` fire into
+  // `pending_trace`; the daemon now drains it in drain_and_broadcast_observer_log via
+  // the SAME trace machinery the `trace on/off` monitor verb drives (TraceState +
+  // finalize_trace). Signal: arm `obs … when exec $EA31 do trace c64-cpu memory`,
+  // free-run under --stream so the observer fires, then assert a trace became ACTIVE
+  // (engine status RPC) AND a `debug/observer_log` lifecycle line was broadcast. TS:
+  // {traceStarted:true, lifecycleBroadcast:true}; TRX64 must match.
+  {
+    id: "broadcasts-4",
+    severity: "P1",
+    title: "`do trace` observer starts a scoped capture + broadcasts the lifecycle line",
+    spawn: { stream: true },
+    async signal(c) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      // Make sure no trace is already active (a prior case may have left one).
+      await c.call("trace/run/stop", { session_id: sid, wait_index: false }).catch(() => undefined);
+      // Start the continuous driver + boot to where $EA31 fires every frame.
+      await c.call("debug/run", { session_id: sid });
+      await waitRunningBooted(c, sid, 2_500_000, 60_000);
+      let st = await state(c, sid);
+      if (st.runState !== "running") await c.call("debug/run", { session_id: sid });
+      // Arm the START side of the bracket: a `do trace` observer at the IRQ handler.
+      const armOut = await exec("obs tron when exec $EA31 do trace c64-cpu memory");
+      const sink = collectNotes(c);
+      st = await state(c, sid);
+      if (st.runState !== "running") await c.call("debug/run", { session_id: sid });
+      await sleep(4000); // the driver hits $EA31 → the observer starts the scoped trace
+      sink.off();
+      // The engine's own status RPC reports a live trace once the observer fired.
+      const statusRpc = (await c.call("trace/run/status", { session_id: sid })) as any;
+      const traceStarted = statusRpc?.active === true;
+      const lifecycleBroadcast = sink.notes.some(
+        (n) => n.method === "debug/observer_log" &&
+          (n.params?.lines ?? []).some((l: string) => /trace/i.test(l)),
+      );
+      // Clean up: remove the observer and finalize any trace it started.
+      await exec("obs tron del");
+      await c.call("trace/run/stop", { session_id: sid, wait_index: false }).catch(() => undefined);
+      return {
+        // Semantic: the `do trace` observer fired and a scoped trace became active.
+        traceStarted,
+        // The bracket-model lifecycle line was broadcast over debug/observer_log.
+        lifecycleBroadcast,
+      };
+    },
+  },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
