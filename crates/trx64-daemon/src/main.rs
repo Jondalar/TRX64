@@ -4306,6 +4306,17 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             let role = if is_cart { "cartridge" } else { "drive8" };
             let mut st = state.lock().unwrap();
             let was_running = st.session.running;
+            // audit ws-media-0 — eject also routes through the ingress boundary
+            // (= ingestMedia kind:eject, ingress.ts:185): dirty-media guard +
+            // checkpoint-before/after, and (disk) persist the outgoing disk's dirty
+            // writes to its host file BEFORE detaching, so an eject can't lose them.
+            if let Some(reason) = non_persistable_dirty_media(&st) {
+                return Response::err(id, -32602, format!(
+                    "media/unmount: cannot apply a media change — {reason} (Spec 709.13)."
+                ));
+            }
+            let before_id = capture_media_checkpoint(&mut st);
+            let mut persisted_outgoing: Option<String> = None;
             if is_cart {
                 // Cart eject = persist writable flash → detach → power-cycle → resume
                 // (Spec 709.12, VICE-faithful), mirroring the media/ingress eject path.
@@ -4319,9 +4330,16 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 st.ctrl_stop = None;
                 st.notify.broadcast("debug/running", json!({ "session_id": st.session.id, "pacing": { "mode": "pal", "ratio": 1 } }));
             } else {
+                // Persist the outgoing disk's dirty writes to its host file BEFORE
+                // detach (the data-loss fix — detach_disk only flushes into disk.bytes,
+                // not the host file). Then detach.
+                persisted_outgoing = persist_outgoing_disk(&mut st);
                 st.session.machine.drive8.detach_disk();
                 st.session.disk_path = String::new();
             }
+            let after_id = capture_media_checkpoint(&mut st);
+            if let Some(ref b) = before_id { st.checkpoint_ring.pin(b); }
+            if let Some(ref a) = after_id { st.checkpoint_ring.pin(a); }
             let cycle = st.session.machine.clk;
             let event = json!({
                 "cycle": cycle,
@@ -4330,16 +4348,18 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 "format": Value::Null,
                 "sha256": Value::Null,
                 "resetPolicy": Value::Null,
-                "checkpointBeforeId": Value::Null,
-                "checkpointAfterId": Value::Null
+                "checkpointBeforeId": before_id,
+                "checkpointAfterId": after_id
             });
             push_media_event(&mut st, event.clone());
+            let mut detail = json!({ "role": role });
+            if let Some(p) = persisted_outgoing { detail["diskPersisted"] = json!(p); }
             Response::ok(id, json!({
                 "ok": true,
                 "event": event,
                 "paused": !is_cart,
                 "wasRunning": was_running,
-                "detail": { "role": role }
+                "detail": detail
             }))
         }
 
@@ -4368,6 +4388,17 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 let crt_name = path_str.split('/').last().unwrap_or("cartridge.crt").to_string();
                 let sha = sha256_hex(&bytes);
                 let mut st = state.lock().unwrap();
+                // audit ws-media-0 — CRT insert routes through the ingress boundary too:
+                // dirty-media guard + checkpoint-before (a present medium/running machine
+                // = an intervention) BEFORE the power-cycle, checkpoint-after after.
+                if let Some(reason) = non_persistable_dirty_media(&st) {
+                    return Response::err(id, -32602, format!(
+                        "media/mount: cannot apply a media change — {reason} (Spec 709.13)."
+                    ));
+                }
+                let cart_media_present = st.session.machine.drive8.get_attached_disk().is_some()
+                    || st.session.machine.cartridge.is_some();
+                let before_id = if cart_media_present { capture_media_checkpoint(&mut st) } else { None };
                 let mapper_type = match st.session.machine.attach_cart_from_bytes(&bytes, &crt_name) {
                     Ok((_n, t)) => t,
                     Err(e) => return Response::err(id, -32602, format!("media/mount: bad CRT: {e}")),
@@ -4376,6 +4407,9 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 st.session.cart_path = path_str.clone();
                 st.session.machine.fill_power_on_ram();
                 st.session.machine.cold_reset();
+                let after_id = capture_media_checkpoint(&mut st);
+                if let Some(ref b) = before_id { st.checkpoint_ring.pin(b); }
+                if let Some(ref a) = after_id { st.checkpoint_ring.pin(a); }
                 let cycle = st.session.machine.clk;
                 st.session.running = true;
                 st.ctrl_stop = None;
@@ -4383,7 +4417,7 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 let event = json!({
                     "cycle": cycle, "operation": "crt", "role": Value::Null, "format": "crt",
                     "sha256": sha.clone(), "resetPolicy": "power-cycle",
-                    "checkpointBeforeId": Value::Null, "checkpointAfterId": Value::Null,
+                    "checkpointBeforeId": before_id, "checkpointAfterId": after_id,
                 });
                 push_media_event(&mut st, event.clone());
                 return Response::ok(id, json!({
@@ -4412,8 +4446,28 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             };
 
             let mut st = state.lock().unwrap();
-            st.session.machine.drive8.attach_disk(image);
-            st.session.disk_path = path_str.clone();
+            // audit ws-media-0 — route the disk mount through the ingress boundary
+            // (= ingestMedia, ingress.ts:91), NOT a bare drive8.attach_disk:
+            //  1. dirty-media guard (Spec 709.13) — no branching intervention while a
+            //     mounted medium is dirty + non-persistable (here: a writable cart).
+            //  2. checkpoint-before — captured when a medium is already present (an
+            //     intervention vs. a fresh-session root); pinned so the event is
+            //     replayable.
+            //  3. mount_disk_media — persists the OUTGOING disk's dirty writes to its
+            //     host file BEFORE detach/replace (the actual data-loss fix).
+            //  4. checkpoint-after — embedded as event.checkpointAfterId; pinned.
+            if let Some(reason) = non_persistable_dirty_media(&st) {
+                return Response::err(id, -32602, format!(
+                    "media: cannot apply a media change — {reason} (Spec 709.13)."
+                ));
+            }
+            let media_present = st.session.machine.drive8.get_attached_disk().is_some()
+                || st.session.machine.cartridge.is_some();
+            let before_id = if media_present { capture_media_checkpoint(&mut st) } else { None };
+            let persisted_outgoing = mount_disk_media(&mut st, image, &path_str);
+            let after_id = capture_media_checkpoint(&mut st);
+            if let Some(ref b) = before_id { st.checkpoint_ring.pin(b); }
+            if let Some(ref a) = after_id { st.checkpoint_ring.pin(a); }
             let cycle = st.session.machine.clk;
 
             let event = json!({
@@ -4423,17 +4477,19 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 "format": format_str,
                 "sha256": sha256,
                 "resetPolicy": null,
-                "checkpointBeforeId": null,
-                "checkpointAfterId": null
+                "checkpointBeforeId": before_id,
+                "checkpointAfterId": after_id
             });
             push_media_event(&mut st, event.clone());
+            let mut detail = json!({ "name": disk_name, "backingPath": path_str });
+            if let Some(p) = persisted_outgoing { detail["diskPersisted"] = json!(p); }
             Response::ok(id, json!({
                 "mountedPath": path_str,
                 "type": format_str,
                 "slot": 8u64,
                 "sha256": sha256,
                 "event": event,
-                "detail": { "name": disk_name, "backingPath": path_str },
+                "detail": detail,
                 "paused": true
             }))
         }
@@ -4459,6 +4515,17 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 let crt_name = path_str.split('/').last().unwrap_or("cartridge.crt").to_string();
                 let sha = sha256_hex(&bytes);
                 let mut st = state.lock().unwrap();
+                // audit ws-media-0 — CRT swap routes through the ingress boundary too:
+                // dirty-media guard + checkpoint-before (a present medium/running machine
+                // = an intervention) BEFORE the power-cycle, checkpoint-after after.
+                if let Some(reason) = non_persistable_dirty_media(&st) {
+                    return Response::err(id, -32602, format!(
+                        "media/swap: cannot apply a media change — {reason} (Spec 709.13)."
+                    ));
+                }
+                let cart_media_present = st.session.machine.drive8.get_attached_disk().is_some()
+                    || st.session.machine.cartridge.is_some();
+                let before_id = if cart_media_present { capture_media_checkpoint(&mut st) } else { None };
                 let mapper_type = match st.session.machine.attach_cart_from_bytes(&bytes, &crt_name) {
                     Ok((_n, t)) => t,
                     Err(e) => return Response::err(id, -32602, format!("media/swap: bad CRT: {e}")),
@@ -4467,6 +4534,9 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 st.session.cart_path = path_str.clone();
                 st.session.machine.fill_power_on_ram();
                 st.session.machine.cold_reset();
+                let after_id = capture_media_checkpoint(&mut st);
+                if let Some(ref b) = before_id { st.checkpoint_ring.pin(b); }
+                if let Some(ref a) = after_id { st.checkpoint_ring.pin(a); }
                 let cycle = st.session.machine.clk;
                 st.session.running = true;
                 st.ctrl_stop = None;
@@ -4474,7 +4544,7 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 let event = json!({
                     "cycle": cycle, "operation": "crt", "role": Value::Null, "format": "crt",
                     "sha256": sha.clone(), "resetPolicy": "power-cycle",
-                    "checkpointBeforeId": Value::Null, "checkpointAfterId": Value::Null,
+                    "checkpointBeforeId": before_id, "checkpointAfterId": after_id,
                 });
                 push_media_event(&mut st, event.clone());
                 return Response::ok(id, json!({
@@ -4503,8 +4573,28 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             };
 
             let mut st = state.lock().unwrap();
-            st.session.machine.drive8.attach_disk(image);
-            st.session.disk_path = path_str.clone();
+            // audit ws-media-0 — route the disk mount through the ingress boundary
+            // (= ingestMedia, ingress.ts:91), NOT a bare drive8.attach_disk:
+            //  1. dirty-media guard (Spec 709.13) — no branching intervention while a
+            //     mounted medium is dirty + non-persistable (here: a writable cart).
+            //  2. checkpoint-before — captured when a medium is already present (an
+            //     intervention vs. a fresh-session root); pinned so the event is
+            //     replayable.
+            //  3. mount_disk_media — persists the OUTGOING disk's dirty writes to its
+            //     host file BEFORE detach/replace (the actual data-loss fix).
+            //  4. checkpoint-after — embedded as event.checkpointAfterId; pinned.
+            if let Some(reason) = non_persistable_dirty_media(&st) {
+                return Response::err(id, -32602, format!(
+                    "media: cannot apply a media change — {reason} (Spec 709.13)."
+                ));
+            }
+            let media_present = st.session.machine.drive8.get_attached_disk().is_some()
+                || st.session.machine.cartridge.is_some();
+            let before_id = if media_present { capture_media_checkpoint(&mut st) } else { None };
+            let persisted_outgoing = mount_disk_media(&mut st, image, &path_str);
+            let after_id = capture_media_checkpoint(&mut st);
+            if let Some(ref b) = before_id { st.checkpoint_ring.pin(b); }
+            if let Some(ref a) = after_id { st.checkpoint_ring.pin(a); }
             let cycle = st.session.machine.clk;
 
             let event = json!({
@@ -4514,17 +4604,19 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 "format": format_str,
                 "sha256": sha256,
                 "resetPolicy": null,
-                "checkpointBeforeId": null,
-                "checkpointAfterId": null
+                "checkpointBeforeId": before_id,
+                "checkpointAfterId": after_id
             });
             push_media_event(&mut st, event.clone());
+            let mut detail = json!({ "name": disk_name, "backingPath": path_str });
+            if let Some(p) = persisted_outgoing { detail["diskPersisted"] = json!(p); }
             Response::ok(id, json!({
                 "mountedPath": path_str,
                 "type": format_str,
                 "slot": 8u64,
                 "sha256": sha256,
                 "event": event,
-                "detail": { "name": disk_name, "backingPath": path_str },
+                "detail": detail,
                 "paused": true
             }))
         }
@@ -6434,6 +6526,58 @@ fn persist_cart_for_eject(st: &mut State, backing_path: &str) -> Option<String> 
         Ok(()) => Some(backing_path.to_string()),
         Err(_) => None,
     }
+}
+
+/// Spec 742 / BUG-023 — host-file write-back for the OUTGOING disk before it is
+/// detached/replaced (= the c64re `persistDriveToFile`, mount-disk-media.ts:47-56,
+/// called from `mountDiskMedia`'s implicit-eject at :77-82). This is THE actual
+/// data-loss fix for audit ws-media-0: TRX64's old `attach_disk`-direct path
+/// replaced the GCR image in place without serializing the currently-mounted
+/// disk's pending drive writes back to its host file, so swapping A→B while A had
+/// unsaved writes silently lost A's writes. Mirroring VICE saving the image on
+/// detach, this flushes the dirty GCR track into `disk.bytes` then writes those
+/// bytes back to the backing host file. Read-only / no-backing-path / clean media
+/// is skipped (no write). Returns the written path on a real write so the caller
+/// can stamp `detail["diskPersisted"]`.
+fn persist_outgoing_disk(st: &mut State) -> Option<String> {
+    // Flush any pending dirty GCR track into `disk.bytes` first (= VICE
+    // `drive_gcr_data_writeback_all` before reading `fsimage->fd`). Cheap no-op
+    // when nothing is dirty.
+    st.session.machine.drive8.flush_disk_writeback();
+    let disk = st.session.machine.drive8.get_attached_disk()?;
+    if disk.read_only {
+        return None; // never overwrite a read-only image (mount-disk-media.ts:52)
+    }
+    let backing_path = match &disk.backing_path {
+        Some(p) if !p.is_empty() => p.clone(),
+        _ => return None, // uploaded bytes with no host file → RAM-only, nothing to write
+    };
+    let bytes = disk.bytes.clone();
+    match std::fs::write(&backing_path, &bytes) {
+        Ok(()) => Some(backing_path),
+        Err(_) => None,
+    }
+}
+
+/// Spec 742 / BUG-023 — THE single disk-media attach (= the c64re `mountDiskMedia`,
+/// mount-disk-media.ts:63-95). A disk change is an implicit eject of the currently
+/// mounted disk: persist its dirty writes to the host file + detach BEFORE attaching
+/// the new one, else the outgoing disk's writes are lost (audit ws-media-0). No-op
+/// outgoing-persist on the first mount (no disk attached). Records the new path as
+/// the session's disk identity. Returns the persisted-outgoing host path, if any.
+fn mount_disk_media(st: &mut State, image: DiskImage, new_path: &str) -> Option<String> {
+    // Implicit eject: persist + detach the outgoing disk first (mount-disk-media.ts:
+    // 77-82). Only when a disk is actually attached (first mount → None).
+    let persisted_outgoing = if st.session.machine.drive8.get_attached_disk().is_some() {
+        let p = persist_outgoing_disk(st);
+        st.session.machine.drive8.detach_disk();
+        p
+    } else {
+        None
+    };
+    st.session.machine.drive8.attach_disk(image);
+    st.session.disk_path = new_path.to_string();
+    persisted_outgoing
 }
 
 /// Spec 709.13 — capture a real before/after checkpoint into the ring and return
