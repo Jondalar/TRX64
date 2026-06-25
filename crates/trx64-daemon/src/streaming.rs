@@ -338,6 +338,14 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
             break;
         }
 
+        // Spec 771.2 — gate the machine ADVANCE + A/V push on the controller's
+        // run-state. When paused/powered-off (running=false) the TS controller's tick
+        // stops: the picture freezes on the last presented frame and audio goes silent.
+        // TRX64's stream loop is the SOLE machine driver under --stream, so it MUST
+        // honor `running` too — otherwise pause never freezes, power-off shows live
+        // garbage, and a reset glitches under the continuous run.
+        let running = { state.lock().unwrap().session.running };
+        if running {
         // ── Run one PAL frame + render + drain this frame's SID writes ──
         // Lock the shared State only for this window; release before sleeping so
         // other JSON-RPC requests (and disk mounts) interleave between frames.
@@ -390,6 +398,7 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
             hub.broadcast(Message::Binary(audio.into()));
             audio_seq = audio_seq.wrapping_add(1);
         }
+        } // end `if running` — paused/off advances nothing (frozen picture, silent)
 
         // ── Pace to real-time: sleep to the absolute target for this frame. ──
         frames_since_epoch = frames_since_epoch.wrapping_add(1);
