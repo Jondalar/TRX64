@@ -1683,13 +1683,11 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 machine.read_full(a) as u64 | ((machine.read_full(a.wrapping_add(1)) as u64) << 8)
             };
             let sid_regs: Vec<u64> = machine.sid_regs[0..25].iter().map(|b| *b as u64).collect();
-            Response::ok(id, json!({
+            let mut state_json = json!({
                 "c64Cycles": machine.clk,
                 "driveCycles": machine.drive8.drive_clk,
                 "mode": "true-drive",
                 "runState": run_state,
-                "stopReason": stop_reason,
-                "controlOwner": "llm",
                 "cpu": {
                     "pc": cpu.pc as u64,
                     "a": cpu.a as u64,
@@ -1718,7 +1716,11 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                     "cbinv": rd16(0x0318)
                 },
                 "sid": { "regs": sid_regs, "streaming": false }
-            }))
+            });
+            // TS session/state (ws-server.ts:531) emits stopReason ONLY when set
+            // (stopInfo?.reason → undefined omits the key) and has NO controlOwner.
+            if let Some(r) = stop_reason { state_json["stopReason"] = json!(r); }
+            Response::ok(id, state_json)
         }
 
         "session/type" => {
