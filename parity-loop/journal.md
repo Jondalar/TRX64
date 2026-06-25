@@ -44,3 +44,12 @@ route by extension/slot like TS adaptMount. Verified live: im3_MAGICDESK runs+re
 (mech title) + SID music; EF/GMOD2/MegaByter attach; eject → EMPTY; disk path unaffected.
 Lesson: T3.3 fixed media/ingress but the live UI uses media/mount|swap|unmount — must
 test the ACTUAL UI path, not just the audited handler.
+
+## 2026-06-25 — UX sweep part 2 (tabs/warp/scrub) + warp fix
+Tested live in Chrome: tabs (Memory Map / Payloads / Dashboard / Docs) render (empty in
+verprobe project, expected). Scrub: pause → checkpoint filmstrip → click frame → seek
+restores ✓. Reset (warm) → clean BASIC ✓. Found+fixed: Warp was a no-op (stream loop
+ignored pacing_mode); wired warp → 8x cycles/frame (~5x live). Eject→BASIC verified clean
+(vic.mode 0) — earlier black was a transient mid-boot grab, not a bug. Joystick model
+wired (CIA1, core 216/216) — not deep-tested with a live joystick game. MON popout opens
+a separate window (verbs verified headless: d/m/r/bk/bank/help).
