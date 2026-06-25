@@ -344,7 +344,12 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
         // TRX64's stream loop is the SOLE machine driver under --stream, so it MUST
         // honor `running` too — otherwise pause never freezes, power-off shows live
         // garbage, and a reset glitches under the continuous run.
-        let running = { state.lock().unwrap().session.running };
+        // Spec 771.2 (T1.3 wire) — honor the controller pacing mode: "warp" advances
+        // 8× cycles per presented frame (fast-forward at 50fps video), else real-time.
+        let (running, warp) = {
+            let st = state.lock().unwrap();
+            (st.session.running, st.pacing_mode == "warp")
+        };
         if running {
         // ── Run one PAL frame + render + drain this frame's SID writes ──
         // Lock the shared State only for this window; release before sleeping so
@@ -357,7 +362,7 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
                 let mut sink = NullSink;
                 st.session
                     .machine
-                    .run_for_full(CYC_PER_FRAME, &mut sink, |_, _, _, _, _, _, _| {});
+                    .run_for_full(if warp { CYC_PER_FRAME * 8 } else { CYC_PER_FRAME }, &mut sink, |_, _, _, _, _, _, _| {});
             }
             let d_cycles = st.session.machine.c64_core.clk.wrapping_sub(clk_before) as u32;
             let cpu_cycle = st.session.machine.c64_core.clk as u32;
@@ -382,7 +387,8 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
             drop(st);
 
             let vic = build_vic_frame(frame_seq, cpu_cycle, &indices, w as u16, h as u16);
-            let audio = if mono.is_empty() {
+            // Warp: skip audio (8× PCM would garble; TS mutes in warp too).
+            let audio = if warp || mono.is_empty() {
                 None
             } else {
                 Some(build_audio_msg(audio_seq, &mono))
