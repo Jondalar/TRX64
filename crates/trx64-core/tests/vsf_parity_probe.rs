@@ -53,7 +53,7 @@ fn golden_c64re_roundtrip_diff() {
     eprintln!("errors: {:?}", res.errors);
 
     // Re-save and diff per module.
-    let resaved = trx64_core::vsf::save_vsf(&m);
+    let resaved = trx64_core::vsf::save_vsf(&mut m);
     let golden_mods: BTreeMap<_, _> = parse_modules(golden).into_iter().collect();
     let resaved_mods: BTreeMap<_, _> = parse_modules(&resaved).into_iter().collect();
 

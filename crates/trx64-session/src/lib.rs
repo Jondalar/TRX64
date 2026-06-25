@@ -56,6 +56,22 @@ pub struct TraceState {
     /// T2.6 — manual phase markers: (cpu_clk, label). Matches TS `run.marks[]`
     /// (`trace-run.ts` ActiveRun.run.marks + markCount).
     pub marks: Vec<(u64, String)>,
+    /// ws-trace-monitor-misc-23 — the real trace definition id (= TS RuntimeTraceRun
+    /// .definitionId = def.id). For a `trace/start_domains` (captureAll) trace this is
+    /// "live-capture"; for a `trace/run/start` of a registered definition it is THAT
+    /// definition's id. finalize_trace echoes it (NOT a hardcoded "live-capture").
+    pub definition_id: String,
+    /// The definition's version (= TS RuntimeTraceRun.definitionVersion).
+    pub definition_version: i64,
+    /// Wall-clock ms at trace start (= TS ActiveRun.startWall = Date.now()); used to
+    /// compute `overheadMs` at stop (= TS run.overheadMs = Date.now() - startWall).
+    pub start_wall_ms: u128,
+    /// The mounted-media identity SHA captured at start (= TS run.media.sha256), or
+    /// empty when no disk was attached. Echoed in the stop descriptor's `media`.
+    pub media_sha: String,
+    /// The mounted-media source name (basename), echoed in the stop descriptor's
+    /// `media` (= TS run.media.sourceName). Empty when none.
+    pub media_name: String,
 }
 
 impl Session {

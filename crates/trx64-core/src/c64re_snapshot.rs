@@ -862,14 +862,24 @@ pub fn restore_ram_ta(m: &mut Machine, node: &serde_json::Value) -> bool {
 
 /// Build the full RuntimeCheckpoint payload tree from the live machine.
 /// `disk_path`/`image_format` feed the `media` metadata (the daemon supplies them
-/// from the attached disk). `drive1541` is the optional VICE drive blob (None until
-/// part 4).
+/// from the attached disk). `drive1541` is the optional VICE drive blob.
+///
+/// `cart_bytes`/`cart_flash` (Spec 714.5, formats-state-2) are the attached
+/// cartridge's original `.crt` bytes + mutable writable image (flash low+high), which
+/// the daemon captures from the live mapper BEFORE this immutable-borrow call (the
+/// writable image read needs `&mut` to catch the flash erase alarm up). They mirror
+/// c64re's headless-machine-kernel.ts:988-989 `captureCartBytes()`/`captureCartFlash()`
+/// — non-null whenever a cartridge is attached (cart_bytes) / has a writable port
+/// (cart_flash); None ⇒ no cartridge / read-only mapper. Lost-on-dump before this fix
+/// (both were hardcoded null).
 pub fn capture_runtime_checkpoint(
     m: &Machine,
     disk_path: &str,
     image_format: &str,
     drive1541: Option<&[u8]>,
     drive_disk_image: Option<&[u8]>,
+    cart_bytes: Option<&[u8]>,
+    cart_flash: Option<&[u8]>,
 ) -> serde_json::Value {
     use serde_json::json;
     let keys = m.keyboard.pressed_keys();
@@ -898,8 +908,11 @@ pub fn capture_runtime_checkpoint(
         "vicProvenance": serde_json::Value::Null,
         "drive1541": drive1541.map(ta_u8).unwrap_or(serde_json::Value::Null),
         "driveDiskImage": drive_disk_image.map(ta_u8).unwrap_or(serde_json::Value::Null),
-        "cartBytes": serde_json::Value::Null,
-        "cartFlash": serde_json::Value::Null,
+        // Spec 714.5 (formats-state-2): the attached cartridge's original .crt bytes +
+        // mutable flash image, as `{ $ta }` typed-array nodes (null = no cart / no
+        // writable port), so dump/undump round-trips a written EasyFlash's flash.
+        "cartBytes": cart_bytes.map(ta_u8).unwrap_or(serde_json::Value::Null),
+        "cartFlash": cart_flash.map(ta_u8).unwrap_or(serde_json::Value::Null),
         "media": { "diskPath": disk_path, "imageFormat": image_format },
         "audio": serde_json::Value::Null,
     })
@@ -1017,6 +1030,32 @@ pub fn restore_runtime_checkpoint(
         crate::drive_snapshot::restore_drive_disk_image(&mut m.drive8, &disk_blob)?;
     }
 
+    // Cartridge restore (Spec 714.5 / formats-state-2): recreate the mapper from the
+    // captured original `.crt` bytes, then overlay the mutable flash image — mirroring
+    // c64re's restoreMediaCheckpoint(cp.media, cp.cartBytes, cp.cartFlash)
+    // (headless-machine-kernel.ts:1071/1126-1134). `cartBytes` null ⇒ no cartridge was
+    // attached → detach (matches the TS `attachCartridge(undefined)` branch). The
+    // parsed cart name comes from the `.crt` header; the placeholder path is only the
+    // empty-name fallback (parse_crt name handling).
+    match cp.get("cartBytes").and_then(ta_u8_decode) {
+        Some(cart_bytes) if !cart_bytes.is_empty() => {
+            m.attach_cart_from_bytes(&cart_bytes, "snapshot.crt")
+                .map_err(|e| format!("restore cart: {e:?}"))?;
+            // Overlay the mutable writable image (flash low+high) when captured.
+            if let Some(flash) = cp.get("cartFlash").and_then(ta_u8_decode) {
+                if !flash.is_empty() {
+                    if let Some(cart) = m.cartridge.as_mut() {
+                        cart.set_writable_image(&flash);
+                    }
+                }
+            }
+        }
+        _ => {
+            // No cartridge in the checkpoint → ensure none is attached.
+            m.detach_cart();
+        }
+    }
+
     // Hand back the decoded `drive1541` blob for the caller's logging/diagnostics.
     Ok(drive_blob)
 }
@@ -1047,7 +1086,7 @@ mod tests {
         m.c64_int.pending_int = [0, 0x02, 0, 0];
         m.keyboard.key_down("A");
 
-        let cp = capture_runtime_checkpoint(&m, "/tmp/x.g64", "g64", None, None);
+        let cp = capture_runtime_checkpoint(&m, "/tmp/x.g64", "g64", None, None, None, None);
         // Spot-check the tree shape (field names match c64re).
         assert_eq!(cp["schemaVersion"], 1);
         assert_eq!(cp["atInstructionBoundary"], true);
@@ -1097,7 +1136,7 @@ mod tests {
         m.ram[0x2000] = 0x99;
         m.vic.raster_line = 55;
 
-        let cp = capture_runtime_checkpoint(&m, "", "", None, None);
+        let cp = capture_runtime_checkpoint(&m, "", "", None, None, None, None);
         let bytes = write_native_snapshot(WriteNativeSnapshotArgs {
             checkpoint: cp,
             schema_version: 1,
@@ -1169,6 +1208,8 @@ mod tests {
             "d64",
             Some(&drive1541),
             disk_blob.as_deref(),
+            None,
+            None,
         );
         assert_ne!(cp["drive1541"], serde_json::Value::Null);
         assert_ne!(cp["driveDiskImage"], serde_json::Value::Null);

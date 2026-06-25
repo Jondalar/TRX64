@@ -136,6 +136,37 @@ const SCRAMBLE_D64_B = (() => {
   return SCRAMBLE_D64;
 })();
 
+// ── c64re-own VSF module reader ───────────────────────────────────────────────
+// Both daemons write the c64re-own compact VSF framing (session-vsf.ts / vsf.rs):
+//   file header = "VICE Snapshot File\x1A" (19) + major + minor + null-term machine
+//   per module = null-terminated name + major + minor + 4-byte LE data length + data
+// Returns the DATA length (excluding the module header) of the named module, or -1
+// when absent / on a parse error. Used to read the DRIVECPU module's byte length back
+// off the saved file (no per-module length is exposed over the WS reply).
+function vsfModuleDataLen(buf: Buffer, want: string): number {
+  const MAGIC = "VICE Snapshot File\x1a"; // 19 bytes
+  if (buf.length < MAGIC.length + 2 || buf.toString("latin1", 0, MAGIC.length) !== MAGIC) return -1;
+  // Skip magic (19) + major (1) + minor (1); machine name is null-terminated.
+  let cur = MAGIC.length + 2;
+  const nameEnd = buf.indexOf(0x00, cur);
+  if (nameEnd < 0) return -1;
+  cur = nameEnd + 1; // past the machine-name null
+  while (cur < buf.length) {
+    const nul = buf.indexOf(0x00, cur);
+    if (nul < 0) break;
+    const name = buf.toString("latin1", cur, nul);
+    cur = nul + 1;
+    if (cur + 6 > buf.length) break; // major + minor + 4-byte length
+    cur += 2; // major, minor
+    const len = buf.readUInt32LE(cur);
+    cur += 4;
+    if (cur + len > buf.length) break;
+    if (name === want) return len;
+    cur += len;
+  }
+  return -1;
+}
+
 const CASES: ConfCase[] = [
   // ── P0: ws-session-debug-0 — free-run breakpoint under --stream ────────────
   // Set a breakpoint on the BASIC idle loop ($E5CD, hit every iteration) while the
@@ -1029,6 +1060,141 @@ const CASES: ConfCase[] = [
       return {
         // The behavioural signal: a trace is active immediately after the create.
         traceOpened: status?.active === true,
+      };
+    },
+  },
+
+  // ── P1: formats-state-1 — VSF embeds the 1541 drive snapshot (DRIVECPU module) ──
+  // (Audit theme T6.) TS's saveSessionVsf embeds drive1541.snapshot() into the
+  // DRIVECPU module (session-vsf.ts:116-118 — the full drive core blob: DRIVE8 +
+  // DRIVECPU0 + 1541VIA1D0 + VIA2D0). TRX64's save_vsf wrote ser_drivecpu() = 0 bytes
+  // (vsf.rs:219/314), so a saved VSF carried an EMPTY drive module — the 1541 state was
+  // lost. Fix: serialize the live drive (drive_snapshot::capture_drive1541) into the
+  // DRIVECPU module. Signal: mount a disk + run so the drive CPU is live, vsf/save to an
+  // abs path, read the file back and parse the DRIVECPU module's data length. TS:
+  // driveModuleNonEmpty=true; TRX64 (before fix): false.
+  {
+    id: "formats-state-1",
+    severity: "P1",
+    title: "VSF save embeds the 1541 drive snapshot (non-empty DRIVECPU module)",
+    spawn: { stream: true, seedFiles: [{ rel: "fixtureA.d64", bytes: SCRAMBLE_D64 }] },
+    async signal(c, d) {
+      const sid = await liveSession(c);
+      const diskPath = `${d.projectDir}/fixtureA.d64`;
+      await c.call("media/mount", { session_id: sid, path: diskPath, slot: 8 });
+      // Run so the drive CPU has booted past its reset (the DOS ROM init runs even
+      // without a host LOAD — the drive CPU + VIA state is live). --stream does not
+      // auto-run; debug/run starts the live driver, then we wait for boot.
+      await c.call("debug/run", { session_id: sid });
+      await waitRunningBooted(c, sid, 1_500_000, 60_000);
+      const vsfPath = `${d.projectDir}/state.vsf`;
+      await c.call("vsf/save", { session_id: sid, output_path: vsfPath });
+      let driveLen = -1;
+      if (existsSync(vsfPath)) {
+        try { driveLen = vsfModuleDataLen(readFileSync(vsfPath), "DRIVECPU"); } catch { driveLen = -1; }
+      }
+      return {
+        // The behavioural signal: the saved VSF's DRIVECPU module carries the drive
+        // blob (non-empty), not an empty stub.
+        driveModuleNonEmpty: driveLen > 0,
+      };
+    },
+  },
+
+  // ── P1: formats-state-2 — .c64re dump captures the cartridge flash + .crt bytes ──
+  // (Audit theme T6.) TS's checkpoint capture threads the attached cartridge's original
+  // .crt bytes (cartBytes = cartMedia.bytes) + its mutable flash image (cartFlash =
+  // getWritableImage()) into the RuntimeCheckpoint (headless-machine-kernel.ts:988-989).
+  // A writable EasyFlash's getWritableImage() returns the flash array even when clean
+  // (cartridge.ts:913), so a dump of an attached EasyFlash carries BOTH non-null.
+  // TRX64's capture_runtime_checkpoint hardcoded cartBytes/cartFlash = null
+  // (c64re_snapshot.rs:901-902) — the cartridge flash was lost across dump/undump. Fix:
+  // capture the cart bytes + writable image into the .c64re checkpoint. Signal: mount a
+  // writable EasyFlash, snapshot/dump to an abs .c64re path, read the file (magic +
+  // gzip(JSON)) and report whether checkpoint.cartBytes/cartFlash are non-null. TS:
+  // {cartBytesCaptured:true, cartFlashCaptured:true}; TRX64 (before fix): {false,false}.
+  {
+    id: "formats-state-2",
+    severity: "P1",
+    title: ".c64re dump captures the cartridge flash + .crt bytes (not null)",
+    spawn: { seedFiles: [{ rel: "fixture.crt", bytes: EASYFLASH_CRT }] },
+    async signal(c, d) {
+      const { gunzipSync } = await import("node:zlib");
+      const sid = await liveSession(c);
+      const crtPath = `${d.projectDir}/fixture.crt`;
+      await c.call("media/mount", { session_id: sid, path: crtPath, slot: 0 });
+      const snapPath = `${d.projectDir}/cart.c64re`;
+      await c.call("snapshot/dump", { session_id: sid, path: snapPath });
+      let cartBytesCaptured = false;
+      let cartFlashCaptured = false;
+      if (existsSync(snapPath)) {
+        try {
+          const raw = readFileSync(snapPath);
+          // .c64re container = magic(8) + version(1) + sha256(32) + gzip(JSON.stringify(doc)).
+          const doc = JSON.parse(gunzipSync(raw.subarray(41)).toString("utf8")) as any;
+          const cp = doc?.checkpoint ?? {};
+          cartBytesCaptured = cp.cartBytes != null;
+          cartFlashCaptured = cp.cartFlash != null;
+        } catch { /* parse error → stays false */ }
+      }
+      return {
+        // The behavioural signal: the dump carries the cart's original .crt bytes…
+        cartBytesCaptured,
+        // …and its writable flash image (so undump restores the flash).
+        cartFlashCaptured,
+      };
+    },
+  },
+
+  // ── P1: ws-trace-monitor-misc-23 — trace/run/stop returns the real run descriptor ──
+  // (Audit theme T6.) TS's traceRun.stop() returns the real RuntimeTraceRun: the run's
+  // definitionId (= def.id), cycleStart/cycleEnd, overheadMs, and marks[] (trace-run.ts
+  // stop()). TRX64's finalize_trace hardcoded definitionId="live-capture" and dropped
+  // cycle window / overhead / marks / media (main.rs:2280-2285). Fix: finalize_trace
+  // returns the real definition id + cycleStart/cycleEnd + overheadMs + marks[] + media.
+  // Signal: register a NAMED definition, start a trace with it, add a mark, run a known
+  // cycle window, stop, and read the stop descriptor's {definitionId, hasCycleWindow,
+  // markCount}. TS: {<the named id>, true, 1}; TRX64 (before fix): {"live-capture",
+  // false, 0}.
+  {
+    id: "ws-trace-monitor-misc-23",
+    severity: "P1",
+    title: "trace/run/stop returns the real definitionId + cycle window + marks",
+    async signal(c, d) {
+      const sid = await liveSession(c);
+      // Register a NAMED trace definition (a captureAll-shaped cpu trace). The id is
+      // explicit so we can assert the stop descriptor echoes it (not "live-capture").
+      const defId = "misc23-named-trace";
+      const definition = {
+        id: defId,
+        version: 1,
+        name: "misc23 named trace",
+        domains: ["c64-cpu"],
+        triggers: [{ kind: "pc-range", domain: "c64-cpu", from: 0, to: 0xffff }],
+        captures: [{ kind: "cpu-row", domain: "c64-cpu" }],
+        retention: "evidence",
+        checkpointPolicy: "none",
+      };
+      const put = (await c.call("trace/definition/put", { session_id: sid, definition })) as any;
+      const realId = put?.id ?? defId;
+      const out = `${d.projectDir}/misc23.duckdb`;
+      await c.call("trace/run/start", { session_id: sid, definition_id: realId, output: out });
+      // Stamp one mark, then advance a known cycle window so cycleStart != cycleEnd.
+      await c.call("trace/run/mark", { session_id: sid, label: "m0" });
+      await c.call("session/run", { session_id: sid, cycles: 200_000 });
+      const stop = (await c.call("trace/run/stop", { session_id: sid, wait_index: false })) as any;
+      const run = stop?.run ?? {};
+      const hasCycleWindow =
+        typeof run.cycleStart === "number" &&
+        typeof run.cycleEnd === "number" &&
+        run.cycleEnd >= run.cycleStart;
+      return {
+        // The stop descriptor must echo the real definition id, not "live-capture".
+        reportedDefId: run.definitionId ?? null,
+        // …carry a populated cycle window…
+        hasCycleWindow,
+        // …and the mark we stamped (marks[] length).
+        markCount: Array.isArray(run.marks) ? run.marks.length : 0,
       };
     },
   },

@@ -216,9 +216,16 @@ fn ser_sid(machine: &Machine) -> Vec<u8> {
     machine.sid_regs[0..32].to_vec()
 }
 
-/// DRIVECPU module (0 bytes — stub).
-fn ser_drivecpu() -> Vec<u8> {
-    Vec::new()
+/// DRIVECPU module — the full 1541 drive CORE snapshot blob.
+///
+/// 1:1 with c64re session-vsf.ts:116-118, which embeds `drive1541.snapshot()` (the
+/// drive-core blob: DRIVE8 + DRIVECPU0 + 1541VIA1D0 + VIA2D0, save_disks=0). We reuse
+/// the exact byte-compatible serializer the `.c64re` checkpoint ring already uses
+/// (`drive_snapshot::capture_drive1541`), so the VSF DRIVECPU module carries the live
+/// drive state instead of an empty stub. The mutable disk image (GCRIMAGE) is NOT
+/// embedded in VSF — c64re keeps the VSF DRIVECPU module to the drive CORE only.
+fn ser_drivecpu(machine: &mut Machine) -> Vec<u8> {
+    crate::drive_snapshot::capture_drive1541(&mut machine.drive8)
 }
 
 /// IECBUS module (6 bytes).
@@ -292,7 +299,12 @@ fn ser_keyboard(machine: &Machine) -> Vec<u8> {
 // ── Public save function ──────────────────────────────────────────────────────
 
 /// Serialize machine state to VSF bytes.
-pub fn save_vsf(machine: &Machine) -> Vec<u8> {
+///
+/// `&mut Machine` because the DRIVECPU module embeds the live 1541 drive snapshot
+/// (`drive_snapshot::capture_drive1541`, which advances the drive's snapshot-sync
+/// bookkeeping — a `&mut Drive1541`), exactly as c64re's saveSessionVsf embeds
+/// `drive1541.snapshot()`.
+pub fn save_vsf(machine: &mut Machine) -> Vec<u8> {
     let mut buf = Vec::with_capacity(70_000);
 
     // VSF file header.
@@ -300,6 +312,10 @@ pub fn save_vsf(machine: &Machine) -> Vec<u8> {
     buf.push(VSF_MAJOR);
     buf.push(VSF_MINOR);
     buf.extend_from_slice(VSF_MACHINE);
+
+    // Capture the drive-core blob up front (needs the mutable borrow) so the rest of
+    // the modules can use the shared immutable serializers.
+    let drivecpu = ser_drivecpu(machine);
 
     // Module order MUST match TS: MAINCPU, C64MEM, CIA1, CIA2, SID, DRIVECPU,
     // IECBUS, VIC-II, KEYBOARD.
@@ -311,7 +327,7 @@ pub fn save_vsf(machine: &Machine) -> Vec<u8> {
     write_module(&mut buf, b"CIA2", &ser_cia(&machine.cia2, clk));
 
     write_module(&mut buf, b"SID", &ser_sid(machine));
-    write_module(&mut buf, b"DRIVECPU", &ser_drivecpu());
+    write_module(&mut buf, b"DRIVECPU", &drivecpu);
     write_module(&mut buf, b"IECBUS", &ser_iecbus(machine));
     write_module(&mut buf, b"VIC-II", &ser_vicii(machine));
     write_module(&mut buf, b"KEYBOARD", &ser_keyboard(machine));
@@ -464,6 +480,17 @@ fn load_sid(machine: &mut Machine, data: &[u8]) -> Result<(), String> {
     // so the SID re-initializes from the restored register file on the next writes.
     machine.sid.reset();
     Ok(())
+}
+
+/// DRIVECPU module — restore the 1541 drive CORE from the embedded blob (= c64re
+/// session-vsf.ts:217 `drive1541.restore(mod.data)`). An EMPTY module (a legacy save
+/// or a save with no live drive) is a clean no-op; otherwise it routes to the same
+/// byte-compatible deserializer the `.c64re` checkpoint ring uses.
+fn load_drivecpu(machine: &mut Machine, data: &[u8]) -> Result<(), String> {
+    if data.is_empty() {
+        return Ok(()); // empty stub (legacy/no-drive) — keep the live drive as-is.
+    }
+    crate::drive_snapshot::restore_drive1541(&mut machine.drive8, data)
 }
 
 fn load_iecbus(machine: &mut Machine, data: &[u8]) -> Result<(), String> {
@@ -848,7 +875,9 @@ pub fn load_vsf(machine: &mut Machine, data: &[u8]) -> Result<VsfLoadResult, Str
             "CIA1" => load_cia(&mut machine.cia1, mod_data, "CIA1"),
             "CIA2" => load_cia(&mut machine.cia2, mod_data, "CIA2"),
             "SID" => load_sid(machine, mod_data),
-            "DRIVECPU" => Ok(()), // empty stub
+            // DRIVECPU now carries the drive-core blob (= c64re drive1541.restore()).
+            // An empty module (a legacy save / no live drive) is a no-op restore.
+            "DRIVECPU" => load_drivecpu(machine, mod_data),
             "IECBUS" => load_iecbus(machine, mod_data),
             "VIC-II" => load_vicii(machine, mod_data),
             "KEYBOARD" => load_keyboard(machine, mod_data),
@@ -893,7 +922,7 @@ mod tests {
         m.cpu6510.clk = 50000;
         m.clk = 50000;
 
-        let bytes = save_vsf(&m);
+        let bytes = save_vsf(&mut m);
         let mut m2 = Machine::new();
         let result = load_vsf(&mut m2, &bytes).expect("load failed");
         assert!(result.errors.is_empty(), "load errors: {:?}", result.errors);
@@ -913,7 +942,7 @@ mod tests {
         m.port_dir = 0x2F;
         m.port_data = 0x37;
 
-        let bytes = save_vsf(&m);
+        let bytes = save_vsf(&mut m);
         let mut m2 = Machine::new();
         let result = load_vsf(&mut m2, &bytes).expect("load failed");
         assert!(result.errors.is_empty());
@@ -989,12 +1018,15 @@ mod tests {
 
     #[test]
     fn module_byte_counts() {
-        let m = Machine::new();
+        let mut m = Machine::new();
         assert_eq!(ser_maincpu(&m).len(), 11, "MAINCPU");
         assert_eq!(ser_c64mem(&m).len(), 65550, "C64MEM");
         assert_eq!(ser_cia(&m.cia1, 0).len(), 48, "CIA");
         assert_eq!(ser_sid(&m).len(), 32, "SID");
-        assert_eq!(ser_drivecpu().len(), 0, "DRIVECPU");
+        // Fork B (formats-state-1): DRIVECPU is no longer the empty stub — it embeds
+        // the full drive-core blob (DRIVE8 + DRIVECPU0 + 1541VIA1D0 + VIA2D0), matching
+        // c64re's saveSessionVsf which embeds drive1541.snapshot(). It must be NON-empty.
+        assert!(ser_drivecpu(&mut m).len() > 0, "DRIVECPU (drive-core blob)");
         assert_eq!(ser_iecbus(&m).len(), 6, "IECBUS");
         assert_eq!(ser_vicii(&m).len(), 108, "VIC-II");
         assert_eq!(ser_keyboard(&m).len(), 6, "KEYBOARD");

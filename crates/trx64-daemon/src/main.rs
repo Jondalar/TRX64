@@ -2251,6 +2251,13 @@ fn parse_hex(tok: &str) -> Option<u32> {
 /// T2.6 — also updates `state.last_trace_path` and `state.last_run_id` (= TS
 /// `TraceRunController.lastStorePath`/`lastRunId`, set in `stop()`).
 fn finalize_trace(st: &mut State) -> (Value, Value) {
+    // Capture cycleEnd from the LIVE machine before taking the trace (= TS run.cycleEnd
+    // = controller.session.c64Cpu.cycles at stop, trace-run.ts:453).
+    let cycle_end = st.session.machine.clk;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
     match st.session.trace.take() {
         None => (Value::Null, json!({ "active": false })),
         Some(t) => {
@@ -2276,15 +2283,30 @@ fn finalize_trace(st: &mut State) -> (Value, Value) {
             };
             st.last_trace_path = Some(duckdb_path);
             st.last_run_id = Some(t.run_id.clone());
-            (
-                json!({
-                    "runId": t.run_id,
-                    "definitionId": "live-capture",
-                    "eventCount": t.event_count,
-                    "bytesWritten": bytes_written,
-                }),
-                json!({ "active": false, "binary": true }),
-            )
+            // ws-trace-monitor-misc-23 — return the REAL RuntimeTraceRun descriptor
+            // (trace-run.ts stop()): the run's own definitionId (NOT a hardcoded
+            // "live-capture"), version, cycleStart/cycleEnd, overheadMs, marks[], media.
+            let overhead_ms = now_ms.saturating_sub(t.start_wall_ms) as u64;
+            let marks: Vec<Value> = t
+                .marks
+                .iter()
+                .map(|(cycle, label)| json!({ "cycle": cycle, "label": label }))
+                .collect();
+            let mut run = json!({
+                "runId": t.run_id,
+                "definitionId": t.definition_id,
+                "definitionVersion": t.definition_version,
+                "cycleStart": t.cycle_start,
+                "cycleEnd": cycle_end,
+                "overheadMs": overhead_ms,
+                "eventCount": t.event_count,
+                "bytesWritten": bytes_written,
+                "marks": marks,
+            });
+            if !t.media_sha.is_empty() {
+                run["media"] = json!({ "sha256": t.media_sha, "sourceName": t.media_name });
+            }
+            (run, json!({ "active": false, "binary": true }))
         }
     }
 }
@@ -2947,6 +2969,22 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                     "createdAt": "",
                 }))
                 .unwrap_or_default();
+                st.session.machine.drive8.flush_disk_writeback();
+                let (media_sha, media_name) = match st.session.machine.drive8.get_attached_disk() {
+                    Some(disk) => (
+                        sha256_hex(&disk.bytes),
+                        disk.backing_path
+                            .as_ref()
+                            .and_then(|p| p.rsplit('/').next())
+                            .map(String::from)
+                            .unwrap_or_default(),
+                    ),
+                    None => (String::new(), String::new()),
+                };
+                let start_wall_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
                 st.session.trace = Some(TraceState {
                     retrace_path: retrace,
                     meta_json,
@@ -2956,6 +2994,12 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                     event_count: 0,
                     domains: domains.clone(),
                     marks: Vec::new(),
+                    // captureAll session trace ⇒ definitionId "live-capture" (= TS).
+                    definition_id: "live-capture".to_string(),
+                    definition_version: 1,
+                    start_wall_ms,
+                    media_sha,
+                    media_name,
                 });
                 st.last_run_id = Some(run_id.clone());
                 // TS startSessionTrace returns { runId, outputPath, domains }.
@@ -5213,6 +5257,24 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 "createdAt": "",
             }))
             .unwrap_or_default();
+            // Flush any in-flight drive write so the captured media SHA reflects the
+            // current image bytes (VICE flushes before reading fsimage->fd).
+            st.session.machine.drive8.flush_disk_writeback();
+            let (media_sha, media_name) = match st.session.machine.drive8.get_attached_disk() {
+                Some(disk) => (
+                    sha256_hex(&disk.bytes),
+                    disk.backing_path
+                        .as_ref()
+                        .and_then(|p| p.rsplit('/').next())
+                        .map(String::from)
+                        .unwrap_or_default(),
+                ),
+                None => (String::new(), String::new()),
+            };
+            let start_wall_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
             st.session.trace = Some(TraceState {
                 retrace_path: retrace,
                 meta_json,
@@ -5222,6 +5284,12 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 event_count: 0,
                 domains: domains.clone(),
                 marks: Vec::new(),
+                // captureAll domains trace ⇒ definitionId "live-capture" (= TS).
+                definition_id: "live-capture".to_string(),
+                definition_version: 1,
+                start_wall_ms,
+                media_sha: media_sha.clone(),
+                media_name: media_name.clone(),
             });
             // T2.6 — mirror TS start(): lastRunId set on trace start, survives stop().
             st.last_run_id = Some(run_id.clone());
@@ -5236,12 +5304,8 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 "eventCount": 0,
                 "bytesWritten": 0
             });
-            // Flush any in-flight drive write so the echoed media SHA reflects
-            // the current image bytes (VICE flushes before reading fsimage->fd).
-            st.session.machine.drive8.flush_disk_writeback();
-            if let Some(disk) = st.session.machine.drive8.get_attached_disk() {
-                let sha = sha256_hex(&disk.bytes);
-                run["media"] = json!({ "sha256": sha });
+            if !media_sha.is_empty() {
+                run["media"] = json!({ "sha256": media_sha, "sourceName": media_name });
             }
             Response::ok(id, json!({
                 "run": run,
@@ -5348,6 +5412,25 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 "createdAt": "",
             }))
             .unwrap_or_default();
+            // Capture the mounted-media identity (= TS gatherMediaIdentity → run.media):
+            // sha256 + basename of the attached disk (empty when none). flush first so
+            // the captured SHA reflects any pending write-back.
+            st.session.machine.drive8.flush_disk_writeback();
+            let (media_sha, media_name) = match st.session.machine.drive8.get_attached_disk() {
+                Some(disk) => (
+                    sha256_hex(&disk.bytes),
+                    disk.backing_path
+                        .as_ref()
+                        .and_then(|p| p.rsplit('/').next())
+                        .map(String::from)
+                        .unwrap_or_default(),
+                ),
+                None => (String::new(), String::new()),
+            };
+            let start_wall_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
             st.session.trace = Some(TraceState {
                 retrace_path: retrace,
                 meta_json,
@@ -5357,11 +5440,17 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 event_count: 0,
                 domains: domains.clone(),
                 marks: Vec::new(),
+                // ws-trace-monitor-misc-23 — echo the REAL definition id/version + the
+                // start-wall baseline + media identity so finalize_trace returns the full
+                // RuntimeTraceRun descriptor (not a hardcoded "live-capture").
+                definition_id: definition_id.clone(),
+                definition_version: def_version,
+                start_wall_ms,
+                media_sha: media_sha.clone(),
+                media_name: media_name.clone(),
             });
             // T2.6 — mirror TS start(): lastRunId set on trace start, survives stop().
             st.last_run_id = Some(run_id.clone());
-            // Echo the mounted media SHA (same as trace/start_domains).
-            st.session.machine.drive8.flush_disk_writeback();
             let mut run = json!({
                 "runId": run_id,
                 "definitionId": definition_id,
@@ -5371,9 +5460,8 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 "eventCount": 0,
                 "bytesWritten": 0
             });
-            if let Some(disk) = st.session.machine.drive8.get_attached_disk() {
-                let sha = sha256_hex(&disk.bytes);
-                run["media"] = json!({ "sha256": sha });
+            if !media_sha.is_empty() {
+                run["media"] = json!({ "sha256": media_sha, "sourceName": media_name });
             }
             Response::ok(id, json!({ "run": run }))
         }
@@ -6253,6 +6341,9 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 trx64_core::drive_snapshot::capture_drive1541(&mut st.session.machine.drive8);
             let drive_disk_blob =
                 trx64_core::drive_snapshot::capture_drive_disk_image(&st.session.machine.drive8);
+            // formats-state-2 — capture the cartridge bytes + writable flash (needs the
+            // &mut for the flash erase-alarm catch-up) BEFORE the immutable-borrow call.
+            let (cart_bytes, cart_flash) = capture_cart_blobs(&mut st.session.machine);
             let m = &st.session.machine;
             let checkpoint = trx64_core::c64re_snapshot::capture_runtime_checkpoint(
                 m,
@@ -6260,6 +6351,8 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 &disk_format,
                 Some(&drive1541_blob),
                 drive_disk_blob.as_deref(),
+                cart_bytes.as_deref(),
+                cart_flash.as_deref(),
             );
             let cycle = m.c64_core.clk as i64;
             let pc = m.c64_core.reg_pc as i64;
@@ -6377,8 +6470,8 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 .and_then(|v| v.as_str())
                 .unwrap_or("/tmp/trx64.vsf")
                 .to_string();
-            let st = state.lock().unwrap();
-            let bytes = trx64_core::vsf::save_vsf(&st.session.machine);
+            let mut st = state.lock().unwrap();
+            let bytes = trx64_core::vsf::save_vsf(&mut st.session.machine);
             let bytes_written = bytes.len();
             drop(st);
             // Response shape MATCHES the TS daemon (ws-server.ts vsf/save handler):
@@ -6684,6 +6777,22 @@ fn gather_native_media_inputs(
         });
     }
     out
+}
+
+/// formats-state-2 — capture the attached cartridge's `(cartBytes, cartFlash)` for the
+/// `.c64re` checkpoint, mirroring c64re's captureCartBytes()/captureCartFlash()
+/// (headless-machine-kernel.ts:1109-1118). `cartBytes` = the original `.crt` bytes
+/// (non-null whenever a cartridge is attached); `cartFlash` = the live writable image
+/// (flash low+high), None for a read-only mapper. `&mut` because `writable_image`
+/// catches the flash erase alarm up before serializing. Both None when no cartridge.
+fn capture_cart_blobs(machine: &mut trx64_core::Machine) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    if machine.cartridge.is_none() {
+        return (None, None);
+    }
+    let clk = machine.c64_core.clk;
+    let cart_bytes = machine.cartridge_image.as_ref().map(|img| img.raw_bytes.clone());
+    let cart_flash = machine.cartridge.as_mut().and_then(|c| c.writable_image(clk));
+    (cart_bytes, cart_flash)
 }
 
 /// Spec 766.5 — capture one recorder anchor from the live machine: build the
@@ -7791,12 +7900,17 @@ fn capture_live_checkpoint(session: &mut Session) -> Value {
         trx64_core::drive_snapshot::capture_drive1541(&mut session.machine.drive8);
     let drive_disk_blob =
         trx64_core::drive_snapshot::capture_drive_disk_image(&session.machine.drive8);
+    // formats-state-2 — full ring anchor carries the cart bytes + writable flash too
+    // (c64re's non-omitMedia checkpoint, headless-machine-kernel.ts:988-989).
+    let (cart_bytes, cart_flash) = capture_cart_blobs(&mut session.machine);
     let mut cp = trx64_core::c64re_snapshot::capture_runtime_checkpoint(
         &session.machine,
         &disk_path,
         &disk_format,
         Some(&drive1541_blob),
         drive_disk_blob.as_deref(),
+        cart_bytes.as_deref(),
+        cart_flash.as_deref(),
     );
     // Embed the clean disk bytes as `driveDiskImage` so the ring's content-addressed
     // pool dedups them and a restore re-attaches the disk before restoring the drive
@@ -7875,12 +7989,15 @@ fn capture_recorder_anchor_payload(session: &mut Session) -> Value {
         ),
         None => (String::new(), String::new()),
     };
-    // Pass no drive blobs → the checkpoint tree omits the big GCR/disk overlay; the
-    // disk image rides the recorder's medium stream instead (gen-gated).
+    // Pass no drive blobs / cart blobs → the checkpoint tree omits the big GCR/disk
+    // overlay + the cart bytes/flash (the omitMedia anchor); the disk image + cart
+    // bytes ride the recorder's medium stream instead (gen-gated).
     let mut cp = trx64_core::c64re_snapshot::capture_runtime_checkpoint(
         &session.machine,
         &disk_path,
         &disk_format,
+        None,
+        None,
         None,
         None,
     );

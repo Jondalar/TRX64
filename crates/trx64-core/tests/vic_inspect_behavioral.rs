@@ -36,7 +36,7 @@ fn inject_keys(m: &mut Machine, s: &[u8]) {
 /// Capture the live machine as a RuntimeCheckpoint Value (the same tree the ring
 /// stores and the inspect engine reads).
 fn capture(m: &Machine) -> serde_json::Value {
-    trx64_core::c64re_snapshot::capture_runtime_checkpoint(m, "", "", None, None)
+    trx64_core::c64re_snapshot::capture_runtime_checkpoint(m, "", "", None, None, None, None)
 }
 
 #[test]
