@@ -53,3 +53,16 @@ ignored pacing_mode); wired warp → 8x cycles/frame (~5x live). Eject→BASIC v
 (vic.mode 0) — earlier black was a transient mid-boot grab, not a bug. Joystick model
 wired (CIA1, core 216/216) — not deep-tested with a live joystick game. MON popout opens
 a separate window (verbs verified headless: d/m/r/bk/bank/help).
+
+## 2026-06-25 — KNOWN BUG: scrub-restore wedges daemon (drive VIA alarm spin)
+User: pause → scrub (click filmstrip) → run → "VM tot". Diagnosed via `sample` of the
+wedged trx64-daemon: trx64-av-stream thread stuck in stream_loop → run_for_full →
+Drive1541::run_cycles → viacore::run_pending_alarms INFINITE loop (alarm_set/set_int
+spinning). No panic — a true hang. run_pending_alarms is `while clk > next_pending_alarm_clk
+{ dispatch }`; after a checkpoint/restore the drive clock (core.clk) and the VIA
+alarm_context (next_pending_alarm_clk) are NOT restored on the same time-base, so clk >>
+next deadline → dispatches forever → holds the state Mutex → every WS handler blocks →
+daemon-wide wedge (new connections can't even handshake). FIX (next focused session):
+make restore_live_checkpoint restore the drive clock + via1/via2 alarm_context consistently
+(same CLK_BASE), and/or bound run_pending_alarms catch-up. Repro: boot, run a few s (ring
+auto-captures), pause, restore an earlier checkpoint, run.
