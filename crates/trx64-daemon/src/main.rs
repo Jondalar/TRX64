@@ -818,7 +818,7 @@ fn drain_and_broadcast_observer_log(st: &mut State) {
 /// SEGMENT-RUN the machine until one trips (or the budget exhausts) and return the
 /// real stop info. When none are armed, preserve the historical immediate
 /// `running` return (no advance) so the zero-cost / no-debug contract is unchanged.
-fn run_debug_control(id: Value, st: &mut State, frame: u64, is_continue: bool) -> Response {
+fn run_debug_control(id: Value, st: &mut State, frame: u64, _is_continue: bool) -> Response {
     {
         let State { breakpoints, observers: reg, .. } = &mut *st;
         sync_observers(breakpoints, reg);
@@ -843,10 +843,17 @@ fn run_debug_control(id: Value, st: &mut State, frame: u64, is_continue: bool) -
         }));
     }
 
-    // Continuing FROM a breakpoint: advance one instruction past the current PC
-    // first, so the boundary check doesn't immediately re-trip the same bp.
-    if is_continue {
-        step_one_instruction(&mut st.session);
+    // runtime-controller.ts:277 stepPastCurrentBreakpoint — if the PC currently sits ON
+    // an enabled exec breakpoint, advance one instruction first so a run/continue does
+    // not immediately re-trip the same address. TS calls this on BOTH run() and
+    // continue() (run() unconditionally) — so it is PC-based, not continue-only.
+    // (Without this, `bk <pc>` at the current PC made every debug/run halt instantly =
+    // a perma-pause from the user's perspective.)
+    {
+        let pc = st.session.machine.c64_core.reg_pc;
+        if st.breakpoints.entries.iter().any(|e| e.enabled && e.pc == pc) {
+            step_one_instruction(&mut st.session);
+        }
     }
 
     // Split the borrow of `st` so the registry can be passed as the core observer
