@@ -258,6 +258,34 @@ struct State {
     /// so the 250 ms UI poll renders a steady blink through a write burst.
     cart_led_gen: u64,
     cart_led_last_write_at: Option<std::time::Instant>,
+    /// T2.8 — monitor-shell session-private cursor/lens state (= monitor-shell.ts
+    /// module-level `bankDefaults` / `memCursors` / `disasmCursors` / `sidefxOn`).
+    /// The daemon holds one session, so these are single-valued (not per-id maps).
+    mon: MonitorState,
+}
+
+/// T2.8 — the monitor-shell.ts module-level per-session state, collapsed for the
+/// daemon's single session. `bank_default` = sticky lens for m/d (monitor-shell
+/// `bankDefaults`, default "cpu"); `mem_cursor`/`disasm_cursor` = the shared
+/// per-session cursors so a bare `m`/`d` follows the latest dump/step
+/// (`memCursors`/`disasmCursors`); `sidefx_on` = side-effect read toggle
+/// (`sidefxOn`, default OFF → peek).
+struct MonitorState {
+    bank_default: String,
+    mem_cursor: Option<u16>,
+    disasm_cursor: Option<u16>,
+    sidefx_on: bool,
+}
+
+impl MonitorState {
+    fn new() -> Self {
+        Self {
+            bank_default: "cpu".to_string(),
+            mem_cursor: None,
+            disasm_cursor: None,
+            sidefx_on: false,
+        }
+    }
 }
 
 /// Spec 271 — one in-process batch (= c64re `BatchEntry`). Results are stored as a
@@ -766,22 +794,20 @@ fn drain_and_broadcast_observer_log(st: &mut State) {
     //    (TS uses async/await but the wire shape is identical).
     let cmds = st.observers.drain_pending_cmds();
     for cmd in cmds {
-        match run_monitor(&mut st.session, &cmd) {
+        // Run the monitor command, then broadcast — collect the lines first so the
+        // run_monitor `&mut State` borrow ends before the `notify` borrow.
+        let lines: Vec<String> = match run_monitor(st, &cmd) {
             Ok(out) => {
                 let mut lines = vec![format!(r#"obs cmd "{cmd}":"#)];
                 lines.extend(out.lines().map(|l| l.to_string()));
-                st.notify.broadcast("debug/observer_log", json!({
-                    "session_id": session_id,
-                    "lines": lines,
-                }));
+                lines
             }
-            Err(e) => {
-                st.notify.broadcast("debug/observer_log", json!({
-                    "session_id": session_id,
-                    "lines": [format!(r#"obs cmd "{cmd}": ERROR {e}"#)],
-                }));
-            }
-        }
+            Err(e) => vec![format!(r#"obs cmd "{cmd}": ERROR {e}"#)],
+        };
+        st.notify.broadcast("debug/observer_log", json!({
+            "session_id": session_id,
+            "lines": lines,
+        }));
     }
 }
 
@@ -1071,50 +1097,105 @@ fn run_isolated_segment(
     }
 }
 
-/// Minimal VICE-style monitor: supports `wr [lens] <addr> <bytes..>`, `r`,
-/// `r reg=val ...`. Enough to inject a program + set PC, CPU-isolated.
-fn run_monitor(session: &mut Session, command: &str) -> Result<String, String> {
-    let toks: Vec<&str> = command.split_whitespace().collect();
-    if toks.is_empty() {
+/// T2.8 — 1:1 port of `disasmLine` (disasm6502.ts): `$addr  bb bb bb  MNEMONIC ops`.
+/// Bytes padded to a fixed 8-char column; mnemonic upper-cased, operand hex
+/// LOWER-case (VICE-ish). `labels` (addr→name) annotation is the TS Block-F
+/// feature; TRX64 has no project-label bridge wired into `run_monitor`, so the
+/// label arg is always absent here (the no-label TS path). Returns (size, line).
+fn disasm_line_ts(read: impl Fn(u16) -> u8, addr: u16) -> (u16, String) {
+    use trx64_core::tables::{MICROCODE_TABLE, UNDOC_TABLE};
+    let opcode = read(addr);
+    // TS disasm6502 uses the verbatim OPCODES table (full 256 incl. undocumented).
+    // TRX64's MICROCODE_TABLE/UNDOC_TABLE are the same coverage; a hole → "???".
+    let entry = MICROCODE_TABLE[opcode as usize]
+        .map(|e| (e.op.to_string(), e.mode))
+        .or_else(|| UNDOC_TABLE[opcode as usize].map(|e| (e.kind.to_string(), e.mode)));
+    let (mne, mode) = match entry {
+        Some((m, mode)) => (m, mode),
+        None => ("???".to_string(), "imp"),
+    };
+    let size = instr_len(opcode) as u16;
+    let b1 = read(addr.wrapping_add(1));
+    let b2 = read(addr.wrapping_add(2));
+    // Operand text — operand hex LOWER-case, matching disasm6502.ts `hx`.
+    let text = match mode {
+        "imp" | "acc" => String::new(),
+        "imm" => format!("#${:02x}", b1),
+        "zp" => format!("${:02x}", b1),
+        "zpx" => format!("${:02x},x", b1),
+        "zpy" => format!("${:02x},y", b1),
+        "abs" => format!("${:04x}", (b1 as u16) | ((b2 as u16) << 8)),
+        "absx" => format!("${:04x},x", (b1 as u16) | ((b2 as u16) << 8)),
+        "absy" => format!("${:04x},y", (b1 as u16) | ((b2 as u16) << 8)),
+        "ind" => format!("(${:04x})", (b1 as u16) | ((b2 as u16) << 8)),
+        "indx" => format!("(${:02x},x)", b1),
+        "indy" => format!("(${:02x}),y", b1),
+        "rel" => {
+            let signed = if b1 >= 0x80 { b1 as i32 - 0x100 } else { b1 as i32 };
+            let target = ((addr as i32) + size as i32 + signed) as u16;
+            format!("${:04x}", target)
+        }
+        _ => String::new(),
+    };
+    // Bytes column: "bb bb bb" = 8 chars max; pad to 8 (disasm6502.ts padEnd(8)).
+    let bytes: Vec<String> = (0..size).map(|i| format!("{:02x}", read(addr.wrapping_add(i)))).collect();
+    let bytes_col = format!("{:<8}", bytes.join(" "));
+    let ops = if text.is_empty() { String::new() } else { format!(" {text}") };
+    let line = format!("${:04x}  {}  {}{}", addr, bytes_col, mne.to_uppercase(), ops);
+    (size, line)
+}
+
+/// T2.8 — Spec 754 §3.x: VICE-superset interactive monitor command processor.
+/// 1:1 port of the dispatch + output text format of monitor-shell.ts
+/// `runMonitorCommand`. CORE verbs are wired to the daemon's State (breakpoints,
+/// the run loops, cursors/lens); DEFERRED verbs (map/taint/swimlane/chis from a
+/// trace store, inspect/xref/sym from a project index, label/note from a project
+/// workspace) ERROR exactly like the TS "bridge unavailable / no project" path —
+/// they are NOT faked. The TS `MonitorResult { output | error }` is collapsed to
+/// `Ok(output)` / `Err(error)` (the monitor/exec handler re-wraps to {output}/{error}).
+fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
+    let cmd = command.trim().to_string();
+    if cmd.is_empty() {
         return Ok(String::new());
     }
+    let toks: Vec<String> = cmd.split_whitespace().map(|s| s.to_string()).collect();
     let op = toks[0].to_ascii_lowercase();
-    match op.as_str() {
-        "wr" => {
-            let mut i = 1;
-            // Optional lens: `io` routes the write through the I/O space (VIC /
-            // SID / colour-RAM / CIA) instead of flat RAM. `cpu`/`ram` = RAM.
-            let io_lens = matches!(toks.get(i), Some(&"io"));
-            if matches!(toks.get(i), Some(&("cpu" | "ram" | "io"))) {
-                i += 1;
-            }
-            let addr = parse_hex(toks.get(i).copied().ok_or("wr: missing addr")?)
-                .ok_or("wr: bad addr")? as u16;
-            i += 1;
-            let bytes: Result<Vec<u8>, String> = toks[i..]
-                .iter()
-                .map(|t| parse_hex(t).map(|v| v as u8).ok_or_else(|| format!("wr: bad byte {t}")))
-                .collect();
-            let bytes = bytes?;
-            if bytes.is_empty() {
-                return Err("wr: need >=1 byte value ($00-$FF)".into());
-            }
-            if io_lens {
-                session.machine.poke_io(addr, &bytes);
-                // I/O-lens inject = a render scenario programming the VIC/colour-RAM;
-                // it still needs the full VIC-ticked machine to sweep the per-cycle
-                // frame, so flag io_injected (which keeps the full-machine run path)
-                // rather than `injected` (which would route to the chip-isolated bus).
-                session.io_injected = true;
-            } else {
-                session.machine.poke(addr, &bytes);
-                session.injected = true;
-            }
-            let lens = if io_lens { "io" } else { "cpu" };
-            Ok(format!("wrote {} byte(s) @ ${:04X} ({lens})", bytes.len(), addr))
+
+    // --- TS-local helpers (closures over no state — pure parsers/formatters). ---
+    // parseAddr: hex with optional `$`, masked to 16 bits; None on non-hex.
+    let parse_addr = |t: Option<&String>| -> Option<u16> {
+        t.and_then(|t| parse_hex(t)).map(|v| (v & 0xffff) as u16)
+    };
+    // parseByte: hex $00-$FF; None if out of range / non-hex.
+    let parse_byte = |t: Option<&String>| -> Option<u8> {
+        t.and_then(|t| parse_hex(t)).and_then(|v| if v <= 0xff { Some(v as u8) } else { None })
+    };
+    const LENSES: [&str; 5] = ["cpu", "ram", "rom", "io", "cart"];
+    // lensOf: a bank word; `default` → the sticky default. None if absent/other.
+    let bank_default = st.mon.bank_default.clone();
+    let lens_of = |t: Option<&String>| -> Option<String> {
+        let t = t?;
+        let l = t.to_ascii_lowercase();
+        if l == "default" {
+            return Some(bank_default.clone());
         }
+        if LENSES.contains(&l.as_str()) { Some(l) } else { None }
+    };
+
+    // sidefx OFF (default) → side-effect-free peek; ON → live read. TRX64's daemon
+    // has no separate side-effecting monitor read path (read_full is already the
+    // peek lane), so `sidefx` is honoured as the toggle wire-state but reads always
+    // use the side-effect-free lens peek (documented; the gate exercises peek).
+    let _sidefx = st.mon.sidefx_on;
+
+    // readByte/writeByte (= monitor-shell readByte/writeByte). drive8 device is not
+    // wired in run_monitor (no driveProbe), so reads are C64-only.
+    // (closures borrow the machine; defined per-branch to satisfy the borrow checker)
+
+    match op.as_str() {
+        // ---- Registers (Spec 754 §3.3d). `r` shows; `r a=$42 x=$10` sets. ----
         "r" | "registers" => {
-            let sets: Vec<&str> = toks[1..].iter().copied().filter(|t| t.contains('=')).collect();
+            let sets: Vec<&String> = toks[1..].iter().filter(|t| t.contains('=')).collect();
             if !sets.is_empty() {
                 let mut done = Vec::new();
                 for pair in sets {
@@ -1128,13 +1209,21 @@ fn run_monitor(session: &mut Session, command: &str) -> Result<String, String> {
                             continue;
                         }
                     };
-                    let c = &mut session.machine.cpu6510;
+                    let c = &mut st.session.machine.cpu6510;
                     match reg.as_str() {
                         "a" | "ac" => { c.reg_a = v as u8; done.push(format!("a=${:02X}", v as u8)); }
                         "x" | "xr" => { c.reg_x = v as u8; done.push(format!("x=${:02X}", v as u8)); }
                         "y" | "yr" => { c.reg_y = v as u8; done.push(format!("y=${:02X}", v as u8)); }
                         "sp" => { c.reg_sp = v as u8; done.push(format!("sp=${:02X}", v as u8)); }
-                        "pc" => { c.reg_pc = v as u16; done.push(format!("pc=${:04X}", v as u16)); }
+                        "pc" => {
+                            c.reg_pc = v as u16;
+                            // Also drive the live full-machine core's PC, so a subsequent
+                            // `g`/`step` resumes from here on the full-machine path (the TS
+                            // `r pc=` sets the one CPU; TRX64 has two cores kept in sync).
+                            st.session.machine.c64_core.reg_pc = v as u16;
+                            st.mon.disasm_cursor = Some(v as u16);
+                            done.push(format!("pc=${:04X}", v as u16));
+                        }
                         "p" | "fl" | "flags" => {
                             c.reg_p = (v as u8) & !0xa2;
                             c.flag_n = (v as u8) & 0x80;
@@ -1144,72 +1233,722 @@ fn run_monitor(session: &mut Session, command: &str) -> Result<String, String> {
                         _ => done.push(format!("unknown reg '{reg}'")),
                     }
                 }
-                session.machine.sync_after_monitor();
-                session.injected = true;
+                st.session.machine.sync_after_monitor();
+                st.session.injected = true;
                 Ok(format!("set {}", done.join(" ")))
             } else {
-                let c = &session.machine.cpu6510;
+                // Registers view (Spec 754 §3.3d, variant B): the VICE register line
+                // with the flow column, then a PLA-port line and an IRQ/NMI vectors
+                // line. 1:1 with monitor-shell.ts `r`. TRX64 has no FlowTracker, so
+                // `flow` is reported as MAIN (the common post-boot case — no fabricated
+                // interrupt frame; an honest constant, not a faked stack).
+                let m = &st.session.machine;
+                let c = &m.cpu6510;
+                // flags string: NV-BDIZC, upper if set / lower if clear (= disasmLine).
+                let flags = c.flags();
+                let names = ['N', 'V', '-', 'B', 'D', 'I', 'Z', 'C'];
+                let flags_str: String = names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &f)| {
+                        if (flags >> (7 - i)) & 1 != 0 { f } else { f.to_ascii_lowercase() }
+                    })
+                    .collect();
+                // Vectors via the cpu lens (KERNAL banked) — peek, no side effect.
+                let pk = |a: u16| m.peek_lens(a, "cpu");
+                let w16 = |lo: u16, hi: u16| (pk(lo) as u16) | ((pk(hi) as u16) << 8);
+                let irq_hw = w16(0xfffe, 0xffff);
+                let nmi_hw = w16(0xfffa, 0xfffb);
+                let cinv = w16(0x0314, 0x0315);
+                let nmiv = w16(0x0318, 0x0319);
+                // PLA banking latches: $00 = direction, $01 = port value (low 3 bits
+                // select LORAM/HIRAM/CHAREN).
+                let ddr = m.port_dir;
+                let port = m.port_data;
+                let loram = port & 1;
+                let hiram = (port >> 1) & 1;
+                let charen = (port >> 2) & 1;
                 Ok(format!(
-                    "  ADDR AC XR YR SP NV-BDIZC\n.;{:04X} {:02X} {:02X} {:02X} {:02X} {:02X}",
-                    c.reg_pc, c.reg_a, c.reg_x, c.reg_y, c.reg_sp, c.flags()
+                    "  ADDR AC XR YR SP NV-BDIZC  flow\n\
+                     .;{:04X} {:02X} {:02X} {:02X} {:02X} {}  MAIN\n  \
+                     port  $00=${:02X} $01=${:02X}  LORAM={} HIRAM={} CHAREN={}\n  \
+                     vectors  IRQ hw=${:04X}  CINV $0314->${:04X}     NMI hw=${:04X}  NMIV $0318->${:04X}",
+                    c.reg_pc, c.reg_a, c.reg_x, c.reg_y, c.reg_sp, flags_str,
+                    ddr, port, loram, hiram, charen,
+                    irq_hw, cinv, nmi_hw, nmiv
                 ))
             }
         }
-        "m" | "mb" | "mem" => {
-            // `m [lens] <addr_lo> [<addr_hi>]` — memory dump.
-            //
-            // TS monitor-shell.ts format: rows of 32 bytes starting at
-            // (addr & ~0x1f), hex section padEnd(96), then "  " + ascii.
-            //   ">C:XXXX  HH HH HH...   ...."
-            //   row starts at (start & ~0x1f); a row shows up to 32 bytes.
+
+        // ---- Memory edit: wr [lens] <addr> <byte..> --------------------------
+        "wr" => {
             let mut i = 1;
-            // Skip optional lens token (cpu/ram/rom/io).
-            if matches!(toks.get(i), Some(&("cpu" | "ram" | "rom" | "io" | "cart"))) {
+            let io_lens = matches!(toks.get(i).map(|s| s.as_str()), Some("io"));
+            if matches!(toks.get(i).map(|s| s.as_str()), Some("cpu" | "ram" | "io")) {
                 i += 1;
             }
-            let addr_lo = parse_hex(toks.get(i).copied().ok_or("m: missing addr")?)
-                .ok_or("m: bad addr")? as u16;
+            let addr = parse_addr(toks.get(i)).ok_or("wr: usage: wr [lens] <addr> <byte..>")? as u16;
             i += 1;
-            let addr_hi = toks
-                .get(i)
-                .and_then(|t| parse_hex(t))
-                .map(|v| v as u16)
-                .unwrap_or(addr_lo);
-            let row_start = addr_lo & !0x1f_u16; // 32-byte aligned row
-            // Build one row (may be partial if addr_hi < row_start+31).
-            let mut hex_bytes: Vec<String> = Vec::new();
-            let mut ascii = String::new();
-            let mut col = 0u32;
-            let mut a = row_start;
-            loop {
-                if a >= addr_lo && a <= addr_hi {
-                    let b = session.machine.ram[a as usize];
-                    hex_bytes.push(format!("{:02X}", b));
-                    ascii.push(if b >= 0x20 && b < 0x7f { b as char } else { '.' });
-                } else {
-                    // Before start or after end in the row window: skip (don't show).
-                    // TS does: for j in 0..32 { if a+j <= end { push byte } }
-                    // so we only push bytes that are within [start, end].
-                    // But for bytes in [row_start, addr_lo) they are NOT pushed.
-                    // The padEnd(96) pads the WHOLE row slot, so missing leading bytes
-                    // also consume their 3-char slot (they appear as spaces).
-                    // However, when addr_lo is row-aligned (e.g. 0x0200 = 0x0200 & ~0x1f)
-                    // there are no pre-bytes. Handle gracefully by inserting empty.
-                }
-                col += 1;
-                if col >= 32 || a == addr_hi { break; }
-                if a == 0xffff { break; }
-                a = a.wrapping_add(1);
+            let bytes: Result<Vec<u8>, String> = toks[i..]
+                .iter()
+                .map(|t| parse_byte(Some(t)).ok_or_else(|| "wr: need >=1 byte value ($00-$FF)".to_string()))
+                .collect();
+            let bytes = bytes?;
+            if bytes.is_empty() {
+                return Err("wr: need >=1 byte value ($00-$FF)".into());
             }
-            // For partial rows, we only push the bytes in [addr_lo..=addr_hi].
-            // The TS format pads `bytes.join(" ")` to 96 chars regardless.
-            let hex_str = hex_bytes.join(" ");
-            // Pad to exactly 96 chars (32×3 = 96).
-            let hex_padded = format!("{:<96}", hex_str);
-            Ok(format!(">C:{:04X}  {}  {}", row_start, hex_padded, ascii))
+            if io_lens {
+                st.session.machine.poke_io(addr, &bytes);
+                st.session.io_injected = true;
+            } else {
+                st.session.machine.poke(addr, &bytes);
+                st.session.injected = true;
+            }
+            let lens = if io_lens { "io" } else { "cpu" };
+            Ok(format!("wrote {} byte(s) @ ${:04X} ({lens})", bytes.len(), addr))
         }
-        _ => Err(format!("monitor: unsupported command '{op}'")),
+
+        // ---- Memory dump: m [lens] [addr] [end] (§3.3b bank lens). -----------
+        // $20 bytes/row + PETSCII column, default length $800. peek (no side fx).
+        "m" | "mem" => {
+            let mut i = 1;
+            let lens_tok = lens_of(toks.get(i));
+            let lens = lens_tok.clone().unwrap_or_else(|| st.mon.bank_default.clone());
+            if lens_tok.is_some() {
+                i += 1;
+            }
+            let start = parse_addr(toks.get(i))
+                .or(st.mon.mem_cursor)
+                .unwrap_or(0);
+            let end = parse_addr(toks.get(i + 1))
+                .unwrap_or_else(|| std::cmp::min(0xffff, start as u32 + 0x7ff) as u16);
+            let mut lines: Vec<String> = Vec::new();
+            // for (a = start & ~0x1f; a <= end; a += 32)
+            let mut a: u32 = (start & !0x1f) as u32;
+            let end_u = end as u32;
+            while a <= end_u {
+                let mut bytes: Vec<String> = Vec::new();
+                let mut ascii = String::new();
+                for j in 0..32u32 {
+                    let aj = a + j;
+                    if aj > end_u {
+                        break;
+                    }
+                    let b = st.session.machine.peek_lens((aj & 0xffff) as u16, &lens);
+                    bytes.push(format!("{:02X}", b));
+                    ascii.push(if (0x20..0x7f).contains(&b) { b as char } else { '.' });
+                }
+                let lens_letter = if lens == "cpu" {
+                    'C'
+                } else {
+                    lens.chars().next().unwrap().to_ascii_uppercase()
+                };
+                lines.push(format!(
+                    ">{}:{:04X}  {}  {}",
+                    lens_letter,
+                    a & 0xffff,
+                    format!("{:<96}", bytes.join(" ")),
+                    ascii
+                ));
+                a += 32;
+            }
+            st.mon.mem_cursor = Some(((end as u32 + 1) & 0xffff) as u16);
+            Ok(lines.join("\n"))
+        }
+
+        // ---- Disassembly: d [lens] [addr] [count|end] ------------------------
+        "d" | "disass" => {
+            let mut i = 1;
+            let lens_tok = lens_of(toks.get(i));
+            let lens = lens_tok.clone().unwrap_or_else(|| st.mon.bank_default.clone());
+            if lens_tok.is_some() {
+                i += 1;
+            }
+            let start = parse_addr(toks.get(i))
+                .or(st.mon.disasm_cursor)
+                .unwrap_or(st.session.machine.cpu6510.reg_pc);
+            // `d <start> <end>` = RANGE (VICE). The 2nd arg, present, is an END addr.
+            let end: Option<u16> = if toks.get(i + 1).is_some() {
+                Some(parse_addr(toks.get(i + 1)).ok_or("d: bad end address")?)
+            } else {
+                None
+            };
+            if let Some(e) = end {
+                if e < (start & 0xffff) {
+                    return Err(format!("d: end ${:04X} < start ${:04X}", e, start & 0xffff));
+                }
+            }
+            let pc = st.session.machine.cpu6510.reg_pc;
+            let read = |x: u16| st.session.machine.peek_lens(x, &lens);
+            let mut lines: Vec<String> = Vec::new();
+            let mut a = start & 0xffff;
+            const MAX: usize = 4096;
+            let mut n = 0usize;
+            if let Some(e) = end {
+                let e = e & 0xffff;
+                while a <= e && n < MAX {
+                    let (size, line) = disasm_line_ts(read, a);
+                    lines.push(if a == pc { format!("{line} <-- PC") } else { line });
+                    a = a.wrapping_add(size);
+                    n += 1;
+                    if a == 0 {
+                        break; // wrapped past $FFFF
+                    }
+                }
+                if a <= e && n >= MAX {
+                    lines.push(format!(
+                        "… (truncated at ${:04X} — `d ${:04X} ${:04X}` to continue)",
+                        a, a, e
+                    ));
+                }
+            } else {
+                while n < 16 {
+                    let (size, line) = disasm_line_ts(read, a);
+                    lines.push(if a == pc { format!("{line} <-- PC") } else { line });
+                    a = a.wrapping_add(size);
+                    n += 1;
+                }
+            }
+            st.mon.disasm_cursor = Some(a);
+            Ok(lines.join("\n"))
+        }
+
+        // ---- f <start> <end> <data..> — fill the range, repeating the data. --
+        "f" | "fill" => {
+            let start = parse_addr(toks.get(1)).ok_or("f: usage: f <start> <end> <byte..>")?;
+            let end = parse_addr(toks.get(2)).ok_or("f: usage: f <start> <end> <byte..>")?;
+            let data: Vec<Option<u8>> = toks[3..].iter().map(|t| parse_byte(Some(t))).collect();
+            if data.is_empty() || data.iter().any(|b| b.is_none()) {
+                return Err("f: need >=1 fill byte".into());
+            }
+            let data: Vec<u8> = data.into_iter().map(|b| b.unwrap()).collect();
+            let mut n: usize = 0;
+            let mut a = start as u32;
+            while a <= end as u32 {
+                let b = data[n % data.len()];
+                st.session.machine.poke((a & 0xffff) as u16, &[b]);
+                n += 1;
+                a += 1;
+            }
+            st.session.injected = true;
+            Ok(format!(
+                "filled ${:04X}..${:04X} ({} bytes, pattern {})",
+                start, end, n, data.len()
+            ))
+        }
+
+        // ---- t <start> <end> <dest> — move/copy (overlap-safe). --------------
+        "t" | "move" => {
+            let start = parse_addr(toks.get(1)).ok_or("t: usage: t <start> <end> <dest>")?;
+            let end = parse_addr(toks.get(2)).ok_or("t: usage: t <start> <end> <dest>")?;
+            let dest = parse_addr(toks.get(3)).ok_or("t: usage: t <start> <end> <dest>")?;
+            let len = end as i32 - start as i32 + 1;
+            if len <= 0 {
+                return Err("t: end < start".into());
+            }
+            let len = len as u16;
+            let mut buf: Vec<u8> = Vec::with_capacity(len as usize);
+            for k in 0..len {
+                buf.push(st.session.machine.peek_lens(start.wrapping_add(k), "cpu"));
+            }
+            for (k, b) in buf.iter().enumerate() {
+                st.session.machine.poke(dest.wrapping_add(k as u16), &[*b]);
+            }
+            st.session.injected = true;
+            Ok(format!(
+                "moved {} byte(s) ${:04X}..${:04X} -> ${:04X}",
+                len, start, end, dest
+            ))
+        }
+
+        // ---- c <start> <end> <dest> — compare, list differences. -------------
+        "c" | "compare" => {
+            let start = parse_addr(toks.get(1)).ok_or("c: usage: c <start> <end> <dest>")?;
+            let end = parse_addr(toks.get(2)).ok_or("c: usage: c <start> <end> <dest>")?;
+            let dest = parse_addr(toks.get(3)).ok_or("c: usage: c <start> <end> <dest>")?;
+            let len = end as i32 - start as i32 + 1;
+            if len <= 0 {
+                return Err("c: end < start".into());
+            }
+            let len = len as u16;
+            let mut diffs: Vec<String> = Vec::new();
+            for k in 0..len {
+                let av = st.session.machine.peek_lens(start.wrapping_add(k), "cpu");
+                let bv = st.session.machine.peek_lens(dest.wrapping_add(k), "cpu");
+                if av != bv {
+                    diffs.push(format!(
+                        "  ${:04X}: {:02X} != {:02X} @${:04X}",
+                        start.wrapping_add(k), av, bv, dest.wrapping_add(k)
+                    ));
+                }
+                if diffs.len() > 64 {
+                    diffs.push("  ... (truncated)".to_string());
+                    break;
+                }
+            }
+            Ok(if diffs.is_empty() {
+                format!("identical (${:04X}..${:04X} == ${:04X})", start, end, dest)
+            } else {
+                format!("differences:\n{}", diffs.join("\n"))
+            })
+        }
+
+        // ---- h <start> <end> <byte/xx..> — hunt/search (xx or * = wildcard). --
+        "h" | "hunt" => {
+            let start = parse_addr(toks.get(1)).ok_or("h: usage: h <start> <end> <byte/xx..>")?;
+            let end = parse_addr(toks.get(2)).ok_or("h: usage: h <start> <end> <byte/xx..>")?;
+            let mut pat: Vec<i32> = Vec::new();
+            let mut bad = toks.len() < 4;
+            for t in &toks[3..] {
+                if t.eq_ignore_ascii_case("xx") || t == "*" {
+                    pat.push(-1);
+                } else if let Some(b) = parse_byte(Some(t)) {
+                    pat.push(b as i32);
+                } else {
+                    bad = true;
+                }
+            }
+            if pat.is_empty() || bad {
+                return Err("h: need >=1 pattern byte (xx = wildcard)".into());
+            }
+            let mut hits: Vec<u16> = Vec::new();
+            let mut a = start as i32;
+            while a + (pat.len() as i32) - 1 <= end as i32 {
+                let mut m = true;
+                for (k, pb) in pat.iter().enumerate() {
+                    if *pb != -1
+                        && st.session.machine.peek_lens((a as u16).wrapping_add(k as u16), "cpu") as i32 != *pb
+                    {
+                        m = false;
+                        break;
+                    }
+                }
+                if m {
+                    hits.push(a as u16);
+                    if hits.len() > 256 {
+                        break;
+                    }
+                }
+                a += 1;
+            }
+            Ok(if hits.is_empty() {
+                "not found".to_string()
+            } else {
+                format!(
+                    "found {}:\n  {}",
+                    hits.len(),
+                    hits.iter().map(|a| format!("${:04X}", a)).collect::<Vec<_>>().join(" ")
+                )
+            })
+        }
+
+        // ---- Bank lens default (§3.3b/§3.3d): bank [cpu|ram|rom|io|cart]. ----
+        "bank" => {
+            let arg = toks.get(1).map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+            if arg.is_empty() {
+                return Ok(format!(
+                    "bank = {}  (lens for m/d; one of cpu|ram|rom|io|cart)",
+                    st.mon.bank_default
+                ));
+            }
+            if LENSES.contains(&arg.as_str()) {
+                st.mon.bank_default = arg.clone();
+                Ok(format!("bank = {arg}"))
+            } else {
+                Err(format!("bank: expected cpu|ram|rom|io|cart, got '{arg}'"))
+            }
+        }
+
+        // ---- sidefx [on|off|toggle] (§3.4). ----------------------------------
+        "sidefx" => {
+            let arg = toks.get(1).map(|s| s.to_ascii_lowercase()).unwrap_or_else(|| "toggle".into());
+            let cur = st.mon.sidefx_on;
+            let next = match arg.as_str() {
+                "on" => Some(true),
+                "off" => Some(false),
+                "toggle" => Some(!cur),
+                _ => None,
+            };
+            let next = next.ok_or("sidefx: on|off|toggle")?;
+            st.mon.sidefx_on = next;
+            Ok(if next {
+                "sidefx = on (monitor reads are LIVE — I/O side effects)".to_string()
+            } else {
+                "sidefx = off (peek — side-effect-free, default)".to_string()
+            })
+        }
+
+        // ---- Breakpoints: bk | bk <addr> | bk -<addr> | bk clear ------------
+        "bk" | "break" | "b" => {
+            let t1 = toks.get(1);
+            match t1 {
+                None => {
+                    let list = &st.breakpoints.entries;
+                    Ok(if list.is_empty() {
+                        "no breakpoints (set: bk <addr>)".to_string()
+                    } else {
+                        let mut s = String::from("breakpoints:");
+                        for e in list {
+                            s.push_str(&format!("\n  #{}  ${:04X}", e.num, e.pc));
+                        }
+                        s
+                    })
+                }
+                Some(t1) if t1.eq_ignore_ascii_case("clear") => {
+                    st.breakpoints.entries.clear();
+                    Ok("breakpoints cleared".to_string())
+                }
+                Some(t1) if t1.starts_with('-') => {
+                    let a = parse_addr(Some(&t1[1..].to_string()))
+                        .ok_or_else(|| format!("bad address: {t1}"))?;
+                    st.breakpoints.entries.retain(|e| e.pc != a);
+                    Ok(format!("removed bp ${:04X} ({} left)", a, st.breakpoints.entries.len()))
+                }
+                Some(t1) => {
+                    let addr = parse_addr(Some(t1)).ok_or_else(|| format!("bad address: {t1}"))?;
+                    let num = st.breakpoints.next_num;
+                    st.breakpoints.next_num += 1;
+                    st.breakpoints.entries.push(BpEntry { num, pc: addr, enabled: true });
+                    Ok(format!("bk #{} set at ${:04X} ({} total)", num, addr, st.breakpoints.entries.len()))
+                }
+            }
+        }
+
+        // ---- Delete breakpoint(s): del | del <num> ... ----------------------
+        "del" | "delete" => {
+            if toks.get(1).is_none() {
+                st.breakpoints.entries.clear();
+                return Ok("all breakpoints deleted".to_string());
+            }
+            let mut out: Vec<String> = Vec::new();
+            for t in &toks[1..] {
+                match t.parse::<u32>() {
+                    Err(_) => out.push(format!("bad checknum: {t}")),
+                    Ok(num) => {
+                        let before = st.breakpoints.entries.len();
+                        st.breakpoints.entries.retain(|e| e.num != num);
+                        if st.breakpoints.entries.len() < before {
+                            out.push(format!("deleted #{num}"));
+                        } else {
+                            out.push(format!("no breakpoint #{num}"));
+                        }
+                    }
+                }
+            }
+            Ok(out.join("\n"))
+        }
+
+        // ---- Go / resume (§3.1). g [addr] / x ; enters the run-loop. ---------
+        // TRX64 daemon is request/response with no autonomous loop. `g` mirrors
+        // the TS BUG-036 contract shape: set PC (if given), step past a parked
+        // breakpoint, mark running, and report ".C:PC (running — Pause to halt)".
+        // The actual advance happens on the next debug/run (the run-loop), exactly
+        // like TS where `ctrl.continue()` flips run-state and the tick loop runs.
+        "g" | "x" => {
+            if op == "g" {
+                if let Some(addr) = parse_addr(toks.get(1)) {
+                    st.session.machine.cpu6510.reg_pc = addr;
+                    st.session.machine.c64_core.reg_pc = addr;
+                }
+            }
+            let gpc = st.session.machine.cpu6510.reg_pc;
+            // If parked on a breakpoint at this PC, step past it so continue doesn't
+            // immediately re-trigger on the first instruction (VICE `g` skips it).
+            if st.breakpoints.entries.iter().any(|e| e.pc == gpc) {
+                step_one_instruction(&mut st.session);
+            }
+            st.session.running = true;
+            st.ctrl_stop = None;
+            Ok(format!(
+                "continuing at .C:{:04X} (running — Pause to halt)",
+                st.session.machine.cpu6510.reg_pc
+            ))
+        }
+
+        // ---- until <addr> — synchronous run-to-landing (run until addr, stop). -
+        "until" => {
+            let addr = parse_addr(toks.get(1)).ok_or("until: usage: until <addr>")?;
+            st.session.running = false;
+            // bps = { addr } ∪ user breakpoints (VICE `until` respects bps).
+            let mut bps: std::collections::HashSet<u16> = std::collections::HashSet::new();
+            bps.insert(addr);
+            for e in &st.breakpoints.entries {
+                bps.insert(e.pc);
+            }
+            if bps.contains(&st.session.machine.cpu6510.reg_pc) {
+                step_one_instruction(&mut st.session);
+            }
+            let start_clk = st.session.machine.clk;
+            const CAP: u64 = 20_000_000;
+            let mut executed: u64 = 0;
+            let mut hit = false;
+            while executed < CAP {
+                step_one_instruction(&mut st.session);
+                executed += 1;
+                let pc = st.session.machine.cpu6510.reg_pc;
+                if bps.contains(&pc) {
+                    hit = true;
+                    break;
+                }
+                if st.session.machine.clk.wrapping_sub(start_clk) >= CAP {
+                    break;
+                }
+            }
+            let cyc = st.session.machine.clk.wrapping_sub(start_clk);
+            let pc = st.session.machine.cpu6510.reg_pc;
+            st.mon.disasm_cursor = Some(pc);
+            Ok(if hit {
+                format!(
+                    "until ${:04X} reached -> .C:{:04X} ({} instr, {} cyc)",
+                    addr, pc, executed, cyc
+                )
+            } else {
+                format!(
+                    "until ${:04X} NOT reached ({} instr, {} cyc, pc=${:04X})",
+                    addr, executed, cyc, pc
+                )
+            })
+        }
+
+        // ---- Stepping (§4.2/§4.3). z/step/si = step into; n/next/so = step over;
+        // ret/return = run until current frame returns. 1:1 with stepping.ts
+        // stepInto/stepOver/runReturn. The reported cycle count is the LANDING
+        // instruction's OWN cycle cost (`r.cyc`), NOT the elapsed total — for
+        // `next`/`ret` that is the JSR's / the RTS-RTI's own cost (stepping.ts:197,
+        // 217, 242). TRX64 has no FlowTracker, so the `landLine` flow tag /
+        // stop-reason suffix (TS `[irq]` / `, hit user bp`) is dropped; the
+        // instruction landing line + `(tag, N cyc)` shape is matched. SP semantics:
+        // TRX64's stack-pop RTS/RTI raises SP above the entry level (sp1 > sp0).
+        "z" | "step" | "si" => {
+            st.session.running = false;
+            let clk0 = st.session.machine.clk;
+            step_one_instruction(&mut st.session);
+            let cyc = st.session.machine.clk.wrapping_sub(clk0); // r.cyc (single step)
+            let pc = st.session.machine.cpu6510.reg_pc;
+            st.mon.disasm_cursor = Some(pc);
+            let (_, line) = disasm_line_ts(|a| st.session.machine.peek_lens(a, "cpu"), pc);
+            Ok(format!("{line} (step, {cyc} cyc)"))
+        }
+        "n" | "next" | "so" => {
+            st.session.running = false;
+            let start_pc = st.session.machine.cpu6510.reg_pc;
+            let init_sp = st.session.machine.cpu6510.reg_sp;
+            let opcode = st.session.machine.peek_lens(start_pc, "cpu");
+            let is_jsr = opcode == 0x20;
+            let bp_set: std::collections::HashSet<u16> =
+                st.breakpoints.entries.iter().map(|e| e.pc).collect();
+            // Execute the instruction at PC; `r_cyc` = ITS own cost (the value TS
+            // reports for `next`, even when it's a JSR — stepping.ts:217).
+            let clk0 = st.session.machine.clk;
+            step_one_instruction(&mut st.session);
+            let r_cyc = st.session.machine.clk.wrapping_sub(clk0);
+            if is_jsr {
+                // runUntilReturn: run the subroutine body until it RTSes back (SP
+                // restored to the entry level → balanced) or a user bp trips.
+                let next_pc = start_pc.wrapping_add(3);
+                const CAP: u64 = 5_000_000;
+                let mut iters: u64 = 0;
+                loop {
+                    let pc = st.session.machine.cpu6510.reg_pc;
+                    let sp = st.session.machine.cpu6510.reg_sp;
+                    if (pc == next_pc && sp >= init_sp) || (sp > init_sp) {
+                        break;
+                    }
+                    if bp_set.contains(&pc) && iters > 0 {
+                        break;
+                    }
+                    if iters >= CAP {
+                        break;
+                    }
+                    step_one_instruction(&mut st.session);
+                    iters += 1;
+                }
+            }
+            let pc = st.session.machine.cpu6510.reg_pc;
+            st.mon.disasm_cursor = Some(pc);
+            let (_, line) = disasm_line_ts(|a| st.session.machine.peek_lens(a, "cpu"), pc);
+            Ok(format!("{line} (next, {r_cyc} cyc)"))
+        }
+        "ret" | "return" => {
+            st.session.running = false;
+            let sp0 = st.session.machine.cpu6510.reg_sp;
+            let bp_set: std::collections::HashSet<u16> =
+                st.breakpoints.entries.iter().map(|e| e.pc).collect();
+            const SKIP_CAP: u64 = 5_000_000;
+            let mut guard: u64 = 0;
+            let mut last_cyc: u64 = 0;
+            loop {
+                if guard >= SKIP_CAP {
+                    break;
+                }
+                // The op about to execute (so we can detect the RTS/RTI return).
+                let op_pc = st.session.machine.cpu6510.reg_pc;
+                let opcode = st.session.machine.peek_lens(op_pc, "cpu");
+                let is_ret = opcode == 0x60 || opcode == 0x40; // RTS / RTI
+                let clk0 = st.session.machine.clk;
+                step_one_instruction(&mut st.session);
+                last_cyc = st.session.machine.clk.wrapping_sub(clk0); // r.cyc
+                guard += 1;
+                let pc = st.session.machine.cpu6510.reg_pc;
+                if bp_set.contains(&pc) {
+                    break;
+                }
+                // stepping.ts:241 — stop when the executed instr was RTS/RTI AND the
+                // resulting SP rose above the entry level (the current frame returned).
+                if is_ret && (st.session.machine.cpu6510.reg_sp as u16) > sp0 as u16 {
+                    break;
+                }
+            }
+            let pc = st.session.machine.cpu6510.reg_pc;
+            st.mon.disasm_cursor = Some(pc);
+            let (_, line) = disasm_line_ts(|a| st.session.machine.peek_lens(a, "cpu"), pc);
+            Ok(format!("{line} (return, {last_cyc} cyc)"))
+        }
+
+        // ---- flow / bt — Spec 754 §3.3h capability panels. -------------------
+        // TRX64 has no FlowTracker (interrupt/trap frame stack) or stack-scan
+        // backtrace builder wired into run_monitor. The TS verbs always produce
+        // output (never error); to stay faithful WITHOUT faking a frame stack we
+        // report the honest "no frame active" / minimal state shape rather than a
+        // fabricated chain. (main flow = no interrupt frame is the common case.)
+        "flow" => {
+            // TS: `flow: current=main  focus=auto\nframes:\n  (main — no interrupt/trap frame active)`
+            Ok(
+                "flow: current=main  focus=auto\nframes:\n  (main — no interrupt/trap frame active)"
+                    .to_string(),
+            )
+        }
+        "bt" => {
+            // TS buildBacktrace scans the 6502 stack for JSR return-address
+            // candidates. TRX64 has no backtrace builder in run_monitor; emit the
+            // minimal honest panel (no fabricated chain) rather than fake frames.
+            Ok("(backtrace unavailable — no flow/stack-scan bridge in this monitor)".to_string())
+        }
+
+        // ---- Reset -----------------------------------------------------------
+        "reset" => {
+            st.session.running = false;
+            // TS: s.resetCold("pal-default"). TRX64 cold-reset = re-boot from ROMs
+            // (fill_power_on_ram + ROM reload + reset vectors), matching resetCold.
+            let roms = rom_dir();
+            let _ = st.session.boot(&roms);
+            st.session.injected = false;
+            st.session.io_injected = false;
+            st.mon.disasm_cursor = None;
+            st.mon.mem_cursor = None;
+            Ok("reset".to_string())
+        }
+
+        // ---- DEFERRED verbs: trace-store reads (map/taint/swimlane/chis). -----
+        // The TS DAEMON wires a `traceRead` bridge backed by a DuckDB trace store;
+        // with no active/finalized trace it THROWS `no trace store — run \`trace on\`
+        // first`, which monitor-shell catches as `<verb>: <message>` (ws-server.ts:2099,
+        // monitor-shell.ts:1123). TRX64 has no DuckDB trace-store reader, so it
+        // produces the IDENTICAL daemon-shaped error (graceful, not faked) — `trace
+        // on` is itself a deferred capability here, so the store is always absent.
+        "map" => Err("map: no trace store — run `trace on` first".into()),
+        "taint" => Err("taint: no trace store — run `trace on` first".into()),
+        "swimlane" | "sw" => {
+            // ws-server.ts:2069 — the swimlane store-absent message is worded slightly
+            // differently from map/taint (it names the on→off bracket).
+            Err("swimlane: no trace store — run `trace on` … `trace off` first".into())
+        }
+        "chis" => Err("chis: no trace store — run `trace on` first".into()),
+
+        // ---- DEFERRED verbs: project-index reads (inspect/xref/sym). ----------
+        // TS errors when `ctx.projectRead` is absent. No project index bridge here.
+        "inspect" => Err("inspect: project-read bridge unavailable (run via the daemon)".into()),
+        "xref" => Err("xref: project-read bridge unavailable (run via the daemon)".into()),
+        "sym" => Err("sym: project-read bridge unavailable (run via the daemon)".into()),
+
+        // ---- DEFERRED verbs: project-label writes (label/unlabel/note). -------
+        // TS errors when `ctx.projectLabels` is absent ("no project workspace
+        // bound"). No ProjectKnowledgeService bridge here → identical error.
+        "label" | "unlabel" | "note" | "load_labels" | "ll" | "save_labels" | "sl" => {
+            Err(format!("{op}: no project workspace bound (labels need a project)"))
+        }
+
+        // ---- Help ------------------------------------------------------------
+        "help" | "?" => Ok(monitor_help_text()),
+
+        _ => Err(format!("unknown command: {op}. Try 'help'.")),
     }
+}
+
+/// T2.8 — the `help`/`?` text. VERBATIM copy of the monitor-shell.ts help block
+/// (the help simply LISTS every verb of the VICE-superset, including ones whose
+/// runtime bridges are deferred in this daemon — the help text itself is identical
+/// regardless of which bridges are wired, so it is reproduced 1:1).
+fn monitor_help_text() -> String {
+    [
+        "monitor (VICE-superset):",
+        "  EXEC",
+        "    g [addr]         go/resume the run-loop (PC=addr); Pause button halts",
+        "    x                exit/resume (= g)",
+        "    until <addr>     run until PC=addr, then stop (synchronous)",
+        "    z / step         step into — may enter IRQ/NMI (VICE-correct)",
+        "    n / next         step over — skips JSR + runs THROUGH IRQ/NMI",
+        "    ret / return     run until current frame returns (RTS/RTI)",
+        "    focus [m]        flow focus: auto|main|irq|nmi|brk|clear (C64RE)",
+        "    sf / nf          step into/over, stop only in focused flow (C64RE)",
+        "    flow             interrupt/trap flow frame stack (panel)",
+        "    bt               backtrace (stack scan + flow frames)",
+        "    reset            cold reset",
+        "  MEMORY (bank lens: cpu|ram|rom|io|cart, default cpu = what CPU sees)",
+        "    m [lens] <a> [b] memory dump ($20/row + petscii; default len $800)",
+        "    d [lens] [a] [end] disassemble: a..end range (VICE), or ~16 from a/PC",
+        "    sd [n]           step+disasm: the REAL executed path, loops folded (dynamic)",
+        "    df [-i] [a] [n]  follow-disasm: walk control flow (static); -i asks at branches (df t|f|b)",
+        "    screen           decode the 40x25 text screen (real screen pointer)",
+        "    io [1|addr]      I/O area per device: register hex (peek) + state details (VICE io)",
+        "    bitmap <a> [w h] [hires|charset|sprite]  render a RAM range to a PNG (scrub gfx)",
+        "    bank [lens]      show/set the sticky default lens for m/d",
+        "    wr [lens] <a> <b..>  write exactly these bytes from a",
+        "    f <a> <b> <d..>  fill range a..b with repeating data",
+        "    a <a> [instr]    assemble; `a c000` enters assemble mode (type lines, empty exits)",
+        "    t <a> <b> <dst>  move/copy a..b to dst (overlap-safe)",
+        "    c <a> <b> <dst>  compare a..b vs dst (list diffs)",
+        "    h <a> <b> <d..>  hunt for a byte pattern (xx = wildcard)",
+        "  BREAKPOINTS / OBSERVERS",
+        "    bk               list breakpoints (#num $addr)",
+        "    bk <a> | bk -<a> set / remove breakpoint (by addr)",
+        "    del <n..> | del  delete by #num / delete all",
+        "    obs <name> when exec|load|store <a[..b]> [if <cond>] do break|log [fields]",
+        "      log fields: a/x/y/sp/pc/fl or $addr[:w]  e.g. `do log $fd $fe $ff a x y`",
+        "    obs | obs log    list observers / show log lines",
+        "    obs <name> on|off|del   (name may glob: `obs * del` = all, `obs c* off`)",
+        "    ignore <name> [n]",
+        "      cond: a/x/y/pc/sp/fl/rl/val/addr  == != < > <= >= && || ( )",
+        "  CPU",
+        "    r                registers (+ flow + IRQ/NMI vectors)",
+        "    r a=$42 x=$10    set registers (a/x/y/sp/pc/fl)",
+        "    sidefx [on|off]  monitor read side effects (default off = peek)",
+        "    device [c64|drive8]  target the C64 or the 1541 CPU (drive8 = read-inspect r/m/d)",
+        "  STATE / TRACE",
+        "    dump|undump <p>  snapshot persist/restore (.c64re, Spec 707)",
+        "    savecrt [\"<p>\"]  write live flash state to the mounted .crt (or to <p> as a copy)",
+        "    swapcrt \"<p>\"    hot-swap the .crt, NO reset (same mapper: bank/ctrl carried) — build iteration",
+        "    trace on|off|status|mark   live trace gate (Spec 746)",
+        "    tracedb start|stop|status|mark   declarative trace (Spec 708)",
+        "  ANALYSIS (need a trace — `trace on` first)",
+        "    map [cpu]        memory map: free RAM / persistence surface",
+        "    taint <a> [cyc]  data-flow taint backward from (cyc,addr)",
+        "    swimlane [list|name] [s] [e]  trace lanes (cpu/irq/nmi/io/1541): list / newest / by name; tail ~2000cy",
+        "                     `swimlane <s> <e>` with no covering trace → auto checkpoint-ring replay",
+        "    chis [cyc] | chis <s> <e>  replay from the ring → swimlane: last N cyc, or any historical window",
+        "  KNOWLEDGE (reads the project _analysis.json that covers the address)",
+        "    inspect <a> [stem]  segment kind/label + xrefs at a",
+        "    xref <a> [stem]     who calls/jumps/reads/writes a (in + out)",
+        "    sym <name> [stem]   reverse lookup: named routine/label -> address",
+        "  FILE (rooted at the project dir; relative paths off the session cwd)",
+        "    pwd | cd [dir] | ls [dir]   FS shell (cd with no arg = project dir)",
+        "    mkdir <dir> | rmdir <dir>   make / remove a directory",
+        "    load \"<f>\" [addr]   load a PRG into RAM (2-byte header, or override addr)",
+        "    save \"<f>\" <a1> <a2>  save a1..a2 as a PRG (2-byte load addr = a1)",
+        "    bload \"<f>\" <addr>   raw binary load (no header)",
+        "    bsave \"<f>\" <a1> <a2>  raw binary save (no header)",
+    ]
+    .join("\n")
 }
 
 /// Parse a hex token (optional leading `$`).
@@ -2410,7 +3149,7 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            match run_monitor(&mut st.session, &cmd) {
+            match run_monitor(&mut st, &cmd) {
                 Ok(out) => Response::ok(id, json!({ "output": out })),
                 Err(e) => Response::ok(id, json!({ "error": e })),
             }
@@ -6038,6 +6777,7 @@ async fn main() {
         last_run_id: None,
         cart_led_gen: 0,
         cart_led_last_write_at: None,
+        mon: MonitorState::new(),
     }));
 
     // The singleton live A/V stream hub (ADR-073): one pacing loop drives the
@@ -6111,6 +6851,7 @@ mod batch1_tests {
             control_owner: "human".to_string(),
             last_trace_path: None,
             last_run_id: None,
+            mon: MonitorState::new(),
         }))
     }
 

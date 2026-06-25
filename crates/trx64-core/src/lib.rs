@@ -932,6 +932,57 @@ impl Machine {
         }
     }
 
+    /// T2.8 — side-effect-free banked peek with an explicit bank lens (= the
+    /// monitor-shell `c64Bus.peek(addr, lens)` / memory-bus.ts `peek`). Mirrors the
+    /// TS lens routing 1:1:
+    ///   cpu  → the live PLA-banked side-effect-free read (= [`read_full`]).
+    ///   ram  → raw RAM regardless of banking.
+    ///   rom  → the underlying ROM byte for ROM windows (BASIC/CHARGEN/KERNAL),
+    ///          else raw RAM (memory-bus.ts `peekRom`).
+    ///   io   → side-effect-free I/O register peek for $D000-$DFFF, else raw RAM
+    ///          (memory-bus.ts `peekIo`).
+    ///   cart → cartridge ROM byte for the cart windows + cart IO ($DE00-$DFFF)
+    ///          via the mapper's side-effect-free peek, else open bus / RAM
+    ///          (memory-bus.ts `peekCart`). TRX64 cart mappers expose no
+    ///          side-effect-free peek yet, so this is best-effort: cart IO pages
+    ///          fall back to the I/O shadow and cart ROM windows to raw RAM
+    ///          (documented limit, same spirit as the TS fallback).
+    pub fn peek_lens(&self, addr: u16, lens: &str) -> u8 {
+        match lens {
+            "ram" => self.ram[addr as usize],
+            "rom" => match addr {
+                0xa000..=0xbfff => self.basic_rom[(addr as usize) - 0xa000],
+                0xd000..=0xdfff => self.char_rom[(addr as usize) - 0xd000],
+                0xe000..=0xffff => self.kernal_rom[(addr as usize) - 0xe000],
+                _ => self.ram[addr as usize],
+            },
+            "io" => {
+                if (0xd000..=0xdfff).contains(&addr) {
+                    match addr {
+                        0xd000..=0xd3ff => self.vic.read_reg(addr as u8),
+                        0xd400..=0xd7ff => self.sid_regs[(addr as usize - 0xd400) & 0x1f],
+                        0xd800..=0xdbff => (self.io_shadow[(addr as usize) - 0xd000] & 0x0f) | 0xf0,
+                        0xdc00..=0xdcff => self.cia1.peek(addr),
+                        0xdd00..=0xddff => self.cia2.peek(addr),
+                        _ => self.io_shadow[(addr as usize) - 0xd000],
+                    }
+                } else {
+                    self.ram[addr as usize]
+                }
+            }
+            // cart: best-effort fallback (no side-effect-free mapper peek yet).
+            "cart" => {
+                if (0xde00..=0xdfff).contains(&addr) {
+                    self.io_shadow[(addr as usize) - 0xd000]
+                } else {
+                    self.ram[addr as usize]
+                }
+            }
+            // cpu (and any unknown) → the live PLA-banked side-effect-free read.
+            _ => self.read_full(addr),
+        }
+    }
+
     /// Current VIC bank base from CIA2 port-A bits 0-1 (= computeVicBankBase):
     /// bank = 3 - (PA & DDRA & 3); base = bank * $4000. Input pins float high, so
     /// the effective output is (PRA | ~DDRA) — but for bank selection VICE uses
