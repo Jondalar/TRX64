@@ -301,6 +301,18 @@ struct State {
     /// filmstrip/scrub depends on a populated ring; without this loop it is sparse.
     /// Skipped while a mounted medium is dirty + non-persistable (Spec 709.13).
     autocapture_frames_since: u64,
+    /// Spec 769.5a — the SEPARATE per-checkpoint thumbnail store (= the c64re
+    /// `RuntimeController.checkpointThumbs` map, runtime-controller.ts:181). Keyed by
+    /// checkpoint id, capped at [`MAX_THUMBS`]. Decoupled from the ring's
+    /// framebuffer-OMITTED (BUG-049) auto-capture anchor: when the stream loop
+    /// auto-captures, it downscales the live frame it JUST rendered for the video
+    /// broadcast and stores it here under the SAME id the ring assigned. The scrub
+    /// filmstrip (`checkpoint/thumbnails`) then intersects `ring.list()` with this
+    /// store — so every auto-anchor gets a thumbnail (previously only the rare
+    /// framebuffer-present checkpoints did). `checkpoint_thumb_order` tracks
+    /// insertion order for oldest-first eviction (a HashMap has no order).
+    checkpoint_thumbs: std::collections::HashMap<String, CheckpointThumb>,
+    checkpoint_thumb_order: std::collections::VecDeque<String>,
     /// T2.8 — monitor-shell session-private cursor/lens state (= monitor-shell.ts
     /// module-level `bankDefaults` / `memCursors` / `disasmCursors` / `sidefxOn`).
     /// The daemon holds one session, so these are single-valued (not per-id maps).
@@ -5424,21 +5436,36 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             }))
         }
 
-        // checkpoint/thumbnails — the scrub filmstrip (ws-server.ts:1028-1037): every
-        // live ring checkpoint with a small palette-indexed thumbnail (id, cycles,
-        // frame, pinned, width, height, palette:b64, indices:b64). c64re grabs each
-        // thumb from the live frame at capture time; TRX64 renders it from the
-        // checkpoint's STORED `vicPresentation` framebuffer (full-capture path),
-        // cropped to the 384×272 canvas + 1/4 downscaled — 1:1 wire shape, and an
-        // entry whose anchor omits the framebuffer simply yields no thumbnail (just
-        // like a c64re checkpoint with no captured thumb is absent from `filmstrip()`).
+        // checkpoint/thumbnails — the scrub filmstrip (ws-server.ts:1028-1037, =
+        // RuntimeController.filmstrip): every live ring checkpoint that has a thumbnail,
+        // in ring order, with a small palette-indexed picture (id, cycles, frame,
+        // pinned, width, height, palette:b64, indices:b64). c64re keeps a SEPARATE
+        // per-id thumb store filled at capture time from the live frame (the anchor
+        // itself is framebuffer-omitted, BUG-049); filmstrip intersects ring.list()
+        // with that store. TRX64 mirrors this: read each ref's picture from
+        // `checkpoint_thumbs` (populated by stream_maybe_autocapture for every
+        // auto-anchor), FALLING BACK to a thumbnail rendered from the checkpoint's
+        // STORED `vicPresentation` framebuffer for a framebuffer-present entry with no
+        // stored thumb (explicit checkpoint/capture keeps the FB). An entry with
+        // neither yields no thumbnail — like a c64re checkpoint absent from
+        // `filmstrip()`. This is the Spec 769.5a fix: previously ONLY the rare
+        // framebuffer-present checkpoints got a thumb, so the filmstrip showed ~4 of
+        // ~70 ring entries; now every auto-anchor has one.
         "checkpoint/thumbnails" => {
             let st = state.lock().unwrap();
             let refs = st.checkpoint_ring.list();
             let mut thumbnails: Vec<Value> = Vec::new();
             for r in &refs {
-                let Some(cp) = st.checkpoint_ring.restore_snapshot(&r.id) else { continue };
-                let Some((w, h, palette, indices)) = checkpoint_thumbnail(&cp) else { continue };
+                let (w, h, palette, indices) = if let Some(t) = st.checkpoint_thumbs.get(&r.id) {
+                    (t.width, t.height, t.palette.clone(), t.indices.clone())
+                } else if let Some(cp) = st.checkpoint_ring.restore_snapshot(&r.id) {
+                    match checkpoint_thumbnail(&cp) {
+                        Some(v) => v,
+                        None => continue,
+                    }
+                } else {
+                    continue;
+                };
                 thumbnails.push(json!({
                     "id": r.id,
                     "cycles": r.cycles,
@@ -6426,7 +6453,7 @@ fn stream_maybe_autopersist_disk(st: &mut State, frame: u64) {
 /// ring. SKIPS while a mounted medium is dirty + non-persistable (Spec 709.13).
 /// Isolated: a capture failure NEVER kills the loop (the ring returns Err on a
 /// gap, never panics). Disable with C64RE_CHECKPOINT_AUTOCAPTURE=0.
-fn stream_maybe_autocapture(st: &mut State, frame: u64) {
+fn stream_maybe_autocapture(st: &mut State, frame: u64, canvas_w: usize, canvas_h: usize, canvas_indices: &[u8]) {
     if std::env::var("C64RE_CHECKPOINT_AUTOCAPTURE").as_deref() == Ok("0") {
         return;
     }
@@ -6447,7 +6474,33 @@ fn stream_maybe_autocapture(st: &mut State, frame: u64) {
     // is TRX64's lighter omit-framebuffer variant). A capture Err is a ring gap,
     // swallowed — the loop continues.
     let cp = capture_recorder_anchor_payload(&mut st.session);
-    let _ = st.checkpoint_ring.capture(cp, frame, cycles);
+    // Spec 769.5a — store a downscaled thumbnail of the JUST-RENDERED live frame
+    // keyed by the ring's assigned id, in the SEPARATE thumb store (= c64re
+    // captureThumb at the auto-capture point, runtime-controller.ts:840). The anchor
+    // itself stays framebuffer-omitted (BUG-049); the filmstrip reads the picture
+    // from this store, so every auto-anchor — not just framebuffer-present ones —
+    // gets a thumbnail. Cheap; inside the existing per-frame lock window.
+    if let Ok(r) = st.checkpoint_ring.capture(cp, frame, cycles) {
+        if let Some(thumb) = make_thumb_from_canvas(canvas_w, canvas_h, canvas_indices) {
+            store_checkpoint_thumb(st, r.id, thumb);
+        }
+    }
+}
+
+/// Spec 769.5a — insert a thumbnail keyed by checkpoint id, evicting the oldest
+/// (insertion order) when the store exceeds [`MAX_THUMBS`]. 1:1 with c64re
+/// `captureThumb` (runtime-controller.ts:434-441): a separate, ring-decoupled store.
+fn store_checkpoint_thumb(st: &mut State, id: String, thumb: CheckpointThumb) {
+    if st.checkpoint_thumbs.insert(id.clone(), thumb).is_none() {
+        st.checkpoint_thumb_order.push_back(id);
+    }
+    while st.checkpoint_thumbs.len() > MAX_THUMBS {
+        if let Some(oldest) = st.checkpoint_thumb_order.pop_front() {
+            st.checkpoint_thumbs.remove(&oldest);
+        } else {
+            break;
+        }
+    }
 }
 
 /// The scenario-player replay target over the live `Machine`. `type` drives the
@@ -7253,6 +7306,63 @@ fn render_screenshot(machine: &trx64_core::Machine, scale: usize) -> (String, u3
 /// `makeCheckpointThumbnail`'s default (factor 4 → the 384×272 canvas becomes 96×68).
 const THUMB_FACTOR: usize = 4;
 
+/// Spec 769.5a — cap on the separate per-checkpoint thumbnail store. 1:1 with the
+/// c64re `RuntimeController.MAX_THUMBS` (runtime-controller.ts:182); evicts oldest
+/// (insertion order) when exceeded. The ring itself bounds restorable checkpoints,
+/// so an orphaned thumb (its ring entry already evicted) is simply never surfaced
+/// by `filmstrip()` and ages out under this cap — exactly the c64re contract.
+const MAX_THUMBS: usize = 1024;
+
+/// Spec 769.5a — a captured scrub-filmstrip thumbnail (downscaled live frame). The
+/// daemon mirror of the c64re `CheckpointThumbnail` (inspect/checkpoint-thumbnail.ts:14):
+/// `width`/`height` palette-indexed picture + the 48-byte RGB palette.
+#[derive(Clone)]
+struct CheckpointThumb {
+    width: usize,
+    height: usize,
+    /// 48-byte RGB palette (16 × 3).
+    palette: Vec<u8>,
+    /// width*height palette indices (0..15).
+    indices: Vec<u8>,
+}
+
+/// Spec 769.5a — downscale the JUST-RENDERED live canvas (the per-frame 384×272
+/// 4-bit `indices` the stream loop built for the video broadcast) into a thumbnail.
+/// The TRX64 mirror of `makeCheckpointThumbnail` (inspect/checkpoint-thumbnail.ts:30):
+/// same nearest-neighbour 1/factor downscale, same `{ width, height, palette(48 RGB),
+/// indices(w*h) }` shape. c64re grabs the thumbnail from the live frame at capture
+/// time (its literal-port VIC is per-cycle stateful → no pure snapshot→frame fn) and
+/// stores it in a SEPARATE map keyed by the checkpoint id — decoupled from the
+/// ring's (framebuffer-omitted, BUG-049) auto-capture anchor. This builds the same
+/// thumbnail from the live canvas the stream loop already has in hand, so the
+/// framebuffer-omitted auto-anchors still get a real picture. Returns None if the
+/// canvas is empty.
+fn make_thumb_from_canvas(w: usize, h: usize, indices: &[u8]) -> Option<CheckpointThumb> {
+    let ow = w / THUMB_FACTOR;
+    let oh = h / THUMB_FACTOR;
+    if ow == 0 || oh == 0 || indices.len() < w * h {
+        return None;
+    }
+    let mut out = vec![0u8; ow * oh];
+    for oy in 0..oh {
+        let sy = oy * THUMB_FACTOR * w;
+        let orow = oy * ow;
+        for ox in 0..ow {
+            out[orow + ox] = indices[sy + ox * THUMB_FACTOR] & 0x0f;
+        }
+    }
+    let mut palette = Vec::with_capacity(48);
+    for rgb in trx64_core::render::COLODORE.iter() {
+        palette.extend_from_slice(rgb);
+    }
+    Some(CheckpointThumb {
+        width: ow,
+        height: oh,
+        palette,
+        indices: out,
+    })
+}
+
 /// Build a downscaled palette-indexed thumbnail from a stored checkpoint's
 /// `vicPresentation.literalPortFbStable` framebuffer — the TRX64 mirror of
 /// `makeCheckpointThumbnail` (inspect/checkpoint-thumbnail.ts:30). c64re grabs the
@@ -7474,6 +7584,8 @@ async fn main() {
         disk_ap_seen_hash: None,
         disk_ap_done_hash: None,
         autocapture_frames_since: 0,
+        checkpoint_thumbs: std::collections::HashMap::new(),
+        checkpoint_thumb_order: std::collections::VecDeque::new(),
         mon: MonitorState::new(),
     }));
 
@@ -7556,6 +7668,8 @@ mod batch1_tests {
             disk_ap_seen_hash: None,
             disk_ap_done_hash: None,
             autocapture_frames_since: 0,
+            checkpoint_thumbs: std::collections::HashMap::new(),
+            checkpoint_thumb_order: std::collections::VecDeque::new(),
             mon: MonitorState::new(),
         }))
     }
@@ -8960,12 +9074,17 @@ mod batch1_tests {
     #[test]
     fn item3_autocapture_fills_ring_at_cadence_without_explicit_capture() {
         let state = make_state();
+        // A synthetic non-uniform live canvas (384×272 4-bit), so the downscaled
+        // thumbnail is a real picture (>1 distinct index), like the live stream loop
+        // passes its just-rendered frame.
+        let (cw, ch) = (trx64_core::render::CANVAS_W, trx64_core::render::CANVAS_H);
+        let canvas: Vec<u8> = (0..cw * ch).map(|i| (i % 16) as u8).collect();
         // Run enough frames for ~6 capture windows (~3 s @ 50 fps, cadence 25).
         let windows = 6u64;
         let total = CHECKPOINT_CAPTURE_EVERY_FRAMES * windows + 2;
         for frame in 0..total {
             let mut st = state.lock().unwrap();
-            stream_maybe_autocapture(&mut st, frame);
+            stream_maybe_autocapture(&mut st, frame, cw, ch, &canvas);
         }
         let st = state.lock().unwrap();
         let n = st.checkpoint_ring.list().len();
@@ -8979,6 +9098,48 @@ mod batch1_tests {
             st.checkpoint_ring.list().iter().all(|r| r.frame > 0 || r.cycles == 0),
             "auto-captures stamped with the stream-loop frame"
         );
+        // Spec 769.5a — EVERY auto-anchor (framebuffer-OMITTED) now has a stored
+        // thumbnail: the thumb store has one entry per live ring ref (the bug was
+        // ~4-of-~70). 96×68, real picture.
+        for r in st.checkpoint_ring.list() {
+            let t = st.checkpoint_thumbs.get(&r.id)
+                .unwrap_or_else(|| panic!("auto-anchor {} has no thumbnail (Spec 769.5a)", r.id));
+            assert_eq!(t.width, cw / THUMB_FACTOR);
+            assert_eq!(t.height, ch / THUMB_FACTOR);
+            assert_eq!(t.indices.len(), t.width * t.height);
+            assert_eq!(t.palette.len(), 48);
+            assert!(t.indices.iter().any(|&b| b != t.indices[0]), "thumbnail is a real (non-uniform) picture");
+        }
+    }
+
+    /// Spec 769.5a PROOF — checkpoint/thumbnails count == checkpoint/list count for
+    /// framebuffer-OMITTED auto-anchors (the bug: filmstrip showed only the rare
+    /// framebuffer-present checkpoints). Drives the stream autocapture hook (which
+    /// fills the separate thumb store), then asserts the wire-level filmstrip
+    /// surfaces a thumbnail for EVERY ring entry.
+    #[test]
+    fn thumbnails_count_matches_ring_for_omit_framebuffer_autoanchors() {
+        let state = make_state();
+        let (cw, ch) = (trx64_core::render::CANVAS_W, trx64_core::render::CANVAS_H);
+        let canvas: Vec<u8> = (0..cw * ch).map(|i| (i % 16) as u8).collect();
+        let total = CHECKPOINT_CAPTURE_EVERY_FRAMES * 5 + 2;
+        for frame in 0..total {
+            let mut st = state.lock().unwrap();
+            stream_maybe_autocapture(&mut st, frame, cw, ch, &canvas);
+        }
+        let list = call(&state, "checkpoint/list", json!({}));
+        let ring_n = list["checkpoints"].as_array().unwrap().len();
+        let res = call(&state, "checkpoint/thumbnails", json!({}));
+        let thumbs = res["thumbnails"].as_array().unwrap();
+        assert!(ring_n >= 5, "auto-anchors accumulated (got {ring_n})");
+        assert_eq!(thumbs.len(), ring_n, "every framebuffer-omitted auto-anchor has a thumbnail (Spec 769.5a)");
+        for t in thumbs {
+            assert_eq!(t["width"], json!(96));
+            assert_eq!(t["height"], json!(68));
+            let idx = base64_decode_for_test(t["indices"].as_str().unwrap());
+            assert_eq!(idx.len(), 96 * 68);
+            assert!(idx.iter().any(|&b| b != idx[0]), "thumbnail is a real picture, not all-one-colour");
+        }
     }
 }
 

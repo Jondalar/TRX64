@@ -402,7 +402,10 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
             crate::stream_maybe_autopersist_cart(&mut st, frame_no);
             crate::stream_maybe_autopersist_disk(&mut st, frame_no);
             if !warp {
-                crate::stream_maybe_autocapture(&mut st, frame_no);
+                // Spec 769.5a — pass the JUST-RENDERED live canvas so the auto-capture
+                // can store a downscaled thumbnail keyed by the new checkpoint id
+                // (the ring anchor itself stays framebuffer-omitted, BUG-049).
+                crate::stream_maybe_autocapture(&mut st, frame_no, w, h, &indices);
             }
 
             // Drop the lock before building the (larger) wire buffers + sleeping.
