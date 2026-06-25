@@ -185,6 +185,17 @@ pub trait CartMapper: Send {
     fn writable_generation(&self) -> u64 {
         0
     }
+    /// Spec 714.5 — true when this mapper's full mutable hardware state (flash,
+    /// EEPROM, …) is faithfully captured/restored by `writable_image`/
+    /// `set_writable_image`, so a DIRTY cartridge IS persistable (no reject from
+    /// the media-ingress dirty guard / checkpoint chokepoint). Read-only mappers
+    /// and families without a writable port return `false` (default) and stay
+    /// reject-on-dirty. (= the TS `persistsWritableState?(): boolean`,
+    /// cartridge.ts:67; the writable families EasyFlash/Megabyter/Gmod2/Gmod3/
+    /// C64MegaCart all return true.)
+    fn persists_writable_state(&self) -> bool {
+        false
+    }
     /// The live writable image (flash array + any EEPROM), for snapshot /
     /// write-back. None ⇒ this mapper has no writable backing (read-only tier).
     /// `clk` so the flash catches its erase alarm up before serializing.
@@ -996,6 +1007,11 @@ impl CartMapper for EasyFlashMapper {
     fn is_writable_dirty(&self) -> bool {
         self.lo_flash.is_dirty() || self.hi_flash.is_dirty()
     }
+    // ts:911 — EasyFlash persists its full flash state (writable_image/crt_image),
+    // so a dirty EasyFlash is captured, not rejected by the dirty-media guard.
+    fn persists_writable_state(&self) -> bool {
+        true
+    }
     fn writable_generation(&self) -> u64 {
         self.lo_flash.writable_generation() + self.hi_flash.writable_generation()
     }
@@ -1220,6 +1236,10 @@ impl CartMapper for Gmod2Mapper {
     fn is_writable_dirty(&self) -> bool {
         self.flash.is_dirty() || self.eeprom.is_dirty()
     }
+    // ts:1266 — GMOD2 persists flash + M93C86 EEPROM (writable_image/crt_image).
+    fn persists_writable_state(&self) -> bool {
+        true
+    }
     fn writable_generation(&self) -> u64 {
         self.flash.writable_generation() + self.eeprom.writable_generation()
     }
@@ -1348,6 +1368,10 @@ impl CartMapper for MegabyterMapper {
     }
     fn is_writable_dirty(&self) -> bool {
         self.flash.is_dirty()
+    }
+    // ts:1439 — Megabyter persists its MX29F800 flash (writable_image/crt_image).
+    fn persists_writable_state(&self) -> bool {
+        true
     }
     fn writable_generation(&self) -> u64 {
         self.flash.writable_generation()

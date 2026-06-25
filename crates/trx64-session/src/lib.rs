@@ -29,6 +29,11 @@ pub struct Session {
     /// flushes to this path. `None` = no trace.
     pub trace: Option<TraceState>,
     pub disk_path: String,
+    /// BUG-023-cart / Spec 742 — the host `.crt` path of the live cartridge (= the
+    /// c64re `session.cartPath`), so a writable (EasyFlash) cart can write its
+    /// programmed flash back on eject/persist. Empty when no cart or uploaded bytes
+    /// with no backing path. Set by the CRT media/ingress path; cleared on eject.
+    pub cart_path: String,
 }
 
 /// Trace bookkeeping for an active `.c64retrace` capture.
@@ -63,6 +68,7 @@ impl Session {
             io_injected: false,
             trace: None,
             disk_path: String::new(),
+            cart_path: String::new(),
         }
     }
 

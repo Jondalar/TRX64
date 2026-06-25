@@ -170,7 +170,10 @@ struct State {
     ctrl_frame: u64,
     /// Last stop reason (set on pause, cleared on continue/run).
     ctrl_stop: Option<CtrlStop>,
-    /// Monotonic checkpoint counter for media/ingress checkpoint IDs.
+    /// Monotonic checkpoint counter for legacy media/ingress checkpoint IDs.
+    /// Superseded by real ring captures (capture_media_checkpoint); kept inert for
+    /// the State init sites until those are pruned.
+    #[allow(dead_code)]
     checkpoint_counter: u64,
     /// Spec 705.B — the always-on bounded in-memory checkpoint ring (rewind /
     /// time-travel). Transient, in-memory only; zero-cost until the first
@@ -3610,170 +3613,263 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             }))
         }
 
+        // Spec 709 / 709.13 — the single media-ingress entry point. Full port of
+        // c64re `ingestMedia` (media/ingress.ts:91-301): drive9 + .c64re + dirty-
+        // media guards, then a deterministic boundary (conditional pause →
+        // checkpoint-before → apply → checkpoint-after → pin → event → conditional
+        // resume). TRX64 has no autonomous tick loop, so "pause"/"resume" set the
+        // `running` flag (+ broadcast debug/paused|running) exactly as the wire
+        // contract requires; the cycle-budget run happens on the next debug/run.
         "media/ingress" => {
             let kind = req.params.get("kind").and_then(|v| v.as_str()).unwrap_or("disk").to_string();
             let path = req.params.get("path").and_then(|v| v.as_str()).map(str::to_string);
             let bytes_b64 = req.params.get("bytes_b64").and_then(|v| v.as_str()).map(str::to_string);
             let name = req.params.get("name").and_then(|v| v.as_str()).map(str::to_string);
             let role = req.params.get("role").and_then(|v| v.as_str()).unwrap_or("drive8").to_string();
+            // CRT only: reset policy (default power-cycle, = buildIngressRequest ts:61).
+            let reset_policy = req.params.get("resetPolicy").and_then(|v| v.as_str())
+                .map(|s| if s == "reset" { "reset" } else { "power-cycle" })
+                .unwrap_or("power-cycle").to_string();
+            // PRG only: load vs inject-run (default load, = buildIngressRequest ts:60).
+            let prg_mode = req.params.get("mode").and_then(|v| v.as_str())
+                .map(|s| if s == "inject-run" { "inject-run" } else { "load" })
+                .unwrap_or("load").to_string();
+            let prg_entry = req.params.get("entry").and_then(|v| v.as_u64()).map(|e| (e & 0xffff) as u16);
+            // Spec 709.12 — resumeIfRunning. The TS ws-server sets it to (kind=="crt")
+            // for every ingress route (ws-server.ts:1749/1779); honor an explicit
+            // param too so a deterministic caller can pin the paused contract.
+            let resume_if_running = req.params.get("resumeIfRunning").and_then(|v| v.as_bool())
+                .unwrap_or(kind == "crt");
 
-            match kind.as_str() {
-                "eject" => {
-                    let mut st = state.lock().unwrap();
-                    st.session.machine.drive8.detach_disk();
-                    st.session.disk_path = String::new();
-                    let cycle = st.session.machine.clk;
-                    let cp_before = format!("cp_{}_{}", cycle, st.checkpoint_counter);
-                    st.checkpoint_counter += 1;
-                    let cp_after = format!("cp_{}_{}", cycle, st.checkpoint_counter);
-                    st.checkpoint_counter += 1;
-                    let event = json!({
-                        "cycle": cycle,
-                        "operation": "eject",
-                        "role": role,
-                        "checkpointBeforeId": cp_before,
-                        "checkpointAfterId": cp_after
-                    });
-                    push_media_event(&mut st, event.clone());
-                    Response::ok(id, json!({
-                        "ok": true,
-                        "event": event,
-                        "paused": true,
-                        "wasRunning": false,
-                        "detail": { "role": role }
-                    }))
-                }
-                "disk" => {
-                    let bytes = if let Some(b64) = bytes_b64 {
-                        match base64_decode(&b64) {
-                            Ok(b) => b,
-                            Err(e) => return Response::err(id, -32602, format!("media/ingress: base64 decode: {e}")),
-                        }
-                    } else if let Some(ref p) = path {
-                        match std::fs::read(p) {
-                            Ok(b) => b,
-                            Err(e) => return Response::err(id, -32602, format!("media/ingress: file read {p}: {e}")),
-                        }
-                    } else {
-                        return Response::err(id, -32602, "media/ingress: disk requires path or bytes_b64");
-                    };
-
-                    let disk_name = name.unwrap_or_else(|| {
-                        path.as_deref()
-                            .and_then(|p| p.split('/').last())
-                            .unwrap_or("disk")
-                            .to_string()
-                    });
-                    let format_str = if disk_name.to_lowercase().ends_with(".g64")
-                        || (bytes.len() >= 8 && &bytes[..8] == b"GCR-1541")
-                    {
-                        "g64"
-                    } else {
-                        "d64"
-                    };
-                    let sha256 = sha256_hex(&bytes);
-                    let backing_path = path.clone();
-                    let disk_path_str = path.clone().unwrap_or_default();
-
-                    let disk_kind = if format_str == "g64" { DiskKind::G64 } else { DiskKind::D64 };
-                    let image = DiskImage {
-                        kind: disk_kind,
-                        bytes,
-                        backing_path: backing_path.clone(),
-                        read_only: false,
-                    };
-
-                    let mut st = state.lock().unwrap();
-                    st.session.machine.drive8.attach_disk(image);
-                    st.session.disk_path = disk_path_str;
-                    let cycle = st.session.machine.clk;
-                    let cp_after = format!("cp_{}_{}", cycle, st.checkpoint_counter);
-                    st.checkpoint_counter += 1;
-
-                    let detail = if let Some(ref bp) = backing_path {
-                        json!({ "name": disk_name, "backingPath": bp })
-                    } else {
-                        json!({ "name": disk_name })
-                    };
-
-                    let event = json!({
-                        "cycle": cycle,
-                        "operation": "disk",
-                        "role": "drive8",
-                        "format": format_str,
-                        "sha256": sha256,
-                        "checkpointAfterId": cp_after
-                    });
-                    push_media_event(&mut st, event.clone());
-                    Response::ok(id, json!({
-                        "ok": true,
-                        "event": event,
-                        "paused": true,
-                        "wasRunning": false,
-                        "detail": detail
-                    }))
-                }
-                "prg" => {
-                    let prg_bytes = if let Some(b64) = bytes_b64 {
-                        match base64_decode(&b64) {
-                            Ok(b) => b,
-                            Err(e) => return Response::err(id, -32602, format!("media/ingress: base64 decode: {e}")),
-                        }
-                    } else if let Some(ref p) = path {
-                        match std::fs::read(p) {
-                            Ok(b) => b,
-                            Err(e) => return Response::err(id, -32602, format!("media/ingress: file read {p}: {e}")),
-                        }
-                    } else {
-                        return Response::err(id, -32602, "media/ingress: prg requires path or bytes_b64");
-                    };
-
-                    if prg_bytes.len() < 2 {
-                        return Response::err(id, -32602, "media/ingress: PRG too short (< 2 bytes)");
-                    }
-                    let load_addr = (prg_bytes[0] as u16) | ((prg_bytes[1] as u16) << 8);
-                    let body = &prg_bytes[2..];
-                    let sha256 = sha256_hex(&prg_bytes);
-                    let prg_name = name.unwrap_or_else(|| {
-                        path.as_deref()
-                            .and_then(|p| p.split('/').last())
-                            .unwrap_or("program.prg")
-                            .to_string()
-                    });
-
-                    let mut st = state.lock().unwrap();
-                    st.session.machine.poke(load_addr, body);
-                    st.session.machine.cpu6510.reg_pc = load_addr;
-                    st.session.machine.sync_after_monitor();
-                    st.session.injected = true;
-                    let cycle = st.session.machine.clk;
-
-                    let event = json!({
-                        "cycle": cycle,
-                        "operation": "prg",
-                        "role": null,
-                        "format": "prg",
-                        "sha256": sha256,
-                        "resetPolicy": null,
-                        "checkpointBeforeId": null,
-                        "checkpointAfterId": null
-                    });
-                    push_media_event(&mut st, event.clone());
-                    Response::ok(id, json!({
-                        "ok": true,
-                        "event": event,
-                        "paused": true,
-                        "wasRunning": false,
-                        "detail": { "name": prg_name, "loadAddress": load_addr as u64 }
-                    }))
-                }
-                "crt" => {
-                    Response::err(id, -32601, "media/ingress: crt kind not yet implemented")
-                }
-                other => {
-                    Response::err(id, -32602, format!("media/ingress: unsupported kind '{other}'"))
-                }
+            // --- drive9 hard reject (v1 drive8-only), ingress.ts:96-100 ---
+            let slot = req.params.get("slot").and_then(|v| v.as_u64());
+            if role == "drive9" || role == "9" || slot == Some(9) {
+                return Response::err(id, -32602, "media-ingress: drive 9 is not supported in v1 (drive8-only). Request rejected, not registered.");
             }
+
+            // --- resolve bytes up-front for non-eject (the .c64re guard reads them),
+            //     ingress.ts:102-109 + buildIngressRequest byte resolution ---
+            let bytes: Option<Vec<u8>> = if kind != "eject" {
+                let b = if let Some(ref b64) = bytes_b64 {
+                    match base64_decode(b64) {
+                        Ok(b) => b,
+                        Err(e) => return Response::err(id, -32602, format!("media/ingress: base64 decode: {e}")),
+                    }
+                } else if let Some(ref p) = path {
+                    match std::fs::read(p) {
+                        Ok(b) => b,
+                        Err(e) => return Response::err(id, -32602, format!("media/ingress: file read {p}: {e}")),
+                    }
+                } else {
+                    return Response::err(id, -32602, format!("media/ingress: {kind} requires path or bytes_b64"));
+                };
+                // --- .c64re is NOT media, ingress.ts:102-109 (looksLikeC64re ts:62-64) ---
+                let nm = name.clone().unwrap_or_default();
+                let looks_c64re = nm.to_lowercase().ends_with(".c64re")
+                    || (b.len() >= 8 && &b[..8] == trx64_core::native_snapshot::NATIVE_SNAPSHOT_MAGIC.as_slice());
+                if looks_c64re {
+                    return Response::err(id, -32603, "media-ingress: .c64re is a runtime snapshot, not media. Use snapshot/undump (Spec 707), not media ingest.");
+                }
+                Some(b)
+            } else {
+                None
+            };
+
+            let mut st = state.lock().unwrap();
+
+            // --- Spec 709.13 dirty-media guard (BEFORE pause/apply/checkpoint/event),
+            //     ingress.ts:122-129 ---
+            if let Some(dirty) = non_persistable_dirty_media(&st) {
+                return Response::err(id, -32603, format!(
+                    "media-ingress: cannot apply a media change — {dirty} (Spec 709.13). v1 cannot \
+                     persist this state, so the intervention would create a non-restorable checkpoint/branch. \
+                     Aborting (no partial apply, no checkpoint, no event)."
+                ));
+            }
+
+            // --- boundary: wasRunning + conditional pause, ingress.ts:138-143 ---
+            let was_running = st.session.running;
+            let requires_pause =
+                kind == "crt" || kind == "prg" || (kind == "eject" && role == "cartridge");
+            if was_running && requires_pause {
+                // ctrl.pause() — runtime-controller.ts:295 server-PUSHes debug/paused.
+                st.session.running = false;
+                let pc = st.session.machine.cpu6510.reg_pc as u64;
+                let cycles = st.session.machine.clk;
+                st.ctrl_stop = Some(CtrlStop { reason: "pause", pc: st.session.machine.cpu6510.reg_pc, cycles });
+                st.notify.broadcast("debug/paused", json!({
+                    "session_id": st.session.id,
+                    "stop": { "reason": "pause", "pc": pc, "cycles": cycles },
+                }));
+            }
+
+            // --- mediaPresent + needBefore + checkpoint-before, ingress.ts:145-152 ---
+            let media_present = st.session.machine.drive8.get_attached_disk().is_some()
+                || st.session.machine.cartridge.is_some();
+            let need_before = was_running || media_present;
+            let before_id = if need_before { capture_media_checkpoint(&mut st) } else { None };
+
+            // --- apply the op (= ingress.ts:158-243 runExclusive switch) ---
+            let mut detail = serde_json::Map::new();
+            let mut format: Option<String> = None;
+            let mut sha256: Option<String> = None;
+            let apply_err: Option<(i64, String)> = (|| {
+                match kind.as_str() {
+                    "disk" => {
+                        let bytes = bytes.clone().unwrap();
+                        let disk_name = name.clone().unwrap_or_else(|| {
+                            path.as_deref().and_then(|p| p.split('/').last()).unwrap_or("disk").to_string()
+                        });
+                        // diskFormat, ingress.ts:66-73.
+                        let fmt = if disk_name.to_lowercase().ends_with(".g64")
+                            || (bytes.len() >= 8 && &bytes[..8] == b"GCR-1541") { "g64" }
+                        else if disk_name.to_lowercase().ends_with(".d64") { "d64" }
+                        else { "d64" };
+                        format = Some(fmt.to_string());
+                        sha256 = Some(sha256_hex(&bytes));
+                        let backing_path = path.clone();
+                        let disk_kind = if fmt == "g64" { DiskKind::G64 } else { DiskKind::D64 };
+                        st.session.machine.drive8.attach_disk(DiskImage {
+                            kind: disk_kind, bytes, backing_path: backing_path.clone(), read_only: false,
+                        });
+                        st.session.disk_path = path.clone().unwrap_or_default();
+                        detail.insert("name".to_string(), json!(disk_name));
+                        if let Some(ref bp) = backing_path { detail.insert("backingPath".to_string(), json!(bp)); }
+                        None
+                    }
+                    "eject" => {
+                        if role == "drive8" {
+                            st.session.machine.drive8.detach_disk();
+                            st.session.disk_path = String::new();
+                        } else {
+                            // BUG-023-cart / Spec 742 — write programmed flash back to the
+                            // host .crt BEFORE detaching (ingress.ts:190-204).
+                            let cart_path = st.session.cart_path.clone();
+                            if !cart_path.is_empty() {
+                                if let Some(p) = persist_cart_for_eject(&mut st, &cart_path) {
+                                    detail.insert("cartPersisted".to_string(), json!(p));
+                                }
+                            }
+                            st.session.machine.detach_cart();
+                            st.session.cart_path = String::new();
+                            // resetCold("pal-default", { keepRam: true }) — ingress.ts:204.
+                            st.session.machine.cold_reset();
+                        }
+                        detail.insert("role".to_string(), json!(role));
+                        None
+                    }
+                    "prg" => {
+                        let prg_bytes = bytes.clone().unwrap();
+                        if prg_bytes.len() < 2 {
+                            return Some((-32602, "media-ingress: PRG too short (need 2-byte load header)".to_string()));
+                        }
+                        sha256 = Some(sha256_hex(&prg_bytes));
+                        format = Some("prg".to_string());
+                        // loadPrgBytes, ingress.ts:306-318: poke at load addr + set
+                        // BASIC VARTAB ($2D/$2E) when loaded at $0801.
+                        let load_addr = (prg_bytes[0] as u16) | ((prg_bytes[1] as u16) << 8);
+                        let body = &prg_bytes[2..];
+                        st.session.machine.poke(load_addr, body);
+                        let end_addr = load_addr.wrapping_add(body.len() as u16);
+                        if load_addr == 0x0801 {
+                            st.session.machine.poke(0x2d, &[(end_addr & 0xff) as u8, ((end_addr >> 8) & 0xff) as u8]);
+                        }
+                        let report_end = end_addr.wrapping_sub(1);
+                        detail.insert("loadAddress".to_string(), json!(load_addr as u64));
+                        detail.insert("endAddress".to_string(), json!(report_end as u64));
+                        detail.insert("mode".to_string(), json!(prg_mode));
+                        // inject-run: set PC to entry (default load addr), ingress.ts:216-220.
+                        if prg_mode == "inject-run" {
+                            let entry = prg_entry.unwrap_or(load_addr);
+                            st.session.machine.cpu6510.reg_pc = entry;
+                            detail.insert("entry".to_string(), json!(entry as u64));
+                        }
+                        st.session.machine.sync_after_monitor();
+                        st.session.injected = true;
+                        None
+                    }
+                    "crt" => {
+                        let crt_bytes = bytes.clone().unwrap();
+                        let crt_name = name.clone().unwrap_or_else(|| {
+                            path.as_deref().and_then(|p| p.split('/').last()).unwrap_or("cartridge.crt").to_string()
+                        });
+                        format = Some("crt".to_string());
+                        sha256 = Some(sha256_hex(&crt_bytes));
+                        // loadCartridgeMapperFromBytes + attachCartridge, ingress.ts:226-230.
+                        // Parse failure → hard error (no fake success), ingress.ts:226.
+                        let mapper_type = match st.session.machine.attach_cart_from_bytes(&crt_bytes, &crt_name) {
+                            Ok((_n, t)) => t,
+                            Err(e) => return Some((-32602, format!("media-ingress: bad CRT: {e}"))),
+                        };
+                        // BUG-023-cart / Spec 742 — remember the host .crt path for
+                        // writable flash write-back on eject/persist, ingress.ts:233.
+                        st.session.cart_path = path.clone().unwrap_or_default();
+                        // resetCold("pal-default", { keepRam: resetPolicy=="reset" }),
+                        // ingress.ts:236. power-cycle wipes RAM (fill_power_on_ram);
+                        // reset keeps it. The cart was attached above, so cold_reset's
+                        // cart-aware $FFFC fetch re-vectors from the cart (Ultimax/GAME).
+                        if reset_policy == "power-cycle" {
+                            st.session.machine.fill_power_on_ram();
+                        }
+                        st.session.machine.cold_reset();
+                        detail.insert("mapperType".to_string(), json!(mapper_type_str(mapper_type)));
+                        if let Some(ref p) = path { detail.insert("backingPath".to_string(), json!(p)); }
+                        detail.insert("resetPolicy".to_string(), json!(reset_policy));
+                        None
+                    }
+                    other => Some((-32602, format!("media/ingress: unsupported kind '{other}'"))),
+                }
+            })();
+
+            if let Some((code, msg)) = apply_err {
+                return Response::err(id, code, msg);
+            }
+
+            // --- checkpoint-after + pin before/after, ingress.ts:254-256 ---
+            let after_id = capture_media_checkpoint(&mut st);
+            if let Some(ref b) = before_id { st.checkpoint_ring.pin(b); }
+            if let Some(ref a) = after_id { st.checkpoint_ring.pin(a); }
+
+            // --- the replayable MediaIngressEvent, ingress.ts:258-267 ---
+            // ts: ctrl.session.c64Cpu.cycles — TRX64 Cpu6510::cycles mirrors clk;
+            // use machine.clk for consistency with the other media-event sites.
+            let cycle = st.session.machine.clk;
+            let event = json!({
+                "cycle": cycle,
+                "operation": kind,
+                "role": if kind == "eject" || kind == "disk" { json!(role) } else { Value::Null },
+                "format": format,
+                "sha256": sha256,
+                "resetPolicy": if kind == "crt" { json!(reset_policy) } else { Value::Null },
+                "checkpointBeforeId": before_id,
+                "checkpointAfterId": after_id,
+            });
+            push_media_event(&mut st, event.clone());
+
+            // --- resume semantics, ingress.ts:282-298 ---
+            // isCartPowerCycle = crt || (eject && cartridge). resumeAfter =
+            // requiresPause && resumeIfRunning && (wasRunning || isCartPowerCycle).
+            let is_cart_power_cycle = kind == "crt" || (kind == "eject" && role == "cartridge");
+            let resume_after = requires_pause && resume_if_running && (was_running || is_cart_power_cycle);
+            if resume_after {
+                // ctrl.run() — runtime-controller.ts:282 server-PUSHes debug/running.
+                st.session.running = true;
+                st.ctrl_stop = None;
+                let pacing_snap = json!({ "mode": st.pacing_mode, "ratio": st.pacing_ratio });
+                st.notify.broadcast("debug/running", json!({
+                    "session_id": st.session.id,
+                    "pacing": pacing_snap,
+                }));
+            }
+            let paused = !st.session.running;
+
+            Response::ok(id, json!({
+                "ok": true,
+                "event": event,
+                "paused": paused,
+                "wasRunning": was_running,
+                "detail": Value::Object(detail),
+            }))
         }
 
         "media/unmount" => {
@@ -5759,6 +5855,60 @@ fn push_media_event(st: &mut State, event: Value) {
         let drop = st.media_events.len() - MAX_MEDIA_EVENTS;
         st.media_events.drain(0..drop);
     }
+}
+
+/// Spec 709.13 / 714.5 — the shared dirty-media guard (= the c64re
+/// `RuntimeController.nonPersistableDirtyMedia`, runtime-controller.ts:470-484).
+/// Returns Some(reason) when the live cartridge has a writable (flash/EEPROM)
+/// delta since attach AND its mapper does NOT faithfully capture/restore that
+/// state — v1 cannot snapshot it, so a media intervention would mint a
+/// non-restorable checkpoint/branch. A persisting family (EasyFlash/GMOD2/
+/// Megabyter) is captured, not rejected. Read-only mappers are never dirty →
+/// None. ONLY the cartridge is consulted (the disk has its own write-through /
+/// .c64re embed path), exactly like the TS guard.
+fn non_persistable_dirty_media(st: &State) -> Option<String> {
+    let cart = st.session.machine.cartridge.as_ref()?;
+    if cart.is_writable_dirty() && !cart.persists_writable_state() {
+        return Some(
+            "writable cartridge state changed since attach and this mapper has no persistence \
+             port; v1 cannot snapshot it"
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// BUG-023-cart / Spec 742 — host-file write-back for a writable cartridge on
+/// eject (= the c64re `persistCartridgeToFile`, persist-cartridge.ts:20-30). VICE
+/// saves the `.crt` on detach; the read-only / non-writable / clean / no-path
+/// cases are skipped with a reason (no write). Returns the written path on a real
+/// write so the caller can stamp `detail["cartPersisted"]`.
+fn persist_cart_for_eject(st: &mut State, backing_path: &str) -> Option<String> {
+    if backing_path.is_empty() {
+        return None;
+    }
+    let clk = st.session.machine.clk;
+    let cart = st.session.machine.cartridge.as_mut()?;
+    // persist-cartridge.ts:23-24 — only a dirty, persisting mapper is written.
+    if !cart.persists_writable_state() || !cart.is_writable_dirty() {
+        return None;
+    }
+    let img = cart.crt_image(clk)?;
+    match std::fs::write(backing_path, &img) {
+        Ok(()) => Some(backing_path.to_string()),
+        Err(_) => None,
+    }
+}
+
+/// Spec 709.13 — capture a real before/after checkpoint into the ring and return
+/// its id (= the c64re `controller.captureCheckpoint()` → `ring.capture(...)`).
+/// None only on a capture error (the ring rejects a malformed payload); callers
+/// treat None as "no checkpoint id" and still complete the media op.
+fn capture_media_checkpoint(st: &mut State) -> Option<String> {
+    let frame = st.ctrl_frame;
+    let cycles = st.session.machine.c64_core.clk;
+    let cp = capture_live_checkpoint(&mut st.session);
+    st.checkpoint_ring.capture(cp, frame, cycles).ok().map(|r| r.id)
 }
 
 /// The scenario-player replay target over the live `Machine`. `type` drives the
