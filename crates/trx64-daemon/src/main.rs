@@ -370,6 +370,11 @@ struct MonitorState {
     mem_cursor: Option<u16>,
     disasm_cursor: Option<u16>,
     sidefx_on: bool,
+    /// Sticky inspect target (= monitor-shell `deviceSel`, default "c64"). When
+    /// "drive8" the read-inspect verbs `r`/`m`/`d` target the 1541 drive CPU
+    /// (read-inspect ONLY — Spec 754 §3.3i); other verbs are blocked with a clear
+    /// message. `device c64|drive8` (or `dev`) flips it.
+    device: String,
 }
 
 impl MonitorState {
@@ -379,6 +384,7 @@ impl MonitorState {
             mem_cursor: None,
             disasm_cursor: None,
             sidefx_on: false,
+            device: "c64".to_string(),
         }
     }
 }
@@ -1478,13 +1484,68 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
     // use the side-effect-free lens peek (documented; the gate exercises peek).
     let _sidefx = st.mon.sidefx_on;
 
-    // readByte/writeByte (= monitor-shell readByte/writeByte). drive8 device is not
-    // wired in run_monitor (no driveProbe), so reads are C64-only.
+    // readByte/writeByte (= monitor-shell readByte/writeByte). When device=drive8
+    // the read-inspect verbs r/m/d peek the 1541 drive CPU address space
+    // (drive_peek); the C64 path is unchanged otherwise.
     // (closures borrow the machine; defined per-branch to satisfy the borrow checker)
+    let device = st.mon.device.clone();
+
+    // ---- device target (Spec 754 §3.3i / audit ws-trace-monitor-misc-8) ----------
+    // Sticky inspect target: `device` shows / `device c64|drive8` sets. While
+    // device=drive8 the monitor is READ-INSPECT only — only r/m/d (+ device/help)
+    // act on the 1541 CPU; every other verb is blocked with a clear message (so it
+    // can't silently mutate the C64). 1:1 with monitor-shell.ts:233-245.
+    if op == "device" || op == "dev" {
+        let arg = toks.get(1).map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+        if arg.is_empty() {
+            return Ok(format!(
+                "device: {device}   (c64 | drive8 — drive8 = read-inspect r/m/d on the 1541 CPU)"
+            ));
+        }
+        if arg == "c64" || arg == "drive8" {
+            st.mon.device = arg.clone();
+            return Ok(format!("device: {arg}"));
+        }
+        return Err("device: usage: device c64|drive8".into());
+    }
+    // Spec 754 §3.3i — drive8 is read-inspect only: allow r/m/d (+ help/?). Anything
+    // else would act on the C64 → block it (matches monitor-shell.ts:243).
+    if device == "drive8" && !matches!(op.as_str(), "r" | "m" | "d" | "help" | "?") {
+        return Err(format!(
+            "device drive8: read-inspect only (r/m/d). `device c64` first to use `{op}`."
+        ));
+    }
 
     match op.as_str() {
         // ---- Registers (Spec 754 §3.3d). `r` shows; `r a=$42 x=$10` sets. ----
         "r" | "registers" => {
+            // audit ws-trace-monitor-misc-8 — device drive8: the 1541 CPU registers
+            // (read-only). 1:1 with monitor-shell.ts:481-488 (drive_pc / a / x / y / sp
+            // / flags / drive_clk + track/halftrack), so the panel is unambiguously the
+            // DRIVE core (header "1541 (drive 8)"), distinct from the C64 panel.
+            if device == "drive8" {
+                let drv = &st.session.machine.drive8;
+                let c = &drv.core;
+                let flags = c.status();
+                let names = ['N', 'V', '-', 'B', 'D', 'I', 'Z', 'C'];
+                let flags_str: String = names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &f)| {
+                        if (flags >> (7 - i)) & 1 != 0 { f } else { f.to_ascii_lowercase() }
+                    })
+                    .collect();
+                let halftrack = drv.rotation.current_half_track;
+                let track = (halftrack / 2) + 1;
+                return Ok(format!(
+                    "1541 (drive 8)\n  \
+                     ADDR AC XR YR SP NV-BDIZC  clk\n\
+                     .;{:04X} {:02X} {:02X} {:02X} {:02X} {}  {}\n  \
+                     track {} (halftrack {})",
+                    c.reg_pc, c.reg_a, c.reg_x, c.reg_y, c.reg_sp, flags_str, drv.drive_clk,
+                    track, halftrack
+                ));
+            }
             let sets: Vec<&String> = toks[1..].iter().filter(|t| t.contains('=')).collect();
             if !sets.is_empty() {
                 let mut done = Vec::new();
@@ -1624,7 +1685,13 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                     if aj > end_u {
                         break;
                     }
-                    let b = st.session.machine.peek_lens((aj & 0xffff) as u16, &lens);
+                    // device drive8: peek the 1541 CPU address space (read-inspect),
+                    // else the C64 banked lens (monitor-shell.ts:150-156 driveProbe).
+                    let b = if device == "drive8" {
+                        st.session.machine.drive8.drive_peek((aj & 0xffff) as u16)
+                    } else {
+                        st.session.machine.peek_lens((aj & 0xffff) as u16, &lens)
+                    };
                     bytes.push(format!("{:02X}", b));
                     ascii.push(if (0x20..0x7f).contains(&b) { b as char } else { '.' });
                 }
@@ -1654,9 +1721,14 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             if lens_tok.is_some() {
                 i += 1;
             }
+            let default_pc = if st.mon.device == "drive8" {
+                st.session.machine.drive8.core.reg_pc
+            } else {
+                st.session.machine.cpu6510.reg_pc
+            };
             let start = parse_addr(toks.get(i))
                 .or(st.mon.disasm_cursor)
-                .unwrap_or(st.session.machine.cpu6510.reg_pc);
+                .unwrap_or(default_pc);
             // `d <start> <end>` = RANGE (VICE). The 2nd arg, present, is an END addr.
             let end: Option<u16> = if toks.get(i + 1).is_some() {
                 Some(parse_addr(toks.get(i + 1)).ok_or("d: bad end address")?)
@@ -1669,7 +1741,15 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 }
             }
             let pc = st.session.machine.cpu6510.reg_pc;
-            let read = |x: u16| st.session.machine.peek_lens(x, &lens);
+            // device drive8: disassemble the 1541 CPU address space (read-inspect).
+            let on_drive = device == "drive8";
+            let read = |x: u16| {
+                if on_drive {
+                    st.session.machine.drive8.drive_peek(x)
+                } else {
+                    st.session.machine.peek_lens(x, &lens)
+                }
+            };
             let mut lines: Vec<String> = Vec::new();
             let mut a = start & 0xffff;
             const MAX: usize = 4096;
@@ -2095,24 +2175,159 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             Ok(format!("{line} (return, {last_cyc} cyc)"))
         }
 
-        // ---- flow / bt — Spec 754 §3.3h capability panels. -------------------
-        // TRX64 has no FlowTracker (interrupt/trap frame stack) or stack-scan
-        // backtrace builder wired into run_monitor. The TS verbs always produce
-        // output (never error); to stay faithful WITHOUT faking a frame stack we
-        // report the honest "no frame active" / minimal state shape rather than a
-        // fabricated chain. (main flow = no interrupt frame is the common case.)
+        // ---- flow / bt — Spec 754 §3.3h capability panels (audit misc-13). ----
+        // These report LIVE machine state, not a constant. TRX64 has no FlowTracker
+        // (interrupt/trap frame STACK), so `flow` reports the honest "main" framing
+        // (no fabricated interrupt chain) but the `bt` verb is the state-dependent
+        // panel: it scans the ACTUAL 6502 stack page for JSR return-address
+        // candidates, 1:1 with monitor-shell.ts buildBacktrace (backtrace.ts:23-40),
+        // so the panel reflects the live SP + stack contents.
         "flow" => {
-            // TS: `flow: current=main  focus=auto\nframes:\n  (main — no interrupt/trap frame active)`
+            // TS: `flow: current=main  focus=auto\nframes:\n  (main …)`. TRX64 has no
+            // flow-frame tracker, so `current`/`focus` are the honest constant main
+            // framing; the live state-dependent capability is `bt`.
             Ok(
                 "flow: current=main  focus=auto\nframes:\n  (main — no interrupt/trap frame active)"
                     .to_string(),
             )
         }
         "bt" => {
-            // TS buildBacktrace scans the 6502 stack for JSR return-address
-            // candidates. TRX64 has no backtrace builder in run_monitor; emit the
-            // minimal honest panel (no fabricated chain) rather than fake frames.
-            Ok("(backtrace unavailable — no flow/stack-scan bridge in this monitor)".to_string())
+            // buildBacktrace (backtrace.ts): scan $0100+((sp+1)&0xff) .. $01FF in
+            // 2-byte steps for JSR return-address candidates (ret = (hi<<8|lo)+1),
+            // up to 16. Reads via the cpu lens (peek, no side effect). State-dependent
+            // on the live SP + stack bytes — NOT a constant.
+            let m = &st.session.machine;
+            let sp = (m.cpu6510.reg_sp & 0xff) as u32;
+            let mut lines: Vec<String> =
+                vec!["backtrace (live stack scan — best-effort; refine with `chis`):".to_string()];
+            let mut found = 0usize;
+            let mut a: u32 = 0x0100 + ((sp + 1) & 0xff);
+            while a <= 0x01ff && found < 16 {
+                let lo = m.peek_lens((a & 0xffff) as u16, "cpu") as u32;
+                let hi = m.peek_lens(((a + 1) & 0xffff) as u16, "cpu") as u32;
+                let ret = (((hi << 8) | lo) + 1) & 0xffff;
+                lines.push(format!("  ${:04X}: -> ${:04X}  (JSR return?)", a & 0xffff, ret));
+                found += 1;
+                a += 2;
+            }
+            if found == 0 {
+                lines.push("  (stack empty — SP at top)".to_string());
+            }
+            Ok(lines.join("\n"))
+        }
+
+        // ---- Live trace gate (Spec 746 / audit misc-2): trace on|off|status|mark --
+        // Wires the monitor `trace` verb to the EXISTING trace machinery (TraceState +
+        // finalize_trace — the same engine behind trace/start_domains, runtime/mark,
+        // trace/run/stop). 1:1 with monitor-shell.ts:413-441 (which drives
+        // ctrl.traceRun). Was MISSING → `unknown command: trace` (help LIED @2221).
+        "trace" => {
+            let sub = toks.get(1).map(|s| s.to_ascii_lowercase()).unwrap_or_else(|| "status".into());
+            match sub.as_str() {
+                "off" | "stop" => {
+                    if st.session.trace.is_none() {
+                        return Ok("trace: no active run".into());
+                    }
+                    let (run, _status) = finalize_trace(st);
+                    let run_id = run.get("runId").and_then(|v| v.as_str()).unwrap_or("");
+                    let events = run.get("eventCount").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let marks = run.get("marks").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                    let evidence = st.last_trace_path.clone().unwrap_or_default();
+                    Ok(format!(
+                        "trace off: {run_id}  events={events} marks={marks}\n  evidence: {evidence}"
+                    ))
+                }
+                "status" => Ok(match &st.session.trace {
+                    Some(t) => format!(
+                        "trace active: {} events={} marks={}",
+                        t.run_id, t.event_count, t.marks.len()
+                    ),
+                    None => "trace: off".to_string(),
+                }),
+                "mark" => {
+                    // trace mark "<label>" — quoted label, else the rest of the line.
+                    let label = quoted_first(&cmd).unwrap_or_else(|| toks[2..].join(" "));
+                    if label.is_empty() {
+                        return Ok("trace: usage: trace mark \"<label>\"".into());
+                    }
+                    let clk = st.session.machine.clk;
+                    match st.session.trace.as_mut() {
+                        Some(t) => {
+                            t.marks.push((clk, label.clone()));
+                            Ok(format!("trace mark: \"{label}\" @ cycle {clk}"))
+                        }
+                        // TS marks against ctrl.traceRun (throws if inactive at the WS
+                        // boundary); the monitor verb mirrors runtime/mark's guard.
+                        None => Ok("trace: no active run — `trace on` first".into()),
+                    }
+                }
+                "on" | "start" => {
+                    if st.session.trace.is_some() {
+                        return Ok("trace: already active — `trace off` first".into());
+                    }
+                    // captureAll default domains (= monitor-shell.ts:434) unless the
+                    // user supplied a domain list after `trace on`.
+                    let doms: Vec<String> = toks[2..].iter().filter(|s| !s.is_empty()).cloned().collect();
+                    let domains = if doms.is_empty() {
+                        vec!["c64-cpu".into(), "drive8-cpu".into(), "iec".into(), "memory".into()]
+                    } else {
+                        doms
+                    };
+                    let output = default_trace_output(&st.session.id);
+                    let retrace = output.with_extension("c64retrace");
+                    let cycle_start = st.session.machine.clk;
+                    let run_id = format!("run_live-capture_{cycle_start}");
+                    let meta_json = serde_json::to_string(&json!({
+                        "runId": run_id,
+                        "defId": "live-capture",
+                        "defVersion": 1,
+                        "defName": "live-capture",
+                        "defJson": "",
+                        "domains": domains,
+                        "cycleStart": cycle_start,
+                        "createdAt": "",
+                    }))
+                    .unwrap_or_default();
+                    st.session.machine.drive8.flush_disk_writeback();
+                    let (media_sha, media_name) = match st.session.machine.drive8.get_attached_disk() {
+                        Some(disk) => (
+                            sha256_hex(&disk.bytes),
+                            disk.backing_path
+                                .as_ref()
+                                .and_then(|p| p.rsplit('/').next())
+                                .map(String::from)
+                                .unwrap_or_default(),
+                        ),
+                        None => (String::new(), String::new()),
+                    };
+                    let start_wall_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0);
+                    st.session.trace = Some(TraceState {
+                        retrace_path: retrace,
+                        meta_json,
+                        cycle_start,
+                        buf: Vec::new(),
+                        run_id: run_id.clone(),
+                        event_count: 0,
+                        domains: domains.clone(),
+                        marks: Vec::new(),
+                        definition_id: "live-capture".to_string(),
+                        definition_version: 1,
+                        start_wall_ms,
+                        media_sha,
+                        media_name,
+                    });
+                    st.last_run_id = Some(run_id.clone());
+                    Ok(format!(
+                        "trace on: {run_id}  domains=[{}]\n  evidence: {}",
+                        domains.join(","),
+                        output.to_string_lossy()
+                    ))
+                }
+                _ => Ok("trace: on [domains...] | off | status | mark \"<label>\"".into()),
+            }
         }
 
         // ---- Reset -----------------------------------------------------------
@@ -2239,6 +2454,15 @@ fn monitor_help_text() -> String {
         "    bsave \"<f>\" <a1> <a2>  raw binary save (no header)",
     ]
     .join("\n")
+}
+
+/// The first double-quoted substring of a command (= the TS
+/// `[...cmd.matchAll(/"([^"]*)"/g)].map(m => m[1])[0]`). `None` when unquoted.
+fn quoted_first(cmd: &str) -> Option<String> {
+    let start = cmd.find('"')?;
+    let rest = &cmd[start + 1..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
 }
 
 /// Parse a hex token (optional leading `$`).

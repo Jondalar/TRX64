@@ -1198,6 +1198,149 @@ const CASES: ConfCase[] = [
       };
     },
   },
+
+  // ── P1: ws-trace-monitor-misc-2 — monitor `trace on/off/status/mark` is wired ──
+  // The monitor REPL (monitor/exec) advertises `trace on|off|status|mark` in its
+  // `help` text, but TRX64's run_monitor had NO `trace` arm → the verb fell through
+  // to `unknown command: trace` (the help LIES). TS monitor-shell.ts:413-441 drives
+  // ctrl.traceRun: `trace on` starts a live trace (captureAll domains), `trace
+  // status` reports active/off, `trace mark "<l>"` stamps a marker, `trace off`
+  // finalizes. Fix: wire run_monitor's `trace` arm to the EXISTING trace machinery
+  // (TraceState + finalize_trace, the same engine behind trace/start_domains +
+  // trace/run/stop + runtime/mark). Signal: a first signal `recognized` (the output
+  // does NOT contain "unknown command" — catches the help-lies divergence) PLUS a
+  // semantic signal `traceActiveAfterOn` (after `trace on`, trace/run/status reports
+  // a live trace) and `statusReportsActive` (the monitor's own `trace status` panel
+  // reports the trace is active). TS: {recognized:true, traceActiveAfterOn:true,
+  // statusReportsActive:true}; TRX64 (before fix): {false,false,false}.
+  {
+    id: "ws-trace-monitor-misc-2",
+    severity: "P1",
+    title: "monitor `trace on/off/status/mark` is wired to the trace engine (help no longer lies)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      const recognized = (s: string) => !/unknown command/i.test(s);
+      // `trace on` must be recognized AND actually start a trace.
+      const onOut = await exec("trace on");
+      // The behavioural truth: a trace is now active per the engine's own status RPC.
+      const statusRpc = (await c.call("trace/run/status", { session_id: sid })) as any;
+      const traceActiveAfterOn = statusRpc?.active === true;
+      // The monitor's own `trace status` panel must reflect the active trace.
+      const statusOut = await exec("trace status");
+      // Stamp a mark via the monitor verb (only meaningful with an active trace).
+      const markOut = await exec('trace mark "probe"');
+      // `trace off` finalizes — recognized + no error.
+      const offOut = await exec("trace off");
+      return {
+        // First signal: the verb is recognized (the help no longer lies).
+        recognized:
+          recognized(onOut) &&
+          recognized(statusOut) &&
+          recognized(markOut) &&
+          recognized(offOut),
+        // Semantic: `trace on` actually started a trace (engine status).
+        traceActiveAfterOn,
+        // Semantic: the monitor's `trace status` panel reports the active trace
+        // (the word "active" appears; formatting differs, so match the token).
+        statusReportsActive: /active/i.test(statusOut),
+      };
+    },
+  },
+
+  // ── P1: ws-trace-monitor-misc-13 — monitor `flow`/`bt` report LIVE state ──────
+  // TS monitor-shell.ts:1103-1115: `flow` reports the live interrupt/trap frame
+  // state and `bt` scans the ACTUAL 6502 stack for JSR-return candidates
+  // (backtrace.ts buildBacktrace — state-dependent on SP + stack contents). TRX64's
+  // run_monitor returned CONSTANT placeholder strings (main.rs:2104-2116) regardless
+  // of machine state. Fix: make `bt` scan the real stack (1:1 with buildBacktrace),
+  // so the panel is state-dependent, not constant. Signal: read `bt` at the cold
+  // (rest) state, then push a known return address onto the 6502 stack (lower SP +
+  // write the stack bytes via the monitor `wr`/`r sp=` verbs) and read `bt` again —
+  // assert the output CHANGED (reflects the live stack), i.e. the panel is no longer
+  // constant. Compared TS vs TRX64 on the SAME scripted stack mutation: both must
+  // report a state-dependent `bt`. TS: {btReflectsStack:true, recognized:true};
+  // TRX64 (before fix): {false-ish (constant), false}.
+  {
+    id: "ws-trace-monitor-misc-13",
+    severity: "P1",
+    title: "monitor `flow`/`bt` reflect live state (bt scans the real stack, not a constant)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      const recognized = (s: string) => !/unknown command/i.test(s);
+      // Set a KNOWN stack: SP just below the top, and a synthetic JSR return address
+      // ($1233 → reported as $1234) at the two stack slots the scan reads first.
+      // The scan reads $0100+((sp+1)&0xff) and +1 (backtrace.ts:27-30).
+      await exec("r sp=fb");                  // SP=$FB → first scan slot = $01FC/$01FD
+      await exec("wr ram 01fc 33 12");        // ret-lo=$33 ret-hi=$12 → scan reports $1234
+      const bt1 = await exec("bt");
+      // Now move the synthetic frame so the scanned return address changes.
+      await exec("wr ram 01fc 77 56");        // → scan now reports $5678
+      const bt2 = await exec("bt");
+      return {
+        // The verb must be recognized (the help advertises `bt`/`flow`).
+        recognized: recognized(bt1) && recognized(bt2) && recognized(await exec("flow")),
+        // Semantic: `bt` reflects the live stack — the SAME verb returns DIFFERENT
+        // output for two different stack contents (a constant string never would),
+        // AND the rolled-in return address is visible in the panel.
+        btReflectsStack: bt1 !== bt2 && /1234/i.test(bt1) && /5678/i.test(bt2),
+      };
+    },
+  },
+
+  // ── P1: ws-trace-monitor-misc-8 — monitor `device drive8` targets the 1541 CPU ──
+  // TS monitor-shell.ts:233-249: `device drive8` selects the active CPU so a
+  // subsequent `r`/`m`/`d` inspect the 1541 drive CPU (read-inspect only); `device
+  // c64` switches back. The 1541 register panel (monitor-shell.ts:481-488) is headed
+  // "1541 (drive 8)" and shows the DRIVE CPU's PC (in the drive ROM $C000-$FFFF after
+  // boot), distinct from the C64 CPU regs. TRX64's run_monitor had NO `device` arm
+  // (the help @2216 advertises it; the comment @1481 confirmed drive8 is not wired) →
+  // `unknown command: device`. Fix: wire `device c64|drive8` (sticky) + route `r`/`m`/
+  // `d` to the drive CPU while device=drive8 + the read-inspect-only guard. Signal:
+  // `device drive8` then `r` → the panel names the drive ("1541"/"drive 8") and the
+  // C64 vs drive register panels DIFFER (distinct CPU). TS: {recognized:true,
+  // drivePanelDistinct:true, namesDrive:true}; TRX64 (before fix): {false,false,false}.
+  {
+    id: "ws-trace-monitor-misc-8",
+    severity: "P1",
+    title: "monitor `device drive8` targets the 1541 drive CPU for r/m/d (help no longer lies)",
+    spawn: { seedFiles: [{ rel: "fixtureA.d64", bytes: SCRAMBLE_D64 }] },
+    async signal(c, d) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      const recognized = (s: string) => !/unknown command/i.test(s);
+      // Mount a disk + advance so the 1541 DOS ROM init has run and the drive CPU PC
+      // sits in the drive ROM range — makes the drive panel unambiguously distinct.
+      const diskPath = `${d.projectDir}/fixtureA.d64`;
+      await c.call("media/mount", { session_id: sid, path: diskPath, slot: 8 }).catch(() => undefined);
+      await c.call("session/run", { session_id: sid, cycles: 2_000_000 }).catch(() => undefined);
+      // C64 register panel (device defaults to c64).
+      await exec("device c64");
+      const c64Regs = await exec("r");
+      // Switch to the drive CPU and read its registers.
+      const devOut = await exec("device drive8");
+      const driveRegs = await exec("r");
+      return {
+        // The verb is recognized (help advertises `device`).
+        recognized: recognized(devOut) && recognized(driveRegs),
+        // Semantic: the drive register panel is DISTINCT from the C64's (different CPU).
+        drivePanelDistinct: c64Regs !== driveRegs && driveRegs.length > 0,
+        // Semantic: the drive panel names the 1541 drive (the drive-CPU header), which
+        // the C64 panel never does — the tell that r now reads the drive core.
+        namesDrive: /1541|drive 8/i.test(driveRegs) && !/1541|drive 8/i.test(c64Regs),
+      };
+    },
+  },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────

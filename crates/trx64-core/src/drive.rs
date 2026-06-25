@@ -959,6 +959,26 @@ impl Drive1541 {
         self.ram[(addr & 0x07FF) as usize]
     }
 
+    /// Side-effect-free peek of the drive CPU's address space (= the monitor-shell
+    /// `driveProbe.peek` used by `device drive8` r/m/d). Mirrors the drive read map
+    /// (drive.rs:278-302) — RAM $0000-$07FF (mirrored to $7FFF), DOS ROM $8000-$FFFF
+    /// (rom[addr & 0x7FFF]) — but returns 0 for the VIA register windows ($1800-$1BFF
+    /// VIA1, $1C00-$1FFF VIA2) so a peek NEVER clears byte_ready/IFR or dispatches a
+    /// timer alarm (unlike `read`, which is a live bus access). Read-inspect only.
+    #[inline]
+    pub fn drive_peek(&self, addr: u16) -> u8 {
+        match addr {
+            0x0000..=0x7FFF => {
+                if (0x1800..=0x1BFF).contains(&addr) || (0x1C00..=0x1FFF).contains(&addr) {
+                    0 // VIA window: peek is side-effect-free → no register read
+                } else {
+                    self.ram[(addr & 0x07FF) as usize]
+                }
+            }
+            0x8000..=0xFFFF => self.rom[(addr & 0x7FFF) as usize],
+        }
+    }
+
     /// Write a byte of the drive's 2 KB RAM (mirrored every $800). Used to poke
     /// the DOS job queue directly ($00=$80 READ, $06/$07 = track/sector) to drive
     /// a sector read without the full IEC command handshake.
