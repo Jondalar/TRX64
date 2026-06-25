@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use trx64_core::drive::{DiskImage, DiskKind};
-use trx64_core::NullSink;
+use trx64_core::{BusKind, NullSink, Observer};
 use trx64_session::{Session, TraceState};
 use trx64_trace::{FrameSink, TraceChannels, TracingObserver};
 
@@ -296,6 +296,153 @@ fn project_dir() -> PathBuf {
     env::var("C64RE_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("trx64"))
+}
+
+// ── Memory-access tracker (= TS debug/memory-access-map.ts MemoryAccessTracker) ──
+
+/// Per-page classification, mirroring the TS `PageClass` union.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PageClass {
+    Unused,
+    ReadOnly,
+    Dead,
+    Live,
+}
+
+impl PageClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            PageClass::Unused => "unused",
+            PageClass::ReadOnly => "read-only",
+            PageClass::Dead => "dead",
+            PageClass::Live => "live",
+        }
+    }
+}
+
+/// Tracks per-page read/write counts over a run window; classifies into
+/// unused / read-only / dead / live — mirroring `MemoryAccessTracker` in
+/// `src/runtime/headless/debug/memory-access-map.ts`.
+///
+/// Implements `Observer` so it can be passed directly to `run_for_full*`.
+struct MemoryAccessObserver {
+    reads: [u32; 256],
+    writes: [u32; 256],
+    last_write_idx: [i64; 256],
+    read_after_write: [bool; 256],
+    idx: u64,
+}
+
+impl MemoryAccessObserver {
+    fn new() -> Self {
+        MemoryAccessObserver {
+            reads: [0u32; 256],
+            writes: [0u32; 256],
+            last_write_idx: [-1i64; 256],
+            read_after_write: [false; 256],
+            idx: 0,
+        }
+    }
+
+    fn classify(&self, p: usize) -> PageClass {
+        let r = self.reads[p];
+        let w = self.writes[p];
+        if r == 0 && w == 0 {
+            PageClass::Unused
+        } else if w == 0 {
+            PageClass::ReadOnly
+        } else if r == 0 {
+            PageClass::Dead
+        } else if self.read_after_write[p] {
+            PageClass::Live
+        } else {
+            PageClass::Dead
+        }
+    }
+
+    /// Build the TS-shaped `{ tally, regions, cycles, classes, minBytes }` result.
+    /// `want_classes` = filter set; `min_bytes` = minimum region byte span.
+    fn into_result(self, budget: u64, want_classes: &[&str], min_bytes: u64) -> Value {
+        // Build per-page classification.
+        let want_set: std::collections::HashSet<&str> = want_classes.iter().copied().collect();
+
+        // Classify all 256 pages.
+        let classes: Vec<PageClass> = (0..256).map(|p| self.classify(p)).collect();
+
+        // Tally: counts per class across all pages.
+        let mut tally = serde_json::Map::new();
+        for &cls in &classes {
+            let key = cls.as_str();
+            let entry = tally.entry(key.to_string()).or_insert(json!(0));
+            *entry = json!(entry.as_u64().unwrap_or(0) + 1);
+        }
+
+        // Coalesce contiguous same-class page runs → regions (= TS build() method).
+        let mut regions: Vec<Value> = Vec::new();
+        let mut s = 0usize;
+        for p in 1usize..=256 {
+            let same = p < 256 && classes[p] == classes[s];
+            if !same {
+                let run_reads: u64 = (s..p).map(|q| self.reads[q] as u64).sum();
+                let run_writes: u64 = (s..p).map(|q| self.writes[q] as u64).sum();
+                let start_addr = (s as u64) << 8;
+                let end_addr = (((p as u64) - 1) << 8) | 0xff;
+                let cls = classes[s];
+                // Filter: only wanted classes AND region size >= min_bytes.
+                let region_size = end_addr - start_addr + 1;
+                if want_set.contains(cls.as_str()) && region_size >= min_bytes {
+                    regions.push(json!({
+                        "start": start_addr,
+                        "end": end_addr,
+                        "cls": cls.as_str(),
+                        "reads": run_reads,
+                        "writes": run_writes,
+                    }));
+                }
+                s = p;
+            }
+        }
+
+        json!({
+            "tally": tally,
+            "regions": regions,
+            "cycles": budget,
+            "classes": want_classes,
+            "minBytes": min_bytes,
+        })
+    }
+}
+
+impl Observer for MemoryAccessObserver {
+    fn on_instruction(&mut self, _pc: u16, _op: u8, _b1: u8, _b2: u8, _a: u8, _x: u8, _y: u8, _sp: u8, _p: u8, _clk: u64) {}
+    fn on_interrupt(&mut self, _vector: u16, _clk: u64) {}
+
+    /// Record every real bus access — mirror of the TS attach() closure:
+    ///   read  → reads[page]++; if lastWriteIdx[page] >= 0 → readAfterWrite = true
+    ///   write → writes[page]++; lastWriteIdx[page] = idx; readAfterWrite = false
+    /// Fetch + dummy accesses are skipped (only Read and Write are counted, per the
+    /// TS observer which fires on `kind === "read"` / else for every real access).
+    fn on_bus(&mut self, kind: BusKind, addr: u16, _value: u8, _pc: u16, _clk: u64, _old: u8) {
+        let p = (addr >> 8) as usize;
+        let i = self.idx as i64;
+        match kind {
+            BusKind::Read => {
+                self.reads[p] = self.reads[p].saturating_add(1);
+                if self.last_write_idx[p] >= 0 {
+                    self.read_after_write[p] = true;
+                }
+                self.idx += 1;
+            }
+            BusKind::Write => {
+                self.writes[p] = self.writes[p].saturating_add(1);
+                self.last_write_idx[p] = i;
+                self.read_after_write[p] = false; // new write supersedes prior consumption
+                self.idx += 1;
+            }
+            // Fetch and dummy accesses: not counted (TS only hooks real read/write)
+            BusKind::Fetch | BusKind::DummyRead | BusKind::DummyWrite => {}
+        }
+    }
 }
 
 // ── CPU-isolated run + monitor + trace helpers ────────────────────────────────
@@ -3823,8 +3970,39 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
 
         // ── checkpoint/*, recorder/*, vsf/*, trace/read, debug/memory_access_map ─
 
+        // debug/memory_access_map — per-region read/write liveness over a run window.
+        // 1:1 with ws-server.ts:731 + src/runtime/headless/debug/memory-access-map.ts.
+        // Attaches a MemoryAccessObserver (= TS MemoryAccessTracker), runs the
+        // requested cycle budget on the full machine, classifies pages into
+        // unused/read-only/dead/live, coalesces into regions, filters by `classes`
+        // and `min_bytes`, returns the TS-shaped map.
         "debug/memory_access_map" => {
-            Response::err(id, -32001, "NOT_IMPLEMENTED: debug/memory_access_map: deferred")
+            let cyc: u64 = req.params.get("cycles")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(2_000_000);
+            // Default classes = ["dead", "unused"] (= TS wantClasses default).
+            let classes_raw: Vec<String> = req.params.get("classes")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_else(|| vec!["dead".to_string(), "unused".to_string()]);
+            let want_classes: Vec<&str> = classes_raw.iter().map(String::as_str).collect();
+            let min_bytes: u64 = req.params.get("min_bytes")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(256);
+
+            let mut st = state.lock().unwrap();
+            let session = &mut st.session;
+            let full_machine = session.machine.full_assembled
+                && (!session.injected || session.io_injected);
+
+            let mut obs = MemoryAccessObserver::new();
+            if full_machine {
+                session.machine.run_for_full(cyc, &mut obs, |_, _, _, _, _, _, _| {});
+            } else {
+                session.machine.run_for(cyc, &mut obs);
+            }
+            let result = obs.into_result(cyc, &want_classes, min_bytes);
+            Response::ok(id, result)
         }
 
         "trace/read" => {
@@ -6086,13 +6264,43 @@ mod batch1_tests {
     #[test]
     fn deferred_methods_report_not_implemented() {
         let st = make_state();
-        // The vic/inspect/* engine methods AND checkpoint/thumbnails are now
-        // implemented (see checkpoint_thumbnails_render_from_ring_framebuffer). What
-        // remains deferred: the trace/access-map readers.
-        for m in ["trace/read", "debug/memory_access_map"] {
+        // The vic/inspect/* engine methods, checkpoint/thumbnails, and
+        // debug/memory_access_map are now implemented. What remains deferred:
+        // the trace/read binary reader.
+        for m in ["trace/read"] {
             let e = call_err(&st, m, json!({}));
             assert_eq!(e.code, -32001);
             assert!(e.message.contains("NOT_IMPLEMENTED"));
+        }
+    }
+
+    #[test]
+    fn debug_memory_access_map_shape() {
+        // Verify the debug/memory_access_map handler returns the TS-shaped response
+        // (tally / regions / cycles / classes / minBytes) and does not error.
+        // Uses a blank (no-ROM) machine so the run is safe and deterministic.
+        let st = make_state();
+        let r = call(&st, "debug/memory_access_map", json!({
+            "cycles": 10000,
+            "classes": ["unused", "dead", "read-only", "live"],
+            "min_bytes": 1
+        }));
+        assert!(r["tally"].is_object(), "tally must be an object");
+        assert!(r["regions"].is_array(), "regions must be an array");
+        assert_eq!(r["cycles"], json!(10000u64));
+        assert_eq!(r["minBytes"], json!(1u64));
+
+        // Regions must have the required shape fields.
+        for region in r["regions"].as_array().unwrap() {
+            assert!(region["start"].is_u64(), "region.start");
+            assert!(region["end"].is_u64(), "region.end");
+            assert!(region["cls"].is_string(), "region.cls");
+            assert!(region["reads"].is_u64(), "region.reads");
+            assert!(region["writes"].is_u64(), "region.writes");
+            // Verify size >= min_bytes (= 1 here, always satisfied).
+            let start = region["start"].as_u64().unwrap();
+            let end = region["end"].as_u64().unwrap();
+            assert!(end >= start, "region end >= start");
         }
     }
 
