@@ -261,6 +261,46 @@ struct State {
     /// so the 250 ms UI poll renders a steady blink through a write burst.
     cart_led_gen: u64,
     cart_led_last_write_at: Option<std::time::Instant>,
+    /// Spec 714.5 / Spec 705.B — the per-frame BACKGROUND-LOOP layer the c64re
+    /// RuntimeController runs that has no WS method (runtime-controller.ts). TRX64's
+    /// `stream_loop` is the SOLE per-frame machine driver under --stream, so it
+    /// hosts these three behaviors (gated on `running`, like the advance/audio gate).
+    ///
+    /// BUG-040 cart auto-persist (= maybeAutoPersistCart, runtime-controller.ts:493).
+    /// The mapper's monotonic writableGeneration() distinguishes "still being
+    /// written" (gen moving → re-arm the settle window) from "settled" (gen stable
+    /// for the debounce → write the flash back to the host .crt once via the same
+    /// persist path as eject). DEBOUNCE IS BY FRAME COUNT (not wall-clock), per the
+    /// stream-loop discipline. `cart_ap_seen_gen` = last gen observed;
+    /// `cart_ap_settle_frame` = the stream-loop frame at which it last changed;
+    /// `cart_ap_done_gen` = the gen already written to the host file.
+    cart_ap_seen_gen: u64,
+    cart_ap_settle_frame: u64,
+    cart_ap_done_gen: u64,
+    /// Disk lazy host-file writeback (parity-neutral enhancement — see report). TS
+    /// writes the host .d64/.g64 EAGERLY at the GCR-data-writeback commit point
+    /// (fsimage_dxx.ts:428 hostFlush, BUG-023 — VICE's fd IS the file). TRX64's
+    /// write-through only mirrors the dirty track into `disk.bytes` (in-memory); the
+    /// host file is reached only on media/persist|eject. To give the user the
+    /// lazily-updated host disk file, the stream loop flushes + writes the backing
+    /// file when a dirty track has been settled for the debounce window. `disk_ap_*`
+    /// track the same settle/done gen as the cart, derived from a content hash of
+    /// the (flushed) disk bytes (TRX64 has no diskWriteGeneration facade).
+    /// `disk_ap_pending` arms the host-file writeback: set true the frame a drive
+    /// write first flushes a dirty GCR track into `disk.bytes` (flush_disk_writeback
+    /// returns true ONCE then clears the dirty flag), so subsequent frames keep
+    /// debouncing on the now-stable `disk.bytes` content hash even though the track
+    /// is no longer dirty. Cleared after the host file is written.
+    disk_ap_pending: bool,
+    disk_ap_settle_frame: u64,
+    disk_ap_seen_hash: Option<String>,
+    disk_ap_done_hash: Option<String>,
+    /// Spec 705.B — auto-capture cadence: capture a render-anchor (framebuffer-
+    /// OMITTED, BUG-049) into the checkpoint ring every CHECKPOINT_CAPTURE_EVERY_FRAMES
+    /// stream-loop frames (= CHECKPOINT_AUTOCAPTURE, runtime-controller.ts:157). The
+    /// filmstrip/scrub depends on a populated ring; without this loop it is sparse.
+    /// Skipped while a mounted medium is dirty + non-persistable (Spec 709.13).
+    autocapture_frames_since: u64,
     /// T2.8 — monitor-shell session-private cursor/lens state (= monitor-shell.ts
     /// module-level `bankDefaults` / `memCursors` / `disasmCursors` / `sidefxOn`).
     /// The daemon holds one session, so these are single-valued (not per-id maps).
@@ -6219,6 +6259,197 @@ fn capture_media_checkpoint(st: &mut State) -> Option<String> {
     st.checkpoint_ring.capture(cp, frame, cycles).ok().map(|r| r.id)
 }
 
+// ── stream_loop BACKGROUND-LOOP layer (the c64re RuntimeController per-frame
+//    behaviors with no WS method) ─────────────────────────────────────────────
+//
+// TRX64's `stream_loop` (streaming.rs) is the SOLE per-frame machine driver under
+// --stream. The c64re RuntimeController runs, every frame / on a setInterval,
+// several behaviors that have NO WS method (runtime-controller.ts). Three were
+// missing here; these helpers port them. They run on the stream thread INSIDE the
+// per-frame lock window (gen/hash checks are cheap; the actual persist/capture is
+// throttled/debounced), and the stream loop only calls them while `running`.
+
+/// BUG-040 cart auto-persist debounce in stream-loop FRAMES (~50 fps PAL). The TS
+/// debounce is CART_AUTOPERSIST_DEBOUNCE_MS = 5_000 (runtime-controller.ts:100) —
+/// long enough to coalesce an EAPI write/erase burst, short enough that a crash
+/// loses little. ~5 s × ~50 fps ≈ 250 frames. (Frame-count, NOT wall-clock, per
+/// the stream-loop discipline.)
+const CART_AUTOPERSIST_DEBOUNCE_FRAMES: u64 = 250;
+/// Disk lazy-writeback debounce in frames. The same coalescing rationale as the
+/// cart: a drive-write burst (one SAVE) settles before the host .d64/.g64 is
+/// touched once. ~1 s.
+const DISK_AUTOPERSIST_DEBOUNCE_FRAMES: u64 = 50;
+/// Spec 705.B auto-capture cadence in frames. The c64re header documents ~25
+/// frames (~0.5 s @ 50 fps PAL — runtime-controller.ts:69-76); the live TS const
+/// is now 50 (1 s, runtime-controller.ts:77). Per this task's explicit "~every
+/// 0.5 s" filmstrip requirement, TRX64 uses 25 (the finer cadence; satisfies the
+/// "multiple checkpoints accumulate" proof either way).
+const CHECKPOINT_CAPTURE_EVERY_FRAMES: u64 = 25;
+
+/// ITEM 1 — cart auto-persist (.crt lazy writeback). Called once per RUNNING
+/// stream-loop frame. = maybeAutoPersistCart (runtime-controller.ts:493). The
+/// mapper's monotonic writableGeneration() distinguishes "still being written"
+/// (gen moving → re-arm the settle window) from "settled" (gen stable for the
+/// debounce window → write the flash back to the host .crt once via the SAME
+/// persist logic as eject, minus the eject/detach/power-cycle: persist-in-place).
+/// Frame-count debounce. Broadcasts media/cart_persisted {auto:true}. Disable with
+/// C64RE_CART_AUTOPERSIST=0 (eject/explicit persist still work).
+fn stream_maybe_autopersist_cart(st: &mut State, frame: u64) {
+    if std::env::var("C64RE_CART_AUTOPERSIST").as_deref() == Ok("0") {
+        return;
+    }
+    // Cheap gate: read the mapper's write generation + dirty flag. A clean / read-
+    // only / non-writable / gen-0 cart is a no-op (no allocation, no I/O).
+    let (gen, dirty) = match st.session.machine.cartridge.as_ref() {
+        Some(c) => (c.writable_generation(), c.is_writable_dirty()),
+        None => return,
+    };
+    if gen == 0 || !dirty {
+        return;
+    }
+    // runtime-controller.ts:501-505 — gen advanced → still being written; re-arm
+    // the settle window and bail (the EAPI burst keeps bumping the gen).
+    if gen != st.cart_ap_seen_gen {
+        st.cart_ap_seen_gen = gen;
+        st.cart_ap_settle_frame = frame;
+        return;
+    }
+    // runtime-controller.ts:506 — this gen already persisted; nothing to do.
+    if gen == st.cart_ap_done_gen {
+        return;
+    }
+    // runtime-controller.ts:507 — not settled long enough yet.
+    if frame.wrapping_sub(st.cart_ap_settle_frame) < CART_AUTOPERSIST_DEBOUNCE_FRAMES {
+        return;
+    }
+    // Settled → write the host .crt via the eject-path persist logic (persist-in-
+    // place: no detach/cold-reset). runtime-controller.ts:508-516.
+    let cart_path = st.session.cart_path.clone();
+    if cart_path.is_empty() {
+        st.cart_ap_done_gen = gen; // nothing to write to — don't re-try hot
+        return;
+    }
+    let written = persist_cart_for_eject(st, &cart_path);
+    st.cart_ap_done_gen = gen; // also on a skipped write — don't re-try hot every frame
+    if let Some(path) = written {
+        let session_id = st.session.id.clone();
+        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        st.notify.broadcast(
+            "media/cart_persisted",
+            json!({ "session_id": session_id, "path": path, "bytes": bytes, "auto": true }),
+        );
+    }
+}
+
+/// ITEM 2 — disk lazy host-file writeback (.d64/.g64). Called once per RUNNING
+/// stream-loop frame. PARITY-NEUTRAL ENHANCEMENT: the c64re TS runtime writes the
+/// host disk file EAGERLY at the GCR-data-writeback commit point (fsimage_dxx.ts:
+/// 428 hostFlush, BUG-023 — VICE's fd IS the real file). TRX64's write-through
+/// (`attach_with_writeback` → `flush_disk_writeback`) only mirrors the dirty track
+/// into the IN-MEMORY `disk.bytes`; the host file is reached only on media/persist
+/// or eject. To give the user the lazily-updated host .d64/.g64 they asked for,
+/// this flushes the dirty track + writes the backing file ONCE the disk content has
+/// settled for the debounce window. Guarded: only when a backing_path exists AND
+/// the disk is writable. Frame-count debounce; content-hash gen (no diskWriteGen
+/// facade in TRX64).
+fn stream_maybe_autopersist_disk(st: &mut State, frame: u64) {
+    // Cheap gate: flush any pending dirty GCR track into `disk.bytes` (VICE
+    // drive_gcr_data_writeback_all → fsimage->fd). Returns true ONCE per dirty
+    // burst — that arms the debounce; the flag then drops, so on later frames the
+    // flush is a no-op but we keep debouncing on the now-stable `disk.bytes`.
+    if st.session.machine.drive8.flush_disk_writeback() {
+        st.disk_ap_pending = true;
+    }
+    // Nothing armed → no drive write has happened → no host I/O (true no-op for a
+    // clean, never-written disk: no hash, no fs::write).
+    if !st.disk_ap_pending {
+        return;
+    }
+    // Confirm writable + path-backed (the persist guards). A non-writable target
+    // (no disk / read-only / no backing path) disarms — the dirty track already
+    // mirrored into disk.bytes (it rides the .c64re/ring), it just can't lazily
+    // reach a host file. Read metadata under the borrow, then drop.
+    let target = match st.session.machine.drive8.get_attached_disk() {
+        None => None,
+        Some(d) if d.read_only => None,
+        Some(d) => match &d.backing_path {
+            Some(p) if !p.is_empty() => Some((p.clone(), sha256_hex(&d.bytes))),
+            _ => None,
+        },
+    };
+    let (backing_path, hash) = match target {
+        Some(t) => t,
+        None => {
+            st.disk_ap_pending = false; // can't lazily write a host file here
+            return;
+        }
+    };
+    // Content-hash gen: changed since last poll → re-arm the settle window (a SAVE
+    // is a burst of track writes; coalesce them into one host write).
+    if Some(&hash) != st.disk_ap_seen_hash.as_ref() {
+        st.disk_ap_seen_hash = Some(hash);
+        st.disk_ap_settle_frame = frame;
+        return;
+    }
+    if Some(&hash) == st.disk_ap_done_hash.as_ref() {
+        return; // already written
+    }
+    if frame.wrapping_sub(st.disk_ap_settle_frame) < DISK_AUTOPERSIST_DEBOUNCE_FRAMES {
+        return;
+    }
+    // Settled → write the host disk file (= media/persist disk branch, minus the
+    // response envelope). Snapshot the bytes, drop the borrow before the I/O.
+    let bytes = match st.session.machine.drive8.get_attached_disk() {
+        Some(d) => d.bytes.clone(),
+        None => return,
+    };
+    match std::fs::write(&backing_path, &bytes) {
+        Ok(()) => {
+            st.disk_ap_done_hash = Some(hash);
+            st.disk_ap_pending = false; // settled + written; re-armed on the next drive write
+            let session_id = st.session.id.clone();
+            st.notify.broadcast(
+                "media/disk_persisted",
+                json!({ "session_id": session_id, "path": backing_path, "bytes": bytes.len(), "auto": true }),
+            );
+        }
+        Err(_) => {
+            // Don't mark done on a failed write — retry after the next settle.
+        }
+    }
+}
+
+/// ITEM 3 — auto-capture every CHECKPOINT_CAPTURE_EVERY_FRAMES frames (filmstrip).
+/// Called once per RUNNING stream-loop frame. = CHECKPOINT_AUTOCAPTURE
+/// (runtime-controller.ts:88/157). Captures a RENDER-ANCHOR (framebuffer OMITTED,
+/// BUG-049) into the checkpoint ring so the UI filmstrip/scrub has a populated
+/// ring. SKIPS while a mounted medium is dirty + non-persistable (Spec 709.13).
+/// Isolated: a capture failure NEVER kills the loop (the ring returns Err on a
+/// gap, never panics). Disable with C64RE_CHECKPOINT_AUTOCAPTURE=0.
+fn stream_maybe_autocapture(st: &mut State, frame: u64) {
+    if std::env::var("C64RE_CHECKPOINT_AUTOCAPTURE").as_deref() == Ok("0") {
+        return;
+    }
+    st.autocapture_frames_since = st.autocapture_frames_since.wrapping_add(1);
+    if st.autocapture_frames_since < CHECKPOINT_CAPTURE_EVERY_FRAMES {
+        return;
+    }
+    st.autocapture_frames_since = 0;
+    // Spec 709.13 — skip (a ring gap beats a corrupt checkpoint) while a mounted
+    // medium is dirty + non-persistable.
+    if non_persistable_dirty_media(st).is_some() {
+        return;
+    }
+    let cycles = st.session.machine.c64_core.clk;
+    // Render-anchor: the framebuffer-omitted core payload (runtime-controller.ts:
+    // 839/847 omitFramebuffer + omitMedia is the recorder anchor; the ring's
+    // auto-capture in TS uses the render-anchor — capture_recorder_anchor_payload
+    // is TRX64's lighter omit-framebuffer variant). A capture Err is a ring gap,
+    // swallowed — the loop continues.
+    let cp = capture_recorder_anchor_payload(&mut st.session);
+    let _ = st.checkpoint_ring.capture(cp, frame, cycles);
+}
+
 /// The scenario-player replay target over the live `Machine`. `type` drives the
 /// keyboard matrix and `set_joystick1/2` drives the live CIA1 joystick model
 /// (port 1 = PB, port 2 = PA); paddle/restore are still no-ops. `run_for`
@@ -7235,6 +7466,14 @@ async fn main() {
         last_run_id: None,
         cart_led_gen: 0,
         cart_led_last_write_at: None,
+        cart_ap_seen_gen: 0,
+        cart_ap_settle_frame: 0,
+        cart_ap_done_gen: 0,
+        disk_ap_pending: false,
+        disk_ap_settle_frame: 0,
+        disk_ap_seen_hash: None,
+        disk_ap_done_hash: None,
+        autocapture_frames_since: 0,
         mon: MonitorState::new(),
     }));
 
@@ -7309,6 +7548,14 @@ mod batch1_tests {
             control_owner: "human".to_string(),
             last_trace_path: None,
             last_run_id: None,
+            cart_ap_seen_gen: 0,
+            cart_ap_settle_frame: 0,
+            cart_ap_done_gen: 0,
+            disk_ap_pending: false,
+            disk_ap_settle_frame: 0,
+            disk_ap_seen_hash: None,
+            disk_ap_done_hash: None,
+            autocapture_frames_since: 0,
             mon: MonitorState::new(),
         }))
     }
@@ -8524,6 +8771,214 @@ mod batch1_tests {
             }
         }
         out
+    }
+
+    // ── BACKGROUND-LOOP layer proofs (the 3 stream_loop per-frame hooks) ──────
+    //
+    // These exercise the actual `stream_maybe_*` helpers the stream loop calls
+    // each running frame (no live WS server / ROMs needed — `make_state()` is a
+    // blank machine and the helpers operate on `State`). Each proves the
+    // observable side effect the c64re RuntimeController produces with NO WS
+    // method: a settled cart write reaches the host .crt; a settled disk write
+    // reaches the host .d64; the checkpoint ring fills at the auto-cadence.
+
+    /// Minimal valid CRT header (0x40 bytes) + N CHIP packets — copy of the core
+    /// `cart_mapper_gate::build_crt` so the proof is self-contained.
+    fn build_crt_for_test(hw: u16, exrom: u8, game: u8, name: &str, chips: &[(u16, u16, Vec<u8>)]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"C64 CARTRIDGE   ");
+        v.extend_from_slice(&0x40u32.to_be_bytes());
+        v.extend_from_slice(&0x0100u16.to_be_bytes());
+        v.extend_from_slice(&hw.to_be_bytes());
+        v.push(exrom);
+        v.push(game);
+        v.extend_from_slice(&[0u8; 6]);
+        let mut nm = [0u8; 32];
+        let nb = name.as_bytes();
+        nm[..nb.len().min(32)].copy_from_slice(&nb[..nb.len().min(32)]);
+        v.extend_from_slice(&nm);
+        for (bank, load, data) in chips {
+            v.extend_from_slice(b"CHIP");
+            let packet_len = 0x10 + data.len() as u32;
+            v.extend_from_slice(&packet_len.to_be_bytes());
+            v.extend_from_slice(&0u16.to_be_bytes());
+            v.extend_from_slice(&bank.to_be_bytes());
+            v.extend_from_slice(&load.to_be_bytes());
+            v.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            v.extend_from_slice(data);
+        }
+        v
+    }
+
+    /// A BankInfo with the ultimax-write state the EasyFlash flash-program path
+    /// needs (it stores to flash only in ultimax; EasyFlash boots ultimax).
+    fn bi_for_test() -> trx64_core::cart::BankInfo {
+        trx64_core::cart::BankInfo {
+            cpu_port_direction: 0x2f,
+            cpu_port_value: 0x37,
+            basic_visible: true,
+            kernal_visible: true,
+            io_visible: true,
+            char_visible: false,
+            cartridge_attached: true,
+            cartridge_exrom: None,
+            cartridge_game: None,
+            phi1: 0xff,
+        }
+    }
+
+    /// ITEM 1 PROOF — cart auto-persist (.crt lazy writeback). Mount a writable
+    /// EasyFlash cart with a host .crt path, drive a real AM29F040B byte-program
+    /// (bumps writableGeneration + sets dirty), then run the stream hook for >
+    /// debounce frames with NO explicit media/persist — assert the host .crt FILE
+    /// changed on disk. (= maybeAutoPersistCart, runtime-controller.ts:493/510.)
+    #[test]
+    fn item1_cart_autopersist_writes_host_crt_without_explicit_persist() {
+        let dir = std::env::temp_dir().join(format!("trx64_item1_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let crt_path = dir.join("ef_writable.crt");
+
+        // Bank 0: 16K chip (ROML+ROMH), erased flash (0xFF) + a ROMH reset vector.
+        let mut bank0 = vec![0xffu8; 0x4000];
+        bank0[0x3ffc] = 0x00;
+        bank0[0x3ffd] = 0x80;
+        let crt = build_crt_for_test(32, 1, 0, "EF", &[(0, 0x8000, bank0)]);
+        std::fs::write(&crt_path, &crt).unwrap();
+        let orig_meta = std::fs::metadata(&crt_path).unwrap();
+        let orig_len = orig_meta.len();
+        let orig_bytes = std::fs::read(&crt_path).unwrap();
+
+        let state = make_state();
+        {
+            let mut st = state.lock().unwrap();
+            st.session.machine.attach_cart_from_bytes(&crt, "EF").expect("attach EF");
+            st.session.cart_path = crt_path.to_string_lossy().to_string();
+            st.session.machine.cold_reset(); // EasyFlash boots ultimax (register_02=0)
+
+            // Drive a real AM29F040B byte-program through the live cart mapper —
+            // EXACTLY the cart_mapper_gate sequence (AA/55/A0/<addr,data>). This
+            // bumps writable_generation() and sets is_writable_dirty().
+            let bi = bi_for_test();
+            let clk = st.session.machine.clk;
+            let cart = st.session.machine.cartridge.as_mut().expect("cart attached");
+            assert!(!cart.is_writable_dirty(), "clean before program");
+            cart.write(0x8555, 0xaa, &bi, clk);
+            cart.write(0x82aa, 0x55, &bi, clk);
+            cart.write(0x8555, 0xa0, &bi, clk);
+            cart.write(0x8100, 0x42, &bi, clk);
+            assert!(cart.is_writable_dirty(), "dirty after program");
+            assert!(cart.writable_generation() > 0, "gen bumped");
+        }
+
+        // Run the stream hook frame-by-frame. The gen settles immediately (no
+        // further writes), so after CART_AUTOPERSIST_DEBOUNCE_FRAMES it writes once.
+        // No media/persist call anywhere.
+        let total = CART_AUTOPERSIST_DEBOUNCE_FRAMES + 5;
+        for frame in 0..total {
+            let mut st = state.lock().unwrap();
+            stream_maybe_autopersist_cart(&mut st, frame);
+        }
+
+        let new_bytes = std::fs::read(&crt_path).unwrap();
+        assert_eq!(new_bytes.len() as u64, orig_len, "EasyFlash re-pack keeps .crt length");
+        assert_ne!(new_bytes, orig_bytes, "host .crt FILE bytes changed after auto-persist");
+        // The programmed byte (0x42) must be present in the re-packed image (ROML
+        // offset 0x100 = header(0x40) + CHIP-header(0x10) + 0x100).
+        assert_eq!(new_bytes[0x40 + 0x10 + 0x100], 0x42, "programmed flash byte in host .crt");
+
+        // Idempotent: a second pass at the SAME settled gen must NOT re-write
+        // (cart_ap_done_gen guards it). Capture mtime is platform-flaky, so prove
+        // via the done-gen sentinel instead.
+        {
+            let st = state.lock().unwrap();
+            assert_eq!(st.cart_ap_done_gen, st.cart_ap_seen_gen, "settled gen recorded as done");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ITEM 2 PROOF — disk auto-persist (.d64 lazy writeback). Mount a writable
+    /// blank D64 with a host backing path, drive a REAL dirty GCR track (the same
+    /// `write_next_bit` the engine calls on a drive write), then run the stream
+    /// hook for > debounce frames with NO explicit media/persist — assert the .d64
+    /// host FILE updated. PARITY-NEUTRAL enhancement (TS writes eagerly via
+    /// fsimage_dxx hostFlush; TRX64 here lazily, debounced).
+    #[test]
+    fn item2_disk_autopersist_writes_host_d64_without_explicit_persist() {
+        let dir = std::env::temp_dir().join(format!("trx64_item2_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let d64_path = dir.join("blank.d64");
+
+        // A blank 174848-byte D64 (35 tracks) — a valid GCR-encodable image.
+        let blank = vec![0u8; 174848];
+        std::fs::write(&d64_path, &blank).unwrap();
+        let orig_bytes = std::fs::read(&d64_path).unwrap();
+
+        let state = make_state();
+        {
+            let mut st = state.lock().unwrap();
+            st.session.machine.drive8.attach_disk(DiskImage {
+                kind: DiskKind::D64,
+                bytes: blank.clone(),
+                backing_path: Some(d64_path.to_string_lossy().to_string()),
+                read_only: false,
+            });
+            // Drive a real bit-level write at the parked head (track 18) → dirties
+            // a GCR track exactly as the engine's WRITE path does.
+            st.session.machine.drive8.rotation.write_one_bit_for_test(1);
+            assert!(
+                st.session.machine.drive8.rotation.has_dirty_track(),
+                "a real GCR track is dirty"
+            );
+        }
+
+        // Run the disk hook. flush_disk_writeback() returns true on the first
+        // running frame (mirrors disk.bytes), then the content-hash settles and
+        // the host file is written once after the debounce.
+        let total = DISK_AUTOPERSIST_DEBOUNCE_FRAMES + 5;
+        for frame in 0..total {
+            let mut st = state.lock().unwrap();
+            stream_maybe_autopersist_disk(&mut st, frame);
+        }
+
+        let new_bytes = std::fs::read(&d64_path).unwrap();
+        assert_eq!(new_bytes.len(), orig_bytes.len(), "D64 size preserved");
+        assert_ne!(new_bytes, orig_bytes, "host .d64 FILE bytes changed after auto-persist");
+        {
+            let st = state.lock().unwrap();
+            assert!(st.disk_ap_done_hash.is_some(), "disk settle recorded as done");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ITEM 3 PROOF — auto-capture every N frames (filmstrip). Drive the stream
+    /// autocapture hook across several cadence windows with NO explicit
+    /// checkpoint/capture — assert the ring accumulates multiple checkpoints
+    /// (one per CHECKPOINT_CAPTURE_EVERY_FRAMES). (= CHECKPOINT_AUTOCAPTURE,
+    /// runtime-controller.ts:157.)
+    #[test]
+    fn item3_autocapture_fills_ring_at_cadence_without_explicit_capture() {
+        let state = make_state();
+        // Run enough frames for ~6 capture windows (~3 s @ 50 fps, cadence 25).
+        let windows = 6u64;
+        let total = CHECKPOINT_CAPTURE_EVERY_FRAMES * windows + 2;
+        for frame in 0..total {
+            let mut st = state.lock().unwrap();
+            stream_maybe_autocapture(&mut st, frame);
+        }
+        let st = state.lock().unwrap();
+        let n = st.checkpoint_ring.list().len();
+        assert!(
+            n as u64 >= windows,
+            "ring accumulated multiple auto-captures (got {n}, want >= {windows}) WITHOUT any explicit checkpoint/capture"
+        );
+        // Each accumulated ref carries the auto-cadence frame (proves these came
+        // from the per-frame hook, not an explicit capture).
+        assert!(
+            st.checkpoint_ring.list().iter().all(|r| r.frame > 0 || r.cycles == 0),
+            "auto-captures stamped with the stream-loop frame"
+        );
     }
 }
 

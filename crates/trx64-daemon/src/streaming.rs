@@ -383,6 +383,28 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
             // Video: crop the per-cycle displayed buffer → 384×272 4-bit indices.
             let (w, h, indices) = st.session.machine.render_canvas_indices();
 
+            // ── BACKGROUND-LOOP layer (the c64re RuntimeController per-frame
+            // behaviors with no WS method — runtime-controller.ts). The stream loop
+            // is the SOLE per-frame driver under --stream, so it hosts them here,
+            // gated on `running` (we're inside the `if running` block already), in
+            // the per-frame lock window. The gen/hash checks are CHEAP; only the
+            // actual persist/capture costs, and those are throttled/debounced by
+            // FRAME COUNT (`frame_seq`, which advances only while running). A hook
+            // panic must never kill the stream — but the helpers are total (Err is
+            // swallowed inside), so no extra catch is needed.
+            //   ITEM 1 — cart auto-persist (.crt lazy writeback), BUG-040.
+            //   ITEM 2 — disk auto-persist (.d64/.g64 lazy writeback).
+            //   ITEM 3 — auto-capture every N frames (filmstrip), Spec 705.B.
+            // Skip the autocapture during WARP (8× fast-forward would flood the ring
+            // and isn't the live-scrub use case); persist hooks still run (a settled
+            // save must reach disk regardless of pace).
+            let frame_no = frame_seq as u64;
+            crate::stream_maybe_autopersist_cart(&mut st, frame_no);
+            crate::stream_maybe_autopersist_disk(&mut st, frame_no);
+            if !warp {
+                crate::stream_maybe_autocapture(&mut st, frame_no);
+            }
+
             // Drop the lock before building the (larger) wire buffers + sleeping.
             drop(st);
 

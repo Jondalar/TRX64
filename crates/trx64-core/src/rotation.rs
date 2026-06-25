@@ -1114,6 +1114,19 @@ impl Rotation {
         self.gcr_dirty_track != 0
     }
 
+    /// Drive one bit-level write at the current head exactly as the rotation
+    /// engine's WRITE path does (`write_next_bit`). This is the SAME call the
+    /// engine makes internally on a drive write (rotation.rs:670/855); it is
+    /// exposed only so a cross-crate integration test (the daemon's disk
+    /// auto-persist proof) can produce a REAL dirty GCR track without booting the
+    /// drive CPU + a full SAVE. Never called in product code (the engine has its
+    /// own internal caller). Marked `#[doc(hidden)]` to keep it off the public API
+    /// surface docs.
+    #[doc(hidden)]
+    pub fn write_one_bit_for_test(&mut self, value: u8) {
+        self.write_next_bit(value);
+    }
+
     /// VIA2 PRA pin input = the current `GCR_read` byte (via2d read_pra). The
     /// caller advances the model via [`byte_read`] first, then samples this.
     #[inline]
