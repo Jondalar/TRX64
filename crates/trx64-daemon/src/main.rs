@@ -231,11 +231,6 @@ struct State {
     /// reports sid.streaming truthfully (live audio = streaming_enabled && running),
     /// mirroring TS `audioStreams.has(session_id)`. Was hardcoded false → SID light OFF.
     streaming_enabled: bool,
-    /// T1.5 — track whether we have already served a session/create call. The first
-    /// call returns attached=false (building a new session); subsequent calls return
-    /// attached=true (attaching to the existing machine). Mirrors c64re one-machine-
-    /// per-process semantics (runtimeSessions.start checks listIntegratedSessions[0]).
-    session_created: bool,
     /// T1.3 — current pacing mode (RuntimeController.pacing.mode). One of "pal",
     /// "warp", "fixed-ratio". Stored here because TRX64 has no autonomous pacing
     /// loop; session/set_pacing sets it and debug/state reads it back exactly as the
@@ -1880,9 +1875,12 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         }
 
         "session/create" => {
-            let mut st = state.lock().unwrap();
-            let attached = st.session_created;
-            st.session_created = true;
+            let st = state.lock().unwrap();
+            // Spec 744 shared-attach: the singleton machine is constructed at daemon
+            // boot, so session/create ALWAYS attaches to the existing machine (mirrors
+            // TS runtimeSessions.start → attached=true when a machine is present). The
+            // boot-time construct is the only attached=false; clients never observe it.
+            let attached = true;
             let cpu = &st.session.machine.cpu;
             let pc = cpu.pc as u64;
             let c64_cycles = st.session.machine.clk;
@@ -5957,9 +5955,7 @@ async fn main() {
         media_events: Vec::new(),
         batches: std::collections::HashMap::new(),
         notify: streaming::NotifyHub::new(),
-        streaming_enabled: streaming_on,
-        session_created: false,
-        pacing_mode: "pal".to_string(),
+        streaming_enabled: streaming_on,        pacing_mode: "pal".to_string(),
         pacing_ratio: 1.0,
         control_owner: "human".to_string(),
         last_trace_path: None,
@@ -6031,9 +6027,7 @@ mod batch1_tests {
             media_events: Vec::new(),
             batches: std::collections::HashMap::new(),
             notify: streaming::NotifyHub::new(),
-            streaming_enabled: false,
-            session_created: false,
-            pacing_mode: "pal".to_string(),
+            streaming_enabled: false,            pacing_mode: "pal".to_string(),
             pacing_ratio: 1.0,
             control_owner: "human".to_string(),
             last_trace_path: None,
