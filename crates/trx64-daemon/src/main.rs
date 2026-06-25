@@ -231,6 +231,11 @@ struct State {
     /// reports sid.streaming truthfully (live audio = streaming_enabled && running),
     /// mirroring TS `audioStreams.has(session_id)`. Was hardcoded false → SID light OFF.
     streaming_enabled: bool,
+    /// T1.5 — track whether we have already served a session/create call. The first
+    /// call returns attached=false (building a new session); subsequent calls return
+    /// attached=true (attaching to the existing machine). Mirrors c64re one-machine-
+    /// per-process semantics (runtimeSessions.start checks listIntegratedSessions[0]).
+    session_created: bool,
 }
 
 /// Spec 271 — one in-process batch (= c64re `BatchEntry`). Results are stored as a
@@ -1613,7 +1618,9 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         }
 
         "session/create" => {
-            let st = state.lock().unwrap();
+            let mut st = state.lock().unwrap();
+            let attached = st.session_created;
+            st.session_created = true;
             let cpu = &st.session.machine.cpu;
             let pc = cpu.pc as u64;
             let c64_cycles = st.session.machine.clk;
@@ -1622,7 +1629,7 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 "sessionId": "integrated-1",
                 "mode": "true-drive",
                 "diskPath": disk_path,
-                "attached": true,
+                "attached": attached,
                 "c64Cycles": c64_cycles,
                 "pc": pc,
                 "trace": null
@@ -5290,6 +5297,7 @@ async fn main() {
         batches: std::collections::HashMap::new(),
         notify: streaming::NotifyHub::new(),
         streaming_enabled: streaming_on,
+        session_created: false,
     }));
 
     // The singleton live A/V stream hub (ADR-073): one pacing loop drives the
@@ -5356,6 +5364,7 @@ mod batch1_tests {
             batches: std::collections::HashMap::new(),
             notify: streaming::NotifyHub::new(),
             streaming_enabled: false,
+            session_created: false,
         }))
     }
 
