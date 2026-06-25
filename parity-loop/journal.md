@@ -28,3 +28,10 @@ T3.1 vic-inspect-engine (was already ported; matrix stale), T3.2 time-travel
 (overlay_run + snapshot_tree + promote_branch). Integrate-gate: full no-disk oracle
 GREEN 24/0, release build clean, monitor verbs verified live (d/m/r/bk/bank/help).
 loop_status=DONE. Only deferred: T3.5 trace/read (DuckDB query layer, Phase-2 by design).
+
+## 2026-06-25 — UX self-test + step-past fix
+User hit "dauerpause": root = a stray `bk $E5CD` I left from the T2.8 monitor verb probe
+(PC idles on $E5CD → re-trips every run). del fixed it. Found + fixed a real parity gap:
+debug/run did step-past-current-bp only for continue; TS run() does it always (PC-based).
+Now both. UX verified live: run/pause(freeze)/reset(clean)/audio(SID ON)/monitor verbs
+(d/m/r/bk/bank/help) all good.
