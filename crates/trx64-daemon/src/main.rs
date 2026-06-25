@@ -4116,6 +4116,46 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 Err(e) => return Response::err(id, -32602, format!("media/mount: file read {path_str}: {e}")),
             };
 
+            // Route by extension, mirroring TS adaptMount (ws-server.ts:1757): the
+            // Inspector CART dropdown mounts a .crt through media/mount (slot 0). The old
+            // handler ignored the extension and ALWAYS attached as a d64 disk on drive8,
+            // so a CRT could never be inserted. .c64re is a snapshot, not media.
+            let lower = path_str.to_lowercase();
+            if lower.ends_with(".c64re") {
+                return Response::err(id, -32602, "media/mount: .c64re is a runtime snapshot, not media — use snapshot/undump (Spec 707).");
+            }
+            if lower.ends_with(".crt") {
+                // Spec 709.12 — CRT insert = attach cart → power-cycle → resume (so the
+                // cart executes). Same primitives as media/ingress kind:crt.
+                let crt_name = path_str.split('/').last().unwrap_or("cartridge.crt").to_string();
+                let sha = sha256_hex(&bytes);
+                let mut st = state.lock().unwrap();
+                let mapper_type = match st.session.machine.attach_cart_from_bytes(&bytes, &crt_name) {
+                    Ok((_n, t)) => t,
+                    Err(e) => return Response::err(id, -32602, format!("media/mount: bad CRT: {e}")),
+                };
+                let mt = mapper_type_str(mapper_type).to_string();
+                st.session.cart_path = path_str.clone();
+                st.session.machine.fill_power_on_ram();
+                st.session.machine.cold_reset();
+                let cycle = st.session.machine.clk;
+                st.session.running = true;
+                st.ctrl_stop = None;
+                st.notify.broadcast("debug/running", json!({ "session_id": st.session.id, "pacing": { "mode": "pal", "ratio": 1 } }));
+                let event = json!({
+                    "cycle": cycle, "operation": "crt", "role": Value::Null, "format": "crt",
+                    "sha256": sha.clone(), "resetPolicy": "power-cycle",
+                    "checkpointBeforeId": Value::Null, "checkpointAfterId": Value::Null,
+                });
+                push_media_event(&mut st, event.clone());
+                return Response::ok(id, json!({
+                    "mountedPath": path_str, "type": "crt", "mapperType": mt.clone(), "sha256": sha,
+                    "event": event,
+                    "detail": { "name": crt_name, "backingPath": path_str, "mapperType": mt, "resetPolicy": "power-cycle" },
+                    "paused": false,
+                }));
+            }
+
             let disk_name = path_str.split('/').last().unwrap_or("disk").to_string();
             let format_str = if disk_name.to_lowercase().ends_with(".g64")
                 || (bytes.len() >= 8 && &bytes[..8] == b"GCR-1541")
