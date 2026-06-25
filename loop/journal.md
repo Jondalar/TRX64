@@ -787,3 +787,9 @@ Cross-runtime e2e: WS-surface 11/11, snapshot round-trip 2/2 live, corpus reach-
 game gate = broad authority). oracle.ts untouched (additive harness). byte-exact green. TRX64 is FEATURE-
 COMPLETE vs c64re TS headless: verbatim cores + cartridge(r+flash-w) + drive-write + reSID + full WS surface +
 .c64re 100% cross-runtime + observability + A/V tap. 55 items, ~8-10x faster.
+
+## 2026-06-25 — LOOP COMPLETE: feature-complete reached, cron 501ae922 cancelled
+
+The autonomous build-loop ("port c64re TS headless -> Rust, durchziehen bis feature-complete") reached its
+goal. 55 items, 328+ commits. Driver stopped the recurring cron (501ae922) since the queue is empty and the
+feature-complete bar (ADR-087) is met. Restart with /loop if optional beyond-parity extras are wanted later.
