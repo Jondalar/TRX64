@@ -227,6 +227,10 @@ struct State {
     /// hub fans a `{jsonrpc,method,params}` notification (no id) to all. Always
     /// present (unlike the `--stream`-gated A/V `StreamHub`).
     notify: Arc<streaming::NotifyHub>,
+    /// Spec 771.2 (T1.1) — whether the --stream A/V hub is enabled, so session/state
+    /// reports sid.streaming truthfully (live audio = streaming_enabled && running),
+    /// mirroring TS `audioStreams.has(session_id)`. Was hardcoded false → SID light OFF.
+    streaming_enabled: bool,
 }
 
 /// Spec 271 — one in-process batch (= c64re `BatchEntry`). Results are stored as a
@@ -1666,6 +1670,8 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             // Mirrors session/state in ws-server.ts (runState/stopReason/controlOwner).
             let run_state = if st.session.running { "running" } else { "paused" };
             let stop_reason = st.ctrl_stop.as_ref().map(|s| s.reason);
+            // Spec 771.2 (T1.1) — live audio is streaming when the hub is on AND running.
+            let streaming = st.streaming_enabled && st.session.running;
             let machine = &st.session.machine;
             let cpu = &machine.cpu;
             let v = |off: u8| machine.vic.read_reg(off);
@@ -1715,7 +1721,7 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                     "cinv": rd16(0x0314),
                     "cbinv": rd16(0x0318)
                 },
-                "sid": { "regs": sid_regs, "streaming": false }
+                "sid": { "regs": sid_regs, "streaming": streaming }
             });
             // TS session/state (ws-server.ts:531) emits stopReason ONLY when set
             // (stopInfo?.reason → undefined omits the key) and has NO controlOwner.
@@ -5261,6 +5267,8 @@ async fn main() {
         }
     }
 
+    let streaming_on =
+        cli.stream || matches!(env::var("TRX64_STREAM").ok().as_deref(), Some("1") | Some("true"));
     let state: SharedState = Arc::new(Mutex::new(State {
         session,
         breakpoints: Breakpoints::new(),
@@ -5280,14 +5288,13 @@ async fn main() {
         media_events: Vec::new(),
         batches: std::collections::HashMap::new(),
         notify: streaming::NotifyHub::new(),
+        streaming_enabled: streaming_on,
     }));
 
     // The singleton live A/V stream hub (ADR-073): one pacing loop drives the
     // singleton machine and broadcasts BIN_VIC/BIN_AUDIO to all connected clients.
     // Only created when --stream (or TRX64_STREAM=1) is set; otherwise None, so a
     // connecting client never triggers an auto-run (byte-exact oracle stays clean).
-    let streaming_on =
-        cli.stream || matches!(env::var("TRX64_STREAM").ok().as_deref(), Some("1") | Some("true"));
     let hub: Option<Arc<streaming::StreamHub>> = if streaming_on {
         eprintln!("[trx64] live A/V push ENABLED (--stream): clients are auto-subscribed at ~50fps");
         Some(streaming::StreamHub::new(Arc::clone(&state)))
@@ -5347,6 +5354,7 @@ mod batch1_tests {
             media_events: Vec::new(),
             batches: std::collections::HashMap::new(),
             notify: streaming::NotifyHub::new(),
+            streaming_enabled: false,
         }))
     }
 
