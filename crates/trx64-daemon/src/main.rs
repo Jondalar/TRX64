@@ -2617,15 +2617,52 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
 
             let mut st = state.lock().unwrap();
             st.session.machine.poke(load_addr, body);
-            // Set PC to run address (or load address if not specified)
-            let pc = run_addr.unwrap_or(load_addr as u64) as u16;
-            st.session.machine.cpu6510.reg_pc = pc;
-            st.session.machine.sync_after_monitor();
-            st.session.injected = true;
+
+            // Mirror TS ingress.ts loadPrgBytes: when loaded at the standard BASIC
+            // start ($0801), set VARTAB ($2D/$2E) = byte after the program so that
+            // a subsequent RUN can find the end of the BASIC program. This matches:
+            //   if (loadAddress === 0x0801) { ram[0x2d] = endAddress & 0xff;
+            //                                 ram[0x2e] = (endAddress >> 8) & 0xff; }
+            if load_addr == 0x0801 {
+                let end_addr = (load_addr as usize + body.len()) & 0xffff;
+                let vartab = [(end_addr & 0xff) as u8, ((end_addr >> 8) & 0xff) as u8];
+                st.session.machine.poke(0x002d, &vartab);
+            }
+
+            // Mirror TS ws-server.ts runtime/run_prg autostart logic (line 782-788):
+            //   if entry != undefined        → pause; set PC = entry; continue
+            //   else if loadAddress == $0801 → ctrl.continue(); s.typeText("RUN\r")
+            //   else                         → pause; set PC = loadAddress; continue
+            let action: String;
+            if let Some(entry) = run_addr {
+                // Explicit entry point: set PC and resume (mirrors TS pause→setPC→continue).
+                let pc = (entry & 0xffff) as u16;
+                st.session.machine.cpu6510.reg_pc = pc;
+                st.session.machine.sync_after_monitor();
+                st.session.injected = true;
+                st.session.running = true;
+                action = format!("g ${:04x}", pc);
+            } else if load_addr == 0x0801 {
+                // BASIC program: resume the machine then type "RUN\r" so BASIC executes.
+                // Mirrors: ctrl.continue(); s.typeText("RUN\r"); action = "BASIC RUN"
+                st.session.running = true;
+                st.session.injected = true;
+                let now = st.session.machine.cpu6510.clk;
+                st.session.machine.keyboard.type_text(now, "RUN\r", 80_000, 80_000);
+                action = "BASIC RUN".to_string();
+            } else {
+                // Machine-code at non-BASIC load address: set PC to load address and resume.
+                // Mirrors: pause; set PC = loadAddress; continue; action = "g $XXXX (default = load address)"
+                st.session.machine.cpu6510.reg_pc = load_addr;
+                st.session.machine.sync_after_monitor();
+                st.session.injected = true;
+                st.session.running = true;
+                action = format!("g ${:04x} (default = load address)", load_addr);
+            }
 
             Response::ok(id, json!({
                 "loadAddress": load_addr as u64,
-                "action": "loaded"
+                "action": action
             }))
         }
 
