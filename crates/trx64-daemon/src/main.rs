@@ -245,6 +245,12 @@ struct State {
     /// defaults to 1.0 (1× PAL speed). Mirrored from TS: `if (ratio && ratio > 0)
     /// this.pacing.ratio = ratio` (runtime-controller.ts:331).
     pacing_ratio: f64,
+    /// T1.2 — who is currently driving the shared session: "human" (UI) or "llm"
+    /// (MCP / agent). Default "human". Mirrors RuntimeController.controlOwner
+    /// (runtime-controller.ts:189). Sticky; set when a side issues a control op
+    /// (run/pause/continue/step). broadcast `debug/control` on change only (Spec 767
+    /// setControlOwner, runtime-controller.ts:338). Signal only; never gates access.
+    control_owner: String,
 }
 
 /// Spec 271 — one in-process batch (= c64re `BatchEntry`). Results are stored as a
@@ -576,7 +582,8 @@ fn run_debug_control(id: Value, st: &mut State, frame: u64, is_continue: bool) -
         let bps = st.breakpoints.list_vice_json();
         let pc = st.session.machine.c64_core.reg_pc as u64;
         let cycles = st.session.machine.clk;
-        let (pacing_mode, pacing_ratio) = (st.pacing_mode.clone(), st.pacing_ratio);
+        let (pacing_mode, pacing_ratio, control_owner) =
+            (st.pacing_mode.clone(), st.pacing_ratio, st.control_owner.clone());
         return Response::ok(id, json!({
             "runState": "running",
             "pacing": { "mode": pacing_mode, "ratio": pacing_ratio },
@@ -585,7 +592,7 @@ fn run_debug_control(id: Value, st: &mut State, frame: u64, is_continue: bool) -
             "frame": frame,
             "breakpoints": bps,
             "stop": null,
-            "controlOwner": "llm"
+            "controlOwner": control_owner
         }));
     }
 
@@ -663,7 +670,8 @@ fn run_debug_control(id: Value, st: &mut State, frame: u64, is_continue: bool) -
             "stop": stop.clone(),
             "registers": registers,
         }));
-        let (pacing_mode, pacing_ratio) = (st.pacing_mode.clone(), st.pacing_ratio);
+        let (pacing_mode, pacing_ratio, control_owner) =
+            (st.pacing_mode.clone(), st.pacing_ratio, st.control_owner.clone());
         Response::ok(id, json!({
             "runState": "paused",
             "pacing": { "mode": pacing_mode, "ratio": pacing_ratio },
@@ -672,12 +680,13 @@ fn run_debug_control(id: Value, st: &mut State, frame: u64, is_continue: bool) -
             "frame": frame,
             "breakpoints": bps,
             "stop": stop,
-            "controlOwner": "llm"
+            "controlOwner": control_owner
         }))
     } else {
         // Budget exhausted without a hit: the machine advanced; report running.
         let pc = st.session.machine.c64_core.reg_pc as u64;
-        let (pacing_mode, pacing_ratio) = (st.pacing_mode.clone(), st.pacing_ratio);
+        let (pacing_mode, pacing_ratio, control_owner) =
+            (st.pacing_mode.clone(), st.pacing_ratio, st.control_owner.clone());
         Response::ok(id, json!({
             "runState": "running",
             "pacing": { "mode": pacing_mode, "ratio": pacing_ratio },
@@ -686,7 +695,7 @@ fn run_debug_control(id: Value, st: &mut State, frame: u64, is_continue: bool) -
             "frame": frame,
             "breakpoints": bps,
             "stop": null,
-            "controlOwner": "llm"
+            "controlOwner": control_owner
         }))
     }
 }
@@ -2110,6 +2119,9 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
 
         "debug/run" => {
             let mut st = state.lock().unwrap();
+            // T1.2 — Spec 767: read source param, update control_owner, broadcast on change.
+            let owner = owner_from_source(&req.params);
+            set_control_owner(&mut st, owner);
             st.session.running = true;
             st.ctrl_stop = None;
             st.ctrl_frame += 1;
@@ -2129,6 +2141,9 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
 
         "debug/pause" => {
             let mut st = state.lock().unwrap();
+            // T1.2 — Spec 767: read source param, update control_owner, broadcast on change.
+            let owner = owner_from_source(&req.params);
+            set_control_owner(&mut st, owner);
             st.session.running = false;
             st.ctrl_frame += 1;
             let frame = st.ctrl_frame;
@@ -2143,7 +2158,8 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 "session_id": st.session.id,
                 "stop": stop_obj.clone(),
             }));
-            let (pacing_mode, pacing_ratio) = (st.pacing_mode.clone(), st.pacing_ratio);
+            let (pacing_mode, pacing_ratio, control_owner) =
+                (st.pacing_mode.clone(), st.pacing_ratio, st.control_owner.clone());
             Response::ok(id, json!({
                 "runState": "paused",
                 "pacing": { "mode": pacing_mode, "ratio": pacing_ratio },
@@ -2152,12 +2168,15 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 "frame": frame,
                 "breakpoints": bps,
                 "stop": stop_obj,
-                "controlOwner": "llm"
+                "controlOwner": control_owner
             }))
         }
 
         "debug/continue" => {
             let mut st = state.lock().unwrap();
+            // T1.2 — Spec 767: read source param, update control_owner, broadcast on change.
+            let owner = owner_from_source(&req.params);
+            set_control_owner(&mut st, owner);
             st.session.running = true;
             st.ctrl_stop = None;
             // Spec 771.2 — continue() === run() in runtime-controller.ts:287, so it
@@ -2176,6 +2195,9 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
 
         "debug/step" => {
             let mut st = state.lock().unwrap();
+            // T1.2 — Spec 767: read source param, update control_owner, broadcast on change.
+            let owner = owner_from_source(&req.params);
+            set_control_owner(&mut st, owner);
             step_one_instruction(&mut st.session);
             st.session.running = false;
             let registers = register_dump(&st.session);
@@ -4774,6 +4796,25 @@ fn run_scenario(st: &mut State, scenario: &Value) -> Result<Value, String> {
     }))
 }
 
+/// T1.2 — Spec 767 `setControlOwner`: set `State.control_owner` and broadcast
+/// `debug/control { session_id, owner }` ONLY on change, matching
+/// RuntimeController.setControlOwner (runtime-controller.ts:338).
+fn set_control_owner(st: &mut State, owner: &str) {
+    if st.control_owner != owner {
+        st.control_owner = owner.to_string();
+        st.notify.broadcast("debug/control", json!({
+            "session_id": st.session.id,
+            "owner": owner,
+        }));
+    }
+}
+
+/// T1.2 — derive control owner from a `source` param value, mirroring TS:
+/// `source === "llm" ? "llm" : "human"` (ws-server.ts:987).
+fn owner_from_source(params: &Value) -> &'static str {
+    if params.get("source").and_then(|v| v.as_str()) == Some("llm") { "llm" } else { "human" }
+}
+
 /// The `debug/state` controller-state object (= c64re `controller.state()`), built
 /// from the live `State`. Shared by `debug/state` and `checkpoint/restore`'s
 /// `state` field so both report the identical shape.
@@ -4788,6 +4829,8 @@ fn build_debug_state(st: &State) -> Value {
     };
     // T1.3: pacing is stored in State (session/set_pacing mutates it); default "pal"/1.
     // Mirrors TS RuntimeController.state() → { pacing: { ...this.pacing } }.
+    // T1.2: controlOwner is tracked in State (default "human"); set_control_owner()
+    // updates it on each run/pause/continue/step. Mirrors RuntimeController.controlOwner.
     json!({
         "runState": run_state,
         "pacing": { "mode": st.pacing_mode, "ratio": st.pacing_ratio },
@@ -4796,7 +4839,7 @@ fn build_debug_state(st: &State) -> Value {
         "frame": st.ctrl_frame,
         "breakpoints": bps,
         "stop": stop,
-        "controlOwner": "llm"
+        "controlOwner": st.control_owner
     })
 }
 
@@ -5342,6 +5385,7 @@ async fn main() {
         session_created: false,
         pacing_mode: "pal".to_string(),
         pacing_ratio: 1.0,
+        control_owner: "human".to_string(),
     }));
 
     // The singleton live A/V stream hub (ADR-073): one pacing loop drives the
@@ -5411,6 +5455,7 @@ mod batch1_tests {
             session_created: false,
             pacing_mode: "pal".to_string(),
             pacing_ratio: 1.0,
+            control_owner: "human".to_string(),
         }))
     }
 
@@ -5559,7 +5604,8 @@ mod batch1_tests {
         assert!(r["frame"].is_u64());
         assert!(r["breakpoints"].is_array());
         assert_eq!(r["stop"], Value::Null);
-        assert_eq!(r["controlOwner"], json!("llm"));
+        // T1.2: default control_owner is "human" (no control op issued yet).
+        assert_eq!(r["controlOwner"], json!("human"));
     }
 
     #[test]
