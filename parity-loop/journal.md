@@ -19,3 +19,12 @@ T2.4 cart write-LED, T1.6 warm_reset(soft-reset), T2.3 gcr sector-under-head, T1
 Integrate-gate caught T1.5 regression (attached false-on-first) → fixed to shared-attach true,
 re-recorded boot-basic-ready + iso-cia-icr goldens. Full no-disk oracle GREEN 24/0. core 216/216.
 Remaining: T2.8 monitor-command-parity + Tier-3 deep ports.
+
+## 2026-06-25 — Tier-3 workflow (wvovswrtu) COMPLETE → BACKLOG DONE
+T3.4 run_prg-autostart, T3.6 scenario-save-durability, T2.8 monitor-command-parity
+(full VICE-superset: d/m/r/g/x/until/z/n/ret/bk/del/bank/f/t/c/h/reset/help; map/taint/
+inspect/xref graceful-deferred), T3.3 media/ingress full Spec-709.13 + CRT path,
+T3.1 vic-inspect-engine (was already ported; matrix stale), T3.2 time-travel
+(overlay_run + snapshot_tree + promote_branch). Integrate-gate: full no-disk oracle
+GREEN 24/0, release build clean, monitor verbs verified live (d/m/r/bk/bank/help).
+loop_status=DONE. Only deferred: T3.5 trace/read (DuckDB query layer, Phase-2 by design).
