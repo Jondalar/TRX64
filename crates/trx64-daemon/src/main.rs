@@ -256,6 +256,12 @@ struct State {
     /// `None` until the first trace is stopped.
     last_trace_path: Option<String>,
     last_run_id: Option<String>,
+    /// T2.4 — BUG-042 cart write-LED: last seen writableGeneration from the cart
+    /// (TS ws-server.ts:1599-1602 `cartLedTrack`). When the generation advances
+    /// `cart_led_last_write_at` is stamped; the "write" activity is held for 1.2 s
+    /// so the 250 ms UI poll renders a steady blink through a write burst.
+    cart_led_gen: u64,
+    cart_led_last_write_at: Option<std::time::Instant>,
 }
 
 /// Spec 271 — one in-process batch (= c64re `BatchEntry`). Results are stored as a
@@ -2269,11 +2275,14 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
 
         // session/cart_status — live cartridge status (ws-server.ts:1581). Returns
         // null when no cart attached; else { type, bank, activity, booted, sourceName }.
-        // TRX64 has no write-LED generation counter, so activity is "read" when the
-        // cart is mapped (exrom==0 || game==0) else "idle"; booted is false (no
-        // cartBootedFrom tracking). Shape matches the TS.
+        // T2.4 / BUG-042: mirrors the TS `cartLedTrack` write-LED logic:
+        //   gen = cart.writableGeneration() (monotonic flash/EEPROM write counter)
+        //   if gen advanced since last poll → stamp lastWriteAt
+        //   if < 1.2 s since lastWriteAt → activity = "write"
+        //   else if cart mapped (exrom==0 || game==0) → "read", else "idle"
+        // booted is false (no cartBootedFrom tracking in TRX64).
         "session/cart_status" => {
-            let st = state.lock().unwrap();
+            let mut st = state.lock().unwrap();
             let m = &st.session.machine;
             match m.cartridge.as_ref() {
                 None => Response::ok(id, Value::Null),
@@ -2282,11 +2291,26 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                     let bank = cart.get_state().current_bank as u64;
                     let lines = cart.get_lines();
                     let mapped = lines.exrom == 0 || lines.game == 0;
-                    let activity = if mapped { "read" } else { "idle" };
                     let source_name = m
                         .cartridge_image
                         .as_ref()
                         .map(|img| img.name.clone());
+                    // BUG-042 write-LED: track writableGeneration across polls.
+                    let gen = cart.writable_generation();
+                    if gen != st.cart_led_gen {
+                        st.cart_led_gen = gen;
+                        st.cart_led_last_write_at = Some(std::time::Instant::now());
+                    }
+                    let write_held = st.cart_led_last_write_at
+                        .map(|t| t.elapsed() < std::time::Duration::from_millis(1200))
+                        .unwrap_or(false);
+                    let activity: &str = if write_held {
+                        "write"
+                    } else if mapped {
+                        "read"
+                    } else {
+                        "idle"
+                    };
                     Response::ok(id, json!({
                         "type": type_str,
                         "bank": bank,
@@ -5889,6 +5913,8 @@ async fn main() {
         control_owner: "human".to_string(),
         last_trace_path: None,
         last_run_id: None,
+        cart_led_gen: 0,
+        cart_led_last_write_at: None,
     }));
 
     // The singleton live A/V stream hub (ADR-073): one pacing loop drives the
