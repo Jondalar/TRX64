@@ -8,14 +8,40 @@
   "max_retries": 4,
   "retry_count": 0,
   "in_flight": null,
-  "tier1": ["T1.4", "T1.5", "T1.1", "T1.3", "T1.2", "T1.6", "T1.7"],
-  "tier2": ["T2.1", "T2.2", "T2.4", "T2.5", "T2.6", "T2.7", "T2.3"],
-  "tier3": ["T3.4", "T3.6", "T3.1", "T3.2", "T3.3", "T3.5"],
-  "done": [],
+  "tier1": [
+    "T1.4",
+    "T1.5",
+    "T1.3",
+    "T1.2",
+    "T1.6",
+    "T1.7"
+  ],
+  "tier2": [
+    "T2.1",
+    "T2.2",
+    "T2.4",
+    "T2.5",
+    "T2.6",
+    "T2.7",
+    "T2.3"
+  ],
+  "tier3": [
+    "T3.4",
+    "T3.6",
+    "T3.1",
+    "T3.2",
+    "T3.3",
+    "T3.5"
+  ],
+  "done": [
+    "T1.1"
+  ],
   "blocked": [],
   "current_item": null,
   "gate": "cargo build clean + per-item behavior match (notif-diff / UI / probe) + NO oracle no-disk regression (cpu/cia/protocol/sid/vsf GREEN) + 1:1 with TS. No fake-green.",
-  "known_red": ["iso-vic c64Cycles +1..+4: VICE-accurate, pre-existing (ADR-053)"],
+  "known_red": [
+    "iso-vic c64Cycles +1..+4: VICE-accurate, pre-existing (ADR-053)"
+  ],
   "rule": "TRX64 adapts to TS; never touch c64re UI/MCP. Commit per item, persist state before exit.",
   "loop_status": "RUNNING",
   "updated": "2026-06-25"
