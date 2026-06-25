@@ -53,6 +53,16 @@ chip behavior) = `opus`. Driver gates + commits; builders port one item.
       trace/run/mark (marks vec), trace/current (last store). Gate: methods work, 1:1 shape.
 - [ ] T2.7 `memory-access-map` [sonnet] — implement debug/memory_access_map (vs stub).
       Gate: returns liveness map for a cycle budget.
+- [ ] T2.8 `monitor-command-parity` [opus] — TRX64 `run_monitor` supports ONLY wr/r/m
+      (~3 of ~80 TS verbs). Port the TS monitor-shell (`src/runtime/headless/debug/
+      monitor-shell.ts`, 1290 lines) command surface into run_monitor: CORE verbs first
+      (d/disasm, g/x/z/n/sf/nf/si/so/step/next stepping, bk/break/del/until breakpoints,
+      flow/bt, m/mb/dump/hunt/f-fill/move mem-ops, bank/cpu/ram/io/rom/cart spaces,
+      label/note/sym, reset/start/stop, help). DEFER (need trace/read T3.5 + project index):
+      map/taint/swimlane/chis (traceRead), inspect/xref (projectRead) — wire as "needs
+      trace/project" stubs that error gracefully like TS does when ctx hook absent.
+      Mirror the TS dispatch + output format verbatim. Gate: representative verbs match TS
+      monitor/exec output 1:1 on a booted machine. (User-reported: "monitor total reduziert".)
 
 ## Tier 3 — deep ports (high-effort)
 

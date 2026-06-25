@@ -1,29 +1,16 @@
 {
   "phase": 2,
   "title": "100% WS-surface parity with c64re TS headless",
-  "stage": "tier1",
+  "stage": "tier3",
   "ts_runtime_root": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP",
   "ts_spec": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/src/workspace-ui/ws-server.ts + src/runtime/headless/debug/runtime-controller.ts",
   "matrix": "docs/ts-parity-reconciliation.md",
   "max_retries": 4,
   "retry_count": 0,
   "in_flight": null,
-  "tier1": [
-    "T1.4",
-    "T1.5",
-    "T1.3",
-    "T1.2",
-    "T1.6",
-    "T1.7"
-  ],
+  "tier1": [],
   "tier2": [
-    "T2.1",
-    "T2.2",
-    "T2.4",
-    "T2.5",
-    "T2.6",
-    "T2.7",
-    "T2.3"
+    "T2.8"
   ],
   "tier3": [
     "T3.4",
@@ -34,7 +21,20 @@
     "T3.5"
   ],
   "done": [
-    "T1.1"
+    "T1.1",
+    "T1.4",
+    "T1.5",
+    "T1.3",
+    "T1.2",
+    "T2.1",
+    "T2.5",
+    "T2.2",
+    "T2.6",
+    "T2.7",
+    "T2.4",
+    "T1.6",
+    "T2.3",
+    "T1.7"
   ],
   "blocked": [],
   "current_item": null,
@@ -44,5 +44,6 @@
   ],
   "rule": "TRX64 adapts to TS; never touch c64re UI/MCP. Commit per item, persist state before exit.",
   "loop_status": "RUNNING",
-  "updated": "2026-06-25"
+  "updated": "2026-06-25",
+  "note_monitor": "T2.8 monitor-command-parity added (user: monitor total reduziert) — next batch w/ Tier3"
 }
