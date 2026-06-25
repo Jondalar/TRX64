@@ -4157,6 +4157,24 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             Response::err(id, -32601, format!("Method not found: {m}"))
         }
 
+        // ── runtime/call ─────────────────────────────────────────────────────
+        // AgentQueryApi facade — mirrors TS ws-server.ts:1717.
+        // Payload: { session_id, op, args }
+        // → reuse dispatch_api_call allowlist by building a synthetic params
+        //   value with { method: op, args: args } (identical dispatch table).
+        // session_id accepted but ignored (singleton session, like all TRX64
+        // runtime/* handlers).
+        "runtime/call" => {
+            let op = match req.params.get("op").and_then(|v| v.as_str()) {
+                Some(o) => o.to_string(),
+                None => return Response::err(id, -32602, "runtime/call: missing op"),
+            };
+            let args = req.params.get("args").cloned().unwrap_or(json!([]));
+            // Build synthetic params matching what dispatch_api_call expects.
+            let synthetic = json!({ "method": op, "args": args });
+            dispatch_api_call(id, &synthetic, state)
+        }
+
         other => {
             Response::err(id, -32601, format!("Method not found: {other}"))
         }
