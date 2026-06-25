@@ -4080,27 +4080,52 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         }
 
         "media/unmount" => {
-            let role = req.params.get("role").and_then(|v| v.as_str()).unwrap_or("drive8").to_string();
+            let role_param = req.params.get("role").and_then(|v| v.as_str());
+            let slot = req.params.get("slot").and_then(|v| v.as_u64());
+            // TS media/unmount (ws-server.ts:709): slot 0 OR role "cartridge" → cart
+            // eject; slot 9 rejected; else drive8. The old handler ignored slot and
+            // ALWAYS ejected drive8, so the UI's ejectSlot(0) removed the disk instead
+            // of the cartridge (and the cart never came out).
+            if slot == Some(9) {
+                return Response::err(id, -32602, "media/unmount: drive 9 not supported (v1 drive8-only)");
+            }
+            let is_cart = role_param == Some("cartridge") || slot == Some(0);
+            let role = if is_cart { "cartridge" } else { "drive8" };
             let mut st = state.lock().unwrap();
-            st.session.machine.drive8.detach_disk();
-            st.session.disk_path = String::new();
+            let was_running = st.session.running;
+            if is_cart {
+                // Cart eject = persist writable flash → detach → power-cycle → resume
+                // (Spec 709.12, VICE-faithful), mirroring the media/ingress eject path.
+                let cart_path = st.session.cart_path.clone();
+                if !cart_path.is_empty() { persist_cart_for_eject(&mut st, &cart_path); }
+                st.session.machine.detach_cart();
+                st.session.cart_path = String::new();
+                st.session.machine.fill_power_on_ram();
+                st.session.machine.cold_reset();
+                st.session.running = true;
+                st.ctrl_stop = None;
+                st.notify.broadcast("debug/running", json!({ "session_id": st.session.id, "pacing": { "mode": "pal", "ratio": 1 } }));
+            } else {
+                st.session.machine.drive8.detach_disk();
+                st.session.disk_path = String::new();
+            }
             let cycle = st.session.machine.clk;
             let event = json!({
                 "cycle": cycle,
                 "operation": "eject",
                 "role": role,
-                "format": null,
-                "sha256": null,
-                "resetPolicy": null,
-                "checkpointBeforeId": null,
-                "checkpointAfterId": null
+                "format": Value::Null,
+                "sha256": Value::Null,
+                "resetPolicy": Value::Null,
+                "checkpointBeforeId": Value::Null,
+                "checkpointAfterId": Value::Null
             });
             push_media_event(&mut st, event.clone());
             Response::ok(id, json!({
                 "ok": true,
                 "event": event,
-                "paused": true,
-                "wasRunning": false,
+                "paused": !is_cart,
+                "wasRunning": was_running,
                 "detail": { "role": role }
             }))
         }
@@ -4210,6 +4235,42 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 Ok(b) => b,
                 Err(e) => return Response::err(id, -32602, format!("media/swap: file read {path_str}: {e}")),
             };
+
+            // media/swap shares TS adaptMount with media/mount — route .crt → cartridge
+            // (was always disk-on-drive8), .c64re → reject. See media/mount above.
+            let lower = path_str.to_lowercase();
+            if lower.ends_with(".c64re") {
+                return Response::err(id, -32602, "media/swap: .c64re is a runtime snapshot, not media — use snapshot/undump (Spec 707).");
+            }
+            if lower.ends_with(".crt") {
+                let crt_name = path_str.split('/').last().unwrap_or("cartridge.crt").to_string();
+                let sha = sha256_hex(&bytes);
+                let mut st = state.lock().unwrap();
+                let mapper_type = match st.session.machine.attach_cart_from_bytes(&bytes, &crt_name) {
+                    Ok((_n, t)) => t,
+                    Err(e) => return Response::err(id, -32602, format!("media/swap: bad CRT: {e}")),
+                };
+                let mt = mapper_type_str(mapper_type).to_string();
+                st.session.cart_path = path_str.clone();
+                st.session.machine.fill_power_on_ram();
+                st.session.machine.cold_reset();
+                let cycle = st.session.machine.clk;
+                st.session.running = true;
+                st.ctrl_stop = None;
+                st.notify.broadcast("debug/running", json!({ "session_id": st.session.id, "pacing": { "mode": "pal", "ratio": 1 } }));
+                let event = json!({
+                    "cycle": cycle, "operation": "crt", "role": Value::Null, "format": "crt",
+                    "sha256": sha.clone(), "resetPolicy": "power-cycle",
+                    "checkpointBeforeId": Value::Null, "checkpointAfterId": Value::Null,
+                });
+                push_media_event(&mut st, event.clone());
+                return Response::ok(id, json!({
+                    "mountedPath": path_str, "type": "crt", "mapperType": mt.clone(), "sha256": sha,
+                    "event": event,
+                    "detail": { "name": crt_name, "backingPath": path_str, "mapperType": mt, "resetPolicy": "power-cycle" },
+                    "paused": false,
+                }));
+            }
 
             let disk_name = path_str.split('/').last().unwrap_or("disk").to_string();
             let format_str = if disk_name.to_lowercase().ends_with(".g64")
