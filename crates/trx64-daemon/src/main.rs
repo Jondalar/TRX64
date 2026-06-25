@@ -2241,6 +2241,13 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             let drv = &m.drive8;
             let half_track = (drv.rotation.current_half_track & 0xff) as u64;
             let track = half_track / 2;
+            // T2.3 — sector under the GCR read head (ws-server.ts:1519-1524):
+            // viceSectorUnderHead returns -1 for no header / empty track; the TS
+            // keeps `sector` at 0 in that case (only assigns when `sec >= 0`).
+            let sector: u64 = {
+                let sec = drv.rotation.sector_under_head();
+                if sec >= 0 { sec as u64 } else { 0 }
+            };
             let motor_on = (drv.rotation.byte_ready_active & BRA_MOTOR_ON) != 0;
             let led_on = motor_on;
             let led_pwm: u64 = if led_on { 1000 } else { 0 };
@@ -2268,7 +2275,7 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 "rwMode": "read",
                 "halfTrack": half_track,
                 "track": track,
-                "sector": 0,
+                "sector": sector,
                 "drivePc": drive_pc,
                 "dd00": { "pra": dd00pra, "ddr": dd00ddr },
                 "transferMode": transfer_mode

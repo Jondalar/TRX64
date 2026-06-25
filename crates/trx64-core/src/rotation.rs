@@ -435,6 +435,66 @@ impl Rotation {
         self.image.as_ref().and_then(|img| img.tracks.get(idx))
     }
 
+    /// PORT OF: ws-server.ts:60-79 (`viceSectorUnderHead`). Decode the physical
+    /// sector under (or next approaching) the GCR read head. Loader-independent
+    /// (works for KERNAL + custom fastloaders) — reads the actual GCR track,
+    /// scans from the head bit-position for the next sector header block, returns
+    /// its sector number. Mirrors VICE's monitor sector indicator. Returns `-1`
+    /// if no header is found (unformatted/empty track).
+    ///
+    /// The TS reads `d0.gcr.tracks[ht - 2]` (`ht = current_half_track`),
+    /// `d0.GCR_head_offset` (a BIT position), and calls `gcr_find_sync` /
+    /// `gcr_decode_block` from `gcr.ts`. Here those map to `self.image.tracks[
+    /// current_half_track - 2]`, `self.gcr_head_offset`, and the crate-private
+    /// `gcr_find_sync` / `gcr_decode_block` — byte-for-byte the same scan.
+    pub fn sector_under_head(&self) -> i32 {
+        use crate::gcr::{gcr_decode_block, gcr_find_sync};
+        // ts:61-62 — ht = current_half_track; raw = gcr.tracks[ht - 2].
+        let idx = (self.current_half_track as usize).wrapping_sub(2);
+        let raw = match self.image.as_ref().and_then(|img| img.tracks.get(idx)) {
+            Some(t) => t,
+            None => return -1,
+        };
+        // ts:63 — if (!raw?.data || !raw.size) return -1.
+        if raw.data.is_empty() || raw.size == 0 {
+            return -1;
+        }
+        // ts:64 — bits = raw.size * 8.
+        let bits = (raw.size as i64) * 8;
+        // ts:66 — p = (((GCR_head_offset % bits) + bits) % bits). GCR_head_offset
+        // is a BIT position; normalize into [0, bits).
+        let mut p: i64 = (((self.gcr_head_offset as i64) % bits) + bits) % bits;
+        // ts:67-68 — header buffer + firstSync tracker.
+        let mut header = [0u8; 4];
+        let mut first_sync: i64 = -1;
+        // ts:69 — for (guard = 0; guard < 64; guard++).
+        for _ in 0..64 {
+            // ts:70-71 — p = gcr_find_sync(raw, p, bits); if (p < 0) return -1.
+            p = gcr_find_sync(raw, p, bits);
+            if p < 0 {
+                return -1; // no sync = no header
+            }
+            // ts:72 — if (firstSync === p) return -1 (full revolution, no header).
+            if first_sync == p {
+                return -1;
+            }
+            // ts:73 — if (firstSync < 0) firstSync = p.
+            if first_sync < 0 {
+                first_sync = p;
+            }
+            // ts:74 — gcr_decode_block(raw, p, header, 1).
+            gcr_decode_block(raw, p, &mut header, 1);
+            // ts:75 — if (header[0] === 0x08) return header[2] (sector).
+            if header[0] == 0x08 {
+                return header[2] as i32;
+            }
+            // ts:76 — not a header (e.g. 0x07 data block); the next find_sync(p)
+            // advances to the following sync mark.
+        }
+        // ts:78 — return -1.
+        -1
+    }
+
     /// PORT OF: rotation.ts:482-665 (rotation.c:339-570 rotation_1541_gcr).
     /// C `static`. 1541 circuit simulation for GCR-based images (.g64).
     fn rotation_1541_gcr(&mut self, ref_cycles_in: u64) {

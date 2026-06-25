@@ -464,7 +464,12 @@ fn gcr_convert_gcr_to_4bytes(source: &[u8], source_off: usize, dest: &mut [u8], 
 /// SYNC mark (>=10 consecutive 1-bits), starting from bit position `p`, looking
 /// at most `s` bits. Returns the bit position of the byte after the sync, or
 /// `-CBMDOS_FDC_ERR_SYNC` if none found.
-fn gcr_find_sync(raw: &GcrTrack, mut p: i64, mut s: i64) -> i64 {
+///
+/// `pub(crate)` so the rotation layer's sector-under-head decoder
+/// ([`crate::rotation::Rotation::sector_under_head`], T2.3 — the port of
+/// ws-server.ts:60 `viceSectorUnderHead`) can reuse the exact same scan VICE's
+/// monitor uses; not exported beyond the crate.
+pub(crate) fn gcr_find_sync(raw: &GcrTrack, mut p: i64, mut s: i64) -> i64 {
     if raw.data.is_empty() || raw.size == 0 {
         return -(CBMDOS_FDC_ERR_SYNC as i64);
     }
@@ -500,7 +505,10 @@ fn gcr_find_sync(raw: &GcrTrack, mut p: i64, mut s: i64) -> i64 {
 /// gcr_decode_block (gcr.ts:233-264 / gcr.c:205-232): read `num` GCR groups
 /// (5 bytes each) starting at bit position `p`, decode to `num*4` raw bytes in
 /// `buf`.
-fn gcr_decode_block(raw: &GcrTrack, p: i64, buf: &mut [u8], num: usize) {
+///
+/// `pub(crate)` for the same reason as [`gcr_find_sync`] — consumed by T2.3's
+/// sector-under-head decoder ([`crate::rotation::Rotation::sector_under_head`]).
+pub(crate) fn gcr_decode_block(raw: &GcrTrack, p: i64, buf: &mut [u8], num: usize) {
     if raw.data.is_empty() {
         return;
     }
