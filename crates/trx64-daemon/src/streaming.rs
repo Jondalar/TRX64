@@ -58,7 +58,9 @@ const VIC_FMT_INDEXED: u8 = 1;
 
 /// PAL Φ2 cycles per frame (312 rasterlines × 63 cycles = 19656). Canonical PAL
 /// frame length used by the project's av-record harness; one frame per push.
-const CYC_PER_FRAME: u64 = 19656;
+/// Public so the `checkpoint/restore` render-flag path (main.rs) can re-sim exactly
+/// one PAL frame to regenerate a framebuffer-omitted anchor's picture.
+pub const CYC_PER_FRAME: u64 = 19656;
 /// PAL Φ2 clock (Hz) — used to derive the real-time frame period from the cycle
 /// budget, so the pace stays self-consistent with the cycles actually run.
 const PAL_CYCLES_PER_SEC: f64 = 985_248.0;
@@ -457,6 +459,33 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
             hub.broadcast(Message::Binary(audio.into()));
             audio_seq = audio_seq.wrapping_add(1);
         }
+        } else {
+            // Paused/off advances nothing (frozen picture, silent) — EXCEPT a
+            // one-shot present requested by `checkpoint/restore` (audit
+            // ws-checkpoint-scrub-1). The TS controller ALWAYS presentFrame()s on a
+            // restore so the paused canvas refreshes to the rolled-back picture with
+            // "no client-grab dependency" (runtime-controller.ts:606-613). The paused
+            // loop is otherwise silent, so the restore handler sets `force_present_frame`
+            // and we consume it ONCE here: render the (already-restored) live frame,
+            // push exactly one BIN_VIC (binary only — TS pushFrame on restore emits no
+            // JSON), then clear the flag (no continuous push — the machine stays frozen).
+            let vic_msg = {
+                let mut st = state.lock().unwrap();
+                if !st.force_present_frame {
+                    None
+                } else {
+                    st.force_present_frame = false;
+                    let cpu_cycle = st.session.machine.c64_core.clk as u32;
+                    let (w, h, indices) = st.session.machine.render_canvas_indices();
+                    // Binary VIC frame ONLY — 1:1 with TS pushFrame on restore (no JSON
+                    // session/frame_available, which TS emits only in the running loop).
+                    Some(build_vic_frame(frame_seq, cpu_cycle, &indices, w as u16, h as u16))
+                }
+            };
+            if let Some(vic) = vic_msg {
+                hub.broadcast(Message::Binary(vic.into()));
+                frame_seq = frame_seq.wrapping_add(1);
+            }
         } // end `if running` — paused/off advances nothing (frozen picture, silent)
 
         // ── Pace to real-time: sleep to the absolute target for this frame. ──

@@ -334,6 +334,18 @@ struct State {
     /// the jammed state and drops into the monitor ONCE per episode. Re-armed when the
     /// jam clears (or on a fresh run()).
     stream_broke_on_jam: bool,
+    /// Spec 771.2 (audit ws-checkpoint-scrub-1) — one-shot "present a fresh frame
+    /// even though paused" request, set by `checkpoint/restore`. The TS controller's
+    /// restore ALWAYS presentFrame()s on restore (runtime-controller.ts:606-613, "no
+    /// client-grab dependency"), so a paused scrub refreshes the canvas to the
+    /// rolled-back picture immediately. TRX64's stream loop sends nothing while
+    /// paused (frozen picture), so a paused restore would leave the pre-scrub frame on
+    /// screen. The restore handler sets this; the stream loop's paused branch consumes
+    /// it ONCE — pushing exactly one BIN_VIC + `session/frame_available` — then clears
+    /// it (no continuous push, the machine stays frozen). When no --stream hub exists,
+    /// the restore handler still broadcasts `session/frame_available` directly, so a
+    /// command-driven daemon signals the refresh too.
+    force_present_frame: bool,
 }
 
 /// T2.8 — the monitor-shell.ts module-level per-session state, collapsed for the
@@ -5717,7 +5729,16 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         // checkpoint/restore — restore a ring entry into the live machine.
         // Params: { id, then?: "pause"|"run"|"keep", render?: bool }.
         // Response: { restored: RuntimeCheckpointRef, state: <debug state> }.
-        // then==="run": pin the restored anchor + truncate future anchors (Spec 761).
+        //
+        // 1:1 with the TS controller restore (runtime-controller.ts:535-617):
+        //   then==="run"   → pin the anchor + truncate the future + resume (Spec 761).
+        //   then==="pause" → ensure paused + publish debug/stopped (reason "pause").
+        //   then==="keep"  → INHERIT the prior run-state (a running machine stays
+        //                    running; a paused one stays paused). This is the default
+        //                    (omitted then). (Audit ws-checkpoint-scrub-0.)
+        //   render:true    → re-sim ~1 frame to regenerate the framebuffer for a
+        //                    framebuffer-OMITTED auto-anchor (Audit ws-checkpoint-scrub-2).
+        // EVERY restore pushes a fresh frame (Audit ws-checkpoint-scrub-1).
         "checkpoint/restore" => {
             let cp_id = match req.params.get("id").and_then(|v| v.as_str()) {
                 Some(s) if !s.is_empty() => s.to_string(),
@@ -5726,9 +5747,17 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             let then = req.params.get("then").and_then(|v| v.as_str());
             let intent = match then {
                 Some("pause") | Some("run") | Some("keep") => then,
-                _ => None,
+                _ => None, // omitted/unknown ≡ "keep" (runtime-controller.ts:541 default)
             };
+            // runtime-controller.ts:544 — `render` only re-sims when NOT resuming (a
+            // running machine regenerates the framebuffer on its own next frame).
+            let render = req.params.get("render").and_then(|v| v.as_bool()).unwrap_or(false)
+                && intent != Some("run");
             let mut st = state.lock().unwrap();
+            // Audit ws-checkpoint-scrub-0 — capture the run-state BEFORE the restore so
+            // "keep" can inherit it. `restore_live_checkpoint` force-sets running=false
+            // internally (a restore is a control point), so we must snapshot it here.
+            let was_running = st.session.running;
             // Resolve the stored payload (rehydrated media) + its ref.
             let snapshot = match st.checkpoint_ring.restore_snapshot(&cp_id) {
                 Some(s) => s,
@@ -5739,15 +5768,31 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             if let Err(e) = restore_live_checkpoint(&mut st.session, &snapshot) {
                 return Response::err(id, -32001, format!("checkpoint/restore: {e}"));
             }
-            let restored = st.checkpoint_ring.get(&cp_id).map(|r| r.to_json());
-            // then==="run": this is a new timeline — pin the anchor + drop the future.
-            if intent == Some("run") {
-                st.checkpoint_ring.pin(&cp_id);
-                st.checkpoint_ring.truncate_after(&cp_id, true);
-                st.session.running = true;
-            } else {
-                st.session.running = false;
+            // Audit ws-checkpoint-scrub-2 — an auto-capture anchor OMITS the two VIC
+            // framebuffers (BUG-049 — they are a derivable shadow), so a paused restore
+            // would leave the live `displayed` buffer stale/black. Honour render:true by
+            // re-simulating ONE PAL frame after the state restore so the framebuffer is
+            // regenerated from the rolled-back RAM/VIC state (runtime-controller.ts:599-601
+            // `runFor(PAL_CYCLES_PER_FRAME)`). The ~1-frame advance is invisible in a
+            // paused preview; the exact-state path (runtime_rewind) passes no render.
+            if render {
+                run_cycle_budget(&mut st.session, crate::streaming::CYC_PER_FRAME);
             }
+            let restored = st.checkpoint_ring.get(&cp_id).map(|r| r.to_json());
+            // Run-state resolution (runtime-controller.ts:541-552/588):
+            //   run  → new timeline: pin the anchor + drop the future, then resume.
+            //   pause→ ensure paused.
+            //   keep → inherit the prior run-state (running stays running). (scrub-0)
+            let now_running = match intent {
+                Some("run") => {
+                    st.checkpoint_ring.pin(&cp_id);
+                    st.checkpoint_ring.truncate_after(&cp_id, true);
+                    true
+                }
+                Some("pause") => false,
+                _ => was_running, // "keep" / omitted
+            };
+            st.session.running = now_running;
             // A restore is a control discontinuity (= a pause/seek): advance the
             // controller frame + clear the last stop, mirroring the undump/reset path.
             st.ctrl_frame += 1;
@@ -5756,14 +5801,39 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             // post-restore-stale samples): push `audio/flush` (ws-server.ts:1667/1690
             // `onRestore` → `this.broadcast("audio/flush", …)`).
             st.notify.broadcast("audio/flush", json!({ "session_id": st.session.id }));
+            let registers = register_dump(&st.session);
             // Spec 771.2 — runtime-controller.ts:603 restore() server-PUSHes
             // debug/checkpoint_restored so every client's canvas refreshes to the
             // rolled-back frame (Live.tsx:337 grabs a fresh screenshot on it).
             st.notify.broadcast("debug/checkpoint_restored", json!({
                 "session_id": st.session.id,
                 "ref": cp_id.clone(),
-                "registers": register_dump(&st.session),
+                "registers": registers.clone(),
             }));
+            // Audit ws-checkpoint-scrub-1 — ALWAYS present a fresh frame on restore
+            // (runtime-controller.ts:606-613 frameCounter++/presentFrame, "no client-grab
+            // dependency"). TS's presentFrame pushes the BINARY VIC frame only (ws-server
+            // .ts:474-503 pushFrame; the JSON `session/frame_available` is emitted ONLY in
+            // the running loop's maybePresentFrame, NOT on restore — so we must NOT emit it
+            // here either, to stay 1:1). Under --stream the paused loop is silent, so we
+            // request a one-shot present: the paused stream branch consumes the flag once
+            // and pushes exactly one BIN_VIC. A running restore (then=run) gets its frame
+            // from the resumed loop's next tick; the flag is harmlessly consumed-or-ignored.
+            st.force_present_frame = true;
+            // Audit ws-checkpoint-scrub-4 — a then=pause restore must publish
+            // debug/stopped (reason "pause"), so a passive UI freezes the run-state on
+            // the scrub (runtime-controller.ts:614-617 stopInfo + broadcast debug/stopped).
+            if intent == Some("pause") {
+                let pc = st.session.machine.c64_core.reg_pc;
+                let cycles = st.session.machine.clk;
+                st.ctrl_stop = Some(CtrlStop { reason: "pause", pc, cycles });
+                let stop_obj = json!({ "reason": "pause", "pc": pc as u64, "cycles": cycles });
+                st.notify.broadcast("debug/stopped", json!({
+                    "session_id": st.session.id,
+                    "stop": stop_obj,
+                    "registers": registers,
+                }));
+            }
             let machine_state = build_debug_state(&st);
             Response::ok(id, json!({
                 "restored": restored,
@@ -8009,6 +8079,7 @@ async fn main() {
         checkpoint_thumb_order: std::collections::VecDeque::new(),
         mon: MonitorState::new(),
         stream_broke_on_jam: false,
+        force_present_frame: false,
     }));
 
     // The singleton live A/V stream hub (ADR-073): one pacing loop drives the
@@ -8095,6 +8166,7 @@ mod batch1_tests {
             checkpoint_thumb_order: std::collections::VecDeque::new(),
             mon: MonitorState::new(),
             stream_broke_on_jam: false,
+            force_present_frame: false,
         }))
     }
 
@@ -8557,6 +8629,183 @@ mod batch1_tests {
             let g = st.lock().unwrap();
             assert_eq!(g.session.machine.c64_core.reg_pc, pre_pc, "PC rewound");
             assert_eq!(g.session.machine.read_full(0xc000), 0xa9, "RAM rewound");
+        }
+    }
+
+    // ── Audit ws-checkpoint-scrub-0/1/2/4 — restore is the shared, broadcast-rich
+    // path (theme T4). These DIRECTLY verify the 4 restore divergences against the TS
+    // controller restore (runtime-controller.ts:535-617). Cases 0 + 4 are also gated
+    // differentially by the WS-conformance oracle; cases 1 + 2 are oracle-BLOCKED (TS
+    // can't report the signal: 1 = TS pushes a BINARY frame on restore the text
+    // ws-client cannot read, no JSON session/frame_available; 2 = no JSON method
+    // exposes framebuffer pixel content), so these tests ARE their direct verification.
+
+    #[test]
+    fn checkpoint_restore_then_keep_inherits_running_state() {
+        // Audit ws-checkpoint-scrub-0 — restore with then="keep" (or omitted) must
+        // INHERIT the prior run-state: a RUNNING machine stays running (TS:
+        // runtime-controller.ts:541-552/588 keep → pause=false → runState UNCHANGED).
+        // Before the fix the handler forced running=false on any non-"run" intent.
+        let st = make_state();
+        let cap = call(&st, "checkpoint/capture", json!({}));
+        let cp_id = cap["ref"]["id"].as_str().unwrap().to_string();
+
+        // RUNNING machine + then omitted (≡ "keep") → stays running.
+        st.lock().unwrap().session.running = true;
+        let r = call(&st, "checkpoint/restore", json!({ "id": cp_id }));
+        assert_eq!(r["state"]["runState"], json!("running"), "keep inherits running");
+        assert!(st.lock().unwrap().session.running, "machine still running after keep restore");
+
+        // PAUSED machine + then="keep" → stays paused (the inherited state both ways).
+        st.lock().unwrap().session.running = false;
+        let r = call(&st, "checkpoint/restore", json!({ "id": cp_id, "then": "keep" }));
+        assert_eq!(r["state"]["runState"], json!("paused"), "keep inherits paused");
+
+        // then="run" → resumes; then="pause" → pauses (the explicit intents unaffected).
+        let r = call(&st, "checkpoint/restore", json!({ "id": cp_id, "then": "run" }));
+        assert_eq!(r["state"]["runState"], json!("running"), "run resumes");
+        let r = call(&st, "checkpoint/restore", json!({ "id": cp_id, "then": "pause" }));
+        assert_eq!(r["state"]["runState"], json!("paused"), "pause pauses");
+    }
+
+    #[test]
+    fn checkpoint_restore_then_pause_broadcasts_debug_stopped() {
+        // Audit ws-checkpoint-scrub-4 — a then="pause" restore must PUSH debug/stopped
+        // (reason "pause") so a passive UI freezes the run-state (TS:
+        // runtime-controller.ts:614-617). Before the fix only audio/flush +
+        // debug/checkpoint_restored were pushed.
+        let st = make_state();
+        let cap = call(&st, "checkpoint/capture", json!({}));
+        let cp_id = cap["ref"]["id"].as_str().unwrap().to_string();
+        let mut rx = probe_notifications(&st);
+
+        call(&st, "checkpoint/restore", json!({ "id": cp_id, "then": "pause" }));
+        let notes = drain_notifications(&mut rx);
+        let stopped: Vec<_> = notes
+            .iter()
+            .filter(|(m, p)| m == "debug/stopped" && p["stop"]["reason"] == json!("pause"))
+            .collect();
+        assert_eq!(stopped.len(), 1, "exactly one debug/stopped reason=pause: {notes:?}");
+        assert!(stopped[0].1.get("registers").is_some(), "carries the register dump");
+    }
+
+    #[test]
+    fn checkpoint_restore_then_keep_emits_no_debug_stopped() {
+        // Guard the inverse of scrub-4: a then="keep" restore of a RUNNING machine must
+        // NOT push debug/stopped (TS only publishes it on the pause intent). Without
+        // this, a fix that always emits debug/stopped would diverge the other way.
+        let st = make_state();
+        let cap = call(&st, "checkpoint/capture", json!({}));
+        let cp_id = cap["ref"]["id"].as_str().unwrap().to_string();
+        st.lock().unwrap().session.running = true;
+        let mut rx = probe_notifications(&st);
+        call(&st, "checkpoint/restore", json!({ "id": cp_id, "then": "keep" }));
+        let notes = drain_notifications(&mut rx);
+        assert!(
+            !notes.iter().any(|(m, _)| m == "debug/stopped"),
+            "no debug/stopped on a keep-running restore: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_restore_requests_one_shot_frame_present() {
+        // Audit ws-checkpoint-scrub-1 (oracle-BLOCKED — TS pushes a BINARY frame on
+        // restore that the text ws-client cannot read; no JSON proxy). DIRECT
+        // verification: a restore sets `force_present_frame` so the (otherwise silent)
+        // paused stream loop pushes ONE fresh BIN_VIC — the TRX64 mirror of TS's
+        // unconditional presentFrame() on restore (runtime-controller.ts:606-613, "no
+        // client-grab dependency"). Holds for a paused restore (where TS's gap bit).
+        let st = make_state();
+        let cap = call(&st, "checkpoint/capture", json!({}));
+        let cp_id = cap["ref"]["id"].as_str().unwrap().to_string();
+        // Pre-condition: the flag is clear (nothing requested a present yet).
+        assert!(!st.lock().unwrap().force_present_frame);
+        call(&st, "checkpoint/restore", json!({ "id": cp_id, "then": "pause" }));
+        assert!(
+            st.lock().unwrap().force_present_frame,
+            "restore requested the one-shot fresh-frame present (consumed once by the paused loop)"
+        );
+    }
+
+    #[test]
+    fn checkpoint_restore_render_regenerates_omitted_framebuffer() {
+        // Audit ws-checkpoint-scrub-2 (oracle-BLOCKED — no JSON method exposes
+        // framebuffer PIXEL content; the text ws-client cannot read the binary frame).
+        // DIRECT verification: a framebuffer-OMITTED auto-anchor restored with
+        // render:true re-sims ~1 frame so the live `displayed` buffer is REGENERATED
+        // from the rolled-back state (TS: runtime-controller.ts:544/599-601). Restored
+        // WITHOUT render, the omitted fb leaves `displayed` UNTOUCHED (stale).
+        //
+        // Needs a VIC-ticked (ROM-booted, full_assembled) machine — the per-cycle
+        // VIC sweep is what fills `dbuf` and the start-of-frame swap publishes it to
+        // `displayed` (vic.rs:1194). A blank Session::new machine has full_assembled
+        // =false (CPU-only path, no sweep), so it can't regenerate a framebuffer.
+        let roms = rom_dir();
+        if !roms.join("kernal-901227-03.bin").exists() {
+            eprintln!("[skip] render-fb test: ROMs absent at {}", roms.display());
+            return;
+        }
+        let st = make_state();
+        {
+            let mut g = st.lock().unwrap();
+            g.session.boot(&roms).expect("boot ROMs");
+            assert!(g.session.machine.full_assembled, "VIC-ticked machine");
+            // Run to a real, painted screen (KERNAL boot + BASIC banner ≈ 2 frames of
+            // border + a drawn READY. ~30 PAL frames is plenty and sub-second native).
+            run_cycle_budget(&mut g.session, crate::streaming::CYC_PER_FRAME * 30);
+        }
+        // Capture an anchor whose stored payload OMITS the framebuffer — exactly the
+        // auto-cadence anchor (capture_recorder_anchor_payload nulls the vicPresentation
+        // framebuffers), inserted straight into the ring.
+        let cp_id = {
+            let mut g = st.lock().unwrap();
+            let frame = g.ctrl_frame;
+            let cycles = g.session.machine.c64_core.clk;
+            let cp = capture_recorder_anchor_payload(&mut g.session);
+            assert!(
+                cp["vicPresentation"]["literalPortFbStable"].is_null(),
+                "auto-anchor omits the framebuffer (BUG-049)"
+            );
+            g.checkpoint_ring.capture(cp, frame, cycles).unwrap().id
+        };
+
+        // Stamp a SENTINEL pattern into the live `displayed` so we can tell
+        // "regenerated" (re-sim overwrote it) from "stale" (left untouched).
+        let fb_len = st.lock().unwrap().session.machine.vic.displayed.len();
+        let sentinel = 0xAB;
+        let stamp = |st: &SharedState| {
+            let mut g = st.lock().unwrap();
+            for b in g.session.machine.vic.displayed.iter_mut() {
+                *b = sentinel;
+            }
+            // Also stamp dbuf: the start-of-frame swap publishes dbuf→displayed, so a
+            // stale dbuf would otherwise masquerade as "regenerated".
+            for b in g.session.machine.vic.dbuf.iter_mut() {
+                *b = sentinel;
+            }
+        };
+
+        // Restore WITHOUT render → the omitted fb is skipped, the sentinel survives.
+        stamp(&st);
+        call(&st, "checkpoint/restore", json!({ "id": cp_id, "then": "pause" }));
+        {
+            let g = st.lock().unwrap();
+            assert!(
+                g.session.machine.vic.displayed.iter().all(|&b| b == sentinel),
+                "no-render restore leaves the omitted fb stale (sentinel intact)"
+            );
+        }
+        // Restore WITH render → the re-sim regenerates the framebuffer, so the sentinel
+        // is overwritten by real VIC output (a painted READY screen ≠ a flat 0xAB).
+        stamp(&st);
+        call(&st, "checkpoint/restore", json!({ "id": cp_id, "then": "pause", "render": true }));
+        {
+            let g = st.lock().unwrap();
+            assert!(
+                !g.session.machine.vic.displayed.iter().all(|&b| b == sentinel),
+                "render:true regenerated the framebuffer (sentinel overwritten by the re-sim)"
+            );
+            assert_eq!(g.session.machine.vic.displayed.len(), fb_len, "framebuffer size unchanged");
         }
     }
 

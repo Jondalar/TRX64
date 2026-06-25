@@ -522,6 +522,161 @@ const CASES: ConfCase[] = [
       };
     },
   },
+
+  // ── P1: ws-checkpoint-scrub-0 — restore then="keep" inherits the run-state ────
+  // checkpoint-restore is the shared, broadcast-rich path (audit theme T4). A
+  // then="keep" (or omitted `then`) restore must INHERIT the prior run-state: a
+  // RUNNING machine stays running (TS: runtime-controller.ts:541-552/588 — keep →
+  // pause=false → runState UNCHANGED). TRX64 (before fix, main.rs:5409-5415) forced
+  // running=false on any non-"run" intent, so a keep-restore of a running machine
+  // wrongly PAUSED it. The signal: under --stream, run to a booted/running machine,
+  // capture an anchor, restore {then:"keep"}, and read runState after. TS: "running";
+  // TRX64 (before fix): "paused". (Audit ws-checkpoint-scrub-0.)
+  {
+    id: "ws-checkpoint-scrub-0",
+    severity: "P1",
+    title: 'restore then="keep" inherits the prior run-state (running stays running)',
+    spawn: { stream: true },
+    async signal(c) {
+      const sid = await liveSession(c);
+      // Start the continuous --stream driver and let it boot a bit so the machine is
+      // genuinely RUNNING (not a one-shot budget that left it paused at the end).
+      await c.call("debug/run", { session_id: sid });
+      let st = await waitRunningBooted(c, sid, 1_500_000, 60_000);
+      // Re-arm the continuous driver if a one-shot debug/run left it paused at budget.
+      if (st.runState !== "running") await c.call("debug/run", { session_id: sid });
+      // Capture an anchor of the live (running) state.
+      const cap = (await c.call("checkpoint/capture", { session_id: sid })) as any;
+      const cpId = cap?.ref?.id ?? cap?.id;
+      // Restore with then omitted (≡ "keep"). A keep-restore of a RUNNING machine must
+      // leave it running.
+      await c.call("checkpoint/restore", { session_id: sid, id: cpId, then: "keep" });
+      // Give the stream loop a beat to keep advancing if it is (still) running, then read.
+      await sleep(1000);
+      st = await state(c, sid);
+      return {
+        // The behavioural signal: a keep-restore of a running machine stays "running".
+        runStateAfterKeepRestore: st.runState,
+      };
+    },
+  },
+
+  // ── P1: ws-checkpoint-scrub-4 — restore then="pause" pushes debug/stopped ─────
+  // A then="pause" restore must server-PUSH debug/stopped (reason "pause") so a
+  // passive UI freezes the run-state on the scrub (TS: runtime-controller.ts:614-617
+  // stopInfo reason:"pause" + broadcast debug/stopped). TRX64 (before fix,
+  // main.rs:5404-5436) pushed only audio/flush + debug/checkpoint_restored on a
+  // restore — never debug/stopped. The signal: capture an anchor, collectNotes,
+  // restore {then:"pause"}, count debug/stopped (reason "pause") pushes. TS: ≥1;
+  // TRX64 (before fix): 0. (Audit ws-checkpoint-scrub-4.)
+  {
+    id: "ws-checkpoint-scrub-4",
+    severity: "P1",
+    title: 'restore then="pause" broadcasts debug/stopped (reason "pause")',
+    spawn: { stream: true },
+    async signal(c) {
+      const sid = await liveSession(c);
+      // No need to free-run; a fresh paused machine can capture + restore an anchor.
+      const cap = (await c.call("checkpoint/capture", { session_id: sid })) as any;
+      const cpId = cap?.ref?.id ?? cap?.id;
+      const sink = collectNotes(c);
+      await c.call("checkpoint/restore", { session_id: sid, id: cpId, then: "pause" });
+      await sleep(500);
+      sink.off();
+      const stopped = sink.notes.filter(
+        (n) => n.method === "debug/stopped" && n.params?.stop?.reason === "pause",
+      );
+      return {
+        // The behavioural signal: a then=pause restore pushes debug/stopped(reason=pause).
+        pushedDebugStoppedPause: stopped.length > 0,
+      };
+    },
+  },
+
+  // ── P1: ws-checkpoint-scrub-1 — restore pushes a fresh frame ──────────────────
+  // BLOCKED by the oracle harness (NOT a TRX64 defect). The TS controller ALWAYS
+  // presentFrame()s on restore so a paused canvas refreshes to the rolled-back
+  // picture "with no client-grab dependency" (runtime-controller.ts:606-613). But
+  // TS's presentFrame pushes the BINARY VIC frame ONLY (ws-server.ts:474-503
+  // pushFrame); it does NOT emit the JSON `session/frame_available` on restore (that
+  // is emitted only inside the RUNNING loop's maybePresentFrame, runtime-
+  // controller.ts:907). So there is no faithful JSON proxy: the text ws-client
+  // cannot read the binary frame, and a `session/frame_available`-count signal would
+  // diverge the WRONG way (TS pushes none on restore). The TRX64 fix mirrors TS
+  // exactly (a fresh BINARY frame on restore, no extra JSON) and is verified DIRECTLY
+  // on TRX64: `checkpoint_restore_requests_one_shot_frame_present` (main.rs tests)
+  // asserts a restore sets `force_present_frame`, which the otherwise-silent paused
+  // stream loop consumes once to push exactly one BIN_VIC — the TRX64 equivalent of
+  // TS's unconditional presentFrame() on restore. Re-arm if a JSON frame-content
+  // method (or a binary-frame-reading ws-client) lands in the oracle.
+  {
+    id: "ws-checkpoint-scrub-1",
+    severity: "P1",
+    title: "restore pushes a fresh frame (paused canvas refreshes to the rolled-back picture)",
+    blocked:
+      "TS pushes a BINARY VIC frame on restore (ws-server.ts pushFrame) that the text " +
+      "ws-client cannot read, and emits NO JSON session/frame_available on restore — so " +
+      "there is no faithful JSON proxy. Fix verified DIRECTLY on TRX64: a restore sets " +
+      "force_present_frame → the paused stream loop pushes one BIN_VIC (test " +
+      "checkpoint_restore_requests_one_shot_frame_present).",
+    spawn: { stream: true },
+    async signal(c) {
+      // Kept intact so the case re-arms once a frame-content JSON signal exists. This
+      // proxy is the session/frame_available-on-restore count (which is NOT faithful —
+      // see `blocked`), retained only to document the shape.
+      const sid = await liveSession(c);
+      const cap = (await c.call("checkpoint/capture", { session_id: sid })) as any;
+      const cpId = cap?.ref?.id ?? cap?.id;
+      const sink = collectNotes(c);
+      await c.call("checkpoint/restore", { session_id: sid, id: cpId, then: "pause" });
+      await sleep(500);
+      sink.off();
+      return {
+        frameAvailableOnRestore: sink.notes.some((n) => n.method === "session/frame_available"),
+      };
+    },
+  },
+
+  // ── P1: ws-checkpoint-scrub-2 — restore honours the `render` flag ─────────────
+  // BLOCKED by the oracle harness (NOT a TRX64 defect). A framebuffer-OMITTED
+  // auto-anchor restored with render:true must re-sim ~1 frame to regenerate the
+  // framebuffer so the paused canvas shows a picture (TS: runtime-controller.ts:
+  // 544/599-601). TRX64 (before fix) never read `render` and c64re_snapshot.rs:775
+  // skips the omitted fb, so the canvas stayed black/stale. The divergence is in the
+  // framebuffer PIXEL content, which NO JSON method exposes (vic/inspect/* report VIC
+  // REGISTERS, not pixels) and the text ws-client cannot read the binary frame — so
+  // there is no faithful JSON proxy on either runtime. The TRX64 fix (honour
+  // render:true → re-sim one PAL frame after the state restore) is verified DIRECTLY
+  // on TRX64: `checkpoint_restore_render_regenerates_omitted_framebuffer` (main.rs
+  // tests) boots ROMs, paints a real screen, omits the anchor framebuffer, and
+  // asserts that a render:true restore REGENERATES the live `displayed` buffer (the
+  // stamped sentinel is overwritten) while a no-render restore leaves it stale.
+  {
+    id: "ws-checkpoint-scrub-2",
+    severity: "P1",
+    title: "restore honours render:true (re-sims a frame so a fb-omitted anchor gets a picture)",
+    blocked:
+      "The divergence is in framebuffer PIXEL content; no JSON method exposes it " +
+      "(vic/inspect/* report VIC REGISTERS, not pixels) and the text ws-client cannot " +
+      "read the binary frame — no faithful JSON proxy. Fix verified DIRECTLY on TRX64: " +
+      "a render:true restore regenerates the live `displayed` buffer (test " +
+      "checkpoint_restore_render_regenerates_omitted_framebuffer).",
+    spawn: { stream: true },
+    async signal(c) {
+      // Kept intact so the case re-arms once a frame-content JSON signal exists. The
+      // best available JSON read is vic/inspect (REGISTERS only) — not a faithful
+      // framebuffer-content signal (see `blocked`), retained to document the intent.
+      const sid = await liveSession(c);
+      const cap = (await c.call("checkpoint/capture", { session_id: sid })) as any;
+      const cpId = cap?.ref?.id ?? cap?.id;
+      await c.call("checkpoint/restore", { session_id: sid, id: cpId, then: "pause", render: true });
+      const open = (await c.call("vic/inspect/open", { session_id: sid }).catch(() => null)) as any;
+      return {
+        // NOT faithful: this only reflects VIC registers, not framebuffer pixels.
+        inspectReturnedFrame: open?.frame != null,
+      };
+    },
+  },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
