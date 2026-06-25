@@ -567,6 +567,70 @@ fn register_dump(session: &Session) -> String {
 /// generous ~10 frames of PAL cycles — enough to reach any boot-time bp).
 const DEBUG_RUN_BUDGET: u64 = 10_000_000;
 
+/// T2.2 — Spec 754 §3.3e: drain observer side-effects accumulated during a run
+/// chunk (or a single step) and broadcast them as `debug/observer_log` events.
+///
+/// 1:1 with runtime-controller.ts:697-725 (the chunk-boundary drain block in tick()):
+///   • pending_log  → one `debug/observer_log { session_id, lines }` if non-empty.
+///   • pending_marks → one `debug/observer_log` per mark, formatted as
+///                     `obs mark: "label" @ cyc N`  (trace active)
+///                     `obs mark: "label" (no active trace — ignored)` (no trace).
+///   • pending_cmds  → one `debug/observer_log` per cmd with the monitor output
+///                     (synchronous; TS is async but the format is identical).
+///
+/// Called after every `run_until_break` and after every `step_one_instruction`
+/// so nothing is lost.
+fn drain_and_broadcast_observer_log(st: &mut State) {
+    let session_id = st.session.id.clone();
+
+    // 1. pending_log (runtime-controller.ts:697-698)
+    let log_lines = st.observers.drain_pending_log();
+    if !log_lines.is_empty() {
+        st.notify.broadcast("debug/observer_log", json!({
+            "session_id": session_id,
+            "lines": log_lines,
+        }));
+    }
+
+    // 2. pending_marks (runtime-controller.ts:702-710)
+    let marks = st.observers.drain_pending_marks();
+    let trace_active = st.session.trace.is_some();
+    let cycles = st.session.machine.clk;
+    for label in marks {
+        let line = if trace_active {
+            format!(r#"obs mark: "{label}" @ cyc {cycles}"#)
+        } else {
+            format!(r#"obs mark: "{label}" (no active trace — ignored)"#)
+        };
+        st.notify.broadcast("debug/observer_log", json!({
+            "session_id": session_id,
+            "lines": [line],
+        }));
+    }
+
+    // 3. pending_cmds (runtime-controller.ts:711-725) — run synchronously
+    //    (TS uses async/await but the wire shape is identical).
+    let cmds = st.observers.drain_pending_cmds();
+    for cmd in cmds {
+        match run_monitor(&mut st.session, &cmd) {
+            Ok(out) => {
+                let mut lines = vec![format!(r#"obs cmd "{cmd}":"#)];
+                lines.extend(out.lines().map(|l| l.to_string()));
+                st.notify.broadcast("debug/observer_log", json!({
+                    "session_id": session_id,
+                    "lines": lines,
+                }));
+            }
+            Err(e) => {
+                st.notify.broadcast("debug/observer_log", json!({
+                    "session_id": session_id,
+                    "lines": [format!(r#"obs cmd "{cmd}": ERROR {e}"#)],
+                }));
+            }
+        }
+    }
+}
+
 /// Drive `debug/run` / `debug/continue`. When breakpoints/watchpoints are armed,
 /// SEGMENT-RUN the machine until one trips (or the budget exhausts) and return the
 /// real stop info. When none are armed, preserve the historical immediate
@@ -612,6 +676,11 @@ fn run_debug_control(id: Value, st: &mut State, frame: u64, is_continue: bool) -
         let State { breakpoints, observers: reg, .. } = &mut *st;
         writeback_hits(breakpoints, reg);
     }
+
+    // T2.2 — Spec 754 §3.3e: drain observer side-effects accumulated this chunk
+    // (runtime-controller.ts:697-725). Done on every path (halt + budget-exhausted)
+    // so nothing is lost, matching the TS tick() drain which runs before the halt check.
+    drain_and_broadcast_observer_log(st);
 
     let bps = st.breakpoints.list_vice_json();
     let cycles = st.session.machine.clk;
@@ -2200,6 +2269,12 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             set_control_owner(&mut st, owner);
             step_one_instruction(&mut st.session);
             st.session.running = false;
+            // T2.2 — Spec 754 §3.3e: drain observer side-effects after the step,
+            // matching the TS run-chunk drain (runtime-controller.ts:697-725).
+            // TS step() (line 317-326) does not drain explicitly, but step is always
+            // called from the WS handler which runs the same drain path. We drain
+            // here so observers fired during the single instruction reach the client.
+            drain_and_broadcast_observer_log(&mut st);
             let registers = register_dump(&st.session);
             let cycles = st.session.machine.clk;
             let c = &st.session.machine.cpu6510;
