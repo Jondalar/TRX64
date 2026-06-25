@@ -22,10 +22,11 @@
 // Exit 0 = every selected case GREEN (TRX64 ≡ TS). Exit 1 = at least one RED.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { spawnDaemon, type Daemon, type SpawnOpts } from "./daemon.js";
 import { connect, type RpcClient } from "./ws-client.js";
 import { diffResponses, formatDivergence } from "./diff.js";
+import { decodeTrace } from "./trace-decode.js";
 
 const SAMPLES =
   process.env.C64RE_SAMPLES ??
@@ -84,6 +85,14 @@ interface ConfCase {
   spawn?: SpawnOpts;
   /** Extract a JSON-able behavioural signal from one (already-connected) daemon. */
   signal: (c: RpcClient, d: Daemon) => Promise<unknown>;
+  /** When set, the case is SKIPPED by the default suite and reported as BLOCKED
+   *  (neither GREEN nor RED — it does not gate). Used when the divergence is real and
+   *  the TRX64 fix is verified out-of-band, but the TS AUTHORITY cannot report the
+   *  comparison signal under THIS oracle harness (e.g. a TS query method that awaits a
+   *  worker thread which is non-functional under tsx-from-src). The `signal` is kept
+   *  intact so the case re-arms automatically once the harness limitation is lifted —
+   *  run it explicitly with `--only <id> --include-blocked`. */
+  blocked?: string;
 }
 
 const SCRAMBLE_D64 = (() => {
@@ -343,6 +352,176 @@ const CASES: ConfCase[] = [
       };
     },
   },
+
+  // ── P1: broadcasts-1 — JAM auto-break under --stream (regression guard) ──────
+  // A KIL/JAM illegal opcode (0x02) jams the CPU: clk keeps cycling but PC is
+  // frozen (VICE-faithful), so a free-running advance never aborts on it. TS's
+  // per-frame tick detects the jammed state and HALTS (runState→paused) +
+  // server-PUSHes debug/stopped with reason "jam" (Spec 764, runtime-controller.ts
+  // :791-807). P0-A (926a399) lifted that detection into TRX64's stream loop
+  // (stream_debug_gated_advance, main.rs:1143-1171); this case is the regression
+  // guard. Load a 1-byte PRG `[$02]` at $1000 and run it (PC=$1000) under the
+  // continuous --stream driver, then read the run-state + the pushed stop reason.
+  // BOTH runtimes: jammed=true, reason "jam", broadcastReasonJam=true.
+  {
+    id: "broadcasts-1",
+    severity: "P1",
+    title: "JAM (KIL) auto-break halts + pushes debug/stopped reason=jam under --stream",
+    spawn: { stream: true },
+    async signal(c) {
+      const sid = await liveSession(c);
+      const sink = collectNotes(c);
+      // Load `[$02]` (KIL) at $1000 and run from there. run_prg pause→setPC=$1000
+      // →continue, and under --stream the continuous loop is the live driver.
+      // bytes_b64 = base64([0x00,0x10, 0x02]) = the 2-byte load addr $1000 + the KIL.
+      const prgB64 = Buffer.from([0x00, 0x10, 0x02]).toString("base64");
+      await c.call("runtime/run_prg", { session_id: sid, bytes_b64: prgB64, run: 0x1000 });
+      // The driver executes the KIL within a frame; give it a few frames to halt.
+      await sleep(4000);
+      const st = await state(c, sid);
+      sink.off();
+      const jamStop = sink.notes.find(
+        (n) => n.method === "debug/stopped" && (n.params?.stop?.reason === "jam"),
+      );
+      return {
+        // A jammed CPU makes no progress — the machine must be paused.
+        jammed: st.runState === "paused",
+        // …and the stop reason carried over the debug/stopped push must be "jam".
+        broadcastReasonJam: jamStop != null,
+        // The stop reason value itself (load-bearing — must read "jam" on both).
+        reason: (jamStop?.params as any)?.stop?.reason ?? null,
+      };
+    },
+  },
+
+  // ── P1: background-workers-async-5 — trace firehose fed during free-run ───────
+  // TS's tick() drains the active trace once per completed frame, so its binary
+  // writer keeps appending to the `.c64retrace` authority while the machine free-runs
+  // (runtime-controller.ts:869-874). TRX64's stream loop advanced with a NullSink +
+  // a no-op trace path, so a trace started DURING a --stream free-run recorded
+  // nothing. The signal starts the continuous driver, starts a cpu+memory trace to an
+  // explicit `.c64retrace` path under the project dir, free-runs ~1M+ cycles, stops
+  // (finalizes the log), decodes the file and counts events. TS: many. TRX64 (before
+  // wiring run_cycle_budget into the free-run advance): ~0. The signal is the
+  // CROSSED-THRESHOLD boolean (TS 50/PAL-frame vs TRX64 25/PAL-frame cadences differ,
+  // and the TS oracle is ~4 fps, so absolute counts diverge by design — both runtimes
+  // must simply produce a substantial, non-empty trace). (Audit P1 background-workers-async-5.)
+  {
+    id: "background-workers-async-5",
+    severity: "P1",
+    title: "live trace is fed every frame while free-running under --stream",
+    spawn: { stream: true },
+    async signal(c, d) {
+      const sid = await liveSession(c);
+      const duckdbPath = `${d.projectDir}/livetrace.duckdb`;
+      const retracePath = `${d.projectDir}/livetrace.c64retrace`;
+      // Start the continuous --stream driver, then wait until it has booted a bit so
+      // the trace window captures live CPU/memory activity (not a cold idle).
+      await c.call("debug/run", { session_id: sid });
+      await waitRunningBooted(c, sid, 1_500_000, 60_000);
+      // Start the trace the SAME way the WS does (trace/start_domains), to an explicit
+      // .c64retrace path so the case can read it back on either runtime.
+      await c.call("trace/start_domains", {
+        session_id: sid,
+        domains: ["c64-cpu", "memory"],
+        output: duckdbPath,
+      });
+      // Free-run a window so the per-frame drain feeds the firehose. The TS oracle is
+      // ~4 fps (≈80k cyc/frame), so ~25 wall-seconds is ~1M+ cycles of free-run.
+      const cycStart = (await state(c, sid)).c64Cycles ?? 0;
+      const deadline = Date.now() + 40_000;
+      while (Date.now() < deadline) {
+        await sleep(2000);
+        const cyc = (await state(c, sid)).c64Cycles ?? 0;
+        if (cyc - cycStart >= 1_000_000) break;
+      }
+      // Stop the trace → finalizes the .c64retrace (TS awaits the writer; TRX64 writes
+      // the buffer synchronously). wait_index:false so we don't block on the DuckDB index.
+      await c.call("trace/run/stop", { session_id: sid, wait_index: false }).catch(() => undefined);
+      // The writer finalize may land a beat after the RPC resolves (TS worker); give it
+      // a short grace + retry the read.
+      let events = 0;
+      for (let i = 0; i < 5; i++) {
+        if (existsSync(retracePath)) {
+          try {
+            const buf = readFileSync(retracePath);
+            events = decodeTrace(buf).records.length;
+            if (events > 0) break;
+          } catch { /* partial flush — retry */ }
+        }
+        await sleep(500);
+      }
+      return {
+        // The behavioural signal: a trace started DURING free-run captured a
+        // substantial event stream (not the empty log of a NullSink advance).
+        traceCapturedDuringFreeRun: events > 100,
+      };
+    },
+  },
+
+  // ── P1: background-workers-async-0 — recorder auto-fed during free-run ────────
+  // TS's tick() feeds the active recorder one omitMedia anchor at the per-second
+  // auto-capture cadence (runtime-controller.ts:846-852), so a FREE-RUNNING machine
+  // grows recorder anchors over time WITHOUT any explicit capture. TRX64's stream
+  // loop fed only the checkpoint ring; the recorder advanced only on an explicit
+  // recorder/capture (main.rs recorder/capture handler), so a --stream free-run
+  // left it frozen. The recorder is default-OFF on TS (opt-in C64RE_RECORDER=1, set
+  // on BOTH daemons via spawn.env); TRX64 needs an explicit recorder/start (TS has
+  // none — its recorder is created by run() — so the call is best-effort). The signal
+  // takes a baseline anchor count, free-runs, polls for growth, and reports whether
+  // the count INCREASED over the window. TS: true (auto-fed). TRX64 (before fix):
+  // false (flat). (Audit P1 background-workers-async-0 + ws-checkpoint-scrub-7.)
+  {
+    id: "background-workers-async-0",
+    severity: "P1",
+    title: "recorder auto-fed each cadence while free-running under --stream",
+    // BLOCKED by the TS oracle harness, NOT by a TRX64 defect. The TS recorder's
+    // every query method (recorder/list + recorder/status) does `await c.recorder
+    // .list()/.stats()`, which round-trips to a node:worker_threads worker resolved
+    // at WORKER_PATH = `${dirname(import.meta.url)}/recorder-worker.js`. Under the
+    // tsx-from-src oracle daemon, import.meta.url is the SRC `.ts` dir — where only
+    // recorder-worker.ts exists (the built .js lives under dist/) — so the worker
+    // fails to load, its error is swallowed, and the query promise NEVER resolves
+    // (rpc timeout). So the TS authority cannot report the recorder anchor count here.
+    // The fix IS verified directly on TRX64 (in-process recorder, no worker): under
+    // --stream the anchor count grows 1→3→6→8→11→13→16 over 12 s of free-run
+    // (was flat at 1 before stream_maybe_feed_recorder, main.rs). Re-arm once the TS
+    // recorder worker resolves under tsx (or the oracle runs the built TS daemon).
+    blocked:
+      "TS recorder/list|status awaits a worker thread that is non-functional under " +
+      "tsx-from-src (recorder-worker.js resolves to the src .ts dir). Fix verified " +
+      "directly on TRX64 (anchors grow 1→16 over 12s free-run under --stream).",
+    spawn: { stream: true, env: { C64RE_RECORDER: "1" } },
+    async signal(c) {
+      const sid = await liveSession(c);
+      // TRX64 needs an explicit recorder/start; TS auto-creates the recorder in run()
+      // and has no such method → ignore the error there.
+      await c.call("recorder/start", { session_id: sid }).catch(() => undefined);
+      // Start the continuous --stream driver (on TS this ALSO creates the recorder).
+      await c.call("debug/run", { session_id: sid });
+      const listCount = async (): Promise<number> => {
+        const r = (await c.call("recorder/list", { session_id: sid })) as any;
+        return Array.isArray(r?.anchors) ? r.anchors.length : 0;
+      };
+      // Baseline AFTER the driver is live (recorder/start may have captured 1 anchor;
+      // we measure GROWTH from here, so a runtime starting at 1 vs 0 doesn't matter).
+      const baseline = await listCount();
+      // Poll for growth. The recorder cadence is in EMULATED frames (TS 50 / TRX64 25)
+      // and the TS oracle daemon emulates ~4 fps, so one TS cadence ≈ 12.5s wall —
+      // poll up to ~60s for at least one fresh anchor (well under the 240s RPC cap).
+      const deadline = Date.now() + 60_000;
+      let latest = baseline;
+      while (Date.now() < deadline) {
+        await sleep(2000);
+        latest = await listCount();
+        if (latest > baseline) break;
+      }
+      return {
+        // The behavioural signal: free-running grows the recorder anchor count.
+        recorderGrewWhileFreeRunning: latest > baseline,
+      };
+    },
+  },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -385,6 +564,9 @@ async function main() {
   const sev = sevIdx >= 0 ? args[sevIdx + 1] : undefined;
   const onlyIdx = args.indexOf("--only");
   const only = onlyIdx >= 0 ? args[onlyIdx + 1] : undefined;
+  // `--include-blocked` runs the harness-blocked cases too (e.g. to re-check whether
+  // the TS-side limitation has been lifted). By default they are SKIPPED + reported.
+  const includeBlocked = args.includes("--include-blocked");
 
   const selected = CASES.filter(
     (c) => (!sev || c.severity === sev) && (!only || c.id === only),
@@ -396,12 +578,26 @@ async function main() {
 
   console.log(`\nDifferential WS-conformance gate — ${selected.length} case(s)\n`);
   let red = 0;
+  let blocked = 0;
   for (const cse of selected) {
     process.stdout.write(`[${cse.severity}] ${cse.id} — ${cse.title}\n`);
+    // A harness-blocked case does not gate: skip it unless `--only` named it or
+    // `--include-blocked` is set (then it runs and its result is shown, not counted).
+    if (cse.blocked && !includeBlocked && only !== cse.id) {
+      blocked++;
+      console.log(`   BLOCKED  ${cse.blocked}\n`);
+      continue;
+    }
     try {
       const r = await runCase(cse);
       if (r.ok) {
         console.log(`   GREEN  TRX64 ≡ TS  ${JSON.stringify(r.tsSig)}\n`);
+      } else if (cse.blocked) {
+        // Run-on-demand of a blocked case: report, but never fail the suite on it.
+        blocked++;
+        console.log(`   BLOCKED (ran on demand) ${r.detail}`);
+        console.log(`          TS   = ${JSON.stringify(r.tsSig)}`);
+        console.log(`          TRX64= ${JSON.stringify(r.trxSig)}\n`);
       } else {
         red++;
         console.log(`   RED    ${r.detail}`);
@@ -409,11 +605,17 @@ async function main() {
         console.log(`          TRX64= ${JSON.stringify(r.trxSig)}\n`);
       }
     } catch (e) {
-      red++;
-      console.log(`   ERROR  ${e instanceof Error ? e.message : String(e)}\n`);
+      if (cse.blocked) {
+        blocked++;
+        console.log(`   BLOCKED (ran on demand) ${e instanceof Error ? e.message : String(e)}\n`);
+      } else {
+        red++;
+        console.log(`   ERROR  ${e instanceof Error ? e.message : String(e)}\n`);
+      }
     }
   }
-  console.log(`${selected.length - red}/${selected.length} GREEN, ${red} RED`);
+  const gated = selected.length - blocked;
+  console.log(`${gated - red}/${gated} GREEN, ${red} RED${blocked ? `, ${blocked} BLOCKED (non-gating)` : ""}`);
   process.exit(red === 0 ? 0 : 1);
 }
 

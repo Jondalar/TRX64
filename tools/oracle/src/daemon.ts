@@ -47,6 +47,10 @@ export interface SpawnOpts {
    *  disk/cart so media/recent + media/mount have real fixtures. `rel` is a path
    *  relative to the project dir; nested dirs are created. */
   seedFiles?: Array<{ rel: string; bytes: Buffer | Uint8Array }>;
+  /** Extra environment variables for BOTH daemons (e.g. C64RE_RECORDER=1 to
+   *  opt the recorder in on TS, where it is default-OFF). Applied verbatim to the
+   *  child env of each kind so a case can flip the SAME feature flag on both. */
+  env?: Record<string, string>;
 }
 
 export async function spawnDaemon(kind: DaemonKind, opts: SpawnOpts = {}): Promise<Daemon> {
@@ -61,17 +65,19 @@ export async function spawnDaemon(kind: DaemonKind, opts: SpawnOpts = {}): Promi
   }
   const streamArg = opts.stream ? ["--stream"] : [];
 
+  const extraEnv = opts.env ?? {};
   let child: ChildProcess;
   if (kind === "ts") {
     child = spawn(
       "node_modules/.bin/tsx",
       ["src/runtime/headless/daemon/run.ts", "--project", projectDir, "--port", String(port), ...streamArg],
-      { cwd: C64RE_ROOT, stdio: "ignore", detached: true, env: { ...process.env, C64RE_RUNTIME_AUTOSTART: "0" } },
+      { cwd: C64RE_ROOT, stdio: "ignore", detached: true, env: { ...process.env, C64RE_RUNTIME_AUTOSTART: "0", ...extraEnv } },
     );
   } else {
     child = spawn(TRX64_BIN, ["--project", projectDir, "--port", String(port), ...streamArg], {
       stdio: "ignore",
       detached: true,
+      env: { ...process.env, ...extraEnv },
     });
   }
 

@@ -301,6 +301,17 @@ struct State {
     /// filmstrip/scrub depends on a populated ring; without this loop it is sparse.
     /// Skipped while a mounted medium is dirty + non-persistable (Spec 709.13).
     autocapture_frames_since: u64,
+    /// Spec 766.5b (audit background-workers-async-0 + ws-checkpoint-scrub-7) —
+    /// recorder auto-feed cadence: capture one CORE-ONLY (omitMedia) recorder anchor
+    /// every CHECKPOINT_CAPTURE_EVERY_FRAMES stream-loop frames while a recorder is
+    /// active, mirroring the c64re tick() recorder.captureAnchor call (runtime-
+    /// controller.ts:846-852) — there the recorder rides the SAME cadence as the ring
+    /// auto-capture, inside tick(), so a free-running machine grows recorder anchors
+    /// over time. TRX64 previously fed the recorder ONLY on an explicit recorder/
+    /// capture, so a --stream free-run left the recorder frozen at 1 (or 0) anchors.
+    /// This counter drives the per-frame feed (separate from `autocapture_frames_since`
+    /// because the ring auto-capture is warp-skipped while the recorder is not).
+    recorder_frames_since: u64,
     /// Spec 769.5a — the SEPARATE per-checkpoint thumbnail store (= the c64re
     /// `RuntimeController.checkpointThumbs` map, runtime-controller.ts:181). Keyed by
     /// checkpoint id, capped at [`MAX_THUMBS`]. Decoupled from the ring's
@@ -1052,11 +1063,28 @@ fn stream_debug_gated_advance(st: &mut State, budget: u64) -> u32 {
     let clk_before = st.session.machine.c64_core.clk;
 
     if !observers_armed(&st.observers) {
-        // ── No debug gate: plain full-machine advance (historical stream path). ──
-        let mut sink = NullSink;
-        st.session
-            .machine
-            .run_for_full(budget, &mut sink, |_, _, _, _, _, _, _| {});
+        // ── No debug gate. When a trace is ACTIVE, the free-run advance must FEED the
+        // firehose every frame (audit background-workers-async-5): the c64re tick()
+        // drains traceRun once per completed frame so its worker writes the
+        // .c64retrace authority (runtime-controller.ts:869-874). TRX64's stream loop
+        // previously advanced with a bare NullSink, so a trace started during a
+        // --stream free-run recorded NOTHING. `run_cycle_budget` is the SAME trace-
+        // aware advance path the one-shot session/run uses — it attaches a real
+        // TracingObserver with the trace's channels and appends the frame's events to
+        // session.trace.buf (flushed to .c64retrace at trace/run/stop).
+        if st.session.trace.is_some() {
+            run_cycle_budget(&mut st.session, budget);
+        } else {
+            // No trace: the historical plain full-machine advance. KEEP this as
+            // `run_for_full` UNCONDITIONALLY (NOT run_cycle_budget's no-trace path,
+            // which routes an injected machine onto the cpu6510-isolated `run_for`) —
+            // the JAM auto-break below reads `c64_core.is_jammed`, which only the full
+            // path drives. Byte-identical to the pre-trace stream path.
+            let mut sink = NullSink;
+            st.session
+                .machine
+                .run_for_full(budget, &mut sink, |_, _, _, _, _, _, _| {});
+        }
     } else {
         // runtime-controller.ts:277 stepPastCurrentBreakpoint — if the PC currently
         // sits ON an enabled exec breakpoint (e.g. we just halted there and the user
@@ -1169,6 +1197,21 @@ fn stream_debug_gated_advance(st: &mut State, budget: u64) -> u32 {
         // Not jammed — re-arm the edge for the next episode.
         st.stream_broke_on_jam = false;
     }
+
+    // ITEM (audit background-workers-async-3) — drain observer `do log`/`do mark`/
+    // `do cmd` side-effects EVERY free-run frame. The c64re tick() drains them once
+    // per chunk, unconditionally, BEFORE the halt checks (runtime-controller.ts:
+    // 697-725) — a non-halting log/mark/cmd observer reaches the monitor only via this
+    // chunk-boundary drain, not an explicit `obs log`. TRX64 previously drained them
+    // ONLY inside the observers-armed branch above (so the armed-but-non-halt frame is
+    // covered) AND in the one-shot run_debug_control; the per-frame free-run path had
+    // no standalone drain. This makes the per-frame drain authoritative for the stream
+    // loop. On an armed frame the branch above already drained, so this is a cheap
+    // no-op (the pending queues are empty); on a no-observer frame nothing queued, so
+    // it is also a no-op. The bp/observer/JAM halt branches return early ABOVE this —
+    // each having already drained before its halt broadcast (TS order: log lines
+    // precede the halt), so a halt frame's ordering is preserved.
+    drain_and_broadcast_observer_log(st);
 
     st.session.machine.c64_core.clk.wrapping_sub(clk_before) as u32
 }
@@ -3613,6 +3656,12 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 // Explicit entry point: set PC and resume (mirrors TS pause→setPC→continue).
                 let pc = (entry & 0xffff) as u16;
                 st.session.machine.cpu6510.reg_pc = pc;
+                // The full-machine driver (run_for_full, used by the --stream loop AND
+                // session/run) executes from `c64_core`, NOT `cpu6510`; sync_after_monitor
+                // only mirrors cpu6510 → the snapshot, not into c64_core. So set the
+                // full-machine PC too (= the monitor `g` command, main.rs:1874-1875),
+                // else a run-from-entry keeps running the KERNAL at the old c64_core PC.
+                st.session.machine.c64_core.reg_pc = pc;
                 st.session.machine.sync_after_monitor();
                 st.session.injected = true;
                 st.session.running = true;
@@ -3629,6 +3678,10 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 // Machine-code at non-BASIC load address: set PC to load address and resume.
                 // Mirrors: pause; set PC = loadAddress; continue; action = "g $XXXX (default = load address)"
                 st.session.machine.cpu6510.reg_pc = load_addr;
+                // Set the full-machine PC too (= monitor `g`, main.rs:1874-1875) — the
+                // run_for_full driver runs from c64_core, which sync_after_monitor does
+                // not touch (see the explicit-entry branch above for the full rationale).
+                st.session.machine.c64_core.reg_pc = load_addr;
                 st.session.machine.sync_after_monitor();
                 st.session.injected = true;
                 st.session.running = true;
@@ -6821,6 +6874,39 @@ fn stream_maybe_autocapture(st: &mut State, frame: u64, canvas_w: usize, canvas_
     }
 }
 
+/// ITEM 4 (audit background-workers-async-0 + ws-checkpoint-scrub-7) — feed the
+/// active recorder every CHECKPOINT_CAPTURE_EVERY_FRAMES RUNNING stream-loop frames.
+/// = the c64re tick() recorder feed (runtime-controller.ts:846-852): inside the
+/// per-second auto-capture cadence, `if (this.recorder) this.recorder.captureAnchor
+/// (a.payload, …, omitMedia)`. So a FREE-RUNNING machine grows recorder anchors over
+/// time without any explicit recorder/capture. TRX64 previously fed the recorder
+/// ONLY on an explicit recorder/capture (main.rs recorder/capture handler), so a
+/// --stream free-run left the recorder anchor count frozen at 1 (or 0) — the
+/// divergence this closes. Reuses `capture_anchor_now` (= capture_recorder_anchor
+/// _payload + the gen-gated medium stream), so the on-disk anchor shape is identical
+/// to an explicit recorder/capture. No-op (zero cost) when no recorder is active.
+/// Isolated: capture_anchor_now never panics (the recorder store evicts, never
+/// throws). Disable with C64RE_RECORDER_AUTOFEED=0.
+fn stream_maybe_feed_recorder(st: &mut State, _frame: u64) {
+    // Zero-cost gate: nothing to feed when the recorder is inactive.
+    if st.recorder.is_none() {
+        return;
+    }
+    if std::env::var("C64RE_RECORDER_AUTOFEED").as_deref() == Ok("0") {
+        return;
+    }
+    st.recorder_frames_since = st.recorder_frames_since.wrapping_add(1);
+    if st.recorder_frames_since < CHECKPOINT_CAPTURE_EVERY_FRAMES {
+        return;
+    }
+    st.recorder_frames_since = 0;
+    // One CORE-ONLY (omitFramebuffer + gen-gated omitMedia) anchor — the same path
+    // an explicit recorder/capture takes (runtime-controller.ts:847 snapshot{shallow,
+    // omitFramebuffer, omitMedia}). The seq is discarded here (the cadence drives it,
+    // not a caller).
+    let _ = capture_anchor_now(st);
+}
+
 /// Spec 769.5a — insert a thumbnail keyed by checkpoint id, evicting the oldest
 /// (insertion order) when the store exceeds [`MAX_THUMBS`]. 1:1 with c64re
 /// `captureThumb` (runtime-controller.ts:434-441): a separate, ring-decoupled store.
@@ -7918,6 +8004,7 @@ async fn main() {
         disk_ap_seen_hash: None,
         disk_ap_done_hash: None,
         autocapture_frames_since: 0,
+        recorder_frames_since: 0,
         checkpoint_thumbs: std::collections::HashMap::new(),
         checkpoint_thumb_order: std::collections::VecDeque::new(),
         mon: MonitorState::new(),
@@ -8003,6 +8090,7 @@ mod batch1_tests {
             disk_ap_seen_hash: None,
             disk_ap_done_hash: None,
             autocapture_frames_since: 0,
+            recorder_frames_since: 0,
             checkpoint_thumbs: std::collections::HashMap::new(),
             checkpoint_thumb_order: std::collections::VecDeque::new(),
             mon: MonitorState::new(),

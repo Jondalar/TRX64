@@ -411,6 +411,15 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
                 // (the ring anchor itself stays framebuffer-omitted, BUG-049).
                 crate::stream_maybe_autocapture(&mut st, frame_no, w, h, &indices);
             }
+            //   ITEM 4 — recorder auto-feed (audit background-workers-async-0 +
+            //   ws-checkpoint-scrub-7). The c64re tick() feeds the active recorder one
+            //   omitMedia anchor at the SAME per-second cadence as the ring auto-capture
+            //   (runtime-controller.ts:846-852), so a free-running machine grows recorder
+            //   anchors over time. Runs in BOTH warp + PAL (unlike the warp-skipped ring
+            //   auto-capture) — the recorder is not the live-scrub filmstrip; it is the
+            //   off-thread scrub history, fed regardless of pace. No-op unless a recorder
+            //   is active (recorder/start).
+            crate::stream_maybe_feed_recorder(&mut st, frame_no);
 
             // audit streaming-av-5 — push the lightweight JSON `session/frame_available`
             // notification on every PRESENTED frame, alongside the binary VIC frame, for
