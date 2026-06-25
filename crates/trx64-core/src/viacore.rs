@@ -726,6 +726,20 @@ pub fn run_pending_alarms(
     offset: u64,
 ) {
     while clk > ctx.alarm_context.next_pending_alarm_clk {
+        // [SAFETY — parity TODO] The 1541 drive viacore still arms alarm deadlines
+        // u32-masked (`& 0xffff_ffff`) while the drive clock (`clk` here = drive
+        // core.clk) is u64-MONOTONIC. BUG-025/Spec-743 removed the u32 masks on the
+        // C64 core but did NOT extend that to the drive viacore. Once the drive clock
+        // crosses 2^32 (long run / warp / a checkpoint-restore over that boundary) the
+        // u32-range deadline is permanently unreachable → this loop "catches up" ~4
+        // billion times while HOLDING the state Mutex → the whole daemon wedges
+        // (observed: pause → scrub → run = dead VM, all WS handlers blocked). Bail on
+        // the impossible gap instead of hanging: the drive VIA alarms stall, but the
+        // C64 + daemon stay alive. REAL FIX = make the drive viacore u64-monotonic
+        // (remove the `& 0xffff_ffff` masks throughout; differential-test vs VICE).
+        if clk.wrapping_sub(ctx.alarm_context.next_pending_alarm_clk) > (1u64 << 31) {
+            break;
+        }
         // alarm.h:131-144 alarm_context_dispatch: fire the cached next-pending
         // alarm, offset = u32(cpu_clk - next_pending_alarm_clk).
         let cpu_clk = (clk + offset) & 0xffff_ffff;
