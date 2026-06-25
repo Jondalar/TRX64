@@ -180,7 +180,8 @@ pub struct TraceChannels {
     pub vic: bool,
     /// `sid` channel — RESERVED, NO live producer. Activates the SID isolation
     /// bus so the exerciser runs against the SID model, but op-0x22 is never
-    /// emitted. The `sid` domain also enables `cpu` + `memory` channels.
+    /// emitted. The `sid` domain enables ONLY this channel (= TS: sid → {"sid"});
+    /// it does NOT co-enable `cpu`/`memory` (audit formats-state-6).
     pub sid: bool,
     /// `drive_pc` channel — emits DRIVE_CPU_STEP (0x30). Activated by "drive8-cpu"
     /// domain. Sampled at C64 instruction boundaries, deduplicated by PC.
@@ -196,7 +197,12 @@ impl TraceChannels {
                 "c64-cpu" => c.cpu = true,
                 "memory" => c.mem = true,
                 "vic" | "c64-vic" => c.vic = true,
-                "sid" => { c.sid = true; c.cpu = true; c.mem = true; }
+                // audit formats-state-6 — `sid` enables ONLY the sid channel (= TS
+                // domainsToChannels: sid → {"sid"}). The sid channel has no live
+                // producer, so a sid-only domain yields an empty stream; it must NOT
+                // co-enable cpu/mem (that wrongly inflated a sid trace with every
+                // CPU step + RAM/IO write).
+                "sid" => { c.sid = true; }
                 "drive8-cpu" => c.drive_cpu = true,
                 _ => {}
             }

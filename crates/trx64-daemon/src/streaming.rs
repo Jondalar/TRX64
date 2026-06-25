@@ -412,6 +412,21 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
                 crate::stream_maybe_autocapture(&mut st, frame_no, w, h, &indices);
             }
 
+            // audit streaming-av-5 — push the lightweight JSON `session/frame_available`
+            // notification on every PRESENTED frame, alongside the binary VIC frame, for
+            // metadata-only consumers (= TS runtime-controller.ts maybePresentFrame →
+            // broadcast("session/frame_available", {session_id, frame, c64Cycles}), 1:1
+            // per presented frame since PAL_PRESENT_DIVISOR=1). c64Cycles is the full
+            // master clock (TS `c64Cpu.cycles`), NOT the truncated u32 in the binary frame.
+            st.notify.broadcast(
+                "session/frame_available",
+                serde_json::json!({
+                    "session_id": st.session.id,
+                    "frame": frame_seq as u64,
+                    "c64Cycles": st.session.machine.clk,
+                }),
+            );
+
             // Drop the lock before building the (larger) wire buffers + sleeping.
             drop(st);
 

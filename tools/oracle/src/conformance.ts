@@ -162,6 +162,187 @@ const CASES: ConfCase[] = [
       };
     },
   },
+
+  // ── P1: ws-session-debug-5 — break_* entries carry `addr`, not `pc` ─────────
+  // TS uniformly keys a breakpoint entry by `addr` (runtime-controller.ts
+  // listBreakpoints → {num, addr}; ws-server.ts break_add/del/list echo it). TRX64
+  // emitted `{num, pc}`, so a UI/LLM reading `entry.addr` saw undefined. The signal
+  // reads the breakpoints array returned by break_add AND break_list and reports
+  // which key the entry actually carries. TS: hasAddr=true,hasPc=false. TRX64
+  // (before fix): hasAddr=false,hasPc=true. (Audit P1 ws-session-debug-5.)
+  {
+    id: "ws-session-debug-5",
+    severity: "P1",
+    title: "break_add/del/list entries key on `addr` (not `pc`)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      const added = (await c.call("debug/break_add", { session_id: sid, pc: 0xea31 })) as any;
+      const listed = (await c.call("debug/break_list", { session_id: sid })) as any;
+      const fromAdd: any[] = added?.breakpoints ?? [];
+      const fromList: any[] = listed?.breakpoints ?? [];
+      const entry = fromList[0] ?? fromAdd[0] ?? {};
+      return {
+        // The load-bearing field: the entry must expose its address as `addr`.
+        addEntryHasAddr: fromAdd.length > 0 && fromAdd.every((e) => "addr" in e),
+        listEntryHasAddr: fromList.length > 0 && fromList.every((e) => "addr" in e),
+        // …and must NOT leak the legacy `pc` key (TS never emits it here).
+        entryHasPc: "pc" in entry,
+        // The address value itself must survive under `addr`.
+        addrValue: entry.addr ?? null,
+      };
+    },
+  },
+
+  // ── P1: ws-media-2 — disk eject reports the REAL run-state ──────────────────
+  // A disk eject is a live device op (the C64 keeps running). TS's ingress reports
+  // paused = (runState === "paused"), so a running machine ejecting a disk returns
+  // paused:false. TRX64 hardcoded paused:!is_cart = true for every disk eject. The
+  // signal mounts a disk, runs to booted, ejects, and reads the unmount `paused`.
+  // TS: false. TRX64 (before fix): true. (Audit P1 ws-media-2.)
+  {
+    id: "ws-media-2",
+    severity: "P1",
+    title: "disk eject reports real run-state (paused:false while running)",
+    spawn: { stream: true, seedFiles: [{ rel: "fixtureA.d64", bytes: SCRAMBLE_D64 }] },
+    async signal(c, d) {
+      const sid = await liveSession(c);
+      const diskPath = `${d.projectDir}/fixtureA.d64`;
+      await c.call("media/mount", { session_id: sid, path: diskPath, slot: 8 });
+      // --stream does NOT auto-run; debug/run starts the live driver.
+      await c.call("debug/run", { session_id: sid });
+      // Wait until the machine is genuinely running + booted past the IRQ-on point
+      // so the eject happens while running (the divergence is run-state-dependent).
+      const st = await waitRunningBooted(c, sid, 2_500_000, 60_000);
+      if (st.runState !== "running") await c.call("debug/run", { session_id: sid });
+      const ejectResp = (await c.call("media/unmount", { session_id: sid, slot: 8 })) as any;
+      return {
+        // The behavioural signal: a disk eject on a RUNNING machine is never paused.
+        ejectPaused: ejectResp?.paused === true,
+      };
+    },
+  },
+
+  // ── P1: ws-session-debug-12 — cold reset clears the checkpoint ring ─────────
+  // A cold power-cycle is a new machine: the ring's anchors belong to the OLD
+  // timeline, so TS drops the ring on resetCold (ws-server.ts → checkpointRing
+  // .clear()). TRX64's cold reset path left the ring populated. The signal captures
+  // two checkpoints, asserts the ring is non-empty, cold-resets, then lists the ring
+  // count. TS: 0. TRX64 (before fix): 2. (Audit P1 ws-session-debug-12.)
+  {
+    id: "ws-session-debug-12",
+    severity: "P1",
+    title: "session/reset {mode:cold} clears the checkpoint ring",
+    async signal(c) {
+      const sid = await liveSession(c);
+      await c.call("checkpoint/capture", { session_id: sid });
+      await c.call("checkpoint/capture", { session_id: sid });
+      const before = (await c.call("checkpoint/list", { session_id: sid })) as any;
+      const beforeCount = (before?.checkpoints ?? []).length;
+      await c.call("session/reset", { session_id: sid, mode: "cold" });
+      const after = (await c.call("checkpoint/list", { session_id: sid })) as any;
+      const afterCount = (after?.checkpoints ?? []).length;
+      return {
+        // Pre-condition (both runtimes accumulate ≥1 anchor) — guards a false green.
+        hadCheckpoints: beforeCount > 0,
+        // The behavioural signal: the cold reset must leave the ring empty.
+        ringEmptyAfterColdReset: afterCount === 0,
+      };
+    },
+  },
+
+  // ── P1: ws-trace-monitor-misc-18 — runtime/mark requires an active trace ─────
+  // TS throws if no trace is active (you cannot stamp a marker into a stream that
+  // isn't recording); only with an active trace does it record + return the real
+  // mark count. TRX64 returned ok with a fabricated count regardless. The signal
+  // calls runtime/mark with NO active trace and reports whether it succeeded. TS:
+  // ok=false (error). TRX64 (before fix): ok=true. (Audit P1 ws-trace-monitor-misc-18.)
+  {
+    id: "ws-trace-monitor-misc-18",
+    severity: "P1",
+    title: "runtime/mark errors when no trace is active",
+    async signal(c) {
+      const sid = await liveSession(c);
+      let ok = false;
+      let marks: unknown = null;
+      try {
+        const r = (await c.call("runtime/mark", { session_id: sid, label: "probe" })) as any;
+        ok = true;
+        marks = r?.marks ?? null;
+      } catch {
+        ok = false;
+      }
+      return {
+        // The behavioural signal: marking an inactive trace must NOT succeed.
+        markSucceededWithoutTrace: ok,
+      };
+    },
+  },
+
+  // ── P1: formats-state-6 — `sid` trace domain enables ONLY the sid channel ────
+  // TS maps `sid` → the `sid` channel alone (no live producer → empty stream), so
+  // ADDING `sid` to a trace's domains contributes ZERO extra events. TRX64's `sid`
+  // domain wrongly also flipped on cpu+mem, so adding `sid` to a cpu trace inflated
+  // the event count with all RAM/IO writes. A bare ["sid"] trace is an invalid
+  // definition (no triggers/captures) that TS rejects up front, so the discriminator
+  // is differential: run a ["c64-cpu"] trace (cpu only) and a ["c64-cpu","sid"] trace
+  // over the same cycle budget, and report whether the `sid` domain inflated the
+  // count. TS: false (sid adds nothing). TRX64 (before fix): true (sid → +mem).
+  // (Audit P1 formats-state-6.)
+  {
+    id: "formats-state-6",
+    severity: "P1",
+    title: "trace `sid` domain enables only sid (adds no cpu/mem events)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      const runTrace = async (domains: string[]): Promise<number> => {
+        await c.call("trace/start_domains", { session_id: sid, domains });
+        await c.call("session/run", { session_id: sid, cycles: 300_000 });
+        const status = (await c.call("trace/run/status", { session_id: sid })) as any;
+        const n = Number(status?.eventCount ?? 0);
+        await c.call("trace/run/stop", { session_id: sid }).catch(() => undefined);
+        return n;
+      };
+      const cpuOnly = await runTrace(["c64-cpu"]);
+      const cpuPlusSid = await runTrace(["c64-cpu", "sid"]);
+      return {
+        // The behavioural signal: adding the `sid` domain must NOT inflate the
+        // event count (no mem/cpu co-enable). >1.5× = the sid→cpu+mem leak fired.
+        sidDomainInflatesEvents: cpuOnly > 0 && cpuPlusSid > cpuOnly * 1.5,
+      };
+    },
+  },
+
+  // ── P1: streaming-av-5 — session/frame_available JSON notification per frame ─
+  // TS pushes a lightweight `session/frame_available` JSON notification on every
+  // presented frame (alongside the binary VIC frame), for metadata-only consumers.
+  // TRX64's stream loop pushed only the binary VIC frame; the NotifyHub was never
+  // called. The signal spawns --stream, runs, collects notifications ~3s, and counts
+  // the frame_available pushes. TS: > 0. TRX64 (before fix): 0. (Audit P1 streaming-av-5.)
+  {
+    id: "streaming-av-5",
+    severity: "P1",
+    title: "session/frame_available JSON notification emitted per presented frame",
+    spawn: { stream: true },
+    async signal(c) {
+      const sid = await liveSession(c);
+      const sink = collectNotes(c);
+      await c.call("debug/run", { session_id: sid });
+      await sleep(3000); // the running stream loop presents frames continuously
+      sink.off();
+      const frameNotes = sink.notes.filter((n) => n.method === "session/frame_available");
+      const first = frameNotes[0]?.params as any;
+      return {
+        // The behavioural signal: at least one frame_available notification arrived.
+        gotFrameAvailable: frameNotes.length > 0,
+        // …and it carries the TS payload shape ({session_id, frame, c64Cycles}).
+        hasPayloadShape:
+          first != null &&
+          "session_id" in first &&
+          "frame" in first &&
+          "c64Cycles" in first,
+      };
+    },
+  },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -172,8 +353,11 @@ async function runCase(cse: ConfCase): Promise<{ ok: boolean; tsSig: unknown; tr
   let trx: Daemon | undefined;
   try {
     [ts, trx] = await Promise.all([spawnDaemon("ts", cse.spawn), spawnDaemon("trx64", cse.spawn)]);
-    const tsC = await connect(ts.endpoint, 60_000);
-    const trxC = await connect(trx.endpoint, 60_000);
+    // Per-RPC timeout. The TS oracle daemon is tsx-from-src (~4fps), and some
+    // control ops are a single blocking RPC that runs millions of cycles inline
+    // (e.g. session/reset cold = runFor(5M)). 240s keeps those from a false timeout.
+    const tsC = await connect(ts.endpoint, 240_000);
+    const trxC = await connect(trx.endpoint, 240_000);
     let tsSig: unknown, trxSig: unknown;
     try {
       tsSig = await cse.signal(tsC, ts);

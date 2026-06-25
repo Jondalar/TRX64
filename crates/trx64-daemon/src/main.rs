@@ -621,8 +621,9 @@ fn run_cycle_budget(session: &mut Session, budget: u64) {
         } else if channels.sid {
             // SID isolation gate: routes $D400-$D7FF to the SID 6581 model.
             // The `sid` domain has NO live trace producer (reserved, like vic —
-            // ADR-015 pattern); SID writes appear as op-0x11 RAM_WRITE from the
-            // CPU bus tap. The cpu/memory channels are co-enabled by `sid` domain.
+            // ADR-015 pattern); SID writes appear as op-0x11 RAM_WRITE ONLY when the
+            // `memory` channel is independently enabled. `sid` alone emits nothing
+            // (audit formats-state-6: sid no longer co-enables cpu/mem).
             session.machine.run_for_sid(seg, &mut obs);
         } else if channels.mem {
             session.machine.run_for_cia(seg, &mut obs);
@@ -3177,6 +3178,12 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 st.session.machine.fill_power_on_ram();
                 st.session.machine.cold_reset();
                 st.session.machine.drive8.cold_reset();
+                // audit ws-session-debug-12 — a cold power-cycle is a NEW machine: the
+                // checkpoint ring's anchors belong to the OLD timeline (pre-reset
+                // RAM/state), so scrubbing back to them would jump into a defunct
+                // session. Drop the ring; it refills from the fresh boot. (= TS
+                // ws-server.ts cold path → ctrl.checkpointRing.clear(), Spec 761.)
+                st.checkpoint_ring.clear();
             }
             st.session.machine.keyboard.clear();
             run_cycle_budget(&mut st.session, 5_000_000);
@@ -3507,8 +3514,11 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             let num = st.breakpoints.next_num;
             st.breakpoints.next_num += 1;
             st.breakpoints.entries.push(BpEntry { num, pc: pc_val, enabled: true });
+            // audit ws-session-debug-5 — emit `addr` (not `pc`) for each entry: TS
+            // uniformly keys a breakpoint by `addr` (runtime-controller.ts
+            // listBreakpoints → {num, addr}; ws-server.ts break_add/del/list echo it).
             let list: Vec<Value> = st.breakpoints.entries.iter()
-                .map(|e| json!({ "num": e.num, "pc": e.pc as u64 }))
+                .map(|e| json!({ "num": e.num, "addr": e.pc as u64 }))
                 .collect();
             Response::ok(id, json!({
                 "num": num,
@@ -3525,8 +3535,9 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 // No id = delete all
                 st.breakpoints.entries.clear();
             }
+            // audit ws-session-debug-5 — `addr` key (= TS), not `pc`.
             let list: Vec<Value> = st.breakpoints.entries.iter()
-                .map(|e| json!({ "num": e.num, "pc": e.pc as u64 }))
+                .map(|e| json!({ "num": e.num, "addr": e.pc as u64 }))
                 .collect();
             Response::ok(id, json!({
                 "deleted": true,
@@ -3536,8 +3547,9 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
 
         "debug/break_list" => {
             let st = state.lock().unwrap();
+            // audit ws-session-debug-5 — `addr` key (= TS), not `pc`.
             let list: Vec<Value> = st.breakpoints.entries.iter()
-                .map(|e| json!({ "num": e.num, "pc": e.pc as u64 }))
+                .map(|e| json!({ "num": e.num, "addr": e.pc as u64 }))
                 .collect();
             Response::ok(id, json!({ "breakpoints": list }))
         }
@@ -3834,11 +3846,22 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let st = state.lock().unwrap();
-            let (run_id, event_count, marks) = match &st.session.trace {
-                Some(t) => (t.run_id.clone(), t.event_count, 1u64),
-                None => ("".to_string(), 0u64, 0u64),
+            let mut st = state.lock().unwrap();
+            // audit ws-trace-monitor-misc-18 — match TS: you cannot stamp a phase
+            // marker into a stream that isn't recording. Error when no trace is
+            // active (ws-server.ts:753 throws); else record the mark + return the
+            // REAL mark count (was a fabricated marks:1 + success-when-inactive).
+            let session_id = st.session.id.clone();
+            let cycle = st.session.machine.clk;
+            let Some(t) = st.session.trace.as_mut() else {
+                return Response::err(id, -32001, format!(
+                    "No active trace on session {session_id} (start one with runtime_session_start trace_out=...)."
+                ));
             };
+            t.marks.push((cycle, label.clone()));
+            let run_id = t.run_id.clone();
+            let event_count = t.event_count;
+            let marks = t.marks.len() as u64;
             Response::ok(id, json!({
                 "runId": run_id,
                 "eventCount": event_count,
@@ -4354,10 +4377,16 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             push_media_event(&mut st, event.clone());
             let mut detail = json!({ "role": role });
             if let Some(p) = persisted_outgoing { detail["diskPersisted"] = json!(p); }
+            // audit ws-media-2 — report the REAL run-state, not a hardcoded `!is_cart`.
+            // TS's ingress returns paused = (runState === "paused"): a disk eject is a
+            // live device op that never pauses, so a running machine stays running
+            // (paused:false). A cart eject power-cycles into running above
+            // (st.session.running=true), so this still reports paused:false for carts.
+            let paused = !st.session.running;
             Response::ok(id, json!({
                 "ok": true,
                 "event": event,
-                "paused": !is_cart,
+                "paused": paused,
                 "wasRunning": was_running,
                 "detail": detail
             }))
