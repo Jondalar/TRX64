@@ -35,3 +35,12 @@ User hit "dauerpause": root = a stray `bk $E5CD` I left from the T2.8 monitor ve
 debug/run did step-past-current-bp only for continue; TS run() does it always (PC-based).
 Now both. UX verified live: run/pause(freeze)/reset(clean)/audio(SID ON)/monitor verbs
 (d/m/r/bk/bank/help) all good.
+
+## 2026-06-25 — careful UX sweep: CRT insert/eject (3 bugs found+fixed)
+User: "kann KEIN crt einlegen". Root: the Inspector CART dropdown uses media/mount
+slot:0 (not media/ingress, which T3.3 fixed). media/mount + media/swap + media/unmount
+all ignored slot → treated cart as disk-on-drive8 / ejected drive8. Fixed all three to
+route by extension/slot like TS adaptMount. Verified live: im3_MAGICDESK runs+renders
+(mech title) + SID music; EF/GMOD2/MegaByter attach; eject → EMPTY; disk path unaffected.
+Lesson: T3.3 fixed media/ingress but the live UI uses media/mount|swap|unmount — must
+test the ACTUAL UI path, not just the audited handler.
