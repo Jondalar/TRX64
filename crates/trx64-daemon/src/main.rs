@@ -602,8 +602,15 @@ fn full_machine_gate(session: &Session) -> bool {
         .as_ref()
         .map(|t| TraceChannels::from_domains(&t.domains).vic)
         .unwrap_or(false);
+    // A cartridge ONLY exists on the full literal-VIC machine (the isolated cpu6510
+    // ISA exerciser has no cart mapper). When a cart is attached, the run MUST use the
+    // full machine so a CPU store to the cart's IO1/IO2 register ($DE00-$DFFF) reaches
+    // the mapper (e.g. an EasyFlash live bank switch) — a `wr`-marked `injected` flag
+    // must NOT force the isolated core out from under an attached cart. (Audit
+    // ws-cart-live-mapping — 713 §7.1 live mapping.)
+    let cart_attached = session.machine.cartridge.is_some();
     session.machine.full_assembled
-        && (!session.injected || session.io_injected || vic_directed)
+        && (cart_attached || !session.injected || session.io_injected || vic_directed)
 }
 
 /// A passive observer that records whether a hardware IRQ/NMI was DISPATCHED during
@@ -8226,6 +8233,15 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             push_media_event(&mut st, event.clone());
             let mut detail = json!({ "name": disk_name, "backingPath": path_str });
             if let Some(p) = persisted_outgoing { detail["diskPersisted"] = json!(p); }
+            // audit ws-media-mount-pause (Spec 709 §2.2 / §709.13.1) — a DISK
+            // mount/swap is a live device op (the 1541 is a separate device): a
+            // running C64 keeps running through the insert, so the reply reports the
+            // REAL run-state, NOT a hardcoded `paused:true`. TS's ingress returns
+            // paused=(runState==="paused") (ingress.ts:299); a disk insert never
+            // pauses the C64, so a running machine returns paused:false. (Only a
+            // C64-INTERNAL change — CRT/PRG — pauses; those branches already report
+            // paused:false after resuming.)
+            let paused = !st.session.running;
             Response::ok(id, json!({
                 "mountedPath": path_str,
                 "type": format_str,
@@ -8233,7 +8249,7 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 "sha256": sha256,
                 "event": event,
                 "detail": detail,
-                "paused": true
+                "paused": paused
             }))
         }
 
@@ -8360,6 +8376,15 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             push_media_event(&mut st, event.clone());
             let mut detail = json!({ "name": disk_name, "backingPath": path_str });
             if let Some(p) = persisted_outgoing { detail["diskPersisted"] = json!(p); }
+            // audit ws-media-mount-pause (Spec 709 §2.2 / §709.13.1) — a DISK
+            // mount/swap is a live device op (the 1541 is a separate device): a
+            // running C64 keeps running through the insert, so the reply reports the
+            // REAL run-state, NOT a hardcoded `paused:true`. TS's ingress returns
+            // paused=(runState==="paused") (ingress.ts:299); a disk insert never
+            // pauses the C64, so a running machine returns paused:false. (Only a
+            // C64-INTERNAL change — CRT/PRG — pauses; those branches already report
+            // paused:false after resuming.)
+            let paused = !st.session.running;
             Response::ok(id, json!({
                 "mountedPath": path_str,
                 "type": format_str,
@@ -8367,7 +8392,7 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 "sha256": sha256,
                 "event": event,
                 "detail": detail,
-                "paused": true
+                "paused": paused
             }))
         }
 

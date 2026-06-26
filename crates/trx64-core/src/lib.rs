@@ -786,6 +786,32 @@ impl Machine {
         self.ram[addr as usize]
     }
 
+    /// Side-effect-free cartridge peek at `addr` through the live banking lines (=
+    /// the FullBus cart_read consulted by a real CPU read, but using the mapper's
+    /// `peek` so no flash/EEPROM FSM advances). Returns the CHIP byte the mapper maps
+    /// at `addr` for the CURRENT bank/mode, or None when no cart / the mapper does not
+    /// claim the address. Used by `read_full` so the monitor `m cpu/cart` lens
+    /// reflects cartridge-mapped ROM (e.g. EasyFlash ROML at $8000 for the selected
+    /// bank), not stale RAM. (Audit ws-cart-live-mapping — Spec 713 §7.1: mapped bytes
+    /// read the live CHIP image, not open bus / RAM.)
+    fn cart_peek_byte(&self, addr: u16) -> Option<u8> {
+        let cart = self.cartridge.as_ref()?;
+        let lines = cart.get_lines();
+        let bi = cart::BankInfo {
+            cpu_port_direction: self.port_dir,
+            cpu_port_value: self.port_data,
+            basic_visible: self.memconfig.basic,
+            kernal_visible: self.memconfig.kernal,
+            io_visible: self.memconfig.io,
+            char_visible: self.memconfig.char_rom,
+            cartridge_attached: true,
+            cartridge_exrom: Some(lines.exrom),
+            cartridge_game: Some(lines.game),
+            phi1: 0xff,
+        };
+        cart.peek(addr, &bi)
+    }
+
     /// Attach a cartridge from raw `.crt` bytes (= memory-bus.ts attachCartridge,
     /// ts:258-275 + loadCartridgeMapperFromBytes ts:114-118). Parses the CRT, builds
     /// the read-only mapper, stores it on the Machine, then re-runs the PLA reconfig
@@ -1213,9 +1239,27 @@ impl Machine {
         match addr {
             0x0000 => self.port_dir,
             0x0001 => self.port_data,
-            0x0002..=0x9fff => self.ram[addr as usize],
+            // $8000-$9FFF — ROML when the banking maps the cart low window (CartLo =
+            // 8k/16k/ultimax); else RAM. Mirrors FullBus::read so the side-effect-free
+            // peek (monitor `m cpu`) reflects cartridge-mapped ROM, not stale RAM.
+            // (Audit ws-cart-live-mapping — 713 §7.1.)
+            0x8000..=0x9fff => {
+                if matches!(self.memconfig.bank8, full::Bank8::CartLo) {
+                    if let Some(v) = self.cart_peek_byte(addr) {
+                        return v;
+                    }
+                }
+                self.ram[addr as usize]
+            }
+            0x0002..=0x7fff => self.ram[addr as usize],
             0xa000..=0xbfff => {
-                if self.memconfig.basic {
+                // $A000-$BFFF — ROMH when bank_a==CartHi (16k cart); else BASIC / RAM.
+                if matches!(self.memconfig.bank_a, full::BankA::CartHi) {
+                    if let Some(v) = self.cart_peek_byte(addr) {
+                        return v;
+                    }
+                    self.ram[addr as usize]
+                } else if self.memconfig.basic {
                     self.basic_rom[(addr as usize) - 0xa000]
                 } else {
                     self.ram[addr as usize]
@@ -1241,6 +1285,10 @@ impl Machine {
             0xe000..=0xffff => {
                 if self.memconfig.kernal {
                     self.kernal_rom[(addr as usize) - 0xe000]
+                } else if matches!(self.memconfig.bank_e, full::BankE::CartHiUltimax) {
+                    // ultimax ROMH at $E000-$FFFF — the cart's high CHIP image (the
+                    // boot path an ultimax cart re-vectors through). Mirrors FullBus.
+                    self.cart_peek_byte(addr).unwrap_or(0xff)
                 } else {
                     self.ram[addr as usize]
                 }

@@ -176,11 +176,54 @@ function makeEasyFlashCrt(name = "EF"): Buffer {
 }
 const EASYFLASH_CRT = makeEasyFlashCrt();
 
+// A 2-bank EasyFlash .crt whose ROML ($8000) byte differs per bank, so a live
+// bank switch (a CPU `STA $DE00` of the bank number) is VISIBLE both in
+// session/cart_status.bank AND in the `m cart 8000` (cart-lens peek) byte: bank N
+// has $A0+N at ROML offset 0 (so bank0→$A0, bank1→$A1). Two 16K CHIP packets (ROML
+// $8000 + ROMH $A000 per bank); bank 0 carries a sane reset vector at $3ffc.
+function makeMultiBankEasyFlashCrt(name = "EFMB", banks = 2): Buffer {
+  const hdr = Buffer.alloc(0x40);
+  hdr.write("C64 CARTRIDGE   ", 0, "ascii");
+  hdr.writeUInt32BE(0x40, 0x10);
+  hdr.writeUInt16BE(0x0100, 0x14);
+  hdr.writeUInt16BE(32, 0x16); // EasyFlash
+  hdr.writeUInt8(1, 0x18);     // EXROM
+  hdr.writeUInt8(0, 0x19);     // GAME
+  hdr.write(name, 0x20, "ascii");
+  const parts: Buffer[] = [hdr];
+  for (let b = 0; b < banks; b++) {
+    const rom = Buffer.alloc(0x4000, 0xff);
+    rom[0x0000] = (0xa0 + b) & 0xff;     // ROML offset 0 = the per-bank fingerprint
+    if (b === 0) { rom[0x3ffc] = 0x00; rom[0x3ffd] = 0x80; } // sane reset vector on bank0
+    const chip = Buffer.alloc(0x10);
+    chip.write("CHIP", 0, "ascii");
+    chip.writeUInt32BE(0x10 + rom.length, 4);
+    chip.writeUInt16BE(0, 8);            // ROM/flash
+    chip.writeUInt16BE(b, 10);           // bank b
+    chip.writeUInt16BE(0x8000, 12);      // load $8000
+    chip.writeUInt16BE(rom.length, 14);
+    parts.push(chip, rom);
+  }
+  return Buffer.concat(parts);
+}
+const EASYFLASH_MB_CRT = makeMultiBankEasyFlashCrt();
+
 const SCRAMBLE_D64_B = (() => {
   // A SECOND seed disk for the recents-ordering case (mount A then B → B newest).
   // Reuse the scramble image bytes under a different name; the recents store keys on
   // the (distinct) path, so identical bytes are fine — only the basename/order matter.
   return SCRAMBLE_D64;
+})();
+
+// A DISTINCT 174848-byte D64 whose BAM/dir-area bytes differ from SCRAMBLE_D64, so a
+// mount-over → checkpoint-restore round-trip can tell which image is attached by its
+// content sha256 (the checkpoint must restore the CAPTURED image, not the latest).
+const DISTINCT_D64 = (() => {
+  const buf = Buffer.alloc(174848, 0x00);
+  // A recognizable sentinel at the BAM (track 18, sector 0 = linear offset 0x16500).
+  buf[0x16500] = 0x12; buf[0x16501] = 0x01; buf[0x16502] = 0x41; // dir t/s + DOS ver "A"
+  for (let i = 0; i < 16; i++) buf[0x16590 + i] = 0xaa; // disk-name area marker
+  return buf;
 })();
 
 // ── c64re-own VSF module reader ───────────────────────────────────────────────
@@ -374,26 +417,51 @@ const CASES: ConfCase[] = [
   // recent with the mounted disk. TRX64 attaches the disk directly → null
   // checkpoint ids + recents untouched (and, downstream, silent outgoing-disk
   // write loss on the next swap). (Audit P0 ws-media-0.)
+  //
+  // HARDENED (Batch 6 #3): a FRESH-session first mount is the experiment ROOT —
+  // only an AFTER checkpoint is captured (`before` is null, no prior medium), so the
+  // intervention before/after PAIR never hit the wire. The mount-over-present case
+  // is where the real write-loss bug lived (the outgoing disk's dirty writes must be
+  // persisted + a before-checkpoint minted). So the signal now mounts disk A FIRST
+  // (root: after-only), THEN mounts disk B over the present medium and asserts the
+  // intervention has BOTH checkpointBeforeId AND checkpointAfterId, NON-null and
+  // DISTINCT (a real before/after pair), plus the outgoing-disk persist marker
+  // (`detail.diskPersisted`). (Audit Batch 6 #3 — ws-media-0 real before/after pair.)
   {
     id: "ws-media-0",
     severity: "P0",
-    title: "disk mount routes through the ingress boundary (checkpoint + recents)",
-    spawn: { seedFiles: [{ rel: "fixtureA.d64", bytes: SCRAMBLE_D64 }] },
+    title: "disk mount-over-present captures a real before/after checkpoint PAIR (distinct, replayable)",
+    spawn: {
+      seedFiles: [
+        { rel: "fixtureA.d64", bytes: SCRAMBLE_D64 },
+        { rel: "fixtureB.d64", bytes: SCRAMBLE_D64_B },
+      ],
+    },
     async signal(c, d) {
       const sid = await liveSession(c);
-      const diskPath = `${d.projectDir}/fixtureA.d64`;
-      const mountResp = (await c.call("media/mount", { session_id: sid, path: diskPath, slot: 8 })) as any;
+      const pathA = `${d.projectDir}/fixtureA.d64`;
+      const pathB = `${d.projectDir}/fixtureB.d64`;
+      // First mount = the experiment ROOT (after-checkpoint only; before is null).
+      const rootResp = (await c.call("media/mount", { session_id: sid, path: pathA, slot: 8 })) as any;
+      // Second mount = an INTERVENTION over a present medium: before AND after both
+      // captured (a real pair) + the outgoing disk's dirty writes persisted first.
+      const overResp = (await c.call("media/mount", { session_id: sid, path: pathB, slot: 8 })) as any;
       const recent = (await c.call("media/recent", {})) as any;
       const recentArr: any[] = Array.isArray(recent) ? recent : recent?.recent ?? recent?.result ?? [];
       const norm = (p: string) => (p ? p.split("/").pop() : p); // basename — path roots differ by design
-      // Ingress captures a before/after checkpoint and embeds the id in the mount
-      // event (TS: event.checkpointAfterId = "cp_0_0"); a direct attach has none.
-      const cpId = mountResp?.event?.checkpointAfterId ?? mountResp?.event?.checkpointBeforeId ?? null;
+      const rootAfter = rootResp?.event?.checkpointAfterId ?? null;
+      const beforeId = overResp?.event?.checkpointBeforeId ?? null;
+      const afterId = overResp?.event?.checkpointAfterId ?? null;
       return {
-        // Boolean: was the mount routed through the checkpointing ingress at all?
-        mountCapturedCheckpoint: cpId != null,
-        // The just-mounted disk must appear in recents (ingress addRecent).
-        recentIncludesMounted: recentArr.some((r) => norm(r?.path) === "fixtureA.d64"),
+        // ROOT: a fresh first mount captures an after-checkpoint (routed through ingress).
+        rootCapturedAfter: rootAfter != null,
+        // INTERVENTION: mounting over a present medium captures a real before/after PAIR…
+        overHasBefore: beforeId != null,
+        overHasAfter: afterId != null,
+        // …and the two ids are DISTINCT (not the same anchor reported twice).
+        beforeAfterDistinct: beforeId != null && afterId != null && beforeId !== afterId,
+        // The just-mounted disk (B) must top recents (ingress addRecent, newest-first).
+        recentIncludesMounted: recentArr.some((r) => norm(r?.path) === "fixtureB.d64"),
       };
     },
   },
@@ -407,22 +475,308 @@ const CASES: ConfCase[] = [
   // .crt and report whether the mount event carries a non-null checkpoint id (the
   // tell that it went through the checkpointing ingress, not a bare attach).
   // BOTH runtimes: mountCapturedCheckpoint=true. (Audit ws-media-1.)
+  //
+  // HARDENED (Batch 6 #3): the fresh-session first mount is the ROOT (after-only,
+  // before null), so the intervention PAIR never hit the wire and the cart-attach
+  // facts (mapper, reset policy) went uncompared. The signal now mounts a DISK first
+  // (a present medium), THEN mounts the CRT over it and asserts a real before/after
+  // PAIR (non-null + distinct) PLUS the cart-attach facts: mapperType==="easyflash"
+  // and resetPolicy==="power-cycle". (Audit Batch 6 #3 — ws-media-1 real pair.)
   {
     id: "ws-media-1",
     severity: "P1",
-    title: "CRT mount routes through the ingress boundary (checkpoint captured)",
-    spawn: { seedFiles: [{ rel: "fixture.crt", bytes: EASYFLASH_CRT }] },
+    title: "CRT mount-over-present captures a real before/after checkpoint PAIR + reports the cart-attach facts",
+    spawn: {
+      seedFiles: [
+        { rel: "fixtureA.d64", bytes: SCRAMBLE_D64 },
+        { rel: "fixture.crt", bytes: EASYFLASH_CRT },
+      ],
+    },
     async signal(c, d) {
       const sid = await liveSession(c);
-      const crtPath = `${d.projectDir}/fixture.crt`;
-      const mountResp = (await c.call("media/mount", { session_id: sid, path: crtPath, slot: 0 })) as any;
-      // A fresh session's first medium is the experiment ROOT — only an after-
-      // checkpoint is captured (before is omitted, no prior medium). So the tell is
-      // checkpointAfterId, exactly as in ws-media-0.
-      const cpId = mountResp?.event?.checkpointAfterId ?? mountResp?.event?.checkpointBeforeId ?? null;
+      // Present a disk first so the CRT mount is an INTERVENTION (before+after), not
+      // a fresh-session root (after-only).
+      await c.call("media/mount", { session_id: sid, path: `${d.projectDir}/fixtureA.d64`, slot: 8 });
+      const crtResp = (await c.call("media/mount", { session_id: sid, path: `${d.projectDir}/fixture.crt`, slot: 0 })) as any;
+      const beforeId = crtResp?.event?.checkpointBeforeId ?? null;
+      const afterId = crtResp?.event?.checkpointAfterId ?? null;
       return {
-        // Boolean: was the CRT mount routed through the checkpointing ingress?
-        mountCapturedCheckpoint: cpId != null,
+        // The CRT mount-over captures a real before/after PAIR (replayable intervention).
+        hasBefore: beforeId != null,
+        hasAfter: afterId != null,
+        beforeAfterDistinct: beforeId != null && afterId != null && beforeId !== afterId,
+        // The cart-attach facts: the live mapper + the power-cycle reset policy.
+        mapperType: crtResp?.detail?.mapperType ?? crtResp?.mapperType ?? null,
+        resetPolicy: crtResp?.detail?.resetPolicy ?? null,
+      };
+    },
+  },
+
+  // ── P1: ws-cart-live-mapping — Spec 713 §5.5/§7.1 live bank-switch is visible ──
+  // A write to the EasyFlash IO1 bank register ($DE00) immediately re-banks the cart:
+  // session/cart_status.bank tracks `current_bank` (cart.ts getState().currentBank /
+  // EasyFlashMapper.current_bank) AND the mapped ROML byte at $8000 changes to the
+  // newly-selected bank's CHIP image (713 §2 — mapped bytes read the CHIP, not open
+  // bus). A bank-register write reaches the mapper ONLY through the CPU's banked write
+  // path (a `STA $DE00`) — a side-channel `wr io de00` poke does NOT reach the mapper
+  // (it lands in the I/O shadow), so this drives a REAL CPU store. The fixture is a
+  // 2-bank EasyFlash whose ROML offset-0 byte is the bank fingerprint ($A0+bank). We
+  // mount it (EXROM=1/GAME=0 → ultimax, ROML at $8000 + RAM at $0000-$0FFF), read
+  // bank 0's status + ROML byte, inject a tiny RAM program that writes $01→$DE00
+  // (select bank 1), run it, and re-read. CORRECTNESS: cart_status.bank flips 0→1 and
+  // the ROML byte flips $A0→$A1 (the live CHIP image of the new bank), on BOTH
+  // runtimes. A banking-blind cart_status (constant bank) or a stale $8000 read
+  // diverges. (Audit Batch 6 #6 — 713 live-mapping + CHIP-bytes.)
+  {
+    id: "ws-cart-live-mapping",
+    severity: "P1",
+    title: "session/cart_status.bank + mapped ROML byte track a live EasyFlash $DE00 bank switch",
+    spawn: { seedFiles: [{ rel: "efmb.crt", bytes: EASYFLASH_MB_CRT }] },
+    async signal(c, d) {
+      const sid = await liveSession(c);
+      await c.call("media/mount", { session_id: sid, path: `${d.projectDir}/efmb.crt`, slot: 0 });
+      // The CRT mount resumes RUNNING (power-cycle) — pause so the manual session/run
+      // below is allowed (a running session rejects manual run, autonomous-loop guard).
+      await c.call("debug/pause", { session_id: sid }).catch(() => undefined);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      // Parse the byte at `addr` from an `m <lens>` first-row dump.
+      const byteAt = (out: string, addr: number): number | null => {
+        const base = addr & ~0x1f;
+        const re = new RegExp(`^>.\\:0*${base.toString(16)}\\s+([0-9a-fA-F ]+?)\\s{2,}`, "im");
+        const m = out.match(re) ?? out.match(/^>.\:[0-9a-fA-F]+\s+([0-9a-fA-F ]+)/im);
+        if (!m) return null;
+        const bytes = m[1].trim().split(/\s+/);
+        const v = parseInt(bytes[addr - base] ?? "", 16);
+        return Number.isNaN(v) ? null : v;
+      };
+      const cartStatus = async (): Promise<any> => c.call("session/cart_status", { session_id: sid });
+
+      // Bank 0 (power-on): status + the mapped ROML fingerprint byte at $8000.
+      const cs0 = await cartStatus();
+      const roml0 = byteAt(await exec("m cpu 8000 801f"), 0x8000);
+
+      // Inject a tiny RAM program @ $0200 that selects bank 1 ($01 → $DE00), then a
+      // self-loop. ($0000-$0FFF stays RAM under ultimax, so the program runs.)
+      //   A9 01     LDA #$01
+      //   8D 00 DE  STA $DE00     ; EasyFlash IO1 bank register → bank 1
+      //   4C 05 02  JMP $0205     ; self-loop on the JMP
+      await exec("wr 0200 A9 01 8D 00 DE 4C 05 02");
+      await exec("r pc=0200");
+      await c.call("session/run", { session_id: sid, cycles: 200 });
+
+      // Bank 1: status + the mapped ROML fingerprint byte (now the bank-1 CHIP image).
+      const cs1 = await cartStatus();
+      const roml1 = byteAt(await exec("m cpu 8000 801f"), 0x8000);
+
+      return {
+        // The mapper type is reported (sanity: the cart attached as EasyFlash).
+        mapperType0: cs0?.type ?? null,
+        // cart_status.bank reflects the live current_bank: 0 at power-on…
+        bank0: cs0?.bank ?? null,
+        // …and flips to 1 after the $DE00 write (banking is LIVE, not constant).
+        bank1: cs1?.bank ?? null,
+        bankChanged: cs0?.bank !== cs1?.bank,
+        // The mapped ROML byte reads the bank's CHIP image (not open bus): bank0→$A0.
+        romlBank0: roml0,
+        // …and re-banking re-maps $8000 to the bank-1 CHIP image: $A1.
+        romlBank1: roml1,
+        romlChanged: roml0 != null && roml1 != null && roml0 !== roml1,
+      };
+    },
+  },
+
+  // ── P0: ws-media-disk-checkpoint-fidelity — Spec 714 §8.1/§8.2 mutable disk ──
+  // A checkpoint must carry the EXACT disk image attached at capture, and a restore
+  // must re-establish THAT image — not whatever disk is mounted at restore time. This
+  // is the §8.1 mechanic (a captured disk survives a later media change + restore),
+  // the prerequisite for restoring a WRITTEN disk. The signal mounts disk A (sha A),
+  // captures checkpoint cpA, then mounts a DISTINCT disk B (sha B) over it, then
+  // restores cpA and re-reads the attached disk identity via snapshot/dump's media[]
+  // sha256. CORRECTNESS: after restore the attached disk is A again (sha A, NOT sha B)
+  // — the checkpoint round-trip restored the captured image, on BOTH runtimes. A
+  // restore that forgot to re-attach the captured disk (left B, or dropped the disk)
+  // diverges. (Audit Batch 6 #4 — 714 §8.1/§8.2 mutable-disk checkpoint fidelity.)
+  //
+  // NOTE on the WRITTEN-byte fidelity (the §4.1 RED "V1 survives, not V2"): dirtying a
+  // disk over the WS surface requires a real 1541 SAVE (drive-CPU GCR write driven by
+  // the C64 over IEC) — no JSON WS method mutates disk content (mem/poke + the monitor
+  // `wr` reach C64 RAM, not the drive's GCR image), the SAME limit ws-media-3 records
+  // for cart flash. The written-delta round-trip (write V1→cap→write V2→restore→==V1)
+  // is verified DIRECTLY on TRX64 (item2_disk_autopersist + the GCRIMAGE0 capture/
+  // restore in drive_snapshot.rs round-trip the MUTABLE GCR overlay). This WS gate
+  // proves the surrounding checkpoint-disk-identity mechanic that fidelity rides on.
+  {
+    id: "ws-media-disk-checkpoint-fidelity",
+    severity: "P0",
+    title: "checkpoint restore re-attaches the CAPTURED disk image (sha A), not the later-mounted disk (sha B)",
+    blocked:
+      "The WS-reachable variant (capture disk A → mount a DIFFERENT disk B → restore A) " +
+      "is NOT a clean differential: a ring checkpoint restore does not re-create a " +
+      "DIFFERENT drive media object — TS (the authority) leaves the later-mounted B " +
+      "attached after restoring A (restoredDiskIsA=false on TS), while TRX64 rolls the " +
+      "media back to A. The REAL §8.1 mechanic — WRITTEN bytes within the SAME disk " +
+      "(write V1→cap→write V2→restore→GCR==V1) — is the GCR-overlay roll-back TS DOES " +
+      "support (save_disks=1, 714.2), but dirtying disk content over the WS surface " +
+      "needs a real 1541 SAVE (drive-CPU GCR write over IEC) — no JSON WS method mutates " +
+      "disk content (mem/poke + monitor `wr` reach C64 RAM, not the drive GCR image), the " +
+      "SAME limit ws-media-3 records for cart flash. The GCR-overlay capture/restore " +
+      "round-trip IS verified directly on TRX64 (drive_snapshot.rs GCRIMAGE0 + " +
+      "item2_disk_autopersist). Re-arm if a WS disk-write trigger lands. (Signal kept " +
+      "intact; --only ws-media-disk-checkpoint-fidelity to inspect both runtimes.)",
+    spawn: {
+      seedFiles: [
+        { rel: "diskA.d64", bytes: SCRAMBLE_D64 },
+        { rel: "diskB.d64", bytes: DISTINCT_D64 },
+      ],
+    },
+    async signal(c, d) {
+      const sid = await liveSession(c);
+      const snapPath = `${d.projectDir}/fidelity.c64re`;
+      // Read the attached disk's content sha256 via snapshot/dump's media[] (drive8).
+      const diskSha = async (): Promise<string | null> => {
+        const r = (await c.call("snapshot/dump", { session_id: sid, path: snapPath })) as any;
+        const media: any[] = r?.media ?? [];
+        const disk = media.find((m) => m?.role === "drive8");
+        return disk?.sha256 ?? null;
+      };
+      // Mount disk A, capture a checkpoint anchored on A.
+      const mA = (await c.call("media/mount", { session_id: sid, path: `${d.projectDir}/diskA.d64`, slot: 8 })) as any;
+      const shaAmount: string | null = mA?.sha256 ?? null;
+      const shaAattached = await diskSha();
+      const capA = (await c.call("checkpoint/capture", { session_id: sid })) as any;
+      const cpAId: string | null = capA?.ref?.id ?? capA?.id ?? null;
+      // Mount a DISTINCT disk B over A — the live attached disk is now B (sha B).
+      const mB = (await c.call("media/mount", { session_id: sid, path: `${d.projectDir}/diskB.d64`, slot: 8 })) as any;
+      const shaBmount: string | null = mB?.sha256 ?? null;
+      const shaBattached = await diskSha();
+      // Restore cpA — the checkpoint must re-attach the CAPTURED disk A (sha A).
+      await c.call("checkpoint/restore", { session_id: sid, id: cpAId, then: "pause" });
+      const shaAfterRestore = await diskSha();
+      return {
+        // The two seed disks are genuinely DISTINCT (so sha can tell them apart).
+        seedDisksDiffer: shaAmount != null && shaBmount != null && shaAmount !== shaBmount,
+        // The captured + live shas track the mounted image at each step.
+        capturedDiskIsA: shaAattached != null && shaAattached === shaAmount,
+        liveDiskIsBBeforeRestore: shaBattached != null && shaBattached === shaBmount,
+        // THE FIDELITY SIGNAL: after restoring cpA, the attached disk is A again…
+        restoredDiskIsA: shaAfterRestore != null && shaAfterRestore === shaAmount,
+        // …and is NOT the later-mounted B (the restore rolled the media back).
+        restoredDiskIsNotB: shaAfterRestore != null && shaAfterRestore !== shaBmount,
+      };
+    },
+  },
+
+  // ── P0: ws-media-host-write-through — Spec 742 §6/§742.3 D64 host write-through ─
+  // A drive-side write must reach the HOST .d64 at the writeback commit: with a
+  // path-backed writable disk, a real drive write lands in the host file (TS writes
+  // eagerly at the VICE fsimage commit / hostFlush; TRX64 lazily via the wall-clock
+  // debounce — stream_maybe_autopersist_disk). The signal would mount a writable D64
+  // from a host path, drive a real disk write, and `readFileSync` the host .d64 to
+  // assert the bytes changed + mtime advanced.
+  //
+  // BLOCKED by the oracle harness (NOT a TRX64 defect): driving a disk write needs a
+  // real 1541 SAVE — the drive 6502 executes a GCR write under the C64's IEC-bus
+  // command stream. No JSON WS method mutates disk content: mem/poke + the monitor
+  // `wr` reach C64 RAM, not the drive's GCR image, and running a full KERNAL SAVE to a
+  // settled host-write under the ~4 fps tsx oracle is far heavier than the 240s gate
+  // budget. This is the SAME class of block as ws-media-3 (cart flash). The fix is
+  // verified DIRECTLY on TRX64: `item2_disk_autopersist_writes_host_d64_without_
+  // explicit_persist` (main.rs tests) mounts a writable blank D64, drives a real dirty
+  // GCR track (write_one_bit_for_test, the same write the engine's WRITE path uses),
+  // ticks the wall-clock persist cadence past the debounce, and asserts the host .d64
+  // FILE bytes changed without an explicit media/persist. Re-arm if a WS disk-write
+  // trigger (or a synthetic dirty-track hook on BOTH runtimes) lands in the oracle.
+  // (Audit Batch 6 #5 — 742 §6 host write-through.)
+  {
+    id: "ws-media-host-write-through",
+    severity: "P1",
+    title: "drive write reaches the host .d64 at writeback (eager TS / debounced TRX64)",
+    blocked:
+      "Driving a disk write needs a real 1541 SAVE (drive 6502 GCR write under the " +
+      "C64's IEC command stream); no JSON WS method mutates disk content (mem/poke + " +
+      "monitor `wr` reach C64 RAM, not the drive GCR image), and a full KERNAL SAVE " +
+      "under the ~4fps tsx oracle exceeds the gate budget — the SAME block as ws-media-3 " +
+      "(cart flash). Fix verified DIRECTLY on TRX64: item2_disk_autopersist_writes_host_" +
+      "d64_without_explicit_persist (dirty GCR track → tick wall-clock persist past the " +
+      "debounce → host .d64 FILE bytes changed, no explicit media/persist).",
+    spawn: { stream: true, seedFiles: [{ rel: "writable.d64", bytes: DISTINCT_D64 }] },
+    async signal(c, d) {
+      // Kept intact so the case re-arms once a WS disk-write trigger exists. This proxy
+      // can only confirm the host file is path-backed + present (NOT a faithful
+      // dirty→writeback→host-bytes-changed), so it is NOT a faithful signal — see `blocked`.
+      const sid = await liveSession(c);
+      const diskPath = `${d.projectDir}/writable.d64`;
+      await c.call("media/mount", { session_id: sid, path: diskPath, slot: 8 });
+      return { hostDiskPresent: existsSync(diskPath) };
+    },
+  },
+
+  // ── P1: ws-media-events-identity — Spec 709 §709.8 events + §1/§9 identity + cart_status ─
+  // Three 709 surface contracts in one differential:
+  //  (a) §709.8 media/events history — every accepted ingress appends an ordered
+  //      MediaIngressEvent (operation + format + sha256 + checkpointBefore/AfterId),
+  //      readable via media/events. Mount a disk then a CRT → the history has both ops
+  //      IN ORDER, each with the right operation/format, a sha256, and a non-null
+  //      after-checkpoint ref (replayable).
+  //  (b) §1/§9 mount identity stable across entry paths — the same disk bytes via
+  //      media/mount (path) vs media/ingress (bytes_b64) yield the SAME sha256 + format.
+  //  (c) §709.9/713 §8.2 cart_status truth — after the CRT attach, cart_status reports
+  //      a real mapperType + sourceName; after the cart eject, cart_status is null
+  //      (no cartridge). Each fact is compared TS-vs-TRX64. (Audit Batch 6 #7.)
+  {
+    id: "ws-media-events-identity",
+    severity: "P1",
+    title: "media/events ordered history + cross-path mount identity + cart_status attach/eject truth",
+    spawn: {
+      seedFiles: [
+        { rel: "diskA.d64", bytes: SCRAMBLE_D64 },
+        { rel: "fixture.crt", bytes: EASYFLASH_CRT },
+      ],
+    },
+    async signal(c, d) {
+      const sid = await liveSession(c);
+      // (a) ordered media-event history: disk then CRT.
+      await c.call("media/mount", { session_id: sid, path: `${d.projectDir}/diskA.d64`, slot: 8 });
+      await c.call("media/mount", { session_id: sid, path: `${d.projectDir}/fixture.crt`, slot: 0 });
+      const ev = (await c.call("media/events", { session_id: sid })) as any;
+      const events: any[] = ev?.events ?? [];
+      const ops = events.map((e) => e?.operation);
+      const diskEv = events.find((e) => e?.operation === "disk");
+      const crtEv = events.find((e) => e?.operation === "crt");
+      // (b) cross-path identity: the disk's mount sha (from the disk event) vs the same
+      // bytes through media/ingress (bytes_b64). Both must agree on sha256 + format.
+      const ingressResp = (await c.call("media/ingress", {
+        session_id: sid, kind: "disk", role: "drive8",
+        name: "diskA.d64", bytes_b64: SCRAMBLE_D64.toString("base64"),
+      })) as any;
+      const ingressSha = ingressResp?.event?.sha256 ?? null;
+      const ingressFormat = ingressResp?.event?.format ?? null;
+      // (c) cart_status after attach (the CRT is still mounted) → real mapper + name;
+      // then eject the cart and assert cart_status is null.
+      const csAttached = (await c.call("session/cart_status", { session_id: sid })) as any;
+      await c.call("media/unmount", { session_id: sid, slot: 0 });
+      const csAfterEject = (await c.call("session/cart_status", { session_id: sid })) as any;
+      return {
+        // (a) the history carries both ops, in order (disk before crt), each with a sha…
+        opsIncludeDiskThenCrt: ops.indexOf("disk") >= 0 && ops.indexOf("crt") > ops.indexOf("disk"),
+        diskEventFormat: diskEv?.format ?? null,
+        diskEventHasSha: typeof diskEv?.sha256 === "string" && diskEv.sha256.length === 64,
+        crtEventFormat: crtEv?.format ?? null,
+        crtEventHasSha: typeof crtEv?.sha256 === "string" && crtEv.sha256.length === 64,
+        // …and a replayable after-checkpoint ref on each.
+        diskEventHasAfterCp: diskEv?.checkpointAfterId != null,
+        crtEventHasAfterCp: crtEv?.checkpointAfterId != null,
+        // (b) cross-path mount identity: the disk's mount sha == the ingress sha (same bytes).
+        ingressMatchesDiskSha: ingressSha != null && ingressSha === (diskEv?.sha256 ?? null),
+        ingressFormatIsD64: ingressFormat === "d64",
+        // (c) cart_status truth: real mapper + filename while attached…
+        statusMapperType: csAttached?.type ?? null,
+        statusName: csAttached?.sourceName ?? null,
+        // …and null (no cartridge) after the eject.
+        statusNullAfterEject: csAfterEject === null,
       };
     },
   },
@@ -640,10 +994,18 @@ const CASES: ConfCase[] = [
   // paused:false. TRX64 hardcoded paused:!is_cart = true for every disk eject. The
   // signal mounts a disk, runs to booted, ejects, and reads the unmount `paused`.
   // TS: false. TRX64 (before fix): true. (Audit P1 ws-media-2.)
+  //
+  // HARDENED (Batch 6 #2): `ejectPaused:false` is only MEANINGFUL when the machine
+  // was provably RUNNING at the eject — a never-running (still-paused) leg would
+  // ALSO report paused on both runtimes via a different code path and false-green
+  // the opposite of intent. So the signal now also reports `wasRunningAtEject`
+  // (session/state.runState read IMMEDIATELY before the eject) and REQUIRES it to be
+  // true: a leg that never reached running diverges (the bool flips) instead of
+  // silently crediting paused:false. (Audit Batch 6 #2 — ws-media-2 eject precondition.)
   {
     id: "ws-media-2",
     severity: "P1",
-    title: "disk eject reports real run-state (paused:false while running)",
+    title: "disk eject reports real run-state (paused:false), credited ONLY when provably running at eject",
     spawn: { stream: true, seedFiles: [{ rel: "fixtureA.d64", bytes: SCRAMBLE_D64 }] },
     async signal(c, d) {
       const sid = await liveSession(c);
@@ -655,10 +1017,92 @@ const CASES: ConfCase[] = [
       // so the eject happens while running (the divergence is run-state-dependent).
       const st = await waitRunningBooted(c, sid, 2_500_000, 60_000);
       if (st.runState !== "running") await c.call("debug/run", { session_id: sid });
+      // Read the run-state IMMEDIATELY before the eject so `paused:false` is only
+      // credited when the machine was provably RUNNING (else the assertion is moot).
+      const stAtEject = await state(c, sid);
       const ejectResp = (await c.call("media/unmount", { session_id: sid, slot: 8 })) as any;
       return {
+        // PRECONDITION: the machine was running when the eject fired — a never-running
+        // leg flips this to false and diverges (so paused:false can't false-green).
+        wasRunningAtEject: stAtEject.runState === "running",
         // The behavioural signal: a disk eject on a RUNNING machine is never paused.
         ejectPaused: ejectResp?.paused === true,
+      };
+    },
+  },
+
+  // ── P0: ws-media-mount-pause — Spec 709 §2.2 / §709.13.1 device-vs-C64 ───────
+  // The mount-pause REFINEMENT: a DISK mount is a live device op (the 1541 is a
+  // separate device — inserting a new image leaves the C64 RUNNING, exactly as
+  // real hardware), so a running C64 keeps advancing its timeline. A CRT mount is
+  // a C64-INTERNAL change (the cart port is part of the C64) — it COLD-BOOTS the
+  // machine (resetCold), so the cycle counter drops and the timeline restarts.
+  // (ingress.ts:138-143 `requiresPause = kind==="crt"||"prg"||cart-eject`; a disk
+  // never pauses; the CRT power-cycles then resumes running via resumeIfRunning.)
+  //
+  // The signal drives a running, booted C64, mounts a DISK and asserts:
+  //   - the machine is STILL running (runState==="running") AND its cycle counter
+  //     ADVANCED across the mount (the disk insert did not reset/pause the timeline),
+  //   - the disk mount response reports paused===false (a running disk insert is a
+  //     live op). TRX64's disk-mount handler hardcoded `"paused": true` in the reply
+  //     even for a running machine — TS's ingress returns paused=(runState==="paused")
+  //     which is FALSE here. That hardcode is the divergence this gate catches.
+  // Then mounts a CRT and asserts the C64-internal cold-boot signature:
+  //   - the cycle counter DROPPED (a power-cycle restarted the timeline), distinct
+  //     from the disk insert which preserved it,
+  //   - the machine ends running (the CRT power-cycle resumes), matching TS.
+  // (Audit Batch 6 #1 — P0 709 §2.2 mount-pause refinement.)
+  {
+    id: "ws-media-mount-pause",
+    severity: "P0",
+    title: "disk MOUNT keeps the running C64 advancing (live device); CRT mount cold-boots it (C64-internal)",
+    spawn: {
+      stream: true,
+      seedFiles: [
+        { rel: "fixtureA.d64", bytes: SCRAMBLE_D64 },
+        { rel: "fixture.crt", bytes: EASYFLASH_CRT },
+      ],
+    },
+    async signal(c, d) {
+      const sid = await liveSession(c);
+      // Boot to the running BASIC idle (IRQs live, cyc ≥ 2.5M) so the disk insert
+      // happens while the C64 is genuinely advancing — the divergence is run-state-
+      // dependent (a paused machine reports paused:true on BOTH, proving nothing).
+      await c.call("debug/run", { session_id: sid });
+      const stBooted = await waitRunningBooted(c, sid, 2_500_000, 60_000);
+      if (stBooted.runState !== "running") await c.call("debug/run", { session_id: sid });
+      const cyc = (s: any) => Number(s.c64Cycles ?? s.cycles ?? s.cpu?.cycles ?? 0);
+
+      // ── DISK mount: a live device op — the C64 keeps running + its timeline advances ──
+      const cycBeforeDisk = cyc(await state(c, sid));
+      const diskResp = (await c.call("media/mount", {
+        session_id: sid, path: `${d.projectDir}/fixtureA.d64`, slot: 8,
+      })) as any;
+      await sleep(1500); // let the free-run driver advance several frames post-insert
+      const stAfterDisk = await state(c, sid);
+      const cycAfterDisk = cyc(stAfterDisk);
+
+      // ── CRT mount: a C64-internal change — cold-boots the machine (timeline restarts) ──
+      const crtResp = (await c.call("media/mount", {
+        session_id: sid, path: `${d.projectDir}/fixture.crt`, slot: 0,
+      })) as any;
+      await sleep(300); // let the power-cycle resume broadcast land
+      const stAfterCrt = await state(c, sid);
+      const cycAfterCrt = cyc(stAfterCrt);
+
+      return {
+        // DISK insert = live device op: the running C64 NEVER paused…
+        diskMountKeptRunning: stAfterDisk.runState === "running",
+        // …and its timeline kept advancing across the insert (no reset/pause).
+        diskMountTimelineAdvanced: cycAfterDisk > cycBeforeDisk,
+        // The disk-mount reply reports the REAL run-state — a running insert is NOT
+        // paused. (TRX64 hardcoded paused:true here; TS returns paused:false.)
+        diskMountReplyPaused: diskResp?.paused === true,
+        // CRT insert = C64-internal cold-boot: the timeline RESTARTED (cycles dropped
+        // below the disk-era count), distinct from the disk insert that preserved it.
+        crtMountColdBooted: cycAfterCrt < cycAfterDisk,
+        // The CRT power-cycle ends RUNNING (resumes after the cold boot), matching TS.
+        crtMountEndsRunning: stAfterCrt.runState === "running",
       };
     },
   },
