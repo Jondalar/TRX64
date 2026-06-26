@@ -3391,6 +3391,353 @@ const CASES: ConfCase[] = [
       };
     },
   },
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // BATCH 3 — Spec 769 time-travel / L7 code-overlay debug loop (P0 acceptance).
+  // The overlay loop (`runtime/overlay_run`, ws-server.ts:938-980) restores an
+  // anchor, applies RAM patches, runs forward (optionally to an until_pc), reads
+  // back flagged addresses, and returns the post-run registers — leaving the
+  // machine PAUSED. It is REPEATABLE: each call restores FRESH (the prior overlay
+  // is rolled back by the full-RAM restore, restore_runtime_checkpoint /
+  // restoreCheckpoint), so the LLM iterates a fix from a fixed point with no
+  // rebuild/reboot. That full-RAM rollback is the loop's whole mechanic and the
+  // §7 acceptance gate. See case-audit.md "Spec 769 — time-travel / overlay".
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // ── P0: ws-overlay-run-loop — the L7 overlay reply shape + read-back ─────────
+  // Spec 769 §3/§6 (769.2): capture an anchor, overlay_run with a RAM patch + an
+  // until_pc breakpoint, assert the FULL reply: { anchorId, applied[{addr,len}],
+  // ranCycles, hitPc, reads{"$addr":byte}, registers{pc,a,x,y,sp,flags,cycles} }.
+  // We run forward to a DETERMINISTIC KERNAL address ($EA31, the jiffy-IRQ entry)
+  // via until_pc so the landing PC + all GP registers are byte-stable across both
+  // runtimes (cold-boot puts both machines in the same idle loop; an until_pc hit
+  // pins them to the SAME instruction). The patch lands at $0400 (screen RAM, not
+  // touched by the boot loop), so reads["$0400"]===0x2a proves the overlay WROTE
+  // RAM and the post-run read sees it. The hitPc===until_pc + registers.pc==hitPc
+  // prove the bounded run honoured the breakpoint. registers.cycles is NORMALIZED
+  // to "is a number" (not its exact value): a 4-cycle cold-boot clock skew exists
+  // INDEPENDENT of the overlay (the anchor itself captures at 5000000 vs 5000004),
+  // so asserting the exact cycles would false-RED on a pre-existing, non-overlay
+  // divergence. Every OTHER register (pc,a,x,y,sp,flags) IS compared field-for-
+  // field, so an overlay that corrupts a register still diverges loud.
+  {
+    id: "ws-overlay-run-loop",
+    severity: "P0",
+    title: "runtime/overlay_run reply shape + RAM patch read-back (L7 debug loop, ends paused)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      // Cold boot so KERNAL+IRQs are live: only then does $EA31 (the jiffy IRQ
+      // handler) fire so the until_pc breakpoint is reachable. reset is synchronous.
+      await c.call("session/reset", { session_id: sid, mode: "cold" });
+      // Capture the anchor of the booted-READY state (the fixed point the loop
+      // restores to on every iteration).
+      const cap = (await c.call("checkpoint/capture", { session_id: sid })) as any;
+      const anchorCyc = cap?.ref?.cycles ?? cap?.cycles ?? null;
+      // overlay_run: patch $0400 := 0x2a (read-back flagged), run forward bounded,
+      // breakpoint at $EA31. Ends PAUSED (ws-server.ts restores then:"pause").
+      const o = (await c.call("runtime/overlay_run", {
+        session_id: sid,
+        patches: [{ addr: 0x0400, bytes: [0x2a], read: true }],
+        run_cycles: 200000,
+        until_pc: 0xea31,
+      })) as any;
+      // The machine must be PAUSED after the loop (the overlay loop never leaves it
+      // free-running — the LLM observes a frozen post-run state).
+      const st = await state(c, sid);
+      const reg = o?.registers ?? {};
+      return {
+        // The patch was applied at the requested addr with the requested length.
+        applied: o?.applied,
+        // The bounded run honoured the until_pc breakpoint (hit == target).
+        hitPc: o?.hitPc,
+        ranCycles: o?.ranCycles,
+        // The read-back of the patched addr sees the overlaid byte AFTER the run.
+        readBack0400: o?.reads?.["$0400"],
+        // The anchor id is non-empty + deterministic (the restored fixed point).
+        anchorIdPresent: typeof o?.anchorId === "string" && o.anchorId.length > 0,
+        // FULL register shape (all present), value-compared EXCEPT cycles (cold-boot
+        // 4-cycle skew is pre-existing + non-overlay — normalized to presence).
+        regPc: reg.pc,
+        regPcMatchesHit: Number(reg.pc) === Number(o?.hitPc),
+        regA: reg.a,
+        regX: reg.x,
+        regY: reg.y,
+        regSp: reg.sp,
+        regFlags: reg.flags,
+        regCyclesIsNumber: typeof reg.cycles === "number",
+        // The anchor captured at a real (non-null) cycle.
+        anchorHasCycles: anchorCyc != null,
+        // Ends PAUSED (the loop observes a frozen state, never a free-run).
+        endedPaused: st.runState === "paused",
+      };
+    },
+  },
+
+  // ── P0: ws-overlay-restore-undoes — the rollback that MAKES the loop a loop ───
+  // Spec 769 §3/§7 (769.2): re-running the SAME anchor with a different/empty patch
+  // must ROLL BACK the prior overlay. A TRX64 that does NOT fully restore RAM
+  // between calls (e.g. a sparse/partial restore, or one that skips the screen-RAM
+  // page) would leave the first patch resident — the high-risk port bug here. The
+  // signal: overlay_run anchorA with [$033c := 0xff, read] → reads["$033c"]===0xff;
+  // then the SAME anchor with an EMPTY patch (read-only) → reads["$033c"] must be
+  // the ORIGINAL value (≠ 0xff). $033c (cassette buffer) is untouched by the idle
+  // loop so its original is stable. We capture the pristine original FIRST (an
+  // empty-patch overlay_run before any write) and assert: (a) the 0xff write was
+  // visible in pass 1, (b) the rollback in pass 2 restored the EXACT original, and
+  // (c) the original is provably not 0xff (so "rolled back" is a real change). All
+  // three must agree TS≡TRX64. This is the §7 acceptance gate.
+  {
+    id: "ws-overlay-restore-undoes",
+    severity: "P0",
+    title: "overlay_run restores FRESH each call — a prior RAM patch is fully rolled back (769 §7 gate)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      await c.call("session/reset", { session_id: sid, mode: "cold" });
+      await c.call("checkpoint/capture", { session_id: sid });
+      // PASS 0 — read the pristine original at $033c (empty patch, no run): the
+      // restore-to-anchor leaves RAM at the anchor's value.
+      const p0 = (await c.call("runtime/overlay_run", {
+        session_id: sid,
+        patches: [{ addr: 0x033c, bytes: [], read: true }],
+        run_cycles: 0,
+      })) as any;
+      const original = p0?.reads?.["$033c"];
+      // PASS 1 — overlay $033c := 0xff (no run): the read-back must see 0xff.
+      const p1 = (await c.call("runtime/overlay_run", {
+        session_id: sid,
+        patches: [{ addr: 0x033c, bytes: [0xff], read: true }],
+        run_cycles: 0,
+      })) as any;
+      const afterWrite = p1?.reads?.["$033c"];
+      // PASS 2 — SAME anchor, EMPTY patch (no run): the restore must have rolled the
+      // 0xff back to `original` BEFORE the (empty) patch applied.
+      const p2 = (await c.call("runtime/overlay_run", {
+        session_id: sid,
+        patches: [{ addr: 0x033c, bytes: [], read: true }],
+        run_cycles: 0,
+      })) as any;
+      const afterRollback = p2?.reads?.["$033c"];
+      return {
+        // The overlay write was visible in pass 1.
+        writeVisible: Number(afterWrite) === 0xff,
+        // The rollback restored the EXACT pristine original (the loop's mechanic).
+        rolledBackToOriginal: Number(afterRollback) === Number(original),
+        // "Rolled back" is a REAL change, not a coincidence (original ≠ 0xff).
+        originalNotFf: Number(original) !== 0xff,
+        // The literal original byte (TS≡TRX64 — both restore the same anchor RAM).
+        original,
+      };
+    },
+  },
+
+  // ── P2: ws-overlay-empty-ring — overlay_run on an empty ring throws ──────────
+  // Spec 769 §6 (769.2): with no checkpoints to anchor on, overlay_run throws
+  // "runtime/overlay_run: no checkpoints to anchor on" (ws-server.ts:943 /
+  // main.rs:6555). A PL-7 silent no-op (returning a fake reply) is the port hazard.
+  // We clear the ring then overlay_run any patch → both must THROW (a real RPC
+  // error), not return a success envelope.
+  {
+    id: "ws-overlay-empty-ring",
+    severity: "P2",
+    title: "runtime/overlay_run on an empty checkpoint ring throws (no silent no-op, PL-7)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      // Empty the ring (checkpoint/clear evicts every non-pinned anchor).
+      await c.call("checkpoint/clear", { session_id: sid }).catch(() => undefined);
+      let threw = false;
+      let noAnchor = false;
+      try {
+        await c.call("runtime/overlay_run", {
+          session_id: sid,
+          patches: [{ addr: 0x033c, bytes: [0x01] }],
+          run_cycles: 0,
+        });
+      } catch (e) {
+        threw = true;
+        const msg = e instanceof Error ? e.message : String(e);
+        let text = msg;
+        try { const j = JSON.parse(msg); if (j?.message) text = String(j.message); } catch { /* plain */ }
+        noAnchor = /no checkpoints to anchor on/i.test(text);
+      }
+      return { threw, noAnchor };
+    },
+  },
+
+  // ── P2: ws-overlay-anchor-selection — at/before anchor_cycle is deterministic ─
+  // Spec 769 §6 (769.2): given anchor_cycle, the loop picks the anchor at-or-before
+  // that cycle (else the nearest); the returned anchorId is deterministic
+  // (ws-server.ts:946-954 / main.rs:6557-6578). We capture TWO anchors at known
+  // DIFFERENT cycles (a `session/run` between them advances the clock), then
+  // overlay_run with an anchor_cycle BETWEEN them → the returned anchorId must be
+  // the EARLIER (at/before) anchor on both runtimes. The two ids are stable
+  // ("cp_<gen>_<n>" on both), so we compare WHICH of the two captured ids was
+  // chosen (a boolean: chose-the-earlier), not the literal id string (the gen
+  // counter differs across the two daemons' lifetimes).
+  {
+    id: "ws-overlay-anchor-selection",
+    severity: "P2",
+    title: "runtime/overlay_run anchor_cycle picks the at-or-before anchor (deterministic)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      await c.call("session/reset", { session_id: sid, mode: "cold" });
+      // Anchor A at the booted cycle.
+      const capA = (await c.call("checkpoint/capture", { session_id: sid })) as any;
+      const idA = capA?.ref?.id ?? capA?.id;
+      const cycA = Number(capA?.ref?.cycles ?? capA?.cycles ?? 0);
+      // Advance the clock a known amount, then capture anchor B (later cycle).
+      await c.call("session/run", { session_id: sid, cycles: 100000 });
+      const capB = (await c.call("checkpoint/capture", { session_id: sid })) as any;
+      const idB = capB?.ref?.id ?? capB?.id;
+      const cycB = Number(capB?.ref?.cycles ?? capB?.cycles ?? 0);
+      // Pick an anchor_cycle strictly between A and B → must resolve to A (at/before).
+      const between = Math.floor((cycA + cycB) / 2);
+      const o = (await c.call("runtime/overlay_run", {
+        session_id: sid,
+        anchor_cycle: between,
+        patches: [{ addr: 0x033c, bytes: [], read: true }],
+        run_cycles: 0,
+      })) as any;
+      return {
+        // B is strictly later than A (the run advanced the clock).
+        bIsLater: cycB > cycA,
+        // anchor_cycle between A and B resolves to A (the at-or-before anchor).
+        choseEarlier: String(o?.anchorId) === String(idA),
+        // It did NOT pick the later anchor (B is after the requested cycle).
+        notChoseLater: String(o?.anchorId) !== String(idB),
+      };
+    },
+  },
+
+  // ── NOTE (asm-source overlays, 769 §6 P1) — NOT WS-differential-testable here ─
+  // Spec 769 §6 mentions `{addr, source:<asm>}` overlays (assemble_source → bytes,
+  // equivalent to raw bytes). The WS `runtime/overlay_run` handler reads ONLY
+  // `patches[].bytes` (ws-server.ts:957-963) — the asm→bytes assembly lives in the
+  // MCP `runtime_overlay_run` tool layer (server-tools/headless.ts), NOT on the WS
+  // surface. So over WS both daemons accept only pre-assembled bytes, and there is
+  // no `source` field to diverge on. Recorded as an MCP-tool-level note (the raw-
+  // bytes path IS covered by ws-overlay-run-loop above); no WS gate is added.
+
+  // ── P1 (BLOCKED): recorder-list-shape — supersedes background-workers-async-0 ─
+  // Spec 769 §2 (769.1): an ACTIVE recorder → recorder/list returns
+  // { active:true, anchors:[{seq,cycle,wallMs,diskGen,cartGen,schemaVersion}…] };
+  // anchors accrue while free-running; seq is monotonic + cycle ascending.
+  // BLOCKED by the TS oracle harness (NOT a TRX64 defect). The TS recorder/list
+  // does `await c.recorder.list()`, which round-trips to a node:worker_threads
+  // worker resolved at WORKER_PATH = `${dir(import.meta.url)}/recorder-worker.js`
+  // (runtime-recorder.ts:33). Under the tsx-from-src oracle daemon import.meta.url
+  // is the SRC `.ts` dir — where only recorder-worker.ts exists (the built .js is
+  // under dist/) — so `new Worker(.js)` never loads, its error is swallowed, and the
+  // list() promise NEVER resolves (RPC timeout). EMPIRICALLY CONFIRMED: TS
+  // recorder/list hangs (>20 s) while TRX64 returns in ~1 ms with the correct shape
+  // ({active:true, anchors:[{seq:0,cycle,wallMs,diskGen,cartGen,schemaVersion}]}).
+  // So the TS AUTHORITY cannot report the comparison signal over WS under THIS
+  // harness — same class as the original background-workers-async-0. This case is a
+  // STRENGTHENING (past that case's count-only check): it asserts the full anchor
+  // SHAPE + monotonic seq + ascending cycle, and re-arms automatically once the
+  // oracle runs the built (dist) TS daemon (where recorder-worker.js resolves) — run
+  // `--only recorder-list-shape --include-blocked` to re-check. The TRX64 side is
+  // verified directly here (the in-process recorder, no worker).
+  {
+    id: "recorder-list-shape",
+    severity: "P1",
+    title: "recorder/list returns the anchor list shape (active + {seq,cycle,…}; monotonic seq, ascending cycle)",
+    blocked:
+      "TS recorder/list awaits a node:worker_threads worker (recorder-worker.js) that " +
+      "is non-functional under tsx-from-src (resolves to the src .ts dir; the built .js " +
+      "is under dist/), so the list() promise never resolves (RPC timeout). EMPIRICALLY " +
+      "confirmed: TS hangs >20s; TRX64 returns the correct shape in ~1ms. Re-arm when the " +
+      "oracle runs the built (dist) TS daemon.",
+    spawn: { stream: true, env: { C64RE_RECORDER: "1" } },
+    async signal(c) {
+      const sid = await liveSession(c);
+      // TRX64 needs an explicit recorder/start; TS auto-creates it in run() and has no
+      // such method → ignore the error there.
+      await c.call("recorder/start", { session_id: sid }).catch(() => undefined);
+      // Start the continuous --stream driver (on TS this ALSO creates the recorder).
+      await c.call("debug/run", { session_id: sid });
+      const fetchList = async (): Promise<any> =>
+        (await c.call("recorder/list", { session_id: sid })) as any;
+      // Poll for ≥1 anchor (the recorder feeds an anchor at the auto-capture cadence).
+      let r = await fetchList();
+      const deadline = Date.now() + 60_000;
+      while (Date.now() < deadline && (!Array.isArray(r?.anchors) || r.anchors.length < 1)) {
+        await sleep(2000);
+        r = await fetchList();
+      }
+      const anchors: any[] = Array.isArray(r?.anchors) ? r.anchors : [];
+      const first = anchors[0] ?? {};
+      // Monotonic seq + ascending cycle across the accrued anchors.
+      let seqMonotonic = true, cycleAscending = true;
+      for (let i = 1; i < anchors.length; i++) {
+        if (!(Number(anchors[i].seq) > Number(anchors[i - 1].seq))) seqMonotonic = false;
+        if (!(Number(anchors[i].cycle) >= Number(anchors[i - 1].cycle))) cycleAscending = false;
+      }
+      return {
+        active: r?.active === true,
+        hasAnchors: anchors.length >= 1,
+        // The anchor entry carries the RecorderAnchorRef fields.
+        firstHasSeq: typeof first.seq === "number",
+        firstHasCycle: typeof first.cycle === "number",
+        firstHasSchemaVersion: typeof first.schemaVersion === "number",
+        seqMonotonic,
+        cycleAscending,
+      };
+    },
+  },
+
+  // ── P1 (BLOCKED): recorder-dump — anchor → .c64re file + descriptor; arg guards ─
+  // Spec 769 §2 (769.1)/707: recorder/dump({seq,path}) writes the anchor at `seq`
+  // to a native .c64re (non-empty, "C64RESNP" magic) and returns a descriptor;
+  // missing seq/path throws. BLOCKED for the SAME reason as recorder-list-shape —
+  // recorder/dump first does `recorder.list()`-style worker round-trips (the seq
+  // lookup goes through the worker store), so the TS side cannot report under tsx-
+  // from-src. EMPIRICALLY CONFIRMED on TRX64: dump writes an 18.3 KB .c64re starting
+  // "C64RESNP" + returns { path, cycle, pc, machine, media, fileBytes, breakpoints };
+  // `recorder/dump` with no seq → "recorder/dump: seq required"; no path →
+  // "recorder/dump: path required". Re-arms with the dist TS daemon.
+  {
+    id: "recorder-dump",
+    severity: "P1",
+    title: "recorder/dump writes the anchor to a .c64re (magic C64RESNP, non-empty) + arg guards throw",
+    blocked:
+      "TS recorder/dump routes the seq lookup through the same node:worker_threads " +
+      "recorder worker that is non-functional under tsx-from-src — so the TS authority " +
+      "cannot report. Verified directly on TRX64: dump writes an 18.3KB .c64re (magic " +
+      "C64RESNP) + returns a descriptor; missing seq/path throw the documented errors. " +
+      "Re-arm when the oracle runs the built (dist) TS daemon.",
+    spawn: { stream: true, env: { C64RE_RECORDER: "1" } },
+    async signal(c, d) {
+      const sid = await liveSession(c);
+      await c.call("recorder/start", { session_id: sid }).catch(() => undefined);
+      await c.call("debug/run", { session_id: sid });
+      // Wait for ≥1 anchor, then dump the first seq.
+      const fetchList = async (): Promise<any> =>
+        (await c.call("recorder/list", { session_id: sid })) as any;
+      let lr = await fetchList();
+      const deadline = Date.now() + 60_000;
+      while (Date.now() < deadline && (!Array.isArray(lr?.anchors) || lr.anchors.length < 1)) {
+        await sleep(2000);
+        lr = await fetchList();
+      }
+      const seq = lr?.anchors?.[0]?.seq;
+      const path = join(d.projectDir, "recorder-anchor.c64re");
+      await c.call("recorder/dump", { session_id: sid, seq, path });
+      const exists = existsSync(path);
+      const bytes = exists ? readFileSync(path) : Buffer.alloc(0);
+      const magic = bytes.length >= 8 ? bytes.toString("latin1", 0, 8) : "";
+      // Arg guards: missing seq / missing path throw.
+      let noSeqThrew = false, noPathThrew = false;
+      try { await c.call("recorder/dump", { session_id: sid, path }); } catch { noSeqThrew = true; }
+      try { await c.call("recorder/dump", { session_id: sid, seq }); } catch { noPathThrew = true; }
+      return {
+        fileExists: exists,
+        nonEmpty: bytes.length > 0,
+        magicC64resnp: magic === "C64RESNP",
+        noSeqThrew,
+        noPathThrew,
+      };
+    },
+  },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
