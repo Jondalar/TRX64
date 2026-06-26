@@ -8,6 +8,8 @@ This is a faithful but enhanced vice clone, made with a modern headless and API 
 
 .c64re formats are compatible with C64RE, a .vsf compatibility layer is included. TRX64 can read and import .vsf but N O T export. 
 
+As per Request by Count Zero on behalf of csdb staff, I removed any associtation on csdb with this. If you want to interact with me on both, TRX64 or C64RE please use github.
+
 ---
 
 ## Quick start
