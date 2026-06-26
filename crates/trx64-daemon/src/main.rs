@@ -560,6 +560,40 @@ impl FlowTracker {
     }
 }
 
+/// SINGLE-PATH bus-selection gate (Spec 723). The ONE predicate that decides whether a
+/// scenario runs on the FULL literal-VIC product machine (`run_for_full*`, the VIC the
+/// TS reference always ticks) or on the chip-ISOLATED `cpu6510` core. Every advance path
+/// — the run path (`run_cycle_budget`), the step paths (`step_one_instruction`,
+/// `step_one_capture_interrupt`), the break-run (`run_until_break`), and
+/// `debug/memory_access_map` — MUST read THIS so RUN and STEP/INSPECT see the SAME
+/// machine for the same scenario (no run-vs-step observer effect).
+///
+/// `full_machine` reads SCENARIO state only (`full_assembled` + `injected`/`io_injected`
+/// + a `vic`-directed trace directive), NEVER a recording channel:
+///   * a real boot / `wr io` register-injection / a `vic`-directed program → full machine
+///     (the per-cycle VIC renderer must sweep the raster; the VIC steals CPU cycles via
+///     badline / sprite-DMA BA-low).
+///   * a plain-`wr`-injected CPU/CIA/SID ISA micro-exerciser → the isolated `cpu6510`
+///     core it is a unit test OF (the core the TS-recorded goldens for those exercisers
+///     match; the full machine's VERBATIM VICE core legitimately diverges from the TS
+///     oracle on jammed-CPU / indexed-RMW FETCH_OPCODE cycle counts).
+///
+/// `vic_directed` reads the active trace's `vic`/`c64-vic` domain — but ONLY to ENGAGE
+/// the VIC (the moral equivalent of `io_injected`); the `vic` domain has NO recording
+/// producer, so it changes the BUS, never a recording filter. It is NOT a recording
+/// channel: the recording domains are `c64-cpu`/`memory`/`sid`/`drive8-cpu`, none of
+/// which flips this gate — hence enabling any RECORDING domain leaves execution
+/// (and thus the run-vs-step machine choice) unchanged.
+fn full_machine_gate(session: &Session) -> bool {
+    let vic_directed = session
+        .trace
+        .as_ref()
+        .map(|t| TraceChannels::from_domains(&t.domains).vic)
+        .unwrap_or(false);
+    session.machine.full_assembled
+        && (!session.injected || session.io_injected || vic_directed)
+}
+
 /// A passive observer that records whether a hardware IRQ/NMI was DISPATCHED during
 /// one instruction step (and which vector). The verbatim C64 core fires
 /// `Observer::on_interrupt(vector, clk)` at the TOP of the NMI ($FFFA) / IRQ ($FFFE)
@@ -597,8 +631,9 @@ impl Observer for InterruptCaptureObserver {
 /// captured vector (None / 0xfffa / 0xfffe). The observer is passive — the VM state
 /// is byte-identical to the `NullSink` path.
 fn step_one_capture_interrupt(session: &mut Session) -> Option<u16> {
-    let full_machine =
-        session.machine.full_assembled && (!session.injected || session.io_injected);
+    // Spec 723: SAME bus gate the run path (`run_cycle_budget`) uses — STEP must see the
+    // machine the scenario RUNS on (incl. the `vic`-directed full-machine engage).
+    let full_machine = full_machine_gate(session);
     let mut obs = InterruptCaptureObserver::new();
     if full_machine {
         session.machine.run_for_full_capped(999_999, 1, &mut obs, |_, _, _, _, _, _, _| {});
@@ -1114,14 +1149,9 @@ fn run_cycle_budget(session: &mut Session, budget: u64) {
     // of `io_injected` (a scenario directive to wire the VIC), so the cycle timeline is
     // the literal VIC's regardless. It does NOT make any RECORDING domain change
     // execution: the recording domains are `c64-cpu`/`memory`/`sid`/`drive8-cpu`, and
-    // none of them flips this gate.
-    let vic_directed = session
-        .trace
-        .as_ref()
-        .map(|t| TraceChannels::from_domains(&t.domains).vic)
-        .unwrap_or(false);
-    let full_machine = session.machine.full_assembled
-        && (!session.injected || session.io_injected || vic_directed);
+    // none of them flips this gate. The SAME `full_machine_gate` decides the step/inspect
+    // paths, so RUN and STEP see the same machine for the same scenario (Spec 723).
+    let full_machine = full_machine_gate(session);
 
     let Some((channels, need_header, meta_json)) = session.trace.as_ref().map(|t| {
         (TraceChannels::from_domains(&t.domains), t.buf.is_empty(), t.meta_json.clone())
@@ -1223,8 +1253,9 @@ fn step_one_instruction(session: &mut Session) {
     // even though that is an injection. But the cycle-exact CPU/CIA-ISOLATED gates
     // inject a program via plain `wr` (injected, NOT io_injected) and must stay on
     // the CPU-only path so VIC badline steals don't perturb their cycle counts.
-    let full_machine =
-        session.machine.full_assembled && (!session.injected || session.io_injected);
+    // Spec 723: SAME bus gate the run path (`run_cycle_budget`) uses — a `vic`-directed
+    // scenario engages the full VIC when STEPPED, exactly as it does when RUN.
+    let full_machine = full_machine_gate(session);
     let mut obs = NullSink;
     if full_machine {
         session.machine.run_for_full_capped(999_999, 1, &mut obs, |_, _, _, _, _, _, _| {});
@@ -1862,8 +1893,9 @@ fn run_until_break(
     reg: &mut observers::ObserverRegistry,
     cycle_budget: u64,
 ) -> BreakRun {
-    let full_machine =
-        session.machine.full_assembled && (!session.injected || session.io_injected);
+    // Spec 723: SAME bus gate the run path (`run_cycle_budget`) uses — run-to-break must
+    // halt on the machine the scenario RUNS on (incl. the `vic`-directed full-machine).
+    let full_machine = full_machine_gate(session);
     let start_clk = session.machine.clk;
     reg.clear_halt();
 
@@ -8397,8 +8429,11 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
 
             let mut st = state.lock().unwrap();
             let session = &mut st.session;
-            let full_machine = session.machine.full_assembled
-                && (!session.injected || session.io_injected);
+            // Spec 723: SAME bus gate the run path (`run_cycle_budget`) uses — the
+            // access map must reflect the machine the scenario RUNS on. On a `vic`-directed
+            // (or io-injected / booted) scenario this engages the full VIC, so the map
+            // sees the VIC register + sweep accesses a FlatRam isolated run would miss.
+            let full_machine = full_machine_gate(session);
 
             let mut obs = MemoryAccessObserver::new();
             if full_machine {

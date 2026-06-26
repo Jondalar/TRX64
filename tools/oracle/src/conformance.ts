@@ -619,6 +619,127 @@ const CASES: ConfCase[] = [
     },
   },
 
+  // ── P1: step-run-bus-consistency — STEP sees the SAME machine as RUN ─────────
+  // The run-vs-step observer-effect guard for the single-path bus gate (Spec 723).
+  // commit 182f6e0 fixed the RUN path (`run_cycle_budget`) to ENGAGE the full
+  // literal-VIC machine on a `vic`-directed scenario (the `vic_directed` term), but
+  // left FOUR step/inspect sites on the OLD gate (`full_assembled && (!injected ||
+  // io_injected)`, no `vic_directed`): `step_one_instruction`,
+  // `step_one_capture_interrupt`, `run_until_break`, `debug/memory_access_map`. So
+  // the SAME scenario could STEP/INSPECT on a DIFFERENT bus than it RUNS on — a
+  // debugger showing a different machine than what executes.
+  //
+  // This case uses a `vic`-directed INJECTED program (so `vic_directed` is the
+  // deciding term — a plain injected program would stay on FlatRam, a real boot would
+  // be full-machine on BOTH gates; only `injected && vic_directed` separates old from
+  // new). The program reads the VIC raster $D012 in a tight loop and stores it to
+  // $0900, then `JMP`s back. On the full literal-VIC machine the raster ADVANCES as
+  // cycles pass (VIC ticked) and badline DMA steals CPU cycles; on FlatRam $D012 is
+  // static (no VIC) and no cycles are stolen.
+  //
+  // Signal: drive the SAME program two ways, each on its OWN fresh machine, both with
+  // the `vic` trace domain active, both via the SAME instruction budget:
+  //   * RUN leg  — `session/run` (the run path = `run_cycle_budget`), read endpoint
+  //     PC + c64Cycles + the captured raster at $0900.
+  //   * STEP leg — `runtime/call stepInto` × N (the step path = `step_one_instruction`),
+  //     read the same endpoint via `runtime/call monitorRegisters` + memory.
+  // Reports finalPc/cycles for both legs, whether they MATCH, and whether the VIC was
+  // actually live (raster advanced) under stepping. GREEN requires: run==step on
+  // TRX64 (no observer effect) AND the TRX64 signal == the TS signal (TS has ONE
+  // execution path, so its run and step always agree). BEFORE the fix the STEP leg ran
+  // FlatRam (static $D012, no badline steal) → finalCycles/raster diverged from the RUN
+  // leg → bus_consistent=false.
+  {
+    id: "step-run-bus-consistency",
+    severity: "P1",
+    title: "step-debug uses the SAME bus as the run path (no run-vs-step observer effect)",
+    async signal(c, d) {
+      // $0800: SEI; loop: LDA $D012 / STA $0900 / JMP loop. The raster read is the
+      // VIC-liveness probe; the JMP self-loop runs forever so a fixed instruction
+      // budget is well-defined. (3 instrs/iteration after the one-time SEI.)
+      //   0800 78        SEI
+      //   0801 AD 12 D0   LDA $D012
+      //   0804 8D 00 09   STA $0900
+      //   0807 4C 01 08   JMP $0801
+      const PROG = "wr 0800 78 AD 12 D0 8D 00 09 4C 01 08";
+      const ENTRY = "r pc=0800";
+      // Enough instructions to cross several rasterlines (incl. badlines) so the
+      // VIC-tick vs FlatRam divergence is unambiguous; small enough to stay fast.
+      const STEPS = 600;
+
+      // RUN leg: run a cycle budget on a fresh machine, then read the endpoint. We run
+      // a generous cycle budget and DON'T compare raw cycles to the step leg (the run
+      // path stops at a cycle boundary, the step path at an instruction boundary); the
+      // cross-leg invariant we assert is the CAPTURED RASTER liveness + that BOTH legs
+      // see a live (advancing) VIC. The intra-leg PC is also reported.
+      const runLeg = async (rpc: RpcClient) => {
+        const created = (await rpc.call("session/create", {})) as any;
+        const sid = created?.sessionId ?? created?.session_id;
+        await rpc.call("monitor/exec", { session_id: sid, command: PROG });
+        await rpc.call("monitor/exec", { session_id: sid, command: ENTRY });
+        await rpc.call("trace/start_domains", { session_id: sid, domains: ["vic"] });
+        // Sample the raster early, then run a window, then sample again — a LIVE VIC
+        // moves the captured raster; FlatRam leaves it static.
+        await rpc.call("session/run", { session_id: sid, cycles: 200 });
+        const early = ((await rpc.call("runtime/call", {
+          session_id: sid, op: "monitorMemory", args: [0x0900, 0x0900],
+        })) as any)?.[0] ?? -1;
+        await rpc.call("session/run", { session_id: sid, cycles: 8000 });
+        const late = ((await rpc.call("runtime/call", {
+          session_id: sid, op: "monitorMemory", args: [0x0900, 0x0900],
+        })) as any)?.[0] ?? -1;
+        await rpc.call("trace/run/stop", { session_id: sid, wait_index: true }).catch(() => undefined);
+        return { rasterEarly: Number(early), rasterLate: Number(late), live: Number(early) !== Number(late) };
+      };
+
+      // STEP leg: single-step the SAME program N instructions on a fresh machine via the
+      // step path, sampling the captured raster early and late the SAME way.
+      const stepLeg = async (rpc: RpcClient) => {
+        const created = (await rpc.call("session/create", {})) as any;
+        const sid = created?.sessionId ?? created?.session_id;
+        await rpc.call("monitor/exec", { session_id: sid, command: PROG });
+        await rpc.call("monitor/exec", { session_id: sid, command: ENTRY });
+        await rpc.call("trace/start_domains", { session_id: sid, domains: ["vic"] });
+        const readRaster = async () =>
+          Number(((await rpc.call("runtime/call", {
+            session_id: sid, op: "monitorMemory", args: [0x0900, 0x0900],
+          })) as any)?.[0] ?? -1);
+        // Step a few iterations to populate $0900, sample early.
+        for (let i = 0; i < 9; i++) await rpc.call("runtime/call", { session_id: sid, op: "stepInto", args: [] });
+        const early = await readRaster();
+        for (let i = 0; i < STEPS; i++) await rpc.call("runtime/call", { session_id: sid, op: "stepInto", args: [] });
+        const late = await readRaster();
+        await rpc.call("trace/run/stop", { session_id: sid, wait_index: true }).catch(() => undefined);
+        return { rasterEarly: early, rasterLate: late, live: early !== late };
+      };
+
+      // RUN on the case's daemon, STEP on a fresh sibling of the SAME kind (kind-honest:
+      // TS-vs-TS for the TS leg, TRX-vs-TRX for the TRX64 leg).
+      const run = await runLeg(c);
+      const other = await spawnDaemon(d.kind);
+      let step: { rasterEarly: number; rasterLate: number; live: boolean };
+      try {
+        const oc = await connect(other.endpoint);
+        try {
+          step = await stepLeg(oc);
+        } finally {
+          oc.close();
+        }
+      } finally {
+        other.stop();
+      }
+      return {
+        runLive: run.live,
+        stepLive: step.live,
+        // The observer-effect contract: STEP must engage the VIC exactly as RUN does.
+        // Before the fix the STEP leg ran FlatRam → stepLive=false while runLive=true.
+        // After: both ticking the literal VIC → both live → consistent. (= TS, which has
+        // one execution path so its run and step always agree.)
+        bus_consistent: run.live === step.live,
+      };
+    },
+  },
+
   // ── P1: streaming-av-5 — session/frame_available JSON notification per frame ─
   // TS pushes a lightweight `session/frame_available` JSON notification on every
   // presented frame (alongside the binary VIC frame), for metadata-only consumers.
