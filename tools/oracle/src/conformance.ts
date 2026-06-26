@@ -1744,6 +1744,147 @@ const CASES: ConfCase[] = [
       };
     },
   },
+
+  // ── P1: ws-trace-monitor-misc-16 — monitor label/note WRITE + .sym round-trip ─
+  // TS monitor-shell.ts:250-275 → ws-server.ts:2207-2258 (ProjectKnowledgeService):
+  // `label <addr> <name>` persists a user label to <project>/knowledge/labels.user.json
+  // (+ a memory-address entity), `label` (bare) lists them, `unlabel` removes one,
+  // `note <addr> "<text>"` drops a finding, and `save_labels`/`load_labels` round-trip
+  // a VICE `.sym` (`al C:<hx> .<name>`). The disassembler then annotates: `d <addr>` of
+  // a labelled address shows `<name>:` above the line (disasm6502.ts:155-161). TRX64's
+  // run_monitor (main.rs:3090-3092) unconditionally errored "no project workspace bound"
+  // for ALL these verbs (no ProjectKnowledgeService bridge). Fix: a faithful project-
+  // knowledge persistence bridge (project_knowledge.rs) over the SAME store
+  // format/location. Signal — SEMANTIC behaviour compared TS vs TRX64 on the SAME
+  // scripted sequence: a label is set, listed, shown in the disasm, round-tripped
+  // through a .sym, and a note is recognized. TS: all true; TRX64 (before fix): all
+  // false (every verb errors "no project workspace bound").
+  {
+    id: "ws-trace-monitor-misc-16",
+    severity: "P1",
+    title: "monitor label/unlabel/note + save_labels/load_labels persist project knowledge (no longer error)",
+    // No seed needed — the labels are CREATED at runtime; both daemons own a project
+    // dir (--project <tmp>), so the knowledge store lands under it identically.
+    async signal(c, d) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      // BEFORE: the historic stub error must be gone.
+      const noWorkspaceErr = (s: string) => /no project workspace bound/i.test(s);
+      // 1) Set a label at $C000 → persisted (returns "label $c000 = myroutine (...)").
+      const setOut = await exec("label c000 myroutine");
+      // 2) Bare `label` lists it.
+      const listOut = await exec("label");
+      // 3) `d $C000` disassembly annotates the labelled address with `myroutine:`.
+      //    Put a known opcode there first so the disasm is deterministic (NOP).
+      await exec("wr ram c000 ea");
+      const disOut = await exec("d c000 c000");
+      // 4) save_labels writes a VICE .sym, load_labels reads it back.
+      const symPath = `${d.projectDir}/labels.sym`;
+      const saveOut = await exec(`save_labels "${symPath}"`);
+      const symMadeFile = (() => {
+        try { return /al\s+C:c000\s+\.myroutine/i.test(readFileSync(symPath, "utf8")); }
+        catch { return false; }
+      })();
+      // Clear, then load the .sym back → the label reappears in the list.
+      await exec("unlabel myroutine");
+      const listAfterUnlabel = await exec("label");
+      const loadOut = await exec(`load_labels "${symPath}"`);
+      const listAfterLoad = await exec("label");
+      // 5) `note <addr> "<text>"` is recognized + persists a finding (returns "note saved").
+      const noteOut = await exec('note d020 "border colour write"');
+      return {
+        // The historic stub error is gone on EVERY verb.
+        notErroredAsNoWorkspace:
+          !noWorkspaceErr(setOut) && !noWorkspaceErr(listOut) && !noWorkspaceErr(saveOut) &&
+          !noWorkspaceErr(loadOut) && !noWorkspaceErr(noteOut),
+        // Semantic: set → the persisted label is listed.
+        labelSetAndListed: /myroutine/i.test(setOut) && /myroutine/i.test(listOut),
+        // Semantic: the disassembly annotates the labelled address (asm-style `name:`).
+        disasmShowsLabel: /myroutine:/i.test(disOut),
+        // Semantic: save_labels wrote a VICE-format .sym file.
+        symRoundTripSaved: symMadeFile,
+        // Semantic: unlabel removed it, load_labels brought it back.
+        symRoundTripLoaded:
+          !/myroutine/i.test(listAfterUnlabel) &&
+          /loaded\s+1\s+label/i.test(loadOut) &&
+          /myroutine/i.test(listAfterLoad),
+        // Semantic: note is recognized + persisted (the confirmation string).
+        notePersisted: /note saved @ \$d020/i.test(noteOut),
+      };
+    },
+  },
+
+  // ── P1: ws-trace-monitor-misc-15 — monitor inspect/xref/sym project-read bridge ─
+  // TS monitor-shell.ts:1181-1207 → ws-server.ts:2135-2191: `inspect <addr>` returns
+  // the analysis segment(s) + callers covering the address, `xref <addr>` the project-
+  // wide cross-references, and `sym <name>` resolves a name→address — all read from the
+  // project's `*_analysis.json` (effective-segments overlay + the address/xref index).
+  // TRX64's run_monitor (main.rs:3083-3085) unconditionally errored "project-read bridge
+  // unavailable". Fix: a faithful project-read bridge (project_knowledge.rs) over the
+  // SAME on-disk analysis files. We SEED a representative `*_analysis.json` (segments +
+  // codeAnalysis.xrefs) into BOTH daemons' project dirs so both read identical project
+  // knowledge. Signal — SEMANTIC behaviour compared TS vs TRX64 on the SAME fixture:
+  // inspect/xref/sym all return the seeded knowledge (not an error). TS: all true; TRX64
+  // (before fix): all false (every verb errors "project-read bridge unavailable").
+  {
+    id: "ws-trace-monitor-misc-15",
+    severity: "P1",
+    title: "monitor inspect/xref/sym read the project _analysis.json (no longer error)",
+    spawn: {
+      seedFiles: [
+        {
+          // A minimal valid analysis report: two segments (a labelled `main` code
+          // segment + a data segment) and two xrefs (a read of $0900 + a call of $0810).
+          rel: "fixture_analysis.json",
+          bytes: Buffer.from(
+            JSON.stringify({
+              segments: [
+                { kind: "code", start: 0x0810, end: 0x08ff, label: "main" },
+                { kind: "data", start: 0x0900, end: 0x09ff },
+              ],
+              codeAnalysis: {
+                xrefs: [
+                  { sourceAddress: 0x0820, targetAddress: 0x0900, type: "read", operandText: "lda $0900" },
+                  { sourceAddress: 0x0950, targetAddress: 0x0810, type: "call" },
+                ],
+              },
+            }),
+          ),
+        },
+      ],
+    },
+    async signal(c) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      const bridgeErr = (s: string) => /project-read bridge unavailable/i.test(s);
+      // inspect $0810 → owns the labelled `main` code segment + the $0950 caller.
+      const inspectOut = await exec("inspect 0810");
+      // xref $0900 → the $0820 read references it (project-wide).
+      const xrefOut = await exec("xref 0900");
+      // sym main → reverse-resolves the labelled segment to $0810.
+      const symOut = await exec("sym main");
+      return {
+        // The historic stub error is gone on EVERY verb.
+        notErroredAsBridgeUnavailable:
+          !bridgeErr(inspectOut) && !bridgeErr(xrefOut) && !bridgeErr(symOut),
+        // Semantic: inspect surfaces the seeded segment knowledge at $0810.
+        inspectReturnsKnowledge:
+          /0810/i.test(inspectOut) && /code/i.test(inspectOut) && /main/i.test(inspectOut),
+        // Semantic: inspect lists the cross-file caller of $0810.
+        inspectShowsCaller: /0950/i.test(inspectOut),
+        // Semantic: xref surfaces the seeded reference INTO $0900.
+        xrefReturnsRefs: /0820/i.test(xrefOut) && /in:1/i.test(xrefOut),
+        // Semantic: sym reverse-resolves the labelled segment.
+        symResolvesName: /main/i.test(symOut) && /0810/i.test(symOut),
+      };
+    },
+  },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -30,6 +30,7 @@ use trx64_session::{Session, TraceState};
 use trx64_trace::{FrameSink, TraceChannels, TracingObserver};
 
 mod observers;
+mod project_knowledge;
 mod streaming;
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
@@ -1528,6 +1529,45 @@ fn disasm_line_ts(read: impl Fn(u16) -> u8, addr: u16) -> (u16, String) {
     (size, line)
 }
 
+/// `disasmLine` WITH the Spec 754 §3.3f (Block F) label annotation
+/// (disasm6502.ts:155-161): a target-address label is appended as `; → name`, and
+/// the instruction's OWN address label is prepended as an asm-style `name:` line.
+/// Both the label AND the numeric address stay visible. Mirrors the TS
+/// `di.target ?? (di.size === 3 ? di.operand : undefined)` target resolution.
+fn disasm_line_ts_labeled(
+    read: impl Fn(u16) -> u8,
+    addr: u16,
+    labels: &std::collections::BTreeMap<u16, String>,
+) -> (u16, String) {
+    let (size, mut line) = disasm_line_ts(&read, addr);
+    let opcode = read(addr);
+    let b1 = read(addr.wrapping_add(1));
+    let b2 = read(addr.wrapping_add(2));
+    let mode = trx64_core::tables::MICROCODE_TABLE[opcode as usize]
+        .map(|e| e.mode)
+        .or_else(|| trx64_core::tables::UNDOC_TABLE[opcode as usize].map(|e| e.mode))
+        .unwrap_or("imp");
+    // di.target (abs / rel) ?? (di.size === 3 ? di.operand : undefined).
+    let target: Option<u16> = match mode {
+        "abs" => Some((b1 as u16) | ((b2 as u16) << 8)),
+        "rel" => {
+            let signed = if b1 >= 0x80 { b1 as i32 - 0x100 } else { b1 as i32 };
+            Some(((addr as i32) + size as i32 + signed) as u16)
+        }
+        _ if size == 3 => Some((b1 as u16) | ((b2 as u16) << 8)),
+        _ => None,
+    };
+    if let Some(t) = target {
+        if let Some(name) = labels.get(&t) {
+            line.push_str(&format!("   ; → {name}"));
+        }
+    }
+    if let Some(own) = labels.get(&addr) {
+        line = format!("{own}:\n{line}");
+    }
+    (size, line)
+}
+
 /// Spec 754 §3.3k — control-flow classification for the `df` static walk. 1:1 with
 /// monitor-flow-disasm.ts `classify`: JMP abs / JMP (ind) / JSR / RTS / RTI / BRK /
 /// conditional branch / normal. `target` carries the abs operand (or, for JMP(ind),
@@ -1939,6 +1979,9 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 }
             }
             let pc = st.session.machine.cpu6510.reg_pc;
+            // Spec 754 §3.3f (Block F) — addr→name index (user labels) so the
+            // disassembly shows symbols alongside the addresses (= TS getLabels()).
+            let labels = project_knowledge::user_label_index(&fs_project_dir());
             // device drive8: disassemble the 1541 CPU address space (read-inspect).
             let on_drive = device == "drive8";
             let read = |x: u16| {
@@ -1955,7 +1998,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             if let Some(e) = end {
                 let e = e & 0xffff;
                 while a <= e && n < MAX {
-                    let (size, line) = disasm_line_ts(read, a);
+                    let (size, line) = disasm_line_ts_labeled(read, a, &labels);
                     lines.push(if a == pc { format!("{line} <-- PC") } else { line });
                     a = a.wrapping_add(size);
                     n += 1;
@@ -1971,7 +2014,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 }
             } else {
                 while n < 16 {
-                    let (size, line) = disasm_line_ts(read, a);
+                    let (size, line) = disasm_line_ts_labeled(read, a, &labels);
                     lines.push(if a == pc { format!("{line} <-- PC") } else { line });
                     a = a.wrapping_add(size);
                     n += 1;
@@ -3078,17 +3121,103 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
         }
         "chis" => Err("chis: no trace store — run `trace on` first".into()),
 
-        // ---- DEFERRED verbs: project-index reads (inspect/xref/sym). ----------
-        // TS errors when `ctx.projectRead` is absent. No project index bridge here.
-        "inspect" => Err("inspect: project-read bridge unavailable (run via the daemon)".into()),
-        "xref" => Err("xref: project-read bridge unavailable (run via the daemon)".into()),
-        "sym" => Err("sym: project-read bridge unavailable (run via the daemon)".into()),
+        // ---- Project-index reads (inspect/xref/sym) — audit ws-trace-monitor-misc-15. -
+        // TS wires `ctx.projectRead` (ws-server.ts:2135-2191): scan C64RE_PROJECT_DIR for
+        // the `*_analysis.json` covering the address, load its effective segments + the
+        // project-wide address/xref index, and answer inspect/xref/sym. TRX64's stub
+        // unconditionally errored. Fix: a faithful project-read bridge over the SAME on-
+        // disk analysis/annotation files (project_knowledge.rs). The project dir is the
+        // `--project` arg ?? C64RE_PROJECT_DIR (= fs_project_dir, 1:1 with the TS
+        // `process.env.C64RE_PROJECT_DIR` the daemon's run.ts sets from --project).
+        "inspect" => {
+            let addr = match parse_addr(toks.get(1)) {
+                Some(a) => a,
+                None => return Err("inspect: usage: inspect <addr> [artifact-stem]".into()),
+            };
+            Ok(project_knowledge::project_read_inspect(&fs_project_dir(), addr))
+        }
+        "xref" => {
+            let addr = match parse_addr(toks.get(1)) {
+                Some(a) => a,
+                None => return Err("xref: usage: xref <addr> [artifact-stem]".into()),
+            };
+            Ok(project_knowledge::project_read_xref(&fs_project_dir(), addr))
+        }
+        "sym" => {
+            let q = match toks.get(1) {
+                Some(q) => q.clone(),
+                None => return Err("sym: usage: sym <name> [artifact-stem]".into()),
+            };
+            project_knowledge::project_read_sym(&fs_project_dir(), &q).map_err(|e| format!("sym: {e}"))
+        }
 
-        // ---- DEFERRED verbs: project-label writes (label/unlabel/note). -------
-        // TS errors when `ctx.projectLabels` is absent ("no project workspace
-        // bound"). No ProjectKnowledgeService bridge here → identical error.
+        // ---- Project-label writes (label/unlabel/note/save_labels/load_labels) —
+        // audit ws-trace-monitor-misc-16. TS wires `ctx.projectLabels`
+        // (ws-server.ts:2207-2258, ProjectKnowledgeService): persists a user label to
+        // `<project>/knowledge/labels.user.json` (+ a memory-address entity / a note
+        // finding) and round-trips a VICE `.sym`. TRX64's stub unconditionally errored.
+        // Fix: a faithful project-knowledge persistence bridge over the SAME store
+        // format/location (project_knowledge.rs). The label store always targets the
+        // project dir (= TS `this.projectDir ?? C64RE_PROJECT_DIR`, NOT the FS-shell
+        // cwd); the .sym FILE path resolves cwd-relative (= TS `resolveFsPath(file)`).
         "label" | "unlabel" | "note" | "load_labels" | "ll" | "save_labels" | "sl" => {
-            Err(format!("{op}: no project workspace bound (labels need a project)"))
+            let dir = fs_project_dir();
+            match op.as_str() {
+                "label" => {
+                    if toks.len() == 1 {
+                        return Ok(project_knowledge::project_labels_list(&dir));
+                    }
+                    let addr = match parse_addr(toks.get(1)) {
+                        Some(a) => a,
+                        None => return Err(
+                            "label: usage: label <addr> <name>  |  label (list)  |  unlabel <addr|name>"
+                                .into(),
+                        ),
+                    };
+                    let name = toks[2..].join(" ").trim().to_string();
+                    if name.is_empty() {
+                        return Err("label: a name is required — label <addr> <name>".into());
+                    }
+                    project_knowledge::project_labels_set(&dir, addr, &name)
+                }
+                "unlabel" => {
+                    let key = match toks.get(1) {
+                        Some(k) => k.clone(),
+                        None => return Err("unlabel: usage: unlabel <addr|name>".into()),
+                    };
+                    project_knowledge::project_labels_del(&dir, &key)
+                }
+                "note" => {
+                    let addr = parse_addr(toks.get(1));
+                    // note <addr> "<text>" — the text is the FIRST quoted run (= TS
+                    // cmd.matchAll(/"([^"]*)"/g)[0]).
+                    let text = quoted_first(&cmd);
+                    match (addr, text) {
+                        (Some(a), Some(t)) => project_knowledge::project_labels_note(&dir, a, &t),
+                        _ => Err("note: usage: note <addr> \"<text>\"".into()),
+                    }
+                }
+                _ => {
+                    // save_labels / load_labels — the FILE resolves cwd-relative.
+                    let (file, _rest) = parse_file_cmd();
+                    let file = match file {
+                        Some(f) => resolve_fs_path(&f),
+                        None => {
+                            let verb = if op == "save_labels" || op == "sl" {
+                                "save_labels"
+                            } else {
+                                "load_labels"
+                            };
+                            return Err(format!("{op}: usage: {verb} \"<file.sym>\""));
+                        }
+                    };
+                    if op == "save_labels" || op == "sl" {
+                        project_knowledge::project_labels_save(&dir, &file)
+                    } else {
+                        project_knowledge::project_labels_load(&dir, &file)
+                    }
+                }
+            }
         }
 
         // ---- STATE: snapshot dump / undump (audit ws-trace-monitor-misc-9) ---------
