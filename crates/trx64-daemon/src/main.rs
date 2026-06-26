@@ -29,6 +29,7 @@ use trx64_core::{BusKind, NullSink, Observer};
 use trx64_session::{Session, TraceState};
 use trx64_trace::{FrameSink, TraceChannels, TracingObserver};
 
+mod assembler;
 mod observers;
 mod project_knowledge;
 mod snapshot_diff;
@@ -403,6 +404,15 @@ struct MonitorState {
     /// through unchanged — exactly like the TS `resolveFsPath` (which is NOT a hard
     /// jail: it only defaults relative paths to the cwd; `..`/abs escape freely).
     fs_cwd: Option<String>,
+    /// Spec 754 §3.3c — modal assemble cursor (= monitor-shell `asmCursors`). When
+    /// `Some(addr)` the monitor is in VICE-style `a` assemble mode: EVERY line is an
+    /// instruction assembled at the cursor (no verb dispatch); an empty line exits.
+    asm_cursor: Option<u16>,
+    /// The `MonitorResult.prompt` for the LAST command (= the TS modal `prompt`
+    /// field). Set per-command by `run_monitor` (cleared at entry); the `monitor/exec`
+    /// handler forwards it on the reply so a modal `a`/`df -i` prompt reaches the wire
+    /// exactly as TS's `runMonitorCommand` returns `{ output, prompt }`.
+    pending_prompt: Option<String>,
 }
 
 impl MonitorState {
@@ -414,6 +424,8 @@ impl MonitorState {
             sidefx_on: false,
             device: "c64".to_string(),
             fs_cwd: None,
+            asm_cursor: None,
+            pending_prompt: None,
         }
     }
 }
@@ -2184,7 +2196,31 @@ fn sc_to_ascii(sc: u8) -> char {
 /// they are NOT faked. The TS `MonitorResult { output | error }` is collapsed to
 /// `Ok(output)` / `Err(error)` (the monitor/exec handler re-wraps to {output}/{error}).
 fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
+    // Clear any prompt carried from a prior command; a modal verb re-sets it below.
+    st.mon.pending_prompt = None;
     let cmd = command.trim().to_string();
+
+    // ---- Modal assemble interception (Spec 754 §3.3c). 1:1 with monitor-shell.ts
+    // :218-223. A session in assemble mode treats EVERY line as an instruction (no
+    // verb dispatch); an empty line EXITS. A bad instruction stays in mode + re-shows
+    // the prompt (friendlier than VICE, which silently drops out — intentional). This
+    // runs BEFORE the empty-line no-op below because in mode an empty line is the
+    // explicit exit, not a no-op.
+    if let Some(at) = st.mon.asm_cursor {
+        if cmd.is_empty() {
+            st.mon.asm_cursor = None;
+            return Ok(String::new());
+        }
+        match assemble_at(st, at, &cmd) {
+            Ok(out) => return Ok(out),
+            Err(e) => {
+                // Re-show the prompt at the UNCHANGED cursor (cursor not advanced).
+                st.mon.pending_prompt = Some(asm_prompt(at));
+                return Err(e);
+            }
+        }
+    }
+
     if cmd.is_empty() {
         return Ok(String::new());
     }
@@ -2832,6 +2868,29 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 "filled ${:04X}..${:04X} ({} bytes, pattern {})",
                 start, end, n, data.len()
             ))
+        }
+
+        // ---- a <addr> [instr] — inline 6502 assembler (Spec 754 §3.3c). ------
+        // `a c000 lda #$01` assembles that line then STAYS in modal assemble at the
+        // next addr; `a c000` (no instr) ENTERS modal assemble at $C000 (the modal
+        // interception at the top of run_monitor then takes every following line). The
+        // help advertised it but run_monitor had NO arm → `unknown command: a` (the
+        // help LIED). 1:1 with monitor-shell.ts:715-728 (op==="a").
+        "a" => {
+            let addr = parse_addr(toks.get(1)).ok_or(
+                "a: usage: a <addr> [instruction]  — enter assemble mode (empty line exits)",
+            )?;
+            if toks.len() < 3 {
+                // Enter modal assemble at addr; the interception handles subsequent lines.
+                st.mon.asm_cursor = Some(addr);
+                st.mon.disasm_cursor = Some(addr);
+                st.mon.pending_prompt = Some(asm_prompt(addr));
+                return Ok(String::new());
+            }
+            // Assemble the inline instruction (the rest of the line). This leaves the
+            // session in modal assemble at the next addr (= TS, which stays in mode).
+            let instr = toks[2..].join(" ");
+            assemble_at(st, addr, &instr)
         }
 
         // ---- t <start> <end> <dest> — move/copy (overlap-safe). --------------
@@ -4449,6 +4508,32 @@ fn quoted_first(cmd: &str) -> Option<String> {
     let rest = &cmd[start + 1..];
     let end = rest.find('"')?;
     Some(rest[..end].to_string())
+}
+
+/// Modal assemble prompt at `addr` (= monitor-shell.ts `asmPrompt`): VICE-style
+/// `.cXXXX  ` (dot, lower-case 4-hex, two trailing spaces).
+fn asm_prompt(addr: u16) -> String {
+    format!(".{:04x}  ", addr & 0xffff)
+}
+
+/// Assemble one instruction at `addr` and write it (= monitor-shell.ts `assembleAt`,
+/// :191-204). On success: poke the bytes via the CPU write path, advance BOTH the
+/// modal assemble cursor and the disasm cursor (→ stay in mode), set `pending_prompt`
+/// to the next prompt, and return the `addr  bb bb  <disasm>` listing line. On error:
+/// return the error (cursor unchanged; the caller re-shows the prompt). The bytes are
+/// written through `poke` (raw RAM), matching the TS `s.c64Bus.write` for RAM targets;
+/// the disassembly read-back uses the cpu lens, 1:1 with the TS `disasmLine(peek cpu)`.
+fn assemble_at(st: &mut State, addr: u16, text: &str) -> Result<String, String> {
+    let r = assembler::assemble_line(text, addr).map_err(|e| format!("a: {e}"))?;
+    st.session.machine.poke(addr, &r.bytes);
+    st.session.injected = true;
+    let next = addr.wrapping_add(r.size);
+    st.mon.asm_cursor = Some(next);
+    st.mon.disasm_cursor = Some(next);
+    st.mon.pending_prompt = Some(asm_prompt(next));
+    let bytes_col: String = r.bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+    let (_, back) = disasm_line_ts(|a| st.session.machine.peek_lens(a, "cpu"), addr);
+    Ok(format!("{:04x}  {:<11}  {}", addr, bytes_col, back))
 }
 
 /// Parse a hex token (optional leading `$`).
@@ -6144,9 +6229,26 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            match run_monitor(&mut st, &cmd) {
-                Ok(out) => Response::ok(id, json!({ "output": out })),
-                Err(e) => Response::ok(id, json!({ "error": e })),
+            let res = run_monitor(&mut st, &cmd);
+            // Forward the modal `prompt` (= TS `MonitorResult.prompt`) when a modal verb
+            // (`a` assemble / `df -i`) set one — so the wire reply matches the TS
+            // `runMonitorCommand` `{ output, prompt }` / `{ error, prompt }` shape.
+            let prompt = st.mon.pending_prompt.take();
+            match res {
+                Ok(out) => {
+                    let mut body = json!({ "output": out });
+                    if let Some(p) = prompt {
+                        body["prompt"] = json!(p);
+                    }
+                    Response::ok(id, body)
+                }
+                Err(e) => {
+                    let mut body = json!({ "error": e });
+                    if let Some(p) = prompt {
+                        body["prompt"] = json!(p);
+                    }
+                    Response::ok(id, body)
+                }
             }
         }
 

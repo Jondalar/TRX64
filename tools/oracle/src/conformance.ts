@@ -2941,6 +2941,456 @@ const CASES: ConfCase[] = [
       };
     },
   },
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // BATCH 2 — Spec 754 monitor-core verbs (the largest coverage gap). Each case
+  // drives the verb via `monitor/exec` with a setup that makes the output
+  // VERIFIABLE, and asserts the verb did the RIGHT thing (TS≡TRX64) — not merely
+  // "no unknown command". See case-audit.md "Spec 754 — interactive monitor".
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // ── P0: monitor-g-x — `g`/`x` enter CONTINUOUS running (BUG-036) ────────────
+  // Spec 754 §3.1/§2: `g` flips run-state to running (the Run-button path), NOT a
+  // 1-frame burst; `g <addr>` sets PC then continues; `x` aliases `g`. The retired
+  // burst-`g` (halt after ~1 frame) is the divergence this catches. Signal: under
+  // --stream, `monitor/exec g` → runState===running immediately, then the free-run
+  // driver advances ≫20000 cyc; `g <addr>` lands PC at/after that addr, still
+  // running; `x` keeps it running. TS≡TRX64 on every boolean.
+  {
+    id: "monitor-g-x",
+    severity: "P0",
+    title: "monitor `g`/`x` enter continuous running (not a 1-frame burst); `g <addr>` sets PC",
+    spawn: { stream: true },
+    async signal(c) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      const recognized = (s: string) => !/unknown command/i.test(s);
+      // Cold-boot so KERNAL+IRQs are live (the `g` continue then free-runs the idle
+      // loop). reset is synchronous; afterwards the machine is paused at READY.
+      await c.call("session/reset", { session_id: sid, mode: "cold" });
+      const gOut = await exec("g");
+      const st1 = await state(c, sid);
+      const cyc1 = Number(st1.c64Cycles ?? st1.cpu?.cycles ?? 0);
+      // Let the free-run driver advance — a continuous `g` must move ≫20000 cyc.
+      await sleep(2500);
+      const st2 = await state(c, sid);
+      const cyc2 = Number(st2.c64Cycles ?? st2.cpu?.cycles ?? 0);
+      // `g <addr>` sets PC then continues. Use a KERNAL idle-loop address that the
+      // running machine reaches every frame ($EA31 = the jiffy IRQ handler entry).
+      const gAddrOut = await exec("g e5cd"); // $E5CD = a KERNAL routine; PC is forced there
+      const st3 = await state(c, sid);
+      const pc3 = Number(st3.cpu?.pc ?? st3.pc ?? -1);
+      const xOut = await exec("x");
+      const st4 = await state(c, sid);
+      return {
+        recognized: recognized(gOut) && recognized(gAddrOut) && recognized(xOut),
+        // `g` immediately reports running (not paused-after-burst).
+        gWentRunning: st1.runState === "running",
+        // The continuous driver advanced the machine far past one frame's worth.
+        advancedContinuously: cyc2 - cyc1 > 20000,
+        // `g <addr>` forced PC to/at-or-past the target (the continue may have moved
+        // a few instructions; we set PC to $E5CD then continue, so it is >= that on a
+        // fresh continue — assert it landed AT the address the `g` forced it to).
+        gAddrSetPc: pc3 >= 0xe5cd - 4 && st3.runState === "running",
+        // `x` aliases `g`: still running after `x`.
+        xKeptRunning: st4.runState === "running",
+      };
+    },
+  },
+
+  // ── P0: monitor-n-ret — step model: `n` step-OVER, `z` step-INTO, `ret` run-to-RTS ─
+  // Spec 754 §3.3/§4.2-3: `z`/`si` step INTO (PC→subroutine body); `n`/`so` step OVER
+  // (PC→after the JSR, the body run-through); `ret` runs to the next RTS/RTI return.
+  // step-over-vs-into is easy to mis-port. Signal: plant `JSR $C010 / NOP` at
+  // $C000/$C003 and `RTS` at $C010. From PC=$C000: `z`→PC=$C010 (into the body); reset
+  // PC, `n`→PC=$C003 (over, skipping the body); set PC=$C010, `ret`→PC=$C003 (returned).
+  // PC landings compared byte-exact TS≡TRX64.
+  {
+    id: "monitor-n-ret",
+    severity: "P0",
+    title: "monitor step model — `z` into, `n` over (skips JSR body), `ret` runs to RTS",
+    async signal(c) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      const pc = async (): Promise<number> => {
+        const st = await state(c, sid);
+        return Number(st.cpu?.pc ?? st.pc ?? -1);
+      };
+      // $C000: JSR $C010 ; $C003: NOP ; $C010: RTS  (the subroutine just returns).
+      await exec("wr c000 20 10 c0 ea");
+      await exec("wr c010 60");
+      // ── z (step INTO): from $C000 the JSR pushes + lands in the body at $C010. ──
+      await exec("r pc=c000");
+      await exec("z");
+      const pcIntoJsr = await pc();
+      // ── n (step OVER): from $C000 the JSR body is run-through; PC lands after it. ──
+      await exec("r pc=c000");
+      await exec("n");
+      const pcOverJsr = await pc();
+      // ── ret (run to RTS): from inside the body at $C010 (just the RTS), ret should
+      // execute the RTS and return to the caller's next instruction ($C003). We seed a
+      // return address on the stack so the RTS has somewhere to go: push $C002 (RTS
+      // adds 1 → $C003). SP starts at $FF; push hi then lo to $01FF/$01FE. ──
+      await exec("wr ram 01ff c0");  // return-addr hi
+      await exec("wr ram 01fe 02");  // return-addr lo ($C002 +1 → $C003)
+      await exec("r sp=fd");          // SP below the two pushed bytes
+      await exec("r pc=c010");        // at the RTS
+      await exec("ret");
+      const pcAfterRet = await pc();
+      return {
+        // z stepped INTO the subroutine body.
+        zSteppedInto: pcIntoJsr === 0xc010,
+        // n stepped OVER the JSR (body run-through, PC after the JSR).
+        nSteppedOver: pcOverJsr === 0xc003,
+        // ret ran the RTS and returned to the caller ($C003 = seeded $C002 + 1).
+        retReturned: pcAfterRet === 0xc003,
+      };
+    },
+  },
+
+  // ── P1: monitor-until — `until <addr>` synchronous run-to-landing ───────────
+  // Spec 754 §3.3/§3.1: `until <addr>` synchronously runs to addr and HALTS there
+  // (PC===addr, runState NOT running) — distinct from the live `g`. Signal: plant a
+  // tiny loop that reaches a known address, `until <addr>`, assert reported PC===addr
+  // and the machine is paused there. TS≡TRX64.
+  {
+    id: "monitor-until",
+    severity: "P1",
+    title: "monitor `until <addr>` synchronously runs to the address and halts there",
+    async signal(c) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      // $C000: NOP NOP NOP ; $C003: JMP $C003 (a self-loop landing pad). `until c003`
+      // must execute the three NOPs and stop AT $C003.
+      await exec("wr c000 ea ea ea 4c 03 c0");
+      await exec("r pc=c000");
+      const untilOut = await exec("until c003");
+      const st = await state(c, sid);
+      const pc = Number(st.cpu?.pc ?? st.pc ?? -1);
+      return {
+        recognized: !/unknown command/i.test(untilOut),
+        // Landed exactly at the requested address.
+        landedAtAddr: pc === 0xc003,
+        // Synchronous halt — not left running (unlike `g`).
+        haltedNotRunning: st.runState !== "running",
+        // The reply text reports the reached address (parsed numerically, format-agnostic).
+        replyReportsAddr: /c003/i.test(untilOut),
+      };
+    },
+  },
+
+  // ── P1: monitor-bank-lens-m — `m <lens> <addr>` honours the banking lens (BUG-038) ─
+  // Spec 754 §3.3b: `m ram e000`/`m rom e000`/`m cpu e000` return DIFFERENT bytes for
+  // the same address per the lens. A banking-BLIND `m` (a plausible TRX64
+  // simplification) returns identical bytes. Signal: cold boot (KERNAL mapped at
+  // $E000), write a RAM sentinel UNDER the KERNAL via the `ram` lens, then read the
+  // same address three ways: `m rom e000` shows the KERNAL byte (ROM image), `m ram
+  // e000` shows the sentinel (raw RAM), and they DIFFER. Same idea for $D000 (`m io`
+  // = VIC regs vs `m ram` = raw RAM). TS≡TRX64.
+  {
+    id: "monitor-bank-lens-m",
+    severity: "P1",
+    title: "monitor `m <lens> <addr>` honours the bank lens (rom≠ram≠io at the same address)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      // The first data byte of an `m` dump row: ">X:AAAA  bb bb ..." — grab the byte
+      // at the requested column (the row starts at addr & ~0x1f, so compute the index).
+      const firstByteAt = (out: string, addr: number): number => {
+        // Find the row whose base == addr & ~0x1f, then index into its byte list.
+        const base = addr & ~0x1f;
+        const re = new RegExp(`^>.\\:0*${base.toString(16)}\\s+([0-9a-fA-F ]+?)\\s{2,}`, "im");
+        const m = out.match(re) ?? out.match(/^>.\:[0-9a-fA-F]+\s+([0-9a-fA-F ]+)/im);
+        if (!m) return -1;
+        const bytes = m[1].trim().split(/\s+/);
+        const idx = addr - base;
+        const v = parseInt(bytes[idx] ?? "", 16);
+        return Number.isNaN(v) ? -1 : v;
+      };
+      // Cold boot so KERNAL is in the ROM image and mapped at $E000 under cpu lens.
+      await c.call("session/reset", { session_id: sid, mode: "cold" });
+      // Write a distinguishable sentinel into RAM under the KERNAL.
+      await exec("wr ram e000 5a");
+      const romOut = await exec("m rom e000 e01f");
+      const ramOut = await exec("m ram e000 e01f");
+      const cpuOut = await exec("m cpu e000 e01f");
+      const romByte = firstByteAt(romOut, 0xe000);
+      const ramByte = firstByteAt(ramOut, 0xe000);
+      const cpuByte = firstByteAt(cpuOut, 0xe000);
+      return {
+        // The RAM lens shows the raw sentinel we wrote.
+        ramShowsSentinel: ramByte === 0x5a,
+        // The ROM lens shows the KERNAL image byte (NOT the sentinel) — banking honoured.
+        romNotSentinel: romByte >= 0 && romByte !== 0x5a,
+        // cpu lens == rom here (KERNAL is mapped at boot), and != the raw RAM sentinel.
+        cpuMatchesRom: cpuByte === romByte && cpuByte !== 0x5a,
+        // The decisive differential: a banking-BLIND `m` would return identical bytes.
+        lensesDiffer: ramByte !== romByte && ramByte >= 0 && romByte >= 0,
+      };
+    },
+  },
+
+  // ── P1: monitor-sidefx — `sidefx on/off` toggles the read-side-effect lane ──
+  // Spec 754 §3.4: `sidefx off` (default) reads I/O via side-effect-free peek; `sidefx
+  // on` = live reads. Signal: assert the verb is recognized + toggles, and that under
+  // `sidefx off` repeated `m io` reads of a latching register are STABLE (the peek
+  // doesn't clear it). We verify the toggle is honoured (off↔on wire state) and that
+  // the off-path read is stable — the load-bearing, file-derivable contract. TS≡TRX64.
+  {
+    id: "monitor-sidefx",
+    severity: "P1",
+    title: "monitor `sidefx on/off` toggles read side-effects; off-path peek is stable",
+    async signal(c) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      await c.call("session/reset", { session_id: sid, mode: "cold" });
+      const offOut = await exec("sidefx off");
+      // Two side-effect-free reads of $D019 (raster IRQ latch) must agree (peek never
+      // acks). Parse the first byte of the io-lens dump row.
+      const firstByte = (out: string): number => {
+        const m = out.match(/^>.\:[0-9a-fA-F]+\s+([0-9a-fA-F]{2})/im);
+        return m ? parseInt(m[1], 16) : -1;
+      };
+      const r1 = firstByte(await exec("m io d019 d019"));
+      const r2 = firstByte(await exec("m io d019 d019"));
+      const onOut = await exec("sidefx on");
+      const offAgain = await exec("sidefx off");
+      return {
+        recognized: !/unknown command/i.test(offOut) && !/unknown command/i.test(onOut),
+        // The toggle is acknowledged in both directions (off→on→off).
+        offAcknowledged: /off/i.test(offOut) && /off/i.test(offAgain),
+        onAcknowledged: /on/i.test(onOut),
+        // The side-effect-free read is STABLE across two peeks (no latch clear).
+        offReadStable: r1 >= 0 && r1 === r2,
+      };
+    },
+  },
+
+  // ── P1: monitor-a-inline — inline `a <addr> <instr>` assembles into RAM ──────
+  // Spec 754 §3.3c: `a <addr> <instr>` assembles one instruction (all modes) and pokes
+  // the bytes. The help advertised `a` but run_monitor had NO arm → `unknown command:
+  // a`. Signal: assemble four instructions across modes and read the bytes back via
+  // `m ram`. NOTE: an inline `a` LEAVES the session in modal assemble (1:1 with TS,
+  // which calls assembleAt → sets the cursor), so we send an empty line to EXIT modal
+  // mode before each read. Byte-exact TS≡TRX64.
+  {
+    id: "monitor-a-inline",
+    severity: "P1",
+    title: "monitor inline `a <addr> <instr>` assembles bytes into RAM (all modes)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      const recognized = (s: string) => !/unknown command/i.test(s);
+      // Read N bytes starting at addr from an `m ram` dump (first row).
+      const ramBytes = (out: string, addr: number, n: number): number[] => {
+        const base = addr & ~0x1f;
+        const re = new RegExp(`^>.\\:0*${base.toString(16)}\\s+([0-9a-fA-F ]+?)\\s{2,}`, "im");
+        const m = out.match(re) ?? out.match(/^>.\:[0-9a-fA-F]+\s+([0-9a-fA-F ]+)/im);
+        if (!m) return [];
+        const bytes = m[1].trim().split(/\s+/);
+        const start = addr - base;
+        return Array.from({ length: n }, (_, i) => parseInt(bytes[start + i] ?? "", 16));
+      };
+      // Assemble each instruction inline, then EXIT modal mode (empty line) before
+      // reading bytes back (an inline `a` leaves the session in modal assemble).
+      const aImm = await exec("a c000 lda #$01");
+      await exec("");
+      const aAbs = await exec("a c010 sta $d020");
+      await exec("");
+      const aJsr = await exec("a c020 jsr $fce2");
+      await exec("");
+      const aRts = await exec("a c030 rts");
+      await exec("");
+      const immBytes = ramBytes(await exec("m ram c000 c001"), 0xc000, 2);
+      const absBytes = ramBytes(await exec("m ram c010 c012"), 0xc010, 3);
+      const jsrBytes = ramBytes(await exec("m ram c020 c022"), 0xc020, 3);
+      const rtsBytes = ramBytes(await exec("m ram c030 c030"), 0xc030, 1);
+      const eq = (a: number[], b: number[]) => a.length === b.length && a.every((v, i) => v === b[i]);
+      return {
+        recognized: recognized(aImm) && recognized(aAbs) && recognized(aJsr) && recognized(aRts),
+        immOk: eq(immBytes, [0xa9, 0x01]),   // LDA #$01
+        absOk: eq(absBytes, [0x8d, 0x20, 0xd0]), // STA $D020
+        jsrOk: eq(jsrBytes, [0x20, 0xe2, 0xfc]), // JSR $FCE2
+        rtsOk: eq(rtsBytes, [0x60]),         // RTS
+      };
+    },
+  },
+
+  // ── P1: monitor-a-modal — modal assemble `a <addr>` (prompt + cursor advance) ─
+  // Spec 754 §3.3c: `a <addr>` (no instr) enters assemble mode → MonitorResult.prompt
+  // = `.cXXX`; bare instruction lines assemble + advance the cursor (prompt advances);
+  // an empty line exits. The `prompt` field is forwarded over the wire (TS
+  // runMonitorCommand returns {output,prompt}; TRX64 must too). Signal: `a c000`→prompt
+  // /^\.c000/; bare `lda #$01`→prompt advanced /^\.c002/ + bytes A9 01; empty line→no
+  // prompt. TS≡TRX64.
+  {
+    id: "monitor-a-modal",
+    severity: "P1",
+    title: "monitor modal assemble `a <addr>` — prompt at cursor, advances per line, empty exits",
+    async signal(c) {
+      const sid = await liveSession(c);
+      const call = async (command: string): Promise<{ output: string; prompt?: string }> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return { output: String(r?.output ?? r?.error ?? ""), prompt: r?.prompt };
+      };
+      const ramBytes = async (addr: number, n: number): Promise<number[]> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command: `m ram ${addr.toString(16)} ${(addr + n - 1).toString(16)}` })) as any;
+        const out = String(r?.output ?? "");
+        const base = addr & ~0x1f;
+        const re = new RegExp(`^>.\\:0*${base.toString(16)}\\s+([0-9a-fA-F ]+?)\\s{2,}`, "im");
+        const m = out.match(re) ?? out.match(/^>.\:[0-9a-fA-F]+\s+([0-9a-fA-F ]+)/im);
+        if (!m) return [];
+        const bytes = m[1].trim().split(/\s+/);
+        const start = addr - base;
+        return Array.from({ length: n }, (_, i) => parseInt(bytes[start + i] ?? "", 16));
+      };
+      // Enter modal assemble at $C000 → prompt `.c000`.
+      const enter = await call("a c000");
+      // A bare instruction line (no `a` prefix) assembles at the cursor + advances it.
+      const line1 = await call("lda #$01");
+      // Read the bytes BEFORE exiting (still in modal mode — `m` would be eaten, so
+      // read via a fresh exec AFTER exiting). Exit modal mode with an empty line.
+      const exit = await call("");
+      const bytes = await ramBytes(0xc000, 2);
+      const promptAt = (p?: string) => (p ?? "").trim().toLowerCase();
+      return {
+        // Entering modal assemble returns a prompt anchored at the cursor.
+        enterPromptAtC000: /^\.0*c000/.test(promptAt(enter.prompt)),
+        // A bare instr line advanced the cursor by the instruction size (2 → $C002).
+        lineAdvancedToC002: /^\.0*c002/.test(promptAt(line1.prompt)),
+        // The instruction landed in RAM.
+        bytesLanded: bytes.length === 2 && bytes[0] === 0xa9 && bytes[1] === 0x01,
+        // The empty line EXITED modal mode → no prompt on the reply.
+        emptyLineExits: exit.prompt === undefined || exit.prompt === null,
+      };
+    },
+  },
+
+  // ── P1: monitor-t-c-h — cracking core: transfer / compare / hunt memory ─────
+  // Spec 754 §3.3c: `t <s> <e> <dst>` moves a range (overlap-safe); `c <s> <e> <dst>`
+  // compares → diff addresses; `h <s> <e> <pat..>` hunts a byte pattern (xx wildcard)
+  // → match addresses. Signal: `f` a sentinel pattern, then exercise all three and
+  // verify the result by reading the destination back / parsing the reported addresses.
+  // TS≡TRX64.
+  {
+    id: "monitor-t-c-h",
+    severity: "P1",
+    title: "monitor `t`/`c`/`h` — transfer, compare, and hunt memory (the cracking core)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      const ramBytes = (out: string, addr: number, n: number): number[] => {
+        const base = addr & ~0x1f;
+        const re = new RegExp(`^>.\\:0*${base.toString(16)}\\s+([0-9a-fA-F ]+?)\\s{2,}`, "im");
+        const m = out.match(re) ?? out.match(/^>.\:[0-9a-fA-F]+\s+([0-9a-fA-F ]+)/im);
+        if (!m) return [];
+        const bytes = m[1].trim().split(/\s+/);
+        const start = addr - base;
+        return Array.from({ length: n }, (_, i) => parseInt(bytes[start + i] ?? "", 16));
+      };
+      // Seed a known 4-byte pattern at $C000: DE AD BE EF.
+      await exec("wr ram c000 de ad be ef");
+      // Clear the destination + a hunt control region so leftovers don't false-match.
+      await exec("f c100 c1ff 00");
+      await exec("f c200 c2ff 00");
+      // ── h: hunt the pattern in $C000..$C0FF → must contain $C000. ──
+      const hOut = await exec("h c000 c0ff de ad be ef");
+      const hMatchedC000 = /c000/i.test(hOut);
+      // ── h with a wildcard: `de xx be ef` must also match $C000. ──
+      const hWildOut = await exec("h c000 c0ff de xx be ef");
+      const hWildMatchedC000 = /c000/i.test(hWildOut);
+      // ── t: transfer $C000..$C003 → $C100, then read the destination back. ──
+      await exec("t c000 c003 c100");
+      const dst = ramBytes(await exec("m ram c100 c103"), 0xc100, 4);
+      const transferOk = dst.length === 4 && dst[0] === 0xde && dst[1] === 0xad && dst[2] === 0xbe && dst[3] === 0xef;
+      // ── c: compare $C000..$C003 vs $C100 → identical now. ──
+      const cEqual = await exec("c c000 c003 c100");
+      const compareEqual = /identical/i.test(cEqual);
+      // Mutate one byte at the destination, then compare → reports the differing addr.
+      await exec("wr ram c100 00");
+      const cDiff = await exec("c c000 c003 c100");
+      const compareReportsDiff = /c000/i.test(cDiff) && /diff/i.test(cDiff);
+      return {
+        huntFound: hMatchedC000,
+        huntWildcardFound: hWildMatchedC000,
+        transferOk,
+        compareEqual,
+        compareReportsDiff,
+      };
+    },
+  },
+
+  // ── P1: monitor-r-vectors — `r` shows LIVE IRQ/NMI vectors from RAM $0314.. ──
+  // Spec 754 §3.3d: `r` shows regs + a live `vectors` block (CINV $0314→, NMIV
+  // $0318→), DERIVED from RAM — a constant block is a likely port shortcut. Also
+  // `r a=$42 x=$10` sets multiple regs. Signal: cold boot → `r` shows the live CINV
+  // target ($EA31 default); poke $0314/$0315 → `r` reflects the moved target; set regs
+  // → `r` shows them. The vectors must TRACK RAM (a constant block would not). TS≡TRX64.
+  {
+    id: "monitor-r-vectors",
+    severity: "P1",
+    title: "monitor `r` shows live IRQ/NMI vectors (derived from RAM $0314..), and sets regs",
+    async signal(c) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      // Parse the CINV target from the vectors line `CINV $0314->$XXXX`.
+      const cinvTarget = (out: string): number => {
+        const m = out.match(/CINV\s*\$0314->\$([0-9a-fA-F]{4})/i);
+        return m ? parseInt(m[1], 16) : -1;
+      };
+      await c.call("session/reset", { session_id: sid, mode: "cold" });
+      // The KERNAL sets CINV ($0314) → $EA31 at boot.
+      const r0 = await exec("r");
+      const cinv0 = cinvTarget(r0);
+      const cinvShownAtBoot = cinv0 === 0xea31;
+      // Move the vector in RAM; `r` must reflect the NEW target (live-derived).
+      await exec("wr ram 0314 cd ab");  // $0314=$CD $0315=$AB → CINV → $ABCD
+      const r1 = await exec("r");
+      const cinv1 = cinvTarget(r1);
+      const vectorsTrackRam = cinv1 === 0xabcd;
+      // Set multiple registers in one go; `r` shows them.
+      await exec("r a=42 x=10");
+      const r2 = await exec("r");
+      // The register line: `.;PPPP AA XX YY SP ...` — second/third hex pairs are A/X.
+      const regLine = r2.split("\n").find((l) => /\.;[0-9a-fA-F]{4}/.test(l)) ?? "";
+      const m = regLine.match(/\.;[0-9a-fA-F]{4}\s+([0-9a-fA-F]{2})\s+([0-9a-fA-F]{2})/);
+      const aSet = m ? parseInt(m[1], 16) : -1;
+      const xSet = m ? parseInt(m[2], 16) : -1;
+      return {
+        // The vectors block names CINV/$0314 and shows the live boot target.
+        cinvShownAtBoot,
+        hasNmivBlock: /NMIV\s*\$0318/i.test(r0),
+        // The decisive differential: the vector TRACKS RAM (a constant block would not).
+        vectorsTrackRam,
+        // `r a= x=` set both registers (shown back by `r`).
+        regsSet: aSet === 0x42 && xSet === 0x10,
+      };
+    },
+  },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
