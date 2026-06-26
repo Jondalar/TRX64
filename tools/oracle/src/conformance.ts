@@ -1296,6 +1296,67 @@ const CASES: ConfCase[] = [
     },
   },
 
+  // ── P1: ws-flow-tracker-irq — monitor `flow` shows the LIVE interrupt context ──
+  // misc-13 only proved `flow`/`bt` are RECOGNIZED + that `bt` is state-dependent.
+  // The `flow` panel itself was still a CONSTANT "main" on TRX64 (no FlowTracker),
+  // while TS renders the live interrupt/trap frame STACK (monitor-shell.ts:1103-1117
+  // ← FlowTracker.flowState(), stepping.ts:174-190). TS's FlowTracker is STEP-DRIVEN
+  // (apply() runs from stepInto/stepOver/…): when a single `z` step accepts a
+  // hardware IRQ (SP drops by exactly 3, op≠BRK — stepOne, stepping.ts:96-101) it
+  // pushes an `irq` frame, so the NEXT `flow` reports `current=irq` + a frame line.
+  // Signal: boot to IRQs-live, read `flow` at the cold (rest) state (current=main),
+  // then single-step `z` in a bounded loop until `flow` flips to `current=irq` (a raster
+  // IRQ fires every frame, so it is reachable within a bounded number of steps); also
+  // step on to the RTI so the frame POPS back to main (current=main again). TRX64
+  // before the FlowTracker port: `flow` is the constant "main" — sawIrqFrame=false,
+  // never state-dependent. After: state-dependent like TS. Compared TS vs TRX64 on the
+  // SAME machine state → both must report {sawIrqFrame:true, restIsMain:true,
+  // poppedBackToMain:true, frameLineWhenIrq:true}. (FlowTracker port — audit misc-13++.)
+  {
+    id: "ws-flow-tracker-irq",
+    severity: "P1",
+    title: "monitor `flow` reflects the live interrupt context (IRQ frame pushed on z-step into the handler, popped on RTI)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      // Boot the machine so IRQs are live (CINV→$EA31 firing every frame) via a
+      // SYNCHRONOUS cold reset: ws-server.ts session/reset {cold} runs the KERNAL to
+      // READY inline (5M cyc, resetCold), so afterwards the machine sits in the BASIC
+      // idle loop with the jiffy IRQ taken each frame. (debug/run is async-scheduled
+      // and only advances under --stream, which this case does not spawn.)
+      await c.call("session/reset", { session_id: sid, mode: "cold" });
+      // Read the rest-state flow: at READY the FlowTracker stack is empty → main.
+      const flowRest = await exec("flow");
+      const currentOf = (s: string): string => (s.match(/current=([a-z]+)/i)?.[1] ?? "").toLowerCase();
+      const restIsMain = currentOf(flowRest) === "main";
+      // Single-step until a `z` step ACCEPTS a hardware IRQ → FlowTracker pushes an
+      // `irq` frame → `flow` reports current=irq with a frame line. Bounded: a frame
+      // is ~19656 cycles (PAL), an IRQ fires each frame, so well within the cap.
+      let sawIrqFrame = false;
+      let frameLineWhenIrq = false;
+      let poppedBackToMain = false;
+      for (let i = 0; i < 25000 && !sawIrqFrame; i++) {
+        await exec("z");
+        const f = await exec("flow");
+        if (currentOf(f) === "irq") {
+          sawIrqFrame = true;
+          // The frame panel must show the irq frame line (not the "(main — no …)"
+          // placeholder): `current=irq` AND a frame body that mentions irq.
+          frameLineWhenIrq = /\birq\b/i.test(f) && !/no interrupt\/trap frame active/i.test(f);
+          // Keep stepping until the handler RTIs and the frame pops back to main.
+          for (let j = 0; j < 4000 && !poppedBackToMain; j++) {
+            await exec("z");
+            if (currentOf(await exec("flow")) === "main") poppedBackToMain = true;
+          }
+        }
+      }
+      return { restIsMain, sawIrqFrame, frameLineWhenIrq, poppedBackToMain };
+    },
+  },
+
   // ── P1: ws-trace-monitor-misc-8 — monitor `device drive8` targets the 1541 CPU ──
   // TS monitor-shell.ts:233-249: `device drive8` selects the active CPU so a
   // subsequent `r`/`m`/`d` inspect the 1541 drive CPU (read-inspect only); `device
@@ -2420,6 +2481,75 @@ const CASES: ConfCase[] = [
         runForward: await probe("runForward", ["snap-x", 1000]),
         diffBranches: await probe("diffBranches", ["a", "b"]),
         promoteBranch: await probe("promoteBranch", ["branch-x"]),
+      };
+    },
+  },
+
+  // ── P1: ws-rewind-snapshot-tree — the REAL rewind surface is at PARITY ────────
+  // The 6 runtime/call rewind methods above all throw a guard (matched by misc-24).
+  // The ACTUAL working time-travel surface is the two dedicated WS handlers
+  //   runtime/snapshot_tree  (ws-server.ts:1891-1909)  — the branch tree handle,
+  //   runtime/promote_branch (ws-server.ts:1911-1920)  — promote a branch → Scenario.
+  // Both build a FRESH createAgentQueryApi → beginRewindSession() per call, so the
+  // OBSERVABLE result depends only on construction: a single ROOT branch with a
+  // freshly-minted randomUUID() id (rewind.ts:99) + ringSize=32 (DEFAULT_RING_SIZE).
+  // Because the ids are random + non-persistent on BOTH sides (a caller can never
+  // know the next call's root id), the parity signal is the STRUCTURE, not the ids:
+  //   snapshot_tree → exactly 1 branch, that branch IS the root (id===rootBranchId,
+  //     no parentId, startSnapshotId===rootSnapshotId, empty patches+children),
+  //     ringSize===32, and rootBranchId/rootSnapshotId are non-empty;
+  //   promote_branch <unknown id> → throws "branch <id> not found"
+  //     (RewindManager.promoteBranch, rewind.rs:189-192 ≡ rewind.ts:250-252) — never
+  //     a stub / method-not-found / fake success;
+  //   promote_branch <the just-read root id> → succeeds (root branch exists this
+  //     call), returning { scenarioId: "<sid>-branch-<8hex>", scenario.mode:
+  //     "true-drive", patches: [] } (rewind.ts:257-268). NOTE: snapshot_tree mints a
+  //     NEW root each call, so promoting the id read from a PRIOR snapshot_tree call
+  //     fails on BOTH — we promote within the SAME conceptual handle by re-reading,
+  //     which still mints a new id; therefore the root-promote is checked by the
+  //     ERROR path (any supplied id is "not found" against the fresh manager), and
+  //     the SUCCESS path is asserted at the unit level (rewind.rs tests) — here we
+  //     assert the two runtimes AGREE on the observable handler behaviour.
+  // Both runtimes must report the IDENTICAL normalized shape. (Verify the real
+  // rewind surface — companion to misc-24's throw-surface.)
+  {
+    id: "ws-rewind-snapshot-tree",
+    severity: "P1",
+    title: "runtime/snapshot_tree + promote_branch are at parity (root-only branch handle; unknown-id throws not-found)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      const tree = (await c.call("runtime/snapshot_tree", { session_id: sid })) as any;
+      const branches = (tree?.branches ?? {}) as Record<string, any>;
+      const ids = Object.keys(branches);
+      const rootId: string = tree?.rootBranchId ?? "";
+      const root = branches[rootId] ?? {};
+      // promote a deliberately-bogus branch id — must throw "not found" (the
+      // RewindManager guard), NOT method-not-found and NOT a fake success.
+      let promoteUnknown = { threw: false, notFound: false };
+      try {
+        await c.call("runtime/promote_branch", { session_id: sid, branch_id: "deadbeef-not-a-branch" });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        let text = msg;
+        try { const j = JSON.parse(msg); if (j?.message) text = String(j.message); } catch { /* plain */ }
+        const isMethodNotFound = /method not found|-32601|unknown method/i.test(msg);
+        promoteUnknown = { threw: true, notFound: /not found/i.test(text) && !isMethodNotFound };
+      }
+      // Normalized, id-agnostic STRUCTURE (random UUIDs stripped — both sides mint
+      // fresh non-deterministic ids, so only the topology + constants compare).
+      return {
+        branchCount: ids.length,                                   // 1 (root only)
+        onlyBranchIsRoot: ids.length === 1 && ids[0] === rootId,    // sole branch == root
+        ringSize: tree?.ringSize ?? null,                          // 32
+        scenarioIdPresent: typeof tree?.scenarioId === "string" && tree.scenarioId.length > 0,
+        rootIdsPresent: rootId.length > 0 && typeof tree?.rootSnapshotId === "string" && tree.rootSnapshotId.length > 0,
+        rootHasNoParent: root?.parentId === undefined || root?.parentId === null,
+        rootSelfRooted: root?.rootId === rootId,                    // rootBranch.rootId = rootBranchId
+        rootStartIsRootSnapshot: root?.startSnapshotId === tree?.rootSnapshotId,
+        rootPatchesEmpty: Array.isArray(root?.patches) && root.patches.length === 0,
+        rootChildrenEmpty: Array.isArray(root?.children) && root.children.length === 0,
+        promoteUnknownThrew: promoteUnknown.threw,
+        promoteUnknownNotFound: promoteUnknown.notFound,
       };
     },
   },

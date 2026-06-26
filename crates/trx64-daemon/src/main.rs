@@ -355,6 +355,11 @@ struct State {
     /// module-level `bankDefaults` / `memCursors` / `disasmCursors` / `sidefxOn`).
     /// The daemon holds one session, so these are single-valued (not per-id maps).
     mon: MonitorState,
+    /// Spec 623 §4.2/§4.3 — the per-session interrupt/trap flow-frame tracker (=
+    /// the c64re `RuntimeController.flow`, runtime-controller.ts:141). Backs the
+    /// monitor `flow`/`focus` panels; mutated per single-step by `step_one_with_flow`
+    /// from the `z`/`n`/`ret` handlers. PASSIVE — never advances the VM.
+    flow: FlowTracker,
     /// Spec 764 — JAM (KIL) auto-break edge for the per-frame stream driver (=
     /// runtime-controller.ts:793 `brokeOnJam`). A jammed CPU keeps cycling clk with
     /// PC frozen, so the free-run advance never aborts on it; the stream loop detects
@@ -411,6 +416,248 @@ impl MonitorState {
             fs_cwd: None,
         }
     }
+}
+
+/// Spec 623 §4.2/§4.3 — the per-session control-flow tracker, a 1:1 port of the
+/// c64re TS `FlowTracker` (stepping.ts:145-281) that backs the monitor `flow`
+/// panel (monitor-shell.ts:1103-1117 ← `ctrl.flow.flowState()`). It maintains the
+/// interrupt/trap FRAME STACK so `flow` reports whether execution is currently in
+/// main / irq / nmi flow — the LIVE interrupt context, not a constant.
+///
+/// STEP-DRIVEN, exactly like TS: the stack is mutated by [`FlowTracker::apply`],
+/// which is called from the daemon's `z`/`step`/`n`/`ret` handlers after each
+/// single-step (the TS `apply()` runs from `stepInto`/`stepOver`/`runReturn`/…).
+/// A cold break from free-run leaves the stack empty → current=main (the documented
+/// best-effort cold state, stepping.ts:142-143). The classification mirrors
+/// `stepOne` (stepping.ts:78-103): an SP drop of exactly 3 across a step whose
+/// pre-opcode is not BRK is the unambiguous hardware IRQ/NMI dispatch (no other
+/// 6502 instruction pushes 3 bytes); BRK ($00) is a software interrupt entry; RTI
+/// ($40) pops the innermost frame AFTER the RTI runs in handler flow.
+///
+/// PASSIVE OBSERVER (Spec 723 observer-effect lesson): the tracker reads CPU regs
+/// the daemon already has post-step and reads the NMI vector via the non-side-effect
+/// `peek_lens` — it never advances the VM, so it has ZERO effect on byte-exact
+/// execution. The no-disk corpus is identical with it wired in.
+///
+/// FlowKind = main|irq|nmi|brk|trap (stepping.ts:39). BRK folds to its own `brk`
+/// kind (TS classifies BRK entry as `brk`); `trap` is vestigial in the single-path
+/// runtime. The 3-frame model (main/irq/nmi) plus `brk` matches stepping.ts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FlowKind {
+    Main,
+    Irq,
+    Nmi,
+    Brk,
+}
+
+impl FlowKind {
+    /// The lowercase tag the TS render uses (`fr.kind` / `current=<kind>`).
+    fn tag(self) -> &'static str {
+        match self {
+            FlowKind::Main => "main",
+            FlowKind::Irq => "irq",
+            FlowKind::Nmi => "nmi",
+            FlowKind::Brk => "brk",
+        }
+    }
+}
+
+/// stepping.ts:44-51 — `CpuFlowFrame`. Field names mirror the TS interface; only the
+/// fields the `flow` panel renders are carried (`stepping.ts:185-189`):
+/// kind, enteredAtPc (→ `pc`), enteredAtCycle (→ `cyc`), returnPc (→ `ret`).
+#[derive(Clone, Copy)]
+struct CpuFlowFrame {
+    kind: FlowKind,
+    entered_at_pc: u16,
+    entered_at_cycle: u64,
+    return_pc: u16,
+}
+
+/// stepping.ts:78-103 — the classified result of one single step, used by
+/// [`FlowTracker::apply`]. `ev` is the StepEventType; `flow` is set only for `int`.
+struct StepClass {
+    is_int: bool,
+    is_rti: bool,
+    flow: FlowKind, // only meaningful when is_int
+    pc0: u16,
+    pc1: u16,
+    cycle_abs: u64,
+}
+
+/// 1:1 port of the TS `FlowTracker` (stepping.ts:145-190). Only the state the
+/// `flow` panel observes is carried; the stepping COMMANDS themselves stay in the
+/// daemon's existing `z`/`n`/`ret` handlers (which already mirror stepInto/
+/// stepOver/runReturn), and call [`FlowTracker::apply`] per single step.
+struct FlowTracker {
+    /// stepping.ts:146 — the interrupt/trap frame stack (innermost last).
+    stack: Vec<CpuFlowFrame>,
+    /// stepping.ts:147 — focus mode string (auto|main|irq|nmi|brk|none). The
+    /// `flow` panel renders it verbatim; `focus` verb sets it. Default "auto".
+    focus: String,
+}
+
+impl FlowTracker {
+    fn new() -> Self {
+        FlowTracker { stack: Vec::new(), focus: "auto".to_string() }
+    }
+
+    /// stepping.ts:149-151 — currentFlow(): the innermost frame's kind, else main.
+    fn current_flow(&self) -> FlowKind {
+        self.stack.last().map(|f| f.kind).unwrap_or(FlowKind::Main)
+    }
+
+    /// stepping.ts:158 — reset(): clear the frame stack (focus is left intact, as in
+    /// TS where `reset()` only nulls `stack`).
+    fn reset(&mut self) {
+        self.stack.clear();
+    }
+
+    /// stepping.ts:160-171 — apply(): mutate the stack from a classified step. An
+    /// `int` pushes a frame; an `rti` pops the innermost (AFTER the RTI ran in
+    /// handler flow); jsr/rts/normal don't change the interrupt-flow kind.
+    fn apply(&mut self, r: &StepClass) {
+        if r.is_int {
+            self.stack.push(CpuFlowFrame {
+                kind: r.flow,
+                entered_at_pc: r.pc1,
+                entered_at_cycle: r.cycle_abs,
+                return_pc: r.pc0,
+            });
+        } else if r.is_rti && !self.stack.is_empty() {
+            self.stack.pop();
+        }
+    }
+
+    /// monitor-shell.ts:1103-1117 — render the `flow` panel from flowState()
+    /// (stepping.ts:174-190). Identical text shape:
+    ///   `flow: current=<kind>  focus=<focus>\nframes:\n<lines | placeholder>`
+    /// where each frame line is
+    ///   `  <kind>  enter=$PPPP -> ret=$RRRR  cyc=<cycle>`.
+    fn render(&self) -> String {
+        let frames = if self.stack.is_empty() {
+            "  (main — no interrupt/trap frame active)".to_string()
+        } else {
+            self.stack
+                .iter()
+                .map(|f| {
+                    format!(
+                        "  {}  enter=${:04X} -> ret=${:04X}  cyc={}",
+                        f.kind.tag(),
+                        f.entered_at_pc,
+                        f.return_pc,
+                        f.entered_at_cycle
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        format!(
+            "flow: current={}  focus={}\nframes:\n{}",
+            self.current_flow().tag(),
+            self.focus,
+            frames
+        )
+    }
+}
+
+/// A passive observer that records whether a hardware IRQ/NMI was DISPATCHED during
+/// one instruction step (and which vector). The verbatim C64 core fires
+/// `Observer::on_interrupt(vector, clk)` at the TOP of the NMI ($FFFA) / IRQ ($FFFE)
+/// branch of `do_interrupt` (c64_6510core.rs:2174 / :2207) — a pure callback that
+/// does NOT alter CPU/clk/int state. This is the AUTHORITATIVE interrupt-entry
+/// signal on the full-machine path: unlike a stack-pointer-delta heuristic, it is
+/// exact even though TRX64's verbatim core (like VICE) FOLDS the 7-cycle interrupt
+/// entry AND the first handler opcode into the SAME instruction step (so the SP
+/// delta across the step is NOT a clean −3). All other Observer hooks are no-ops, so
+/// the VM runs byte-identically to the `NullSink` path (Spec 723 observer-effect: a
+/// passive tap, zero execution effect).
+struct InterruptCaptureObserver {
+    /// The vector of the LAST interrupt dispatched in the step (0xfffa NMI / 0xfffe
+    /// IRQ), or None if none. At most one hardware entry per single step.
+    vector: Option<u16>,
+}
+
+impl InterruptCaptureObserver {
+    fn new() -> Self {
+        InterruptCaptureObserver { vector: None }
+    }
+}
+
+impl Observer for InterruptCaptureObserver {
+    fn on_instruction(&mut self, _pc: u16, _op: u8, _b1: u8, _b2: u8, _a: u8, _x: u8, _y: u8, _sp: u8, _p: u8, _clk: u64) {}
+    fn on_bus(&mut self, _kind: BusKind, _addr: u16, _value: u8, _pc: u16, _clk: u64, _old: u8) {}
+    fn on_interrupt(&mut self, vector: u16, _clk: u64) {
+        self.vector = Some(vector);
+    }
+}
+
+/// Advance exactly one instruction with the same machine-path selection as
+/// [`step_one_instruction`], but threading an [`InterruptCaptureObserver`] so the
+/// caller learns whether a hardware IRQ/NMI was dispatched in the step. Returns the
+/// captured vector (None / 0xfffa / 0xfffe). The observer is passive — the VM state
+/// is byte-identical to the `NullSink` path.
+fn step_one_capture_interrupt(session: &mut Session) -> Option<u16> {
+    let full_machine =
+        session.machine.full_assembled && (!session.injected || session.io_injected);
+    let mut obs = InterruptCaptureObserver::new();
+    if full_machine {
+        session.machine.run_for_full_capped(999_999, 1, &mut obs, |_, _, _, _, _, _, _| {});
+    } else {
+        session.machine.run_for_capped(999_999, 1, &mut obs);
+    }
+    obs.vector
+}
+
+/// Classify ONE single step like stepping.ts `stepOne` (78-103), then apply it to
+/// the FlowTracker (= the TS `this.apply(r)` calls in stepInto/stepOver/…). Captures
+/// the pre-step PC/SP/opcode, runs the step, and classifies the StepEventType.
+///
+/// PORT NOTE (why this is NOT a literal SP−3 test): the TS `Cpu65xxVice.runFor(1)`
+/// lands at the bare handler VECTOR with the first handler opcode NOT folded in
+/// (stepping.ts:19-20), so TS detects the entry by a clean SP−3. TRX64's verbatim
+/// full-machine core (VICE-faithful) FOLDS the 7-cycle entry + the first handler
+/// opcode into one step, so the SP delta is NOT −3 (e.g. entry −3 then the KERNAL's
+/// `$FF48 PHA` −1 ⇒ −4, landing at $FF49). The AUTHORITATIVE entry signal is the
+/// core's `on_interrupt(vector)` callback, captured passively by
+/// [`step_one_capture_interrupt`]. The OBSERVABLE FlowTracker behaviour is identical
+/// to TS: an interrupt pushes a frame, RTI pops it.
+///
+///   on_interrupt fired (vector 0xfffa) → int, flow=nmi
+///   on_interrupt fired (vector 0xfffe) → int, flow=irq
+///   op0==BRK ($00)                     → int, flow=brk  (BRK uses do_irqbrk, which
+///                                        does NOT fire on_interrupt — detect by op)
+///   op0==RTI ($40)                     → rti (pop the innermost frame)
+///   else                               → normal / jsr / rts (no flow-stack change)
+fn step_one_with_flow(session: &mut Session, flow: &mut FlowTracker) {
+    let pc0 = session.machine.cpu6510.reg_pc;
+    let op0 = session.machine.peek_lens(pc0, "cpu");
+    let int_vector = step_one_capture_interrupt(session);
+    let pc1 = session.machine.cpu6510.reg_pc;
+    let cycle_abs = session.machine.clk;
+
+    let (is_int, is_rti, kind, entered_at_pc) = if let Some(vec) = int_vector {
+        // Hardware IRQ/NMI dispatched in this step. enteredAtPc = the handler entry
+        // (the value at the vector — the true handler start, before the folded first
+        // opcode advanced PC), nmi iff the vector was $FFFA.
+        let lo = session.machine.peek_lens(vec, "cpu") as u16;
+        let hi = session.machine.peek_lens(vec.wrapping_add(1), "cpu") as u16;
+        let handler = lo | (hi << 8);
+        let k = if vec == 0xfffa { FlowKind::Nmi } else { FlowKind::Irq };
+        (true, false, k, handler)
+    } else if op0 == 0x00 {
+        // BRK = software interrupt entry (do_irqbrk → $FFFE, no on_interrupt). The
+        // handler entry is the value at the IRQ/BRK vector $FFFE.
+        let lo = session.machine.peek_lens(0xfffe, "cpu") as u16;
+        let hi = session.machine.peek_lens(0xffff, "cpu") as u16;
+        (true, false, FlowKind::Brk, lo | (hi << 8))
+    } else if op0 == 0x40 {
+        // RTI = interrupt return (pop).
+        (false, true, FlowKind::Main, pc1)
+    } else {
+        // normal / jsr / rts — no interrupt-flow change.
+        (false, false, FlowKind::Main, pc1)
+    };
+    flow.apply(&StepClass { is_int, is_rti, flow: kind, pc0, pc1: entered_at_pc, cycle_abs });
 }
 
 /// Spec 271 — one in-process batch (= c64re `BatchEntry`). Results are stored as a
@@ -3104,7 +3351,9 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
         "z" | "step" | "si" => {
             st.session.running = false;
             let clk0 = st.session.machine.clk;
-            step_one_instruction(&mut st.session);
+            // stepInto (stepping.ts:195-198): one instruction (may enter an IRQ/NMI),
+            // tracked into the FlowTracker so `flow` reflects the live interrupt frame.
+            step_one_with_flow(&mut st.session, &mut st.flow);
             let cyc = st.session.machine.clk.wrapping_sub(clk0); // r.cyc (single step)
             let pc = st.session.machine.cpu6510.reg_pc;
             st.mon.disasm_cursor = Some(pc);
@@ -3120,9 +3369,17 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             let bp_set: std::collections::HashSet<u16> =
                 st.breakpoints.entries.iter().map(|e| e.pc).collect();
             // Execute the instruction at PC; `r_cyc` = ITS own cost (the value TS
-            // reports for `next`, even when it's a JSR — stepping.ts:217).
+            // reports for `next`, even when it's a JSR — stepping.ts:217). Track the
+            // single instruction into the FlowTracker UNLESS it's a JSR: stepOver
+            // (stepping.ts:209-228) only apply()s for single instructions
+            // (normal/rts/rti — and an `int` is run-through, not applied here); a JSR
+            // body is run-through via runUntilReturn (balanced), so it is NOT applied.
             let clk0 = st.session.machine.clk;
-            step_one_instruction(&mut st.session);
+            if is_jsr {
+                step_one_instruction(&mut st.session);
+            } else {
+                step_one_with_flow(&mut st.session, &mut st.flow);
+            }
             let r_cyc = st.session.machine.clk.wrapping_sub(clk0);
             if is_jsr {
                 // runUntilReturn: run the subroutine body until it RTSes back (SP
@@ -3168,7 +3425,9 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 let opcode = st.session.machine.peek_lens(op_pc, "cpu");
                 let is_ret = opcode == 0x60 || opcode == 0x40; // RTS / RTI
                 let clk0 = st.session.machine.clk;
-                step_one_instruction(&mut st.session);
+                // runReturn (stepping.ts:234-246) calls apply() on EVERY step, so the
+                // flow stack stays consistent across an interrupt taken mid-return.
+                step_one_with_flow(&mut st.session, &mut st.flow);
                 last_cyc = st.session.machine.clk.wrapping_sub(clk0); // r.cyc
                 guard += 1;
                 let pc = st.session.machine.cpu6510.reg_pc;
@@ -3188,20 +3447,20 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
         }
 
         // ---- flow / bt — Spec 754 §3.3h capability panels (audit misc-13). ----
-        // These report LIVE machine state, not a constant. TRX64 has no FlowTracker
-        // (interrupt/trap frame STACK), so `flow` reports the honest "main" framing
-        // (no fabricated interrupt chain) but the `bt` verb is the state-dependent
-        // panel: it scans the ACTUAL 6502 stack page for JSR return-address
-        // candidates, 1:1 with monitor-shell.ts buildBacktrace (backtrace.ts:23-40),
-        // so the panel reflects the live SP + stack contents.
+        // Both report LIVE machine state, not a constant. `flow` now renders the
+        // per-session FlowTracker (the interrupt/trap frame STACK, mutated per
+        // single-step by the z/n/ret handlers) — 1:1 with monitor-shell.ts:1103-1117
+        // (← FlowTracker.flowState(), stepping.ts:174-190). After a `z`-step accepts a
+        // hardware IRQ the panel reports current=irq + a frame line, then pops to main
+        // on the RTI. `bt` scans the ACTUAL 6502 stack page for JSR return-address
+        // candidates (buildBacktrace, backtrace.ts:23-40), so it too reflects the
+        // live SP + stack contents.
         "flow" => {
-            // TS: `flow: current=main  focus=auto\nframes:\n  (main …)`. TRX64 has no
-            // flow-frame tracker, so `current`/`focus` are the honest constant main
-            // framing; the live state-dependent capability is `bt`.
-            Ok(
-                "flow: current=main  focus=auto\nframes:\n  (main — no interrupt/trap frame active)"
-                    .to_string(),
-            )
+            // FlowTracker.render() (stepping.ts:174-190 + monitor-shell.ts:1103-1117):
+            //   `flow: current=<kind>  focus=<focus>\nframes:\n<lines | placeholder>`.
+            // At the cold/rest state the stack is empty → current=main; after stepping
+            // into an interrupt it is state-dependent (current=irq|nmi|brk + frames).
+            Ok(st.flow.render())
         }
         "bt" => {
             // buildBacktrace (backtrace.ts): scan $0100+((sp+1)&0xff) .. $01FF in
@@ -3224,6 +3483,14 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             }
             if found == 0 {
                 lines.push("  (stack empty — SP at top)".to_string());
+            }
+            // backtrace.ts:35-38 — append the EXACT FlowTracker IRQ/NMI/BRK frames
+            // (more than VICE) when the flow stack is non-empty.
+            if !st.flow.stack.is_empty() {
+                lines.push("flow frames (exact, from stepping):".to_string());
+                for fr in &st.flow.stack {
+                    lines.push(format!("  {} @ ${:04X}", fr.kind.tag(), fr.entered_at_pc));
+                }
             }
             Ok(lines.join("\n"))
         }
@@ -3358,6 +3625,9 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             st.session.io_injected = false;
             st.mon.disasm_cursor = None;
             st.mon.mem_cursor = None;
+            // The machine is power-cycled → any interrupt frames the FlowTracker held
+            // are stale (TS gets a fresh controller + FlowTracker on resetCold).
+            st.flow.reset();
             Ok("reset".to_string())
         }
 
@@ -5577,6 +5847,9 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             // A reset is a control discontinuity — clear stop + advance the frame.
             st.ctrl_stop = None;
             st.ctrl_frame += 1;
+            // The machine state changed under the FlowTracker — any held interrupt
+            // frames are stale (TS gets a fresh controller on resetCold/Warm).
+            st.flow.reset();
             // A reset is also an AUDIO-timeline discontinuity (reSID re-init): push
             // `audio/flush` so the client flushes its worklet ring + re-syncs the send
             // epoch (ws-server.ts:1430 — same mechanism as a checkpoint restore).
@@ -10767,6 +11040,7 @@ async fn main() {
         checkpoint_thumbs: std::collections::HashMap::new(),
         checkpoint_thumb_order: std::collections::VecDeque::new(),
         mon: MonitorState::new(),
+        flow: FlowTracker::new(),
         stream_broke_on_jam: false,
         force_present_frame: false,
     }));
@@ -10857,6 +11131,7 @@ mod batch1_tests {
             checkpoint_thumbs: std::collections::HashMap::new(),
             checkpoint_thumb_order: std::collections::VecDeque::new(),
             mon: MonitorState::new(),
+            flow: FlowTracker::new(),
             stream_broke_on_jam: false,
             force_present_frame: false,
         }))
