@@ -270,6 +270,31 @@ const CASES: ConfCase[] = [
     },
   },
 
+  // ── P1: ws-media-cart-status-name — cart_status sourceName is the FILE name ──
+  // (Spec 709.13.) The CART label (UI) = session/cart_status.sourceName. TS reports
+  // the mounted FILE name (getCartridgeMedia().name, ws-server.ts:1581). TRX64 used to
+  // report the cartridge_image CRT-HEADER name (a 32-byte field baked at build time +
+  // shared across a project's derived carts) — so the label showed e.g. "WASTELAND EF
+  // MENU POC" for every wasteland cart and looked stale/cached + wrong. The .crt's
+  // header name ("INTERNAL POC NAME") deliberately differs from its filename
+  // ("mycart.crt"): the signal asserts sourceName is the FILENAME, not the header.
+  {
+    id: "ws-media-cart-status-name",
+    severity: "P1",
+    title: "session/cart_status sourceName is the mounted FILE name, not the CRT-header name",
+    spawn: { seedFiles: [{ rel: "mycart.crt", bytes: makeEasyFlashCrt("INTERNAL POC NAME") }] },
+    async signal(c, d) {
+      const sid = await liveSession(c);
+      await c.call("media/mount", { session_id: sid, path: `${d.projectDir}/mycart.crt`, slot: 0 });
+      const cs = (await c.call("session/cart_status", { session_id: sid })) as any;
+      return {
+        // The label must derive from the mounted FILE, not the cart's internal header.
+        isFilename: cs?.sourceName === "mycart.crt",
+        isHeaderName: cs?.sourceName === "INTERNAL POC NAME",
+      };
+    },
+  },
+
   // ── P1: ws-media-8 — media/recent overlays the recents store AND is project-scoped ──
   // (Audit theme T3 + BUG-013.) TS's media/recent overlays a GLOBAL persisted recents
   // store (recent-files.ts getRecent: newest-first, max 10, each carrying a `mountedAt`

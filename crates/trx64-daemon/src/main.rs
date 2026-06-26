@@ -6047,6 +6047,12 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         // booted is false (no cartBootedFrom tracking in TRX64).
         "session/cart_status" => {
             let mut st = state.lock().unwrap();
+            // Spec 709.13 — sourceName is the mounted FILE name (TS = getCartridgeMedia().name,
+            // ws-server.ts:1581), NOT the cartridge_image CRT-header name. The CRT header name
+            // is baked at build time and shared across a project's derived carts, so reporting
+            // it makes the CART label look stale/cached + wrong (e.g. "WASTELAND EF MENU POC"
+            // for every wasteland cart). The mounted file path is the backend truth.
+            let cart_path = st.session.cart_path.clone();
             let m = &st.session.machine;
             match m.cartridge.as_ref() {
                 None => Response::ok(id, Value::Null),
@@ -6055,10 +6061,16 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                     let bank = cart.get_state().current_bank as u64;
                     let lines = cart.get_lines();
                     let mapped = lines.exrom == 0 || lines.game == 0;
-                    let source_name = m
-                        .cartridge_image
-                        .as_ref()
-                        .map(|img| img.name.clone());
+                    let source_name = if cart_path.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            std::path::Path::new(&cart_path)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| cart_path.clone()),
+                        )
+                    };
                     // BUG-042 write-LED: track writableGeneration across polls.
                     let gen = cart.writable_generation();
                     if gen != st.cart_led_gen {
