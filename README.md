@@ -4,7 +4,7 @@
 A native (Rust) cycle-exact Commodore 64 + 1541 emulator that you drive over a
 WebSocket JSON-RPC API.
 
-This is a faithful viceo clone, made with a modern headless and API first aproach in mind. You can use this together with C64RE or any other application - be it a separate front end (I am building my macOS native version currently) or just with an llm. 
+This is a faithful but enhanced vice clone, made with a modern headless and API first aproach in mind. You can use this together with C64RE or any other application - be it a separate front end (I am building my macOS native version currently) or just with an llm. 
 
 .c64re formats are compatible with C64RE, a .vsf compatibility layer is included. TRX64 can read and import .vsf but N O T export. 
 
