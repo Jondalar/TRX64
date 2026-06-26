@@ -389,6 +389,13 @@ struct MonitorState {
     /// (read-inspect ONLY — Spec 754 §3.3i); other verbs are blocked with a clear
     /// message. `device c64|drive8` (or `dev`) flips it.
     device: String,
+    /// FILE mini-shell session cwd (= monitor-shell `fsShellCwd` map, single-valued
+    /// for the daemon's one session). `None` until `cd` sets it; a bare `pwd`/`ls`
+    /// then roots at the project dir. Relative `load`/`save`/`bload`/`bsave`/`ls`/
+    /// `cd` paths resolve against this (else the project dir). Absolute paths pass
+    /// through unchanged — exactly like the TS `resolveFsPath` (which is NOT a hard
+    /// jail: it only defaults relative paths to the cwd; `..`/abs escape freely).
+    fs_cwd: Option<String>,
 }
 
 impl MonitorState {
@@ -399,6 +406,7 @@ impl MonitorState {
             disasm_cursor: None,
             sidefx_on: false,
             device: "c64".to_string(),
+            fs_cwd: None,
         }
     }
 }
@@ -1623,6 +1631,56 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
     // peek lane), so `sidefx` is honoured as the toggle wire-state but reads always
     // use the side-effect-free lens peek (documented; the gate exercises peek).
     let _sidefx = st.mon.sidefx_on;
+
+    // ---- FILE mini-shell path helpers (= monitor-shell.ts:174-185) ----------------
+    // projectDir = `--project <dir>` arg ?? C64RE_PROJECT_DIR env ?? cwd (1:1 with the
+    // TS `ctx.projectDir ?? C64RE_PROJECT_DIR ?? process.cwd()`). The FS-shell `cwd()`
+    // = the per-session `fs_cwd` (set by `cd`) or that project dir. `resolveFsPath`
+    // joins a RELATIVE arg against the cwd; an ABSOLUTE arg passes through unchanged —
+    // NOT a hard jail, exactly as the TS resolveFsPath (which only DEFAULTS relative
+    // paths; `..`/abs escape freely, so TRX64 must not jail what TS doesn't).
+    let fs_project_dir = || -> String {
+        std::env::args()
+            .skip_while(|a| a != "--project")
+            .nth(1)
+            .filter(|p| !p.is_empty())
+            .or_else(|| std::env::var("C64RE_PROJECT_DIR").ok())
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            })
+    };
+    let fs_cwd_now = st.mon.fs_cwd.clone().unwrap_or_else(fs_project_dir);
+    let resolve_fs_path = |arg: &str| -> String {
+        if std::path::Path::new(arg).is_absolute() {
+            arg.to_string()
+        } else {
+            std::path::Path::new(&fs_cwd_now)
+                .join(arg)
+                .to_string_lossy()
+                .to_string()
+        }
+    };
+    // parseFileCmd (= monitor-shell.ts:182-185): the first token after the verb is the
+    // file (a "quoted name" wins, else the bare token); `rest` = remaining tokens.
+    let parse_file_cmd = || -> (Option<String>, Vec<String>) {
+        if let Some(q) = quoted_first(&cmd) {
+            // `rest` after the closing quote.
+            let after = cmd
+                .splitn(2, &format!("\"{q}\""))
+                .nth(1)
+                .unwrap_or("")
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect();
+            (Some(q), after)
+        } else if toks.len() > 1 {
+            (Some(toks[1].clone()), toks[2..].to_vec())
+        } else {
+            (None, Vec::new())
+        }
+    };
 
     // readByte/writeByte (= monitor-shell readByte/writeByte). When device=drive8
     // the read-inspect verbs r/m/d peek the 1541 drive CPU address space
@@ -3031,6 +3089,412 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
         // bound"). No ProjectKnowledgeService bridge here → identical error.
         "label" | "unlabel" | "note" | "load_labels" | "ll" | "save_labels" | "sl" => {
             Err(format!("{op}: no project workspace bound (labels need a project)"))
+        }
+
+        // ---- STATE: snapshot dump / undump (audit ws-trace-monitor-misc-9) ---------
+        // monitor-shell.ts:279-296: `dump "<p.c64re>"` writes a runtime snapshot to
+        // disk (dumpRuntimeSnapshot → formatDumpSummary), `undump "<p>"` restores it
+        // (undumpRuntimeSnapshot → paused). The help @ STATE/TRACE advertised both, but
+        // run_monitor had NO arm → `unknown command: dump`. Fix: wire each arm to the
+        // EXISTING snapshot/dump + snapshot/undump capability (write_native_snapshot /
+        // read_native_snapshot + capture/restore_runtime_checkpoint — the very engine
+        // behind the snapshot/* WS methods). Relative paths resolve against the FS-shell
+        // cwd (= the project dir), 1:1 with the TS comment at monitor-shell.ts:283-288.
+        "dump" | "undump" => {
+            let (file, _rest) = parse_file_cmd();
+            let path = match file {
+                Some(p) => resolve_fs_path(&p),
+                None => return Err(format!("{op}: usage: {op} \"<path.c64re>\"")),
+            };
+            if op == "dump" {
+                // ── snapshot/dump core (= the WS handler, taking &mut st) ──────────
+                st.session.machine.drive8.flush_disk_writeback();
+                let (disk_path, disk_format) = match st.session.machine.drive8.get_attached_disk() {
+                    Some(d) => (
+                        d.backing_path.clone().unwrap_or_default(),
+                        match d.kind { DiskKind::G64 => "g64", DiskKind::D64 => "d64" }.to_string(),
+                    ),
+                    None => (String::new(), String::new()),
+                };
+                let drive1541_blob =
+                    trx64_core::drive_snapshot::capture_drive1541(&mut st.session.machine.drive8);
+                let drive_disk_blob =
+                    trx64_core::drive_snapshot::capture_drive_disk_image(&st.session.machine.drive8);
+                let (cart_bytes, cart_flash) = capture_cart_blobs(&mut st.session.machine);
+                let media_inputs = gather_native_media_inputs(&st.session);
+                let media_summary = gather_snapshot_media(&st.session);
+                let breakpoints = st.breakpoints.entries.len();
+                let m = &st.session.machine;
+                let checkpoint = trx64_core::c64re_snapshot::capture_runtime_checkpoint(
+                    m, &disk_path, &disk_format,
+                    Some(&drive1541_blob), drive_disk_blob.as_deref(),
+                    cart_bytes.as_deref(), cart_flash.as_deref(),
+                );
+                let cycle = m.c64_core.clk as i64;
+                let pc = m.c64_core.reg_pc as i64;
+                let bytes = trx64_core::native_snapshot::write_native_snapshot(
+                    trx64_core::native_snapshot::WriteNativeSnapshotArgs {
+                        checkpoint,
+                        schema_version:
+                            trx64_core::c64re_snapshot::RUNTIME_CHECKPOINT_SCHEMA_VERSION,
+                        media: media_inputs,
+                        runtime_version: "trx64-runtime/1".to_string(),
+                        machine_model: "c64-pal".to_string(),
+                        provenance: None,
+                        pc,
+                        cycle,
+                    },
+                );
+                if let Some(parent) = std::path::Path::new(&path).parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                match std::fs::write(&path, &bytes) {
+                    Ok(()) => {
+                        // formatDumpSummary (= snapshot-persistence.ts:271-281).
+                        let media = if media_summary.is_empty() {
+                            "none".to_string()
+                        } else {
+                            media_summary.iter().map(|m| {
+                                let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("");
+                                let fmt = m.get("format").and_then(|v| v.as_str()).unwrap_or("");
+                                let name = m.get("sourceName").and_then(|v| v.as_str())
+                                    .filter(|s| !s.is_empty()).unwrap_or(fmt);
+                                let kb = m.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0) / 1024;
+                                format!("{role}={name}({fmt}, {kb}KB)")
+                            }).collect::<Vec<_>>().join(", ")
+                        };
+                        Ok(format!(
+                            "dumped {path}\n  cycle={cycle} pc=${:04x} machine=c64-pal\n  media: {media}\n  file={:.1}KB breakpoints={breakpoints}",
+                            pc, bytes.len() as f64 / 1024.0
+                        ))
+                    }
+                    Err(e) => Err(format!("dump: write error: {e}")),
+                }
+            } else {
+                // ── snapshot/undump core (= the WS handler, taking &mut st) ────────
+                let file_bytes = match std::fs::read(&path) {
+                    Ok(b) => b,
+                    Err(e) => return Err(format!("undump: cannot read {path}: {e}")),
+                };
+                let read = match trx64_core::native_snapshot::read_native_snapshot(&file_bytes) {
+                    Ok(r) => r,
+                    Err(e) => return Err(format!("undump: {e}")),
+                };
+                // Re-establish embedded drive8 media FIRST, then restore.
+                let mut media_lbl: Vec<String> = Vec::new();
+                for rm in &read.media {
+                    if rm.reference.role != "drive8" { continue; }
+                    let bytes = match &rm.bytes {
+                        Some(b) => b.clone(),
+                        None => return Err(format!(
+                            "undump: media {} has no embedded payload (v1 needs embedded bytes)",
+                            rm.reference.role
+                        )),
+                    };
+                    let kind = if rm.reference.format == "d64" { DiskKind::D64 } else { DiskKind::G64 };
+                    st.session.machine.drive8.attach_disk(DiskImage {
+                        kind, bytes,
+                        backing_path: rm.reference.source_name.clone(),
+                        read_only: false,
+                    });
+                    let name = rm.reference.source_name.clone()
+                        .filter(|s| !s.is_empty()).unwrap_or_else(|| rm.reference.format.clone());
+                    media_lbl.push(format!("{}={name}({})", rm.reference.role, rm.reference.format));
+                }
+                match trx64_core::c64re_snapshot::restore_runtime_checkpoint(
+                    &mut st.session.machine, &read.checkpoint,
+                ) {
+                    Ok(_blob) => {
+                        let cycle = st.session.machine.c64_core.clk;
+                        let pc = st.session.machine.c64_core.reg_pc;
+                        let breakpoints = st.breakpoints.entries.len();
+                        st.session.running = false;
+                        st.mon.disasm_cursor = Some(pc); // bare `d` follows the restored PC
+                        let machine = read.manifest.machine.model.clone();
+                        let media = if media_lbl.is_empty() { "none".to_string() } else { media_lbl.join(", ") };
+                        // formatUndumpSummary (= snapshot-persistence.ts:282-292).
+                        Ok(format!(
+                            "undumped {path}\n  cycle={cycle} pc=${:04x} machine={machine} (paused)\n  media: {media}\n  breakpoints={breakpoints}",
+                            pc
+                        ))
+                    }
+                    Err(e) => Err(format!("undump: {e}")),
+                }
+            }
+        }
+
+        // ---- STATE: savecrt / savecrtstate (audit ws-trace-monitor-misc-9) ---------
+        // monitor-shell.ts:303-319: write the LIVE cart flash state to the mounted .crt
+        // (bare → the backing file; `savecrt "<p>"` → a re-packed copy at <p>). The help
+        // advertised it but run_monitor had NO arm → `unknown command: savecrt`. Fix:
+        // wire it to the EXISTING cart-persist capability (cartridge.crt_image(clk) →
+        // the bytes, cartridge_image.path → the backing file — the same path media/
+        // persist role:cartridge uses).
+        "savecrt" | "savecrtstate" => {
+            if st.session.machine.cartridge.is_none() {
+                return Err("savecrt: no cartridge attached".into());
+            }
+            let (file, _rest) = parse_file_cmd();
+            let m = &mut st.session.machine;
+            let clk = m.clk;
+            // Re-pack the live state to a .crt image (None ⇒ this mapper can't).
+            let img = match m.cartridge.as_mut().and_then(|c| c.crt_image(clk)) {
+                Some(b) => b,
+                None => return Err("savecrt: this mapper cannot re-pack a .crt".into()),
+            };
+            // `savecrt "<p>"` → write the re-packed image to <p> as a copy.
+            if let Some(f) = file {
+                let target = resolve_fs_path(&f);
+                if let Some(parent) = std::path::Path::new(&target).parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                return match std::fs::write(&target, &img) {
+                    Ok(()) => Ok(format!("savecrt: {} bytes -> {target}", img.len())),
+                    Err(e) => Err(format!("savecrt: write error: {e}")),
+                };
+            }
+            // Bare `savecrt` → update the mounted backing file.
+            let path = m.cartridge_image.as_ref().map(|i| i.path.clone()).unwrap_or_default();
+            if path.is_empty() {
+                return Ok("savecrt: skipped — no backing file path".into());
+            }
+            match std::fs::write(&path, &img) {
+                Ok(()) => Ok(format!("savecrt: {} bytes -> {path}", img.len())),
+                Err(e) => Err(format!("savecrt: write error: {e}")),
+            }
+        }
+
+        // ---- STATE: swapcrt (audit ws-trace-monitor-misc-9) -----------------------
+        // monitor-shell.ts:330-367: hot-swap the .crt in the FROZEN machine, NO reset;
+        // same mapper type carries banking continuation (currentBank + controlRegister).
+        // The help advertised it but run_monitor had NO arm. Fix: wire it to the EXISTING
+        // cart capability (load_cartridge_from_bytes / attach_cart_from_bytes +
+        // get_state/set_state for the banking carry-over).
+        "swapcrt" => {
+            let (file, _rest) = parse_file_cmd();
+            let f = match file {
+                Some(f) => f,
+                None => return Err("swapcrt: usage: swapcrt \"<new.crt>\"".into()),
+            };
+            let p = resolve_fs_path(&f);
+            if !std::path::Path::new(&p).exists() {
+                return Err(format!("swapcrt: no such file: {p}"));
+            }
+            let bytes = match std::fs::read(&p) {
+                Ok(b) => b,
+                Err(e) => return Err(format!("swapcrt: cannot read {p}: {e}")),
+            };
+            let basename = std::path::Path::new(&p)
+                .file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| p.clone());
+            let m = &mut st.session.machine;
+            // Old cart continuation (banking) + type, captured BEFORE the swap.
+            let old_type = m.cartridge.as_ref().map(|c| c.mapper_type());
+            let old_state = m.cartridge.as_ref().map(|c| c.get_state());
+            let old_name = m.cartridge_image.as_ref()
+                .map(|i| std::path::Path::new(&i.path).file_name()
+                    .map(|n| n.to_string_lossy().to_string()).unwrap_or_default())
+                .unwrap_or_default();
+            // Persist a dirty old cart to its backing file first (eject semantics).
+            let mut lines: Vec<String> = Vec::new();
+            if m.cartridge.as_ref().map(|c| c.is_writable_dirty()).unwrap_or(false) {
+                let clk = m.clk;
+                let old_path = m.cartridge_image.as_ref().map(|i| i.path.clone()).unwrap_or_default();
+                if !old_path.is_empty() {
+                    if let Some(img) = m.cartridge.as_mut().and_then(|c| c.crt_image(clk)) {
+                        if std::fs::write(&old_path, &img).is_ok() {
+                            lines.push(format!("persisted old cart: {} bytes -> {old_path}", img.len()));
+                        }
+                    }
+                }
+            }
+            // Attach the new cart (NO reset).
+            let new_type = match m.attach_cart_from_bytes(&bytes, &basename) {
+                Ok((_name, t)) => t,
+                Err(e) => return Err(format!("swapcrt: {e:?}")),
+            };
+            // Same mapper type → carry the banking continuation (bank + ctrl reg) so
+            // running code resumes in the same window. Flash DATA is the NEW build's
+            // (set_state's banking-only state leaves the new content alone).
+            let carried = if old_type == Some(new_type) {
+                if let Some(os) = old_state {
+                    let bank = os.current_bank;
+                    let ctrl = os.control_register;
+                    if let Some(c) = m.cartridge.as_mut() {
+                        c.set_state(trx64_core::cart::CartState {
+                            current_bank: bank, control_register: ctrl, flash: None,
+                        });
+                    }
+                    // Re-run the PLA reconfig so the carried lines take effect.
+                    m.memconfig = m.memconfig_table[m.pla_index()];
+                    Some(match ctrl {
+                        Some(cr) => format!("carried banking: bank={bank} ctrl=${cr:02x}"),
+                        None => format!("carried banking: bank={bank}"),
+                    })
+                } else { None }
+            } else { None };
+            // Track the new backing path so a later savecrt/auto-persist hits it.
+            if let Some(img) = m.cartridge_image.as_mut() { img.path = p.clone(); }
+            lines.push(format!(
+                "swapped: {} -> {new_type:?} ({basename})",
+                old_type.map(|t| format!("{t:?} ({old_name})")).unwrap_or_else(|| "(none)".into())
+            ));
+            lines.push(carried.unwrap_or_else(|| "fresh boot-state registers (no/changed mapper type)".into()));
+            lines.push("no reset — running code sees the new ROM bytes NOW".into());
+            Ok(lines.join("\n"))
+        }
+
+        // ---- FILE mini-shell (audit ws-trace-monitor-misc-11) ---------------------
+        // monitor-shell.ts:769-845: the host-FS verb family + PRG/raw load/save, rooted
+        // at the project dir (relative paths off the session cwd). The help @ FILE
+        // advertised them but run_monitor had NO arms → `unknown command: pwd`. Fix:
+        // wire pwd/cd/ls/dir/mkdir/rmdir + load/save/bload/bsave to std::fs + the
+        // EXISTING machine RAM access (poke / ram), matching the TS resolveFsPath cwd
+        // rules (NOT a hard jail — abs/`..` pass through exactly as TS).
+        "pwd" => Ok(fs_cwd_now.clone()),
+        "cd" => {
+            let (file, _rest) = parse_file_cmd();
+            let d = match file {
+                Some(a) => resolve_fs_path(&a),
+                None => fs_project_dir(),
+            };
+            match std::fs::metadata(&d) {
+                Ok(md) if md.is_dir() => { st.mon.fs_cwd = Some(d.clone()); Ok(d) }
+                Ok(_) => Err(format!("cd: not a directory: {d}")),
+                Err(_) => Err(format!("cd: no such directory: {d}")),
+            }
+        }
+        "ls" | "dir" => {
+            let (file, _rest) = parse_file_cmd();
+            let d = match file {
+                Some(a) => resolve_fs_path(&a),
+                None => fs_cwd_now.clone(),
+            };
+            let mut ents: Vec<(bool, String)> = match std::fs::read_dir(&d) {
+                Ok(rd) => rd.filter_map(|e| e.ok()).map(|e| {
+                    let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    (is_dir, e.file_name().to_string_lossy().to_string())
+                }).collect(),
+                Err(e) => return Err(format!("ls: {e}")),
+            };
+            ents.sort_by(|a, b| a.1.cmp(&b.1));
+            ents.truncate(500);
+            let body = if ents.is_empty() {
+                "  (empty)".to_string()
+            } else {
+                ents.iter().map(|(is_dir, name)| format!("  {} {name}", if *is_dir { "d" } else { "-" }))
+                    .collect::<Vec<_>>().join("\n")
+            };
+            Ok(format!("{d}:\n{body}"))
+        }
+        "mkdir" => {
+            let (file, _rest) = parse_file_cmd();
+            let arg = match file { Some(a) => a, None => return Err("mkdir: usage: mkdir <dir>".into()) };
+            match std::fs::create_dir_all(resolve_fs_path(&arg)) {
+                Ok(()) => Ok(format!("mkdir {arg}")),
+                Err(e) => Err(format!("mkdir: {e}")),
+            }
+        }
+        "rmdir" => {
+            let (file, _rest) = parse_file_cmd();
+            let arg = match file { Some(a) => a, None => return Err("rmdir: usage: rmdir <dir>".into()) };
+            match std::fs::remove_dir(resolve_fs_path(&arg)) {
+                Ok(()) => Ok(format!("rmdir {arg}")),
+                Err(e) => Err(format!("rmdir: {e}")),
+            }
+        }
+        // load "<file>" [addr] — PRG load into RAM (2-byte header → load addr, or override).
+        "load" => {
+            let (file, rest) = parse_file_cmd();
+            let f = match file { Some(f) => f, None => return Err("load: usage: load \"<file>\" [addr]".into()) };
+            let p = resolve_fs_path(&f);
+            if !std::path::Path::new(&p).exists() {
+                return Err(format!("load: no such file: {p}"));
+            }
+            let buf = match std::fs::read(&p) { Ok(b) => b, Err(e) => return Err(format!("load: {e}")) };
+            if buf.len() < 2 { return Err("load: PRG too short (need 2-byte header)".into()); }
+            let override_addr = rest.first().and_then(|t| parse_hex(t)).map(|v| (v & 0xffff) as u16);
+            let load_address = override_addr
+                .unwrap_or_else(|| (buf[0] as u16) | ((buf[1] as u16) << 8));
+            let body = &buf[2..];
+            st.session.machine.poke(load_address, body);
+            st.session.machine.sync_after_monitor();
+            let end_address = load_address.wrapping_add(body.len() as u16).wrapping_sub(1);
+            st.mon.disasm_cursor = Some(load_address);
+            let bn = std::path::Path::new(&f).file_name()
+                .map(|n| n.to_string_lossy().to_string()).unwrap_or(f.clone());
+            Ok(format!(
+                "loaded {bn}: ${:04x}..${:04x} ({} bytes)",
+                load_address, end_address, body.len()
+            ))
+        }
+        // save "<file>" <a1> <a2> — save a RAM range as a PRG (2-byte load addr = a1).
+        "save" => {
+            let (file, rest) = parse_file_cmd();
+            let a1 = parse_addr(rest.first());
+            let a2 = parse_addr(rest.get(1));
+            let (f, a1, a2) = match (file, a1, a2) {
+                (Some(f), Some(a1), Some(a2)) if a2 >= a1 => (f, a1, a2),
+                _ => return Err("save: usage: save \"<file>\" <a1> <a2>".into()),
+            };
+            let mut bytes: Vec<u8> = vec![(a1 & 0xff) as u8, ((a1 >> 8) & 0xff) as u8];
+            for a in a1..=a2 { bytes.push(st.session.machine.ram[a as usize]); }
+            let target = resolve_fs_path(&f);
+            match std::fs::write(&target, &bytes) {
+                Ok(()) => {
+                    let bn = std::path::Path::new(&f).file_name()
+                        .map(|n| n.to_string_lossy().to_string()).unwrap_or(f.clone());
+                    Ok(format!("saved {bn}: ${a1:04x}..${a2:04x} ({} bytes + load addr)", bytes.len() - 2))
+                }
+                Err(e) => Err(format!("save: {e}")),
+            }
+        }
+        // bload "<file>" <addr> — raw binary load (no header).
+        "bload" => {
+            let (file, rest) = parse_file_cmd();
+            let addr = parse_addr(rest.first());
+            let (f, addr) = match (file, addr) {
+                (Some(f), Some(a)) => (f, a),
+                _ => return Err("bload: usage: bload \"<file>\" <addr>".into()),
+            };
+            let p = resolve_fs_path(&f);
+            if !std::path::Path::new(&p).exists() {
+                return Err(format!("bload: no such file: {p}"));
+            }
+            let buf = match std::fs::read(&p) { Ok(b) => b, Err(e) => return Err(format!("bload: {e}")) };
+            let mut n = 0u32;
+            for (i, b) in buf.iter().enumerate() {
+                let a = addr as usize + i;
+                if a > 0xffff { break; }
+                st.session.machine.ram[a] = *b;
+                n += 1;
+            }
+            st.session.machine.sync_after_monitor();
+            st.mon.disasm_cursor = Some(addr);
+            let bn = std::path::Path::new(&f).file_name()
+                .map(|n| n.to_string_lossy().to_string()).unwrap_or(f.clone());
+            let end = (addr as u32 + n.saturating_sub(1)) & 0xffff;
+            Ok(format!("bloaded {bn}: {n} bytes -> ${addr:04x}..${end:04x}"))
+        }
+        // bsave "<file>" <a1> <a2> — raw binary save (no header).
+        "bsave" => {
+            let (file, rest) = parse_file_cmd();
+            let a1 = parse_addr(rest.first());
+            let a2 = parse_addr(rest.get(1));
+            let (f, a1, a2) = match (file, a1, a2) {
+                (Some(f), Some(a1), Some(a2)) if a2 >= a1 => (f, a1, a2),
+                _ => return Err("bsave: usage: bsave \"<file>\" <a1> <a2>".into()),
+            };
+            let mut bytes: Vec<u8> = Vec::new();
+            for a in a1..=a2 { bytes.push(st.session.machine.ram[a as usize]); }
+            let target = resolve_fs_path(&f);
+            match std::fs::write(&target, &bytes) {
+                Ok(()) => {
+                    let bn = std::path::Path::new(&f).file_name()
+                        .map(|n| n.to_string_lossy().to_string()).unwrap_or(f.clone());
+                    Ok(format!("bsaved {bn}: ${a1:04x}..${a2:04x} ({} bytes, raw)", bytes.len()))
+                }
+                Err(e) => Err(format!("bsave: {e}")),
+            }
         }
 
         // ---- Help ------------------------------------------------------------

@@ -22,7 +22,7 @@
 // Exit 0 = every selected case GREEN (TRX64 ≡ TS). Exit 1 = at least one RED.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { spawnDaemon, type Daemon, type SpawnOpts } from "./daemon.js";
 import { connect, type RpcClient } from "./ws-client.js";
 import { diffResponses, formatDivergence } from "./diff.js";
@@ -1602,6 +1602,145 @@ const CASES: ConfCase[] = [
         hasBaseHeader: base !== null,
         // Semantic (live content): a marker written at the live base decodes in-grid.
         markerVisible,
+      };
+    },
+  },
+
+  // ── P1: ws-trace-monitor-misc-9 — monitor `dump`/`undump`/`savecrt`/`swapcrt` ──
+  // The monitor REPL advertises dump|undump (STATE/TRACE) + savecrt|swapcrt in its
+  // help text, but TRX64's run_monitor had NO arms for them → the verb fell through to
+  // `unknown command: dump` (the help LIES). TS monitor-shell.ts:279-367 wires each to
+  // the live capability: `dump "<p>"` writes a runtime snapshot to disk, `undump "<p>"`
+  // restores it; `savecrt "<p>"` re-packs the live cart flash to a .crt. Fix: wire
+  // run_monitor's dump/undump arms to the EXISTING snapshot/dump+undump engine
+  // (write_native_snapshot / read_native_snapshot) and savecrt/swapcrt to the EXISTING
+  // cart capability (crt_image / attach_cart_from_bytes). Signal: a first signal
+  // `recognized` (no "unknown command" — catches the help-lies divergence) PLUS the
+  // EFFECT: `dump <p>` creates a non-empty snapshot FILE on disk, `undump <p>` reads it
+  // back (recognized + paused), and (with the EasyFlash .crt mounted) `savecrt <p>`
+  // writes a non-empty .crt FILE. Compared TS vs TRX64 on the SAME scripted sequence:
+  // both recognized + both produce the files. TS: all true; TRX64 (before fix): all
+  // false (every verb is `unknown command`).
+  {
+    id: "ws-trace-monitor-misc-9",
+    severity: "P1",
+    title: "monitor `dump`/`undump`/`savecrt`/`swapcrt` are wired to the live capabilities (help no longer lies)",
+    spawn: { seedFiles: [{ rel: "fixture.crt", bytes: EASYFLASH_CRT }] },
+    async signal(c, d) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      const recognized = (s: string) => !/unknown command/i.test(s);
+      const fileNonEmpty = (p: string) => {
+        try { return existsSync(p) && statSync(p).size > 0; } catch { return false; }
+      };
+      // dump → a runtime snapshot FILE under the per-daemon project dir.
+      const snapPath = `${d.projectDir}/probe.c64re`;
+      const dumpOut = await exec(`dump "${snapPath}"`);
+      const dumpMadeFile = fileNonEmpty(snapPath);
+      // undump → reads it back (recognized + no error). The monitor pauses on restore.
+      const undumpOut = await exec(`undump "${snapPath}"`);
+      // savecrt → re-pack the live EasyFlash flash to a NEW .crt copy on disk.
+      const crtPath = `${d.projectDir}/fixture.crt`;
+      await c.call("media/mount", { session_id: sid, path: crtPath, slot: 0 });
+      const outCrt = `${d.projectDir}/saved.crt`;
+      const saveOut = await exec(`savecrt "${outCrt}"`);
+      const saveMadeFile = fileNonEmpty(outCrt);
+      // swapcrt → hot-swap the SAME .crt back in, NO reset (recognized + no error).
+      const swapOut = await exec(`swapcrt "${crtPath}"`);
+      return {
+        // First signal: every verb is recognized (the help no longer lies).
+        recognized:
+          recognized(dumpOut) &&
+          recognized(undumpOut) &&
+          recognized(saveOut) &&
+          recognized(swapOut),
+        // Effect: `dump` produced a non-empty snapshot file on disk.
+        dumpMadeFile,
+        // Effect: `undump` read it back without error (no "error"/"cannot" wording).
+        undumpOk: recognized(undumpOut) && /undumped/i.test(undumpOut),
+        // Effect: `savecrt` produced a non-empty .crt file on disk.
+        saveMadeFile,
+        // Effect: `swapcrt` succeeded (no error wording).
+        swapOk: recognized(swapOut) && /swapped/i.test(swapOut),
+      };
+    },
+  },
+
+  // ── P1: ws-trace-monitor-misc-11 — monitor host-FS + PRG verbs are wired ──────
+  // The monitor REPL advertises the FILE family — pwd/cd/ls/dir/mkdir/rmdir +
+  // load/save/bload/bsave — rooted at the project dir, but TRX64's run_monitor had NO
+  // arms → `unknown command: pwd` (the help LIES). TS monitor-shell.ts:769-845 wires the
+  // host-FS mini-shell (cwd defaults to the project dir; relative paths resolve off the
+  // session cwd; absolute/`..` pass through — NOT a hard jail) + PRG load/save honouring
+  // the 2-byte load address + bload/bsave raw binary at an address. Fix: wire the family
+  // to std::fs + the EXISTING machine RAM access (poke / ram), matching the TS
+  // resolveFsPath cwd rules. Signal: a first signal `recognized` (no "unknown command")
+  // PLUS the EFFECT: `pwd` returns a path, `ls` lists the project-dir seed file, and a
+  // `bsave`/`bload` round-trip preserves the bytes (write a known pattern to RAM, bsave
+  // it, zero RAM, bload it back, read it). Compared TS vs TRX64 on the SAME scripted
+  // sequence: both recognized + both list the same project-dir entry + round-trip the
+  // same bytes. TS: all true; TRX64 (before fix): all false (every verb is `unknown
+  // command`).
+  {
+    id: "ws-trace-monitor-misc-11",
+    severity: "P1",
+    title: "monitor host-FS + PRG verbs (pwd/cd/ls/mkdir + load/save/bload/bsave) are wired (help no longer lies)",
+    spawn: { seedFiles: [{ rel: "seed.txt", bytes: Buffer.from("trx64-fs-probe") }] },
+    async signal(c, d) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      const recognized = (s: string) => !/unknown command/i.test(s);
+      // pwd → recognized + a path (an absolute path string, non-empty).
+      const pwdOut = await exec("pwd");
+      const pwdIsPath = pwdOut.startsWith("/") && pwdOut.length > 1;
+      // cd to the project dir (no-arg = project dir), then ls → lists the seed file.
+      const cdOut = await exec("cd");
+      const lsOut = await exec("ls");
+      const lsListsSeed = /seed\.txt/.test(lsOut);
+      // mkdir a subdir, then ls it → recognized + present.
+      const mkdirOut = await exec("mkdir sub");
+      const lsSub = await exec("ls sub");
+      // bsave/bload round-trip: write a known 4-byte pattern to RAM at $C000, bsave it,
+      // clobber that RAM, bload it back, and read it. The bytes must survive.
+      await exec("wr ram c000 de ad be ef");
+      const dumpPath = `${d.projectDir}/round.bin`;
+      const bsaveOut = await exec(`bsave "${dumpPath}" c000 c003`);
+      const bsaveMadeFile = (() => { try { return statSync(dumpPath).size === 4; } catch { return false; } })();
+      await exec("wr ram c000 00 00 00 00");                 // clobber
+      const bloadOut = await exec(`bload "${dumpPath}" c000`); // restore from file
+      const memBack = await exec("m ram c000 c003");          // read it back
+      // The restored pattern must read back (DE AD BE EF appear in the dump).
+      const roundTripped = /de\s*ad\s*be\s*ef/i.test(memBack.replace(/[^0-9a-fA-F\s]/g, " "));
+      // load/save: save a PRG (2-byte load addr = $C000) of the round-trip RAM, then
+      // load it back at an OVERRIDE address and confirm the verb is recognized.
+      const prgPath = `${d.projectDir}/round.prg`;
+      const saveOut = await exec(`save "${prgPath}" c000 c003`);
+      const loadOut = await exec(`load "${prgPath}"`);
+      return {
+        // First signal: every verb is recognized (the help no longer lies).
+        recognized:
+          recognized(pwdOut) && recognized(cdOut) && recognized(lsOut) &&
+          recognized(mkdirOut) && recognized(lsSub) &&
+          recognized(bsaveOut) && recognized(bloadOut) &&
+          recognized(saveOut) && recognized(loadOut),
+        // Effect: `pwd` is an absolute path.
+        pwdIsPath,
+        // Effect: `ls` lists the project-dir seed file (the FS shell is rooted there).
+        lsListsSeed,
+        // Effect: `mkdir` succeeded (no error wording).
+        mkdirOk: /mkdir sub/.test(mkdirOut),
+        // Effect: a bsave/bload round-trip preserved the bytes (DE AD BE EF survive).
+        roundTripped,
+        // Effect: bsave produced a 4-byte raw file on disk.
+        bsaveMadeFile,
+        // Effect: save/load a PRG are recognized + report a load address.
+        prgIo: /saved/i.test(saveOut) && /loaded/i.test(loadOut) && /c000/i.test(loadOut),
       };
     },
   },

@@ -652,8 +652,10 @@ impl Machine {
     /// cartridge's EXROM/GAME lines (= memory-bus.ts memPlaConfigChanged index,
     /// ts:855-869). No cart ⇒ EXROM=GAME=1 ⇒ (port | 0x18), byte-identical to the
     /// prior hard-coded no-cart index. Used by `cold_reset` (the FullBus has its
-    /// own copy of this in `pla_config_changed`).
-    fn pla_index(&self) -> usize {
+    /// own copy of this in `pla_config_changed`) and by the monitor `swapcrt` verb to
+    /// re-apply the banking lines after a same-mapper `set_state` carry-over (= the TS
+    /// attachCartridge memconfig recompute, monitor-shell.ts:361).
+    pub fn pla_index(&self) -> usize {
         let port = ((!self.port_dir | self.port_data) & 0x07) as usize;
         let loram = port & 0x01;
         let hiram = (port >> 1) & 0x01;
