@@ -1971,6 +1971,94 @@ const CASES: ConfCase[] = [
     },
   },
 
+  // ── P1: ws-build-trace-from-ring — targeted .c64retrace from a delta-ring window
+  // NON-GATING (blocked, TRX64 superset, reverse-debug Phase 1c): the UI scrub-bar
+  // selects TWO thumbnails (a cycle window) → "build trace" → a `.c64retrace` for
+  // EXACTLY that window, then swimlane/map/taint on just those cycles. No whole-run
+  // capture, no cycle guessing. TS has NO always-on full-delta ring, so it cannot dump
+  // a window after the fact → the differential cannot compare; asserted on the TRX64
+  // daemon alone (run with --include-blocked), per the reverse-debug doctrine.
+  //   tsx src/conformance.ts --only ws-build-trace-from-ring --include-blocked
+  //
+  // FLOW (TRX64): free-run past boot so the always-on delta ring holds real history,
+  // pick a cycle window [a,b] INSIDE the ring (a couple of PAL frames ending just
+  // before `now`), call `trace/build_from_ring {a,b}`. Assert (i) the returned
+  // `.c64retrace` exists on disk and is non-empty AND decodes to real CPU rows, (ii)
+  // `swimlane <a> <b>` (monitor) over the resulting store returns REAL cpu rows for that
+  // window (a `$XXXX` PC, not empty/error), (iii) event_count > 0. RED-before: the WS
+  // method did not exist (→ -32601 / error → all booleans false). GREEN-after.
+  {
+    id: "ws-build-trace-from-ring",
+    severity: "P1",
+    blocked:
+      "TRX64 superset: TS has no always-on full-delta ring, so it cannot dump a targeted " +
+      ".c64retrace for an arbitrary past cycle window. trace/build_from_ring slices TRX64's " +
+      "10s delta ring on demand; asserted on TRX64 alone (run with --include-blocked).",
+    title: "trace/build_from_ring dumps a targeted .c64retrace for a delta-ring cycle window; swimlane reads it — TRX64 reverse-debug superset",
+    spawn: { stream: true },
+    async signal(c, d) {
+      if (d.kind !== "trx64") {
+        // TS has no equivalent — documented refusal, non-gating. Same SHAPE as TRX64.
+        return { fileOnDisk: false, decodesCpuRows: false, swimlaneReturnsRows: false, hasEvents: false, notClipped: false };
+      }
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      // Free-run well past boot so the delta ring holds several PAL frames of real
+      // history (each frame ≈ 19656 cyc; the ring covers ~10s).
+      await c.call("debug/run", { session_id: sid });
+      await waitRunningBooted(c, sid, 1_500_000, 60_000);
+      await sleep(800);
+      await c.call("debug/step", { session_id: sid }); // settle to a paused boundary
+      const now = (await state(c, sid)).c64Cycles ?? 0;
+      // A window of ~2 PAL frames ending a hair before `now` — comfortably inside the
+      // 10s ring, and recent enough that the write slab has NOT wrapped over it.
+      const b = Math.max(2_000, now - 2_000);
+      const a = Math.max(1_000, b - 40_000);
+      const res = (await c.call("trace/build_from_ring", {
+        session_id: sid,
+        cycle_start: a,
+        cycle_end: b,
+      })) as any;
+      const retracePath: string = res?.retrace_path ?? "";
+      const eventCount: number = Number(res?.event_count ?? 0);
+      // (i) the file exists on disk and is non-empty AND decodes to real CPU rows.
+      let fileOnDisk = false;
+      let decodesCpuRows = false;
+      if (retracePath && existsSync(retracePath) && statSync(retracePath).size > 0) {
+        fileOnDisk = true;
+        try {
+          const dec = decodeTrace(readFileSync(retracePath));
+          // A CPU_STEP row (family "cpu") with a real PC, stamped inside the window.
+          decodesCpuRows = dec.records.some(
+            (r: any) =>
+              r.family === "cpu" &&
+              typeof r.fields?.pc === "number" &&
+              r.cycle >= a && r.cycle <= b,
+          );
+        } catch {
+          decodesCpuRows = false;
+        }
+      }
+      // (ii) swimlane over the resulting store returns real cpu rows for the window.
+      const swimOut = await exec(`swimlane ${a} ${b}`);
+      const swimlaneReturnsRows =
+        /\$[0-9a-fA-F]{2,4}/.test(swimOut) &&
+        !/unknown command|not supported|no trace store|no trace/i.test(swimOut);
+      return {
+        fileOnDisk,
+        decodesCpuRows,
+        swimlaneReturnsRows,
+        hasEvents: eventCount > 0,
+        // The window was fully inside the ring (no clip) — sanity that we picked a live
+        // window, not one that fell off the back of the ring.
+        notClipped: res?.clipped !== true,
+      };
+    },
+  },
+
   // ── P1: ws-trace-monitor-misc-13 — monitor `flow`/`bt` report LIVE state ──────
   // TS monitor-shell.ts:1103-1115: `flow` reports the live interrupt/trap frame
   // state and `bt` scans the ACTUAL 6502 stack for JSR-return candidates

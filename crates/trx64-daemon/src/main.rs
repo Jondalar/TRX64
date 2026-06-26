@@ -3767,6 +3767,38 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             Ok(lines.join("\n"))
         }
 
+        // reverse-debug Phase 1c — `buildtrace <s> <e>`: dump the always-on delta ring's
+        // [s,e] cycle window to a `.c64retrace` (the SAME engine as the WS method
+        // trace/build_from_ring) and point the monitor's trace store at it, so the very
+        // next `swimlane <s> <e>` / `map` / `taint` reads exactly this window. The UI's
+        // "select two scrub thumbnails → build trace" backed by one verb.
+        "buildtrace" => {
+            let parse_cyc = |t: Option<&String>| -> Option<u64> {
+                t.and_then(|s| s.trim_start_matches('$').parse::<u64>().ok())
+            };
+            let (s, e) = match (parse_cyc(toks.get(1)), parse_cyc(toks.get(2))) {
+                (Some(s), Some(e)) => (s, e),
+                _ => return Err("buildtrace: usage: buildtrace <cycle_start> <cycle_end>".into()),
+            };
+            match build_trace_from_ring(st, s, e, None) {
+                Ok(out) => {
+                    let path = out.get("retrace_path").and_then(|v| v.as_str()).unwrap_or("");
+                    let ev = out.get("event_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let instr = out.get("instruction_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let lo = out.get("cycle_start").and_then(|v| v.as_u64()).unwrap_or(s);
+                    let hi = out.get("cycle_end").and_then(|v| v.as_u64()).unwrap_or(e);
+                    let mut msg = format!(
+                        "buildtrace: dumped delta-ring cycles {lo}–{hi} → {instr} instr, {ev} events\n  evidence: {path}\n  now: `swimlane {lo} {hi}` / `map` / `taint <addr>` read this window"
+                    );
+                    if out.get("clipped").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        msg.push_str("\n  NOTE: the window extends beyond the live ring — only the covered cycles were dumped (older history lives in a finalized trace).");
+                    }
+                    Ok(msg)
+                }
+                Err(err) => Err(format!("buildtrace: {err}")),
+            }
+        }
+
         // ---- Live trace gate (Spec 746 / audit misc-2): trace on|off|status|mark --
         // Wires the monitor `trace` verb to the EXISTING trace machinery (TraceState +
         // finalize_trace — the same engine behind trace/start_domains, runtime/mark,
@@ -4742,6 +4774,111 @@ fn assemble_at(st: &mut State, addr: u16, text: &str) -> Result<String, String> 
 fn parse_hex(tok: &str) -> Option<u32> {
     let t = tok.strip_prefix('$').unwrap_or(tok);
     u32::from_str_radix(t, 16).ok()
+}
+
+/// reverse-debug Phase 1c — slice the always-on full-delta ring for the cycle window
+/// `[cycle_start, cycle_end]` and DUMP it into a `.c64retrace` using the SAME binary
+/// record format the live trace writes (`FrameSink::write_delta_entry` → CPU_STEP 0x10
+/// + RAM_WRITE 0x11), so the file is read by the existing sidecar path (swimlane / map
+/// / taint) identically to a finalized live trace. Backs both `trace/build_from_ring`
+/// (WS) and the monitor `buildtrace` verb (one path, no format invention).
+///
+/// The `.duckdb` index is left LAZY (built by the sidecar on first read), and
+/// `state.last_trace_path` is pointed at it so the monitor map/swimlane/taint/chis verbs
+/// read THIS store immediately. Does NOT disturb an active `trace on` capture (it only
+/// touches `last_trace_path`, not `session.trace`).
+fn build_trace_from_ring(
+    st: &mut State,
+    cycle_start: u64,
+    cycle_end: u64,
+    output_path: Option<PathBuf>,
+) -> Result<Value, String> {
+    let (lo, hi) = if cycle_start <= cycle_end { (cycle_start, cycle_end) } else { (cycle_end, cycle_start) };
+
+    if !st.session.machine.delta_ring.enabled() {
+        return Err("the full-delta ring is disabled (TRX64_CPUHISTORY=0) — nothing to dump.".into());
+    }
+    let ring_span = st.session.machine.delta_ring.cycle_span();
+
+    // Slice the ring for [lo, hi], oldest→newest, each entry with its writes.
+    let mut slice: Vec<(trx64_core::DeltaEntry, Vec<trx64_core::WriteRec>)> = Vec::new();
+    st.session.machine.delta_ring.slice_by_cycle(lo, hi, &mut slice);
+
+    // Resolve the output `.c64retrace` path (default under the session runtime dir,
+    // like default_trace_output) and its sibling `.duckdb`.
+    let base = output_path.unwrap_or_else(|| default_trace_output(&st.session.id));
+    let retrace_path = base.with_extension("c64retrace");
+    let duckdb_path = {
+        let p = retrace_path.to_string_lossy();
+        if p.ends_with(".c64retrace") {
+            format!("{}.duckdb", &p[..p.len() - ".c64retrace".len()])
+        } else {
+            p.into_owned()
+        }
+    };
+
+    // The dump is cpu + memory (the ring's two halves). Build a VALID defJson header
+    // (so the c64re DuckDB indexer's JSON.parse(meta.defJson) succeeds and the store is
+    // readable) — same shape as trace/start_domains.
+    let domains: Vec<String> = vec!["c64-cpu".into(), "memory".into()];
+    let run_id = format!("run_ring-dump_{lo}_{hi}");
+    let def_json_str = serde_json::to_string(&capture_all_def_json(&domains)).unwrap_or_default();
+    let meta_json = serde_json::to_string(&json!({
+        "runId": run_id,
+        "defId": "ring-dump",
+        "defVersion": 1,
+        "defName": "delta-ring window dump",
+        "defJson": def_json_str,
+        "domains": domains,
+        "cycleStart": lo,
+        "createdAt": now_iso8601_utc(),
+    }))
+    .unwrap_or_default();
+
+    // Encode: header + each entry's CPU_STEP (+ its RAM_WRITEs).
+    let mut sink = FrameSink::with_header(&meta_json);
+    let mut event_count: u64 = 0;
+    for (e, writes) in &slice {
+        event_count += sink.write_delta_entry(e, writes);
+    }
+    let bytes = sink.buf;
+    let bytes_written = bytes.len();
+
+    if let Some(parent) = retrace_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    // Remove any stale sibling .duckdb so the sidecar rebuilds the index from THIS fresh
+    // .c64retrace (the indexer only builds when the .duckdb is absent).
+    let _ = std::fs::remove_file(&duckdb_path);
+    std::fs::write(&retrace_path, &bytes)
+        .map_err(|e| format!("write {}: {e}", retrace_path.display()))?;
+
+    // Point the CURRENT trace store at this dump so the monitor reads it immediately.
+    st.last_trace_path = Some(duckdb_path.clone());
+    st.last_run_id = Some(run_id.clone());
+
+    let mut out = json!({
+        "retrace_path": retrace_path.to_string_lossy(),
+        "duckdb_path": duckdb_path,
+        "event_count": event_count,
+        "instruction_count": slice.len(),
+        "bytes_written": bytes_written,
+        "cycle_start": lo,
+        "cycle_end": hi,
+        "run_id": run_id,
+    });
+    if let Some((oldest, newest)) = ring_span {
+        out["ring_cycle_span"] = json!({ "oldest": oldest, "newest": newest });
+        // Flag a window that fell (partly) outside the live ring — the dump then covers
+        // only the overlap (older history lives in a finalized trace).
+        if lo < oldest || hi > newest {
+            out["clipped"] = json!(true);
+        }
+    } else {
+        out["clipped"] = json!(true);
+    }
+    Ok(out)
 }
 
 /// Flush the active trace to its `.c64retrace` path; returns (run, status) JSON.
@@ -8228,6 +8365,43 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 "outputPath": output.to_string_lossy(),
                 "domains": domains
             }))
+        }
+
+        // reverse-debug Phase 1c — `trace/build_from_ring { cycle_start, cycle_end,
+        // output_path? }`: a TARGETED dump-on-demand of the always-on full-delta ring.
+        //
+        // The UI scrub-bar selects TWO thumbnails (a cycle window); this slices the
+        // 10 s delta ring for the entries whose cycle ∈ [cycle_start, cycle_end] and
+        // ENCODES them into a `.c64retrace` using the SAME binary record format the live
+        // trace writes (FrameSink::write_delta_entry → CPU_STEP 0x10 + RAM_WRITE 0x11),
+        // so the file is read by the EXISTING sidecar path (swimlane / map / taint)
+        // identically to a finalized live trace. No whole-run capture, no cycle guessing.
+        //
+        // The `.duckdb` index is left LAZY (built by the sidecar on first read, exactly
+        // like a finalized trace), and `state.last_trace_path` is pointed at it so the
+        // monitor map/swimlane/taint/chis verbs read THIS store immediately.
+        //
+        // Runs ON DEMAND (not the hot path); the state lock is held only for the slice
+        // copy + encode (a bounded window), then released.
+        "trace/build_from_ring" => {
+            let cycle_start = match req.params.get("cycle_start").and_then(|v| v.as_u64()) {
+                Some(c) => c,
+                None => return Response::err(id, -32602, "trace/build_from_ring: cycle_start required (u64)"),
+            };
+            let cycle_end = match req.params.get("cycle_end").and_then(|v| v.as_u64()) {
+                Some(c) => c,
+                None => return Response::err(id, -32602, "trace/build_from_ring: cycle_end required (u64)"),
+            };
+            let output_path = req
+                .params
+                .get("output_path")
+                .and_then(|v| v.as_str())
+                .map(PathBuf::from);
+            let mut st = state.lock().unwrap();
+            match build_trace_from_ring(&mut st, cycle_start, cycle_end, output_path) {
+                Ok(out) => Response::ok(id, out),
+                Err(e) => Response::err(id, -32001, e),
+            }
         }
 
         // ── Spec 708 — declarative trace definitions (validate / put / list) ──

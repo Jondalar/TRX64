@@ -388,6 +388,44 @@ impl DeltaRing {
         let newest_slot = ((self.entry_head - 1) % cap as u64) as usize;
         Some((self.entries[oldest_slot].cycle, self.entries[newest_slot].cycle))
     }
+
+    /// reverse-debug Phase 1c — copy every retained entry whose `cycle` is in
+    /// `[lo, hi]` (inclusive), OLDEST → NEWEST (chronological), each paired with the
+    /// writes it performed (in stored order), into `out`. Clears `out` first.
+    ///
+    /// This is the slice the `trace/build_from_ring` daemon method encodes into a
+    /// `.c64retrace`: a targeted dump of a cycle window the UI scrub-bar selected. The
+    /// ring is push-ordered by `cycle` (the CPU clock is monotonic per Spec 743), so a
+    /// forward walk of the live window is already chronological.
+    ///
+    /// An entry whose write slab has wrapped (its writes are stale) is still emitted —
+    /// its `DeltaEntry` header lives in the entry ring — but with an EMPTY write list
+    /// (the bytes are gone). This matches `writes_for`'s stale behaviour; the CPU row is
+    /// always faithful, only the mem rows for a slab-evicted entry are lost. In the
+    /// 10 s default ring a 2-thumbnail window is always well inside both slabs.
+    ///
+    /// NOT on the hot path (an on-demand dump, not per-instruction).
+    pub fn slice_by_cycle(&self, lo: u64, hi: u64, out: &mut Vec<(DeltaEntry, Vec<WriteRec>)>) -> usize {
+        out.clear();
+        let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+        let len = self.len();
+        if len == 0 {
+            return 0;
+        }
+        let cap = self.entries.len();
+        let start = self.entry_head - len as u64;
+        let mut writes_scratch: Vec<WriteRec> = Vec::new();
+        for k in 0..len as u64 {
+            let slot = ((start + k) % cap as u64) as usize;
+            let e = self.entries[slot];
+            if e.cycle < lo || e.cycle > hi {
+                continue;
+            }
+            self.writes_for(&e, &mut writes_scratch);
+            out.push((e, std::mem::take(&mut writes_scratch)));
+        }
+        out.len()
+    }
 }
 
 impl Default for DeltaRing {
@@ -592,6 +630,55 @@ mod tests {
         assert_eq!(r.writes_capacity(), 32);
         instr(&mut r, 0x9, (0, 0, 0, 0xff, 0), 9, &[]);
         assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn slice_by_cycle_selects_window_chronologically() {
+        // reverse-debug Phase 1c — the cycle-window slice the trace/build_from_ring
+        // dump encodes. Build a known stream, slice [b,c] and assert it returns EXACTLY
+        // the in-range entries (oldest→newest) with their writes, and excludes the rest.
+        let mut r = DeltaRing::with_capacity(16, 64);
+        r.set_enabled(true);
+        // 5 instructions at cycles 100,110,120,130,140 with distinct writes.
+        instr(&mut r, 0x1000, (0, 0, 0, 0xff, 0), 100, &[(0x10, 0xaa, 0x01)]);
+        instr(&mut r, 0x1001, (1, 0, 0, 0xff, 0), 110, &[(0x11, 0xbb, 0x02), (0x12, 0xcc, 0x03)]);
+        instr(&mut r, 0x1002, (2, 0, 0, 0xff, 0), 120, &[]); // no writes (branch/compare)
+        instr(&mut r, 0x1003, (3, 0, 0, 0xff, 0), 130, &[(0x13, 0xdd, 0x04)]);
+        instr(&mut r, 0x1004, (4, 0, 0, 0xff, 0), 140, &[(0x14, 0xee, 0x05)]);
+
+        // Window [110, 130] → entries at 110, 120, 130 (3 of the 5).
+        let mut out: Vec<(DeltaEntry, Vec<WriteRec>)> = Vec::new();
+        let n = r.slice_by_cycle(110, 130, &mut out);
+        assert_eq!(n, 3, "three entries in [110,130]");
+        // Oldest → newest order.
+        assert_eq!(out[0].0.cycle, 110);
+        assert_eq!(out[0].0.pc, 0x1001);
+        assert_eq!(out[1].0.cycle, 120);
+        assert_eq!(out[2].0.cycle, 130);
+        // Out-of-range entries (100, 140) excluded.
+        assert!(out.iter().all(|(e, _)| e.cycle >= 110 && e.cycle <= 130));
+        // Writes round-trip exactly (order + bytes).
+        assert_eq!(out[0].1.len(), 2);
+        assert_eq!(out[0].1[0], WriteRec { addr: 0x11, old_value: 0xbb, new_value: 0x02 });
+        assert_eq!(out[0].1[1], WriteRec { addr: 0x12, old_value: 0xcc, new_value: 0x03 });
+        assert_eq!(out[1].1.len(), 0, "no-write entry has an empty write list");
+        assert_eq!(out[2].1.len(), 1);
+        assert_eq!(out[2].1[0], WriteRec { addr: 0x13, old_value: 0xdd, new_value: 0x04 });
+
+        // Reversed args normalise to the same window.
+        let mut out2: Vec<(DeltaEntry, Vec<WriteRec>)> = Vec::new();
+        assert_eq!(r.slice_by_cycle(130, 110, &mut out2), 3);
+        assert_eq!(out2[0].0.cycle, 110);
+
+        // A window outside the ring is empty.
+        let mut out3: Vec<(DeltaEntry, Vec<WriteRec>)> = Vec::new();
+        assert_eq!(r.slice_by_cycle(500, 600, &mut out3), 0);
+        assert!(out3.is_empty());
+
+        // A single-cycle window picks exactly one entry.
+        let mut out4: Vec<(DeltaEntry, Vec<WriteRec>)> = Vec::new();
+        assert_eq!(r.slice_by_cycle(120, 120, &mut out4), 1);
+        assert_eq!(out4[0].0.pc, 0x1002);
     }
 
     #[test]

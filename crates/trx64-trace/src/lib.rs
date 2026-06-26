@@ -137,6 +137,45 @@ impl FrameSink {
         self.buf.push(value);
     }
 
+    /// reverse-debug Phase 1c — encode ONE always-on delta-ring entry (its CPU
+    /// PRE-state header + every write it performed) as the trace's CPU_STEP (0x10) +
+    /// RAM_WRITE (0x11) records, so a `trace/build_from_ring` dump round-trips through
+    /// the EXISTING sidecar read path (swimlane / map / taint) identically to a live
+    /// trace. Returns the number of records written (1 cpu row + N mem rows).
+    ///
+    /// FIELD MAPPING (ring → trace), and the two documented GAPS:
+    ///  * `cycle` ← `e.cycle` (the instruction's clock stamp) — EXACT; this is the
+    ///    field swimlane/map/taint query on, so the window is faithful.
+    ///  * `pc`    ← `e.pc` (the opcode address) — EXACT.
+    ///  * `a/x/y/sp/p` ← the ring's PRE-execute registers. GAP vs a live CPU_STEP,
+    ///    which carries POST-execute regs (and `p` with N/Z masked): the always-on
+    ///    delta ring stores the PRE-state (the state reverse-step lands on), so a
+    ///    rebuilt row reports pre-instruction regs. The PC/cycle the readers key on are
+    ///    unaffected; the reg columns are pre- not post-state. Self-consistent.
+    ///  * `opcode/b1/b2` ← 0. GAP: the delta ring does not store the opcode or operand
+    ///    bytes (it is a reg+write undo log, not a disassembly log). A rebuilt trace's
+    ///    disasm column is therefore blank; the CPU row, its PC and its writes are real.
+    ///  * each write → RAM_WRITE (0x11) with `value`=new, `pc`=`e.pc`, `cycle`=`e.cycle`,
+    ///    and `old_value` carried under the SAME rule as the live `on_bus` tap (Spec
+    ///    753): only for a write to the side-effect-free RAM window `$0002..$D000`.
+    pub fn write_delta_entry(
+        &mut self,
+        e: &trx64_core::DeltaEntry,
+        writes: &[trx64_core::WriteRec],
+    ) -> u64 {
+        // CPU row (PRE-state regs; opcode/operands unknown → 0).
+        self.write_cpu_step(e.cycle, e.pc, 0, e.a, e.x, e.y, e.sp, e.p, 0, 0);
+        let mut count = 1u64;
+        for w in writes {
+            // Same old-value rule as TracingObserver::on_bus (Spec 753): carry the
+            // pre-write byte only inside the RAM window; I/O-window writes omit it.
+            let old_opt = if (0x0002..0xd000).contains(&w.addr) { Some(w.old_value) } else { None };
+            self.write_mem_access(TraceOp::RamWrite, e.cycle, w.addr, w.new_value, e.pc, ACCESS_WRITE, old_opt);
+            count += 1;
+        }
+        count
+    }
+
     #[inline]
     #[allow(clippy::too_many_arguments)]
     fn write_mem_access(
