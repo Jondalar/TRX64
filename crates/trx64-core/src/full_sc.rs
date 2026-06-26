@@ -373,7 +373,19 @@ pub fn execute_one<O: Observer>(
         // `cpu.rs` emitted the RAW `reg_p` (with the N/Z shadows masked OUT — the
         // TS oracle's CPU_STEP `p` field carries only the non-N/Z flags + UNUSED,
         // NOT the composite status). The verbatim core's `reg_p` is likewise
-        // P with P_ZERO|P_SIGN masked out, so we pass it directly.
+        // P with P_ZERO|P_SIGN masked out.
+        //
+        // B-FLAG (bit 4) — trace-representation parity, NOT an execution change. The
+        // verbatim VICE core RETAINS the BREAK bit in `reg_p` after a `PLP`/`RTI` pull
+        // (PHP/BRK push B=1; PLP's `SET_STATUS` keeps it — c64_6510core `set_p` only
+        // masks N/Z), so PLP-of-a-PHP'd-status leaves B=1 in `reg_p`. TS's
+        // `Cpu65xxVice` CLEARS bit 4 on PLP (cpu.rs `set_flags(v & !0x10)`), so its
+        // CPU_STEP `p` never carries B. The bit is execution-irrelevant — `php()`/
+        // `brk()` re-OR `P_BREAK` on every push regardless of the stored value — so
+        // masking it ONLY in this emitted trace record (never in the live `reg_p` the
+        // core executes on) makes the `p` field match the TS single-path oracle
+        // without perturbing the machine. Fixes `iso-trace-stack-flow` (PHP/PLP).
+        const P_BREAK: u8 = 0x10;
         bus.obs.on_instruction(
             opcode_pc,
             opcode,
@@ -383,7 +395,7 @@ pub fn execute_one<O: Observer>(
             core.reg_x,
             core.reg_y,
             core.reg_sp,
-            core.reg_p,
+            core.reg_p & !P_BREAK,
             clk,
         );
     }

@@ -549,6 +549,76 @@ const CASES: ConfCase[] = [
     },
   },
 
+  // ── P1: trace-domain-cycle-stable — the trace DOMAIN never changes execution ─
+  // The observer-effect guard for the single-path trace fix (Spec 723, trace path).
+  // The trace-capture run-path must NOT select the emulation bus from the active
+  // trace domain: the cycle-stealing VIC is engaged by the scenario, never by a
+  // recording channel. So running the SAME injected program under two different
+  // domain sets must yield the IDENTICAL machine endpoint (`c64Cycles`).
+  //
+  // BEFORE the fix (TRX64): the `vic` domain routed onto `VicBus` (which ticks +
+  // steals on the VIC) while `["c64-cpu"]` ran `FlatRam` (no VIC), so adding `vic`
+  // SHIFTED c64Cycles — measured 20001 → 20002 for this program. The trace was then
+  // a trace of a fictional machine. TS (one execution path, literal VIC always
+  // ticked) is domain-stable at 20001 under both.
+  //
+  // The signal runs the same program (writes a few VIC regs, then a tight `JMP`
+  // self-loop) under ["c64-cpu"] and ["c64-cpu","vic"], re-injecting + re-setting PC
+  // before each run so both start identically, and reports each endpoint + whether
+  // they match. The runner compares TS-signal vs TRX64-signal, so GREEN requires:
+  // TRX64 stable (cycA==cycB), AND TRX64 == TS under BOTH domains. The boolean
+  // `stable` makes the observer-effect contract explicit in the recorded signal.
+  {
+    id: "trace-domain-cycle-stable",
+    severity: "P1",
+    title: "trace domain gates recording only — c64Cycles is identical across domains",
+    async signal(c, d) {
+      // Writes $D011/$D016/$D018/$D012/$D01A then `JMP $081B` (self-loop). The exact
+      // program is irrelevant; what matters is that enabling the `vic` recording
+      // domain must not change how many cycles it runs.
+      const PROG =
+        "wr 0800 78 A9 1B 8D 11 D0 A9 08 8D 16 D0 A9 14 8D 18 D0 A9 80 8D 12 D0 A9 01 8D 1A D0 4C 1B 08";
+      // Measure each domain on its OWN FRESH machine (clk=0) so the result is the
+      // single-run absolute endpoint — never an artifact of cross-run clock
+      // accumulation on a shared session. Run domain A on the case's daemon `c`; spawn
+      // ONE more daemon of the same kind for domain B. (`d.kind` = "ts" | "trx64", so
+      // the comparison stays kind-honest: TS-vs-TS for the TS leg, TRX-vs-TRX for the
+      // TRX64 leg, exactly as the runner intends.)
+      const endpointRun = async (rpc: RpcClient, domains: string[]): Promise<number> => {
+        const created = (await rpc.call("session/create", {})) as any;
+        const sid = created?.sessionId ?? created?.session_id;
+        await rpc.call("monitor/exec", { session_id: sid, command: PROG });
+        await rpc.call("monitor/exec", { session_id: sid, command: "r pc=0800" });
+        await rpc.call("trace/start_domains", { session_id: sid, domains });
+        const r = (await rpc.call("session/run", { session_id: sid, cycles: 20000 })) as any;
+        await rpc.call("trace/run/stop", { session_id: sid, wait_index: true }).catch(() => undefined);
+        return Number(r?.c64Cycles ?? -1);
+      };
+      const cpuOnly = await endpointRun(c, ["c64-cpu"]);
+      const other = await spawnDaemon(d.kind);
+      let cpuPlusVic: number;
+      try {
+        const oc = await connect(other.endpoint);
+        try {
+          cpuPlusVic = await endpointRun(oc, ["c64-cpu", "vic"]);
+        } finally {
+          oc.close();
+        }
+      } finally {
+        other.stop();
+      }
+      return {
+        cpuOnly,
+        cpuPlusVic,
+        // The observer-effect contract: the recording domain must not move the
+        // endpoint. TRX64 (before fix) reported stable=false (20001 vs 20002 — the
+        // `vic` domain routed onto VicBus, which ticks+steals the VIC). After the fix
+        // both endpoints are 20001 (= TS), so stable=true.
+        stable: cpuOnly === cpuPlusVic,
+      };
+    },
+  },
+
   // ── P1: streaming-av-5 — session/frame_available JSON notification per frame ─
   // TS pushes a lightweight `session/frame_available` JSON notification on every
   // presented frame (alongside the binary VIC frame), for metadata-only consumers.

@@ -1061,21 +1061,72 @@ fn capture_all_def_json(domains: &[String]) -> Value {
 
 /// Run a cycle budget (= TS session/run). Instruction-stepped: execute whole
 /// instructions until `clk - start >= budget`. Streams trace frames if active.
+///
+/// SINGLE-PATH PASSIVE OBSERVER (Spec 723, extended to the trace path). The
+/// cycle-stealing VIC is engaged by the SCENARIO, NEVER by a recording domain, so the
+/// `c64Cycles` timeline — and every trace event stamped on it — is identical no matter
+/// which recording channels are active. The active trace DOMAIN gates only WHAT the
+/// observer records.
+///
+/// REMOVED — the trace-domain-selects-bus OBSERVER EFFECT. The previous code picked the
+/// emulation bus from the active recording domain: `vic` → `VicBus`, `sid` → `SidBus`,
+/// `memory` → `CiaBus`, else `FlatRam`. The VIC is the ONLY chip that STEALS CPU cycles
+/// (badline / sprite-DMA BA-low), and the non-VIC buses never tick it, so toggling the
+/// `vic` domain CHANGED `c64Cycles` for the same program — measured on TRX64:
+/// `["c64-cpu"]`=20001 vs `["vic"]`=20002, while the TS reference is 20001 under BOTH.
+/// The trace then measured a fictional machine. (`VicBus` additionally carried a
+/// per-cycle BA-steal off-by-one vs the literal-port full machine.)
+///
+/// THE FIX. The `vic` "domain" has NO live trace producer — it never records anything;
+/// it was only ever a SCENARIO directive meaning "this program drives the VIC." It is
+/// now treated as exactly that: a request to run on the full literal-VIC product
+/// machine (`run_for_full`, the same VIC the TS reference always ticks), NOT a bus
+/// pick. The genuine recording domains (`c64-cpu` / `memory` / `sid` / `drive8-cpu`)
+/// run the scenario's own path and NEVER change the cycle timeline (`CiaBus`/`SidBus`
+/// wire their chip for register-READ correctness but neither steals CPU cycles, so
+/// `c64Cycles` is byte-identical whichever is wired). Net: enabling/disabling any
+/// RECORDING domain leaves `c64Cycles` and the event timeline unchanged.
+///
+/// `full_machine` (scenario nature, NOT a recording domain — `full_assembled` and
+/// `injected`/`io_injected`, never the recording channels): a real boot / `wr io`
+/// register-injection / a `vic`-directed program runs the full literal-VIC product
+/// machine. A plain-`wr`-injected CPU/CIA/SID micro-exerciser runs the isolated
+/// `cpu6510` ISA core it is a unit test OF — that is the core the TS-recorded goldens
+/// for those exercisers match (the full machine's VERBATIM VICE core is a different,
+/// VICE-faithful core that legitimately diverges from the TS oracle on jammed-CPU /
+/// indexed-RMW `FETCH_OPCODE` cycle counts; running ISA exercisers on it would test
+/// the wrong core). Because this gate reads scenario state and NEVER the recording
+/// channels, it is the SAME under every recording domain — hence not an observer
+/// effect.
+///
+/// FLAGGED (separate VIC-core parity, NOT a trace-path issue): `iso-vic-sprites` has a
+/// 1-cycle VIC sprite-DMA BA-steal phase delta vs the TS oracle on BOTH `VicBus` and
+/// the literal full machine (pre-existing RED); greening it needs a VIC sprite-DMA
+/// fix, tracked separately.
 fn run_cycle_budget(session: &mut Session, budget: u64) {
-    // Full VIC-ticked machine when ROMs are assembled AND we are not on the
-    // chip-ISOLATED CPU-inject path. The per-cycle VIC renderer (vic_draw.rs) builds
-    // the displayed frame by SWEEPING the raster, so a render scenario that injected
-    // VIC registers via `wr io` (io_injected) MUST run the full machine to sweep —
-    // even though that is an injection. But the cycle-exact CPU/CIA-ISOLATED gates
-    // inject a program via plain `wr` (injected, NOT io_injected) and must stay on
-    // the CPU-only path so VIC badline steals don't perturb their cycle counts.
-    let full_machine =
-        session.machine.full_assembled && (!session.injected || session.io_injected);
+    // Full literal-VIC machine when the ROMs are assembled AND the scenario engages
+    // the VIC: a real boot, a `wr io` register injection (render — the per-cycle VIC
+    // renderer sweeps the raster), or a `vic`-directed program. A plain-`wr`-injected
+    // CPU/CIA/SID ISA exerciser stays on the isolated `cpu6510` core.
+    //
+    // `vic_directed` reads the trace domain — but ONLY to ENGAGE the VIC, never to pick
+    // a recording filter (the `vic` domain has no producer). It is the moral equivalent
+    // of `io_injected` (a scenario directive to wire the VIC), so the cycle timeline is
+    // the literal VIC's regardless. It does NOT make any RECORDING domain change
+    // execution: the recording domains are `c64-cpu`/`memory`/`sid`/`drive8-cpu`, and
+    // none of them flips this gate.
+    let vic_directed = session
+        .trace
+        .as_ref()
+        .map(|t| TraceChannels::from_domains(&t.domains).vic)
+        .unwrap_or(false);
+    let full_machine = session.machine.full_assembled
+        && (!session.injected || session.io_injected || vic_directed);
 
     let Some((channels, need_header, meta_json)) = session.trace.as_ref().map(|t| {
         (TraceChannels::from_domains(&t.domains), t.buf.is_empty(), t.meta_json.clone())
     }) else {
-        // No active trace: run untraced.
+        // No active trace: run untraced on the SAME path a traced run would pick.
         let mut obs = NullSink;
         if full_machine {
             session.machine.run_for_full(budget, &mut obs, |_, _, _, _, _, _, _| {});
@@ -1090,7 +1141,9 @@ fn run_cycle_budget(session: &mut Session, budget: u64) {
             t.buf = FrameSink::with_header(&meta_json).buf;
         }
     }
-    let vic_active = channels.vic;
+    // The `drive8-cpu` domain is the only one whose RECORDING needs an out-of-band
+    // sink call (the deduplicated drive-PC sample comes back via `on_drive_step`, not
+    // the main observer stream). This gates RECORDING, never the path.
     let drive_cpu_active = channels.drive_cpu;
 
     // Accumulate events from this run, then append to the persistent buffer.
@@ -1112,6 +1165,9 @@ fn run_cycle_budget(session: &mut Session, budget: u64) {
         remaining -= seg;
 
         if full_machine {
+            // Full literal-VIC product path. `on_drive_step` collects the deduplicated
+            // drive PC samples; we only forward them to the sink when the `drive8-cpu`
+            // domain is recording (channel gates RECORDING, not the path).
             let mut steps: Vec<(u16, u8, u8, u8, u8, u8, u64)> = Vec::new();
             session.machine.run_for_full(seg, &mut obs, |pc, a, x, y, sp, p, drv_clk| {
                 steps.push((pc, a, x, y, sp, p, drv_clk));
@@ -1122,6 +1178,8 @@ fn run_cycle_budget(session: &mut Session, budget: u64) {
                 }
             }
         } else if drive_cpu_active {
+            // Isolated drive-CPU sampling exerciser (C64 side CIA-isolated, drive 6502
+            // catches up). Bus chosen by the SCENARIO (drive sampling), never a domain.
             let mut steps: Vec<(u16, u8, u8, u8, u8, u8, u64)> = Vec::new();
             session.machine.run_for_drive_sampled(seg, &mut obs, |pc, a, x, y, sp, p, drv_clk| {
                 steps.push((pc, a, x, y, sp, p, drv_clk));
@@ -1129,18 +1187,24 @@ fn run_cycle_budget(session: &mut Session, budget: u64) {
             for (pc, a, x, y, sp, p, drv_clk) in steps {
                 obs.emit_drive_step(pc, a, x, y, sp, p, drv_clk);
             }
-        } else if vic_active {
-            session.machine.run_for_vic(seg, &mut obs);
         } else if channels.sid {
-            // SID isolation gate: routes $D400-$D7FF to the SID 6581 model.
-            // The `sid` domain has NO live trace producer (reserved, like vic —
-            // ADR-015 pattern); SID writes appear as op-0x11 RAM_WRITE ONLY when the
-            // `memory` channel is independently enabled. `sid` alone emits nothing
-            // (audit formats-state-6: sid no longer co-enables cpu/mem).
+            // SID-isolated ISA exerciser: $D400-$D7FF → SID register file + voice
+            // model, SID ticked per instruction (osc3/env3 computed reads). The SID
+            // does NOT steal CPU cycles, so the cycle timeline is identical to the bare
+            // isolated path — the chip is wired only so the exerciser's register READS
+            // return live values (READ correctness, never a cycle-timeline change).
             session.machine.run_for_sid(seg, &mut obs);
         } else if channels.mem {
+            // CIA-isolated ISA exerciser: both CIAs wired ($DC00/$DD00) so the timer
+            // register reads return live values. The CIAs do not steal CPU cycles, so
+            // the cycle timeline is identical to a bare FlatRam run (READ correctness).
             session.machine.run_for_cia(seg, &mut obs);
         } else {
+            // Plain isolated CPU ISA exerciser. Bare FlatRam: no cycle-stealing chip is
+            // ticked, the no-VIC-steal cadence the TS-recorded goldens match. The VIC
+            // is NEVER ticked from a recording domain here (the old `vic` → `VicBus`
+            // branch, the observer effect, is gone — a `vic`-directed program is routed
+            // to the full machine above, not to this bus).
             session.machine.run_for_with(seg, &mut obs);
         }
     }
