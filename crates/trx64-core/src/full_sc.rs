@@ -480,6 +480,15 @@ pub fn execute_one<O: Observer>(
                 clk,
             );
         }
+        // reverse-debug Phase 1b — stamp the SAME decoded opcode + operand bytes onto
+        // the in-flight delta entry (opened by `begin` pre-execute, published by
+        // `commit` below). Reuses the exact `opcode`/`b1`/`b2` locals — no re-fetch, no
+        // extra read — so a `build_from_ring` trace carries a REAL disasm column
+        // (LDA/STA/JMP/…) instead of opcode-0 (= BRK for every row). An interrupt-only
+        // dispatch never enters this `fetch` block, so its entry keeps opcode 0.
+        if let Some(dr) = bus.delta_ring.as_deref_mut() {
+            dr.set_opcode(opcode, b1, b2);
+        }
     }
     // reverse-debug Phase 1b — publish the full-delta entry. Committed UNCONDITIONALLY
     // after the execute (not only inside the `fetch` block): an interrupt-only dispatch

@@ -152,9 +152,12 @@ impl FrameSink {
     ///    delta ring stores the PRE-state (the state reverse-step lands on), so a
     ///    rebuilt row reports pre-instruction regs. The PC/cycle the readers key on are
     ///    unaffected; the reg columns are pre- not post-state. Self-consistent.
-    ///  * `opcode/b1/b2` ← 0. GAP: the delta ring does not store the opcode or operand
-    ///    bytes (it is a reg+write undo log, not a disassembly log). A rebuilt trace's
-    ///    disasm column is therefore blank; the CPU row, its PC and its writes are real.
+    ///  * `opcode/b1/b2` ← `e.opcode`/`e.b1`/`e.b2`. REAL: the delta entry now carries
+    ///    the decoded opcode + operand bytes, stamped at retire by `DeltaRing::set_opcode`
+    ///    from the SAME fields the `cpu_history` ring receives (no re-decode). So a
+    ///    rebuilt trace's disasm column shows real mnemonics (LDA/STA/JMP/…), not a blank
+    ///    / BRK-for-every-row column. (An interrupt-only dispatch with no opcode body
+    ///    leaves these at 0 — the same as a live trace's interrupt rows.)
     ///  * each write → RAM_WRITE (0x11) with `value`=new, `pc`=`e.pc`, `cycle`=`e.cycle`,
     ///    and `old_value` carried under the SAME rule as the live `on_bus` tap (Spec
     ///    753): only for a write to the side-effect-free RAM window `$0002..$D000`.
@@ -163,8 +166,8 @@ impl FrameSink {
         e: &trx64_core::DeltaEntry,
         writes: &[trx64_core::WriteRec],
     ) -> u64 {
-        // CPU row (PRE-state regs; opcode/operands unknown → 0).
-        self.write_cpu_step(e.cycle, e.pc, 0, e.a, e.x, e.y, e.sp, e.p, 0, 0);
+        // CPU row (PRE-state regs; opcode/operands are REAL, stamped at retire).
+        self.write_cpu_step(e.cycle, e.pc, e.opcode, e.a, e.x, e.y, e.sp, e.p, e.b1, e.b2);
         let mut count = 1u64;
         for w in writes {
             // Same old-value rule as TracingObserver::on_bus (Spec 753): carry the

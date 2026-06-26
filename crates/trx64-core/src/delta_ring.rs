@@ -62,6 +62,11 @@ pub struct WriteRec {
 /// instruction). `p` is the **COMPOSITE** status byte (N/Z/B/all flags intact, =
 /// `C64Core6510::status()`), so a restore is byte-exact — unlike `CpuHistEntry.p`,
 /// which masks N/Z/B for the trace.
+///
+/// OPCODE/OPERANDS (`opcode`/`b1`/`b2`) are set at RETIRE by `set_opcode` from the
+/// SAME decoded fields `cpu_history.push` receives (the post-execute fetch), so a
+/// `build_from_ring` trace carries a REAL disasm column (LDA/STA/JMP/…), not a
+/// blank/BRK one. Unset (interrupt-only dispatch with no opcode body) they stay 0.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct DeltaEntry {
@@ -86,8 +91,13 @@ pub struct DeltaEntry {
     pub sp: u8,
     /// COMPOSITE processor status BEFORE this instruction (all flags intact).
     pub p: u8,
-    /// Padding (keeps the 24-byte `#[repr(C)]` layout explicit / stable).
-    pub _pad: u8,
+    /// Opcode byte of this instruction (set at retire via `set_opcode`; 0 if the
+    /// dispatch had no normal opcode body, e.g. an interrupt-only push).
+    pub opcode: u8,
+    /// Operand byte 1 (low) — set with `opcode` at retire; 0 for 1-byte opcodes.
+    pub b1: u8,
+    /// Operand byte 2 (high) — set with `opcode` at retire; 0 for <3-byte opcodes.
+    pub b2: u8,
 }
 
 /// Default reverse-history depth in seconds (user decision: 10 s). Overridable via
@@ -226,9 +236,27 @@ impl DeltaRing {
             y,
             sp,
             p,
-            _pad: 0,
+            opcode: 0,
+            b1: 0,
+            b2: 0,
         };
         self.in_flight = true;
+    }
+
+    /// HOT PATH. Stamp the in-flight instruction's decoded opcode + operand bytes onto
+    /// the pending entry, called at retire with the SAME `opcode`/`b1`/`b2` the
+    /// `cpu_history` ring receives (no second decode, no extra memory read). Lets a
+    /// `build_from_ring` trace carry a REAL disasm column instead of opcode-0 (= BRK
+    /// for every row). A no-op when the ring is gated off or no instruction is in
+    /// flight (an interrupt-only dispatch leaves the entry's opcode at 0).
+    #[inline]
+    pub fn set_opcode(&mut self, opcode: u8, b1: u8, b2: u8) {
+        if !self.enabled || !self.in_flight {
+            return;
+        }
+        self.cur.opcode = opcode;
+        self.cur.b1 = b1;
+        self.cur.b2 = b2;
     }
 
     /// HOT PATH. Append one write to the in-flight instruction. `old` = the byte at
@@ -454,7 +482,9 @@ impl Clone for DeltaRing {
 mod tests {
     use super::*;
 
-    /// Helper: record a whole instruction (begin + writes + commit).
+    /// Helper: record a whole instruction (begin + writes + commit). Stamps a
+    /// deterministic opcode/operand so the build_from_ring disasm round-trip is
+    /// checkable: `opcode = pc.low`, `b1 = pc.high`, `b2 = 0`.
     fn instr(
         r: &mut DeltaRing,
         pc: u16,
@@ -464,6 +494,7 @@ mod tests {
     ) {
         let (a, x, y, sp, p) = regs;
         r.begin(pc, a, x, y, sp, p, cycle);
+        r.set_opcode(pc as u8, (pc >> 8) as u8, 0);
         for &(addr, old, new) in writes {
             r.record_write(addr, old, new);
         }
@@ -487,6 +518,10 @@ mod tests {
         assert_eq!(e.a, 1);
         assert_eq!(e.sp, 0xfd);
         assert_eq!(e.p, 0x30);
+        // `instr` stamps opcode = pc.low, b1 = pc.high (deterministic decode marker).
+        assert_eq!(e.opcode, 0x00, "opcode = pc.low");
+        assert_eq!(e.b1, 0x10, "b1 = pc.high");
+        assert_eq!(e.b2, 0x00);
         assert_eq!(e.write_count, 1);
         let mut w = Vec::new();
         r.writes_for(&e, &mut w);
@@ -679,6 +714,54 @@ mod tests {
         let mut out4: Vec<(DeltaEntry, Vec<WriteRec>)> = Vec::new();
         assert_eq!(r.slice_by_cycle(120, 120, &mut out4), 1);
         assert_eq!(out4[0].0.pc, 0x1002);
+    }
+
+    #[test]
+    fn set_opcode_roundtrips_through_slice_not_brk() {
+        // Regression for the build_from_ring "all-BRK disasm" bug: opcodes stamped via
+        // set_opcode must survive into the cycle-window slice (what write_delta_entry
+        // encodes), NOT come back as 0 (= BRK for every row).
+        let mut r = DeltaRing::with_capacity(16, 64);
+        r.set_enabled(true);
+        // Drive set_opcode directly with real 6502 opcodes (LDA #imm, JMP abs, STA abs).
+        r.begin(0x0801, 0, 0, 0, 0xff, 0x20, 1000);
+        r.set_opcode(0xA9, 0x41, 0x00); // LDA #$41
+        r.commit();
+        r.begin(0x0803, 0x41, 0, 0, 0xff, 0x20, 1003);
+        r.set_opcode(0x8D, 0x00, 0x04); // STA $0400
+        r.record_write(0x0400, 0x20, 0x41);
+        r.commit();
+        r.begin(0x0806, 0x41, 0, 0, 0xff, 0x20, 1007);
+        r.set_opcode(0x4C, 0x00, 0x08); // JMP $0800
+        r.commit();
+
+        let mut out: Vec<(DeltaEntry, Vec<WriteRec>)> = Vec::new();
+        let n = r.slice_by_cycle(1000, 1007, &mut out);
+        assert_eq!(n, 3);
+        // The opcodes round-trip exactly — NOT 0/BRK.
+        assert_eq!(out[0].0.opcode, 0xA9);
+        assert_eq!(out[0].0.b1, 0x41);
+        assert_eq!(out[1].0.opcode, 0x8D);
+        assert_eq!(out[1].0.b1, 0x00);
+        assert_eq!(out[1].0.b2, 0x04);
+        assert_eq!(out[2].0.opcode, 0x4C);
+        assert_eq!(out[2].0.b2, 0x08);
+        assert!(out.iter().all(|(e, _)| e.opcode != 0x00), "no entry decodes as BRK");
+    }
+
+    #[test]
+    fn set_opcode_noop_when_disabled_or_no_instruction() {
+        let mut r = DeltaRing::with_capacity(8, 32);
+        // Disabled: set_opcode does nothing (no panic, no state).
+        r.set_enabled(false);
+        r.set_opcode(0xA9, 0x41, 0x00);
+        assert!(r.newest().is_none());
+        // Enabled but no in-flight instruction: set_opcode is a no-op, opcode stays 0.
+        r.set_enabled(true);
+        r.set_opcode(0xA9, 0x41, 0x00); // before any begin()
+        r.begin(0x1000, 0, 0, 0, 0xff, 0, 1);
+        r.commit(); // committed without set_opcode → interrupt-only-style entry
+        assert_eq!(r.newest().unwrap().opcode, 0, "no set_opcode → opcode 0 (interrupt-only)");
     }
 
     #[test]
