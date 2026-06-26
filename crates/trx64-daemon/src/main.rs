@@ -5023,6 +5023,34 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
             Response::ok(id, json!(snapshot_diff::format_diff(&diff)))
         }
 
+        // ── Rewind / time-travel AgentQueryApi methods (runtime/call) ────────────
+        // Spec 243 / 769: beginRewindSession / rewindTo / applyPatch / runForward /
+        // diffBranches / promoteBranch (agent-api.ts:251-274). EVERY one routes through
+        // `beginRewindSession()`, which REQUIRES scenarioId+diskPath+mode in the
+        // AgentApiOptions (agent-api.ts:252-253):
+        //     if (!this.scenarioId || !this.diskPath || !this.mode)
+        //       throw new Error("beginRewindSession requires scenarioId+diskPath+mode in AgentApiOptions");
+        // In the c64re daemon `runtime/call` builds `createAgentQueryApi({ session })`
+        // with NO scenarioId/diskPath/mode (ws-server.ts:1720), so over `runtime/call`
+        // ALL SIX throw that IDENTICAL guard string BEFORE touching any RewindManager
+        // state — verified against the live TS daemon. None is observably functional
+        // over WS. The ONLY working rewind surface over WS is the dedicated
+        // `runtime/snapshot_tree` + `runtime/promote_branch` handlers (ws-server.ts
+        // :1897/1917 pass scenarioId+diskPath+mode), backed here by rewind.rs.
+        //
+        // So for byte-faithful parity these six are HANDLED (not method-not-found) but
+        // return the IDENTICAL guard error TS does — backing a working rewind over
+        // runtime/call would DIVERGE (TRX64 succeeding where TS throws = fake-green).
+        // Same pattern as the trace-method arm below ("traceBackend not configured").
+        "beginRewindSession" | "rewindTo" | "applyPatch" | "runForward"
+        | "diffBranches" | "promoteBranch" => {
+            Response::err(
+                id,
+                -32000,
+                "beginRewindSession requires scenarioId+diskPath+mode in AgentApiOptions",
+            )
+        }
+
         // ── Trace-backed AgentQueryApi methods (runtime/call) ────────────────────
         // queryEvents / followPath / swimlaneSlice / traceTaint / profileLoader.
         // In the c64re daemon `runtime/call` builds `createAgentQueryApi({ session })`

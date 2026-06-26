@@ -2363,6 +2363,66 @@ const CASES: ConfCase[] = [
       };
     },
   },
+
+  // ── P1: ws-trace-monitor-misc-24 — runtime/call RewindManager (the 6 methods) ──
+  // The Spec 243/769 time-travel surface in createAgentQueryApi:
+  //   beginRewindSession · rewindTo · applyPatch · runForward · diffBranches ·
+  //   promoteBranch (agent-api.ts:251-274). Each routes through
+  //   `beginRewindSession()` which REQUIRES scenarioId+diskPath+mode in the
+  //   AgentApiOptions (agent-api.ts:252-253):
+  //       if (!this.scenarioId || !this.diskPath || !this.mode)
+  //         throw new Error("beginRewindSession requires scenarioId+diskPath+mode in AgentApiOptions");
+  //
+  // RFL (probed against the LIVE TS daemon): `runtime/call` builds the API with
+  // `createAgentQueryApi({ session })` — NO scenarioId/diskPath/mode (ws-server.ts
+  // :1720). So over `runtime/call` ALL SIX methods throw the IDENTICAL guard string
+  // BEFORE touching any RewindManager state — none of them is observably functional
+  // over WS. (The ONLY working rewind surface over WS is the dedicated
+  // `runtime/snapshot_tree` + `runtime/promote_branch` handlers, which DO pass
+  // scenarioId/diskPath/mode — ws-server.ts:1897/1917 — and TRX64 backs those via
+  // rewind.rs, covered by the rewind.rs unit tests + the snapshot_tree/promote_branch
+  // handler cases.) The `_rewind` lazy-cache on AgentQueryApi is moot here: the
+  // whole AgentQueryApi is reconstructed per `runtime/call` (ws-server.ts:1717-1724),
+  // so even if the guard passed, no branch state would persist across calls.
+  //
+  // This is the SAME shape as the trace-method arm (misc-19b): handled, but TS
+  // returns a stable DOMAIN error. Unlike diffSnapshots (misc-22, a JS TypeError that
+  // could not be matched), this guard string is stable and identical on every call,
+  // so it IS a real differential — NOT blocked. TRX64 (pre-fix) routed all six to the
+  // dispatch_api_call `other` -32601 arm ("unknown method"). Fix: HANDLE all six in
+  // dispatch_api_call, returning the IDENTICAL guard error (NOT method-not-found, and
+  // NOT a working rewind — succeeding where TS throws would be fake-green). Signal:
+  // call each over runtime/call and report {handled, message}. TS == TRX64 ==
+  // {handled:true, message:"beginRewindSession requires scenarioId+diskPath+mode in AgentApiOptions"}.
+  {
+    id: "ws-trace-monitor-misc-24",
+    severity: "P1",
+    title: "runtime/call rewind methods match TS (handled, beginRewindSession guard — scenarioId+diskPath+mode required)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      const notFound = (msg: string) =>
+        /method not found|unknown (runtime op|method)|not allowed|-32601/i.test(msg);
+      const probe = async (op: string, args: unknown[]) => {
+        try {
+          await c.call("runtime/call", { session_id: sid, op, args });
+          return { handled: true, message: "<ok>" };
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          let text = msg;
+          try { const j = JSON.parse(msg); if (j?.message) text = String(j.message); } catch { /* plain */ }
+          return { handled: !notFound(msg), message: text };
+        }
+      };
+      return {
+        beginRewindSession: await probe("beginRewindSession", [{}]),
+        rewindTo: await probe("rewindTo", [1000]),
+        applyPatch: await probe("applyPatch", ["snap-x", []]),
+        runForward: await probe("runForward", ["snap-x", 1000]),
+        diffBranches: await probe("diffBranches", ["a", "b"]),
+        promoteBranch: await probe("promoteBranch", ["branch-x"]),
+      };
+    },
+  },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────

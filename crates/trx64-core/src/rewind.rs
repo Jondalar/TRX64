@@ -14,11 +14,15 @@
 //!
 //! WHAT DIFFERS FROM THE TS (and why it is still 1:1 on the OBSERVABLE contract):
 //!   The WS handlers `runtime/snapshot_tree` and `runtime/promote_branch`
-//!   (workspace-ui/ws-server.ts:1891 / :1911) construct a FRESH RewindManager via
-//!   `api.beginRewindSession()` on EVERY call — there is NO persistent per-session
-//!   RewindManager held across calls. So the OBSERVABLE result of those two handlers
-//!   depends only on construction (the root snapshot + root branch) and the supplied
-//!   `branch_id`. This port reproduces exactly that:
+//!   (workspace-ui/ws-server.ts:1891 / :1911) build a FRESH `createAgentQueryApi`
+//!   on EVERY call (passing scenarioId+diskPath+mode), then call
+//!   `api.beginRewindSession()`. `beginRewindSession()` lazily caches `_rewind` on
+//!   the AgentQueryApi instance — but the WHOLE AgentQueryApi is reconstructed per
+//!   handler invocation, so there is NO persistent per-session RewindManager held
+//!   across calls; the in-memory branch/snapshot Maps never survive a WS round-trip.
+//!   So the OBSERVABLE result of those two handlers depends only on construction
+//!   (the root snapshot + root branch) and the supplied `branch_id`. This port
+//!   reproduces exactly that:
 //!     • `snapshot_tree` → a freshly-built handle with the single root branch,
 //!     • `promote_branch` → succeeds ONLY if `branch_id` is the freshly-generated
 //!       root id (which a caller cannot know in advance, the same as TS where each
