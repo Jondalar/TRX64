@@ -1579,10 +1579,10 @@ const CASES: ConfCase[] = [
       // differ between daemons at cold reset, so each writes its marker at its own
       // base — the round-trip is what we assert, not a shared address).
       const baseMatch = /screen @ \$([0-9a-f]{4})/i.exec(first);
-      const base = baseMatch ? parseInt(baseMatch[1], 16) : null;
+      const base = baseMatch && baseMatch[1] ? parseInt(baseMatch[1], 16) : null;
       // The grid rows are the `|<40 chars>|` lines (25 of them).
       const gridRows0 = first.split("\n").filter((l) => /^\|.*\|$/.test(l));
-      const cols0 = gridRows0.length ? gridRows0[0].length - 2 : 0; // strip the two pipes
+      const cols0 = gridRows0[0] ? gridRows0[0].length - 2 : 0; // strip the two pipes
       // Live-content check: write screen-code $01 (=`A`) into the daemon's own screen
       // base cell (0,0), re-decode, and confirm an `A` now sits at grid row 0 col 0.
       let markerVisible = false;
@@ -1590,7 +1590,7 @@ const CASES: ConfCase[] = [
         await exec(`wr ram ${base.toString(16)} 01`);
         const second = await exec("screen");
         const rows = second.split("\n").filter((l) => /^\|.*\|$/.test(l));
-        markerVisible = rows.length >= 1 && rows[0][1] === "A"; // [0] is the leading `|`
+        markerVisible = rows[0] !== undefined && rows[0][1] === "A"; // [0] is the leading `|`
       }
       return {
         // First signal: the verb is recognized (the help no longer lies).
@@ -1603,6 +1603,89 @@ const CASES: ConfCase[] = [
         hasBaseHeader: base !== null,
         // Semantic (live content): a marker written at the live base decodes in-grid.
         markerVisible,
+      };
+    },
+  },
+
+  // ── P1: ws-trace-monitor-misc-10b — monitor VIC-data verbs bitmap/charset/sprite ──
+  // The monitor REPL advertises `bitmap <a> [w h] [hires|charset|sprite]` in its `help`
+  // text (and `screen` is the 4th VIC-data verb, wired in misc-10), but TRX64's
+  // run_monitor had NO `bitmap`/`bm` arm → the verb (and ALL its modes — hires/charset/
+  // sprite) fell through to `unknown command: bitmap` (the help LIES). In the canonical
+  // TS runtime (monitor-shell.ts:745-767) `charset`/`sprite` are NOT standalone verbs —
+  // they are MODES of `bitmap`, which decodes a live RAM range to a PNG per C64 graphics
+  // mode (monitor-bitmap.ts) and returns `bitmap <mode> $XXXX → W×Hpx (N bytes read) →
+  // <file>`. Fix: wire run_monitor's `bitmap`/`bm` arm 1:1 — same arg parse (addr hex,
+  // w/h decimal, mode token), same per-mode dims + byte-count, same PNG artifact + the
+  // same output string. Signal — driven on the SAME live state into RAM first (so the
+  // render reflects THIS daemon's live memory): a first signal `recognized` (no "unknown
+  // command", catching the help-lies divergence) PLUS semantic structural properties on
+  // each of the three modes — the mode name + base addr are echoed in the header, the
+  // reported byte-count equals the mode's w·h·stride (charset 16·16·8, sprite 8·4·64,
+  // hires 40·25·1), and a PNG artifact actually lands in this daemon's own project dir.
+  // Exact bytes/paths are NOT asserted (project dirs differ per daemon; PNG container
+  // bytes differ between encoders — the render gate proves pixels elsewhere). TS: all
+  // true; TRX64 (before fix): recognized=false (every mode is `unknown command`).
+  {
+    id: "ws-trace-monitor-misc-10b",
+    severity: "P1",
+    title: "monitor VIC-data verbs bitmap/charset/sprite are wired (modes of `bitmap`; help no longer lies)",
+    async signal(c, d) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      const recognized = (s: string) => !/unknown command/i.test(s);
+      // Seed deterministic live state so each render reflects THIS daemon's RAM (not a
+      // cold-default): a non-zero pattern across the regions each mode reads. $E000 is
+      // RAM under the KERNAL shadow (the CPU lens still peeks RAM there) — write a wide
+      // alternating pattern so the decode has content.
+      await exec("f c000 dfff aa 55");
+      // Drive each mode. (charset/sprite are MODES of `bitmap`, matching the TS runtime.)
+      const bmpOut = await exec("bitmap c000 40 25 hires");
+      const chrOut = await exec("bitmap c000 16 16 charset");
+      const sprOut = await exec("bitmap c000 8 4 sprite");
+      // Parse `bitmap <mode> $XXXX → W×Hpx (N bytes read) → <file>`.
+      const parse = (s: string) => {
+        const m = /bitmap\s+(\w+)\s+\$([0-9a-f]{4})\s+→\s+(\d+)×(\d+)px\s+\((\d+)\s+bytes read\)\s+→\s+(.+)$/i.exec(s.trim());
+        if (!m) return null;
+        return {
+          mode: m[1]!.toLowerCase(),
+          base: parseInt(m[2]!, 16),
+          width: parseInt(m[3]!, 10),
+          height: parseInt(m[4]!, 10),
+          bytes: parseInt(m[5]!, 10),
+          file: m[6]!,
+        };
+      };
+      const bmp = parse(bmpOut);
+      const chr = parse(chrOut);
+      const spr = parse(sprOut);
+      // A PNG artifact landed in THIS daemon's own project dir (compare per-daemon, not
+      // absolute path equality — the dirs differ between TS and TRX64).
+      const fileMade = (p: { file: string } | null) => {
+        if (!p) return false;
+        try { return p.file.startsWith(d.projectDir) && statSync(p.file).size > 0; }
+        catch { return false; }
+      };
+      return {
+        // First signal: every mode is recognized (the help no longer lies).
+        recognized: recognized(bmpOut) && recognized(chrOut) && recognized(sprOut),
+        // Semantic: the header echoes the mode + base addr for each.
+        bmpHeaderOk: bmp !== null && bmp.mode === "hires" && bmp.base === 0xc000,
+        chrHeaderOk: chr !== null && chr.mode === "charset" && chr.base === 0xc000,
+        sprHeaderOk: spr !== null && spr.mode === "sprite" && spr.base === 0xc000,
+        // Semantic: the byte-count equals the mode's w·h·stride (live params).
+        bmpBytes: bmp?.bytes ?? -1,   // hires 40·25·1 = 1000
+        chrBytes: chr?.bytes ?? -1,   // charset 16·16·8 = 2048
+        sprBytes: spr?.bytes ?? -1,   // sprite 8·4·64 = 2048
+        // Semantic: pixel dims per mode (charset/sprite expand the cells).
+        bmpDims: bmp ? `${bmp.width}x${bmp.height}` : "",   // 320x25
+        chrDims: chr ? `${chr.width}x${chr.height}` : "",   // 128x128
+        sprDims: spr ? `${spr.width}x${spr.height}` : "",   // 192x84
+        // Effect: a non-empty PNG artifact lands in each daemon's own project dir.
+        artifactsMade: fileMade(bmp) && fileMade(chr) && fileMade(spr),
       };
     },
   },

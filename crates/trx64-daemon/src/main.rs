@@ -2237,6 +2237,54 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             Ok(lines.join("\n"))
         }
 
+        // ---- bitmap <addr> [w] [h] [hires|charset|sprite] — render a RAM range
+        // as an image (§3.3b, folds the Scrub tab). 1:1 with monitor-shell.ts:745-
+        // 767: the text console can't inline it, so it writes a PNG artifact +
+        // returns the path. w/h are DECIMAL counts (cells/rows/sprites per mode);
+        // addr is hex. (multicolor = v1.1.) The help advertised it but run_monitor
+        // had NO arm → `unknown command: bitmap` (the help LIED). charset/sprite
+        // are MODES of this verb (matching TS), not standalone verbs.
+        "bitmap" | "bm" => {
+            let addr = match parse_addr(toks.get(1)) {
+                Some(a) => a,
+                None => return Err("bitmap: usage: bitmap <addr> [w] [h] [hires|charset|sprite]".into()),
+            };
+            let rest = &toks[2..];
+            let mode_tok = rest.iter().find(|t| {
+                let l = t.to_ascii_lowercase();
+                matches!(l.as_str(), "hires" | "charset" | "sprite" | "mc" | "multicolor")
+            });
+            if let Some(mt) = mode_tok {
+                let l = mt.to_ascii_lowercase();
+                if l == "mc" || l == "multicolor" {
+                    return Err("bitmap: multicolor is v1.1 — use hires | charset | sprite".into());
+                }
+            }
+            let mode = mode_tok.map(|t| t.to_ascii_lowercase()).unwrap_or_else(|| "hires".to_string());
+            let nums: Vec<u32> = rest
+                .iter()
+                .filter(|t| t.chars().all(|c| c.is_ascii_digit()) && !t.is_empty())
+                .filter_map(|t| t.parse::<u32>().ok())
+                .collect();
+            let (def_w, def_h): (u32, u32) = match mode.as_str() {
+                "charset" => (16, 16),
+                "sprite" => (8, 4),
+                _ => (40, 25),
+            };
+            let w = nums.first().copied().unwrap_or(def_w).clamp(1, 256);
+            let h = nums.get(1).copied().unwrap_or(def_h).clamp(1, 256);
+            let read = |a: u16| st.session.machine.peek_lens(a, "cpu");
+            let (width, height, rgba, bytes) = monitor_bitmap_decode(&read, addr, w, h, &mode);
+            let png = rgba_to_png(width, height, &rgba);
+            let file = resolve_fs_path(&format!("bitmap_{addr:04x}_{mode}_{w}x{h}.png"));
+            if let Err(e) = std::fs::write(&file, &png) {
+                return Err(format!("bitmap: {e}"));
+            }
+            Ok(format!(
+                "bitmap {mode} ${addr:04x} → {width}×{height}px ({bytes} bytes read) → {file}"
+            ))
+        }
+
         // ---- f <start> <end> <data..> — fill the range, repeating the data. --
         "f" | "fill" => {
             let start = parse_addr(toks.get(1)).ok_or("f: usage: f <start> <end> <byte..>")?;
@@ -9931,6 +9979,86 @@ fn base64_encode(data: &[u8]) -> String {
         _ => {}
     }
     out
+}
+
+/// Decode a RAM range to an RGBA buffer for the monitor `bitmap` verb. 1:1 with
+/// monitor-bitmap.ts `decode()` + `renderBitmapPng()` (Spec 754 §3.3b): the same
+/// monochrome FG/BG, the same per-mode dims, and the same byte-count, so the
+/// returned `(width, height, bytes)` match the TS render exactly. `read` peeks
+/// RAM through the live CPU lens (= TS `readByte(a, "cpu")`).
+fn monitor_bitmap_decode(
+    read: &dyn Fn(u16) -> u8,
+    addr: u16,
+    w: u32,
+    h: u32,
+    mode: &str,
+) -> (u32, u32, Vec<u8>, u32) {
+    // Monochrome palette (= monitor-bitmap.ts FG/BG): bit set = foreground.
+    const FG: [u8; 3] = [0xcc, 0xcc, 0xff];
+    const BG: [u8; 3] = [0x20, 0x20, 0x40];
+    let (width, height): (u32, u32) = match mode {
+        "charset" => (w * 8, h * 8),
+        "sprite" => (w * 24, h * 21),
+        _ => (w * 8, h), // hires
+    };
+    let mut rgba = vec![0u8; (width as usize) * (height as usize) * 4];
+    let mut set = |x: u32, y: u32, on: bool| {
+        let i = ((y * width + x) as usize) * 4;
+        let c = if on { FG } else { BG };
+        rgba[i] = c[0];
+        rgba[i + 1] = c[1];
+        rgba[i + 2] = c[2];
+        rgba[i + 3] = 0xff;
+    };
+    match mode {
+        "charset" => {
+            // w×h grid of 8×8 char cells; 8 bytes per cell.
+            for cy in 0..h {
+                for cx in 0..w {
+                    let base = (addr as u32).wrapping_add((cy * w + cx) * 8);
+                    for r in 0..8u32 {
+                        let byte = read(((base + r) & 0xffff) as u16);
+                        for b in 0..8u32 {
+                            set(cx * 8 + b, cy * 8 + r, (byte >> (7 - b)) & 1 != 0);
+                        }
+                    }
+                }
+            }
+        }
+        "sprite" => {
+            // w×h grid of 24×21 sprites; 3 bytes/row × 21 rows, 64-byte stride.
+            for sy in 0..h {
+                for sx in 0..w {
+                    let base = (addr as u32).wrapping_add((sy * w + sx) * 64);
+                    for r in 0..21u32 {
+                        for bcol in 0..3u32 {
+                            let byte = read(((base + r * 3 + bcol) & 0xffff) as u16);
+                            for b in 0..8u32 {
+                                set(sx * 24 + bcol * 8 + b, sy * 21 + r, (byte >> (7 - b)) & 1 != 0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {
+            // hires: w bytes/row → w*8 px wide, h rows tall; linear.
+            for y in 0..h {
+                for bx in 0..w {
+                    let byte = read(((addr as u32 + y * w + bx) & 0xffff) as u16);
+                    for b in 0..8u32 {
+                        set(bx * 8 + b, y, (byte >> (7 - b)) & 1 != 0);
+                    }
+                }
+            }
+        }
+    }
+    let bytes = match mode {
+        "charset" => w * h * 8,
+        "sprite" => w * h * 64,
+        _ => w * h,
+    };
+    (width, height, rgba, bytes)
 }
 
 /// Encode an RGBA buffer to PNG bytes (8-bit RGBA, no interlace). The exact zlib
