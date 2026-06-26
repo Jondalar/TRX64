@@ -1030,6 +1030,21 @@ pub fn restore_runtime_checkpoint(
         crate::drive_snapshot::restore_drive_disk_image(&mut m.drive8, &disk_blob)?;
     }
 
+    // Re-anchor the drive's C64-clock catch-up reference to the restored anchor
+    // instant (= the restored C64 clk). `drive_c64_ref` is the monotonic C64 clock
+    // the drive was last advanced up to; the next push-flush catch-up advances the
+    // drive by `clk - drive_c64_ref`. It is a Machine-level field (NOT part of the
+    // drive blob — the blob carries the drive CPU's own `stop_clk`/`cycle_accum`),
+    // so a restore that left it at its STALE pre-restore value made the first
+    // post-restore catch-up feed the drive the wrong number of cycles — a
+    // non-deterministic drive replay (restore A + run N twice landed the drive 6502
+    // at a different PC each time, ±a few cycles from the fixed-point sync_accum
+    // phase). VICE/TS keep this reference inside the drive CPU (`cpu->last_clk` in
+    // the DRIVECPU CLOCK chunk) so it re-anchors implicitly; TRX64's split needs
+    // this explicit re-anchor. Set it to the restored C64 clk so the drive resumes
+    // exactly where it was captured. (Spec 761 §5.3 deterministic-replay.)
+    m.drive_c64_ref = m.c64_core.clk;
+
     // Cartridge restore (Spec 714.5 / formats-state-2): recreate the mapper from the
     // captured original `.crt` bytes, then overlay the mutable flash image — mirroring
     // c64re's restoreMediaCheckpoint(cp.media, cp.cartBytes, cp.cartFlash)

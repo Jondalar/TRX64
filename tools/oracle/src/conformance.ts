@@ -5660,6 +5660,292 @@ const CASES: ConfCase[] = [
       };
     },
   },
+
+  // ── P1: ws-brk-no-autobreak — BRK ($00) does NOT auto-break (Spec 764 §3/OQ1) ──
+  // broadcasts-1 proves the KIL/JAM auto-break (a jammed CPU → halt + debug/stopped
+  // reason="jam"). This case proves the COMPLEMENT and pins the runtimes' actual
+  // BRK policy: in BOTH the TS runtime and TRX64 there is NO `breakOnBrk` toggle —
+  // a `BRK` ($00) is a NORMAL software interrupt that runs its real KERNAL IRQ/BRK
+  // vector ($FFFE), so the machine KEEPS RUNNING and no `debug/stopped reason="brk"`
+  // is ever pushed. Only the *jammed* (KIL) state auto-breaks (runtime-controller.ts
+  // :832-853 checks `c64Cpu.jammed`, NOT BRK; reason enum has "jam", no "brk"; TRX64
+  // stream loop main.rs:2015 checks `is_jammed` only). A runtime that wrongly treated
+  // BRK as a stop (auto-paused / pushed reason="brk") would diverge.
+  //
+  // Signal: under --stream, load `[$00]` (BRK) at $1000 and run from there. After a
+  // settle window assert the machine is NOT paused (it ran the BRK vector and carried
+  // on) AND no debug/stopped with reason "brk" was pushed. BOTH runtimes: pausedOnBrk
+  // false, sawBrkStop false. (A jam DOES stop — that contrast is broadcasts-1.)
+  {
+    id: "ws-brk-no-autobreak",
+    severity: "P1",
+    title: "BRK ($00) is a normal software interrupt — no auto-break, no debug/stopped reason=brk (vs JAM which does)",
+    spawn: { stream: true },
+    async signal(c) {
+      const sid = await liveSession(c);
+      const sink = collectNotes(c);
+      // Load `[$00]` (BRK) at $1000 and run from there under the continuous --stream
+      // driver. bytes_b64 = base64([0x00,0x10, 0x00]) = 2-byte load addr $1000 + BRK.
+      const prgB64 = Buffer.from([0x00, 0x10, 0x00]).toString("base64");
+      await c.call("runtime/run_prg", { session_id: sid, bytes_b64: prgB64, run: 0x1000 });
+      // Give the driver several frames: the BRK dispatches to the KERNAL vector and the
+      // machine keeps free-running (a jam would have paused within a frame).
+      await sleep(4000);
+      const st = await state(c, sid);
+      sink.off();
+      // A stop carrying reason "brk" must NEVER appear (there is no such reason).
+      const brkStop = sink.notes.find(
+        (n) => n.method === "debug/stopped" && (n.params?.stop?.reason === "brk"),
+      );
+      // ALSO confirm the asymmetry holds: no jam-stop either (BRK is not a jam).
+      const jamStop = sink.notes.find(
+        (n) => n.method === "debug/stopped" && (n.params?.stop?.reason === "jam"),
+      );
+      return {
+        // BRK does NOT pause the machine — it ran the vector and kept going.
+        pausedOnBrk: st.runState === "paused",
+        // No "brk" stop reason exists / was pushed.
+        sawBrkStop: brkStop != null,
+        // …and BRK is not misclassified as a jam either.
+        sawJamStop: jamStop != null,
+        // The exact stop reason value (if any debug/stopped fired at all over the window).
+        lastStopReason:
+          sink.notes.filter((n) => n.method === "debug/stopped").pop()?.params?.stop?.reason ?? null,
+      };
+    },
+  },
+
+  // ── P1: ws-sync-jam-result — synchronous session/run over a JAM (Spec 764 §2.5) ─
+  // broadcasts-1 covers the ASYNC --stream auto-break path. This case covers the
+  // DISTINCT SYNCHRONOUS code path: a budgeted, paused-machine `session/run` that
+  // executes a KIL/JAM. The synchronous reply is NOT a `breakpoint{}` object — that
+  // early-return is reserved for an exec-breakpoint hit (ws-server.ts:914 `r.aborted
+  // === "breakpoint"`; main.rs:6376 `run.halted`). On a JAM the budget advance instead
+  // exits on its INSTRUCTION cap: a jammed CPU does not advance clk past the KIL, so
+  // `cycles-start >= cycleBudget` never trips and the loop runs out its instruction
+  // count, returning the plain `{c64Cycles}` shape with the CPU PC PINNED at the KIL
+  // address and the cycle delta SHORT of the budget (it did NOT spin the whole budget).
+  // The differential: TS is the authority for what a synchronous run over a JAM
+  // returns, and TRX64 must match field-for-field — NO breakpoint object, c64Cycles a
+  // number, the consumed delta is short of the budget (the jam short-circuits the
+  // budget, it is not burned), and the PC is frozen at the jam. (A sync path that
+  // returned a breakpoint{} on jam, or whose jammed core kept cycling clk to burn the
+  // whole budget, or that advanced the PC past the KIL, would diverge here even though
+  // broadcasts-1 stays green.) The exact consumed-delta is captured raw so the cross-
+  // runtime equality is transparent, not asserted to a value the gate guessed.
+  {
+    id: "ws-sync-jam-result",
+    severity: "P1",
+    title: "synchronous session/run over a KIL/JAM returns plain {c64Cycles} (no breakpoint), budget short-circuited, PC frozen at the jam",
+    async signal(c) {
+      const sid = await liveSession(c);
+      // Pause first — session/run is a MANUAL primitive, rejected while the autonomous
+      // loop owns the clock (ws-session-debug-2). No --stream spawn here, but make sure.
+      await c.call("debug/pause", { session_id: sid }).catch(() => undefined);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      // Inject a KIL ($02) at $1000 and point BOTH cores' PC at it.
+      await exec("wr ram 1000 02");
+      await exec("r pc=1000");
+      const stBefore = await state(c, sid);
+      const cycBefore = Number(stBefore.c64Cycles ?? stBefore.cycles ?? stBefore.cpu?.cycles ?? 0);
+      // A large budget — a non-jamming program would burn ~all of it; a jam does NOT
+      // (the jammed CPU stalls clk, so the budget short-circuits on the instruction cap).
+      const BUDGET = 100_000;
+      const reply = (await c.call("session/run", { session_id: sid, cycles: BUDGET })) as any;
+      const cycAfter = Number(reply?.c64Cycles ?? 0);
+      const delta = cycAfter - cycBefore;
+      // The CPU PC is frozen at the KIL address (the jam never advances past $1000).
+      const stAfter = await state(c, sid);
+      const pcAfter = Number(stAfter.cpu?.pc ?? stAfter.pc ?? -1);
+      return {
+        // The synchronous reply is the plain budget shape — NO breakpoint{} object.
+        hasBreakpointObject: reply?.breakpoint != null,
+        // It reports a real advanced clock (c64Cycles is a number).
+        c64CyclesIsNumber: typeof reply?.c64Cycles === "number",
+        // The jam SHORT-CIRCUITS the budget — the consumed delta is far below it (the
+        // jammed CPU stalls clk; the budget was NOT burned). Both runtimes agree.
+        budgetShortCircuited: delta < BUDGET,
+        // The PC is pinned at the jam address (frozen, not advanced through the budget).
+        pcFrozenAtJam: pcAfter === 0x1000,
+      };
+    },
+  },
+
+  // ── P1: ws-restore-floppy-state — drive state is restored too (Spec 761 §4/§5.1) ─
+  // A checkpoint/restore must move the C64 AND the 1541 drive to the SAME instant —
+  // not just the C64 core. The drive 6502 keeps its OWN clock/PC (it spins its idle
+  // wait-loop every cycle the machine advances), and the GCR rotation/head state is
+  // part of the snapshot (drive_snapshot.rs DRIVECPU + GCRIMAGE0 + rotation). The
+  // restore must roll the drive's `drivePc`/`halfTrack`/`drive_clk` back to the
+  // captured anchor's values — a restore that rolled back only the C64 and left the
+  // drive at its post-run state would diverge.
+  //
+  // Signal: mount a disk, capture anchor A and record the drive snapshot {drivePc,
+  // halfTrack} via session/drive_status; run forward a window (the drive CPU advances
+  // its own PC/clock); record the post-run drive state and assert it MOVED (so the
+  // restore has something to undo); restore A {then:"pause"} and re-read the drive
+  // state → it equals the captured A again. BOTH runtimes must report the drive
+  // rolled back to A. (No prior case touches the drive side of restore.)
+  {
+    id: "ws-restore-floppy-state",
+    severity: "P1",
+    title: "checkpoint/restore rolls the 1541 drive (drivePc + halfTrack) back to the captured anchor, not just the C64",
+    spawn: { seedFiles: [{ rel: "disk.d64", bytes: SCRAMBLE_D64 }] },
+    async signal(c, d) {
+      const sid = await liveSession(c);
+      // Mount a disk so a real drive is attached + spinning (the drive 6502 advances
+      // its idle loop whenever the machine runs).
+      await c.call("media/mount", { session_id: sid, path: `${d.projectDir}/disk.d64`, slot: 8 });
+      const driveState = async () => {
+        const r = (await c.call("session/drive_status", { session_id: sid })) as any;
+        return { drivePc: Number(r?.drivePc ?? -1), halfTrack: Number(r?.halfTrack ?? -1) };
+      };
+      // Settle the drive a touch so it is past cold reset, then capture anchor A.
+      await c.call("session/run", { session_id: sid, cycles: 200_000 }).catch(() => undefined);
+      const dA = await driveState();
+      const capA = (await c.call("checkpoint/capture", { session_id: sid })) as any;
+      const cpAId: string | null = capA?.ref?.id ?? capA?.id ?? null;
+      // Run forward — the drive 6502 advances its own PC/clock past A.
+      await c.call("session/run", { session_id: sid, cycles: 500_000 }).catch(() => undefined);
+      const dAfterRun = await driveState();
+      // Restore A {then:"pause"} — the drive must roll back to A's snapshot.
+      await c.call("checkpoint/restore", { session_id: sid, id: cpAId, then: "pause" });
+      const dAfterRestore = await driveState();
+      return {
+        // The drive PC at capture is a real drive-ROM address (1541 ROM $C000–$FFFF).
+        capturedDrivePcInRom: dA.drivePc >= 0xc000 && dA.drivePc <= 0xffff,
+        // The drive genuinely MOVED between capture and the post-run read (so the
+        // restore has something to undo — a no-op restore would falsely green).
+        driveMovedDuringRun: dAfterRun.drivePc !== dA.drivePc,
+        // THE RESTORE SIGNAL: after restoring A the drive PC is back at A's value…
+        drivePcRolledBack: dAfterRestore.drivePc === dA.drivePc,
+        // …and the head half-track is back at A's value too (the rotation/head state
+        // is part of the snapshot, not just the drive CPU).
+        halfTrackRolledBack: dAfterRestore.halfTrack === dA.halfTrack,
+      };
+    },
+  },
+
+  // ── P1: ws-restore-rerun-determinism — deterministic replay (Spec 761 §5.3) ─────
+  // Restore-and-rerun must be DETERMINISTIC: restoring an anchor with then:"keep" and
+  // running EXACTLY the same cycle budget twice re-reaches a byte-equal end point B
+  // (RAM byte + CPU registers + the drive PC). This is the foundation of the L7
+  // overlay-debug loop and the rewind/scrub UX — a non-deterministic replay (RNG
+  // seed, uninitialised state, a per-run clock skew) would make every restore land
+  // somewhere different. The signal captures anchor A, restores it TWICE and runs the
+  // SAME budget after each, then asserts the two end tuples {pc,a,x,y,sp,ramByte,
+  // drivePc} are identical — first within each runtime (intra-runtime determinism),
+  // and then the SHAPE/equality cross-runtime (TS≡TRX64: both are deterministic).
+  {
+    id: "ws-restore-rerun-determinism",
+    severity: "P1",
+    title: "restore A {then:keep} + run N → byte-equal end state, twice (deterministic replay incl. drive)",
+    spawn: { seedFiles: [{ rel: "disk.d64", bytes: SCRAMBLE_D64 }] },
+    async signal(c, d) {
+      const sid = await liveSession(c);
+      await c.call("media/mount", { session_id: sid, path: `${d.projectDir}/disk.d64`, slot: 8 });
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      // Read a deterministic end-state TUPLE: C64 regs + a known RAM byte + the drive PC.
+      const endTuple = async () => {
+        const st = await state(c, sid);
+        const ds = (await c.call("session/drive_status", { session_id: sid })) as any;
+        // a known RAM byte at $0314 (CINV lo) — a stable, machine-derived value.
+        const mem = await exec("m ram 0314 0314");
+        const byte = (mem.match(/[0-9a-f]{4}[ :]+([0-9a-f]{2})/i) ?? [])[1]?.toLowerCase() ?? null;
+        return {
+          pc: Number(st.cpu?.pc ?? st.pc ?? -1),
+          a: Number(st.cpu?.a ?? -1),
+          x: Number(st.cpu?.x ?? -1),
+          y: Number(st.cpu?.y ?? -1),
+          sp: Number(st.cpu?.sp ?? -1),
+          ramByte: byte,
+          drivePc: Number(ds?.drivePc ?? -1),
+        };
+      };
+      // Settle, then capture anchor A.
+      await c.call("debug/pause", { session_id: sid }).catch(() => undefined);
+      await c.call("session/run", { session_id: sid, cycles: 200_000 }).catch(() => undefined);
+      const capA = (await c.call("checkpoint/capture", { session_id: sid })) as any;
+      const cpAId: string | null = capA?.ref?.id ?? capA?.id ?? null;
+      const RUN_N = 300_000;
+      // Replay #1: restore A (keep), run exactly N, read B.
+      await c.call("checkpoint/restore", { session_id: sid, id: cpAId, then: "keep" });
+      await c.call("debug/pause", { session_id: sid }).catch(() => undefined);
+      await c.call("session/run", { session_id: sid, cycles: RUN_N });
+      const b1 = await endTuple();
+      // Replay #2: restore the SAME anchor A (keep), run exactly N again, read B again.
+      await c.call("checkpoint/restore", { session_id: sid, id: cpAId, then: "keep" });
+      await c.call("debug/pause", { session_id: sid }).catch(() => undefined);
+      await c.call("session/run", { session_id: sid, cycles: RUN_N });
+      const b2 = await endTuple();
+      return {
+        // Intra-runtime determinism: the two replays land on a byte-equal end state.
+        replayDeterministic: JSON.stringify(b1) === JSON.stringify(b2),
+        // The end tuple is well-formed (a real PC + RAM byte + drive PC) so the
+        // equality above is meaningful, not two matching error sentinels.
+        endStateWellFormed:
+          b1.pc >= 0 && b1.ramByte != null && b1.drivePc >= 0xc000 && b1.drivePc <= 0xffff,
+      };
+    },
+  },
+
+  // ── P2: ws-lockstep-not-an-input — single-path doctrine (Spec 723 §2.1) ─────────
+  // The runtime has exactly ONE execution path (event-catchup + microcoded CPU +
+  // literal VIC + VICE1541). There is NO `use_cycle_lockstep`/`scheduler`/`lockstep`
+  // toggle accepted as a session/create input — the legacy CycleLockstepScheduler /
+  // LockstepStrategy / bus-owner-table are deleted, and neither runtime reads such a
+  // field. The doctrine guarantee a differential gate can prove: passing such a field
+  // is treated IDENTICALLY by both runtimes — it is silently IGNORED (a no-op param,
+  // not an accept-vs-error divergence), and the machine still boots + advances on the
+  // single path. A runtime that re-introduced a lockstep input — accepting it,
+  // rejecting it, or switching paths on it — would diverge from the other.
+  //
+  // Signal: session/create with `use_cycle_lockstep:true` (+ `scheduler:"lockstep"`)
+  // does NOT throw on either runtime (the field is ignored), the returned session is
+  // usable, and a debug/run advances the clock on the one-and-only path. BOTH:
+  // createThrew false, machine boots/advances.
+  {
+    id: "ws-lockstep-not-an-input",
+    severity: "P2",
+    title: "session/create ignores use_cycle_lockstep/scheduler — single-path, no lockstep toggle (Spec 723)",
+    spawn: { stream: true },
+    async signal(c) {
+      // session/create with the (removed) lockstep inputs — both runtimes must IGNORE
+      // them (no accept-vs-reject divergence). On the shared-attach singleton this
+      // attaches to the existing machine; the extra fields are simply unread.
+      let createThrew = false;
+      let sid: string | null = null;
+      try {
+        const created = (await c.call("session/create", {
+          use_cycle_lockstep: true,
+          scheduler: "lockstep",
+          lockstep: true,
+        })) as any;
+        sid = created?.sessionId ?? created?.session_id ?? null;
+      } catch {
+        createThrew = true;
+      }
+      // Fall back to the live singleton if create returned no id (shared-attach).
+      if (!sid) sid = await liveSession(c);
+      // The single path still drives the machine: free-run advances the clock.
+      await c.call("debug/run", { session_id: sid });
+      const cyc0 = Number((await state(c, sid)).c64Cycles ?? 0);
+      const st = await waitRunningBooted(c, sid, cyc0 + 100_000, 60_000);
+      const cyc1 = Number(st.c64Cycles ?? 0);
+      return {
+        // The lockstep field is not a real input — create did not reject it…
+        createThrew,
+        // …and the one-and-only path booted + advanced the clock.
+        machineAdvanced: cyc1 > cyc0,
+      };
+    },
+  },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
