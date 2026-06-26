@@ -31,6 +31,7 @@ use trx64_trace::{FrameSink, TraceChannels, TracingObserver};
 
 mod observers;
 mod project_knowledge;
+mod snapshot_diff;
 mod streaming;
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
@@ -4972,6 +4973,54 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
         "breakpointAuditLog" => {
             let _st = state.lock().unwrap();
             Response::ok(id, json!([]))
+        }
+
+        // ── Disasm linkage (Spec 235) — resolvePc / resolvePcs ───────────────────
+        // agent-api.ts:128-133 → resolve-pc.ts. Maps a PC (or list of PCs) to the
+        // project disasm knowledge at that address (routine / label / segment /
+        // source) read from `<artifactId>_analysis.json` + `<artifactId>_annotations
+        // .json` (the SAME on-disk files the inspect/xref/sym bridge reads). The TS
+        // facade signature is resolvePc(artifactId, pc): runtime/call carries args as
+        // [artifactId, pc] (resolvePcs: [artifactId, pcs[]]). Returns the ResolvedPc
+        // JSON byte-for-byte (absent layers omitted, like TS `undefined`).
+        "resolvePc" => {
+            let artifact_id = args.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let pc = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let dir = project_knowledge::active_project_dir();
+            Response::ok(id, project_knowledge::resolve_pc(&dir, &artifact_id, pc))
+        }
+
+        "resolvePcs" => {
+            let artifact_id = args.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let pcs: Vec<u32> = args
+                .get(1)
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|p| p.as_u64().map(|n| n as u32)).collect())
+                .unwrap_or_default();
+            let dir = project_knowledge::active_project_dir();
+            Response::ok(id, json!(project_knowledge::resolve_pcs(&dir, &artifact_id, &pcs)))
+        }
+
+        // ── Snapshot diff (Spec 246) — diffSnapshots / formatDiff ─────────────────
+        // agent-api.ts:150-155 → snapshot-diff.ts. diffSnapshots(a, b) compares two
+        // c64re-own VSF byte buffers (the SAME framing `saveVsf` returns) → a
+        // structured SnapshotDiff (RAM ranges + per-chip register diffs + PLA + drive
+        // + IEC). formatDiff(diff) renders the text table. runtime/call carries the
+        // VSF buffers as JSON number arrays (the Uint8Array transport, like saveVsf).
+        "diffSnapshots" => {
+            let to_bytes = |v: Option<&Value>| -> Vec<u8> {
+                v.and_then(|x| x.as_array())
+                    .map(|a| a.iter().filter_map(|b| b.as_u64().map(|n| n as u8)).collect())
+                    .unwrap_or_default()
+            };
+            let a = to_bytes(args.first());
+            let b = to_bytes(args.get(1));
+            Response::ok(id, snapshot_diff::diff_snapshots(&a, &b))
+        }
+
+        "formatDiff" => {
+            let diff = args.first().cloned().unwrap_or(json!({}));
+            Response::ok(id, json!(snapshot_diff::format_diff(&diff)))
         }
 
         // ── Trace-backed AgentQueryApi methods (runtime/call) ────────────────────

@@ -465,6 +465,274 @@ fn parse_sym_line(line: &str) -> Option<(u16, String)> {
     None
 }
 
+// ── resolvePc / resolvePcs (Spec 235 — resolve-pc.ts) ─────────────────────────
+//
+// Faithful port of `src/runtime/headless/v2/resolve-pc.ts` `resolvePc(artifactId,
+// pc)` / `resolvePcs(artifactId, pcs)`. Maps a PC to its position in the project's
+// disassembly knowledge — the SAME on-disk files the inspect/xref/sym bridge above
+// reads (`<artifactId>_analysis.json` segments + `<artifactId>_annotations.json`
+// routines/labels/segments). Returns a `ResolvedPc`-shaped JSON value:
+//
+//   { artifactId, pc, routine?, label?, segment?, source? }
+//
+// Layer 1 RoutineAnnotation range match; Layer 2 nearest LabelAnnotation ≤ PC;
+// Layer 3 effective-segment classification; Layer 4 source line in `<id>_disasm.asm`.
+// Absent layers are OMITTED (resolve-pc.ts leaves the field `undefined`, which
+// JSON.stringify drops) — we replicate that omission so the JSON matches byte-for-byte.
+
+/// The active project dir = `--project <dir>` arg ?? `C64RE_PROJECT_DIR` env ?? cwd.
+/// 1:1 with resolve-pc.ts `getProjectDir()` (`process.env["C64RE_PROJECT_DIR"] ??
+/// process.cwd()`); the daemon's run.ts sets `C64RE_PROJECT_DIR` from `--project`,
+/// so the `--project` arg layer matches the TS daemon exactly.
+pub fn active_project_dir() -> String {
+    std::env::args()
+        .skip_while(|a| a != "--project")
+        .nth(1)
+        .filter(|p| !p.is_empty())
+        .or_else(|| std::env::var("C64RE_PROJECT_DIR").ok())
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default()
+        })
+}
+
+/// `parseHex(hex)` (resolve-pc.ts:91): strip a leading `$`, base-16.
+fn parse_hex_addr(hex: &str) -> Option<u32> {
+    u32::from_str_radix(hex.trim_start_matches('$'), 16).ok()
+}
+
+struct ResolveData {
+    /// Sorted by entry ascending; exit = next entry - 1, or None for the last.
+    routines_sorted: Vec<(u32, Option<u32>, String, Option<String>)>, // (entry, exit, name, description)
+    /// Sorted by address ascending.
+    labels_sorted: Vec<(u32, String)>, // (address, name)
+    /// Effective segments sorted by start ascending: (start, end, kind, confidence).
+    segments_sorted: Vec<(u32, u32, String, f64)>,
+    /// addr → 1-based line in `<id>_disasm.asm`, or None when absent.
+    disasm_lines: Option<BTreeMap<u32, usize>>,
+    disasm_file: Option<String>,
+}
+
+/// Load + index the per-artifact knowledge (resolve-pc.ts `loadArtifactData`).
+fn load_resolve_data(project_dir: &str, artifact_id: &str) -> ResolveData {
+    let dir = Path::new(project_dir);
+
+    // --- analysis JSON ---
+    let analysis_path = dir.join(format!("{artifact_id}_analysis.json"));
+    let analysis: Option<Value> = std::fs::read_to_string(&analysis_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+
+    // --- annotations JSON ---
+    let ann_path = dir.join(format!("{artifact_id}_annotations.json"));
+    let annotations: Option<Value> = std::fs::read_to_string(&ann_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+
+    // routines: sort by entry; exit = next.entry - 1 (resolve-pc.ts:146-158).
+    let mut routines_sorted: Vec<(u32, Option<u32>, String, Option<String>)> = Vec::new();
+    if let Some(rs) = annotations
+        .as_ref()
+        .and_then(|a| a.get("routines"))
+        .and_then(|r| r.as_array())
+    {
+        for rt in rs {
+            let (Some(addr), Some(name)) = (
+                rt.get("address").and_then(|v| v.as_str()).and_then(parse_hex_addr),
+                rt.get("name").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            let desc = rt.get("comment").and_then(|v| v.as_str()).map(String::from);
+            routines_sorted.push((addr, None, name.to_string(), desc));
+        }
+        routines_sorted.sort_by_key(|r| r.0);
+        for i in 0..routines_sorted.len() {
+            if let Some(next) = routines_sorted.get(i + 1).map(|n| n.0) {
+                routines_sorted[i].1 = Some(next.wrapping_sub(1));
+            }
+        }
+    }
+
+    // labels: sort by address (resolve-pc.ts:161-167).
+    let mut labels_sorted: Vec<(u32, String)> = Vec::new();
+    if let Some(ls) = annotations
+        .as_ref()
+        .and_then(|a| a.get("labels"))
+        .and_then(|l| l.as_array())
+    {
+        for lbl in ls {
+            let (Some(addr), Some(name)) = (
+                lbl.get("address").and_then(|v| v.as_str()).and_then(parse_hex_addr),
+                lbl.get("label").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            labels_sorted.push((addr, name.to_string()));
+        }
+        labels_sorted.sort_by_key(|l| l.0);
+    }
+
+    // segments: effective-segments overlay (resolve-pc.ts:174-188). The fixture path
+    // has no annotation segments → raw analysis segments; confidence = score.confidence
+    // ?? 0 for analysis-owned, 0.9 for annotation-owned (load_effective_segments below
+    // already merges the annotation overlay, but does not carry the per-segment score,
+    // so we read confidence directly off the analysis report here, 1:1 with resolve-pc).
+    let mut segments_sorted: Vec<(u32, u32, String, f64)> = Vec::new();
+    let overlay_present = annotations
+        .as_ref()
+        .and_then(|a| a.get("segments"))
+        .and_then(|s| s.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    if overlay_present {
+        // Annotation segment overlay is present: replicate buildEffectiveSegments via
+        // the shared loader, then assign 0.9 confidence to every emitted run (the TS
+        // `typeof s.confidence === "number" ? s.confidence : 0.9` — the overlay merge
+        // drops the score, so every effective run is 0.9). This matches resolve-pc.ts
+        // when annotation reclassifications exist.
+        for (start, end, kind, _label) in load_effective_segments(&analysis_path) {
+            segments_sorted.push((start as u32, end as u32, kind, 0.9));
+        }
+    } else if let Some(segs) = analysis
+        .as_ref()
+        .and_then(|a| a.get("segments"))
+        .and_then(|s| s.as_array())
+    {
+        for seg in segs {
+            let (Some(start), Some(end)) = (
+                seg.get("start").and_then(coerce_addr),
+                seg.get("end").and_then(coerce_addr),
+            ) else {
+                continue;
+            };
+            let kind = seg.get("kind").and_then(|k| k.as_str()).unwrap_or("unknown").to_string();
+            let confidence = seg
+                .get("score")
+                .and_then(|s| s.get("confidence"))
+                .and_then(|c| c.as_f64())
+                .unwrap_or(0.0);
+            segments_sorted.push((start as u32, end as u32, kind, confidence));
+        }
+    }
+    segments_sorted.sort_by_key(|s| s.0);
+
+    // disasm line index (resolve-pc.ts:98-113, 190-201): first `; $XXXX` per addr wins.
+    let disasm_path = dir.join(format!("{artifact_id}_disasm.asm"));
+    let (disasm_lines, disasm_file) = match std::fs::read_to_string(&disasm_path) {
+        Ok(text) => {
+            let mut idx: BTreeMap<u32, usize> = BTreeMap::new();
+            for (i, line) in text.split('\n').enumerate() {
+                if let Some(addr) = addr_comment(line) {
+                    idx.entry(addr).or_insert(i + 1); // 1-based, first occurrence wins
+                }
+            }
+            (Some(idx), Some(disasm_path.to_string_lossy().to_string()))
+        }
+        Err(_) => (None, None),
+    };
+
+    ResolveData {
+        routines_sorted,
+        labels_sorted,
+        segments_sorted,
+        disasm_lines,
+        disasm_file,
+    }
+}
+
+/// Extract the address from a `; $XXXX` comment (resolve-pc.ts ADDR_COMMENT_RE).
+fn addr_comment(line: &str) -> Option<u32> {
+    // /;\s*\$([0-9A-Fa-f]{4})/
+    let semi = line.find(';')?;
+    let rest = &line[semi + 1..];
+    let dollar = rest.find('$')?;
+    // Everything between `;` and `$` must be whitespace (the `\s*` in the regex).
+    if !rest[..dollar].chars().all(|c| c.is_whitespace()) {
+        return None;
+    }
+    let hex: String = rest[dollar + 1..].chars().take(4).collect();
+    if hex.len() == 4 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        u32::from_str_radix(&hex, 16).ok()
+    } else {
+        None
+    }
+}
+
+/// resolve-pc.ts `resolveOne`: produce the `ResolvedPc` JSON for one (artifact, pc).
+fn resolve_one(artifact_id: &str, pc: u32, data: &ResolveData) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert("artifactId".to_string(), json!(artifact_id));
+    out.insert("pc".to_string(), json!(pc));
+
+    // Layer 1: largest routine entry ≤ pc, included only if pc ≤ exit (or exit None).
+    if let Some((entry, exit, name, desc)) = data
+        .routines_sorted
+        .iter()
+        .rev()
+        .find(|(entry, _, _, _)| *entry <= pc)
+    {
+        if exit.map(|e| pc <= e).unwrap_or(true) {
+            let mut r = serde_json::Map::new();
+            r.insert("name".to_string(), json!(name));
+            // description is OMITTED when None (resolve-pc.ts assigns `undefined`).
+            if let Some(d) = desc {
+                r.insert("description".to_string(), json!(d));
+            }
+            r.insert("entry".to_string(), json!(entry));
+            // exit is OMITTED when None (TS `exit: undefined`).
+            if let Some(e) = exit {
+                r.insert("exit".to_string(), json!(e));
+            }
+            out.insert("routine".to_string(), Value::Object(r));
+        }
+    }
+
+    // Layer 2: nearest label ≤ pc.
+    if let Some((addr, name)) = data.labels_sorted.iter().rev().find(|(addr, _)| *addr <= pc) {
+        out.insert(
+            "label".to_string(),
+            json!({ "name": name, "isExact": *addr == pc }),
+        );
+    }
+
+    // Layer 3: first covering effective segment.
+    for (start, end, kind, confidence) in &data.segments_sorted {
+        if *start > pc {
+            break;
+        }
+        if pc <= *end {
+            out.insert(
+                "segment".to_string(),
+                json!({ "kind": kind, "confidence": confidence }),
+            );
+            break;
+        }
+    }
+
+    // Layer 4: source line in `<id>_disasm.asm`.
+    if let (Some(lines), Some(file)) = (&data.disasm_lines, &data.disasm_file) {
+        if let Some(line) = lines.get(&pc) {
+            out.insert("source".to_string(), json!({ "file": file, "line": line }));
+        }
+    }
+
+    Value::Object(out)
+}
+
+/// `resolvePc(artifactId, pc)` (resolve-pc.ts:300).
+pub fn resolve_pc(project_dir: &str, artifact_id: &str, pc: u32) -> Value {
+    let data = load_resolve_data(project_dir, artifact_id);
+    resolve_one(artifact_id, pc, &data)
+}
+
+/// `resolvePcs(artifactId, pcs)` (resolve-pc.ts:323) — loads once, resolves each.
+pub fn resolve_pcs(project_dir: &str, artifact_id: &str, pcs: &[u32]) -> Vec<Value> {
+    let data = load_resolve_data(project_dir, artifact_id);
+    pcs.iter().map(|pc| resolve_one(artifact_id, *pc, &data)).collect()
+}
+
 fn parse_hex_key(key: &str) -> Option<u16> {
     let k = key.trim_start_matches('$');
     if (1..=4).contains(&k.len()) && k.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -870,6 +1138,60 @@ mod tests {
         let sym = project_read_sym(&dir, "main").unwrap();
         assert!(sym.contains("sym main = $0810"), "sym: {sym}");
         assert!(project_read_sym(&dir, "nope").is_err());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn resolve_pc_from_fixture() {
+        // Mirrors the conformance misc-21 fixture: a labelled code segment + a data
+        // segment (with score.confidence) plus a routine + a label annotation. Asserts
+        // the ResolvedPc layers (routine/label/segment) + the OMISSION of absent fields
+        // (no `exit` on a single routine, bare object below everything).
+        let d = tmp();
+        let dir = d.to_string_lossy().to_string();
+        let analysis = json!({
+            "binaryName": "fixture",
+            "segments": [
+                { "kind": "code", "start": 0x0810, "end": 0x08ff, "score": { "confidence": 0.85 } },
+                { "kind": "data", "start": 0x0900, "end": 0x09ff, "score": { "confidence": 0.5 } }
+            ]
+        });
+        fs::write(d.join("fixture_analysis.json"), serde_json::to_string(&analysis).unwrap()).unwrap();
+        let annotations = json!({
+            "version": 1,
+            "binary": "fixture",
+            "segments": [],
+            "labels": [{ "address": "0850", "label": "inner" }],
+            "routines": [{ "address": "0810", "name": "main", "comment": "entry point" }]
+        });
+        fs::write(d.join("fixture_annotations.json"), serde_json::to_string(&annotations).unwrap()).unwrap();
+
+        // $0850: inside routine `main`, exactly at label `inner`, in the code segment.
+        let at_label = resolve_pc(&dir, "fixture", 0x0850);
+        assert_eq!(at_label["artifactId"], json!("fixture"));
+        assert_eq!(at_label["pc"], json!(0x0850));
+        assert_eq!(at_label["routine"]["name"], json!("main"));
+        assert_eq!(at_label["routine"]["description"], json!("entry point"));
+        assert_eq!(at_label["routine"]["entry"], json!(0x0810));
+        // single routine → exit is OMITTED (TS `undefined`).
+        assert!(at_label["routine"].get("exit").is_none(), "exit must be omitted: {at_label}");
+        assert_eq!(at_label["label"], json!({ "name": "inner", "isExact": true }));
+        assert_eq!(at_label["segment"], json!({ "kind": "code", "confidence": 0.85 }));
+
+        // $0900: nearest label still `inner` (not exact), in the data segment.
+        let in_data = resolve_pc(&dir, "fixture", 0x0900);
+        assert_eq!(in_data["label"], json!({ "name": "inner", "isExact": false }));
+        assert_eq!(in_data["segment"], json!({ "kind": "data", "confidence": 0.5 }));
+
+        // $0700: below everything — bare {artifactId, pc}, no other keys.
+        let below = resolve_pc(&dir, "fixture", 0x0700);
+        assert_eq!(below, json!({ "artifactId": "fixture", "pc": 0x0700 }));
+
+        // Batch resolves each (same shapes).
+        let batch = resolve_pcs(&dir, "fixture", &[0x0850, 0x0900, 0x0700]);
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch[0], at_label);
+        assert_eq!(batch[2], below);
         let _ = fs::remove_dir_all(&d);
     }
 }

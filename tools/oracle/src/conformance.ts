@@ -2231,6 +2231,138 @@ const CASES: ConfCase[] = [
       };
     },
   },
+
+  // ── P1: ws-trace-monitor-misc-21 — runtime/call resolvePc / resolvePcs ────────
+  // TS agent-api.ts:128-133 → resolve-pc.ts (Spec 235): resolvePc(artifactId, pc)
+  // maps a PC to the project disasm knowledge at that address — the routine /
+  // nearest-label / effective-segment / source line — read from the SAME on-disk
+  // files the inspect/xref/sym bridge (misc-15) uses: `<artifactId>_analysis.json`
+  // segments + `<artifactId>_annotations.json` routines/labels. Both daemons set
+  // C64RE_PROJECT_DIR=--project, so resolve-pc reads the seeded fixtures. TRX64
+  // (pre-fix) routed resolvePc/resolvePcs to the dispatch_api_call `other` -32601
+  // arm ("no faithful backing"). Fix: wire them to project_knowledge.rs (the
+  // inspect/sym read path), returning the ResolvedPc shape byte-for-byte (absent
+  // layers omitted, like TS `undefined`). Signal: seed a representative analysis +
+  // annotations fixture, then runtime/call resolvePc at three addresses + a
+  // resolvePcs batch, and compare the FULL ResolvedPc JSON TS-vs-TRX64. TS: real
+  // resolved knowledge; TRX64 (pre-fix): -32601 (caught as the `error` string).
+  {
+    id: "ws-trace-monitor-misc-21",
+    severity: "P1",
+    title: "runtime/call resolvePc/resolvePcs read the project knowledge (no longer -32601)",
+    spawn: {
+      seedFiles: [
+        {
+          // Analysis: a labelled `code` segment ($0810-$08FF, confidence 0.85) +
+          // a `data` segment ($0900-$09FF, confidence 0.5).
+          rel: "fixture_analysis.json",
+          bytes: Buffer.from(
+            JSON.stringify({
+              binaryName: "fixture",
+              segments: [
+                { kind: "code", start: 0x0810, end: 0x08ff, score: { confidence: 0.85 } },
+                { kind: "data", start: 0x0900, end: 0x09ff, score: { confidence: 0.5 } },
+              ],
+            }),
+          ),
+        },
+        {
+          // Annotations: one routine (`main` @ $0810) + one label (`inner` @ $0850).
+          rel: "fixture_annotations.json",
+          bytes: Buffer.from(
+            JSON.stringify({
+              version: 1,
+              binary: "fixture",
+              segments: [],
+              labels: [{ address: "0850", label: "inner" }],
+              routines: [{ address: "0810", name: "main", comment: "entry point" }],
+            }),
+          ),
+        },
+      ],
+    },
+    async signal(c) {
+      const sid = await liveSession(c);
+      // runtime/call carries the AgentQueryApi facade args as a positional array:
+      // resolvePc(artifactId, pc) → [artifactId, pc]. A -32601 (no backing) surfaces
+      // as a thrown RPC error → captured as { error } so the signal still compares.
+      const call = async (op: string, args: unknown[]) => {
+        try {
+          return await c.call("runtime/call", { session_id: sid, op, args });
+        } catch (e) {
+          return { error: e instanceof Error ? e.message : String(e) };
+        }
+      };
+      // $0850: inside routine `main`, exactly at label `inner`, in the `code` segment.
+      const atLabel = await call("resolvePc", ["fixture", 0x0850]);
+      // $0900: past the routine range (single routine, exit = undefined → still
+      // inside per resolve-pc), nearest label still `inner`, in the `data` segment.
+      const inData = await call("resolvePc", ["fixture", 0x0900]);
+      // $0700: below everything — no routine/label/segment (bare {artifactId, pc}).
+      const below = await call("resolvePc", ["fixture", 0x0700]);
+      // Batch of the same three addresses (resolvePcs loads once, resolves each).
+      const batch = await call("resolvePcs", ["fixture", [0x0850, 0x0900, 0x0700]]);
+      return { atLabel, inData, below, batch };
+    },
+  },
+
+  // ── P1: ws-trace-monitor-misc-22 — runtime/call diffSnapshots / formatDiff ────
+  // TS agent-api.ts:150-155 → snapshot-diff.ts (Spec 246): diffSnapshots(a, b)
+  // compares two VSF byte buffers → a structured SnapshotDiff (RAM changed-ranges +
+  // per-chip register diffs + PLA + drive + IEC); formatDiff renders the text table.
+  // TRX64 (pre-fix) routed diffSnapshots/formatDiff to the dispatch_api_call -32601
+  // `other` arm. Fix: a faithful snapshot_diff.rs port reading the c64re-own VSF
+  // framing (proven by snapshot_diff.rs unit tests on real VSF bytes), wired into
+  // runtime/call.
+  //
+  // BLOCKED — the TS AUTHORITY cannot report the comparison signal under THIS
+  // harness. `diffSnapshots(a, b)` takes two `Uint8Array`s; `runtime/call` carries
+  // its `args` as JSON (ws-server.ts:1717-1724 spreads the array verbatim with NO
+  // typed-array reconstruction), and `saveVsf` comes back as an index-keyed JSON
+  // OBJECT, not even an array. Probed against the live TS daemon:
+  //   • diffSnapshots([saveVsfObject, …])  → "bytes.indexOf is not a function"
+  //   • diffSnapshots([number[], number[]]) → "The list argument must be an instance
+  //     of SharedArrayBuffer, ArrayBuffer or ArrayBufferView" (readVsf does
+  //     `new TextDecoder().decode(bytes.slice(...))`, which rejects a plain array).
+  // So over `runtime/call` with JSON args the TS authority ALWAYS throws — there is
+  // no snapshot-handle/ref variant in createAgentQueryApi to pass instead. A faithful
+  // differential signal is therefore impossible: making TRX64 SUCCEED where TS throws
+  // would be fake-green, and TS's error is a JS TypeError (not a stable domain string)
+  // so an "both error identically" match cannot be asserted either. The TRX64 backing
+  // is correct for an in-process / binary-transport caller and is gated by the
+  // snapshot_diff.rs unit tests instead. Re-arms automatically if a binary
+  // snapshot transport (e.g. base64 args) is ever added to runtime/call.
+  {
+    id: "ws-trace-monitor-misc-22",
+    severity: "P1",
+    title: "runtime/call diffSnapshots/formatDiff diff two VSF snapshots (TS authority cannot transport Uint8Array over JSON)",
+    blocked:
+      "TS diffSnapshots(a,b) needs in-process Uint8Array args; runtime/call carries JSON only " +
+      "(saveVsf → index-object, readVsf rejects a plain array) so the TS authority always throws. " +
+      "No snapshot-handle variant exists. TRX64 backing proven by snapshot_diff.rs unit tests.",
+    async signal(c) {
+      const sid = await liveSession(c);
+      const call = async (op: string, args: unknown[]) => {
+        try {
+          return await c.call("runtime/call", { session_id: sid, op, args });
+        } catch (e) {
+          return { error: e instanceof Error ? e.message : String(e) };
+        }
+      };
+      const snapA = (await call("saveVsf", [])) as unknown;
+      const snapB = (await call("saveVsf", [])) as unknown;
+      const diff = await call("diffSnapshots", [snapA, snapB]);
+      const formatted = await call("formatDiff", [diff]);
+      const d = diff as any;
+      const text = typeof formatted === "string" ? formatted : "";
+      return {
+        diffSucceeded: d != null && d.error === undefined,
+        formatSucceeded: typeof formatted === "string",
+        ramTotalChanged: d?.ram?.totalChanged ?? null,
+        formatLen: text.length,
+      };
+    },
+  },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
