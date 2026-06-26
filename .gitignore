@@ -14,6 +14,9 @@ tools/oracle/corpus/**/*.golden.json
 # Copyrighted Commodore ROM / commercial-game snapshots — local-only test fixtures, never tracked
 crates/trx64-core/tests/fixtures/vsf/*.vsf
 
-# Local working docs — agent instructions + working checklist, kept local, not published
+# Local working docs — agent instructions, design specs, build-loop state.
+# Kept LOCAL (used by the build loop + the design record), not published on GitHub.
 /CLAUDE.md
 /CHECKLIST.md
+/docs/
+/loop/
