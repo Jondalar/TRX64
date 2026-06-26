@@ -452,6 +452,27 @@ fn project_dir() -> PathBuf {
         .unwrap_or_else(|_| std::env::temp_dir().join("trx64"))
 }
 
+/// The active project dir = `--project <dir>` arg ?? `C64RE_PROJECT_DIR` env ?? cwd
+/// (1:1 with the TS daemon's run.ts, which sets `process.env.C64RE_PROJECT_DIR` from
+/// `--project` before scenario-registry.ts reads it). Used by the FILE-BACKED
+/// scenario registry (scenario-registry.ts: project `scenarios/` dir). Mirrors the
+/// `fs_project_dir` resolution in run_monitor.
+fn resolve_project_dir() -> Option<PathBuf> {
+    std::env::args()
+        .skip_while(|a| a != "--project")
+        .nth(1)
+        .filter(|p| !p.is_empty())
+        .or_else(|| std::env::var("C64RE_PROJECT_DIR").ok())
+        .map(PathBuf::from)
+}
+
+/// The project-local `scenarios/` directory (file-backed registry store), or None
+/// when no project dir is resolvable. 1:1 with scenario-registry.ts
+/// `projectScenariosDir()` (`<projectDir>/scenarios`).
+fn scenarios_dir() -> Option<PathBuf> {
+    resolve_project_dir().map(|p| p.join("scenarios"))
+}
+
 // ── Memory-access tracker (= TS debug/memory-access-map.ts MemoryAccessTracker) ──
 
 /// Per-page classification, mirroring the TS `PageClass` union.
@@ -4196,12 +4217,41 @@ fn disasm_one(addr: u16, read: impl Fn(u16) -> u8) -> Value {
 
 // ── api/call dispatch ─────────────────────────────────────────────────────────
 
-fn dispatch_api_call(id: Value, params: &Value, state: &SharedState) -> Response {
+/// The narrow MCP per-verb bridge allowlist — 1:1 with the TS
+/// `WsServer.API_CALL_ALLOWLIST` (ws-server.ts:179-185). Only these methods are
+/// reachable over `api/call`. `runtime/call` (the full AgentQueryApi facade) is
+/// NOT gated by this — it reaches every method `dispatch_api_call` can back.
+const API_CALL_ALLOWLIST: &[&str] = &[
+    "monitorRegisters",
+    "monitorMemory",
+    "monitorDisasm",
+    "stepInto",
+    "stepOver",
+    "addPcBreakpoint",
+    "listBreakpoints",
+    "removeBreakpoint",
+    "until",
+    "status",
+];
+
+/// Shared dispatch for `api/call` (narrow, allowlist-gated when `full=false`) and
+/// `runtime/call` (the full AgentQueryApi facade when `full=true`). TS keeps these
+/// as two SEPARATE surfaces: `api/call` is the narrow MCP per-verb bridge gated by
+/// API_CALL_ALLOWLIST (ws-server.ts:655), while `runtime/call` runs the WHOLE
+/// createAgentQueryApi with no allowlist (ws-server.ts:1717). Method names + return
+/// shapes are identical between the two; only the gate differs.
+fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool) -> Response {
     let method = match params.get("method").and_then(|v| v.as_str()) {
         Some(m) => m.to_string(),
         None => return Response::err(id, -32602, "api/call: missing method"),
     };
     let args = params.get("args").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+
+    // The narrow `api/call` route is allowlist-gated (TS ws-server.ts:656). The full
+    // `runtime/call` route is not — it reaches every backed AgentQueryApi method.
+    if !full && !API_CALL_ALLOWLIST.contains(&method.as_str()) {
+        return Response::err(id, -32601, format!("api/call: method not allowed: {method}"));
+    }
 
     match method.as_str() {
         "monitorRegisters" => {
@@ -4428,6 +4478,197 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState) -> Response
                 "hasBookmarkBackend": false,
                 "hasScenarioRegistry": false
             }))
+        }
+
+        // ── Full AgentQueryApi methods (runtime/call only — NOT in the narrow ──
+        // api/call allowlist). 1:1 method names with agent-api.ts; each maps to an
+        // existing TRX64 capability. Methods with no faithful TRX64 backing stay in
+        // the `other` -32601 arm below (see the misc-19 report for the full list).
+
+        // goto(addr): void — set the C64 PC. agent-api.ts:235 → MonitorAPI.goto.
+        "goto" => {
+            let addr = args.first().and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+            let mut st = state.lock().unwrap();
+            st.session.machine.cpu6510.reg_pc = addr;
+            st.session.machine.c64_core.reg_pc = addr;
+            st.session.machine.sync_after_monitor();
+            // TS goto() returns void → JSON-RPC omits result.
+            Response::void(id)
+        }
+
+        // stepOut(opts?): StepOutResult — run until the current subroutine returns
+        // (SP climbs back to entry+2 = RTS/RTI). agent-api.ts:240 → MonitorAPI.stepOut
+        // (monitor.ts:312). Same {halted, cyclesElapsed, instructionsElapsed, finalPc}
+        // shape; instructionsElapsed == cyclesElapsed (TS _instrCount == cpu.cycles).
+        "stepOut" => {
+            let budget: u64 = args
+                .first()
+                .and_then(|o| o.get("budget"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1_000_000);
+            let mut st = state.lock().unwrap();
+            let start_clk = st.session.machine.clk;
+            let entry_sp = st.session.machine.cpu6510.reg_sp;
+            let mut halted = false;
+            let mut steps: u64 = 0;
+            while steps < budget {
+                step_one_instruction(&mut st.session);
+                steps += 1;
+                // Stack returns: SP back to (or above) entry+2 means RTS/RTI fired.
+                if st.session.machine.cpu6510.reg_sp >= entry_sp.wrapping_add(2) {
+                    halted = true;
+                    break;
+                }
+            }
+            let cycles_elapsed = st.session.machine.clk.wrapping_sub(start_clk);
+            let final_pc = st.session.machine.cpu6510.reg_pc;
+            Response::ok(id, json!({
+                "halted": halted,
+                "cyclesElapsed": cycles_elapsed,
+                "instructionsElapsed": cycles_elapsed,
+                "finalPc": final_pc as u64
+            }))
+        }
+
+        // monitorFind(start,end,pattern): FindResult[] — scan C64 memory for a byte
+        // pattern. agent-api.ts:246 → MonitorAPI.find. Returns the match addresses.
+        "monitorFind" => {
+            let start_addr = args.first().and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+            let end_addr = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0xffff) as u16;
+            let pattern: Vec<u8> = args
+                .get(2)
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|b| b.as_u64().map(|n| n as u8)).collect())
+                .unwrap_or_default();
+            let st = state.lock().unwrap();
+            let mut hits: Vec<Value> = Vec::new();
+            if !pattern.is_empty() && end_addr >= start_addr {
+                let plen = pattern.len();
+                let mut a = start_addr as u32;
+                let last = end_addr as u32;
+                while a + (plen as u32) <= last + 1 {
+                    let mut matched = true;
+                    for (i, p) in pattern.iter().enumerate() {
+                        if st.session.machine.read_full((a as u16).wrapping_add(i as u16)) != *p {
+                            matched = false;
+                            break;
+                        }
+                    }
+                    if matched {
+                        hits.push(json!({ "addr": a as u64 }));
+                    }
+                    a += 1;
+                }
+            }
+            Response::ok(id, json!(hits))
+        }
+
+        // runScenario(scenario): ReplayResult — deterministic replay. agent-api.ts:145
+        // → scenario.ts runScenario. Reuses the same run_scenario the
+        // runtime/scenario_run handler drives.
+        "runScenario" => {
+            let scenario = match args.first() {
+                Some(s) if s.is_object() => s.clone(),
+                _ => return Response::err(id, -32602, "runScenario: scenario object required"),
+            };
+            let mut st = state.lock().unwrap();
+            match run_scenario(&mut st, &scenario) {
+                Ok(result) => Response::ok(id, result),
+                Err(e) => Response::err(id, -32001, format!("runScenario: {e}")),
+            }
+        }
+
+        // saveVsf(): Uint8Array — full session state as c64re VSF bytes. agent-api.ts
+        // :291 → vsf.rs save_vsf. Returned as a byte array (the TS runtime/call path
+        // returns the raw Uint8Array; JSON-RPC carries it as a number array).
+        "saveVsf" => {
+            let mut st = state.lock().unwrap();
+            let bytes = trx64_core::vsf::save_vsf(&mut st.session.machine);
+            let arr: Vec<u64> = bytes.into_iter().map(|b| b as u64).collect();
+            Response::ok(id, json!(arr))
+        }
+
+        // ── Breakpoint family (beyond the narrow addPc/list/remove) ──────────────
+        // addBreakpoint(spec): string — agent-api.ts:178. Accepts a BreakpointSpec
+        // {id, predicate:{kind:"pc",pc}, action, enabled}. Stored on the same
+        // api_entries surface backing listBreakpoints/removeBreakpoint.
+        "addBreakpoint" => {
+            let spec = match args.first() {
+                Some(s) if s.is_object() => s.clone(),
+                _ => return Response::err(id, -32602, "addBreakpoint: spec object required"),
+            };
+            let bp_id = spec.get("id").and_then(|v| v.as_str()).unwrap_or("bp0").to_string();
+            let pc = spec
+                .get("predicate")
+                .and_then(|p| p.get("pc"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u16;
+            let action = spec.get("action").and_then(|v| v.as_str()).unwrap_or("halt").to_string();
+            let enabled = spec.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+            let hit_limit = spec.get("hitLimit").and_then(|v| v.as_u64()).map(|n| n as u32);
+            let ignore_count = spec.get("ignoreCount").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let mut st = state.lock().unwrap();
+            st.breakpoints.api_entries.retain(|e| e.id != bp_id);
+            st.breakpoints.api_entries.push(ApiBpEntry {
+                id: bp_id.clone(),
+                pc,
+                action,
+                enabled,
+                hit_limit,
+                ignore_count,
+                hit_count: 0,
+            });
+            // TS addBreakpoint returns spec.id.
+            Response::ok(id, json!(bp_id))
+        }
+
+        // addTracepoint(id,pc): string — agent-api.ts:186. A tracepoint is a
+        // non-halting (action="trace") pc breakpoint on the same surface.
+        "addTracepoint" => {
+            let bp_id = args.first().and_then(|v| v.as_str()).unwrap_or("tp0").to_string();
+            let pc = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+            let mut st = state.lock().unwrap();
+            st.breakpoints.api_entries.retain(|e| e.id != bp_id);
+            st.breakpoints.api_entries.push(ApiBpEntry {
+                id: bp_id.clone(),
+                pc,
+                action: "trace".to_string(),
+                enabled: true,
+                hit_limit: None,
+                ignore_count: 0,
+                hit_count: 0,
+            });
+            Response::ok(id, json!(bp_id))
+        }
+
+        // enableBreakpoint(id,enabled): void — agent-api.ts:196.
+        "enableBreakpoint" => {
+            let bp_id = args.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let enabled = args.get(1).and_then(|v| v.as_bool()).unwrap_or(true);
+            let mut st = state.lock().unwrap();
+            if let Some(e) = st.breakpoints.api_entries.iter_mut().find(|e| e.id == bp_id) {
+                e.enabled = enabled;
+            }
+            Response::void(id)
+        }
+
+        // setBreakpointIgnoreCount(id,count): void — agent-api.ts:200 (VICE `ignore`).
+        "setBreakpointIgnoreCount" => {
+            let bp_id = args.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let count = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let mut st = state.lock().unwrap();
+            if let Some(e) = st.breakpoints.api_entries.iter_mut().find(|e| e.id == bp_id) {
+                e.ignore_count = count;
+            }
+            Response::void(id)
+        }
+
+        // breakpointAuditLog(): {id,reason,cycle}[] — agent-api.ts:203. TRX64 keeps
+        // no per-hit audit ring on this surface yet; return an empty log (a real,
+        // non-error reply — the method IS handled), matching the TS shape.
+        "breakpointAuditLog" => {
+            let _st = state.lock().unwrap();
+            Response::ok(id, json!([]))
         }
 
         other => {
@@ -5316,7 +5557,8 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         // ── api/call ─────────────────────────────────────────────────────────
 
         "api/call" => {
-            dispatch_api_call(id, &req.params, state)
+            // Narrow MCP per-verb bridge — allowlist-gated (full=false).
+            dispatch_api_call(id, &req.params, state, false)
         }
 
         // ── runtime/* ────────────────────────────────────────────────────────
@@ -8042,28 +8284,60 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         }
 
         // ── Spec 231/268 — deterministic scenario replay + registry ──────────
-        // 1:1 with the c64re ws-server.ts runtime/scenario_* handlers. The c64re
-        // registry is file-backed (samples/ + project dir); TRX64 keeps an in-
-        // process per-session registry (additive — never writes into the c64re
-        // repo). `scenario_run` replays a scenario deterministically: restore the
-        // start snapshot, feed the recorded inputs at their cycles (the scenario
-        // player), run cycleBudget cycles, then hash the end RAM. A re-run on the
-        // same build hashes identically — the determinism contract (Spec 231).
+        // 1:1 with the c64re ws-server.ts runtime/scenario_* handlers. The registry
+        // is FILE-BACKED (scenario-registry.ts): scenario_save persists to the
+        // project `scenarios/` dir; scenario_list re-scans that dir on EVERY call so
+        // a scenario written by ANY daemon on the same project dir is surfaced (a
+        // fresh daemon picks them up). `scenario_run` replays deterministically:
+        // restore the start snapshot, feed the recorded inputs at their cycles (the
+        // scenario player), run cycleBudget cycles, then hash the end RAM. A re-run
+        // on the same build hashes identically — the determinism contract (Spec 231).
 
         // runtime/scenario_list — registry summaries.
-        // c64re: listScenarios() → ScenarioSummary[]. ws-server.ts:1922-1925.
+        // c64re: listScenarios() → ScenarioSummary[] (scenario-registry.ts:91-100):
+        // scan the project (+ samples) dir on EACH call; each summary carries a
+        // `source` field. ws-server.ts:1922-1925.
         "runtime/scenario_list" => {
             let st = state.lock().unwrap();
-            let mut list: Vec<Value> = st
-                .scenarios
-                .values()
-                .map(scenario_summary)
-                .collect();
-            // Stable order by id for deterministic listings.
-            list.sort_by(|a, b| {
-                a.get("id").and_then(|v| v.as_str()).unwrap_or("")
-                    .cmp(b.get("id").and_then(|v| v.as_str()).unwrap_or(""))
-            });
+            // Merge by id: disk re-scan ("project") first, then the in-memory copies
+            // ("memory") — same id keeps the disk view (file is the authority). This
+            // is the file-backed re-scan: a scenario only on disk (= a fresh/other
+            // daemon's save) is listed even when this process never saw it via RPC.
+            let mut by_id: std::collections::BTreeMap<String, Value> =
+                std::collections::BTreeMap::new();
+            // In-memory copies first (source = "memory" when no on-disk peer).
+            for s in st.scenarios.values() {
+                let sid = s.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                by_id.insert(sid, scenario_summary_src(s, "memory"));
+            }
+            // Disk re-scan overrides (source = "project"), 1:1 with scanDir.
+            if let Some(scen_dir) = scenarios_dir() {
+                if let Ok(entries) = fs::read_dir(&scen_dir) {
+                    for ent in entries.flatten() {
+                        let path = ent.path();
+                        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                            continue;
+                        }
+                        let raw = match fs::read_to_string(&path) {
+                            Ok(r) => r,
+                            Err(_) => continue,
+                        };
+                        let obj: Value = match serde_json::from_str(&raw) {
+                            Ok(o) => o,
+                            Err(_) => continue,
+                        };
+                        // readScenarioFile rejects entries missing id/diskPath.
+                        let has_id = obj.get("id").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false);
+                        let has_disk = obj.get("diskPath").and_then(|v| v.as_str()).is_some();
+                        if !has_id || !has_disk {
+                            continue;
+                        }
+                        let sid = obj.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        by_id.insert(sid, scenario_summary_src(&obj, "project"));
+                    }
+                }
+            }
+            let list: Vec<Value> = by_id.into_values().collect();
             Response::ok(id, json!(list))
         }
 
@@ -8082,16 +8356,16 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             let mut saved = scenario.clone();
             saved["savedAt"] = json!(now_iso8601());
 
-            // Determine target directory: C64RE_PROJECT_DIR/scenarios/ if set, else
-            // we'd use SAMPLES_DIR, but TRX64 doesn't bundle samples — just in-memory.
-            // If no project dir, store in-memory only.
+            // File-backed registry (scenario-registry.ts saveScenario): persist the
+            // scenario JSON to the project `scenarios/` dir, resolved from the
+            // `--project` arg ?? C64RE_PROJECT_DIR (= the same dir the TS daemon
+            // scans). A fresh daemon / scenario_list re-scan then surfaces it.
             let mut file_path_opt = None;
-            if let Ok(project_dir) = env::var("C64RE_PROJECT_DIR") {
-                let scenarios_dir = PathBuf::from(&project_dir).join("scenarios");
-                if let Err(e) = fs::create_dir_all(&scenarios_dir) {
+            if let Some(scen_dir) = scenarios_dir() {
+                if let Err(e) = fs::create_dir_all(&scen_dir) {
                     eprintln!("Failed to create scenarios dir: {}", e);
                 } else {
-                    let file_path = scenarios_dir.join(format!("{}.json", sid));
+                    let file_path = scen_dir.join(format!("{}.json", sid));
                     match fs::write(
                         &file_path,
                         serde_json::to_string_pretty(&saved).unwrap_or_default()
@@ -8102,6 +8376,9 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 }
             }
 
+            // Keep an in-memory copy too (fast path / no-project-dir fallback) — the
+            // listing re-scans disk and merges, so the in-memory copy never shadows a
+            // fresher on-disk one.
             let mut st = state.lock().unwrap();
             st.scenarios.insert(sid.clone(), saved);
 
@@ -8122,17 +8399,18 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 None => return Response::err(id, -32602, "id required"),
             };
             let mut st = state.lock().unwrap();
-            let deleted = st.scenarios.remove(&sid).is_some();
+            let mem_removed = st.scenarios.remove(&sid).is_some();
 
-            // Also try to delete the file from the project dir if it exists.
-            if let Ok(project_dir) = env::var("C64RE_PROJECT_DIR") {
-                let file_path = PathBuf::from(&project_dir)
-                    .join("scenarios")
-                    .join(format!("{}.json", sid));
-                let _ = fs::remove_file(&file_path);
+            // File-backed delete (scenario-registry.ts deleteScenario): drop the file
+            // from the project `scenarios/` dir (same --project-aware resolution as
+            // save/list). `deleted` is true if the file OR the in-memory copy existed.
+            let mut file_removed = false;
+            if let Some(scen_dir) = scenarios_dir() {
+                let file_path = scen_dir.join(format!("{}.json", sid));
+                file_removed = fs::remove_file(&file_path).is_ok();
             }
 
-            Response::ok(id, json!({ "deleted": deleted }))
+            Response::ok(id, json!({ "deleted": mem_removed || file_removed }))
         }
 
         // runtime/scenario_load — the full stored scenario. c64re: loadScenario()
@@ -8191,8 +8469,10 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             };
             let args = req.params.get("args").cloned().unwrap_or(json!([]));
             // Build synthetic params matching what dispatch_api_call expects.
+            // runtime/call = the FULL AgentQueryApi facade — NOT allowlist-gated
+            // (full=true), 1:1 with TS ws-server.ts:1717 createAgentQueryApi.
             let synthetic = json!({ "method": op, "args": args });
-            dispatch_api_call(id, &synthetic, state)
+            dispatch_api_call(id, &synthetic, state, true)
         }
 
         other => {
@@ -8409,8 +8689,10 @@ fn now_iso8601() -> String {
 }
 
 /// scenario-registry.ts:62-73 — `summarise`: the light listing view of a stored
-/// scenario `{ id, diskPath, mode, cycleBudget, inputCount, savedAt }`.
-fn scenario_summary(s: &Value) -> Value {
+/// scenario `{ id, diskPath, mode, cycleBudget, inputCount, savedAt, source }`. The
+/// `source` is "project" (file-backed) or "memory" (in-process fallback when no
+/// project dir is resolvable); TS uses "project" | "samples".
+fn scenario_summary_src(s: &Value, source: &str) -> Value {
     json!({
         "id": s.get("id").and_then(|v| v.as_str()).unwrap_or(""),
         "diskPath": s.get("diskPath").and_then(|v| v.as_str()).unwrap_or(""),
@@ -8418,6 +8700,7 @@ fn scenario_summary(s: &Value) -> Value {
         "cycleBudget": s.get("cycleBudget").and_then(|v| v.as_u64()).unwrap_or(0),
         "inputCount": s.get("inputs").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0) as u64,
         "savedAt": s.get("savedAt").and_then(|v| v.as_str()).unwrap_or(""),
+        "source": source,
     })
 }
 

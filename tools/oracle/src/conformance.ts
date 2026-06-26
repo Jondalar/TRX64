@@ -22,7 +22,8 @@
 // Exit 0 = every selected case GREEN (TRX64 ≡ TS). Exit 1 = at least one RED.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
 import { spawnDaemon, type Daemon, type SpawnOpts } from "./daemon.js";
 import { connect, type RpcClient } from "./ws-client.js";
 import { diffResponses, formatDivergence } from "./diff.js";
@@ -1882,6 +1883,139 @@ const CASES: ConfCase[] = [
         xrefReturnsRefs: /0820/i.test(xrefOut) && /in:1/i.test(xrefOut),
         // Semantic: sym reverse-resolves the labelled segment.
         symResolvesName: /main/i.test(symOut) && /0810/i.test(symOut),
+      };
+    },
+  },
+
+  // ── P1: ws-trace-monitor-misc-19 — runtime/call exposes the FULL AgentQueryApi ──
+  // TS keeps two SEPARATE dispatch tables: `api/call` is the narrow MCP per-verb
+  // bridge gated by API_CALL_ALLOWLIST (monitorRegisters/memory/disasm, stepInto/
+  // stepOver, addPcBreakpoint/listBreakpoints/removeBreakpoint, until, status —
+  // ws-server.ts:179-185 + 655), while `runtime/call` runs the WHOLE
+  // createAgentQueryApi (ws-server.ts:1717-1724) — saveVsf, goto, stepOut,
+  // monitorFind, runScenario, the breakpoint family, … — with NO allowlist. TRX64
+  // (pre-fix) collapsed BOTH onto the narrow ~10-method dispatch_api_call, so any
+  // full-API-only method went -32601 over BOTH routes. Fix: route runtime/call to
+  // the FULL set of AgentQueryApi methods TRX64 can back; api/call stays narrow.
+  // Signal: call a representative set of full-API-only methods over `runtime/call`
+  // and report {handled} per method (handled = the reply is NOT a method-not-found
+  // -32601). ALSO assert api/call still REJECTS a full-only method (narrow gate
+  // intact). TS: every full-API method handled:true, api/call rejects; TRX64
+  // (pre-fix): every full-API method handled:false (-32601). (Audit P1 misc-19.)
+  {
+    id: "ws-trace-monitor-misc-19",
+    severity: "P1",
+    title: "runtime/call exposes the full AgentQueryApi; api/call stays narrow",
+    async signal(c) {
+      const sid = await liveSession(c);
+      // `handled` = the method is recognised by the dispatch (NOT -32601). A method
+      // that exists but errors on bad args / missing config is STILL handled — only
+      // a method-not-found counts as unhandled. This is the misc-19 divergence
+      // signal (the full table vs the narrow table), independent of return shape.
+      const notFound = (msg: string) =>
+        /method not found|unknown (runtime op|method)|not allowed|-32601/i.test(msg);
+      const handled = async (route: "runtime/call" | "api/call", op: string, args: unknown[]) => {
+        try {
+          if (route === "runtime/call") {
+            await c.call("runtime/call", { session_id: sid, op, args });
+          } else {
+            await c.call("api/call", { session_id: sid, method: op, args });
+          }
+          return true; // resolved → handled
+        } catch (e) {
+          return !notFound(e instanceof Error ? e.message : String(e));
+        }
+      };
+      // Representative full-AgentQueryApi methods that are NOT in the narrow
+      // API_CALL_ALLOWLIST. All must be handled via runtime/call.
+      const saveVsf = await handled("runtime/call", "saveVsf", []);
+      const gotoH = await handled("runtime/call", "goto", [0xe5cd]);
+      const stepOut = await handled("runtime/call", "stepOut", [{ budget: 1000 }]);
+      const monitorFind = await handled("runtime/call", "monitorFind", [0x0000, 0x00ff, [0x00]]);
+      const runScenario = await handled("runtime/call", "runScenario", [
+        { id: "misc19-inline", diskPath: "none", mode: "true-drive", cycleBudget: 1000, inputs: [] },
+      ]);
+      const addBreakpoint = await handled("runtime/call", "addBreakpoint", [
+        { id: "misc19-bp", predicate: { kind: "pc", pc: 0xe5cd }, action: "halt", enabled: true },
+      ]);
+      const addTracepoint = await handled("runtime/call", "addTracepoint", ["misc19-tp", 0xe5cd]);
+      const breakpointAuditLog = await handled("runtime/call", "breakpointAuditLog", []);
+      // The narrow gate stays intact: a full-only method is REJECTED via api/call.
+      const apiCallRejectsFullOnly = !(await handled("api/call", "saveVsf", []));
+      return {
+        saveVsf,
+        gotoH,
+        stepOut,
+        monitorFind,
+        runScenario,
+        addBreakpoint,
+        addTracepoint,
+        breakpointAuditLog,
+        apiCallRejectsFullOnly,
+      };
+    },
+  },
+
+  // ── P1: ws-trace-monitor-misc-20 — the scenario registry is FILE-BACKED ──────
+  // TS scenario-registry.ts re-scans the samples + project `scenarios/` dirs on
+  // EVERY listScenarios() call (scanDir reads every *.json), and each summary
+  // carries a `source` field ("samples" | "project"). saveScenario() persists the
+  // scenario JSON to the project dir. So a scenario written to disk — by THIS
+  // daemon or any other on the same project dir — appears in the next list. TRX64
+  // (pre-fix) kept an in-memory HashMap that never re-read disk and had no
+  // `source` field, so a scenario only on disk (i.e. as a FRESH daemon would see
+  // it) was invisible. Fix: file-back the registry — scenario_save persists to the
+  // project `scenarios/` dir, scenario_list scans that dir (+ samples) on each
+  // call and includes a `source` field, 1:1 with scenario-registry.ts. Signal: (1)
+  // scenario_save → assert the file lands on disk; (2) write a SECOND scenario
+  // file DIRECTLY to disk (= what a fresh/other daemon's save left behind, which an
+  // in-memory-only registry never saw) and assert scenario_list surfaces it with a
+  // `source` field. {savedFileOnDisk, scenarioPersists, hasSource}. TS:
+  // {true,true,true}; TRX64 (pre-fix): {false,false,false}. (Audit P1 misc-20.)
+  {
+    id: "ws-trace-monitor-misc-20",
+    severity: "P1",
+    title: "scenario registry is file-backed (re-scans project dir + carries a source)",
+    async signal(c, d) {
+      await liveSession(c);
+      const savedScenario = {
+        id: "misc20-saved",
+        diskPath: "none",
+        mode: "true-drive",
+        cycleBudget: 1000,
+        inputs: [],
+      };
+      // (1) scenario_save must persist the JSON to <projectDir>/scenarios/<id>.json.
+      await c.call("runtime/scenario_save", { scenario: savedScenario });
+      const savedPath = join(d.projectDir, "scenarios", "misc20-saved.json");
+      const savedFileOnDisk = existsSync(savedPath);
+
+      // (2) Write a SECOND scenario file DIRECTLY to disk — this is precisely what a
+      // FRESH daemon (or a second daemon on the same project dir) would find on its
+      // first list: a file the in-process registry never received via the RPC. A
+      // file-backed registry re-scans and lists it; an in-memory-only one cannot.
+      const scenDir = join(d.projectDir, "scenarios");
+      mkdirSync(scenDir, { recursive: true });
+      const diskOnly = {
+        id: "misc20-diskonly",
+        diskPath: "none",
+        mode: "true-drive",
+        cycleBudget: 2000,
+        inputs: [],
+        savedAt: "2026-06-26T00:00:00.000Z",
+      };
+      writeFileSync(join(scenDir, "misc20-diskonly.json"), JSON.stringify(diskOnly, null, 2), "utf8");
+
+      const list = (await c.call("runtime/scenario_list", {})) as any[];
+      const arr = Array.isArray(list) ? list : [];
+      const diskEntry = arr.find((s) => s?.id === "misc20-diskonly");
+      return {
+        // scenario_save actually wrote the file to the project dir.
+        savedFileOnDisk,
+        // a disk-only scenario (fresh-daemon view) is surfaced by the next list.
+        scenarioPersists: !!diskEntry,
+        // every listed entry carries a `source` field (1:1 scenario-registry.ts).
+        hasSource: arr.length > 0 && arr.every((s) => typeof s?.source === "string"),
       };
     },
   },
