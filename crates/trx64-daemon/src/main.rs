@@ -624,10 +624,191 @@ impl Observer for MemoryAccessObserver {
 
 /// Default sibling `.duckdb` output path under a temp runtime dir.
 fn default_trace_output(session_id: &str) -> PathBuf {
-    std::env::temp_dir()
-        .join("trx64-runtime")
-        .join(session_id)
-        .join("live.duckdb")
+    // 1:1 with the c64re daemon: `resolveSnapshotPath("runtime/<session>/live_<ts>.duckdb")`
+    // (ws-server.ts:1255). TWO properties matter and were BROKEN by the old fixed
+    // `/tmp/trx64-runtime/<session>/live.duckdb`:
+    //   • UNIQUE filename per trace (radix36(now) suffix) — a FIXED name let a stale
+    //     `.duckdb` from a prior trace shadow the fresh `.c64retrace` (the c64re
+    //     indexer only (re)builds when the `.duckdb` is ABSENT), so trace/read
+    //     returned the OLD index. A unique name guarantees a clean lazy build.
+    //   • PROJECT-SCOPED root (when a project dir is resolvable) — a shared /tmp path
+    //     collided across concurrent daemons (e.g. the differential conformance gate
+    //     spawns two at once). The project dir is per-daemon → isolated.
+    let now36 = radix36(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    );
+    let file = format!("live_{now36}.duckdb");
+    let base = resolve_project_dir().unwrap_or_else(|| std::env::temp_dir().join("trx64-runtime"));
+    base.join("runtime").join(session_id).join(file)
+}
+
+// ── trace/read Node sidecar (Spec "Interim A") ────────────────────────────────
+//
+// TRX64 already WRITES the `.c64retrace` (the shared interchange format). It does
+// not yet have a native DuckDB indexer + the v2 reader algorithms, so the
+// trace-analysis surface (trace/read + the v2 ops) is served by SHELLING OUT to a
+// tiny Node sidecar that imports the EXISTING c64re indexer + v2 readers and runs
+// them over a `.c64retrace`/`.duckdb` pair. Byte-identical to the c64re TS daemon
+// by construction (it IS the same code path, ws-server.ts:1302-1377). Requires
+// Node/tsx + the c64re TS source on disk (fine for the c64re-as-backend use case;
+// the standalone deployment is served by the future native Rust port, spec B).
+
+/// The TRX64 repo root (holds `tools/`). `TRX64_ROOT` env wins; else the build-time
+/// `CARGO_MANIFEST_DIR` (= `crates/trx64-daemon`) walked up two levels; else the
+/// known dev path. Used to locate the sidecar + the tsx in tools/oracle.
+fn trx64_root() -> PathBuf {
+    if let Ok(p) = std::env::var("TRX64_ROOT") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    // crates/trx64-daemon → repo root (../..). Robust even when the binary is run
+    // from an arbitrary cwd (the oracle spawns it detached with stdio ignored).
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if let Some(root) = manifest.parent().and_then(|p| p.parent()) {
+        if root.join("tools").join("trace-read-sidecar").exists() {
+            return root.to_path_buf();
+        }
+    }
+    PathBuf::from("/Users/alex/Development/C64/Tools/TRX64")
+}
+
+/// Resolve the `tsx` runner: prefer the one vendored under tools/oracle/node_modules
+/// (per the Interim-A spec), else bare `tsx` on PATH.
+fn resolve_tsx(root: &std::path::Path) -> PathBuf {
+    let vendored = root.join("tools").join("oracle").join("node_modules").join(".bin").join("tsx");
+    if vendored.exists() {
+        vendored
+    } else {
+        PathBuf::from("tsx")
+    }
+}
+
+/// Run a `trace/read` op via the Node sidecar. `duckdb_path` is the `.duckdb` INDEX
+/// path (built lazily from its `.c64retrace` sibling on first read — covers misc-1).
+/// `op` + `args` mirror the WS `trace/read` params exactly. Returns the op's JSON
+/// result, or an `Err(message)` (sidecar/Node missing, op error, malformed output) —
+/// the caller maps that to a clean WS error, NEVER a panic.
+fn run_trace_read_sidecar(op: &str, duckdb_path: &str, args: &Value) -> Result<Value, String> {
+    let root = trx64_root();
+    let sidecar = root.join("tools").join("trace-read-sidecar").join("sidecar.ts");
+    if !sidecar.exists() {
+        return Err(format!(
+            "trace/read sidecar not found at {} — the Node trace-read sidecar is required for trace analysis (set TRX64_ROOT or build the native reader).",
+            sidecar.display()
+        ));
+    }
+    let tsx = resolve_tsx(&root);
+    let c64re_root = std::env::var("C64RE_ROOT")
+        .unwrap_or_else(|_| "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP".to_string());
+    let args_json = serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string());
+
+    let output = std::process::Command::new(&tsx)
+        .arg(&sidecar)
+        .arg(op)
+        .arg("--duckdb")
+        .arg(duckdb_path)
+        .arg("--args")
+        .arg(&args_json)
+        // Run from the c64re root so the sidecar's c64re/@duckdb imports resolve, and
+        // pass C64RE_ROOT explicitly (the sidecar also reads it directly).
+        .current_dir(&c64re_root)
+        .env("C64RE_ROOT", &c64re_root)
+        .output()
+        .map_err(|e| {
+            format!(
+                "trace/read sidecar spawn failed ({}): {e} — Node/tsx is required for trace analysis (looked for tsx at {}).",
+                op,
+                tsx.display()
+            )
+        })?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let last_line = stdout.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+    if last_line.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "trace/read sidecar produced no output (op={op}, status={}): {}",
+            output.status,
+            stderr.lines().rev().take(3).collect::<Vec<_>>().join(" | ")
+        ));
+    }
+    let parsed: Value = serde_json::from_str(last_line)
+        .map_err(|e| format!("trace/read sidecar emitted non-JSON (op={op}): {e}: {last_line}"))?;
+    // The sidecar reports op failures as {"error": "..."} + a non-zero exit.
+    if let Some(err) = parsed.get("error").and_then(|v| v.as_str()) {
+        return Err(err.to_string());
+    }
+    if !output.status.success() {
+        return Err(format!("trace/read sidecar exited non-zero (op={op}): {last_line}"));
+    }
+    Ok(parsed)
+}
+
+/// Resolve the `.duckdb` index path the sidecar should read for the CURRENT trace
+/// (active or last-finalized), so trace/read + the monitor map/swimlane/taint verbs
+/// + the runtime/call trace methods all target the same store. Returns None when no
+/// trace has ever run (= TS "no trace store"). Mirrors trace/current's path logic.
+fn current_trace_duckdb(st: &State) -> Option<String> {
+    if let Some(t) = &st.session.trace {
+        let retrace = t.retrace_path.to_string_lossy();
+        let p = if retrace.ends_with(".c64retrace") {
+            format!("{}.duckdb", &retrace[..retrace.len() - ".c64retrace".len()])
+        } else {
+            retrace.into_owned()
+        };
+        Some(p)
+    } else {
+        st.last_trace_path.clone()
+    }
+}
+
+/// Build the `RuntimeTraceDefinition` for a capture-all live trace over `domains`
+/// — 1:1 with c64re `captureAllDef` (runtime-trace-sink.ts:32). The `.c64retrace`
+/// file header carries this as `defJson` (= `JSON.stringify(def)`), and the c64re
+/// DuckDB indexer does `JSON.parse(meta.defJson)` (binary-log-indexer.ts:140) to
+/// rebuild the `trace_run` row. An EMPTY defJson breaks that parse ("Unexpected
+/// end of JSON input"), so a TRX64-written trace was un-indexable → trace/read
+/// (audit misc-0/1) could not read it. Field ORDER + values match the TS def so
+/// the header is byte-faithful to a TS-written one (id/version/name/domains/
+/// triggers/captures/retention/checkpointPolicy). Used by `trace/start_domains`.
+fn capture_all_def_json(domains: &[String]) -> Value {
+    let mut triggers: Vec<Value> = Vec::new();
+    let mut captures: Vec<Value> = Vec::new();
+    let has = |d: &str| domains.iter().any(|x| x == d);
+    if has("c64-cpu") {
+        triggers.push(json!({ "kind": "pc-range", "domain": "c64-cpu", "from": 0, "to": 0xffff }));
+        captures.push(json!({ "kind": "cpu-row", "domain": "c64-cpu" }));
+    }
+    if has("drive8-cpu") {
+        triggers.push(json!({ "kind": "pc-range", "domain": "drive8-cpu", "from": 0, "to": 0xffff }));
+        captures.push(json!({ "kind": "cpu-row", "domain": "drive8-cpu" }));
+    }
+    if has("memory") {
+        triggers.push(json!({ "kind": "mem-access", "access": "any", "from": 0, "to": 0xffff }));
+        captures.push(json!({ "kind": "mem-row" }));
+    }
+    if has("iec") {
+        triggers.push(json!({ "kind": "iec-transition" }));
+        captures.push(json!({ "kind": "iec-row" }));
+    }
+    if has("vic") {
+        triggers.push(json!({ "kind": "raster-window", "fromLine": 0, "toLine": 311 }));
+        captures.push(json!({ "kind": "vic-row" }));
+    }
+    json!({
+        "id": "live-capture",
+        "version": 1,
+        "name": "live session capture",
+        "domains": domains,
+        "triggers": triggers,
+        "captures": captures,
+        "retention": "evidence",
+        "checkpointPolicy": "none",
+    })
 }
 
 /// Run a cycle budget (= TS session/run). Instruction-stepped: execute whole
@@ -3107,15 +3288,20 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                     let retrace = output.with_extension("c64retrace");
                     let cycle_start = st.session.machine.clk;
                     let run_id = format!("run_live-capture_{cycle_start}");
+                    // misc-1/misc-14 — write a VALID defJson (the c64re indexer does
+                    // `JSON.parse(meta.defJson)`; an empty string broke indexing → the
+                    // monitor map/swimlane/taint verbs could never read this store).
+                    let def_json_str =
+                        serde_json::to_string(&capture_all_def_json(&domains)).unwrap_or_default();
                     let meta_json = serde_json::to_string(&json!({
                         "runId": run_id,
                         "defId": "live-capture",
                         "defVersion": 1,
-                        "defName": "live-capture",
-                        "defJson": "",
+                        "defName": "live session capture",
+                        "defJson": def_json_str,
                         "domains": domains,
                         "cycleStart": cycle_start,
-                        "createdAt": "",
+                        "createdAt": now_iso8601_utc(),
                     }))
                     .unwrap_or_default();
                     st.session.machine.drive8.flush_disk_writeback();
@@ -3174,21 +3360,90 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             Ok("reset".to_string())
         }
 
-        // ---- DEFERRED verbs: trace-store reads (map/taint/swimlane/chis). -----
+        // ---- Trace-store reads (map/taint/swimlane/chis) — audit misc-14. --------
         // The TS DAEMON wires a `traceRead` bridge backed by a DuckDB trace store;
-        // with no active/finalized trace it THROWS `no trace store — run \`trace on\`
-        // first`, which monitor-shell catches as `<verb>: <message>` (ws-server.ts:2099,
-        // monitor-shell.ts:1123). TRX64 has no DuckDB trace-store reader, so it
-        // produces the IDENTICAL daemon-shaped error (graceful, not faked) — `trace
-        // on` is itself a deferred capability here, so the store is always absent.
-        "map" => Err("map: no trace store — run `trace on` first".into()),
-        "taint" => Err("taint: no trace store — run `trace on` first".into()),
-        "swimlane" | "sw" => {
-            // ws-server.ts:2069 — the swimlane store-absent message is worded slightly
-            // differently from map/taint (it names the on→off bracket).
-            Err("swimlane: no trace store — run `trace on` … `trace off` first".into())
+        // monitor-shell parses the verb args then calls ctx.traceRead(op, args)
+        // (ws-server.ts:2104-2129, monitor-shell.ts:1116-1178). TRX64 routes the SAME
+        // reads through the Node sidecar (the c64re indexer + v2 readers), keyed on
+        // the CURRENT trace store (active or last-finalized). With NO trace store the
+        // verbs return the IDENTICAL daemon-shaped error.
+        //
+        // `map [cpu]` — trace_memory_map free-RAM / persistence surface.
+        "map" => {
+            let cpu = toks.get(1).map(|s| s.to_ascii_lowercase()).unwrap_or_else(|| "c64".to_string());
+            if cpu != "c64" && cpu != "drive8" {
+                return Ok("map: cpu must be c64|drive8".into());
+            }
+            match current_trace_duckdb(st) {
+                None => Err("map: no trace store — run `trace on` first".into()),
+                Some(db) => match run_trace_read_sidecar("map", &db, &json!({ "cpu": cpu })) {
+                    Ok(v) => Ok(v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string()),
+                    Err(e) => Err(format!("map: {e}")),
+                },
+            }
         }
-        "chis" => Err("chis: no trace store — run `trace on` first".into()),
+        // `taint <addr> [cycle]` — backward data-flow taint. cycle omitted ⇒ the
+        // store's own MAX(cycle) (= TS: no live-clock default).
+        "taint" => {
+            let addr = match parse_addr(toks.get(1)) {
+                Some(a) => a,
+                None => return Ok("taint: usage: taint <addr> [cycle]".into()),
+            };
+            let mut args = json!({ "start_addr": addr });
+            if let Some(c) = toks.get(2).and_then(|s| s.parse::<i64>().ok()) {
+                args["start_cycle"] = json!(c);
+            }
+            match current_trace_duckdb(st) {
+                None => Err("taint: no trace store — run `trace on` first".into()),
+                Some(db) => match run_trace_read_sidecar("taint_text", &db, &args) {
+                    Ok(v) => Ok(v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string()),
+                    Err(e) => Err(format!("taint: {e}")),
+                },
+            }
+        }
+        // `swimlane [list|name] [s] [e]` — trace lanes, newest trace tail by default.
+        // The sidecar serves the CURRENT-store path (default window + explicit
+        // <s>[e]); `list` + `<name>` + the checkpoint-ring/chis fallback need the live
+        // ring (not file-derivable) → reported as unsupported here, not faked.
+        "swimlane" | "sw" => {
+            let a1 = toks.get(1).map(|s| s.as_str());
+            let is_num = |t: Option<&str>| t.map(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).unwrap_or(false);
+            if a1.map(|s| s.eq_ignore_ascii_case("list")).unwrap_or(false) {
+                return Err("swimlane list: not supported via TRX64 (the live trace-store directory listing needs the daemon ring) — read a specific window: `swimlane <s> <e>`".into());
+            }
+            if let Some(name) = a1 {
+                if !is_num(Some(name)) {
+                    return Err(format!("swimlane: no trace named '{}' — by-name selection needs the daemon store directory; read the current trace with `swimlane <s> <e>`", name.trim_end_matches(".duckdb")));
+                }
+            }
+            let mut args = json!({ "last_cycles": 2000 });
+            if is_num(a1) {
+                args["cycle_start"] = json!(a1.unwrap().parse::<i64>().unwrap_or(0));
+                if is_num(toks.get(2).map(|s| s.as_str())) {
+                    args["cycle_end"] = json!(toks[2].parse::<i64>().unwrap_or(0));
+                }
+            }
+            match current_trace_duckdb(st) {
+                None => Err("swimlane: no trace store — run `trace on` … `trace off` first".into()),
+                Some(db) => {
+                    // `stem` = the store basename without .duckdb (= TS `# <stem>`).
+                    let stem = std::path::Path::new(&db)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("trace")
+                        .to_string();
+                    args["stem"] = json!(stem);
+                    match run_trace_read_sidecar("swimlane_text", &db, &args) {
+                        Ok(v) => Ok(v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string()),
+                        Err(e) => Err(format!("swimlane: {e}")),
+                    }
+                }
+            }
+        }
+        // `chis` — checkpoint-ring replay swimlane. Needs the LIVE ring (replay with
+        // capture), which is not derivable from a stored `.c64retrace`; report
+        // unsupported here rather than fake it.
+        "chis" => Err("chis: not supported via TRX64 (checkpoint-ring replay needs the live daemon ring) — use `swimlane <s> <e>` over a captured trace".into()),
 
         // ---- Project-index reads (inspect/xref/sym) — audit ws-trace-monitor-misc-15. -
         // TS wires `ctx.projectRead` (ws-server.ts:2135-2191): scan C64RE_PROJECT_DIR for
@@ -4717,6 +4972,21 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
         "breakpointAuditLog" => {
             let _st = state.lock().unwrap();
             Response::ok(id, json!([]))
+        }
+
+        // ── Trace-backed AgentQueryApi methods (runtime/call) ────────────────────
+        // queryEvents / followPath / swimlaneSlice / traceTaint / profileLoader.
+        // In the c64re daemon `runtime/call` builds `createAgentQueryApi({ session })`
+        // with NO `traceBackend` wired (ws-server.ts:1720), so EVERY one of these
+        // throws "traceBackend not configured" (agent-api.ts:107…124) — verified
+        // against the live TS daemon. The REAL trace-read surface is `trace/read`
+        // (now sidecar-backed). So for byte-faithful parity these methods are HANDLED
+        // (not method-not-found) but return the IDENTICAL "traceBackend not
+        // configured" error TS does — routing them to the sidecar would DIVERGE
+        // (TRX64 succeeding where TS errors = fake-green). Use `trace/read` op=
+        // query_events / swimlane / follow_path / taint / profile_loader instead.
+        "queryEvents" | "followPath" | "swimlaneSlice" | "traceTaint" | "profileLoader" => {
+            Response::err(id, -32000, "traceBackend not configured")
         }
 
         other => {
@@ -7055,15 +7325,25 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 .and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|d| d.as_str().map(String::from)).collect())
                 .unwrap_or_else(|| vec!["c64-cpu".into(), "memory".into()]);
+            // misc-0/1 — write the FULL capture-all definition as defJson (a valid
+            // JSON STRING), matching c64re captureAllDef + trace-run.ts:217
+            // (`defJson: JSON.stringify(def)`). The c64re DuckDB indexer does
+            // `JSON.parse(meta.defJson)` (binary-log-indexer.ts:140); an empty string
+            // threw "Unexpected end of JSON input", so a TRX64-written trace was
+            // un-indexable and trace/read could not read it. defName + createdAt also
+            // match the TS header now (oracle diffs records, NOT the meta header, so
+            // this is gate-safe).
+            let def_json_str =
+                serde_json::to_string(&capture_all_def_json(&domains)).unwrap_or_default();
             let meta_json = serde_json::to_string(&json!({
                 "runId": run_id,
                 "defId": "live-capture",
                 "defVersion": 1,
-                "defName": "live-capture",
-                "defJson": "",
+                "defName": "live session capture",
+                "defJson": def_json_str,
                 "domains": domains,
                 "cycleStart": cycle_start,
-                "createdAt": "",
+                "createdAt": now_iso8601_utc(),
             }))
             .unwrap_or_default();
             // Flush any in-flight drive write so the captured media SHA reflects the
@@ -7716,8 +7996,26 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             Response::ok(id, result)
         }
 
+        // trace/read — read a trace store IN/ALONGSIDE the daemon (audit misc-0).
+        // 1:1 with the c64re ws-server.ts:1302-1377 handler: params { op, duckdb_path,
+        // args }. TRX64 has no native DuckDB reader yet, so it shells out to the Node
+        // sidecar that imports the EXISTING c64re indexer + v2 readers (byte-identical
+        // by construction). The index is built lazily from the `.c64retrace`
+        // authority on first read (covers misc-1: no index at trace stop).
         "trace/read" => {
-            Response::err(id, -32001, "NOT_IMPLEMENTED: trace/read: deferred")
+            let op = match req.params.get("op").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => return Response::err(id, -32602, "trace/read: op required"),
+            };
+            let duckdb_path = match req.params.get("duckdb_path").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return Response::err(id, -32602, "trace/read: duckdb_path required"),
+            };
+            let args = req.params.get("args").cloned().unwrap_or(json!({}));
+            match run_trace_read_sidecar(&op, &duckdb_path, &args) {
+                Ok(v) => Response::ok(id, v),
+                Err(e) => Response::err(id, -32001, e),
+            }
         }
 
         // ── Spec 705.B — checkpoint ring (rewind / time-travel) ──────────────
@@ -10785,16 +11083,17 @@ mod batch1_tests {
     }
 
     #[test]
-    fn deferred_methods_report_not_implemented() {
+    fn trace_read_validates_params() {
+        // trace/read is now IMPLEMENTED (Node sidecar, audit misc-0): it no longer
+        // returns NOT_IMPLEMENTED. With no `op`/`duckdb_path` it rejects with the
+        // param-error contract (-32602), the same shape the c64re WS handler uses.
         let st = make_state();
-        // The vic/inspect/* engine methods, checkpoint/thumbnails, and
-        // debug/memory_access_map are now implemented. What remains deferred:
-        // the trace/read binary reader.
-        for m in ["trace/read"] {
-            let e = call_err(&st, m, json!({}));
-            assert_eq!(e.code, -32001);
-            assert!(e.message.contains("NOT_IMPLEMENTED"));
-        }
+        let e = call_err(&st, "trace/read", json!({}));
+        assert_eq!(e.code, -32602, "trace/read with no params → invalid-params");
+        assert!(e.message.contains("op required"), "names the missing op param: {}", e.message);
+        let e2 = call_err(&st, "trace/read", json!({ "op": "store_fn" }));
+        assert_eq!(e2.code, -32602, "trace/read with no duckdb_path → invalid-params");
+        assert!(e2.message.contains("duckdb_path required"), "names the missing path: {}", e2.message);
     }
 
     #[test]

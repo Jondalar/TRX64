@@ -2102,6 +2102,135 @@ const CASES: ConfCase[] = [
       };
     },
   },
+
+  // ── shared trace-capture helper for the trace/read cases ─────────────────────
+  // (declared as a closure inside each signal — kept here as a doc anchor.)
+
+  // ── P1: ws-trace-monitor-misc-0 — trace/read serves the trace store ──────────
+  // TS ws-server.ts:1302-1377 wires trace/read: build/await the DuckDB index from
+  // the `.c64retrace` authority (lazy-on-read, audit misc-1), then run a reader op.
+  // store_fn getInfo/topPcs are the deterministic shape (queries.ts). TRX64 returned
+  // -32001 NOT_IMPLEMENTED. Fix: trace/read shells out to the Node sidecar that
+  // imports the EXISTING c64re indexer + readers → byte-identical by construction.
+  // Signal: capture a cold-boot trace on BOTH daemons (start_domains cpu+memory, run
+  // 200k cyc, stop), then trace/read getInfo + topPcs. Compare the DETERMINISTIC,
+  // content-derived fields only — getInfo.tableCounts (per-channel event counts) +
+  // masterClockRange (the .c64retrace is byte-equal across runtimes, so these match);
+  // topPcs SORTED by (count desc, pc asc) to neutralise DuckDB tie ROW-order (the
+  // pc/count SET is deterministic, the order among equal counts is not). The volatile
+  // meta (run_id / created_at) is excluded. TS: real counts; TRX64 (pre-fix):
+  // unreadable. (Audit P1 ws-trace-monitor-misc-0 + misc-1 lazy index.)
+  {
+    id: "ws-trace-monitor-misc-0",
+    severity: "P1",
+    title: "trace/read serves getInfo/topPcs over a captured .c64retrace (sidecar)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      await c.call("trace/start_domains", { session_id: sid, domains: ["c64-cpu", "memory"] });
+      await c.call("session/run", { session_id: sid, cycles: 200_000 });
+      await c.call("trace/run/stop", { session_id: sid });
+      const cur = (await c.call("trace/current", { session_id: sid })) as any;
+      const db = String(cur?.path ?? "");
+      const gi = (await c.call("trace/read", { op: "store_fn", duckdb_path: db, args: { fn: "getInfo" } })) as any;
+      const tp = (await c.call("trace/read", {
+        op: "store_fn", duckdb_path: db, args: { fn: "topPcs", args: { cpu: "c64", limit: 12 } },
+      })) as Array<{ pc: number; count: number }>;
+      // tie-order-stable: equal counts → ascending pc. The SET + counts are what the
+      // trace content determines; DuckDB does not stabilise row order among ties.
+      // `LIMIT` ALSO cuts mid-tie at the boundary count, keeping a DIFFERENT subset of
+      // that equal-count group per runtime — so drop the lowest returned count group
+      // (the only limit-truncated one); every higher count is fully present + stable.
+      const arr = Array.isArray(tp) ? tp : [];
+      const minCount = arr.length ? Math.min(...arr.map((r) => r.count)) : 0;
+      const topPcsSorted = [...arr]
+        .filter((r) => r.count > minCount)
+        .sort((a, b) => (b.count - a.count) || (a.pc - b.pc));
+      return {
+        // event counts per channel — the .c64retrace is byte-equal, so identical.
+        tableCounts: gi?.tableCounts ?? null,
+        masterClockRange: gi?.masterClockRange ?? null,
+        topPcsSorted,
+        // sanity: the read actually returned a populated store (not an empty stub).
+        hasEvents: Number(gi?.tableCounts?.["events:total"] ?? 0) > 0,
+      };
+    },
+  },
+
+  // ── P1: ws-trace-monitor-misc-14 — monitor map/swimlane read the trace store ─
+  // TS monitor-shell parses the verb args then calls ctx.traceRead(op,args) (the WS
+  // daemon trace bridge, ws-server.ts:2104-2129). TRX64's monitor map/swimlane were
+  // hardcoded "no trace store". Fix: route them through the SAME sidecar over the
+  // current trace store. Signal: capture a cold-boot trace on BOTH, then `map c64`
+  // (the trace-memory-map text — fully deterministic) and `swimlane` (lane render).
+  // `map` is compared EXACT. `swimlane` is compared with its first line — `# <stem>`,
+  // where stem = live_<radix36(now)>, a per-run UNIQUE store name on BOTH runtimes —
+  // stripped; the rest (the `swimlane <s>–<e>` window header + the rendered rows) is
+  // deterministic. TS: real map/swimlane text; TRX64 (pre-fix): "no trace store".
+  // (Audit P1 ws-trace-monitor-misc-14.)
+  {
+    id: "ws-trace-monitor-misc-14",
+    severity: "P1",
+    title: "monitor map/swimlane read the captured trace store (sidecar)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      await c.call("trace/start_domains", { session_id: sid, domains: ["c64-cpu", "memory"] });
+      await c.call("session/run", { session_id: sid, cycles: 200_000 });
+      await c.call("trace/run/stop", { session_id: sid });
+      const mapOut = String(((await c.call("monitor/exec", { session_id: sid, command: "map c64" })) as any)?.output ?? "");
+      const swOut = String(((await c.call("monitor/exec", { session_id: sid, command: "swimlane" })) as any)?.output ?? "");
+      // Strip the volatile `# <stem>` first line (stem carries a per-run timestamp).
+      const swBody = swOut.split("\n").slice(1).join("\n");
+      return {
+        // the map text is fully deterministic (no per-run identifiers).
+        mapText: mapOut,
+        // the swimlane window header + rows, minus the unique store-name line.
+        swimlaneBody: swBody,
+        // sanity: both verbs produced real trace output (not a "no trace store" stub).
+        mapHasContent: mapOut.includes("trace_memory_map"),
+        swimlaneHasWindow: /swimlane\s+\d+[–-]\d+/.test(swBody),
+      };
+    },
+  },
+
+  // ── P1: ws-trace-monitor-misc-19b — runtime/call trace methods match TS ──────
+  // The 5 trace-backed AgentQueryApi methods (queryEvents/followPath/swimlaneSlice/
+  // traceTaint/profileLoader). In the c64re daemon `runtime/call` builds the API with
+  // NO traceBackend (ws-server.ts:1720), so each throws "traceBackend not configured"
+  // — verified against the live TS daemon. The REAL trace-read surface is `trace/read`
+  // (sidecar-backed). TRX64 returned method-not-found (-32601) for all five. Fix:
+  // they are now HANDLED, returning the IDENTICAL "traceBackend not configured" error
+  // — NOT routed to the sidecar (that would diverge: TRX64 succeeding where TS errors
+  // = fake-green). Signal: call each over runtime/call and report {handled, message}.
+  // TS = TRX64 = {handled:true, message:"traceBackend not configured"} for all five.
+  {
+    id: "ws-trace-monitor-misc-19b",
+    severity: "P1",
+    title: "runtime/call trace methods match TS (handled, traceBackend not configured)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      const notFound = (msg: string) =>
+        /method not found|unknown (runtime op|method)|not allowed|-32601/i.test(msg);
+      const probe = async (op: string) => {
+        try {
+          await c.call("runtime/call", { session_id: sid, op, args: [{}] });
+          return { handled: true, message: "<ok>" };
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          // Normalise the JSON-RPC error envelope down to its message text.
+          let text = msg;
+          try { const j = JSON.parse(msg); if (j?.message) text = String(j.message); } catch { /* plain */ }
+          return { handled: !notFound(msg), message: text };
+        }
+      };
+      return {
+        queryEvents: await probe("queryEvents"),
+        followPath: await probe("followPath"),
+        swimlaneSlice: await probe("swimlaneSlice"),
+        traceTaint: await probe("traceTaint"),
+        profileLoader: await probe("profileLoader"),
+      };
+    },
+  },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
