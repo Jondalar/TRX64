@@ -17,6 +17,7 @@ pub mod checkpoint_ring;
 pub mod cia;
 pub mod cpu;
 pub mod cpu_history;
+pub mod delta_ring;
 pub mod drive;
 pub mod drive_6510core;
 pub mod drive_snapshot;
@@ -47,6 +48,7 @@ pub mod vsf;
 pub use cia::Cia;
 pub use cpu::{Bus, Cpu6510};
 pub use cpu_history::{CpuHistEntry, CpuHistoryRing};
+pub use delta_ring::{DeltaEntry, DeltaRing, WriteRec};
 pub use drive::Drive1541;
 pub use full::{Bank8, BankA, BankE, FullBus, MemConfig};
 pub use iec::IecCore;
@@ -501,6 +503,51 @@ pub struct Machine {
     /// env kill-switch `TRX64_CPUHISTORY=0`. NOT machine state: `Clone` yields an
     /// empty ring (live-timeline, not snapshot state), and it is never serialized.
     pub cpu_history: crate::cpu_history::CpuHistoryRing,
+
+    /// Always-on FULL-DELTA undo ring (reverse-debug Phase 1b). Per retired
+    /// instruction it records the CPU PRE-state (incl. the composite P) AND every
+    /// memory/IO write `{addr, old_value, new_value}` — enough to UNDO the
+    /// instruction (write `old_value`s back + restore the pre-state regs). Fed from
+    /// the SAME `execute_one` retire point as `cpu_history`. Backs `reverse_step` /
+    /// `who_wrote`. Always-on (the write capture is NOT gated on a trace), default-ON,
+    /// shared kill-switch `TRX64_CPUHISTORY=0`, depth `TRX64_REVERSE_SECONDS` (10 s).
+    /// Like `cpu_history`: live-timeline state, NOT machine state — `Clone` is empty,
+    /// never serialized.
+    pub delta_ring: crate::delta_ring::DeltaRing,
+}
+
+/// reverse-debug Phase 1b — the CPU state the machine landed on after a reverse-step
+/// (the PRE-state of the oldest instruction undone). `p` is the COMPOSITE status.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReverseLanded {
+    pub pc: u16,
+    pub a: u8,
+    pub x: u8,
+    pub y: u8,
+    pub sp: u8,
+    pub p: u8,
+    pub cycle: u64,
+}
+
+/// reverse-debug Phase 1b — the result of [`Machine::reverse_step`]: how many
+/// instructions were actually undone, the landed CPU state, and every write rolled
+/// back (newest instruction first, each instruction's writes in undo order).
+#[derive(Clone, Debug, Default)]
+pub struct ReverseStepOutcome {
+    pub steps_taken: usize,
+    pub landed: ReverseLanded,
+    pub undone_writes: Vec<crate::delta_ring::WriteRec>,
+}
+
+/// reverse-debug Phase 1b — one [`Machine::who_wrote`] hit: the instruction PC + cycle
+/// that wrote `addr`, and the `old→new` bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WhoWroteHit {
+    pub pc: u16,
+    pub cycle: u64,
+    pub addr: u16,
+    pub old_value: u8,
+    pub new_value: u8,
 }
 
 /// ROM load error.
@@ -562,6 +609,7 @@ impl Machine {
             cartridge: None,
             cartridge_image: None,
             cpu_history: crate::cpu_history::CpuHistoryRing::new(),
+            delta_ring: crate::delta_ring::DeltaRing::new(),
         }
     }
 
@@ -803,6 +851,10 @@ impl Machine {
         // continuous with the fresh boot (report the boundary, don't fake it). The
         // slab is retained (clear() only resets the head).
         self.cpu_history.clear();
+        // reverse-debug Phase 1b — same timeline boundary: drop the full-delta undo
+        // ring so a reverse-step / who_wrote never crosses the cold-reset boundary
+        // (the spec's "report the boundary, don't fake it"). Slabs retained.
+        self.delta_ring.clear();
         self.sync_snapshot();
     }
 
@@ -906,6 +958,143 @@ impl Machine {
     /// Refresh the legacy `cpu`/`clk` snapshot after monitor register edits.
     pub fn sync_after_monitor(&mut self) {
         self.sync_snapshot();
+    }
+
+    /// reverse-debug Phase 1b — restore one undone write's `old_value` to the SAME
+    /// storage location the forward store wrote, WITHOUT chip side effects. RAM /
+    /// zero-page is byte-exact (the crash use-case target: stack / ZP / code). For the
+    /// IO window the store goes to the I/O shadow / register file directly (NOT through
+    /// the chip's `write`, which would re-run timer/latch side effects) — best-effort,
+    /// per the contract that reverse-step does NOT restore chip internal counters.
+    fn restore_byte(&mut self, addr: u16, old: u8) {
+        match addr {
+            // The $00/$01 CPU port: restore the byte AND recompute the PLA memconfig from
+            // it, so a subsequent `read_full` peek sees the rolled-back banking (the port
+            // drives the bank map; leaving memconfig stale would mis-bank reads after the
+            // undo). This is byte-state restoration, not chip-counter restoration.
+            0x0000 => {
+                self.port_dir = old;
+                self.memconfig = self.memconfig_table[self.pla_index()];
+            }
+            0x0001 => {
+                self.port_data = old;
+                self.memconfig = self.memconfig_table[self.pla_index()];
+            }
+            0x0002..=0xcfff => self.ram[addr as usize] = old,
+            0xd000..=0xdfff => {
+                // I/O window: write the byte back into the shadow/register file
+                // directly (no chip side effects). VIC/SID register files + the I/O
+                // shadow mirror the storage `poke_io` uses; the colour-RAM nibble keeps
+                // its low-nibble convention. Chip internal counters are out of scope.
+                match addr {
+                    0xd000..=0xd3ff => self.vic.write_reg(addr as u8, old),
+                    0xd400..=0xd7ff => {
+                        self.sid_regs[(addr as usize - 0xd400) & 0x1f] = old;
+                    }
+                    0xd800..=0xdbff => {
+                        self.io_shadow[(addr as usize) - 0xd000] = old & 0x0f;
+                    }
+                    _ => self.io_shadow[(addr as usize) - 0xd000] = old,
+                }
+            }
+            // $E000-$FFFF stores land in RAM under the KERNAL (writes go to RAM even
+            // with KERNAL mapped — the forward store wrote `ram[addr]`).
+            0xe000..=0xffff => self.ram[addr as usize] = old,
+        }
+    }
+
+    /// reverse-debug Phase 1b — UNDO the last `n` retired instructions, landing the
+    /// machine at the state BEFORE the oldest one undone. For each instruction (newest
+    /// first): write its writes' `old_value`s back in REVERSE order, then restore the
+    /// CPU registers (incl. the composite P) from that entry's PRE-state header. Pops
+    /// each undone entry off the delta ring so a subsequent reverse-step targets the
+    /// instruction before it.
+    ///
+    /// HARD CONTRACT: this restores CPU + RAM + IO-register BYTES, NOT chip internal
+    /// counters (VIC raster / CIA timers / sprite-DMA). After a reverse-step the machine
+    /// is for INSPECTION ONLY — to resume forward, restore a checkpoint anchor.
+    ///
+    /// Returns `Ok((landed, undone_writes))` where `landed` is the PC/regs the machine
+    /// now sits at and `undone_writes` is the full list of writes rolled back (newest
+    /// instruction first, each instruction's writes in undo order). Errs if the ring is
+    /// disabled/empty or shallower than `n` (reports how many were available).
+    pub fn reverse_step(&mut self, n: usize) -> Result<ReverseStepOutcome, String> {
+        if !self.delta_ring.enabled() {
+            return Err("reverse-step: the delta ring is disabled (TRX64_CPUHISTORY=0)".into());
+        }
+        if n == 0 {
+            return Err("reverse-step: n must be ≥ 1".into());
+        }
+        let avail = self.delta_ring.len();
+        if avail == 0 {
+            return Err(
+                "reverse-step: no history in the delta ring (run the machine first)".into(),
+            );
+        }
+        let steps = n.min(avail);
+        let mut undone_writes: Vec<crate::delta_ring::WriteRec> = Vec::new();
+        let mut landed = ReverseLanded::default();
+        let mut scratch: Vec<crate::delta_ring::WriteRec> = Vec::new();
+        for _ in 0..steps {
+            // Pop the newest entry (also rewinds the write cursor past its writes).
+            let e = match self.delta_ring.pop_newest() {
+                Some(e) => e,
+                None => break,
+            };
+            // The entry's writes were captured BEFORE pop rewound the cursor; re-read
+            // them from the just-popped header. (pop_newest only moved the heads; the
+            // slab bytes are intact until overwritten by a future forward write.)
+            self.delta_ring.writes_for(&e, &mut scratch);
+            // Undo writes in REVERSE order (the last write is on top of the prior one
+            // at the same address — e.g. RMW dummy-then-real).
+            for w in scratch.iter().rev() {
+                self.restore_byte(w.addr, w.old_value);
+                undone_writes.push(*w);
+            }
+            // Restore the CPU PRE-state (the state before this instruction).
+            self.c64_core.reg_pc = e.pc;
+            self.c64_core.reg_a = e.a;
+            self.c64_core.reg_x = e.x;
+            self.c64_core.reg_y = e.y;
+            self.c64_core.reg_sp = e.sp;
+            self.c64_core.set_status_composite(e.p);
+            self.c64_core.clk = e.cycle;
+            landed = ReverseLanded {
+                pc: e.pc,
+                a: e.a,
+                x: e.x,
+                y: e.y,
+                sp: e.sp,
+                p: e.p,
+                cycle: e.cycle,
+            };
+        }
+        // Mirror the rewound CPU state into the legacy snapshot the daemon reads.
+        self.sync_snapshot_sc();
+        Ok(ReverseStepOutcome {
+            steps_taken: steps,
+            landed,
+            undone_writes,
+        })
+    }
+
+    /// reverse-debug Phase 1b — the stack-crash shortcut. Scan the delta ring's writes
+    /// BACKWARD (newest→oldest) for the last `limit` writers of `addr`. Returns each hit
+    /// as the writing instruction's PC + cycle + the `old→new` bytes, newest first.
+    /// Stops at the ring's readable edge (older history lives only in the finalized
+    /// trace). Read-only — does not mutate the machine.
+    pub fn who_wrote(&self, addr: u16, limit: usize) -> Vec<WhoWroteHit> {
+        self.delta_ring
+            .who_wrote(addr, limit)
+            .into_iter()
+            .map(|(e, w)| WhoWroteHit {
+                pc: e.pc,
+                cycle: e.cycle,
+                addr: w.addr,
+                old_value: w.old_value,
+                new_value: w.new_value,
+            })
+            .collect()
     }
 
     /// Side-effect-free banked read through the current PLA config (for
@@ -1340,6 +1529,7 @@ impl Machine {
                     fb,
                     obs,
                     cpu_history: Some(&mut self.cpu_history),
+                    delta_ring: Some(&mut self.delta_ring),
                     core_pc,
                     core_clk,
                     fetch: None,

@@ -86,6 +86,19 @@ in this pass, or ship primitives first and add triage after?** Phase 2 is cheap 
 Phase 1 but is where the "magic" is. (Recommendation: build both — Phase 2 is small and is
 the actual UX the user described.)
 
+## Decisions (user, 2026-06-26)
+- **The ring is ALWAYS-ON, no pre-arming.** "trace on" must NOT be required to inspect history
+  — the instructions+deltas are always in the ring; the `.c64retrace` file is an **on-demand
+  DUMP** of the ring (a persisted slice), not a separate capture you arm beforehand. So a
+  crash's run-up is ALWAYS reverse-debuggable.
+- **Depth = 10 seconds** of always-on full-delta history (≈3M instructions + ~3M writes ≈
+  100–150 MB). Tunable via env. Phase 1a shipped the CPU-only ring (~0.85s, 6 MB); this
+  extends it to the full deltas at 10s.
+- **One ring serves all live reads:** chis (done) + swimlane/map/taint + reverse_step +
+  who_wrote read the SAME always-on ring; the finalized-trace/sidecar path stays only as the
+  fallback for windows older than the ring. Build order: (1b) full-delta ring + reverse_step +
+  who_wrote; (1c) route swimlane/map/taint at the live ring + make "trace on" = dump-on-demand.
+
 ## Out of scope
 - Cycle-exact whole-machine reverse (use the ring + replay).
 - Reverse across a media swap / cold reset (the trace boundary; report it, don't fake it).

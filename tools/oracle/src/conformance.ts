@@ -1859,6 +1859,118 @@ const CASES: ConfCase[] = [
     },
   },
 
+  // ── P1: ws-reverse-step — real backward-stepping (TRX64 superset, reverse-debug 1b)
+  // NON-GATING (blocked): TS has only the snapshot ring-crutch (restore-anchor + replay-
+  // forward) — it has NO O(1) delta-undo `runtime/reverse_step`, so the differential
+  // cannot compare. TRX64's always-on full-delta ring undoes the last instruction(s)
+  // (write old_values back + restore the CPU pre-state). Asserted on the TRX64 daemon
+  // alone (run with --include-blocked), per the reverse-debug verification doctrine
+  // ("NOT the differential gate — TRX64 superset").
+  //   tsx src/conformance.ts --only ws-reverse-step --include-blocked
+  //
+  // FLOW (TRX64): after `liveSession` the machine is booted (cold reset ran the KERNAL to
+  // READY on the full-machine path → the delta ring already holds real history). Read the
+  // CPU state, single-step ONE real instruction (fed into the ring), then `reverse_step
+  // n=1` over WS. Assert the WS reply landed back on the EXACT pre-step PC + registers AND
+  // that `session/state` confirms the machine's live PC rolled back. RED-before: the
+  // method did not exist (→ -32601 / error). GREEN-after: pc/regs match the pre-state.
+  {
+    id: "ws-reverse-step",
+    severity: "P1",
+    blocked:
+      "TRX64 superset: TS has only the snapshot ring-crutch (replay-forward), no O(1) " +
+      "delta-undo reverse_step, so the differential can't compare. TRX64's full-delta ring " +
+      "undoes the last instruction (RAM+regs byte-exact); asserted on TRX64 alone (run with " +
+      "--include-blocked).",
+    title: "runtime/reverse_step undoes the last instruction (pc/regs/ram roll back to the pre-state) — TRX64 reverse-debug superset",
+    async signal(c, d) {
+      if (d.kind !== "trx64") {
+        // TS has no reverse_step — documented refusal, non-gating. Same SHAPE as the
+        // TRX64 signal so the (non-gating) divergence is purely value-based.
+        return { landedOnPreState: false, inspectOnly: false, ramRolledBack: false, movedForward: false };
+      }
+      const sid = await liveSession(c);
+      // Pre-state: the live CPU before we step forward.
+      const s0 = await state(c, sid);
+      const pc0 = s0.cpu.pc, a0 = s0.cpu.a, x0 = s0.cpu.x, y0 = s0.cpu.y, sp0 = s0.cpu.sp;
+      // Step ONE real instruction (full-machine path → recorded into the delta ring).
+      await c.call("debug/step", { session_id: sid });
+      const s1 = await state(c, sid);
+      const movedForward = s1.cpu.pc !== pc0 || s1.cpu.cycles !== s0.cpu.cycles;
+      // Reverse it.
+      const rev = (await c.call("runtime/reverse_step", { session_id: sid, n: 1 })) as any;
+      // Re-read the live state: the machine must sit back at the pre-step PC.
+      const s2 = await state(c, sid);
+      return {
+        // The WS reply landed on the exact pre-step CPU state.
+        landedOnPreState:
+          rev?.stepsTaken === 1 &&
+          rev?.pc === pc0 && rev?.a === a0 && rev?.x === x0 && rev?.y === y0 && rev?.sp === sp0,
+        // The contract flag is surfaced (inspect-only).
+        inspectOnly: rev?.inspectOnly === true,
+        // The LIVE machine PC rolled back (not just the reply).
+        ramRolledBack: s2.cpu.pc === pc0,
+        // Sanity: the forward step actually moved (so the reverse undid something real).
+        movedForward,
+      };
+    },
+  },
+
+  // ── P1: ws-who-wrote — last-writer scan over the live delta ring (reverse-debug 1b)
+  // NON-GATING (blocked): the stack-crash shortcut "who put the bad byte on $XXXX". TS
+  // has no equivalent live last-writer scan over an always-on delta ring; asserted on
+  // TRX64 alone (--include-blocked).
+  //   tsx src/conformance.ts --only ws-who-wrote --include-blocked
+  //
+  // FLOW (TRX64): the booted KERNAL idle loop + jiffy IRQ continuously write the zero-page
+  // jiffy clock ($00A0-$00A2) and other ZP. After settling, `runtime/who_wrote {addr:
+  // 0x00A2}` must return ≥1 writer with a KERNAL/RAM PC and a coherent old→new pair. We
+  // also pin a KNOWN write deterministically: step until the live PC's instruction stores
+  // to a zero-page byte is hard to guarantee, so we additionally assert the structural
+  // contract (writers[] shape, newest-first) on whatever the live ring captured.
+  {
+    id: "ws-who-wrote",
+    severity: "P1",
+    blocked:
+      "TRX64 superset: no TS equivalent live last-writer scan over an always-on delta " +
+      "ring; asserted on TRX64 alone (run with --include-blocked).",
+    title: "runtime/who_wrote pins the last writer(s) of an address from the live delta ring — TRX64 reverse-debug superset",
+    // --stream: the per-frame stream loop is the free-run driver, so `debug/run` actually
+    // advances the machine past READY (without it `waitRunningBooted` never reaches 3.8M).
+    spawn: { stream: true },
+    async signal(c, d) {
+      if (d.kind !== "trx64") {
+        return { foundWriter: false, newestFirst: false, oldNewCoherent: false };
+      }
+      const sid = await liveSession(c);
+      // Run WELL PAST the BASIC READY prompt: the jiffy clock LSB ($00A2) is only
+      // incremented once the editor IRQ (CINV→$EA31→UDTIM) is live, which is AFTER the
+      // KERNAL reset finishes (~2M cyc). Settle to ~4M cyc so several `INC $A2`s have
+      // landed in the ring (each frame ≈ 19656 cyc → dozens of increments).
+      await c.call("debug/run", { session_id: sid });
+      await waitRunningBooted(c, sid, 3_800_000, 90_000);
+      await sleep(800);
+      await c.call("debug/step", { session_id: sid }); // settle to a paused boundary
+      // $00A2 = jiffy-clock LSB, incremented by the KERNAL timer IRQ every frame; over a
+      // multi-frame post-READY window it is a guaranteed live writer in the ring.
+      const r = (await c.call("runtime/who_wrote", { session_id: sid, addr: 0x00a2, limit: 8 })) as any;
+      const writers: any[] = Array.isArray(r?.writers) ? r.writers : [];
+      const foundWriter = writers.length >= 1;
+      // Newest-first ordering: cycles non-increasing.
+      let newestFirst = true;
+      for (let i = 1; i < writers.length; i++) {
+        if (writers[i].cycle > writers[i - 1].cycle) { newestFirst = false; break; }
+      }
+      // Each hit is structurally coherent: addr matches, old/new are bytes, a real PC.
+      const oldNewCoherent =
+        foundWriter &&
+        writers.every(
+          (w) => w.addr === 0x00a2 && w.old >= 0 && w.old <= 255 && w.new >= 0 && w.new <= 255 && typeof w.pc === "number" && w.pc > 0,
+        );
+      return { foundWriter, newestFirst, oldNewCoherent };
+    },
+  },
+
   // ── P1: ws-trace-monitor-misc-13 — monitor `flow`/`bt` report LIVE state ──────
   // TS monitor-shell.ts:1103-1115: `flow` reports the live interrupt/trap frame
   // state and `bt` scans the ACTUAL 6502 stack for JSR-return candidates

@@ -26,6 +26,7 @@ use crate::c64_6510core::{
 };
 use crate::cia::CIAT_TABLEN;
 use crate::cpu_history::CpuHistoryRing;
+use crate::delta_ring::DeltaRing;
 use crate::full::FullBus;
 use crate::{BusKind, Observer};
 
@@ -49,6 +50,13 @@ pub struct FullScBus<'a, 'o, 'w, 'h, O: Observer> {
     /// live machine ring (none today; kept optional so a future caller can opt out
     /// without the ring leaking into the bus type's contract).
     pub cpu_history: Option<&'h mut CpuHistoryRing>,
+    /// Always-on FULL-DELTA undo ring (reverse-debug Phase 1b). `write_raw` /
+    /// `write_raw_dummy` forward each write's `{addr, old, new}` here via
+    /// `record_write`; `execute_one` brackets the instruction with `begin` (CPU
+    /// pre-state) / `commit` so the entry is self-sufficient to UNDO. SAME `'h`
+    /// borrow lifetime as `cpu_history` (distinct field, so the two `&mut` borrows of
+    /// `Machine` are disjoint). `None` only where a bus is built without a live ring.
+    pub delta_ring: Option<&'h mut DeltaRing>,
     /// Per-address access-watch table (Spec 754 §3.3e watchpoint gate). `None`
     /// when no watchpoint is armed = the single zero-cost branch the TS BUG-049
     /// zero-idle-cost discipline requires; the `on_access` hook is reached ONLY
@@ -194,6 +202,14 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
         } else {
             0
         };
+        // reverse-debug Phase 1b — pre-write value of the $00/$01 CPU port (the trace
+        // window above excludes it, but the undo log must restore it). Only read for the
+        // 2-byte port window — a rare write, so the branch is near-free on the hot path.
+        let port_pre_old = if addr < 0x0002 {
+            crate::cpu::Bus::read(&mut self.fb, addr)
+        } else {
+            0
+        };
         crate::cpu::Bus::write(&mut self.fb, addr, value);
         let pc = self.pc();
         let clk = self.clk();
@@ -203,6 +219,20 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
             self.obs.on_bus(BusKind::Write, a, v, pc, clk, o);
         }
         self.obs.on_bus(BusKind::Write, addr, value, pc, clk, old);
+        // reverse-debug Phase 1b — feed the full-delta undo ring. The undo `old` covers
+        // the WHOLE side-effect-free CPU window $0000..$D000 (RAM + the $00/$01 CPU port
+        // — the port matters: a corrupted $01 unmaps the KERNAL, a crash cause we must be
+        // able to roll back). For $0002..$D000 we reuse the trace `old` (no extra read);
+        // for the $00/$01 port we read it back here (the trace records 0 there by its own
+        // contract, unchanged). The IO window ($D000-$DFFF) records the trace `old` (0) —
+        // reverse-step excludes chip internal counters, so the IO byte is best-effort. The
+        // side-effect writes (CIA→$DD00 IEC re-push etc.) are chip plumbing, NOT undone.
+        if let Some(dr) = self.delta_ring.as_deref_mut() {
+            // $00/$01 → the pre-write port value captured above (the trace `old` is 0
+            // there); $0002..$D000 → reuse the trace `old`; $D000+ → the trace `old` (0).
+            let undo_old = if addr < 0x0002 { port_pre_old } else { old };
+            dr.record_write(addr, undo_old, value);
+        }
         // Spec 754 §3.3e watchpoint gate (= cpu65xx-vice.ts:495 store):
         // `if (accessWatch && accessWatch[addr]) onObservedAccess("WRITE", ...)`.
         // A hit sets halt_requested; the run loop stops at the next boundary.
@@ -259,6 +289,13 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
         let pc = self.pc();
         let clk = self.clk();
         self.obs.on_bus(BusKind::DummyWrite, addr, value, pc, clk, old);
+        // reverse-debug Phase 1b — the RMW dummy write-back is a real bus store; record
+        // it so the undo restores `old` even if the instruction is interrupted between
+        // the dummy and the real write. The real `write_raw` records a second entry
+        // (old→new); `who_wrote`'s intra-instruction "last write wins" picks the real one.
+        if let Some(dr) = self.delta_ring.as_deref_mut() {
+            dr.record_write(addr, old, value);
+        }
     }
 
     /// check_ba (mainc64cpu.c:194-208) — the VIC BA cycle-steal. Reuses the
@@ -356,6 +393,23 @@ pub fn execute_one<O: Observer>(
     int: &mut IntStatus,
 ) -> i32 {
     bus.fetch = None;
+    // reverse-debug Phase 1b — open the full-delta undo entry with the CPU PRE-state
+    // BEFORE the instruction runs (the state reverse-step lands on). The pre-PC is the
+    // live reg_pc (= the opcode address, before any fetch advances it); `p` is the
+    // COMPOSITE status (all flags intact — byte-exact restore, unlike the trace `p`).
+    // Each store inside the instruction appends via `record_write`; `commit` publishes
+    // it at retire. `begin` reads the pre-state cheaply (a few field copies into a
+    // scratch); on the disabled path it is a single early-return.
+    let pre_pc = core.reg_pc;
+    let pre_a = core.reg_a;
+    let pre_x = core.reg_x;
+    let pre_y = core.reg_y;
+    let pre_sp = core.reg_sp;
+    let pre_p = core.status();
+    let pre_clk = core.clk;
+    if let Some(dr) = bus.delta_ring.as_deref_mut() {
+        dr.begin(pre_pc, pre_a, pre_x, pre_y, pre_sp, pre_p, pre_clk);
+    }
     let result = c64_6510core_execute(core, bus, int);
     if let Some((opcode_pc, opcode, _p1, _p2hi, _fetch_clk)) = bus.fetch.take() {
         // POST-instruction clk minus the one trailing clk_inc, reproducing
@@ -426,6 +480,15 @@ pub fn execute_one<O: Observer>(
                 clk,
             );
         }
+    }
+    // reverse-debug Phase 1b — publish the full-delta entry. Committed UNCONDITIONALLY
+    // after the execute (not only inside the `fetch` block): an interrupt-only dispatch
+    // (no normal opcode body) still pushed PCH/PCL/P onto the stack via `write_raw`, and
+    // those pushes must be undoable as part of this execute's atomic delta. `commit`
+    // pairs the recorded writes with the pre-state header `begin` opened (a no-op when
+    // the ring is disabled or `begin` never ran).
+    if let Some(dr) = bus.delta_ring.as_deref_mut() {
+        dr.commit();
     }
     result
 }

@@ -3695,6 +3695,78 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             Ok(lines.join("\n"))
         }
 
+        // reverse-debug Phase 1b — `rstep`/`reverse [n]`: UNDO the last n instructions
+        // from the always-on full-delta ring (default 1). Restores CPU + RAM +
+        // IO-register BYTES, NOT chip internal counters → INSPECT-backward only (to
+        // resume forward, restore a checkpoint anchor). Reports the landed PC/regs +
+        // the writes rolled back.
+        "rstep" | "reverse" => {
+            let n: usize = toks
+                .get(1)
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(1)
+                .max(1);
+            match st.session.machine.reverse_step(n) {
+                Ok(out) => {
+                    let l = out.landed;
+                    let mut lines = vec![format!(
+                        "reverse-step: undid {} instruction(s) → landed @ ${:04X}  A=${:02X} X=${:02X} Y=${:02X} SP=${:02X} P=${:02X}  cyc={}",
+                        out.steps_taken, l.pc, l.a, l.x, l.y, l.sp, l.p, l.cycle
+                    )];
+                    if out.undone_writes.is_empty() {
+                        lines.push("  (no memory writes were rolled back)".to_string());
+                    } else {
+                        lines.push(format!("  rolled back {} write(s) (newest first):", out.undone_writes.len()));
+                        for w in out.undone_writes.iter().take(32) {
+                            lines.push(format!(
+                                "    ${:04X}: ${:02X} <- ${:02X}  (restored old)",
+                                w.addr, w.old_value, w.new_value
+                            ));
+                        }
+                        if out.undone_writes.len() > 32 {
+                            lines.push(format!("    … +{} more", out.undone_writes.len() - 32));
+                        }
+                    }
+                    lines.push("  NOTE: inspect-backward only — CPU+RAM+IO bytes restored, NOT chip counters (VIC raster / CIA timers). Restore a checkpoint anchor to resume forward.".to_string());
+                    Ok(lines.join("\n"))
+                }
+                Err(e) => Err(e),
+            }
+        }
+
+        // reverse-debug Phase 1b — `whowrote <addr>`: the stack-crash shortcut. Scan
+        // the always-on delta ring's writes BACKWARD for the last writer(s) of <addr>
+        // → the instruction PC + cycle + old→new bytes, newest first.
+        "whowrote" => {
+            let addr = match parse_addr(toks.get(1)) {
+                Some(a) => a,
+                None => return Err("whowrote: need an address, e.g. `whowrote 01f5`".into()),
+            };
+            let limit = toks
+                .get(2)
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(8)
+                .clamp(1, 64);
+            let hits = st.session.machine.who_wrote(addr, limit);
+            if hits.is_empty() {
+                return Ok(format!(
+                    "whowrote ${addr:04X}: no writer in the live delta ring (window not covered, or never written since the last reset). Older history lives only in a finalized trace."
+                ));
+            }
+            let mut lines = vec![format!(
+                "whowrote ${:04X}: {} writer(s) in the live ring (newest first):",
+                addr,
+                hits.len()
+            )];
+            for h in &hits {
+                lines.push(format!(
+                    "  $ {:04X} <- written by ${:04X} @ cyc {}  (${:02X} -> ${:02X})",
+                    h.addr, h.pc, h.cycle, h.old_value, h.new_value
+                ));
+            }
+            Ok(lines.join("\n"))
+        }
+
         // ---- Live trace gate (Spec 746 / audit misc-2): trace on|off|status|mark --
         // Wires the monitor `trace` verb to the EXISTING trace machinery (TraceState +
         // finalize_trace — the same engine behind trace/start_domains, runtime/mark,
@@ -4571,6 +4643,9 @@ fn monitor_help_text() -> String {
         "    swimlane [list|name] [s] [e]  trace lanes (cpu/irq/nmi/io/1541): list / newest / by name; tail ~2000cy",
         "                     `swimlane <s> <e>` with no covering trace → auto checkpoint-ring replay",
         "    chis [cyc] | chis <s> <e>  cpu instruction history: LIVE cpuhistory ring first (works while a trace is active), falls back to the captured trace; last N cyc (default 4000) or a window",
+        "  REVERSE-DEBUG (always-on full-delta ring — no pre-arming; inspect-backward only)",
+        "    rstep [n] | reverse [n]   UNDO the last n instructions (default 1): restore CPU+RAM+IO bytes to before them; reports the landed regs + writes rolled back",
+        "    whowrote <addr> [n]       last n writer(s) of <addr> from the ring (newest first): PC + cycle + old->new — the stack-crash shortcut",
         "  KNOWLEDGE (reads the project _analysis.json that covers the address)",
         "    inspect <a> [stem]  segment kind/label + xrefs at a",
         "    xref <a> [stem]     who calls/jumps/reads/writes a (in + out)",
@@ -6883,6 +6958,71 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 "eventCount": event_count,
                 "marks": marks,
                 "label": label
+            }))
+        }
+
+        // reverse-debug Phase 1b — UNDO the last n instructions from the always-on
+        // full-delta ring (default 1). Restores CPU + RAM + IO-register bytes to the
+        // state before them (NOT chip internal counters → inspect-backward only).
+        // Returns the landed {pc, regs} + the writes rolled back.
+        "runtime/reverse_step" => {
+            let n = req.params.get("n").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
+            let mut st = state.lock().unwrap();
+            match st.session.machine.reverse_step(n) {
+                Ok(out) => {
+                    let l = out.landed;
+                    let writes: Vec<Value> = out
+                        .undone_writes
+                        .iter()
+                        .map(|w| json!({
+                            "addr": w.addr,
+                            "old": w.old_value,
+                            "new": w.new_value,
+                        }))
+                        .collect();
+                    Response::ok(id, json!({
+                        "stepsTaken": out.steps_taken,
+                        "pc": l.pc,
+                        "a": l.a,
+                        "x": l.x,
+                        "y": l.y,
+                        "sp": l.sp,
+                        "p": l.p,
+                        "cycle": l.cycle,
+                        "undoneWrites": writes,
+                        // The hard contract — surfaced so a caller never treats this as
+                        // a resume-forward point.
+                        "inspectOnly": true,
+                        "note": "CPU+RAM+IO bytes restored; chip internal counters (VIC raster / CIA timers) NOT restored. Restore a checkpoint anchor to resume forward.",
+                    }))
+                }
+                Err(e) => Response::err(id, -32001, e),
+            }
+        }
+
+        // reverse-debug Phase 1b — last writer(s) of an address from the always-on
+        // delta ring, newest first (the stack-crash shortcut "who put the bad byte").
+        "runtime/who_wrote" => {
+            let addr = match req.params.get("addr").and_then(|v| v.as_u64()) {
+                Some(a) => (a & 0xffff) as u16,
+                None => return Response::err(id, -32602, "runtime/who_wrote: missing addr (0-65535)"),
+            };
+            let limit = req.params.get("limit").and_then(|v| v.as_u64()).unwrap_or(8).clamp(1, 64) as usize;
+            let st = state.lock().unwrap();
+            let hits = st.session.machine.who_wrote(addr, limit);
+            let out: Vec<Value> = hits
+                .iter()
+                .map(|h| json!({
+                    "pc": h.pc,
+                    "cycle": h.cycle,
+                    "addr": h.addr,
+                    "old": h.old_value,
+                    "new": h.new_value,
+                }))
+                .collect();
+            Response::ok(id, json!({
+                "addr": addr,
+                "writers": out,
             }))
         }
 

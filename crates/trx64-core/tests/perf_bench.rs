@@ -201,9 +201,14 @@ fn bench_cpuhistory_ring_overhead() {
     let run_once = |ring_on: bool| -> f64 {
         let mut m = Machine::new();
         m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
-        // Toggle the ring AFTER construction (the env is read at new()); explicit so
-        // the bench is deterministic regardless of the ambient TRX64_CPUHISTORY.
+        // Toggle BOTH always-on rings AFTER construction (the env is read at new());
+        // explicit so the bench is deterministic regardless of the ambient
+        // TRX64_CPUHISTORY. reverse-debug Phase 1b: this now measures the FULL hot-path
+        // cost = the CPU-history ring (Phase 1a) + the full-delta undo ring (Phase 1b,
+        // per-instruction begin/commit + per-write record_write). The kill-switch gates
+        // both together in production, so the bench gates both together too.
         m.cpu_history.set_enabled(ring_on);
+        m.delta_ring.set_enabled(ring_on);
         let mut sink = NullSink;
         m.run_for_full(3_000_000, &mut sink, |_, _, _, _, _, _, _| {});
         let chunk = 500_000u64;
@@ -214,11 +219,13 @@ fn bench_cpuhistory_ring_overhead() {
             done += chunk;
         }
         let secs = t0.elapsed().as_secs_f64();
-        // Sanity: the ON run actually recorded into the ring.
+        // Sanity: the ON run actually recorded into BOTH rings; OFF recorded nothing.
         if ring_on {
-            assert!(m.cpu_history.len() > 0, "ring ON but recorded nothing");
+            assert!(m.cpu_history.len() > 0, "cpu-history ring ON but recorded nothing");
+            assert!(m.delta_ring.len() > 0, "delta ring ON but recorded nothing");
         } else {
-            assert_eq!(m.cpu_history.len(), 0, "ring OFF but recorded something");
+            assert_eq!(m.cpu_history.len(), 0, "cpu-history ring OFF but recorded something");
+            assert_eq!(m.delta_ring.len(), 0, "delta ring OFF but recorded something");
         }
         secs
     };

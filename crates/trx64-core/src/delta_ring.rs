@@ -1,0 +1,610 @@
+//! delta_ring.rs — reverse-debug Phase 1b: the always-on FULL-DELTA undo ring.
+//!
+//! Phase 1a (`cpu_history.rs`) is a CPU-only ring (PC + post-instruction regs +
+//! opcode) that `chis` reads. This module ADDS the other half a real *reverse-step*
+//! needs: per retired instruction, the **CPU pre-state** AND every **memory/IO write
+//! that instruction performed** (`{addr, old_value, new_value}`). With both halves an
+//! entry is *self-sufficient to UNDO*: write the `old_value`s back (reverse order) and
+//! restore the CPU registers → the machine sits at the state BEFORE that instruction.
+//!
+//! WHY a SECOND ring (not extend `CpuHistEntry`): `CpuHistEntry` stores POST-instruction
+//! registers with the trace-`p` representation (N/Z + B masked out) — it is the `chis`
+//! display row, locked to a 24-byte layout the perf/layout test pins. Reverse-step needs
+//! the COMPOSITE pre-state P (N/Z/B intact, byte-exact restore) plus a variable-length
+//! write list. Different shape, different lifetime concern → a sibling ring. Both are fed
+//! from the SAME `execute_one` retire point (no second decode/step).
+//!
+//! ALWAYS-ON, NO PRE-ARMING (user decision 2026-06-26): the write capture is NOT gated on
+//! a trace. The bus write path already knows `old_value` (Spec 753 capture, same spot);
+//! `execute_one` forwards each write into this ring every instruction. So a crash's run-up
+//! is ALWAYS reverse-debuggable — `trace on` is only an on-demand DUMP of this ring.
+//!
+//! HOT-PATH DISCIPLINE (~1 MHz): `begin` stamps a scratch pre-state header; `record_write`
+//! is one append into a pre-allocated write slab; `commit` writes the finished entry header
+//! + advances two cursors. NO allocation, NO formatting, one `enabled` branch. Both slabs
+//! are built once at `Machine::new` and never grow.
+//!
+//! MEMORY: sized for ~10 s of 6502 history. ~3M instr × 24 B (entry) + ~3M writes × 8 B
+//! ≈ 72 + 24 ≈ ~96 MB at the default; tunable via `TRX64_REVERSE_SECONDS` (default 10) and
+//! killed by `TRX64_CPUHISTORY=0` (shared kill-switch with Phase 1a — one knob).
+//!
+//! CONTRACT (the hard one): reverse-step restores CPU + RAM + IO-register *bytes*, NOT chip
+//! internal counters (VIC raster / CIA timers / sprite-DMA). After a reverse-step the
+//! machine is for INSPECTION, not resume-forward — to resume forward, restore a checkpoint
+//! anchor (the cycle-exact ring). This module never touches those counters.
+//!
+//! CLONE / SNAPSHOT: like Phase 1a, the ring is LIVE-TIMELINE state, not machine state. A
+//! COW fork / restored snapshot starts FRESH (empty), so `Clone` returns an empty ring of
+//! the same capacities (O(1)); it is never serialized into a `.c64re` snapshot.
+
+/// One recorded memory/IO write. `#[repr(C)]`, 4 bytes: `addr` (u16) + `old_value` +
+/// `new_value` (u8 each). `old_value` is the byte that was at `addr` BEFORE the write
+/// (the undo info); `new_value` is what the instruction stored (for `who_wrote`'s
+/// `old→new` report). Padded to 4 by alignment.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct WriteRec {
+    /// Target address of the write.
+    pub addr: u16,
+    /// Byte at `addr` BEFORE the write (undo value).
+    pub old_value: u8,
+    /// Byte the instruction wrote (for the `old→new` report).
+    pub new_value: u8,
+}
+
+/// One retired-instruction delta record: the CPU PRE-state header + a slice into the
+/// shared write slab (`[write_start, write_start + write_count)`, mapped through the
+/// slab's modulus). `#[repr(C)]`: u64 `cycle` first (8-aligned), then the u32
+/// `write_start`, the u16 `pc`, the u16 `write_count`, then the 6 register bytes →
+/// rounds up to 24 bytes.
+///
+/// REGISTERS are the PRE-execute state (the state to land on after undoing this
+/// instruction). `p` is the **COMPOSITE** status byte (N/Z/B/all flags intact, =
+/// `C64Core6510::status()`), so a restore is byte-exact — unlike `CpuHistEntry.p`,
+/// which masks N/Z/B for the trace.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct DeltaEntry {
+    /// CPU master clock stamp at this instruction's retire (= `CpuHistEntry.cycle`).
+    pub cycle: u64,
+    /// Monotonic index of this entry's first write in the shared write slab. The
+    /// entry's writes are `write_slab[(write_start + k) % writes_cap]` for
+    /// `k in 0..write_count`. Stale once `write_head - write_start > writes_cap`
+    /// (the slab wrapped over them) — see `writes_for`.
+    pub write_start: u32,
+    /// Program counter BEFORE this instruction (the opcode address = landing PC).
+    pub pc: u16,
+    /// Number of writes this instruction performed (0..=~8).
+    pub write_count: u16,
+    /// Accumulator BEFORE this instruction.
+    pub a: u8,
+    /// X BEFORE this instruction.
+    pub x: u8,
+    /// Y BEFORE this instruction.
+    pub y: u8,
+    /// Stack pointer BEFORE this instruction.
+    pub sp: u8,
+    /// COMPOSITE processor status BEFORE this instruction (all flags intact).
+    pub p: u8,
+    /// Padding (keeps the 24-byte `#[repr(C)]` layout explicit / stable).
+    pub _pad: u8,
+}
+
+/// Default reverse-history depth in seconds (user decision: 10 s). Overridable via
+/// `TRX64_REVERSE_SECONDS`.
+pub const DEFAULT_REVERSE_SECONDS: usize = 10;
+
+/// 6502 instructions per second at the PAL ~1 MHz clock, used to size the ring from
+/// the seconds budget. ~1M cyc/s ÷ ~3.5 cyc/instr ≈ ~300k instr/s; round to 300k so
+/// 10 s ≈ 3M instructions (the spec's figure).
+pub const INSTR_PER_SECOND: usize = 300_000;
+
+/// Writes-slab over-provision factor relative to the entry count. Real code averages
+/// well under one write per instruction (loads/branches/compares write nothing), but
+/// store-heavy bursts (block copies, stack pushes, RMW) cluster; 1.25× headroom keeps
+/// the write window aligned with the instruction window so reverse-step / who_wrote see
+/// a consistent depth. (3M instr → 3.75M writes × 8 B ≈ 30 MB.)
+pub const WRITES_PER_INSTR_NUM: usize = 5;
+pub const WRITES_PER_INSTR_DEN: usize = 4;
+
+/// Always-on full-delta undo ring (reverse-debug Phase 1b).
+///
+/// Two flat slabs:
+///  * `entries` — `entry_cap` `DeltaEntry` slots, circular by `entry_head % cap`.
+///  * `writes`  — `writes_cap` `WriteRec` slots, circular by `write_head % cap`.
+///
+/// `entry_head` / `write_head` are monotonic u64 counters (never wrap in practice).
+/// The hot path is `begin` (stash the pre-state header in `cur`), `record_write`
+/// (append into `writes`, bump the in-flight count), `commit` (publish the header,
+/// advance `entry_head`). Zero allocation; both slabs are fixed at construction.
+pub struct DeltaRing {
+    /// Entry slab (pre-state headers). Boxed: lives on the heap, not inline in `Machine`.
+    entries: Box<[DeltaEntry]>,
+    /// Write slab (`{addr, old, new}` per write). Boxed for the same reason.
+    writes: Box<[WriteRec]>,
+    /// Total entries ever committed (monotonic). Newest entry = `(entry_head-1) % cap`.
+    entry_head: u64,
+    /// Total writes ever appended (monotonic). Next write slot = `write_head % cap`.
+    write_head: u64,
+    /// Scratch header for the instruction currently executing (filled by `begin`,
+    /// published by `commit`). `write_start` is the `write_head` at `begin`.
+    cur: DeltaEntry,
+    /// Whether an instruction is in flight (between `begin` and `commit`). Guards a
+    /// stray `record_write` outside an instruction (defensive; never true in product).
+    in_flight: bool,
+    /// Kill-switch (shared `TRX64_CPUHISTORY` knob). When false the whole ring is inert.
+    enabled: bool,
+}
+
+impl DeltaRing {
+    /// Build a ring sized from `TRX64_REVERSE_SECONDS` (default 10 s), honoring the
+    /// shared `TRX64_CPUHISTORY` kill-switch (default-ON).
+    pub fn new() -> Self {
+        let secs = match std::env::var("TRX64_REVERSE_SECONDS") {
+            Ok(v) => v.trim().parse::<usize>().unwrap_or(DEFAULT_REVERSE_SECONDS),
+            Err(_) => DEFAULT_REVERSE_SECONDS,
+        }
+        .max(1);
+        let entry_cap = secs * INSTR_PER_SECOND;
+        let writes_cap = entry_cap * WRITES_PER_INSTR_NUM / WRITES_PER_INSTR_DEN;
+        Self::with_capacity(entry_cap, writes_cap)
+    }
+
+    /// Build a ring with explicit slab sizes (≥ 1 each), honoring the env kill-switch.
+    pub fn with_capacity(entry_cap: usize, writes_cap: usize) -> Self {
+        let ecap = entry_cap.max(1);
+        let wcap = writes_cap.max(1);
+        let enabled = match std::env::var("TRX64_CPUHISTORY") {
+            Ok(v) => {
+                let v = v.trim().to_ascii_lowercase();
+                !(v == "0" || v == "off" || v == "false" || v == "no")
+            }
+            Err(_) => true,
+        };
+        Self {
+            entries: vec![DeltaEntry::default(); ecap].into_boxed_slice(),
+            writes: vec![WriteRec::default(); wcap].into_boxed_slice(),
+            entry_head: 0,
+            write_head: 0,
+            cur: DeltaEntry::default(),
+            in_flight: false,
+            enabled,
+        }
+    }
+
+    /// Entry-slab capacity (max retained instructions).
+    #[inline]
+    pub fn entry_capacity(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Write-slab capacity (max retained writes).
+    #[inline]
+    pub fn writes_capacity(&self) -> usize {
+        self.writes.len()
+    }
+
+    /// Number of valid entries currently retained (`min(entry_head, entry_cap)`).
+    #[inline]
+    pub fn len(&self) -> usize {
+        (self.entry_head as usize).min(self.entries.len())
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.entry_head == 0
+    }
+
+    /// Whether the kill-switch left the ring armed.
+    #[inline]
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Force the armed state (test hook + perf-bench toggle, like Phase 1a).
+    #[inline]
+    pub fn set_enabled(&mut self, on: bool) {
+        self.enabled = on;
+    }
+
+    /// HOT PATH. Open the in-flight instruction: stash its CPU PRE-state header. The
+    /// `p` argument is the COMPOSITE status (all flags). `record_write` calls between
+    /// here and `commit` attach to this entry. No allocation.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin(&mut self, pc: u16, a: u8, x: u8, y: u8, sp: u8, p: u8, cycle: u64) {
+        if !self.enabled {
+            return;
+        }
+        self.cur = DeltaEntry {
+            cycle,
+            write_start: self.write_head as u32,
+            pc,
+            write_count: 0,
+            a,
+            x,
+            y,
+            sp,
+            p,
+            _pad: 0,
+        };
+        self.in_flight = true;
+    }
+
+    /// HOT PATH. Append one write to the in-flight instruction. `old` = the byte at
+    /// `addr` BEFORE the store (the undo value), `new` = the stored byte. One slab
+    /// store + two counter bumps. Overwrites the oldest write slot once full.
+    #[inline]
+    pub fn record_write(&mut self, addr: u16, old: u8, new: u8) {
+        if !self.enabled || !self.in_flight {
+            return;
+        }
+        let cap = self.writes.len();
+        let slot = (self.write_head % cap as u64) as usize;
+        self.writes[slot] = WriteRec { addr, old_value: old, new_value: new };
+        self.write_head = self.write_head.wrapping_add(1);
+        self.cur.write_count = self.cur.write_count.saturating_add(1);
+    }
+
+    /// HOT PATH. Publish the in-flight instruction's header into the entry slab and
+    /// advance `entry_head`. A no-op if `begin` was gated off / never called. One
+    /// struct store + one counter bump.
+    #[inline]
+    pub fn commit(&mut self) {
+        if !self.enabled || !self.in_flight {
+            return;
+        }
+        let cap = self.entries.len();
+        let slot = (self.entry_head % cap as u64) as usize;
+        self.entries[slot] = self.cur;
+        self.entry_head = self.entry_head.wrapping_add(1);
+        self.in_flight = false;
+    }
+
+    /// Drop all history (head reset) without freeing the slabs. Used on a cold reset /
+    /// media swap (the timeline boundary — don't present pre-boundary deltas as
+    /// continuous). The slabs are retained.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.entry_head = 0;
+        self.write_head = 0;
+        self.in_flight = false;
+    }
+
+    /// The newest committed entry (the last retired instruction), or `None` if empty.
+    /// Copy (the struct is 24 B). This is the one reverse-step undoes first.
+    pub fn newest(&self) -> Option<DeltaEntry> {
+        if self.entry_head == 0 {
+            return None;
+        }
+        let cap = self.entries.len();
+        let slot = ((self.entry_head - 1) % cap as u64) as usize;
+        Some(self.entries[slot])
+    }
+
+    /// Whether an entry's writes are still readable (the write slab has NOT wrapped
+    /// over them). The newest entry is always readable; an old one whose
+    /// `write_start + write_count` fell behind `write_head - writes_cap` is stale.
+    #[inline]
+    fn writes_readable(&self, e: &DeltaEntry) -> bool {
+        let wcap = self.writes.len() as u64;
+        // The oldest still-live write index. A write at logical index `i` is live iff
+        // `i >= write_head - wcap`. The entry's writes span [start, start+count).
+        let oldest_live = self.write_head.saturating_sub(wcap);
+        e.write_count == 0 || e.write_start as u64 >= oldest_live
+    }
+
+    /// Copy an entry's writes (in stored order: oldest→newest as recorded) into `out`,
+    /// clearing it first. Empty if the entry has no writes OR they have been
+    /// overwritten (the slab wrapped) — caller checks `out.len() == e.write_count` to
+    /// detect the stale case. NOT on the hot path.
+    pub fn writes_for(&self, e: &DeltaEntry, out: &mut Vec<WriteRec>) {
+        out.clear();
+        if e.write_count == 0 || !self.writes_readable(e) {
+            return;
+        }
+        let cap = self.writes.len();
+        for k in 0..e.write_count as u64 {
+            let slot = ((e.write_start as u64 + k) % cap as u64) as usize;
+            out.push(self.writes[slot]);
+        }
+    }
+
+    /// Pop the newest entry off the ring (un-commit it), exposing the prior entry as
+    /// the new newest. Used by `reverse_step` AFTER it has applied the undo, so a
+    /// second reverse-step targets the previous instruction. Also rewinds the write
+    /// cursor past that entry's writes (they have been undone and are no longer part of
+    /// the live forward timeline). Returns the popped entry, or `None` if empty.
+    ///
+    /// NOTE: rewinding `write_head` is safe because the popped entry is ALWAYS the
+    /// newest, so its writes are the most-recently-appended ones (`write_head -
+    /// write_count .. write_head`) — exactly the tail we drop.
+    pub fn pop_newest(&mut self) -> Option<DeltaEntry> {
+        if self.entry_head == 0 {
+            return None;
+        }
+        let e = self.newest().unwrap();
+        self.entry_head -= 1;
+        // Rewind the write cursor past this entry's writes (the newest tail).
+        self.write_head = self.write_head.saturating_sub(e.write_count as u64);
+        Some(e)
+    }
+
+    /// Scan the ring's writes BACKWARD (newest→oldest) for the last writer(s) of
+    /// `addr`, returning up to `limit` hits as `(entry, write)` pairs, newest first.
+    /// Stops early at the first entry whose writes have been overwritten (the readable
+    /// window's edge) — beyond it the answer is in the finalized trace, not the ring.
+    /// NOT on the hot path (a `who_wrote` query, not per-instruction).
+    pub fn who_wrote(&self, addr: u16, limit: usize) -> Vec<(DeltaEntry, WriteRec)> {
+        let mut hits = Vec::new();
+        if limit == 0 {
+            return hits;
+        }
+        let len = self.len();
+        if len == 0 {
+            return hits;
+        }
+        let cap = self.entries.len();
+        // Walk entries newest → oldest.
+        for back in 0..len as u64 {
+            let logical = self.entry_head - 1 - back;
+            let slot = (logical % cap as u64) as usize;
+            let e = self.entries[slot];
+            if !self.writes_readable(&e) {
+                // This entry's writes are gone → so are all older ones. Stop.
+                break;
+            }
+            if e.write_count == 0 {
+                continue;
+            }
+            // Scan this instruction's writes newest→oldest (a later write to the same
+            // addr in the same instruction — e.g. RMW dummy then real — wins).
+            let wcap = self.writes.len();
+            for wk in (0..e.write_count as u64).rev() {
+                let wslot = ((e.write_start as u64 + wk) % wcap as u64) as usize;
+                let w = self.writes[wslot];
+                if w.addr == addr {
+                    hits.push((e, w));
+                    if hits.len() >= limit {
+                        return hits;
+                    }
+                    break; // one hit per instruction is enough for the "who wrote" answer
+                }
+            }
+        }
+        hits
+    }
+
+    /// The cycle range currently covered by the entry ring (`Some((oldest, newest))`)
+    /// or `None` when empty. Lets a caller report the reverse window / decide
+    /// ring-vs-trace fallback.
+    pub fn cycle_span(&self) -> Option<(u64, u64)> {
+        let len = self.len();
+        if len == 0 {
+            return None;
+        }
+        let cap = self.entries.len();
+        let oldest_slot = ((self.entry_head - len as u64) % cap as u64) as usize;
+        let newest_slot = ((self.entry_head - 1) % cap as u64) as usize;
+        Some((self.entries[oldest_slot].cycle, self.entries[newest_slot].cycle))
+    }
+}
+
+impl Default for DeltaRing {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// CLONE = a FRESH, EMPTY ring of the same capacities + armed state (live-timeline
+/// state, not machine state — same reasoning as `CpuHistoryRing`). O(1) zeroed slabs.
+impl Clone for DeltaRing {
+    fn clone(&self) -> Self {
+        Self {
+            entries: vec![DeltaEntry::default(); self.entries.len()].into_boxed_slice(),
+            writes: vec![WriteRec::default(); self.writes.len()].into_boxed_slice(),
+            entry_head: 0,
+            write_head: 0,
+            cur: DeltaEntry::default(),
+            in_flight: false,
+            enabled: self.enabled,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: record a whole instruction (begin + writes + commit).
+    fn instr(
+        r: &mut DeltaRing,
+        pc: u16,
+        regs: (u8, u8, u8, u8, u8),
+        cycle: u64,
+        writes: &[(u16, u8, u8)],
+    ) {
+        let (a, x, y, sp, p) = regs;
+        r.begin(pc, a, x, y, sp, p, cycle);
+        for &(addr, old, new) in writes {
+            r.record_write(addr, old, new);
+        }
+        r.commit();
+    }
+
+    #[test]
+    fn entry_and_write_layout_bounded() {
+        assert_eq!(std::mem::size_of::<DeltaEntry>(), 24, "DeltaEntry layout drifted");
+        assert_eq!(std::mem::size_of::<WriteRec>(), 4, "WriteRec layout drifted");
+    }
+
+    #[test]
+    fn begin_record_commit_roundtrip() {
+        let mut r = DeltaRing::with_capacity(16, 64);
+        r.set_enabled(true);
+        instr(&mut r, 0x1000, (1, 2, 3, 0xfd, 0x30), 100, &[(0x0400, 0x20, 0x41)]);
+        assert_eq!(r.len(), 1);
+        let e = r.newest().unwrap();
+        assert_eq!(e.pc, 0x1000);
+        assert_eq!(e.a, 1);
+        assert_eq!(e.sp, 0xfd);
+        assert_eq!(e.p, 0x30);
+        assert_eq!(e.write_count, 1);
+        let mut w = Vec::new();
+        r.writes_for(&e, &mut w);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0], WriteRec { addr: 0x0400, old_value: 0x20, new_value: 0x41 });
+    }
+
+    #[test]
+    fn multi_write_instruction_order_preserved() {
+        let mut r = DeltaRing::with_capacity(8, 32);
+        r.set_enabled(true);
+        // An instruction (e.g. an interrupt push or RMW) with 3 writes.
+        instr(
+            &mut r,
+            0x2000,
+            (0, 0, 0, 0xff, 0x24),
+            500,
+            &[(0x01ff, 0xaa, 0x20), (0x01fe, 0xbb, 0x00), (0x01fd, 0xcc, 0x24)],
+        );
+        let e = r.newest().unwrap();
+        assert_eq!(e.write_count, 3);
+        let mut w = Vec::new();
+        r.writes_for(&e, &mut w);
+        assert_eq!(w.len(), 3);
+        assert_eq!(w[0].addr, 0x01ff);
+        assert_eq!(w[1].addr, 0x01fe);
+        assert_eq!(w[2].addr, 0x01fd);
+    }
+
+    #[test]
+    fn pop_newest_exposes_prior_and_rewinds_writes() {
+        let mut r = DeltaRing::with_capacity(8, 32);
+        r.set_enabled(true);
+        instr(&mut r, 0x100, (0, 0, 0, 0xff, 0), 10, &[(0x10, 0, 1)]);
+        instr(&mut r, 0x102, (0, 0, 0, 0xff, 0), 12, &[(0x11, 0, 2), (0x12, 0, 3)]);
+        assert_eq!(r.len(), 2);
+        // Pop the newest (2 writes) → write_head rewinds by 2, len 1.
+        let popped = r.pop_newest().unwrap();
+        assert_eq!(popped.pc, 0x102);
+        assert_eq!(popped.write_count, 2);
+        assert_eq!(r.len(), 1);
+        let now = r.newest().unwrap();
+        assert_eq!(now.pc, 0x100);
+        let mut w = Vec::new();
+        r.writes_for(&now, &mut w);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].addr, 0x10);
+    }
+
+    #[test]
+    fn entry_ring_wraps() {
+        let mut r = DeltaRing::with_capacity(4, 64);
+        r.set_enabled(true);
+        for i in 0..10u64 {
+            instr(&mut r, 0x300 + i as u16, (0, 0, 0, 0xff, 0), 1000 + i, &[(i as u16, 0, 1)]);
+        }
+        assert_eq!(r.len(), 4, "entry len caps at entry_cap after wrap");
+        // Newest is the last push.
+        assert_eq!(r.newest().unwrap().pc, 0x300 + 9);
+        // The oldest surviving entry is i=6 (last 4 = 6,7,8,9).
+        let (oldest_cyc, newest_cyc) = r.cycle_span().unwrap();
+        assert_eq!(oldest_cyc, 1006);
+        assert_eq!(newest_cyc, 1009);
+    }
+
+    #[test]
+    fn who_wrote_finds_last_writer_newest_first() {
+        let mut r = DeltaRing::with_capacity(16, 64);
+        r.set_enabled(true);
+        // $01F5 written three times by three instructions; who_wrote must list newest first.
+        instr(&mut r, 0xa00, (0, 0, 0, 0xff, 0), 1, &[(0x01f5, 0x00, 0x11)]);
+        instr(&mut r, 0xb00, (0, 0, 0, 0xff, 0), 2, &[(0x0200, 0x00, 0x99)]); // unrelated
+        instr(&mut r, 0xc00, (0, 0, 0, 0xff, 0), 3, &[(0x01f5, 0x11, 0x22)]);
+        instr(&mut r, 0xd00, (0, 0, 0, 0xff, 0), 4, &[(0x01f5, 0x22, 0x33)]);
+        let hits = r.who_wrote(0x01f5, 5);
+        assert_eq!(hits.len(), 3);
+        // Newest first: $D00 (3) → $C00 (2) → $A00 (1).
+        assert_eq!(hits[0].0.pc, 0xd00);
+        assert_eq!(hits[0].1, WriteRec { addr: 0x01f5, old_value: 0x22, new_value: 0x33 });
+        assert_eq!(hits[1].0.pc, 0xc00);
+        assert_eq!(hits[2].0.pc, 0xa00);
+        // limit honored.
+        let one = r.who_wrote(0x01f5, 1);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].0.pc, 0xd00);
+        // unknown addr → no hits.
+        assert!(r.who_wrote(0x9999, 5).is_empty());
+    }
+
+    #[test]
+    fn who_wrote_picks_last_write_within_an_instruction() {
+        // A single instruction that writes $50 twice (RMW dummy-then-real); who_wrote
+        // must report the LATER (real) write.
+        let mut r = DeltaRing::with_capacity(8, 32);
+        r.set_enabled(true);
+        instr(&mut r, 0x400, (0, 0, 0, 0xff, 0), 7, &[(0x0050, 0x05, 0x05), (0x0050, 0x05, 0x06)]);
+        let hits = r.who_wrote(0x0050, 5);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].1.new_value, 0x06, "last write within the instruction wins");
+    }
+
+    #[test]
+    fn stale_writes_stop_who_wrote_at_window_edge() {
+        // Tiny write slab forces the oldest entry's writes to be overwritten while the
+        // entry header still lives. who_wrote must stop at the readable edge, not read
+        // garbage.
+        let mut r = DeltaRing::with_capacity(8, 4); // 4-write slab.
+        r.set_enabled(true);
+        // 6 instructions, 1 write each → write_head=6, slab holds the last 4 writes.
+        for i in 0..6u64 {
+            instr(&mut r, 0x500 + i as u16, (0, 0, 0, 0xff, 0), 100 + i, &[(0x80, i as u8, (i + 1) as u8)]);
+        }
+        // The 2 oldest writes (i=0,1) are overwritten; entries 0,1 are stale.
+        let hits = r.who_wrote(0x80, 99);
+        // Only entries whose writes survived (i=2..5 = 4 writes) are reported.
+        assert_eq!(hits.len(), 4, "who_wrote stops at the readable write window");
+        assert_eq!(hits[0].0.pc, 0x505, "newest reported first");
+    }
+
+    #[test]
+    fn disabled_records_nothing() {
+        let mut r = DeltaRing::with_capacity(8, 32);
+        r.set_enabled(false);
+        instr(&mut r, 0x1, (0, 0, 0, 0, 0), 1, &[(0x10, 0, 1)]);
+        assert_eq!(r.len(), 0);
+        assert!(r.newest().is_none());
+        assert!(r.who_wrote(0x10, 5).is_empty());
+    }
+
+    #[test]
+    fn clear_drops_history_keeps_capacity() {
+        let mut r = DeltaRing::with_capacity(8, 32);
+        r.set_enabled(true);
+        for i in 0..5u64 {
+            instr(&mut r, i as u16, (0, 0, 0, 0xff, 0), i, &[(i as u16, 0, 1)]);
+        }
+        assert_eq!(r.len(), 5);
+        r.clear();
+        assert_eq!(r.len(), 0);
+        assert_eq!(r.entry_capacity(), 8);
+        assert_eq!(r.writes_capacity(), 32);
+        instr(&mut r, 0x9, (0, 0, 0, 0xff, 0), 9, &[]);
+        assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn clone_is_empty_same_capacity() {
+        let mut r = DeltaRing::with_capacity(32, 64);
+        r.set_enabled(true);
+        for i in 0..10u64 {
+            instr(&mut r, i as u16, (0, 0, 0, 0xff, 0), i, &[(i as u16, 0, 1)]);
+        }
+        let c = r.clone();
+        assert_eq!(c.entry_capacity(), 32);
+        assert_eq!(c.writes_capacity(), 64);
+        assert_eq!(c.len(), 0, "clone starts empty");
+        assert!(c.enabled());
+    }
+}
