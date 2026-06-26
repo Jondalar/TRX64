@@ -4,13 +4,9 @@
 A native (Rust) cycle-exact Commodore 64 + 1541 emulator that you drive over a
 WebSocket JSON-RPC API.
 
-You don't swap "a core" — you swap **the process behind `ws://127.0.0.1:<port>`**.
-The C64RE workbench, its UI, and its 50+ MCP tools stay byte-for-byte unchanged;
-they just talk to whichever process serves the socket. TRX64 speaks the same
-JSON-RPC 2.0 protocol and writes the same `.c64retrace` / `.c64re` formats as the
-TS runtime, so the two are interchangeable — and the TS runtime served as the
-golden oracle that proved TRX64's behavioral parity. TRX64 then goes **beyond** it
-(reverse-debug — see below).
+This is a faithful viceo clone, made with a modern headless and API first aproach in mind. You can use this together with C64RE or any other application - be it a separate front end (I am building my macOS native version currently) or just with an llm. 
+
+.c64re formats are compatible with C64RE, a .vsf compatibility layer is included. TRX64 can read and import .vsf but N O T export. 
 
 ---
 
