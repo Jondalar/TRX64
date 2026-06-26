@@ -2126,6 +2126,51 @@ fn disasm_line_ts_labeled(
     (size, line)
 }
 
+/// reverse-debug Phase 1a — render the LIVE CPU-history ring (`Machine::cpu_history`)
+/// as `chis` cpu-history rows. Each row disassembles the instruction FROM THE RING
+/// ENTRY's captured opcode bytes (pc/opcode/b1/b2) — NOT from live RAM (which may have
+/// changed since the instruction ran), reusing `disasm_line_ts` (the same disassembler
+/// the monitor `d` verb uses). The cycle stamp + post-instruction registers follow the
+/// disasm, matching the swimlane/chis "instruction + state" shape as close as practical:
+///   `c<cycle>  $pc  bb bb bb  MNEMONIC ops   a=.. x=.. y=.. sp=.. p=..`
+/// `entries` are oldest → newest (as `last_n`/`window_by_cycle` produce them).
+fn format_chis_from_ring(entries: &[trx64_core::CpuHistEntry], header: &str) -> String {
+    let mut out = String::new();
+    out.push_str(header);
+    out.push('\n');
+    if entries.is_empty() {
+        out.push_str("(cpuhistory ring empty)");
+        return out;
+    }
+    for e in entries {
+        // Disassemble from the CAPTURED bytes: a 3-byte read window backed by the
+        // entry's own opcode/operands (pc+0=opcode, pc+1=b1, pc+2=b2). Anything
+        // outside that window is unused by a single-instruction disasm.
+        let pc = e.pc;
+        let op = e.opcode;
+        let b1 = e.b1;
+        let b2 = e.b2;
+        let read = move |addr: u16| -> u8 {
+            match addr.wrapping_sub(pc) {
+                0 => op,
+                1 => b1,
+                2 => b2,
+                _ => 0,
+            }
+        };
+        let (_size, line) = disasm_line_ts(read, pc);
+        out.push_str(&format!(
+            "c{:<10} {}   a={:02x} x={:02x} y={:02x} sp={:02x} p={:02x}\n",
+            e.cycle, line, e.a, e.x, e.y, e.sp, e.p
+        ));
+    }
+    // Trim the trailing newline so the block has no blank tail line.
+    while out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
 /// Spec 754 §3.3k — control-flow classification for the `df` static walk. 1:1 with
 /// monitor-flow-disasm.ts `classify`: JMP abs / JMP (ind) / JSR / RTS / RTI / BRK /
 /// conditional branch / normal. `target` carries the abs operand (or, for JMP(ind),
@@ -3866,25 +3911,78 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 }
             }
         }
-        // `chis` — CPU instruction history. TS reconstructs it by checkpoint-ring REPLAY
-        // (restore the nearest anchor, replay forward, capture each instruction). TRX64
-        // reads the cpu lane of the captured `.c64retrace` DIRECTLY via the sidecar — the
-        // same instruction rows are already on disk, no live ring needed (and it's the live
-        // data, not a replay reconstruction). `chis [cyc]` = the last <cyc> cycles
-        // (default 4000); `chis <s> <e>` = an explicit window. Same swimlane formatter.
+        // `chis` — CPU instruction history (VICE `cpuhistory`). reverse-debug Phase 1a.
+        //
+        // SOURCE PRIORITY:
+        //   1. LIVE ring (`Machine::cpu_history`) — the last N executed instructions,
+        //      always-on, NO trace/finalize/sidecar dependency. This is the USER'S FLOW:
+        //      they run WITH the trace ON and type `chis` → the ring serves it instantly.
+        //      `chis` = last 4000 CYCLES from the ring's newest; `chis <cyc>` = last <cyc>
+        //      cycles; `chis <s> <e>` = an explicit cycle window. When the ring covers the
+        //      window we render FROM THE RING (the captured opcode bytes + post-instr regs).
+        //   2. FALLBACK to the finalized `.c64retrace` via the sidecar (the historical path,
+        //      commit 57c9191) when the ring is empty OR the requested explicit window is
+        //      OLDER than the ring covers (history beyond the live window).
+        //   3. Honest error when neither source has the data.
         "chis" => {
             let a1 = toks.get(1).map(|s| s.as_str());
             let is_num = |t: Option<&str>| t.map(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).unwrap_or(false);
-            let mut args = json!({ "last_cycles": 4000 });
-            if is_num(a1) {
-                if is_num(toks.get(2).map(|s| s.as_str())) {
-                    args = json!({ "cycle_start": a1.unwrap().parse::<i64>().unwrap_or(0), "cycle_end": toks[2].parse::<i64>().unwrap_or(0) });
+            // Parse the (cycle-based) request, mirroring the historical sidecar args.
+            let explicit_window: Option<(u64, u64)> = if is_num(a1) && is_num(toks.get(2).map(|s| s.as_str())) {
+                Some((
+                    a1.unwrap().parse::<u64>().unwrap_or(0),
+                    toks[2].parse::<u64>().unwrap_or(0),
+                ))
+            } else {
+                None
+            };
+            let last_cycles: u64 = if explicit_window.is_none() && is_num(a1) {
+                a1.unwrap().parse::<u64>().unwrap_or(4000)
+            } else {
+                4000
+            };
+
+            // ── 1. LIVE ring first. ──────────────────────────────────────────────
+            let ring = &st.session.machine.cpu_history;
+            let span = ring.cycle_span(); // Some((oldest, newest)) when non-empty.
+            // Decide whether the ring can serve this request. For an explicit window we
+            // require the window START to be within (or newer than) the ring's oldest
+            // cycle — otherwise the user is asking for history older than the live ring,
+            // which only the finalized trace has → fall back.
+            let ring_can_serve = match (span, explicit_window) {
+                (Some((oldest, _newest)), Some((s, _e))) => s >= oldest,
+                (Some(_), None) => true, // last-N / last-cycles is always within the ring.
+                (None, _) => false,      // empty ring → fall back.
+            };
+            if ring_can_serve {
+                let mut entries: Vec<trx64_core::CpuHistEntry> = Vec::new();
+                let header: String;
+                if let Some((s, e)) = explicit_window {
+                    let (lo, hi) = if s <= e { (s, e) } else { (e, s) };
+                    ring.window_by_cycle(lo, hi, &mut entries);
+                    header = format!("# cpuhistory (live ring) — cycles {lo}–{hi}, {} instr", entries.len());
                 } else {
-                    args = json!({ "last_cycles": a1.unwrap().parse::<i64>().unwrap_or(4000) });
+                    // last_cycles window ending at the ring's newest cycle.
+                    let (_oldest, newest) = span.unwrap();
+                    let lo = newest.saturating_sub(last_cycles);
+                    ring.window_by_cycle(lo, newest, &mut entries);
+                    header = format!("# cpuhistory (live ring) — last {last_cycles} cycles, {} instr", entries.len());
                 }
+                if !entries.is_empty() {
+                    return Ok(format_chis_from_ring(&entries, &header));
+                }
+                // Ring claimed to cover the window but it held no instruction in that
+                // cycle range (e.g. a sub-instruction window): fall through to the trace.
             }
+
+            // ── 2. Fallback: the finalized `.c64retrace` (historical) via the sidecar. ─
+            let mut args = if let Some((s, e)) = explicit_window {
+                json!({ "cycle_start": s as i64, "cycle_end": e as i64 })
+            } else {
+                json!({ "last_cycles": last_cycles as i64 })
+            };
             match current_trace_duckdb(st) {
-                None => Err("chis: no trace store — run `trace on` first (chis reads the cpu lane of the captured trace)".into()),
+                None => Err("chis: no cpu history — the live ring is empty (run the machine) and no trace store exists (run `trace on`). `chis` reads the live cpuhistory ring first, then the captured trace.".into()),
                 Some(db) => {
                     let stem = std::path::Path::new(&db)
                         .file_stem()
@@ -4472,7 +4570,7 @@ fn monitor_help_text() -> String {
         "    taint <a> [cyc]  data-flow taint backward from (cyc,addr)",
         "    swimlane [list|name] [s] [e]  trace lanes (cpu/irq/nmi/io/1541): list / newest / by name; tail ~2000cy",
         "                     `swimlane <s> <e>` with no covering trace → auto checkpoint-ring replay",
-        "    chis [cyc] | chis <s> <e>  cpu instruction history from the captured trace: last N cyc (default 4000), or a window",
+        "    chis [cyc] | chis <s> <e>  cpu instruction history: LIVE cpuhistory ring first (works while a trace is active), falls back to the captured trace; last N cyc (default 4000) or a window",
         "  KNOWLEDGE (reads the project _analysis.json that covers the address)",
         "    inspect <a> [stem]  segment kind/label + xrefs at a",
         "    xref <a> [stem]     who calls/jumps/reads/writes a (in + out)",

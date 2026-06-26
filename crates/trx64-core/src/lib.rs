@@ -16,6 +16,7 @@ pub mod cart;
 pub mod checkpoint_ring;
 pub mod cia;
 pub mod cpu;
+pub mod cpu_history;
 pub mod drive;
 pub mod drive_6510core;
 pub mod drive_snapshot;
@@ -45,6 +46,7 @@ pub mod vsf;
 
 pub use cia::Cia;
 pub use cpu::{Bus, Cpu6510};
+pub use cpu_history::{CpuHistEntry, CpuHistoryRing};
 pub use drive::Drive1541;
 pub use full::{Bank8, BankA, BankE, FullBus, MemConfig};
 pub use iec::IecCore;
@@ -491,6 +493,14 @@ pub struct Machine {
     /// The parsed CRT image backing `cartridge` (name / mapper-type / raw bytes
     /// for the attach record), or None.
     pub cartridge_image: Option<crate::cart::ParsedCartridgeImage>,
+
+    /// Always-on CPU-history ring (reverse-debug Phase 1a). Fed per retired
+    /// instruction from `run_for_full_capped_dbg` (the single full-machine choke
+    /// point) so the monitor `chis` verb has the last N executed instructions LIVE,
+    /// with NO trace/finalize/sidecar dependency (VICE `cpuhistory`). Default-ON,
+    /// env kill-switch `TRX64_CPUHISTORY=0`. NOT machine state: `Clone` yields an
+    /// empty ring (live-timeline, not snapshot state), and it is never serialized.
+    pub cpu_history: crate::cpu_history::CpuHistoryRing,
 }
 
 /// ROM load error.
@@ -551,6 +561,7 @@ impl Machine {
             drive_c64_ref: 0,
             cartridge: None,
             cartridge_image: None,
+            cpu_history: crate::cpu_history::CpuHistoryRing::new(),
         }
     }
 
@@ -787,6 +798,11 @@ impl Machine {
         // SID: reset register file + voice state to power-on defaults.
         self.sid_regs = [0u8; 32];
         self.sid.reset();
+        // reverse-debug Phase 1a — a cold reset is a timeline boundary: drop the
+        // CPU-history ring so `chis` never presents pre-reset instructions as
+        // continuous with the fresh boot (report the boundary, don't fake it). The
+        // slab is retained (clear() only resets the head).
+        self.cpu_history.clear();
         self.sync_snapshot();
     }
 
@@ -1323,6 +1339,7 @@ impl Machine {
                 let mut bus = full_sc::FullScBus {
                     fb,
                     obs,
+                    cpu_history: Some(&mut self.cpu_history),
                     core_pc,
                     core_clk,
                     fetch: None,

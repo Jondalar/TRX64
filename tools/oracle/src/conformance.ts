@@ -1771,6 +1771,94 @@ const CASES: ConfCase[] = [
     },
   },
 
+  // ── P1: ws-trace-chis-live — `chis` works LIVE from the always-on cpuhistory ring
+  // THE USER BUG (reverse-debug Phase 1a). The user runs the machine and types `chis`
+  // (the obvious VICE cpuhistory verb) WHILE a trace is active. The FINALIZED path
+  // (ws-trace-e2e-read, commit 57c9191) reads the captured .c64retrace via the sidecar
+  // — but that needs a FINALIZED trace (after `trace off` + index build); a LIVE
+  // (still-capturing) trace has no readable index yet, so live `chis` failed. TRX64 now
+  // serves it from an always-on in-memory cpuhistory ring (Machine::cpu_history), fed
+  // per retired instruction at the same point the trace cpu-row hook fires — NO trace /
+  // finalize / sidecar dependency.
+  //
+  // THE COMPARABLE (differential) FLOW — gated here: `chis` LIVE during a free-run with
+  // NO active trace. BOTH runtimes serve this from their live ring (TS replays its
+  // checkpoint ring; TRX64 reads the cpuhistory ring) and BOTH return real cpu
+  // instruction rows (a $XXXX PC), NOT a stub/error/empty. Signal normalized to that
+  // boolean so the differential is apples-to-apples.
+  //
+  // THE SUPERSET (the user's EXACT trace-ACTIVE flow) is verified by `ws-trace-chis-
+  // live-trace-active` below — NON-gating, because TS's chisReplay REFUSES while a
+  // trace is active ("a trace is active — `trace off` first", ws-server.ts:1965) whereas
+  // TRX64's ring serves it. That divergence is TRX64 being strictly better, so the
+  // differential can't be GREEN; it is asserted on TRX64 alone there.
+  {
+    id: "ws-trace-chis-live",
+    severity: "P1",
+    title: "monitor `chis` returns LIVE cpu history from the ring during free-run (no finalized trace)",
+    spawn: { stream: true },
+    async signal(c) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      await c.call("debug/run", { session_id: sid });
+      await waitRunningBooted(c, sid, 1_500_000, 60_000);
+      // Let the live ring fill (TRX64) AND let TS auto-capture its first checkpoint
+      // (TS chisReplay needs ≥1 ring checkpoint; the tsx daemon is ~4fps, so settle
+      // generously so the no-trace comparable flow is stable on BOTH under 2-daemon load).
+      await sleep(2500);
+      // The USER'S FLOW (comparable form): type `chis` LIVE. NO trace finalize/sidecar.
+      const chisOut = await exec("chis");
+      // "real live history" = a PC hex row AND not an error/stub/empty.
+      const hasLiveHistory =
+        /\$[0-9a-fA-F]{2,4}/.test(chisOut) &&
+        !/unknown command|not supported|no trace store|no trace|no cpu history/i.test(chisOut);
+      return { chisReturnsLiveHistory: hasLiveHistory };
+    },
+  },
+
+  // ── P1: ws-trace-chis-live-trace-active — the user's EXACT flow (TRX64 superset) ──
+  // NON-GATING (blocked): the user types `chis` WHILE a trace is ACTIVE. TRX64 serves it
+  // from the cpuhistory ring (the whole point of Phase 1a); TS's chisReplay throws while
+  // a trace is active (ws-server.ts:1965 `if (ctrl.traceRun.isActive()) throw`). The
+  // differential therefore CANNOT be GREEN — TRX64 is strictly better here — so this is
+  // asserted on the TRX64 daemon alone and reported non-gating, per the reverse-debug
+  // verification doctrine ("NOT the differential gate — TRX64 superset"). Run on demand:
+  //   tsx src/conformance.ts --only ws-trace-chis-live-trace-active --include-blocked
+  {
+    id: "ws-trace-chis-live-trace-active",
+    severity: "P1",
+    blocked:
+      "TRX64 superset: TS chisReplay refuses while a trace is active (ws-server.ts:1965), " +
+      "so the differential can't compare. TRX64's cpuhistory ring serves the user's exact " +
+      "trace-ON `chis` flow; asserted on TRX64 alone (run with --include-blocked).",
+    title: "monitor `chis` returns live cpu history WHILE a trace is active (TRX64 cpuhistory-ring superset)",
+    spawn: { stream: true },
+    async signal(c, d) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      await c.call("debug/run", { session_id: sid });
+      await waitRunningBooted(c, sid, 1_500_000, 60_000);
+      // Start a trace and LEAVE IT ACTIVE (do NOT stop / finalize / build the index).
+      await c.call("trace/start_domains", { session_id: sid, domains: ["c64-cpu", "memory"] });
+      await sleep(250);
+      const chisOut = await exec("chis");
+      const isLive = (s: string) =>
+        /\$[0-9a-fA-F]{2,4}/.test(s) &&
+        !/unknown command|not supported|no trace store|no trace|no cpu history|trace is active/i.test(s);
+      // On the TRX64 daemon this MUST be live history (the superset). On the TS daemon it
+      // is the documented refusal; we only assert the TRX64 side (the capability claim).
+      return d.kind === "trx64"
+        ? { chisLiveWhileTracing: isLive(chisOut) }
+        : { chisLiveWhileTracing: false /* TS refuses — documented, non-gating */ };
+    },
+  },
+
   // ── P1: ws-trace-monitor-misc-13 — monitor `flow`/`bt` report LIVE state ──────
   // TS monitor-shell.ts:1103-1115: `flow` reports the live interrupt/trap frame
   // state and `bt` scans the ACTUAL 6502 stack for JSR-return candidates

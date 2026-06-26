@@ -25,6 +25,7 @@ use crate::c64_6510core::{
     c64_6510core_execute, C64Core6510, C64Core6510Bus, IntStatus, OPERAND_BYTES,
 };
 use crate::cia::CIAT_TABLEN;
+use crate::cpu_history::CpuHistoryRing;
 use crate::full::FullBus;
 use crate::{BusKind, Observer};
 
@@ -35,12 +36,19 @@ use crate::{BusKind, Observer};
 ///   * the live `reg_pc`/`clk` threading (read from the core via raw pointers so
 ///     each bus record is stamped exactly as `cpu.rs` stamped it),
 ///   * the verbatim-core cycle hooks (`vic_cycle` / `check_ba` / `process_alarms`).
-pub struct FullScBus<'a, 'o, 'w, O: Observer> {
+pub struct FullScBus<'a, 'o, 'w, 'h, O: Observer> {
     /// The assembled bus — all banking / IO / IEC / keyboard dispatch is reused
     /// verbatim from here.
     pub fb: FullBus<'a>,
     /// Trace observer. on_bus is emitted from `read_raw`/`write_raw`.
     pub obs: &'o mut O,
+    /// Always-on CPU-history ring (reverse-debug Phase 1a). `execute_one` pushes the
+    /// retired instruction here beside the `Observer::on_instruction` trace hook —
+    /// SAME fields, no second decode. Borrowed `&mut` from `Machine::cpu_history`
+    /// each instruction. `None` only on the rare paths that build a bus without a
+    /// live machine ring (none today; kept optional so a future caller can opt out
+    /// without the ring leaking into the bus type's contract).
+    pub cpu_history: Option<&'h mut CpuHistoryRing>,
     /// Per-address access-watch table (Spec 754 §3.3e watchpoint gate). `None`
     /// when no watchpoint is armed = the single zero-cost branch the TS BUG-049
     /// zero-idle-cost discipline requires; the `on_access` hook is reached ONLY
@@ -85,7 +93,7 @@ pub struct FullScBus<'a, 'o, 'w, O: Observer> {
     pub fetched: bool,
 }
 
-impl<'a, 'o, 'w, O: Observer> FullScBus<'a, 'o, 'w, O> {
+impl<'a, 'o, 'w, 'h, O: Observer> FullScBus<'a, 'o, 'w, 'h, O> {
     /// The bus-record `pc` field, to the TS/cpu.rs convention: the reg_pc value
     /// cpu.rs had at the access (= opcode_pc + bytes consumed from the instruction
     /// stream). cpu.rs advanced reg_pc DURING the operand fetch, so by the body's
@@ -141,7 +149,7 @@ impl<'a, 'o, 'w, O: Observer> FullScBus<'a, 'o, 'w, O> {
     }
 }
 
-impl<'a, 'o, 'w, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, O> {
+impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O> {
     /// LOAD path (mainc64cpu.c:359-363) real read. Reuses [`FullBus`]'s banked
     /// read dispatch EXACTLY, then emits the `on_bus(Read)` record (+ any chip
     /// side-effect reads, e.g. the $DD00 IEC `iecReadPins` indirection, emitted
@@ -344,7 +352,7 @@ impl<'a, 'o, 'w, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, O> {
 /// byte for 3-byte opcodes (0 for 1/2-byte, matching `cpu.rs`'s `b2`).
 pub fn execute_one<O: Observer>(
     core: &mut C64Core6510,
-    bus: &mut FullScBus<O>,
+    bus: &mut FullScBus<'_, '_, '_, '_, O>,
     int: &mut IntStatus,
 ) -> i32 {
     bus.fetch = None;
@@ -386,6 +394,7 @@ pub fn execute_one<O: Observer>(
         // core executes on) makes the `p` field match the TS single-path oracle
         // without perturbing the machine. Fixes `iso-trace-stack-flow` (PHP/PLP).
         const P_BREAK: u8 = 0x10;
+        let p_field = core.reg_p & !P_BREAK;
         bus.obs.on_instruction(
             opcode_pc,
             opcode,
@@ -395,9 +404,28 @@ pub fn execute_one<O: Observer>(
             core.reg_x,
             core.reg_y,
             core.reg_sp,
-            core.reg_p & !P_BREAK,
+            p_field,
             clk,
         );
+        // reverse-debug Phase 1a — feed the always-on CPU-history ring with the SAME
+        // retired-instruction fields (no second decode/step). Independent of `obs`:
+        // the ring records even when tracing is off (NullSink) or a non-trace observer
+        // (the breakpoint registry) is attached. The push is a few field stores into a
+        // pre-allocated slab (CpuHistoryRing::push), zero-alloc on this ~1 MHz path.
+        if let Some(ring) = bus.cpu_history.as_deref_mut() {
+            ring.push(
+                opcode_pc,
+                opcode,
+                b1,
+                b2,
+                core.reg_a,
+                core.reg_x,
+                core.reg_y,
+                core.reg_sp,
+                p_field,
+                clk,
+            );
+        }
     }
     result
 }

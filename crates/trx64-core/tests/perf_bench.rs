@@ -179,6 +179,71 @@ fn bench_pure_headless() {
     .report("WORKLOAD 1 — pure headless (CPU+VIC+CIA+SID, no drive)");
 }
 
+// ── Workload 1b: cpuhistory-ring overhead (ring ON vs OFF) ──────────────────
+//
+// reverse-debug Phase 1a perf gate. The always-on CPU-history ring pushes one
+// record per retired instruction on the ~1 MHz hot path; this must be negligible.
+// Runs the SAME pure-headless steady-state workload TWICE on identical machines —
+// once with the ring ENABLED (the shipped default) and once with it DISABLED (the
+// `TRX64_CPUHISTORY=0` kill-switch, via `set_enabled(false)`) — and reports the
+// cycles/sec delta. K medians each; the delta is the cost of `CpuHistoryRing::push`.
+#[test]
+#[ignore = "perf benchmark; run --release with --ignored --nocapture"]
+fn bench_cpuhistory_ring_overhead() {
+    if !roms_present() {
+        eprintln!("skip bench_cpuhistory_ring_overhead: ROMs absent at {ROM_DIR}");
+        return;
+    }
+    // Default 2M cycles/run (the task's "free-run ~2M cycles" measure); override with
+    // TRX64_PURE_BUDGET to match the larger pure bench.
+    let budget = env_budget("TRX64_PURE_BUDGET", 2_000_000);
+
+    let run_once = |ring_on: bool| -> f64 {
+        let mut m = Machine::new();
+        m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+        // Toggle the ring AFTER construction (the env is read at new()); explicit so
+        // the bench is deterministic regardless of the ambient TRX64_CPUHISTORY.
+        m.cpu_history.set_enabled(ring_on);
+        let mut sink = NullSink;
+        m.run_for_full(3_000_000, &mut sink, |_, _, _, _, _, _, _| {});
+        let chunk = 500_000u64;
+        let t0 = Instant::now();
+        let mut done = 0u64;
+        while done < budget {
+            m.run_for_full_capped(chunk, chunk * 2, &mut sink, |_, _, _, _, _, _, _| {});
+            done += chunk;
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        // Sanity: the ON run actually recorded into the ring.
+        if ring_on {
+            assert!(m.cpu_history.len() > 0, "ring ON but recorded nothing");
+        } else {
+            assert_eq!(m.cpu_history.len(), 0, "ring OFF but recorded something");
+        }
+        secs
+    };
+
+    let mut on = Vec::with_capacity(K_RUNS);
+    let mut off = Vec::with_capacity(K_RUNS);
+    for _ in 0..K_RUNS {
+        // Interleave ON/OFF so thermal/scheduler drift hits both equally.
+        on.push(run_once(true));
+        off.push(run_once(false));
+    }
+    let med_on = median(&mut on.clone());
+    let med_off = median(&mut off.clone());
+    let mhz = |s: f64| (budget as f64) / s / 1_000_000.0;
+    let delta_pct = (med_on - med_off) / med_off * 100.0;
+    eprintln!("\n========== WORKLOAD 1b — cpuhistory-ring overhead (ON vs OFF) ==========");
+    eprintln!("  budget = {budget} C64 cycles/run, K = {K_RUNS} timed runs each");
+    eprintln!("  ring OFF (kill-switch)  median : {med_off:.4} s  ({:.3} MHz)", mhz(med_off));
+    eprintln!("  ring ON  (shipped)      median : {med_on:.4} s  ({:.3} MHz)", mhz(med_on));
+    eprintln!("  DELTA (ON vs OFF)              : {delta_pct:+.2}%  (negative = ON faster = within noise)");
+    eprintln!(
+        "  RAW: cpuhistory_overhead budget={budget} k={K_RUNS} off_med_s={med_off:.6} on_med_s={med_on:.6} delta_pct={delta_pct:.3}"
+    );
+}
+
 // ── Workload 2: full-system disk workload (scramble_infinity.d64) ───────────
 //
 // The realistic "running a game" path: boot + mount the D64 + LOAD"*",8,1 + RUN,
