@@ -170,14 +170,21 @@ function vsfModuleDataLen(buf: Buffer, want: string): number {
 
 const CASES: ConfCase[] = [
   // ── P0: ws-session-debug-0 — free-run breakpoint under --stream ────────────
-  // Set a breakpoint on the BASIC idle loop ($E5CD, hit every iteration) while the
+  // Set a breakpoint on the KERNAL IRQ handler ($EA31, hit every frame) while the
   // --stream loop is the live driver. TS gates breakpoints in its per-frame tick,
-  // so the machine HALTS + fires debug/breakpoint_hit|stopped + runState→paused.
-  // TRX64's stream loop checks nothing → never halts. (Audit P0 ws-session-debug-0.)
+  // so the machine HALTS at $EA31 + fires debug/breakpoint_hit(pc=$EA31) +
+  // runState→paused with stopReason "breakpoint". TRX64's stream loop checks nothing
+  // → never halts. (Audit P0 ws-session-debug-0 — HARDENED: the prior signal proved
+  // *a* stop, not that the BP CAUSED it. A budget-pause/JAM/generic pause false-greens
+  // a stream loop that never honours the bp. We now assert (a) the NEGATIVE leg —
+  // free-run with NO bp armed stays running (halted=false), so a generic pause can't
+  // masquerade as the bp halt; (b) the halt PC is exactly $EA31 (session/state cpu.pc)
+  // AND stopReason is "breakpoint"; (c) the broadcast is specifically
+  // debug/breakpoint_hit with params.pc===$EA31 — NOT a bare debug/paused/stopped.)
   {
     id: "ws-session-debug-0",
     severity: "P0",
-    title: "free-run breakpoint under --stream halts the machine",
+    title: "free-run breakpoint under --stream halts AT $EA31 (bp caused it, not a generic pause)",
     spawn: { stream: true },
     async signal(c) {
       const sid = await liveSession(c);
@@ -197,16 +204,40 @@ const CASES: ConfCase[] = [
       // A one-shot debug/run may have left TRX64 paused at the budget; re-arm the
       // continuous driver so the bp test exercises the free-run path, not a one-shot.
       if (st.runState !== "running") await c.call("debug/run", { session_id: sid });
+
+      // ── NEGATIVE leg: free-run with NO breakpoint armed must KEEP RUNNING. ──
+      // This is what makes the positive halt meaningful: a stream loop that pauses
+      // for ANY reason (budget exhaustion, a stray JAM, a generic pause) would have
+      // false-greened the old presence-only signal. Here, no-bp ⇒ still running.
+      await sleep(2000); // let the free-run driver advance several frames with no bp
+      const stNoBp = await state(c, sid);
+      const cycBeforeBp = stNoBp.c64Cycles ?? stNoBp.cycles ?? stNoBp.cpu?.cycles ?? 0;
+      // Re-arm if the boot-window poll above (one-shot path) left it paused.
+      if (stNoBp.runState !== "running") await c.call("debug/run", { session_id: sid });
+
+      // ── POSITIVE leg: arm bp at $EA31; the continuous driver must hit it + halt. ──
       const sink = collectNotes(c);
       await c.call("debug/break_add", { session_id: sid, pc: 0xea31 });
       await sleep(4000); // continuous driver must hit $EA31 + halt
       st = await state(c, sid);
       sink.off();
+      const haltPc = st.cpu?.pc ?? st.pc ?? null;
+      const bpHit = sink.notes.find(
+        (n) => n.method === "debug/breakpoint_hit" && Number((n.params as any)?.pc) === 0xea31,
+      );
       return {
+        // NEGATIVE: with no bp armed the free-run machine never paused.
+        ranWithoutBpStaysRunning: stNoBp.runState === "running",
+        // POSITIVE: the bp halted the machine AT $EA31 (not merely "a stop happened").
         halted: st.runState === "paused",
-        firedHaltBroadcast: sink.notes.some(
-          (n) => n.method === "debug/breakpoint_hit" || n.method === "debug/stopped" || n.method === "debug/paused",
-        ),
+        haltPcIsEa31: Number(haltPc) === 0xea31,
+        stopReasonBreakpoint: st.stopReason === "breakpoint",
+        // BROADCAST: specifically debug/breakpoint_hit with params.pc===$EA31, not a
+        // bare debug/paused/stopped — proves the bp (not a generic pause) drove it.
+        firedBreakpointHitAtEa31: bpHit != null,
+        // Causation sanity: the machine WAS advancing before the bp (so the halt is a
+        // genuine free-run stop, not a never-started session reading paused both ways).
+        advancedBeforeBp: Number(cycBeforeBp) >= 2_500_000,
       };
     },
   },
@@ -699,7 +730,7 @@ const CASES: ConfCase[] = [
   {
     id: "step-run-bus-consistency",
     severity: "P1",
-    title: "step-debug uses the SAME bus as the run path (no run-vs-step observer effect)",
+    title: "step-debug uses the SAME bus as run, CYCLE-COMMENSURATE (same endpoint raster/cycles/PC)",
     async signal(c, d) {
       // $0800: SEI; loop: LDA $D012 / STA $0900 / JMP loop. The raster read is the
       // VIC-liveness probe; the JMP self-loop runs forever so a fixed instruction
@@ -714,61 +745,69 @@ const CASES: ConfCase[] = [
       // VIC-tick vs FlatRam divergence is unambiguous; small enough to stay fast.
       const STEPS = 600;
 
-      // RUN leg: run a cycle budget on a fresh machine, then read the endpoint. We run
-      // a generous cycle budget and DON'T compare raw cycles to the step leg (the run
-      // path stops at a cycle boundary, the step path at an instruction boundary); the
-      // cross-leg invariant we assert is the CAPTURED RASTER liveness + that BOTH legs
-      // see a live (advancing) VIC. The intra-leg PC is also reported.
-      const runLeg = async (rpc: RpcClient) => {
-        const created = (await rpc.call("session/create", {})) as any;
-        const sid = created?.sessionId ?? created?.session_id;
-        await rpc.call("monitor/exec", { session_id: sid, command: PROG });
-        await rpc.call("monitor/exec", { session_id: sid, command: ENTRY });
-        await rpc.call("trace/start_domains", { session_id: sid, domains: ["vic"] });
-        // Sample the raster early, then run a window, then sample again — a LIVE VIC
-        // moves the captured raster; FlatRam leaves it static.
-        await rpc.call("session/run", { session_id: sid, cycles: 200 });
-        const early = ((await rpc.call("runtime/call", {
-          session_id: sid, op: "monitorMemory", args: [0x0900, 0x0900],
-        })) as any)?.[0] ?? -1;
-        await rpc.call("session/run", { session_id: sid, cycles: 8000 });
-        const late = ((await rpc.call("runtime/call", {
-          session_id: sid, op: "monitorMemory", args: [0x0900, 0x0900],
-        })) as any)?.[0] ?? -1;
-        await rpc.call("trace/run/stop", { session_id: sid, wait_index: true }).catch(() => undefined);
-        return { rasterEarly: Number(early), rasterLate: Number(late), live: Number(early) !== Number(late) };
+      const readClkPc = async (rpc: RpcClient, sid: string) => {
+        const st = (await rpc.call("session/state", { session_id: sid })) as any;
+        return {
+          clk: Number(st.c64Cycles ?? st.cpu?.cycles ?? 0),
+          pc: Number(st.cpu?.pc ?? st.pc ?? -1),
+        };
       };
+      const readRaster = async (rpc: RpcClient, sid: string) =>
+        Number(((await rpc.call("runtime/call", {
+          session_id: sid, op: "monitorMemory", args: [0x0900, 0x0900],
+        })) as any)?.[0] ?? -1);
 
-      // STEP leg: single-step the SAME program N instructions on a fresh machine via the
-      // step path, sampling the captured raster early and late the SAME way.
+      // STEP leg FIRST: single-step the SAME program N instructions on a fresh machine
+      // via the step path. Record the EXACT endpoint clk (an instruction boundary), PC,
+      // and the captured raster at $0900. This endpoint clk becomes the RUN leg's budget
+      // so the two legs are CYCLE-COMMENSURATE (the audit HARDEN: the old signal only
+      // proved each leg's VIC *ticked*, not that step ticks it at the SAME RATE as run —
+      // a badline-steal / off-by-one VIC tick under stepping was invisible).
       const stepLeg = async (rpc: RpcClient) => {
         const created = (await rpc.call("session/create", {})) as any;
         const sid = created?.sessionId ?? created?.session_id;
         await rpc.call("monitor/exec", { session_id: sid, command: PROG });
         await rpc.call("monitor/exec", { session_id: sid, command: ENTRY });
         await rpc.call("trace/start_domains", { session_id: sid, domains: ["vic"] });
-        const readRaster = async () =>
-          Number(((await rpc.call("runtime/call", {
-            session_id: sid, op: "monitorMemory", args: [0x0900, 0x0900],
-          })) as any)?.[0] ?? -1);
-        // Step a few iterations to populate $0900, sample early.
-        for (let i = 0; i < 9; i++) await rpc.call("runtime/call", { session_id: sid, op: "stepInto", args: [] });
-        const early = await readRaster();
+        const startClk = (await readClkPc(rpc, sid)).clk;
         for (let i = 0; i < STEPS; i++) await rpc.call("runtime/call", { session_id: sid, op: "stepInto", args: [] });
-        const late = await readRaster();
+        const end = await readClkPc(rpc, sid);
+        const raster = await readRaster(rpc, sid);
         await rpc.call("trace/run/stop", { session_id: sid, wait_index: true }).catch(() => undefined);
-        return { rasterEarly: early, rasterLate: late, live: early !== late };
+        // budget = the cycles the step path actually consumed (= an instruction boundary).
+        return { endClk: end.clk, budget: end.clk - startClk, pc: end.pc, raster };
       };
 
-      // RUN on the case's daemon, STEP on a fresh sibling of the SAME kind (kind-honest:
-      // TS-vs-TS for the TS leg, TRX-vs-TRX for the TRX64 leg).
-      const run = await runLeg(c);
+      // RUN leg: run a cycle budget equal to the step path's consumed cycles on a fresh
+      // machine, then read the endpoint. Because `run_for_full(budget)` stops at the FIRST
+      // instruction boundary where `clk-start >= budget` and `budget` IS a step-path
+      // instruction boundary, the run path lands on the SAME boundary → endpoint clk/PC/
+      // raster must be IDENTICAL to the step leg if (and only if) step and run tick the
+      // VIC at the same rate.
+      const runLeg = async (rpc: RpcClient, budget: number) => {
+        const created = (await rpc.call("session/create", {})) as any;
+        const sid = created?.sessionId ?? created?.session_id;
+        await rpc.call("monitor/exec", { session_id: sid, command: PROG });
+        await rpc.call("monitor/exec", { session_id: sid, command: ENTRY });
+        await rpc.call("trace/start_domains", { session_id: sid, domains: ["vic"] });
+        const startClk = (await readClkPc(rpc, sid)).clk;
+        await rpc.call("session/run", { session_id: sid, cycles: budget });
+        const end = await readClkPc(rpc, sid);
+        const raster = await readRaster(rpc, sid);
+        await rpc.call("trace/run/stop", { session_id: sid, wait_index: true }).catch(() => undefined);
+        return { consumed: end.clk - startClk, pc: end.pc, raster };
+      };
+
+      // STEP on the case's daemon, RUN on a fresh sibling of the SAME kind (kind-honest:
+      // TS-vs-TS for the TS leg, TRX-vs-TRX for the TRX64 leg). Step first to derive the
+      // budget; run second to match it.
+      const step = await stepLeg(c);
       const other = await spawnDaemon(d.kind);
-      let step: { rasterEarly: number; rasterLate: number; live: boolean };
+      let run: { consumed: number; pc: number; raster: number };
       try {
         const oc = await connect(other.endpoint);
         try {
-          step = await stepLeg(oc);
+          run = await runLeg(oc, step.budget);
         } finally {
           oc.close();
         }
@@ -776,13 +815,19 @@ const CASES: ConfCase[] = [
         other.stop();
       }
       return {
-        runLive: run.live,
-        stepLive: step.live,
-        // The observer-effect contract: STEP must engage the VIC exactly as RUN does.
-        // Before the fix the STEP leg ran FlatRam → stepLive=false while runLive=true.
-        // After: both ticking the literal VIC → both live → consistent. (= TS, which has
-        // one execution path so its run and step always agree.)
-        bus_consistent: run.live === step.live,
+        // The cross-leg, cycle-commensurate equality contract (Spec 723 single bus):
+        //   * same cycles consumed for the same instruction boundary,
+        //   * same final PC (both in the 3-instr loop body),
+        //   * same captured raster value at $0900 (the VIC ticked at the SAME rate).
+        // A badline-steal / VIC-tick-rate divergence between step and run breaks one of
+        // these even though "each leg moved" would still hold. TS has ONE execution path
+        // so its run and step always agree; TRX64 must agree too.
+        sameCyclesConsumed: run.consumed === step.budget,
+        samePc: run.pc === step.pc,
+        sameRaster: run.raster === step.raster,
+        // VIC liveness sanity: the captured raster is a real VIC value (0..311), not the
+        // FlatRam static read (a dead VIC would leave $0900 at a fixed boot byte).
+        rasterPlausible: step.raster >= 0 && step.raster <= 0x1ff,
       };
     },
   },
@@ -796,7 +841,7 @@ const CASES: ConfCase[] = [
   {
     id: "streaming-av-5",
     severity: "P1",
-    title: "session/frame_available JSON notification emitted per presented frame",
+    title: "session/frame_available carries the FULL master clock at 1:1 frame cadence (truncated-u32 catch)",
     spawn: { stream: true },
     async signal(c) {
       const sid = await liveSession(c);
@@ -804,17 +849,73 @@ const CASES: ConfCase[] = [
       await c.call("debug/run", { session_id: sid });
       await sleep(3000); // the running stream loop presents frames continuously
       sink.off();
+      // Read the live master clock immediately after the window — the binary frame's
+      // cpu_cycle is a truncated u32, but session/state.c64Cycles is the FULL u64
+      // master clock. The LAST frame_available.c64Cycles must agree with it (the
+      // truncated-u32 catch: a u32-clamped broadcast diverges from the u64 state).
+      const st = (await state(c, sid)) as any;
+      const stClk = Number(st.c64Cycles ?? st.cpu?.cycles ?? 0);
+
       const frameNotes = sink.notes.filter((n) => n.method === "session/frame_available");
       const first = frameNotes[0]?.params as any;
+      const last = frameNotes[frameNotes.length - 1]?.params as any;
+      const frames = frameNotes.map((n) => Number((n.params as any)?.frame));
+      const cycles = frameNotes.map((n) => Number((n.params as any)?.c64Cycles));
+
+      // Δframe between consecutive presented frames is exactly 1 (PAL_PRESENT_DIVISOR=1).
+      let frameStrictlyInc = frames.length >= 2;
+      let frameDeltaAlwaysOne = frames.length >= 2;
+      for (let i = 1; i < frames.length; i++) {
+        const cur = frames[i] ?? NaN, prev = frames[i - 1] ?? NaN;
+        if (!(cur > prev)) frameStrictlyInc = false;
+        if (cur - prev !== 1) frameDeltaAlwaysOne = false;
+      }
+      // c64Cycles is the full master clock, strictly increasing, advancing ONE PAL
+      // frame's worth per presented frame. Each per-frame delta = one frame budget
+      // (CYC_PER_FRAME=19656) + a small instruction-overshoot (run_for_full stops at
+      // the first instruction boundary past the budget, so the EXACT delta jitters by a
+      // few cycles per frame and is NOT identical TS-vs-TRX64 — we do NOT gate on the
+      // exact value). What we DO assert: every delta sits in a plausible PAL-frame band.
+      // A truncated-u32 clock (wraps to tiny deltas), a static clock (delta 0), or a
+      // wrong-scale clock all FALL OUT of this band → caught. The band is a fixed PAL
+      // physical constant, true on BOTH runtimes (so the diff stays green).
+      let cyclesStrictlyInc = cycles.length >= 2;
+      const deltas: number[] = [];
+      for (let i = 1; i < cycles.length; i++) {
+        const cur = cycles[i] ?? NaN, prev = cycles[i - 1] ?? NaN;
+        if (!(cur > prev)) cyclesStrictlyInc = false;
+        deltas.push(cur - prev);
+      }
+      // One PAL frame is 312 lines × 63 cyc = 19656; allow up to one instruction (~7 cyc)
+      // overshoot per frame, plus generous slack for a boot/first-present window outlier.
+      const FRAME_LO = 19656;
+      const FRAME_HI = 19656 + 256;
+      const cadenceAllInFrameBand =
+        deltas.length > 0 && deltas.every((dlt) => dlt >= FRAME_LO && dlt <= FRAME_HI);
+
       return {
-        // The behavioural signal: at least one frame_available notification arrived.
-        gotFrameAvailable: frameNotes.length > 0,
-        // …and it carries the TS payload shape ({session_id, frame, c64Cycles}).
+        // ≥2 notes so "strictly increasing" is a real assertion, not vacuous.
+        gotMultipleFrames: frameNotes.length >= 2,
+        // Payload shape ({session_id, frame, c64Cycles}).
         hasPayloadShape:
-          first != null &&
-          "session_id" in first &&
-          "frame" in first &&
-          "c64Cycles" in first,
+          first != null && "session_id" in first && "frame" in first && "c64Cycles" in first,
+        // frame strictly increasing, one-per-presented-frame.
+        frameStrictlyInc,
+        frameDeltaAlwaysOne,
+        // c64Cycles strictly increasing.
+        cyclesStrictlyInc,
+        // Each per-frame c64Cycles delta is one PAL-frame budget (≈19656) — the clock is
+        // the FULL master clock at 1:1 frame cadence, not a truncated/static/wrong-scale
+        // value. (Boolean band, not the jittery exact delta, so TS≡TRX64.)
+        cadenceAllInFrameBand,
+        // FULL-CLOCK identity: the last broadcast c64Cycles is the same master clock as
+        // session/state (≤ it, within a few frames). A truncated-u32 broadcast would
+        // diverge from the u64 state value once the run crosses 0xFFFFFFFF; here we assert
+        // they are the SAME clock at the SAME scale, in-window.
+        lastCycleIsMasterClock:
+          last != null &&
+          Number(last.c64Cycles) <= stClk &&
+          stClk - Number(last.c64Cycles) <= Math.max(FRAME_HI * 4, 100_000),
       };
     },
   },
@@ -1001,7 +1102,7 @@ const CASES: ConfCase[] = [
   {
     id: "ws-checkpoint-scrub-0",
     severity: "P1",
-    title: 'restore then="keep" inherits the prior run-state (running stays running)',
+    title: 'restore then="keep" inherits the prior run-state (running stays running; paused stays paused)',
     spawn: { stream: true },
     async signal(c) {
       const sid = await liveSession(c);
@@ -1011,18 +1112,49 @@ const CASES: ConfCase[] = [
       let st = await waitRunningBooted(c, sid, 1_500_000, 60_000);
       // Re-arm the continuous driver if a one-shot debug/run left it paused at budget.
       if (st.runState !== "running") await c.call("debug/run", { session_id: sid });
+      // ── PRECONDITION (audit ws-checkpoint-scrub-0 HARDENED) — the keep-restore-of-
+      // RUNNING bug only exists if the machine is GENUINELY running at capture. The old
+      // signal never asserted this: a slow tsx oracle that left the machine paused would
+      // make BOTH legs report "paused" → a mutual-green of the EXACT bug TRX64 had. We
+      // now return the pre-restore run-state and require it be "running" (a never-booted
+      // TS leg then diverges loud instead of silently greening).
+      st = await state(c, sid);
+      const runStateBeforeRunningRestore = st.runState;
       // Capture an anchor of the live (running) state.
-      const cap = (await c.call("checkpoint/capture", { session_id: sid })) as any;
-      const cpId = cap?.ref?.id ?? cap?.id;
+      const capRun = (await c.call("checkpoint/capture", { session_id: sid })) as any;
+      const cpIdRun = capRun?.ref?.id ?? capRun?.id;
       // Restore with then omitted (≡ "keep"). A keep-restore of a RUNNING machine must
       // leave it running.
-      await c.call("checkpoint/restore", { session_id: sid, id: cpId, then: "keep" });
+      await c.call("checkpoint/restore", { session_id: sid, id: cpIdRun, then: "keep" });
       // Give the stream loop a beat to keep advancing if it is (still) running, then read.
       await sleep(1000);
       st = await state(c, sid);
+      const runStateAfterKeepRestore = st.runState;
+
+      // ── SYMMETRIC leg: keep-restore of a PAUSED machine must STAY paused. ──
+      // Pause the machine, confirm paused, capture, keep-restore, re-read. A correct
+      // "keep" inherits paused → paused (the inverse direction of the running case);
+      // a bug that always *forces* a run-state in one direction is caught by one of the
+      // two legs.
+      await c.call("debug/pause", { session_id: sid }).catch(() => undefined);
+      await sleep(300);
+      st = await state(c, sid);
+      const runStateBeforePausedRestore = st.runState;
+      const capPause = (await c.call("checkpoint/capture", { session_id: sid })) as any;
+      const cpIdPause = capPause?.ref?.id ?? capPause?.id;
+      await c.call("checkpoint/restore", { session_id: sid, id: cpIdPause, then: "keep" });
+      await sleep(500);
+      st = await state(c, sid);
+      const runStateAfterPausedKeepRestore = st.runState;
+
       return {
-        // The behavioural signal: a keep-restore of a running machine stays "running".
-        runStateAfterKeepRestore: st.runState,
+        // PRECONDITION: the machine was provably running before the running-leg restore.
+        runStateBeforeRunningRestore,
+        // RUNNING keep-restore stays running.
+        runStateAfterKeepRestore,
+        // PAUSED keep-restore stays paused (symmetric inverse).
+        runStateBeforePausedRestore,
+        runStateAfterPausedKeepRestore,
       };
     },
   },
@@ -1038,23 +1170,41 @@ const CASES: ConfCase[] = [
   {
     id: "ws-checkpoint-scrub-4",
     severity: "P1",
-    title: 'restore then="pause" broadcasts debug/stopped (reason "pause")',
+    title: 'restore then="pause" broadcasts EXACTLY ONE debug/stopped(reason=pause) at the restored anchor coords',
     spawn: { stream: true },
     async signal(c) {
       const sid = await liveSession(c);
       // No need to free-run; a fresh paused machine can capture + restore an anchor.
+      // Read the machine PC at capture so we can assert the restored stop lands there.
+      const stAtCap = await state(c, sid);
+      const pcAtCap = stAtCap.cpu?.pc ?? stAtCap.pc ?? null;
       const cap = (await c.call("checkpoint/capture", { session_id: sid })) as any;
       const cpId = cap?.ref?.id ?? cap?.id;
+      const cpCycles = cap?.ref?.cycles ?? cap?.cycles ?? null;
       const sink = collectNotes(c);
       await c.call("checkpoint/restore", { session_id: sid, id: cpId, then: "pause" });
       await sleep(500);
       sink.off();
       const stopped = sink.notes.filter(
-        (n) => n.method === "debug/stopped" && n.params?.stop?.reason === "pause",
+        (n) => n.method === "debug/stopped" && (n.params as any)?.stop?.reason === "pause",
       );
+      const stop = stopped[0]?.params as any;
+      // The audit HARDEN: bare presence false-greens an impl that pushes a stop with the
+      // WRONG coords (or several). Assert EXACTLY ONE pause-stop, that its {pc,cycles}
+      // match the restored anchor (pc==pc-at-capture, cycles==anchor.cycles), and that
+      // it carries a non-empty registers dump.
       return {
-        // The behavioural signal: a then=pause restore pushes debug/stopped(reason=pause).
-        pushedDebugStoppedPause: stopped.length > 0,
+        // EXACTLY one pause-stop pushed (not zero, not a flurry).
+        pauseStopCount: stopped.length,
+        // Coordinates of the pushed stop == the restored anchor's coordinates.
+        stopReasonPause: stop?.stop?.reason === "pause",
+        stopPcMatchesAnchor: pcAtCap != null && Number(stop?.stop?.pc) === Number(pcAtCap),
+        stopCyclesMatchAnchor: cpCycles != null && Number(stop?.stop?.cycles) === Number(cpCycles),
+        // The stop carries register state (a passive UI renders it on the scrub freeze).
+        hasRegisters:
+          typeof stop?.registers === "string"
+            ? stop.registers.length > 0
+            : stop?.registers != null,
       };
     },
   },
