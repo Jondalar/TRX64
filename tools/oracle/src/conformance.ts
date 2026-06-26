@@ -2134,9 +2134,10 @@ const CASES: ConfCase[] = [
         // TS has no trace/index WS method and it is NOT registered in the c64re
         // TRX64_ONLY_METHODS list (which we must not edit), so it declines with the
         // generic -32601 "method not found" rather than the TRX64-only message. Either
-        // decline is the honest TS signal here: the TS runtime does NOT service this
-        // trace-decode op; TRX64 delivers it. Accept a clean decline of EITHER shape.
-        const tsDeclines = await assertDeclined(c, "trace/index", { session_id: sid });
+        // The TS runtime does NOT service this trace-decode op; TRX64 delivers it.
+        // trace/index is now in the c64re TRX64_ONLY_METHODS set → TS gives the clean
+        // "not supported by the TypeScript runtime" decline (not a generic -32601).
+        const tsDeclines = await assertTrx64OnlyDecline(c, "trace/index", { session_id: sid });
         return { behavesCorrectly: tsDeclines };
       }
       const exec = async (command: string): Promise<string> => {
@@ -2199,10 +2200,11 @@ const CASES: ConfCase[] = [
       const sid = await liveSession(c);
       if (d.kind !== "trx64") {
         // Not registered in the c64re TRX64_ONLY_METHODS list (un-editable here) → the
-        // TS runtime declines with -32601. The TS runtime has no in-process reverse
-        // rings, so declining is the honest signal; TRX64 delivers the knob. Accept a
-        // clean decline of either shape (TRX64-only message OR method-not-found).
-        const tsDeclines = await assertDeclined(c, "runtime/set_reverse_depth", { session_id: sid, seconds: 2 });
+        // The TS runtime has no in-process reverse rings, so declining is the honest
+        // signal; TRX64 delivers the knob. runtime/set_reverse_depth is now in the c64re
+        // TRX64_ONLY_METHODS set → TS gives the clean "not supported by the TypeScript
+        // runtime" decline (not a generic -32601).
+        const tsDeclines = await assertTrx64OnlyDecline(c, "runtime/set_reverse_depth", { session_id: sid, seconds: 2 });
         return { behavesCorrectly: tsDeclines };
       }
       const capOf = (r: any) => Number(r?.deltaEntryCapacity ?? 0);
