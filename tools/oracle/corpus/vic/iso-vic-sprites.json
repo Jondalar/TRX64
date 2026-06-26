@@ -10,5 +10,9 @@
     { "method": "session/run", "params": { "session_id": "$sessionId", "cycles": 25000 }, "capture": true, "label": "run" },
     { "method": "trace/run/stop", "params": { "session_id": "$sessionId", "wait_index": true }, "label": "trace-stop" },
     { "method": "trace/run/status", "params": { "session_id": "$sessionId" }, "capture": true, "label": "trace-status" }
-  ]
+  ],
+  "viceOverrides": {
+    "run": { "c64Cycles": 25000 }
+  },
+  "_viceNote": "VICE-arbitrated. RFL vs VICE x64SC source (viciisc/vicii-cycle.c:590 prefetch_cycles=3+1 + mainc64cpu.c check_ba:194-208 / maincpu_steal_cycles): the VIC sprite-DMA prefetch logic is identical across VICE/TS/TRX64; the 1-cycle is the CPU-side sprite-DMA BA-steal (the SC-core 'STORE write is never check_ba'd' detail — this program's STA $D015/$D001/$D003/$D011). TRX64's c64_6510core.rs is a verbatim 1:1 port of mainc64cpu.c -> 25000 = VICE-correct; TS's Cpu65xxVice records 25001 = 1 cycle off VICE. The golden is TS-recorded (gitignored) so it holds 25001; this viceOverride corrects the expected to VICE-truth (25000) at compare-time so a golden re-record cannot silently revert it. Principle: where TS != VICE, stay VICE-correct, don't degrade TRX64."
 }

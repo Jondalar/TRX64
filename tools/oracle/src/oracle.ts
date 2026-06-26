@@ -118,7 +118,17 @@ async function cmdCompare(scnPath: string): Promise<number> {
   for (let i = 0; i < n; i++) {
     const g = golden.responses[i]!;
     const c = cand.responses[i]!;
-    const d = diffResponses(g.result, c.result, `$.${g.label}`);
+    // VICE-arbitrated override (durable, git-tracked in the scenario): where the TS
+    // runtime is provably LESS accurate than VICE x64SC (the ground truth) on a
+    // cycle-exact value, the golden is TS-RECORDED (and gitignored/regenerable) so it
+    // carries TS's value — but the scenario's `viceOverrides[label]` corrects the
+    // expected value to VICE-truth before the diff. See the scenario's `_viceNote`.
+    const ov = (scn as unknown as { viceOverrides?: Record<string, Record<string, unknown>> })
+      .viceOverrides?.[g.label];
+    const gResult = ov && g.result && typeof g.result === "object"
+      ? { ...(g.result as object), ...ov }
+      : g.result;
+    const d = diffResponses(gResult, c.result, `$.${g.label}`);
     if (d) {
       firstDiv = d;
       break;
