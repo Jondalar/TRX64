@@ -2059,6 +2059,105 @@ const CASES: ConfCase[] = [
     },
   },
 
+  // ── P1: ws-jam-triage — guided crash-triage on a JAM (TRX64 superset, reverse-debug 2)
+  // NON-GATING (blocked, TRX64 superset): when the machine JAMs (wild PC / illegal
+  // opcode), the monitor auto-prints the CAUSAL CHAIN — crash → wild control transfer →
+  // stack corruptor — instead of making the user hand-walk it. The classic derail is an
+  // RTS that popped a CORRUPTED return address. TS has no always-on CPU-history + delta
+  // rings, so it cannot reconstruct the chain → the differential cannot compare; asserted
+  // on the TRX64 daemon alone (run with --include-blocked), like ws-reverse-step /
+  // ws-who-wrote, per the reverse-debug verification doctrine.
+  //   tsx src/conformance.ts --only ws-jam-triage --include-blocked
+  //
+  // FLOW (TRX64): boot to a live machine, then INJECT a deliberate stack-smash at $C000
+  // (RAM): SEI; set SP=$FC; write a BAD return address ($C0DD) onto the stack via two
+  // STAs (the corruptors @ $C006 / $C00B); RTS pops it → PC = $C0DE (the wild PC, holding
+  // a JAM $02). Point the PC at the program and `debug/run` under --stream — the per-frame
+  // FULL-machine driver executes it, FEEDS the always-on rings, hits the JAM and fires the
+  // Spec-764 auto-break (the SAME path a real game derail takes). Then read the triage over
+  // WS (`runtime/crash_triage`). Assert it (i) names the JAM/wild PC + opcode, (ii)
+  // identifies the RTS stack pop, and (iii) `who_wrote` PINS the smashing STA instruction's
+  // PC. Also exercise the monitor `triage` verb. RED-before: the method/verb did not exist
+  // (→ -32601 / unknown command → all booleans false). GREEN-after.
+  //
+  // (We DON'T single-step the program: the monitor `z`/`wr` step path is the CPU-ISOLATED
+  // cycle-exact lane which deliberately does NOT feed the rings — only the full-machine
+  // free-run does. The product JAM always happens on the full path, which this exercises.)
+  {
+    id: "ws-jam-triage",
+    severity: "P1",
+    blocked:
+      "TRX64 superset: TS has no always-on CPU-history + delta rings, so it cannot " +
+      "reconstruct the crash→wild-transfer→corruptor chain on a JAM. runtime/crash_triage " +
+      "+ the `triage` verb read TRX64's rings; asserted on TRX64 alone (run with " +
+      "--include-blocked).",
+    title:
+      "runtime/crash_triage auto-pins the stack corruptor on a JAM (crash → wild RTS → smashing STA) — TRX64 reverse-debug superset",
+    // --stream: the per-frame FULL-machine driver runs the injected program, feeds the
+    // rings, and fires the Spec-764 JAM auto-break (run_for_full ignores `injected`).
+    spawn: { stream: true },
+    async signal(c, d) {
+      if (d.kind !== "trx64") {
+        // TS has no equivalent — documented refusal, non-gating. Same SHAPE as TRX64.
+        return {
+          namesWildPc: false,
+          identifiesRtsPop: false,
+          pinsCorruptor: false,
+          corruptorPcCorrect: false,
+          verbAgrees: false,
+        };
+      }
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      // Inject the stack-smash program @ $C000 (RAM). The two STAs are the corruptors:
+      //   $C000 SEI            78          ; no IRQ to perturb the stack
+      //   $C001 LDX #$FC       A2 FC
+      //   $C003 TXS            9A          ; SP=$FC → RTS pops $01FD(lo)/$01FE(hi)
+      //   $C004 LDA #$DD       A9 DD
+      //   $C006 STA $01FD      8D FD 01    ; corruptor ret-lo  @ $C006
+      //   $C009 LDA #$C0       A9 C0
+      //   $C00B STA $01FE      8D FE 01    ; corruptor ret-hi  @ $C00B
+      //   $C00E RTS            60          ; pops $C0DD → PC = $C0DE (wild)
+      // and $C0DE = JAM ($02).
+      await exec("wr ram c000 78 a2 fc 9a a9 dd 8d fd 01 a9 c0 8d fe 01 60");
+      await exec("wr ram c0de 02");
+      await exec("r pc=c000"); // sets both cores' PC (full path resumes here)
+      // Free-run on the full path; the program JAMs within the first frame. Poll until
+      // the CPU is jammed at the wild PC (PC frozen at $C0DE).
+      await c.call("debug/run", { session_id: sid });
+      let jammedPc = 0;
+      for (let i = 0; i < 60; i++) {
+        const st = await state(c, sid);
+        const pc = st.cpu?.pc ?? st.pc ?? 0;
+        if (pc === 0xc0de) { jammedPc = pc; break; }
+        await sleep(100);
+      }
+      // Read the structured triage over WS.
+      const t = (await c.call("runtime/crash_triage", { session_id: sid })) as any;
+      const transfer = t?.transfer ?? {};
+      const slots: any[] = Array.isArray(t?.corruptorSlots) ? t.corruptorSlots : [];
+      // (i) names the JAM / wild PC + opcode.
+      const namesWildPc = t?.crash?.pc === 0xc0de && t?.crash?.opcode === 0x02;
+      // (ii) identifies the RTS stack pop.
+      const identifiesRtsPop =
+        transfer?.kind === "RTS" && transfer?.isStackPop === true && transfer?.atPc === 0xc00e;
+      // (iii) who_wrote pins the smashing STA PCs: ret-lo @ $C006, ret-hi @ $C00B.
+      const pinsCorruptor = t?.pinnedCorruptor === true;
+      const loSlot = slots.find((s) => s.addr === 0x01fd);
+      const hiSlot = slots.find((s) => s.addr === 0x01fe);
+      const corruptorPcCorrect =
+        !!loSlot && loSlot.writerPc === 0xc006 && !!hiSlot && hiSlot.writerPc === 0xc00b;
+      // The monitor `triage` verb agrees (names the wild PC + the RTS).
+      const verbOut = await exec("triage");
+      const verbAgrees =
+        /C0DE/i.test(verbOut) && /RTS/.test(verbOut) && !/unknown command/i.test(verbOut);
+      return { namesWildPc, identifiesRtsPop, pinsCorruptor, corruptorPcCorrect, verbAgrees };
+    },
+  },
+
   // ── P1: ws-trace-monitor-misc-13 — monitor `flow`/`bt` report LIVE state ──────
   // TS monitor-shell.ts:1103-1115: `flow` reports the live interrupt/trap frame
   // state and `bt` scans the ACTUAL 6502 stack for JSR-return candidates

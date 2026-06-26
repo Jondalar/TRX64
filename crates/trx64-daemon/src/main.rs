@@ -1451,6 +1451,127 @@ fn register_dump(session: &Session) -> String {
     )
 }
 
+/// reverse-debug Phase 2 — render a [`TriageChain`] as monitor text lines (the JAM
+/// drop-in + the `triage` verb print this). The first line is the compact causal chain;
+/// the rest break out the crash point, the wild transfer, and the corruptor slot(s) with
+/// their confidence tags, so a low-confidence guess never looks like a pinned fact.
+fn format_triage_lines(chain: &trx64_core::crash_triage::TriageChain) -> Vec<String> {
+    use trx64_core::crash_triage::TransferKind;
+    let mut lines = Vec::new();
+    lines.push("── crash triage (reverse-debug Phase 2) ──────────────────────".to_string());
+    // The compact one-line chain.
+    lines.push(chain.summary.clone());
+    // Crash point + lead-in.
+    lines.push(format!(
+        "  crash:    JAM @ ${:04X}  op ${:02X}",
+        chain.crash.pc, chain.crash.opcode
+    ));
+    if !chain.crash.lead_in.is_empty() {
+        let trail: Vec<String> = chain
+            .crash
+            .lead_in
+            .iter()
+            .map(|e| format!("${:04X}", e.pc))
+            .collect();
+        lines.push(format!("  lead-in:  {}", trail.join(" → ")));
+    }
+    // The wild transfer.
+    lines.push(format!(
+        "  transfer: {} @ ${:04X} → ${:04X}  [{}]",
+        chain.transfer.kind.as_str(),
+        chain.transfer.at_pc,
+        chain.transfer.landed_pc,
+        chain.transfer.confidence.as_str()
+    ));
+    lines.push(format!("            {}", chain.transfer.note));
+    // The corruptor slots (only present for a stack pop).
+    if chain.transfer.kind.is_stack_pop() {
+        for slot in &chain.corruptor_slots {
+            if let (Some(pc), Some(cyc), Some(old), Some(new)) = (
+                slot.writer_pc,
+                slot.writer_cycle,
+                slot.writer_old,
+                slot.writer_new,
+            ) {
+                lines.push(format!(
+                    "  slot ${:04X}=${:02X}  ← written by ${:04X} @ cyc {} (${:02X}→${:02X})  [{}]",
+                    slot.addr, slot.value, pc, cyc, old, new, slot.confidence.as_str()
+                ));
+            } else {
+                lines.push(format!(
+                    "  slot ${:04X}=${:02X}  ← no writer in the live ring  [{}]",
+                    slot.addr, slot.value, slot.confidence.as_str()
+                ));
+            }
+        }
+        if chain.pinned_corruptor {
+            lines.push(
+                "  ⇒ corruptor PINNED — the cited instruction put the bad byte on the stack."
+                    .to_string(),
+            );
+        } else {
+            lines.push(
+                "  ⇒ corruptor NOT pinned (low confidence) — the bad return byte was stacked \
+                 before the reverse window, or is a genuine return. Inspect manually."
+                    .to_string(),
+            );
+        }
+    } else if !matches!(chain.transfer.kind, TransferKind::Unknown) {
+        lines.push(
+            "  ⇒ not a stack smash — no stack corruptor to attribute (see the transfer note)."
+                .to_string(),
+        );
+    }
+    lines
+}
+
+/// reverse-debug Phase 2 — the structured [`TriageChain`] as JSON (the
+/// `runtime/crash_triage` WS reply + the JAM `debug/stopped` broadcast attach this).
+fn triage_to_json(chain: &trx64_core::crash_triage::TriageChain) -> Value {
+    let lead_in: Vec<Value> = chain
+        .crash
+        .lead_in
+        .iter()
+        .map(|e| json!({ "pc": e.pc, "opcode": e.opcode, "cycle": e.cycle }))
+        .collect();
+    let slots: Vec<Value> = chain
+        .corruptor_slots
+        .iter()
+        .map(|s| {
+            json!({
+                "addr": s.addr,
+                "value": s.value,
+                "writerPc": s.writer_pc,
+                "writerCycle": s.writer_cycle,
+                "writerOld": s.writer_old,
+                "writerNew": s.writer_new,
+                "confidence": s.confidence.as_str(),
+                "note": s.note,
+            })
+        })
+        .collect();
+    json!({
+        "summary": chain.summary,
+        "pinnedCorruptor": chain.pinned_corruptor,
+        "crash": {
+            "pc": chain.crash.pc,
+            "opcode": chain.crash.opcode,
+            "leadIn": lead_in,
+        },
+        "transfer": {
+            "kind": chain.transfer.kind.as_str(),
+            "atPc": chain.transfer.at_pc,
+            "landedPc": chain.transfer.landed_pc,
+            "preSp": chain.transfer.pre_sp,
+            "vectorAddr": chain.transfer.vector_addr,
+            "isStackPop": chain.transfer.kind.is_stack_pop(),
+            "confidence": chain.transfer.confidence.as_str(),
+            "note": chain.transfer.note,
+        },
+        "corruptorSlots": slots,
+    })
+}
+
 /// Default cycle budget for a synchronous breakpoint-gated run (the daemon is
 /// request/response; a real autonomous loop would be unbounded, so we cap at a
 /// generous ~10 frames of PAL cycles — enough to reach any boot-time bp).
@@ -1854,6 +1975,13 @@ fn stream_debug_gated_advance(st: &mut State, budget: u64) -> u32 {
             let cycles = st.session.machine.clk;
             let opcode = st.session.machine.read_full(pc) & 0xff;
             st.ctrl_stop = Some(CtrlStop { reason: "jam", pc, cycles });
+            // reverse-debug Phase 2 — auto-run the guided crash-triage on the jammed
+            // state and ATTACH the causal chain to the stop broadcast, so the user gets
+            // the "crash → wild transfer → stack corruptor" walk for free (no hand-
+            // walking). Read-only; the JAMmed PC is the crash PC.
+            let chain = st.session.machine.crash_triage(Some(pc));
+            let triage_json = triage_to_json(&chain);
+            let triage_lines = format_triage_lines(&chain);
             let stop = json!({
                 "reason": "jam",
                 "pc": pc as u64,
@@ -1861,10 +1989,18 @@ fn stream_debug_gated_advance(st: &mut State, budget: u64) -> u32 {
                 "opcode": opcode as u64,
             });
             let registers = register_dump(&st.session);
+            let session_id = st.session.id.clone();
             st.notify.broadcast("debug/stopped", json!({
-                "session_id": st.session.id,
+                "session_id": session_id,
                 "stop": stop,
                 "registers": registers,
+                "triage": triage_json,
+            }));
+            // Also emit the human-readable chain into the monitor log stream so the
+            // drop-in shows it alongside the existing JAM context.
+            st.notify.broadcast("debug/observer_log", json!({
+                "session_id": session_id,
+                "lines": triage_lines,
             }));
         }
     } else {
@@ -3767,6 +3903,19 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             Ok(lines.join("\n"))
         }
 
+        // reverse-debug Phase 2 — `triage [pc]`: re-run the guided crash-triage on
+        // demand. Reads the always-on CPU-history + delta rings to reconstruct the
+        // causal chain (crash → wild control transfer → stack corruptor). With no arg it
+        // triages the LIVE (crashed) PC — the same chain the JAM drop-in auto-printed;
+        // pass a hex PC to triage a specific wild address. PRAGMATIC + HONEST: each step
+        // is confidence-tagged and a non-stack-pop transfer is reported without inventing
+        // a stack corruptor.
+        "triage" => {
+            let at_pc = parse_addr(toks.get(1));
+            let chain = st.session.machine.crash_triage(at_pc);
+            Ok(format_triage_lines(&chain).join("\n"))
+        }
+
         // reverse-debug Phase 1c — `buildtrace <s> <e>`: dump the always-on delta ring's
         // [s,e] cycle window to a `.c64retrace` (the SAME engine as the WS method
         // trace/build_from_ring) and point the monitor's trace store at it, so the very
@@ -4678,6 +4827,7 @@ fn monitor_help_text() -> String {
         "  REVERSE-DEBUG (always-on full-delta ring — no pre-arming; inspect-backward only)",
         "    rstep [n] | reverse [n]   UNDO the last n instructions (default 1): restore CPU+RAM+IO bytes to before them; reports the landed regs + writes rolled back",
         "    whowrote <addr> [n]       last n writer(s) of <addr> from the ring (newest first): PC + cycle + old->new — the stack-crash shortcut",
+        "    triage [pc]               guided crash-triage: causal chain (crash -> wild RTS/JMP transfer -> stack corruptor) from the rings; auto-printed on a JAM. Confidence-tagged.",
         "  KNOWLEDGE (reads the project _analysis.json that covers the address)",
         "    inspect <a> [stem]  segment kind/label + xrefs at a",
         "    xref <a> [stem]     who calls/jumps/reads/writes a (in + out)",
@@ -7161,6 +7311,24 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 "addr": addr,
                 "writers": out,
             }))
+        }
+
+        // reverse-debug Phase 2 — re-run the guided crash-triage on demand and return
+        // the structured causal chain (the SAME chain the JAM drop-in auto-attaches to
+        // `debug/stopped`). With no `pc` param it triages the live (crashed) PC; an
+        // optional `pc` triages a specific wild address. Read-only — does not mutate.
+        "runtime/crash_triage" => {
+            let at_pc = req.params.get("pc").and_then(|v| v.as_u64()).map(|p| (p & 0xffff) as u16);
+            let st = state.lock().unwrap();
+            let chain = st.session.machine.crash_triage(at_pc);
+            // The structured chain + the formatted text lines (so a TUI can print the
+            // same block the drop-in does without re-formatting).
+            let mut out = triage_to_json(&chain);
+            if let Some(obj) = out.as_object_mut() {
+                let lines: Vec<Value> = format_triage_lines(&chain).into_iter().map(Value::from).collect();
+                obj.insert("lines".to_string(), Value::Array(lines));
+            }
+            Response::ok(id, out)
         }
 
         "runtime/swap_disk_and_continue" => {

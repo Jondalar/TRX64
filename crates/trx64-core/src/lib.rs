@@ -17,6 +17,7 @@ pub mod checkpoint_ring;
 pub mod cia;
 pub mod cpu;
 pub mod cpu_history;
+pub mod crash_triage;
 pub mod delta_ring;
 pub mod drive;
 pub mod drive_6510core;
@@ -48,6 +49,9 @@ pub mod vsf;
 pub use cia::Cia;
 pub use cpu::{Bus, Cpu6510};
 pub use cpu_history::{CpuHistEntry, CpuHistoryRing};
+pub use crash_triage::{
+    Confidence, CrashPoint, StackSlot, TransferKind, TriageChain, WildTransfer,
+};
 pub use delta_ring::{DeltaEntry, DeltaRing, WriteRec};
 pub use drive::Drive1541;
 pub use full::{Bank8, BankA, BankE, FullBus, MemConfig};
@@ -1095,6 +1099,38 @@ impl Machine {
                 new_value: w.new_value,
             })
             .collect()
+    }
+
+    /// reverse-debug Phase 2 — guided crash-triage. Reads the two always-on rings
+    /// (CPU-history for the wild-transfer walk, delta-ring for the corruptor) and the
+    /// current (crashed) PC to reconstruct the causal chain:
+    ///   crash point → wild control transfer (RTS/RTI/JMP-ind/JMP/JSR) → stack corruptor.
+    ///
+    /// PRAGMATIC + HONEST: each step is confidence-tagged; a non-stack-pop transfer is
+    /// reported WITHOUT fabricating a stack corruptor (see `crash_triage`). Read-only —
+    /// does not mutate the machine, so it is safe on the live JAM drop-in and re-runnable.
+    ///
+    /// `at_pc` overrides the crash PC (defaults to the live `c64_core.reg_pc`) so a
+    /// caller can triage a specific wild PC; the JAM drop-in passes the jammed PC.
+    pub fn crash_triage(&self, at_pc: Option<u16>) -> crate::crash_triage::TriageChain {
+        // Snapshot the WHOLE CPU-history ring (oldest → newest). A JAMmed CPU re-fetches
+        // the same opcode every cycle, so the ring tail is a long storm of identical
+        // crash-PC entries (up to a full ~19.6k-cycle PAL frame before the auto-break
+        // halts the run) — the wild transfer can be thousands of entries back. The
+        // triage's `find_wild_transfer` collapses that storm; we just need to hand it the
+        // full window so the transfer is not beyond the snapshot. This is an on-demand
+        // query (not the hot path): copying ≤256k × 24 B (≤6 MiB) is fine.
+        let mut history: Vec<crate::cpu_history::CpuHistEntry> = Vec::new();
+        self.cpu_history.last_n(self.cpu_history.len(), &mut history);
+        let crash_pc = at_pc.unwrap_or(self.c64_core.reg_pc);
+        crate::crash_triage::triage(crate::crash_triage::TriageInputs {
+            history: &history,
+            delta: &self.delta_ring,
+            crash_pc,
+            // Side-effect-free banked read (IO-aware) for the crash opcode + popped
+            // stack bytes.
+            read: |a| self.read_full(a),
+        })
     }
 
     /// Side-effect-free banked read through the current PLA config (for
