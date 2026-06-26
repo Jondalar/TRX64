@@ -10,7 +10,7 @@ members = [
 [workspace.package]
 edition = "2021"
 version = "0.0.1"
-license = "MIT"
+license = "GPL-3.0-or-later"
 
 # TRX64 — Rust drop-in for the C64ReverseEngineeringMCP headless runtime.
 # Phase 1: behavior-identical replacement of the Node daemon behind ws://127.0.0.1:4312,
