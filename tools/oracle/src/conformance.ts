@@ -169,6 +169,86 @@ function vsfModuleDataLen(buf: Buffer, want: string): number {
 }
 
 const CASES: ConfCase[] = [
+  // ── P0: ws-checkpoint-ring-cadence — Spec 772 ring cadence + retention cap ─────
+  // The checkpoint ring is the UI scrub-filmstrip buffer (NOT deep history — that is
+  // the Spec 766 recorder). Spec 772 sizes it: cadence 0.5s = 25 PAL frames, retention
+  // 10s = a MAX-ENTRIES cap of 20 (ceil(seconds/(cadence/50))) on top of the 32 MiB
+  // byte budget, evict-oldest on whichever-first. BEFORE this spec the two runtimes
+  // DIVERGED: TS captured every 50 frames (1s) and the ring was UNCAPPED (~512-slot
+  // byte budget → minutes of history); TRX64 captured every 25 frames and was also
+  // uncapped. So a long free-run grew the TS ring at half TRX64's rate AND neither
+  // capped → the live counts drifted apart and ran past ~20 (TS ~10+, TRX64 ~30+ over
+  // ~2-3 min). AFTER: both capture every 25 frames AND both cap the LIVE ring at 20,
+  // so checkpoint/list count is IDENTICAL and bounded, and checkpoint/thumbnails count
+  // == checkpoint/list count (thumbs evict WITH the ring entry, Spec 772). The signal
+  // free-runs under --stream and polls checkpoint/list until the live count PLATEAUS
+  // (the cap is reached — eviction holds it flat), then reports the plateau count + the
+  // thumbnail==list equality. TS is the authority on the cap value; TRX64 must match.
+  // The TS oracle daemon emulates ~3.5 fps, so one 25-frame cadence ≈ ~7s wall and
+  // reaching the 20-entry cap takes ~140s — each poll RPC is fast, so the long free-run
+  // sits well under the 240s per-RPC cap (run the suite with a ~300s budget).
+  {
+    id: "ws-checkpoint-ring-cadence",
+    severity: "P0",
+    title:
+      "checkpoint ring caps the LIVE count at the Spec-772 retention size (default 20 = 10s @ 0.5s cadence), identical on both runtimes; thumbnails count == list count",
+    spawn: { stream: true },
+    async signal(c) {
+      const sid = await liveSession(c);
+      const listCount = async (): Promise<number> => {
+        const r = (await c.call("checkpoint/list", { session_id: sid })) as any;
+        return (r?.checkpoints ?? []).length;
+      };
+      const thumbCount = async (): Promise<number> => {
+        const r = (await c.call("checkpoint/thumbnails", { session_id: sid })) as any;
+        return (r?.thumbnails ?? []).length;
+      };
+      // Start the continuous --stream driver and let it free-run, accumulating anchors.
+      await c.call("debug/run", { session_id: sid });
+      // Poll checkpoint/list until the count PLATEAUS (3 consecutive equal, non-zero
+      // reads = the cap is holding the ring flat via eviction) or a generous deadline.
+      // We track the MAX count ever seen so an overflow past the cap is caught too.
+      const deadline = Date.now() + 230_000;
+      let maxSeen = 0;
+      let last = -1;
+      let stableHits = 0;
+      let plateau = 0;
+      while (Date.now() < deadline) {
+        await sleep(4000);
+        const n = await listCount();
+        if (n > maxSeen) maxSeen = n;
+        if (n === last && n > 0) {
+          stableHits++;
+          // A real plateau (not a transient stall): require the count to be ≥ a small
+          // floor so a momentarily-stuck-at-2 read can't false-plateau before the cap.
+          if (stableHits >= 3 && n >= 8) { plateau = n; break; }
+        } else {
+          stableHits = 0;
+        }
+        last = n;
+      }
+      // If we never hit a stable plateau, fall back to the last observed count so the
+      // diff still compares the two runtimes (a never-plateaued TS leg diverges loud).
+      if (plateau === 0) plateau = await listCount();
+      // At the plateau, the thumbnail filmstrip must surface exactly one thumb per live
+      // ring entry (thumbs evict WITH the ring entry — Spec 772 prune-orphans).
+      const ringNow = await listCount();
+      const thumbsNow = await thumbCount();
+      return {
+        // The behavioural signal: the live ring count plateaus at the SAME capped value
+        // on both runtimes (the authority supplies it). Was divergent before Spec 772.
+        plateauRingCount: plateau,
+        // The cap is an UPPER bound — the ring never exceeds the plateau (no overflow).
+        neverExceededPlateau: maxSeen <= plateau,
+        // The ring is bounded (NOT minutes of history) — the default cap is 20, so a
+        // free-run that ran long enough to plateau holds a SMALL ring, not ~30+/512.
+        ringIsBounded: ringNow <= 24,
+        // Spec 769.5a + 772 — every live ring entry has a thumbnail (filmstrip == ring).
+        thumbnailsMatchRing: thumbsNow === ringNow,
+      };
+    },
+  },
+
   // ── P0: ws-session-debug-0 — free-run breakpoint under --stream ────────────
   // Set a breakpoint on the KERNAL IRQ handler ($EA31, hit every frame) while the
   // --stream loop is the live driver. TS gates breakpoints in its per-frame tick,

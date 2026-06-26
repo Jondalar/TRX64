@@ -42,8 +42,28 @@ pub const SLOT_BYTES: u64 = RAM_BYTES; // 65536
 const FB_BYTES: u64 = 65 * 8 * 312; // 162240
 
 /// runtime-checkpoint-ring.ts:136 — `DEFAULT_CHECKPOINT_RING_BUDGET_BYTES = 32 MiB`
-/// → ~512 slots at SLOT_BYTES = 64 KiB.
+/// → ~512 slots at SLOT_BYTES = 64 KiB. Spec 772: this is now the SECONDARY bound —
+/// the ring is sized for the UI scrub-filmstrip by the max-entries cap below; the
+/// byte budget is the safety ceiling. Eviction fires on whichever bound hits first.
 pub const DEFAULT_CHECKPOINT_RING_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Spec 772 — default ring retention in seconds (the UI scrub window). 1:1 with the
+/// c64re `DEFAULT_CHECKPOINT_RING_SECONDS` (runtime-checkpoint-ring.ts).
+pub const DEFAULT_CHECKPOINT_RING_SECONDS: f64 = 10.0;
+
+/// Spec 772 — max LIVE entries the ring retains = `ceil(seconds / (cadenceFrames/50))`
+/// (PAL 50 fps). At the 10s / 25-frame default that is **20**. Clamped ≥ 1. 1:1 with
+/// the c64re `checkpointRingMaxEntries` (runtime-checkpoint-ring.ts).
+pub fn checkpoint_ring_max_entries(seconds: f64, cadence_frames: u64) -> u64 {
+    let sec = if seconds.is_finite() && seconds > 0.0 {
+        seconds
+    } else {
+        DEFAULT_CHECKPOINT_RING_SECONDS
+    };
+    let cad = if cadence_frames >= 1 { cadence_frames } else { 25 } as f64;
+    let seconds_per_capture = cad / 50.0; // PAL 50fps
+    ((sec / seconds_per_capture).ceil() as u64).max(1)
+}
 
 /// runtime-checkpoint-ring.ts:66 — top-level payload fields holding large mutable
 /// media blobs, content-addressed into the pool on capture, rehydrated on restore.
@@ -141,6 +161,8 @@ struct PooledBlob {
 /// runtime-checkpoint-ring.ts:147 — `class RuntimeCheckpointRing`.
 pub struct RuntimeCheckpointRing {
     budget_bytes: u64,
+    /// Spec 772 — max LIVE entries (the UI-scrub cap), or `u64::MAX` = byte-budget only.
+    max_entries: u64,
     slot_count: u64,
     /// runtime-checkpoint-ring.ts:154 — free slot indices (LIFO). Tracked for the
     /// stats/capacity policy only (TRX64 has no slab to index into).
@@ -156,8 +178,15 @@ pub struct RuntimeCheckpointRing {
 
 impl RuntimeCheckpointRing {
     /// runtime-checkpoint-ring.ts:164-169 — `slotCount = max(1, floor(budget/slot))`,
-    /// free slots seeded `slotCount-1..=0` (LIFO).
+    /// free slots seeded `slotCount-1..=0` (LIFO). Byte-budget bound only (no entry cap).
     pub fn with_budget(budget_bytes: u64) -> Self {
+        Self::with_budget_and_max_entries(budget_bytes, u64::MAX)
+    }
+
+    /// Spec 772 — like `with_budget` but with a max LIVE entries cap (the UI-scrub
+    /// filmstrip size). Eviction fires on WHICHEVER bound (byte budget OR entry cap)
+    /// is hit first (oldest-unpinned, pin-exempt). `max_entries == u64::MAX` = no cap.
+    pub fn with_budget_and_max_entries(budget_bytes: u64, max_entries: u64) -> Self {
         let slot_count = (budget_bytes / SLOT_BYTES).max(1);
         let mut free_slots = Vec::with_capacity(slot_count as usize);
         let mut i = slot_count;
@@ -167,6 +196,7 @@ impl RuntimeCheckpointRing {
         }
         Self {
             budget_bytes,
+            max_entries: max_entries.max(1),
             slot_count,
             free_slots,
             entries: Vec::new(),
@@ -283,9 +313,21 @@ impl RuntimeCheckpointRing {
         Ok(r)
     }
 
-    /// runtime-checkpoint-ring.ts:269-280 — get a free slot, evicting the oldest
-    /// UNPINNED entry when the slab is full.
+    /// runtime-checkpoint-ring.ts:269-280 (Spec 772) — get a free slot, evicting the
+    /// oldest UNPINNED entry on WHICHEVER bound is hit first: the byte-budget slot
+    /// count OR the max-entries cap. The cap keeps the LIVE entry count ≤ max_entries
+    /// after this capture (the ring is the short UI-scrub buffer; deep history = the
+    /// recorder). Pinned entries are exempt from both bounds.
     fn acquire_slot(&mut self) -> Result<u64, String> {
+        // Spec 772 — entry-count cap: evict oldest-unpinned until adding one more keeps
+        // the live count ≤ max_entries. (No-op when max_entries == u64::MAX.)
+        while (self.entries.len() as u64) + 1 > self.max_entries {
+            match self.entries.iter().position(|e| !e.r.pinned) {
+                Some(i) => self.remove_entry_at(i),
+                None => break, // all remaining entries pinned — let the byte budget decide
+            }
+        }
+        // Byte-budget bound: a full slab evicts the oldest unpinned entry to free a slot.
         if self.free_slots.is_empty() {
             let idx = self.entries.iter().position(|e| !e.r.pinned);
             match idx {

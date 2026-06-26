@@ -9816,12 +9816,39 @@ const CART_AUTOPERSIST_DEBOUNCE_MS: u64 = 5_000;
 /// the cart: a drive-write burst (one SAVE) settles before the host .d64/.g64 is
 /// touched once. ~1 s. (Wall-clock, not frame count — fires while paused too.)
 const DISK_AUTOPERSIST_DEBOUNCE_MS: u64 = 1_000;
-/// Spec 705.B auto-capture cadence in frames. The c64re header documents ~25
-/// frames (~0.5 s @ 50 fps PAL — runtime-controller.ts:69-76); the live TS const
-/// is now 50 (1 s, runtime-controller.ts:77). Per this task's explicit "~every
-/// 0.5 s" filmstrip requirement, TRX64 uses 25 (the finer cadence; satisfies the
-/// "multiple checkpoints accumulate" proof either way).
-const CHECKPOINT_CAPTURE_EVERY_FRAMES: u64 = 25;
+/// Spec 705.B / Spec 772 auto-capture cadence in frames. Default 25 (~0.5 s @ 50 fps
+/// PAL — the UI scrub-filmstrip granularity), env-overridable via
+/// C64RE_CHECKPOINT_CADENCE_FRAMES (1:1 with the c64re const, runtime-controller.ts:77).
+/// Spec 772 unified BOTH runtimes to 25 (TS was 50 → the cadence divergence this closes).
+/// A fn, not a const, because env reads aren't const; called wherever the cadence is
+/// compared/multiplied (identical to a const at every call site).
+fn checkpoint_capture_every_frames() -> u64 {
+    std::env::var("C64RE_CHECKPOINT_CADENCE_FRAMES")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(25)
+}
+
+/// Spec 772 — ring retention in seconds (default 10), env-overridable via
+/// C64RE_CHECKPOINT_RING_SECONDS (1:1 with runtime-controller.ts CHECKPOINT_RING_SECONDS).
+fn checkpoint_ring_seconds() -> f64 {
+    std::env::var("C64RE_CHECKPOINT_RING_SECONDS")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|&n| n > 0.0)
+        .unwrap_or(10.0)
+}
+
+/// Spec 772 — max LIVE ring entries (the UI-scrub cap) = ceil(seconds / (cadence/50))
+/// (PAL 50 fps). At the 10s / 25-frame default that is 20. 1:1 with the c64re
+/// `checkpointRingMaxEntries` (runtime-checkpoint-ring.ts). Clamped ≥ 1.
+fn checkpoint_ring_max_entries() -> u64 {
+    let seconds = checkpoint_ring_seconds();
+    let cadence = checkpoint_capture_every_frames() as f64;
+    let seconds_per_capture = cadence / 50.0; // PAL 50fps
+    ((seconds / seconds_per_capture).ceil() as u64).max(1)
+}
 
 /// ITEM 1 — cart auto-persist (.crt lazy writeback). = maybeAutoPersistCart
 /// (runtime-controller.ts:493). The mapper's monotonic writableGeneration()
@@ -9971,7 +9998,7 @@ fn stream_maybe_autocapture(st: &mut State, frame: u64, canvas_w: usize, canvas_
         return;
     }
     st.autocapture_frames_since = st.autocapture_frames_since.wrapping_add(1);
-    if st.autocapture_frames_since < CHECKPOINT_CAPTURE_EVERY_FRAMES {
+    if st.autocapture_frames_since < checkpoint_capture_every_frames() {
         return;
     }
     st.autocapture_frames_since = 0;
@@ -10022,7 +10049,7 @@ fn stream_maybe_feed_recorder(st: &mut State, _frame: u64) {
         return;
     }
     st.recorder_frames_since = st.recorder_frames_since.wrapping_add(1);
-    if st.recorder_frames_since < CHECKPOINT_CAPTURE_EVERY_FRAMES {
+    if st.recorder_frames_since < checkpoint_capture_every_frames() {
         return;
     }
     st.recorder_frames_since = 0;
@@ -10033,14 +10060,27 @@ fn stream_maybe_feed_recorder(st: &mut State, _frame: u64) {
     let _ = capture_anchor_now(st);
 }
 
-/// Spec 769.5a — insert a thumbnail keyed by checkpoint id, evicting the oldest
-/// (insertion order) when the store exceeds [`MAX_THUMBS`]. 1:1 with c64re
-/// `captureThumb` (runtime-controller.ts:434-441): a separate, ring-decoupled store.
+/// Spec 769.5a / Spec 772 — insert a thumbnail keyed by checkpoint id, then keep the
+/// thumb store in lock-step with the ring: prune any thumb whose ring entry has been
+/// evicted (so thumbs evict WITH the ring entry, not at an independent 1024 cap), and
+/// apply the [`max_thumbs`] hard backstop. 1:1 with the c64re `captureThumb` +
+/// `pruneOrphanThumbs` (runtime-controller.ts:434-460).
 fn store_checkpoint_thumb(st: &mut State, id: String, thumb: CheckpointThumb) {
     if st.checkpoint_thumbs.insert(id.clone(), thumb).is_none() {
         st.checkpoint_thumb_order.push_back(id);
     }
-    while st.checkpoint_thumbs.len() > MAX_THUMBS {
+    // Spec 772 — drop thumbs whose ring entry is no longer live (evicted by the ring's
+    // entry/byte cap, truncated, or cleared). The ring is the authority on which
+    // checkpoints are live; the thumb store tracks it exactly.
+    let live: std::collections::HashSet<String> =
+        st.checkpoint_ring.list().into_iter().map(|r| r.id).collect();
+    if st.checkpoint_thumbs.keys().any(|k| !live.contains(k)) {
+        st.checkpoint_thumbs.retain(|k, _| live.contains(k));
+        st.checkpoint_thumb_order.retain(|k| live.contains(k));
+    }
+    // Hard backstop cap (aligned to the ring size, Spec 772).
+    let cap = max_thumbs();
+    while st.checkpoint_thumbs.len() > cap {
         if let Some(oldest) = st.checkpoint_thumb_order.pop_front() {
             st.checkpoint_thumbs.remove(&oldest);
         } else {
@@ -10975,12 +11015,18 @@ fn render_screenshot(machine: &trx64_core::Machine, scale: usize) -> (String, u3
 /// `makeCheckpointThumbnail`'s default (factor 4 → the 384×272 canvas becomes 96×68).
 const THUMB_FACTOR: usize = 4;
 
-/// Spec 769.5a — cap on the separate per-checkpoint thumbnail store. 1:1 with the
-/// c64re `RuntimeController.MAX_THUMBS` (runtime-controller.ts:182); evicts oldest
-/// (insertion order) when exceeded. The ring itself bounds restorable checkpoints,
-/// so an orphaned thumb (its ring entry already evicted) is simply never surfaced
-/// by `filmstrip()` and ages out under this cap — exactly the c64re contract.
-const MAX_THUMBS: usize = 1024;
+/// Spec 769.5a / Spec 772 — cap on the separate per-checkpoint thumbnail store,
+/// ALIGNED to the ring size (= ring max-entries × 2 headroom). 1:1 with the c64re
+/// `RuntimeController.MAX_THUMBS` (runtime-controller.ts:182), which Spec 772 changed
+/// from a flat 1024 to `ringMaxEntries * 2`: there is no point holding 1024 thumbs
+/// when the ring only retains ~20 checkpoints. `store_checkpoint_thumb` ALSO prunes
+/// any thumb whose ring entry has been evicted (prune-orphans), so thumbs evict WITH
+/// the ring entry; this cap is the hard backstop. A fn (not a const) because the ring
+/// size is env-driven. The ×2 absorbs the transient where a fresh thumb is inserted
+/// just before its evicted predecessor is pruned.
+fn max_thumbs() -> usize {
+    (checkpoint_ring_max_entries() as usize).saturating_mul(2)
+}
 
 /// Spec 769.5a — a captured scrub-filmstrip thumbnail (downscaled live frame). The
 /// daemon mirror of the c64re `CheckpointThumbnail` (inspect/checkpoint-thumbnail.ts:14):
@@ -11229,7 +11275,13 @@ async fn main() {
         ctrl_frame: 0, // incremented on each debug/run|pause|continue; first pause → 1
         ctrl_stop: None,
         checkpoint_counter: 0,
-        checkpoint_ring: trx64_core::checkpoint_ring::RuntimeCheckpointRing::new(),
+        // Spec 772 — the ring is the short UI-scrub buffer: a max-entries cap (default
+        // 20 = 10s @ 0.5s cadence, env-overridable) on top of the 32 MiB byte budget,
+        // evict-oldest on whichever-first. Deep history = the recorder, not this ring.
+        checkpoint_ring: trx64_core::checkpoint_ring::RuntimeCheckpointRing::with_budget_and_max_entries(
+            trx64_core::checkpoint_ring::DEFAULT_CHECKPOINT_RING_BUDGET_BYTES,
+            checkpoint_ring_max_entries(),
+        ),
         inspect_evidence: Vec::new(),
         vic_provenance_enabled: false,
         trace_definitions: std::collections::HashMap::new(),
@@ -11319,7 +11371,13 @@ mod batch1_tests {
             ctrl_frame: 0,
             ctrl_stop: None,
             checkpoint_counter: 0,
-            checkpoint_ring: trx64_core::checkpoint_ring::RuntimeCheckpointRing::new(),
+            // Spec 772 — the ring is the short UI-scrub buffer: a max-entries cap (default
+        // 20 = 10s @ 0.5s cadence, env-overridable) on top of the 32 MiB byte budget,
+        // evict-oldest on whichever-first. Deep history = the recorder, not this ring.
+        checkpoint_ring: trx64_core::checkpoint_ring::RuntimeCheckpointRing::with_budget_and_max_entries(
+            trx64_core::checkpoint_ring::DEFAULT_CHECKPOINT_RING_BUDGET_BYTES,
+            checkpoint_ring_max_entries(),
+        ),
             inspect_evidence: Vec::new(),
             vic_provenance_enabled: false,
             trace_definitions: std::collections::HashMap::new(),
@@ -13063,7 +13121,7 @@ mod batch1_tests {
         let canvas: Vec<u8> = (0..cw * ch).map(|i| (i % 16) as u8).collect();
         // Run enough frames for ~6 capture windows (~3 s @ 50 fps, cadence 25).
         let windows = 6u64;
-        let total = CHECKPOINT_CAPTURE_EVERY_FRAMES * windows + 2;
+        let total = checkpoint_capture_every_frames() * windows + 2;
         for frame in 0..total {
             let mut st = state.lock().unwrap();
             stream_maybe_autocapture(&mut st, frame, cw, ch, &canvas);
@@ -13104,7 +13162,7 @@ mod batch1_tests {
         let state = make_state();
         let (cw, ch) = (trx64_core::render::CANVAS_W, trx64_core::render::CANVAS_H);
         let canvas: Vec<u8> = (0..cw * ch).map(|i| (i % 16) as u8).collect();
-        let total = CHECKPOINT_CAPTURE_EVERY_FRAMES * 5 + 2;
+        let total = checkpoint_capture_every_frames() * 5 + 2;
         for frame in 0..total {
             let mut st = state.lock().unwrap();
             stream_maybe_autocapture(&mut st, frame, cw, ch, &canvas);
