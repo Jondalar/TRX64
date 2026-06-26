@@ -3866,10 +3866,39 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 }
             }
         }
-        // `chis` — checkpoint-ring replay swimlane. Needs the LIVE ring (replay with
-        // capture), which is not derivable from a stored `.c64retrace`; report
-        // unsupported here rather than fake it.
-        "chis" => Err("chis: not supported via TRX64 (checkpoint-ring replay needs the live daemon ring) — use `swimlane <s> <e>` over a captured trace".into()),
+        // `chis` — CPU instruction history. TS reconstructs it by checkpoint-ring REPLAY
+        // (restore the nearest anchor, replay forward, capture each instruction). TRX64
+        // reads the cpu lane of the captured `.c64retrace` DIRECTLY via the sidecar — the
+        // same instruction rows are already on disk, no live ring needed (and it's the live
+        // data, not a replay reconstruction). `chis [cyc]` = the last <cyc> cycles
+        // (default 4000); `chis <s> <e>` = an explicit window. Same swimlane formatter.
+        "chis" => {
+            let a1 = toks.get(1).map(|s| s.as_str());
+            let is_num = |t: Option<&str>| t.map(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).unwrap_or(false);
+            let mut args = json!({ "last_cycles": 4000 });
+            if is_num(a1) {
+                if is_num(toks.get(2).map(|s| s.as_str())) {
+                    args = json!({ "cycle_start": a1.unwrap().parse::<i64>().unwrap_or(0), "cycle_end": toks[2].parse::<i64>().unwrap_or(0) });
+                } else {
+                    args = json!({ "last_cycles": a1.unwrap().parse::<i64>().unwrap_or(4000) });
+                }
+            }
+            match current_trace_duckdb(st) {
+                None => Err("chis: no trace store — run `trace on` first (chis reads the cpu lane of the captured trace)".into()),
+                Some(db) => {
+                    let stem = std::path::Path::new(&db)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("trace")
+                        .to_string();
+                    args["stem"] = json!(stem);
+                    match run_trace_read_sidecar("swimlane_text", &db, &args) {
+                        Ok(v) => Ok(v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string()),
+                        Err(e) => Err(format!("chis: {e}")),
+                    }
+                }
+            }
+        }
 
         // ---- Project-index reads (inspect/xref/sym) — audit ws-trace-monitor-misc-15. -
         // TS wires `ctx.projectRead` (ws-server.ts:2135-2191): scan C64RE_PROJECT_DIR for
@@ -4443,7 +4472,7 @@ fn monitor_help_text() -> String {
         "    taint <a> [cyc]  data-flow taint backward from (cyc,addr)",
         "    swimlane [list|name] [s] [e]  trace lanes (cpu/irq/nmi/io/1541): list / newest / by name; tail ~2000cy",
         "                     `swimlane <s> <e>` with no covering trace → auto checkpoint-ring replay",
-        "    chis [cyc] | chis <s> <e>  replay from the ring → swimlane: last N cyc, or any historical window",
+        "    chis [cyc] | chis <s> <e>  cpu instruction history from the captured trace: last N cyc (default 4000), or a window",
         "  KNOWLEDGE (reads the project _analysis.json that covers the address)",
         "    inspect <a> [stem]  segment kind/label + xrefs at a",
         "    xref <a> [stem]     who calls/jumps/reads/writes a (in + out)",

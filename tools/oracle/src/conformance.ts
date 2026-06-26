@@ -1720,6 +1720,57 @@ const CASES: ConfCase[] = [
     },
   },
 
+  // ── P1: ws-trace-e2e-read — the full capture→read workflow returns REAL data ──
+  // The class the chis stub slipped through: the gate tested WS response SHAPES, not the
+  // end-to-end workflow (capture a trace → type a read verb → see real data). `chis` was a
+  // hardcoded "not supported" stub even though the cpu rows it needs are in the captured
+  // .c64retrace (swimlane reads them fine). This drives the ACTUAL workflow on a FINALIZED
+  // trace: free-run past boot, capture a window (the UI's domains), STOP with wait_index so
+  // the .duckdb index is built, then call EACH monitor read verb (chis/swimlane/map) and
+  // assert it returns REAL trace content (a PC hex row), NOT an error/stub/empty.
+  // NOTE: this covers the FINALIZED/historical read. LIVE read (chis while the trace is
+  // still active) is a separate capability (TS serves it from the live checkpoint ring;
+  // TRX64 needs the in-memory cpuhistory ring — the reverse-debug Phase-1 build) and gets
+  // its own case once that lands.
+  {
+    id: "ws-trace-e2e-read",
+    severity: "P1",
+    title: "capture→read workflow: chis/swimlane/map all return real trace data (no stub/empty)",
+    spawn: { stream: true },
+    async signal(c) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      await c.call("debug/run", { session_id: sid });
+      await waitRunningBooted(c, sid, 1_500_000, 60_000);
+      const cs = (await state(c, sid)).c64Cycles ?? 0;
+      await c.call("trace/start_domains", { session_id: sid, domains: ["c64-cpu", "memory"] });
+      // A SHORT capture window keeps the .duckdb index small, so the FIRST read verb (which
+      // builds the index from the .c64retrace) returns fast under the 2-daemon oracle load.
+      await sleep(250);
+      const ce = (await state(c, sid)).c64Cycles ?? 0;
+      // wait_index:true → finalize AND build the .duckdb index, so the FIRST read verb
+      // hits a ready index (not a cold/half-flushed tail).
+      await c.call("trace/run/stop", { session_id: sid, wait_index: true }).catch(() => undefined);
+      await sleep(1000);
+      // "real trace read" = has a PC hex row AND is not an error/stub/empty.
+      const hasTrace = (s: string) =>
+        /\$[0-9a-fA-F]{2,4}/.test(s) &&
+        !/unknown command|not supported|no trace store|no trace/i.test(s);
+      const chisOut = await exec("chis");
+      const swimOut = await exec(`swimlane ${cs} ${ce}`);
+      const mapOut = await exec("map");
+      return {
+        // The anti-stub guard: chis returns real cpu instruction history (not the stub).
+        chisReturnsCpuHistory: hasTrace(chisOut),
+        swimlaneReturnsRows: hasTrace(swimOut),
+        mapReturnsContent: mapOut.length > 40 && !/unknown command|no trace/i.test(mapOut),
+      };
+    },
+  },
+
   // ── P1: ws-trace-monitor-misc-13 — monitor `flow`/`bt` report LIVE state ──────
   // TS monitor-shell.ts:1103-1115: `flow` reports the live interrupt/trap frame
   // state and `bt` scans the ACTUAL 6502 stack for JSR-return candidates
