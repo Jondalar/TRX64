@@ -1490,6 +1490,121 @@ const CASES: ConfCase[] = [
       };
     },
   },
+
+  // ── P1: ws-trace-monitor-misc-5 — monitor `sd`/`df` flow-disasm are wired ──────
+  // The monitor REPL advertises `sd` (step+disasm: the REAL executed path) and `df`
+  // (follow-disasm: static control-flow walk) in its `help` text, but TRX64's
+  // run_monitor had NO `sd`/`df` arm → both fell through to `unknown command` (the
+  // help LIES). TS monitor-shell.ts:622-648 drives monitor-flow-disasm.ts: `sd [n]`
+  // single-steps n instructions and renders each touched address once (loops folded
+  // to body+×count) ending with a `-- sd: N steps …` footer; `df [addr] [n]` does a
+  // STATIC control-flow walk from addr (follows JMP, descends JSR/returns on RTS,
+  // loop-guarded) — a multi-instruction flow listing. Fix: wire run_monitor's `sd`/
+  // `df` arms onto the EXISTING engine — `sd` reuses step_one_instruction + the
+  // working `d`/disasm renderer (disasm_line_ts); `df` reuses disasm_line_ts + a
+  // small 6502 control-flow classifier. Signal: a first signal `recognized` (output
+  // does NOT contain "unknown command" — catches the help-lies divergence) PLUS
+  // semantic properties: `sd` output carries the sd footer AND a disassembled
+  // instruction line (a `$addr  bytes  MNEMONIC` row), and `df $C000` produces a
+  // multi-line flow listing of disassembled instructions. Compared TS vs TRX64 on
+  // the SAME cold machine state. TS: {recognized:true, sdHasFooter:true,
+  // sdHasInstr:true, dfMultiLine:true, dfHasInstr:true}; TRX64 (before fix): all-false.
+  {
+    id: "ws-trace-monitor-misc-5",
+    severity: "P1",
+    title: "monitor `sd`/`df` flow-disasm are wired (step+disasm path / static flow walk; help no longer lies)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      const recognized = (s: string) => !/unknown command/i.test(s);
+      // A disassembled instruction row looks like `$c000  a9 01  LDA #$01` — match
+      // the structural shape: a `$hhhh` address column followed (after spaces) by an
+      // UPPERCASE 3-letter mnemonic. Independent of which exact opcode sits in RAM.
+      const hasDisasmInstr = (s: string) => /\$[0-9a-f]{4}\s+[0-9a-f? ]+\s+[A-Z?]{3}/m.test(s);
+      // `sd 4` — step 4 instructions from PC, render the executed path + sd footer.
+      const sdOut = await exec("sd 4");
+      // `df $C000` — static control-flow walk from $C000 (KERNAL/BASIC region is
+      // mapped at cold reset; a multi-instruction listing comes back).
+      const dfOut = await exec("df $C000");
+      const dfLines = dfOut.split("\n").filter((l) => l.trim().length > 0);
+      return {
+        // First signal: both verbs are recognized (the help no longer lies).
+        recognized: recognized(sdOut) && recognized(dfOut),
+        // Semantic: `sd` rendered the dynamic step+disasm path (its `-- sd:` footer).
+        sdHasFooter: /--\s*sd:/i.test(sdOut),
+        // Semantic: `sd` rendered at least one disassembled instruction.
+        sdHasInstr: hasDisasmInstr(sdOut),
+        // Semantic: `df` produced a multi-instruction flow listing (not a one-liner).
+        dfMultiLine: dfLines.length >= 2,
+        // Semantic: `df` rendered disassembled instructions (it walked the flow).
+        dfHasInstr: hasDisasmInstr(dfOut),
+      };
+    },
+  },
+
+  // ── P1: ws-trace-monitor-misc-10 — monitor `screen` VIC data-region inspect ────
+  // The monitor REPL advertises `screen` (decode the 40×25 text screen at the live
+  // screen pointer) in its `help` text, but TRX64's run_monitor had NO `screen` arm
+  // → it fell through to `unknown command` (the help LIES). TS monitor-shell.ts:
+  // 731-742 reads the live VIC base addresses (VIC bank from CIA2 $DD00 + the $D018
+  // matrix nibble), then decodes the 40×25 screen-RAM matrix into a `|<40 chars>|`
+  // grid (screen-code → ASCII), headed `screen @ $XXXX  (VIC bank $XXXX, $D018=$XX)`.
+  // Fix: wire run_monitor's `screen` arm 1:1 — same base computation (peek $DD00/$D018
+  // via the io lens, vicBank=(3-dd00)*0x4000, screenBase=vicBank+nibble*0x400), same
+  // scToAscii decode, same grid + header. Signal: a first signal `recognized` (output
+  // does NOT contain "unknown command") PLUS semantic structural properties compared
+  // on the SAME machine state — the output is a 25-row × 40-col grid (`|…40…|` rows),
+  // the header names a screen base, AND (the live-content check) a known marker
+  // written into THIS daemon's own reported screen base shows up decoded in the grid.
+  // Exact bytes are NOT asserted (header/formatting may differ); structure + the
+  // round-tripped marker are. TS: {recognized:true, gridRows:25, gridCols:40,
+  // hasBaseHeader:true, markerVisible:true}; TRX64 (before fix): all-false/zero.
+  {
+    id: "ws-trace-monitor-misc-10",
+    severity: "P1",
+    title: "monitor `screen` decodes the live 40x25 text screen (VIC data-region inspect; help no longer lies)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      const recognized = (s: string) => !/unknown command/i.test(s);
+      const first = await exec("screen");
+      // Parse THIS daemon's own reported screen base from the header (the base may
+      // differ between daemons at cold reset, so each writes its marker at its own
+      // base — the round-trip is what we assert, not a shared address).
+      const baseMatch = /screen @ \$([0-9a-f]{4})/i.exec(first);
+      const base = baseMatch ? parseInt(baseMatch[1], 16) : null;
+      // The grid rows are the `|<40 chars>|` lines (25 of them).
+      const gridRows0 = first.split("\n").filter((l) => /^\|.*\|$/.test(l));
+      const cols0 = gridRows0.length ? gridRows0[0].length - 2 : 0; // strip the two pipes
+      // Live-content check: write screen-code $01 (=`A`) into the daemon's own screen
+      // base cell (0,0), re-decode, and confirm an `A` now sits at grid row 0 col 0.
+      let markerVisible = false;
+      if (base !== null) {
+        await exec(`wr ram ${base.toString(16)} 01`);
+        const second = await exec("screen");
+        const rows = second.split("\n").filter((l) => /^\|.*\|$/.test(l));
+        markerVisible = rows.length >= 1 && rows[0][1] === "A"; // [0] is the leading `|`
+      }
+      return {
+        // First signal: the verb is recognized (the help no longer lies).
+        recognized: recognized(first),
+        // Semantic: a 25-row grid.
+        gridRows: gridRows0.length,
+        // Semantic: each row is 40 columns wide.
+        gridCols: cols0,
+        // Semantic: the header reports a screen base.
+        hasBaseHeader: base !== null,
+        // Semantic (live content): a marker written at the live base decodes in-grid.
+        markerVisible,
+      };
+    },
+  },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────

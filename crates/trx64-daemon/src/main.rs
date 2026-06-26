@@ -1520,6 +1520,67 @@ fn disasm_line_ts(read: impl Fn(u16) -> u8, addr: u16) -> (u16, String) {
     (size, line)
 }
 
+/// Spec 754 §3.3k — control-flow classification for the `df` static walk. 1:1 with
+/// monitor-flow-disasm.ts `classify`: JMP abs / JMP (ind) / JSR / RTS / RTI / BRK /
+/// conditional branch / normal. `target` carries the abs operand (or, for JMP(ind),
+/// the POINTER address; for a branch, the resolved relative target).
+enum CfKind {
+    Normal,
+    Jmp,
+    JmpInd,
+    Jsr,
+    Rts,
+    Rti,
+    Brk,
+    Branch,
+}
+struct CfInfo {
+    size: u16,
+    kind: CfKind,
+    target: Option<u16>,
+}
+fn classify_cf(read: impl Fn(u16) -> u8, addr: u16) -> CfInfo {
+    let op = read(addr);
+    let size = instr_len(op) as u16;
+    let abs = || -> u16 {
+        (read(addr.wrapping_add(1)) as u16) | ((read(addr.wrapping_add(2)) as u16) << 8)
+    };
+    match op {
+        0x4c => CfInfo { size, kind: CfKind::Jmp, target: Some(abs()) }, // JMP abs
+        0x6c => CfInfo { size, kind: CfKind::JmpInd, target: Some(abs()) }, // JMP (ind)
+        0x20 => CfInfo { size, kind: CfKind::Jsr, target: Some(abs()) }, // JSR abs
+        0x60 => CfInfo { size, kind: CfKind::Rts, target: None },
+        0x40 => CfInfo { size, kind: CfKind::Rti, target: None },
+        0x00 => CfInfo { size, kind: CfKind::Brk, target: None },
+        // Conditional branches BPL/BMI/BVC/BVS/BCC/BCS/BNE/BEQ.
+        0x10 | 0x30 | 0x50 | 0x70 | 0x90 | 0xb0 | 0xd0 | 0xf0 => {
+            let rel = read(addr.wrapping_add(1));
+            let off = if rel < 0x80 { rel as i32 } else { rel as i32 - 256 };
+            let target = ((addr as i32) + 2 + off) as u16;
+            CfInfo { size, kind: CfKind::Branch, target: Some(target) }
+        }
+        _ => CfInfo { size, kind: CfKind::Normal, target: None },
+    }
+}
+
+/// Screen-code → ASCII for the `screen` decode (display only). 1:1 with
+/// monitor-shell.ts scToAscii: ignore the reverse-video bit, @ for 0, A-Z for 1-26,
+/// space for 32, the punctuation/digit range 33-63 verbatim, '.' otherwise.
+fn sc_to_ascii(sc: u8) -> char {
+    let c = sc & 0x7f; // ignore the reverse-video bit
+    if c == 0 {
+        '@'
+    } else if (1..=26).contains(&c) {
+        (64 + c) as char // A-Z
+    } else if c == 32 {
+        ' '
+    } else if (33..=63).contains(&c) {
+        c as char // !"#…digits…?
+    } else {
+        '.'
+    }
+}
+
 /// T2.8 — Spec 754 §3.x: VICE-superset interactive monitor command processor.
 /// 1:1 port of the dispatch + output text format of monitor-shell.ts
 /// `runMonitorCommand`. CORE verbs are wired to the daemon's State (breakpoints,
@@ -1859,6 +1920,198 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 }
             }
             st.mon.disasm_cursor = Some(a);
+            Ok(lines.join("\n"))
+        }
+
+        // ---- Flow disassembly (Spec 754 §3.3k / audit ws-trace-monitor-misc-5) ----
+        // sd [n] — DYNAMIC: step n instructions from PC, render the REAL executed
+        // path (each touched address ONCE, loops folded to body + ×count), footer
+        // `-- sd: N steps, K distinct addrs -> .C:<land>`. 1:1 with monitor-flow-
+        // disasm.ts stepDisasm. Non-destructive: capture a machine checkpoint, step,
+        // render, then restore (the live shared session must not advance). Reuses the
+        // EXISTING step_one_instruction + disasm renderer (disasm_line_ts).
+        "sd" => {
+            let n = toks
+                .get(1)
+                .and_then(|t| t.parse::<i64>().ok())
+                .unwrap_or(50)
+                .clamp(1, 100_000) as usize;
+            // Snapshot the machine so sd is non-destructive (= the TS checkpoint
+            // save/restore wrap). Machine-only checkpoint (no media blobs needed for
+            // the RAM/CPU/chip restore sd touches).
+            let cp = trx64_core::c64re_snapshot::capture_runtime_checkpoint(
+                &st.session.machine,
+                "",
+                "",
+                None,
+                None,
+                None,
+                None,
+            );
+            let was_running = st.session.running;
+            st.session.running = false;
+            let mut order: Vec<u16> = Vec::new();
+            let mut count: std::collections::HashMap<u16, u32> = std::collections::HashMap::new();
+            for _ in 0..n {
+                let pc = st.session.machine.cpu6510.reg_pc;
+                if !count.contains_key(&pc) {
+                    order.push(pc);
+                }
+                *count.entry(pc).or_insert(0) += 1;
+                step_one_instruction(&mut st.session);
+            }
+            let land = st.session.machine.cpu6510.reg_pc;
+            // Restore the pre-sd machine state (non-destructive). On a restore error
+            // (should not happen with a self-captured checkpoint) leave it advanced
+            // and append a note — exactly like the TS `(sd: could not snapshot …)` path.
+            let restore_err =
+                trx64_core::c64re_snapshot::restore_runtime_checkpoint(&mut st.session.machine, &cp)
+                    .err();
+            st.session.machine.sync_after_monitor();
+            st.session.running = was_running;
+            // Render each touched address once (first-seen order) + ×count for loops.
+            let read = |a: u16| st.session.machine.peek_lens(a, "cpu");
+            let mut lines: Vec<String> = order
+                .iter()
+                .map(|&pc| {
+                    let (_, line) = disasm_line_ts(read, pc);
+                    let c = *count.get(&pc).unwrap();
+                    if c > 1 {
+                        format!("{line}   x{c}")
+                    } else {
+                        line
+                    }
+                })
+                .collect();
+            lines.push(format!(
+                "-- sd: {} steps, {} distinct addrs -> .C:{:04x}",
+                n,
+                order.len(),
+                land
+            ));
+            if let Some(e) = restore_err {
+                lines.push(format!(
+                    "(sd: could not snapshot — machine ADVANCED; `snap` first to preserve) [{e}]"
+                ));
+            }
+            Ok(lines.join("\n"))
+        }
+        // df [-i] [addr] [n] — STATIC control-flow walk (addr-first, like `d`;
+        // default from the disasm cursor / PC). Follows JMP, descends JSR + returns
+        // on RTS, follows an indirect JMP, loop-guarded. Conditional branch defaults
+        // to fall-through + annotates the taken target. 1:1 with monitor-flow-disasm.ts
+        // followDisasm (the non-interactive walk; -i interactive resolution is the
+        // UI-prompt path and not exercised by the gate, so the walk runs to its limit).
+        "df" => {
+            let mut i = 1usize;
+            // Accept (and skip) the -i flag; TRX64's monitor/exec is request/response
+            // with no modal prompt channel, so the walk proceeds non-interactively.
+            if toks.get(i).map(|s| s.as_str()) == Some("-i") {
+                i += 1;
+            }
+            let default_addr = st.mon.disasm_cursor.unwrap_or(st.session.machine.cpu6510.reg_pc);
+            let addr = parse_addr(toks.get(i)).map(|a| {
+                i += 1;
+                a
+            });
+            let addr = addr.unwrap_or(default_addr);
+            let n = toks
+                .get(i)
+                .and_then(|t| t.parse::<i64>().ok())
+                .unwrap_or(200)
+                .clamp(1, 100_000) as usize;
+            let read = |a: u16| st.session.machine.peek_lens(a, "cpu");
+            let indent = |depth: usize| -> String { "  ".repeat(depth.min(8)) };
+            let mut lines: Vec<String> = Vec::new();
+            let mut a = addr & 0xffff;
+            let mut stack: Vec<u16> = Vec::new();
+            let mut visited: std::collections::HashSet<u16> = std::collections::HashSet::new();
+            let mut remaining = n;
+            while remaining > 0 {
+                if visited.contains(&a) {
+                    lines.push(format!("{}  | back to ${:04x} (loop)", indent(stack.len()), a));
+                    break;
+                }
+                visited.insert(a);
+                let cf = classify_cf(read, a);
+                let (_, line) = disasm_line_ts(read, a);
+                lines.push(format!("{}{}", indent(stack.len()), line));
+                remaining -= 1;
+                match cf.kind {
+                    CfKind::Jmp => {
+                        a = cf.target.unwrap();
+                    }
+                    CfKind::JmpInd => {
+                        let p = cf.target.unwrap();
+                        let t = (read(p) as u16) | ((read(p.wrapping_add(1)) as u16) << 8);
+                        lines.push(format!("{}  -> (${:04x}) = ${:04x}", indent(stack.len()), p, t));
+                        a = t;
+                    }
+                    CfKind::Jsr => {
+                        stack.push(a.wrapping_add(cf.size));
+                        a = cf.target.unwrap();
+                    }
+                    CfKind::Rts | CfKind::Rti => {
+                        if let Some(ret) = stack.pop() {
+                            a = ret;
+                        } else {
+                            let kind = if matches!(cf.kind, CfKind::Rts) { "rts" } else { "rti" };
+                            lines.push(format!(
+                                "{}  (end — {kind}, call stack empty)",
+                                indent(stack.len())
+                            ));
+                            break;
+                        }
+                    }
+                    CfKind::Brk => {
+                        lines.push(format!("{}  (end — BRK)", indent(stack.len())));
+                        break;
+                    }
+                    CfKind::Branch => {
+                        let fall = a.wrapping_add(cf.size);
+                        // non-interactive default: fall-through + annotate the taken target.
+                        lines.push(format!(
+                            "{}  ; taken -> ${:04x}",
+                            indent(stack.len()),
+                            cf.target.unwrap()
+                        ));
+                        a = fall;
+                    }
+                    CfKind::Normal => {
+                        a = a.wrapping_add(cf.size);
+                    }
+                }
+            }
+            if remaining == 0 {
+                lines.push("-- df: reached step limit".to_string());
+            }
+            st.mon.disasm_cursor = Some(a);
+            Ok(lines.join("\n"))
+        }
+
+        // ---- screen — decode the 40x25 text screen (audit ws-trace-monitor-misc-10).
+        // Reads the LIVE screen pointer: VIC bank from CIA2 $DD00 (PA bits 0..1 are
+        // inverted) + the $D018 matrix nibble. Then decodes the 40×25 screen-RAM matrix
+        // (screen-code → ASCII) into a `|<40 chars>|` grid. 1:1 with monitor-shell.ts
+        // :731-742 (base computation, scToAscii, header, grid). $DD00/$D018 are read
+        // via the io lens; the matrix is read from RAM (the VIC reads RAM directly).
+        "screen" => {
+            let dd00 = st.session.machine.peek_lens(0xdd00, "io") & 0x03;
+            let vic_bank = ((3 - dd00) as u16) * 0x4000; // CIA2 PA bits 0..1 inverted
+            let d018 = st.session.machine.peek_lens(0xd018, "io");
+            let screen_base = vic_bank.wrapping_add((((d018 >> 4) & 0x0f) as u16) * 0x0400);
+            let mut lines: Vec<String> = vec![format!(
+                "screen @ ${:04x}  (VIC bank ${:04x}, $D018=${:02x})",
+                screen_base, vic_bank, d018
+            )];
+            for row in 0u16..25 {
+                let mut line = String::new();
+                for col in 0u16..40 {
+                    let a = screen_base.wrapping_add(row * 40 + col);
+                    line.push(sc_to_ascii(st.session.machine.peek_lens(a, "ram")));
+                }
+                lines.push(format!("|{line}|"));
+            }
             Ok(lines.join("\n"))
         }
 
