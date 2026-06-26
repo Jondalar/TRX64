@@ -3738,6 +3738,296 @@ const CASES: ConfCase[] = [
       };
     },
   },
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // BATCH 4 — checkpoint INTEGRITY + ring structure
+  //   (case-audit.md §"Spec 707 …", §"Spec 705.B / 769 …", §"Fix order Batch 4")
+  // ─────────────────────────────────────────────────────────────────────────
+
+  // ── P1: ws-checkpoint-pin-unpin — pin/unpin ring mechanics + unknown-id throws ─
+  // Spec 705.B §3.4/§4.10: pin(id) marks an anchor exempt from eviction and returns
+  // { ref{…pinned:true}, stats{pinnedCount…} }; unpin flips it back; pin/unpin of an
+  // UNKNOWN id THROWS (ws-server.ts:1043-1056 → "checkpoint/pin: unknown id <id>"),
+  // never a silent no-op (PL-7). The eviction-SURVIVAL leg (capture, pin, fill the
+  // ring past the cap, assert the pinned anchor survives) is NOT WS-differential-
+  // testable here: BOTH runtimes hardcode the ring budget to 32 MiB ≈ 512 SLOT_BYTES
+  // slots (runtime-checkpoint-ring.ts:136 DEFAULT_CHECKPOINT_RING_BUDGET_BYTES /
+  // checkpoint_ring.rs:46) with NO env override on either side, so filling past the
+  // cap means 512+ WS captures (~64 KiB RAM each) against the ~4 fps tsx oracle —
+  // infeasible in a 240 s case, and shrinking the budget would need a bilateral
+  // c64re-side change (FORBIDDEN in this batch). The eviction POLICY itself (oldest-
+  // unpinned evicted; all-pinned-full errors) is covered by the TRX64 ring unit tests
+  // (checkpoint_ring.rs:557/574 eviction_drops_oldest_unpinned_when_full +
+  // capture_errors_when_all_pinned_and_full). This case asserts the WS pin/unpin
+  // CONTRACT (the surface the audit's P1 signal names) field-for-field TS≡TRX64.
+  {
+    id: "ws-checkpoint-pin-unpin",
+    severity: "P1",
+    title: "checkpoint/pin marks pinned + bumps stats.pinnedCount; unpin flips back; unknown id throws (PL-7)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      // A fresh paused machine can capture an anchor without free-running.
+      const cap = (await c.call("checkpoint/capture", { session_id: sid })) as any;
+      const cpId = cap?.ref?.id ?? cap?.id;
+      // pin → { ref.pinned === true, stats.pinnedCount >= 1 }.
+      const p = (await c.call("checkpoint/pin", { session_id: sid, id: cpId })) as any;
+      const pinnedRef = p?.ref?.pinned === true;
+      const pinnedStat = Number(p?.stats?.pinnedCount ?? -1) >= 1;
+      // list reflects the pin on that id (the ref carried in the ring is pinned).
+      const listed = (await c.call("checkpoint/list", { session_id: sid })) as any;
+      const listEntry = (listed?.checkpoints ?? []).find((e: any) => String(e.id) === String(cpId));
+      const listShowsPinned = listEntry?.pinned === true;
+      // unpin → { ref.pinned === false }.
+      const u = (await c.call("checkpoint/unpin", { session_id: sid, id: cpId })) as any;
+      const unpinnedRef = u?.ref?.pinned === false;
+      // unknown-id pin/unpin must THROW a real RPC error (not a silent no-op, PL-7).
+      let pinUnknownThrew = false;
+      try { await c.call("checkpoint/pin", { session_id: sid, id: "deadbeef-nope" }); }
+      catch { pinUnknownThrew = true; }
+      let unpinUnknownThrew = false;
+      try { await c.call("checkpoint/unpin", { session_id: sid, id: "deadbeef-nope" }); }
+      catch { unpinUnknownThrew = true; }
+      return {
+        // pin sets the ref pinned + bumps the pinned count.
+        pinnedRef,
+        pinnedStat,
+        // the ring's own list view reflects the pin on that id.
+        listShowsPinned,
+        // unpin flips it back to false.
+        unpinnedRef,
+        // pin/unpin of an unknown id throws (no PL-7 silent fallback).
+        pinUnknownThrew,
+        unpinUnknownThrew,
+      };
+    },
+  },
+
+  // ── P0: ws-checkpoint-restore-unknown-id-throws — PL-7 silent-fallback trap ────
+  // Spec 705.B/769 §4: checkpoint/restore with NO id or an UNKNOWN id must THROW a
+  // real RPC error — never silently no-op (leaving the live machine as-is so a UI
+  // thinks the scrub landed) or restore garbage. TS: ws-server.ts:1066 throws
+  // "checkpoint/restore: id required" on a missing id, and restoreCheckpoint(id) on
+  // an unknown id throws out of the ring lookup. A PL-7 silent-fallback (returning a
+  // success envelope while doing nothing) is the classic C→TS/Rust port miss — and
+  // it false-greens any restore-happy-path case that never checks the error arm. We
+  // assert BOTH legs throw on BOTH runtimes AND that the machine state (pc/cycles) is
+  // UNCHANGED across the failed restore (a silent restore-of-garbage would move it).
+  {
+    id: "ws-checkpoint-restore-unknown-id-throws",
+    severity: "P0",
+    title: "checkpoint/restore with missing/unknown id throws (no silent no-op, no garbage restore) — PL-7",
+    async signal(c) {
+      const sid = await liveSession(c);
+      // Read the live coords before the failed restores — they must be untouched.
+      const before = await state(c, sid);
+      const pcBefore = before.cpu?.pc ?? before.pc ?? null;
+      const cycBefore = before.c64Cycles ?? before.cycles ?? before.cpu?.cycles ?? null;
+      // (a) missing id → throw.
+      let missingThrew = false;
+      try { await c.call("checkpoint/restore", { session_id: sid }); }
+      catch { missingThrew = true; }
+      // (b) unknown id → throw (a real error, not method-not-found and not success).
+      let unknownThrew = false;
+      try { await c.call("checkpoint/restore", { session_id: sid, id: "deadbeef-nope" }); }
+      catch { unknownThrew = true; }
+      // State must be UNCHANGED across the two failed restores (no garbage applied).
+      const after = await state(c, sid);
+      const pcAfter = after.cpu?.pc ?? after.pc ?? null;
+      const cycAfter = after.c64Cycles ?? after.cycles ?? after.cpu?.cycles ?? null;
+      return {
+        missingThrew,
+        unknownThrew,
+        // A failed restore left the machine exactly where it was (PL-7: no silent
+        // partial/garbage restore that moves the live state).
+        pcUnchanged: Number(pcAfter) === Number(pcBefore),
+        cyclesUnchanged: Number(cycAfter) === Number(cycBefore),
+      };
+    },
+  },
+
+  // ── P2: ws-checkpoint-thumbnails-shape — filmstrip thumbnail reply contract ────
+  // Spec 769.5a / 705.B §4.10: checkpoint/thumbnails returns
+  // { thumbnails:[{id,cycles,frame,pinned,width,height,palette(b64),indices(b64)}…] }
+  // — one entry per live ring anchor that has a thumbnail, in ring order, each with a
+  // non-empty base64 palette + indices and a positive width/height (the VIC display
+  // dims). TS: ws-server.ts:1028-1037 (= RuntimeController.filmstrip). An explicit
+  // checkpoint/capture KEEPS the framebuffer, so TRX64 renders a thumbnail from the
+  // stored vicPresentation FB (main.rs:8786-8813 checkpoint_thumbnail fallback) —
+  // the same shape TS emits. We capture two explicit anchors, fetch the thumbnails,
+  // and compare the normalized per-entry shape (field presence + non-empty b64 +
+  // w/h>0) field-for-field. A TRX64 that lacked the method would surface as method-
+  // not-found (caught here → empty), diverging loud; here it is implemented, so the
+  // case proves the SHAPE matches (audit ★: method-not-found is the catch).
+  {
+    id: "ws-checkpoint-thumbnails-shape",
+    severity: "P2",
+    title: "checkpoint/thumbnails reply shape matches TS (id+cycles+frame+pinned+w/h+b64 palette/indices)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      // Two explicit captures: explicit capture keeps the framebuffer, so each anchor
+      // has a renderable thumbnail on both runtimes.
+      await c.call("checkpoint/capture", { session_id: sid });
+      await c.call("checkpoint/capture", { session_id: sid });
+      let methodMissing = false;
+      let res: any = null;
+      try {
+        res = (await c.call("checkpoint/thumbnails", { session_id: sid })) as any;
+      } catch (e) {
+        // method-not-found (or any error) → record the divergence loudly.
+        const msg = e instanceof Error ? e.message : String(e);
+        if (/method not found|-32601/i.test(msg)) methodMissing = true;
+      }
+      const thumbs: any[] = Array.isArray(res?.thumbnails) ? res.thumbnails : [];
+      // Normalize each entry to a presence/validity shape (not the literal b64 — the
+      // pictures differ pixel-for-pixel across daemons; we compare the CONTRACT).
+      const entryShape = (t: any) => ({
+        hasId: typeof t?.id === "string" && t.id.length > 0,
+        cyclesIsNumber: typeof t?.cycles === "number",
+        frameIsNumber: typeof t?.frame === "number",
+        pinnedIsBool: typeof t?.pinned === "boolean",
+        widthPositive: Number(t?.width) > 0,
+        heightPositive: Number(t?.height) > 0,
+        paletteNonEmptyB64: typeof t?.palette === "string" && t.palette.length > 0,
+        indicesNonEmptyB64: typeof t?.indices === "string" && t.indices.length > 0,
+      });
+      return {
+        methodMissing,
+        // At least one thumbnail came back (the two explicit captures each have a FB).
+        hasThumbnails: thumbs.length >= 1,
+        // The first entry's normalized contract shape (field-for-field TS≡TRX64).
+        firstShape: thumbs[0] ? entryShape(thumbs[0]) : null,
+        // Every returned entry satisfies the contract (catches a partial impl).
+        allValid: thumbs.length >= 1 && thumbs.every((t) => Object.values(entryShape(t)).every(Boolean)),
+      };
+    },
+  },
+
+  // ── P0: ws-snapshot-integrity-reject — corrupt .c64re rejected, no partial restore
+  // Spec 707 §6.5/§3: snapshot/undump of a CORRUPTED container (flipped body byte =
+  // failed sha256, truncated header, or bad magic) must REJECT THE WHOLE FILE with a
+  // clear RPC error AND leave the machine state UNTOUCHED — no half-applied restore
+  // (the high-risk port behaviour: validate-then-mutate vs mutate-as-you-go). TS:
+  // undumpRuntimeSnapshot calls readNativeSnapshot FIRST (magic+version+sha256+media
+  // sha) and throws BEFORE attachDisk/restoreFromSnapshot (snapshot-persistence.ts:
+  // 218-246) — so a corrupt file never touches state. TRX64 mirrors this: read_native
+  // _snapshot validates+returns Err BEFORE the state lock + attach_disk/restore (main
+  // .rs:9076-9079). We dump a valid .c64re, then write THREE corrupt variants
+  // (sha-mismatch / truncated / bad-magic), and for EACH assert undump THROWS and the
+  // live {pc,cycles,RAM-sentinel} is unchanged afterward (no partial clobber).
+  {
+    id: "ws-snapshot-integrity-reject",
+    severity: "P0",
+    title: "snapshot/undump rejects a corrupted .c64re WHOLE — throws + leaves state untouched (707 §6.5)",
+    async signal(c, d) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      // Plant a RAM sentinel so we can prove RAM was not clobbered by a partial restore.
+      await exec("wr ram c000 5a a5 5a a5");
+      const readByte = async (addr: string): Promise<string> => {
+        const out = await exec(`m ram ${addr} ${addr}`);
+        const hex = out.replace(/[^0-9a-fA-F\s]/g, " ").trim().split(/\s+/);
+        // The first 4-hex token is the address echo; the byte follows. Find the first
+        // 2-hex token AFTER a 4-hex address token.
+        const addrIdx = hex.findIndex((t) => t.length === 4);
+        const byte = hex.slice(addrIdx + 1).find((t) => t.length === 2);
+        return (byte ?? "").toLowerCase();
+      };
+      const sentinelBefore = await readByte("c000");
+      // Dump a VALID snapshot to an abs path (a good baseline to corrupt).
+      const goodPath = `${d.projectDir}/good.c64re`;
+      await c.call("snapshot/dump", { session_id: sid, path: goodPath });
+      const good = readFileSync(goodPath);
+      const HEADER_LEN = 8 + 1 + 32; // magic(8)+version(1)+sha256(32)
+      // Read the live coords AFTER the dump (the dump itself captured a checkpoint,
+      // which may bump the controller frame — but pc/cycles of a paused machine hold).
+      const stBefore = await state(c, sid);
+      const pcBefore = stBefore.cpu?.pc ?? stBefore.pc ?? null;
+      const cycBefore = stBefore.c64Cycles ?? stBefore.cycles ?? stBefore.cpu?.cycles ?? null;
+
+      // Variant 1 — sha256 mismatch: flip a byte in the gzip body (offset >= HEADER_LEN).
+      const shaBad = Buffer.from(good);
+      shaBad[HEADER_LEN] = shaBad[HEADER_LEN]! ^ 0xff;
+      const shaBadPath = `${d.projectDir}/sha-bad.c64re`;
+      writeFileSync(shaBadPath, shaBad);
+      // Variant 2 — truncated: keep only the header (no body → sha over empty != stored).
+      const truncPath = `${d.projectDir}/trunc.c64re`;
+      writeFileSync(truncPath, Buffer.from(good.subarray(0, HEADER_LEN)));
+      // Variant 3 — bad magic: clobber the first magic byte.
+      const magicBad = Buffer.from(good);
+      magicBad[0] = magicBad[0]! ^ 0xff;
+      const magicBadPath = `${d.projectDir}/magic-bad.c64re`;
+      writeFileSync(magicBadPath, magicBad);
+
+      const undumpThrows = async (path: string): Promise<boolean> => {
+        try { await c.call("snapshot/undump", { session_id: sid, path }); return false; }
+        catch { return true; }
+      };
+      const shaThrew = await undumpThrows(shaBadPath);
+      const truncThrew = await undumpThrows(truncPath);
+      const magicThrew = await undumpThrows(magicBadPath);
+
+      // State must be UNTOUCHED after the three failed undumps (no partial clobber).
+      const stAfter = await state(c, sid);
+      const pcAfter = stAfter.cpu?.pc ?? stAfter.pc ?? null;
+      const cycAfter = stAfter.c64Cycles ?? stAfter.cycles ?? stAfter.cpu?.cycles ?? null;
+      const sentinelAfter = await readByte("c000");
+      return {
+        // Each corrupt variant is rejected (a real RPC error).
+        shaMismatchThrew: shaThrew,
+        truncatedThrew: truncThrew,
+        badMagicThrew: magicThrew,
+        // The machine state is untouched after the failed undumps (no partial restore).
+        pcUnchanged: Number(pcAfter) === Number(pcBefore),
+        cyclesUnchanged: Number(cycAfter) === Number(cycBefore),
+        // The RAM sentinel survived (a half-applied restore would clobber it).
+        sentinelUnchanged: sentinelAfter === sentinelBefore && sentinelBefore === "5a",
+      };
+    },
+  },
+
+  // ── P1: ws-snapshot-dump-descriptor — dump reply descriptor shape (707 §4) ─────
+  // Spec 707 §4: snapshot/dump returns a DESCRIPTOR { path, cycle, pc, machine, media,
+  // fileBytes, breakpoints } — machine "c64-pal", a real cycle/pc, the embedded media
+  // list (each {role,format,sourceName?,sha256,bytes}), and the on-disk byte count. TS:
+  // dumpRuntimeSnapshot (snapshot-persistence.ts:135-143). With an EasyFlash mounted,
+  // the media list carries the cartridge role with a CONTENT-derived sha256 (so the
+  // sha is equal across runtimes), and fileBytes>0. We mount the writable EasyFlash,
+  // dump, and compare the normalized descriptor (machine, cycle/pc/fileBytes positivity,
+  // the cart media entry's role/format/sha256/bytes) field-for-field TS≡TRX64. The
+  // .c64re container itself is byte-identical-format (magic C64RESNP); the *file* bytes
+  // differ (createdAt timestamp) so we compare fileBytes>0, not its literal value.
+  {
+    id: "ws-snapshot-dump-descriptor",
+    severity: "P1",
+    title: "snapshot/dump returns the 707 §4 descriptor (machine, cycle/pc, media sha256, fileBytes)",
+    spawn: { seedFiles: [{ rel: "fixture.crt", bytes: EASYFLASH_CRT }] },
+    async signal(c, d) {
+      const sid = await liveSession(c);
+      await c.call("media/mount", { session_id: sid, path: `${d.projectDir}/fixture.crt`, slot: 0 });
+      const r = (await c.call("snapshot/dump", { session_id: sid, path: `${d.projectDir}/desc.c64re` })) as any;
+      const media: any[] = Array.isArray(r?.media) ? r.media : [];
+      // The cartridge media entry (role "cartridge"); its sha256 is content-derived so
+      // it is EQUAL across daemons (the .crt bytes are identical), unlike volatile paths.
+      const cart = media.find((m) => m.role === "cartridge");
+      return {
+        // The descriptor's machine model.
+        machine: r?.machine ?? null,
+        // A real cycle + pc (numbers ≥ 0) and a non-empty file on disk.
+        cycleIsNumber: typeof r?.cycle === "number",
+        pcIsNumber: typeof r?.pc === "number",
+        fileBytesPositive: Number(r?.fileBytes) > 0,
+        breakpointsIsNumber: typeof r?.breakpoints === "number",
+        // The cart media entry is present with a content-derived sha256 (TS≡TRX64).
+        cartRole: cart?.role ?? null,
+        cartFormat: cart?.format ?? null,
+        cartSha256: cart?.sha256 ?? null,
+        cartBytesPositive: Number(cart?.bytes) > 0,
+      };
+    },
+  },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
