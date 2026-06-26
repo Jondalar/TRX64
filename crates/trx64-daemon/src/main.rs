@@ -10003,12 +10003,15 @@ fn scenario_steps_from_inputs(inputs: &[Value]) -> Vec<trx64_core::scenario_play
 }
 
 // ── Spec 265 — recent-media scan ─────────────────────────────────────────────
-// media/recent (ws-server.ts:1809) returns `{ path, name, type }[]` image-media
-// found under the active project dir (+ the C64RE samples/ corpus). c64re also
-// overlays a persisted global recents store (~/.config/c64re/recent-media.json);
-// TRX64 keeps no host-state store (additive), so it scans the project dir and the
-// samples corpus only — the same §2/§3 directory sources c64re walks. Image exts
-// only (.crt/.d64/.g64/.vsf; .prg excluded — matches c64re's project walk).
+// media/recent (ws-server.ts:1809) returns `{ path, name, type, mountedAt }[]`
+// image-media for the picker. BUG-013 / Spec 771: in PRODUCTION mode the picker shows
+// ONLY active-project media. TRX64 is the external production bin and has no
+// `--dev-samples` flag, so it is ALWAYS production: it overlays the (project-scoped)
+// in-memory recents store, then walks the active project dir, and NEVER scans the c64re
+// `samples/` corpus (that scan is c64re's §2 `--dev-samples`-gated dev convenience). The
+// recents store is gated to inside the project dir (insideProject, ws-server.ts:1836) so
+// a cart mounted in a different project earlier doesn't leak in. Image exts only
+// (.crt/.d64/.g64/.vsf; .prg excluded — matches c64re's project walk).
 fn scan_recent_media(recent: &[RecentMedia]) -> Vec<Value> {
     const IMG_EXTS: &[&str] = &[".crt", ".d64", ".g64", ".vsf"];
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -10025,14 +10028,42 @@ fn scan_recent_media(recent: &[RecentMedia]) -> Vec<Value> {
         .nth(1)
         .unwrap_or_default();
 
+    // BUG-013 — the picker must show ONLY active-project media in PRODUCTION mode.
+    // TRX64 has no `--dev-samples` flag (Spec 771 — the external bin is ALWAYS
+    // production), so every recents path is gated to inside the resolved project dir,
+    // 1:1 with the c64re `insideProject` (ws-server.ts:1824-1828): canonicalize both
+    // and keep only paths strictly under the project root. An empty/missing project →
+    // nothing is inside it (matches TS returning false on an empty projDirAbs).
+    let proj_root_canon: Option<std::path::PathBuf> = if project_path.is_empty() {
+        None
+    } else {
+        std::fs::canonicalize(&project_path)
+            .ok()
+            .or_else(|| Some(std::path::PathBuf::from(&project_path)))
+    };
+    let inside_project = |p: &str| -> bool {
+        let root = match &proj_root_canon {
+            Some(r) => r,
+            None => return false,
+        };
+        let cand = std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p));
+        // Strict descendant: equal-to-root is not "inside" (matches TS `rel !== ""`).
+        cand != *root && cand.starts_with(root)
+    };
+
     // 0) audit ws-media-8 — overlay the persisted recents store FIRST (= c64re §1,
     //    ws-server.ts:1833-1839): existing recents, NEWEST-FIRST, each carrying its
     //    `mountedAt` timestamp, ahead of the dir scans below. Skip a recents entry
     //    whose file no longer exists (recent-files-style staleness, ws-server.ts:1834),
     //    and dedup so a recents path is not re-listed by the dir scan. The store is
     //    already newest-first (add_recent_media prepends), so iterate in order.
+    //    BUG-013: gate to inside the project dir (ws-server.ts:1836 production branch),
+    //    so a cart mounted in a DIFFERENT project earlier does not leak into this one.
     for r in recent {
         if !std::path::Path::new(&r.path).exists() {
+            continue;
+        }
+        if !inside_project(&r.path) {
             continue;
         }
         if seen.contains(&r.path) {
@@ -10107,38 +10138,14 @@ fn scan_recent_media(recent: &[RecentMedia]) -> Vec<Value> {
         walk(std::path::Path::new(&project_path), 0, &mut seen, &mut out, &ext_of);
     }
 
-    // 2) The C64RE samples/ corpus (= c64re §2 dev-samples scan) — top-level only.
-    let c64re_root = std::env::var("C64RE_ROOT")
-        .unwrap_or_else(|_| "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP".to_string());
-    let samples = std::path::Path::new(&c64re_root).join("samples");
-    if samples.exists() {
-        let mut entries: Vec<_> = match std::fs::read_dir(&samples) {
-            Ok(rd) => rd.flatten().collect(),
-            Err(_) => Vec::new(),
-        };
-        entries.sort_by_key(|e| e.file_name());
-        for entry in entries {
-            if out.len() >= 100 {
-                break;
-            }
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') || name == "node_modules" {
-                continue;
-            }
-            let full = entry.path();
-            if full.is_dir() {
-                continue; // top-level only
-            }
-            let abs = full.to_string_lossy().to_string();
-            if seen.contains(&abs) {
-                continue;
-            }
-            if let Some(ext) = ext_of(&name) {
-                seen.insert(abs.clone());
-                out.push(json!({ "path": abs, "name": name, "type": &ext[1..] }));
-            }
-        }
-    }
+    // 2) NO samples scan. BUG-013 / Spec 771: the c64re §2 repo `samples/` scan runs
+    //    ONLY under `--dev-samples` (ws-server.ts:1841-1859, `if (this.devSamples …)`).
+    //    TRX64 is the external production bin and never gets `--dev-samples`, so the
+    //    samples corpus must NEVER be scanned — the picker shows ONLY active-project
+    //    media (the §1 project-dir walk above). The unconditional samples scan that
+    //    used to live here leaked the c64re samples carts (AccoladeComics_TRX+1D_EF.crt,
+    //    im3_MAGICDESK.crt, lykia_*.crt, yeti_mountain_GMOD2.crt) into every project's
+    //    picker — exactly the out-of-project leak ws-media-8 now guards against.
 
     out.truncate(100);
     out

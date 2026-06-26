@@ -270,22 +270,34 @@ const CASES: ConfCase[] = [
     },
   },
 
-  // ── P1: ws-media-8 — media/recent overlays the persisted recents store ──────
-  // (Audit theme T3.) TS's media/recent overlays a GLOBAL persisted recents store
-  // (recent-files.ts getRecent: newest-first, max 10, each carrying a `mountedAt`
-  // timestamp; addRecent stamps it on every ingest) AHEAD of the dir scans
-  // (ws-server.ts:1809-1887). TRX64's scan_recent_media was project+samples dir scan
-  // ONLY (alphabetical, no store, no mountedAt). Fix: maintain a recents store updated
-  // on every mount (newest-first, cap 10, mountedAt), overlaid ahead of the dir scan,
-  // 1:1 with recent-files.ts. Signal: mount disk A then disk B (two seed disks), then
-  // read media/recent — assert the FIRST entry is the most-recently-mounted (B) and
-  // entries carry a mountedAt field. TS: {topIsNewest:true, hasMountedAt:true}; TRX64
-  // (before fix): {false,false}. C64RE_RECENT_FILE points at a per-daemon temp store so
-  // neither runtime touches the user's real recents (and the two daemons can't share).
+  // ── P1: ws-media-8 — media/recent overlays the recents store AND is project-scoped ──
+  // (Audit theme T3 + BUG-013.) TS's media/recent overlays a GLOBAL persisted recents
+  // store (recent-files.ts getRecent: newest-first, max 10, each carrying a `mountedAt`
+  // timestamp; addRecent stamps it on every ingest) AHEAD of the dir scans, BUT in
+  // PRODUCTION mode (no --dev-samples) it shows ONLY active-project media: §1 recents are
+  // gated to inside the project dir (`insideProject`, ws-server.ts:1824-1838) and the §2
+  // repo `samples/` scan runs ONLY under --dev-samples (ws-server.ts:1841-1859). TRX64 has
+  // NO --dev-samples flag (Spec 771 — the external bin is ALWAYS production), so it must
+  // NEVER scan samples and must gate its recents store to the project dir.
+  //
+  // This case asserts BOTH halves:
+  //  (a) recents-store ordering: maintain a recents store updated on every mount
+  //      (newest-first, cap 10, mountedAt), overlaid ahead of the dir scan, 1:1 with
+  //      recent-files.ts → {topIsNewest, hasMountedAt}.
+  //  (b) PROJECT-SCOPING (BUG-013): every entry's path is under the daemon's --project
+  //      dir. TRX64's old scan_recent_media UNCONDITIONALLY scanned the real c64re
+  //      `samples/` dir (absolute path that EXISTS on disk), so even this hermetic
+  //      project surfaced the samples carts (AccoladeComics_TRX+1D_EF.crt, im3_MAGICDESK.crt,
+  //      lykia_*.crt, yeti_mountain_GMOD2.crt) — out-of-project leak. Signal:
+  //      `outOfProjectCount` = entries whose path is NOT under d.projectDir. TS
+  //      (production, project-only): 0. TRX64 (before fix): >0. Both (after fix): 0.
+  //
+  // C64RE_RECENT_FILE points at a per-daemon temp store so neither runtime touches the
+  // user's real recents (and the two daemons can't share).
   {
     id: "ws-media-8",
     severity: "P1",
-    title: "media/recent overlays the persisted recents store (newest-first + mountedAt)",
+    title: "media/recent: recents store (newest-first + mountedAt) AND project-scoped (no samples leak)",
     spawn: {
       seedFiles: [
         { rel: "diskA.d64", bytes: SCRAMBLE_D64 },
@@ -304,11 +316,21 @@ const CASES: ConfCase[] = [
       const recent = (await c.call("media/recent", {})) as any;
       const arr: any[] = Array.isArray(recent) ? recent : recent?.recent ?? recent?.result ?? [];
       const norm = (p: string) => (p ? p.split("/").pop() : p);
+      // BUG-013 project-scoping: count entries whose resolved path is NOT under the
+      // daemon's --project dir. The samples carts (absolute /…/samples/*.crt) live OUTSIDE
+      // every hermetic project, so a samples scan makes this > 0. Normalize a trailing
+      // slash so the boundary check is a clean prefix match on the project root.
+      const projRoot = d.projectDir.replace(/\/+$/, "") + "/";
+      const insideProject = (p: string): boolean => typeof p === "string" && p.startsWith(projRoot);
+      const outOfProjectCount = arr.filter((r) => !insideProject(r?.path)).length;
       return {
         // The most-recently-mounted disk (B) must be the FIRST recents entry.
         topIsNewest: arr.length > 0 && norm(arr[0]?.path) === "diskB.d64",
         // Every store-sourced entry carries a mountedAt timestamp (recent-files.ts).
         hasMountedAt: arr.length > 0 && typeof arr[0]?.mountedAt === "string" && arr[0].mountedAt.length > 0,
+        // BUG-013: production picker shows ONLY active-project media — zero out-of-project
+        // entries (no unconditional samples/ scan, recents store gated to the project dir).
+        outOfProjectCount,
       };
     },
   },
