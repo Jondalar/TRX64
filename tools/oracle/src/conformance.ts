@@ -75,6 +75,31 @@ async function waitRunningBooted(c: RpcClient, sid: string, minCyc: number, time
   return st;
 }
 
+/** TRX64-superset reverse-debug methods (runtime/reverse_step, runtime/who_wrote,
+ *  runtime/crash_triage, trace/build_from_ring) are delivered ONLY by the TRX64 runtime.
+ *  The TS runtime CLEANLY DECLINES them (ws-server.ts TRX64_ONLY_METHODS) with the message
+ *  "not supported by the TypeScript runtime — use the TRX64 runtime" + a `data.trx64Only`
+ *  marker — NOT the generic -32601 "method not found", NOT a matched throw. The ws-client
+ *  surfaces the JSON-RPC error as an Error whose `.message` is the server message, so we
+ *  match the recognizable refusal text (the `data` marker is not carried over the client).
+ *  Returns true iff the call was declined with that clean, recognizable message. A success
+ *  (no throw), a -32601, or any other error → false (the TS side did NOT decline cleanly). */
+async function assertTrx64OnlyDecline(
+  c: RpcClient,
+  method: string,
+  params: Record<string, unknown>,
+): Promise<boolean> {
+  try {
+    await c.call(method, params);
+    return false; // TS must NOT actually service a TRX64-only superset method.
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // The clean TRX64-superset decline — explicitly NOT -32601 / "method not found".
+    if (/method not found|-32601/i.test(msg)) return false;
+    return /not supported by the TypeScript runtime/i.test(msg) || /trx64Only/i.test(msg);
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // CASES
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1860,34 +1885,34 @@ const CASES: ConfCase[] = [
   },
 
   // ── P1: ws-reverse-step — real backward-stepping (TRX64 superset, reverse-debug 1b)
-  // NON-GATING (blocked): TS has only the snapshot ring-crutch (restore-anchor + replay-
-  // forward) — it has NO O(1) delta-undo `runtime/reverse_step`, so the differential
-  // cannot compare. TRX64's always-on full-delta ring undoes the last instruction(s)
-  // (write old_values back + restore the CPU pre-state). Asserted on the TRX64 daemon
-  // alone (run with --include-blocked), per the reverse-debug verification doctrine
-  // ("NOT the differential gate — TRX64 superset").
-  //   tsx src/conformance.ts --only ws-reverse-step --include-blocked
+  // TWO-SIDED, GATING. TRX64's always-on full-delta ring undoes the last instruction(s)
+  // (write old_values back + restore the CPU pre-state). The TS runtime has only the
+  // snapshot ring-crutch (replay-forward), no O(1) delta-undo `runtime/reverse_step`, so
+  // it now CLEANLY DECLINES the method ("not supported by the TypeScript runtime — use the
+  // TRX64 runtime", ws-server.ts TRX64_ONLY_METHODS) instead of -32601 method-not-found.
+  // The differential is `behavesCorrectly` = each runtime did the right thing FOR ITS KIND:
+  // TS declines cleanly; TRX64 delivers. Both true → identical signal → GREEN, GATING.
+  //   tsx src/conformance.ts --only ws-reverse-step
   //
   // FLOW (TRX64): after `liveSession` the machine is booted (cold reset ran the KERNAL to
   // READY on the full-machine path → the delta ring already holds real history). Read the
   // CPU state, single-step ONE real instruction (fed into the ring), then `reverse_step
   // n=1` over WS. Assert the WS reply landed back on the EXACT pre-step PC + registers AND
-  // that `session/state` confirms the machine's live PC rolled back. RED-before: the
-  // method did not exist (→ -32601 / error). GREEN-after: pc/regs match the pre-state.
+  // that `session/state` confirms the machine's live PC rolled back.
+  // FLOW (TS): call `runtime/reverse_step` once; the WS server declines it with the
+  // recognizable TRX64-superset message → `tsDeclinesCleanly`.
   {
     id: "ws-reverse-step",
     severity: "P1",
-    blocked:
-      "TRX64 superset: TS has only the snapshot ring-crutch (replay-forward), no O(1) " +
-      "delta-undo reverse_step, so the differential can't compare. TRX64's full-delta ring " +
-      "undoes the last instruction (RAM+regs byte-exact); asserted on TRX64 alone (run with " +
-      "--include-blocked).",
-    title: "runtime/reverse_step undoes the last instruction (pc/regs/ram roll back to the pre-state) — TRX64 reverse-debug superset",
+    title: "runtime/reverse_step undoes the last instruction (TRX64 delivers; TS cleanly declines) — TRX64 reverse-debug superset",
     async signal(c, d) {
       if (d.kind !== "trx64") {
-        // TS has no reverse_step — documented refusal, non-gating. Same SHAPE as the
-        // TRX64 signal so the (non-gating) divergence is purely value-based.
-        return { landedOnPreState: false, inspectOnly: false, ramRolledBack: false, movedForward: false };
+        // TS has no reverse_step — assert the CLEAN decline (not -32601, not a generic
+        // throw). The single comparable signal `behavesCorrectly` is true when TS refused
+        // the superset method with the recognizable "TypeScript runtime" message.
+        const sid = await liveSession(c);
+        const tsDeclinesCleanly = await assertTrx64OnlyDecline(c, "runtime/reverse_step", { session_id: sid, n: 1 });
+        return { behavesCorrectly: tsDeclinesCleanly };
       }
       const sid = await liveSession(c);
       // Pre-state: the live CPU before we step forward.
@@ -1901,26 +1926,26 @@ const CASES: ConfCase[] = [
       const rev = (await c.call("runtime/reverse_step", { session_id: sid, n: 1 })) as any;
       // Re-read the live state: the machine must sit back at the pre-step PC.
       const s2 = await state(c, sid);
-      return {
-        // The WS reply landed on the exact pre-step CPU state.
-        landedOnPreState:
-          rev?.stepsTaken === 1 &&
-          rev?.pc === pc0 && rev?.a === a0 && rev?.x === x0 && rev?.y === y0 && rev?.sp === sp0,
-        // The contract flag is surfaced (inspect-only).
-        inspectOnly: rev?.inspectOnly === true,
-        // The LIVE machine PC rolled back (not just the reply).
-        ramRolledBack: s2.cpu.pc === pc0,
-        // Sanity: the forward step actually moved (so the reverse undid something real).
-        movedForward,
-      };
+      // The WS reply landed on the exact pre-step CPU state.
+      const landedOnPreState =
+        rev?.stepsTaken === 1 &&
+        rev?.pc === pc0 && rev?.a === a0 && rev?.x === x0 && rev?.y === y0 && rev?.sp === sp0;
+      // The contract flag is surfaced (inspect-only).
+      const inspectOnly = rev?.inspectOnly === true;
+      // The LIVE machine PC rolled back (not just the reply).
+      const ramRolledBack = s2.cpu.pc === pc0;
+      // TRX64 behaves correctly when it actually delivered the reverse-step: the forward
+      // step moved, the reply landed on the pre-state, the live PC rolled back, inspect-only.
+      return { behavesCorrectly: movedForward && landedOnPreState && ramRolledBack && inspectOnly };
     },
   },
 
   // ── P1: ws-who-wrote — last-writer scan over the live delta ring (reverse-debug 1b)
-  // NON-GATING (blocked): the stack-crash shortcut "who put the bad byte on $XXXX". TS
-  // has no equivalent live last-writer scan over an always-on delta ring; asserted on
-  // TRX64 alone (--include-blocked).
-  //   tsx src/conformance.ts --only ws-who-wrote --include-blocked
+  // TWO-SIDED, GATING: the stack-crash shortcut "who put the bad byte on $XXXX". TRX64's
+  // always-on delta ring serves the live last-writer scan; the TS runtime has no equivalent
+  // and now CLEANLY DECLINES `runtime/who_wrote` ("not supported by the TypeScript runtime
+  // — use the TRX64 runtime"). `behavesCorrectly` = TS declines cleanly ∧ TRX64 delivers.
+  //   tsx src/conformance.ts --only ws-who-wrote
   //
   // FLOW (TRX64): the booted KERNAL idle loop + jiffy IRQ continuously write the zero-page
   // jiffy clock ($00A0-$00A2) and other ZP. After settling, `runtime/who_wrote {addr:
@@ -1928,19 +1953,19 @@ const CASES: ConfCase[] = [
   // also pin a KNOWN write deterministically: step until the live PC's instruction stores
   // to a zero-page byte is hard to guarantee, so we additionally assert the structural
   // contract (writers[] shape, newest-first) on whatever the live ring captured.
+  // FLOW (TS): call `runtime/who_wrote` once → assert the clean TRX64-superset decline.
   {
     id: "ws-who-wrote",
     severity: "P1",
-    blocked:
-      "TRX64 superset: no TS equivalent live last-writer scan over an always-on delta " +
-      "ring; asserted on TRX64 alone (run with --include-blocked).",
-    title: "runtime/who_wrote pins the last writer(s) of an address from the live delta ring — TRX64 reverse-debug superset",
+    title: "runtime/who_wrote pins the last writer(s) of an address (TRX64 delivers; TS cleanly declines) — TRX64 reverse-debug superset",
     // --stream: the per-frame stream loop is the free-run driver, so `debug/run` actually
     // advances the machine past READY (without it `waitRunningBooted` never reaches 3.8M).
     spawn: { stream: true },
     async signal(c, d) {
       if (d.kind !== "trx64") {
-        return { foundWriter: false, newestFirst: false, oldNewCoherent: false };
+        const sid = await liveSession(c);
+        const tsDeclinesCleanly = await assertTrx64OnlyDecline(c, "runtime/who_wrote", { session_id: sid, addr: 0x00a2, limit: 8 });
+        return { behavesCorrectly: tsDeclinesCleanly };
       }
       const sid = await liveSession(c);
       // Run WELL PAST the BASIC READY prompt: the jiffy clock LSB ($00A2) is only
@@ -1967,39 +1992,40 @@ const CASES: ConfCase[] = [
         writers.every(
           (w) => w.addr === 0x00a2 && w.old >= 0 && w.old <= 255 && w.new >= 0 && w.new <= 255 && typeof w.pc === "number" && w.pc > 0,
         );
-      return { foundWriter, newestFirst, oldNewCoherent };
+      // TRX64 behaves correctly when it actually pinned the writer(s): found ≥1, newest-first,
+      // structurally coherent.
+      return { behavesCorrectly: foundWriter && newestFirst && oldNewCoherent };
     },
   },
 
   // ── P1: ws-build-trace-from-ring — targeted .c64retrace from a delta-ring window
-  // NON-GATING (blocked, TRX64 superset, reverse-debug Phase 1c): the UI scrub-bar
-  // selects TWO thumbnails (a cycle window) → "build trace" → a `.c64retrace` for
-  // EXACTLY that window, then swimlane/map/taint on just those cycles. No whole-run
-  // capture, no cycle guessing. TS has NO always-on full-delta ring, so it cannot dump
-  // a window after the fact → the differential cannot compare; asserted on the TRX64
-  // daemon alone (run with --include-blocked), per the reverse-debug doctrine.
-  //   tsx src/conformance.ts --only ws-build-trace-from-ring --include-blocked
+  // TWO-SIDED, GATING (TRX64 superset, reverse-debug Phase 1c): the UI scrub-bar selects
+  // TWO thumbnails (a cycle window) → "build trace" → a `.c64retrace` for EXACTLY that
+  // window, then swimlane/map/taint on just those cycles. No whole-run capture, no cycle
+  // guessing. TRX64 slices its always-on 10s delta ring on demand; the TS runtime has NO
+  // always-on full-delta ring, so it cannot dump a window after the fact and now CLEANLY
+  // DECLINES `trace/build_from_ring` ("not supported by the TypeScript runtime").
+  // `behavesCorrectly` = TS declines cleanly ∧ TRX64 produces a readable window trace.
+  //   tsx src/conformance.ts --only ws-build-trace-from-ring
   //
   // FLOW (TRX64): free-run past boot so the always-on delta ring holds real history,
   // pick a cycle window [a,b] INSIDE the ring (a couple of PAL frames ending just
   // before `now`), call `trace/build_from_ring {a,b}`. Assert (i) the returned
   // `.c64retrace` exists on disk and is non-empty AND decodes to real CPU rows, (ii)
   // `swimlane <a> <b>` (monitor) over the resulting store returns REAL cpu rows for that
-  // window (a `$XXXX` PC, not empty/error), (iii) event_count > 0. RED-before: the WS
-  // method did not exist (→ -32601 / error → all booleans false). GREEN-after.
+  // window (a `$XXXX` PC, not empty/error), (iii) event_count > 0.
+  // FLOW (TS): call `trace/build_from_ring` once → assert the clean TRX64-superset decline.
   {
     id: "ws-build-trace-from-ring",
     severity: "P1",
-    blocked:
-      "TRX64 superset: TS has no always-on full-delta ring, so it cannot dump a targeted " +
-      ".c64retrace for an arbitrary past cycle window. trace/build_from_ring slices TRX64's " +
-      "10s delta ring on demand; asserted on TRX64 alone (run with --include-blocked).",
-    title: "trace/build_from_ring dumps a targeted .c64retrace for a delta-ring cycle window; swimlane reads it — TRX64 reverse-debug superset",
+    title: "trace/build_from_ring dumps a targeted .c64retrace for a delta-ring cycle window (TRX64 delivers; TS cleanly declines) — TRX64 reverse-debug superset",
     spawn: { stream: true },
     async signal(c, d) {
       if (d.kind !== "trx64") {
-        // TS has no equivalent — documented refusal, non-gating. Same SHAPE as TRX64.
-        return { fileOnDisk: false, decodesCpuRows: false, swimlaneReturnsRows: false, hasEvents: false, notClipped: false };
+        // TS has no always-on full-delta ring — assert the clean TRX64-superset decline.
+        const sid = await liveSession(c);
+        const tsDeclinesCleanly = await assertTrx64OnlyDecline(c, "trace/build_from_ring", { session_id: sid, cycle_start: 1_000, cycle_end: 41_000 });
+        return { behavesCorrectly: tsDeclinesCleanly };
       }
       const sid = await liveSession(c);
       const exec = async (command: string): Promise<string> => {
@@ -2047,27 +2073,27 @@ const CASES: ConfCase[] = [
       const swimlaneReturnsRows =
         /\$[0-9a-fA-F]{2,4}/.test(swimOut) &&
         !/unknown command|not supported|no trace store|no trace/i.test(swimOut);
+      // The window was fully inside the ring (no clip) — sanity that we picked a live
+      // window, not one that fell off the back of the ring.
+      const notClipped = res?.clipped !== true;
+      // TRX64 behaves correctly when it produced a readable window trace: file on disk,
+      // decodes to real CPU rows, swimlane reads them back, has events, not clipped.
       return {
-        fileOnDisk,
-        decodesCpuRows,
-        swimlaneReturnsRows,
-        hasEvents: eventCount > 0,
-        // The window was fully inside the ring (no clip) — sanity that we picked a live
-        // window, not one that fell off the back of the ring.
-        notClipped: res?.clipped !== true,
+        behavesCorrectly:
+          fileOnDisk && decodesCpuRows && swimlaneReturnsRows && eventCount > 0 && notClipped,
       };
     },
   },
 
   // ── P1: ws-jam-triage — guided crash-triage on a JAM (TRX64 superset, reverse-debug 2)
-  // NON-GATING (blocked, TRX64 superset): when the machine JAMs (wild PC / illegal
-  // opcode), the monitor auto-prints the CAUSAL CHAIN — crash → wild control transfer →
-  // stack corruptor — instead of making the user hand-walk it. The classic derail is an
-  // RTS that popped a CORRUPTED return address. TS has no always-on CPU-history + delta
-  // rings, so it cannot reconstruct the chain → the differential cannot compare; asserted
-  // on the TRX64 daemon alone (run with --include-blocked), like ws-reverse-step /
-  // ws-who-wrote, per the reverse-debug verification doctrine.
-  //   tsx src/conformance.ts --only ws-jam-triage --include-blocked
+  // TWO-SIDED, GATING (TRX64 superset): when the machine JAMs (wild PC / illegal opcode),
+  // the monitor auto-prints the CAUSAL CHAIN — crash → wild control transfer → stack
+  // corruptor — instead of making the user hand-walk it. The classic derail is an RTS that
+  // popped a CORRUPTED return address. TRX64 reconstructs the chain from its always-on
+  // CPU-history + delta rings; the TS runtime has no such rings and now CLEANLY DECLINES
+  // `runtime/crash_triage` ("not supported by the TypeScript runtime — use the TRX64
+  // runtime"). `behavesCorrectly` = TS declines cleanly ∧ TRX64 names the corruptor.
+  //   tsx src/conformance.ts --only ws-jam-triage
   //
   // FLOW (TRX64): boot to a live machine, then INJECT a deliberate stack-smash at $C000
   // (RAM): SEI; set SP=$FC; write a BAD return address ($C0DD) onto the stack via two
@@ -2077,8 +2103,8 @@ const CASES: ConfCase[] = [
   // Spec-764 auto-break (the SAME path a real game derail takes). Then read the triage over
   // WS (`runtime/crash_triage`). Assert it (i) names the JAM/wild PC + opcode, (ii)
   // identifies the RTS stack pop, and (iii) `who_wrote` PINS the smashing STA instruction's
-  // PC. Also exercise the monitor `triage` verb. RED-before: the method/verb did not exist
-  // (→ -32601 / unknown command → all booleans false). GREEN-after.
+  // PC. Also exercise the monitor `triage` verb.
+  // FLOW (TS): call `runtime/crash_triage` once → assert the clean TRX64-superset decline.
   //
   // (We DON'T single-step the program: the monitor `z`/`wr` step path is the CPU-ISOLATED
   // cycle-exact lane which deliberately does NOT feed the rings — only the full-machine
@@ -2086,26 +2112,17 @@ const CASES: ConfCase[] = [
   {
     id: "ws-jam-triage",
     severity: "P1",
-    blocked:
-      "TRX64 superset: TS has no always-on CPU-history + delta rings, so it cannot " +
-      "reconstruct the crash→wild-transfer→corruptor chain on a JAM. runtime/crash_triage " +
-      "+ the `triage` verb read TRX64's rings; asserted on TRX64 alone (run with " +
-      "--include-blocked).",
     title:
-      "runtime/crash_triage auto-pins the stack corruptor on a JAM (crash → wild RTS → smashing STA) — TRX64 reverse-debug superset",
+      "runtime/crash_triage auto-pins the stack corruptor on a JAM (TRX64 delivers; TS cleanly declines) — TRX64 reverse-debug superset",
     // --stream: the per-frame FULL-machine driver runs the injected program, feeds the
     // rings, and fires the Spec-764 JAM auto-break (run_for_full ignores `injected`).
     spawn: { stream: true },
     async signal(c, d) {
       if (d.kind !== "trx64") {
-        // TS has no equivalent — documented refusal, non-gating. Same SHAPE as TRX64.
-        return {
-          namesWildPc: false,
-          identifiesRtsPop: false,
-          pinsCorruptor: false,
-          corruptorPcCorrect: false,
-          verbAgrees: false,
-        };
+        // TS has no always-on CPU-history rings — assert the clean TRX64-superset decline.
+        const sid = await liveSession(c);
+        const tsDeclinesCleanly = await assertTrx64OnlyDecline(c, "runtime/crash_triage", { session_id: sid });
+        return { behavesCorrectly: tsDeclinesCleanly };
       }
       const sid = await liveSession(c);
       const exec = async (command: string): Promise<string> => {
@@ -2154,7 +2171,12 @@ const CASES: ConfCase[] = [
       const verbOut = await exec("triage");
       const verbAgrees =
         /C0DE/i.test(verbOut) && /RTS/.test(verbOut) && !/unknown command/i.test(verbOut);
-      return { namesWildPc, identifiesRtsPop, pinsCorruptor, corruptorPcCorrect, verbAgrees };
+      // TRX64 behaves correctly when it auto-pinned the corruptor: named the wild PC,
+      // identified the RTS pop, pinned the smashing STA PCs, and the monitor verb agrees.
+      return {
+        behavesCorrectly:
+          namesWildPc && identifiesRtsPop && pinsCorruptor && corruptorPcCorrect && verbAgrees,
+      };
     },
   },
 
