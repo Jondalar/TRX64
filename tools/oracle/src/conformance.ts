@@ -700,21 +700,38 @@ const CASES: ConfCase[] = [
   {
     id: "ws-trace-monitor-misc-18",
     severity: "P1",
-    title: "runtime/mark errors when no trace is active",
+    title: "runtime/mark errors when no trace is active AND counts real marks under an active trace",
     async signal(c) {
       const sid = await liveSession(c);
-      let ok = false;
-      let marks: unknown = null;
+      // ── Negative arm: mark with NO active trace must throw (the original bug). ──
+      // Start from a guaranteed-inactive state (a prior case may have left a trace).
+      await c.call("trace/run/stop", { session_id: sid, wait_index: false }).catch(() => undefined);
+      let markSucceededWithoutTrace = false;
       try {
-        const r = (await c.call("runtime/mark", { session_id: sid, label: "probe" })) as any;
-        ok = true;
-        marks = r?.marks ?? null;
+        await c.call("runtime/mark", { session_id: sid, label: "probe" });
+        markSucceededWithoutTrace = true;
       } catch {
-        ok = false;
+        markSucceededWithoutTrace = false;
       }
+      // ── Positive arm: the ORIGINAL bug was a FABRICATED count returned regardless.
+      // With a real active trace, mark TWICE and assert the returned count GROWS
+      // 1→2, the labels echo, and trace/run/status reports the SAME count (not a
+      // fabricated constant). A runtime that hardcodes marks:1 diverges here.
+      await c.call("trace/start_domains", { session_id: sid, domains: ["c64-cpu", "memory"] });
+      const m1 = (await c.call("runtime/mark", { session_id: sid, label: "m0" })) as any;
+      const m2 = (await c.call("runtime/mark", { session_id: sid, label: "m1" })) as any;
+      const status = (await c.call("trace/run/status", { session_id: sid })) as any;
+      await c.call("trace/run/stop", { session_id: sid, wait_index: false }).catch(() => undefined);
       return {
         // The behavioural signal: marking an inactive trace must NOT succeed.
-        markSucceededWithoutTrace: ok,
+        markSucceededWithoutTrace,
+        // The captured count GROWS 1→2 (not a fabricated constant), labels echo,
+        // and the engine's own status agrees with the second mark's count.
+        firstMarkCount: Number(m1?.marks ?? -1),
+        secondMarkCount: Number(m2?.marks ?? -1),
+        firstLabelEcho: m1?.label === "m0",
+        secondLabelEcho: m2?.label === "m1",
+        statusMarksAgrees: Number(status?.marks ?? -1) === Number(m2?.marks ?? -2),
       };
     },
   },
@@ -749,6 +766,318 @@ const CASES: ConfCase[] = [
         // The behavioural signal: adding the `sid` domain must NOT inflate the
         // event count (no mem/cpu co-enable). >1.5× = the sid→cpu+mem leak fired.
         sidDomainInflatesEvents: cpuOnly > 0 && cpuPlusSid > cpuOnly * 1.5,
+      };
+    },
+  },
+
+  // ── P0: ws-trace-indirect-store-ea — Spec 753 §1/§3/§9 indirect-store EA capture ─
+  // The WHOLE POINT of Spec 753: a mem-row trace must record the COMPUTED effective
+  // address of an indirect store (`STA ($zp),Y` / `STA ($zp,X)`), NOT the decoded
+  // operand (the zero-page pointer). A runtime that taps the write at the operand
+  // level shows the indirect TARGET page untouched and stamps the ZP page instead —
+  // so `trace_memory_map` (and any taint/who-wrote read) points at the wrong page.
+  // The existing misc-14 case only cold-boots; it NEVER exercises an indirect store,
+  // so this divergence was invisible. We inject a tiny program that builds a ZP
+  // pointer → $C800, then `STA ($FB),Y` (Y=0) writes $5A to $C800, plus a CONTROL
+  // absolute `STA $C900` writing $A5 to $C900. We trace c64-cpu + memory, run, stop
+  // (wait_index → the .duckdb is built), then read the captured mem-WRITE rows back
+  // by raw SQL over the store and report the addresses written with each value.
+  // CORRECTNESS signal: the byte $5A landed at addr $C800 (the COMPUTED EA — the
+  // indirect target), the control $A5 at $C900, and the ZP pointer page ($00FB) is
+  // NOT where $5A appears. TS records the real EA; a TRX64 that taps the operand
+  // would show $5A at $00FB / nothing at $C800 → RED. (Audit Batch 5 #1, 753 §1/§3.)
+  {
+    id: "ws-trace-indirect-store-ea",
+    severity: "P0",
+    title: "trace records the COMPUTED EA of STA ($zp),Y (the indirect target page, not the operand)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      // Program @ $0800:
+      //   A9 00     LDA #$00        ; ptr lo
+      //   85 FB     STA $FB
+      //   A9 C8     LDA #$C8        ; ptr hi  → ($FB) = $C800
+      //   85 FC     STA $FC
+      //   A0 00     LDY #$00
+      //   A9 5A     LDA #$5A        ; the indirect-store value
+      //   91 FB     STA ($FB),Y     ; INDIRECT store → computed EA = $C800
+      //   A9 A5     LDA #$A5        ; control value
+      //   8D 00 C9  STA $C900       ; ABSOLUTE control store → $C900
+      //   4C 16 08  JMP $0816       ; self-loop ($0816 = the JMP itself)
+      const PROG =
+        "wr 0800 A9 00 85 FB A9 C8 85 FC A0 00 A9 5A 91 FB A9 A5 8D 00 C9 4C 16 08";
+      await c.call("monitor/exec", { session_id: sid, command: PROG });
+      await c.call("monitor/exec", { session_id: sid, command: "r pc=0800" });
+      // Capture c64-cpu + memory so the indirect store's mem-WRITE row is recorded.
+      await c.call("trace/start_domains", { session_id: sid, domains: ["c64-cpu", "memory"] });
+      await c.call("session/run", { session_id: sid, cycles: 5000 });
+      await c.call("trace/run/stop", { session_id: sid, wait_index: true }).catch(() => undefined);
+      const cur = (await c.call("trace/current", { session_id: sid })) as any;
+      const db = String(cur?.path ?? cur?.duckdbPath ?? "");
+      // Raw SQL over the indexed store: pull the (addr,value) of every C64 mem WRITE.
+      // `trace_event` rows for the CPU bus tap carry data_json.{op,addr,value}; op is
+      // 'write' for a store (= the c64re indexer's RAM_WRITE→'write' decode).
+      const sql =
+        "SELECT CAST(json_extract(data_json,'$.addr') AS INTEGER) AS addr, " +
+        "CAST(json_extract(data_json,'$.value') AS INTEGER) AS value " +
+        "FROM trace_event WHERE channel='bus_access' " +
+        "AND json_extract_string(data_json,'$.op')='write' " +
+        "AND json_extract(data_json,'$.addr') IS NOT NULL";
+      let rows: Array<{ addr: number; value: number }> = [];
+      try {
+        const r = (await c.call("trace/read", {
+          op: "sql", duckdb_path: db, args: { sql, limit: 5000 },
+        })) as any;
+        rows = (r?.rows ?? []).map((row: any[]) => ({ addr: Number(row[0]), value: Number(row[1]) }));
+      } catch { rows = []; }
+      const writesTo = (addr: number) => rows.filter((w) => w.addr === addr);
+      // Did $5A land at the COMPUTED indirect EA $C800?  (the 753 contract)
+      const indirectEaHit = writesTo(0xc800).some((w) => w.value === 0x5a);
+      // Did the control absolute store $A5 land at $C900?
+      const absControlHit = writesTo(0xc900).some((w) => w.value === 0xa5);
+      // The indirect value must NOT appear at the ZP pointer page ($00FB) — a runtime
+      // that tapped the OPERAND would stamp $5A there instead of at $C800.
+      const valueAtZpPointer = writesTo(0x00fb).some((w) => w.value === 0x5a);
+      return {
+        // The behavioural truth (Spec 753 §1): the indirect store's mem-row carries the
+        // COMPUTED EA ($C800), not the operand — so the target page reads as written.
+        indirectEaHit,
+        // The plain absolute store is the control — both runtimes must record it.
+        absControlHit,
+        // The indirect value is NOT misattributed to the zero-page pointer page.
+        valueAtZpPointer,
+        // sanity: the trace actually captured memory writes (not an empty store).
+        anyWrites: rows.length > 0,
+      };
+    },
+  },
+
+  // ── P1: ws-trace-run-status-contract — Spec 726 §6a / 708 full status shape ───
+  // The existing readers assert only `eventCount` (formats-state-6) or `active`
+  // (misc-2). No case asserts the FULL TraceRunStatus contract — definitionId,
+  // marks, binary, capturing, overflowed, retracePath — so TRX64 could (and DID)
+  // drop those fields and stay green. TS's traceRun.status() (trace-run.ts) returns
+  // {active, runId, definitionId, eventCount, bytesBuffered, marks, overflowed,
+  // capturing, binary, retracePath} for an active run. We start a captureAll trace,
+  // mark once, run a window so eventCount grows, and assert the full shape.
+  {
+    id: "ws-trace-run-status-contract",
+    severity: "P1",
+    title: "trace/run/status carries the full contract (definitionId, marks, binary, capturing, overflowed, retracePath)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      // Guaranteed-inactive start so the active-status fields are this run's own.
+      await c.call("trace/run/stop", { session_id: sid, wait_index: false }).catch(() => undefined);
+      await c.call("trace/start_domains", { session_id: sid, domains: ["c64-cpu", "memory"] });
+      await c.call("runtime/mark", { session_id: sid, label: "m0" }).catch(() => undefined);
+      await c.call("session/run", { session_id: sid, cycles: 200_000 });
+      const s = (await c.call("trace/run/status", { session_id: sid })) as any;
+      await c.call("trace/run/stop", { session_id: sid, wait_index: false }).catch(() => undefined);
+      return {
+        active: s?.active === true,
+        hasRunId: typeof s?.runId === "string" && s.runId.length > 0,
+        // A captureAll trace's definitionId is the same id on both runtimes ("live-capture").
+        definitionId: s?.definitionId ?? null,
+        eventCountPositive: Number(s?.eventCount ?? 0) > 0,
+        // The mark stamped above must be reflected (>=1) — not a dropped/zeroed field.
+        marksAtLeastOne: Number(s?.marks ?? 0) >= 1,
+        binary: s?.binary === true,
+        capturing: s?.capturing === true,
+        overflowed: s?.overflowed === false,
+        retracePathNonEmpty: typeof s?.retracePath === "string" && s.retracePath.length > 0,
+      };
+    },
+  },
+
+  // ── P1: ws-trace-double-start-guard — Spec 708 §4 double-start / stop-when-idle ─
+  // Starting a trace while one is already ACTIVE must THROW ("trace already active …
+  // stop it first"), not silently clobber the in-flight capture. TS guards this in
+  // ws-server.ts:1281 (and TraceRun.start throws). `trace/run/stop` when nothing is
+  // active must NOT throw — it returns `{run:null,status}` (the self-aborted/idle
+  // path, ws-server.ts:1303). TRX64's trace/start_domains UNCONDITIONALLY overwrote
+  // st.session.trace (no guard) → a second start orphaned the first .c64retrace and
+  // reset eventCount silently. Fixed: added the same active-guard. Signal: stop to
+  // idle; assert stop-when-idle does NOT throw + reports active:false; start once;
+  // start AGAIN → assert it THREW; clean up.
+  {
+    id: "ws-trace-double-start-guard",
+    severity: "P1",
+    title: "trace double-start throws; stop-when-inactive returns status (not a throw)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      // Stop to a known-idle state first.
+      await c.call("trace/run/stop", { session_id: sid, wait_index: false }).catch(() => undefined);
+      // stop-when-inactive: must NOT throw, returns {run:null, status:{active:false}}.
+      let stopWhenIdleThrew = false;
+      let stopWhenIdleRunNull = false;
+      try {
+        const r = (await c.call("trace/run/stop", { session_id: sid, wait_index: false })) as any;
+        stopWhenIdleRunNull = r?.run == null;
+      } catch {
+        stopWhenIdleThrew = true;
+      }
+      // First start succeeds.
+      let firstStartThrew = false;
+      try {
+        await c.call("trace/start_domains", { session_id: sid, domains: ["c64-cpu"] });
+      } catch {
+        firstStartThrew = true;
+      }
+      // Second start while active MUST throw (the guard).
+      let secondStartThrew = false;
+      try {
+        await c.call("trace/start_domains", { session_id: sid, domains: ["c64-cpu"] });
+      } catch {
+        secondStartThrew = true;
+      }
+      // Clean up the live trace for later cases.
+      await c.call("trace/run/stop", { session_id: sid, wait_index: false }).catch(() => undefined);
+      return {
+        // stop-when-inactive is graceful (no throw) and reports the idle status.
+        stopWhenIdleThrew,
+        stopWhenIdleRunNull,
+        // the first start works, the second (double-start) is rejected.
+        firstStartThrew,
+        secondStartThrew,
+      };
+    },
+  },
+
+  // ── P1: ws-trace-def-reject — Spec 708 §11 / 708.7 implement-or-REJECT ─────────
+  // trace/definition/validate (and put) must REJECT an unsupported trigger
+  // (`monitor-stop`, `manual-mark`) and an unsupported checkpointPolicy
+  // (`on-trigger`) with `{ok:false, errors[]}` — NOT silently accept-then-no-op
+  // (the 708.7 trap). A supported pc-range + cpu-row def must validate `{ok:true}`.
+  // TS validateTraceDefinition (trace-definition.ts) and TRX64
+  // validate_trace_definition both encode this; this case asserts the parity.
+  {
+    id: "ws-trace-def-reject",
+    severity: "P1",
+    title: "trace/definition rejects unsupported triggers + checkpointPolicy; accepts a supported def",
+    async signal(c) {
+      const sid = await liveSession(c);
+      const validate = async (definition: any): Promise<{ ok: boolean; errorCount: number }> => {
+        const r = (await c.call("trace/definition/validate", { session_id: sid, definition })) as any;
+        return { ok: r?.ok === true, errorCount: Array.isArray(r?.errors) ? r.errors.length : 0 };
+      };
+      const base = {
+        id: "case-def",
+        version: 1,
+        name: "case def",
+        domains: ["c64-cpu"],
+        retention: "transient",
+      };
+      const supported = {
+        ...base,
+        triggers: [{ kind: "pc-range", domain: "c64-cpu", from: 0, to: 0xffff }],
+        captures: [{ kind: "cpu-row", domain: "c64-cpu" }],
+      };
+      const unsupportedTrigger = {
+        ...base,
+        triggers: [{ kind: "manual-mark" }],
+        captures: [{ kind: "cpu-row", domain: "c64-cpu" }],
+      };
+      const monitorStopTrigger = {
+        ...base,
+        triggers: [{ kind: "monitor-stop" }],
+        captures: [{ kind: "cpu-row", domain: "c64-cpu" }],
+      };
+      const onTriggerPolicy = {
+        ...supported,
+        checkpointPolicy: "on-trigger",
+      };
+      const ok = await validate(supported);
+      const manual = await validate(unsupportedTrigger);
+      const monStop = await validate(monitorStopTrigger);
+      const onTrig = await validate(onTriggerPolicy);
+      // put on the unsupported def must ALSO reject {ok:false} (not throw, not store).
+      const putBad = (await c.call("trace/definition/put", { session_id: sid, definition: unsupportedTrigger })) as any;
+      const putGood = (await c.call("trace/definition/put", { session_id: sid, definition: supported })) as any;
+      return {
+        // A supported def validates clean.
+        supportedOk: ok.ok && ok.errorCount === 0,
+        // manual-mark / monitor-stop triggers reject with at least one error.
+        manualMarkRejected: !manual.ok && manual.errorCount > 0,
+        monitorStopRejected: !monStop.ok && monStop.errorCount > 0,
+        // checkpointPolicy:on-trigger rejects.
+        onTriggerPolicyRejected: !onTrig.ok && onTrig.errorCount > 0,
+        // put mirrors validate: bad → {ok:false}, good → {ok:true, id}.
+        putBadRejected: putBad?.ok === false,
+        putGoodAccepted: putGood?.ok === true && typeof putGood?.id === "string",
+      };
+    },
+  },
+
+  // ── P1: ws-trace-capture-selection — Spec 708 §11 / 708.7 capture selection ────
+  // A trace DEFINITION declaring only `cpu-row` must DROP memory rows even when the
+  // `memory` domain is enabled (the domain opens the channel; the captures select
+  // which rows are KEPT). TS gates each event by `declaredCaptures.has(captureKind)`
+  // (trace-run.ts:287) — so a `[cpu-row]`-only def records 0 mem rows, while a
+  // `[cpu-row, mem-row]` def records them. TRX64 (before fix) derived its recording
+  // channels from DOMAINS ALONE (TraceChannels::from_domains) and ignored the def's
+  // captures → it recorded mem rows even when only `cpu-row` was declared (the 708.7
+  // silent-no-op trap: a declared selection that does nothing). Fixed: TRX64 now masks
+  // the channels by the declared capture kinds. Signal: put + run a store-heavy
+  // injected program twice — Def A (cpu-row only) and Def B (cpu-row + mem-row) over
+  // the same memory domain + same budget — and count the captured mem WRITE rows.
+  // Contract: A drops mem rows (memCountA===0), B keeps them (memCountB>0).
+  {
+    id: "ws-trace-capture-selection",
+    severity: "P1",
+    title: "a def declaring only cpu-row drops mem rows even with the memory domain enabled (708.7)",
+    async signal(c) {
+      // Store-heavy program @ $0800: repeatedly STA to $C800..$C803, then JMP back.
+      //   A2 00     LDX #$00
+      //   A9 5A     LDA #$5A
+      //   9D 00 C8  STA $C800,X
+      //   E8        INX
+      //   E0 04     CPX #$04
+      //   D0 F8     BNE $0804     ; loop the 4 stores
+      //   4C 00 08  JMP $0800     ; restart (keeps storing under the budget)
+      const PROG = "wr 0800 A2 00 A9 5A 9D 00 C8 E8 E0 04 D0 F8 4C 00 08";
+      const countMemWrites = async (rpc: RpcClient, captures: any[]): Promise<number> => {
+        // Each leg runs on its OWN fresh machine so the cycle window is identical.
+        const created = (await rpc.call("session/create", {})) as any;
+        const sid = created?.sessionId ?? created?.session_id;
+        await rpc.call("monitor/exec", { session_id: sid, command: PROG });
+        await rpc.call("monitor/exec", { session_id: sid, command: "r pc=0800" });
+        const def = {
+          id: `capsel-${captures.length}`,
+          version: 1,
+          name: "capsel",
+          domains: ["c64-cpu", "memory"],
+          retention: "transient",
+          // A full-range pc-range + mem-access trigger so both row kinds COULD fire;
+          // the captures list is what selects whether mem rows are KEPT.
+          triggers: [
+            { kind: "pc-range", domain: "c64-cpu", from: 0, to: 0xffff },
+            { kind: "mem-access", access: "any", from: 0, to: 0xffff },
+          ],
+          captures,
+        };
+        await rpc.call("trace/definition/put", { session_id: sid, definition: def });
+        await rpc.call("trace/run/start", { session_id: sid, definition_id: def.id });
+        await rpc.call("session/run", { session_id: sid, cycles: 20_000 });
+        await rpc.call("trace/run/stop", { session_id: sid, wait_index: true }).catch(() => undefined);
+        const cur = (await rpc.call("trace/current", { session_id: sid })) as any;
+        const db = String(cur?.path ?? cur?.duckdbPath ?? "");
+        const sql =
+          "SELECT COUNT(*) AS n FROM trace_event WHERE channel='bus_access' " +
+          "AND json_extract_string(data_json,'$.op')='write'";
+        try {
+          const r = (await rpc.call("trace/read", { op: "sql", duckdb_path: db, args: { sql, limit: 4 } })) as any;
+          return Number((r?.rows ?? [])[0]?.[0] ?? 0);
+        } catch { return -1; }
+      };
+      const memCountA = await countMemWrites(c, [{ kind: "cpu-row", domain: "c64-cpu" }]);
+      const memCountB = await countMemWrites(c, [
+        { kind: "cpu-row", domain: "c64-cpu" },
+        { kind: "mem-row" },
+      ]);
+      return {
+        // Def A declares only cpu-row → NO mem rows captured (the 708.7 selection).
+        memDroppedWhenUndeclared: memCountA === 0,
+        // Def B declares mem-row → mem rows ARE captured (the store-heavy loop wrote many).
+        memKeptWhenDeclared: memCountB > 0,
       };
     },
   },
@@ -2571,15 +2900,21 @@ const CASES: ConfCase[] = [
       if (st.runState !== "running") await c.call("debug/run", { session_id: sid });
       await sleep(5000); // the driver hits $EA31 every frame → log broadcasts accrue
       sink.off();
-      const logBroadcasts = sink.notes.filter(
-        (n) => n.method === "debug/observer_log" || n.method === "debug/observer_hit",
-      ).length;
+      // HARDENED (audit Batch 5 #4): match ONLY `debug/observer_log` — NOT
+      // `observer_hit`. A runtime that mis-implements `do log` as a BREAK (halting on
+      // every IRQ) would emit observer_hit + pause, false-greening the old OR-match.
+      const logBroadcasts = sink.notes.filter((n) => n.method === "debug/observer_log").length;
+      // The machine must STILL be running after the window — `do log` is a tracepoint
+      // (print + continue), NEVER a break. A break-misimplementation pauses here.
+      const stAfter = await state(c, sid);
       // Clean up the tracepoint.
       await exec("obs irqtp del");
       return {
-        // The behavioural signal: a `do log` observer fired during free-run and the
-        // per-frame drain broadcast at least one debug/observer_log (count>0).
-        observerLogFired: logBroadcasts > 0,
+        // The behavioural signal: the `do log` observer fired MULTIPLE times during
+        // free-run (the per-frame drain broadcast debug/observer_log, not a one-shot).
+        observerLogFiredMultiple: logBroadcasts > 1,
+        // log = continue: the machine kept running across the window (NOT a break).
+        keptRunning: stAfter.runState === "running",
       };
     },
   },
@@ -3336,6 +3671,161 @@ const CASES: ConfCase[] = [
         mapHasContent: mapOut.includes("trace_memory_map"),
         swimlaneHasWindow: /swimlane\s+\d+[–-]\d+/.test(swBody),
       };
+    },
+  },
+
+  // ── P1: ws-trace-monitor-start-line — monitor `trace on` start line carries the runId ─
+  // The monitor `trace on <domains>` START line is `trace on: <runId>  domains=[…]`
+  // (monitor-shell.ts:439). The audit (Batch 5 #4) wants the START form asserted (not
+  // a residual/ERROR/off line) AND the start-line runId tied to the engine's own
+  // status. The per-runtime runId FORMAT differs (TS `run_<def>_<radix36>` vs TRX64's
+  // monitor `run_live-capture_<cyc>`) + is per-run volatile, so the cross-runtime
+  // signal is STRUCTURAL: the start line is the START form (`trace on:` + the domains
+  // both echoed), the parsed runId is non-empty, AND trace/run/status reports THAT
+  // SAME runId active with the requested domains — an internal-consistency invariant
+  // that holds identically on both runtimes (true on TS, must be true on TRX64).
+  {
+    id: "ws-trace-monitor-start-line",
+    severity: "P1",
+    title: "monitor `trace on` start line carries the runId that trace/run/status then reports active",
+    async signal(c) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      // Guaranteed-idle start so the line we parse is THIS run's start, not a residual.
+      await c.call("trace/run/stop", { session_id: sid, wait_index: false }).catch(() => undefined);
+      const onOut = await exec("trace on c64-cpu memory");
+      // The START form: "trace on: <runId>  domains=[c64-cpu,memory]". Reject the
+      // already-active / off / error variants.
+      const isStartForm = /trace on:\s*\S/.test(onOut) && /c64-cpu/.test(onOut) && /memory/.test(onOut);
+      const startRunId = (onOut.match(/trace on:\s*(\S+)/)?.[1] ?? "").trim();
+      // Run a window so eventCount grows, then read the engine status.
+      await c.call("session/run", { session_id: sid, cycles: 200_000 });
+      const status = (await c.call("trace/run/status", { session_id: sid })) as any;
+      await c.call("trace/run/stop", { session_id: sid, wait_index: false }).catch(() => undefined);
+      return {
+        // The line is the START form with both requested domains echoed.
+        isStartForm,
+        // A non-empty runId was parsed from the start line.
+        startRunIdNonEmpty: startRunId.length > 0,
+        // The engine's status reports THAT SAME runId active (internal consistency).
+        statusRunIdMatchesStart: String(status?.runId ?? "") === startRunId && status?.active === true,
+        // eventCount grew under the window (the trace really recorded).
+        eventCountGrew: Number(status?.eventCount ?? 0) > 0,
+      };
+    },
+  },
+
+  // ── P1: ws-trace-swimlane-verbs — narrowed `swimlane list` / `<name>` (audit Batch 5 #5) ─
+  // The monitor `swimlane list` (list stored traces newest-first) + `swimlane <name>`
+  // (select a stored trace by basename) are SERVED by the TS daemon (ws-server.ts
+  // swimlane bridge — a per-session `.duckdb` directory scan + getInfo) but TRX64
+  // REFUSED both ("not supported via TRX64" / "by-name selection needs the daemon
+  // store directory") — a live divergence. Fixed: TRX64's swimlane arm now scans the
+  // per-session trace-store dir (session_trace_store_dir + list_trace_stores) and
+  // resolves `<name>.duckdb`, exactly like TS. Signal: capture a trace (so one store
+  // exists), then drive `swimlane list` + `swimlane <name>` (the name lifted from the
+  // list line) and assert BOTH are recognized + structurally real (a trace line in
+  // the list, a swimlane window for the named store) on both runtimes. The per-run
+  // store NAME + cycle values are volatile (radix36 timestamp, differ TS↔TRX64), so
+  // the signal compares STRUCTURE (recognized + has a row), not the literal text.
+  {
+    id: "ws-trace-swimlane-verbs",
+    severity: "P1",
+    title: "monitor `swimlane list` / `swimlane <name>` serve the stored traces (TRX64 no longer refuses)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      // Capture + finalize a trace so the session trace-store directory has ≥1 store.
+      await c.call("trace/run/stop", { session_id: sid, wait_index: false }).catch(() => undefined);
+      await c.call("trace/start_domains", { session_id: sid, domains: ["c64-cpu", "memory"] });
+      await c.call("session/run", { session_id: sid, cycles: 200_000 });
+      await c.call("trace/run/stop", { session_id: sid, wait_index: true }).catch(() => undefined);
+      const recognized = (s: string) =>
+        !/unknown command/i.test(s) && !/not supported via TRX64/i.test(s) && !/needs the daemon store/i.test(s);
+      // `swimlane list` — the stored-trace listing.
+      const listOut = await exec("swimlane list");
+      // A real list carries the header + at least one `<name>  cyc <a>..<b>  events=<n>` line.
+      const listLine = listOut.split("\n").find((l) => /events=\d+/.test(l)) ?? "";
+      const storeName = (listLine.trim().split(/\s+/)[0] ?? "").trim();
+      // `swimlane <name>` — select that store by basename.
+      const nameOut = storeName ? await exec(`swimlane ${storeName}`) : "";
+      return {
+        // both verbs are recognized (no "not supported via TRX64" refusal).
+        listRecognized: recognized(listOut),
+        // the list has at least one real trace line (events=<n>).
+        listHasTraceLine: /events=\d+/.test(listOut),
+        // by-name selection is recognized AND renders a swimlane window (`# <stem>`).
+        nameRecognized: recognized(nameOut),
+        nameRendersWindow: /^#\s+\S/m.test(nameOut) || /swimlane\s+\d+[–-]\d+/.test(nameOut),
+      };
+    },
+  },
+
+  // ── P1: ws-trace-crossfeed-reader — read a .c64retrace captured on the OTHER runtime ─
+  // misc-0 / misc-14 compare TRX64-shells-to-the-SAME-sidecar-as-TS over the SAME
+  // store, so they match by construction and prove nothing about cross-runtime
+  // interchange. This case makes the READER the only variable: each leg CAPTURES a
+  // cold-boot trace on the OPPOSITE-kind daemon (TS leg captures on TRX64, TRX64 leg
+  // captures on TS), then READS that `.c64retrace`'s index via the case daemon's
+  // `trace/read` (getInfo + topPcs). The `.c64retrace` binary format is the shared
+  // interchange authority, so a faithful reader on either runtime surfaces the SAME
+  // content-derived getInfo (tableCounts + masterClockRange) + topPcs SET. A reader
+  // that can't ingest the other runtime's file (or a format that isn't truly shared)
+  // diverges here. (Audit Batch 5 #5 — the shared-reader blind-spot cross-feed.)
+  {
+    id: "ws-trace-crossfeed-reader",
+    severity: "P1",
+    title: "trace/read ingests a .c64retrace captured on the OTHER runtime (reader is the only variable)",
+    async signal(c, d) {
+      // Capture a cold-boot trace on a FRESH daemon of the OPPOSITE kind, finalize it,
+      // and return the abs .duckdb path (both daemons are local tmp dirs on one FS).
+      const opposite = d.kind === "ts" ? "trx64" : "ts";
+      const other = await spawnDaemon(opposite as any);
+      let db = "";
+      try {
+        const oc = await connect(other.endpoint, 240_000);
+        try {
+          const osid = await liveSession(oc);
+          await oc.call("trace/start_domains", { session_id: osid, domains: ["c64-cpu", "memory"] });
+          await oc.call("session/run", { session_id: osid, cycles: 200_000 });
+          await oc.call("trace/run/stop", { session_id: osid, wait_index: true }).catch(() => undefined);
+          const cur = (await oc.call("trace/current", { session_id: osid })) as any;
+          db = String(cur?.path ?? cur?.duckdbPath ?? "");
+        } finally {
+          oc.close();
+        }
+        // Now READ the other runtime's .c64retrace via THIS daemon's reader.
+        const gi = (await c.call("trace/read", {
+          op: "store_fn", duckdb_path: db, args: { fn: "getInfo" },
+        })) as any;
+        const tp = (await c.call("trace/read", {
+          op: "store_fn", duckdb_path: db, args: { fn: "topPcs", args: { cpu: "c64", limit: 12 } },
+        })) as Array<{ pc: number; count: number }>;
+        // Tie-order-stable topPcs (= misc-0): drop the limit-truncated lowest group,
+        // sort by (count desc, pc asc) — the SET is content-determined.
+        const arr = Array.isArray(tp) ? tp : [];
+        const minCount = arr.length ? Math.min(...arr.map((r) => r.count)) : 0;
+        const topPcsSorted = [...arr]
+          .filter((r) => r.count > minCount)
+          .sort((a, b) => (b.count - a.count) || (a.pc - b.pc));
+        return {
+          // content-derived: the .c64retrace is byte-equal across runtimes, so a
+          // faithful reader on EITHER runtime surfaces the same counts/range/PCs.
+          tableCounts: gi?.tableCounts ?? null,
+          masterClockRange: gi?.masterClockRange ?? null,
+          topPcsSorted,
+          // sanity: the cross-fed file was actually readable (a populated store).
+          crossFedReadable: Number(gi?.tableCounts?.["events:total"] ?? 0) > 0,
+        };
+      } finally {
+        other.stop();
+      }
     },
   },
 

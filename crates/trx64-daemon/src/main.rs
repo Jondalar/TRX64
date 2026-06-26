@@ -1061,6 +1061,37 @@ fn current_trace_duckdb(st: &State) -> Option<String> {
     }
 }
 
+/// The per-session trace-store DIRECTORY (= TS `runtime/<session>/`, the parent of
+/// every `live_*.duckdb` written by `trace/start_domains`). Used by the monitor
+/// `swimlane list` / `swimlane <name>` verbs to list / select a stored trace by
+/// basename — 1:1 with the TS ws-server.ts swimlane `list`/`name` directory scan.
+/// Resolves under the project dir (`<project>/runtime/<session>/`); falls back to
+/// the parent of the current/last store path when no project dir is set.
+fn session_trace_store_dir(st: &State) -> Option<std::path::PathBuf> {
+    if let Some(base) = resolve_project_dir() {
+        return Some(base.join("runtime").join(&st.session.id));
+    }
+    current_trace_duckdb(st)
+        .and_then(|p| std::path::Path::new(&p).parent().map(|d| d.to_path_buf()))
+}
+
+/// List the stored `.duckdb` traces in `dir`, NEWEST-mtime first (= TS listStores()
+/// in the swimlane `list` bridge). Returns (basename-without-.duckdb, abs-path).
+fn list_trace_stores(dir: &std::path::Path) -> Vec<(String, std::path::PathBuf)> {
+    let mut stores: Vec<(String, std::path::PathBuf, std::time::SystemTime)> = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    for ent in rd.flatten() {
+        let p = ent.path();
+        if p.extension().and_then(|e| e.to_str()) == Some("duckdb") {
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+            let mtime = ent.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+            stores.push((stem, p, mtime));
+        }
+    }
+    stores.sort_by(|a, b| b.2.cmp(&a.2)); // newest first
+    stores.into_iter().map(|(s, p, _)| (s, p)).collect()
+}
+
 /// Build the `RuntimeTraceDefinition` for a capture-all live trace over `domains`
 /// — 1:1 with c64re `captureAllDef` (runtime-trace-sink.ts:32). The `.c64retrace`
 /// file header carries this as `defJson` (= `JSON.stringify(def)`), and the c64re
@@ -1166,7 +1197,14 @@ fn run_cycle_budget(session: &mut Session, budget: u64) {
     let full_machine = full_machine_gate(session);
 
     let Some((channels, need_header, meta_json)) = session.trace.as_ref().map(|t| {
-        (TraceChannels::from_domains(&t.domains), t.buf.is_empty(), t.meta_json.clone())
+        // Spec 708.7 — domains open the channels; the declared captures select which
+        // rows are KEPT. mask_by_captures is a no-op for a captureAll trace (empty
+        // captures) and gates each channel for a registered-definition run.
+        (
+            TraceChannels::from_domains(&t.domains).mask_by_captures(&t.captures),
+            t.buf.is_empty(),
+            t.meta_json.clone(),
+        )
     }) else {
         // No active trace: run untraced on the SAME path a traced run would pick.
         let mut obs = NullSink;
@@ -4091,6 +4129,8 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                         start_wall_ms,
                         media_sha,
                         media_name,
+                        // monitor `trace on` = captureAll (keep every domain-implied row).
+                        captures: Vec::new(),
                     });
                     st.last_run_id = Some(run_id.clone());
                     Ok(format!(
@@ -4212,36 +4252,89 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
         "swimlane" | "sw" => {
             let a1 = toks.get(1).map(|s| s.as_str());
             let is_num = |t: Option<&str>| t.map(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).unwrap_or(false);
+            // `swimlane list` — list the stored traces newest-first with their event
+            // count + cycle span (= TS ws-server.ts swimlane `list` directory scan +
+            // per-store getInfo). Reads the per-session trace-store directory.
             if a1.map(|s| s.eq_ignore_ascii_case("list")).unwrap_or(false) {
-                return Err("swimlane list: not supported via TRX64 (the live trace-store directory listing needs the daemon ring) — read a specific window: `swimlane <s> <e>`".into());
-            }
-            if let Some(name) = a1 {
-                if !is_num(Some(name)) {
-                    return Err(format!("swimlane: no trace named '{}' — by-name selection needs the daemon store directory; read the current trace with `swimlane <s> <e>`", name.trim_end_matches(".duckdb")));
+                let dir = match session_trace_store_dir(st) {
+                    Some(d) => d,
+                    None => return Ok("swimlane list: no traces yet (run `trace on` … `trace off`)".into()),
+                };
+                let stores = list_trace_stores(&dir);
+                if stores.is_empty() {
+                    return Ok("swimlane list: no traces yet (run `trace on` … `trace off`)".into());
                 }
-            }
-            let mut args = json!({ "last_cycles": 2000 });
-            if is_num(a1) {
-                args["cycle_start"] = json!(a1.unwrap().parse::<i64>().unwrap_or(0));
-                if is_num(toks.get(2).map(|s| s.as_str())) {
-                    args["cycle_end"] = json!(toks[2].parse::<i64>().unwrap_or(0));
-                }
-            }
-            match current_trace_duckdb(st) {
-                None => Err("swimlane: no trace store — run `trace on` … `trace off` first".into()),
-                Some(db) => {
-                    // `stem` = the store basename without .duckdb (= TS `# <stem>`).
-                    let stem = std::path::Path::new(&db)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("trace")
-                        .to_string();
-                    args["stem"] = json!(stem);
-                    match run_trace_read_sidecar("swimlane_text", &db, &args) {
-                        Ok(v) => Ok(v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string()),
-                        Err(e) => Err(format!("swimlane: {e}")),
+                let mut lines = vec!["traces (newest first) — `swimlane <name>`:".to_string()];
+                for (name, path) in stores.iter().take(30) {
+                    let dbs = path.to_string_lossy();
+                    // getInfo over the store (builds the index lazily if absent) → event
+                    // count + master-clock span, exactly the TS `list` line shape.
+                    match run_trace_read_sidecar("store_fn", &dbs, &json!({ "fn": "getInfo" })) {
+                        Ok(gi) => {
+                            let ev = gi.get("tableCounts")
+                                .and_then(|t| t.get("events:total"))
+                                .and_then(|n| n.as_i64().or_else(|| n.as_str().and_then(|s| s.parse().ok())))
+                                .unwrap_or(0);
+                            let (mn, mx) = gi.get("masterClockRange")
+                                .filter(|r| !r.is_null())
+                                .map(|r| (
+                                    r.get("min").and_then(|x| x.as_i64()).unwrap_or(0),
+                                    r.get("max").and_then(|x| x.as_i64()).unwrap_or(0),
+                                ))
+                                .unwrap_or((0, 0));
+                            lines.push(format!("  {name}  cyc {mn}..{mx}  events={ev}"));
+                        }
+                        Err(_) => lines.push(format!("  {name}  (index not built — read once to build)")),
                     }
                 }
+                return Ok(lines.join("\n"));
+            }
+            let mut args = json!({ "last_cycles": 2000 });
+            // `swimlane <name> [s] [e]` — select a stored trace by basename; numeric a1
+            // is a cycle window over the current trace (= TS `name` vs `<s> <e>` split).
+            let named_store: Option<String> = match a1 {
+                Some(name) if !is_num(Some(name)) => {
+                    let dir = session_trace_store_dir(st);
+                    let nm = name.trim_end_matches(".duckdb");
+                    let cand = dir.as_ref().map(|d| d.join(format!("{nm}.duckdb")));
+                    match cand {
+                        Some(p) if p.exists() => {
+                            // `swimlane <name> <s> <e>` — explicit window over the named store.
+                            if is_num(toks.get(2).map(|s| s.as_str())) {
+                                args["cycle_start"] = json!(toks[2].parse::<i64>().unwrap_or(0));
+                                if is_num(toks.get(3).map(|s| s.as_str())) {
+                                    args["cycle_end"] = json!(toks[3].parse::<i64>().unwrap_or(0));
+                                }
+                            }
+                            Some(p.to_string_lossy().into_owned())
+                        }
+                        _ => return Err(format!("swimlane: no trace named '{nm}' — try `swimlane list`")),
+                    }
+                }
+                _ => {
+                    if is_num(a1) {
+                        args["cycle_start"] = json!(a1.unwrap().parse::<i64>().unwrap_or(0));
+                        if is_num(toks.get(2).map(|s| s.as_str())) {
+                            args["cycle_end"] = json!(toks[2].parse::<i64>().unwrap_or(0));
+                        }
+                    }
+                    None
+                }
+            };
+            let db = match named_store.or_else(|| current_trace_duckdb(st)) {
+                Some(d) => d,
+                None => return Err("swimlane: no trace store — run `trace on` … `trace off` first".into()),
+            };
+            // `stem` = the store basename without .duckdb (= TS `# <stem>`).
+            let stem = std::path::Path::new(&db)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("trace")
+                .to_string();
+            args["stem"] = json!(stem);
+            match run_trace_read_sidecar("swimlane_text", &db, &args) {
+                Ok(v) => Ok(v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string()),
+                Err(e) => Err(format!("swimlane: {e}")),
             }
         }
         // `chis` — CPU instruction history (VICE `cpuhistory`). reverse-debug Phase 1a.
@@ -6177,6 +6270,8 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                     start_wall_ms,
                     media_sha,
                     media_name,
+                    // session/create-with-trace = captureAll (keep every domain-implied row).
+                    captures: Vec::new(),
                 });
                 st.last_run_id = Some(run_id.clone());
                 // TS startSessionTrace returns { runId, outputPath, domains }.
@@ -8581,6 +8676,13 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
 
         "trace/start_domains" => {
             let mut st = state.lock().unwrap();
+            // Spec 708 double-start guard (= TS ws-server.ts:1281): starting a trace
+            // while one is already active must THROW, not silently clobber the live
+            // capture (which would orphan the in-flight .c64retrace + reset eventCount).
+            if st.session.trace.is_some() {
+                return Response::err(id, -32001,
+                    format!("trace already active on session {} — stop it first (trace/run/stop).", st.session.id));
+            }
             let output = req
                 .params
                 .get("output")
@@ -8650,6 +8752,8 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 start_wall_ms,
                 media_sha: media_sha.clone(),
                 media_name: media_name.clone(),
+                // captureAll trace — empty captures means "keep every domain-implied row".
+                captures: Vec::new(),
             });
             // T2.6 — mirror TS start(): lastRunId set on trace start, survives stop().
             st.last_run_id = Some(run_id.clone());
@@ -8784,8 +8888,16 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                     .unwrap_or_default()
                     .as_millis(),
             );
+            // resolveSnapshotPath roots a RELATIVE output under the project dir (= TS
+            // resolveSnapshotPath). Without this the default `traces/<def>_<ts>.duckdb`
+            // was a bare relative path the cwd-agnostic sidecar/readers could not find,
+            // so a trace/run/start capture was unreadable (trace/read "no trace store").
             let output = output.unwrap_or_else(|| {
-                std::path::PathBuf::from(format!("traces/{}_{}.duckdb", definition_id, now36))
+                let rel = format!("traces/{}_{}.duckdb", definition_id, now36);
+                match resolve_project_dir() {
+                    Some(base) => base.join(rel),
+                    None => std::path::PathBuf::from(rel),
+                }
             });
             let retrace = output.with_extension("c64retrace");
             let cycle_start = st.session.machine.clk;
@@ -8796,6 +8908,13 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 .and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|d| d.as_str().map(String::from)).collect())
                 .unwrap_or_else(|| vec!["c64-cpu".into(), "memory".into()]);
+            // Spec 708.7 — the def's DECLARED capture kinds (the row-selection layer).
+            // The domains open the channels; the captures select which rows are KEPT.
+            let captures: Vec<String> = def
+                .get("captures")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|c| c.get("kind").and_then(|k| k.as_str()).map(String::from)).collect())
+                .unwrap_or_default();
             let def_version = def.get("version").and_then(|v| v.as_i64()).unwrap_or(1);
             let def_name = def.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let meta_json = serde_json::to_string(&json!({
@@ -8845,6 +8964,8 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 start_wall_ms,
                 media_sha: media_sha.clone(),
                 media_name: media_name.clone(),
+                // Spec 708.7 — gate the recorded rows by the def's declared captures.
+                captures,
             });
             // T2.6 — mirror TS start(): lastRunId set on trace start, survives stop().
             st.last_run_id = Some(run_id.clone());
@@ -9021,12 +9142,24 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
         }
 
         "trace/run/status" => {
+            // Spec 726 §6a / 708 full status contract (= TS TraceRun.status(),
+            // trace-run.ts): an ACTIVE trace reports the FULL run shape, not a subset.
+            // The prior status dropped definitionId/marks/overflowed/capturing/
+            // bytesBuffered, so the 708 contract case (marks/binary/capturing/
+            // overflowed) could not be asserted. A live TRX64 trace is ALWAYS the
+            // binary sink (binary:true) actively recording (capturing:true) with no
+            // queue overflow (overflowed:false = TS `a.binary ? false : a.overflow`).
             let st = state.lock().unwrap();
             let status = match &st.session.trace {
                 Some(t) => json!({
                     "active": true,
                     "runId": t.run_id,
+                    "definitionId": t.definition_id,
                     "eventCount": t.event_count,
+                    "bytesBuffered": t.buf.len() as u64,
+                    "marks": t.marks.len() as u64,
+                    "overflowed": false,
+                    "capturing": true,
                     "binary": true,
                     "retracePath": t.retrace_path.to_string_lossy(),
                 }),

@@ -72,6 +72,14 @@ pub struct TraceState {
     /// The mounted-media source name (basename), echoed in the stop descriptor's
     /// `media` (= TS run.media.sourceName). Empty when none.
     pub media_name: String,
+    /// Spec 708 §11 / 708.7 — the DECLARED capture kinds for this run (`cpu-row`,
+    /// `mem-row`, `vic-row`, `iec-row`, `drive-cpu-row`). The trace DOMAINS open the
+    /// channels; the CAPTURES select which rows are KEPT (= TS `declaredCaptures`,
+    /// trace-run.ts:287). A `trace/start_domains` (captureAll) trace declares ALL the
+    /// kinds its domains imply; a `trace/run/start` of a registered definition declares
+    /// exactly the def's captures, so a def opening the `memory` domain but declaring
+    /// only `cpu-row` DROPS mem rows (the 708.7 selection — not a silent no-op).
+    pub captures: Vec<String>,
 }
 
 impl Session {

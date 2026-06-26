@@ -256,6 +256,30 @@ impl TraceChannels {
     pub fn default_cpu_mem() -> Self {
         TraceChannels { cpu: true, mem: true, vic: true, sid: false, drive_cpu: false }
     }
+
+    /// Spec 708 §11 / 708.7 — mask the (domain-derived) channels by the DECLARED
+    /// capture kinds. The domains opened the channels; the captures select which
+    /// rows are KEPT (= TS `declaredCaptures.has(captureKind)`, trace-run.ts:287).
+    /// An EMPTY capture list means "captureAll" (the `trace/start_domains` path,
+    /// where every domain-implied row is kept) and is left untouched. A non-empty
+    /// list gates each channel: a def opening the `memory` domain but declaring only
+    /// `cpu-row` drops mem rows (mem channel masked off). The channel→capture-kind
+    /// mapping mirrors TS CHANNEL_TO_CAPTURE: cpu→cpu-row, bus_access/io→mem-row,
+    /// vic→vic-row, iec→iec-row, drive_pc→cpu-row(drive8-cpu).
+    pub fn mask_by_captures<S: AsRef<str>>(mut self, captures: &[S]) -> Self {
+        if captures.is_empty() {
+            return self; // captureAll: keep every domain-implied row.
+        }
+        let has = |k: &str| captures.iter().any(|c| c.as_ref() == k);
+        self.cpu &= has("cpu-row");
+        self.mem &= has("mem-row");
+        self.vic &= has("vic-row");
+        // The 1541 drive CPU row is a `cpu-row` capture with the drive8-cpu domain
+        // (= TS CHANNEL_TO_CAPTURE drive_pc → cpu-row).
+        self.drive_cpu &= has("cpu-row");
+        // `sid` is reserved (no producer); leave it untouched (no sid-row capture).
+        self
+    }
 }
 
 /// Streaming trace observer: encodes CpuStep + RAM/IO mem-access frames as the
