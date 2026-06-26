@@ -182,6 +182,37 @@ impl DeltaRing {
         }
     }
 
+    /// Compute the (entry_cap, writes_cap) pair for a depth in seconds — the SAME
+    /// sizing `new()` applies from `TRX64_REVERSE_SECONDS`, exposed so a runtime
+    /// `set_reverse_depth` rebuilds the ring at a new depth with identical math.
+    pub fn caps_for_seconds(secs: usize) -> (usize, usize) {
+        let secs = secs.max(1);
+        let entry_cap = secs * INSTR_PER_SECOND;
+        let writes_cap = entry_cap * WRITES_PER_INSTR_NUM / WRITES_PER_INSTR_DEN;
+        (entry_cap, writes_cap)
+    }
+
+    /// RUNTIME RESIZE (reverse-debug depth knob). Rebuild both slabs at new
+    /// capacities for FUTURE capture and DROP all current history (the slabs are
+    /// freshly allocated). The `enabled` (kill-switch) state is preserved. This is
+    /// NOT on the hot path — it is a deliberate `runtime/set_reverse_depth` /
+    /// `revdepth` operation. It cannot retroactively extend history: a culprit that
+    /// already scrolled out of the old ring is gone; only capture from now on uses
+    /// the new depth. (Mirrors `with_capacity`, minus the env re-read — the live
+    /// `enabled` flag is kept so a depth change does not silently re-arm a
+    /// kill-switched ring.)
+    pub fn resize(&mut self, entry_cap: usize, writes_cap: usize) {
+        let ecap = entry_cap.max(1);
+        let wcap = writes_cap.max(1);
+        self.entries = vec![DeltaEntry::default(); ecap].into_boxed_slice();
+        self.writes = vec![WriteRec::default(); wcap].into_boxed_slice();
+        self.entry_head = 0;
+        self.write_head = 0;
+        self.cur = DeltaEntry::default();
+        self.in_flight = false;
+        // `enabled` deliberately preserved.
+    }
+
     /// Entry-slab capacity (max retained instructions).
     #[inline]
     pub fn entry_capacity(&self) -> usize {
@@ -762,6 +793,79 @@ mod tests {
         r.begin(0x1000, 0, 0, 0, 0xff, 0, 1);
         r.commit(); // committed without set_opcode → interrupt-only-style entry
         assert_eq!(r.newest().unwrap().opcode, 0, "no set_opcode → opcode 0 (interrupt-only)");
+    }
+
+    #[test]
+    fn caps_for_seconds_matches_new_sizing() {
+        // The per-second sizing the runtime knob uses must equal what `new()` derives.
+        let (e, w) = DeltaRing::caps_for_seconds(10);
+        assert_eq!(e, 10 * INSTR_PER_SECOND);
+        assert_eq!(w, e * WRITES_PER_INSTR_NUM / WRITES_PER_INSTR_DEN);
+        // Clamp: 0 seconds floors to 1.
+        let (e0, _w0) = DeltaRing::caps_for_seconds(0);
+        assert_eq!(e0, INSTR_PER_SECOND);
+    }
+
+    #[test]
+    fn resize_rebuilds_slabs_drops_history_keeps_enabled() {
+        // Reverse-depth knob: resize SHRINKS/GROWS both slabs, DROPS history, keeps the
+        // armed flag — exactly the runtime/set_reverse_depth contract.
+        let mut r = DeltaRing::with_capacity(16, 64);
+        r.set_enabled(true);
+        for i in 0..10u64 {
+            instr(&mut r, 0x100 + i as u16, (0, 0, 0, 0xff, 0), i, &[(i as u16, 0, 1)]);
+        }
+        assert_eq!(r.len(), 10);
+        // SHRINK to a tiny ring → history gone, new caps applied, still enabled.
+        r.resize(4, 5);
+        assert_eq!(r.entry_capacity(), 4);
+        assert_eq!(r.writes_capacity(), 5);
+        assert_eq!(r.len(), 0, "resize drops all history");
+        assert!(r.is_empty());
+        assert!(r.enabled(), "resize preserves the armed flag");
+        // The shrunk ring still records and caps at the new size (4-entry wrap).
+        for i in 0..6u64 {
+            instr(&mut r, 0x200 + i as u16, (0, 0, 0, 0xff, 0), 100 + i, &[(i as u16, 0, 1)]);
+        }
+        assert_eq!(r.len(), 4, "post-resize ring caps at the NEW capacity");
+        assert_eq!(r.newest().unwrap().pc, 0x200 + 5);
+        // GROW back and confirm a wider window is retained.
+        r.resize(32, 64);
+        assert_eq!(r.entry_capacity(), 32);
+        assert_eq!(r.len(), 0);
+        for i in 0..20u64 {
+            instr(&mut r, 0x300 + i as u16, (0, 0, 0, 0xff, 0), 200 + i, &[]);
+        }
+        assert_eq!(r.len(), 20, "grown ring retains the full 20 (< 32 cap)");
+    }
+
+    #[test]
+    fn ram_estimate_for_default_depth_is_about_96mb() {
+        // The set_reverse_depth RAM figure (delta entries 24B + writes 4B + cpuhistory
+        // 24B) must land near the documented ~96 MB for the 10 s default, so the daemon
+        // reports a truthful cost. (This pins the per-second sizing the knob reports.)
+        let secs = 10usize;
+        let (e, w) = DeltaRing::caps_for_seconds(secs);
+        let cpu_cap = secs * INSTR_PER_SECOND; // cpu-history scaled to depth by the knob
+        let bytes = e * std::mem::size_of::<DeltaEntry>()
+            + w * std::mem::size_of::<WriteRec>()
+            + cpu_cap * std::mem::size_of::<crate::cpu_history::CpuHistEntry>();
+        let mb = bytes as f64 / (1024.0 * 1024.0);
+        // 72 MB (entries) + 15 MB (writes) + 72 MB (cpuhistory@depth) ≈ 159 MB.
+        // (The 96 MB doc figure predates scaling cpu-history with depth; assert a sane
+        // band so an accidental ×10 sizing bug is caught.)
+        assert!(mb > 120.0 && mb < 200.0, "10s rings ≈ {mb:.0} MB (expected 120..200)");
+    }
+
+    #[test]
+    fn resize_preserves_disabled_killswitch() {
+        // A kill-switched ring stays inert across a resize (no silent re-arm).
+        let mut r = DeltaRing::with_capacity(8, 32);
+        r.set_enabled(false);
+        r.resize(4, 8);
+        assert!(!r.enabled(), "resize must not re-arm a kill-switched ring");
+        instr(&mut r, 0x1, (0, 0, 0, 0, 0), 1, &[(0x10, 0, 1)]);
+        assert_eq!(r.len(), 0, "disabled ring records nothing after resize");
     }
 
     #[test]

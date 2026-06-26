@@ -3916,6 +3916,42 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             Ok(format_triage_lines(&chain).join("\n"))
         }
 
+        // reverse-debug depth knob — `revdepth [seconds]`: with an arg, REBUILD both
+        // always-on rings (delta + cpu-history) at that depth for FUTURE capture; with
+        // no arg, REPORT the current depth. Setting it DISCARDS current history (fresh
+        // ring) — it affects capture from now on only and cannot retroactively extend
+        // history. `TRX64_REVERSE_SECONDS` stays the boot default.
+        "revdepth" => {
+            let mb = |bytes: u64| (bytes as f64) / (1024.0 * 1024.0);
+            match toks.get(1).and_then(|s| s.trim_start_matches('$').parse::<u64>().ok()) {
+                None => {
+                    let info = st.session.machine.reverse_depth_info();
+                    Ok(format!(
+                        "revdepth: {}s (~{:.1} MB) — delta {} entries / {} writes, cpuhistory {} entries\n  (pass a number to rebuild, e.g. `revdepth 30`)",
+                        info.seconds, mb(info.ram_bytes),
+                        info.delta_entry_capacity, info.delta_write_capacity, info.cpu_history_capacity,
+                    ))
+                }
+                Some(s) => {
+                    let clamped = (s.max(1)).min(600) as usize;
+                    let info = st.session.machine.set_reverse_depth(clamped);
+                    let mut lines = vec![format!(
+                        "revdepth: rebuilt rings at {}s (~{:.1} MB) — delta {} entries / {} writes, cpuhistory {} entries",
+                        info.seconds, mb(info.ram_bytes),
+                        info.delta_entry_capacity, info.delta_write_capacity, info.cpu_history_capacity,
+                    )];
+                    if (s as usize) != info.seconds {
+                        lines.push(format!("  (requested {s}s clamped to {}s; allowed 1..=600)", info.seconds));
+                    }
+                    lines.push("  DISCARDED current history (fresh ring); affects capture FROM NOW ON only — cannot retroactively extend history.".into());
+                    if info.seconds > 120 {
+                        lines.push(format!("  WARNING: {}s costs ~{:.1} MB always-on ring RAM; multi-minute depths run into GBs.", info.seconds, mb(info.ram_bytes)));
+                    }
+                    Ok(lines.join("\n"))
+                }
+            }
+        }
+
         // reverse-debug Phase 1c — `buildtrace <s> <e>`: dump the always-on delta ring's
         // [s,e] cycle window to a `.c64retrace` (the SAME engine as the WS method
         // trace/build_from_ring) and point the monitor's trace store at it, so the very
@@ -4129,6 +4165,50 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
         // The sidecar serves the CURRENT-store path (default window + explicit
         // <s>[e]); `list` + `<name>` + the checkpoint-ring/chis fallback need the live
         // ring (not file-derivable) → reported as unsupported here, not faked.
+        // `traceindex [path]` — EXPLICITLY build the `.duckdb` index for a `.c64retrace`
+        // (the trace-decode gap fix). With no arg it indexes the CURRENT/last trace; an
+        // optional path may be the `.c64retrace` or its `.duckdb` sibling. Runs the SAME
+        // sidecar indexer the lazy read path uses, but as an explicit op — so a captured
+        // trace that `trace_store_info` reported as "no trace.duckdb" becomes queryable.
+        // Reports events indexed + the honest bound (the indexer streams oldest→newest
+        // with NO event cap; a 1.2 GB trace's oldest events ARE indexed).
+        "traceindex" => {
+            let db = match toks.get(1).map(|s| s.as_str()).filter(|s| !s.is_empty()) {
+                Some(p) => {
+                    if p.ends_with(".c64retrace") {
+                        format!("{}.duckdb", &p[..p.len() - ".c64retrace".len()])
+                    } else {
+                        p.to_string()
+                    }
+                }
+                None => match current_trace_duckdb(st) {
+                    Some(db) => db,
+                    None => return Err(
+                        "traceindex: no path given and no trace has run — `trace on` … `trace off` first, or `traceindex <path.c64retrace>`".into()),
+                },
+            };
+            match run_trace_read_sidecar("index", &db, &json!({ "wait": true })) {
+                Ok(v) => {
+                    let events = v.get("eventsIndexed").and_then(|n| n.as_i64());
+                    let bounded = v.get("bounded").and_then(|b| b.as_bool()).unwrap_or(false);
+                    let path = v.get("duckdbPath").and_then(|p| p.as_str()).unwrap_or(&db);
+                    let mut lines = vec![match events {
+                        Some(n) => format!("traceindex: built {path} — {n} event(s) indexed (oldest→newest, no cap)"),
+                        None => format!("traceindex: {path} — index still building (re-run to await)"),
+                    }];
+                    if let Some(r) = v.get("cycleRange").filter(|r| !r.is_null()) {
+                        let mn = r.get("min").and_then(|x| x.as_i64()).unwrap_or(0);
+                        let mx = r.get("max").and_then(|x| x.as_i64()).unwrap_or(0);
+                        lines.push(format!("  cycle span: {mn}..{mx} (min == trace start ⇒ the oldest events survived)"));
+                    }
+                    if bounded {
+                        lines.push("  bounded: still building (15s grace expired) — NO data dropped; re-run to await completion".into());
+                    }
+                    Ok(lines.join("\n"))
+                }
+                Err(e) => Err(format!("traceindex: {e}")),
+            }
+        }
         "swimlane" | "sw" => {
             let a1 = toks.get(1).map(|s| s.as_str());
             let is_num = |t: Option<&str>| t.map(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).unwrap_or(false);
@@ -4818,6 +4898,7 @@ fn monitor_help_text() -> String {
         "    swapcrt \"<p>\"    hot-swap the .crt, NO reset (same mapper: bank/ctrl carried) — build iteration",
         "    trace on|off|status|mark   live trace gate (Spec 746)",
         "    tracedb start|stop|status|mark   declarative trace (Spec 708)",
+        "    traceindex [path]   build the .duckdb index for the current/last (or <path>) .c64retrace so it is queryable (oldest->newest, no event cap)",
         "  ANALYSIS (need a trace — `trace on` first)",
         "    map [cpu]        memory map: free RAM / persistence surface",
         "    taint <a> [cyc]  data-flow taint backward from (cyc,addr)",
@@ -4828,6 +4909,7 @@ fn monitor_help_text() -> String {
         "    rstep [n] | reverse [n]   UNDO the last n instructions (default 1): restore CPU+RAM+IO bytes to before them; reports the landed regs + writes rolled back",
         "    whowrote <addr> [n]       last n writer(s) of <addr> from the ring (newest first): PC + cycle + old->new — the stack-crash shortcut",
         "    triage [pc]               guided crash-triage: causal chain (crash -> wild RTS/JMP transfer -> stack corruptor) from the rings; auto-printed on a JAM. Confidence-tagged.",
+        "    revdepth [seconds]        report / set the always-on reverse-ring depth: rebuilds the delta+cpuhistory rings (DISCARDS history; future capture only; 1..=600s). TRX64_REVERSE_SECONDS = boot default",
         "  KNOWLEDGE (reads the project _analysis.json that covers the address)",
         "    inspect <a> [stem]  segment kind/label + xrefs at a",
         "    xref <a> [stem]     who calls/jumps/reads/writes a (in + out)",
@@ -7313,6 +7395,63 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             }))
         }
 
+        // reverse-debug depth knob — REBUILD both always-on rings (delta + cpu-history)
+        // at a new depth (seconds) for FUTURE capture. With no `seconds` it REPORTS the
+        // current depth (read-only). Setting it DISCARDS current history (fresh slabs)
+        // and only affects capture from now on — it cannot retroactively extend history
+        // (a culprit already scrolled out is gone). `TRX64_REVERSE_SECONDS` stays the
+        // BOOT default; this is the live override.
+        "runtime/set_reverse_depth" => {
+            // Read-only when `seconds` is absent.
+            let requested = req.params.get("seconds").and_then(|v| v.as_u64());
+            let mut st = state.lock().unwrap();
+            // RAM-cost formatter (bytes → MB, 1 dp).
+            let mb = |bytes: u64| (bytes as f64) / (1024.0 * 1024.0);
+            let info = match requested {
+                None => {
+                    // Report the live depth without touching the rings.
+                    let info = st.session.machine.reverse_depth_info();
+                    return Response::ok(id, json!({
+                        "seconds": info.seconds,
+                        "deltaEntryCapacity": info.delta_entry_capacity,
+                        "deltaWriteCapacity": info.delta_write_capacity,
+                        "cpuHistoryCapacity": info.cpu_history_capacity,
+                        "estimatedRamMb": (mb(info.ram_bytes) * 10.0).round() / 10.0,
+                        "discardedHistory": false,
+                        "note": "current reverse-depth (no change). Pass `seconds` to rebuild the rings.",
+                    }));
+                }
+                Some(s) => {
+                    // Clamp to a sane window: ≥1 s, ≤600 s (10 min). A multi-minute depth
+                    // costs GBs (~9.6 MB/s of both rings), so warn past 120 s.
+                    let clamped = (s.max(1)).min(600) as usize;
+                    let info = st.session.machine.set_reverse_depth(clamped);
+                    let mut out = json!({
+                        "seconds": info.seconds,
+                        "requestedSeconds": s,
+                        "deltaEntryCapacity": info.delta_entry_capacity,
+                        "deltaWriteCapacity": info.delta_write_capacity,
+                        "cpuHistoryCapacity": info.cpu_history_capacity,
+                        "estimatedRamMb": (mb(info.ram_bytes) * 10.0).round() / 10.0,
+                        // The hard contract — surfaced so a caller never expects the past back.
+                        "discardedHistory": true,
+                        "note": "rings rebuilt at the new depth. Current history was DISCARDED (fresh ring); this affects capture FROM NOW ON only — it cannot retroactively extend history (a culprit already scrolled out is gone). TRX64_REVERSE_SECONDS stays the boot default.",
+                    });
+                    if (s as usize) != info.seconds {
+                        out["clampNote"] = json!(format!(
+                            "requested {s}s clamped to {}s (allowed 1..=600)", info.seconds));
+                    }
+                    if info.seconds > 120 {
+                        out["warning"] = json!(format!(
+                            "reverse depth {}s costs ~{:.1} MB of always-on ring RAM — multi-minute depths run into GBs.",
+                            info.seconds, mb(info.ram_bytes)));
+                    }
+                    out
+                }
+            };
+            Response::ok(id, info)
+        }
+
         // reverse-debug Phase 2 — re-run the guided crash-triage on demand and return
         // the structured causal chain (the SAME chain the JAM drop-in auto-attaches to
         // `debug/stopped`). With no `pc` param it triages the live (crashed) PC; an
@@ -8769,28 +8908,116 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                 } else {
                     retrace.into_owned()
                 };
+                // Honest index status: does the `.duckdb` exist on disk yet? An active
+                // trace has not been finalized, so the index is built lazily on the
+                // first read (or by `trace/index`) — caller can decide to index now.
+                let indexed = std::path::Path::new(&duckdb_path).exists();
                 Response::ok(id, json!({
                     "path": duckdb_path,
+                    "duckdbPath": duckdb_path,
+                    "retracePath": t.retrace_path.to_string_lossy(),
                     "runId": t.run_id,
                     "active": true,
-                    "indexing": false
+                    "indexing": false,
+                    "indexed": indexed,
                 }))
             } else if let (Some(path), Some(run_id)) = (&st.last_trace_path, &st.last_run_id) {
+                // Finalized trace: report whether the `.duckdb` index has been built
+                // (auto-index on stop, an earlier read, or an explicit `trace/index`).
+                let retrace_path = if path.ends_with(".duckdb") {
+                    format!("{}.c64retrace", &path[..path.len() - ".duckdb".len()])
+                } else {
+                    format!("{path}.c64retrace")
+                };
+                let indexed = std::path::Path::new(path).exists();
                 Response::ok(id, json!({
                     "path": path,
+                    "duckdbPath": path,
+                    "retracePath": retrace_path,
                     "runId": run_id,
                     "active": false,
-                    "indexing": false
+                    "indexing": false,
+                    "indexed": indexed,
                 }))
             } else {
                 Response::ok(id, json!({ "path": Value::Null }))
             }
         }
 
+        // trace/index — EXPLICITLY build the `.duckdb` index for a `.c64retrace` (the
+        // trace-decode gap fix). `trace_store_info` and any reader that opens the
+        // `.duckdb` DIRECTLY never trigger the sidecar's lazy-on-read build, so a
+        // captured-but-unindexed trace looks like "directory has no trace.duckdb".
+        // This method runs the SAME sidecar indexer the lazy path uses, but as an
+        // explicit op that returns { duckdbPath, eventsIndexed, bounded, boundedFrom,
+        // cap, indexedFromOldest } WITHOUT running an analysis query.
+        //
+        // params: { retrace_path? (the `.c64retrace` OR its `.duckdb` sibling — both
+        // accepted; defaults to the current/last finalized trace), wait? (default
+        // true = run to completion; false = 15s grace then report "still building"). }
+        //
+        // HONESTY: the indexer streams the WHOLE file oldest→newest with NO event cap,
+        // so a 1.2 GB trace's oldest events ARE indexed (cap=null, indexedFromOldest=
+        // true). `bounded` is true ONLY when wait=false and the grace expired before
+        // the build finished — that is a not-ready state, never dropped data.
+        "trace/index" => {
+            // Resolve the target `.duckdb` path. An explicit retrace_path may be the
+            // `.c64retrace` (→ derive `.duckdb`) or already a `.duckdb`; default to the
+            // current/last trace store.
+            let duckdb_path = {
+                let st = state.lock().unwrap();
+                match req.params.get("retrace_path").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                    Some(p) => {
+                        if p.ends_with(".c64retrace") {
+                            format!("{}.duckdb", &p[..p.len() - ".c64retrace".len()])
+                        } else {
+                            p.to_string()
+                        }
+                    }
+                    None => match current_trace_duckdb(&st) {
+                        Some(db) => db,
+                        None => return Response::err(id, -32001,
+                            "trace/index: no retrace_path given and no trace has run (nothing to index)"),
+                    },
+                }
+            };
+            // Lock is released before shelling out to the sidecar (the index build can
+            // take minutes on a multi-GB trace — never hold the session mutex for it).
+            let wait = req.params.get("wait").and_then(|v| v.as_bool()).unwrap_or(true);
+            match run_trace_read_sidecar("index", &duckdb_path, &json!({ "wait": wait })) {
+                Ok(v) => Response::ok(id, v),
+                Err(e) => Response::err(id, -32001, e),
+            }
+        }
+
         "trace/run/stop" => {
-            let mut st = state.lock().unwrap();
-            let status = finalize_trace(&mut *st);
-            Response::ok(id, json!({ "run": status.0, "status": status.1 }))
+            // wait_index (default false to preserve the instant-stop behaviour): when
+            // truthy, BUILD the `.duckdb` index now (the trace-decode gap fix) so the
+            // finalized trace is immediately queryable by BOTH trace/read AND any reader
+            // that opens the `.duckdb` directly (trace_store_info) — not only after a
+            // lazy first read. finalize_trace writes the `.c64retrace` + sets
+            // last_trace_path; we then index its sibling via the same sidecar path.
+            let wait_index = req.params.get("wait_index").and_then(|v| v.as_bool()).unwrap_or(false);
+            let (status, duckdb_path) = {
+                let mut st = state.lock().unwrap();
+                let status = finalize_trace(&mut *st);
+                // The duckdb path finalize_trace just recorded (None when no trace ran).
+                (status, st.last_trace_path.clone())
+            }; // lock released before the (potentially minutes-long) index build
+            let mut out = json!({ "run": status.0, "status": status.1 });
+            if wait_index {
+                if let Some(db) = duckdb_path {
+                    // wait=true → run the decode to completion so the store is ready on
+                    // return. Soft-fail: a sidecar/index error must NOT break trace stop
+                    // (the `.c64retrace` authority is on disk + re-indexable); surface it
+                    // as an `index` field, not an RPC error.
+                    match run_trace_read_sidecar("index", &db, &json!({ "wait": true })) {
+                        Ok(v) => { out["index"] = v; }
+                        Err(e) => { out["index"] = json!({ "ok": false, "error": e, "duckdbPath": db }); }
+                    }
+                }
+            }
+            Response::ok(id, out)
         }
 
         "trace/run/status" => {

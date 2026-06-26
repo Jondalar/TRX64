@@ -16,8 +16,15 @@
 // CONTRACT (CLI):
 //   tsx sidecar.ts <op> --duckdb <path> [--retrace <path>] [--args <json>]
 //
-//   <op>  =  store_fn | swimlane | query_events | follow_path | taint
+//   <op>  =  index | store_fn | swimlane | query_events | follow_path | taint
 //            | profile_loader | sql
+//
+//   `index` is the explicit "decode this `.c64retrace` into its `.duckdb` index"
+//   op (the trace-decode gap fix): it BUILDS the index and reports how many events
+//   landed + whether the build was bounded, WITHOUT running an analysis query. The
+//   other ops trigger the SAME build lazily on first read; `index` makes it explicit
+//   so `trace_store_info`-style readers that open the `.duckdb` directly (and never
+//   trigger a lazy build) find a ready store.
 //   --duckdb   the `.duckdb` INDEX path. Built lazily from the `.c64retrace`
 //              authority (the sibling, or --retrace) when absent. This IS the path
 //              ensureIndexBounded()/withDuckDb() take, so the lazy-build (audit
@@ -124,6 +131,96 @@ async function runOp({ op, duckdb, retrace, args }: Argv): Promise<unknown> {
   const wantRetrace = retrace ?? retracePathFor(duckdb);
   if (!existsSync(duckdb) && !existsSync(wantRetrace)) {
     throw new Error(`no trace store and no .c64retrace authority at ${duckdb} (looked for ${wantRetrace})`);
+  }
+
+  // index — the trace-decode gap fix. EXPLICITLY build the `.duckdb` index from the
+  // `.c64retrace` authority, then report how many events landed + the honest bound,
+  // WITHOUT running an analysis query. A reader that opens the `.duckdb` directly
+  // (e.g. trace_store_info) never triggers the lazy-on-read build the other ops get;
+  // this op closes that gap.
+  //
+  // HONESTY ABOUT THE BOUND (the load-bearing part): the underlying indexer
+  // (binary-log-indexer.indexBinaryLog) STREAMS the whole `.c64retrace` from byte 0
+  // (the OLDEST event) forward to EOF (the NEWEST). There is NO event cap and NO
+  // newest/oldest truncation — a 1.2 GB trace's oldest events ARE indexed (they go
+  // in first). The only "bound" is a TIME bound on the WAIT, NOT on the data:
+  //   • wait=true  (default; the explicit "decode this" intent) → ensureIndex, the
+  //     UNBOUNDED wait. It runs to completion; the returned store holds EVERY event,
+  //     oldest included. bounded=false, indexedFromOldest=true.
+  //   • wait=false (MCP-stall-safe) → ensureIndexBounded, a 15 s grace then it
+  //     returns while the background build keeps running. If the store is not ready
+  //     yet bounded=true with boundedFrom="wait-timeout" — nothing was DROPPED, the
+  //     index is simply not finished. Re-run `index` (or any read) to await it.
+  if (op === "index") {
+    const bg = await c64re("runtime/headless/trace/background-indexer");
+    const wait = args.wait !== false; // default true
+    let indexBuilt = true;
+    let boundedFrom: "none" | "wait-timeout" = "none";
+    if (wait) {
+      await bg.ensureIndex(duckdb); // unbounded → runs to completion (or throws why)
+    } else {
+      try {
+        await bg.ensureIndexBounded(duckdb);
+      } catch (e) {
+        // ensureIndexBounded throws the "still building, retry in ~30s" message when
+        // the 15 s grace expires. That is NOT a failure and NOT data loss — surface
+        // it honestly as a not-yet-ready bound, not an error.
+        indexBuilt = existsSync(duckdb);
+        boundedFrom = "wait-timeout";
+        if (!indexBuilt) {
+          return {
+            duckdbPath: duckdb,
+            retracePath: wantRetrace,
+            indexBuilt: false,
+            bounded: true,
+            boundedFrom,
+            cap: null,
+            indexedFromOldest: true,
+            eventsIndexed: null,
+            note:
+              "index still building in the background (15s grace expired). The full " +
+              ".c64retrace is being decoded oldest→newest; NO events are dropped. " +
+              "Re-run `index` (or any read) to await completion. " +
+              (e instanceof Error ? e.message : String(e)),
+          };
+        }
+      }
+    }
+    if (!existsSync(duckdb)) {
+      const why = bg.indexError?.(duckdb);
+      throw new Error(`index build produced no store at ${duckdb}${why ? `: ${why}` : ""}`);
+    }
+    // Report how many events landed + the cycle span, so a caller can SEE the oldest
+    // event survived (masterClockRange.min == the trace's cycleStart ⇒ front intact).
+    const q = await c64re("runtime/trace-store/queries");
+    const info: any = await q.getInfo(duckdb);
+    const tc = (info?.tableCounts ?? {}) as Record<string, number | bigint>;
+    const eventsIndexed = Number(tc["events:total"] ?? 0);
+    const channels: Record<string, number> = {};
+    for (const [k, v] of Object.entries(tc)) {
+      if (k.startsWith("events:") && k !== "events:total") channels[k.slice("events:".length)] = Number(v);
+    }
+    const range = info?.masterClockRange
+      ? { min: Number(info.masterClockRange.min), max: Number(info.masterClockRange.max) }
+      : null;
+    return jsonSafe({
+      duckdbPath: duckdb,
+      retracePath: wantRetrace,
+      indexBuilt,
+      // No event cap exists in the indexer → bounded only when the (wait=false) grace
+      // expired before the build finished (boundedFrom="wait-timeout"); the data is
+      // never truncated, oldest events survive.
+      bounded: boundedFrom !== "none",
+      boundedFrom,
+      cap: null,
+      indexedFromOldest: true,
+      eventsIndexed,
+      channels,
+      cycleRange: range,
+      note:
+        "Full streaming index (oldest→newest, no event cap). A 1.2 GB trace's oldest " +
+        "events are indexed (read first). bounded reflects only the wait, never dropped data.",
+    });
   }
 
   // store_fn — the trace_store_* reader functions (queries.ts). ensureIndexBounded

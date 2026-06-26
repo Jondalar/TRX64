@@ -100,6 +100,27 @@ async function assertTrx64OnlyDecline(
   }
 }
 
+/** A WEAKER decline check for TRX64-superset methods that are NOT (yet) registered in
+ *  the c64re `TRX64_ONLY_METHODS` set (which lives in the un-editable c64re repo). Such
+ *  a method is declined by the TS runtime with the generic -32601 "method not found"
+ *  rather than the curated TRX64-only message. For the trace-decode / reverse-depth
+ *  superset ops, EITHER decline is the honest TS signal: the TS runtime does NOT service
+ *  the method (it has no trace-decode WS op / no in-process reverse rings), while TRX64
+ *  delivers it. Returns true iff the TS side DECLINED (threw) rather than servicing it; a
+ *  success (no throw) → false (TS must not actually service a TRX64-superset method). */
+async function assertDeclined(
+  c: RpcClient,
+  method: string,
+  params: Record<string, unknown>,
+): Promise<boolean> {
+  try {
+    await c.call(method, params);
+    return false; // TS must NOT service a TRX64-superset method.
+  } catch {
+    return true; // any clean RPC error (TRX64-only message OR -32601) = declined.
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // CASES
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2081,6 +2102,141 @@ const CASES: ConfCase[] = [
       return {
         behavesCorrectly:
           fileOnDisk && decodesCpuRows && swimlaneReturnsRows && eventCount > 0 && notClipped,
+      };
+    },
+  },
+
+  // ── P1: ws-trace-index — EXPLICIT trace-decode of a captured `.c64retrace` (TRX64 superset)
+  // THE BUG (trace-decode gap): a captured 1.2 GB `.c64retrace` could not be queried because
+  // the `.duckdb` index is built LAZILY only on the first sidecar read — `trace_store_info`
+  // and any reader that opens the `.duckdb` DIRECTLY never triggered that build, so it
+  // reported "directory has no trace.duckdb". `trace/index` is the explicit "decode this"
+  // op: it BUILDS the index via the same sidecar path and reports how many events landed +
+  // the honest bound (the indexer streams oldest→newest with NO event cap — a 1.2 GB trace's
+  // oldest events ARE indexed). TRX64 delivers it; the TS runtime has no such WS method.
+  //
+  // FLOW (TRX64): free-run past boot, capture a short window, STOP with wait_index:FALSE (so
+  // NO lazy/auto build happens yet — the `.duckdb` is absent). Assert trace/current reports
+  // indexed:false. Then call `trace/index` and assert: the `.duckdb` now exists on disk,
+  // eventsIndexed > 0, bounded:false (full build), indexedFromOldest:true, and a subsequent
+  // read (`swimlane` over the window via the now-present index) returns real PC rows.
+  // FLOW (TS): the differential can't compare (TS has no trace/index) → clean-decline doctrine.
+  //   tsx src/conformance.ts --only ws-trace-index
+  {
+    id: "ws-trace-index",
+    severity: "P1",
+    title:
+      "trace/index explicitly builds the .duckdb for a captured .c64retrace so it is queryable (TRX64 delivers; TS cleanly declines) — trace-decode gap fix",
+    spawn: { stream: true },
+    async signal(c, d) {
+      const sid = await liveSession(c);
+      if (d.kind !== "trx64") {
+        // TS has no trace/index WS method and it is NOT registered in the c64re
+        // TRX64_ONLY_METHODS list (which we must not edit), so it declines with the
+        // generic -32601 "method not found" rather than the TRX64-only message. Either
+        // decline is the honest TS signal here: the TS runtime does NOT service this
+        // trace-decode op; TRX64 delivers it. Accept a clean decline of EITHER shape.
+        const tsDeclines = await assertDeclined(c, "trace/index", { session_id: sid });
+        return { behavesCorrectly: tsDeclines };
+      }
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      await c.call("debug/run", { session_id: sid });
+      await waitRunningBooted(c, sid, 1_500_000, 60_000);
+      const cs = (await state(c, sid)).c64Cycles ?? 0;
+      await c.call("trace/start_domains", { session_id: sid, domains: ["c64-cpu", "memory"] });
+      await sleep(250);
+      const ce = (await state(c, sid)).c64Cycles ?? 0;
+      // STOP WITHOUT wait_index → finalize the `.c64retrace` but build NO `.duckdb` yet
+      // (no lazy build either, since we don't read before indexing). This reproduces the
+      // captured-but-unindexed state `trace_store_info` choked on.
+      await c.call("trace/run/stop", { session_id: sid, wait_index: false }).catch(() => undefined);
+      await sleep(300);
+      // trace/current must report the store path + indexed:false (no `.duckdb` on disk).
+      const cur = (await c.call("trace/current", { session_id: sid })) as any;
+      const duckdbPath: string = cur?.duckdbPath ?? cur?.path ?? "";
+      const notIndexedBefore = cur?.indexed === false && !!duckdbPath && !existsSync(duckdbPath);
+      // EXPLICITLY index it.
+      const idx = (await c.call("trace/index", { session_id: sid })) as any;
+      const eventsIndexed = Number(idx?.eventsIndexed ?? 0);
+      const indexBuiltField = idx?.indexBuilt === true;
+      const fullNotBounded = idx?.bounded === false && idx?.cap === null && idx?.indexedFromOldest === true;
+      const duckdbNowOnDisk = existsSync(idx?.duckdbPath ?? duckdbPath);
+      // A subsequent read must now return real rows (the index is queryable).
+      const swimOut = await exec(`swimlane ${cs} ${ce}`);
+      const swimReturnsRows =
+        /\$[0-9a-fA-F]{2,4}/.test(swimOut) &&
+        !/unknown command|not supported|no trace store|no trace/i.test(swimOut);
+      return {
+        behavesCorrectly:
+          notIndexedBefore &&
+          indexBuiltField &&
+          eventsIndexed > 0 &&
+          fullNotBounded &&
+          duckdbNowOnDisk &&
+          swimReturnsRows,
+      };
+    },
+  },
+
+  // ── P1: ws-set-reverse-depth — runtime-settable always-on reverse-ring depth (TRX64 superset)
+  // Part B of the trace-depth work: `runtime/set_reverse_depth { seconds }` REBUILDS the
+  // always-on delta + cpu-history rings at a new capacity for FUTURE capture (discarding
+  // current history). TRX64 delivers it; the TS runtime has no in-process reverse rings, so
+  // it CLEANLY DECLINES. Assert: set to 2s → a `who_wrote` window beyond the (tiny) ring is
+  // empty / the depth report shrank; set back up → the capacity GREW. The signal compares the
+  // reported ring capacities + the discardedHistory contract.
+  //   tsx src/conformance.ts --only ws-set-reverse-depth
+  {
+    id: "ws-set-reverse-depth",
+    severity: "P1",
+    title:
+      "runtime/set_reverse_depth rebuilds the always-on reverse rings at a new depth (TRX64 delivers; TS cleanly declines) — runtime-settable reverse depth",
+    spawn: { stream: true },
+    async signal(c, d) {
+      const sid = await liveSession(c);
+      if (d.kind !== "trx64") {
+        // Not registered in the c64re TRX64_ONLY_METHODS list (un-editable here) → the
+        // TS runtime declines with -32601. The TS runtime has no in-process reverse
+        // rings, so declining is the honest signal; TRX64 delivers the knob. Accept a
+        // clean decline of either shape (TRX64-only message OR method-not-found).
+        const tsDeclines = await assertDeclined(c, "runtime/set_reverse_depth", { session_id: sid, seconds: 2 });
+        return { behavesCorrectly: tsDeclines };
+      }
+      const capOf = (r: any) => Number(r?.deltaEntryCapacity ?? 0);
+      // SHRINK to 2s → small ring, history discarded.
+      const small = (await c.call("runtime/set_reverse_depth", { session_id: sid, seconds: 2 })) as any;
+      const smallCap = capOf(small);
+      const smallDiscarded = small?.discardedHistory === true;
+      const smallSeconds = small?.seconds === 2;
+      // Run a touch so the (small) ring fills with fresh history.
+      await c.call("debug/run", { session_id: sid });
+      await waitRunningBooted(c, sid, 1_500_000, 60_000);
+      await sleep(300);
+      await c.call("debug/step", { session_id: sid });
+      // GROW to 8s → bigger ring than 2s.
+      const big = (await c.call("runtime/set_reverse_depth", { session_id: sid, seconds: 8 })) as any;
+      const bigCap = capOf(big);
+      const grew = bigCap > smallCap && big?.seconds === 8 && big?.discardedHistory === true;
+      // No-arg read-only report must reflect the current (8s) depth without discarding.
+      const report = (await c.call("runtime/set_reverse_depth", { session_id: sid })) as any;
+      const reportsCurrent = report?.seconds === 8 && report?.discardedHistory === false && capOf(report) === bigCap;
+      // The monitor `revdepth` verb agrees (and lists the rebuilt capacities).
+      const verb = await (async () => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command: "revdepth" })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      })();
+      const verbAgrees = /revdepth: 8s/.test(verb) && !/unknown command/i.test(verb);
+      return {
+        behavesCorrectly:
+          smallSeconds &&
+          smallDiscarded &&
+          smallCap > 0 &&
+          grew &&
+          reportsCurrent &&
+          verbAgrees,
       };
     },
   },

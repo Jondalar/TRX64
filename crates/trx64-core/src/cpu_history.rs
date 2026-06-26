@@ -107,6 +107,19 @@ impl CpuHistoryRing {
         }
     }
 
+    /// RUNTIME RESIZE (reverse-debug depth knob). Rebuild the slab at a new capacity
+    /// for FUTURE capture and DROP all current history (the slab is freshly
+    /// allocated). The `enabled` (kill-switch) state is preserved. NOT on the hot
+    /// path — a deliberate `runtime/set_reverse_depth` / `revdepth` operation. It
+    /// cannot retroactively extend history (a culprit already scrolled out is gone);
+    /// only capture from now on uses the new capacity. Sibling of `DeltaRing::resize`.
+    pub fn resize(&mut self, capacity: usize) {
+        let cap = capacity.max(1);
+        self.slab = vec![CpuHistEntry::default(); cap].into_boxed_slice();
+        self.head = 0;
+        // `enabled` deliberately preserved.
+    }
+
     /// Ring capacity (max retained instructions).
     #[inline]
     pub fn capacity(&self) -> usize {
@@ -352,6 +365,40 @@ mod tests {
         // Still usable after clear.
         push_ent(&mut r, ent(0x9, 9));
         assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn resize_rebuilds_slab_drops_history_keeps_enabled() {
+        // Reverse-depth knob sibling of DeltaRing::resize.
+        let mut r = CpuHistoryRing::with_capacity(8);
+        r.set_enabled(true);
+        for i in 0..6u64 {
+            push_ent(&mut r, ent(0x40 + i as u16, i));
+        }
+        assert_eq!(r.len(), 6);
+        // GROW → history dropped, new capacity, still armed.
+        r.resize(32);
+        assert_eq!(r.capacity(), 32);
+        assert_eq!(r.len(), 0, "resize drops history");
+        assert!(r.enabled(), "resize keeps the armed flag");
+        for i in 0..20u64 {
+            push_ent(&mut r, ent(0x50 + i as u16, 100 + i));
+        }
+        assert_eq!(r.len(), 20, "grown ring retains the 20 (< 32 cap)");
+        // SHRINK → caps at the new size.
+        r.resize(4);
+        assert_eq!(r.capacity(), 4);
+        for i in 0..10u64 {
+            push_ent(&mut r, ent(0x60 + i as u16, 200 + i));
+        }
+        assert_eq!(r.len(), 4, "shrunk ring caps at the NEW capacity");
+        // Disabled stays disabled across resize.
+        let mut d = CpuHistoryRing::with_capacity(8);
+        d.set_enabled(false);
+        d.resize(4);
+        assert!(!d.enabled());
+        push_ent(&mut d, ent(1, 1));
+        assert_eq!(d.len(), 0);
     }
 
     #[test]

@@ -554,6 +554,23 @@ pub struct WhoWroteHit {
     pub new_value: u8,
 }
 
+/// reverse-debug depth knob — the rebuilt always-on-ring sizing after
+/// [`Machine::set_reverse_depth`] (or the current state via
+/// [`Machine::reverse_depth_info`]). Backs `runtime/set_reverse_depth` / `revdepth`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReverseDepthInfo {
+    /// Reverse-history depth in seconds (the requested/derived depth).
+    pub seconds: usize,
+    /// Delta-ring entry-slab capacity (retained instructions).
+    pub delta_entry_capacity: usize,
+    /// Delta-ring write-slab capacity (retained `{addr,old,new}` writes).
+    pub delta_write_capacity: usize,
+    /// CPU-history-ring capacity (retained instructions for `chis`).
+    pub cpu_history_capacity: usize,
+    /// Total RAM cost of BOTH rings at this depth, in bytes.
+    pub ram_bytes: u64,
+}
+
 /// ROM load error.
 #[derive(Debug)]
 pub enum RomError {
@@ -1099,6 +1116,61 @@ impl Machine {
                 new_value: w.new_value,
             })
             .collect()
+    }
+
+    /// RUNTIME REVERSE-DEPTH KNOB (`runtime/set_reverse_depth` / `revdepth`). Rebuild
+    /// BOTH always-on rings (delta + cpu-history) for `seconds` of FUTURE history,
+    /// using the same per-second sizing `DeltaRing::new` derives from
+    /// `TRX64_REVERSE_SECONDS`. The cpu-history ring (whose BOOT default is a fixed
+    /// 256k entries ≈ 0.25 s, NOT seconds-scaled) is also scaled to `seconds` here so
+    /// the two rings cover the same window after the knob — a deliberate, documented
+    /// effect of the runtime knob (the boot default is unchanged).
+    ///
+    /// DISCARDS CURRENT HISTORY: both slabs are freshly allocated, so anything already
+    /// captured is gone and capture restarts empty. This CANNOT retroactively extend
+    /// history — a culprit older than the new depth that already scrolled out is lost;
+    /// only capture from now on uses the new depth. Returns the new capacities so the
+    /// caller can report the RAM cost. `seconds` is clamped to ≥ 1 here; the daemon
+    /// applies the upper clamp + the multi-GB warning.
+    pub fn set_reverse_depth(&mut self, seconds: usize) -> ReverseDepthInfo {
+        let secs = seconds.max(1);
+        let (entry_cap, writes_cap) = crate::delta_ring::DeltaRing::caps_for_seconds(secs);
+        let cpu_cap = secs * crate::delta_ring::INSTR_PER_SECOND;
+        self.delta_ring.resize(entry_cap, writes_cap);
+        self.cpu_history.resize(cpu_cap);
+        // RAM bytes: delta entries (24 B) + delta writes (4 B) + cpu-history (24 B).
+        let ram_bytes =
+            entry_cap * std::mem::size_of::<crate::delta_ring::DeltaEntry>()
+                + writes_cap * std::mem::size_of::<crate::delta_ring::WriteRec>()
+                + cpu_cap * std::mem::size_of::<crate::cpu_history::CpuHistEntry>();
+        ReverseDepthInfo {
+            seconds: secs,
+            delta_entry_capacity: entry_cap,
+            delta_write_capacity: writes_cap,
+            cpu_history_capacity: cpu_cap,
+            ram_bytes: ram_bytes as u64,
+        }
+    }
+
+    /// Current reverse-depth as derived from the delta ring's entry capacity (the
+    /// authority for `seconds`), plus both rings' live capacities + the RAM cost — so
+    /// a no-arg `revdepth` / `runtime/set_reverse_depth` query can report the state.
+    pub fn reverse_depth_info(&self) -> ReverseDepthInfo {
+        let entry_cap = self.delta_ring.entry_capacity();
+        let writes_cap = self.delta_ring.writes_capacity();
+        let cpu_cap = self.cpu_history.capacity();
+        let seconds = (entry_cap / crate::delta_ring::INSTR_PER_SECOND).max(1);
+        let ram_bytes =
+            entry_cap * std::mem::size_of::<crate::delta_ring::DeltaEntry>()
+                + writes_cap * std::mem::size_of::<crate::delta_ring::WriteRec>()
+                + cpu_cap * std::mem::size_of::<crate::cpu_history::CpuHistEntry>();
+        ReverseDepthInfo {
+            seconds,
+            delta_entry_capacity: entry_cap,
+            delta_write_capacity: writes_cap,
+            cpu_history_capacity: cpu_cap,
+            ram_bytes: ram_bytes as u64,
+        }
     }
 
     /// reverse-debug Phase 2 — guided crash-triage. Reads the two always-on rings
