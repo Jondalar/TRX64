@@ -111,3 +111,76 @@ fn typed_in_process_path() {
 
     eprintln!("[smoke] OK — typed in-process FFI path proven");
 }
+
+/// Live A/V pull-API smoke (ADR-073 §pull): construct → boot → `frameBuffer()` is the
+/// full-res 384×272 palette+index frame; `audioDrain()` returns PCM after a frame of
+/// running and DRAINS (an immediate re-drain returns fewer/zero samples).
+#[test]
+fn live_av_pull_api() {
+    let roms = rom_dir();
+    if !roms.join("kernal-901227-03.bin").exists() {
+        eprintln!("[smoke] ROMs not found at {} — skipping", roms.display());
+        return;
+    }
+
+    let rt = Runtime::new(roms.to_string_lossy().to_string()).expect("Runtime::new");
+    rt.create_session(true).expect("create_session");
+    // Boot to the READY screen: `reset(cold:)` runs the KERNAL to READY (the 5 M-cycle
+    // run-to-READY the daemon's session/reset does), so the VIC has swept full
+    // `displayed` frames showing the light-blue border/background + READY text — a real
+    // multi-colour frame, not the power-on black.
+    rt.reset(true).expect("cold reset to READY");
+
+    // ── frameBuffer(): full-res palette + index image ──
+    let fb = rt.frame_buffer();
+    eprintln!(
+        "[smoke] frameBuffer: {}x{} palette={}B indices={}B",
+        fb.width,
+        fb.height,
+        fb.palette.len(),
+        fb.indices.len()
+    );
+    assert_eq!(fb.width, 384, "VICE PAL canvas width");
+    assert_eq!(fb.height, 272, "VICE PAL canvas height");
+    assert_eq!(fb.palette.len(), 48, "16 RGB palette entries");
+    assert_eq!(
+        fb.indices.len(),
+        (fb.width * fb.height) as usize,
+        "one index byte per pixel"
+    );
+    assert!(fb.indices.iter().all(|&i| i < 16), "all indices in 0..15");
+    // A booted READY screen is not all one colour (border + text) — sanity that the
+    // extraction is a real frame, not a zeroed buffer.
+    let distinct = {
+        let mut seen = [false; 16];
+        for &i in fb.indices.iter() {
+            seen[i as usize] = true;
+        }
+        seen.iter().filter(|&&s| s).count()
+    };
+    // A booted READY screen is the light-blue border (14) + blue background (6) — >1
+    // colour, proving the extraction is a real swept frame, not a zeroed buffer.
+    assert!(distinct >= 2, "a booted frame uses >1 colour (got {distinct})");
+
+    // ── audioDrain(): drains + reports rate ──
+    assert_eq!(rt.audio_sample_rate(), 44_100, "fixed reSID rate");
+    // First drain installs the capture hook + primes reSID → no cycles yet → empty.
+    let primed = rt.audio_drain();
+    eprintln!("[smoke] audioDrain #1 (prime): {} samples", primed.len());
+    // Run a frame so SID cycles elapse, then drain → non-empty PCM for that window.
+    rt.run_cycles(19_656).expect("run_cycles frame");
+    let first = rt.audio_drain();
+    eprintln!("[smoke] audioDrain #2 (after frame): {} samples", first.len());
+    assert!(!first.is_empty(), "a frame of running yields PCM samples");
+    // An IMMEDIATE second drain (no cycles run in between) drains → far fewer / zero.
+    let second = rt.audio_drain();
+    eprintln!("[smoke] audioDrain #3 (immediate): {} samples", second.len());
+    assert!(
+        second.len() < first.len(),
+        "immediate re-drain returns fewer samples (proves it drained): {} !< {}",
+        second.len(),
+        first.len()
+    );
+
+    eprintln!("[smoke] OK — live A/V pull-API proven (frameBuffer + audioDrain)");
+}

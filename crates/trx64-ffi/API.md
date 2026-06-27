@@ -34,6 +34,29 @@ Swift names are uniffi's camelCase rendering of the Rust snake_case below.
 | `reset` | `(cold: Bool) throws -> ResetResult` | `cold` = power-cycle (fresh DRAM); else warm (RAM preserved). Runs the KERNAL to READY. |
 | `screenshot` | `() throws -> Data` | PNG bytes of the current displayed frame (decoded from the handler's data URL). |
 
+## Live A/V (pull)
+
+The native app renders video at ~50 Hz and feeds audio to AVAudioEngine by **pulling**
+A/V from the runtime in-process — at its OWN cadence (per video frame, per audio
+callback). A/V is **binary** and deliberately bypasses the JSON-RPC `dispatch` + event
+channel (JSON cannot carry a frame / PCM efficiently), so these methods reach the core
+**directly** (the same `SharedState` lock every handler uses); they are **additive** and
+do not touch `dispatch` or any existing method. `Vec<u8>` / `Vec<i16>` map to Swift
+`Data` / `[Int16]`, so there is no base64 and no JSON on the hot path.
+
+| Method | Signature | Purpose |
+|--------|-----------|---------|
+| `frameBuffer` | `() -> FrameBuffer` | The CURRENT displayed frame at FULL resolution as a palette + index image — the 384×272 VICE PAL canvas (the same `displayed` buffer `screenshot()` and the scrub thumbnails come from, here full-res + un-palettized). Pull once per video frame and blit. Non-throwing (a pure read). |
+| `audioDrain` | `() -> [Int16]` | Drain + return the SID PCM accumulated since the last `audioDrain()` — **mono `Int16`** at `audioSampleRate()` (44100 Hz). Draining EMPTIES the buffer, so repeated calls don't re-deliver. Pull in the AVAudioEngine source callback. The FIRST call installs the SID capture hook + primes reSID and returns empty (no cycles elapsed yet); thereafter each call returns the samples for exactly the cycles run since the previous drain (reSID synthesis-state is carried across pulls → continuous, no clicks). Non-throwing. |
+| `audioSampleRate` | `() -> UInt32` | The runtime's fixed SID sample rate (Hz) — **44100**. Fetch once when configuring the AVAudioEngine format. Every `audioDrain()` sample is mono at this rate. Non-throwing. |
+
+**Audio format**: mono, signed 16-bit PCM (`Int16`), 44100 Hz (reSID, single SID). To
+feed AVAudioEngine, fill an `AVAudioPCMBuffer`'s `int16ChannelData` with the returned
+`[Int16]` (or duplicate L=R for a stereo node).
+
+**Frame format**: see `FrameBuffer` below. To draw, for each of `width*height` pixels,
+`i = indices[p]` (0..15) selects RGB `palette[i*3 ..< i*3+3]`.
+
 ## run / step
 
 | Method | Signature | Purpose |
@@ -205,6 +228,12 @@ Swift names are uniffi's camelCase rendering of the Rust snake_case below.
 `id: String`, `cycles: UInt64`, `frame: UInt64`, `pinned: Bool`,
 `width: UInt32`, `height: UInt32`, `palette: String` (b64 RGB),
 `indices: String` (b64 indices)
+
+### FrameBuffer (live A/V pull)
+`width: UInt32` (384), `height: UInt32` (272), `palette: Data` (RGB, 16×3 = 48 bytes),
+`indices: Data` (`width*height` bytes, each 0..15 indexing `palette`).
+Full-resolution counterpart of `Thumbnail` — raw `Data`, NOT base64 (in-process pull,
+no JSON). `i = indices[p]` → RGB `palette[i*3 ..< i*3+3]`.
 
 ### ReverseResult
 `stepsTaken: UInt64`, `pc, a, x, y, sp, p: UInt32`, `cycle: UInt64`,

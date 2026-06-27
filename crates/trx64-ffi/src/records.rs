@@ -367,6 +367,27 @@ pub struct Thumbnail {
     pub indices: String,
 }
 
+// ── live A/V (pull) ───────────────────────────────────────────────────────────
+
+/// The current displayed frame at FULL resolution as a palette + index image
+/// (`frameBuffer()`). Same shape as a [`Thumbnail`]'s palette/indices, but full-res
+/// (the 384×272 VICE PAL canvas) and NOT base64 — `Vec<u8>` maps to Swift `Data`,
+/// and this is an in-process pull (no JSON), so raw bytes are correct + fast.
+///
+/// To draw: for each of `width*height` pixels, `i = indices[p]` (0..15) selects RGB
+/// `palette[i*3 .. i*3+3]`. `palette` is 16×3 = 48 bytes; `indices` is
+/// `width*height` bytes. This is NOT a serde record (built directly from core bytes,
+/// no JSON decode) — hence no `Deserialize`.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FrameBuffer {
+    pub width: u32,
+    pub height: u32,
+    /// RGB palette, 16×3 = 48 bytes (Swift `Data`).
+    pub palette: Vec<u8>,
+    /// `width*height` palette indices, each 0..15 (Swift `Data`).
+    pub indices: Vec<u8>,
+}
+
 // ── reverse-debug ─────────────────────────────────────────────────────────────
 
 /// An undone write reported by `runtime/reverse_step`.

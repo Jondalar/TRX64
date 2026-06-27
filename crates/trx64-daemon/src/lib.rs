@@ -24,6 +24,13 @@ pub use daemon::{
     SharedState, State,
 };
 
+// Live A/V PULL-API (ADR-073 §pull) — the two direct-core pull entry points + their
+// plain (Send) data structs, consumed by the FFI's typed `frameBuffer()` /
+// `audioDrain()`. Additive; these bypass `dispatch` because A/V is binary.
+pub use daemon::{
+    pull_audio_drain, pull_frame_buffer, AudioDrainData, FrameBufferData, AUDIO_SAMPLE_RATE,
+};
+
 // The event-broadcast hub (subscribe a forwarder channel → typed events).
 pub use daemon::streaming;
 

@@ -41,7 +41,10 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 
 use trx64_daemon::streaming::NotifySub;
-use trx64_daemon::{create_embedded_state, dispatch, notify_hub, Request, Response, SharedState};
+use trx64_daemon::{
+    create_embedded_state, dispatch, notify_hub, pull_audio_drain, pull_frame_buffer, Request,
+    Response, SharedState, AUDIO_SAMPLE_RATE,
+};
 
 uniffi::setup_scaffolding!();
 
@@ -216,6 +219,48 @@ impl Runtime {
             .map_err(|e| Trx64Error::Decode {
                 message: format!("screenshot base64: {e}"),
             })
+    }
+
+    // ── live A/V (pull) ──────────────────────────────────────────────────────────
+    //
+    // Two ADDITIVE typed PULL methods for the native app's render/audio loops. A/V is
+    // BINARY and bypasses the JSON-RPC `dispatch`/event channel (JSON can't carry a
+    // frame/PCM efficiently), so these reach the core DIRECTLY via the daemon's
+    // `pull_*` helpers — the SAME `&SharedState` lock every handler uses. They do NOT
+    // call `dispatch` or any existing method. The app pulls at its own cadence (per
+    // video frame, per audio callback). `Vec<u8>`/`Vec<i16>` map to Swift `Data`/
+    // `[Int16]`, so no base64 and no JSON on the hot path.
+
+    /// The CURRENT displayed frame at FULL resolution as a palette + index image (the
+    /// 384×272 VICE PAL canvas — the SAME `displayed` buffer `screenshot()` and the
+    /// scrub thumbnails come from, here full-res + un-palettized). Pull this once per
+    /// video frame (~50 Hz) and blit it. See [`FrameBuffer`] for the draw recipe.
+    pub fn frame_buffer(&self) -> FrameBuffer {
+        let fb = pull_frame_buffer(&self.state);
+        FrameBuffer {
+            width: fb.width,
+            height: fb.height,
+            palette: fb.palette,
+            indices: fb.indices,
+        }
+    }
+
+    /// Drain + return the SID PCM accumulated since the last `audioDrain()` — mono
+    /// `Int16` at [`audioSampleRate`] (44100 Hz), ready to fill an `AVAudioPCMBuffer`
+    /// (`int16ChannelData`). Draining EMPTIES the buffer, so repeated calls don't
+    /// re-deliver. Pull this in the AVAudioEngine source callback. The first call
+    /// installs the SID capture hook + primes reSID and returns empty (no cycles have
+    /// elapsed yet); thereafter each call returns the samples for exactly the cycles
+    /// run since the previous drain (reSID synthesis-state is carried across pulls, so
+    /// the stream is continuous — no clicks).
+    pub fn audio_drain(&self) -> Vec<i16> {
+        pull_audio_drain(&self.state).samples
+    }
+
+    /// The runtime's fixed SID sample rate (Hz) — 44100. Fetch once when configuring
+    /// the AVAudioEngine format; every [`audioDrain`] sample is mono at this rate.
+    pub fn audio_sample_rate(&self) -> u32 {
+        AUDIO_SAMPLE_RATE
     }
 
     // ── run / step ─────────────────────────────────────────────────────────────

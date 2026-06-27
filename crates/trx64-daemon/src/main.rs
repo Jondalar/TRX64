@@ -379,6 +379,35 @@ pub struct State {
     /// the restore handler still broadcasts `session/frame_available` directly, so a
     /// command-driven daemon signals the refresh too.
     force_present_frame: bool,
+    /// Live A/V PULL-API (FFI / native app, ADR-073 §pull) — the persistent SID
+    /// audio pump for [`pull_audio_drain`]. `None` until the first `audioDrain()`
+    /// installs the SID write-trace hook + primes reSID. The reSID engine itself is
+    /// `!Send` (it holds the process-global reSID `MutexGuard`), so it CANNOT live in
+    /// `State` (which must be `Send` for `Arc<Mutex<State>>`); instead the pump keeps
+    /// only `Send` state — the shared write-capture buffer, the reSID synthesis-state
+    /// checkpoint (continuity across pulls), and the last clk — and reconstructs the
+    /// engine + `restore_state`s it on each drain (= the streaming-loop pattern, pull-
+    /// shaped). Off by default → zero cost until the app starts pulling audio.
+    audio_pump: Option<AudioPump>,
+}
+
+/// Live A/V PULL-API — persistent, `Send` state for the SID audio pump
+/// ([`pull_audio_drain`]). See the `audio_pump` field doc for WHY the reSID engine
+/// is not held here.
+struct AudioPump {
+    /// SID register writes captured by the `set_write_trace` hook since the last
+    /// drain (CPU order, $D4xx offset masked to 0x00..0x1f). Shared with the hook
+    /// (`Box<dyn FnMut + Send>`); drained + cleared every pull.
+    writes: std::sync::Arc<std::sync::Mutex<Vec<(u8, u8)>>>,
+    /// reSID synthesis-state checkpoint (= `SidAudioEngine::capture_state` /
+    /// VICE `sid_snapshot_state_t`) — carries filter/envelope/oscillator state
+    /// across pulls so the per-call engine reconstruction is continuous (no clicks).
+    /// Empty before the first drain primes the engine.
+    resid_state: Vec<u8>,
+    /// The `c64_core.clk` value at the previous drain. The next drain emits PCM for
+    /// exactly `clk_now - last_clk` cycles (= the streaming loop's per-frame
+    /// `d_cycles`, but over the host's pull window).
+    last_clk: u64,
 }
 
 /// T2.8 — the monitor-shell.ts module-level per-session state, collapsed for the
@@ -12378,6 +12407,7 @@ pub fn build_state(session: Session, streaming_on: bool) -> State {
         flow: FlowTracker::new(),
         stream_broke_on_jam: false,
         force_present_frame: false,
+        audio_pump: None,
     }
 }
 
@@ -12399,6 +12429,161 @@ pub fn create_embedded_state(
 /// subscribes a forwarder channel to this and maps each broadcast to a typed event.
 pub fn notify_hub(state: &SharedState) -> Arc<streaming::NotifyHub> {
     state.lock().unwrap().notify.clone()
+}
+
+// ── Live A/V PULL-API (FFI / native app — ADR-073 §pull) ────────────────────────
+//
+// Two ADDITIVE pull entry points for the in-process native app (trx64-ffi). A/V is
+// BINARY and deliberately bypasses the JSON-RPC `dispatch`/event channel (JSON
+// can't carry a frame/PCM efficiently), so these reach the core DIRECTLY through the
+// SAME `&SharedState` lock every handler uses — they do NOT touch `dispatch` or any
+// existing method. The app pulls at its own cadence (per video frame, per audio
+// callback). Mirrors what `session/screenshot` (frame) and the `streaming.rs`
+// stream loop (audio) already do internally, but returns raw `Send` bytes instead of
+// a base64/PNG JSON envelope.
+
+/// The current displayed frame as a full-resolution palette + index image — the
+/// 384×272 VICE PAL canvas the per-cycle VIC sweep produced (the SAME `displayed`
+/// buffer `session/screenshot` and the scrub thumbnails come from, here un-downscaled
+/// and un-palettized). `palette` is the 48-byte COLODORE RGB table (16×3); `indices`
+/// is `width*height` bytes, each 0..15 indexing the palette. Pure read; no engine,
+/// no state mutation, no `dispatch`.
+pub struct FrameBufferData {
+    pub width: u32,
+    pub height: u32,
+    /// 48 bytes — 16 RGB triplets (COLODORE), R,G,B order, palette-index order.
+    pub palette: Vec<u8>,
+    /// `width*height` bytes, each a 0..15 palette index.
+    pub indices: Vec<u8>,
+}
+
+/// Drained SID PCM since the last drain — mono `i16` at `sample_rate` Hz.
+pub struct AudioDrainData {
+    /// Mono Int16 PCM samples produced for the cycles elapsed since the previous
+    /// drain. Empties on read (a subsequent immediate drain returns ~0 samples).
+    pub samples: Vec<i16>,
+    /// The runtime's fixed reSID sample rate (44100 Hz).
+    pub sample_rate: u32,
+}
+
+/// Pull the current full-resolution displayed frame as palette + indices. Reuses the
+/// core's `render_canvas_indices` (the live-stream / thumbnail index source) and the
+/// `COLODORE` palette — the exact extraction the screenshot + filmstrip use, at full
+/// 384×272 res.
+pub fn pull_frame_buffer(state: &SharedState) -> FrameBufferData {
+    let st = state.lock().unwrap();
+    let (w, h, indices) = st.session.machine.render_canvas_indices();
+    let mut palette = Vec::with_capacity(48);
+    for rgb in trx64_core::render::COLODORE.iter() {
+        palette.extend_from_slice(rgb);
+    }
+    FrameBufferData {
+        width: w as u32,
+        height: h as u32,
+        palette,
+        indices,
+    }
+}
+
+/// The runtime's fixed reSID sample rate (Hz). Matches `streaming.rs` / `WavFormat`
+/// / `export_session_audio` (44100). Exposed so the app sizes its AVAudioEngine
+/// format without a drain.
+pub const AUDIO_SAMPLE_RATE: u32 = 44_100;
+
+/// Drain + return the SID PCM accumulated since the last drain (empties on read).
+///
+/// First call: install the additive SID `set_write_trace` hook (capturing $D4xx
+/// writes into a shared buffer), prime reSID from the live SID register file, and
+/// discard the priming silence — returning 0 samples (no cycles have elapsed yet).
+/// Each subsequent call: reconstruct a `SidAudioEngine`, `restore_state` the carried
+/// reSID synthesis-state (continuity, no clicks), replay the captured writes in CPU
+/// order, `record_boundary(clk_now - last_clk)`, `flush`, `take_pcm`, then save the
+/// synthesis-state + `last_clk` back. This is the streaming-loop audio pattern in a
+/// PULL shape: the engine is built per-call because it is `!Send` (cannot live in the
+/// `Send` `State`); the carried synthesis-state makes that seamless.
+///
+/// THREADING: serialized on the same `State` lock as every other access — the FFI
+/// `Runtime` already funnels all access through this one `Mutex`, so concurrent pulls
+/// from the video + audio threads are mutually exclusive (correct, never torn).
+pub fn pull_audio_drain(state: &SharedState) -> AudioDrainData {
+    use trx64_core::resid_audio::SidAudioEngine;
+    use trx64_core::resid_ffi::ResidConfig;
+
+    let mut st = state.lock().unwrap();
+
+    // ── First drain: install the capture hook + prime reSID, emit nothing ──
+    if st.audio_pump.is_none() {
+        let writes: std::sync::Arc<std::sync::Mutex<Vec<(u8, u8)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let w = std::sync::Arc::clone(&writes);
+            st.session
+                .machine
+                .sid
+                .set_write_trace(Some(Box::new(move |addr, value| {
+                    w.lock().unwrap().push((addr, value));
+                })));
+        }
+        // Prime reSID with the live SID register file (frequencies/PW/control already
+        // set — not power-on silence), apply, discard the priming PCM, and snapshot the
+        // synthesis-state for the NEXT (real) drain. The engine is dropped at the end of
+        // this block → releases the process-global reSID guard.
+        let resid_state = {
+            let mut engine = SidAudioEngine::new(ResidConfig::default());
+            for reg in 0u8..=0x18 {
+                let v = st.session.machine.read_full(0xD400 + reg as u16);
+                engine.record_write(reg, v);
+            }
+            engine.record_boundary(0);
+            engine.flush();
+            let _ = engine.take_pcm(); // discard priming silence
+            engine.capture_state()
+        };
+        let last_clk = st.session.machine.c64_core.clk;
+        st.audio_pump = Some(AudioPump {
+            writes,
+            resid_state,
+            last_clk,
+        });
+        // No cycles elapsed since install → no audio this call.
+        return AudioDrainData {
+            samples: Vec::new(),
+            sample_rate: AUDIO_SAMPLE_RATE,
+        };
+    }
+
+    // ── Subsequent drain: emit PCM for the cycles since last drain ──
+    let clk_now = st.session.machine.c64_core.clk;
+    // Take the pump out so we can mutably borrow it AND the machine; put it back after.
+    let mut pump = st.audio_pump.take().expect("audio_pump present");
+    let d_cycles = clk_now.wrapping_sub(pump.last_clk);
+    // Drain the captured writes (CPU order) without holding the lock across the engine.
+    let captured: Vec<(u8, u8)> = {
+        let mut pending = pump.writes.lock().unwrap();
+        std::mem::take(&mut *pending)
+    };
+
+    let samples = {
+        let mut engine = SidAudioEngine::new(ResidConfig::default());
+        engine.restore_state(&pump.resid_state);
+        for (addr, value) in &captured {
+            engine.record_write(*addr, *value);
+        }
+        // reSID's emit cycle-count is a u32 window; clamp the (normally tiny per-pull)
+        // delta defensively so a huge gap can't overflow the cast.
+        engine.record_boundary(d_cycles.min(u32::MAX as u64) as u32);
+        engine.flush();
+        let pcm = engine.take_pcm();
+        pump.resid_state = engine.capture_state();
+        pcm
+    };
+    pump.last_clk = clk_now;
+    st.audio_pump = Some(pump);
+
+    AudioDrainData {
+        samples,
+        sample_rate: AUDIO_SAMPLE_RATE,
+    }
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -12559,6 +12744,7 @@ mod batch1_tests {
             flow: FlowTracker::new(),
             stream_broke_on_jam: false,
             force_present_frame: false,
+            audio_pump: None,
         }))
     }
 
