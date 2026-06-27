@@ -27,6 +27,10 @@ A normal emulator runs code. TRX64 lets you *interrogate* it:
   crash PC → the wild jump → the stack corruptor.
 - **A forensic trace firehose** — capture CPU / drive / IEC / memory to a binary
   log, index it, and query it as swimlanes, memory maps, or data-flow taint.
+- **Faithful cartridges, including Save-to-Flash** — EasyFlash and the commercial
+  CRT families (Ocean, Magic Desk, GMOD2/3, MegaByter …) run on source-faithful
+  mapper cores. Writable flash and EEPROM genuinely persist: an EasyFlash
+  *Save to Flash* survives a reset and round-trips through a snapshot.
 - **Shared human + LLM sessions** — one machine per process, co-driven. A person and
   an agent inspect, step, and steer the *same* live C64 at the same time.
 - **API-first** — every capability above is one JSON-RPC method. No GUI assumptions,
@@ -82,8 +86,8 @@ The surface, by area:
 - **Session & run** — create/state/reset/screenshot; run, pause, step, run an exact
   cycle budget; pacing (`realtime` or `warp` 8× fast-forward); execution breakpoints.
 - **Input** — keys, typed text, joystick, and load/autostart a `.prg`.
-- **Media** — mount/swap/unmount disks (`.d64`/`.g64`) and cartridges (`.crt`, all
-  VICE mapper families including writable flash) through one checkpointing ingress.
+- **Media** — mount/swap/unmount disks (`.d64`/`.g64`) and cartridges (`.crt`)
+  through one checkpointing ingress (cartridge fidelity above).
 - **Trace** — start a capture over chosen domains, index it, query it, or carve a
   trace for an exact cycle window straight out of the always-on ring.
 - **Checkpoint / scrub & snapshots** — the ring-bound rewind (a 10 s
