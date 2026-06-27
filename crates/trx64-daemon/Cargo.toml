@@ -4,6 +4,13 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+# Linkable library face (additive — Spec FFI). Exposes the SAME compilation unit
+# (src/main.rs) so the in-process FFI (`trx64-ffi`) can call `dispatch()` +
+# `NotifyHub` socket-free. The `[[bin]]` below is unchanged.
+[lib]
+name = "trx64_daemon"
+path = "src/lib.rs"
+
 [[bin]]
 name = "trx64-daemon"
 path = "src/main.rs"

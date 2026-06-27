@@ -29,11 +29,11 @@ use trx64_core::{BusKind, NullSink, Observer};
 use trx64_session::{Session, TraceState};
 use trx64_trace::{FrameSink, TraceChannels, TracingObserver};
 
-mod assembler;
-mod observers;
-mod project_knowledge;
-mod snapshot_diff;
-mod streaming;
+pub mod assembler;
+pub mod observers;
+pub mod project_knowledge;
+pub mod snapshot_diff;
+pub mod streaming;
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -61,29 +61,29 @@ struct Cli {
 // ── JSON-RPC 2.0 wire types ───────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
-struct Request {
+pub struct Request {
     #[allow(dead_code)]
-    jsonrpc: String,
-    id: Value,
-    method: String,
+    pub jsonrpc: String,
+    pub id: Value,
+    pub method: String,
     #[serde(default)]
-    params: Value,
+    pub params: Value,
 }
 
 #[derive(Debug, Serialize)]
-struct Response {
+pub struct Response {
     jsonrpc: &'static str,
-    id: Value,
+    pub id: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<Value>,
+    pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<RpcError>,
+    pub error: Option<RpcError>,
 }
 
 #[derive(Debug, Serialize)]
-struct RpcError {
-    code: i64,
-    message: String,
+pub struct RpcError {
+    pub code: i64,
+    pub message: String,
 }
 
 impl Response {
@@ -160,7 +160,7 @@ struct CtrlStop {
 }
 
 /// Singleton session, kept in memory for the daemon's lifetime.
-struct State {
+pub struct State {
     session: Session,
     breakpoints: Breakpoints,
     /// The breakpoint/watchpoint POLICY (cond-AST, hit/ignore, watch tables).
@@ -735,7 +735,7 @@ struct BatchEntry {
 /// c64re PINNED_MEDIA_EVENTS window; large enough for replay/branch consumers).
 const MAX_MEDIA_EVENTS: usize = 256;
 
-type SharedState = Arc<Mutex<State>>;
+pub type SharedState = Arc<Mutex<State>>;
 
 // ── ROM directory resolution ──────────────────────────────────────────────────
 
@@ -748,6 +748,7 @@ fn rom_dir() -> PathBuf {
 
 // ── Project root for crash log ────────────────────────────────────────────────
 
+#[allow(dead_code)] // crash-log path; reached only via the bin `main`.
 fn project_dir() -> PathBuf {
     env::var("C64RE_ROOT")
         .map(PathBuf::from)
@@ -1900,7 +1901,7 @@ fn run_debug_control(id: Value, st: &mut State, frame: u64, _is_continue: bool) 
 ///
 /// Returns the number of C64 cycles actually advanced this frame, so the caller can
 /// drive audio over exactly the window that ran (a halt may stop mid-frame).
-fn stream_debug_gated_advance(st: &mut State, budget: u64) -> u32 {
+pub(crate) fn stream_debug_gated_advance(st: &mut State, budget: u64) -> u32 {
     // Re-sync the observer registry from the bp surfaces (preserving live counts),
     // exactly like the one-shot run_debug_control entry.
     {
@@ -6281,7 +6282,7 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
 
 // ── RPC method dispatch ───────────────────────────────────────────────────────
 
-fn dispatch(req: Request, state: &SharedState) -> Response {
+pub fn dispatch(req: Request, state: &SharedState) -> Response {
     let id = req.id.clone();
     match req.method.as_str() {
         "ping" => {
@@ -10722,7 +10723,7 @@ const MAX_RECENT_MEDIA: usize = 10;
 /// :51). No chrono dep: compute civil date from the Unix epoch (Howard Hinnant's
 /// days_from_civil inverse). Distinct from `now_iso8601` (the opaque `epoch:<secs>`
 /// scenario stamp) because the recents store mirrors a real client-facing ISO string.
-fn now_iso8601_utc() -> String {
+pub(crate) fn now_iso8601_utc() -> String {
     let dur = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
@@ -10952,7 +10953,7 @@ fn checkpoint_ring_max_entries() -> u64 {
 /// bp-stopped, so a dirty-then-pause STILL reaches the host file. The stream loop
 /// therefore calls this EVERY iteration (running OR paused), not only `if running`.
 /// Broadcasts media/cart_persisted {auto:true}. Disable with C64RE_CART_AUTOPERSIST=0.
-fn stream_maybe_autopersist_cart(st: &mut State, now_ms: u64) {
+pub(crate) fn stream_maybe_autopersist_cart(st: &mut State, now_ms: u64) {
     if std::env::var("C64RE_CART_AUTOPERSIST").as_deref() == Ok("0") {
         return;
     }
@@ -11010,7 +11011,7 @@ fn stream_maybe_autopersist_cart(st: &mut State, now_ms: u64) {
 /// exists AND the disk is writable. WALL-CLOCK ms debounce (`now_ms`), so a SAVE then
 /// pause still reaches the host file (audit ws-media-3); content-hash gen (no
 /// diskWriteGen facade in TRX64). Called EVERY stream-loop iteration (running or paused).
-fn stream_maybe_autopersist_disk(st: &mut State, now_ms: u64) {
+pub(crate) fn stream_maybe_autopersist_disk(st: &mut State, now_ms: u64) {
     // Cheap gate: flush any pending dirty GCR track into `disk.bytes` (VICE
     // drive_gcr_data_writeback_all → fsimage->fd). Returns true ONCE per dirty
     // burst — that arms the debounce; the flag then drops, so on later frames the
@@ -11084,7 +11085,7 @@ fn stream_maybe_autopersist_disk(st: &mut State, now_ms: u64) {
 /// ring. SKIPS while a mounted medium is dirty + non-persistable (Spec 709.13).
 /// Isolated: a capture failure NEVER kills the loop (the ring returns Err on a
 /// gap, never panics). Disable with C64RE_CHECKPOINT_AUTOCAPTURE=0.
-fn stream_maybe_autocapture(st: &mut State, frame: u64, canvas_w: usize, canvas_h: usize, canvas_indices: &[u8]) {
+pub(crate) fn stream_maybe_autocapture(st: &mut State, frame: u64, canvas_w: usize, canvas_h: usize, canvas_indices: &[u8]) {
     if std::env::var("C64RE_CHECKPOINT_AUTOCAPTURE").as_deref() == Ok("0") {
         return;
     }
@@ -11131,7 +11132,7 @@ fn stream_maybe_autocapture(st: &mut State, frame: u64, canvas_w: usize, canvas_
 /// to an explicit recorder/capture. No-op (zero cost) when no recorder is active.
 /// Isolated: capture_anchor_now never panics (the recorder store evicts, never
 /// throws). Disable with C64RE_RECORDER_AUTOFEED=0.
-fn stream_maybe_feed_recorder(st: &mut State, _frame: u64) {
+pub(crate) fn stream_maybe_feed_recorder(st: &mut State, _frame: u64) {
     // Zero-cost gate: nothing to feed when the recorder is inactive.
     if st.recorder.is_none() {
         return;
@@ -12215,6 +12216,7 @@ fn checkpoint_thumbnail(cp: &Value) -> Option<(usize, usize, Vec<u8>, Vec<u8>)> 
 
 // ── Connection handler ────────────────────────────────────────────────────────
 
+#[allow(dead_code)] // bin-only WS transport; unused in the `[lib]` embed unit.
 async fn handle_connection(
     stream: TcpStream,
     addr: SocketAddr,
@@ -12314,8 +12316,94 @@ async fn handle_connection(
     eprintln!("[trx64] client disconnected: {addr}");
 }
 
+// ── Embeddable construction (shared by the daemon `main` AND the FFI lib) ──────
+//
+// The full `State` initializer lives HERE so the daemon binary, the in-process FFI
+// (`trx64-ffi`), and the round-trip tests all build a byte-identical State (no
+// drift between the embedded path and the socket path). This is a pure EXTRACTION
+// of the initializer that previously sat inline in `main()` — no behaviour change.
+
+/// Build the singleton [`State`] from an already-booted [`Session`]. `streaming_on`
+/// only stamps `streaming_enabled` (the FFI has no `--stream` A/V hub; it consumes
+/// `NotifyHub` events directly), so it is `false` for an FFI embed.
+pub fn build_state(session: Session, streaming_on: bool) -> State {
+    State {
+        session,
+        breakpoints: Breakpoints::new(),
+        observers: observers::ObserverRegistry::new(),
+        dsl_observers: Vec::new(),
+        dsl_disabled: std::collections::HashSet::new(),
+        type_buffer: Vec::new(),
+        ctrl_frame: 0, // incremented on each debug/run|pause|continue; first pause → 1
+        ctrl_stop: None,
+        checkpoint_counter: 0,
+        // Spec 772 — the ring is the short UI-scrub buffer: a max-entries cap (default
+        // 20 = 10s @ 0.5s cadence, env-overridable) on top of the 32 MiB byte budget,
+        // evict-oldest on whichever-first. Deep history = the recorder, not this ring.
+        checkpoint_ring: trx64_core::checkpoint_ring::RuntimeCheckpointRing::with_budget_and_max_entries(
+            trx64_core::checkpoint_ring::DEFAULT_CHECKPOINT_RING_BUDGET_BYTES,
+            checkpoint_ring_max_entries(),
+        ),
+        inspect_evidence: Vec::new(),
+        vic_provenance_enabled: false,
+        trace_definitions: std::collections::HashMap::new(),
+        recorder: None,
+        recorder_disk_gen: 0,
+        recorder_disk_hash: None,
+        scenarios: std::collections::HashMap::new(),
+        media_events: Vec::new(),
+        recent_media: Vec::new(),
+        batches: std::collections::HashMap::new(),
+        notify: streaming::NotifyHub::new(),
+        streaming_enabled: streaming_on,
+        pacing_mode: "pal".to_string(),
+        pacing_ratio: 1.0,
+        control_owner: "human".to_string(),
+        last_trace_path: None,
+        last_run_id: None,
+        cart_led_gen: 0,
+        cart_led_last_write_at: None,
+        cart_ap_seen_gen: 0,
+        cart_ap_settle_at_ms: 0,
+        cart_ap_done_gen: 0,
+        disk_ap_pending: false,
+        disk_ap_settle_at_ms: 0,
+        disk_ap_seen_hash: None,
+        disk_ap_done_hash: None,
+        autocapture_frames_since: 0,
+        recorder_frames_since: 0,
+        checkpoint_thumbs: std::collections::HashMap::new(),
+        checkpoint_thumb_order: std::collections::VecDeque::new(),
+        mon: MonitorState::new(),
+        flow: FlowTracker::new(),
+        stream_broke_on_jam: false,
+        force_present_frame: false,
+    }
+}
+
+/// Boot a fresh singleton session + cold-reset the machine from `rom_dir`, then wrap
+/// it in a [`SharedState`] ready for [`dispatch`] — the in-process equivalent of the
+/// daemon's boot path in [`main`]. A blank machine is returned (with the error
+/// propagated) if the ROMs cannot be loaded, mirroring `main`'s WARN fallback.
+pub fn create_embedded_state(
+    rom_dir: &std::path::Path,
+) -> Result<SharedState, trx64_core::RomError> {
+    let mut session = Session::new("integrated-1");
+    let boot = session.boot(rom_dir);
+    let state = Arc::new(Mutex::new(build_state(session, false)));
+    boot.map(|()| state)
+}
+
+/// The active [`NotifyHub`] for an embedded state — the single event-broadcast hub
+/// that every `dispatch` handler pushes server notifications through. The FFI
+/// subscribes a forwarder channel to this and maps each broadcast to a typed event.
+pub fn notify_hub(state: &SharedState) -> Arc<streaming::NotifyHub> {
+    state.lock().unwrap().notify.clone()
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
+#[allow(dead_code)] // binary entry point; inert when this file is the `[lib]` module.
 #[tokio::main]
 async fn main() {
     // Install a crash log hook before anything else.
@@ -12356,57 +12444,7 @@ async fn main() {
 
     let streaming_on =
         cli.stream || matches!(env::var("TRX64_STREAM").ok().as_deref(), Some("1") | Some("true"));
-    let state: SharedState = Arc::new(Mutex::new(State {
-        session,
-        breakpoints: Breakpoints::new(),
-        observers: observers::ObserverRegistry::new(),
-        dsl_observers: Vec::new(),
-        dsl_disabled: std::collections::HashSet::new(),
-        type_buffer: Vec::new(),
-        ctrl_frame: 0, // incremented on each debug/run|pause|continue; first pause → 1
-        ctrl_stop: None,
-        checkpoint_counter: 0,
-        // Spec 772 — the ring is the short UI-scrub buffer: a max-entries cap (default
-        // 20 = 10s @ 0.5s cadence, env-overridable) on top of the 32 MiB byte budget,
-        // evict-oldest on whichever-first. Deep history = the recorder, not this ring.
-        checkpoint_ring: trx64_core::checkpoint_ring::RuntimeCheckpointRing::with_budget_and_max_entries(
-            trx64_core::checkpoint_ring::DEFAULT_CHECKPOINT_RING_BUDGET_BYTES,
-            checkpoint_ring_max_entries(),
-        ),
-        inspect_evidence: Vec::new(),
-        vic_provenance_enabled: false,
-        trace_definitions: std::collections::HashMap::new(),
-        recorder: None,
-        recorder_disk_gen: 0,
-        recorder_disk_hash: None,
-        scenarios: std::collections::HashMap::new(),
-        media_events: Vec::new(),
-        recent_media: Vec::new(),
-        batches: std::collections::HashMap::new(),
-        notify: streaming::NotifyHub::new(),
-        streaming_enabled: streaming_on,        pacing_mode: "pal".to_string(),
-        pacing_ratio: 1.0,
-        control_owner: "human".to_string(),
-        last_trace_path: None,
-        last_run_id: None,
-        cart_led_gen: 0,
-        cart_led_last_write_at: None,
-        cart_ap_seen_gen: 0,
-        cart_ap_settle_at_ms: 0,
-        cart_ap_done_gen: 0,
-        disk_ap_pending: false,
-        disk_ap_settle_at_ms: 0,
-        disk_ap_seen_hash: None,
-        disk_ap_done_hash: None,
-        autocapture_frames_since: 0,
-        recorder_frames_since: 0,
-        checkpoint_thumbs: std::collections::HashMap::new(),
-        checkpoint_thumb_order: std::collections::VecDeque::new(),
-        mon: MonitorState::new(),
-        flow: FlowTracker::new(),
-        stream_broke_on_jam: false,
-        force_present_frame: false,
-    }));
+    let state: SharedState = Arc::new(Mutex::new(build_state(session, streaming_on)));
 
     // The singleton live A/V stream hub (ADR-073): one pacing loop drives the
     // singleton machine and broadcasts BIN_VIC/BIN_AUDIO to all connected clients.

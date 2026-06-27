@@ -1,0 +1,291 @@
+# TRX64 FFI — Typed Swift API
+
+The `trx64-ffi` crate is the **typed uniffi façade** that lets a native Swift app
+(TRX64-App) embed the TRX64 runtime **in-process** — no daemon subprocess, no
+WebSocket. Every typed method is a thin wrapper over the SAME `dispatch()` the
+WebSocket daemon uses, so the typed Swift API **cannot drift** from the wire
+contract (the typed-binding definition is versioned here, in TRX64).
+
+- **Object**: `Runtime` (one machine per process, shared — Single-Path / One-Machine
+  contract).
+- **Errors**: every typed method `throws` a `Trx64Error` (no JSON error blobs).
+- **Events**: a typed `RuntimeEvent` stream via the `EventListener` callback.
+- **Escape hatch**: `call(method, paramsJson) -> String` covers every method not in
+  the typed surface → 100 % coverage.
+
+Swift names are uniffi's camelCase rendering of the Rust snake_case below.
+
+---
+
+## Construction
+
+| Method | Signature | Purpose |
+|--------|-----------|---------|
+| `Runtime(romDir:)` | `init(romDir: String) throws -> Runtime` | Boot a fresh singleton machine from ROMs in `romDir`; cold-reset to the reset vector, paused. |
+
+---
+
+## session
+
+| Method | Signature | Purpose |
+|--------|-----------|---------|
+| `createSession` | `(pal: Bool) throws -> SessionInfo` | Attach to the singleton session (the machine is built at construction; `create` always attaches). |
+| `state` | `() throws -> MachineState` | Full machine state: CPU regs, cycles, run-state, VIC, flow, vectors, SID. |
+| `reset` | `(cold: Bool) throws -> ResetResult` | `cold` = power-cycle (fresh DRAM); else warm (RAM preserved). Runs the KERNAL to READY. |
+| `screenshot` | `() throws -> Data` | PNG bytes of the current displayed frame (decoded from the handler's data URL). |
+
+## run / step
+
+| Method | Signature | Purpose |
+|--------|-----------|---------|
+| `run` | `() throws -> DebugState` | Flip run-state to running. |
+| `pause` | `() throws -> DebugState` | Pause (`stop.reason = "pause"`). |
+| `step` | `() throws -> MachineState` | Single-step one instruction; returns the new full state. |
+| `runCycles` | `(n: UInt64) throws -> RunResult` | Advance exactly `n` C64 cycles (may stop early on a breakpoint). |
+| `setPacing` | `(pacing: Pacing) throws -> DebugState` | Set pacing mode (`pal`/`warp`/`fixed-ratio`) + ratio. |
+
+## input
+
+| Method | Signature | Purpose |
+|--------|-----------|---------|
+| `keyDown` | `(key: String) throws` | Press a key (c64re key id, e.g. `"A"`, `"RETURN"`, `"RUN_STOP"`, `"L_SHIFT"`). |
+| `keyUp` | `(key: String) throws` | Release a key. |
+| `typeText` | `(text: String) throws -> TypeResult` | Type a PETSCII string through the keyboard matrix. |
+| `joystick` | `(port: UInt8, state: JoystickState) throws` | Set a port's joystick (all-false → release). |
+| `loadPrg` | `(bytes: Data) throws -> LoadResult` | Load a PRG into RAM (honours its 2-byte load-address header). Does not run. |
+| `runPrg` | `(bytes: Data) throws -> RunPrgResult` | Load + autostart (BASIC `RUN` for $0801, else JMP to load address). |
+
+## monitor
+
+| Method | Signature | Purpose |
+|--------|-----------|---------|
+| `monitorExec` | `(command: String) throws -> String` | Run one monitor-REPL command (`d`, `m`, `r`, `g`, `bk`, `obs`, `flow`, …); returns the output text. |
+
+## media
+
+| Method | Signature | Purpose |
+|--------|-----------|---------|
+| `mount` | `(path: String, slot: UInt8) throws -> MediaResult` | Mount a disk (.d64/.g64) or cartridge (.crt) from a host path. |
+| `swap` | `(path: String) throws -> MediaResult` | Swap the mounted disk (drive stays attached). |
+| `unmount` | `(slot: UInt8) throws -> UnmountResult` | Unmount the drive (slot 8). |
+| `recentMedia` | `() throws -> [MediaEntry]` | Recent-media list (newest-first, mount timestamps). |
+| `cartStatus` | `() throws -> CartStatus?` | Attached cartridge status, or `nil` when no cart. |
+
+## trace
+
+| Method | Signature | Purpose |
+|--------|-----------|---------|
+| `traceStart` | `(domains: [String]) throws -> TraceRun` | Start a capture-all trace over the given domains. |
+| `traceStop` | `() throws -> TraceStatus` | Stop the active trace; returns the finalized run status. |
+| `traceIndex` | `(path: String?) throws -> IndexResult` | Index a `.c64retrace` into DuckDB (`nil` = last finalized). |
+| `buildTraceFromRing` | `(start: UInt64, end: UInt64) throws -> TraceFile` | Build a `.c64retrace` (+ DuckDB) from a ring cycle-window. |
+
+## checkpoint / scrub
+
+| Method | Signature | Purpose |
+|--------|-----------|---------|
+| `checkpointCapture` | `() throws -> Checkpoint` | Capture a checkpoint into the in-memory ring. |
+| `checkpointRestore` | `(id: String, then: String, render: Bool) throws` | Restore a checkpoint; `then` = `pause`/`run`/`keep`; `render` re-presents the frame. |
+| `checkpointList` | `() throws -> [Checkpoint]` | List the ring's checkpoints. |
+| `thumbnails` | `() throws -> [Thumbnail]` | Scrub-filmstrip thumbnails (palette + indices) per checkpoint. |
+
+## reverse-debug
+
+| Method | Signature | Purpose |
+|--------|-----------|---------|
+| `reverseStep` | `(n: UInt64) throws -> ReverseResult` | Inspect-step backward `n` instructions over the reverse history. |
+| `whoWrote` | `(addr: UInt16, limit: UInt32) throws -> [Writer]` | Recent writers of `addr` (PC + cycle + old/new), most recent first. |
+| `crashTriage` | `() throws -> TriageChain` | Walk the crash cause chain from the live PC. |
+| `setReverseDepth` | `(seconds: UInt64) throws -> ReverseDepth` | Set the reverse-history depth in seconds (resizes the buffers). |
+
+## snapshot
+
+| Method | Signature | Purpose |
+|--------|-----------|---------|
+| `dump` | `(path: String) throws -> SnapshotInfo` | Dump a full machine snapshot (`.c64re`) to `path`. |
+| `undump` | `(path: String) throws -> SnapshotInfo` | Restore a machine snapshot from `path`. |
+
+## events
+
+| Method | Signature | Purpose |
+|--------|-----------|---------|
+| `setListener` | `(listener: EventListener)` | Register a typed event listener (replaces any existing). |
+| `clearListener` | `()` | Detach the listener (stops the forwarder thread). |
+
+## escape hatch
+
+| Method | Signature | Purpose |
+|--------|-----------|---------|
+| `call` | `(method: String, paramsJson: String) -> String` | Raw JSON-RPC: any method + params-object string → full JSON-RPC response string. Errors are returned in the JSON, not thrown. |
+
+---
+
+## Result structs (uniffi records)
+
+### SessionInfo
+`sessionId: String`, `mode: String`, `diskPath: String`, `attached: Bool`,
+`c64Cycles: UInt64`, `pc: UInt32`, `trace: TraceRun?`
+
+### MachineState
+`c64Cycles: UInt64`, `driveCycles: UInt64`, `mode: String`,
+`runState: String` ("running"|"paused"), `cpu: CpuState`, `vic: VicState`,
+`flow: FlowState`, `vectors: Vectors`, `sid: SidState`, `stopReason: String?`
+
+- **CpuState** — `pc, a, x, y, sp, flags: UInt32`, `cycles: UInt64`
+- **VicState** — `rasterLine, rasterCycle, mode, bank, screenPtr, chargenPtr, bitmapPtr, border, background: UInt32`
+- **FlowState** — `focus: String`, `current: String`
+- **Vectors** — `irq, nmi, cinv, cbinv: UInt32`
+- **SidState** — `regs: [UInt32]`, `streaming: Bool`
+
+### ResetResult
+`c64Cycles: UInt64`, `pc: UInt32`, `mode: String` ("cold"|"soft")
+
+### Pacing (input)
+`mode: String` ("pal"|"warp"|"fixed-ratio"), `ratio: Double`
+
+### DebugState
+`runState: String`, `pacing: PacingState`, `pc: UInt32`, `cycles: UInt64`,
+`frame: UInt64`, `breakpoints: [BreakpointInfo]`, `stop: StopInfo?`,
+`controlOwner: String`
+
+- **PacingState** — `mode: String`, `ratio: Double`
+- **BreakpointInfo** — `num: UInt32`, `addr: UInt32`
+- **StopInfo** — `reason: String`, `pc: UInt32`, `cycles: UInt64`
+
+### RunResult
+`c64Cycles: UInt64`, `breakpoint: RunBreakpoint?`
+- **RunBreakpoint** — `pc: UInt32`, `num: UInt32`
+
+### TypeResult
+`c64Cycles: UInt64`, `queued: UInt64`
+
+### JoystickState (input)
+`up, down, left, right, fire: Bool`
+
+### LoadResult
+`loadAddress: UInt32`, `endAddress: UInt32`, `bytesLoaded: UInt64`, `path: String`
+
+### RunPrgResult
+`loadAddress: UInt32`, `action: String`
+
+### MediaResult
+`mountedPath: String`, `type: String` ("d64"|"g64"|"crt"), `sha256: String`,
+`paused: Bool`, `slot: UInt32?` (disk), `mapperType: String?` (cart)
+
+### UnmountResult
+`ok: Bool`, `paused: Bool`, `wasRunning: Bool`
+
+### MediaEntry
+`path: String`, `name: String`, `type: String`, `mountedAt: String?`
+
+### CartStatus
+`type: String`, `bank: UInt32`, `activity: String` ("write"|"read"|"idle"),
+`booted: Bool`, `sourceName: String?`
+
+### TraceRun
+`runId: String`, `definitionId: String`, `definitionVersion: Int64`,
+`cycleStart: UInt64`, `eventCount: UInt64`, `bytesWritten: UInt64?`,
+`media: TraceMedia?`
+- **TraceMedia** — `sha256: String`, `sourceName: String`
+
+### TraceStatus
+`run: TraceRun`, `status: String`, `index: IndexResult?`
+
+### IndexResult
+`duckdbPath: String`, `eventsIndexed: UInt64`, `bounded: Bool`,
+`boundedFrom: UInt64?`, `cap: UInt64?`, `indexedFromOldest: Bool`
+
+### TraceFile
+`retracePath: String`, `duckdbPath: String`, `eventsEncoded: UInt64`
+
+### Checkpoint
+`id: String`, `frame: UInt64`, `cycles: UInt64`, `pinned: Bool`
+
+### Thumbnail
+`id: String`, `cycles: UInt64`, `frame: UInt64`, `pinned: Bool`,
+`width: UInt32`, `height: UInt32`, `palette: String` (b64 RGB),
+`indices: String` (b64 indices)
+
+### ReverseResult
+`stepsTaken: UInt64`, `pc, a, x, y, sp, p: UInt32`, `cycle: UInt64`,
+`undoneWrites: [UndoneWrite]`, `inspectOnly: Bool`, `note: String`
+- **UndoneWrite** — `addr, old, new: UInt32`
+
+### Writer
+`pc: UInt32`, `cycle: UInt64`, `addr, old, new: UInt32`
+
+### TriageChain
+`lines: [String]`
+
+### ReverseDepth
+`seconds: UInt64`, `deltaEntryCapacity: UInt64`, `deltaWriteCapacity: UInt64`,
+`cpuHistoryCapacity: UInt64`, `estimatedRamMb: Double`,
+`discardedHistory: Bool`, `note: String`, `warning: String?`
+
+### SnapshotInfo
+`path: String`, `cycle: UInt64`, `pc: UInt32`, `machine: String`,
+`media: [SnapshotMedia]`, `breakpoints: UInt64`, `fileBytes: UInt64?` (dump only)
+- **SnapshotMedia** — `role: String`, `format: String`, `sourceName: String`, `sha256: String`, `bytes: UInt64`
+
+---
+
+## RuntimeEvent (enum)
+
+Delivered to `EventListener.onEvent(event:)`. Every known `NotifyHub` broadcast
+maps to a typed variant; anything else (and future events) falls through to
+`other` with the raw method + params JSON, so nothing is dropped.
+
+| Variant | Associated values | Source broadcast |
+|---------|-------------------|------------------|
+| `frameAvailable` | `sessionId: String, frame: UInt64, c64Cycles: UInt64` | `session/frame_available` |
+| `running` | `sessionId: String` | `debug/running` |
+| `paused` | `sessionId: String, reason: String, pc: UInt32, cycles: UInt64` | `debug/paused` |
+| `stopped` | `sessionId: String, reason: String, pc: UInt32, cycles: UInt64` | `debug/stopped` |
+| `breakpointHit` | `sessionId: String, pc: UInt32, num: UInt32` | `debug/breakpoint_hit` |
+| `observerHit` | `sessionId: String, name: String` | `debug/observer_hit` |
+| `observerLog` | `sessionId: String, message: String` | `debug/observer_log` |
+| `checkpointRestored` | `sessionId: String, id: String` | `debug/checkpoint_restored` |
+| `controlChanged` | `sessionId: String, controlOwner: String` | `debug/control` |
+| `audioFlush` | `sessionId: String` | `audio/flush` |
+| `mediaChanged` | `sessionId: String` | `media/cart_persisted` |
+| `batchProgress` | `paramsJson: String` | `batch/progress` |
+| `other` | `method: String, paramsJson: String` | (any other / future) |
+
+### EventListener (callback interface)
+```swift
+protocol EventListener: AnyObject {
+    func onEvent(event: RuntimeEvent)
+}
+```
+
+How it's wired: `setListener` subscribes a channel to the daemon's single
+`NotifyHub` (the same hub the WebSocket transport fans notifications through). A
+dedicated forwarder thread block-drains the channel, parses each JSON-RPC
+notification envelope, maps it to a typed `RuntimeEvent`, and calls `onEvent`. The
+subscription + thread are owned by the `Runtime`; `clearListener` (or dropping the
+`Runtime`) stops and joins the thread, so the Swift callback always outlives every
+`onEvent` call.
+
+---
+
+## Trx64Error (error enum)
+
+Thrown by every typed method.
+
+| Variant | Fields | Meaning |
+|---------|--------|---------|
+| `boot` | `message: String` | Runtime could not be constructed (e.g. ROMs not found). |
+| `dispatch` | `code: Int64, message: String` | A JSON-RPC handler returned an error. |
+| `decode` | `message: String` | The handler's JSON did not match the typed shape (façade bug / contract change); includes the raw JSON. |
+| `invalidArgument` | `message: String` | Bad caller argument (e.g. un-decodable base64). |
+
+---
+
+## Coverage note
+
+The typed surface covers the App-UI workflows (session / run / input / monitor /
+media / trace / checkpoint / reverse-debug / snapshot / events). The full TRX64
+JSON-RPC surface is far larger; everything not typed above is reachable verbatim
+through `call(method:paramsJson:)`, which returns the raw JSON-RPC response string.
+Because both paths funnel through the one `dispatch()`, the typed methods and the
+escape hatch can never disagree with the WebSocket daemon.

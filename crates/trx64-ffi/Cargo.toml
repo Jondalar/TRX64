@@ -1,0 +1,31 @@
+[package]
+name = "trx64-ffi"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Typed uniffi bindings — embed TRX64 in-process in a native Swift app."
+
+# uniffi needs the library compiled as a C-ABI shared/static object (the Swift app
+# links the staticlib into its XCFramework). `lib` keeps it usable from Rust tests +
+# the bundled uniffi-bindgen binary; `cdylib` is the runtime form for bindgen.
+[lib]
+name = "trx64_ffi"
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[dependencies]
+# The runtime, as a linkable library — the typed façade calls dispatch() + NotifyHub
+# from this SAME compilation unit the WS daemon uses, so the typed API cannot drift.
+trx64-daemon = { path = "../trx64-daemon" }
+
+# Typed bindings generator (proc-macro `#[uniffi::export]` style, current uniffi).
+uniffi = { version = "0.31", features = ["cli"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+
+# Same versions as trx64-daemon so the NotifyHub channel types (mpsc sender +
+# tungstenite `Message`) are IDENTICAL across the crate boundary — the FFI
+# subscribes its forwarder channel directly to the daemon's hub.
+tokio = { version = "1", features = ["sync", "rt"] }
+tokio-tungstenite = { version = "0.24", features = [] }
