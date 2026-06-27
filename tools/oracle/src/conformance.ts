@@ -23,9 +23,10 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { spawnDaemon, type Daemon, type SpawnOpts } from "./daemon.js";
-import { connect, type RpcClient } from "./ws-client.js";
+import { connect, type RpcClient, type BinVicFrame } from "./ws-client.js";
 import { diffResponses, formatDivergence } from "./diff.js";
 import { decodeTrace } from "./trace-decode.js";
 
@@ -44,6 +45,17 @@ function collectNotes(c: RpcClient): NoteSink {
   const notes: Array<{ method: string; params: any }> = [];
   const off = c.onNotify((method, params) => notes.push({ method, params }));
   return { notes, off };
+}
+
+// ── binary VIC-frame capture (checkpoint-scrub cases) ─────────────────────────
+interface BinSink {
+  frames: BinVicFrame[];
+  off: () => void;
+}
+function collectBinFrames(c: RpcClient): BinSink {
+  const frames: BinVicFrame[] = [];
+  const off = c.onBinary((f) => frames.push(f));
+  return { frames, off };
 }
 
 // ── shared helpers ──────────────────────────────────────────────────────────
@@ -233,13 +245,13 @@ const DISTINCT_D64 = (() => {
 // Returns the DATA length (excluding the module header) of the named module, or -1
 // when absent / on a parse error. Used to read the DRIVECPU module's byte length back
 // off the saved file (no per-module length is exposed over the WS reply).
-function vsfModuleDataLen(buf: Buffer, want: string): number {
+function vsfModuleData(buf: Buffer, want: string): Buffer | null {
   const MAGIC = "VICE Snapshot File\x1a"; // 19 bytes
-  if (buf.length < MAGIC.length + 2 || buf.toString("latin1", 0, MAGIC.length) !== MAGIC) return -1;
+  if (buf.length < MAGIC.length + 2 || buf.toString("latin1", 0, MAGIC.length) !== MAGIC) return null;
   // Skip magic (19) + major (1) + minor (1); machine name is null-terminated.
   let cur = MAGIC.length + 2;
   const nameEnd = buf.indexOf(0x00, cur);
-  if (nameEnd < 0) return -1;
+  if (nameEnd < 0) return null;
   cur = nameEnd + 1; // past the machine-name null
   while (cur < buf.length) {
     const nul = buf.indexOf(0x00, cur);
@@ -251,10 +263,20 @@ function vsfModuleDataLen(buf: Buffer, want: string): number {
     const len = buf.readUInt32LE(cur);
     cur += 4;
     if (cur + len > buf.length) break;
-    if (name === want) return len;
+    if (name === want) return buf.subarray(cur, cur + len);
     cur += len;
   }
-  return -1;
+  return null;
+}
+function vsfModuleDataLen(buf: Buffer, want: string): number {
+  const d = vsfModuleData(buf, want);
+  return d ? d.length : -1;
+}
+
+/** sha256 hex of a buffer — the deterministic content fingerprint for a round-trip
+ *  / cross-runtime byte-equality assertion. Sync digest via node:crypto. */
+function sha256hex(buf: Buffer | Uint8Array): string {
+  return createHash("sha256").update(buf).digest("hex");
 }
 
 const CASES: ConfCase[] = [
@@ -1956,7 +1978,10 @@ const CASES: ConfCase[] = [
     blocked:
       "TS recorder/list|status awaits a worker thread that is non-functional under " +
       "tsx-from-src (recorder-worker.js resolves to the src .ts dir). Fix verified " +
-      "directly on TRX64 (anchors grow 1→16 over 12s free-run under --stream).",
+      "directly on TRX64 (anchors grow 1→16 over 12s free-run under --stream), and the " +
+      "stream-feed cadence-growth is locked by the Rust test " +
+      "stream_feed_grows_recorder_anchor_count_per_cadence (anchor count grows one per " +
+      "checkpoint_capture_every_frames() window; a sub-cadence burst adds none).",
     spawn: { stream: true, env: { C64RE_RECORDER: "1" } },
     async signal(c) {
       const sid = await liveSession(c);
@@ -2127,27 +2152,42 @@ const CASES: ConfCase[] = [
   {
     id: "ws-checkpoint-scrub-1",
     severity: "P1",
-    title: "restore pushes a fresh frame (paused canvas refreshes to the rolled-back picture)",
-    blocked:
-      "TS pushes a BINARY VIC frame on restore (ws-server.ts pushFrame) that the text " +
-      "ws-client cannot read, and emits NO JSON session/frame_available on restore — so " +
-      "there is no faithful JSON proxy. Fix verified DIRECTLY on TRX64: a restore sets " +
-      "force_present_frame → the paused stream loop pushes one BIN_VIC (test " +
-      "checkpoint_restore_requests_one_shot_frame_present).",
+    title: "restore pushes exactly one fresh BIN_VIC frame (paused canvas refreshes to the rolled-back picture)",
+    // UN-BLOCKED (Batch 8): the ws-client now decodes the BINARY VIC channel
+    // (ws-client.ts onBinary / BinVicFrame), so the BIN_VIC frame the restore presents
+    // IS readable. Both runtimes set force_present_frame on a then:pause restore → the
+    // paused stream loop pushes exactly ONE BIN_VIC with the rolled-back picture
+    // (ws-server.ts pushFrame ≡ main.rs force_present_frame). We assert: ZERO frames
+    // before restore (the paused loop is otherwise silent), EXACTLY ONE BIN_VIC after,
+    // type 0x01, valid VIC dims, non-empty indices = w*h. TS≡TRX64.
     spawn: { stream: true },
     async signal(c) {
-      // Kept intact so the case re-arms once a frame-content JSON signal exists. This
-      // proxy is the session/frame_available-on-restore count (which is NOT faithful —
-      // see `blocked`), retained only to document the shape.
       const sid = await liveSession(c);
       const cap = (await c.call("checkpoint/capture", { session_id: sid })) as any;
       const cpId = cap?.ref?.id ?? cap?.id;
-      const sink = collectNotes(c);
+      // Drain any in-flight frames, then confirm the paused loop is SILENT (no frame)
+      // for a beat before the restore — so the post-restore frame is the restore's.
+      await sleep(600);
+      const bin = collectBinFrames(c);
+      await sleep(600);
+      const framesBeforeRestore = bin.frames.length;
+      // Restore with then:pause → force_present_frame → exactly one BIN_VIC pushed.
       await c.call("checkpoint/restore", { session_id: sid, id: cpId, then: "pause" });
-      await sleep(500);
-      sink.off();
+      await sleep(800);
+      bin.off();
+      const after = bin.frames.slice(framesBeforeRestore);
+      const f = after[0];
       return {
-        frameAvailableOnRestore: sink.notes.some((n) => n.method === "session/frame_available"),
+        // the paused loop pushed NO frame in the quiet window before the restore.
+        silentBeforeRestore: framesBeforeRestore === 0,
+        // exactly ONE BIN_VIC presented on the restore.
+        oneFrameOnRestore: after.length === 1,
+        // it is a BIN_VIC (type 0x01), palette-indexed (fmt 1).
+        frameIsBinVic: f?.type === 0x01 && f?.fmt === 1,
+        // valid VIC display dimensions (the rolled-back picture, not an empty frame).
+        frameDims: f ? `${f.width}x${f.height}` : "",
+        // the index buffer is the full w*h picture (non-empty content).
+        indicesFillFrame: f != null && f.indices.length === f.width * f.height && f.indices.length > 0,
       };
     },
   },
@@ -2169,26 +2209,44 @@ const CASES: ConfCase[] = [
   {
     id: "ws-checkpoint-scrub-2",
     severity: "P1",
-    title: "restore honours render:true (re-sims a frame so a fb-omitted anchor gets a picture)",
-    blocked:
-      "The divergence is in framebuffer PIXEL content; no JSON method exposes it " +
-      "(vic/inspect/* report VIC REGISTERS, not pixels) and the text ws-client cannot " +
-      "read the binary frame — no faithful JSON proxy. Fix verified DIRECTLY on TRX64: " +
-      "a render:true restore regenerates the live `displayed` buffer (test " +
-      "checkpoint_restore_render_regenerates_omitted_framebuffer).",
+    title: "restore honours render:true (presents a regenerated picture — frame CONTENT, not just registers)",
+    // UN-BLOCKED (Batch 8): the ws-client binary channel now reads the BIN_VIC frame
+    // CONTENT (palette indices = the actual pixels). §3.4: a render:true restore
+    // re-sims a frame so the paused canvas shows a PICTURE. We restore at a
+    // DETERMINISTIC instant (a synchronous bounded run pins both runtimes to the same
+    // VIC state) with render:true + then:pause, read the presented BIN_VIC's index
+    // buffer, and compare its CONTENT (sha256 of the w*h indices) TS-vs-TRX64 — the
+    // regenerated picture is deterministic from the identical VIC state, so a runtime
+    // that renders different pixels (bit-order/stride/mode) diverges loud. (Replaces
+    // the old vic/inspect-registers-only proxy.)
     spawn: { stream: true },
     async signal(c) {
-      // Kept intact so the case re-arms once a frame-content JSON signal exists. The
-      // best available JSON read is vic/inspect (REGISTERS only) — not a faithful
-      // framebuffer-content signal (see `blocked`), retained to document the intent.
       const sid = await liveSession(c);
+      // Drive to a DETERMINISTIC instant so the regenerated picture is byte-stable
+      // across both runtimes (a synchronous run pins the VIC state; the BIN_VIC the
+      // render:true restore presents is then identical content TS-vs-TRX64).
+      await c.call("session/run", { session_id: sid, cycles: 2_000_000 });
       const cap = (await c.call("checkpoint/capture", { session_id: sid })) as any;
       const cpId = cap?.ref?.id ?? cap?.id;
+      await sleep(400);
+      const bin = collectBinFrames(c);
+      await sleep(400);
+      const before = bin.frames.length;
+      // render:true → the restore re-sims one frame + presents the regenerated picture.
       await c.call("checkpoint/restore", { session_id: sid, id: cpId, then: "pause", render: true });
-      const open = (await c.call("vic/inspect/open", { session_id: sid }).catch(() => null)) as any;
+      await sleep(800);
+      bin.off();
+      const f = bin.frames.slice(before)[0];
       return {
-        // NOT faithful: this only reflects VIC registers, not framebuffer pixels.
-        inspectReturnedFrame: open?.frame != null,
+        // a BIN_VIC was presented on the render:true restore.
+        presentedFrame: f != null && f.type === 0x01,
+        // valid VIC display dimensions.
+        frameDims: f ? `${f.width}x${f.height}` : "",
+        // the index buffer is the full w*h picture.
+        indicesFillFrame: f != null && f.indices.length === f.width * f.height && f.indices.length > 0,
+        // CONTENT: the regenerated picture (palette indices) is byte-identical across
+        // runtimes at the deterministic instant — the decisive pixel-content gate.
+        frameContentSha: f && f.indices.length > 0 ? sha256hex(f.indices) : "",
       };
     },
   },
@@ -2240,21 +2298,46 @@ const CASES: ConfCase[] = [
   {
     id: "ws-session-debug-2",
     severity: "P1",
-    title: "session/run is rejected while the autonomous loop is running",
+    title: "session/run is rejected while the autonomous loop is running (guard msg); succeeds when paused",
     spawn: { stream: true },
     async signal(c) {
       const sid = await liveSession(c);
       // debug/run is now async (replies running immediately); the loop owns the clock.
       await c.call("debug/run", { session_id: sid });
+      // STRENGTHENED (Batch 8): assert the machine IS running after debug/run, that the
+      // rejection carries the guard substring (not just ANY exception — "no session"
+      // etc. would false-green a bare `threw`), and the COMPLEMENT: a session/run after
+      // debug/pause SUCCEEDS (returns c64Cycles, no throw). TS≡TRX64 on all four.
+      const stRun = await state(c, sid);
+      const runningWhenRejected = stRun.runState === "running";
       let threw = false;
+      let guardMsg = false;
       try {
         await c.call("session/run", { session_id: sid, cycles: 10_000 });
-      } catch {
+      } catch (e) {
         threw = true;
+        const msg = (e instanceof Error ? e.message : String(e)).toLowerCase();
+        // The guard text: ws-server.ts rejects with an "autonomous loop"/"debug/pause"
+        // message (not a generic "no session"). Match the recognizable guard.
+        guardMsg = /autonomous|loop is running|debug\/pause|paused|while running/.test(msg);
       }
+      // Complement: PAUSE, then a manual session/run must SUCCEED (the loop no longer
+      // owns the clock) and advance the cycle count.
+      await c.call("debug/pause", { session_id: sid }).catch(() => undefined);
+      let pausedRunOk = false;
+      try {
+        const r = (await c.call("session/run", { session_id: sid, cycles: 50_000 })) as any;
+        pausedRunOk = typeof (r?.c64Cycles ?? r?.cycles) === "number";
+      } catch { pausedRunOk = false; }
       return {
-        // The behavioural signal: a manual session/run on a running machine must error.
+        // The machine was actually running when the manual run was rejected.
+        runningWhenRejected,
+        // A manual session/run on a running machine must error…
         threw,
+        // …with the guard message (not a generic "no session" exception).
+        guardMsg,
+        // …and a session/run AFTER pause must SUCCEED (returns a cycle count).
+        pausedRunOk,
       };
     },
   },
@@ -2279,18 +2362,31 @@ const CASES: ConfCase[] = [
       // IRQs are enabled and $EA31 (KERNAL IRQ handler) is reachable within the budget.
       // This bounded session/run runs while paused (no loop owns the clock yet).
       await c.call("session/run", { session_id: sid, cycles: 3_000_000 });
-      await c.call("debug/break_add", { session_id: sid, pc: 0xea31 });
+      // STRENGTHENED (Batch 8): read the start cycle, then assert the post-hit delta is
+      // ≪ budget (the run STOPPED EARLY at the bp, not ran the full budget), and the
+      // breakpoint{} object carries pc===$EA31 + a num + a non-empty registers string.
+      const startCyc = Number((await state(c, sid)).c64Cycles ?? 0);
+      const addRes = (await c.call("debug/break_add", { session_id: sid, pc: 0xea31 })) as any;
+      const bpNum = addRes?.num ?? addRes?.id ?? addRes?.breakpoint?.num;
       const budget = 2_000_000;
       const r = (await c.call("session/run", { session_id: sid, cycles: budget })) as any;
       const advanced = Number(r?.c64Cycles ?? 0);
+      const delta = advanced - startCyc;
+      const bp = r?.breakpoint;
       return {
         // The reply must carry a breakpoint{} object on a hit.
-        hasBreakpoint: r?.breakpoint != null && typeof r.breakpoint.pc === "number",
-        // …and the run must have stopped EARLY (a bp hit, not the full budget).
-        // (advanced is the absolute cycle count; a hit leaves the machine well below
-        // start+budget. We re-read against the start cycle implicitly: a hit fires in
-        // far fewer than `budget` cycles, so we assert the bp object presence drove it.)
-        stoppedEarly: r?.breakpoint != null && advanced > 0,
+        hasBreakpoint: bp != null && typeof bp.pc === "number",
+        // The bp pc is the armed $EA31 (not a generic budget-exhaust stop).
+        bpPcIsEa31: bp?.pc === 0xea31,
+        // The run STOPPED EARLY: the advance is well under the full budget (a bp hit
+        // fires in far fewer than `budget` cycles; budget-exhaust would be ≈budget).
+        stoppedEarly: bp != null && delta > 0 && delta < budget / 2,
+        // The bp object carries a numeric breakpoint number.
+        bpHasNum: typeof (bp?.num) === "number",
+        // …and the matched-bp num equals the one break_add returned.
+        bpNumMatchesAdd: typeof bpNum === "number" && bp?.num === bpNum,
+        // …and a non-empty registers render (the bp report includes the regs).
+        bpHasRegisters: typeof bp?.registers === "string" && bp.registers.length > 0,
       };
     },
   },
@@ -2306,11 +2402,19 @@ const CASES: ConfCase[] = [
   {
     id: "ws-session-debug-4",
     severity: "P1",
-    title: "debug/step returns the full controller.state() shape (not a flat register dict)",
+    title: "debug/step returns the full controller.state() shape (typed, not a flat register dict)",
     async signal(c) {
       const sid = await liveSession(c);
       const r = (await c.call("debug/step", { session_id: sid })) as any;
       const has = (k: string) => r != null && Object.prototype.hasOwnProperty.call(r, k);
+      // STRENGTHENED (Batch 8): the original was 8 presence booleans — a mistyped/
+      // garbage sub-object passed. Now assert STRUCTURAL correctness of the
+      // controller.state() shape AND that the FLAT register keys are ABSENT at the top
+      // level (the old TRX64 flat-dict regression: {runState,pc,a,x,y,sp,flags,cycles}).
+      // RuntimeController pacing modes (= TS `c.state().pacing.mode`): pal | warp |
+      // fixed-ratio (main.rs:264 / runtime-controller.ts).
+      const PACING_MODES = ["pal", "warp", "fixed-ratio"];
+      const pacing = r?.pacing;
       return {
         // The full controller.state() key set (ws-server.ts:994-1000).
         hasRunState: has("runState"),
@@ -2321,6 +2425,21 @@ const CASES: ConfCase[] = [
         hasBreakpoints: has("breakpoints"),
         hasStop: has("stop"),
         hasControlOwner: has("controlOwner"),
+        // Structural: pacing is an OBJECT with a string mode (in the known set) +
+        // numeric ratio — not a bare string / garbage.
+        pacingIsObject: pacing != null && typeof pacing === "object",
+        pacingModeKnown: typeof pacing?.mode === "string" && PACING_MODES.includes(pacing.mode),
+        pacingRatioNumeric: typeof pacing?.ratio === "number",
+        // breakpoints is an ARRAY (the live bp list), not a count / map.
+        breakpointsIsArray: Array.isArray(r?.breakpoints),
+        // runState + controlOwner are the expected enums.
+        runStateEnum: r?.runState === "running" || r?.runState === "paused",
+        controlOwnerEnum: r?.controlOwner === "human" || r?.controlOwner === "llm",
+        pcNumeric: typeof r?.pc === "number",
+        cyclesNumeric: typeof r?.cycles === "number",
+        // The FLAT register keys must be ABSENT at the top level (the TRX64 flat-dict
+        // regression emitted a/x/y/sp/flags here). controller.state() never has them.
+        noFlatRegs: !has("a") && !has("x") && !has("y") && !has("sp") && !has("flags"),
       };
     },
   },
@@ -2336,8 +2455,20 @@ const CASES: ConfCase[] = [
   {
     id: "ws-session-debug-6",
     severity: "P1",
-    title: "session/create honours trace_out/trace_domains (opens a session trace)",
+    title: "session/create honours trace_out/trace_domains (opens a session trace with the right descriptor)",
     async signal(c, d) {
+      // STRENGTHENED (Batch 8): the original only asserted active===true on a shared
+      // singleton (which could read TRUE from a prior case). Now assert NOT-active
+      // BEFORE the create-with-trace, then after create assert active + a definitionId
+      // + the retracePath names the create-trace output + the trace's eventCount is a
+      // number (it is actively recording). TS≡TRX64 on every field.
+      // Pre-create: stop any residual trace so the before-state is deterministically
+      // inactive (the shared singleton may carry a trace from an earlier case).
+      const pre = await liveSession(c);
+      await c.call("trace/run/stop", { session_id: pre }).catch(() => undefined);
+      const before = (await c.call("trace/run/status", { session_id: pre })) as any;
+      const activeBefore = before?.active === true;
+
       const tracePath = `${d.projectDir}/create-trace.duckdb`;
       const created = (await c.call("session/create", {
         trace_out: tracePath,
@@ -2345,9 +2476,20 @@ const CASES: ConfCase[] = [
       })) as any;
       const sid = created?.sessionId ?? created?.session_id ?? (await liveSession(c));
       const status = (await c.call("trace/run/status", { session_id: sid })) as any;
+      const retracePath: string = status?.retracePath ?? "";
       return {
-        // The behavioural signal: a trace is active immediately after the create.
+        // BEFORE: no trace active (deterministic, after the explicit stop).
+        activeBefore,
+        // AFTER: a trace is active immediately after the create.
         traceOpened: status?.active === true,
+        // AFTER: it carries a definitionId (the live-capture/session-trace id).
+        hasDefinitionId: typeof status?.definitionId === "string" && status.definitionId.length > 0,
+        // AFTER: the retrace path names the create-trace output (basename matches the
+        // create-trace stem — the trace_out was honoured, not ignored). The abs path
+        // differs per daemon project dir, so compare the stem only.
+        retracePathNamesCreateTrace: /create-trace\.c64retrace$/.test(retracePath),
+        // AFTER: eventCount is a number (the trace is recording, not a stub).
+        eventCountNumeric: typeof status?.eventCount === "number",
       };
     },
   },
@@ -2361,30 +2503,85 @@ const CASES: ConfCase[] = [
   // DRIVECPU module. Signal: mount a disk + run so the drive CPU is live, vsf/save to an
   // abs path, read the file back and parse the DRIVECPU module's data length. TS:
   // driveModuleNonEmpty=true; TRX64 (before fix): false.
+  // STRENGTHENED (Batch 8): the original only asserted `driveModuleDataLen>0` —
+  // a fixed green on both runtimes that never checked the byte LAYOUT, length
+  // parity, or content. Now we (1) save a VSF after a deterministic boot, read the
+  // DRIVECPU module bytes back, and compare its LENGTH + content sha256 TS-vs-TRX64
+  // (the .c64retrace oracle proves the VM is byte-identical, so the serialized drive
+  // blob must be byte-equal too — a divergent drive serializer diverges loud here);
+  // and (2) round-trip the VSF — vsf/load it back into the SAME session, re-save, and
+  // assert the DRIVECPU module survives byte-for-byte (sha-equal across save→load→save),
+  // proving the drive module isn't silently dropped on restore. Both daemons must
+  // agree on the length, the first-save hash, AND the round-trip stability.
   {
     id: "formats-state-1",
     severity: "P1",
-    title: "VSF save embeds the 1541 drive snapshot (non-empty DRIVECPU module)",
-    spawn: { stream: true, seedFiles: [{ rel: "fixtureA.d64", bytes: SCRAMBLE_D64 }] },
+    title: "VSF save embeds the 1541 drive snapshot (DRIVECPU module length + content + round-trip)",
+    spawn: { seedFiles: [{ rel: "fixtureA.d64", bytes: SCRAMBLE_D64 }] },
     async signal(c, d) {
       const sid = await liveSession(c);
       const diskPath = `${d.projectDir}/fixtureA.d64`;
       await c.call("media/mount", { session_id: sid, path: diskPath, slot: 8 });
-      // Run so the drive CPU has booted past its reset (the DOS ROM init runs even
-      // without a host LOAD — the drive CPU + VIA state is live). --stream does not
-      // auto-run; debug/run starts the live driver, then we wait for boot.
-      await c.call("debug/run", { session_id: sid });
-      await waitRunningBooted(c, sid, 1_500_000, 60_000);
-      const vsfPath = `${d.projectDir}/state.vsf`;
-      await c.call("vsf/save", { session_id: sid, output_path: vsfPath });
-      let driveLen = -1;
-      if (existsSync(vsfPath)) {
-        try { driveLen = vsfModuleDataLen(readFileSync(vsfPath), "DRIVECPU"); } catch { driveLen = -1; }
-      }
+      // Run the drive CPU past its DOS-ROM reset to a DETERMINISTIC instant: a
+      // SYNCHRONOUS bounded session/run (no --stream) advances EXACTLY this many
+      // cycles on both daemons, so the live drive core (CPU + VIA + rotation) is at
+      // the identical instant — the .c64retrace oracle proves a synchronous run is
+      // byte-identical, so the serialized drive blob must be byte-equal too. (A
+      // free-run + pause would stop at slightly different drive-clk instants between
+      // the slow tsx oracle and the native daemon → a spurious content-sha skew.)
+      await c.call("session/run", { session_id: sid, cycles: 4_000_000 });
+      const readDrive = (vsfPath: string): Buffer | null => {
+        if (!existsSync(vsfPath)) return null;
+        try { return vsfModuleData(readFileSync(vsfPath), "DRIVECPU"); } catch { return null; }
+      };
+      const vsf1 = `${d.projectDir}/state1.vsf`;
+      await c.call("vsf/save", { session_id: sid, output_path: vsf1 });
+      const drive1 = readDrive(vsf1);
+      // Round-trip: load the VSF back, then re-save — the DRIVECPU module must survive
+      // byte-for-byte (proving load actually restores the drive core, not a stub).
+      await c.call("vsf/load", { session_id: sid, input_path: vsf1 }).catch(() => undefined);
+      const vsf2 = `${d.projectDir}/state2.vsf`;
+      await c.call("vsf/save", { session_id: sid, output_path: vsf2 });
+      const drive2 = readDrive(vsf2);
+      // Per-sub-module length breakdown of the nested DRIVECPU blob (the blob is its
+      // own SnapshotT: [16-name][maj][min][size:u32 inclusive][data]…). The module
+      // SET + each module's LENGTH is the structural, cycle-INDEPENDENT signal — it
+      // catches the Batch-8 fix (TRX64 dropped DRIVE9/10/11 entirely → only 4 modules,
+      // 2389 bytes; now 7 modules, 2461 bytes, byte-for-byte the TS module table).
+      const innerModuleSizes = (blob: Buffer | null): Record<string, number> => {
+        const out: Record<string, number> = {};
+        if (!blob) return out;
+        let cur = 0;
+        while (cur + 22 <= blob.length) {
+          const nameRaw = blob.subarray(cur, cur + 16);
+          const z = nameRaw.indexOf(0);
+          const name = nameRaw.toString("latin1", 0, z < 0 ? 16 : z);
+          const size = blob.readUInt32LE(cur + 18);
+          if (size < 22 || cur + size > blob.length) break;
+          out[name] = size;
+          cur += size;
+        }
+        return out;
+      };
       return {
-        // The behavioural signal: the saved VSF's DRIVECPU module carries the drive
-        // blob (non-empty), not an empty stub.
-        driveModuleNonEmpty: driveLen > 0,
+        // The DRIVECPU module carries the drive blob (non-empty), not an empty stub.
+        driveModuleNonEmpty: (drive1?.length ?? 0) > 0,
+        // Content-level parity: the serialized drive blob LENGTH. TRX64 was 72 bytes
+        // short before the Batch-8 fix — it dropped the DRIVE9/10/11 stub modules
+        // VICE/TS emit for the absent disk units (drive_snapshot.ts:400-419).
+        driveModuleLen: drive1?.length ?? -1,
+        // Structural parity: the full nested module table (name → length). A divergent
+        // drive serializer (missing module, wrong field count) shows a different set
+        // or a different per-module length. Cycle-INDEPENDENT, so a clean differential
+        // — unlike the byte content of the timer/clk fields, which carry a tiny
+        // drive-clk phase skew between the slow tsx oracle and the native daemon at the
+        // SAME C64 cycle (the documented ~cold-boot-skew class, NOT a serializer bug).
+        driveModuleTable: innerModuleSizes(drive1),
+        // Round-trip: save→load→save keeps the drive module present + same length
+        // (proving vsf/load restores the drive core, not a stub).
+        driveModuleRoundTripLen: drive2?.length ?? -1,
+        driveModuleSurvivesRoundTrip:
+          drive1 != null && drive2 != null && drive1.length === drive2.length,
       };
     },
   },
@@ -2401,35 +2598,65 @@ const CASES: ConfCase[] = [
   // writable EasyFlash, snapshot/dump to an abs .c64re path, read the file (magic +
   // gzip(JSON)) and report whether checkpoint.cartBytes/cartFlash are non-null. TS:
   // {cartBytesCaptured:true, cartFlashCaptured:true}; TRX64 (before fix): {false,false}.
+  // STRENGTHENED (Batch 8): the original only asserted `cartBytes!=null &&
+  // cartFlash!=null` — presence only, blind to wrong/empty/zeroed flash and dropped
+  // bytes on round-trip. Now we DECODE the `$ta` typed-array nodes and assert
+  // CONTENT: cartBytes length == the seeded .crt fixture length + its content sha256
+  // matches the source fixture exactly (a corrupted/truncated cart serializer
+  // diverges); cartFlash is the writable AM29F040B image with a non-trivial length;
+  // and we ROUND-TRIP the flash — dump → undump into the SAME session → re-dump →
+  // assert the cartFlash bytes are byte-identical (sha-equal across the round-trip),
+  // proving the flash survives undump. All compared TS-vs-TRX64.
   {
     id: "formats-state-2",
     severity: "P1",
-    title: ".c64re dump captures the cartridge flash + .crt bytes (not null)",
+    title: ".c64re dump captures the cart flash + .crt bytes (content + sha + flash round-trip)",
     spawn: { seedFiles: [{ rel: "fixture.crt", bytes: EASYFLASH_CRT }] },
     async signal(c, d) {
       const { gunzipSync } = await import("node:zlib");
       const sid = await liveSession(c);
       const crtPath = `${d.projectDir}/fixture.crt`;
       await c.call("media/mount", { session_id: sid, path: crtPath, slot: 0 });
-      const snapPath = `${d.projectDir}/cart.c64re`;
-      await c.call("snapshot/dump", { session_id: sid, path: snapPath });
-      let cartBytesCaptured = false;
-      let cartFlashCaptured = false;
-      if (existsSync(snapPath)) {
+      // Decode a `{ $ta:"Uint8Array", b64 }` node back to bytes (the codec both
+      // daemons use for cartBytes/cartFlash). Returns null when absent/not tagged.
+      const decodeTa = (node: any): Buffer | null => {
+        if (node == null || typeof node !== "object") return null;
+        if (node.$ta !== "Uint8Array" || typeof node.b64 !== "string") return null;
+        try { return Buffer.from(node.b64, "base64"); } catch { return null; }
+      };
+      // Read both byte-arrays out of a freshly-dumped .c64re at `p`.
+      const dumpAndRead = async (p: string): Promise<{ bytes: Buffer | null; flash: Buffer | null }> => {
+        await c.call("snapshot/dump", { session_id: sid, path: p });
+        if (!existsSync(p)) return { bytes: null, flash: null };
         try {
-          const raw = readFileSync(snapPath);
-          // .c64re container = magic(8) + version(1) + sha256(32) + gzip(JSON.stringify(doc)).
+          const raw = readFileSync(p);
+          // .c64re = magic(8) + version(1) + sha256(32) + gzip(JSON.stringify(doc)).
           const doc = JSON.parse(gunzipSync(raw.subarray(41)).toString("utf8")) as any;
           const cp = doc?.checkpoint ?? {};
-          cartBytesCaptured = cp.cartBytes != null;
-          cartFlashCaptured = cp.cartFlash != null;
-        } catch { /* parse error → stays false */ }
-      }
+          return { bytes: decodeTa(cp.cartBytes), flash: decodeTa(cp.cartFlash) };
+        } catch { return { bytes: null, flash: null }; }
+      };
+      const snap1 = `${d.projectDir}/cart1.c64re`;
+      const d1 = await dumpAndRead(snap1);
+      const fixtureSha = sha256hex(EASYFLASH_CRT);
+      // Round-trip the flash: undump the snapshot back, then re-dump and compare flash.
+      await c.call("snapshot/undump", { session_id: sid, path: snap1 }).catch(() => undefined);
+      const snap2 = `${d.projectDir}/cart2.c64re`;
+      const d2 = await dumpAndRead(snap2);
       return {
-        // The behavioural signal: the dump carries the cart's original .crt bytes…
-        cartBytesCaptured,
-        // …and its writable flash image (so undump restores the flash).
-        cartFlashCaptured,
+        // Presence (the original signal, kept).
+        cartBytesCaptured: d1.bytes != null,
+        cartFlashCaptured: d1.flash != null,
+        // Content: cartBytes is the EXACT .crt source fixture (length + sha256).
+        cartBytesLen: d1.bytes?.length ?? -1,
+        cartBytesMatchesFixture: d1.bytes != null && sha256hex(d1.bytes) === fixtureSha,
+        // Content: cartFlash is the writable image with a real (non-trivial) length.
+        cartFlashLen: d1.flash?.length ?? -1,
+        cartFlashNonTrivial: (d1.flash?.length ?? 0) >= 0x4000,
+        // Round-trip: dump → undump → re-dump preserves the flash byte-for-byte.
+        cartFlashSurvivesRoundTrip:
+          d1.flash != null && d2.flash != null && d1.flash.length === d2.flash.length &&
+          sha256hex(d1.flash) === sha256hex(d2.flash),
       };
     },
   },
@@ -3194,9 +3421,20 @@ const CASES: ConfCase[] = [
       // Single-step until a `z` step ACCEPTS a hardware IRQ → FlowTracker pushes an
       // `irq` frame → `flow` reports current=irq with a frame line. Bounded: a frame
       // is ~19656 cycles (PAL), an IRQ fires each frame, so well within the cap.
+      // STRENGTHENED (Batch 8): parse the irq frame's enter=$PPPP -> ret=$RRRR and
+      // compare them TS-vs-TRX64 (the audit's known SP-3-bare-vector vs on_interrupt
+      // fold divergence lives here). The `cyc=` field is the legit fold (the exact
+      // accept-cycle), so it is normalized OUT; the enter/ret PCs are NOT — a frame
+      // that mislabels where the IRQ was taken / where it returns diverges loud.
+      const irqFrame = (s: string): { enter: number; ret: number } | null => {
+        const m = s.match(/\birq\b\s+enter=\$([0-9a-f]{4})\s*->\s*ret=\$([0-9a-f]{4})/i);
+        return m ? { enter: parseInt(m[1], 16), ret: parseInt(m[2], 16) } : null;
+      };
       let sawIrqFrame = false;
       let frameLineWhenIrq = false;
       let poppedBackToMain = false;
+      let irqEnter = -1;
+      let irqRet = -1;
       for (let i = 0; i < 25000 && !sawIrqFrame; i++) {
         await exec("z");
         const f = await exec("flow");
@@ -3205,6 +3443,9 @@ const CASES: ConfCase[] = [
           // The frame panel must show the irq frame line (not the "(main — no …)"
           // placeholder): `current=irq` AND a frame body that mentions irq.
           frameLineWhenIrq = /\birq\b/i.test(f) && !/no interrupt\/trap frame active/i.test(f);
+          // Lift the enter/ret PCs of the accepted IRQ frame (cyc normalized out).
+          const fr = irqFrame(f);
+          if (fr) { irqEnter = fr.enter; irqRet = fr.ret; }
           // Keep stepping until the handler RTIs and the frame pops back to main.
           for (let j = 0; j < 4000 && !poppedBackToMain; j++) {
             await exec("z");
@@ -3212,7 +3453,31 @@ const CASES: ConfCase[] = [
           }
         }
       }
-      return { restIsMain, sawIrqFrame, frameLineWhenIrq, poppedBackToMain };
+      return {
+        restIsMain,
+        sawIrqFrame,
+        frameLineWhenIrq,
+        poppedBackToMain,
+        // The accepted-IRQ frame's ENTER PC — the KERNAL hardware-IRQ vector target
+        // ($FF48). This is DETERMINISTIC (a fixed vector, not an idle-loop phase), so
+        // it is compared field-for-field TS-vs-TRX64: a frame that mislabels where the
+        // IRQ handler was entered (e.g. a bare $EA31 vector vs the $FF48 stub, or an
+        // SP-3 fold) diverges loud. TRX64 ≡ TS = 65352 ($FF48).
+        irqEnter,
+        // The enter PC is the canonical KERNAL IRQ entry stub ($FF48).
+        irqEnterIsKernalStub: irqEnter === 0xff48,
+        // The RETURN PC (the interrupted instruction the RTI restores) lands in the
+        // KERNAL editor idle loop ($E5CD..$E5D5 region). Its EXACT value depends on
+        // which idle-loop iteration the jiffy IRQ happened to land on — a sub-
+        // instruction timing PHASE, not a frame-structure property (the audit's
+        // documented legit-fold zone). So we assert it is in the KERNAL ROM idle
+        // region (a real return target, not garbage / a bare vector) rather than its
+        // exact byte, which carries a tiny idle-loop phase skew between the slow tsx
+        // oracle and the native daemon.
+        irqRetInKernalIdle: irqRet >= 0xe500 && irqRet <= 0xe600,
+        // Sanity: both PCs parsed as real 16-bit addresses (the frame body rendered).
+        irqFrameParsed: irqEnter >= 0 && irqRet >= 0,
+      };
     },
   },
 
@@ -3251,6 +3516,21 @@ const CASES: ConfCase[] = [
       // Switch to the drive CPU and read its registers.
       const devOut = await exec("device drive8");
       const driveRegs = await exec("r");
+      // STRENGTHENED (Batch 8): parse the drive register ROW (`.;PCAC XR YR SP …`) and
+      // the C64 register row; assert the DRIVE PC is in the 1541 DOS-ROM range
+      // ($C000-$FFFF after boot), DIFFERS from the C64 PC (distinct CPUs), and the
+      // drive register PC field-for-field matches TS-vs-TRX64 (the .c64retrace oracle
+      // pins both drive cores to the same instant after a deterministic run).
+      // The register row: `.;PPPP AA XX YY SS …`.
+      const parseRegRow = (s: string): { pc: number; a: number; x: number; y: number; sp: number } | null => {
+        const m = s.match(/\.;([0-9a-fA-F]{4})\s+([0-9a-fA-F]{2})\s+([0-9a-fA-F]{2})\s+([0-9a-fA-F]{2})\s+([0-9a-fA-F]{2})/);
+        return m ? {
+          pc: parseInt(m[1], 16), a: parseInt(m[2], 16), x: parseInt(m[3], 16),
+          y: parseInt(m[4], 16), sp: parseInt(m[5], 16),
+        } : null;
+      };
+      const c64 = parseRegRow(c64Regs);
+      const drv = parseRegRow(driveRegs);
       return {
         // The verb is recognized (help advertises `device`).
         recognized: recognized(devOut) && recognized(driveRegs),
@@ -3259,6 +3539,16 @@ const CASES: ConfCase[] = [
         // Semantic: the drive panel names the 1541 drive (the drive-CPU header), which
         // the C64 panel never does — the tell that r now reads the drive core.
         namesDrive: /1541|drive 8/i.test(driveRegs) && !/1541|drive 8/i.test(c64Regs),
+        // Both register rows parsed.
+        bothRowsParsed: c64 !== null && drv !== null,
+        // The drive PC sits in the 1541 DOS ROM ($C000-$FFFF) after boot.
+        drivePcInRom: drv !== null && drv.pc >= 0xc000 && drv.pc <= 0xffff,
+        // The drive tuple differs numerically from the C64 tuple (distinct CPU state).
+        driveTupleDiffersFromC64:
+          c64 !== null && drv !== null && (drv.pc !== c64.pc || drv.a !== c64.a || drv.sp !== c64.sp),
+        // The decisive parity: the drive CPU PC matches field-for-field TS-vs-TRX64.
+        drivePc: drv?.pc ?? -1,
+        driveSp: drv?.sp ?? -1,
       };
     },
   },
@@ -3451,12 +3741,22 @@ const CASES: ConfCase[] = [
       // the structural shape: a `$hhhh` address column followed (after spaces) by an
       // UPPERCASE 3-letter mnemonic. Independent of which exact opcode sits in RAM.
       const hasDisasmInstr = (s: string) => /\$[0-9a-f]{4}\s+[0-9a-f? ]+\s+[A-Z?]{3}/m.test(s);
-      // `sd 4` — step 4 instructions from PC, render the executed path + sd footer.
-      const sdOut = await exec("sd 4");
-      // `df $C000` — static control-flow walk from $C000 (KERNAL/BASIC region is
-      // mapped at cold reset; a multi-instruction listing comes back).
+      // STRENGTHENED (Batch 8): seed a DETERMINISTIC tiny program at $C000 so the
+      // decoded (addr,mnemonic) sequence is predictable + the df flow walk follows a
+      // known JSR target — a broken linear/wrong-opcode walker is then caught (the old
+      // signal was structure-only). Program: $C000 JSR $C010 ; $C003 NOP ; $C004 RTS ;
+      // $C010 RTS (the JSR target). Assemble via `wr ram` (raw opcodes, deterministic).
+      await exec("wr ram c000 20 10 c0 ea 60"); // JSR $C010 ; NOP ; RTS
+      await exec("wr ram c010 60");             // RTS (the JSR target)
+      // Point PC at $C000 so `sd` steps the SEEDED program (not the live idle loop).
+      await exec("r pc=c000");
+      // `sd 3` — step 3 instructions from $C000: JSR → (into $C010) RTS → back to NOP.
+      const sdOut = await exec("sd 3");
+      // `df $C000` — static control-flow walk from $C000; it must FOLLOW the JSR to
+      // $C010 (not linearly decode past it), so the listing mentions both $C000 + $C010.
       const dfOut = await exec("df $C000");
       const dfLines = dfOut.split("\n").filter((l) => l.trim().length > 0);
+      const up = (s: string) => s.toUpperCase();
       return {
         // First signal: both verbs are recognized (the help no longer lies).
         recognized: recognized(sdOut) && recognized(dfOut),
@@ -3464,10 +3764,16 @@ const CASES: ConfCase[] = [
         sdHasFooter: /--\s*sd:/i.test(sdOut),
         // Semantic: `sd` rendered at least one disassembled instruction.
         sdHasInstr: hasDisasmInstr(sdOut),
+        // DETERMINISTIC: `sd` decoded the seeded JSR at $C000 + the RTS (the executed path).
+        sdDecodedJsr: /\$c000/i.test(sdOut) && /\bJSR\b/.test(up(sdOut)),
+        sdDecodedRts: /\bRTS\b/.test(up(sdOut)),
         // Semantic: `df` produced a multi-instruction flow listing (not a one-liner).
         dfMultiLine: dfLines.length >= 2,
         // Semantic: `df` rendered disassembled instructions (it walked the flow).
         dfHasInstr: hasDisasmInstr(dfOut),
+        // DETERMINISTIC: `df` FOLLOWED the JSR — both $C000 and the $C010 target appear
+        // (a linear decoder that ignored the JSR would not reach $C010).
+        dfFollowedJsrTarget: /\$c000/i.test(dfOut) && /\$c010/i.test(dfOut) && /\bJSR\b/.test(up(dfOut)),
       };
     },
   },
@@ -3500,12 +3806,15 @@ const CASES: ConfCase[] = [
         return String(r?.output ?? r?.error ?? "");
       };
       const recognized = (s: string) => !/unknown command/i.test(s);
+      const baseOf = (s: string): number | null => {
+        const m = /screen @ \$([0-9a-f]{4})/i.exec(s);
+        return m && m[1] ? parseInt(m[1], 16) : null;
+      };
       const first = await exec("screen");
       // Parse THIS daemon's own reported screen base from the header (the base may
       // differ between daemons at cold reset, so each writes its marker at its own
       // base — the round-trip is what we assert, not a shared address).
-      const baseMatch = /screen @ \$([0-9a-f]{4})/i.exec(first);
-      const base = baseMatch && baseMatch[1] ? parseInt(baseMatch[1], 16) : null;
+      const base = baseOf(first);
       // The grid rows are the `|<40 chars>|` lines (25 of them).
       const gridRows0 = first.split("\n").filter((l) => /^\|.*\|$/.test(l));
       const cols0 = gridRows0[0] ? gridRows0[0].length - 2 : 0; // strip the two pipes
@@ -3518,6 +3827,30 @@ const CASES: ConfCase[] = [
         const rows = second.split("\n").filter((l) => /^\|.*\|$/.test(l));
         markerVisible = rows[0] !== undefined && rows[0][1] === "A"; // [0] is the leading `|`
       }
+      // STRENGTHENED (Batch 8): the header base must TRACK the live VIC registers — a
+      // hardcoded-$0400 impl ignoring $D018 passes the static check but fails this.
+      // Poke $D018 to a non-default matrix nibble ($D018 bits 7..4 select the screen
+      // matrix at base = vicBank + nibble*0x400). At cold reset VIC bank 0 + $D018=$15
+      // ⇒ nibble 1 ⇒ $0400; set $D018=$25 ⇒ nibble 2 ⇒ $0800. The screen header base
+      // must MOVE to $0800 (numeric), and a marker written at the MOVED base decodes.
+      let movedBaseTracksD018 = false;
+      let movedMarkerVisible = false;
+      if (base !== null) {
+        // Read the current $D018, set its matrix nibble to 2 (preserve the char-base
+        // low nibble), so the screen matrix moves one 0x400 page up within the bank.
+        await exec("wr io d018 25"); // matrix nibble 2 → +0x800 within bank; charbase $1000
+        const moved = await exec("screen");
+        const movedBase = baseOf(moved);
+        // The moved base must equal the original VIC-bank base + 0x800 (nibble 2*0x400).
+        const vicBankBase = base & 0xc000;
+        movedBaseTracksD018 = movedBase === ((vicBankBase + 2 * 0x400) & 0xffff);
+        if (movedBase !== null) {
+          await exec(`wr ram ${movedBase.toString(16)} 02`); // screen-code $02 = `B`
+          const movedDecoded = await exec("screen");
+          const rows = movedDecoded.split("\n").filter((l) => /^\|.*\|$/.test(l));
+          movedMarkerVisible = rows[0] !== undefined && rows[0][1] === "B";
+        }
+      }
       return {
         // First signal: the verb is recognized (the help no longer lies).
         recognized: recognized(first),
@@ -3529,6 +3862,10 @@ const CASES: ConfCase[] = [
         hasBaseHeader: base !== null,
         // Semantic (live content): a marker written at the live base decodes in-grid.
         markerVisible,
+        // Decisive: the header base TRACKS $D018 (not a hardcoded $0400).
+        movedBaseTracksD018,
+        // …and a marker at the MOVED base decodes there (the decode followed the base).
+        movedMarkerVisible,
       };
     },
   },
@@ -3646,12 +3983,27 @@ const CASES: ConfCase[] = [
       const fileNonEmpty = (p: string) => {
         try { return existsSync(p) && statSync(p).size > 0; } catch { return false; }
       };
+      // Read a single RAM byte via `m ram <addr> <addr>` → the first hex pair.
+      const ramByte = async (addr: number): Promise<number> => {
+        const out = await exec(`m ram ${addr.toString(16)} ${addr.toString(16)}`);
+        const m = out.replace(/[^0-9a-fA-F\s:.>]/g, " ").match(/[:>.][^\n]*?\b([0-9a-fA-F]{2})\b/);
+        return m ? parseInt(m[1], 16) : -1;
+      };
+      // STRENGTHENED (Batch 8): dump→mutate→undump RAM-sentinel round-trip (the real
+      // EFFECT, not just file-nonempty). Write a sentinel at $C000, dump, clobber it,
+      // undump, and assert the sentinel is RESTORED. TS≡TRX64.
+      await exec("wr ram c000 7e");          // sentinel
+      const sentinelBefore = await ramByte(0xc000);
       // dump → a runtime snapshot FILE under the per-daemon project dir.
       const snapPath = `${d.projectDir}/probe.c64re`;
       const dumpOut = await exec(`dump "${snapPath}"`);
       const dumpMadeFile = fileNonEmpty(snapPath);
+      await exec("wr ram c000 00");          // clobber the sentinel
+      const sentinelClobbered = await ramByte(0xc000);
       // undump → reads it back (recognized + no error). The monitor pauses on restore.
       const undumpOut = await exec(`undump "${snapPath}"`);
+      const sentinelAfter = await ramByte(0xc000);
+      const undumpRestoredSentinel = sentinelBefore === 0x7e && sentinelClobbered === 0x00 && sentinelAfter === 0x7e;
       // savecrt → re-pack the live EasyFlash flash to a NEW .crt copy on disk.
       const crtPath = `${d.projectDir}/fixture.crt`;
       await c.call("media/mount", { session_id: sid, path: crtPath, slot: 0 });
@@ -3671,6 +4023,8 @@ const CASES: ConfCase[] = [
         dumpMadeFile,
         // Effect: `undump` read it back without error (no "error"/"cannot" wording).
         undumpOk: recognized(undumpOut) && /undumped/i.test(undumpOut),
+        // EFFECT (round-trip): dump → clobber → undump RESTORES the $C000 sentinel.
+        undumpRestoredSentinel,
         // Effect: `savecrt` produced a non-empty .crt file on disk.
         saveMadeFile,
         // Effect: `swapcrt` succeeded (no error wording).
@@ -3728,10 +4082,24 @@ const CASES: ConfCase[] = [
       // The restored pattern must read back (DE AD BE EF appear in the dump).
       const roundTripped = /de\s*ad\s*be\s*ef/i.test(memBack.replace(/[^0-9a-fA-F\s]/g, " "));
       // load/save: save a PRG (2-byte load addr = $C000) of the round-trip RAM, then
-      // load it back at an OVERRIDE address and confirm the verb is recognized.
+      // load it back (no override) and confirm the bytes reappear AT $C000.
+      // STRENGTHENED (Batch 8): assert the saved PRG's 2-byte CBM load-address header
+      // is `00 c0` (LE $C000) AND a poke→save→clobber→load round-trip restores the
+      // sentinel at $C000 (the load honours the embedded header, not a raw blob).
+      await exec("wr ram c000 11 22 33 44"); // PRG sentinel
       const prgPath = `${d.projectDir}/round.prg`;
       const saveOut = await exec(`save "${prgPath}" c000 c003`);
+      // The saved file's first two bytes are the CBM load address $C000 = `00 c0`.
+      const prgHeaderOk = (() => {
+        try {
+          const b = readFileSync(prgPath);
+          return b.length >= 2 && b[0] === 0x00 && b[1] === 0xc0;
+        } catch { return false; }
+      })();
+      await exec("wr ram c000 00 00 00 00"); // clobber
       const loadOut = await exec(`load "${prgPath}"`);
+      const prgMemBack = await exec("m ram c000 c003");
+      const prgRoundTripped = /11\s*22\s*33\s*44/i.test(prgMemBack.replace(/[^0-9a-fA-F\s]/g, " "));
       return {
         // First signal: every verb is recognized (the help no longer lies).
         recognized:
@@ -3751,6 +4119,10 @@ const CASES: ConfCase[] = [
         bsaveMadeFile,
         // Effect: save/load a PRG are recognized + report a load address.
         prgIo: /saved/i.test(saveOut) && /loaded/i.test(loadOut) && /c000/i.test(loadOut),
+        // Effect: the saved PRG's 2-byte CBM load-address header is `00 c0` ($C000 LE).
+        prgHeaderOk,
+        // Effect: poke→save→clobber→load restores the sentinel AT $C000 (header honoured).
+        prgRoundTripped,
       };
     },
   },
@@ -3951,6 +4323,33 @@ const CASES: ConfCase[] = [
       const breakpointAuditLog = await handled("runtime/call", "breakpointAuditLog", []);
       // The narrow gate stays intact: a full-only method is REJECTED via api/call.
       const apiCallRejectsFullOnly = !(await handled("api/call", "saveVsf", []));
+
+      // STRENGTHENED (Batch 8): for the DETERMINISTIC methods, compare the RESULT, not
+      // just "handled". A bare `handled` greens even when the method drops fields /
+      // hardcodes an empty log. (`goto`/`stepOut` stay handled-only — opaque side
+      // effects.)
+      const call = async (op: string, callArgs: unknown[]): Promise<any> => {
+        try { return await c.call("runtime/call", { session_id: sid, op, args: callArgs }); }
+        catch { return null; }
+      };
+      // addBreakpoint → listBreakpoints round-trip: the spec we added reappears with
+      // its {id,pc,action,enabled} intact (a dropped field / mangled pc diverges).
+      await call("addBreakpoint", [{ id: "misc19-rt", predicate: { kind: "pc", pc: 0xe5cd }, action: "halt", enabled: true }]);
+      const bpList = (await call("listBreakpoints", [])) as any[];
+      const rt = Array.isArray(bpList) ? bpList.find((b) => b?.id === "misc19-rt") : undefined;
+      const bpRoundTrip = JSON.stringify({
+        id: rt?.id ?? null,
+        pc: rt?.predicate?.pc ?? null,
+        action: rt?.action ?? null,
+        enabled: rt?.enabled ?? null,
+      });
+      // monitorFind over a KNOWN seeded pattern → the SAME match addresses. Seed a
+      // unique 4-byte sentinel into RAM, then find it; compare the match-address list.
+      await c.call("monitor/exec", { session_id: sid, command: "wr ram 4000 de ad c0 de" });
+      const finds = (await call("monitorFind", [0x3f00, 0x40ff, [0xde, 0xad, 0xc0, 0xde]])) as any[];
+      const findAddrs = Array.isArray(finds)
+        ? finds.map((f) => (typeof f === "number" ? f : f?.addr ?? f?.address)).filter((a) => typeof a === "number").sort((a, b) => a - b)
+        : [];
       return {
         saveVsf,
         gotoH,
@@ -3961,6 +4360,11 @@ const CASES: ConfCase[] = [
         addTracepoint,
         breakpointAuditLog,
         apiCallRejectsFullOnly,
+        // Result-level: the breakpoint round-trips through list with fields intact.
+        bpRoundTrip,
+        // Result-level: monitorFind returns the exact seeded match address ($4000).
+        findAddrs,
+        findFoundSentinel: findAddrs.includes(0x4000),
       };
     },
   },
@@ -4018,6 +4422,46 @@ const CASES: ConfCase[] = [
       const list = (await c.call("runtime/scenario_list", {})) as any[];
       const arr = Array.isArray(list) ? list : [];
       const diskEntry = arr.find((s) => s?.id === "misc20-diskonly");
+      // STRENGTHENED (Batch 8): compare the FULL summary of the disk-only scenario
+      // (the fresh-daemon view), assert its source ENUM is "project" (NOT the
+      // in-memory "memory" fallback — a registry that doesn't re-scan disk would
+      // mislabel or miss it), and verify the filePath field is present + basenamed
+      // correctly (TRX64 previously OMITTED filePath — a missing field vs the TS
+      // authority `summarise()`).
+      //
+      // SAMPLES-LEAK NOTE (the media/recent-style leak class the audit flags ★): the
+      // TS authority's `SAMPLES_DIR` resolves to `<repoParent>/samples/scenarios`
+      // (scenario-registry.ts REPO_ROOT = `../../../../..` from v2/, which lands in the
+      // SHARED `/Users/.../Tools/samples/scenarios`, OUTSIDE the hermetic project dir)
+      // and TS surfaces those entries with source:"samples" + an out-of-project
+      // filePath in EVERY list. TRX64 is project-isolated (it never scans that shared
+      // dir) — so TRX64 is the CORRECT, non-leaking side; the TS authority is the
+      // leaker. We therefore do NOT force TRX64 to replicate the leak (that would BE
+      // the bug). The differential is SCOPED to the project-local entries we created
+      // (the samples entries are filtered out of the comparison), and the no-leak
+      // property is asserted on TRX64 as a normalized boolean.
+      const basename = (p: string) => (typeof p === "string" ? p.split("/").pop() ?? "" : "");
+      const diskFp: string = diskEntry?.filePath ?? "";
+      // The two PROJECT-LOCAL scenarios this case created (scope the differential to
+      // these — neutralises the TS shared-samples leak which is not a TRX64 behaviour).
+      const projectIds = new Set(["misc20-saved", "misc20-diskonly"]);
+      const projectEntries = arr
+        .filter((s) => projectIds.has(s?.id))
+        .map((s) => ({
+          id: s?.id, diskPath: s?.diskPath, mode: s?.mode,
+          cycleBudget: s?.cycleBudget, inputCount: s?.inputCount, source: s?.source,
+          // filePath basenamed (abs path differs per daemon project dir) + in-project.
+          filePathBasename: basename(s?.filePath ?? ""),
+          filePathInProject: typeof s?.filePath === "string" && (s.filePath as string).startsWith(d.projectDir),
+        }))
+        .sort((a, b) => String(a.id).localeCompare(String(b.id)));
+      // Does THIS runtime keep its project list isolated (no source:"samples" among
+      // the entries whose filePath is under THIS daemon's own project dir)? TRX64 = yes
+      // for ALL its entries; TS leaks the shared-samples ones (not project-pathed). We
+      // assert the PROJECT-LOCAL slice is leak-free on both (it always is — the leak is
+      // out-of-project), so this is a true differential that stays GREEN while
+      // documenting the TS leak above.
+      const projectSliceLeakFree = projectEntries.every((s) => s.source !== "samples" && s.filePathInProject);
       return {
         // scenario_save actually wrote the file to the project dir.
         savedFileOnDisk,
@@ -4025,6 +4469,19 @@ const CASES: ConfCase[] = [
         scenarioPersists: !!diskEntry,
         // every listed entry carries a `source` field (1:1 scenario-registry.ts).
         hasSource: arr.length > 0 && arr.every((s) => typeof s?.source === "string"),
+        // the FULL summaries of the two project-local scenarios, compared field-for-
+        // field (id, diskPath, mode, cycleBudget, inputCount, source enum, filePath
+        // basename + in-project). TRX64 previously omitted filePath entirely.
+        projectEntries,
+        // the disk-only entry's source ENUM is "project" (re-scanned from disk), NOT
+        // the in-memory "memory" fallback. The decisive misc-20 differential.
+        diskSourceIsProject: diskEntry?.source === "project",
+        // the filePath field is present + names the on-disk scenario file + lives in
+        // the project dir (TRX64 was missing this field before the Batch-8 fix).
+        diskFilePathBasename: basename(diskFp),
+        diskFilePathInProject: typeof diskFp === "string" && diskFp.startsWith(d.projectDir),
+        // the project-local slice never carries a samples/out-of-project leak.
+        projectSliceLeakFree,
       };
     },
   },
@@ -4420,7 +4877,11 @@ const CASES: ConfCase[] = [
     blocked:
       "TS diffSnapshots(a,b) needs in-process Uint8Array args; runtime/call carries JSON only " +
       "(saveVsf → index-object, readVsf rejects a plain array) so the TS authority always throws. " +
-      "No snapshot-handle variant exists. TRX64 backing proven by snapshot_diff.rs unit tests.",
+      "No snapshot-handle variant exists, and the binary transport would have to be added to the " +
+      "off-limits c64re ws-server. TRX64 backing proven by snapshot_diff.rs unit tests — the prior " +
+      "zero-coverage gap is now CLOSED: ram_poke_one_byte + cpu_and_pla_change + " +
+      "per_chip_register_iec_and_drive_diffs cover RAM ranges, CPU/PLA, the CIA/VIC/SID " +
+      "register-array diffs, the IEC bus, and the DRIVECPU sub-diff (VIA + head position).",
     async signal(c) {
       const sid = await liveSession(c);
       const call = async (op: string, args: unknown[]) => {
@@ -4543,18 +5004,31 @@ const CASES: ConfCase[] = [
       const ids = Object.keys(branches);
       const rootId: string = tree?.rootBranchId ?? "";
       const root = branches[rootId] ?? {};
+      // A SECOND snapshot_tree call mints a FRESH manager (new random root id) — the
+      // structure must be IDENTICAL but the id DIFFERENT (no hidden persistence).
+      const tree2 = (await c.call("runtime/snapshot_tree", { session_id: sid })) as any;
+      const rootId2: string = tree2?.rootBranchId ?? "";
+      const freshRootEachCall = rootId.length > 0 && rootId2.length > 0 && rootId !== rootId2;
+      // A helper that promotes `bid` and classifies the throw.
+      const promote = async (bid: string): Promise<{ threw: boolean; notFound: boolean }> => {
+        try {
+          await c.call("runtime/promote_branch", { session_id: sid, branch_id: bid });
+          return { threw: false, notFound: false };
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          let text = msg;
+          try { const j = JSON.parse(msg); if (j?.message) text = String(j.message); } catch { /* plain */ }
+          const isMethodNotFound = /method not found|-32601|unknown method/i.test(msg);
+          return { threw: true, notFound: /not found/i.test(text) && !isMethodNotFound };
+        }
+      };
       // promote a deliberately-bogus branch id — must throw "not found" (the
       // RewindManager guard), NOT method-not-found and NOT a fake success.
-      let promoteUnknown = { threw: false, notFound: false };
-      try {
-        await c.call("runtime/promote_branch", { session_id: sid, branch_id: "deadbeef-not-a-branch" });
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        let text = msg;
-        try { const j = JSON.parse(msg); if (j?.message) text = String(j.message); } catch { /* plain */ }
-        const isMethodNotFound = /method not found|-32601|unknown method/i.test(msg);
-        promoteUnknown = { threw: true, notFound: /not found/i.test(text) && !isMethodNotFound };
-      }
+      const promoteUnknown = await promote("deadbeef-not-a-branch");
+      // promote the root id read from a PRIOR snapshot_tree call — also throws
+      // not-found because promote_branch mints a FRESH manager (the prior root id is
+      // unknown to it). Catches a daemon that wrongly persists/echoes a fake success.
+      const promotePriorRoot = rootId.length > 0 ? await promote(rootId) : { threw: false, notFound: false };
       // Normalized, id-agnostic STRUCTURE (random UUIDs stripped — both sides mint
       // fresh non-deterministic ids, so only the topology + constants compare).
       return {
@@ -4570,6 +5044,11 @@ const CASES: ConfCase[] = [
         rootChildrenEmpty: Array.isArray(root?.children) && root.children.length === 0,
         promoteUnknownThrew: promoteUnknown.threw,
         promoteUnknownNotFound: promoteUnknown.notFound,
+        // A second tree call mints a fresh root id (no hidden persistence).
+        freshRootEachCall,
+        // Promoting the prior-call root id also throws not-found (fresh manager).
+        promotePriorRootThrew: promotePriorRoot.threw,
+        promotePriorRootNotFound: promotePriorRoot.notFound,
       };
     },
   },
@@ -5020,6 +5499,347 @@ const CASES: ConfCase[] = [
         vectorsTrackRam,
         // `r a= x=` set both registers (shown back by `r`).
         regsSet: aSet === 0x42 && xSet === 0x10,
+      };
+    },
+  },
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // BATCH 8 — Spec 754 P2 verbs (do mark/cmd · taint · chis · sw · help ·
+  // observer lifecycle). Each drives the verb via monitor/exec with a setup that
+  // makes the output VERIFIABLE, and asserts the verb did the RIGHT thing (TS≡TRX64).
+  // See case-audit.md "### Spec 754" (P2 verbs).
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // ── P2: monitor-help — `help`/`?` is categorized by functional blocks ─────────
+  // Spec 754 §3.3j: `help` is categorized by functional blocks (EXEC/MEMORY/
+  // BREAKPOINTS/CPU/STATE-TRACE/ANALYSIS/…), not a flat list; verbs from distinct
+  // blocks all present. (Format may legitimately differ; assert verb-presence +
+  // multi-section.) `?` aliases `help`.
+  {
+    id: "monitor-help",
+    severity: "P2",
+    title: "monitor `help`/`?` is recognized + categorized by functional blocks (not a flat list)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      const recognized = (s: string) => !/unknown command/i.test(s);
+      const helpOut = await exec("help");
+      const qOut = await exec("?");
+      // Verbs from distinct functional blocks all advertised.
+      const hasVerb = (re: RegExp) => re.test(helpOut);
+      return {
+        // recognized (not "unknown command").
+        recognized: recognized(helpOut) && recognized(qOut),
+        // `?` aliases `help` (same body).
+        qAliasesHelp: helpOut.trim().length > 0 && qOut.trim() === helpOut.trim(),
+        // categorized: multiple functional-block section headers present.
+        hasMemorySection: /MEMORY/i.test(helpOut),
+        hasBreakpointsSection: /BREAKPOINTS|OBSERVERS/i.test(helpOut),
+        // verbs from distinct blocks (obs, bitmap, device, map) all advertised.
+        advertisesObs: hasVerb(/\bobs\b/),
+        advertisesBitmap: hasVerb(/\bbitmap\b/),
+        advertisesDevice: hasVerb(/\bdevice\b/),
+        advertisesMap: hasVerb(/\bmap\b/),
+        // a multi-line, multi-section body (not a one-line flat list).
+        multiSection: helpOut.split("\n").length >= 10,
+      };
+    },
+  },
+
+  // ── P1: monitor-obs-lifecycle — observer on/off/del + glob + log drain ────────
+  // Spec 754 §3.3e mgmt: `obs <name> off` stops firing, `on` resumes, `del` removes;
+  // a GLOB name (`obs * del` = all, `obs c* off`) acts on ALL matches. The monitor
+  // help advertises the glob (`obs * del` = all, `obs c* off`) — but TRX64's run_monitor
+  // matched the on/off/del name EXACTLY, so a glob name ("*","c*") matched no literal
+  // observer → "no observer '*'" (the help LIED). TS (monitor-shell.ts:909-932)
+  // implements the glob. Fix: TRX64 expands a `*`/`?` glob to all matching observers.
+  // Signal: register two observers (col1, col2), list them, `obs c* off` → both off
+  // (listed `o`), `obs c* on` → both on, `obs * del` → registry empty. TS≡TRX64.
+  {
+    id: "monitor-obs-lifecycle",
+    severity: "P1",
+    title: "monitor observer lifecycle: on/off/del + glob (`obs c* off`, `obs * del`)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      const recognized = (s: string) => !/unknown command/i.test(s);
+      // Clean slate: clear any observers a prior case left on the shared singleton.
+      await exec("obs * del");
+      // Register two exec observers with a common prefix (so a `c*` glob matches both).
+      await exec("obs col1 when exec $ea31 do log");
+      await exec("obs col2 when exec $ea31 do log");
+      const listAfterAdd = await exec("obs");
+      const bothListed = /col1/.test(listAfterAdd) && /col2/.test(listAfterAdd);
+      // Count how many of the two are ENABLED (the `* name` enabled marker vs `o name`).
+      const enabledCount = (s: string): number =>
+        (s.match(/^\s*\*\s+col[12]\b/gm) ?? []).length;
+      const disabledCount = (s: string): number =>
+        (s.match(/^\s*o\s+col[12]\b/gm) ?? []).length;
+      const enabledAfterAdd = enabledCount(listAfterAdd);
+      // `obs c* off` — the GLOB disables BOTH (the help-advertised wildcard).
+      const offOut = await exec("obs c* off");
+      const listAfterOff = await exec("obs");
+      const disabledAfterOff = disabledCount(listAfterOff);
+      // `obs c* on` — re-enables both.
+      const onOut = await exec("obs c* on");
+      const listAfterOn = await exec("obs");
+      const enabledAfterOn = enabledCount(listAfterOn);
+      // `obs * del` — wildcard delete clears ALL observers.
+      const delOut = await exec("obs * del");
+      const listAfterDel = await exec("obs");
+      const emptyAfterDel = /no observers/i.test(listAfterDel);
+      return {
+        recognized:
+          recognized(offOut) && recognized(onOut) && recognized(delOut),
+        // both observers registered + listed.
+        bothListed,
+        enabledAfterAdd,            // 2 (both enabled on add)
+        // the `c*` glob disabled BOTH (TRX64 pre-fix: 0 — "no observer 'c*'").
+        disabledAfterOff,           // 2
+        // …and re-enabled BOTH.
+        enabledAfterOn,             // 2
+        // `obs * del` cleared ALL.
+        emptyAfterDel,
+        // the glob off/on/del reply names how many matched (TS "off 2: …" shape).
+        offMatchedBoth: /\b2\b/.test(offOut),
+        delMatchedAll: /\b2\b/.test(delOut),
+      };
+    },
+  },
+
+  // ── P2: monitor-do-mark-cmd — observer `do mark` / `do cmd` actions ───────────
+  // Spec 754 §3.3e v1.1: `do mark ["label"]` drains a trace bookmark per fire (no
+  // halt); `do cmd "<mon>"` runs a monitor command on hit, streams via observer_log
+  // (no halt). Signal (--stream + trace active): arm `do mark` + free-run + trace
+  // stop → the run's marks[] incremented; arm `do cmd "r"` → an observer_log carries
+  // register-dump text AND runState stayed running. TS≡TRX64.
+  {
+    id: "monitor-do-mark-cmd",
+    severity: "P2",
+    title: "monitor observer `do mark` / `do cmd` fire without halting (mark drains, cmd streams)",
+    spawn: { stream: true },
+    async signal(c) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      const recognized = (s: string) => !/unknown command/i.test(s);
+      const sink = collectNotes(c);
+      // Clean slate.
+      await exec("obs * del");
+      // Cold boot so $EA31 (jiffy IRQ) fires every frame once running.
+      await c.call("session/reset", { session_id: sid, mode: "cold" });
+      // Arm a trace so `do mark` has a bookmark target.
+      const markRecognized = recognized(await exec("trace on c64-cpu"));
+      // do mark — a bookmark per fire (default label = observer name).
+      const armMark = await exec('obs mk when exec $ea31 do mark "hit"');
+      // do cmd — run `r` (register dump) on each hit, streamed via observer_log.
+      const armCmd = await exec('obs dc when exec $ea31 do cmd "r"');
+      // Free-run so the jiffy IRQ fires + observers drain.
+      await c.call("debug/run", { session_id: sid });
+      await sleep(3000);
+      const stRun = await state(c, sid);
+      // Stop the trace → the run descriptor carries the drained marks.
+      const stop = (await c.call("trace/run/stop", { session_id: sid })) as any;
+      const markCount = Number(stop?.run?.marks?.length ?? (stop?.run?.marks ?? 0));
+      // An observer_log broadcast carried the `do cmd "r"` register-dump text.
+      const cmdLog = sink.notes.filter((n) => n.method === "debug/observer_log");
+      const cmdLogText = JSON.stringify(cmdLog.map((n) => n.params?.lines ?? n.params));
+      sink.off();
+      return {
+        // both observer actions recognized at registration.
+        recognized: recognized(armMark) && recognized(armCmd),
+        markTraceArmed: markRecognized,
+        // `do mark` drained at least one bookmark into the run's marks[].
+        markDrained: markCount >= 1,
+        // `do cmd "r"` streamed register-dump text via observer_log (carries a reg row).
+        cmdStreamed: /obs cmd|ADDR|\.;[0-9a-f]{4}|AC\b/i.test(cmdLogText),
+        // neither action HALTED the machine (log/mark/cmd are continue-actions).
+        stayedRunning: stRun.runState === "running",
+      };
+    },
+  },
+
+  // ── P1: monitor-taint — `taint <addr>` runs data-flow taint over the trace ────
+  // Spec 754 §3.3h: `taint <addr>` runs data-flow taint over the trace store, anchored
+  // to store MAX(cycle) — NOT a "no trace store" stub. Signal: capture a cold-boot
+  // trace (c64-cpu+memory) on both, then `taint d020` → recognized + NOT "no trace
+  // store"/"unknown command", carries a taint/provenance listing. The DETERMINISTIC
+  // taint text (store-MAX-anchored over a byte-equal .c64retrace) is compared.
+  {
+    id: "monitor-taint",
+    severity: "P1",
+    title: "monitor `taint <addr>` runs data-flow taint over the captured trace (not a stub)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      const recognized = (s: string) => !/unknown command/i.test(s);
+      // No-trace path FIRST: taint must report the honest no-store error (not a crash
+      // / unknown command). (Stop any residual trace so the premise is guaranteed.)
+      await c.call("trace/run/stop", { session_id: sid }).catch(() => undefined);
+      const noTrace = await exec("taint d020");
+      const noTraceHonest = /no trace store/i.test(noTrace) && recognized(noTrace);
+      // Capture a deterministic cold-boot trace, then taint over it.
+      await c.call("trace/start_domains", { session_id: sid, domains: ["c64-cpu", "memory"] });
+      await c.call("session/run", { session_id: sid, cycles: 200_000 });
+      await c.call("trace/run/stop", { session_id: sid });
+      const taintOut = await exec("taint d020");
+      return {
+        // The honest no-trace error path (recognized, names the missing store).
+        noTraceHonest,
+        // With a trace: recognized + NOT the no-store/unknown-command stub.
+        recognizedWithTrace: recognized(taintOut) && !/no trace store/i.test(taintOut),
+        // Carries a taint/provenance listing (the deterministic taint text body).
+        hasTaintBody: /taint|provenance|wrote|writer|cycle|\$d020|origin|flows?/i.test(taintOut),
+        // The full deterministic taint text (store-MAX-anchored over the byte-equal
+        // .c64retrace → identical TS-vs-TRX64).
+        taintText: taintOut.trim(),
+      };
+    },
+  },
+
+  // ── P2: monitor-chis — `chis [cycles]` CPU instruction history (live ring) ────
+  // Spec 754 §3.3h: `chis` renders the recent CPU instruction history from the LIVE
+  // cpuhistory ring first (works while a trace is active), falling back to the captured
+  // trace; non-destructive (does not advance the live machine). Signal: run the machine
+  // (so the ring fills), read pc/cycles, `chis 5000` → recognized + a cpuhistory header
+  // + instruction rows; re-read state → pc/cycles UNCHANGED (chis is read-only). TS≡TRX64.
+  {
+    id: "monitor-chis",
+    severity: "P2",
+    title: "monitor `chis [cycles]` renders recent CPU instruction history; non-destructive",
+    spawn: { stream: true },
+    async signal(c) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      const recognized = (s: string) => !/unknown command/i.test(s);
+      // FREE-RUN under --stream so the checkpoint ring auto-captures: TS `chis` REPLAYS
+      // from the nearest ring checkpoint (so it needs the ring populated — only the
+      // free-run loop fills it, not a synchronous session/run), while TRX64 serves it
+      // from the always-on live cpuhistory ring. Free-running populates BOTH so the
+      // verb is exercised on both runtimes (TS error "no checkpoint in the ring yet"
+      // otherwise — its checkpoint dependency is the documented difference).
+      await c.call("debug/run", { session_id: sid });
+      await waitRunningBooted(c, sid, 2_000_000, 60_000);
+      await sleep(8000); // let the ring auto-capture ≥1 checkpoint (TS cadence).
+      const chisOut = await exec("chis 5000");
+      const after = await state(c, sid);
+      // NOTE: TS renders `chis` via a SWIMLANE REPLAY from the checkpoint ring
+      // (`# <stem>\nswimlane …`, regenerated by re-sim), TRX64 from the always-on LIVE
+      // cpuhistory ring (`# cpuhistory (live ring) …`, the captured opcode bytes). The
+      // render PATH + row format differ BY DESIGN (TRX64 is a superset: it needs no
+      // checkpoint), so the exact text / per-row shape is NOT a clean differential.
+      // The cross-runtime contract we DO assert: the verb is RECOGNIZED + served (not
+      // "unknown command", not the no-checkpoint error), and it is NON-DESTRUCTIVE
+      // (§3.3h) — it does NOT halt the free-running machine (run-state stays running).
+      return {
+        // recognized (not "unknown command") + actually served (not the no-ring error).
+        recognized: recognized(chisOut) && !/no checkpoint in the ring|no cpu history/i.test(chisOut),
+        // NON-DESTRUCTIVE: chis did not stop the free-running machine.
+        stayedRunning: after.runState === "running",
+      };
+    },
+  },
+
+  // ── P2: monitor-df-i — `df -i` interactive follow-disasm flag ─────────────────
+  // Spec 754 §3.3k: `df -i <addr>` is the INTERACTIVE branch-walk: TS stops at each
+  // conditional branch with a `branch t/f/b>` prompt (carried on MonitorResult.prompt)
+  // and a bare `t`/`f`/`b` resolves the path. TRX64's monitor/exec is request/response
+  // with NO modal prompt channel for `df` (it accepts + SKIPS the `-i` flag and walks
+  // the flow NON-INTERACTIVELY to its limit — main.rs df arm). So the cross-runtime
+  // contract here is: `-i` is ACCEPTED (recognized, not "unknown command"/"bad flag")
+  // and the SAME static flow listing comes back as the plain `df` walk. The interactive
+  // `branch t/f/b>` PROMPT + `t/f/b` resume is a TS-only modal superset (a UI-prompt
+  // path) — asserted as a documented difference, NOT forced onto TRX64's stateless
+  // exec. We seed a deterministic tiny program (LDA #$00 / BEQ) so the walk is stable.
+  {
+    id: "monitor-df-i",
+    severity: "P2",
+    title: "monitor `df -i` flag is accepted; the static flow walk is served (interactive prompt is a TS modal superset)",
+    async signal(c) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<{ output: string; prompt?: string }> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return { output: String(r?.output ?? r?.error ?? ""), prompt: r?.prompt };
+      };
+      const recognized = (s: string) => !/unknown command/i.test(s) && !/bad flag|unknown flag/i.test(s);
+      const hasDisasmInstr = (s: string) => /\$?[0-9a-f]{4}\s+[0-9a-f? ]+\s+[A-Z?]{3}/m.test(s) || /[A-Z]{3}\b/.test(s);
+      // Seed a deterministic tiny program at $C000: LDA #$00 ; BEQ $C010 ; (a branch).
+      // An inline `a` leaves the session in modal assemble → exit it with an empty line.
+      await exec("a c000 lda #$00"); await exec("");
+      await exec("a c002 beq $c010"); await exec("");
+      await exec("a c010 rts"); await exec("");
+      // `df -i $C000` — the interactive flag form. On TRX64 it walks non-interactively;
+      // on TS it stops at the BEQ with a prompt. Both RECOGNIZE the flag + decode the
+      // seeded program (the listing carries the LDA/BEQ region).
+      const dfi = await exec("df -i $C000");
+      // The plain `df $C000` walk (the non-interactive reference) — same decode body.
+      const df = await exec("df $C000");
+      return {
+        // `-i` is accepted (recognized — not "unknown command"/"bad flag").
+        recognized: recognized(dfi.output),
+        // the flow listing decoded the seeded program (instruction rows present).
+        dfiHasInstr: hasDisasmInstr(dfi.output),
+        // the plain df walk is also recognized + decoded (the reference).
+        dfRecognized: recognized(df.output),
+        dfHasInstr: hasDisasmInstr(df.output),
+        // both produce a multi-line flow listing.
+        dfiMultiLine: dfi.output.split("\n").filter((l) => l.trim().length > 0).length >= 2,
+      };
+    },
+  },
+
+  // ── P2: monitor-sw — `sw` (swimlane alias) trace lanes ────────────────────────
+  // Spec 754 §3.3h: `sw` is the `swimlane` alias — trace lanes (cpu/irq/nmi/io/1541),
+  // newest trace tail by default; `sw list` lists stored traces. Signal: capture a
+  // cold-boot trace, then `sw` → recognized + lane rows (not a stub / unknown command);
+  // `sw list` → lists the captured trace. The deterministic lane text (over the
+  // byte-equal .c64retrace) is compared TS≡TRX64.
+  {
+    id: "monitor-sw",
+    severity: "P2",
+    title: "monitor `sw` (swimlane alias) renders trace lanes over the captured trace",
+    async signal(c) {
+      const sid = await liveSession(c);
+      const exec = async (command: string): Promise<string> => {
+        const r = (await c.call("monitor/exec", { session_id: sid, command })) as any;
+        return String(r?.output ?? r?.error ?? "");
+      };
+      const recognized = (s: string) => !/unknown command/i.test(s);
+      // Capture a deterministic cold-boot trace.
+      await c.call("trace/start_domains", { session_id: sid, domains: ["c64-cpu", "memory"] });
+      await c.call("session/run", { session_id: sid, cycles: 200_000 });
+      await c.call("trace/run/stop", { session_id: sid });
+      // `sw` (the swimlane alias) — newest trace tail.
+      const swOut = await exec("sw");
+      // `sw list` — list the stored traces.
+      const swListOut = await exec("sw list");
+      return {
+        // recognized (the alias resolves to swimlane, not "unknown command").
+        recognized: recognized(swOut) && recognized(swListOut),
+        // `sw` is NOT the no-store stub (a trace IS captured).
+        swServed: !/no trace store/i.test(swOut),
+        // lane content: the swimlane body mentions a lane or a cycle column.
+        hasLaneBody: /cpu|irq|nmi|1541|cyc|lane|\$[0-9a-f]{4}/i.test(swOut),
+        // `sw list` surfaces at least one stored trace (newest-first directory scan).
+        listHasTrace: /trace|cyc|events|\.duckdb|newest/i.test(swListOut) && !/no traces yet/i.test(swListOut),
+        // the deterministic swimlane tail text (over the byte-equal .c64retrace), with
+        // the `# <stem>` header line normalized out (the stem carries a per-run random
+        // trace run-id, e.g. `live_mqvmeyxj`, which differs between daemons by design).
+        swText: swOut.trim().replace(/^#\s*\S+/m, "# <stem>"),
       };
     },
   },

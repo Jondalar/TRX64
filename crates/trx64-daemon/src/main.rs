@@ -1656,6 +1656,14 @@ fn drain_and_broadcast_observer_log(st: &mut State) {
     let cycles = st.session.machine.clk;
     for label in marks {
         let line = if trace_active {
+            // When a trace is active, RECORD the bookmark into the run's marks[] (=
+            // TS runtime-controller.ts:751 `this.traceRun.mark(label)`), so a later
+            // trace/run/stop carries it. TRX64 previously only BROADCAST the line and
+            // never pushed it onto the trace → `do mark` marks were lost from the run
+            // descriptor (audit monitor-do-mark-cmd).
+            if let Some(t) = st.session.trace.as_mut() {
+                t.marks.push((cycles, label.clone()));
+            }
             format!(r#"obs mark: "{label}" @ cyc {cycles}"#)
         } else {
             format!(r#"obs mark: "{label}" (no active trace — ignored)"#)
@@ -3363,9 +3371,42 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             let name = rest[0].clone();
             let sub = rest.get(1).map(|s| s.to_ascii_lowercase()).unwrap_or_default();
 
+            // A name containing `*`/`?` is a GLOB → on/off/del act on ALL matches
+            // (`obs * del` = all, `obs c* off` = every observer starting "c"). 1:1 with
+            // monitor-shell.ts:909-932 (audit monitor-obs-lifecycle). TRX64 previously
+            // matched the name EXACTLY, so a glob matched no literal observer → "no
+            // observer '*'" while the help advertised the wildcard (the help LIED).
+            let is_glob = name.contains('*') || name.contains('?');
+            // Expand the glob to the matching observer names. `*` = any run (incl.
+            // empty), `?` = exactly one char — anchored full-string match, 1:1 with the
+            // TS globMatches() regex (`^` + `*`→".*" + `?`→"." + `$`). Observer names
+            // are plain identifiers (no regex metachars), so a direct glob walk suffices.
+            let glob_matches = |st: &State| -> Vec<String> {
+                st.dsl_observers
+                    .iter()
+                    .map(|o| o.name.clone())
+                    .filter(|n| glob_full_match(&name, n))
+                    .collect()
+            };
+
             // `obs <name> on|off` — persist the disable intent in `dsl_disabled` so it
             // survives the per-run sync_observers rebuild; re-sync to apply immediately.
             if rest.len() == 2 && (sub == "on" || sub == "off") {
+                if is_glob {
+                    let matches = glob_matches(st);
+                    if matches.is_empty() {
+                        return Ok(format!("no observer matches '{name}'"));
+                    }
+                    for m in &matches {
+                        if sub == "off" { st.dsl_disabled.insert(m.clone()); }
+                        else { st.dsl_disabled.remove(m); }
+                    }
+                    {
+                        let State { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } = &mut *st;
+                        sync_observers(breakpoints, dsl_observers, dsl_disabled, reg);
+                    }
+                    return Ok(format!("{sub} {}: {}", matches.len(), matches.join(", ")));
+                }
                 if !st.dsl_observers.iter().any(|o| o.name == name) {
                     return Ok(format!("no observer '{name}'"));
                 }
@@ -3383,6 +3424,18 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
 
             // `obs <name> del|delete|rm`
             if rest.len() == 2 && (sub == "del" || sub == "delete" || sub == "rm") {
+                if is_glob {
+                    let matches = glob_matches(st);
+                    if matches.is_empty() {
+                        return Ok(format!("no observer matches '{name}'"));
+                    }
+                    for m in &matches {
+                        st.dsl_observers.retain(|o| &o.name != m);
+                        st.observers.remove(m);
+                        st.dsl_disabled.remove(m);
+                    }
+                    return Ok(format!("deleted {}: {}", matches.len(), matches.join(", ")));
+                }
                 let before = st.dsl_observers.len();
                 st.dsl_observers.retain(|o| o.name != name);
                 if st.dsl_observers.len() != before {
@@ -4947,6 +5000,38 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
 /// (the help simply LISTS every verb of the VICE-superset, including ones whose
 /// runtime bridges are deferred in this daemon — the help text itself is identical
 /// regardless of which bridges are wired, so it is reproduced 1:1).
+/// Anchored full-string glob match supporting `*` (any run, incl. empty) and `?`
+/// (exactly one char) — the observer on/off/del wildcard (monitor-shell.ts:912-914
+/// globMatches, where the pattern is `^` + escaped-name with `*`→".*", `?`→"."` +
+/// `$`). Observer names are plain identifiers, so this character walk is equivalent.
+fn glob_full_match(pat: &str, s: &str) -> bool {
+    let p: Vec<char> = pat.chars().collect();
+    let t: Vec<char> = s.chars().collect();
+    // Classic two-pointer glob match with backtracking over `*`.
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star, mut mark) = (usize::MAX, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = pi;
+            mark = ti;
+            pi += 1;
+        } else if star != usize::MAX {
+            pi = star + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 fn monitor_help_text() -> String {
     [
         "monitor (VICE-superset):",
@@ -10208,10 +10293,12 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             // daemon's save) is listed even when this process never saw it via RPC.
             let mut by_id: std::collections::BTreeMap<String, Value> =
                 std::collections::BTreeMap::new();
-            // In-memory copies first (source = "memory" when no on-disk peer).
+            // In-memory copies first (source = "memory" when no on-disk peer). No
+            // on-disk file backs a memory-only entry, so filePath = "" (= TS, whose
+            // registry has no file path until saveScenario writes one).
             for s in st.scenarios.values() {
                 let sid = s.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                by_id.insert(sid, scenario_summary_src(s, "memory"));
+                by_id.insert(sid, scenario_summary_src(s, "memory", ""));
             }
             // Disk re-scan overrides (source = "project"), 1:1 with scanDir.
             if let Some(scen_dir) = scenarios_dir() {
@@ -10236,7 +10323,11 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
                             continue;
                         }
                         let sid = obj.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        by_id.insert(sid, scenario_summary_src(&obj, "project"));
+                        // filePath = the absolute on-disk scenario JSON path (= TS
+                        // scanDir's `join(dir, name)`), so the disk re-scan summary
+                        // carries the path field too.
+                        let fp = path.to_string_lossy().into_owned();
+                        by_id.insert(sid, scenario_summary_src(&obj, "project", &fp));
                     }
                 }
             }
@@ -10595,7 +10686,12 @@ fn now_iso8601() -> String {
 /// scenario `{ id, diskPath, mode, cycleBudget, inputCount, savedAt, source }`. The
 /// `source` is "project" (file-backed) or "memory" (in-process fallback when no
 /// project dir is resolvable); TS uses "project" | "samples".
-fn scenario_summary_src(s: &Value, source: &str) -> Value {
+fn scenario_summary_src(s: &Value, source: &str, file_path: &str) -> Value {
+    // 1:1 with scenario-registry.ts `summarise()`: id, diskPath, mode, cycleBudget,
+    // inputCount, savedAt, filePath, source. TRX64 previously omitted `filePath` (the
+    // absolute on-disk path of the scenario JSON) — a missing field vs the TS authority
+    // (audit ws-trace-monitor-misc-20). For an in-memory-only scenario the TS registry
+    // has no on-disk file yet, so `file_path` is "" there.
     json!({
         "id": s.get("id").and_then(|v| v.as_str()).unwrap_or(""),
         "diskPath": s.get("diskPath").and_then(|v| v.as_str()).unwrap_or(""),
@@ -10603,6 +10699,7 @@ fn scenario_summary_src(s: &Value, source: &str) -> Value {
         "cycleBudget": s.get("cycleBudget").and_then(|v| v.as_u64()).unwrap_or(0),
         "inputCount": s.get("inputs").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0) as u64,
         "savedAt": s.get("savedAt").and_then(|v| v.as_str()).unwrap_or(""),
+        "filePath": file_path,
         "source": source,
     })
 }
@@ -12354,6 +12451,24 @@ async fn main() {
 mod batch1_tests {
     use super::*;
 
+    #[test]
+    fn glob_full_match_observer_wildcards() {
+        // `*` = any run incl. empty, `?` = exactly one char, anchored full-string —
+        // the observer on/off/del wildcard (audit monitor-obs-lifecycle).
+        assert!(glob_full_match("*", "col1"));
+        assert!(glob_full_match("*", ""));
+        assert!(glob_full_match("c*", "col1"));
+        assert!(glob_full_match("c*", "col2"));
+        assert!(glob_full_match("col?", "col1"));
+        assert!(!glob_full_match("col?", "col12")); // ? is exactly one char
+        assert!(!glob_full_match("c*", "abc"));     // anchored at start
+        assert!(glob_full_match("col1", "col1"));   // literal
+        assert!(!glob_full_match("col1", "col2"));
+        assert!(glob_full_match("*1", "col1"));     // suffix glob
+        assert!(glob_full_match("c*1", "col1"));    // mid glob
+        assert!(!glob_full_match("c*1", "col2"));
+    }
+
     fn make_state() -> SharedState {
         Arc::new(Mutex::new(State {
             session: Session::new("integrated-1"),
@@ -13294,6 +13409,44 @@ mod batch1_tests {
         assert_eq!(call(&st, "recorder/status", json!({}))["active"], json!(false));
         // capture while inactive is a no-op { active: false }.
         assert_eq!(call(&st, "recorder/capture", json!({}))["active"], json!(false));
+    }
+
+    #[test]
+    fn stream_feed_grows_recorder_anchor_count_per_cadence() {
+        // background-workers-async-0 is BLOCKED in the WS oracle (the TS recorder/list
+        // awaits a worker thread that is non-functional under tsx-from-src), so the
+        // free-run anchor-GROWTH behaviour can't be compared cross-runtime there. This
+        // test verifies the TRX64 behaviour DIRECTLY: with the recorder active, the
+        // stream loop's per-frame feed (`stream_maybe_feed_recorder`) captures a fresh
+        // anchor every `checkpoint_capture_every_frames()` frames — so the anchor count
+        // GROWS over a free-run (was flat before the feed wiring), exactly the signal
+        // the WS case would assert if the TS worker resolved.
+        let st = make_state();
+        call(&st, "recorder/start", json!({}));
+        let count = |st: &SharedState| -> usize {
+            call(st, "recorder/list", json!({}))["anchors"].as_array().map(|a| a.len()).unwrap_or(0)
+        };
+        let cadence = checkpoint_capture_every_frames();
+        let baseline = count(&st);
+        // Drive ~3 cadence windows of frames through the feed; each full window must
+        // add exactly one anchor (the feed fires on frames_since == cadence).
+        {
+            let mut g = st.lock().unwrap();
+            for f in 0..(cadence * 3) {
+                stream_maybe_feed_recorder(&mut g, f as u64);
+            }
+        }
+        let after = count(&st);
+        assert!(after >= baseline + 3, "feed grew the ring: {baseline} -> {after} over 3 cadence windows (cadence={cadence})");
+        // A SUB-cadence burst (fewer than one window) must NOT add an anchor.
+        let mid = count(&st);
+        {
+            let mut g = st.lock().unwrap();
+            for f in 0..(cadence.saturating_sub(1)) {
+                stream_maybe_feed_recorder(&mut g, f as u64);
+            }
+        }
+        assert_eq!(count(&st), mid, "a sub-cadence burst adds no anchor");
     }
 
     // ── Spec 231/268 — scenario registry + replay (wire-shape parity) ─────────

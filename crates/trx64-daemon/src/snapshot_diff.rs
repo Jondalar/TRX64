@@ -577,6 +577,74 @@ mod tests {
     }
 
     #[test]
+    fn per_chip_register_iec_and_drive_diffs() {
+        // Closes the snapshot_diff zero-coverage gap (audit ws-trace-monitor-misc-22):
+        // the per-chip register-array diffs (CIA1/VIC/SID), the IEC-bus diff, and the
+        // DRIVECPU sub-diff (drive CPU regs + VIA + GCRHEAD head position) — all of
+        // which the WS oracle case CANNOT exercise (TS can't transport Uint8Array over
+        // JSON). Here the c64re-VSF framing is fed directly to the Rust port.
+        let cia1_a = vec![0x11u8; 16];
+        let mut cia1_b = cia1_a.clone();
+        cia1_b[4] = 0xab; // CIA1 reg 4 (timer A lo) changed.
+        let vic_a = vec![0u8; 80];
+        let mut vic_b = vic_a.clone();
+        vic_b[0x20] = 0x06; // VIC border colour changed.
+        let sid_a = vec![0u8; 32];
+        let mut sid_b = sid_a.clone();
+        sid_b[24] = 0x0f; // SID volume/filter changed.
+        // IECBUS: 6-byte released-flags (the diff_iec_bus input).
+        let iec_a = vec![1u8, 1, 1, 0, 0, 0];
+        let iec_b = vec![1u8, 0, 1, 0, 0, 0]; // CLK released→pulled.
+        // GCRHEAD: 2-byte LE half-track.
+        let head_a = vec![0x02u8, 0x00]; // half-track 2
+        let head_b = vec![0x24u8, 0x00]; // half-track 36
+        let via1_a = vec![0u8; 15];
+        let mut via1_b = via1_a.clone();
+        via1_b[0] = 0x80; // VIA1 reg 0 changed.
+
+        let a = build_vsf(&[
+            ("MAINCPU", cpu_module(0x1000, 0x10, 100)),
+            ("C64MEM", c64mem_module(&[], 0x37)),
+            ("CIA1", cia1_a.clone()),
+            ("VIC-II", vic_a.clone()),
+            ("SID", sid_a.clone()),
+            ("IECBUS", iec_a),
+            ("DRIVECPU", cpu_module(0xc000, 0x00, 50)),
+            ("VIA1d1541", via1_a),
+            ("GCRHEAD", head_a),
+        ]);
+        let b = build_vsf(&[
+            ("MAINCPU", cpu_module(0x1000, 0x10, 100)),
+            ("C64MEM", c64mem_module(&[], 0x37)),
+            ("CIA1", cia1_b),
+            ("VIC-II", vic_b),
+            ("SID", sid_b),
+            ("IECBUS", iec_b),
+            ("DRIVECPU", cpu_module(0xc010, 0x00, 90)),
+            ("VIA1d1541", via1_b),
+            ("GCRHEAD", head_b),
+        ]);
+        let diff = diff_snapshots(&a, &b);
+        // CIA1 reg 4 flagged with before/after.
+        let cia1c = diff["cia1"]["changedRegisters"].as_array().unwrap();
+        assert!(cia1c.iter().any(|r| r["reg"] == json!(4) && r["before"] == json!(0x11) && r["after"] == json!(0xab)));
+        // VIC border-colour reg flagged.
+        assert!(diff["vic"]["changedRegisters"].as_array().unwrap().iter().any(|r| r["reg"] == json!(0x20)));
+        // SID volume reg flagged.
+        assert!(diff["sid"]["changedRegisters"].as_array().unwrap().iter().any(|r| r["reg"] == json!(24)));
+        // IEC bus reflects the CLK transition (the diff is non-trivial / present).
+        assert!(diff.get("iecBus").is_some());
+        // Drive sub-diff present (both carry DRIVECPU): VIA1 reg + head position moved.
+        let drive = &diff["drive"];
+        assert!(drive["via1"]["changedRegisters"].as_array().unwrap().iter().any(|r| r["reg"] == json!(0)));
+        assert_eq!(drive["headPosition"]["trackHalfBefore"], json!(2));
+        assert_eq!(drive["headPosition"]["trackHalfAfter"], json!(36));
+        // formatDiff renders without panicking and mentions a chip section.
+        let text = format_diff(&diff);
+        assert!(!text.is_empty());
+    }
+
+    #[test]
     fn cpu_and_pla_change() {
         let a = build_vsf(&[
             ("MAINCPU", cpu_module(0x1000, 0x10, 100)),

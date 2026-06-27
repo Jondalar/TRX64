@@ -90,9 +90,33 @@ const MACHINE_SYNC_PAL: u32 = 0;
 pub fn capture_drive1541(drive: &mut Drive1541) -> Vec<u8> {
     let mut s = SnapshotT::create_in_memory();
     write_drive_module(drive, &mut s);
+    // VICE drive_snapshot_write_module walks ALL NUM_DISK_UNITS (drives 8..11) and
+    // emits a DRIVE<n> chunk for each — full for the live unit 0 (DRIVE8, has_tde=1),
+    // a has_tde=0/has_drives=0 STUB for the absent units 1..3 (drive_snapshot.ts
+    // :402-419 ≡ drive-snapshot.c:182-210). TRX64 emitted only DRIVE8, so a saved VSF
+    // was 72 bytes short of the TS authority (3 × 24-byte stubs) — formats-state-1
+    // length divergence. Emit the stubs to restore byte-for-byte module symmetry.
+    // (Spec 612 PL-9: write VICE-format module chunks, not a TRX64-shaped subset.)
+    write_drive_stub_module(&mut s, 9);
+    write_drive_stub_module(&mut s, 10);
+    write_drive_stub_module(&mut s, 11);
     write_drivecpu_module(drive, &mut s);
     write_via_modules(drive, &mut s);
     s.to_bytes()
+}
+
+/// Write a DRIVE<n> module for a present-but-TDE-OFF disk unit — the symmetry chunk
+/// VICE/TS emit for every NUM_DISK_UNITS slot. In the c64re TS authority units 9..11
+/// are non-null diskunit objects with `Drive%iTrueEmulation` OFF, so the full branch
+/// runs but stops after the two header bytes: has_tde=0, has_drives=1 (single drive,
+/// `drive_is_dualdrive_by_devnr ? 2 : 1` ⇒ 1). With has_tde=0 NO further fields are
+/// written, so the chunk is exactly the 22-byte header + `00 01` = 24 bytes
+/// (drive_snapshot.ts:422-444). `n` is the drive number (9/10/11). (Spec 612 PL-9.)
+fn write_drive_stub_module(s: &mut SnapshotT, n: u32) {
+    let mut m = s.module_create(&format!("DRIVE{n}"), DRIVE_SNAP_MAJOR, DRIVE_SNAP_MINOR);
+    s.smw_b(&mut m, 0); // has_tde   = 0 (Drive<n>TrueEmulation off)
+    s.smw_b(&mut m, 1); // has_drives = 1 (single drive present)
+    s.module_close(&m);
 }
 
 /// Restore the live drive from a `drive1541` blob (= c64re `drive1541.restore()`).

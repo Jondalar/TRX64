@@ -297,6 +297,41 @@ mod tests {
     }
 
     #[test]
+    fn populated_non_root_branch_json_shape() {
+        // The WS surface only ever exposes the ROOT branch (snapshot_tree mints a
+        // fresh RewindManager per call, and the apply-patch/run-forward verbs throw
+        // the beginRewindSession guard) — so a POPULATED (non-root) tree is not
+        // WS-reachable on EITHER runtime (ws-rewind-snapshot-tree records this). This
+        // unit test proves the populated-branch serialization the WS handler WOULD
+        // emit if a fork existed: a child branch carries parentId, rootId, a non-empty
+        // patches[], endCycle/endSnapshotId/resultHash, and a children list — all in
+        // the camelCase wire shape, with the root-only `undefined` fields now present.
+        let child = SnapshotBranch {
+            id: "branch-child".into(),
+            parent_id: Some("branch-root".into()),
+            root_id: Some("branch-root".into()),
+            at_cycle: 5000,
+            patches: vec![json!({ "addr": 0x033c, "bytes": [0xff] })],
+            start_snapshot_id: "snap-A".into(),
+            end_cycle: Some(6000),
+            end_snapshot_id: Some("snap-B".into()),
+            result_hash: Some("deadbeef".into()),
+            children: vec!["branch-grandchild".into()],
+        };
+        let v = child.to_json();
+        assert_eq!(v["id"], json!("branch-child"));
+        assert_eq!(v["parentId"], json!("branch-root"));
+        assert_eq!(v["rootId"], json!("branch-root"));
+        assert_eq!(v["atCycle"], json!(5000));
+        assert_eq!(v["patches"], json!([{ "addr": 0x033c, "bytes": [0xff] }]));
+        assert_eq!(v["startSnapshotId"], json!("snap-A"));
+        assert_eq!(v["endCycle"], json!(6000));
+        assert_eq!(v["endSnapshotId"], json!("snap-B"));
+        assert_eq!(v["resultHash"], json!("deadbeef"));
+        assert_eq!(v["children"], json!(["branch-grandchild"]));
+    }
+
+    #[test]
     fn promote_unknown_branch_errors_like_ts() {
         let rm = RewindManager::new("sess-1", "/disks/x.d64", 0, None);
         let e = rm.promote_branch("nope-not-a-real-id", "true-drive").unwrap_err();
