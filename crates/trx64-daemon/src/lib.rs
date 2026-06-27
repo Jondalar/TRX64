@@ -34,6 +34,14 @@ pub use daemon::{
 // The event-broadcast hub (subscribe a forwarder channel → typed events).
 pub use daemon::streaming;
 
+/// Process-wide reSID construction count (see `trx64_core::resid_ffi`). Re-exported so
+/// the FFI audio-path tests can ASSERT the persistent-engine contract — the
+/// `audioDrain()` render thread constructs reSID ONCE, not per drain (the per-drain
+/// reconstruct was the ~60 Hz hum). Test-facing only.
+pub fn resid_construct_count() -> u64 {
+    trx64_core::resid_ffi::resid_construct_count()
+}
+
 // `main.rs`'s submodules (streaming.rs, project_knowledge.rs) reference a handful of
 // items by the CRATE-ROOT path (`crate::stream_*`, `crate::now_iso8601_utc`). In the
 // `[[bin]]` those live at the crate root (main.rs IS the root); in this `[lib]` they

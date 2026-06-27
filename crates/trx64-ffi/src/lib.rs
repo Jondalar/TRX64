@@ -249,10 +249,14 @@ impl Runtime {
     /// `Int16` at [`audioSampleRate`] (44100 Hz), ready to fill an `AVAudioPCMBuffer`
     /// (`int16ChannelData`). Draining EMPTIES the buffer, so repeated calls don't
     /// re-deliver. Pull this in the AVAudioEngine source callback. The first call
-    /// installs the SID capture hook + primes reSID and returns empty (no cycles have
-    /// elapsed yet); thereafter each call returns the samples for exactly the cycles
-    /// run since the previous drain (reSID synthesis-state is carried across pulls, so
-    /// the stream is continuous — no clicks).
+    /// installs the SID capture hook + spawns the audio render thread (which constructs
+    /// reSID ONCE and primes it) and returns empty (no cycles have elapsed yet);
+    /// thereafter each call returns the samples for exactly the cycles run since the
+    /// previous drain. Rendering is a CONTINUOUS persistent-engine render drained from a
+    /// PCM ring (mirrors the `--stream` loop / C64RE Spec 768): the render thread holds
+    /// one reSID engine for the whole session, fed by a SID write-ring; `audioDrain()`
+    /// just pops the PCM ring — no per-pull reconstruct, so the stream is continuous
+    /// across drain boundaries (no clicks, no hum).
     pub fn audio_drain(&self) -> Vec<i16> {
         pull_audio_drain(&self.state).samples
     }

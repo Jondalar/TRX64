@@ -184,3 +184,131 @@ fn live_av_pull_api() {
 
     eprintln!("[smoke] OK — live A/V pull-API proven (frameBuffer + audioDrain)");
 }
+
+/// Persistent-engine audio render-thread contract (the ~60 Hz hum fix). Drives
+/// several emulation windows feeding the render thread, drains repeatedly, and
+/// asserts the three properties that the per-drain-reconstruct path violated:
+///   (a) the PCM is CONTINUOUS across drain boundaries — no large sample-to-sample
+///       jump at a seam that wasn't in the source (the hum was a per-drain seam
+///       discontinuity);
+///   (b) the sample count over a ~1 s real-time-equivalent run ≈ 44100 (rate
+///       correct — the engine advances by the REAL elapsed cycles);
+///   (c) the reSID engine is CONSTRUCTED ONCE for the whole session (no per-drain
+///       reconstruct) — the construction counter grows by exactly 1 across all the
+///       drains.
+#[test]
+fn audio_persistent_engine_continuity() {
+    let roms = rom_dir();
+    if !roms.join("kernal-901227-03.bin").exists() {
+        eprintln!("[smoke] ROMs not found at {} — skipping", roms.display());
+        return;
+    }
+
+    let rt = Runtime::new(roms.to_string_lossy().to_string()).expect("Runtime::new");
+    rt.create_session(true).expect("create_session");
+    rt.reset(true).expect("cold reset to READY");
+
+    const PAL_CYCLES_PER_FRAME: u64 = 19_656; // ~50 Hz PAL frame (matches streaming.rs)
+    const FRAMES: u64 = 50; // ~1 s of real-time-equivalent emulation
+    const SAMPLE_RATE: u64 = 44_100;
+
+    // First drain installs the hook + spawns the render thread (constructs reSID once)
+    // → empty (no cycles yet). Snapshot the construction count AFTER the engine exists.
+    let primed = rt.audio_drain();
+    assert!(primed.is_empty(), "prime drain is empty (no cycles yet)");
+    let constructs_after_prime = trx64_daemon::resid_construct_count();
+    assert!(
+        constructs_after_prime >= 1,
+        "the render thread constructed reSID at least once"
+    );
+
+    // ── Drive FRAMES windows, draining each, KEEPING the per-window chunks ──
+    // Keeping the chunks lets us distinguish a SEAM delta (last sample of window N →
+    // first sample of window N+1) from an INTRA-window delta — the whole point of the
+    // continuity check (a per-drain reconstruct injects an outlier at the seams only).
+    let mut chunks: Vec<Vec<i16>> = Vec::new();
+    let mut stream: Vec<i16> = Vec::new();
+    for f in 0..FRAMES {
+        rt.run_cycles(PAL_CYCLES_PER_FRAME).expect("run a PAL frame");
+        let chunk = rt.audio_drain();
+        assert!(
+            !chunk.is_empty(),
+            "frame {f}: a frame of running yields PCM (persistent engine renders the window)"
+        );
+        stream.extend_from_slice(&chunk);
+        chunks.push(chunk);
+    }
+
+    // (c) CONSTRUCT-ONCE: the counter did NOT grow across the FRAMES drains — the
+    // engine is the SAME persistent instance, never reconstructed per drain.
+    let constructs_after_run = trx64_daemon::resid_construct_count();
+    assert_eq!(
+        constructs_after_run, constructs_after_prime,
+        "reSID was reconstructed during draining (per-drain reconstruct = the hum): \
+         {constructs_after_prime} → {constructs_after_run}"
+    );
+
+    // (b) RATE: ~44100 samples per ~1 s of real-time-equivalent cycles. Allow a ±5 %
+    // band for reSID's fractional sample timing + the final partial window.
+    let expected = SAMPLE_RATE as f64; // FRAMES * PAL_CYCLES_PER_FRAME ≈ 1 s @ ~985 kHz
+    let got = stream.len() as f64;
+    eprintln!(
+        "[smoke] persistent-engine audio: {} samples over {} frames (~{:.0} expected); \
+         constructs={}",
+        stream.len(),
+        FRAMES,
+        expected,
+        constructs_after_run
+    );
+    assert!(
+        (got - expected).abs() / expected < 0.05,
+        "sample rate off: got {got} samples, expected ~{expected} (±5 %)"
+    );
+
+    // (a) CONTINUITY at the seams. Compute, SEPARATELY:
+    //   * `max_intra_step` = largest adjacent |Δ| WITHIN any single window (the natural
+    //     ceiling of a continuous signal — never crosses a drain boundary), and
+    //   * `max_seam_step` = largest |Δ| ACROSS a drain boundary (last of window N →
+    //     first of window N+1).
+    // A persistent engine produces seam deltas indistinguishable from intra-window
+    // deltas (the signal is one continuous render, only chopped for delivery). The
+    // per-drain reconstruct restarted reSID's resampler FIR every drain → a sharp seam
+    // SPIKE far above the smooth in-window deltas (the audible ~60 Hz hum). So a real
+    // guard: every seam step must be within the intra-window ceiling (+ a tiny margin).
+    let mut max_intra_step: i32 = 0;
+    for c in &chunks {
+        for w in c.windows(2) {
+            let d = (w[1] as i32 - w[0] as i32).abs();
+            if d > max_intra_step {
+                max_intra_step = d;
+            }
+        }
+    }
+    let mut max_seam_step: i32 = 0;
+    for pair in chunks.windows(2) {
+        if let (Some(&prev_last), Some(&this_first)) = (pair[0].last(), pair[1].first()) {
+            let d = (this_first as i32 - prev_last as i32).abs();
+            if d > max_seam_step {
+                max_seam_step = d;
+            }
+        }
+    }
+    eprintln!(
+        "[smoke] continuity: max seam step={} max intra-window step={} ({} boundaries)",
+        max_seam_step,
+        max_intra_step,
+        chunks.len().saturating_sub(1)
+    );
+    // A persistent, continuous render keeps the seam step at or below the intra-window
+    // ceiling. Allow a small margin (the seam crosses a slightly-longer cycle gap due
+    // to the host pull cadence vs. a fixed sample stride). A reconstruct seam would be
+    // many×; this catches the regression with headroom for benign timing jitter.
+    let ceiling = max_intra_step + max_intra_step / 4 + 64; // intra + 25 % + floor
+    assert!(
+        max_seam_step <= ceiling,
+        "a drain seam step ({max_seam_step}) is an OUTLIER vs the intra-window ceiling \
+         ({ceiling}) — discontinuity at a boundary (the per-drain-reconstruct hum)"
+    );
+
+    eprintln!("[smoke] OK — persistent-engine continuity + rate + construct-once proven");
+}

@@ -380,34 +380,74 @@ pub struct State {
     /// command-driven daemon signals the refresh too.
     force_present_frame: bool,
     /// Live A/V PULL-API (FFI / native app, ADR-073 §pull) — the persistent SID
-    /// audio pump for [`pull_audio_drain`]. `None` until the first `audioDrain()`
-    /// installs the SID write-trace hook + primes reSID. The reSID engine itself is
-    /// `!Send` (it holds the process-global reSID `MutexGuard`), so it CANNOT live in
-    /// `State` (which must be `Send` for `Arc<Mutex<State>>`); instead the pump keeps
-    /// only `Send` state — the shared write-capture buffer, the reSID synthesis-state
-    /// checkpoint (continuity across pulls), and the last clk — and reconstructs the
-    /// engine + `restore_state`s it on each drain (= the streaming-loop pattern, pull-
-    /// shaped). Off by default → zero cost until the app starts pulling audio.
-    audio_pump: Option<AudioPump>,
+    /// audio renderer for [`pull_audio_drain`]. `None` until the first `audioDrain()`
+    /// installs the SID write-trace hook + spawns the render thread. The reSID engine
+    /// itself is `!Send` (it holds the process-global reSID `MutexGuard`), so it lives
+    /// on a DEDICATED render thread — constructed ONCE, never reconstructed, never
+    /// crossing threads. `State` keeps only the `Send` handles (write-capture buffer,
+    /// write-ring sender, PCM ring, thread join + stop). This MIRRORS the `--stream`
+    /// loop (`streaming.rs` `stream_loop`) and C64RE's Spec 768 reSID worker:
+    /// write-ring (emu→render) → persistent engine → PCM-ring (render→main). Off by
+    /// default → zero cost until the app starts pulling audio. Joined on `State` drop.
+    audio_render: Option<AudioRenderThread>,
 }
 
-/// Live A/V PULL-API — persistent, `Send` state for the SID audio pump
-/// ([`pull_audio_drain`]). See the `audio_pump` field doc for WHY the reSID engine
-/// is not held here.
-struct AudioPump {
+/// Live A/V PULL-API — persistent, `Send` handles for the FFI SID audio render
+/// thread ([`pull_audio_drain`]). The `!Send` reSID `SidAudioEngine` is owned BY the
+/// render thread (constructed once, thread-confined → persistent, never
+/// reconstructed); `State` holds only these `Send` channels + lifecycle handles.
+/// Mirrors `streaming.rs` `stream_loop` (persistent engine on its own thread) and
+/// C64RE Spec 768 (persistent engine on a worker, fed by a write-ring, producing a
+/// PCM ring).
+struct AudioRenderThread {
     /// SID register writes captured by the `set_write_trace` hook since the last
     /// drain (CPU order, $D4xx offset masked to 0x00..0x1f). Shared with the hook
-    /// (`Box<dyn FnMut + Send>`); drained + cleared every pull.
+    /// (`Box<dyn FnMut + Send>`); drained + cleared every pull, then sent (with the
+    /// window's `d_cycles`) over the write-ring.
     writes: std::sync::Arc<std::sync::Mutex<Vec<(u8, u8)>>>,
-    /// reSID synthesis-state checkpoint (= `SidAudioEngine::capture_state` /
-    /// VICE `sid_snapshot_state_t`) — carries filter/envelope/oscillator state
-    /// across pulls so the per-call engine reconstruction is continuous (no clicks).
-    /// Empty before the first drain primes the engine.
-    resid_state: Vec<u8>,
-    /// The `c64_core.clk` value at the previous drain. The next drain emits PCM for
+    /// The write-ring (emu→render). Each `audioDrain()` sends `(window writes in CPU
+    /// order, d_cycles for that window)`; the render thread replays them into the
+    /// persistent engine, closes the boundary, flushes → PCM. `Send` (the engine
+    /// never crosses here — only the data).
+    tx: std::sync::mpsc::Sender<(Vec<(u8, u8)>, u32)>,
+    /// The PCM ring (render→main). The render thread pushes the reSID PCM it produced;
+    /// `audioDrain()` pops accumulated samples (FIFO). NO engine access on drain.
+    pcm: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<i16>>>,
+    /// Total Φ2 cycles the render thread has CONSUMED (one boundary per window). The
+    /// drain side bumps `sent_cycles` when it sends a window and waits (bounded) until
+    /// `processed_cycles == sent_cycles` before popping, so a pull returns the PCM for
+    /// the window it just sent (deterministic for callers that pull then read, like the
+    /// smoke test) while the engine stays persistent + the stream continuous.
+    processed_cycles: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Total Φ2 cycles SENT to the render thread so far (sum of every window's
+    /// `d_cycles`). Drain waits for `processed_cycles` to reach this before popping.
+    sent_cycles: u64,
+    /// The `c64_core.clk` value at the previous drain. The next drain sends PCM for
     /// exactly `clk_now - last_clk` cycles (= the streaming loop's per-frame
-    /// `d_cycles`, but over the host's pull window).
+    /// `d_cycles`, but over the host's pull window) — so the engine advances by the
+    /// REAL elapsed cycles (44100 samples/s at ~1 MHz real-time).
     last_clk: u64,
+    /// Stop flag — set on drop; the render thread also exits when the `tx` is dropped
+    /// (its `recv()` returns `Err`), so this is a belt-and-braces signal.
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The render-thread join handle. `Drop` signals stop + drops `tx` (closing the
+    /// channel) then joins, so the thread (and its reSID guard) is released cleanly —
+    /// no leak, no UB.
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for AudioRenderThread {
+    fn drop(&mut self) {
+        // Signal stop so the render loop exits on its next timeout-poll, then join. The
+        // render loop also exits if `tx` is dropped (recv → Disconnected); the stop flag
+        // covers the case where a window is mid-render. `tx` (a plain field) is dropped
+        // after this body, but the timeout-poll guarantees the thread wakes regardless,
+        // so the join never deadlocks. One construct, one drop of the reSID engine.
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
 }
 
 /// T2.8 — the monitor-shell.ts module-level per-session state, collapsed for the
@@ -12407,7 +12447,7 @@ pub fn build_state(session: Session, streaming_on: bool) -> State {
         flow: FlowTracker::new(),
         stream_broke_on_jam: false,
         force_present_frame: false,
-        audio_pump: None,
+        audio_render: None,
     }
 }
 
@@ -12492,27 +12532,35 @@ pub const AUDIO_SAMPLE_RATE: u32 = 44_100;
 
 /// Drain + return the SID PCM accumulated since the last drain (empties on read).
 ///
-/// First call: install the additive SID `set_write_trace` hook (capturing $D4xx
-/// writes into a shared buffer), prime reSID from the live SID register file, and
-/// discard the priming silence — returning 0 samples (no cycles have elapsed yet).
-/// Each subsequent call: reconstruct a `SidAudioEngine`, `restore_state` the carried
-/// reSID synthesis-state (continuity, no clicks), replay the captured writes in CPU
-/// order, `record_boundary(clk_now - last_clk)`, `flush`, `take_pcm`, then save the
-/// synthesis-state + `last_clk` back. This is the streaming-loop audio pattern in a
-/// PULL shape: the engine is built per-call because it is `!Send` (cannot live in the
-/// `Send` `State`); the carried synthesis-state makes that seamless.
+/// PERSISTENT-ENGINE render thread (mirrors the `--stream` loop / C64RE Spec 768):
 ///
-/// THREADING: serialized on the same `State` lock as every other access — the FFI
-/// `Runtime` already funnels all access through this one `Mutex`, so concurrent pulls
-/// from the video + audio threads are mutually exclusive (correct, never torn).
+/// First call: install the additive SID `set_write_trace` hook (capturing $D4xx
+/// writes into a shared buffer) + spawn the render thread. The render thread
+/// constructs ONE `SidAudioEngine`, primes it from the live SID register file (so the
+/// stream starts from the live state, not power-on silence), then loops draining the
+/// write-ring: replay the window's writes (CPU order) → `record_boundary(d_cycles)`
+/// → `flush` → push the PCM into the PCM ring. The engine PERSISTS across the whole
+/// session — never reconstructed (the per-drain reconstruct was the ~60 Hz hum). The
+/// first call sends no window (no cycles elapsed) → returns empty.
+///
+/// Each subsequent call: compute `d_cycles = clk_now - last_clk`, drain the captured
+/// writes, send `(writes, d_cycles)` over the write-ring to the render thread, then
+/// POP all accumulated samples from the PCM ring — NO engine access, NO reconstruct.
+/// The render thread advances the persistent engine by the REAL elapsed cycles, so
+/// the rate is correct (44100 samples/s at ~1 MHz real-time) and the stream is
+/// CONTINUOUS across drain boundaries (no seam discontinuity → no hum).
+///
+/// THREADING: the State lock serializes the send/pop side (the FFI `Runtime` funnels
+/// all access through this one `Mutex`); the render thread owns the `!Send` engine
+/// alone. The two communicate only over `Send` channels (write-ring + PCM ring).
 pub fn pull_audio_drain(state: &SharedState) -> AudioDrainData {
     use trx64_core::resid_audio::SidAudioEngine;
     use trx64_core::resid_ffi::ResidConfig;
 
     let mut st = state.lock().unwrap();
 
-    // ── First drain: install the capture hook + prime reSID, emit nothing ──
-    if st.audio_pump.is_none() {
+    // ── First drain: install the capture hook + spawn the persistent render thread ──
+    if st.audio_render.is_none() {
         let writes: std::sync::Arc<std::sync::Mutex<Vec<(u8, u8)>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         {
@@ -12524,27 +12572,112 @@ pub fn pull_audio_drain(state: &SharedState) -> AudioDrainData {
                     w.lock().unwrap().push((addr, value));
                 })));
         }
-        // Prime reSID with the live SID register file (frequencies/PW/control already
-        // set — not power-on silence), apply, discard the priming PCM, and snapshot the
-        // synthesis-state for the NEXT (real) drain. The engine is dropped at the end of
-        // this block → releases the process-global reSID guard.
-        let resid_state = {
-            let mut engine = SidAudioEngine::new(ResidConfig::default());
-            for reg in 0u8..=0x18 {
-                let v = st.session.machine.read_full(0xD400 + reg as u16);
-                engine.record_write(reg, v);
-            }
-            engine.record_boundary(0);
-            engine.flush();
-            let _ = engine.take_pcm(); // discard priming silence
-            engine.capture_state()
-        };
+        // Snapshot the live SID register file so the render thread primes reSID from the
+        // live state (frequencies/PW/control already set), exactly like the stream loop.
+        let mut prime: Vec<(u8, u8)> = Vec::with_capacity(0x19);
+        for reg in 0u8..=0x18 {
+            let v = st.session.machine.read_full(0xD400 + reg as u16);
+            prime.push((reg, v));
+        }
         let last_clk = st.session.machine.c64_core.clk;
-        st.audio_pump = Some(AudioPump {
+
+        // Write-ring (emu→render) + PCM ring (render→main) + stop flag + progress.
+        let (tx, rx) = std::sync::mpsc::channel::<(Vec<(u8, u8)>, u32)>();
+        let pcm: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<i16>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let processed_cycles =
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Set true by the thread once the engine is constructed + primed. The prime
+        // drain waits for it so (a) the construct has happened before we return (the
+        // construct-once invariant is observable) and (b) the FIRST real window renders
+        // (the engine exists before any data is sent).
+        let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let pcm_thread = std::sync::Arc::clone(&pcm);
+        let stop_thread = std::sync::Arc::clone(&stop);
+        let processed_thread = std::sync::Arc::clone(&processed_cycles);
+        let ready_thread = std::sync::Arc::clone(&ready);
+        let join = std::thread::Builder::new()
+            .name("trx64-ffi-audio".into())
+            .spawn(move || {
+                // ── PERSISTENT reSID engine — constructed ONCE on this thread, owned
+                // for the thread's whole life (never reconstructed). The MutexGuard it
+                // holds (RESID_GUARD) makes it !Send → it cannot leave this thread, which
+                // is exactly the contract. This is the streaming-loop / Spec-768 shape.
+                let mut engine = SidAudioEngine::new(ResidConfig::default());
+                // Prime: apply the live register snapshot, emit nothing, discard silence.
+                for (reg, v) in &prime {
+                    engine.record_write(*reg, *v);
+                }
+                engine.record_boundary(0);
+                engine.flush();
+                let _ = engine.take_pcm();
+                // Signal "engine constructed + primed" → unblocks the prime drain.
+                ready_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+
+                loop {
+                    if stop_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    // Poll the write-ring with a timeout so the stop flag is honored even
+                    // when the host is not pulling audio.
+                    match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                        Ok((window_writes, d_cycles)) => {
+                            // Drain THIS window: replay writes (CPU order) → boundary →
+                            // flush → PCM, on the PERSISTENT engine. Identical to the
+                            // stream loop's per-frame sequence.
+                            for (addr, value) in &window_writes {
+                                engine.record_write(*addr, *value);
+                            }
+                            engine.record_boundary(d_cycles);
+                            engine.flush();
+                            let mono = engine.take_pcm();
+                            if !mono.is_empty() {
+                                let mut ring = pcm_thread.lock().unwrap();
+                                ring.extend(mono.into_iter());
+                            }
+                            // Publish progress AFTER the PCM is in the ring, so a drain
+                            // that waits on `processed_cycles` always sees the samples.
+                            processed_thread.fetch_add(
+                                d_cycles as u64,
+                                std::sync::atomic::Ordering::SeqCst,
+                            );
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                        // Sender dropped (State dropped) → exit.
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                // `engine` drops here → releases the reSID guard. One construct, one drop.
+            })
+            .expect("spawn trx64-ffi audio render thread");
+
+        st.audio_render = Some(AudioRenderThread {
             writes,
-            resid_state,
+            tx,
+            pcm,
+            processed_cycles,
+            sent_cycles: 0,
             last_clk,
+            stop,
+            join: Some(join),
         });
+        // Wait (bounded) for the render thread to construct + prime the engine before
+        // returning, so the engine exists before the first window is sent and the
+        // construct-once invariant is observable to the caller. `Resid::new` may block
+        // on the process-global RESID_GUARD if a prior render thread is still being
+        // dropped, so allow a generous ceiling; the construct itself is sub-ms.
+        {
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !ready.load(std::sync::atomic::Ordering::SeqCst) {
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+        }
         // No cycles elapsed since install → no audio this call.
         return AudioDrainData {
             samples: Vec::new(),
@@ -12552,33 +12685,50 @@ pub fn pull_audio_drain(state: &SharedState) -> AudioDrainData {
         };
     }
 
-    // ── Subsequent drain: emit PCM for the cycles since last drain ──
+    // ── Subsequent drain: send this window to the render thread, pop accumulated PCM ──
     let clk_now = st.session.machine.c64_core.clk;
-    // Take the pump out so we can mutably borrow it AND the machine; put it back after.
-    let mut pump = st.audio_pump.take().expect("audio_pump present");
-    let d_cycles = clk_now.wrapping_sub(pump.last_clk);
-    // Drain the captured writes (CPU order) without holding the lock across the engine.
+    let render = st.audio_render.as_mut().expect("audio_render present");
+    let d_cycles = clk_now.wrapping_sub(render.last_clk);
+    render.last_clk = clk_now;
+
+    // Drain the captured writes (CPU order) and send the window to the render thread.
     let captured: Vec<(u8, u8)> = {
-        let mut pending = pump.writes.lock().unwrap();
+        let mut pending = render.writes.lock().unwrap();
         std::mem::take(&mut *pending)
     };
+    // reSID's emit cycle-count is a u32 window; clamp the (normally tiny per-pull)
+    // delta defensively so a huge gap can't overflow the cast.
+    let d_cycles_u32 = d_cycles.min(u32::MAX as u64) as u32;
+    render.sent_cycles = render.sent_cycles.wrapping_add(d_cycles_u32 as u64);
+    let target = render.sent_cycles;
+    let processed = std::sync::Arc::clone(&render.processed_cycles);
+    // Send the window. If the render thread is gone (shouldn't happen while State is
+    // alive), the send errors — return whatever PCM is already buffered.
+    let _ = render.tx.send((captured, d_cycles_u32));
 
-    let samples = {
-        let mut engine = SidAudioEngine::new(ResidConfig::default());
-        engine.restore_state(&pump.resid_state);
-        for (addr, value) in &captured {
-            engine.record_write(*addr, *value);
+    // Wait (bounded) for the render thread to consume the window we just sent, so this
+    // pull returns the PCM for the cycles that elapsed before it (deterministic for a
+    // pull-then-read caller). The persistent engine renders continuously, so this is a
+    // sub-ms hand-off in practice; cap at ~50 ms so a stalled render thread can't hang
+    // the host. (The State lock is held, but the render thread never touches State, so
+    // there is no deadlock.)
+    if d_cycles_u32 > 0 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+        while processed.load(std::sync::atomic::Ordering::SeqCst) < target {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
         }
-        // reSID's emit cycle-count is a u32 window; clamp the (normally tiny per-pull)
-        // delta defensively so a huge gap can't overflow the cast.
-        engine.record_boundary(d_cycles.min(u32::MAX as u64) as u32);
-        engine.flush();
-        let pcm = engine.take_pcm();
-        pump.resid_state = engine.capture_state();
-        pcm
+    }
+
+    // Pop ALL accumulated PCM from the ring — NO engine access, NO reconstruct. Across
+    // pulls the stream is whole + continuous (the engine is persistent), so there is no
+    // seam discontinuity at a drain boundary → no ~60 Hz hum.
+    let samples: Vec<i16> = {
+        let mut ring = render.pcm.lock().unwrap();
+        ring.drain(..).collect()
     };
-    pump.last_clk = clk_now;
-    st.audio_pump = Some(pump);
 
     AudioDrainData {
         samples,
@@ -12744,7 +12894,7 @@ mod batch1_tests {
             flow: FlowTracker::new(),
             stream_broke_on_jam: false,
             force_present_frame: false,
-            audio_pump: None,
+            audio_render: None,
         }))
     }
 

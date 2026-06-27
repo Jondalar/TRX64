@@ -16,7 +16,19 @@
 //! GPL-3.0-or-later. See vendor/resid/PROVENANCE.md.
 
 use std::os::raw::{c_double, c_int};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+
+/// Process-wide count of `Resid::new` calls (= reSID engine constructions).
+/// Used by the audio-path tests to ASSERT the persistent-engine contract: the
+/// FFI `audioDrain()` render thread must construct the engine ONCE, not once per
+/// drain (the per-drain reconstruct was the ~60 Hz hum). Monotonic; never reset.
+pub static RESID_CONSTRUCT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Read the process-wide reSID construction count (see [`RESID_CONSTRUCT_COUNT`]).
+pub fn resid_construct_count() -> u64 {
+    RESID_CONSTRUCT_COUNT.load(Ordering::SeqCst)
+}
 
 /// The shim is a SINGLE module-global `reSID::SID`. This process-wide guard
 /// serializes the (cheap) construct/configure window so concurrent `Resid::new`
@@ -144,6 +156,7 @@ impl Resid {
     /// one global SID).
     pub fn new(cfg: ResidConfig) -> Self {
         let guard = RESID_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        RESID_CONSTRUCT_COUNT.fetch_add(1, Ordering::SeqCst);
         let r = Self { cfg, cycle_acc: 0.0, _guard: guard };
         r.configure();
         r
