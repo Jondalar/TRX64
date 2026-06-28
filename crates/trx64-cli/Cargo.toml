@@ -38,4 +38,10 @@ base64 = "0.22"
 ratatui = "0.29"
 crossterm = "0.28"
 
-# NOTE: the native emulator window (Part 2) adds winit + softbuffer + cpal here.
+# ── Native emulator window (Part 2) ──────────────────────────────────────────
+# winit owns the window + input event loop (MUST run on the main thread on macOS).
+# softbuffer does a CPU pixel blit (no GPU/wgpu tree → fast build, broad portability).
+# cpal is the cross-platform audio backend (CoreAudio / ALSA / WASAPI).
+winit = "0.30"
+softbuffer = "0.4"
+cpal = "0.15"

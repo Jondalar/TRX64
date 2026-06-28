@@ -121,14 +121,10 @@ fn main() {
         }
     });
 
-    // Main-thread loop: wait for the cockpit's signals. In Part 1 the window is not
-    // yet built, so `OpenWindow` is acknowledged with a log-only stub; `--window`
-    // likewise notes the window ships in Part 2. The MAIN thread is deliberately the
-    // owner of this dispatch so Part 2 can drop a winit EventLoop in here unchanged.
-    if cli.window {
-        eprintln!("[trx64-cli] --window: the native emulator window ships in Part 2; running the cockpit only.");
-    }
-    window::main_thread_loop(&engine, to_main_rx);
+    // Main-thread loop: owns the winit EventLoop (macOS requires the main thread).
+    // The cockpit's `window` verb opens the emulator window on demand; `--window`
+    // opens it at launch. Both run alongside the cockpit on the SAME machine.
+    window::main_thread_loop(&engine, to_main_rx, cli.window);
 
     engine_quit(&engine);
     let _ = tui.join();

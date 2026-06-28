@@ -72,9 +72,8 @@ impl Engine {
         }
     }
 
-    /// The underlying shared machine — used by the Part 2 window's A/V pull loop
+    /// The underlying shared machine — used by the emulator window's A/V pull loop
     /// (`pull_frame_buffer` / `pull_audio_drain`).
-    #[allow(dead_code)] // consumed by the Part 2 emulator window
     pub fn shared_state(&self) -> &SharedState {
         &self.state
     }
@@ -391,27 +390,20 @@ impl Engine {
         }
     }
 
-    // ── input (window forwards host keys/joystick through these) ────────────────
-    //
-    // These are driven by the Part 2 emulator window (host keyboard → matrix;
-    // arrows/space/gamepad → joystick). Allowed-dead in Part 1.
+    // ── input (the emulator window forwards host keys/joystick through these) ────
 
-    #[allow(dead_code)]
     pub fn key_down(&self, key: &str) {
         let _ = self.rpc("session/key_down", json!({ "key": key }));
     }
-    #[allow(dead_code)]
     pub fn key_up(&self, key: &str) {
         let _ = self.rpc("session/key_up", json!({ "key": key }));
     }
-    #[allow(dead_code)]
     pub fn joystick_set(&self, port: u8, up: bool, down: bool, left: bool, right: bool, fire: bool) {
         let _ = self.rpc(
             "session/joystick_set",
             json!({ "port": port, "up": up, "down": down, "left": left, "right": right, "fire": fire }),
         );
     }
-    #[allow(dead_code)]
     pub fn joystick_clear(&self, port: u8) {
         let _ = self.rpc("session/joystick_clear", json!({ "port": port }));
     }
