@@ -104,13 +104,21 @@ fn main() {
             if pump_engine.should_quit() {
                 break;
             }
+            let t0 = std::time::Instant::now();
             let advanced = pump_engine.pump_frame();
             if advanced == 0 {
                 // Paused (or warp-stopped): idle a frame.
                 thread::sleep(frame);
             } else if !pump_engine.is_warp() {
-                // Real-time PAL: pace one frame. (Warp runs flat-out.)
-                thread::sleep(frame);
+                // Real-time PAL: pace to a 20 ms FRAME PERIOD — sleep only the remainder
+                // after the emulation work. `pump_frame` then sleep(20ms) made the period
+                // work+20ms (< 50 fps) → SID production fell below 44100/s → the audio
+                // ring slowly underran → periodic stutter. Subtracting the work keeps it
+                // at ~50 fps so production matches the output rate.
+                let elapsed = t0.elapsed();
+                if elapsed < frame {
+                    thread::sleep(frame - elapsed);
+                }
             }
         }
     });

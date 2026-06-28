@@ -76,8 +76,12 @@ impl AudioOutput {
             buffer_size: cpal::BufferSize::Default,
         };
 
-        // ~40 ms pre-roll cushion @ 44100.
-        let ring = Arc::new(Mutex::new(Ring::new((AUDIO_SAMPLE_RATE as usize) * 40 / 1000)));
+        // Pre-roll cushion. The producer fills in BURSTS (~882 samples per 20 ms pump
+        // frame, 0 between), and thread::sleep frame pacing jitters, so a small cushion
+        // underruns → re-prime → audible gaps. ~150 ms (≈7 frames) absorbs the
+        // burstiness + jitter; the 250 ms cap below still bounds latency. (Matches the
+        // SwiftUI AudioOutput's ~180 ms target.)
+        let ring = Arc::new(Mutex::new(Ring::new((AUDIO_SAMPLE_RATE as usize) * 150 / 1000)));
 
         let stream = build_stream(&device, &config, sample_format, channels, Arc::clone(&ring))?;
         if let Err(e) = stream.play() {
