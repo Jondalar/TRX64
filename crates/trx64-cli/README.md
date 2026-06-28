@@ -33,6 +33,34 @@ on. `/pause` freezes it; `/run` resumes.
 
 ---
 
+## Install — run it as `trx64cli`
+
+The binary is named **`trx64cli`** (no dash). Two ways to get it on your shell, all three
+OSes:
+
+**Self-compile (needs Rust)** — the simplest path:
+
+```bash
+cargo install --path crates/trx64-cli
+```
+
+`cargo install` builds in release mode and drops `trx64cli` into `~/.cargo/bin`
+(`%USERPROFILE%\.cargo\bin\trx64cli.exe` on Windows), which rustup already put on your
+`PATH`. Then run **`trx64cli`** from any shell — macOS, Linux, Windows.
+
+**Prebuilt (no Rust)** — for distribution to the scene: a GitHub Actions matrix
+(`ubuntu-latest` / `windows-latest` / `macos-latest`) builds `trx64cli` **natively** per
+OS and attaches the binaries to a GitHub release. Download the one for your OS, drop it on
+your `PATH`. Native builds sidestep the reSID C++ cross-compile entirely (each runner has
+a working toolchain) — see `docs/spec-cross-platform-linux-windows.md`.
+
+> **ROMs are not bundled.** `trx64cli` needs `resources/roms` (KERNAL/BASIC/CHARGEN +
+> 1541) — Commodore IP, never shipped in the binary or a release. Install them separately
+> (the ROM script) and point `--rom-dir` at them (or keep them under
+> `$C64RE_ROOT/resources/roms`).
+
+---
+
 ## Two vocabularies: `/` = machine, bare = monitor
 
 The command line follows one rule (shared with C64RE + the app —

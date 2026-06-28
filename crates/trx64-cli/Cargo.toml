@@ -17,7 +17,9 @@ name = "trx64_cli"
 path = "src/lib.rs"
 
 [[bin]]
-name = "trx64-cli"
+# The installed/distributed command is `trx64cli` (no dash) — `cargo install` puts it
+# on PATH under this name, and the release binaries are named this per OS.
+name = "trx64cli"
 path = "src/main.rs"
 
 [dependencies]
