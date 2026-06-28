@@ -128,6 +128,12 @@ pub struct WildTransfer {
     pub vector_addr: Option<u16>,
     pub confidence: Confidence,
     pub note: String,
+    /// TRX64 feature-request #3 — true when the wild transfer could NOT be identified
+    /// because it lies OLDER than the live history ring (the ring window is too short),
+    /// as opposed to a transfer that was genuinely indeterminate from a present window.
+    /// Drives the typed `ring_exhausted` signal so the user reads "bump revdepth /
+    /// trigger earlier", not "no data / wrong PC".
+    pub ring_bound: bool,
 }
 
 /// The stack slot a pop read, and who last wrote it (the corruptor candidate).
@@ -159,6 +165,13 @@ pub struct TriageChain {
     /// True when the crash was a genuine stack-smash and the triage pinned a writer for
     /// at least one popped slot (the high-value case).
     pub pinned_corruptor: bool,
+    /// TRX64 feature-request #1 — the PINNED loop/halt onset: the control transfer that
+    /// ENTERED the tight loop / halt-trap the machine is now spinning in, captured at
+    /// onset and exempt from ring eviction. `Some` when the always-on detector pinned a
+    /// loop entry since the last timeline boundary (it survives even after the
+    /// spinning-storm evicted the transfer from the live history ring — the recurring
+    /// "transfer older than the ring" blind spot). `None` when no loop was detected.
+    pub loop_onset: Option<crate::delta_ring::LoopOnset>,
     /// A human-readable one-line summary (the compact chain) + any honesty caveats.
     pub summary: String,
 }
@@ -244,9 +257,16 @@ pub fn triage<R: Fn(u16) -> u8>(inp: TriageInputs<R>) -> TriageChain {
         }
     }
 
+    // ── 4. TRX64 feature-request #1 — the PINNED loop/halt onset. The always-on
+    // detector pinned the entry transfer the instant the tight loop / halt began, so it
+    // is available even when the spinning-storm has long since evicted that transfer
+    // from the live history ring. Read-only.
+    let loop_onset = inp.delta.loop_onset();
+
     let crash = CrashPoint { pc: crash_pc, opcode: crash_opcode, lead_in };
-    let summary = format_summary(&crash, &transfer, &corruptor_slots, pinned_corruptor);
-    TriageChain { crash, transfer, corruptor_slots, pinned_corruptor, summary }
+    let summary =
+        format_summary(&crash, &transfer, &corruptor_slots, pinned_corruptor, loop_onset.as_ref());
+    TriageChain { crash, transfer, corruptor_slots, pinned_corruptor, loop_onset, summary }
 }
 
 /// Collapse the ring tail's consecutive duplicate PCs (the JAM re-fetch storm) and keep
@@ -286,6 +306,7 @@ fn find_wild_transfer(history: &[CpuHistEntry], crash_pc: u16) -> WildTransfer {
         note: "no control-flow instruction found before the crash PC in the live \
                history ring (the derail predates the ring, or PC walked off a block)"
             .to_string(),
+        ring_bound: false,
     };
     if history.is_empty() {
         out.note =
@@ -320,8 +341,10 @@ fn find_wild_transfer(history: &[CpuHistEntry], crash_pc: u16) -> WildTransfer {
     let transfer_idx = match landing_idx {
         Some(0) => {
             // The landing is the oldest entry in the window — the transfer that produced
-            // it fell off the back of the ring.
+            // it fell off the back of the ring. TRX64 feature-request #3: this is the
+            // ring-boundary case (window too short), not an indeterminate one.
             out.confidence = Confidence::Low;
+            out.ring_bound = true;
             out.note = format!(
                 "the crash PC ${crash_pc:04X} is the oldest instruction still in the \
                  ring — the transfer that jumped here is older than the reverse window"
@@ -411,6 +434,27 @@ fn find_wild_transfer(history: &[CpuHistEntry], crash_pc: u16) -> WildTransfer {
 
 /// Build the compact one-line chain + honesty caveats.
 fn format_summary(
+    crash: &CrashPoint,
+    transfer: &WildTransfer,
+    slots: &[StackSlot],
+    pinned: bool,
+    loop_onset: Option<&crate::delta_ring::LoopOnset>,
+) -> String {
+    // TRX64 feature-request #1 — surface the PINNED loop entry first when present: the
+    // transfer that ENTERED the spin is the root-cause fact the ring otherwise loses.
+    let loop_prefix = match loop_onset {
+        Some(lo) => format!(
+            "loop entry: ${:04X} -> ${:04X} @cyc {}  |  ",
+            lo.src_pc, lo.dst_pc, lo.cycle
+        ),
+        None => String::new(),
+    };
+    let body = format_summary_body(crash, transfer, slots, pinned);
+    format!("{loop_prefix}{body}")
+}
+
+/// The crash/transfer/corruptor part of the summary (without the loop-onset prefix).
+fn format_summary_body(
     crash: &CrashPoint,
     transfer: &WildTransfer,
     slots: &[StackSlot],
@@ -623,6 +667,69 @@ mod tests {
         assert_eq!(chain.transfer.kind, TransferKind::Unknown);
         assert!(chain.corruptor_slots.is_empty());
         assert!(!chain.pinned_corruptor);
+    }
+
+    #[test]
+    fn loop_onset_surfaces_in_triage_chain_after_spin_storm() {
+        // FEATURE #1: a halt-trap `JMP $self`. Even when the live history ring is the
+        // generic JAM/wild path, the PINNED loop onset must appear in the chain +
+        // summary so `triage` reports "loop entry: $SRC → $DST" after seconds spinning.
+        let ram = [0u8; 0x10000];
+        // A tiny delta ring that the spin-storm wraps completely.
+        let mut dr = DeltaRing::with_capacity(4, 8);
+        dr.set_enabled(true);
+        // The entry transfer: JSR @ $07A6 → $0900.
+        dr.begin(0x07a6, 0, 0, 0, 0xfb, 0, 4242);
+        dr.set_opcode(0x20, 0x00, 0x09);
+        dr.commit();
+        // Spin `JMP $0900` thousands of times (wraps the 4-entry ring many times over).
+        for i in 0..3000u64 {
+            dr.begin(0x0900, 0, 0, 0, 0xfb, 0, 4243 + i);
+            dr.set_opcode(0x4c, 0x00, 0x09);
+            dr.commit();
+        }
+        // The history ring fed to triage holds only the spin tail (the JSR is evicted).
+        let history = vec![
+            hist(0x0900, 0x4c, 0x00, 0x09, 0xfb, 7000),
+            hist(0x0900, 0x4c, 0x00, 0x09, 0xfb, 7001),
+        ];
+        let chain = triage(TriageInputs {
+            history: &history,
+            delta: &dr,
+            crash_pc: 0x0900,
+            read: mem(&ram),
+        });
+        // The pinned loop onset is present + names the entry transfer the ring lost.
+        let lo = chain.loop_onset.expect("loop onset in chain");
+        assert_eq!(lo.src_pc, 0x07a6);
+        assert_eq!(lo.dst_pc, 0x0900);
+        assert_eq!(lo.cycle, 4242);
+        assert!(chain.summary.contains("loop entry"), "summary surfaces the loop entry");
+        assert!(chain.summary.contains("$07A6"));
+    }
+
+    #[test]
+    fn no_loop_onset_leaves_chain_field_none() {
+        // FEATURE #1: when no loop was detected the field is None (a normal stack-smash
+        // triage is unaffected — no spurious loop line).
+        let mut ram = [0u8; 0x10000];
+        ram[0x01fc] = 0xac;
+        ram[0x01fd] = 0xde;
+        ram[0xdead] = 0x02;
+        let dr = DeltaRing::with_capacity(8, 32); // empty ring → no onset.
+        let history = vec![
+            hist(0xe59f, 0xea, 0, 0, 0xfb, 200),
+            hist(0xe5a0, OP_RTS, 0, 0, 0xfd, 201),
+            hist(0xdead, 0x02, 0, 0, 0xfd, 202),
+        ];
+        let chain = triage(TriageInputs {
+            history: &history,
+            delta: &dr,
+            crash_pc: 0xdead,
+            read: mem(&ram),
+        });
+        assert!(chain.loop_onset.is_none());
+        assert!(!chain.summary.contains("loop entry"));
     }
 
     #[test]

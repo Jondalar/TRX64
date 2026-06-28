@@ -108,6 +108,53 @@ pub struct DeltaEntry {
     pub b2: u8,
 }
 
+/// TRX64 feature-request #1 (loop/halt ONSET capture) — the PINNED record of the
+/// control transfer that ENTERED a tight self-loop / halt-trap, captured the FIRST
+/// instant the loop is detected and EXEMPT from ring eviction so it survives no matter
+/// how long the loop then spins. See `TRX64_FEATURE_REQUESTS.md` (Wasteland_EF) #1.
+///
+/// WHY pinned-not-in-ring: a tight `JMP self` / branch-to-self floods both rings with
+/// its own body within milliseconds, so by the time `triage` runs the transfer that
+/// jumped INTO the halt has already scrolled out ("transfer older than the ring"). This
+/// record is a single struct held BESIDE the ring slabs (never overwritten by forward
+/// capture), so the entry transfer is recoverable after seconds of spinning.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoopOnset {
+    /// PC of the instruction that transferred control INTO the loop body (the
+    /// JSR/JMP/RTS/branch/fall-through that landed at `dst_pc`). This is the loop's
+    /// entry transfer — the root-cause fact the ring otherwise loses first.
+    pub src_pc: u16,
+    /// Opcode byte of that entry-transfer instruction (0 if it predates ring coverage).
+    pub src_opcode: u8,
+    /// The address the loop body starts at (where control landed = the first PC of the
+    /// detected loop set).
+    pub dst_pc: u16,
+    /// Accumulator at loop entry (PRE-state of the entry-transfer instruction).
+    pub a: u8,
+    /// X at loop entry.
+    pub x: u8,
+    /// Y at loop entry.
+    pub y: u8,
+    /// Stack pointer at loop entry.
+    pub sp: u8,
+    /// Composite processor status at loop entry.
+    pub p: u8,
+    /// CPU master clock at loop entry (the entry-transfer instruction's cycle).
+    pub cycle: u64,
+}
+
+/// TRX64 feature-request #1 — how many times the PC must re-execute within the small
+/// loop window before the onset is declared (a self-loop is detected on the first
+/// iteration regardless). Tuned low: a real hang is hit within a handful of iterations,
+/// and a legitimate short loop that runs `K` times then exits simply re-arms when the
+/// PC escapes the set, so a false onset is cheap + self-correcting.
+pub const LOOP_ITER_THRESHOLD: u32 = 4;
+
+/// TRX64 feature-request #1 — the loop-body address window size: the PC must stay
+/// within a set of ≤ this many DISTINCT instruction addresses to count as a tight loop
+/// (matches the spec's "window ≤ ~8 instructions").
+pub const LOOP_WINDOW: usize = 8;
+
 /// Default reverse-history depth in seconds (user decision: 10 s). Overridable via
 /// `TRX64_REVERSE_SECONDS`.
 pub const DEFAULT_REVERSE_SECONDS: usize = 10;
@@ -152,6 +199,31 @@ pub struct DeltaRing {
     in_flight: bool,
     /// Kill-switch (shared `TRX64_CPUHISTORY` knob). When false the whole ring is inert.
     enabled: bool,
+
+    // ── TRX64 feature-request #1 — loop/halt ONSET capture (see `LoopOnset`) ────────
+    /// The PINNED entry-transfer record, captured the first instant a tight loop / halt
+    /// is detected and held BESIDE the ring (exempt from eviction). `None` until the
+    /// first onset; re-armed (cleared) when the PC escapes the loop window. NOT serialized
+    /// (live-timeline state, like the rest of the ring).
+    loop_onset: Option<LoopOnset>,
+    /// A small sliding buffer of the most recent committed entries (oldest→newest,
+    /// capped at `LOOP_WINDOW + 1`), used by the loop-onset detector. When the current
+    /// PC matches an EARLIER entry in this buffer, the PC is circling a small address
+    /// set; the body spans from that earlier occurrence to now, and the entry transfer
+    /// is the entry IMMEDIATELY BEFORE that earlier occurrence (the instruction that
+    /// jumped INTO the body). Bounded + pre-sized → no hot-path allocation after warm-up.
+    recent: Vec<DeltaEntry>,
+    /// How many times the PC has revisited an address already in `recent` since the loop
+    /// candidate first formed (consecutive re-executions of the same small set). Crosses
+    /// `LOOP_ITER_THRESHOLD` → declare a multi-instruction tight loop. Reset to 0 when
+    /// the candidate breaks (the PC leaves the set / the body grows too large).
+    loop_iters: u32,
+    /// The loop body's start PC for the in-progress candidate (the address that first
+    /// repeated), and the pinned entry-transfer candidate for it. Held while the
+    /// iteration count climbs toward the threshold so the pin lands the ORIGINAL entry
+    /// even after several body passes. `None` when no candidate is forming.
+    cand_dst: Option<u16>,
+    cand_src: Option<DeltaEntry>,
 }
 
 impl DeltaRing {
@@ -187,6 +259,11 @@ impl DeltaRing {
             cur: DeltaEntry::default(),
             in_flight: false,
             enabled,
+            loop_onset: None,
+            recent: Vec::with_capacity(LOOP_WINDOW + 1),
+            loop_iters: 0,
+            cand_dst: None,
+            cand_src: None,
         }
     }
 
@@ -218,6 +295,14 @@ impl DeltaRing {
         self.write_head = 0;
         self.cur = DeltaEntry::default();
         self.in_flight = false;
+        // TRX64 feature-request #1 — a resize is a fresh-capture boundary: drop the
+        // loop-onset state too (the pinned record + detector buffer) so a new depth
+        // starts with no stale loop pin.
+        self.loop_onset = None;
+        self.recent.clear();
+        self.loop_iters = 0;
+        self.cand_dst = None;
+        self.cand_src = None;
         // `enabled` deliberately preserved.
     }
 
@@ -242,6 +327,18 @@ impl DeltaRing {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.entry_head == 0
+    }
+
+    /// TRX64 feature-request #3 — whether the entry ring has WRAPPED (evicted its
+    /// oldest entries because more instructions retired than the slab holds). True ⇒ a
+    /// reverse query that bottoms out has hit the ring boundary, NOT an empty result:
+    /// older history existed but scrolled out → the window is too short (raise revdepth
+    /// / break earlier). The write slab wraps slightly ahead of the entry slab (it is
+    /// over-provisioned), so the entry-slab wrap is the conservative "history was lost"
+    /// signal.
+    #[inline]
+    pub fn entries_wrapped(&self) -> bool {
+        self.entry_head > self.entries.len() as u64
     }
 
     /// Whether the kill-switch left the ring armed.
@@ -403,6 +500,97 @@ impl DeltaRing {
         self.entries[slot] = self.cur;
         self.entry_head = self.entry_head.wrapping_add(1);
         self.in_flight = false;
+        // TRX64 feature-request #1 — feed the just-committed instruction to the
+        // loop-onset detector (the entry now carries pre-state regs + opcode/operands).
+        self.detect_loop_onset(self.cur);
+    }
+
+    /// HOT PATH (≈ a tiny fixed scan over `recent` per instruction; no allocation after
+    /// the buffer warms up). TRX64 feature-request #1 — loop/halt ONSET capture. Fed the
+    /// just-committed `DeltaEntry` (PRE-state regs + opcode/operands). Pins the entry
+    /// transfer the FIRST instant a tight loop / halt is detected, so it survives no
+    /// matter how long the loop then spins (the recurring "transfer older than the ring"
+    /// blind spot). The pin is one-shot until a timeline boundary re-arms it via `clear`.
+    #[inline]
+    fn detect_loop_onset(&mut self, e: DeltaEntry) {
+        // The pin is one-shot — once we have an onset we only need to keep the recent
+        // buffer warm (so a future `clear`/`resize` re-arm starts clean), no re-detect.
+        if self.loop_onset.is_some() {
+            push_recent(&mut self.recent, e);
+            return;
+        }
+
+        // ── (a) SELF-LOOP: a JMP-abs / branch whose target resolves to its OWN
+        // instruction address (`JMP *` / `BNE *`). Detected on the FIRST execution —
+        // the spin-storm has not even started, so pin immediately. The entry transfer is
+        // the instruction that ran IMMEDIATELY BEFORE this self-looping PC (the newest
+        // entry in `recent` — `e` is not pushed yet).
+        if is_self_branch(e.pc, e.opcode, e.b1, e.b2) {
+            let src = self.recent.last().copied().unwrap_or(e);
+            self.set_onset(src, e.pc);
+            push_recent(&mut self.recent, e);
+            return;
+        }
+
+        // ── (b) MULTI-INSTRUCTION tight loop: the PC circles a small set of addresses
+        // (the loop body, ≤ `LOOP_WINDOW` distinct PCs) for ≥ K iterations. We ANCHOR on
+        // the first address that repeats and count how many times the PC returns to that
+        // anchor (= one full loop iteration). Body instructions BETWEEN anchor returns
+        // are still "in the recent set", so they keep the candidate alive without
+        // resetting it; only a PC that leaves the recent set entirely (a genuine escape)
+        // breaks the candidate. The entry transfer is the instruction immediately before
+        // the anchor's earlier occurrence (what jumped INTO the body).
+        let in_recent = self.recent.iter().any(|p| p.pc == e.pc);
+        match self.cand_dst {
+            Some(anchor) if anchor == e.pc => {
+                // Returned to the loop anchor — one more full iteration.
+                self.loop_iters = self.loop_iters.saturating_add(1);
+                if self.loop_iters >= LOOP_ITER_THRESHOLD {
+                    let src = self.cand_src.unwrap_or(e);
+                    self.set_onset(src, anchor);
+                }
+            }
+            Some(_) if in_recent => {
+                // Traversing the loop body between anchor returns — candidate stays.
+            }
+            _ => {
+                if in_recent {
+                    // First repeat → a loop-body candidate forms, anchored at this PC.
+                    // Its entry transfer is the instruction before this PC's earlier
+                    // occurrence in `recent`.
+                    let back = self.recent.iter().rposition(|p| p.pc == e.pc).unwrap();
+                    let src = if back > 0 { self.recent[back - 1] } else { self.recent[0] };
+                    self.cand_dst = Some(e.pc);
+                    self.cand_src = Some(src);
+                    self.loop_iters = 1;
+                } else {
+                    // The PC left the recent set entirely → escaped; reset the candidate.
+                    self.loop_iters = 0;
+                    self.cand_dst = None;
+                    self.cand_src = None;
+                }
+            }
+        }
+
+        push_recent(&mut self.recent, e);
+    }
+
+    /// TRX64 feature-request #1 — pin the loop-onset record from the entry-transfer
+    /// instruction `src` and the loop-body start `dst`. The pinned regs/cycle are the
+    /// entry transfer's own PRE-state (the state the machine had on entering the loop).
+    #[inline]
+    fn set_onset(&mut self, src: DeltaEntry, dst: u16) {
+        self.loop_onset = Some(LoopOnset {
+            src_pc: src.pc,
+            src_opcode: src.opcode,
+            dst_pc: dst,
+            a: src.a,
+            x: src.x,
+            y: src.y,
+            sp: src.sp,
+            p: src.p,
+            cycle: src.cycle,
+        });
     }
 
     /// Drop all history (head reset) without freeing the slabs. Used on a cold reset /
@@ -413,6 +601,24 @@ impl DeltaRing {
         self.entry_head = 0;
         self.write_head = 0;
         self.in_flight = false;
+        // TRX64 feature-request #1 — a timeline boundary (cold reset / media swap)
+        // RE-ARMS the loop-onset detector: drop the pinned record + the detector buffer
+        // so the next run captures its OWN loop entry, not one from before the boundary.
+        self.loop_onset = None;
+        self.recent.clear();
+        self.loop_iters = 0;
+        self.cand_dst = None;
+        self.cand_src = None;
+    }
+
+    /// TRX64 feature-request #1 — the PINNED loop/halt onset record (the entry transfer
+    /// captured the first instant a tight loop / halt was detected), or `None` if no
+    /// loop has been detected since the last timeline boundary. Survives ring eviction
+    /// (held beside the slabs), so `triage` can report `loop entry: $SRC → $DST @cyc N`
+    /// even after seconds of spinning. Read-only — does not mutate the ring.
+    #[inline]
+    pub fn loop_onset(&self) -> Option<LoopOnset> {
+        self.loop_onset
     }
 
     /// The newest committed entry (the last retired instruction), or `None` if empty.
@@ -590,6 +796,13 @@ impl Clone for DeltaRing {
             cur: DeltaEntry::default(),
             in_flight: false,
             enabled: self.enabled,
+            // TRX64 feature-request #1 — a clone is a FRESH timeline (like the slabs):
+            // start with no loop-onset pin + an empty detector.
+            loop_onset: None,
+            recent: Vec::with_capacity(LOOP_WINDOW + 1),
+            loop_iters: 0,
+            cand_dst: None,
+            cand_src: None,
         }
     }
 }
@@ -600,6 +813,40 @@ impl Clone for DeltaRing {
 const DELTA_ENTRY_LE: usize = 8 + 4 + 2 + 2 + 6 + 3; // cycle,write_start,pc,write_count,5 regs,opcode/b1/b2 = 25
 /// LE byte width of a serialized [`WriteRec`].
 const WRITE_REC_LE: usize = 2 + 1 + 1; // addr,old,new = 4
+
+/// TRX64 feature-request #1 — whether `opcode` (with operands `b1`/`b2`) at address
+/// `pc` is a control transfer whose target resolves to its OWN instruction = a tight
+/// self-loop (`JMP $self` or a relative branch back to itself, the classic `BNE *` /
+/// `JMP *` halt spin).
+///
+/// * `JMP $4C abs` — target = the absolute operand `(b1,b2)`; self iff it equals `pc`.
+/// * relative branch (`BPL/BMI/BVC/BVS/BCC/BCS/BNE/BEQ`) — a 2-byte instruction; the
+///   target is `(pc + 2) + (b1 as i8)`; self iff `b1 == 0xFE` (= −2), the encoding of
+///   "branch back to my own opcode" (the infinite-spin idiom).
+#[inline]
+fn is_self_branch(pc: u16, opcode: u8, b1: u8, b2: u8) -> bool {
+    match opcode {
+        // JMP abs to its own address.
+        0x4C => u16::from_le_bytes([b1, b2]) == pc,
+        // Relative branches: operand −2 lands back on the branch opcode itself.
+        0x10 | 0x30 | 0x50 | 0x70 | 0x90 | 0xB0 | 0xD0 | 0xF0 => b1 == 0xFE,
+        _ => false,
+    }
+}
+
+/// TRX64 feature-request #1 — push `e` onto the loop-onset detector's bounded recent
+/// buffer (oldest→newest), dropping the oldest once it exceeds `LOOP_WINDOW + 1`. The
+/// `+1` keeps both the loop body (≤ `LOOP_WINDOW`) AND the entry-transfer instruction
+/// before it in the window so a body-start repeat can still resolve its entry. After
+/// warm-up this is a copy + (when full) a single `remove(0)` of a ≤9-element Vec — no
+/// allocation. (A `remove(0)` on a tiny Vec is cheaper than a VecDeque's overhead here.)
+#[inline]
+fn push_recent(recent: &mut Vec<DeltaEntry>, e: DeltaEntry) {
+    if recent.len() >= LOOP_WINDOW + 1 {
+        recent.remove(0);
+    }
+    recent.push(e);
+}
 
 fn delta_entry_to_le(e: &DeltaEntry) -> [u8; DELTA_ENTRY_LE] {
     let mut o = [0u8; DELTA_ENTRY_LE];
@@ -696,6 +943,173 @@ mod tests {
             r.record_write(addr, old, new);
         }
         r.commit();
+    }
+
+    /// TRX64 feature-request #1 — record an instruction with an EXPLICIT opcode/operand
+    /// (so a JMP/branch is decoded as such by the loop-onset detector). Default regs.
+    fn instr_op(r: &mut DeltaRing, pc: u16, opcode: u8, b1: u8, b2: u8, cycle: u64) {
+        r.begin(pc, 0, 0, 0, 0xff, 0, cycle);
+        r.set_opcode(opcode, b1, b2);
+        r.commit();
+    }
+
+    #[test]
+    fn is_self_branch_classifies_self_loops() {
+        // JMP $0801 at $0801 = self-loop; JMP elsewhere is not.
+        assert!(is_self_branch(0x0801, 0x4C, 0x01, 0x08));
+        assert!(!is_self_branch(0x0801, 0x4C, 0x00, 0x08));
+        // BNE *-... with operand $FE (−2) branches back to its own opcode = self-loop.
+        assert!(is_self_branch(0x1000, 0xD0, 0xFE, 0x00));
+        assert!(is_self_branch(0x4000, 0xF0, 0xFE, 0x00)); // BEQ self
+        // BNE with any other operand is not a self-loop.
+        assert!(!is_self_branch(0x1000, 0xD0, 0x10, 0x00));
+        // A non-branch opcode is never a self-loop.
+        assert!(!is_self_branch(0x1000, 0xEA, 0xFE, 0x00)); // NOP
+    }
+
+    #[test]
+    fn loop_onset_pins_self_jmp_entry_and_survives_spin_storm() {
+        // FEATURE #1: a `JMP $self` halt-trap. The entry transfer (a JSR that ran just
+        // before the spin) must be PINNED at onset and survive a tiny ring that the
+        // spin-storm then completely wraps over.
+        let mut r = DeltaRing::with_capacity(4, 8); // tiny: the storm wraps it in 4 instr.
+        r.set_enabled(true);
+        // The entry transfer: a JSR @ $07A6 with distinctive regs lands at $0900.
+        r.begin(0x07a6, 0x11, 0x22, 0x33, 0xfb, 0x24, 5000);
+        r.set_opcode(0x20, 0x00, 0x09); // JSR $0900
+        r.commit();
+        // The self-loop body: JMP $0900 at $0900, spun thousands of times.
+        for i in 0..5000u64 {
+            instr_op(&mut r, 0x0900, 0x4C, 0x00, 0x09, 5001 + i);
+        }
+        // The ring slab (4 entries) is long since full of $0900 spin entries…
+        assert_eq!(r.len(), 4);
+        assert!(r.newest().unwrap().pc == 0x0900);
+        // …but the PINNED onset still names the JSR that entered the loop.
+        let lo = r.loop_onset().expect("loop onset pinned");
+        assert_eq!(lo.src_pc, 0x07a6, "entry transfer PC pinned");
+        assert_eq!(lo.src_opcode, 0x20, "entry transfer opcode (JSR) pinned");
+        assert_eq!(lo.dst_pc, 0x0900, "loop body start pinned");
+        assert_eq!(lo.cycle, 5000, "entry cycle pinned");
+        assert_eq!((lo.a, lo.x, lo.y, lo.sp, lo.p), (0x11, 0x22, 0x33, 0xfb, 0x24));
+    }
+
+    #[test]
+    fn loop_onset_pins_branch_to_self() {
+        // FEATURE #1: a `BNE *` (operand −2) infinite branch.
+        let mut r = DeltaRing::with_capacity(8, 16);
+        r.set_enabled(true);
+        instr_op(&mut r, 0x2000, 0xEA, 0, 0, 100); // NOP (the predecessor / entry)
+        for i in 0..200u64 {
+            instr_op(&mut r, 0x2001, 0xD0, 0xFE, 0, 101 + i); // BNE *  (self)
+        }
+        let lo = r.loop_onset().expect("branch-to-self pinned");
+        assert_eq!(lo.src_pc, 0x2000, "predecessor NOP is the entry transfer");
+        assert_eq!(lo.dst_pc, 0x2001, "the self-branch is the loop body");
+        assert_eq!(lo.cycle, 100);
+    }
+
+    #[test]
+    fn loop_onset_pins_multi_instruction_tight_loop() {
+        // FEATURE #1: a 3-instruction body looped via a back-branch (NOT a self-branch),
+        // detected by the "PC stays in a small set for ≥ K iterations" heuristic. The
+        // PINNED entry must be the instruction that JUMPED INTO the body, not a body
+        // instruction.
+        let mut r = DeltaRing::with_capacity(64, 128);
+        r.set_enabled(true);
+        // Entry transfer: JMP $3000 from $5000 (regs distinctive).
+        r.begin(0x5000, 0xAA, 0xBB, 0xCC, 0xf0, 0x20, 9000);
+        r.set_opcode(0x4C, 0x00, 0x30); // JMP $3000
+        r.commit();
+        // 3-instruction body: $3000 (LDA), $3002 (CMP), $3004 (BNE $3000 — back-branch,
+        // operand reaches $3000 but is NOT −2, so it is NOT a self-branch). Loop it
+        // many times; the multi-instr heuristic must fire.
+        let mut cyc = 9001u64;
+        for _ in 0..20 {
+            instr_op(&mut r, 0x3000, 0xA9, 0x00, 0, cyc); cyc += 1;
+            instr_op(&mut r, 0x3002, 0xC9, 0x00, 0, cyc); cyc += 1;
+            instr_op(&mut r, 0x3004, 0xD0, 0xFA, 0, cyc); cyc += 1; // BNE $3000 (−6)
+        }
+        let lo = r.loop_onset().expect("multi-instruction loop pinned");
+        assert_eq!(lo.src_pc, 0x5000, "the JMP into the body is the entry transfer");
+        assert_eq!(lo.src_opcode, 0x4C);
+        assert_eq!(lo.dst_pc, 0x3000, "loop body start = first body PC");
+        assert_eq!(lo.cycle, 9000);
+    }
+
+    #[test]
+    fn loop_onset_rearms_after_clear() {
+        // FEATURE #1: a timeline boundary (clear) re-arms the detector — a new loop
+        // captures its OWN entry, not the pre-boundary one.
+        let mut r = DeltaRing::with_capacity(8, 16);
+        r.set_enabled(true);
+        instr_op(&mut r, 0x100, 0xEA, 0, 0, 1);
+        for i in 0..50u64 {
+            instr_op(&mut r, 0x101, 0x4C, 0x01, 0x01, 2 + i); // JMP $0101 self
+        }
+        assert!(r.loop_onset().is_some());
+        r.clear();
+        assert!(r.loop_onset().is_none(), "clear re-arms (drops the pin)");
+        // A fresh loop after the boundary pins its own entry.
+        instr_op(&mut r, 0x800, 0xEA, 0, 0, 1000);
+        for i in 0..50u64 {
+            instr_op(&mut r, 0x801, 0x4C, 0x01, 0x08, 1001 + i); // JMP $0801 self
+        }
+        let lo = r.loop_onset().expect("fresh loop pinned after clear");
+        assert_eq!(lo.src_pc, 0x800);
+        assert_eq!(lo.dst_pc, 0x801);
+    }
+
+    #[test]
+    fn loop_onset_not_set_for_normal_straight_line_code() {
+        // FEATURE #1: straight-line forward execution must NOT trip the detector (no
+        // false onset). The PC advances monotonically through distinct addresses.
+        let mut r = DeltaRing::with_capacity(64, 128);
+        r.set_enabled(true);
+        for i in 0..40u64 {
+            // Distinct, monotonically increasing PCs (NOPs) — never revisits an address.
+            instr_op(&mut r, 0x1000 + (i as u16) * 2, 0xEA, 0, 0, 100 + i);
+        }
+        assert!(r.loop_onset().is_none(), "straight-line code never pins a loop");
+    }
+
+    #[test]
+    fn loop_onset_pin_is_one_shot_keeps_first_entry() {
+        // FEATURE #1: the pin is captured ONCE at onset; later spinning must NOT
+        // overwrite it with a body instruction as the "src".
+        let mut r = DeltaRing::with_capacity(4, 8);
+        r.set_enabled(true);
+        instr_op(&mut r, 0x600, 0x20, 0x00, 0x07, 10); // JSR $0700 (entry)
+        for i in 0..1000u64 {
+            instr_op(&mut r, 0x700, 0x4C, 0x00, 0x07, 11 + i); // JMP $0700 self
+        }
+        let lo1 = r.loop_onset().unwrap();
+        // Spin more — the pin must be UNCHANGED (still the JSR @ $0600).
+        for i in 0..1000u64 {
+            instr_op(&mut r, 0x700, 0x4C, 0x00, 0x07, 2000 + i);
+        }
+        let lo2 = r.loop_onset().unwrap();
+        assert_eq!(lo1, lo2, "the onset pin is one-shot (not re-captured per spin)");
+        assert_eq!(lo2.src_pc, 0x600);
+    }
+
+    #[test]
+    fn entries_wrapped_reports_ring_eviction() {
+        // FEATURE #3: entries_wrapped is the ring-exhaustion signal — false until the
+        // entry slab evicts, true once it has.
+        let mut r = DeltaRing::with_capacity(4, 16);
+        r.set_enabled(true);
+        assert!(!r.entries_wrapped(), "fresh ring not wrapped");
+        for i in 0..4u64 {
+            instr(&mut r, 0x100 + i as u16, (0, 0, 0, 0xff, 0), i, &[]);
+        }
+        assert!(!r.entries_wrapped(), "exactly-full ring has NOT yet evicted");
+        // One more retire evicts the oldest → wrapped.
+        instr(&mut r, 0x999, (0, 0, 0, 0xff, 0), 99, &[]);
+        assert!(r.entries_wrapped(), "ring evicted its oldest entry → wrapped");
+        // A clear resets the wrap state (fresh timeline).
+        r.clear();
+        assert!(!r.entries_wrapped(), "clear resets the wrap state");
     }
 
     #[test]

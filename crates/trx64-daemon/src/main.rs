@@ -1576,6 +1576,18 @@ fn format_triage_lines(chain: &trx64_core::crash_triage::TriageChain) -> Vec<Str
     lines.push("── crash triage (reverse-debug Phase 2) ──────────────────────".to_string());
     // The compact one-line chain.
     lines.push(chain.summary.clone());
+    // TRX64 feature-request #1 — the PINNED loop/halt onset, surfaced even after the
+    // spin-storm evicted the entry transfer from the live history ring.
+    if let Some(lo) = chain.loop_onset {
+        lines.push(format!(
+            "  loop entry: ${:04X} -> ${:04X} @cyc {}  (entered via op ${:02X}; A=${:02X} X=${:02X} Y=${:02X} SP=${:02X} P=${:02X})",
+            lo.src_pc, lo.dst_pc, lo.cycle, lo.src_opcode, lo.a, lo.x, lo.y, lo.sp, lo.p
+        ));
+        lines.push(
+            "            ↑ pinned at loop onset — survives the spin-storm that evicts the live ring."
+                .to_string(),
+        );
+    }
     // Crash point + lead-in.
     lines.push(format!(
         "  crash:    JAM @ ${:04X}  op ${:02X}",
@@ -1665,9 +1677,25 @@ fn triage_to_json(chain: &trx64_core::crash_triage::TriageChain) -> Value {
             })
         })
         .collect();
+    // TRX64 feature-request #1 — the PINNED loop/halt onset (the entry transfer that
+    // entered the spin), null when no loop was detected since the last timeline boundary.
+    let loop_onset = chain.loop_onset.map(|lo| {
+        json!({
+            "srcPc": lo.src_pc,
+            "srcOpcode": lo.src_opcode,
+            "dstPc": lo.dst_pc,
+            "a": lo.a,
+            "x": lo.x,
+            "y": lo.y,
+            "sp": lo.sp,
+            "p": lo.p,
+            "cycle": lo.cycle,
+        })
+    });
     json!({
         "summary": chain.summary,
         "pinnedCorruptor": chain.pinned_corruptor,
+        "loopOnset": loop_onset,
         "crash": {
             "pc": chain.crash.pc,
             "opcode": chain.crash.opcode,
@@ -1682,6 +1710,9 @@ fn triage_to_json(chain: &trx64_core::crash_triage::TriageChain) -> Value {
             "isStackPop": chain.transfer.kind.is_stack_pop(),
             "confidence": chain.transfer.confidence.as_str(),
             "note": chain.transfer.note,
+            // TRX64 feature-request #3 — the transfer fell off the back of the ring
+            // (window too short), not merely indeterminate.
+            "ringBound": chain.transfer.ring_bound,
         },
         "corruptorSlots": slots,
     })
@@ -4143,10 +4174,21 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 .unwrap_or(8)
                 .clamp(1, 64);
             let hits = st.session.machine.who_wrote(addr, limit);
+            // TRX64 feature-request #3 — typed ring-exhaustion signal: a miss against a
+            // WRAPPED ring means "window too short" (the writer may be older than the
+            // ring), distinct from "never written / wrong address".
+            let exhaustion = st.session.machine.ring_exhaustion(!hits.is_empty());
             if hits.is_empty() {
-                return Ok(format!(
+                let mut lines = vec![format!(
                     "whowrote ${addr:04X}: no writer in the live delta ring (window not covered, or never written since the last reset). Older history lives only in a finalized trace."
-                ));
+                )];
+                if exhaustion.ring_exhausted {
+                    lines.push(format!(
+                        "ring_exhausted: true   revdepth={}s   hint: {}",
+                        exhaustion.revdepth_seconds, exhaustion.hint
+                    ));
+                }
+                return Ok(lines.join("\n"));
             }
             let mut lines = vec![format!(
                 "whowrote ${:04X}: {} writer(s) in the live ring (newest first):",
@@ -4172,7 +4214,18 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
         "triage" => {
             let at_pc = parse_addr(toks.get(1));
             let chain = st.session.machine.crash_triage(at_pc);
-            Ok(format_triage_lines(&chain).join("\n"))
+            // TRX64 feature-request #3 — the typed ring-exhaustion signal. The triage
+            // bottomed out at the ring boundary when the wild transfer is older than the
+            // ring (`ring_bound`); confirm + size it with the machine's ring state.
+            let exhaustion = st.session.machine.ring_exhaustion(!chain.transfer.ring_bound);
+            let mut lines = format_triage_lines(&chain);
+            if chain.transfer.ring_bound && exhaustion.ring_exhausted {
+                lines.push(format!(
+                    "ring_exhausted: true   revdepth={}s   hint: {}",
+                    exhaustion.revdepth_seconds, exhaustion.hint
+                ));
+            }
+            Ok(lines.join("\n"))
         }
 
         // reverse-debug depth knob — `revdepth [seconds]`: with an arg, REBUILD both
@@ -4682,6 +4735,16 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 // cycle range (e.g. a sub-instruction window): fall through to the trace.
             }
 
+            // TRX64 feature-request #3 — the request asked for a window OLDER than the
+            // live ring's oldest cycle (the ring wrapped past it) → the ring boundary,
+            // not an empty result. Record it so the no-trace fallback can emit the typed
+            // ring_exhausted signal instead of a bare "no history".
+            let asked_older_than_ring = match (span, explicit_window) {
+                (Some((oldest, _)), Some((s, _e))) => s < oldest,
+                _ => false,
+            };
+            let exhaustion = st.session.machine.ring_exhaustion(!asked_older_than_ring);
+
             // ── 2. Fallback: the finalized `.c64retrace` (historical) via the sidecar. ─
             let mut args = if let Some((s, e)) = explicit_window {
                 json!({ "cycle_start": s as i64, "cycle_end": e as i64 })
@@ -4689,7 +4752,16 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 json!({ "last_cycles": last_cycles as i64 })
             };
             match current_trace_duckdb(st) {
-                None => Err("chis: no cpu history — the live ring is empty (run the machine) and no trace store exists (run `trace on`). `chis` reads the live cpuhistory ring first, then the captured trace.".into()),
+                None => {
+                    let mut msg = String::from("chis: no cpu history — the live ring is empty (run the machine) and no trace store exists (run `trace on`). `chis` reads the live cpuhistory ring first, then the captured trace.");
+                    if asked_older_than_ring && exhaustion.ring_exhausted {
+                        msg.push_str(&format!(
+                            "\nring_exhausted: true   revdepth={}s   hint: {}",
+                            exhaustion.revdepth_seconds, exhaustion.hint
+                        ));
+                    }
+                    Err(msg)
+                }
                 Some(db) => {
                     let stem = std::path::Path::new(&db)
                         .file_stem()
@@ -5313,8 +5385,8 @@ fn monitor_help_text() -> String {
         "    chis [cyc] | chis <s> <e>  cpu instruction history: LIVE cpuhistory ring first (works while a trace is active), falls back to the captured trace; last N cyc (default 4000) or a window",
         "  REVERSE-DEBUG (always-on full-delta ring — no pre-arming; inspect-backward only)",
         "    rstep [n] | reverse [n]   UNDO the last n instructions (default 1): restore CPU+RAM+IO bytes to before them; reports the landed regs + writes rolled back",
-        "    whowrote <addr> [n]       last n writer(s) of <addr> from the ring (newest first): PC + cycle + old->new — the stack-crash shortcut",
-        "    triage [pc]               guided crash-triage: causal chain (crash -> wild RTS/JMP transfer -> stack corruptor) from the rings; auto-printed on a JAM. Confidence-tagged.",
+        "    whowrote <addr> [n]       last n writer(s) of <addr> from the ring (newest first): PC + cycle + old->new — the stack-crash shortcut. Emits `ring_exhausted: true` + a depth hint on a miss past a wrapped ring.",
+        "    triage [pc]               guided crash-triage: causal chain (crash -> wild RTS/JMP transfer -> stack corruptor) from the rings; auto-printed on a JAM. Confidence-tagged. Surfaces a PINNED `loop entry: $SRC -> $DST` for a tight-loop/halt; `ring_exhausted` when the transfer is older than the ring.",
         "    revdepth [seconds]        report / set the always-on reverse-ring depth: rebuilds the delta+cpuhistory rings (DISCARDS history; future capture only; 1..=600s). TRX64_REVERSE_SECONDS = boot default",
         "    diff <idA> <idB>          typed by-ID diff of two checkpoint anchors (RAM runs + per-chip register changes). READ-ONLY (live machine unchanged). ids from `checkpoint/list`",
         "    ringdump <path>           serialize the WHOLE reverse-debug buffer (checkpoint+delta+cpuhistory rings) → one gzipped .c64rering file (the tester->dev hand-off)",

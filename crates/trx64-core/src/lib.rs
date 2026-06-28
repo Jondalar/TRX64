@@ -555,6 +555,24 @@ pub struct WhoWroteHit {
     pub new_value: u8,
 }
 
+/// TRX64 feature-request #3 — ring-exhaustion as a typed, first-class signal. When a
+/// reverse query (`triage`/`chis`/`whowrote`) bottoms out at the ring boundary this
+/// distinguishes "the window was too short" (raise depth / break earlier) from "no data
+/// / wrong address". Built by [`Machine::ring_exhaustion`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RingExhaustion {
+    /// True when the delta ring has WRAPPED (evicted older history) AND the query found
+    /// nothing in the retained window — so the answer may lie OLDER than the ring. False
+    /// when the ring still has headroom (a miss is then genuinely "never happened in this
+    /// run / wrong address", not a window-too-short case).
+    pub ring_exhausted: bool,
+    /// The current reverse-history depth in seconds (the `revdepth`), so the hint can
+    /// suggest a concrete larger value.
+    pub revdepth_seconds: usize,
+    /// A ready-to-print remediation hint (empty when not exhausted).
+    pub hint: String,
+}
+
 /// reverse-debug depth knob — the rebuilt always-on-ring sizing after
 /// [`Machine::set_reverse_depth`] (or the current state via
 /// [`Machine::reverse_depth_info`]). Backs `runtime/set_reverse_depth` / `revdepth`.
@@ -1197,6 +1215,35 @@ impl Machine {
             delta_write_capacity: writes_cap,
             cpu_history_capacity: cpu_cap,
             ram_bytes: ram_bytes as u64,
+        }
+    }
+
+    /// TRX64 feature-request #3 — the typed ring-exhaustion signal for a reverse query
+    /// that came up empty. `found` = whether the query located its target in the
+    /// retained window. When `found` is false AND the delta ring has WRAPPED (evicted
+    /// older history), the answer may lie older than the ring → `ring_exhausted: true`
+    /// with a remediation hint (raise `revdepth` / break earlier). When the ring still
+    /// has headroom a miss is a genuine "never happened / wrong address" (not exhausted).
+    /// `suggest_seconds` is the next-step depth the hint proposes (caller picks, e.g.
+    /// 2× current clamped to 600).
+    pub fn ring_exhaustion(&self, found: bool) -> RingExhaustion {
+        let seconds = self.reverse_depth_info().seconds;
+        if found || !self.delta_ring.entries_wrapped() {
+            return RingExhaustion {
+                ring_exhausted: false,
+                revdepth_seconds: seconds,
+                hint: String::new(),
+            };
+        }
+        let suggest = (seconds.saturating_mul(2)).clamp(seconds + 1, 600);
+        RingExhaustion {
+            ring_exhausted: true,
+            revdepth_seconds: seconds,
+            hint: format!(
+                "the reverse window is full (revdepth={seconds}s, ring wrapped) — the \
+                 answer may be OLDER than the ring. Raise depth (`revdepth {suggest}`) \
+                 or trigger/break earlier, then re-run."
+            ),
         }
     }
 
@@ -1964,5 +2011,56 @@ impl Machine {
 impl Default for Machine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod ring_exhaustion_tests {
+    use super::*;
+
+    /// Record `n` no-write instructions into the machine's delta ring (the always-on
+    /// reverse buffer) so a query past the ring depth can be exercised without a full run.
+    fn fill_delta(m: &mut Machine, n: u64) {
+        m.delta_ring.set_enabled(true);
+        for i in 0..n {
+            m.delta_ring.begin(0x1000 + (i as u16 & 0xff), 0, 0, 0, 0xff, 0, i);
+            m.delta_ring.commit();
+        }
+    }
+
+    #[test]
+    fn ring_exhaustion_typed_when_query_past_wrapped_ring() {
+        // FEATURE #3: a query that bottoms out against a WRAPPED ring returns
+        // ring_exhausted=true with a remediation hint; a miss against a ring with
+        // headroom does NOT (genuine "never happened / wrong address").
+        let mut m = Machine::new();
+        // Shrink the delta ring to a tiny capacity so it wraps quickly (and set a known
+        // revdepth so the hint reports it).
+        m.delta_ring.resize(4, 8);
+        m.delta_ring.set_enabled(true);
+
+        // (a) Not wrapped + a hit → not exhausted.
+        let not_exhausted = m.ring_exhaustion(true);
+        assert!(!not_exhausted.ring_exhausted);
+        assert!(not_exhausted.hint.is_empty());
+
+        // (b) Not yet wrapped + a miss → still NOT exhausted (ring has headroom).
+        fill_delta(&mut m, 3); // 3 < cap 4 → no eviction.
+        assert!(!m.delta_ring.entries_wrapped());
+        let headroom_miss = m.ring_exhaustion(false);
+        assert!(!headroom_miss.ring_exhausted, "miss with headroom is not exhaustion");
+
+        // (c) Wrapped + a miss → EXHAUSTED, with a typed hint that names revdepth.
+        fill_delta(&mut m, 10); // 10 > cap 4 → wraps.
+        assert!(m.delta_ring.entries_wrapped());
+        let exhausted = m.ring_exhaustion(false);
+        assert!(exhausted.ring_exhausted, "miss past a wrapped ring is exhaustion");
+        assert!(exhausted.revdepth_seconds >= 1);
+        assert!(exhausted.hint.contains("revdepth"), "hint suggests raising depth");
+        assert!(exhausted.hint.contains("earlier"), "hint mentions breaking earlier");
+
+        // (d) Wrapped but a HIT → not exhausted (we found the answer in-window).
+        let wrapped_hit = m.ring_exhaustion(true);
+        assert!(!wrapped_hit.ring_exhausted, "a hit is never exhaustion, even when wrapped");
     }
 }
