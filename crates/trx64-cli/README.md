@@ -7,8 +7,7 @@ FFI — it links the runtime library and calls it directly. One machine, shared 
 cockpit, the per-frame pump, and the window.
 
 It runs on macOS, Linux, and Windows (winit + cpal + ratatui are all cross-platform);
-the only build wrinkle is the vendored reSID C++ — see
-`docs/spec-cross-platform-linux-windows.md`.
+the only build wrinkle is the vendored reSID C++, handled by the cross-build chain.
 
 ---
 
@@ -48,11 +47,10 @@ cargo install --path crates/trx64-cli
 (`%USERPROFILE%\.cargo\bin\trx64cli.exe` on Windows), which rustup already put on your
 `PATH`. Then run **`trx64cli`** from any shell — macOS, Linux, Windows.
 
-**Prebuilt (no Rust)** — for distribution to the scene: a GitHub Actions matrix
-(`ubuntu-latest` / `windows-latest` / `macos-latest`) builds `trx64cli` **natively** per
-OS and attaches the binaries to a GitHub release. Download the one for your OS, drop it on
-your `PATH`. Native builds sidestep the reSID C++ cross-compile entirely (each runner has
-a working toolchain) — see `docs/spec-cross-platform-linux-windows.md`.
+**Prebuilt (no Rust)** — the maintainer cross-builds a `trx64cli` per OS (macOS arm64
+natively; Linux + Windows from the Mac via the Apple `container` chain — reSID C++
+compiles inside a Linux container) and hands the binaries out directly. Drop the one for
+your OS on your `PATH`.
 
 > **ROMs are not bundled.** `trx64cli` needs `resources/roms` (KERNAL/BASIC/CHARGEN +
 > 1541) — Commodore IP, never shipped in the binary or a release. Install them separately
@@ -63,8 +61,7 @@ a working toolchain) — see `docs/spec-cross-platform-linux-windows.md`.
 
 ## Two vocabularies: `/` = machine, bare = monitor
 
-The command line follows one rule (shared with C64RE + the app —
-`docs/command-syntax-convention.md`):
+The command line follows one rule (shared with C64RE + the app):
 
 | You type | Goes to |
 |---|---|
@@ -92,10 +89,11 @@ meta commands are `/`-namespaced — discoverable (`/help`) and collision-free.
 | `/ringdump <path>` · `/ringload <path>` | write / load a `.c64rering` reverse-debug buffer |
 | `/help` · `/quit` | list commands / exit |
 
-Everything else is sent verbatim to the monitor. Run `help` (bare) for the monitor's
-own verb list — disassemble/dump/assemble, breakpoints + observers, flow/backtrace,
-tracing, memory-map / taint / swimlanes, and the reverse-debug verbs (`rstep`,
-`whowrote`, `diff`, `chis`, crash triage).
+Everything else is sent verbatim to the monitor — see **[MONITOR.md](../../MONITOR.md)**
+for the full command reference (disassemble/dump/assemble, breakpoints + observers,
+flow/backtrace, tracing, memory-map / taint / swimlanes, and the reverse-debug verbs
+`rstep` / `whowrote` / `diff` / `chis` / crash triage). Or run `help` (bare) in the
+cockpit for the live verb list.
 
 ---
 
@@ -162,4 +160,4 @@ at the opcode, the FLOW line shows the stop) instead of hanging, so you can then
 `trx64-cli` links `trx64-daemon`'s `[lib]` target and calls `dispatch()` + the A/V-pull
 helpers directly. The winit `EventLoop` owns the main thread (a macOS requirement); the
 cockpit and the per-frame pump run on worker threads; audio runs on cpal's thread — all
-sharing one `Arc<Mutex<State>>`. See `docs/spec-trx64-cli.md` for the design.
+sharing one `Arc<Mutex<State>>`.

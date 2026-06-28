@@ -106,7 +106,9 @@ A single method — `monitor/exec` — drives a full interactive monitor (~128 v
 VICE superset): run/step, bank-aware dump/disassemble/assemble, breakpoints and
 observers, dynamic and flow disassembly, transfer/compare/hunt, interrupt-flow and
 backtrace, tracing, memory-map / taint / swimlanes, and the reverse-debug verbs
-above. Run `help` for the full list.
+above. **[MONITOR.md](MONITOR.md)** is the full command reference (tables per category
++ the bank lens, the reverse-debug ring, checkpoint ring, traces, and a walkthrough);
+`help` prints the live verb list.
 
 ---
 
