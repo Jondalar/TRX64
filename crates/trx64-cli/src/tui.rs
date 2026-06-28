@@ -72,9 +72,9 @@ impl Cockpit {
         Self {
             input: String::new(),
             log: vec![
-                "TRX64 cockpit — type `help`, drive with high-level verbs,".into(),
-                "or send any monitor command (d / m / r / bk / g / trace …).".into(),
-                "`window` spawns the emulator. `quit` exits.".into(),
+                "TRX64 cockpit — powered on + running. A bare line goes to the monitor".into(),
+                "(d / m / r / bk / g / trace …); /-commands drive the machine.".into(),
+                "/help · /window spawns the emulator · /pause freezes · /quit exits.".into(),
                 String::new(),
             ],
             history: Vec::new(),

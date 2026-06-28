@@ -89,6 +89,10 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // Power-on semantics: a real C64 boots + runs when switched on. boot_engine
+    // cold-boots to the reset vector; set the host run flag so the pump drives it
+    // straight to READY instead of sitting frozen. (`/pause` to freeze.)
+    let _ = engine.exec_line("/run");
 
     // The per-frame emulation pump: advances the machine one frame at a time while the
     // host run flag is set. Runs on its own thread, shares the Engine.
