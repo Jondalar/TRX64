@@ -128,6 +128,8 @@ feed AVAudioEngine, fill an `AVAudioPCMBuffer`'s `int16ChannelData` with the ret
 |--------|-----------|---------|
 | `dump` | `(path: String) throws -> SnapshotInfo` | Dump a full machine snapshot (`.c64re`) to `path`. |
 | `undump` | `(path: String) throws -> SnapshotInfo` | Restore a machine snapshot from `path`. |
+| `ringbufferDump` | `(path: String) throws -> RingDumpInfo` | Serialize the WHOLE reverse-debug buffer (checkpoint ring + delta ring + cpu-history + current anchor) into one gzipped `.c64rering` file. (WS: `ringbuffer/dump {path}`; monitor: `ringdump <path>`.) |
+| `ringbufferRestore` | `(path: String) throws -> RingDumpInfo` | Load a `.c64rering` file → reconstruct the rings + restore the machine to the dump's "current" anchor. Scrub, `reverseStep`, `whoWrote`, `chis`, `diffCheckpoints` then all work on the loaded buffer. (WS: `ringbuffer/restore {path}`; monitor: `ringload <path>`.) |
 
 ## events
 
@@ -262,6 +264,10 @@ no JSON). `i = indices[p]` → RGB `palette[i*3 ..< i*3+3]`.
 - **RamRun** — `start: UInt32`, `byteCount: UInt32`, `old: Data`, `new: Data` (one contiguous run of changed RAM; `old`/`new` are the run's bytes before/after — NOT a 64 K byte list)
 - **RegChange** — `name: String`, `old, new: UInt32` (CPU names: `pc`/`a`/`x`/`y`/`sp`/`flags`; chips: `$NN`; CIA tagged `cia1.$NN`/`cia2.$NN`; drive tagged `cpu.pc`/`via1.$NN`/`headHalfTrack`/…)
 - A chip's list is empty when unchanged; `drive` is empty unless **both** anchors carried a 1541 DRIVECPU.
+
+### RingDumpInfo
+`path: String`, `anchors: UInt64`, `deltaEntries: UInt64`, `cpuHistory: UInt64`,
+`cycleFirst, cycleLast: UInt64`, `currentId: String?`, `fileBytes: UInt64`, `version: UInt32`
 
 ---
 

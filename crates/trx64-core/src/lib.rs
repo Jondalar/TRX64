@@ -32,6 +32,7 @@ pub mod m93c86;
 pub mod native_snapshot;
 pub mod recorder;
 pub mod rewind;
+pub mod ring_dump;
 pub mod rotation;
 pub mod render;
 pub mod resid_audio;

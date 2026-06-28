@@ -4168,6 +4168,50 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             }
         }
 
+        // Spec time-travel-tooling Piece 2 — `ringdump <path>` / `ringload <path>`:
+        // dump / restore the WHOLE reverse-debug buffer to/from a gzipped `.c64rering`
+        // container (the SAME engine as WS `ringbuffer/dump`·`restore` + FFI). The
+        // tester→dev hand-off: dump a bug's full context, ship the file, reload + scrub.
+        "ringdump" => {
+            let path = match toks.get(1) {
+                Some(p) => p.clone(),
+                None => return Err("ringdump: usage: ringdump <path.c64rering>".into()),
+            };
+            match ringbuffer_dump_to_path(st, &path) {
+                Ok(info) => Ok(format!(
+                    "ringdump: {} anchor(s), {} delta entr(ies), {} cpu-history → {}  ({} bytes, cycles {}–{})",
+                    info["anchors"].as_u64().unwrap_or(0),
+                    info["deltaEntries"].as_u64().unwrap_or(0),
+                    info["cpuHistory"].as_u64().unwrap_or(0),
+                    path,
+                    info["fileBytes"].as_u64().unwrap_or(0),
+                    info["cycleFirst"].as_u64().unwrap_or(0),
+                    info["cycleLast"].as_u64().unwrap_or(0),
+                )),
+                Err(e) => Err(format!("ringdump: {e}")),
+            }
+        }
+
+        "ringload" => {
+            let path = match toks.get(1) {
+                Some(p) => p.clone(),
+                None => return Err("ringload: usage: ringload <path.c64rering>".into()),
+            };
+            match ringbuffer_restore_from_path(st, &path) {
+                Ok(info) => Ok(format!(
+                    "ringload: restored {} anchor(s), {} delta entr(ies), {} cpu-history from {}  (current={}, cycles {}–{})\n  now: scrub (`checkpoint/list`), `rstep`, `whowrote`, `chis`, `diff <idA> <idB>` all work on this buffer",
+                    info["anchors"].as_u64().unwrap_or(0),
+                    info["deltaEntries"].as_u64().unwrap_or(0),
+                    info["cpuHistory"].as_u64().unwrap_or(0),
+                    path,
+                    info["currentId"].as_str().unwrap_or("none"),
+                    info["cycleFirst"].as_u64().unwrap_or(0),
+                    info["cycleLast"].as_u64().unwrap_or(0),
+                )),
+                Err(e) => Err(format!("ringload: {e}")),
+            }
+        }
+
         // ---- Live trace gate (Spec 746 / audit misc-2): trace on|off|status|mark --
         // Wires the monitor `trace` verb to the EXISTING trace machinery (TraceState +
         // finalize_trace — the same engine behind trace/start_domains, runtime/mark,
@@ -5181,6 +5225,9 @@ fn monitor_help_text() -> String {
         "    whowrote <addr> [n]       last n writer(s) of <addr> from the ring (newest first): PC + cycle + old->new — the stack-crash shortcut",
         "    triage [pc]               guided crash-triage: causal chain (crash -> wild RTS/JMP transfer -> stack corruptor) from the rings; auto-printed on a JAM. Confidence-tagged.",
         "    revdepth [seconds]        report / set the always-on reverse-ring depth: rebuilds the delta+cpuhistory rings (DISCARDS history; future capture only; 1..=600s). TRX64_REVERSE_SECONDS = boot default",
+        "    diff <idA> <idB>          typed by-ID diff of two checkpoint anchors (RAM runs + per-chip register changes). READ-ONLY (live machine unchanged). ids from `checkpoint/list`",
+        "    ringdump <path>           serialize the WHOLE reverse-debug buffer (checkpoint+delta+cpuhistory rings) → one gzipped .c64rering file (the tester->dev hand-off)",
+        "    ringload <path>           restore a .c64rering: reconstruct the rings + restore the machine to its current anchor; scrub/rstep/whowrote/chis/diff then work on it",
         "  KNOWLEDGE (reads the project _analysis.json that covers the address)",
         "    inspect <a> [stem]  segment kind/label + xrefs at a",
         "    xref <a> [stem]     who calls/jumps/reads/writes a (in + out)",
@@ -10388,6 +10435,45 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             Response::err(id, -32001, format!("NOT_IMPLEMENTED: {m}: deferred"))
         }
 
+        // ── Spec time-travel-tooling Piece 2 — ringbuffer dump/restore ───────────
+        // Serialize / reconstruct the WHOLE reverse-debug buffer (checkpoint ring +
+        // delta ring + cpu-history ring) to/from one gzipped `.c64rering` container.
+        // After restore the scrub filmstrip, reverse_step, who_wrote, chis, and
+        // diffCheckpoints all work on the dumped buffer (the tester→dev hand-off).
+
+        // ringbuffer/dump { path } → RingDumpInfo. READ-ONLY w.r.t. the machine.
+        "ringbuffer/dump" => {
+            let path = match req.params.get("path").and_then(|v| v.as_str()) {
+                Some(p) if !p.is_empty() => p.to_string(),
+                _ => return Response::err(id, -32602, "ringbuffer/dump: path required"),
+            };
+            let st = state.lock().unwrap();
+            match ringbuffer_dump_to_path(&st, &path) {
+                Ok(mut info) => {
+                    info["path"] = json!(path);
+                    Response::ok(id, info)
+                }
+                Err(e) => Response::err(id, -32001, format!("ringbuffer/dump: {e}")),
+            }
+        }
+
+        // ringbuffer/restore { path } → RingDumpInfo. Reconstructs the rings + restores
+        // the machine to the dump's "current" anchor.
+        "ringbuffer/restore" => {
+            let path = match req.params.get("path").and_then(|v| v.as_str()) {
+                Some(p) if !p.is_empty() => p.to_string(),
+                _ => return Response::err(id, -32602, "ringbuffer/restore: path required"),
+            };
+            let mut st = state.lock().unwrap();
+            match ringbuffer_restore_from_path(&mut st, &path) {
+                Ok(mut info) => {
+                    info["path"] = json!(path);
+                    Response::ok(id, info)
+                }
+                Err(e) => Response::err(id, -32001, format!("ringbuffer/restore: {e}")),
+            }
+        }
+
         // ── Spec 231/268 — deterministic scenario replay + registry ──────────
         // 1:1 with the c64re ws-server.ts runtime/scenario_* handlers. The registry
         // is FILE-BACKED (scenario-registry.ts): scenario_save persists to the
@@ -12206,6 +12292,92 @@ fn format_typed_snapshot_diff(d: &Value) -> String {
     lines.join("\n")
 }
 
+// ── Spec time-travel-tooling Piece 2 — ringbuffer dump/restore ────────────────
+//
+// Serialize the WHOLE reverse-debug buffer (checkpoint ring + delta ring + cpu-
+// history ring) into one gzipped `.c64rering` container, and reconstruct it
+// elsewhere. After restore the scrub filmstrip, reverse_step, who_wrote, chis, and
+// diffCheckpoints all work on the dumped buffer. The per-anchor states reuse the
+// existing RuntimeCheckpoint serialization; the container framing/gzip lives in
+// trx64_core::ring_dump.
+
+/// Build the `.c64rering` container from the live rings, write it to `path`, and
+/// return the `RingDumpInfo`-shaped JSON. The "current" anchor = the newest ring
+/// entry (the scrub head). READ-ONLY w.r.t. the machine.
+fn ringbuffer_dump_to_path(st: &State, path: &str) -> Result<Value, String> {
+    // "current" = the newest anchor (the live scrub head); None when the ring is empty.
+    let current_id = st.checkpoint_ring.list().last().map(|r| r.id.clone());
+    let dump = trx64_core::ring_dump::RingBufferDump {
+        checkpoint_ring: st.checkpoint_ring.to_dump(current_id),
+        delta_ring: st.session.machine.delta_ring.to_dump(),
+        cpu_history: st.session.machine.cpu_history.to_dump(),
+    };
+    let bytes = trx64_core::ring_dump::write_ring_dump(&dump);
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(path, &bytes).map_err(|e| format!("write {path}: {e}"))?;
+    let info = dump.info(bytes.len() as u64);
+    Ok(ring_dump_info_to_json(&info))
+}
+
+/// Read a `.c64rering` container from `path`, reconstruct the three rings INTO state,
+/// restore the machine to the dump's "current" anchor, and return the
+/// `RingDumpInfo`-shaped JSON. After this the scrub filmstrip + reverse-debug + diff
+/// all work on the loaded buffer.
+fn ringbuffer_restore_from_path(st: &mut State, path: &str) -> Result<Value, String> {
+    let file_bytes = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
+    let dump = trx64_core::ring_dump::read_ring_dump(&file_bytes)?;
+
+    // Reconstruct the three rings.
+    st.checkpoint_ring =
+        trx64_core::checkpoint_ring::RuntimeCheckpointRing::from_dump(&dump.checkpoint_ring);
+    st.session.machine.delta_ring =
+        trx64_core::delta_ring::DeltaRing::from_dump(&dump.delta_ring);
+    st.session.machine.cpu_history =
+        trx64_core::cpu_history::CpuHistoryRing::from_dump(&dump.cpu_history);
+
+    // Restore the machine to the dump's "current" anchor (the scrub head) so the loaded
+    // session sits where the tester left it. Falls back to the newest anchor when the
+    // dump carries no explicit current id; a no-anchor dump leaves the live machine as-is.
+    let target = dump
+        .checkpoint_ring
+        .current_id
+        .clone()
+        .or_else(|| st.checkpoint_ring.list().last().map(|r| r.id.clone()));
+    if let Some(cur) = target {
+        if let Some(snapshot) = st.checkpoint_ring.restore_snapshot(&cur) {
+            restore_live_checkpoint(&mut st.session, &snapshot)?;
+            // A restore is a control discontinuity (= a pause/seek): mirror the
+            // undump/checkpoint-restore tail so the run-state + audio are coherent.
+            st.session.running = false;
+            st.ctrl_frame += 1;
+            st.ctrl_stop = None;
+            st.notify
+                .broadcast("audio/flush", json!({ "session_id": st.session.id }));
+            st.force_present_frame = true;
+        }
+    }
+
+    let info = dump.info(file_bytes.len() as u64);
+    Ok(ring_dump_info_to_json(&info))
+}
+
+/// JSON wire shape for the `RingDumpInfo` typed record (`ringbuffer/dump|restore`).
+fn ring_dump_info_to_json(info: &trx64_core::ring_dump::RingDumpInfo) -> Value {
+    json!({
+        "path": "",
+        "anchors": info.anchors,
+        "deltaEntries": info.delta_entries,
+        "cpuHistory": info.cpu_history,
+        "cycleFirst": info.cycle_first,
+        "cycleLast": info.cycle_last,
+        "currentId": info.current_id,
+        "fileBytes": info.file_bytes,
+        "version": info.version,
+    })
+}
+
 // ── Spec 766.5 — recorder anchor capture ──────────────────────────────────────
 //
 // The c64re controller feeds the recorder a CORE-ONLY anchor (omitMedia) at the
@@ -13804,6 +13976,125 @@ mod batch1_tests {
         // Missing args → -32602.
         let e2 = call_err(&st, "runtime/diff_checkpoints", json!({ "idA": "x" }));
         assert_eq!(e2.code, -32602);
+    }
+
+    // ── Spec time-travel-tooling Piece 2 — ringbuffer dump/restore round-trip ─────
+
+    #[test]
+    fn ringbuffer_dump_restore_round_trip_faithful() {
+        // Capture two anchors with a known RAM change between them + populate the delta
+        // + cpu-history rings, ringbuffer/dump to a file, ringbuffer/restore into a
+        // FRESH state, then assert: (a) same anchor count + cycles, (b) diffCheckpoints
+        // on the restored anchors == the same diff as before the dump, (c) chis +
+        // reverse-debug (who_wrote) work on the restored ring.
+        let src = make_state();
+
+        // Anchor A (clean) — captured at clk 0.
+        let a_id = call(&src, "checkpoint/capture", json!({}))["ref"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // Poke a known run, populate the reverse-debug rings, capture anchor B.
+        {
+            let mut g = src.lock().unwrap();
+            g.session.machine.ram[0x4000] = 0xDE;
+            g.session.machine.ram[0x4001] = 0xAD;
+            g.session.machine.sync_after_monitor();
+            // Populate the delta ring (begin/record_write/commit) + cpu-history.
+            g.session.machine.delta_ring.set_enabled(true);
+            g.session.machine.cpu_history.set_enabled(true);
+            for i in 0..8u64 {
+                g.session.machine.delta_ring.begin(0x1000 + i as u16, i as u8, 0, 0, 0xff, 0x20, 1000 + i);
+                g.session.machine.delta_ring.record_write(0x6000 + i as u16, 0, (i + 1) as u8);
+                g.session.machine.delta_ring.commit();
+                g.session.machine.cpu_history.push(0x1000 + i as u16, 0xa9, i as u8, 0, 1, 2, 3, 0xf0, 0x30, 1000 + i);
+            }
+        }
+        let b_id = call(&src, "checkpoint/capture", json!({}))["ref"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // The reference diff BEFORE the dump.
+        let ref_diff = call(
+            &src,
+            "runtime/diff_checkpoints",
+            json!({ "idA": a_id, "idB": b_id }),
+        );
+
+        // Reference anchor list (id + cycles) + ring counts before the dump.
+        let ref_anchors: Vec<(String, u64)> = call(&src, "checkpoint/list", json!({}))["checkpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| (c["id"].as_str().unwrap().to_string(), c["cycles"].as_u64().unwrap()))
+            .collect();
+
+        // Dump to a temp .c64rering.
+        let dir = std::env::temp_dir().join("trx64-ringdump-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("buf.c64rering");
+        let dump_info = call(&src, "ringbuffer/dump", json!({ "path": path.to_string_lossy() }));
+        assert_eq!(dump_info["anchors"], json!(2));
+        assert_eq!(dump_info["deltaEntries"], json!(8));
+        assert_eq!(dump_info["cpuHistory"], json!(8));
+        assert!(dump_info["fileBytes"].as_u64().unwrap() > 0);
+        // The file exists + carries the container magic.
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(&raw[0..8], b"C64RERNG", "container magic");
+
+        // FRESH state → restore the ring from the file.
+        let dst = make_state();
+        let restore_info = call(&dst, "ringbuffer/restore", json!({ "path": path.to_string_lossy() }));
+        assert_eq!(restore_info["anchors"], json!(2));
+        assert_eq!(restore_info["deltaEntries"], json!(8));
+        assert_eq!(restore_info["cpuHistory"], json!(8));
+
+        // (a) Same anchors with matching cycles, same order.
+        let got_anchors: Vec<(String, u64)> = call(&dst, "checkpoint/list", json!({}))["checkpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| (c["id"].as_str().unwrap().to_string(), c["cycles"].as_u64().unwrap()))
+            .collect();
+        assert_eq!(got_anchors, ref_anchors, "restored anchors match (id + cycles)");
+
+        // (b) diffCheckpoints on the RESTORED anchors == the pre-dump diff.
+        let got_diff = call(
+            &dst,
+            "runtime/diff_checkpoints",
+            json!({ "idA": a_id, "idB": b_id }),
+        );
+        assert_eq!(got_diff, ref_diff, "restored-ring diff is byte-faithful to the original");
+        // And it actually carries the $4000 run.
+        assert!(
+            got_diff["ram"].as_array().unwrap().iter().any(|r| r["start"] == json!(0x4000)),
+            "restored diff has the $4000 RAM run"
+        );
+
+        // (c) chis + reverse-debug (who_wrote) work on the restored rings.
+        {
+            let g = dst.lock().unwrap();
+            assert_eq!(g.session.machine.cpu_history.len(), 8, "restored cpu-history populated");
+            assert_eq!(g.session.machine.delta_ring.len(), 8, "restored delta ring populated");
+            let hits = g.session.machine.who_wrote(0x6007, 4);
+            assert!(!hits.is_empty(), "who_wrote works on the restored delta ring");
+            assert_eq!(hits[0].new_value, 8, "who_wrote returns the restored write value");
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ringbuffer_dump_restore_arg_errors() {
+        let st = make_state();
+        assert_eq!(call_err(&st, "ringbuffer/dump", json!({})).code, -32602);
+        assert_eq!(call_err(&st, "ringbuffer/restore", json!({})).code, -32602);
+        // Restore of a non-existent file → -32001.
+        assert_eq!(
+            call_err(&st, "ringbuffer/restore", json!({ "path": "/nope/does/not/exist.c64rering" })).code,
+            -32001
+        );
     }
 
     // ── Audit ws-checkpoint-scrub-0/1/2/4 — restore is the shared, broadcast-rich

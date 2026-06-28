@@ -36,6 +36,14 @@
 //! CLONE / SNAPSHOT: like Phase 1a, the ring is LIVE-TIMELINE state, not machine state. A
 //! COW fork / restored snapshot starts FRESH (empty), so `Clone` returns an empty ring of
 //! the same capacities (O(1)); it is never serialized into a `.c64re` snapshot.
+//!
+//! RING DUMP (Spec time-travel-tooling Piece 2): the EXCEPTION to "never serialized" —
+//! the `.c64rering` container deliberately persists the FULL reverse-debug buffer for the
+//! tester→dev hand-off. `to_dump`/`from_dump` round-trip the whole ring (both slabs +
+//! heads + caps + armed flag). This is a separate, opt-in container, NOT the per-state
+//! `.c64re` snapshot (that still gets a fresh ring).
+
+use serde::{Deserialize, Serialize};
 
 /// One recorded memory/IO write. `#[repr(C)]`, 4 bytes: `addr` (u16) + `old_value` +
 /// `new_value` (u8 each). `old_value` is the byte that was at `addr` BEFORE the write
@@ -246,6 +254,83 @@ impl DeltaRing {
     #[inline]
     pub fn set_enabled(&mut self, on: bool) {
         self.enabled = on;
+    }
+
+    // ── Spec time-travel-tooling Piece 2 — ring dump/restore ────────────────────
+    //
+    // Serialize the WHOLE ring (both slabs + the monotonic heads + caps + armed flag)
+    // for the `.c64rering` container, and reconstruct it elsewhere. The slabs are
+    // `#[repr(C)]` POD, so they round-trip as raw LE bytes (no field-by-field codec).
+    // Only the VALID window is dumped (a wrapped ring physically stores the last `cap`
+    // entries, but the logical order matters for who_wrote/reverse_step) — the restore
+    // re-lays them so `newest()`/`who_wrote`/`writes_for` see the identical sequence.
+
+    /// Dump the ring to a [`DeltaRingDump`] (the `.c64rering` payload). Captures the
+    /// valid entries oldest→newest with each entry's own writes inlined, so a restore
+    /// is independent of the physical slab wrap. NOT on the hot path.
+    pub fn to_dump(&self) -> DeltaRingDump {
+        let len = self.len();
+        let mut entries: Vec<DeltaEntry> = Vec::with_capacity(len);
+        let mut writes: Vec<WriteRec> = Vec::new();
+        let mut scratch: Vec<WriteRec> = Vec::new();
+        let cap = self.entries.len() as u64;
+        let start = self.entry_head - len as u64;
+        for k in 0..len as u64 {
+            let slot = ((start + k) % cap) as usize;
+            let mut e = self.entries[slot];
+            self.writes_for(&e, &mut scratch);
+            // Re-base the entry's write window onto the FLAT dump-writes vec so the
+            // restore can re-lay both slabs contiguously (write_start = running count).
+            e.write_start = writes.len() as u32;
+            e.write_count = scratch.len() as u16;
+            writes.extend_from_slice(&scratch);
+            entries.push(e);
+        }
+        DeltaRingDump {
+            entry_cap: self.entries.len() as u32,
+            writes_cap: self.writes.len() as u32,
+            enabled: self.enabled,
+            entries: entries.iter().flat_map(delta_entry_to_le).collect(),
+            writes: writes.iter().flat_map(write_rec_to_le).collect(),
+        }
+    }
+
+    /// Reconstruct a ring from a [`DeltaRingDump`] (the inverse of [`to_dump`]). Lays
+    /// the dumped entries + their writes into freshly sized slabs so the restored ring
+    /// answers `newest`/`who_wrote`/`writes_for`/`reverse_step` identically to the
+    /// source. The armed flag is restored from the dump.
+    pub fn from_dump(d: &DeltaRingDump) -> Self {
+        let mut ring = Self::with_capacity(d.entry_cap.max(1) as usize, d.writes_cap.max(1) as usize);
+        ring.enabled = d.enabled;
+        let dumped_entries: Vec<DeltaEntry> =
+            d.entries.chunks_exact(DELTA_ENTRY_LE).map(delta_entry_from_le).collect();
+        let dumped_writes: Vec<WriteRec> =
+            d.writes.chunks_exact(WRITE_REC_LE).map(write_rec_from_le).collect();
+        let ecap = ring.entries.len();
+        let wcap = ring.writes.len();
+        // Replay the dumped entries in order, re-issuing their writes against the fresh
+        // slabs so the monotonic heads + write windows match (same as live capture).
+        for e in &dumped_entries {
+            let lo = e.write_start as usize;
+            let hi = lo + e.write_count as usize;
+            let ws = dumped_writes.get(lo..hi).unwrap_or(&[]);
+            // begin → record each write → commit, but bypass the enabled gate so a
+            // ring dumped while armed restores its history even if the env later
+            // disabled it (the dump IS the history; honour it).
+            let entry = DeltaEntry {
+                write_start: ring.write_head as u32,
+                ..*e
+            };
+            for w in ws {
+                let slot = (ring.write_head % wcap as u64) as usize;
+                ring.writes[slot] = *w;
+                ring.write_head = ring.write_head.wrapping_add(1);
+            }
+            let slot = (ring.entry_head % ecap as u64) as usize;
+            ring.entries[slot] = DeltaEntry { write_count: e.write_count, ..entry };
+            ring.entry_head = ring.entry_head.wrapping_add(1);
+        }
+        ring
     }
 
     /// HOT PATH. Open the in-flight instruction: stash its CPU PRE-state header. The
@@ -506,6 +591,87 @@ impl Clone for DeltaRing {
             in_flight: false,
             enabled: self.enabled,
         }
+    }
+}
+
+// ── Ring dump payload (Spec time-travel-tooling Piece 2) ──────────────────────────
+
+/// LE byte width of a serialized [`DeltaEntry`] in a [`DeltaRingDump`].
+const DELTA_ENTRY_LE: usize = 8 + 4 + 2 + 2 + 6 + 3; // cycle,write_start,pc,write_count,5 regs,opcode/b1/b2 = 25
+/// LE byte width of a serialized [`WriteRec`].
+const WRITE_REC_LE: usize = 2 + 1 + 1; // addr,old,new = 4
+
+fn delta_entry_to_le(e: &DeltaEntry) -> [u8; DELTA_ENTRY_LE] {
+    let mut o = [0u8; DELTA_ENTRY_LE];
+    o[0..8].copy_from_slice(&e.cycle.to_le_bytes());
+    o[8..12].copy_from_slice(&e.write_start.to_le_bytes());
+    o[12..14].copy_from_slice(&e.pc.to_le_bytes());
+    o[14..16].copy_from_slice(&e.write_count.to_le_bytes());
+    o[16] = e.a;
+    o[17] = e.x;
+    o[18] = e.y;
+    o[19] = e.sp;
+    o[20] = e.p;
+    o[21] = e.opcode;
+    o[22] = e.b1;
+    o[23] = e.b2;
+    o
+}
+
+fn delta_entry_from_le(b: &[u8]) -> DeltaEntry {
+    DeltaEntry {
+        cycle: u64::from_le_bytes(b[0..8].try_into().unwrap()),
+        write_start: u32::from_le_bytes(b[8..12].try_into().unwrap()),
+        pc: u16::from_le_bytes(b[12..14].try_into().unwrap()),
+        write_count: u16::from_le_bytes(b[14..16].try_into().unwrap()),
+        a: b[16],
+        x: b[17],
+        y: b[18],
+        sp: b[19],
+        p: b[20],
+        opcode: b[21],
+        b1: b[22],
+        b2: b[23],
+    }
+}
+
+fn write_rec_to_le(w: &WriteRec) -> [u8; WRITE_REC_LE] {
+    let mut o = [0u8; WRITE_REC_LE];
+    o[0..2].copy_from_slice(&w.addr.to_le_bytes());
+    o[2] = w.old_value;
+    o[3] = w.new_value;
+    o
+}
+
+fn write_rec_from_le(b: &[u8]) -> WriteRec {
+    WriteRec {
+        addr: u16::from_le_bytes(b[0..2].try_into().unwrap()),
+        old_value: b[2],
+        new_value: b[3],
+    }
+}
+
+/// Serializable snapshot of a whole [`DeltaRing`] for the `.c64rering` container. The
+/// two slabs ride as flat LE byte payloads (`#[serde(with)]` base64) — compact even
+/// before the container's outer gzip. `entries` holds the valid window oldest→newest
+/// (each entry's `write_start`/`write_count` index into the flat `writes`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeltaRingDump {
+    pub entry_cap: u32,
+    pub writes_cap: u32,
+    pub enabled: bool,
+    /// Flat LE entry payload (`entries.len()/DELTA_ENTRY_LE` records).
+    #[serde(with = "crate::ring_dump::b64_bytes")]
+    pub entries: Vec<u8>,
+    /// Flat LE write payload (`writes.len()/WRITE_REC_LE` records).
+    #[serde(with = "crate::ring_dump::b64_bytes")]
+    pub writes: Vec<u8>,
+}
+
+impl DeltaRingDump {
+    /// Number of valid entries carried (for the container's `RingDumpInfo`).
+    pub fn entry_count(&self) -> usize {
+        self.entries.len() / DELTA_ENTRY_LE
     }
 }
 

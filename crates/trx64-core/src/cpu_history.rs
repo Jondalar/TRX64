@@ -27,6 +27,8 @@
 //! ring is never serialized into a `.c64re` snapshot. History belongs to the run
 //! that produced it, not to a past state you jumped back to.
 
+use serde::{Deserialize, Serialize};
+
 /// One retired-instruction record. `#[repr(C)]` for a stable layout: u64 `cycle`
 /// first (8-byte aligned), then the u16 `pc`, then the u8 run; the struct rounds up
 /// to the u64 alignment = 24 bytes. (Packing it to 18 would need `#[repr(packed)]`,
@@ -227,6 +229,38 @@ impl CpuHistoryRing {
         out.len()
     }
 
+    // ── Spec time-travel-tooling Piece 2 — ring dump/restore ────────────────────
+
+    /// Dump the ring to a [`CpuHistoryRingDump`] (the `.c64rering` payload): the valid
+    /// window oldest→newest + the capacity + the armed flag. Unlike `Clone` (which
+    /// deliberately drops history), the dump PERSISTS it for the tester→dev hand-off.
+    pub fn to_dump(&self) -> CpuHistoryRingDump {
+        let mut out = Vec::with_capacity(self.len());
+        self.last_n(self.len(), &mut out);
+        CpuHistoryRingDump {
+            capacity: self.slab.len() as u32,
+            enabled: self.enabled,
+            entries: out.iter().flat_map(cpu_hist_to_le).collect(),
+        }
+    }
+
+    /// Reconstruct a ring from a [`CpuHistoryRingDump`] (inverse of [`to_dump`]). Lays
+    /// the dumped entries into a fresh slab so `last_n`/`window_by_cycle`/`cycle_span`
+    /// answer identically. The armed flag is restored from the dump (so `chis` works
+    /// on the restored ring even if the env later disabled capture).
+    pub fn from_dump(d: &CpuHistoryRingDump) -> Self {
+        let mut ring = Self::with_capacity(d.capacity.max(1) as usize);
+        ring.enabled = d.enabled;
+        let cap = ring.slab.len();
+        for b in d.entries.chunks_exact(CPU_HIST_LE) {
+            let e = cpu_hist_from_le(b);
+            let slot = (ring.head % cap as u64) as usize;
+            ring.slab[slot] = e;
+            ring.head = ring.head.wrapping_add(1);
+        }
+        ring
+    }
+
     /// The cycle range currently covered by the ring (`Some((oldest, newest))`), or
     /// `None` when empty. Lets `chis` decide ring-vs-trace for an explicit window:
     /// if the requested window is older than `oldest`, fall back to the trace.
@@ -259,6 +293,60 @@ impl Clone for CpuHistoryRing {
             head: 0,
             enabled: self.enabled,
         }
+    }
+}
+
+// ── Ring dump payload (Spec time-travel-tooling Piece 2) ──────────────────────────
+
+/// LE byte width of a serialized [`CpuHistEntry`]: cycle(8) + pc(2) + 9 register
+/// bytes (opcode, b1, b2, a, x, y, sp, p) = 19.
+const CPU_HIST_LE: usize = 8 + 2 + 9;
+
+fn cpu_hist_to_le(e: &CpuHistEntry) -> [u8; CPU_HIST_LE] {
+    let mut o = [0u8; CPU_HIST_LE];
+    o[0..8].copy_from_slice(&e.cycle.to_le_bytes());
+    o[8..10].copy_from_slice(&e.pc.to_le_bytes());
+    o[10] = e.opcode;
+    o[11] = e.b1;
+    o[12] = e.b2;
+    o[13] = e.a;
+    o[14] = e.x;
+    o[15] = e.y;
+    o[16] = e.sp;
+    o[17] = e.p;
+    o
+}
+
+fn cpu_hist_from_le(b: &[u8]) -> CpuHistEntry {
+    CpuHistEntry {
+        cycle: u64::from_le_bytes(b[0..8].try_into().unwrap()),
+        pc: u16::from_le_bytes(b[8..10].try_into().unwrap()),
+        opcode: b[10],
+        b1: b[11],
+        b2: b[12],
+        a: b[13],
+        x: b[14],
+        y: b[15],
+        sp: b[16],
+        p: b[17],
+    }
+}
+
+/// Serializable snapshot of a whole [`CpuHistoryRing`] for the `.c64rering` container.
+/// The valid window rides as a flat LE byte payload (base64 in JSON, gzipped by the
+/// container).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CpuHistoryRingDump {
+    pub capacity: u32,
+    pub enabled: bool,
+    #[serde(with = "crate::ring_dump::b64_bytes")]
+    pub entries: Vec<u8>,
+}
+
+impl CpuHistoryRingDump {
+    /// Number of valid entries carried (for the container's `RingDumpInfo`).
+    pub fn entry_count(&self) -> usize {
+        self.entries.len() / CPU_HIST_LE
     }
 }
 

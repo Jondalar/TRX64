@@ -449,6 +449,32 @@ where
         .map_err(serde::de::Error::custom)
 }
 
+/// `ringbuffer/dump` + `ringbuffer/restore` (= [`Runtime::ringbuffer_dump`] /
+/// [`Runtime::ringbuffer_restore`]) result — a summary of the serialized/loaded
+/// reverse-debug buffer (Spec time-travel-tooling Piece 2).
+#[derive(Debug, Clone, uniffi::Record, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RingDumpInfo {
+    pub path: String,
+    /// Checkpoint-ring anchor count.
+    pub anchors: u64,
+    /// Delta-ring (reverse-step / who_wrote) instruction count.
+    pub delta_entries: u64,
+    /// CPU-history (chis) instruction count.
+    pub cpu_history: u64,
+    /// Cycle of the oldest anchor (scrub-timeline start).
+    pub cycle_first: u64,
+    /// Cycle of the newest anchor (scrub-timeline end).
+    pub cycle_last: u64,
+    /// The "current" anchor id (the scrub head), if any.
+    #[serde(default)]
+    pub current_id: Option<String>,
+    /// On-disk container size in bytes (gzipped).
+    pub file_bytes: u64,
+    /// Container format version.
+    pub version: u32,
+}
+
 // ── reverse-debug ─────────────────────────────────────────────────────────────
 
 /// An undone write reported by `runtime/reverse_step`.

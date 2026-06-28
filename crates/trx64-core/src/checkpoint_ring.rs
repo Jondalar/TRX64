@@ -27,6 +27,7 @@
 //! Zero-cost when unused: an empty ring holds an empty Vec — no slab, no allocation
 //! until the first `capture`.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -454,6 +455,97 @@ impl RuntimeCheckpointRing {
         self.disk_pool_bytes = 0;
     }
 
+    // ── Spec time-travel-tooling Piece 2 — ring dump/restore ────────────────────
+
+    /// Dump the ring to a [`RuntimeCheckpointRingDump`] (the `.c64rering` payload):
+    /// every entry with its FULLY-REHYDRATED payload (the pooled media blobs spliced
+    /// back in, so each anchor is self-contained), plus its ref metadata + the budget/
+    /// max-entries policy + the seq counter (so a restored ring keeps minting unique
+    /// ids) + the "current" anchor id. NOT on the hot path.
+    pub fn to_dump(&self, current_id: Option<String>) -> RuntimeCheckpointRingDump {
+        let entries: Vec<CheckpointAnchorDump> = self
+            .entries
+            .iter()
+            .map(|e| CheckpointAnchorDump {
+                id: e.r.id.clone(),
+                frame: e.r.frame,
+                cycles: e.r.cycles,
+                pinned: e.r.pinned,
+                byte_size: e.r.byte_size,
+                created_at_ms: e.r.created_at_ms,
+                // The rehydrated payload (pooled blobs spliced back) — self-contained.
+                payload: self.restore_snapshot(&e.r.id).unwrap_or(Value::Null),
+            })
+            .collect();
+        RuntimeCheckpointRingDump {
+            budget_bytes: self.budget_bytes,
+            max_entries: self.max_entries,
+            seq: self.seq,
+            current_id,
+            entries,
+        }
+    }
+
+    /// Reconstruct a ring from a [`RuntimeCheckpointRingDump`] (inverse of [`to_dump`]).
+    /// Re-inserts every dumped anchor PRESERVING its id/frame/cycles/pinned/byteSize/
+    /// createdAtMs and re-pooling its media blobs (so the content-addressed dedup is
+    /// rebuilt). The seq counter is restored so new captures keep minting unique ids.
+    /// Bypasses the eviction policy (the dump already fits — it WAS a live ring).
+    pub fn from_dump(d: &RuntimeCheckpointRingDump) -> Self {
+        let mut ring =
+            Self::with_budget_and_max_entries(d.budget_bytes, d.max_entries);
+        ring.entries.clear();
+        ring.free_slots.clear();
+        for a in &d.entries {
+            let mut payload = a.payload.clone();
+            // Re-extract the pooled media blobs into the content-addressed pool,
+            // nulling them in the stored entry (mirrors `capture`'s pooling) so the
+            // restored ring dedups identical disks exactly as the live one did.
+            let mut blob_hashes: HashMap<String, String> = HashMap::new();
+            for slot in POOLED_BLOB_SLOTS {
+                if let Some(bytes) = ta_decode(payload.get(slot)) {
+                    if !bytes.is_empty() {
+                        let hash = sha256_hex(&bytes);
+                        match ring.disk_pool.get_mut(&hash) {
+                            Some(p) => p.refs += 1,
+                            None => {
+                                let len = bytes.len() as u64;
+                                ring.disk_pool
+                                    .insert(hash.clone(), PooledBlob { bytes, refs: 1 });
+                                ring.disk_pool_bytes += len;
+                            }
+                        }
+                        blob_hashes.insert(slot.to_string(), hash);
+                        payload[slot] = Value::Null;
+                    }
+                }
+            }
+            ring.entries.push(RingEntry {
+                r: RuntimeCheckpointRef {
+                    id: a.id.clone(),
+                    frame: a.frame,
+                    cycles: a.cycles,
+                    pinned: a.pinned,
+                    byte_size: a.byte_size,
+                    created_at_ms: a.created_at_ms,
+                },
+                payload,
+                blob_hashes,
+            });
+        }
+        // Restore the seq counter (must be ≥ the count to never collide), and rebuild
+        // the free-slot accounting to keep the stats contract consistent.
+        ring.seq = d.seq.max(ring.entries.len() as u64);
+        let used = ring.entries.len() as u64;
+        let free = ring.slot_count.saturating_sub(used);
+        let mut i = free;
+        while i > 0 {
+            i -= 1;
+            ring.free_slots.push(i);
+        }
+        ring
+    }
+
     /// runtime-checkpoint-ring.ts:378-394 — stats().
     pub fn stats(&self) -> RuntimeCheckpointRingStats {
         let pinned_count = self.entries.iter().filter(|e| e.r.pinned).count() as u64;
@@ -478,6 +570,36 @@ impl Default for RuntimeCheckpointRing {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ── Ring dump payload (Spec time-travel-tooling Piece 2) ──────────────────────────
+
+/// One checkpoint anchor in a [`RuntimeCheckpointRingDump`] — the ref metadata + the
+/// FULLY-REHYDRATED RuntimeCheckpoint payload tree (pooled media spliced back in, so
+/// the anchor is self-contained inside the `.c64rering` container).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointAnchorDump {
+    pub id: String,
+    pub frame: u64,
+    pub cycles: u64,
+    pub pinned: bool,
+    pub byte_size: u64,
+    pub created_at_ms: u64,
+    /// The rehydrated checkpoint Value (the same shape `restore_snapshot` returns /
+    /// `restore_runtime_checkpoint` consumes).
+    pub payload: Value,
+}
+
+/// Serializable snapshot of a whole [`RuntimeCheckpointRing`] for the `.c64rering`
+/// container: every anchor + the budget/max-entries policy + the seq counter + the
+/// "current" anchor id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeCheckpointRingDump {
+    pub budget_bytes: u64,
+    pub max_entries: u64,
+    pub seq: u64,
+    pub current_id: Option<String>,
+    pub entries: Vec<CheckpointAnchorDump>,
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────────

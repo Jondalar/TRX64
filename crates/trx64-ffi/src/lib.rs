@@ -538,6 +538,28 @@ impl Runtime {
         decode(v)
     }
 
+    // ── ringbuffer dump/restore (Spec time-travel-tooling Piece 2) ──────────────
+
+    /// Serialize the WHOLE reverse-debug buffer (checkpoint ring + delta ring +
+    /// cpu-history ring + the "current" anchor) into one gzipped `.c64rering` file at
+    /// `path` — the tester→dev hand-off. Returns a [`RingDumpInfo`] summary. READ-ONLY
+    /// w.r.t. the machine.
+    pub fn ringbuffer_dump(&self, path: String) -> Result<RingDumpInfo, Trx64Error> {
+        let v = self.rpc("ringbuffer/dump", json!({ "path": path }))?;
+        decode(v)
+    }
+
+    /// Load a `.c64rering` file from `path`, reconstruct the checkpoint / delta /
+    /// cpu-history rings into the runtime, and restore the machine to the dump's
+    /// "current" anchor. After this the scrub filmstrip ([`Runtime::checkpoint_list`] /
+    /// [`Runtime::thumbnails`]), [`Runtime::reverse_step`], [`Runtime::who_wrote`],
+    /// `chis` (via the monitor), and [`Runtime::diff_checkpoints`] all work on the
+    /// loaded buffer. Returns a [`RingDumpInfo`] summary.
+    pub fn ringbuffer_restore(&self, path: String) -> Result<RingDumpInfo, Trx64Error> {
+        let v = self.rpc("ringbuffer/restore", json!({ "path": path }))?;
+        decode(v)
+    }
+
     // ── escape hatch ───────────────────────────────────────────────────────────
 
     /// Raw JSON-RPC escape hatch: send any `method` with `params_json` (a JSON object
