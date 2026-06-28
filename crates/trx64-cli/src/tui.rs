@@ -80,9 +80,15 @@ impl Cockpit {
             scroll: 0,
             input: String::new(),
             log: vec![
-                "TRX64 cockpit — powered on + running. A bare line goes to the monitor".into(),
-                "(d / m / r / bk / g / trace …); /-commands drive the machine.".into(),
-                "/help · /window spawns the emulator · /pause freezes · /quit exits.".into(),
+                "████████╗ ██████╗  ██╗  ██╗  ██████╗  ██╗  ██╗".into(),
+                "╚══██╔══╝ ██╔══██╗ ╚██╗██╔╝ ██╔════╝  ██║  ██║".into(),
+                "   ██║    ██████╔╝  ╚███╔╝  ███████╗  ███████║".into(),
+                "   ██║    ██╔══██╗  ██╔██╗  ██╔═══██╗ ╚════██║".into(),
+                "   ██║    ██║  ██║ ██╔╝ ██╗ ╚██████╔╝      ██║".into(),
+                "   ╚═╝    ╚═╝  ╚═╝ ╚═╝  ╚═╝  ╚═════╝       ╚═╝".into(),
+                String::new(),
+                "powered on + running · a bare line → monitor (d/m/r/bk/g/trace) · /help · /quit"
+                    .into(),
                 String::new(),
             ],
             history: Vec::new(),
@@ -376,6 +382,12 @@ fn draw_log(f: &mut Frame, area: Rect, cp: &Cockpit) {
         .map(|l| {
             if l.starts_with("> ") {
                 Line::from(Span::styled(l.clone(), Style::default().fg(Color::Green)))
+            } else if l.contains('█') {
+                // The TRX64 startup banner.
+                Line::from(Span::styled(
+                    l.clone(),
+                    Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                ))
             } else {
                 Line::from(Span::raw(l.clone()))
             }

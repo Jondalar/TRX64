@@ -20,3 +20,4 @@ crates/trx64-core/tests/fixtures/vsf/*.vsf
 /CHECKLIST.md
 /docs/
 /loop/
+/dist/

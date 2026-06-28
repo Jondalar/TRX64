@@ -2495,8 +2495,11 @@ fn format_chis_from_ring(entries: &[trx64_core::CpuHistEntry], header: &str) -> 
             }
         };
         let (_size, line) = disasm_line_ts(read, pc);
+        // Pad the disasm to a fixed width so the registers land in clean columns
+        // regardless of operand length (1–3 byte ops). 30 covers `$pc  bb bb bb
+        // MNEMONIC ($nn),Y`; longer (rare) lines just shift right for that row.
         out.push_str(&format!(
-            "c{:<10} {}   a={:02x} x={:02x} y={:02x} sp={:02x} p={:02x}\n",
+            "c{:<10} {:<30}  a={:02x} x={:02x} y={:02x} sp={:02x} p={:02x}\n",
             e.cycle, line, e.a, e.x, e.y, e.sp, e.p
         ));
     }
