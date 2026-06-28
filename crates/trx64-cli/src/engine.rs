@@ -137,7 +137,11 @@ impl Engine {
         match self.rpc("session/run", json!({ "cycles": budget })) {
             Ok(v) => {
                 // A breakpoint/observer hit halts the run early — reflect it as PAUSE.
-                if v.get("breakpoint").is_some() {
+                // Spec 764 — a KIL/JAM also halts the run early (`jam` object in the
+                // reply): clear the host run flag so the pump STOPS re-issuing
+                // session/run on the jammed CPU (the spin/hang) and the cockpit shows
+                // PAUSED at the KIL. The daemon already pushed debug/stopped reason=jam.
+                if v.get("breakpoint").is_some() || v.get("jam").is_some() {
                     self.running.store(false, Ordering::SeqCst);
                 }
                 v.get("c64Cycles").and_then(|c| c.as_u64()).unwrap_or(0)

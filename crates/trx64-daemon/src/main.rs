@@ -1930,6 +1930,26 @@ fn run_debug_control(id: Value, st: &mut State, frame: u64, _is_continue: bool) 
             "controlOwner": control_owner
         }))
     } else {
+        // Spec 764 — a KIL/JAM during this run jams the CPU (PC frozen) without a bp
+        // hit; observe it via the shared helper (freeze + debug/stopped reason="jam")
+        // so a synchronous continue halts here instead of looping the advance. Same
+        // jam-halt path every other driver uses.
+        if check_and_handle_jam(st) {
+            let pc = jammed_pc(st);
+            let cycles = st.session.machine.clk;
+            let (pacing_mode, pacing_ratio, control_owner) =
+                (st.pacing_mode.clone(), st.pacing_ratio, st.control_owner.clone());
+            return Response::ok(id, json!({
+                "runState": "paused",
+                "pacing": { "mode": pacing_mode, "ratio": pacing_ratio },
+                "pc": pc as u64,
+                "cycles": cycles,
+                "frame": frame,
+                "breakpoints": bps,
+                "stop": { "reason": "jam", "pc": pc as u64, "cycles": cycles },
+                "controlOwner": control_owner
+            }));
+        }
         // Budget exhausted without a hit: the machine advanced; report running.
         let pc = st.session.machine.c64_core.reg_pc as u64;
         let (pacing_mode, pacing_ratio, control_owner) =
@@ -1944,6 +1964,101 @@ fn run_debug_control(id: Value, st: &mut State, frame: u64, _is_continue: bool) 
             "stop": null,
             "controlOwner": control_owner
         }))
+    }
+}
+
+/// Spec 764 — the SINGLE JAM (KIL) halt-on-jam implementation every run driver calls
+/// AFTER its advance. A KIL/JAM illegal opcode jams the CPU (`c64_core.is_jammed` =
+/// VICE `maincpu_jammed`): clk keeps cycling but PC stays FROZEN at the KIL, so no
+/// run-advance ever aborts on it — a free-running driver that re-issues the advance
+/// spins forever burning its budget on the jammed CPU (the "läuft sich tot" hang). The
+/// TS reference cleanly HALTS instead (runtime-controller.ts:791-807): runState→paused,
+/// PC frozen at the KIL, debug/stopped reason="jam" (the UI red border).
+///
+/// This helper generalizes the `--stream` jam-halt (previously inline in
+/// [`stream_debug_gated_advance`]) so EVERY run driver — `session/run`, `debug/run`
+/// (+ `debug/continue`), the monitor `g`/go path, AND the stream loop — observes the
+/// jam and halts identically: there is ONE jam-halt implementation, not two.
+///
+/// Behavior (1:1 with the prior inline stream block):
+/// * Jammed → freeze (`running=false`); ONCE per episode (gated on
+///   `stream_broke_on_jam` so a multi-frame free-run doesn't re-broadcast every frame)
+///   set `ctrl_stop` reason="jam" with the jammed PC, run the read-only crash-triage,
+///   and server-PUSH `debug/stopped` (reason="jam", carrying pc/cycles/opcode +
+///   triage) plus the human-readable triage `debug/observer_log`. The PC is NOT
+///   advanced past the KIL.
+/// * Not jammed → re-arm the edge (`stream_broke_on_jam=false`) for the next episode.
+///
+/// Returns whether the C64 CPU is jammed, so a synchronous driver (e.g. `session/run`)
+/// can short-circuit its reply (signal the pump to PAUSE rather than keep pumping).
+pub(crate) fn check_and_handle_jam(st: &mut State) -> bool {
+    // A KIL jams whichever CPU CORE the active run path drives. The full literal-VIC
+    // path (run_for_full — boot / cart / io-injected / vic-directed) jams `c64_core`
+    // (= VICE maincpu_jammed); the chip-ISOLATED ISA-exerciser path (run_for, a `wr`/
+    // run_prg-injected CPU — `session.injected` true, no cart/io/vic) jams the separate
+    // `cpu6510` interpreter (cpu.rs:1024). full_machine_gate decides the path per run, so
+    // exactly ONE core advances — observe a jam on EITHER and report the jammed core's PC.
+    let core_jammed = st.session.machine.c64_core.is_jammed;
+    let iso_jammed = st.session.machine.cpu6510.is_jammed();
+    if !core_jammed && !iso_jammed {
+        // Not jammed — re-arm the edge for the next episode (a future jam re-broadcasts).
+        st.stream_broke_on_jam = false;
+        return false;
+    }
+    // A jammed CPU makes no progress: FREEZE so a free-run driver stops re-advancing
+    // (the stream loop gates on `running`; the pump clears its host run flag on the
+    // jam signal) and the picture freezes on the last frame, 1:1 with TS runState→paused.
+    st.session.running = false;
+    if !st.stream_broke_on_jam {
+        st.stream_broke_on_jam = true;
+        // The PC frozen at the KIL is on the core that actually ran (and jammed).
+        let pc = if core_jammed {
+            st.session.machine.c64_core.reg_pc
+        } else {
+            st.session.machine.cpu6510.reg_pc
+        };
+        let cycles = st.session.machine.clk;
+        let opcode = st.session.machine.read_full(pc) & 0xff;
+        st.ctrl_stop = Some(CtrlStop { reason: "jam", pc, cycles });
+        // reverse-debug Phase 2 — auto-run the guided crash-triage on the jammed state
+        // and ATTACH the causal chain to the stop broadcast (read-only; the JAMmed PC
+        // is the crash PC), so the user gets the crash walk for free.
+        let chain = st.session.machine.crash_triage(Some(pc));
+        let triage_json = triage_to_json(&chain);
+        let triage_lines = format_triage_lines(&chain);
+        let stop = json!({
+            "reason": "jam",
+            "pc": pc as u64,
+            "cycles": cycles,
+            "opcode": opcode as u64,
+        });
+        let registers = register_dump(&st.session);
+        let session_id = st.session.id.clone();
+        st.notify.broadcast("debug/stopped", json!({
+            "session_id": session_id,
+            "stop": stop,
+            "registers": registers,
+            "triage": triage_json,
+        }));
+        // Also emit the human-readable chain into the monitor log stream so the
+        // drop-in shows it alongside the existing JAM context.
+        st.notify.broadcast("debug/observer_log", json!({
+            "session_id": session_id,
+            "lines": triage_lines,
+        }));
+    }
+    true
+}
+
+/// The PC frozen at the KIL on whichever CPU core jammed (full-machine `c64_core` or
+/// the chip-isolated `cpu6510` exerciser) — for a driver that wants to report the
+/// jammed PC in its synchronous reply. Prefers the full-machine core when both read
+/// jammed (only one path runs per advance, so they agree in practice).
+fn jammed_pc(st: &State) -> u16 {
+    if st.session.machine.c64_core.is_jammed {
+        st.session.machine.c64_core.reg_pc
+    } else {
+        st.session.machine.cpu6510.reg_pc
     }
 }
 
@@ -2088,48 +2203,10 @@ pub(crate) fn stream_debug_gated_advance(st: &mut State, budget: u64) -> u32 {
 
     // ── Spec 764 — JAM (KIL) auto-break (runtime-controller.ts:791-807). A jammed
     // CPU keeps cycling clk with PC frozen, so neither advance path aborts on it.
-    // Detect the jammed state here; halt (a jammed CPU makes no progress) and drop
-    // into the monitor ONCE per episode, re-arming when the jam clears. ──
-    if st.session.machine.c64_core.is_jammed {
-        st.session.running = false;
-        if !st.stream_broke_on_jam {
-            st.stream_broke_on_jam = true;
-            let pc = st.session.machine.c64_core.reg_pc;
-            let cycles = st.session.machine.clk;
-            let opcode = st.session.machine.read_full(pc) & 0xff;
-            st.ctrl_stop = Some(CtrlStop { reason: "jam", pc, cycles });
-            // reverse-debug Phase 2 — auto-run the guided crash-triage on the jammed
-            // state and ATTACH the causal chain to the stop broadcast, so the user gets
-            // the "crash → wild transfer → stack corruptor" walk for free (no hand-
-            // walking). Read-only; the JAMmed PC is the crash PC.
-            let chain = st.session.machine.crash_triage(Some(pc));
-            let triage_json = triage_to_json(&chain);
-            let triage_lines = format_triage_lines(&chain);
-            let stop = json!({
-                "reason": "jam",
-                "pc": pc as u64,
-                "cycles": cycles,
-                "opcode": opcode as u64,
-            });
-            let registers = register_dump(&st.session);
-            let session_id = st.session.id.clone();
-            st.notify.broadcast("debug/stopped", json!({
-                "session_id": session_id,
-                "stop": stop,
-                "registers": registers,
-                "triage": triage_json,
-            }));
-            // Also emit the human-readable chain into the monitor log stream so the
-            // drop-in shows it alongside the existing JAM context.
-            st.notify.broadcast("debug/observer_log", json!({
-                "session_id": session_id,
-                "lines": triage_lines,
-            }));
-        }
-    } else {
-        // Not jammed — re-arm the edge for the next episode.
-        st.stream_broke_on_jam = false;
-    }
+    // The shared `check_and_handle_jam` halts (freeze) + drops into the monitor ONCE
+    // per episode (debug/stopped reason="jam") and re-arms when the jam clears — the
+    // SAME helper every other run driver calls, so there is one jam-halt path. ──
+    check_and_handle_jam(st);
 
     // ITEM (audit background-workers-async-3) — drain observer `do log`/`do mark`/
     // `do cmd` side-effects EVERY free-run frame. The c64re tick() drains them once
@@ -3792,6 +3869,11 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             }
             st.session.running = true;
             st.ctrl_stop = None;
+            // Spec 764 — `g`/`x` is a fresh run intent: re-arm the JAM edge so a
+            // still-jammed machine asked to go re-broadcasts debug/stopped reason=jam
+            // (the shared helper observes it on the next advance — stream loop under
+            // --stream, or the CLI pump's session/run).
+            st.stream_broke_on_jam = false;
             Ok(format!(
                 "continuing at .C:{:04X} (running — Pause to halt)",
                 st.session.machine.cpu6510.reg_pc
@@ -3821,6 +3903,12 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 let pc = st.session.machine.cpu6510.reg_pc;
                 if bps.contains(&pc) {
                     hit = true;
+                    break;
+                }
+                // Spec 764 — a KIL/JAM freezes PC (the bp test above would never trip):
+                // stop stepping immediately rather than burning the whole CAP on a
+                // jammed CPU. The shared helper freezes + pushes debug/stopped reason=jam.
+                if check_and_handle_jam(st) {
                     break;
                 }
                 if st.session.machine.clk.wrapping_sub(start_clk) >= CAP {
@@ -6612,11 +6700,34 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                         },
                     }));
                 }
+                // Spec 764 — a KIL/JAM that fired DURING this armed run jams the CPU
+                // (PC frozen) without tripping a bp; observe it via the shared helper
+                // (freeze + debug/stopped reason="jam") and signal the caller so the
+                // CLI pump PAUSES instead of re-issuing session/run on the jammed CPU.
+                if check_and_handle_jam(&mut st) {
+                    let pc = jammed_pc(&st);
+                    return Response::ok(id, json!({
+                        "c64Cycles": st.session.machine.clk,
+                        "jam": { "pc": pc as u64 },
+                    }));
+                }
                 // Budget exhausted without a hit: report the advanced cycle count.
                 return Response::ok(id, json!({ "c64Cycles": cycles_now }));
             }
 
             run_cycle_budget(&mut st.session, cycles);
+            // Spec 764 — the no-debug budget advance has no halt gate, so a jammed CPU
+            // (KIL frozen at PC) would otherwise burn the WHOLE budget here and the CLI
+            // pump would keep re-issuing session/run → the spin/hang. Observe the jam via
+            // the shared helper (freeze + debug/stopped reason="jam") and signal it so the
+            // pump halts. The PC stays frozen at the KIL.
+            if check_and_handle_jam(&mut st) {
+                let pc = jammed_pc(&st);
+                return Response::ok(id, json!({
+                    "c64Cycles": st.session.machine.clk,
+                    "jam": { "pc": pc as u64 },
+                }));
+            }
             Response::ok(id, json!({ "c64Cycles": st.session.machine.clk }))
         }
 
@@ -7165,6 +7276,11 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             set_control_owner(&mut st, owner);
             st.session.running = true;
             st.ctrl_stop = None;
+            // Spec 764 — a fresh run() re-arms the JAM edge (runtime-controller.ts:793
+            // brokeOnJam reset on run), so a still-jammed machine asked to run again
+            // re-broadcasts debug/stopped reason=jam (the shared helper observes it on
+            // the next advance).
+            st.stream_broke_on_jam = false;
             st.ctrl_frame += 1;
             // Spec 771.2 — runtime-controller.ts:282 run() server-PUSHes debug/running
             // at the run transition. Without it the UI never leaves the paused/frozen
@@ -7220,6 +7336,9 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             set_control_owner(&mut st, owner);
             st.session.running = true;
             st.ctrl_stop = None;
+            // Spec 764 — continue() === run(): re-arm the JAM edge so a still-jammed
+            // machine asked to continue re-broadcasts debug/stopped reason=jam.
+            st.stream_broke_on_jam = false;
             // Spec 771.2 — continue() === run() in runtime-controller.ts:287, so it
             // server-PUSHes debug/running too.
             let pacing_snap = json!({ "mode": st.pacing_mode, "ratio": st.pacing_ratio });
