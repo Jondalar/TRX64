@@ -27,16 +27,10 @@ trx64cli --window   # cockpit + a native emulator window (play here, debug in th
 
 ## ROMs
 
-trx64cli needs the C64 ROMs (KERNAL / BASIC / CHARGEN + the 1541 DOS). It looks for them
-in a `roms/` directory next to the binary, or wherever you point it:
+The C64 ROMs are included — the `roms/` folder sits next to the binary, so `trx64cli`
+finds them automatically. Just run it. (Keep `trx64cli` and `roms/` together.)
 
-```
-trx64cli --rom-dir /path/to/c64-roms
-```
-
-Expected files: `kernal-901227-03.bin`, `basic-901226-01.bin`,
-`characters-901225-01.bin` (+ the 1541 `dos1541`). These are the standard VICE C64 ROM
-dumps.
+To use your own ROM set instead: `trx64cli --rom-dir /path/to/c64-roms`.
 
 ## Driving it
 

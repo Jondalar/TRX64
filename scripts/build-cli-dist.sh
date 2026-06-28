@@ -47,10 +47,23 @@ container run --rm -m 6g -c 4 -v "$PWD":/work -w /work "$IMG" bash -c '
   x86_64-w64-mingw32-strip /work/dist/windows-x86_64/x86_64-pc-windows-gnu/release/trx64cli.exe 2>/dev/null || true'
 cp dist/windows-x86_64/x86_64-pc-windows-gnu/release/trx64cli.exe "$OUT/windows-x86_64/"
 
-cp scripts/dist-readme.md "$OUT/README.md" 2>/dev/null || true
+# Bundle the C64 ROMs + the README into each OS folder, then zip per OS. The binary
+# auto-finds a `roms/` sitting next to it (default_rom_dir), so the unzipped folder
+# just runs. ROM_SRC defaults to the C64RE checkout; override for a different set.
+ROM_SRC="${ROM_SRC:-${C64RE_ROOT:-/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP}/resources/roms}"
+if [ ! -f "$ROM_SRC/kernal-901227-03.bin" ]; then
+  echo "WARNING: no ROMs at $ROM_SRC — handout will not boot without --rom-dir. Set ROM_SRC."
+fi
+
+for os in macos-arm64 linux-x86_64 windows-x86_64; do
+  cp scripts/dist-readme.md "$OUT/$os/README.md"
+  if [ -d "$ROM_SRC" ]; then
+    mkdir -p "$OUT/$os/roms"
+    cp "$ROM_SRC"/*.bin "$OUT/$os/roms/" 2>/dev/null || true
+  fi
+  ( cd "$OUT" && zip -qr "trx64cli-$os-$VER.zip" "$os" )
+  echo "  packed $OUT/trx64cli-$os-$VER.zip"
+done
 
 echo "== done — dist/handout (build $VER) =="
-ls -laR "$OUT"
-echo
-echo "ROMs are NOT included. Either drop a roms/ dir next to each binary, or run with"
-echo "  trx64cli --rom-dir <path-to-c64-roms>   (kernal-901227-03.bin, basic-901226-01.bin, characters-901225-01.bin)"
+ls -la "$OUT"/*.zip

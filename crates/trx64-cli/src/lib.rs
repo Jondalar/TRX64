@@ -15,12 +15,36 @@ pub mod window;
 
 pub use engine::{CmdResult, Engine, StateSnapshot};
 
-/// Mirror the daemon's `rom_dir()` resolution: $C64RE_ROOT/resources/roms with the
-/// daemon's default root.
+/// Resolve the ROM directory, trying the likely locations in order and picking the
+/// first that actually has the KERNAL. This makes the distributed binary work with a
+/// `roms/` folder sitting next to it (the handout layout), while still honouring
+/// `$C64RE_ROOT` for the in-tree dev setup. `--rom-dir` overrides this entirely.
 pub fn default_rom_dir() -> std::path::PathBuf {
-    let root = std::env::var("C64RE_ROOT")
-        .unwrap_or_else(|_| "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP".to_string());
-    std::path::PathBuf::from(root).join("resources").join("roms")
+    use std::path::PathBuf;
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    // 1. Explicit C64RE checkout (dev / daemon parity).
+    if let Ok(root) = std::env::var("C64RE_ROOT") {
+        candidates.push(PathBuf::from(root).join("resources").join("roms"));
+    }
+    // 2. `roms/` next to the executable — the distributed handout (trx64cli + roms/).
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("roms"));
+        }
+    }
+    // 3. `roms/` in the current working directory.
+    candidates.push(PathBuf::from("roms"));
+    // 4. Dev fallback: the in-tree C64RE checkout.
+    candidates.push(
+        PathBuf::from("/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP")
+            .join("resources")
+            .join("roms"),
+    );
+    candidates
+        .iter()
+        .find(|p| p.join("kernal-901227-03.bin").exists())
+        .cloned()
+        .unwrap_or_else(|| candidates.into_iter().next().unwrap_or_else(|| PathBuf::from("roms")))
 }
 
 /// Boot a fresh in-process machine from `rom_dir` and wrap it in an [`Engine`].
