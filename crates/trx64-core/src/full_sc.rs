@@ -490,6 +490,53 @@ pub fn execute_one<O: Observer>(
             dr.set_opcode(opcode, b1, b2);
         }
     }
+    // TRX64 feature-request #2 — capture the WRITER's caller chain (top return-stack
+    // frames) so `whowrote` can attribute a write done by a SHARED primitive (a common
+    // copy/store/loader) to its CALL SITE, not just the leaf PC. Captured ONLY for
+    // instructions that actually WROTE (the load/branch/compare majority pays nothing):
+    // we gate on the in-flight write count, then read the top frames straight from RAM
+    // (the 6502 stack is always $0100-$01FF = RAM, so this is a side-effect-free,
+    // O(3) read). The frames live at the PRE-state SP (`pre_sp`): a JSR stacks PCL@sp+1,
+    // PCH@sp+2 (high byte at the higher address), and RTS returns to that address + 1 —
+    // so each frame's return address is `(PCH<<8 | PCL) + 1`. `depth` = how many of the
+    // ≤3 frames fit before the stack underflows ($01FF).
+    if bus.delta_ring.as_deref().map(|dr| dr.in_flight_write_count()).unwrap_or(0) > 0 {
+        let ram = &bus.fb.ram;
+        let mut chain = crate::delta_ring::CallerChain::default();
+        // The 6502 stack grows DOWN: a push writes $0100+SP then SP--, so after a JSR
+        // (PCH then PCL pushed) the SP points at the next free slot and the topmost
+        // frame's bytes are at $0100+((SP+1)&FF) = PCL, $0100+((SP+2)&FF) = PCH. We walk
+        // upward (SP += 2) for up to 3 frames, reading each frame's return address
+        // (`(PCH<<8|PCL)+1`). Stop once SP reaches the empty-stack top ($FF/$FE — no more
+        // pushed bytes above it). Addresses are masked to the $0100 page (RAM, so the
+        // read is side-effect-free). Best-effort: a leaf that wasn't reached via JSR
+        // reads whatever sits above SP, but the innermost frame is the high-value one and
+        // the field report explicitly frames this as a heuristic top-of-stack snapshot.
+        let mut sp = pre_sp;
+        for k in 0..3usize {
+            // An empty stack (SP == $FF) has no frame above it. SP == $FE has exactly one
+            // frame (its 2 bytes at $01FF/$0100), which we DO read; the next iteration's
+            // SP wraps to $00 → caught by the `sp == 0xFF`-equivalent guard below.
+            if sp == 0xff {
+                break;
+            }
+            // `sp` is u8, so `wrapping_add` keeps the offset within the $0100 page; add
+            // the page base after masking to 0..=$FF.
+            let lo = ram[0x0100 + sp.wrapping_add(1) as usize];
+            let hi = ram[0x0100 + sp.wrapping_add(2) as usize];
+            chain.frames[k] = u16::from_le_bytes([lo, hi]).wrapping_add(1);
+            chain.depth = (k + 1) as u8;
+            // Advance past this frame; if it would wrap past the top of the page the
+            // stack is exhausted — no further frame.
+            if sp >= 0xfe {
+                break;
+            }
+            sp = sp.wrapping_add(2);
+        }
+        if let Some(dr) = bus.delta_ring.as_deref_mut() {
+            dr.set_caller_chain(chain);
+        }
+    }
     // reverse-debug Phase 1b — publish the full-delta entry. Committed UNCONDITIONALLY
     // after the execute (not only inside the `fetch` block): an interrupt-only dispatch
     // (no normal opcode body) still pushed PCH/PCL/P onto the stack via `write_raw`, and

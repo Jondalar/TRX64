@@ -120,6 +120,46 @@ fn who_wrote_pins_the_last_writer_live() {
 }
 
 #[test]
+fn who_wrote_attributes_a_shared_sub_to_its_two_call_sites() {
+    // FEATURE #2: a SHARED store subroutine ($C040: STA $0500 ; RTS) is called from two
+    // sites. who_wrote must return DISTINCT caller chains so the operation (not just the
+    // leaf STA PC) is identifiable — the field report's core ask. End-to-end through the
+    // real core (the JSR pushes the return address; execute_one reads it off the stack).
+    let mut m = Machine::new();
+    m.delta_ring.set_enabled(true);
+
+    // Shared sub @ $C040:  STA $0500 (8D 00 05) ; RTS (60)
+    m.poke(0xc040, &[0x8d, 0x00, 0x05, 0x60]);
+    // Site A @ $C000: LDA #$11 ; JSR $C040 ; JMP $C020
+    //   A9 11  20 40 C0  4C 20 C0
+    m.poke(0xc000, &[0xa9, 0x11, 0x20, 0x40, 0xc0, 0x4c, 0x20, 0xc0]);
+    // Site B @ $C020: LDA #$22 ; JSR $C040 ; (RTS to nowhere / stop)
+    //   A9 22  20 40 C0  60
+    m.poke(0xc020, &[0xa9, 0x22, 0x20, 0x40, 0xc0, 0x60]);
+
+    m.c64_core.reg_pc = 0xc000;
+    // Run enough instructions for: A:LDA, A:JSR, sub:STA, sub:RTS, A:JMP,
+    //                              B:LDA, B:JSR, sub:STA, sub:RTS  = 9.
+    m.run_for_full_capped(9 * 16, 9, &mut trx64_core::NullSink, |_, _, _, _, _, _, _| {});
+
+    let hits = m.who_wrote(0x0500, 8);
+    assert_eq!(hits.len(), 2, "the shared sub wrote $0500 from two sites");
+    // BOTH writers are the SAME leaf PC ($C040 = the STA inside the sub) — proving the
+    // leaf alone cannot distinguish them.
+    assert_eq!(hits[0].pc, 0xc040, "leaf store PC");
+    assert_eq!(hits[1].pc, 0xc040, "same leaf store PC for both writes");
+    // …but the CALLER CHAINS differ: newest = site B (return $C025), then site A ($C005).
+    assert!(hits[0].caller_chain.depth >= 1, "caller chain captured for site B");
+    assert!(hits[1].caller_chain.depth >= 1, "caller chain captured for site A");
+    assert_eq!(hits[0].caller_chain.frames[0], 0xc025, "site B return address");
+    assert_eq!(hits[1].caller_chain.frames[0], 0xc005, "site A return address");
+    assert_ne!(
+        hits[0].caller_chain.frames[0], hits[1].caller_chain.frames[0],
+        "the two call sites are DISTINGUISHED by the caller chain (the whole point of #2)"
+    );
+}
+
+#[test]
 fn reverse_step_rolls_back_the_cpu_port() {
     // The $01 CPU port drives the PLA banking; a corrupted $01 is a real crash cause.
     // Verify reverse_step restores the port byte AND the derived memconfig.

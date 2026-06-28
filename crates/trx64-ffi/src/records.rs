@@ -512,6 +512,11 @@ pub struct Writer {
     pub addr: u32,
     pub old: u32,
     pub new: u32,
+    /// TRX64 feature-request #2 — the caller chain (top return-stack frames the writing
+    /// instruction saw, innermost first). Empty when none was captured. Lets a UI
+    /// attribute a write done by a shared primitive to its call site.
+    #[serde(default)]
+    pub caller_chain: Vec<u32>,
 }
 
 /// `runtime/crash_triage` result — the human-readable cause chain.

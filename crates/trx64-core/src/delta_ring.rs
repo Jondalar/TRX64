@@ -108,6 +108,32 @@ pub struct DeltaEntry {
     pub b2: u8,
 }
 
+/// TRX64 feature-request #2 (`whowrote` caller chain) — the top 1..3 return-stack
+/// frames captured at a write, so `whowrote` can attribute a write done by a SHARED
+/// primitive (copy/store/loader called from many sites) to the CALLER, not just the
+/// leaf PC. `#[repr(C)]`: three u16 return addresses + a `depth` count (how many were
+/// actually read off the stack, 0..=3) + 1 pad = 8 bytes.
+///
+/// RING-SIZE DECISION (the one to flag): NOT packed into `DeltaEntry` (which is exactly
+/// 24 B with NO spare bytes — adding 6 B would round it to 32 B = +33% on the 72 MB
+/// entry slab ≈ +24 MB, and break the pinned 24-B layout + the dump codec). Instead a
+/// SEPARATE parallel slab sized to the entry slab: 8 B × entry_cap ≈ +24 MB at the 10 s
+/// default. The chain is CAPTURED ONLY for instructions that actually wrote (the caller
+/// gates the stack read on `in_flight_write_count() > 0`), so the ~1 MHz hot path pays
+/// nothing for the load/branch/compare majority; the slab slot for a no-write entry
+/// stays zeroed (`depth == 0`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct CallerChain {
+    /// Up to three return addresses read off the stack at the write (innermost first):
+    /// `frames[0]` = the immediate caller's return address, `[1]`/`[2]` = its callers.
+    /// Unused entries are 0; `depth` says how many are valid.
+    pub frames: [u16; 3],
+    /// How many `frames` were actually read (0..=3). 0 ⇒ no chain captured (a no-write
+    /// entry, or the stack was empty / unreadable).
+    pub depth: u8,
+}
+
 /// TRX64 feature-request #1 (loop/halt ONSET capture) — the PINNED record of the
 /// control transfer that ENTERED a tight self-loop / halt-trap, captured the FIRST
 /// instant the loop is detected and EXEMPT from ring eviction so it survives no matter
@@ -200,6 +226,18 @@ pub struct DeltaRing {
     /// Kill-switch (shared `TRX64_CPUHISTORY` knob). When false the whole ring is inert.
     enabled: bool,
 
+    // ── TRX64 feature-request #2 — `whowrote` caller chain (see `CallerChain`) ───────
+    /// Parallel caller-chain slab, sized to + indexed IDENTICALLY to `entries` (slot =
+    /// `entry_index % entry_cap`). `callers[slot]` holds the top return-stack frames the
+    /// instruction at `entries[slot]` saw — populated only for instructions that wrote
+    /// (the caller gates the stack read on `in_flight_write_count()`); a no-write slot
+    /// stays `depth == 0`. Boxed for the same reason as the entry slab.
+    callers: Box<[CallerChain]>,
+    /// Scratch caller chain for the in-flight instruction (set by `set_caller_chain`
+    /// between `begin` and `commit`; published into `callers[slot]` at `commit`). Reset
+    /// each `begin` so an instruction that does not capture leaves `depth == 0`.
+    cur_callers: CallerChain,
+
     // ── TRX64 feature-request #1 — loop/halt ONSET capture (see `LoopOnset`) ────────
     /// The PINNED entry-transfer record, captured the first instant a tight loop / halt
     /// is detected and held BESIDE the ring (exempt from eviction). `None` until the
@@ -259,6 +297,8 @@ impl DeltaRing {
             cur: DeltaEntry::default(),
             in_flight: false,
             enabled,
+            callers: vec![CallerChain::default(); ecap].into_boxed_slice(),
+            cur_callers: CallerChain::default(),
             loop_onset: None,
             recent: Vec::with_capacity(LOOP_WINDOW + 1),
             loop_iters: 0,
@@ -291,6 +331,9 @@ impl DeltaRing {
         let wcap = writes_cap.max(1);
         self.entries = vec![DeltaEntry::default(); ecap].into_boxed_slice();
         self.writes = vec![WriteRec::default(); wcap].into_boxed_slice();
+        // TRX64 feature-request #2 — the caller-chain slab rides the entry-slab size.
+        self.callers = vec![CallerChain::default(); ecap].into_boxed_slice();
+        self.cur_callers = CallerChain::default();
         self.entry_head = 0;
         self.write_head = 0;
         self.cur = DeltaEntry::default();
@@ -453,7 +496,35 @@ impl DeltaRing {
             b1: 0,
             b2: 0,
         };
+        // TRX64 feature-request #2 — reset the in-flight caller chain so an instruction
+        // that does not capture one leaves the slot at depth 0.
+        self.cur_callers = CallerChain::default();
         self.in_flight = true;
+    }
+
+    /// HOT PATH (light — a struct copy). TRX64 feature-request #2: stamp the in-flight
+    /// instruction's caller chain (top return-stack frames). Called from `execute_one`
+    /// ONLY when the instruction wrote at least one byte (the caller gates on
+    /// `in_flight_write_count()`), so the load/branch/compare majority pays nothing. A
+    /// no-op when the ring is gated off / no instruction is in flight.
+    #[inline]
+    pub fn set_caller_chain(&mut self, chain: CallerChain) {
+        if !self.enabled || !self.in_flight {
+            return;
+        }
+        self.cur_callers = chain;
+    }
+
+    /// TRX64 feature-request #2 — the number of writes the in-flight instruction has
+    /// recorded so far. Lets `execute_one` decide whether to pay the stack-read for the
+    /// caller chain (only writers need it). 0 when no instruction is in flight.
+    #[inline]
+    pub fn in_flight_write_count(&self) -> u16 {
+        if self.enabled && self.in_flight {
+            self.cur.write_count
+        } else {
+            0
+        }
     }
 
     /// HOT PATH. Stamp the in-flight instruction's decoded opcode + operand bytes onto
@@ -498,6 +569,9 @@ impl DeltaRing {
         let cap = self.entries.len();
         let slot = (self.entry_head % cap as u64) as usize;
         self.entries[slot] = self.cur;
+        // TRX64 feature-request #2 — publish the in-flight caller chain into the parallel
+        // slot (zeroed for a no-write / no-capture instruction).
+        self.callers[slot] = self.cur_callers;
         self.entry_head = self.entry_head.wrapping_add(1);
         self.in_flight = false;
         // TRX64 feature-request #1 — feed the just-committed instruction to the
@@ -725,6 +799,52 @@ impl DeltaRing {
         hits
     }
 
+    /// TRX64 feature-request #2 — like [`who_wrote`] but ALSO returns each hit's
+    /// [`CallerChain`] (the top return-stack frames the writing instruction saw), so a
+    /// write done by a SHARED primitive can be attributed to the call site, not just the
+    /// leaf PC. Same newest→oldest walk + readable-edge stop. The caller chain comes from
+    /// the parallel `callers` slab at the SAME slot as the entry (so it cannot drift from
+    /// its instruction). A no-capture entry returns a `depth == 0` chain.
+    pub fn who_wrote_with_callers(
+        &self,
+        addr: u16,
+        limit: usize,
+    ) -> Vec<(DeltaEntry, WriteRec, CallerChain)> {
+        let mut hits = Vec::new();
+        if limit == 0 {
+            return hits;
+        }
+        let len = self.len();
+        if len == 0 {
+            return hits;
+        }
+        let cap = self.entries.len();
+        for back in 0..len as u64 {
+            let logical = self.entry_head - 1 - back;
+            let slot = (logical % cap as u64) as usize;
+            let e = self.entries[slot];
+            if !self.writes_readable(&e) {
+                break;
+            }
+            if e.write_count == 0 {
+                continue;
+            }
+            let wcap = self.writes.len();
+            for wk in (0..e.write_count as u64).rev() {
+                let wslot = ((e.write_start as u64 + wk) % wcap as u64) as usize;
+                let w = self.writes[wslot];
+                if w.addr == addr {
+                    hits.push((e, w, self.callers[slot]));
+                    if hits.len() >= limit {
+                        return hits;
+                    }
+                    break;
+                }
+            }
+        }
+        hits
+    }
+
     /// The cycle range currently covered by the entry ring (`Some((oldest, newest))`)
     /// or `None` when empty. Lets a caller report the reverse window / decide
     /// ring-vs-trace fallback.
@@ -796,6 +916,9 @@ impl Clone for DeltaRing {
             cur: DeltaEntry::default(),
             in_flight: false,
             enabled: self.enabled,
+            // TRX64 feature-request #2 — a clone is a fresh empty caller slab too.
+            callers: vec![CallerChain::default(); self.entries.len()].into_boxed_slice(),
+            cur_callers: CallerChain::default(),
             // TRX64 feature-request #1 — a clone is a FRESH timeline (like the slabs):
             // start with no loop-onset pin + an empty detector.
             loop_onset: None,
@@ -1093,6 +1216,81 @@ mod tests {
         assert_eq!(lo2.src_pc, 0x600);
     }
 
+    /// FEATURE #2 helper: record an instruction that writes `addr` AND carries a caller
+    /// chain (begin → set_caller_chain → record_write → commit), mirroring the
+    /// execute_one capture order.
+    fn instr_write_with_chain(
+        r: &mut DeltaRing,
+        pc: u16,
+        cycle: u64,
+        addr: u16,
+        new: u8,
+        chain: &[u16],
+    ) {
+        r.begin(pc, 0, 0, 0, 0xff, 0, cycle);
+        r.set_opcode(0x8d, addr as u8, (addr >> 8) as u8); // STA abs
+        r.record_write(addr, 0, new);
+        // execute_one only captures the chain when the instruction wrote — assert that
+        // gate holds here, then publish.
+        assert_eq!(r.in_flight_write_count(), 1);
+        let mut cc = CallerChain::default();
+        for (k, f) in chain.iter().take(3).enumerate() {
+            cc.frames[k] = *f;
+            cc.depth = (k + 1) as u8;
+        }
+        r.set_caller_chain(cc);
+        r.commit();
+    }
+
+    #[test]
+    fn who_wrote_with_callers_distinguishes_two_call_sites() {
+        // FEATURE #2: the SAME leaf store routine ($8800) writes $0A81 from TWO different
+        // call sites. who_wrote_with_callers must return DISTINCT caller chains so the
+        // operation (not just the leaf) is identifiable.
+        let mut r = DeltaRing::with_capacity(64, 128);
+        r.set_enabled(true);
+        // Call site A: $0B05 -> $0AC0 -> $8800 (the leaf store).
+        instr_write_with_chain(&mut r, 0x8800, 100, 0x0a81, 0x11, &[0x0ac0, 0x0b05]);
+        // An unrelated write in between.
+        instr_write_with_chain(&mut r, 0x8800, 110, 0x0200, 0x55, &[0x1234]);
+        // Call site B: $0C09 -> $0AC0 -> $8800 (same leaf, different outer caller).
+        instr_write_with_chain(&mut r, 0x8800, 120, 0x0a81, 0x22, &[0x0ac0, 0x0c09]);
+
+        let hits = r.who_wrote_with_callers(0x0a81, 8);
+        assert_eq!(hits.len(), 2, "two writers of $0A81");
+        // Newest first → call site B.
+        let (_, w0, c0) = &hits[0];
+        assert_eq!(w0.new_value, 0x22);
+        assert_eq!(c0.depth, 2);
+        assert_eq!(c0.frames[0], 0x0ac0);
+        assert_eq!(c0.frames[1], 0x0c09, "site B's outer caller");
+        // Then call site A.
+        let (_, w1, c1) = &hits[1];
+        assert_eq!(w1.new_value, 0x11);
+        assert_eq!(c1.frames[1], 0x0b05, "site A's outer caller — DISTINCT from B");
+        assert_ne!(c0.frames[1], c1.frames[1], "the two call sites are distinguished");
+    }
+
+    #[test]
+    fn caller_chain_absent_for_no_write_instruction() {
+        // FEATURE #2: a non-writing instruction (a branch/compare) carries NO caller
+        // chain (depth 0) — the capture is gated on writes, so the load/branch majority
+        // pays nothing and leaves the slot zeroed.
+        let mut r = DeltaRing::with_capacity(16, 32);
+        r.set_enabled(true);
+        // A no-write instruction: in_flight_write_count must be 0 (the execute_one gate).
+        r.begin(0x2000, 0, 0, 0, 0xff, 0, 10);
+        r.set_opcode(0xea, 0, 0); // NOP
+        assert_eq!(r.in_flight_write_count(), 0, "no writes → caller chain not captured");
+        r.commit();
+        // A writing instruction WITH a chain, so the ring is non-empty for the query.
+        instr_write_with_chain(&mut r, 0x8800, 20, 0x0400, 0x41, &[0x0a00]);
+        let hits = r.who_wrote_with_callers(0x0400, 4);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].2.depth, 1);
+        assert_eq!(hits[0].2.frames[0], 0x0a00);
+    }
+
     #[test]
     fn entries_wrapped_reports_ring_eviction() {
         // FEATURE #3: entries_wrapped is the ring-exhaustion signal — false until the
@@ -1116,6 +1314,10 @@ mod tests {
     fn entry_and_write_layout_bounded() {
         assert_eq!(std::mem::size_of::<DeltaEntry>(), 24, "DeltaEntry layout drifted");
         assert_eq!(std::mem::size_of::<WriteRec>(), 4, "WriteRec layout drifted");
+        // FEATURE #2: the caller-chain slab entry is a compact 8 B (3×u16 + depth + pad),
+        // so the parallel slab is ~24 MB at the 10 s default — NOT the +33% the 24→32 B
+        // DeltaEntry growth would have cost (the documented ring-size decision).
+        assert_eq!(std::mem::size_of::<CallerChain>(), 8, "CallerChain layout drifted");
     }
 
     #[test]

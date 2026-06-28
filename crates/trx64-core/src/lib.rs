@@ -53,7 +53,7 @@ pub use cpu_history::{CpuHistEntry, CpuHistoryRing};
 pub use crash_triage::{
     Confidence, CrashPoint, StackSlot, TransferKind, TriageChain, WildTransfer,
 };
-pub use delta_ring::{DeltaEntry, DeltaRing, WriteRec};
+pub use delta_ring::{CallerChain, DeltaEntry, DeltaRing, LoopOnset, WriteRec};
 pub use drive::Drive1541;
 pub use full::{Bank8, BankA, BankE, FullBus, MemConfig};
 pub use iec::IecCore;
@@ -545,7 +545,9 @@ pub struct ReverseStepOutcome {
 }
 
 /// reverse-debug Phase 1b — one [`Machine::who_wrote`] hit: the instruction PC + cycle
-/// that wrote `addr`, and the `old→new` bytes.
+/// that wrote `addr`, and the `old→new` bytes. TRX64 feature-request #2 adds the
+/// `caller_chain` — the top return-stack frames the writing instruction saw, so a write
+/// done by a SHARED primitive can be attributed to its call site, not just the leaf PC.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WhoWroteHit {
     pub pc: u16,
@@ -553,6 +555,10 @@ pub struct WhoWroteHit {
     pub addr: u16,
     pub old_value: u8,
     pub new_value: u8,
+    /// TRX64 feature-request #2 — the caller chain (top 1..3 return addresses, innermost
+    /// first; `depth == 0` ⇒ none captured for this hit). Decode to symbols only if a
+    /// symbol file is loaded (the daemon does that at render time).
+    pub caller_chain: crate::delta_ring::CallerChain,
 }
 
 /// TRX64 feature-request #3 — ring-exhaustion as a typed, first-class signal. When a
@@ -1146,19 +1152,20 @@ impl Machine {
 
     /// reverse-debug Phase 1b — the stack-crash shortcut. Scan the delta ring's writes
     /// BACKWARD (newest→oldest) for the last `limit` writers of `addr`. Returns each hit
-    /// as the writing instruction's PC + cycle + the `old→new` bytes, newest first.
-    /// Stops at the ring's readable edge (older history lives only in the finalized
-    /// trace). Read-only — does not mutate the machine.
+    /// as the writing instruction's PC + cycle + the `old→new` bytes + its caller chain
+    /// (TRX64 feature-request #2), newest first. Stops at the ring's readable edge (older
+    /// history lives only in the finalized trace). Read-only — does not mutate the machine.
     pub fn who_wrote(&self, addr: u16, limit: usize) -> Vec<WhoWroteHit> {
         self.delta_ring
-            .who_wrote(addr, limit)
+            .who_wrote_with_callers(addr, limit)
             .into_iter()
-            .map(|(e, w)| WhoWroteHit {
+            .map(|(e, w, chain)| WhoWroteHit {
                 pc: e.pc,
                 cycle: e.cycle,
                 addr: w.addr,
                 old_value: w.old_value,
                 new_value: w.new_value,
+                caller_chain: chain,
             })
             .collect()
     }

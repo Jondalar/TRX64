@@ -4196,10 +4196,23 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 hits.len()
             )];
             for h in &hits {
-                lines.push(format!(
-                    "  $ {:04X} <- written by ${:04X} @ cyc {}  (${:02X} -> ${:02X})",
+                // TRX64 feature-request #2 — append the CALLER CHAIN (top return-stack
+                // frames the writing instruction saw) so a write by a SHARED primitive is
+                // attributed to its call site, not just the leaf PC. `depth == 0` ⇒ none
+                // captured (an interrupt/early-boot write with an empty/unreadable stack).
+                let chain = h.caller_chain;
+                let mut line = format!(
+                    "  ${:04X} <- written by ${:04X} @ cyc {}  (${:02X} -> ${:02X})",
                     h.addr, h.pc, h.cycle, h.old_value, h.new_value
-                ));
+                );
+                if chain.depth > 0 {
+                    let frames: Vec<String> = chain.frames[..chain.depth as usize]
+                        .iter()
+                        .map(|f| format!("${f:04X}"))
+                        .collect();
+                    line.push_str(&format!("   caller chain: {}", frames.join(" -> ")));
+                }
+                lines.push(line);
             }
             Ok(lines.join("\n"))
         }
@@ -5385,7 +5398,7 @@ fn monitor_help_text() -> String {
         "    chis [cyc] | chis <s> <e>  cpu instruction history: LIVE cpuhistory ring first (works while a trace is active), falls back to the captured trace; last N cyc (default 4000) or a window",
         "  REVERSE-DEBUG (always-on full-delta ring — no pre-arming; inspect-backward only)",
         "    rstep [n] | reverse [n]   UNDO the last n instructions (default 1): restore CPU+RAM+IO bytes to before them; reports the landed regs + writes rolled back",
-        "    whowrote <addr> [n]       last n writer(s) of <addr> from the ring (newest first): PC + cycle + old->new — the stack-crash shortcut. Emits `ring_exhausted: true` + a depth hint on a miss past a wrapped ring.",
+        "    whowrote <addr> [n]       last n writer(s) of <addr> from the ring (newest first): PC + cycle + old->new + caller chain (top return frames -> identifies the CALLER of a shared store). Emits `ring_exhausted: true` + a depth hint on a miss past a wrapped ring.",
         "    triage [pc]               guided crash-triage: causal chain (crash -> wild RTS/JMP transfer -> stack corruptor) from the rings; auto-printed on a JAM. Confidence-tagged. Surfaces a PINNED `loop entry: $SRC -> $DST` for a tight-loop/halt; `ring_exhausted` when the transfer is older than the ring.",
         "    revdepth [seconds]        report / set the always-on reverse-ring depth: rebuilds the delta+cpuhistory rings (DISCARDS history; future capture only; 1..=600s). TRX64_REVERSE_SECONDS = boot default",
         "    diff <idA> <idB>          typed by-ID diff of two checkpoint anchors (RAM runs + per-chip register changes). READ-ONLY (live machine unchanged). ids from `checkpoint/list`",
@@ -7893,19 +7906,31 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             let limit = req.params.get("limit").and_then(|v| v.as_u64()).unwrap_or(8).clamp(1, 64) as usize;
             let st = state.lock().unwrap();
             let hits = st.session.machine.who_wrote(addr, limit);
+            // TRX64 feature-request #3 — typed ring-exhaustion (a miss past a wrapped ring).
+            let exhaustion = st.session.machine.ring_exhaustion(!hits.is_empty());
             let out: Vec<Value> = hits
                 .iter()
-                .map(|h| json!({
-                    "pc": h.pc,
-                    "cycle": h.cycle,
-                    "addr": h.addr,
-                    "old": h.old_value,
-                    "new": h.new_value,
-                }))
+                .map(|h| {
+                    // TRX64 feature-request #2 — the caller chain (top return frames).
+                    let chain: Vec<u16> = h.caller_chain.frames
+                        [..h.caller_chain.depth as usize]
+                        .to_vec();
+                    json!({
+                        "pc": h.pc,
+                        "cycle": h.cycle,
+                        "addr": h.addr,
+                        "old": h.old_value,
+                        "new": h.new_value,
+                        "callerChain": chain,
+                    })
+                })
                 .collect();
             Response::ok(id, json!({
                 "addr": addr,
                 "writers": out,
+                "ringExhausted": exhaustion.ring_exhausted,
+                "revdepthSeconds": exhaustion.revdepth_seconds,
+                "ringExhaustedHint": exhaustion.hint,
             }))
         }
 
