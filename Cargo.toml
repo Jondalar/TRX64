@@ -6,6 +6,7 @@ members = [
     "crates/trx64-session",
     "crates/trx64-daemon",
     "crates/trx64-ffi",
+    "crates/trx64-cli",
 ]
 
 [workspace.package]
