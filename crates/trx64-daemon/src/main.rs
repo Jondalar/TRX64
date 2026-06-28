@@ -4152,6 +4152,22 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             }
         }
 
+        // Spec time-travel-tooling Piece 1 — `diff <idA> <idB>`: typed by-ID diff of
+        // two checkpoint anchors (RAM runs + per-chip register changes). READ-ONLY —
+        // the live machine is restored to its current state after the diff. Backed by
+        // the SAME `diff_checkpoints_by_id` the WS `runtime/diff_checkpoints` method
+        // and the FFI `diffCheckpoints` call.
+        "diff" => {
+            let (a, b) = match (toks.get(1), toks.get(2)) {
+                (Some(a), Some(b)) => (a.clone(), b.clone()),
+                _ => return Err("diff: usage: diff <idA> <idB>  (checkpoint ids from `checkpoint/list`)".into()),
+            };
+            match diff_checkpoints_by_id(st, &a, &b) {
+                Ok(v) => Ok(format_typed_snapshot_diff(&v)),
+                Err(e) => Err(format!("diff: {e}")),
+            }
+        }
+
         // ---- Live trace gate (Spec 746 / audit misc-2): trace on|off|status|mark --
         // Wires the monitor `trace` verb to the EXISTING trace machinery (TraceState +
         // finalize_trace — the same engine behind trace/start_domains, runtime/mark,
@@ -7725,6 +7741,37 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 obj.insert("lines".to_string(), Value::Array(lines));
             }
             Response::ok(id, out)
+        }
+
+        // Spec time-travel-tooling Piece 1 — diffCheckpoints(idA, idB). Resolve two
+        // ring anchors BY ID, run the EXISTING snapshot_diff compute on their two
+        // machine states, return a TYPED SnapshotDiff record (RAM contiguous runs +
+        // per-chip register-change lists). READ-ONLY: the live machine is byte-
+        // identical after the diff (diff_checkpoints_by_id snapshots + restores live).
+        "runtime/diff_checkpoints" => {
+            let id_a = match req
+                .params
+                .get("idA")
+                .or_else(|| req.params.get("id_a"))
+                .and_then(|v| v.as_str())
+            {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return Response::err(id, -32602, "runtime/diff_checkpoints: idA required"),
+            };
+            let id_b = match req
+                .params
+                .get("idB")
+                .or_else(|| req.params.get("id_b"))
+                .and_then(|v| v.as_str())
+            {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return Response::err(id, -32602, "runtime/diff_checkpoints: idB required"),
+            };
+            let mut st = state.lock().unwrap();
+            match diff_checkpoints_by_id(&mut st, &id_a, &id_b) {
+                Ok(v) => Response::ok(id, v),
+                Err(e) => Response::err(id, -32001, format!("runtime/diff_checkpoints: {e}")),
+            }
         }
 
         "runtime/swap_disk_and_continue" => {
@@ -11881,6 +11928,284 @@ fn restore_live_checkpoint(session: &mut Session, cp: &Value) -> Result<(), Stri
     Ok(())
 }
 
+// ── Spec time-travel-tooling Piece 1 — diffCheckpoints(idA, idB) ───────────────
+//
+// Resolve two checkpoint anchors BY ID from the live ring, run the EXISTING
+// snapshot_diff compute on their two machine states, and return a TYPED
+// `SnapshotDiff`-shaped JSON value (RAM grouped into contiguous changed runs, one
+// `[{name,old,new}]` list per chip).
+//
+// READ-ONLY contract: the live machine MUST be byte-identical after the diff. The
+// snapshot_diff compute parses the c64re-own VSF framing (`save_vsf` emits exactly
+// the modules it reads: MAINCPU/C64MEM/CIA1/CIA2/SID/DRIVECPU/IECBUS/VIC-II), and
+// the only way to obtain an anchor's VSF bytes is to put that anchor INTO the
+// machine and `save_vsf`. So we (1) snapshot the LIVE state to a checkpoint Value,
+// (2) restore anchor A → `save_vsf` → bytes A, (3) restore anchor B → `save_vsf` →
+// bytes B, (4) restore the saved LIVE state back, then (5) compute the diff. The
+// restore→save→restore round-trip uses the SAME path checkpoint/restore uses, and
+// the final restore-back leaves the machine exactly as it was found (verified: live
+// PC/cycles unchanged).
+//
+// No new diff logic — `snapshot_diff::diff_snapshots` is the compute; this wraps it
+// with by-ID anchor resolution + the typed-record reshape.
+fn diff_checkpoints_by_id(st: &mut State, id_a: &str, id_b: &str) -> Result<Value, String> {
+    // Resolve both anchors up front so an unknown id errors BEFORE we disturb the
+    // machine (the snapshot/restore-back below only happens on the happy path).
+    let snap_a = st
+        .checkpoint_ring
+        .restore_snapshot(id_a)
+        .ok_or_else(|| format!("unknown checkpoint id {id_a}"))?;
+    let snap_b = st
+        .checkpoint_ring
+        .restore_snapshot(id_b)
+        .ok_or_else(|| format!("unknown checkpoint id {id_b}"))?;
+
+    // (1) Preserve the LIVE state so the diff is read-only. Capturing it as a ring
+    // checkpoint Value (the exact shape restore_live_checkpoint consumes) means the
+    // restore-back at the end is byte-faithful — same path as a normal restore.
+    let was_running = st.session.running;
+    let live = capture_live_checkpoint(&mut st.session);
+
+    // (2)+(3) Restore each anchor and capture its VSF bytes. Helper keeps the two
+    // legs identical; any restore failure short-circuits to the live restore-back.
+    let vsf_of = |session: &mut Session, snap: &Value| -> Result<Vec<u8>, String> {
+        restore_live_checkpoint(session, snap)?;
+        Ok(trx64_core::vsf::save_vsf(&mut session.machine))
+    };
+    let result: Result<Value, String> = (|| {
+        let a = vsf_of(&mut st.session, &snap_a)?;
+        let b = vsf_of(&mut st.session, &snap_b)?;
+        // (5) The compute (existing, tested) over the two VSF buffers, then the typed
+        // reshape — which re-reads the exact RAM run bytes from the C64MEM modules of
+        // the same two buffers (so a run's `old`/`new` is the FULL run, not the
+        // 100-entry sample cap).
+        let raw = snapshot_diff::diff_snapshots(&a, &b);
+        Ok(snapshot_diff_to_typed(&raw, &a, &b))
+    })();
+
+    // (4) Restore the LIVE state back — ALWAYS, even on a mid-diff error, so the
+    // machine is left exactly as found (read-only contract). Best-effort: a failure
+    // here is a genuine bug (the live snapshot we just took must round-trip), so it
+    // is surfaced if the diff itself otherwise succeeded.
+    let restore_back = restore_live_checkpoint(&mut st.session, &live);
+    st.session.running = was_running;
+
+    match (result, restore_back) {
+        (Ok(v), Ok(())) => Ok(v),
+        (Err(e), _) => Err(e),
+        (Ok(_), Err(e)) => Err(format!("diff ok but live restore-back failed: {e}")),
+    }
+}
+
+/// Reshape the legacy byte-buffer `diff_snapshots` JSON into the typed `SnapshotDiff`
+/// record shape (Spec time-travel-tooling Piece 1):
+///   { cycleA, cycleB,
+///     ram:   [{ start, old:b64, new:b64 }]      (contiguous changed RUNS),
+///     cpu/vic/cia/sid/drive: [{ name, old, new }] }
+/// The RAM runs come from `diff_snapshots`' `changedRanges` (start/end), with the
+/// actual old/new bytes read back from the two VSF buffers — but the compute already
+/// dropped them, so we re-derive the run bytes from the `sample` (full coverage) is
+/// not possible (sample caps at 100). Instead we carry the run extents + the per-run
+/// bytes are reconstructed here directly from the two C64MEM module slices, which the
+/// caller passes in. (See `snapshot_diff_to_typed_with_ram`.)
+///
+/// This top-level reshape handles everything EXCEPT the RAM run bytes; the full RAM
+/// reconstruction lives in `snapshot_diff_to_typed` which has the two buffers.
+fn reg_changes_from_chip(chip: &Value, name_of: &dyn Fn(i64) -> String) -> Vec<Value> {
+    chip.get("changedRegisters")
+        .and_then(|r| r.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|cr| {
+                    let reg = cr.get("reg").and_then(|v| v.as_i64()).unwrap_or(0);
+                    json!({
+                        "name": name_of(reg),
+                        "old": cr.get("before").and_then(|v| v.as_u64()).unwrap_or(0),
+                        "new": cr.get("after").and_then(|v| v.as_u64()).unwrap_or(0),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Convert the raw `diff_snapshots` JSON into the typed `SnapshotDiff` record shape.
+/// RAM runs carry the run extent (`start` + `byteCount`) + the FULL old/new byte
+/// slices for that run, read directly from the C64MEM modules of the two VSF buffers
+/// `vsf_a`/`vsf_b` (the `changedRanges` extents from the compute are exact; the bytes
+/// are sliced from the buffers, NOT the 100-entry sample, so a long run's payload is
+/// complete).
+fn snapshot_diff_to_typed(raw: &Value, vsf_a: &[u8], vsf_b: &[u8]) -> Value {
+    // CPU register names (snapshot-diff emits string regs for the main CPU).
+    let cpu = raw
+        .get("cpu")
+        .and_then(|c| c.get("changedRegs"))
+        .and_then(|r| r.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|cr| {
+                    json!({
+                        "name": cr.get("reg").and_then(|v| v.as_str()).unwrap_or("?"),
+                        "old": cr.get("before").and_then(|v| v.as_u64()).unwrap_or(0),
+                        "new": cr.get("after").and_then(|v| v.as_u64()).unwrap_or(0),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    // Chip register indices → a "$NN" name (the chip diffs carry numeric reg indices).
+    let idx_name = |i: i64| format!("${:02X}", i & 0xff);
+    let empty = json!({});
+    let vic = reg_changes_from_chip(raw.get("vic").unwrap_or(&empty), &idx_name);
+    // CIA1 + CIA2 are two separate VSF modules; merge into a single `cia` list,
+    // tagging the reg name with its chip so the consumer can tell them apart.
+    let cia1 = reg_changes_from_chip(raw.get("cia1").unwrap_or(&empty), &|i| {
+        format!("cia1.${:02X}", i & 0xff)
+    });
+    let cia2 = reg_changes_from_chip(raw.get("cia2").unwrap_or(&empty), &|i| {
+        format!("cia2.${:02X}", i & 0xff)
+    });
+    let mut cia = cia1;
+    cia.extend(cia2);
+    let sid = reg_changes_from_chip(raw.get("sid").unwrap_or(&empty), &idx_name);
+
+    // Drive sub-diff (present only when both anchors carry a DRIVECPU). Merge the
+    // drive CPU regs + VIA1/VIA2 + head move into a single `drive` change list.
+    let mut drive: Vec<Value> = Vec::new();
+    if let Some(d) = raw.get("drive").filter(|d| !d.is_null()) {
+        let cpu_names = ["pc", "a", "x", "y", "sp", "p"];
+        if let Some(dc) = d.get("cpu") {
+            for c in reg_changes_from_chip(dc, &|i| {
+                cpu_names
+                    .get(i as usize)
+                    .map(|s| format!("cpu.{s}"))
+                    .unwrap_or_else(|| format!("cpu.${:02X}", i & 0xff))
+            }) {
+                drive.push(c);
+            }
+        }
+        if let Some(v) = d.get("via1") {
+            drive.extend(reg_changes_from_chip(v, &|i| format!("via1.${:02X}", i & 0xff)));
+        }
+        if let Some(v) = d.get("via2") {
+            drive.extend(reg_changes_from_chip(v, &|i| format!("via2.${:02X}", i & 0xff)));
+        }
+        let hp = d.get("headPosition").cloned().unwrap_or(json!({}));
+        let hb = hp.get("trackHalfBefore").and_then(|v| v.as_u64()).unwrap_or(0);
+        let ha = hp.get("trackHalfAfter").and_then(|v| v.as_u64()).unwrap_or(0);
+        if hb != ha {
+            drive.push(json!({ "name": "headHalfTrack", "old": hb, "new": ha }));
+        }
+    }
+
+    // RAM runs: extent from `changedRanges` (exact), bytes sliced from the C64MEM
+    // module of each VSF buffer (the FULL run payload, base64).
+    let ram_obj = raw.get("ram").cloned().unwrap_or(json!({}));
+    let ram_a = snapshot_diff::vsf_c64mem_ram(vsf_a);
+    let ram_b = snapshot_diff::vsf_c64mem_ram(vsf_b);
+    let ram_runs: Vec<Value> = ram_obj
+        .get("changedRanges")
+        .and_then(|r| r.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|rng| {
+                    let start = rng.get("start").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    let end = rng.get("end").and_then(|v| v.as_u64()).unwrap_or(start as u64) as usize;
+                    let lo = start.min(ram_a.len()).min(ram_b.len());
+                    let hi = (end + 1).min(ram_a.len()).min(ram_b.len());
+                    let (old, new): (&[u8], &[u8]) = if lo < hi {
+                        (&ram_a[lo..hi], &ram_b[lo..hi])
+                    } else {
+                        (&[], &[])
+                    };
+                    json!({
+                        "start": start as u64,
+                        "byteCount": (end - start + 1) as u64,
+                        "old": base64_encode(old),
+                        "new": base64_encode(new),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    json!({
+        "cycleA": raw.get("fromCycle").and_then(|v| v.as_u64()).unwrap_or(0),
+        "cycleB": raw.get("toCycle").and_then(|v| v.as_u64()).unwrap_or(0),
+        "ram": ram_runs,
+        "cpu": cpu,
+        "vic": vic,
+        "cia": cia,
+        "sid": sid,
+        "drive": drive,
+    })
+}
+
+/// Render a typed `SnapshotDiff` (from `snapshot_diff_to_typed`) as monitor text.
+fn format_typed_snapshot_diff(d: &Value) -> String {
+    let a = d.get("cycleA").and_then(|v| v.as_u64()).unwrap_or(0);
+    let b = d.get("cycleB").and_then(|v| v.as_u64()).unwrap_or(0);
+    let mut lines = vec![format!(
+        "checkpoint diff  cycles {a} → {b}  (Δ{})",
+        b.wrapping_sub(a)
+    )];
+    // RAM runs.
+    let ram = d.get("ram").and_then(|r| r.as_array()).cloned().unwrap_or_default();
+    if ram.is_empty() {
+        lines.push("RAM:   no changes".to_string());
+    } else {
+        let total: u64 = ram
+            .iter()
+            .map(|r| r.get("byteCount").and_then(|v| v.as_u64()).unwrap_or(0))
+            .sum();
+        lines.push(format!("RAM:   {} run(s), {total} byte(s) changed", ram.len()));
+        for r in ram.iter().take(12) {
+            let start = r.get("start").and_then(|v| v.as_u64()).unwrap_or(0);
+            let bc = r.get("byteCount").and_then(|v| v.as_u64()).unwrap_or(0);
+            if bc == 1 {
+                lines.push(format!("         ${start:04X}"));
+            } else {
+                lines.push(format!("         ${start:04X}-${:04X}  ({bc} B)", start + bc - 1));
+            }
+        }
+        if ram.len() > 12 {
+            lines.push(format!("         … +{} more run(s)", ram.len() - 12));
+        }
+    }
+    // Per-chip register changes.
+    let chip = |label: &str, key: &str| -> String {
+        let regs = d.get(key).and_then(|r| r.as_array()).cloned().unwrap_or_default();
+        if regs.is_empty() {
+            return format!("{label:<7}no changes");
+        }
+        let body = regs
+            .iter()
+            .take(8)
+            .map(|c| {
+                format!(
+                    "{} {}→{}",
+                    c.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+                    c.get("old").and_then(|v| v.as_u64()).unwrap_or(0),
+                    c.get("new").and_then(|v| v.as_u64()).unwrap_or(0),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("  ");
+        let more = if regs.len() > 8 { format!(" (+{} more)", regs.len() - 8) } else { String::new() };
+        format!("{label:<7}{body}{more}")
+    };
+    lines.push(chip("CPU:", "cpu"));
+    lines.push(chip("VIC:", "vic"));
+    lines.push(chip("CIA:", "cia"));
+    lines.push(chip("SID:", "sid"));
+    let drive = d.get("drive").and_then(|r| r.as_array()).cloned().unwrap_or_default();
+    if !drive.is_empty() {
+        lines.push(chip("DRIVE:", "drive"));
+    }
+    lines.join("\n")
+}
+
 // ── Spec 766.5 — recorder anchor capture ──────────────────────────────────────
 //
 // The c64re controller feeds the recorder a CORE-ONLY anchor (omitMedia) at the
@@ -13359,6 +13684,126 @@ mod batch1_tests {
             assert_eq!(g.session.machine.c64_core.reg_pc, pre_pc, "PC rewound");
             assert_eq!(g.session.machine.read_full(0xc000), 0xa9, "RAM rewound");
         }
+    }
+
+    // ── Spec time-travel-tooling Piece 1 — diffCheckpoints(idA, idB) ─────────────
+
+    #[test]
+    fn diff_checkpoints_ram_runs_and_read_only() {
+        // Capture anchor A, poke a KNOWN contiguous RAM range, capture anchor B, then
+        // runtime/diff_checkpoints → assert (a) the typed SnapshotDiff's RAM runs match
+        // the change (start + exact old/new bytes), and (b) the live machine is byte-
+        // identical after the diff (read-only contract).
+        let st = make_state();
+
+        // Anchor A — clean state.
+        let a_id = call(&st, "checkpoint/capture", json!({}))["ref"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Poke a known 4-byte run at $4000 (old all-0 → new DE AD BE EF) + a single
+        // byte at $5000 (a SECOND run, so we exercise multi-run grouping).
+        let old_4000 = {
+            let mut g = st.lock().unwrap();
+            let old = [
+                g.session.machine.read_full(0x4000),
+                g.session.machine.read_full(0x4001),
+                g.session.machine.read_full(0x4002),
+                g.session.machine.read_full(0x4003),
+            ];
+            g.session.machine.ram[0x4000] = 0xDE;
+            g.session.machine.ram[0x4001] = 0xAD;
+            g.session.machine.ram[0x4002] = 0xBE;
+            g.session.machine.ram[0x4003] = 0xEF;
+            g.session.machine.ram[0x5000] = 0x42;
+            g.session.machine.sync_after_monitor();
+            old
+        };
+
+        // Anchor B — mutated state.
+        let b_id = call(&st, "checkpoint/capture", json!({}))["ref"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Record the LIVE state BEFORE the diff (read-only assertion target).
+        let (pc_before, clk_before, ram4000_before) = {
+            let g = st.lock().unwrap();
+            (
+                g.session.machine.c64_core.reg_pc,
+                g.session.machine.c64_core.clk,
+                g.session.machine.read_full(0x4000),
+            )
+        };
+
+        // The typed by-ID diff.
+        let d = call(
+            &st,
+            "runtime/diff_checkpoints",
+            json!({ "idA": a_id, "idB": b_id }),
+        );
+
+        // RAM runs: the two contiguous runs, with exact extents + byte payloads.
+        let runs = d["ram"].as_array().unwrap();
+        // The $4000 run + the $5000 run (the order is start-ascending from the compute).
+        let run_4000 = runs
+            .iter()
+            .find(|r| r["start"] == json!(0x4000))
+            .expect("a run starting at $4000");
+        assert_eq!(run_4000["byteCount"], json!(4), "4-byte run at $4000");
+        // old/new are base64 — decode and compare against the known bytes.
+        let dec = |s: &str| base64_decode(s).unwrap();
+        let old_b = dec(run_4000["old"].as_str().unwrap());
+        let new_b = dec(run_4000["new"].as_str().unwrap());
+        assert_eq!(old_b, old_4000.to_vec(), "run A bytes = pre-poke");
+        assert_eq!(new_b, vec![0xDE, 0xAD, 0xBE, 0xEF], "run B bytes = post-poke");
+        let run_5000 = runs
+            .iter()
+            .find(|r| r["start"] == json!(0x5000))
+            .expect("a run starting at $5000");
+        assert_eq!(run_5000["byteCount"], json!(1));
+        assert_eq!(dec(run_5000["new"].as_str().unwrap()), vec![0x42]);
+
+        // Cross-check against the EXISTING byte-buffer compute: the typed run extents
+        // must match diff_snapshots' changedRanges (same compute, just reshaped).
+        // (The two anchors' VSF bytes are not exposed by the WS surface; the parity is
+        // structural — the reshape reads the SAME changedRanges the compute emits.)
+        let total: u64 = runs
+            .iter()
+            .map(|r| r["byteCount"].as_u64().unwrap())
+            .sum();
+        assert_eq!(total, 5, "exactly 5 RAM bytes changed across both runs");
+
+        // READ-ONLY: the live machine is byte-identical after the diff.
+        {
+            let g = st.lock().unwrap();
+            assert_eq!(g.session.machine.c64_core.reg_pc, pc_before, "PC unchanged");
+            assert_eq!(g.session.machine.c64_core.clk, clk_before, "cycles unchanged");
+            assert_eq!(
+                g.session.machine.read_full(0x4000),
+                ram4000_before,
+                "live RAM unchanged (still anchor-B mutated value $DE)"
+            );
+            assert_eq!(g.session.machine.read_full(0x4000), 0xDE);
+        }
+
+        // cycleA / cycleB are present (both anchors captured at clk 0 here, so equal).
+        assert!(d["cycleA"].is_u64());
+        assert!(d["cycleB"].is_u64());
+    }
+
+    #[test]
+    fn diff_checkpoints_unknown_id_errors() {
+        let st = make_state();
+        let cap = call(&st, "checkpoint/capture", json!({}));
+        let real = cap["ref"]["id"].as_str().unwrap().to_string();
+        // Unknown idA / idB → -32001 (resolved BEFORE the machine is disturbed).
+        let e = call_err(&st, "runtime/diff_checkpoints", json!({ "idA": "cp_nope_0", "idB": real }));
+        assert_eq!(e.code, -32001);
+        // Missing args → -32602.
+        let e2 = call_err(&st, "runtime/diff_checkpoints", json!({ "idA": "x" }));
+        assert_eq!(e2.code, -32602);
     }
 
     // ── Audit ws-checkpoint-scrub-0/1/2/4 — restore is the shared, broadcast-rich

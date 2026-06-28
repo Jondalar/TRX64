@@ -61,6 +61,20 @@ fn module<'a>(mods: &'a [(String, &'a [u8])], want: &str) -> Option<&'a [u8]> {
     mods.iter().find(|(n, _)| n == want).map(|(_, d)| *d)
 }
 
+/// Extract the 64 KiB RAM image from a c64re-own VSF buffer's `C64MEM` module (the
+/// SAME slice `diff_snapshots` diffs). Returns the first `min(len, 65536)` bytes, or
+/// an empty Vec when the buffer carries no C64MEM module. Used by the typed
+/// `diffCheckpoints` reshape to slice the exact old/new bytes of each changed RAM run
+/// (Spec time-travel-tooling Piece 1) — the run extents come from the compute, the
+/// byte payloads come from here.
+pub fn vsf_c64mem_ram(buf: &[u8]) -> Vec<u8> {
+    let mods = index_modules(buf);
+    match module(&mods, "C64MEM") {
+        Some(m) => m[..m.len().min(65536)].to_vec(),
+        None => Vec::new(),
+    }
+}
+
 // ── CPU (MAINCPU) ─────────────────────────────────────────────────────────────
 // Layout: PC(2) A X Y SP P cycles(4 LE) = 11 bytes (snapshot-diff.ts:301-315).
 struct CpuFields {

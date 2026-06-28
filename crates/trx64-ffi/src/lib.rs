@@ -494,6 +494,24 @@ impl Runtime {
         decode(v.get("writers").cloned().unwrap_or(v))
     }
 
+    /// Typed, by-ID diff of two checkpoint anchors (Spec time-travel-tooling Piece 1).
+    /// Resolves `id_a` / `id_b` from the in-memory ring, runs the snapshot-diff compute
+    /// on their two machine states, and returns a typed [`SnapshotDiff`] (RAM grouped
+    /// into contiguous runs + per-chip register-change lists). READ-ONLY — the live
+    /// machine is byte-identical after the call. Pair with [`Runtime::checkpoint_list`]
+    /// for the ids; works on a ring loaded via [`Runtime::ringbuffer_restore`] too.
+    pub fn diff_checkpoints(
+        &self,
+        id_a: String,
+        id_b: String,
+    ) -> Result<SnapshotDiff, Trx64Error> {
+        let v = self.rpc(
+            "runtime/diff_checkpoints",
+            json!({ "idA": id_a, "idB": id_b }),
+        )?;
+        decode(v)
+    }
+
     /// Triage a crash: walk the cause chain from the (optional) PC, else the live PC.
     pub fn crash_triage(&self) -> Result<TriageChain, Trx64Error> {
         let v = self.rpc("runtime/crash_triage", json!({}))?;

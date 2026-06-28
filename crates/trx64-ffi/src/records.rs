@@ -388,6 +388,67 @@ pub struct FrameBuffer {
     pub indices: Vec<u8>,
 }
 
+// ── checkpoint diff (Spec time-travel-tooling Piece 1) ──────────────────────────
+
+/// One contiguous run of changed RAM bytes in a [`SnapshotDiff`]. `old`/`new` are the
+/// run's byte payloads (`byteCount` bytes each) BEFORE / AFTER — Swift `Data`.
+#[derive(Debug, Clone, uniffi::Record, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RamRun {
+    /// First changed address of the run.
+    pub start: u32,
+    /// Number of bytes in the run.
+    pub byte_count: u32,
+    /// The run's bytes in checkpoint A (base64-decoded to `Data`).
+    #[serde(deserialize_with = "de_b64")]
+    pub old: Vec<u8>,
+    /// The run's bytes in checkpoint B (base64-decoded to `Data`).
+    #[serde(deserialize_with = "de_b64")]
+    pub new: Vec<u8>,
+}
+
+/// One changed register/field in a [`SnapshotDiff`] chip list. `name` is the
+/// register's label (CPU: "pc"/"a"/…; chips: "$NN"; CIA: "cia1.$NN"; drive:
+/// "via1.$NN"/"headHalfTrack"/…). `old`/`new` are the byte (or 16-bit head) values.
+#[derive(Debug, Clone, uniffi::Record, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegChange {
+    pub name: String,
+    pub old: u32,
+    pub new: u32,
+}
+
+/// `runtime/diff_checkpoints` (= [`Runtime::diff_checkpoints`]) result — a typed,
+/// by-ID diff of two checkpoint anchors. RAM is grouped into contiguous changed runs
+/// (NOT a 64 K byte list); each chip carries its changed-register list. `cpu`/`vic`/
+/// `cia`/`sid`/`drive` are empty when that chip is unchanged (`drive` is empty unless
+/// both anchors carried a 1541 DRIVECPU).
+#[derive(Debug, Clone, uniffi::Record, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotDiff {
+    pub cycle_a: u64,
+    pub cycle_b: u64,
+    pub ram: Vec<RamRun>,
+    pub cpu: Vec<RegChange>,
+    pub vic: Vec<RegChange>,
+    pub cia: Vec<RegChange>,
+    pub sid: Vec<RegChange>,
+    pub drive: Vec<RegChange>,
+}
+
+/// serde helper: decode a base64 string JSON value into `Vec<u8>` (the RAM run bytes
+/// ride the wire as base64 to stay JSON-safe over `dispatch`).
+fn de_b64<'de, D>(d: D) -> Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use base64::Engine as _;
+    let s: String = String::deserialize(d)?;
+    base64::engine::general_purpose::STANDARD
+        .decode(s.as_bytes())
+        .map_err(serde::de::Error::custom)
+}
+
 // ── reverse-debug ─────────────────────────────────────────────────────────────
 
 /// An undone write reported by `runtime/reverse_step`.

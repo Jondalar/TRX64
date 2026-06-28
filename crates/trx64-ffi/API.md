@@ -111,6 +111,7 @@ feed AVAudioEngine, fill an `AVAudioPCMBuffer`'s `int16ChannelData` with the ret
 | `checkpointRestore` | `(id: String, then: String, render: Bool) throws` | Restore a checkpoint; `then` = `pause`/`run`/`keep`; `render` re-presents the frame. |
 | `checkpointList` | `() throws -> [Checkpoint]` | List the ring's checkpoints. |
 | `thumbnails` | `() throws -> [Thumbnail]` | Scrub-filmstrip thumbnails (palette + indices) per checkpoint. |
+| `diffCheckpoints` | `(idA: String, idB: String) throws -> SnapshotDiff` | Typed, by-ID diff of two ring anchors (RAM runs + per-chip register changes). **Read-only** — the live machine is byte-identical afterwards. (WS: `runtime/diff_checkpoints {idA,idB}`; monitor: `diff <idA> <idB>`.) |
 
 ## reverse-debug
 
@@ -255,6 +256,12 @@ no JSON). `i = indices[p]` → RGB `palette[i*3 ..< i*3+3]`.
 `path: String`, `cycle: UInt64`, `pc: UInt32`, `machine: String`,
 `media: [SnapshotMedia]`, `breakpoints: UInt64`, `fileBytes: UInt64?` (dump only)
 - **SnapshotMedia** — `role: String`, `format: String`, `sourceName: String`, `sha256: String`, `bytes: UInt64`
+
+### SnapshotDiff
+`cycleA, cycleB: UInt64`, `ram: [RamRun]`, `cpu, vic, cia, sid, drive: [RegChange]`
+- **RamRun** — `start: UInt32`, `byteCount: UInt32`, `old: Data`, `new: Data` (one contiguous run of changed RAM; `old`/`new` are the run's bytes before/after — NOT a 64 K byte list)
+- **RegChange** — `name: String`, `old, new: UInt32` (CPU names: `pc`/`a`/`x`/`y`/`sp`/`flags`; chips: `$NN`; CIA tagged `cia1.$NN`/`cia2.$NN`; drive tagged `cpu.pc`/`via1.$NN`/`headHalfTrack`/…)
+- A chip's list is empty when unchanged; `drive` is empty unless **both** anchors carried a 1541 DRIVECPU.
 
 ---
 
