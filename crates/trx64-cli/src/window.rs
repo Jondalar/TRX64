@@ -32,7 +32,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, PhysicalKey};
+use winit::keyboard::{Key, KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::audio::AudioOutput;
@@ -110,6 +110,8 @@ struct App {
     next_frame: Instant,
     /// Joystick (port 2) edge state, so we only push on change.
     joy: JoyState,
+    /// Whether a host Shift is held — drives the symbolic char mapping (Spec 310).
+    shift_held: bool,
 }
 
 #[derive(Default, Clone, Copy, PartialEq)]
@@ -131,6 +133,7 @@ impl App {
             audio: None,
             next_frame: Instant::now(),
             joy: JoyState::default(),
+            shift_held: false,
         }
     }
 
@@ -232,60 +235,77 @@ impl App {
     fn handle_key(&mut self, event: &winit::event::KeyEvent) {
         let pressed = event.state == ElementState::Pressed;
 
-        // Joystick (port 2): arrows = directions, Left-Alt = fire. (Fire is NOT space,
-        // so the spacebar stays free for typing into BASIC; cursor movement in BASIC is
-        // sacrificed to the joystick — this is a play-focused window.) Push on change.
+        // Track host Shift (for the symbolic char mapping). The shift key is ALSO sent
+        // to the matrix below via map_special — idempotent + self-correcting (Spec 310).
         if let PhysicalKey::Code(code) = event.physical_key {
-            use winit::keyboard::KeyCode::*;
-            let mut new = self.joy;
-            let mut is_joy = true;
-            match code {
-                ArrowUp => new.up = pressed,
-                ArrowDown => new.down = pressed,
-                ArrowLeft => new.left = pressed,
-                ArrowRight => new.right = pressed,
-                AltLeft | AltRight => new.fire = pressed,
-                _ => is_joy = false,
-            }
-            if is_joy {
-                if new != self.joy {
-                    self.joy = new;
-                    if new == JoyState::default() {
-                        self.engine.joystick_clear(2);
-                    } else {
-                        self.engine
-                            .joystick_set(2, new.up, new.down, new.left, new.right, new.fire);
-                    }
-                }
-                return;
+            if matches!(code, KeyCode::ShiftLeft | KeyCode::ShiftRight) {
+                self.shift_held = pressed;
             }
         }
 
-        // Keyboard matrix: resolve the physical key (+ modifiers) to a c64re id.
-        if let Some(mapped) = keymap::resolve(event.physical_key) {
-            if mapped.shift && pressed {
-                self.engine.key_down("L_SHIFT");
-            }
-            if pressed {
-                self.engine.key_down(mapped.key);
-            } else {
-                self.engine.key_up(mapped.key);
-                if mapped.shift {
-                    self.engine.key_up("L_SHIFT");
+        // Joystick (C64RE Spec 310): WASD = directions, Space = fire — but ONLY when
+        // joystick mode is enabled (`/joystick port1|port2`). When off (the default),
+        // WASD/Space are normal keys, so typing into BASIC works. The arrow keys are
+        // the CURSOR keys (handled by the keyboard mapping below), matching C64RE.
+        let joy_port = self.engine.joystick_mode();
+        if joy_port != 0 {
+            if let PhysicalKey::Code(code) = event.physical_key {
+                if let Some(bit) = keymap::joy_bit(code) {
+                    let mut new = self.joy;
+                    match bit {
+                        keymap::JoyBit::Up => new.up = pressed,
+                        keymap::JoyBit::Down => new.down = pressed,
+                        keymap::JoyBit::Left => new.left = pressed,
+                        keymap::JoyBit::Right => new.right = pressed,
+                        keymap::JoyBit::Fire => new.fire = pressed,
+                    }
+                    if new != self.joy {
+                        self.joy = new;
+                        if new == JoyState::default() {
+                            self.engine.joystick_clear(joy_port);
+                        } else {
+                            self.engine.joystick_set(
+                                joy_port, new.up, new.down, new.left, new.right, new.fire,
+                            );
+                        }
+                    }
+                    return;
                 }
             }
-            return;
         }
-        // Fallback: named logical keys (modifiers winit reports only logically).
-        if let Key::Named(named) = &event.logical_key {
-            if let Some(id) = keymap::map_named(*named) {
-                if pressed {
+
+        // Spec 310 symbolic mapping: SPECIAL keys by physical position (layout-
+        // independent), then PRINTABLE keys by the LOGICAL character (host-layout +
+        // shift resolved by the OS — correct on QWERTZ etc.).
+        let ids: Option<Vec<&'static str>> = match event.physical_key {
+            PhysicalKey::Code(code) => keymap::map_special(code)
+                .or_else(|| char_for(event).and_then(|ch| keymap::map_char(ch, self.shift_held))),
+            PhysicalKey::Unidentified(_) => {
+                char_for(event).and_then(|ch| keymap::map_char(ch, self.shift_held))
+            }
+        };
+        if let Some(ids) = ids {
+            if pressed {
+                for id in &ids {
                     self.engine.key_down(id);
-                } else {
+                }
+            } else {
+                // Release in reverse so the base key lifts before its L_SHIFT.
+                for id in ids.iter().rev() {
                     self.engine.key_up(id);
                 }
             }
         }
+    }
+}
+
+/// The host-layout + shift resolved character for a key event (winit `logical_key`),
+/// for the Spec-310 symbolic printable mapping. `None` for non-character (named) keys.
+fn char_for(event: &winit::event::KeyEvent) -> Option<char> {
+    if let Key::Character(s) = &event.logical_key {
+        s.chars().next()
+    } else {
+        None
     }
 }
 

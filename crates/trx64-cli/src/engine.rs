@@ -18,7 +18,7 @@
 //! (which honours breakpoints + JAM) WITHOUT flipping the controller flag — exactly
 //! the FFI pattern. `pause` clears the flag.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -43,6 +43,9 @@ pub struct Engine {
     /// Monotonic generation bumped on every machine-mutating verb, so the window's
     /// audio first-drain / re-sync can notice resets without polling state.
     epoch: Arc<AtomicU64>,
+    /// Virtual-joystick mode: 0 = off (WASD/Space are keyboard), 1 = port 1, 2 = port 2.
+    /// When on, the window routes WASD+Space to the joystick (C64RE Spec 310).
+    joystick_mode: Arc<AtomicU8>,
 }
 
 /// The outcome of a single command-line submission.
@@ -69,7 +72,13 @@ impl Engine {
             warp: Arc::new(AtomicBool::new(false)),
             quit: Arc::new(AtomicBool::new(false)),
             epoch: Arc::new(AtomicU64::new(0)),
+            joystick_mode: Arc::new(AtomicU8::new(0)),
         }
+    }
+
+    /// Virtual-joystick mode (0 = off, 1 = port 1, 2 = port 2). Read by the window.
+    pub fn joystick_mode(&self) -> u8 {
+        self.joystick_mode.load(Ordering::SeqCst)
     }
 
     /// The underlying shared machine — used by the emulator window's A/V pull loop
@@ -197,6 +206,7 @@ impl Engine {
             "eject" => self.verb_eject(),
             "load" => self.verb_load(&arg),
             "warp" => self.verb_warp(rest.first().copied()),
+            "joystick" | "joy" => self.verb_joystick(rest.first().copied()),
             "window" => CmdResult { output: "opening emulator window…".into(), open_window: true, quit: false },
             "dump" => self.verb_dump(&arg),
             "restore" => self.verb_restore(&arg),
@@ -352,6 +362,32 @@ impl Engine {
             }
             Some(other) => CmdResult::text(format!("warp: unknown '{other}' (use on|off)")),
         }
+    }
+
+    fn verb_joystick(&self, sub: Option<&str>) -> CmdResult {
+        // C64RE Spec 310: when ON, the window routes WASD+Space to the joystick; when
+        // OFF they are normal keys. Default off so typing works.
+        let prev = self.joystick_mode.load(Ordering::SeqCst);
+        let mode = match sub.map(|s| s.to_ascii_lowercase()).as_deref() {
+            Some("off") | None => 0u8,
+            Some("port1") | Some("p1") | Some("1") => 1,
+            Some("port2") | Some("p2") | Some("2") | Some("on") => 2,
+            Some(other) => {
+                return CmdResult::text(format!(
+                    "joystick: unknown '{other}' (use off|port1|port2)"
+                ))
+            }
+        };
+        self.joystick_mode.store(mode, Ordering::SeqCst);
+        // Release any held joystick on a port we're leaving (avoid a stuck direction).
+        if prev != 0 && prev != mode {
+            let _ = self.rpc("session/joystick_clear", json!({ "port": prev }));
+        }
+        let label = match mode {
+            0 => "JOYSTICK OFF (WASD/Space type normally).".to_string(),
+            p => format!("JOYSTICK ON — port {p} (WASD = directions, Space = fire)."),
+        };
+        CmdResult::text(label)
     }
 
     fn verb_dump(&self, path: &str) -> CmdResult {
@@ -540,6 +576,7 @@ TRX64 cockpit — VM commands are /-prefixed; a bare line goes to the monitor.
   /eject               unmount drive8
   /load <prg>          load a .prg into RAM (no run)
   /warp on|off         8× / real-time PAL pacing
+  /joystick off|port1|port2   route WASD+Space to the joystick (off = type)
   /window              spawn the native emulator window
   /dump <path>         write a .c64re snapshot
   /restore <path>      load a .c64re snapshot
