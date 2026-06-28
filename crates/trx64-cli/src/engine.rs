@@ -93,6 +93,15 @@ impl Engine {
     pub fn is_warp(&self) -> bool {
         self.warp.load(Ordering::SeqCst)
     }
+    /// Whether the DAEMON controller (`session.running`) is running — distinct from the
+    /// host run flag. The pump reads this to adopt daemon-side run intents (a disk/CRT
+    /// mount resume, monitor `g`/`x`) into the host pump (see [`Self::pump_frame`]).
+    fn controller_running(&self) -> bool {
+        self.rpc("session/state", json!({}))
+            .ok()
+            .and_then(|v| v.get("runState").and_then(|r| r.as_str()).map(|s| s == "running"))
+            .unwrap_or(false)
+    }
     pub fn should_quit(&self) -> bool {
         self.quit.load(Ordering::SeqCst)
     }
@@ -135,6 +144,18 @@ impl Engine {
     /// returns early with a `breakpoint` object — we then clear the host run flag so
     /// the cockpit shows PAUSED at the hit.
     pub fn pump_frame(&self) -> u64 {
+        // Reconcile the dual run-state. The CLI host pump is the clock, so the daemon
+        // controller MUST stay paused (`session/run` refuses while `session.running`
+        // is set). But a daemon op the CLI doesn't own can flip it true: a disk/CRT
+        // mount resumes (`media/mount`), and the monitor `g`/`x` continue does too.
+        // Treat that as a RUN INTENT — adopt the host run flag and force the controller
+        // back to paused — so mount and `g` actually run, and `session/run` stays
+        // legal. (Clearing the host flag on the resulting error was the "stuck PAUSED /
+        // can't resume after mount" bug.)
+        if self.controller_running() {
+            self.running.store(true, Ordering::SeqCst);
+            let _ = self.rpc("debug/pause", json!({ "source": "cli" }));
+        }
         if !self.running.load(Ordering::SeqCst) {
             return 0;
         }
@@ -156,9 +177,9 @@ impl Engine {
                 v.get("c64Cycles").and_then(|c| c.as_u64()).unwrap_or(0)
             }
             Err(_) => {
-                // session/run only errors if the controller flag is set — which we
-                // never do under the pump. Be defensive: pause on any error.
-                self.running.store(false, Ordering::SeqCst);
+                // A residual controller-running race — re-pause it and skip this tick.
+                // KEEP the host flag so the next tick resumes (never strand the machine).
+                let _ = self.rpc("debug/pause", json!({ "source": "cli" }));
                 0
             }
         }
