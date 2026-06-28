@@ -124,7 +124,7 @@ fn run_loop(term: &mut Term, engine: &Engine, to_main: &Sender<UiToMain>) -> io:
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     && matches!(key.code, XKeyCode::Char('c') | XKeyCode::Char('d'))
                 {
-                    let _ = engine.exec_line("quit");
+                    let _ = engine.exec_line("/quit");
                     let _ = to_main.send(UiToMain::Quit);
                     return Ok(());
                 }

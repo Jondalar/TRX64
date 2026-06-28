@@ -30,7 +30,7 @@ fn high_level_verb_sequence_drives_one_machine() {
     let Some(engine) = engine_or_skip() else { return };
 
     // ── power on → cold boot, host run flag set ────────────────────────────────
-    let r = engine.exec_line("power on");
+    let r = engine.exec_line("/power on");
     assert!(r.output.contains("POWER ON"), "power on output: {}", r.output);
     assert!(engine.is_running(), "host run flag set after power on");
 
@@ -55,7 +55,7 @@ fn high_level_verb_sequence_drives_one_machine() {
     );
 
     // ── pause → host run flag cleared, pump stops advancing ────────────────────
-    let p = engine.exec_line("pause");
+    let p = engine.exec_line("/pause");
     assert!(p.output.contains("PAUSE"), "pause output: {}", p.output);
     assert!(!engine.is_running(), "host run flag cleared after pause");
     let frozen = engine.snapshot().c64_cycles;
@@ -65,19 +65,19 @@ fn high_level_verb_sequence_drives_one_machine() {
     assert_eq!(frozen, engine.snapshot().c64_cycles, "paused machine does not advance");
 
     // ── reset cold → PC reflects reset vector ──────────────────────────────────
-    let rst = engine.exec_line("reset cold");
+    let rst = engine.exec_line("/reset cold");
     assert!(rst.output.contains("RESET (cold)"), "reset output: {}", rst.output);
 
     // ── warp toggles ───────────────────────────────────────────────────────────
-    assert!(engine.exec_line("warp on").output.contains("WARP ON"));
+    assert!(engine.exec_line("/warp on").output.contains("WARP ON"));
     assert!(engine.is_warp());
-    assert!(engine.exec_line("warp off").output.contains("WARP OFF"));
+    assert!(engine.exec_line("/warp off").output.contains("WARP OFF"));
     assert!(!engine.is_warp());
 
     // ── step single-instructions a paused machine ──────────────────────────────
-    engine.exec_line("pause");
+    engine.exec_line("/pause");
     let pc0 = engine.snapshot().pc;
-    engine.exec_line("step");
+    engine.exec_line("/step");
     // PC should change after one instruction (KERNAL has no self-loop at the reset PC).
     let pc1 = engine.snapshot().pc;
     assert_ne!(pc0, pc1, "step advanced PC: ${pc0:04X} -> ${pc1:04X}");
@@ -92,15 +92,15 @@ fn monitor_passthrough_and_unknown_verbs() {
     let r = engine.exec_line("r");
     assert!(r.output.contains("ADDR") || r.output.contains("AC"), "registers: {}", r.output);
 
-    // `help` is high-level.
-    assert!(engine.exec_line("help").output.contains("high-level verbs"));
+    // `/help` is a VM command.
+    assert!(engine.exec_line("/help").output.contains("/power"));
 
-    // `window` signals the main thread (open_window), no machine change.
-    let w = engine.exec_line("window");
+    // `/window` signals the main thread (open_window), no machine change.
+    let w = engine.exec_line("/window");
     assert!(w.open_window, "window verb sets open_window");
 
-    // `quit` sets the quit flag.
-    let q = engine.exec_line("quit");
+    // `/quit` sets the quit flag.
+    let q = engine.exec_line("/quit");
     assert!(q.quit && engine.should_quit(), "quit verb sets quit flag");
 }
 

@@ -133,5 +133,5 @@ fn main() {
 
 /// Ensure the quit flag is set so the pump + any window observe shutdown.
 fn engine_quit(engine: &Engine) {
-    let _ = engine.exec_line("quit");
+    let _ = engine.exec_line("/quit");
 }

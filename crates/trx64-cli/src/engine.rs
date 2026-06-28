@@ -165,7 +165,17 @@ impl Engine {
         if line.is_empty() {
             return CmdResult::text("");
         }
-        let mut parts = line.split_whitespace();
+        // `/`-prefixed = VM / high-level command (slash-command namespace); a bare
+        // line = monitor passthrough (the ~128-verb VICE-superset — the primary
+        // surface, so you type `d c000` / `r` / `bk e000` directly).
+        let vm = match line.strip_prefix('/') {
+            Some(rest) => rest.trim(),
+            None => return self.verb_monitor(line),
+        };
+        if vm.is_empty() {
+            return CmdResult::text(help_text()); // bare "/" → the VM help
+        }
+        let mut parts = vm.split_whitespace();
         let verb = parts.next().unwrap_or("").to_ascii_lowercase();
         let rest: Vec<&str> = parts.collect();
         let arg = rest.join(" ");
@@ -174,7 +184,7 @@ impl Engine {
             "power" => self.verb_power(rest.first().copied()),
             "reset" => self.verb_reset(rest.first().copied()),
             "run" => {
-                // `run` with no arg = resume; `run <prg>` = load+autostart.
+                // `/run` with no arg = resume; `/run <prg>` = load+autostart.
                 if arg.is_empty() {
                     self.verb_run()
                 } else {
@@ -197,8 +207,9 @@ impl Engine {
                 self.quit.store(true, Ordering::SeqCst);
                 CmdResult { output: "bye.".into(), open_window: false, quit: true }
             }
-            // Not a high-level verb → full monitor passthrough.
-            _ => self.verb_monitor(line),
+            // Unknown /verb — DON'T fall through to the monitor (the user explicitly
+            // used the VM namespace); point them at /help.
+            other => CmdResult::text(format!("unknown command: /{other} — try /help")),
         }
     }
 
@@ -244,9 +255,12 @@ impl Engine {
         };
         let r = self.rpc("session/reset", json!({ "mode": mode }));
         self.bump_epoch();
+        // A real machine reset boots + runs — don't leave it frozen at the reset
+        // vector. Set the host run flag so the pump drives it (like `power on`).
+        self.running.store(true, Ordering::SeqCst);
         match r {
             Ok(v) => CmdResult::text(format!(
-                "RESET ({label}) @ PC=${:04X}.",
+                "RESET ({label}) @ PC=${:04X}, running.",
                 v.get("pc").and_then(|p| p.as_u64()).unwrap_or(0)
             )),
             Err(e) => CmdResult::text(format!("reset failed: {e}")),
@@ -513,30 +527,32 @@ fn compact(v: &Value) -> String {
 
 pub fn help_text() -> String {
     "\
-TRX64 cockpit — high-level verbs:
-  power on|off        cold boot / halt+reset to powered-off
-  reset [cold|warm]   power-cycle (fresh DRAM) / RESET line (RAM kept)
-  run                 resume free-running
-  run <prg>           load + autostart a .prg, then run
-  pause               freeze the machine
-  step                single-step one instruction
-  mount <path>        mount a .d64/.g64/.crt
-  eject               unmount drive8
-  load <prg>          load a .prg into RAM (no run)
-  warp on|off         8× / real-time PAL pacing
-  window              spawn the native emulator window
-  dump <path>         write a .c64re snapshot
-  restore <path>      load a .c64re snapshot
-  ringdump <path>     write a .c64rering reverse-debug buffer
-  ringload <path>     load a .c64rering reverse-debug buffer
-  help                this help
-  quit                exit
+TRX64 cockpit — VM commands are /-prefixed; a bare line goes to the monitor.
 
-Anything else is sent verbatim to the VICE-superset monitor, e.g.:
-  d c000              disassemble    m 0400      memory dump
-  r                   registers      bk e000     breakpoint
-  g                   go             trace on    instruction trace
-  whowrote d020       last writers   diff a b    checkpoint diff
+  /-commands (the machine):
+  /power on|off        cold boot / halt+reset to powered-off
+  /reset [cold|warm]   power-cycle (fresh DRAM) / RESET line (RAM kept)
+  /run                 resume free-running
+  /run <prg>           load + autostart a .prg, then run
+  /pause               freeze the machine
+  /step                single-step one instruction
+  /mount <path>        mount a .d64/.g64/.crt
+  /eject               unmount drive8
+  /load <prg>          load a .prg into RAM (no run)
+  /warp on|off         8× / real-time PAL pacing
+  /window              spawn the native emulator window
+  /dump <path>         write a .c64re snapshot
+  /restore <path>      load a .c64re snapshot
+  /ringdump <path>     write a .c64rering reverse-debug buffer
+  /ringload <path>     load a .c64rering reverse-debug buffer
+  /help                this help
+  /quit                exit
+
+  bare line → the VICE-superset monitor (~128 verbs), e.g.:
+  d c000               disassemble    m 0400      memory dump
+  r                    registers      bk e000     breakpoint
+  g                    go             trace on    instruction trace
+  whowrote d020        last writers   diff a b    checkpoint diff
 "
     .to_string()
 }

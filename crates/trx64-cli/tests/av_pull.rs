@@ -21,7 +21,7 @@ fn engine_or_skip() -> Option<Engine> {
 #[test]
 fn frame_buffer_is_full_canvas_with_content() {
     let Some(engine) = engine_or_skip() else { return };
-    engine.exec_line("power on");
+    engine.exec_line("/power on");
     // Run ~30 frames so the READY screen is fully drawn.
     for _ in 0..30 {
         engine.pump_frame();
@@ -45,7 +45,7 @@ fn frame_buffer_is_full_canvas_with_content() {
 #[test]
 fn audio_drain_path_is_live() {
     let Some(engine) = engine_or_skip() else { return };
-    engine.exec_line("power on");
+    engine.exec_line("/power on");
 
     // First drain installs the SID capture hook + spawns the persistent render thread
     // and returns empty (no cycles elapsed yet) — that's the documented contract.
