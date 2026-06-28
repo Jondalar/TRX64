@@ -41,7 +41,7 @@ fn high_level_verb_sequence_drives_one_machine() {
     // ── pump a few frames → cycles advance ─────────────────────────────────────
     let before = engine.snapshot().c64_cycles;
     for _ in 0..5 {
-        engine.pump_frame();
+        engine.pump_frame(19_656);
     }
     let after = engine.snapshot().c64_cycles;
     assert!(after > before, "cycles advanced under the pump: {before} -> {after}");
@@ -60,7 +60,7 @@ fn high_level_verb_sequence_drives_one_machine() {
     assert!(!engine.is_running(), "host run flag cleared after pause");
     let frozen = engine.snapshot().c64_cycles;
     for _ in 0..3 {
-        engine.pump_frame();
+        engine.pump_frame(19_656);
     }
     assert_eq!(frozen, engine.snapshot().c64_cycles, "paused machine does not advance");
 
@@ -86,7 +86,7 @@ fn high_level_verb_sequence_drives_one_machine() {
 #[test]
 fn monitor_passthrough_and_unknown_verbs() {
     let Some(engine) = engine_or_skip() else { return };
-    engine.exec_line("power on");
+    engine.exec_line("/power on");
 
     // `r` is a monitor verb (registers), not a high-level verb → passthrough.
     let r = engine.exec_line("r");

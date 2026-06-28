@@ -24,7 +24,7 @@ fn frame_buffer_is_full_canvas_with_content() {
     engine.exec_line("/power on");
     // Run ~30 frames so the READY screen is fully drawn.
     for _ in 0..30 {
-        engine.pump_frame();
+        engine.pump_frame(19_656);
     }
 
     let fb = trx64_daemon::pull_frame_buffer(engine.shared_state());
@@ -60,7 +60,7 @@ fn audio_drain_path_is_live() {
     let mut total = 0usize;
     for _ in 0..6 {
         for _ in 0..10 {
-            engine.pump_frame();
+            engine.pump_frame(19_656);
         }
         std::thread::sleep(std::time::Duration::from_millis(60));
         total += trx64_daemon::pull_audio_drain(engine.shared_state()).samples.len();

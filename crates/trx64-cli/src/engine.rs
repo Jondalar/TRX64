@@ -143,7 +143,11 @@ impl Engine {
     /// FFI/embedded-host loop. On a breakpoint/JAM halt the daemon's `session/run`
     /// returns early with a `breakpoint` object — we then clear the host run flag so
     /// the cockpit shows PAUSED at the hit.
-    pub fn pump_frame(&self) -> u64 {
+    /// Advance the machine by `base_cycles` (the host pump passes the cycles for the
+    /// REAL wall-clock time elapsed since the last tick — `elapsed × PAL_CPU_HZ` — so
+    /// the machine runs at true PAL real-time and SID production matches 44100 Hz, like
+    /// the SwiftUI AppModel pump; a fixed 50 fps budget drifted slow → audio crackle).
+    pub fn pump_frame(&self, base_cycles: u64) -> u64 {
         // Reconcile the dual run-state. The CLI host pump is the clock, so the daemon
         // controller MUST stay paused (`session/run` refuses while `session.running`
         // is set). But a daemon op the CLI doesn't own can flip it true: a disk/CRT
@@ -160,10 +164,13 @@ impl Engine {
             return 0;
         }
         let budget = if self.warp.load(Ordering::SeqCst) {
-            CYC_PER_FRAME * 8
+            base_cycles.saturating_mul(8)
         } else {
-            CYC_PER_FRAME
+            base_cycles
         };
+        if budget == 0 {
+            return 0; // no wall-clock time elapsed this tick — nothing to advance
+        }
         match self.rpc("session/run", json!({ "cycles": budget })) {
             Ok(v) => {
                 // A breakpoint/observer hit halts the run early — reflect it as PAUSE.

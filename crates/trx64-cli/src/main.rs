@@ -98,28 +98,28 @@ fn main() {
     // host run flag is set. Runs on its own thread, shares the Engine.
     let pump_engine = engine.clone();
     let pump = thread::spawn(move || {
-        // ~50 Hz PAL cadence. The pump sleeps a frame when paused so it doesn't spin.
-        let frame = Duration::from_millis(20);
+        // Pace by WALL-CLOCK, like the SwiftUI AppModel pump: each tick advances the
+        // cycles for the REAL time elapsed (`elapsed × PAL_CPU_HZ`), so the machine runs
+        // at true PAL real-time and SID output matches 44100 Hz exactly. A fixed 50 fps
+        // budget (19656 × 50 = 982800 cyc/s) ran slightly slow vs PAL's 985248 cyc/s →
+        // SID production ≈ 43990/s < the 44100 output rate → the audio ring slowly
+        // drained → constant underrun = crackle. A catch-up cap avoids a huge jump after
+        // a stall; the ~5 ms tick also matches the audio drain cadence (steady, not
+        // bursty). `pump_frame` no-ops while paused (host run flag clear).
+        const PAL_CPU_HZ: f64 = 985_248.0; // PAL 6569 system clock
+        const MAX_CATCHUP: u64 = 19_656 * 2; // ~2 frames
+        let tick = Duration::from_millis(5);
+        let mut last = std::time::Instant::now();
         loop {
             if pump_engine.should_quit() {
                 break;
             }
-            let t0 = std::time::Instant::now();
-            let advanced = pump_engine.pump_frame();
-            if advanced == 0 {
-                // Paused (or warp-stopped): idle a frame.
-                thread::sleep(frame);
-            } else if !pump_engine.is_warp() {
-                // Real-time PAL: pace to a 20 ms FRAME PERIOD — sleep only the remainder
-                // after the emulation work. `pump_frame` then sleep(20ms) made the period
-                // work+20ms (< 50 fps) → SID production fell below 44100/s → the audio
-                // ring slowly underran → periodic stutter. Subtracting the work keeps it
-                // at ~50 fps so production matches the output rate.
-                let elapsed = t0.elapsed();
-                if elapsed < frame {
-                    thread::sleep(frame - elapsed);
-                }
-            }
+            let now = std::time::Instant::now();
+            let elapsed = now.duration_since(last).as_secs_f64();
+            last = now;
+            let cycles = ((elapsed * PAL_CPU_HZ) as u64).min(MAX_CATCHUP);
+            pump_engine.pump_frame(cycles);
+            thread::sleep(tick);
         }
     });
 
