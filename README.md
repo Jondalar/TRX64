@@ -53,19 +53,22 @@ cargo build --release
 
 ---
 
-## Two ways to use it
+## Three ways to use it
 
-TRX64 is one runtime with two front doors — both speak the same protocol, so the same
-UI code works against either:
+TRX64 is one runtime with three front doors:
 
 - **As a daemon** — the `trx64-daemon` binary serves WebSocket JSON-RPC. This is how
   [C64ReverseEngineeringMCP](https://github.com/Jondalar/C64ReverseEngineeringMCP)
   uses it (select it with `TRX64=1 ./ui.sh restart`), and how any client or LLM
   connects.
-- **In-process** — the `trx64-ffi` crate exposes a typed library (uniffi → Swift
-  bindings) so a native app embeds the runtime directly, no subprocess. See
+- **In-process (typed)** — the `trx64-ffi` crate exposes a typed library (uniffi →
+  Swift bindings) so a native app embeds the runtime directly, no subprocess. See
   [`crates/trx64-ffi/API.md`](crates/trx64-ffi/API.md). A native macOS frontend is in
   progress on top of it.
+- **`trx64-cli`** — a cross-platform terminal **cockpit + emulator window** that embeds
+  the runtime in-process (Rust → Rust, no daemon/WS/FFI). Play in a native window, debug
+  in a TUI, drive it with `/`-commands + the full monitor. See
+  [`crates/trx64-cli/README.md`](crates/trx64-cli/README.md).
 
 ---
 
