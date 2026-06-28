@@ -1254,6 +1254,35 @@ impl Machine {
         }
     }
 
+    /// TRX64 feature-request — GUARDRAIL #2 (undump vs mounted cart). After an `undump`
+    /// restores C64 RAM from a snapshot while a cartridge is MOUNTED, the resident RAM
+    /// the snapshot wrote can diverge from the cart's flash/ROM (the field session's
+    /// "resident code != mounted flash" pollution). This samples the cart's low ROM
+    /// window ($8000..) via the side-effect-free cart peek and compares it to the resident
+    /// RAM underneath; if they differ it returns `Some((addr, cart_byte, ram_byte))` for
+    /// the FIRST divergent sample — a NON-FATAL nudge. `None` when no cart is mounted, the
+    /// cart maps no low ROM, or the resident bytes match the cart at every sample.
+    /// Read-only.
+    pub fn cart_resident_divergence(&self) -> Option<(u16, u8, u8)> {
+        // Only meaningful with a cartridge mounted.
+        self.cartridge.as_ref()?;
+        // Sample across the 8K low cart window at a coarse stride (the nudge only needs
+        // ONE mismatch to flag; a full 8K compare is unnecessary for a workflow warning).
+        for off in (0u16..0x2000).step_by(0x40) {
+            let addr = 0x8000u16 + off;
+            // The cart byte this window would map (None ⇒ cart maps no low ROM here).
+            let cart_byte = match self.cart_peek_byte(addr) {
+                Some(b) => b,
+                None => return None, // mapper exposes no low-ROM peek → can't compare.
+            };
+            let ram_byte = self.ram[addr as usize];
+            if cart_byte != ram_byte {
+                return Some((addr, cart_byte, ram_byte));
+            }
+        }
+        None
+    }
+
     /// reverse-debug Phase 2 — guided crash-triage. Reads the two always-on rings
     /// (CPU-history for the wild-transfer walk, delta-ring for the corruptor) and the
     /// current (crashed) PC to reconstruct the causal chain:

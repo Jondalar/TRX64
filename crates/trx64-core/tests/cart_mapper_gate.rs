@@ -310,6 +310,37 @@ fn machine_memconfig_magicdesk_8k_boot_config() {
 }
 
 #[test]
+fn cart_resident_divergence_guardrail() {
+    // GUARDRAIL #2 (undump vs mounted cart): cart_resident_divergence flags when the
+    // resident RAM under the cart window differs from the cart's flash/ROM, and clears
+    // when they match. (No cart → None.)
+    use trx64_core::Machine;
+
+    // No cart mounted → no divergence signal.
+    let bare = Machine::new();
+    assert!(bare.cart_resident_divergence().is_none(), "no cart → no nudge");
+
+    // Mount an 8K cart whose ROM is all $AA at $8000..$9FFF.
+    let mut m = Machine::new();
+    let crt = build_crt(19, 0, 1, "MD", &[(0, 0x8000, vec![0xaa; 0x2000])]);
+    m.attach_cart_from_bytes(&crt, "MD").expect("attach");
+    // Resident RAM under the window is power-on (0x00) → DIVERGES from the cart ($AA).
+    let div = m.cart_resident_divergence().expect("RAM 0x00 vs cart 0xAA diverges");
+    assert_eq!(div.0, 0x8000, "first divergent sample at the window base");
+    assert_eq!(div.1, 0xaa, "cart byte");
+    assert_eq!(div.2, 0x00, "resident RAM byte");
+
+    // Make the resident RAM under the WHOLE low window match the cart → no divergence.
+    for off in 0..0x2000usize {
+        m.ram[0x8000 + off] = 0xaa;
+    }
+    assert!(
+        m.cart_resident_divergence().is_none(),
+        "resident RAM == cart at every sample → no nudge"
+    );
+}
+
+#[test]
 fn machine_no_cart_memconfig_unchanged() {
     use trx64_core::Machine;
     let m = Machine::new();

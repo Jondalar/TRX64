@@ -159,6 +159,25 @@ struct CtrlStop {
     cycles: u64,
 }
 
+/// TRX64 feature-request #4 — one project-supplied on-trap dump rule. NO built-in
+/// engine knowledge lives in the core: the PROJECT tells the debugger which bytes are
+/// "the diagnosis" at a given trap PC. On reaching/halting at `pc`, the debugger reads
+/// each `dump` byte and auto-emits `label: name=$XX name2=$YY (decode)`. Loaded from a
+/// small JSON file via the `traprules <path>` verb. See `TRX64_FEATURE_REQUESTS.md` #4.
+#[derive(Clone, Debug)]
+struct TrapRule {
+    /// The trap PC this rule fires at (reached / halted-at / breakpoint).
+    pc: u16,
+    /// Human label for the trap (e.g. "loader miss").
+    label: String,
+    /// The diagnostic bytes to read + name: `(name, addr, len)`. `len` is 1..=8 bytes,
+    /// emitted as a single hex value (LE for len>1) under `name`.
+    dump: Vec<(String, u16, u8)>,
+    /// Optional human decode line appended in parentheses (e.g.
+    /// "k2 bit7 => DIRECT-overlay miss"). Empty = omitted.
+    decode: String,
+}
+
 /// Singleton session, kept in memory for the daemon's lifetime.
 pub struct State {
     session: Session,
@@ -390,6 +409,11 @@ pub struct State {
     /// write-ring (emu→render) → persistent engine → PCM-ring (render→main). Off by
     /// default → zero cost until the app starts pulling audio. Joined on `State` drop.
     audio_render: Option<AudioRenderThread>,
+    /// TRX64 feature-request #4 — project-supplied on-trap dump rules, keyed by trap PC
+    /// (last write wins on a duplicate PC). Loaded via `traprules <path>`; consulted on
+    /// the JAM / breakpoint-at-PC paths to auto-emit `label: name=$XX (decode)`. Empty by
+    /// default (no built-in engine knowledge); session-scoped (lost on close).
+    trap_rules: std::collections::HashMap<u16, TrapRule>,
 }
 
 /// Live A/V PULL-API — persistent, `Send` handles for the FFI SID audio render
@@ -1718,6 +1742,129 @@ fn triage_to_json(chain: &trx64_core::crash_triage::TriageChain) -> Value {
     })
 }
 
+/// TRX64 feature-request #4 — parse project-supplied on-trap dump rules from JSON. The
+/// project file is either a single rule object or an array of them:
+///   `{ "pc":"$088F", "label":"loader miss",
+///      "dump":[["k1","$0A80",1],["k2","$0A81",1]],
+///      "decode":"k2 bit7 => DIRECT-overlay miss" }`
+/// Addresses/PC accept `$`-prefixed or bare hex; `len` defaults to 1 and clamps 1..=8.
+/// Returns the parsed rules (NO built-in engine knowledge — the project owns the bytes)
+/// or an error string describing the first malformed field.
+fn parse_trap_rules(json: &Value) -> Result<Vec<TrapRule>, String> {
+    let arr: Vec<&Value> = match json {
+        Value::Array(a) => a.iter().collect(),
+        Value::Object(_) => vec![json],
+        _ => return Err("traprules: expected a JSON object or an array of objects".into()),
+    };
+    let hex16 = |v: &Value, field: &str| -> Result<u16, String> {
+        let s = v.as_str().ok_or_else(|| format!("traprules: `{field}` must be a hex string"))?;
+        parse_hex(s)
+            .map(|n| (n & 0xffff) as u16)
+            .ok_or_else(|| format!("traprules: `{field}`=\"{s}\" is not hex"))
+    };
+    let mut out = Vec::new();
+    for (i, r) in arr.into_iter().enumerate() {
+        let obj = r
+            .as_object()
+            .ok_or_else(|| format!("traprules: rule #{i} is not an object"))?;
+        let pc = hex16(obj.get("pc").ok_or_else(|| format!("traprules: rule #{i} missing `pc`"))?, "pc")?;
+        let label = obj
+            .get("label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("trap")
+            .to_string();
+        let decode = obj.get("decode").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let mut dump = Vec::new();
+        if let Some(d) = obj.get("dump") {
+            let items = d
+                .as_array()
+                .ok_or_else(|| format!("traprules: rule #{i} `dump` must be an array"))?;
+            for (j, item) in items.iter().enumerate() {
+                let t = item
+                    .as_array()
+                    .ok_or_else(|| format!("traprules: rule #{i} dump[{j}] must be [name, addr, len?]"))?;
+                let name = t
+                    .first()
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| format!("traprules: rule #{i} dump[{j}][0] (name) must be a string"))?
+                    .to_string();
+                let addr = hex16(
+                    t.get(1).ok_or_else(|| format!("traprules: rule #{i} dump[{j}] missing addr"))?,
+                    "dump addr",
+                )?;
+                let len = t
+                    .get(2)
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1)
+                    .clamp(1, 8) as u8;
+                dump.push((name, addr, len));
+            }
+        }
+        out.push(TrapRule { pc, label, dump, decode });
+    }
+    Ok(out)
+}
+
+/// TRX64 feature-request #4 — render the diagnostic emit for a trap rule, reading the
+/// `dump` bytes from the live machine (side-effect-free banked peek) and formatting
+/// `label: name=$XX name2=$YYYY (decode)`. A multi-byte field is shown LE as one value.
+/// Read-only.
+fn format_trap_rule_emit(rule: &TrapRule, m: &trx64_core::Machine) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for (name, addr, len) in &rule.dump {
+        let mut val: u64 = 0;
+        for k in 0..*len as u16 {
+            let b = m.read_full(addr.wrapping_add(k)) as u64;
+            val |= b << (8 * k); // little-endian
+        }
+        let width = (*len as usize) * 2;
+        parts.push(format!("{name}=${val:0width$X}"));
+    }
+    let mut s = format!("{}: {}", rule.label, parts.join(" "));
+    if !rule.decode.is_empty() {
+        s.push_str(&format!(" ({})", rule.decode));
+    }
+    s
+}
+
+/// TRX64 feature-request — GUARDRAIL #1 (key-injection vs free-running core). When the
+/// machine is being advanced by the --stream background loop (`running &&
+/// streaming_enabled`), a request/response key-injection (session/key_down · key_up ·
+/// type) races the autonomous advance — keys queued relative to the current clock can be
+/// scanned past before the KERNAL reads them, so inputs are silently LOST. This was the
+/// big time-sink in the field session. Returns a NON-FATAL warning string to attach to
+/// the reply (the op still runs), or `None` when the core is paused (inputs land cleanly).
+fn free_run_input_warning(st: &State) -> Option<String> {
+    if st.session.running && st.streaming_enabled {
+        Some(
+            "the machine is FREE-RUNNING (stream loop advancing) — injected key events \
+             race the autonomous advance and may be LOST. Pause (debug/pause) before \
+             key injection, or drive input via a scenario."
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+/// TRX64 feature-request #4 — if the project registered an on-trap dump rule for `pc`,
+/// render its decoded diagnostic and server-PUSH it as a `debug/observer_log` line (so a
+/// breakpoint-at-PC halt self-explains alongside the existing halt notifications).
+/// Returns the rendered emit (for a caller that also wants to attach it to a reply), or
+/// `None` when no rule matches. Read-only.
+fn maybe_emit_trap_rule(st: &State, pc: u16) -> Option<String> {
+    let rule = st.trap_rules.get(&pc)?;
+    let emit = format_trap_rule_emit(rule, &st.session.machine);
+    st.notify.broadcast(
+        "debug/observer_log",
+        json!({
+            "session_id": st.session.id,
+            "lines": [format!("trap rule @ ${pc:04X}: {emit}")],
+        }),
+    );
+    Some(emit)
+}
+
 /// Default cycle budget for a synchronous breakpoint-gated run (the daemon is
 /// request/response; a real autonomous loop would be unbounded, so we cap at a
 /// generous ~10 frames of PAL cycles — enough to reach any boot-time bp).
@@ -1940,6 +2087,9 @@ fn run_debug_control(id: Value, st: &mut State, frame: u64, _is_continue: bool) 
                 "cycles": cycles,
                 "registers": registers.clone(),
             }));
+            // TRX64 feature-request #4 — if a project on-trap rule covers this halt PC,
+            // auto-emit its decoded diagnostic into the observer-log stream.
+            maybe_emit_trap_rule(st, run.pc);
         }
         // Spec 771.2 — runtime-controller.ts:768/782 ALSO server-PUSHes debug/stopped
         // alongside the specific hit, so a passive UI freezes the run-state on any halt.
@@ -2064,18 +2214,30 @@ pub(crate) fn check_and_handle_jam(st: &mut State) -> bool {
             "opcode": opcode as u64,
         });
         let registers = register_dump(&st.session);
+        // TRX64 feature-request #4 — if the project registered an on-trap dump rule for
+        // this halt PC, auto-emit its decoded diagnostic (read-only) alongside the triage.
+        let trap_emit = st
+            .trap_rules
+            .get(&pc)
+            .map(|r| format_trap_rule_emit(r, &st.session.machine));
         let session_id = st.session.id.clone();
         st.notify.broadcast("debug/stopped", json!({
             "session_id": session_id,
             "stop": stop,
             "registers": registers,
             "triage": triage_json,
+            // feature #4: the project-supplied trap diagnosis for this PC (null if none).
+            "trapDiagnosis": trap_emit,
         }));
         // Also emit the human-readable chain into the monitor log stream so the
         // drop-in shows it alongside the existing JAM context.
+        let mut log_lines = triage_lines;
+        if let Some(emit) = trap_emit {
+            log_lines.push(format!("trap rule @ ${pc:04X}: {emit}"));
+        }
         st.notify.broadcast("debug/observer_log", json!({
             "session_id": session_id,
-            "lines": triage_lines,
+            "lines": log_lines,
         }));
     }
     true
@@ -2218,6 +2380,9 @@ pub(crate) fn stream_debug_gated_advance(st: &mut State, budget: u64) -> u32 {
                     "cycles": cycles,
                     "registers": registers.clone(),
                 }));
+                // TRX64 feature-request #4 — auto-emit a project on-trap diagnostic if a
+                // rule covers this halt PC (per-frame stream-driver path).
+                maybe_emit_trap_rule(st, run.pc);
             }
             // ALSO debug/stopped so a passive UI freezes the run-state on any halt
             // (runtime-controller.ts:768/782).
@@ -4241,6 +4406,55 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             Ok(lines.join("\n"))
         }
 
+        // TRX64 feature-request #4 — `traprules <path>` loads project-supplied on-trap
+        // dump rules from a JSON file; `traprules` (no arg) lists the loaded rules;
+        // `traprules clear` drops them. On reaching/halting at a rule's PC (JAM /
+        // breakpoint), the debugger auto-emits `label: name=$XX (decode)` reading the
+        // project-named diagnostic bytes — NO built-in engine knowledge in the core.
+        "traprules" => {
+            match toks.get(1).map(|s| s.as_str()) {
+                None => {
+                    if st.trap_rules.is_empty() {
+                        return Ok("traprules: none loaded. `traprules <path.json>` loads project on-trap dump rules.".into());
+                    }
+                    let mut rules: Vec<&TrapRule> = st.trap_rules.values().collect();
+                    rules.sort_by_key(|r| r.pc);
+                    let mut lines = vec![format!("traprules: {} rule(s):", rules.len())];
+                    for r in rules {
+                        let dumps: Vec<String> = r
+                            .dump
+                            .iter()
+                            .map(|(n, a, l)| format!("{n}@${a:04X}:{l}"))
+                            .collect();
+                        let decode = if r.decode.is_empty() { String::new() } else { format!("  => {}", r.decode) };
+                        lines.push(format!("  ${:04X}  \"{}\"  [{}]{}", r.pc, r.label, dumps.join(", "), decode));
+                    }
+                    Ok(lines.join("\n"))
+                }
+                Some("clear") => {
+                    let n = st.trap_rules.len();
+                    st.trap_rules.clear();
+                    Ok(format!("traprules: cleared {n} rule(s)"))
+                }
+                Some(arg) => {
+                    let path = resolve_fs_path(arg);
+                    let raw = std::fs::read_to_string(&path)
+                        .map_err(|e| format!("traprules: read {path}: {e}"))?;
+                    let json: Value = serde_json::from_str(&raw)
+                        .map_err(|e| format!("traprules: parse {path}: {e}"))?;
+                    let rules = parse_trap_rules(&json)?;
+                    let n = rules.len();
+                    for r in rules {
+                        st.trap_rules.insert(r.pc, r);
+                    }
+                    Ok(format!(
+                        "traprules: loaded {n} rule(s) from {path} ({} total). They auto-emit on reaching their PC (JAM / breakpoint).",
+                        st.trap_rules.len()
+                    ))
+                }
+            }
+        }
+
         // reverse-debug depth knob — `revdepth [seconds]`: with an arg, REBUILD both
         // always-on rings (delta + cpu-history) at that depth for FUTURE capture; with
         // no arg, REPORT the current depth. Setting it DISCARDS current history (fresh
@@ -5011,10 +5225,24 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                         let machine = read.manifest.machine.model.clone();
                         let media = if media_lbl.is_empty() { "none".to_string() } else { media_lbl.join(", ") };
                         // formatUndumpSummary (= snapshot-persistence.ts:282-292).
-                        Ok(format!(
+                        let mut summary = format!(
                             "undumped {path}\n  cycle={cycle} pc=${:04x} machine={machine} (paused)\n  media: {media}\n  breakpoints={breakpoints}",
                             pc
-                        ))
+                        );
+                        // GUARDRAIL #2 — warn (non-fatal) when the restored resident RAM
+                        // diverges from the MOUNTED cart flash (the field session's
+                        // "resident code != mounted flash" pollution).
+                        if let Some((addr, cart_b, ram_b)) =
+                            st.session.machine.cart_resident_divergence()
+                        {
+                            summary.push_str(&format!(
+                                "\n  WARNING: resident RAM diverges from the mounted cart at \
+                                 ${addr:04X} (cart=${cart_b:02X} ram=${ram_b:02X}) — the \
+                                 undumped RAM may not match the live flash. Verify, or re-mount \
+                                 the cart / cold-boot if the resident code is stale."
+                            ));
+                        }
+                        Ok(summary)
                     }
                     Err(e) => Err(format!("undump: {e}")),
                 }
@@ -5400,6 +5628,7 @@ fn monitor_help_text() -> String {
         "    rstep [n] | reverse [n]   UNDO the last n instructions (default 1): restore CPU+RAM+IO bytes to before them; reports the landed regs + writes rolled back",
         "    whowrote <addr> [n]       last n writer(s) of <addr> from the ring (newest first): PC + cycle + old->new + caller chain (top return frames -> identifies the CALLER of a shared store). Emits `ring_exhausted: true` + a depth hint on a miss past a wrapped ring.",
         "    triage [pc]               guided crash-triage: causal chain (crash -> wild RTS/JMP transfer -> stack corruptor) from the rings; auto-printed on a JAM. Confidence-tagged. Surfaces a PINNED `loop entry: $SRC -> $DST` for a tight-loop/halt; `ring_exhausted` when the transfer is older than the ring.",
+        "    traprules <path> | traprules [clear]   load/list/clear project on-trap dump rules (JSON {pc,label,dump:[[name,addr,len]],decode}); auto-emits `label: name=$XX (decode)` on reaching that PC (JAM / breakpoint)",
         "    revdepth [seconds]        report / set the always-on reverse-ring depth: rebuilds the delta+cpuhistory rings (DISCARDS history; future capture only; 1..=600s). TRX64_REVERSE_SECONDS = boot default",
         "    diff <idA> <idB>          typed by-ID diff of two checkpoint anchors (RAM runs + per-chip register changes). READ-ONLY (live machine unchanged). ids from `checkpoint/list`",
         "    ringdump <path>           serialize the WHOLE reverse-debug buffer (checkpoint+delta+cpuhistory rings) → one gzipped .c64rering file (the tester->dev hand-off)",
@@ -6915,9 +7144,12 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             // UTF-16 code units; our ASCII command strings make chars().count()
             // equal to the JS .length.
             let queued = text.chars().count() as u64;
+            // GUARDRAIL #1 — warn (non-fatal) if injecting into a free-running core.
+            let warning = free_run_input_warning(&st);
             Response::ok(id, json!({
                 "c64Cycles": c64_cycles,
-                "queued": queued
+                "queued": queued,
+                "freeRunWarning": warning,
             }))
         }
 
@@ -7014,7 +7246,9 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 .into_iter()
                 .map(Value::String)
                 .collect();
-            Response::ok(id, json!({ "ok": true, "pressed": pressed }))
+            // GUARDRAIL #1 — warn (non-fatal) if injecting into a free-running core.
+            let warning = free_run_input_warning(&st);
+            Response::ok(id, json!({ "ok": true, "pressed": pressed, "freeRunWarning": warning }))
         }
 
         // session/key_up — release a single held key (ws-server.ts:1449).
@@ -7034,7 +7268,9 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 .into_iter()
                 .map(Value::String)
                 .collect();
-            Response::ok(id, json!({ "ok": true, "pressed": pressed }))
+            // GUARDRAIL #1 — warn (non-fatal) if injecting into a free-running core.
+            let warning = free_run_input_warning(&st);
+            Response::ok(id, json!({ "ok": true, "pressed": pressed, "freeRunWarning": warning }))
         }
 
         // session/release_keys — release all held keys (ws-server.ts:1455). The TS
@@ -13164,6 +13400,7 @@ pub fn build_state(session: Session, streaming_on: bool) -> State {
         stream_broke_on_jam: false,
         force_present_frame: false,
         audio_render: None,
+        trap_rules: std::collections::HashMap::new(),
     }
 }
 
@@ -13611,6 +13848,7 @@ mod batch1_tests {
             stream_broke_on_jam: false,
             force_present_frame: false,
             audio_render: None,
+            trap_rules: std::collections::HashMap::new(),
         }))
     }
 
@@ -15656,6 +15894,162 @@ mod batch1_tests {
             assert_eq!(idx.len(), 96 * 68);
             assert!(idx.iter().any(|&b| b != idx[0]), "thumbnail is a real picture, not all-one-colour");
         }
+    }
+
+    #[test]
+    fn trap_rules_parse_and_decode_emit() {
+        // FEATURE #4: parse the field-report's exact example JSON, then assert the
+        // rendered emit reads the project-named diagnostic bytes from the live machine
+        // and formats `label: name=$XX name2=$YY (decode)`.
+        let def = json!({
+            "pc": "$088F", "label": "loader miss",
+            "dump": [["k1", "$0A80", 1], ["k2", "$0A81", 1]],
+            "decode": "k2 bit7 => DIRECT-overlay miss"
+        });
+        let rules = parse_trap_rules(&def).expect("parse single rule");
+        assert_eq!(rules.len(), 1);
+        let r = &rules[0];
+        assert_eq!(r.pc, 0x088f);
+        assert_eq!(r.label, "loader miss");
+        assert_eq!(r.dump, vec![
+            ("k1".to_string(), 0x0a80, 1),
+            ("k2".to_string(), 0x0a81, 1),
+        ]);
+
+        // Stage the diagnostic bytes in RAM ($0A80=$00, $0A81=$E3) + render the emit.
+        let state = make_state();
+        {
+            let mut st = state.lock().unwrap();
+            st.session.machine.ram[0x0a80] = 0x00;
+            st.session.machine.ram[0x0a81] = 0xe3;
+            let g = &st.session.machine;
+            let emit = format_trap_rule_emit(r, g);
+            // Exactly the field report's expected line.
+            assert_eq!(emit, "loader miss: k1=$00 k2=$E3 (k2 bit7 => DIRECT-overlay miss)");
+        }
+
+        // An ARRAY of rules + a multi-byte (LE) field parse + render.
+        let arr = json!([
+            { "pc": "0900", "label": "vec", "dump": [["ptr", "$0A82", 2]] },
+            { "pc": "$0901", "label": "flag", "dump": [["f", "$0A84", 1]], "decode": "set" }
+        ]);
+        let rules2 = parse_trap_rules(&arr).expect("parse array");
+        assert_eq!(rules2.len(), 2);
+        assert_eq!(rules2[0].pc, 0x0900);
+        assert_eq!(rules2[0].dump[0].2, 2, "len=2 parsed");
+        {
+            let mut st = state.lock().unwrap();
+            st.session.machine.ram[0x0a82] = 0x34; // lo
+            st.session.machine.ram[0x0a83] = 0x12; // hi → LE $1234
+            let emit = format_trap_rule_emit(&rules2[0], &st.session.machine);
+            assert_eq!(emit, "vec: ptr=$1234", "multi-byte field rendered little-endian");
+        }
+
+        // A malformed rule errors (missing pc).
+        assert!(parse_trap_rules(&json!({ "label": "x" })).is_err());
+    }
+
+    #[test]
+    fn trap_rules_verb_load_list_clear_and_jam_emit() {
+        // FEATURE #4: drive the `traprules` monitor verb end-to-end (load from a JSON
+        // file, list, clear) AND assert the JAM broadcast carries the trap diagnosis.
+        let state = make_state();
+        // Write a rule file in the scratch dir.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("trx64_traprules_{}.json", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"{ "pc":"$0801", "label":"boot trap",
+                 "dump":[["a","$00FB",1],["b","$00FC",1]],
+                 "decode":"a|b nonzero => stuck" }"#,
+        )
+        .unwrap();
+
+        // Load via the verb.
+        let out = {
+            let mut st = state.lock().unwrap();
+            run_monitor(&mut st, &format!("traprules {}", path.display())).unwrap()
+        };
+        assert!(out.contains("loaded 1 rule"), "load output: {out}");
+
+        // List shows it.
+        let listed = {
+            let mut st = state.lock().unwrap();
+            run_monitor(&mut st, "traprules").unwrap()
+        };
+        assert!(listed.contains("$0801"), "list output: {listed}");
+        assert!(listed.contains("boot trap"), "list shows the label");
+
+        // Stage bytes + a JAM at $0801, then run the JAM handler and assert the
+        // trapDiagnosis is attached to the debug/stopped broadcast. Subscribe a tokio
+        // unbounded channel to the NotifyHub (send is non-blocking → no runtime needed;
+        // try_recv drains synchronously) so we observe the actual broadcast envelope.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let _sub;
+        {
+            let mut st = state.lock().unwrap();
+            _sub = st.notify.subscribe(tx);
+            st.session.machine.ram[0x00fb] = 0x05;
+            st.session.machine.ram[0x00fc] = 0x00;
+            // Force a JAM at $0801: put a KIL opcode there + point the core at it + mark
+            // it jammed (the handler reads the jammed core's PC).
+            st.session.machine.ram[0x0801] = 0x02; // KIL
+            st.session.machine.c64_core.reg_pc = 0x0801;
+            st.session.machine.c64_core.is_jammed = true;
+            check_and_handle_jam(&mut st);
+        }
+        // Drain the broadcast envelopes and find the debug/stopped one.
+        let mut diag: Option<String> = None;
+        while let Ok(msg) = rx.try_recv() {
+            if let tokio_tungstenite::tungstenite::Message::Text(t) = msg {
+                let v: Value = serde_json::from_str(&t).unwrap();
+                if v["method"] == json!("debug/stopped") {
+                    if let Some(d) = v["params"]["trapDiagnosis"].as_str() {
+                        diag = Some(d.to_string());
+                    }
+                }
+            }
+        }
+        let diag = diag.expect("debug/stopped carried trapDiagnosis");
+        assert!(diag.contains("boot trap"), "diag: {diag}");
+        assert!(diag.contains("a=$05"), "diag reads the staged byte: {diag}");
+        assert!(diag.contains("(a|b nonzero => stuck)"), "diag carries the decode: {diag}");
+
+        // Clear drops it.
+        let cleared = {
+            let mut st = state.lock().unwrap();
+            run_monitor(&mut st, "traprules clear").unwrap()
+        };
+        assert!(cleared.contains("cleared 1"), "clear output: {cleared}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn guardrail_warns_on_key_injection_into_free_running_core() {
+        // GUARDRAIL #1: session/key_down into a FREE-RUNNING core (running &&
+        // streaming) attaches a non-fatal freeRunWarning; a paused core does NOT.
+        let state = make_state();
+
+        // Paused (default) → no warning.
+        let paused = call(&state, "session/key_down", json!({ "key": "A" }));
+        assert!(paused["freeRunWarning"].is_null(), "paused core: no warning");
+
+        // Mark the machine free-running (stream loop advancing).
+        {
+            let mut st = state.lock().unwrap();
+            st.session.running = true;
+            st.streaming_enabled = true;
+        }
+        let running = call(&state, "session/key_down", json!({ "key": "B" }));
+        let warn = running["freeRunWarning"].as_str().expect("free-run warning attached");
+        assert!(warn.contains("FREE-RUNNING"), "warning text: {warn}");
+        assert!(warn.contains("may be LOST"), "warning explains the risk: {warn}");
+        // The key still registered (non-fatal — the op runs).
+        assert_eq!(running["ok"], json!(true));
+
+        // session/type carries it too.
+        let typed = call(&state, "session/type", json!({ "text": "RUN" }));
+        assert!(typed["freeRunWarning"].as_str().is_some(), "type also warns when free-running");
     }
 }
 
