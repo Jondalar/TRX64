@@ -16,7 +16,10 @@ use std::io::{self, Stdout};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode as XKeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode as XKeyCode, KeyEventKind,
+    KeyModifiers, MouseEventKind,
+};
 use crossterm::{execute, terminal};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -49,13 +52,14 @@ pub fn run(engine: Engine, to_main: Sender<UiToMain>) -> io::Result<()> {
 fn setup_terminal() -> io::Result<Term> {
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, terminal::EnterAlternateScreen)?;
+    // EnableMouseCapture so the OUTPUT/LOG pane is mouse-scrollable inside the alt screen.
+    execute!(stdout, terminal::EnterAlternateScreen, EnableMouseCapture)?;
     Terminal::new(CrosstermBackend::new(stdout))
 }
 
 fn restore_terminal(term: &mut Term) -> io::Result<()> {
     terminal::disable_raw_mode()?;
-    execute!(term.backend_mut(), terminal::LeaveAlternateScreen)?;
+    execute!(term.backend_mut(), DisableMouseCapture, terminal::LeaveAlternateScreen)?;
     term.show_cursor()
 }
 
@@ -65,11 +69,15 @@ struct Cockpit {
     history: Vec<String>,
     hist_idx: Option<usize>,
     snap: StateSnapshot,
+    /// Lines scrolled UP from the bottom of the log (0 = pinned to the tail). Mouse
+    /// wheel adjusts it; any new output snaps back to 0.
+    scroll: usize,
 }
 
 impl Cockpit {
     fn new() -> Self {
         Self {
+            scroll: 0,
             input: String::new(),
             log: vec![
                 "TRX64 cockpit — powered on + running. A bare line goes to the monitor".into(),
@@ -87,6 +95,7 @@ impl Cockpit {
         for line in text.split('\n') {
             self.log.push(line.to_string());
         }
+        self.scroll = 0; // new output → snap to the tail
         // Bound the log so it doesn't grow unbounded over a long session.
         const MAX: usize = 5000;
         if self.log.len() > MAX {
@@ -116,74 +125,131 @@ fn run_loop(term: &mut Term, engine: &Engine, to_main: &Sender<UiToMain>) -> io:
         }
 
         if event::poll(poll)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                // Ctrl-C / Ctrl-D quit the cockpit.
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && matches!(key.code, XKeyCode::Char('c') | XKeyCode::Char('d'))
-                {
-                    let _ = engine.exec_line("/quit");
-                    let _ = to_main.send(UiToMain::Quit);
-                    return Ok(());
-                }
-                match key.code {
-                    XKeyCode::Char(c) => {
-                        cp.input.push(c);
-                        cp.hist_idx = None;
+            match event::read()? {
+                // Mouse wheel scrolls the OUTPUT/LOG pane (offset clamped in draw_log).
+                Event::Mouse(m) => match m.kind {
+                    MouseEventKind::ScrollUp => cp.scroll = (cp.scroll + 3).min(cp.log.len()),
+                    MouseEventKind::ScrollDown => cp.scroll = cp.scroll.saturating_sub(3),
+                    _ => {}
+                },
+                Event::Key(key) => {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
                     }
-                    XKeyCode::Backspace => {
-                        cp.input.pop();
+                    // Ctrl-C / Ctrl-D quit the cockpit.
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && matches!(key.code, XKeyCode::Char('c') | XKeyCode::Char('d'))
+                    {
+                        let _ = engine.exec_line("/quit");
+                        let _ = to_main.send(UiToMain::Quit);
+                        return Ok(());
                     }
-                    XKeyCode::Up => {
-                        if !cp.history.is_empty() {
-                            let i = match cp.hist_idx {
-                                None => cp.history.len() - 1,
-                                Some(0) => 0,
-                                Some(i) => i - 1,
-                            };
-                            cp.hist_idx = Some(i);
-                            cp.input = cp.history[i].clone();
-                        }
-                    }
-                    XKeyCode::Down => {
-                        if let Some(i) = cp.hist_idx {
-                            if i + 1 < cp.history.len() {
-                                cp.hist_idx = Some(i + 1);
-                                cp.input = cp.history[i + 1].clone();
-                            } else {
-                                cp.hist_idx = None;
-                                cp.input.clear();
+                    match key.code {
+                        // Tab: complete the /-command verb.
+                        XKeyCode::Tab => {
+                            if let Some(msg) = autocomplete(&mut cp.input) {
+                                cp.push_log(&msg);
                             }
                         }
+                        XKeyCode::Char(c) => {
+                            cp.input.push(c);
+                            cp.hist_idx = None;
+                        }
+                        XKeyCode::Backspace => {
+                            cp.input.pop();
+                        }
+                        XKeyCode::Up => {
+                            if !cp.history.is_empty() {
+                                let i = match cp.hist_idx {
+                                    None => cp.history.len() - 1,
+                                    Some(0) => 0,
+                                    Some(i) => i - 1,
+                                };
+                                cp.hist_idx = Some(i);
+                                cp.input = cp.history[i].clone();
+                            }
+                        }
+                        XKeyCode::Down => {
+                            if let Some(i) = cp.hist_idx {
+                                if i + 1 < cp.history.len() {
+                                    cp.hist_idx = Some(i + 1);
+                                    cp.input = cp.history[i + 1].clone();
+                                } else {
+                                    cp.hist_idx = None;
+                                    cp.input.clear();
+                                }
+                            }
+                        }
+                        XKeyCode::Enter => {
+                            let line = cp.input.trim().to_string();
+                            cp.input.clear();
+                            cp.hist_idx = None;
+                            if line.is_empty() {
+                                continue;
+                            }
+                            cp.history.push(line.clone());
+                            cp.push_log(&format!("> {line}"));
+                            let r = engine.exec_line(&line);
+                            if !r.output.is_empty() {
+                                cp.push_log(&r.output);
+                            }
+                            if r.open_window {
+                                let _ = to_main.send(UiToMain::OpenWindow);
+                            }
+                            if r.quit {
+                                let _ = to_main.send(UiToMain::Quit);
+                                return Ok(());
+                            }
+                        }
+                        _ => {}
                     }
-                    XKeyCode::Enter => {
-                        let line = cp.input.trim().to_string();
-                        cp.input.clear();
-                        cp.hist_idx = None;
-                        if line.is_empty() {
-                            continue;
-                        }
-                        cp.history.push(line.clone());
-                        cp.push_log(&format!("> {line}"));
-                        let r = engine.exec_line(&line);
-                        if !r.output.is_empty() {
-                            cp.push_log(&r.output);
-                        }
-                        if r.open_window {
-                            let _ = to_main.send(UiToMain::OpenWindow);
-                        }
-                        if r.quit {
-                            let _ = to_main.send(UiToMain::Quit);
-                            return Ok(());
-                        }
-                    }
-                    _ => {}
                 }
+                _ => {}
             }
         }
     }
+}
+
+/// Tab-complete a /-command verb in place. Returns a message listing candidates when
+/// the prefix is ambiguous (input is also completed to the longest common prefix); on a
+/// single match the verb is filled in with a trailing space; `None` when nothing to do.
+fn autocomplete(input: &mut String) -> Option<String> {
+    const VERBS: [&str; 17] = [
+        "power", "reset", "run", "pause", "step", "mount", "eject", "load", "warp", "joystick",
+        "window", "dump", "restore", "ringdump", "ringload", "help", "quit",
+    ];
+    let rest = input.strip_prefix('/')?;
+    if rest.contains(' ') {
+        return None; // verb already entered — args aren't completed
+    }
+    let matches: Vec<&str> = VERBS.iter().copied().filter(|v| v.starts_with(rest)).collect();
+    match matches.as_slice() {
+        [] => None,
+        [only] => {
+            *input = format!("/{only} ");
+            None
+        }
+        many => {
+            let lcp = longest_common_prefix(many);
+            if lcp.len() > rest.len() {
+                *input = format!("/{lcp}");
+            }
+            Some(format!(
+                "  {}",
+                many.iter().map(|m| format!("/{m}")).collect::<Vec<_>>().join("  ")
+            ))
+        }
+    }
+}
+
+fn longest_common_prefix(items: &[&str]) -> String {
+    let first = items.first().copied().unwrap_or("");
+    let mut len = first.len();
+    for s in &items[1..] {
+        let common = first.bytes().zip(s.bytes()).take_while(|(a, b)| a == b).count();
+        len = len.min(common);
+    }
+    first[..len].to_string()
 }
 
 fn draw(f: &mut Frame, cp: &Cockpit) {
@@ -299,10 +365,13 @@ fn draw_flow(f: &mut Frame, area: Rect, s: &StateSnapshot) {
 }
 
 fn draw_log(f: &mut Frame, area: Rect, cp: &Cockpit) {
-    // Show the tail of the log that fits.
     let inner_h = area.height.saturating_sub(2) as usize;
-    let start = cp.log.len().saturating_sub(inner_h);
-    let lines: Vec<Line> = cp.log[start..]
+    // Scroll: `cp.scroll` lines up from the tail, clamped so the window stays in range.
+    let max_scroll = cp.log.len().saturating_sub(inner_h);
+    let scroll = cp.scroll.min(max_scroll);
+    let end = cp.log.len() - scroll;
+    let start = end.saturating_sub(inner_h);
+    let lines: Vec<Line> = cp.log[start..end]
         .iter()
         .map(|l| {
             if l.starts_with("> ") {
@@ -312,9 +381,15 @@ fn draw_log(f: &mut Frame, area: Rect, cp: &Cockpit) {
             }
         })
         .collect();
+    // Title shows a scrollback indicator when not pinned to the tail.
+    let title = if scroll > 0 {
+        format!(" OUTPUT / LOG  ▲ {scroll} (scroll down to live) ")
+    } else {
+        " OUTPUT / LOG ".to_string()
+    };
     f.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(" OUTPUT / LOG "))
+            .block(Block::default().borders(Borders::ALL).title(title))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -334,4 +409,32 @@ fn draw_input(f: &mut Frame, area: Rect, cp: &Cockpit) {
 
 fn panel<'a>(lines: Vec<Line<'a>>, title: &'a str) -> Paragraph<'a> {
     Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(format!(" {title} ")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn autocomplete_single_completes_with_space() {
+        let mut s = "/pow".to_string();
+        assert_eq!(autocomplete(&mut s), None);
+        assert_eq!(s, "/power ");
+    }
+
+    #[test]
+    fn autocomplete_ambiguous_fills_common_prefix_and_lists() {
+        // /re → {reset, restore}; LCP = "res".
+        let mut s = "/re".to_string();
+        let msg = autocomplete(&mut s).expect("candidates listed");
+        assert_eq!(s, "/res");
+        assert!(msg.contains("/reset") && msg.contains("/restore"));
+    }
+
+    #[test]
+    fn autocomplete_ignores_bare_monitor_lines() {
+        let mut s = "d c000".to_string();
+        assert_eq!(autocomplete(&mut s), None);
+        assert_eq!(s, "d c000");
+    }
 }
