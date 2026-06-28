@@ -27,14 +27,27 @@ use trx64_daemon::{pull_audio_drain, SharedState, AUDIO_SAMPLE_RATE};
 struct Ring {
     buf: VecDeque<i16>,
     /// Samples that must accumulate before the callback starts emitting audio (jitter
-    /// cushion). Once primed, stays primed unless fully drained.
+    /// cushion). Met ONCE, then `primed` stays true for the stream's life — an underrun
+    /// emits silence WITHOUT re-priming (mirrors the SwiftUI `AudioOutput`). The old
+    /// re-prime-on-underrun turned every momentary underrun into a full `preroll`-long
+    /// silence gap = the audible drops/hänger.
     preroll: usize,
+    /// Governor: when the backlog exceeds `gov_target + gov_margin`, drop the oldest
+    /// down to `gov_target` so latency stays bounded (banked samples are stale anyway).
+    gov_target: usize,
+    gov_margin: usize,
     primed: bool,
 }
 
 impl Ring {
-    fn new(preroll: usize) -> Self {
-        Self { buf: VecDeque::with_capacity(preroll * 4), preroll, primed: false }
+    fn new(preroll: usize, gov_target: usize, gov_margin: usize) -> Self {
+        Self {
+            buf: VecDeque::with_capacity(preroll * 4),
+            preroll,
+            gov_target,
+            gov_margin,
+            primed: false,
+        }
     }
 }
 
@@ -76,12 +89,17 @@ impl AudioOutput {
             buffer_size: cpal::BufferSize::Default,
         };
 
-        // Pre-roll cushion. The producer fills in BURSTS (~882 samples per 20 ms pump
-        // frame, 0 between), and thread::sleep frame pacing jitters, so a small cushion
-        // underruns → re-prime → audible gaps. ~150 ms (≈7 frames) absorbs the
-        // burstiness + jitter; the 250 ms cap below still bounds latency. (Matches the
-        // SwiftUI AudioOutput's ~180 ms target.)
-        let ring = Arc::new(Mutex::new(Ring::new((AUDIO_SAMPLE_RATE as usize) * 150 / 1000)));
+        // Ring cushion, mirroring the SwiftUI AudioOutput (Spec 703/706): 200 ms
+        // pre-roll, 180 ms steady-state target, 50 ms slack before the governor trims.
+        // The producer fills in BURSTS (~882 samples per 20 ms pump frame, 0 between)
+        // and frame pacing jitters, so a generous cushion + underrun=silence (no
+        // re-prime) keeps playback smooth; the governor bounds latency on the high side.
+        let rate = AUDIO_SAMPLE_RATE as usize;
+        let ring = Arc::new(Mutex::new(Ring::new(
+            rate * 200 / 1000,
+            rate * 180 / 1000,
+            rate * 50 / 1000,
+        )));
 
         let stream = build_stream(&device, &config, sample_format, channels, Arc::clone(&ring))?;
         if let Err(e) = stream.play() {
@@ -183,6 +201,7 @@ fn fill<T: cpal::Sample + cpal::FromSample<i16>>(
 ) {
     let silence = T::from_sample(0i16);
     let mut r = ring.lock().unwrap();
+    // Pre-roll: emit silence until the cushion is met, then stay primed for life.
     if !r.primed {
         if r.buf.len() >= r.preroll {
             r.primed = true;
@@ -191,16 +210,18 @@ fn fill<T: cpal::Sample + cpal::FromSample<i16>>(
             return;
         }
     }
+    // Governor: bound latency — if backed up beyond target + margin, drop the oldest
+    // down to target (banked samples are stale). Mirrors the SwiftUI AudioOutput.
+    if r.buf.len() > r.gov_target + r.gov_margin {
+        let drop = r.buf.len() - r.gov_target;
+        r.buf.drain(0..drop);
+    }
     let channels = channels.max(1);
     let frames = out.len() / channels;
     for f in 0..frames {
-        let v = match r.buf.pop_front() {
-            Some(x) => T::from_sample(x),
-            None => {
-                r.primed = false; // underran — re-prime before emitting again
-                silence
-            }
-        };
+        // Underrun → silence for the missing samples, but STAY primed (no re-prime gap):
+        // a momentary underrun is then a sub-ms blip, not a `preroll`-long drop.
+        let v = r.buf.pop_front().map(T::from_sample).unwrap_or(silence);
         for c in 0..channels {
             out[f * channels + c] = v;
         }
