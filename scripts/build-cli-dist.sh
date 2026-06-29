@@ -44,8 +44,15 @@ container run --rm -m 6g -c 4 -v "$PWD":/work -w /work "$IMG" bash -c '
     AR_x86_64_pc_windows_gnu=x86_64-w64-mingw32-ar \
     CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc
   cargo build --release -p trx64-cli --target x86_64-pc-windows-gnu
-  x86_64-w64-mingw32-strip /work/dist/windows-x86_64/x86_64-pc-windows-gnu/release/trx64cli.exe 2>/dev/null || true'
+  x86_64-w64-mingw32-strip /work/dist/windows-x86_64/x86_64-pc-windows-gnu/release/trx64cli.exe 2>/dev/null || true
+  # reSID is C++ → the .exe needs the MinGW runtime DLLs at launch. A clean Windows has none
+  # ("libstdc++-6.dll not found"); static-linking them is unreliable with this cc/rustc-mingw
+  # setup, so stage the runtime DLLs to bundle next to the .exe (copied into the handout below).
+  mkdir -p /work/dist/windows-dlls
+  for dll in libstdc++-6.dll libgcc_s_seh-1.dll libwinpthread-1.dll; do
+    src=$(find /usr -name "$dll" 2>/dev/null | head -1); [ -n "$src" ] && cp "$src" /work/dist/windows-dlls/; done'
 cp dist/windows-x86_64/x86_64-pc-windows-gnu/release/trx64cli.exe "$OUT/windows-x86_64/"
+cp dist/windows-dlls/*.dll "$OUT/windows-x86_64/"   # MinGW runtime DLLs next to the .exe
 
 # Bundle the C64 ROMs + the README into each OS folder, then zip per OS. The binary
 # auto-finds a `roms/` sitting next to it (default_rom_dir), so the unzipped folder
