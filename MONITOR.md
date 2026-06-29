@@ -115,13 +115,27 @@ you care about across interrupts.
 | `bk` | list breakpoints (`#num $addr`) |
 | `bk <a>` / `bk -<a>` | set / remove a breakpoint by address |
 | `del <n..>` / `del` | delete by `#num` / delete all |
-| `obs <name> when exec\|load\|store <a[..b]> [if <cond>] do break\|log [fields]` | conditional observer |
+| `obs <name> when exec\|load\|store <a[..b]> [if <cond>] do <action>` | conditional observer (actions below) |
 | `obs` / `obs log` | list observers / show log lines |
 | `obs <name> on\|off\|del` | toggle/delete (name may glob: `obs * del`, `obs c* off`) |
 | `ignore <name> [n]` | ignore the next n hits |
 
-`do log` fields: `a x y sp pc fl` or `$addr[:w]`. Condition operators:
-`== != < > <= >= && || ( )` over `a/x/y/pc/sp/fl/rl/val/addr`.
+**`do <action>`** — one of:
+
+- `break` — halt the run on hit (default).
+- `log [fields]` — append a log line (non-halting). Fields: `a x y sp pc fl` or `$addr[:w]` (`:w` = 16-bit). E.g. `do log $fd $fe $ff a x y`.
+- `mark ["label"]` — drop a trace bookmark on hit (default label = the observer name).
+- `cmd "<monitor command>"` — run any monitor command on each hit.
+- `trace [domains]\|off` — start / stop a scoped trace capture (**bracket model**). Domains: `c64-cpu drive8-cpu iec vic memory` (default `c64-cpu memory`); `do trace off` stops.
+
+**Trace-bracket example** — capture only the `$4000..$4100` region, driven by exec events:
+
+```
+obs cap     when exec $4000 do trace c64-cpu memory   # start at $4000
+obs cap_off when exec $4100 do trace off              # stop at $4100
+```
+
+**Condition operators:** `== != < > <= >= && || ( )` over `a/x/y/pc/sp/fl/rl/val/addr`.
 
 ### CPU
 | command | what it does |

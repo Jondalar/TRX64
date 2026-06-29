@@ -3694,7 +3694,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                     sync_observers(breakpoints, dsl_observers, dsl_disabled, reg);
                 }
                 if st.dsl_observers.is_empty() {
-                    return Ok("no observers (obs <name> when exec|load|store <addr> [if <cond>] do break|log)".into());
+                    return Ok("no observers (obs <name> when exec|load|store <addr> [if <cond>] do break|log|mark|cmd|trace)".into());
                 }
                 let lines: Vec<String> = st
                     .dsl_observers
@@ -5600,8 +5600,11 @@ fn monitor_help_text() -> String {
         "    bk               list breakpoints (#num $addr)",
         "    bk <a> | bk -<a> set / remove breakpoint (by addr)",
         "    del <n..> | del  delete by #num / delete all",
-        "    obs <name> when exec|load|store <a[..b]> [if <cond>] do break|log [fields]",
+        "    obs <name> when exec|load|store <a[..b]> [if <cond>] do <action> [fields]",
+        "      actions: break | log [fields] | mark [\"label\"] | cmd \"<cmd>\" | trace [domains]|off",
         "      log fields: a/x/y/sp/pc/fl or $addr[:w]  e.g. `do log $fd $fe $ff a x y`",
+        "      trace domains: c64-cpu|drive8-cpu|iec|vic|memory (default c64-cpu+memory)",
+        "        bracket: `obs c when exec $4000 do trace` … `obs c2 when exec $4100 do trace off`",
         "    obs | obs log    list observers / show log lines",
         "    obs <name> on|off|del   (name may glob: `obs * del` = all, `obs c* off`)",
         "    ignore <name> [n]",
