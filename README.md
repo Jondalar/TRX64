@@ -51,6 +51,19 @@ cargo build --release
   breakpoints, JAM auto-break, recorder, observers). Omit it for a pure
   request/response core.
 
+**Windows: use the GNU toolchain, not MSVC.** The vendored reSID is GCC/Clang C++ and
+does not compile under MSVC (`cl` fails building `resid`; the `-std:c++11 D9002` warning
+is just the symptom). Build with MinGW-w64:
+
+```
+rustup default stable-x86_64-pc-windows-gnu   # (or: cargo build --target x86_64-pc-windows-gnu)
+# + a MinGW-w64 g++ on PATH (e.g. MSYS2: pacman -S mingw-w64-x86_64-toolchain)
+cargo build --release
+```
+
+macOS and Linux build natively (clang / gcc) with no extra setup. Cross-building the
+Windows + Linux binaries from a Mac is scripted in `scripts/build-cli-dist.sh`.
+
 ---
 
 ## Three ways to use it
