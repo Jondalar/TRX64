@@ -7292,6 +7292,8 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 Some(p) => p.to_string(),
                 None => return Response::err(id, -32602, "session/load_prg: prg_path required"),
             };
+            // Resolve relative to the cockpit `cd` cwd (same as media/mount).
+            let prg_path = { let st = state.lock().unwrap(); resolve_fs_path_with_state(&st, &prg_path) };
             let bytes = match std::fs::read(&prg_path) {
                 Ok(b) => b,
                 Err(e) => return Response::err(id, -32602, format!("session/load_prg: read {prg_path}: {e}")),
@@ -7791,6 +7793,8 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                     Err(e) => return Response::err(id, -32602, format!("runtime/run_prg: base64 decode error: {e}")),
                 }
             } else if let Some(path) = prg_path {
+                // Resolve relative to the cockpit `cd` cwd (same as media/mount).
+                let path = { let st = state.lock().unwrap(); resolve_fs_path_with_state(&st, &path) };
                 match std::fs::read(&path) {
                     Ok(b) => b,
                     Err(e) => return Response::err(id, -32602, format!("runtime/run_prg: file read error: {e}")),
@@ -8813,6 +8817,9 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 Some(p) => p.to_string(),
                 None => return Response::err(id, -32602, "media/mount: missing path"),
             };
+            // Resolve relative to the cockpit `cd` cwd (BUG: `/mount foo.crt` after `cd out`
+            // read foo.crt relative to the process cwd → "No such file"; now reads .../out/foo.crt).
+            let path_str = { let st = state.lock().unwrap(); resolve_fs_path_with_state(&st, &path_str) };
 
             let bytes = match std::fs::read(&path_str) {
                 Ok(b) => b,
@@ -8965,6 +8972,8 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 Some(p) => p.to_string(),
                 None => return Response::err(id, -32602, "media/swap: missing path"),
             };
+            // Resolve relative to the cockpit `cd` cwd (same as media/mount).
+            let path_str = { let st = state.lock().unwrap(); resolve_fs_path_with_state(&st, &path_str) };
 
             let bytes = match std::fs::read(&path_str) {
                 Ok(b) => b,
@@ -11457,6 +11466,29 @@ fn non_persistable_dirty_media(st: &State) -> Option<String> {
         );
     }
     None
+}
+
+/// Resolve a user file path the way the monitor FILE shell does (resolveFsPath):
+/// absolute → unchanged; relative → joined to the session cwd (`cd`) or the project
+/// dir when unset. Lets `/mount foo.crt` after `cd out` read .../out/foo.crt instead
+/// of the daemon's process cwd (the cockpit `cd` sets `st.mon.fs_cwd`).
+fn resolve_fs_path_with_state(st: &State, arg: &str) -> String {
+    if arg.is_empty() || std::path::Path::new(arg).is_absolute() {
+        return arg.to_string();
+    }
+    let cwd = st.mon.fs_cwd.clone().unwrap_or_else(|| {
+        std::env::args()
+            .skip_while(|a| a != "--project")
+            .nth(1)
+            .filter(|p| !p.is_empty())
+            .or_else(|| std::env::var("C64RE_PROJECT_DIR").ok())
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            })
+    });
+    std::path::Path::new(&cwd).join(arg).to_string_lossy().to_string()
 }
 
 /// BUG-023-cart / Spec 742 — host-file write-back for a writable cartridge on
