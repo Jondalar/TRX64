@@ -65,6 +65,9 @@ fn restore_terminal(term: &mut Term) -> io::Result<()> {
 
 struct Cockpit {
     input: String,
+    /// Cursor as a CHAR index into `input` (0..=char_count) — drives left/right/
+    /// home/end navigation + cursor-aware insert/backspace/delete (was append-only).
+    cursor: usize,
     log: Vec<String>,
     history: Vec<String>,
     hist_idx: Option<usize>,
@@ -79,6 +82,7 @@ impl Cockpit {
         Self {
             scroll: 0,
             input: String::new(),
+            cursor: 0,
             log: vec![
                 "████████╗ ██████╗  ██╗  ██╗  ██████╗  ██╗  ██╗".into(),
                 "╚══██╔══╝ ██╔══██╗ ╚██╗██╔╝ ██╔════╝  ██║  ██║".into(),
@@ -95,6 +99,41 @@ impl Cockpit {
             hist_idx: None,
             snap: StateSnapshot::default(),
         }
+    }
+
+    // ── command-line editing (char-safe: cursor is a char index) ───────────────
+    fn line_char_len(&self) -> usize {
+        self.input.chars().count()
+    }
+    fn byte_at(&self, char_idx: usize) -> usize {
+        self.input
+            .char_indices()
+            .nth(char_idx)
+            .map(|(b, _)| b)
+            .unwrap_or(self.input.len())
+    }
+    fn insert_char(&mut self, c: char) {
+        let b = self.byte_at(self.cursor);
+        self.input.insert(b, c);
+        self.cursor += 1;
+    }
+    fn backspace(&mut self) {
+        if self.cursor > 0 {
+            let b = self.byte_at(self.cursor - 1);
+            self.input.remove(b);
+            self.cursor -= 1;
+        }
+    }
+    fn delete_at(&mut self) {
+        if self.cursor < self.line_char_len() {
+            let b = self.byte_at(self.cursor);
+            self.input.remove(b);
+        }
+    }
+    /// Replace the whole line (history recall / clear) and park the cursor at the end.
+    fn set_line(&mut self, s: String) {
+        self.cursor = s.chars().count();
+        self.input = s;
     }
 
     fn push_log(&mut self, text: &str) {
@@ -156,13 +195,29 @@ fn run_loop(term: &mut Term, engine: &Engine, to_main: &Sender<UiToMain>) -> io:
                             if let Some(msg) = autocomplete(&mut cp.input) {
                                 cp.push_log(&msg);
                             }
+                            cp.cursor = cp.line_char_len();
                         }
                         XKeyCode::Char(c) => {
-                            cp.input.push(c);
+                            cp.insert_char(c);
                             cp.hist_idx = None;
                         }
                         XKeyCode::Backspace => {
-                            cp.input.pop();
+                            cp.backspace();
+                        }
+                        XKeyCode::Delete => {
+                            cp.delete_at();
+                        }
+                        XKeyCode::Left => {
+                            cp.cursor = cp.cursor.saturating_sub(1);
+                        }
+                        XKeyCode::Right => {
+                            cp.cursor = (cp.cursor + 1).min(cp.line_char_len());
+                        }
+                        XKeyCode::Home => {
+                            cp.cursor = 0;
+                        }
+                        XKeyCode::End => {
+                            cp.cursor = cp.line_char_len();
                         }
                         XKeyCode::Up => {
                             if !cp.history.is_empty() {
@@ -172,23 +227,23 @@ fn run_loop(term: &mut Term, engine: &Engine, to_main: &Sender<UiToMain>) -> io:
                                     Some(i) => i - 1,
                                 };
                                 cp.hist_idx = Some(i);
-                                cp.input = cp.history[i].clone();
+                                cp.set_line(cp.history[i].clone());
                             }
                         }
                         XKeyCode::Down => {
                             if let Some(i) = cp.hist_idx {
                                 if i + 1 < cp.history.len() {
                                     cp.hist_idx = Some(i + 1);
-                                    cp.input = cp.history[i + 1].clone();
+                                    cp.set_line(cp.history[i + 1].clone());
                                 } else {
                                     cp.hist_idx = None;
-                                    cp.input.clear();
+                                    cp.set_line(String::new());
                                 }
                             }
                         }
                         XKeyCode::Enter => {
                             let line = cp.input.trim().to_string();
-                            cp.input.clear();
+                            cp.set_line(String::new());
                             cp.hist_idx = None;
                             if line.is_empty() {
                                 continue;
@@ -408,10 +463,21 @@ fn draw_log(f: &mut Frame, area: Rect, cp: &Cockpit) {
 }
 
 fn draw_input(f: &mut Frame, area: Rect, cp: &Cockpit) {
+    // Block cursor AT the char index (reverse-video over the char under it; a green
+    // block past the end) so the cursor can sit mid-string for left/right editing.
+    let chars: Vec<char> = cp.input.chars().collect();
+    let cur = cp.cursor.min(chars.len());
+    let before: String = chars[..cur].iter().collect();
+    let (under, after): (String, String) = if cur < chars.len() {
+        (chars[cur].to_string(), chars[cur + 1..].iter().collect())
+    } else {
+        (" ".to_string(), String::new())
+    };
     let line = Line::from(vec![
         Span::styled("> ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-        Span::raw(cp.input.clone()),
-        Span::styled("█", Style::default().fg(Color::Green)),
+        Span::raw(before),
+        Span::styled(under, Style::default().fg(Color::Green).add_modifier(Modifier::REVERSED)),
+        Span::raw(after),
     ]);
     f.render_widget(
         Paragraph::new(line).block(Block::default().borders(Borders::ALL).title(" command ")),
@@ -426,6 +492,41 @@ fn panel<'a>(lines: Vec<Line<'a>>, title: &'a str) -> Paragraph<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_editor_cursor_insert_backspace_delete() {
+        let mut cp = Cockpit::new();
+        for c in "abc".chars() {
+            cp.insert_char(c);
+        }
+        assert_eq!(cp.input, "abc");
+        assert_eq!(cp.cursor, 3);
+        // mid-string insert: a|bc → aX|bc
+        cp.cursor = 1;
+        cp.insert_char('X');
+        assert_eq!(cp.input, "aXbc");
+        assert_eq!(cp.cursor, 2);
+        // backspace removes the char BEFORE the cursor: aX|bc → a|bc
+        cp.backspace();
+        assert_eq!(cp.input, "abc");
+        assert_eq!(cp.cursor, 1);
+        // delete removes the char AT the cursor: a|bc → a|c
+        cp.delete_at();
+        assert_eq!(cp.input, "ac");
+        assert_eq!(cp.cursor, 1);
+        // navigation clamps; set_line parks the cursor at the end.
+        cp.cursor = 99;
+        cp.cursor = cp.cursor.min(cp.line_char_len());
+        assert_eq!(cp.cursor, 2);
+        cp.set_line("hello".into());
+        assert_eq!((cp.input.as_str(), cp.cursor), ("hello", 5));
+        // backspace/delete at the edges are no-ops, not panics.
+        cp.cursor = 0;
+        cp.backspace();
+        cp.cursor = cp.line_char_len();
+        cp.delete_at();
+        assert_eq!(cp.input, "hello");
+    }
 
     #[test]
     fn autocomplete_single_completes_with_space() {
