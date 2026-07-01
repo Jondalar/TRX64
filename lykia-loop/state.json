@@ -1,0 +1,39 @@
+{
+  "loop": "lykia-megabyter-cpu-divergence",
+  "goal": "Lykia (MegaByter cart) crashes to PC=$0002 in TRX64 but runs in the C64RE TS oracle. Find + fix the TRX64 CPU-core (or memory-read) divergence via a TS<->TRX64 first-divergence trace.",
+  "charter": "lykia-loop/CHARTER.md",
+  "repo": "/Users/alex/Development/C64/Tools/TRX64",
+  "branch": "main",
+  "loop_status": "PARKED",
+  "start_when": "CLI-feel loop DONE and Alex gives the go",
+  "created": "2026-07-01",
+  "oracle": "C64RE TypeScript runtime (runs Lykia fully); TRX64 Rust is the one that crashes",
+  "repro": {
+    "cart_rebuilt": "/Users/alex/Development/C64/Cracking/Lykia/build/out/lykia_rebuilt.crt",
+    "cart_original": "/Users/alex/Development/C64/Cracking/Lykia/INPUT/lykia_protovision.crt",
+    "cart_sample": "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/lykia_MEGABYTER.crt",
+    "anchor_pc": "$8009",
+    "raster_sync_pc": "$82D3",
+    "crash_pc": "$0002",
+    "good_result": "boots to Lykia / Play / Prologue menu (TS)"
+  },
+  "ruled_out": [
+    "MegaByter cart layer (cart.rs:1264) — 1:1 port of cartridge.ts:1060, read-diffed",
+    "bus $8000 RAM-fallthrough (full.rs:707), PLA reconfig on $DE02, build_linear_chip_data",
+    "MegaByter banking (probe-713-devcore green; register_02/current_bank stay 0 at crash)"
+  ],
+  "scope_files": [
+    "crates/trx64-core/src/cpu.rs",
+    "crates/trx64-core/src/c64_6510core.rs",
+    "crates/trx64-core/src/full.rs (only if divergence is a READ)"
+  ],
+  "out_of_scope": ["drive_6510core.rs (1541 CPU)", "cart layer", "C64RE/UI/MCP"],
+  "tasks": [
+    { "id": "P0", "title": "deterministic repro on BOTH (separate backends): TS reaches menu, TRX64 crashes to $0002; anchor at $8009", "status": "todo" },
+    { "id": "P1", "title": "backward crash-triage in TRX64 (triage/whowrote/chis/rstep) -> bound the [last-good..crash] window", "status": "todo" },
+    { "id": "P2", "title": "forward differential trace TS<->TRX64 into DuckDB (PC+regs+reads), align past raster-sync, report FIRST divergence + ~20 events", "status": "todo" },
+    { "id": "P3", "title": "classify A(opcode/flow) vs B(read); read TS Cpu65xxVice vs Rust cpu.rs for the localized element; walk the 10 conversion-bug families", "status": "todo" },
+    { "id": "P4", "title": "fix root cause + TS<->Rust diff-test + re-trace shows convergence + Lykia boots to menu in TRX64", "status": "todo" },
+    { "id": "P5", "title": "regression: lykianew logo, 4 cart families boot, probe-713-devcore + CPU diff-tests green", "status": "todo" }
+  ]
+}
