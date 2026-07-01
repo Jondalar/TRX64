@@ -50,8 +50,8 @@
       "title": "Tab autocomplete rewrite: 3 namespaces + path-complete via fs/complete + colored list",
       "files": ["crates/trx64-cli/src/tui.rs"],
       "deps": ["S1", "S2", "S3"],
-      "status": "todo",
-      "notes": ""
+      "status": "done",
+      "notes": "450e376 — namespace-aware Tab (plan_complete: /VM, !FS, bare-monitor verb sets), path verbs complete last token via fs/complete rpc, ambiguous prefixes print ftcolor-styled candidate list; cargo test -p trx64-cli 49/49 green"
     },
     {
       "id": "S6",
