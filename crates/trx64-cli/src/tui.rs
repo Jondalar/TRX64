@@ -40,6 +40,22 @@ pub enum UiToMain {
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
+/// One line in the OUTPUT/LOG pane. `style`, when set, overrides the draw-time content
+/// heuristic (banner / `> ` echo) — used by `!ls` filetype coloring (S4) and, later,
+/// the colored Tab candidate lists (S5). Plain lines carry `style: None` and keep the
+/// existing content-based styling in [`draw_log`].
+#[derive(Debug, Clone, PartialEq)]
+struct LogLine {
+    text: String,
+    style: Option<Style>,
+}
+
+impl From<&str> for LogLine {
+    fn from(s: &str) -> Self {
+        LogLine { text: s.to_string(), style: None }
+    }
+}
+
 /// Run the cockpit to completion (blocks the calling thread). `to_main` carries the
 /// window/quit signals to the main thread.
 pub fn run(engine: Engine, to_main: Sender<UiToMain>) -> io::Result<()> {
@@ -68,7 +84,7 @@ struct Cockpit {
     /// Cursor as a CHAR index into `input` (0..=char_count) — drives left/right/
     /// home/end navigation + cursor-aware insert/backspace/delete (was append-only).
     cursor: usize,
-    log: Vec<String>,
+    log: Vec<LogLine>,
     history: Vec<String>,
     hist_idx: Option<usize>,
     snap: StateSnapshot,
@@ -90,10 +106,10 @@ impl Cockpit {
                 "   ██║    ██╔══██╗  ██╔██╗  ██╔═══██╗ ╚════██║".into(),
                 "   ██║    ██║  ██║ ██╔╝ ██╗ ╚██████╔╝      ██║".into(),
                 "   ╚═╝    ╚═╝  ╚═╝ ╚═╝  ╚═╝  ╚═════╝       ╚═╝".into(),
-                String::new(),
+                "".into(),
                 "powered on + running · a bare line → monitor (d/m/r/bk/g/trace) · /help · /quit"
                     .into(),
-                String::new(),
+                "".into(),
             ],
             history: Vec::new(),
             hist_idx: None,
@@ -138,10 +154,22 @@ impl Cockpit {
 
     fn push_log(&mut self, text: &str) {
         for line in text.split('\n') {
-            self.log.push(line.to_string());
+            self.log.push(LogLine::from(line));
         }
+        self.trim_log();
+    }
+
+    /// Push already-styled lines (e.g. `!ls` filetype coloring, S4). Same tail-snap +
+    /// bound as [`push_log`], but each line carries its own [`Style`].
+    fn push_log_styled(&mut self, lines: Vec<LogLine>) {
+        self.log.extend(lines);
+        self.trim_log();
+    }
+
+    /// Snap the view to the tail and bound the log so it doesn't grow unbounded over a
+    /// long session. Shared by [`push_log`] + [`push_log_styled`].
+    fn trim_log(&mut self) {
         self.scroll = 0; // new output → snap to the tail
-        // Bound the log so it doesn't grow unbounded over a long session.
         const MAX: usize = 5000;
         if self.log.len() > MAX {
             let drop = self.log.len() - MAX;
@@ -252,7 +280,12 @@ fn run_loop(term: &mut Term, engine: &Engine, to_main: &Sender<UiToMain>) -> io:
                             cp.push_log(&format!("> {line}"));
                             let r = engine.exec_line(&line);
                             if !r.output.is_empty() {
-                                cp.push_log(&r.output);
+                                // S4: `!ls`/`!dir` output is filetype-colored per entry;
+                                // every other command's output logs verbatim.
+                                match ls_styled_lines(&line, &r.output) {
+                                    Some(styled) => cp.push_log_styled(styled),
+                                    None => cp.push_log(&r.output),
+                                }
                             }
                             if r.open_window {
                                 let _ = to_main.send(UiToMain::OpenWindow);
@@ -301,6 +334,44 @@ fn autocomplete(input: &mut String) -> Option<String> {
             ))
         }
     }
+}
+
+/// The filetype [`Style`] for a single `ls`/`dir` entry line. The daemon FS format is
+/// `"  {d|-} {name}"` (main.rs ls verb): a two-space indent, a `d`/`-` dir flag, a
+/// space, then the name. Returns `None` for the `"{dir}:"` header, the `"  (empty)"`
+/// sentinel, and anything that doesn't match the entry shape — those stay plain.
+fn ls_entry_style(line: &str) -> Option<Style> {
+    let rest = line.strip_prefix("  ")?;
+    let bytes = rest.as_bytes();
+    let is_dir = match bytes.first()? {
+        b'd' => true,
+        b'-' => false,
+        _ => return None, // header path / "(empty)" / anything else → plain
+    };
+    if bytes.get(1) != Some(&b' ') {
+        return None;
+    }
+    // Bytes 0 (flag) + 1 (space) are ASCII, so slicing at 2 is a valid char boundary.
+    let name = &rest[2..];
+    Some(crate::ftcolor::style_for(name, is_dir))
+}
+
+/// If `line` is an `!ls`/`!dir` cockpit command, split its `output` into per-line
+/// [`LogLine`]s with filetype coloring (entries via [`ls_entry_style`]; header +
+/// `(empty)` sentinel left plain). Returns `None` for any other command so its output
+/// is logged verbatim. Pure — no I/O, so the routing is unit-testable.
+fn ls_styled_lines(line: &str, output: &str) -> Option<Vec<LogLine>> {
+    let fs = line.strip_prefix('!')?.trim_start();
+    let verb = fs.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    if verb != "ls" && verb != "dir" {
+        return None;
+    }
+    Some(
+        output
+            .split('\n')
+            .map(|l| LogLine { text: l.to_string(), style: ls_entry_style(l) })
+            .collect(),
+    )
 }
 
 fn longest_common_prefix(items: &[&str]) -> String {
@@ -435,16 +506,19 @@ fn draw_log(f: &mut Frame, area: Rect, cp: &Cockpit) {
     let lines: Vec<Line> = cp.log[start..end]
         .iter()
         .map(|l| {
-            if l.starts_with("> ") {
-                Line::from(Span::styled(l.clone(), Style::default().fg(Color::Green)))
-            } else if l.contains('█') {
+            if let Some(style) = l.style {
+                // Pre-styled line (e.g. `!ls` filetype coloring, S4).
+                Line::from(Span::styled(l.text.clone(), style))
+            } else if l.text.starts_with("> ") {
+                Line::from(Span::styled(l.text.clone(), Style::default().fg(Color::Green)))
+            } else if l.text.contains('█') {
                 // The TRX64 startup banner.
                 Line::from(Span::styled(
-                    l.clone(),
+                    l.text.clone(),
                     Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
                 ))
             } else {
-                Line::from(Span::raw(l.clone()))
+                Line::from(Span::raw(l.text.clone()))
             }
         })
         .collect();
@@ -549,5 +623,77 @@ mod tests {
         let mut s = "d c000".to_string();
         assert_eq!(autocomplete(&mut s), None);
         assert_eq!(s, "d c000");
+    }
+
+    // ── S4: !ls filetype coloring ─────────────────────────────────────────────
+
+    #[test]
+    fn ls_output_is_filetype_colored_by_flag_column() {
+        // The daemon ls verb format: "{dir}:" header + "  {d|-} {name}" per entry.
+        let output = "/games:\n  d subdir\n  - game.crt\n  - disk.d64\n  - loader.prg\n  - notes.md\n  - readme";
+        let styled = ls_styled_lines("!ls", output).expect("!ls output is colored");
+        // header stays plain
+        assert_eq!(styled[0].text, "/games:");
+        assert_eq!(styled[0].style, None);
+        // dir-ness comes from the `d|-` column, not the name's extension
+        assert_eq!(styled[1].style, Some(crate::ftcolor::style_for("subdir", true)));
+        assert_eq!(styled[2].style, Some(crate::ftcolor::style_for("game.crt", false)));
+        assert_eq!(styled[3].style, Some(crate::ftcolor::style_for("disk.d64", false)));
+        assert_eq!(styled[4].style, Some(crate::ftcolor::style_for("loader.prg", false)));
+        assert_eq!(styled[5].style, Some(crate::ftcolor::style_for("notes.md", false)));
+        // no-extension file → default (Other) style, still Some (colored path taken)
+        assert_eq!(styled[6].style, Some(crate::ftcolor::style_for("readme", false)));
+        // the displayed text is preserved verbatim (flag column + name)
+        assert_eq!(styled[2].text, "  - game.crt");
+    }
+
+    #[test]
+    fn ls_header_and_empty_sentinel_stay_plain() {
+        let styled = ls_styled_lines("!ls", "/empty:\n  (empty)").expect("colored");
+        assert_eq!(styled[0].style, None); // "{dir}:" header
+        assert_eq!(styled[1].style, None); // "  (empty)" sentinel
+    }
+
+    #[test]
+    fn ls_dir_alias_and_arg_are_colored() {
+        // `!dir` alias + an explicit path arg both take the coloring path.
+        let styled = ls_styled_lines("!dir sub", "/root/sub:\n  - a.d64").expect("!dir colored");
+        assert_eq!(styled[1].style, Some(crate::ftcolor::style_for("a.d64", false)));
+    }
+
+    #[test]
+    fn non_ls_commands_are_not_colored() {
+        // bare monitor command
+        assert_eq!(ls_styled_lines("d c000", "c000: ..."), None);
+        // another FS verb behind `!`
+        assert_eq!(ls_styled_lines("!pwd", "/home"), None);
+        // VM command
+        assert_eq!(ls_styled_lines("/mount foo.crt", "mounted"), None);
+        // a bare `ls` is a cockpit nudge, not the `!` routing layer → not colored here
+        assert_eq!(ls_styled_lines("ls", "  - x.crt"), None);
+    }
+
+    #[test]
+    fn ls_entry_style_rejects_malformed_lines() {
+        assert_eq!(ls_entry_style("no-indent"), None); // missing 2-space indent
+        assert_eq!(ls_entry_style("  x foo"), None); // flag col isn't d/-
+        assert_eq!(ls_entry_style("  d"), None); // no separator space after the flag
+        assert_eq!(ls_entry_style("  (empty)"), None); // the empty sentinel
+        assert_eq!(ls_entry_style("  - a.crt"), Some(crate::ftcolor::style_for("a.crt", false)));
+        assert_eq!(ls_entry_style("  d sub"), Some(crate::ftcolor::style_for("sub", true)));
+    }
+
+    #[test]
+    fn push_log_styled_appends_and_snaps_to_tail() {
+        let mut cp = Cockpit::new();
+        cp.scroll = 5;
+        let before = cp.log.len();
+        cp.push_log_styled(vec![LogLine {
+            text: "  - x.crt".into(),
+            style: Some(crate::ftcolor::style_for("x.crt", false)),
+        }]);
+        assert_eq!(cp.log.len(), before + 1);
+        assert_eq!(cp.log.last().unwrap().style, Some(crate::ftcolor::style_for("x.crt", false)));
+        assert_eq!(cp.scroll, 0); // new output snaps back to the live tail
     }
 }
