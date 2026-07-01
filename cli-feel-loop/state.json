@@ -18,8 +18,8 @@
       "title": "! namespace + verb aliases (umount/undump/settings) + help",
       "files": ["crates/trx64-cli/src/engine.rs"],
       "deps": [],
-      "status": "todo",
-      "notes": ""
+      "status": "done",
+      "notes": "f8994c3 — ! FS namespace + bare-verb nudge, /umount /undump /settings aliases, help/fs_help; tests/namespaces.rs; 20/20 green"
     },
     {
       "id": "S2",

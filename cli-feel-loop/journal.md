@@ -9,3 +9,4 @@
   readline muscles, + verify the cockpit pump resumes after a CRT power-cycle mount.
 - Infra written: SPEC.md (9 slices, file:line anchored), state.json, MASTER_PROMPT.md,
   AGENTS.md. Implementation workflow kicking off next; 15-min loop armed after.
+- S1: `!` FS namespace + bare-verb nudge, /umount /undump /settings aliases, cockpit+FS help — f8994c3 — green
