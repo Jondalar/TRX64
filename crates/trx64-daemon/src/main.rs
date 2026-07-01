@@ -7583,6 +7583,67 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             }
         }
 
+        // CLI-FEEL S3 — Tab path-completion backend for the trx64cli cockpit. This is
+        // a COCKPIT convenience rpc; it does NOT touch the shared monitor FS verbs
+        // (pwd/cd/ls/… in run_monitor stay bare-callable). Resolve `partial` against
+        // the cockpit `cd` cwd with the SAME rules the FS verbs / media mount use
+        // (resolve_fs_path_with_state), split it into (dir, stem), list `dir`, and
+        // return the entries whose name starts with `stem` (case-insensitive) plus
+        // the longest common prefix of the matches so the client can fill the shared
+        // stem. Trailing `/` lists a directory's contents (empty stem); no arg lists
+        // the cwd. Errors are SOFT → empty entries (Tab must never surface an error).
+        // Cap 500, matching the `ls` verb.
+        "fs/complete" => {
+            let partial = req
+                .params
+                .get("partial")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            // Split at the LAST '/': everything up to & including it is the directory
+            // part, the rest is the stem being completed. No slash → complete inside
+            // the cwd (dir_part = "").
+            let (dir_part, stem) = match partial.rfind('/') {
+                Some(i) => (&partial[..=i], &partial[i + 1..]),
+                None => ("", partial.as_str()),
+            };
+            // Empty dir_part → the cwd (resolve "." against it). An absolute or
+            // relative dir_part resolves exactly like the FS verbs do.
+            let dir_arg = if dir_part.is_empty() { "." } else { dir_part };
+            let resolved_dir = {
+                let st = state.lock().unwrap();
+                resolve_fs_path_with_state(&st, dir_arg)
+            };
+            let stem_lc = stem.to_lowercase();
+            let mut ents: Vec<(bool, String)> = match std::fs::read_dir(&resolved_dir) {
+                Ok(rd) => rd
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        if stem_lc.is_empty() || name.to_lowercase().starts_with(&stem_lc) {
+                            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                            Some((is_dir, name))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+                // Soft error (missing dir / permission): Tab returns an empty set.
+                Err(_) => Vec::new(),
+            };
+            ents.sort_by(|a, b| a.1.cmp(&b.1));
+            ents.truncate(500);
+            let common = fs_longest_common_prefix(ents.iter().map(|(_, n)| n.as_str()));
+            let entries: Vec<Value> = ents
+                .iter()
+                .map(|(is_dir, name)| json!({ "name": name, "is_dir": is_dir }))
+                .collect();
+            Response::ok(
+                id,
+                json!({ "entries": entries, "common": common, "dir": resolved_dir }),
+            )
+        }
+
         // ── debug/* ──────────────────────────────────────────────────────────
 
         "debug/run" => {
@@ -11491,6 +11552,30 @@ fn resolve_fs_path_with_state(st: &State, arg: &str) -> String {
     std::path::Path::new(&cwd).join(arg).to_string_lossy().to_string()
 }
 
+/// CLI-FEEL S3 — the longest common prefix (by char) of a set of names, used by the
+/// `fs/complete` rpc so the cockpit can fill the shared stem on Tab. Empty when the
+/// set is empty or the names share no leading char; the whole name when there is
+/// exactly one match.
+fn fs_longest_common_prefix<'a>(mut names: impl Iterator<Item = &'a str>) -> String {
+    let first = match names.next() {
+        Some(f) => f,
+        None => return String::new(),
+    };
+    let mut prefix: Vec<char> = first.chars().collect();
+    for name in names {
+        let chars: Vec<char> = name.chars().collect();
+        let mut i = 0;
+        while i < prefix.len() && i < chars.len() && prefix[i] == chars[i] {
+            i += 1;
+        }
+        prefix.truncate(i);
+        if prefix.is_empty() {
+            break;
+        }
+    }
+    prefix.into_iter().collect()
+}
+
 /// BUG-023-cart / Spec 742 — host-file write-back for a writable cartridge on
 /// eject (= the c64re `persistCartridgeToFile`, persist-cartridge.ts:20-30). VICE
 /// saves the `.crt` on detach; the read-only / non-writable / clean / no-path
@@ -13939,6 +14024,98 @@ mod batch1_tests {
             params,
         };
         dispatch(req, state).error.expect("expected an error")
+    }
+
+    #[test]
+    fn fs_longest_common_prefix_cases() {
+        // CLI-FEEL S3 — the stem-fill primitive behind `fs/complete`.
+        assert_eq!(fs_longest_common_prefix(["a.crt", "a2.crt"].into_iter()), "a");
+        assert_eq!(fs_longest_common_prefix(["only.prg"].into_iter()), "only.prg");
+        assert_eq!(fs_longest_common_prefix(["foo", "bar"].into_iter()), "");
+        assert_eq!(fs_longest_common_prefix(std::iter::empty::<&str>()), "");
+        assert_eq!(
+            fs_longest_common_prefix(["load.prg", "loader.prg", "load2.prg"].into_iter()),
+            "load"
+        );
+    }
+
+    #[test]
+    fn fs_complete_lists_matches_common_and_dir() {
+        // CLI-FEEL S3 — the `fs/complete` cockpit Tab backend. Build a temp dir with
+        // `a.crt`, `a2.crt`, and a `sub/` holding `inside.prg`, point the cockpit cwd
+        // at it, and exercise: bare stem (matches + common prefix), trailing-slash
+        // (list a subdir), no-arg (list cwd), and a soft error (missing dir → empty).
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("trx64-fscomplete-{}-{}", std::process::id(), uniq));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("a.crt"), b"").unwrap();
+        std::fs::write(base.join("a2.crt"), b"").unwrap();
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        std::fs::write(base.join("sub").join("inside.prg"), b"").unwrap();
+
+        let st = make_state();
+        st.lock().unwrap().mon.fs_cwd = Some(base.to_string_lossy().to_string());
+
+        // Bare stem "a" → both .crt files, NOT the `sub` dir; common prefix "a".
+        let r = call(&st, "fs/complete", json!({ "partial": "a" }));
+        let names: Vec<String> = r["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&"a.crt".to_string()), "a.crt in {names:?}");
+        assert!(names.contains(&"a2.crt".to_string()), "a2.crt in {names:?}");
+        assert!(!names.contains(&"sub".to_string()), "sub filtered out by stem");
+        assert_eq!(r["common"], "a");
+        // The `.crt` entries are files, not dirs.
+        let a_entry = r["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == "a.crt")
+            .unwrap();
+        assert_eq!(a_entry["is_dir"], false);
+
+        // Trailing slash "sub/" → list the subdir contents.
+        let r2 = call(&st, "fs/complete", json!({ "partial": "sub/" }));
+        let names2: Vec<String> = r2["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names2, vec!["inside.prg".to_string()]);
+        assert_eq!(r2["common"], "inside.prg");
+
+        // No arg → list the whole cwd (files + the sub dir).
+        let r3 = call(&st, "fs/complete", json!({ "partial": "" }));
+        let names3: Vec<String> = r3["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(names3.contains(&"a.crt".to_string()));
+        assert!(names3.contains(&"a2.crt".to_string()));
+        assert!(names3.contains(&"sub".to_string()));
+        let sub_entry = r3["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == "sub")
+            .unwrap();
+        assert_eq!(sub_entry["is_dir"], true);
+
+        // Missing directory → soft error, empty entries (Tab never fails).
+        let r4 = call(&st, "fs/complete", json!({ "partial": "nope-does-not-exist/x" }));
+        assert!(r4["entries"].as_array().unwrap().is_empty());
+        assert_eq!(r4["common"], "");
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
