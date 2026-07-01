@@ -1,0 +1,89 @@
+{
+  "loop": "cli-feel",
+  "goal": "trx64cli cockpit = bash for the emulator: / ! bare namespaces, always Tab-complete (verbs+paths), filetype colors, readline muscles, verified media semantics",
+  "spec": "cli-feel-loop/SPEC.md",
+  "repo": "/Users/alex/Development/C64/Tools/TRX64",
+  "branch": "main",
+  "loop_status": "RUNNING",
+  "created": "2026-07-01",
+  "guardrails": [
+    "never push (commit only)",
+    "never touch C64RE / UI / MCP",
+    "shared monitor FS verbs stay bare-callable; ! is a cockpit routing layer",
+    "each slice must compile + test + self-review before commit; no half-slices"
+  ],
+  "tasks": [
+    {
+      "id": "S1",
+      "title": "! namespace + verb aliases (umount/undump/settings) + help",
+      "files": ["crates/trx64-cli/src/engine.rs"],
+      "deps": [],
+      "status": "todo",
+      "notes": ""
+    },
+    {
+      "id": "S2",
+      "title": "filetype color module ftcolor.rs (pure) + unit tests",
+      "files": ["crates/trx64-cli/src/ftcolor.rs", "crates/trx64-cli/src/lib.rs"],
+      "deps": [],
+      "status": "todo",
+      "notes": ""
+    },
+    {
+      "id": "S3",
+      "title": "fs/complete daemon rpc (resolve vs fs_cwd, quotes/spaces, dir-aware)",
+      "files": ["crates/trx64-daemon/src/main.rs"],
+      "deps": [],
+      "status": "todo",
+      "notes": ""
+    },
+    {
+      "id": "S4",
+      "title": "!ls coloring in cockpit (parse d|- flag, apply ftcolor)",
+      "files": ["crates/trx64-cli/src/tui.rs"],
+      "deps": ["S2"],
+      "status": "todo",
+      "notes": ""
+    },
+    {
+      "id": "S5",
+      "title": "Tab autocomplete rewrite: 3 namespaces + path-complete via fs/complete + colored list",
+      "files": ["crates/trx64-cli/src/tui.rs"],
+      "deps": ["S1", "S2", "S3"],
+      "status": "todo",
+      "notes": ""
+    },
+    {
+      "id": "S6",
+      "title": "readline muscles (Ctrl-A/E/K/U/W/L, Ctrl-C clear-line) + persistent+dedup history",
+      "files": ["crates/trx64-cli/src/tui.rs"],
+      "deps": ["S5"],
+      "status": "todo",
+      "notes": "same file as S4/S5 -> sequence after them"
+    },
+    {
+      "id": "S7",
+      "title": "mount-resume verify + /eject smart target + unify eject RAM semantics",
+      "files": ["crates/trx64-cli/src/engine.rs", "crates/trx64-daemon/src/main.rs"],
+      "deps": ["S1"],
+      "status": "todo",
+      "notes": "semantics already mostly correct; verify cockpit pump resumes after CRT power-cycle"
+    },
+    {
+      "id": "S8",
+      "title": "docs: MONITOR.md namespaces + cockpit README + help agree",
+      "files": ["MONITOR.md", "crates/trx64-cli/README.md"],
+      "deps": ["S1", "S5", "S7"],
+      "status": "todo",
+      "notes": ""
+    },
+    {
+      "id": "S9",
+      "title": "final gate: release build (update symlink) + full tests + TEST-CHECKLIST.md",
+      "files": ["cli-feel-loop/TEST-CHECKLIST.md"],
+      "deps": ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8"],
+      "status": "todo",
+      "notes": ""
+    }
+  ]
+}
