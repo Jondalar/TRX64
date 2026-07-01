@@ -16,3 +16,4 @@
 - S4: !ls/!dir output filetype-colored in cockpit (LogLine style + ls_styled_lines/ls_entry_style, ftcolor palette) — c000533 — green
 - S5: namespace-aware Tab autocomplete (plan_complete: /VM + !FS + bare-monitor verb sets, path verbs via fs/complete rpc, ftcolor candidate list) — 450e376 — green
 - S6: readline muscles (Ctrl-A/E/K/U/W/L + Ctrl-C clear-line) + persistent, deduped, capped $HOME/.trx64/history (atomic compaction) — 7a3255d — green
+- S8: docs — MONITOR.md 3-namespace + bare-callable caveat, README namespaces/media/colors/readline, help_text real Tab promise, tests/docs_agree.rs agreement guard — 9681bbd — green

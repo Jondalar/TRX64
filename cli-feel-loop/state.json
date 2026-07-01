@@ -74,8 +74,8 @@
       "title": "docs: MONITOR.md namespaces + cockpit README + help agree",
       "files": ["MONITOR.md", "crates/trx64-cli/README.md"],
       "deps": ["S1", "S5", "S7"],
-      "status": "todo",
-      "notes": ""
+      "status": "done",
+      "notes": "9681bbd — MONITOR.md 3-namespace + bare-callable caveat, README namespaces/! table/media/colors/readline, help_text() real verb+path Tab promise, tests/docs_agree.rs pins help/README/MONITOR agreement; cargo test -p trx64-cli 64/64 green"
     },
     {
       "id": "S9",
