@@ -12,6 +12,7 @@
 //! is delivered to the main thread over an mpsc channel (winit's EventLoop must own
 //! the main thread on macOS); everything else is handled inline.
 
+use std::cell::Cell;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
@@ -62,11 +63,33 @@ const HIST_FILE_SLACK: usize = 256;
 struct LogLine {
     text: String,
     style: Option<Style>,
+    /// When set, the line renders from these per-span (text, style) pairs instead of the
+    /// single `text`+`style` pair — used by the structured help formatter (S10) to color
+    /// the verb column green while the description stays default-fg on the SAME physical
+    /// line (a single `Style` can't do that). `text` mirrors the plain concatenation so
+    /// width math + tests still see the visible content.
+    spans: Option<Vec<(String, Style)>>,
+}
+
+impl LogLine {
+    /// A plain, unstyled line (draw-time content heuristic decides its color).
+    fn plain(text: impl Into<String>) -> Self {
+        LogLine { text: text.into(), style: None, spans: None }
+    }
+    /// A single-style line.
+    fn styled(text: impl Into<String>, style: Style) -> Self {
+        LogLine { text: text.into(), style: Some(style), spans: None }
+    }
+    /// A multi-span line; `text` is derived from the span texts for width math + tests.
+    fn from_spans(spans: Vec<(String, Style)>) -> Self {
+        let text: String = spans.iter().map(|(t, _)| t.as_str()).collect();
+        LogLine { text, style: None, spans: Some(spans) }
+    }
 }
 
 impl From<&str> for LogLine {
     fn from(s: &str) -> Self {
-        LogLine { text: s.to_string(), style: None }
+        LogLine { text: s.to_string(), style: None, spans: None }
     }
 }
 
@@ -109,6 +132,11 @@ struct Cockpit {
     /// Lines scrolled UP from the bottom of the log (0 = pinned to the tail). Mouse
     /// wheel adjusts it; any new output snaps back to 0.
     scroll: usize,
+    /// The OUTPUT/LOG pane's INNER width (border-subtracted) from the last [`draw_log`].
+    /// The Enter handler reads it to render structured `help` output to the exact pane
+    /// width. `Cell` so `draw_log` (which holds `&Cockpit`) can record it. `0` until the
+    /// first draw — `format_help_lines` clamps a 0/tiny width to a usable minimum.
+    log_inner_width: Cell<usize>,
 }
 
 impl Cockpit {
@@ -133,6 +161,7 @@ impl Cockpit {
             hist_idx: None,
             hist_path: None,
             snap: StateSnapshot::default(),
+            log_inner_width: Cell::new(0),
         }
     }
 
@@ -469,11 +498,24 @@ fn run_loop(term: &mut Term, engine: &Engine, to_main: &Sender<UiToMain>) -> io:
                             cp.push_log(&format!("> {line}"));
                             let r = engine.exec_line(&line);
                             if !r.output.is_empty() {
-                                // S4: `!ls`/`!dir` output is filetype-colored per entry;
-                                // every other command's output logs verbatim.
-                                match ls_styled_lines(&line, &r.output) {
-                                    Some(styled) => cp.push_log_styled(styled),
-                                    None => cp.push_log(&r.output),
+                                // S10: every help variant is re-rendered structured
+                                // (colored headers, aligned verb column, hanging-indent-
+                                // wrapped descriptions) to the pane width via
+                                // `format_help_lines`. `help`/`?`/`!help` return the
+                                // daemon's VICE-superset monitor reference
+                                // (`monitor_help_text`, main.rs); `/help` returns the CLI's
+                                // OWN cockpit help (`engine::help_text`) — a different,
+                                // shorter text the monitor-tuned formatter still renders
+                                // acceptably. S4: `!ls`/`!dir` output is filetype-colored
+                                // per entry; every other command's output logs verbatim.
+                                if is_help_command(&line) {
+                                    let width = cp.log_inner_width.get();
+                                    cp.push_log_styled(format_help_lines(&r.output, width));
+                                } else {
+                                    match ls_styled_lines(&line, &r.output) {
+                                        Some(styled) => cp.push_log_styled(styled),
+                                        None => cp.push_log(&r.output),
+                                    }
                                 }
                             }
                             if r.open_window {
@@ -725,7 +767,7 @@ fn candidate_log_lines(entries: &[Value]) -> Vec<LogLine> {
             let name = e.get("name").and_then(|n| n.as_str()).unwrap_or("");
             let is_dir = e.get("is_dir").and_then(|d| d.as_bool()).unwrap_or(false);
             let text = if is_dir { format!("  {name}/") } else { format!("  {name}") };
-            LogLine { text, style: Some(crate::ftcolor::style_for(name, is_dir)) }
+            LogLine { text, style: Some(crate::ftcolor::style_for(name, is_dir)), spans: None }
         })
         .collect();
     if entries.len() > CAP {
@@ -767,7 +809,7 @@ fn ls_styled_lines(line: &str, output: &str) -> Option<Vec<LogLine>> {
     Some(
         output
             .split('\n')
-            .map(|l| LogLine { text: l.to_string(), style: ls_entry_style(l) })
+            .map(|l| LogLine { text: l.to_string(), style: ls_entry_style(l), spans: None })
             .collect(),
     )
 }
@@ -896,6 +938,9 @@ fn draw_flow(f: &mut Frame, area: Rect, s: &StateSnapshot) {
 
 fn draw_log(f: &mut Frame, area: Rect, cp: &Cockpit) {
     let inner_h = area.height.saturating_sub(2) as usize;
+    // Record the inner (border-subtracted) width so the Enter handler can width-wrap
+    // structured `help` output to exactly what this pane renders (S10).
+    cp.log_inner_width.set(area.width.saturating_sub(2) as usize);
     // Scroll: `cp.scroll` lines up from the tail, clamped so the window stays in range.
     let max_scroll = cp.log.len().saturating_sub(inner_h);
     let scroll = cp.scroll.min(max_scroll);
@@ -904,7 +949,12 @@ fn draw_log(f: &mut Frame, area: Rect, cp: &Cockpit) {
     let lines: Vec<Line> = cp.log[start..end]
         .iter()
         .map(|l| {
-            if let Some(style) = l.style {
+            if let Some(spans) = &l.spans {
+                // Multi-span line (e.g. structured `help`: green verb + default desc, S10).
+                Line::from(
+                    spans.iter().map(|(t, s)| Span::styled(t.clone(), *s)).collect::<Vec<_>>(),
+                )
+            } else if let Some(style) = l.style {
                 // Pre-styled line (e.g. `!ls` filetype coloring, S4).
                 Line::from(Span::styled(l.text.clone(), style))
             } else if l.text.starts_with("> ") {
@@ -959,6 +1009,296 @@ fn draw_input(f: &mut Frame, area: Rect, cp: &Cockpit) {
 
 fn panel<'a>(lines: Vec<Line<'a>>, title: &'a str) -> Paragraph<'a> {
     Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(format!(" {title} ")))
+}
+
+// ── S10: structured, colored, width-aware INLINE help rendering ─────────────────
+//
+// The bare `help` verb (and its `?`/`!help` aliases) returns the big VICE-superset monitor
+// reference — dozens of `verb  description` rows organised under section headers. (`/help`
+// is the ONE exception: it returns the CLI's own, shorter cockpit help — `engine::help_text`
+// — not the monitor reference; it still flows through the same formatter below.) Dumped
+// verbatim into the OUTPUT/LOG pane, long descriptions wrap and shatter the verb column
+// into an unreadable grey blob. `format_help_lines` re-renders that text IN PLACE (no
+// pager): colored section headers, the verb column aligned + green, and descriptions
+// hanging-indent-wrapped to the pane width. The parser degrades gracefully — any line it
+// doesn't recognise renders as plain text; it never panics, at any width.
+
+/// The visual indent (chars) of a monitor verb row.
+const HELP_VERB_INDENT: usize = 4;
+/// Cap for the aligned verb column. A verb longer than this is emitted on its own line(s)
+/// with the description indented underneath (an over-wide column would waste the pane).
+const HELP_VERB_CAP: usize = 18;
+/// The gap between the verb column and the description column.
+const HELP_GAP: usize = 2;
+/// The indent (chars) at which a sub / continuation line hangs.
+const HELP_SUB_INDENT: usize = 6;
+/// Floor for the render width so a 0/1/tiny pane still produces sane, panic-free output.
+const HELP_MIN_WIDTH: usize = 10;
+/// How many chars past the aligned description column a single-space verb row's args may
+/// overflow before its trailing text is treated as more spec syntax rather than a
+/// description. Keeps `d [lens] [a] [end] disassemble …` (args 2 chars over the column) a
+/// Verb, while leaving the long `obs …` spec (whose next space is ~14 chars past the
+/// column) a Spec. See [`classify_help_line`].
+const HELP_SINGLE_SPACE_SLOP: usize = 3;
+
+/// Whether `line` (already trimmed, mirroring `exec_line`'s lowercasing) is a help command
+/// whose output should go through [`format_help_lines`]. Pure.
+fn is_help_command(line: &str) -> bool {
+    matches!(line.trim().to_ascii_lowercase().as_str(), "help" | "?" | "/help" | "!help")
+}
+
+/// A classified source line of help text. Borrows the trimmed content from the input.
+#[derive(Debug, PartialEq)]
+enum HelpLine<'a> {
+    /// A blank separator line.
+    Blank,
+    /// The col-0 title line (e.g. `monitor (VICE-superset):`).
+    Title(&'a str),
+    /// A 2-space section header with no `verb  desc` split (e.g. `EXEC`).
+    Section(&'a str),
+    /// A verb row split on the first run of >=2 spaces into `verb` + `desc`.
+    Verb { verb: &'a str, desc: &'a str },
+    /// A verb/spec row with no description (all single spaces, e.g. the `obs …` spec).
+    Spec(&'a str),
+    /// A sub / continuation line (6+-space indent) — a dim continuation of the row above.
+    Sub(&'a str),
+}
+
+/// Classify one raw help line by its leading indent + shape. Pure. Order matters: a deep
+/// (6+) indent is a continuation EVEN when it happens to contain a 2-space run (e.g. the
+/// `log fields: …  e.g. …` sub-line), so the indent test precedes the verb/desc split.
+///
+/// `aligned_desc_col` is the source column at which descriptions line up across verb rows
+/// (from [`detect_help_desc_col`] over the whole help text) — `None` when there are no verb
+/// rows to align to. It lets an indent 3..=5 row whose verb+args column is so wide that only
+/// a SINGLE space separates it from the description (e.g. `m [lens] <a> [b] memory dump …`)
+/// still classify as [`HelpLine::Verb`] instead of a fully-green [`HelpLine::Spec`].
+fn classify_help_line(line: &str, aligned_desc_col: Option<usize>) -> HelpLine<'_> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    // Leading spaces are ASCII, so `indent` is a valid char boundary + a char count.
+    let content = line[indent..].trim_end();
+    if content.is_empty() {
+        return HelpLine::Blank;
+    }
+    if indent == 0 {
+        return HelpLine::Title(content);
+    }
+    if indent >= HELP_SUB_INDENT {
+        return HelpLine::Sub(content);
+    }
+    // indent 1..=5: a run of >=2 spaces splits verb | description.
+    if let Some(pos) = content.find("  ") {
+        let verb = content[..pos].trim_end();
+        let desc = content[pos..].trim_start();
+        if !verb.is_empty() && !desc.is_empty() {
+            return HelpLine::Verb { verb, desc };
+        }
+    }
+    if indent <= 2 {
+        HelpLine::Section(content)
+    } else {
+        // indent 3..=5 with no >=2-space run. A column-aligned verb row can still leave only
+        // a SINGLE space between a full-width verb+args column and its description — e.g.
+        // `m [lens] <a> [b] memory dump …`, `d [lens] [a] [end] disassemble …`, and
+        // `bk <a> | bk -<a> set / remove …` (the three most-used monitor commands). Recover
+        // those via the aligned description column: if a single space sits right at the
+        // column (a verb that exactly fills it) or a few chars past it (args that overflow
+        // it), split there into verb | description. Genuinely desc-less specs (`obs …`,
+        // `ignore …`) carry NO space near the column, so they stay Spec (rendered fully
+        // green). Verb/args + the gap are ASCII, so byte offsets == char offsets here.
+        if let Some(col) = aligned_desc_col {
+            let lo = col.saturating_sub(1);
+            let hi = (lo + HELP_SINGLE_SPACE_SLOP).min(content.len());
+            let bytes = content.as_bytes();
+            if let Some(pos) = (lo..=hi).find(|&p| bytes.get(p) == Some(&b' ')) {
+                let verb = content[..pos].trim_end();
+                let desc = content[pos + 1..].trim_start();
+                if !verb.is_empty() && !desc.is_empty() {
+                    return HelpLine::Verb { verb, desc };
+                }
+            }
+        }
+        // No description column to align to → a full spec (no description column).
+        HelpLine::Spec(content)
+    }
+}
+
+/// The source column at which descriptions line up across the help's verb rows — the mode of
+/// the "end of the first run of >=2 spaces" position over indent 3..=5 rows (i.e. where the
+/// padded verb column ends and the description begins). Ties break to the SMALLEST column so
+/// the single-space fallback in [`classify_help_line`] stays conservative. `None` when no
+/// such rows exist. Pure. (Verb columns + the gap are ASCII, so this byte offset is also a
+/// char offset.)
+fn detect_help_desc_col(raw: &str) -> Option<usize> {
+    use std::collections::HashMap;
+    let mut hist: HashMap<usize, usize> = HashMap::new();
+    for line in raw.split('\n') {
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        if !(3..=5).contains(&indent) {
+            continue;
+        }
+        let content = line[indent..].trim_end();
+        if let Some(start) = content.find("  ") {
+            // End of the space run = the column where the description begins.
+            let end = content[start..]
+                .find(|c: char| c != ' ')
+                .map(|off| start + off)
+                .unwrap_or(content.len());
+            *hist.entry(end).or_insert(0) += 1;
+        }
+    }
+    // Most frequent column wins; on a tie, the smaller (leftmost) column.
+    hist.into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
+        .map(|(col, _)| col)
+}
+
+/// Word-wrap `text` to lines of at most `width` chars, char-safe. Word-aware; a single
+/// word longer than `width` is hard-split on char boundaries (never mid-codepoint). Always
+/// returns >=1 line (empty/blank input → one empty line). `width` is floored to 1.
+fn wrap_help_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_len = 0usize; // chars in `cur`
+    for word in text.split_whitespace() {
+        let wlen = word.chars().count();
+        // Flush if appending (with a joining space) would overflow the line.
+        if cur_len > 0 && cur_len + 1 + wlen > width {
+            lines.push(std::mem::take(&mut cur));
+            cur_len = 0;
+        }
+        if wlen <= width {
+            if cur_len > 0 {
+                cur.push(' ');
+                cur_len += 1;
+            }
+            cur.push_str(word);
+            cur_len += wlen;
+        } else {
+            // Word wider than a whole line: emit char-boundary chunks; the tail stays as
+            // the current line so later words can still pack onto it.
+            if cur_len > 0 {
+                lines.push(std::mem::take(&mut cur));
+                cur_len = 0;
+            }
+            let chars: Vec<char> = word.chars().collect();
+            let mut i = 0;
+            while i < chars.len() {
+                let end = (i + width).min(chars.len());
+                let chunk: String = chars[i..end].iter().collect();
+                if end == chars.len() {
+                    cur = chunk;
+                    cur_len = end - i;
+                } else {
+                    lines.push(chunk);
+                }
+                i = end;
+            }
+        }
+    }
+    if !cur.is_empty() || lines.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+/// Push `text` wrapped with a hanging indent: the first line sits at `indent`, wrapped
+/// continuation lines sit two chars deeper. Every emitted line is `<= width` chars. All
+/// lines carry `style`. Char-safe + panic-free at any width.
+fn push_hanging(out: &mut Vec<LogLine>, text: &str, indent: usize, width: usize, style: Style) {
+    let indent = indent.min(width.saturating_sub(1));
+    let cont = (indent + 2).min(width.saturating_sub(1)).max(indent);
+    // Wrap to the (narrower) continuation width so BOTH the first + hanging lines fit.
+    let seg_w = width.saturating_sub(cont).max(1);
+    for (i, seg) in wrap_help_text(text, seg_w).into_iter().enumerate() {
+        let pad = if i == 0 { indent } else { cont };
+        out.push(LogLine::styled(format!("{}{}", " ".repeat(pad), seg), style));
+    }
+}
+
+/// Render the raw help `raw` into styled [`LogLine`]s wrapped to `width` (the log pane's
+/// inner width). PURE. See the module comment above for the layout contract.
+fn format_help_lines(raw: &str, width: usize) -> Vec<LogLine> {
+    let title_style = Style::default().add_modifier(Modifier::BOLD);
+    let section_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let verb_style = Style::default().fg(Color::Green);
+    let desc_style = Style::default(); // default foreground
+    let sub_style = Style::default().fg(Color::DarkGray);
+
+    let width = width.max(HELP_MIN_WIDTH);
+
+    // The source column descriptions align to, so single-space verb rows (a verb+args that
+    // fills the column, leaving only ONE space before the description) still classify as Verb.
+    let aligned_desc_col = detect_help_desc_col(raw);
+    let classified: Vec<HelpLine> =
+        raw.split('\n').map(|l| classify_help_line(l, aligned_desc_col)).collect();
+
+    // The aligned verb column: the longest verb, capped. (`Verb` rows only — specs/subs
+    // don't share the column.)
+    let max_verb = classified
+        .iter()
+        .filter_map(|l| match l {
+            HelpLine::Verb { verb, .. } => Some(verb.chars().count()),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let verb_col = max_verb.min(HELP_VERB_CAP);
+
+    // Column where descriptions begin. Clamped so at least 1 char of description fits even
+    // on a tiny pane (`desc_col <= width-1`).
+    let desc_col = (HELP_VERB_INDENT + verb_col + HELP_GAP).min(width.saturating_sub(1));
+    // Char width available to pad the verb before the gap. When clamped tight this shrinks,
+    // pushing more verbs onto their own line — still correct, just less pretty.
+    let verb_pad_target = desc_col.saturating_sub(HELP_VERB_INDENT + HELP_GAP);
+    let desc_width = width.saturating_sub(desc_col).max(1);
+
+    let mut out: Vec<LogLine> = Vec::new();
+    for hl in classified {
+        match hl {
+            HelpLine::Blank => out.push(LogLine::plain("")),
+            HelpLine::Title(t) => push_hanging(&mut out, t, 0, width, title_style),
+            HelpLine::Section(s) => push_hanging(&mut out, s, 2, width, section_style),
+            HelpLine::Spec(spec) => {
+                push_hanging(&mut out, spec, HELP_VERB_INDENT, width, verb_style)
+            }
+            HelpLine::Sub(sub) => push_hanging(&mut out, sub, HELP_SUB_INDENT, width, sub_style),
+            HelpLine::Verb { verb, desc } => {
+                let vlen = verb.chars().count();
+                let desc_segs = wrap_help_text(desc, desc_width);
+                if verb_pad_target > 0 && vlen <= verb_pad_target {
+                    // Inline: `<indent><verb (green)><pad><desc-seg-0 (default)>`, then any
+                    // wrapped continuation lines aligned under the description column.
+                    let pad = verb_pad_target - vlen + HELP_GAP;
+                    let first = desc_segs.first().cloned().unwrap_or_default();
+                    out.push(LogLine::from_spans(vec![
+                        (" ".repeat(HELP_VERB_INDENT), desc_style),
+                        (verb.to_string(), verb_style),
+                        (" ".repeat(pad), desc_style),
+                        (first, desc_style),
+                    ]));
+                    for seg in desc_segs.iter().skip(1) {
+                        out.push(LogLine::styled(
+                            format!("{}{}", " ".repeat(desc_col), seg),
+                            desc_style,
+                        ));
+                    }
+                } else {
+                    // Verb wider than the column (or a too-tight pane): verb on its own
+                    // line(s), the description indented underneath at the desc column.
+                    push_hanging(&mut out, verb, HELP_VERB_INDENT, width, verb_style);
+                    for seg in &desc_segs {
+                        out.push(LogLine::styled(
+                            format!("{}{}", " ".repeat(desc_col), seg),
+                            desc_style,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1269,6 +1609,7 @@ mod tests {
         cp.push_log_styled(vec![LogLine {
             text: "  - x.crt".into(),
             style: Some(crate::ftcolor::style_for("x.crt", false)),
+            spans: None,
         }]);
         assert_eq!(cp.log.len(), before + 1);
         assert_eq!(cp.log.last().unwrap().style, Some(crate::ftcolor::style_for("x.crt", false)));
@@ -1446,5 +1787,342 @@ mod tests {
         let cp = Cockpit::new();
         assert!(cp.history.is_empty());
         assert!(cp.hist_path.is_none());
+    }
+
+    // ── S10: structured, colored, width-aware INLINE help rendering ─────────────
+
+    /// The styles the formatter uses, mirrored here so assertions read clearly.
+    fn help_section_style() -> Style {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    }
+    fn help_verb_style() -> Style {
+        Style::default().fg(Color::Green)
+    }
+    fn help_sub_style() -> Style {
+        Style::default().fg(Color::DarkGray)
+    }
+
+    #[test]
+    fn help_command_trigger_is_case_insensitive() {
+        assert!(is_help_command("help"));
+        assert!(is_help_command("HELP"));
+        assert!(is_help_command("?"));
+        assert!(is_help_command("/help"));
+        assert!(is_help_command("!help"));
+        assert!(is_help_command("  Help  ")); // trimmed + lowercased like exec_line
+        // not help — must fall through to the normal output path
+        assert!(!is_help_command("helpme"));
+        assert!(!is_help_command("d c000"));
+        assert!(!is_help_command("/helpx"));
+    }
+
+    #[test]
+    fn classify_detects_each_line_shape() {
+        // The aligned description column of the real monitor help. Indent-based shapes
+        // (blank/title/section/sub) return before it matters; verb/spec shapes below use it.
+        let col = Some(17);
+        assert_eq!(classify_help_line("", col), HelpLine::Blank);
+        assert_eq!(classify_help_line("      ", col), HelpLine::Blank);
+        assert_eq!(
+            classify_help_line("monitor (VICE-superset):", col),
+            HelpLine::Title("monitor (VICE-superset):")
+        );
+        // 2-space, no verb/desc split → section header
+        assert_eq!(classify_help_line("  EXEC", col), HelpLine::Section("EXEC"));
+        assert_eq!(
+            classify_help_line("  MEMORY (bank lens: cpu|ram)", col),
+            HelpLine::Section("MEMORY (bank lens: cpu|ram)")
+        );
+        // 4-space verb row split on the FIRST run of >=2 spaces
+        assert_eq!(
+            classify_help_line("    g [addr]         go/resume the run-loop", col),
+            HelpLine::Verb { verb: "g [addr]", desc: "go/resume the run-loop" }
+        );
+        // S10 regression: column-aligned verb rows whose verb+args fills the column, so only
+        // a SINGLE space separates verb from description — the three most-used monitor
+        // commands. These must classify as Verb (green verb + description), NOT a fully-green
+        // Spec. `m`/`bk` sit exactly at the column; `d`'s args overflow it by 2 chars.
+        assert_eq!(
+            classify_help_line(
+                "    m [lens] <a> [b] memory dump ($20/row + petscii; default len $800)",
+                col
+            ),
+            HelpLine::Verb {
+                verb: "m [lens] <a> [b]",
+                desc: "memory dump ($20/row + petscii; default len $800)"
+            }
+        );
+        assert_eq!(
+            classify_help_line(
+                "    d [lens] [a] [end] disassemble: a..end range (VICE), or ~16 from a/PC",
+                col
+            ),
+            HelpLine::Verb {
+                verb: "d [lens] [a] [end]",
+                desc: "disassemble: a..end range (VICE), or ~16 from a/PC"
+            }
+        );
+        assert_eq!(
+            classify_help_line("    bk <a> | bk -<a> set / remove breakpoint (by addr)", col),
+            HelpLine::Verb { verb: "bk <a> | bk -<a>", desc: "set / remove breakpoint (by addr)" }
+        );
+        // 4-space, all single spaces, NO description → a no-desc spec. These must STAY Spec
+        // even with the column known: their next space is nowhere near the column.
+        assert_eq!(
+            classify_help_line("    obs <name> when exec <a> do <action>", col),
+            HelpLine::Spec("obs <name> when exec <a> do <action>")
+        );
+        assert_eq!(
+            classify_help_line(
+                "    obs <name> when exec|load|store <a[..b]> [if <cond>] do <action> [fields]",
+                col
+            ),
+            HelpLine::Spec(
+                "obs <name> when exec|load|store <a[..b]> [if <cond>] do <action> [fields]"
+            )
+        );
+        assert_eq!(
+            classify_help_line("    ignore <name> [n]", col),
+            HelpLine::Spec("ignore <name> [n]")
+        );
+        // Without a detected column (no verb rows to align to) the single-space fallback is
+        // disabled: the same `m` row can't be split and stays a Spec.
+        assert_eq!(
+            classify_help_line("    m [lens] <a> [b] memory dump", None),
+            HelpLine::Spec("m [lens] <a> [b] memory dump")
+        );
+        // 6+-space indent → sub/continuation, EVEN with an inner 2-space run
+        assert_eq!(
+            classify_help_line("      log fields: a/x/y  e.g. `do log $fd`", col),
+            HelpLine::Sub("log fields: a/x/y  e.g. `do log $fd`")
+        );
+        assert_eq!(
+            classify_help_line("                     `swimlane <s> <e>` deep continuation", col),
+            HelpLine::Sub("`swimlane <s> <e>` deep continuation")
+        );
+    }
+
+    #[test]
+    fn detect_help_desc_col_finds_the_aligned_column() {
+        // Mixed widths, but the descriptions align at content-column 17 (indent 4 + a
+        // 13-wide padded verb column). The mode wins over the wider outliers.
+        let raw = "\
+monitor (VICE-superset):
+  EXEC
+    g [addr]         go/resume the run-loop
+    x                exit/resume (= g)
+    until <addr>     run until PC=addr, then stop
+    swimlane [list|name] [s] [e]  trace lanes (wide verb, later column)";
+        assert_eq!(detect_help_desc_col(raw), Some(17));
+        // No indent 3..=5 verb rows at all → nothing to align to.
+        assert_eq!(detect_help_desc_col("title:\n  SECTION\n"), None);
+    }
+
+    #[test]
+    fn section_header_renders_cyan_bold() {
+        let out = format_help_lines("  EXEC", 80);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "  EXEC"); // indent preserved
+        assert_eq!(out[0].style, Some(help_section_style()));
+    }
+
+    #[test]
+    fn verb_row_splits_and_greens_the_verb() {
+        let out = format_help_lines("    g [addr]         go/resume the run-loop", 80);
+        assert_eq!(out.len(), 1);
+        let spans = out[0].spans.as_ref().expect("verb row is multi-span");
+        // exactly one span carries the verb text, and it is green
+        let verb_span = spans.iter().find(|(t, _)| t == "g [addr]").expect("green verb span");
+        assert_eq!(verb_span.1, help_verb_style());
+        // the description span is default-fg (not green, not cyan)
+        assert!(spans.iter().any(|(t, s)| t.contains("go/resume") && *s == Style::default()));
+        // the visible text keeps the verb + aligned column + description
+        assert!(out[0].text.starts_with("    g [addr]"));
+        assert!(out[0].text.contains("go/resume the run-loop"));
+    }
+
+    #[test]
+    fn long_description_hangs_under_the_desc_column() {
+        // one section + one verb row whose description must wrap several times at width 40
+        let raw = "  EXEC\n    g [addr]         resume the run-loop from the given address and \
+                   keep going until the pause button halts it again for good";
+        let width = 40;
+        let out = format_help_lines(raw, width);
+
+        // No emitted line exceeds the width (char count, not bytes).
+        for l in &out {
+            assert!(
+                l.text.chars().count() <= width,
+                "line exceeds width {width}: {:?} ({} chars)",
+                l.text,
+                l.text.chars().count()
+            );
+        }
+
+        // verb_col = len("g [addr]") = 8 → desc column = 4 + 8 + 2 = 14.
+        let desc_col = 14;
+        // out[0] = section header; out[1] = the inline verb+first-desc line; the rest are
+        // wrapped continuation lines, each indented to the description column.
+        assert_eq!(out[0].text, "  EXEC");
+        assert!(out[1].spans.is_some(), "first verb line is multi-span");
+        assert!(out.len() > 2, "the long description should wrap onto continuation lines");
+        for cont in &out[2..] {
+            assert!(
+                cont.text.starts_with(&" ".repeat(desc_col)),
+                "continuation not aligned to desc col {desc_col}: {:?}",
+                cont.text
+            );
+            // and the continuation carries actual description text past the indent
+            assert!(!cont.text.trim().is_empty());
+            assert_eq!(cont.style, Some(Style::default()));
+        }
+    }
+
+    #[test]
+    fn long_verb_goes_on_its_own_line_then_desc_underneath() {
+        // A verb far wider than the ~18 cap: emitted on its own green line(s), then the
+        // description indented beneath it.
+        let raw = "    bitmap <a> [w h] [hires|charset|sprite]  render a RAM range to a PNG";
+        let width = 60;
+        let out = format_help_lines(raw, width);
+        assert!(out.len() >= 2);
+        // the first line is the green verb/spec (single-style, not the inline multi-span)
+        assert!(out[0].spans.is_none());
+        assert_eq!(out[0].style, Some(help_verb_style()));
+        assert!(out[0].text.trim_start().starts_with("bitmap <a>"));
+        // a later line carries the description, default-fg
+        assert!(out
+            .iter()
+            .any(|l| l.text.contains("render a RAM range") && l.style == Some(Style::default())));
+        for l in &out {
+            assert!(l.text.chars().count() <= width);
+        }
+    }
+
+    #[test]
+    fn no_desc_spec_wraps_green_without_panic() {
+        // the `obs …` spec is a single long no-desc row — must wrap (green) at a narrow
+        // width without panicking, and every line must fit.
+        let raw =
+            "    obs <name> when exec|load|store <a[..b]> [if <cond>] do <action> [fields]";
+        let width = 24;
+        let out = format_help_lines(raw, width);
+        assert!(!out.is_empty());
+        for l in &out {
+            assert_eq!(l.style, Some(help_verb_style())); // whole spec is green
+            assert!(l.text.chars().count() <= width);
+        }
+    }
+
+    #[test]
+    fn sub_lines_render_dark_gray() {
+        let out = format_help_lines("      actions: break | log | mark | trace", 80);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].style, Some(help_sub_style()));
+        assert!(out[0].text.starts_with("      ")); // hangs at the sub indent
+    }
+
+    #[test]
+    fn wrap_is_utf8_char_safe() {
+        // a description with multi-byte codepoints, wrapped narrow: no codepoint is split
+        // (every produced line is valid UTF-8 by construction, and the char total is
+        // preserved modulo the collapsed inter-word spaces).
+        let text = "café ünïcödé — schöne grüße naïve résumé façade";
+        let segs = wrap_help_text(text, 7);
+        for s in &segs {
+            assert!(s.chars().count() <= 7, "seg too wide: {s:?}");
+        }
+        // the multi-byte word survives intact somewhere across the wrapped lines
+        let joined = segs.join(" ");
+        assert!(joined.contains("ünïcödé"));
+        assert!(joined.contains("grüße"));
+
+        // a single word LONGER than the width is hard-split on char boundaries (no panic)
+        let one_long = wrap_help_text("ünïcödé-très-lööng", 4);
+        assert!(one_long.iter().all(|s| s.chars().count() <= 4));
+        assert_eq!(one_long.concat().replace(' ', ""), "ünïcödé-très-lööng");
+    }
+
+    #[test]
+    fn tiny_width_does_not_panic() {
+        // width 0 / 1 must not panic (clamped to a usable minimum) and must yield output.
+        for w in [0usize, 1, 2, 3] {
+            let out = format_help_lines(
+                "monitor (VICE-superset):\n  EXEC\n    g [addr]         go/resume\n      sub line",
+                w,
+            );
+            assert!(!out.is_empty(), "width {w} produced no lines");
+        }
+    }
+
+    #[test]
+    fn real_monitor_help_slice_formats_without_panic() {
+        // A verbatim slice of monitor_help_text() (main.rs) — the mix of title, section,
+        // aligned verbs, single-space verbs, no-desc specs, and deep continuations must
+        // all format cleanly.
+        let raw = "\
+monitor (VICE-superset):
+  EXEC
+    g [addr]         go/resume the run-loop (PC=addr); Pause button halts
+    x                exit/resume (= g)
+    until <addr>     run until PC=addr, then stop (synchronous)
+    reset            cold reset
+  MEMORY (bank lens: cpu|ram|rom|io|cart, default cpu = what CPU sees)
+    m [lens] <a> [b] memory dump ($20/row + petscii; default len $800)
+    d [lens] [a] [end] disassemble: a..end range (VICE), or ~16 from a/PC
+  BREAKPOINTS / OBSERVERS
+    bk               list breakpoints (#num $addr)
+    bk <a> | bk -<a> set / remove breakpoint (by addr)
+    obs <name> when exec|load|store <a[..b]> [if <cond>] do <action> [fields]
+      actions: break | log [fields] | mark [\"label\"] | cmd \"<cmd>\" | trace [domains]|off
+    swimlane [list|name] [s] [e]  trace lanes (cpu/irq/nmi/io/1541): list / newest
+                     `swimlane <s> <e>` with no covering trace → auto checkpoint-ring replay";
+        for width in [80usize, 60, 40, 20, 10, 1] {
+            let out = format_help_lines(raw, width);
+            assert!(!out.is_empty(), "width {width} produced no lines");
+            let eff = width.max(HELP_MIN_WIDTH);
+            for l in &out {
+                assert!(
+                    l.text.chars().count() <= eff,
+                    "width {width}: line exceeds {eff}: {:?}",
+                    l.text
+                );
+            }
+        }
+
+        // S10 regression (positive render check at a comfortable width): the single-space
+        // rows `m`/`d`/`bk` must render as a green verb span + a default-fg description span,
+        // NOT as a fully-green Spec — and their descriptions must align to the SAME column as
+        // an ordinary verb row (`g [addr]`).
+        let out = format_help_lines(raw, 80);
+        // The rendered description column for a `verb` row: char index of `needle` in the
+        // (single) LogLine that carries a green span exactly equal to `verb`.
+        let desc_col_of = |verb: &str, needle: &str| -> Option<usize> {
+            out.iter().find_map(|l| {
+                let spans = l.spans.as_ref()?;
+                let is_verb_row = spans.iter().any(|(t, s)| t == verb && *s == help_verb_style());
+                if !is_verb_row {
+                    return None;
+                }
+                // the verb is green and some later span carries the (default-fg) description
+                assert!(
+                    spans
+                        .iter()
+                        .any(|(t, s)| t.contains(needle) && *s == Style::default()),
+                    "row for verb {verb:?} has no default-fg description span containing {needle:?}: {:?}",
+                    l.text
+                );
+                l.text.find(needle).map(|b| l.text[..b].chars().count())
+            })
+        };
+
+        let g_col = desc_col_of("g [addr]", "go/resume").expect("g [addr] verb row");
+        let m_col = desc_col_of("m [lens] <a> [b]", "memory dump").expect("m verb row (single-space)");
+        let d_col = desc_col_of("d [lens] [a] [end]", "disassemble:").expect("d verb row (single-space)");
+        let bk_col =
+            desc_col_of("bk <a> | bk -<a>", "set / remove").expect("bk verb row (single-space)");
+        assert_eq!(m_col, g_col, "m description must align to the verb-row desc column");
+        assert_eq!(d_col, g_col, "d description must align to the verb-row desc column");
+        assert_eq!(bk_col, g_col, "bk description must align to the verb-row desc column");
     }
 }
