@@ -9,6 +9,7 @@ use std::path::Path;
 
 pub mod audio;
 pub mod engine;
+pub mod ftcolor;
 pub mod keymap;
 pub mod tui;
 pub mod window;
