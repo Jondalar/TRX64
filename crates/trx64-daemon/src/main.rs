@@ -11574,6 +11574,11 @@ fn resolve_fs_path_with_state(st: &State, arg: &str) -> String {
 /// `fs/complete` rpc so the cockpit can fill the shared stem on Tab. Empty when the
 /// set is empty or the names share no leading char; the whole name when there is
 /// exactly one match.
+/// Longest common prefix of the matched names, returned in the FIRST name's casing.
+/// The comparison is ASCII-case-insensitive so it matches `fs/complete`'s
+/// case-insensitive stem filter: a mixed-case match set (e.g. `Game.prg` + `gate.prg`
+/// for stem `g`) still yields a fillable prefix (`Ga`) instead of the empty string a
+/// case-sensitive compare would produce.
 fn fs_longest_common_prefix<'a>(mut names: impl Iterator<Item = &'a str>) -> String {
     let first = match names.next() {
         Some(f) => f,
@@ -11583,7 +11588,7 @@ fn fs_longest_common_prefix<'a>(mut names: impl Iterator<Item = &'a str>) -> Str
     for name in names {
         let chars: Vec<char> = name.chars().collect();
         let mut i = 0;
-        while i < prefix.len() && i < chars.len() && prefix[i] == chars[i] {
+        while i < prefix.len() && i < chars.len() && prefix[i].eq_ignore_ascii_case(&chars[i]) {
             i += 1;
         }
         prefix.truncate(i);
@@ -14055,6 +14060,10 @@ mod batch1_tests {
             fs_longest_common_prefix(["load.prg", "loader.prg", "load2.prg"].into_iter()),
             "load"
         );
+        // Mixed-case matches (case-insensitive filter) still yield a fillable prefix,
+        // returned in the first name's casing.
+        assert_eq!(fs_longest_common_prefix(["Game.prg", "gate.prg"].into_iter()), "Ga");
+        assert_eq!(fs_longest_common_prefix(["Alpha", "alfa"].into_iter()), "Al");
     }
 
     #[test]
