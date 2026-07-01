@@ -8669,7 +8669,16 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                             }
                             st.session.machine.detach_cart();
                             st.session.cart_path = String::new();
-                            // resetCold("pal-default", { keepRam: true }) — ingress.ts:204.
+                            // CLI-FEEL S7 — unify eject RAM semantics: a cart eject is a
+                            // full power-cycle (RAM wiped), matching media/unmount's cart
+                            // branch (fill_power_on_ram + cold_reset) and the user's
+                            // real-C64 model (cart out → power off → power on). This
+                            // INTENTIONALLY diverges from the TS oracle's resetCold({
+                            // keepRam:true }) (ingress.ts:204): keeping RAM here left the
+                            // two eject routes (media/ingress vs media/unmount) diverging.
+                            // fill_power_on_ram (power off) then cold_reset (power on) is
+                            // exactly what media/unmount runs, so both routes now match.
+                            st.session.machine.fill_power_on_ram();
                             st.session.machine.cold_reset();
                         }
                         detail.insert("role".to_string(), json!(role));
@@ -8799,9 +8808,18 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             if slot == Some(9) {
                 return Response::err(id, -32602, "media/unmount: drive 9 not supported (v1 drive8-only)");
             }
-            let is_cart = role_param == Some("cartridge") || slot == Some(0);
-            let role = if is_cart { "cartridge" } else { "drive8" };
             let mut st = state.lock().unwrap();
+            // CLI-FEEL S7 — the cockpit `/eject` sends role:"auto" (it can't know what's
+            // mounted without a round-trip); resolve it HERE against the live machine so
+            // ONE command ejects the cartridge if one is inserted, else the disk on
+            // drive8 — atomically under the lock, with no read-then-eject status race.
+            // Explicit callers keep the TS contract (slot 0 OR role "cartridge" → cart).
+            let is_cart = if role_param == Some("auto") {
+                st.session.machine.cartridge.is_some()
+            } else {
+                role_param == Some("cartridge") || slot == Some(0)
+            };
+            let role = if is_cart { "cartridge" } else { "drive8" };
             let was_running = st.session.running;
             // audit ws-media-0 — eject also routes through the ingress boundary
             // (= ingestMedia kind:eject, ingress.ts:185): dirty-media guard +

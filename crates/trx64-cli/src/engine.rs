@@ -358,14 +358,46 @@ impl Engine {
             return CmdResult::text("mount <path> — needs a .d64/.g64/.crt path.");
         }
         match self.rpc("media/mount", json!({ "path": path })) {
-            Ok(v) => CmdResult::text(format!("MOUNT {path} → {}", compact(&v))),
+            Ok(v) => {
+                // CLI-FEEL S7 — reconcile the dual run-state after the mount. A CRT
+                // mount power-cycles the DAEMON into running (reply `paused:false`); adopt
+                // that into the host run flag so the cockpit's pump resumes IMMEDIATELY
+                // (the freshly cold-booted cart runs) instead of only after pump_frame's
+                // next controller-running poll. A disk mount is a live device op that does
+                // NOT change run-state — the reply reports the machine's REAL `paused`, so
+                // a running machine stays running and a paused one stays paused (no false
+                // resume). We therefore only ever SET the flag when the daemon says it is
+                // running, never clear it.
+                if v.get("paused").and_then(|p| p.as_bool()) == Some(false) {
+                    self.running.store(true, Ordering::SeqCst);
+                }
+                CmdResult::text(format!("MOUNT {path} → {}", compact(&v)))
+            }
             Err(e) => CmdResult::text(format!("mount failed: {e}")),
         }
     }
 
     fn verb_eject(&self) -> CmdResult {
-        match self.rpc("media/unmount", json!({})) {
-            Ok(_) => CmdResult::text("EJECT — drive8 unmounted."),
+        // CLI-FEEL S7 — smart target. The cockpit can't know what's mounted without a
+        // round-trip, so it sends role:"auto" and the daemon resolves it against the live
+        // machine: a cartridge is ejected if one is inserted, else the disk on drive8.
+        // (The old `{}` payload made the daemon default to drive8, so `/eject` on a
+        // cart-only machine tried to unmount an absent disk and left the cart in.)
+        match self.rpc("media/unmount", json!({ "role": "auto" })) {
+            Ok(v) => {
+                // A cart eject power-cycles the daemon into running (`paused:false`) —
+                // adopt it into the host run flag so the cockpit resumes immediately (same
+                // reconcile as verb_mount).
+                if v.get("paused").and_then(|p| p.as_bool()) == Some(false) {
+                    self.running.store(true, Ordering::SeqCst);
+                }
+                let role = v
+                    .get("detail")
+                    .and_then(|d| d.get("role"))
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("drive8");
+                CmdResult::text(format!("EJECT — {role} unmounted."))
+            }
             Err(e) => CmdResult::text(format!("eject failed: {e}")),
         }
     }
