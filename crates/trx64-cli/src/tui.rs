@@ -13,6 +13,7 @@
 //! the main thread on macOS); everything else is handled inline.
 
 use std::io::{self, Stdout};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
@@ -40,6 +41,18 @@ pub enum UiToMain {
 }
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
+
+/// Max command-history entries kept in memory + on disk (bash-ish). Applies to the
+/// in-memory ring ([`Cockpit::push_history`]), the loaded on-disk tail
+/// ([`load_history_from`]), and the persisted file itself ([`append_history_line`], which
+/// compacts back down to this cap).
+const HIST_CAP: usize = 2000;
+
+/// How far the on-disk history file may overshoot [`HIST_CAP`] before
+/// [`append_history_line`] rewrites it down to the last [`HIST_CAP`] entries. The slack
+/// amortises the rewrite so a hot session isn't rewriting the whole file on every command
+/// once it fills up (bash `HISTFILESIZE`, with headroom).
+const HIST_FILE_SLACK: usize = 256;
 
 /// One line in the OUTPUT/LOG pane. `style`, when set, overrides the draw-time content
 /// heuristic (banner / `> ` echo) — used by `!ls` filetype coloring (S4) and, later,
@@ -88,6 +101,10 @@ struct Cockpit {
     log: Vec<LogLine>,
     history: Vec<String>,
     hist_idx: Option<usize>,
+    /// On-disk history file (`$HOME/.trx64/history`), set at boot in [`run_loop`]. `None`
+    /// when `$HOME` is unset — history then stays in-memory only. `new()` leaves it `None`
+    /// so unit tests are side-effect-free.
+    hist_path: Option<PathBuf>,
     snap: StateSnapshot,
     /// Lines scrolled UP from the bottom of the log (0 = pinned to the tail). Mouse
     /// wheel adjusts it; any new output snaps back to 0.
@@ -114,6 +131,7 @@ impl Cockpit {
             ],
             history: Vec::new(),
             hist_idx: None,
+            hist_path: None,
             snap: StateSnapshot::default(),
         }
     }
@@ -153,6 +171,49 @@ impl Cockpit {
         self.input = s;
     }
 
+    // ── readline kill/word muscles (char-safe; cursor is a char index) ──────────
+    /// Ctrl-K: drop everything from the cursor to the end of the line.
+    fn kill_to_end(&mut self) {
+        let b = self.byte_at(self.cursor);
+        self.input.truncate(b);
+    }
+    /// Ctrl-U: drop everything before the cursor; the cursor moves to the start.
+    fn kill_to_start(&mut self) {
+        let b = self.byte_at(self.cursor);
+        self.input.replace_range(0..b, "");
+        self.cursor = 0;
+    }
+    /// Ctrl-W: delete the word before the cursor — first any whitespace directly to the
+    /// left, then the run of non-whitespace (bash `unix-word-rubout`).
+    fn delete_word_before(&mut self) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let mut start = self.cursor;
+        while start > 0 && chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        while start > 0 && !chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        let (b_start, b_end) = (self.byte_at(start), self.byte_at(self.cursor));
+        self.input.replace_range(b_start..b_end, "");
+        self.cursor = start;
+    }
+
+    /// Push `entry` onto the in-memory history, skipping a consecutive duplicate (bash
+    /// `ignoredups`). Caps the ring to [`HIST_CAP`]. Returns whether the entry was pushed
+    /// so the caller only appends genuinely-new lines to the on-disk history.
+    fn push_history(&mut self, entry: &str) -> bool {
+        if self.history.last().map(String::as_str) == Some(entry) {
+            return false; // consecutive duplicate → keep the history clean
+        }
+        self.history.push(entry.to_string());
+        if self.history.len() > HIST_CAP {
+            let drop = self.history.len() - HIST_CAP;
+            self.history.drain(0..drop);
+        }
+        true
+    }
+
     fn push_log(&mut self, text: &str) {
         for line in text.split('\n') {
             self.log.push(LogLine::from(line));
@@ -179,8 +240,75 @@ impl Cockpit {
     }
 }
 
+// ── persistent command history ($HOME/.trx64/history) ──────────────────────────
+
+/// The on-disk history file: `$HOME/.trx64/history`. `None` when `$HOME` is unset (the
+/// cockpit then keeps history in-memory only).
+fn history_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".trx64").join("history"))
+}
+
+/// Load history from `path`, one entry per line. Missing/unreadable file → empty (history
+/// is best-effort, never fatal). Blank lines are dropped; the last [`HIST_CAP`] entries
+/// are kept.
+fn load_history_from(path: &Path) -> Vec<String> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut lines: Vec<String> =
+        content.lines().filter(|l| !l.is_empty()).map(str::to_string).collect();
+    if lines.len() > HIST_CAP {
+        let drop = lines.len() - HIST_CAP;
+        lines.drain(0..drop);
+    }
+    lines
+}
+
+/// Append one entry to the on-disk history, creating the parent dir. Best-effort: any I/O
+/// error is swallowed so a read-only `$HOME` never breaks the cockpit. After the write the
+/// file is compacted (see [`trim_history_file`]) so the persisted store stays bounded to
+/// ~[`HIST_CAP`] and never grows without limit.
+fn append_history_line(path: &Path, entry: &str) {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{entry}");
+    }
+    trim_history_file(path);
+}
+
+/// Rewrite `path` down to its last [`HIST_CAP`] non-blank lines once it has overshot the
+/// cap by more than [`HIST_FILE_SLACK`]. This is what keeps the persisted history file
+/// bounded (the in-memory ring and load path are capped separately). Best-effort: any I/O
+/// error leaves the file as-is (it just stays a little larger until the next successful
+/// compaction). The rewrite goes through a sibling temp file + rename so a crash mid-write
+/// can't truncate an otherwise-good history.
+fn trim_history_file(path: &Path) {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+    if lines.len() <= HIST_CAP + HIST_FILE_SLACK {
+        return;
+    }
+    let mut body = lines[lines.len() - HIST_CAP..].join("\n");
+    body.push('\n');
+    let tmp = path.with_extension("history.tmp");
+    if std::fs::write(&tmp, &body).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
 fn run_loop(term: &mut Term, engine: &Engine, to_main: &Sender<UiToMain>) -> io::Result<()> {
     let mut cp = Cockpit::new();
+    // Load persistent history at boot (best-effort; empty when $HOME is unset/unreadable).
+    cp.hist_path = history_path();
+    if let Some(path) = &cp.hist_path {
+        cp.history = load_history_from(path);
+    }
     let poll = Duration::from_millis(50);
     let mut last_state = Instant::now();
 
@@ -210,13 +338,66 @@ fn run_loop(term: &mut Term, engine: &Engine, to_main: &Sender<UiToMain>) -> io:
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
-                    // Ctrl-C / Ctrl-D quit the cockpit.
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && matches!(key.code, XKeyCode::Char('c') | XKeyCode::Char('d'))
-                    {
-                        let _ = engine.exec_line("/quit");
-                        let _ = to_main.send(UiToMain::Quit);
-                        return Ok(());
+                    // Ctrl-<key> readline muscles. Handled here so they don't fall
+                    // through to the Char insert arm (which ignores modifiers and would
+                    // otherwise type the bare letter — the noted gotcha).
+                    if key.modifiers.contains(KeyModifiers::CONTROL) {
+                        match key.code {
+                            // Ctrl-C: clear a non-empty line (bash convention); an empty
+                            // line quits.
+                            XKeyCode::Char('c') => {
+                                if cp.input.is_empty() {
+                                    let _ = engine.exec_line("/quit");
+                                    let _ = to_main.send(UiToMain::Quit);
+                                    return Ok(());
+                                }
+                                cp.set_line(String::new());
+                                cp.hist_idx = None;
+                                continue;
+                            }
+                            // Ctrl-D: delete-at when the line is non-empty; an empty line
+                            // quits (EOF).
+                            XKeyCode::Char('d') => {
+                                if cp.input.is_empty() {
+                                    let _ = engine.exec_line("/quit");
+                                    let _ = to_main.send(UiToMain::Quit);
+                                    return Ok(());
+                                }
+                                cp.delete_at();
+                                cp.hist_idx = None;
+                                continue;
+                            }
+                            XKeyCode::Char('a') => {
+                                cp.cursor = 0;
+                                continue;
+                            }
+                            XKeyCode::Char('e') => {
+                                cp.cursor = cp.line_char_len();
+                                continue;
+                            }
+                            XKeyCode::Char('k') => {
+                                cp.kill_to_end();
+                                cp.hist_idx = None;
+                                continue;
+                            }
+                            XKeyCode::Char('u') => {
+                                cp.kill_to_start();
+                                cp.hist_idx = None;
+                                continue;
+                            }
+                            XKeyCode::Char('w') => {
+                                cp.delete_word_before();
+                                cp.hist_idx = None;
+                                continue;
+                            }
+                            // Ctrl-L: clear the log pane; the next draw repaints.
+                            XKeyCode::Char('l') => {
+                                cp.log.clear();
+                                cp.scroll = 0;
+                                continue;
+                            }
+                            _ => {}
+                        }
                     }
                     match key.code {
                         // Tab: namespace-aware completion (verbs in /, !, and the bare
@@ -231,9 +412,11 @@ fn run_loop(term: &mut Term, engine: &Engine, to_main: &Sender<UiToMain>) -> io:
                         }
                         XKeyCode::Backspace => {
                             cp.backspace();
+                            cp.hist_idx = None; // editing a recalled line detaches it
                         }
                         XKeyCode::Delete => {
                             cp.delete_at();
+                            cp.hist_idx = None; // editing a recalled line detaches it
                         }
                         XKeyCode::Left => {
                             cp.cursor = cp.cursor.saturating_sub(1);
@@ -276,7 +459,13 @@ fn run_loop(term: &mut Term, engine: &Engine, to_main: &Sender<UiToMain>) -> io:
                             if line.is_empty() {
                                 continue;
                             }
-                            cp.history.push(line.clone());
+                            // Dedup consecutive duplicates; only genuinely-new lines get
+                            // appended to the on-disk history.
+                            if cp.push_history(&line) {
+                                if let Some(path) = cp.hist_path.as_deref() {
+                                    append_history_line(path, &line);
+                                }
+                            }
                             cp.push_log(&format!("> {line}"));
                             let r = engine.exec_line(&line);
                             if !r.output.is_empty() {
@@ -1084,5 +1273,178 @@ mod tests {
         assert_eq!(cp.log.len(), before + 1);
         assert_eq!(cp.log.last().unwrap().style, Some(crate::ftcolor::style_for("x.crt", false)));
         assert_eq!(cp.scroll, 0); // new output snaps back to the live tail
+    }
+
+    // ── S6: readline kill/word muscles + persistent, deduped history ────────────
+
+    #[test]
+    fn kill_to_end_drops_from_cursor() {
+        let mut cp = Cockpit::new();
+        cp.set_line("hello world".into());
+        cp.cursor = 5; // "hello| world"
+        cp.kill_to_end();
+        assert_eq!(cp.input, "hello");
+        assert_eq!(cp.cursor, 5);
+        // at the end it is a no-op, not a panic
+        cp.kill_to_end();
+        assert_eq!(cp.input, "hello");
+    }
+
+    #[test]
+    fn kill_to_start_drops_before_cursor() {
+        let mut cp = Cockpit::new();
+        cp.set_line("hello world".into());
+        cp.cursor = 6; // "hello |world"
+        cp.kill_to_start();
+        assert_eq!(cp.input, "world");
+        assert_eq!(cp.cursor, 0);
+        // at the start it is a no-op
+        cp.kill_to_start();
+        assert_eq!(cp.input, "world");
+    }
+
+    #[test]
+    fn delete_word_before_eats_word_and_trailing_space() {
+        let mut cp = Cockpit::new();
+        cp.set_line("/mount some.crt".into());
+        cp.cursor = cp.line_char_len(); // end
+        cp.delete_word_before();
+        assert_eq!(cp.input, "/mount ");
+        assert_eq!(cp.cursor, 7);
+        // a second Ctrl-W eats the trailing space + the "/mount" word
+        cp.delete_word_before();
+        assert_eq!(cp.input, "");
+        assert_eq!(cp.cursor, 0);
+        // no-op at column 0
+        cp.delete_word_before();
+        assert_eq!(cp.input, "");
+    }
+
+    #[test]
+    fn delete_word_before_midline_keeps_tail() {
+        let mut cp = Cockpit::new();
+        cp.set_line("abc def ghi".into());
+        cp.cursor = 7; // "abc def| ghi" → delete "def"
+        cp.delete_word_before();
+        assert_eq!(cp.input, "abc  ghi");
+        assert_eq!(cp.cursor, 4);
+    }
+
+    #[test]
+    fn kill_ops_are_char_safe() {
+        // multi-byte chars must not split a codepoint / panic
+        let mut cp = Cockpit::new();
+        cp.set_line("héllo wörld".into());
+        cp.cursor = 6; // after "héllo " (6 chars)
+        cp.kill_to_start();
+        assert_eq!(cp.input, "wörld");
+        assert_eq!(cp.cursor, 0);
+    }
+
+    #[test]
+    fn push_history_dedups_consecutive() {
+        let mut cp = Cockpit::new();
+        assert!(cp.push_history("d c000"));
+        assert!(!cp.push_history("d c000")); // consecutive dup → skipped
+        assert!(cp.push_history("g"));
+        assert!(cp.push_history("d c000")); // non-consecutive → kept again
+        assert_eq!(cp.history, vec!["d c000", "g", "d c000"]);
+    }
+
+    #[test]
+    fn push_history_caps_at_hist_cap() {
+        let mut cp = Cockpit::new();
+        for i in 0..(HIST_CAP + 50) {
+            assert!(cp.push_history(&format!("cmd{i}")));
+        }
+        assert_eq!(cp.history.len(), HIST_CAP);
+        // the oldest entries were dropped; the newest survives
+        assert_eq!(cp.history.first().unwrap(), "cmd50");
+        assert_eq!(cp.history.last().unwrap(), &format!("cmd{}", HIST_CAP + 49));
+    }
+
+    #[test]
+    fn history_round_trips_through_a_file() {
+        let dir = std::env::temp_dir().join(format!("trx64_s6_hist_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join(".trx64").join("history");
+
+        // append several entries (dir is created on first write)
+        append_history_line(&path, "d c000");
+        append_history_line(&path, "g");
+        append_history_line(&path, "!ls");
+
+        let loaded = load_history_from(&path);
+        assert_eq!(loaded, vec!["d c000", "g", "!ls"]);
+
+        // a missing file loads as empty, not an error
+        assert!(load_history_from(&dir.join("nope")).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_history_caps_to_the_tail() {
+        let dir = std::env::temp_dir().join(format!("trx64_s6_histcap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history");
+        let body: String =
+            (0..(HIST_CAP + 25)).map(|i| format!("cmd{i}\n")).collect();
+        std::fs::write(&path, body).unwrap();
+
+        let loaded = load_history_from(&path);
+        assert_eq!(loaded.len(), HIST_CAP);
+        assert_eq!(loaded.first().unwrap(), "cmd25"); // oldest tail-trimmed
+        assert_eq!(loaded.last().unwrap(), &format!("cmd{}", HIST_CAP + 24));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_history_file_stays_bounded() {
+        // The persisted file (not just the in-memory ring / load path) must stay capped:
+        // appending far past the cap compacts it back down instead of growing forever.
+        let dir = std::env::temp_dir().join(format!("trx64_s6_histbound_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join(".trx64").join("history");
+
+        let total = HIST_CAP + HIST_FILE_SLACK + 500;
+        for i in 0..total {
+            append_history_line(&path, &format!("cmd{i}"));
+        }
+
+        // On disk: never more than cap + slack lines, and at least the full cap survives.
+        let on_disk: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+        assert!(
+            on_disk.len() <= HIST_CAP + HIST_FILE_SLACK,
+            "history file grew unbounded: {} lines",
+            on_disk.len()
+        );
+        assert!(on_disk.len() >= HIST_CAP, "history file over-trimmed: {} lines", on_disk.len());
+
+        // The newest entry is always retained; the oldest have been dropped.
+        assert_eq!(on_disk.last().unwrap(), &format!("cmd{}", total - 1));
+        assert!(!on_disk.iter().any(|l| l == "cmd0"), "oldest entry should be trimmed");
+
+        // And the loader still yields exactly the last HIST_CAP entries.
+        let loaded = load_history_from(&path);
+        assert_eq!(loaded.len(), HIST_CAP);
+        assert_eq!(loaded.last().unwrap(), &format!("cmd{}", total - 1));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_cockpit_has_no_history_side_effects() {
+        // new() must stay pure: no disk read, no hist_path (loaded only in run_loop).
+        let cp = Cockpit::new();
+        assert!(cp.history.is_empty());
+        assert!(cp.hist_path.is_none());
     }
 }
