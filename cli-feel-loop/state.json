@@ -66,8 +66,8 @@
       "title": "mount-resume verify + /eject smart target + unify eject RAM semantics",
       "files": ["crates/trx64-cli/src/engine.rs", "crates/trx64-daemon/src/main.rs"],
       "deps": ["S1"],
-      "status": "todo",
-      "notes": "semantics already mostly correct; verify cockpit pump resumes after CRT power-cycle"
+      "status": "done",
+      "notes": "33780b7 — /mount sets host run flag (pump resumes post CRT power-cycle), /eject role:auto → daemon resolves occupied slot, media/ingress eject-cart power-cycles RAM to match media/unmount; tests/s7_media_semantics.rs 4/4 green"
     },
     {
       "id": "S8",
