@@ -521,6 +521,30 @@ pub trait C64Core6510Bus {
         self.process_alarms(clk);
     }
 
+    /// PER-CYCLE interrupt-line levels. VICE stamps `maincpu_set_nmi`/`set_irq`
+    /// at the EXACT rclk from inside the CIA/VIC alarm callbacks (the CIA's
+    /// underflow calls `my_set_int(rclk)`; the VIC's raster IRQ calls
+    /// `maincpu_set_irq(rclk)`). TRX64's CIA/VIC do not call the CPU back, so the
+    /// core samples these levels itself once per cycle inside `clk_inc` (AFTER
+    /// `interrupt_delay_alarms` has advanced the chips to `clk`) and calls
+    /// `set_nmi`/`set_irq` at `clk`. This delivers a mid-instruction line-low
+    /// (CIA ICR-read ack) and the subsequent line-high (next Timer-A underflow)
+    /// as DISTINCT edges — the edges a boundary-only sample swallowed. Default
+    /// `false`: an implementor with no CIA/VIC (test bus / drive) reports the
+    /// line released, so the per-cycle `set_*` calls are inert no-ops.
+    #[inline]
+    fn cia2_nmi_line(&self) -> bool {
+        false
+    }
+    #[inline]
+    fn cia1_irq_line(&self) -> bool {
+        false
+    }
+    #[inline]
+    fn vic_irq_line(&self) -> bool {
+        false
+    }
+
     /// PORT OF: mainc64cpu.c:778 ROM_TRAP_HANDLER() = traps_handler(). Returns 0
     /// if handled in place, a replacement opcode (>0, <0xffffffff) to replay, or
     /// 0xffffffff for a real JAM. Default 0xffffffff (no trap installed → JAM).
@@ -768,6 +792,24 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
         // interrupt_delay() — m64:97-110.
         let clk = self.core.clk;
         self.bus.interrupt_delay_alarms(clk);
+        // Per-cycle interrupt-line stamp — VICE parity for the CIA/VIC alarm
+        // callbacks that call maincpu_set_nmi/set_irq at the exact rclk. The
+        // alarm dispatch above advanced the CIAs (and the VIC ticked last cycle)
+        // so the ICR/raster line levels are current for `clk`; stamp them into
+        // IntStatus at `clk`. Ordered BEFORE the irq_clk/nmi_clk delay-cycle
+        // bumps so a fresh 0→1 edge stamped on THIS cycle (irq_clk/nmi_clk = clk)
+        // already counts toward its INTERRUPT_DELAY latency this cycle — the same
+        // order VICE uses (alarm dispatch, then the *_clk <= maincpu_clk bump).
+        // set_nmi/set_irq are idempotent per level (assert guarded by
+        // pending_int==0, deassert by pending_int!=0), so the per-cycle calls
+        // only mutate on a true edge and are otherwise near-free. The essential
+        // fix: this delivers the CIA2 /NMI line-low (ICR-read ack → nnmi 1→0)
+        // and the next Timer-A underflow line-high (fresh 0→1 edge → re-stamped
+        // nmi_clk + IK_NMI re-raised) even when both fall inside a single
+        // instruction, so an NMI-driven streaming depacker is never wedged.
+        self.int.set_nmi(INT_SRC_CIA2, self.bus.cia2_nmi_line(), clk);
+        self.int.set_irq(INT_SRC_CIA1, self.bus.cia1_irq_line(), clk);
+        self.int.set_irq(INT_SRC_VIC, self.bus.vic_irq_line(), clk);
         if self.int.irq_clk <= self.core.clk {
             self.int.irq_delay_cycles += 1;
         }
@@ -2958,6 +3000,179 @@ mod tests {
         assert!(
             opinfo_delays_interrupt(core.last_opcode_info) != 0,
             "same-page taken branch set DELAYS_INTERRUPT"
+        );
+    }
+
+    // =========================================================================
+    // Per-cycle CIA2 → /NMI edge delivery (the Lykia stage-3 wedge).
+    //
+    // Reproduces "two Timer-A underflows with an ICR-read ack in between, within
+    // ONE instruction window → TWO NMIs delivered". The bus models CIA2's /NMI
+    // line as a level toggled by the handler's own RMW instruction: the READ half
+    // (ICR-read ack) drops the line, the DUMMY-WRITE half (next Timer-A underflow)
+    // re-raises it — two consecutive CPU cycles with NO instruction boundary
+    // between them. A boundary-only sampler would only ever see the net-high level
+    // and swallow the low→high edge, wedging the NMI after the first dispatch
+    // (exactly the TRX64 bug). The per-cycle stamp inside `clk_inc` sees both
+    // edges, so a fresh NMI is (re)generated on every handler pass.
+    // =========================================================================
+
+    /// Flat-RAM bus with a CIA2 /NMI line whose level is driven by accesses to a
+    /// magic address ($D000): a READ drops the line (ICR-read ack), a WRITE (real
+    /// or dummy) re-raises it (next Timer-A underflow). Counts NMI-vector
+    /// dispatches via `on_interrupt`.
+    struct NmiLineBus {
+        ram: Box<[u8; 0x10000]>,
+        /// CIA2 interrupt-output level wired to the CPU /NMI line.
+        line: bool,
+        /// Number of times the CPU took the NMI vector ($FFFA).
+        nmi_dispatches: u32,
+    }
+    impl NmiLineBus {
+        fn new() -> Self {
+            NmiLineBus { ram: Box::new([0u8; 0x10000]), line: false, nmi_dispatches: 0 }
+        }
+    }
+    const NMI_MAGIC: u16 = 0xd000;
+    impl C64Core6510Bus for NmiLineBus {
+        fn read_raw(&mut self, a: u16) -> u8 {
+            // The RMW READ half = the handler's CIA ICR read → line released.
+            if a == NMI_MAGIC {
+                self.line = false;
+            }
+            self.ram[a as usize]
+        }
+        fn write_raw(&mut self, a: u16, v: u8) {
+            // The RMW WRITE half = the next Timer-A underflow → line re-asserted.
+            if a == NMI_MAGIC {
+                self.line = true;
+            }
+            self.ram[a as usize] = v;
+        }
+        fn write_raw_dummy(&mut self, a: u16, v: u8) {
+            if a == NMI_MAGIC {
+                self.line = true;
+            }
+            self.ram[a as usize] = v;
+        }
+        fn check_ba(&mut self, _loi: &mut u32, _ba_low: bool) -> u64 {
+            0
+        }
+        fn vic_cycle(&mut self, _clk: u64) {}
+        // The whole point: the SC core samples this every cycle inside clk_inc.
+        fn cia2_nmi_line(&self) -> bool {
+            self.line
+        }
+        fn on_interrupt(&mut self, vector: u16, _clk: u64) {
+            if vector == 0xfffa {
+                self.nmi_dispatches += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn nmi_edge_redelivered_after_ack_within_one_instruction() {
+        let mut core = C64Core6510::new();
+        let mut bus = NmiLineBus::new();
+        let mut int = IntStatus::new();
+
+        // Main loop at $C000: JMP $C000 (self-loop, 3 cycles) — provides
+        // instruction boundaries between NMIs.
+        bus.ram[0xc000] = 0x4c;
+        bus.ram[0xc001] = 0x00;
+        bus.ram[0xc002] = 0xc0;
+
+        // NMI handler at $FE00:
+        //   EE B0 FE   INC $FEB0   ; "$FEB0 INC" — proves the handler ran ($FF43-style)
+        //   EE 00 D0   INC $D000   ; RMW: READ acks /NMI low, DUMMY-WRITE re-raises it
+        //   40         RTI
+        bus.ram[0xfe00] = 0xee;
+        bus.ram[0xfe01] = 0xb0;
+        bus.ram[0xfe02] = 0xfe;
+        bus.ram[0xfe03] = 0xee;
+        bus.ram[0xfe04] = 0x00;
+        bus.ram[0xfe05] = 0xd0;
+        bus.ram[0xfe06] = 0x40;
+
+        // NMI vector $FFFA/$FFFB → $FE00.
+        bus.ram[0xfffa] = 0x00;
+        bus.ram[0xfffb] = 0xfe;
+
+        core.reg_pc = 0xc000;
+        core.reg_sp = 0xff;
+        // CIA2 Timer A has already underflowed (line high) — the first NMI edge.
+        bus.line = true;
+
+        // Run a bounded number of instructions; each NMI pass is
+        // NMI-entry + INC + INC + RTI + JMP ≈ 5 instructions.
+        for _ in 0..400 {
+            c64_6510core_execute(&mut core, &mut bus, &mut int);
+        }
+
+        // Post-fix: the low→high edge inside the INC $D000 RMW window is seen
+        // per-cycle, so a fresh NMI fires on every handler pass. Boundary-only
+        // sampling would swallow it and freeze at exactly 1 dispatch.
+        assert!(
+            bus.nmi_dispatches >= 2,
+            "expected repeated NMI delivery (>=2), got {} — the low→high edge \
+             inside one instruction was swallowed (boundary-only sampling)",
+            bus.nmi_dispatches
+        );
+        // The handler's "$FEB0 INC" ran once per NMI dispatch (mod 256).
+        assert_eq!(
+            bus.ram[0xfeb0] as u32,
+            bus.nmi_dispatches & 0xff,
+            "handler body ran exactly once per NMI dispatch"
+        );
+
+        // Sanity: the invariants that make redelivery correct rather than a
+        // double-count. After the run the line is high (last write re-raised it),
+        // so exactly one source is asserted on the /NMI line…
+        assert_eq!(int.nnmi, 1, "exactly one NMI source physically asserted");
+        // …and CIA2's pending latch is set (edge armed / being serviced), never
+        // multiply-counted.
+        assert_ne!(
+            int.pending_int[INT_SRC_CIA2] & IK_NMI,
+            0,
+            "CIA2 NMI source latched exactly once"
+        );
+    }
+
+    /// Guard invariant (Spec: edge-triggered, no re-fire on a still-high line):
+    /// a level that goes high ONCE and stays high delivers exactly ONE NMI — the
+    /// still-asserted line alone must never re-fire (that is what keeps RESTORE /
+    /// other NMI sources edge-triggered). Uses the same bus with the line pinned
+    /// high and NO ack access, so no low→high edge is ever regenerated.
+    #[test]
+    fn nmi_level_high_fires_exactly_once() {
+        let mut core = C64Core6510::new();
+        let mut bus = NmiLineBus::new();
+        let mut int = IntStatus::new();
+
+        // Handler at $FE00 that does NOT touch $D000 (never acks the line):
+        //   EE B0 FE   INC $FEB0
+        //   40         RTI
+        bus.ram[0xc000] = 0x4c; // JMP $C000
+        bus.ram[0xc001] = 0x00;
+        bus.ram[0xc002] = 0xc0;
+        bus.ram[0xfe00] = 0xee; // INC $FEB0
+        bus.ram[0xfe01] = 0xb0;
+        bus.ram[0xfe02] = 0xfe;
+        bus.ram[0xfe03] = 0x40; // RTI
+        bus.ram[0xfffa] = 0x00;
+        bus.ram[0xfffb] = 0xfe;
+
+        core.reg_pc = 0xc000;
+        core.reg_sp = 0xff;
+        bus.line = true; // stays high forever — no ack, no new edge
+
+        for _ in 0..400 {
+            c64_6510core_execute(&mut core, &mut bus, &mut int);
+        }
+
+        assert_eq!(
+            bus.nmi_dispatches, 1,
+            "a line that stays high must fire the NMI exactly once (edge-triggered)"
         );
     }
 }

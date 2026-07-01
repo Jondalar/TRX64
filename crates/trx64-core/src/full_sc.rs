@@ -343,6 +343,26 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
         self.fb.cia2.update_to(clk, table);
     }
 
+    /// PER-CYCLE line levels the SC core samples inside `clk_inc` to stamp the
+    /// CPU NMI/IRQ latches at the exact underflow / raster cycle (= VICE's CIA
+    /// alarm callback `my_set_int(rclk)` and VIC `maincpu_set_irq(rclk)`). CIA2's
+    /// interrupt output is wired to /NMI; CIA1 + the VIC feed the shared /IRQ.
+    /// The CIAs were advanced to `clk` by `process_alarms`/`interrupt_delay_alarms`
+    /// (via `update_to`) and the VIC ticked in `vic_cycle`, so these are pure
+    /// reads of the current latched line state.
+    #[inline]
+    fn cia2_nmi_line(&self) -> bool {
+        self.fb.cia2.irq_asserted()
+    }
+    #[inline]
+    fn cia1_irq_line(&self) -> bool {
+        self.fb.cia1.irq_asserted()
+    }
+    #[inline]
+    fn vic_irq_line(&self) -> bool {
+        self.fb.vic.irq_line
+    }
+
     /// cpu_reset (mainc64cpu.c:631-651) — invoked on the IK_RESET dispatch. The
     /// C64 reset vector ($FFFC/$FFFD) is read by DO_INTERRUPT itself (through
     /// `load`); there is no extra state to seed here for the stock machine (the
