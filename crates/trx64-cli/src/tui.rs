@@ -27,6 +27,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
+use serde_json::{json, Value};
 
 use crate::engine::{Engine, StateSnapshot};
 
@@ -218,12 +219,11 @@ fn run_loop(term: &mut Term, engine: &Engine, to_main: &Sender<UiToMain>) -> io:
                         return Ok(());
                     }
                     match key.code {
-                        // Tab: complete the /-command verb.
+                        // Tab: namespace-aware completion (verbs in /, !, and the bare
+                        // monitor namespace; paths for path-taking verbs). Parks the
+                        // cursor at the end + pushes any candidate list itself.
                         XKeyCode::Tab => {
-                            if let Some(msg) = autocomplete(&mut cp.input) {
-                                cp.push_log(&msg);
-                            }
-                            cp.cursor = cp.line_char_len();
+                            autocomplete(&mut cp, engine);
                         }
                         XKeyCode::Char(c) => {
                             cp.insert_char(c);
@@ -304,36 +304,245 @@ fn run_loop(term: &mut Term, engine: &Engine, to_main: &Sender<UiToMain>) -> io:
     }
 }
 
-/// Tab-complete a /-command verb in place. Returns a message listing candidates when
-/// the prefix is ambiguous (input is also completed to the longest common prefix); on a
-/// single match the verb is filled in with a trailing space; `None` when nothing to do.
-fn autocomplete(input: &mut String) -> Option<String> {
-    const VERBS: [&str; 17] = [
-        "power", "reset", "run", "pause", "step", "mount", "eject", "load", "warp", "joystick",
-        "window", "dump", "restore", "ringdump", "ringload", "help", "quit",
-    ];
-    let rest = input.strip_prefix('/')?;
-    if rest.contains(' ') {
-        return None; // verb already entered — args aren't completed
-    }
-    let matches: Vec<&str> = VERBS.iter().copied().filter(|v| v.starts_with(rest)).collect();
-    match matches.as_slice() {
-        [] => None,
-        [only] => {
-            *input = format!("/{only} ");
-            None
+// ── Tab completion (namespace-aware: /-verbs, !-verbs, bare monitor verbs, paths) ──
+
+/// VM (`/`) verbs — the machine namespace, INCLUDING the aliases `exec_line` accepts
+/// (umount/undump/joy/exit), so Tab offers every spelling.
+const VM_VERBS: &[&str] = &[
+    "power", "reset", "run", "pause", "step", "mount", "eject", "umount", "load", "warp",
+    "joystick", "joy", "window", "dump", "restore", "undump", "ringdump", "ringload", "settings",
+    "help", "quit", "exit",
+];
+
+/// VM verbs whose argument is a path — after `"/<verb> "`, Tab path-completes the last
+/// token (mirrors the PATH verbs in `engine::exec_line`).
+const VM_PATH_VERBS: &[&str] =
+    &["mount", "load", "run", "dump", "restore", "undump", "ringdump", "ringload"];
+
+/// FS (`!`) verbs — the filesystem namespace (mirrors `engine::FS_VERBS`, the monitor
+/// file shell verbs, re-prefixed with `!`).
+const FS_VERBS: &[&str] =
+    &["pwd", "cd", "ls", "dir", "mkdir", "rmdir", "load", "save", "bload", "bsave"];
+
+/// FS verbs whose argument is a path (all of them except `pwd`).
+const FS_PATH_VERBS: &[&str] =
+    &["cd", "ls", "dir", "mkdir", "rmdir", "load", "save", "bload", "bsave"];
+
+/// Curated monitor verbs (the bare namespace) — from `MONITOR.md`, minus the FS verbs
+/// (those live behind `!`). Used for bare-line verb completion.
+const MONITOR_VERBS: &[&str] = &[
+    // execution
+    "g", "x", "until", "z", "step", "n", "next", "ret", "return", "focus", "sf", "nf", "flow",
+    "bt", "reset",
+    // memory
+    "m", "d", "sd", "df", "screen", "io", "bitmap", "bank", "wr", "f", "a", "t", "c", "h",
+    // breakpoints & observers
+    "bk", "del", "obs", "ignore",
+    // cpu
+    "r", "sidefx", "device",
+    // state & trace
+    "dump", "undump", "savecrt", "swapcrt", "trace", "tracedb", "traceindex",
+    // analysis
+    "map", "taint", "swimlane", "chis",
+    // reverse-debug
+    "rstep", "reverse", "whowrote", "triage", "revdepth", "diff", "ringdump", "ringload",
+    // knowledge
+    "inspect", "xref", "sym",
+];
+
+/// What a Tab press should complete for the current input line. Pure classification —
+/// no I/O — so it is unit-testable without the rpc.
+enum CompletePlan {
+    /// Nothing to complete (empty bare line; a non-path verb followed by args).
+    Nothing,
+    /// Complete a verb from `set`, displayed with the namespace prefix `ns` (`/`/`!`/``).
+    Verbs { ns: &'static str, stem: String, set: &'static [&'static str] },
+    /// Complete a path — the last token of the line is a path argument.
+    Path,
+}
+
+/// Decide what Tab completes for `input`, by namespace. Pure.
+fn plan_complete(input: &str) -> CompletePlan {
+    // `/` — the machine namespace.
+    if let Some(rest) = input.strip_prefix('/') {
+        if !rest.contains(' ') {
+            return CompletePlan::Verbs { ns: "/", stem: rest.to_string(), set: VM_VERBS };
         }
+        let verb = rest.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+        return if VM_PATH_VERBS.contains(&verb.as_str()) {
+            CompletePlan::Path
+        } else {
+            CompletePlan::Nothing
+        };
+    }
+    // `!` — the filesystem namespace.
+    if let Some(rest) = input.strip_prefix('!') {
+        if !rest.contains(' ') {
+            return CompletePlan::Verbs { ns: "!", stem: rest.to_string(), set: FS_VERBS };
+        }
+        let verb = rest.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+        return if FS_PATH_VERBS.contains(&verb.as_str()) {
+            CompletePlan::Path
+        } else {
+            CompletePlan::Nothing
+        };
+    }
+    // bare — the monitor namespace. Verb completion only (no space yet); a space means
+    // args (addresses / symbols), which are out of scope for now.
+    if !input.is_empty() && !input.contains(' ') {
+        return CompletePlan::Verbs { ns: "", stem: input.to_string(), set: MONITOR_VERBS };
+    }
+    CompletePlan::Nothing
+}
+
+/// Tab-complete the cockpit input line in place, namespace-aware. Fills the line (verb
+/// or path), pushes an ambiguous-verb candidate list or a COLORED path-candidate list
+/// into the log, and parks the cursor at the end.
+fn autocomplete(cp: &mut Cockpit, engine: &Engine) {
+    match plan_complete(&cp.input) {
+        CompletePlan::Nothing => {}
+        CompletePlan::Verbs { ns, stem, set } => {
+            let (line, listing) = complete_verb(ns, &stem, set);
+            cp.input = line;
+            if !listing.is_empty() {
+                cp.push_log_styled(listing);
+            }
+        }
+        CompletePlan::Path => {
+            let (line, listing) = complete_path(&cp.input, engine);
+            cp.input = line;
+            if !listing.is_empty() {
+                cp.push_log_styled(listing);
+            }
+        }
+    }
+    cp.cursor = cp.line_char_len();
+}
+
+/// Pure verb completion. Returns the (possibly completed) line and the candidate lines
+/// to log — empty on a zero/unique match; one plain line listing the candidates when the
+/// prefix is ambiguous (the line is also filled to the longest common prefix).
+fn complete_verb(ns: &str, stem: &str, set: &[&str]) -> (String, Vec<LogLine>) {
+    let matches: Vec<&str> = set.iter().copied().filter(|v| v.starts_with(stem)).collect();
+    match matches.as_slice() {
+        [] => (format!("{ns}{stem}"), Vec::new()),
+        [only] => (format!("{ns}{only} "), Vec::new()),
         many => {
             let lcp = longest_common_prefix(many);
-            if lcp.len() > rest.len() {
-                *input = format!("/{lcp}");
-            }
-            Some(format!(
+            let line =
+                if lcp.len() > stem.len() { format!("{ns}{lcp}") } else { format!("{ns}{stem}") };
+            let listing = format!(
                 "  {}",
-                many.iter().map(|m| format!("/{m}")).collect::<Vec<_>>().join("  ")
-            ))
+                many.iter().map(|m| format!("{ns}{m}")).collect::<Vec<_>>().join("  ")
+            );
+            (line, vec![LogLine::from(listing.as_str())])
         }
     }
+}
+
+/// The path token being completed, carved out of the input line.
+#[derive(Debug, Clone, PartialEq)]
+struct PathTok {
+    /// The untouched head of the line before the token (INCLUDING the separating space,
+    /// but NOT an opening quote — the quote is captured by `quoted`).
+    head: String,
+    /// The partial path typed so far (may contain spaces when it was quoted).
+    partial: String,
+    /// Whether the token was introduced by an (unclosed) double-quote.
+    quoted: bool,
+}
+
+/// Extract the path token from `input`: everything after an unclosed `"` (a quoted path,
+/// spaces allowed), else the last whitespace-delimited token. Pure.
+fn split_path_token(input: &str) -> PathTok {
+    // An odd number of double-quotes → the last `"` is still open: everything after it
+    // is the (space-allowing) path token.
+    if input.matches('"').count() % 2 == 1 {
+        let q = input.rfind('"').unwrap();
+        return PathTok {
+            head: input[..q].to_string(),
+            partial: input[q + 1..].to_string(),
+            quoted: true,
+        };
+    }
+    match input.rfind(char::is_whitespace) {
+        Some(i) => {
+            let next = i + input[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+            PathTok {
+                head: input[..next].to_string(),
+                partial: input[next..].to_string(),
+                quoted: false,
+            }
+        }
+        None => PathTok { head: String::new(), partial: input.to_string(), quoted: false },
+    }
+}
+
+/// Pure line reconstruction after a path lookup. `single` is `Some(is_dir)` when exactly
+/// one candidate matched (fill + terminate: dir → `/`, file → space, closing the quote
+/// when needed); `None` when many matched (fill the common prefix only, token left open).
+/// (Re)quotes when the token was already quoted or the completed text contains a space.
+fn apply_path_completion(tok: &PathTok, common: &str, single: Option<bool>) -> String {
+    // The daemon's `common` is relative to the token's directory part (it splits at the
+    // last `/`), so re-attach that prefix — computed identically — to rebuild the token.
+    let dir_part = match tok.partial.rfind('/') {
+        Some(i) => &tok.partial[..=i],
+        None => "",
+    };
+    let completed = format!("{dir_part}{common}");
+    let needs_quote = tok.quoted || completed.contains(' ');
+    let open = if needs_quote { "\"" } else { "" };
+    let tail = match single {
+        Some(true) => "/".to_string(),
+        Some(false) => {
+            if needs_quote {
+                "\" ".to_string()
+            } else {
+                " ".to_string()
+            }
+        }
+        None => String::new(),
+    };
+    format!("{}{open}{completed}{tail}", tok.head)
+}
+
+/// Path completion via the daemon `fs/complete` rpc. Returns the (possibly completed)
+/// line and, on multiple candidates, a COLORED candidate list to log. A soft/empty rpc
+/// result leaves the line untouched.
+fn complete_path(input: &str, engine: &Engine) -> (String, Vec<LogLine>) {
+    let tok = split_path_token(input);
+    let resp = engine.rpc("fs/complete", json!({ "partial": tok.partial })).unwrap_or(Value::Null);
+    let entries = resp.get("entries").and_then(|e| e.as_array()).cloned().unwrap_or_default();
+    let common = resp.get("common").and_then(|c| c.as_str()).unwrap_or("");
+    match entries.len() {
+        0 => (input.to_string(), Vec::new()),
+        1 => {
+            let is_dir = entries[0].get("is_dir").and_then(|d| d.as_bool()).unwrap_or(false);
+            (apply_path_completion(&tok, common, Some(is_dir)), Vec::new())
+        }
+        _ => (apply_path_completion(&tok, common, None), candidate_log_lines(&entries)),
+    }
+}
+
+/// One colored [`LogLine`] per candidate (each line carries a single [`Style`], so
+/// per-filetype coloring is one entry per line), capped so a large directory can't flood
+/// the log.
+fn candidate_log_lines(entries: &[Value]) -> Vec<LogLine> {
+    const CAP: usize = 100;
+    let mut out: Vec<LogLine> = entries
+        .iter()
+        .take(CAP)
+        .map(|e| {
+            let name = e.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            let is_dir = e.get("is_dir").and_then(|d| d.as_bool()).unwrap_or(false);
+            let text = if is_dir { format!("  {name}/") } else { format!("  {name}") };
+            LogLine { text, style: Some(crate::ftcolor::style_for(name, is_dir)) }
+        })
+        .collect();
+    if entries.len() > CAP {
+        out.push(LogLine::from(format!("  … {} more", entries.len() - CAP).as_str()));
+    }
+    out
 }
 
 /// The filetype [`Style`] for a single `ls`/`dir` entry line. The daemon FS format is
@@ -602,27 +811,207 @@ mod tests {
         assert_eq!(cp.input, "hello");
     }
 
+    // ── S5: namespace-aware Tab completion ─────────────────────────────────────
+
     #[test]
-    fn autocomplete_single_completes_with_space() {
-        let mut s = "/pow".to_string();
-        assert_eq!(autocomplete(&mut s), None);
-        assert_eq!(s, "/power ");
+    fn verb_single_completes_with_space() {
+        let (line, listing) = complete_verb("/", "pow", VM_VERBS);
+        assert_eq!(line, "/power ");
+        assert!(listing.is_empty());
     }
 
     #[test]
-    fn autocomplete_ambiguous_fills_common_prefix_and_lists() {
+    fn verb_ambiguous_fills_common_prefix_and_lists() {
         // /re → {reset, restore}; LCP = "res".
-        let mut s = "/re".to_string();
-        let msg = autocomplete(&mut s).expect("candidates listed");
-        assert_eq!(s, "/res");
-        assert!(msg.contains("/reset") && msg.contains("/restore"));
+        let (line, listing) = complete_verb("/", "re", VM_VERBS);
+        assert_eq!(line, "/res");
+        assert_eq!(listing.len(), 1);
+        let msg = &listing[0].text;
+        assert!(msg.contains("/reset") && msg.contains("/restore"), "listing: {msg}");
+        // the candidate list is a plain line (no per-entry style for verbs)
+        assert_eq!(listing[0].style, None);
     }
 
     #[test]
-    fn autocomplete_ignores_bare_monitor_lines() {
-        let mut s = "d c000".to_string();
-        assert_eq!(autocomplete(&mut s), None);
-        assert_eq!(s, "d c000");
+    fn verb_no_match_leaves_line_unchanged() {
+        let (line, listing) = complete_verb("/", "zzz", VM_VERBS);
+        assert_eq!(line, "/zzz");
+        assert!(listing.is_empty());
+    }
+
+    #[test]
+    fn plan_routes_each_namespace() {
+        // verb completion in each namespace
+        assert!(matches!(plan_complete("/mo"), CompletePlan::Verbs { ns: "/", .. }));
+        assert!(matches!(plan_complete("!l"), CompletePlan::Verbs { ns: "!", .. }));
+        assert!(matches!(plan_complete("wh"), CompletePlan::Verbs { ns: "", .. }));
+        // path completion after a space on a path-taking verb
+        assert!(matches!(plan_complete("/mount foo"), CompletePlan::Path));
+        assert!(matches!(plan_complete("!cd sub"), CompletePlan::Path));
+        // a non-path verb followed by args → nothing
+        assert!(matches!(plan_complete("/eject x"), CompletePlan::Nothing));
+        assert!(matches!(plan_complete("!pwd x"), CompletePlan::Nothing));
+        // a bare monitor command WITH an argument → nothing (was the old behaviour for
+        // `d c000`); an empty line → nothing.
+        assert!(matches!(plan_complete("d c000"), CompletePlan::Nothing));
+        assert!(matches!(plan_complete(""), CompletePlan::Nothing));
+    }
+
+    #[test]
+    fn plan_bare_monitor_verb_completes() {
+        // A bare, space-free token completes against the curated monitor verb set.
+        match plan_complete("who") {
+            CompletePlan::Verbs { ns, stem, set } => {
+                assert_eq!(ns, "");
+                assert_eq!(stem, "who");
+                let (line, listing) = complete_verb(ns, &stem, set);
+                assert_eq!(line, "whowrote "); // unique monitor verb
+                assert!(listing.is_empty());
+            }
+            _ => panic!("bare monitor verb should complete"),
+        }
+    }
+
+    #[test]
+    fn split_path_token_unquoted_last_token() {
+        assert_eq!(
+            split_path_token("!cd sub/fo"),
+            PathTok { head: "!cd ".into(), partial: "sub/fo".into(), quoted: false }
+        );
+    }
+
+    #[test]
+    fn split_path_token_quoted_allows_spaces() {
+        // an open double-quote captures the rest as one path, spaces and all
+        assert_eq!(
+            split_path_token("!load \"my ga"),
+            PathTok { head: "!load ".into(), partial: "my ga".into(), quoted: true }
+        );
+    }
+
+    #[test]
+    fn split_path_token_no_space_is_whole_input() {
+        assert_eq!(
+            split_path_token("abc"),
+            PathTok { head: String::new(), partial: "abc".into(), quoted: false }
+        );
+    }
+
+    #[test]
+    fn apply_single_file_fills_and_spaces() {
+        let tok = PathTok { head: "!load ".into(), partial: "loa".into(), quoted: false };
+        assert_eq!(apply_path_completion(&tok, "loader.prg", Some(false)), "!load loader.prg ");
+    }
+
+    #[test]
+    fn apply_single_dir_appends_slash() {
+        let tok = PathTok { head: "!cd ".into(), partial: "su".into(), quoted: false };
+        assert_eq!(apply_path_completion(&tok, "sub", Some(true)), "!cd sub/");
+    }
+
+    #[test]
+    fn apply_many_fills_common_prefix_only() {
+        let tok = PathTok { head: "!ls ".into(), partial: "a".into(), quoted: false };
+        assert_eq!(apply_path_completion(&tok, "a", None), "!ls a");
+    }
+
+    #[test]
+    fn apply_requotes_when_completed_has_space() {
+        // an unquoted token whose completion contains a space → wrap it in quotes
+        let tok = PathTok { head: "!load ".into(), partial: "my".into(), quoted: false };
+        assert_eq!(
+            apply_path_completion(&tok, "my game.prg", Some(false)),
+            "!load \"my game.prg\" "
+        );
+    }
+
+    #[test]
+    fn apply_preserves_quote_and_reattaches_dir_part() {
+        // quoted token with a dir part; the daemon `common` is relative to the dir part,
+        // so it must be re-attached, and the quote preserved + closed on a file.
+        let tok = PathTok { head: "!load ".into(), partial: "sub/lo".into(), quoted: true };
+        assert_eq!(
+            apply_path_completion(&tok, "loader.prg", Some(false)),
+            "!load \"sub/loader.prg\" "
+        );
+    }
+
+    #[test]
+    fn candidate_log_lines_color_by_filetype() {
+        let entries = vec![
+            json!({ "name": "sub", "is_dir": true }),
+            json!({ "name": "a.crt", "is_dir": false }),
+        ];
+        let lines = candidate_log_lines(&entries);
+        assert_eq!(lines.len(), 2);
+        // a dir gets a trailing '/' + dir style
+        assert_eq!(lines[0].text, "  sub/");
+        assert_eq!(lines[0].style, Some(crate::ftcolor::style_for("sub", true)));
+        // a file is colored by its extension
+        assert_eq!(lines[1].text, "  a.crt");
+        assert_eq!(lines[1].style, Some(crate::ftcolor::style_for("a.crt", false)));
+    }
+
+    /// rpc-backed: boot a machine (skip when ROMs absent), point the FS cwd at a temp
+    /// dir, and exercise `complete_path` + the `autocomplete` orchestrator end-to-end.
+    #[test]
+    fn path_complete_against_live_cwd() {
+        let rom_dir = crate::default_rom_dir();
+        if !rom_dir.join("kernal-901227-03.bin").exists() {
+            eprintln!("[skip] path_complete_against_live_cwd: ROMs absent at {}", rom_dir.display());
+            return;
+        }
+        let engine = match crate::boot_engine(&rom_dir) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("[skip] path_complete_against_live_cwd: boot failed: {e}");
+                return;
+            }
+        };
+        let dir = std::env::temp_dir().join(format!("trx64_s5_pathcomp_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.crt"), b"").unwrap();
+        std::fs::write(dir.join("a2.crt"), b"").unwrap();
+        std::fs::write(dir.join("uniquefile.prg"), b"").unwrap();
+        std::fs::create_dir_all(dir.join("subby")).unwrap();
+
+        engine.exec_line(&format!("!cd {}", dir.display()));
+
+        // Ambiguous: "!ls a" → common "a" (no growth), colored list of both .crt files.
+        let (line, listing) = complete_path("!ls a", &engine);
+        assert_eq!(line, "!ls a");
+        let names: Vec<&str> = listing.iter().map(|l| l.text.trim()).collect();
+        assert!(names.contains(&"a.crt") && names.contains(&"a2.crt"), "names: {names:?}");
+        // the candidate list is COLORED (.crt → yellow via ftcolor)
+        assert!(listing
+            .iter()
+            .any(|l| l.style == Some(crate::ftcolor::style_for("a.crt", false))));
+
+        // Unique file: "!load uni" → fill + trailing space, no listing.
+        let (line, listing) = complete_path("!load uni", &engine);
+        assert_eq!(line, "!load uniquefile.prg ");
+        assert!(listing.is_empty());
+
+        // Unique dir: "!cd sub" → fill + trailing slash.
+        let (line, _) = complete_path("!cd sub", &engine);
+        assert_eq!(line, "!cd subby/");
+
+        // Orchestrator wiring: a verb completion (no rpc) sets the line + parks cursor.
+        let mut cp = Cockpit::new();
+        cp.set_line("/pow".into());
+        autocomplete(&mut cp, &engine);
+        assert_eq!(cp.input, "/power ");
+        assert_eq!(cp.cursor, cp.line_char_len());
+
+        // Orchestrator wiring: a path completion (rpc-backed) fills the line.
+        let mut cp = Cockpit::new();
+        cp.set_line("!cd sub".into());
+        autocomplete(&mut cp, &engine);
+        assert_eq!(cp.input, "!cd subby/");
+        assert_eq!(cp.cursor, cp.line_char_len());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── S4: !ls filetype coloring ─────────────────────────────────────────────
