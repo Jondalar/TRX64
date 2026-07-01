@@ -42,8 +42,8 @@
       "title": "!ls coloring in cockpit (parse d|- flag, apply ftcolor)",
       "files": ["crates/trx64-cli/src/tui.rs"],
       "deps": ["S2"],
-      "status": "todo",
-      "notes": ""
+      "status": "done",
+      "notes": "c000533 — LogLine{text,style}; ls_styled_lines/ls_entry_style split !ls/!dir output into ftcolor-styled entries (dir flag col drives dir-vs-file), header+(empty) stay plain; 6 unit tests; cargo test -p trx64-cli 37/37 green"
     },
     {
       "id": "S5",
