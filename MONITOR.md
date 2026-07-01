@@ -7,8 +7,11 @@ WS client.
 
 How you reach it:
 
-- **trx64-cli cockpit** — type a command on a bare line (`d c000`, `r`, `bk e000`). The
-  `/`-prefixed verbs are machine control; everything else is the monitor.
+- **trx64-cli cockpit** — three command namespaces. A **bare line** is the monitor
+  (`d c000`, `r`, `bk e000`); a **`/`-prefixed** line is machine control (`/run`,
+  `/mount`, `/reset` — see the cockpit README); a **`!`-prefixed** line is the
+  filesystem (`!ls`, `!cd`, `!load "…"` — the *File* verbs below, re-prefixed).
+  **Tab** completes verbs in all three namespaces and paths for path arguments.
 - **WebSocket** — `{"method":"monitor/exec","params":{"command":"d c000"}}`.
 - **In the monitor** — `help` (or `?`) prints the live verb list.
 
@@ -182,6 +185,10 @@ obs cap_off when exec $4100 do trace off              # stop at $4100
 | `sym <name> [stem]` | reverse lookup: named routine/label → address |
 
 ### File  (rooted at the project dir)
+> In the **trx64cli cockpit** these File verbs are reached with a `!` prefix
+> (`!ls`, `!cd`, `!load "…"`); a bare `ls`/`cd`/… there prints a nudge to the `!`
+> form. Everywhere else (WebSocket, C64RE `runtime_monitor`) they stay bare-callable.
+
 | command | what it does |
 |---|---|
 | `pwd` / `cd [dir]` / `ls [dir]` | FS shell (`cd` with no arg = project dir) |

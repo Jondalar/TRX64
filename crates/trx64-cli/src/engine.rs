@@ -700,7 +700,7 @@ pub fn help_text() -> String {
     "\
 TRX64 cockpit = bash for the emulator. Three namespaces:
   /…  the machine   !…  the filesystem   bare  the monitor
-Tab completes /-command verbs (fuller completion coming).
+Tab completes verbs in all three namespaces + paths for path arguments.
 
   /-commands (the machine):
   /power on|off        cold boot / halt+reset to powered-off

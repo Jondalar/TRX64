@@ -59,17 +59,24 @@ your OS on your `PATH`.
 
 ---
 
-## Two vocabularies: `/` = machine, bare = monitor
+## Three namespaces: bash for the emulator
 
-The command line follows one rule (shared with C64RE + the app):
+The command line has three namespaces, picked by the first character:
 
 | You type | Goes to |
 |---|---|
 | a **bare line** (`d c000`, `r`, `bk e000`, `g`, `trace on`, `whowrote d020`) | the **monitor** — the full ~128-verb VICE superset |
 | a **`/`-prefixed** line (`/run`, `/mount disk.d64`, `/reset`) | a **VM / machine command** |
+| a **`!`-prefixed** line (`!ls`, `!cd docs`, `!load "game.prg"`) | the **filesystem** — the monitor's file shell, re-prefixed |
 
 The monitor is the surface you live in, so it's frictionless (no prefix). Machine and
-meta commands are `/`-namespaced — discoverable (`/help`) and collision-free.
+meta commands are `/`-namespaced — discoverable (`/help`) and collision-free. The
+filesystem verbs sit behind `!`, like a coding tool's shell escape.
+
+> **`!` is a cockpit routing layer only.** The FS verbs (`pwd cd ls dir mkdir rmdir
+> load save bload bsave`) live in the shared monitor and stay **bare-callable**
+> everywhere else (WebSocket, C64RE `runtime_monitor`). In *this cockpit* a bare FS
+> verb prints a one-line nudge to the `!` form, so `/`, `!`, and bare read cleanly.
 
 ### `/`-commands
 
@@ -80,20 +87,47 @@ meta commands are `/`-namespaced — discoverable (`/help`) and collision-free.
 | `/run` | resume free-running |
 | `/run <prg>` | load + autostart a `.prg` |
 | `/pause` · `/step` | freeze / single-step one instruction |
-| `/mount <path>` · `/eject` | insert a `.d64`/`.g64`/`.crt` (auto-runs) / unmount drive 8 |
+| `/mount <path>` · `/eject` (`/umount`) | insert a `.d64`/`.g64` (disk swaps live) or `.crt` (cold-boots) / eject the cart or unmount drive 8 |
 | `/load <prg>` | load a `.prg` into RAM (no run) |
 | `/warp on\|off` | 8× / real-time PAL pacing |
 | `/joystick off\|port1\|port2` | route WASD+Space to the joystick (off = type) |
 | `/window` | spawn the native emulator window |
-| `/dump <path>` · `/restore <path>` | write / load a `.c64re` snapshot |
+| `/dump <path>` · `/restore <path>` (`/undump`) | write / load a `.c64re` snapshot |
 | `/ringdump <path>` · `/ringload <path>` | write / load a `.c64rering` reverse-debug buffer |
+| `/settings` | read-only status (pacing / warp / joystick / disk / cart) |
 | `/help` · `/quit` | list commands / exit |
 
-Everything else is sent verbatim to the monitor — see **[MONITOR.md](../../MONITOR.md)**
-for the full command reference (disassemble/dump/assemble, breakpoints + observers,
-flow/backtrace, tracing, memory-map / taint / swimlanes, and the reverse-debug verbs
-`rstep` / `whowrote` / `diff` / `chis` / crash triage). Or run `help` (bare) in the
-cockpit for the live verb list.
+### `!`-commands (the filesystem)
+
+The monitor's file shell, re-prefixed with `!`. Paths are rooted at the project dir.
+
+| command | action |
+|---|---|
+| `!pwd` · `!cd [dir]` · `!ls` (`!dir`) `[dir]` | print / change / list (`!cd` no arg = project dir) |
+| `!mkdir <dir>` · `!rmdir <dir>` | make (recursive) / remove an empty directory |
+| `!load "<f>" [addr]` · `!save "<f>" <a1> <a2>` | PRG load into RAM / save a RAM range as a PRG |
+| `!bload "<f>" <addr>` · `!bsave "<f>" <a1> <a2>` | raw binary load / save (no header) |
+
+Everything else (a bare line) is sent verbatim to the monitor — see
+**[MONITOR.md](../../MONITOR.md)** for the full command reference (disassemble/dump/
+assemble, breakpoints + observers, flow/backtrace, tracing, memory-map / taint /
+swimlanes, and the reverse-debug verbs `rstep` / `whowrote` / `diff` / `chis` / crash
+triage). Or run `help` (bare) in the cockpit for the live verb list.
+
+### Media semantics (CRT ≠ Disk)
+
+`/mount` and `/eject` behave like the real hardware — a disk swap and a cartridge
+change are not the same event:
+
+- **Disk mount** (`.d64`/`.g64`) swaps the medium only — **no reset, no
+  power-cycle**. The floppy state and the running program survive, exactly like sliding
+  a new disk into a live 1541.
+- **CRT mount** (`.crt`) is a **power-cycle cold boot**: power off → insert → power on.
+  Atomic, and the cockpit's run-state is reconciled so the machine visibly boots the
+  cart (the pump resumes).
+- **`/eject`** targets what's actually mounted (cart first, else disk). Ejecting a
+  cartridge power-cycles (RAM wiped, like pulling a cart from a real C64); ejecting a
+  disk just removes the medium.
 
 ---
 
@@ -115,10 +149,32 @@ The panels refresh ~20 Hz from the live machine. The MACHINE panel shows RUNNING
 
 - **Mouse wheel** scrolls the OUTPUT/LOG pane. Any new output snaps back to the live
   tail; a `▲N` indicator in the title shows you're in scrollback.
-- **↑ / ↓** walk the command history.
-- **Tab** completes a `/`-command verb: a single match fills it in; an ambiguous prefix
-  fills the longest common prefix and lists the candidates.
-- **Ctrl-C / Ctrl-D** quit.
+- **↑ / ↓** walk the command history — persisted to `~/.trx64/history`, consecutive
+  duplicates deduped, capped at ~2000 lines.
+- **Tab** completes namespace-aware: `/`-verbs, `!`-verbs, or bare monitor verbs by
+  prefix, and **paths** for any path argument (through quotes + spaces). A single match
+  fills in (dir → trailing `/`, file → trailing space); an ambiguous prefix fills the
+  longest common prefix and lists the candidates — path candidates **colored by
+  filetype** (below).
+- **← / → / Home / End** move the cursor; **Backspace / Delete** edit anywhere in the
+  line (editing a recalled history line detaches it).
+- **Readline muscles:** Ctrl-A (home), Ctrl-E (end), Ctrl-K (kill to end), Ctrl-U (kill
+  to start), Ctrl-W (delete word before), Ctrl-L (clear the log).
+- **Ctrl-C** clears a non-empty line (bash convention) or quits when the line is empty;
+  **Ctrl-D** deletes forward, or quits on an empty line (EOF).
+
+### Filetype colors (LS_COLORS-lite)
+
+`!ls` output and Tab path-candidate lists are colored by type:
+
+| color | filetypes |
+|---|---|
+| blue + bold | directories |
+| yellow | `.crt` (cartridge) |
+| cyan | `.d64` / `.g64` / `.p64` (disk image) |
+| green | `.prg` / `.bin` (program / raw) |
+| magenta | `.c64re` / `.c64retrace` / `.c64rering` (snapshot / trace / ring) |
+| gray | `.asm` / `.tass` / `.md` / `.json` (source / text) |
 
 ---
 
