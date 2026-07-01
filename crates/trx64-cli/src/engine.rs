@@ -202,12 +202,35 @@ impl Engine {
         if line.is_empty() {
             return CmdResult::text("");
         }
+        // `!`-prefixed = the FILESYSTEM namespace. The FS verbs (pwd/cd/ls/…) live in
+        // the monitor, so `!ls` routes to monitor `ls`. The `!` prefix is a COCKPIT
+        // routing layer ONLY — the shared `run_monitor` keeps every FS verb bare-
+        // callable (C64RE drives them via `runtime_monitor`), so we never touch it.
+        if let Some(rest) = line.strip_prefix('!') {
+            let fs = rest.trim();
+            if fs.is_empty() {
+                return CmdResult::text(fs_help_text()); // bare "!" → the FS help
+            }
+            return self.verb_monitor(fs);
+        }
         // `/`-prefixed = VM / high-level command (slash-command namespace); a bare
         // line = monitor passthrough (the ~128-verb VICE-superset — the primary
         // surface, so you type `d c000` / `r` / `bk e000` directly).
         let vm = match line.strip_prefix('/') {
             Some(rest) => rest.trim(),
-            None => return self.verb_monitor(line),
+            None => {
+                // Cockpit nudge: the FS verbs now live behind `!`. If a bare line's
+                // FIRST token is an FS verb, hint the `!` form instead of silently
+                // running the monitor's copy. This is a cockpit-only routing hint —
+                // `run_monitor` is unchanged, so the verbs stay bare-callable there.
+                let first = line.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+                if FS_VERBS.contains(&first.as_str()) {
+                    return CmdResult::text(format!(
+                        "filesystem commands live behind '!' — try !{first}"
+                    ));
+                }
+                return self.verb_monitor(line);
+            }
         };
         if vm.is_empty() {
             return CmdResult::text(help_text()); // bare "/" → the VM help
@@ -231,15 +254,16 @@ impl Engine {
             "pause" => self.verb_pause(),
             "step" => self.verb_step(),
             "mount" => self.verb_mount(&arg),
-            "eject" => self.verb_eject(),
+            "eject" | "umount" => self.verb_eject(),
             "load" => self.verb_load(&arg),
             "warp" => self.verb_warp(rest.first().copied()),
             "joystick" | "joy" => self.verb_joystick(rest.first().copied()),
             "window" => CmdResult { output: "opening emulator window…".into(), open_window: true, quit: false },
             "dump" => self.verb_dump(&arg),
-            "restore" => self.verb_restore(&arg),
+            "restore" | "undump" => self.verb_restore(&arg),
             "ringdump" => self.verb_ringdump(&arg),
             "ringload" => self.verb_ringload(&arg),
+            "settings" => self.verb_settings(),
             "help" => CmdResult::text(help_text()),
             "quit" | "exit" => {
                 self.quit.store(true, Ordering::SeqCst);
@@ -472,6 +496,51 @@ impl Engine {
         }
     }
 
+    /// `/settings` — a read-only cockpit status summary: run-state, pacing/warp,
+    /// the virtual-joystick mode, and the mounted disk + cartridge. Composed from
+    /// the host run/warp flags plus read-only `session/state` / `session/list` /
+    /// `session/cart_status` rpcs (no machine mutation).
+    fn verb_settings(&self) -> CmdResult {
+        let running = if self.is_running() { "running" } else { "paused" };
+        let pacing = if self.is_warp() { "warp (8×)" } else { "PAL real-time (1×)" };
+        let joy = match self.joystick_mode() {
+            0 => "off (WASD/Space type normally)".to_string(),
+            p => format!("port {p} (WASD = directions, Space = fire)"),
+        };
+        // Mounted disk (empty diskPath = none) — session/list carries it read-only.
+        let disk = self
+            .rpc("session/list", json!({}))
+            .ok()
+            .and_then(|v| {
+                v.get(0)
+                    .and_then(|s| s.get("diskPath"))
+                    .and_then(|p| p.as_str())
+                    .map(|p| p.to_string())
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "(none)".to_string());
+        // Cartridge (null = none) — session/cart_status carries type + sourceName.
+        let cart = match self.rpc("session/cart_status", json!({})) {
+            Ok(Value::Null) | Err(_) => "(none)".to_string(),
+            Ok(v) => {
+                let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("cart");
+                match v.get("sourceName").and_then(|s| s.as_str()) {
+                    Some(name) if !name.is_empty() => format!("{name} ({ty})"),
+                    _ => ty.to_string(),
+                }
+            }
+        };
+        let pc = self.cur_pc();
+        CmdResult::text(format!(
+            "TRX64 settings\n  \
+             state:    {running} @ PC=${pc:04X}\n  \
+             pacing:   {pacing}\n  \
+             joystick: {joy}\n  \
+             disk:     {disk}\n  \
+             cart:     {cart}"
+        ))
+    }
+
     // ── input (the emulator window forwards host keys/joystick through these) ────
 
     pub fn key_down(&self, key: &str) {
@@ -589,9 +658,17 @@ fn compact(v: &Value) -> String {
     }
 }
 
+/// FS verbs that live in the monitor's file shell. Bare use of one of these in the
+/// cockpit is NUDGED toward the `!` namespace (`!ls`); they remain bare-callable in
+/// `run_monitor` itself (C64RE depends on that) — this list is a COCKPIT hint only.
+pub const FS_VERBS: [&str; 10] =
+    ["pwd", "cd", "ls", "dir", "mkdir", "rmdir", "load", "save", "bload", "bsave"];
+
 pub fn help_text() -> String {
     "\
-TRX64 cockpit — VM commands are /-prefixed; a bare line goes to the monitor.
+TRX64 cockpit = bash for the emulator. Three namespaces:
+  /…  the machine   !…  the filesystem   bare  the monitor
+Tab completes /-command verbs (fuller completion coming).
 
   /-commands (the machine):
   /power on|off        cold boot / halt+reset to powered-off
@@ -601,23 +678,46 @@ TRX64 cockpit — VM commands are /-prefixed; a bare line goes to the monitor.
   /pause               freeze the machine
   /step                single-step one instruction
   /mount <path>        mount a .d64/.g64/.crt
-  /eject               unmount drive8
+  /eject | /umount     eject the cartridge or unmount drive8
   /load <prg>          load a .prg into RAM (no run)
   /warp on|off         8× / real-time PAL pacing
   /joystick off|port1|port2   route WASD+Space to the joystick (off = type)
   /window              spawn the native emulator window
   /dump <path>         write a .c64re snapshot
-  /restore <path>      load a .c64re snapshot
+  /restore | /undump <path>   load a .c64re snapshot
   /ringdump <path>     write a .c64rering reverse-debug buffer
   /ringload <path>     load a .c64rering reverse-debug buffer
+  /settings            read-only status (pacing/warp/joystick/disk/cart)
   /help                this help
   /quit                exit
+
+  !-commands (the filesystem — the monitor file shell, re-prefixed):
+  !pwd  !cd <dir>  !ls|!dir [dir]  !mkdir <dir>  !rmdir <dir>
+  !load \"<f>\" [addr]  !save \"<f>\" <a1> <a2>  !bload \"<f>\" <addr>  !bsave \"<f>\" <a1> <a2>
 
   bare line → the VICE-superset monitor (~128 verbs), e.g.:
   d c000               disassemble    m 0400      memory dump
   r                    registers      bk e000     breakpoint
   g                    go             trace on    instruction trace
   whowrote d020        last writers   diff a b    checkpoint diff
+"
+    .to_string()
+}
+
+/// Short help for a bare `!` (the filesystem namespace) — mirrors the monitor's file
+/// shell verbs verbatim (argument shapes match `run_monitor`, main.rs:5379-5524).
+pub fn fs_help_text() -> String {
+    "\
+!-commands (the filesystem — the monitor file shell, re-prefixed):
+  !pwd                    print the working directory
+  !cd <dir>               change directory (no arg → project dir)
+  !ls | !dir [dir]        list a directory (default: cwd)
+  !mkdir <dir>            make a directory (recursive)
+  !rmdir <dir>            remove an empty directory
+  !load \"<file>\" [addr]   PRG load into RAM (header load-addr, or override)
+  !save \"<file>\" <a1> <a2>   save a RAM range as a PRG
+  !bload \"<file>\" <addr>  raw binary load (no header)
+  !bsave \"<file>\" <a1> <a2>  raw binary save (no header)
 "
     .to_string()
 }

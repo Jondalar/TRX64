@@ -18,8 +18,10 @@ fn mount_resolves_relative_path_against_cd_cwd() {
     std::fs::write(dir.join("dummy.crt"), b"readable but not a valid CRT").unwrap();
 
     let e = boot_engine(Path::new(ROMS)).expect("boot");
-    // `cd` into the temp dir (sets the monitor fs_cwd), then mount by RELATIVE name.
-    e.exec_line(&format!("cd {}", dir.display()));
+    // `!cd` into the temp dir (sets the monitor fs_cwd via the `!` filesystem
+    // namespace — CLI-FEEL S1), then mount by RELATIVE name. (A bare `cd` is now a
+    // cockpit nudge to `!cd`, so the fs verb is used through its `!` prefix here.)
+    e.exec_line(&format!("!cd {}", dir.display()));
     let out = e.exec_line("/mount dummy.crt").output;
     eprintln!("mount output: {out}");
 
