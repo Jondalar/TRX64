@@ -68,12 +68,15 @@ Windows + Linux binaries from a Mac is scripted in `scripts/build-cli-dist.sh`.
 
 ## Three ways to use it
 
+Leitregel: Capability → TRX64, Meaning/Memory → C64RE.
+
 TRX64 is one runtime with three front doors:
 
-- **As a daemon** — the `trx64-daemon` binary serves WebSocket JSON-RPC. This is how
-  [C64ReverseEngineeringMCP](https://github.com/Jondalar/C64ReverseEngineeringMCP)
-  uses it (select it with `TRX64=1 ./ui.sh restart`), and how any client or LLM
-  connects.
+- **As a daemon** — the `trx64-daemon` binary serves WebSocket JSON-RPC. This is
+  C64RE's **default** runtime backend: C64RE auto-discovers a running
+  `trx64-daemon` (and spawns one if none is found), and any other client or LLM
+  connects the same way. (The legacy `TRX64=1 ./ui.sh restart` opt-in is no longer
+  required.)
 - **In-process (typed)** — the `trx64-ffi` crate exposes a typed library (uniffi →
   Swift bindings) so a native app embeds the runtime directly, no subprocess. See
   [`crates/trx64-ffi/API.md`](crates/trx64-ffi/API.md). A native macOS frontend is in
