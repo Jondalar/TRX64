@@ -26,8 +26,8 @@
       "title": "filetype color module ftcolor.rs (pure) + unit tests",
       "files": ["crates/trx64-cli/src/ftcolor.rs", "crates/trx64-cli/src/lib.rs"],
       "deps": [],
-      "status": "todo",
-      "notes": ""
+      "status": "done",
+      "notes": "6bef1b2 — pure ftcolor.rs: ext_bucket() + style_for() (dir-blue wins), LS_COLORS-lite palette, wired into lib.rs; 7 unit tests green"
     },
     {
       "id": "S3",
