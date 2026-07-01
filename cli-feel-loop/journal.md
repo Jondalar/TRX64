@@ -15,3 +15,4 @@
 - S7: mount-resume verify (host run flag on /mount) + /eject role:auto → occupied-slot resolve + unified eject-cart RAM power-cycle; tests/s7_media_semantics.rs 4/4 — 33780b7 — green
 - S4: !ls/!dir output filetype-colored in cockpit (LogLine style + ls_styled_lines/ls_entry_style, ftcolor palette) — c000533 — green
 - S5: namespace-aware Tab autocomplete (plan_complete: /VM + !FS + bare-monitor verb sets, path verbs via fs/complete rpc, ftcolor candidate list) — 450e376 — green
+- S6: readline muscles (Ctrl-A/E/K/U/W/L + Ctrl-C clear-line) + persistent, deduped, capped $HOME/.trx64/history (atomic compaction) — 7a3255d — green

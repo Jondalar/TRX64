@@ -58,8 +58,8 @@
       "title": "readline muscles (Ctrl-A/E/K/U/W/L, Ctrl-C clear-line) + persistent+dedup history",
       "files": ["crates/trx64-cli/src/tui.rs"],
       "deps": ["S5"],
-      "status": "todo",
-      "notes": "same file as S4/S5 -> sequence after them"
+      "status": "done",
+      "notes": "7a3255d — Ctrl-A/E/K/U/W/L + Ctrl-C clear-line (empty quits), char-safe kill/word ops, HIST_CAP-capped ignoredups history persisted to $HOME/.trx64/history (atomic temp+rename compaction); cargo test -p trx64-cli 60/60 green"
     },
     {
       "id": "S7",
