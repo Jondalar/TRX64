@@ -4,7 +4,7 @@
   "spec": "cli-feel-loop/SPEC.md",
   "repo": "/Users/alex/Development/C64/Tools/TRX64",
   "branch": "main",
-  "loop_status": "RUNNING",
+  "loop_status": "DONE",
   "created": "2026-07-01",
   "guardrails": [
     "never push (commit only)",
@@ -16,74 +16,118 @@
     {
       "id": "S1",
       "title": "! namespace + verb aliases (umount/undump/settings) + help",
-      "files": ["crates/trx64-cli/src/engine.rs"],
+      "files": [
+        "crates/trx64-cli/src/engine.rs"
+      ],
       "deps": [],
       "status": "done",
-      "notes": "f8994c3 — ! FS namespace + bare-verb nudge, /umount /undump /settings aliases, help/fs_help; tests/namespaces.rs; 20/20 green"
+      "notes": "f8994c3 \u2014 ! FS namespace + bare-verb nudge, /umount /undump /settings aliases, help/fs_help; tests/namespaces.rs; 20/20 green"
     },
     {
       "id": "S2",
       "title": "filetype color module ftcolor.rs (pure) + unit tests",
-      "files": ["crates/trx64-cli/src/ftcolor.rs", "crates/trx64-cli/src/lib.rs"],
+      "files": [
+        "crates/trx64-cli/src/ftcolor.rs",
+        "crates/trx64-cli/src/lib.rs"
+      ],
       "deps": [],
       "status": "done",
-      "notes": "6bef1b2 — pure ftcolor.rs: ext_bucket() + style_for() (dir-blue wins), LS_COLORS-lite palette, wired into lib.rs; 7 unit tests green"
+      "notes": "6bef1b2 \u2014 pure ftcolor.rs: ext_bucket() + style_for() (dir-blue wins), LS_COLORS-lite palette, wired into lib.rs; 7 unit tests green"
     },
     {
       "id": "S3",
       "title": "fs/complete daemon rpc (resolve vs fs_cwd, quotes/spaces, dir-aware)",
-      "files": ["crates/trx64-daemon/src/main.rs"],
+      "files": [
+        "crates/trx64-daemon/src/main.rs"
+      ],
       "deps": [],
       "status": "done",
-      "notes": "a1f3749 — fs/complete rpc + fs_longest_common_prefix helper: resolves partial vs cockpit cwd (FS-verb rules), returns matches (name/is_dir) + common prefix; soft-error → empty; 2 tests green"
+      "notes": "a1f3749 \u2014 fs/complete rpc + fs_longest_common_prefix helper: resolves partial vs cockpit cwd (FS-verb rules), returns matches (name/is_dir) + common prefix; soft-error \u2192 empty; 2 tests green | fix: common-prefix case-insensitive (verifier finding)"
     },
     {
       "id": "S4",
       "title": "!ls coloring in cockpit (parse d|- flag, apply ftcolor)",
-      "files": ["crates/trx64-cli/src/tui.rs"],
-      "deps": ["S2"],
+      "files": [
+        "crates/trx64-cli/src/tui.rs"
+      ],
+      "deps": [
+        "S2"
+      ],
       "status": "done",
-      "notes": "c000533 — LogLine{text,style}; ls_styled_lines/ls_entry_style split !ls/!dir output into ftcolor-styled entries (dir flag col drives dir-vs-file), header+(empty) stay plain; 6 unit tests; cargo test -p trx64-cli 37/37 green"
+      "notes": "c000533 \u2014 LogLine{text,style}; ls_styled_lines/ls_entry_style split !ls/!dir output into ftcolor-styled entries (dir flag col drives dir-vs-file), header+(empty) stay plain; 6 unit tests; cargo test -p trx64-cli 37/37 green"
     },
     {
       "id": "S5",
       "title": "Tab autocomplete rewrite: 3 namespaces + path-complete via fs/complete + colored list",
-      "files": ["crates/trx64-cli/src/tui.rs"],
-      "deps": ["S1", "S2", "S3"],
+      "files": [
+        "crates/trx64-cli/src/tui.rs"
+      ],
+      "deps": [
+        "S1",
+        "S2",
+        "S3"
+      ],
       "status": "done",
-      "notes": "450e376 — namespace-aware Tab (plan_complete: /VM, !FS, bare-monitor verb sets), path verbs complete last token via fs/complete rpc, ambiguous prefixes print ftcolor-styled candidate list; cargo test -p trx64-cli 49/49 green"
+      "notes": "450e376 \u2014 namespace-aware Tab (plan_complete: /VM, !FS, bare-monitor verb sets), path verbs complete last token via fs/complete rpc, ambiguous prefixes print ftcolor-styled candidate list; cargo test -p trx64-cli 49/49 green"
     },
     {
       "id": "S6",
       "title": "readline muscles (Ctrl-A/E/K/U/W/L, Ctrl-C clear-line) + persistent+dedup history",
-      "files": ["crates/trx64-cli/src/tui.rs"],
-      "deps": ["S5"],
+      "files": [
+        "crates/trx64-cli/src/tui.rs"
+      ],
+      "deps": [
+        "S5"
+      ],
       "status": "done",
-      "notes": "7a3255d — Ctrl-A/E/K/U/W/L + Ctrl-C clear-line (empty quits), char-safe kill/word ops, HIST_CAP-capped ignoredups history persisted to $HOME/.trx64/history (atomic temp+rename compaction); cargo test -p trx64-cli 60/60 green"
+      "notes": "7a3255d \u2014 Ctrl-A/E/K/U/W/L + Ctrl-C clear-line (empty quits), char-safe kill/word ops, HIST_CAP-capped ignoredups history persisted to $HOME/.trx64/history (atomic temp+rename compaction); cargo test -p trx64-cli 60/60 green"
     },
     {
       "id": "S7",
       "title": "mount-resume verify + /eject smart target + unify eject RAM semantics",
-      "files": ["crates/trx64-cli/src/engine.rs", "crates/trx64-daemon/src/main.rs"],
-      "deps": ["S1"],
+      "files": [
+        "crates/trx64-cli/src/engine.rs",
+        "crates/trx64-daemon/src/main.rs"
+      ],
+      "deps": [
+        "S1"
+      ],
       "status": "done",
-      "notes": "33780b7 — /mount sets host run flag (pump resumes post CRT power-cycle), /eject role:auto → daemon resolves occupied slot, media/ingress eject-cart power-cycles RAM to match media/unmount; tests/s7_media_semantics.rs 4/4 green"
+      "notes": "33780b7 \u2014 /mount sets host run flag (pump resumes post CRT power-cycle), /eject role:auto \u2192 daemon resolves occupied slot, media/ingress eject-cart power-cycles RAM to match media/unmount; tests/s7_media_semantics.rs 4/4 green"
     },
     {
       "id": "S8",
       "title": "docs: MONITOR.md namespaces + cockpit README + help agree",
-      "files": ["MONITOR.md", "crates/trx64-cli/README.md"],
-      "deps": ["S1", "S5", "S7"],
+      "files": [
+        "MONITOR.md",
+        "crates/trx64-cli/README.md"
+      ],
+      "deps": [
+        "S1",
+        "S5",
+        "S7"
+      ],
       "status": "done",
-      "notes": "9681bbd — MONITOR.md 3-namespace + bare-callable caveat, README namespaces/! table/media/colors/readline, help_text() real verb+path Tab promise, tests/docs_agree.rs pins help/README/MONITOR agreement; cargo test -p trx64-cli 64/64 green"
+      "notes": "9681bbd \u2014 MONITOR.md 3-namespace note + README rewrite (! table, aliases, media/colors/readline) + help_text agree; docs_agree.rs 4 tests"
     },
     {
       "id": "S9",
       "title": "final gate: release build (update symlink) + full tests + TEST-CHECKLIST.md",
-      "files": ["cli-feel-loop/TEST-CHECKLIST.md"],
-      "deps": ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8"],
-      "status": "todo",
-      "notes": ""
+      "files": [
+        "cli-feel-loop/TEST-CHECKLIST.md"
+      ],
+      "deps": [
+        "S1",
+        "S2",
+        "S3",
+        "S4",
+        "S5",
+        "S6",
+        "S7",
+        "S8"
+      ],
+      "status": "done",
+      "notes": "release build green (symlink\u2192fresh 12:22), full tests 250 passed (12 suites); TEST-CHECKLIST.md written"
     }
   ]
 }

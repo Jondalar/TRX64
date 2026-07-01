@@ -17,3 +17,13 @@
 - S5: namespace-aware Tab autocomplete (plan_complete: /VM + !FS + bare-monitor verb sets, path verbs via fs/complete rpc, ftcolor candidate list) — 450e376 — green
 - S6: readline muscles (Ctrl-A/E/K/U/W/L + Ctrl-C clear-line) + persistent, deduped, capped $HOME/.trx64/history (atomic compaction) — 7a3255d — green
 - S8: docs — MONITOR.md 3-namespace + bare-callable caveat, README namespaces/media/colors/readline, help_text real Tab promise, tests/docs_agree.rs agreement guard — 9681bbd — green
+- S3 fix: fs/complete common-prefix now ASCII-case-insensitive (mixed-case dirs fill instead of no-fill) — verifier finding — green
+- Post-workflow verifier triage: S6 "history grows unbounded" + S8 ".p64 mountable / disk auto-runs" flags were STALE (final code already correct: trim_history_file bounds the file; README has no .p64-mount/auto-runs claim). Only S3's case-prefix was real → fixed.
+- S9: release build green (symlink /usr/local/bin/trx64cli → fresh 12:22), full tests 250 passed (12 suites), TEST-CHECKLIST.md written. loop_status=DONE.
+
+## Result
+All 8 slices + S3 fix landed on master (not pushed). trx64cli cockpit now = bash for
+the emulator: `/` machine · `!` filesystem · bare monitor, always-on Tab (verbs all 3
+namespaces + colored path completion through quotes/spaces), LS_COLORS-lite, readline
+muscles + persistent history, and verified disk-hotswap / CRT-power-cycle / CRT-eject
+media semantics. Ready for the 60-second manual test in TEST-CHECKLIST.md.
