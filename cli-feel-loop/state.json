@@ -34,8 +34,8 @@
       "title": "fs/complete daemon rpc (resolve vs fs_cwd, quotes/spaces, dir-aware)",
       "files": ["crates/trx64-daemon/src/main.rs"],
       "deps": [],
-      "status": "todo",
-      "notes": ""
+      "status": "done",
+      "notes": "a1f3749 — fs/complete rpc + fs_longest_common_prefix helper: resolves partial vs cockpit cwd (FS-verb rules), returns matches (name/is_dir) + common prefix; soft-error → empty; 2 tests green"
     },
     {
       "id": "S4",

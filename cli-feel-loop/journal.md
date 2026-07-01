@@ -11,3 +11,4 @@
   AGENTS.md. Implementation workflow kicking off next; 15-min loop armed after.
 - S1: `!` FS namespace + bare-verb nudge, /umount /undump /settings aliases, cockpit+FS help — f8994c3 — green
 - S2: pure ftcolor.rs (ext_bucket + style_for, dir-blue wins) LS_COLORS-lite palette, wired into lib.rs, 7 unit tests — 6bef1b2 — green
+- S3: fs/complete daemon rpc + fs_longest_common_prefix (path Tab-completion backend, dir-aware, soft-error) — a1f3749 — green
