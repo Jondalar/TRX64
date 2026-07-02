@@ -2698,6 +2698,7 @@ dependencies = [
  "serde_json",
  "softbuffer",
  "trx64-daemon",
+ "trx64-static",
  "winit",
 ]
 
@@ -2728,6 +2729,7 @@ dependencies = [
  "tokio-tungstenite",
  "trx64-core",
  "trx64-session",
+ "trx64-static",
  "trx64-trace",
 ]
 
@@ -2750,6 +2752,14 @@ version = "0.0.1"
 dependencies = [
  "trx64-core",
  "trx64-trace",
+]
+
+[[package]]
+name = "trx64-static"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
+ "trx64-core",
 ]
 
 [[package]]

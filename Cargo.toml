@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/trx64-core",
+    "crates/trx64-static",
     "crates/trx64-trace",
     "crates/trx64-session",
     "crates/trx64-daemon",

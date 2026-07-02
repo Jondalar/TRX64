@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
+use trx64_cli::disasm_cmd::{self, DisasmArgs};
 use trx64_cli::engine::Engine;
 use trx64_cli::tui::{self, UiToMain};
 use trx64_cli::window;
@@ -58,11 +59,52 @@ enum Command {
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
     },
+
+    /// Static disassembly of a PRG or raw memory image — machine-free (no ROMs,
+    /// no boot). Capability-cut step 1: the shared `trx64-static` decoder (the
+    /// same disassembler as the monitor `d` verb). PRG by default (2-byte
+    /// load-address header); `--load-address` switches to raw-image mode. E.g.
+    ///   trx64cli disasm game.prg
+    ///   trx64cli disasm dump.bin --load-address $c000 --count 32 --json
+    Disasm {
+        /// Input file (.prg by default; any raw image with --load-address).
+        file: PathBuf,
+        /// Treat FILE as a raw image loaded at this address (hex: $c000 / 0xc000 / c000).
+        #[arg(long, value_parser = trx64_cli::disasm_cmd::parse_addr)]
+        load_address: Option<u16>,
+        /// First address to disassemble (default: the load address).
+        #[arg(long, value_parser = trx64_cli::disasm_cmd::parse_addr)]
+        start: Option<u16>,
+        /// Maximum number of instructions to emit (default: to end of image).
+        #[arg(long)]
+        count: Option<usize>,
+        /// Emit JSON (array of {addr, bytes, mnemonic, operand, text}) instead of text.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 fn main() {
     let cli = Cli::parse();
     let rom_dir = cli.rom_dir.clone().unwrap_or_else(default_rom_dir);
+
+    // ── Static one-shot: disasm (no machine, no ROMs, no TUI) ──────────────────
+    if let Some(Command::Disasm { file, load_address, start, count, json }) = &cli.cmd {
+        match disasm_cmd::run_disasm(&DisasmArgs {
+            file,
+            load_address: *load_address,
+            start: *start,
+            count: *count,
+            json: *json,
+        }) {
+            Ok(out) => println!("{out}"),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
 
     // ── One-shot mode (no TUI, no window) ──────────────────────────────────────
     if let Some(Command::Mon { command }) = &cli.cmd {

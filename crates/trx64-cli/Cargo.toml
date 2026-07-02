@@ -27,6 +27,9 @@ path = "src/main.rs"
 # compilation unit the WS daemon uses, in-process. No second runtime path.
 trx64-daemon = { path = "../trx64-daemon" }
 
+# Static (machine-free) capability — the `disasm` subcommand (capability-cut step 1).
+trx64-static = { path = "../trx64-static" }
+
 # JSON plumbing for building Request params + reading Response/state.
 serde_json = "1"
 

@@ -151,6 +151,7 @@ trx64-daemon   tokio · WS JSON-RPC 2.0 · binary frames · the stream loop
 trx64-ffi      typed uniffi bindings for in-process embedding (e.g. Swift)
 trx64-session  session lifecycle · run control · snapshot / rewind · warp
 trx64-trace    TraceOp encoder → .c64retrace (the immovable format)
+trx64-static   machine-free capability: 6502 decode (`trx64cli disasm`; later media parse, classifiers)
 trx64-core     pure, deterministic, synchronous emulation · zero-cost Observer · Clone-able state
 ```
 

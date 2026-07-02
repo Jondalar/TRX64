@@ -1,0 +1,19 @@
+# trx64-static — static (machine-free) capability: decode / parse / classify.
+# Capability-cut Q2-C crate (docs/capability-cut-decisions.md): static capability
+# lives in a lib crate, NOT the daemon. Started by migration step 1 (the 6502
+# raw-decode dedupe). Consumers: trx64-daemon (monitor verbs), trx64-cli
+# (`trx64cli disasm`), later trx64-mcp (façade).
+
+[package]
+name = "trx64-static"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "TRX64 static capability: machine-free 6502 decode (later: media parse, classifiers)."
+
+[dependencies]
+trx64-core = { path = "../trx64-core" }
+
+[dev-dependencies]
+# Golden-parity tests read the TS-oracle-generated JSON (tests/goldens/).
+serde_json = "1"

@@ -22,6 +22,10 @@ cargo run -p trx64-cli --release -- --window
 
 # one-shot: run a single command, print, exit (scripting / CI)
 cargo run -p trx64-cli --release -- mon "d c000"
+
+# static disasm of a PRG / raw image — machine-free, no ROMs (capability-cut step 1)
+cargo run -p trx64-cli --release -- disasm game.prg
+cargo run -p trx64-cli --release -- disasm dump.bin --load-address '$c000' --count 32 --json
 ```
 
 `--rom-dir <dir>` overrides the ROM directory (KERNAL/BASIC/CHARGEN + 1541); it defaults

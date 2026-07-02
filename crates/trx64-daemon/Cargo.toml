@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 trx64-core = { path = "../trx64-core" }
+trx64-static = { path = "../trx64-static" }
 trx64-trace = { path = "../trx64-trace" }
 trx64-session = { path = "../trx64-session" }
 

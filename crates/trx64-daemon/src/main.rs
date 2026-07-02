@@ -2571,92 +2571,11 @@ fn run_isolated_segment(
     }
 }
 
-/// T2.8 — 1:1 port of `disasmLine` (disasm6502.ts): `$addr  bb bb bb  MNEMONIC ops`.
-/// Bytes padded to a fixed 8-char column; mnemonic upper-cased, operand hex
-/// LOWER-case (VICE-ish). `labels` (addr→name) annotation is the TS Block-F
-/// feature; TRX64 has no project-label bridge wired into `run_monitor`, so the
-/// label arg is always absent here (the no-label TS path). Returns (size, line).
-fn disasm_line_ts(read: impl Fn(u16) -> u8, addr: u16) -> (u16, String) {
-    use trx64_core::tables::{MICROCODE_TABLE, UNDOC_TABLE};
-    let opcode = read(addr);
-    // TS disasm6502 uses the verbatim OPCODES table (full 256 incl. undocumented).
-    // TRX64's MICROCODE_TABLE/UNDOC_TABLE are the same coverage; a hole → "???".
-    let entry = MICROCODE_TABLE[opcode as usize]
-        .map(|e| (e.op.to_string(), e.mode))
-        .or_else(|| UNDOC_TABLE[opcode as usize].map(|e| (e.kind.to_string(), e.mode)));
-    let (mne, mode) = match entry {
-        Some((m, mode)) => (m, mode),
-        None => ("???".to_string(), "imp"),
-    };
-    let size = instr_len(opcode) as u16;
-    let b1 = read(addr.wrapping_add(1));
-    let b2 = read(addr.wrapping_add(2));
-    // Operand text — operand hex LOWER-case, matching disasm6502.ts `hx`.
-    let text = match mode {
-        "imp" | "acc" => String::new(),
-        "imm" => format!("#${:02x}", b1),
-        "zp" => format!("${:02x}", b1),
-        "zpx" => format!("${:02x},x", b1),
-        "zpy" => format!("${:02x},y", b1),
-        "abs" => format!("${:04x}", (b1 as u16) | ((b2 as u16) << 8)),
-        "absx" => format!("${:04x},x", (b1 as u16) | ((b2 as u16) << 8)),
-        "absy" => format!("${:04x},y", (b1 as u16) | ((b2 as u16) << 8)),
-        "ind" => format!("(${:04x})", (b1 as u16) | ((b2 as u16) << 8)),
-        "indx" => format!("(${:02x},x)", b1),
-        "indy" => format!("(${:02x}),y", b1),
-        "rel" => {
-            let signed = if b1 >= 0x80 { b1 as i32 - 0x100 } else { b1 as i32 };
-            let target = ((addr as i32) + size as i32 + signed) as u16;
-            format!("${:04x}", target)
-        }
-        _ => String::new(),
-    };
-    // Bytes column: "bb bb bb" = 8 chars max; pad to 8 (disasm6502.ts padEnd(8)).
-    let bytes: Vec<String> = (0..size).map(|i| format!("{:02x}", read(addr.wrapping_add(i)))).collect();
-    let bytes_col = format!("{:<8}", bytes.join(" "));
-    let ops = if text.is_empty() { String::new() } else { format!(" {text}") };
-    let line = format!("${:04x}  {}  {}{}", addr, bytes_col, mne.to_uppercase(), ops);
-    (size, line)
-}
-
-/// `disasmLine` WITH the Spec 754 §3.3f (Block F) label annotation
-/// (disasm6502.ts:155-161): a target-address label is appended as `; → name`, and
-/// the instruction's OWN address label is prepended as an asm-style `name:` line.
-/// Both the label AND the numeric address stay visible. Mirrors the TS
-/// `di.target ?? (di.size === 3 ? di.operand : undefined)` target resolution.
-fn disasm_line_ts_labeled(
-    read: impl Fn(u16) -> u8,
-    addr: u16,
-    labels: &std::collections::BTreeMap<u16, String>,
-) -> (u16, String) {
-    let (size, mut line) = disasm_line_ts(&read, addr);
-    let opcode = read(addr);
-    let b1 = read(addr.wrapping_add(1));
-    let b2 = read(addr.wrapping_add(2));
-    let mode = trx64_core::tables::MICROCODE_TABLE[opcode as usize]
-        .map(|e| e.mode)
-        .or_else(|| trx64_core::tables::UNDOC_TABLE[opcode as usize].map(|e| e.mode))
-        .unwrap_or("imp");
-    // di.target (abs / rel) ?? (di.size === 3 ? di.operand : undefined).
-    let target: Option<u16> = match mode {
-        "abs" => Some((b1 as u16) | ((b2 as u16) << 8)),
-        "rel" => {
-            let signed = if b1 >= 0x80 { b1 as i32 - 0x100 } else { b1 as i32 };
-            Some(((addr as i32) + size as i32 + signed) as u16)
-        }
-        _ if size == 3 => Some((b1 as u16) | ((b2 as u16) << 8)),
-        _ => None,
-    };
-    if let Some(t) = target {
-        if let Some(name) = labels.get(&t) {
-            line.push_str(&format!("   ; → {name}"));
-        }
-    }
-    if let Some(own) = labels.get(&addr) {
-        line = format!("{own}:\n{line}");
-    }
-    (size, line)
-}
+// T2.8 — the 6502 disasm formatters (1:1 ports of disasm6502.ts `disasmLine`,
+// plus the Spec 754 §3.3f labeled variant) moved to the shared static-capability
+// crate (capability-cut migration step 1): `trx64-static/src/disasm6502.rs`.
+// The daemon, `trx64cli disasm` and (later) `trx64-mcp` share ONE decoder.
+use trx64_static::disasm6502::{disasm_line_ts, disasm_line_ts_labeled};
 
 /// reverse-debug Phase 1a — render the LIVE CPU-history ring (`Machine::cpu_history`)
 /// as `chis` cpu-history rows. Each row disassembles the instruction FROM THE RING
@@ -6202,68 +6121,19 @@ fn radix36(mut n: u128) -> String {
 }
 
 // ── 6502 disassembler ─────────────────────────────────────────────────────────
+// Decode + formatting live in the shared static-capability crate
+// (`trx64-static/src/disasm6502.rs`, capability-cut migration step 1).
+use trx64_static::disasm6502::instr_len;
 
-fn instr_len(opcode: u8) -> usize {
-    use trx64_core::tables::{MICROCODE_TABLE, UNDOC_TABLE};
-    let mode = MICROCODE_TABLE[opcode as usize]
-        .map(|e| e.mode)
-        .or_else(|| UNDOC_TABLE[opcode as usize].map(|e| e.mode));
-    match mode {
-        Some("imp") | Some("acc") => 1,
-        Some("imm") | Some("zp") | Some("zpx") | Some("zpy")
-        | Some("indx") | Some("indy") | Some("rel") => 2,
-        Some("abs") | Some("absx") | Some("absy") | Some("ind") => 3,
-        _ => 1, // Unknown/JAM: treat as 1-byte
-    }
-}
-
+/// `monitorDisasm` wire shape — thin Value adapter over the shared decoder.
 fn disasm_one(addr: u16, read: impl Fn(u16) -> u8) -> Value {
-    use trx64_core::tables::{MICROCODE_TABLE, UNDOC_TABLE};
-
-    let opcode = read(addr);
-    let len = instr_len(opcode);
-    let bytes: Vec<u8> = (0..len as u16).map(|i| read(addr.wrapping_add(i))).collect();
-    let b1 = bytes.get(1).copied().unwrap_or(0);
-    let b2 = bytes.get(2).copied().unwrap_or(0);
-
-    let (mne, mode) = MICROCODE_TABLE[opcode as usize]
-        .map(|e| (e.op.to_uppercase(), e.mode))
-        .or_else(|| UNDOC_TABLE[opcode as usize].map(|e| (e.kind.to_uppercase(), e.mode)))
-        .unwrap_or_else(|| (format!(".byte ${:02X}", opcode), "imp"));
-
-    let operand = match mode {
-        "imp" | "acc" => String::new(),
-        "imm" => format!("#${:02X}", b1),
-        "zp" => format!("${:02X}", b1),
-        "zpx" => format!("${:02X},X", b1),
-        "zpy" => format!("${:02X},Y", b1),
-        "rel" => {
-            let off = b1 as i8 as i32;
-            let target = (addr as i32 + 2 + off) as u16;
-            format!("${:04X}", target)
-        }
-        "abs" => format!("${:04X}", (b1 as u16) | ((b2 as u16) << 8)),
-        "absx" => format!("${:04X},X", (b1 as u16) | ((b2 as u16) << 8)),
-        "absy" => format!("${:04X},Y", (b1 as u16) | ((b2 as u16) << 8)),
-        "ind" => format!("(${:04X})", (b1 as u16) | ((b2 as u16) << 8)),
-        "indx" => format!("(${:02X},X)", b1),
-        "indy" => format!("(${:02X}),Y", b1),
-        _ => String::new(),
-    };
-
-    let byte_str = bytes.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
-    let text = if operand.is_empty() {
-        format!("${:04X}  {:<8}  {}", addr, byte_str, mne)
-    } else {
-        format!("${:04X}  {:<8}  {} {}", addr, byte_str, mne, operand)
-    };
-
+    let d = trx64_static::disasm6502::disasm_one(addr, read);
     json!({
-        "addr": addr as u64,
-        "bytes": bytes.iter().map(|b| *b as u64).collect::<Vec<_>>(),
-        "mnemonic": mne,
-        "operand": operand,
-        "text": text
+        "addr": d.addr as u64,
+        "bytes": d.bytes.iter().map(|b| *b as u64).collect::<Vec<_>>(),
+        "mnemonic": d.mnemonic,
+        "operand": d.operand,
+        "text": d.text
     })
 }
 
