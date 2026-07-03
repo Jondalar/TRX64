@@ -168,6 +168,27 @@ diffed against VICE cycle by cycle. That correctness discipline is what makes th
 time-travel and reverse-debug features trustworthy: a rewound or reverse-stepped
 machine is the *real* machine state, not an approximation.
 
+### Quality gate (local, enforced on push — Spec 783)
+
+Regression protection without cloud CI. One command runs the whole gate and exits
+non-zero on any red (quiet on green, first-failure-loud):
+
+```sh
+./scripts/gate.sh            # clippy → rust gate tests → 7-game gate → conformance
+./scripts/install-hooks.sh   # one-time: sets core.hooksPath=hooks (idempotent)
+```
+
+`hooks/pre-push` runs the gate and **blocks a red push**; the 771.6 version-pin runs it
+first too, so only a green state is ever frozen. The gate is:
+
+- **rust gate tests** (release) — `iso_vic_gate` + `vic_collision_gate` + `cart_mapper_gate` (blocking).
+- **7-game behavioral gate** (release, ~25 s) — gates on the 7/7 PASS verdict; refreshes the
+  `traces/gate_*` screenshots. SKIPs loudly (never a false green) if the C64RE ROMs/samples are absent.
+- **clippy** — non-blocking today (pre-existing warning backlog); `GATE_CLIPPY_STRICT=1` enforces it.
+- **WS conformance** (`tools/oracle`, TS↔TRX64) — opt-in via `GATE_CONFORMANCE=1` (heavy; drives the C64RE oracle).
+
+Bypass a single deliberate WIP push with **`GATE_SKIP=1 git push`** (loud warning, never the default).
+
 ---
 
 ## License & Credits

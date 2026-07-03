@@ -1,0 +1,36 @@
+#!/bin/sh
+# ─────────────────────────────────────────────────────────────────────────────
+# hooks/pre-push — Spec 783.2. Runs the local quality gate and BLOCKS the push
+# on red. Installed repo-wide via `scripts/install-hooks.sh` (sets
+# core.hooksPath=hooks), so both machines enforce it.
+#
+# Escape hatch for a deliberate WIP push (LOUD warning, never the default):
+#   GATE_SKIP=1 git push
+#
+# Git invokes this with `<remote> <url>` argv and the refs on stdin; the gate is
+# repo-wide, so we ignore both.
+# ─────────────────────────────────────────────────────────────────────────────
+
+if [ "${GATE_SKIP:-0}" = "1" ]; then
+  printf '\n' >&2
+  printf '  ##############################################################\n' >&2
+  printf '  #  GATE_SKIP=1 — Spec 783 quality gate BYPASSED             #\n' >&2
+  printf '  #  This push is UNVERIFIED. You are on the hook for green.  #\n' >&2
+  printf '  ##############################################################\n' >&2
+  printf '\n' >&2
+  exit 0
+fi
+
+HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$HOOK_DIR/.." && pwd)
+
+printf '\n=== Spec 783 pre-push quality gate ===\n' >&2
+if "$REPO_ROOT/scripts/gate.sh" >&2; then
+  printf '=== gate GREEN — push allowed ===\n\n' >&2
+  exit 0
+fi
+
+printf '\n' >&2
+printf '=== gate RED — PUSH BLOCKED ===\n' >&2
+printf '    Fix the gate above, or bypass this one push with:  GATE_SKIP=1 git push\n\n' >&2
+exit 1
