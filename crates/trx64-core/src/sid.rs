@@ -492,7 +492,7 @@ impl Sid6581 {
                     if vc.adsr_value < 0xff {
                         vc.adsr_value += 1;
                     }
-                    if vc.adsr_value >= 0xff {
+                    if vc.adsr_value == 0xff {
                         // ATTACK → DECAY.
                         vc.adsrm = ADSR_DECAY;
                         vc.cycle_accum = 0;
