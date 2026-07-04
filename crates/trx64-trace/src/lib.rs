@@ -248,7 +248,7 @@ pub struct TraceChannels {
     /// `drive_pc` channel — emits DRIVE_CPU_STEP (0x30). Activated by "drive8-cpu"
     /// domain. Sampled at C64 instruction boundaries, deduplicated by PC.
     pub drive_cpu: bool,
-    /// `drive-mechanism` channel — emits DRIVE_HEAD (0x32): the 1541 read head's
+    /// `drive-mechanism` channel — emits DRIVE_HEAD (0x34): the 1541 read head's
     /// (halftrack, sector) timeline. OFF by default; armed only by the
     /// "drive-mechanism" domain (Spec 784 loader-lens). The always-on CPU ring and
     /// the parity path are unaffected.
@@ -344,7 +344,7 @@ impl TracingObserver {
         self.event_count += 1;
     }
 
-    /// Emit a DRIVE_HEAD record (0x32) — gated on the `drive-mechanism` channel.
+    /// Emit a DRIVE_HEAD record (0x34) — gated on the `drive-mechanism` channel.
     /// Called from the drive-sampled run loop when the sector under the head changes.
     /// `sector` = 0xff when the head is between sectors (rotation gap).
     #[inline]
@@ -429,7 +429,7 @@ mod tests {
         assert!(!TraceChannels::from_domains(&["c64-cpu", "memory"]).drive_mechanism);
     }
 
-    // DRIVE_HEAD (0x32) byte layout: op(1) + cycle f64(8) + halftrack(1) + sector(1) = 11.
+    // DRIVE_HEAD (0x34) byte layout: op(1) + cycle f64(8) + halftrack(1) + sector(1) = 11.
     #[test]
     fn write_drive_head_byte_layout() {
         let mut sink = FrameSink::events_only();
