@@ -11,7 +11,8 @@
 //!       access(u8, bit0=r/w, bit7=hasOld) oldValue(u8)                            = 16 bytes
 //!   DRIVE_CPU_STEP (0x30):  same layout as CPU_STEP — 19 bytes total
 //!   DRIVE_RAM_WRITE (0x31): same layout as RAM_WRITE — 16 bytes total
-//!   DRIVE_HEAD (0x32):      op(1) cycle(f64) halftrack(u8) sector(u8) — 11 bytes (Spec 784)
+//!   DRIVE_HEAD (0x34):      op(1) cycle(f64) halftrack(u8) sector(u8) — 11 bytes (Spec 784)
+//!     (0x32/0x33 are RESERVED in binary-format.ts for VIA_REG_WRITE / GCR_EVENT.)
 //!
 //! access/oldValue (Spec 753): WRITE records carry the pre-write value for RAM
 //! (addr in $0002..$D000); reads and I/O-window writes omit it (hasOld=0).
@@ -32,10 +33,11 @@ pub enum TraceOp {
     DriveCpuStep = 0x30,
     /// Drive 1541 memory bus access (op 0x31 — binary-format.ts DRIVE_RAM_WRITE).
     DriveRamWrite = 0x31,
-    /// Drive 1541 disk-mechanism head position (op 0x32): halftrack + sector under
+    /// Drive 1541 disk-mechanism head position (op 0x34): halftrack + sector under
     /// head. Spec 784 loader-lens; emitted only when the `drive-mechanism` channel is
-    /// armed on command — never present in parity/oracle traces.
-    DriveHead = 0x32,
+    /// armed on command — never present in parity/oracle traces. 0x34 (NOT 0x32/0x33,
+    /// which binary-format.ts reserves for VIA_REG_WRITE / GCR_EVENT).
+    DriveHead = 0x34,
 }
 
 pub const MAGIC: &[u8; 8] = b"C64RETR1";
@@ -125,7 +127,7 @@ impl FrameSink {
         self.buf.push(0); // b2: not observable
     }
 
-    /// Encode a DRIVE_HEAD (0x32) record: the 1541 disk-mechanism state — which
+    /// Encode a DRIVE_HEAD (0x34) record: the 1541 disk-mechanism state — which
     /// physical (halftrack, sector) the read head is over at `cycle`. Loader-agnostic
     /// ground truth for the SOURCE of decoded bytes (Spec 784 landing-map). Layout:
     /// op(1) cycle(f64) halftrack(u8) sector(u8, 0xff = between sectors) = 11 bytes.
@@ -433,7 +435,7 @@ mod tests {
         let mut sink = FrameSink::events_only();
         sink.write_drive_head(0x0102_0304_0506_0708, 71, 17);
         assert_eq!(sink.buf.len(), 11, "11-byte record");
-        assert_eq!(sink.buf[0], TraceOp::DriveHead as u8, "op 0x32");
+        assert_eq!(sink.buf[0], TraceOp::DriveHead as u8, "op 0x34");
         assert_eq!(sink.buf[9], 71, "halftrack");
         assert_eq!(sink.buf[10], 17, "sector");
         // cycle is f64 LE of the u64 clock.
