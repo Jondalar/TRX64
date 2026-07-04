@@ -87,9 +87,26 @@ fn armed_head_trace_populates_during_real_load() {
     assert!(at_t18 > 0, "the head trace must record the head over the directory track T18");
     assert!(real_sectors > 0, "the head trace must see real sectors under the head at T18");
 
+    // Spec 784 Option A — the READ-SET lane must also populate: the drive latched GCR
+    // bytes off real sectors during the directory read. This is the truth
+    // validate_extraction diffs against, and the fix for the write-time buffering lie.
+    let reads = m.drain_block_reads();
+    eprintln!("block-read (read-set) records during LOAD: {}", reads.len());
+    assert!(!reads.is_empty(), "the read-set lane must record blocks the drive physically read");
+    for (clk, ht, sec, bytes) in &reads {
+        assert!((2..=84).contains(ht), "read-set halftrack {ht} in range (clk {clk})");
+        assert!(*sec <= 20, "read-set sector {sec} valid (0..20) — a gap (0xff) is never a read source");
+        assert!(*bytes > 0, "a read-set record always attributes >0 GCR bytes");
+    }
+    // The directory lives on T18 — at least one block read there.
+    let read_t18 = reads.iter().filter(|(_, ht, _, _)| *ht == 36).count();
+    eprintln!("read-set records at T18 (ht36): {read_t18}");
+    assert!(read_t18 > 0, "the read-set must record a block physically read at the directory track T18");
+
     // A second run WITHOUT arming must NOT accumulate (armed-on-command contract).
     m.arm_head_trace(false);
     inject_keys(&mut m, b"\r");
     m.run_for_full(1_000_000, &mut sink, |_, _, _, _, _, _, _| {});
     assert!(m.drain_head_trace().is_empty(), "disarmed → no head samples accumulate");
+    assert!(m.drain_block_reads().is_empty(), "disarmed → no read-set records accumulate");
 }

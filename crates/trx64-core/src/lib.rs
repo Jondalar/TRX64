@@ -522,10 +522,21 @@ pub struct Machine {
     /// Spec 784 loader-lens — armed-on-command 1541 disk-mechanism head trace. OFF by
     /// default (does NOT run with the always-on CPU ring). When armed, a `(drv_clk,
     /// halftrack, sector)` sample is pushed whenever the sector under the head changes,
-    /// sampled at each drive-PC step; the daemon drains + emits DRIVE_HEAD (0x32).
+    /// sampled at each drive-PC step; the daemon drains + emits DRIVE_HEAD (0x34).
     pub head_trace_armed: bool,
     pub head_trace: Vec<(u64, u8, u8)>,
     head_trace_last: Option<(u8, u8)>,
+    /// Spec 784 loader-lens READ-SET lane. Armed together with `head_trace`. On each
+    /// sector-under-head change, if the drive latched GCR bytes off the sector it is
+    /// LEAVING (`rotation.gcr_read_count` advanced since we entered it), a
+    /// `(drv_clk, halftrack, sector, bytes)` tuple is pushed — the ground truth of
+    /// which physical block the loader actually READ (not merely rotated past). The
+    /// daemon drains it → BLOCK_READ (0x35). Distinct from `head_trace` (every
+    /// transition) — this keeps ONLY the consumed sectors.
+    pub block_reads: Vec<(u64, u8, u8, u16)>,
+    /// `rotation.gcr_read_count` snapshot at the moment the head entered the CURRENT
+    /// sector. `gcr_read_count - sector_entry_read_count` = bytes read off it so far.
+    sector_entry_read_count: u64,
 }
 
 /// reverse-debug Phase 1b — the CPU state the machine landed on after a reverse-step
@@ -666,6 +677,8 @@ impl Machine {
             head_trace_armed: false,
             head_trace: Vec::new(),
             head_trace_last: None,
+            block_reads: Vec::new(),
+            sector_entry_read_count: 0,
         }
     }
 
@@ -1641,6 +1654,11 @@ impl Machine {
         if on {
             self.head_trace.clear();
             self.head_trace_last = None;
+            // Spec 784 read-set lane: clear + re-baseline the per-sector byte counter
+            // to the free-running drive count (only deltas are used, so any prior
+            // value is a valid baseline).
+            self.block_reads.clear();
+            self.sector_entry_read_count = self.drive8.rotation.gcr_read_count;
         }
     }
 
@@ -1648,6 +1666,13 @@ impl Machine {
     /// (sector-change deduplicated). Sector 0xff = head between sectors.
     pub fn drain_head_trace(&mut self) -> Vec<(u64, u8, u8)> {
         std::mem::take(&mut self.head_trace)
+    }
+
+    /// Spec 784 — take the accumulated `(drv_clk, halftrack, sector, bytes)` read-set
+    /// records (one per sector the drive latched ≥1 GCR byte off). The ORDERED list of
+    /// physical blocks the loader actually READ.
+    pub fn drain_block_reads(&mut self) -> Vec<(u64, u8, u8, u16)> {
+        std::mem::take(&mut self.block_reads)
     }
 
     pub fn run_for_full<O: Observer, F>(&mut self, budget: u64, obs: &mut O, on_drive_step: F)
@@ -1848,6 +1873,23 @@ impl Machine {
                     let s = self.drive8.rotation.sector_under_head();
                     let sec = if s < 0 { 0xff } else { s as u8 };
                     if self.head_trace_last != Some((ht, sec)) {
+                        // READ-SET lane: the sector we are LEAVING was physically READ
+                        // iff the drive latched GCR bytes off it while over it. Attribute
+                        // those bytes to the OLD (halftrack, sector), then re-baseline for
+                        // the new sector. A rotation gap (0xff) is never a read source.
+                        let now = self.drive8.rotation.gcr_read_count;
+                        if let Some((old_ht, old_sec)) = self.head_trace_last {
+                            let bytes = now.wrapping_sub(self.sector_entry_read_count);
+                            if old_sec != 0xff && bytes > 0 {
+                                self.block_reads.push((
+                                    drv_clk,
+                                    old_ht,
+                                    old_sec,
+                                    bytes.min(0xffff) as u16,
+                                ));
+                            }
+                        }
+                        self.sector_entry_read_count = now;
                         self.head_trace.push((drv_clk, ht, sec));
                         self.head_trace_last = Some((ht, sec));
                     }

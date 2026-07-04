@@ -1370,10 +1370,14 @@ fn run_cycle_budget(session: &mut Session, budget: u64) {
                     obs.emit_drive_step(pc, a, x, y, sp, p, drv_clk);
                 }
             }
-            // Spec 784 — drain this segment's armed head samples → DRIVE_HEAD (0x32).
+            // Spec 784 — drain this segment's armed head samples → DRIVE_HEAD (0x34)
+            // (every transition) + the read-set → BLOCK_READ (0x35) (consumed sectors).
             if drive_mechanism_active {
                 for (drv_clk, ht, sec) in session.machine.drain_head_trace() {
                     obs.emit_drive_head(ht, sec, drv_clk);
+                }
+                for (drv_clk, ht, sec, bytes) in session.machine.drain_block_reads() {
+                    obs.emit_block_read(ht, sec, bytes, drv_clk);
                 }
             }
         } else if drive_cpu_active {

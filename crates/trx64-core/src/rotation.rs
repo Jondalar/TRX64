@@ -198,6 +198,17 @@ pub struct Rotation {
     /// serializes THIS half-track (= VICE `drive_gcr_data_writeback` flushing
     /// `current_half_track` at the moment the head is about to move).
     pub dirty_half_track: u32,
+
+    /// Spec 784 loader-lens — NON-VICE, PASSIVE instrumentation. Monotonic count of
+    /// GCR data bytes the drive has latched off the disk surface (bumped once per
+    /// [`byte_read`], the via2d `read_pra`/`GCR_read` path). Read ONLY by the
+    /// loader-lens block-read lane to attribute a sector as physically consumed
+    /// (read-set truth) — never consulted by the emulation logic, so it causes ZERO
+    /// behavioural divergence from VICE. Not a `drive_t` field; `#[derive(Clone)]`
+    /// carries it (only deltas are used, so a cloned value is harmless) and the
+    /// explicit snapshot serializer (`drive_snapshot.rs`) never touches it, so it has
+    /// no snapshot-parity impact.
+    pub gcr_read_count: u64,
 }
 
 impl Default for Rotation {
@@ -263,6 +274,7 @@ impl Rotation {
             writeback_bytes: None,
             writeback_kind: None,
             dirty_half_track: 0,
+            gcr_read_count: 0,
         }
     }
 
@@ -909,6 +921,12 @@ impl Rotation {
     /// Writes `dptr->GCR_read` and returns void (the assembled byte is read at
     /// the call site via [`pra_pin`]).
     pub fn byte_read(&mut self, clk: u64) {
+        // Spec 784 loader-lens — PASSIVE read-set instrumentation. This is the
+        // via2d `read_pra`/`GCR_read` consume point: one GCR data byte latched off
+        // the disk surface. Count it so the loader-lens can tell a sector the drive
+        // physically READ from one the head merely rotated past (the 78×T35 bug).
+        // Never read by the emulation → zero behavioural effect (see field doc).
+        self.gcr_read_count = self.gcr_read_count.wrapping_add(1);
         if self.attach_clk != 0 {
             if clk.wrapping_sub(self.attach_clk) < DRIVE_ATTACH_DELAY {
                 self.gcr_read = 0;

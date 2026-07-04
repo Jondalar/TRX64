@@ -38,6 +38,12 @@ pub enum TraceOp {
     /// armed on command — never present in parity/oracle traces. 0x34 (NOT 0x32/0x33,
     /// which binary-format.ts reserves for VIA_REG_WRITE / GCR_EVENT).
     DriveHead = 0x34,
+    /// Spec 784 loader-lens READ-SET (op 0x35): one record per physical block the
+    /// drive actually READ (latched ≥1 GCR byte off) — halftrack + sector + byte count.
+    /// The head-position lane (0x34) records every transition; THIS lane keeps only the
+    /// consumed sectors, the ground-truth read-set validate_extraction diffs a manifest
+    /// against. Emitted only when the `drive-mechanism` channel is armed.
+    BlockRead = 0x35,
 }
 
 pub const MAGIC: &[u8; 8] = b"C64RETR1";
@@ -138,6 +144,20 @@ impl FrameSink {
         self.buf.extend_from_slice(&(cycle as f64).to_le_bytes());
         self.buf.push(halftrack);
         self.buf.push(sector);
+    }
+
+    /// Encode a BLOCK_READ (0x35) record: the 1541 read-set — the drive latched
+    /// `bytes` GCR data bytes off physical (halftrack, sector) before the head moved
+    /// on. Loader-agnostic ground truth of which block the loader actually READ
+    /// (Spec 784). Layout: op(1) cycle(f64) halftrack(u8) sector(u8) bytes(u16 LE) =
+    /// 13 bytes. Emitted ONLY when the `drive-mechanism` channel is armed.
+    #[inline]
+    pub fn write_block_read(&mut self, cycle: u64, halftrack: u8, sector: u8, bytes: u16) {
+        self.buf.push(TraceOp::BlockRead as u8);
+        self.buf.extend_from_slice(&(cycle as f64).to_le_bytes());
+        self.buf.push(halftrack);
+        self.buf.push(sector);
+        self.buf.extend_from_slice(&bytes.to_le_bytes());
     }
 
     /// Encode a VIC_REG_WRITE frame (op 0x20, 13 bytes total: op + cycle f64 +
@@ -355,6 +375,18 @@ impl TracingObserver {
         self.sink.write_drive_head(drv_clk, halftrack, sector);
         self.event_count += 1;
     }
+
+    /// Emit a BLOCK_READ record (0x35) — gated on the `drive-mechanism` channel.
+    /// Called from the drive-sampled run loop when the head leaves a sector the drive
+    /// latched GCR bytes off (Spec 784 read-set).
+    #[inline]
+    pub fn emit_block_read(&mut self, halftrack: u8, sector: u8, bytes: u16, drv_clk: u64) {
+        if !self.channels.drive_mechanism {
+            return;
+        }
+        self.sink.write_block_read(drv_clk, halftrack, sector, bytes);
+        self.event_count += 1;
+    }
 }
 
 impl Observer for TracingObserver {
@@ -469,5 +501,39 @@ mod tests {
         let mut sink = FrameSink::events_only();
         sink.write_drive_head(0, 71, 0xff);
         assert_eq!(sink.buf[10], 0xff);
+    }
+
+    // BLOCK_READ (0x35) byte layout: op(1) + cycle f64(8) + ht(1) + sec(1) + bytes u16(2) = 13.
+    #[test]
+    fn write_block_read_byte_layout() {
+        let mut sink = FrameSink::events_only();
+        sink.write_block_read(0x0102_0304_0506_0708, 70, 17, 0x0154);
+        assert_eq!(sink.buf.len(), 13, "13-byte record");
+        assert_eq!(sink.buf[0], TraceOp::BlockRead as u8, "op 0x35");
+        assert_eq!(sink.buf[9], 70, "halftrack");
+        assert_eq!(sink.buf[10], 17, "sector");
+        assert_eq!(u16::from_le_bytes([sink.buf[11], sink.buf[12]]), 0x0154, "bytes LE");
+        let mut c = [0u8; 8];
+        c.copy_from_slice(&sink.buf[1..9]);
+        assert_eq!(f64::from_le_bytes(c), 0x0102_0304_0506_0708u64 as f64);
+    }
+
+    // emit_block_read is gated: silent when the channel is off, 13 bytes when armed.
+    #[test]
+    fn emit_block_read_gated_by_channel() {
+        let mut off = TracingObserver::with_channels(
+            FrameSink::events_only(),
+            TraceChannels::from_domains(&["c64-cpu"]),
+        );
+        off.emit_block_read(70, 17, 254, 1000);
+        assert_eq!(off.into_buf().len(), 0, "not armed -> no record");
+
+        let mut on = TracingObserver::with_channels(
+            FrameSink::events_only(),
+            TraceChannels::from_domains(&["drive-mechanism"]),
+        );
+        on.emit_block_read(70, 17, 254, 1000);
+        assert_eq!(on.event_count, 1);
+        assert_eq!(on.into_buf().len(), 13, "armed -> one 13-byte record");
     }
 }
