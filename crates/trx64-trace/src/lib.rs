@@ -11,6 +11,7 @@
 //!       access(u8, bit0=r/w, bit7=hasOld) oldValue(u8)                            = 16 bytes
 //!   DRIVE_CPU_STEP (0x30):  same layout as CPU_STEP — 19 bytes total
 //!   DRIVE_RAM_WRITE (0x31): same layout as RAM_WRITE — 16 bytes total
+//!   DRIVE_HEAD (0x32):      op(1) cycle(f64) halftrack(u8) sector(u8) — 11 bytes (Spec 784)
 //!
 //! access/oldValue (Spec 753): WRITE records carry the pre-write value for RAM
 //! (addr in $0002..$D000); reads and I/O-window writes omit it (hasOld=0).
@@ -31,6 +32,10 @@ pub enum TraceOp {
     DriveCpuStep = 0x30,
     /// Drive 1541 memory bus access (op 0x31 — binary-format.ts DRIVE_RAM_WRITE).
     DriveRamWrite = 0x31,
+    /// Drive 1541 disk-mechanism head position (op 0x32): halftrack + sector under
+    /// head. Spec 784 loader-lens; emitted only when the `drive-mechanism` channel is
+    /// armed on command — never present in parity/oracle traces.
+    DriveHead = 0x32,
 }
 
 pub const MAGIC: &[u8; 8] = b"C64RETR1";
@@ -118,6 +123,19 @@ impl FrameSink {
         self.buf.push(p);
         self.buf.push(0); // b1: not observable
         self.buf.push(0); // b2: not observable
+    }
+
+    /// Encode a DRIVE_HEAD (0x32) record: the 1541 disk-mechanism state — which
+    /// physical (halftrack, sector) the read head is over at `cycle`. Loader-agnostic
+    /// ground truth for the SOURCE of decoded bytes (Spec 784 landing-map). Layout:
+    /// op(1) cycle(f64) halftrack(u8) sector(u8, 0xff = between sectors) = 11 bytes.
+    /// Emitted ONLY when the `drive-mechanism` channel is armed (never in parity traces).
+    #[inline]
+    pub fn write_drive_head(&mut self, cycle: u64, halftrack: u8, sector: u8) {
+        self.buf.push(TraceOp::DriveHead as u8);
+        self.buf.extend_from_slice(&(cycle as f64).to_le_bytes());
+        self.buf.push(halftrack);
+        self.buf.push(sector);
     }
 
     /// Encode a VIC_REG_WRITE frame (op 0x20, 13 bytes total: op + cycle f64 +
@@ -228,17 +246,23 @@ pub struct TraceChannels {
     /// `drive_pc` channel — emits DRIVE_CPU_STEP (0x30). Activated by "drive8-cpu"
     /// domain. Sampled at C64 instruction boundaries, deduplicated by PC.
     pub drive_cpu: bool,
+    /// `drive-mechanism` channel — emits DRIVE_HEAD (0x32): the 1541 read head's
+    /// (halftrack, sector) timeline. OFF by default; armed only by the
+    /// "drive-mechanism" domain (Spec 784 loader-lens). The always-on CPU ring and
+    /// the parity path are unaffected.
+    pub drive_mechanism: bool,
 }
 
 impl TraceChannels {
     /// Map trace domains → channels (= TS domainsToChannels).
     pub fn from_domains<S: AsRef<str>>(domains: &[S]) -> Self {
-        let mut c = TraceChannels { cpu: false, mem: false, vic: false, sid: false, drive_cpu: false };
+        let mut c = TraceChannels { cpu: false, mem: false, vic: false, sid: false, drive_cpu: false, drive_mechanism: false };
         for d in domains {
             match d.as_ref() {
                 "c64-cpu" => c.cpu = true,
                 "memory" => c.mem = true,
                 "vic" | "c64-vic" => c.vic = true,
+                "drive-mechanism" => c.drive_mechanism = true,
                 // audit formats-state-6 — `sid` enables ONLY the sid channel (= TS
                 // domainsToChannels: sid → {"sid"}). The sid channel has no live
                 // producer, so a sid-only domain yields an empty stream; it must NOT
@@ -254,7 +278,7 @@ impl TraceChannels {
 
     /// Default capture set (no domains given) = cpu + memory (TS daemon default).
     pub fn default_cpu_mem() -> Self {
-        TraceChannels { cpu: true, mem: true, vic: true, sid: false, drive_cpu: false }
+        TraceChannels { cpu: true, mem: true, vic: true, sid: false, drive_cpu: false, drive_mechanism: false }
     }
 
     /// Spec 708 §11 / 708.7 — mask the (domain-derived) channels by the DECLARED
@@ -277,6 +301,8 @@ impl TraceChannels {
         // The 1541 drive CPU row is a `cpu-row` capture with the drive8-cpu domain
         // (= TS CHANNEL_TO_CAPTURE drive_pc → cpu-row).
         self.drive_cpu &= has("cpu-row");
+        // Spec 784 — the 1541 disk-mechanism head row (drive-mechanism domain).
+        self.drive_mechanism &= has("drive-mechanism-row");
         // `sid` is reserved (no producer); leave it untouched (no sid-row capture).
         self
     }
@@ -313,6 +339,18 @@ impl TracingObserver {
             return;
         }
         self.sink.write_drive_cpu_step(drv_clk, pc, a, x, y, sp, p);
+        self.event_count += 1;
+    }
+
+    /// Emit a DRIVE_HEAD record (0x32) — gated on the `drive-mechanism` channel.
+    /// Called from the drive-sampled run loop when the sector under the head changes.
+    /// `sector` = 0xff when the head is between sectors (rotation gap).
+    #[inline]
+    pub fn emit_drive_head(&mut self, halftrack: u8, sector: u8, drv_clk: u64) {
+        if !self.channels.drive_mechanism {
+            return;
+        }
+        self.sink.write_drive_head(drv_clk, halftrack, sector);
         self.event_count += 1;
     }
 }
@@ -373,4 +411,61 @@ impl Observer for TracingObserver {
     }
 
     fn on_interrupt(&mut self, _vector: u16, _clk: u64) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Spec 784 A1 — the "drive-mechanism" domain arms ONLY the new head channel.
+    #[test]
+    fn drive_mechanism_domain_arms_only_head_channel() {
+        let c = TraceChannels::from_domains(&["drive-mechanism"]);
+        assert!(c.drive_mechanism, "drive-mechanism domain arms the head channel");
+        assert!(!c.cpu && !c.mem && !c.vic && !c.sid && !c.drive_cpu, "and nothing else");
+        // OFF by default (always-on CPU ring unaffected).
+        assert!(!TraceChannels::from_domains(&["c64-cpu", "memory"]).drive_mechanism);
+    }
+
+    // DRIVE_HEAD (0x32) byte layout: op(1) + cycle f64(8) + halftrack(1) + sector(1) = 11.
+    #[test]
+    fn write_drive_head_byte_layout() {
+        let mut sink = FrameSink::events_only();
+        sink.write_drive_head(0x0102_0304_0506_0708, 71, 17);
+        assert_eq!(sink.buf.len(), 11, "11-byte record");
+        assert_eq!(sink.buf[0], TraceOp::DriveHead as u8, "op 0x32");
+        assert_eq!(sink.buf[9], 71, "halftrack");
+        assert_eq!(sink.buf[10], 17, "sector");
+        // cycle is f64 LE of the u64 clock.
+        let mut c = [0u8; 8];
+        c.copy_from_slice(&sink.buf[1..9]);
+        assert_eq!(f64::from_le_bytes(c), 0x0102_0304_0506_0708u64 as f64);
+    }
+
+    // emit_drive_head is gated: silent when the channel is off, 11 bytes when armed.
+    #[test]
+    fn emit_drive_head_gated_by_channel() {
+        let mut off = TracingObserver::with_channels(
+            FrameSink::events_only(),
+            TraceChannels::from_domains(&["c64-cpu"]),
+        );
+        off.emit_drive_head(71, 17, 1000);
+        assert_eq!(off.into_buf().len(), 0, "not armed -> no record");
+
+        let mut on = TracingObserver::with_channels(
+            FrameSink::events_only(),
+            TraceChannels::from_domains(&["drive-mechanism"]),
+        );
+        on.emit_drive_head(71, 17, 1000);
+        assert_eq!(on.event_count, 1);
+        assert_eq!(on.into_buf().len(), 11, "armed -> one 11-byte record");
+    }
+
+    // 0xff sector = "between sectors" (rotation gap) round-trips.
+    #[test]
+    fn drive_head_gap_sector() {
+        let mut sink = FrameSink::events_only();
+        sink.write_drive_head(0, 71, 0xff);
+        assert_eq!(sink.buf[10], 0xff);
+    }
 }
