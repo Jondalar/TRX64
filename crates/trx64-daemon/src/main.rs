@@ -1308,6 +1308,7 @@ fn run_cycle_budget(session: &mut Session, budget: u64) {
         )
     }) else {
         // No active trace: run untraced on the SAME path a traced run would pick.
+        session.machine.arm_head_trace(false); // Spec 784 — never accumulate untraced.
         let mut obs = NullSink;
         if full_machine {
             session.machine.run_for_full(budget, &mut obs, |_, _, _, _, _, _, _| {});
@@ -1326,6 +1327,11 @@ fn run_cycle_budget(session: &mut Session, budget: u64) {
     // sink call (the deduplicated drive-PC sample comes back via `on_drive_step`, not
     // the main observer stream). This gates RECORDING, never the path.
     let drive_cpu_active = channels.drive_cpu;
+    // Spec 784 — arm the loader-lens 1541 head trace for THIS run iff the
+    // drive-mechanism domain is recording; disarm (+ clear) otherwise so it never
+    // accumulates on non-loader runs.
+    let drive_mechanism_active = channels.drive_mechanism;
+    session.machine.arm_head_trace(drive_mechanism_active);
 
     // Accumulate events from this run, then append to the persistent buffer.
     let mut obs = TracingObserver::with_channels(FrameSink::events_only(), channels);
@@ -1356,6 +1362,12 @@ fn run_cycle_budget(session: &mut Session, budget: u64) {
             if drive_cpu_active {
                 for (pc, a, x, y, sp, p, drv_clk) in steps {
                     obs.emit_drive_step(pc, a, x, y, sp, p, drv_clk);
+                }
+            }
+            // Spec 784 — drain this segment's armed head samples → DRIVE_HEAD (0x32).
+            if drive_mechanism_active {
+                for (drv_clk, ht, sec) in session.machine.drain_head_trace() {
+                    obs.emit_drive_head(ht, sec, drv_clk);
                 }
             }
         } else if drive_cpu_active {

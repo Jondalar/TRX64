@@ -519,6 +519,13 @@ pub struct Machine {
     /// Like `cpu_history`: live-timeline state, NOT machine state — `Clone` is empty,
     /// never serialized.
     pub delta_ring: crate::delta_ring::DeltaRing,
+    /// Spec 784 loader-lens — armed-on-command 1541 disk-mechanism head trace. OFF by
+    /// default (does NOT run with the always-on CPU ring). When armed, a `(drv_clk,
+    /// halftrack, sector)` sample is pushed whenever the sector under the head changes,
+    /// sampled at each drive-PC step; the daemon drains + emits DRIVE_HEAD (0x32).
+    pub head_trace_armed: bool,
+    pub head_trace: Vec<(u64, u8, u8)>,
+    head_trace_last: Option<(u8, u8)>,
 }
 
 /// reverse-debug Phase 1b — the CPU state the machine landed on after a reverse-step
@@ -656,6 +663,9 @@ impl Machine {
             cartridge_image: None,
             cpu_history: crate::cpu_history::CpuHistoryRing::new(),
             delta_ring: crate::delta_ring::DeltaRing::new(),
+            head_trace_armed: false,
+            head_trace: Vec::new(),
+            head_trace_last: None,
         }
     }
 
@@ -1624,6 +1634,22 @@ impl Machine {
     /// identical to [`run_for_capped`].
     ///
     /// `on_drive_step`: deduplicated drive-PC sample (for the drive8-cpu domain).
+    /// Spec 784 — arm/disarm the loader-lens head trace. Arming clears the buffer.
+    /// OFF by default; only the daemon's `drive-mechanism`-armed run turns it on.
+    pub fn arm_head_trace(&mut self, on: bool) {
+        self.head_trace_armed = on;
+        if on {
+            self.head_trace.clear();
+            self.head_trace_last = None;
+        }
+    }
+
+    /// Spec 784 — take the accumulated `(drv_clk, halftrack, sector)` head samples
+    /// (sector-change deduplicated). Sector 0xff = head between sectors.
+    pub fn drain_head_trace(&mut self) -> Vec<(u64, u8, u8)> {
+        std::mem::take(&mut self.head_trace)
+    }
+
     pub fn run_for_full<O: Observer, F>(&mut self, budget: u64, obs: &mut O, on_drive_step: F)
     where
         F: FnMut(u16, u8, u8, u8, u8, u8, u64),
@@ -1814,6 +1840,18 @@ impl Machine {
             self.iec.iec_drive_write((!self.drive8.via1_pb_iec_output()) & 0xff, 0);
             if let Some((pc, a, x, y, sp, p, drv_clk)) = self.drive8.sample_pc_change() {
                 on_drive_step(pc, a, x, y, sp, p, drv_clk);
+                // Spec 784 — armed-on-command 1541 head-position sample (loader-lens
+                // SOURCE ground truth). Pushed only when the sector under the head
+                // changes; never runs with the always-on ring.
+                if self.head_trace_armed {
+                    let ht = self.drive8.rotation.current_half_track as u8;
+                    let s = self.drive8.rotation.sector_under_head();
+                    let sec = if s < 0 { 0xff } else { s as u8 };
+                    if self.head_trace_last != Some((ht, sec)) {
+                        self.head_trace.push((drv_clk, ht, sec));
+                        self.head_trace_last = Some((ht, sec));
+                    }
+                }
             }
             executed += 1;
             // A watchpoint that hit during this instruction halts NOW, at the
