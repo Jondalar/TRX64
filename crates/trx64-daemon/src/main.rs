@@ -1226,6 +1226,12 @@ fn capture_all_def_json(domains: &[String]) -> Value {
         triggers.push(json!({ "kind": "raster-window", "fromLine": 0, "toLine": 311 }));
         captures.push(json!({ "kind": "vic-row" }));
     }
+    if has("drive-mechanism") {
+        // Spec 784 — the 1541 head lane. DRIVE_HEAD (0x34) is emitted by the run-loop
+        // drain (arm_head_trace → emit_drive_head), NOT a trigger; this capture-row is
+        // what keeps mask_by_captures from masking the drive_mechanism channel off.
+        captures.push(json!({ "kind": "drive-mechanism-row", "domain": "drive-mechanism" }));
+    }
     json!({
         "id": "live-capture",
         "version": 1,
@@ -3848,7 +3854,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                     if args.first().map(|s| s == "off").unwrap_or(false) {
                         trace_scope = Some(observers::TraceScope { off: true, domains: vec![] });
                     } else {
-                        const ALL: [&str; 5] = ["c64-cpu", "drive8-cpu", "iec", "vic", "memory"];
+                        const ALL: [&str; 6] = ["c64-cpu", "drive8-cpu", "iec", "vic", "memory", "drive-mechanism"];
                         if let Some(bad) = args.iter().find(|d| !ALL.contains(&d.as_str())) {
                             return Err(format!(
                                 "obs: trace: unknown domain '{bad}' (use {} or 'off')",
