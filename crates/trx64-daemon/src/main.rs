@@ -13378,7 +13378,15 @@ async fn handle_connection(
 /// Build the singleton [`State`] from an already-booted [`Session`]. `streaming_on`
 /// only stamps `streaming_enabled` (the FFI has no `--stream` A/V hub; it consumes
 /// `NotifyHub` events directly), so it is `false` for an FFI embed.
-pub fn build_state(session: Session, streaming_on: bool) -> State {
+pub fn build_state(mut session: Session, streaming_on: bool) -> State {
+    // Requirement (10-day standing): daemon up ⟹ C64 runs. A STREAMING (UI) daemon
+    // starts the machine in the RUNNING state so the pacing loop advances it
+    // immediately once the UI attaches — the user/LLM pauses ONLY via an explicit
+    // Freeze (debug/pause). A non-streaming (oracle / byte-exact) daemon stays paused
+    // (Session::new default) for deterministic, manually-driven runs.
+    if streaming_on {
+        session.running = true;
+    }
     State {
         session,
         breakpoints: Breakpoints::new(),
