@@ -259,8 +259,8 @@ impl Engine {
             "warp" => self.verb_warp(rest.first().copied()),
             "joystick" | "joy" => self.verb_joystick(rest.first().copied()),
             "window" => CmdResult { output: "opening emulator window…".into(), open_window: true, quit: false },
-            "dump" => self.verb_dump(&arg),
-            "restore" | "undump" => self.verb_restore(&arg),
+            "dump" | "snapshot" => self.verb_dump(&arg),
+            "restore" | "undump" | "loadsnapshot" => self.verb_restore(&arg),
             "ringdump" => self.verb_ringdump(&arg),
             "ringload" => self.verb_ringload(&arg),
             "settings" => self.verb_settings(),
@@ -476,7 +476,7 @@ impl Engine {
 
     fn verb_dump(&self, path: &str) -> CmdResult {
         if path.is_empty() {
-            return CmdResult::text("dump <path> — writes a .c64re snapshot.");
+            return CmdResult::text("dump <path> — writes a .c64re snapshot (alias: snapshot).");
         }
         match self.rpc("snapshot/dump", json!({ "path": path })) {
             Ok(v) => CmdResult::text(format!("DUMP → {path} {}", compact(&v))),
@@ -486,7 +486,7 @@ impl Engine {
 
     fn verb_restore(&self, path: &str) -> CmdResult {
         if path.is_empty() {
-            return CmdResult::text("restore <path> — loads a .c64re snapshot.");
+            return CmdResult::text("restore <path> — loads a .c64re snapshot (aliases: undump, loadsnapshot).");
         }
         let r = self.rpc("snapshot/undump", json!({ "path": path }));
         self.bump_epoch();
@@ -715,8 +715,8 @@ Tab completes verbs in all three namespaces + paths for path arguments.
   /warp on|off         8× / real-time PAL pacing
   /joystick off|port1|port2   route WASD+Space to the joystick (off = type)
   /window              spawn the native emulator window
-  /dump <path>         write a .c64re snapshot
-  /restore | /undump <path>   load a .c64re snapshot
+  /dump | /snapshot <path>   write a .c64re snapshot
+  /restore | /undump | /loadsnapshot <path>   load a .c64re snapshot
   /ringdump <path>     write a .c64rering reverse-debug buffer
   /ringload <path>     load a .c64rering reverse-debug buffer
   /settings            read-only status (pacing/warp/joystick/disk/cart)

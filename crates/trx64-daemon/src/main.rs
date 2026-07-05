@@ -5053,13 +5053,16 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
         // read_native_snapshot + capture/restore_runtime_checkpoint — the very engine
         // behind the snapshot/* WS methods). Relative paths resolve against the FS-shell
         // cwd (= the project dir), 1:1 with the TS comment at monitor-shell.ts:283-288.
-        "dump" | "undump" => {
+        // `snapshot`/`loadsnapshot` are aliases: our runtime snapshot IS the `.c64re`
+        // dump. An agent that reached for "snapshot" (VICE terminology) gets the same
+        // capability instead of `unknown command: snapshot`.
+        "dump" | "snapshot" | "undump" | "loadsnapshot" => {
             let (file, _rest) = parse_file_cmd();
             let path = match file {
                 Some(p) => resolve_fs_path(&p),
                 None => return Err(format!("{op}: usage: {op} \"<path.c64re>\"")),
             };
-            if op == "dump" {
+            if op == "dump" || op == "snapshot" {
                 // ── snapshot/dump core (= the WS handler, taking &mut st) ──────────
                 st.session.machine.drive8.flush_disk_writeback();
                 let (disk_path, disk_format) = match st.session.machine.drive8.get_attached_disk() {
@@ -5556,7 +5559,7 @@ fn monitor_help_text() -> String {
         "    sidefx [on|off]  monitor read side effects (default off = peek)",
         "    device [c64|drive8]  target the C64 or the 1541 CPU (drive8 = read-inspect r/m/d)",
         "  STATE / TRACE",
-        "    dump|undump <p>  snapshot persist/restore (.c64re, Spec 707)",
+        "    dump|snapshot <p>  write a .c64re snapshot; undump|loadsnapshot <p>  restore it (Spec 707)",
         "    savecrt [\"<p>\"]  write live flash state to the mounted .crt (or to <p> as a copy)",
         "    swapcrt \"<p>\"    hot-swap the .crt, NO reset (same mapper: bank/ctrl carried) — build iteration",
         "    trace on|off|status|mark   live trace gate (Spec 746)",

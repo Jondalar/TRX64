@@ -108,6 +108,21 @@ fn undump_aliases_restore() {
     let restore = engine.exec_line("/restore").output;
     let undump = engine.exec_line("/undump").output;
     assert_eq!(restore, undump, "/undump and /restore take the same path");
+    let loadsnapshot = engine.exec_line("/loadsnapshot").output;
+    assert_eq!(restore, loadsnapshot, "/loadsnapshot and /restore take the same path");
+}
+
+/// `/snapshot` is an alias of `/dump` — our runtime snapshot IS the .c64re dump, so an
+/// agent reaching for VICE's "snapshot" gets the capability instead of unknown-command.
+#[test]
+fn snapshot_aliases_dump() {
+    let Some(engine) = engine_or_skip() else { return };
+
+    let dump = engine.exec_line("/dump").output;
+    let snapshot = engine.exec_line("/snapshot").output;
+    assert_eq!(dump, snapshot, "/snapshot and /dump take the same path");
+    assert!(!dump.contains("unknown"), "/dump is a known verb: {dump}");
+    assert!(!snapshot.contains("unknown"), "/snapshot is a known verb: {snapshot}");
 }
 
 /// `/settings` returns a non-empty read-only status summary.

@@ -541,14 +541,14 @@ fn run_loop(term: &mut Term, engine: &Engine, to_main: &Sender<UiToMain>) -> io:
 /// (umount/undump/joy/exit), so Tab offers every spelling.
 const VM_VERBS: &[&str] = &[
     "power", "reset", "run", "pause", "step", "mount", "eject", "umount", "load", "warp",
-    "joystick", "joy", "window", "dump", "restore", "undump", "ringdump", "ringload", "settings",
+    "joystick", "joy", "window", "dump", "snapshot", "restore", "undump", "loadsnapshot", "ringdump", "ringload", "settings",
     "help", "quit", "exit",
 ];
 
 /// VM verbs whose argument is a path — after `"/<verb> "`, Tab path-completes the last
 /// token (mirrors the PATH verbs in `engine::exec_line`).
 const VM_PATH_VERBS: &[&str] =
-    &["mount", "load", "run", "dump", "restore", "undump", "ringdump", "ringload"];
+    &["mount", "load", "run", "dump", "snapshot", "restore", "undump", "loadsnapshot", "ringdump", "ringload"];
 
 /// FS (`!`) verbs — the filesystem namespace (mirrors `engine::FS_VERBS`, the monitor
 /// file shell verbs, re-prefixed with `!`).
@@ -572,7 +572,7 @@ const MONITOR_VERBS: &[&str] = &[
     // cpu
     "r", "sidefx", "device",
     // state & trace
-    "dump", "undump", "savecrt", "swapcrt", "trace", "tracedb", "traceindex",
+    "dump", "snapshot", "undump", "loadsnapshot", "savecrt", "swapcrt", "trace", "tracedb", "traceindex",
     // analysis
     "map", "taint", "swimlane", "chis",
     // reverse-debug
