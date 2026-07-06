@@ -3,7 +3,22 @@
 //! Boot-paused, idle-safe, opChain-serialized mutations, media mount, snapshot ring /
 //! rewind tree. Phase-2 home of warp + parallel `explore()` over COW machine forks.
 
+use trx64_core::cart::{CartMapper, ParsedCartridgeImage};
+use trx64_core::drive::DiskImage;
 use trx64_core::Machine;
+
+/// Spec 786 — a cartridge held in the session's media registry while the
+/// machine is powered OFF. The live mapper + parsed image are transplanted
+/// verbatim (NOT rebuilt from bytes) so EasyFlash flash state persists across
+/// a power-cycle: a physical cartridge does not lose its contents when the
+/// C64 is switched off.
+pub struct InsertedCart {
+    pub image: ParsedCartridgeImage,
+    pub mapper: Box<dyn CartMapper>,
+    /// Host `.crt` path (persist/eject writeback + reporting). Empty for
+    /// uploaded bytes with no backing file.
+    pub path: String,
+}
 
 /// One session = one machine instance. Long-lived, outlives MCP reconnects.
 pub struct Session {
@@ -34,6 +49,19 @@ pub struct Session {
     /// programmed flash back on eject/persist. Empty when no cart or uploaded bytes
     /// with no backing path. Set by the CRT media/ingress path; cleared on eject.
     pub cart_path: String,
+    /// Spec 786 — machine power state. `true` = built + booted (live);
+    /// `false` = powered off (blank `Machine::new()`, no live state). Guards
+    /// the three lifecycle primitives (`power_on` / `power_off` / `warm_reset`).
+    pub powered: bool,
+    /// Spec 786 — media registry: cartridge held WHILE POWERED OFF. A
+    /// power-off transplants the live cart here (flash intact); a power-on
+    /// transplants it back into the fresh machine. `None` while powered (the
+    /// machine is the source of truth then). Cart insert/eject mutate this
+    /// across a power-cycle (off → mutate → on).
+    pub inserted_cart: Option<InsertedCart>,
+    /// Spec 786 — media registry: disk image held while powered off (writes
+    /// intact). Same off↔machine transplant as the cartridge.
+    pub inserted_disk: Option<DiskImage>,
 }
 
 /// Trace bookkeeping for an active `.c64retrace` capture.
@@ -93,12 +121,117 @@ impl Session {
             trace: None,
             disk_path: String::new(),
             cart_path: String::new(),
+            powered: false,
+            inserted_cart: None,
+            inserted_disk: None,
         }
     }
 
     /// Boot the session: load ROMs from `rom_dir` and cold-reset the machine.
+    /// This is the daemon-startup init; it leaves the session PAUSED
+    /// (`running` stays false — Spec 744.3) but POWERED (the machine is now
+    /// live). The run loop is started separately by the daemon/UI.
     pub fn boot(&mut self, rom_dir: &std::path::Path) -> Result<(), trx64_core::RomError> {
-        self.machine.boot_from_dir(rom_dir)
+        self.machine.boot_from_dir(rom_dir)?;
+        self.powered = true;
+        Ok(())
+    }
+
+    // ---- Spec 786 — power lifecycle: 3 guarded primitives ----------------
+
+    /// Power the machine ON: full initialisation IDENTICAL to the daemon
+    /// startup (`Machine::new()` + `boot_from_dir`), then re-attach whatever
+    /// media is registered. This is the ONLY path that yields fresh I/O chips
+    /// (VIC / CIA1 / CIA2 come only from `Machine::new()`; `cold_reset` cannot
+    /// clear stale chip state) — so nothing from a previous run survives.
+    /// Comes up RUNNING. No-op if already powered (a real machine can't be
+    /// switched on twice).
+    pub fn power_on(&mut self, rom_dir: &std::path::Path) -> Result<(), trx64_core::RomError> {
+        if self.powered {
+            return Ok(());
+        }
+        let mut machine = Machine::new();
+        machine.boot_from_dir(rom_dir)?;
+        // Re-insert the registered cartridge: transplant the live mapper +
+        // image (flash preserved), then cold-reset so the machine re-vectors
+        // $FFFC THROUGH the cart (boots INTO it, like a real insert + power-on).
+        // No cart ⇒ the KERNAL boot from `boot_from_dir` stands.
+        if let Some(cart) = self.inserted_cart.take() {
+            self.cart_path = cart.path.clone();
+            machine.cartridge = Some(cart.mapper);
+            machine.cartridge_image = Some(cart.image);
+            machine.cold_reset();
+        }
+        // Re-attach the registered disk (writes intact).
+        if let Some(disk) = self.inserted_disk.take() {
+            machine.drive8.attach_disk(disk);
+        }
+        self.machine = machine;
+        self.running = true;
+        self.powered = true;
+        self.injected = false;
+        self.io_injected = false;
+        Ok(())
+    }
+
+    /// Power the machine OFF: everything off, no live state. Flush pending disk
+    /// writes, transplant the live media into the registry (physical media
+    /// survive a power cut — EasyFlash flash + disk writes), then blank the
+    /// machine to a dead `Machine::new()` (no ROMs). No-op if already off.
+    pub fn power_off(&mut self) {
+        if !self.powered {
+            return;
+        }
+        // Physical cart survives: move the live mapper + image into the
+        // registry so the next power-on re-inserts it (flash intact).
+        if let Some(mapper) = self.machine.cartridge.take() {
+            let image = self
+                .machine
+                .cartridge_image
+                .take()
+                .expect("cartridge_image present whenever cartridge is present");
+            self.inserted_cart = Some(InsertedCart { image, mapper, path: self.cart_path.clone() });
+        }
+        // Physical disk survives: flush in-flight writes into the image bytes,
+        // then move the image into the registry.
+        self.machine.drive8.flush_disk_writeback();
+        self.inserted_disk = self.machine.drive8.disk.take();
+        self.machine = Machine::new();
+        self.running = false;
+        self.powered = false;
+    }
+
+    /// HW RESET line: jump through $FFFC ($FCE2 for the stock KERNAL), RAM +
+    /// media preserved, I/O chips reset (= `Machine::warm_reset`). Recovers a
+    /// running OR jammed machine. No-op if powered off.
+    pub fn warm_reset(&mut self) {
+        if !self.powered {
+            return;
+        }
+        self.machine.warm_reset();
+    }
+
+    /// Spec 786 — register a cartridge in the media registry (insert). Parses
+    /// the `.crt` bytes into a fresh mapper; takes effect on the next
+    /// `power_on`. The daemon composes an insert as power_off → set → power_on.
+    pub fn set_inserted_cart(
+        &mut self,
+        bytes: &[u8],
+        name: &str,
+        path: &str,
+    ) -> Result<trx64_core::cart::MapperType, trx64_core::cart::CrtError> {
+        let (image, mapper) = trx64_core::cart::load_cartridge_from_bytes(bytes, name, None)?;
+        let mt = image.mapper_type;
+        self.inserted_cart = Some(InsertedCart { image, mapper, path: path.to_string() });
+        Ok(mt)
+    }
+
+    /// Spec 786 — drop the registered cartridge (eject). Takes effect on the
+    /// next `power_on`. The daemon composes an eject as power_off → clear →
+    /// power_on.
+    pub fn clear_inserted_cart(&mut self) {
+        self.inserted_cart = None;
+        self.cart_path = String::new();
     }
 
     /// Native fast snapshot: clone the Machine (ADR-002).

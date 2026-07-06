@@ -1288,6 +1288,44 @@ fn capture_all_def_json(domains: &[String]) -> Value {
 /// 1-cycle VIC sprite-DMA BA-steal phase delta vs the TS oracle on BOTH `VicBus` and
 /// the literal full machine (pre-existing RED); greening it needs a VIC sprite-DMA
 /// fix, tracked separately.
+/// Spec 786 — power the machine ON with the daemon-side housekeeping a power
+/// transition implies: fresh full init (fresh VIC/CIA — the ONLY way to clear
+/// stale chip state, `cold_reset` can't), drop the checkpoint ring (the old
+/// timeline is defunct), clear the control-stop + re-arm the JAM edge, reset
+/// the flow tracker + monitor cursors, warm the boot to a stable screen, and
+/// flush the audio timeline. `Session::power_on` itself is a no-op if already
+/// powered, so a caller that forgot an intervening `do_power_off` can't build a
+/// second machine.
+fn do_power_on(st: &mut State) {
+    let roms = rom_dir();
+    let _ = st.session.power_on(&roms);
+    st.checkpoint_ring.clear();
+    st.ctrl_stop = None;
+    st.ctrl_frame += 1;
+    st.flow.reset();
+    st.stream_broke_on_jam = false;
+    st.mon.disasm_cursor = None;
+    st.mon.mem_cursor = None;
+    // Warm the boot so the returned pc/screen is post-KERNAL (parity with the
+    // old cold-reset 5M run). Runs on the freshly-built RUNNING machine.
+    run_cycle_budget(&mut st.session, 5_000_000);
+    st.notify.broadcast("audio/flush", json!({ "session_id": st.session.id }));
+}
+
+/// Spec 786 — power the machine OFF (dead, no live state) + the same
+/// housekeeping minus the boot warm-up (a powered-off machine runs nothing).
+fn do_power_off(st: &mut State) {
+    st.session.power_off();
+    st.checkpoint_ring.clear();
+    st.ctrl_stop = None;
+    st.ctrl_frame += 1;
+    st.flow.reset();
+    st.stream_broke_on_jam = false;
+    st.mon.disasm_cursor = None;
+    st.mon.mem_cursor = None;
+    st.notify.broadcast("audio/flush", json!({ "session_id": st.session.id }));
+}
+
 fn run_cycle_budget(session: &mut Session, budget: u64) {
     // Full literal-VIC machine when the ROMs are assembled AND the scenario engages
     // the VIC: a real boot, a `wr io` register injection (render — the per-cycle VIC
@@ -4645,22 +4683,43 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             }
         }
 
-        // ---- Reset -----------------------------------------------------------
+        // ---- Power / reset (Spec 786) ---------------------------------------
+        // `reset [warm|cold]` (default warm = HW RESET line → $FCE2, RAM + media
+        // preserved); `power on|off`. All compose the session power primitives,
+        // identical to the `session/reset` + `session/power` WS methods.
         "reset" => {
-            st.session.running = false;
-            // TS: s.resetCold("pal-default"). TRX64 cold-reset = re-boot from ROMs
-            // (fill_power_on_ram + ROM reload + reset vectors), matching resetCold.
-            let roms = rom_dir();
-            let _ = st.session.boot(&roms);
-            st.session.injected = false;
-            st.session.io_injected = false;
-            st.mon.disasm_cursor = None;
-            st.mon.mem_cursor = None;
-            // The machine is power-cycled → any interrupt frames the FlowTracker held
-            // are stale (TS gets a fresh controller + FlowTracker on resetCold).
-            st.flow.reset();
-            Ok("reset".to_string())
+            match toks.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
+                Some("cold") => {
+                    do_power_off(st);
+                    do_power_on(st);
+                    Ok("reset cold (power-cycle)".to_string())
+                }
+                _ => {
+                    // warm = HW RESET line: $FCE2 via $FFFC, RAM + media preserved.
+                    st.session.warm_reset();
+                    st.session.machine.keyboard.clear();
+                    run_cycle_budget(&mut st.session, 5_000_000);
+                    st.ctrl_stop = None;
+                    st.ctrl_frame += 1;
+                    st.flow.reset();
+                    st.stream_broke_on_jam = false;
+                    st.mon.disasm_cursor = None;
+                    st.mon.mem_cursor = None;
+                    Ok("reset warm ($FCE2)".to_string())
+                }
+            }
         }
+        "power" => match toks.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
+            Some("on") => {
+                do_power_on(st);
+                Ok(format!("power on (powered={})", st.session.powered))
+            }
+            Some("off") => {
+                do_power_off(st);
+                Ok(format!("power off (powered={})", st.session.powered))
+            }
+            _ => Ok("power on|off".to_string()),
+        },
 
         // ---- Trace-store reads (map/taint/swimlane/chis) — audit misc-14. --------
         // The TS DAEMON wires a `traceRead` bridge backed by a DuckDB trace store;
@@ -7228,43 +7287,59 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
         // from a running/JAMmed game; RAM is preserved. The cold path additionally
         // fills power-on DRAM + power-cycles the drive. Both run the KERNAL to READY
         // (5M cycles, matching the TS runFor). Returns { c64Cycles, pc, mode }.
+        // Spec 786 — reset composes the power primitives:
+        //   soft → warm_reset ($FCE2, RAM + media preserved, I/O chips reset)
+        //   cold → power_off → power_on (fresh full init; inserted media kept)
         "session/reset" => {
             let mode = req.params.get("mode").and_then(|v| v.as_str()).unwrap_or("cold");
             let mut st = state.lock().unwrap();
-            if mode == "soft" {
-                // Warm = HW RESET line, RAM preserved (= resetWarm, ws-server.ts:1409).
-                st.session.machine.warm_reset();
-            } else {
-                // Cold power-cycle = fresh DRAM fill, then reset.
-                st.session.machine.fill_power_on_ram();
-                st.session.machine.cold_reset();
-                st.session.machine.drive8.cold_reset();
-                // audit ws-session-debug-12 — a cold power-cycle is a NEW machine: the
-                // checkpoint ring's anchors belong to the OLD timeline (pre-reset
-                // RAM/state), so scrubbing back to them would jump into a defunct
-                // session. Drop the ring; it refills from the fresh boot. (= TS
-                // ws-server.ts cold path → ctrl.checkpointRing.clear(), Spec 761.)
-                st.checkpoint_ring.clear();
-            }
-            st.session.machine.keyboard.clear();
-            run_cycle_budget(&mut st.session, 5_000_000);
             let out_mode = if mode == "soft" { "soft" } else { "cold" };
+            if mode == "soft" {
+                // Warm = HW RESET line: $FCE2 via $FFFC, RAM + media preserved,
+                // VIC/CIA/CPU/IEC reset. No-op if powered off.
+                st.session.warm_reset();
+                st.session.machine.keyboard.clear();
+                run_cycle_budget(&mut st.session, 5_000_000);
+                // A reset is a control + audio-timeline discontinuity; the held
+                // FlowTracker frames are stale.
+                st.ctrl_stop = None;
+                st.ctrl_frame += 1;
+                st.flow.reset();
+                st.stream_broke_on_jam = false;
+                st.notify.broadcast("audio/flush", json!({ "session_id": st.session.id }));
+            } else {
+                // Cold reset = the power-cycle composition. do_power_* carry the
+                // ring drop, boot warm-up, flow/monitor reset + audio flush.
+                do_power_off(&mut st);
+                do_power_on(&mut st);
+            }
             let pc = st.session.machine.cpu6510.reg_pc as u64;
             let cycles = st.session.machine.clk;
-            // A reset is a control discontinuity — clear stop + advance the frame.
-            st.ctrl_stop = None;
-            st.ctrl_frame += 1;
-            // The machine state changed under the FlowTracker — any held interrupt
-            // frames are stale (TS gets a fresh controller on resetCold/Warm).
-            st.flow.reset();
-            // A reset is also an AUDIO-timeline discontinuity (reSID re-init): push
-            // `audio/flush` so the client flushes its worklet ring + re-syncs the send
-            // epoch (ws-server.ts:1430 — same mechanism as a checkpoint restore).
-            st.notify.broadcast("audio/flush", json!({ "session_id": st.session.id }));
             Response::ok(id, json!({
                 "c64Cycles": cycles,
                 "pc": pc,
                 "mode": out_mode
+            }))
+        }
+
+        // Spec 786 — explicit power verbs. `on` = full init (no-op if already
+        // on), `off` = dead machine, no live state (no-op if already off).
+        "session/power" => {
+            let op = req.params.get("op").and_then(|v| v.as_str()).unwrap_or("");
+            let mut st = state.lock().unwrap();
+            match op {
+                "on" => do_power_on(&mut st),
+                "off" => do_power_off(&mut st),
+                _ => return Response::err(id, -32602, "session/power: op must be \"on\" or \"off\""),
+            }
+            let powered = st.session.powered;
+            let pc = st.session.machine.cpu6510.reg_pc as u64;
+            let cycles = st.session.machine.clk;
+            Response::ok(id, json!({
+                "op": op,
+                "powered": powered,
+                "pc": pc,
+                "c64Cycles": cycles
             }))
         }
 
@@ -8725,24 +8800,24 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                     "media/unmount: cannot apply a media change — {reason} (Spec 709.13)."
                 ));
             }
-            let before_id = capture_media_checkpoint(&mut st);
+            // A CART eject is a power-cycle (Spec 786): the ring checkpoints belong
+            // to the old cart-inserted timeline and are dropped by the power-off, so
+            // none are captured/pinned for a cart. A DISK unmount is a live device op
+            // → capture before/after as before.
+            let before_id = if is_cart { None } else { capture_media_checkpoint(&mut st) };
             let mut persisted_outgoing: Option<String> = None;
             if is_cart {
-                // Cart eject = persist writable flash → detach → power-cycle → resume
-                // (Spec 709.12, VICE-faithful), mirroring the media/ingress eject path.
+                // Persist any programmed flash back to the .crt while the cart is still
+                // LIVE in the machine (before the power-off transplant).
                 let cart_path = st.session.cart_path.clone();
                 if !cart_path.is_empty() { persist_cart_for_eject(&mut st, &cart_path); }
-                st.session.machine.detach_cart();
-                st.session.cart_path = String::new();
-                st.session.machine.fill_power_on_ram();
-                st.session.machine.cold_reset();
-                st.session.running = true;
-                st.ctrl_stop = None;
-                // audit ws-media-14 — resume with the LIVE pacing, not hardcoded pal/1.
-                // TS routes a cart eject through the ingress + ctrl.run(), and run()
-                // broadcasts debug/running carrying `this.pacing` (whatever set_pacing
-                // last selected, e.g. "warp"; runtime-controller.ts:282). Hardcoding
-                // pal/1 here reset a warp session to 1× on every cart eject.
+                // Eject = power_off → drop the cart from the registry → power_on.
+                // The disk (if any) is preserved across the power-cycle via the registry.
+                do_power_off(&mut st);
+                st.session.clear_inserted_cart();
+                do_power_on(&mut st);
+                // audit ws-media-14 — resume with the LIVE pacing (do_power_on set
+                // running=true); a warp session must stay warp across a cart eject.
                 let session_id = st.session.id.clone();
                 let (mode, ratio) = (st.pacing_mode.clone(), st.pacing_ratio);
                 st.notify.broadcast("debug/running", json!({ "session_id": session_id, "pacing": { "mode": mode, "ratio": ratio } }));
@@ -8754,7 +8829,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 st.session.machine.drive8.detach_disk();
                 st.session.disk_path = String::new();
             }
-            let after_id = capture_media_checkpoint(&mut st);
+            let after_id = if is_cart { None } else { capture_media_checkpoint(&mut st) };
             if let Some(ref b) = before_id { st.checkpoint_ring.pin(b); }
             if let Some(ref a) = after_id { st.checkpoint_ring.pin(a); }
             let cycle = st.session.machine.clk;
@@ -8822,26 +8897,29 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                         "media/mount: cannot apply a media change — {reason} (Spec 709.13)."
                     ));
                 }
-                let cart_media_present = st.session.machine.drive8.get_attached_disk().is_some()
-                    || st.session.machine.cartridge.is_some();
-                let before_id = if cart_media_present { capture_media_checkpoint(&mut st) } else { None };
-                let mapper_type = match st.session.machine.attach_cart_from_bytes(&bytes, &crt_name) {
-                    Ok((_n, t)) => t,
+                // Spec 786 — CRT insert = power_off → register cart → power_on.
+                // Validate the CRT up front so a bad file leaves the running
+                // machine untouched.
+                let mapper_type = match trx64_core::cart::load_cartridge_from_bytes(&bytes, &crt_name, None) {
+                    Ok((image, _mapper)) => image.mapper_type,
                     Err(e) => return Response::err(id, -32602, format!("media/mount: bad CRT: {e}")),
                 };
                 let mt = mapper_type_str(mapper_type).to_string();
-                st.session.cart_path = path_str.clone();
                 // audit ws-media-8 — record the cart in the recents store (newest-first,
                 // mountedAt), 1:1 with TS addRecent on every CRT ingest (ingress.ts:250).
                 add_recent_media(&mut st, &path_str, "crt");
-                st.session.machine.fill_power_on_ram();
-                st.session.machine.cold_reset();
-                let after_id = capture_media_checkpoint(&mut st);
-                if let Some(ref b) = before_id { st.checkpoint_ring.pin(b); }
-                if let Some(ref a) = after_id { st.checkpoint_ring.pin(a); }
+                // Insert is a power-cycle: the ring checkpoints belong to the old
+                // timeline and are dropped by the power-off, so none are captured/
+                // pinned for a cart. The disk (if any) is preserved via the registry.
+                do_power_off(&mut st);
+                if let Err(e) = st.session.set_inserted_cart(&bytes, &crt_name, &path_str) {
+                    do_power_on(&mut st); // recover cartless
+                    return Response::err(id, -32602, format!("media/mount: bad CRT: {e}"));
+                }
+                do_power_on(&mut st);
+                let before_id: Option<String> = None;
+                let after_id: Option<String> = None;
                 let cycle = st.session.machine.clk;
-                st.session.running = true;
-                st.ctrl_stop = None;
                 // audit ws-media-14 — resume with the LIVE pacing, not hardcoded pal/1
                 // (TS CRT insert resumes via ctrl.run() = `this.pacing`, ws-server.ts
                 // resumeIfRunning:"crt" → runtime-controller.ts:282).

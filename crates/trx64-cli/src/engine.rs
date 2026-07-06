@@ -276,16 +276,17 @@ impl Engine {
     }
 
     fn verb_power(&self, sub: Option<&str>) -> CmdResult {
+        // Spec 786 — power is a first-class primitive on the daemon.
         match sub.map(|s| s.to_ascii_lowercase()).as_deref() {
             Some("on") | None => {
-                // Cold boot: fresh DRAM + cold reset, then start running.
-                let r = self.rpc("session/reset", json!({ "mode": "cold" }));
+                // Full init (fresh machine, inserted media re-attached), running.
+                let r = self.rpc("session/power", json!({ "op": "on" }));
                 self.bump_epoch();
                 match r {
                     Ok(v) => {
                         self.running.store(true, Ordering::SeqCst);
                         CmdResult::text(format!(
-                            "POWER ON — cold boot @ PC=${:04X}, running.",
+                            "POWER ON — full init @ PC=${:04X}, running.",
                             v.get("pc").and_then(|p| p.as_u64()).unwrap_or(0)
                         ))
                     }
@@ -293,16 +294,13 @@ impl Engine {
                 }
             }
             Some("off") => {
-                // Powered-off state: stop the pump + cold-reset to a quiescent machine
-                // (the runtime has no literal power-off; cold-reset + halted is the
-                // closest faithful "off" — a blank machine waiting for power on).
+                // Everything off, no live state (blank dead machine, media registry kept).
                 self.running.store(false, Ordering::SeqCst);
-                let _ = self.rpc("debug/pause", json!({ "source": "cli" }));
-                let r = self.rpc("session/reset", json!({ "mode": "cold" }));
+                let r = self.rpc("session/power", json!({ "op": "off" }));
                 self.bump_epoch();
                 match r {
-                    Ok(_) => CmdResult::text("POWER OFF — machine halted + reset to powered-off state."),
-                    Err(e) => CmdResult::text(format!("power off: reset failed: {e}")),
+                    Ok(_) => CmdResult::text("POWER OFF — machine off (no live state)."),
+                    Err(e) => CmdResult::text(format!("power off failed: {e}")),
                 }
             }
             Some(other) => CmdResult::text(format!("power: unknown sub '{other}' (use on|off)")),
@@ -310,10 +308,11 @@ impl Engine {
     }
 
     fn verb_reset(&self, sub: Option<&str>) -> CmdResult {
-        // reset [cold|warm]; cold = power-cycle (fresh DRAM), warm = RESET line (RAM kept).
+        // Spec 786 — reset [warm|cold]; DEFAULT warm (RESET line → $FCE2, RAM +
+        // media kept). `cold` = power-cycle (power_off → power_on, fresh DRAM+chips).
         let (mode, label) = match sub.map(|s| s.to_ascii_lowercase()).as_deref() {
-            Some("warm") | Some("soft") => ("soft", "warm"),
-            _ => ("cold", "cold"),
+            Some("cold") => ("cold", "cold"),
+            _ => ("soft", "warm"),
         };
         let r = self.rpc("session/reset", json!({ "mode": mode }));
         self.bump_epoch();
@@ -703,8 +702,8 @@ TRX64 cockpit = bash for the emulator. Three namespaces:
 Tab completes verbs in all three namespaces + paths for path arguments.
 
   /-commands (the machine):
-  /power on|off        cold boot / halt+reset to powered-off
-  /reset [cold|warm]   power-cycle (fresh DRAM) / RESET line (RAM kept)
+  /power on|off        full init (fresh machine) / everything off, no state
+  /reset [warm|cold]   RESET line → $FCE2 (default, RAM+media kept) / power-cycle
   /run                 resume free-running
   /run <prg>           load + autostart a .prg, then run
   /pause               freeze the machine
