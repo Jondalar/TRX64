@@ -18,6 +18,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
+use trx64_core::c64re_snapshot::restore_runtime_checkpoint;
+use trx64_core::drive::{DiskImage, DiskKind};
+use trx64_core::native_snapshot::read_native_snapshot;
 use trx64_core::{BusKind, Machine, Observer, RunStop};
 
 use crate::disasm_cmd::parse_addr;
@@ -84,6 +87,9 @@ fn hex(bytes: &[u8]) -> String {
 /// The parsed, defaulted sandbox request.
 pub struct SandboxArgs {
     pub rom_dir: PathBuf,
+    /// Optional `.c64re` snapshot to restore into the fresh machine before running
+    /// (loader-resident seed) — the routine then runs on top of that state.
+    pub seed: Option<String>,
     pub loads: Vec<SandboxLoad>,
     pub entry: u16,
     pub harvest_addr: u16,
@@ -101,6 +107,7 @@ pub struct SandboxArgs {
 #[allow(clippy::too_many_arguments)]
 pub fn run_sandbox_cli(
     rom_dir: &Path,
+    seed: Option<&str>,
     load: &[String],
     entry: u16,
     harvest: &str,
@@ -124,6 +131,7 @@ pub fn run_sandbox_cli(
     };
     run_sandbox(&SandboxArgs {
         rom_dir: rom_dir.to_path_buf(),
+        seed: seed.map(|s| s.to_string()),
         loads,
         entry,
         harvest_addr,
@@ -179,6 +187,29 @@ pub fn run_sandbox(args: &SandboxArgs) -> Result<String, String> {
     let mut m = Machine::new();
     m.boot_from_dir(&args.rom_dir)
         .map_err(|e| format!("boot ROMs from {}: {e:?}", args.rom_dir.display()))?;
+
+    // Optional seed: restore a .c64re snapshot into the booted machine (a loader-
+    // resident state), then run the routine on top of it. Mirrors the daemon undump:
+    // re-attach drive8 media FIRST, then restore_runtime_checkpoint.
+    if let Some(seed) = &args.seed {
+        let bytes = std::fs::read(seed).map_err(|e| format!("read seed {seed}: {e}"))?;
+        let read = read_native_snapshot(&bytes).map_err(|e| format!("seed {seed}: {e}"))?;
+        for rm in &read.media {
+            if rm.reference.role != "drive8" {
+                continue;
+            }
+            let Some(mbytes) = rm.bytes.clone() else { continue };
+            let kind = if rm.reference.format == "d64" { DiskKind::D64 } else { DiskKind::G64 };
+            m.drive8.attach_disk(DiskImage {
+                kind,
+                bytes: mbytes,
+                backing_path: rm.reference.source_name.clone(),
+                read_only: false,
+            });
+        }
+        restore_runtime_checkpoint(&mut m, &read.checkpoint)
+            .map_err(|e| format!("seed restore: {e}"))?;
+    }
 
     // Apply --load blobs (the PRG header supplies the address when @ADDR is omitted).
     for ld in &args.loads {

@@ -93,9 +93,13 @@ enum Command {
     ///   trx64cli sandbox --load depacker.prg --load packed.bin@$2000 \
     ///                    --entry '$0334' --harvest '$4000:0x800' --json
     Sandbox {
+        /// Optional .c64re snapshot to restore before running (loader-resident seed);
+        /// the routine then runs on top of that state. Generate one with `boot`.
+        #[arg(long)]
+        seed: Option<String>,
         /// A blob to load: FILE@ADDR (ADDR hex), or FILE alone for a .prg (2-byte
-        /// load-address header). Repeatable.
-        #[arg(long = "load", required = true)]
+        /// load-address header). Repeatable. Optional when --seed supplies the code.
+        #[arg(long = "load")]
         load: Vec<String>,
         /// Entry PC of the routine to call (hex).
         #[arg(long, value_parser = trx64_cli::disasm_cmd::parse_addr)]
@@ -185,12 +189,12 @@ fn main() {
 
     // ── Real-core sandbox one-shot (Spec 787 v1 + 788; own machine, no TUI) ─────
     if let Some(Command::Sandbox {
-        load, entry, harvest, zp, sentinel, io, stub_addr, cyc_cap, instr_cap, json,
+        seed, load, entry, harvest, zp, sentinel, io, stub_addr, cyc_cap, instr_cap, json,
     }) = &cli.cmd
     {
         match sandbox_cmd::run_sandbox_cli(
-            &rom_dir, load, *entry, harvest, zp, *sentinel, io.as_deref(), *stub_addr, *cyc_cap,
-            *instr_cap, *json,
+            &rom_dir, seed.as_deref(), load, *entry, harvest, zp, *sentinel, io.as_deref(),
+            *stub_addr, *cyc_cap, *instr_cap, *json,
         ) {
             Ok(out) => println!("{out}"),
             Err(e) => {
