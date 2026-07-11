@@ -26,6 +26,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 
 use trx64_cli::disasm_cmd::{self, DisasmArgs};
+use trx64_cli::sandbox_cmd;
 use trx64_cli::engine::Engine;
 use trx64_cli::tui::{self, UiToMain};
 use trx64_cli::window;
@@ -82,6 +83,44 @@ enum Command {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+
+    /// One-shot real-core execution sandbox (Spec 787 v1 + 788): boot a fresh
+    /// machine (this process = one throwaway scratch instance), load bytes, run the
+    /// title's OWN routine to a sentinel, harvest a RAM slice. Runs on the
+    /// AUTHORITATIVE 6502 — not the TS shadow — so a banking/IO depacker executes
+    /// for real. E.g.
+    ///   trx64cli sandbox --load depacker.prg --load packed.bin@$2000 \
+    ///                    --entry '$0334' --harvest '$4000:0x800' --json
+    Sandbox {
+        /// A blob to load: FILE@ADDR (ADDR hex), or FILE alone for a .prg (2-byte
+        /// load-address header). Repeatable.
+        #[arg(long = "load", required = true)]
+        load: Vec<String>,
+        /// Entry PC of the routine to call (hex).
+        #[arg(long, value_parser = trx64_cli::disasm_cmd::parse_addr)]
+        entry: u16,
+        /// RAM range to harvest after the run: ADDR:LEN (LEN decimal or 0x-hex).
+        #[arg(long)]
+        harvest: String,
+        /// Extra sentinel breakpoint besides the routine's RTS-return (hex).
+        #[arg(long, value_parser = trx64_cli::disasm_cmd::parse_addr)]
+        sentinel: Option<u16>,
+        /// $01 memory-config the entry stub sets before calling (hex byte, default $37).
+        #[arg(long)]
+        io: Option<String>,
+        /// Address of the 11-byte entry stub (hex, default $02a7 free RAM).
+        #[arg(long, value_parser = trx64_cli::disasm_cmd::parse_addr)]
+        stub_addr: Option<u16>,
+        /// Cycle budget cap (default 100_000_000).
+        #[arg(long)]
+        cyc_cap: Option<u64>,
+        /// Instruction cap (default 40_000_000).
+        #[arg(long)]
+        instr_cap: Option<u64>,
+        /// Emit JSON instead of text.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 fn main() {
@@ -97,6 +136,24 @@ fn main() {
             count: *count,
             json: *json,
         }) {
+            Ok(out) => println!("{out}"),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
+
+    // ── Real-core sandbox one-shot (Spec 787 v1 + 788; own machine, no TUI) ─────
+    if let Some(Command::Sandbox {
+        load, entry, harvest, sentinel, io, stub_addr, cyc_cap, instr_cap, json,
+    }) = &cli.cmd
+    {
+        match sandbox_cmd::run_sandbox_cli(
+            &rom_dir, load, *entry, harvest, *sentinel, io.as_deref(), *stub_addr, *cyc_cap,
+            *instr_cap, *json,
+        ) {
             Ok(out) => println!("{out}"),
             Err(e) => {
                 eprintln!("{e}");

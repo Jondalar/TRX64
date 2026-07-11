@@ -30,6 +30,10 @@ trx64-daemon = { path = "../trx64-daemon" }
 # Static (machine-free) capability — the `disasm` subcommand (capability-cut step 1).
 trx64-static = { path = "../trx64-static" }
 
+# The core, as a linkable library — the `sandbox` subcommand drives a fresh
+# Machine directly (Spec 787 v1 scratch instance / 788 run_routine_to_sentinel).
+trx64-core = { path = "../trx64-core" }
+
 # JSON plumbing for building Request params + reading Response/state.
 serde_json = "1"
 
