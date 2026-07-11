@@ -90,6 +90,10 @@ pub struct SandboxArgs {
     /// Optional `.c64re` snapshot to restore into the fresh machine before running
     /// (loader-resident seed) — the routine then runs on top of that state.
     pub seed: Option<String>,
+    /// Optional cart to attach on the cold machine (a cart-resident depacker's ROM).
+    pub cart: Option<String>,
+    /// Optional disk to attach on the cold machine (for a drive-reading routine).
+    pub disk: Option<String>,
     pub loads: Vec<SandboxLoad>,
     pub entry: u16,
     pub harvest_addr: u16,
@@ -108,6 +112,8 @@ pub struct SandboxArgs {
 pub fn run_sandbox_cli(
     rom_dir: &Path,
     seed: Option<&str>,
+    cart: Option<&str>,
+    disk: Option<&str>,
     load: &[String],
     entry: u16,
     harvest: &str,
@@ -132,6 +138,8 @@ pub fn run_sandbox_cli(
     run_sandbox(&SandboxArgs {
         rom_dir: rom_dir.to_path_buf(),
         seed: seed.map(|s| s.to_string()),
+        cart: cart.map(|s| s.to_string()),
+        disk: disk.map(|s| s.to_string()),
         loads,
         entry,
         harvest_addr,
@@ -209,6 +217,32 @@ pub fn run_sandbox(args: &SandboxArgs) -> Result<String, String> {
         }
         restore_runtime_checkpoint(&mut m, &read.checkpoint)
             .map_err(|e| format!("seed restore: {e}"))?;
+    }
+
+    // Optional cold media attach (a cart-resident depacker's ROM / a drive-read
+    // routine's disk). Banking is the caller's job (--io / the routine).
+    if let Some(cart) = &args.cart {
+        let bytes = std::fs::read(cart).map_err(|e| format!("read cart {cart}: {e}"))?;
+        let name = std::path::Path::new(cart)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("cart");
+        m.attach_cart_from_bytes(&bytes, name)
+            .map_err(|e| format!("attach cart {cart}: {e:?}"))?;
+    }
+    if let Some(disk) = &args.disk {
+        let bytes = std::fs::read(disk).map_err(|e| format!("read disk {disk}: {e}"))?;
+        let kind = if disk.to_ascii_lowercase().ends_with(".g64") {
+            DiskKind::G64
+        } else {
+            DiskKind::D64
+        };
+        m.drive8.attach_disk(DiskImage {
+            kind,
+            bytes,
+            backing_path: Some(disk.clone()),
+            read_only: true,
+        });
     }
 
     // Apply --load blobs (the PRG header supplies the address when @ADDR is omitted).

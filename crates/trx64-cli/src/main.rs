@@ -97,6 +97,15 @@ enum Command {
         /// the routine then runs on top of that state. Generate one with `boot`.
         #[arg(long)]
         seed: Option<String>,
+        /// Attach a cart on the cold machine. NOTE: an EF/ultimax cart REMAPS memory
+        /// ($8000/$E000 = cart ROM, $4000 = open bus), so a naive RAM stub+routine may
+        /// not run cleanly — for a cart-resident depacker prefer --seed (a .c64re of
+        /// the cart already running in its banked state).
+        #[arg(long)]
+        cart: Option<String>,
+        /// Attach a disk on the cold machine (.d64/.g64; for a drive-reading routine).
+        #[arg(long)]
+        disk: Option<String>,
         /// A blob to load: FILE@ADDR (ADDR hex), or FILE alone for a .prg (2-byte
         /// load-address header). Repeatable. Optional when --seed supplies the code.
         #[arg(long = "load")]
@@ -189,12 +198,13 @@ fn main() {
 
     // ── Real-core sandbox one-shot (Spec 787 v1 + 788; own machine, no TUI) ─────
     if let Some(Command::Sandbox {
-        seed, load, entry, harvest, zp, sentinel, io, stub_addr, cyc_cap, instr_cap, json,
+        seed, cart, disk, load, entry, harvest, zp, sentinel, io, stub_addr, cyc_cap, instr_cap,
+        json,
     }) = &cli.cmd
     {
         match sandbox_cmd::run_sandbox_cli(
-            &rom_dir, seed.as_deref(), load, *entry, harvest, zp, *sentinel, io.as_deref(),
-            *stub_addr, *cyc_cap, *instr_cap, *json,
+            &rom_dir, seed.as_deref(), cart.as_deref(), disk.as_deref(), load, *entry, harvest, zp,
+            *sentinel, io.as_deref(), *stub_addr, *cyc_cap, *instr_cap, *json,
         ) {
             Ok(out) => println!("{out}"),
             Err(e) => {
