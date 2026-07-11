@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
-use trx64_core::{Machine, NullSink, RunStop};
+use trx64_core::{BusKind, Machine, Observer, RunStop};
 
 use crate::disasm_cmd::parse_addr;
 
@@ -138,6 +138,43 @@ pub fn run_sandbox_cli(
     })
 }
 
+/// Counts retired instructions and tracks the written address span. Real writes
+/// only (not the 6502 dummy-write cycle), and $0000-$01ff excluded — the CPU port
+/// ($00/$01, set by the stub) and the stack page (jsr/rts + pushes) are machinery,
+/// not the routine's output. Depack output lands in main RAM ($0200+).
+#[derive(Default)]
+struct SandboxObs {
+    steps: u64,
+    write_lo: Option<u16>,
+    write_hi: Option<u16>,
+}
+
+impl Observer for SandboxObs {
+    #[allow(clippy::too_many_arguments)]
+    fn on_instruction(
+        &mut self,
+        _pc: u16,
+        _opcode: u8,
+        _b1: u8,
+        _b2: u8,
+        _a: u8,
+        _x: u8,
+        _y: u8,
+        _sp: u8,
+        _p: u8,
+        _clk: u64,
+    ) {
+        self.steps += 1;
+    }
+    fn on_bus(&mut self, kind: BusKind, addr: u16, _value: u8, _pc: u16, _clk: u64, _old: u8) {
+        if matches!(kind, BusKind::Write) && addr > 0x01ff {
+            self.write_lo = Some(self.write_lo.map_or(addr, |lo| lo.min(addr)));
+            self.write_hi = Some(self.write_hi.map_or(addr, |hi| hi.max(addr)));
+        }
+    }
+    fn on_interrupt(&mut self, _vector: u16, _clk: u64) {}
+}
+
 pub fn run_sandbox(args: &SandboxArgs) -> Result<String, String> {
     let mut m = Machine::new();
     m.boot_from_dir(&args.rom_dir)
@@ -203,7 +240,7 @@ pub fn run_sandbox(args: &SandboxArgs) -> Result<String, String> {
     }
 
     let clk0 = m.c64_core.clk;
-    let mut obs = NullSink;
+    let mut obs = SandboxObs::default();
     let stop = m.run_for_full_capped_dbg(
         args.cyc_cap,
         args.instr_cap,
@@ -214,6 +251,11 @@ pub fn run_sandbox(args: &SandboxArgs) -> Result<String, String> {
         |_, _, _, _, _, _, _| {},
     );
     let cycles = m.c64_core.clk.wrapping_sub(clk0);
+    let steps = obs.steps;
+    let written_span = match (obs.write_lo, obs.write_hi) {
+        (Some(lo), Some(hi)) => Some((lo, hi)),
+        _ => None,
+    };
 
     let stop_reason = match stop {
         RunStop::Breakpoint(pc) if pc == ret => "sentinel_rts",
@@ -235,12 +277,17 @@ pub fn run_sandbox(args: &SandboxArgs) -> Result<String, String> {
             "stopReason": stop_reason,
             "pc": m.c64_core.reg_pc,
             "cycles": cycles,
+            "steps": steps,
+            "writtenSpan": written_span.map(|(lo, hi)| json!({ "lo": lo, "hi": hi })),
             "harvest": { "addr": args.harvest_addr, "len": slice.len(), "hex": hex(slice) },
         });
         serde_json::to_string(&out).map_err(|e| e.to_string())
     } else {
+        let span = written_span
+            .map(|(lo, hi)| format!(" writes=${lo:04x}..${hi:04x}"))
+            .unwrap_or_default();
         Ok(format!(
-            "sandbox: stop={stop_reason} pc=${:04x} cycles={cycles}  harvest ${:04x}..+{} = {}",
+            "sandbox: stop={stop_reason} pc=${:04x} cycles={cycles} steps={steps}{span}  harvest ${:04x}..+{} = {}",
             m.c64_core.reg_pc,
             args.harvest_addr,
             slice.len(),
