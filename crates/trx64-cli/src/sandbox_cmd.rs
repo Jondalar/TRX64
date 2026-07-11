@@ -58,6 +58,21 @@ fn parse_harvest(s: &str) -> Result<(u16, usize), String> {
     Ok((addr, len))
 }
 
+/// Parse `ADDR=VAL` — a zero-page byte to seed before the run (ADDR 00-ff hex,
+/// VAL hex). Depackers take their src/dst pointers here (e.g. `--zp $fb=$00`).
+fn parse_zp(s: &str) -> Result<(u16, u8), String> {
+    let (a, v) = s
+        .split_once('=')
+        .ok_or_else(|| format!("bad --zp '{s}' (want ADDR=VAL, e.g. $fb=$00)"))?;
+    let addr = parse_addr(a)?;
+    if addr > 0xff {
+        return Err(format!("--zp address ${addr:04x} is not zero-page (00-ff)"));
+    }
+    let vh = v.strip_prefix('$').or_else(|| v.strip_prefix("0x")).unwrap_or(v);
+    let val = u8::from_str_radix(vh, 16).map_err(|_| format!("bad --zp value '{v}' (hex byte)"))?;
+    Ok((addr, val))
+}
+
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -73,6 +88,7 @@ pub struct SandboxArgs {
     pub entry: u16,
     pub harvest_addr: u16,
     pub harvest_len: usize,
+    pub zp: Vec<(u16, u8)>,
     pub sentinel: Option<u16>,
     pub io: u8,
     pub stub_addr: u16,
@@ -88,6 +104,7 @@ pub fn run_sandbox_cli(
     load: &[String],
     entry: u16,
     harvest: &str,
+    zp: &[String],
     sentinel: Option<u16>,
     io: Option<&str>,
     stub_addr: Option<u16>,
@@ -97,6 +114,7 @@ pub fn run_sandbox_cli(
 ) -> Result<String, String> {
     let loads = load.iter().map(|s| parse_load(s)).collect::<Result<Vec<_>, _>>()?;
     let (harvest_addr, harvest_len) = parse_harvest(harvest)?;
+    let zp = zp.iter().map(|s| parse_zp(s)).collect::<Result<Vec<_>, _>>()?;
     let io = match io {
         Some(s) => {
             let hex = s.strip_prefix('$').or_else(|| s.strip_prefix("0x")).unwrap_or(s);
@@ -110,6 +128,7 @@ pub fn run_sandbox_cli(
         entry,
         harvest_addr,
         harvest_len,
+        zp,
         sentinel,
         io,
         stub_addr: stub_addr.unwrap_or(DEFAULT_STUB_ADDR),
@@ -151,6 +170,12 @@ pub fn run_sandbox(args: &SandboxArgs) -> Result<String, String> {
             );
         }
         m.poke(addr, body);
+    }
+
+    // Seed zero-page bytes (depacker src/dst pointers etc.). Note: $00/$01 are the
+    // CPU port — $01 is set by the stub via --io, so a --zp $01 would be overwritten.
+    for (addr, val) in &args.zp {
+        m.poke(*addr, &[*val]);
     }
 
     // Entry stub: sei; lda #io; sta $01; jsr entry; jmp self. `entry`'s RTS returns
@@ -241,5 +266,13 @@ mod tests {
         assert_eq!(parse_harvest("$4000:0x800").unwrap(), (0x4000, 0x800));
         assert_eq!(parse_harvest("c000:16").unwrap(), (0xc000, 16));
         assert!(parse_harvest("nope").is_err());
+    }
+
+    #[test]
+    fn parse_zp_ok_and_bounds() {
+        assert_eq!(parse_zp("$fb=$00").unwrap(), (0xfb, 0x00));
+        assert_eq!(parse_zp("fd=40").unwrap(), (0xfd, 0x40));
+        assert!(parse_zp("$1000=$00").is_err()); // not zero-page
+        assert!(parse_zp("nope").is_err());
     }
 }

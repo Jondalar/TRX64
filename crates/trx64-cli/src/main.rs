@@ -102,6 +102,10 @@ enum Command {
         /// RAM range to harvest after the run: ADDR:LEN (LEN decimal or 0x-hex).
         #[arg(long)]
         harvest: String,
+        /// Seed a zero-page byte before the run: ADDR=VAL (both hex). Repeatable —
+        /// depackers take their src/dst pointers here (e.g. --zp $fb=$00 --zp $fc=$20).
+        #[arg(long = "zp")]
+        zp: Vec<String>,
         /// Extra sentinel breakpoint besides the routine's RTS-return (hex).
         #[arg(long, value_parser = trx64_cli::disasm_cmd::parse_addr)]
         sentinel: Option<u16>,
@@ -147,11 +151,11 @@ fn main() {
 
     // ── Real-core sandbox one-shot (Spec 787 v1 + 788; own machine, no TUI) ─────
     if let Some(Command::Sandbox {
-        load, entry, harvest, sentinel, io, stub_addr, cyc_cap, instr_cap, json,
+        load, entry, harvest, zp, sentinel, io, stub_addr, cyc_cap, instr_cap, json,
     }) = &cli.cmd
     {
         match sandbox_cmd::run_sandbox_cli(
-            &rom_dir, load, *entry, harvest, *sentinel, io.as_deref(), *stub_addr, *cyc_cap,
+            &rom_dir, load, *entry, harvest, zp, *sentinel, io.as_deref(), *stub_addr, *cyc_cap,
             *instr_cap, *json,
         ) {
             Ok(out) => println!("{out}"),
