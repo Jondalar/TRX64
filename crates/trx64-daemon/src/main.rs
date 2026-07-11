@@ -204,6 +204,12 @@ pub struct State {
     type_buffer: Vec<u8>,
     /// Monotonic controller-state counter; increments on each debug/run|pause|continue.
     ctrl_frame: u64,
+    /// Spec 786 audio fix — increments on each machine REBUILD (do_power_on /
+    /// do_power_off = a fresh `Machine::new()`). The streaming loop watches this to
+    /// re-install the SID `$D4xx` write-trace hook on the new SID; without it, audio
+    /// dies on the first power-cycle (e.g. an EF CRT insert = off→on). Distinct from
+    /// `ctrl_frame`, which also bumps on pause/run and would re-prime reSID far too often.
+    machine_generation: u64,
     /// Last stop reason (set on pause, cleared on continue/run).
     ctrl_stop: Option<CtrlStop>,
     /// Monotonic checkpoint counter for legacy media/ingress checkpoint IDs.
@@ -1299,6 +1305,7 @@ fn capture_all_def_json(domains: &[String]) -> Value {
 fn do_power_on(st: &mut State) {
     let roms = rom_dir();
     let _ = st.session.power_on(&roms);
+    st.machine_generation += 1; // Spec 786 audio fix — signal the streaming loop to re-hook the fresh SID.
     st.checkpoint_ring.clear();
     st.ctrl_stop = None;
     st.ctrl_frame += 1;
@@ -1315,7 +1322,16 @@ fn do_power_on(st: &mut State) {
 /// Spec 786 — power the machine OFF (dead, no live state) + the same
 /// housekeeping minus the boot warm-up (a powered-off machine runs nothing).
 fn do_power_off(st: &mut State) {
+    // Bug #2 fix (2026-07-10): power-OFF is the machine's terminal state ("AUS
+    // komplett") — finalize any active trace FIRST so it is flushed to `.c64retrace`
+    // + background-indexed, instead of stranding the buffer in RAM (lost on the next
+    // power-on / process exit). Pause and the soft `session/close` are NOT terminal
+    // and deliberately do NOT end a trace — the CPU/C64-state trace is indifferent to
+    // run/pause and the machine stays alive across a soft close. No-op when no trace
+    // is active (finalize_trace's take() → None).
+    let _ = finalize_trace(st, true);
     st.session.power_off();
+    st.machine_generation += 1; // Spec 786 audio fix — signal the streaming loop to re-hook the fresh SID.
     st.checkpoint_ring.clear();
     st.ctrl_stop = None;
     st.ctrl_frame += 1;
@@ -2012,7 +2028,7 @@ fn drain_and_broadcast_observer_log(st: &mut State) {
         let line = if off {
             if st.session.trace.is_some() {
                 // Finalize the active trace (= `trace off`).
-                let (run, _status) = finalize_trace(st);
+                let (run, _status) = finalize_trace(st, true);
                 let run_id = run.get("runId").and_then(|v| v.as_str()).unwrap_or("");
                 let events = run.get("eventCount").and_then(|v| v.as_u64()).unwrap_or(0);
                 format!("obs {name}: trace off — {run_id} events={events}")
@@ -4574,7 +4590,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                     if st.session.trace.is_none() {
                         return Ok("trace: no active run".into());
                     }
-                    let (run, _status) = finalize_trace(st);
+                    let (run, _status) = finalize_trace(st, true);
                     let run_id = run.get("runId").and_then(|v| v.as_str()).unwrap_or("");
                     let events = run.get("eventCount").and_then(|v| v.as_u64()).unwrap_or(0);
                     let marks = run.get("marks").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
@@ -5845,7 +5861,7 @@ fn build_trace_from_ring(
 /// Flush the active trace to its `.c64retrace` path; returns (run, status) JSON.
 /// T2.6 — also updates `state.last_trace_path` and `state.last_run_id` (= TS
 /// `TraceRunController.lastStorePath`/`lastRunId`, set in `stop()`).
-fn finalize_trace(st: &mut State) -> (Value, Value) {
+fn finalize_trace(st: &mut State, background_index: bool) -> (Value, Value) {
     // Capture cycleEnd from the LIVE machine before taking the trace (= TS run.cycleEnd
     // = controller.session.c64Cpu.cycles at stop, trace-run.ts:453).
     let cycle_end = st.session.machine.clk;
@@ -5876,8 +5892,20 @@ fn finalize_trace(st: &mut State) -> (Value, Value) {
                     p.into_owned()
                 }
             };
-            st.last_trace_path = Some(duckdb_path);
+            st.last_trace_path = Some(duckdb_path.clone());
             st.last_run_id = Some(t.run_id.clone());
+            // Trace-decode gap fix (2026-07-10): on trace-off, kick the `.duckdb` index
+            // build in the BACKGROUND so a finalized trace is queryable WITHOUT an opt-in
+            // flag or a manual `trace/index` — mirroring the retired TS stop() which ALWAYS
+            // indexed. The sidecar decode is minutes on a large `.c64retrace`, so it runs on
+            // a detached thread and must not block the stop RPC. Skipped when the caller will
+            // index synchronously (trace/run/stop wait_index=true) to avoid a double build of
+            // the same store. Soft: an index failure leaves the re-indexable `.c64retrace`.
+            if background_index {
+                std::thread::spawn(move || {
+                    let _ = run_trace_read_sidecar("index", &duckdb_path, &json!({ "wait": true }));
+                });
+            }
             // ws-trace-monitor-misc-23 — return the REAL RuntimeTraceRun descriptor
             // (trace-run.ts stop()): the run's own definitionId (NOT a hardcoded
             // "live-capture"), version, cycleStart/cycleEnd, overheadMs, marks[], media.
@@ -9914,7 +9942,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             let wait_index = req.params.get("wait_index").and_then(|v| v.as_bool()).unwrap_or(false);
             let (status, duckdb_path) = {
                 let mut st = state.lock().unwrap();
-                let status = finalize_trace(&mut *st);
+                let status = finalize_trace(&mut *st, !wait_index);
                 // The duckdb path finalize_trace just recorded (None when no trace ran).
                 (status, st.last_trace_path.clone())
             }; // lock released before the (potentially minutes-long) index build
@@ -13480,6 +13508,7 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         dsl_disabled: std::collections::HashSet::new(),
         type_buffer: Vec::new(),
         ctrl_frame: 0, // incremented on each debug/run|pause|continue; first pause → 1
+        machine_generation: 0,
         ctrl_stop: None,
         checkpoint_counter: 0,
         // Spec 772 — the ring is the short UI-scrub buffer: a max-entries cap (default
@@ -13928,6 +13957,7 @@ mod batch1_tests {
             dsl_disabled: std::collections::HashSet::new(),
             type_buffer: Vec::new(),
             ctrl_frame: 0,
+            machine_generation: 0,
             ctrl_stop: None,
             checkpoint_counter: 0,
             // Spec 772 — the ring is the short UI-scrub buffer: a max-entries cap (default

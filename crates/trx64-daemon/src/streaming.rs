@@ -305,7 +305,12 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
     // ── reSID audio engine (owned on this thread; !Send) + the Send write hook ──
     let mut engine = SidAudioEngine::new(ResidConfig::default());
     let writes: Arc<Mutex<Vec<(u8, u8)>>> = Arc::new(Mutex::new(Vec::new()));
-    {
+    // Track the machine-rebuild generation (bumped by do_power_on / do_power_off).
+    // Spec 786 rebuilds the machine (Machine::new() → a fresh SID with NO write-trace
+    // hook) on every power-cycle, so the hook + reSID prime below is RE-RUN in the loop
+    // whenever this changes — else audio goes permanently silent after the first
+    // power-cycle (e.g. an EF CRT insert = off→on). Seeded at the initial install.
+    let mut last_machine_generation = {
         // Install the additive SID write-trace hook so EVERY $D4xx write (in CPU
         // order) is captured for reSID. The hook must be Send → it captures only
         // the Arc<Mutex<Vec>> byte buffer (the engine itself stays on this thread).
@@ -320,7 +325,8 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
             let v = st.session.machine.read_full(0xD400 + reg as u16);
             engine.record_write(reg, v);
         }
-    }
+        st.machine_generation
+    };
     engine.record_boundary(0); // apply the priming writes, emit nothing
     engine.flush();
     let _ = engine.take_pcm(); // discard priming silence
@@ -355,7 +361,23 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
         // Spec 771.2 (T1.3 wire) — honor the controller pacing mode: "warp" advances
         // 8× cycles per presented frame (fast-forward at 50fps video), else real-time.
         let (running, warp) = {
-            let st = state.lock().unwrap();
+            let mut st = state.lock().unwrap();
+            // Spec 786 audio fix — a power-cycle (cold reset / cart insert-eject /
+            // /power) rebuilds the machine into a fresh SID with no write-trace hook.
+            // Detect via machine_generation and RE-ATTACH the capture hook + re-prime
+            // reSID from the new SID register file, so audio survives the rebuild
+            // instead of going permanently silent.
+            if st.machine_generation != last_machine_generation {
+                last_machine_generation = st.machine_generation;
+                let w = Arc::clone(&writes);
+                st.session.machine.sid.set_write_trace(Some(Box::new(move |addr, value| {
+                    w.lock().unwrap().push((addr, value));
+                })));
+                for reg in 0u8..=0x18 {
+                    let v = st.session.machine.read_full(0xD400 + reg as u16);
+                    engine.record_write(reg, v);
+                }
+            }
             (st.session.running, st.pacing_mode == "warp")
         };
 
