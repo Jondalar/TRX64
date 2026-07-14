@@ -13,7 +13,7 @@
 //!   cargo test -p trx64-core --test cart_mapper_gate behavioral -- --ignored --nocapture
 
 use trx64_core::cart::{
-    load_cartridge_from_bytes, parse_crt, BankInfo, CartState, MapperType,
+    load_cartridge_from_bytes, parse_crt, BankInfo, CartLines, CartState, MapperType,
 };
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -267,6 +267,86 @@ fn easyflash_gmod2_megabyter_build_writable_mappers() {
     let mb = build_crt(86, 0, 1, "MB", &[(0, 0x8000, vec![0u8; 0x2000])]);
     let (_i, m3) = load_cartridge_from_bytes(&mb, "MB", None).expect("MegaByter builds");
     assert_eq!(m3.mapper_type(), MapperType::MegaByter);
+}
+
+// ── C64MegaCart (hw 61, martinpiper fork — M29F160FT 2MB flash) ──────────────
+
+#[test]
+fn c64megacart_builds_writable_mapper() {
+    // hw=61 now builds the WRITABLE tier (was Unsupported).
+    let crt = build_crt(61, 1, 0, "C64MC", &[(0, 0x8000, vec![0u8; 0x2000])]);
+    let img = parse_crt(&crt, "x", None).unwrap();
+    assert_eq!(img.mapper_type, MapperType::C64MegaCart);
+    let (_i, m) = load_cartridge_from_bytes(&crt, "C64MC", None).expect("C64MegaCart builds");
+    assert_eq!(m.mapper_type(), MapperType::C64MegaCart);
+    // Persists its flash → a dirty cart is snapshot-able (not reject-on-dirty).
+    assert!(m.persists_writable_state());
+}
+
+#[test]
+fn c64megacart_control_lines() {
+    // CONTROL ($DF00) bits 7/6 → EXROM/GAME (manual §2). Boot = 8K GAME.
+    let crt = build_crt(61, 1, 0, "C64MC", &[(0, 0x8000, vec![0xffu8; 0x2000])]);
+    let (_i, mut m) = load_cartridge_from_bytes(&crt, "C64MC", None).unwrap();
+    let eg = |l: CartLines| (l.exrom, l.game);
+    // Boot: 8K GAME (EXROM low, GAME high).
+    assert_eq!(eg(m.get_lines()), (0, 1));
+    // $C0 → Ultimax (EXROM high, GAME low).
+    m.write(0xdf00, 0xc0, &bi(), 0);
+    assert_eq!(eg(m.get_lines()), (1, 0));
+    // $80 → Kill/RAM (EXROM high, GAME high).
+    m.write(0xdf00, 0x80, &bi(), 0);
+    assert_eq!(eg(m.get_lines()), (1, 1));
+    // $40 "illegal/float" → mode UNCHANGED (fork only handles $C0/$00/$80).
+    m.write(0xdf00, 0x40, &bi(), 0);
+    assert_eq!(eg(m.get_lines()), (1, 1)); // still Kill/RAM
+    // $00 → back to 8K GAME.
+    m.write(0xdf00, 0x00, &bi(), 0);
+    assert_eq!(eg(m.get_lines()), (0, 1));
+    // Distinguishing case: from 8K GAME, $40 leaves the mode UNCHANGED (VICE
+    // fork). The TS oracle collapses this to "off" (1,1); we follow the fork.
+    m.write(0xdf00, 0x40, &bi(), 0);
+    assert_eq!(eg(m.get_lines()), (0, 1)); // still 8K GAME, NOT off
+}
+
+#[test]
+fn c64megacart_bank_assembly_and_flash() {
+    // Bank 0 = all $FF so a program (bits 1→0 only) is observable.
+    let crt = build_crt(61, 1, 0, "C64MC", &[(0, 0x8000, vec![0xffu8; 0x2000])]);
+    let (_i, mut m) = load_cartridge_from_bytes(&crt, "C64MC", None).unwrap();
+
+    // 14-bit bank: low byte via $DE00, high 6 bits via $DF00 (bits 5-0).
+    m.write(0xde00, 0x12, &bi(), 0); // bank bits 0-7
+    m.write(0xdf00, 0x03, &bi(), 0); // bank bits 8-13 = 3 (and mode → 8K GAME)
+    assert_eq!(m.get_state().current_bank, 0x0312);
+
+    // Back to bank 0, enter ULTIMAX ($C0) to expose the flash command interface.
+    m.write(0xde00, 0x00, &bi(), 0);
+    m.write(0xdf00, 0xc0, &bi(), 0);
+    assert_eq!(m.get_state().current_bank, 0x0000);
+    assert_eq!(m.read(0x8000, &bi(), 0), Some(0xff)); // erased flash
+
+    // AMD program sequence via the $E000 ROMH window (manual §4C): unlock $AAA/$555.
+    m.write(0xeaaa, 0xaa, &bi(), 0); // unlock 1
+    m.write(0xe555, 0x55, &bi(), 0); // unlock 2
+    m.write(0xeaaa, 0xa0, &bi(), 0); // program command
+    m.write(0xe017, 0x5a, &bi(), 0); // program data → flash[$17] = $FF & $5A
+
+    // Programmed byte visible at BOTH the ROMH ($E000) and ROML ($8000) windows
+    // (same flash, same offset), and the flash is now dirty.
+    assert_eq!(m.read(0xe017, &bi(), 0), Some(0x5a));
+    assert_eq!(m.read(0x8017, &bi(), 0), Some(0x5a));
+    assert!(m.is_writable_dirty());
+
+    // A store outside ultimax does NOT program (mode gate): back to 8K GAME.
+    m.write(0xdf00, 0x00, &bi(), 0);
+    m.write(0xeaaa, 0xaa, &bi(), 0);
+    m.write(0xe555, 0x55, &bi(), 0);
+    m.write(0xeaaa, 0xa0, &bi(), 0);
+    m.write(0xe018, 0x11, &bi(), 0); // ignored — not ultimax
+    // $E018 was 0xFF and stays 0xFF (re-enter ultimax to observe).
+    m.write(0xdf00, 0xc0, &bi(), 0);
+    assert_eq!(m.read(0xe018, &bi(), 0), Some(0xff));
 }
 
 #[test]

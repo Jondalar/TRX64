@@ -47,8 +47,9 @@ pub enum MapperType {
     EasyFlash, // CARTRIDGE_EASYFLASH (hw 0x20)
     Gmod2,     // CARTRIDGE_GMOD2 (hw 0x3c) — flash + M93C86 EEPROM
     MegaByter, // CARTRIDGE_MEGABYTER (hw 0x56) — MX29F800CB flash, ROML only
+    C64MegaCart, // CARTRIDGE_C64MEGACART (hw 61, martinpiper fork) — M29F160FT flash
     /// A CRT hardware-type that maps to a serial/SPI family not yet built
-    /// (GMOD3 SPI-flash, C64MegaCart). Parsed but produces no mapper.
+    /// (GMOD3 SPI-flash). Parsed but produces no mapper.
     Unsupported,
 }
 
@@ -281,8 +282,9 @@ fn infer_mapper_type(
         32 => Some(MapperType::EasyFlash),  // CARTRIDGE_EASYFLASH
         60 => Some(MapperType::Gmod2),      // CARTRIDGE_GMOD2 (flash + M93C86)
         86 => Some(MapperType::MegaByter),  // CARTRIDGE_MEGABYTER (MX29F800CB)
-        // serial/SPI families not yet built (GMOD3 SPI-flash, C64MegaCart).
-        61 => Some(MapperType::Unsupported), // c64megacart
+        // C64MegaCart (martinpiper VICE fork): M29F160FT 2MB flash, GMOD2-derived.
+        61 => Some(MapperType::C64MegaCart), // CARTRIDGE_C64MEGACART
+        // serial/SPI families not yet built (GMOD3 SPI-flash).
         62 => Some(MapperType::Unsupported), // gmod3
         _ => None,                           // ts:260-261
     }
@@ -774,7 +776,7 @@ impl CartMapper for OceanMapper {
 
 // ── WRITABLE flash tier ──────────────────────────────────────────────────────
 
-use crate::flash040::{Flash040, FLASH040B, FLASH040_NORMAL, FLASH800_CB};
+use crate::flash040::{Flash040, FLASH040B, FLASH040_160, FLASH040_NORMAL, FLASH800_CB};
 use crate::m93c86::M93c86;
 
 /// resolveRelativeOffset (ts:281-283): the $2000-window offset of `address`.
@@ -1384,10 +1386,165 @@ impl CartMapper for MegabyterMapper {
     }
 }
 
+/// C64MegaCart (Replica Software; Martin Piper's VICE fork `c64/cart/c64megacart.c`,
+/// itself GMOD2-derived). Micron M29F160FT — 2MB flash (256×8K ROML banks, "top
+/// boot"), device `{0x01,0xd2,2}` (`FLASH040_160`). Two write-only registers:
+///   $DE00 (IO1, BANK):    low bank byte → bank bits 0-7.
+///   $DF00 (IO2, CONTROL): bits 5-0 → bank bits 8-13; bits 7/6 → mode —
+///     0xC0 ULTIMAX (flash-write mode, ROMH replaces KERNAL at $E000),
+///     0x00 8K GAME, 0x80 Kill/RAM. (0x40 "illegal/float" leaves mode unchanged,
+///     mirroring the fork's if/else-if that only handles 0xC0/0x00/0x80.)
+/// Flash reads at ROML $8000-$9FFF AND (ultimax) ROMH $E000-$FFFF, and programs
+/// ONLY in ultimax via the $E000 window (manual §4 — unlock $AAA/$555). Same
+/// offset for both windows: (addr & $1FFF) + (bank << 13). Register reads are
+/// open-bus (vicii_read_phi1 in the fork — the CPU never reads them back), so the
+/// mapper does not claim IO reads. The fork's separate VIC-side config (cmodeVIC)
+/// is folded into the single CPU-side CartLines this trait exposes, as
+/// EasyFlash/Megabyter also do here.
+#[derive(Clone, Copy, PartialEq)]
+enum C64MegaCartMode {
+    Game8k,  // $00: EXROM low, GAME high  → ROML $8000-$9FFF
+    Ram,     // $80: EXROM high, GAME high → cart killed, internal RAM
+    Ultimax, // $C0: EXROM high, GAME low  → ROMH replaces KERNAL at $E000 (flash mode)
+}
+
+#[derive(Clone)]
+pub struct C64MegaCartMapper {
+    bank: u16, // 14-bit ROML bank: bits 0-7 via $DE00, bits 8-13 via $DF00
+    mode: C64MegaCartMode,
+    flash: Flash040,
+}
+
+impl C64MegaCartMapper {
+    pub fn new(image: &ParsedCartridgeImage) -> Self {
+        C64MegaCartMapper {
+            bank: 0,
+            mode: C64MegaCartMode::Game8k,
+            flash: Flash040::new(
+                build_linear_chip_data(image, |b| b.roml.as_ref(), 256),
+                "c64megacart",
+                FLASH040_160,
+            ),
+        }
+    }
+    /// c64megacart.c — (addr & $1FFF) + (roml_bank << 13). Same for ROML ($8000)
+    /// and the ultimax ROMH ($E000) window (both use the low 13 address bits).
+    fn flash_offset(&self, address: u16) -> u32 {
+        ((self.bank as u32) << 13) | ((address & 0x1fff) as u32)
+    }
+}
+
+impl CartMapper for C64MegaCartMapper {
+    fn mapper_type(&self) -> MapperType {
+        MapperType::C64MegaCart
+    }
+    /// CONTROL bits 7/6 → EXROM/GAME (manual §2 Control Bit Mapping).
+    fn get_lines(&self) -> CartLines {
+        match self.mode {
+            C64MegaCartMode::Game8k => CartLines { exrom: 0, game: 1 },
+            C64MegaCartMode::Ram => CartLines { exrom: 1, game: 1 },
+            C64MegaCartMode::Ultimax => CartLines { exrom: 1, game: 0 },
+        }
+    }
+    /// c64megacart_roml_read (+ ultimax ROMH): the current flash bank at both the
+    /// $8000 and $E000 windows. The bus PLA-gates which window is live.
+    fn read(&mut self, address: u16, _bank_info: &BankInfo, clk: u64) -> Option<u8> {
+        if (0x8000..=0x9fff).contains(&address) || (0xe000..=0xffff).contains(&address) {
+            return Some(self.flash.read(self.flash_offset(address), clk));
+        }
+        None
+    }
+    fn peek(&self, address: u16, _bank_info: &BankInfo) -> Option<u8> {
+        if (0x8000..=0x9fff).contains(&address) || (0xe000..=0xffff).contains(&address) {
+            return Some(self.flash.peek(self.flash_offset(address)));
+        }
+        None
+    }
+    /// c64megacart_io1_store / io2_store + romh_store. Flash program ONLY in
+    /// ultimax via the $E000 ROMH window (manual §4: unlock/erase/program cycles).
+    fn write(&mut self, address: u16, value: u8, _bank_info: &BankInfo, clk: u64) -> bool {
+        if (0xde00..=0xdeff).contains(&address) {
+            self.bank = (self.bank & 0xff00) | value as u16; // BANK: bits 0-7
+            return true;
+        }
+        if (0xdf00..=0xdfff).contains(&address) {
+            self.bank = (self.bank & 0x00ff) | (((value & 0x3f) as u16) << 8); // bits 8-13
+            match value & 0xc0 {
+                0xc0 => self.mode = C64MegaCartMode::Ultimax,
+                0x00 => self.mode = C64MegaCartMode::Game8k,
+                0x80 => self.mode = C64MegaCartMode::Ram,
+                _ => {} // 0x40 illegal/float: mode unchanged (fork).
+            }
+            return true;
+        }
+        if self.mode == C64MegaCartMode::Ultimax && (0xe000..=0xffff).contains(&address) {
+            self.flash.store(self.flash_offset(address), value, clk);
+            return true;
+        }
+        false
+    }
+    /// c64megacart_reset: bank 0, 8K GAME. Flash DATA (state machine) preserved —
+    /// the fork resets the FSM here too, harmlessly.
+    fn reset(&mut self) {
+        self.bank = 0;
+        self.mode = C64MegaCartMode::Game8k;
+    }
+    fn get_state(&self) -> CartState {
+        let mut flash = self.flash.clone();
+        CartState {
+            current_bank: self.bank,
+            control_register: Some(match self.mode {
+                C64MegaCartMode::Game8k => 0x00,
+                C64MegaCartMode::Ram => 0x80,
+                C64MegaCartMode::Ultimax => 0xc0,
+            }),
+            flash: Some(FlashCartState {
+                flash_lo: Some(flash.snapshot_state(0)),
+                flash_hi: None,
+                eeprom: None,
+                easyflash_jumper: 0,
+                easyflash_ram: Vec::new(),
+            }),
+        }
+    }
+    fn set_state(&mut self, state: CartState) {
+        self.bank = state.current_bank & 0x3fff;
+        self.mode = match state.control_register.unwrap_or(0) & 0xc0 {
+            0xc0 => C64MegaCartMode::Ultimax,
+            0x80 => C64MegaCartMode::Ram,
+            _ => C64MegaCartMode::Game8k,
+        };
+        if let Some(f) = &state.flash {
+            if let Some(s) = &f.flash_lo {
+                self.flash.restore_state(s);
+            }
+        }
+    }
+    fn clone_box(&self) -> Box<dyn CartMapper> {
+        Box::new(self.clone())
+    }
+    fn is_writable_dirty(&self) -> bool {
+        self.flash.is_dirty()
+    }
+    // C64MegaCart persists its M29F160FT flash (writable_image / crt_image).
+    fn persists_writable_state(&self) -> bool {
+        true
+    }
+    fn writable_generation(&self) -> u64 {
+        self.flash.writable_generation()
+    }
+    fn writable_image(&mut self, clk: u64) -> Option<Vec<u8>> {
+        Some(self.flash.get_data(clk).to_vec())
+    }
+    fn set_writable_image(&mut self, bytes: &[u8]) {
+        self.flash.load_data(bytes);
+    }
+}
+
 /// ts:120-154 — mapperFromImage: build the concrete mapper for a parsed image.
 /// The read-only families build their banked mapper; the writable flash families
-/// (EasyFlash, GMOD2, MegaByter) build their flash + EEPROM mapper; the remaining
-/// serial/SPI families (GMOD3, C64MegaCart) yield `Err`.
+/// (EasyFlash, GMOD2, MegaByter, C64MegaCart) build their flash + EEPROM mapper;
+/// the remaining serial/SPI families (GMOD3) yield `Err`.
 pub fn mapper_from_image(
     image: &ParsedCartridgeImage,
 ) -> Result<Box<dyn CartMapper>, CrtError> {
@@ -1401,6 +1558,7 @@ pub fn mapper_from_image(
         MapperType::EasyFlash => Ok(Box::new(EasyFlashMapper::new(image))),
         MapperType::Gmod2 => Ok(Box::new(Gmod2Mapper::new(image))),
         MapperType::MegaByter => Ok(Box::new(MegabyterMapper::new(image))),
+        MapperType::C64MegaCart => Ok(Box::new(C64MegaCartMapper::new(image))),
         MapperType::Unsupported => Err(CrtError::Unsupported(MapperType::Unsupported)),
     }
 }
