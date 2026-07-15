@@ -46,6 +46,7 @@ pub mod vic_inspect;
 pub mod viacore;
 pub mod vice_snapshot_stream;
 pub mod vsf;
+pub mod vsf_export;
 
 pub use cia::Cia;
 pub use cpu::{Bus, Cpu6510};

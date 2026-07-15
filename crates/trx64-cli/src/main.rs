@@ -210,6 +210,18 @@ enum Command {
         render: Option<String>,
     },
 
+    /// Convert a `.c64re` snapshot into a VICE-x64sc-loadable `.vsf` (Spec 791.5,
+    /// the return trip): load the `.c64re` into an isolated machine, emit a `.vsf`
+    /// with VICE-exact module layouts (MAINCPU/C64MEM/CIA1/CIA2/SID/VIC-IISC). The
+    /// un-modelled VIC draw-buffer is zeroed (VICE re-derives). E.g.
+    ///   trx64cli convert-c64re wl.c64re wl.vsf
+    ConvertC64re {
+        /// Input `.c64re` native snapshot.
+        input: String,
+        /// Output `.vsf` (VICE x64sc snapshot).
+        output: String,
+    },
+
     /// Boot a disk/cart in an isolated process (own machine, no daemon, no shared
     /// session) to a state, then dump a .c64re snapshot — mints seeds/fixtures for
     /// `sandbox --seed`. E.g.
@@ -292,6 +304,34 @@ fn main() {
     // ── VSF → .c64re convert one-shot (Spec 791.2; own machine, no daemon) ──────
     if let Some(Command::ConvertVsf { input, output, json, render }) = &cli.cmd {
         match convert_cmd::run_convert(&rom_dir, input, output, *json, render.as_deref()) {
+            Ok(out) => println!("{out}"),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
+
+    // ── .c64re → VSF export one-shot (Spec 791.5; own machine, no daemon) ───────
+    if let Some(Command::ConvertC64re { input, output }) = &cli.cmd {
+        let run = || -> Result<String, String> {
+            let bytes = std::fs::read(input).map_err(|e| format!("read {input}: {e}"))?;
+            let read = trx64_core::native_snapshot::read_native_snapshot(&bytes)
+                .map_err(|e| format!("parse {input}: {e}"))?;
+            let mut m = trx64_core::Machine::new();
+            m.boot_from_dir(&rom_dir)
+                .map_err(|e| format!("boot ROMs: {e:?}"))?;
+            trx64_core::c64re_snapshot::restore_runtime_checkpoint(&mut m, &read.checkpoint)
+                .map_err(|e| format!("restore: {e}"))?;
+            let vsf = trx64_core::vsf_export::save_vice_vsf(&m);
+            std::fs::write(output, &vsf).map_err(|e| format!("write {output}: {e}"))?;
+            Ok(format!(
+                "convert-c64re: {input} → {output}\n  pc=${:04x} cycle={} bytes={} machine=C64SC",
+                m.c64_core.reg_pc, m.c64_core.clk, vsf.len()
+            ))
+        };
+        match run() {
             Ok(out) => println!("{out}"),
             Err(e) => {
                 eprintln!("{e}");
