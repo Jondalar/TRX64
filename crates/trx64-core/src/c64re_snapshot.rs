@@ -824,6 +824,222 @@ pub fn write_color_ram(m: &mut Machine, color_ram: &[u8]) {
     }
 }
 
+// ── cartState (Spec 792.1 — cartridge continuation) ─────────────────────────────
+//
+// The confirmed gap (Spec 792 §Problem): the checkpoint re-created the cart mapper
+// from `cartBytes` + overlaid `cartFlash` (the flash DATA array) but NEVER captured
+// the mapper's live continuation — `current_bank`, `control_register`
+// (EF register_02 / MegaCart mode), the EasyFlash jumper, the IO2 RAM, and the
+// flash command-FSM. A banked cart therefore resumed at bank 0 / register 0.
+//
+// The mapper already exposes `get_state()`/`set_state()` (`CartState` in cart.rs).
+// This node serializes that state (the SAME shape c64re's `HeadlessCartridgeState`
+// carries — types.ts:54-94, camelCase field names) so both `.c64re` and the ring
+// round-trip the full cart continuation. Additive + `Option`-gated: a `.c64re`
+// without `cartState` (707 back-compat) still loads (restore skips a null/absent
+// node), and a read-only cart emits only `currentBank`/`controlRegister`.
+
+use crate::cart::{CartMapper, CartState, FlashCartState};
+use crate::flash040::Flash040SnapState;
+use crate::m93c86::M93c86SnapState;
+
+/// Flash040 command-FSM continuation (= c64re `Flash040SnapState`, types.ts:86-94).
+/// The flash DATA array is NOT here — it rides in the separate `cartFlash` writable
+/// image; only the command state + pending erase-alarm clock.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Flash040StateSnapshot {
+    pub state: i64,
+    #[serde(rename = "baseState")]
+    pub base_state: i64,
+    #[serde(rename = "programByte")]
+    pub program_byte: i64,
+    #[serde(rename = "lastRead")]
+    pub last_read: i64,
+    pub dirty: bool,
+    #[serde(rename = "eraseMask")]
+    pub erase_mask: Vec<i64>, // 8 bytes
+    #[serde(rename = "eraseAlarmClk")]
+    pub erase_alarm_clk: i64,
+}
+
+/// M93C86 serial-EEPROM continuation (= c64re `M93c86SnapState`, m93c86.ts:19-26) —
+/// the full 2KB array + the serial command shift state. GMOD2 / C64MegaCart carry
+/// this alongside `flashLoState`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct M93c86StateSnapshot {
+    pub data: Vec<i64>,
+    pub cs: i64,
+    pub clock: i64,
+    #[serde(rename = "dataIn")]
+    pub data_in: i64,
+    #[serde(rename = "dataOut")]
+    pub data_out: i64,
+    #[serde(rename = "inputShiftreg")]
+    pub input_shiftreg: i64,
+    #[serde(rename = "inputCount")]
+    pub input_count: i64,
+    #[serde(rename = "outputShiftreg")]
+    pub output_shiftreg: i64,
+    #[serde(rename = "outputCount")]
+    pub output_count: i64,
+    pub command: i64,
+    pub addr: i64,
+    #[serde(rename = "writeEnable")]
+    pub write_enable: i64,
+    #[serde(rename = "readyBusy")]
+    pub ready_busy: i64,
+}
+
+/// The mapper continuation (= c64re `HeadlessCartridgeState`, types.ts:54-94, the
+/// checkpoint-relevant subset). `currentBank`/`controlRegister` for every family;
+/// the EasyFlash jumper + IO2 RAM + per-flash command state only for the writable
+/// tier (`skip_serializing_if` keeps the read-only node minimal).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CartStateSnapshot {
+    #[serde(rename = "currentBank")]
+    pub current_bank: i64,
+    #[serde(rename = "controlRegister", skip_serializing_if = "Option::is_none")]
+    pub control_register: Option<i64>,
+    #[serde(rename = "easyflashJumper", skip_serializing_if = "Option::is_none")]
+    pub easyflash_jumper: Option<i64>,
+    #[serde(rename = "easyflashRam", skip_serializing_if = "Option::is_none")]
+    pub easyflash_ram: Option<Vec<i64>>, // 256 bytes IO2 RAM
+    #[serde(rename = "flashLoState", skip_serializing_if = "Option::is_none")]
+    pub flash_lo_state: Option<Flash040StateSnapshot>,
+    #[serde(rename = "flashHiState", skip_serializing_if = "Option::is_none")]
+    pub flash_hi_state: Option<Flash040StateSnapshot>,
+    #[serde(rename = "eepromState", skip_serializing_if = "Option::is_none")]
+    pub eeprom_state: Option<M93c86StateSnapshot>,
+}
+
+fn flash_state_to_json(s: &Flash040SnapState) -> Flash040StateSnapshot {
+    Flash040StateSnapshot {
+        state: s.state as i64,
+        base_state: s.base_state as i64,
+        program_byte: s.program_byte as i64,
+        last_read: s.last_read as i64,
+        dirty: s.dirty,
+        erase_mask: s.erase_mask.iter().map(|&b| b as i64).collect(),
+        erase_alarm_clk: s.erase_alarm_clk,
+    }
+}
+
+fn flash_state_from_json(s: &Flash040StateSnapshot) -> Flash040SnapState {
+    // erase_mask is a fixed 8-byte array (flash040 FLASH040_ERASE_MASK_SIZE).
+    let mut mask = [0u8; 8];
+    for (i, &b) in s.erase_mask.iter().enumerate().take(8) {
+        mask[i] = b as u8;
+    }
+    Flash040SnapState {
+        state: s.state as u8,
+        base_state: s.base_state as u8,
+        program_byte: s.program_byte as u8,
+        last_read: s.last_read as u8,
+        dirty: s.dirty,
+        erase_mask: mask,
+        erase_alarm_clk: s.erase_alarm_clk,
+    }
+}
+
+fn eeprom_state_to_json(s: &M93c86SnapState) -> M93c86StateSnapshot {
+    M93c86StateSnapshot {
+        data: s.data.iter().map(|&b| b as i64).collect(),
+        cs: s.cs as i64,
+        clock: s.clock as i64,
+        data_in: s.data_in as i64,
+        data_out: s.data_out as i64,
+        input_shiftreg: s.input_shiftreg as i64,
+        input_count: s.input_count as i64,
+        output_shiftreg: s.output_shiftreg as i64,
+        output_count: s.output_count as i64,
+        command: s.command as i64,
+        addr: s.addr as i64,
+        write_enable: s.write_enable as i64,
+        ready_busy: s.ready_busy as i64,
+    }
+}
+
+fn eeprom_state_from_json(s: &M93c86StateSnapshot) -> M93c86SnapState {
+    M93c86SnapState {
+        data: s.data.iter().map(|&b| b as u8).collect(),
+        cs: s.cs as u8,
+        clock: s.clock as u8,
+        data_in: s.data_in as u8,
+        data_out: s.data_out as u8,
+        input_shiftreg: s.input_shiftreg as u32,
+        input_count: s.input_count as u32,
+        output_shiftreg: s.output_shiftreg as u32,
+        output_count: s.output_count as u32,
+        command: s.command as u8,
+        addr: s.addr as u32,
+        write_enable: s.write_enable as u8,
+        ready_busy: s.ready_busy as u8,
+    }
+}
+
+/// Read a live cartridge mapper's continuation (`get_state()`) into the `cartState`
+/// snapshot shape. `get_state()` is `&self` (it clones the flash + snapshots the FSM
+/// at clk 0, exactly like the VSF cart-state capture), so this is a pure read.
+pub fn capture_cart_state(cart: &dyn CartMapper) -> CartStateSnapshot {
+    let st = cart.get_state();
+    let (jumper, ram, lo, hi, eeprom) = match &st.flash {
+        Some(f) => (
+            Some(f.easyflash_jumper as i64),
+            if f.easyflash_ram.is_empty() {
+                None
+            } else {
+                Some(f.easyflash_ram.iter().map(|&b| b as i64).collect())
+            },
+            f.flash_lo.as_ref().map(flash_state_to_json),
+            f.flash_hi.as_ref().map(flash_state_to_json),
+            f.eeprom.as_ref().map(eeprom_state_to_json),
+        ),
+        None => (None, None, None, None, None),
+    };
+    CartStateSnapshot {
+        current_bank: st.current_bank as i64,
+        control_register: st.control_register.map(|v| v as i64),
+        easyflash_jumper: jumper,
+        easyflash_ram: ram,
+        flash_lo_state: lo,
+        flash_hi_state: hi,
+        eeprom_state: eeprom,
+    }
+}
+
+/// Restore a live cartridge mapper's continuation from the `cartState` snapshot
+/// (`set_state()`), AFTER the mapper has been re-created from `cartBytes` + the flash
+/// DATA overlaid from `cartFlash`. The read-only mappers consume only
+/// `currentBank`/`controlRegister`; the writable tier also re-arms the flash FSM +
+/// jumper + IO2 RAM + EEPROM.
+pub fn restore_cart_state(cart: &mut Box<dyn CartMapper>, s: &CartStateSnapshot) {
+    let has_flash = s.flash_lo_state.is_some()
+        || s.flash_hi_state.is_some()
+        || s.eeprom_state.is_some()
+        || s.easyflash_ram.is_some()
+        || s.easyflash_jumper.is_some();
+    let flash = if has_flash {
+        Some(FlashCartState {
+            flash_lo: s.flash_lo_state.as_ref().map(flash_state_from_json),
+            flash_hi: s.flash_hi_state.as_ref().map(flash_state_from_json),
+            eeprom: s.eeprom_state.as_ref().map(eeprom_state_from_json),
+            easyflash_jumper: s.easyflash_jumper.unwrap_or(0) as u8,
+            easyflash_ram: s
+                .easyflash_ram
+                .as_ref()
+                .map(|v| v.iter().map(|&b| b as u8).collect())
+                .unwrap_or_default(),
+        })
+    } else {
+        None
+    };
+    cart.set_state(CartState {
+        current_bank: s.current_bank as u16,
+        control_register: s.control_register.map(|v| v as u8),
+        flash,
+    });
+}
+
 // ── RAM as a `$ta` node ─────────────────────────────────────────────────────────
 
 /// Encode the 64K RAM as the c64re `{ $ta: "Uint8Array", b64 }` node.
@@ -913,6 +1129,16 @@ pub fn capture_runtime_checkpoint(
         // writable port), so dump/undump round-trips a written EasyFlash's flash.
         "cartBytes": cart_bytes.map(ta_u8).unwrap_or(serde_json::Value::Null),
         "cartFlash": cart_flash.map(ta_u8).unwrap_or(serde_json::Value::Null),
+        // Spec 792.1 — the cart mapper's live continuation (bank/register/jumper/IO2
+        // RAM/flash-FSM), read from the live mapper via `get_state()` (`&self`). Null
+        // when no cartridge is attached. Additive: a `.c64re` without this node still
+        // loads (707 back-compat). Rides the ring too (checkpoint_ring stores the same
+        // tree + restores via `restore_runtime_checkpoint`).
+        "cartState": m
+            .cartridge
+            .as_ref()
+            .map(|c| serde_json::to_value(capture_cart_state(c.as_ref())).unwrap())
+            .unwrap_or(serde_json::Value::Null),
         "media": { "diskPath": disk_path, "imageFormat": image_format },
         "audio": serde_json::Value::Null,
     })
@@ -1056,13 +1282,34 @@ pub fn restore_runtime_checkpoint(
         Some(cart_bytes) if !cart_bytes.is_empty() => {
             m.attach_cart_from_bytes(&cart_bytes, "snapshot.crt")
                 .map_err(|e| format!("restore cart: {e:?}"))?;
-            // Overlay the mutable writable image (flash low+high) when captured.
+            // Overlay the mutable writable image (flash low+high) when captured. This
+            // restores the flash DATA array (Spec 714.5); the flash COMMAND-FSM +
+            // bank/register/jumper/IO2-RAM come from `cartState` below.
             if let Some(flash) = cp.get("cartFlash").and_then(ta_u8_decode) {
                 if !flash.is_empty() {
                     if let Some(cart) = m.cartridge.as_mut() {
                         cart.set_writable_image(&flash);
                     }
                 }
+            }
+            // Spec 792.1 — re-arm the mapper continuation (bank/control-register/
+            // jumper/IO2-RAM/flash-FSM) so a banked cart resumes at its captured bank,
+            // not bank 0. AFTER attach + the flash-DATA overlay (mirrors the VSF EF
+            // restore, vsf.rs:944-955). Null/absent ⇒ a pre-792 `.c64re`: leave the
+            // freshly-attached mapper at its boot state (707 back-compat).
+            match cp.get("cartState") {
+                Some(cs) if !cs.is_null() => {
+                    let snap: CartStateSnapshot = serde_json::from_value(cs.clone())
+                        .map_err(|e| format!("restore cartState: {e}"))?;
+                    if let Some(cart) = m.cartridge.as_mut() {
+                        restore_cart_state(cart, &snap);
+                    }
+                    // The restored register/jumper change EXROM/GAME (the attach ran
+                    // with register_02 = 0) → recompute the live memconfig from the
+                    // restored cart lines (mirrors vsf.rs:959).
+                    m.memconfig = m.memconfig_table[m.pla_index()];
+                }
+                _ => {}
             }
         }
         _ => {
@@ -1467,6 +1714,116 @@ mod tests {
         assert!(restore_ram_ta(&mut m2, &node));
         assert_eq!(m2.ram[0x1000], 0xde);
         assert_eq!(m2.ram[0xffff], 0xad);
+    }
+
+    /// Spec 792.1 — a banked EasyFlash cart's continuation (bank / register_02 /
+    /// IO2 RAM) survives capture → restore. ROM-free (no boot): builds a synthetic
+    /// EF CRT, drives the mapper into a non-zero bank, checkpoints, and restores into
+    /// a fresh machine. Before the fix the restored cart resumed at bank 0.
+    #[test]
+    fn cart_state_roundtrip_easyflash_bank() {
+        use crate::cart::BankInfo;
+
+        // Minimal EF CRT (hw type 32) with two banks (distinct ROML fill).
+        fn ef_crt() -> Vec<u8> {
+            let mut v = Vec::new();
+            v.extend_from_slice(b"C64 CARTRIDGE   ");
+            v.extend_from_slice(&0x40u32.to_be_bytes());
+            v.extend_from_slice(&0x0100u16.to_be_bytes());
+            v.extend_from_slice(&32u16.to_be_bytes()); // EasyFlash
+            v.push(1); // exrom
+            v.push(0); // game
+            v.extend_from_slice(&[0u8; 6]);
+            v.extend_from_slice(&[0u8; 32]); // name
+            for (bank, fill) in [(0u16, 0x11u8), (1u16, 0x22u8)] {
+                v.extend_from_slice(b"CHIP");
+                v.extend_from_slice(&(0x10u32 + 0x2000).to_be_bytes());
+                v.extend_from_slice(&0u16.to_be_bytes());
+                v.extend_from_slice(&bank.to_be_bytes());
+                v.extend_from_slice(&0x8000u16.to_be_bytes());
+                v.extend_from_slice(&0x2000u16.to_be_bytes());
+                v.extend_from_slice(&vec![fill; 0x2000]);
+            }
+            v
+        }
+        let bi = BankInfo {
+            cpu_port_direction: 0x2f,
+            cpu_port_value: 0x37,
+            basic_visible: true,
+            kernal_visible: true,
+            io_visible: true,
+            char_visible: false,
+            cartridge_attached: true,
+            cartridge_exrom: None,
+            cartridge_game: None,
+            phi1: 0xff,
+        };
+
+        let crt = ef_crt();
+        let mut m = Machine::new();
+        m.attach_cart_from_bytes(&crt, "ef").expect("attach EF");
+        let clk = m.c64_core.clk;
+        if let Some(cart) = m.cartridge.as_mut() {
+            cart.write(0xde02, 0x06, &bi, clk); // register_02 = 6 (8K mode)
+            cart.write(0xde00, 0x01, &bi, clk); // bank 1
+            cart.write(0xdf00, 0xa5, &bi, clk); // IO2 RAM
+            cart.write(0xdf40, 0x5a, &bi, clk);
+        }
+        let want = m.cartridge.as_ref().unwrap().get_state();
+        assert_eq!(want.current_bank, 1);
+        assert_eq!(want.control_register, Some(0x06));
+
+        // Capture the cart bytes + writable image the daemon would, then the tree.
+        let cart_flash = m.cartridge.as_mut().and_then(|c| c.writable_image(clk));
+        let cp = capture_runtime_checkpoint(&m, "", "", None, None, Some(&crt), cart_flash.as_deref());
+        assert!(!cp["cartState"].is_null(), "cartState node emitted");
+        assert_eq!(cp["cartState"]["currentBank"], 1);
+        assert_eq!(cp["cartState"]["controlRegister"], 6);
+
+        // Restore into a fresh machine (no prior cart).
+        let mut m2 = Machine::new();
+        restore_runtime_checkpoint(&mut m2, &cp).expect("restore");
+        let got = m2.cartridge.as_ref().expect("cart re-attached").get_state();
+        assert_eq!(got.current_bank, 1, "banked cart resumes at its captured bank");
+        assert_eq!(got.control_register, Some(0x06), "register_02 restored");
+        let f = got.flash.expect("EF flash state");
+        assert_eq!(f.easyflash_ram[0x00], 0xa5, "IO2 RAM restored");
+        assert_eq!(f.easyflash_ram[0x40], 0x5a, "IO2 RAM restored");
+    }
+
+    /// Spec 792.1 back-compat — a pre-792 `.c64re` (cart attached, but NO `cartState`
+    /// node) still restores: the freshly-attached mapper stays at its boot state.
+    #[test]
+    fn cart_restore_without_cartstate_is_back_compat() {
+        let mut m = Machine::new();
+        // A checkpoint whose cart node exists but carries no cartState (707 shape).
+        let crt = {
+            let mut v = Vec::new();
+            v.extend_from_slice(b"C64 CARTRIDGE   ");
+            v.extend_from_slice(&0x40u32.to_be_bytes());
+            v.extend_from_slice(&0x0100u16.to_be_bytes());
+            v.extend_from_slice(&19u16.to_be_bytes()); // Magic Desk
+            v.push(0);
+            v.push(1);
+            v.extend_from_slice(&[0u8; 6]);
+            v.extend_from_slice(&[0u8; 32]);
+            v.extend_from_slice(b"CHIP");
+            v.extend_from_slice(&(0x10u32 + 0x2000).to_be_bytes());
+            v.extend_from_slice(&0u16.to_be_bytes());
+            v.extend_from_slice(&0u16.to_be_bytes());
+            v.extend_from_slice(&0x8000u16.to_be_bytes());
+            v.extend_from_slice(&0x2000u16.to_be_bytes());
+            v.extend_from_slice(&vec![0x77u8; 0x2000]);
+            v
+        };
+        let mut cp = capture_runtime_checkpoint(&m, "", "", None, None, Some(&crt), None);
+        // Simulate a 707 dump: drop the additive cartState node entirely.
+        cp.as_object_mut().unwrap().remove("cartState");
+        assert!(cp.get("cartState").is_none());
+        restore_runtime_checkpoint(&mut m, &cp).expect("restore 707-shape");
+        // Cart re-attached at boot state (bank 0) — no panic, no partial restore.
+        let st = m.cartridge.as_ref().expect("cart attached").get_state();
+        assert_eq!(st.current_bank, 0);
     }
 }
 
