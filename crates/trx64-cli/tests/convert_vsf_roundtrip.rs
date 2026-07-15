@@ -77,7 +77,7 @@ fn convert_vsf_roundtrip_resumes() {
     // Convert the SAME VSF → .c64re via the CLI code path.
     let out = std::env::temp_dir().join(format!("trx64-convert-{}.c64re", std::process::id()));
     let out_str = out.to_string_lossy().to_string();
-    let text = convert_cmd::run_convert(&rom_dir, &sample_str, &out_str, false).expect("convert-vsf");
+    let text = convert_cmd::run_convert(&rom_dir, &sample_str, &out_str, false, None).expect("convert-vsf");
     eprintln!("{text}");
 
     // Machine B: load the produced .c64re back.

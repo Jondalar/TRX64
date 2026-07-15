@@ -204,6 +204,10 @@ enum Command {
         /// instead of text.
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Also write a PNG screenshot of the restored screen (undump the .c64re,
+        /// draw a few frames, render) — see what the converted VSF resumes to.
+        #[arg(long)]
+        render: Option<String>,
     },
 
     /// Boot a disk/cart in an isolated process (own machine, no daemon, no shared
@@ -286,8 +290,8 @@ fn main() {
     }
 
     // ── VSF → .c64re convert one-shot (Spec 791.2; own machine, no daemon) ──────
-    if let Some(Command::ConvertVsf { input, output, json }) = &cli.cmd {
-        match convert_cmd::run_convert(&rom_dir, input, output, *json) {
+    if let Some(Command::ConvertVsf { input, output, json, render }) = &cli.cmd {
+        match convert_cmd::run_convert(&rom_dir, input, output, *json, render.as_deref()) {
             Ok(out) => println!("{out}"),
             Err(e) => {
                 eprintln!("{e}");

@@ -19,8 +19,10 @@
 
 use std::path::Path;
 
+use base64::Engine as _;
 use serde_json::json;
 
+use crate::boot_engine;
 use trx64_core::c64re_snapshot::{capture_runtime_checkpoint, RUNTIME_CHECKPOINT_SCHEMA_VERSION};
 use trx64_core::native_snapshot::{write_native_snapshot, WriteNativeSnapshotArgs};
 use trx64_core::vsf::{load_vsf_report, VsfLoadReport};
@@ -28,7 +30,13 @@ use trx64_core::Machine;
 
 /// Load `input` (.vsf) into a fresh machine booted from `rom_dir`, dump a `.c64re`
 /// to `output`, and return the formatted report (text, or JSON when `json`).
-pub fn run_convert(rom_dir: &Path, input: &str, output: &str, json: bool) -> Result<String, String> {
+pub fn run_convert(
+    rom_dir: &Path,
+    input: &str,
+    output: &str,
+    json: bool,
+    render: Option<&str>,
+) -> Result<String, String> {
     let bytes = std::fs::read(input).map_err(|e| format!("read {input}: {e}"))?;
 
     // Fresh isolated machine (ROMs needed so the resumed state can execute against
@@ -87,6 +95,27 @@ pub fn run_convert(rom_dir: &Path, input: &str, output: &str, json: bool) -> Res
         }
     }
     std::fs::write(output, &out_bytes).map_err(|e| format!("write {output}: {e}"))?;
+
+    // Optional screenshot: undump the just-written .c64re into a fresh isolated
+    // engine, run a few frames so the literal-port VIC draws the restored screen,
+    // then render to PNG (mirrors boot's render path — the reusable engine render).
+    if let Some(png_path) = render {
+        let engine = boot_engine(rom_dir).map_err(|e| format!("{e}"))?;
+        engine.rpc("snapshot/undump", json!({ "path": output }))?;
+        let _ = engine.rpc("debug/pause", json!({ "source": "cli-convert" }));
+        let mut done: u64 = 0;
+        while done < 25_000 {
+            engine.rpc("session/run", json!({ "cycles": 20_000 }))?;
+            done += 20_000;
+        }
+        let r = engine.rpc("runtime/render_screen", json!({ "scale": 2 }))?;
+        let url = r.get("dataUrl").and_then(|v| v.as_str()).unwrap_or("");
+        let b64 = url.strip_prefix("data:image/png;base64,").unwrap_or(url);
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| format!("render base64 decode: {e}"))?;
+        std::fs::write(png_path, &png).map_err(|e| format!("write {png_path}: {e}"))?;
+    }
 
     if json {
         let out = json!({
