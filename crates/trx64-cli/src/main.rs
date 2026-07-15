@@ -126,7 +126,7 @@ enum Command {
         /// $01 memory-config the entry stub sets before calling (hex byte, default $37).
         #[arg(long)]
         io: Option<String>,
-        /// Address of the 11-byte entry stub (hex, default $02a7 free RAM).
+        /// Address of the 11-byte entry stub (hex, default $02a7 free RAM). Stub mode only.
         #[arg(long, value_parser = trx64_cli::disasm_cmd::parse_addr)]
         stub_addr: Option<u16>,
         /// Cycle budget cap (default 100_000_000).
@@ -135,6 +135,28 @@ enum Command {
         /// Instruction cap (default 40_000_000).
         #[arg(long)]
         instr_cap: Option<u64>,
+        /// Direct-entry mode (TS-faithful): set PC=entry, seed registers, and pre-stage
+        /// the RTS sentinel on the stack ($01FE=$FD/$01FF=$FF ⇒ RTS → $FFFE) instead of
+        /// the `jsr entry` stub — so A/X/Y are observed unclobbered at entry. Auto-enabled
+        /// by any --reg-*.
+        #[arg(long, default_value_t = false)]
+        direct_entry: bool,
+        /// Seed A observed at entry (hex $xx / 0x / decimal). Implies --direct-entry.
+        #[arg(long = "reg-a")]
+        reg_a: Option<String>,
+        /// Seed X observed at entry (hex/decimal). Implies --direct-entry.
+        #[arg(long = "reg-x")]
+        reg_x: Option<String>,
+        /// Seed Y observed at entry (hex/decimal). Implies --direct-entry.
+        #[arg(long = "reg-y")]
+        reg_y: Option<String>,
+        /// Seed SP observed at entry (hex/decimal, default $FD). Implies --direct-entry.
+        #[arg(long = "reg-sp")]
+        reg_sp: Option<String>,
+        /// Seed the P status register observed at entry (hex/decimal, default $22 =
+        /// TS Cpu6502 power-on flags). Implies --direct-entry.
+        #[arg(long = "reg-p")]
+        reg_p: Option<String>,
         /// Emit JSON instead of text.
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -199,12 +221,14 @@ fn main() {
     // ── Real-core sandbox one-shot (Spec 787 v1 + 788; own machine, no TUI) ─────
     if let Some(Command::Sandbox {
         seed, cart, disk, load, entry, harvest, zp, sentinel, io, stub_addr, cyc_cap, instr_cap,
-        json,
+        direct_entry, reg_a, reg_x, reg_y, reg_sp, reg_p, json,
     }) = &cli.cmd
     {
         match sandbox_cmd::run_sandbox_cli(
             &rom_dir, seed.as_deref(), cart.as_deref(), disk.as_deref(), load, *entry, harvest, zp,
-            *sentinel, io.as_deref(), *stub_addr, *cyc_cap, *instr_cap, *json,
+            *sentinel, io.as_deref(), *stub_addr, *cyc_cap, *instr_cap, *direct_entry,
+            reg_a.as_deref(), reg_x.as_deref(), reg_y.as_deref(), reg_sp.as_deref(),
+            reg_p.as_deref(), *json,
         ) {
             Ok(out) => println!("{out}"),
             Err(e) => {
