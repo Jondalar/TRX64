@@ -99,8 +99,10 @@ fn maincpu(m: &Machine) -> Vec<u8> {
     w.dw(0); // last_opcode_info
     w.dw(0); // ane_log_level
     w.dw(0); // lxa_log_level
-    // interrupt_write_snapshot(maincpu_int_status) — 76 bytes of interrupt-controller
-    // state we don't model; VICE re-derives IRQ/NMI from the chip regs on resume.
+    // interrupt_write_snapshot + new + sc — the interrupt controller. These CLOCKs are
+    // TIMESTAMPS (not scheduled alarms): a real x64sc VSF carries them as 0 and resumes
+    // fine (verified against the reference), so 0 is correct here — do NOT use CLOCK_MAX.
+    // (Contrast the CART freeze/NMI ALARM times, which MUST be CLOCK_MAX — see c64cart.)
     w.pad_to(103);
     w.buf
 }
@@ -273,8 +275,12 @@ fn c64cart(st: &crate::cart::CartState) -> Vec<u8> {
     w.b(0); // export_ram
     w.b(0); // export.ultimax_phi1
     w.b(0); // export.ultimax_phi2
-    w.clock(0); // cart_freeze_alarm_time
-    w.clock(0); // cart_nmi_alarm_time
+    // cart_freeze/nmi_alarm_time MUST be CLOCK_MAX ("no alarm scheduled"). 0 reads as
+    // "a cart freeze/NMI is due at clk 0" → at a mid-game clk VICE fires it immediately
+    // → the EasyFlash freeze/NMI handler re-boots the cart ("the CRT starts new like a
+    // reset" — the field symptom). The reference x64sc VSF carries CLOCK_MAX here.
+    w.clock(u64::MAX); // cart_freeze_alarm_time
+    w.clock(u64::MAX); // cart_nmi_alarm_time
     w.zeros(4); // export_slot1 (game/exrom/phi1/phi2)
     w.zeros(4); // export_slotmain
     w.zeros(4); // export_passthrough
