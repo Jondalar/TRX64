@@ -1342,6 +1342,44 @@ fn do_power_off(st: &mut State) {
     st.notify.broadcast("audio/flush", json!({ "session_id": st.session.id }));
 }
 
+/// Spec 786 power-cycle specialised for a state RESTORE (the `.c64re` cold
+/// undump). Tears the machine down to fresh chips — the ONLY way to clear the
+/// stale internal SID/VIC state a field-by-field `restore_runtime_checkpoint`
+/// leaves behind (its regs-only overwrite cannot reset the reSID oscillators or
+/// the VIC micro-pipeline; that is what made a `.c64re` undump keep the previous
+/// program's SID playing, render a stale frame, and appear to "land in the cart
+/// intro"). Bumps `machine_generation` so the streaming loop re-hooks the fresh
+/// SID (streaming.rs `!=` check).
+///
+/// Deliberately UNLIKE `do_power_off`/`do_power_on`:
+/// - does NOT clear the checkpoint ring — a restore navigates a timeline, it does
+///   not end one (decision 2026-07-15: ring/scrub restore stays the fast field
+///   path, so the ring must survive an undump);
+/// - does NOT run the 5M warm boot — the caller overwrites CPU+RAM+chips from the
+///   snapshot immediately after, so a warm-up (which would also run a cart's
+///   cold-boot intro) is pure waste.
+///
+/// The registered cart/disk are transplanted through the cycle by
+/// `Session::power_off`/`power_on`; the subsequent `restore_runtime_checkpoint` is
+/// the sole cart authority (re-attaches from `cartBytes`, or `detach_cart`), so the
+/// re-inserted cart is harmlessly replaced or removed.
+fn power_cycle_for_restore(st: &mut State) {
+    // Flush any active trace before the machine is torn down (its buffer would
+    // otherwise strand — same reasoning as do_power_off's finalize).
+    let _ = finalize_trace(st, true);
+    st.session.power_off();
+    let roms = rom_dir();
+    let _ = st.session.power_on(&roms);
+    st.machine_generation += 1; // re-hook the fresh SID (streaming.rs `!=` check)
+    st.ctrl_stop = None;
+    st.ctrl_frame += 1;
+    st.flow.reset();
+    st.stream_broke_on_jam = false;
+    st.mon.disasm_cursor = None;
+    st.mon.mem_cursor = None;
+    st.notify.broadcast("audio/flush", json!({ "session_id": st.session.id }));
+}
+
 fn run_cycle_budget(session: &mut Session, budget: u64) {
     // Full literal-VIC machine when the ROMs are assembled AND the scenario engages
     // the VIC: a real boot, a `wr io` register injection (render — the per-cycle VIC
@@ -5202,64 +5240,33 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                     Err(e) => Err(format!("dump: write error: {e}")),
                 }
             } else {
-                // ── snapshot/undump core (= the WS handler, taking &mut st) ────────
-                let file_bytes = match std::fs::read(&path) {
-                    Ok(b) => b,
-                    Err(e) => return Err(format!("undump: cannot read {path}: {e}")),
-                };
-                let read = match trx64_core::native_snapshot::read_native_snapshot(&file_bytes) {
-                    Ok(r) => r,
-                    Err(e) => return Err(format!("undump: {e}")),
-                };
-                // Re-establish embedded drive8 media FIRST, then restore.
-                let mut media_lbl: Vec<String> = Vec::new();
-                for rm in &read.media {
-                    if rm.reference.role != "drive8" { continue; }
-                    let bytes = match &rm.bytes {
-                        Some(b) => b.clone(),
-                        None => return Err(format!(
-                            "undump: media {} has no embedded payload (v1 needs embedded bytes)",
-                            rm.reference.role
-                        )),
-                    };
-                    let kind = if rm.reference.format == "d64" { DiskKind::D64 } else { DiskKind::G64 };
-                    st.session.machine.drive8.attach_disk(DiskImage {
-                        kind, bytes,
-                        backing_path: rm.reference.source_name.clone(),
-                        read_only: false,
-                    });
-                    let name = rm.reference.source_name.clone()
-                        .filter(|s| !s.is_empty()).unwrap_or_else(|| rm.reference.format.clone());
-                    media_lbl.push(format!("{}={name}({})", rm.reference.role, rm.reference.format));
-                }
-                match trx64_core::c64re_snapshot::restore_runtime_checkpoint(
-                    &mut st.session.machine, &read.checkpoint,
-                ) {
-                    Ok(_blob) => {
-                        let cycle = st.session.machine.c64_core.clk;
-                        let pc = st.session.machine.c64_core.reg_pc;
+                // ── snapshot/undump (shared core — power-cycle → restore) ──────────
+                match undump_native_snapshot(st, &path) {
+                    Ok(r) => {
                         let breakpoints = st.breakpoints.entries.len();
-                        st.session.running = false;
-                        st.mon.disasm_cursor = Some(pc); // bare `d` follows the restored PC
-                        let machine = read.manifest.machine.model.clone();
-                        let media = if media_lbl.is_empty() { "none".to_string() } else { media_lbl.join(", ") };
                         // formatUndumpSummary (= snapshot-persistence.ts:282-292).
+                        let media = if r.media.is_empty() {
+                            "none".to_string()
+                        } else {
+                            r.media
+                                .iter()
+                                .map(|m| {
+                                    let name = m
+                                        .source_name
+                                        .clone()
+                                        .filter(|s| !s.is_empty())
+                                        .unwrap_or_else(|| m.format.clone());
+                                    format!("{}={name}({})", m.role, m.format)
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        };
                         let mut summary = format!(
-                            "undumped {path}\n  cycle={cycle} pc=${:04x} machine={machine} (paused)\n  media: {media}\n  breakpoints={breakpoints}",
-                            pc
+                            "undumped {path}\n  cycle={} pc=${:04x} machine={} (paused)\n  media: {media}\n  breakpoints={breakpoints}",
+                            r.cycle, r.pc, r.machine_model
                         );
-                        // GUARDRAIL #2 — warn (non-fatal) when the restored resident RAM
-                        // diverges from the MOUNTED cart flash (the field session's
-                        // "resident code != mounted flash" pollution).
-                        if let Some((addr, cart_b, ram_b)) =
-                            st.session.machine.cart_resident_divergence()
-                        {
-                            summary.push_str(&format!(
-                                "\n  WARNING: resident RAM diverges from the mounted cart at \
-                                 ${addr:04X} (cart=${cart_b:02X} ram=${ram_b:02X}) — the \
-                                 undumped RAM may not match the live flash. Verify, or re-mount \
-                                 the cart / cold-boot if the resident code is stale."
-                            ));
+                        if let Some(w) = r.warning {
+                            summary.push_str(&format!("\n  WARNING: {w}"));
                         }
                         Ok(summary)
                     }
@@ -10858,63 +10865,31 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 Some(p) => p.to_string(),
                 None => return Response::err(id, -32602, "snapshot/undump: path required"),
             };
-            let file_bytes = match std::fs::read(&path) {
-                Ok(b) => b,
-                Err(e) => return Response::err(id, -32001, format!("snapshot/undump: cannot read {path}: {e}")),
-            };
-            // Read + validate the container (magic / version / sha256 / media sha).
-            let read = match trx64_core::native_snapshot::read_native_snapshot(&file_bytes) {
-                Ok(r) => r,
-                Err(e) => return Response::err(id, -32001, format!("snapshot/undump: {e}")),
-            };
             let mut st = state.lock().unwrap();
-
-            // Re-establish embedded media FIRST (drive8 disk) so a fresh-session
-            // undump has the disk attached, then restore the checkpoint.
-            let mut media_summary: Vec<Value> = Vec::new();
-            for rm in &read.media {
-                if rm.reference.role != "drive8" { continue; }
-                let bytes = match &rm.bytes {
-                    Some(b) => b.clone(),
-                    None => return Response::err(id, -32001, format!(
-                        "snapshot/undump: media {} has no embedded payload (v1 needs embedded bytes)",
-                        rm.reference.role
-                    )),
-                };
-                let kind = if rm.reference.format == "d64" { DiskKind::D64 } else { DiskKind::G64 };
-                let disk = DiskImage {
-                    kind,
-                    bytes: bytes.clone(),
-                    backing_path: rm.reference.source_name.clone(),
-                    read_only: false,
-                };
-                st.session.machine.drive8.attach_disk(disk);
-                media_summary.push(json!({
-                    "role": rm.reference.role,
-                    "format": rm.reference.format,
-                    "sourceName": rm.reference.source_name,
-                    "sha256": rm.reference.sha256,
-                    "bytes": bytes.len() as u64
-                }));
-            }
-
-            match trx64_core::c64re_snapshot::restore_runtime_checkpoint(
-                &mut st.session.machine, &read.checkpoint,
-            ) {
-                Ok(_drive_blob) => {
-                    let cycle = st.session.machine.c64_core.clk;
-                    let pc = st.session.machine.c64_core.reg_pc as u64;
+            // Shared core: power-cycle to fresh chips → re-attach media → restore
+            // (audio/flush is broadcast inside power_cycle_for_restore). The undump is
+            // a restore → the session is left paused.
+            match undump_native_snapshot(&mut st, &path) {
+                Ok(r) => {
                     let breakpoints = st.breakpoints.entries.len() as u64;
-                    // An undump is a restore → the session is paused.
-                    st.session.running = false;
-                    // …and an audio-timeline discontinuity → flush the worklet ring
-                    // (same `onRestore` push as a checkpoint restore, ws-server.ts:1690).
-                    st.notify.broadcast("audio/flush", json!({ "session_id": st.session.id }));
+                    let media_summary: Vec<Value> = r
+                        .media
+                        .iter()
+                        .map(|m| {
+                            json!({
+                                "role": m.role,
+                                "format": m.format,
+                                "sourceName": m.source_name,
+                                "sha256": m.sha256,
+                                "bytes": m.bytes
+                            })
+                        })
+                        .collect();
                     Response::ok(id, json!({
                         "path": path,
-                        "cycle": cycle,
-                        "pc": pc,
-                        "machine": read.manifest.machine.model,
+                        "cycle": r.cycle,
+                        "pc": r.pc as u64,
+                        "machine": r.machine_model,
                         "media": media_summary,
                         "breakpoints": breakpoints,
                         "paused": true
@@ -12615,6 +12590,113 @@ fn restore_live_checkpoint(session: &mut Session, cp: &Value) -> Result<(), Stri
     trx64_core::c64re_snapshot::restore_runtime_checkpoint(&mut session.machine, cp)?;
     session.running = false;
     Ok(())
+}
+
+/// One re-attached drive8 medium restored by `undump_native_snapshot`, in a shape
+/// both callers can format (the monitor `role=name(fmt)` string, the WS media JSON).
+struct UndumpMedia {
+    role: String,
+    format: String,
+    source_name: Option<String>,
+    sha256: String,
+    bytes: u64,
+}
+
+/// The outcome of `undump_native_snapshot`, formatted differently by each caller.
+struct UndumpResult {
+    pc: u16,
+    cycle: u64,
+    machine_model: String,
+    media: Vec<UndumpMedia>,
+    /// Non-fatal resident-vs-cart divergence warning, if any.
+    warning: Option<String>,
+}
+
+/// The SINGLE user-facing `.c64re` cold undump — shared by the monitor `undump`
+/// command and the WS `snapshot/undump` handler (previously two near-identical
+/// inline copies). Reads + validates the container, **power-cycles to fresh chips**
+/// (`power_cycle_for_restore` — fixes the "restore onto a live dirty machine" bug:
+/// stale SID kept playing, VIC render broken, appeared to land in the cart intro),
+/// re-attaches the embedded drive8 media onto the fresh machine, then restores the
+/// checkpoint on top. Leaves the session PAUSED. Errors are returned WITHOUT a
+/// prefix — each caller adds its own (`undump:` / `snapshot/undump:`).
+fn undump_native_snapshot(st: &mut State, path: &str) -> Result<UndumpResult, String> {
+    let file_bytes =
+        std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let read = trx64_core::native_snapshot::read_native_snapshot(&file_bytes)?;
+
+    // Fresh chips FIRST (Spec 786): clears the stale internal chip state the field
+    // restore cannot, resets the SID, re-hooks audio. Does not clear the ring.
+    power_cycle_for_restore(st);
+
+    // Re-attach the embedded drive8 media onto the fresh machine, then restore.
+    let mut media = Vec::new();
+    for rm in &read.media {
+        if rm.reference.role != "drive8" {
+            continue;
+        }
+        let bytes = match &rm.bytes {
+            Some(b) => b.clone(),
+            None => {
+                return Err(format!(
+                    "media {} has no embedded payload (v1 needs embedded bytes)",
+                    rm.reference.role
+                ))
+            }
+        };
+        let kind = if rm.reference.format == "d64" { DiskKind::D64 } else { DiskKind::G64 };
+        let len = bytes.len() as u64;
+        st.session.machine.drive8.attach_disk(DiskImage {
+            kind,
+            bytes,
+            backing_path: rm.reference.source_name.clone(),
+            read_only: false,
+        });
+        media.push(UndumpMedia {
+            role: rm.reference.role.clone(),
+            format: rm.reference.format.clone(),
+            source_name: rm.reference.source_name.clone(),
+            sha256: rm.reference.sha256.clone(),
+            bytes: len,
+        });
+    }
+
+    trx64_core::c64re_snapshot::restore_runtime_checkpoint(
+        &mut st.session.machine,
+        &read.checkpoint,
+    )?;
+
+    let pc = st.session.machine.c64_core.reg_pc;
+    let cycle = st.session.machine.c64_core.clk;
+    st.session.running = false;
+    st.mon.disasm_cursor = Some(pc); // bare `d` follows the restored PC
+    // Refresh the paused canvas to the RESTORED frame. The `--stream` paused loop is
+    // otherwise silent (it only advances a running machine), so without this the UI
+    // keeps showing the pre-undump picture — a restore that "looks borked / not 1:1".
+    // Mirrors `checkpoint/restore` (main.rs ~10546): request a one-shot present; the
+    // paused stream branch renders the already-restored `vic.displayed` (the exact
+    // dumped frame — the framebuffer is captured/restored via `vicPresentation`) and
+    // pushes exactly one BIN_VIC. Harmlessly consumed-or-ignored when no stream runs.
+    st.force_present_frame = true;
+
+    // GUARDRAIL — warn (non-fatal) when the restored resident RAM diverges from the
+    // MOUNTED cart flash (a stale-resident-code smell; the field "resident != flash").
+    let warning = st.session.machine.cart_resident_divergence().map(|(addr, cart_b, ram_b)| {
+        format!(
+            "resident RAM diverges from the mounted cart at ${addr:04X} \
+             (cart=${cart_b:02X} ram=${ram_b:02X}) — the undumped RAM may not match \
+             the live flash. Verify, or re-mount the cart / cold-boot if the resident \
+             code is stale."
+        )
+    });
+
+    Ok(UndumpResult {
+        pc,
+        cycle,
+        machine_model: read.manifest.machine.model.clone(),
+        media,
+        warning,
+    })
 }
 
 // ── Spec time-travel-tooling Piece 1 — diffCheckpoints(idA, idB) ───────────────
@@ -14901,6 +14983,28 @@ mod batch1_tests {
             st.lock().unwrap().force_present_frame,
             "restore requested the one-shot fresh-frame present (consumed once by the paused loop)"
         );
+    }
+
+    #[test]
+    fn snapshot_undump_requests_one_shot_frame_present() {
+        // Regression (2026-07-15): a `.c64re` undump on a PAUSED machine must refresh the
+        // canvas to the RESTORED frame. The `--stream` paused loop only advances a
+        // running machine, so without a one-shot present the UI keeps the pre-undump
+        // picture and the restore "looks borked / not 1:1" — the field report. The
+        // framebuffer itself is captured/restored faithfully (vicPresentation); this
+        // guards the DAEMON-side present that surfaces it, mirroring checkpoint/restore.
+        let st = make_state();
+        let path = std::env::temp_dir().join("trx64_undump_present_test.c64re");
+        let path_s = path.to_str().unwrap().to_string();
+        call(&st, "snapshot/dump", json!({ "path": path_s }));
+        // Pre-condition: clear the flag so the assertion is meaningful.
+        st.lock().unwrap().force_present_frame = false;
+        call(&st, "snapshot/undump", json!({ "path": path_s }));
+        assert!(
+            st.lock().unwrap().force_present_frame,
+            "undump requested the one-shot fresh-frame present"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

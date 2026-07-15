@@ -22,3 +22,6 @@ crates/trx64-core/tests/fixtures/vsf/*.vsf
 /loop/
 /*-loop/
 /dist/
+
+# commercial VICE snapshots (never track)
+*.vsf
