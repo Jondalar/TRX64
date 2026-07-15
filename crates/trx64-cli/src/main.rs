@@ -103,6 +103,13 @@ enum Command {
         /// the cart already running in its banked state).
         #[arg(long)]
         cart: Option<String>,
+        /// Spec 790 — cart type for a raw `.bin` `--cart`: a VICE id (32, 86, 61, …)
+        /// or mnemonic (ef/easyflash, gmod2, megabyter/mb, c64megacart/c64mc,
+        /// magicdesk/md, md16, ocean, 8k, 16k, ultimax). REQUIRED for a raw `.bin`
+        /// unless its type auto-detects structurally; an OPTIONAL header override for
+        /// a `.crt`. Omit (or `auto`/`crt`) to auto-detect.
+        #[arg(long = "cart-type")]
+        cart_type: Option<String>,
         /// Attach a disk on the cold machine (.d64/.g64; for a drive-reading routine).
         #[arg(long)]
         disk: Option<String>,
@@ -220,14 +227,14 @@ fn main() {
 
     // ── Real-core sandbox one-shot (Spec 787 v1 + 788; own machine, no TUI) ─────
     if let Some(Command::Sandbox {
-        seed, cart, disk, load, entry, harvest, zp, sentinel, io, stub_addr, cyc_cap, instr_cap,
-        direct_entry, reg_a, reg_x, reg_y, reg_sp, reg_p, json,
+        seed, cart, cart_type, disk, load, entry, harvest, zp, sentinel, io, stub_addr, cyc_cap,
+        instr_cap, direct_entry, reg_a, reg_x, reg_y, reg_sp, reg_p, json,
     }) = &cli.cmd
     {
         match sandbox_cmd::run_sandbox_cli(
-            &rom_dir, seed.as_deref(), cart.as_deref(), disk.as_deref(), load, *entry, harvest, zp,
-            *sentinel, io.as_deref(), *stub_addr, *cyc_cap, *instr_cap, *direct_entry,
-            reg_a.as_deref(), reg_x.as_deref(), reg_y.as_deref(), reg_sp.as_deref(),
+            &rom_dir, seed.as_deref(), cart.as_deref(), cart_type.as_deref(), disk.as_deref(), load,
+            *entry, harvest, zp, *sentinel, io.as_deref(), *stub_addr, *cyc_cap, *instr_cap,
+            *direct_entry, reg_a.as_deref(), reg_x.as_deref(), reg_y.as_deref(), reg_sp.as_deref(),
             reg_p.as_deref(), *json,
         ) {
             Ok(out) => println!("{out}"),

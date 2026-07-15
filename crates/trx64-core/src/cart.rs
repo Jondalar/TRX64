@@ -299,6 +299,25 @@ pub enum CrtError {
     UnknownHardware(u16),
     /// A known flash/serial family that this read-only tier does not implement.
     Unsupported(MapperType),
+    /// Spec 790 — a raw `.bin` whose byte length is not a whole number of the
+    /// type's bank units, or exceeds the type's bank capacity. Never silently
+    /// truncated (the whole point of the typed attach is faithful geometry).
+    BadBinSize {
+        len: usize,
+        bank_unit: usize,
+        max_banks: usize,
+    },
+    /// Spec 790 — `resolve_cart_type` was handed a string that is neither a known
+    /// VICE numeric id nor a known mnemonic. Carries the offending string; the
+    /// Display lists the valid set.
+    UnknownCartType(String),
+    /// Spec 790 S1 — a raw `.bin` was attached with `CartType::Auto`, and the
+    /// structural-only first-cut detect (eapi / CBM80 / reset-vector + size) could
+    /// not settle on a single confident type. The caller must pass an explicit
+    /// `--cart-type`. Resolving the genuinely ambiguous cases (watch $DE00/$DE02/
+    /// $DF00 + the AMD flash command sequence, lock the type in-place) is the
+    /// runtime self-configuring cart harness = Spec 790 S2, NOT this slice.
+    BinTypeAmbiguous,
 }
 
 impl std::fmt::Display for CrtError {
@@ -310,6 +329,27 @@ impl std::fmt::Display for CrtError {
             }
             CrtError::Unsupported(t) => {
                 write!(f, "Unsupported cartridge type {t:?} — no authoritative read-only VICE implementation (flash/serial tier out of scope).")
+            }
+            CrtError::BadBinSize { len, bank_unit, max_banks } => {
+                write!(
+                    f,
+                    "Bad raw .bin size {len} bytes: must be a whole number of {bank_unit}-byte bank units, 1..={max_banks} banks (no silent truncation)."
+                )
+            }
+            CrtError::UnknownCartType(s) => {
+                write!(
+                    f,
+                    "Unknown cart type '{s}'. Valid: a VICE numeric id (5, 19, 32, 60, 85, 86, 61, -2, -3, -6, 0) \
+                     or a mnemonic (ef/easyflash, gmod2, megabyter/mb, c64megacart/c64mc, magicdesk/md, md16, ocean, 8k, 16k, ultimax, crt/auto)."
+                )
+            }
+            CrtError::BinTypeAmbiguous => {
+                write!(
+                    f,
+                    "Raw .bin cartridge type could not be structurally auto-detected (Spec 790 S1). \
+                     Pass an explicit --cart-type <id|mnemonic> (e.g. megabyter, c64megacart, ef, magicdesk). \
+                     Automatic resolution of ambiguous flash carts is the runtime self-configuring harness (Spec 790 S2)."
+                )
             }
         }
     }
@@ -1574,4 +1614,278 @@ pub fn load_cartridge_from_bytes(
     let image = parse_crt(data, name, mapper_type)?;
     let mapper = mapper_from_image(&image)?;
     Ok((image, mapper))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Spec 790 — raw `.bin` cartridge front-end (typed attach)
+//
+// A raw `.bin` is the full LINEAR flash/ROM image (every bank present, NO CHIP
+// packets), so it carries no cartridge type in-band; the type is supplied out of
+// band (CLI `--cart-type` / API `cart_type`). This front-end splits the linear
+// image into the SAME `ParsedCartridgeImage` shape `parse_crt` builds, per the
+// type's geometry descriptor (§790.7), so every existing mapper works unchanged —
+// it is a second FRONT-END, not a second mapper tier.
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// The attach intent for a set of cart bytes: either header/structure-driven
+/// auto-detect, or a caller-forced concrete type (= VICE `cartridge_attach_image`
+/// `type == CARTRIDGE_CRT(0)` vs a positive `CARTRIDGE_*`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CartType {
+    /// Detect from the bytes: `.crt` → header hw type; raw `.bin` → the Spec 790 S1
+    /// structural first-cut detect (may yield `BinTypeAmbiguous`).
+    Auto,
+    /// Force a concrete mapper type: `.crt` → header override; raw `.bin` → the
+    /// geometry for this type drives the linear split.
+    Forced(MapperType),
+}
+
+/// How a bank's bank-unit slice maps onto the ROM windows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BinLayout {
+    /// 8 KiB bank → ROML `$8000-$9FFF` only.
+    Roml8k,
+    /// 16 KiB bank → ROML `$8000-$9FFF` + ROMH `$A000-$BFFF`.
+    Roml16kRomhA000,
+    /// 16 KiB ultimax bank → ROML `$8000-$9FFF` + ROMH `$E000-$FFFF`.
+    Roml16kRomhE000,
+}
+
+/// §790.7 — the per-type geometry descriptor. This is the SINGLE source of truth
+/// for the `.bin` linear split; `max_banks` is kept in lock-step with each mapper's
+/// existing `build_linear_chip_data(image, accessor, bank_count)` capacity so the
+/// front-end and the mapper agree on geometry.
+struct BinGeometry {
+    /// Bytes per bank on disk (0x2000 for an 8K-bank type, 0x4000 for 16K/ultimax).
+    bank_unit: usize,
+    /// Window mapping for each bank slice.
+    layout: BinLayout,
+    /// Boot EXROM line (authoritative for the generic NormalMapper; a boot hint for
+    /// the flash/banked mappers, which self-determine lines from their mode reg).
+    exrom: u8,
+    /// Boot GAME line (see `exrom`).
+    game: u8,
+    /// Bank capacity (matches the mapper's `build_linear_chip_data` bank_count).
+    max_banks: usize,
+}
+
+/// §790.7 — resolve the geometry descriptor for a concrete mapper type. The
+/// serial/SPI `Unsupported` family has no `.bin` geometry (no mapper is built).
+fn bin_geometry(mapper_type: MapperType) -> Result<BinGeometry, CrtError> {
+    use BinLayout::*;
+    let g = match mapper_type {
+        // Generic single-bank carts — lines authoritative (NormalMapper).
+        MapperType::Normal8k => BinGeometry { bank_unit: 0x2000, layout: Roml8k, exrom: 0, game: 1, max_banks: 1 },
+        MapperType::Normal16k => BinGeometry { bank_unit: 0x4000, layout: Roml16kRomhA000, exrom: 0, game: 0, max_banks: 1 },
+        MapperType::Ultimax => BinGeometry { bank_unit: 0x4000, layout: Roml16kRomhE000, exrom: 1, game: 0, max_banks: 1 },
+        // Banked read-only carts.
+        MapperType::Ocean => BinGeometry { bank_unit: 0x2000, layout: Roml8k, exrom: 0, game: 0, max_banks: 64 },
+        MapperType::MagicDesk => BinGeometry { bank_unit: 0x2000, layout: Roml8k, exrom: 0, game: 1, max_banks: 128 },
+        MapperType::MagicDesk16 => BinGeometry { bank_unit: 0x4000, layout: Roml16kRomhA000, exrom: 0, game: 0, max_banks: 128 },
+        // Writable flash carts — boot lines are a hint (mapper resets its own mode).
+        // max_banks mirror the mapper build_linear_chip_data bank_count:
+        //   EasyFlash 64 (cart.rs new()), Gmod2 64, Megabyter 128, C64MegaCart 256.
+        MapperType::EasyFlash => BinGeometry { bank_unit: 0x4000, layout: Roml16kRomhA000, exrom: 1, game: 0, max_banks: 64 },
+        MapperType::Gmod2 => BinGeometry { bank_unit: 0x2000, layout: Roml8k, exrom: 0, game: 1, max_banks: 64 },
+        MapperType::MegaByter => BinGeometry { bank_unit: 0x2000, layout: Roml8k, exrom: 0, game: 1, max_banks: 128 },
+        MapperType::C64MegaCart => BinGeometry { bank_unit: 0x2000, layout: Roml8k, exrom: 0, game: 1, max_banks: 256 },
+        MapperType::Unsupported => return Err(CrtError::Unsupported(MapperType::Unsupported)),
+    };
+    Ok(g)
+}
+
+/// §790.1 — `parse_bin`: build a `ParsedCartridgeImage` from a raw linear `.bin`
+/// image of a KNOWN `mapper_type`. Same output shape as `parse_crt`; only the
+/// source differs (linear `N*bank_unit` split vs CHIP packets).
+///
+/// - Optional 2-byte load-address strip when `data.len() % bank_unit == 2` (VICE
+///   `UTIL_FILE_LOAD_SKIP_ADDRESS`, a PRG-style prepended address).
+/// - Size rule (more lenient than VICE's exact gate, matching our 0xFF-pad): accept
+///   `len == bank_unit * k`, `1 ≤ k ≤ max_banks`; absent trailing banks are 0xFF via
+///   the mapper's `build_linear_chip_data`. A non-multiple or over-max size is a hard
+///   `CrtError::BadBinSize` — never a silent truncation.
+pub fn parse_bin(
+    data: &[u8],
+    path: &str,
+    name: &str,
+    mapper_type: MapperType,
+) -> Result<ParsedCartridgeImage, CrtError> {
+    let geom = bin_geometry(mapper_type)?;
+
+    // Optional 2-byte load-address strip (§790.1 / VICE util.c:368 SKIP_ADDRESS).
+    let slice: &[u8] = if geom.bank_unit != 0 && data.len() % geom.bank_unit == 2 {
+        &data[2..]
+    } else {
+        data
+    };
+
+    // Size gate: a whole number of bank units, 1..=max_banks.
+    if geom.bank_unit == 0 || slice.is_empty() || slice.len() % geom.bank_unit != 0 {
+        return Err(CrtError::BadBinSize {
+            len: data.len(),
+            bank_unit: geom.bank_unit,
+            max_banks: geom.max_banks,
+        });
+    }
+    let k = slice.len() / geom.bank_unit;
+    if k < 1 || k > geom.max_banks {
+        return Err(CrtError::BadBinSize {
+            len: data.len(),
+            bank_unit: geom.bank_unit,
+            max_banks: geom.max_banks,
+        });
+    }
+
+    // Linear split: bank N at `N * bank_unit`.
+    let mut banks: BTreeMap<u16, CrtBank> = BTreeMap::new();
+    let mut profiles: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
+    for n in 0..k {
+        let off = n * geom.bank_unit;
+        let mut bank = CrtBank::default();
+        match geom.layout {
+            BinLayout::Roml8k => {
+                bank.roml = Some(normalize_bank_data(&slice[off..off + 0x2000]));
+                profiles.insert(CrtLoadProfile::Roml as u8);
+            }
+            BinLayout::Roml16kRomhA000 => {
+                bank.roml = Some(normalize_bank_data(&slice[off..off + 0x2000]));
+                bank.romh_a000 = Some(normalize_bank_data(&slice[off + 0x2000..off + 0x4000]));
+                profiles.insert(CrtLoadProfile::Roml as u8);
+                profiles.insert(CrtLoadProfile::RomhA000 as u8);
+            }
+            BinLayout::Roml16kRomhE000 => {
+                bank.roml = Some(normalize_bank_data(&slice[off..off + 0x2000]));
+                bank.romh_e000 = Some(normalize_bank_data(&slice[off + 0x2000..off + 0x4000]));
+                profiles.insert(CrtLoadProfile::Roml as u8);
+                profiles.insert(CrtLoadProfile::RomhE000 as u8);
+            }
+        }
+        banks.insert(n as u16, bank);
+    }
+
+    let display_name = if name.trim().is_empty() {
+        std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string())
+    } else {
+        name.to_string()
+    };
+
+    Ok(ParsedCartridgeImage {
+        path: path.to_string(),
+        name: display_name,
+        mapper_type,
+        exrom: geom.exrom,
+        game: geom.game,
+        banks,
+        profiles,
+        raw_bytes: slice.to_vec(),
+    })
+}
+
+/// True when `bytes` carry the `C64 CARTRIDGE   ` signature (a `.crt` container,
+/// vs a raw `.bin`). The one structural discriminator the smart-attach door uses.
+pub fn is_crt(bytes: &[u8]) -> bool {
+    bytes.len() >= 16 && bytes[0..16] == CRT_SIGNATURE[..]
+}
+
+/// §790.1 — parse a raw `.bin` and build its mapper in one step (= the `.crt`
+/// `load_cartridge_from_bytes`). `path` defaults to `name` for the image record.
+pub fn load_cartridge_from_bin(
+    data: &[u8],
+    name: &str,
+    mapper_type: MapperType,
+) -> Result<(ParsedCartridgeImage, Box<dyn CartMapper>), CrtError> {
+    let image = parse_bin(data, name, name, mapper_type)?;
+    let mapper = mapper_from_image(&image)?;
+    Ok((image, mapper))
+}
+
+/// §790.2 — resolve a `--cart-type` / `cart_type` string (a VICE numeric id OR a
+/// mnemonic, case-insensitive) into a `CartType`. `crt`/`auto`/`0` (the
+/// `CARTRIDGE_CRT` sentinel) → `CartType::Auto`; every concrete name/id →
+/// `CartType::Forced`. Unknown → `CrtError::UnknownCartType`.
+///
+/// (The declared signature in the spec is `-> Result<MapperType, CrtError>`, but
+/// the sentinel `crt`/`auto`/`0` cannot be a `MapperType`; `CartType` is the type
+/// that carries BOTH a concrete mapper and the auto sentinel, which is exactly what
+/// "→ a sentinel meaning detect from header/auto" requires — so it is the coherent
+/// return type and the CLI/attach layer consumes it directly.)
+pub fn resolve_cart_type(s: &str) -> Result<CartType, CrtError> {
+    let t = s.trim().to_ascii_lowercase();
+    // Auto/detect sentinel (VICE CARTRIDGE_CRT == 0).
+    if matches!(t.as_str(), "crt" | "auto" | "0") {
+        return Ok(CartType::Auto);
+    }
+    // Numeric VICE id (positive = also the .crt header type; negatives = the
+    // VICE-internal generic families).
+    if let Ok(id) = t.parse::<i32>() {
+        let mt = match id {
+            -3 => MapperType::Normal8k,   // CARTRIDGE_GENERIC_8KB
+            -2 => MapperType::Normal16k,  // CARTRIDGE_GENERIC_16KB
+            -6 => MapperType::Ultimax,    // CARTRIDGE_ULTIMAX
+            5 => MapperType::Ocean,
+            19 => MapperType::MagicDesk,
+            32 => MapperType::EasyFlash,
+            60 => MapperType::Gmod2,
+            85 => MapperType::MagicDesk16,
+            86 => MapperType::MegaByter,
+            61 => MapperType::C64MegaCart, // martinpiper fork
+            _ => return Err(CrtError::UnknownCartType(s.to_string())),
+        };
+        return Ok(CartType::Forced(mt));
+    }
+    // Mnemonic (LLM-friendly).
+    let mt = match t.as_str() {
+        "ef" | "easyflash" => MapperType::EasyFlash,
+        "gmod2" => MapperType::Gmod2,
+        "megabyter" | "mb" => MapperType::MegaByter,
+        "c64megacart" | "c64mc" => MapperType::C64MegaCart,
+        "magicdesk" | "md" => MapperType::MagicDesk,
+        "md16" | "magicdesk16" => MapperType::MagicDesk16,
+        "ocean" => MapperType::Ocean,
+        "8k" | "generic8k" => MapperType::Normal8k,
+        "16k" | "generic16k" => MapperType::Normal16k,
+        "ultimax" => MapperType::Ultimax,
+        _ => return Err(CrtError::UnknownCartType(s.to_string())),
+    };
+    Ok(CartType::Forced(mt))
+}
+
+/// §790.3 (S1) — STRUCTURAL-ONLY first-cut type detect for a raw `.bin` attached
+/// with `CartType::Auto`. This slice only settles the unambiguous structural cases;
+/// the genuinely ambiguous flash carts are left to the caller's explicit
+/// `--cart-type` (or, later, the Spec 790 S2 runtime self-configuring harness).
+///
+/// 1. EAPI signature `65 61 70 69` ("eapi") at bank-0 ROMH `$1800` (= file offset
+///    `$3800` under the 16K-interleaved EasyFlash layout) → EasyFlash.
+/// 2. CBM80 autostart signature (`C3 C2 CD 38 30`) at ROML `$8004` (= file offset
+///    `$0004`) on a single-bank image → generic 8K (`$2000`) / 16K (`$4000`).
+/// 3. A 16K image with no CBM80 whose reset vector (`$3FFC/$3FFD`, i.e. ROMH
+///    `$1FFC/$1FFD`) points into `$E000-$FFFF` → ultimax.
+/// Anything else → `BinTypeAmbiguous`.
+pub fn detect_bin_type(data: &[u8]) -> Result<MapperType, CrtError> {
+    // 1. EasyFlash EAPI at bank-0 ROMH $1800 (16K-interleaved: file offset $3800).
+    if data.len() >= 0x3804 && &data[0x3800..0x3804] == b"eapi" {
+        return Ok(MapperType::EasyFlash);
+    }
+    // 2. CBM80 autostart signature at ROML $8004.
+    const CBM80: [u8; 5] = [0xc3, 0xc2, 0xcd, 0x38, 0x30];
+    let has_cbm80 = data.len() >= 9 && data[4..9] == CBM80;
+    if has_cbm80 {
+        match data.len() {
+            0x2000 => return Ok(MapperType::Normal8k),
+            0x4000 => return Ok(MapperType::Normal16k),
+            _ => {} // CBM80 but a multi-bank/odd size ⇒ not confidently generic.
+        }
+    }
+    // 3. Ultimax: a 16K image, no low CBM80, reset vector into $E000-$FFFF.
+    if data.len() == 0x4000 && !has_cbm80 {
+        let reset = (data[0x3ffc] as u16) | ((data[0x3ffd] as u16) << 8);
+        if (0xe000..=0xffff).contains(&reset) {
+            return Ok(MapperType::Ultimax);
+        }
+    }
+    Err(CrtError::BinTypeAmbiguous)
 }

@@ -146,6 +146,11 @@ pub struct SandboxArgs {
     pub seed: Option<String>,
     /// Optional cart to attach on the cold machine (a cart-resident depacker's ROM).
     pub cart: Option<String>,
+    /// Spec 790 — the cart type for a raw `.bin` (`--cart-type <id|mnemonic>`).
+    /// For a `.crt` it is an optional header override; for a raw `.bin` it is the
+    /// forced geometry. Absent ⇒ `CartType::Auto` (a raw `.bin` then runs the S1
+    /// structural detect, which may be ambiguous and demand an explicit type).
+    pub cart_type: Option<String>,
     /// Optional disk to attach on the cold machine (for a drive-reading routine).
     pub disk: Option<String>,
     pub loads: Vec<SandboxLoad>,
@@ -190,6 +195,7 @@ pub fn run_sandbox_cli(
     rom_dir: &Path,
     seed: Option<&str>,
     cart: Option<&str>,
+    cart_type: Option<&str>,
     disk: Option<&str>,
     load: &[String],
     entry: u16,
@@ -227,6 +233,7 @@ pub fn run_sandbox_cli(
         rom_dir: rom_dir.to_path_buf(),
         seed: seed.map(|s| s.to_string()),
         cart: cart.map(|s| s.to_string()),
+        cart_type: cart_type.map(|s| s.to_string()),
         disk: disk.map(|s| s.to_string()),
         loads,
         entry,
@@ -367,8 +374,16 @@ pub fn run_sandbox(args: &SandboxArgs) -> Result<String, String> {
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("cart");
-        m.attach_cart_from_bytes(&bytes, name)
-            .map_err(|e| format!("attach cart {cart}: {e:?}"))?;
+        // Spec 790 — resolve `--cart-type` → CartType (Auto when absent). A `.crt` is
+        // header-driven with an optional override; a raw `.bin` is forced to the
+        // named geometry, or (Auto) runs the S1 structural detect (may demand a type).
+        let ty = match &args.cart_type {
+            Some(s) => trx64_core::cart::resolve_cart_type(s)
+                .map_err(|e| format!("--cart-type '{s}': {e}"))?,
+            None => trx64_core::cart::CartType::Auto,
+        };
+        m.attach_cart_typed(&bytes, name, ty)
+            .map_err(|e| format!("attach cart {cart}: {e}"))?;
     }
     if let Some(disk) = &args.disk {
         let bytes = std::fs::read(disk).map_err(|e| format!("read disk {disk}: {e}"))?;
@@ -680,6 +695,7 @@ mod tests {
             rom_dir,
             seed: None,
             cart: None,
+            cart_type: None,
             disk: None,
             loads: Vec::new(),
             entry: 0xc000,

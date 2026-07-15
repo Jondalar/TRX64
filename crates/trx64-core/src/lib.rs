@@ -871,7 +871,38 @@ impl Machine {
         bytes: &[u8],
         name: &str,
     ) -> Result<(String, cart::MapperType), cart::CrtError> {
-        let (image, mapper) = cart::load_cartridge_from_bytes(bytes, name, None)?;
+        // Spec 790 — thin wrapper over the smart-attach door with `Auto` intent, so
+        // existing callers keep their `.crt`-header-driven behaviour unchanged.
+        self.attach_cart_typed(bytes, name, cart::CartType::Auto)
+    }
+
+    /// Spec 790 §790.3 — smart cartridge attach (one door, VICE
+    /// `cartridge_attach_image` model). Dispatch on the bytes:
+    /// - `C64 CARTRIDGE   ` signature ⇒ `parse_crt`; `Forced(t)` overrides the
+    ///   header hw type, `Auto` is header-driven.
+    /// - else a raw `.bin` ⇒ `Forced(t)` splits per that type's geometry
+    ///   (`parse_bin`); `Auto` runs the S1 structural-only detect, which may
+    ///   return `BinTypeAmbiguous` (caller must then pass an explicit `--cart-type`;
+    ///   the ambiguous-case resolver is the Spec 790 S2 runtime harness).
+    pub fn attach_cart_typed(
+        &mut self,
+        bytes: &[u8],
+        name: &str,
+        ty: cart::CartType,
+    ) -> Result<(String, cart::MapperType), cart::CrtError> {
+        let (image, mapper) = if cart::is_crt(bytes) {
+            let override_ty = match ty {
+                cart::CartType::Forced(t) => Some(t),
+                cart::CartType::Auto => None,
+            };
+            cart::load_cartridge_from_bytes(bytes, name, override_ty)?
+        } else {
+            let concrete = match ty {
+                cart::CartType::Forced(t) => t,
+                cart::CartType::Auto => cart::detect_bin_type(bytes)?,
+            };
+            cart::load_cartridge_from_bin(bytes, name, concrete)?
+        };
         let result = (image.name.clone(), image.mapper_type);
         self.cartridge = Some(mapper);
         self.cartridge_image = Some(image);

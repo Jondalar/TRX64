@@ -1,7 +1,15 @@
-# Spec 790 — Raw `.bin` Cartridge Attach with a Mandatory Type Parameter
+# Spec 790 — Raw `.bin` Cartridge Attach with a Typed Attach (`Auto` | `Forced`)
 
-**Status:** PROPOSED (2026-07-15). **Repo:** TRX64.
+**Status:** PROPOSED (2026-07-15); **Slice 1 (S1) IN PROGRESS.** **Repo:** TRX64.
 **Shared cross-repo numbering** (registry = C64RE `specs/README.md`).
+
+> **Model correction (S1, 2026-07-15):** the attach type is **not** an
+> unconditional "mandatory parameter". It is `CartType = Auto | Forced(MapperType)`.
+> `Auto` is the default (a `.crt` is header-driven; a raw `.bin` runs the S1
+> structural-only detect — §790.8 — which may return `BinTypeAmbiguous` and ask the
+> caller for an explicit type). `Forced(t)` skips detection and uses `t`'s geometry
+> (a `.crt` header override, or the raw-`.bin` split). The sections below are updated
+> to this model; the original "mandatory type" framing is superseded.
 
 ## Motivation
 
@@ -12,9 +20,11 @@ so the type (EasyFlash / Magic Desk / Megabyter / C64MegaCart / …) must be
 supplied **out of band**.
 
 VICE solves this with a UI prompt ("what CRT is this?") OR a per-type command-line
-option. The prompt is UI-gedöns we don't want. We take the **CLI/API** route:
-**the type is a mandatory parameter for a `.bin`**, passed by the human on the
-CLI or by the LLM over the API. No prompt, no guessing.
+option. The prompt is UI-gedöns we don't want. We take the **CLI/API** route: the
+type is supplied out of band by the human on the CLI or the LLM over the API
+(`CartType::Forced`), with an `Auto` default that detects what it structurally can
+(§790.8 S1) and asks for an explicit type only when it genuinely cannot tell. No
+prompt, no silent guessing.
 
 Leitregel: this is a **capability** → TRX64. C64RE consumes it (media ingress /
 sandbox seed) but owns none of the mechanics.
@@ -116,45 +126,70 @@ pub fn load_cartridge_from_bin(
 ### 790.2 — type resolver: numeric ID **or** mnemonic → `MapperType`
 
 ```rust
-pub fn resolve_cart_type(s: &str) -> Result<MapperType, CrtError>;
+pub fn resolve_cart_type(s: &str) -> Result<CartType, CrtError>;
 ```
 
 Accepts (case-insensitive):
-- a **numeric VICE ID** (`"32"`, `"86"`, `"61"`, `"-2"`, …) → via the VICE
-  numbering (reuse/extend `infer_mapper_type`'s table + the negatives for generic).
+- a **numeric VICE ID** (`"32"`, `"86"`, `"61"`, `"-2"`, …) → `CartType::Forced`
+  via the VICE numbering (reuse/extend `infer_mapper_type`'s table + the negatives
+  for generic: `-3` 8K, `-2` 16K, `-6` ultimax).
 - a **mnemonic** (LLM-friendly): `ef`/`easyflash`, `gmod2`, `megabyter`/`mb`,
-  `c64megacart`/`c64mc`, `magicdesk`/`md`, `md16`, `ocean`, `8k`, `16k`, `ultimax`.
-- `crt`/`auto`/`0` → the sentinel "detect from header" (only valid when the bytes
-  actually carry the `.crt` signature; see 790.3).
+  `c64megacart`/`c64mc`, `magicdesk`/`md`, `md16`, `ocean`, `8k`, `16k`, `ultimax`
+  → `CartType::Forced`.
+- `crt`/`auto`/`0` → `CartType::Auto` (the `CARTRIDGE_CRT` sentinel = "detect from
+  header/structure"; §790.3).
 
 Unknown string → `CrtError::UnknownCartType(String)` (new variant) with the valid
 list in the message.
 
-### 790.3 — smart attach entry (`.crt` vs `.bin`, one door)
+> **Return type note.** The sentinel `crt`/`auto`/`0` cannot be a bare `MapperType`;
+> `CartType` is the type that carries **both** a concrete mapper and the auto
+> sentinel, so `resolve_cart_type` returns `Result<CartType, CrtError>` (consumed
+> directly by the CLI / `attach_cart_typed`).
 
-Extend the choke point so the daemon/CLI call **one** function:
+### 790.3 — smart attach entry (`.crt` vs `.bin`, one door) — `Auto | Forced`
+
+Extend the choke point so the daemon/CLI call **one** function, with an explicit
+`CartType` intent:
 
 ```rust
-Machine::attach_cart_typed(&mut self, bytes, name, path, ty: Option<MapperType>);
-Session::set_inserted_cart_typed(&mut self, bytes, name, path, ty: Option<MapperType>);
+pub enum CartType { Auto, Forced(MapperType) }
+
+Machine::attach_cart_typed(&mut self, bytes, name, ty: CartType)
+    -> Result<(String, MapperType), CrtError>;
 ```
 
-Dispatch (mirrors VICE `cartridge_attach_image`):
-- bytes start with `C64 CARTRIDGE   ` ⇒ `parse_crt` (a supplied `ty` is an **override**
-  of the header, else header-driven).
-- else (raw `.bin`) ⇒ `ty` is **mandatory**; `None` → `CrtError::BinTypeRequired`.
-  `parse_bin(bytes, path, name, ty)`.
+Dispatch (mirrors VICE `cartridge_attach_image`, where `type == CARTRIDGE_CRT(0)`
+is auto and any positive `CARTRIDGE_*` is forced):
+- bytes start with `C64 CARTRIDGE   ` ⇒ `parse_crt`. `Forced(t)` is a header
+  **override**; `Auto` is header-driven.
+- else (raw `.bin`) ⇒ `Forced(t)` splits the linear image per `t`'s geometry
+  (`parse_bin`). `Auto` runs the **S1 structural-only** first-cut detect (§790.8):
+  eapi / CBM80 / reset-vector + size → a single confident type ⇒ `parse_bin(that)`;
+  otherwise `CrtError::BinTypeAmbiguous`, telling the caller to pass an explicit
+  `--cart-type`. (Resolving the genuinely ambiguous flash carts is the **S2** runtime
+  self-configuring harness — §790.8 — not this slice.)
 
-The old `attach_cart_from_bytes(bytes, name)` stays as a thin `…_typed(…, None)`
-wrapper (no caller churn; `.crt`-only behaviour unchanged).
+The old `attach_cart_from_bytes(bytes, name)` stays as a thin
+`attach_cart_typed(…, CartType::Auto)` wrapper (no caller churn; `.crt`-only
+behaviour unchanged). The daemon/session cart-attach call sites keep passing through
+this wrapper (i.e. `Auto`) in S1; threading an explicit `CartType` on the daemon/
+session API is the 790.5 wire work.
 
-### 790.4 — CLI: mandatory `--cart-type` for a `.bin`
+### 790.4 — CLI: `--cart-type` for a `.bin` (default `Auto`)
 
-`trx64cli sandbox`/`boot` (and any `--cart` consumer) gain `--cart-type <id|mnemonic>`.
-Rule enforced at the CLI boundary:
-- `--cart` is a `.crt` (has the signature) → `--cart-type` optional (override).
-- `--cart` is a raw `.bin` → `--cart-type` **required**; its absence is a usage
-  error naming the mnemonic set (no prompt, no default-guess).
+`trx64cli sandbox` (and any `--cart` consumer) gains `--cart-type <id|mnemonic>`.
+Rule at the CLI boundary:
+- `--cart-type` present → `resolve_cart_type` → `Forced` (or `Auto` for
+  `crt`/`auto`/`0`).
+- `--cart-type` absent → `CartType::Auto`.
+- `--cart` is a `.crt` → `--cart-type` is an optional header override.
+- `--cart` is a raw `.bin` under `Auto` → the S1 structural detect runs; if it can't
+  settle, the attach fails with `BinTypeAmbiguous`, whose message names the mnemonic
+  set (no prompt, no default-guess). Passing `--cart-type` resolves it.
+
+(S1 wires `sandbox`. `boot` mounts via `media/mount` — the daemon API path, 790.5 —
+so its typed `cart_type` rides that wire work, not the CLI flag.)
 
 ### 790.5 — API: `cart_type` field on the wire
 
@@ -174,7 +209,9 @@ Extend `crates/trx64-core/tests/cart_mapper_gate.rs`:
 - `resolve_cart_type`: id and mnemonic both resolve; unknown → error.
 - size rules: non-multiple → `BadBinSize`; `k > max_banks` → `BadBinSize`;
   `len == unit*k + 2` → 2-byte strip then k banks.
-- smart entry: raw bin + `None` → `BinTypeRequired`; `.crt` bytes ignore/override.
+- smart entry: raw bin + `Forced` → attaches; raw bin + `Auto` with eapi → EF;
+  ambiguous raw bin + `Auto` → `BinTypeAmbiguous`; `.crt` bytes stay header-driven
+  (with an optional `Forced` override).
 - round-trip vs `.crt`: a `.bin` and the equivalent full `.crt` (all banks present)
   build byte-identical flash → identical reads.
 
@@ -198,7 +235,31 @@ flash/banked mappers these are only a boot hint — the mapper self-determines l
 from its mode register at reset (e.g. C64MegaCartMapper boots 8K game). For the
 generic mappers (NormalMapper) they are authoritative. The descriptor lives beside
 each mapper's existing `build_linear_chip_data` bank_count so geometry has **one**
-source of truth.
+source of truth (`cart::bin_geometry(mapper_type) -> BinGeometry`).
+
+### 790.8 — `Auto` detection has two tiers (S1 shipped here, S2 deferred)
+
+A raw `.bin` attached with `CartType::Auto` has **no in-band type**, so detection is
+tiered:
+
+- **S1 — structural-only first-cut (this slice).** A single pass over the static
+  bytes: (1) the EAPI signature `65 61 70 69` at bank-0 ROMH `$1800` (file offset
+  `$3800` under the 16 KiB-interleaved layout) → EasyFlash; (2) the CBM80 autostart
+  signature (`C3 C2 CD 38 30`) at ROML `$8004` on a single-bank image → generic 8K
+  (`$2000`) / 16K (`$4000`); (3) a 16 KiB image with no CBM80 whose reset vector
+  (`$3FFC/$3FFD`) points into `$E000-$FFFF` → ultimax. Anything else (e.g. a
+  multi-bank flash dump, which has no reliable static marker) → `BinTypeAmbiguous`,
+  which asks the caller for an explicit `--cart-type`. S1 never guesses a banked
+  flash family from bytes alone.
+
+- **S2 — runtime self-configuring cart harness (next slice, NOT built here).**
+  Attach the image as a generic banked cart, run it, and **watch** the register
+  writes it makes — `$DE00`/`$DE02` (Magic Desk / Megabyter / EasyFlash bank+mode),
+  `$DF00` (C64MegaCart control), and the AMD flash command sequence
+  (`AA`/`55`/`A0`/`80`/`30` unlock+program+erase writes) — to fingerprint the mapper
+  and **lock the concrete type in-place**, with the S1 eapi/size cues as tiebreak.
+  This resolves the cases S1 leaves ambiguous, without a UI prompt. Deferred to
+  Spec 790 S2.
 
 ## Non-goals
 
@@ -218,10 +279,12 @@ source of truth.
    equivalent `.crt` and reads byte-identical.
 2. `resolve_cart_type` maps both numeric ID and mnemonic; unknown → a clear error
    listing valid values.
-3. Smart attach: raw `.bin` without a type → `BinTypeRequired`; with a type →
-   attaches; `.crt` bytes still attach header-driven (type optional override).
-4. CLI: `trx64cli sandbox --cart X.bin` **without** `--cart-type` is a usage error;
-   `--cart-type c64megacart` (or `61`) boots the bin. `.crt` still works with no
+3. Smart attach: raw `.bin` + `Auto` that the S1 detect can't settle → the attach
+   fails `BinTypeAmbiguous`; raw `.bin` + `Forced(t)` (or eapi under `Auto`) →
+   attaches; `.crt` bytes still attach header-driven (type an optional override).
+4. CLI: `trx64cli sandbox --cart X.bin` on an ambiguous raw bin **without**
+   `--cart-type` fails with `BinTypeAmbiguous` naming the mnemonic set;
+   `--cart-type c64megacart` (or `61`) attaches the bin. `.crt` still works with no
    `--cart-type`.
 5. API: a `media/mount` of a raw `.bin` with `cart_type` attaches; without it, a
    typed error (not a silent no-cart).
