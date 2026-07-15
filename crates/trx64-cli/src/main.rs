@@ -25,7 +25,9 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
+use trx64_cli::boot_cmd;
 use trx64_cli::disasm_cmd::{self, DisasmArgs};
+use trx64_cli::sandbox_cmd;
 use trx64_cli::engine::Engine;
 use trx64_cli::tui::{self, UiToMain};
 use trx64_cli::window;
@@ -82,6 +84,94 @@ enum Command {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+
+    /// One-shot real-core execution sandbox (Spec 787 v1 + 788): boot a fresh
+    /// machine (this process = one throwaway scratch instance), load bytes, run the
+    /// title's OWN routine to a sentinel, harvest a RAM slice. Runs on the
+    /// AUTHORITATIVE 6502 — not the TS shadow — so a banking/IO depacker executes
+    /// for real. E.g.
+    ///   trx64cli sandbox --load depacker.prg --load packed.bin@$2000 \
+    ///                    --entry '$0334' --harvest '$4000:0x800' --json
+    Sandbox {
+        /// Optional .c64re snapshot to restore before running (loader-resident seed);
+        /// the routine then runs on top of that state. Generate one with `boot`.
+        #[arg(long)]
+        seed: Option<String>,
+        /// Attach a cart on the cold machine. NOTE: an EF/ultimax cart REMAPS memory
+        /// ($8000/$E000 = cart ROM, $4000 = open bus), so a naive RAM stub+routine may
+        /// not run cleanly — for a cart-resident depacker prefer --seed (a .c64re of
+        /// the cart already running in its banked state).
+        #[arg(long)]
+        cart: Option<String>,
+        /// Attach a disk on the cold machine (.d64/.g64; for a drive-reading routine).
+        #[arg(long)]
+        disk: Option<String>,
+        /// A blob to load: FILE@ADDR (ADDR hex), or FILE alone for a .prg (2-byte
+        /// load-address header). Repeatable. Optional when --seed supplies the code.
+        #[arg(long = "load")]
+        load: Vec<String>,
+        /// Entry PC of the routine to call (hex).
+        #[arg(long, value_parser = trx64_cli::disasm_cmd::parse_addr)]
+        entry: u16,
+        /// RAM range to harvest after the run: ADDR:LEN (LEN decimal or 0x-hex).
+        #[arg(long)]
+        harvest: String,
+        /// Seed a zero-page byte before the run: ADDR=VAL (both hex). Repeatable —
+        /// depackers take their src/dst pointers here (e.g. --zp $fb=$00 --zp $fc=$20).
+        #[arg(long = "zp")]
+        zp: Vec<String>,
+        /// Extra sentinel breakpoint besides the routine's RTS-return (hex).
+        #[arg(long, value_parser = trx64_cli::disasm_cmd::parse_addr)]
+        sentinel: Option<u16>,
+        /// $01 memory-config the entry stub sets before calling (hex byte, default $37).
+        #[arg(long)]
+        io: Option<String>,
+        /// Address of the 11-byte entry stub (hex, default $02a7 free RAM).
+        #[arg(long, value_parser = trx64_cli::disasm_cmd::parse_addr)]
+        stub_addr: Option<u16>,
+        /// Cycle budget cap (default 100_000_000).
+        #[arg(long)]
+        cyc_cap: Option<u64>,
+        /// Instruction cap (default 40_000_000).
+        #[arg(long)]
+        instr_cap: Option<u64>,
+        /// Emit JSON instead of text.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Boot a disk/cart in an isolated process (own machine, no daemon, no shared
+    /// session) to a state, then dump a .c64re snapshot — mints seeds/fixtures for
+    /// `sandbox --seed`. E.g.
+    ///   trx64cli boot --disk scramble.d64 --type 'LOAD"*",8,1\rRUN\r' \
+    ///                 --cycles 90000000 --dump scramble.c64re
+    Boot {
+        /// Disk/cart to mount (.d64/.g64/.crt).
+        #[arg(long)]
+        disk: String,
+        /// Cycles to run to the READY prompt before typing (default 3_000_000).
+        #[arg(long, default_value_t = 3_000_000)]
+        warmup: u64,
+        /// Keystrokes to queue (\r = RETURN). Repeatable — put LOAD and RUN in
+        /// SEPARATE --type flags. E.g. --type 'LOAD"*",8,1\r' --type 'RUN\r'.
+        #[arg(long = "type")]
+        type_text: Vec<String>,
+        /// Cycles to run after EACH --type so its command completes (default 40_000_000).
+        #[arg(long, default_value_t = 40_000_000)]
+        type_gap: u64,
+        /// Final settle cycles after the last --type (~985248/s PAL). Default 90_000_000.
+        #[arg(long, default_value_t = 90_000_000)]
+        cycles: u64,
+        /// Per session/run-call cycle chunk (default 10_000_000).
+        #[arg(long, default_value_t = 10_000_000)]
+        chunk: u64,
+        /// Output .c64re snapshot path.
+        #[arg(long)]
+        dump: String,
+        /// Also write a PNG screenshot of the final screen (verify what booted).
+        #[arg(long)]
+        render: Option<String>,
+    },
 }
 
 fn main() {
@@ -97,6 +187,37 @@ fn main() {
             count: *count,
             json: *json,
         }) {
+            Ok(out) => println!("{out}"),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
+
+    // ── Real-core sandbox one-shot (Spec 787 v1 + 788; own machine, no TUI) ─────
+    if let Some(Command::Sandbox {
+        seed, cart, disk, load, entry, harvest, zp, sentinel, io, stub_addr, cyc_cap, instr_cap,
+        json,
+    }) = &cli.cmd
+    {
+        match sandbox_cmd::run_sandbox_cli(
+            &rom_dir, seed.as_deref(), cart.as_deref(), disk.as_deref(), load, *entry, harvest, zp,
+            *sentinel, io.as_deref(), *stub_addr, *cyc_cap, *instr_cap, *json,
+        ) {
+            Ok(out) => println!("{out}"),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
+
+    // ── Boot-and-dump one-shot (isolated scratch instance → .c64re fixture) ─────
+    if let Some(Command::Boot { disk, warmup, type_text, type_gap, cycles, chunk, dump, render }) = &cli.cmd {
+        match boot_cmd::run_boot(&rom_dir, disk, *warmup, type_text, *type_gap, *cycles, *chunk, dump, render.as_deref()) {
             Ok(out) => println!("{out}"),
             Err(e) => {
                 eprintln!("{e}");
