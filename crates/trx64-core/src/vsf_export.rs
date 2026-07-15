@@ -253,10 +253,87 @@ fn vic_iisc(m: &Machine) -> Vec<u8> {
     w.buf
 }
 
-/// Serialize `machine` into a VICE-x64sc `.vsf` byte image (Spec 791.5).
-/// The cart module is a follow-up slice — a cart-carrying state exports its core
-/// (VICE resumes cart-less until then).
-pub fn save_vice_vsf(m: &Machine) -> Vec<u8> {
+// ── EasyFlash cartridge (C64CART + CARTEF + FLASH040EF×2) ────────────────────────
+const EF_FLASH_SIZE: usize = 0x80000; // 512 KiB per flash chip (lo/hi)
+const EF_CART_RAM_SIZE: usize = 0x100; // 256-byte IO2 RAM
+const EF_ERASE_MASK_SIZE: usize = 8;
+const CARTRIDGE_EASYFLASH: u32 = 32; // VICE cart type id
+
+/// Generic C64CART module (66 bytes) — tells VICE the cart TYPE so it dispatches to
+/// the EasyFlash reader for CARTEF/FLASH040EF. game/exrom/ultimax are re-derived by
+/// VICE from register_00/02 when it applies the EF config, so best-effort here.
+fn c64cart(st: &crate::cart::CartState) -> Vec<u8> {
+    let mut w = W::new();
+    w.b(1); // number_of_carts
+    w.dw(CARTRIDGE_EASYFLASH); // mem_cartridge_type
+    w.b(0); // export.game
+    w.b(0); // export.exrom
+    w.dw(st.current_bank as u32); // romh_bank
+    w.dw(st.current_bank as u32); // roml_bank
+    w.b(0); // export_ram
+    w.b(0); // export.ultimax_phi1
+    w.b(0); // export.ultimax_phi2
+    w.clock(0); // cart_freeze_alarm_time
+    w.clock(0); // cart_nmi_alarm_time
+    w.zeros(4); // export_slot1 (game/exrom/phi1/phi2)
+    w.zeros(4); // export_slotmain
+    w.zeros(4); // export_passthrough
+    w.zeros(16); // 4× reserved DW
+    w.dw(CARTRIDGE_EASYFLASH); // cart_ids[0]
+    debug_assert_eq!(w.buf.len(), 66);
+    w.buf
+}
+
+/// CARTEF (1048835 bytes): jumper + register_00(bank) + register_02(mode) + IO2 RAM
+/// (256) + the two 512 KiB flash images (roml, romh). `flash_img` is the writable
+/// image (roml ++ romh) captured from the live mapper.
+fn cartef(st: &crate::cart::CartState, flash_img: &[u8]) -> Vec<u8> {
+    let f = st.flash.as_ref();
+    let mut w = W::new();
+    w.b(f.map(|f| f.easyflash_jumper).unwrap_or(0) & 1);
+    w.b(st.current_bank as u8); // register_00
+    w.b(st.control_register.unwrap_or(0)); // register_02
+    // IO2 RAM (256).
+    let mut ram = [0u8; EF_CART_RAM_SIZE];
+    if let Some(fs) = f {
+        for (i, s) in ram.iter_mut().enumerate() {
+            *s = fs.easyflash_ram.get(i).copied().unwrap_or(0);
+        }
+    }
+    w.ba(&ram);
+    // roml (first 512K) + romh (second 512K) of the writable image.
+    let mut lohi = vec![0u8; 2 * EF_FLASH_SIZE];
+    let n = flash_img.len().min(lohi.len());
+    lohi[..n].copy_from_slice(&flash_img[..n]);
+    w.ba(&lohi);
+    w.buf
+}
+
+/// FLASH040EF (12 bytes): the flash command-FSM for one chip (lo or hi).
+fn flash040ef(fsm: Option<&crate::flash040::Flash040SnapState>) -> Vec<u8> {
+    let mut w = W::new();
+    match fsm {
+        Some(s) => {
+            w.b(s.state);
+            w.b(s.base_state);
+            w.b(s.program_byte);
+            let mut mask = [0u8; EF_ERASE_MASK_SIZE];
+            for (i, m) in mask.iter_mut().enumerate() {
+                *m = s.erase_mask.get(i).copied().unwrap_or(0);
+            }
+            w.ba(&mask);
+            w.b(s.last_read);
+        }
+        None => w.zeros(3 + EF_ERASE_MASK_SIZE + 1),
+    }
+    debug_assert_eq!(w.buf.len(), 12);
+    w.buf
+}
+
+/// Serialize `machine` into a VICE-x64sc `.vsf` byte image (Spec 791.5). Emits the
+/// six core modules; if an EasyFlash cart is present, also C64CART + CARTEF +
+/// FLASH040EF×2 so VICE resumes the cart (banked flash game).
+pub fn save_vice_vsf(m: &mut Machine) -> Vec<u8> {
     let mut out = file_header();
     module(&mut out, "MAINCPU", 1, 3, &maincpu(m));
     module(&mut out, "C64MEM", 0, 1, &c64mem(m));
@@ -264,5 +341,20 @@ pub fn save_vice_vsf(m: &Machine) -> Vec<u8> {
     module(&mut out, "CIA2", 2, 5, &cia(&m.cia2));
     module(&mut out, "SID", 1, 5, &sid(m));
     module(&mut out, "VIC-II", 1, 4, &vic_iisc(m));
+
+    // EasyFlash cart, if present (writable_image needs &mut; take it before the
+    // immutable get_state so the borrows don't overlap).
+    let clk = m.c64_core.clk;
+    let flash_img = m.cartridge.as_mut().and_then(|c| c.writable_image(clk));
+    let state = m.cartridge.as_ref().map(|c| c.get_state());
+    if let (Some(st), Some(flash)) = (state.as_ref(), flash_img.as_ref()) {
+        if st.flash.is_some() {
+            module(&mut out, "C64CART", 0, 1, &c64cart(st));
+            module(&mut out, "CARTEF", 0, 0, &cartef(st, flash));
+            let f = st.flash.as_ref().unwrap();
+            module(&mut out, "FLASH040EF", 2, 0, &flash040ef(f.flash_lo.as_ref()));
+            module(&mut out, "FLASH040EF", 2, 0, &flash040ef(f.flash_hi.as_ref()));
+        }
+    }
     out
 }

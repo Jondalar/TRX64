@@ -324,7 +324,7 @@ fn main() {
                 .map_err(|e| format!("boot ROMs: {e:?}"))?;
             trx64_core::c64re_snapshot::restore_runtime_checkpoint(&mut m, &read.checkpoint)
                 .map_err(|e| format!("restore: {e}"))?;
-            let vsf = trx64_core::vsf_export::save_vice_vsf(&m);
+            let vsf = trx64_core::vsf_export::save_vice_vsf(&mut m);
             std::fs::write(output, &vsf).map_err(|e| format!("write {output}: {e}"))?;
             Ok(format!(
                 "convert-c64re: {input} → {output}\n  pc=${:04x} cycle={} bytes={} machine=C64SC",
