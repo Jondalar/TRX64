@@ -557,6 +557,21 @@ impl Cia {
         let _ = tab;
     }
 
+    /// Re-arm both timer alarms after a snapshot restore that set the register file
+    /// + `ta`/`tb` cnt/latch/clk directly (e.g. a VICE-VSF import — vsf.rs). Such a
+    /// restore leaves each `Ciat.state` at its stopped default and the cached
+    /// `ta_alarmclk`/`tb_alarmclk` at `CLOCK_NEVER`, so a RUNNING timer would never
+    /// fire its underflow IRQ again — the game's CIA-timer-driven logic (frame clock,
+    /// raster-split IRQ setup) silently stalls. Reconstruct each timer's control
+    /// state from CRA/CRB (`ciat_set_ctrl`) and predict the next underflow clk
+    /// (`ciat_set_alarm`) — the VICE `cia_snapshot_read_module` tail.
+    pub fn restore_rearm_alarms(&mut self, tab: &[u16; CIAT_TABLEN]) {
+        self.ta.set_ctrl(self.regs[CIA_CRA]);
+        self.tb.set_ctrl(self.regs[CIA_CRB]);
+        self.ciat_set_alarm_ta(tab);
+        self.ciat_set_alarm_tb(tab);
+    }
+
     /// CPU read of a CIA register (addr already masked to $DC00-$DDFF window by the
     /// bus). `clk` = CPU master clock at the access (rclk, READ_OFFSET=0).
     pub fn read(&mut self, addr: u16, clk: u64, tab: &[u16; CIAT_TABLEN]) -> u8 {

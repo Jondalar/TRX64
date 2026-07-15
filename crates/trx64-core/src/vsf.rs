@@ -1034,6 +1034,7 @@ fn load_vice_vsf(machine: &mut Machine, data: &[u8]) -> Result<VsfLoadResult, St
     // VICE order: PRA[0] PRB[1] DDRA[2] DDRB[3] TIMER_A[4..5] TIMER_B[6..7]
     //   TOD_TEN[8] TOD_SEC[9] TOD_MIN[10] TOD_HR[11] SDR[12] ICR[13] CRA[14]
     //   CRB[15] LATCH_A[16..17] LATCH_B[18..19] ...
+    let cia_tab = machine.cia_table.clone();
     for (name, want_cia2) in [("CIA1", false), ("CIA2", true)] {
         match vice_find_module(data, name) {
             Some(m) if m.data_len >= 20 => {
@@ -1074,6 +1075,13 @@ fn load_vice_vsf(machine: &mut Machine, data: &[u8]) -> Result<VsfLoadResult, St
                 cia.clk = clk;
                 cia.ta.clk = clk;
                 cia.tb.clk = clk;
+                // Re-arm the timer alarms from the restored CRA/CRB + cnt/latch. The
+                // register write above set the FILE but not the Ciat control state or
+                // the cached underflow-alarm clk (still CLOCK_NEVER from Machine::new),
+                // so a running timer would never fire again — the game's frame clock +
+                // raster-split IRQ stall (VSF resumed to a garbled bottom split / dead
+                // timer). VICE cia_snapshot_read_module does the same re-arm on load.
+                cia.restore_rearm_alarms(cia_tab.as_ref());
                 loaded.push(name.to_string());
             }
             Some(m) => errors.push((name.into(), format!("too short: {}", m.data_len))),
@@ -1092,13 +1100,42 @@ fn load_vice_vsf(machine: &mut Machine, data: &[u8]) -> Result<VsfLoadResult, St
         Some(_) | None => ignored.push("SID".to_string()),
     }
 
-    // ── VIC-II v1.3: model[0] + regs[0x40]@1 (the rest is the 123 KB pipeline
-    //    blob we cannot reconstruct — take ONLY model + 64 regs + derived ptrs) ──
+    // ── VIC-IISC (x64sc) module: model[0] + regs[0x40]@1, then the cycle-exact
+    //    micro-pipeline (coarse-VIC cut: we take regs + raster position + the
+    //    COLOUR RAM). The colour RAM is the critical non-pipeline field: it is a
+    //    SEPARATE 1K chip (not in C64MEM's 64K DRAM), feeds the "11" multicolor
+    //    bitmap pattern + text colour, and without it every colour-RAM pixel resolves
+    //    to colour 0 (black) — a mid-game EF screen resumed with its white menu/HUD
+    //    rendered black. VICE writes it at a fixed offset inside the VIC-IISC module
+    //    (viciisc/vicii-snapshot.c: model 1 + regs 64 + raster_cycle/cycle_flags/
+    //    raster_line 3×DW + start_of_frame 1 + irq_status 1 + raster_irq_line DW +
+    //    raster_irq_triggered 1 + vbuf 40 + cbuf 40 + gbuf 1 + dbuf_offset DW + dbuf
+    //    520 + ysmooth DW + 4×B + 6×DW(idle/vcbase/vc/rc/vmli/bad_line) + lp(2×B +
+    //    3×DW + CLOCK/qword) + reg11_delay 1 + 2×DW + 9×B → colour_ram @ 761).
+    const VICIISC_COLOR_RAM_OFF: usize = 761;
     match vice_find_module(data, "VIC-II").or_else(|| vice_find_module(data, "VIC-IISC")) {
         Some(m) if m.data_len >= 1 + 64 => {
             let d = &data[m.data_start..m.data_start + m.data_len];
             // d[0] = model byte; d[1..65] = the 64 public VIC registers.
             machine.vic.regs[0..64].copy_from_slice(&d[1..1 + 64]);
+            // Raster position (viciisc order: raster_cycle, cycle_flags, raster_line —
+            // each a DWORD right after the registers) so the resumed frame starts where
+            // VICE dumped it, not at line 0.
+            let dw = |o: usize| u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
+            if d.len() >= 77 {
+                machine.vic.raster_cycle = dw(65) as u16;
+                machine.vic.cycle_flags = dw(69);
+                machine.vic.raster_line = dw(73) as u16;
+            }
+            // ysmooth (the latched vertical-scroll, a SEPARATE DWORD @ 689 — NOT derived
+            // from regs[$11]&7 by the renderer). Left at 0 it shifts the whole display 7
+            // rows vs a dump taken with ysmooth=7 (the observed 7px vertical offset).
+            // Offsets after regs: raster_cycle/cycle_flags/raster_line 3×DW + sof 1 +
+            // irq_status 1 + raster_irq_line DW + raster_irq_triggered 1 + vbuf 40 +
+            // cbuf 40 + gbuf 1 + dbuf_offset DW + dbuf 520 → ysmooth @ 689.
+            if d.len() >= 693 {
+                machine.vic.ysmooth = dw(689) as u8;
+            }
             // Recompute the IRQ line from the restored $D019 latch ∧ $D01A mask.
             machine.vic.irq_status = machine.vic.regs[0x19] & 0x0f;
             machine.vic.irq_line =
@@ -1109,6 +1146,16 @@ fn load_vice_vsf(machine: &mut Machine, data: &[u8]) -> Result<VsfLoadResult, St
             // Raster-IRQ compare line ($D012 + $D011 bit7).
             machine.vic.raster_irq_line =
                 (machine.vic.regs[0x12] as u16) | (((machine.vic.regs[0x11] as u16) & 0x80) << 1);
+            // COLOUR RAM (0x400, low nibbles) → `write_color_ram` writes BOTH the
+            // `ram[$D800..]` and `io_shadow[$0800..]` stores; the full-machine VIC
+            // reads colour RAM from `io_shadow`, so without it the "11" multicolor
+            // pixels resolve to black (white menu/HUD rendered black on resume).
+            if d.len() >= VICIISC_COLOR_RAM_OFF + 0x400 {
+                crate::c64re_snapshot::write_color_ram(
+                    machine,
+                    &d[VICIISC_COLOR_RAM_OFF..VICIISC_COLOR_RAM_OFF + 0x400],
+                );
+            }
             loaded.push("VIC-II".to_string());
         }
         Some(_) | None => ignored.push("VIC-II".to_string()),

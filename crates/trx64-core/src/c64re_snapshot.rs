@@ -817,10 +817,18 @@ pub fn read_color_ram(m: &Machine) -> [u8; 0x400] {
     out
 }
 
-/// Write color RAM back into the 64K image (low nibble).
+/// Write color RAM back (low nibble) into BOTH stores that must agree:
+/// - `ram[$D800..]` — the ISO-bus VIC + what `read_color_ram` captures;
+/// - `io_shadow[$0800..]` — the FULL-machine bus VIC's colour-RAM source
+///   (`full.rs` reads colour RAM from `io_shadow`, NOT `ram`).
+/// Writing only `ram` left every product (full-machine) restore blind to colour
+/// RAM: each "11" multicolor-bitmap pixel resolved to colour 0 (black), so a
+/// resumed screen rendered its white text/HUD black. This is the single colour-RAM
+/// restore primitive for `.c64re`, the ring, and the VSF import.
 pub fn write_color_ram(m: &mut Machine, color_ram: &[u8]) {
     for (i, &c) in color_ram.iter().enumerate().take(0x400) {
         m.ram[0xd800 + i] = (m.ram[0xd800 + i] & 0xf0) | (c & 0x0f);
+        m.io_shadow[0x0800 + i] = (m.io_shadow[0x0800 + i] & 0xf0) | (c & 0x0f);
     }
 }
 
