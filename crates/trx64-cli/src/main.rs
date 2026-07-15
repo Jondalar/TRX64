@@ -26,6 +26,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 
 use trx64_cli::boot_cmd;
+use trx64_cli::convert_cmd;
 use trx64_cli::disasm_cmd::{self, DisasmArgs};
 use trx64_cli::sandbox_cmd;
 use trx64_cli::engine::Engine;
@@ -188,6 +189,23 @@ enum Command {
         json: bool,
     },
 
+    /// Convert a VICE (or c64re-own) `.vsf` snapshot into a `.c64re` (Spec 791.2):
+    /// load the VSF into a fresh machine (isolated process, no daemon), dump a
+    /// `.c64re` the runtime already reads (`sandbox --seed` / `undump`). Prints a
+    /// fidelity report (loaded/coarse/absent + `faithful|partial|inspection-only`),
+    /// NOT a silent `errors=[]`. E.g.
+    ///   trx64cli convert-vsf boris_ef.vsf boris_ef.c64re --json
+    ConvertVsf {
+        /// Input `.vsf` (real VICE x64sc snapshot, or a c64re-own VSF).
+        input: String,
+        /// Output `.c64re` native snapshot path.
+        output: String,
+        /// Emit JSON ({input,output,source,fidelity,loaded,coarse,absent,...})
+        /// instead of text.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
     /// Boot a disk/cart in an isolated process (own machine, no daemon, no shared
     /// session) to a state, then dump a .c64re snapshot — mints seeds/fixtures for
     /// `sandbox --seed`. E.g.
@@ -258,6 +276,18 @@ fn main() {
             reg_sp.as_deref(), reg_p.as_deref(), stream.as_deref(), stream_hex.as_deref(),
             stream_hook, *json,
         ) {
+            Ok(out) => println!("{out}"),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
+
+    // ── VSF → .c64re convert one-shot (Spec 791.2; own machine, no daemon) ──────
+    if let Some(Command::ConvertVsf { input, output, json }) = &cli.cmd {
+        match convert_cmd::run_convert(&rom_dir, input, output, *json) {
             Ok(out) => println!("{out}"),
             Err(e) => {
                 eprintln!("{e}");

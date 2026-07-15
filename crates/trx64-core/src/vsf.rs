@@ -55,6 +55,13 @@ const MOD_MINOR: u8 = 0;
 /// Marker present in VICE x64sc snapshots (SIDEXTENDED module name).
 const VICE_MARKER: &[u8] = b"SIDEXTENDED";
 
+/// The "VICE Version\x1a" string in a real VICE snapshot's 58-byte header (Spec
+/// 791.4) — a structural fingerprint c64re-own snapshots never carry.
+const VICE_VERSION_MARKER: &[u8] = b"VICE Version\x1a";
+/// Offset of `VICE_VERSION_MARKER` inside the 58-byte real-VICE header:
+/// magic(19) + major/minor(2) + machine_name[16] = 37.
+const VICE_VERSION_OFF: usize = 37;
+
 // ── Public types ──────────────────────────────────────────────────────────────
 
 /// Result of a VSF load operation.
@@ -64,6 +71,87 @@ pub struct VsfLoadResult {
     pub ignored_modules: Vec<String>,
     pub errors: Vec<(String, String)>,
     pub source: &'static str,
+}
+
+// ── Fidelity classification (Spec 791.3 — retire the `errors=[]` footgun) ────────
+
+/// How faithfully a VSF was restored into the `Machine`. Replaces the old
+/// `errors=[]` signal, which let a caller mistake an inspection-only import for a
+/// resumable machine (issue report 2026-07-15). A converter/caller reads THIS to
+/// know whether the imported state actually resumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fidelity {
+    /// Every machine-state-core module (CPU/RAM/CIA/VIC/SID) fully restored and no
+    /// *critical* module (`C64CART`, the drive) present-but-dropped ⇒ resumes 1:1.
+    Faithful,
+    /// The machine-state core is restored (resumable) but at least one critical
+    /// module present in the file was NOT restored (e.g. `DRIVE8`, `C64CART`) or a
+    /// module came in only approximately (`coarse`) ⇒ resumes, but not 1:1.
+    Partial,
+    /// The resumable core (CPU + RAM) did not come in — only inspectable registers.
+    /// The state can be READ but not reliably run forward.
+    InspectionOnly,
+}
+
+impl Fidelity {
+    /// The Spec 791.3 wire vocabulary (`faithful` | `partial` | `inspection-only`),
+    /// used by `trx64cli convert-vsf --json` and text output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Fidelity::Faithful => "faithful",
+            Fidelity::Partial => "partial",
+            Fidelity::InspectionOnly => "inspection-only",
+        }
+    }
+}
+
+/// Per-module honesty report for a VSF load (Spec 791.3). Walks ALL modules present
+/// in the file and buckets each: `loaded` (fully restored), `coarse` (restored only
+/// approximately — none in slice 1), `absent` (present in the file but NOT restored).
+/// `fidelity` is derived from those buckets by [`classify_fidelity`].
+#[derive(Debug, Clone)]
+pub struct VsfLoadReport {
+    pub loaded: Vec<String>,
+    pub coarse: Vec<String>,
+    pub absent: Vec<String>,
+    pub fidelity: Fidelity,
+    /// "c64re" | "vice-x64sc" — which framing the file used.
+    pub source: &'static str,
+}
+
+/// Modules whose absence (present-in-file but NOT restored) means the import is NOT
+/// faithful: the cartridge and the 1541 drive. Dropping any of these silently is the
+/// exact footgun that turned a partial EF-debug import into a phantom "execution
+/// divergence" (issue report 2026-07-15). The VIC micro-pipeline is handled by the
+/// coarse-VIC cut (Spec 791.1b) and is NOT listed here in slice 1 — the register
+/// head we do lift is a genuine (loaded) restore for resume.
+const CRITICAL_MODULES: &[&str] = &["C64CART", "DRIVE8", "DRIVECPU0"];
+
+/// The machine-state-core modules that must be fully restored for a `Faithful`
+/// verdict (Spec 791.3). `MAINCPU` + `C64MEM` alone make the machine *resumable*;
+/// the rest complete the core.
+const CORE_MODULES: &[&str] = &["MAINCPU", "C64MEM", "CIA1", "CIA2", "SID", "VIC-II"];
+
+/// Derive the [`Fidelity`] from the per-module buckets (Spec 791.3 rule):
+/// - resumable core (`MAINCPU` + `C64MEM`) absent ⇒ `InspectionOnly`;
+/// - any critical module (`CRITICAL_MODULES`) present-but-absent, or any `coarse`
+///   module ⇒ `Partial`;
+/// - full machine-state core restored and nothing critical missing ⇒ `Faithful`.
+fn classify_fidelity(loaded: &[String], coarse: &[String], absent: &[String]) -> Fidelity {
+    let in_loaded = |name: &str| loaded.iter().any(|m| m == name);
+    // Resumable iff CPU + RAM came in.
+    if !in_loaded("MAINCPU") || !in_loaded("C64MEM") {
+        return Fidelity::InspectionOnly;
+    }
+    let critical_dropped = absent.iter().any(|m| CRITICAL_MODULES.contains(&m.as_str()));
+    if critical_dropped || !coarse.is_empty() {
+        return Fidelity::Partial;
+    }
+    if CORE_MODULES.iter().all(|c| in_loaded(c)) {
+        Fidelity::Faithful
+    } else {
+        Fidelity::Partial
+    }
 }
 
 // ── Write helpers ─────────────────────────────────────────────────────────────
@@ -350,6 +438,14 @@ fn read_u32_le(data: &[u8], off: usize) -> Option<u32> {
         | ((data[off + 3] as u32) << 24))
 }
 
+/// Read a full little-endian u64 (8 bytes). Used for VICE's 8-byte `SMW_CLOCK`
+/// MAINCPU clock (Spec 791.1 — import the WHOLE clock, not just the low 32 bits).
+fn read_u64_le(data: &[u8], off: usize) -> Option<u64> {
+    let lo = read_u32_le(data, off)? as u64;
+    let hi = read_u32_le(data, off + 4)? as u64;
+    Some(lo | (hi << 32))
+}
+
 // ── Module loaders ────────────────────────────────────────────────────────────
 
 fn load_maincpu(machine: &mut Machine, data: &[u8]) -> Result<(), String> {
@@ -617,6 +713,46 @@ fn vice_find_module(data: &[u8], name: &str) -> Option<ViceModule> {
     None
 }
 
+/// Detect a genuine VICE x64sc snapshot by HEADER STRUCTURE (Spec 791.4), not only
+/// by grepping for the "SIDEXTENDED" module-name string. A real VICE VSF carries the
+/// 58-byte header with "VICE Version\x1a" at offset 37; the SIDEXTENDED marker is
+/// kept as a fast-path OR (cheap early-out + older detector).
+fn is_native_vice_vsf(data: &[u8]) -> bool {
+    // Fast path: the SIDEXTENDED module name (c64re never writes it).
+    if data.windows(VICE_MARKER.len()).any(|w| w == VICE_MARKER) {
+        return true;
+    }
+    // Structural: VSF magic + the 58-byte-header "VICE Version" marker at offset 37.
+    data.len() >= VICE_VERSION_OFF + VICE_VERSION_MARKER.len()
+        && data.len() >= VSF_MAGIC.len()
+        && &data[0..VSF_MAGIC.len()] == VSF_MAGIC
+        && &data[VICE_VERSION_OFF..VICE_VERSION_OFF + VICE_VERSION_MARKER.len()] == VICE_VERSION_MARKER
+}
+
+/// Walk the real-VICE module list and return EVERY module name present (Spec 791.3
+/// "walk ALL modules"). Mirrors `vice_find_module`'s size-includes-header walk.
+fn vice_walk_modules(data: &[u8]) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut off = VICE_HEADER_LEN;
+    while off + VICE_MOD_HEADER_LEN <= data.len() {
+        let raw = &data[off..off + VICE_MOD_NAME_LEN];
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(VICE_MOD_NAME_LEN);
+        let mname = std::str::from_utf8(&raw[..end]).unwrap_or("").to_string();
+        let size = match read_u32_le(data, off + 18) {
+            Some(s) => s as usize,
+            None => break,
+        };
+        if size < VICE_MOD_HEADER_LEN {
+            break; // malformed — same guard as vice_find_module
+        }
+        if !mname.is_empty() {
+            names.push(mname);
+        }
+        off += size;
+    }
+    names
+}
+
 /// Parse a real-VICE x64sc .vsf and inject the recoverable machine state into
 /// `machine`. Returns the modules that were parsed (loaded) and those skipped.
 fn load_vice_vsf(machine: &mut Machine, data: &[u8]) -> Result<VsfLoadResult, String> {
@@ -650,9 +786,11 @@ fn load_vice_vsf(machine: &mut Machine, data: &[u8]) -> Result<VsfLoadResult, St
     match vice_find_module(data, "MAINCPU") {
         Some(m) if m.data_len >= 15 => {
             let d = &data[m.data_start..m.data_start + m.data_len];
-            // CLK is an 8-byte SMW_CLOCK; we keep only the low 32 bits (the engine
-            // clock is session-local and only needs a consistent baseline).
-            let clk = read_u32_le(d, 0).unwrap_or(0) as u64;
+            // CLK is an 8-byte SMW_CLOCK. Spec 791.1 — import the FULL 64-bit clock
+            // (TRX64's engine clock is a monotonic JS-safe u64, Spec 743). Previously
+            // only the low 32 bits came in, so a snapshot taken past the 32-bit wrap
+            // (~72 min of PAL runtime) resumed with a truncated clock baseline.
+            let clk = read_u64_le(d, 0).unwrap_or(0);
             let a = d[8];
             let x = d[9];
             let y = d[10];
@@ -807,8 +945,10 @@ fn load_vice_vsf(machine: &mut Machine, data: &[u8]) -> Result<VsfLoadResult, St
 /// real-VICE parser (`load_vice_vsf`). c64re-own snapshots fall through to the
 /// compact module-by-module parser.
 pub fn load_vsf(machine: &mut Machine, data: &[u8]) -> Result<VsfLoadResult, String> {
-    // VICE detection: a "SIDEXTENDED" module name ⟹ a genuine VICE 3.7+ file.
-    if data.windows(VICE_MARKER.len()).any(|w| w == VICE_MARKER) {
+    // VICE detection (Spec 791.4): the 58-byte-header "VICE Version" fingerprint +
+    // module structure, OR the fast-path "SIDEXTENDED" module name (c64re never
+    // writes it). A c64re-own snapshot falls through to the compact parser below.
+    if is_native_vice_vsf(data) {
         return load_vice_vsf(machine, data);
     }
 
@@ -904,6 +1044,85 @@ pub fn load_vsf(machine: &mut Machine, data: &[u8]) -> Result<VsfLoadResult, Str
         errors,
         source: "c64re",
     })
+}
+
+// ── Fidelity-reporting load (Spec 791.3 — the converter's entry) ────────────────
+
+/// Walk the c64re-own module list and return EVERY module name present. Mirrors the
+/// `load_vsf` compact parse loop (null-terminated name + size EXCLUDES header).
+fn c64re_walk_modules(data: &[u8]) -> Vec<String> {
+    let mut names = Vec::new();
+    if data.len() < 19 + 2 + 4 || &data[0..19] != VSF_MAGIC {
+        return names;
+    }
+    let name_start = 21;
+    let name_end = data[name_start..]
+        .iter()
+        .position(|&b| b == 0)
+        .map(|p| name_start + p + 1)
+        .unwrap_or(name_start + 1);
+    let mut cursor = name_end;
+    while cursor < data.len() {
+        let name_null = match data[cursor..].iter().position(|&b| b == 0) {
+            Some(p) => cursor + p,
+            None => break,
+        };
+        let mod_name = std::str::from_utf8(&data[cursor..name_null]).unwrap_or("?").to_string();
+        cursor = name_null + 1;
+        if cursor + 6 > data.len() {
+            break;
+        }
+        cursor += 2; // major/minor
+        let mod_len = match read_u32_le(data, cursor) {
+            Some(v) => v as usize,
+            None => break,
+        };
+        cursor += 4;
+        if cursor + mod_len > data.len() {
+            break;
+        }
+        cursor += mod_len;
+        names.push(mod_name);
+    }
+    names
+}
+
+/// Bucket present modules into loaded/coarse/absent and classify (Spec 791.3).
+/// `coarse` is empty in slice 1 (no approximate restores yet — Spec 791.1b adds the
+/// coarse VIC). A present module counts as loaded when its (normalized) name is in
+/// `loaded`; the real-VICE VIC pipeline module ("VIC-IISC") normalizes to the loaded
+/// head "VIC-II", so the register-head restore is NOT double-listed as absent.
+fn build_report(source: &'static str, loaded: &[String], present: &[String]) -> VsfLoadReport {
+    let loaded: Vec<String> = loaded.to_vec();
+    let is_loaded = |name: &str| -> bool {
+        loaded.iter().any(|m| m == name)
+            || ((name == "VIC-IISC" || name == "VIC-II") && loaded.iter().any(|m| m == "VIC-II"))
+    };
+    let mut absent: Vec<String> = Vec::new();
+    for m in present {
+        if !is_loaded(m) && !absent.contains(m) {
+            absent.push(m.clone());
+        }
+    }
+    let coarse: Vec<String> = Vec::new();
+    let fidelity = classify_fidelity(&loaded, &coarse, &absent);
+    VsfLoadReport { loaded, coarse, absent, fidelity, source }
+}
+
+/// Load a VSF and return the Spec 791.3 fidelity report (loaded / coarse / absent +
+/// `Fidelity`) instead of the bare `errors=[]` list — the honesty-fixed entry the
+/// `trx64cli convert-vsf` converter uses. `load_vsf` stays for back-compat callers
+/// that only need the restored machine + loaded-module list.
+pub fn load_vsf_report(machine: &mut Machine, data: &[u8]) -> Result<VsfLoadReport, String> {
+    if is_native_vice_vsf(data) {
+        let result = load_vice_vsf(machine, data)?;
+        let present = vice_walk_modules(data);
+        Ok(build_report(result.source, &result.loaded_modules, &present))
+    } else {
+        let result = load_vsf(machine, data)?;
+        let present = c64re_walk_modules(data);
+        Ok(build_report(result.source, &result.loaded_modules, &present))
+    }
 }
 
 #[cfg(test)]
@@ -1030,5 +1249,180 @@ mod tests {
         assert_eq!(ser_iecbus(&m).len(), 6, "IECBUS");
         assert_eq!(ser_vicii(&m).len(), 108, "VIC-II");
         assert_eq!(ser_keyboard(&m).len(), 6, "KEYBOARD");
+    }
+
+    // ── Spec 791 — synthetic real-VICE VSF builders (no copyrighted sample needed) ─
+    //
+    // A minimal but structurally-genuine VICE x64sc snapshot: the 58-byte header
+    // ("VICE Version\x1a" fingerprint) + 22-byte-per-module framing (size INCLUDES
+    // the header). Enough for the loader + the fidelity classifier to exercise their
+    // real paths without a copyrighted game snapshot.
+
+    /// The 58-byte real-VICE file header.
+    fn vice_header() -> Vec<u8> {
+        let mut h = Vec::new();
+        h.extend_from_slice(VSF_MAGIC); // 19
+        h.push(2);
+        h.push(0); // major/minor
+        let mut mach = [0u8; 16];
+        mach[..5].copy_from_slice(b"C64SC");
+        h.extend_from_slice(&mach); // 16
+        h.extend_from_slice(VICE_VERSION_MARKER); // "VICE Version\x1a" (13)
+        h.extend_from_slice(&[3, 7, 0, 0, 0, 0, 0, 0]); // rc/svn (8)
+        assert_eq!(h.len(), VICE_HEADER_LEN, "real-VICE header is 58 bytes");
+        h
+    }
+
+    /// Append a real-VICE module (16-byte name, major, minor, 4-byte size that
+    /// INCLUDES the 22-byte header, then `data`).
+    fn push_vice_module(buf: &mut Vec<u8>, name: &str, data: &[u8]) {
+        let mut nm = [0u8; VICE_MOD_NAME_LEN];
+        let n = name.len().min(VICE_MOD_NAME_LEN);
+        nm[..n].copy_from_slice(&name.as_bytes()[..n]);
+        buf.extend_from_slice(&nm);
+        buf.push(1);
+        buf.push(0); // major/minor
+        push_u32_le(buf, (VICE_MOD_HEADER_LEN + data.len()) as u32);
+        buf.extend_from_slice(data);
+    }
+
+    /// A MAINCPU v1.4 module body: CLK[0..8], A[8], X[9], Y[10], SP[11],
+    /// PC[12..14], STATUS[14]. `clk` is the FULL 64-bit SMW_CLOCK.
+    fn vice_maincpu(clk: u64, pc: u16) -> Vec<u8> {
+        let mut d = Vec::new();
+        for i in 0..8 {
+            d.push(((clk >> (i * 8)) & 0xff) as u8);
+        }
+        d.push(0x11); // A
+        d.push(0x22); // X
+        d.push(0x33); // Y
+        d.push(0xfd); // SP
+        d.push((pc & 0xff) as u8);
+        d.push((pc >> 8) as u8);
+        d.push(0x24); // STATUS (I set)
+        d
+    }
+
+    /// A C64MEM v0.1 module body: pport.data[0], pport.dir[1], exrom[2], game[3],
+    /// RAM[4..4+65536]. Places `loop_at`: SEI; JMP loop_at so a resume spins in RAM
+    /// (never warm-starts), with the CPU port set to all-RAM ($34) so the loop runs.
+    fn vice_c64mem(loop_at: u16) -> Vec<u8> {
+        let mut d = vec![0x34, 0x2f, 1, 1]; // pport.data=$34 (all-RAM), dir=$2f, exrom, game
+        let mut ram = vec![0u8; 65536];
+        let a = loop_at as usize;
+        ram[a] = 0x78; // SEI
+        ram[a + 1] = 0x4c; // JMP abs
+        ram[a + 2] = (loop_at & 0xff) as u8;
+        ram[a + 3] = (loop_at >> 8) as u8;
+        ram[0x4000] = 0xa5; // a RAM spot-check marker
+        d.extend_from_slice(&ram);
+        d
+    }
+
+    /// Full 64-bit MAINCPU clock (Spec 791.1): a clock past the 32-bit wrap must
+    /// import WHOLE, not truncated to the low 32 bits.
+    #[test]
+    fn maincpu_full_64bit_clock_imported() {
+        let clk: u64 = 0x0000_0001_2345_6789; // high dword non-zero
+        let mut vsf = vice_header();
+        push_vice_module(&mut vsf, "MAINCPU", &vice_maincpu(clk, 0xc000));
+        push_vice_module(&mut vsf, "C64MEM", &vice_c64mem(0xc000));
+        let mut m = Machine::new();
+        let report = load_vsf_report(&mut m, &vsf).expect("load report");
+        assert_eq!(report.source, "vice-x64sc");
+        assert_eq!(m.c64_core.clk, clk, "full 64-bit clock imported (not truncated)");
+        assert_eq!(m.cpu6510.clk, clk, "cpu6510 clock mirror");
+        assert_eq!(m.c64_core.reg_pc, 0xc000, "PC restored");
+    }
+
+    /// Native-VSF detection by header structure (Spec 791.4): a real VICE header with
+    /// NO "SIDEXTENDED" module is still detected + routed to the VICE parser.
+    #[test]
+    fn native_detection_by_header_not_only_marker() {
+        let mut vsf = vice_header();
+        push_vice_module(&mut vsf, "MAINCPU", &vice_maincpu(1000, 0xc000));
+        push_vice_module(&mut vsf, "C64MEM", &vice_c64mem(0xc000));
+        assert!(is_native_vice_vsf(&vsf), "structural detector fires without SIDEXTENDED");
+        let mut m = Machine::new();
+        let r = load_vsf_report(&mut m, &vsf).expect("load");
+        assert_eq!(r.source, "vice-x64sc", "routed to the real-VICE parser");
+    }
+
+    /// Fidelity classification (Spec 791.3): a disk-game-shaped VSF carrying a DRIVE8
+    /// module we do NOT restore ⇒ `Partial` with DRIVE8 in `absent` — NOT `Faithful`,
+    /// NOT the old `errors=[]` footgun.
+    #[test]
+    fn fidelity_partial_when_drive8_dropped() {
+        let mut vsf = vice_header();
+        push_vice_module(&mut vsf, "MAINCPU", &vice_maincpu(50_000, 0xc000));
+        push_vice_module(&mut vsf, "C64MEM", &vice_c64mem(0xc000));
+        // The drive modules a real disk-game VSF carries — present, but slice 1 does
+        // not restore them.
+        push_vice_module(&mut vsf, "DRIVE8", &[0u8; 8]);
+        push_vice_module(&mut vsf, "DRIVECPU0", &[0u8; 8]);
+        push_vice_module(&mut vsf, "1541VIA1D0", &[0u8; 8]);
+
+        let mut m = Machine::new();
+        let report = load_vsf_report(&mut m, &vsf).expect("load report");
+
+        assert_eq!(report.fidelity, Fidelity::Partial, "critical DRIVE8 dropped ⇒ Partial");
+        assert_ne!(report.fidelity, Fidelity::Faithful, "must NOT read as faithful");
+        assert!(report.absent.iter().any(|s| s == "DRIVE8"), "DRIVE8 in absent: {:?}", report.absent);
+        assert!(report.loaded.iter().any(|s| s == "MAINCPU"), "MAINCPU loaded");
+        assert!(report.loaded.iter().any(|s| s == "C64MEM"), "C64MEM loaded");
+        // The report REPLACES the errors=[] signal: fidelity is an explicit verdict.
+        assert_eq!(report.fidelity.as_str(), "partial");
+    }
+
+    /// Fidelity classification (Spec 791.3): a machine-state-core-only VSF (CPU, RAM,
+    /// CIA, SID, VIC — no drive, no cart) restores fully ⇒ `Faithful`.
+    #[test]
+    fn fidelity_faithful_when_core_only() {
+        let mut vsf = vice_header();
+        push_vice_module(&mut vsf, "MAINCPU", &vice_maincpu(50_000, 0xc000));
+        push_vice_module(&mut vsf, "C64MEM", &vice_c64mem(0xc000));
+        push_vice_module(&mut vsf, "CIA1", &[0u8; 24]); // >= 20 bytes
+        push_vice_module(&mut vsf, "CIA2", &[0u8; 24]);
+        // SID: num_sids/sound/engine/model + 32 regs (>= 36 bytes).
+        push_vice_module(&mut vsf, "SID", &[0u8; 40]);
+        // VIC-IISC: model[0] + 64 regs (>= 65 bytes) — the register head we restore.
+        push_vice_module(&mut vsf, "VIC-IISC", &[0u8; 96]);
+
+        let mut m = Machine::new();
+        let report = load_vsf_report(&mut m, &vsf).expect("load report");
+        assert_eq!(report.fidelity, Fidelity::Faithful, "full core, nothing critical: {report:?}");
+        assert!(report.absent.is_empty(), "nothing absent: {:?}", report.absent);
+        assert!(report.coarse.is_empty(), "coarse empty in slice 1");
+        // The VIC-IISC head is credited to the loaded "VIC-II", not double-listed absent.
+        assert!(report.loaded.iter().any(|s| s == "VIC-II"), "VIC head loaded");
+    }
+
+    /// Inspection-only: a VSF with no resumable core (no MAINCPU/C64MEM) — only an
+    /// inspectable module — classifies `InspectionOnly`, never `Faithful`.
+    #[test]
+    fn fidelity_inspection_only_without_core() {
+        let mut vsf = vice_header();
+        push_vice_module(&mut vsf, "SID", &[0u8; 40]);
+        // A SIDEXTENDED module forces VICE routing even without a core.
+        push_vice_module(&mut vsf, "SIDEXTENDED", &[0u8; 4]);
+        let mut m = Machine::new();
+        let report = load_vsf_report(&mut m, &vsf).expect("load report");
+        assert_eq!(report.fidelity, Fidelity::InspectionOnly, "no CPU/RAM ⇒ inspection-only");
+        assert_ne!(report.fidelity, Fidelity::Faithful);
+    }
+
+    /// The c64re-own round-trip stays `Faithful` (save_vsf writes the full core), and
+    /// `load_vsf_report` classifies it without regressing the compact parser.
+    #[test]
+    fn c64re_own_roundtrip_reports_faithful() {
+        let mut m = Machine::new();
+        m.cpu6510.reg_pc = 0x0810;
+        m.ram[0x1000] = 0x5a;
+        let bytes = save_vsf(&mut m);
+        let mut m2 = Machine::new();
+        let report = load_vsf_report(&mut m2, &bytes).expect("load report");
+        assert_eq!(report.source, "c64re");
+        assert_eq!(report.fidelity, Fidelity::Faithful, "c64re-own full-core save ⇒ faithful: {report:?}");
+        assert_eq!(m2.ram[0x1000], 0x5a);
     }
 }
