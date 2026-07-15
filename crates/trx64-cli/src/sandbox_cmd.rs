@@ -109,6 +109,61 @@ fn parse_byte(s: &str) -> Result<u8, String> {
     }
 }
 
+/// Parse a run of hex bytes: `"a0b1c2"`, or space/comma-separated tokens each
+/// optionally `$`/`0x`-prefixed (`"$a0 b1 0xc2"`). Whitespace and commas are
+/// separators; the concatenated nibbles must be an even count. Used by
+/// `--stream-hex` and `--load-hex` (mirrors the tool's inline `hex_bytes`).
+fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, String> {
+    let mut hexstr = String::new();
+    for tok in s.split(|c: char| c.is_whitespace() || c == ',') {
+        if tok.is_empty() {
+            continue;
+        }
+        let t = tok.strip_prefix("0x").or_else(|| tok.strip_prefix('$')).unwrap_or(tok);
+        hexstr.push_str(t);
+    }
+    if hexstr.len() % 2 != 0 {
+        return Err(format!("bad hex bytes '{s}' (odd nibble count)"));
+    }
+    let mut out = Vec::with_capacity(hexstr.len() / 2);
+    let mut i = 0;
+    while i < hexstr.len() {
+        let pair = &hexstr[i..i + 2];
+        out.push(u8::from_str_radix(pair, 16).map_err(|_| format!("bad hex byte '{pair}' in '{s}'"))?);
+        i += 2;
+    }
+    Ok(out)
+}
+
+/// Parse `ADDR=<hexbytes>` for `--load-hex` — an inline byte load at ADDR (ADDR
+/// hex). Same target/semantics as `--load` but without a temp file.
+fn parse_load_hex(s: &str) -> Result<(u16, Vec<u8>), String> {
+    let (a, v) = s
+        .split_once('=')
+        .ok_or_else(|| format!("bad --load-hex '{s}' (want ADDR=<hexbytes>, e.g. $4000=a2ff8d)"))?;
+    let addr = parse_addr(a)?;
+    let bytes = parse_hex_bytes(v)?;
+    if bytes.is_empty() {
+        return Err(format!("--load-hex '{s}': empty byte list"));
+    }
+    Ok((addr, bytes))
+}
+
+/// The RTS a stream-hook synthesises: pull the 16-bit return address off the stack
+/// (LIFO: PCL then PCH), bump SP by 2, return `addr + 1` = the resume PC. Matches
+/// `cpu6502.ts` pop()/step() (lines 110-113, 163-164): `sp+=1; lo=stack[sp];
+/// sp+=1; hi=stack[sp]; ret=((hi<<8)|lo)+1`. The stack page ($0100-$01FF) is
+/// always RAM regardless of banking, so we read `m.ram` directly.
+fn rts_pop(m: &mut Machine) -> u16 {
+    let mut sp = m.c64_core.reg_sp;
+    sp = sp.wrapping_add(1);
+    let lo = m.ram[0x0100 | sp as usize] as u16;
+    sp = sp.wrapping_add(1);
+    let hi = m.ram[0x0100 | sp as usize] as u16;
+    m.c64_core.reg_sp = sp;
+    ((hi << 8) | lo).wrapping_add(1)
+}
+
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -154,9 +209,14 @@ pub struct SandboxArgs {
     /// Optional disk to attach on the cold machine (for a drive-reading routine).
     pub disk: Option<String>,
     pub loads: Vec<SandboxLoad>,
+    /// Inline hex loads (`--load-hex $ADDR=<hex>`), applied like `--load` but from
+    /// literal bytes (mirrors the tool's `hex_bytes` load option).
+    pub load_hex: Vec<(u16, Vec<u8>)>,
     pub entry: u16,
-    pub harvest_addr: u16,
-    pub harvest_len: usize,
+    /// Harvest ranges (repeatable `--harvest ADDR:LEN`). The FIRST is the primary
+    /// range echoed in the text output + the back-compat `harvest` JSON field; all
+    /// are returned in `harvests`.
+    pub harvests: Vec<(u16, usize)>,
     pub zp: Vec<(u16, u8)>,
     pub sentinel: Option<u16>,
     pub io: u8,
@@ -173,6 +233,14 @@ pub struct SandboxArgs {
     pub reg_y: Option<u8>,
     pub reg_sp: Option<u8>,
     pub reg_p: Option<u8>,
+    /// Byte stream fed to `--stream-hook` PCs (ported from `sandbox-runner.ts`
+    /// `inputStream`, line 51/132). The concatenation of `--stream <file>` then
+    /// `--stream-hex`.
+    pub stream: Vec<u8>,
+    /// PCs that, when reached, synthesise "A = next stream byte; C = 0; RTS"
+    /// instead of executing (ported from `cpu6502.ts` step() hook, lines 148-168,
+    /// + `sandbox-runner.ts` `streamHookPcs`, line 52/133).
+    pub stream_hooks: Vec<u16>,
     pub json: bool,
 }
 
@@ -198,8 +266,9 @@ pub fn run_sandbox_cli(
     cart_type: Option<&str>,
     disk: Option<&str>,
     load: &[String],
+    load_hex: &[String],
     entry: u16,
-    harvest: &str,
+    harvest: &[String],
     zp: &[String],
     sentinel: Option<u16>,
     io: Option<&str>,
@@ -212,10 +281,27 @@ pub fn run_sandbox_cli(
     reg_y: Option<&str>,
     reg_sp: Option<&str>,
     reg_p: Option<&str>,
+    stream_file: Option<&str>,
+    stream_hex: Option<&str>,
+    stream_hook: &[String],
     json: bool,
 ) -> Result<String, String> {
     let loads = load.iter().map(|s| parse_load(s)).collect::<Result<Vec<_>, _>>()?;
-    let (harvest_addr, harvest_len) = parse_harvest(harvest)?;
+    let load_hex = load_hex.iter().map(|s| parse_load_hex(s)).collect::<Result<Vec<_>, _>>()?;
+    let harvests = harvest.iter().map(|s| parse_harvest(s)).collect::<Result<Vec<_>, _>>()?;
+    if harvests.is_empty() {
+        return Err("at least one --harvest ADDR:LEN is required".to_string());
+    }
+    let stream_hooks = stream_hook.iter().map(|s| parse_addr(s)).collect::<Result<Vec<_>, _>>()?;
+    // Byte stream feed: `--stream <file>` bytes first, then `--stream-hex` bytes.
+    let mut stream: Vec<u8> = Vec::new();
+    if let Some(path) = stream_file {
+        let b = std::fs::read(path).map_err(|e| format!("read --stream {path}: {e}"))?;
+        stream.extend_from_slice(&b);
+    }
+    if let Some(hx) = stream_hex {
+        stream.extend_from_slice(&parse_hex_bytes(hx)?);
+    }
     let zp = zp.iter().map(|s| parse_zp(s)).collect::<Result<Vec<_>, _>>()?;
     let io = match io {
         // --io is always hex (unchanged from the original), e.g. `$37` / `37`.
@@ -236,9 +322,9 @@ pub fn run_sandbox_cli(
         cart_type: cart_type.map(|s| s.to_string()),
         disk: disk.map(|s| s.to_string()),
         loads,
+        load_hex,
         entry,
-        harvest_addr,
-        harvest_len,
+        harvests,
         zp,
         sentinel,
         io,
@@ -251,6 +337,8 @@ pub fn run_sandbox_cli(
         reg_y: opt_byte(reg_y, "reg-y")?,
         reg_sp: opt_byte(reg_sp, "reg-sp")?,
         reg_p: opt_byte(reg_p, "reg-p")?,
+        stream,
+        stream_hooks,
         json,
     })
 }
@@ -334,8 +422,13 @@ struct SandboxOutcome {
     final_y: u8,
     final_sp: u8,
     final_p: u8,
+    /// The FIRST harvest range's addr + bytes (back-compat: the single `harvest`).
     harvest_addr: u16,
     harvest: Vec<u8>,
+    /// ALL harvest ranges (`--harvest` repeatable): (addr, bytes).
+    harvests: Vec<(u16, Vec<u8>)>,
+    /// Stream bytes consumed by `--stream-hook` fires (TS `SandboxRunResult.streamPos`).
+    stream_pos: usize,
 }
 
 pub fn run_sandbox(args: &SandboxArgs) -> Result<String, String> {
@@ -434,6 +527,12 @@ pub fn run_sandbox(args: &SandboxArgs) -> Result<String, String> {
         m.poke(addr, body);
     }
 
+    // Inline hex loads (`--load-hex $ADDR=<hex>`): same target/semantics as --load,
+    // from literal bytes (no temp file).
+    for (addr, body) in &args.load_hex {
+        m.poke(*addr, body);
+    }
+
     let outcome = execute_sandbox(&mut m, args);
 
     if args.json {
@@ -459,11 +558,21 @@ pub fn run_sandbox(args: &SandboxArgs) -> Result<String, String> {
                 "sp": outcome.final_sp,
                 "p": outcome.final_p,
             },
+            // Stream-hook progress (TS SandboxRunResult.streamPos) — bytes fed to
+            // the --stream-hook PCs.
+            "streamPos": outcome.stream_pos,
+            // Back-compat: the FIRST harvest range as a single object.
             "harvest": {
                 "addr": outcome.harvest_addr,
                 "len": outcome.harvest.len(),
                 "hex": hex(&outcome.harvest),
             },
+            // ALL harvest ranges (--harvest repeatable).
+            "harvests": outcome
+                .harvests
+                .iter()
+                .map(|(addr, bytes)| json!({ "addr": addr, "len": bytes.len(), "hex": hex(bytes) }))
+                .collect::<Vec<_>>(),
         });
         serde_json::to_string(&out).map_err(|e| e.to_string())
     } else {
@@ -478,8 +587,26 @@ pub fn run_sandbox(args: &SandboxArgs) -> Result<String, String> {
                 outcome.runs.iter().map(|(lo, hi)| format!("${lo:04x}..${hi:04x}")).collect();
             format!(" runs=[{}]", parts.join(","))
         };
+        // Show streamPos when stream-hooks were in play (either bytes fed or an
+        // exhausted stop).
+        let stream = if outcome.stream_pos > 0 || outcome.stop_reason == "stream_exhausted" {
+            format!(" streamPos={}", outcome.stream_pos)
+        } else {
+            String::new()
+        };
+        // Show every harvest range when more than one was requested.
+        let harvests = if outcome.harvests.len() > 1 {
+            let parts: Vec<String> = outcome
+                .harvests
+                .iter()
+                .map(|(addr, bytes)| format!("${:04x}..+{}={}", addr, bytes.len(), hex(bytes)))
+                .collect();
+            format!("  harvests=[{}]", parts.join(", "))
+        } else {
+            String::new()
+        };
         Ok(format!(
-            "sandbox: stop={} pc=${:04x} cycles={} steps={} a=${:02x} x=${:02x} y=${:02x} sp=${:02x} p=${:02x}{span}{runs}  harvest ${:04x}..+{} = {}",
+            "sandbox: stop={} pc=${:04x} cycles={} steps={} a=${:02x} x=${:02x} y=${:02x} sp=${:02x} p=${:02x}{span}{runs}{stream}  harvest ${:04x}..+{} = {}{harvests}",
             outcome.stop_reason,
             outcome.pc,
             outcome.cycles,
@@ -569,18 +696,112 @@ fn execute_sandbox(m: &mut Machine, args: &SandboxArgs) -> SandboxOutcome {
     if let Some(extra) = args.sentinel {
         bp.insert(extra);
     }
+    // Stream-hook PCs also break at the boundary BEFORE execute — the same
+    // "small set lookup per step" the breakpoint gate already performs
+    // (run_for_full_capped_dbg checks the bp set per instruction). When one fires
+    // we synthesise the get_byte return instead of running the routine there.
+    let hook_pcs: HashSet<u16> = args.stream_hooks.iter().copied().collect();
+    for &h in &hook_pcs {
+        bp.insert(h);
+    }
 
     let clk0 = m.c64_core.clk;
     let mut obs = SandboxObs::new();
-    let stop = m.run_for_full_capped_dbg(
-        args.cyc_cap,
-        args.instr_cap,
-        Some(&bp),
-        None,
-        None,
-        &mut obs,
-        |_, _, _, _, _, _, _| {},
-    );
+
+    // Drive the run loop, servicing stream-hooks between segments. The caps
+    // (cyc_cap / instr_cap) are tracked cumulatively so many hook re-entries still
+    // honour them. With no hooks this loop makes exactly one run call and the
+    // behaviour is byte-identical to the pre-stream-hook single-call path.
+    let mut cyc_remaining = args.cyc_cap;
+    let mut instr_remaining = args.instr_cap;
+    let mut prev_steps = 0u64;
+    let mut stream_pos = 0usize;
+
+    // Stop-reason vocab → the TS `StopReason` the C64RE depack harvest expects
+    // (sandbox-runner.ts:138 / sandbox-depack-generic.ts:109):
+    //   * RunStop::Breakpoint at the RTS-sentinel landing  → "sentinel_rts"
+    //     (top-level RTS: stub `jmp self`, or direct-entry $FFFE).
+    //   * RunStop::Breakpoint at any OTHER bp (--sentinel / explicit stop-PC)
+    //                                                       → "stop_pc"
+    //   * a stream-hook fire with no bytes left             → "stream_exhausted"
+    //     (cpu6502.ts:157).
+    //   * RunStop::CycleBudget (cycle cap) OR ::Completed (instruction cap) OR
+    //     ::Observer                                        → "max_steps" (cap-out).
+    let stop_reason: &'static str;
+    let ok: bool;
+    loop {
+        let seg_clk0 = m.c64_core.clk;
+        let stop = m.run_for_full_capped_dbg(
+            cyc_remaining,
+            instr_remaining,
+            Some(&bp),
+            None,
+            None,
+            &mut obs,
+            |_, _, _, _, _, _, _| {},
+        );
+        cyc_remaining = cyc_remaining.saturating_sub(m.c64_core.clk.wrapping_sub(seg_clk0));
+        instr_remaining = instr_remaining.saturating_sub(obs.steps - prev_steps);
+        prev_steps = obs.steps;
+
+        match stop {
+            RunStop::Breakpoint(pc) if hook_pcs.contains(&pc) => {
+                // Stream-hook fire — reproduce cpu6502.ts step() (lines 148-168):
+                //   * bytes left → A = next stream byte, N/Z per A, C = 0
+                //     ("byte OK"), then RTS; keep running.
+                //   * exhausted  → A = 0, C = 0 (no N/Z update), then RTS; stop
+                //     with `stream_exhausted`.
+                // In BOTH branches an RTS that lands on the staged sentinel ends as
+                // `sentinel_rts` (the TS `ret === 0xfffe` guard, lines 155/165).
+                if stream_pos >= args.stream.len() {
+                    m.c64_core.reg_a = 0;
+                    m.c64_core.reg_p &= !0x01; // clear carry (P bit 0)
+                    let ret = rts_pop(m);
+                    m.c64_core.reg_pc = ret;
+                    m.cpu6510.reg_pc = ret;
+                    if ret == sentinel_landing {
+                        stop_reason = "sentinel_rts";
+                        ok = true;
+                    } else {
+                        stop_reason = "stream_exhausted";
+                        ok = false;
+                    }
+                    break;
+                }
+                let b = args.stream[stream_pos];
+                stream_pos += 1;
+                m.c64_core.reg_a = b;
+                m.c64_core.flag_n = b & 0x80; // setNZ: N = bit 7
+                m.c64_core.flag_z = if b == 0 { 0 } else { 1 }; // setNZ: Z (0 iff set)
+                m.c64_core.reg_p &= !0x01; // C = 0 ("byte OK")
+                let ret = rts_pop(m);
+                m.c64_core.reg_pc = ret;
+                m.cpu6510.reg_pc = ret;
+                if ret == sentinel_landing {
+                    stop_reason = "sentinel_rts";
+                    ok = true;
+                    break;
+                }
+                // else: keep running from `ret` (next loop iteration).
+            }
+            RunStop::Breakpoint(pc) if pc == sentinel_landing => {
+                stop_reason = "sentinel_rts";
+                ok = true;
+                break;
+            }
+            RunStop::Breakpoint(_) => {
+                stop_reason = "stop_pc";
+                ok = true;
+                break;
+            }
+            RunStop::CycleBudget | RunStop::Completed | RunStop::Observer => {
+                stop_reason = "max_steps";
+                ok = false;
+                break;
+            }
+        }
+    }
+
     let cycles = m.c64_core.clk.wrapping_sub(clk0);
     let steps = obs.steps;
     let written_span = match (obs.write_lo, obs.write_hi) {
@@ -589,25 +810,18 @@ fn execute_sandbox(m: &mut Machine, args: &SandboxArgs) -> SandboxOutcome {
     };
     let runs = obs.runs();
 
-    // Stop-reason vocab → the TS `StopReason` the C64RE depack harvest expects
-    // (sandbox-runner.ts:138 / sandbox-depack-generic.ts:109):
-    //   * RunStop::Breakpoint at the RTS-sentinel landing  → "sentinel_rts"
-    //     (top-level RTS: stub `jmp self`, or direct-entry $FFFE).
-    //   * RunStop::Breakpoint at any OTHER bp (--sentinel / explicit stop-PC)
-    //                                                       → "stop_pc"
-    //   * RunStop::CycleBudget (cycle cap) OR ::Completed (instruction cap) OR
-    //     ::Observer                                        → "max_steps" (cap-out).
-    let stop_reason = match stop {
-        RunStop::Breakpoint(pc) if pc == sentinel_landing => "sentinel_rts",
-        RunStop::Breakpoint(_) => "stop_pc",
-        RunStop::CycleBudget | RunStop::Completed | RunStop::Observer => "max_steps",
-    };
-    let ok = matches!(stop, RunStop::Breakpoint(_));
-
-    // Harvest the raw RAM slice (ignores banking = the unpacked bytes as written).
-    let start = args.harvest_addr as usize;
-    let end = (start + args.harvest_len).min(0x1_0000);
-    let harvest = m.ram[start..end].to_vec();
+    // Harvest every requested range (raw RAM slice = the unpacked bytes as written,
+    // ignoring banking). The first range is the back-compat single `harvest`.
+    let harvests: Vec<(u16, Vec<u8>)> = args
+        .harvests
+        .iter()
+        .map(|&(addr, len)| {
+            let start = addr as usize;
+            let end = (start + len).min(0x1_0000);
+            (addr, m.ram[start..end].to_vec())
+        })
+        .collect();
+    let (harvest_addr, harvest) = harvests.first().cloned().unwrap_or((0, Vec::new()));
 
     SandboxOutcome {
         ok,
@@ -622,8 +836,10 @@ fn execute_sandbox(m: &mut Machine, args: &SandboxArgs) -> SandboxOutcome {
         final_y: m.c64_core.reg_y,
         final_sp: m.c64_core.reg_sp,
         final_p: m.c64_core.status(),
-        harvest_addr: args.harvest_addr,
+        harvest_addr,
         harvest,
+        harvests,
+        stream_pos,
     }
 }
 
@@ -664,6 +880,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_hex_bytes_variants() {
+        assert_eq!(parse_hex_bytes("a0b1c2").unwrap(), vec![0xa0, 0xb1, 0xc2]);
+        assert_eq!(parse_hex_bytes("$a0 b1 0xc2").unwrap(), vec![0xa0, 0xb1, 0xc2]);
+        assert_eq!(parse_hex_bytes("de,ad,be,ef").unwrap(), vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(parse_hex_bytes("").unwrap(), Vec::<u8>::new());
+        assert!(parse_hex_bytes("abc").is_err(), "odd nibble count");
+        assert!(parse_hex_bytes("zz").is_err(), "not hex");
+    }
+
+    #[test]
+    fn parse_load_hex_ok_and_err() {
+        assert_eq!(parse_load_hex("$4000=a2ff8d").unwrap(), (0x4000, vec![0xa2, 0xff, 0x8d]));
+        assert_eq!(parse_load_hex("c000=60").unwrap(), (0xc000, vec![0x60]));
+        assert!(parse_load_hex("$4000=").is_err(), "empty byte list");
+        assert!(parse_load_hex("nope").is_err(), "no '='");
+    }
+
+    #[test]
     fn contiguous_runs_splits_on_gaps() {
         // Two runs + a singleton, sorted.
         let addrs = [0x4000u16, 0xe000, 0xe001, 0xe002, 0xe004, 0xe005];
@@ -698,9 +932,9 @@ mod tests {
             cart_type: None,
             disk: None,
             loads: Vec::new(),
+            load_hex: Vec::new(),
             entry: 0xc000,
-            harvest_addr: 0xc000,
-            harvest_len: 0,
+            harvests: Vec::new(),
             zp: Vec::new(),
             sentinel: None,
             io: DEFAULT_IO,
@@ -713,6 +947,8 @@ mod tests {
             reg_y: None,
             reg_sp: None,
             reg_p: None,
+            stream: Vec::new(),
+            stream_hooks: Vec::new(),
             json: false,
         }
     }
@@ -764,8 +1000,7 @@ mod tests {
         args.reg_sp = Some(0x80);
         args.reg_p = Some(0x25); // I set ⇒ IRQ-safe; unused+I+C = $25
         args.sentinel = Some(0xc015);
-        args.harvest_addr = 0x4000;
-        args.harvest_len = 6;
+        args.harvests = vec![(0x4000, 6)];
 
         let out = execute_sandbox(&mut m, &args);
         assert_eq!(out.stop_reason, "stop_pc", "explicit --sentinel ⇒ stop_pc");
@@ -815,8 +1050,7 @@ mod tests {
         args.entry = 0xc000;
         args.io = 0x34; // all-RAM: $E000 is RAM, so the STA lands + is harvestable
         args.direct_entry = true; // no reg seeds; use TS defaults (A/X/Y=0, SP=$fd)
-        args.harvest_addr = 0xe000;
-        args.harvest_len = 16;
+        args.harvests = vec![(0xe000, 16)];
 
         let out = execute_sandbox(&mut m, &args);
         assert_eq!(out.stop_reason, "sentinel_rts");
@@ -863,8 +1097,7 @@ mod tests {
         args.entry = 0xc000;
         args.io = 0x34;
         // direct_entry stays false, no reg seeds ⇒ stub path.
-        args.harvest_addr = 0x4000;
-        args.harvest_len = 4;
+        args.harvests = vec![(0x4000, 4)];
 
         assert!(!args.wants_direct_entry(), "must take the stub path");
         let out = execute_sandbox(&mut m, &args);
@@ -872,5 +1105,132 @@ mod tests {
         assert!(out.ok);
         assert_eq!(out.harvest, vec![0xee; 4]);
         assert_eq!(out.runs, vec![(0x4000, 0x4003)]);
+    }
+
+    /// The routine that JSRs a hooked get_byte PC N times, storing each returned A
+    /// to $4000+i. The `--stream-hook` mechanism (ported from cpu6502.ts step()
+    /// hook + sandbox-runner.ts streamHookPcs) feeds `--stream-hex` bytes: the
+    /// harvested bytes == the stream input, streamPos advances by N, and multi-range
+    /// `--harvest` returns each slice.
+    #[test]
+    fn stream_hook_feeds_bytes_and_advances_stream_pos() {
+        let Some(rom_dir) = rom_dir_or_skip() else { return };
+        let mut m = booted(&rom_dir);
+        // get_byte is at $c100 — it is HOOKED, so its body is never executed; the
+        // hook synthesises A = next stream byte + RTS. We still poke a real RTS
+        // there so a fresh-RAM/no-hook run would at least not JAM (defensive).
+        // c000: LDX #$00        A2 00
+        // c002: JSR $c100       20 00 C1   ; get_byte (hooked)
+        // c005: STA $4000,X     9D 00 40
+        // c008: INX             E8
+        // c009: CPX #$04        E0 04
+        // c00b: BNE $c002       D0 F5
+        // c00d: RTS             60          ; top-level ⇒ sentinel_rts
+        let routine = [
+            0xa2, 0x00, // LDX #$00
+            0x20, 0x00, 0xc1, // JSR $c100
+            0x9d, 0x00, 0x40, // STA $4000,X
+            0xe8, // INX
+            0xe0, 0x04, // CPX #$04
+            0xd0, 0xf5, // BNE $c002
+            0x60, // RTS
+        ];
+        m.poke(0xc000, &routine);
+        m.poke(0xc100, &[0x60]); // RTS body (never reached — hooked)
+
+        let mut args = base_args(rom_dir);
+        args.entry = 0xc000;
+        args.io = 0x34;
+        args.direct_entry = true;
+        args.stream_hooks = vec![0xc100];
+        args.stream = vec![0x11, 0x22, 0x33, 0x44];
+        // Two harvest ranges: the whole run + a sub-slice (multi-range --harvest).
+        args.harvests = vec![(0x4000, 4), (0x4002, 2)];
+
+        let out = execute_sandbox(&mut m, &args);
+        assert_eq!(out.stop_reason, "sentinel_rts", "top-level RTS after the loop");
+        assert!(out.ok);
+        // Harvested bytes == the --stream input, in order.
+        assert_eq!(out.harvest, vec![0x11, 0x22, 0x33, 0x44], "stored stream bytes");
+        // streamPos advanced by the 4 fed bytes.
+        assert_eq!(out.stream_pos, 4, "streamPos == bytes consumed");
+        // Multi-range harvest: both slices returned.
+        assert_eq!(out.harvests.len(), 2);
+        assert_eq!(out.harvests[0], (0x4000, vec![0x11, 0x22, 0x33, 0x44]));
+        assert_eq!(out.harvests[1], (0x4002, vec![0x33, 0x44]));
+        // Final A = last byte fed (get_byte set A, STA didn't change it).
+        assert_eq!(out.final_a, 0x44, "A holds the last streamed byte");
+    }
+
+    /// When a stream-hook fires with no bytes left, the run stops with
+    /// `stream_exhausted` (cpu6502.ts:157). Feed fewer bytes than get_byte calls.
+    #[test]
+    fn stream_hook_exhausted_stops() {
+        let Some(rom_dir) = rom_dir_or_skip() else { return };
+        let mut m = booted(&rom_dir);
+        // Same 4-iteration loop, but only 2 stream bytes → the 3rd get_byte
+        // exhausts the stream.
+        let routine = [
+            0xa2, 0x00, // LDX #$00
+            0x20, 0x00, 0xc1, // JSR $c100 (hooked)
+            0x9d, 0x00, 0x40, // STA $4000,X
+            0xe8, // INX
+            0xe0, 0x04, // CPX #$04
+            0xd0, 0xf5, // BNE $c002
+            0x60, // RTS
+        ];
+        m.poke(0xc000, &routine);
+        m.poke(0xc100, &[0x60]);
+
+        let mut args = base_args(rom_dir);
+        args.entry = 0xc000;
+        args.io = 0x34;
+        args.direct_entry = true;
+        args.stream_hooks = vec![0xc100];
+        args.stream = vec![0xaa, 0xbb]; // only 2 bytes for 4 calls
+        args.harvests = vec![(0x4000, 4)];
+
+        let out = execute_sandbox(&mut m, &args);
+        assert_eq!(out.stop_reason, "stream_exhausted", "3rd get_byte has no byte");
+        assert!(!out.ok);
+        assert_eq!(out.stream_pos, 2, "only the 2 available bytes were consumed");
+        // The two available bytes were stored before exhaustion; the 3rd store
+        // never ran (the hook stopped at the RTS boundary).
+        assert_eq!(out.harvest[0], 0xaa);
+        assert_eq!(out.harvest[1], 0xbb);
+    }
+
+    /// `--load-hex` inline load applies bytes exactly like `--load` (via run_sandbox,
+    /// the full file-I/O path), and multi-range `--harvest` shows in the JSON.
+    #[test]
+    fn load_hex_inline_and_multi_harvest_json() {
+        let Some(rom_dir) = rom_dir_or_skip() else { return };
+        // Routine loaded ONLY via --load-hex (no --load file): fill $4000..$4003
+        // with $cc, then RTS.
+        // c000: LDX #$00 / LDA #$cc / STA $4000,X / INX / CPX #$04 / BNE / RTS
+        let mut args = base_args(rom_dir);
+        args.entry = 0xc000;
+        args.io = 0x34;
+        args.direct_entry = true;
+        args.load_hex = vec![(
+            0xc000,
+            vec![0xa2, 0x00, 0xa9, 0xcc, 0x9d, 0x00, 0x40, 0xe8, 0xe0, 0x04, 0xd0, 0xf8, 0x60],
+        )];
+        args.harvests = vec![(0x4000, 2), (0x4002, 2)];
+        args.json = true;
+
+        let out = run_sandbox(&args).expect("run_sandbox");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(v["stopReason"], "sentinel_rts");
+        assert_eq!(v["streamPos"], 0, "no stream hooks used");
+        // Back-compat single harvest = first range.
+        assert_eq!(v["harvest"]["hex"], "cccc");
+        // All ranges present.
+        let harvests = v["harvests"].as_array().expect("harvests array");
+        assert_eq!(harvests.len(), 2);
+        assert_eq!(harvests[0]["addr"], 0x4000);
+        assert_eq!(harvests[0]["hex"], "cccc");
+        assert_eq!(harvests[1]["addr"], 0x4002);
+        assert_eq!(harvests[1]["hex"], "cccc");
     }
 }

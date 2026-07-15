@@ -117,12 +117,18 @@ enum Command {
         /// load-address header). Repeatable. Optional when --seed supplies the code.
         #[arg(long = "load")]
         load: Vec<String>,
+        /// Inline byte load: $ADDR=<hexbytes> (e.g. --load-hex '$4000=a2ff8d').
+        /// Repeatable. Like --load but from literal bytes (no temp file).
+        #[arg(long = "load-hex")]
+        load_hex: Vec<String>,
         /// Entry PC of the routine to call (hex).
         #[arg(long, value_parser = trx64_cli::disasm_cmd::parse_addr)]
         entry: u16,
         /// RAM range to harvest after the run: ADDR:LEN (LEN decimal or 0x-hex).
+        /// Repeatable — the first is the primary range echoed in text + the
+        /// back-compat `harvest` JSON field; all are returned in `harvests`.
         #[arg(long)]
-        harvest: String,
+        harvest: Vec<String>,
         /// Seed a zero-page byte before the run: ADDR=VAL (both hex). Repeatable —
         /// depackers take their src/dst pointers here (e.g. --zp $fb=$00 --zp $fc=$20).
         #[arg(long = "zp")]
@@ -164,6 +170,19 @@ enum Command {
         /// TS Cpu6502 power-on flags). Implies --direct-entry.
         #[arg(long = "reg-p")]
         reg_p: Option<String>,
+        /// Stream-hook PC (hex): when the routine reaches this PC, DON'T execute it —
+        /// inject A = next stream byte, clear carry, and RTS (ported from the TS
+        /// sandbox get_byte hook). Repeatable. Feed bytes with --stream / --stream-hex.
+        /// Works with both the stub path and --direct-entry.
+        #[arg(long = "stream-hook")]
+        stream_hook: Vec<String>,
+        /// File whose bytes feed the --stream-hook PCs, consumed in order.
+        #[arg(long)]
+        stream: Option<String>,
+        /// Inline hex bytes appended to the --stream-hook feed (e.g. --stream-hex
+        /// 'de ad be ef'). Applied after --stream.
+        #[arg(long = "stream-hex")]
+        stream_hex: Option<String>,
         /// Emit JSON instead of text.
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -227,15 +246,17 @@ fn main() {
 
     // ── Real-core sandbox one-shot (Spec 787 v1 + 788; own machine, no TUI) ─────
     if let Some(Command::Sandbox {
-        seed, cart, cart_type, disk, load, entry, harvest, zp, sentinel, io, stub_addr, cyc_cap,
-        instr_cap, direct_entry, reg_a, reg_x, reg_y, reg_sp, reg_p, json,
+        seed, cart, cart_type, disk, load, load_hex, entry, harvest, zp, sentinel, io, stub_addr,
+        cyc_cap, instr_cap, direct_entry, reg_a, reg_x, reg_y, reg_sp, reg_p, stream_hook, stream,
+        stream_hex, json,
     }) = &cli.cmd
     {
         match sandbox_cmd::run_sandbox_cli(
             &rom_dir, seed.as_deref(), cart.as_deref(), cart_type.as_deref(), disk.as_deref(), load,
-            *entry, harvest, zp, *sentinel, io.as_deref(), *stub_addr, *cyc_cap, *instr_cap,
-            *direct_entry, reg_a.as_deref(), reg_x.as_deref(), reg_y.as_deref(), reg_sp.as_deref(),
-            reg_p.as_deref(), *json,
+            load_hex, *entry, harvest, zp, *sentinel, io.as_deref(), *stub_addr, *cyc_cap,
+            *instr_cap, *direct_entry, reg_a.as_deref(), reg_x.as_deref(), reg_y.as_deref(),
+            reg_sp.as_deref(), reg_p.as_deref(), stream.as_deref(), stream_hex.as_deref(),
+            stream_hook, *json,
         ) {
             Ok(out) => println!("{out}"),
             Err(e) => {
