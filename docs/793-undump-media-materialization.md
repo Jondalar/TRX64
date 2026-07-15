@@ -1,6 +1,12 @@
 # Spec 793 — Undump Media Materialization (`<name>_media/` sidecar → real picker mount → purge)
 
-**Status:** PROPOSED (2026-07-15). **Repo:** TRX64.
+**Status:** BUILT (2026-07-15) — 793.1 materialize-on-undump (disk + cart) + 793.4 cart
+externalization + 793.3 purge (`undump_media_purge` WS + monitor `killmedia`, tag-scoped)
+landed in `undump_native_snapshot`/`purge_materialized_media`; gated by
+`undump_materializes_media_sidecar_and_purge_removes_it`. 793.2 picker visibility is free
+(the sidecar files are browsable via `media/browse` and mount file-backed via
+`backing_path`). Optional follow-up: a dedicated MCP tool wrapper (the LLM already reaches
+purge via `runtime_monitor "killmedia"`). **Repo:** TRX64.
 **Shared cross-repo numbering** (registry = C64RE `specs/README.md`).
 **Depends on / touches:** Spec 707 (`.c64re` embedded `mediaPayloads`), Spec 709
 (media ingress / dirty-media guard), Spec 714 (mutable media / file-backed mounts),

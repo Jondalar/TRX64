@@ -269,6 +269,12 @@ pub struct State {
     /// ~/.config/c64re store — additive, no shared global side effects), so the
     /// newest-first ordering + mountedAt overlay match TS without touching real files.
     recent_media: Vec<RecentMedia>,
+    /// Spec 793 — `<name>_media/` sidecar directories created by `undump` media
+    /// materialization (the embedded disk/cart written out as real, picker-visible,
+    /// file-backed mounts). `undump_media_purge` / monitor `killmedia` deletes ONLY
+    /// these (+ unmounts a mount whose backing file lives under one) — never a user's
+    /// own mount. Tag = "the daemon created it", the safety boundary.
+    materialized_media: Vec<String>,
     /// Spec 271 — in-process batch registry (batchId → BatchEntry JSON). The c64re
     /// batch runner spawns N worker threads (scenario-pool); TRX64's daemon is
     /// single-threaded, so `batch/start` runs the scenarios SEQUENTIALLY through the
@@ -5314,6 +5320,19 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 Ok(()) => Ok(format!("savecrt: {} bytes -> {path}", img.len())),
                 Err(e) => Err(format!("savecrt: write error: {e}")),
             }
+        }
+
+        // ---- STATE: killmedia (Spec 793 — purge undump-materialized media) ---------
+        // Delete every `<name>_media/` sidecar undump created (files + dir), detaching a
+        // live mount backed by one first. Touches ONLY daemon-materialized dirs, NEVER a
+        // user's own mount. The LLM/test-overlay auto-cleanup verb; also `undump_media_purge`
+        // over WS.
+        "killmedia" | "purgemedia" => {
+            if st.materialized_media.is_empty() {
+                return Ok("killmedia: no undump-materialized media to purge".into());
+            }
+            let (ndirs, nfiles) = purge_materialized_media(st);
+            Ok(format!("killmedia: purged {ndirs} dir(s), {nfiles} file(s)"))
         }
 
         // ---- STATE: swapcrt (audit ws-trace-monitor-misc-9) -----------------------
@@ -10899,6 +10918,20 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             }
         }
 
+        // Spec 793 — purge every undump-materialized `<name>_media/` sidecar (the
+        // LLM/test-overlay auto-cleanup). Tag-scoped: deletes ONLY dirs the daemon
+        // created via undump materialization, never a user's own mount.
+        "undump_media_purge" => {
+            let mut st = state.lock().unwrap();
+            let tracked = st.materialized_media.len();
+            let (dirs, files) = purge_materialized_media(&mut st);
+            Response::ok(id, json!({
+                "tracked": tracked,
+                "dirsRemoved": dirs,
+                "filesRemoved": files
+            }))
+        }
+
         "vsf/save" => {
             let output_path = req.params
                 .get("output_path")
@@ -12629,6 +12662,24 @@ fn undump_native_snapshot(st: &mut State, path: &str) -> Result<UndumpResult, St
     // restore cannot, resets the SID, re-hooks audio. Does not clear the ring.
     power_cycle_for_restore(st);
 
+    // Spec 793 — MATERIALIZE the embedded media into a `<name>_media/` sidecar next to
+    // the snapshot, then mount each FILE-backed. This turns the old invisible in-memory
+    // attach into a real, picker-visible mount whose writes persist to a file the user
+    // owns (and can abräumen). The dir is tagged in `materialized_media` so
+    // `undump_media_purge` can later kill ONLY what undump created.
+    let media_dir = {
+        let p = std::path::Path::new(path);
+        let stem = p
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "snapshot".to_string());
+        p.parent()
+            .map(|d| d.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(format!("{stem}_media"))
+    };
+    let mut materialized_any = false;
+
     // Re-attach the embedded drive8 media onto the fresh machine, then restore.
     let mut media = Vec::new();
     for rm in &read.media {
@@ -12646,10 +12697,30 @@ fn undump_native_snapshot(st: &mut State, path: &str) -> Result<UndumpResult, St
         };
         let kind = if rm.reference.format == "d64" { DiskKind::D64 } else { DiskKind::G64 };
         let len = bytes.len() as u64;
+        // Write the disk out to `<name>_media/<file>` and mount THAT (file-backed).
+        let fname = rm
+            .reference
+            .source_name
+            .clone()
+            .filter(|s| !s.is_empty())
+            .map(|s| std::path::Path::new(&s).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or(s))
+            .unwrap_or_else(|| format!("drive8.{}", rm.reference.format));
+        let backing = match std::fs::create_dir_all(&media_dir).and_then(|_| {
+            let fp = media_dir.join(&fname);
+            std::fs::write(&fp, &bytes).map(|_| fp)
+        }) {
+            Ok(fp) => {
+                materialized_any = true;
+                Some(fp.to_string_lossy().to_string())
+            }
+            // Materialization is best-effort: on a write failure fall back to the
+            // in-memory attach (never break the undump over a filesystem hiccup).
+            Err(_) => rm.reference.source_name.clone(),
+        };
         st.session.machine.drive8.attach_disk(DiskImage {
             kind,
             bytes,
-            backing_path: rm.reference.source_name.clone(),
+            backing_path: backing,
             read_only: false,
         });
         media.push(UndumpMedia {
@@ -12665,6 +12736,42 @@ fn undump_native_snapshot(st: &mut State, path: &str) -> Result<UndumpResult, St
         &mut st.session.machine,
         &read.checkpoint,
     )?;
+
+    // Spec 793 — materialize the CART too (refine decision: cart also externalized).
+    // The restore re-created the mapper from `cartBytes`; write those bytes out as a
+    // `.crt` in `<name>_media/` and point the session/cart image at it so the cart is
+    // a normal picker mount (swap/inspect/abräumen uniform with the disk).
+    if let Some(cart_bytes) = read
+        .checkpoint
+        .get("cartBytes")
+        .and_then(trx64_core::native_snapshot::ta_u8_decode)
+    {
+        if !cart_bytes.is_empty() {
+            let cname = std::path::Path::new(path)
+                .file_stem()
+                .map(|s| format!("{}.crt", s.to_string_lossy()))
+                .unwrap_or_else(|| "cart.crt".to_string());
+            if std::fs::create_dir_all(&media_dir).is_ok() {
+                let cp = media_dir.join(&cname);
+                if std::fs::write(&cp, &cart_bytes).is_ok() {
+                    materialized_any = true;
+                    let cps = cp.to_string_lossy().to_string();
+                    st.session.cart_path = cps.clone();
+                    if let Some(img) = st.session.machine.cartridge_image.as_mut() {
+                        img.path = cps;
+                    }
+                }
+            }
+        }
+    }
+
+    // Tag the sidecar dir so `undump_media_purge` / `killmedia` can later delete ONLY it.
+    if materialized_any {
+        let d = media_dir.to_string_lossy().to_string();
+        if !st.materialized_media.contains(&d) {
+            st.materialized_media.push(d);
+        }
+    }
 
     let pc = st.session.machine.c64_core.reg_pc;
     let cycle = st.session.machine.c64_core.clk;
@@ -12697,6 +12804,53 @@ fn undump_native_snapshot(st: &mut State, path: &str) -> Result<UndumpResult, St
         media,
         warning,
     })
+}
+
+/// Spec 793 — `undump_media_purge` / monitor `killmedia`: delete EVERY
+/// undump-materialized `<name>_media/` sidecar (files + dir) and its registry tag,
+/// first detaching a live mount whose backing file lives under one (so no dangling
+/// mount is left). Touches ONLY dirs the daemon itself created via undump
+/// materialization — never a user's own mount. Returns (dirs_removed, files_removed).
+fn purge_materialized_media(st: &mut State) -> (usize, usize) {
+    let dirs = std::mem::take(&mut st.materialized_media);
+    if dirs.is_empty() {
+        return (0, 0);
+    }
+    let under = |p: &str| -> bool { !p.is_empty() && dirs.iter().any(|d| p.starts_with(d.as_str())) };
+
+    // Detach a disk mount backed by a materialized file (avoid a dangling mount +
+    // release the file before delete). Writes are DISCARDED — purge is "kill the tmp".
+    let disk_backed = st
+        .session
+        .machine
+        .drive8
+        .get_attached_disk()
+        .and_then(|d| d.backing_path.clone())
+        .map(|p| under(&p))
+        .unwrap_or(false);
+    if disk_backed {
+        st.session.machine.drive8.detach_disk();
+    }
+    // Drop the cart's file-backing label if it points into a purged dir (the in-memory
+    // cart stays functional; it just no longer claims a deleted file as its backing).
+    if under(&st.session.cart_path) {
+        st.session.cart_path.clear();
+        if let Some(img) = st.session.machine.cartridge_image.as_mut() {
+            img.path.clear();
+        }
+    }
+
+    let mut ndirs = 0usize;
+    let mut nfiles = 0usize;
+    for d in &dirs {
+        if let Ok(rd) = std::fs::read_dir(d) {
+            nfiles += rd.flatten().count();
+        }
+        if std::fs::remove_dir_all(d).is_ok() {
+            ndirs += 1;
+        }
+    }
+    (ndirs, nfiles)
 }
 
 // ── Spec time-travel-tooling Piece 1 — diffCheckpoints(idA, idB) ───────────────
@@ -13613,6 +13767,7 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         scenarios: std::collections::HashMap::new(),
         media_events: Vec::new(),
         recent_media: Vec::new(),
+        materialized_media: Vec::new(),
         batches: std::collections::HashMap::new(),
         notify: streaming::NotifyHub::new(),
         streaming_enabled: streaming_on,
@@ -14062,6 +14217,7 @@ mod batch1_tests {
             scenarios: std::collections::HashMap::new(),
             media_events: Vec::new(),
             recent_media: Vec::new(),
+            materialized_media: Vec::new(),
             batches: std::collections::HashMap::new(),
             notify: streaming::NotifyHub::new(),
             streaming_enabled: false,
@@ -15005,6 +15161,39 @@ mod batch1_tests {
             "undump requested the one-shot fresh-frame present"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn undump_materializes_media_sidecar_and_purge_removes_it() {
+        // Spec 793 — undump writes the embedded drive8 disk into a `<name>_media/`
+        // sidecar + mounts it file-backed (real, picker-visible), tags the dir, and
+        // `undump_media_purge` deletes ONLY that tag (never a user mount).
+        let st = make_state();
+        let tmp = std::env::temp_dir();
+        let d64 = tmp.join("trx64_793_test.d64");
+        std::fs::write(&d64, vec![0u8; 174_848]).unwrap(); // blank 35-track D64
+        call(&st, "media/mount", json!({ "path": d64.to_str().unwrap() }));
+        let snap = tmp.join("trx64_793_snap.c64re");
+        let snap_s = snap.to_str().unwrap().to_string();
+        call(&st, "snapshot/dump", json!({ "path": snap_s }));
+
+        let media_dir = tmp.join("trx64_793_snap_media");
+        let _ = std::fs::remove_dir_all(&media_dir);
+        call(&st, "snapshot/undump", json!({ "path": snap_s }));
+        assert!(media_dir.exists(), "undump created the <name>_media/ sidecar");
+        assert!(
+            std::fs::read_dir(&media_dir).unwrap().count() >= 1,
+            "the embedded disk was written into the sidecar"
+        );
+        assert_eq!(st.lock().unwrap().materialized_media.len(), 1, "the dir is tagged");
+
+        let r = call(&st, "undump_media_purge", json!({}));
+        assert!(r["dirsRemoved"].as_u64().unwrap() >= 1, "purge removed the sidecar dir");
+        assert!(!media_dir.exists(), "the sidecar is gone after purge");
+        assert!(st.lock().unwrap().materialized_media.is_empty(), "the tag is cleared");
+
+        let _ = std::fs::remove_file(&d64);
+        let _ = std::fs::remove_file(&snap);
     }
 
     #[test]
