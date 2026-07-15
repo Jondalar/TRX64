@@ -26,22 +26,30 @@ Parse every VSF module, map it onto our `Machine` state, emit a `.c64re`. The
 runtime stays **untouched** (it already reads `.c64re`). One entry:
 `trx64cli convert-vsf <in.vsf> <out.c64re>`. Boris does `convert-vsf` + `undump`.
 
-## Why one-way (no `.c64re → VSF` export)
+## Direction — import first, export ADDED (owner, 2026-07-15: "Rest und retour")
 
-Import fills a **superset** (VICE's machine-state ⊂ `.c64re`) — clean. Export is a
-**lossy downgrade** and is also *harder*:
+Import fills a **superset** (VICE's machine-state ⊂ `.c64re`) — clean. Export was
+first deferred as a lossy downgrade; the owner then asked for the **return trip**
+too (`.c64re` → `.vsf`, so a c64re state can go BACK into VICE — Boris's interop),
+accepting the losses. **Export is now IN scope (791.5 below).**
+
+The two honest caveats stand — they shape *what* export emits, not *whether*:
 - **Lossy by definition:** `.c64re`'s extras — JAM-freeze, the reverse-step
   delta-ring, rewind cpu-history, the checkpoint ring, embedded PNG frames, trace,
   media-embed, provenance — have **no** representation in VSF (a flat snapshot with
-  no notion of history/time-travel/archive). Export drops all of it.
-- **Harder on the VIC:** import may take the VIC **coarse** (regs + raster line)
-  and let our runtime fill the rest; export must emit VICE's **exact** viciisc
-  pipeline encoding or VICE rejects/mis-resumes it. The "off-limits" VIC blob is
-  worse for write than read.
-- We are **leaving** VICE — no workflow needs VICE to consume our snapshots.
+  no notion of history/time-travel/archive). Export simply **drops** all of it; the
+  VSF carries the resumable machine core only. That is acceptable for the interop
+  use case (hand a running machine to VICE), which is all export is for.
+- **The VIC tail:** VICE's `read_module` walks the VIC-IISC fields sequentially and
+  rejects a short/mis-sized module, so export must emit the WHOLE module incl. the
+  `raster_snapshot` draw-buffer + `draw_cycle` pipeline. But that draw-buffer is
+  VICE's OUTPUT framebuffer, which VICE **re-derives** as it runs — so export emits
+  it **zeroed at the correct x64sc geometry** (a one-frame redraw glitch on load,
+  then exact). Our own viciisc-faithful state supplies every other field verbatim.
 
-⇒ **Import only.** Export is explicitly out of scope (a strictly-worse format at
-higher cost).
+Validation is possible: a real **VICE x64sc binary** is on disk
+(`.../vice/vice/src/x64sc`), so the export round-trips through actual VICE (load the
+emitted `.vsf`, resume, screenshot) — not just through our own loader.
 
 ## Key insight — our own fidelity lowers the effort
 
@@ -101,10 +109,37 @@ for, delivered for free by the converter.)
 Detect a real VICE VSF from the 58-byte header + module walk, **not** by searching
 for the `SIDEXTENDED` marker string. Expose the same detection on the CLI path.
 
+> **Import status (2026-07-15):** 791.1a/b/c largely landed. On top of regs/clock/
+> EF/keyboard, the VIC-IISC import now also restores **colour RAM** (module offset
+> 761 → `ram[$D800]` AND `io_shadow[$0800]` — the full-machine VIC reads the latter;
+> missing it rendered white text/HUD black), **ysmooth** (offset 689 → the 7px
+> vertical offset), and **raster_cycle/cycle_flags/raster_line**; the CIA import
+> **re-arms the timer alarms** (`Cia::restore_rearm_alarms`) so a running timer keeps
+> firing. A mid-game EF Wasteland `.vsf` now renders **structurally 100%** vs the
+> VICE screenshot (only the palette differs — ours is colodore, by design).
+
+### 791.5 — `.c64re` → VSF EXPORT (the return trip, owner 2026-07-15)
+Emit a **VICE-x64sc-loadable** `.vsf` from a `.c64re` (or the live machine).
+`trx64cli convert-c64re <in.c64re> <out.vsf>`. A NEW writer (`save_vice_vsf`) — the
+existing `save_vsf` emits the *c64re-own* compact framing, which VICE cannot load;
+export emits each module in VICE's **exact** `*_snapshot_read_module` field order:
+`MAINCPU`, `C64MEM` (pport + 64K + pport tail), `CIA1`/`CIA2`, `SID`, `VIC-IISC`
+(model + regs + raster + vbuf/cbuf/gbuf/dbuf + ysmooth + collisions + vc/rc/vmli +
+lightpen + …+ **colour_ram** + sprites + `draw_cycle` pipeline + `raster_snapshot`),
+and `C64CART`+`CARTEF`+`FLASH040EF` for an EF cart. The `raster_snapshot` draw-buffer
+is emitted **zeroed at the x64sc geometry** (VICE re-derives the picture on the first
+frame). **Lossy by design:** the `.c64re` history/ring/trace/provenance extras are
+dropped — a VSF is a flat machine core. Validated by loading the emitted `.vsf` in the
+real **VICE x64sc** binary and resuming.
+
 ## Non-goals
 
-- **No `.c64re → VSF` export** (see "Why one-way").
-- **No cycle-exact VIC micro-pipeline** reconstruction (coarse-VIC cut).
+- **No cycle-exact VIC draw-buffer export** — the `raster_snapshot` framebuffer is
+  emitted zeroed (correct geometry); VICE re-derives it (one-frame redraw). Every
+  other VIC field is exact.
+- **No `.c64re` extras in the VSF** — JAM/rewind/ring/PNG/trace/media-embed/
+  provenance are dropped on export (VSF has no representation; by design).
+- **No cycle-exact VIC micro-pipeline** reconstruction on IMPORT (coarse-VIC cut).
 - No TAPE/DATASETTE restore (we don't emulate tape; low value).
 - Not a change to the `.c64re` format (707) — the converter emits it as-is.
 
@@ -121,12 +156,20 @@ for the `SIDEXTENDED` marker string. Expose the same detection on the CLI path.
 4. Fidelity: a VSF whose `C64CART` is dropped, or VIC restored coarse, returns
    `partial`/`inspection-only` with the module lists — never `faithful` / `errors=[]`.
 5. `convert-vsf` and the direct Rust API accept the same native VICE VSF files.
+6. **Export (791.5):** `trx64cli convert-c64re in.c64re out.vsf` produces a `.vsf`
+   the real **VICE x64sc** binary loads and resumes; a round-trip
+   `.c64re → .vsf → VICE (screenshot)` matches the `.c64re → our render`, and
+   `.c64re → .vsf → our `load_vice_vsf`` returns to the same machine core state.
 
 ## Build order (slices)
 
 1. **791.3 fidelity result + 791.2 `convert-vsf` skeleton** over today's partial
    loader — immediate honesty-fix + the CLI onramp, even before more modules land.
 2. **791.1a: C64CART (EasyFlash) + full clock + KEYBOARD** — the high-value slice;
-   unblocks EF continuation.
-3. **791.1b: coarse VIC (raster line + bad_line)** — resumable non-warm-start.
-4. **791.1c: CIA alarms, then DRIVE8** — faithful CIA/drive continuation.
+   unblocks EF continuation. **DONE.**
+3. **791.1b: coarse VIC (colour RAM + ysmooth + raster).** **DONE** (structural 100%).
+4. **791.1c: CIA alarms** **DONE**; **DRIVE8** import — follow-up.
+5. **791.5 EXPORT** `.c64re → .vsf` (the return trip): the VICE-exact writer +
+   `convert-c64re` CLI, validated against the on-disk VICE x64sc. Easy modules first
+   (MAINCPU/C64MEM/CIA/SID), then the VIC-IISC module (+ zeroed draw-buffer tail),
+   then EF cart; VICE-load-tested at each step.
