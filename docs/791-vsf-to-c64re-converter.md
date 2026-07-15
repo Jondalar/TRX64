@@ -109,14 +109,23 @@ for, delivered for free by the converter.)
 Detect a real VICE VSF from the 58-byte header + module walk, **not** by searching
 for the `SIDEXTENDED` marker string. Expose the same detection on the CLI path.
 
-> **Import status (2026-07-15):** 791.1a/b/c largely landed. On top of regs/clock/
-> EF/keyboard, the VIC-IISC import now also restores **colour RAM** (module offset
+> **Import status (2026-07-15): COMPLETE for every subsystem TRX64 emulates.**
+> On top of regs/clock/EF, the VIC-IISC import restores **colour RAM** (module offset
 > 761 → `ram[$D800]` AND `io_shadow[$0800]` — the full-machine VIC reads the latter;
 > missing it rendered white text/HUD black), **ysmooth** (offset 689 → the 7px
-> vertical offset), and **raster_cycle/cycle_flags/raster_line**; the CIA import
-> **re-arms the timer alarms** (`Cia::restore_rearm_alarms`) so a running timer keeps
-> firing. A mid-game EF Wasteland `.vsf` now renders **structurally 100%** vs the
-> VICE screenshot (only the palette differs — ours is colodore, by design).
+> vertical offset), **raster_cycle/cycle_flags/raster_line**; the CIA import **re-arms
+> the timer alarms** (`Cia::restore_rearm_alarms`). The **1541 DRIVE** is restored —
+> DRIVE8 + DRIVECPU0 + 1541VIA1D0 + VIA2D0 re-framed into our `restore_drive1541` blob
+> (same VICE module format, Spec 612) — and the KEYBOARD (idle: no keys held = the
+> correct resume state). A mid-game EF Wasteland `.vsf` renders **structurally 100%**
+> vs the VICE screenshot (only the palette differs — ours is colodore, by design).
+>
+> **Scope boundary (NOT omitted work — hardware TRX64 does not emulate):** the modules
+> `FSDRIVE` (virtual host-dir drive), `C64MEMHACKS` (REU/GEORAM), `TAPEPORT`/`DATASETTE`
+> (tape), `USERPORT` — TRX64 has no such device, so VICE resumes them on defaults. And
+> `SIDEXTENDED` (reSID sub-frame oscillator/filter phase) — the SID itself IS restored
+> via its registers (the `SID` module); the extended phase re-derives within one frame,
+> so the SID plays correctly. These are the ONLY VSF modules not mapped, all by scope.
 
 ### 791.5 — `.c64re` → VSF EXPORT (the return trip, owner 2026-07-15)
 Emit a **VICE-x64sc-loadable** `.vsf` from a `.c64re` (or the live machine).

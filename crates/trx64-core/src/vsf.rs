@@ -908,6 +908,38 @@ fn parse_flash040ef(data: &[u8], nth: usize, clk: u64) -> Option<Flash040SnapSta
 /// attach it to `machine`. Returns `Ok(true)` when an EF cart was restored, `Ok(false)`
 /// when the file carries no `CARTEF` (no cart, or a non-EF cart — left absent), and
 /// `Err` only on a malformed/short `CARTEF`.
+/// Our DRIVECPU0 module data length (`capture_drive1541`) — VICE's is this + a trailing
+/// 52-byte idle interrupt sub-block we omit; the first `OUR_DRIVECPU0_DATA_LEN` bytes are
+/// byte-identical field layout, so truncating VICE's module to this yields our format.
+const OUR_DRIVECPU0_DATA_LEN: usize = 2100;
+
+/// Re-frame the VSF's 1541 drive modules (DRIVE8 + DRIVECPU0 + 1541VIA1D0 + VIA2D0) into
+/// a headerless blob that `restore_drive1541` reads by name (they are the SAME VICE
+/// module format we emit). `None` when no DRIVE8 module is present. DRIVECPU0 is
+/// truncated to our layout (dropping VICE's trailing idle interrupt block).
+fn build_drive_blob_from_vsf(data: &[u8]) -> Option<Vec<u8>> {
+    vice_find_module(data, "DRIVE8")?; // anchor: no DRIVE8 ⇒ nothing to restore
+    let mut blob = Vec::new();
+    for (name, trunc) in [
+        ("DRIVE8", None),
+        ("DRIVECPU0", Some(OUR_DRIVECPU0_DATA_LEN)),
+        ("1541VIA1D0", None),
+        ("VIA2D0", None),
+    ] {
+        let m = vice_find_module(data, name)?;
+        let dlen = trunc.map(|t: usize| t.min(m.data_len)).unwrap_or(m.data_len);
+        let mut nm = [0u8; 16];
+        let nb = name.as_bytes();
+        nm[..nb.len().min(16)].copy_from_slice(&nb[..nb.len().min(16)]);
+        blob.extend_from_slice(&nm);
+        blob.push(data[m.data_start - 6]); // major (module header)
+        blob.push(data[m.data_start - 5]); // minor
+        blob.extend_from_slice(&((22 + dlen) as u32).to_le_bytes());
+        blob.extend_from_slice(&data[m.data_start..m.data_start + dlen]);
+    }
+    Some(blob)
+}
+
 fn load_c64cart_easyflash(machine: &mut Machine, data: &[u8]) -> Result<bool, String> {
     let cartef = match vice_find_module(data, "CARTEF") {
         Some(m) => m,
@@ -1180,20 +1212,44 @@ fn load_vice_vsf(machine: &mut Machine, data: &[u8]) -> Result<VsfLoadResult, St
         }
     };
 
-    // Restore the IEC bus to its released (idle) baseline — the real-VICE drive
-    // modules carry the live bus, but TRX64 does not resume the drive from a VICE
-    // file (see header). A released bus is the correct idle state for a paused C64.
-    machine.iec.iecbus.cpu_bus = 0x10 | 0x40 | 0x80; // ATN/CLK/DATA all released
-    machine.iec.iec_update_ports();
+    // Restore the 1541 drive from the VICE DRIVE8 + DRIVECPU0 + 1541VIA1D0 + VIA2D0
+    // modules. `restore_drive1541` consumes our own drive-snapshot blob, which is the
+    // SAME VICE module format (Spec 612 faithful port) — so we re-frame the VSF's drive
+    // modules into that blob (truncating VICE's DRIVECPU0 to our layout, which is
+    // identical minus VICE's trailing 52-byte idle interrupt sub-block) and feed it.
+    // No disk GCR in a plain VSF (VICE doesn't embed it without save_disks) → the drive
+    // resumes with its state (idle / head position); a disk is attached separately.
+    let drive_restored = match build_drive_blob_from_vsf(data) {
+        Some(blob) => match crate::drive_snapshot::restore_drive1541(&mut machine.drive8, &blob) {
+            Ok(()) => {
+                machine.iec.iec_update_ports();
+                loaded.push("DRIVE8".to_string());
+                loaded.push("DRIVECPU0".to_string());
+                loaded.push("1541VIA1D0".to_string());
+                loaded.push("VIA2D0".to_string());
+                true
+            }
+            Err(e) => {
+                errors.push(("DRIVE8".into(), e));
+                false
+            }
+        },
+        None => false,
+    };
+    if !drive_restored {
+        // No drive modules (or a parse miss) → released idle bus for a paused C64.
+        machine.iec.iecbus.cpu_bus = 0x10 | 0x40 | 0x80; // ATN/CLK/DATA all released
+        machine.iec.iec_update_ports();
+    }
 
-    // Note the DRIVE8/9/10/11, DRIVECPU0, 1541VIA1D0, VIA2D0, FSDRIVE, GLUE,
-    // C64MEMHACKS, TAPEPORT, DATASETTE, KEYBOARD, JOYPORT*, JOYSTICK*, USERPORT,
-    // SIDEXTENDED, C64CART modules as ignored (not mapped into the Machine) — except a
-    // C64CART we restored above (EasyFlash), which is credited to `loaded`.
-    for n in [
-        "DRIVE8", "DRIVECPU0", "1541VIA1D0", "VIA2D0", "FSDRIVE", "GLUE",
-        "TAPEPORT", "DATASETTE", "KEYBOARD", "SIDEXTENDED", "C64CART",
-    ] {
+    // KEYBOARD: a resumed snapshot holds no keys (transient input) — our default
+    // matrix already IS "no keys down", the correct resume state. Credit it as handled.
+    if vice_find_module(data, "KEYBOARD").is_some() {
+        loaded.push("KEYBOARD".to_string());
+    }
+
+    // The remaining modules are not mapped into the Machine.
+    for n in ["FSDRIVE", "GLUE", "TAPEPORT", "DATASETTE", "SIDEXTENDED", "C64CART"] {
         if n == "C64CART" && ef_loaded {
             continue;
         }

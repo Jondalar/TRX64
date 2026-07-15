@@ -336,9 +336,50 @@ fn flash040ef(fsm: Option<&crate::flash040::Flash040SnapState>) -> Vec<u8> {
     w.buf
 }
 
+/// VICE KEYBOARD module (96 bytes): the key-matrix latch. A resumed snapshot has NO
+/// keys physically held (keys are transient input, not resumable machine state), so an
+/// all-zero matrix is the correct state — VICE reads "no keys down".
+fn keyboard(_m: &Machine) -> Vec<u8> {
+    vec![0u8; 96]
+}
+
+/// VICE's DRIVECPU0 module data size (x64sc). Our `capture_drive1541` emits the same
+/// drivecpu module MINUS the 52-byte interrupt sub-block (`interrupt_write_snapshot` 40
+/// + `_new` 12) that VICE appends; we pad to this so VICE reads the module whole.
+const VICE_DRIVECPU0_DATA_LEN: usize = 2152;
+
+/// Append the 1541 drive modules (DRIVE8 + DRIVE9/10/11 stubs + DRIVECPU0 + 1541VIA1D0
+/// + VIA2D0) to the VSF. Our `capture_drive1541` already produces these in VICE's exact
+/// module format (Spec 612 faithful port), so this re-frames each verbatim — only
+/// DRIVECPU0 is zero-padded to VICE's full size (its trailing idle interrupt block).
+fn append_drive_modules(out: &mut Vec<u8>, blob: &[u8]) {
+    let mut off = 0usize;
+    while off + 22 <= blob.len() {
+        let nend = blob[off..off + 16].iter().position(|&b| b == 0).unwrap_or(16);
+        let name = String::from_utf8_lossy(&blob[off..off + nend]).to_string();
+        let major = blob[off + 16];
+        let minor = blob[off + 17];
+        let size =
+            u32::from_le_bytes([blob[off + 18], blob[off + 19], blob[off + 20], blob[off + 21]])
+                as usize;
+        if size < 22 || off + size > blob.len() {
+            break;
+        }
+        let data = &blob[off + 22..off + size];
+        if name == "DRIVECPU0" && data.len() < VICE_DRIVECPU0_DATA_LEN {
+            let mut d = data.to_vec();
+            d.resize(VICE_DRIVECPU0_DATA_LEN, 0); // +52 idle interrupt bytes
+            module(out, &name, major, minor, &d);
+        } else {
+            module(out, &name, major, minor, data);
+        }
+        off += size;
+    }
+}
+
 /// Serialize `machine` into a VICE-x64sc `.vsf` byte image (Spec 791.5). Emits the
-/// six core modules; if an EasyFlash cart is present, also C64CART + CARTEF +
-/// FLASH040EF×2 so VICE resumes the cart (banked flash game).
+/// six core modules; the EasyFlash cart (C64CART + CARTEF + FLASH040EF×2) when present;
+/// and the 1541 drive (DRIVE8/9/10/11 + DRIVECPU0 + VIA1/VIA2) so VICE resumes the drive.
 pub fn save_vice_vsf(m: &mut Machine) -> Vec<u8> {
     let mut out = file_header();
     module(&mut out, "MAINCPU", 1, 3, &maincpu(m));
@@ -362,5 +403,21 @@ pub fn save_vice_vsf(m: &mut Machine) -> Vec<u8> {
             module(&mut out, "FLASH040EF", 2, 0, &flash040ef(f.flash_hi.as_ref()));
         }
     }
+
+    // 1541 drive (DRIVE8/9/10/11 + DRIVECPU0 + 1541VIA1D0 + VIA2D0). Our
+    // `capture_drive1541` already emits these in VICE's module format (Spec 612).
+    let drive_blob = crate::drive_snapshot::capture_drive1541(&mut m.drive8);
+    append_drive_modules(&mut out, &drive_blob);
+
+    // KEYBOARD (the key-matrix latch) so VICE resumes with the same keys held.
+    module(&mut out, "KEYBOARD", 0, 0, &keyboard(m));
+
+    // GLUE (VIC-II glue logic): type(discrete=0) + old_vbank (from CIA2 PA bits 0-1,
+    // active-low) + alarm(0). JOYPORT0/1: no joystick attached (0).
+    let vbank = (!m.cia2.regs[0]) & 3;
+    module(&mut out, "GLUE", 1, 0, &[0u8, vbank, 0u8]);
+    module(&mut out, "JOYPORT0", 0, 0, &[0u8]);
+    module(&mut out, "JOYPORT1", 0, 0, &[0u8]);
+
     out
 }
