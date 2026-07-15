@@ -41,9 +41,32 @@ pub fn run_convert(rom_dir: &Path, input: &str, output: &str, json: bool) -> Res
     let report: VsfLoadReport =
         load_vsf_report(&mut m, &bytes).map_err(|e| format!("load {input}: {e}"))?;
 
-    // Capture the RuntimeCheckpoint (Spec 707). Slice 1 restores no drive/cart, so
-    // those blobs are None (the c64re restore path tolerates null — drive stays cold).
-    let checkpoint = capture_runtime_checkpoint(&m, "", "", None, None, None, None);
+    // Capture the restored cartridge (Spec 791 slice 2 — the EF-unblock): its `.crt`
+    // bytes (for the EasyFlash cart, the synthesized EF `.crt` the loader attached) +
+    // the live writable flash image, so the `.c64re` embeds the cart and `undump` /
+    // `sandbox --seed` bring the EasyFlash cart back with its flash intact. Mirrors the
+    // daemon's `capture_cart_blobs`. The `&mut` writable-image read (catches the flash
+    // erase alarm up) is taken BEFORE the immutable `&m` checkpoint borrow below.
+    let (cart_bytes, cart_flash) = if m.cartridge.is_some() {
+        let clk = m.c64_core.clk;
+        let cb = m.cartridge_image.as_ref().map(|img| img.raw_bytes.clone());
+        let cf = m.cartridge.as_mut().and_then(|c| c.writable_image(clk));
+        (cb, cf)
+    } else {
+        (None, None)
+    };
+
+    // Capture the RuntimeCheckpoint (Spec 707). The drive blobs stay None (drive
+    // restore is a later slice); the cart blobs carry the restored EasyFlash.
+    let checkpoint = capture_runtime_checkpoint(
+        &m,
+        "",
+        "",
+        None,
+        None,
+        cart_bytes.as_deref(),
+        cart_flash.as_deref(),
+    );
     let pc = m.c64_core.reg_pc as i64;
     let cycle = m.c64_core.clk as i64;
 

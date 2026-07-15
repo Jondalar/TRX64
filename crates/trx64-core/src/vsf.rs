@@ -35,7 +35,9 @@
 //!   VIC-II    108 bytes
 //!   KEYBOARD  6 bytes
 
+use crate::cart::{CartState, FlashCartState};
 use crate::cia::CIA_ICR;
+use crate::flash040::Flash040SnapState;
 use crate::Machine;
 
 // ── VSF header constants ──────────────────────────────────────────────────────
@@ -753,6 +755,211 @@ fn vice_walk_modules(data: &[u8]) -> Vec<String> {
     names
 }
 
+// ── C64CART EasyFlash restore (Spec 791.1a slice 2 — the EF-unblock) ────────────
+//
+// A real VICE EasyFlash VSF carries THREE modules (easyflash.c / flash040core.c):
+//
+//   "C64CART"    (c64carthooks.c:3326) — the GENERIC cart-config chunk. Carries
+//                `mem_cartridge_type` (= 32 CARTRIDGE_EASYFLASH) + the export lines +
+//                the active cart-id list. We do not need its body to rebuild the
+//                mapper — the EF-specific "CARTEF" module carries the continuation —
+//                but its presence is what the fidelity report keys "C64CART" on.
+//   "CARTEF" 0.0 (easyflash.c:677-712):
+//                BYTE  jumper
+//                BYTE  register_00  (the live 6-bit ROM bank)
+//                BYTE  register_02  (mode & 0x87)
+//                ARRAY ram[256]     (the $DF00 IO2 RAM)
+//                ARRAY roml[0x80000] (lo flash = 64 ROML banks × 8K)
+//                ARRAY romh[0x80000] (hi flash = 64 ROMH banks × 8K)
+//   "FLASH040EF" 2.0 (flash040core.c:515-538) — TWICE, lo then hi:
+//                BYTE  state / BYTE base_state / BYTE program_byte /
+//                ARRAY erase_mask[8] / BYTE last_read
+//
+// Reconstruction: synthesize an EasyFlash `.crt` from the two flash arrays, attach it
+// through the normal `attach_cart_from_bytes` path (so the SAME `.crt` bytes end up in
+// `cartridge_image.raw_bytes` and the `.c64re` checkpoint's `cartBytes` can rebuild the
+// mapper on undump), overlay the EXACT flash bytes via `set_writable_image`, then apply
+// the continuation state (bank / register_02 / jumper / IO2-RAM / the lo+hi command
+// FSMs) via `set_state`. Field mapping onto `EasyFlashMapper`/`Flash040`:
+//   register_00 → current_bank; register_02 → register02; jumper → jumper;
+//   ram → io_ram; roml/romh → lo_flash.data/hi_flash.data; the FLASH040EF FSM →
+//   Flash040 {state, base_state, program_byte, erase_mask, last_read}.
+
+/// 256-byte EasyFlash IO2 ($DF00) RAM (VICE `CART_RAM_SIZE`).
+const EF_CART_RAM_SIZE: usize = 256;
+/// One EasyFlash flash chip = 64 banks × 8K = 512 KiB (VICE `roml_banks`/`romh_banks`).
+const EF_FLASH_SIZE: usize = 0x80000;
+/// VICE `FLASH040_ERASE_MASK_SIZE`.
+const EF_ERASE_MASK_SIZE: usize = 8;
+
+/// Find the `nth` (0-based) occurrence of a module by name. VICE writes TWO modules
+/// with the SAME name "FLASH040EF" (lo then hi), so `vice_find_module` (first-match)
+/// cannot distinguish them.
+fn vice_find_module_nth(data: &[u8], name: &str, nth: usize) -> Option<ViceModule> {
+    let mut off = VICE_HEADER_LEN;
+    let mut count = 0;
+    while off + VICE_MOD_HEADER_LEN <= data.len() {
+        let raw = &data[off..off + VICE_MOD_NAME_LEN];
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(VICE_MOD_NAME_LEN);
+        let mname = std::str::from_utf8(&raw[..end]).unwrap_or("");
+        let size = read_u32_le(data, off + 18)? as usize;
+        if size < VICE_MOD_HEADER_LEN {
+            break;
+        }
+        if mname == name {
+            if count == nth {
+                return Some(ViceModule {
+                    data_start: off + VICE_MOD_HEADER_LEN,
+                    data_len: size - VICE_MOD_HEADER_LEN,
+                });
+            }
+            count += 1;
+        }
+        off += size;
+    }
+    None
+}
+
+/// Is the 8K bank slice at `off` all-0xFF (an unpopulated flash bank)?
+fn ef_slice_all_ff(data: &[u8], off: usize) -> bool {
+    let end = (off + 0x2000).min(data.len());
+    off >= data.len() || data[off..end].iter().all(|&b| b == 0xff)
+}
+
+/// Append a CRT `CHIP` packet (16-byte header + `data`) laid out exactly as
+/// `parse_crt` reads it (chip type FLASH=2, then bank / load-addr / size, all BE).
+fn ef_push_chip(out: &mut Vec<u8>, bank: u16, load_addr: u16, data: &[u8]) {
+    out.extend_from_slice(b"CHIP");
+    out.extend_from_slice(&((0x10 + data.len()) as u32).to_be_bytes()); // total packet len
+    out.extend_from_slice(&2u16.to_be_bytes()); // chip type: FLASH
+    out.extend_from_slice(&bank.to_be_bytes()); // bank
+    out.extend_from_slice(&load_addr.to_be_bytes()); // load address
+    out.extend_from_slice(&(data.len() as u16).to_be_bytes()); // size
+    out.extend_from_slice(data);
+}
+
+/// Synthesize an EasyFlash `.crt` (hardware type 32) from the two 512 KiB flash
+/// arrays. Bank 0 is always emitted (ROML+ROMH) so the mapper has unambiguous
+/// geometry; other banks are emitted only when non-empty (byte-exactness is
+/// guaranteed by the later `set_writable_image`, so lean synthesis is safe).
+fn synth_easyflash_crt(roml: &[u8], romh: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(0x40 + roml.len() + romh.len());
+    // ── CRT header (0x40 bytes) ──
+    out.extend_from_slice(b"C64 CARTRIDGE   "); // 16
+    out.extend_from_slice(&0x40u32.to_be_bytes()); // header length
+    out.extend_from_slice(&0x0100u16.to_be_bytes()); // version 1.0
+    out.extend_from_slice(&32u16.to_be_bytes()); // hardware type = EasyFlash
+    out.push(1); // EXROM (mapper computes live lines from register_02/jumper)
+    out.push(1); // GAME
+    out.extend_from_slice(&[0u8; 6]); // reserved
+    let mut name = [0u8; 32];
+    name[..9].copy_from_slice(b"EASYFLASH");
+    out.extend_from_slice(&name);
+    debug_assert_eq!(out.len(), 0x40);
+    // ── CHIP packets ──
+    let banks = (roml.len() / 0x2000).max(romh.len() / 0x2000);
+    for bank in 0..banks {
+        let off = bank * 0x2000;
+        if bank == 0 || !ef_slice_all_ff(roml, off) {
+            let end = (off + 0x2000).min(roml.len());
+            ef_push_chip(&mut out, bank as u16, 0x8000, &roml[off..end]);
+        }
+        if bank == 0 || !ef_slice_all_ff(romh, off) {
+            let end = (off + 0x2000).min(romh.len());
+            ef_push_chip(&mut out, bank as u16, 0xa000, &romh[off..end]);
+        }
+    }
+    out
+}
+
+/// Parse the `nth` "FLASH040EF" module into a `Flash040SnapState`. VICE does not save
+/// the erase-alarm clock; on read it re-arms the alarm to `maincpu_clk +
+/// erase_sector_cycles` when the FSM is mid-erase (flash040core.c:571-580). We mirror
+/// that: for an AM29F040B (EasyFlash) `erase_sector_cycles = 1_000_000`.
+fn parse_flash040ef(data: &[u8], nth: usize, clk: u64) -> Option<Flash040SnapState> {
+    let m = vice_find_module_nth(data, "FLASH040EF", nth)?;
+    let d = &data[m.data_start..m.data_start + m.data_len];
+    if d.len() < 3 + EF_ERASE_MASK_SIZE + 1 {
+        return None;
+    }
+    let state = d[0];
+    let base_state = d[1];
+    let program_byte = d[2];
+    let mut erase_mask = [0u8; EF_ERASE_MASK_SIZE];
+    erase_mask.copy_from_slice(&d[3..3 + EF_ERASE_MASK_SIZE]);
+    let last_read = d[3 + EF_ERASE_MASK_SIZE];
+    // FLASH040_STATE_CHIP_ERASE=9, SECTOR_ERASE=10, SECTOR_ERASE_TIMEOUT=11.
+    let erase_alarm_clk = match state {
+        9 | 10 | 11 => clk as i64 + 1_000_000,
+        _ => -1,
+    };
+    Some(Flash040SnapState {
+        state,
+        base_state,
+        program_byte,
+        last_read,
+        dirty: false,
+        erase_mask,
+        erase_alarm_clk,
+    })
+}
+
+/// Reconstruct an EasyFlash cart from a VSF's `CARTEF` + `FLASH040EF` modules and
+/// attach it to `machine`. Returns `Ok(true)` when an EF cart was restored, `Ok(false)`
+/// when the file carries no `CARTEF` (no cart, or a non-EF cart — left absent), and
+/// `Err` only on a malformed/short `CARTEF`.
+fn load_c64cart_easyflash(machine: &mut Machine, data: &[u8]) -> Result<bool, String> {
+    let cartef = match vice_find_module(data, "CARTEF") {
+        Some(m) => m,
+        None => return Ok(false), // no EasyFlash cart in this file
+    };
+    let d = &data[cartef.data_start..cartef.data_start + cartef.data_len];
+    let need = 3 + EF_CART_RAM_SIZE + 2 * EF_FLASH_SIZE;
+    if d.len() < need {
+        return Err(format!("CARTEF too short: {} < {}", d.len(), need));
+    }
+    let jumper = d[0] & 1;
+    let register_00 = d[1]; // live ROM bank
+    let register_02 = d[2]; // mode & 0x87
+    let ram = d[3..3 + EF_CART_RAM_SIZE].to_vec();
+    let roml_off = 3 + EF_CART_RAM_SIZE;
+    let romh_off = roml_off + EF_FLASH_SIZE;
+    let roml = &d[roml_off..roml_off + EF_FLASH_SIZE];
+    let romh = &d[romh_off..romh_off + EF_FLASH_SIZE];
+
+    let clk = machine.c64_core.clk;
+    let lo_fsm = parse_flash040ef(data, 0, clk);
+    let hi_fsm = parse_flash040ef(data, 1, clk);
+
+    // Attach via a synthesized EF `.crt` (reuses the whole attach + `.c64re` cart-embed
+    // path), then overlay exact flash bytes + the continuation state.
+    let crt = synth_easyflash_crt(roml, romh);
+    machine
+        .attach_cart_from_bytes(&crt, "vsf-easyflash")
+        .map_err(|e| format!("attach EasyFlash: {e:?}"))?;
+    if let Some(cart) = machine.cartridge.as_mut() {
+        let mut img = Vec::with_capacity(2 * EF_FLASH_SIZE);
+        img.extend_from_slice(roml);
+        img.extend_from_slice(romh);
+        cart.set_writable_image(&img); // byte-exact flash (wins over EAPI-replacement)
+        cart.set_state(CartState {
+            current_bank: register_00 as u16,
+            control_register: Some(register_02),
+            flash: Some(FlashCartState {
+                flash_lo: lo_fsm,
+                flash_hi: hi_fsm,
+                eeprom: None,
+                easyflash_jumper: jumper,
+                easyflash_ram: ram,
+            }),
+        });
+    }
+    // Recompute the live memconfig from the restored EF lines (register_02 + jumper
+    // drive 8k/16k/off/ultimax — the attach above ran with register_02=0).
+    machine.memconfig = machine.memconfig_table[machine.pla_index()];
+    Ok(true)
+}
+
 /// Parse a real-VICE x64sc .vsf and inject the recoverable machine state into
 /// `machine`. Returns the modules that were parsed (loaded) and those skipped.
 fn load_vice_vsf(machine: &mut Machine, data: &[u8]) -> Result<VsfLoadResult, String> {
@@ -907,6 +1114,25 @@ fn load_vice_vsf(machine: &mut Machine, data: &[u8]) -> Result<VsfLoadResult, St
         Some(_) | None => ignored.push("VIC-II".to_string()),
     }
 
+    // ── C64CART (EasyFlash) — Spec 791.1a slice 2 (the EF-unblock) ──
+    // A real EF VSF carries the generic "C64CART" module + the EF-specific "CARTEF"
+    // (jumper / register_00 / register_02 / IO2-RAM + the two 512K flash arrays) + two
+    // "FLASH040EF" command-FSM modules. Reconstruct the EasyFlashMapper and attach it.
+    // Non-EF `C64CART` (a "C64CART" chunk with no "CARTEF") is left absent (task pt 4).
+    let ef_loaded = match load_c64cart_easyflash(machine, data) {
+        Ok(true) => {
+            loaded.push("C64CART".to_string());
+            loaded.push("CARTEF".to_string());
+            loaded.push("FLASH040EF".to_string());
+            true
+        }
+        Ok(false) => false,
+        Err(e) => {
+            errors.push(("C64CART".into(), e));
+            false
+        }
+    };
+
     // Restore the IEC bus to its released (idle) baseline — the real-VICE drive
     // modules carry the live bus, but TRX64 does not resume the drive from a VICE
     // file (see header). A released bus is the correct idle state for a paused C64.
@@ -915,11 +1141,15 @@ fn load_vice_vsf(machine: &mut Machine, data: &[u8]) -> Result<VsfLoadResult, St
 
     // Note the DRIVE8/9/10/11, DRIVECPU0, 1541VIA1D0, VIA2D0, FSDRIVE, GLUE,
     // C64MEMHACKS, TAPEPORT, DATASETTE, KEYBOARD, JOYPORT*, JOYSTICK*, USERPORT,
-    // SIDEXTENDED, C64CART modules as ignored (not mapped into the Machine).
+    // SIDEXTENDED, C64CART modules as ignored (not mapped into the Machine) — except a
+    // C64CART we restored above (EasyFlash), which is credited to `loaded`.
     for n in [
         "DRIVE8", "DRIVECPU0", "1541VIA1D0", "VIA2D0", "FSDRIVE", "GLUE",
         "TAPEPORT", "DATASETTE", "KEYBOARD", "SIDEXTENDED", "C64CART",
     ] {
+        if n == "C64CART" && ef_loaded {
+            continue;
+        }
         if vice_find_module(data, n).is_some() {
             ignored.push(n.to_string());
         }
@@ -1424,5 +1654,195 @@ mod tests {
         assert_eq!(report.source, "c64re");
         assert_eq!(report.fidelity, Fidelity::Faithful, "c64re-own full-core save ⇒ faithful: {report:?}");
         assert_eq!(m2.ram[0x1000], 0x5a);
+    }
+
+    // ── Spec 791 slice 2 — synthetic EasyFlash VSF builders (no real EF `.vsf` needed) ─
+    //
+    // A real VICE EasyFlash VSF carries a generic "C64CART" module + the EF-specific
+    // "CARTEF" (jumper / register_00 / register_02 / IO2-RAM + the two 512K flash
+    // arrays) + two "FLASH040EF" command-FSM modules. These builders emit exactly that
+    // framing with KNOWN bytes so the loader + fidelity classifier exercise their real
+    // paths without a copyrighted game snapshot. Synthetic bytes only (NEUTRALITY).
+
+    /// Byte offset of the ROML flash marker: bank 3, in-bank offset $10 ⇒ (3<<13)|$10.
+    const EF_ROML_MARKER_OFF: usize = (3 << 13) | 0x10;
+    /// Byte offset of the ROMH flash marker: bank 3, in-bank offset $20 ⇒ (3<<13)|$20.
+    const EF_ROMH_MARKER_OFF: usize = (3 << 13) | 0x20;
+
+    /// A minimal generic "C64CART" module body (c64carthooks.c): number_of_carts +
+    /// mem_cartridge_type (= 32 EasyFlash) + two export bytes. The loader keys the EF
+    /// rebuild on the EF-specific CARTEF module, not this body — this is present so the
+    /// fidelity report has a "C64CART" module to bucket.
+    fn vice_c64cart_generic() -> Vec<u8> {
+        let mut d = Vec::new();
+        d.push(1); // number_of_carts
+        push_u32_le(&mut d, 32); // mem_cartridge_type = CARTRIDGE_EASYFLASH
+        d.push(1); // export.game
+        d.push(0); // export.exrom
+        d
+    }
+
+    /// A "CARTEF" 0.0 module body: jumper / register_00 (bank) / register_02 / RAM[256]
+    /// / ROML[512K] / ROMH[512K]. IO2-RAM carries a marker at $10; ROML a marker at
+    /// bank-3 offset $10; ROMH a marker at bank-3 offset $20.
+    fn vice_cartef(jumper: u8, register_00: u8, register_02: u8) -> Vec<u8> {
+        let mut d = Vec::with_capacity(3 + 256 + 2 * 0x80000);
+        d.push(jumper);
+        d.push(register_00);
+        d.push(register_02);
+        let mut ram = [0u8; 256];
+        ram[0x10] = 0x5a; // IO2-RAM marker
+        d.extend_from_slice(&ram);
+        let mut roml = vec![0u8; 0x80000];
+        roml[EF_ROML_MARKER_OFF] = 0x42; // ROML bank-3 marker
+        d.extend_from_slice(&roml);
+        let mut romh = vec![0u8; 0x80000];
+        romh[EF_ROMH_MARKER_OFF] = 0x99; // ROMH bank-3 marker
+        d.extend_from_slice(&romh);
+        d
+    }
+
+    /// A "FLASH040EF" 2.0 module body: state / base_state / program_byte /
+    /// erase_mask[8] / last_read.
+    fn vice_flash040ef(state: u8, base_state: u8, program_byte: u8, last_read: u8) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.push(state);
+        d.push(base_state);
+        d.push(program_byte);
+        d.extend_from_slice(&[0u8; 8]); // erase_mask
+        d.push(last_read);
+        d
+    }
+
+    /// A BankInfo for the read-only-relevant EF read/peek (EasyFlash ignores it).
+    fn ef_bankinfo() -> crate::cart::BankInfo {
+        crate::cart::BankInfo {
+            cpu_port_direction: 0x2f,
+            cpu_port_value: 0x37,
+            basic_visible: false,
+            kernal_visible: false,
+            io_visible: true,
+            char_visible: false,
+            cartridge_attached: true,
+            cartridge_exrom: Some(1),
+            cartridge_game: Some(1),
+            phi1: 0xff,
+        }
+    }
+
+    /// Build a synthetic EF VSF (header + MAINCPU + C64MEM + C64CART + CARTEF + 2×
+    /// FLASH040EF). `jumper`/`bank`/`reg02` seed the CARTEF continuation; both flash
+    /// FSMs are left in READ state.
+    fn synthetic_ef_vsf(jumper: u8, bank: u8, reg02: u8) -> Vec<u8> {
+        let mut vsf = vice_header();
+        push_vice_module(&mut vsf, "MAINCPU", &vice_maincpu(1000, 0xc000));
+        push_vice_module(&mut vsf, "C64MEM", &vice_c64mem(0xc000));
+        push_vice_module(&mut vsf, "C64CART", &vice_c64cart_generic());
+        push_vice_module(&mut vsf, "CARTEF", &vice_cartef(jumper, bank, reg02));
+        push_vice_module(&mut vsf, "FLASH040EF", &vice_flash040ef(0, 0, 0, 0)); // lo
+        push_vice_module(&mut vsf, "FLASH040EF", &vice_flash040ef(0, 0, 0, 0)); // hi
+        vsf
+    }
+
+    /// Spec 791 slice 2 (primary EF test): a synthetic EF VSF reconstructs the
+    /// EasyFlashMapper — bank / register_02 / jumper / IO2-RAM / the flash arrays — and
+    /// the live mapper reads back those exact values (bank-select → the known flash
+    /// byte; lines per the restored mode).
+    #[test]
+    fn ef_cart_reconstructed_from_vsf() {
+        let jumper = 1u8;
+        let bank = 3u8;
+        let reg02 = 0x80u8; // LED on, mode bits 0 ⇒ jumper drives Ultimax(off)/Off
+        let vsf = synthetic_ef_vsf(jumper, bank, reg02);
+
+        let mut m = Machine::new();
+        let report = load_vsf_report(&mut m, &vsf).expect("load report");
+        assert_eq!(report.source, "vice-x64sc");
+
+        {
+            let cart = m.cartridge.as_ref().expect("EF cart attached");
+            assert_eq!(cart.mapper_type(), crate::cart::MapperType::EasyFlash);
+            let st = cart.get_state();
+            assert_eq!(st.current_bank, bank as u16, "bank (register_00) restored");
+            assert_eq!(st.control_register, Some(reg02), "register_02 restored");
+            let f = st.flash.expect("flash continuation");
+            assert_eq!(f.easyflash_jumper, jumper, "jumper restored");
+            assert_eq!(f.easyflash_ram[0x10], 0x5a, "IO2 RAM restored");
+            // get_lines per the restored mode: reg02 mode-bits 0, jumper on ⇒
+            // memconfig[(1<<3)|0]=2 = Off ⇒ {exrom:1, game:1}.
+            let lines = cart.get_lines();
+            assert_eq!((lines.exrom, lines.game), (1, 1), "Off-mode lines (jumper on)");
+        }
+        // Bank-select → known flash byte: current_bank=3 maps $8010→ROML (3<<13)|$10 and
+        // $A020→ROMH (3<<13)|$20 in the restored flash arrays.
+        let bi = ef_bankinfo();
+        let cart = m.cartridge.as_ref().unwrap();
+        assert_eq!(cart.peek(0x8010, &bi), Some(0x42), "ROML bank-3 flash byte");
+        assert_eq!(cart.peek(0xa020, &bi), Some(0x99), "ROMH bank-3 flash byte");
+    }
+
+    /// Spec 791 slice 2 (fidelity): a synthetic EF VSF moves `C64CART` from the slice-1
+    /// `absent` footgun into `loaded`; a still-unrestored drive keeps the verdict honest
+    /// (`Partial`, not `Faithful`).
+    #[test]
+    fn fidelity_ef_c64cart_loaded_not_absent() {
+        let mut vsf = synthetic_ef_vsf(0, 0, 0);
+        // A drive module present-but-unrestored ⇒ the remaining gap keeps it Partial.
+        push_vice_module(&mut vsf, "DRIVE8", &[0u8; 8]);
+
+        let mut m = Machine::new();
+        let report = load_vsf_report(&mut m, &vsf).expect("load report");
+        assert!(report.loaded.iter().any(|s| s == "C64CART"), "C64CART loaded: {report:?}");
+        assert!(!report.absent.iter().any(|s| s == "C64CART"), "C64CART not absent: {:?}", report.absent);
+        assert!(report.loaded.iter().any(|s| s == "CARTEF"), "CARTEF loaded");
+        assert!(report.loaded.iter().any(|s| s == "FLASH040EF"), "FLASH040EF loaded");
+        assert_eq!(report.fidelity, Fidelity::Partial, "drive gap keeps it Partial: {report:?}");
+        assert!(report.absent.iter().any(|s| s == "DRIVE8"), "drive still absent");
+    }
+
+    /// Spec 791 slice 2 (`.c64re` embed): the RuntimeCheckpoint captured from a
+    /// VSF-reconstructed EF machine embeds the cart `.crt` bytes + the writable flash
+    /// image, so a fresh restore (= `undump` / `sandbox --seed`) re-attaches the
+    /// EasyFlash cart with the restored flash bytes, byte-exact.
+    #[test]
+    fn c64re_embeds_ef_cart_and_flash() {
+        let vsf = synthetic_ef_vsf(1, 3, 0x80);
+        let mut m = Machine::new();
+        load_vsf_report(&mut m, &vsf).expect("load");
+
+        // Capture the cart blobs exactly as convert_cmd / the daemon do.
+        let clk = m.c64_core.clk;
+        let cart_bytes = m
+            .cartridge_image
+            .as_ref()
+            .map(|i| i.raw_bytes.clone())
+            .expect("cart .crt bytes present");
+        let cart_flash = m
+            .cartridge
+            .as_mut()
+            .and_then(|c| c.writable_image(clk))
+            .expect("cart writable flash present");
+        assert_eq!(cart_flash.len(), 2 * 0x80000, "lo+hi flash = 1 MiB");
+        assert_eq!(cart_flash[EF_ROML_MARKER_OFF], 0x42, "ROML marker in captured flash");
+        assert_eq!(cart_flash[0x80000 + EF_ROMH_MARKER_OFF], 0x99, "ROMH marker in captured flash");
+
+        let cp = crate::c64re_snapshot::capture_runtime_checkpoint(
+            &m,
+            "",
+            "",
+            None,
+            None,
+            Some(&cart_bytes),
+            Some(&cart_flash),
+        );
+
+        // Re-load into a fresh machine (= the undump / sandbox --seed path).
+        let mut m2 = Machine::new();
+        crate::c64re_snapshot::restore_runtime_checkpoint(&mut m2, &cp).expect("restore .c64re");
+
+        let cart2 = m2.cartridge.as_mut().expect("EF cart re-attached from .c64re");
+        assert_eq!(cart2.mapper_type(), crate::cart::MapperType::EasyFlash);
+        let flash2 = cart2.writable_image(0).expect("writable image after restore");
+        assert_eq!(flash2, cart_flash, "flash bytes round-trip through .c64re byte-exact");
     }
 }
