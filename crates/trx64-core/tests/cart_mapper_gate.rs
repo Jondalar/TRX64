@@ -13,7 +13,8 @@
 //!   cargo test -p trx64-core --test cart_mapper_gate behavioral -- --ignored --nocapture
 
 use trx64_core::cart::{
-    load_cartridge_from_bytes, parse_crt, BankInfo, CartLines, CartState, MapperType,
+    load_cartridge_from_bytes, mapper_from_image, parse_crt, BankInfo, CartLines, CartState,
+    CrtBank, MapperType, ParsedCartridgeImage,
 };
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -847,4 +848,301 @@ fn behavioral_gmod2_boots_into_cart() {
         "CPU never executed inside the GMOD2 ROML window"
     );
     eprintln!("PASS: GMOD2 executed (flash ROML + M93C86 EEPROM mapper live).");
+}
+
+// ── REAL-SAMPLE FLASH TIER: raw 8K-bank ROML flash images ─────────────────────
+//
+// These exercise the two big-flash ROML mappers (C64MegaCart + MegaByter) on REAL
+// raw flash dumps — one 8 KiB bank per 0x2000 slice (a 1 MiB image = 128 banks).
+// The samples live under a gitignored, local-only directory and never ship; the
+// tests glob it for `*.bin`, so no fixture filename is baked into this file. When
+// the directory is absent or empty (CI, fresh clone) every test self-skips.
+//
+// Run them (fixtures present locally):
+//   cargo test -p trx64-core --test cart_mapper_gate real_flash_cart_samples -- --ignored --nocapture
+
+const COMMERCIAL_DIR: &str =
+    "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/commercial";
+
+/// Load every raw flash `.bin` under the gitignored commercial-samples directory,
+/// in a stable (sorted-path) order. Returns the raw bytes only — never the file
+/// name, so nothing identifying leaks into the test output. Empty when the dir is
+/// absent or has no `.bin` (the caller then skips).
+fn load_commercial_flash_bins() -> Vec<Vec<u8>> {
+    let rd = match std::fs::read_dir(COMMERCIAL_DIR) {
+        Ok(rd) => rd,
+        Err(_) => return Vec::new(),
+    };
+    let mut paths: Vec<std::path::PathBuf> = rd
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("bin"))
+        .collect();
+    paths.sort();
+    paths
+        .into_iter()
+        .filter_map(|p| std::fs::read(&p).ok())
+        .collect()
+}
+
+/// Build an inline ROML `ParsedCartridgeImage` from a raw flash dump — each 0x2000
+/// slice is one ROML bank — tagged with the given flash family. This mirrors what
+/// `parse_crt` produces for an 8K-bank ROML flash, without a `.crt` wrapper (a raw
+/// `.bin` has no CRT header). No profiles/ROMH needed: the flash mappers build
+/// their linear array straight from the per-bank ROML windows.
+fn roml_flash_image(bytes: &[u8], mapper_type: MapperType) -> ParsedCartridgeImage {
+    assert_eq!(
+        bytes.len() % 0x2000,
+        0,
+        "flash image must be a whole number of 8K banks"
+    );
+    let bank_count = bytes.len() / 0x2000;
+    let mut banks = std::collections::BTreeMap::new();
+    for n in 0..bank_count {
+        let mut roml = [0u8; 0x2000];
+        roml.copy_from_slice(&bytes[n * 0x2000..(n + 1) * 0x2000]);
+        banks.insert(
+            n as u16,
+            CrtBank {
+                roml: Some(roml),
+                romh_a000: None,
+                romh_e000: None,
+            },
+        );
+    }
+    ParsedCartridgeImage {
+        path: COMMERCIAL_DIR.to_string(),
+        name: "commercial".to_string(),
+        mapper_type,
+        exrom: 1,
+        game: 0,
+        banks,
+        profiles: std::collections::BTreeSet::new(),
+        raw_bytes: bytes.to_vec(),
+    }
+}
+
+/// Bank-0 read + $DE00 bank switching against the real flash bytes, on BOTH the
+/// C64MegaCart and MegaByter mappers (both are 8K-bank ROML flash, so both must
+/// serve the same dump correctly).
+#[test]
+#[ignore = "needs the gitignored samples/commercial/*.bin real flash images; run with --ignored"]
+fn real_flash_cart_samples_bank_switch() {
+    let bins = load_commercial_flash_bins();
+    if bins.is_empty() {
+        eprintln!("SKIP: no real flash samples under {COMMERCIAL_DIR} (gitignored; absent on CI)");
+        return;
+    }
+    for (i, bytes) in bins.iter().enumerate() {
+        // (1) whole number of 8K banks → bank_count.
+        assert_eq!(
+            bytes.len() % 0x2000,
+            0,
+            "sample #{i}: not a whole number of 8K banks"
+        );
+        let bank_count = bytes.len() / 0x2000;
+        assert!(bank_count >= 2, "sample #{i}: need >= 2 banks to test switching");
+        eprintln!(
+            "sample #{i}: {} bytes = {bank_count} banks of 8K",
+            bytes.len()
+        );
+
+        for mt in [MapperType::C64MegaCart, MapperType::MegaByter] {
+            let image = roml_flash_image(bytes, mt);
+            let mut m = mapper_from_image(&image).expect("build flash mapper");
+            assert_eq!(m.mapper_type(), mt);
+
+            // Bank-0 read: the ROML window == bank 0 of the real flash (spot-check
+            // several offsets incl. $8000, $8004, $9FFF).
+            for off in [0x0000u16, 0x0004, 0x1fff] {
+                let got = m.read(0x8000 + off, &bi(), 0);
+                let want = bytes[off as usize];
+                assert_eq!(
+                    got,
+                    Some(want),
+                    "sample #{i} {mt:?}: $8000+{off:#06x} = {got:?}, real flash byte {want:#04x}"
+                );
+            }
+            eprintln!(
+                "  {mt:?}: bank0 $8000={:#04x} $8004={:#04x} $9fff={:#04x} == real flash bytes",
+                bytes[0], bytes[4], bytes[0x1fff]
+            );
+
+            // Bank switch: $DE00 = k selects ROML bank k (low byte) for k < 128 →
+            // $8000 must read the first byte of bank k in the real dump.
+            for k in [1usize, bank_count / 2, bank_count - 1] {
+                assert!(
+                    k < 128,
+                    "sample #{i}: bank index {k} exceeds the $DE00 8-bit ROML select"
+                );
+                assert!(
+                    m.write(0xde00, k as u8, &bi(), 0),
+                    "sample #{i} {mt:?}: $DE00 bank write must be consumed"
+                );
+                let got = m.read(0x8000, &bi(), 0);
+                let want = bytes[k * 0x2000];
+                assert_eq!(
+                    got,
+                    Some(want),
+                    "sample #{i} {mt:?}: after $DE00={k}, $8000 = {got:?}, real flash[{:#x}] = {want:#04x}",
+                    k * 0x2000
+                );
+                eprintln!(
+                    "  {mt:?}: $DE00={k} -> $8000={want:#04x} (real flash[{:#x}])",
+                    k * 0x2000
+                );
+            }
+            // Restore bank 0.
+            m.write(0xde00, 0x00, &bi(), 0);
+        }
+    }
+}
+
+/// AMD byte-program round-trip in ultimax on BOTH flash mappers, using the real
+/// dump as the erased backdrop: pick a bank-0 cell that reads 0xFF (flash can only
+/// clear 1->0, so a program at an erased cell lands exactly), program it, read it
+/// back changed, and assert the flash reports dirty.
+#[test]
+#[ignore = "needs the gitignored samples/commercial/*.bin real flash images; run with --ignored"]
+fn real_flash_cart_samples_flash_program_roundtrip() {
+    let bins = load_commercial_flash_bins();
+    if bins.is_empty() {
+        eprintln!("SKIP: no real flash samples under {COMMERCIAL_DIR} (gitignored; absent on CI)");
+        return;
+    }
+    for (i, bytes) in bins.iter().enumerate() {
+        // A bank-0 offset that is erased (0xFF) and not an AMD magic address
+        // ($AAA/$555), so the program lands exactly and the unlock writes stay
+        // distinct from the program address.
+        let target = match (0..0x2000usize).find(|&o| bytes[o] == 0xff && o != 0xaaa && o != 0x555)
+        {
+            Some(o) => o as u16,
+            None => {
+                eprintln!("sample #{i}: no erased bank-0 cell to program — skipping this sample");
+                continue;
+            }
+        };
+        let prog = 0x5au8;
+        eprintln!(
+            "sample #{i}: program {prog:#04x} at bank-0 flash offset {target:#06x} (was 0xFF)"
+        );
+
+        // ── C64MegaCart: program via the $E000 ROMH window in ULTIMAX ($DF00=$C0).
+        {
+            let image = roml_flash_image(bytes, MapperType::C64MegaCart);
+            let mut m = mapper_from_image(&image).expect("build C64MegaCart");
+            assert!(!m.is_writable_dirty(), "sample #{i}: fresh flash must be clean");
+            m.write(0xde00, 0x00, &bi(), 0); // bank 0
+            m.write(0xdf00, 0xc0, &bi(), 0); // ULTIMAX = flash-write mode
+            assert_eq!(m.get_lines().exrom, 1, "sample #{i}: C64MegaCart ULTIMAX EXROM");
+            assert_eq!(m.get_lines().game, 0, "sample #{i}: C64MegaCart ULTIMAX GAME");
+            assert_eq!(
+                m.read(0xe000 + target, &bi(), 0),
+                Some(0xff),
+                "sample #{i}: cell erased before program"
+            );
+            // AMD AM29F160 byte-program: unlock $AAA/$555 (via $EAAA/$E555), A0, data.
+            m.write(0xeaaa, 0xaa, &bi(), 0);
+            m.write(0xe555, 0x55, &bi(), 0);
+            m.write(0xeaaa, 0xa0, &bi(), 0);
+            m.write(0xe000 + target, prog, &bi(), 0);
+            // Read back through BOTH windows (ROMH $E000 and ROML $8000 = same flash).
+            assert_eq!(
+                m.read(0xe000 + target, &bi(), 0),
+                Some(prog),
+                "sample #{i}: C64MegaCart ROMH read-back"
+            );
+            assert_eq!(
+                m.read(0x8000 + target, &bi(), 0),
+                Some(prog),
+                "sample #{i}: C64MegaCart ROML read-back (same flash cell)"
+            );
+            assert!(
+                m.is_writable_dirty(),
+                "sample #{i}: C64MegaCart flash must be dirty after program"
+            );
+            eprintln!("  C64MegaCart: $E000+{target:#06x} 0xFF -> {prog:#04x}, dirty=true");
+        }
+
+        // ── MegaByter: program via the $8000 ROML window in ULTIMAX (mode 3 / $DE02).
+        {
+            let image = roml_flash_image(bytes, MapperType::MegaByter);
+            let mut m = mapper_from_image(&image).expect("build MegaByter");
+            assert!(!m.is_writable_dirty(), "sample #{i}: fresh flash must be clean");
+            m.write(0xde00, 0x00, &bi(), 0); // bank 0 (register_00)
+            m.write(0xde02, 0x03, &bi(), 0); // register_02 mode = ULTIMAX
+            assert_eq!(m.get_lines().exrom, 1, "sample #{i}: MegaByter ULTIMAX EXROM");
+            assert_eq!(m.get_lines().game, 0, "sample #{i}: MegaByter ULTIMAX GAME");
+            assert_eq!(
+                m.read(0x8000 + target, &bi(), 0),
+                Some(0xff),
+                "sample #{i}: cell erased before program"
+            );
+            // AMD MX29F800 byte-program via the ROML window: unlock $AAA/$555 ($8AAA/$8555).
+            m.write(0x8aaa, 0xaa, &bi(), 0);
+            m.write(0x8555, 0x55, &bi(), 0);
+            m.write(0x8aaa, 0xa0, &bi(), 0);
+            m.write(0x8000 + target, prog, &bi(), 0);
+            assert_eq!(
+                m.read(0x8000 + target, &bi(), 0),
+                Some(prog),
+                "sample #{i}: MegaByter ROML read-back"
+            );
+            assert!(
+                m.is_writable_dirty(),
+                "sample #{i}: MegaByter flash must be dirty after program"
+            );
+            eprintln!("  MegaByter:   $8000+{target:#06x} 0xFF -> {prog:#04x}, dirty=true");
+        }
+    }
+}
+
+/// EXROM/GAME line transitions per mode on BOTH flash mappers (mode registers only;
+/// the flash bytes are irrelevant here, but the images are still built from the
+/// real dumps so the mapper wiring is exercised end-to-end).
+#[test]
+#[ignore = "needs the gitignored samples/commercial/*.bin real flash images; run with --ignored"]
+fn real_flash_cart_samples_mode_line_transitions() {
+    let bins = load_commercial_flash_bins();
+    if bins.is_empty() {
+        eprintln!("SKIP: no real flash samples under {COMMERCIAL_DIR} (gitignored; absent on CI)");
+        return;
+    }
+    for (i, bytes) in bins.iter().enumerate() {
+        // C64MegaCart CONTROL ($DF00) bits 7/6 → EXROM/GAME.
+        {
+            let image = roml_flash_image(bytes, MapperType::C64MegaCart);
+            let mut m = mapper_from_image(&image).expect("build C64MegaCart");
+            let l = m.get_lines();
+            assert_eq!((l.exrom, l.game), (0, 1), "sample #{i}: C64MegaCart boot = 8K GAME");
+            m.write(0xdf00, 0xc0, &bi(), 0);
+            let l = m.get_lines();
+            assert_eq!((l.exrom, l.game), (1, 0), "sample #{i}: $DF00=$C0 ULTIMAX");
+            m.write(0xdf00, 0x80, &bi(), 0);
+            let l = m.get_lines();
+            assert_eq!((l.exrom, l.game), (1, 1), "sample #{i}: $DF00=$80 RAM/kill");
+            m.write(0xdf00, 0x00, &bi(), 0);
+            let l = m.get_lines();
+            assert_eq!((l.exrom, l.game), (0, 1), "sample #{i}: $DF00=$00 8K GAME");
+        }
+        // MegaByter mode via register_02 ($DE02 bits 0-1): 8K / 16K / RAM / ULTIMAX.
+        {
+            let image = roml_flash_image(bytes, MapperType::MegaByter);
+            let mut m = mapper_from_image(&image).expect("build MegaByter");
+            let l = m.get_lines();
+            assert_eq!((l.exrom, l.game), (0, 1), "sample #{i}: MegaByter boot = 8K");
+            m.write(0xde02, 0x01, &bi(), 0);
+            let l = m.get_lines();
+            assert_eq!((l.exrom, l.game), (0, 0), "sample #{i}: mode 1 = 16K");
+            m.write(0xde02, 0x02, &bi(), 0);
+            let l = m.get_lines();
+            assert_eq!((l.exrom, l.game), (1, 1), "sample #{i}: mode 2 = RAM/off");
+            m.write(0xde02, 0x03, &bi(), 0);
+            let l = m.get_lines();
+            assert_eq!((l.exrom, l.game), (1, 0), "sample #{i}: mode 3 = ULTIMAX");
+            m.write(0xde02, 0x00, &bi(), 0);
+            let l = m.get_lines();
+            assert_eq!((l.exrom, l.game), (0, 1), "sample #{i}: mode 0 = 8K");
+        }
+        eprintln!("sample #{i}: mode/line transitions verified for both mappers");
+    }
 }
