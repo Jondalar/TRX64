@@ -48,6 +48,14 @@ pub enum MapperType {
     Gmod2,     // CARTRIDGE_GMOD2 (hw 0x3c) — flash + M93C86 EEPROM
     MegaByter, // CARTRIDGE_MEGABYTER (hw 0x56) — MX29F800CB flash, ROML only
     C64MegaCart, // CARTRIDGE_C64MEGACART (hw 61, martinpiper fork) — M29F160FT flash
+    /// Spec 790 S2 — a raw `.bin` attached with `CartType::Auto` that the S1
+    /// structural detect could not settle, now driven by the runtime
+    /// self-configuring harness (`SelfConfigCartMapper`). This is the harness's
+    /// mapper type UNTIL it locks a concrete family at runtime, at which point
+    /// `mapper_type()` returns the concrete type (never `SelfConfig`). It is not a
+    /// real cartridge hardware family — it carries no `.bin` geometry and is never
+    /// built by `mapper_from_image` (the harness is constructed directly).
+    SelfConfig,
     /// A CRT hardware-type that maps to a serial/SPI family not yet built
     /// (GMOD3 SPI-flash). Parsed but produces no mapper.
     Unsupported,
@@ -1599,6 +1607,10 @@ pub fn mapper_from_image(
         MapperType::Gmod2 => Ok(Box::new(Gmod2Mapper::new(image))),
         MapperType::MegaByter => Ok(Box::new(MegabyterMapper::new(image))),
         MapperType::C64MegaCart => Ok(Box::new(C64MegaCartMapper::new(image))),
+        // The self-config harness is constructed directly (SelfConfigCartMapper::new
+        // / load_self_config_from_bin), never from a parsed image, and locks a
+        // concrete family at runtime — so it has no image-driven build here.
+        MapperType::SelfConfig => Err(CrtError::Unsupported(MapperType::SelfConfig)),
         MapperType::Unsupported => Err(CrtError::Unsupported(MapperType::Unsupported)),
     }
 }
@@ -1689,6 +1701,9 @@ fn bin_geometry(mapper_type: MapperType) -> Result<BinGeometry, CrtError> {
         MapperType::Gmod2 => BinGeometry { bank_unit: 0x2000, layout: Roml8k, exrom: 0, game: 1, max_banks: 64 },
         MapperType::MegaByter => BinGeometry { bank_unit: 0x2000, layout: Roml8k, exrom: 0, game: 1, max_banks: 128 },
         MapperType::C64MegaCart => BinGeometry { bank_unit: 0x2000, layout: Roml8k, exrom: 0, game: 1, max_banks: 256 },
+        // The harness has no static geometry — it re-derives the concrete type's
+        // geometry via `bin_geometry(concrete)` at lock time.
+        MapperType::SelfConfig => return Err(CrtError::Unsupported(MapperType::SelfConfig)),
         MapperType::Unsupported => return Err(CrtError::Unsupported(MapperType::Unsupported)),
     };
     Ok(g)
@@ -1888,4 +1903,391 @@ pub fn detect_bin_type(data: &[u8]) -> Result<MapperType, CrtError> {
         }
     }
     Err(CrtError::BinTypeAmbiguous)
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Spec 790 S2 — runtime self-configuring cart harness
+//
+// A raw multi-bank flash `.bin` carries no reliable STATIC type marker (S1's
+// `detect_bin_type` returns `BinTypeAmbiguous` for it). Instead of erroring, the
+// `Auto` path attaches this harness: it boots the image as a generic $DE00-banked
+// 8K-game cart, then WATCHES the register accesses the loader makes and LOCKS the
+// concrete family in-place on the first type-specific access. The nice property
+// (confirmed by observing two real flash dumps of the same title): the FIRST
+// cart-register write a loader makes is already the discriminator —
+//   * a C64MegaCart image writes its $DF00 control register first, and never $DE02;
+//   * a Megabyter image writes its $DE02 mode register first, and never $DF00.
+// So very little type-specific behaviour is needed before the lock, and the lock
+// is unambiguous.
+//
+// Detection rules (SPECIFIC-FIRST — a specific discriminator always pre-empts the
+// generic $DE00 fallback):
+//   * $DF00-$DFFF write (IO2)          → C64MegaCart   (EF's $DF00 IO2-RAM is
+//                                        guarded by the eapi cue → EasyFlash).
+//   * $DE00-$DEFF write with bit1 set  → EasyFlash if the eapi signature is
+//     ($DE02-family = mode register)     present, else Megabyter.
+//   * $DE00-$DEFF read used as an       → GMOD2 (needs a prior EEPROM clocking
+//     M93C86 EEPROM DO poll               pattern, so it never misfires on a plain
+//                                         C64MegaCart high-bank number).
+//   * only $DE00 banking for a long     → MagicDesk (Ocean if 512 KiB) — the
+//     while, no specific access           residual $DE00-only family (fallback).
+//
+// On lock the harness re-parses the raw image with the concrete type's geometry
+// (`load_cartridge_from_bin`), transfers the tracked bank-low, and delegates ALL
+// subsequent read/write/peek/get_lines/state/writable calls to the concrete
+// mapper; `mapper_type()` then returns the concrete type (never `SelfConfig`).
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// The residual $DE00-only fallback fires after this many $DE00 bank-select writes
+/// with NO specific discriminator ($DF00 / $DE02-family / EEPROM read) seen — the
+/// cart is then behaviourally a Magic Desk / Ocean ($DE00-banked 8K game). The two
+/// real flash families this harness targets (C64MegaCart, Megabyter) fire their
+/// specific register on the FIRST cart access (observed ~1.8M cycles into boot,
+/// before any $DE00 write), so this fallback is never reached for them; it is the
+/// clean answer only for a genuinely $DE00-only image. Kept generous so a
+/// late-banking specific cart still locks correctly on its eventual mode write.
+pub const SELFCONFIG_MAGICDESK_FALLBACK_WRITES: u32 = 256;
+
+/// Spec 790 S2 — the runtime self-configuring cart mapper. See the module banner
+/// above. Holds the raw `.bin`, a generic AMD flash FSM over its ROML image, the
+/// pre-lock banking state, and (once resolved) the concrete delegate mapper.
+pub struct SelfConfigCartMapper {
+    /// The raw linear `.bin` (re-parsed with the concrete geometry on lock).
+    raw: Vec<u8>,
+    name: String,
+    // ── structural boot-config (just enough to BOOT before discriminators fire) ──
+    /// eapi OR a 16K reset-vector into $E000-$FFFF → boot ultimax; else 8K game.
+    boot_ultimax: bool,
+    /// The EAPI signature is present at bank-0 ROMH $1800 — the EasyFlash tiebreak.
+    eapi_present: bool,
+    // ── pre-lock generic banking ──
+    /// ROML bank low byte = the last $DE00-family ($DExx, bit1 clear) write value.
+    bank_low: u16,
+    /// The last $DE00-family write value (the GMOD2 EEPROM CS/CLK/DI line state).
+    last_de00_write: u8,
+    /// Count of GMOD2-shaped EEPROM clock edges (CS held, CLK bit toggling) — the
+    /// GMOD2 read discriminator requires ≥2 so it can never trip on a C64MegaCart
+    /// high-bank number write followed by an incidental read.
+    eeprom_clock_edges: u32,
+    /// $DE00-family bank-select write count (the Magic Desk / Ocean fallback timer).
+    de00_write_count: u32,
+    /// A generic AMD flash serving ROML reads; the concrete mapper owns the flash
+    /// post-lock (flash programming only ever happens in ultimax = post-lock).
+    flash: Flash040,
+    // ── lock ──
+    /// The concrete mapper once the type is locked; None while still detecting.
+    resolved: Option<Box<dyn CartMapper>>,
+    /// The locked concrete type (mirrors `resolved`), for `mapper_type()`.
+    resolved_type: Option<MapperType>,
+}
+
+impl Clone for SelfConfigCartMapper {
+    fn clone(&self) -> Self {
+        SelfConfigCartMapper {
+            raw: self.raw.clone(),
+            name: self.name.clone(),
+            boot_ultimax: self.boot_ultimax,
+            eapi_present: self.eapi_present,
+            bank_low: self.bank_low,
+            last_de00_write: self.last_de00_write,
+            eeprom_clock_edges: self.eeprom_clock_edges,
+            de00_write_count: self.de00_write_count,
+            flash: self.flash.clone(),
+            // Box<dyn CartMapper> clones via clone_box (the blanket impl above).
+            resolved: self.resolved.clone(),
+            resolved_type: self.resolved_type,
+        }
+    }
+}
+
+/// Compute the minimal structural boot-config from the raw bytes: enough to BOOT
+/// the image correctly (right GAME/EXROM) before the runtime discriminators fire.
+fn selfconfig_boot_config(raw: &[u8]) -> (bool /*ultimax*/, bool /*eapi*/) {
+    // eapi at bank-0 ROMH $1800 (16K-interleaved file offset $3800) → EasyFlash,
+    // which boots ultimax.
+    let eapi = raw.len() >= 0x3804 && &raw[0x3800..0x3804] == b"eapi";
+    if eapi {
+        return (true, true);
+    }
+    // A 16K image with no CBM80 whose reset vector ($3FFC/$3FFD) points into
+    // $E000-$FFFF → ultimax (the machine reboots into the cart ROMH).
+    if raw.len() == 0x4000 {
+        let reset = (raw[0x3ffc] as u16) | ((raw[0x3ffd] as u16) << 8);
+        if (0xe000..=0xffff).contains(&reset) {
+            return (true, false);
+        }
+    }
+    // else boot the common banked-flash config: 8K game (EXROM low, GAME high), so
+    // bank-0 ROML is at $8000 and its CBM80 autostart triggers the loader.
+    (false, false)
+}
+
+impl SelfConfigCartMapper {
+    /// Construct the harness for a raw `.bin` (its concrete type is unknown until
+    /// the loader runs and touches a type-specific register).
+    pub fn new(raw: &[u8], name: &str) -> Self {
+        let (boot_ultimax, eapi_present) = selfconfig_boot_config(raw);
+        SelfConfigCartMapper {
+            raw: raw.to_vec(),
+            name: name.to_string(),
+            boot_ultimax,
+            eapi_present,
+            bank_low: 0,
+            last_de00_write: 0,
+            eeprom_clock_edges: 0,
+            de00_write_count: 0,
+            // A generic 2 MiB AM29F-class row covers every candidate image; the row
+            // is only load-bearing post-lock (autoselect/program), which the
+            // concrete mapper owns, so pre-lock it just serves ROML array reads.
+            flash: Flash040::new(raw.to_vec(), "self-config", FLASH040_160),
+            resolved: None,
+            resolved_type: None,
+        }
+    }
+
+    /// Whether a concrete family has been locked.
+    #[inline]
+    pub fn is_resolved(&self) -> bool {
+        self.resolved.is_some()
+    }
+
+    /// The pre-lock boot EXROM/GAME lines from the structural boot-config.
+    #[inline]
+    fn boot_lines(&self) -> CartLines {
+        if self.boot_ultimax {
+            CartLines { exrom: 1, game: 0 } // ultimax (eapi / reset-vector cart)
+        } else {
+            CartLines { exrom: 0, game: 1 } // 8K game (bank-0 ROML autostart)
+        }
+    }
+
+    /// The linear ROML flash offset for `address` in the current pre-lock bank.
+    #[inline]
+    fn roml_offset(&self, address: u16) -> u32 {
+        ((self.bank_low as u32) << 13) | ((address & 0x1fff) as u32)
+    }
+
+    /// Lock the concrete family: re-parse the raw image with `t`'s geometry, build
+    /// the concrete mapper, and transfer the tracked bank-low into it (via a $DE00
+    /// bank-select write — every candidate maps a $DE00 write to its bank register).
+    /// The TRIGGERING register write is re-applied by the caller after this returns.
+    fn lock(&mut self, t: MapperType, bank_info: &BankInfo, clk: u64) {
+        if self.resolved.is_some() {
+            return;
+        }
+        // Geometry mismatch (e.g. size exceeds the concrete family's capacity) keeps
+        // the harness detecting generically (mapper_type stays SelfConfig) rather than
+        // attaching a wrong-geometry mapper — practically unreachable for the families
+        // this harness locks.
+        if let Ok((_img, mut mapper)) = load_cartridge_from_bin(&self.raw, &self.name, t) {
+            if self.bank_low != 0 {
+                mapper.write(0xde00, self.bank_low as u8, bank_info, clk);
+            }
+            self.resolved = Some(mapper);
+            self.resolved_type = Some(t);
+        }
+    }
+}
+
+impl CartMapper for SelfConfigCartMapper {
+    fn mapper_type(&self) -> MapperType {
+        self.resolved_type.unwrap_or(MapperType::SelfConfig)
+    }
+
+    fn get_lines(&self) -> CartLines {
+        match &self.resolved {
+            Some(m) => m.get_lines(),
+            None => self.boot_lines(),
+        }
+    }
+
+    fn read(&mut self, address: u16, bank_info: &BankInfo, clk: u64) -> Option<u8> {
+        if let Some(m) = self.resolved.as_mut() {
+            return m.read(address, bank_info, clk);
+        }
+        // ── pre-lock generic read ──
+        if (0xde00..=0xdeff).contains(&address) {
+            // A meaningful IO1 read is GMOD2's M93C86 DO poll — but only once we've
+            // seen the EEPROM being clocked (CS held while CLK toggles), so an
+            // incidental read on a $DE00-banked cart can't trip it.
+            if self.eeprom_clock_edges >= 2 && (self.last_de00_write & 0x40) != 0 {
+                self.lock(MapperType::Gmod2, bank_info, clk);
+                if let Some(m) = self.resolved.as_mut() {
+                    return m.read(address, bank_info, clk);
+                }
+            }
+            return None; // open bus (no cart IO1 read pre-lock)
+        }
+        if (0xdf00..=0xdfff).contains(&address) {
+            return None; // IO2 read → open bus pre-lock
+        }
+        if (0x8000..=0x9fff).contains(&address) {
+            return Some(self.flash.read(self.roml_offset(address), clk));
+        }
+        // ROMH windows only for an ultimax boot (best-effort ROML-bank serving; the
+        // interleaved-EF case is caught structurally before the harness).
+        if self.boot_ultimax
+            && ((0xa000..=0xbfff).contains(&address) || (0xe000..=0xffff).contains(&address))
+        {
+            return Some(self.flash.read(self.roml_offset(address), clk));
+        }
+        None
+    }
+
+    fn peek(&self, address: u16, bank_info: &BankInfo) -> Option<u8> {
+        if let Some(m) = self.resolved.as_ref() {
+            return m.peek(address, bank_info);
+        }
+        if (0x8000..=0x9fff).contains(&address) {
+            return Some(self.flash.peek(self.roml_offset(address)));
+        }
+        if self.boot_ultimax
+            && ((0xa000..=0xbfff).contains(&address) || (0xe000..=0xffff).contains(&address))
+        {
+            return Some(self.flash.peek(self.roml_offset(address)));
+        }
+        None
+    }
+
+    fn write(&mut self, address: u16, value: u8, bank_info: &BankInfo, clk: u64) -> bool {
+        if let Some(m) = self.resolved.as_mut() {
+            return m.write(address, value, bank_info, clk);
+        }
+        // ── pre-lock discriminator watch (SPECIFIC-FIRST) ──
+        // IO2 ($DF00) write → C64MegaCart control register (unless eapi ⇒ EF IO2-RAM).
+        if (0xdf00..=0xdfff).contains(&address) {
+            let t = if self.eapi_present {
+                MapperType::EasyFlash
+            } else {
+                MapperType::C64MegaCart
+            };
+            self.lock(t, bank_info, clk);
+            if let Some(m) = self.resolved.as_mut() {
+                return m.write(address, value, bank_info, clk);
+            }
+            return true;
+        }
+        if (0xde00..=0xdeff).contains(&address) {
+            // $DExx with bit1 set = the EasyFlash / Megabyter MODE register.
+            if address & 2 != 0 {
+                let t = if self.eapi_present {
+                    MapperType::EasyFlash
+                } else {
+                    MapperType::MegaByter
+                };
+                self.lock(t, bank_info, clk);
+                if let Some(m) = self.resolved.as_mut() {
+                    return m.write(address, value, bank_info, clk);
+                }
+                return true;
+            }
+            // $DExx bit1 clear = the generic ROML bank-low select (every candidate).
+            // Track the GMOD2 EEPROM clocking pattern: CS (bit6) held while the CLK
+            // (bit5) bit toggles between successive writes.
+            if (value & 0x40) != 0 && (self.last_de00_write & 0x40) != 0 && ((value ^ self.last_de00_write) & 0x20) != 0 {
+                self.eeprom_clock_edges = self.eeprom_clock_edges.saturating_add(1);
+            }
+            self.last_de00_write = value;
+            self.bank_low = value as u16;
+            self.de00_write_count = self.de00_write_count.saturating_add(1);
+            // Residual $DE00-only fallback → Magic Desk (Ocean if 512 KiB).
+            if self.de00_write_count >= SELFCONFIG_MAGICDESK_FALLBACK_WRITES {
+                let t = if self.raw.len() == 0x80000 {
+                    MapperType::Ocean
+                } else {
+                    MapperType::MagicDesk
+                };
+                self.lock(t, bank_info, clk);
+                if let Some(m) = self.resolved.as_mut() {
+                    return m.write(address, value, bank_info, clk);
+                }
+            }
+            return true;
+        }
+        // ROML/ROMH writes: program the flash only in an ultimax boot (faithful to
+        // "flash program only in ultimax"); else non-consumed (falls to RAM).
+        if self.boot_ultimax
+            && ((0x8000..=0x9fff).contains(&address) || (0xe000..=0xffff).contains(&address))
+        {
+            self.flash.store(self.roml_offset(address), value, clk);
+            return true;
+        }
+        false
+    }
+
+    fn reset(&mut self) {
+        if let Some(m) = self.resolved.as_mut() {
+            m.reset();
+            return;
+        }
+        // Pre-lock reset → boot config: bank 0, cleared detection counters. The
+        // pre-lock flash array is never programmed (programming is post-lock in
+        // ultimax), so it needs no re-init.
+        self.bank_low = 0;
+        self.last_de00_write = 0;
+        self.eeprom_clock_edges = 0;
+        self.de00_write_count = 0;
+    }
+
+    fn get_state(&self) -> CartState {
+        match &self.resolved {
+            Some(m) => m.get_state(),
+            None => CartState { current_bank: self.bank_low, control_register: None, flash: None },
+        }
+    }
+
+    fn set_state(&mut self, state: CartState) {
+        match self.resolved.as_mut() {
+            Some(m) => m.set_state(state),
+            None => self.bank_low = state.current_bank & 0xff,
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn CartMapper> {
+        Box::new(self.clone())
+    }
+
+    // ── writable tier: delegate to the concrete mapper once locked ──
+    fn is_writable_dirty(&self) -> bool {
+        self.resolved.as_ref().map(|m| m.is_writable_dirty()).unwrap_or(false)
+    }
+    fn writable_generation(&self) -> u64 {
+        self.resolved.as_ref().map(|m| m.writable_generation()).unwrap_or(0)
+    }
+    fn persists_writable_state(&self) -> bool {
+        self.resolved.as_ref().map(|m| m.persists_writable_state()).unwrap_or(false)
+    }
+    fn writable_image(&mut self, clk: u64) -> Option<Vec<u8>> {
+        self.resolved.as_mut().and_then(|m| m.writable_image(clk))
+    }
+    fn set_writable_image(&mut self, bytes: &[u8]) {
+        if let Some(m) = self.resolved.as_mut() {
+            m.set_writable_image(bytes);
+        }
+    }
+    fn crt_image(&mut self, clk: u64) -> Option<Vec<u8>> {
+        self.resolved.as_mut().and_then(|m| m.crt_image(clk))
+    }
+}
+
+/// Spec 790 S2 — build the self-configuring harness for a raw `.bin` whose type S1
+/// could not settle. Returns a `SelfConfig`-typed image record (raw bytes + name,
+/// 8K-game boot lines) alongside the harness. The concrete type is resolved at
+/// runtime (query `mapper_type()` after the loader banks).
+pub fn load_self_config_from_bin(
+    data: &[u8],
+    name: &str,
+) -> Result<(ParsedCartridgeImage, Box<dyn CartMapper>), CrtError> {
+    let image = ParsedCartridgeImage {
+        path: name.to_string(),
+        name: name.to_string(),
+        mapper_type: MapperType::SelfConfig,
+        exrom: 0,
+        game: 1, // 8K-game boot default; the harness's get_lines() is authoritative
+        banks: BTreeMap::new(),
+        profiles: std::collections::BTreeSet::new(),
+        raw_bytes: data.to_vec(),
+    };
+    let mapper: Box<dyn CartMapper> = Box::new(SelfConfigCartMapper::new(data, name));
+    Ok((image, mapper))
 }

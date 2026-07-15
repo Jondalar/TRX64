@@ -897,11 +897,21 @@ impl Machine {
             };
             cart::load_cartridge_from_bytes(bytes, name, override_ty)?
         } else {
-            let concrete = match ty {
-                cart::CartType::Forced(t) => t,
-                cart::CartType::Auto => cart::detect_bin_type(bytes)?,
-            };
-            cart::load_cartridge_from_bin(bytes, name, concrete)?
+            match ty {
+                cart::CartType::Forced(t) => cart::load_cartridge_from_bin(bytes, name, t)?,
+                // Spec 790 S2 — `Auto` raw `.bin`: settle the structural cases (eapi
+                // / CBM80 / ultimax) directly; otherwise, instead of erroring
+                // `BinTypeAmbiguous`, attach the runtime self-configuring harness,
+                // which boots the image and locks the concrete flash family in-place
+                // on the first type-specific register access it observes.
+                cart::CartType::Auto => match cart::detect_bin_type(bytes) {
+                    Ok(t) => cart::load_cartridge_from_bin(bytes, name, t)?,
+                    Err(cart::CrtError::BinTypeAmbiguous) => {
+                        cart::load_self_config_from_bin(bytes, name)?
+                    }
+                    Err(e) => return Err(e),
+                },
+            }
         };
         let result = (image.name.clone(), image.mapper_type);
         self.cartridge = Some(mapper);

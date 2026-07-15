@@ -1,6 +1,7 @@
 # Spec 790 — Raw `.bin` Cartridge Attach with a Typed Attach (`Auto` | `Forced`)
 
-**Status:** PROPOSED (2026-07-15); **Slice 1 (S1) IN PROGRESS.** **Repo:** TRX64.
+**Status:** PROPOSED (2026-07-15); **Slice 1 (S1) SHIPPED; Slice 2 (S2) BUILT
+(2026-07-15) — the runtime self-configuring harness.** **Repo:** TRX64.
 **Shared cross-repo numbering** (registry = C64RE `specs/README.md`).
 
 > **Model correction (S1, 2026-07-15):** the attach type is **not** an
@@ -252,14 +253,41 @@ tiered:
   which asks the caller for an explicit `--cart-type`. S1 never guesses a banked
   flash family from bytes alone.
 
-- **S2 — runtime self-configuring cart harness (next slice, NOT built here).**
-  Attach the image as a generic banked cart, run it, and **watch** the register
-  writes it makes — `$DE00`/`$DE02` (Magic Desk / Megabyter / EasyFlash bank+mode),
-  `$DF00` (C64MegaCart control), and the AMD flash command sequence
-  (`AA`/`55`/`A0`/`80`/`30` unlock+program+erase writes) — to fingerprint the mapper
-  and **lock the concrete type in-place**, with the S1 eapi/size cues as tiebreak.
-  This resolves the cases S1 leaves ambiguous, without a UI prompt. Deferred to
-  Spec 790 S2.
+- **S2 — runtime self-configuring cart harness (BUILT 2026-07-15).** In the `Auto`
+  raw-`.bin` path, an image S1 cannot settle no longer errors `BinTypeAmbiguous`; it
+  attaches `cart::SelfConfigCartMapper` (a `CartMapper`) instead. The harness holds
+  the raw image + a generic AMD `Flash040`, computes a minimal **structural
+  boot-config** (eapi at bank-0 ROMH `$1800` / a 16 KiB reset-vector into
+  `$E000-$FFFF` → boot ultimax; else 8 KiB game so bank-0 ROML autostarts), and boots
+  the image as a generic `$DE00`-banked cart. It then **watches** the register
+  accesses the running loader makes and **locks the concrete type in-place** on the
+  first type-specific one (SPECIFIC-FIRST):
+
+  - `$DF00` (IO2) write → **C64MegaCart** (`$DF00` under the eapi cue → EasyFlash
+    IO2-RAM instead);
+  - `$DE00`-family write with **bit 1 set** (the mode register) → **EasyFlash** if the
+    eapi signature is present, else **Megabyter**;
+  - `$DE00` read used as an M93C86 EEPROM `DO` poll (after a CS-held/CLK-toggling
+    write pattern) → **GMOD2** (the clock-edge guard prevents a false lock on a plain
+    C64MegaCart high-bank number);
+  - only `$DE00` banking for a long run with no specific access → the residual
+    **Magic Desk** (Ocean at 512 KiB) family.
+
+  On lock the harness re-parses the raw image with the concrete type's geometry
+  (`load_cartridge_from_bin`), transfers the tracked bank-low, and delegates every
+  subsequent `read`/`write`/`peek`/`get_lines`/state/writable call to the concrete
+  mapper; `mapper_type()` returns the concrete type thereafter (the pre-lock value is
+  `MapperType::SelfConfig`, surfaced by the daemon `cart_status` as `self_config`).
+  The nice property — the FIRST cart-register write a loader makes is already the
+  discriminator — was confirmed against two real raw flash dumps of one title in two
+  cart formats: each boots on the generic config, then locks a **distinct** concrete
+  type from the register its loader writes (`$DF00` → C64MegaCart, `$DE02` → Megabyter)
+  ~1.8M cycles into boot, with no cross-contamination (the C64MegaCart image never
+  touches `$DE02`; the Megabyter image never touches `$DF00`). Gate:
+  `crates/trx64-core/tests/cart_bin_gate.rs` — synthetic per-discriminator locks
+  (always-run) + a real-data lock gate (`--ignored`, globs the local fixtures, prints
+  `sample #N` only, and fails-with-report rather than faking a pass if a fixture does
+  not bank within the window).
 
 ## Non-goals
 
@@ -291,6 +319,13 @@ tiered:
 6. Gate: the new `cart_mapper_gate` cases green; full workspace + `gate.sh` green.
 7. A real end-to-end: dump an existing `.crt` cart's full flash to `.bin`, attach it
    via `--cart-type`, confirm it boots identically to the `.crt` (same first frame).
+8. **(S2)** A raw `.bin` + `Auto` that the S1 detect cannot settle now **attaches the
+   self-config harness** (`MapperType::SelfConfig`) instead of failing
+   `BinTypeAmbiguous` — this supersedes the S1 "fails `BinTypeAmbiguous`" half of #3/#4
+   for the machine attach path (the library `detect_bin_type` still returns the error;
+   the attach door catches it and installs the harness). Booting the image and running
+   it must lock a concrete family; two real fixtures of one title in different formats
+   lock **distinct** types (C64MegaCart via `$DF00`, Megabyter via `$DE02`).
 
 ## Open questions
 

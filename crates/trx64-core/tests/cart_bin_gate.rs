@@ -10,7 +10,7 @@
 
 use trx64_core::cart::{
     self, load_cartridge_from_bin, mapper_from_image, parse_bin, resolve_cart_type, BankInfo,
-    CartType, CrtError, MapperType,
+    CartMapper, CartType, CrtError, MapperType,
 };
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -271,15 +271,19 @@ fn attach_typed_raw_bin_auto_eapi_detects_easyflash() {
 }
 
 #[test]
-fn attach_typed_raw_bin_auto_ambiguous_errors() {
+fn attach_typed_raw_bin_auto_ambiguous_attaches_self_config_harness() {
     use trx64_core::Machine;
     // 4 banks of 8K, no eapi, no CBM80 → the S1 structural detect cannot settle.
+    // Spec 790 S2: instead of `BinTypeAmbiguous`, the Auto path now attaches the
+    // runtime self-configuring harness, which resolves the concrete type at runtime.
     let bin = raw_8k_bin(4);
     let mut m = Machine::new();
-    match m.attach_cart_typed(&bin, "x", CartType::Auto) {
-        Err(CrtError::BinTypeAmbiguous) => {}
-        other => panic!("expected BinTypeAmbiguous, got {other:?}"),
-    }
+    let (name, ty) = m
+        .attach_cart_typed(&bin, "x", CartType::Auto)
+        .expect("ambiguous raw bin now attaches the self-config harness");
+    assert_eq!(name, "x");
+    // Unlocked until the loader touches a type-specific register at runtime.
+    assert_eq!(ty, MapperType::SelfConfig);
 }
 
 #[test]
@@ -308,4 +312,266 @@ fn attach_from_bytes_wrapper_matches_auto() {
     let mut m = Machine::new();
     let (_n, ty) = m.attach_cart_from_bytes(&crt, "MD").expect("wrapper attach");
     assert_eq!(ty, MapperType::MagicDesk);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Spec 790 Slice 2 — the runtime self-configuring cart harness.
+//
+// A raw multi-bank flash `.bin` (no reliable static type marker) attaches the
+// `SelfConfigCartMapper`, which boots the image as a generic $DE00-banked 8K-game
+// cart and LOCKS the concrete flash family in-place on the first type-specific
+// register access. Two layers below:
+//   1. SYNTHETIC (always run): drive each discriminator directly on the harness and
+//      assert it locks the right type + post-lock reads match the concrete mapper.
+//   2. REAL-DATA (gated on ROMs + local `.bin` fixtures, run with `--ignored`): boot
+//      each raw fixture, run, and assert the harness locks a concrete type; two
+//      fixtures of the same title in different formats must lock DIFFERENT types.
+//      NEUTRAL: the dir is globbed, only `sample #N` is printed — no filenames.
+// ══════════════════════════════════════════════════════════════════════════════
+
+use trx64_core::cart::{SelfConfigCartMapper, SELFCONFIG_MAGICDESK_FALLBACK_WRITES};
+
+/// A raw 8K-bank ROML `.bin` whose bank N's byte 0 = `0xA0+N` and byte $1FFF =
+/// `0xB0+N` — so a bank-select is verifiable from the served ROML byte.
+fn raw_8k_marked(banks: usize) -> Vec<u8> {
+    let mut v = vec![0u8; banks * 0x2000];
+    for n in 0..banks {
+        v[n * 0x2000] = 0xa0 + n as u8;
+        v[n * 0x2000 + 0x1fff] = 0xb0 + n as u8;
+    }
+    v
+}
+
+#[test]
+fn self_config_pre_lock_serves_roml_and_banks_generically() {
+    // Before any discriminator fires the harness is unresolved and serves ROML from
+    // the $DE00-selected bank (the generic behaviour that lets a loader boot + run).
+    let bin = raw_8k_marked(4);
+    let mut h = SelfConfigCartMapper::new(&bin, "x");
+    assert_eq!(h.mapper_type(), MapperType::SelfConfig);
+    assert!(!h.is_resolved());
+    assert_eq!(h.read(0x8000, &bi(), 0), Some(0xa0)); // bank 0
+    assert_eq!(h.read(0x9fff, &bi(), 0), Some(0xb0));
+    h.write(0xde00, 0x02, &bi(), 0); // select bank 2 (generic bank-low)
+    assert_eq!(h.read(0x8000, &bi(), 0), Some(0xa2));
+    assert_eq!(h.read(0x9fff, &bi(), 0), Some(0xb2));
+    // Still unresolved: a plain $DE00 write is not a type-specific discriminator.
+    assert_eq!(h.mapper_type(), MapperType::SelfConfig);
+}
+
+#[test]
+fn self_config_locks_c64megacart_on_df00_write() {
+    let bin = raw_8k_marked(8);
+    let mut h = SelfConfigCartMapper::new(&bin, "x");
+    h.write(0xde00, 0x03, &bi(), 0); // bank low = 3 (pre-lock)
+    let consumed = h.write(0xdf00, 0x00, &bi(), 0); // IO2 control → LOCK C64MegaCart
+    assert!(consumed);
+    assert_eq!(h.mapper_type(), MapperType::C64MegaCart);
+    assert!(h.is_resolved());
+
+    // Post-lock behaviour must match a fresh concrete C64MegaCart driven the same way.
+    let (_img, mut cc) =
+        load_cartridge_from_bin(&bin, "x", MapperType::C64MegaCart).unwrap();
+    cc.write(0xde00, 0x03, &bi(), 0);
+    cc.write(0xdf00, 0x00, &bi(), 0);
+    for bank in [0u8, 3, 5, 7] {
+        h.write(0xde00, bank, &bi(), 0);
+        cc.write(0xde00, bank, &bi(), 0);
+        assert_eq!(h.read(0x8000, &bi(), 0), cc.read(0x8000, &bi(), 0), "bank {bank} ROML");
+        assert_eq!(h.read(0x9fff, &bi(), 0), cc.read(0x9fff, &bi(), 0), "bank {bank} ROML end");
+    }
+    assert_eq!(h.get_lines().exrom, cc.get_lines().exrom);
+    assert_eq!(h.get_lines().game, cc.get_lines().game);
+}
+
+#[test]
+fn self_config_locks_megabyter_on_de02_write() {
+    let bin = raw_8k_marked(8);
+    let mut h = SelfConfigCartMapper::new(&bin, "x");
+    h.write(0xde00, 0x02, &bi(), 0); // bank low = 2 (pre-lock)
+    let consumed = h.write(0xde02, 0x00, &bi(), 0); // $DE02 mode → LOCK Megabyter
+    assert!(consumed);
+    assert_eq!(h.mapper_type(), MapperType::MegaByter);
+
+    let (_img, mut mb) = load_cartridge_from_bin(&bin, "x", MapperType::MegaByter).unwrap();
+    mb.write(0xde00, 0x02, &bi(), 0);
+    mb.write(0xde02, 0x00, &bi(), 0);
+    for bank in [0u8, 2, 4, 7] {
+        h.write(0xde00, bank, &bi(), 0);
+        mb.write(0xde00, bank, &bi(), 0);
+        assert_eq!(h.read(0x8000, &bi(), 0), mb.read(0x8000, &bi(), 0), "bank {bank}");
+    }
+    assert_eq!(h.get_lines().game, mb.get_lines().game);
+}
+
+#[test]
+fn self_config_locks_easyflash_on_de02_when_eapi_present() {
+    // A 16K-interleaved image with the eapi signature at bank-0 ROMH $1800 ⇒ the
+    // $DE02 mode-register discriminator resolves to EasyFlash (eapi tiebreak), not
+    // Megabyter. (In the Auto attach path such an image is already caught by the S1
+    // structural eapi detect; this asserts the harness's own tiebreak directly.)
+    let mut bin = vec![0xffu8; 2 * 0x4000];
+    bin[0x3800..0x3804].copy_from_slice(b"eapi"); // bank-0 ROMH $1800
+    let mut h = SelfConfigCartMapper::new(&bin, "ef");
+    // eapi ⇒ boot ultimax lines pre-lock.
+    assert_eq!(h.get_lines().exrom, 1);
+    assert_eq!(h.get_lines().game, 0);
+    h.write(0xde02, 0x00, &bi(), 0); // mode register → LOCK EasyFlash (eapi)
+    assert_eq!(h.mapper_type(), MapperType::EasyFlash);
+}
+
+#[test]
+fn self_config_locks_magicdesk_on_de00_only_quiescence() {
+    // A cart that only ever banks through $DE00 (no $DF00 / $DE02 / EEPROM read) is
+    // the Magic Desk / Ocean residual: after the fallback threshold of $DE00-only
+    // writes with no specific discriminator, the harness locks Magic Desk.
+    let bin = raw_8k_marked(4);
+    let mut h = SelfConfigCartMapper::new(&bin, "md");
+    for i in 0..SELFCONFIG_MAGICDESK_FALLBACK_WRITES {
+        // Keep bit1 clear (bank-low family) and CS/CLK quiet so only the $DE00
+        // fallback path is exercised.
+        h.write(0xde00, (i % 4) as u8, &bi(), 0);
+    }
+    assert_eq!(h.mapper_type(), MapperType::MagicDesk);
+
+    // Post-lock behaviour matches a fresh Magic Desk driven with the same last bank.
+    let (_img, mut md) = load_cartridge_from_bin(&bin, "md", MapperType::MagicDesk).unwrap();
+    for bank in [0u8, 1, 2, 3] {
+        h.write(0xde00, bank, &bi(), 0);
+        md.write(0xde00, bank, &bi(), 0);
+        assert_eq!(h.read(0x8000, &bi(), 0), md.read(0x8000, &bi(), 0), "bank {bank}");
+    }
+    // Magic Desk disable bit (bit7) releases the cart on both.
+    h.write(0xde00, 0x80, &bi(), 0);
+    md.write(0xde00, 0x80, &bi(), 0);
+    assert_eq!(h.get_lines().exrom, md.get_lines().exrom);
+    assert_eq!(h.get_lines().game, md.get_lines().game);
+}
+
+#[test]
+fn self_config_specific_discriminator_preempts_magicdesk_fallback() {
+    // Even after many $DE00 writes (short of the fallback), the first $DF00 write
+    // still locks C64MegaCart — specific-first ordering.
+    let bin = raw_8k_marked(8);
+    let mut h = SelfConfigCartMapper::new(&bin, "x");
+    for _ in 0..(SELFCONFIG_MAGICDESK_FALLBACK_WRITES - 1) {
+        h.write(0xde00, 0x01, &bi(), 0);
+    }
+    assert_eq!(h.mapper_type(), MapperType::SelfConfig); // not yet fallen back
+    h.write(0xdf00, 0x00, &bi(), 0);
+    assert_eq!(h.mapper_type(), MapperType::C64MegaCart);
+}
+
+// ── REAL-DATA lock gate (gated on ROMs + local `.bin` fixtures) ───────────────
+
+const ROM_DIR: &str = "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/resources/roms";
+const COMMERCIAL_BIN_DIR: &str =
+    "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/commercial";
+
+#[test]
+#[ignore = "needs ROMs + local samples/commercial/*.bin; run with --ignored --nocapture"]
+fn self_config_real_bins_lock_distinct_types() {
+    use std::path::Path;
+    use trx64_core::{Machine, NullSink};
+
+    if !Path::new(ROM_DIR).join("kernal-901227-03.bin").exists() {
+        eprintln!("SKIP: ROMs absent");
+        return;
+    }
+    let mut bins: Vec<std::path::PathBuf> = match std::fs::read_dir(COMMERCIAL_BIN_DIR) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|x| x == "bin").unwrap_or(false))
+            .collect(),
+        Err(_) => {
+            eprintln!("SKIP: {COMMERCIAL_BIN_DIR} absent");
+            return;
+        }
+    };
+    if bins.is_empty() {
+        eprintln!("SKIP: no *.bin fixtures in {COMMERCIAL_BIN_DIR}");
+        return;
+    }
+    bins.sort(); // deterministic sample ordering; filenames are NOT surfaced
+
+    // Generous window for the loader's init banking (observed discriminator ~1.8M
+    // cycles into boot for these fixtures); run in chunks and early-exit on lock.
+    const CHUNK: u64 = 200_000;
+    const BUDGET: u64 = 8_000_000;
+
+    let mut locked_types: Vec<MapperType> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+
+    for (i, path) in bins.iter().enumerate() {
+        let raw = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(_) => {
+                failures.push(format!("sample #{i}: unreadable"));
+                continue;
+            }
+        };
+        let mut m = Machine::new();
+        m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+        let (_name, attach_ty) = m
+            .attach_cart_typed(&raw, "sample", CartType::Auto)
+            .expect("raw .bin attaches the self-config harness under Auto");
+        // A raw flash dump with no static marker must attach UNRESOLVED (the harness).
+        assert_eq!(attach_ty, MapperType::SelfConfig, "sample #{i} should attach the harness");
+        m.cold_reset();
+
+        let mut sink = NullSink;
+        let mut ran: u64 = 0;
+        let mut locked: Option<(MapperType, u64)> = None;
+        while ran < BUDGET {
+            m.run_for_full(CHUNK, &mut sink, |_, _, _, _, _, _, _| {});
+            ran += CHUNK;
+            let ty = m.cartridge.as_ref().map(|c| c.mapper_type()).unwrap_or(MapperType::SelfConfig);
+            if ty != MapperType::SelfConfig {
+                locked = Some((ty, ran));
+                break;
+            }
+        }
+
+        match locked {
+            Some((ty, cyc)) => {
+                eprintln!("sample #{i}: LOCKED {ty:?} after ~{cyc} cycles (final_pc=${:04X})", m.cpu.pc);
+                locked_types.push(ty);
+            }
+            None => {
+                // REPORT (per the gate contract) rather than fake a pass.
+                let msg = format!(
+                    "sample #{i}: did NOT lock within {BUDGET} cycles (banks-late / no register write in window, final_pc=${:04X})",
+                    m.cpu.pc
+                );
+                eprintln!("{msg}");
+                failures.push(msg);
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "self-config harness failed to lock on {} fixture(s): {:?}",
+        failures.len(),
+        failures
+    );
+    // Each fixture locked a concrete flash family.
+    for (i, ty) in locked_types.iter().enumerate() {
+        assert_ne!(*ty, MapperType::SelfConfig, "sample #{i} unresolved");
+    }
+    // Two fixtures of the SAME title in DIFFERENT cart formats must lock DIFFERENT
+    // types (the whole point: the harness discriminates the formats by the register
+    // each loader writes).
+    if locked_types.len() >= 2 {
+        let mut uniq = locked_types.clone();
+        uniq.sort_by_key(|t| format!("{t:?}"));
+        uniq.dedup();
+        assert_eq!(
+            uniq.len(),
+            locked_types.len(),
+            "expected each fixture to lock a DISTINCT type, got {locked_types:?}"
+        );
+        eprintln!("PASS: {} fixtures locked distinct types {:?}", locked_types.len(), locked_types);
+    }
 }
