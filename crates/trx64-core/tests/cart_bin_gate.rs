@@ -575,3 +575,89 @@ fn self_config_real_bins_lock_distinct_types() {
         eprintln!("PASS: {} fixtures locked distinct types {:?}", locked_types.len(), locked_types);
     }
 }
+
+// Real EasyFlash cart, re-linearized from a .crt into a raw 16K-per-bank .bin
+// (ROML 8K ++ ROMH 8K) and attached under Auto → the harness must auto-lock
+// EasyFlash. Neutral + env-gated (no fixture identity in code): set
+// C64RE_EF_CRT_SAMPLE to any EasyFlash .crt. Run: `--ignored --nocapture`.
+#[test]
+#[ignore = "needs C64RE_EF_CRT_SAMPLE=<an EasyFlash .crt> + ROMs; run with --ignored"]
+fn self_config_locks_easyflash_on_real_ef_crt() {
+    use std::path::Path;
+    use trx64_core::cart::parse_crt;
+    use trx64_core::{Machine, NullSink};
+
+    let crt_path = match std::env::var("C64RE_EF_CRT_SAMPLE") {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("SKIP: C64RE_EF_CRT_SAMPLE unset");
+            return;
+        }
+    };
+    if !Path::new(ROM_DIR).join("kernal-901227-03.bin").exists() {
+        eprintln!("SKIP: ROMs absent");
+        return;
+    }
+    let crt = match std::fs::read(&crt_path) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("SKIP: crt unreadable");
+            return;
+        }
+    };
+    let img = parse_crt(&crt, "efsample", None).expect("parse .crt");
+    assert_eq!(img.mapper_type, MapperType::EasyFlash, "sample is not an EasyFlash .crt");
+
+    // Re-linearize to the raw EF .bin layout: 16K per bank = ROML(8K) ++ ROMH(8K).
+    let max_bank = *img.banks.keys().max().unwrap() as usize;
+    let mut bin: Vec<u8> = Vec::with_capacity((max_bank + 1) * 0x4000);
+    for n in 0..=max_bank {
+        let b = img.banks.get(&(n as u16));
+        let roml = b.and_then(|b| b.roml).unwrap_or([0xff; 0x2000]);
+        let romh = b.and_then(|b| b.romh_a000.or(b.romh_e000)).unwrap_or([0xff; 0x2000]);
+        bin.extend_from_slice(&roml);
+        bin.extend_from_slice(&romh);
+    }
+
+    let mut m = Machine::new();
+    m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+    let (_n, attach_ty) = m
+        .attach_cart_typed(&bin, "efsample", CartType::Auto)
+        .expect("attach EF .bin via Auto");
+
+    // EF is detectable STRUCTURALLY (the eapi signature is a definitive static
+    // marker) — so the Auto path may resolve EasyFlash immediately at attach,
+    // without running. If it does not (attaches the harness), run until the
+    // loader's first $DE02 write locks it. Either path must end at EasyFlash.
+    if attach_ty != MapperType::SelfConfig {
+        eprintln!("real EF .crt: EasyFlash detected STRUCTURALLY at attach (eapi)");
+        assert_eq!(attach_ty, MapperType::EasyFlash, "structural detect must be EasyFlash");
+        return;
+    }
+
+    m.cold_reset();
+    let mut sink = NullSink;
+    let mut ran: u64 = 0;
+    let mut locked: Option<(MapperType, u64)> = None;
+    const CHUNK: u64 = 200_000;
+    const BUDGET: u64 = 16_000_000;
+    while ran < BUDGET {
+        m.run_for_full(CHUNK, &mut sink, |_, _, _, _, _, _, _| {});
+        ran += CHUNK;
+        let ty = m.cartridge.as_ref().map(|c| c.mapper_type()).unwrap_or(MapperType::SelfConfig);
+        if ty != MapperType::SelfConfig {
+            locked = Some((ty, ran));
+            break;
+        }
+    }
+    match locked {
+        Some((ty, cyc)) => {
+            eprintln!("real EF .crt: LOCKED {ty:?} after ~{cyc} cycles");
+            assert_eq!(ty, MapperType::EasyFlash, "a real EasyFlash cart must auto-lock EasyFlash");
+        }
+        None => panic!(
+            "real EF cart did NOT lock within {BUDGET} cycles (final_pc=${:04X})",
+            m.cpu.pc
+        ),
+    }
+}
