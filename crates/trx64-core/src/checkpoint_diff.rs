@@ -750,6 +750,33 @@ fn nested_i64(v: &Value, keys: &[&str]) -> i64 {
     cur.as_i64().unwrap_or(0)
 }
 
+// ── cheat-candidate finder (Spec 798) ────────────────────────────────────────
+
+/// Find RAM addresses that DECREASED between two checkpoints — candidate life /
+/// health / ammo counters for a cheat (the snapshot-diff → decrementer step).
+/// Compares the full 64K RAM (not the 794 capped sample). Ranked: smallest delta
+/// first (a life counter is usually −1), then by address. Returns up to `max`.
+pub fn find_ram_decrements(a: &Value, b: &Value, max: usize) -> Vec<Value> {
+    let (ra, rb) = match (decode_bytes(a.get("ram")), decode_bytes(b.get("ram"))) {
+        (Some(x), Some(y)) => (x, y),
+        _ => return vec![],
+    };
+    let n = ra.len().min(rb.len());
+    let mut out: Vec<(usize, u8, u8, u8)> = Vec::new();
+    for i in 0..n {
+        if rb[i] < ra[i] {
+            out.push((i, ra[i], rb[i], ra[i] - rb[i]));
+        }
+    }
+    out.sort_by(|x, y| x.3.cmp(&y.3).then(x.0.cmp(&y.0)));
+    out.into_iter()
+        .take(max)
+        .map(|(addr, before, after, delta)| {
+            json!({ "addr": addr, "before": before, "after": after, "delta": delta })
+        })
+        .collect()
+}
+
 // ── text rendering ───────────────────────────────────────────────────────────
 
 fn str_list(v: &Value, key: &str) -> Vec<String> {
@@ -1013,5 +1040,25 @@ mod tests {
         let sample = &d["components"]["cia1"]["changes"][0]["sample"][0];
         assert_eq!(sample["reg"], json!("ICR"));
         assert!(d["components"]["cia1"]["summary"].as_str().unwrap().contains("ICR"));
+    }
+
+    #[test]
+    fn find_ram_decrements_ranks_smallest_delta_ignores_increases() {
+        let mut a = vec![0u8; 32];
+        a[5] = 3;
+        a[6] = 9;
+        a[10] = 5;
+        let mut b = vec![0u8; 32];
+        b[5] = 2; // −1 (a life counter)
+        b[6] = 1; // −8
+        b[10] = 8; // +3 → an increase, must be ignored
+        let ca = json!({ "ram": ta_u8(&a) });
+        let cb = json!({ "ram": ta_u8(&b) });
+        let cands = find_ram_decrements(&ca, &cb, 10);
+        assert_eq!(cands.len(), 2, "only the two decreases");
+        assert_eq!(cands[0]["addr"], json!(5), "smallest delta first");
+        assert_eq!(cands[0]["delta"], json!(1));
+        assert_eq!(cands[1]["addr"], json!(6));
+        assert!(cands.iter().all(|c| c["addr"] != json!(10)), "increase excluded");
     }
 }

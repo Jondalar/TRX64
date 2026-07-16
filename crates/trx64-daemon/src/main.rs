@@ -8634,6 +8634,48 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             Response::ok(id, d)
         }
 
+        // ── runtime/find_cheat_candidates (Spec 798) ──────────────────────────
+        // Snapshot-diff → decrementer: RAM addresses that DECREASED between two
+        // anchors (candidate life/health/ammo counters), ranked smallest-delta
+        // first. The finder half of the cheat loop; the verify half creates a 796
+        // candidate that freezes the address + runs the scenario. READ-ONLY.
+        "runtime/find_cheat_candidates" => {
+            let before = match req
+                .params
+                .get("before")
+                .or_else(|| req.params.get("before_id"))
+                .and_then(|v| v.as_str())
+            {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return Response::err(id, -32602, "runtime/find_cheat_candidates: before required"),
+            };
+            let after = match req
+                .params
+                .get("after")
+                .or_else(|| req.params.get("after_id"))
+                .and_then(|v| v.as_str())
+            {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return Response::err(id, -32602, "runtime/find_cheat_candidates: after required"),
+            };
+            let max = req.params.get("max").and_then(|v| v.as_u64()).unwrap_or(32) as usize;
+            let st = state.lock().unwrap();
+            let a = match st.checkpoint_ring.restore_snapshot(&before) {
+                Some(v) => v,
+                None => {
+                    return Response::err(id, -32001, format!("runtime/find_cheat_candidates: unknown anchor {before}"))
+                }
+            };
+            let b = match st.checkpoint_ring.restore_snapshot(&after) {
+                Some(v) => v,
+                None => {
+                    return Response::err(id, -32001, format!("runtime/find_cheat_candidates: unknown anchor {after}"))
+                }
+            };
+            let cands = trx64_core::checkpoint_diff::find_ram_decrements(&a, &b, max);
+            Response::ok(id, json!({ "count": cands.len(), "candidates": cands }))
+        }
+
         "runtime/swap_disk_and_continue" => {
             let path_str = match req.params.get("path").and_then(|v| v.as_str()) {
                 Some(p) => p.to_string(),
