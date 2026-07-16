@@ -146,27 +146,34 @@ guarantees — **determinism** (scenario) and **fidelity** (792).
 ## 5. Status — built vs. designed (the GAPS to close)
 
 **BUILT:** `.c64re` (707) · ring (705.B/765) · recorder (766) · binary timeline (726.B)
-· scrub/resume (761) · `runtime_overlay_run` (769.2, branch `spec-769`) · scenarios
-(231 / `scenario_player` / `run_scenario`) · restore-fidelity gate (792) · VSF ⇄ `.c64re`
-import+export incl. drive+keyboard (791).
+· scrub/resume (761) · **769 rewind + `runtime_overlay_run` + the human UI** — the
+C64RE workbench ships the wired snapshot/time-travel UI (`ui/src/workbench/`:
+`Snapshots.tsx`, `SnapshotTreeView.tsx`, `Filmstrip.tsx`, `ScrubTimeline.tsx`,
+`SnapshotDetail.tsx`, `ScenarioInputTimeline.tsx`, ~840 LOC calling
+`checkpoint/list|pin|restore|thumbnails|unpin` + `snapshot/dump` + the
+`checkpoint_restored` event) — so the "769.5 filmstrip UI, LAST" note in the 769 spec
+header is **STALE** (the UI landed via the UI-redesign; reconcile the spec status) ·
+scenarios (231 / `scenario_player` / `run_scenario`) · restore-fidelity gate (792) ·
+VSF ⇄ `.c64re` import+export incl. drive+keyboard (791).
 
 **DESIGNED, NOT BUILT — the gap-closing backlog:**
 
-1. **776 — recorded intervention branch + outcome-diff** (the big one). Turns the
-   ephemeral `runtime_overlay_run` into a first-class *branch object* (pinned checkpoint
-   + ordered interventions + provenance) with `diff_branch_outcome(baseline,
-   intervention)`. Merges + retires C64RE 711 + 712. Composes the existing
-   `diffCheckpoints` / ring primitives.
+1. **776 — recorded intervention branch + outcome-diff** (the big one, and the REAL
+   overlay gap). Turns the ephemeral `runtime_overlay_run` into a first-class *branch
+   object* (pinned checkpoint + ordered interventions + provenance) with
+   `diff_branch_outcome(baseline, intervention)`. Merges + retires C64RE 711 + 712.
+   Composes the existing `diffCheckpoints` / ring primitives. (The UI already has
+   `SnapshotTreeView` to render branches — the engine/branch object is what's missing.)
 2. **762 — snapshot-diff cheat finder.** Diff two pinned anchors' RAM + an Inspector
    pixel-mark → locate a lives/energy decrementer → synthesize a cheat overlay. A payoff
    app of 776 + the ring.
-3. **769 human filmstrip UI** — the QuickTime-trimmer scrub UI (paused-only, lazy frozen
-   thumbnails, click = full restore). Deliberately built LAST, after the LLM API.
-4. **766 §10 firehose convergence** — fold the trace onto the *same* shared-memory
+3. **766 §10 firehose convergence** — fold the trace onto the *same* shared-memory
    firehose as the ring (one producer, many consumers), reconciling lossy-recorder vs.
    no-drop-trace.
-5. **`.c64rering`** — whole-ring gz dump so a tester can ship an entire reverse-debug
+4. **`.c64rering`** — whole-ring gz dump so a tester can ship an entire reverse-debug
    buffer, extending the `.c64re` currency to the full timeline.
+5. **Spec-status hygiene** — 769 header still says "769.5 UI LAST / not built"; reconcile
+   to reflect the shipped workbench UI (a doc/board fix, not engine work).
 
 **Meaning layer (C64RE, always the last step, never a side effect):** turning a validated
 branch into a `FindingRecord` / `PatchRecipe` / provenance edge; "export a cracked image"
