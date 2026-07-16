@@ -211,6 +211,13 @@ pub struct State {
     /// dies on the first power-cycle (e.g. an EF CRT insert = off→on). Distinct from
     /// `ctrl_frame`, which also bumps on pause/run and would re-prime reSID far too often.
     machine_generation: u64,
+    /// Spec 786 audio fix, CLI/window path — the `machine_generation` the SID
+    /// write-trace hook in `pull_audio_drain` was last installed for. When it lags
+    /// `machine_generation` (a power-cycle / EF-CRT insert rebuilt the SID), the drain
+    /// re-installs the hook on the fresh SID; without this the CLI emulator window
+    /// goes SILENT after the first power-cycle (the streaming loop had the fix; this
+    /// pull path did not).
+    audio_hooked_generation: u64,
     /// Last stop reason (set on pause, cleared on continue/run).
     ctrl_stop: Option<CtrlStop>,
     /// Monotonic checkpoint counter for legacy media/ingress checkpoint IDs.
@@ -14166,6 +14173,7 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         type_buffer: Vec::new(),
         ctrl_frame: 0, // incremented on each debug/run|pause|continue; first pause → 1
         machine_generation: 0,
+        audio_hooked_generation: 0,
         ctrl_stop: None,
         checkpoint_counter: 0,
         // Spec 772 — the ring is the short UI-scrub buffer: a max-entries cap (default
@@ -14338,6 +14346,7 @@ pub fn pull_audio_drain(state: &SharedState) -> AudioDrainData {
                     w.lock().unwrap().push((addr, value));
                 })));
         }
+        st.audio_hooked_generation = st.machine_generation;
         // Snapshot the live SID register file so the render thread primes reSID from the
         // live state (frequencies/PW/control already set), exactly like the stream loop.
         let mut prime: Vec<(u8, u8)> = Vec::with_capacity(0x19);
@@ -14449,6 +14458,23 @@ pub fn pull_audio_drain(state: &SharedState) -> AudioDrainData {
             samples: Vec::new(),
             sample_rate: AUDIO_SAMPLE_RATE,
         };
+    }
+
+    // Spec 786 audio fix (CLI/window path) — a power-cycle / EF-CRT insert rebuilt the
+    // machine (bumped `machine_generation`) → the fresh SID has NO write-trace hook →
+    // silence. Re-install the hook on the current SID, reusing the SAME writes ring the
+    // render thread drains. The persistent render engine is untouched.
+    if st.audio_hooked_generation != st.machine_generation {
+        let w = st.audio_render.as_ref().map(|r| std::sync::Arc::clone(&r.writes));
+        if let Some(w) = w {
+            st.session
+                .machine
+                .sid
+                .set_write_trace(Some(Box::new(move |addr, value| {
+                    w.lock().unwrap().push((addr, value));
+                })));
+        }
+        st.audio_hooked_generation = st.machine_generation;
     }
 
     // ── Subsequent drain: send this window to the render thread, pop accumulated PCM ──
@@ -14618,6 +14644,7 @@ mod batch1_tests {
             type_buffer: Vec::new(),
             ctrl_frame: 0,
             machine_generation: 0,
+            audio_hooked_generation: 0,
             ctrl_stop: None,
             checkpoint_counter: 0,
             // Spec 772 — the ring is the short UI-scrub buffer: a max-entries cap (default

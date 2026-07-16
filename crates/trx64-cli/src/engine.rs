@@ -238,7 +238,17 @@ impl Engine {
         let mut parts = vm.split_whitespace();
         let verb = parts.next().unwrap_or("").to_ascii_lowercase();
         let rest: Vec<&str> = parts.collect();
-        let arg = rest.join(" ");
+        // Strip ONE surrounding pair of matched quotes so `/mount "a b.crt"` yields the
+        // path `a b.crt`, not the literal `"a b.crt"` (the quotes were kept in the path →
+        // file-not-found). `/mount a b.crt` (no quotes) already worked — join handles the
+        // space — so this only rescues the quoted form.
+        let joined = rest.join(" ");
+        let arg = joined
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .or_else(|| joined.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+            .unwrap_or(&joined)
+            .to_string();
 
         match verb.as_str() {
             "power" => self.verb_power(rest.first().copied()),
