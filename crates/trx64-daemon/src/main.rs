@@ -4578,6 +4578,34 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             }
         }
 
+        // Spec 794 — `cdiff <idA> <idB> [eq] [c:NAME] [l:NAME] [r:SPACE:FROM-TO]`:
+        // whitebox COMPONENT diff of two checkpoint anchors — the full checkpoint_diff
+        // over the anchor Values directly (no machine round-trip), reaching color RAM,
+        // Floppy RAM and internal chip state the 246 `diff` cannot. Verdict + exclusion
+        // mask (`eq` = equivalence preset, `c:` component, `l:` lane, `r:` range).
+        // READ-ONLY.
+        "cdiff" => {
+            let (a, b) = match (toks.get(1), toks.get(2)) {
+                (Some(a), Some(b)) => (a.clone(), b.clone()),
+                _ => {
+                    return Err(
+                        "cdiff: usage: cdiff <idA> <idB> [eq] [c:NAME] [l:NAME] [r:SPACE:FROM-TO]".into(),
+                    )
+                }
+            };
+            let mask = component_diff_mask_from_toks(&toks[3..]);
+            let snap_a = st
+                .checkpoint_ring
+                .restore_snapshot(&a)
+                .ok_or_else(|| format!("cdiff: unknown checkpoint id {a}"))?;
+            let snap_b = st
+                .checkpoint_ring
+                .restore_snapshot(&b)
+                .ok_or_else(|| format!("cdiff: unknown checkpoint id {b}"))?;
+            let d = trx64_core::checkpoint_diff::diff_checkpoints(&snap_a, &snap_b, &mask);
+            Ok(trx64_core::checkpoint_diff::format_component_diff(&d))
+        }
+
         // Spec time-travel-tooling Piece 2 — `ringdump <path>` / `ringload <path>`:
         // dump / restore the WHOLE reverse-debug buffer to/from a gzipped `.c64rering`
         // container (the SAME engine as WS `ringbuffer/dump`·`restore` + FFI). The
@@ -8366,6 +8394,57 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 Ok(v) => Response::ok(id, v),
                 Err(e) => Response::err(id, -32001, format!("runtime/diff_checkpoints: {e}")),
             }
+        }
+
+        // Spec 794 — whitebox COMPONENT diff of two checkpoint anchors (equivalence
+        // verdict + `exclude` mask), computed over the anchor Values directly (no
+        // machine round-trip → reaches color RAM, Floppy RAM, internal chip state).
+        // READ-ONLY. Params: idA, idB, optional exclude {components,lanes,ranges,presets}.
+        "runtime/component_diff" => {
+            let id_a = match req
+                .params
+                .get("idA")
+                .or_else(|| req.params.get("id_a"))
+                .and_then(|v| v.as_str())
+            {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return Response::err(id, -32602, "runtime/component_diff: idA required"),
+            };
+            let id_b = match req
+                .params
+                .get("idB")
+                .or_else(|| req.params.get("id_b"))
+                .and_then(|v| v.as_str())
+            {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return Response::err(id, -32602, "runtime/component_diff: idB required"),
+            };
+            let mask = trx64_core::checkpoint_diff::ExcludeMask::from_json(
+                req.params.get("exclude").unwrap_or(&Value::Null),
+            );
+            let st = state.lock().unwrap();
+            let snap_a = match st.checkpoint_ring.restore_snapshot(&id_a) {
+                Some(v) => v,
+                None => {
+                    return Response::err(
+                        id,
+                        -32001,
+                        format!("runtime/component_diff: unknown checkpoint id {id_a}"),
+                    )
+                }
+            };
+            let snap_b = match st.checkpoint_ring.restore_snapshot(&id_b) {
+                Some(v) => v,
+                None => {
+                    return Response::err(
+                        id,
+                        -32001,
+                        format!("runtime/component_diff: unknown checkpoint id {id_b}"),
+                    )
+                }
+            };
+            let d = trx64_core::checkpoint_diff::diff_checkpoints(&snap_a, &snap_b, &mask);
+            Response::ok(id, d)
         }
 
         "runtime/swap_disk_and_continue" => {
@@ -12873,6 +12952,35 @@ fn purge_materialized_media(st: &mut State) -> (usize, usize) {
 //
 // No new diff logic — `snapshot_diff::diff_snapshots` is the compute; this wraps it
 // with by-ID anchor resolution + the typed-record reshape.
+/// Build a Spec 794 ExcludeMask from monitor `cdiff` trailing tokens: `eq` (or
+/// `preset`) = equivalence preset, `c:NAME` component, `l:NAME` lane,
+/// `r:SPACE:FROM-TO` address range.
+fn component_diff_mask_from_toks(toks: &[String]) -> trx64_core::checkpoint_diff::ExcludeMask {
+    let mut components: Vec<String> = Vec::new();
+    let mut lanes: Vec<String> = Vec::new();
+    let mut presets: Vec<String> = Vec::new();
+    let mut ranges: Vec<Value> = Vec::new();
+    for t in toks {
+        if t == "eq" || t == "preset" {
+            presets.push("equivalence".to_string());
+        } else if let Some(v) = t.strip_prefix("c:") {
+            components.push(v.to_string());
+        } else if let Some(v) = t.strip_prefix("l:") {
+            lanes.push(v.to_string());
+        } else if let Some(v) = t.strip_prefix("r:") {
+            if let Some((space, rng)) = v.split_once(':') {
+                if let Some((from, to)) = rng.split_once('-') {
+                    ranges.push(json!({ "space": space, "from": from, "to": to }));
+                }
+            }
+        }
+    }
+    let mask_json = json!({
+        "components": components, "lanes": lanes, "presets": presets, "ranges": ranges,
+    });
+    trx64_core::checkpoint_diff::ExcludeMask::from_json(&mask_json)
+}
+
 fn diff_checkpoints_by_id(st: &mut State, id_a: &str, id_b: &str) -> Result<Value, String> {
     // Resolve both anchors up front so an unknown id errors BEFORE we disturb the
     // machine (the snapshot/restore-back below only happens on the happy path).
