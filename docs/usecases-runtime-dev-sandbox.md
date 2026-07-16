@@ -24,13 +24,29 @@ Two things make it new:
    snapshot is the baseline; the overlay is your work-in-progress; the output is the code
    delta for the real build.
 
-### The five building blocks (how they compose)
+### The building blocks (bottom-up) + the pipeline
 
-- **Sandbox** = the core. Isolated execution; your code runs on the baseline.
-- **Snapshot** = the fixed baseline version (a defined starting point).
+- **Ring (always-on capture) = the FOUNDATION**, under everything else. Because it runs
+  continuously you can **time-travel back and DUMP a `.c64re` at any past moment WITHOUT a
+  replay** — mint the exact baseline where the bug/life-loss happens. Also the basis for
+  traces + reverse-debugging.
+- **Snapshot (`.c64re`)** = the fixed baseline version, minted from the ring (or live) by
+  `dump`. Portable point-in-time currency.
+- **Sandbox** = a scoped/scratch TRX64 that `undump`s a `.c64re`; isolated execution of
+  your code on that baseline. **N scratch instances = N parallel scenarios** (Spec 787).
 - **Overlay + inline-compile** = your code/data injected, no build pipeline.
-- **Scenario** = deterministic iteration of that code on the baseline.
-- **Whitebox inspect / diff** = reach the components, not just the outcome hash.
+- **Scenario = state + overlay** = deterministic iteration of that code on the baseline.
+- **Whitebox validate** = reach the components (not just the outcome hash) → **derive the
+  final code** (the delta for the real build).
+
+**The pipeline:** `ring → (traces / reverse-debug / point-in-time snapshots) → dump →
+sandboxed TRX64 undump → scenario (= state + overlay) → validate (whitebox) → derive final
+code`, with **N scenarios in parallel**.
+
+**The human-tester handoff (important — testers do NOT use an LLM):** a tester rewinds via
+the ring to the moment a bug appears, dumps a `.c64re`, and hands that file over; the
+dev/LLM then runs the sandbox → scenario → overlay → validate loop on it. The ring is the
+man↔machine interchange, not just an LLM convenience.
 
 ## The use cases (all = "your own code on a baseline")
 

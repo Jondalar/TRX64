@@ -9,6 +9,39 @@ These three are ONE system, not three features. A **snapshot** is a point, a
 intervention on a point whose effect you measure by diff — and all of it runs over one
 timeline, on one state object, guaranteed bit-faithful on resume.
 
+## The stack, bottom-up + the pipeline (owner, 2026-07-16 — corrects the layering)
+
+The **ring is the FOUNDATION — it lies UNDER the `.c64re` snapshots**, not beside them.
+Because it is always-on, you can **time-travel back and DUMP a `.c64re` at any past
+moment — WITHOUT a replay.** That is the load-bearing capability: in testing you rewind to
+the instant a bug/life-loss happens and mint the exact snapshot that would otherwise cost
+a full recorded replay. Gold for debugging — and the **human tester handoff**: testers
+(who do NOT use an LLM) rewind via the ring, dump a `.c64re` at the bug, and hand that file
+to the dev/LLM. The ring is the man↔machine interchange.
+
+```
+RING (always-on capture) = the FOUNDATION
+   ├─→ traces
+   ├─→ reverse-debugging
+   └─→ point-in-time snapshots: time-travel back + DUMP = a .c64re at any past
+         moment, WITHOUT a replay        ← the tester's gold / the man↔machine handoff
+        │ dump
+        ▼
+   .c64re  (portable point-in-time state = the currency)
+        │ undump into a SANDBOXED TRX64 (scoped / scratch instance)
+        ▼
+   state  ──+ overlay (your code, inline-compiled)──▶  SCENARIO = state + overlay
+        │ validate (WHITEBOX component diff)
+        ▼
+   derive the FINAL CODE (the delta for the real build)
+
+   N scenarios in PARALLEL  =  N scratch instances (Spec 787: 1 live + N scratch)
+```
+
+The rest of this doc details each stage; **read the dependency as above** (ring →
+`.c64re` → sandbox → scenario+overlay → validate → final code), not as the flat layer list
+below.
+
 ---
 
 ## 0. The foundation — ONE state object
