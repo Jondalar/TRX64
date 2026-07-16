@@ -30,6 +30,7 @@ use trx64_session::{Session, TraceState};
 use trx64_trace::{FrameSink, TraceChannels, TracingObserver};
 
 pub mod assembler;
+pub mod candidate;
 pub mod observers;
 pub mod project_knowledge;
 pub mod snapshot_diff;
@@ -371,6 +372,11 @@ pub struct State {
     /// This counter drives the per-frame feed (separate from `autocapture_frames_since`
     /// because the ring auto-capture is warp-skipped while the recorder is not).
     recorder_frames_since: u64,
+    /// Spec 796 — the live candidate store (session-lifetime). Keyed by candidate id
+    /// (`cand-<seq>`). Each candidate = baseline anchor + bound scenario + accumulating
+    /// overlay patch-set + cached no-patch baseline result.
+    candidates: std::collections::HashMap<String, candidate::Candidate>,
+    candidate_seq: u64,
     /// Spec 769.5a — the SEPARATE per-checkpoint thumbnail store (= the c64re
     /// `RuntimeController.checkpointThumbs` map, runtime-controller.ts:181). Keyed by
     /// checkpoint id, capped at [`MAX_THUMBS`]. Decoupled from the ring's
@@ -8187,6 +8193,140 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             }))
         }
 
+        // ── runtime/candidate_* (Spec 796) ────────────────────────────────────
+        // A candidate = baseline anchor + bound scenario + accumulating overlay
+        // patch-set + cached no-patch baseline. create/patch/run(auto-eval)/remove/
+        // list/delete/export. Runs on the live shared session (like overlay_run).
+        "runtime/candidate_create" => {
+            let anchor = match req
+                .params
+                .get("anchor")
+                .or_else(|| req.params.get("baseline_anchor"))
+                .and_then(|v| v.as_str())
+            {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return Response::err(id, -32602, "runtime/candidate_create: anchor required"),
+            };
+            // Scenario = {inputs, cycleBudget}; strip any startSnapshot — the anchor
+            // IS the start (a run restores it then plays these inputs post-patch).
+            let mut scenario = req.params.get("scenario").cloned().unwrap_or_else(|| json!({}));
+            if let Some(obj) = scenario.as_object_mut() {
+                obj.remove("startSnapshot");
+            }
+            let mut st = state.lock().unwrap();
+            let snapshot = match st.checkpoint_ring.restore_snapshot(&anchor) {
+                Some(s) => s,
+                None => {
+                    return Response::err(id, -32001, format!("runtime/candidate_create: unknown anchor {anchor}"))
+                }
+            };
+            if let Err(e) = restore_live_checkpoint(&mut st.session, &snapshot) {
+                return Response::err(id, -32001, format!("runtime/candidate_create: {e}"));
+            }
+            st.session.running = false;
+            st.ctrl_frame += 1;
+            st.ctrl_stop = None;
+            // Baseline = the NO-PATCH scenario run from the anchor.
+            if let Err(e) = run_scenario(&mut st, &scenario) {
+                return Response::err(id, -32001, format!("runtime/candidate_create: baseline run: {e}"));
+            }
+            let baseline_result = capture_live_checkpoint(&mut st.session);
+            st.candidate_seq += 1;
+            let cand_id = format!("cand-{}", st.candidate_seq);
+            let cand = candidate::Candidate::new(cand_id.clone(), anchor, scenario, baseline_result);
+            let out = cand.to_json();
+            st.candidates.insert(cand_id, cand);
+            Response::ok(id, out)
+        }
+
+        "runtime/candidate_patch" => {
+            let cand_id = match req.params.get("id").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => return Response::err(id, -32602, "runtime/candidate_patch: id required"),
+            };
+            let space = req.params.get("space").and_then(|v| v.as_str()).unwrap_or("ram").to_string();
+            let bank = req.params.get("bank").and_then(|v| v.as_u64()).map(|b| b as u16);
+            let addr = (req.params.get("addr").and_then(|v| v.as_u64()).unwrap_or(0) & 0xffff) as u16;
+            let source = req.params.get("source").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let bytes: Vec<u8> = req
+                .params
+                .get("bytes")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().map(|b| (b.as_u64().unwrap_or(0) & 0xff) as u8).collect())
+                .unwrap_or_default();
+            let mut st = state.lock().unwrap();
+            let Some(c) = st.candidates.get_mut(&cand_id) else {
+                return Response::err(id, -32001, format!("runtime/candidate_patch: unknown candidate {cand_id}"));
+            };
+            c.add_or_replace_patch(candidate::Patch { space, bank, addr, source, bytes });
+            Response::ok(id, c.to_json())
+        }
+
+        "runtime/candidate_run" => {
+            let cand_id = match req.params.get("id").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => return Response::err(id, -32602, "runtime/candidate_run: id required"),
+            };
+            let mut st = state.lock().unwrap();
+            match run_candidate(&mut st, &cand_id) {
+                Ok(v) => Response::ok(id, v),
+                Err(e) => Response::err(id, -32001, format!("runtime/candidate_run: {e}")),
+            }
+        }
+
+        "runtime/candidate_remove_patch" => {
+            let cand_id = match req.params.get("id").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => return Response::err(id, -32602, "runtime/candidate_remove_patch: id required"),
+            };
+            let space = req.params.get("space").and_then(|v| v.as_str()).unwrap_or("ram").to_string();
+            let bank = req.params.get("bank").and_then(|v| v.as_u64()).map(|b| b as u16);
+            let addr = (req.params.get("addr").and_then(|v| v.as_u64()).unwrap_or(0) & 0xffff) as u16;
+            let mut st = state.lock().unwrap();
+            let Some(c) = st.candidates.get_mut(&cand_id) else {
+                return Response::err(id, -32001, format!("runtime/candidate_remove_patch: unknown candidate {cand_id}"));
+            };
+            let removed = c.remove_patch(&space, bank, addr);
+            let mut out = c.to_json();
+            out["removed"] = json!(removed);
+            Response::ok(id, out)
+        }
+
+        "runtime/candidate_list" => {
+            let st = state.lock().unwrap();
+            if let Some(cand_id) = req.params.get("id").and_then(|v| v.as_str()) {
+                match st.candidates.get(cand_id) {
+                    Some(c) => Response::ok(id, c.to_json()),
+                    None => Response::err(id, -32001, format!("runtime/candidate_list: unknown candidate {cand_id}")),
+                }
+            } else {
+                let list: Vec<Value> = st.candidates.values().map(|c| c.to_json()).collect();
+                Response::ok(id, json!({ "candidates": list }))
+            }
+        }
+
+        "runtime/candidate_delete" => {
+            let cand_id = match req.params.get("id").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => return Response::err(id, -32602, "runtime/candidate_delete: id required"),
+            };
+            let mut st = state.lock().unwrap();
+            let existed = st.candidates.remove(&cand_id).is_some();
+            Response::ok(id, json!({ "id": cand_id, "deleted": existed }))
+        }
+
+        "runtime/candidate_export" => {
+            let cand_id = match req.params.get("id").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => return Response::err(id, -32602, "runtime/candidate_export: id required"),
+            };
+            let st = state.lock().unwrap();
+            match st.candidates.get(&cand_id) {
+                Some(c) => Response::ok(id, c.export_json()),
+                None => Response::err(id, -32001, format!("runtime/candidate_export: unknown candidate {cand_id}")),
+            }
+        }
+
         // ── runtime/snapshot_tree ────────────────────────────────────────────
         // Spec 268 / 769 — time-travel branch tree. 1:1 with ws-server.ts:1891-1909:
         // beginRewindSession() builds a FRESH RewindManager (root snapshot + root
@@ -12999,6 +13139,86 @@ fn purge_materialized_media(st: &mut State) -> (usize, usize) {
 //
 // No new diff logic — `snapshot_diff::diff_snapshots` is the compute; this wraps it
 // with by-ID anchor resolution + the typed-record reshape.
+/// Spec 796 — apply one candidate patch to the live machine (RAM or a cart bank,
+/// reusing the 795 overlay primitives).
+fn apply_candidate_patch(machine: &mut trx64_core::Machine, p: &candidate::Patch) -> Result<(), String> {
+    if p.space == "ram" {
+        for (i, &b) in p.bytes.iter().enumerate() {
+            machine.ram[(p.addr as usize + i) & 0xffff] = b;
+        }
+        Ok(())
+    } else {
+        let bank = p.bank.unwrap_or(0);
+        let cart = machine
+            .cartridge
+            .as_mut()
+            .ok_or("candidate patch targets a cart bank but no cartridge is attached")?;
+        for (i, &b) in p.bytes.iter().enumerate() {
+            cart.overlay_bank_write(&p.space, bank, ((p.addr as usize + i) & 0xffff) as u16, b)?;
+        }
+        Ok(())
+    }
+}
+
+/// Spec 796 — run a candidate: restore its baseline anchor, apply ALL its patches
+/// (795 overlay, RAM + cart), play its bound scenario (231, deterministic from the
+/// post-patch state), capture the end checkpoint, and auto-diff (794) against the
+/// cached no-patch baseline. Returns { registers, verdict, ranCycles }. Ephemeral —
+/// the baseline anchor is untouched, so the next run reproduces this one.
+fn run_candidate(st: &mut State, cand_id: &str) -> Result<Value, String> {
+    // Clone the candidate's inputs out so the &mut State borrow is free for the
+    // restore/run/diff below; the verdict is written back at the end.
+    let cand = st
+        .candidates
+        .get(cand_id)
+        .ok_or_else(|| format!("unknown candidate {cand_id}"))?
+        .clone();
+
+    // (1) Restore the baseline anchor into the live session (a control discontinuity).
+    let snapshot = st
+        .checkpoint_ring
+        .restore_snapshot(&cand.baseline_anchor)
+        .ok_or_else(|| format!("candidate {cand_id}: unknown baseline anchor {}", cand.baseline_anchor))?;
+    restore_live_checkpoint(&mut st.session, &snapshot)?;
+    st.session.running = false;
+    st.ctrl_frame += 1;
+    st.ctrl_stop = None;
+
+    // (2) Apply all patches (RAM + cart).
+    for p in &cand.patches {
+        apply_candidate_patch(&mut st.session.machine, p)?;
+    }
+
+    // (3) Play the bound scenario (no startSnapshot → from the post-patch anchor).
+    let start_clk = st.session.machine.cpu6510.clk;
+    run_scenario(st, &cand.scenario)?;
+    let ran = st.session.machine.cpu6510.clk.saturating_sub(start_clk);
+
+    // (4) Capture the end + auto-diff vs the cached baseline result.
+    let end = capture_live_checkpoint(&mut st.session);
+    let diff = trx64_core::checkpoint_diff::diff_checkpoints(
+        &cand.baseline_result,
+        &end,
+        &trx64_core::checkpoint_diff::ExcludeMask::default(),
+    );
+    if let Some(c) = st.candidates.get_mut(cand_id) {
+        c.last_verdict = Some(diff.get("verdict").cloned().unwrap_or(Value::Null));
+    }
+
+    let c = &st.session.machine.cpu6510;
+    Ok(json!({
+        "id": cand_id,
+        "ranCycles": ran,
+        "registers": {
+            "pc": c.reg_pc as u64, "a": c.reg_a as u64, "x": c.reg_x as u64,
+            "y": c.reg_y as u64, "sp": c.reg_sp as u64, "flags": c.flags() as u64,
+            "cycles": st.session.machine.clk,
+        },
+        "verdict": diff.get("verdict").cloned().unwrap_or(Value::Null),
+        "diff": diff,
+    }))
+}
+
 /// Build a Spec 794 ExcludeMask from monitor `cdiff` trailing tokens: `eq` (or
 /// `preset`) = equivalence preset, `c:NAME` component, `l:NAME` lane,
 /// `r:SPACE:FROM-TO` address range.
@@ -13942,6 +14162,8 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         disk_ap_done_hash: None,
         autocapture_frames_since: 0,
         recorder_frames_since: 0,
+        candidates: std::collections::HashMap::new(),
+        candidate_seq: 0,
         checkpoint_thumbs: std::collections::HashMap::new(),
         checkpoint_thumb_order: std::collections::VecDeque::new(),
         mon: MonitorState::new(),
@@ -14392,6 +14614,8 @@ mod batch1_tests {
             disk_ap_done_hash: None,
             autocapture_frames_since: 0,
             recorder_frames_since: 0,
+        candidates: std::collections::HashMap::new(),
+        candidate_seq: 0,
             checkpoint_thumbs: std::collections::HashMap::new(),
             checkpoint_thumb_order: std::collections::VecDeque::new(),
             mon: MonitorState::new(),
@@ -16752,6 +16976,62 @@ mod batch1_tests {
         // session/type carries it too.
         let typed = call(&state, "session/type", json!({ "text": "RUN" }));
         assert!(typed["freeRunWarning"].as_str().is_some(), "type also warns when free-running");
+    }
+
+    // Spec 796 — candidate lifecycle over the full WS path (create → patch → run →
+    // auto-eval → remove → export), on a blank machine with a 0-cycle scenario so the
+    // diff reflects ONLY the overlay (no execution) — deterministic, ROM-free.
+    #[test]
+    fn candidate_lifecycle_run_and_autoeval() {
+        let state = make_state();
+        let cp = call(&state, "checkpoint/capture", json!({}));
+        let anchor = cp["ref"]["id"].as_str().expect("checkpoint id").to_string();
+
+        let created = call(
+            &state,
+            "runtime/candidate_create",
+            json!({ "anchor": anchor, "scenario": { "inputs": [], "cycleBudget": 0 } }),
+        );
+        let cid = created["id"].as_str().expect("candidate id").to_string();
+
+        // (a) no patch → identical vs its own baseline.
+        let r0 = call(&state, "runtime/candidate_run", json!({ "id": cid }));
+        assert_eq!(r0["verdict"]["identical"], json!(true), "no-patch run must be identical");
+
+        // (b) a RAM patch → the run differs, and names `ram`.
+        call(
+            &state,
+            "runtime/candidate_patch",
+            json!({ "id": cid, "space": "ram", "addr": 0xcf00, "bytes": [0x5a], "source": "lda #$5a" }),
+        );
+        let r1 = call(&state, "runtime/candidate_run", json!({ "id": cid }));
+        assert_eq!(r1["verdict"]["identical"], json!(false), "ram patch must differ");
+        assert!(r1["verdict"]["differing"].as_array().unwrap().iter().any(|c| c == "ram"));
+
+        // (c) deterministic — a second run reproduces the verdict.
+        let r2 = call(&state, "runtime/candidate_run", json!({ "id": cid }));
+        assert_eq!(r1["verdict"], r2["verdict"], "candidate runs must be deterministic");
+
+        // (d) remove the patch → back to identical.
+        call(
+            &state,
+            "runtime/candidate_remove_patch",
+            json!({ "id": cid, "space": "ram", "addr": 0xcf00 }),
+        );
+        let r3 = call(&state, "runtime/candidate_run", json!({ "id": cid }));
+        assert_eq!(r3["verdict"]["identical"], json!(true), "after remove, identical again");
+
+        // (e) export before removing carried the source; re-add + export the seed.
+        call(
+            &state,
+            "runtime/candidate_patch",
+            json!({ "id": cid, "space": "roml", "bank": 2, "addr": 0x8000, "bytes": [0xea], "source": "nop" }),
+        );
+        let ex = call(&state, "runtime/candidate_export", json!({ "id": cid }));
+        let ps = ex["patches"].as_array().unwrap();
+        assert_eq!(ps.len(), 1);
+        assert_eq!(ps[0]["space"], json!("roml"));
+        assert_eq!(ps[0]["source"], json!("nop"));
     }
 }
 
