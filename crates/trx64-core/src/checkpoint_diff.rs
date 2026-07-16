@@ -596,6 +596,34 @@ fn lane_of(path: &str) -> Option<&'static str> {
     None
 }
 
+// ── hardware register names ──────────────────────────────────────────────────
+// Canonical MOS chip register mnemonics. The checkpoint stores CIA/SID as register
+// FILES (`cia1.c_cia[16]`, `sid.regs[32]`) whose Range-delta indices are register
+// numbers → name them so a changed register reads `ICR`/`MODEVOL`, not `$0D`/`$18`.
+// (VIC is already stored as named fields, so it needs no index table.)
+
+const CIA_REGS: [&str; 16] = [
+    "PRA", "PRB", "DDRA", "DDRB", "TALO", "TAHI", "TBLO", "TBHI", "TOD10TH", "TODSEC", "TODMIN",
+    "TODHR", "SDR", "ICR", "CRA", "CRB",
+];
+
+const SID_REGS: [&str; 29] = [
+    "FREQLO1", "FREQHI1", "PWLO1", "PWHI1", "CTRL1", "ATKDCY1", "SUSREL1", "FREQLO2", "FREQHI2",
+    "PWLO2", "PWHI2", "CTRL2", "ATKDCY2", "SUSREL2", "FREQLO3", "FREQHI3", "PWLO3", "PWHI3", "CTRL3",
+    "ATKDCY3", "SUSREL3", "FCLO", "FCHI", "RESFILT", "MODEVOL", "POTX", "POTY", "OSC3", "ENV3",
+];
+
+/// The HW register mnemonic for a register-file path + index (CIA / SID), else None.
+fn reg_name_for(path: &str, index: usize) -> Option<&'static str> {
+    if path.ends_with(".c_cia") {
+        return CIA_REGS.get(index).copied();
+    }
+    if path == "sid.regs" {
+        return SID_REGS.get(index).copied();
+    }
+    None
+}
+
 // ── assemble output ──────────────────────────────────────────────────────────
 
 fn assemble(deltas: Vec<Delta>, excluded: Vec<String>, a: &Value, b: &Value) -> Value {
@@ -611,7 +639,20 @@ fn assemble(deltas: Vec<Delta>, excluded: Vec<String>, a: &Value, b: &Value) -> 
                 (path.clone(), e)
             }
             Delta::Range { path, start, end, count, sample } => {
-                let mut e = json!({ "kind": "range", "path": path, "start": start, "end": end, "count": count, "sample": sample });
+                // Attach the HW register mnemonic to each sample on a register-file path.
+                let named: Vec<Value> = sample
+                    .iter()
+                    .map(|sv| {
+                        let mut sv = sv.clone();
+                        if let Some(idx) = sv.get("index").and_then(|x| x.as_u64()) {
+                            if let Some(name) = reg_name_for(path, idx as usize) {
+                                sv["reg"] = json!(name);
+                            }
+                        }
+                        sv
+                    })
+                    .collect();
+                let mut e = json!({ "kind": "range", "path": path, "start": start, "end": end, "count": count, "sample": named });
                 if let Some(l) = lane_of(path) {
                     e["lane"] = json!(l);
                 }
@@ -666,10 +707,20 @@ fn summarize(ch: &[Value]) -> String {
     let mut scal = 0;
     let mut rng = 0;
     let mut bytes: i64 = 0;
+    let mut regs: Vec<String> = Vec::new();
     for c in ch {
         if c.get("kind").and_then(|k| k.as_str()) == Some("range") {
             rng += 1;
             bytes += c.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
+            if let Some(sample) = c.get("sample").and_then(|s| s.as_array()) {
+                for sv in sample {
+                    if let Some(r) = sv.get("reg").and_then(|r| r.as_str()) {
+                        if !regs.iter().any(|x| x == r) {
+                            regs.push(r.to_string());
+                        }
+                    }
+                }
+            }
         } else {
             scal += 1;
         }
@@ -681,7 +732,11 @@ fn summarize(ch: &[Value]) -> String {
     if rng > 0 {
         parts.push(format!("{rng} range{} ({bytes} bytes)", if rng == 1 { "" } else { "s" }));
     }
-    parts.join(", ")
+    let mut s = parts.join(", ");
+    if !regs.is_empty() {
+        s.push_str(&format!(" [{}]", regs.join(", ")));
+    }
+    s
 }
 
 fn nested_i64(v: &Value, keys: &[&str]) -> i64 {
@@ -944,5 +999,19 @@ mod tests {
             .unwrap()
             .iter()
             .any(|e| e == "component:sid (matched 0)"));
+    }
+
+    #[test]
+    fn cia_register_gets_hw_name() {
+        let mut a = mini();
+        a["cia1"]["c_cia"] = json!(vec![0i64; 16]);
+        let mut regs = vec![0i64; 16];
+        regs[13] = 0x81; // CIA register $0D = ICR
+        let mut b = mini();
+        b["cia1"]["c_cia"] = json!(regs);
+        let d = diff_checkpoints(&a, &b, &ExcludeMask::default());
+        let sample = &d["components"]["cia1"]["changes"][0]["sample"][0];
+        assert_eq!(sample["reg"], json!("ICR"));
+        assert!(d["components"]["cia1"]["summary"].as_str().unwrap().contains("ICR"));
     }
 }
