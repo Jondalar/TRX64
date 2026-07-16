@@ -27,6 +27,7 @@ use clap::{Parser, Subcommand};
 
 use trx64_cli::boot_cmd;
 use trx64_cli::convert_cmd;
+use trx64_cli::diff_cmd;
 use trx64_cli::disasm_cmd::{self, DisasmArgs};
 use trx64_cli::sandbox_cmd;
 use trx64_cli::engine::Engine;
@@ -222,6 +223,35 @@ enum Command {
         output: String,
     },
 
+    /// Whitebox component-diff of two `.c64re` snapshots (Spec 794): a per-component
+    /// equivalence verdict (cpu/ram/colorram/cia/vic/sid/drive incl. Floppy RAM) with
+    /// a caller exclusion mask. Reads the two checkpoints only — no machine, no
+    /// daemon. The scoring step of the sandbox fan-out. E.g.
+    ///   trx64cli diff base.c64re cand.c64re --preset equivalence \
+    ///           --exclude driveram:0x0000-0x07FF --component sid
+    Diff {
+        /// Baseline `.c64re`.
+        a: String,
+        /// Candidate `.c64re`.
+        b: String,
+        /// Exclude an address window `space:from-to`
+        /// (space = c64ram|colorram|driveram|drivezp). Repeatable.
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
+        /// Exclude a whole component (e.g. sid, drive.ram, vic). Repeatable.
+        #[arg(long = "component")]
+        component: Vec<String>,
+        /// Exclude a volatile lane (cycles|raster|sid_noise|open_bus|framebuffer). Repeatable.
+        #[arg(long = "lane")]
+        lane: Vec<String>,
+        /// Apply a named preset (equivalence = mask all volatile lanes). Repeatable.
+        #[arg(long = "preset")]
+        preset: Vec<String>,
+        /// Emit the full diff JSON instead of the text verdict summary.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Boot a disk/cart in an isolated process (own machine, no daemon, no shared
     /// session) to a state, then dump a .c64re snapshot — mints seeds/fixtures for
     /// `sandbox --seed`. E.g.
@@ -332,6 +362,18 @@ fn main() {
             ))
         };
         match run() {
+            Ok(out) => println!("{out}"),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
+
+    // ── Whitebox component-diff of two .c64re snapshots (Spec 794; no machine) ──
+    if let Some(Command::Diff { a, b, exclude, component, lane, preset, json }) = &cli.cmd {
+        match diff_cmd::run_diff(a, b, exclude, component, lane, preset, *json) {
             Ok(out) => println!("{out}"),
             Err(e) => {
                 eprintln!("{e}");

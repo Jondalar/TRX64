@@ -45,6 +45,7 @@ const CANON: &[&str] = &[
     "cart.rom",
     "drive.cpu",
     "drive.ram",
+    "drive.rotation",
     "drive.via1",
     "drive.via2",
     "drive.disk",
@@ -63,27 +64,237 @@ enum Delta {
     Range { path: String, start: usize, end: usize, count: usize, sample: Vec<Value> },
 }
 
+impl Delta {
+    fn path(&self) -> &str {
+        match self {
+            Delta::Scalar { path, .. } => path,
+            Delta::Range { path, .. } => path,
+        }
+    }
+}
+
+// ── exclusion mask ───────────────────────────────────────────────────────────
+
+/// A caller-supplied exclusion mask (Spec 794). Removes chosen state from the
+/// equivalence verdict — by whole component, by named volatile lane, or by an
+/// address range within an addressable component (RAM / color RAM / Floppy RAM).
+/// Everything it removes is echoed in `verdict.excluded` (the echo law).
+#[derive(Default, Clone)]
+pub struct ExcludeMask {
+    pub components: Vec<String>,
+    pub lanes: Vec<String>,
+    pub ranges: Vec<RangeMask>,
+}
+
+/// An address window (inclusive) within one addressable component.
+#[derive(Clone)]
+pub struct RangeMask {
+    pub component: String,
+    pub from: usize,
+    pub to: usize,
+}
+
+/// Map a caller `space` name to the addressable component it targets.
+fn space_to_component(space: &str) -> Option<&'static str> {
+    match space {
+        "c64ram" => Some("ram"),
+        "colorram" => Some("colorram"),
+        "driveram" | "drivezp" => Some("drive.ram"),
+        _ => None,
+    }
+}
+
+fn parse_addr(v: Option<&Value>) -> usize {
+    match v {
+        Some(Value::Number(n)) => n.as_u64().unwrap_or(0) as usize,
+        Some(Value::String(s)) => {
+            let t = s.trim();
+            if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix('$')) {
+                usize::from_str_radix(h, 16).unwrap_or(0)
+            } else {
+                t.parse::<usize>().or_else(|_| usize::from_str_radix(t, 16)).unwrap_or(0)
+            }
+        }
+        _ => 0,
+    }
+}
+
+impl ExcludeMask {
+    /// Parse the `exclude` object: `{ components:[], lanes:[], ranges:[{space,from,to}],
+    /// presets:[] }`. Null / missing → an empty (strict) mask.
+    pub fn from_json(v: &Value) -> Self {
+        let mut m = ExcludeMask::default();
+        if v.is_null() {
+            return m;
+        }
+        if let Some(ps) = v.get("presets").and_then(|x| x.as_array()) {
+            for p in ps.iter().filter_map(|x| x.as_str()) {
+                m.apply_preset(p);
+            }
+        }
+        if let Some(cs) = v.get("components").and_then(|x| x.as_array()) {
+            for c in cs.iter().filter_map(|x| x.as_str()) {
+                m.components.push(c.to_string());
+            }
+        }
+        if let Some(ls) = v.get("lanes").and_then(|x| x.as_array()) {
+            for l in ls.iter().filter_map(|x| x.as_str()) {
+                if !m.lanes.iter().any(|x| x == l) {
+                    m.lanes.push(l.to_string());
+                }
+            }
+        }
+        if let Some(rs) = v.get("ranges").and_then(|x| x.as_array()) {
+            for r in rs {
+                let space = r.get("space").and_then(|x| x.as_str()).unwrap_or("");
+                if let Some(comp) = space_to_component(space) {
+                    m.ranges.push(RangeMask {
+                        component: comp.to_string(),
+                        from: parse_addr(r.get("from")),
+                        to: parse_addr(r.get("to")),
+                    });
+                }
+            }
+        }
+        m
+    }
+
+    /// Expand a named preset into lanes/ranges. `equivalence` = the volatile lanes
+    /// that always advance between two behaviourally-identical scratch runs.
+    fn apply_preset(&mut self, p: &str) {
+        if p == "equivalence" {
+            for l in ["cycles", "raster", "sid_noise", "open_bus", "framebuffer"] {
+                if !self.lanes.iter().any(|x| x == l) {
+                    self.lanes.push(l.to_string());
+                }
+            }
+        }
+    }
+}
+
+/// Subtract the inclusive window `[from,to]` from `[s,e]`. Returns the residual
+/// sub-ranges (0, 1 or 2) and whether any overlap was removed.
+fn subtract(s: usize, e: usize, from: usize, to: usize) -> (Vec<(usize, usize)>, bool) {
+    if to < s || from > e {
+        return (vec![(s, e)], false);
+    }
+    let mut res = Vec::new();
+    if from > s {
+        res.push((s, from - 1));
+    }
+    if to < e {
+        res.push((to + 1, e));
+    }
+    (res, true)
+}
+
+/// Apply the mask: drop excluded deltas (splitting partially-masked ranges) and
+/// build the echo list. Every mask entry appears in the echo, annotated
+/// `(matched 0)` when it removed nothing (echo law — never silent).
+fn apply_mask(deltas: Vec<Delta>, mask: &ExcludeMask) -> (Vec<Delta>, Vec<String>) {
+    let mut kept: Vec<Delta> = Vec::new();
+    let mut comp_hit = vec![false; mask.components.len()];
+    let mut lane_hit = vec![false; mask.lanes.len()];
+    let mut range_hit = vec![false; mask.ranges.len()];
+
+    for d in deltas {
+        let path = d.path().to_string();
+        let comp = component_of(&path);
+        let lane = lane_of(&path);
+
+        if let Some(i) = mask.components.iter().position(|c| *c == comp) {
+            comp_hit[i] = true;
+            continue;
+        }
+        if let Some(l) = lane {
+            if let Some(i) = mask.lanes.iter().position(|x| x == l) {
+                lane_hit[i] = true;
+                continue;
+            }
+        }
+
+        match d {
+            Delta::Range { path: rp, start, end, sample, .. } => {
+                let relevant: Vec<usize> = mask
+                    .ranges
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, rm)| rm.component == comp)
+                    .map(|(i, _)| i)
+                    .collect();
+                if relevant.is_empty() {
+                    kept.push(Delta::Range { path: rp, start, end, count: end - start + 1, sample });
+                    continue;
+                }
+                let mut segments = vec![(start, end)];
+                for &ri in &relevant {
+                    let rm = &mask.ranges[ri];
+                    let mut next = Vec::new();
+                    for (s, e) in segments.drain(..) {
+                        let (residual, hit) = subtract(s, e, rm.from, rm.to);
+                        if hit {
+                            range_hit[ri] = true;
+                        }
+                        next.extend(residual);
+                    }
+                    segments = next;
+                }
+                for (s, e) in segments {
+                    let sub: Vec<Value> = sample
+                        .iter()
+                        .filter(|sv| {
+                            let idx = sv.get("index").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+                            idx >= s && idx <= e
+                        })
+                        .cloned()
+                        .collect();
+                    kept.push(Delta::Range { path: rp.clone(), start: s, end: e, count: e - s + 1, sample: sub });
+                }
+            }
+            other => kept.push(other),
+        }
+    }
+
+    let mut excluded: Vec<String> = Vec::new();
+    for (i, c) in mask.components.iter().enumerate() {
+        excluded.push(format!("component:{c}{}", if comp_hit[i] { "" } else { " (matched 0)" }));
+    }
+    for (i, l) in mask.lanes.iter().enumerate() {
+        excluded.push(format!("lane:{l}{}", if lane_hit[i] { "" } else { " (matched 0)" }));
+    }
+    for (i, r) in mask.ranges.iter().enumerate() {
+        excluded.push(format!(
+            "range:{} ${:04X}-${:04X}{}",
+            r.component,
+            r.from,
+            r.to,
+            if range_hit[i] { "" } else { " (matched 0)" }
+        ));
+    }
+    (kept, excluded)
+}
+
 // ── public entry ─────────────────────────────────────────────────────────────
 
 /// Diff two RuntimeCheckpoint JSON trees → the Spec 794 component-diff value:
 /// `{ schema, fromCycle, toCycle, verdict{identical,differing,excluded,scope},
 ///    components{ <comp>: {identical, summary, changes[]} } }`.
 ///
-/// STRICT: every component is in scope, no masking (the `exclude` mask is a later
-/// slice). This is the Spec 792 byte-exact bar — any single differing field/byte in
-/// any component (incl. color RAM, drive RAM, internal chip state) flips
-/// `verdict.identical` to false and names the component.
-pub fn diff_checkpoints(a: &Value, b: &Value) -> Value {
+/// `mask` removes chosen state from the verdict (whole components / volatile lanes /
+/// address ranges incl. Floppy RAM), echoed in `verdict.excluded`. An empty mask
+/// (`ExcludeMask::default()`) is STRICT = the Spec 792 byte-exact bar: any single
+/// differing field/byte in any component (incl. color RAM, drive RAM, internal chip
+/// state) flips `verdict.identical` and names the component.
+pub fn diff_checkpoints(a: &Value, b: &Value, mask: &ExcludeMask) -> Value {
     let mut deltas: Vec<Delta> = Vec::new();
     walk(a, b, "", &mut deltas);
 
     // Decompose the opaque drive blob into addressable sub-module components so
     // Floppy RAM etc. are diffed at byte granularity, not "drive.blob changed".
-    let drive_a = a.get("drive1541");
-    let drive_b = b.get("drive1541");
-    drive_blob_components(drive_a, drive_b, &mut deltas);
+    drive_blob_components(a.get("drive1541"), b.get("drive1541"), &mut deltas);
 
-    assemble(deltas, a, b)
+    let (kept, excluded) = apply_mask(deltas, mask);
+    assemble(kept, excluded, a, b)
 }
 
 // ── recursive JSON walk ──────────────────────────────────────────────────────
@@ -228,19 +439,44 @@ fn drive_blob_components(a: Option<&Value>, b: Option<&Value>, out: &mut Vec<Del
         (Some(x), Some(y)) => (x, y),
         _ => return,
     };
-    // Each (module-name, component, address-base) — DRIVE8 carries the 2 KB RAM.
+    // Whole-module components: DRIVE8 = rotation/head state, the two VIAs.
     for (module, comp) in [
-        ("DRIVE8", "drive.ram"),
-        ("DRIVECPU0", "drive.cpu"),
+        ("DRIVE8", "drive.rotation"),
         ("1541VIA1D0", "drive.via1"),
-        ("1541VIA2D0", "drive.via2"),
+        ("VIA2D0", "drive.via2"),
     ] {
-        let ma = vice_module(&ba, module);
-        let mb = vice_module(&bb, module);
-        match (ma, mb) {
-            (Some(da), Some(db)) if da != db => diff_bytes(da, db, comp, out),
-            _ => {}
+        if let (Some(da), Some(db)) = (vice_module(&ba, module), vice_module(&bb, module)) {
+            if da != db {
+                diff_bytes(da, db, comp, out);
+            }
         }
+    }
+    // DRIVECPU0 = the drive 6502 header FOLLOWED by the 2 KB drive RAM as the module's
+    // LAST field (drive_snapshot.rs write_drivecpu_module: `smw_ba(&ram, 0x800)` then
+    // module_close). So RAM offset = data.len() - 0x800 and its byte indices ARE 1541
+    // RAM addresses $0000-$07FF — which is what an `exclude driveram $0000-$07FF` mask
+    // and a Floppy-RAM cheat hunt address.
+    if let (Some(da), Some(db)) = (vice_module(&ba, "DRIVECPU0"), vice_module(&bb, "DRIVECPU0")) {
+        let (hdr_a, ram_a) = split_drive_ram(da);
+        let (hdr_b, ram_b) = split_drive_ram(db);
+        if hdr_a != hdr_b {
+            diff_bytes(hdr_a, hdr_b, "drive.cpu", out);
+        }
+        if ram_a != ram_b {
+            diff_bytes(ram_a, ram_b, "drive.ram", out);
+        }
+    }
+}
+
+/// Split a DRIVECPU0 module's data into (CPU header, 2 KB drive RAM). The RAM is the
+/// module's LAST field, so it is the trailing `0x800` bytes; a named fn (not a
+/// closure) so both returned slices share the input's lifetime.
+fn split_drive_ram(d: &[u8]) -> (&[u8], &[u8]) {
+    const DRIVE_RAM: usize = 0x800;
+    if d.len() >= DRIVE_RAM {
+        d.split_at(d.len() - DRIVE_RAM)
+    } else {
+        (d, &d[..0])
     }
 }
 
@@ -362,7 +598,7 @@ fn lane_of(path: &str) -> Option<&'static str> {
 
 // ── assemble output ──────────────────────────────────────────────────────────
 
-fn assemble(deltas: Vec<Delta>, a: &Value, b: &Value) -> Value {
+fn assemble(deltas: Vec<Delta>, excluded: Vec<String>, a: &Value, b: &Value) -> Value {
     use std::collections::BTreeMap;
     let mut comps: BTreeMap<String, Vec<Value>> = BTreeMap::new();
     for d in &deltas {
@@ -419,7 +655,7 @@ fn assemble(deltas: Vec<Delta>, a: &Value, b: &Value) -> Value {
         "verdict": {
             "identical": differing.is_empty(),
             "differing": differing,
-            "excluded": [],
+            "excluded": excluded,
             "scope": scope,
         },
         "components": Value::Object(cmap),
@@ -459,6 +695,50 @@ fn nested_i64(v: &Value, keys: &[&str]) -> i64 {
     cur.as_i64().unwrap_or(0)
 }
 
+// ── text rendering ───────────────────────────────────────────────────────────
+
+fn str_list(v: &Value, key: &str) -> Vec<String> {
+    v.get(key)
+        .and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default()
+}
+
+/// A compact human/agent-readable rendering of a component-diff value — the verdict,
+/// the excluded (masked) set, and a one-line summary per differing component. Used by
+/// `trx64cli diff` and the daemon monitor `diff` command.
+pub fn format_component_diff(d: &Value) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let from = d.get("fromCycle").and_then(|v| v.as_i64()).unwrap_or(0);
+    let to = d.get("toCycle").and_then(|v| v.as_i64()).unwrap_or(0);
+    lines.push(format!("checkpoint diff  cycles {from} → {to}"));
+
+    let verdict = d.get("verdict").cloned().unwrap_or_else(|| json!({}));
+    let identical = verdict.get("identical").and_then(|v| v.as_bool()).unwrap_or(false);
+    let differing = str_list(&verdict, "differing");
+    if identical {
+        lines.push("VERDICT: IDENTICAL".to_string());
+    } else {
+        lines.push(format!("VERDICT: DIFFERS  (differing: {})", differing.join(", ")));
+    }
+    let excluded = str_list(&verdict, "excluded");
+    if !excluded.is_empty() {
+        lines.push(format!("excluded: {}", excluded.join(", ")));
+    }
+
+    if let Some(comps) = d.get("components").and_then(|v| v.as_object()) {
+        for name in &differing {
+            let summary = comps
+                .get(name)
+                .and_then(|c| c.get("summary"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
+            lines.push(format!("  {name:<14} {summary}"));
+        }
+    }
+    lines.join("\n")
+}
+
 // ── tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -485,7 +765,7 @@ mod tests {
     #[test]
     fn identical_is_identical() {
         let m = mini();
-        let d = diff_checkpoints(&m, &m.clone());
+        let d = diff_checkpoints(&m, &m.clone(), &ExcludeMask::default());
         assert_eq!(d["verdict"]["identical"], json!(true));
         assert_eq!(d["verdict"]["differing"], json!([]));
         // scope must always list the canonical components.
@@ -497,7 +777,7 @@ mod tests {
         let a = mini();
         let mut b = mini();
         b["cpu"]["pc"] = json!(0x2000);
-        let d = diff_checkpoints(&a, &b);
+        let d = diff_checkpoints(&a, &b, &ExcludeMask::default());
         assert_eq!(d["verdict"]["identical"], json!(false));
         assert!(d["verdict"]["differing"].as_array().unwrap().iter().any(|c| c == "cpu"));
         assert_eq!(d["components"]["cpu"]["identical"], json!(false));
@@ -510,7 +790,7 @@ mod tests {
         bytes[5] = 0x5a;
         let mut b = mini();
         b["ram"] = ta_u8(&bytes);
-        let d = diff_checkpoints(&a, &b);
+        let d = diff_checkpoints(&a, &b, &ExcludeMask::default());
         assert!(d["verdict"]["differing"].as_array().unwrap().iter().any(|c| c == "ram"));
         let ch = &d["components"]["ram"]["changes"][0];
         assert_eq!(ch["kind"], json!("range"));
@@ -523,7 +803,7 @@ mod tests {
         let a = mini();
         let mut b = mini();
         b["vic"]["color_ram"][5] = json!(0x0e);
-        let d = diff_checkpoints(&a, &b);
+        let d = diff_checkpoints(&a, &b, &ExcludeMask::default());
         // color RAM must NOT fold into `vic` — it is its own component.
         assert!(d["verdict"]["differing"].as_array().unwrap().iter().any(|c| c == "colorram"));
         assert_eq!(d["components"]["vic"]["identical"], json!(true));
@@ -534,7 +814,7 @@ mod tests {
         let a = mini();
         let mut b = mini();
         b["cia1"]["ta_latch"] = json!(0x1ff);
-        let d = diff_checkpoints(&a, &b);
+        let d = diff_checkpoints(&a, &b, &ExcludeMask::default());
         assert!(d["verdict"]["differing"].as_array().unwrap().iter().any(|c| c == "cia1"));
     }
 
@@ -543,11 +823,126 @@ mod tests {
         let a = mini();
         let mut b = mini();
         b["vic"]["raster_line"] = json!(42);
-        let d = diff_checkpoints(&a, &b);
+        let d = diff_checkpoints(&a, &b, &ExcludeMask::default());
         // strict mode: vic differs (lane not masked yet)…
         assert!(d["verdict"]["differing"].as_array().unwrap().iter().any(|c| c == "vic"));
         // …but the change carries the `raster` lane tag for later masking.
         let ch = &d["components"]["vic"]["changes"][0];
         assert_eq!(ch["lane"], json!("raster"));
+    }
+
+    // ── mask tests ───────────────────────────────────────────────────────────
+
+    /// Build a minimal `drive1541` blob = one DRIVECPU0 module whose LAST 0x800
+    /// bytes are the drive RAM (as the real writer lays it out), preceded by an
+    /// 8-byte stand-in CPU header. Mirrors `vice_module`'s framing.
+    fn drive_blob(ram: &[u8]) -> Vec<u8> {
+        fn push_module(buf: &mut Vec<u8>, name: &str, data: &[u8]) {
+            let mut nm = [0u8; 16];
+            let nb = name.as_bytes();
+            nm[..nb.len()].copy_from_slice(nb);
+            buf.extend_from_slice(&nm);
+            buf.push(0); // major
+            buf.push(0); // minor
+            let size = (22 + data.len()) as u32; // TOTAL incl the 22-byte header
+            buf.extend_from_slice(&size.to_le_bytes());
+            buf.extend_from_slice(data);
+        }
+        let mut buf = vec![0u8; 58]; // file header (length only matters to vice_module)
+        let mut data = vec![0u8; 8]; // CPU header stand-in
+        data.extend_from_slice(ram); // 0x800 RAM at the tail
+        push_module(&mut buf, "DRIVECPU0", &data);
+        buf
+    }
+
+    fn with_drive(ram: &[u8]) -> Value {
+        let mut m = mini();
+        m["drive1541"] = ta_u8(&drive_blob(ram));
+        m
+    }
+
+    #[test]
+    fn floppy_ram_masked_in_and_out() {
+        let mut ram_a = vec![0u8; 0x800];
+        let mut ram_b = vec![0u8; 0x800];
+        ram_a[5] = 0x03;
+        ram_b[5] = 0x00; // a life counter decremented in drive RAM
+        let a = with_drive(&ram_a);
+        let b = with_drive(&ram_b);
+
+        // Strict: Floppy RAM is a first-class component and differs at $0005.
+        let strict = diff_checkpoints(&a, &b, &ExcludeMask::default());
+        assert_eq!(strict["verdict"]["identical"], json!(false));
+        assert!(strict["verdict"]["differing"].as_array().unwrap().iter().any(|c| c == "drive.ram"));
+        let ch = &strict["components"]["drive.ram"]["changes"][0];
+        assert_eq!(ch["start"], json!(5));
+
+        // Masked: exclude the whole Floppy RAM → identical, and echoed.
+        let mask = ExcludeMask::from_json(&json!({
+            "ranges": [{ "space": "driveram", "from": "0x0000", "to": "0x07FF" }]
+        }));
+        let masked = diff_checkpoints(&a, &b, &mask);
+        assert_eq!(masked["verdict"]["identical"], json!(true));
+        let ex = masked["verdict"]["excluded"].as_array().unwrap();
+        assert!(ex.iter().any(|e| e.as_str().unwrap().starts_with("range:drive.ram")));
+    }
+
+    #[test]
+    fn partial_range_mask_keeps_residual() {
+        let mut ram_a = vec![0u8; 0x800];
+        let mut ram_b = vec![0u8; 0x800];
+        ram_a[0x10] = 1; // inside the masked window
+        ram_b[0x10] = 2;
+        ram_a[0x200] = 1; // OUTSIDE the masked window → must survive
+        ram_b[0x200] = 2;
+        let a = with_drive(&ram_a);
+        let b = with_drive(&ram_b);
+        let mask = ExcludeMask::from_json(&json!({
+            "ranges": [{ "space": "driveram", "from": "0x0000", "to": "0x00FF" }]
+        }));
+        let d = diff_checkpoints(&a, &b, &mask);
+        // $0200 still differs → not identical, drive.ram still listed.
+        assert_eq!(d["verdict"]["identical"], json!(false));
+        let changes = d["components"]["drive.ram"]["changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0]["start"], json!(0x200));
+    }
+
+    #[test]
+    fn component_exclude_removes_it() {
+        let a = mini();
+        let mut b = mini();
+        b["cpu"]["pc"] = json!(0x2000);
+        let mask = ExcludeMask::from_json(&json!({ "components": ["cpu"] }));
+        let d = diff_checkpoints(&a, &b, &mask);
+        assert_eq!(d["verdict"]["identical"], json!(true));
+        assert!(d["verdict"]["excluded"].as_array().unwrap().iter().any(|e| e == "component:cpu"));
+    }
+
+    #[test]
+    fn equivalence_preset_masks_volatile_lanes() {
+        let a = mini();
+        let mut b = mini();
+        b["vic"]["raster_line"] = json!(200); // volatile — different scratch run timing
+        b["cpu"]["cycles"] = json!(999_999);
+        let strict = diff_checkpoints(&a, &b, &ExcludeMask::default());
+        assert_eq!(strict["verdict"]["identical"], json!(false));
+        let eq = ExcludeMask::from_json(&json!({ "presets": ["equivalence"] }));
+        let d = diff_checkpoints(&a, &b, &eq);
+        // raster + cycles are volatile lanes → behaviourally identical.
+        assert_eq!(d["verdict"]["identical"], json!(true));
+    }
+
+    #[test]
+    fn echo_law_reports_zero_match() {
+        let a = mini();
+        let b = mini(); // identical
+        let mask = ExcludeMask::from_json(&json!({ "components": ["sid"] }));
+        let d = diff_checkpoints(&a, &b, &mask);
+        assert!(d["verdict"]["excluded"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e == "component:sid (matched 0)"));
     }
 }
