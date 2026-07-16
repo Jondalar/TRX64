@@ -37,6 +37,15 @@ struct Ring {
     gov_target: usize,
     gov_margin: usize,
     primed: bool,
+    /// Source (44100) samples consumed per output frame = 44100 / output_rate.
+    /// `1.0` when the device runs at 44100 (mac/linux happy path) → one pop per frame,
+    /// bit-identical to the non-resampled path. `< 1.0` (e.g. Windows/WASAPI 48000) holds
+    /// samples across frames (zero-order hold); `> 1.0` decimates. Set once at stream build.
+    step: f64,
+    /// Fractional read cursor across the mono source ring (accumulates `step`).
+    pos: f64,
+    /// Last sample popped — repeated while `pos < 1.0` (zero-order hold on upsample).
+    held: i16,
 }
 
 impl Ring {
@@ -47,6 +56,9 @@ impl Ring {
             gov_target,
             gov_margin,
             primed: false,
+            step: 1.0,
+            pos: 0.0,
+            held: 0,
         }
     }
 }
@@ -82,7 +94,12 @@ impl AudioOutput {
         };
         let sample_format = supported.sample_format();
         let channels = supported.config().channels.max(1) as usize;
-        // Force the runtime's sample rate so 1 drained sample == 1 output frame.
+        // Prefer the runtime's rate so 1 drained sample == 1 output frame. macOS CoreAudio
+        // and Linux ALSA/Pulse accept 44100 and resample for us. Windows WASAPI *shared
+        // mode* does NOT — it rejects any rate that isn't the device mix format (commonly
+        // 48000), so build_output_stream errors and the window runs muted. We therefore try
+        // 44100 first and, if the backend refuses it, fall back to the device's own default
+        // rate and resample 44100 → device in `fill` (step != 1.0). See `AudioOutput::start`.
         let config = StreamConfig {
             channels: supported.config().channels.max(1),
             sample_rate: cpal::SampleRate(AUDIO_SAMPLE_RATE),
@@ -101,7 +118,30 @@ impl AudioOutput {
             rate * 50 / 1000,
         )));
 
-        let stream = build_stream(&device, &config, sample_format, channels, Arc::clone(&ring))?;
+        // Try the forced 44100 stream (quiet: a failure here is expected on Windows and we
+        // recover). On failure, rebuild at the device's default rate + resample.
+        let (stream, out_rate) =
+            match build_stream(&device, &config, sample_format, channels, Arc::clone(&ring), true) {
+                Some(s) => (s, AUDIO_SAMPLE_RATE),
+                None => {
+                    let dev_rate = supported.config().sample_rate;
+                    let cfg2 = StreamConfig {
+                        channels: supported.config().channels.max(1),
+                        sample_rate: dev_rate,
+                        buffer_size: cpal::BufferSize::Default,
+                    };
+                    eprintln!(
+                        "[trx64-cli] audio: 44100 Hz refused by the backend — using device rate {} Hz + resample.",
+                        dev_rate.0
+                    );
+                    let s = build_stream(&device, &cfg2, sample_format, channels, Arc::clone(&ring), false)?;
+                    (s, dev_rate.0)
+                }
+            };
+
+        // Resample cursor: source (44100) samples consumed per output frame. 1.0 = exact.
+        ring.lock().unwrap().step = AUDIO_SAMPLE_RATE as f64 / out_rate as f64;
+
         if let Err(e) = stream.play() {
             eprintln!("[trx64-cli] audio: stream.play failed ({e}) — muted.");
             return None;
@@ -154,6 +194,7 @@ fn build_stream(
     fmt: SampleFormat,
     channels: usize,
     ring: Arc<Mutex<Ring>>,
+    quiet: bool,
 ) -> Option<Stream> {
     let err_fn = |e| eprintln!("[trx64-cli] audio stream error: {e}");
     // The mono i16 ring up-mixes into whatever sample format the device wants via
@@ -185,7 +226,11 @@ fn build_stream(
     match res {
         Ok(s) => Some(s),
         Err(e) => {
-            eprintln!("[trx64-cli] audio: build_output_stream failed ({e}) — muted.");
+            // Quiet on the first (forced-44100) attempt — the caller recovers by rebuilding
+            // at the device rate. Only the final failure is worth a "muted" warning.
+            if !quiet {
+                eprintln!("[trx64-cli] audio: build_output_stream failed ({e}) — muted.");
+            }
             None
         }
     }
@@ -219,9 +264,28 @@ fn fill<T: cpal::Sample + cpal::FromSample<i16>>(
     let channels = channels.max(1);
     let frames = out.len() / channels;
     for f in 0..frames {
-        // Underrun → silence for the missing samples, but STAY primed (no re-prime gap):
-        // a momentary underrun is then a sub-ms blip, not a `preroll`-long drop.
-        let v = r.buf.pop_front().map(T::from_sample).unwrap_or(silence);
+        // Advance the fractional read cursor by `step` source samples per output frame and
+        // pop the whole-sample part. step == 1.0 pops exactly one → identical to the
+        // non-resampled path. step < 1.0 (device > 44100) holds a sample across frames;
+        // step > 1.0 decimates. Underrun → silence but STAY primed (sub-ms blip, not a
+        // `preroll`-long drop); reset the cursor so resume doesn't fast-forward the debt.
+        r.pos += r.step;
+        let mut underrun = false;
+        while r.pos >= 1.0 {
+            match r.buf.pop_front() {
+                Some(s) => {
+                    r.held = s;
+                    r.pos -= 1.0;
+                }
+                None => {
+                    underrun = true;
+                    r.held = 0;
+                    r.pos = 0.0;
+                    break;
+                }
+            }
+        }
+        let v = if underrun { silence } else { T::from_sample(r.held) };
         for c in 0..channels {
             out[f * channels + c] = v;
         }
