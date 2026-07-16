@@ -8056,16 +8056,45 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             // s.c64Bus.ram[(addr + i) & 0xffff] = bytes[i] & 0xff.
             let mut applied: Vec<Value> = vec![];
             for p in &patches {
+                // Spec 795 — `space` selects RAM (default) or a cart bank (roml/romh).
+                let space = p.get("space").and_then(|v| v.as_str()).unwrap_or("ram");
                 let addr = (p.get("addr").and_then(|v| v.as_u64()).unwrap_or(0) & 0xffff) as usize;
                 let bytes: Vec<u8> = p
                     .get("bytes")
                     .and_then(|v| v.as_array())
                     .map(|a| a.iter().map(|b| (b.as_u64().unwrap_or(0) & 0xff) as u8).collect())
                     .unwrap_or_default();
-                for (i, &b) in bytes.iter().enumerate() {
-                    st.session.machine.ram[(addr + i) & 0xffff] = b;
+                if space == "ram" {
+                    for (i, &b) in bytes.iter().enumerate() {
+                        st.session.machine.ram[(addr + i) & 0xffff] = b;
+                    }
+                    applied.push(json!({ "space": "ram", "addr": addr as u64, "len": bytes.len() as u64 }));
+                } else {
+                    // Cart bank overlay (roml/romh + explicit bank). Ephemeral: rolled
+                    // back on the next anchor restore (792 cart restore reloads flash).
+                    let bank = p.get("bank").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+                    match st.session.machine.cartridge.as_mut() {
+                        Some(cart) => {
+                            for (i, &b) in bytes.iter().enumerate() {
+                                if let Err(e) =
+                                    cart.overlay_bank_write(space, bank, ((addr + i) & 0xffff) as u16, b)
+                                {
+                                    return Response::err(id, -32001, format!("runtime/overlay_run: {e}"));
+                                }
+                            }
+                            applied.push(json!({
+                                "space": space, "bank": bank, "addr": addr as u64, "len": bytes.len() as u64
+                            }));
+                        }
+                        None => {
+                            return Response::err(
+                                id,
+                                -32001,
+                                "runtime/overlay_run: cart overlay requested but no cartridge attached",
+                            )
+                        }
+                    }
                 }
-                applied.push(json!({ "addr": addr as u64, "len": bytes.len() as u64 }));
             }
 
             // Run forward (bounded; optional breakpoint at until_pc). ws-server.ts:967-975.
@@ -8112,9 +8141,27 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             let mut reads = serde_json::Map::new();
             for p in &patches {
                 if p.get("read").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    let space = p.get("space").and_then(|v| v.as_str()).unwrap_or("ram");
                     let a = (p.get("addr").and_then(|v| v.as_u64()).unwrap_or(0) & 0xffff) as usize;
-                    let key = format!("${:04x}", a);
-                    reads.insert(key, json!(st.session.machine.ram[a] as u64));
+                    if space == "ram" {
+                        let key = format!("${:04x}", a);
+                        reads.insert(key, json!(st.session.machine.ram[a] as u64));
+                    } else {
+                        // Cart bank read-back (proves the overlay / bank isolation).
+                        let bank = p.get("bank").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+                        let key = format!("{space}:{bank}:${:04x}", a);
+                        let val = st
+                            .session
+                            .machine
+                            .cartridge
+                            .as_ref()
+                            .map(|c| c.overlay_bank_read(space, bank, a as u16));
+                        match val {
+                            Some(Ok(v)) => reads.insert(key, json!(v as u64)),
+                            Some(Err(e)) => reads.insert(key, json!(format!("err: {e}"))),
+                            None => reads.insert(key, json!("err: no cartridge")),
+                        };
+                    }
                 }
             }
 

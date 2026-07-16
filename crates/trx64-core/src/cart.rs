@@ -220,6 +220,48 @@ pub trait CartMapper: Send {
     fn crt_image(&mut self, _clk: u64) -> Option<Vec<u8>> {
         None
     }
+
+    // ── Banked code overlay (Spec 795) ──────────────────────────────────────────
+
+    /// Overlay one byte into a cart bank IMAGE for an EXPLICIT bank at a CPU-window
+    /// address (`space` = "roml" $8000-$9FFF / "romh" $A000-$BFFF or $E000-$FFFF).
+    /// This is a WHAT-IF patch of the flash array, bypassing the flash command FSM —
+    /// NOT a program/erase sequence. Ephemeral: rolled back when the anchor is
+    /// restored (Spec 792 cart restore reloads the original flash). Default:
+    /// unsupported (read-only mappers / non-flash families).
+    fn overlay_bank_write(&mut self, _space: &str, _bank: u16, _addr: u16, _byte: u8) -> Result<(), String> {
+        Err("banked overlay (Spec 795) not implemented for this mapper".into())
+    }
+
+    /// Read one byte back from a cart bank IMAGE (side-effect-free), for the overlay
+    /// read-back / bank-isolation check. Default: unsupported.
+    fn overlay_bank_read(&self, _space: &str, _bank: u16, _addr: u16) -> Result<u8, String> {
+        Err("banked overlay read (Spec 795) not implemented for this mapper".into())
+    }
+}
+
+/// Spec 795 — resolve a cart overlay `(space, addr)` to `(use_hi_flash, window_base)`.
+/// roml → the lo flash at $8000; romh → the hi flash at $A000 (16k) or $E000 (ultimax).
+fn cart_overlay_target(space: &str, addr: u16) -> Result<(bool, u16), String> {
+    match space {
+        "roml" => {
+            if (0x8000..=0x9fff).contains(&addr) {
+                Ok((false, 0x8000))
+            } else {
+                Err(format!("overlay roml addr ${addr:04X} outside $8000-$9FFF"))
+            }
+        }
+        "romh" => {
+            if (0xa000..=0xbfff).contains(&addr) {
+                Ok((true, 0xa000))
+            } else if (0xe000..=0xffff).contains(&addr) {
+                Ok((true, 0xe000))
+            } else {
+                Err(format!("overlay romh addr ${addr:04X} outside $A000-$BFFF/$E000-$FFFF"))
+            }
+        }
+        other => Err(format!("unknown cart overlay space {other:?} (want roml|romh)")),
+    }
 }
 
 impl Clone for Box<dyn CartMapper> {
@@ -1120,6 +1162,34 @@ impl CartMapper for EasyFlashMapper {
             offset += packet_len;
         }
         Some(out)
+    }
+
+    /// Spec 795 — overlay a byte into an EF bank's flash array (what-if patch,
+    /// bypasses the flash command FSM). Index mirrors `chip_offset`:
+    /// `(bank << 13) | (addr - window_base)` into lo_flash (roml) / hi_flash (romh).
+    fn overlay_bank_write(&mut self, space: &str, bank: u16, addr: u16, byte: u8) -> Result<(), String> {
+        let (hi, base) = cart_overlay_target(space, addr)?;
+        let offset = (((bank as u32) << 13) | ((addr - base) as u32)) as usize;
+        let flash = if hi { &mut self.hi_flash } else { &mut self.lo_flash };
+        if offset >= flash.data.len() {
+            return Err(format!(
+                "overlay bank {bank} {space} ${addr:04X} → offset ${offset:X} exceeds flash (${:X})",
+                flash.data.len()
+            ));
+        }
+        flash.data[offset] = byte;
+        Ok(())
+    }
+
+    fn overlay_bank_read(&self, space: &str, bank: u16, addr: u16) -> Result<u8, String> {
+        let (hi, base) = cart_overlay_target(space, addr)?;
+        let offset = (((bank as u32) << 13) | ((addr - base) as u32)) as usize;
+        let flash = if hi { &self.hi_flash } else { &self.lo_flash };
+        flash
+            .data
+            .get(offset)
+            .copied()
+            .ok_or_else(|| format!("overlay read bank {bank} {space} ${addr:04X} → offset ${offset:X} exceeds flash"))
     }
 }
 
@@ -2290,4 +2360,87 @@ pub fn load_self_config_from_bin(
     };
     let mapper: Box<dyn CartMapper> = Box::new(SelfConfigCartMapper::new(data, name));
     Ok((image, mapper))
+}
+
+#[cfg(test)]
+mod overlay795_tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn image(mapper_type: MapperType, bank_fills: &[(u16, u8)]) -> ParsedCartridgeImage {
+        let mut banks: BTreeMap<u16, CrtBank> = BTreeMap::new();
+        for &(bank, fill) in bank_fills {
+            let mut b = CrtBank::default();
+            b.roml = Some([fill; 0x2000]);
+            banks.insert(bank, b);
+        }
+        ParsedCartridgeImage {
+            path: String::new(),
+            name: "test".into(),
+            mapper_type,
+            exrom: 0,
+            game: 1,
+            banks,
+            profiles: BTreeSet::new(),
+            raw_bytes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn ef_overlay_write_read_and_bank_isolation() {
+        let img = image(MapperType::EasyFlash, &[(0, 0x00), (3, 0xaa)]);
+        let mut ef = EasyFlashMapper::new(&img);
+        // bank 3 roml $8010 starts as its fill (0xaa).
+        assert_eq!(ef.overlay_bank_read("roml", 3, 0x8010).unwrap(), 0xaa);
+        ef.overlay_bank_write("roml", 3, 0x8010, 0x42).unwrap();
+        assert_eq!(ef.overlay_bank_read("roml", 3, 0x8010).unwrap(), 0x42);
+        // bank 0 at the same window offset is untouched (isolation): bank-0 fill 0x00.
+        assert_eq!(ef.overlay_bank_read("roml", 0, 0x8010).unwrap(), 0x00);
+    }
+
+    #[test]
+    fn ef_overlay_rejects_bad_space_and_addr() {
+        let img = image(MapperType::EasyFlash, &[(0, 0x00)]);
+        let mut ef = EasyFlashMapper::new(&img);
+        assert!(ef.overlay_bank_write("bogus", 0, 0x8000, 1).is_err());
+        // $A000 is not in the roml window.
+        assert!(ef.overlay_bank_write("roml", 0, 0xa000, 1).is_err());
+    }
+
+    #[test]
+    fn readonly_mapper_overlay_errors_by_default() {
+        let img = image(MapperType::Normal8k, &[(0, 0x00)]);
+        let mut nm = NormalMapper::new(&img);
+        assert!(nm.overlay_bank_write("roml", 0, 0x8000, 1).is_err());
+    }
+
+    fn dummy_bank_info() -> BankInfo {
+        BankInfo {
+            cpu_port_direction: 0x2f,
+            cpu_port_value: 0x37,
+            basic_visible: false,
+            kernal_visible: false,
+            io_visible: true,
+            char_visible: false,
+            cartridge_attached: true,
+            cartridge_exrom: Some(0),
+            cartridge_game: Some(1),
+            phi1: 0xff,
+        }
+    }
+
+    #[test]
+    fn ef_overlay_is_served_by_cpu_read() {
+        let img = image(MapperType::EasyFlash, &[(0, 0x00), (3, 0xaa)]);
+        let mut ef = EasyFlashMapper::new(&img);
+        let bi = dummy_bank_info();
+        // Overlay into bank 3, select bank 3, read via the mapper read path (what the
+        // CPU fetches at $8010) → sees the overlay 0x42, not the original 0xaa.
+        ef.overlay_bank_write("roml", 3, 0x8010, 0x42).unwrap();
+        ef.write(0xde00, 3, &bi, 0); // EF bank select → current_bank = 3
+        assert_eq!(ef.read(0x8010, &bi, 0), Some(0x42));
+        // Select bank 0 → the overlay is not visible (read-path bank isolation).
+        ef.write(0xde00, 0, &bi, 0);
+        assert_eq!(ef.read(0x8010, &bi, 0), Some(0x00));
+    }
 }
