@@ -398,6 +398,26 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
             crate::stream_maybe_autopersist_disk(&mut st, now_ms);
         }
 
+        // ── Spec 767 (live-view) — control-owner idle release ──────────────────────
+        // Revert control_owner "llm"→"human" once the LLM goes idle (no operating
+        // command for the idle window), so the green border returns to human-owned when
+        // the LLM stops driving. NOTE: not gated on `running` — under --stream the human
+        // session free-runs (running=true) the whole time, so a `!running` gate would
+        // never release. While the LLM drives its OWN bounded free-run, that path keeps
+        // `last_llm_activity` fresh each frame (Slice 2), so this only fires on real idle.
+        // Runs every loop iteration regardless of run-state (like the media-persist block).
+        {
+            let mut st = state.lock().unwrap();
+            if st.control_owner == "llm" {
+                if let Some(t) = st.last_llm_activity {
+                    if t.elapsed() >= Duration::from_millis(3000) {
+                        crate::set_control_owner(&mut st, "human");
+                        st.last_llm_activity = None;
+                    }
+                }
+            }
+        }
+
         if running {
         // ── Run one PAL frame + render + drain this frame's SID writes ──
         // Lock the shared State only for this window; release before sleeping so

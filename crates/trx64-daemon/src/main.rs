@@ -315,6 +315,11 @@ pub struct State {
     /// (run/pause/continue/step). broadcast `debug/control` on change only (Spec 767
     /// setControlOwner, runtime-controller.ts:338). Signal only; never gates access.
     control_owner: String,
+    /// Spec 767 (live-view) — wall-clock of the last LLM-source OPERATING command.
+    /// The stream pump reverts `control_owner` "llm"→"human" after an idle gap (and
+    /// only while NOT running) so the border returns to human-owned when the LLM stops
+    /// driving. `None` until the first LLM operating command.
+    last_llm_activity: Option<std::time::Instant>,
     /// T2.6 — last finalized trace store path and run id (= TS TraceRunController
     /// `lastStorePath`/`lastRunId`). Set in finalize_trace; surfaced by trace/current.
     /// `None` until the first trace is stopped.
@@ -6873,6 +6878,9 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
 
 pub fn dispatch(req: Request, state: &SharedState) -> Response {
     let id = req.id.clone();
+    // Spec 767 (live-view) — flip the shared-session control owner to whoever issued this
+    // OPERATING command (green border when the LLM is co-driving) BEFORE the handler runs.
+    note_operating_owner_for(&req, state);
     match req.method.as_str() {
         "ping" => {
             Response::ok(id, json!({}))
@@ -7161,8 +7169,12 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 "sid": { "regs": sid_regs, "streaming": streaming }
             });
             // TS session/state (ws-server.ts:531) emits stopReason ONLY when set
-            // (stopInfo?.reason → undefined omits the key) and has NO controlOwner.
+            // (stopInfo?.reason → undefined omits the key).
             if let Some(r) = stop_reason { state_json["stopReason"] = json!(r); }
+            // Spec 767 (live-view) — report the shared-session control owner so the UI can
+            // SEED the border colour on (re)connect (it otherwise only learns the owner
+            // from the one-shot `debug/control` broadcast, missed on a late attach).
+            state_json["controlOwner"] = json!(st.control_owner);
             Response::ok(id, state_json)
         }
 
@@ -12786,7 +12798,7 @@ fn run_scenario(st: &mut State, scenario: &Value) -> Result<Value, String> {
 /// T1.2 — Spec 767 `setControlOwner`: set `State.control_owner` and broadcast
 /// `debug/control { session_id, owner }` ONLY on change, matching
 /// RuntimeController.setControlOwner (runtime-controller.ts:338).
-fn set_control_owner(st: &mut State, owner: &str) {
+pub(crate) fn set_control_owner(st: &mut State, owner: &str) {
     if st.control_owner != owner {
         st.control_owner = owner.to_string();
         st.notify.broadcast("debug/control", json!({
@@ -12800,6 +12812,54 @@ fn set_control_owner(st: &mut State, owner: &str) {
 /// `source === "llm" ? "llm" : "human"` (ws-server.ts:987).
 fn owner_from_source(params: &Value) -> &'static str {
     if params.get("source").and_then(|v| v.as_str()) == Some("llm") { "llm" } else { "human" }
+}
+
+/// Spec 767 (live-view) — the OPERATING methods: issuing one is "driving the machine",
+/// so the shared-session control owner flips to whoever sent it (green border when
+/// that's the LLM). Read-only polls (session/state, session/screenshot, session/list,
+/// *_status) are EXCLUDED so a UI/LLM poll never flips the border. `monitor/exec` counts
+/// as operating even for a bare `m` read — the LLM inspecting the live machine is still
+/// "driving" from the human's perspective.
+fn is_operating_method(m: &str) -> bool {
+    matches!(
+        m,
+        "session/run"
+            | "session/type"
+            | "session/joystick_set"
+            | "session/joystick_clear"
+            | "session/load_prg"
+            | "session/reset"
+            | "session/power"
+            | "monitor/exec"
+            | "debug/run"
+            | "debug/pause"
+            | "debug/continue"
+            | "debug/step"
+            | "checkpoint/capture"
+            | "checkpoint/restore"
+            | "media/mount"
+            | "media/swap"
+            | "media/ingress"
+            | "media/unmount"
+    )
+}
+
+/// Spec 767 (live-view) — pre-dispatch hook: for an OPERATING command, flip the control
+/// owner to its `source` ("llm" → green) and stamp the idle timer; no-op for reads. This
+/// generalizes the per-handler `set_control_owner` (which only the debug/* handlers had)
+/// to EVERY operating method, so tool-mode ops (session/run, monitor/exec, …) also turn
+/// the border green. Takes+releases the lock before the real handler re-locks (sequential,
+/// no re-entrancy).
+fn note_operating_owner_for(req: &Request, state: &SharedState) {
+    if !is_operating_method(req.method.as_str()) {
+        return;
+    }
+    let mut st = state.lock().unwrap();
+    let owner = owner_from_source(&req.params);
+    set_control_owner(&mut st, owner);
+    if owner == "llm" {
+        st.last_llm_activity = Some(std::time::Instant::now());
+    }
 }
 
 /// The `debug/state` controller-state object (= c64re `controller.state()`), built
@@ -14214,6 +14274,7 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         pacing_mode: "pal".to_string(),
         pacing_ratio: 1.0,
         control_owner: "human".to_string(),
+        last_llm_activity: None,
         last_trace_path: None,
         last_run_id: None,
         cart_led_gen: 0,
@@ -14687,6 +14748,7 @@ mod batch1_tests {
             pacing_mode: "pal".to_string(),
             pacing_ratio: 1.0,
             control_owner: "human".to_string(),
+            last_llm_activity: None,
             last_trace_path: None,
             last_run_id: None,
             cart_ap_seen_gen: 0,
