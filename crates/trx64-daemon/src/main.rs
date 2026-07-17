@@ -7184,6 +7184,10 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             // SEED the border colour on (re)connect (it otherwise only learns the owner
             // from the one-shot `debug/control` broadcast, missed on a late attach).
             state_json["controlOwner"] = json!(st.control_owner);
+            // Spec 767 slice 2 — whether the stream pump is running (--stream): a bounded
+            // run can only stream live via the pump, so a caller uses the capped streaming
+            // run when this is true and the blocking session/run when it's false (headless).
+            state_json["streamPump"] = json!(st.streaming_enabled);
             Response::ok(id, state_json)
         }
 
