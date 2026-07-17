@@ -401,7 +401,7 @@ pub fn capture_cia(cia: &Cia) -> CiaSnapshot {
 
 /// Restore a TRX64 `Cia` from the c64re `Cia6526ViceSnapshot` shape. Mirrors the
 /// VSF `load_cia` reconstruction (register file → timer latches/clk → alarm clk).
-pub fn restore_cia(cia: &mut Cia, s: &CiaSnapshot) {
+pub fn restore_cia(cia: &mut Cia, s: &CiaSnapshot, tab: &[u16; crate::cia::CIAT_TABLEN]) {
     for i in 0..16 {
         cia.regs[i] = s.c_cia.get(i).copied().unwrap_or(0) as u8;
     }
@@ -421,9 +421,14 @@ pub fn restore_cia(cia: &mut Cia, s: &CiaSnapshot) {
     }
     cia.tod_latched = s.todlatched != 0;
     cia.tod_prescaler = s.power_tickcounter as u32;
-    // Re-derive the cached alarm clk from the restored timer (stopped → NEVER).
-    cia.ta_alarmclk = if cia.ta.is_running() { cia.ta.clk } else { CLOCK_NEVER };
-    cia.tb_alarmclk = if cia.tb.is_running() { cia.tb.clk } else { CLOCK_NEVER };
+    // Re-derive the cached alarm clk = the PREDICTED next-underflow clk (VICE
+    // ciat_set_alarm), NOT `ta.clk` (the timer's last-update clk). The old
+    // `= ta.clk` set the alarm to ~now, so the dispatch `while ta_alarmclk <= rclk`
+    // fired the timer IRQ immediately/early after every undump — desyncing any
+    // CIA-timer-driven raster multiplexer (IM3: the room re-render garbled within
+    // ~3 frames from a byte-faithful restore). Stopped timer → NEVER.
+    cia.ta_alarmclk = if cia.ta.is_running() { cia.ta.set_alarm(tab) } else { CLOCK_NEVER };
+    cia.tb_alarmclk = if cia.tb.is_running() { cia.tb.set_alarm(tab) } else { CLOCK_NEVER };
 }
 
 /// Read TRX64's SID (`sid` voice state + `sid_regs`) into the c64re `SidSnapshot`.
@@ -812,7 +817,14 @@ pub fn reseed_cia_timer_latches(cia: &mut Cia) {
 pub fn read_color_ram(m: &Machine) -> [u8; 0x400] {
     let mut out = [0u8; 0x400];
     for (i, c) in out.iter_mut().enumerate() {
-        *c = m.ram[0xd800 + i] & 0x0f;
+        // Colour RAM lives in `io_shadow[$0800..]` — that is where the CPU writes
+        // $D800-$DBFF land AND where the FULL-machine VIC reads colour from (full.rs
+        // render input + per-cycle c-access). `ram[$D800..]` is the SEPARATE
+        // RAM-under-I/O, which the game never writes for colour — capturing it there
+        // snapshotted a stale/blank colour RAM, so every undump restored the wrong
+        // per-cell colour + MC-vs-hires flag → the room re-rendered as garbage
+        // (IM3). Read the authoritative store. (write_color_ram already writes BOTH.)
+        *c = m.io_shadow[0x0800 + i] & 0x0f;
     }
     out
 }
@@ -1190,17 +1202,19 @@ pub fn restore_runtime_checkpoint(
         restore_cpu(m, &cpu);
     }
 
-    // CIA1 / CIA2.
+    // CIA1 / CIA2. Clone the shared transition-table Arc so restore_cia can
+    // recompute the alarm clks (set_alarm) without borrowing `m` twice.
+    let cia_tab = m.cia_table.clone();
     if let Some(c) = cp.get("cia1") {
         let s: CiaSnapshot =
             serde_json::from_value(c.clone()).map_err(|e| format!("restore cia1: {e}"))?;
-        restore_cia(&mut m.cia1, &s);
+        restore_cia(&mut m.cia1, &s, &cia_tab);
         reseed_cia_timer_latches(&mut m.cia1);
     }
     if let Some(c) = cp.get("cia2") {
         let s: CiaSnapshot =
             serde_json::from_value(c.clone()).map_err(|e| format!("restore cia2: {e}"))?;
-        restore_cia(&mut m.cia2, &s);
+        restore_cia(&mut m.cia2, &s, &cia_tab);
         reseed_cia_timer_latches(&mut m.cia2);
     }
 
@@ -1342,7 +1356,7 @@ mod tests {
         m.c64_core.reg_a = 0x42;
         m.c64_core.clk = 1_234_567;
         m.ram[0x0400] = 0x08;
-        m.ram[0xd800] = 0x0e; // color RAM
+        m.io_shadow[0x0800] = 0x0e; // color RAM (authoritative store: capture reads io_shadow, not ram-under-IO)
         m.port_dir = 0x2f;
         m.port_data = 0x17;
         m.cia1.regs[CIA_TAL] = 0x11;
@@ -1545,7 +1559,8 @@ mod tests {
         assert_eq!(snap.model, 0);
 
         let mut m2 = Machine::new();
-        restore_cia(&mut m2.cia1, &snap);
+        let tab2 = m2.cia_table.clone();
+        restore_cia(&mut m2.cia1, &snap, &tab2);
         assert_eq!(m2.cia1.regs[CIA_TAL], 0x34);
         assert_eq!(m2.cia1.ta.state, 0x55);
         assert_eq!(m2.cia1.ta.latch, 0x1234);
@@ -1664,7 +1679,7 @@ mod tests {
         m.vic.sbuf_reg[2] = 0xdeadbeef;
         m.vic.dbuf_line = 5;
         m.vic.dbuf[5 * crate::render::FB_W + 10] = 0x07;
-        m.ram[0xd800] = 0x0a; // color RAM cell 0
+        m.io_shadow[0x0800] = 0x0a; // color RAM cell 0 (authoritative store: io_shadow)
 
         let snap = capture_vic(&m);
         assert_eq!(snap.regs.len(), 0x40);
