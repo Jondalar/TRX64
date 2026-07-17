@@ -49,6 +49,7 @@ pub fn resid_construct_count() -> u64 {
 // resolves identically in both compilation contexts. Crate-internal only — NOT part
 // of the public FFI surface.
 pub(crate) use daemon::{
-    now_iso8601_utc, set_control_owner, stream_debug_gated_advance, stream_maybe_autocapture,
-    stream_maybe_autopersist_cart, stream_maybe_autopersist_disk, stream_maybe_feed_recorder,
+    maybe_autopause_capped_run, now_iso8601_utc, set_control_owner, stream_debug_gated_advance,
+    stream_maybe_autocapture, stream_maybe_autopersist_cart, stream_maybe_autopersist_disk,
+    stream_maybe_feed_recorder,
 };

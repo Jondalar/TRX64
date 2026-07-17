@@ -320,6 +320,15 @@ pub struct State {
     /// only while NOT running) so the border returns to human-owned when the LLM stops
     /// driving. `None` until the first LLM operating command.
     last_llm_activity: Option<std::time::Instant>,
+    /// Spec 767 slice 2 (live-view) — when set, the stream pump auto-pauses the free-run
+    /// once `machine.clk` reaches this cap: a BOUNDED run that still streams every rendered
+    /// frame through the pump (the machine renders → the frames go out), instead of the
+    /// blocking synchronous `session/run` that froze the picture. Cleared on auto-pause or
+    /// any explicit pause.
+    run_cap_clk: Option<u64>,
+    /// Spec 767 slice 2 — `pacing_mode` to restore when a capped run auto-pauses, so a
+    /// warp LLM run does not leave the shared (human) session stuck in warp. None = leave.
+    run_cap_restore_pace: Option<String>,
     /// T2.6 — last finalized trace store path and run id (= TS TraceRunController
     /// `lastStorePath`/`lastRunId`). Set in finalize_trace; surfaced by trace/current.
     /// `None` until the first trace is stopped.
@@ -7743,6 +7752,26 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             set_control_owner(&mut st, owner);
             st.session.running = true;
             st.ctrl_stop = None;
+            // Spec 767 slice 2 (live-view) — optional cycle cap: a BOUNDED run that still
+            // streams every rendered frame through the pump (the machine renders → frames
+            // go out), auto-pausing at the cap. Optional `pace` (e.g. "warp") runs it fast;
+            // the prior pace is restored on auto-pause so the human's session is undisturbed.
+            // No `cycles` → an uncapped free-run (clears any stale cap).
+            match req.params.get("cycles").and_then(|v| v.as_u64()) {
+                Some(cyc) => {
+                    st.run_cap_clk = Some(st.session.machine.clk.saturating_add(cyc));
+                    if let Some(pace) = req.params.get("pace").and_then(|v| v.as_str()) {
+                        if pace != st.pacing_mode {
+                            st.run_cap_restore_pace = Some(st.pacing_mode.clone());
+                            st.pacing_mode = pace.to_string();
+                        }
+                    }
+                }
+                None => {
+                    st.run_cap_clk = None;
+                    st.run_cap_restore_pace = None;
+                }
+            }
             // Spec 764 — a fresh run() re-arms the JAM edge (runtime-controller.ts:793
             // brokeOnJam reset on run), so a still-jammed machine asked to run again
             // re-broadcasts debug/stopped reason=jam (the shared helper observes it on
@@ -12862,6 +12891,41 @@ fn note_operating_owner_for(req: &Request, state: &SharedState) {
     }
 }
 
+/// Spec 767 slice 2 (live-view) — called by the stream pump on every advanced frame. While
+/// a capped LLM run streams, keep the owner-idle timer fresh (so the idle-release does not
+/// fire MID-run), and auto-pause once the cap clk is reached: freeze at the cap, restore the
+/// pre-warp pace (so the shared human session is not left in warp), and broadcast
+/// debug/paused (reason "budget") so the UI grabs the final frame and the waiting caller
+/// sees the stop. No-op when no cap is set. Mirrors the jam-halt helper shape.
+pub(crate) fn maybe_autopause_capped_run(st: &mut State) {
+    let cap = match st.run_cap_clk {
+        Some(c) => c,
+        None => return,
+    };
+    if st.control_owner == "llm" {
+        st.last_llm_activity = Some(std::time::Instant::now());
+    }
+    if st.session.machine.c64_core.clk >= cap {
+        st.session.running = false;
+        st.run_cap_clk = None;
+        if let Some(prev) = st.run_cap_restore_pace.take() {
+            st.pacing_mode = prev;
+        }
+        let cycles = st.session.machine.clk;
+        let pc = st.session.machine.c64_core.reg_pc;
+        st.ctrl_stop = Some(CtrlStop { reason: "budget", pc, cycles });
+        st.notify.broadcast(
+            "debug/paused",
+            json!({
+                "session_id": st.session.id,
+                "reason": "budget",
+                "pc": pc as u64,
+                "cycles": cycles,
+            }),
+        );
+    }
+}
+
 /// The `debug/state` controller-state object (= c64re `controller.state()`), built
 /// from the live `State`. Shared by `debug/state` and `checkpoint/restore`'s
 /// `state` field so both report the identical shape.
@@ -14275,6 +14339,8 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         pacing_ratio: 1.0,
         control_owner: "human".to_string(),
         last_llm_activity: None,
+        run_cap_clk: None,
+        run_cap_restore_pace: None,
         last_trace_path: None,
         last_run_id: None,
         cart_led_gen: 0,
@@ -14749,6 +14815,8 @@ mod batch1_tests {
             pacing_ratio: 1.0,
             control_owner: "human".to_string(),
             last_llm_activity: None,
+            run_cap_clk: None,
+            run_cap_restore_pace: None,
             last_trace_path: None,
             last_run_id: None,
             cart_ap_seen_gen: 0,

@@ -438,6 +438,10 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
             // is the historical plain advance (byte-identical).
             let budget = if warp { CYC_PER_FRAME * 8 } else { CYC_PER_FRAME };
             let d_cycles = crate::stream_debug_gated_advance(&mut st, budget);
+            // Spec 767 slice 2 (live-view) — a capped LLM run auto-pauses here once the cap
+            // clk is reached (this just-rendered frame is the last one streamed), and keeps
+            // the owner-idle timer fresh while it runs. No-op when no cap is set.
+            crate::maybe_autopause_capped_run(&mut st);
             let cpu_cycle = st.session.machine.c64_core.clk as u32;
 
             // Audio: drain this frame's writes (CPU order) into the engine, close
