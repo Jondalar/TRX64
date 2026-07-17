@@ -64,6 +64,11 @@ export async function spawnDaemon(kind: DaemonKind, opts: SpawnOpts = {}): Promi
     writeFileSync(abs, f.bytes);
   }
   const streamArg = opts.stream ? ["--stream"] : [];
+  // Spec 767 — the TRX64 daemon now STREAMS BY DEFAULT (presentation is not gated behind a
+  // start flag). The byte-exact cases that want a silent, deterministic, no-auto-run machine
+  // (opts.stream falsy) must therefore pass `--headless`. The TS oracle daemon keeps the old
+  // opt-in `--stream` semantics (streamArg), so its behaviour is unchanged.
+  const trx64Arg = opts.stream ? [] : ["--headless"];
 
   const extraEnv = opts.env ?? {};
   let child: ChildProcess;
@@ -74,7 +79,7 @@ export async function spawnDaemon(kind: DaemonKind, opts: SpawnOpts = {}): Promi
       { cwd: C64RE_ROOT, stdio: "ignore", detached: true, env: { ...process.env, C64RE_RUNTIME_AUTOSTART: "0", ...extraEnv } },
     );
   } else {
-    child = spawn(TRX64_BIN, ["--project", projectDir, "--port", String(port), ...streamArg], {
+    child = spawn(TRX64_BIN, ["--project", projectDir, "--port", String(port), ...trx64Arg], {
       stdio: "ignore",
       detached: true,
       env: { ...process.env, ...extraEnv },

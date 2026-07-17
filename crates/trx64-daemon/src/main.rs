@@ -49,14 +49,19 @@ struct Cli {
     #[arg(long, default_value = "")]
     project: String,
 
-    /// Enable the live A/V binary push (ADR-073): in this mode a connecting client
-    /// (e.g. the read-only `ws-av-tap.mjs`) is subscribed to a singleton pacing
-    /// loop that runs the machine in real-time (~50 fps PAL) and pushes BIN_VIC +
-    /// BIN_AUDIO per frame. OFF by default so the byte-exact oracle (which spawns
-    /// command-driven, deterministic daemons) sees NO machine advance on connect.
-    /// Also enabled by setting `TRX64_STREAM=1`.
+    /// DEPRECATED / no-op (kept so existing spawns that pass `--stream` don't error):
+    /// the live A/V binary push is now ON BY DEFAULT (see `--headless` to opt out). The
+    /// invariant is "whenever the C64 advances, the frames are visible" — presentation is
+    /// no longer gated behind a start flag.
     #[arg(long, default_value_t = false)]
     stream: bool,
+
+    /// Opt OUT of the live A/V push + the connect-time auto-run: a silent, deterministic,
+    /// command-driven machine that only advances on an explicit session/run (NO pacing
+    /// loop, NO frames, NO auto-run on connect). For the byte-exact oracle / conformance
+    /// and headless tool daemons. The product/UI daemon omits this → streams by default.
+    #[arg(long, default_value_t = false)]
+    headless: bool,
 }
 
 // ── JSON-RPC 2.0 wire types ───────────────────────────────────────────────────
@@ -14715,18 +14720,23 @@ async fn main() {
         }
     }
 
-    let streaming_on =
-        cli.stream || matches!(env::var("TRX64_STREAM").ok().as_deref(), Some("1") | Some("true"));
+    // Spec 767 — presentation is ON BY DEFAULT: whenever the C64 advances, the frames are
+    // visible to any connected client, no start flag. `--headless` opts out (byte-exact
+    // oracle / conformance / tool daemons that want a silent, deterministic machine). The
+    // legacy `--stream` flag + `TRX64_STREAM` env are now no-ops (already the default).
+    let streaming_on = !cli.headless;
+    let _ = (cli.stream, env::var("TRX64_STREAM")); // deprecated inputs, ignored
     let state: SharedState = Arc::new(Mutex::new(build_state(session, streaming_on)));
 
-    // The singleton live A/V stream hub (ADR-073): one pacing loop drives the
-    // singleton machine and broadcasts BIN_VIC/BIN_AUDIO to all connected clients.
-    // Only created when --stream (or TRX64_STREAM=1) is set; otherwise None, so a
-    // connecting client never triggers an auto-run (byte-exact oracle stays clean).
+    // The singleton live A/V stream hub (ADR-073): one pacing loop drives the singleton
+    // machine and broadcasts BIN_VIC/BIN_AUDIO to all connected clients. Spec 767 — created
+    // BY DEFAULT (the C64's work is always visible); only `--headless` skips it → None, so a
+    // silent deterministic machine never auto-runs on connect (byte-exact oracle stays clean).
     let hub: Option<Arc<streaming::StreamHub>> = if streaming_on {
-        eprintln!("[trx64] live A/V push ENABLED (--stream): clients are auto-subscribed at ~50fps");
+        eprintln!("[trx64] live A/V push ON (default): clients auto-subscribed at ~50fps (--headless to disable)");
         Some(streaming::StreamHub::new(Arc::clone(&state)))
     } else {
+        eprintln!("[trx64] --headless: silent deterministic machine (no A/V push, no auto-run)");
         None
     };
 

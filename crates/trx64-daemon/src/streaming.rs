@@ -413,6 +413,22 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
                     if t.elapsed() >= Duration::from_millis(3000) {
                         crate::set_control_owner(&mut st, "human");
                         st.last_llm_activity = None;
+                        // Spec 767 — return the shared machine to the human's default: if the
+                        // LLM left it paused by a capped run (a "budget" stop — NOT a human
+                        // pause / breakpoint / jam), resume the free-run so the UI KEEPS
+                        // RUNNING. The pump advances + streams again on the next iteration.
+                        let capped_pause = !st.session.running
+                            && st.ctrl_stop.as_ref().map(|s| s.reason) == Some("budget");
+                        if capped_pause {
+                            st.session.running = true;
+                            st.ctrl_stop = None;
+                            let sid = st.session.id.clone();
+                            let pacing = serde_json::json!({ "mode": st.pacing_mode, "ratio": st.pacing_ratio });
+                            st.notify.broadcast(
+                                "debug/running",
+                                serde_json::json!({ "session_id": sid, "pacing": pacing }),
+                            );
+                        }
                     }
                 }
             }
