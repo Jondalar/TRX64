@@ -9006,19 +9006,18 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                                     detail.insert("cartPersisted".to_string(), json!(p));
                                 }
                             }
-                            st.session.machine.detach_cart();
-                            st.session.cart_path = String::new();
-                            // CLI-FEEL S7 — unify eject RAM semantics: a cart eject is a
-                            // full power-cycle (RAM wiped), matching media/unmount's cart
-                            // branch (fill_power_on_ram + cold_reset) and the user's
-                            // real-C64 model (cart out → power off → power on). This
-                            // INTENTIONALLY diverges from the TS oracle's resetCold({
-                            // keepRam:true }) (ingress.ts:204): keeping RAM here left the
-                            // two eject routes (media/ingress vs media/unmount) diverging.
-                            // fill_power_on_ram (power off) then cold_reset (power on) is
-                            // exactly what media/unmount runs, so both routes now match.
-                            st.session.machine.fill_power_on_ram();
-                            st.session.machine.cold_reset();
+                            // Cart eject = a REAL C64 power off/on. AUS ist AUS: the whole
+                            // machine goes away. do_power_off tears it down (the live cart is
+                            // transplanted into the registry), clear_inserted_cart drops it,
+                            // do_power_on rebuilds a FRESH Machine — fresh CIA1/CIA2/VIC with
+                            // clocks aligned to the new (reset) CPU clock → boots to BASIC.
+                            // The prior `fill_power_on_ram + cold_reset` did NOT recreate the
+                            // CIAs, so CIA timer clocks stayed in the OLD timeline (billions
+                            // of cycles ahead of the reset CPU clock) → Timer A could never
+                            // underflow → the keyboard-scan IRQ died (Boris: Alter Ego).
+                            do_power_off(&mut st);
+                            st.session.clear_inserted_cart();
+                            do_power_on(&mut st);
                         }
                         detail.insert("role".to_string(), json!(role));
                         None
@@ -9069,14 +9068,20 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                         // BUG-023-cart / Spec 742 — remember the host .crt path for
                         // writable flash write-back on eject/persist, ingress.ts:233.
                         st.session.cart_path = path.clone().unwrap_or_default();
-                        // resetCold("pal-default", { keepRam: resetPolicy=="reset" }),
-                        // ingress.ts:236. power-cycle wipes RAM (fill_power_on_ram);
-                        // reset keeps it. The cart was attached above, so cold_reset's
-                        // cart-aware $FFFC fetch re-vectors from the cart (Ultimax/GAME).
-                        if reset_policy == "power-cycle" {
-                            st.session.machine.fill_power_on_ram();
-                        }
-                        st.session.machine.cold_reset();
+                        // Cart insert = a REAL C64 power off/on (a cart insert IS a
+                        // power-cycle — RAM + timeline gone, regardless of resetPolicy). The
+                        // cart is on the live machine; do_power_off transplants it into the
+                        // registry, then do_power_on rebuilds a FRESH Machine — fresh CIA1/
+                        // CIA2/VIC with clocks aligned to the reset CPU clock — that
+                        // re-vectors $FFFC INTO the cart. The prior `fill_power_on_ram +
+                        // cold_reset` did NOT recreate the CIAs, so a 2nd cart in the same
+                        // daemon inherited stale CIA timer clocks from the previous timeline
+                        // (billions of cycles ahead) → Timer A never underflowed → the
+                        // keyboard-scan IRQ died (Boris: Alter Ego life-tree screen).
+                        // (resetPolicy is still reported in `detail` below, but a cart insert
+                        // always power-cycles now — keepRam is not honoured for a cartridge.)
+                        do_power_off(&mut st);
+                        do_power_on(&mut st);
                         detail.insert("mapperType".to_string(), json!(mapper_type_str(mapper_type)));
                         if let Some(ref p) = path { detail.insert("backingPath".to_string(), json!(p)); }
                         detail.insert("resetPolicy".to_string(), json!(reset_policy));
@@ -9421,19 +9426,29 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 }
                 let cart_media_present = st.session.machine.drive8.get_attached_disk().is_some()
                     || st.session.machine.cartridge.is_some();
-                let before_id = if cart_media_present { capture_media_checkpoint(&mut st) } else { None };
-                let mapper_type = match st.session.machine.attach_cart_from_bytes(&bytes, &crt_name) {
-                    Ok((_n, t)) => t,
-                    Err(e) => return Response::err(id, -32602, format!("media/swap: bad CRT: {e}")),
-                };
+                // SWAP = a REAL C64 power off/on. AUS ist AUS: RAM + timeline + chips gone,
+                // so there is no meaningful "before" checkpoint (do_power_off clears the ring
+                // anyway). Order per the real machine: detach old → power_off → insert new →
+                // power_on. Rebuilds FRESH CIA1/CIA2/VIC with clocks aligned to the reset CPU
+                // clock; the prior `fill_power_on_ram + cold_reset` left stale CIA timer clocks
+                // from the old timeline → keyboard-scan IRQ dead (Boris repro).
+                let _ = cart_media_present;
+                // Validate the new .crt BEFORE tearing the machine down — a bad CRT must not
+                // leave the session powered-off + cartless.
+                if let Err(e) = trx64_core::cart::load_cartridge_from_bytes(&bytes, &crt_name, None) {
+                    return Response::err(id, -32602, format!("media/swap: bad CRT: {e}"));
+                }
+                st.session.machine.detach_cart(); // old cart out
+                do_power_off(&mut st); // AUS
+                let mapper_type = st
+                    .session
+                    .set_inserted_cart(&bytes, &crt_name, &path_str)
+                    .expect("re-parse of an already-validated CRT cannot fail"); // new cart in
                 let mt = mapper_type_str(mapper_type).to_string();
-                st.session.cart_path = path_str.clone();
-                // audit ws-media-8 — record the cart in the recents store (see media/mount).
                 add_recent_media(&mut st, &path_str, "crt");
-                st.session.machine.fill_power_on_ram();
-                st.session.machine.cold_reset();
+                do_power_on(&mut st); // EIN — fresh chips, boot into the new cart
+                let before_id: Option<String> = None; // AUS ist AUS — no "before" survives
                 let after_id = capture_media_checkpoint(&mut st);
-                if let Some(ref b) = before_id { st.checkpoint_ring.pin(b); }
                 if let Some(ref a) = after_id { st.checkpoint_ring.pin(a); }
                 let cycle = st.session.machine.clk;
                 st.session.running = true;
