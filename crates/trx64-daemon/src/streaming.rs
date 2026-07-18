@@ -434,6 +434,32 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
             }
         }
 
+        // ── Spec 767 (insert-settle) — resume a briefly-held machine ────────────────
+        // After a power-on with the A/V hub, do_power_on holds the machine paused (+ sets
+        // resume_at + force_present_frame) so THIS pump first re-hooks the fresh SID (the
+        // machine_generation check above) and presents the post-boot frame while paused.
+        // Resume it once the settle window elapses, so the visible boot starts with the
+        // framebuffer + audio already up (no lost first ~500ms). Takes effect next iteration
+        // (the `running` local was read at the top), which is fine (~one frame).
+        {
+            let mut st = state.lock().unwrap();
+            if let Some(at) = st.resume_at {
+                if Instant::now() >= at {
+                    st.resume_at = None;
+                    if !st.session.running {
+                        st.session.running = true;
+                        let sid = st.session.id.clone();
+                        let pacing =
+                            serde_json::json!({ "mode": st.pacing_mode, "ratio": st.pacing_ratio });
+                        st.notify.broadcast(
+                            "debug/running",
+                            serde_json::json!({ "session_id": sid, "pacing": pacing }),
+                        );
+                    }
+                }
+            }
+        }
+
         if running {
         // ── Run one PAL frame + render + drain this frame's SID writes ──
         // Lock the shared State only for this window; release before sleeping so
