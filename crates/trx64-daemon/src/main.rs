@@ -2584,6 +2584,43 @@ pub(crate) fn stream_debug_gated_advance(st: &mut State, budget: u64) -> u32 {
 /// evaluates false does not wedge). Load/store watchpoints arm the core's
 /// `access_watch` table; the registry's `on_access` sets `halt_requested`, honored
 /// at the next boundary (RunStop::Observer).
+/// Spec 767 (trace-always) — a Tee observer: forwards every `Observer` callback to BOTH
+/// sinks, so an armed (breakpoint / watchpoint) run can ALSO feed the trace firehose. Without
+/// this, `run_until_break` fed only the observer registry, so a trace captured NOTHING while
+/// any breakpoint/observer was set ("OHNE Obs/Bks geht der Trace, mit nicht"). Invariant:
+/// while cycles run, the trace gets entries regardless of what else is configured. `on_access`
+/// halts if EITHER sink asks (the registry's watchpoints do; the tracing sink never halts).
+struct TeeObserver<'a, A: Observer, B: Observer> {
+    a: &'a mut A,
+    b: &'a mut B,
+}
+
+impl<A: Observer, B: Observer> Observer for TeeObserver<'_, A, B> {
+    #[allow(clippy::too_many_arguments)]
+    fn on_instruction(&mut self, pc: u16, opcode: u8, b1: u8, b2: u8, a: u8, x: u8, y: u8, sp: u8, p: u8, clk: u64) {
+        self.a.on_instruction(pc, opcode, b1, b2, a, x, y, sp, p, clk);
+        self.b.on_instruction(pc, opcode, b1, b2, a, x, y, sp, p, clk);
+    }
+    fn on_bus(&mut self, kind: BusKind, addr: u16, value: u8, pc: u16, clk: u64, old: u8) {
+        self.a.on_bus(kind, addr, value, pc, clk, old);
+        self.b.on_bus(kind, addr, value, pc, clk, old);
+    }
+    fn on_interrupt(&mut self, vector: u16, clk: u64) {
+        self.a.on_interrupt(vector, clk);
+        self.b.on_interrupt(vector, clk);
+    }
+    fn on_access(&mut self, kind: BusKind, addr: u16, value: u8) -> bool {
+        // Evaluate BOTH (no short-circuit) so each sink sees every access; halt if either asks.
+        let halt_a = self.a.on_access(kind, addr, value);
+        let halt_b = self.b.on_access(kind, addr, value);
+        halt_a || halt_b
+    }
+    fn on_vic_reg(&mut self, clk: u64, raster_y: u16, kind: u8, value: u8) {
+        self.a.on_vic_reg(clk, raster_y, kind, value);
+        self.b.on_vic_reg(clk, raster_y, kind, value);
+    }
+}
+
 fn run_until_break(
     session: &mut Session,
     reg: &mut observers::ObserverRegistry,
@@ -2605,6 +2642,25 @@ fn run_until_break(
         .iter()
         .any(|o| o.enabled && o.trigger != observers::ObsTrigger::Exec && o.cond.is_some());
     let seg_cap: u64 = if access_needs_step { 1 } else { u64::MAX };
+
+    // Spec 767 (trace-always) — feed the trace firehose even while armed. Compute the trace
+    // channels ONCE (Copy); each full-machine segment then runs a TracingObserver tee'd with
+    // the observer registry and appends that segment's events to the persistent trace buffer,
+    // so a trace captures regardless of bp/observer state. The isolated path has no observer
+    // sink (can't trace) — but the live UI is always the full machine. Write the file header
+    // on the first traced run, mirroring `run_cycle_budget`.
+    let trace_channels: Option<TraceChannels> = session
+        .trace
+        .as_ref()
+        .map(|t| TraceChannels::from_domains(&t.domains).mask_by_captures(&t.captures));
+    if trace_channels.is_some() {
+        if let Some(t) = session.trace.as_mut() {
+            if t.buf.is_empty() {
+                let meta = t.meta_json.clone();
+                t.buf = FrameSink::with_header(&meta).buf;
+            }
+        }
+    }
 
     loop {
         let elapsed = session.machine.clk.wrapping_sub(start_clk);
@@ -2633,15 +2689,38 @@ fn run_until_break(
         let bp_ref = bp_set.as_ref();
 
         let stop = if full_machine {
-            session.machine.run_for_full_capped_dbg(
-                seg_budget,
-                max_instr,
-                bp_ref,
-                None,
-                aw_ref,
-                reg,
-                |_, _, _, _, _, _, _| {},
-            )
+            if let Some(ch) = trace_channels {
+                // Trace-aware: tee the registry with a per-segment TracingObserver, then
+                // append this segment's events to the trace buffer.
+                let mut tracing = TracingObserver::with_channels(FrameSink::events_only(), ch);
+                let s = {
+                    let mut tee = TeeObserver { a: &mut *reg, b: &mut tracing };
+                    session.machine.run_for_full_capped_dbg(
+                        seg_budget,
+                        max_instr,
+                        bp_ref,
+                        None,
+                        aw_ref,
+                        &mut tee,
+                        |_, _, _, _, _, _, _| {},
+                    )
+                };
+                if let Some(t) = session.trace.as_mut() {
+                    t.event_count += tracing.event_count;
+                    t.buf.extend_from_slice(&tracing.into_buf());
+                }
+                s
+            } else {
+                session.machine.run_for_full_capped_dbg(
+                    seg_budget,
+                    max_instr,
+                    bp_ref,
+                    None,
+                    aw_ref,
+                    reg,
+                    |_, _, _, _, _, _, _| {},
+                )
+            }
         } else {
             // CPU-isolated path (no full machine). The dbg entry point lives on the
             // full SC path only; for the isolated path we step + check the bp set
