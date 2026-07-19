@@ -327,12 +327,6 @@ pub struct State {
     /// Spec 767 slice 2 — `pacing_mode` to restore when a capped run auto-pauses, so a
     /// warp LLM run does not leave the shared (human) session stuck in warp. None = leave.
     run_cap_restore_pace: Option<String>,
-    /// Spec 767 (insert-settle) — when set, the stream pump resumes the machine (running=true)
-    /// once this wall-clock is reached. After a power-on WITH the A/V hub, the machine is held
-    /// paused for ~500ms so the pump RE-HOOKS audio + PRESENTS the post-boot frame BEFORE it
-    /// runs on — otherwise the first ~500ms of a CRT's visible boot is lost to pipeline
-    /// warm-up (the user "misses" the boot start). None = no pending resume.
-    resume_at: Option<std::time::Instant>,
     /// T2.6 — last finalized trace store path and run id (= TS TraceRunController
     /// `lastStorePath`/`lastRunId`). Set in finalize_trace; surfaced by trace/current.
     /// `None` until the first trace is stopped.
@@ -1350,21 +1344,22 @@ fn do_power_on(st: &mut State) {
     st.stream_broke_on_jam = false;
     st.mon.disasm_cursor = None;
     st.mon.mem_cursor = None;
-    // Warm the boot so the returned pc/screen is post-KERNAL (parity with the
-    // old cold-reset 5M run). Runs on the freshly-built RUNNING machine.
-    run_cycle_budget(&mut st.session, 5_000_000);
-    st.notify.broadcast("audio/flush", json!({ "session_id": st.session.id }));
-    // Spec 767 (insert-settle) — with the A/V hub, HOLD the freshly-booted machine paused for
-    // ~500ms: the stream pump re-hooks the fresh SID (machine_generation bumped above) and
-    // presents the post-boot frame (force_present_frame) while paused, so when it resumes the
-    // framebuffer + audio are already up — the first ~500ms of a CRT's visible boot is no
-    // longer lost to pipeline warm-up. The pump resumes it at `resume_at`. `--headless` (no
-    // hub) skips this: that machine is command-driven and only advances on session/run.
     if st.streaming_enabled {
-        st.session.running = false;
+        // Spec 767 — LIVE A/V hub: STREAM the boot from cycle 0 so the user sees the WHOLE
+        // intro (VICE-parity). The synchronous 5M warm-boot (the `else` below) runs the cart
+        // cold-start + the first ~1s of the intro INVISIBLY, so the UI "renders ~1s too late".
+        // Instead leave the machine fresh + RUNNING and let the stream pump render from the
+        // first frame; the pump re-hooks the fresh SID (machine_generation bumped above) BEFORE
+        // its first advance, so audio is up from frame 1. Present the initial frame at once.
+        st.session.running = true;
         st.force_present_frame = true;
-        st.resume_at = Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
+    } else {
+        // Headless (no hub) — warm the boot so tool ops (session/run) see a post-KERNAL
+        // machine (parity with the old cold-reset 5M run). Runs on the freshly-built RUNNING
+        // machine; a command-driven daemon never streams, so there is nothing to miss.
+        run_cycle_budget(&mut st.session, 5_000_000);
     }
+    st.notify.broadcast("audio/flush", json!({ "session_id": st.session.id }));
 }
 
 /// Spec 786 — power the machine OFF (dead, no live state) + the same
@@ -14439,7 +14434,6 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         last_llm_activity: None,
         run_cap_clk: None,
         run_cap_restore_pace: None,
-        resume_at: None,
         last_trace_path: None,
         last_run_id: None,
         cart_led_gen: 0,
@@ -14920,7 +14914,6 @@ mod batch1_tests {
             last_llm_activity: None,
             run_cap_clk: None,
             run_cap_restore_pace: None,
-            resume_at: None,
             last_trace_path: None,
             last_run_id: None,
             cart_ap_seen_gen: 0,
