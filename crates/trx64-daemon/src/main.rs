@@ -869,11 +869,48 @@ pub type SharedState = Arc<Mutex<State>>;
 
 // ── ROM directory resolution ──────────────────────────────────────────────────
 
+/// Resolve the C64 ROM directory CROSS-PLATFORM. The old body hardcoded a single Mac
+/// path whenever `C64RE_ROOT` was unset — so any `do_power_on` / restore rebuild on a
+/// machine without that env (e.g. the standalone trx64-cli on Windows) resolved to a
+/// nonexistent path, `power_on` loaded NO ROMs, and the machine was left dead
+/// (PC=$0000, $FFFC/$FFFE = 0). Try, in order: `C64RE_ROOT/resources/roms`; dirs
+/// relative to the EXECUTABLE and a few levels up (`roms/`, `resources/roms/` — the
+/// same layout trx64-cli's own resolver uses, which is why Mike's BASIC boots but a
+/// cart mount didn't); the CWD; finally the Mac dev checkout. Pick the first that
+/// actually contains the KERNAL; only fall back to a bare `roms` when nothing matches.
 fn rom_dir() -> PathBuf {
-    let root = env::var("C64RE_ROOT").unwrap_or_else(|_| {
-        "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP".to_string()
-    });
-    PathBuf::from(root).join("resources").join("roms")
+    let has_kernal = |p: &std::path::Path| p.join("kernal-901227-03.bin").exists();
+    if let Ok(root) = env::var("C64RE_ROOT") {
+        let p = PathBuf::from(root).join("resources").join("roms");
+        if has_kernal(&p) {
+            return p;
+        }
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = env::current_exe() {
+        let mut dir = exe.parent().map(|p| p.to_path_buf());
+        for _ in 0..4 {
+            match dir {
+                Some(d) => {
+                    candidates.push(d.join("roms"));
+                    candidates.push(d.join("resources").join("roms"));
+                    dir = d.parent().map(|p| p.to_path_buf());
+                }
+                None => break,
+            }
+        }
+    }
+    candidates.push(PathBuf::from("roms"));
+    candidates.push(PathBuf::from("resources").join("roms"));
+    candidates.push(
+        PathBuf::from("/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP")
+            .join("resources")
+            .join("roms"),
+    );
+    candidates
+        .into_iter()
+        .find(|p| has_kernal(p))
+        .unwrap_or_else(|| PathBuf::from("roms"))
 }
 
 // ── Project root for crash log ────────────────────────────────────────────────
@@ -1335,7 +1372,13 @@ fn capture_all_def_json(domains: &[String]) -> Value {
 /// second machine.
 fn do_power_on(st: &mut State) {
     let roms = rom_dir();
-    let _ = st.session.power_on(&roms);
+    if let Err(e) = st.session.power_on(&roms) {
+        // Don't SWALLOW a ROM-load failure into a dead machine (PC=$0000) — surface it.
+        eprintln!(
+            "[trx64] power_on FAILED (roms at {}): {e:?} — machine left WITHOUT ROMs",
+            roms.display()
+        );
+    }
     st.machine_generation += 1; // Spec 786 audio fix — signal the streaming loop to re-hook the fresh SID.
     st.checkpoint_ring.clear();
     st.ctrl_stop = None;
@@ -1412,7 +1455,12 @@ fn power_cycle_for_restore(st: &mut State) {
     let _ = finalize_trace(st, true);
     st.session.power_off();
     let roms = rom_dir();
-    let _ = st.session.power_on(&roms);
+    if let Err(e) = st.session.power_on(&roms) {
+        eprintln!(
+            "[trx64] power_on FAILED (roms at {}): {e:?} — machine left WITHOUT ROMs",
+            roms.display()
+        );
+    }
     st.machine_generation += 1; // re-hook the fresh SID (streaming.rs `!=` check)
     st.ctrl_stop = None;
     st.ctrl_frame += 1;
