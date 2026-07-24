@@ -5459,8 +5459,18 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         };
+                        // Spec 793 — name the DIRECTORY the media were materialized into,
+                        // so "what was mounted" is answerable without guessing: the media
+                        // line says WHICH (role=name(format)), this says WHERE.
+                        let media_dir = r
+                            .media
+                            .iter()
+                            .find_map(|m| m.path.as_deref())
+                            .and_then(|p| std::path::Path::new(p).parent())
+                            .map(|d| format!("\n  media dir: {}", d.display()))
+                            .unwrap_or_default();
                         let mut summary = format!(
-                            "undumped {path}\n  cycle={} pc=${:04x} machine={} (paused)\n  media: {media}\n  breakpoints={breakpoints}",
+                            "undumped {path}\n  cycle={} pc=${:04x} machine={} (paused)\n  media: {media}{media_dir}\n  breakpoints={breakpoints}",
                             r.cycle, r.pc, r.machine_model
                         );
                         if let Some(w) = r.warning {
@@ -11412,7 +11422,9 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                                 "format": m.format,
                                 "sourceName": m.source_name,
                                 "sha256": m.sha256,
-                                "bytes": m.bytes
+                                "bytes": m.bytes,
+                                // Spec 793 — where it was materialized + mounted from.
+                                "path": m.path
                             })
                         })
                         .collect();
@@ -13228,6 +13240,10 @@ struct UndumpMedia {
     source_name: Option<String>,
     sha256: String,
     bytes: u64,
+    /// Spec 793 — the materialized `<name>_media/<file>` this medium was written to and
+    /// is now mounted FROM, so the caller can see (and re-mount / inspect / delete) the
+    /// real file. `None` only when materialization fell back to the in-memory attach.
+    path: Option<String>,
 }
 
 /// The outcome of `undump_native_snapshot`, formatted differently by each caller.
@@ -13315,7 +13331,7 @@ fn undump_native_snapshot(st: &mut State, path: &str) -> Result<UndumpResult, St
         st.session.machine.drive8.attach_disk(DiskImage {
             kind,
             bytes,
-            backing_path: backing,
+            backing_path: backing.clone(),
             read_only: false,
         });
         media.push(UndumpMedia {
@@ -13324,6 +13340,7 @@ fn undump_native_snapshot(st: &mut State, path: &str) -> Result<UndumpResult, St
             source_name: rm.reference.source_name.clone(),
             sha256: rm.reference.sha256.clone(),
             bytes: len,
+            path: backing,
         });
     }
 
@@ -13353,8 +13370,29 @@ fn undump_native_snapshot(st: &mut State, path: &str) -> Result<UndumpResult, St
                     let cps = cp.to_string_lossy().to_string();
                     st.session.cart_path = cps.clone();
                     if let Some(img) = st.session.machine.cartridge_image.as_mut() {
-                        img.path = cps;
+                        img.path = cps.clone();
                     }
+                    // Spec 793 — REPORT the cart as media as well. The materialize loop
+                    // above only collects `drive8`, so a cart-only snapshot summarised as
+                    // "media: none" even though an EF/MagicDesk cart WAS restored and
+                    // written here. That read as "the cart is gone" and sent a caller
+                    // chasing a `swapcrt` it did not need — while the real cart (and its
+                    // banks) had been mounted all along.
+                    let fmt = st
+                        .session
+                        .machine
+                        .cartridge
+                        .as_ref()
+                        .map(|c| mapper_type_str(c.mapper_type()).to_string())
+                        .unwrap_or_else(|| "crt".to_string());
+                    media.push(UndumpMedia {
+                        role: "cart".to_string(),
+                        format: fmt,
+                        source_name: Some(cname.clone()),
+                        sha256: sha256_hex(&cart_bytes),
+                        bytes: cart_bytes.len() as u64,
+                        path: Some(cps),
+                    });
                 }
             }
         }
