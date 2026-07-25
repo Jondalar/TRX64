@@ -25,3 +25,6 @@ crates/trx64-core/tests/fixtures/vsf/*.vsf
 
 # commercial VICE snapshots (never track)
 *.vsf
+
+# ROMs baked into the Docker image — Commodore IP, never to github (Spec 799 §9.1)
+docker/roms/

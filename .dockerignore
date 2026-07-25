@@ -1,0 +1,14 @@
+# Build context = the TRX64 repo root (built with `container build -f docker/Dockerfile .`).
+# Keep it small: the builder only needs the workspace sources; everything below is either
+# huge build output or irrelevant to the image.
+target/
+dist/
+traces/
+tools/
+loop/
+*.vsf
+.git/
+docker/dist/
+**/*.c64re
+**/*.c64retrace
+samples/

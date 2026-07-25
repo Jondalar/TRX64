@@ -49,6 +49,15 @@ struct Cli {
     #[arg(long, default_value = "")]
     project: String,
 
+    /// Interface to bind. Default `127.0.0.1` (localhost only — the safe product/UI
+    /// default). Set `0.0.0.0` to accept connections from OTHER hosts/containers, e.g. the
+    /// containerized sidecar (Spec 799) where the web app in a sibling container drives the
+    /// daemon over the bridge network. The daemon WS has NO auth, so only bind `0.0.0.0`
+    /// where the network is trusted / a reverse-proxy provides auth (Spec 799 §5.4).
+    /// Also settable via the `TRX64_BIND` env var (the flag wins).
+    #[arg(long)]
+    bind: Option<String>,
+
     /// Opt OUT of the live A/V push + the connect-time auto-run: a silent, deterministic,
     /// command-driven machine that only advances on an explicit session/run (NO pacing
     /// loop, NO frames, NO auto-run on connect). For the byte-exact oracle / conformance
@@ -14909,7 +14918,15 @@ async fn main() {
         None
     };
 
-    let addr: SocketAddr = format!("127.0.0.1:{}", cli.port).parse().unwrap();
+    // Bind interface: --bind flag ?? TRX64_BIND env ?? 127.0.0.1 (localhost-only default).
+    let bind_host = cli
+        .bind
+        .clone()
+        .or_else(|| env::var("TRX64_BIND").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let addr: SocketAddr = format!("{bind_host}:{}", cli.port)
+        .parse()
+        .unwrap_or_else(|e| panic!("invalid --bind '{bind_host}': {e}"));
     let listener = TcpListener::bind(addr).await.expect("failed to bind");
     eprintln!("[trx64] listening on ws://{addr}");
 
