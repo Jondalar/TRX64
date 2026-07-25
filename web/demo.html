@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>wl-trx64 player — demo</title>
+  <style>
+    body { margin:0; background:#1a1a2e; color:#ccd; font:14px/1.5 system-ui, sans-serif; }
+    header { padding:12px 16px; background:#111; }
+    header h1 { margin:0; font-size:16px; color:#c0f; }
+    main { max-width:820px; margin:20px auto; padding:0 16px; }
+    trx64-player { width:100%; max-width:768px; border:1px solid #333; }
+    .row { display:flex; gap:8px; margin:12px 0; flex-wrap:wrap; }
+    label { display:flex; gap:6px; align-items:center; }
+    input { font:inherit; background:#222; color:#cdf; border:1px solid #444; padding:4px 8px; }
+    input[size] { min-width:0; }
+    button { font:inherit; background:#333; color:#cdf; border:1px solid #555; padding:6px 14px; cursor:pointer; }
+    p.note { opacity:.6; font-size:13px; }
+    code { background:#222; padding:1px 5px; border-radius:3px; }
+  </style>
+</head>
+<body>
+  <header><h1>wl-trx64 player — standalone demo</h1></header>
+  <main>
+    <p class="note">Boots + plays a cart in the browser with NO editor — just the
+      <code>&lt;trx64-player&gt;</code> web component pointed at a daemon WS + a container-side
+      image path. This is exactly what an editor embeds in a Play tab.</p>
+
+    <div class="row">
+      <label>WS <input id="ws" size="34" value="ws://127.0.0.1:4340"></label>
+      <label>image <input id="img" size="20" value="/play/wl.crt"></label>
+      <button id="go">Load / Play</button>
+    </div>
+
+    <div id="host"></div>
+
+    <p class="note">Click the picture to grab the keyboard. Toggle
+      <b>⌨ keyboard ⇄ 🕹 joystick</b> in the bar (games want joystick: arrows/WASD move,
+      Space fires). Audio starts on the first click.</p>
+  </main>
+
+  <script type="module" src="./trx64-player.js"></script>
+  <script>
+    const host = document.getElementById("host");
+    const esc = (s) => s.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+    function mount() {
+      const ws = esc(document.getElementById("ws").value.trim());
+      const img = esc(document.getElementById("img").value.trim());
+      // Embed exactly the way an editor would: declare the element in markup.
+      host.innerHTML =
+        `<trx64-player ws="${ws}"${img ? ` image="${img}"` : ""} audio autostart></trx64-player>`;
+    }
+    document.getElementById("go").addEventListener("click", mount);
+  </script>
+</body>
+</html>
