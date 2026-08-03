@@ -36,6 +36,15 @@ A normal emulator runs code. TRX64 lets you *interrogate* it:
 - **API-first** — every capability above is one JSON-RPC method. No GUI assumptions,
   no hidden state: scriptable by a tool, an LLM, or your own frontend.
 
+## What to expect
+
+This is my (dkl / Jondalar) personal emulator I developed for my own needs when
+reverse engineering C64 games. You might need different features or things - 
+and you invited to contribute code. Use PR mechanisms here on GitHub please.
+
+I will not answer feature requests without code / structured requirements and I 
+am not able to give support.
+
 ---
 
 ## Quick start
