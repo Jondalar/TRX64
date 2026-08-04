@@ -3,7 +3,7 @@
 The stable surface a web app (e.g. the Wasteland editor) codes against to **mount a
 cartridge image, boot it, show the live picture, and take keyboard/joystick input** —
 without touching the emulator's internals. This is the daemon's existing WS contract,
-frozen and documented for consumers; **the daemon does not change for this** (Spec 799).
+frozen and documented for consumers; **the daemon does not change for this.**
 
 - **Provider:** the `wl-trx64` container running `trx64-daemon` (streaming, default mode).
 - **Consumer:** any front-end. **The recommended path is to embed the shipped
@@ -27,7 +27,7 @@ frozen and documented for consumers; **the daemon does not change for this** (Sp
   `{"method":"debug/running", …}`.
 - **A/V = BINARY frames** (§4). Every binary WS message is one video or audio frame.
 
-There is **one live machine per container** (Spec 787). Every client connected to the
+There is **one live machine per container**. Every client connected to the
 same container drives/sees the SAME machine — the emulator is a single shared C64, not
 per-connection. `session_id` may be passed but is not required (single session).
 
@@ -140,10 +140,10 @@ Joystick: WASD/arrows → `session/joystick_set {port:2, …}`; the C64 games re
 - **Recommended idle-kill:** the consumer closes the session (or drops the WS) after
   ~10 min with no connected viewer. The 100 %-CPU failure mode is a *free-running session
   with no one watching* — not the daemon itself.
-- **Measured (QNAP native amd64, Spec 799 §7):** one streaming session = **~40 % of one
+- **Measured (QNAP native amd64):** one streaming session = **~40 % of one
   core, ~150 MiB**, 50 fps. Put `--cpus`/memory caps on the container so a busy session
   can never starve the web app.
-- **One machine.** A second concurrent player waits (or, later, a Spec 787 scratch
+- **One machine.** A second concurrent player waits (or, later, a scratch
   process inside the container). Scale-out = more containers.
 
 ---
@@ -208,4 +208,4 @@ frames onto a 384×272 canvas → forward keys as §5 names.
 
 ---
 
-Cross-links: Spec 799 (packaging + sidecar arch — `../../C64ReverseEngineeringMCP/specs/799-trx64-docker.md`), `docker/Dockerfile` (the image), `web/trx64-player.js` (the shipped client) + `web/demo.html` (embed harness).
+Cross-links: the packaging + sidecar-architecture spec (`../../C64ReverseEngineeringMCP/specs/799-trx64-docker.md`), `docker/Dockerfile` (the image), `web/trx64-player.js` (the shipped client) + `web/demo.html` (embed harness).

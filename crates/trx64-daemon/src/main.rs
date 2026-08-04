@@ -9125,7 +9125,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 let looks_c64re = nm.to_lowercase().ends_with(".c64re")
                     || (b.len() >= 8 && &b[..8] == trx64_core::native_snapshot::NATIVE_SNAPSHOT_MAGIC.as_slice());
                 if looks_c64re {
-                    return Response::err(id, -32603, "media-ingress: .c64re is a runtime snapshot, not media. Use snapshot/undump (Spec 707), not media ingest.");
+                    return Response::err(id, -32603, "media-ingress: .c64re is a runtime snapshot, not media. Use snapshot/undump, not media ingest.");
                 }
                 Some(b)
             } else {
@@ -9456,7 +9456,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             // so a CRT could never be inserted. .c64re is a snapshot, not media.
             let lower = path_str.to_lowercase();
             if lower.ends_with(".c64re") {
-                return Response::err(id, -32602, "media/mount: .c64re is a runtime snapshot, not media — use snapshot/undump (Spec 707).");
+                return Response::err(id, -32602, "media/mount: .c64re is a runtime snapshot, not media — use snapshot/undump.");
             }
             if lower.ends_with(".crt") {
                 // Spec 709.12 — CRT insert = attach cart → power-cycle → resume (so the
@@ -9611,7 +9611,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             // (was always disk-on-drive8), .c64re → reject. See media/mount above.
             let lower = path_str.to_lowercase();
             if lower.ends_with(".c64re") {
-                return Response::err(id, -32602, "media/swap: .c64re is a runtime snapshot, not media — use snapshot/undump (Spec 707).");
+                return Response::err(id, -32602, "media/swap: .c64re is a runtime snapshot, not media — use snapshot/undump.");
             }
             if lower.ends_with(".crt") {
                 let crt_name = path_str.split('/').last().unwrap_or("cartridge.crt").to_string();
