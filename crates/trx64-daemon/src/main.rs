@@ -5871,11 +5871,11 @@ fn monitor_help_text() -> String {
         "    sidefx [on|off]  monitor read side effects (default off = peek)",
         "    device [c64|drive8]  target the C64 or the 1541 CPU (drive8 = read-inspect r/m/d)",
         "  STATE / TRACE",
-        "    dump|snapshot <p>  write a .c64re snapshot; undump|loadsnapshot <p>  restore it (Spec 707)",
+        "    dump|snapshot <p>  write a .c64re snapshot; undump|loadsnapshot <p>  restore it",
         "    savecrt [\"<p>\"]  write live flash state to the mounted .crt (or to <p> as a copy)",
         "    swapcrt \"<p>\"    hot-swap the .crt, NO reset (same mapper: bank/ctrl carried) — build iteration",
-        "    trace on|off|status|mark   live trace gate (Spec 746)",
-        "    tracedb start|stop|status|mark   declarative trace (Spec 708)",
+        "    trace on|off|status|mark   live trace gate",
+        "    tracedb start|stop|status|mark   declarative trace",
         "    traceindex [path]   build the .duckdb index for the current/last (or <path>) .c64retrace so it is queryable (oldest->newest, no event cap)",
         "  ANALYSIS (need a trace — `trace on` first)",
         "    map [cpu]        memory map: free RAM / persistence surface",
@@ -9138,7 +9138,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             //     ingress.ts:122-129 ---
             if let Some(dirty) = non_persistable_dirty_media(&st) {
                 return Response::err(id, -32603, format!(
-                    "media-ingress: cannot apply a media change — {dirty} (Spec 709.13). v1 cannot \
+                    "media-ingress: cannot apply a media change — {dirty}. v1 cannot \
                      persist this state, so the intervention would create a non-restorable checkpoint/branch. \
                      Aborting (no partial apply, no checkpoint, no event)."
                 ));
@@ -9372,7 +9372,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             // writes to its host file BEFORE detaching, so an eject can't lose them.
             if let Some(reason) = non_persistable_dirty_media(&st) {
                 return Response::err(id, -32602, format!(
-                    "media/unmount: cannot apply a media change — {reason} (Spec 709.13)."
+                    "media/unmount: cannot apply a media change — {reason}."
                 ));
             }
             // A CART eject is a power-cycle (Spec 786): the ring checkpoints belong
@@ -9469,7 +9469,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 // = an intervention) BEFORE the power-cycle, checkpoint-after after.
                 if let Some(reason) = non_persistable_dirty_media(&st) {
                     return Response::err(id, -32602, format!(
-                        "media/mount: cannot apply a media change — {reason} (Spec 709.13)."
+                        "media/mount: cannot apply a media change — {reason}."
                     ));
                 }
                 // Spec 786 — CRT insert = power_off → register cart → power_on.
@@ -9545,7 +9545,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             //  4. checkpoint-after — embedded as event.checkpointAfterId; pinned.
             if let Some(reason) = non_persistable_dirty_media(&st) {
                 return Response::err(id, -32602, format!(
-                    "media: cannot apply a media change — {reason} (Spec 709.13)."
+                    "media: cannot apply a media change — {reason}."
                 ));
             }
             let media_present = st.session.machine.drive8.get_attached_disk().is_some()
@@ -9622,7 +9622,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 // = an intervention) BEFORE the power-cycle, checkpoint-after after.
                 if let Some(reason) = non_persistable_dirty_media(&st) {
                     return Response::err(id, -32602, format!(
-                        "media/swap: cannot apply a media change — {reason} (Spec 709.13)."
+                        "media/swap: cannot apply a media change — {reason}."
                     ));
                 }
                 let cart_media_present = st.session.machine.drive8.get_attached_disk().is_some()
@@ -9702,7 +9702,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             //  4. checkpoint-after — embedded as event.checkpointAfterId; pinned.
             if let Some(reason) = non_persistable_dirty_media(&st) {
                 return Response::err(id, -32602, format!(
-                    "media: cannot apply a media change — {reason} (Spec 709.13)."
+                    "media: cannot apply a media change — {reason}."
                 ));
             }
             let media_present = st.session.machine.drive8.get_attached_disk().is_some()
