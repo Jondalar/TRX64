@@ -40,7 +40,7 @@ A normal emulator runs code. TRX64 lets you *interrogate* it:
 
 This is my (dkl / Jondalar) personal emulator I developed for my own needs when
 reverse engineering C64 games. You might need different features or things - 
-and you invited to contribute code. Use PR mechanisms here on GitHub please.
+and you are invited to contribute code. Use PR mechanisms here on GitHub please.
 
 I will not answer feature requests without code / structured requirements and I 
 am not able to give support.
