@@ -7053,7 +7053,13 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
     note_operating_owner_for(&req, state);
     match req.method.as_str() {
         "ping" => {
-            Response::ok(id, json!({ "runtime_version": RUNTIME_VERSION }))
+            // Handshake payload: `runtime_version` is the WIRE-PROTOCOL epoch a client
+            // hard-checks; `version` is the product build, reported so a consumer can say
+            // WHICH build it is talking to (two builds can share an epoch yet differ).
+            Response::ok(
+                id,
+                json!({ "runtime_version": RUNTIME_VERSION, "version": env!("CARGO_PKG_VERSION") }),
+            )
         }
 
         "session/create" => {
@@ -14933,7 +14939,11 @@ async fn main() {
         .parse()
         .unwrap_or_else(|e| panic!("invalid --bind '{bind_host}': {e}"));
     let listener = TcpListener::bind(addr).await.expect("failed to bind");
-    eprintln!("[trx64] listening on ws://{addr}");
+    eprintln!(
+        "[trx64] TRX64 {} ({}) listening on ws://{addr}",
+        env!("CARGO_PKG_VERSION"),
+        RUNTIME_VERSION
+    );
 
     loop {
         match listener.accept().await {

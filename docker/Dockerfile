@@ -27,6 +27,14 @@ RUN cargo build --release -p trx64-daemon \
 
 # ── runtime ─────────────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
+# Product version — keep in lockstep with [workspace.package] version in Cargo.toml,
+# and tag the image with the same number (wl-trx64:<version>, plus :latest).
+# The WS protocol epoch is SEPARATE (see RUNTIME_VERSION in the daemon).
+ARG TRX64_VERSION=0.1.0
+LABEL org.opencontainers.image.title="wl-trx64" \
+      org.opencontainers.image.description="TRX64 C64 runtime daemon (WS on 4340)" \
+      org.opencontainers.image.version="${TRX64_VERSION}" \
+      org.opencontainers.image.licenses="GPL-3.0-or-later"
 # libstdc++6 + libgcc: the reSID C++ runtime the statically-linked daemon still needs.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libstdc++6 ca-certificates \
