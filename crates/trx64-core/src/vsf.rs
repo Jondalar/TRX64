@@ -1178,14 +1178,16 @@ fn load_vice_vsf(machine: &mut Machine, data: &[u8]) -> Result<VsfLoadResult, St
             // Raster-IRQ compare line ($D012 + $D011 bit7).
             machine.vic.raster_irq_line =
                 (machine.vic.regs[0x12] as u16) | (((machine.vic.regs[0x11] as u16) & 0x80) << 1);
-            // COLOUR RAM (0x400, low nibbles) → `write_color_ram` writes BOTH the
-            // `ram[$D800..]` and `io_shadow[$0800..]` stores; the full-machine VIC
-            // reads colour RAM from `io_shadow`, so without it the "11" multicolor
-            // pixels resolve to black (white menu/HUD rendered black on resume).
+            // COLOUR RAM (0x400, low nibbles). VSF's colour RAM is a SEPARATE VICE module —
+            // the C64MEM `$D800` is RAM-under-I/O, not colour — so land it in BOTH stores
+            // (also_ram=true): `mem[$D800..]` for the literal-port VIC and `io_shadow[$0800..]`
+            // for the full-machine VIC (without the latter, "11" multicolor pixels resolve to
+            // black → white menu/HUD rendered black on resume).
             if d.len() >= VICIISC_COLOR_RAM_OFF + 0x400 {
                 crate::c64re_snapshot::write_color_ram(
                     machine,
                     &d[VICIISC_COLOR_RAM_OFF..VICIISC_COLOR_RAM_OFF + 0x400],
+                    true,
                 );
             }
             loaded.push("VIC-II".to_string());

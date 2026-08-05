@@ -755,7 +755,10 @@ pub fn restore_vic(m: &mut Machine, s: &VicSnapshot) {
         v.irq_line = (v.irq_status & v.regs[0x1a] & 0x0f) != 0;
     }
     m.vic.c64re_draw_cycle_restore(&s.draw_cycle);
-    write_color_ram(m, &s.color_ram.iter().map(|&b| b as u8).collect::<Vec<u8>>());
+    // `.c64re`/ring restore: the full 64K RAM blob already restored `mem[$D800]` (the
+    // literal-port VIC's colour). Only sync the io_shadow oracle mirror; do NOT overwrite
+    // `mem[$D800]` with this field (also_ram=false) — that corrupted Highpool's colours.
+    write_color_ram(m, &s.color_ram.iter().map(|&b| b as u8).collect::<Vec<u8>>(), false);
 }
 
 /// Read the `vicPresentation` seam: the two 520×312 color-index framebuffers
@@ -829,18 +832,27 @@ pub fn read_color_ram(m: &Machine) -> [u8; 0x400] {
     out
 }
 
-/// Write color RAM back (low nibble) into BOTH stores that must agree:
-/// - `ram[$D800..]` — the ISO-bus VIC + what `read_color_ram` captures;
-/// - `io_shadow[$0800..]` — the FULL-machine bus VIC's colour-RAM source
-///   (`full.rs` reads colour RAM from `io_shadow`, NOT `ram`).
-/// Writing only `ram` left every product (full-machine) restore blind to colour
-/// RAM: each "11" multicolor-bitmap pixel resolved to colour 0 (black), so a
-/// resumed screen rendered its white text/HUD black. This is the single colour-RAM
-/// restore primitive for `.c64re`, the ring, and the VSF import.
-pub fn write_color_ram(m: &mut Machine, color_ram: &[u8]) {
+/// Restore color RAM (low nibble) into the two stores the two VIC paths read from:
+/// - `io_shadow[$0800..]` — the FULL-machine (oracle) VIC's colour source (`full.rs`).
+///   ALWAYS synced.
+/// - `ram[$D800..]` — the LITERAL-PORT (product) VIC's colour source (`lib.rs` VicMemView
+///   reads `mem[$D800..]`). Written only when `also_ram` is set.
+///
+/// `also_ram` MUST be false when the caller separately restores a full 64K RAM image that
+/// was captured from THIS machine's `mem[$D800]` (the `.c64re`/ring path): that blob already
+/// holds the exact colours the literal-port VIC rendered at capture, so overwriting them with
+/// this `color_ram` field CORRUPTS them for engines whose colours live in `mem[$D800]`
+/// (KERNAL-free Highpool: `io_shadow` held `init_io_video`'s uniform fill while the real
+/// per-cell colours were in `mem[$D800]` — restoring the field over the blob turned the map a
+/// uniform colour = the "red bars"). It MUST be true for VSF import, where the 64K `C64MEM`
+/// module's `$D800` is RAM-under-I/O (not colour) and the colour RAM is a separate VICE
+/// module — there `mem[$D800]` is the only place to land it.
+pub fn write_color_ram(m: &mut Machine, color_ram: &[u8], also_ram: bool) {
     for (i, &c) in color_ram.iter().enumerate().take(0x400) {
-        m.ram[0xd800 + i] = (m.ram[0xd800 + i] & 0xf0) | (c & 0x0f);
         m.io_shadow[0x0800 + i] = (m.io_shadow[0x0800 + i] & 0xf0) | (c & 0x0f);
+        if also_ram {
+            m.ram[0xd800 + i] = (m.ram[0xd800 + i] & 0xf0) | (c & 0x0f);
+        }
     }
 }
 
@@ -1356,7 +1368,8 @@ mod tests {
         m.c64_core.reg_a = 0x42;
         m.c64_core.clk = 1_234_567;
         m.ram[0x0400] = 0x08;
-        m.io_shadow[0x0800] = 0x0e; // color RAM (authoritative store: capture reads io_shadow, not ram-under-IO)
+        m.io_shadow[0x0800] = 0x0e; // colour RAM ($D800, I/O in) — captured via read_color_ram
+        m.ram[0xd800] = 0x03; // RAM under I/O ($D800, I/O out) — a DISTINCT store, captured by the 64K RAM blob
         m.port_dir = 0x2f;
         m.port_data = 0x17;
         m.cia1.regs[CIA_TAL] = 0x11;
@@ -1393,7 +1406,11 @@ mod tests {
         assert_eq!(m2.c64_core.reg_a, 0x42);
         assert_eq!(m2.c64_core.clk, 1_234_567);
         assert_eq!(m2.ram[0x0400], 0x08);
-        assert_eq!(m2.ram[0xd800] & 0x0f, 0x0e);
+        // The two $D800 stores restore INDEPENDENTLY to their OWN captured value — $01 selects
+        // which the CPU sees at read time. RAM-under-I/O comes from the 64K blob; colour RAM
+        // from the color_ram field. Restore must NOT clobber one with the other.
+        assert_eq!(m2.ram[0xd800] & 0x0f, 0x03); // RAM under I/O (blob), unclobbered
+        assert_eq!(m2.io_shadow[0x0800] & 0x0f, 0x0e); // colour RAM (field)
         assert_eq!(m2.port_dir, 0x2f);
         assert_eq!(m2.port_data, 0x17);
         assert_eq!(m2.cia1.regs[CIA_TAL], 0x11);
@@ -1679,7 +1696,7 @@ mod tests {
         m.vic.sbuf_reg[2] = 0xdeadbeef;
         m.vic.dbuf_line = 5;
         m.vic.dbuf[5 * crate::render::FB_W + 10] = 0x07;
-        m.io_shadow[0x0800] = 0x0a; // color RAM cell 0 (authoritative store: io_shadow)
+        m.io_shadow[0x0800] = 0x0a; // colour RAM cell 0 (io_shadow) — restore_vic restores THIS store, not RAM-under-I/O
 
         let snap = capture_vic(&m);
         assert_eq!(snap.regs.len(), 0x40);
@@ -1704,7 +1721,7 @@ mod tests {
         assert_eq!(m2.vic.sprite[3].x, 0x1ff);
         assert_eq!(m2.vic.cregs[0x20], 0x0e);
         assert_eq!(m2.vic.sbuf_reg[2], 0xdeadbeef);
-        assert_eq!(m2.ram[0xd800] & 0x0f, 0x0a);
+        assert_eq!(m2.io_shadow[0x0800] & 0x0f, 0x0a); // restore_vic restores the colour RAM (io_shadow); RAM-under-I/O is the RAM-restore's job
         assert_eq!(m2.vic.dbuf[5 * crate::render::FB_W + 10], 0x07);
     }
 
