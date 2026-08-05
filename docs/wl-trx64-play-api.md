@@ -191,6 +191,24 @@ Give the daemon a **second volume, read-write on both sides**, and dump into tha
               ->  consumer container /dumps  (rw)   # serves the file to the browser
 ```
 
+Use a **separate** host directory, NOT a subdirectory of the `/play` tree: mounting a subdir of
+an already-read-only mount gives the daemon the same files under two paths with different
+permissions (`/play/dumps` ro, `/dumps` rw), which only invites a write to the wrong one.
+
+Deployed shape (both containers mount the same host dir at `/dumps`):
+
+```
+docker run -d --name wl-trx64 --restart unless-stopped \
+  --network <bridge-network> --ip <static-ip> \
+  -v <host>/play:/play:ro \
+  -v <host>/dumps:/dumps \
+  -e TRX64_BIND=0.0.0.0 wl-trx64:<version>
+```
+
+Pin the image **version**, not `:latest`, so a redeploy is deliberate and the running build is
+identifiable (`ping` reports the same number). The dumps dir must be writable by the container
+user (uid 1000, `trx64`); `/play` stays read-only.
+
 A `.c64re` is a few MB (64 K RAM + cart + flash + a 520×312 framebuffer) — prune it, keep the
 newest N. The consumer serves what the daemon wrote; `/play` stays read-only and the cart stays
 protected.
