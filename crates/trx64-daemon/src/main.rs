@@ -872,6 +872,11 @@ struct BatchEntry {
 
 /// Spec 709.8 — keep the media-event history bounded (matches the spirit of the
 /// c64re PINNED_MEDIA_EVENTS window; large enough for replay/branch consumers).
+/// The wire-protocol version this daemon speaks (Spec 800 §D). Bump the integer ONLY on a
+/// wire-breaking change, in lockstep with C64RE's EXPECTED_RUNTIME_PROTOCOL — the client
+/// requires an EXACT match and hard-fails otherwise. Returned by `ping` for the handshake.
+const RUNTIME_VERSION: &str = "trx64-runtime/1";
+
 const MAX_MEDIA_EVENTS: usize = 256;
 
 pub type SharedState = Arc<Mutex<State>>;
@@ -5414,7 +5419,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                         schema_version:
                             trx64_core::c64re_snapshot::RUNTIME_CHECKPOINT_SCHEMA_VERSION,
                         media: media_inputs,
-                        runtime_version: "trx64-runtime/1".to_string(),
+                        runtime_version: RUNTIME_VERSION.to_string(),
                         machine_model: "c64-pal".to_string(),
                         provenance: None,
                         pc,
@@ -7048,7 +7053,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
     note_operating_owner_for(&req, state);
     match req.method.as_str() {
         "ping" => {
-            Response::ok(id, json!({}))
+            Response::ok(id, json!({ "runtime_version": RUNTIME_VERSION }))
         }
 
         "session/create" => {
@@ -11288,7 +11293,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                     checkpoint: payload,
                     schema_version: schema_version as i64,
                     media: media_inputs,
-                    runtime_version: "trx64-runtime/1".to_string(),
+                    runtime_version: RUNTIME_VERSION.to_string(),
                     machine_model: "c64-pal".to_string(),
                     provenance: Some(json!({ "checkpointId": format!("recorder:{seq}") })),
                     pc,
@@ -11386,7 +11391,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                     checkpoint,
                     schema_version: trx64_core::c64re_snapshot::RUNTIME_CHECKPOINT_SCHEMA_VERSION,
                     media: media_inputs,
-                    runtime_version: "trx64-runtime/1".to_string(),
+                    runtime_version: RUNTIME_VERSION.to_string(),
                     machine_model: "c64-pal".to_string(),
                     provenance: None,
                     pc,
