@@ -7355,6 +7355,57 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             // run can only stream live via the pump, so a caller uses the capped streaming
             // run when this is true and the blocking session/run when it's false (headless).
             state_json["streamPump"] = json!(st.streaming_enabled);
+            // ── powered + mounted media ─────────────────────────────────────────────
+            // A consumer showing a SHARED machine must be able to ask "what is in it?"
+            // WITHOUT mounting something to find out — mounting a cart power-cycles, so
+            // a viewer that guesses reboots someone else's game. `powered` likewise lets
+            // a UI draw the power button from truth after a page load.
+            //
+            // Identity is `bytes` + `mtime` (a cheap stat), NOT a hash: this is polled,
+            // and hashing a 1 MB cart per poll would be absurd. A rebuild changes both,
+            // which is exactly the "is the machine running the cart I just built?" test.
+            state_json["powered"] = json!(st.session.powered);
+            let media_entry = |p: &str| -> serde_json::Value {
+                if p.is_empty() {
+                    return serde_json::Value::Null;
+                }
+                let (bytes, mtime) = match std::fs::metadata(p) {
+                    Ok(m) => (
+                        m.len(),
+                        m.modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0),
+                    ),
+                    // Mounted from bytes with no live file (or the file moved): still report
+                    // the path so the consumer sees WHAT is mounted; identity is unknown.
+                    Err(_) => (0, 0),
+                };
+                json!({ "path": p, "bytes": bytes, "mtime": mtime })
+            };
+            // Read what is ACTUALLY in the machine (the parsed cart image / the attached
+            // disk), not the session's bookkeeping strings — `cart_path` is only written on
+            // undump, so a `media/mount` would have reported an empty machine.
+            // Prefer the session's full mounted path (set by media/mount + undump);
+            // `ParsedCartridgeImage.path` is only the file NAME, which cannot be stat'ed.
+            let cart_path = if !st.session.cart_path.is_empty() {
+                st.session.cart_path.clone()
+            } else {
+                machine.cartridge_image.as_ref().map(|i| i.path.clone()).unwrap_or_default()
+            };
+            let disk_path = machine
+                .drive8
+                .get_attached_disk()
+                .and_then(|d| d.backing_path.clone())
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| st.session.disk_path.clone());
+            let cart_name = machine.cartridge_image.as_ref().map(|i| i.name.clone());
+            let mut cart_json = media_entry(&cart_path);
+            if let (Some(obj), Some(n)) = (cart_json.as_object_mut(), cart_name) {
+                obj.insert("name".to_string(), json!(n));
+            }
+            state_json["media"] = json!({ "cart": cart_json, "disk": media_entry(&disk_path) });
             Response::ok(id, state_json)
         }
 
@@ -9502,6 +9553,10 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                     do_power_on(&mut st); // recover cartless
                     return Response::err(id, -32602, format!("media/mount: bad CRT: {e}"));
                 }
+                // Track WHAT is mounted, with the full path: `ParsedCartridgeImage.path` only
+                // carries the file name, and `session/state.media` must report a path a
+                // consumer can stat + compare ("is this the cart I just built?").
+                st.session.cart_path = path_str.clone();
                 do_power_on(&mut st);
                 let before_id: Option<String> = None;
                 let after_id: Option<String> = None;

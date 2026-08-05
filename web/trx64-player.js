@@ -12,6 +12,14 @@
 //   audio     (boolean)   enable WebAudio playback (starts on first user gesture)
 //   joystick  (boolean)   start in joystick mode (arrows/WASD + Space=fire) instead of keys
 //   autostart (boolean)   connect immediately (default: connect on first click/attach)
+//   mount-policy          if-changed (default) | always | never. The machine is SHARED and
+//                         mounting a cart POWER-CYCLES it, so the default mounts only when
+//                         nothing is mounted or a DIFFERENT image is: opening / re-opening a
+//                         view attaches to the running machine instead of rebooting it.
+//   readonly  (boolean)   observer mode — render video/audio, send NO keyboard/joystick.
+//
+// Methods: call(method, params) · mount(path) · readState()
+// Events:  trx64-connected {state} · trx64-state {state} · trx64-runstate {runState}
 //
 // Contract: docs/wl-trx64-play-api.md. No build step, no dependencies.
 
@@ -47,7 +55,10 @@ class Trx64Player extends HTMLElement {
     // "createElement result must not have attributes"). Only set plain JS fields here;
     // read attributes + build the shadow DOM in connectedCallback.
     super();
-    this.ws = null; this.id = 0; this.pend = new Map();
+    // NB `_reqId`, NOT `id`: `id` is a REFLECTED DOM property, so `this.id = 0` would set the
+    // element's id ATTRIBUTE — and an element that already carries attributes makes Chrome
+    // reject `document.createElement("trx64-player")` ("the result must not have attributes").
+    this.ws = null; this._reqId = 0; this.pend = new Map();
     this.mode = "keyboard";
     this.held = new Set();                 // C64 key names currently down (for cleanup)
     this.joy = { up: false, down: false, left: false, right: false, fire: false };
@@ -106,7 +117,7 @@ class Trx64Player extends HTMLElement {
   call(method, params = {}) {
     return new Promise((resolve) => {
       if (!this.ws || this.ws.readyState !== 1) return resolve(null);
-      const i = ++this.id; this.pend.set(i, resolve);
+      const i = ++this._reqId; this.pend.set(i, resolve);
       this.ws.send(JSON.stringify({ jsonrpc: "2.0", id: i, method, params }));
     });
   }
@@ -122,11 +133,14 @@ class Trx64Player extends HTMLElement {
     ws.onopen = async () => {
       this.setStatus("connected", "on"); this.reconnectMs = 500;
       await this.call("session/create");
+      const state = await this.readState();
+      this.emit("trx64-connected", { state });
+      // The machine is SHARED: mounting a cart power-cycles it, so mounting on every
+      // connect reboots a game someone else (or you, in another tab) is playing. Only
+      // mount when the policy says so.
       const image = this.getAttribute("image");
-      if (image) {
-        const r = await this.call("media/mount", { path: image });
-        this.setStatus(r?.error ? `mount failed: ${r.error.message}` : "playing", r?.error ? "err" : "on");
-      }
+      if (image && this.shouldMount(image, state)) await this.mount(image);
+      else if (image) this.setStatus("attached", "on");
     };
     ws.onmessage = (e) => this.onMessage(e);
     ws.onerror = () => this.setStatus("ws error", "err");
@@ -136,12 +150,49 @@ class Trx64Player extends HTMLElement {
     };
   }
 
+  // ── embedder surface: state, mount policy, events ─────────────────────────
+  /** Fire a DOM event so an embedder's control bar can show TRUTH instead of guessing.
+   *  Events: `trx64-connected` {state}, `trx64-state` {state}, `trx64-runstate` {runState}. */
+  emit(type, detail) {
+    this.dispatchEvent(new CustomEvent(type, { detail, bubbles: true, composed: true }));
+  }
+
+  /** Read `session/state` and publish it as `trx64-state`. Returns the state (or null). */
+  async readState() {
+    const r = await this.call("session/state");
+    const state = r?.result ?? null;
+    if (state) this.emit("trx64-state", { state });
+    return state;
+  }
+
+  /** Decide whether connecting should mount `image`, per the `mount-policy` attribute:
+   *  `if-changed` (default) — mount only when nothing is mounted or a DIFFERENT image is;
+   *  `always` — legacy behaviour (every connect power-cycles); `never` — attach only. */
+  shouldMount(image, state) {
+    const policy = (this.getAttribute("mount-policy") || "if-changed").toLowerCase();
+    if (policy === "never") return false;
+    if (policy === "always") return true;
+    const cart = state?.media?.cart;
+    if (!cart || !cart.path) return true;        // nothing in the machine → mount
+    return cart.path !== image;                  // different image → mount; same → attach
+  }
+
+  /** Explicitly mount an image ("the build finished, take this cart"). Power-cycles on a
+   *  cart, so it is a deliberate action — never a side effect of showing the machine. */
+  async mount(path) {
+    const r = await this.call("media/mount", { path });
+    const failed = !!r?.error;
+    this.setStatus(failed ? `mount failed: ${r.error.message}` : "playing", failed ? "err" : "on");
+    await this.readState();
+    return r;
+  }
+
   onMessage(e) {
     if (typeof e.data === "string") {
       let m; try { m = JSON.parse(e.data); } catch { return; }
       if (m.id != null && this.pend.has(m.id)) { this.pend.get(m.id)(m); this.pend.delete(m.id); return; }
-      if (m.method === "debug/paused") this.setStatus("paused");
-      else if (m.method === "debug/running") this.setStatus("playing", "on");
+      if (m.method === "debug/paused") { this.setStatus("paused"); this.emit("trx64-runstate", { runState: "paused" }); }
+      else if (m.method === "debug/running") { this.setStatus("playing", "on"); this.emit("trx64-runstate", { runState: "running" }); }
       return;
     }
     const b = new Uint8Array(e.data);
@@ -194,6 +245,8 @@ class Trx64Player extends HTMLElement {
 
   onKey(e, down) {
     if (e.repeat && down) return;
+    // Observer mode: watch a shared machine without being able to steer it.
+    if (this.hasAttribute("readonly")) return;
     e.preventDefault();
     if (this.mode === "joystick") return this.onJoyKey(e, down);
     const key = codeToKey(e);

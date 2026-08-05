@@ -67,7 +67,7 @@ All are JSON-RPC `method`s. `params` shown; omit `session_id` (single machine).
 |---|---|---|
 | `ping` | — | `{}` — liveness (use for the container healthcheck) |
 | `session/create` | — | attaches/creates the one machine; returns session id + state |
-| `session/state` | — | `{ c64Cycles, runState:"running"\|"paused", cpu:{pc,a,x,y,sp,flags}, vic:{…}, controlOwner, streamPump, … }` |
+| `session/state` | — | `{ c64Cycles, runState:"running"\|"paused", powered:bool, media:{cart,disk}, cpu:{pc,a,x,y,sp,flags}, vic:{…}, controlOwner, streamPump, … }` — see §3.1 |
 | `media/mount` | `{ "path": "/play/x.crt" }` | mount `.crt`/`.d64`/`.g64`; a cart power-cycles + boots. Returns `{ detail:{ mapperType, name, … }, … }` |
 | `session/key_down` | `{ "key": "<NAME>" }` | press one C64 key (held). `key` = PETSCII name (§5) |
 | `session/key_up` | `{ "key": "<NAME>" }` | release it |
@@ -75,10 +75,37 @@ All are JSON-RPC `method`s. `params` shown; omit `session_id` (single machine).
 | `session/joystick_clear` | `{ "port":2 }` | release all lines |
 | `session/screenshot` | — | `{ dataUrl:"data:image/png;base64,…" }` — one PNG (384×272). For a thumbnail; the live view uses BIN_VIC, not this |
 | `session/close` | — | soft-close (machine + media stay; a later create re-attaches) |
-| `debug/pause` / `debug/run` | — | freeze / resume (usually not needed for play; the cart free-runs) |
+| `debug/pause` / `debug/run` | — | freeze / resume. NOTE: a manual `session/run` is refused while the machine free-runs (`-32001`) — pause first |
+| `session/power` | `{ "op":"off"\|"on" }` | the general switch. **off** stops the machine entirely (use it around a build that replaces the mounted file); **on** boots it back with whatever is registered |
+| `session/reset` | `{ "mode":"soft"\|"cold" }` | **soft** = hardware RESET line (RAM + media preserved). **cold** = full power-cycle. Default when `mode` is omitted: **cold** |
+| `snapshot/dump` | `{ "path":"/dumps/x.c64re" }` | write a full state snapshot (RAM + cart + flash + framebuffer). Written BY THE DAEMON, so the path must be writable **inside the container** — see §6.1 |
+| `snapshot/undump` | `{ "path":"…" }` | restore one (power-cycles) |
+
+**These mutate a SHARED machine.** One power-off / reset / mount stops the game for
+*everyone* attached, so a consumer should treat them as privileged actions and confirm the
+destructive ones. Reading state and pulling frames affects nobody.
 
 Server **notifications** the consumer may observe (all text, no `id`): `debug/running`,
 `debug/paused` (run-state changed → toggle a "running/paused" badge), `debug/stopped`.
+
+### 3.1 `session/state.media` + `powered` — know what is in the machine
+
+A viewer must be able to ask *"what is mounted?"* **without** mounting something to find out —
+mounting a cart power-cycles, so a consumer that guesses reboots someone else's game.
+
+```json
+{ "powered": true,
+  "media": { "cart": { "path": "/play/wl.crt", "name": "WASTELAND EF BY DKL/TREX",
+                       "bytes": 1050688, "mtime": 1785766446 },
+             "disk": null } }
+```
+
+- `path` is the full container-side path of what is actually inserted (`null` when empty).
+- Identity is **`bytes` + `mtime`** (a cheap stat), deliberately not a hash: this is polled, and
+  hashing a 1 MB cart per poll would be absurd. A rebuild changes both — which is exactly the
+  *"is the machine already running the cart I just built?"* test.
+- `powered` reflects the power lifecycle, so a UI can draw its power button from truth after a
+  page reload instead of assuming.
 
 ---
 
@@ -143,8 +170,30 @@ Joystick: WASD/arrows → `session/joystick_set {port:2, …}`; the C64 games re
 - **Measured (QNAP native amd64):** one streaming session = **~40 % of one
   core, ~150 MiB**, 50 fps. Put `--cpus`/memory caps on the container so a busy session
   can never starve the web app.
-- **One machine.** A second concurrent player waits (or, later, a scratch
-  process inside the container). Scale-out = more containers.
+- **One machine, shared.** Everyone attached sees and drives the SAME C64 — that is the
+  design, not a limit: one person plays while another watches. It also means every mutating
+  call (§3) hits everybody. Scale-out = more containers.
+- **The time-machine runs too.** In streaming mode (the container default) the checkpoint ring
+  and the recorder feed automatically — that is what makes scrub/rewind possible, and it is
+  already inside the ~150 MiB measured above. Tunable via env if a memory cap is tight:
+  `C64RE_CHECKPOINT_RING_SECONDS` (default 10), `C64RE_CHECKPOINT_CADENCE_FRAMES` (25),
+  `C64RE_CHECKPOINT_AUTOCAPTURE=0` / `C64RE_RECORDER_AUTOFEED=0` to switch them off.
+
+### 6.1 Volumes — where a dump may be written
+
+`/play` is mounted **read-only** on the daemon on purpose: an EasyFlash cart writes back, and
+that must not modify the built `.crt`. So `snapshot/dump` cannot write there.
+
+Give the daemon a **second volume, read-write on both sides**, and dump into that:
+
+```
+<host>/dumps  ->  daemon container   /dumps  (rw)
+              ->  consumer container /dumps  (rw)   # serves the file to the browser
+```
+
+A `.c64re` is a few MB (64 K RAM + cart + flash + a 520×312 framebuffer) — prune it, keep the
+newest N. The consumer serves what the daemon wrote; `/play` stays read-only and the cart stays
+protected.
 
 ---
 
@@ -190,10 +239,30 @@ defines it, and the editor stays untouched. An embedder writes **one tag**:
 <trx64-player ws="wss://editor.example/ws/play" image="/play/wl.crt" audio></trx64-player>
 ```
 
-Attributes: `ws` (required, daemon WS URL), `image` (cart/disk path to mount on connect),
-`audio` (enable WebAudio, starts on first click), `joystick` (start in joystick mode),
-`autostart` (connect immediately vs. on first click). Swap carts by setting `image` and
-re-connecting; the component exposes the same `session/*` calls internally.
+**Attributes**
+
+| attribute | meaning |
+|---|---|
+| `ws` (required) | daemon WS URL (through your auth proxy) |
+| `image` | container-side path, mounted per `mount-policy` |
+| `mount-policy` | `if-changed` (default) · `always` · `never` — see below |
+| `audio` | enable WebAudio (starts on the first click) |
+| `joystick` | start in joystick mode instead of keyboard |
+| `readonly` | observer mode: render video/audio, send NO input |
+| `autostart` | connect immediately instead of on first click |
+
+**`mount-policy` — why the default is `if-changed`.** Mounting a cart power-cycles the shared
+machine. A component that mounts on every connect therefore reboots the game whenever anyone
+opens (or re-opens) the view. With `if-changed` the component reads `session/state` first and
+mounts only when the machine is empty or running a *different* image; otherwise it just
+attaches to what is already running. Use `never` for a pure viewer, `always` for the old
+behaviour.
+
+**Methods:** `call(method, params)` (any RPC — power, reset, dump ride on this),
+`mount(path)` (explicit "the build finished, take this cart"), `readState()`.
+
+**Events** (DOM `CustomEvent`, `detail` as shown) — so a control bar shows truth instead of
+guessing: `trx64-connected` `{state}`, `trx64-state` `{state}`, `trx64-runstate` `{runState}`.
 
 The editor's Play tab is then just: serve `trx64-player.js`, proxy `/ws/play` to the
 daemon with auth (§7), drop the tag into the Play panel. No decode code, no key tables.
