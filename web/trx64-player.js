@@ -60,6 +60,7 @@ class Trx64Player extends HTMLElement {
     // reject `document.createElement("trx64-player")` ("the result must not have attributes").
     this.ws = null; this._reqId = 0; this.pend = new Map();
     this.mode = "keyboard";
+    this.runState = "running"; this.pacing = "pal";   // corrected from session/state on connect
     this.held = new Set();                 // C64 key names currently down (for cleanup)
     this.joy = { up: false, down: false, left: false, right: false, fire: false };
     this.audioCtx = null; this.audioTime = 0;
@@ -77,18 +78,21 @@ class Trx64Player extends HTMLElement {
         .bar { display:flex; gap:8px; align-items:center; padding:4px 6px; background:#111; line-height:1.4; }
         .bar button { font:inherit; color:#8f8; background:#222; border:1px solid #444; cursor:pointer; padding:2px 8px; }
         .bar .st { margin-left:auto; opacity:.8; }
+        .bar button.on { color:#111; background:#8f8; border-color:#8f8; }
         .dot { width:8px; height:8px; border-radius:50%; background:#666; display:inline-block; }
         .dot.on { background:#4caf50; } .dot.err { background:#e44; }
         .hint { opacity:.6; }
       </style>
-      <div class="wrap" tabindex="0">
-        <canvas width="${VW}" height="${VH}"></canvas>
-      </div>
       <div class="bar">
         <span class="dot"></span>
+        <button class="run" title="pause / resume the machine">⏸ pause</button>
+        <button class="warp" title="run as fast as the host allows (affects everyone — shared machine)">⚡ warp</button>
         <button class="mode"></button>
         <span class="hint"></span>
         <span class="st">idle</span>
+      </div>
+      <div class="wrap" tabindex="0">
+        <canvas width="${VW}" height="${VH}"></canvas>
       </div>`;
     this.$wrap = root.querySelector(".wrap");
     this.$canvas = root.querySelector("canvas");
@@ -100,6 +104,17 @@ class Trx64Player extends HTMLElement {
     this.$mode = root.querySelector(".mode");
     this.$mode.onclick = () => this.setMode(this.mode === "keyboard" ? "joystick" : "keyboard");
     this.setMode(this.mode);
+
+    // Machine controls. These drive the SHARED machine — everyone attached is paused/warped
+    // with you — so an observer (`readonly`) does not get them.
+    this.$run = root.querySelector(".run");
+    this.$warp = root.querySelector(".warp");
+    if (this.hasAttribute("readonly")) {
+      this.$run.remove(); this.$warp.remove();
+    } else {
+      this.$run.onclick = () => this.setPaused(this.runState !== "paused");
+      this.$warp.onclick = () => this.setWarp(this.pacing !== "warp");
+    }
 
     // Input is captured while the widget has focus (click it to grab the keyboard).
     this.$wrap.addEventListener("keydown", (e) => this.onKey(e, true));
@@ -157,12 +172,47 @@ class Trx64Player extends HTMLElement {
     this.dispatchEvent(new CustomEvent(type, { detail, bubbles: true, composed: true }));
   }
 
-  /** Read `session/state` and publish it as `trx64-state`. Returns the state (or null). */
+  /** Read `session/state`, mirror it into the control bar, publish it as `trx64-state`. */
   async readState() {
     const r = await this.call("session/state");
     const state = r?.result ?? null;
-    if (state) this.emit("trx64-state", { state });
+    if (state) { this.applyState(state); this.emit("trx64-state", { state }); }
     return state;
+  }
+
+  /** Draw the controls from TRUTH, so a reload (or someone else's action on the shared
+   *  machine) is reflected instead of guessed. */
+  applyState(state) {
+    if (state.runState) this.setRunState(state.runState);
+    if (state.pacing?.mode) this.setPacing(state.pacing.mode);
+  }
+
+  setRunState(runState) {
+    this.runState = runState;
+    if (this.$run) {
+      const paused = runState === "paused";
+      this.$run.textContent = paused ? "▶ run" : "⏸ pause";
+      this.$run.classList.toggle("on", paused);
+    }
+  }
+
+  setPacing(mode) {
+    this.pacing = mode;
+    if (this.$warp) this.$warp.classList.toggle("on", mode === "warp");
+  }
+
+  /** Pause / resume the SHARED machine. */
+  async setPaused(paused) {
+    await this.call(paused ? "debug/pause" : "debug/run");
+    this.setRunState(paused ? "paused" : "running");
+    this.emit("trx64-runstate", { runState: paused ? "paused" : "running" });
+  }
+
+  /** Warp = run as fast as the host allows; `pal` = realtime. Affects everyone attached. */
+  async setWarp(on) {
+    await this.call("session/set_pacing", { mode: on ? "warp" : "pal" });
+    this.setPacing(on ? "warp" : "pal");
+    this.setStatus(on ? "warp" : "playing", "on");
   }
 
   /** Decide whether connecting should mount `image`, per the `mount-policy` attribute:
@@ -191,8 +241,9 @@ class Trx64Player extends HTMLElement {
     if (typeof e.data === "string") {
       let m; try { m = JSON.parse(e.data); } catch { return; }
       if (m.id != null && this.pend.has(m.id)) { this.pend.get(m.id)(m); this.pend.delete(m.id); return; }
-      if (m.method === "debug/paused") { this.setStatus("paused"); this.emit("trx64-runstate", { runState: "paused" }); }
-      else if (m.method === "debug/running") { this.setStatus("playing", "on"); this.emit("trx64-runstate", { runState: "running" }); }
+      // Someone else on the shared machine may have paused/resumed it — follow along.
+      if (m.method === "debug/paused") { this.setStatus("paused"); this.setRunState("paused"); this.emit("trx64-runstate", { runState: "paused" }); }
+      else if (m.method === "debug/running") { this.setStatus("playing", "on"); this.setRunState("running"); this.emit("trx64-runstate", { runState: "running" }); }
       return;
     }
     const b = new Uint8Array(e.data);

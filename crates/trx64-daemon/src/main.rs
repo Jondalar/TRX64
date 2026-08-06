@@ -7365,6 +7365,10 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             // and hashing a 1 MB cart per poll would be absurd. A rebuild changes both,
             // which is exactly the "is the machine running the cart I just built?" test.
             state_json["powered"] = json!(st.session.powered);
+            // Pacing belongs in state for the same reason as `powered`: a UI must draw its
+            // warp toggle from truth after a reload, and on a SHARED machine a viewer has to
+            // see that someone else put it in warp (otherwise the game just looks broken-fast).
+            state_json["pacing"] = json!({ "mode": st.pacing_mode, "ratio": st.pacing_ratio });
             let media_entry = |p: &str| -> serde_json::Value {
                 if p.is_empty() {
                     return serde_json::Value::Null;

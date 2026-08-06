@@ -77,6 +77,7 @@ All are JSON-RPC `method`s. `params` shown; omit `session_id` (single machine).
 | `session/close` | — | soft-close (machine + media stay; a later create re-attaches) |
 | `debug/pause` / `debug/run` | — | freeze / resume. NOTE: a manual `session/run` is refused while the machine free-runs (`-32001`) — pause first |
 | `session/power` | `{ "op":"off"\|"on" }` | the general switch. **off** stops the machine entirely (use it around a build that replaces the mounted file); **on** boots it back with whatever is registered |
+| `session/set_pacing` | `{ "mode":"pal"\|"warp"\|"fixed-ratio", "ratio":num }` | how fast the machine runs. `pal` = realtime, **`warp`** = as fast as the host allows (measured ~8× on a Mac; less on a NAS, where realtime already costs ~40 % of a core). Reported back in `session/state.pacing` |
 | `session/reset` | `{ "mode":"soft"\|"cold" }` | **soft** = hardware RESET line (RAM + media preserved). **cold** = full power-cycle. Default when `mode` is omitted: **cold** |
 | `snapshot/dump` | `{ "path":"/dumps/x.c64re" }` | write a full state snapshot (RAM + cart + flash + framebuffer). Written BY THE DAEMON, so the path must be writable **inside the container** — see §6.1 |
 | `snapshot/undump` | `{ "path":"…" }` | restore one (power-cycles) |
@@ -95,6 +96,7 @@ mounting a cart power-cycles, so a consumer that guesses reboots someone else's 
 
 ```json
 { "powered": true,
+  "pacing": { "mode": "pal", "ratio": 1 },
   "media": { "cart": { "path": "/play/wl.crt", "name": "WASTELAND EF BY DKL/TREX",
                        "bytes": 1050688, "mtime": 1785766446 },
              "disk": null } }
@@ -105,7 +107,9 @@ mounting a cart power-cycles, so a consumer that guesses reboots someone else's 
   hashing a 1 MB cart per poll would be absurd. A rebuild changes both — which is exactly the
   *"is the machine already running the cart I just built?"* test.
 - `powered` reflects the power lifecycle, so a UI can draw its power button from truth after a
-  page reload instead of assuming.
+  page reload instead of assuming. `pacing` is there for the same reason — and because on a
+  shared machine a viewer must be able to see that *someone else* engaged warp, otherwise the
+  game merely looks broken-fast.
 
 ---
 
@@ -276,8 +280,15 @@ mounts only when the machine is empty or running a *different* image; otherwise 
 attaches to what is already running. Use `never` for a pure viewer, `always` for the old
 behaviour.
 
+**Built-in control bar.** Above the picture the component carries **⏸ pause / ▶ run** and
+**⚡ warp** (plus the ⌨/🕹 input-mode toggle). Both are drawn from `session/state` on connect
+and kept live by the `debug/paused|running` notifications, so they follow what *anyone*
+attached does. Both drive the shared machine, so `readonly` removes them entirely. An embedder
+that wants its own bar can ignore these and drive the RPCs through `call()`.
+
 **Methods:** `call(method, params)` (any RPC — power, reset, dump ride on this),
-`mount(path)` (explicit "the build finished, take this cart"), `readState()`.
+`mount(path)` (explicit "the build finished, take this cart"), `readState()`,
+`setPaused(bool)`, `setWarp(bool)`.
 
 **Events** (DOM `CustomEvent`, `detail` as shown) — so a control bar shows truth instead of
 guessing: `trx64-connected` `{state}`, `trx64-state` `{state}`, `trx64-runstate` `{runState}`.
