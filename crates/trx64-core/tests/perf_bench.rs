@@ -23,8 +23,8 @@ use std::time::Instant;
 use trx64_core::drive::{DiskImage, DiskKind};
 use trx64_core::{Machine, NullSink};
 
-const ROM_DIR: &str = "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/resources/roms";
-const SAMPLES: &str = "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples";
+const ROM_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/resources/roms");
+const SAMPLES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/samples");
 
 /// C64 PAL master clock (MHz). 985248.444 Hz → 0.985248 MHz.
 const PAL_HZ: f64 = 985_248.444;

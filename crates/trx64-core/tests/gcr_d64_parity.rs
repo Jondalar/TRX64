@@ -13,7 +13,7 @@
 use trx64_core::gcr::GcrImage;
 
 const SAMPLE: &str =
-    "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/scramble_infinity.d64";
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/samples/scramble_infinity.d64");
 
 /// Minimal SHA-256 (FIPS 180-4), first 8 bytes as hex — no external crate.
 fn sha256_16(data: &[u8]) -> String {

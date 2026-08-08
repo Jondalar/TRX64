@@ -5,7 +5,7 @@
 use std::path::Path;
 use trx64_cli::boot_engine;
 
-const ROMS: &str = "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/resources/roms";
+const ROMS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/resources/roms");
 
 #[test]
 fn mount_resolves_relative_path_against_cd_cwd() {

@@ -1226,7 +1226,7 @@ mod tests {
     #[test]
     fn rotation_advances_head_and_assembles_bytes() {
         let path =
-            "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/scramble_infinity.d64";
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/samples/scramble_infinity.d64");
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
             Err(_) => return, // skip without sample

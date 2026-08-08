@@ -883,6 +883,19 @@ pub type SharedState = Arc<Mutex<State>>;
 
 // ── ROM directory resolution ──────────────────────────────────────────────────
 
+/// The sibling C64RE checkout, resolved from the SOURCE tree at compile time
+/// (`crates/trx64-daemon` → `../../..` = the directory that holds both repos).
+///
+/// Spec 802 §2 defect (5) / acceptance §5.5: an absolute path out of the author's
+/// home directory must not appear anywhere in the sources. This keeps the same
+/// dev-convenience behaviour — a side-by-side `TRX64/` + `C64ReverseEngineeringMCP/`
+/// checkout resolves without any env — for ANY developer's layout, and it is
+/// always the LAST candidate tried, after `C64RE_ROOT`, the exe-relative dirs and
+/// the cwd. When the directory does not exist (a shipped binary, the container) the
+/// candidate simply never matches.
+const DEV_C64RE_ROOT: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP");
+
 /// Resolve the C64 ROM directory CROSS-PLATFORM. The old body hardcoded a single Mac
 /// path whenever `C64RE_ROOT` was unset — so any `do_power_on` / restore rebuild on a
 /// machine without that env (e.g. the standalone trx64-cli on Windows) resolved to a
@@ -890,7 +903,8 @@ pub type SharedState = Arc<Mutex<State>>;
 /// (PC=$0000, $FFFC/$FFFE = 0). Try, in order: `C64RE_ROOT/resources/roms`; dirs
 /// relative to the EXECUTABLE and a few levels up (`roms/`, `resources/roms/` — the
 /// same layout trx64-cli's own resolver uses, which is why Mike's BASIC boots but a
-/// cart mount didn't); the CWD; finally the Mac dev checkout. Pick the first that
+/// cart mount didn't); the CWD; finally the sibling C64RE dev checkout (source-tree
+/// relative, [`DEV_C64RE_ROOT`] — no author path in the sources). Pick the first that
 /// actually contains the KERNAL; only fall back to a bare `roms` when nothing matches.
 fn rom_dir() -> PathBuf {
     let has_kernal = |p: &std::path::Path| p.join("kernal-901227-03.bin").exists();
@@ -916,11 +930,9 @@ fn rom_dir() -> PathBuf {
     }
     candidates.push(PathBuf::from("roms"));
     candidates.push(PathBuf::from("resources").join("roms"));
-    candidates.push(
-        PathBuf::from("/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP")
-            .join("resources")
-            .join("roms"),
-    );
+    // Last resort: the sibling C64RE dev checkout (source-tree-relative, see
+    // DEV_C64RE_ROOT — no author path in the sources, Spec 802 §5.5).
+    candidates.push(PathBuf::from(DEV_C64RE_ROOT).join("resources").join("roms"));
     candidates
         .into_iter()
         .find(|p| has_kernal(p))
@@ -1129,110 +1141,108 @@ fn default_trace_output(session_id: &str) -> PathBuf {
     base.join("runtime").join(session_id).join(file)
 }
 
-// ── trace/read Node sidecar (Spec "Interim A") ────────────────────────────────
+// ── trace/read — NATIVE, in-process (Spec 802) ────────────────────────────────
 //
-// TRX64 already WRITES the `.c64retrace` (the shared interchange format). It does
-// not yet have a native DuckDB indexer + the v2 reader algorithms, so the
-// trace-analysis surface (trace/read + the v2 ops) is served by SHELLING OUT to a
-// tiny Node sidecar that imports the EXISTING c64re indexer + v2 readers and runs
-// them over a `.c64retrace`/`.duckdb` pair. Byte-identical to the c64re TS daemon
-// by construction (it IS the same code path, ws-server.ts:1302-1377). Requires
-// Node/tsx + the c64re TS source on disk (fine for the c64re-as-backend use case;
-// the standalone deployment is served by the future native Rust port, spec B).
+// THE RULE: TRX64 is the runtime AND the monitor. Every verb — `dump`, `ringdump`,
+// capture AND trace read — runs with NO Node, NO TypeScript, NO C64RE source tree
+// and NO spawned helper. C64RE consumes TRX64 and keeps no second reader.
+//
+// This used to shell out (`tsx tools/trace-read-sidecar/sidecar.ts`) to a Node
+// process that dynamically imported *C64RE's* TypeScript reader — a Rust daemon
+// acting as a pass-through back into the very repo asking it the question. Typing
+// `map` in the TRX64 monitor executed C64RE TypeScript. Consequences (Spec 802 §2):
+// it worked on exactly one machine (needed Node + `tsx` + the C64RE checkout + a
+// correct root path); it never worked on Windows (`resolve_tsx` preferred the
+// extensionless POSIX npm shim `CreateProcess` cannot execute, and the bare `tsx`
+// fallback only ever resolves as `tsx.exe`, which npm does not ship); it never
+// worked in the container (no Node in the image); and a failed index build was
+// invisible, so capture reported success on unreadable data.
+//
+// The reader is now `trx64-traceindex`: in-process, DuckDB statically bundled, and
+// depending on `trx64-trace` for the format constants so the reader and the writer
+// physically cannot drift. NO FORMAT CHANGE — the `.c64retrace` binary format and
+// the DuckDB index schema are untouched, existing stores keep working.
+//
+// The signature is DELIBERATELY unchanged from the sidecar's
+// (`(op, duckdb_path, args) -> Result<Value, String>`) so every call site keeps its
+// exact error mapping: an `Err(String)` still becomes a clean WS / monitor error,
+// NEVER a panic.
 
-/// The TRX64 repo root (holds `tools/`). `TRX64_ROOT` env wins; else the build-time
-/// `CARGO_MANIFEST_DIR` (= `crates/trx64-daemon`) walked up two levels; else the
-/// known dev path. Used to locate the sidecar + the tsx in tools/oracle.
-fn trx64_root() -> PathBuf {
-    if let Ok(p) = std::env::var("TRX64_ROOT") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
+/// The ops `trace/read` accepts. An op outside this set is a caller mistake
+/// (→ `-32602` invalid params), not a runtime failure.
+///
+/// The sidecar's raw `sql` passthrough is **dropped** with the port (Spec 802 OQ1):
+/// it had no caller left, and an arbitrary-SQL door on a daemon that binds
+/// `0.0.0.0` in the container is not worth keeping. `store_fn`/`safeQuery` — which
+/// carries the SELECT/WITH prefix gate and the 200-row cap — is the supported way
+/// to run a query.
+const TRACE_READ_OPS: &[&str] = &[
+    "index",
+    "store_fn",
+    "map",
+    "swimlane",
+    "swimlane_text",
+    "taint",
+    "taint_text",
+    // The three v2 reader ops. Routed to `trx64-traceindex` like every other op;
+    // their core algorithms are still being ported (Spec 802 F2), so they answer
+    // with the reader's own "not implemented yet" error rather than a dispatch
+    // arm here — the daemon no longer refuses an op it advertises.
+    "query_events",
+    "follow_path",
+    "profile_loader",
+];
+
+/// Run a `trace/read` op natively. `duckdb_path` is the `.duckdb` INDEX path; it is
+/// built lazily from its `.c64retrace` sibling on first read (the reader's
+/// `ensure_index_bounded`, same lazy-on-read contract the sidecar had). `op` +
+/// `args` mirror the WS `trace/read` params exactly.
+fn trace_read_native(op: &str, duckdb_path: &str, args: &Value) -> Result<Value, String> {
+    use trx64_traceindex as ti;
+    let path = std::path::Path::new(duckdb_path);
+    let out: ti::Result<Value> = match op {
+        "index" => {
+            let wait = args.get("wait").and_then(|v| v.as_bool()).unwrap_or(true);
+            ti::op_index(path, None, wait)
         }
-    }
-    // crates/trx64-daemon → repo root (../..). Robust even when the binary is run
-    // from an arbitrary cwd (the oracle spawns it detached with stdio ignored).
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    if let Some(root) = manifest.parent().and_then(|p| p.parent()) {
-        if root.join("tools").join("trace-read-sidecar").exists() {
-            return root.to_path_buf();
-        }
-    }
-    PathBuf::from("/Users/alex/Development/C64/Tools/TRX64")
+        "store_fn" => ti::queries::op_store_fn(path, args),
+        "map" => ti::map::op_map(path, args.get("cpu").and_then(|v| v.as_str())),
+        "swimlane" => ti::swimlane::op_swimlane(path, args),
+        "swimlane_text" => ti::swimlane::op_swimlane_text(path, args),
+        "taint" => ti::taint::op_taint(path, args),
+        "taint_text" => ti::taint::op_taint_text(path, args),
+        // The v2 reader ops (`runtime_query_events` / `runtime_follow_path` /
+        // `runtime_profile_loader` on the C64RE side). ARGUMENT CASE DIFFERS PER OP
+        // and is part of the contract (Spec 802 R3 §5): `query_events` and
+        // `follow_path` take camelCase — the sidecar forwarded the WS `args` object
+        // straight into the TS query object — while `profile_loader` takes
+        // snake_case. Each op's parser owns its convention; pass `args` verbatim.
+        // There is deliberately NO sidecar fallback: re-adding the spawn would
+        // reinstate exactly the dependency this spec removes.
+        "query_events" => ti::query_events::op_query_events(path, args),
+        "follow_path" => ti::follow_path::op_follow_path(path, args),
+        "profile_loader" => ti::profile_loader::op_profile_loader(path, args),
+        _ => return Err(format!("trace/read: unknown op \"{op}\"")),
+    };
+    out.map_err(|e| e.to_string())
 }
 
-/// Resolve the `tsx` runner: prefer the one vendored under tools/oracle/node_modules
-/// (per the Interim-A spec), else bare `tsx` on PATH.
-fn resolve_tsx(root: &std::path::Path) -> PathBuf {
-    let vendored = root.join("tools").join("oracle").join("node_modules").join(".bin").join("tsx");
-    if vendored.exists() {
-        vendored
-    } else {
-        PathBuf::from("tsx")
-    }
+/// Honest index state for a `.duckdb` store: `(indexed, indexing, error)`.
+///
+/// Spec 802 §2 defect (4) / R4 §A.4-3: `indexed` used to be a bare
+/// `Path::exists()`, so a truncated or failed build still reported `true`. With the
+/// indexer in-process the job registry knows the truth — a store counts as indexed
+/// only when the file is there, no build is in flight, and the last build for it
+/// did not fail.
+fn index_state(duckdb_path: &str) -> (bool, bool, Option<String>) {
+    let p = std::path::Path::new(duckdb_path);
+    let indexing = trx64_traceindex::is_indexing(p);
+    let error = trx64_traceindex::index_error(p);
+    let indexed = p.exists() && !indexing && error.is_none();
+    (indexed, indexing, error)
 }
 
-/// Run a `trace/read` op via the Node sidecar. `duckdb_path` is the `.duckdb` INDEX
-/// path (built lazily from its `.c64retrace` sibling on first read — covers misc-1).
-/// `op` + `args` mirror the WS `trace/read` params exactly. Returns the op's JSON
-/// result, or an `Err(message)` (sidecar/Node missing, op error, malformed output) —
-/// the caller maps that to a clean WS error, NEVER a panic.
-fn run_trace_read_sidecar(op: &str, duckdb_path: &str, args: &Value) -> Result<Value, String> {
-    let root = trx64_root();
-    let sidecar = root.join("tools").join("trace-read-sidecar").join("sidecar.ts");
-    if !sidecar.exists() {
-        return Err(format!(
-            "trace/read sidecar not found at {} — the Node trace-read sidecar is required for trace analysis (set TRX64_ROOT or build the native reader).",
-            sidecar.display()
-        ));
-    }
-    let tsx = resolve_tsx(&root);
-    let c64re_root = std::env::var("C64RE_ROOT")
-        .unwrap_or_else(|_| "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP".to_string());
-    let args_json = serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string());
-
-    let output = std::process::Command::new(&tsx)
-        .arg(&sidecar)
-        .arg(op)
-        .arg("--duckdb")
-        .arg(duckdb_path)
-        .arg("--args")
-        .arg(&args_json)
-        // Run from the c64re root so the sidecar's c64re/@duckdb imports resolve, and
-        // pass C64RE_ROOT explicitly (the sidecar also reads it directly).
-        .current_dir(&c64re_root)
-        .env("C64RE_ROOT", &c64re_root)
-        .output()
-        .map_err(|e| {
-            format!(
-                "trace/read sidecar spawn failed ({}): {e} — Node/tsx is required for trace analysis (looked for tsx at {}).",
-                op,
-                tsx.display()
-            )
-        })?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let last_line = stdout.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
-    if last_line.is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "trace/read sidecar produced no output (op={op}, status={}): {}",
-            output.status,
-            stderr.lines().rev().take(3).collect::<Vec<_>>().join(" | ")
-        ));
-    }
-    let parsed: Value = serde_json::from_str(last_line)
-        .map_err(|e| format!("trace/read sidecar emitted non-JSON (op={op}): {e}: {last_line}"))?;
-    // The sidecar reports op failures as {"error": "..."} + a non-zero exit.
-    if let Some(err) = parsed.get("error").and_then(|v| v.as_str()) {
-        return Err(err.to_string());
-    }
-    if !output.status.success() {
-        return Err(format!("trace/read sidecar exited non-zero (op={op}): {last_line}"));
-    }
-    Ok(parsed)
-}
-
-/// Resolve the `.duckdb` index path the sidecar should read for the CURRENT trace
+/// Resolve the `.duckdb` index path the native reader should read for the CURRENT trace
 /// (active or last-finalized), so trace/read + the monitor map/swimlane/taint verbs
 /// + the runtime/call trace methods all target the same store. Returns None when no
 /// trace has ever run (= TS "no trace store"). Mirrors trace/current's path logic.
@@ -4991,7 +5001,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
         // The TS DAEMON wires a `traceRead` bridge backed by a DuckDB trace store;
         // monitor-shell parses the verb args then calls ctx.traceRead(op, args)
         // (ws-server.ts:2104-2129, monitor-shell.ts:1116-1178). TRX64 routes the SAME
-        // reads through the Node sidecar (the c64re indexer + v2 readers), keyed on
+        // reads through the NATIVE reader (`trx64-traceindex`, Spec 802), keyed on
         // the CURRENT trace store (active or last-finalized). With NO trace store the
         // verbs return the IDENTICAL daemon-shaped error.
         //
@@ -5003,7 +5013,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             }
             match current_trace_duckdb(st) {
                 None => Err("map: no trace store — run `trace on` first".into()),
-                Some(db) => match run_trace_read_sidecar("map", &db, &json!({ "cpu": cpu })) {
+                Some(db) => match trace_read_native("map", &db, &json!({ "cpu": cpu })) {
                     Ok(v) => Ok(v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string()),
                     Err(e) => Err(format!("map: {e}")),
                 },
@@ -5022,20 +5032,20 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             }
             match current_trace_duckdb(st) {
                 None => Err("taint: no trace store — run `trace on` first".into()),
-                Some(db) => match run_trace_read_sidecar("taint_text", &db, &args) {
+                Some(db) => match trace_read_native("taint_text", &db, &args) {
                     Ok(v) => Ok(v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string()),
                     Err(e) => Err(format!("taint: {e}")),
                 },
             }
         }
         // `swimlane [list|name] [s] [e]` — trace lanes, newest trace tail by default.
-        // The sidecar serves the CURRENT-store path (default window + explicit
+        // The reader serves the CURRENT-store path (default window + explicit
         // <s>[e]); `list` + `<name>` + the checkpoint-ring/chis fallback need the live
         // ring (not file-derivable) → reported as unsupported here, not faked.
         // `traceindex [path]` — EXPLICITLY build the `.duckdb` index for a `.c64retrace`
         // (the trace-decode gap fix). With no arg it indexes the CURRENT/last trace; an
         // optional path may be the `.c64retrace` or its `.duckdb` sibling. Runs the SAME
-        // sidecar indexer the lazy read path uses, but as an explicit op — so a captured
+        // native indexer the lazy read path uses, but as an explicit op — so a captured
         // trace that `trace_store_info` reported as "no trace.duckdb" becomes queryable.
         // Reports events indexed + the honest bound (the indexer streams oldest→newest
         // with NO event cap; a 1.2 GB trace's oldest events ARE indexed).
@@ -5054,7 +5064,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                         "traceindex: no path given and no trace has run — `trace on` … `trace off` first, or `traceindex <path.c64retrace>`".into()),
                 },
             };
-            match run_trace_read_sidecar("index", &db, &json!({ "wait": true })) {
+            match trace_read_native("index", &db, &json!({ "wait": true })) {
                 Ok(v) => {
                     let events = v.get("eventsIndexed").and_then(|n| n.as_i64());
                     let bounded = v.get("bounded").and_then(|b| b.as_bool()).unwrap_or(false);
@@ -5096,7 +5106,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                     let dbs = path.to_string_lossy();
                     // getInfo over the store (builds the index lazily if absent) → event
                     // count + master-clock span, exactly the TS `list` line shape.
-                    match run_trace_read_sidecar("store_fn", &dbs, &json!({ "fn": "getInfo" })) {
+                    match trace_read_native("store_fn", &dbs, &json!({ "fn": "getInfo" })) {
                         Ok(gi) => {
                             let ev = gi.get("tableCounts")
                                 .and_then(|t| t.get("events:total"))
@@ -5159,7 +5169,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 .unwrap_or("trace")
                 .to_string();
             args["stem"] = json!(stem);
-            match run_trace_read_sidecar("swimlane_text", &db, &args) {
+            match trace_read_native("swimlane_text", &db, &args) {
                 Ok(v) => Ok(v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string()),
                 Err(e) => Err(format!("swimlane: {e}")),
             }
@@ -5168,19 +5178,19 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
         //
         // SOURCE PRIORITY:
         //   1. LIVE ring (`Machine::cpu_history`) — the last N executed instructions,
-        //      always-on, NO trace/finalize/sidecar dependency. This is the USER'S FLOW:
+        //      always-on, NO trace/finalize/index dependency. This is the USER'S FLOW:
         //      they run WITH the trace ON and type `chis` → the ring serves it instantly.
         //      `chis` = last 4000 CYCLES from the ring's newest; `chis <cyc>` = last <cyc>
         //      cycles; `chis <s> <e>` = an explicit cycle window. When the ring covers the
         //      window we render FROM THE RING (the captured opcode bytes + post-instr regs).
-        //   2. FALLBACK to the finalized `.c64retrace` via the sidecar (the historical path,
+        //   2. FALLBACK to the finalized `.c64retrace` via the trace reader (the historical path,
         //      commit 57c9191) when the ring is empty OR the requested explicit window is
         //      OLDER than the ring covers (history beyond the live window).
         //   3. Honest error when neither source has the data.
         "chis" => {
             let a1 = toks.get(1).map(|s| s.as_str());
             let is_num = |t: Option<&str>| t.map(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).unwrap_or(false);
-            // Parse the (cycle-based) request, mirroring the historical sidecar args.
+            // Parse the (cycle-based) request, mirroring the historical reader args.
             let explicit_window: Option<(u64, u64)> = if is_num(a1) && is_num(toks.get(2).map(|s| s.as_str())) {
                 Some((
                     a1.unwrap().parse::<u64>().unwrap_or(0),
@@ -5238,7 +5248,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             };
             let exhaustion = st.session.machine.ring_exhaustion(!asked_older_than_ring);
 
-            // ── 2. Fallback: the finalized `.c64retrace` (historical) via the sidecar. ─
+            // ── 2. Fallback: the finalized `.c64retrace` (historical) via the reader. ──
             let mut args = if let Some((s, e)) = explicit_window {
                 json!({ "cycle_start": s as i64, "cycle_end": e as i64 })
             } else {
@@ -5262,7 +5272,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                         .unwrap_or("trace")
                         .to_string();
                     args["stem"] = json!(stem);
-                    match run_trace_read_sidecar("swimlane_text", &db, &args) {
+                    match trace_read_native("swimlane_text", &db, &args) {
                         Ok(v) => Ok(v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string()),
                         Err(e) => Err(format!("chis: {e}")),
                     }
@@ -5998,11 +6008,12 @@ fn parse_hex(tok: &str) -> Option<u32> {
 /// reverse-debug Phase 1c — slice the always-on full-delta ring for the cycle window
 /// `[cycle_start, cycle_end]` and DUMP it into a `.c64retrace` using the SAME binary
 /// record format the live trace writes (`FrameSink::write_delta_entry` → CPU_STEP 0x10
-/// + RAM_WRITE 0x11), so the file is read by the existing sidecar path (swimlane / map
+/// + RAM_WRITE 0x11), so the file is read by the native reader path (swimlane / map
 /// / taint) identically to a finalized live trace. Backs both `trace/build_from_ring`
 /// (WS) and the monitor `buildtrace` verb (one path, no format invention).
 ///
-/// The `.duckdb` index is left LAZY (built by the sidecar on first read), and
+/// The `.duckdb` index is left LAZY (Spec 802: built IN-PROCESS by the native reader
+/// on first read via `ensure_index_bounded` — the lazy contract is unchanged), and
 /// `state.last_trace_path` is pointed at it so the monitor map/swimlane/taint/chis verbs
 /// read THIS store immediately. Does NOT disturb an active `trace on` capture (it only
 /// touches `last_trace_path`, not `session.trace`).
@@ -6067,7 +6078,7 @@ fn build_trace_from_ring(
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
-    // Remove any stale sibling .duckdb so the sidecar rebuilds the index from THIS fresh
+    // Remove any stale sibling .duckdb so the reader rebuilds the index from THIS fresh
     // .c64retrace (the indexer only builds when the .duckdb is absent).
     let _ = std::fs::remove_file(&duckdb_path);
     std::fs::write(&retrace_path, &bytes)
@@ -6139,14 +6150,33 @@ fn finalize_trace(st: &mut State, background_index: bool) -> (Value, Value) {
             // Trace-decode gap fix (2026-07-10): on trace-off, kick the `.duckdb` index
             // build in the BACKGROUND so a finalized trace is queryable WITHOUT an opt-in
             // flag or a manual `trace/index` — mirroring the retired TS stop() which ALWAYS
-            // indexed. The sidecar decode is minutes on a large `.c64retrace`, so it runs on
-            // a detached thread and must not block the stop RPC. Skipped when the caller will
-            // index synchronously (trace/run/stop wait_index=true) to avoid a double build of
-            // the same store. Soft: an index failure leaves the re-indexable `.c64retrace`.
+            // indexed. The decode is minutes on a large `.c64retrace`, so it runs on its own
+            // OS thread and must not block the stop RPC (nor the async executor: DuckDB is a
+            // blocking C++ library). Skipped when the caller will index synchronously
+            // (trace/run/stop wait_index=true) to avoid a double build of the same store.
+            //
+            // Spec 802 goal 5 — HONEST FAILURE. This used to be
+            // `std::thread::spawn(|| { let _ = …; })`: the `Result` was dropped on a
+            // detached thread with no channel back to `State`, so capture reported success
+            // on data nobody could read and the failure surfaced later, somewhere else.
+            // `start_background_index` records the outcome in the reader's job registry
+            // (keyed by store path, and it refuses to start a second builder for the same
+            // target), so `trace/current` + `trace/run/status` now report the REAL state:
+            // `indexed:false` + `indexError:"…"` instead of a bare `Path::exists()`. The
+            // failure is also logged to stderr by the builder thread itself.
             if background_index {
-                std::thread::spawn(move || {
-                    let _ = run_trace_read_sidecar("index", &duckdb_path, &json!({ "wait": true }));
-                });
+                let retrace = trx64_traceindex::retrace_path_for(std::path::Path::new(&duckdb_path));
+                // NOTE (Spec 802 R2 J-3, deliberately NOT enabled here): TRX64 writes no
+                // 0x01 Mark records, so `trace_mark` — and therefore the `anchors` view —
+                // comes out empty for a TRX64-captured trace. `IndexOverrides.marks` is the
+                // zero-format-change fix and `t.marks` is right here, but turning it on
+                // would make the native store differ from a sidecar-built one and muddy the
+                // parity gate. Flip it after the gate passes.
+                let _job = trx64_traceindex::start_background_index(
+                    &retrace,
+                    std::path::Path::new(&duckdb_path),
+                    None,
+                );
             }
             // ws-trace-monitor-misc-23 — return the REAL RuntimeTraceRun descriptor
             // (trace-run.ts stop()): the run's own definitionId (NOT a hardcoded
@@ -7029,9 +7059,9 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
         // with NO `traceBackend` wired (ws-server.ts:1720), so EVERY one of these
         // throws "traceBackend not configured" (agent-api.ts:107…124) — verified
         // against the live TS daemon. The REAL trace-read surface is `trace/read`
-        // (now sidecar-backed). So for byte-faithful parity these methods are HANDLED
-        // (not method-not-found) but return the IDENTICAL "traceBackend not
-        // configured" error TS does — routing them to the sidecar would DIVERGE
+        // (Spec 802: natively backed). So for byte-faithful parity these methods are
+        // HANDLED (not method-not-found) but return the IDENTICAL "traceBackend not
+        // configured" error TS does — routing them to the reader would DIVERGE
         // (TRX64 succeeding where TS errors = fake-green). Use `trace/read` op=
         // query_events / swimlane / follow_path / taint / profile_loader instead.
         "queryEvents" | "followPath" | "swimlaneSlice" | "traceTaint" | "profileLoader" => {
@@ -9014,10 +9044,18 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
         // ── media/* ──────────────────────────────────────────────────────────
 
         "media/list_paths" => {
+            // Spec 802 §5.5 — no author paths. `C64RE_ROOT` wins; otherwise the
+            // source-tree-relative sibling checkout (DEV_C64RE_ROOT), which simply
+            // reports exists:false when it is not there.
             let c64re_root = std::env::var("C64RE_ROOT")
-                .unwrap_or_else(|_| "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP".to_string());
+                .unwrap_or_else(|_| DEV_C64RE_ROOT.to_string());
             let samples_path = format!("{c64re_root}/samples");
-            let downloads_path = format!("{}/Downloads", std::env::var("HOME").unwrap_or_else(|_| "/Users/alex".to_string()));
+            // HOME (POSIX) / USERPROFILE (Windows). With neither set, report the
+            // Downloads root as absent rather than inventing somebody's home dir.
+            let home = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_default();
+            let downloads_path = if home.is_empty() { String::new() } else { format!("{home}/Downloads") };
             let project_path = std::env::args()
                 .skip_while(|a| a != "--project")
                 .nth(1)
@@ -9100,35 +9138,39 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 entries.push(entry_obj);
             }
 
-            // Sort using Node.js localeCompare to match TS browseDir's sort((a,b)=>a.localeCompare(b)).
-            // ICU collation (used by Node) differs from Rust's Unicode ordering for filenames with
-            // punctuation, brackets, underscores — we can't replicate it without ICU.
-            let names: Vec<String> = entries.iter()
-                .filter_map(|e| e["name"].as_str().map(str::to_string))
-                .collect();
-            let names_json = serde_json::to_string(&names).unwrap_or_else(|_| "[]".into());
-            let sorted_names: Vec<String> = std::process::Command::new("node")
-                .arg("-e")
-                .arg(format!(
-                    "const n={names_json}; console.log(JSON.stringify(n.sort((a,b)=>a.localeCompare(b))));"
-                ))
-                .output()
-                .ok()
-                .and_then(|out| serde_json::from_slice::<Vec<String>>(&out.stdout).ok())
-                .unwrap_or_else(|| {
-                    // Fallback: case-insensitive ASCII sort
-                    let mut ns = names.clone();
-                    ns.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
-                    ns
-                });
-            // Rebuild entries in sorted order
-            let mut name_to_entry: std::collections::HashMap<String, Value> = entries
-                .into_iter()
-                .map(|e| (e["name"].as_str().unwrap_or("").to_string(), e))
-                .collect();
-            entries = sorted_names.into_iter()
-                .filter_map(|n| name_to_entry.remove(&n))
-                .collect();
+            // ── Ordering: TRX64's own, sorted natively (Spec 802 §4.2) ────────────
+            //
+            // This used to shell out — `node -e "…n.sort((a,b)=>a.localeCompare(b))…"` —
+            // to imitate the TS `browseDir`'s ICU collation, because Rust's ordering
+            // differs and we had no ICU. Matching TS was right while TS was the golden
+            // implementation; it no longer is, so TRX64's order is now AUTHORITATIVE and
+            // the spawn is gone — it was the daemon's LAST child process (Spec 802 §5.4:
+            // the daemon sources must contain no process-spawn construction at all).
+            //
+            // The spawn was worse than it looked, which is why the fallback goes too:
+            //   • it was a SECOND hidden Node dependency, and it DEGRADED to an ASCII
+            //     sort instead of failing — so on every machine without Node the listing
+            //     silently used a different order and nobody noticed;
+            //   • its result was locale-dependent (LANG/LC_ALL in the daemon's env), so
+            //     the "authoritative" order already varied between machines;
+            //   • rebuilding `entries` by looking names up in a HashMap silently DROPPED
+            //     any entry missing from the child's stdout — a partial/garbled reply
+            //     that still parsed as Vec<String> shortened the browse listing.
+            //
+            // TRX64's rule, documented and stable everywhere:
+            //   1. compare names case-insensitively, so `Apple.g64` and `apple.g64` sit
+            //      together instead of being split by ASCII case;
+            //   2. tie-break on the raw name, so names equal-ignoring-case get a
+            //      DETERMINISTIC order rather than inheriting `read_dir`'s
+            //      filesystem-enumeration order.
+            // Dirs and files stay interleaved (unchanged). No ICU, no locale, no child
+            // process, no name round-trip: the same directory yields the same listing on
+            // every platform.
+            entries.sort_by(|a, b| {
+                let an = a["name"].as_str().unwrap_or("");
+                let bn = b["name"].as_str().unwrap_or("");
+                an.to_lowercase().cmp(&bn.to_lowercase()).then_with(|| an.cmp(bn))
+            });
 
             Response::ok(id, json!({
                 "path": canonical,
@@ -10233,10 +10275,10 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
         // 10 s delta ring for the entries whose cycle ∈ [cycle_start, cycle_end] and
         // ENCODES them into a `.c64retrace` using the SAME binary record format the live
         // trace writes (FrameSink::write_delta_entry → CPU_STEP 0x10 + RAM_WRITE 0x11),
-        // so the file is read by the EXISTING sidecar path (swimlane / map / taint)
+        // so the file is read by the EXISTING native reader path (swimlane / map / taint)
         // identically to a finalized live trace. No whole-run capture, no cycle guessing.
         //
-        // The `.duckdb` index is left LAZY (built by the sidecar on first read, exactly
+        // The `.duckdb` index is left LAZY (built by the native reader on first read, exactly
         // like a finalized trace), and `state.last_trace_path` is pointed at it so the
         // monitor map/swimlane/taint/chis verbs read THIS store immediately.
         //
@@ -10338,7 +10380,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             );
             // resolveSnapshotPath roots a RELATIVE output under the project dir (= TS
             // resolveSnapshotPath). Without this the default `traces/<def>_<ts>.duckdb`
-            // was a bare relative path the cwd-agnostic sidecar/readers could not find,
+            // was a bare relative path the cwd-agnostic readers could not find,
             // so a trace/run/start capture was unreadable (trace/read "no trace store").
             let output = output.unwrap_or_else(|| {
                 let rel = format!("traces/{}_{}.duckdb", definition_id, now36);
@@ -10477,37 +10519,48 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 } else {
                     retrace.into_owned()
                 };
-                // Honest index status: does the `.duckdb` exist on disk yet? An active
-                // trace has not been finalized, so the index is built lazily on the
-                // first read (or by `trace/index`) — caller can decide to index now.
-                let indexed = std::path::Path::new(&duckdb_path).exists();
-                Response::ok(id, json!({
+                // Honest index status (Spec 802 R4 §A.4-3). This was a bare
+                // `Path::exists()`, so a half-written or failed index still reported
+                // `indexed:true`. The indexer is in-process now, so the job registry
+                // knows whether a build is in flight and whether the last one failed.
+                let (indexed, indexing, index_error) = index_state(&duckdb_path);
+                let mut out = json!({
                     "path": duckdb_path,
                     "duckdbPath": duckdb_path,
                     "retracePath": t.retrace_path.to_string_lossy(),
                     "runId": t.run_id,
                     "active": true,
-                    "indexing": false,
+                    "indexing": indexing,
                     "indexed": indexed,
-                }))
+                });
+                if let Some(e) = index_error {
+                    out["indexError"] = json!(e);
+                }
+                Response::ok(id, out)
             } else if let (Some(path), Some(run_id)) = (&st.last_trace_path, &st.last_run_id) {
                 // Finalized trace: report whether the `.duckdb` index has been built
-                // (auto-index on stop, an earlier read, or an explicit `trace/index`).
+                // (auto-index on stop, an earlier read, or an explicit `trace/index`) —
+                // and, when the background build FAILED, say so instead of claiming the
+                // store is there (Spec 802 goal 5).
                 let retrace_path = if path.ends_with(".duckdb") {
                     format!("{}.c64retrace", &path[..path.len() - ".duckdb".len()])
                 } else {
                     format!("{path}.c64retrace")
                 };
-                let indexed = std::path::Path::new(path).exists();
-                Response::ok(id, json!({
+                let (indexed, indexing, index_error) = index_state(path);
+                let mut out = json!({
                     "path": path,
                     "duckdbPath": path,
                     "retracePath": retrace_path,
                     "runId": run_id,
                     "active": false,
-                    "indexing": false,
+                    "indexing": indexing,
                     "indexed": indexed,
-                }))
+                });
+                if let Some(e) = index_error {
+                    out["indexError"] = json!(e);
+                }
+                Response::ok(id, out)
             } else {
                 Response::ok(id, json!({ "path": Value::Null }))
             }
@@ -10515,9 +10568,9 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
 
         // trace/index — EXPLICITLY build the `.duckdb` index for a `.c64retrace` (the
         // trace-decode gap fix). `trace_store_info` and any reader that opens the
-        // `.duckdb` DIRECTLY never trigger the sidecar's lazy-on-read build, so a
+        // `.duckdb` DIRECTLY never trigger the reader's lazy-on-read build, so a
         // captured-but-unindexed trace looks like "directory has no trace.duckdb".
-        // This method runs the SAME sidecar indexer the lazy path uses, but as an
+        // This method runs the SAME native indexer the lazy path uses, but as an
         // explicit op that returns { duckdbPath, eventsIndexed, bounded, boundedFrom,
         // cap, indexedFromOldest } WITHOUT running an analysis query.
         //
@@ -10550,10 +10603,10 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                     },
                 }
             };
-            // Lock is released before shelling out to the sidecar (the index build can
-            // take minutes on a multi-GB trace — never hold the session mutex for it).
+            // Lock is released before the build (it can take minutes on a multi-GB
+            // trace — never hold the session mutex for it).
             let wait = req.params.get("wait").and_then(|v| v.as_bool()).unwrap_or(true);
-            match run_trace_read_sidecar("index", &duckdb_path, &json!({ "wait": wait })) {
+            match trace_read_native("index", &duckdb_path, &json!({ "wait": wait })) {
                 Ok(v) => Response::ok(id, v),
                 Err(e) => Response::err(id, -32001, e),
             }
@@ -10565,7 +10618,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             // finalized trace is immediately queryable by BOTH trace/read AND any reader
             // that opens the `.duckdb` directly (trace_store_info) — not only after a
             // lazy first read. finalize_trace writes the `.c64retrace` + sets
-            // last_trace_path; we then index its sibling via the same sidecar path.
+            // last_trace_path; we then index its sibling in-process.
             let wait_index = req.params.get("wait_index").and_then(|v| v.as_bool()).unwrap_or(false);
             let (status, duckdb_path) = {
                 let mut st = state.lock().unwrap();
@@ -10577,12 +10630,28 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             if wait_index {
                 if let Some(db) = duckdb_path {
                     // wait=true → run the decode to completion so the store is ready on
-                    // return. Soft-fail: a sidecar/index error must NOT break trace stop
-                    // (the `.c64retrace` authority is on disk + re-indexable); surface it
-                    // as an `index` field, not an RPC error.
-                    match run_trace_read_sidecar("index", &db, &json!({ "wait": true })) {
+                    // return.
+                    //
+                    // Spec 802 goal 5 — LOUD FAILURE. This used to annotate the OK
+                    // response with `out.index = {ok:false, error}` and still return
+                    // `Response::ok`; the C64RE consumer destructures only `{ run }`, so
+                    // the failure was invisible on both sides and `trace_finalize` reported
+                    // success on a store nobody could query. `wait_index:true` is the
+                    // caller EXPLICITLY asking for a queryable store — if it is not
+                    // queryable, the request failed. The `.c64retrace` authority is still
+                    // on disk and re-indexable, so the error says exactly that and names
+                    // the path + `trace/index` as the retry.
+                    match trace_read_native("index", &db, &json!({ "wait": true })) {
                         Ok(v) => { out["index"] = v; }
-                        Err(e) => { out["index"] = json!({ "ok": false, "error": e, "duckdbPath": db }); }
+                        Err(e) => {
+                            let retrace = trx64_traceindex::retrace_path_for(std::path::Path::new(&db));
+                            return Response::err(id, -32001, format!(
+                                "trace/run/stop: the trace was finalized but its index build FAILED, \
+                                 so the store is NOT queryable: {e} — the capture itself is intact at \
+                                 {} and can be re-indexed with `trace/index` (retrace_path).",
+                                retrace.display()
+                            ));
+                        }
                     }
                 }
             }
@@ -10598,7 +10667,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             // binary sink (binary:true) actively recording (capturing:true) with no
             // queue overflow (overflowed:false = TS `a.binary ? false : a.overflow`).
             let st = state.lock().unwrap();
-            let status = match &st.session.trace {
+            let mut status = match &st.session.trace {
                 Some(t) => json!({
                     "active": true,
                     "runId": t.run_id,
@@ -10613,6 +10682,23 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 }),
                 None => json!({ "active": false }),
             };
+            // Spec 802 goal 5 — the background index kicked by `finalize_trace` runs on
+            // its own thread and returns nothing to the stop RPC. When it FAILED, say so
+            // here (additive fields; absent while the build is fine or still running) so
+            // the failure cannot stay invisible until some later reader trips over it.
+            if st.session.trace.is_none() {
+                if let Some(db) = &st.last_trace_path {
+                    let (_indexed, indexing, index_error) = index_state(db);
+                    if indexing {
+                        status["indexing"] = json!(true);
+                        status["duckdbPath"] = json!(db);
+                    }
+                    if let Some(e) = index_error {
+                        status["indexError"] = json!(e);
+                        status["duckdbPath"] = json!(db);
+                    }
+                }
+            }
             Response::ok(id, status)
         }
 
@@ -10976,23 +11062,31 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             Response::ok(id, result)
         }
 
-        // trace/read — read a trace store IN/ALONGSIDE the daemon (audit misc-0).
-        // 1:1 with the c64re ws-server.ts:1302-1377 handler: params { op, duckdb_path,
-        // args }. TRX64 has no native DuckDB reader yet, so it shells out to the Node
-        // sidecar that imports the EXISTING c64re indexer + v2 readers (byte-identical
-        // by construction). The index is built lazily from the `.c64retrace`
-        // authority on first read (covers misc-1: no index at trace stop).
+        // trace/read — read a trace store IN the daemon (Spec 802). Params
+        // { op, duckdb_path, args }. The reader is NATIVE (`trx64-traceindex`,
+        // statically-bundled DuckDB): no Node, no C64RE checkout, no spawn. The index
+        // is built lazily from the `.c64retrace` authority on first read (covers
+        // misc-1: no index at trace stop).
         "trace/read" => {
             let op = match req.params.get("op").and_then(|v| v.as_str()) {
                 Some(s) => s.to_string(),
                 None => return Response::err(id, -32602, "trace/read: op required"),
             };
+            // `op` used to be forwarded unvalidated. Reject an unknown op as a PARAMS
+            // error (-32602) instead of letting it travel to the reader and come back as
+            // a generic runtime failure; the message enumerates the surface.
+            if !TRACE_READ_OPS.contains(&op.as_str()) {
+                return Response::err(id, -32602, format!(
+                    "trace/read: unknown op \"{op}\" — supported: {}",
+                    TRACE_READ_OPS.join(", ")
+                ));
+            }
             let duckdb_path = match req.params.get("duckdb_path").and_then(|v| v.as_str()) {
                 Some(s) if !s.is_empty() => s.to_string(),
                 _ => return Response::err(id, -32602, "trace/read: duckdb_path required"),
             };
             let args = req.params.get("args").cloned().unwrap_or(json!({}));
-            match run_trace_read_sidecar(&op, &duckdb_path, &args) {
+            match trace_read_native(&op, &duckdb_path, &args) {
                 Ok(v) => Response::ok(id, v),
                 Err(e) => Response::err(id, -32001, e),
             }
@@ -15510,7 +15604,7 @@ mod batch1_tests {
 
     #[test]
     fn trace_read_validates_params() {
-        // trace/read is now IMPLEMENTED (Node sidecar, audit misc-0): it no longer
+        // trace/read is now IMPLEMENTED (native reader, Spec 802): it no longer
         // returns NOT_IMPLEMENTED. With no `op`/`duckdb_path` it rejects with the
         // param-error contract (-32602), the same shape the c64re WS handler uses.
         let st = make_state();

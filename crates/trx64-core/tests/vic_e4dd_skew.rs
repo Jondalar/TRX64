@@ -39,7 +39,7 @@
 use std::path::Path;
 use trx64_core::{BusKind, Machine, Observer};
 
-const ROM_DIR: &str = "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/resources/roms";
+const ROM_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/resources/roms");
 
 #[derive(Default)]
 struct Sink {

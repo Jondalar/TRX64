@@ -1,0 +1,53 @@
+# trx64-traceindex — Spec 802: the NATIVE `.c64retrace` reader + DuckDB indexer.
+#
+# WHY A SEPARATE CRATE (and not inside `trx64-trace`):
+#   `trx64-trace` is the WRITE path. It is linked into the emulation hot loop
+#   (it implements `trx64_core::Observer`) and is pulled in by `trx64-session`
+#   → `trx64-daemon` → `trx64-ffi` (the Swift XCFramework staticlib) and by
+#   `trx64-cli`. It has exactly ONE dependency (`trx64-core`) and must keep it:
+#   `bundled` DuckDB is a multi-minute C++ compile and a ~50 MB static archive.
+#   Making every consumer of the ENCODER pay for the QUERY ENGINE is the wrong
+#   trade — and it would make the FFI/staticlib target carry DuckDB forever.
+#
+#   So: this crate is the ONLY place in the workspace that depends on `duckdb`.
+#   It depends on `trx64-trace` for the opcode table / MAGIC / FORMAT_VERSION /
+#   ACCESS_* constants, so the reader and the writer physically cannot drift
+#   (Spec 802 R2 §H: "decode.rs should be shared with — or lifted from — the
+#   writer's opcode table").
+#
+# NO FORMAT CHANGE. This crate only READS `.c64retrace` and WRITES the existing
+# DuckDB index schema (Spec 726 "Shape B": trace_run / trace_event / trace_mark
+# / meta + 5 compat views).
+
+[package]
+name = "trx64-traceindex"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "TRX64 native trace read: .c64retrace streaming reader + DuckDB index builder + query layer (Spec 802)."
+
+[dependencies]
+# The writer — single source of truth for the opcode values + format constants.
+trx64-trace = { path = "../trx64-trace" }
+
+# The query engine. `bundled` compiles DuckDB from source and links it
+# statically: the produced binary needs NO system libduckdb anywhere (the whole
+# point of Spec 802 — works in the slim container, on a clean Windows clone,
+# with only Rust installed).
+# NOTE the version scheme: duckdb-rs encodes the DuckDB release in its own
+# version (1.10505.0 == DuckDB 1.5.5), so "1.10505" is a normal caret range.
+duckdb = { version = "1.10505", features = ["bundled"] }
+
+# Header meta parsing (`meta_json`) + the reader ops' JSON result shapes.
+# NOTE: `data_json` is built by a hand-rolled writer in `rows.rs`, NOT by
+# serde_json — key ORDER and integer formatting are part of the parity contract
+# and serde_json's default map is alphabetically ordered.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# The integration test builds byte-exact `.c64retrace` fixtures and then reads
+# the produced store back with a plain connection. Same crate + features as
+# above (cargo unifies them), so this adds no build cost.
+duckdb = { version = "1.10505", features = ["bundled"] }
+serde_json = "1"

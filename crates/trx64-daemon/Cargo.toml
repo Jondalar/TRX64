@@ -20,6 +20,10 @@ trx64-core = { path = "../trx64-core" }
 trx64-static = { path = "../trx64-static" }
 trx64-trace = { path = "../trx64-trace" }
 trx64-session = { path = "../trx64-session" }
+# Spec 802 — NATIVE trace read. The daemon reads `.c64retrace` + queries the
+# DuckDB index in-process; no `tsx` sidecar, no Node, no C64RE source tree.
+# This is the ONLY crate that pulls in DuckDB (statically bundled).
+trx64-traceindex = { path = "../trx64-traceindex" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

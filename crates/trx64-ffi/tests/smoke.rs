@@ -15,7 +15,7 @@ use trx64_ffi::{EventListener, JoystickState, Pacing, Runtime, RuntimeEvent};
 
 fn rom_dir() -> std::path::PathBuf {
     let root = std::env::var("C64RE_ROOT")
-        .unwrap_or_else(|_| "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP".to_string());
+        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP").to_string());
     std::path::PathBuf::from(root).join("resources").join("roms")
 }
 

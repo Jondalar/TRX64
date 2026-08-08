@@ -42,7 +42,7 @@ pub fn default_rom_dir() -> std::path::PathBuf {
     candidates.push(PathBuf::from("roms"));
     // 4. Dev fallback: the in-tree C64RE checkout.
     candidates.push(
-        PathBuf::from("/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP")
+        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP"))
             .join("resources")
             .join("roms"),
     );

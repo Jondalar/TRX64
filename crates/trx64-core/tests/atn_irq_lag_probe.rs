@@ -12,9 +12,9 @@ use std::path::Path;
 use trx64_core::drive::{DiskImage, DiskKind};
 use trx64_core::{Machine, NullSink};
 
-const ROM_DIR: &str = "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/resources/roms";
+const ROM_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/resources/roms");
 const SAMPLE: &str =
-    "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/scramble_infinity.d64";
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/samples/scramble_infinity.d64");
 
 fn roms_present() -> bool {
     let d = Path::new(ROM_DIR);
@@ -255,7 +255,7 @@ fn scramble_run_trace() {
                 for px in rgba.chunks(4) {
                     ppm.extend_from_slice(&px[..3]);
                 }
-                let p = format!("/Users/alex/Development/C64/Tools/TRX64/traces/scramble_trx64_+{}M.ppm", shot + 1);
+                let p = format!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../traces/scramble_trx64_+{}M.ppm"), shot + 1);
                 std::fs::write(&p, &ppm).ok();
                 eprintln!("  snapshot +{}M: PC=${:04X} D011=${:02X} distinct_colors={}", shot + 1, m.cpu6510.reg_pc, m.read_full(0xD011), dc.len());
             }
@@ -281,7 +281,7 @@ fn scramble_run_trace() {
             ppm.push(px[1]);
             ppm.push(px[2]);
         }
-        let out = "/Users/alex/Development/C64/Tools/TRX64/traces/scramble_trx64.ppm";
+        let out = concat!(env!("CARGO_MANIFEST_DIR"), "/../../traces/scramble_trx64.ppm");
         std::fs::write(out, &ppm).expect("write ppm");
         // Distinct non-grey pixels = the title art rendered (not a blank screen).
         let mut distinct_colors = std::collections::HashSet::new();

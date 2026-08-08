@@ -39,9 +39,9 @@ use trx64_core::drive::{DiskImage, DiskKind, Drive1541};
 use std::path::Path;
 
 const ROM_DIR: &str =
-    "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/resources/roms";
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/resources/roms");
 const SAMPLE: &str =
-    "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/scramble_infinity.d64";
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/samples/scramble_infinity.d64");
 
 /// D64 linear byte offset of track 18, sector 0 (zones 21/19/18/17 sectors/track).
 fn d64_t18s0_off() -> usize {

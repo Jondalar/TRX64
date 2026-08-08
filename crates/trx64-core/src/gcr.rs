@@ -1211,7 +1211,7 @@ mod tests {
     /// and a 0xff sync run exists (real disks always have sync marks).
     #[test]
     fn from_g64_real_sample_motm() {
-        let path = "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/motm.g64";
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/samples/motm.g64");
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
             Err(_) => return, // skip without sample
@@ -1237,7 +1237,7 @@ mod tests {
     /// 7-game .g64 milestone — every game image must at least MOUNT.
     #[test]
     fn from_g64_scans_all_samples() {
-        let dir = "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples";
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/samples");
         let rd = match std::fs::read_dir(dir) {
             Ok(rd) => rd,
             Err(_) => return, // skip without sample dir

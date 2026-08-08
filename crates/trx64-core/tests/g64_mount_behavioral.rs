@@ -16,8 +16,8 @@ use std::path::Path;
 use trx64_core::drive::{DiskImage, DiskKind};
 use trx64_core::{Machine, NullSink};
 
-const ROM_DIR: &str = "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/resources/roms";
-const SAMPLE: &str = "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/motm.g64";
+const ROM_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/resources/roms");
+const SAMPLE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/samples/motm.g64");
 const OUT_PNG: &str = "/tmp/trx64_motm_title.png";
 const OUT_PNG_EARLY: &str = "/tmp/trx64_motm_early.png";
 

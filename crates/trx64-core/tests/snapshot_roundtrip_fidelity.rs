@@ -33,7 +33,7 @@ use trx64_core::native_snapshot::{
 };
 use trx64_core::{BusKind, Machine, Observer};
 
-const ROM_DIR: &str = "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/resources/roms";
+const ROM_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/resources/roms");
 const N_CYCLES: u64 = 200_000;
 
 fn roms_present() -> bool {

@@ -947,7 +947,7 @@ mod tests {
     use std::path::Path;
     use trx64_core::RunStop;
 
-    const ROM_DIR: &str = "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/resources/roms";
+    const ROM_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/resources/roms");
 
     fn roms_present() -> bool {
         Path::new(ROM_DIR).join("kernal-901227-03.bin").exists()

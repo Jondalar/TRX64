@@ -23,9 +23,9 @@ use std::path::Path;
 use trx64_core::drive::{DiskImage, DiskKind};
 use trx64_core::{Machine, NullSink};
 
-const ROM_DIR: &str = "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/resources/roms";
-const SAMPLES: &str = "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples";
-const TRACES: &str = "/Users/alex/Development/C64/Tools/TRX64/traces";
+const ROM_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/resources/roms");
+const SAMPLES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/samples");
+const TRACES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../traces");
 
 fn roms_present() -> bool {
     let d = Path::new(ROM_DIR);

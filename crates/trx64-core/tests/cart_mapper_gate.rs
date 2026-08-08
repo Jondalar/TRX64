@@ -437,9 +437,9 @@ fn machine_no_cart_memconfig_unchanged() {
 
 // ── BEHAVIORAL: a real Magic Desk CRT boots into the cart ─────────────────────
 
-const ROM_DIR: &str = "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/resources/roms";
+const ROM_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/resources/roms");
 const MD_SAMPLE: &str =
-    "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/im3_MAGICDESK.crt";
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/samples/im3_MAGICDESK.crt");
 
 #[test]
 #[ignore = "needs ROMs + the im3_MAGICDESK.crt sample; run with --ignored"]
@@ -729,7 +729,7 @@ fn easyflash_writeback_persists_across_image_roundtrip() {
 // ── BEHAVIORAL: a real EasyFlash CRT boots into the cart (ROM-gated) ──────────
 
 const EF_SAMPLE: &str =
-    "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/AccoladeComics_TRX+1D_EF.crt";
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/samples/AccoladeComics_TRX+1D_EF.crt");
 
 #[test]
 #[ignore = "needs ROMs + the AccoladeComics_TRX+1D_EF.crt sample; run with --ignored"]
@@ -794,7 +794,7 @@ fn behavioral_easyflash_boots_into_cart() {
 // ── BEHAVIORAL: a real GMOD2 CRT attaches + the flash/EEPROM build (ROM-gated) ─
 
 const GMOD2_SAMPLE: &str =
-    "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/yeti_mountain_GMOD2.crt";
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/samples/yeti_mountain_GMOD2.crt");
 
 #[test]
 #[ignore = "needs ROMs + the yeti_mountain_GMOD2.crt sample; run with --ignored"]
@@ -862,7 +862,7 @@ fn behavioral_gmod2_boots_into_cart() {
 //   cargo test -p trx64-core --test cart_mapper_gate real_flash_cart_samples -- --ignored --nocapture
 
 const COMMERCIAL_DIR: &str =
-    "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/commercial";
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/samples/commercial");
 
 /// Load every raw flash `.bin` under the gitignored commercial-samples directory,
 /// in a stable (sorted-path) order. Returns the raw bytes only — never the file

@@ -32,10 +32,10 @@ use trx64_core::resid_ffi::ResidConfig;
 use trx64_core::resid_audio::SidAudioEngine;
 use trx64_core::{Machine, NullSink};
 
-const ROM_DIR: &str = "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/resources/roms";
+const ROM_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/resources/roms");
 const SAMPLE: &str =
-    "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/scramble_infinity.d64";
-const OUT_MP4: &str = "/Users/alex/Development/C64/Tools/TRX64/traces/scramble_trx64.mp4";
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/samples/scramble_infinity.d64");
+const OUT_MP4: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../traces/scramble_trx64.mp4");
 const V_RAW: &str = "/tmp/scramble_v.rgba";
 const A_RAW: &str = "/tmp/scramble_a.pcm";
 const FFMPEG: &str = "/opt/homebrew/bin/ffmpeg";

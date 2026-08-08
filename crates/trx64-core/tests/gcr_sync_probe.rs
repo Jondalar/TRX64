@@ -8,9 +8,9 @@
 use std::path::Path;
 use trx64_core::drive::{DiskImage, DiskKind, Drive1541};
 
-const ROM_DIR: &str = "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/resources/roms";
+const ROM_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/resources/roms");
 const SAMPLE: &str =
-    "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/scramble_infinity.d64";
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/samples/scramble_infinity.d64");
 
 fn present() -> bool {
     Path::new(ROM_DIR).join("dos1541-325302-01+901229-05.bin").exists()

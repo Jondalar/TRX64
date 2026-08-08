@@ -464,9 +464,9 @@ fn self_config_specific_discriminator_preempts_magicdesk_fallback() {
 
 // ── REAL-DATA lock gate (gated on ROMs + local `.bin` fixtures) ───────────────
 
-const ROM_DIR: &str = "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/resources/roms";
+const ROM_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/resources/roms");
 const COMMERCIAL_BIN_DIR: &str =
-    "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/samples/commercial";
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/samples/commercial");
 
 #[test]
 #[ignore = "needs ROMs + local samples/commercial/*.bin; run with --ignored --nocapture"]
