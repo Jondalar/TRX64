@@ -167,6 +167,13 @@ fn live_av_pull_api() {
     // First drain installs the capture hook + primes reSID → no cycles yet → empty.
     let primed = rt.audio_drain();
     eprintln!("[smoke] audioDrain #1 (prime): {} samples", primed.len());
+    // The daemon refuses a manual `session/run` while the session free-runs under the
+    // autonomous loop — stepping cycles by hand beside the self-run would double-advance
+    // the CPU. These tests drive exact cycle windows, so they must own the clock. Pause
+    // HERE, not at create_session: `reset` runs the KERNAL to READY and leaves the loop
+    // running again, so an earlier pause is undone. (The guard is newer than the tests;
+    // this is the adjustment it always required.)
+    rt.pause().expect("pause the autonomous loop before driving cycles manually");
     // Run a frame so SID cycles elapse, then drain → non-empty PCM for that window.
     rt.run_cycles(19_656).expect("run_cycles frame");
     let first = rt.audio_drain();
@@ -226,6 +233,13 @@ fn audio_persistent_engine_continuity() {
     // Keeping the chunks lets us distinguish a SEAM delta (last sample of window N →
     // first sample of window N+1) from an INTRA-window delta — the whole point of the
     // continuity check (a per-drain reconstruct injects an outlier at the seams only).
+    // The daemon refuses a manual `session/run` while the session free-runs under the
+    // autonomous loop — stepping cycles by hand beside the self-run would double-advance
+    // the CPU. These tests drive exact cycle windows, so they must own the clock. Pause
+    // HERE, not at create_session: `reset` runs the KERNAL to READY and leaves the loop
+    // running again, so an earlier pause is undone. (The guard is newer than the tests;
+    // this is the adjustment it always required.)
+    rt.pause().expect("pause the autonomous loop before driving cycles manually");
     let mut chunks: Vec<Vec<i16>> = Vec::new();
     let mut stream: Vec<i16> = Vec::new();
     for f in 0..FRAMES {
