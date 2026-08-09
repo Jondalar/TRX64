@@ -1836,6 +1836,14 @@ impl Gmod4Mapper {
         (address & 0x1fff) as u32 + 0x2000 + (self.a22 << 22)
     }
 
+    /// The `$DE00` trampoline: 256 bytes from bank 0, at `$1E00` (context A) or `$1F00`
+    /// (context B). Not banked. This is what lets an NMI/IRQ handler live in I/O space
+    /// and stay reachable no matter what the banking registers currently point at.
+    fn offset_io1(&self, address: u16) -> u32 {
+        let page = if self.context == 0 { 0x1e00 } else { 0x1f00 };
+        (address & 0x00ff) as u32 + page + (self.a22 << 22)
+    }
+
     /// While bitbanging, a ROM window reads the SPI data line in bit 7 instead of flash
     /// contents; with the device deselected the line floats high (a pull-up).
     fn bitbang_read(&self) -> u8 {
@@ -1895,6 +1903,19 @@ impl Gmod4Mapper {
                     self.bitbang_read()
                 } else {
                     self.flash_byte(self.offset_e000(address))
+                })
+            }
+            // IO1. Two quite different jobs share this window: while bitbanging it is the
+            // SPI data line (bit 7) — which is how the vendor's own `spi_read_byte` reads
+            // the flash — and otherwise it is the 256-byte trampoline page.
+            0xde00..=0xdeff => {
+                if !matches!(cfg, 7 | 6 | 5) {
+                    return None;
+                }
+                Some(if self.bitbang {
+                    self.bitbang_read()
+                } else {
+                    self.flash_byte(self.offset_io1(address))
                 })
             }
             _ => None,

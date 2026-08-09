@@ -189,16 +189,13 @@ fn reset_clears_control_but_deliberately_not_the_banking_registers() {
 fn spi_xfer(m: &mut Box<dyn CartMapper>, byte: u8) -> u8 {
     const BITBANG: u8 = 0x01;
     const CS_ACTIVE: u8 = 0x00; // bit 5 low = selected
-    const ROM_OFF: u8 = 0x0e; // disable all three windows while bitbanging
     let mut out = 0u8;
     for i in (0..8).rev() {
         let d = ((byte >> i) & 1) << 6;
-        m.write(CTRL, BITBANG | CS_ACTIVE | ROM_OFF | d, &bi(CFG7), 0); // CLK low
-        // The SPI data line is read back in bit 7 of a ROM window.
-        let mut probe = m.clone_box();
-        probe.write(CTRL, BITBANG | CS_ACTIVE | d, &bi(CFG7), 0); // re-enable $8000 to read
-        out = (out << 1) | (probe.read(0x8000, &bi(CFG7), 0).unwrap_or(0) >> 7);
-        m.write(CTRL, BITBANG | CS_ACTIVE | ROM_OFF | d | 0x80, &bi(CFG7), 0); // CLK high
+        m.write(CTRL, BITBANG | CS_ACTIVE | d, &bi(CFG7), 0); // CLK low
+        // Read DO from $DE00 bit 7 — exactly what the vendor's spi_read_byte does.
+        out = (out << 1) | (m.read(0xde00, &bi(CFG7), 0).unwrap_or(0) >> 7);
+        m.write(CTRL, BITBANG | CS_ACTIVE | d | 0x80, &bi(CFG7), 0); // CLK high
     }
     out
 }
@@ -245,4 +242,25 @@ fn state_round_trips_through_get_set_state() {
         m.get_state().control_register,
         "control register survives a snapshot round trip"
     );
+}
+
+#[test]
+fn io1_is_the_trampoline_page_when_not_bitbanging() {
+    // $DE00 shows 256 bytes from bank 0 at $1E00 (context A) / $1F00 (context B) — the
+    // point being an NMI handler that stays reachable whatever the banking registers say.
+    let mut m = mapper(8);
+    assert_eq!(m.read(0xde00, &bi(CFG7), 0), Some(0), "ctx A ⇒ $1E00, still half-bank 0");
+    m.write(0xde08, 0, &bi(CFG7), 0); // select context B
+    assert_eq!(m.read(0xde00, &bi(CFG7), 0), Some(0), "ctx B ⇒ $1F00, same half-bank");
+    // Banking must not move it.
+    m.write(CTRL, BANKING_ON, &bi(CFG7), 0);
+    m.write(0xde0b, 4, &bi(CFG7), 0);
+    assert_eq!(m.read(0xde00, &bi(CFG7), 0), Some(0), "the trampoline never banks");
+}
+
+#[test]
+fn io1_declines_outside_the_io_visible_configs() {
+    let mut m = mapper(4);
+    assert!(m.read(0xde00, &bi(7), 0).is_some());
+    assert_eq!(m.read(0xde00, &bi(1), 0), None, "falls through to the memory underneath");
 }
