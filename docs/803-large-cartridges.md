@@ -1,6 +1,7 @@
 # Spec 803 — Large cartridges: the SPI-flash family, GMod4, and vendor-sourced fidelity
 
-**Status:** PROPOSED
+**Status:** PARTLY BUILT — §5.1 (SPI flash) and §5.2 (GMod4 mapper) shipped 2026-08-09;
+AGR (§6) and the vendor-question follow-ups (§5.4) remain open.
 **Repo:** TRX64 (cartridge emulation). C64RE is unaffected — new mappers need no meaning-layer
 change.
 **Number:** 803 (shared board `C64ReverseEngineeringMCP/specs/README.md`).
@@ -16,7 +17,7 @@ question in our trait, and one shift in where truth comes from.
 |---|---|---|---|---|---|---|
 | **VICE** (+ the upstream patch) | ✅ | ✅ | 2 MB fork | ✅ | patch, unmerged | ❌ bit stored, unused |
 | **Ultimate-64** | ✅ (2018) | ✅ (`large-cart`, 2026-07) | ❌ | ❌ `CART_NOT_IMPL` | ❌ absent | ❌ |
-| **TRX64** (us) | ✅ | ✅ | ✅ 2 MB | ❌ `Unsupported` | ❌ | ❌ |
+| **TRX64** (us) | ✅ | ✅ | ✅ 2 MB | ⏳ unblocked | ✅ **built** | ❌ deliberate |
 
 Two things fall out of this table:
 
@@ -81,7 +82,17 @@ turns into three concrete sources, in descending order of trust:
 
 ## 5. Scope
 
-### 5.1 The primitive
+### 5.1 The primitive — **BUILT**
+
+`crates/trx64-core/src/spi_flash.rs`, 9 tests. Two details a naive port gets wrong and
+that are now pinned: page program **ANDs** into the image (flash only clears bits; only an
+erase raises them), and the output phase — the device shifts DO on the RISING edge while
+the vendor's `spi_read_byte` samples after the FALLING one, so the host reads the bit
+placed by the PREVIOUS edge and the first data bit of a read appears during the last clock
+of the *address* phase. Our first test made exactly that mistake; the vendor's assembler
+settled it, not our reasoning. GMod3 needs no further primitive work.
+
+Original scope:
 
 Port an **SPI-flash device model** (reference: `src/core/spi-flash.c` in the patch, 129 lines
 added). Must answer JEDEC/ID commands, support read (`$03`), page program (`$02`), write-enable
@@ -89,7 +100,25 @@ added). Must answer JEDEC/ID commands, support read (`$03`), page program (`$02`
 
 Retires our `62 => Unsupported` (GMod3) as a side effect.
 
-### 5.2 GMod4
+### 5.2 GMod4 — **BUILT (except AGR)**
+
+`Gmod4Mapper` in `cart.rs` + `tests/cart_gmod4_gate.rs` (14 tests, including the vendor's
+`$9F` JEDEC identify driven through the cartridge registers into the flash). The one
+change outside the mapper: `CartMapper::fake_ultimax()` (default false) plus the two bus
+fallbacks it gates — our bus showed open bus at `$C000`/`$E000` for a declined window,
+correct for a real ultimax cart and wrong for this one. GMod3 will need the same.
+
+Three things that are easy to get backwards, now pinned by tests: the ROM-enable bits are
+**inverted**; reset deliberately does **not** clear the banking registers (the hardware
+leaves them undefined and the vendor documentation requires software to initialise them,
+so zeroing them would hide that class of bug); and banking-off means the bank bits drop
+out of the address entirely, not "bank 0 selected".
+
+Known limitation, shared with upstream: a `$DE00` write the cart declines lands in our I/O
+shadow where VICE writes RAM underneath. Upstream has an open TODO in the same region
+(intrusive mode should make `$DE00-$DE0F` always reach the register).
+
+Original scope:
 
 CRT hardware type **87** — free in our table, right after MegaByter's 86. (The number has moved
 twice; an older summary says 83. The current patch defines 87.)
