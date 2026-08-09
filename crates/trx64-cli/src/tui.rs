@@ -348,14 +348,19 @@ fn run_loop(term: &mut Term, engine: &Engine, to_main: &Sender<UiToMain>) -> io:
             last_state = Instant::now();
         }
 
-        term.draw(|f| draw(f, &cp))?;
-
         if engine.should_quit() {
             let _ = to_main.send(UiToMain::Quit);
             return Ok(());
         }
 
-        if event::poll(poll)? {
+        // Handle EVERY queued event, then draw once. Drawing first (and handling one
+        // event per iteration) let the visible line lag behind the edit buffer whenever
+        // events arrived faster than frames — which is how a recalled history entry could
+        // be shown while the buffer already held the next one, so Enter ran a command
+        // other than the one on screen.
+        let mut handled_any = false;
+        while event::poll(if handled_any { Duration::from_millis(0) } else { poll })? {
+            handled_any = true;
             match event::read()? {
                 // Mouse wheel scrolls the OUTPUT/LOG pane (offset clamped in draw_log).
                 Event::Mouse(m) => match m.kind {
@@ -365,6 +370,18 @@ fn run_loop(term: &mut Term, engine: &Engine, to_main: &Sender<UiToMain>) -> io:
                 },
                 Event::Key(key) => {
                     if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    // HOST HOTKEY — F10 freezes/resumes, and does so from HERE as well as
+                    // from the emulator window, so the same key works wherever the focus
+                    // happens to be. The C64 keyboard has no F10 (only F1..F8), so it can
+                    // never be a key the machine wanted.
+                    if key.code == XKeyCode::F(10) {
+                        let running = engine.is_running();
+                        let r = engine.exec_line(if running { "/pause" } else { "/run" });
+                        if !r.output.is_empty() {
+                            cp.push_log(&r.output);
+                        }
                         continue;
                     }
                     // Ctrl-<key> readline muscles. Handled here so they don't fall
@@ -532,6 +549,8 @@ fn run_loop(term: &mut Term, engine: &Engine, to_main: &Sender<UiToMain>) -> io:
                 _ => {}
             }
         }
+
+        term.draw(|f| draw(f, &cp))?;
     }
 }
 

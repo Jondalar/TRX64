@@ -94,3 +94,36 @@ fn a_window_older_than_the_ring_is_refused_with_a_useful_reason() {
     // hence the conditional. What must never happen is a silent wrong-window answer,
     // which the provenance note above rules out.
 }
+
+// ── F10 freeze/resume (host hotkey, both surfaces) ──────────────────────────────
+
+#[test]
+fn f10_toggles_between_run_and_pause() {
+    // F10 is wired in BOTH the TUI and the emulator window, and both do the same thing:
+    // ask the engine whether it is running and flip it. This pins the underlying verbs so
+    // a rename cannot silently turn the hotkey into a no-op.
+    let Some(engine) = engine_or_skip() else { return };
+    engine.exec_line("/power on");
+
+    engine.exec_line("/run");
+    assert!(engine.is_running(), "/run must set the host run flag");
+
+    let out = engine.exec_line("/pause").output;
+    assert!(!engine.is_running(), "/pause must clear it");
+    assert!(out.contains("PAUSE"), "pause should report where it stopped: {out}");
+
+    let out = engine.exec_line("/run").output;
+    assert!(engine.is_running(), "resuming must set it again");
+    assert!(out.contains("RUN"), "{out}");
+}
+
+#[test]
+fn f_keys_one_to_eight_still_belong_to_the_c64() {
+    // The hotkey is F10 precisely because the C64 has no such key. F1..F8 must keep
+    // reaching the emulated matrix (F2/F4/F6/F8 as SHIFT + F1/F3/F5/F7).
+    use trx64_cli::keymap::map_special;
+    use winit::keyboard::KeyCode;
+    assert_eq!(map_special(KeyCode::F1), Some(vec!["F1"]));
+    assert_eq!(map_special(KeyCode::F8), Some(vec!["L_SHIFT", "F7"]));
+    assert_eq!(map_special(KeyCode::F10), None, "F10 must NOT map to the C64 matrix");
+}

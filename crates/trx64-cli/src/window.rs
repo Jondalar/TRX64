@@ -235,6 +235,24 @@ impl App {
     fn handle_key(&mut self, event: &winit::event::KeyEvent) {
         let pressed = event.state == ElementState::Pressed;
 
+        // HOST HOTKEYS — F9..F12. The C64 keyboard has F1..F8 only (F2/F4/F6/F8 being
+        // SHIFT+F1/F3/F5/F7), so these four physical keys cannot collide with anything
+        // the emulated machine can see. F10 freezes/resumes: the one control you want
+        // without taking your hands off the game, and the reason it is a key at all
+        // rather than only a monitor verb.
+        if let PhysicalKey::Code(code) = event.physical_key {
+            if matches!(code, KeyCode::F10) {
+                if pressed {
+                    let running = self.engine.is_running();
+                    let r = self.engine.exec_line(if running { "/pause" } else { "/run" });
+                    if !r.output.is_empty() {
+                        eprintln!("[F10] {}", r.output.trim());
+                    }
+                }
+                return; // never reaches the C64 matrix
+            }
+        }
+
         // Track host Shift (for the symbolic char mapping). The shift key is ALSO sent
         // to the matrix below via map_special — idempotent + self-correcting (Spec 310).
         if let PhysicalKey::Code(code) = event.physical_key {
