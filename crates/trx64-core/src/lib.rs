@@ -40,6 +40,9 @@ pub mod resid_audio;
 pub mod resid_ffi;
 pub mod scenario_player;
 pub mod sid;
+/// Serial (SPI) flash — the device GMod3/GMod4 bit-bang over CS/CLK/DI/DO. Distinct from
+/// `flash040`, which models the parallel-flash families ($AAA/$555 unlock).
+pub mod spi_flash;
 pub mod tables;
 pub mod vic;
 pub mod vic_draw;
