@@ -530,6 +530,13 @@ impl Engine {
     fn verb_monitor(&self, command: &str) -> CmdResult {
         match self.rpc("monitor/exec", json!({ "command": command })) {
             Ok(v) => {
+                // monitor/exec reports a VERB failure as a successful rpc carrying an
+                // `error` field (matching the TS `{output}|{error}` shape), so reading
+                // only `output` rendered every monitor error as a BLANK line in the
+                // cockpit — the command looked like it did nothing at all.
+                if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+                    return CmdResult::text(err.to_string());
+                }
                 let out = v.get("output").and_then(|o| o.as_str()).unwrap_or("");
                 CmdResult::text(out.to_string())
             }

@@ -340,6 +340,12 @@ pub struct State {
     /// `lastStorePath`/`lastRunId`). Set in finalize_trace; surfaced by trace/current.
     /// `None` until the first trace is stopped.
     last_trace_path: Option<String>,
+    /// When `last_trace_path` points at a store this daemon built ITSELF from the delta
+    /// ring (not at a user's `trace on` capture), the cycle window it covers. Used to
+    /// decide whether a later analysis verb can reuse it or must rebuild — the ring keeps
+    /// moving, so a store built for cycles 1000-2000 is stale once the machine reaches
+    /// 5000. `None` for a real capture, which is never auto-invalidated.
+    ring_trace_window: Option<(u64, u64)>,
     last_run_id: Option<String>,
     /// T2.4 — BUG-042 cart write-LED: last seen writableGeneration from the cart
     /// (TS ws-server.ts:1599-1602 `cartLedTrack`). When the generation advances
@@ -1240,6 +1246,109 @@ fn index_state(duckdb_path: &str) -> (bool, bool, Option<String>) {
     let error = trx64_traceindex::index_error(p);
     let indexed = p.exists() && !indexing && error.is_none();
     (indexed, indexing, error)
+}
+
+
+
+/// One line telling the user the answer came from the always-on ring rather than from a
+/// capture they started, and over which window. Worth saying rather than silently
+/// answering: the ring is bounded, so "nothing found" can mean "not in the last N cycles"
+/// instead of "did not happen".
+fn ring_source_note(st: &State) -> String {
+    match st.ring_trace_window {
+        Some((lo, hi)) => format!(
+            "(no capture running — built from the always-on delta ring, cycles {lo}–{hi})\n"
+        ),
+        None => String::new(),
+    }
+}
+
+/// Resolve a trace store for an ANALYSIS verb (`map` / `taint` / `swimlane`), building one
+/// from the always-on delta ring when no capture exists.
+///
+/// WHY: the delta + cpu-history rings run permanently, so the machine is *always*
+/// recording its instruction stream and every write it performs. Requiring the user to
+/// have had the foresight to run `trace on` before the interesting thing happened made
+/// that recording unreachable — you could only analyse a problem you already expected.
+/// `chis` has read the live ring since it was built; these verbs now get the same
+/// treatment, by dumping the requested window through the existing
+/// `build_trace_from_ring` engine (the same one behind `buildtrace` and
+/// `trace/build_from_ring`) and reading the result.
+///
+/// Precedence, deliberately: a real capture always wins. An auto-built store is reused
+/// only while it still covers what is being asked for — the ring keeps moving, so a store
+/// built for cycles 1000-2000 must not silently answer a question about cycle 5000.
+///
+/// Returns `(duckdb_path, built_now)`. `built_now` lets the caller tell the user where the
+/// data came from, which matters: an auto-built window is bounded by the ring's depth,
+/// not by what the user might assume.
+fn trace_store_for_analysis(
+    st: &mut State,
+    want: Option<(u64, u64)>,
+) -> Result<(String, bool), String> {
+    // 1. A live or finalized capture always wins.
+    if st.session.trace.is_some() {
+        if let Some(p) = current_trace_duckdb(st) {
+            return Ok((p, false));
+        }
+    }
+    // 2. Reuse an existing store when it can answer. A real capture (no recorded window)
+    //    is trusted as-is; an auto-built one only while it covers the request.
+    if let Some(p) = st.last_trace_path.clone() {
+        match (st.ring_trace_window, want) {
+            (None, _) => return Ok((p, false)),
+            (Some((lo, hi)), Some((wlo, whi))) if wlo >= lo && whi <= hi => {
+                return Ok((p, false))
+            }
+            (Some(_), None) => { /* no window asked for — rebuild to catch up */ }
+            _ => { /* window not covered — rebuild */ }
+        }
+    }
+    // 3. Build from the ring.
+    if !st.session.machine.delta_ring.enabled() {
+        return Err(
+            "no trace store, and the always-on delta ring is disabled (TRX64_CPUHISTORY=0). \
+             Either re-enable the ring, or capture explicitly with `trace on` … `trace off`."
+                .into(),
+        );
+    }
+    let span = st.session.machine.delta_ring.cycle_span().ok_or_else(|| {
+        "no trace store, and the delta ring is empty — run the machine first (or capture \
+         explicitly with `trace on` … `trace off`)."
+            .to_string()
+    })?;
+    // Clamp the request into what the ring actually still holds. With NO request, take a
+    // bounded tail rather than the whole ring: the ring can hold millions of cycles, and
+    // dumping + indexing all of it to answer a question about the last two thousand made
+    // the first call stall for ~20s and then time out. The window used is always named in
+    // the answer, and `buildtrace <s> <e>` remains there for a deliberately wider one.
+    const AUTO_TAIL_CYCLES: u64 = 250_000;
+    let (lo, hi) = match want {
+        Some((wlo, whi)) => (wlo.max(span.0), whi.min(span.1)),
+        None => (span.1.saturating_sub(AUTO_TAIL_CYCLES).max(span.0), span.1),
+    };
+    if lo > hi {
+        return Err(format!(
+            "the delta ring only reaches back to cycle {} (now {}) — the requested window is \
+             older than the ring. Capture explicitly with `trace on` for windows that deep.",
+            span.0, span.1
+        ));
+    }
+    let out = build_trace_from_ring(st, lo, hi, None)?;
+    let path = out
+        .get("duckdb_path")
+        .or_else(|| out.get("retrace_path"))
+        .and_then(|v| v.as_str())
+        .map(|s| {
+            if s.ends_with(".c64retrace") {
+                format!("{}.duckdb", &s[..s.len() - ".c64retrace".len()])
+            } else {
+                s.to_string()
+            }
+        })
+        .ok_or_else(|| "build_trace_from_ring returned no store path".to_string())?;
+    st.ring_trace_window = Some((lo, hi));
+    Ok((path, true))
 }
 
 /// Resolve the `.duckdb` index path the native reader should read for the CURRENT trace
@@ -5011,12 +5120,14 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             if cpu != "c64" && cpu != "drive8" {
                 return Ok("map: cpu must be c64|drive8".into());
             }
-            match current_trace_duckdb(st) {
-                None => Err("map: no trace store — run `trace on` first".into()),
-                Some(db) => match trace_read_native("map", &db, &json!({ "cpu": cpu })) {
-                    Ok(v) => Ok(v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string()),
-                    Err(e) => Err(format!("map: {e}")),
-                },
+            // No window argument, so take whatever the ring still holds.
+            let (db, built) = trace_store_for_analysis(st, None).map_err(|e| format!("map: {e}"))?;
+            match trace_read_native("map", &db, &json!({ "cpu": cpu })) {
+                Ok(v) => {
+                    let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                    Ok(if built { format!("{}{text}", ring_source_note(st)) } else { text })
+                }
+                Err(e) => Err(format!("map: {e}")),
             }
         }
         // `taint <addr> [cycle]` — backward data-flow taint. cycle omitted ⇒ the
@@ -5030,12 +5141,14 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             if let Some(c) = toks.get(2).and_then(|s| s.parse::<i64>().ok()) {
                 args["start_cycle"] = json!(c);
             }
-            match current_trace_duckdb(st) {
-                None => Err("taint: no trace store — run `trace on` first".into()),
-                Some(db) => match trace_read_native("taint_text", &db, &args) {
-                    Ok(v) => Ok(v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string()),
-                    Err(e) => Err(format!("taint: {e}")),
-                },
+            let (db, built) =
+                trace_store_for_analysis(st, None).map_err(|e| format!("taint: {e}"))?;
+            match trace_read_native("taint_text", &db, &args) {
+                Ok(v) => {
+                    let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                    Ok(if built { format!("{}{text}", ring_source_note(st)) } else { text })
+                }
+                Err(e) => Err(format!("taint: {e}")),
             }
         }
         // `swimlane [list|name] [s] [e]` — trace lanes, newest trace tail by default.
@@ -5158,10 +5271,22 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                     None
                 }
             };
-            let db = match named_store.or_else(|| current_trace_duckdb(st)) {
-                Some(d) => d,
-                None => return Err("swimlane: no trace store — run `trace on` … `trace off` first".into()),
+            // An explicitly named store is taken as-is; otherwise resolve — and, when
+            // nothing is captured, build the requested window out of the delta ring.
+            let (db, built) = match named_store {
+                Some(d) => (d, false),
+                None => {
+                    let want = match (
+                        args.get("cycle_start").and_then(|v| v.as_i64()),
+                        args.get("cycle_end").and_then(|v| v.as_i64()),
+                    ) {
+                        (Some(a), Some(b)) if a >= 0 && b >= 0 => Some((a as u64, b as u64)),
+                        _ => None,
+                    };
+                    trace_store_for_analysis(st, want).map_err(|e| format!("swimlane: {e}"))?
+                }
             };
+            let ring_note = if built { ring_source_note(st) } else { String::new() };
             // `stem` = the store basename without .duckdb (= TS `# <stem>`).
             let stem = std::path::Path::new(&db)
                 .file_stem()
@@ -5170,7 +5295,10 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 .to_string();
             args["stem"] = json!(stem);
             match trace_read_native("swimlane_text", &db, &args) {
-                Ok(v) => Ok(v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string()),
+                Ok(v) => Ok(format!(
+                    "{ring_note}{}",
+                    v.get("text").and_then(|t| t.as_str()).unwrap_or("")
+                )),
                 Err(e) => Err(format!("swimlane: {e}")),
             }
         }
@@ -6086,6 +6214,9 @@ fn build_trace_from_ring(
 
     // Point the CURRENT trace store at this dump so the monitor reads it immediately.
     st.last_trace_path = Some(duckdb_path.clone());
+    // build_trace_from_ring's own callers (buildtrace / trace/build_from_ring) set the
+    // window themselves where they care; clear it here so a stale one never survives.
+    st.ring_trace_window = None;
     st.last_run_id = Some(run_id.clone());
 
     let mut out = json!({
@@ -14695,6 +14826,7 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         run_cap_clk: None,
         run_cap_restore_pace: None,
         last_trace_path: None,
+        ring_trace_window: None,
         last_run_id: None,
         cart_led_gen: 0,
         cart_led_last_write_at: None,
@@ -15187,6 +15319,7 @@ mod batch1_tests {
             run_cap_clk: None,
             run_cap_restore_pace: None,
             last_trace_path: None,
+            ring_trace_window: None,
             last_run_id: None,
             cart_ap_seen_gen: 0,
             cart_ap_settle_at_ms: 0,
