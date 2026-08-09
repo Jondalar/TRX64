@@ -11948,6 +11948,7 @@ fn mapper_type_str(t: trx64_core::cart::MapperType) -> &'static str {
         Gmod2 => "gmod2",
         MegaByter => "megabyter",
         C64MegaCart => "c64megacart",
+        Gmod4 => "gmod4",
         // Spec 790 S2 — the self-configuring harness before it locks a concrete
         // family (post-lock it delegates `mapper_type()` and never returns this).
         SelfConfig => "self_config",

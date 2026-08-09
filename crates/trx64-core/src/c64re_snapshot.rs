@@ -1055,6 +1055,7 @@ pub fn restore_cart_state(cart: &mut Box<dyn CartMapper>, s: &CartStateSnapshot)
             flash_lo: s.flash_lo_state.as_ref().map(flash_state_from_json),
             flash_hi: s.flash_hi_state.as_ref().map(flash_state_from_json),
             eeprom: s.eeprom_state.as_ref().map(eeprom_state_from_json),
+            spi: None,
             easyflash_jumper: s.easyflash_jumper.unwrap_or(0) as u8,
             easyflash_ram: s
                 .easyflash_ram

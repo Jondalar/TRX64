@@ -981,6 +981,7 @@ fn load_c64cart_easyflash(machine: &mut Machine, data: &[u8]) -> Result<bool, St
                 flash_lo: lo_fsm,
                 flash_hi: hi_fsm,
                 eeprom: None,
+                spi: None,
                 easyflash_jumper: jumper,
                 easyflash_ram: ram,
             }),

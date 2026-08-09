@@ -566,6 +566,22 @@ impl<'a> FullBus<'a> {
 }
 
 impl<'a> FullBus<'a> {
+
+    /// True when the attached cartridge holds ULTIMAX permanently but resolves the
+    /// windows itself (GMod4 and, later, GMod3). Such a cart declines the windows it does
+    /// not drive, and those must then read the NON-ultimax map rather than open bus.
+    #[inline]
+    fn cart_fake_ultimax(&self) -> bool {
+        self.cartridge.as_ref().map_or(false, |c| c.fake_ultimax())
+    }
+
+    /// Would the KERNAL be visible at $E000 if the cart were not forcing ultimax?
+    /// HIRAM (port bit 1) selects it, honouring the data-direction bits.
+    #[inline]
+    fn kernal_visible_without_ultimax(&self) -> bool {
+        ((!self.port_dir | self.port_data) & 0x02) != 0
+    }
+
     /// ts:105 — openBusProvider default `() => 0xff`. The VIC float-bus value the
     /// ultimax open windows read. (No phi1 source wired in this read-only tier.)
     #[inline]
@@ -647,7 +663,11 @@ impl<'a> Bus for FullBus<'a> {
             }
             // $C000-$CFFF — ts:390-401: ultimax ⇒ open bus; else RAM.
             0xc000..=0xcfff => {
-                if self.config.ultimax {
+                // Real ultimax leaves this window open. A fake-ultimax cartridge holds
+                // ULTIMAX only to get first refusal on the windows it DOES drive, and
+                // never drives this one — so it must read as if ultimax were not set
+                // (VICE: mem_read_without_ultimax).
+                if self.config.ultimax && !self.cart_fake_ultimax() {
                     self.open_bus()
                 } else {
                     self.ram[addr as usize]
@@ -671,7 +691,17 @@ impl<'a> Bus for FullBus<'a> {
                     if let Some(v) = self.cart_read(addr) {
                         return v;
                     }
-                    self.open_bus()
+                    // Declined: a fake-ultimax cart wants the non-ultimax map here (the
+                    // KERNAL if the port says so, else RAM), not open bus.
+                    if self.cart_fake_ultimax() {
+                        if self.kernal_visible_without_ultimax() {
+                            self.kernal_rom[(addr as usize) - 0xe000]
+                        } else {
+                            self.ram[addr as usize]
+                        }
+                    } else {
+                        self.open_bus()
+                    }
                 } else {
                     self.ram[addr as usize]
                 }

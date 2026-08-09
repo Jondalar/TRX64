@@ -48,6 +48,10 @@ pub enum MapperType {
     Gmod2,     // CARTRIDGE_GMOD2 (hw 0x3c) — flash + M93C86 EEPROM
     MegaByter, // CARTRIDGE_MEGABYTER (hw 0x56) — MX29F800CB flash, ROML only
     C64MegaCart, // CARTRIDGE_C64MEGACART (hw 61, martinpiper fork) — M29F160FT flash
+    /// CARTRIDGE_GMOD4 (hw 87) — 8 MiB SPI flash, dual banking contexts, three
+    /// independently disableable ROM windows. The first cartridge here that is a
+    /// *serial*-flash family (`spi_flash`), not a parallel one (`flash040`).
+    Gmod4,
     /// Spec 790 S2 — a raw `.bin` attached with `CartType::Auto` that the S1
     /// structural detect could not settle, now driven by the runtime
     /// self-configuring harness (`SelfConfigCartMapper`). This is the harness's
@@ -145,6 +149,9 @@ pub struct FlashCartState {
     pub flash_lo: Option<crate::flash040::Flash040SnapState>,
     pub flash_hi: Option<crate::flash040::Flash040SnapState>,
     pub eeprom: Option<crate::m93c86::M93c86SnapState>,
+    /// GMod4 (and later GMod3): the serial-flash command FSM. The image itself rides
+    /// in the separate writable image, as with the parallel-flash families.
+    pub spi: Option<crate::spi_flash::SpiFlashSnapState>,
     pub easyflash_jumper: u8,
     pub easyflash_ram: Vec<u8>, // 256 bytes IO2 RAM
 }
@@ -184,6 +191,15 @@ pub trait CartMapper: Send {
 
     // ── Writable tier (flash/EEPROM) — default no-op for the read-only mappers ──
 
+    /// Whether this cartridge holds ULTIMAX permanently and resolves the windows
+    /// ITSELF, declining the ones it does not drive (VICE's "fake ultimax": the cart
+    /// read functions end in `mem_read_without_ultimax`). For such a cart a declined
+    /// window must fall back to the NON-ultimax memory map — real ultimax would show
+    /// open bus at $C000 and $E000, which is exactly what these carts do not want.
+    /// False for every classic family, so their behaviour is unchanged.
+    fn fake_ultimax(&self) -> bool {
+        false
+    }
     /// Whether this mapper's flash/EEPROM has been mutated since attach (= the TS
     /// isWritableDirty). Read-only mappers are never dirty.
     fn is_writable_dirty(&self) -> bool {
@@ -332,6 +348,9 @@ fn infer_mapper_type(
         32 => Some(MapperType::EasyFlash),  // CARTRIDGE_EASYFLASH
         60 => Some(MapperType::Gmod2),      // CARTRIDGE_GMOD2 (flash + M93C86)
         86 => Some(MapperType::MegaByter),  // CARTRIDGE_MEGABYTER (MX29F800CB)
+        // CARTRIDGE_GMOD4 — the number moved twice upstream (an older summary says
+        // 83); the current patch defines 87, immediately after MegaByter.
+        87 => Some(MapperType::Gmod4),
         // C64MegaCart (martinpiper VICE fork): M29F160FT 2MB flash, GMOD2-derived.
         61 => Some(MapperType::C64MegaCart), // CARTRIDGE_C64MEGACART
         // serial/SPI families not yet built (GMOD3 SPI-flash).
@@ -1072,6 +1091,7 @@ impl CartMapper for EasyFlashMapper {
                 flash_lo: Some(lo.snapshot_state(0)),
                 flash_hi: Some(hi.snapshot_state(0)),
                 eeprom: None,
+                spi: None,
                 easyflash_jumper: self.jumper,
                 easyflash_ram: self.io_ram.to_vec(),
             }),
@@ -1325,6 +1345,7 @@ impl CartMapper for Gmod2Mapper {
                 flash_lo: Some(flash.snapshot_state(0)),
                 flash_hi: None,
                 eeprom: Some(self.eeprom.snapshot_state()),
+                spi: None,
                 easyflash_jumper: 0,
                 easyflash_ram: Vec::new(),
             }),
@@ -1469,6 +1490,7 @@ impl CartMapper for MegabyterMapper {
                 flash_lo: Some(flash.snapshot_state(0)),
                 flash_hi: None,
                 eeprom: None,
+                spi: None,
                 easyflash_jumper: 0,
                 easyflash_ram: Vec::new(),
             }),
@@ -1620,6 +1642,7 @@ impl CartMapper for C64MegaCartMapper {
                 flash_lo: Some(flash.snapshot_state(0)),
                 flash_hi: None,
                 eeprom: None,
+                spi: None,
                 easyflash_jumper: 0,
                 easyflash_ram: Vec::new(),
             }),
@@ -1677,11 +1700,367 @@ pub fn mapper_from_image(
         MapperType::Gmod2 => Ok(Box::new(Gmod2Mapper::new(image))),
         MapperType::MegaByter => Ok(Box::new(MegabyterMapper::new(image))),
         MapperType::C64MegaCart => Ok(Box::new(C64MegaCartMapper::new(image))),
+        MapperType::Gmod4 => Ok(Box::new(Gmod4Mapper::new(image))),
         // The self-config harness is constructed directly (SelfConfigCartMapper::new
         // / load_self_config_from_bin), never from a parsed image, and locks a
         // concrete family at runtime — so it has no image-driven build here.
         MapperType::SelfConfig => Err(CrtError::Unsupported(MapperType::SelfConfig)),
         MapperType::Unsupported => Err(CrtError::Unsupported(MapperType::Unsupported)),
+    }
+}
+
+/// GMod4 (iComp / individual Computers; VICE patch #368 `c64/cart/gmod4.c`, CRT hw 87).
+/// 8 MiB **SPI** flash — the first serial-flash family here, so it uses `spi_flash`
+/// rather than `flash040`. Register map (`$DE00-$DE0F`, mirrored 16× across `$DExx`):
+///
+/// ```text
+///   $DE00 select context A            $DE08 select context B
+///   $DE01 ctx-A $8000 bank            $DE09 ctx-B $8000 bank
+///   $DE02 ctx-A $A000 bank            $DE0A ctx-B $A000 bank
+///   $DE03 ctx-A both (common 16K)     $DE0B ctx-B both
+///   $DE04-$07 + $DE0C-$0F  CONTROL
+/// ```
+///
+/// Writing ANY banking register also selects that context — the point being that an
+/// IRQ/NMI handler can switch banks without saving the foreground set.
+///
+/// CONTROL bits, whose meaning splits on bit 0:
+///
+/// | bit | bitbang off | bitbang on |
+/// |-----|-------------|------------|
+/// | 0   | 1 = enable SPI bitbang     | — |
+/// | 1/2/3 | 1 = DISABLE ROM at $8000/$A000/$E000 (note the inversion) | same |
+/// | 4   | flash address line A22     | — |
+/// | 5   | intrusive mode             | SPI /CS (0 = selected) |
+/// | 6   | enable banking registers   | SPI data out |
+/// | 7   | AGR                        | SPI CLK (latch on 0→1) |
+///
+/// Offsets: `$8000` → `(addr & $1FFF) + (bank << 14) + (A22 << 22)`; `$A000` → the same
+/// plus `$2000` (odd half of the 16K bank); `$E000` → **always bank 0** + `$2000`, which
+/// is what lets a cartridge own the IRQ/NMI vectors.
+///
+/// **Fake ultimax.** The cart asserts ULTIMAX permanently and then decides per window and
+/// per CPU-port config whether to answer. Where it declines, the bus must read as if
+/// ultimax were NOT set (VICE calls `mem_read_without_ultimax`) — see
+/// `CartMapper::fake_ultimax`.
+///
+/// **AGR is deliberately NOT implemented** — it is stored and never acted on, exactly as
+/// upstream does. With AGR on, the VIC should see RAM at `$1000`/`$9000` instead of the
+/// character generator. No emulator implements this and no vendor example tests it, so
+/// building it means writing the first implementation and the first test, with real
+/// hardware as the only oracle. That is a deliberate decision, recorded in Spec 803 §6.
+#[derive(Clone)]
+pub struct Gmod4Mapper {
+    flash: crate::spi_flash::SpiFlash,
+
+    // ── CONTROL register ──────────────────────────────────────────────────────
+    bitbang: bool,
+    rom8000_enabled: bool,
+    roma000_enabled: bool,
+    rome000_enabled: bool,
+    a22: u32,
+    intrusive: bool,
+    banking_enabled: bool,
+    /// Stored, never acted on. See the AGR note above.
+    agr: bool,
+
+    // ── SPI lines, live only while `bitbang` ──────────────────────────────────
+    spi_cs: u8, // active low
+    spi_data_in: u8,
+    spi_clock: u8,
+
+    // ── banking ───────────────────────────────────────────────────────────────
+    context: u8, // 0 = A, 1 = B
+    rom8000_bank_a: u8,
+    roma000_bank_a: u8,
+    rom8000_bank_b: u8,
+    roma000_bank_b: u8,
+}
+
+impl Gmod4Mapper {
+    pub fn new(image: &ParsedCartridgeImage) -> Self {
+        // 8 MiB linear image; `spi_flash` pads to the device capacity.
+        let data = build_linear_chip_data(image, |b| b.roml.as_ref(), 1024);
+        Gmod4Mapper {
+            flash: crate::spi_flash::SpiFlash::new(data, crate::spi_flash::SpiFlashType::W25q64cv),
+            bitbang: false,
+            // The ROM-enable bits are INVERTED in the register: 0 = enabled. After a
+            // power-up the register reads as 0, so all three windows are live.
+            rom8000_enabled: true,
+            roma000_enabled: true,
+            rome000_enabled: true,
+            a22: 0,
+            intrusive: false,
+            banking_enabled: false,
+            agr: false,
+            spi_cs: 1,
+            spi_data_in: 0,
+            spi_clock: 0,
+            context: 0,
+            rom8000_bank_a: 0,
+            roma000_bank_a: 0,
+            rom8000_bank_b: 0,
+            roma000_bank_b: 0,
+        }
+    }
+
+    /// `mem_config = ((~pport.dir | pport.data) & 7)` — the EFFECTIVE LORAM/HIRAM/CHAREN,
+    /// i.e. an input line reads as 1 when its data-direction bit says "input". GMod4
+    /// consults this itself because under ultimax the PLA would otherwise hide the
+    /// distinction the cartridge needs.
+    fn mem_config(bank_info: &BankInfo) -> u8 {
+        (!bank_info.cpu_port_direction | bank_info.cpu_port_value) & 0x07
+    }
+
+    fn bank_8000(&self) -> u32 {
+        if self.context == 0 { self.rom8000_bank_a as u32 } else { self.rom8000_bank_b as u32 }
+    }
+    fn bank_a000(&self) -> u32 {
+        if self.context == 0 { self.roma000_bank_a as u32 } else { self.roma000_bank_b as u32 }
+    }
+
+    /// `$8000` window offset. With banking off the bank bits drop out entirely — the
+    /// window then shows the low half of bank 0.
+    fn offset_8000(&self, address: u16) -> u32 {
+        let base = (address & 0x1fff) as u32 + (self.a22 << 22);
+        if self.banking_enabled { base + (self.bank_8000() << 14) } else { base }
+    }
+    /// `$A000` window — the ODD 8K half of the same 16K bank, hence `+ 0x2000`.
+    fn offset_a000(&self, address: u16) -> u32 {
+        let base = (address & 0x1fff) as u32 + 0x2000 + (self.a22 << 22);
+        if self.banking_enabled { base + (self.bank_a000() << 14) } else { base }
+    }
+    /// `$E000` — never banked. Always the odd half of bank 0 ("bank #1" in the wiki's
+    /// numbering), so the cart's vectors survive any banking the running code does.
+    fn offset_e000(&self, address: u16) -> u32 {
+        (address & 0x1fff) as u32 + 0x2000 + (self.a22 << 22)
+    }
+
+    /// While bitbanging, a ROM window reads the SPI data line in bit 7 instead of flash
+    /// contents; with the device deselected the line floats high (a pull-up).
+    fn bitbang_read(&self) -> u8 {
+        if self.spi_cs == 0 {
+            self.flash.read_data() << 7
+        } else {
+            0x80
+        }
+    }
+
+    fn flash_byte(&self, offset: u32) -> u8 {
+        let img = self.flash.image();
+        img.get(offset as usize).copied().unwrap_or(0xff)
+    }
+
+    /// Shared by `read` and `peek`: which byte (if any) this window yields. `peek` must
+    /// not disturb the SPI FSM, but neither does a read here — the FSM only advances on
+    /// register WRITES, so both can use this.
+    fn window_byte(&self, address: u16, bank_info: &BankInfo) -> Option<u8> {
+        let cfg = Self::mem_config(bank_info);
+        match address {
+            0x8000..=0x9fff => {
+                // 8K-game-like configs: the cart owns the window.
+                if cfg == 7 || cfg == 3 {
+                    if !self.rom8000_enabled {
+                        return None;
+                    }
+                } else if !(self.rom8000_enabled && self.intrusive) {
+                    return None;
+                }
+                Some(if self.bitbang {
+                    self.bitbang_read()
+                } else {
+                    self.flash_byte(self.offset_8000(address))
+                })
+            }
+            0xa000..=0xbfff => {
+                // 16K-game-like configs.
+                if matches!(cfg, 7 | 6 | 3 | 2) {
+                    if !self.roma000_enabled {
+                        return None;
+                    }
+                } else if !(self.roma000_enabled && self.intrusive) {
+                    return None;
+                }
+                Some(if self.bitbang {
+                    self.bitbang_read()
+                } else {
+                    self.flash_byte(self.offset_a000(address))
+                })
+            }
+            0xe000..=0xffff => {
+                if !self.rome000_enabled {
+                    return None;
+                }
+                Some(if self.bitbang {
+                    self.bitbang_read()
+                } else {
+                    self.flash_byte(self.offset_e000(address))
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+impl CartMapper for Gmod4Mapper {
+    fn mapper_type(&self) -> MapperType {
+        MapperType::Gmod4
+    }
+
+    /// `cart_config_changed_slotmain(CMODE_RAM, CMODE_ULTIMAX, CMODE_READ)` — GMod4 holds
+    /// ULTIMAX permanently and resolves the windows itself. See `fake_ultimax`.
+    fn get_lines(&self) -> CartLines {
+        CartLines { exrom: 1, game: 0 }
+    }
+
+    /// GMod4 declines a window instead of driving it; where it does, the bus must fall
+    /// back to the NON-ultimax map, not to open bus.
+    fn fake_ultimax(&self) -> bool {
+        true
+    }
+
+    fn read(&mut self, address: u16, bank_info: &BankInfo, _clk: u64) -> Option<u8> {
+        self.window_byte(address, bank_info)
+    }
+
+    fn peek(&self, address: u16, bank_info: &BankInfo) -> Option<u8> {
+        self.window_byte(address, bank_info)
+    }
+
+    fn write(&mut self, address: u16, value: u8, bank_info: &BankInfo, _clk: u64) -> bool {
+        if !(0xde00..=0xdeff).contains(&address) {
+            return false;
+        }
+        // The registers answer only in the configs where I/O would be visible WITHOUT
+        // ultimax. Elsewhere the write belongs to the memory underneath. (Upstream has an
+        // open TODO to make $DE00-$DE0F always intrusive; we mirror today's behaviour.)
+        let cfg = Self::mem_config(bank_info);
+        if !matches!(cfg, 7 | 6 | 5) {
+            return false;
+        }
+
+        match address & 0x0f {
+            // Any banking write also selects its context.
+            0x00 => self.context = 0,
+            0x01 => {
+                self.context = 0;
+                self.rom8000_bank_a = value;
+            }
+            0x02 => {
+                self.context = 0;
+                self.roma000_bank_a = value;
+            }
+            0x03 => {
+                self.context = 0;
+                self.rom8000_bank_a = value;
+                self.roma000_bank_a = value;
+            }
+            0x08 => self.context = 1,
+            0x09 => {
+                self.context = 1;
+                self.rom8000_bank_b = value;
+            }
+            0x0a => {
+                self.context = 1;
+                self.roma000_bank_b = value;
+            }
+            0x0b => {
+                self.context = 1;
+                self.rom8000_bank_b = value;
+                self.roma000_bank_b = value;
+            }
+            // CONTROL, mirrored at $x4-$x7 and $xC-$xF.
+            _ => {
+                self.bitbang = (value & 0x01) != 0;
+                // Inverted: a SET bit DISABLES the window.
+                self.rom8000_enabled = (value & 0x02) == 0;
+                self.roma000_enabled = (value & 0x04) == 0;
+                self.rome000_enabled = (value & 0x08) == 0;
+                self.a22 = ((value >> 4) & 1) as u32;
+                if self.bitbang {
+                    self.spi_cs = (value >> 5) & 1;
+                    self.spi_data_in = (value >> 6) & 1;
+                    self.spi_clock = (value >> 7) & 1;
+                } else {
+                    self.intrusive = (value & 0x20) != 0;
+                    self.banking_enabled = (value & 0x40) != 0;
+                    self.agr = (value & 0x80) != 0;
+                }
+            }
+        }
+
+        if self.bitbang {
+            self.flash.write_select(self.spi_cs);
+            if self.spi_cs == 0 {
+                self.flash.write_data(self.spi_data_in);
+                self.flash.write_clock(self.spi_clock);
+            }
+        }
+        true
+    }
+
+    /// The expansion-port RESET line. Note what does NOT happen: the banking registers
+    /// are **not** cleared. The hardware leaves them undefined at power-up and the vendor
+    /// documentation requires software to initialise them after every reset — so zeroing
+    /// them here would be helpful in a way that hides a real class of bug.
+    fn reset(&mut self) {
+        self.bitbang = false;
+        self.rom8000_enabled = true;
+        self.roma000_enabled = true;
+        self.rome000_enabled = true;
+        self.a22 = 0;
+        self.intrusive = false;
+        self.banking_enabled = false;
+        self.agr = false;
+        self.spi_cs = 1;
+        self.spi_data_in = 0;
+        self.spi_clock = 0;
+    }
+
+    fn get_state(&self) -> CartState {
+        CartState {
+            current_bank: self.bank_8000() as u16,
+            control_register: Some(
+                (self.bitbang as u8)
+                    | ((!self.rom8000_enabled as u8) << 1)
+                    | ((!self.roma000_enabled as u8) << 2)
+                    | ((!self.rome000_enabled as u8) << 3)
+                    | ((self.a22 as u8) << 4)
+                    | ((self.intrusive as u8) << 5)
+                    | ((self.banking_enabled as u8) << 6)
+                    | ((self.agr as u8) << 7),
+            ),
+            flash: Some(FlashCartState {
+                spi: Some(self.flash.snap_state()),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn set_state(&mut self, state: CartState) {
+        if let Some(cr) = state.control_register {
+            self.bitbang = (cr & 0x01) != 0;
+            self.rom8000_enabled = (cr & 0x02) == 0;
+            self.roma000_enabled = (cr & 0x04) == 0;
+            self.rome000_enabled = (cr & 0x08) == 0;
+            self.a22 = ((cr >> 4) & 1) as u32;
+            self.intrusive = (cr & 0x20) != 0;
+            self.banking_enabled = (cr & 0x40) != 0;
+            self.agr = (cr & 0x80) != 0;
+        }
+        if let Some(f) = state.flash.as_ref() {
+            if let Some(spi) = f.spi.as_ref() {
+                self.flash.restore_snap_state(spi);
+            }
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn CartMapper> {
+        Box::new(self.clone())
+    }
+
+    fn is_writable_dirty(&self) -> bool {
+        self.flash.is_dirty()
     }
 }
 
@@ -1771,6 +2150,10 @@ fn bin_geometry(mapper_type: MapperType) -> Result<BinGeometry, CrtError> {
         MapperType::Gmod2 => BinGeometry { bank_unit: 0x2000, layout: Roml8k, exrom: 0, game: 1, max_banks: 64 },
         MapperType::MegaByter => BinGeometry { bank_unit: 0x2000, layout: Roml8k, exrom: 0, game: 1, max_banks: 128 },
         MapperType::C64MegaCart => BinGeometry { bank_unit: 0x2000, layout: Roml8k, exrom: 0, game: 1, max_banks: 256 },
+        // GMod4 holds 8 MiB. Banking is in 16K units (bank << 14) with the low 8K at
+        // $8000 and the high 8K at $A000, so a linear image is 1024 x 8K halves. The
+        // cart asserts ULTIMAX permanently (see Gmod4Mapper::get_lines).
+        MapperType::Gmod4 => BinGeometry { bank_unit: 0x2000, layout: Roml8k, exrom: 1, game: 0, max_banks: 1024 },
         // The harness has no static geometry — it re-derives the concrete type's
         // geometry via `bin_geometry(concrete)` at lock time.
         MapperType::SelfConfig => return Err(CrtError::Unsupported(MapperType::SelfConfig)),
@@ -1916,6 +2299,7 @@ pub fn resolve_cart_type(s: &str) -> Result<CartType, CrtError> {
             60 => MapperType::Gmod2,
             85 => MapperType::MagicDesk16,
             86 => MapperType::MegaByter,
+            87 => MapperType::Gmod4,
             61 => MapperType::C64MegaCart, // martinpiper fork
             _ => return Err(CrtError::UnknownCartType(s.to_string())),
         };
