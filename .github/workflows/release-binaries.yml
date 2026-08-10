@@ -15,7 +15,9 @@
 # (green, 16 min, links only /usr/lib, and the produced daemon boots a real machine).
 # Windows is green as of 2026-08-10 — it needed a shim for reSID's gcc-only branch hints
 # (see crates/trx64-core/resid_msvc_prelude.h), and the bundled DuckDB turned out to
-# compile under MSVC untouched. Linux joins once Windows is confirmed on real hardware.
+# compile under MSVC untouched. Linux joins in the same pass, built in a container to pin
+# its glibc floor (see the matrix entry). That completes the three desktop targets, and
+# makes the Linux half of scripts/build-cli-dist.sh redundant.
 #
 # SHELL: `bash` everywhere, including Windows (git-bash ships on the runner). One set of
 # scripts beats maintaining a PowerShell twin of each step.
@@ -88,14 +90,40 @@ jobs:
           - os: macos-latest
             target: macos-arm64
             archive: tar.gz
+            container: ''
           # Windows: MSVC toolchain, preinstalled. winit/cpal use Win32/WASAPI, also part
           # of the OS. `.zip` because that is what a Windows user expects to receive.
           - os: windows-latest
             target: windows-x86_64
             archive: zip
+            container: ''
+          # Linux: built INSIDE rust:bookworm rather than on the runner image, because on
+          # Linux the build host decides who can run the result — a binary needs glibc at
+          # least as new as the one it was linked against. Bookworm pins that floor at 2.36
+          # (Debian 12, Ubuntu 22.04 and anything newer), where ubuntu-latest would raise it
+          # to whatever GitHub ships this month and quietly lock out older desktops. It also
+          # keeps the floor independent of GitHub retiring runner labels, and it is the same
+          # image scripts/build-cli-dist.sh has always used for the handout builds, so this
+          # is not a new, unproven combination.
+          - os: ubuntu-latest
+            target: linux-x86_64
+            archive: tar.gz
+            container: 'rust:bookworm'
     runs-on: ${{ matrix.os }}
+    # Empty string = run directly on the runner. Only the Linux entry sets an image.
+    container: ${{ matrix.container }}
     steps:
       - uses: actions/checkout@v4
+
+      # Linux only, and only these two. ALSA is what cpal binds to; pkg-config is how it
+      # finds it. Note what is NOT here: no X11 or Wayland dev packages, because winit 0.30
+      # dlopens them at RUNTIME instead of linking against them. That is not an assumption —
+      # it is how the handout builds have always worked with this exact image.
+      - name: System libraries
+        if: matrix.target == 'linux-x86_64'
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq libasound2-dev pkg-config
 
       - name: Toolchain
         run: |
@@ -160,8 +188,18 @@ jobs:
         # A binary that cannot resolve its dynamic libraries is useless to whoever
         # downloads it, and an accidental dependency on something only the runner has is
         # invisible until then. macOS answered "/usr/lib only", which is what we want.
+        #
+        # Linux gets the extra question, because there the answer is a NUMBER: the highest
+        # GLIBC_x.y symbol version the binary references IS its minimum glibc, and therefore
+        # the oldest distro that can start it. Printing it means the floor is measured in
+        # every run instead of assumed from the base image.
         run: |
-          if [ "${{ runner.os }}" = "macOS" ]; then
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            ldd ./target/release/trx64cli || true
+            echo "--- highest GLIBC symbol version required (= the floor):"
+            objdump -T ./target/release/trx64cli \
+              | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -5
+          elif [ "${{ runner.os }}" = "macOS" ]; then
             otool -L ./target/release/trx64cli | head -20
           else
             dumpbin //DEPENDENTS ./target/release/trx64cli.exe 2>/dev/null | head -25 \
@@ -177,14 +215,18 @@ jobs:
           # NOTE the ROMs are NOT bundled — they are Commodore's property. The daemon
           # resolves them from C64RE_ROOT/resources/roms; the container mounts them as a
           # volume for the same reason.
+          # Three platforms, three checksum tools: macOS has `shasum` and no `sha256sum`,
+          # Debian has the reverse, Git-Bash on Windows has both. Pick per host instead of
+          # per archive kind — the two are not the same question.
+          sha() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi; }
           if [ "${{ matrix.archive }}" = "zip" ]; then
             cp target/release/trx64cli.exe target/release/trx64-daemon.exe dist/
             (cd dist && 7z a "$NAME.zip" trx64cli.exe trx64-daemon.exe >/dev/null)
-            (cd dist && sha256sum "$NAME.zip" > "$NAME.zip.sha256")
+            (cd dist && sha "$NAME.zip" > "$NAME.zip.sha256")
           else
             cp target/release/trx64cli target/release/trx64-daemon dist/
             (cd dist && tar czf "$NAME.tar.gz" trx64cli trx64-daemon)
-            (cd dist && shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
+            (cd dist && sha "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
           fi
           ls -la dist
 
