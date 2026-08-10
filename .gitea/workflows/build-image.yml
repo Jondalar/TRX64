@@ -42,6 +42,11 @@ jobs:
         shell: sh
     steps:
       - name: Fetch the source
+        # The token lives in the EXPRESSION context, not the shell environment — with
+        # `set -u` an unset $GITHUB_TOKEN aborts, which is the right failure but needs
+        # this to be handed over explicitly.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu
           apk add --no-cache git >/dev/null
