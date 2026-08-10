@@ -59,6 +59,24 @@ jobs:
           rustc --version
           cargo --version
 
+      # Caches ~/.cargo (registry + git checkouts) and target/, keyed on Cargo.lock, the
+      # rustc version and the job. The prize is libduckdb-sys: a C++ amalgamation that ate
+      # ~31 of the 36 minutes when this was measured natively, and that does not change
+      # when our Rust does. It is a registry dependency, so it survives the action's
+      # pruning — our own crates' artifacts do not, which is fine (reSID is seconds).
+      #
+      # KNOW WHAT THIS DOES AND DOES NOT BUY: GitHub evicts cache entries after 7 days
+      # without a hit, so a release built once a month always starts cold. This pays off
+      # while iterating — a red platform, a fix, a rerun — which is exactly the phase this
+      # workflow is in while platforms are being added one at a time.
+      #
+      # cache-on-failure because the useful case is a build that dies LATE: the deps are
+      # already compiled and worth keeping even though the job goes red.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          cache-on-failure: true
+
       - name: Read the product version
         id: ver
         run: |
@@ -76,9 +94,9 @@ jobs:
         # The first macOS artifact shipped 8.5 MB of symbols (94k of them) nobody running
         # the binary needs.
         #
-        # Expect a long, cold build: 433 crates, one of which (bundled DuckDB) is a C++
-        # amalgamation that alone took ~31 of 36 minutes natively on the NAS. Caching is
-        # the obvious follow-up once every platform is green.
+        # A cold build is long: 433 crates, one of which (bundled DuckDB) is a C++
+        # amalgamation that alone took ~31 of 36 minutes natively on the NAS. Measured
+        # cold here: macOS ~16 min, Windows ~40 min. The cache step above cuts the repeat.
         run: |
           cargo build --release --config 'profile.release.strip="symbols"' \
             -p trx64-cli -p trx64-daemon
