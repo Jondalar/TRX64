@@ -19,13 +19,15 @@
 #      editors reach them by a fixed IP that must not move — hence `external: true` rather
 #      than a compose-managed network.
 #
-# Addressing: wl-editor .94 / wl-trx64 .95, wl2-editor .96 / wl2-trx64 .98.
+# Addresses, host paths and the network name come from a gitignored `.env` (see
+# `.env.example`) — this file is public, a deployment's addressing is not.
 #
-# NOT .97 — that is the Home Assistant VM. The tidy .96/.97 pairing was tried and produced
-# a live IP conflict: the address pings (the VM answers) while the port is closed, and from
-# inside the bridge the container resolves its own address locally, so it looks fine from
-# one side and broken from the other. VMs are not containers and do not appear in
-# `docker ps`; check what actually ANSWERS on the LAN before claiming an address.
+# One hard-won rule for whoever fills that .env in: pick the address by scanning what
+# actually ANSWERS on the LAN, not by continuing the pattern. Doing the latter here landed
+# a runtime on an address a VM already held — and VMs do not appear in `docker ps`. The
+# failure is nasty: the address pings (the VM answers) while the port is refused, and from
+# inside the bridge the container resolves its own address locally, so it looks healthy
+# from one side and broken from the other.
 
 services:
   wl-trx64:
@@ -35,12 +37,12 @@ services:
     environment:
       TRX64_BIND: 0.0.0.0   # reachable from the sibling editor container, not just from inside
     volumes:
-      - /share/Container/wl-play:/play:ro          # the built cart; ro so a flash write-back cannot touch it
-      - /share/Container/wl-dumps:/dumps           # snapshot/dump target — daemon writes here
+      - ${HOST_DATA:?set HOST_DATA in .env}/wl-play:/play:ro          # the built cart; ro so a flash write-back cannot touch it
+      - ${HOST_DATA}/wl-dumps:/dumps           # snapshot/dump target — daemon writes here
       - wl-roms:/opt/trx64/resources/roms:ro
     networks:
       lan:
-        ipv4_address: 192.168.242.95
+        ipv4_address: ${WL_TRX64_IP:?set WL_TRX64_IP in .env}
 
   wl2-trx64:
     image: wl-trx64:0.3.0
@@ -49,12 +51,12 @@ services:
     environment:
       TRX64_BIND: 0.0.0.0
     volumes:
-      - /share/Container/wl2-play:/play:ro
-      - /share/Container/wl2-dumps:/dumps
+      - ${HOST_DATA}/wl2-play:/play:ro
+      - ${HOST_DATA}/wl2-dumps:/dumps
       - wl-roms:/opt/trx64/resources/roms:ro
     networks:
       lan:
-        ipv4_address: 192.168.242.98
+        ipv4_address: ${WL2_TRX64_IP:?set WL2_TRX64_IP in .env}
 
 volumes:
   wl-roms:
@@ -63,4 +65,4 @@ volumes:
 networks:
   lan:
     external: true
-    name: qnet-static-eth0-885d06
+    name: ${LAN_NETWORK:?set LAN_NETWORK in .env}

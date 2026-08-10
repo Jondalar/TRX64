@@ -28,3 +28,7 @@ crates/trx64-core/tests/fixtures/vsf/*.vsf
 
 # ROMs baked into the Docker image — Commodore IP, never to github (Spec 799 §9.1)
 docker/roms/
+
+# Deployment addressing — never in the repo (see docker/.env.example)
+docker/.env
+.env

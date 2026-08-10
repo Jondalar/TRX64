@@ -42,16 +42,13 @@ jobs:
         shell: sh
     steps:
       - name: Fetch the source
-        # The token lives in the EXPRESSION context, not the shell environment — with
-        # `set -u` an unset $GITHUB_TOKEN aborts, which is the right failure but needs
-        # this to be handed over explicitly.
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # GITHUB_SERVER_URL is supplied by the runner, so the instance address stays out of
+        # the repository — and the workflow keeps working if the server ever moves.
         run: |
           set -eu
           apk add --no-cache git >/dev/null
           git clone --depth 1 --branch "${GITHUB_REF_NAME:-main}" \
-            "http://x-access-token:${GITHUB_TOKEN}@192.168.242.50/${GITHUB_REPOSITORY}.git" src
+            "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" src
           cd src && git log --oneline -1
 
       - name: Read the product version
