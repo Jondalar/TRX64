@@ -1,0 +1,61 @@
+# The two play sidecars, as a definition instead of two hand-typed `docker run` lines.
+#
+# One container = one live C64 (CLAUDE.md "One Machine Per Process"), so each project gets
+# its own: separate machine, separate memory, separate mounted media. They share only the
+# image and the ROM volume — never a machine.
+#
+#   docker compose -f compose.sidecars.yml up -d
+#
+# PREREQUISITES (both one-off, and deliberately NOT automated here):
+#
+#   1. The ROM volume, seeded from the private ROM image:
+#        docker volume create wl-roms
+#        docker run --rm -v wl-roms:/dest <registry>/alex/wl-roms:1
+#      The ROMs are Commodore's property. They live in a PRIVATE registry and are mounted
+#      read-only; the runtime image itself carries none, which is what allows it to be
+#      published at all.
+#
+#   2. The external network. These are macvlan-style static addresses on the LAN, so the
+#      editors reach them by a fixed IP that must not move — hence `external: true` rather
+#      than a compose-managed network.
+#
+# The editor/runtime pairs are addressed .94/.95 and .96/.97; keep that adjacency when
+# adding a third project.
+
+services:
+  wl-trx64:
+    image: wl-trx64:0.3.0
+    container_name: wl-trx64
+    restart: unless-stopped
+    environment:
+      TRX64_BIND: 0.0.0.0   # reachable from the sibling editor container, not just from inside
+    volumes:
+      - /share/Container/wl-play:/play:ro          # the built cart; ro so a flash write-back cannot touch it
+      - /share/Container/wl-dumps:/dumps           # snapshot/dump target — daemon writes here
+      - wl-roms:/opt/trx64/resources/roms:ro
+    networks:
+      lan:
+        ipv4_address: 192.168.242.95
+
+  wl2-trx64:
+    image: wl-trx64:0.3.0
+    container_name: wl2-trx64
+    restart: unless-stopped
+    environment:
+      TRX64_BIND: 0.0.0.0
+    volumes:
+      - /share/Container/wl2-play:/play:ro
+      - /share/Container/wl2-dumps:/dumps
+      - wl-roms:/opt/trx64/resources/roms:ro
+    networks:
+      lan:
+        ipv4_address: 192.168.242.97
+
+volumes:
+  wl-roms:
+    external: true
+
+networks:
+  lan:
+    external: true
+    name: qnet-static-eth0-885d06
