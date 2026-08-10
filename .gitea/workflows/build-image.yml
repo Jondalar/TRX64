@@ -8,12 +8,12 @@
 #
 # WHY IT NEEDS NO ROMS: the image is ROM-less (Spec 801 §A). Commodore's ROMs are not ours
 # to distribute, so they are mounted at runtime instead of baked in — which also means a
-# CI job needs nothing but the source. That is the whole reason this workflow is five
-# lines of substance.
+# CI job needs nothing but the source. That is why this workflow is so short.
 #
-# The `dockerbuild` label runs the job in a `docker:cli` container with the host's docker
-# socket, so `docker build` here builds on the NAS daemon directly. The image lands in the
-# NAS's local image store — the same one the wl-trx64 / wl2-trx64 containers run from.
+# WHY NO `actions/checkout`: it is a JavaScript action, so it needs `node` inside the job
+# container, and the container here is `docker:cli` (alpine, no node). Rather than drag a
+# node runtime in just to copy files, the source is cloned with git — three lines, no JS
+# runtime, and one less thing that has to be fetched from the internet on a LAN-only box.
 
 name: build-image
 
@@ -36,23 +36,31 @@ jobs:
   image:
     runs-on: dockerbuild
     steps:
-      - name: Check out
-        uses: actions/checkout@v4
+      - name: Fetch the source
+        run: |
+          set -eu
+          apk add --no-cache git >/dev/null
+          git clone --depth 1 --branch "${GITHUB_REF_NAME:-main}" \
+            "http://x-access-token:${GITHUB_TOKEN}@192.168.242.50/${GITHUB_REPOSITORY}.git" src
+          cd src && git log --oneline -1
 
       - name: Read the product version
         id: ver
         run: |
+          set -eu
           # One version for the whole workspace (Spec 800 §E). The image tag must equal it,
           # so a running container can be identified by `ping` alone.
           V="${{ inputs.version }}"
           if [ -z "$V" ]; then
-            V=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+            V=$(grep -m1 '^version = ' src/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           fi
           echo "version=$V" >> $GITHUB_OUTPUT
           echo "building wl-trx64:$V"
 
       - name: Build
         run: |
+          set -eu
+          cd src
           docker build \
             -f docker/Dockerfile \
             --build-arg TRX64_VERSION=${{ steps.ver.outputs.version }} \
@@ -60,11 +68,17 @@ jobs:
             -t wl-trx64:latest \
             .
 
-      - name: Show what was built
+      - name: Prove the tag matches what is inside it
         run: |
+          set -eu
           docker images wl-trx64 --format '{{.Repository}}:{{.Tag}}  {{.Size}}  {{.CreatedSince}}'
-          # Prove the binary in the image reports the version the tag claims. A tag that
-          # disagrees with the build is the drift this pipeline exists to prevent — it
-          # happened once already, when a hand-built "0.1.0" carried features 0.1.0 did not.
-          docker run --rm --entrypoint /usr/local/bin/trx64-daemon \
-            wl-trx64:${{ steps.ver.outputs.version }} --version
+          # A tag that disagrees with the build is the drift this pipeline exists to
+          # prevent — it happened once already, when a hand-built "0.1.0" carried features
+          # that 0.1.0 did not. Fail here rather than on the NAS three days later.
+          GOT=$(docker run --rm --entrypoint /usr/local/bin/trx64-daemon \
+                  wl-trx64:${{ steps.ver.outputs.version }} --version | awk '{print $2}')
+          echo "binary reports: $GOT / tag says: ${{ steps.ver.outputs.version }}"
+          [ "$GOT" = "${{ steps.ver.outputs.version }}" ] || {
+            echo "::error::version mismatch — the image does not contain what its tag claims"
+            exit 1
+          }
