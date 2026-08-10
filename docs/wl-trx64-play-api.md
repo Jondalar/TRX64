@@ -11,8 +11,10 @@ frozen and documented for consumers; **the daemon does not change for this.**
   whole contract (frame decode, key map, audio, reconnect). An embedder writes one tag;
   it never re-implements §4/§5. See §9. This doc specifies the wire protocol underneath it
   for anyone who must build a client from scratch (non-JS, custom UI).
-- **Scope of this doc:** exactly the methods + frame formats the play loop needs. The
-  daemon has a much larger monitor/trace/checkpoint surface; a play consumer ignores it.
+- **Scope of this doc:** the methods + frame formats the play loop needs (§1-§9), plus the
+  **monitor** — the daemon's full VICE-superset debugger, reachable over the SAME socket
+  and documented in §10. A pure viewer can ignore §10; anything that wants to inspect,
+  break or step the running machine needs nothing beyond it.
 
 ---
 
@@ -307,3 +309,59 @@ frames onto a 384×272 canvas → forward keys as §5 names.
 ---
 
 Cross-links: the packaging + sidecar-architecture spec (`../../C64ReverseEngineeringMCP/specs/799-trx64-docker.md`), `docker/Dockerfile` (the image), `web/trx64-player.js` (the shipped client) + `web/demo.html` (embed harness).
+
+---
+
+## 10. The monitor — the debug surface on the same socket
+
+Everything above is the *play* subset. The daemon also exposes its full interactive
+monitor — the VICE-superset debugger, ~130 verbs — over the **same WebSocket, on the same
+machine**, with no second port, no separate session and no extra auth. A consumer that
+already has a play connection has a debugger for free.
+
+```json
+→ {"jsonrpc":"2.0","id":7,"method":"monitor/exec","params":{"command":"r"}}
+← {"jsonrpc":"2.0","id":7,"result":{"output":"  ADDR AC XR YR SP NV-BDIZC\n .;e5d4 00 00 0a f3 ..1....."}}
+```
+
+**⚠ The error shape is a trap.** A verb that FAILS still comes back as a *successful* RPC
+— carrying `error` instead of `output`:
+
+```json
+← {"jsonrpc":"2.0","id":8,"result":{"error":"map: no trace store — …"}}
+```
+
+Read only `output` and every failed command looks like it silently did nothing. (Our own
+CLI cockpit had exactly that bug: monitor errors rendered as blank lines, which hid a real
+fault through two rounds of debugging.) Always check `error` first. A modal verb may also
+return `prompt`.
+
+### 10.1 The verbs a play/debug consumer actually wants
+
+| purpose | verbs |
+|---|---|
+| CPU + memory state | `r` (registers) · `m <from> [to]` (hex dump) · `d <addr>` (disassemble) · `sym`/`label` |
+| stop / resume / step | `g` (go) · `z` (step) · `si`/`so` (step in/over) · `ret` · `until <addr>` |
+| breakpoints + watches | `bk <addr>` · `watch`/`watch_read`/`watch_write` · `del`/`toggle`/`ignore` |
+| what just happened | `chis` (CPU history from the live ring) · `bt` (backtrace) · `whowrote <addr>` |
+| analysis | `map` (memory map) · `swimlane [from to]` · `taint <addr>` · `xref` |
+| media | `crt`/`disk` (status) · `swapcrt` · `eject` |
+| state capture | `dump`/`undump` (`.c64re`) · `ringdump`/`ringload` (whole reverse-debug buffer) |
+| the rest | `help` — the full reference, rendered by the daemon |
+
+**`map` / `swimlane` / `taint` no longer need a capture.** The delta and CPU-history rings
+record permanently, so these answer retroactively out of the ring when nothing was
+captured, and say so in their first line (naming the cycle window they used). `trace on` …
+`trace off` still exists and always wins — the two answer different questions: the ring
+looks *backwards* over a bounded window, a capture records *forwards* for as long as you
+let it run.
+
+### 10.2 On a shared machine
+
+The monitor mutates. `bk` + `g` stops the machine for **everyone** attached, `z` steps it
+under them, and `undump` replaces the world. That is the same warning as §3's power/reset
+group, and it applies with more force here because a breakpoint fires later, when whoever
+set it may no longer be looking.
+
+Reading is free: `r`, `m`, `d`, `chis`, `map`, `swimlane`, `bt` and the media/status verbs
+observe without touching the machine.
