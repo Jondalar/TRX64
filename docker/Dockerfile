@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # wl-trx64 — containerized TRX64 emulator daemon (Spec 799).
 #
 # One container = one trx64-daemon process = one live C64 (CLAUDE.md "One Machine Per
@@ -22,8 +23,23 @@ RUN apt-get update \
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN cargo build --release -p trx64-daemon \
-    && strip target/release/trx64-daemon
+# BuildKit cache mounts. Without them every build recompiled all 433 crates from zero —
+# and one of them, libduckdb-sys, is a C++ amalgamation that alone accounts for ~31 of the
+# 36 minutes. It does not change when our Rust does, so recompiling it per push was pure
+# waste. Cached: the downloaded crates, the git checkouts, and `target/`.
+#
+# WHY THE COPY AT THE END: a cache mount is not part of the image layer, so anything left
+# in `/src/target` is invisible to `COPY --from=builder`. The binary has to be lifted out
+# to a real path inside the same RUN, while the mount is still there.
+#
+# `sharing=locked` because two concurrent builds writing one cargo dir corrupt it.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/src/target,sharing=locked \
+    cargo build --release -p trx64-daemon \
+    && strip target/release/trx64-daemon \
+    && mkdir -p /out \
+    && cp target/release/trx64-daemon /out/trx64-daemon
 
 # ── runtime ─────────────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
@@ -43,7 +59,7 @@ RUN apt-get update \
     && mkdir -p /play /state \
     && chown trx64:trx64 /play /state
 
-COPY --from=builder /src/target/release/trx64-daemon /usr/local/bin/trx64-daemon
+COPY --from=builder /out/trx64-daemon /usr/local/bin/trx64-daemon
 # ROMs are NOT baked in (Spec 801 §A). They are Commodore's property, so an image that
 # carries them cannot be published — not to a registry, not as a release artifact. The
 # operator supplies them once, read-only, at the path rom_dir() already probes first:
