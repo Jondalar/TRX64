@@ -19,8 +19,13 @@
 #      editors reach them by a fixed IP that must not move — hence `external: true` rather
 #      than a compose-managed network.
 #
-# The editor/runtime pairs are addressed .94/.95 and .96/.97; keep that adjacency when
-# adding a third project.
+# Addressing: wl-editor .94 / wl-trx64 .95, wl2-editor .96 / wl2-trx64 .98.
+#
+# NOT .97 — that is the Home Assistant VM. The tidy .96/.97 pairing was tried and produced
+# a live IP conflict: the address pings (the VM answers) while the port is closed, and from
+# inside the bridge the container resolves its own address locally, so it looks fine from
+# one side and broken from the other. VMs are not containers and do not appear in
+# `docker ps`; check what actually ANSWERS on the LAN before claiming an address.
 
 services:
   wl-trx64:
@@ -49,7 +54,7 @@ services:
       - wl-roms:/opt/trx64/resources/roms:ro
     networks:
       lan:
-        ipv4_address: 192.168.242.97
+        ipv4_address: 192.168.242.98
 
 volumes:
   wl-roms:
