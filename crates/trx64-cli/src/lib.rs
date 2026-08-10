@@ -26,6 +26,25 @@ pub use engine::{CmdResult, Engine, StateSnapshot};
 /// `roms/` folder sitting next to it (the handout layout), while still honouring
 /// `$C64RE_ROOT` for the in-tree dev setup. `--rom-dir` overrides this entirely.
 pub fn default_rom_dir() -> std::path::PathBuf {
+    let candidates = rom_dir_candidates();
+    candidates
+        .iter()
+        .find(|p| p.join(KERNAL_FILE).exists())
+        .cloned()
+        .unwrap_or_else(|| {
+            candidates.into_iter().next().unwrap_or_else(|| std::path::PathBuf::from("roms"))
+        })
+}
+
+/// The file whose presence decides that a directory IS a ROM set.
+const KERNAL_FILE: &str = "kernal-901227-03.bin";
+
+/// The directories [`default_rom_dir`] probes, in order.
+///
+/// Split out from the resolver so a failure can print what was actually searched.
+/// "not found" without the search list is the kind of message that sends people
+/// reading source to find out where the program looked.
+pub fn rom_dir_candidates() -> Vec<std::path::PathBuf> {
     use std::path::PathBuf;
     let mut candidates: Vec<PathBuf> = Vec::new();
     // 1. Explicit C64RE checkout (dev / daemon parity).
@@ -47,15 +66,54 @@ pub fn default_rom_dir() -> std::path::PathBuf {
             .join("roms"),
     );
     candidates
-        .iter()
-        .find(|p| p.join("kernal-901227-03.bin").exists())
-        .cloned()
-        .unwrap_or_else(|| candidates.into_iter().next().unwrap_or_else(|| PathBuf::from("roms")))
+}
+
+/// Explain a boot that failed for want of ROMs, and say what to do about it.
+///
+/// This is the first thing a new user sees — `brew install trx64` then `trx64cli`
+/// lands here — so it has to carry the whole story: that the ROMs are deliberately
+/// absent, which files are wanted, and the two ways to point at them. The previous
+/// message was the `io::Error`'s Debug form, `Io(Os { code: 2, kind: NotFound, .. })`,
+/// which tells a stranger nothing and names no remedy.
+pub fn rom_missing_help(tried: &Path, err: &dyn std::fmt::Display) -> String {
+    let mut s = format!("no usable C64 ROMs in {}\n  {err}\n\n", tried.display());
+    s.push_str(
+        "TRX64 ships no ROMs and cannot: they are Commodore's property. Supply your own.\n\
+         \n\
+         Required (3 files, 20 KB):\n  \
+           kernal-901227-03.bin   basic-901226-01.bin   chargen-901225-01.bin\n\
+         Optional — without it the 1541 drive stays dead:\n  \
+           dos1541-325302-01+901229-05.bin   (or the alias 1541.bin)\n\
+         \n\
+         Point trx64cli at them, either way:\n  \
+           trx64cli --rom-dir /path/to/roms ...\n  \
+           export C64RE_ROOT=/path/to/c64re      # uses <that>/resources/roms\n",
+    );
+    // Only worth printing when the path came from the search — with an explicit
+    // --rom-dir, listing directories the user did not ask about is just noise.
+    let candidates = rom_dir_candidates();
+    if candidates.iter().any(|c| c == tried) {
+        s.push_str("\nSearched, in order:\n");
+        for c in &candidates {
+            let why = if !c.exists() {
+                "no such directory"
+            } else if !c.join(KERNAL_FILE).exists() {
+                "directory exists, but no kernal-901227-03.bin"
+            } else {
+                "ok"
+            };
+            s.push_str(&format!("  {} — {why}\n", c.display()));
+        }
+        if std::env::var_os("C64RE_ROOT").is_none() {
+            s.push_str("  (C64RE_ROOT is not set, so its candidate is absent from this list)\n");
+        }
+    }
+    s
 }
 
 /// Boot a fresh in-process machine from `rom_dir` and wrap it in an [`Engine`].
 pub fn boot_engine(rom_dir: &Path) -> Result<Engine, String> {
     let state = trx64_daemon::create_embedded_state(rom_dir)
-        .map_err(|e| format!("boot failed (ROMs at {}): {e:?}", rom_dir.display()))?;
+        .map_err(|e| rom_missing_help(rom_dir, &e))?;
     Ok(Engine::new(state))
 }

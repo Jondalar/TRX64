@@ -912,6 +912,50 @@ const DEV_C64RE_ROOT: &str =
 /// cart mount didn't); the CWD; finally the sibling C64RE dev checkout (source-tree
 /// relative, [`DEV_C64RE_ROOT`] — no author path in the sources). Pick the first that
 /// actually contains the KERNAL; only fall back to a bare `roms` when nothing matches.
+/// What to print when the machine could not boot for want of ROMs.
+///
+/// A separate function so both arms can be tested: the daemon's own `rom_dir()` walks
+/// up from the executable and ends at a compile-time dev checkout, so on a developer's
+/// machine this path cannot be reached at all — which is precisely how it would ship
+/// unverified.
+///
+/// The remedy has to follow the audience. The image ships WITHOUT ROMs (Commodore's
+/// property, so a published image must not carry them) and a forgotten `-v` was the one
+/// likely cause back when the container was the only distribution. It is now also a
+/// release archive and a Homebrew tap, where `-v <host>/roms:...` is simply wrong advice.
+fn rom_missing_report(roms: &std::path::Path, err: &dyn std::fmt::Display, in_container: bool) -> String {
+    // NOT canonicalize(): that resolves by asking the filesystem, so it fails on exactly
+    // the path being complained about. Join against the working directory instead —
+    // unnormalised, but absolute, which is the point of printing it.
+    let abs = if roms.is_absolute() {
+        roms.to_path_buf()
+    } else {
+        env::current_dir().map(|d| d.join(roms)).unwrap_or_else(|_| roms.to_path_buf())
+    };
+    let mut s = format!(
+        "[trx64] WARN: ROM boot failed ({err})\n\
+         [trx64]   looked in: {}\n\
+         [trx64]   The machine will run BLANK (PC=$0000, no KERNAL) until ROMs are present.\n",
+        abs.display()
+    );
+    if in_container {
+        s.push_str("[trx64]   This is a container — mount them read-only:\n");
+        s.push_str("[trx64]     -v <host>/roms:/opt/trx64/resources/roms:ro\n");
+    } else {
+        s.push_str("[trx64]   Say where they are, or put them where the daemon looks:\n");
+        s.push_str(
+            "[trx64]     export C64RE_ROOT=/path/to/c64re   # uses <that>/resources/roms\n",
+        );
+        s.push_str("[trx64]     ...or a roms/ folder next to the executable\n");
+    }
+    s.push_str(
+        "[trx64]   TRX64 ships no ROMs (Commodore's property). Required: \
+         kernal-901227-03.bin, basic-901226-01.bin, chargen-901225-01.bin; \
+         dos1541-325302-01+901229-05.bin (or 1541.bin) for the drive.\n",
+    );
+    s
+}
+
 fn rom_dir() -> PathBuf {
     let has_kernal = |p: &std::path::Path| p.join("kernal-901227-03.bin").exists();
     if let Ok(root) = env::var("C64RE_ROOT") {
@@ -15192,22 +15236,8 @@ async fn main() {
             );
         }
         Err(e) => {
-            // The container image ships WITHOUT ROMs (they are Commodore's property, so a
-            // published image must not carry them). A forgotten mount is therefore the
-            // single most likely cause of this, and a bare "running with blank machine"
-            // sends the operator hunting through emulator internals for what is actually a
-            // missing `-v`. Say the actionable thing.
-            eprintln!("[trx64] WARN: ROM boot failed ({e})");
-            eprintln!("[trx64]   looked in: {}", roms.display());
-            eprintln!(
-                "[trx64]   The machine will run BLANK (PC=$0000, no KERNAL) until ROMs are \
-                 present. In a container, mount them read-only:"
-            );
-            eprintln!("[trx64]     -v <host>/roms:/opt/trx64/resources/roms:ro");
-            eprintln!(
-                "[trx64]   Six files (~68 KB): kernal-901227-03.bin, basic-901226-01.bin, \
-                 chargen, 1541*.bin. Elsewhere, set C64RE_ROOT or TRX64_ROOT."
-            );
+            // `/.dockerenv` is the cheap, long-standing marker for "this is a container".
+            eprint!("{}", rom_missing_report(&roms, &e, std::path::Path::new("/.dockerenv").exists()));
         }
     }
 
@@ -15793,6 +15823,35 @@ mod batch1_tests {
             let end = region["end"].as_u64().unwrap();
             assert!(end >= start, "region end >= start");
         }
+    }
+
+    #[test]
+    fn rom_missing_report_matches_its_audience() {
+        // This message cannot be reached on a developer machine — rom_dir() always finds
+        // the compile-time dev checkout — so without this test it would ship unread.
+        let err = "ROM I/O error: No such file or directory (os error 2)";
+
+        let container = rom_missing_report(std::path::Path::new("/opt/trx64/resources/roms"), &err, true);
+        assert!(container.contains("-v <host>/roms:/opt/trx64/resources/roms:ro"), "{container}");
+        assert!(!container.contains("C64RE_ROOT"), "no host advice in a container: {container}");
+
+        let host = rom_missing_report(std::path::Path::new("/somewhere/roms"), &err, false);
+        assert!(host.contains("C64RE_ROOT"), "{host}");
+        assert!(!host.contains("-v <host>"), "no docker advice off-container: {host}");
+
+        // Both must carry the diagnosis, the consequence and the file list.
+        for m in [&container, &host] {
+            assert!(m.contains(err), "underlying error is quoted: {m}");
+            assert!(m.contains("run BLANK"), "consequence is stated: {m}");
+            assert!(m.contains("kernal-901227-03.bin"), "names the files: {m}");
+            assert!(m.contains("Commodore's property"), "says why none ship: {m}");
+        }
+
+        // A relative dir is reported absolutely — canonicalize() cannot do this, because
+        // the directory being complained about is the one that does not exist.
+        let rel = rom_missing_report(std::path::Path::new("roms"), &err, false);
+        let printed = rel.lines().find(|l| l.contains("looked in:")).unwrap();
+        assert!(printed.contains(&format!("{}", env::current_dir().unwrap().display())), "{rel}");
     }
 
     #[test]
