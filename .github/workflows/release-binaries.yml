@@ -1,0 +1,92 @@
+# Platform binaries, built on GitHub-hosted runners.
+#
+# WHY HERE AND NOT ON THE NAS: containers are built on the self-hosted runner, where the
+# NAS is native amd64 and the image lands where it runs. Binaries are different — macOS
+# needs a Mac and Windows needs MSVC, and cross-compiling is not a way out for this
+# workspace: reSID and a bundled DuckDB are compiled by a real C++ toolchain via build.rs,
+# so every target needs that target's compiler. GitHub has the hardware; running a Mac as
+# a build slave is the thing this avoids.
+#
+# The two pipelines answer different questions, which is why living in different places is
+# not confusing: the NAS is the GATE (every push, fast, is the image sane), this is the
+# RELEASE (rare, deliberate, all platforms).
+#
+# STAGED ON PURPOSE: macOS only for now. Windows follows once this is green, Linux after
+# that. One platform at a time, so a failure names one cause — the same discipline that
+# made the self-hosted runner's four failed attempts readable instead of a guessing game.
+
+name: release-binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version label for the artifact (defaults to the workspace version)'
+        required: false
+
+jobs:
+  macos:
+    # macos-latest is Apple Silicon, which matches the machine these are for. No extra
+    # system dependencies: the CLI pulls in winit + cpal, and their macOS backends
+    # (AppKit / CoreAudio) are part of the OS. The daemon's reSID C++ needs a compiler,
+    # and the Xcode command line tools are preinstalled.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          rustc --version
+          cargo --version
+          clang++ --version | head -1
+
+      - name: Read the product version
+        id: ver
+        run: |
+          V="${{ inputs.version }}"
+          if [ -z "$V" ]; then
+            V=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          fi
+          echo "version=$V" >> $GITHUB_OUTPUT
+          echo "building $V for macos-arm64"
+
+      - name: Build
+        # Expect this to take a while on a cold runner: the workspace is 433 crates, and
+        # one of them (bundled DuckDB) is a C++ amalgamation that took ~31 of 36 minutes
+        # natively on the NAS. Caching is the obvious follow-up once this is green — it is
+        # deliberately absent here so a first failure has one cause, not two.
+        run: cargo build --release -p trx64-cli -p trx64-daemon
+
+      - name: Prove the binaries are what they claim
+        run: |
+          set -eu
+          V="${{ steps.ver.outputs.version }}"
+          for b in trx64cli trx64-daemon; do
+            GOT=$(./target/release/$b --version | awk '{print $2}')
+            echo "$b reports $GOT (expected $V)"
+            [ "$GOT" = "$V" ] || { echo "::error::$b reports $GOT but the build says $V"; exit 1; }
+          done
+          # A binary that cannot find its dynamic libraries is useless to whoever downloads
+          # it; list them so a missing/odd link shows up here rather than on someone's Mac.
+          otool -L ./target/release/trx64cli | head -20
+
+      - name: Package
+        run: |
+          set -eu
+          V="${{ steps.ver.outputs.version }}"
+          mkdir -p dist
+          cp target/release/trx64cli target/release/trx64-daemon dist/
+          cd dist
+          # NOTE the ROMs are NOT bundled — they are Commodore's property. The daemon
+          # resolves them from C64RE_ROOT/resources/roms; see the container's ROM volume.
+          tar czf "trx64-$V-macos-arm64.tar.gz" trx64cli trx64-daemon
+          shasum -a 256 "trx64-$V-macos-arm64.tar.gz" > "trx64-$V-macos-arm64.tar.gz.sha256"
+          ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trx64-macos-arm64
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
