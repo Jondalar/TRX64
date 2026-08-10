@@ -35,6 +35,11 @@ on:
 jobs:
   image:
     runs-on: dockerbuild
+    # The job container is `docker:cli` — alpine, so `sh`, not `bash`. Actions defaults to
+    # bash, which simply is not there. Set once here rather than on every step.
+    defaults:
+      run:
+        shell: sh
     steps:
       - name: Fetch the source
         run: |
