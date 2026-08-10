@@ -3234,7 +3234,7 @@ checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 
 [[package]]
 name = "trx64-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "clap",
@@ -3251,7 +3251,7 @@ dependencies = [
 
 [[package]]
 name = "trx64-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "cc",
@@ -3263,7 +3263,7 @@ dependencies = [
 
 [[package]]
 name = "trx64-daemon"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "futures-util",
@@ -3283,7 +3283,7 @@ dependencies = [
 
 [[package]]
 name = "trx64-ffi"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "serde",
@@ -3296,7 +3296,7 @@ dependencies = [
 
 [[package]]
 name = "trx64-session"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "trx64-core",
  "trx64-trace",
@@ -3304,7 +3304,7 @@ dependencies = [
 
 [[package]]
 name = "trx64-static"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde_json",
  "trx64-core",
@@ -3312,14 +3312,14 @@ dependencies = [
 
 [[package]]
 name = "trx64-trace"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "trx64-core",
 ]
 
 [[package]]
 name = "trx64-traceindex"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "duckdb",
  "serde",
