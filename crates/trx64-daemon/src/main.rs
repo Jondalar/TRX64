@@ -15192,7 +15192,22 @@ async fn main() {
             );
         }
         Err(e) => {
-            eprintln!("[trx64] WARN: ROM boot failed ({e}), running with blank machine");
+            // The container image ships WITHOUT ROMs (they are Commodore's property, so a
+            // published image must not carry them). A forgotten mount is therefore the
+            // single most likely cause of this, and a bare "running with blank machine"
+            // sends the operator hunting through emulator internals for what is actually a
+            // missing `-v`. Say the actionable thing.
+            eprintln!("[trx64] WARN: ROM boot failed ({e})");
+            eprintln!("[trx64]   looked in: {}", roms.display());
+            eprintln!(
+                "[trx64]   The machine will run BLANK (PC=$0000, no KERNAL) until ROMs are \
+                 present. In a container, mount them read-only:"
+            );
+            eprintln!("[trx64]     -v <host>/roms:/opt/trx64/resources/roms:ro");
+            eprintln!(
+                "[trx64]   Six files (~68 KB): kernal-901227-03.bin, basic-901226-01.bin, \
+                 chargen, 1541*.bin. Elsewhere, set C64RE_ROOT or TRX64_ROOT."
+            );
         }
     }
 

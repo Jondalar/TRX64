@@ -44,16 +44,23 @@ RUN apt-get update \
     && chown trx64:trx64 /play /state
 
 COPY --from=builder /src/target/release/trx64-daemon /usr/local/bin/trx64-daemon
-# ROMs (Commodore IP — baked, gitignored, LAN-only per Spec 799 §9.1). The daemon's
-# rom_dir() resolves C64RE_ROOT/resources/roms first (see main.rs rom_dir cross-platform).
-COPY docker/roms /opt/trx64/resources/roms
+# ROMs are NOT baked in (Spec 801 §A). They are Commodore's property, so an image that
+# carries them cannot be published — not to a registry, not as a release artifact. The
+# operator supplies them once, read-only, at the path rom_dir() already probes first:
+#
+#   -v <host>/roms:/opt/trx64/resources/roms:ro
+#
+# Six files, ~68 KB. Normally a copy of a set the operator already owns rather than a
+# download — no third party is involved and nothing has to be reachable at boot.
+RUN mkdir -p /opt/trx64/resources/roms && chown -R trx64:trx64 /opt/trx64
 
 ENV C64RE_ROOT=/opt/trx64 \
     TRX64_PORT=4340 \
     TRX64_BIND=0.0.0.0
 EXPOSE 4340
-# `/play` = shared media (ro from the consumer's side); `/state` = optional undumps/checkpoints.
-VOLUME ["/play", "/state"]
+# `/play` = shared media (ro from the consumer's side); `/state` = optional undumps/
+# checkpoints; the ROM mount is required for the machine to boot at all.
+VOLUME ["/play", "/state", "/opt/trx64/resources/roms"]
 USER trx64
 WORKDIR /state
 
