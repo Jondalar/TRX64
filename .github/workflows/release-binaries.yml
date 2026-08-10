@@ -11,9 +11,11 @@
 # not confusing: the NAS is the GATE (every push, fast, is the image sane), this is the
 # RELEASE (rare, deliberate, all platforms).
 #
-# STAGED: macOS proved itself first (green, 16 min, links only /usr/lib, and the produced
-# daemon boots a real machine). Windows joins now. Linux follows once Windows is confirmed
-# on real hardware — one platform per step, so a failure names one cause.
+# STAGED, one platform per step so a failure names one cause. macOS proved itself first
+# (green, 16 min, links only /usr/lib, and the produced daemon boots a real machine).
+# Windows is green as of 2026-08-10 — it needed a shim for reSID's gcc-only branch hints
+# (see crates/trx64-core/resid_msvc_prelude.h), and the bundled DuckDB turned out to
+# compile under MSVC untouched. Linux joins once Windows is confirmed on real hardware.
 #
 # SHELL: `bash` everywhere, including Windows (git-bash ships on the runner). One set of
 # scripts beats maintaining a PowerShell twin of each step.
@@ -26,13 +28,54 @@ on:
       version:
         description: 'Version label for the artifact (defaults to the workspace version)'
         required: false
+  # Nightly, 03:00 CEST (cron is UTC). Nightly and not per-push because a cold build is
+  # 16-40 minutes per platform and most pushes here cannot change a binary's behaviour
+  # enough to be worth that. The `commits` job below turns the night into a no-op when
+  # nothing landed, so a quiet week costs nothing at all.
+  #
+  # A pleasant side effect: a nightly that DOES build keeps the cargo cache warm, and
+  # GitHub only evicts entries after 7 days without a hit. So the slow cold build is what
+  # you get after a genuinely quiet stretch — which is exactly when nobody is waiting.
+  #
+  # NOTE GitHub disables scheduled workflows in a public repo after 60 days without any
+  # activity, and re-enabling is a button in the Actions tab.
+  schedule:
+    - cron: '0 1 * * *'
 
 defaults:
   run:
     shell: bash
 
 jobs:
+  # Did anything land since yesterday? A scheduled run with no new commit would rebuild
+  # the identical tree, so it is skipped. Manual runs always build — asking for one IS the
+  # reason. Depth-1 is enough: the question is only whether HEAD itself is recent.
+  commits:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        run: |
+          set -eu
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "build=true" >> $GITHUB_OUTPUT
+            echo "manual run — building"
+            exit 0
+          fi
+          LAST=$(git log -1 --format=%cI)
+          if [ -n "$(git log -1 --since='25 hours ago' --format=%H)" ]; then
+            echo "build=true" >> $GITHUB_OUTPUT
+            echo "new commit since yesterday ($LAST) — building"
+          else
+            echo "build=false" >> $GITHUB_OUTPUT
+            echo "nothing landed since yesterday (HEAD is $LAST) — skipping"
+          fi
+
   build:
+    needs: commits
+    if: needs.commits.outputs.build == 'true'
     strategy:
       # Keep going if one platform breaks — a Windows failure should not hide a good macOS
       # build, especially while platforms are still being added one at a time.
@@ -153,3 +196,7 @@ jobs:
             dist/*.zip
             dist/*.sha256
           if-no-files-found: error
+          # Nightlies are a health check, not an archive — a real release is cut
+          # deliberately. Two weeks is long enough to grab yesterday's build and short
+          # enough that the tab does not fill with 90 days of identical zips.
+          retention-days: 14

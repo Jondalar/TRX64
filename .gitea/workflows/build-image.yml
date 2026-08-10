@@ -15,17 +15,26 @@
 # node runtime in just to copy files, the source is cloned with git — three lines, no JS
 # runtime, and one less thing that has to be fetched from the internet on a LAN-only box.
 
+# WHY MANUAL ONLY: this started as a push trigger with a paths filter, which sounded
+# selective and was not — `crates/**` is very nearly every push on this repo, and a cold
+# build is 36-45 minutes on a single runner that everything else then queues behind. Worse,
+# most of those builds could not change the image at all: the Dockerfile builds
+# `-p trx64-daemon`, so nothing under `crates/trx64-cli/**` ever reaches it, and days of
+# TUI work were triggering builds that were identical by construction.
+#
+# There is also act_runner v0.6.1 to consider: past ~45 minutes it logs "No Response from
+# RunDaemon for 60s" and then panics in report/reporter.go:340. The build itself survives —
+# the image is written and tagged — but the reporting dies and Gitea marks a good build
+# failed. Automatic long builds meant regularly explaining a red that was not real.
+#
+# THE COST, stated plainly: nothing now proves the image still builds until someone asks
+# for it. It can rot quietly between deploys. That is accepted because the ask is one
+# click, the version check below still refuses to ship a mislabelled image, and the
+# alternative was a gate people had learned to disbelieve.
+
 name: build-image
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'crates/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'docker/Dockerfile'
-      - '.gitea/workflows/build-image.yml'
   workflow_dispatch:
     inputs:
       version:
