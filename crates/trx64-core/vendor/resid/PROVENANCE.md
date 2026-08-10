@@ -39,6 +39,25 @@ standalone emscripten build. The engine is self-contained — it includes only
 standard C++ headers (`<cassert> <cmath> <cstdlib> <fstream> <iostream>`),
 no VICE-external dependencies.
 
+### The one place "pre-resolved" is a lie: MSVC
+
+Those macros were resolved by *gcc's* configure run. `HAVE_BUILTIN_EXPECT 1`
+makes `likely()`/`unlikely()` expand to `__builtin_expect`, which MSVC does not
+have — a Windows build fails with ~50× `error C3861: '__builtin_expect':
+identifier not found` in `wave.h` and `envelope.h`.
+
+Fixed **without touching these files**: `build.rs` force-includes
+`crates/trx64-core/resid_msvc_prelude.h` (`/FI`) on MSVC targets only. It
+includes `siddefs.h` first — tripping its own `RESID_SIDDEFS_H` guard so the
+vendor sources' includes become no-ops — then redefines the two macros to the
+exact fallback `siddefs.h` itself uses when the configure probe fails,
+`#define likely(x) (x)`. Branch hints steer optimizer layout and change no
+value the SID produces, so audio stays byte-identical.
+
+`__builtin_expect` is the only gcc-ism in this directory (checked: no
+`__attribute__`, no `typeof`, no other `__builtin_*`), so no further shimming
+is expected.
+
 ## License
 
 reSID is **GPL-2.0-or-later** (`Copyright (C) 2010 Dag Lem <resid@nimrod.no>`).

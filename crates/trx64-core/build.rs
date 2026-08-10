@@ -9,12 +9,15 @@
 //   - -DVERSION="1.0-pre2" (version.cc needs it as a C string literal).
 //   - -std=c++11, -O3, -I<vendor/resid>.
 // siddefs.h is the VICE-configured variant (macros pre-resolved), so no
-// configure step is needed.
+// configure step is needed — with ONE caveat: it was configured by gcc, so the
+// resolved `HAVE_BUILTIN_EXPECT 1` is wrong for MSVC. See the is_msvc branch
+// below and resid_msvc_prelude.h.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn main() {
     let resid = Path::new("vendor/resid");
+    let is_msvc = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
 
     // reSID compile units (verbatim from build-resid-wasm.mjs RESID_UNITS).
     let units = [
@@ -32,7 +35,6 @@ fn main() {
     let mut build = cc::Build::new();
     build
         .cpp(true)
-        .std("c++11")
         .include(resid)
         // version.cc: `resid_version_string = VERSION;` needs a C string literal.
         .define("VERSION", "\"1.0-pre2\"")
@@ -46,6 +48,22 @@ fn main() {
         .flag_if_supported("-Wno-unused-variable")
         .warnings(false);
 
+    if is_msvc {
+        // MSVC has no `-std:c++11` (it starts at c++14) and answers the flag with a
+        // D9002 warning per translation unit; its default is already a C++11 superset.
+        //
+        // `/FI` force-includes our prelude ahead of every unit to neutralise reSID's
+        // gcc-only `__builtin_expect` branch hints WITHOUT editing the vendored
+        // siddefs.h — see resid_msvc_prelude.h for the full reasoning. Absolute path
+        // because cl resolves /FI against its own working directory, not ours.
+        let prelude: PathBuf = [env!("CARGO_MANIFEST_DIR"), "resid_msvc_prelude.h"]
+            .iter()
+            .collect();
+        build.flag(format!("/FI{}", prelude.display()));
+    } else {
+        build.std("c++11");
+    }
+
     for u in units {
         build.file(resid.join(u));
     }
@@ -57,4 +75,5 @@ fn main() {
     // Rebuild when any vendored source/header or the shim changes.
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=vendor/resid");
+    println!("cargo:rerun-if-changed=resid_msvc_prelude.h");
 }
