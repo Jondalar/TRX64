@@ -11,9 +11,12 @@
 # not confusing: the NAS is the GATE (every push, fast, is the image sane), this is the
 # RELEASE (rare, deliberate, all platforms).
 #
-# STAGED ON PURPOSE: macOS only for now. Windows follows once this is green, Linux after
-# that. One platform at a time, so a failure names one cause — the same discipline that
-# made the self-hosted runner's four failed attempts readable instead of a guessing game.
+# STAGED: macOS proved itself first (green, 16 min, links only /usr/lib, and the produced
+# daemon boots a real machine). Windows joins now. Linux follows once Windows is confirmed
+# on real hardware — one platform per step, so a failure names one cause.
+#
+# SHELL: `bash` everywhere, including Windows (git-bash ships on the runner). One set of
+# scripts beats maintaining a PowerShell twin of each step.
 
 name: release-binaries
 
@@ -24,13 +27,30 @@ on:
         description: 'Version label for the artifact (defaults to the workspace version)'
         required: false
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  macos:
-    # macos-latest is Apple Silicon, which matches the machine these are for. No extra
-    # system dependencies: the CLI pulls in winit + cpal, and their macOS backends
-    # (AppKit / CoreAudio) are part of the OS. The daemon's reSID C++ needs a compiler,
-    # and the Xcode command line tools are preinstalled.
-    runs-on: macos-latest
+  build:
+    strategy:
+      # Keep going if one platform breaks — a Windows failure should not hide a good macOS
+      # build, especially while platforms are still being added one at a time.
+      fail-fast: false
+      matrix:
+        include:
+          # macOS: no extra system dependencies. The CLI pulls in winit + cpal, whose
+          # macOS backends (AppKit / CoreAudio) are part of the OS, and the Xcode command
+          # line tools supply the C++ compiler reSID needs.
+          - os: macos-latest
+            target: macos-arm64
+            archive: tar.gz
+          # Windows: MSVC toolchain, preinstalled. winit/cpal use Win32/WASAPI, also part
+          # of the OS. `.zip` because that is what a Windows user expects to receive.
+          - os: windows-latest
+            target: windows-x86_64
+            archive: zip
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -38,55 +58,80 @@ jobs:
         run: |
           rustc --version
           cargo --version
-          clang++ --version | head -1
 
       - name: Read the product version
         id: ver
         run: |
+          set -eu
           V="${{ inputs.version }}"
           if [ -z "$V" ]; then
             V=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           fi
           echo "version=$V" >> $GITHUB_OUTPUT
-          echo "building $V for macos-arm64"
+          echo "building $V for ${{ matrix.target }}"
 
       - name: Build
-        # Expect this to take a while on a cold runner: the workspace is 433 crates, and
-        # one of them (bundled DuckDB) is a C++ amalgamation that took ~31 of 36 minutes
-        # natively on the NAS. Caching is the obvious follow-up once this is green — it is
-        # deliberately absent here so a first failure has one cause, not two.
-        run: cargo build --release -p trx64-cli -p trx64-daemon
+        # `strip` via cargo rather than the platform's strip tool: one mechanism for every
+        # target, and it does not touch the local release profile developers debug with.
+        # The first macOS artifact shipped 8.5 MB of symbols (94k of them) nobody running
+        # the binary needs.
+        #
+        # Expect a long, cold build: 433 crates, one of which (bundled DuckDB) is a C++
+        # amalgamation that alone took ~31 of 36 minutes natively on the NAS. Caching is
+        # the obvious follow-up once every platform is green.
+        run: |
+          cargo build --release --config 'profile.release.strip="symbols"' \
+            -p trx64-cli -p trx64-daemon
 
       - name: Prove the binaries are what they claim
         run: |
           set -eu
           V="${{ steps.ver.outputs.version }}"
+          EXT=""
+          [ "${{ runner.os }}" = "Windows" ] && EXT=".exe"
           for b in trx64cli trx64-daemon; do
-            GOT=$(./target/release/$b --version | awk '{print $2}')
+            GOT=$(./target/release/$b$EXT --version | awk '{print $2}')
             echo "$b reports $GOT (expected $V)"
             [ "$GOT" = "$V" ] || { echo "::error::$b reports $GOT but the build says $V"; exit 1; }
           done
-          # A binary that cannot find its dynamic libraries is useless to whoever downloads
-          # it; list them so a missing/odd link shows up here rather than on someone's Mac.
-          otool -L ./target/release/trx64cli | head -20
+
+      - name: What does it link against
+        # A binary that cannot resolve its dynamic libraries is useless to whoever
+        # downloads it, and an accidental dependency on something only the runner has is
+        # invisible until then. macOS answered "/usr/lib only", which is what we want.
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            otool -L ./target/release/trx64cli | head -20
+          else
+            dumpbin //DEPENDENTS ./target/release/trx64cli.exe 2>/dev/null | head -25 \
+              || echo "(dumpbin unavailable outside the VS env — skipped, not a failure)"
+          fi
 
       - name: Package
         run: |
           set -eu
           V="${{ steps.ver.outputs.version }}"
+          NAME="trx64-$V-${{ matrix.target }}"
           mkdir -p dist
-          cp target/release/trx64cli target/release/trx64-daemon dist/
-          cd dist
           # NOTE the ROMs are NOT bundled — they are Commodore's property. The daemon
-          # resolves them from C64RE_ROOT/resources/roms; see the container's ROM volume.
-          tar czf "trx64-$V-macos-arm64.tar.gz" trx64cli trx64-daemon
-          shasum -a 256 "trx64-$V-macos-arm64.tar.gz" > "trx64-$V-macos-arm64.tar.gz.sha256"
-          ls -la
+          # resolves them from C64RE_ROOT/resources/roms; the container mounts them as a
+          # volume for the same reason.
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            cp target/release/trx64cli.exe target/release/trx64-daemon.exe dist/
+            (cd dist && 7z a "$NAME.zip" trx64cli.exe trx64-daemon.exe >/dev/null)
+            (cd dist && sha256sum "$NAME.zip" > "$NAME.zip.sha256")
+          else
+            cp target/release/trx64cli target/release/trx64-daemon dist/
+            (cd dist && tar czf "$NAME.tar.gz" trx64cli trx64-daemon)
+            (cd dist && shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
+          fi
+          ls -la dist
 
       - uses: actions/upload-artifact@v4
         with:
-          name: trx64-macos-arm64
+          name: trx64-${{ matrix.target }}
           path: |
             dist/*.tar.gz
+            dist/*.zip
             dist/*.sha256
           if-no-files-found: error
