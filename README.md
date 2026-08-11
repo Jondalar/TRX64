@@ -117,7 +117,10 @@ The surface, by area:
 - **Media** — mount/swap/unmount disks (`.d64`/`.g64`) and cartridges (`.crt`)
   through one checkpointing ingress (cartridge fidelity above).
 - **Trace** — start a capture over chosen domains, index it, query it, or carve a
-  trace for an exact cycle window straight out of the always-on ring.
+  trace for an exact cycle window straight out of the always-on ring. Two domains
+  are armed-only READ-SET lanes rather than firehoses: `drive-mechanism` records
+  which physical block the 1541 actually latched bytes off, `cart-read` which
+  cartridge bank served which reads and over which part of its 8 KB window.
 - **Checkpoint / scrub & snapshots** — the ring-bound rewind (a 10 s
   scrub-filmstrip) plus full-machine snapshots to `.c64re`.
 - **Reverse-debug** — `reverse_step`, `who_wrote`, `crash_triage`, and live CPU
