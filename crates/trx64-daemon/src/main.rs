@@ -3167,6 +3167,36 @@ fn sc_to_ascii(sc: u8) -> char {
 /// as "no banking". `wr d020 00` therefore wrote the RAM hidden *under* the I/O window,
 /// left the border untouched, and reported success — the TS reference's own comment for
 /// the same line reads "`wr d020 00` blacks the border".
+/// Was a project workspace actually named, or is the "project dir" just wherever the
+/// daemon happens to be running?
+///
+/// `fs_project_dir()` can never fail — it ends in `current_dir()` — which is right for
+/// resolving a path but wrong as a licence to WRITE. The label verbs persist into
+/// `knowledge/` under this directory, so they ask this first.
+fn project_is_bound() -> bool {
+    std::env::args()
+        .skip_while(|a| a != "--project")
+        .nth(1)
+        .filter(|p| !p.is_empty())
+        .or_else(|| std::env::var("C64RE_PROJECT_DIR").ok().filter(|p| !p.is_empty()))
+        .is_some()
+}
+
+/// A monitor read through the bank lens, honouring the `sidefx` toggle.
+///
+/// Default (`sidefx off`) is the peek lane — looking must not change the machine. With
+/// `sidefx on` the reference performs the LIVE read for the cpu/io lenses, so that
+/// inspecting a register does to the machine exactly what the CPU would. That toggle was
+/// stored and never consulted here, which made the monitor's own `sidefx = on (monitor
+/// reads are LIVE — I/O side effects)` reply untrue.
+fn monitor_read(st: &mut State, addr: u16, lens: &str) -> u8 {
+    if st.mon.sidefx_on && matches!(lens, "cpu" | "io") {
+        st.session.machine.read_full_live(addr)
+    } else {
+        st.session.machine.peek_lens(addr, lens)
+    }
+}
+
 fn monitor_write(st: &mut State, addr: u16, bytes: &[u8], lens: &str) {
     match lens {
         "ram" => {
@@ -3239,11 +3269,12 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
         if LENSES.contains(&l.as_str()) { Some(l) } else { None }
     };
 
-    // sidefx OFF (default) → side-effect-free peek; ON → live read. TRX64's daemon
-    // has no separate side-effecting monitor read path (read_full is already the
-    // peek lane), so `sidefx` is honoured as the toggle wire-state but reads always
-    // use the side-effect-free lens peek (documented; the gate exercises peek).
-    let _sidefx = st.mon.sidefx_on;
+    // sidefx OFF (default) → side-effect-free peek; ON → the LIVE read the CPU would
+    // do, via `monitor_read` → `Machine::read_full_live`. The toggle used to be stored
+    // and never consulted, so the monitor answered "reads are LIVE" while every read
+    // stayed a peek. It covers the inspection verbs (m/c/t/h); `d`/`sd`/`bitmap` render
+    // through a plain `Fn(u16) -> u8` and stay peeks, which is also the sane reading —
+    // a listing should not alter the machine it describes.
 
     // ---- FILE mini-shell path helpers (= monitor-shell.ts:174-185) ----------------
     // projectDir = `--project <dir>` arg ?? C64RE_PROJECT_DIR env ?? cwd (1:1 with the
@@ -3506,7 +3537,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                     let b = if device == "drive8" {
                         st.session.machine.drive8.drive_peek((aj & 0xffff) as u16)
                     } else {
-                        st.session.machine.peek_lens((aj & 0xffff) as u16, &lens)
+                        monitor_read(st, (aj & 0xffff) as u16, &lens)
                     };
                     bytes.push(format!("{:02X}", b));
                     ascii.push(if (0x20..0x7f).contains(&b) { b as char } else { '.' });
@@ -3562,6 +3593,11 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             let labels = project_knowledge::user_label_index(&fs_project_dir());
             // device drive8: disassemble the 1541 CPU address space (read-inspect).
             let on_drive = device == "drive8";
+            // Peek, deliberately, even under `sidefx on`: the renderer wants a plain
+            // `Fn(u16) -> u8`, and a side-effecting read cannot be one — it needs &mut.
+            // Reading a whole listing through live I/O would also mean a disassembly
+            // silently changing the machine it is describing. `sidefx` covers the
+            // inspection verbs (m/c/t/h) where the reference's own example lives.
             let read = |x: u16| {
                 if on_drive {
                     st.session.machine.drive8.drive_peek(x)
@@ -3687,10 +3723,19 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
         // UI-prompt path and not exercised by the gate, so the walk runs to its limit).
         "df" => {
             let mut i = 1usize;
-            // Accept (and skip) the -i flag; TRX64's monitor/exec is request/response
-            // with no modal prompt channel, so the walk proceeds non-interactively.
+            // `-i` is NOT implemented here. It used to be accepted and skipped, so the
+            // walk ran to its limit while the caller waited for a `branch t/f/b>` prompt
+            // that would never come — and a follow-up bare `t`/`f`/`b` then landed in the
+            // unrelated move/fill/break verbs. Say so instead of pretending.
+            //
+            // It is buildable: the modal channel exists (`pending_prompt` + the assemble
+            // cursor). It is a feature, not a port fix, so it is not smuggled in here.
             if toks.get(i).map(|s| s.as_str()) == Some("-i") {
-                i += 1;
+                return Err(
+                    "df: -i (interactive branch walk) is not implemented — plain `df` walks \
+                     fall-through to its limit"
+                        .into(),
+                );
             }
             let default_addr = st.mon.disasm_cursor.unwrap_or(st.session.machine.cpu6510.reg_pc);
             let addr = parse_addr(toks.get(i)).map(|a| {
@@ -3908,7 +3953,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             let len = len as u32;
             let mut buf: Vec<u8> = Vec::with_capacity(len as usize);
             for k in 0..len {
-                buf.push(st.session.machine.peek_lens(start.wrapping_add(k as u16), "cpu"));
+                buf.push(monitor_read(st, start.wrapping_add(k as u16), "cpu"));
             }
             for (k, b) in buf.iter().enumerate() {
                 // Banked, matching the TS reference's hardcoded "cpu" lens for t/move.
@@ -3933,8 +3978,8 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             let mut diffs: Vec<String> = Vec::new();
             for k in 0..len {
                 let k = k as u16;
-                let av = st.session.machine.peek_lens(start.wrapping_add(k), "cpu");
-                let bv = st.session.machine.peek_lens(dest.wrapping_add(k), "cpu");
+                let av = monitor_read(st, start.wrapping_add(k), "cpu");
+                let bv = monitor_read(st, dest.wrapping_add(k), "cpu");
                 if av != bv {
                     diffs.push(format!(
                         "  ${:04x}: {:02x} != {:02x} @${:04x}",
@@ -3977,7 +4022,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 let mut m = true;
                 for (k, pb) in pat.iter().enumerate() {
                     if *pb != -1
-                        && st.session.machine.peek_lens((a as u16).wrapping_add(k as u16), "cpu") as i32 != *pb
+                        && monitor_read(st, (a as u16).wrapping_add(k as u16), "cpu") as i32 != *pb
                     {
                         m = false;
                         break;
@@ -4032,7 +4077,8 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             let next = next.ok_or("sidefx: on|off|toggle")?;
             st.mon.sidefx_on = next;
             Ok(if next {
-                "sidefx = on (monitor reads are LIVE — I/O side effects)".to_string()
+                "sidefx = on (m/c/t/h read LIVE — I/O side effects; d/sd/bitmap stay peeks)"
+                    .to_string()
             } else {
                 "sidefx = off (peek — side-effect-free, default)".to_string()
             })
@@ -4496,7 +4542,15 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             let gpc = st.session.machine.cpu6510.reg_pc;
             // If parked on a breakpoint at this PC, step past it so continue doesn't
             // immediately re-trigger on the first instruction (VICE `g` skips it).
-            if st.breakpoints.entries.iter().any(|e| e.pc == gpc) {
+            //
+            // An active EXEC OBSERVER at this PC counts the same way. Checking only
+            // breakpoints meant that after an `obs … when exec $xxxx do break` fired,
+            // `g` re-armed the run and the very next instruction re-triggered the same
+            // observer — the run could never get past that address, while a plain
+            // breakpoint at the identical PC resumed fine. The reference carries the
+            // observer half of this check explicitly.
+            let on_exec_obs = st.observers.exec_active && st.observers.exec_watch[gpc as usize] != 0;
+            if on_exec_obs || st.breakpoints.entries.iter().any(|e| e.pc == gpc) {
                 step_one_instruction(&mut st.session);
             }
             st.session.running = true;
@@ -4526,7 +4580,14 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 step_one_instruction(&mut st.session);
             }
             let start_clk = st.session.machine.clk;
+            // TWO caps, because they count different things. The reference's 20M is an
+            // INSTRUCTION budget; using the same number for the cycle exit as well made
+            // `until` give up after roughly 5-7M instructions (a 6502 instruction costs
+            // several cycles), so it reported "NOT reached" for targets the reference was
+            // still walking towards. The cycle cap stays as a wall-clock backstop, but a
+            // generous one.
             const CAP: u64 = 20_000_000;
+            const CYCLE_CAP: u64 = 200_000_000;
             let mut executed: u64 = 0;
             let mut hit = false;
             while executed < CAP {
@@ -4543,7 +4604,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 if check_and_handle_jam(st) {
                     break;
                 }
-                if st.session.machine.clk.wrapping_sub(start_clk) >= CAP {
+                if st.session.machine.clk.wrapping_sub(start_clk) >= CYCLE_CAP {
                     break;
                 }
             }
@@ -5553,6 +5614,18 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
         // project dir (= TS `this.projectDir ?? C64RE_PROJECT_DIR`, NOT the FS-shell
         // cwd); the .sym FILE path resolves cwd-relative (= TS `resolveFsPath(file)`).
         "label" | "unlabel" | "note" | "load_labels" | "ll" | "save_labels" | "sl" => {
+            // A BOUND project is required, as in the reference ("no project workspace
+            // bound (labels need a project)"). `fs_project_dir()` always resolves to
+            // something — it falls back to the daemon's own working directory — so
+            // without this check `label $1000 foo` silently wrote knowledge/ into
+            // whatever directory the daemon happened to be started from, and `unlabel`
+            // answered "no label matching …" when the truth was "you have no project".
+            if !project_is_bound() {
+                return Err(format!(
+                    "{op}: no project workspace bound (labels need a project — start the \
+                     daemon with --project <dir> or set C64RE_PROJECT_DIR)"
+                ));
+            }
             let dir = fs_project_dir();
             match op.as_str() {
                 "label" => {
@@ -5759,11 +5832,34 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 return Err("savecrt: no cartridge attached".into());
             }
             let (file, _rest) = parse_file_cmd();
+            // The BARE form updates the cartridge's own backing file, so it must not
+            // rewrite it for nothing: the reference skips silently when the cart is not
+            // dirty or the mapper does not persist writable state, and treats "cannot
+            // re-pack" as a skip rather than a failure. Doing it unconditionally meant
+            // every call rewrote the .crt the machine had booted from. An EXPLICIT target
+            // (`savecrt "<p>"`) is a deliberate export and still always writes.
+            if file.is_none() {
+                let cart = st.session.machine.cartridge.as_ref();
+                let dirty = cart.map(|c| c.is_writable_dirty()).unwrap_or(false);
+                let persists = cart.map(|c| c.persists_writable_state()).unwrap_or(false);
+                if !dirty {
+                    return Ok("savecrt: skipped — cartridge state unchanged since attach".into());
+                }
+                if !persists {
+                    return Ok(
+                        "savecrt: skipped — this mapper has no persistence port for writable state"
+                            .into(),
+                    );
+                }
+            }
             let m = &mut st.session.machine;
             let clk = m.clk;
             // Re-pack the live state to a .crt image (None ⇒ this mapper can't).
             let img = match m.cartridge.as_mut().and_then(|c| c.crt_image(clk)) {
                 Some(b) => b,
+                None if file.is_none() => {
+                    return Ok("savecrt: skipped — this mapper cannot re-pack a .crt".into())
+                }
                 None => return Err("savecrt: this mapper cannot re-pack a .crt".into()),
             };
             // `savecrt "<p>"` → write the re-packed image to <p> as a copy.
@@ -16006,6 +16102,47 @@ mod batch1_tests {
             mon(&st, "sd 0").unwrap().contains("-- sd: 50 steps"),
             "`sd 0` must mean the default 50, as `parseInt(t) || 50` does in the reference"
         );
+    }
+
+    #[test]
+    fn sidefx_toggle_actually_changes_how_reads_work() {
+        // The toggle was stored and never consulted: the monitor answered "reads are
+        // LIVE" while every read stayed a side-effect-free peek.
+        let st = make_state();
+        assert!(mon(&st, "sidefx off").unwrap().contains("sidefx = off"));
+        assert!(!st.lock().unwrap().mon.sidefx_on);
+        let on = mon(&st, "sidefx on").unwrap();
+        assert!(st.lock().unwrap().mon.sidefx_on, "toggle stored");
+        // ...and the reply names the verbs it really covers, rather than promising
+        // live reads for the whole monitor.
+        assert!(on.contains("m/c/t/h"), "reply states its scope: {on}");
+        // A read still answers with the same byte either way when nothing is latched.
+        mon(&st, "wr ram 4000 42").unwrap();
+        assert!(mon(&st, "m ram 4000 4000").unwrap().contains("42"));
+    }
+
+    #[test]
+    fn label_verbs_refuse_when_no_project_is_bound() {
+        // fs_project_dir() falls back to the daemon's own cwd, so without this guard
+        // `label` silently wrote knowledge/ into whatever directory it was started from.
+        let st = make_state();
+        if project_is_bound() {
+            return; // a bound project is a legitimate environment; nothing to assert
+        }
+        for cmd in ["label $1000 foo", "unlabel $1000", "note $1000 \"x\"", "ll \"a.sym\""] {
+            let e = mon(&st, cmd).unwrap_err();
+            assert!(e.contains("no project workspace bound"), "{cmd}: {e}");
+        }
+    }
+
+    #[test]
+    fn df_rejects_the_interactive_flag_it_cannot_honour() {
+        // `-i` was accepted and skipped, so the caller waited for a branch prompt that
+        // never came.
+        let st = make_state();
+        let e = mon(&st, "df -i 1000").unwrap_err();
+        assert!(e.contains("not implemented"), "{e}");
+        assert!(mon(&st, "df 1000").is_ok(), "the plain walk still works");
     }
 
     #[test]

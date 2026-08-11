@@ -1142,6 +1142,52 @@ impl Machine {
         self.cia2_pa_out = fb.cia2_pa_out;
     }
 
+    /// The LIVE read — what the CPU would see, side effects and all.
+    ///
+    /// [`Machine::read_full`] is the peek lane: it answers without touching the machine,
+    /// which is what a monitor wants by default. `sidefx on` asks for the opposite, and
+    /// the daemon had no path for it — the toggle was stored and never consulted, so the
+    /// monitor kept reporting "reads are LIVE" while every read stayed a peek.
+    ///
+    /// Goes through `FullBus::read`, the same code the CPU executes.
+    pub fn read_full_live(&mut self, addr: u16) -> u8 {
+        let table = self.cia_table.clone();
+        let mut fb = full::FullBus {
+            ram: &mut self.ram,
+            basic_rom: &self.basic_rom,
+            kernal_rom: &self.kernal_rom,
+            char_rom: &self.char_rom,
+            io: &mut self.io_shadow,
+            vic: &mut self.vic,
+            cia1: &mut self.cia1,
+            cia2: &mut self.cia2,
+            cia_table: &table,
+            sid_regs: &mut self.sid_regs,
+            sid: &mut self.sid,
+            config: self.memconfig,
+            memconfig_table: &self.memconfig_table,
+            port_dir: self.port_dir,
+            port_data: self.port_data,
+            clk: self.clk,
+            cia2_pa_out: self.cia2_pa_out,
+            side_effects: Vec::new(),
+            read_side_effects: Vec::new(),
+            drive: &mut self.drive8,
+            iec: &mut self.iec,
+            keyboard: &self.keyboard,
+            joystick1: self.joystick1,
+            joystick2: self.joystick2,
+            drive_c64_ref: self.drive_c64_ref,
+            cartridge: self.cartridge.as_mut(),
+        };
+        let v = fb.read(addr);
+        self.memconfig = fb.config;
+        self.port_dir = fb.port_dir;
+        self.port_data = fb.port_data;
+        self.cia2_pa_out = fb.cia2_pa_out;
+        v
+    }
+
     /// Set the program counter (CPU-isolated: no boot, atomic PC write).
     pub fn set_pc(&mut self, pc: u16) {
         self.cpu6510.reg_pc = pc;
