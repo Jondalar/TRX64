@@ -157,7 +157,7 @@ fn build_into(
             return;
         }
         let this_seq = seq;
-        seq += 1; // consumed even when the row is None (reserved / 0x34 / 0x35)
+        seq += 1; // consumed even when the row is None (reserved / 0x34 / 0x35 / 0x36)
         let Some(row) = event_to_row(ev, this_seq) else { return };
         if !channels.contains(&row.channel) {
             channels.push(row.channel);

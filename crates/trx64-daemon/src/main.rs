@@ -1518,6 +1518,11 @@ fn capture_all_def_json(domains: &[String]) -> Value {
         // what keeps mask_by_captures from masking the drive_mechanism channel off.
         captures.push(json!({ "kind": "drive-mechanism-row", "domain": "drive-mechanism" }));
     }
+    if has("cart-read") {
+        // Spec 785 C1 — the cartridge read-set lane. CART_READ (0x36) likewise comes
+        // from the run-loop drain (arm_cart_reads → emit_cart_read), not a trigger.
+        captures.push(json!({ "kind": "cart-read-row", "domain": "cart-read" }));
+    }
     json!({
         "id": "live-capture",
         "version": 1,
@@ -1710,6 +1715,7 @@ fn run_cycle_budget(session: &mut Session, budget: u64) {
     }) else {
         // No active trace: run untraced on the SAME path a traced run would pick.
         session.machine.arm_head_trace(false); // Spec 784 — never accumulate untraced.
+        session.machine.arm_cart_reads(false); // Spec 785 C1 — same for the cart lane.
         let mut obs = NullSink;
         if full_machine {
             session.machine.run_for_full(budget, &mut obs, |_, _, _, _, _, _, _| {});
@@ -1733,6 +1739,10 @@ fn run_cycle_budget(session: &mut Session, budget: u64) {
     // accumulates on non-loader runs.
     let drive_mechanism_active = channels.drive_mechanism;
     session.machine.arm_head_trace(drive_mechanism_active);
+    // Spec 785 C1 — same contract for the cartridge read-set: armed for THIS run iff
+    // the cart-read domain is recording, cleared otherwise.
+    let cart_read_active = channels.cart_read;
+    session.machine.arm_cart_reads(cart_read_active);
 
     // Accumulate events from this run, then append to the persistent buffer.
     let mut obs = TracingObserver::with_channels(FrameSink::events_only(), channels);
@@ -1773,6 +1783,16 @@ fn run_cycle_budget(session: &mut Session, budget: u64) {
                 }
                 for (drv_clk, ht, sec, bytes) in session.machine.drain_block_reads() {
                     obs.emit_block_read(ht, sec, bytes, drv_clk);
+                }
+            }
+            // Spec 785 C1 — drain this segment's cart read-set → CART_READ (0x36).
+            // The drain CLOSES the live residencies, so a residency spanning two
+            // segments is reported as two consecutive records for the same bank
+            // (aggregate by (bank, slot) and the totals are identical) rather than
+            // being lost at the end of the run.
+            if cart_read_active {
+                for r in session.machine.drain_cart_reads() {
+                    obs.emit_cart_read(r.cycle, r.bank, r.slot, r.off_lo, r.off_hi, r.bytes);
                 }
             }
         } else if drive_cpu_active {
@@ -4481,7 +4501,8 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                     if args.first().map(|s| s == "off").unwrap_or(false) {
                         trace_scope = Some(observers::TraceScope { off: true, domains: vec![] });
                     } else {
-                        const ALL: [&str; 6] = ["c64-cpu", "drive8-cpu", "iec", "vic", "memory", "drive-mechanism"];
+                        const ALL: [&str; 7] =
+                            ["c64-cpu", "drive8-cpu", "iec", "vic", "memory", "drive-mechanism", "cart-read"];
                         if let Some(bad) = args.iter().find(|d| !ALL.contains(&d.as_str())) {
                             return Err(format!(
                                 "obs: trace: unknown domain '{bad}' (use {} or 'off')",

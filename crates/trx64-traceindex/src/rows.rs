@@ -58,8 +58,14 @@ fn int_txt(v: f64) -> i64 {
 
 /// Translate one decoded frame into its row, or `None` when the opcode maps to
 /// no row (MARK — handled by the caller — plus the reserved opcodes 0x21/0x32/
-/// 0x33 and the loader-lens lanes 0x34/0x35, which the caller still counts
+/// 0x33 and the read-set lanes 0x34/0x35/0x36, which the caller still counts
 /// against `seq`).
+///
+/// The read-set lanes deliberately produce NO DuckDB row: they are not a
+/// per-access timeline to query, they are a whole-run summary whose consumer
+/// (C64RE's loader lens / `validate_extraction`) reads the `.c64retrace` stream
+/// directly. Spec 785 C1 keeps CART_READ (0x36) on that same footing as the disk
+/// lane rather than inventing a second consumption path for it.
 pub fn event_to_row(ev: &DecodedEvent, seq: u64) -> Option<TraceEventRow> {
     match ev.op {
         OP_CPU_STEP | OP_DRIVE_CPU_STEP => {
@@ -167,8 +173,8 @@ pub fn event_to_row(ev: &DecodedEvent, seq: u64) -> Option<TraceEventRow> {
             })
         }
         // MARK (0x01) → trace_mark, handled by the caller (consumes no seq).
-        // 0x21 / 0x32 / 0x33 reserved, 0x34 / 0x35 loader-lens: no row, but the
-        // caller still consumes a seq number for them.
+        // 0x21 / 0x32 / 0x33 reserved, 0x34 / 0x35 / 0x36 read-set lanes: no row,
+        // but the caller still consumes a seq number for them.
         _ => None,
     }
 }

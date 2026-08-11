@@ -12,6 +12,8 @@
 //!   DRIVE_CPU_STEP (0x30):  same layout as CPU_STEP — 19 bytes total
 //!   DRIVE_RAM_WRITE (0x31): same layout as RAM_WRITE — 16 bytes total
 //!   DRIVE_HEAD (0x34):      op(1) cycle(f64) halftrack(u8) sector(u8) — 11 bytes (Spec 784)
+//!   CART_READ (0x36):       op(1) cycle(f64) bank(u16) slot(u8) off_lo(u16) off_hi(u16)
+//!       bytes(u32)                                                        — 20 bytes (Spec 785)
 //!     (0x32/0x33 are RESERVED in binary-format.ts for VIA_REG_WRITE / GCR_EVENT.)
 //!
 //! access/oldValue (Spec 753): WRITE records carry the pre-write value for RAM
@@ -44,6 +46,13 @@ pub enum TraceOp {
     /// consumed sectors, the ground-truth read-set validate_extraction diffs a manifest
     /// against. Emitted only when the `drive-mechanism` channel is armed.
     BlockRead = 0x35,
+    /// Spec 785 C1 CART read-set (op 0x36): the CARTRIDGE counterpart of 0x35 — one
+    /// record per BANK RESIDENCY, carrying the bank, the window (ROML/ROMH), the
+    /// range of window offsets touched and the number of reads the mapper served.
+    /// Where the disk lane's authority is the drive's own byte latch, this lane's is
+    /// the mapper's own read: independent of whether the C64 kept the bytes.
+    /// Emitted only when the `cart-read` channel is armed.
+    CartRead = 0x36,
 }
 
 pub const MAGIC: &[u8; 8] = b"C64RETR1";
@@ -157,6 +166,36 @@ impl FrameSink {
         self.buf.extend_from_slice(&(cycle as f64).to_le_bytes());
         self.buf.push(halftrack);
         self.buf.push(sector);
+        self.buf.extend_from_slice(&bytes.to_le_bytes());
+    }
+
+    /// Encode a CART_READ (0x36) record: the cartridge read-set — while `bank` was
+    /// the bank serving `slot` (0 = ROML $8000-$9FFF, 1 = ROMH $A000-$BFFF /
+    /// $E000-$FFFF), the CPU read `bytes` bytes out of it, touching window offsets
+    /// `off_lo..=off_hi` (Spec 785 C1). `cycle` is the C64 master clock of the
+    /// residency's FIRST served read. Layout: op(1) cycle(f64) bank(u16 LE)
+    /// slot(u8) off_lo(u16 LE) off_hi(u16 LE) bytes(u32 LE) = 20 bytes.
+    ///
+    /// `bytes` is 32-bit, unlike the disk lane's 16: a sector caps at ~300 latched
+    /// bytes, but code EXECUTING out of a bank can serve millions of reads from one
+    /// residency, and a saturating u16 would report a wrong number rather than a
+    /// big one. Emitted ONLY when the `cart-read` channel is armed.
+    #[inline]
+    pub fn write_cart_read(
+        &mut self,
+        cycle: u64,
+        bank: u16,
+        slot: u8,
+        off_lo: u16,
+        off_hi: u16,
+        bytes: u32,
+    ) {
+        self.buf.push(TraceOp::CartRead as u8);
+        self.buf.extend_from_slice(&(cycle as f64).to_le_bytes());
+        self.buf.extend_from_slice(&bank.to_le_bytes());
+        self.buf.push(slot);
+        self.buf.extend_from_slice(&off_lo.to_le_bytes());
+        self.buf.extend_from_slice(&off_hi.to_le_bytes());
         self.buf.extend_from_slice(&bytes.to_le_bytes());
     }
 
@@ -274,18 +313,25 @@ pub struct TraceChannels {
     /// "drive-mechanism" domain (Spec 784 loader-lens). The always-on CPU ring and
     /// the parity path are unaffected.
     pub drive_mechanism: bool,
+    /// `cart-read` channel — emits CART_READ (0x36): the cartridge read-set
+    /// (Spec 785 C1). Its own channel, its own domain, OFF by default; never in a
+    /// parity trace and never in the always-on ring. Independent of
+    /// `drive_mechanism` — a title that loads from disk AND banks a cart can arm
+    /// both, and each lane answers for its own medium.
+    pub cart_read: bool,
 }
 
 impl TraceChannels {
     /// Map trace domains → channels (= TS domainsToChannels).
     pub fn from_domains<S: AsRef<str>>(domains: &[S]) -> Self {
-        let mut c = TraceChannels { cpu: false, mem: false, vic: false, sid: false, drive_cpu: false, drive_mechanism: false };
+        let mut c = TraceChannels { cpu: false, mem: false, vic: false, sid: false, drive_cpu: false, drive_mechanism: false, cart_read: false };
         for d in domains {
             match d.as_ref() {
                 "c64-cpu" => c.cpu = true,
                 "memory" => c.mem = true,
                 "vic" | "c64-vic" => c.vic = true,
                 "drive-mechanism" => c.drive_mechanism = true,
+                "cart-read" => c.cart_read = true,
                 // audit formats-state-6 — `sid` enables ONLY the sid channel (= TS
                 // domainsToChannels: sid → {"sid"}). The sid channel has no live
                 // producer, so a sid-only domain yields an empty stream; it must NOT
@@ -301,7 +347,7 @@ impl TraceChannels {
 
     /// Default capture set (no domains given) = cpu + memory (TS daemon default).
     pub fn default_cpu_mem() -> Self {
-        TraceChannels { cpu: true, mem: true, vic: true, sid: false, drive_cpu: false, drive_mechanism: false }
+        TraceChannels { cpu: true, mem: true, vic: true, sid: false, drive_cpu: false, drive_mechanism: false, cart_read: false }
     }
 
     /// Spec 708 §11 / 708.7 — mask the (domain-derived) channels by the DECLARED
@@ -326,6 +372,8 @@ impl TraceChannels {
         self.drive_cpu &= has("cpu-row");
         // Spec 784 — the 1541 disk-mechanism head row (drive-mechanism domain).
         self.drive_mechanism &= has("drive-mechanism-row");
+        // Spec 785 C1 — the cartridge read-set row (cart-read domain).
+        self.cart_read &= has("cart-read-row");
         // `sid` is reserved (no producer); leave it untouched (no sid-row capture).
         self
     }
@@ -386,6 +434,25 @@ impl TracingObserver {
             return;
         }
         self.sink.write_block_read(drv_clk, halftrack, sector, bytes);
+        self.event_count += 1;
+    }
+
+    /// Emit a CART_READ record (0x36) — gated on the `cart-read` channel. Called
+    /// from the run loop when the machine's cart read-set is drained (Spec 785 C1).
+    #[inline]
+    pub fn emit_cart_read(
+        &mut self,
+        cycle: u64,
+        bank: u16,
+        slot: u8,
+        off_lo: u16,
+        off_hi: u16,
+        bytes: u32,
+    ) {
+        if !self.channels.cart_read {
+            return;
+        }
+        self.sink.write_cart_read(cycle, bank, slot, off_lo, off_hi, bytes);
         self.event_count += 1;
     }
 }
@@ -517,6 +584,78 @@ mod tests {
         let mut c = [0u8; 8];
         c.copy_from_slice(&sink.buf[1..9]);
         assert_eq!(f64::from_le_bytes(c), 0x0102_0304_0506_0708u64 as f64);
+    }
+
+    // Spec 785 C1 — the "cart-read" domain arms ONLY the cart channel, and is not
+    // implied by the disk lane or by any parity domain.
+    #[test]
+    fn cart_read_domain_arms_only_cart_channel() {
+        let c = TraceChannels::from_domains(&["cart-read"]);
+        assert!(c.cart_read, "cart-read domain arms the cart channel");
+        assert!(
+            !c.cpu && !c.mem && !c.vic && !c.sid && !c.drive_cpu && !c.drive_mechanism,
+            "and nothing else"
+        );
+        // OFF by default; the two read-set lanes are independent.
+        assert!(!TraceChannels::from_domains(&["c64-cpu", "memory"]).cart_read);
+        assert!(!TraceChannels::from_domains(&["drive-mechanism"]).cart_read);
+        assert!(!TraceChannels::default_cpu_mem().cart_read);
+        // Both can be armed together (a title that loads from disk AND banks a cart).
+        let both = TraceChannels::from_domains(&["drive-mechanism", "cart-read"]);
+        assert!(both.cart_read && both.drive_mechanism);
+    }
+
+    // CART_READ (0x36) byte layout: op(1) + cycle f64(8) + bank u16(2) + slot(1) +
+    // off_lo u16(2) + off_hi u16(2) + bytes u32(4) = 20.
+    #[test]
+    fn write_cart_read_byte_layout() {
+        let mut sink = FrameSink::events_only();
+        sink.write_cart_read(0x0102_0304_0506_0708, 0x002e, 1, 0x0040, 0x1fff, 0x0001_2345);
+        assert_eq!(sink.buf.len(), 20, "20-byte record");
+        assert_eq!(sink.buf[0], TraceOp::CartRead as u8, "op 0x36");
+        assert_eq!(u16::from_le_bytes([sink.buf[9], sink.buf[10]]), 0x002e, "bank LE");
+        assert_eq!(sink.buf[11], 1, "slot (0 = ROML, 1 = ROMH)");
+        assert_eq!(u16::from_le_bytes([sink.buf[12], sink.buf[13]]), 0x0040, "off_lo LE");
+        assert_eq!(u16::from_le_bytes([sink.buf[14], sink.buf[15]]), 0x1fff, "off_hi LE");
+        assert_eq!(
+            u32::from_le_bytes([sink.buf[16], sink.buf[17], sink.buf[18], sink.buf[19]]),
+            0x0001_2345,
+            "bytes LE — 32-bit: a bank executed out of can serve millions of reads"
+        );
+        let mut c = [0u8; 8];
+        c.copy_from_slice(&sink.buf[1..9]);
+        assert_eq!(f64::from_le_bytes(c), 0x0102_0304_0506_0708u64 as f64);
+    }
+
+    // emit_cart_read is gated: silent when the channel is off, 20 bytes when armed.
+    #[test]
+    fn emit_cart_read_gated_by_channel() {
+        let mut off = TracingObserver::with_channels(
+            FrameSink::events_only(),
+            // The DISK lane armed must not open the cart lane.
+            TraceChannels::from_domains(&["drive-mechanism"]),
+        );
+        off.emit_cart_read(1000, 3, 0, 0, 0x1fff, 8192);
+        assert_eq!(off.into_buf().len(), 0, "not armed -> no record");
+
+        let mut on = TracingObserver::with_channels(
+            FrameSink::events_only(),
+            TraceChannels::from_domains(&["cart-read"]),
+        );
+        on.emit_cart_read(1000, 3, 0, 0, 0x1fff, 8192);
+        assert_eq!(on.event_count, 1);
+        assert_eq!(on.into_buf().len(), 20, "armed -> one 20-byte record");
+    }
+
+    // A registered definition that declares captures gates the lane by its own
+    // capture kind — and by nothing else.
+    #[test]
+    fn cart_read_row_capture_masks_the_lane() {
+        let armed = TraceChannels::from_domains(&["cart-read"]);
+        assert!(armed.mask_by_captures(&["cart-read-row"]).cart_read);
+        assert!(!armed.mask_by_captures(&["cpu-row"]).cart_read);
+        // An empty capture list is captureAll — untouched.
+        assert!(armed.mask_by_captures::<&str>(&[]).cart_read);
     }
 
     // emit_block_read is gated: silent when the channel is off, 13 bytes when armed.

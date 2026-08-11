@@ -165,9 +165,12 @@ pub struct FlashCartState {
 // window and attribute them to the bank that was live while they happened, one
 // record per bank residency.
 //
-// Read `docs/785-cart-read-set.md` before changing the shape; the offset range is
-// the part a byte count alone cannot give, and it is what a manifest slot span is
-// validated against.
+// Read `../C64ReverseEngineeringMCP/specs/785-crt-extraction.md` §2.1 + §5 Part C
+// before changing the shape. Two things it insists on: the offset range is the part
+// a byte count alone cannot give (which part of the 8 KB window was touched, which
+// is what a manifest slot span is validated against), and the lane proves USED and
+// never UNUSED — it is a lower bound on one run, and every surface that shows it
+// must say "used in run X".
 
 /// Which 8 KB CPU window a cart read was served through.
 ///

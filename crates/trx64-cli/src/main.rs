@@ -283,6 +283,16 @@ enum Command {
         /// Also write a PNG screenshot of the final screen (verify what booted).
         #[arg(long)]
         render: Option<String>,
+        /// Capture a `.c64retrace` over the whole boot, finalized on exit. Pass the
+        /// output path; the lanes come from --trace-domains.
+        #[arg(long)]
+        trace: Option<String>,
+        /// Comma-separated trace domains for --trace (default `cart-read`). The
+        /// armed-only lanes are `cart-read` (Spec 785 CART_READ 0x36) and
+        /// `drive-mechanism` (Spec 784 DRIVE_HEAD/BLOCK_READ); `c64-cpu` / `memory`
+        /// are the firehose, and on a full boot they are enormous.
+        #[arg(long, default_value = "cart-read")]
+        trace_domains: String,
     },
 }
 
@@ -384,8 +394,14 @@ fn main() {
     }
 
     // ── Boot-and-dump one-shot (isolated scratch instance → .c64re fixture) ─────
-    if let Some(Command::Boot { disk, warmup, type_text, type_gap, cycles, chunk, dump, render }) = &cli.cmd {
-        match boot_cmd::run_boot(&rom_dir, disk, *warmup, type_text, *type_gap, *cycles, *chunk, dump, render.as_deref()) {
+    if let Some(Command::Boot {
+        disk, warmup, type_text, type_gap, cycles, chunk, dump, render, trace, trace_domains,
+    }) = &cli.cmd
+    {
+        match boot_cmd::run_boot(
+            &rom_dir, disk, *warmup, type_text, *type_gap, *cycles, *chunk, dump,
+            render.as_deref(), trace.as_deref(), trace_domains,
+        ) {
             Ok(out) => println!("{out}"),
             Err(e) => {
                 eprintln!("{e}");

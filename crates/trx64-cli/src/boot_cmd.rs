@@ -49,6 +49,8 @@ pub fn run_boot(
     chunk: u64,
     dump: &str,
     render: Option<&str>,
+    trace: Option<&str>,
+    trace_domains: &str,
 ) -> Result<String, String> {
     let engine = boot_engine(rom_dir).map_err(|e| format!("{e}"))?;
     let mut log: Vec<String> = Vec::new();
@@ -60,6 +62,20 @@ pub fn run_boot(
     // Force the controller paused so session/run may drive cycles directly (it
     // refuses while running, and a mount can flip it on).
     let _ = engine.rpc("debug/pause", json!({ "source": "cli-boot" }));
+
+    // Optional capture over the WHOLE boot, started after the mount (a mount
+    // power-cycles the machine, which would finalize an already-running trace).
+    // Same `trace/start_domains` the daemon serves — the armed-only lanes
+    // (`cart-read`, `drive-mechanism`) arm here exactly as they do live.
+    if let Some(path) = trace {
+        let domains: Vec<&str> =
+            trace_domains.split(',').map(|d| d.trim()).filter(|d| !d.is_empty()).collect();
+        let r = engine.rpc(
+            "trace/start_domains",
+            json!({ "output": path, "domains": domains }),
+        )?;
+        log.push(format!("trace start {domains:?} → {path}: {}", compact(&r)));
+    }
 
     // Warm up to the READY prompt BEFORE typing (keys are scheduled from now on).
     run_cycles(&engine, warmup, chunk)?;
@@ -91,6 +107,13 @@ pub fn run_boot(
             .map_err(|e| format!("render base64 decode: {e}"))?;
         std::fs::write(png_path, &png).map_err(|e| format!("write {png_path}: {e}"))?;
         log.push(format!("render → {png_path} ({} bytes)", png.len()));
+    }
+
+    // Finalize the capture BEFORE the snapshot dump, so the `.c64retrace` covers
+    // exactly the run above and is immediately queryable (wait_index).
+    if trace.is_some() {
+        let r = engine.rpc("trace/run/stop", json!({ "wait_index": true }))?;
+        log.push(format!("trace stop: {}", compact(&r)));
     }
 
     // Dump the .c64re snapshot (write_native_snapshot on this process's machine).

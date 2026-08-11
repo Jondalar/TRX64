@@ -56,6 +56,7 @@ pub const OP_VIA_REG_WRITE: u8 = 0x32;
 pub const OP_GCR_EVENT: u8 = 0x33;
 pub const OP_DRIVE_HEAD: u8 = 0x34;
 pub const OP_BLOCK_READ: u8 = 0x35;
+pub const OP_CART_READ: u8 = 0x36;
 pub const OP_MEDIA_WRITE: u8 = 0x40;
 
 /// IEC line bit assignment (`IEC_BIT`, binary-format.ts:384). 9 meaningful bits.
@@ -86,6 +87,8 @@ pub fn payload_size(op: u8, version: u16) -> Option<usize> {
         OP_IEC_LINE_CHANGE => 10,
         OP_DRIVE_HEAD => 10,
         OP_BLOCK_READ => 12,
+        // Spec 785 C1: cycle(8) + bank(2) + slot(1) + off_lo(2) + off_hi(2) + bytes(4).
+        OP_CART_READ => 19,
         // 0x01 MARK is handled separately (u16-prefixed label);
         // 0x40 MEDIA_WRITE is variable with NO length prefix ⇒ unskippable.
         _ => return None,
@@ -319,8 +322,10 @@ pub fn decode_file_header(buf: &[u8]) -> Result<ParsedHeader> {
 pub struct DecodedEvent {
     pub op: u8,
     /// The EMITTING side's clock: C64 master clock for 0x01/0x10/0x11/0x12/
-    /// 0x20/0x22/0x23, the DRIVE clock for 0x30/0x31/0x34/0x35. The two lanes
+    /// 0x20/0x22/0x23/0x36, the DRIVE clock for 0x30/0x31/0x34/0x35. The two lanes
     /// are different time bases — the stream is NOT globally cycle-monotonic.
+    /// (0x36 CART_READ is C64-side: the cartridge is a bus hook on the main CPU,
+    /// not a clocked device with a domain of its own.)
     pub cycle: f64,
     pub pc: Option<u16>,
     pub opcode: Option<u8>,
@@ -343,7 +348,15 @@ pub struct DecodedEvent {
     pub reg: Option<u16>,
     pub halftrack: Option<u8>,
     pub sector: Option<u8>,
-    pub bytes: Option<u16>,
+    /// Bytes read off the block (0x35) / served out of the bank residency (0x36).
+    /// 32-bit for the cart lane's sake; the disk lane widens its u16 into it.
+    pub bytes: Option<u32>,
+    /// Spec 785 C1 (0x36 only): the bank, the window (0 = ROML, 1 = ROMH) and the
+    /// inclusive range of window offsets the residency touched.
+    pub bank: Option<u16>,
+    pub slot: Option<u8>,
+    pub off_lo: Option<u16>,
+    pub off_hi: Option<u16>,
     pub label: Option<String>,
 }
 
@@ -465,7 +478,19 @@ pub fn decode_event(buf: &[u8], off: usize, version: u16) -> Result<Step> {
         OP_BLOCK_READ => {
             ev.halftrack = Some(buf[o]);
             ev.sector = Some(buf[o + 1]);
-            ev.bytes = Some(u16le(buf, o + 2));
+            ev.bytes = Some(u16le(buf, o + 2) as u32);
+        }
+        OP_CART_READ => {
+            ev.bank = Some(u16le(buf, o));
+            ev.slot = Some(buf[o + 2]);
+            ev.off_lo = Some(u16le(buf, o + 3));
+            ev.off_hi = Some(u16le(buf, o + 5));
+            ev.bytes = Some(u32::from_le_bytes([
+                buf[o + 7],
+                buf[o + 8],
+                buf[o + 9],
+                buf[o + 10],
+            ]));
         }
         OP_MARK => {
             let len = u16le(buf, o) as usize;
@@ -782,6 +807,24 @@ mod tests {
             self.buf.push(sector);
             self.buf.extend_from_slice(&bytes.to_le_bytes());
         }
+        #[allow(clippy::too_many_arguments)]
+        pub fn cart_read(
+            &mut self,
+            c: u64,
+            bank: u16,
+            slot: u8,
+            off_lo: u16,
+            off_hi: u16,
+            bytes: u32,
+        ) {
+            self.buf.push(OP_CART_READ);
+            self.cyc(c);
+            self.buf.extend_from_slice(&bank.to_le_bytes());
+            self.buf.push(slot);
+            self.buf.extend_from_slice(&off_lo.to_le_bytes());
+            self.buf.extend_from_slice(&off_hi.to_le_bytes());
+            self.buf.extend_from_slice(&bytes.to_le_bytes());
+        }
     }
 
     const META: &str = r#"{"runId":"run_x","defId":"live-capture","defVersion":1,"defName":"live session capture","defJson":"{\"id\":\"live-capture\",\"version\":1,\"name\":\"live session capture\",\"retention\":\"transient\"}","domains":["c64-cpu","memory"],"cycleStart":100,"createdAt":"2026-08-08T00:00:00.000Z"}"#;
@@ -1005,6 +1048,29 @@ mod tests {
         assert_eq!(evs[0].halftrack, Some(70));
         assert_eq!(evs[0].sector, Some(17));
         assert_eq!(evs[0].bytes, Some(0x0154));
+    }
+
+    /// Spec 785 C1 — CART_READ (0x36) decodes its six fields, and its 20-byte
+    /// width keeps a following record aligned (a wrong `payload_size` misaligns
+    /// the rest of the stream, which is the failure this pins).
+    #[test]
+    fn cart_read_fields_and_width() {
+        let mut f = Fixture::new(META, 2);
+        f.cart_read(5000, 0x002e, 1, 0x0040, 0x1fff, 0x0001_2345);
+        f.cpu(OP_CPU_STEP, 5001, 0xc000, [1, 2, 3, 4, 5, 6, 7, 8]);
+        let evs = decode_event_stream(&f.buf, 16 + META.len(), 2).unwrap();
+        assert_eq!(evs.len(), 2, "the 20-byte record left the next one aligned");
+        assert_eq!(evs[0].op, OP_CART_READ);
+        assert_eq!(evs[0].clock(), 5000);
+        assert_eq!(evs[0].bank, Some(0x002e));
+        assert_eq!(evs[0].slot, Some(1));
+        assert_eq!(evs[0].off_lo, Some(0x0040));
+        assert_eq!(evs[0].off_hi, Some(0x1fff));
+        assert_eq!(evs[0].bytes, Some(0x0001_2345));
+        assert_eq!(evs[1].pc, Some(0xc000));
+        // The disk lane's fields stay absent on a cart record and vice versa.
+        assert_eq!(evs[0].halftrack, None);
+        assert_eq!(evs[0].sector, None);
     }
 
     /// Regression: the reader must capture its resume position at OPEN time.
