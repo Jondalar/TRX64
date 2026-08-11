@@ -140,7 +140,11 @@ jobs:
       # dlopens them at RUNTIME instead of linking against them. That is not an assumption —
       # it is how the handout builds have always worked with this exact image.
       - name: System libraries
-        if: matrix.target == 'linux-x86_64'
+        # Gated on the OS, not on a target name. Naming one target here is what broke the
+        # arm64 entry the day it was added: the step simply did not run and the build died
+        # in alsa-sys with "The system library `alsa` was not found". The reason this step
+        # exists is "this is Linux", so that is what the condition should say.
+        if: runner.os == 'Linux'
         run: |
           apt-get update -qq
           apt-get install -y -qq libasound2-dev pkg-config
