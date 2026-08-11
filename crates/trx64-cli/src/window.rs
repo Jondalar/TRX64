@@ -232,8 +232,32 @@ impl App {
 
     /// Handle a key event. Returns true if it was consumed as joystick input (so it is
     /// not ALSO sent to the keyboard matrix).
-    fn handle_key(&mut self, event: &winit::event::KeyEvent) {
+    fn handle_key(&mut self, event: &winit::event::KeyEvent, is_synthetic: bool) {
         let pressed = event.state == ElementState::Pressed;
+
+        // Diagnostics for a machine we do not have. Three desktop targets ship, two of
+        // them are used by people who report back as a photograph of a screen, and this
+        // is the one thing that cannot be inferred from a photograph: what the platform
+        // actually delivered. Off by default, one `if` per event when it is.
+        if keylog_enabled() {
+            eprintln!(
+                "[keylog] {:?} synthetic={is_synthetic} repeat={} phys={:?} logical={:?} text={:?}",
+                event.state, event.repeat, event.physical_key, event.logical_key, event.text
+            );
+        }
+
+        // Track host Shift for the symbolic char mapping — from EVERY event including the
+        // synthetic ones, because a focus-change snapshot is exactly the authority on
+        // which modifiers are held.
+        if let PhysicalKey::Code(code) = event.physical_key {
+            if matches!(code, KeyCode::ShiftLeft | KeyCode::ShiftRight) {
+                self.shift_held = pressed;
+            }
+        }
+
+        if !accepts(is_synthetic, pressed) {
+            return;
+        }
 
         // HOST HOTKEYS — F9..F12. The C64 keyboard has F1..F8 only (F2/F4/F6/F8 being
         // SHIFT+F1/F3/F5/F7), so these four physical keys cannot collide with anything
@@ -250,14 +274,6 @@ impl App {
                     }
                 }
                 return; // never reaches the C64 matrix
-            }
-        }
-
-        // Track host Shift (for the symbolic char mapping). The shift key is ALSO sent
-        // to the matrix below via map_special — idempotent + self-correcting (Spec 310).
-        if let PhysicalKey::Code(code) = event.physical_key {
-            if matches!(code, KeyCode::ShiftLeft | KeyCode::ShiftRight) {
-                self.shift_held = pressed;
             }
         }
 
@@ -317,6 +333,33 @@ impl App {
     }
 }
 
+/// May this key event reach the emulated machine?
+///
+/// Winit's Windows backend answers `WM_SETFOCUS` and `WM_KILLFOCUS` by synthesising a
+/// whole keyboard state — `Pressed` for everything `GetAsyncKeyState` reports as held on
+/// focus gain, `Released` for everything on focus loss — and marks those `is_synthetic`.
+/// The macOS backend synthesises nothing at all (every `is_synthetic` there is a literal
+/// `false`), which is why this only ever mattered on one platform.
+///
+/// The two directions are worth opposite things, so a blanket filter would be wrong:
+///
+/// - synthetic **Released** must pass. It is the safety net: alt-tab away mid-keypress and
+///   without it the key stays held in the matrix and the C64 repeats it forever.
+/// - synthetic **Pressed** must not. It replays keys the user never struck into the
+///   emulated machine, simply for putting the window back in front.
+const fn accepts(is_synthetic: bool, pressed: bool) -> bool {
+    !(is_synthetic && pressed)
+}
+
+/// Whether `TRX64_KEYLOG` asked for a trace of every key event. Read once — this is
+/// consulted per keystroke.
+fn keylog_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("TRX64_KEYLOG").map(|v| v != "0" && !v.is_empty()).unwrap_or(false)
+    })
+}
+
 /// The host-layout + shift resolved character for a key event (winit `logical_key`),
 /// for the Spec-310 symbolic printable mapping. `None` for non-character (named) keys.
 fn char_for(event: &winit::event::KeyEvent) -> Option<char> {
@@ -358,8 +401,10 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::RedrawRequested => {
                 self.render();
             }
-            WindowEvent::KeyboardInput { event, .. } => {
-                self.handle_key(&event);
+            // `is_synthetic` is taken, not discarded: it is the whole difference between a
+            // key the user struck and one Windows replayed on a focus change. See `accepts`.
+            WindowEvent::KeyboardInput { event, is_synthetic, .. } => {
+                self.handle_key(&event, is_synthetic);
             }
             WindowEvent::Resized(_) => {
                 if let Some(w) = &self.window {
@@ -388,5 +433,25 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
         el.set_control_flow(ControlFlow::WaitUntil(self.next_frame));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::accepts;
+
+    #[test]
+    fn synthetic_presses_are_dropped_but_synthetic_releases_are_not() {
+        // Real input is untouched in both directions.
+        assert!(accepts(false, true), "a real press reaches the machine");
+        assert!(accepts(false, false), "a real release reaches the machine");
+
+        // Winit's Windows backend replays a whole keyboard state on WM_SETFOCUS. Letting
+        // that through types into the emulated C64 for merely alt-tabbing back in.
+        assert!(!accepts(true, true), "a synthetic press must NOT reach the machine");
+
+        // ...but the WM_KILLFOCUS half is the safety net that lifts keys still held when
+        // focus goes away. Dropping it would leave the C64 repeating that key forever.
+        assert!(accepts(true, false), "a synthetic release MUST still reach the machine");
     }
 }
