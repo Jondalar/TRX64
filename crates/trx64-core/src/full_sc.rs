@@ -198,7 +198,14 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
     fn write_raw(&mut self, addr: u16, value: u8) {
         self.sync_clk();
         let old = if (0x0002..0xd000).contains(&addr) {
-            crate::cpu::Bus::read(&mut self.fb, addr)
+            // Spec 785 C1 — this read is INSTRUMENTATION (the trace/undo pre-write
+            // byte), not a bus cycle the hardware performs. $8000-$BFFF is inside
+            // this window, so without the suspend every store to RAM under a
+            // banked-in cart ROM would fabricate a cart read in the read-set.
+            self.fb.cart_account_suspend = true;
+            let v = crate::cpu::Bus::read(&mut self.fb, addr);
+            self.fb.cart_account_suspend = false;
+            v
         } else {
             0
         };
@@ -281,7 +288,11 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
     fn write_raw_dummy(&mut self, addr: u16, value: u8) {
         self.sync_clk();
         let old = if (0x0002..0xd000).contains(&addr) {
-            crate::cpu::Bus::read(&mut self.fb, addr)
+            // Spec 785 C1 — instrumentation read, not a bus cycle (see `write_raw`).
+            self.fb.cart_account_suspend = true;
+            let v = crate::cpu::Bus::read(&mut self.fb, addr);
+            self.fb.cart_account_suspend = false;
+            v
         } else {
             0
         };

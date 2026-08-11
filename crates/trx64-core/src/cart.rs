@@ -156,6 +156,176 @@ pub struct FlashCartState {
     pub easyflash_ram: Vec<u8>, // 256 bytes IO2 RAM
 }
 
+// ── Spec 785 C1 — the cartridge READ-SET ─────────────────────────────────────
+//
+// The bank analogue of the 1541 read-set (Spec 784 BLOCK_READ). There the DRIVE
+// is the authority: it counts the GCR bytes physically latched off a sector,
+// independent of when — or whether — the C64 later copied them. Here the CART is
+// the authority: we count the reads the mapper actually SERVED out of a ROM
+// window and attribute them to the bank that was live while they happened, one
+// record per bank residency.
+//
+// Read `docs/785-cart-read-set.md` before changing the shape; the offset range is
+// the part a byte count alone cannot give, and it is what a manifest slot span is
+// validated against.
+
+/// Which 8 KB CPU window a cart read was served through.
+///
+/// This is the WINDOW, and for the families whose geometry is 1:1 it is also the
+/// CHIP a `.crt` CHIP packet records: EasyFlash (lo flash → ROML, hi flash →
+/// ROMH), MegaByter and C64MegaCart (ROML only). The MIRRORED families are the
+/// exception — Ocean's 16 KB config serves its single 8 KB ROML bank at BOTH
+/// $8000 and $A000, so a mirror read reports `Romh` although the bytes come out
+/// of the ROML image. The window is what the CPU saw; the mirror is a property of
+/// the family, not of the run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CartSlot {
+    /// ROML — $8000-$9FFF.
+    Roml = 0,
+    /// ROMH — $A000-$BFFF, or $E000-$FFFF under ultimax. Both addresses are the
+    /// same CHIP; the offset is taken inside the 8 KB window, so they fold onto
+    /// one 0..$1FFF range (exactly as the mappers' own `chip_offset` does).
+    Romh = 1,
+}
+
+impl CartSlot {
+    /// The ROM window `addr` belongs to. `None` for $DE00-$DFFF — IO1/IO2 is a
+    /// cart read (register shadow, EasyFlash's 256-byte IO2 RAM, GMOD2's EEPROM
+    /// bit) but never cart ROM payload — and for every address outside the three
+    /// ROM windows.
+    #[inline]
+    pub fn for_address(addr: u16) -> Option<CartSlot> {
+        match addr {
+            0x8000..=0x9fff => Some(CartSlot::Roml),
+            0xa000..=0xbfff | 0xe000..=0xffff => Some(CartSlot::Romh),
+            _ => None,
+        }
+    }
+}
+
+/// One BANK RESIDENCY: while `bank` was the bank serving `slot`, the CPU read
+/// `bytes` bytes out of it, touching window offsets `off_lo..=off_hi`.
+///
+/// `bytes` counts SERVED READS (every real bus read the mapper answered —
+/// opcode fetches included, since code executing out of a bank is exactly what
+/// "this bank was used" means), not distinct addresses: a byte read twice counts
+/// twice, precisely as the disk lane counts a sector re-read twice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CartReadRecord {
+    /// C64 master clock of the residency's FIRST served read — when this bank
+    /// STARTED being read. (The disk lane stamps its record at the closing
+    /// boundary instead; a cart residency has no head to leave, and stamping the
+    /// start is what lets the tail residency be flushed without inventing a
+    /// closing clock.)
+    pub cycle: u64,
+    pub bank: u16,
+    /// [`CartSlot`] as `u8` — 0 = ROML, 1 = ROMH.
+    pub slot: u8,
+    /// Lowest / highest window offset touched (0..=$1FFF), inclusive.
+    pub off_lo: u16,
+    pub off_hi: u16,
+    pub bytes: u32,
+}
+
+/// A live (unclosed) residency.
+#[derive(Clone, Copy, Debug)]
+struct CartResidency {
+    bank: u16,
+    off_lo: u16,
+    off_hi: u16,
+    bytes: u32,
+    cycle: u64,
+}
+
+impl CartResidency {
+    #[inline]
+    fn close(self, slot: usize) -> CartReadRecord {
+        CartReadRecord {
+            cycle: self.cycle,
+            bank: self.bank,
+            slot: slot as u8,
+            off_lo: self.off_lo,
+            off_hi: self.off_hi,
+            bytes: self.bytes,
+        }
+    }
+}
+
+/// The armed cart read-set accumulator. ONE live residency per slot, so a title
+/// interleaving ROML and ROMH reads inside one bank does not ping-pong: each
+/// window closes only when ITS OWN bank changes.
+///
+/// Armed-only. The `Machine` hands the bus a `&mut` to this ONLY while
+/// `cart_read_armed`; disarmed, the bus holds `None` and the hot read path is
+/// byte-for-byte the pre-785 path.
+#[derive(Clone, Debug, Default)]
+pub struct CartReadSet {
+    records: Vec<CartReadRecord>,
+    /// Indexed by `CartSlot as usize`.
+    live: [Option<CartResidency>; 2],
+}
+
+impl CartReadSet {
+    /// Drop everything, live residencies included (arming clears).
+    pub fn clear(&mut self) {
+        self.records.clear();
+        self.live = [None, None];
+    }
+
+    /// Account ONE served cart-ROM read. The hot path: one bank compare, a
+    /// min/max on the offset and an increment. A bank change closes the slot's
+    /// residency and opens the next — which is why a title that reads bank 3,
+    /// switches to 7, reads, and switches back to 3 and reads yields THREE
+    /// records and not two.
+    #[inline]
+    pub fn on_read(&mut self, slot: CartSlot, bank: u16, off: u16, clk: u64) {
+        // Split the borrows explicitly: `live` is indexed, `records` is pushed to.
+        let CartReadSet { records, live } = self;
+        let cell = &mut live[slot as usize];
+        match cell {
+            Some(r) if r.bank == bank => {
+                if off < r.off_lo {
+                    r.off_lo = off;
+                }
+                if off > r.off_hi {
+                    r.off_hi = off;
+                }
+                r.bytes = r.bytes.saturating_add(1);
+            }
+            _ => {
+                if let Some(prev) = cell.take() {
+                    records.push(prev.close(slot as usize));
+                }
+                *cell = Some(CartResidency { bank, off_lo: off, off_hi: off, bytes: 1, cycle: clk });
+            }
+        }
+    }
+
+    /// Take every record, CLOSING the live residencies first so the tail of a run
+    /// is never lost (the last bank a title reads is usually the one that never
+    /// switches again). A residency that spans two drains is therefore reported
+    /// as two consecutive records for the same bank — aggregate by `(bank, slot)`
+    /// and the totals are identical; nothing is dropped and nothing is invented.
+    ///
+    /// Sorted by `cycle`: with both slots live the close order is not the start
+    /// order, and the lane is meant to read as a timeline.
+    pub fn drain(&mut self) -> Vec<CartReadRecord> {
+        for i in 0..self.live.len() {
+            if let Some(r) = self.live[i].take() {
+                self.records.push(r.close(i));
+            }
+        }
+        self.records.sort_by_key(|r| r.cycle);
+        std::mem::take(&mut self.records)
+    }
+
+    /// Nothing observed at all (no closed records, no live residency).
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty() && self.live.iter().all(|r| r.is_none())
+    }
+}
+
 /// ts:39-107 — HeadlessCartridgeMapper. The bus depends on read/write/peek,
 /// get_lines, reset, get_state/set_state (the read-only surface; the writable
 /// flash/clock/phi1 hooks are out of scope for this tier).
@@ -182,6 +352,22 @@ pub trait CartMapper: Send {
     /// ts:106/420 reset(): the expansion-port RESET line — bank + mode/control
     /// return to the boot config so GAME/EXROM re-vector $FFFC from the cart.
     fn reset(&mut self);
+    /// Spec 785 C1 — the bank currently serving the ROM window `addr` falls in,
+    /// for the cart read-set. Called once per SERVED cart read while the lane is
+    /// armed, and never otherwise.
+    ///
+    /// Deliberately NOT `get_state().current_bank`: that is a snapshot call, and
+    /// on the flash families it CLONES the whole flash array (`MegabyterMapper::
+    /// get_state` clones a 1 MB `Flash040` just to expose one register byte).
+    /// This must be a field read.
+    ///
+    /// It takes the ADDRESS rather than a bank number because there is no single
+    /// `current_bank` to lift: MegaByter keeps its bank in `register00`,
+    /// C64MegaCart assembles a 14-bit bank from $DE00 + $DF00, and GMod4 keeps a
+    /// SEPARATE bank per window per banking context — with $E000 not banked at
+    /// all. Each family answers for the window the way its own `read()` resolves
+    /// it. A family without banking answers 0.
+    fn active_bank(&self, addr: u16) -> u16;
     fn get_state(&self) -> CartState;
     fn set_state(&mut self, state: CartState);
     /// Clone into a fresh box (the `Machine` derives `Clone` for snapshots; a
@@ -652,6 +838,10 @@ impl CartMapper for NormalMapper {
     fn reset(&mut self) {
         self.base.current_bank = 0;
     }
+    /// Unbanked family — `current_bank` never leaves 0, for either window.
+    fn active_bank(&self, _addr: u16) -> u16 {
+        self.base.current_bank
+    }
     fn get_state(&self) -> CartState {
         CartState { current_bank: self.base.current_bank, control_register: None, flash: None }
     }
@@ -719,6 +909,11 @@ impl CartMapper for MagicDeskMapper {
         self.base.current_bank = 0;
         self.regval = 0;
     }
+    /// One $DE00 bank register; ROML only ($A000 stays BASIC), so the ROMH answer
+    /// is never consulted — a ROMH read is never SERVED by this family.
+    fn active_bank(&self, _addr: u16) -> u16 {
+        self.base.current_bank
+    }
     fn get_state(&self) -> CartState {
         CartState { current_bank: self.base.current_bank, control_register: Some(self.regval), flash: None }
     }
@@ -784,6 +979,10 @@ impl CartMapper for MagicDesk16Mapper {
     fn reset(&mut self) {
         self.base.current_bank = 0;
         self.regval = 0;
+    }
+    /// One $DE00 bank register feeding BOTH windows (ROML + ROMH of the same bank).
+    fn active_bank(&self, _addr: u16) -> u16 {
+        self.base.current_bank
     }
     fn get_state(&self) -> CartState {
         CartState { current_bank: self.base.current_bank, control_register: Some(self.regval), flash: None }
@@ -870,6 +1069,12 @@ impl CartMapper for OceanMapper {
     fn reset(&mut self) {
         self.base.current_bank = 0;
         self.regval = 0;
+    }
+    /// One $DE00 bank register. In the 16 KB config the SAME 8 KB ROML bank is
+    /// mirrored at $A000, so both slots report it (see [`CartSlot`] — a `Romh`
+    /// record on this family means "the ROML bank, read through the mirror").
+    fn active_bank(&self, _addr: u16) -> u16 {
+        self.base.current_bank
     }
     fn get_state(&self) -> CartState {
         CartState { current_bank: self.base.current_bank, control_register: Some(self.regval), flash: None }
@@ -1080,6 +1285,13 @@ impl CartMapper for EasyFlashMapper {
     fn reset(&mut self) {
         self.current_bank = 0;
         self.register02 = 0x00;
+    }
+    /// ONE bank register ($DE00, & $3F) selects the same bank in BOTH flash chips —
+    /// lo serves ROML, hi serves ROMH ($A000 in 16 K, $E000 in ultimax). So both
+    /// slots answer with `current_bank`, and the SLOT is what separates the two
+    /// chips in a record.
+    fn active_bank(&self, _addr: u16) -> u16 {
+        self.current_bank
     }
     fn get_state(&self) -> CartState {
         let mut lo = self.lo_flash.clone();
@@ -1336,6 +1548,10 @@ impl CartMapper for Gmod2Mapper {
         self.eeprom_cs = 0;
         self.eeprom.write_select(0);
     }
+    /// One $DE00 bank register; the family serves ROML only (8 K mode).
+    fn active_bank(&self, _addr: u16) -> u16 {
+        self.current_bank
+    }
     fn get_state(&self) -> CartState {
         let mut flash = self.flash.clone();
         CartState {
@@ -1480,6 +1696,12 @@ impl CartMapper for MegabyterMapper {
     fn reset(&mut self) {
         self.register00 = 0;
         self.register02 = 0;
+    }
+    /// The bank lives in `register00` ($DE00 with A1 clear, & $7F) — NOT in a
+    /// field called `current_bank`, and NOT reachable through `get_state` without
+    /// cloning the whole 1 MB flash. ROML is the only window this family serves.
+    fn active_bank(&self, _addr: u16) -> u16 {
+        self.register00 as u16
     }
     fn get_state(&self) -> CartState {
         let mut flash = self.flash.clone();
@@ -1628,6 +1850,12 @@ impl CartMapper for C64MegaCartMapper {
     fn reset(&mut self) {
         self.bank = 0;
         self.mode = C64MegaCartMode::Game8k;
+    }
+    /// A 14-bit bank assembled from $DE00 (low 8) + $DF00 (high 6). The SAME bank
+    /// serves ROML ($8000) and the ultimax ROMH ($E000) — both use the low 13
+    /// address bits — so both slots answer with it.
+    fn active_bank(&self, _addr: u16) -> u16 {
+        self.bank
     }
     fn get_state(&self) -> CartState {
         let mut flash = self.flash.clone();
@@ -2036,6 +2264,22 @@ impl CartMapper for Gmod4Mapper {
         self.spi_cs = 1;
         self.spi_data_in = 0;
         self.spi_clock = 0;
+    }
+
+    /// The family that forced this method to take an ADDRESS: each window has its
+    /// own bank, in the live context — and $E000 has none at all (it is pinned to
+    /// bank 0's odd half so the cart's vectors survive whatever the running code
+    /// banks in). With banking disabled every window shows bank 0.
+    fn active_bank(&self, addr: u16) -> u16 {
+        if !self.banking_enabled {
+            return 0;
+        }
+        match addr {
+            0x8000..=0x9fff => self.bank_8000() as u16,
+            0xa000..=0xbfff => self.bank_a000() as u16,
+            // $E000 (and the IO1 trampoline) are never banked.
+            _ => 0,
+        }
     }
 
     fn get_state(&self) -> CartState {
@@ -2704,6 +2948,16 @@ impl CartMapper for SelfConfigCartMapper {
         self.de00_write_count = 0;
     }
 
+    /// Post-lock the concrete family answers; pre-lock the generic $DE00-family
+    /// bank latch is the best available truth (the harness serves every window
+    /// out of the ROML image at that bank).
+    fn active_bank(&self, addr: u16) -> u16 {
+        match self.resolved.as_ref() {
+            Some(m) => m.active_bank(addr),
+            None => self.bank_low,
+        }
+    }
+
     fn get_state(&self) -> CartState {
         match &self.resolved {
             Some(m) => m.get_state(),
@@ -2847,5 +3101,173 @@ mod overlay795_tests {
         // Select bank 0 → the overlay is not visible (read-path bank isolation).
         ef.write(0xde00, 0, &bi, 0);
         assert_eq!(ef.read(0x8010, &bi, 0), Some(0x00));
+    }
+}
+
+#[cfg(test)]
+mod cart_read_set_785_tests {
+    //! Spec 785 C1 — the read-set's residency semantics. The real-cartridge proof
+    //! lives in `tests/cart_read_set.rs`; these pin the shape.
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn image(mapper_type: MapperType, banks_lo: &[(u16, u8)]) -> ParsedCartridgeImage {
+        let mut banks: BTreeMap<u16, CrtBank> = BTreeMap::new();
+        for &(bank, fill) in banks_lo {
+            let mut b = CrtBank::default();
+            b.roml = Some([fill; 0x2000]);
+            b.romh_a000 = Some([fill ^ 0xff; 0x2000]);
+            banks.insert(bank, b);
+        }
+        ParsedCartridgeImage {
+            path: String::new(),
+            name: "test".into(),
+            mapper_type,
+            exrom: 0,
+            game: 0,
+            banks,
+            profiles: BTreeSet::new(),
+            raw_bytes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn slot_is_the_rom_window_and_io_is_not_one() {
+        assert_eq!(CartSlot::for_address(0x8000), Some(CartSlot::Roml));
+        assert_eq!(CartSlot::for_address(0x9fff), Some(CartSlot::Roml));
+        assert_eq!(CartSlot::for_address(0xa000), Some(CartSlot::Romh));
+        assert_eq!(CartSlot::for_address(0xe000), Some(CartSlot::Romh));
+        // IO1/IO2 reaches the mapper too (EasyFlash IO2 RAM, GMOD2 EEPROM), but it
+        // is never cart ROM payload.
+        assert_eq!(CartSlot::for_address(0xde00), None);
+        assert_eq!(CartSlot::for_address(0xdf80), None);
+        assert_eq!(CartSlot::for_address(0x1000), None);
+    }
+
+    // The AC in one test: read bank 3, switch to 7, read, switch back to 3, read
+    // ⇒ THREE records, not two.
+    #[test]
+    fn bank_switch_and_back_yields_three_records() {
+        let mut rs = CartReadSet::default();
+        rs.on_read(CartSlot::Roml, 3, 0x0000, 100);
+        rs.on_read(CartSlot::Roml, 3, 0x0001, 101);
+        rs.on_read(CartSlot::Roml, 7, 0x0100, 200);
+        rs.on_read(CartSlot::Roml, 3, 0x0002, 300);
+        let recs = rs.drain();
+        assert_eq!(recs.len(), 3, "bank 3 → 7 → 3 is three residencies");
+        assert_eq!((recs[0].bank, recs[0].bytes, recs[0].cycle), (3, 2, 100));
+        assert_eq!((recs[1].bank, recs[1].bytes, recs[1].cycle), (7, 1, 200));
+        assert_eq!((recs[2].bank, recs[2].bytes, recs[2].cycle), (3, 1, 300));
+        // Drained empty.
+        assert!(rs.drain().is_empty());
+        assert!(rs.is_empty());
+    }
+
+    #[test]
+    fn offsets_are_the_touched_range_and_bytes_count_every_read() {
+        let mut rs = CartReadSet::default();
+        for off in [0x1000u16, 0x0040, 0x1fff, 0x0040] {
+            rs.on_read(CartSlot::Roml, 1, off, 10);
+        }
+        let recs = rs.drain();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].off_lo, 0x0040);
+        assert_eq!(recs[0].off_hi, 0x1fff);
+        assert_eq!(recs[0].bytes, 4, "a re-read counts again (bytes, not distinct addrs)");
+        assert_eq!(recs[0].slot, CartSlot::Roml as u8);
+    }
+
+    // Interleaved ROML/ROMH reads inside one bank must NOT ping-pong: one live
+    // residency per slot.
+    #[test]
+    fn slots_have_independent_residencies() {
+        let mut rs = CartReadSet::default();
+        for i in 0..4u16 {
+            rs.on_read(CartSlot::Roml, 5, i, 10 + i as u64);
+            rs.on_read(CartSlot::Romh, 5, 0x1000 + i, 10 + i as u64);
+        }
+        let recs = rs.drain();
+        assert_eq!(recs.len(), 2, "one record per slot, not eight");
+        let roml = recs.iter().find(|r| r.slot == CartSlot::Roml as u8).unwrap();
+        let romh = recs.iter().find(|r| r.slot == CartSlot::Romh as u8).unwrap();
+        assert_eq!((roml.bytes, roml.off_lo, roml.off_hi), (4, 0x0000, 0x0003));
+        assert_eq!((romh.bytes, romh.off_lo, romh.off_hi), (4, 0x1000, 0x1003));
+        // A ROMH bank switch closes ONLY the ROMH residency.
+        rs.on_read(CartSlot::Roml, 5, 0, 100);
+        rs.on_read(CartSlot::Romh, 6, 0, 101);
+        rs.on_read(CartSlot::Romh, 6, 1, 102);
+        assert_eq!(rs.drain().len(), 2);
+    }
+
+    // The tail residency is never lost: drain closes what is still live.
+    #[test]
+    fn drain_closes_the_live_residency() {
+        let mut rs = CartReadSet::default();
+        rs.on_read(CartSlot::Roml, 46, 0x0010, 999);
+        let recs = rs.drain();
+        assert_eq!(recs.len(), 1, "the last bank a title reads must still be reported");
+        assert_eq!(recs[0].bank, 46);
+        // Continuing after a drain re-opens a residency (records split, totals keep).
+        rs.on_read(CartSlot::Roml, 46, 0x0011, 1000);
+        assert_eq!(rs.drain()[0].bank, 46);
+    }
+
+    #[test]
+    fn records_come_out_cycle_ordered() {
+        let mut rs = CartReadSet::default();
+        rs.on_read(CartSlot::Roml, 1, 0, 10); // long ROML residency, starts first
+        rs.on_read(CartSlot::Romh, 2, 0, 20); // short ROMH residency
+        rs.on_read(CartSlot::Romh, 3, 0, 30); // closes ROMH(2) before ROML(1) closes
+        let recs = rs.drain();
+        let cycles: Vec<u64> = recs.iter().map(|r| r.cycle).collect();
+        assert_eq!(cycles, vec![10, 20, 30], "close order is not start order — sort by cycle");
+    }
+
+    #[test]
+    fn arming_clears_live_residencies_too() {
+        let mut rs = CartReadSet::default();
+        rs.on_read(CartSlot::Roml, 9, 0, 1);
+        rs.clear();
+        assert!(rs.is_empty());
+        assert!(rs.drain().is_empty());
+    }
+
+    // active_bank is a FIELD read, and each family answers for the window the way
+    // its own read() resolves it.
+    #[test]
+    fn active_bank_per_family() {
+        let bi = BankInfo {
+            cpu_port_direction: 0x2f,
+            cpu_port_value: 0x37,
+            basic_visible: false,
+            kernal_visible: false,
+            io_visible: true,
+            char_visible: false,
+            cartridge_attached: true,
+            cartridge_exrom: Some(0),
+            cartridge_game: Some(0),
+            phi1: 0xff,
+        };
+
+        // EasyFlash: ONE $DE00 register, both windows.
+        let img = image(MapperType::EasyFlash, &[(0, 0x11), (5, 0x55)]);
+        let mut ef = EasyFlashMapper::new(&img);
+        assert_eq!(ef.active_bank(0x8000), 0);
+        ef.write(0xde00, 5, &bi, 0);
+        assert_eq!(ef.active_bank(0x8000), 5);
+        assert_eq!(ef.active_bank(0xa000), 5, "hi flash follows the same bank register");
+        assert_eq!(ef.active_bank(0xe000), 5, "ultimax ROMH is the same chip + bank");
+
+        // MegaByter: the bank is register00, NOT a `current_bank` field, and the
+        // register is $DE00 with A1 CLEAR ($DE02 is the mode register).
+        let img = image(MapperType::MegaByter, &[(0, 0x11), (0x42, 0x22)]);
+        let mut mb = MegabyterMapper::new(&img);
+        assert_eq!(mb.active_bank(0x8000), 0);
+        mb.write(0xde02, 0x01, &bi, 0); // mode register — NOT the bank
+        assert_eq!(mb.active_bank(0x8000), 0, "$DE02 is the mode register, not the bank");
+        mb.write(0xde00, 0x42, &bi, 0);
+        assert_eq!(mb.active_bank(0x8000), 0x42);
+        // ...and reading it must not have cost a flash clone.
+        assert_eq!(mb.active_bank(0x8000), 0x42);
     }
 }

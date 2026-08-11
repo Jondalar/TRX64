@@ -213,6 +213,19 @@ pub struct FullBus<'a> {
     /// SYNCHRONOUSLY from read()/write() (a per-access bus hook, NOT a clocked
     /// device — no tick). When None the banking is exactly the pre-cart path.
     pub cartridge: Option<&'a mut Box<dyn crate::cart::CartMapper>>,
+    /// Spec 785 C1 — the ARMED cartridge read-set accumulator, or None.
+    ///
+    /// `Some` only while `Machine::cart_read_armed`; every other construction site
+    /// (the monitor's `read_full_live`/`write_full`, the bus tests) passes None, so
+    /// a monitor peek/poke can never enter a title's read-set and the disarmed read
+    /// path is the pre-785 one.
+    pub cart_reads: Option<&'a mut crate::cart::CartReadSet>,
+    /// Spec 785 C1 — suspends read-set accounting for the duration of ONE bus
+    /// read. Set by `full_sc`'s store paths around the pre-write old-byte read:
+    /// that read is trace/undo INSTRUMENTATION (VICE does not perform it), so the
+    /// cartridge never sees it and it must not be counted. A write to RAM under a
+    /// banked-in cart ROM would otherwise fabricate one cart read per store.
+    pub cart_account_suspend: bool,
 }
 
 impl<'a> FullBus<'a> {
@@ -599,10 +612,27 @@ impl<'a> FullBus<'a> {
     fn cart_read(&mut self, addr: u16) -> Option<u8> {
         let bi = self.get_bank_info();
         let clk = self.clk;
-        match self.cartridge.as_mut() {
+        let served = match self.cartridge.as_mut() {
             Some(c) => c.read(addr, &bi, clk),
-            None => None,
+            None => return None,
+        };
+        // Spec 785 C1 — the cart READ-SET. Armed-only: with `cart_reads` None this
+        // is one already-predicted branch and the read path is unchanged.
+        //
+        // Counted iff the mapper actually SERVED the byte (`Some`) — a declined
+        // window (GMod4 refusing a window it does not drive, a Base bank with no
+        // data) hands the byte to RAM/open bus and is not a cart read — and iff
+        // the address is a ROM window: $DE00-$DFFF also comes through here, but
+        // IO1/IO2 is register + scratch-RAM space, never cart ROM payload.
+        if served.is_some() && !self.cart_account_suspend {
+            if let Some(slot) = crate::cart::CartSlot::for_address(addr) {
+                if let (Some(rs), Some(c)) = (self.cart_reads.as_deref_mut(), self.cartridge.as_ref())
+                {
+                    rs.on_read(slot, c.active_bank(addr), addr & 0x1fff, clk);
+                }
+            }
         }
+        served
     }
 
     /// Drive a write through the cartridge mapper (ts:
@@ -891,6 +921,8 @@ mod joystick_gate_tests {
             joystick2: joy2,
             drive_c64_ref: 0,
             cartridge: None,
+            cart_reads: None,
+            cart_account_suspend: false,
         }
     }
 

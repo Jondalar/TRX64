@@ -543,6 +543,14 @@ pub struct Machine {
     /// `rotation.gcr_read_count` snapshot at the moment the head entered the CURRENT
     /// sector. `gcr_read_count - sector_entry_read_count` = bytes read off it so far.
     sector_entry_read_count: u64,
+    /// Spec 785 C1 — armed-on-command CARTRIDGE read-set (the bank analogue of the
+    /// 1541 `block_reads` lane). OFF by default and never fed by the always-on
+    /// rings: while armed, the bus hands `cart_read_set` to `FullBus`, which counts
+    /// every read the mapper SERVES out of a ROM window and attributes it to the
+    /// bank live at that moment. The daemon drains it → CART_READ (0x36).
+    pub cart_read_armed: bool,
+    /// The accumulator itself. See [`crate::cart::CartReadSet`].
+    pub cart_read_set: crate::cart::CartReadSet,
 }
 
 /// reverse-debug Phase 1b — the CPU state the machine landed on after a reverse-step
@@ -685,6 +693,8 @@ impl Machine {
             head_trace_last: None,
             block_reads: Vec::new(),
             sector_entry_read_count: 0,
+            cart_read_armed: false,
+            cart_read_set: crate::cart::CartReadSet::default(),
         }
     }
 
@@ -1135,6 +1145,10 @@ impl Machine {
             joystick2: self.joystick2,
             drive_c64_ref: self.drive_c64_ref,
             cartridge: self.cartridge.as_mut(),
+            // Spec 785 C1 — a MONITOR access is not the title reading: never let it
+            // enter the cart read-set.
+            cart_reads: None,
+            cart_account_suspend: false,
         };
         fb.write(addr, val);
         self.memconfig = fb.config;
@@ -1180,6 +1194,10 @@ impl Machine {
             joystick2: self.joystick2,
             drive_c64_ref: self.drive_c64_ref,
             cartridge: self.cartridge.as_mut(),
+            // Spec 785 C1 — a MONITOR access is not the title reading: never let it
+            // enter the cart read-set.
+            cart_reads: None,
+            cart_account_suspend: false,
         };
         let v = fb.read(addr);
         self.memconfig = fb.config;
@@ -1820,6 +1838,24 @@ impl Machine {
         std::mem::take(&mut self.block_reads)
     }
 
+    /// Spec 785 C1 — arm/disarm the CARTRIDGE read-set. Arming clears it. OFF by
+    /// default; only a `cart-read`-armed run turns it on. The disk lane's twin
+    /// ([`Machine::arm_head_trace`]) and this one are independent: a title that
+    /// loads from disk AND banks a cart can arm both.
+    pub fn arm_cart_reads(&mut self, on: bool) {
+        self.cart_read_armed = on;
+        if on {
+            self.cart_read_set.clear();
+        }
+    }
+
+    /// Spec 785 C1 — take the accumulated cart read-set: one
+    /// `{cycle, bank, slot, off_lo, off_hi, bytes}` record per bank residency,
+    /// cycle-ordered, live residencies closed so the tail of the run is included.
+    pub fn drain_cart_reads(&mut self) -> Vec<crate::cart::CartReadRecord> {
+        self.cart_read_set.drain()
+    }
+
     pub fn run_for_full<O: Observer, F>(&mut self, budget: u64, obs: &mut O, on_drive_step: F)
     where
         F: FnMut(u16, u8, u8, u8, u8, u8, u64),
@@ -1960,6 +1996,14 @@ impl Machine {
                     joystick2: self.joystick2,
                     drive_c64_ref: self.drive_c64_ref,
                     cartridge: self.cartridge.as_mut(),
+                    // Spec 785 C1 — the cart read-set rides with the run ONLY while
+                    // armed; None otherwise, so the hot read path is unchanged.
+                    cart_reads: if self.cart_read_armed {
+                        Some(&mut self.cart_read_set)
+                    } else {
+                        None
+                    },
+                    cart_account_suspend: false,
                 };
                 let mut bus = full_sc::FullScBus {
                     fb,
