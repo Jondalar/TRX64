@@ -2,6 +2,10 @@
 
 **Status:** PARTLY BUILT — §5.1 (SPI flash) and §5.2 (GMod4 mapper) shipped 2026-08-09;
 AGR (§6) and the vendor-question follow-ups (§5.4) remain open.
+
+**GMod3 sample availability (2026-08-11): there is none.** Not in the user's hands, not in any archive we have looked at. That puts GMod3 in the same position as AGR — writing the first implementation AND the first test, with hardware as the only oracle. Worth weighing before starting: the SPI core it needs is already built and paid for by GMod4.
+
+By contrast MegaByter and C64MegaCart now HAVE real samples (1 MB raw `.bin`, the same title in both mappers), which answered the register question by diff: `$de00` carries the bank in both; the second register is `$de02` for MegaByter and `$df00` for C64MegaCart. See C64RE spec 785 §3.1.
 **Repo:** TRX64 (cartridge emulation). C64RE is unaffected — new mappers need no meaning-layer
 change.
 **Number:** 803 (shared board `C64ReverseEngineeringMCP/specs/README.md`).
