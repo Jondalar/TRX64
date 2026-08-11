@@ -380,6 +380,7 @@ pub struct Drive1541 {
     /// distilled `Via6522` for VIA2: the disk-controller hooks (stepper/motor/
     /// SYNC/byte-ready) run through `Via2dBackend` exactly as via2d.ts does.
     via2: ViaContext,
+    // (`led_on()` below reads VIA2 PB bit 3 out of this — see there.)
     /// VIA2 IRQ-line mirror (see `viacore::Via2Irq`): the viacore `set_int` hook
     /// records the line level + rclk here; the run loop replays it into
     /// `int.set_irq(1, ..)` at the instruction boundary.
@@ -966,6 +967,19 @@ impl Drive1541 {
     /// VIA1, $1C00-$1FFF VIA2) so a peek NEVER clears byte_ready/IFR or dispatches a
     /// timer alarm (unlike `read`, which is a live bus access). Read-inspect only.
     #[inline]
+    /// The activity LED — VIA2 port B bit 3, driven only when DDRB says that pin is an
+    /// output (VICE's `drive->led_status` is set from the same bit).
+    ///
+    /// There is no `led` field in this port; the monitor's drive panel simply omitted the
+    /// LED because of that, losing the one at-a-glance signal for "is the drive doing
+    /// something". Derived here rather than mirrored into new state, so it cannot go
+    /// stale.
+    pub fn led_on(&self) -> bool {
+        let prb = self.via2.via[crate::viacore::VIA_PRB];
+        let ddrb = self.via2.via[crate::viacore::VIA_DDRB];
+        (prb & ddrb & 0x08) != 0
+    }
+
     pub fn drive_peek(&self, addr: u16) -> u8 {
         match addr {
             0x0000..=0x7FFF => {

@@ -3167,6 +3167,38 @@ fn sc_to_ascii(sc: u8) -> char {
 /// as "no banking". `wr d020 00` therefore wrote the RAM hidden *under* the I/O window,
 /// left the border untouched, and reported success — the TS reference's own comment for
 /// the same line reads "`wr d020 00` blacks the border".
+/// Why a step/next/return stopped, for the landing line's suffix.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StopWhy {
+    /// Landed where it was meant to — a clean step, or a return that returned.
+    Clean,
+    /// A user breakpoint tripped before the verb was finished.
+    UserBp,
+    /// The iteration guard ran out; the verb gave up rather than returning.
+    Cap,
+}
+
+/// The landing line for `step`/`si`/`z`, `n`/`next`/`so` and `ret`/`return`.
+///
+/// Two things used to be missing from all eight verbs, and both are the kind you only
+/// notice when they mislead you:
+///
+/// - the FLOW TAG. A step that entered an interrupt handler printed exactly like an
+///   ordinary one, so nothing in the text said you were now inside an IRQ. The tracker
+///   was there all along — `flow` and `bt` render it — it just was not consulted here.
+/// - the STOP REASON. `ret` that hit a breakpoint mid-callee, and `ret` that gave up
+///   after the guard cap without ever returning, were textually identical to `ret` that
+///   returned. All three read as success.
+fn land_line(line: &str, tag: &str, cyc: u64, flow: FlowKind, why: StopWhy) -> String {
+    let flow_tag = if flow == FlowKind::Main { String::new() } else { format!(" [{}]", flow.tag()) };
+    let why = match why {
+        StopWhy::Clean => "",
+        StopWhy::UserBp => ", hit user bp",
+        StopWhy::Cap => ", CAP",
+    };
+    format!("{line}{flow_tag} ({tag}, {cyc} cyc{why})")
+}
+
 /// Was a project workspace actually named, or is the "project dir" just wherever the
 /// daemon happens to be running?
 ///
@@ -3309,7 +3341,15 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
     // parseFileCmd (= monitor-shell.ts:182-185): the first token after the verb is the
     // file (a "quoted name" wins, else the bare token); `rest` = remaining tokens.
     let parse_file_cmd = || -> (Option<String>, Vec<String>) {
-        if let Some(q) = quoted_first(&cmd) {
+        // The quoted name must follow the VERB, as the reference's anchored regex
+        // (`^\S+\s+"([^"]+)"`) requires. Scanning the whole line for the first quote pair
+        // meant `mkdir foo "bar baz"` created `bar baz` instead of `foo` — and this helper
+        // is shared by EVERY file verb, so the same mis-pick was available to all of them.
+        let anchored = cmd
+            .split_once(char::is_whitespace)
+            .map(|(_verb, rest)| rest.trim_start().starts_with('"'))
+            .unwrap_or(false);
+        if let Some(q) = quoted_first(&cmd).filter(|_| anchored) {
             // `rest` after the closing quote.
             let after = cmd
                 .splitn(2, &format!("\"{q}\""))
@@ -3361,6 +3401,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
     match op.as_str() {
         // ---- Registers (Spec 754 §3.3d). `r` shows; `r a=$42 x=$10` sets. ----
         "r" | "registers" => {
+            let flow_now = st.flow.current_flow();
             // audit ws-trace-monitor-misc-8 — device drive8: the 1541 CPU registers
             // (read-only). 1:1 with monitor-shell.ts:481-488 (drive_pc / a / x / y / sp
             // / flags / drive_clk + track/halftrack), so the panel is unambiguously the
@@ -3377,6 +3418,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                         if (flags >> (7 - i)) & 1 != 0 { f } else { f.to_ascii_lowercase() }
                     })
                     .collect();
+                let led = drv.led_on();
                 let halftrack = drv.rotation.current_half_track;
                 // NO `+ 1`: the field's own doc says "current_half_track (2..=84).
                 // Power-on 36 (T18)", so half-track 36 IS track 18. The extra one showed
@@ -3385,10 +3427,11 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 return Ok(format!(
                     "1541 (drive 8)\n  \
                      ADDR AC XR YR SP NV-BDIZC  clk\n\
-                     .;{:04X} {:02X} {:02X} {:02X} {:02X} {}  {}\n  \
-                     track {} (halftrack {})",
+                     .;{:04x} {:02x} {:02x} {:02x} {:02x} {}  {}\n  \
+                     track {} (halftrack {})  led {}",
                     c.reg_pc, c.reg_a, c.reg_x, c.reg_y, c.reg_sp, flags_str, drv.drive_clk,
-                    track, halftrack
+                    track, halftrack,
+                    if led { "on" } else { "off" }
                 ));
             }
             let sets: Vec<&String> = toks[1..].iter().filter(|t| t.contains('=')).collect();
@@ -3407,10 +3450,10 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                     };
                     let c = &mut st.session.machine.cpu6510;
                     match reg.as_str() {
-                        "a" | "ac" => { c.reg_a = v as u8; done.push(format!("a=${:02X}", v as u8)); }
-                        "x" | "xr" => { c.reg_x = v as u8; done.push(format!("x=${:02X}", v as u8)); }
-                        "y" | "yr" => { c.reg_y = v as u8; done.push(format!("y=${:02X}", v as u8)); }
-                        "sp" => { c.reg_sp = v as u8; done.push(format!("sp=${:02X}", v as u8)); }
+                        "a" | "ac" => { c.reg_a = v as u8; done.push(format!("a=${:02x}", v as u8)); }
+                        "x" | "xr" => { c.reg_x = v as u8; done.push(format!("x=${:02x}", v as u8)); }
+                        "y" | "yr" => { c.reg_y = v as u8; done.push(format!("y=${:02x}", v as u8)); }
+                        "sp" => { c.reg_sp = v as u8; done.push(format!("sp=${:02x}", v as u8)); }
                         "pc" => {
                             c.reg_pc = v as u16;
                             // Also drive the live full-machine core's PC, so a subsequent
@@ -3418,13 +3461,13 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                             // `r pc=` sets the one CPU; TRX64 has two cores kept in sync).
                             st.session.machine.c64_core.reg_pc = v as u16;
                             st.mon.disasm_cursor = Some(v as u16);
-                            done.push(format!("pc=${:04X}", v as u16));
+                            done.push(format!("pc=${:04x}", v as u16));
                         }
                         "p" | "fl" | "flags" => {
                             c.reg_p = (v as u8) & !0xa2;
                             c.flag_n = (v as u8) & 0x80;
                             c.flag_z = if (v as u8) & 0x02 != 0 { 0 } else { 1 };
-                            done.push(format!("fl=${:02X}", v as u8));
+                            done.push(format!("fl=${:02x}", v as u8));
                         }
                         _ => done.push(format!("unknown reg '{reg}'")),
                     }
@@ -3464,12 +3507,17 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 let loram = port & 1;
                 let hiram = (port >> 1) & 1;
                 let charen = (port >> 2) & 1;
+                // The flow column was the literal string "MAIN", so the panel claimed
+                // main flow while the CPU sat inside an interrupt handler — the one place
+                // you look to find out. The tracker is right there and `flow`/`bt`
+                // already read it.
+                let flow = flow_now.tag().to_ascii_uppercase();
                 Ok(format!(
                     "  ADDR AC XR YR SP NV-BDIZC  flow\n\
-                     .;{:04X} {:02X} {:02X} {:02X} {:02X} {}  MAIN\n  \
-                     port  $00=${:02X} $01=${:02X}  LORAM={} HIRAM={} CHAREN={}\n  \
-                     vectors  IRQ hw=${:04X}  CINV $0314->${:04X}     NMI hw=${:04X}  NMIV $0318->${:04X}",
-                    c.reg_pc, c.reg_a, c.reg_x, c.reg_y, c.reg_sp, flags_str,
+                     .;{:04x} {:02x} {:02x} {:02x} {:02x} {}  {}\n  \
+                     port  $00=${:02x} $01=${:02x}  LORAM={} HIRAM={} CHAREN={}\n  \
+                     vectors  IRQ hw=${:04x}  CINV $0314->${:04x}     NMI hw=${:04x}  NMIV $0318->${:04x}",
+                    c.reg_pc, c.reg_a, c.reg_x, c.reg_y, c.reg_sp, flags_str, flow,
                     ddr, port, loram, hiram, charen,
                     irq_hw, cinv, nmi_hw, nmiv
                 ))
@@ -3539,7 +3587,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                     } else {
                         monitor_read(st, (aj & 0xffff) as u16, &lens)
                     };
-                    bytes.push(format!("{:02X}", b));
+                    bytes.push(format!("{:02x}", b));
                     ascii.push(if (0x20..0x7f).contains(&b) { b as char } else { '.' });
                 }
                 let lens_letter = if lens == "cpu" {
@@ -3548,7 +3596,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                     lens.chars().next().unwrap().to_ascii_uppercase()
                 };
                 lines.push(format!(
-                    ">{}:{:04X}  {}  {}",
+                    ">{}:{:04x}  {}  {}",
                     lens_letter,
                     a & 0xffff,
                     format!("{:<96}", bytes.join(" ")),
@@ -3584,7 +3632,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             };
             if let Some(e) = end {
                 if e < (start & 0xffff) {
-                    return Err(format!("d: end ${:04X} < start ${:04X}", e, start & 0xffff));
+                    return Err(format!("d: end ${:04x} < start ${:04x}", e, start & 0xffff));
                 }
             }
             let pc = st.session.machine.cpu6510.reg_pc;
@@ -3622,7 +3670,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 }
                 if a <= e && n >= MAX {
                     lines.push(format!(
-                        "… (truncated at ${:04X} — `d ${:04X} ${:04X}` to continue)",
+                        "… (truncated at ${:04x} — `d ${:04x} ${:04x}` to continue)",
                         a, a, e
                     ));
                 }
@@ -3689,11 +3737,12 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             st.session.machine.sync_after_monitor();
             st.session.running = was_running;
             // Render each touched address once (first-seen order) + ×count for loops.
+            let labels = project_knowledge::user_label_index(&fs_project_dir());
             let read = |a: u16| st.session.machine.peek_lens(a, "cpu");
             let mut lines: Vec<String> = order
                 .iter()
                 .map(|&pc| {
-                    let (_, line) = disasm_line_ts(read, pc);
+                    let (_, line) = disasm_line_ts_labeled(read, pc, &labels);
                     let c = *count.get(&pc).unwrap();
                     if c > 1 {
                         format!("{line}   x{c}")
@@ -3748,6 +3797,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 .and_then(|t| t.parse::<i64>().ok())
                 .unwrap_or(200)
                 .clamp(1, 100_000) as usize;
+            let labels = project_knowledge::user_label_index(&fs_project_dir());
             let read = |a: u16| st.session.machine.peek_lens(a, "cpu");
             let indent = |depth: usize| -> String { "  ".repeat(depth.min(8)) };
             let mut lines: Vec<String> = Vec::new();
@@ -3762,7 +3812,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 }
                 visited.insert(a);
                 let cf = classify_cf(read, a);
-                let (_, line) = disasm_line_ts(read, a);
+                let (_, line) = disasm_line_ts_labeled(read, a, &labels);
                 lines.push(format!("{}{}", indent(stack.len()), line));
                 remaining -= 1;
                 match cf.kind {
@@ -3911,7 +3961,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 a += 1;
             }
             Ok(format!(
-                "filled ${:04X}..${:04X} ({} bytes, pattern {})",
+                "filled ${:04x}..${:04x} ({} bytes, pattern {})",
                 start, end, n, data.len()
             ))
         }
@@ -4042,7 +4092,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 format!(
                     "found {}:\n  {}",
                     hits.len(),
-                    hits.iter().map(|a| format!("${:04X}", a)).collect::<Vec<_>>().join(" ")
+                    hits.iter().map(|a| format!("${:04x}", a)).collect::<Vec<_>>().join(" ")
                 )
             })
         }
@@ -4115,9 +4165,9 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                     observers::ObsTrigger::Store => "store",
                 };
                 let range = if spec.hi != spec.lo {
-                    format!("${:04X}..${:04X}", spec.lo, spec.hi)
+                    format!("${:04x}..${:04x}", spec.lo, spec.hi)
                 } else {
-                    format!("${:04X}", spec.lo)
+                    format!("${:04x}", spec.lo)
                 };
                 let cond = spec
                     .cond_src
@@ -4458,9 +4508,9 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 observers::ObsTrigger::Store => "store",
             };
             let range = if hi != lo {
-                format!("${lo:04X}..${hi:04X}")
+                format!("${lo:04x}..${hi:04x}")
             } else {
-                format!("${lo:04X}")
+                format!("${lo:04x}")
             };
             let cond_disp = cond_src.map(|c| format!(" if {c}")).unwrap_or_default();
             let do_disp = obs_do_desc(st.dsl_observers.last().unwrap());
@@ -4477,7 +4527,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                     } else {
                         let mut s = String::from("breakpoints:");
                         for e in list {
-                            s.push_str(&format!("\n  #{}  ${:04X}", e.num, e.pc));
+                            s.push_str(&format!("\n  #{}  ${:04x}", e.num, e.pc));
                         }
                         s
                     })
@@ -4490,14 +4540,14 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                     let a = parse_addr(Some(&t1[1..].to_string()))
                         .ok_or_else(|| format!("bad address: {t1}"))?;
                     st.breakpoints.entries.retain(|e| e.pc != a);
-                    Ok(format!("removed bp ${:04X} ({} left)", a, st.breakpoints.entries.len()))
+                    Ok(format!("removed bp ${:04x} ({} left)", a, st.breakpoints.entries.len()))
                 }
                 Some(t1) => {
                     let addr = parse_addr(Some(t1)).ok_or_else(|| format!("bad address: {t1}"))?;
                     let num = st.breakpoints.next_num;
                     st.breakpoints.next_num += 1;
                     st.breakpoints.entries.push(BpEntry { num, pc: addr, enabled: true });
-                    Ok(format!("bk #{} set at ${:04X} ({} total)", num, addr, st.breakpoints.entries.len()))
+                    Ok(format!("bk #{} set at ${:04x} ({} total)", num, addr, st.breakpoints.entries.len()))
                 }
             }
         }
@@ -4561,7 +4611,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             // --stream, or the CLI pump's session/run).
             st.stream_broke_on_jam = false;
             Ok(format!(
-                "continuing at .C:{:04X} (running — Pause to halt)",
+                "continuing at .C:{:04x} (running — Pause to halt)",
                 st.session.machine.cpu6510.reg_pc
             ))
         }
@@ -4613,12 +4663,12 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             st.mon.disasm_cursor = Some(pc);
             Ok(if hit {
                 format!(
-                    "until ${:04X} reached -> .C:{:04X} ({} instr, {} cyc)",
+                    "until ${:04x} reached -> .C:{:04x} ({} instr, {} cyc)",
                     addr, pc, executed, cyc
                 )
             } else {
                 format!(
-                    "until ${:04X} NOT reached ({} instr, {} cyc, pc=${:04X})",
+                    "until ${:04x} NOT reached ({} instr, {} cyc, pc=${:04x})",
                     addr, executed, cyc, pc
                 )
             })
@@ -4643,7 +4693,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             let pc = st.session.machine.cpu6510.reg_pc;
             st.mon.disasm_cursor = Some(pc);
             let (_, line) = disasm_line_ts(|a| st.session.machine.peek_lens(a, "cpu"), pc);
-            Ok(format!("{line} (step, {cyc} cyc)"))
+            Ok(land_line(&line, "step", cyc, st.flow.current_flow(), StopWhy::Clean))
         }
         "n" | "next" | "so" => {
             st.session.running = false;
@@ -4666,6 +4716,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 step_one_with_flow(&mut st.session, &mut st.flow);
             }
             let r_cyc = st.session.machine.clk.wrapping_sub(clk0);
+            let mut why = StopWhy::Clean;
             if is_jsr {
                 // runUntilReturn: run the subroutine body until it RTSes back (SP
                 // restored to the entry level → balanced) or a user bp trips.
@@ -4684,9 +4735,11 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                     // a breakpoint on a subroutine's first instruction was stepped over
                     // in silence, which is exactly where people put them.
                     if bp_set.contains(&pc) {
+                        why = StopWhy::UserBp;
                         break;
                     }
                     if iters >= CAP {
+                        why = StopWhy::Cap;
                         break;
                     }
                     step_one_instruction(&mut st.session);
@@ -4696,7 +4749,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             let pc = st.session.machine.cpu6510.reg_pc;
             st.mon.disasm_cursor = Some(pc);
             let (_, line) = disasm_line_ts(|a| st.session.machine.peek_lens(a, "cpu"), pc);
-            Ok(format!("{line} (next, {r_cyc} cyc)"))
+            Ok(land_line(&line, "next", r_cyc, st.flow.current_flow(), why))
         }
         "ret" | "return" => {
             st.session.running = false;
@@ -4706,8 +4759,10 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             const SKIP_CAP: u64 = 5_000_000;
             let mut guard: u64 = 0;
             let mut last_cyc: u64 = 0;
+            let mut why = StopWhy::Clean;
             loop {
                 if guard >= SKIP_CAP {
+                    why = StopWhy::Cap;
                     break;
                 }
                 // The op about to execute (so we can detect the RTS/RTI return).
@@ -4722,6 +4777,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 guard += 1;
                 let pc = st.session.machine.cpu6510.reg_pc;
                 if bp_set.contains(&pc) {
+                    why = StopWhy::UserBp;
                     break;
                 }
                 // stepping.ts:241 — stop when the executed instr was RTS/RTI AND the
@@ -4733,7 +4789,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             let pc = st.session.machine.cpu6510.reg_pc;
             st.mon.disasm_cursor = Some(pc);
             let (_, line) = disasm_line_ts(|a| st.session.machine.peek_lens(a, "cpu"), pc);
-            Ok(format!("{line} (return, {last_cyc} cyc)"))
+            Ok(land_line(&line, "return", last_cyc, st.flow.current_flow(), why))
         }
 
         // ---- flow / bt — Spec 754 §3.3h capability panels (audit misc-13). ----
@@ -4767,7 +4823,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 let lo = m.peek_lens((a & 0xffff) as u16, "cpu") as u32;
                 let hi = m.peek_lens(((a + 1) & 0xffff) as u16, "cpu") as u32;
                 let ret = (((hi << 8) | lo) + 1) & 0xffff;
-                lines.push(format!("  ${:04X}: -> ${:04X}  (JSR return?)", a & 0xffff, ret));
+                lines.push(format!("  ${:04x}: -> ${:04x}  (JSR return?)", a & 0xffff, ret));
                 found += 1;
                 a += 2;
             }
@@ -4779,7 +4835,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             if !st.flow.stack.is_empty() {
                 lines.push("flow frames (exact, from stepping):".to_string());
                 for fr in &st.flow.stack {
-                    lines.push(format!("  {} @ ${:04X}", fr.kind.tag(), fr.entered_at_pc));
+                    lines.push(format!("  {} @ ${:04x}", fr.kind.tag(), fr.entered_at_pc));
                 }
             }
             Ok(lines.join("\n"))
@@ -4800,7 +4856,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 Ok(out) => {
                     let l = out.landed;
                     let mut lines = vec![format!(
-                        "reverse-step: undid {} instruction(s) → landed @ ${:04X}  A=${:02X} X=${:02X} Y=${:02X} SP=${:02X} P=${:02X}  cyc={}",
+                        "reverse-step: undid {} instruction(s) → landed @ ${:04x}  A=${:02x} X=${:02x} Y=${:02x} SP=${:02x} P=${:02x}  cyc={}",
                         out.steps_taken, l.pc, l.a, l.x, l.y, l.sp, l.p, l.cycle
                     )];
                     if out.undone_writes.is_empty() {
@@ -4809,7 +4865,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                         lines.push(format!("  rolled back {} write(s) (newest first):", out.undone_writes.len()));
                         for w in out.undone_writes.iter().take(32) {
                             lines.push(format!(
-                                "    ${:04X}: ${:02X} <- ${:02X}  (restored old)",
+                                "    ${:04x}: ${:02x} <- ${:02x}  (restored old)",
                                 w.addr, w.old_value, w.new_value
                             ));
                         }
@@ -4844,7 +4900,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             let exhaustion = st.session.machine.ring_exhaustion(!hits.is_empty());
             if hits.is_empty() {
                 let mut lines = vec![format!(
-                    "whowrote ${addr:04X}: no writer in the live delta ring (window not covered, or never written since the last reset). Older history lives only in a finalized trace."
+                    "whowrote ${addr:04x}: no writer in the live delta ring (window not covered, or never written since the last reset). Older history lives only in a finalized trace."
                 )];
                 if exhaustion.ring_exhausted {
                     lines.push(format!(
@@ -4855,7 +4911,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 return Ok(lines.join("\n"));
             }
             let mut lines = vec![format!(
-                "whowrote ${:04X}: {} writer(s) in the live ring (newest first):",
+                "whowrote ${:04x}: {} writer(s) in the live ring (newest first):",
                 addr,
                 hits.len()
             )];
@@ -4866,13 +4922,13 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 // captured (an interrupt/early-boot write with an empty/unreadable stack).
                 let chain = h.caller_chain;
                 let mut line = format!(
-                    "  ${:04X} <- written by ${:04X} @ cyc {}  (${:02X} -> ${:02X})",
+                    "  ${:04x} <- written by ${:04x} @ cyc {}  (${:02x} -> ${:02x})",
                     h.addr, h.pc, h.cycle, h.old_value, h.new_value
                 );
                 if chain.depth > 0 {
                     let frames: Vec<String> = chain.frames[..chain.depth as usize]
                         .iter()
-                        .map(|f| format!("${f:04X}"))
+                        .map(|f| format!("${f:04x}"))
                         .collect();
                     line.push_str(&format!("   caller chain: {}", frames.join(" -> ")));
                 }
@@ -4923,10 +4979,10 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                         let dumps: Vec<String> = r
                             .dump
                             .iter()
-                            .map(|(n, a, l)| format!("{n}@${a:04X}:{l}"))
+                            .map(|(n, a, l)| format!("{n}@${a:04x}:{l}"))
                             .collect();
                         let decode = if r.decode.is_empty() { String::new() } else { format!("  => {}", r.decode) };
-                        lines.push(format!("  ${:04X}  \"{}\"  [{}]{}", r.pc, r.label, dumps.join(", "), decode));
+                        lines.push(format!("  ${:04x}  \"{}\"  [{}]{}", r.pc, r.label, dumps.join(", "), decode));
                     }
                     Ok(lines.join("\n"))
                 }
@@ -5152,7 +5208,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                         }
                         // TS marks against ctrl.traceRun (throws if inactive at the WS
                         // boundary); the monitor verb mirrors runtime/mark's guard.
-                        None => Ok("trace: no active run — `trace on` first".into()),
+                        None => Err("trace: no active run — `trace on` first".into()),
                     }
                 }
                 "on" | "start" => {
@@ -5281,7 +5337,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
         "map" => {
             let cpu = toks.get(1).map(|s| s.to_ascii_lowercase()).unwrap_or_else(|| "c64".to_string());
             if cpu != "c64" && cpu != "drive8" {
-                return Ok("map: cpu must be c64|drive8".into());
+                return Err("map: cpu must be c64|drive8".into());
             }
             // No window argument, so take whatever the ring still holds.
             let (db, built) = trace_store_for_analysis(st, None).map_err(|e| format!("map: {e}"))?;
@@ -5298,7 +5354,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
         "taint" => {
             let addr = match parse_addr(toks.get(1)) {
                 Some(a) => a,
-                None => return Ok("taint: usage: taint <addr> [cycle]".into()),
+                None => return Err("taint: usage: taint <addr> [cycle]".into()),
             };
             let mut args = json!({ "start_addr": addr });
             if let Some(c) = toks.get(2).and_then(|s| s.parse::<i64>().ok()) {
@@ -5653,12 +5709,16 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                     project_knowledge::project_labels_del(&dir, &key)
                 }
                 "note" => {
+                    // An EMPTY quoted text is a usage error, not an empty note — the
+                    // reference's `!text` guard treats "" as absent.
                     let addr = parse_addr(toks.get(1));
                     // note <addr> "<text>" — the text is the FIRST quoted run (= TS
                     // cmd.matchAll(/"([^"]*)"/g)[0]).
                     let text = quoted_first(&cmd);
                     match (addr, text) {
-                        (Some(a), Some(t)) => project_knowledge::project_labels_note(&dir, a, &t),
+                        (Some(a), Some(t)) if !t.is_empty() => {
+                            project_knowledge::project_labels_note(&dir, a, &t)
+                        }
                         _ => Err("note: usage: note <addr> \"<text>\"".into()),
                     }
                 }
@@ -5768,8 +5828,12 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                             }).collect::<Vec<_>>().join(", ")
                         };
                         Ok(format!(
-                            "dumped {path}\n  cycle={cycle} pc=${:04x} machine=c64-pal\n  media: {media}\n  file={:.1}KB breakpoints={breakpoints}",
-                            pc, bytes.len() as f64 / 1024.0
+                            // `format=vN` closes the summary, as the reference does — a tool sanity-checking
+                            // which snapshot version it just wrote had nothing to look at.
+                            "dumped {path}\n  cycle={cycle} pc=${:04x} machine=c64-pal\n  media: {media}\n  file={:.1}KB breakpoints={breakpoints} format=v{}",
+                            pc,
+                            bytes.len() as f64 / 1024.0,
+                            trx64_core::native_snapshot::NATIVE_SNAPSHOT_FORMAT_VERSION
                         ))
                     }
                     Err(e) => Err(format!("dump: write error: {e}")),
@@ -5943,7 +6007,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             // Attach the new cart (NO reset).
             let new_type = match m.attach_cart_from_bytes(&bytes, &basename) {
                 Ok((_name, t)) => t,
-                Err(e) => return Err(format!("swapcrt: {e:?}")),
+                Err(e) => return Err(format!("swapcrt: {e}")),
             };
             // Same mapper type → carry the banking continuation (bank + ctrl reg) so
             // running code resumes in the same window. Flash DATA is the NEW build's
@@ -5967,9 +6031,16 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             } else { None };
             // Track the new backing path so a later savecrt/auto-persist hits it.
             if let Some(img) = m.cartridge_image.as_mut() { img.path = p.clone(); }
+            // The wire vocabulary (`easyflash`, `normal_8k`), not the Rust enum's Debug
+            // spelling (`EasyFlash`, `Normal8k`). `mapper_type_str` is the same table the
+            // rest of the daemon reports types with, so a caller that round-trips a type
+            // name through `swapcrt` sees the word it passed in.
             lines.push(format!(
-                "swapped: {} -> {new_type:?} ({basename})",
-                old_type.map(|t| format!("{t:?} ({old_name})")).unwrap_or_else(|| "(none)".into())
+                "swapped: {} -> {} ({basename})",
+                old_type
+                    .map(|t| format!("{} ({old_name})", mapper_type_str(t)))
+                    .unwrap_or_else(|| "(none)".into()),
+                mapper_type_str(new_type)
             ));
             lines.push(carried.unwrap_or_else(|| "fresh boot-state registers (no/changed mapper type)".into()));
             lines.push("no reset — running code sees the new ROM bytes NOW".into());
@@ -6009,7 +6080,12 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 }).collect(),
                 Err(e) => return Err(format!("ls: {e}")),
             };
-            ents.sort_by(|a, b| a.1.cmp(&b.1));
+            // Case-insensitive, like the reference's `localeCompare`. Byte order put
+            // every capitalised name in a block ahead of every lowercase one, so a
+            // project directory listed in an order no human would call sorted.
+            ents.sort_by(|a, b| {
+                a.1.to_lowercase().cmp(&b.1.to_lowercase()).then_with(|| a.1.cmp(&b.1))
+            });
             ents.truncate(500);
             let body = if ents.is_empty() {
                 "  (empty)".to_string()
@@ -16143,6 +16219,83 @@ mod batch1_tests {
         let e = mon(&st, "df -i 1000").unwrap_err();
         assert!(e.contains("not implemented"), "{e}");
         assert!(mon(&st, "df 1000").is_ok(), "the plain walk still works");
+    }
+
+    #[test]
+    fn landing_lines_carry_the_flow_tag_and_the_stop_reason() {
+        // Eight verbs printed the same shape whatever had happened: a step into an IRQ
+        // looked like an ordinary step, and a `ret` that gave up at the guard cap looked
+        // like one that returned.
+        assert_eq!(
+            land_line("$c000  ea        NOP", "step", 2, FlowKind::Main, StopWhy::Clean),
+            "$c000  ea        NOP (step, 2 cyc)"
+        );
+        assert_eq!(
+            land_line("$ea31  48        PHA", "step", 2, FlowKind::Irq, StopWhy::Clean),
+            "$ea31  48        PHA [irq] (step, 2 cyc)"
+        );
+        assert_eq!(
+            land_line("$c003  60        RTS", "return", 9, FlowKind::Main, StopWhy::UserBp),
+            "$c003  60        RTS (return, 9 cyc, hit user bp)"
+        );
+        assert_eq!(
+            land_line("$c003  60        RTS", "return", 9, FlowKind::Nmi, StopWhy::Cap),
+            "$c003  60        RTS [nmi] (return, 9 cyc, CAP)"
+        );
+    }
+
+    #[test]
+    fn addresses_are_lowercase_hex_and_mnemonics_upper() {
+        // House rule: LDA/STA upper, $d020/$c000/$10ae lower. The port was inconsistent
+        // with itself — 78 uppercase format specifiers against 21 lowercase.
+        let st = make_state();
+        {
+            let mut g = st.lock().unwrap();
+            g.session.machine.poke(0xc000, &[0xa9, 0xfa]); // LDA #$fa
+        }
+        let d = mon(&st, "d c000 c001").unwrap();
+        assert!(d.contains("LDA"), "mnemonic stays upper-case: {d}");
+        assert!(d.contains("$c000") || d.contains("c000"), "address lower-case: {d}");
+        assert!(!d.contains("C000"), "no upper-case address: {d}");
+
+        let r = mon(&st, "r").unwrap();
+        assert!(r.contains("$00=$"), "sanity: the register panel rendered");
+        assert!(
+            !r.chars().zip(r.chars().skip(1)).any(|(a, b)| a == '$' && b.is_ascii_uppercase()),
+            "no $ABCD-style upper-case hex in the register panel: {r}"
+        );
+    }
+
+    #[test]
+    fn error_shaped_replies_are_errors() {
+        // monitor/exec promises exactly one of output|error. These answered with a
+        // SUCCESS envelope carrying an error sentence, so a caller branching on `error`
+        // treated a rejected command as one that had worked.
+        let st = make_state();
+        assert!(mon(&st, "map nonsense").is_err());
+        assert!(mon(&st, "taint").is_err());
+        assert!(mon(&st, "trace mark \"x\"").is_err(), "no active run → error");
+    }
+
+    #[test]
+    fn a_quoted_filename_must_follow_the_verb() {
+        // The shared file-argument helper took the first quoted run ANYWHERE on the line,
+        // so `mkdir foo "bar baz"` created `bar baz`. Every file verb shares it.
+        let st = make_state();
+        let out = mon(&st, "mkdir foo \"bar baz\"").unwrap_or_default();
+        assert!(!out.contains("bar baz"), "the bareword wins when the quote is not first: {out}");
+        let _ = std::fs::remove_dir(std::path::Path::new("foo"));
+    }
+
+    #[test]
+    fn note_needs_actual_text() {
+        let st = make_state();
+        if project_is_bound() {
+            return;
+        }
+        // (No project bound → the guard fires first; the empty-text rule is asserted
+        // through the same usage error either way.)
+        assert!(mon(&st, "note $c000 \"\"").is_err());
     }
 
     #[test]
