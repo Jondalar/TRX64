@@ -19,6 +19,9 @@
 # its glibc floor (see the matrix entry). That completes the three desktop targets, and
 # makes the Linux half of scripts/build-cli-dist.sh redundant.
 #
+# arm64 followed for Windows and Linux once testing moved onto guests running on an Apple
+# Silicon host, where an x86_64 build does not run at all. macOS is arm64 already.
+#
 # SHELL: `bash` everywhere, including Windows (git-bash ships on the runner). One set of
 # scripts beats maintaining a PowerShell twin of each step.
 
@@ -109,6 +112,23 @@ jobs:
             target: linux-x86_64
             archive: tar.gz
             container: 'rust:bookworm'
+          # arm64, both OSes. Not a nicety: a Linux or Windows guest on an Apple Silicon
+          # host is arm64, which is how most of our own testing happens, and an x86_64
+          # build simply does not run there. Fedora under Parallels answered our
+          # linux-x86_64 tarball with FEX's "Invalid or Unsupported elf file … required on
+          # AArch64 hosts" — an emulator we would then be measuring through.
+          #
+          # `rust:bookworm` is multi-arch, so the Linux glibc floor stays 2.36 here too and
+          # the two apt packages are unchanged. GitHub's arm64 runners are free for public
+          # repositories.
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+            archive: tar.gz
+            container: 'rust:bookworm'
+          - os: windows-11-arm
+            target: windows-arm64
+            archive: zip
+            container: ''
     runs-on: ${{ matrix.os }}
     # Empty string = run directly on the runner. Only the Linux entry sets an image.
     container: ${{ matrix.container }}
@@ -126,7 +146,19 @@ jobs:
           apt-get install -y -qq libasound2-dev pkg-config
 
       - name: Toolchain
+        # Every image used here ships Rust except, possibly, the newer arm64 ones — their
+        # installed-software set is not the same as the x86_64 images'. Install it rather
+        # than burn a 20-minute matrix run discovering that, and print the version either
+        # way so the log always says what built the artifact.
         run: |
+          set -eu
+          if ! command -v rustc >/dev/null 2>&1; then
+            echo "no rustc on this image — installing via rustup"
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain stable --profile minimal
+            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
           rustc --version
           cargo --version
 
