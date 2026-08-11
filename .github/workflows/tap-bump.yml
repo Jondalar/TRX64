@@ -1,0 +1,156 @@
+# Keep the Homebrew tap pointing at the newest release, without anyone copying two
+# checksums by hand.
+#
+# Fires when a release is PUBLISHED. The release itself is still cut deliberately (a tag
+# plus `gh release create` with the artifacts from release-binaries) — this only carries
+# the result across to Jondalar/homebrew-trx64.
+#
+# It commits straight to the tap's main branch rather than opening a PR: a PR that nobody
+# merges leaves `brew install` handing out the previous version, which is a worse failure
+# than an unreviewed formula line. Everything it writes is derived from the release assets,
+# and a bad bump is one revert away. To gate it instead, push to a branch here and open a
+# PR — the rewrite step stays as it is.
+#
+# PREREQUISITE, and it is not optional: a repository secret TAP_TOKEN. A workflow's built-in
+# GITHUB_TOKEN is scoped to its OWN repository, so it cannot push to the tap. Create a
+# fine-grained PAT with `Contents: Read and write` on Jondalar/homebrew-trx64 only, then:
+#
+#   gh secret set TAP_TOKEN -R Jondalar/TRX64
+#
+# The job fails loudly when it is missing rather than silently skipping — a tap that quietly
+# stopped updating is exactly the thing this workflow exists to prevent.
+
+name: tap-bump
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish to the tap (e.g. v0.3.0)'
+        required: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Which release
+        id: rel
+        run: |
+          set -eu
+          TAG="${{ inputs.tag }}"
+          [ -n "$TAG" ] || TAG="${{ github.event.release.tag_name }}"
+          [ -n "$TAG" ] || { echo "::error::no tag"; exit 1; }
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=${TAG#v}" >> $GITHUB_OUTPUT
+          echo "publishing $TAG to the tap"
+
+      - name: Require the tap token
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          set -eu
+          if [ -z "${TAP_TOKEN:-}" ]; then
+            echo "::error::TAP_TOKEN is not set — see the header of this workflow. The tap was NOT updated."
+            exit 1
+          fi
+
+      - name: Fetch the release checksums
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.rel.outputs.tag }}
+        run: |
+          set -eu
+          # `gh release create` uploads assets AFTER creating the release, so the published
+          # event can arrive before they exist. Retry rather than lose the race.
+          for attempt in 1 2 3 4 5 6; do
+            rm -rf sums && mkdir sums
+            gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p '*.sha256' -D sums || true
+            if [ -f sums/trx64-*-macos-arm64.tar.gz.sha256 ] \
+            && [ -f sums/trx64-*-linux-x86_64.tar.gz.sha256 ]; then
+              echo "got both checksums on attempt $attempt"; exit 0
+            fi
+            echo "assets not complete yet (attempt $attempt) — waiting"; sleep 20
+          done
+          echo "::error::release $TAG has no macos-arm64 + linux-x86_64 checksums"
+          exit 1
+
+      - name: Check out the tap
+        uses: actions/checkout@v4
+        with:
+          repository: Jondalar/homebrew-trx64
+          token: ${{ secrets.TAP_TOKEN }}
+          path: tap
+
+      - name: Rewrite the formula
+        env:
+          VERSION: ${{ steps.rel.outputs.version }}
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import os, re, glob, pathlib
+
+          version = os.environ["VERSION"]
+          # target name -> sha, read from the release's own .sha256 files. Deriving both from
+          # the release means the formula can never disagree with what is published.
+          shas = {}
+          for f in glob.glob("sums/*.sha256"):
+              digest, name = open(f).read().split()[:2]
+              for target in ("macos-arm64", "linux-x86_64"):
+                  if target in name:
+                      shas[target] = (digest, name)
+
+          path = pathlib.Path("tap/Formula/trx64.rb")
+          src = path.read_text()
+          out, current, changed = [], None, 0
+
+          for line in src.splitlines(keepends=True):
+              if re.match(r'\s*version "', line):
+                  line = re.sub(r'"[^"]*"', f'"{version}"', line, count=1); changed += 1
+              elif '/releases/download/' in line:
+                  # The URL is fully determined by version + target, so rebuild it rather
+                  # than patching pieces of the old one.
+                  for target, (_, name) in shas.items():
+                      if target in line:
+                          current = target
+                          line = re.sub(
+                              r'https://\S+"',
+                              f'https://github.com/Jondalar/TRX64/releases/download/'
+                              f'v{version}/{name}"', line, count=1)
+                          changed += 1
+              elif re.match(r'\s*sha256 "', line) and current:
+                  line = re.sub(r'"[0-9a-f]{64}"', f'"{shas[current][0]}"', line, count=1)
+                  changed += 1
+                  current = None
+              out.append(line)
+
+          if changed < 5:   # version + 2 urls + 2 shas
+              raise SystemExit(f"only {changed} lines rewritten — formula shape changed?")
+          path.write_text("".join(out))
+          print("".join(l for l in out if 'version "' in l or 'download/' in l or 'sha256 "' in l))
+          PY
+          ruby -c tap/Formula/trx64.rb
+
+      - name: Commit to the tap
+        env:
+          VERSION: ${{ steps.rel.outputs.version }}
+        run: |
+          set -eu
+          cd tap
+          if git diff --quiet; then
+            echo "formula already at $VERSION — nothing to do"; exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/trx64.rb
+          git commit -m "trx64 $VERSION
+
+          Version, URLs and both checksums taken from the release assets of
+          Jondalar/TRX64 v$VERSION by the tap-bump workflow."
+          git push
+          echo "tap updated to $VERSION"
