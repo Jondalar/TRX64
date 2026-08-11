@@ -1,6 +1,6 @@
 # Spec 796 — Candidate Model (live scenario-bound overlay branch + integrated eval)
 
-**Status:** PROPOSED (2026-07-16). **Repo:** TRX64 (candidate store + run/eval capability) +
+**Status:** BUILT (2026-07-16) — both repos; 7 MCP tools. **Repo:** TRX64 (candidate store + run/eval capability) +
 C64RE (assemble⊕overlay orchestration, MCP tools, delta metadata).
 **Board:** row 796 on `C64RE:specs/README.md`. **Next free after: 797.**
 

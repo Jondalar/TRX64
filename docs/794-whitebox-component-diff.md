@@ -1,6 +1,6 @@
 # Spec 794 — Whitebox Component-Diff (equivalence verdict + exclusion mask)
 
-**Status:** PROPOSED (2026-07-16). **Repo:** TRX64 (capability) + C64RE (meaning/MCP).
+**Status:** BUILT (2026-07-16) — both repos, e2e-verified. **Repo:** TRX64 (capability) + C64RE (meaning/MCP).
 **Board:** row 794 on `C64RE:specs/README.md`. **Next free after: 795.**
 
 **Base it extends:** Spec **246** (save-state semantic diff — `snapshot_diff.rs`

@@ -1,6 +1,6 @@
 # Spec 797 — Final Code Delta
 
-**Status:** PROPOSED (2026-07-16). **Repo:** C64RE (meaning). **Board:** row 797. **Next: 798.**
+**Status:** BUILT (2026-07-16) — both repos. **Repo:** C64RE (meaning). **Board:** row 797. **Next: 798.**
 
 **Base:** Spec 796 `candidate_export` (`{ id, patches: [{ space, bank, addr, source }] }`).
 **Yardstick #4** — the meaning bridge: the code that goes into the real build.

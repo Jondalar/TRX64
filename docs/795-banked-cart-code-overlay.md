@@ -1,6 +1,6 @@
 # Spec 795 — Banked / Cart Code Overlay (lift the RAM-only overlay)
 
-**Status:** PROPOSED (2026-07-16). **Repo:** TRX64 (capability) + C64RE (tool passthrough).
+**Status:** BUILT (2026-07-16) — both repos. **Repo:** TRX64 (capability) + C64RE (tool passthrough).
 **Board:** row 795 on `C64RE:specs/README.md`. **Next free after: 796.**
 
 **Base it extends:** Spec **769.2** — `runtime/overlay_run` (the snapshot-anchored code-overlay

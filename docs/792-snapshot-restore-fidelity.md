@@ -1,6 +1,6 @@
 # Spec 792 — Snapshot Restore Fidelity (`.c64re` + ring must resume bit-faithful)
 
-**Status:** PROPOSED (2026-07-15). **Repo:** TRX64.
+**Status:** RESOLVED (commit acec8bc) — colour RAM read from io_shadow, not ram; gate 7/7. **Repo:** TRX64.
 **Shared cross-repo numbering** (registry = C64RE `specs/README.md`).
 **Depends on / touches:** Spec 707 (`.c64re` native snapshot,
 `c64re_snapshot.rs`), Spec 705.B/765 (checkpoint ring, `checkpoint_ring.rs`), the

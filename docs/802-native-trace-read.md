@@ -1,6 +1,6 @@
 # Spec 802 — TRX64 stands alone: native trace read, zero external processes
 
-**Status:** PROPOSED
+**Status:** BUILT (2026-08-09) — trx64-traceindex; sidecar deleted; parity 562+787
 **Repos:** cross-repo — TRX64 (native reader, drop the spawns) and C64RE (stop reading trace
 stores itself; consume TRX64).
 **Number:** 802 (shared board `C64ReverseEngineeringMCP/specs/README.md`).

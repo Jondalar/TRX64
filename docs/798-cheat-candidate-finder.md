@@ -1,6 +1,6 @@
 # Spec 798 — Cheat-Candidate Finder
 
-**Status:** PROPOSED (2026-07-16). **Repo:** TRX64 (finder) + C64RE (tool). **Board:** row 798.
+**Status:** BUILT (2026-07-16) — both repos; subsumes 762. **Repo:** TRX64 (finder) + C64RE (tool). **Board:** row 798.
 **Next: 799.** (Reuses the number 762 reserved for the cheat-finder — implemented here as 798.)
 
 **Bases:** 794 (checkpoint diff / RAM decode) · 796 (candidate model = the verify half) ·
