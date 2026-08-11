@@ -959,6 +959,11 @@ fn rom_missing_report(roms: &std::path::Path, err: &dyn std::fmt::Display, in_co
             "[trx64]     export C64RE_ROOT=/path/to/c64re   # uses <that>/resources/roms\n",
         );
         s.push_str("[trx64]     ...or a roms/ folder next to the executable\n");
+        if let Some(d) = trx64_core::user_dir::user_rom_dir() {
+            // Name the upgrade-proof location, so a first-time reader learns where the
+            // files go instead of only what went wrong.
+            s.push_str(&format!("[trx64]     ...or put them in {}\n", d.display()));
+        }
     }
     s.push_str(
         "[trx64]   TRX64 ships no ROMs (Commodore's property). Required: \
@@ -969,6 +974,16 @@ fn rom_missing_report(roms: &std::path::Path, err: &dyn std::fmt::Display, in_co
 }
 
 fn rom_dir() -> PathBuf {
+    // Same seeding as the CLI: a self-contained folder (daemon + roms/ beside it) hands
+    // its ROMs to ~/.trx64/roms once, so a package-installed binary finds them later.
+    // Once, never overwriting, and it announces itself — see user_dir::seed_user_roms_from.
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            if let Some(msg) = trx64_core::user_dir::seed_user_roms_from(&dir.join("roms")) {
+                eprintln!("[trx64] {msg}");
+            }
+        }
+    }
     let has_kernal = |p: &std::path::Path| p.join("kernal-901227-03.bin").exists();
     if let Ok(root) = env::var("C64RE_ROOT") {
         let p = PathBuf::from(root).join("resources").join("roms");
@@ -989,6 +1004,14 @@ fn rom_dir() -> PathBuf {
                 None => break,
             }
         }
+    }
+    // `~/.trx64/roms` — the set that survives a package upgrade, and the SAME candidate
+    // at the SAME position as trx64-cli's resolver. Two tools that disagree about where
+    // the ROMs are is the drift class this codebase has spent enough time on already.
+    // After the executable-relative paths on purpose: a set placed next to the binary is
+    // deliberate and must not be shadowed by an older seeded copy.
+    if let Some(d) = trx64_core::user_dir::user_rom_dir() {
+        candidates.push(d);
     }
     candidates.push(PathBuf::from("roms"));
     candidates.push(PathBuf::from("resources").join("roms"));

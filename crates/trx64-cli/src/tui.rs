@@ -271,11 +271,12 @@ impl Cockpit {
 
 // ── persistent command history ($HOME/.trx64/history) ──────────────────────────
 
-/// The on-disk history file: `$HOME/.trx64/history`. `None` when `$HOME` is unset (the
-/// cockpit then keeps history in-memory only).
+/// The on-disk history file: `~/.trx64/history`. `None` when the platform names no home
+/// directory (the cockpit then keeps history in-memory only).
 fn history_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".trx64").join("history"))
+    // Via the shared helper: this used to read `$HOME` alone, which Windows does not set
+    // (it uses %USERPROFILE%), so persistent history had never worked there at all.
+    trx64_core::user_dir::trx64_home().map(|h| h.join("history"))
 }
 
 /// Load history from `path`, one entry per line. Missing/unreadable file → empty (history

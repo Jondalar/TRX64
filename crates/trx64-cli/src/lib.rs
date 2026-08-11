@@ -26,6 +26,17 @@ pub use engine::{CmdResult, Engine, StateSnapshot};
 /// `roms/` folder sitting next to it (the handout layout), while still honouring
 /// `$C64RE_ROOT` for the in-tree dev setup. `--rom-dir` overrides this entirely.
 pub fn default_rom_dir() -> std::path::PathBuf {
+    // A self-contained handout (binary + roms/ beside it) seeds ~/.trx64/roms on its
+    // first run, so every OTHER TRX64 binary on this machine — the brew-installed one
+    // above all, whose own folder is wiped by each upgrade — finds ROMs afterwards
+    // without anyone configuring anything. Once, never overwriting, and it says so.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            if let Some(msg) = trx64_core::user_dir::seed_user_roms_from(&dir.join("roms")) {
+                eprintln!("[trx64] {msg}");
+            }
+        }
+    }
     let candidates = rom_dir_candidates();
     candidates
         .iter()
@@ -57,9 +68,16 @@ pub fn rom_dir_candidates() -> Vec<std::path::PathBuf> {
             candidates.push(dir.join("roms"));
         }
     }
-    // 3. `roms/` in the current working directory.
+    // 3. `~/.trx64/roms` — the set that survives a package upgrade. Under Homebrew the
+    //    executable lives in the Cellar, so candidate 2 is deleted by the next upgrade;
+    //    this one is not. Deliberately AFTER candidate 2, so a stale seeded copy can
+    //    never shadow a set someone put next to the binary on purpose.
+    if let Some(d) = trx64_core::user_dir::user_rom_dir() {
+        candidates.push(d);
+    }
+    // 4. `roms/` in the current working directory.
     candidates.push(PathBuf::from("roms"));
-    // 4. Dev fallback: the in-tree C64RE checkout.
+    // 5. Dev fallback: the in-tree C64RE checkout.
     candidates.push(
         PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP"))
             .join("resources")
@@ -89,6 +107,10 @@ pub fn rom_missing_help(tried: &Path, err: &dyn std::fmt::Display) -> String {
            trx64cli --rom-dir /path/to/roms ...\n  \
            export C64RE_ROOT=/path/to/c64re      # uses <that>/resources/roms\n",
     );
+    if let Some(d) = trx64_core::user_dir::user_rom_dir() {
+        // The upgrade-proof spot, named so a first-time reader learns where the files go.
+        s.push_str(&format!("  ...or drop them in {}\n", d.display()));
+    }
     // Only worth printing when the path came from the search — with an explicit
     // --rom-dir, listing directories the user did not ask about is just noise.
     let candidates = rom_dir_candidates();

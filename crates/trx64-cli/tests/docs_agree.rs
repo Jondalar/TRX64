@@ -84,4 +84,8 @@ fn readme_documents_namespaces_colors_media_and_readline() {
         assert!(r.contains(key), "README missing readline key {key}");
     }
     assert!(r.contains("~/.trx64/history"), "README missing persistent-history note");
+    // The upgrade-proof ROM location and the seeding behaviour: a package-managed install
+    // depends on both, so the README has to name them.
+    assert!(r.contains("~/.trx64/roms"), "README missing the user ROM directory");
+    assert!(r.contains("seeds"), "README missing the first-run seeding note");
 }

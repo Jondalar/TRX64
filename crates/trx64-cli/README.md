@@ -28,8 +28,20 @@ cargo run -p trx64-cli --release -- disasm game.prg
 cargo run -p trx64-cli --release -- disasm dump.bin --load-address '$c000' --count 32 --json
 ```
 
-`--rom-dir <dir>` overrides the ROM directory (KERNAL/BASIC/CHARGEN + 1541); it defaults
-to `$C64RE_ROOT/resources/roms`, matching the daemon.
+`--rom-dir <dir>` overrides the ROM directory (KERNAL/BASIC/CHARGEN + 1541). Without it,
+these are tried in order — the same list, in the same order, as the daemon uses:
+
+1. `$C64RE_ROOT/resources/roms`
+2. `roms/` next to the executable — the self-contained handout layout
+3. **`~/.trx64/roms`** — the set that survives a package upgrade
+4. `roms/` in the working directory
+
+Number 3 matters for a package-managed install: under Homebrew the binary lives in the
+Cellar, so a `roms/` folder beside it is deleted by the next `brew upgrade`. To make that
+painless, a handout folder **seeds** `~/.trx64/roms` on its first run — once, never
+overwriting an existing set, and it prints a line saying it did. Afterwards every TRX64
+binary on the machine finds ROMs with no configuration. The handout copy still wins over
+the seeded one, so a set you place next to a binary is never shadowed by an older copy.
 
 The machine is **powered on and running** at startup — a real C64 boots when switched
 on. `/pause` freezes it; `/run` resumes.

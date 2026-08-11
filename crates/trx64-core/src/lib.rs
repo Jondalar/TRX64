@@ -16,6 +16,7 @@ pub mod cart;
 pub mod checkpoint_diff;
 pub mod checkpoint_ring;
 pub mod cia;
+pub mod user_dir;
 pub mod cpu;
 pub mod cpu_history;
 pub mod crash_triage;
