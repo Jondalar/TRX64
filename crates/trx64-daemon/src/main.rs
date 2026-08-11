@@ -663,6 +663,18 @@ impl FlowTracker {
         self.stack.last().map(|f| f.kind).unwrap_or(FlowKind::Main)
     }
 
+    /// stepping.ts:154-156 — the flow the focus verbs actually aim at. `auto`/`none`
+    /// mean "whatever flow we are in right now"; anything else is that flow verbatim.
+    fn effective_focus(&self) -> FlowKind {
+        match self.focus.as_str() {
+            "main" => FlowKind::Main,
+            "irq" => FlowKind::Irq,
+            "nmi" => FlowKind::Nmi,
+            "brk" => FlowKind::Brk,
+            _ => self.current_flow(),
+        }
+    }
+
     /// stepping.ts:158 — reset(): clear the frame stack (focus is left intact, as in
     /// TS where `reset()` only nulls `stack`).
     fn reset(&mut self) {
@@ -4807,6 +4819,236 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             // At the cold/rest state the stack is empty → current=main; after stepping
             // into an interrupt it is state-dependent (current=irq|nmi|brk + frames).
             Ok(st.flow.render())
+        }
+
+        // ---- tracedb — run a STORED trace definition (monitor-shell.ts:445-470) ------
+        //
+        // `trace on` captures everything; `tracedb start "<id>"` runs a definition that
+        // was put into the registry (trace/definition/put) and records which one, so the
+        // resulting store says what it was capturing and why. The registry was ported;
+        // only the verb in front of it was missing.
+        //
+        // start/stop/status DELEGATE to the `trace` verb rather than repeating its ~60
+        // lines of store setup — two copies of that would drift, and drift is what this
+        // whole exercise is about.
+        "tracedb" => {
+            let sub = toks.get(1).map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+            match sub.as_str() {
+                "stop" => {
+                    let out = run_monitor(st, "trace off")?;
+                    Ok(out.replacen("trace off:", "tracedb stopped:", 1))
+                }
+                "status" => {
+                    let out = run_monitor(st, "trace status")?;
+                    Ok(out.replacen("trace:", "tracedb:", 1))
+                }
+                "start" => {
+                    let def_id = match quoted_first(&cmd).or_else(|| toks.get(2).cloned()) {
+                        Some(d) if !d.is_empty() => d,
+                        _ => {
+                            return Err(
+                                "tracedb: usage: tracedb start \"<definition-id>\"".into()
+                            )
+                        }
+                    };
+                    let def = match st.trace_definitions.get(&def_id) {
+                        Some(d) => d.clone(),
+                        None => {
+                            return Err(format!(
+                                "tracedb: unknown definition \"{def_id}\" (put it via \
+                                 trace/definition/put first)"
+                            ))
+                        }
+                    };
+                    // Domains come from the definition; without them the run would be an
+                    // ordinary capture-all wearing the definition's name.
+                    let domains: Vec<String> = def
+                        .get("domains")
+                        .and_then(|d| d.as_array())
+                        .map(|a| {
+                            a.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+                        })
+                        .unwrap_or_default();
+                    if domains.is_empty() {
+                        return Err(format!(
+                            "tracedb: definition \"{def_id}\" names no domains"
+                        ));
+                    }
+                    let out = run_monitor(st, &format!("trace on {}", domains.join(" ")))?;
+                    // Record WHICH definition this run came from, so the store's meta and
+                    // `tracedb status` do not claim it was a plain live capture.
+                    if let Some(t) = st.session.trace.as_mut() {
+                        t.definition_id = def_id.clone();
+                        t.definition_version =
+                            def.get("version").and_then(|v| v.as_i64()).unwrap_or(1);
+                    }
+                    Ok(out.replacen("trace on:", &format!("tracedb start ({def_id}):"), 1))
+                }
+                _ => Err("tracedb: usage: tracedb start \"<id>\" | stop | status".into()),
+            }
+        }
+
+        // ---- io [1 | <addr>] — the I/O register map (monitor-shell.ts:375-411) -------
+        //
+        // One screen with every chip's registers side by side, which is what you want
+        // when the question is "what is the machine set to right now" rather than "what
+        // is at this address". Reads through the io lens, so it shows the register file
+        // even when the PLA currently banks I/O out.
+        "io" => {
+            let arg = toks.get(1).map(|s| s.as_str());
+            let want_details = arg.is_some();
+            let filter: Option<u16> = match arg {
+                None | Some("1") => None,
+                Some(a) => Some(
+                    parse_addr(Some(&a.to_string())).ok_or("io: usage: io [1 | <addr>]")?,
+                ),
+            };
+            let mut blocks: Vec<(String, u16, u16)> = vec![
+                ("VIC-II".into(), 0xd000, 0xd03f),
+                ("SID".into(), 0xd400, 0xd41f),
+                ("CIA1".into(), 0xdc00, 0xdc0f),
+                ("CIA2".into(), 0xdd00, 0xdd0f),
+            ];
+            if let Some(c) = st.session.machine.cartridge.as_ref() {
+                let nm = mapper_type_str(c.mapper_type()).to_ascii_uppercase();
+                blocks.push((format!("{nm} (IO1)"), 0xde00, 0xde0f));
+                blocks.push((format!("{nm} (IO2)"), 0xdf00, 0xdf0f));
+            }
+            let mut lines: Vec<String> = Vec::new();
+            for (name, start, end) in &blocks {
+                let page = start & 0xff00;
+                if let Some(f) = filter {
+                    if f < page || f > (page | 0xff) {
+                        continue;
+                    }
+                }
+                lines.push(format!("{name}:"));
+                let mut row = *start;
+                while row <= *end {
+                    let mut bytes: Vec<String> = Vec::new();
+                    let mut i = 0u16;
+                    while i < 16 && row.wrapping_add(i) <= *end {
+                        bytes.push(format!(
+                            "{:02x}",
+                            st.session.machine.peek_lens(row.wrapping_add(i), "io")
+                        ));
+                        i += 1;
+                    }
+                    lines.push(format!("  {row:04x}  {}", bytes.join(" ")));
+                    row = row.wrapping_add(16);
+                }
+                if want_details {
+                    lines.push("  No details available.".to_string());
+                }
+                lines.push(String::new());
+            }
+            if lines.is_empty() {
+                return Err(format!("io: no device at ${:04x}", filter.unwrap_or(0)));
+            }
+            Ok(lines.join("\n").trim_end().to_string())
+        }
+
+        // ---- Flow FOCUS (monitor-shell.ts:1075-1099) --------------------------------
+        //
+        // The port took `flow` — the panel that DISPLAYS the focus — and left behind the
+        // four verbs that set and use it. So the panel showed `focus=auto` forever, with
+        // no way to change it, and the help plus the cockpit's completion kept offering
+        // verbs that answered "unknown verb". The whole point is stepping inside one
+        // flow: `focus irq` then `sf` walks the raster interrupt without descending into
+        // whatever main-line code it interrupted.
+        "focus" => {
+            let arg = toks.get(1).map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+            if arg.is_empty() {
+                let stack = if st.flow.stack.is_empty() {
+                    "  (main — no interrupt/trap frame active)".to_string()
+                } else {
+                    st.flow
+                        .stack
+                        .iter()
+                        .map(|f| {
+                            // This port's frame records the RETURN pc where the reference
+                            // records the entry SP; report what we actually have.
+                            format!(
+                                "  {}  enter=${:04x} ret=${:04x}",
+                                f.kind.tag(),
+                                f.entered_at_pc,
+                                f.return_pc
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                return Ok(format!(
+                    "focus = {} (current flow: {})\nflow stack:\n{stack}",
+                    st.flow.focus,
+                    st.flow.current_flow().tag()
+                ));
+            }
+            if matches!(arg.as_str(), "auto" | "main" | "irq" | "nmi" | "brk" | "none" | "clear") {
+                st.flow.focus = if arg == "clear" { "none".to_string() } else { arg };
+                Ok(format!("focus = {}", st.flow.focus))
+            } else {
+                Err(format!("focus: expected auto|main|irq|nmi|brk|clear, got '{arg}'"))
+            }
+        }
+
+        // `sf`/`stepf` — step into, but keep stepping until we are back in the target
+        // flow. `nf`/`nextf` — the same, stepping OVER calls on the way.
+        "sf" | "stepf" | "nf" | "nextf" => {
+            st.session.running = false;
+            let over = matches!(op.as_str(), "nf" | "nextf");
+            let want = st.flow.effective_focus();
+            let bp_set: std::collections::HashSet<u16> =
+                st.breakpoints.entries.iter().map(|e| e.pc).collect();
+            const FOCUS_CAP: u64 = 1_000_000;
+            let mut guard: u64 = 0;
+            let mut why = StopWhy::Cap;
+            let mut cyc = 0u64;
+            while guard < FOCUS_CAP {
+                guard += 1;
+                let pc0 = st.session.machine.cpu6510.reg_pc;
+                let sp0 = st.session.machine.cpu6510.reg_sp;
+                let was_jsr = st.session.machine.peek_lens(pc0, "cpu") == 0x20;
+                let clk0 = st.session.machine.clk;
+                step_one_with_flow(&mut st.session, &mut st.flow);
+                cyc = st.session.machine.clk.wrapping_sub(clk0);
+                if over && was_jsr {
+                    // Run the callee out, exactly as `next` does, so a focus walk does
+                    // not descend into every subroutine on the way.
+                    let ret_pc = pc0.wrapping_add(3);
+                    let mut iters: u64 = 0;
+                    loop {
+                        let pc = st.session.machine.cpu6510.reg_pc;
+                        let sp = st.session.machine.cpu6510.reg_sp;
+                        if (pc == ret_pc && sp >= sp0) || (sp > sp0) || iters >= 5_000_000 {
+                            break;
+                        }
+                        if bp_set.contains(&pc) {
+                            break;
+                        }
+                        step_one_with_flow(&mut st.session, &mut st.flow);
+                        iters += 1;
+                    }
+                }
+                let pc = st.session.machine.cpu6510.reg_pc;
+                if bp_set.contains(&pc) {
+                    why = StopWhy::UserBp;
+                    break;
+                }
+                if st.flow.current_flow() == want {
+                    why = StopWhy::Clean;
+                    break;
+                }
+                if check_and_handle_jam(st) {
+                    why = StopWhy::Clean;
+                    break;
+                }
+            }
+            let pc = st.session.machine.cpu6510.reg_pc;
+            st.mon.disasm_cursor = Some(pc);
+            let (_, line) = disasm_line_ts(|a| st.session.machine.peek_lens(a, "cpu"), pc);
+            let tag = format!("{}:{}", if over { "nextf" } else { "stepf" }, want.tag());
+            Ok(land_line(&line, &tag, cyc, st.flow.current_flow(), why))
         }
         "bt" => {
             // buildBacktrace (backtrace.ts): scan $0100+((sp+1)&0xff) .. $01FF in
@@ -16296,6 +16538,114 @@ mod batch1_tests {
         // (No project bound → the guard fires first; the empty-text rule is asserted
         // through the same usage error either way.)
         assert!(mon(&st, "note $c000 \"\"").is_err());
+    }
+
+    /// EVERY verb the monitor's own help advertises must dispatch.
+    ///
+    /// This is the test that was missing. Seven verbs — `focus`, `sf`, `nf`, `stepf`,
+    /// `nextf`, `io`, `tracedb` — were documented in MONITOR.md, offered by the
+    /// cockpit's tab-completion, listed in this help text, and answered "unknown verb",
+    /// for as long as the port had existed. Nothing could see it: the suite tested the
+    /// Rust monitor against itself, and a verb that was never ported has no test to fail.
+    ///
+    /// The help text is the list, so this cannot drift from the documentation the way a
+    /// second hand-maintained array would.
+    #[test]
+    fn every_verb_the_help_advertises_actually_dispatches() {
+        let st = make_state();
+        let help = monitor_help_text();
+
+        // Verb names are the first token of an indented help line, minus the decoration
+        // around alternatives (`dump|snapshot <p>` → dump, snapshot).
+        let mut verbs: Vec<String> = Vec::new();
+        for line in help.lines() {
+            if !line.starts_with("    ") {
+                continue;
+            }
+            let first = line.trim_start().split_whitespace().next().unwrap_or("");
+            for part in first.split('|') {
+                let v: String =
+                    part.chars().take_while(|c| c.is_ascii_lowercase() || *c == '_').collect();
+                if v.len() >= 1 && !verbs.contains(&v) {
+                    verbs.push(v);
+                }
+            }
+        }
+        assert!(verbs.len() > 40, "help parsed into {} verbs — parser broken?", verbs.len());
+        // Pin a few of the names this gate exists for. Without these, a change to the
+        // help's layout could quietly shrink the covered set to nothing and the test
+        // would still pass — the exact failure mode it is here to prevent.
+        for pinned in ["focus", "sf", "io", "tracedb", "wr", "m", "r"] {
+            assert!(
+                verbs.iter().any(|v| v == pinned),
+                "the help parser lost '{pinned}' — coverage is not what it claims"
+            );
+        }
+
+        let mut unknown: Vec<String> = Vec::new();
+        for v in &verbs {
+            // Bare invocation: most verbs answer with a usage error, which is fine — the
+            // question here is only whether the dispatcher knows the word at all.
+            let reply = match mon(&st, v) {
+                Ok(o) => o,
+                Err(e) => e,
+            };
+            if reply.contains("unknown verb") {
+                unknown.push(v.clone());
+            }
+        }
+        assert!(
+            unknown.is_empty(),
+            "the help advertises verbs the monitor does not have: {unknown:?}"
+        );
+    }
+
+    #[test]
+    fn the_flow_focus_family_is_present_and_sets_the_focus() {
+        // `flow` — the panel that DISPLAYS the focus — was ported; the four verbs that
+        // SET and use it were not, so the panel read `focus=auto` forever.
+        let st = make_state();
+        assert!(mon(&st, "focus").unwrap().contains("focus = auto"));
+        assert_eq!(mon(&st, "focus irq").unwrap(), "focus = irq");
+        assert!(mon(&st, "flow").unwrap().contains("focus=irq"), "the panel follows");
+        assert_eq!(mon(&st, "focus clear").unwrap(), "focus = none");
+        assert!(mon(&st, "focus sideways").is_err());
+
+        // The two stepping verbs exist and land somewhere; on a blank machine they run
+        // into their own guard, which is a legitimate outcome — "unknown verb" is not.
+        for v in ["sf", "stepf", "nf", "nextf"] {
+            let reply = match mon(&st, v) {
+                Ok(o) => o,
+                Err(e) => e,
+            };
+            assert!(!reply.contains("unknown verb"), "{v}: {reply}");
+        }
+    }
+
+    #[test]
+    fn io_shows_the_chip_registers() {
+        let st = make_state();
+        {
+            let mut g = st.lock().unwrap();
+            g.session.machine.poke_io(0xd020, &[0x0e]);
+        }
+        let out = mon(&st, "io").unwrap();
+        for chip in ["VIC-II", "SID", "CIA1", "CIA2"] {
+            assert!(out.contains(chip), "{chip} block missing: {out}");
+        }
+        assert!(out.contains("d020"), "addresses are lower-case hex: {out}");
+        // A filter picks one page, and a page with no device is an error.
+        assert!(mon(&st, "io d400").unwrap().contains("SID"));
+        assert!(mon(&st, "io 1000").is_err());
+    }
+
+    #[test]
+    fn tracedb_needs_a_definition_that_exists() {
+        let st = make_state();
+        assert!(mon(&st, "tracedb").unwrap_err().contains("usage"));
+        let e = mon(&st, "tracedb start \"nope\"").unwrap_err();
+        assert!(e.contains("unknown definition"), "{e}");
+        assert!(!mon(&st, "tracedb status").unwrap_or_default().contains("unknown verb"));
     }
 
     #[test]
