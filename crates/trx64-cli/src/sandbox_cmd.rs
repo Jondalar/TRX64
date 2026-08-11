@@ -843,6 +843,153 @@ fn execute_sandbox(m: &mut Machine, args: &SandboxArgs) -> SandboxOutcome {
     }
 }
 
+// ── Spec 805 — batch: one process start, N runs ───────────────────────────────
+//
+// WHY. `trx64cli` costs ~740 ms to start (measured 2026-08-11; ~650 ms of it is
+// eager machine init, before argument parsing — a tiny binary from the same
+// workspace starts in 86 ms). A caller with N payloads to depack paid that N
+// times: one proof project ran 101 chunks through the C64RE bridge, which spawns
+// a process per call, for ~75 seconds of pure startup and milliseconds of work.
+//
+// WHAT THIS IS NOT. It is not a scratch machine inside the daemon — that is two
+// machines in one process, which doctrine forbids. The scratch instance stays
+// exactly what Spec 787 defined; it simply serves more than one run before it is
+// disposed. Each run still gets its own `Machine::new()` (see `run_sandbox`).
+//
+// ISOLATION. Each item runs on a FRESH THREAD. `Machine::new()` gives fresh
+// chips, but the core carries one thread-local — the IEC bus status arrays,
+// mirroring VICE's static arrays — which no machine constructor resets. A batch
+// whose item N attaches a disk would otherwise see item N-1's device flags. A
+// thread costs microseconds and resets it by construction, which is cheaper than
+// a reset API that someone must remember to call.
+
+/// One item of a `--batch` spec: the SAME string forms the single-run flags take,
+/// so `run_sandbox_cli` does the parsing and batch semantics cannot drift from
+/// single-run semantics.
+fn batch_item_args(item: &serde_json::Value, index: usize) -> Result<Vec<String>, String> {
+    // Returned as a flat "arg list" only for the error message; the real call
+    // below reads the fields directly. Kept separate so a malformed item names
+    // itself instead of failing anonymously.
+    let obj = item
+        .as_object()
+        .ok_or_else(|| format!("runs[{index}]: expected an object"))?;
+    Ok(obj.keys().cloned().collect())
+}
+
+fn str_field<'a>(item: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    item.get(key).and_then(|v| v.as_str())
+}
+
+fn str_list(item: &serde_json::Value, key: &str) -> Vec<String> {
+    item.get(key)
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default()
+}
+
+/// Run every item of a batch spec in THIS process, one fresh machine each.
+/// Returns a JSON object `{ "runs": [ { index, ok, result | error }, … ] }`.
+/// A failing item is reported and does not abort the batch — a depack campaign
+/// wants the 100 that worked plus the name of the one that did not.
+pub fn run_sandbox_batch(rom_dir: &Path, spec_path: &str) -> Result<String, String> {
+    let text = std::fs::read_to_string(spec_path)
+        .map_err(|e| format!("read --batch {spec_path}: {e}"))?;
+    let spec: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("--batch {spec_path}: not JSON: {e}"))?;
+    // Accept either a bare array or `{ "runs": [...] }`.
+    let items = spec
+        .get("runs")
+        .and_then(|v| v.as_array())
+        .or_else(|| spec.as_array())
+        .ok_or_else(|| format!("--batch {spec_path}: expected an array, or an object with a `runs` array"))?
+        .clone();
+    if items.is_empty() {
+        return Err(format!("--batch {spec_path}: no runs"));
+    }
+
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(items.len());
+    for (index, item) in items.into_iter().enumerate() {
+        if let Err(e) = batch_item_args(&item, index) {
+            out.push(serde_json::json!({ "index": index, "ok": false, "error": e }));
+            continue;
+        }
+        let rom_dir = rom_dir.to_path_buf();
+        // Fresh thread per item — see ISOLATION above.
+        let handle = std::thread::Builder::new()
+            .name(format!("sandbox-batch-{index}"))
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                let entry = match str_field(&item, "entry") {
+                    Some(s) => match parse_addr(s) {
+                        Ok(a) => a,
+                        Err(e) => return Err(format!("entry: {e}")),
+                    },
+                    None => return Err("entry is required".to_string()),
+                };
+                let sentinel = match str_field(&item, "sentinel") {
+                    Some(s) => Some(parse_addr(s).map_err(|e| format!("sentinel: {e}"))?),
+                    None => None,
+                };
+                let stub_addr = match str_field(&item, "stubAddr") {
+                    Some(s) => Some(parse_addr(s).map_err(|e| format!("stubAddr: {e}"))?),
+                    None => None,
+                };
+                run_sandbox_cli(
+                    &rom_dir,
+                    str_field(&item, "seed"),
+                    str_field(&item, "cart"),
+                    str_field(&item, "cartType"),
+                    str_field(&item, "disk"),
+                    &str_list(&item, "load"),
+                    &str_list(&item, "loadHex"),
+                    entry,
+                    &str_list(&item, "harvest"),
+                    &str_list(&item, "zp"),
+                    sentinel,
+                    str_field(&item, "io"),
+                    stub_addr,
+                    item.get("cycCap").and_then(|v| v.as_u64()),
+                    item.get("instrCap").and_then(|v| v.as_u64()),
+                    item.get("directEntry").and_then(|v| v.as_bool()).unwrap_or(false),
+                    str_field(&item, "regA"),
+                    str_field(&item, "regX"),
+                    str_field(&item, "regY"),
+                    str_field(&item, "regSp"),
+                    str_field(&item, "regP"),
+                    str_field(&item, "stream"),
+                    str_field(&item, "streamHex"),
+                    &str_list(&item, "streamHook"),
+                    true, // batch output is always JSON
+                )
+            })
+            .map_err(|e| format!("runs[{index}]: spawn: {e}"))?;
+
+        let joined = handle.join();
+        match joined {
+            Ok(Ok(json_text)) => {
+                let value: serde_json::Value = serde_json::from_str(&json_text)
+                    .unwrap_or_else(|_| serde_json::json!({ "raw": json_text }));
+                out.push(serde_json::json!({ "index": index, "ok": true, "result": value }));
+            }
+            Ok(Err(e)) => out.push(serde_json::json!({ "index": index, "ok": false, "error": e })),
+            // A panicking run is a defect, not a batch failure: name it and carry on,
+            // so 100 good results are not lost to one bad routine.
+            Err(_) => out.push(serde_json::json!({
+                "index": index, "ok": false, "error": "run panicked"
+            })),
+        }
+    }
+
+    let ok = out.iter().filter(|r| r["ok"] == serde_json::json!(true)).count();
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "runs": out,
+        "count": out.len(),
+        "ok": ok,
+        "failed": out.len() - ok,
+    }))
+    .unwrap_or_else(|e| format!("{{\"error\":\"serialize: {e}\"}}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

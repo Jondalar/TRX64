@@ -123,9 +123,20 @@ enum Command {
         /// Repeatable. Like --load but from literal bytes (no temp file).
         #[arg(long = "load-hex")]
         load_hex: Vec<String>,
-        /// Entry PC of the routine to call (hex).
+        /// Entry PC of the routine to call (hex). Required unless `--batch` is given.
         #[arg(long, value_parser = trx64_cli::disasm_cmd::parse_addr)]
-        entry: u16,
+        entry: Option<u16>,
+        /// Spec 805 — run N sandbox runs in THIS process instead of one, from a JSON
+        /// spec: an array (or `{"runs":[…]}`) whose items carry the SAME fields the
+        /// single-run flags take (`entry`, `load`, `harvest`, `zp`, `seed`, …, camelCase
+        /// for the two-word ones: `loadHex`, `cartType`, `stubAddr`, `cycCap`, `instrCap`,
+        /// `directEntry`, `regA`…, `streamHex`, `streamHook`). Each run still gets its own
+        /// fresh machine; the process start — ~740 ms, of which ~650 ms is machine init —
+        /// is paid ONCE for the whole batch instead of once per run. Emits
+        /// `{runs:[{index,ok,result|error}],count,ok,failed}`; a failing run is reported
+        /// and does not abort the rest.
+        #[arg(long)]
+        batch: Option<String>,
         /// RAM range to harvest after the run: ADDR:LEN (LEN decimal or 0x-hex).
         /// Repeatable — the first is the primary range echoed in text + the
         /// back-compat `harvest` JSON field; all are returned in `harvests`.
@@ -322,9 +333,25 @@ fn main() {
     if let Some(Command::Sandbox {
         seed, cart, cart_type, disk, load, load_hex, entry, harvest, zp, sentinel, io, stub_addr,
         cyc_cap, instr_cap, direct_entry, reg_a, reg_x, reg_y, reg_sp, reg_p, stream_hook, stream,
-        stream_hex, json,
+        stream_hex, json, batch,
     }) = &cli.cmd
     {
+        // Spec 805 — batch mode: N runs, one process start. Mutually exclusive with the
+        // single-run flags, which the spec file carries per item instead.
+        if let Some(spec_path) = batch {
+            match sandbox_cmd::run_sandbox_batch(&rom_dir, spec_path) {
+                Ok(out) => println!("{out}"),
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            }
+            return;
+        }
+        let Some(entry) = entry else {
+            eprintln!("--entry is required (or pass --batch <spec.json>)");
+            std::process::exit(2);
+        };
         match sandbox_cmd::run_sandbox_cli(
             &rom_dir, seed.as_deref(), cart.as_deref(), cart_type.as_deref(), disk.as_deref(), load,
             load_hex, *entry, harvest, zp, *sentinel, io.as_deref(), *stub_addr, *cyc_cap,
