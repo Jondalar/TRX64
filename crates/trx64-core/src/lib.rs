@@ -1090,6 +1090,58 @@ impl Machine {
         }
     }
 
+    /// The BANKED write — the counterpart to [`Machine::read_full`], and what a
+    /// monitor write verb must use.
+    ///
+    /// [`Machine::poke`] is the raw-RAM injector for building exercisers: it ignores
+    /// banking entirely. Pointing `wr`/`f`/`t` at it meant `wr d020 00` wrote the RAM
+    /// hidden *under* the I/O window and left the border untouched, while still
+    /// reporting success — the write silently did nothing the user could see.
+    ///
+    /// This goes through `FullBus::write`, the very code the CPU executes, rather than
+    /// a second copy of the banking rules that would drift from it: $D020 reaches the
+    /// VIC when I/O is banked in, a write under ROM lands in the RAM beneath, and
+    /// $00/$01 re-configure the PLA. The banking/port fields the write may change are
+    /// persisted back exactly as `run_for_full_capped_dbg` does after an instruction.
+    pub fn write_full(&mut self, addr: u16, val: u8) {
+        let table = self.cia_table.clone();
+        let mut fb = full::FullBus {
+            ram: &mut self.ram,
+            basic_rom: &self.basic_rom,
+            kernal_rom: &self.kernal_rom,
+            char_rom: &self.char_rom,
+            io: &mut self.io_shadow,
+            vic: &mut self.vic,
+            cia1: &mut self.cia1,
+            cia2: &mut self.cia2,
+            cia_table: &table,
+            sid_regs: &mut self.sid_regs,
+            sid: &mut self.sid,
+            config: self.memconfig,
+            memconfig_table: &self.memconfig_table,
+            port_dir: self.port_dir,
+            port_data: self.port_data,
+            // Between instructions the machine's own clock is "now" (it is synced from
+            // whichever core last ran — see the `self.clk = …` assignments after a run).
+            clk: self.clk,
+            cia2_pa_out: self.cia2_pa_out,
+            side_effects: Vec::new(),
+            read_side_effects: Vec::new(),
+            drive: &mut self.drive8,
+            iec: &mut self.iec,
+            keyboard: &self.keyboard,
+            joystick1: self.joystick1,
+            joystick2: self.joystick2,
+            drive_c64_ref: self.drive_c64_ref,
+            cartridge: self.cartridge.as_mut(),
+        };
+        fb.write(addr, val);
+        self.memconfig = fb.config;
+        self.port_dir = fb.port_dir;
+        self.port_data = fb.port_data;
+        self.cia2_pa_out = fb.cia2_pa_out;
+    }
+
     /// Set the program counter (CPU-isolated: no boot, atomic PC write).
     pub fn set_pc(&mut self, pc: u16) {
         self.cpu6510.reg_pc = pc;

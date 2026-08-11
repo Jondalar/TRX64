@@ -3155,6 +3155,37 @@ fn sc_to_ascii(sc: u8) -> char {
 /// workspace) ERROR exactly like the TS "bridge unavailable / no project" path —
 /// they are NOT faked. The TS `MonitorResult { output | error }` is collapsed to
 /// `Ok(output)` / `Err(error)` (the monitor/exec handler re-wraps to {output}/{error}).
+/// A monitor write through the bank lens the verb resolved.
+///
+/// `ram` writes the raw array (the TS `ram` lens). `io` forces the chip write even when
+/// I/O is banked out — a TRX64 extra with no TS counterpart, kept because it is the only
+/// way to poke a register that the current PLA config hides. Everything else — cpu, rom,
+/// cart and the sticky default — goes through the machine's BANKED write, the same path
+/// the CPU itself takes.
+///
+/// That last arm is the fix: all three write verbs used `poke()`, which the core documents
+/// as "no banking". `wr d020 00` therefore wrote the RAM hidden *under* the I/O window,
+/// left the border untouched, and reported success — the TS reference's own comment for
+/// the same line reads "`wr d020 00` blacks the border".
+fn monitor_write(st: &mut State, addr: u16, bytes: &[u8], lens: &str) {
+    match lens {
+        "ram" => {
+            st.session.machine.poke(addr, bytes);
+            st.session.injected = true;
+        }
+        "io" => {
+            st.session.machine.poke_io(addr, bytes);
+            st.session.io_injected = true;
+        }
+        _ => {
+            for (i, b) in bytes.iter().enumerate() {
+                st.session.machine.write_full(addr.wrapping_add(i as u16), *b);
+            }
+            st.session.injected = true;
+        }
+    }
+}
+
 fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
     // Clear any prompt carried from a prior command; a modal verb re-sets it below.
     st.mon.pending_prompt = None;
@@ -3316,7 +3347,10 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                     })
                     .collect();
                 let halftrack = drv.rotation.current_half_track;
-                let track = (halftrack / 2) + 1;
+                // NO `+ 1`: the field's own doc says "current_half_track (2..=84).
+                // Power-on 36 (T18)", so half-track 36 IS track 18. The extra one showed
+                // the head a whole track further out than it was.
+                let track = halftrack / 2;
                 return Ok(format!(
                     "1541 (drive 8)\n  \
                      ADDR AC XR YR SP NV-BDIZC  clk\n\
@@ -3414,8 +3448,13 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
         // ---- Memory edit: wr [lens] <addr> <byte..> --------------------------
         "wr" => {
             let mut i = 1;
-            let io_lens = matches!(toks.get(i).map(|s| s.as_str()), Some("io"));
-            if matches!(toks.get(i).map(|s| s.as_str()), Some("cpu" | "ram" | "io")) {
+            // All five bank words plus `default`, via the same `lens_of` the read verbs
+            // use. Recognising only cpu/ram/io meant `wr rom c000 ea` parsed "rom" as the
+            // ADDRESS and failed with "bad address", and the sticky `bank <lens>` default
+            // had no effect on writes at all.
+            let lens_tok = lens_of(toks.get(i));
+            let lens = lens_tok.clone().unwrap_or_else(|| st.mon.bank_default.clone());
+            if lens_tok.is_some() {
                 i += 1;
             }
             let addr = parse_addr(toks.get(i)).ok_or("wr: usage: wr [lens] <addr> <byte..>")? as u16;
@@ -3428,15 +3467,8 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             if bytes.is_empty() {
                 return Err("wr: need >=1 byte value ($00-$FF)".into());
             }
-            if io_lens {
-                st.session.machine.poke_io(addr, &bytes);
-                st.session.io_injected = true;
-            } else {
-                st.session.machine.poke(addr, &bytes);
-                st.session.injected = true;
-            }
-            let lens = if io_lens { "io" } else { "cpu" };
-            Ok(format!("wrote {} byte(s) @ ${:04X} ({lens})", bytes.len(), addr))
+            monitor_write(st, addr, &bytes, &lens);
+            Ok(format!("wrote {} byte(s) @ ${addr:04x} ({lens})", bytes.len()))
         }
 
         // ---- Memory dump: m [lens] [addr] [end] (§3.3b bank lens). -----------
@@ -3448,9 +3480,13 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             if lens_tok.is_some() {
                 i += 1;
             }
-            let start = parse_addr(toks.get(i))
-                .or(st.mon.mem_cursor)
-                .unwrap_or(0);
+            // A token that is PRESENT but unparseable must not fall through to the
+            // cursor: `m 1000xyz` then dumped some unrelated region and called it a
+            // success. Absent → cursor (the documented default); present-and-bad → say so.
+            let start = match toks.get(i) {
+                Some(t) => parse_addr(Some(t)).ok_or_else(|| format!("m: bad address '{t}'"))?,
+                None => st.mon.mem_cursor.unwrap_or(0),
+            };
             let end = parse_addr(toks.get(i + 1))
                 .unwrap_or_else(|| std::cmp::min(0xffff, start as u32 + 0x7ff) as u16);
             let mut lines: Vec<String> = Vec::new();
@@ -3577,6 +3613,10 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             let n = toks
                 .get(1)
                 .and_then(|t| t.parse::<i64>().ok())
+                // `sd 0` means "no count given" in the TS reference (`parseInt(t) || 50`
+                // — 0 is falsy), i.e. 50 steps. Taking 0 literally and clamping it to 1
+                // turned the same command into a single step.
+                .filter(|n| *n != 0)
                 .unwrap_or(50)
                 .clamp(1, 100_000) as usize;
             // Snapshot the machine so sd is non-destructive (= the TS checkpoint
@@ -3819,11 +3859,12 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             let mut a = start as u32;
             while a <= end as u32 {
                 let b = data[n % data.len()];
-                st.session.machine.poke((a & 0xffff) as u16, &[b]);
+                // Banked, like the TS reference's `writeByte(..., "cpu")` — filling
+                // $D020 must reach the VIC, not the RAM under the I/O window.
+                monitor_write(st, (a & 0xffff) as u16, &[b], "cpu");
                 n += 1;
                 a += 1;
             }
-            st.session.injected = true;
             Ok(format!(
                 "filled ${:04X}..${:04X} ({} bytes, pattern {})",
                 start, end, n, data.len()
@@ -3858,23 +3899,22 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             let start = parse_addr(toks.get(1)).ok_or("t: usage: t <start> <end> <dest>")?;
             let end = parse_addr(toks.get(2)).ok_or("t: usage: t <start> <end> <dest>")?;
             let dest = parse_addr(toks.get(3)).ok_or("t: usage: t <start> <end> <dest>")?;
+            // u32, NOT u16: a full-range move is 65536 bytes, and `65536 as u16` is 0 —
+            // the loop then ran zero times and reported a successful move of nothing.
             let len = end as i32 - start as i32 + 1;
             if len <= 0 {
                 return Err("t: end < start".into());
             }
-            let len = len as u16;
+            let len = len as u32;
             let mut buf: Vec<u8> = Vec::with_capacity(len as usize);
             for k in 0..len {
-                buf.push(st.session.machine.peek_lens(start.wrapping_add(k), "cpu"));
+                buf.push(st.session.machine.peek_lens(start.wrapping_add(k as u16), "cpu"));
             }
             for (k, b) in buf.iter().enumerate() {
-                st.session.machine.poke(dest.wrapping_add(k as u16), &[*b]);
+                // Banked, matching the TS reference's hardcoded "cpu" lens for t/move.
+                monitor_write(st, dest.wrapping_add(k as u16), &[*b], "cpu");
             }
-            st.session.injected = true;
-            Ok(format!(
-                "moved {} byte(s) ${:04X}..${:04X} -> ${:04X}",
-                len, start, end, dest
-            ))
+            Ok(format!("moved {len} byte(s) ${start:04x}..${end:04x} -> ${dest:04x}"))
         }
 
         // ---- c <start> <end> <dest> — compare, list differences. -------------
@@ -3886,14 +3926,18 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             if len <= 0 {
                 return Err("c: end < start".into());
             }
-            let len = len as u16;
+            // u32, NOT u16: `c $0000 $ffff <dest>` is 65536 bytes, and `65536 as u16` is
+            // 0 — the loop ran zero times, `diffs` stayed empty, and the answer was a
+            // confident "identical" for two ranges that had never been looked at.
+            let len = len as u32;
             let mut diffs: Vec<String> = Vec::new();
             for k in 0..len {
+                let k = k as u16;
                 let av = st.session.machine.peek_lens(start.wrapping_add(k), "cpu");
                 let bv = st.session.machine.peek_lens(dest.wrapping_add(k), "cpu");
                 if av != bv {
                     diffs.push(format!(
-                        "  ${:04X}: {:02X} != {:02X} @${:04X}",
+                        "  ${:04x}: {:02x} != {:02x} @${:04x}",
                         start.wrapping_add(k), av, bv, dest.wrapping_add(k)
                     ));
                 }
@@ -3903,7 +3947,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 }
             }
             Ok(if diffs.is_empty() {
-                format!("identical (${:04X}..${:04X} == ${:04X})", start, end, dest)
+                format!("identical (${start:04x}..${end:04x} == ${dest:04x})")
             } else {
                 format!("differences:\n{}", diffs.join("\n"))
             })
@@ -4060,7 +4104,16 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 }
                 // Mirror onto the live registry so the next run honours it; the count is
                 // preserved across rebuilds via sync_observers' `prior` snapshot.
-                st.observers.set_ignore(&name, n);
+                //
+                // A DISABLED observer is not in that registry at all (sync_observers skips
+                // it), so there is nothing to arm — `set_ignore` returns false and the
+                // count used to vanish while the reply still said "skip next N". Report
+                // the real state instead of a number that will never take effect.
+                if !st.observers.set_ignore(&name, n) {
+                    return Ok(format!(
+                        "ignore {name}: observer is off — `obs {name} on` first, then set the count"
+                    ));
+                }
                 return Ok(format!("ignore {name}: skip next {n}"));
             }
 
@@ -4564,7 +4617,12 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                     if (pc == next_pc && sp >= init_sp) || (sp > init_sp) {
                         break;
                     }
-                    if bp_set.contains(&pc) && iters > 0 {
+                    // No `iters > 0` guard: the JSR has ALREADY executed before this
+                    // loop, so on the first pass `pc` is the callee's entry point — not
+                    // the instruction we just stepped off. Skipping the check there meant
+                    // a breakpoint on a subroutine's first instruction was stepped over
+                    // in silence, which is exactly where people put them.
+                    if bp_set.contains(&pc) {
                         break;
                     }
                     if iters >= CAP {
@@ -5472,14 +5530,17 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 Some(a) => a,
                 None => return Err("xref: usage: xref <addr> [artifact-stem]".into()),
             };
-            Ok(project_knowledge::project_read_xref(&fs_project_dir(), addr))
+            let stem = toks.get(2).map(|s| s.as_str());
+            Ok(project_knowledge::project_read_xref(&fs_project_dir(), addr, stem))
         }
         "sym" => {
             let q = match toks.get(1) {
                 Some(q) => q.clone(),
                 None => return Err("sym: usage: sym <name> [artifact-stem]".into()),
             };
-            project_knowledge::project_read_sym(&fs_project_dir(), &q).map_err(|e| format!("sym: {e}"))
+            let stem = toks.get(2).map(|s| s.as_str());
+            project_knowledge::project_read_sym(&fs_project_dir(), &q, stem)
+                .map_err(|e| format!("sym: {e}"))
         }
 
         // ---- Project-label writes (label/unlabel/note/save_labels/load_labels) —
@@ -5570,6 +5631,13 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 None => return Err(format!("{op}: usage: {op} \"<path.c64re>\"")),
             };
             if op == "dump" || op == "snapshot" {
+                // Refuse what we cannot faithfully restore. The guard already existed and
+                // was wired into the WS media handlers only, so the monitor happily wrote
+                // a snapshot whose cartridge state would come back stale — a file that
+                // looks fine until the day you undump it. The TS reference throws here.
+                if let Some(why) = non_persistable_dirty_media(st) {
+                    return Err(format!("{op}: {why}"));
+                }
                 // ── snapshot/dump core (= the WS handler, taking &mut st) ──────────
                 st.session.machine.drive8.flush_disk_writeback();
                 let (disk_path, disk_format) = match st.session.machine.drive8.get_attached_disk() {
@@ -15823,6 +15891,121 @@ mod batch1_tests {
             let end = region["end"].as_u64().unwrap();
             assert!(end >= start, "region end >= start");
         }
+    }
+
+    // ── Monitor verbs ────────────────────────────────────────────────────────────
+    //
+    // These exist because the port had none. The Rust monitor was tested against
+    // itself, which cannot see a verb that writes to the wrong place, computes the
+    // wrong number, or was never ported at all — every one of the cases below was a
+    // real defect found by reading the TS reference next to this file, not a
+    // hypothetical.
+
+    /// Run one monitor command against a fresh machine.
+    fn mon(st: &SharedState, cmd: &str) -> Result<String, String> {
+        let mut g = st.lock().unwrap();
+        run_monitor(&mut g, cmd)
+    }
+
+    #[test]
+    fn write_verbs_reach_io_not_the_ram_underneath() {
+        // `wr d020 00` must black the border. All three write verbs used the core's
+        // `poke()` — documented as "no banking" — so the byte landed in the RAM hidden
+        // under the I/O window, the VIC never saw it, and the reply still said "wrote".
+        let st = make_state();
+        for (cmd, verb) in
+            [("wr d020 07", "wr"), ("f d020 d020 07", "f"), ("t d021 d021 d020", "t")]
+        {
+            {
+                let mut g = st.lock().unwrap();
+                g.session.machine.poke_io(0xd020, &[0x00]);
+                g.session.machine.poke_io(0xd021, &[0x07]); // source for the `t` case
+            }
+            mon(&st, cmd).unwrap_or_else(|e| panic!("{verb}: {e}"));
+            let seen = st.lock().unwrap().session.machine.peek_lens(0xd020, "io");
+            assert_eq!(seen & 0x0f, 0x07, "{verb} must reach the VIC register");
+        }
+    }
+
+    #[test]
+    fn ram_lens_still_writes_raw_ram() {
+        // The banked default must not cost the explicit `ram` lens its meaning: it is
+        // the one way to reach the RAM *under* the I/O window on purpose.
+        let st = make_state();
+        mon(&st, "wr ram d020 5a").unwrap();
+        let g = st.lock().unwrap();
+        assert_eq!(g.session.machine.peek_lens(0xd020, "ram"), 0x5a, "raw RAM written");
+    }
+
+    #[test]
+    fn wr_accepts_every_bank_word() {
+        // Only cpu/ram/io were recognised, so `wr rom c000 ea` parsed "rom" as the
+        // ADDRESS and failed with "bad address".
+        let st = make_state();
+        for lens in ["cpu", "ram", "rom", "io", "cart", "default"] {
+            let out = mon(&st, &format!("wr {lens} c000 ea"))
+                .unwrap_or_else(|e| panic!("wr {lens}: {e}"));
+            assert!(out.starts_with("wrote 1 byte(s)"), "wr {lens}: {out}");
+        }
+    }
+
+    #[test]
+    fn full_range_compare_and_move_do_not_truncate_to_zero() {
+        // `end - start + 1` over $0000..$ffff is 65536, and `65536 as u16` is 0. The
+        // loops ran zero times: `c` reported "identical" for ranges it never looked at,
+        // and `t` reported a successful move of nothing.
+        let st = make_state();
+        {
+            let mut g = st.lock().unwrap();
+            g.session.machine.poke(0x0000, &[0xaa]);
+            g.session.machine.poke(0x8000, &[0x55]); // differs from $0000
+        }
+        let out = mon(&st, "c 0000 ffff 8000").unwrap();
+        assert!(out.starts_with("differences:"), "full-range compare must compare: {out}");
+
+        let out = mon(&st, "t 0000 ffff 0000").unwrap();
+        assert!(out.starts_with("moved 65536 byte(s)"), "full-range move: {out}");
+    }
+
+    #[test]
+    fn drive_track_is_halftrack_over_two() {
+        // rotation.rs: "current_half_track (2..=84). Power-on 36 (T18)". The panel
+        // added one and showed the head a whole track further out than it was.
+        let st = make_state();
+        {
+            let mut g = st.lock().unwrap();
+            g.session.machine.drive8.rotation.current_half_track = 36;
+        }
+        mon(&st, "device drive8").unwrap();
+        let out = mon(&st, "r").unwrap();
+        assert!(out.contains("track 18 (halftrack 36)"), "{out}");
+    }
+
+    #[test]
+    fn a_present_but_unparseable_address_is_an_error_not_a_silent_fallback() {
+        // `m 1000xyz` fell through to the cursor and dumped an unrelated region while
+        // reporting success.
+        let st = make_state();
+        let e = mon(&st, "m 1000xyz").unwrap_err();
+        assert!(e.contains("bad address"), "{e}");
+        // An ABSENT address keeps its documented meaning (cursor / $0000).
+        assert!(mon(&st, "m").is_ok());
+    }
+
+    #[test]
+    fn sd_zero_means_the_default_count() {
+        // TS: `parseInt(t) || 50` — 0 is falsy, so `sd 0` is 50 steps. Taking the 0
+        // literally and clamping to 1 turned the same command into a single step.
+        let st = make_state();
+        // Assert the STEP COUNT in the footer, not the line count: sd folds a loop
+        // that revisits one address into a single line, so 50 steps can render as
+        // few lines as one step does.
+        let st = st;
+        assert!(mon(&st, "sd 1").unwrap().contains("-- sd: 1 steps"));
+        assert!(
+            mon(&st, "sd 0").unwrap().contains("-- sd: 50 steps"),
+            "`sd 0` must mean the default 50, as `parseInt(t) || 50` does in the reference"
+        );
     }
 
     #[test]

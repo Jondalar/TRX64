@@ -786,6 +786,27 @@ fn find_analysis_jsons(project_dir: &str) -> Vec<PathBuf> {
     out
 }
 
+/// The analysis files a project-read verb should consider.
+///
+/// `stem` is the optional `[artifact-stem]` token that both `xref` and `sym` document in
+/// their own usage line. It narrows the search to one artifact when several analyses cover
+/// the same address or the same label name. It used to be accepted and then dropped on the
+/// floor, so the answer came from whichever file the directory scan reached first — the
+/// caller asked for one artifact and silently got another. Matched against the FILE NAME,
+/// as the TS reference does (`basename(p).startsWith(stem)`).
+fn analysis_jsons_for(project_dir: &str, stem: Option<&str>) -> Vec<PathBuf> {
+    let all = find_analysis_jsons(project_dir);
+    match stem {
+        Some(s) if !s.is_empty() => all
+            .into_iter()
+            .filter(|p| {
+                p.file_name().map(|n| n.to_string_lossy().starts_with(s)).unwrap_or(false)
+            })
+            .collect(),
+        _ => all,
+    }
+}
+
 fn stem_of(p: &Path) -> String {
     p.file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -913,9 +934,9 @@ fn resolve_cross_artifact(project_dir: &str, addr: u16) -> Vec<SegEntry> {
     hits
 }
 
-fn build_xref_index(project_dir: &str) -> Vec<XrefEntry> {
+fn build_xref_index(project_dir: &str, stem: Option<&str>) -> Vec<XrefEntry> {
     let mut out = Vec::new();
-    for p in find_analysis_jsons(project_dir) {
+    for p in analysis_jsons_for(project_dir, stem) {
         let owner = stem_of(&p);
         let Ok(text) = std::fs::read_to_string(&p) else { continue };
         let Ok(report) = serde_json::from_str::<Value>(&text) else { continue };
@@ -949,8 +970,8 @@ fn build_xref_index(project_dir: &str) -> Vec<XrefEntry> {
     out
 }
 
-fn resolve_xrefs(project_dir: &str, addr: u16) -> (Vec<XrefEntry>, Vec<XrefEntry>) {
-    let idx = build_xref_index(project_dir);
+fn resolve_xrefs(project_dir: &str, addr: u16, stem: Option<&str>) -> (Vec<XrefEntry>, Vec<XrefEntry>) {
+    let idx = build_xref_index(project_dir, stem);
     let into: Vec<XrefEntry> = idx.iter().filter(|x| x.target == addr).cloned().collect();
     let outof: Vec<XrefEntry> = idx.iter().filter(|x| x.source == addr).cloned().collect();
     (into, outof)
@@ -959,7 +980,8 @@ fn resolve_xrefs(project_dir: &str, addr: u16) -> (Vec<XrefEntry>, Vec<XrefEntry
 /// `inspect <addr>` — owners + callers (ws-server.ts:2175-2184).
 pub fn project_read_inspect(project_dir: &str, addr: u16) -> String {
     let owners = resolve_cross_artifact(project_dir, addr);
-    let (into, _outof) = resolve_xrefs(project_dir, addr);
+    // `inspect` has no stem token of its own — it deliberately reports across artifacts.
+    let (into, _outof) = resolve_xrefs(project_dir, addr, None);
     let mut lines = vec![format!("inspect ${}", hx4(addr))];
     if owners.is_empty() {
         lines.push("  (no analyzed artifact owns this address)".to_string());
@@ -988,8 +1010,8 @@ pub fn project_read_inspect(project_dir: &str, addr: u16) -> String {
 }
 
 /// `xref <addr>` — project-wide callers + own refs (ws-server.ts:2186-2190).
-pub fn project_read_xref(project_dir: &str, addr: u16) -> String {
-    let (into, outof) = resolve_xrefs(project_dir, addr);
+pub fn project_read_xref(project_dir: &str, addr: u16, stem: Option<&str>) -> String {
+    let (into, outof) = resolve_xrefs(project_dir, addr, stem);
     let mut lines = vec![format!(
         "xref ${}  (in:{} out:{}, project-wide)",
         hx4(addr),
@@ -1010,11 +1032,11 @@ pub fn project_read_xref(project_dir: &str, addr: u16) -> String {
 }
 
 /// `sym <name>` — reverse lookup: a labelled segment → its address (ws-server.ts:2157-2166).
-pub fn project_read_sym(project_dir: &str, name: &str) -> Result<String, String> {
+pub fn project_read_sym(project_dir: &str, name: &str, stem: Option<&str>) -> Result<String, String> {
     if name.is_empty() {
         return Err("sym: a name is required".to_string());
     }
-    for p in find_analysis_jsons(project_dir) {
+    for p in analysis_jsons_for(project_dir, stem) {
         for (start, _end, kind, label) in load_effective_segments(&p) {
             if label.as_deref() == Some(name) {
                 return Ok(format!(
@@ -1131,13 +1153,13 @@ mod tests {
         assert!(ins.contains("fixture: $0810..$08ff code (main)"), "inspect: {ins}");
         assert!(ins.contains("<- fixture $0950 call"), "inspect callers: {ins}");
 
-        let xr = project_read_xref(&dir, 0x0900);
+        let xr = project_read_xref(&dir, 0x0900, None);
         assert!(xr.contains("in:1 out:0"), "xref: {xr}");
         assert!(xr.contains("<- fixture $0820 read lda $0900"), "xref: {xr}");
 
-        let sym = project_read_sym(&dir, "main").unwrap();
+        let sym = project_read_sym(&dir, "main", None).unwrap();
         assert!(sym.contains("sym main = $0810"), "sym: {sym}");
-        assert!(project_read_sym(&dir, "nope").is_err());
+        assert!(project_read_sym(&dir, "nope", None).is_err());
         let _ = fs::remove_dir_all(&d);
     }
 
