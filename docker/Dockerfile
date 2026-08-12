@@ -46,7 +46,7 @@ FROM debian:bookworm-slim AS runtime
 # Product version — keep in lockstep with [workspace.package] version in Cargo.toml,
 # and tag the image with the same number (wl-trx64:<version>, plus :latest).
 # The WS protocol epoch is SEPARATE (see RUNTIME_VERSION in the daemon).
-ARG TRX64_VERSION=0.3.1
+ARG TRX64_VERSION=0.3.2
 LABEL org.opencontainers.image.title="wl-trx64" \
       org.opencontainers.image.description="TRX64 C64 runtime daemon (WS on 4340)" \
       org.opencontainers.image.version="${TRX64_VERSION}" \
