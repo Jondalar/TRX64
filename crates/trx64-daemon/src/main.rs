@@ -747,6 +747,12 @@ impl FlowTracker {
 ///     match; the full machine's VERBATIM VICE core legitimately diverges from the TS
 ///     oracle on jammed-CPU / indexed-RMW FETCH_OPCODE cycle counts).
 ///
+/// `injected` alone is NOT that scenario. It is a one-way latch that any monitor
+/// `wr`/`a`/`r <reg>=` or a `session/load_prg` sets and nothing clears, so it cannot by
+/// itself distinguish "a machine BUILT by poking bytes" from "a real machine somebody
+/// poked once". ATTACHED HARDWARE is what makes that call: a cartridge or a mounted disk
+/// means a real C64, and neither exists on the isolated core. An exerciser has neither.
+///
 /// `vic_directed` reads the active trace's `vic`/`c64-vic` domain — but ONLY to ENGAGE
 /// the VIC (the moral equivalent of `io_injected`); the `vic` domain has NO recording
 /// producer, so it changes the BUS, never a recording filter. It is NOT a recording
@@ -766,8 +772,22 @@ fn full_machine_gate(session: &Session) -> bool {
     // must NOT force the isolated core out from under an attached cart. (Audit
     // ws-cart-live-mapping — 713 §7.1 live mapping.)
     let cart_attached = session.machine.cartridge.is_some();
+    // ...and the SAME argument for a mounted disk, which is how the cart escape hatch
+    // above was found the first time. `injected` is a one-way latch set by ANY monitor
+    // `wr`/`a`/`r <reg>=` and by session/load_prg — so a single poke on a booted,
+    // disk-mounted machine used to re-classify it as a bare ISA micro-exerciser and
+    // drop it onto the isolated `cpu6510` core: no VIC, no CIA, no SID and no 1541.
+    // Measured 2026-08-12 on a mounted G64: driveCycles frozen at 0 over 123M C64
+    // cycles, screen garbage, the KERNAL wedged in the IEC serial routine at $EEB2. An
+    // exerciser scenario has no media by construction, so this cannot pull a real
+    // scenario onto the full machine.
+    let media_attached = session.machine.drive8.disk.is_some();
     session.machine.full_assembled
-        && (cart_attached || !session.injected || session.io_injected || vic_directed)
+        && (cart_attached
+            || media_attached
+            || !session.injected
+            || session.io_injected
+            || vic_directed)
 }
 
 /// A passive observer that records whether a hardware IRQ/NMI was DISPATCHED during
@@ -2463,7 +2483,8 @@ fn run_debug_control(id: Value, st: &mut State, frame: u64, _is_continue: bool) 
     // while the session runs; scope it so the fields free up afterward.
     let run = {
         let State { session, observers: reg, .. } = &mut *st;
-        run_until_break(session, reg, DEBUG_RUN_BUDGET)
+        let fm = full_machine_gate(session);
+        run_until_break(session, reg, DEBUG_RUN_BUDGET, fm)
     };
     {
         let State { breakpoints, observers: reg, .. } = &mut *st;
@@ -2760,9 +2781,23 @@ pub(crate) fn stream_debug_gated_advance(st: &mut State, budget: u64) -> u32 {
             }
         }
         // ── Armed: bp/observer-gated segment run, self-halting at the first hit. ──
+        // The bus choice is [`full_machine_gate`], as on every other advance path — and
+        // arming a breakpoint or an observer must not change it. It used to, because the
+        // gate read `session.injected`: one monitor `wr`/`a`/`r <reg>=` on a booted,
+        // disk-mounted session re-classified it as a bare ISA micro-exerciser, so the
+        // frame that armed an observer dropped onto the chipless isolated core while the
+        // unarmed frame before it ran the full machine. The gate now asks for ATTACHED
+        // HARDWARE instead, so a real session stays full-machine either way.
+        //
+        // The unarmed branch above still hardcodes `run_for_full` where this consults the
+        // gate. They agree for every real session (assembled ROMs + media); they part only
+        // on a ROM-less or media-less exerciser, where the unarmed branch is the odd one
+        // out — it needs the full path for the Spec 764 JAM detector (`c64_core.is_jammed`
+        // is only driven there).
         let run = {
             let State { session, observers: reg, .. } = &mut *st;
-            run_until_break(session, reg, budget)
+            let fm = full_machine_gate(session);
+            run_until_break(session, reg, budget, fm)
         };
         {
             let State { breakpoints, observers: reg, .. } = &mut *st;
@@ -2906,14 +2941,17 @@ impl<A: Observer, B: Observer> Observer for TeeObserver<'_, A, B> {
     }
 }
 
+/// `full_machine` is passed IN, not re-derived, because the callers do not all agree:
+/// the stream loop advances the product machine UNCONDITIONALLY (see
+/// [`stream_debug_gated_advance`]), while the one-shot/scenario callers follow
+/// [`full_machine_gate`]. Deriving it here made the armed stream frame pick a different
+/// machine than the unarmed one right next to it — the observers-wreck-everything bug.
 fn run_until_break(
     session: &mut Session,
     reg: &mut observers::ObserverRegistry,
     cycle_budget: u64,
+    full_machine: bool,
 ) -> BreakRun {
-    // Spec 723: SAME bus gate the run path (`run_cycle_budget`) uses — run-to-break must
-    // halt on the machine the scenario RUNS on (incl. the `vic`-directed full-machine).
-    let full_machine = full_machine_gate(session);
     let start_clk = session.machine.clk;
     reg.clear_halt();
 
@@ -3010,7 +3048,7 @@ fn run_until_break(
             // CPU-isolated path (no full machine). The dbg entry point lives on the
             // full SC path only; for the isolated path we step + check the bp set
             // manually so isolated gates still get exec breakpoints.
-            run_isolated_segment(&mut session.machine, bp_ref, max_instr)
+            run_isolated_segment(&mut session.machine, bp_ref, max_instr, seg_budget)
         };
 
         match stop {
@@ -3065,15 +3103,22 @@ fn run_until_break(
 /// only). Steps single instructions, checking the bp set BEFORE each — matching the
 /// full path's break-AT-pc-before-execute semantics. Watchpoints are not supported
 /// on the isolated path (no bus gate there); only the exec bp set is honored.
+///
+/// Stops on EITHER limit. It used to count instructions only, while its caller sized
+/// `max_instr` as `budget/2 + 1000` — but a real 6502 averages ~3.5 cycles per
+/// instruction, so a 5,000,000-cycle budget reliably ran 8,753,500 cycles: 1.75× past
+/// where the caller asked it to stop, every single segment.
 fn run_isolated_segment(
     machine: &mut trx64_core::Machine,
     bp_set: Option<&std::collections::HashSet<u16>>,
     max_instr: u64,
+    cycle_budget: u64,
 ) -> trx64_core::RunStop {
     let mut obs = NullSink;
     let mut executed = 0u64;
+    let start = machine.cpu6510.clk;
     loop {
-        if executed >= max_instr {
+        if executed >= max_instr || machine.cpu6510.clk.wrapping_sub(start) >= cycle_budget {
             return trx64_core::RunStop::CycleBudget;
         }
         let pc = machine.cpu6510.reg_pc;
@@ -7411,7 +7456,8 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
             });
             let run = {
                 let State { session, observers: reg, .. } = &mut *st;
-                run_until_break(session, reg, cycle_budget)
+                let fm = full_machine_gate(session);
+                run_until_break(session, reg, cycle_budget, fm)
             };
             {
                 let State { breakpoints, observers: reg, .. } = &mut *st;
@@ -7970,7 +8016,8 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 }
                 let run = {
                     let State { session, observers: reg, .. } = &mut *st;
-                    run_until_break(session, reg, cycles)
+                    let fm = full_machine_gate(session);
+                    run_until_break(session, reg, cycles, fm)
                 };
                 {
                     let State { breakpoints, observers: reg, .. } = &mut *st;
@@ -9146,7 +9193,8 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                     });
                     let run = {
                         let State { session, observers: reg, .. } = &mut *st;
-                        run_until_break(session, reg, run_cycles)
+                        let fm = full_machine_gate(session);
+                        run_until_break(session, reg, run_cycles, fm)
                     };
                     {
                         let State { breakpoints, observers: reg, .. } = &mut *st;
@@ -15876,6 +15924,74 @@ mod batch1_tests {
         assert!(glob_full_match("*1", "col1"));     // suffix glob
         assert!(glob_full_match("c*1", "col1"));    // mid glob
         assert!(!glob_full_match("c*1", "col2"));
+    }
+
+    // ── the observers-wreck-everything regression (2026-08-12) ──────────────
+    //
+    // Symptom: on a live disk session, arming a `do log` store observer turned the
+    // picture to noise, killed the IRQs and wedged the KERNAL in the IEC serial routine
+    // at $EEB2. The observer was innocent — `session.injected` (a one-way latch that ANY
+    // monitor `wr`/`a`/`r <reg>=` sets) made `full_machine_gate` re-classify a booted,
+    // disk-mounted machine as a bare ISA micro-exerciser, and the ARMED stream branch
+    // consulted that gate while the UNARMED branch right next to it hardcodes the full
+    // machine. Measured on the real disk: driveCycles frozen at 0 over 123M C64 cycles.
+
+    /// A blank 35-track D64's worth of bytes. Structure is irrelevant — the gate asks
+    /// only whether a medium is present, and this keeps the test free of any real image.
+    fn blank_d64() -> trx64_core::drive::DiskImage {
+        trx64_core::drive::DiskImage {
+            kind: trx64_core::drive::DiskKind::D64,
+            bytes: vec![0u8; 683 * 256],
+            backing_path: None,
+            read_only: false,
+        }
+    }
+
+    #[test]
+    fn injected_alone_does_not_unmount_the_full_machine() {
+        let mut s = Session::new("gate-test");
+        // A machine with ROMs assembled and NOTHING poked is the full machine.
+        s.machine.full_assembled = true;
+        assert!(full_machine_gate(&s), "a plain assembled machine must be full");
+
+        // One monitor `wr` sets the latch. With no media that still means "an exerciser
+        // built by poking bytes" — the isolated core it is a unit test OF (Spec 723).
+        s.injected = true;
+        assert!(
+            !full_machine_gate(&s),
+            "a bare poked machine is still the ISA exerciser scenario"
+        );
+
+        // ...but a MOUNTED DISK says otherwise: that is a real C64 somebody poked once,
+        // and the isolated core has no 1541 at all. Same argument as the cart hatch.
+        s.machine.drive8.attach_disk(blank_d64());
+        assert!(
+            full_machine_gate(&s),
+            "a mounted disk must keep the machine on the full path after a `wr` — \
+             this is the assertion that was missing when the live session died"
+        );
+
+        // Ejecting drops it back to the exerciser reading.
+        s.machine.drive8.detach_disk();
+        assert!(!full_machine_gate(&s));
+    }
+
+    #[test]
+    fn isolated_segment_stops_at_the_cycle_budget() {
+        // It used to count instructions ONLY, while its caller sized `max_instr` as
+        // `budget/2 + 1000`. A 6502 averages ~3.5 cycles/instruction, so every segment
+        // ran ~1.75x past the budget (measured: 8,753,500 cycles for a 5,000,000 ask).
+        let mut m = trx64_core::Machine::new();
+        let budget = 5_000u64;
+        let start = m.cpu6510.clk;
+        let stop = run_isolated_segment(&mut m, None, u64::MAX, budget);
+        let ran = m.cpu6510.clk.wrapping_sub(start);
+        assert!(matches!(stop, trx64_core::RunStop::CycleBudget));
+        assert!(ran >= budget, "must actually run the budget, ran {ran}");
+        assert!(
+            ran < budget + 16,
+            "must stop AT the budget, not past it — ran {ran} for a {budget} ask"
+        );
     }
 
     fn make_state() -> SharedState {
