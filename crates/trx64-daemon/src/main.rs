@@ -6867,16 +6867,30 @@ fn finalize_trace(st: &mut State, background_index: bool) -> (Value, Value) {
             // failure is also logged to stderr by the builder thread itself.
             if background_index {
                 let retrace = trx64_traceindex::retrace_path_for(std::path::Path::new(&duckdb_path));
-                // NOTE (Spec 802 R2 J-3, deliberately NOT enabled here): TRX64 writes no
-                // 0x01 Mark records, so `trace_mark` — and therefore the `anchors` view —
-                // comes out empty for a TRX64-captured trace. `IndexOverrides.marks` is the
-                // zero-format-change fix and `t.marks` is right here, but turning it on
-                // would make the native store differ from a sidecar-built one and muddy the
-                // parity gate. Flip it after the gate passes.
+                // Spec 802 R2 J-3 — ENABLED 2026-08-12. TRX64 writes no 0x01 Mark records,
+                // so scanning the file yields none and `trace_mark` (and the `anchors`
+                // view) came out empty while `run.marks` correctly showed them: the tool
+                // reported `marks: 1` against a store holding 0. `IndexOverrides.marks` is
+                // the zero-format-change fix and `t.marks` is right here.
+                //
+                // It was deferred because passing them would make this store differ from a
+                // sidecar-built one and muddy the parity gate. That gate was the TS↔TRX64
+                // conformance run, which drives the C64RE TypeScript daemon — deleted by
+                // Spec 806. There is no sidecar builder on any product path any more, and
+                // C64RE's remaining store schema has no `trace_mark` table at all. The
+                // condition the deferral waited for cannot occur, so the marks go in.
+                let marks_override = if t.marks.is_empty() {
+                    None
+                } else {
+                    Some(trx64_traceindex::IndexOverrides {
+                        marks: Some(t.marks.clone()),
+                        ..Default::default()
+                    })
+                };
                 let _job = trx64_traceindex::start_background_index(
                     &retrace,
                     std::path::Path::new(&duckdb_path),
-                    None,
+                    marks_override,
                 );
             }
             // ws-trace-monitor-misc-23 — return the REAL RuntimeTraceRun descriptor
@@ -11321,11 +11335,17 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             // lazy first read. finalize_trace writes the `.c64retrace` + sets
             // last_trace_path; we then index its sibling in-process.
             let wait_index = req.params.get("wait_index").and_then(|v| v.as_bool()).unwrap_or(false);
-            let (status, duckdb_path) = {
+            let (status, duckdb_path, marks) = {
                 let mut st = state.lock().unwrap();
+                // Spec 802 R2 J-3 — grab the marks BEFORE finalize consumes the run. The
+                // index is built on one of two paths (background when wait_index=false,
+                // synchronous below when true) and BOTH need them, or `trace_mark` comes
+                // out empty on whichever path the caller happened to take.
+                let marks: Vec<(u64, String)> =
+                    st.session.trace.as_ref().map(|t| t.marks.clone()).unwrap_or_default();
                 let status = finalize_trace(&mut *st, !wait_index);
                 // The duckdb path finalize_trace just recorded (None when no trace ran).
-                (status, st.last_trace_path.clone())
+                (status, st.last_trace_path.clone(), marks)
             }; // lock released before the (potentially minutes-long) index build
             let mut out = json!({ "run": status.0, "status": status.1 });
             if wait_index {
@@ -11342,7 +11362,17 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                     // queryable, the request failed. The `.c64retrace` authority is still
                     // on disk and re-indexable, so the error says exactly that and names
                     // the path + `trace/index` as the retry.
-                    match trace_read_native("index", &db, &json!({ "wait": true })) {
+                    // Direct op_index rather than the generic dispatcher: its third
+                    // argument is the IndexOverrides slot, and the dispatcher passes None.
+                    let ov = if marks.is_empty() {
+                        None
+                    } else {
+                        Some(trx64_traceindex::IndexOverrides {
+                            marks: Some(marks.clone()),
+                            ..Default::default()
+                        })
+                    };
+                    match trx64_traceindex::op_index_with(std::path::Path::new(&db), None, true, ov) {
                         Ok(v) => { out["index"] = v; }
                         Err(e) => {
                             let retrace = trx64_traceindex::retrace_path_for(std::path::Path::new(&db));

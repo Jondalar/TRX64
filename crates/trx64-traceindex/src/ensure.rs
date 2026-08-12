@@ -242,6 +242,16 @@ pub fn ensure_index_bounded(duckdb_path: &Path, timeout_ms: Option<u64>) -> Resu
 }
 
 fn ensure_inner(duckdb_path: &Path, bound_ms: Option<u64>) -> Result<()> {
+    ensure_inner_ov(duckdb_path, bound_ms, None)
+}
+
+/// As [`ensure_inner`], carrying the caller's [`IndexOverrides`] into the build it
+/// may start. Spec 802 R2 J-3.
+fn ensure_inner_ov(
+    duckdb_path: &Path,
+    bound_ms: Option<u64>,
+    overrides: Option<IndexOverrides>,
+) -> Result<()> {
     let retrace = retrace_path_for(duckdb_path);
 
     // 1. A build already in flight → wait for it.
@@ -253,7 +263,7 @@ fn ensure_inner(duckdb_path: &Path, bound_ms: Option<u64>) -> Result<()> {
             let needs_build =
                 !duckdb_path.exists() || (stale_check_enabled() && index_is_stale(duckdb_path));
             if needs_build && retrace.exists() {
-                Some(start_background_index(&retrace, duckdb_path, None))
+                Some(start_background_index(&retrace, duckdb_path, overrides.clone()))
             } else {
                 None
             }
@@ -305,6 +315,21 @@ pub fn op_index(
     retrace_override: Option<&Path>,
     wait: bool,
 ) -> Result<serde_json::Value> {
+    op_index_with(duckdb_path, retrace_override, wait, None)
+}
+
+/// As [`op_index`], plus the [`IndexOverrides`] the caller wants baked into the
+/// `trace_run` header. Spec 802 R2 J-3: TRX64 writes no 0x01 Mark records, so a
+/// finalize has to hand its in-memory marks to WHICHEVER index path runs —
+/// background (`start_background_index`) or synchronous (here). Passing them on
+/// only one path is how `trace_mark` came out empty while the stop reply showed
+/// the marks correctly.
+pub fn op_index_with(
+    duckdb_path: &Path,
+    retrace_override: Option<&Path>,
+    wait: bool,
+    overrides: Option<IndexOverrides>,
+) -> Result<serde_json::Value> {
     let want_retrace = retrace_override
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| retrace_path_for(duckdb_path));
@@ -317,8 +342,8 @@ pub fn op_index(
 
     let mut bounded_from = "none";
     if wait {
-        ensure_index(duckdb_path)?;
-    } else if let Err(e) = ensure_index_bounded(duckdb_path, None) {
+        ensure_inner_ov(duckdb_path, None, overrides.clone())?;
+    } else if let Err(e) = ensure_inner_ov(duckdb_path, Some(adaptive_index_timeout_ms(&retrace_path_for(duckdb_path))), overrides.clone()) {
         match e {
             TraceReadError::IndexStillBuilding { .. } => {
                 bounded_from = "wait-timeout";

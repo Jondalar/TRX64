@@ -111,6 +111,7 @@ pub use schema::{
 pub use build::{index_binary_log, retrace_path_for, IndexOverrides, IndexResult};
 
 pub use ensure::{
+    op_index_with,
     adaptive_index_timeout_ms, ensure_index, ensure_index_bounded, index_error, index_is_stale,
     is_indexing, op_index, start_background_index, IndexJob,
 };
