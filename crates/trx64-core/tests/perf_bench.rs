@@ -655,3 +655,78 @@ fn bench_checkpoint_capture_omit_fb() {
         K_RUNS, CAPTURES, min, med, max, rendered
     );
 }
+
+/// Spec 807 §4.3 — does the JSON tree actually cost MEMORY? The rendered string is
+/// 97 583 B for a lean entry, but the ring holds a live `serde_json::Value`, where
+/// every field is a `String` key into a `Map` and every RAM byte lives inside one big
+/// base64 `String`. If the resident cost is close to the rendered size, slices 2-5 buy
+/// little and the spec should say so. This fills a ring with 500 lean entries (10 s at
+/// cadence 1) and reports process RSS before and after.
+#[test]
+#[ignore = "perf benchmark; run --release with --ignored --nocapture"]
+fn bench_checkpoint_ring_resident_memory() {
+    if !roms_present() {
+        eprintln!("skip bench_checkpoint_ring_resident_memory: ROMs absent at {ROM_DIR}");
+        return;
+    }
+    fn rss_kb() -> u64 {
+        // macOS: `ps -o rss= -p <pid>` in KiB. Linux: /proc/self/statm page count.
+        if let Ok(s) = std::fs::read_to_string("/proc/self/statm") {
+            let rss_pages: u64 = s.split_whitespace().nth(1).and_then(|t| t.parse().ok()).unwrap_or(0);
+            return rss_pages * 4;
+        }
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output();
+        out.ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    }
+
+    const N: usize = 500;
+    let mut m = Machine::new();
+    m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+    let mut sink = NullSink;
+    m.run_for_full(3_000_000, &mut sink, |_, _, _, _, _, _, _| {});
+
+    let rendered = serde_json::to_string(
+        &trx64_core::c64re_snapshot::capture_runtime_checkpoint_opts(
+            &m, "/tmp/b.d64", "d64", None, None, None, None, true,
+        ),
+    )
+    .unwrap()
+    .len();
+
+    // A ring big enough to hold all N (byte budget is the secondary bound).
+    let mut ring = trx64_core::checkpoint_ring::RuntimeCheckpointRing::with_budget_and_max_entries(
+        (N as u64 + 8) * trx64_core::checkpoint_ring::SLOT_BYTES,
+        N as u64 + 8,
+    );
+    let before = rss_kb();
+    for i in 0..N {
+        let cp = trx64_core::c64re_snapshot::capture_runtime_checkpoint_opts(
+            &m, "/tmp/b.d64", "d64", None, None, None, None, true,
+        );
+        ring.capture(cp, i as u64, i as u64 * 19_656).expect("capture");
+    }
+    let after = rss_kb();
+    let held = ring.list().len();
+    assert_eq!(held, N, "ring dropped entries: {held} of {N}");
+
+    let delta_kb = after.saturating_sub(before);
+    let per_entry_kb = delta_kb as f64 / N as f64;
+    let accounted_kb = trx64_core::checkpoint_ring::SLOT_BYTES as f64 / 1024.0;
+    eprintln!("\n========== checkpoint ring resident memory (Spec 807 §4.3) ==========");
+    eprintln!("  entries held                   : {held}  (= 10 s at cadence 1)");
+    eprintln!("  RSS before / after             : {before} / {after} KiB");
+    eprintln!("  RSS delta                      : {delta_kb} KiB  ({:.1} MiB)", delta_kb as f64 / 1024.0);
+    eprintln!("  per entry, RESIDENT            : {per_entry_kb:.1} KiB");
+    eprintln!("  per entry, rendered JSON       : {:.1} KiB", rendered as f64 / 1024.0);
+    eprintln!("  per entry, ring ACCOUNTS       : {accounted_kb:.1} KiB  (SLOT_BYTES)");
+    eprintln!("  raw state would be (~RAM+chips): ~70 KiB");
+    eprintln!(
+        "  RAW (machine-parseable): ring_resident n={} rss_delta_kb={} per_entry_kb={:.2} rendered_b={} accounted_kb={:.1}",
+        N, delta_kb, per_entry_kb, rendered, accounted_kb
+    );
+}

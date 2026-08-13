@@ -1,6 +1,6 @@
 # Spec 807 — Binary checkpoint ring: JSON leaves the hot path
 
-**Status:** PROPOSED
+**Status:** PARTLY BUILT — §4.1 shipped (167 → 64 µs, tree 530 → 98 KB). §4.2–§4.6 open.
 **Repos:** TRX64 only (`trx64-core` capture/ring, `trx64-daemon` stream loop). No C64RE-side
 work — the `.c64re` file format and every WS response stay byte-identical.
 **Number:** 807 (shared board `C64ReverseEngineeringMCP/specs/README.md`).
@@ -56,13 +56,25 @@ framebuffers). The *implementation* pays for the framebuffers anyway. 114 of eve
 2. **JSON+base64 is real but secondary.** `ram_ta` is 19 µs; the remaining tree-building is
    ~34 µs. Removing all of it is worth ~50 µs — a third of the discarded framebuffer work.
 
-What JSON *does* cost is **memory**, and there the accounting is wrong: a framebuffer-nulled
-ring entry renders to ~97 KiB (87 KiB of it base64 RAM) while `byte_size` counts
-`SLOT_BYTES = RAM_BYTES` = 65 536 (`checkpoint_ring.rs:40`). The in-memory `serde_json::Value`
-is larger again — every field is a `String` key into a `Map`. The ring under-reports itself
-by at least 1.5× and evicts on a budget it is not measuring. At 500 entries that is the
-difference between the 32 MiB it claims and something around 50 MiB, before counting `Value`
-overhead.
+What JSON *does* cost is **memory**, and that was measured too
+(`bench_checkpoint_ring_resident_memory`: 500 lean entries — 10 s at cadence 1 — into a ring
+sized to hold them all, process RSS before and after):
+
+| Per ring entry | |
+|---|---|
+| **Resident (measured)** | **208.9 KiB** |
+| Rendered JSON | 95.3 KiB |
+| What the ring ACCOUNTS (`SLOT_BYTES`) | 64.0 KiB |
+| What the raw state is (RAM + chips) | ~70 KiB |
+
+**The ring under-reports itself by 3.3×.** A live `serde_json::Value` costs 2.2× its own
+rendered form — every field is a `String` key into a `Map`, and the 64 KiB of RAM lives as an
+87 KiB base64 `String` on top of that. At cadence 1 the ring believes it is holding 32 MiB
+and is actually holding **102 MiB**, and it evicts on the number it believes.
+
+That is the real case for the rest of this spec, and it is a memory case, not a CPU one:
+209 KiB → ~70 KiB is a **3× reduction**, and it is the difference between a 10-second
+per-frame window costing 100 MiB and costing 35 MiB.
 
 And there is no slab behind any of it; `checkpoint_ring.rs:169` says so in as many words:
 *"Tracked for the stats/capacity policy only (TRX64 has no slab to index into)"*.
