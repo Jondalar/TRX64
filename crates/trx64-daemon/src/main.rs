@@ -8161,6 +8161,23 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                     "session is running under the autonomous loop; use debug/pause before manual session/run",
                 );
             }
+            // Spec 808 — ONE rule, both clocks: while the transport holds the machine,
+            // nothing else advances it. The daemon's stream loop honours this in
+            // streaming.rs; the in-process CLI cockpit pumps through session/run
+            // instead, so the same check has to live here or `play back` would set a
+            // flag nobody ticks and a running pump would advance ON TOP of a restore.
+            // Ticking here means the transport steps at whatever rate its host pumps,
+            // which is the same 50/s in both.
+            if transport_tick(&mut st) {
+                let v = transport_status(&st);
+                return Response::ok(
+                    id,
+                    json!({
+                        "c64Cycles": 0,
+                        "transport": v,
+                    }),
+                );
+            }
             let cycles = req
                 .params
                 .get("cycles")
@@ -17129,6 +17146,48 @@ mod batch1_tests {
         assert!(out.contains("end of the ring"), "hitting the end must be stated: {out}");
         // And playback stops rather than spinning at the wall.
         assert!(st.lock().unwrap().transport.playing.is_none());
+    }
+
+    /// The in-process CLI cockpit pumps the machine through `session/run`, not through
+    /// the daemon's stream loop. So the transport has to be honoured there too, or
+    /// `play back` in `trx64cli` would set a flag nobody ticks — and a running pump
+    /// would advance the machine ON TOP of a restore, which is exactly the divergence
+    /// only an intervention is allowed to cause. Found by smoke-testing the built
+    /// binary rather than by reading, which is why it has a test of its own.
+    #[test]
+    fn session_run_does_not_advance_while_the_transport_holds_the_machine() {
+        let st = make_state();
+        fill_anchors(&st, 8);
+        mon(&st, "frame -3").expect("back");
+        let clk_before = st.lock().unwrap().session.machine.c64_core.clk;
+
+        let r = call(&st, "session/run", json!({ "cycles": 19_656 }));
+        assert_eq!(r["c64Cycles"], json!(0), "the pump must not advance a rewound machine");
+        assert!(r["transport"].is_object(), "and it must say why: {r}");
+
+        // Nothing moved.
+        assert_eq!(st.lock().unwrap().session.machine.c64_core.clk, clk_before);
+
+        // Playing back: each pump tick STEPS the transport instead of advancing.
+        mon(&st, "play back").expect("play back");
+        let before = call(&st, "transport/status", json!({}))["frameIndex"].as_u64().unwrap();
+        call(&st, "session/run", json!({ "cycles": 19_656 }));
+        let after = call(&st, "transport/status", json!({}))["frameIndex"].as_u64().unwrap();
+        assert_eq!(after, before - 1, "one pump tick = one anchor back");
+
+        // And once handed back at the head, the pump advances normally again.
+        mon(&st, "goto 8").expect("goto head");
+        let clk_head = st.lock().unwrap().session.machine.c64_core.clk;
+        let _ = clk_head;
+        let r2 = call(&st, "session/run", json!({ "cycles": 19_656 }));
+        assert!(
+            r2["transport"].is_null(),
+            "at the head session/run must NOT be intercepted any more — the pump owns \
+             the machine again: {r2}"
+        );
+        // (Whether the CPU then executes anything is this fixture's business, not the
+        // transport's: make_state() has no ROMs, so `c64Cycles` reports the budget and
+        // the clock does not move. The contract under test is the handover.)
     }
 
     /// G2 — parity. Every transport action reachable as a monitor verb is reachable over
