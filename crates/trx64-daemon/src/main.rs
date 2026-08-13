@@ -401,6 +401,22 @@ pub struct State {
     /// CLI cockpit pumps 200×/s, so counting calls recorded 200 anchors a second and a
     /// 500-anchor ring covered 2.5 seconds instead of ten.
     autocapture_cycles_since: u64,
+    /// Spec 808 rebuild — THE run intent. The daemon owns whether the machine should
+    /// advance; clients send `session/play` / `session/pause` and render what comes back.
+    ///
+    /// Before this the CLI cockpit held its own `running: AtomicBool` whose own comment
+    /// called it "the AUTHORITY … distinct from the controller's `session.running`" —
+    /// two truths about one fact, with a reconciliation hack in the pump for when they
+    /// drifted. Every state bug in 808 came out of that seam: F11 needing three presses,
+    /// the header showing PAUSE while cycles ran, `play back` doing nothing at all.
+    /// TRX64 is a daemon with N clients that must have feature parity; a client that
+    /// remembers anything about the machine has to have its memory reconciled forever.
+    ///
+    /// Distinct from `session.running`, which stays what it was: the AUTONOMOUS loop's
+    /// flag (debug/run), which must be false for a manual tick to be legal.
+    play_intent: bool,
+    /// Spec 808 rebuild — daemon-owned pacing (8× budget per tick). Was a client atomic.
+    warp: bool,
     /// Spec 807 §4.6 — the LIVE capture cadence, in stream-loop frames. Seeded from
     /// `C64RE_CHECKPOINT_CADENCE_FRAMES` (default 25) and changed at runtime by the
     /// `cadence` monitor verb, which retunes the ring's entry cap in the same call.
@@ -8337,7 +8353,11 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             // Spec 771.2 — report the REAL run/pause state + last stop reason (was
             // hardcoded "paused", which kept the UI's seed poll permanently frozen).
             // Mirrors session/state in ws-server.ts (runState/stopReason/controlOwner).
-            let run_state = if st.session.running { "running" } else { "paused" };
+            // Spec 808 rebuild — the RUN INTENT is what a user calls "running", and it
+            // lives here. `session.running` is the AUTONOMOUS loop's flag, a different
+            // question; reporting that as the cockpit's RUN/PAUSE is what let a client
+            // keep its own answer and then disagree with the machine.
+            let run_state = if st.play_intent || st.session.running { "running" } else { "paused" };
             let stop_reason = st.ctrl_stop.as_ref().map(|s| s.reason);
             // Spec 771.2 (T1.1) — live audio is streaming when the hub is on AND running.
             let streaming = st.streaming_enabled && st.session.running;
@@ -8361,6 +8381,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             let mut state_json = json!({
                 "c64Cycles": machine.clk,
                 "transport": transport_status(&st),
+                "warp": st.warp,
                 "driveCycles": machine.drive8.drive_clk,
                 "mode": "true-drive",
                 "runState": run_state,
@@ -8716,11 +8737,24 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
         // Spec 786 — explicit power verbs. `on` = full init (no-op if already
         // on), `off` = dead machine, no live state (no-op if already off).
         "session/power" => {
+            // Spec 808 rebuild — powering on RUNS the machine. That is machine state,
+            // so it is set here; the CLI used to set its own flag, which is precisely the
+            // seam this rebuild removes (a second front-end would never have learned it).
             let op = req.params.get("op").and_then(|v| v.as_str()).unwrap_or("");
             let mut st = state.lock().unwrap();
             match op {
-                "on" => do_power_on(&mut st),
-                "off" => do_power_off(&mut st),
+                "on" => {
+                    do_power_on(&mut st);
+                    // Powering on RUNS the machine, and a fresh machine has no past —
+                    // the ring's anchors describe one that no longer exists.
+                    st.play_intent = true;
+                    transport_discard_timeline(&mut st, "power on");
+                }
+                "off" => {
+                    do_power_off(&mut st);
+                    st.play_intent = false;
+                    transport_discard_timeline(&mut st, "power off");
+                }
                 _ => return Response::err(id, -32602, "session/power: op must be \"on\" or \"off\""),
             }
             let powered = st.session.powered;
@@ -12165,6 +12199,129 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
         // The parity half (§2/G2): every transport action reachable as a monitor verb is
         // reachable here, with the SAME status object back, so the C64RE ribbon renders
         // from data instead of parsing the terminal line.
+        // ── Spec 808 rebuild — the daemon decides what a frame is ──────────────
+        //
+        // ONE tick, ONE decision, in the ONE place that knows everything:
+        //
+        //     transport playing  -> step an anchor (paced by wall clock)
+        //     play_intent        -> advance the emulation
+        //     neither            -> nothing
+        //
+        // Clients hand over the real time elapsed and render the reply. They no longer
+        // hold a run flag, decide what a key means, or set the frame cadence — which is
+        // what made the CLI record 200 anchors a second and the header disagree with the
+        // machine.
+        "session/tick" => {
+            let mut st = state.lock().unwrap();
+            if st.session.running {
+                return Response::err(
+                    id, -32001,
+                    "session is running under the autonomous loop; use debug/pause before manual ticks",
+                );
+            }
+            let elapsed = req
+                .params
+                .get("cycles")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(crate::streaming::CYC_PER_FRAME);
+            let budget = if st.warp { elapsed.saturating_mul(8) } else { elapsed };
+
+            // 1. The transport owns the frame while it is rewound or playing back.
+            if transport_tick(&mut st, budget) {
+                let v = transport_status(&st);
+                return Response::ok(id, json!({ "c64Cycles": 0, "transport": v, "running": false }));
+            }
+            // 2. Otherwise the machine advances — but only if someone asked it to.
+            if !st.play_intent || budget == 0 {
+                let v = transport_status(&st);
+                return Response::ok(id, json!({ "c64Cycles": 0, "transport": v, "running": false }));
+            }
+            {
+                let now = now_ms();
+                stream_maybe_autopersist_cart(&mut st, now);
+                stream_maybe_autopersist_disk(&mut st, now);
+                let frame_no = st.ctrl_frame;
+                let (w, h, indices) = st.session.machine.render_canvas_indices();
+                stream_maybe_autocapture(&mut st, frame_no, budget, w, h, &indices);
+                stream_maybe_feed_recorder(&mut st, frame_no);
+            }
+            let advanced = stream_debug_gated_advance(&mut st, budget);
+            st.ctrl_frame = st.ctrl_frame.wrapping_add(1);
+            // A breakpoint or JAM stops the machine — and it stops it HERE, so every
+            // client learns about it from the same reply instead of inferring it.
+            if st.ctrl_stop.is_some() {
+                st.play_intent = false;
+            }
+            let v = transport_status(&st);
+            Response::ok(id, json!({
+                "c64Cycles": advanced,
+                "transport": v,
+                "running": st.play_intent,
+                "cycles": st.session.machine.c64_core.clk,
+            }))
+        }
+
+        // The run intent, owned here. `session/play` and `session/pause` replace the
+        // client's private run flag.
+        "session/play" => {
+            let mut st = state.lock().unwrap();
+            st.play_intent = true;
+            st.ctrl_stop = None;
+            // Playing forward from a rewound position is a transport move, not a jump to
+            // the head: the anchors ahead are replayed first (Spec 808 decision 4).
+            if st.transport.holds_the_machine() {
+                let _ = transport_play(&mut st, transport::Direction::Fwd, 1);
+            }
+            let v = transport_status(&st);
+            Response::ok(id, json!({ "running": true, "transport": v }))
+        }
+        "session/pause" => {
+            let mut st = state.lock().unwrap();
+            st.play_intent = false;
+            st.transport.playing = None;
+            let pc = st.session.machine.c64_core.reg_pc;
+            let cycles = st.session.machine.clk;
+            st.ctrl_stop = Some(CtrlStop { reason: "pause", pc, cycles });
+            let v = transport_status(&st);
+            Response::ok(id, json!({ "running": false, "pc": pc, "transport": v }))
+        }
+        "session/warp" => {
+            let mut st = state.lock().unwrap();
+            if let Some(on) = req.params.get("on").and_then(|v| v.as_bool()) {
+                st.warp = on;
+            }
+            Response::ok(id, json!({ "warp": st.warp }))
+        }
+
+        // F11, decided HERE. The client sends one event and renders one message; it does
+        // not read two flags and issue two verbs, which is how it came to need three
+        // presses to get from rewind-playing back to playing.
+        "transport/toggle" => {
+            let mut st = state.lock().unwrap();
+            let playing = st.play_intent || st.transport.playing.is_some();
+            let out = if playing {
+                st.play_intent = false;
+                st.transport.playing = None;
+                let pc = st.session.machine.c64_core.reg_pc;
+                let cycles = st.session.machine.clk;
+                st.ctrl_stop = Some(CtrlStop { reason: "pause", pc, cycles });
+                let mut v = transport_status(&st);
+                v["action"] = json!("pause");
+                v
+            } else {
+                // Resuming is ALWAYS forward (Spec 808 §4a).
+                st.play_intent = true;
+                st.ctrl_stop = None;
+                if st.transport.holds_the_machine() {
+                    let _ = transport_play(&mut st, transport::Direction::Fwd, 1);
+                }
+                let mut v = transport_status(&st);
+                v["action"] = json!("play");
+                v
+            };
+            Response::ok(id, out)
+        }
+
         "transport/status" => {
             let st = state.lock().unwrap();
             Response::ok(id, transport_status(&st))
@@ -14551,7 +14708,11 @@ fn transport_status(st: &State) -> Value {
     let ids = transport_anchor_ids(st);
     let pos = transport::locate(&ids, st.transport.cursor.as_deref());
     let secs = pos.as_ref().map(|p| transport_seconds_behind(&ids, p)).unwrap_or(0.0);
-    transport::status_json(&st.transport, pos.as_ref(), secs)
+    let mut v = transport::status_json(&st.transport, pos.as_ref(), secs);
+    // The range rides EVERY status, not just the transport `pause` verb — F11 runs the
+    // cockpit `/pause`, so hanging it off the verb meant it was never actually seen.
+    v["range"] = json!(transport_range_line(st));
+    v
 }
 
 /// Place the machine on anchor `index`. The single point where the transport touches
@@ -14764,21 +14925,21 @@ fn transport_play(st: &mut State, dir: transport::Direction, speed: u32) -> Resu
 fn transport_range_line(st: &State) -> String {
     let ids = transport_anchor_ids(st);
     if ids.is_empty() {
-        return "  buffer: empty".to_string();
+        return "RINGBUFFER SIZE: empty (fills while the machine runs)".to_string();
     }
     let first = ids[0].2;
     let last = ids[ids.len() - 1].2;
     let span = last.saturating_sub(first);
     let secs = span as f64 / TRANSPORT_PAL_HZ;
     let live = st.session.machine.c64_core.clk;
+    let n = ids.len();
     let pos = transport::locate(&ids, st.transport.cursor.as_deref());
     let at = pos
         .as_ref()
-        .map(|p| format!("cyc {} (frame {}/{})", p.cycles, p.index + 1, p.total))
-        .unwrap_or_else(|| format!("cyc {live} (live head)"));
+        .map(|p| format!("Cycle {} Frame {}", p.cycles, p.index + 1))
+        .unwrap_or_else(|| format!("Cycle {live} (live head)"));
     format!(
-        "  buffer: cyc {first} \u{2192} {last}   span {span} cyc = {secs:.2}s over {} anchors\n           at: {at}   machine now: cyc {live}",
-        ids.len()
+        "RINGBUFFER SIZE {n} (starts at Cycle {first} Frame 1 // ends at Cycle {last} Frame {n})\n           span {span} cyc = {secs:.2}s   ·   cursor at {at}   ·   machine now Cycle {live}"
     )
 }
 
@@ -14787,13 +14948,11 @@ fn transport_range_line(st: &State) -> String {
 fn transport_pause(st: &mut State) -> Value {
     st.transport.playing = None;
     let mut out = transport_status(st);
-    // Pause is where you look at the numbers, so pause is where they are printed.
     out["line"] = json!(format!(
         "{}\n{}",
         out["line"].as_str().unwrap_or(""),
-        transport_range_line(st)
+        out["range"].as_str().unwrap_or("")
     ));
-    out["range"] = json!(transport_range_line(st));
     out
 }
 
@@ -16224,6 +16383,8 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         disk_ap_done_hash: None,
         autocapture_frames_since: 0,
         autocapture_cycles_since: 0,
+        play_intent: false,
+        warp: false,
         recorder_frames_since: 0,
         candidates: std::collections::HashMap::new(),
         candidate_seq: 0,
@@ -16788,6 +16949,8 @@ mod batch1_tests {
             disk_ap_done_hash: None,
             autocapture_frames_since: 0,
             autocapture_cycles_since: 0,
+            play_intent: false,
+            warp: false,
             recorder_frames_since: 0,
         candidates: std::collections::HashMap::new(),
         candidate_seq: 0,

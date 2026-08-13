@@ -196,6 +196,57 @@ the frame you asked to see.
 position — the anchors before the cursor stay valid. A reset, a power cycle or a media
 swap replaces the machine, so the whole ring goes.
 
+## §4b The rebuild: the daemon owns the state
+
+The first implementation put run-state in the CLIENT and it produced a bug a round for a
+whole afternoon. Written down because the rule is older than this spec and I built past
+it: `TRX64/CLAUDE.md` already says the daemon "produces bytes, events and machine-state
+and **owns** runtime, instrument, reverse-debug, trace, checkpoints", and
+`docs/wl-trx64-play-api.md` already says "There is one live machine per container. Every
+client connected to the…".
+
+What was wrong: `trx64-cli/src/engine.rs` held `running: Arc<AtomicBool>` whose own
+comment called it *"the AUTHORITY … distinct from the controller's `session.running`"* —
+two truths about one fact — plus a reconciliation hack in the pump for when they drifted.
+The pump loop lived in the client too, so the CLIENT set the frame cadence.
+
+**Five symptoms, one seam:**
+
+| symptom | the seam |
+|---|---|
+| F11 needed three presses to play | two run-flags, each press cleared one |
+| header said PAUSE while cycles ran | client flag said paused, daemon was running |
+| `play back` did nothing | pump gated on the client flag; the transport lives in the daemon |
+| recording 4× too dense (2.5 s ring, not 10) | the client's 5 ms pump set the capture cadence |
+| F10 still paused after pause moved | two key paths with no daemon state between them |
+
+**The shape now.** One decision, in the one place that knows everything:
+
+```
+   session/tick { cycles }        <- clients hand over the real time that passed
+
+     transport playing  ->  step an anchor (paced by the wall clock)
+     play_intent        ->  advance the emulation
+     neither            ->  nothing
+
+   session/play · session/pause · session/warp · transport/toggle
+                                  <- events; the reply is the truth
+```
+
+`transport/toggle` is F11 **in the daemon**: if anything is playing, stop it; otherwise
+resume forward. The client sends one event and renders one message — it no longer reads
+two flags and issues two verbs.
+
+The client keeps `quit` (its own lifecycle), `epoch` (an audio re-sync signal) and
+`joystick_mode` (input routing, a UI concern). It keeps no machine state at all, and
+`scripts/check-client-owns-no-state.sh` fails the build if any comes back — including on
+the give-away phrasings ("AUTHORITY … distinct from", "reconcile the dual").
+
+**Why this is load-bearing rather than tidy:** two front-ends exist and the owner requires
+the same functionality in both. Parity is FREE when both render the same daemon state.
+The moment a client owns something, parity becomes a thing somebody maintains by hand,
+forever, and drifts the first time nobody looks.
+
 ## §5 The mode indicator is load-bearing
 
 Decision 4 has a real hazard, and it is the one thing in this spec that can quietly cost the
