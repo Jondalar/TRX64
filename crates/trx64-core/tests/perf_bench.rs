@@ -796,3 +796,59 @@ fn bench_checkpoint_entry_cost_split() {
         N, ram_kb, tree_kb, residual_rendered
     );
 }
+
+/// Rewind-transport question — what does ONE step of backward playback cost if every
+/// frame is a REAL restore? If a restore fits in a PAL frame with room to spare, then
+/// playback can simply move the machine and every existing viewer (the TUI's `/window`,
+/// the C64RE UI, screenshots, register panels) follows for free, with nothing new built.
+#[test]
+#[ignore = "perf benchmark; run --release with --ignored --nocapture"]
+fn bench_checkpoint_restore_step() {
+    if !roms_present() {
+        eprintln!("skip bench_checkpoint_restore_step: ROMs absent at {ROM_DIR}");
+        return;
+    }
+    const N: usize = 200;
+    let mut m = Machine::new();
+    m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+    let mut sink = NullSink;
+    m.run_for_full(3_000_000, &mut sink, |_, _, _, _, _, _, _| {});
+
+    let mut ring = trx64_core::checkpoint_ring::RuntimeCheckpointRing::with_budget_and_max_entries(
+        (N as u64 + 8) * trx64_core::checkpoint_ring::SLOT_BYTES,
+        N as u64 + 8,
+    );
+    let mut ids = Vec::with_capacity(N);
+    for i in 0..N {
+        let cp = trx64_core::c64re_snapshot::capture_runtime_checkpoint_opts(
+            &m, "/tmp/b.d64", "d64", None, None, None, None, true,
+        );
+        ids.push(ring.capture(cp, i as u64, i as u64 * 19_656).expect("capture").id);
+    }
+
+    // Walk the ring BACKWARDS, restoring each anchor — this is exactly what one second
+    // of backward playback does at cadence 1.
+    let mut target = Machine::new();
+    target.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+    let mut us = Vec::with_capacity(K_RUNS);
+    for _ in 0..K_RUNS {
+        let t0 = Instant::now();
+        for id in ids.iter().rev() {
+            let cp = ring.restore_snapshot(id).expect("snapshot");
+            trx64_core::c64re_snapshot::restore_runtime_checkpoint(&mut target, &cp)
+                .expect("restore");
+        }
+        us.push(t0.elapsed().as_secs_f64() * 1_000_000.0 / N as f64);
+    }
+    let med = median(&mut us.clone());
+    let min = us.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = us.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    eprintln!("\n========== one backward-playback step (restore) ==========");
+    eprintln!("  µs/step  min/median/max        : {min:.1} / {med:.1} / {max:.1}");
+    eprintln!("  share of one PAL frame (20 ms) : {:.2} %", med / 20_000.0 * 100.0);
+    eprintln!("  at 50 steps/s                  : {:.1} % of wall-clock", med / 20_000.0 * 100.0);
+    eprintln!(
+        "  RAW (machine-parseable): restore_step k={} n={} min_us={:.3} med_us={:.3} max_us={:.3}",
+        K_RUNS, N, min, med, max
+    );
+}
