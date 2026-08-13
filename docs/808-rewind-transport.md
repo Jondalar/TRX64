@@ -65,11 +65,17 @@ so a later reader does not have to re-run the argument.
    verschiedene Zweige abgehen lassen kann mit unterschiedlichen Code-Overlays"* — is the
    owner's definition of a **Scenario** and gets **its own spec**, because branches need a
    view that shows them and blurring the two would ship a timeline nobody can see.
-4. **Play-forward replays before it diverges.** From frame 340 of 500, `play` walks 341…500
-   through the existing anchors and only becomes live emulation at the end. Watching never
-   costs you your recording; truncation happens on real intervention (a key, the joystick,
-   `wr`, a resumed run). The owner's own reservation is recorded in §6 — this is the less
-   safe of the two options and it is chosen deliberately.
+4. **Play runs the EMULATION from here.** ~~From frame 340 of 500, `play` walks 341…500
+   through the existing anchors and only becomes live emulation at the end.~~
+   **Reversed by the owner on 2026-08-13, after using it.** Pressing play after a rewind
+   means "carry on from this moment"; a player that first re-shows the next four seconds
+   is answering a question nobody asked. So `play` cuts the anchors ahead and the machine
+   runs — visibly, with the count in the message ("dropped 8 anchor(s) ahead").
+
+   Worth keeping on the record: he called the option we did NOT take the safer one at the
+   time, for the reason in §5 — replaying and running look identical — and it turned out
+   the safety was worth less than the directness. The reversal is a two-line change
+   because both paths were already there.
 5. **Transport keys are F9–F12, and pause moves.** The C64 keyboard has F1–F8 only
    (F2/F4/F6/F8 are SHIFT+F1/F3/F5/F7), so F9–F12 are the only function keys that cannot
    collide with the emulated machine — `window.rs:262` already states this rule. No
@@ -271,10 +277,14 @@ prevent.
 
 On decision 4: *"ich denke B ist sicherer weil halt, aber lass uns mit A anfangen."*
 
-B (immediate live emulation, truncate at once) is the safer semantic — nothing is ever cut
-by surprise, because everything is cut immediately and visibly. A is chosen for the better
-feel, with §5 as the price of admission. If §5 turns out not to be enough in use, B is a
-small change: it is the same code path with the truncation moved earlier.
+**And then, having used it, he asked for B.** A (replay the anchors ahead, go live at the
+head) shipped first; the moment it met a real session the answer was that play should
+simply emulate from here. B is what runs now.
+
+The note that was written here at the time said "if §5 turns out not to be enough in use,
+B is a small change: the same code path with the truncation moved earlier." That held —
+it was two lines. Which is the argument for writing down the option you did not take,
+along with what it would cost to switch.
 
 ## §7 Gates
 

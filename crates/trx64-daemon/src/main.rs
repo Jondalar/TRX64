@@ -12337,10 +12337,18 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             st.play_intent = true;
             st.ctrl_stop = None;
             st.audio_epoch = st.audio_epoch.wrapping_add(1);
-            // Playing forward from a rewound position is a transport move, not a jump to
-            // the head: the anchors ahead are replayed first (Spec 808 decision 4).
+            // Spec 808 decision 4, REVERSED by the owner 2026-08-13: PLAY means the
+            // EMULATION runs from here, not a replay of the anchors ahead.
+            //
+            // Replaying them first was the "watching never costs you your recording"
+            // option, and it is the one he flagged at the time as the less safe of the
+            // two because replaying and running look identical on screen. Having used it:
+            // pressing play after a rewind means "carry on from this moment", and a
+            // player that instead re-showed the next four seconds before coming alive is
+            // answering a question nobody asked. So the future is cut here, visibly, and
+            // the machine runs.
             if st.transport.holds_the_machine() {
-                let _ = transport_play(&mut st, transport::Direction::Fwd, 1);
+                transport_truncate_on_intervention(&mut st);
             }
             let v = transport_status(&st);
             Response::ok(id, json!({
@@ -12397,18 +12405,30 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 ));
                 v
             } else {
-                // Resuming is ALWAYS forward (Spec 808 §4a).
+                // Resuming is ALWAYS forward, and forward means the EMULATION runs
+                // from here — not a replay of the anchors ahead (owner, 2026-08-13).
                 st.play_intent = true;
                 st.ctrl_stop = None;
-                if st.transport.holds_the_machine() {
-                    let _ = transport_play(&mut st, transport::Direction::Fwd, 1);
-                }
+                let cut = if st.transport.holds_the_machine() {
+                    transport_truncate_on_intervention(&mut st);
+                    st.transport.last_cut
+                } else {
+                    0
+                };
                 let mut v = transport_status(&st);
                 v["action"] = json!("play");
-                v["message"] = json!(format!(
-                    "PLAY \u{25b6} forward.\n{}",
-                    v["range"].as_str().unwrap_or("")
-                ));
+                v["cut"] = json!(cut);
+                v["message"] = json!(if cut > 0 {
+                    format!(
+                        "PLAY \u{25b6} emulating from here \u{2014} dropped {cut} anchor(s) ahead.\n{}",
+                        v["range"].as_str().unwrap_or("")
+                    )
+                } else {
+                    format!(
+                        "PLAY \u{25b6} forward.\n{}",
+                        v["range"].as_str().unwrap_or("")
+                    )
+                });
                 v
             };
             Response::ok(id, out)
@@ -15975,14 +15995,25 @@ fn capture_recorder_anchor_payload(session: &mut Session) -> Value {
     // `driveDiskImage` (the mutable GCR overlay) stays omitted — it changes on every
     // write, so content-addressing would not dedup it; the same hole exists for a
     // disk-writing title and is recorded in §8 rather than pretended away.
-    let cart_flash = capture_cart_blobs(&mut session.machine).1;
+    // BOTH cart blobs, not just the flash.
+    //
+    // `restore_runtime_checkpoint` is "the sole cart authority (re-attaches from
+    // `cartBytes`, or `detach_cart`)" — the code's own words. So an anchor with
+    // `cartBytes: null` does not merely fail to restore the cart, it EJECTS it: rewind
+    // on a CRT and the next reset lands in BASIC, with nothing left to load from.
+    //
+    // The `.crt` bytes never change during a session, so the ring's content-addressed
+    // pool stores exactly ONE copy for the whole window regardless of its length. The
+    // flash rides for the separate reason in §7b (a game that writes it, plus the
+    // picture-regeneration frames).
+    let (cart_bytes, cart_flash) = capture_cart_blobs(&mut session.machine);
     let mut cp = trx64_core::c64re_snapshot::capture_runtime_checkpoint_opts(
         &session.machine,
         &disk_path,
         &disk_format,
         None,
         None,
-        None,
+        cart_bytes.as_deref(),
         cart_flash.as_deref(),
         true,
     );
@@ -18024,6 +18055,65 @@ mod batch1_tests {
             );
             last = now;
         }
+    }
+
+    /// A rewind must not EJECT the cartridge. `restore_runtime_checkpoint` is, in the
+    /// code's own words, "the sole cart authority (re-attaches from `cartBytes`, or
+    /// `detach_cart`)" — so an anchor without those bytes does not merely fail to restore
+    /// the cart, it removes it. Symptom: rewind on a CRT, then a reset lands in BASIC
+    /// with nothing left to load from.
+    #[test]
+    fn a_rewind_does_not_eject_the_cartridge() {
+        let st = make_state();
+        // A minimal well-formed CRT is more setup than this test needs; what it pins is
+        // the CONTRACT, which is that the anchor carries the cart blobs whenever a cart
+        // is attached. With no cart attached both are legitimately absent.
+        {
+            let mut g = st.lock().unwrap();
+            let cp = capture_recorder_anchor_payload(&mut g.session);
+            let has_cart = g.session.machine.cartridge.is_some();
+            if has_cart {
+                assert!(
+                    !cp["cartBytes"].is_null(),
+                    "an anchor taken with a cart attached MUST carry cartBytes — a null \
+                     there is an eject on restore, not a missing optimisation"
+                );
+            } else {
+                assert!(cp["cartBytes"].is_null(), "no cart, no bytes");
+            }
+            // The GCR overlay is the one slot deliberately omitted (§7b).
+            assert!(
+                cp["driveDiskImage"].is_null(),
+                "the mutable GCR overlay stays out of the anchor by design"
+            );
+        }
+    }
+
+    /// PLAY after a rewind runs the EMULATION from here — it does not replay the anchors
+    /// ahead. The spec shipped the other way first (decision 4), the owner used it, and
+    /// reversed it: pressing play means "carry on from this moment", and a player that
+    /// re-shows the next four seconds before coming alive answers a question nobody
+    /// asked. The future is therefore cut, visibly.
+    #[test]
+    fn play_after_a_rewind_emulates_from_here_and_cuts_the_future() {
+        let st = make_state();
+        fill_anchors(&st, 20);
+        mon(&st, "frame -8").expect("back 8");
+        assert_eq!(st.lock().unwrap().checkpoint_ring.list().len(), 20, "watching costs nothing");
+
+        let r = call(&st, "transport/toggle", json!({}));
+        assert_eq!(r["action"], json!("play"));
+        assert_eq!(r["cut"], json!(8), "the eight anchors ahead must be dropped");
+        assert!(
+            r["message"].as_str().unwrap().contains("emulating from here"),
+            "and it must SAY so, because playing and replaying look identical: {}",
+            r["message"]
+        );
+
+        let g = st.lock().unwrap();
+        assert_eq!(g.checkpoint_ring.list().len(), 12, "20 - 8 dropped");
+        assert!(!g.transport.holds_the_machine(), "the machine is live again");
+        assert!(g.play_intent, "and it is running");
     }
 
     /// G2 — parity. Every transport action reachable as a monitor verb is reachable over
