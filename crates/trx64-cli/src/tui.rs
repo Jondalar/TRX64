@@ -924,12 +924,16 @@ fn draw_gauges(f: &mut Frame, area: Rect, s: &StateSnapshot) {
     // The header shows the DIRECTION, not the machinery. A forward replay is PLAY even
     // though it runs on the same anchors as a rewind — showing REWIND while it ran
     // forward was the complaint, and it was right.
-    let (run_label, run_color) = match (s.transport_mode.as_deref(), s.transport_direction.as_deref()) {
-        (Some("REPLAY"), Some("fwd")) => ("\u{25b6} PLAY", Color::Green),
-        (Some("REPLAY"), _) => ("\u{25c0}\u{25c0} REWIND", Color::Cyan),
-        (Some("STEP \u{25c0}"), _) => ("\u{25c0}| STEP BACK", Color::Cyan),
-        (Some("STEP \u{25b6}"), _) => ("|\u{25b6} STEP FWD", Color::Cyan),
-        (Some("CUT"), _) => ("\u{2702} CUT", Color::Yellow),
+    // Read the DIRECTION first, because it is the only field that knows which way we are
+    // going. Deriving the label from the mode meant a forward replay showed REWIND, and
+    // then a stale mode meant a resumed replay showed PAUSE — both times the header was
+    // answering from the wrong field.
+    let (run_label, run_color) = match (s.transport_direction.as_deref(), s.transport_mode.as_deref()) {
+        (Some("fwd"), _) => ("\u{25b6} PLAY", Color::Green),
+        (Some("back"), _) => ("\u{25c0}\u{25c0} REWIND", Color::Cyan),
+        (_, Some("STEP \u{25c0}")) => ("\u{25c0}| STEP BACK", Color::Cyan),
+        (_, Some("STEP \u{25b6}")) => ("|\u{25b6} STEP FWD", Color::Cyan),
+        (_, Some("CUT")) => ("\u{2702} CUT", Color::Yellow),
         _ if s.running => ("\u{25b6} PLAY", Color::Green),
         _ => ("\u{23f8} PAUSE", Color::Red),
     };

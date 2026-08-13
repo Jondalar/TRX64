@@ -14591,9 +14591,16 @@ fn transport_move_to(st: &mut State, index: usize) -> Result<Value, String> {
     // whole step is ~2 % of wall-clock, which is what buys a moving picture.
     {
         let mut sink = trx64_core::NullSink;
-        st.session
-            .machine
-            .run_for_full(crate::streaming::CYC_PER_FRAME, &mut sink, |_, _, _, _, _, _, _| {});
+        // TWO frames, and keep the second. An anchor lands wherever the raster happened
+        // to be, so the first frame drawn after it is PARTIAL — the top belongs to the
+        // frame that was already half-drawn and the bottom to the new one. That seam is
+        // the striping you see while scrubbing. The second frame starts at a real frame
+        // boundary and is whole.
+        st.session.machine.run_for_full(
+            crate::streaming::CYC_PER_FRAME * 2,
+            &mut sink,
+            |_, _, _, _, _, _, _| {},
+        );
         let drawn = st.session.machine.vic.displayed.clone();
         restore_live_checkpoint(&mut st.session, &cp)?;
         st.session.machine.vic.displayed = drawn;

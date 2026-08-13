@@ -580,6 +580,7 @@ impl Engine {
                 if rewound {
                     let r = self.exec_line("play fwd");
                     self.sync_transport_pump();
+                    self.resync_after_transport_move();
                     r
                 } else {
                     self.transport_playing.store(false, Ordering::SeqCst);
@@ -591,6 +592,16 @@ impl Engine {
     }
 
     /// Run a transport verb and keep the pump's run-reason in step with it.
+    /// A transport move jumps the machine's clock, forwards or backwards. The audio
+    /// pipeline is a queue filled from that clock, so whatever is already queued belongs
+    /// to a time we just left — playing it produces the doubled/echoed sound you hear
+    /// when resuming. `bump_epoch` is the existing signal the window's audio path uses
+    /// to drop its queue and re-sync (the same one a reset uses, and a rewind is at
+    /// least as violent as a reset).
+    fn resync_after_transport_move(&self) {
+        self.bump_epoch();
+    }
+
     pub fn transport_key(&self, verb: &str) -> CmdResult {
         // Going BACKWARD is not the machine running — it is the transport playing. Both
         // used to be true at once, which is the whole reason F11 misbehaved. Setting the
@@ -600,6 +611,7 @@ impl Engine {
         }
         let r = self.exec_line(verb);
         self.sync_transport_pump();
+        self.resync_after_transport_move();
         r
     }
 
