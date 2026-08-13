@@ -5473,9 +5473,15 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 out["line"].as_str().unwrap_or("").to_string(),
                 transport::KEY_LEGEND.to_string(),
             ];
+            // Say how much rewind is ACTUALLY there, in seconds, next to how much was
+            // configured. "500 anchors" and "10s window" are settings; the first number
+            // is the only one that answers "how far back can I go right now".
+            let have = ids.len() as f64 * st.checkpoint_cadence_frames.max(1) as f64 / 50.0;
             lines.push(format!(
-                "  anchors {}   cadence every {} frame(s)   window {:.1}s",
+                "  {:.1}s of rewind available  ({} anchors, cap {})   cadence every {} frame(s), window {:.1}s",
+                have,
                 ids.len(),
+                st.checkpoint_ring.max_entries(),
                 st.checkpoint_cadence_frames.max(1),
                 st.checkpoint_window_seconds
             ));
@@ -17449,6 +17455,32 @@ mod batch1_tests {
         assert_eq!(
             screen_mid_a, screen_mid_b,
             "the same anchor must regenerate the same picture every time"
+        );
+    }
+
+    /// How much rewind do you ACTUALLY get? The owner measured ~2 seconds where the
+    /// settings promise 10, so this pumps a full window's worth and counts.
+    #[test]
+    fn pumping_a_full_window_fills_the_whole_ring() {
+        let st = make_state();
+        let want = {
+            let g = st.lock().unwrap();
+            g.checkpoint_ring.max_entries()
+        };
+        assert_eq!(want, 500, "10 s at cadence 1");
+
+        for _ in 0..want {
+            call(&st, "session/run", json!({ "cycles": 19_656 }));
+        }
+        let g = st.lock().unwrap();
+        let held = g.checkpoint_ring.list().len() as u64;
+        let stats = g.checkpoint_ring.stats();
+        assert_eq!(
+            held, want,
+            "pumped {want} frames and the ring holds {held} — anchors are being dropped \
+             before the cap. total_bytes={} budget={}",
+            stats.total_bytes,
+            g.checkpoint_ring.budget_bytes()
         );
     }
 

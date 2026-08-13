@@ -561,29 +561,43 @@ impl Engine {
     /// alone deadlocked it.
     pub fn transport_toggle(&self) -> CmdResult {
         use trx64_daemon::transport::F11;
-        let (playing, rewound) = self.transport_where();
-        let running = self.running.load(Ordering::SeqCst);
-        let r = match trx64_daemon::transport::f11_verb(running, playing, rewound) {
-            // Stop BOTH run-reasons in one press. Clearing only one is what made F11
-            // read as "pause" twice in a row before it would play again.
-            F11::StopEverything => {
-                if playing {
+        // ONE question: is anything playing? The machine running and the transport
+        // stepping are both "playing" — tracking them as two flags is what made F11
+        // read as pause twice before it would play.
+        let (transport_playing, rewound) = self.transport_where();
+        let playing = transport_playing || self.running.load(Ordering::SeqCst);
+        let r = match trx64_daemon::transport::f11_action(playing) {
+            F11::Pause => {
+                if transport_playing {
                     let _ = self.exec_line("pause");
                 }
-                if running {
-                    self.exec_line("/pause")
+                self.transport_playing.store(false, Ordering::SeqCst);
+                self.exec_line("/pause")
+            }
+            // Resume is ALWAYS forward. From a rewound position that replays the anchors
+            // ahead of us; at the head it is ordinary emulation.
+            F11::PlayForward => {
+                if rewound {
+                    let r = self.exec_line("play fwd");
+                    self.sync_transport_pump();
+                    r
                 } else {
-                    CmdResult::text("PAUSE")
+                    self.transport_playing.store(false, Ordering::SeqCst);
+                    self.exec_line("/run")
                 }
             }
-            F11::Resume(v) => self.exec_line(v),
         };
-        self.sync_transport_pump();
         r
     }
 
     /// Run a transport verb and keep the pump's run-reason in step with it.
     pub fn transport_key(&self, verb: &str) -> CmdResult {
+        // Going BACKWARD is not the machine running — it is the transport playing. Both
+        // used to be true at once, which is the whole reason F11 misbehaved. Setting the
+        // direction clears the other run-reason.
+        if verb.starts_with("play back") || verb.starts_with("frame -") {
+            self.running.store(false, Ordering::SeqCst);
+        }
         let r = self.exec_line(verb);
         self.sync_transport_pump();
         r

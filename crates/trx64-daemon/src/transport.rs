@@ -257,49 +257,49 @@ pub fn key_verb(f: u8, _running: bool) -> Option<&'static str> {
 }
 
 
-/// F11 — the universal go/stop, as a DECISION rather than a fixed verb.
+/// F11 — play/pause. TWO states, and a direction that is not part of them.
 ///
-/// This is the state machine in one function, and writing it out is what exposed the
-/// hole. The rule is one sentence — **if anything is moving, stop it; otherwise resume
-/// from where we are** — and "resume" differs by position:
+/// The owner's model, and it is simpler than what this first grew into:
 ///
 /// ```text
-///   running  playing  rewound   F11 does     because
-///   ──────────────────────────────────────────────────────────────
-///   yes      -        -         /pause       stop the machine
-///   no       yes      yes       pause        stop the playback
-///   no       no       yes       play fwd     replay forward from here
-///   no       no       no        /run         at the head: just run
+///   ONE state:      PLAYING  or  PAUSED
+///   ONE direction:  FORWARD  or  BACKWARD
+///
+///   PLAYING + FORWARD   = the emulation runs
+///   PLAYING + BACKWARD  = the ring plays backwards, to its oldest anchor
+///
+///   F11  playing -> PAUSED
+///        paused  -> direction := FORWARD, PLAYING
+///   F9   direction := BACKWARD, step one
+///   F10  direction := BACKWARD, play
+///   F12  direction := FORWARD,  step one
 /// ```
 ///
-/// The last row is the one that was broken.
-pub fn f11_verb(running: bool, playing: bool, rewound: bool) -> F11 {
-    // MOVING is the union of both run-reasons. Reading them separately is what made F11
-    // need two presses to get from rewind-playing back to playing: the first press hit
-    // `/pause` (because the host flag was still set), the second hit the transport
-    // `pause`, and only the third played. One question — "is anything moving?" — and one
-    // answer that stops BOTH.
-    if running || playing {
-        F11::StopEverything
-    } else if rewound {
-        F11::Resume("play fwd")
+/// The trap this replaced: "running" and "playing" were tracked as two independent
+/// flags, so a rewound-and-playing machine had both set and one press cleared one of
+/// them. F11 then read as pause twice before it would play. There is one question —
+/// **is it playing?** — and resuming always means forward, which is why F11 needs no
+/// memory of which way you were going.
+pub fn f11_action(playing: bool) -> F11 {
+    if playing {
+        F11::Pause
     } else {
-        F11::Resume("/run")
+        F11::PlayForward
     }
 }
 
-/// What F11 decided. `StopEverything` needs two verbs (the machine and the transport),
-/// which is why this is not a `&str` — expressing it as one string is what let the two
-/// halves get out of step in the first place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum F11 {
-    StopEverything,
-    Resume(&'static str),
+    /// Stop, wherever we are and whichever way we were going.
+    Pause,
+    /// Resume — always forward. From a rewound position that replays the anchors ahead;
+    /// at the head it is ordinary emulation.
+    PlayForward,
 }
 
 #[cfg(test)]
 mod key_tests {
-    use super::{f11_verb, key_verb};
+    use super::key_verb;
 
     #[test]
     fn the_four_host_keys_map_and_nothing_else_does() {
