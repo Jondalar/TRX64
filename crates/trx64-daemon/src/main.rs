@@ -3372,8 +3372,14 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
     // many anchors went so the CUT mode can report a number rather than a shrug.
     {
         let verb = command.trim().split_whitespace().next().unwrap_or("").to_ascii_lowercase();
-        const MUTATORS: [&str; 12] = [
-            "wr", "a", "f", "c", "t", "r", "g", "x", "step", "n", "next", "reset",
+        // A reset REPLACES the machine — the anchors are about a machine that no longer
+        // exists, so they go entirely (see `transport_discard_timeline`). Everything else
+        // here merely diverges from a rewound position and truncates the future.
+        if verb == "reset" {
+            transport_discard_timeline(st, "reset");
+        }
+        const MUTATORS: [&str; 11] = [
+            "wr", "a", "f", "c", "t", "r", "g", "x", "step", "n", "next",
         ];
         if MUTATORS.contains(&verb.as_str()) {
             // `r` with no argument only READS the registers; only `r <reg>=<v>` writes.
@@ -13497,7 +13503,16 @@ fn checkpoint_capture_every_frames() -> u64 {
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&n| n >= 1)
-        .unwrap_or(25)
+        // Spec 808 — DEFAULT 1: one full checkpoint per frame.
+        //
+        // It was 25 (two anchors a second) because a checkpoint used to be expensive.
+        // 807 measured what it actually costs now — 64 µs to capture, 98 KiB resident,
+        // so 10 s of per-frame history is ~48 MiB and ~1 % of wall-clock — and at 25 the
+        // ring holds TWENTY anchors, i.e. **0.4 seconds** of rewind. That is not a
+        // shorter version of the feature, it is no feature: `play back` reaches the
+        // oldest frame before you let go of the key. A default that has to be changed
+        // before the thing works is a default that is wrong.
+        .unwrap_or(1)
 }
 
 /// Spec 772 — ring retention in seconds (default 10), env-overridable via
@@ -14615,7 +14630,22 @@ fn transport_play(st: &mut State, dir: transport::Direction, speed: u32) -> Resu
     }
     st.transport.playing = Some(dir);
     st.transport.mode = transport::TransportMode::Replay;
-    Ok(transport_status(st))
+    let mut out = transport_status(st);
+    // Say how much rewind there actually IS. At the default cadence of 25 the ring holds
+    // 20 anchors = 0.4 s, so `play back` reaches the oldest frame before you let go of
+    // the key and then looks stuck. That is the cadence, not a fault, and the reply has
+    // to say so rather than leave the user pressing the key harder.
+    let span = ids.len() as f64 * st.checkpoint_cadence_frames.max(1) as f64 / 50.0;
+    if span < 2.0 {
+        out["line"] = json!(format!(
+            "{}\n  only {:.1}s of rewind here ({} anchors at every-{}-frames) \u{2014} `cadence 1` gives the full window",
+            out["line"].as_str().unwrap_or(""),
+            span,
+            ids.len(),
+            st.checkpoint_cadence_frames.max(1)
+        ));
+    }
+    Ok(out)
 }
 
 /// Stop where we are. Not a restore: the machine is ALREADY on this anchor (decision 2),
@@ -14646,6 +14676,21 @@ pub(crate) fn transport_tick(st: &mut State) -> bool {
 /// key, the joystick, a monitor write, a resumed run. Decision 4 says watching is free
 /// and only intervention costs you the recording, so this is the one place the future
 /// is truncated, and it records how many anchors went so §5 can report it.
+/// A reset, a power cycle or a media change does not DIVERGE the timeline — it replaces
+/// the machine. The anchors describe a machine that no longer exists, and restoring one
+/// would put back a pre-reset state and make the reset look like it never happened.
+/// So those clear the ring outright rather than truncating it.
+pub(crate) fn transport_discard_timeline(st: &mut State, why: &str) {
+    let had = st.checkpoint_ring.list().len() as u64;
+    st.checkpoint_ring.clear();
+    st.transport = transport::Transport::default();
+    st.autocapture_frames_since = 0;
+    // Deliberately NOT printed: the daemon shares a terminal with the TUI, which draws
+    // boxes at absolute positions, and stderr from here lands inside them. `rewind` will
+    // truthfully report 0 anchors, which is the same information without the mess.
+    let _ = (had, why);
+}
+
 pub(crate) fn transport_truncate_on_intervention(st: &mut State) {
     if !st.transport.holds_the_machine() {
         return;
@@ -17327,12 +17372,20 @@ mod batch1_tests {
     fn cadence_moves_the_capture_rate_and_the_ring_cap_together() {
         let st = make_state();
         // Bare verb reports without changing anything.
+        // Spec 808 changed the DEFAULT to 1 — at 25 the ring held 20 anchors, i.e. 0.4 s
+        // of rewind, which is not a shorter version of the feature but no feature.
         let before = mon(&st, "cadence").expect("cadence");
-        assert!(before.starts_with("cadence: every 25 frame(s)"), "{before}");
+        assert!(before.starts_with("cadence: every 1 frame(s)"), "{before}");
         let cap_before = st.lock().unwrap().checkpoint_ring.max_entries();
-        assert_eq!(cap_before, 20, "10 s at every-25-frames = 20 entries");
+        assert_eq!(cap_before, 500, "10 s at every-frame = 500 entries");
 
-        // Every frame: 50 captures/s over the same 10 s window = 500 entries.
+        // Turning it DOWN is the interesting direction now: fewer anchors, smaller cap.
+        let coarse = mon(&st, "cadence 25").expect("cadence 25");
+        assert!(coarse.contains("every 25 frame(s)"), "{coarse}");
+        assert!(coarse.contains("cap 20 entries"), "{coarse}");
+        assert_eq!(st.lock().unwrap().checkpoint_ring.max_entries(), 20);
+
+        // And back to every frame.
         let out = mon(&st, "cadence 1").expect("cadence 1");
         assert!(out.contains("every 1 frame(s)"), "{out}");
         assert!(out.contains("cap 500 entries"), "{out}");
@@ -19464,12 +19517,21 @@ mod batch1_tests {
             n as u64 >= windows,
             "ring accumulated multiple auto-captures (got {n}, want >= {windows}) WITHOUT any explicit checkpoint/capture"
         );
-        // Each accumulated ref carries the auto-cadence frame (proves these came
-        // from the per-frame hook, not an explicit capture).
-        assert!(
-            st.checkpoint_ring.list().iter().all(|r| r.frame > 0 || r.cycles == 0),
-            "auto-captures stamped with the stream-loop frame"
-        );
+        // Each accumulated ref carries the auto-cadence frame, and consecutive refs are
+        // exactly one cadence apart — which is what proves they came from the per-frame
+        // hook rather than an explicit capture. (The old check was `frame > 0`, which
+        // only held because the default cadence was 25 and so the first capture landed
+        // on frame 24. Spec 808 made the default 1, the first capture lands on frame 0,
+        // and the proxy broke while the behaviour was correct.)
+        let frames: Vec<u64> = st.checkpoint_ring.list().iter().map(|r| r.frame).collect();
+        let cad = checkpoint_capture_every_frames();
+        for w in frames.windows(2) {
+            assert_eq!(
+                w[1] - w[0],
+                cad,
+                "auto-captures must be exactly one cadence apart: {frames:?} at cadence {cad}"
+            );
+        }
         // Spec 769.5a — EVERY auto-anchor (framebuffer-OMITTED) now has a stored
         // thumbnail: the thumb store has one entry per live ring ref (the bug was
         // ~4-of-~70). 96×68, real picture.

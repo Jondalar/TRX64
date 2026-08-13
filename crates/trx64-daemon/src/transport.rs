@@ -227,7 +227,11 @@ pub fn key_verb(f: u8, running: bool) -> Option<&'static str> {
     match f {
         9 => Some("frame -1"),
         10 => Some("play back"),
-        11 => Some(if running { "pause" } else { "play fwd" }),
+        // F11 while running is the COCKPIT pause (`/pause`), which stops the machine —
+        // NOT the transport `pause` verb, which only stops playback. They are different
+        // things with the same word, and wiring the key to the wrong one made F11 look
+        // dead: the log said "paused", the machine kept running.
+        11 => Some(if running { "/pause" } else { "play fwd" }),
         12 => Some("frame +1"),
         _ => None,
     }
@@ -250,8 +254,12 @@ mod key_tests {
     }
 
     #[test]
-    fn f11_is_pause_while_running_and_play_otherwise() {
-        assert_eq!(key_verb(11, true), Some("pause"));
+    fn f11_is_the_machine_pause_while_running_and_play_otherwise() {
+        // `/pause` (cockpit: stop the machine), NOT `pause` (transport: stop playback).
+        // The transport verb leaves the machine running, which is what made F11 appear
+        // to do nothing at all.
+        assert_eq!(key_verb(11, true), Some("/pause"));
+        assert_ne!(key_verb(11, true), Some("pause"), "the transport pause is not a machine pause");
         assert_eq!(key_verb(11, false), Some("play fwd"));
     }
 

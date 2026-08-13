@@ -184,7 +184,11 @@ impl App {
         if let Some(w) = &self.window {
             w.request_redraw();
         }
-        eprintln!("[trx64-cli] emulator window open — play here, debug in the cockpit.");
+        // SILENT. The emulator window shares a terminal with the TUI, and the TUI OWNS
+        // that terminal — it draws boxes at absolute positions. Anything printed to
+        // stderr from here lands inside those boxes and stays until a full repaint: the
+        // "RUNNING[trx64-cli] emulator window clos..." smeared across the MACHINE panel
+        // was exactly this. The cockpit already says the window is open.
     }
 
     fn render(&mut self) {
@@ -289,10 +293,10 @@ impl App {
                     if let Some(line) =
                         trx64_daemon::transport::key_verb(f, self.engine.is_running())
                     {
-                        let r = self.engine.exec_line(line);
-                        if !r.output.is_empty() {
-                            eprintln!("[F{f}] {}", r.output.trim());
-                        }
+                        // SILENT for the same reason: the verb's output already reaches
+                        // the cockpit log, and echoing it here painted "[F10] REPLAY
+                        // frame 1/20" straight through the CPU and VIC boxes.
+                        let _ = self.engine.exec_line(line);
                     }
                 }
                 return; // never reaches the C64 matrix
@@ -418,7 +422,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.surface = None;
                 self.window = None;
                 el.set_control_flow(ControlFlow::Wait);
-                eprintln!("[trx64-cli] emulator window closed — cockpit still running.");
+                // SILENT — the cockpit's own status already reflects the closed window.
             }
             WindowEvent::RedrawRequested => {
                 self.render();
