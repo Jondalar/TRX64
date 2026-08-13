@@ -210,6 +210,60 @@ pub fn status_json(t: &Transport, pos: Option<&Position>, seconds_behind: f64) -
     })
 }
 
+
+/// Spec 808 §4 — the ONE key map. F9..F12 → the monitor verb they run.
+///
+/// This exists as a shared function because the two front-ends have separate key paths
+/// — winit in `trx64-cli/src/window.rs`, crossterm in `trx64-cli/src/tui.rs` — and the
+/// whole point of a host hotkey is that it does the same thing wherever the focus
+/// happens to be. When the mapping lived in both places, moving pause from F10 to F11
+/// updated the terminal and left the emulator window still pausing on F10. One table,
+/// two callers, and that class of drift is gone rather than merely fixed once.
+///
+/// `running` only matters for F11, the one key whose meaning depends on where you are:
+/// running → pause, otherwise → play forward (which at the head is just "run on", the
+/// old freeze/resume behaviour under a new name).
+pub fn key_verb(f: u8, running: bool) -> Option<&'static str> {
+    match f {
+        9 => Some("frame -1"),
+        10 => Some("play back"),
+        11 => Some(if running { "pause" } else { "play fwd" }),
+        12 => Some("frame +1"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::key_verb;
+
+    #[test]
+    fn the_four_host_keys_map_and_nothing_else_does() {
+        assert_eq!(key_verb(9, false), Some("frame -1"));
+        assert_eq!(key_verb(10, false), Some("play back"));
+        assert_eq!(key_verb(12, false), Some("frame +1"));
+        // F1..F8 belong to the emulated machine and must never be intercepted.
+        for f in 1..=8u8 {
+            assert_eq!(key_verb(f, false), None, "F{f} is a C64 key");
+        }
+        assert_eq!(key_verb(13, false), None);
+    }
+
+    #[test]
+    fn f11_is_pause_while_running_and_play_otherwise() {
+        assert_eq!(key_verb(11, true), Some("pause"));
+        assert_eq!(key_verb(11, false), Some("play fwd"));
+    }
+
+    #[test]
+    fn f10_is_no_longer_pause() {
+        // The regression this table exists for: 808 moved pause to F11, and the
+        // emulator window kept pausing on F10 because it had its own copy.
+        assert_ne!(key_verb(10, true), Some("pause"));
+        assert_ne!(key_verb(10, false), Some("pause"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

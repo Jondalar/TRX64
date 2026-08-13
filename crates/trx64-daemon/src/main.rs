@@ -8178,6 +8178,32 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                     }),
                 );
             }
+            // Spec 808 — and the SAME reasoning for the per-frame background work: the
+            // daemon's stream loop calls `stream_maybe_autocapture`, but the in-process
+            // CLI cockpit pumps here instead, so under `trx64cli` the checkpoint ring
+            // never filled at all and every transport verb answered "the ring is empty".
+            // Whoever pumps the machine also feeds the ring; there is no third place
+            // that could.
+            {
+                // The daemon's stream loop hosts the per-frame background work
+                // (streaming.rs ~397): cart write-back, disk write-back, the checkpoint
+                // ring, the recorder feed. The in-process `trx64cli` cockpit does NOT
+                // run that loop — it pumps here — so under the CLI NONE of it happened:
+                // the ring stayed empty (every transport verb said so), and a game that
+                // saved to its cart or disk never reached the host file. Same root
+                // cause, three symptoms, found in one session.
+                //
+                // Whoever pumps the machine owns the frame, and the frame includes this
+                // work. Both hosts now call the same four helpers; there is no third
+                // place a future host could forget.
+                let now = now_ms();
+                stream_maybe_autopersist_cart(&mut st, now);
+                stream_maybe_autopersist_disk(&mut st, now);
+                let frame_no = st.ctrl_frame;
+                let (w, h, indices) = st.session.machine.render_canvas_indices();
+                stream_maybe_autocapture(&mut st, frame_no, w, h, &indices);
+                stream_maybe_feed_recorder(&mut st, frame_no);
+            }
             let cycles = req
                 .params
                 .get("cycles")
@@ -14418,11 +14444,10 @@ fn capture_live_checkpoint(session: &mut Session) -> Value {
 /// describes itself differently depending on which key you pressed is the same class of
 /// confusion §5 is about.
 fn transport_reply(status: &Value) -> String {
-    format!(
-        "{}\n{}",
-        status["line"].as_str().unwrap_or(""),
-        transport::KEY_LEGEND
-    )
+    // ONE line. The legend belongs on `rewind` and on entering the transport, not on
+    // every keypress — F9 held down printed two lines per frame and buried the log it
+    // was supposed to sit next to.
+    status["line"].as_str().unwrap_or("").to_string()
 }
 
 // ── Spec 808 — rewind transport operations ─────────────────────────────────────
@@ -14505,7 +14530,9 @@ fn transport_move_to(st: &mut State, index: usize) -> Result<Value, String> {
 fn transport_step(st: &mut State, delta: i64) -> Result<Value, String> {
     let ids = transport_anchor_ids(st);
     let pos = transport::locate(&ids, st.transport.cursor.as_deref()).ok_or_else(|| {
-        "transport: no position — the ring is empty or the anchor was evicted".to_string()
+        "transport: no anchors yet — the ring fills while the machine RUNS \
+         (`cadence 1` = one per frame; `rewind` shows the count)"
+            .to_string()
     })?;
     let (next, hit_end) = transport::step_index(pos.index, delta, pos.total);
     let mut out = transport_move_to(st, next)?;
@@ -14563,7 +14590,9 @@ fn transport_goto(st: &mut State, target: &str) -> Result<Value, String> {
 fn transport_play(st: &mut State, dir: transport::Direction, speed: u32) -> Result<Value, String> {
     let ids = transport_anchor_ids(st);
     if ids.is_empty() {
-        return Err("transport: the checkpoint ring is empty — nothing to play".into());
+        return Err("transport: no anchors yet — let the machine run first \
+                    (`cadence 1` captures one per frame; `rewind` shows the count)"
+            .into());
     }
     st.transport.speed = speed.clamp(1, 16);
     // Playing forward FROM the head is just running: hand the machine back rather than
@@ -17188,6 +17217,35 @@ mod batch1_tests {
         // (Whether the CPU then executes anything is this fixture's business, not the
         // transport's: make_state() has no ROMs, so `c64Cycles` reports the budget and
         // the clock does not move. The contract under test is the handover.)
+    }
+
+    /// The pump path must do the SAME per-frame work as the stream loop. Three bugs in
+    /// one session came from it not doing so: the checkpoint ring stayed empty under
+    /// `trx64cli` (so every transport verb answered "no anchors"), and a cart or disk
+    /// the game wrote never reached the host file. The daemon's stream loop had all
+    /// four helpers; the CLI cockpit pumps through `session/run` and had none.
+    #[test]
+    fn the_pump_path_does_the_same_per_frame_work_as_the_stream_loop() {
+        let st = make_state();
+        // One anchor per pumped frame, so a handful of pumps must fill the ring.
+        mon(&st, "cadence 1").expect("cadence 1");
+        assert_eq!(st.lock().unwrap().checkpoint_ring.list().len(), 0, "starts empty");
+
+        for _ in 0..5 {
+            call(&st, "session/run", json!({ "cycles": 19_656 }));
+        }
+        let n = st.lock().unwrap().checkpoint_ring.list().len();
+        assert!(
+            n >= 5,
+            "pumping must FEED the ring — got {n} anchors after 5 frames. An empty ring \
+             here is the bug that made every transport verb say 'no anchors yet' under \
+             the in-process cockpit."
+        );
+
+        // And the transport works off what the pump captured, with no stream loop in
+        // sight — which is the whole point of the parity requirement.
+        let out = mon(&st, "frame -2").expect("step back");
+        assert!(out.contains("REPLAY"), "{out}");
     }
 
     /// G2 — parity. Every transport action reachable as a monitor verb is reachable over

@@ -390,24 +390,13 @@ fn run_loop(term: &mut Term, engine: &Engine, to_main: &Sender<UiToMain>) -> io:
                     // terminals, and a control that silently does nothing on someone's
                     // setup is worse than a verb they have to type.
                     if let XKeyCode::F(n @ (9 | 10 | 11 | 12)) = key.code {
-                        let line = match n {
-                            9 => "frame -1".to_string(),
-                            10 => "play back".to_string(),
-                            12 => "frame +1".to_string(),
-                            // F11 is the one key whose meaning depends on where you are:
-                            // playing -> pause, paused/rewound -> play forward, and at the
-                            // head with nothing to replay it is the old freeze/resume.
-                            _ => {
-                                if engine.is_running() {
-                                    "pause".to_string()
-                                } else {
-                                    "play fwd".to_string()
-                                }
+                        if let Some(line) =
+                            trx64_daemon::transport::key_verb(n as u8, engine.is_running())
+                        {
+                            let r = engine.exec_line(line);
+                            if !r.output.is_empty() {
+                                cp.push_log(&r.output);
                             }
-                        };
-                        let r = engine.exec_line(&line);
-                        if !r.output.is_empty() {
-                            cp.push_log(&r.output);
                         }
                         continue;
                     }

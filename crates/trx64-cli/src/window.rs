@@ -259,18 +259,40 @@ impl App {
             return;
         }
 
-        // HOST HOTKEYS — F9..F12. The C64 keyboard has F1..F8 only (F2/F4/F6/F8 being
-        // SHIFT+F1/F3/F5/F7), so these four physical keys cannot collide with anything
-        // the emulated machine can see. F10 freezes/resumes: the one control you want
-        // without taking your hands off the game, and the reason it is a key at all
-        // rather than only a monitor verb.
+        // HOST HOTKEYS — F9..F12 are the rewind transport (Spec 808 §4). The C64
+        // keyboard has F1..F8 only (F2/F4/F6/F8 being SHIFT+F1/F3/F5/F7), so these four
+        // physical keys cannot collide with anything the emulated machine can see.
+        //
+        //   F9  ◀|   one frame back      F11 ⏸/▶  pause / play
+        //   F10 ◀◀   play backwards      F12 |▶   one frame forward
+        //
+        // These are the controls you want without taking your hands off the game, which
+        // is why they are keys at all and not only monitor verbs.
+        //
+        // The SAME mapping lives in `tui.rs` — deliberately, not by accident: the two
+        // surfaces have separate key paths (winit here, crossterm there) and the whole
+        // point of a host hotkey is that it does the same thing wherever the focus
+        // happens to be. Changing one without the other is how F10 kept pausing after
+        // 808 moved pause to F11.
         if let PhysicalKey::Code(code) = event.physical_key {
-            if matches!(code, KeyCode::F10) {
+            if matches!(
+                code,
+                KeyCode::F9 | KeyCode::F10 | KeyCode::F11 | KeyCode::F12
+            ) {
                 if pressed {
-                    let running = self.engine.is_running();
-                    let r = self.engine.exec_line(if running { "/pause" } else { "/run" });
-                    if !r.output.is_empty() {
-                        eprintln!("[F10] {}", r.output.trim());
+                    let f = match code {
+                        KeyCode::F9 => 9u8,
+                        KeyCode::F10 => 10,
+                        KeyCode::F11 => 11,
+                        _ => 12,
+                    };
+                    if let Some(line) =
+                        trx64_daemon::transport::key_verb(f, self.engine.is_running())
+                    {
+                        let r = self.engine.exec_line(line);
+                        if !r.output.is_empty() {
+                            eprintln!("[F{f}] {}", r.output.trim());
+                        }
                     }
                 }
                 return; // never reaches the C64 matrix

@@ -48,6 +48,12 @@ pub fn resid_construct_count() -> u64 {
 // live inside the `daemon` module. Re-export them at the lib root so `crate::X`
 // resolves identically in both compilation contexts. Crate-internal only — NOT part
 // of the public FFI surface.
+/// Spec 808 — the rewind transport's shared pieces, PUBLIC because `trx64-cli` needs
+/// the one key table: the terminal (crossterm) and the emulator window (winit) have
+/// separate key paths, and a second copy of the mapping is how F10 kept pausing after
+/// pause moved to F11.
+pub use daemon::transport;
+
 pub(crate) use daemon::{
     maybe_autopause_capped_run, now_iso8601_utc, set_control_owner, stream_debug_gated_advance,
     stream_maybe_autocapture, stream_maybe_autopersist_cart, stream_maybe_autopersist_disk,
