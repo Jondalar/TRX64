@@ -5480,11 +5480,9 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             // Say how much rewind is ACTUALLY there, in seconds, next to how much was
             // configured. "500 anchors" and "10s window" are settings; the first number
             // is the only one that answers "how far back can I go right now".
-            let have = ids.len() as f64 * st.checkpoint_cadence_frames.max(1) as f64 / 50.0;
+            lines.push(transport_range_line(st));
             lines.push(format!(
-                "  {:.1}s of rewind available  ({} anchors, cap {})   cadence every {} frame(s), window {:.1}s",
-                have,
-                ids.len(),
+                "  cap {} anchors   cadence every {} frame(s)   window {:.1}s",
                 st.checkpoint_ring.max_entries(),
                 st.checkpoint_cadence_frames.max(1),
                 st.checkpoint_window_seconds
@@ -14653,14 +14651,15 @@ fn transport_step(st: &mut State, delta: i64) -> Result<Value, String> {
     let (next, hit_end) = transport::step_index(pos.index, delta, pos.total);
     let mut out = transport_move_to(st, next)?;
     if hit_end {
-        // Say so. A transport that quietly refuses to move looks identical to one that
-        // moved and landed on an identical frame.
+        // Say so, with the numbers. A transport that quietly refuses to move looks
+        // identical to one that moved and landed on an identical frame — and "it does
+        // not reach the bottom of the buffer" is exactly the complaint those two produce.
         st.transport.playing = None;
         out["hitEnd"] = json!(true);
         out["line"] = json!(format!(
-            "{}   (end of the ring — {} anchors held)",
+            "{}   (END OF BUFFER)\n{}",
             out["line"].as_str().unwrap_or(""),
-            pos.total
+            transport_range_line(st)
         ));
     }
     Ok(out)
@@ -14750,11 +14749,45 @@ fn transport_play(st: &mut State, dir: transport::Direction, speed: u32) -> Resu
     Ok(out)
 }
 
+/// The buffer, in facts: which cycle it starts at, which it ends at, how much that is
+/// in seconds, and where the cursor sits inside it.
+///
+/// Added because three rounds of "it does not go back far enough" were argued from
+/// inference on both sides. Two numbers and a span settle it; a description does not.
+fn transport_range_line(st: &State) -> String {
+    let ids = transport_anchor_ids(st);
+    if ids.is_empty() {
+        return "  buffer: empty".to_string();
+    }
+    let first = ids[0].2;
+    let last = ids[ids.len() - 1].2;
+    let span = last.saturating_sub(first);
+    let secs = span as f64 / TRANSPORT_PAL_HZ;
+    let live = st.session.machine.c64_core.clk;
+    let pos = transport::locate(&ids, st.transport.cursor.as_deref());
+    let at = pos
+        .as_ref()
+        .map(|p| format!("cyc {} (frame {}/{})", p.cycles, p.index + 1, p.total))
+        .unwrap_or_else(|| format!("cyc {live} (live head)"));
+    format!(
+        "  buffer: cyc {first} \u{2192} {last}   span {span} cyc = {secs:.2}s over {} anchors\n           at: {at}   machine now: cyc {live}",
+        ids.len()
+    )
+}
+
 /// Stop where we are. Not a restore: the machine is ALREADY on this anchor (decision 2),
 /// which is why "pause and inspect" needs no second step.
 fn transport_pause(st: &mut State) -> Value {
     st.transport.playing = None;
-    transport_status(st)
+    let mut out = transport_status(st);
+    // Pause is where you look at the numbers, so pause is where they are printed.
+    out["line"] = json!(format!(
+        "{}\n{}",
+        out["line"].as_str().unwrap_or(""),
+        transport_range_line(st)
+    ));
+    out["range"] = json!(transport_range_line(st));
+    out
 }
 
 /// One transport tick, called by the stream loop per frame while playing. Returns true

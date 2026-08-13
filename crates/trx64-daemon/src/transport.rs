@@ -180,14 +180,13 @@ pub fn status_line(t: &Transport, pos: Option<&Position>, seconds_behind: f64) -
             } else {
                 format!("-{seconds_behind:.1}s")
             };
-            let filled = if p.total <= 1 {
-                30
-            } else {
-                (p.index * 30 / (p.total - 1)).min(30)
-            };
-            let bar: String = "\u{2593}".repeat(filled) + &"\u{2591}".repeat(30 - filled);
+            // No progress bar. It was drawn with U+2593/U+2591 (shaded blocks), which a
+            // lot of terminal fonts render as the SAME solid block — so it arrived as an
+            // anonymous grey rectangle in the log rather than as a gauge. `frame n/total`
+            // already says the position, and the TUI can draw a real gauge in a panel
+            // where it has geometry to work with. A one-line log entry does not.
             let mut s = format!(
-                "{:<7} {}  frame {}/{}   {when}   {bar}",
+                "{:<7} {}  frame {}/{}   {when}",
                 mode.as_str(),
                 mode.glyph(),
                 p.index + 1,
