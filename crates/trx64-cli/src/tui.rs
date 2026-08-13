@@ -917,10 +917,17 @@ fn draw_gauges(f: &mut Frame, area: Rect, s: &StateSnapshot) {
     f.render_widget(panel(cpu, "CPU"), cols[0]);
 
     // MACHINE panel
-    let (run_label, run_color) = if s.running {
-        ("● RUNNING", Color::Green)
-    } else {
-        ("■ PAUSED", Color::Red)
+    // Spec 808 — the header names the ACTION, not just the run flag. A user who presses
+    // F10 expects to read REWIND; "PAUSED" is true (the machine is not advancing) and
+    // answers a question nobody asked. The transport's own mode wins whenever it is
+    // doing something; RUNNING/PAUSED is what is left when it is not.
+    let (run_label, run_color) = match s.transport_mode.as_deref() {
+        Some("REPLAY") => ("\u{25c0}\u{25c0} REWIND", Color::Cyan),
+        Some("STEP \u{25c0}") => ("\u{25c0}| STEP BACK", Color::Cyan),
+        Some("STEP \u{25b6}") => ("|\u{25b6} STEP FWD", Color::Cyan),
+        Some("CUT") => ("\u{2702} CUT", Color::Yellow),
+        _ if s.running => ("\u{25b6} PLAY", Color::Green),
+        _ => ("\u{23f8} PAUSE", Color::Red),
     };
     let warp_label = if s.warp { "WARP 8×" } else { "PAL 1×" };
     let machine = vec![

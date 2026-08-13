@@ -710,6 +710,11 @@ pub struct StateSnapshot {
     pub irq_vec: u16,
     pub nmi_vec: u16,
     pub stop_reason: Option<String>,
+    /// Spec 808 — what the transport is doing, for the MACHINE header. The user presses
+    /// a key and expects the header to name that key's action: PLAY, PAUSE, REWIND,
+    /// STEP. "PAUSED" alone answered a different question.
+    pub transport_mode: Option<String>,
+    pub transport_line: Option<String>,
 }
 
 impl StateSnapshot {
@@ -727,6 +732,16 @@ impl StateSnapshot {
         StateSnapshot {
             running,
             warp,
+            transport_mode: v
+                .get("transport")
+                .and_then(|t| t.get("mode"))
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string()),
+            transport_line: v
+                .get("transport")
+                .and_then(|t| t.get("line"))
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string()),
             c64_cycles: u(&["c64Cycles"]),
             drive_cycles: u(&["driveCycles"]),
             pc: u(&["cpu", "pc"]) as u16,

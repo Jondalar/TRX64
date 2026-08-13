@@ -32,6 +32,11 @@ pub enum TransportMode {
     /// An intervention truncated the future at the cursor. Sticky until the next
     /// transport move, so the user actually sees it happened.
     Cut,
+    /// A single-step landed here (F9/F12). Distinct from Replay so the header can say
+    /// STEP rather than the mode it happens to share machinery with — the user pressed
+    /// a step key and expects the display to acknowledge that key.
+    StepBack,
+    StepFwd,
 }
 
 impl TransportMode {
@@ -40,6 +45,8 @@ impl TransportMode {
             TransportMode::Replay => "REPLAY",
             TransportMode::Live => "LIVE",
             TransportMode::Cut => "CUT",
+            TransportMode::StepBack => "STEP \u{25c0}",
+            TransportMode::StepFwd => "STEP \u{25b6}",
         }
     }
     /// The glyph the TUI line and the UI ribbon both show.
@@ -48,6 +55,8 @@ impl TransportMode {
             TransportMode::Replay => "\u{25c0}\u{25c0}",
             TransportMode::Live => "\u{25b6}",
             TransportMode::Cut => "\u{25b6}",
+            TransportMode::StepBack => "\u{25c0}|",
+            TransportMode::StepFwd => "|\u{25b6}",
         }
     }
 }
@@ -81,6 +90,15 @@ pub struct Transport {
     pub mode: TransportMode,
     /// How many anchors the last truncation dropped (0 when nothing was cut).
     pub last_cut: u64,
+    /// Spec 808 — cycle budget carried over between ticks, so playback runs at
+    /// WALL-CLOCK speed instead of one step per pump call.
+    ///
+    /// The pump does not tick at 50 Hz; it ticks as often as the host loop comes round
+    /// and passes the cycles for the real time elapsed. Stepping once per call made
+    /// `play back` chew through a 10-second ring in one or two seconds — the counter
+    /// visibly ran backwards, just far too fast to watch. Accumulating the budget and
+    /// stepping once per PAL frame's worth makes 1× actually mean 1×.
+    pub pending_cycles: u64,
 }
 
 impl Default for Transport {
@@ -91,6 +109,7 @@ impl Default for Transport {
             speed: 1,
             mode: TransportMode::Live,
             last_cut: 0,
+            pending_cycles: 0,
         }
     }
 }
@@ -358,6 +377,7 @@ mod tests {
             speed: 1,
             mode: TransportMode::Cut,
             last_cut: 159,
+            pending_cycles: 0,
         };
         let pos = locate(&l, t.cursor.as_deref()).unwrap();
         let line = status_line(&t, Some(&pos), 3.2);
@@ -375,6 +395,7 @@ mod tests {
             speed: 2,
             mode: TransportMode::Replay,
             last_cut: 0,
+            pending_cycles: 0,
         };
         let pos = locate(&l, t.cursor.as_deref()).unwrap();
         let j = status_json(&t, Some(&pos), 3.2);

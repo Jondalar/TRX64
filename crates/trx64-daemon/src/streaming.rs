@@ -457,7 +457,7 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
             // it does, emulation must NOT advance: the transport is placing the machine
             // on an anchor itself (a real restore, 177 us), and advancing on top of that
             // would be the divergence decision 4 says only an INTERVENTION may cause.
-            let d_cycles = if crate::transport_tick(&mut st) {
+            let d_cycles = if crate::transport_tick(&mut st, budget) {
                 0
             } else {
                 crate::stream_debug_gated_advance(&mut st, budget)
