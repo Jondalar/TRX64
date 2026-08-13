@@ -417,6 +417,15 @@ pub struct State {
     play_intent: bool,
     /// Spec 808 rebuild — daemon-owned pacing (8× budget per tick). Was a client atomic.
     warp: bool,
+    /// Spec 808 — AUDIO EPOCH. Bumped by every op that makes the machine's clock
+    /// discontinuous: power, reset, a checkpoint restore, any transport move, pause and
+    /// play. Clients watch it and drop their reSID queue when it changes.
+    ///
+    /// It lives here for the same reason everything else does: the client must not have
+    /// to know WHICH verbs break audio continuity. That list grows (the transport added
+    /// four), a second front-end would have to learn it independently, and a missed entry
+    /// is silent — you just hear the old sound play over the new position.
+    audio_epoch: u64,
     /// Spec 807 §4.6 — the LIVE capture cadence, in stream-loop frames. Seeded from
     /// `C64RE_CHECKPOINT_CADENCE_FRAMES` (default 25) and changed at runtime by the
     /// `cadence` monitor verb, which retunes the ring's entry cap in the same call.
@@ -8421,6 +8430,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 "c64Cycles": machine.clk,
                 "transport": transport_status(&st),
                 "warp": st.warp,
+                "audioEpoch": st.audio_epoch,
                 "driveCycles": machine.drive8.drive_clk,
                 "mode": "true-drive",
                 "runState": run_state,
@@ -8742,6 +8752,8 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
         //   soft → warm_reset ($FCE2, RAM + media preserved, I/O chips reset)
         //   cold → power_off → power_on (fresh full init; inserted media kept)
         "session/reset" => {
+            // A reset restarts the machine: the queued audio is from before it.
+            state.lock().unwrap().audio_epoch += 1;
             let mode = req.params.get("mode").and_then(|v| v.as_str()).unwrap_or("cold");
             let mut st = state.lock().unwrap();
             let out_mode = if mode == "soft" { "soft" } else { "cold" };
@@ -8784,6 +8796,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             match op {
                 "on" => {
                     do_power_on(&mut st);
+                    st.audio_epoch = st.audio_epoch.wrapping_add(1);
                     // Powering on RUNS the machine, and a fresh machine has no past —
                     // the ring's anchors describe one that no longer exists.
                     st.play_intent = true;
@@ -8791,6 +8804,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 }
                 "off" => {
                     do_power_off(&mut st);
+                    st.audio_epoch = st.audio_epoch.wrapping_add(1);
                     st.play_intent = false;
                     transport_discard_timeline(&mut st, "power off");
                 }
@@ -12277,12 +12291,18 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             // 1. The transport owns the frame while it is rewound or playing back.
             if transport_tick(&mut st, budget) {
                 let v = transport_status(&st);
-                return Response::ok(id, json!({ "c64Cycles": 0, "transport": v, "running": false }));
+                return Response::ok(id, json!({
+                    "c64Cycles": 0, "transport": v, "running": false,
+                    "audioEpoch": st.audio_epoch,
+                }));
             }
             // 2. Otherwise the machine advances — but only if someone asked it to.
             if !st.play_intent || budget == 0 {
                 let v = transport_status(&st);
-                return Response::ok(id, json!({ "c64Cycles": 0, "transport": v, "running": false }));
+                return Response::ok(id, json!({
+                    "c64Cycles": 0, "transport": v, "running": false,
+                    "audioEpoch": st.audio_epoch,
+                }));
             }
             {
                 let now = now_ms();
@@ -12306,6 +12326,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 "transport": v,
                 "running": st.play_intent,
                 "cycles": st.session.machine.c64_core.clk,
+                "audioEpoch": st.audio_epoch,
             }))
         }
 
@@ -12315,6 +12336,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             let mut st = state.lock().unwrap();
             st.play_intent = true;
             st.ctrl_stop = None;
+            st.audio_epoch = st.audio_epoch.wrapping_add(1);
             // Playing forward from a rewound position is a transport move, not a jump to
             // the head: the anchors ahead are replayed first (Spec 808 decision 4).
             if st.transport.holds_the_machine() {
@@ -12331,6 +12353,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             let mut st = state.lock().unwrap();
             st.play_intent = false;
             st.transport.playing = None;
+            st.audio_epoch = st.audio_epoch.wrapping_add(1);
             let pc = st.session.machine.c64_core.reg_pc;
             let cycles = st.session.machine.clk;
             st.ctrl_stop = Some(CtrlStop { reason: "pause", pc, cycles });
@@ -12355,6 +12378,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
         "transport/toggle" => {
             let mut st = state.lock().unwrap();
             let playing = st.play_intent || st.transport.playing.is_some();
+            st.audio_epoch = st.audio_epoch.wrapping_add(1);
             let out = if playing {
                 st.play_intent = false;
                 st.transport.playing = None;
@@ -14805,6 +14829,8 @@ fn transport_move_to(st: &mut State, index: usize) -> Result<Value, String> {
         .restore_snapshot(&id)
         .ok_or_else(|| format!("transport: anchor {id} is gone (evicted)"))?;
     restore_live_checkpoint(&mut st.session, &cp)?;
+    // The clock just jumped; whatever is queued belongs to a time we left.
+    st.audio_epoch = st.audio_epoch.wrapping_add(1);
 
     // Spec 808 — REGENERATE THE PICTURE.
     //
@@ -15108,6 +15134,7 @@ pub(crate) fn transport_tick(st: &mut State, budget_cycles: u64) -> bool {
 /// would put back a pre-reset state and make the reset look like it never happened.
 /// So those clear the ring outright rather than truncating it.
 pub(crate) fn transport_discard_timeline(st: &mut State, why: &str) {
+    st.audio_epoch = st.audio_epoch.wrapping_add(1);
     let had = st.checkpoint_ring.list().len() as u64;
     st.checkpoint_ring.clear();
     st.transport = transport::Transport::default();
@@ -16502,6 +16529,7 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         autocapture_cycles_since: 0,
         play_intent: false,
         warp: false,
+        audio_epoch: 0,
         recorder_frames_since: 0,
         candidates: std::collections::HashMap::new(),
         candidate_seq: 0,
@@ -17068,6 +17096,7 @@ mod batch1_tests {
             autocapture_cycles_since: 0,
             play_intent: false,
             warp: false,
+            audio_epoch: 0,
             recorder_frames_since: 0,
         candidates: std::collections::HashMap::new(),
         candidate_seq: 0,
@@ -17953,6 +17982,48 @@ mod batch1_tests {
             "1200 pumped frames must all be held under a 3000 cap — got {held}, which \
              means a bound other than the cap is evicting"
         );
+    }
+
+    /// Every clock discontinuity must bump the AUDIO EPOCH, or the reSID queue plays
+    /// sound from a time the machine has left — the doubled audio on resume. The list of
+    /// such ops grows (the transport added four), so it is asserted rather than trusted,
+    /// and it is asserted HERE because a client must never have to keep that list.
+    #[test]
+    fn every_clock_discontinuity_bumps_the_audio_epoch() {
+        let st = make_state();
+        call(&st, "session/power", json!({ "op": "on" }));
+        for _ in 0..8 {
+            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+        }
+        let epoch = |st: &SharedState| -> u64 {
+            call(st, "session/state", json!({}))["audioEpoch"].as_u64().unwrap()
+        };
+
+        let mut last = epoch(&st);
+        for (label, run) in [
+            ("pause", 0u8),
+            ("play", 1),
+            ("toggle", 2),
+            ("step back", 3),
+            ("reset", 4),
+            ("power off", 5),
+        ] {
+            match run {
+                0 => { call(&st, "session/pause", json!({})); }
+                1 => { call(&st, "session/play", json!({})); }
+                2 => { call(&st, "transport/toggle", json!({})); }
+                3 => { let _ = mon(&st, "frame -1"); }
+                4 => { call(&st, "session/reset", json!({ "mode": "warm" })); }
+                _ => { call(&st, "session/power", json!({ "op": "off" })); }
+            }
+            let now = epoch(&st);
+            assert!(
+                now != last,
+                "`{label}` makes the clock discontinuous and must bump the audio epoch \
+                 (stayed at {last}) — otherwise the queue plays the old position"
+            );
+            last = now;
+        }
     }
 
     /// G2 — parity. Every transport action reachable as a monitor verb is reachable over

@@ -151,7 +151,17 @@ impl Engine {
         // `transport_playing` flag, plus a reconciliation hack for when they disagreed.
         // Every 808 state bug lived in that seam.
         match self.rpc("session/tick", json!({ "cycles": base_cycles })) {
-            Ok(v) => v.get("c64Cycles").and_then(|c| c.as_u64()).unwrap_or(0),
+            Ok(v) => {
+                // Follow the daemon's audio epoch every tick. This is how power, reset
+                // and a CRT mount reach the audio path without the client knowing they
+                // are audio-relevant.
+                if let Some(e) = v.get("audioEpoch").and_then(|e| e.as_u64()) {
+                    if e != self.epoch.load(Ordering::SeqCst) {
+                        self.epoch.store(e, Ordering::SeqCst);
+                    }
+                }
+                v.get("c64Cycles").and_then(|c| c.as_u64()).unwrap_or(0)
+            }
             Err(_) => 0,
         }
     }
@@ -521,13 +531,29 @@ impl Engine {
         r
     }
 
-    /// A transport move jumps the machine's clock, forwards or backwards. The audio
-    /// pipeline is a queue filled from that clock, so whatever is already queued belongs
-    /// to a time we just left — playing it produces the doubled sound on resume.
-    /// `bump_epoch` is the existing signal the window's audio path uses to drop its queue
-    /// and re-sync (the same one a reset uses; a rewind is at least as violent).
+    /// The audio queue is filled from the machine's clock, so any op that makes that
+    /// clock discontinuous — power, reset, a restore, a transport move, pause, play —
+    /// leaves queued sound belonging to a time we left. That is what the doubled audio
+    /// on resume was.
+    ///
+    /// The client does NOT keep the list of which verbs those are. The DAEMON bumps an
+    /// `audioEpoch` and this follows it: the list grows (the transport added four), a
+    /// second front-end would have to learn it independently, and a missed entry is
+    /// silent — you simply hear the old sound over the new position.
+    fn follow_daemon_audio_epoch(&self) {
+        let daemon = self
+            .rpc("session/state", json!({}))
+            .ok()
+            .and_then(|v| v.get("audioEpoch").and_then(|e| e.as_u64()))
+            .unwrap_or(0);
+        if daemon != self.epoch.load(Ordering::SeqCst) {
+            self.epoch.store(daemon, Ordering::SeqCst);
+        }
+    }
+
+    /// Kept as the name the transport paths call; it now just follows the daemon.
     fn resync_after_transport_move(&self) {
-        self.bump_epoch();
+        self.follow_daemon_audio_epoch();
     }
 
     fn verb_monitor(&self, command: &str) -> CmdResult {
