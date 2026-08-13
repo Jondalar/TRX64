@@ -395,6 +395,15 @@ pub struct State {
     /// filmstrip/scrub depends on a populated ring; without this loop it is sparse.
     /// Skipped while a mounted medium is dirty + non-persistable (Spec 709.13).
     autocapture_frames_since: u64,
+    /// Spec 807 §4.6 — the LIVE capture cadence, in stream-loop frames. Seeded from
+    /// `C64RE_CHECKPOINT_CADENCE_FRAMES` (default 25) and changed at runtime by the
+    /// `cadence` monitor verb, which retunes the ring's entry cap in the same call.
+    /// Before this field the cadence was re-read from the env on every frame while the
+    /// cap was fixed at start-up, so the two could not stay consistent.
+    checkpoint_cadence_frames: u64,
+    /// Spec 807 §4.6 — the ring's retention window in seconds (the scrub window).
+    /// Seeded from `C64RE_CHECKPOINT_RING_SECONDS` (default 10).
+    checkpoint_window_seconds: f64,
     /// Spec 766.5b (audit background-workers-async-0 + ws-checkpoint-scrub-7) —
     /// recorder auto-feed cadence: capture one CORE-ONLY (omitMedia) recorder anchor
     /// every CHECKPOINT_CAPTURE_EVERY_FRAMES stream-loop frames while a recorder is
@@ -5346,6 +5355,62 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
         // no arg, REPORT the current depth. Setting it DISCARDS current history (fresh
         // ring) — it affects capture from now on only and cannot retroactively extend
         // history. `TRX64_REVERSE_SECONDS` stays the boot default.
+        // Spec 807 §4.6 — `cadence [frames] [seconds]`: the checkpoint ring's counterpart
+        // to `revdepth`. The ring is what a rewind/scrub actually reads, and until now it
+        // had NO monitor verb at all — capture rate and window were env-only, so changing
+        // either meant restarting the daemon and losing the machine.
+        //
+        // The two settings are coupled: max_entries = ceil(seconds / (cadence/50)). Setting
+        // one without the other is the trap this verb exists to close — cadence 1 against a
+        // cap sized for cadence 25 turns a 10-second window into 0.4 s, and nothing goes
+        // red. So this always sets both.
+        "cadence" => {
+            let live = |st: &State| -> (u64, f64, u64, usize) {
+                (
+                    st.checkpoint_cadence_frames.max(1),
+                    st.checkpoint_window_seconds,
+                    st.checkpoint_ring.max_entries(),
+                    st.checkpoint_ring.list().len(),
+                )
+            };
+            let parse_num = |t: Option<&String>| -> Option<f64> {
+                t.and_then(|x| x.trim().trim_start_matches('$').parse::<f64>().ok())
+            };
+            match parse_num(toks.get(1)) {
+                None => {
+                    let (cad, secs, cap, held) = live(st);
+                    Ok(format!(
+                        "cadence: every {cad} frame(s) = {:.1} capture(s)/s, window {secs:.1}s \u{2192} cap {cap} entries ({held} held)\n                           (`cadence <frames> [seconds]` to change, e.g. `cadence 1` for a checkpoint every frame)",
+                        50.0 / cad as f64
+                    ))
+                }
+                Some(f) => {
+                    let frames = (f.max(1.0).min(3000.0)) as u64;
+                    let secs = parse_num(toks.get(2))
+                        .filter(|v| v.is_finite() && *v > 0.0)
+                        .map(|v| v.min(600.0))
+                        .unwrap_or(st.checkpoint_window_seconds);
+                    st.checkpoint_cadence_frames = frames;
+                    st.checkpoint_window_seconds = secs;
+                    let want = trx64_core::checkpoint_ring::checkpoint_ring_max_entries(secs, frames);
+                    let cap = st.checkpoint_ring.set_max_entries(want);
+                    let held = st.checkpoint_ring.list().len();
+                    let mut out = vec![format!(
+                        "cadence: every {frames} frame(s) = {:.1} capture(s)/s, window {secs:.1}s \u{2192} cap {cap} entries ({held} held)",
+                        50.0 / frames as f64
+                    )];
+                    // The honest part: say what it will cost before it costs it. ~98 KiB
+                    // resident per entry, measured (Spec 807 perf_bench).
+                    let mib = (cap as f64 * 98.0) / 1024.0;
+                    out.push(format!("  ~{mib:.0} MiB when full (~98 KiB/entry, measured)"));
+                    if frames == 1 {
+                        out.push("  every frame: this is the per-frame checkpoint the reverse-playback work needs".into());
+                    }
+                    Ok(out.join("\n"))
+                }
+            }
+        }
+
         "revdepth" => {
             let mb = |bytes: u64| (bytes as f64) / (1024.0 * 1024.0);
             match toks.get(1).and_then(|s| s.trim_start_matches('$').parse::<u64>().ok()) {
@@ -13380,7 +13445,7 @@ pub(crate) fn stream_maybe_autocapture(st: &mut State, frame: u64, canvas_w: usi
         return;
     }
     st.autocapture_frames_since = st.autocapture_frames_since.wrapping_add(1);
-    if st.autocapture_frames_since < checkpoint_capture_every_frames() {
+    if st.autocapture_frames_since < st.checkpoint_cadence_frames.max(1) {
         return;
     }
     st.autocapture_frames_since = 0;
@@ -15493,6 +15558,8 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         cart_ap_settle_at_ms: 0,
         cart_ap_done_gen: 0,
         disk_ap_pending: false,
+        checkpoint_cadence_frames: checkpoint_capture_every_frames(),
+        checkpoint_window_seconds: checkpoint_ring_seconds(),
         disk_ap_settle_at_ms: 0,
         disk_ap_seen_hash: None,
         disk_ap_done_hash: None,
@@ -16053,6 +16120,8 @@ mod batch1_tests {
             cart_ap_settle_at_ms: 0,
             cart_ap_done_gen: 0,
             disk_ap_pending: false,
+        checkpoint_cadence_frames: checkpoint_capture_every_frames(),
+        checkpoint_window_seconds: checkpoint_ring_seconds(),
             disk_ap_settle_at_ms: 0,
             disk_ap_seen_hash: None,
             disk_ap_done_hash: None,
@@ -16522,6 +16591,72 @@ mod batch1_tests {
         run_monitor(&mut g, cmd)
     }
 
+    /// Spec 807 §4.6 — `cadence` sets the capture rate AND the ring's entry cap in one
+    /// call, because setting either alone is the bug the verb exists to prevent.
+    ///
+    /// Before 807 the cadence was read from the env every frame while the cap was fixed
+    /// at daemon start, so they could not agree: cadence 1 against a cap sized for
+    /// cadence 25 turns a 10-second scrub window into 0.4 s, and nothing reports a
+    /// problem — the ring just evicts 24 of every 25 captures.
+    #[test]
+    fn cadence_moves_the_capture_rate_and_the_ring_cap_together() {
+        let st = make_state();
+        // Bare verb reports without changing anything.
+        let before = mon(&st, "cadence").expect("cadence");
+        assert!(before.starts_with("cadence: every 25 frame(s)"), "{before}");
+        let cap_before = st.lock().unwrap().checkpoint_ring.max_entries();
+        assert_eq!(cap_before, 20, "10 s at every-25-frames = 20 entries");
+
+        // Every frame: 50 captures/s over the same 10 s window = 500 entries.
+        let out = mon(&st, "cadence 1").expect("cadence 1");
+        assert!(out.contains("every 1 frame(s)"), "{out}");
+        assert!(out.contains("cap 500 entries"), "{out}");
+        {
+            let g = st.lock().unwrap();
+            assert_eq!(g.checkpoint_cadence_frames, 1, "the live cadence must follow");
+            assert_eq!(
+                g.checkpoint_ring.max_entries(),
+                500,
+                "the cap must follow the cadence IN THE SAME CALL — this is the whole point"
+            );
+        }
+
+        // A window change recomputes too, and the estimate is stated, not left to be
+        // discovered when RSS climbs.
+        let out2 = mon(&st, "cadence 1 2").expect("cadence 1 2");
+        assert!(out2.contains("cap 100 entries"), "{out2}");
+        assert!(out2.contains("MiB when full"), "must say what it costs: {out2}");
+
+        // Nonsense is clamped, never accepted.
+        let out3 = mon(&st, "cadence 0").expect("cadence 0");
+        assert!(out3.contains("every 1 frame(s)"), "0 clamps to 1: {out3}");
+    }
+
+    /// Spec 807 §4.6 — lowering the cap evicts immediately rather than waiting for the
+    /// next capture, so `cadence` cannot leave the ring over its own limit.
+    #[test]
+    fn lowering_the_cadence_cap_evicts_at_once() {
+        let st = make_state();
+        mon(&st, "cadence 1").expect("cadence 1");
+        {
+            let mut g = st.lock().unwrap();
+            for i in 0..12u64 {
+                let cp = capture_live_checkpoint(&mut g.session);
+                g.checkpoint_ring.capture(cp, i, i * 19_656).expect("capture");
+            }
+            assert_eq!(g.checkpoint_ring.list().len(), 12);
+        }
+        // 10 s at every-50-frames = 10 entries: two must go, oldest first.
+        mon(&st, "cadence 50").expect("cadence 50");
+        let g = st.lock().unwrap();
+        assert_eq!(g.checkpoint_ring.list().len(), 10, "cap must be enforced at once");
+        assert_eq!(
+            g.checkpoint_ring.list()[0].frame,
+            2,
+            "eviction is oldest-first, so frames 0 and 1 are the ones that go"
+        );
+    }
+
     #[test]
     fn write_verbs_reach_io_not_the_ram_underneath() {
         // `wr d020 00` must black the border. All three write verbs used the core's
@@ -16968,11 +17103,29 @@ mod batch1_tests {
         let cp_id = cap["ref"]["id"].as_str().unwrap().to_string();
         assert!(cp_id.starts_with("cp_"), "id is cp_<frame>_<seq>: {cp_id}");
         assert_eq!(cap["ref"]["pinned"], json!(false));
-        // byteSize = RAM (65536) + 2 framebuffers (2*162240): TRX64's
-        // capture_runtime_checkpoint always captures the present framebuffers
-        // (the c64re EXPLICIT-capture path; the auto-cadence omitFramebuffer path
-        // is not used here). = 390016.
-        assert_eq!(cap["ref"]["byteSize"], json!(390016));
+        // byteSize = the RAW buffers, charged exactly — RAM (65536) + 2 framebuffers
+        // (2*162240) = 390016 — PLUS the residual chip-state tree, which is now a
+        // measured length rather than an omission (Spec 807 §4.2/§4.5).
+        //
+        // The explicit-capture path DOES carry the framebuffers (the per-frame
+        // auto-cadence path omits them since 807 §4.1; this is not that path). What
+        // changed is that all three ride as RAW bytes instead of base64 inside a live
+        // `Value`, and the tree they used to hide in is finally charged. The old figure
+        // counted the buffers and pretended the rest of the entry was free — which is
+        // how a ring of 500 entries reported 32 MiB while holding 102.
+        //
+        // Asserted as a RANGE, not a magic constant: the residual tree's exact encoded
+        // length is not a contract, and pinning it would make every future field
+        // addition look like a regression. What IS the contract: the raw buffers are
+        // charged in full, and the tree is small.
+        const RAW_BUFFERS: u64 = 65536 + 2 * 162240;
+        let byte_size = cap["ref"]["byteSize"].as_u64().unwrap();
+        assert!(
+            byte_size > RAW_BUFFERS && byte_size < RAW_BUFFERS + 32 * 1024,
+            "byteSize {byte_size} must be the raw buffers ({RAW_BUFFERS}) plus a small \
+             residual tree — under means the tree is uncharged again, way over means it \
+             is not compact"
+        );
         assert_eq!(cap["stats"]["count"], json!(1));
         assert_eq!(cap["stats"]["slotBytes"], json!(65536));
 

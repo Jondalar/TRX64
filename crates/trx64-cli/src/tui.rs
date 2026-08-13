@@ -597,6 +597,8 @@ const MONITOR_VERBS: &[&str] = &[
     "map", "taint", "swimlane", "chis",
     // reverse-debug
     "rstep", "reverse", "whowrote", "triage", "revdepth", "diff", "ringdump", "ringload",
+    // checkpoint ring (Spec 807 §4.6)
+    "cadence",
     // knowledge
     "inspect", "xref", "sym",
 ];

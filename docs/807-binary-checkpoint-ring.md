@@ -1,6 +1,7 @@
 # Spec 807 — Binary checkpoint ring: JSON leaves the hot path
 
-**Status:** PARTLY BUILT — §4.1 shipped (167 → 64 µs, tree 530 → 98 KB). §4.2–§4.6 open.
+**Status:** BUILT — all six slices. Capture 167 → 64 µs, ring entry 208.9 → 97.7 KiB, and the
+ring now reports what it holds. One measured follow-up is named in §8.
 **Repos:** TRX64 only (`trx64-core` capture/ring, `trx64-daemon` stream loop). No C64RE-side
 work — the `.c64re` file format and every WS response stay byte-identical.
 **Number:** 807 (shared board `C64ReverseEngineeringMCP/specs/README.md`).
@@ -107,87 +108,120 @@ base64 coming *out*), the media metadata strings, and a handful of scalars.
 So the native representation is not a new model. It is the arguments `capture_runtime_checkpoint`
 already receives, kept instead of thrown away.
 
-## §3 Design — capture native, render on read
+## §3 Design — capture native, render on read (SUPERSEDED by measurement)
 
-**One rule: the JSON is built by the same code as today, just later.**
+**Kept as written, because being wrong here is the useful part of this document.**
 
-```
-capture_runtime_checkpoint_native(m, …) -> RuntimeCheckpointNative     // no JSON, no base64
-RuntimeCheckpointNative::to_value(&self) -> serde_json::Value          // today's json!{} block, moved
-capture_runtime_checkpoint(m, …) -> Value   =   …_native(m, …).to_value()   // signature unchanged
-```
+The plan was a `RuntimeCheckpointNative` struct holding the typed sub-snapshots, with
+`to_value()` as a renderer, on the reasoning that "the sub-captures are already structs, so
+the native form is nearly free". Then §4.2's split measurement showed the residual tree
+costs **111 KiB resident for 9.9 KiB of content** — an 11× `Value` tax that a struct would
+have removed, yes, but so does simply *not holding a tree*. Storing the encoded bytes gets
+the same win, in one field, and **cannot silently drop a payload field** the way a
+hand-modelled struct can.
 
-Because `to_value` **is** the old `json!` block verbatim, the emitted tree is byte-identical
-by construction rather than by care — and every existing caller of
-`capture_runtime_checkpoint` (dump, undump, vsf, diff, tests) keeps working untouched.
+The original text follows, unchanged:
 
-The ring then stores `RuntimeCheckpointNative`:
+> `capture_runtime_checkpoint_native(m, …) -> RuntimeCheckpointNative` — no JSON, no base64;
+> `RuntimeCheckpointNative::to_value(&self)` — today's `json!{}` block, moved;
+> `capture_runtime_checkpoint(m, …)` = `…_native(m, …).to_value()`, signature unchanged.
+> Because `to_value` **is** the old block verbatim, the emitted tree is byte-identical by
+> construction rather than by care. The ring stores the struct; `restore_snapshot` renders.
+> RAM lives as `Box<[u8; 0x10000]>`: fixed layout, fixed positions.
 
-- `restore_snapshot(&id) -> Option<Value>` keeps its signature and calls `.to_value()`.
-- `checkpoint_thumbnail`, `checkpoint_diff`, `restore_live_checkpoint`,
-  `restore_runtime_checkpoint` keep taking `&Value` and notice nothing.
-- The content-addressed media pool is **already** binary (`ta_decode` at capture, raw
-  `Vec<u8>` in `PooledBlob`) — it stops needing the decode, and the pooled slots become a
-  move instead of a base64 round-trip.
+What survived from it is the load-bearing half — **the asymmetry**. Capture runs 50×/s at
+cadence 1; restore runs when a human clicks. The cost belongs where the traffic isn't. That
+is why `restore_snapshot` is the one place base64 and JSON are paid for now.
 
-**The asymmetry is the whole point.** Capture runs 50×/s at cadence 1. Restore runs when a
-human clicks — call it once a minute. Today the hot path pays so the cold path can be
-comfortable; afterwards the cost sits where the traffic isn't.
+## §4 Slices — what was built
 
-RAM lives as `Box<[u8; 0x10000]>` inside the struct: one 64 KiB allocation per entry, or a
-`memcpy` into a reused buffer when a slot is recycled. Fixed layout, fixed positions.
+Ordered by what the measurement said, not by what the title said.
 
-## §4 Slices
+1. **DONE — do not build what is thrown away.** `capture_vic_presentation_opts` /
+   `capture_runtime_checkpoint_opts` take `omit_framebuffer`. Both per-frame producers
+   pass `true`; every persist caller goes through the unchanged wrapper. The daemon's
+   after-the-fact nulling became a `debug_assert`, so the contract is enforced at the
+   seam instead of assumed. **167 → 64 µs, tree 530 → 98 KB.**
+2. **DONE — the residual tree is stored as compact bytes, not a live `Value`.** Written
+   as a native struct in the plan; the split measurement changed the design and the
+   change is the interesting part:
 
-Ordered by what the measurement says, not by what the title says. Slice 1 is 68 % of the win
-and the smallest change in the spec.
+   ```text
+   raw RAM per entry                64.2 KiB   (irreducible — it IS the state)
+   residual tree as a live Value   111.1 KiB
+   the same tree, rendered           9.9 KiB   → the Value costs 11× its content
+   ```
 
-1. **Do not build what is thrown away.** `capture_runtime_checkpoint` gains an explicit
-   `omit_framebuffer: bool` (or a `CaptureOpts`), and `capture_vic_presentation` is not
-   called for the two `literalPort*` fields when it is set. Both per-frame producers pass
-   `true`; dump/undump/vsf pass `false` and are unchanged. Expected: **167 → ~53 µs**. The
-   daemon's after-the-fact nulling in `capture_recorder_anchor_payload` is then dead code and
-   goes with it.
-2. **`RuntimeCheckpointNative` + `to_value`.** Define the struct; move the `json!` block into
-   `to_value` unchanged; re-express `capture_runtime_checkpoint` as the two-step. Nothing
-   else changes. Gate G1 lands here.
-3. **Ring stores native.** `RingEntry.payload: RuntimeCheckpointNative`; `restore_snapshot`
-   renders. Pool slots move bytes instead of decoding base64. This is where the **memory**
-   win is — the ~97 KiB rendered entry becomes ~70 KiB of actual struct + RAM.
-4. **Recorder anchor on the same path.** `capture_recorder_anchor_payload`
-   (`main.rs:14930`) builds native and only renders if the recorder's sink wants JSON. Both
-   per-frame producers are then JSON-free.
-5. **Honest accounting.** `byte_size` counts the real resident bytes (RAM + blobs + a
-   measured struct constant) instead of `SLOT_BYTES`. The byte budget starts meaning what it
-   says. Report the corrected figure in `stats()`.
-6. **Cadence reachable at runtime.** A `cadence` monitor verb, mirroring what `revdepth`
-   already is for the delta ring: show the current cadence/window, set it, rebuild the ring's
-   entry cap in the same call. Today `checkpoint_capture_every_frames()` is read per frame
-   while `checkpoint_ring_max_entries()` is evaluated once at State construction
-   (`main.rs:15453`/`16013`) — so a live cadence change without a matching cap rebuild
-   silently shrinks the window (cadence 1 into a cap of 20 = a 0.4 s ring). The verb must
-   set both or neither.
+   Ten kilobytes of chip state cost a hundred, because a `serde_json::Value` pays a
+   `Map`, a `String` key and an enum per node. So the fix is not to model those fields
+   in Rust — it is to stop holding them as a tree at all. `RingEntry.payload: Vec<u8>`;
+   `serde_json::from_slice` rebuilds the identical tree in `restore_snapshot`.
+
+   **Bytes rather than a modelled struct, deliberately.** The payload carries fields no
+   struct here owns (`_ringDriveDiskBytes`, `vicProvenance`, `media`, `audio`,
+   `alarmsMaincpu`, `cartState`, joystick/paddle blocks, and whatever a later spec
+   adds). A struct would be a second schema to keep in step with `c64re_snapshot`, and
+   the first forgotten field would be silently dropped on restore. Bytes cannot lose a
+   field.
+3. **DONE — the big buffers ride raw.** `RAW_SLOTS` (`ram` and the two framebuffers) are
+   decoded out of the tree at capture and re-encoded in `restore_snapshot`. Not
+   content-addressed like the media pool: RAM differs every frame, so hashing 64 KiB per
+   capture would cost more than the capture and never hit. Media stays pooled — it is
+   unchanged across a whole ring, so one copy serves 500 entries. `from_dump` does the
+   same extraction, so a `ringload` costs what the ring it came from cost.
+4. **DONE via §4.1 — both per-frame producers are on the lean path.** The ring's
+   auto-capture and the recorder feed share `capture_recorder_anchor_payload`, so one
+   change covered both. The recorder's *own* anchor ring (`recorder/recorder_ring.rs`)
+   has its own codec and was left alone — see §8.
+5. **DONE — honest accounting.** `byte_size` = the raw buffers' real length + the tree's
+   measured encoded length. `stats().total_bytes` sums the entries instead of assuming
+   `SLOT_BYTES` each. The daemon test that pinned the old figure now asserts a RANGE
+   (raw buffers charged in full, tree small) rather than a magic constant, so a future
+   field addition is not a false regression.
+6. **DONE — `cadence` monitor verb.** The checkpoint ring had no verb at all; the delta
+   ring has had `revdepth` for ages. `cadence` shows the rate, the window, the cap and
+   how many entries are held; `cadence <frames> [seconds]` sets the rate **and retunes
+   the ring's entry cap in the same call**, and states the expected memory before it is
+   spent. The cadence moved from a per-frame `std::env::var` read into daemon state, so
+   it and the cap can no longer disagree — the trap being closed is cadence 1 against a
+   cap sized for cadence 25, which silently turns a 10 s window into 0.4 s while nothing
+   goes red. Lowering the cap evicts at once rather than waiting for the next capture.
+
+### Result
+
+| | before | after |
+|---|---|---|
+| Capture (per-frame path) | 167 µs | **64 µs** |
+| Rendered tree | 530 KB | **98 KB** |
+| Resident per ring entry | 208.9 KiB | **97.7 KiB** |
+| Ring of 500 entries (10 s at cadence 1) | 102 MiB | **48 MiB** |
+| What the ring *claimed* | 32 MiB | what it holds |
 
 ## §5 Gates
 
-- **G1 — byte-identical JSON.** For a booted machine with a disk and a cart attached:
-  `capture_runtime_checkpoint(...)` before and after the refactor produce equal `Value`s.
-  Asserted as native→`to_value()` vs a checked-in expected tree, so it survives slice 2.
-- **G2 — round-trip.** `capture → to_value → restore_runtime_checkpoint` leaves RAM, CPU,
-  CIA, SID, VIC and the drive byte-identical. This is the existing `.c64re` round-trip test,
-  which must stay green untouched.
-- **G3 — ring restore.** Capture into the ring, evict, restore a surviving entry; machine
-  and disk match. Existing scrub tests stay green.
-- **G4 — no JSON on the capture path.** A test that captures with a poisoned allocator
-  counter, or failing that, a direct assertion that `stream_maybe_autocapture` reaches no
-  `serde_json` symbol: the honest cheap version is a `#[test]` that captures 500 anchors and
-  asserts wall-clock under a threshold measured in G5.
-- **G5 — the measurement, which is the point.** Capture 500 anchors at cadence 1, before and
-  after, and record: per-capture µs (median + p99), allocations, daemon RSS, and whether the
-  stream loop holds 50 fps. **The before-numbers get written into this spec**, not just the
-  after — a speedup with no baseline is a claim, not a result ([[feedback_prove_the_baseline_first]]:
-  prove the control reached the state).
-- **G6 — board.** `scripts/check-spec-board.sh` green.
+All green (916 tests, clippy 0 errors, `scripts/check-spec-board.sh` green).
+
+- **G1 — the persist path is untouched.** `omit_framebuffer_subtracts_exactly_two_fields_and_nothing_else`:
+  the default wrapper and an explicit `false` produce the same tree, that tree still carries
+  the framebuffers, the top-level field set is unchanged under `true`, every field except
+  `vicPresentation` is byte-identical, and inside it exactly the two framebuffers went null
+  while the three scalars survived.
+- **G2 — a lean checkpoint restores.** `lean_and_full_checkpoints_differ_only_in_the_framebuffer`
+  restores both and asserts RAM and the presentation scalars come back from each. Written as
+  a PAIR so it also records what a lean restore does *not* bring back — which is pre-807 ring
+  behaviour, since the daemon nulled both fields after capture long before this spec.
+- **G3 — ring round-trip.** The existing `checkpoint_ring_*` daemon tests stayed green
+  through the storage change; `restore_snapshot` re-splices raw blobs and pooled media, so
+  every consumer sees the tree it always saw.
+- **G4 — accounting cannot drift back.** The daemon test asserts `byteSize` as a RANGE: above
+  the raw buffers (so the tree is charged at all) and below raw + 32 KiB (so it is compact).
+  A magic constant would have made the next added field look like a regression.
+- **G5 — the measurement, recorded.** Five `#[ignore]` benches in `perf_bench.rs`:
+  `bench_checkpoint_capture`, `_omit_fb`, `_field_sizes`, `_framebuffer_waste`,
+  `_ring_resident_memory`, `_entry_cost_split`. Before-numbers are in §1, after-numbers in
+  §4. Run with `cargo test -p trx64-core --release --test perf_bench -- --ignored --nocapture`.
+- **G6 — `cadence` cannot desync.** `cadence_moves_the_capture_rate_and_the_ring_cap_together`
+  and `lowering_the_cadence_cap_evicts_at_once`.
 
 ## §6 Non-goals
 
@@ -206,3 +240,19 @@ forward) needs a full checkpoint per frame, not one per 25. That is a single cad
 capture currently builds a JSON tree inside the frame lock.
 
 This spec does not build reverse playback. It removes the reason it cannot be tried.
+
+## §8 The one measured thing left
+
+`capture → ring store` end to end is **218.7 µs** while the capture alone is 63.7 µs. The
+gap is a base64 **round trip**: `capture_runtime_checkpoint` encodes the 64 KiB RAM into an
+87 KiB string, and the ring immediately decodes it back to bytes for `RAW_SLOTS`. Both
+halves are wasted — the bytes were raw two function calls earlier.
+
+Closing it is the one place the original §3 design still earns its keep: a capture that can
+hand RAM over *raw* (a `CaptureOpts` that leaves `ram` as a byte buffer, rendered only by
+`restore_snapshot`) removes ~50 µs from every per-frame capture.
+
+Not done here because it is not blocking: 218.7 µs is 1.09 % of a PAL frame, so even both
+producers at cadence 1 sit near 2 %. It is written down so the next person does not
+rediscover it — and because "encode, then immediately decode" is exactly the kind of thing
+that looks deliberate once it has been in the tree for a year.

@@ -704,12 +704,14 @@ fn bench_checkpoint_ring_resident_memory() {
         N as u64 + 8,
     );
     let before = rss_kb();
+    let t0 = Instant::now();
     for i in 0..N {
         let cp = trx64_core::c64re_snapshot::capture_runtime_checkpoint_opts(
             &m, "/tmp/b.d64", "d64", None, None, None, None, true,
         );
         ring.capture(cp, i as u64, i as u64 * 19_656).expect("capture");
     }
+    let capture_us = t0.elapsed().as_secs_f64() * 1_000_000.0 / N as f64;
     let after = rss_kb();
     let held = ring.list().len();
     assert_eq!(held, N, "ring dropped entries: {held} of {N}");
@@ -719,6 +721,7 @@ fn bench_checkpoint_ring_resident_memory() {
     let accounted_kb = trx64_core::checkpoint_ring::SLOT_BYTES as f64 / 1024.0;
     eprintln!("\n========== checkpoint ring resident memory (Spec 807 §4.3) ==========");
     eprintln!("  entries held                   : {held}  (= 10 s at cadence 1)");
+    eprintln!("  capture+store, END TO END      : {capture_us:.1} µs  ({:.2} % of a PAL frame)", capture_us / 20_000.0 * 100.0);
     eprintln!("  RSS before / after             : {before} / {after} KiB");
     eprintln!("  RSS delta                      : {delta_kb} KiB  ({:.1} MiB)", delta_kb as f64 / 1024.0);
     eprintln!("  per entry, RESIDENT            : {per_entry_kb:.1} KiB");
@@ -728,5 +731,68 @@ fn bench_checkpoint_ring_resident_memory() {
     eprintln!(
         "  RAW (machine-parseable): ring_resident n={} rss_delta_kb={} per_entry_kb={:.2} rendered_b={} accounted_kb={:.1}",
         N, delta_kb, per_entry_kb, rendered, accounted_kb
+    );
+}
+
+/// Spec 807 §4.3 follow-up — WHERE the resident cost of a ring entry actually is.
+///
+/// Moving the 64 KiB RAM out of the tree only took an entry from 208.9 to 192.4 KiB
+/// (8 %), which means the 87 KiB base64 String was NOT the dominant cost and the
+/// spec's "3× reduction" projection was wrong. This isolates the two halves: 500
+/// copies of the raw RAM alone, then 500 copies of the residual tree alone.
+#[test]
+#[ignore = "perf benchmark; run --release with --ignored --nocapture"]
+fn bench_checkpoint_entry_cost_split() {
+    if !roms_present() {
+        eprintln!("skip bench_checkpoint_entry_cost_split: ROMs absent at {ROM_DIR}");
+        return;
+    }
+    fn rss_kb() -> u64 {
+        if let Ok(s) = std::fs::read_to_string("/proc/self/statm") {
+            let p: u64 = s.split_whitespace().nth(1).and_then(|t| t.parse().ok()).unwrap_or(0);
+            return p * 4;
+        }
+        std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    }
+    const N: usize = 500;
+
+    let mut m = Machine::new();
+    m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+    let mut sink = NullSink;
+    m.run_for_full(3_000_000, &mut sink, |_, _, _, _, _, _, _| {});
+
+    // Half A: the raw RAM, 500×.
+    let a0 = rss_kb();
+    let rams: Vec<Vec<u8>> = (0..N).map(|_| m.ram.to_vec()).collect();
+    let a1 = rss_kb();
+    assert_eq!(rams.len(), N);
+
+    // Half B: the residual tree (a lean checkpoint with `ram` nulled), 500×.
+    let mut lean = trx64_core::c64re_snapshot::capture_runtime_checkpoint_opts(
+        &m, "/tmp/b.d64", "d64", None, None, None, None, true,
+    );
+    lean["ram"] = serde_json::Value::Null;
+    let residual_rendered = serde_json::to_string(&lean).unwrap().len();
+    let b0 = rss_kb();
+    let trees: Vec<serde_json::Value> = (0..N).map(|_| lean.clone()).collect();
+    let b1 = rss_kb();
+    assert_eq!(trees.len(), N);
+
+    let ram_kb = (a1.saturating_sub(a0)) as f64 / N as f64;
+    let tree_kb = (b1.saturating_sub(b0)) as f64 / N as f64;
+    eprintln!("\n========== ring entry cost, split (Spec 807 §4.3) ==========");
+    eprintln!("  raw RAM per entry              : {ram_kb:.1} KiB   (64.0 expected)");
+    eprintln!("  residual JSON tree per entry   : {tree_kb:.1} KiB");
+    eprintln!("  residual tree, RENDERED        : {:.1} KiB", residual_rendered as f64 / 1024.0);
+    eprintln!("  → the tree costs {:.0}× its rendered size", tree_kb / (residual_rendered as f64 / 1024.0));
+    eprintln!(
+        "  RAW (machine-parseable): entry_split n={} ram_kb={:.2} tree_kb={:.2} residual_rendered_b={}",
+        N, ram_kb, tree_kb, residual_rendered
     );
 }
