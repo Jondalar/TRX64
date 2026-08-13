@@ -3,7 +3,11 @@
 > Shared cross-repo numbering (C64RE + TRX64 draw from ONE range; see the C64RE
 > `specs/README.md` board). 776 = first number after C64RE's 775.
 
-**Status:** PROPOSED (planning). **Repo:** TRX64 (the engine) — App + C64RE consume.
+**Status:** SUPERSEDED (2026-08-12). Its subject — the active experiment loop,
+`run → intervene → diff` — was delivered by 795 (banked-cart overlay), 796 (the
+candidate model, `candidate.rs` and its MCP tools) and 797 (final code delta). Nothing
+here is open; this reads as a plan for work that exists. Close it, or fold whatever is
+left into 796. **Repo:** TRX64 (the engine) — App + C64RE consume.
 **Merges + retires:** C64RE Spec 711 (Code/Data Overlay + Controlled Intervention
 Branches) + Spec 712 (Rewind, Replay, Branch-Diff). Those two are the same loop
 seen from two ends (711 = intervene/branch, 712 = replay/compare); with the ring +

@@ -1,6 +1,7 @@
 # Spec 790 — Raw `.bin` Cartridge Attach with a Typed Attach (`Auto` | `Forced`)
 
-**Status:** PROPOSED (2026-07-15); **Slice 1 (S1) SHIPPED; Slice 2 (S2) BUILT
+**Status:** BUILT (corrected 2026-08-12 — the header said PROPOSED while the same
+line recorded both slices done); **Slice 1 (S1) SHIPPED; Slice 2 (S2) BUILT
 (2026-07-15) — the runtime self-configuring harness.** **Repo:** TRX64.
 **Shared cross-repo numbering** (registry = C64RE `specs/README.md`).
 

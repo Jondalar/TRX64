@@ -1,6 +1,12 @@
 # Spec 783 — Local Quality-Gate Enforcement (no cloud CI)
 
-**Status:** PROPOSED (2026-07-03). **Repo:** TRX64.
+**Status:** HALF BUILT (measured 2026-08-12). The gates all exist —
+`seven_game_gate.rs`, `iso_vic_gate.rs`, `vic_collision_gate.rs`, `cart_mapper_gate.rs`,
+`tools/oracle/src/conformance.ts` and 7/7 screenshot oracles. The ENFORCEMENT does not:
+`.git/hooks/` is empty and no `core.hooksPath` is set. This spec says of itself "they
+exist — this is wiring + enforcement", and the wiring is the missing half. Consequence,
+stated plainly: the regression protection that CLAUDE.md and every runtime commit point
+at holds only because someone runs `cargo test` by hand. **Repo:** TRX64.
 **Shared cross-repo numbering** (registry = C64RE `specs/README.md`).
 
 ## Motivation

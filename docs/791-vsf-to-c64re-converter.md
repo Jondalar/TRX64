@@ -1,6 +1,9 @@
 # Spec 791 — VSF → `.c64re` Converter (one-way import onramp)
 
-**Status:** PROPOSED (2026-07-15). **Repo:** TRX64.
+**Status:** BUILT (corrected 2026-08-12; was PROPOSED since 2026-07-15). Shipped:
+`vsf.rs`, `vsf_export.rs`, `convert_cmd.rs` (`trx64cli convert-vsf`),
+`convert_vsf_roundtrip.rs`, `vsf_parity_probe.rs`, and a fidelity report in both
+directions. It sat wrong for four weeks because nothing compared the header to the tree. **Repo:** TRX64.
 **Shared cross-repo numbering** (registry = C64RE `specs/README.md`).
 **Depends on:** existing `crates/trx64-core/src/vsf.rs` partial VICE loader
 (`load_vice_vsf`), the `.c64re` native snapshot (Spec 707), the cartridge mappers
