@@ -616,7 +616,7 @@ const MONITOR_VERBS: &[&str] = &[
     // reverse-debug
     "rstep", "reverse", "whowrote", "triage", "revdepth", "diff", "ringdump", "ringload",
     // checkpoint ring (Spec 807 §4.6) + rewind transport (Spec 808)
-    "cadence", "play", "pause", "frame", "goto", "rewind",
+    "cadence", "window", "play", "pause", "frame", "goto", "rewind",
     // knowledge
     "inspect", "xref", "sym",
 ];

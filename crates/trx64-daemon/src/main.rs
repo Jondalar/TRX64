@@ -5512,6 +5512,38 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             Ok(lines.join("\n"))
         }
 
+        // `window <seconds>` — the same knob from the other side: how far back you want
+        // to be able to go. Keeps the cadence and recomputes the cap and the budget.
+        "window" => {
+            let secs = toks
+                .get(1)
+                .and_then(|t| t.trim().trim_end_matches('s').parse::<f64>().ok());
+            match secs {
+                None => Ok(format!(
+                    "window: {:.1}s at every-{}-frames \u{2192} cap {} anchors\n  {}",
+                    st.checkpoint_window_seconds,
+                    st.checkpoint_cadence_frames.max(1),
+                    st.checkpoint_ring.max_entries(),
+                    transport_range_line(st)
+                )),
+                Some(v) if v.is_finite() && v > 0.0 => {
+                    let secs = v.min(600.0);
+                    st.checkpoint_window_seconds = secs;
+                    let frames = st.checkpoint_cadence_frames.max(1);
+                    let want =
+                        trx64_core::checkpoint_ring::checkpoint_ring_max_entries(secs, frames);
+                    let cap = st.checkpoint_ring.set_max_entries(want);
+                    Ok(format!(
+                        "window: {secs:.1}s at every-{frames}-frames \u{2192} cap {cap} anchors\n  \
+                         ~{:.0} MiB when full (~98 KiB/anchor, measured)   budget now {} MiB",
+                        (cap as f64 * 98.0) / 1024.0,
+                        st.checkpoint_ring.budget_bytes() / (1024 * 1024)
+                    ))
+                }
+                Some(_) => Err("window: seconds must be > 0 (max 600)".into()),
+            }
+        }
+
         "cadence" => {
             let live = |st: &State| -> (u64, f64, u64, usize) {
                 (
@@ -5541,6 +5573,9 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                     st.checkpoint_cadence_frames = frames;
                     st.checkpoint_window_seconds = secs;
                     let want = trx64_core::checkpoint_ring::checkpoint_ring_max_entries(secs, frames);
+                    // `set_max_entries` grows the byte bound with the cap — eviction
+                    // fires on whichever bound hits first, so a cap without a budget
+                    // means asking for sixty seconds and quietly getting ten.
                     let cap = st.checkpoint_ring.set_max_entries(want);
                     let held = st.checkpoint_ring.list().len();
                     let mut out = vec![format!(
@@ -5550,7 +5585,10 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                     // The honest part: say what it will cost before it costs it. ~98 KiB
                     // resident per entry, measured (Spec 807 perf_bench).
                     let mib = (cap as f64 * 98.0) / 1024.0;
-                    out.push(format!("  ~{mib:.0} MiB when full (~98 KiB/entry, measured)"));
+                    out.push(format!(
+                        "  ~{mib:.0} MiB when full (~98 KiB/entry, measured)   budget now {} MiB",
+                        st.checkpoint_ring.budget_bytes() / (1024 * 1024)
+                    ));
                     if frames == 1 {
                         out.push("  every frame: this is the per-frame checkpoint the reverse-playback work needs".into());
                     }
@@ -6871,6 +6909,7 @@ fn monitor_help_text() -> String {
         "    Watching is free: replaying keeps the anchors. Only an INTERVENTION (a write, a key, a resumed run) truncates the future — the mode line then says CUT and how many anchors went.",
         "  CHECKPOINT RING (the scrub/filmstrip buffer — full machine states, NOT the delta ring)",
         "    cadence                   report the capture rate, window, entry cap and how many anchors are held",
+        "    window [seconds]          how far back you want to reach (default 60s, max 600) — recomputes the cap AND the byte budget",
         "    cadence <frames> [secs]   set the rate AND retune the cap together (`cadence 1` = one full checkpoint per frame). States the expected memory (~98 KiB/anchor) before spending it. 1..=3000 frames, window 1..=600s",
         "    ringdump <path>           serialize the WHOLE reverse-debug buffer (checkpoint+delta+cpuhistory rings) → one gzipped .c64rering file (the tester->dev hand-off)",
         "    ringload <path>           restore a .c64rering: reconstruct the rings + restore the machine to its current anchor; scrub/rstep/whowrote/chis/diff then work on it",
@@ -13743,7 +13782,10 @@ fn checkpoint_ring_seconds() -> f64 {
         .ok()
         .and_then(|s| s.trim().parse::<f64>().ok())
         .filter(|&n| n > 0.0)
-        .unwrap_or(10.0)
+        // Spec 808 — DEFAULT from the core constant, not a second copy here. Ten seconds
+        // turned out to be simply too short to work with; sixty is the default now, and
+        // `window <seconds>` changes it live.
+        .unwrap_or(trx64_core::checkpoint_ring::DEFAULT_CHECKPOINT_RING_SECONDS)
 }
 
 /// Spec 772 — max LIVE ring entries (the UI-scrub cap) = ceil(seconds / (cadence/50))
@@ -16419,7 +16461,7 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         // 20 = 10s @ 0.5s cadence, env-overridable) on top of the 32 MiB byte budget,
         // evict-oldest on whichever-first. Deep history = the recorder, not this ring.
         checkpoint_ring: trx64_core::checkpoint_ring::RuntimeCheckpointRing::with_budget_and_max_entries(
-            trx64_core::checkpoint_ring::DEFAULT_CHECKPOINT_RING_BUDGET_BYTES,
+            trx64_core::checkpoint_ring::checkpoint_ring_budget_for(checkpoint_ring_max_entries()),
             checkpoint_ring_max_entries(),
         ),
         inspect_evidence: Vec::new(),
@@ -16985,7 +17027,7 @@ mod batch1_tests {
         // 20 = 10s @ 0.5s cadence, env-overridable) on top of the 32 MiB byte budget,
         // evict-oldest on whichever-first. Deep history = the recorder, not this ring.
         checkpoint_ring: trx64_core::checkpoint_ring::RuntimeCheckpointRing::with_budget_and_max_entries(
-            trx64_core::checkpoint_ring::DEFAULT_CHECKPOINT_RING_BUDGET_BYTES,
+            trx64_core::checkpoint_ring::checkpoint_ring_budget_for(checkpoint_ring_max_entries()),
             checkpoint_ring_max_entries(),
         ),
             inspect_evidence: Vec::new(),
@@ -17784,6 +17826,9 @@ mod batch1_tests {
     #[test]
     fn pumping_a_full_window_fills_the_whole_ring() {
         let st = make_state();
+        // A short window on purpose: this asserts that a cap is REACHED, and pumping the
+        // 60-second default would be 3000 frames of test for the same statement.
+        mon(&st, "window 10").expect("window 10");
         let want = {
             let g = st.lock().unwrap();
             g.checkpoint_ring.max_entries()
@@ -17881,6 +17926,35 @@ mod batch1_tests {
         }
     }
 
+    /// A window you ASK for is a window you GET. The byte budget was a fixed 32 MiB —
+    /// 512 slots — which happens to be just over the 500 a ten-second window needs, so
+    /// nothing ever noticed it was the real limit. Ask for sixty seconds and the cap says
+    /// 3000 while the slab says 512, and the slab wins silently.
+    #[test]
+    fn a_longer_window_is_actually_honoured_not_clipped_by_the_budget() {
+        let st = make_state();
+        mon(&st, "window 60").expect("window 60");
+        {
+            let g = st.lock().unwrap();
+            assert_eq!(g.checkpoint_ring.max_entries(), 3000, "60 s at cadence 1");
+            assert!(
+                g.checkpoint_ring.budget_bytes() >= 3000 * 100 * 1024,
+                "the byte budget must follow the cap, or it evicts first: {} bytes",
+                g.checkpoint_ring.budget_bytes()
+            );
+        }
+        // And it must really hold that many, not just claim to.
+        for _ in 0..1200 {
+            call(&st, "session/run", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+        }
+        let held = st.lock().unwrap().checkpoint_ring.list().len();
+        assert_eq!(
+            held, 1200,
+            "1200 pumped frames must all be held under a 3000 cap — got {held}, which \
+             means a bound other than the cap is evicting"
+        );
+    }
+
     /// G2 — parity. Every transport action reachable as a monitor verb is reachable over
     /// RPC with the same status object back, so the C64RE ribbon renders from data
     /// instead of parsing the terminal line. This is the gate that keeps the two
@@ -17962,6 +18036,9 @@ mod batch1_tests {
         // Bare verb reports without changing anything.
         // Spec 808 changed the DEFAULT to 1 — at 25 the ring held 20 anchors, i.e. 0.4 s
         // of rewind, which is not a shorter version of the feature but no feature.
+        // Pin the window so this tests the RELATION, not whatever the default happens
+        // to be (it moved from 10 s to 60 s when 10 proved too short to work with).
+        mon(&st, "window 10").expect("window 10");
         let before = mon(&st, "cadence").expect("cadence");
         assert!(before.starts_with("cadence: every 1 frame(s)"), "{before}");
         let cap_before = st.lock().unwrap().checkpoint_ring.max_entries();
@@ -18003,6 +18080,7 @@ mod batch1_tests {
     #[test]
     fn lowering_the_cadence_cap_evicts_at_once() {
         let st = make_state();
+        mon(&st, "window 10").expect("window 10");
         mon(&st, "cadence 1").expect("cadence 1");
         {
             let mut g = st.lock().unwrap();

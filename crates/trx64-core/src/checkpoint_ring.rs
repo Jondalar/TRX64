@@ -56,7 +56,21 @@ pub const DEFAULT_CHECKPOINT_RING_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Spec 772 — default ring retention in seconds (the UI scrub window). 1:1 with the
 /// c64re `DEFAULT_CHECKPOINT_RING_SECONDS` (runtime-checkpoint-ring.ts).
-pub const DEFAULT_CHECKPOINT_RING_SECONDS: f64 = 10.0;
+pub const DEFAULT_CHECKPOINT_RING_SECONDS: f64 = 60.0;
+
+/// Measured resident cost of one anchor after Spec 807 (~98 KiB). Used to size the byte
+/// budget from the requested window instead of pinning it at 32 MiB — that constant was
+/// 512 slots, which happened to be just over the 500 a ten-second window needs, so
+/// nothing noticed. Ask for sixty seconds and the ring would have evicted at 512 and
+/// silently kept ten.
+pub const ANCHOR_BYTES_ESTIMATE: u64 = 100 * 1024;
+
+/// The byte budget a window of `max_entries` anchors actually needs, with a little head
+/// room. The budget is a SAFETY CEILING, so it must never be the thing that decides the
+/// window — the entry cap is.
+pub fn checkpoint_ring_budget_for(max_entries: u64) -> u64 {
+    (max_entries.max(1) + 16) * ANCHOR_BYTES_ESTIMATE
+}
 
 /// Spec 772 — max LIVE entries the ring retains = `ceil(seconds / (cadenceFrames/50))`
 /// (PAL 50 fps). At the 10s / 25-frame default that is **20**. Clamped ≥ 1. 1:1 with
@@ -299,6 +313,19 @@ impl RuntimeCheckpointRing {
     /// would; raising it just makes room.
     pub fn set_max_entries(&mut self, max_entries: u64) -> u64 {
         self.max_entries = max_entries.max(1);
+        // Grow the byte bound with the entry cap. Eviction fires on whichever bound hits
+        // first, so leaving the budget behind would mean asking for sixty seconds and
+        // quietly getting ten — the cap says 3000, the slab says 512, and the slab wins.
+        let want_budget = checkpoint_ring_budget_for(self.max_entries);
+        if want_budget > self.budget_bytes {
+            let extra = (want_budget - self.budget_bytes) / SLOT_BYTES;
+            let base = self.slot_count;
+            for i in 0..extra {
+                self.free_slots.push(base + i);
+            }
+            self.slot_count += extra;
+            self.budget_bytes = want_budget;
+        }
         while (self.entries.len() as u64) > self.max_entries {
             match self.entries.iter().position(|e| !e.r.pinned) {
                 Some(i) => self.remove_entry_at(i),
