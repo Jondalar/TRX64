@@ -294,6 +294,26 @@ small change: it is the same code path with the truncation moved earlier.
   The 177 µs above is the restore alone.
 - **G6 — board.** `scripts/check-spec-board.sh` green.
 
+## §7b Side effects a restore cannot undo
+
+The picture regeneration (§4a) runs two frames of **real code** after each restore. Real
+code writes things. Anything it writes that the anchor does not carry is a mutation the
+re-restore cannot undo — so every scrub step would quietly change it.
+
+- **Cart flash: fixed.** It rides every anchor now. It had to: a game that saves to its
+  cart left the flash in the future while the CPU was restored into the past, and the
+  regeneration frames could write it again on every step. Symptom: boot from CRT, pause,
+  rewind, play, and the game no longer got past its intro. Affordable because the ring
+  pools these blobs content-addressed — an unchanged flash across all 500 anchors is ONE
+  copy, and only a real write adds another.
+- **Disk (the mutable GCR overlay): still open.** It changes on every write, so
+  content-addressing would not dedup it and a per-anchor copy is not affordable at this
+  cadence. A disk-writing title has the same hole. Written down rather than pretended
+  away; the fix is probably an undo-log of written sectors, not a copy of the image.
+- **The host file underneath: still open, and older than this spec.** Rewinding does not
+  un-write a `.d64`/`.g64` — the stream loop persists dirty tracks to the ORIGINAL file.
+  Time travel has a side channel that does not travel.
+
 ## §8 Non-goals
 
 - **Branching.** Its own spec (decision 3).
