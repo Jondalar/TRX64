@@ -743,6 +743,8 @@ pub struct StateSnapshot {
     /// STEP. "PAUSED" alone answered a different question.
     pub transport_mode: Option<String>,
     pub transport_line: Option<String>,
+    /// "back" | "fwd" | "none" — the header shows REWIND only when actually going back.
+    pub transport_direction: Option<String>,
 }
 
 impl StateSnapshot {
@@ -768,6 +770,11 @@ impl StateSnapshot {
             transport_line: v
                 .get("transport")
                 .and_then(|t| t.get("line"))
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string()),
+            transport_direction: v
+                .get("transport")
+                .and_then(|t| t.get("direction"))
                 .and_then(|m| m.as_str())
                 .map(|s| s.to_string()),
             c64_cycles: u(&["c64Cycles"]),

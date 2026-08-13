@@ -14712,6 +14712,7 @@ fn transport_play(st: &mut State, dir: transport::Direction, speed: u32) -> Resu
         }
     }
     st.transport.playing = Some(dir);
+    st.transport.last_step_ms = now_ms();
     st.transport.mode = transport::TransportMode::Replay;
     let mut out = transport_status(st);
     // Say how much rewind there actually IS. At the default cadence of 25 the ring holds
@@ -14744,15 +14745,25 @@ pub(crate) fn transport_tick(st: &mut State, budget_cycles: u64) -> bool {
     let Some(dir) = st.transport.playing else {
         return st.transport.holds_the_machine();
     };
-    // Pace against WALL CLOCK, not against how often the host pump happens to call.
-    // The pump passes the cycles for the real time elapsed since its last tick, so one
-    // PAL frame's worth = one anchor at 1×. Without this, `play back` ran a ten-second
-    // ring dry in one or two seconds: the right frames, far too fast to watch.
-    st.transport.pending_cycles = st.transport.pending_cycles.saturating_add(budget_cycles);
-    let per_step = crate::streaming::CYC_PER_FRAME / st.transport.speed.max(1) as u64;
+    // Pace against the WALL CLOCK, directly. Earlier this accumulated the cycle budget
+    // the caller passed, which is only as trustworthy as the caller: a ten-second ring
+    // still emptied in about two seconds. Real milliseconds cannot be got wrong by
+    // whoever is driving the pump.
+    let now = now_ms();
+    if st.transport.last_step_ms == 0 {
+        st.transport.last_step_ms = now;
+    }
+    let ms_per_step = (20u64 / st.transport.speed.max(1) as u64).max(1); // 20 ms = PAL frame
+    let due = now.saturating_sub(st.transport.last_step_ms) / ms_per_step;
+    if due == 0 {
+        let _ = budget_cycles;
+        return st.transport.holds_the_machine();
+    }
+    st.transport.last_step_ms = now;
+    let mut remaining = due.min(4); // never binge after a stall
     let mut moved = false;
-    while st.transport.pending_cycles >= per_step {
-        st.transport.pending_cycles -= per_step;
+    while remaining > 0 {
+        remaining -= 1;
         let delta = match dir {
             transport::Direction::Back => -1,
             transport::Direction::Fwd => 1,
@@ -17341,12 +17352,24 @@ mod batch1_tests {
         // Nothing moved.
         assert_eq!(st.lock().unwrap().session.machine.c64_core.clk, clk_before);
 
-        // Playing back: each pump tick STEPS the transport instead of advancing.
+        // Playing back: pump ticks STEP the transport instead of advancing the machine.
+        // Paced by WALL CLOCK (one anchor per 20 ms at 1x), not one per call — the
+        // caller's cycle budget proved untrustworthy, a ten-second ring emptied in two.
+        // So the test waits real time rather than counting calls.
         mon(&st, "play back").expect("play back");
         let before = call(&st, "transport/status", json!({}))["frameIndex"].as_u64().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(45));
         call(&st, "session/run", json!({ "cycles": 19_656 }));
         let after = call(&st, "transport/status", json!({}))["frameIndex"].as_u64().unwrap();
-        assert_eq!(after, before - 1, "one pump tick = one anchor back");
+        assert!(
+            after < before,
+            "after 45 ms of playback the transport must have stepped back              (was {before}, now {after})"
+        );
+        assert!(
+            before - after <= 4,
+            "and must not binge after a wait: {} steps for 45 ms",
+            before - after
+        );
 
         // And once handed back at the head, the pump advances normally again.
         mon(&st, "goto 8").expect("goto head");

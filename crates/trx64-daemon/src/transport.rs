@@ -90,15 +90,15 @@ pub struct Transport {
     pub mode: TransportMode,
     /// How many anchors the last truncation dropped (0 when nothing was cut).
     pub last_cut: u64,
-    /// Spec 808 — cycle budget carried over between ticks, so playback runs at
-    /// WALL-CLOCK speed instead of one step per pump call.
+    /// Spec 808 — wall-clock timestamp of the last step, so playback runs at REAL
+    /// speed instead of as fast as the host pump happens to call.
     ///
     /// The pump does not tick at 50 Hz; it ticks as often as the host loop comes round
     /// and passes the cycles for the real time elapsed. Stepping once per call made
     /// `play back` chew through a 10-second ring in one or two seconds — the counter
     /// visibly ran backwards, just far too fast to watch. Accumulating the budget and
     /// stepping once per PAL frame's worth makes 1× actually mean 1×.
-    pub pending_cycles: u64,
+    pub last_step_ms: u64,
 }
 
 impl Default for Transport {
@@ -109,7 +109,7 @@ impl Default for Transport {
             speed: 1,
             mode: TransportMode::Live,
             last_cut: 0,
-            pending_cycles: 0,
+            last_step_ms: 0,
         }
     }
 }
@@ -214,6 +214,10 @@ pub fn status_json(t: &Transport, pos: Option<&Position>, seconds_behind: f64) -
     json!({
         "mode": t.mode.as_str(),
         "playing": t.playing.map(|d| d.as_str()),
+        // The DIRECTION is what the header needs: playing backwards is REWIND, playing
+        // forwards is PLAY. Reporting only a "replay" mode made a forward replay show
+        // REWIND while it ran forward.
+        "direction": t.playing.map(|d| d.as_str()).unwrap_or("none"),
         "speed": t.speed,
         "cursor": t.cursor,
         "frameIndex": pos.map(|p| p.index as u64 + 1),
@@ -389,7 +393,7 @@ mod tests {
             speed: 1,
             mode: TransportMode::Cut,
             last_cut: 159,
-            pending_cycles: 0,
+            last_step_ms: 0,
         };
         let pos = locate(&l, t.cursor.as_deref()).unwrap();
         let line = status_line(&t, Some(&pos), 3.2);
@@ -407,7 +411,7 @@ mod tests {
             speed: 2,
             mode: TransportMode::Replay,
             last_cut: 0,
-            pending_cycles: 0,
+            last_step_ms: 0,
         };
         let pos = locate(&l, t.cursor.as_deref()).unwrap();
         let j = status_json(&t, Some(&pos), 3.2);

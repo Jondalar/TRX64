@@ -921,11 +921,15 @@ fn draw_gauges(f: &mut Frame, area: Rect, s: &StateSnapshot) {
     // F10 expects to read REWIND; "PAUSED" is true (the machine is not advancing) and
     // answers a question nobody asked. The transport's own mode wins whenever it is
     // doing something; RUNNING/PAUSED is what is left when it is not.
-    let (run_label, run_color) = match s.transport_mode.as_deref() {
-        Some("REPLAY") => ("\u{25c0}\u{25c0} REWIND", Color::Cyan),
-        Some("STEP \u{25c0}") => ("\u{25c0}| STEP BACK", Color::Cyan),
-        Some("STEP \u{25b6}") => ("|\u{25b6} STEP FWD", Color::Cyan),
-        Some("CUT") => ("\u{2702} CUT", Color::Yellow),
+    // The header shows the DIRECTION, not the machinery. A forward replay is PLAY even
+    // though it runs on the same anchors as a rewind — showing REWIND while it ran
+    // forward was the complaint, and it was right.
+    let (run_label, run_color) = match (s.transport_mode.as_deref(), s.transport_direction.as_deref()) {
+        (Some("REPLAY"), Some("fwd")) => ("\u{25b6} PLAY", Color::Green),
+        (Some("REPLAY"), _) => ("\u{25c0}\u{25c0} REWIND", Color::Cyan),
+        (Some("STEP \u{25c0}"), _) => ("\u{25c0}| STEP BACK", Color::Cyan),
+        (Some("STEP \u{25b6}"), _) => ("|\u{25b6} STEP FWD", Color::Cyan),
+        (Some("CUT"), _) => ("\u{2702} CUT", Color::Yellow),
         _ if s.running => ("\u{25b6} PLAY", Color::Green),
         _ => ("\u{23f8} PAUSE", Color::Red),
     };
