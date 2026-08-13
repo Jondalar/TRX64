@@ -36,6 +36,19 @@ pub struct Engine {
     /// the AUTHORITY for the cockpit's RUN/PAUSE indicator, distinct from the
     /// controller's `session.running` (which we keep paused so `session/run` is legal).
     running: Arc<AtomicBool>,
+    /// Spec 808 — the OTHER reason the pump must tick: the rewind transport is playing.
+    ///
+    /// The state machine has two independent "something should happen each frame"
+    /// sources, and they are mutually exclusive: either the machine ADVANCES, or the
+    /// transport STEPS to another anchor. Both are driven by the same pump. Gating the
+    /// pump on `running` alone deadlocked the transport — rewinding means the machine is
+    /// not running, so the pump stopped, so the tick that would have stepped the
+    /// transport never fired, so `play back` set a flag nobody read.
+    ///
+    /// INVARIANT: the pump ticks while `running || transport_playing`. Set when a play
+    /// verb starts the transport, cleared when a pumped reply reports it stopped (it
+    /// stops by itself at the ends and at the head), so the two cannot drift.
+    transport_playing: Arc<AtomicBool>,
     /// Warp pacing flag (8× frame budget per pump tick when set).
     warp: Arc<AtomicBool>,
     /// Set true when `quit` is issued — the pump + window observe it to shut down.
@@ -69,6 +82,7 @@ impl Engine {
         Self {
             state,
             running: Arc::new(AtomicBool::new(false)),
+            transport_playing: Arc::new(AtomicBool::new(false)),
             warp: Arc::new(AtomicBool::new(false)),
             quit: Arc::new(AtomicBool::new(false)),
             epoch: Arc::new(AtomicU64::new(0)),
@@ -160,7 +174,9 @@ impl Engine {
             self.running.store(true, Ordering::SeqCst);
             let _ = self.rpc("debug/pause", json!({ "source": "cli" }));
         }
-        if !self.running.load(Ordering::SeqCst) {
+        // Spec 808 — tick while EITHER source wants a frame. See `transport_playing`.
+        let playing = self.transport_playing.load(Ordering::SeqCst);
+        if !self.running.load(Ordering::SeqCst) && !playing {
             return 0;
         }
         let budget = if self.warp.load(Ordering::SeqCst) {
@@ -180,6 +196,14 @@ impl Engine {
                 // PAUSED at the KIL. The daemon already pushed debug/stopped reason=jam.
                 if v.get("breakpoint").is_some() || v.get("jam").is_some() {
                     self.running.store(false, Ordering::SeqCst);
+                }
+                // Spec 808 — the daemon intercepted this frame for the transport. It
+                // reports whether it is still playing; when it stops (an end, the head,
+                // an explicit pause) the pump must stop ticking for it, or a paused
+                // cockpit would spin a frame loop forever doing nothing.
+                if let Some(t) = v.get("transport") {
+                    let still = t.get("playing").map(|p| !p.is_null()).unwrap_or(false);
+                    self.transport_playing.store(still, Ordering::SeqCst);
                 }
                 v.get("c64Cycles").and_then(|c| c.as_u64()).unwrap_or(0)
             }
@@ -525,6 +549,48 @@ impl Engine {
             Ok(v) => CmdResult::text(format!("RINGLOAD ← {path} {}", compact(&v))),
             Err(e) => CmdResult::text(format!("ringload failed: {e}")),
         }
+    }
+
+    /// Spec 808 — F11, the universal go/stop. A DECISION, not a key mapping: what
+    /// "resume" means depends on where the transport stands, and the daemon owns that.
+    /// One `transport/status` call per keypress (not per frame), then the verb.
+    ///
+    /// Also the only place the pump's second run-reason gets armed: starting playback
+    /// has to switch the pump on, or the tick that steps the transport never fires —
+    /// rewinding means the machine is NOT running, so gating the pump on `running`
+    /// alone deadlocked it.
+    pub fn transport_toggle(&self) -> CmdResult {
+        let (playing, rewound) = self.transport_where();
+        let running = self.running.load(Ordering::SeqCst);
+        let verb = trx64_daemon::transport::f11_verb(running, playing, rewound);
+        let r = self.exec_line(verb);
+        self.sync_transport_pump();
+        r
+    }
+
+    /// Run a transport verb and keep the pump's run-reason in step with it.
+    pub fn transport_key(&self, verb: &str) -> CmdResult {
+        let r = self.exec_line(verb);
+        self.sync_transport_pump();
+        r
+    }
+
+    /// `(playing, rewound)` from the daemon — the transport's position is the daemon's
+    /// to know (decision 1), so the CLI asks rather than keeping a second copy.
+    fn transport_where(&self) -> (bool, bool) {
+        match self.rpc("transport/status", json!({})) {
+            Ok(v) => (
+                v.get("playing").map(|p| !p.is_null()).unwrap_or(false),
+                !v.get("atHead").and_then(|b| b.as_bool()).unwrap_or(true),
+            ),
+            Err(_) => (false, false),
+        }
+    }
+
+    /// After any transport verb: arm or disarm the pump's transport run-reason.
+    fn sync_transport_pump(&self) {
+        let (playing, _) = self.transport_where();
+        self.transport_playing.store(playing, Ordering::SeqCst);
     }
 
     fn verb_monitor(&self, command: &str) -> CmdResult {

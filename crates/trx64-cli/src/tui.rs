@@ -390,10 +390,13 @@ fn run_loop(term: &mut Term, engine: &Engine, to_main: &Sender<UiToMain>) -> io:
                     // terminals, and a control that silently does nothing on someone's
                     // setup is worse than a verb they have to type.
                     if let XKeyCode::F(n @ (9 | 10 | 11 | 12)) = key.code {
-                        if let Some(line) =
+                        let r = if n == 11 {
+                            Some(engine.transport_toggle())
+                        } else {
                             trx64_daemon::transport::key_verb(n as u8, engine.is_running())
-                        {
-                            let r = engine.exec_line(line);
+                                .map(|v| engine.transport_key(v))
+                        };
+                        if let Some(r) = r {
                             if !r.output.is_empty() {
                                 cp.push_log(&r.output);
                             }

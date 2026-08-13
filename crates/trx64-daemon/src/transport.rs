@@ -223,23 +223,52 @@ pub fn status_json(t: &Transport, pos: Option<&Position>, seconds_behind: f64) -
 /// `running` only matters for F11, the one key whose meaning depends on where you are:
 /// running → pause, otherwise → play forward (which at the head is just "run on", the
 /// old freeze/resume behaviour under a new name).
-pub fn key_verb(f: u8, running: bool) -> Option<&'static str> {
+pub fn key_verb(f: u8, _running: bool) -> Option<&'static str> {
     match f {
         9 => Some("frame -1"),
         10 => Some("play back"),
-        // F11 while running is the COCKPIT pause (`/pause`), which stops the machine —
-        // NOT the transport `pause` verb, which only stops playback. They are different
-        // things with the same word, and wiring the key to the wrong one made F11 look
-        // dead: the log said "paused", the machine kept running.
-        11 => Some(if running { "/pause" } else { "play fwd" }),
+        // F11 is NOT a fixed verb — it is a DECISION, so it is not in this table. See
+        // `f11_verb`. Mapping it to one string was wrong in two of the four states: at
+        // the head `play fwd` has nothing ahead to replay, so it correctly did nothing
+        // and the machine stayed paused with the key looking dead.
+        11 => None,
         12 => Some("frame +1"),
         _ => None,
     }
 }
 
+
+/// F11 — the universal go/stop, as a DECISION rather than a fixed verb.
+///
+/// This is the state machine in one function, and writing it out is what exposed the
+/// hole. The rule is one sentence — **if anything is moving, stop it; otherwise resume
+/// from where we are** — and "resume" differs by position:
+///
+/// ```text
+///   running  playing  rewound   F11 does     because
+///   ──────────────────────────────────────────────────────────────
+///   yes      -        -         /pause       stop the machine
+///   no       yes      yes       pause        stop the playback
+///   no       no       yes       play fwd     replay forward from here
+///   no       no       no        /run         at the head: just run
+/// ```
+///
+/// The last row is the one that was broken.
+pub fn f11_verb(running: bool, playing: bool, rewound: bool) -> &'static str {
+    if running {
+        "/pause"
+    } else if playing {
+        "pause"
+    } else if rewound {
+        "play fwd"
+    } else {
+        "/run"
+    }
+}
+
 #[cfg(test)]
 mod key_tests {
-    use super::key_verb;
+    use super::{f11_verb, key_verb};
 
     #[test]
     fn the_four_host_keys_map_and_nothing_else_does() {
@@ -253,15 +282,6 @@ mod key_tests {
         assert_eq!(key_verb(13, false), None);
     }
 
-    #[test]
-    fn f11_is_the_machine_pause_while_running_and_play_otherwise() {
-        // `/pause` (cockpit: stop the machine), NOT `pause` (transport: stop playback).
-        // The transport verb leaves the machine running, which is what made F11 appear
-        // to do nothing at all.
-        assert_eq!(key_verb(11, true), Some("/pause"));
-        assert_ne!(key_verb(11, true), Some("pause"), "the transport pause is not a machine pause");
-        assert_eq!(key_verb(11, false), Some("play fwd"));
-    }
 
     #[test]
     fn f10_is_no_longer_pause() {

@@ -290,13 +290,14 @@ impl App {
                         KeyCode::F11 => 11,
                         _ => 12,
                     };
-                    if let Some(line) =
+                    // SILENT (the TUI owns this terminal). F11 is a decision the engine
+                    // makes from the daemon's transport state; the others are fixed.
+                    if f == 11 {
+                        let _ = self.engine.transport_toggle();
+                    } else if let Some(v) =
                         trx64_daemon::transport::key_verb(f, self.engine.is_running())
                     {
-                        // SILENT for the same reason: the verb's output already reaches
-                        // the cockpit log, and echoing it here painted "[F10] REPLAY
-                        // frame 1/20" straight through the CPU and VIC boxes.
-                        let _ = self.engine.exec_line(line);
+                        let _ = self.engine.transport_key(v);
                     }
                 }
                 return; // never reaches the C64 matrix

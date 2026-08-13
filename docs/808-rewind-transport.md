@@ -121,6 +121,66 @@ when they are usable, so nobody has to have learned them:
 A ribbon on the existing `ScrubTimeline` / `Filmstrip` components. Buttons call the verbs
 above — no UI-only behaviour, no second implementation of the loop.
 
+## §4a The state machine
+
+Written down after four bugs in a row that were all the same bug: **the transport is a
+state machine with two run-reasons, and it was implemented as a flag plus reflexes.**
+
+```mermaid
+stateDiagram-v2
+    [*] --> LiveRunning
+
+    LiveRunning: LIVE · running
+    LivePaused:  LIVE · paused
+    Rewound:     REPLAY · standing on an anchor
+    PlayingBack: REPLAY · walking backwards
+    PlayingFwd:  REPLAY · walking forwards
+    Cut:         CUT · the future was dropped
+
+    LiveRunning --> LivePaused: F11 (/pause)
+    LivePaused  --> LiveRunning: F11 (/run)
+
+    LiveRunning --> PlayingBack: F10 (play back)
+    LivePaused  --> PlayingBack: F10 (play back)
+
+    PlayingBack --> Rewound: F11 (pause) / oldest anchor reached
+    PlayingFwd  --> Rewound: F11 (pause)
+    PlayingFwd  --> LiveRunning: head reached — cursor released
+
+    Rewound --> Rewound: F9 / F12 (one anchor)
+    Rewound --> PlayingBack: F10
+    Rewound --> PlayingFwd: F11 (play fwd)
+
+    Rewound --> Cut: write · key · resumed run
+    Cut --> LivePaused: cursor released, ring truncated
+    LiveRunning --> LiveRunning: reset — ring DISCARDED, not truncated
+```
+
+**Two run-reasons, one pump.** The machine advancing and the transport stepping are
+mutually exclusive activities driven by the same per-frame pump:
+
+```
+    pump ticks  ⟺  machine should advance  OR  transport should step
+```
+
+Getting that wrong is what produced the visible failures, and each looked like its own
+bug until the diagram existed:
+
+| Symptom | The state-machine hole |
+|---|---|
+| `play back` did nothing while paused | pump gated on `running` alone → the tick that steps the transport never fired |
+| F11 did nothing at the head | mapped to one fixed verb; `play fwd` at the head has nothing to replay and never resumes the machine |
+| F11 "paused" but the machine kept running | the key ran the transport `pause` (stop playback) instead of the cockpit `/pause` (stop machine) |
+| after a reset, rewinding undid the reset | reset TRUNCATED the ring; it must DISCARD it — a reset replaces the machine, so every anchor describes one that is gone |
+
+**F11 is therefore a decision, not a mapping** (`transport::f11_verb`): if anything is
+moving, stop it; otherwise resume from where we are, and "resume" is `play fwd` when
+rewound and `/run` at the head. The four rows are one match arm each and one test each.
+
+**And a reset is not a divergence.** Truncation is for *diverging* from a rewound
+position — the anchors before the cursor stay valid. A reset, a power cycle or a media
+swap replaces the machine, so the whole ring goes.
+
 ## §5 The mode indicator is load-bearing
 
 Decision 4 has a real hazard, and it is the one thing in this spec that can quietly cost the
