@@ -504,7 +504,7 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
                 // Spec 769.5a — pass the JUST-RENDERED live canvas so the auto-capture
                 // can store a downscaled thumbnail keyed by the new checkpoint id
                 // (the ring anchor itself stays framebuffer-omitted, BUG-049).
-                crate::stream_maybe_autocapture(&mut st, frame_no, w, h, &indices);
+                crate::stream_maybe_autocapture(&mut st, frame_no, budget, w, h, &indices);
             }
             //   ITEM 4 — recorder auto-feed (audit background-workers-async-0 +
             //   ws-checkpoint-scrub-7). The c64re tick() feeds the active recorder one

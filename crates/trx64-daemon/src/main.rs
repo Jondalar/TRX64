@@ -397,6 +397,10 @@ pub struct State {
     /// filmstrip/scrub depends on a populated ring; without this loop it is sparse.
     /// Skipped while a mounted medium is dirty + non-persistable (Spec 709.13).
     autocapture_frames_since: u64,
+    /// Spec 808 — emulated cycles since the last auto-capture. CYCLES, not calls: the
+    /// CLI cockpit pumps 200×/s, so counting calls recorded 200 anchors a second and a
+    /// 500-anchor ring covered 2.5 seconds instead of ten.
+    autocapture_cycles_since: u64,
     /// Spec 807 §4.6 — the LIVE capture cadence, in stream-loop frames. Seeded from
     /// `C64RE_CHECKPOINT_CADENCE_FRAMES` (default 25) and changed at runtime by the
     /// `cadence` monitor verb, which retunes the ring's entry cap in the same call.
@@ -8239,7 +8243,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 stream_maybe_autopersist_disk(&mut st, now);
                 let frame_no = st.ctrl_frame;
                 let (w, h, indices) = st.session.machine.render_canvas_indices();
-                stream_maybe_autocapture(&mut st, frame_no, w, h, &indices);
+                stream_maybe_autocapture(&mut st, frame_no, cycles_budget_hint, w, h, &indices);
                 stream_maybe_feed_recorder(&mut st, frame_no);
             }
             let cycles = req
@@ -13711,15 +13715,29 @@ pub(crate) fn stream_maybe_autopersist_disk(st: &mut State, now_ms: u64) {
 /// ring. SKIPS while a mounted medium is dirty + non-persistable (Spec 709.13).
 /// Isolated: a capture failure NEVER kills the loop (the ring returns Err on a
 /// gap, never panics). Disable with C64RE_CHECKPOINT_AUTOCAPTURE=0.
-pub(crate) fn stream_maybe_autocapture(st: &mut State, frame: u64, canvas_w: usize, canvas_h: usize, canvas_indices: &[u8]) {
+pub(crate) fn stream_maybe_autocapture(st: &mut State, frame: u64, elapsed_cycles: u64, canvas_w: usize, canvas_h: usize, canvas_indices: &[u8]) {
     if std::env::var("C64RE_CHECKPOINT_AUTOCAPTURE").as_deref() == Ok("0") {
         return;
     }
-    st.autocapture_frames_since = st.autocapture_frames_since.wrapping_add(1);
-    if st.autocapture_frames_since < st.checkpoint_cadence_frames.max(1) {
+    // Spec 808 — count EMULATED CYCLES, not calls.
+    //
+    // This used to add 1 per call, which is right only if the caller calls once per
+    // frame. The daemon's stream loop does; the in-process CLI cockpit pumps every 5 ms
+    // — 200 calls a second — so at cadence 1 it captured 200 anchors a second instead of
+    // 50, and a 500-anchor ring covered TWO AND A HALF SECONDS instead of ten. The
+    // symptom was "I only get about 2 seconds back", and it was not the playback speed:
+    // the recording itself was four times too dense.
+    //
+    // Cycles are the honest unit. One PAL frame is 19656 of them however often anyone
+    // calls, and a caller that hands over a whole frame's worth still captures once.
+    st.autocapture_cycles_since = st
+        .autocapture_cycles_since
+        .wrapping_add(elapsed_cycles.max(1));
+    let per_capture = crate::streaming::CYC_PER_FRAME * st.checkpoint_cadence_frames.max(1);
+    if st.autocapture_cycles_since < per_capture {
         return;
     }
-    st.autocapture_frames_since = 0;
+    st.autocapture_cycles_since = 0;
     // Spec 709.13 — skip (a ring gap beats a corrupt checkpoint) while a mounted
     // medium is dirty + non-persistable.
     if non_persistable_dirty_media(st).is_some() {
@@ -14613,7 +14631,7 @@ fn transport_step(st: &mut State, delta: i64) -> Result<Value, String> {
         let frame_no = st.ctrl_frame;
         {
             let (w, h, indices) = st.session.machine.render_canvas_indices();
-            stream_maybe_autocapture(st, frame_no, w, h, &indices);
+            stream_maybe_autocapture(st, frame_no, crate::streaming::CYC_PER_FRAME, w, h, &indices);
         }
         let mut sink = trx64_core::NullSink;
         st.session.machine.run_for_full(
@@ -16165,6 +16183,7 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         disk_ap_seen_hash: None,
         disk_ap_done_hash: None,
         autocapture_frames_since: 0,
+        autocapture_cycles_since: 0,
         recorder_frames_since: 0,
         candidates: std::collections::HashMap::new(),
         candidate_seq: 0,
@@ -16728,6 +16747,7 @@ mod batch1_tests {
             disk_ap_seen_hash: None,
             disk_ap_done_hash: None,
             autocapture_frames_since: 0,
+            autocapture_cycles_since: 0,
             recorder_frames_since: 0,
         candidates: std::collections::HashMap::new(),
         candidate_seq: 0,
@@ -17504,6 +17524,42 @@ mod batch1_tests {
              before the cap. total_bytes={} budget={}",
             stats.total_bytes,
             g.checkpoint_ring.budget_bytes()
+        );
+    }
+
+    /// The recording DENSITY must follow emulated time, not the caller's call rate.
+    ///
+    /// This is the bug behind "I only get about two seconds back". The auto-capture
+    /// counted CALLS: right for the daemon's stream loop (one call per frame), wrong for
+    /// the CLI cockpit, which pumps every 5 ms. At cadence 1 that recorded 200 anchors a
+    /// second instead of 50, so a 500-anchor ring covered 2.5 seconds — and playing it
+    /// back at a real 50/s then looked four times too slow, which was the other half of
+    /// the same complaint.
+    #[test]
+    fn recording_density_follows_emulated_time_not_the_call_rate() {
+        // One second of emulated time, delivered in 200 small pumps like the CLI does.
+        let st = make_state();
+        let quarter = crate::streaming::CYC_PER_FRAME / 4;
+        for _ in 0..200 {
+            call(&st, "session/run", json!({ "cycles": quarter }));
+        }
+        let dense = st.lock().unwrap().checkpoint_ring.list().len();
+
+        // The same second delivered as 50 whole frames, like the stream loop does.
+        let st2 = make_state();
+        for _ in 0..50 {
+            call(&st2, "session/run", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+        }
+        let coarse = st2.lock().unwrap().checkpoint_ring.list().len();
+
+        assert_eq!(
+            dense, coarse,
+            "one second of emulated time must record the same number of anchors however \
+             it is delivered — {dense} via 200 small pumps vs {coarse} via 50 frames"
+        );
+        assert!(
+            (48..=52).contains(&dense),
+            "and that number is ~50 at cadence 1 (PAL), got {dense}"
         );
     }
 
@@ -19723,7 +19779,7 @@ mod batch1_tests {
         let total = checkpoint_capture_every_frames() * windows + 2;
         for frame in 0..total {
             let mut st = state.lock().unwrap();
-            stream_maybe_autocapture(&mut st, frame, cw, ch, &canvas);
+            stream_maybe_autocapture(&mut st, frame, crate::streaming::CYC_PER_FRAME, cw, ch, &canvas);
         }
         let st = state.lock().unwrap();
         let n = st.checkpoint_ring.list().len();
@@ -19773,7 +19829,7 @@ mod batch1_tests {
         let total = checkpoint_capture_every_frames() * 5 + 2;
         for frame in 0..total {
             let mut st = state.lock().unwrap();
-            stream_maybe_autocapture(&mut st, frame, cw, ch, &canvas);
+            stream_maybe_autocapture(&mut st, frame, crate::streaming::CYC_PER_FRAME, cw, ch, &canvas);
         }
         let list = call(&state, "checkpoint/list", json!({}));
         let ring_n = list["checkpoints"].as_array().unwrap().len();
