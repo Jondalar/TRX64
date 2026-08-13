@@ -453,7 +453,15 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
             // audio runs over exactly that window). When no bp/observer is armed it
             // is the historical plain advance (byte-identical).
             let budget = if warp { CYC_PER_FRAME * 8 } else { CYC_PER_FRAME };
-            let d_cycles = crate::stream_debug_gated_advance(&mut st, budget);
+            // Spec 808 — the rewind transport owns the frame while it is rewound. When
+            // it does, emulation must NOT advance: the transport is placing the machine
+            // on an anchor itself (a real restore, 177 us), and advancing on top of that
+            // would be the divergence decision 4 says only an INTERVENTION may cause.
+            let d_cycles = if crate::transport_tick(&mut st) {
+                0
+            } else {
+                crate::stream_debug_gated_advance(&mut st, budget)
+            };
             // Spec 767 slice 2 (live-view) — a capped LLM run auto-pauses here once the cap
             // clk is reached (this just-rendered frame is the last one streamed), and keeps
             // the owner-idle timer fresh while it runs. No-op when no cap is set.

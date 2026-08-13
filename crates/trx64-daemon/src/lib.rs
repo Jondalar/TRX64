@@ -52,4 +52,6 @@ pub(crate) use daemon::{
     maybe_autopause_capped_run, now_iso8601_utc, set_control_owner, stream_debug_gated_advance,
     stream_maybe_autocapture, stream_maybe_autopersist_cart, stream_maybe_autopersist_disk,
     stream_maybe_feed_recorder,
+    // Spec 808 — the rewind transport's per-frame tick, called by the stream loop.
+    transport_tick,
 };

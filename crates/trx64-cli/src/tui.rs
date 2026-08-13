@@ -373,13 +373,39 @@ fn run_loop(term: &mut Term, engine: &Engine, to_main: &Sender<UiToMain>) -> io:
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
-                    // HOST HOTKEY — F10 freezes/resumes, and does so from HERE as well as
-                    // from the emulator window, so the same key works wherever the focus
-                    // happens to be. The C64 keyboard has no F10 (only F1..F8), so it can
-                    // never be a key the machine wanted.
-                    if key.code == XKeyCode::F(10) {
-                        let running = engine.is_running();
-                        let r = engine.exec_line(if running { "/pause" } else { "/run" });
+                    // HOST HOTKEYS — F9..F12 are the rewind transport (Spec 808 §4).
+                    // The C64 keyboard has F1..F8 only (F2/F4/F6/F8 being SHIFT+F1/F3/F5/
+                    // F7), so these four physical keys can never be keys the machine
+                    // wanted. They work from HERE as well as from the emulator window, so
+                    // the same key does the same thing wherever the focus happens to be.
+                    //
+                    // The layout reads left-to-right as a transport, which is why pause
+                    // MOVED off F10 onto F11 — F10 was freeze/resume and is documented in
+                    // no .md in this repo, so nothing written down had to change:
+                    //
+                    //   F9  ◀|   one frame back      F11 ⏸/▶  pause / play
+                    //   F10 ◀◀   play backwards      F12 |▶   one frame forward
+                    //
+                    // No modifiers on purpose: Shift+F-keys are swallowed by some
+                    // terminals, and a control that silently does nothing on someone's
+                    // setup is worse than a verb they have to type.
+                    if let XKeyCode::F(n @ (9 | 10 | 11 | 12)) = key.code {
+                        let line = match n {
+                            9 => "frame -1".to_string(),
+                            10 => "play back".to_string(),
+                            12 => "frame +1".to_string(),
+                            // F11 is the one key whose meaning depends on where you are:
+                            // playing -> pause, paused/rewound -> play forward, and at the
+                            // head with nothing to replay it is the old freeze/resume.
+                            _ => {
+                                if engine.is_running() {
+                                    "pause".to_string()
+                                } else {
+                                    "play fwd".to_string()
+                                }
+                            }
+                        };
+                        let r = engine.exec_line(&line);
                         if !r.output.is_empty() {
                             cp.push_log(&r.output);
                         }
@@ -597,8 +623,8 @@ const MONITOR_VERBS: &[&str] = &[
     "map", "taint", "swimlane", "chis",
     // reverse-debug
     "rstep", "reverse", "whowrote", "triage", "revdepth", "diff", "ringdump", "ringload",
-    // checkpoint ring (Spec 807 §4.6)
-    "cadence",
+    // checkpoint ring (Spec 807 §4.6) + rewind transport (Spec 808)
+    "cadence", "play", "pause", "frame", "goto", "rewind",
     // knowledge
     "inspect", "xref", "sym",
 ];

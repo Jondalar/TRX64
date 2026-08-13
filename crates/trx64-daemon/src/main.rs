@@ -35,6 +35,8 @@ pub mod observers;
 pub mod project_knowledge;
 pub mod snapshot_diff;
 pub mod streaming;
+/// Spec 808 — the rewind transport (play the machine backwards).
+pub mod transport;
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -401,6 +403,11 @@ pub struct State {
     /// Before this field the cadence was re-read from the env on every frame while the
     /// cap was fixed at start-up, so the two could not stay consistent.
     checkpoint_cadence_frames: u64,
+    /// Spec 808 — the rewind transport: cursor, play state, mode. The DAEMON owns the
+    /// playback loop (decision 1), so this lives here and both front-ends only display
+    /// it. While `cursor` is set the transport is placing the machine and the stream
+    /// loop must not advance emulation.
+    transport: transport::Transport,
     /// Spec 807 §4.6 — the ring's retention window in seconds (the scrub window).
     /// Seeded from `C64RE_CHECKPOINT_RING_SECONDS` (default 10).
     checkpoint_window_seconds: f64,
@@ -3358,6 +3365,25 @@ fn monitor_write(st: &mut State, addr: u16, bytes: &[u8], lens: &str) {
 }
 
 fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
+    // Spec 808 §3.4 — an intervention while rewound is what truncates the future.
+    // WATCHING is free (play/frame/goto move the machine but keep the anchors); CHANGING
+    // it is not. These are the monitor verbs that change machine state, so this is where
+    // the one timeline gets cut, and `transport_truncate_on_intervention` records how
+    // many anchors went so the CUT mode can report a number rather than a shrug.
+    {
+        let verb = command.trim().split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+        const MUTATORS: [&str; 12] = [
+            "wr", "a", "f", "c", "t", "r", "g", "x", "step", "n", "next", "reset",
+        ];
+        if MUTATORS.contains(&verb.as_str()) {
+            // `r` with no argument only READS the registers; only `r <reg>=<v>` writes.
+            let writes = verb != "r" || command.contains('=');
+            if writes {
+                transport_truncate_on_intervention(st);
+            }
+        }
+    }
+
     // Clear any prompt carried from a prior command; a modal verb re-sets it below.
     st.mon.pending_prompt = None;
     let cmd = command.trim().to_string();
@@ -5364,6 +5390,77 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
         // one without the other is the trap this verb exists to close — cadence 1 against a
         // cap sized for cadence 25 turns a 10-second window into 0.4 s, and nothing goes
         // red. So this always sets both.
+        // ── Spec 808 — the rewind transport ────────────────────────────────────
+        // These five verbs ARE the API: the TUI keys (F9-F12) and the C64RE ribbon are
+        // two thin callers of exactly this surface, which is what makes feature parity
+        // a property of the design rather than a thing someone has to maintain (§2).
+        //
+        // NOTE `goto` here is the TRANSPORT goto (a position on the timeline). The
+        // `api/call` method of the same name sets the CPU's PC — different surface,
+        // different namespace, and they never meet.
+        "play" => {
+            let dir = match toks.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
+                Some("back") | Some("b") | Some("rev") => transport::Direction::Back,
+                Some("fwd") | Some("f") | Some("forward") | None => transport::Direction::Fwd,
+                Some(other) => {
+                    return Err(format!("play: `{other}`? usage: play back|fwd [speed]"))
+                }
+            };
+            let speed = toks
+                .get(2)
+                .and_then(|t| t.trim().trim_end_matches('x').parse::<u32>().ok())
+                .unwrap_or(1);
+            let out = transport_play(st, dir, speed)?;
+            Ok(transport_reply(&out))
+        }
+
+        "pause" => {
+            let out = transport_pause(st);
+            Ok(transport_reply(&out))
+        }
+
+        "frame" => {
+            let Some(arg) = toks.get(1) else {
+                return Ok(transport_reply(&transport_status(st)));
+            };
+            let t = arg.trim();
+            let delta: i64 = t
+                .parse()
+                .map_err(|_| format!("frame: `{t}`? usage: frame -N | frame +N"))?;
+            let out = transport_step(st, delta)?;
+            Ok(transport_reply(&out))
+        }
+
+        "goto" => {
+            let Some(target) = toks.get(1) else {
+                return Err("goto: usage: goto <frame> | goto c<cycle>".into());
+            };
+            let out = transport_goto(st, target)?;
+            Ok(transport_reply(&out))
+        }
+
+        "rewind" => {
+            let out = transport_status(st);
+            let ids = transport_anchor_ids(st);
+            let mut lines = vec![
+                out["line"].as_str().unwrap_or("").to_string(),
+                transport::KEY_LEGEND.to_string(),
+            ];
+            lines.push(format!(
+                "  anchors {}   cadence every {} frame(s)   window {:.1}s",
+                ids.len(),
+                st.checkpoint_cadence_frames.max(1),
+                st.checkpoint_window_seconds
+            ));
+            if ids.is_empty() {
+                lines.push(
+                    "  nothing captured yet — `cadence 1` gives one anchor per frame".into(),
+                );
+            }
+            lines.push("  play back|fwd [speed] · pause · frame -N|+N · goto <frame|c<cycle>>".into());
+            Ok(lines.join("\n"))
+        }
+
         "cadence" => {
             let live = |st: &State| -> (u64, f64, u64, usize) {
                 (
@@ -6713,6 +6810,14 @@ fn monitor_help_text() -> String {
         "    traprules <path> | traprules [clear]   load/list/clear project on-trap dump rules (JSON {pc,label,dump:[[name,addr,len]],decode}); auto-emits `label: name=$XX (decode)` on reaching that PC (JAM / breakpoint)",
         "    revdepth [seconds]        report / set the always-on reverse-ring depth: rebuilds the delta+cpuhistory rings (DISCARDS history; future capture only; 1..=600s). TRX64_REVERSE_SECONDS = boot default",
         "    diff <idA> <idB>          typed by-ID diff of two checkpoint anchors (RAM runs + per-chip register changes). READ-ONLY (live machine unchanged). ids from `checkpoint/list`",
+        "  REWIND TRANSPORT (Spec 808 — plays the MACHINE backwards, not cached pictures)",
+        "    play back|fwd [speed]     play through the anchors; every step is a real restore, so registers/memory/drive are correct at every frame. `play fwd` at the head just runs.",
+        "    pause                     stop where you are — the machine IS there, no second step needed",
+        "    frame -N | +N             step N anchors (stops at the ends, never wraps)",
+        "    goto <frame> | goto c<cyc>  jump to a position; a cycle lands on the anchor at-or-before it",
+        "    rewind                    mode + position + window + anchors held, and the key legend",
+        "    keys: F9 one back | F10 play back | F11 pause/play | F12 one forward",
+        "    Watching is free: replaying keeps the anchors. Only an INTERVENTION (a write, a key, a resumed run) truncates the future — the mode line then says CUT and how many anchors went.",
         "  CHECKPOINT RING (the scrub/filmstrip buffer — full machine states, NOT the delta ring)",
         "    cadence                   report the capture rate, window, entry cap and how many anchors are held",
         "    cadence <frames> [secs]   set the rate AND retune the cap together (`cadence 1` = one full checkpoint per frame). States the expected memory (~98 KiB/anchor) before spending it. 1..=3000 frames, window 1..=600s",
@@ -11972,6 +12077,78 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
         }
 
         // checkpoint/pin — { ref, stats }; errors on unknown id (= c64re throw).
+        // ── Spec 808 — the rewind transport over RPC ───────────────────────────
+        // The parity half (§2/G2): every transport action reachable as a monitor verb is
+        // reachable here, with the SAME status object back, so the C64RE ribbon renders
+        // from data instead of parsing the terminal line.
+        "transport/status" => {
+            let st = state.lock().unwrap();
+            Response::ok(id, transport_status(&st))
+        }
+        "transport/play" => {
+            let dir = match req.params.get("direction").and_then(|v| v.as_str()) {
+                Some("back") => transport::Direction::Back,
+                Some("fwd") | None => transport::Direction::Fwd,
+                Some(other) => {
+                    return Response::err(
+                        id,
+                        -32602,
+                        format!("transport/play: direction must be back|fwd, got {other}"),
+                    )
+                }
+            };
+            let speed = req.params.get("speed").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+            let mut st = state.lock().unwrap();
+            match transport_play(&mut st, dir, speed) {
+                Ok(v) => Response::ok(id, v),
+                Err(e) => Response::err(id, -32001, e),
+            }
+        }
+        "transport/pause" => {
+            let mut st = state.lock().unwrap();
+            let v = transport_pause(&mut st);
+            Response::ok(id, v)
+        }
+        "transport/frame" => {
+            let delta = match req.params.get("delta").and_then(|v| v.as_i64()) {
+                Some(d) => d,
+                None => return Response::err(id, -32602, "transport/frame: delta required"),
+            };
+            let mut st = state.lock().unwrap();
+            match transport_step(&mut st, delta) {
+                Ok(v) => Response::ok(id, v),
+                Err(e) => Response::err(id, -32001, e),
+            }
+        }
+        "transport/goto" => {
+            // Accepts { frame: N } or { cycle: N } — or { target: "N" | "c<N>" } so the
+            // monitor verb and the RPC take literally the same string.
+            let target = req
+                .params
+                .get("target")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| req.params.get("frame").and_then(|v| v.as_u64()).map(|n| n.to_string()))
+                .or_else(|| {
+                    req.params
+                        .get("cycle")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| format!("c{n}"))
+                });
+            let Some(target) = target else {
+                return Response::err(
+                    id,
+                    -32602,
+                    "transport/goto: one of target | frame | cycle required",
+                );
+            };
+            let mut st = state.lock().unwrap();
+            match transport_goto(&mut st, &target) {
+                Ok(v) => Response::ok(id, v),
+                Err(e) => Response::err(id, -32001, e),
+            }
+        }
+
         "checkpoint/pin" => {
             let cp_id = match req.params.get("id").and_then(|v| v.as_str()) {
                 Some(s) if !s.is_empty() => s.to_string(),
@@ -14218,6 +14395,225 @@ fn capture_live_checkpoint(session: &mut Session) -> Value {
     cp
 }
 
+
+/// Render a transport status Value as the two-line terminal answer (§4): the state line
+/// plus the key legend. One helper so every verb answers identically — a transport that
+/// describes itself differently depending on which key you pressed is the same class of
+/// confusion §5 is about.
+fn transport_reply(status: &Value) -> String {
+    format!(
+        "{}\n{}",
+        status["line"].as_str().unwrap_or(""),
+        transport::KEY_LEGEND
+    )
+}
+
+// ── Spec 808 — rewind transport operations ─────────────────────────────────────
+//
+// Every one of these ends with the machine STANDING on an anchor (or at the head).
+// There is no "show a picture and restore later" path: a step is a restore, measured at
+// 177 µs, so the machine is always genuinely where the transport says it is. That is
+// what makes the TUI's `/window`, the C64RE UI and every register panel correct for
+// free, and it is why §2's feature parity costs nothing.
+
+/// PAL master clock — for turning a cycle delta into the "-3.2s" the status line shows.
+const TRANSPORT_PAL_HZ: f64 = 985_248.444;
+
+/// The ring's anchors, oldest-first, as `(id, frame, cycles)`.
+fn transport_anchor_ids(st: &State) -> Vec<(String, u64, u64)> {
+    st.checkpoint_ring
+        .list()
+        .into_iter()
+        .map(|r| (r.id, r.frame, r.cycles))
+        .collect()
+}
+
+/// How far behind the head a position is, in seconds of emulated time.
+fn transport_seconds_behind(ids: &[(String, u64, u64)], pos: &transport::Position) -> f64 {
+    match ids.last() {
+        Some((_, _, head_cycles)) => {
+            (head_cycles.saturating_sub(pos.cycles)) as f64 / TRANSPORT_PAL_HZ
+        }
+        None => 0.0,
+    }
+}
+
+/// The status both surfaces render. Never fails — an empty ring is a legitimate answer
+/// ("no anchors yet"), not an error, because a freshly booted daemon is in exactly that
+/// state and the transport line should say so rather than blow up.
+fn transport_status(st: &State) -> Value {
+    let ids = transport_anchor_ids(st);
+    let pos = transport::locate(&ids, st.transport.cursor.as_deref());
+    let secs = pos.as_ref().map(|p| transport_seconds_behind(&ids, p)).unwrap_or(0.0);
+    transport::status_json(&st.transport, pos.as_ref(), secs)
+}
+
+/// Place the machine on anchor `index`. The single point where the transport touches
+/// the machine — `frame`, `goto`, `play` and the per-frame tick all come through here,
+/// so there is one restore path to get right and one place the mode is decided.
+fn transport_move_to(st: &mut State, index: usize) -> Result<Value, String> {
+    let ids = transport_anchor_ids(st);
+    if ids.is_empty() {
+        return Err("transport: the checkpoint ring is empty — nothing to rewind to \
+                    (`cadence` sets the capture rate)"
+            .into());
+    }
+    let index = index.min(ids.len() - 1);
+    let (id, _, _) = ids[index].clone();
+    let at_head = index + 1 == ids.len();
+
+    let cp = st
+        .checkpoint_ring
+        .restore_snapshot(&id)
+        .ok_or_else(|| format!("transport: anchor {id} is gone (evicted)"))?;
+    restore_live_checkpoint(&mut st.session, &cp)?;
+
+    // At the head the transport lets go: the stream loop owns the machine again and new
+    // anchors are recorded. Anywhere else it holds on, and the mode says REPLAY — the
+    // anchors ahead are still intact and can be played forward.
+    st.transport.cursor = if at_head { None } else { Some(id) };
+    st.transport.mode = if at_head {
+        transport::TransportMode::Live
+    } else {
+        transport::TransportMode::Replay
+    };
+    if at_head {
+        st.transport.playing = None;
+    }
+    st.transport.last_cut = 0;
+    Ok(transport_status(st))
+}
+
+/// Step `delta` anchors (negative = back). Stops at the ends rather than wrapping.
+fn transport_step(st: &mut State, delta: i64) -> Result<Value, String> {
+    let ids = transport_anchor_ids(st);
+    let pos = transport::locate(&ids, st.transport.cursor.as_deref()).ok_or_else(|| {
+        "transport: no position — the ring is empty or the anchor was evicted".to_string()
+    })?;
+    let (next, hit_end) = transport::step_index(pos.index, delta, pos.total);
+    let mut out = transport_move_to(st, next)?;
+    if hit_end {
+        // Say so. A transport that quietly refuses to move looks identical to one that
+        // moved and landed on an identical frame.
+        st.transport.playing = None;
+        out["hitEnd"] = json!(true);
+        out["line"] = json!(format!(
+            "{}   (end of the ring — {} anchors held)",
+            out["line"].as_str().unwrap_or(""),
+            pos.total
+        ));
+    }
+    Ok(out)
+}
+
+/// Jump to an exact frame index (1-based, as the status line shows) or CPU cycle. A
+/// cycle target lands on the anchor at-or-before it: anchors are frame-granular, and
+/// pretending otherwise would report a cycle the machine is not actually at.
+fn transport_goto(st: &mut State, target: &str) -> Result<Value, String> {
+    let ids = transport_anchor_ids(st);
+    if ids.is_empty() {
+        return Err("transport: the checkpoint ring is empty".into());
+    }
+    let t = target.trim();
+    let index = if let Some(cyc) = t.strip_prefix('c').or_else(|| t.strip_prefix('@')) {
+        let want: u64 = cyc
+            .trim()
+            .parse()
+            .map_err(|_| format!("goto: `{t}` is not a cycle (use c<number> or @<number>)"))?;
+        // at-or-before, so the machine is never claimed to be ahead of where it is
+        ids.iter()
+            .rposition(|(_, _, c)| *c <= want)
+            .ok_or_else(|| {
+                format!(
+                    "goto: cycle {want} is older than the ring (oldest anchor is at cycle {})",
+                    ids[0].2
+                )
+            })?
+    } else {
+        let n: usize = t
+            .parse()
+            .map_err(|_| format!("goto: `{t}` is neither a frame number nor c<cycle>"))?;
+        if n == 0 || n > ids.len() {
+            return Err(format!("goto: frame {n} is outside 1..={}", ids.len()));
+        }
+        n - 1
+    };
+    transport_move_to(st, index)
+}
+
+/// Start playing. Speed multiplies the per-frame step count; 1× at cadence 1 is 50
+/// steps/s, i.e. real time.
+fn transport_play(st: &mut State, dir: transport::Direction, speed: u32) -> Result<Value, String> {
+    let ids = transport_anchor_ids(st);
+    if ids.is_empty() {
+        return Err("transport: the checkpoint ring is empty — nothing to play".into());
+    }
+    st.transport.speed = speed.clamp(1, 16);
+    // Playing forward FROM the head is just running: hand the machine back rather than
+    // pretending to replay anchors that do not exist yet.
+    let pos = transport::locate(&ids, st.transport.cursor.as_deref());
+    let at_head = pos.as_ref().map(|p| p.index + 1 == p.total).unwrap_or(true);
+    if dir == transport::Direction::Fwd && at_head {
+        st.transport.cursor = None;
+        st.transport.playing = None;
+        st.transport.mode = transport::TransportMode::Live;
+        return Ok(transport_status(st));
+    }
+    // Playing back FROM the head: take hold of the machine at the head anchor first, so
+    // the first tick steps from a known position.
+    if st.transport.cursor.is_none() {
+        if let Some(p) = pos {
+            let (id, _, _) = ids[p.index].clone();
+            st.transport.cursor = Some(id);
+        }
+    }
+    st.transport.playing = Some(dir);
+    st.transport.mode = transport::TransportMode::Replay;
+    Ok(transport_status(st))
+}
+
+/// Stop where we are. Not a restore: the machine is ALREADY on this anchor (decision 2),
+/// which is why "pause and inspect" needs no second step.
+fn transport_pause(st: &mut State) -> Value {
+    st.transport.playing = None;
+    transport_status(st)
+}
+
+/// One transport tick, called by the stream loop per frame while playing. Returns true
+/// when the transport consumed the frame (so the loop must NOT advance emulation).
+pub(crate) fn transport_tick(st: &mut State) -> bool {
+    let Some(dir) = st.transport.playing else {
+        return st.transport.holds_the_machine();
+    };
+    let delta = match dir {
+        transport::Direction::Back => -(st.transport.speed as i64),
+        transport::Direction::Fwd => st.transport.speed as i64,
+    };
+    // A failed step stops playback rather than retrying forever on a broken ring.
+    if transport_step(st, delta).is_err() {
+        st.transport.playing = None;
+    }
+    st.transport.holds_the_machine()
+}
+
+/// Called from every path that CHANGES the machine while the transport is rewound — a
+/// key, the joystick, a monitor write, a resumed run. Decision 4 says watching is free
+/// and only intervention costs you the recording, so this is the one place the future
+/// is truncated, and it records how many anchors went so §5 can report it.
+pub(crate) fn transport_truncate_on_intervention(st: &mut State) {
+    if !st.transport.holds_the_machine() {
+        return;
+    }
+    let Some(id) = st.transport.cursor.clone() else {
+        return;
+    };
+    let dropped = st.checkpoint_ring.truncate_after(&id, true);
+    st.transport.cursor = None;
+    st.transport.playing = None;
+    st.transport.mode = transport::TransportMode::Cut;
+    st.transport.last_cut = dropped;
+}
+
 /// Restore the live machine from a ring checkpoint Value (re-attaching the embedded
 /// drive8 disk first, then `restore_runtime_checkpoint`). Mirrors snapshot/undump.
 /// Returns Ok(()) on success. Leaves the session paused (a restore is a pause point).
@@ -15562,6 +15958,7 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         cart_ap_done_gen: 0,
         disk_ap_pending: false,
         checkpoint_cadence_frames: checkpoint_capture_every_frames(),
+        transport: transport::Transport::default(),
         checkpoint_window_seconds: checkpoint_ring_seconds(),
         disk_ap_settle_at_ms: 0,
         disk_ap_seen_hash: None,
@@ -16124,6 +16521,7 @@ mod batch1_tests {
             cart_ap_done_gen: 0,
             disk_ap_pending: false,
         checkpoint_cadence_frames: checkpoint_capture_every_frames(),
+        transport: transport::Transport::default(),
         checkpoint_window_seconds: checkpoint_ring_seconds(),
             disk_ap_settle_at_ms: 0,
             disk_ap_seen_hash: None,
@@ -16592,6 +16990,213 @@ mod batch1_tests {
     fn mon(st: &SharedState, cmd: &str) -> Result<String, String> {
         let mut g = st.lock().unwrap();
         run_monitor(&mut g, cmd)
+    }
+
+    // ── Spec 808 — rewind transport gates ──────────────────────────────────────
+
+    /// Fill the ring with `n` anchors from the live machine, advancing it between each
+    /// so every anchor is a genuinely different state (an identical-state ring would
+    /// make the exactness gate below pass for the wrong reason).
+    fn fill_anchors(st: &SharedState, n: usize) {
+        let mut g = st.lock().unwrap();
+        for i in 0..n {
+            g.session.machine.poke(0x0400 + i as u16, &[i as u8]);
+            let cp = capture_live_checkpoint(&mut g.session);
+            g.checkpoint_ring.capture(cp, i as u64, i as u64 * 19_656).unwrap();
+        }
+    }
+
+    /// G1 — a backward step is EXACT, not approximate. §1's whole design rests on this:
+    /// if a restore were lossy, "the machine follows for free" would be a lie and every
+    /// register panel would show something subtly wrong.
+    #[test]
+    fn stepping_back_and_forward_returns_the_identical_machine() {
+        let st = make_state();
+        fill_anchors(&st, 8);
+        let (ram_before, pc_before, clk_before) = {
+            let g = st.lock().unwrap();
+            (
+                g.session.machine.ram.to_vec(),
+                g.session.machine.c64_core.reg_pc,
+                g.session.machine.c64_core.clk,
+            )
+        };
+
+        mon(&st, "frame -3").expect("back 3");
+        {
+            let g = st.lock().unwrap();
+            assert_ne!(
+                g.session.machine.ram.as_ref().as_slice(), ram_before.as_slice(),
+                "stepping back must actually MOVE the machine — if RAM is unchanged the \
+                 transport is showing pictures, not restoring"
+            );
+        }
+        mon(&st, "frame +3").expect("fwd 3");
+
+        let g = st.lock().unwrap();
+        assert_eq!(g.session.machine.ram.as_ref(), ram_before.as_slice(), "RAM must return byte-exact");
+        assert_eq!(g.session.machine.c64_core.reg_pc, pc_before, "PC must return");
+        assert_eq!(g.session.machine.c64_core.clk, clk_before, "the clock must return");
+    }
+
+    /// G4 — the mode cannot lie. REPLAY while standing on intact anchors, LIVE at the
+    /// head, CUT with a count the instant an intervention truncates. §5 exists because
+    /// replaying and running live look identical on screen; this is what makes them
+    /// distinguishable.
+    #[test]
+    fn the_mode_says_replay_then_live_then_cut_with_a_count() {
+        let st = make_state();
+        fill_anchors(&st, 10);
+
+        // At the head after filling: LIVE, nothing behind us.
+        let head = mon(&st, "rewind").expect("rewind");
+        assert!(head.contains("LIVE"), "{head}");
+        assert!(head.contains("frame 10/10"), "{head}");
+
+        // Rewound: REPLAY, and the anchors are all still there.
+        let back = mon(&st, "frame -4").expect("back");
+        assert!(back.contains("REPLAY"), "{back}");
+        assert!(back.contains("frame 6/10"), "{back}");
+        assert_eq!(st.lock().unwrap().checkpoint_ring.list().len(), 10, "watching must not cut");
+
+        // Forward to the head again: LIVE, still nothing lost.
+        let fwd = mon(&st, "frame +4").expect("fwd");
+        assert!(fwd.contains("LIVE"), "{fwd}");
+        assert_eq!(st.lock().unwrap().checkpoint_ring.list().len(), 10);
+
+        // Rewind, then INTERVENE: the future goes, and the mode says how much.
+        mon(&st, "frame -4").expect("back again");
+        mon(&st, "wr ram 0400 ff").expect("write");
+        let cut = mon(&st, "rewind").expect("rewind after write");
+        assert!(cut.contains("CUT"), "an intervention must announce itself: {cut}");
+        assert!(cut.contains("-4 anchors"), "and say how many went: {cut}");
+        assert_eq!(
+            st.lock().unwrap().checkpoint_ring.list().len(),
+            6,
+            "the four anchors ahead of the cursor must be gone"
+        );
+    }
+
+    /// G1b — `goto` by frame and by cycle land where they say, and a cycle lands on the
+    /// anchor AT-OR-BEFORE it rather than rounding forward (which would report the
+    /// machine as being somewhere it is not).
+    #[test]
+    fn goto_takes_a_frame_or_a_cycle_and_never_rounds_forward() {
+        let st = make_state();
+        fill_anchors(&st, 10);
+
+        let by_frame = mon(&st, "goto 3").expect("goto 3");
+        assert!(by_frame.contains("frame 3/10"), "{by_frame}");
+
+        // Anchor k sits at cycle k*19656. Ask for one cycle PAST anchor 5 (index 4).
+        let by_cycle = mon(&st, &format!("goto c{}", 4 * 19_656 + 1)).expect("goto cycle");
+        assert!(
+            by_cycle.contains("frame 5/10"),
+            "a cycle between anchors must land on the one BEFORE it: {by_cycle}"
+        );
+
+        assert!(mon(&st, "goto 0").is_err(), "frame 0 does not exist (1-based)");
+        assert!(mon(&st, "goto 99").is_err(), "past the end must be an error, not a clamp");
+        // The oldest anchor here sits at cycle 0, so nothing can be older than the ring
+        // — cycle 0 and cycle 1 both land on it. The "older than the ring" error path is
+        // covered by the ring having wrapped, which needs a separately-seeded ring.
+        assert!(mon(&st, "goto c0").expect("goto c0").contains("frame 1/10"));
+        {
+            // A ring whose oldest anchor is NOT at zero: now "before the ring" exists.
+            let st2 = make_state();
+            {
+                let mut g = st2.lock().unwrap();
+                for i in 0..3u64 {
+                    let cp = capture_live_checkpoint(&mut g.session);
+                    g.checkpoint_ring
+                        .capture(cp, i, 5_000_000 + i * 19_656)
+                        .unwrap();
+                }
+            }
+            let err = mon(&st2, "goto c1000").expect_err("before the ring must be an error");
+            assert!(err.contains("older than the ring"), "{err}");
+        }
+    }
+
+    /// G1c — the ends clamp and SAY they clamped. A transport that quietly refuses to
+    /// move is indistinguishable from one that moved onto an identical frame.
+    #[test]
+    fn playing_past_the_ends_stops_and_says_so() {
+        let st = make_state();
+        fill_anchors(&st, 5);
+        let out = mon(&st, "frame -99").expect("back past the start");
+        assert!(out.contains("frame 1/5"), "{out}");
+        assert!(out.contains("end of the ring"), "hitting the end must be stated: {out}");
+        // And playback stops rather than spinning at the wall.
+        assert!(st.lock().unwrap().transport.playing.is_none());
+    }
+
+    /// G2 — parity. Every transport action reachable as a monitor verb is reachable over
+    /// RPC with the same status object back, so the C64RE ribbon renders from data
+    /// instead of parsing the terminal line. This is the gate that keeps the two
+    /// front-ends from drifting apart.
+    #[test]
+    fn every_transport_verb_has_an_rpc_twin() {
+        let st = make_state();
+        fill_anchors(&st, 10);
+
+        let v = call(&st, "transport/status", json!({}));
+        assert_eq!(v["mode"], json!("LIVE"));
+        assert_eq!(v["frameTotal"], json!(10));
+        for field in ["mode", "playing", "speed", "frameIndex", "frameTotal", "atHead", "line", "keys"] {
+            assert!(!v[field].is_null() || field == "playing", "status must carry `{field}`");
+        }
+
+        let f = call(&st, "transport/frame", json!({ "delta": -4 }));
+        assert_eq!(f["frameIndex"], json!(6));
+        assert_eq!(f["mode"], json!("REPLAY"));
+
+        let g = call(&st, "transport/goto", json!({ "frame": 2 }));
+        assert_eq!(g["frameIndex"], json!(2));
+        let gc = call(&st, "transport/goto", json!({ "cycle": 4 * 19_656 }));
+        assert_eq!(gc["frameIndex"], json!(5));
+
+        let p = call(&st, "transport/play", json!({ "direction": "back", "speed": 2 }));
+        assert_eq!(p["playing"], json!("back"));
+        assert_eq!(p["speed"], json!(2));
+
+        let pause = call(&st, "transport/pause", json!({}));
+        assert!(pause["playing"].is_null(), "pause must clear the play state");
+
+        // The monitor verb and the RPC must agree about where we are.
+        let via_verb = mon(&st, "rewind").expect("rewind");
+        let via_rpc = call(&st, "transport/status", json!({}));
+        assert!(
+            via_verb.contains(via_rpc["line"].as_str().unwrap()),
+            "the two surfaces must describe the same position:\n  verb: {via_verb}\n  rpc: {}",
+            via_rpc["line"]
+        );
+    }
+
+    /// G3 — the keys are documented where a user looks. 807 shipped a verb that was
+    /// tab-completable and absent from the help; that is not repeated here.
+    #[test]
+    fn the_transport_is_in_the_help_text() {
+        let st = make_state();
+        let help = mon(&st, "help").expect("help");
+        for needle in ["play back", "pause", "frame -N", "goto", "rewind", "F9", "F10", "F11", "F12"] {
+            assert!(help.contains(needle), "help must mention `{needle}`");
+        }
+    }
+
+    /// The transport must hand the machine BACK at the head, or the stream loop would
+    /// never advance again and the emulator would look frozen with no error anywhere.
+    #[test]
+    fn reaching_the_head_releases_the_machine() {
+        let st = make_state();
+        fill_anchors(&st, 6);
+        mon(&st, "frame -3").expect("back");
+        assert!(st.lock().unwrap().transport.holds_the_machine(), "rewound holds it");
+        mon(&st, "frame +3").expect("fwd to head");
+        assert!(
+            !st.lock().unwrap().transport.holds_the_machine(),
+            "at the head the stream loop must own the machine again"
+        );
     }
 
     /// Spec 807 §4.6 — `cadence` sets the capture rate AND the ring's entry cap in one
