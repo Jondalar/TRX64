@@ -12213,11 +12213,20 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
         // machine.
         "session/tick" => {
             let mut st = state.lock().unwrap();
+            // ADOPT a daemon-side run intent instead of refusing it.
+            //
+            // `session.running` is the autonomous loop's flag, and several daemon ops set
+            // it as a side effect: power on, reset, a CRT mount (which power-cycles).
+            // Refusing the tick then froze the machine after every one of those — the
+            // regression the owner hit immediately.
+            //
+            // The CLI used to reconcile this by forcing the controller back to paused
+            // from OUTSIDE. That reconciliation was right; its location was not. It lives
+            // here now, where the flags do: a controller run is a RUN INTENT, so adopt it
+            // and hand the clock back to the tick loop.
             if st.session.running {
-                return Response::err(
-                    id, -32001,
-                    "session is running under the autonomous loop; use debug/pause before manual ticks",
-                );
+                st.play_intent = true;
+                st.session.running = false;
             }
             let elapsed = req
                 .params
@@ -12273,7 +12282,11 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 let _ = transport_play(&mut st, transport::Direction::Fwd, 1);
             }
             let v = transport_status(&st);
-            Response::ok(id, json!({ "running": true, "transport": v }))
+            Response::ok(id, json!({
+                "running": true,
+                "transport": v,
+                "message": "RUN \u{2014} free-running.",
+            }))
         }
         "session/pause" => {
             let mut st = state.lock().unwrap();
@@ -12283,7 +12296,11 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             let cycles = st.session.machine.clk;
             st.ctrl_stop = Some(CtrlStop { reason: "pause", pc, cycles });
             let v = transport_status(&st);
-            Response::ok(id, json!({ "running": false, "pc": pc, "transport": v }))
+            let message = format!(
+                "PAUSE @ PC=${pc:04X}.\n{}",
+                v["range"].as_str().unwrap_or("")
+            );
+            Response::ok(id, json!({ "running": false, "pc": pc, "transport": v, "message": message }))
         }
         "session/warp" => {
             let mut st = state.lock().unwrap();
@@ -12307,6 +12324,14 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 st.ctrl_stop = Some(CtrlStop { reason: "pause", pc, cycles });
                 let mut v = transport_status(&st);
                 v["action"] = json!("pause");
+                // ONE ready-to-print message. The client prints `message` verbatim and
+                // assembles nothing: assembling it there is why the buffer range appeared
+                // on `/pause` and not on F11 — two call sites, two different fields, one
+                // of them forgotten.
+                v["message"] = json!(format!(
+                    "PAUSE @ PC=${pc:04X}.\n{}",
+                    v["range"].as_str().unwrap_or("")
+                ));
                 v
             } else {
                 // Resuming is ALWAYS forward (Spec 808 §4a).
@@ -12317,6 +12342,10 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 }
                 let mut v = transport_status(&st);
                 v["action"] = json!("play");
+                v["message"] = json!(format!(
+                    "PLAY \u{25b6} forward.\n{}",
+                    v["range"].as_str().unwrap_or("")
+                ));
                 v
             };
             Response::ok(id, out)
@@ -17764,6 +17793,46 @@ mod batch1_tests {
             (48..=52).contains(&dense),
             "and that number is ~50 at cadence 1 (PAL), got {dense}"
         );
+    }
+
+    /// Every door that RESTARTS the machine must leave it running. Power on, reset and
+    /// a CRT mount all set the controller's `session.running` as a side effect, and the
+    /// tick used to REFUSE in that state — so the machine froze after each of them the
+    /// moment the client's reconciliation was removed. One test per door, because the
+    /// regression was invisible until someone pressed the button.
+    #[test]
+    fn every_restart_door_leaves_the_machine_running() {
+        // A CRT mount is the third door and behaves the same (it power-cycles), but it
+        // needs a real .crt on the machine, and the samples are third-party property that
+        // is never committed. Power and reset exercise the identical path.
+        for door in ["power", "reset"] {
+            let st = make_state();
+            match door {
+                "power" => {
+                    call(&st, "session/power", json!({ "op": "on" }));
+                }
+                "reset" => {
+                    call(&st, "session/power", json!({ "op": "on" }));
+                    call(&st, "session/reset", json!({ "mode": "warm" }));
+                }
+                _ => unreachable!(),
+            }
+            let before = st.lock().unwrap().session.machine.c64_core.clk;
+            let r = call(&st, "session/tick", json!({ "cycles": 19_656 }));
+            assert!(
+                r.get("error").is_none(),
+                "{door}: the tick must not refuse — it froze the machine: {r}"
+            );
+            assert_eq!(
+                r["running"], json!(true),
+                "{door}: must leave the machine RUNNING"
+            );
+            let after = st.lock().unwrap().session.machine.c64_core.clk;
+            assert!(
+                after > before,
+                "{door}: the machine must actually advance ({before} -> {after})"
+            );
+        }
     }
 
     /// G2 — parity. Every transport action reachable as a monitor verb is reachable over

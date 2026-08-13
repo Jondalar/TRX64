@@ -301,26 +301,18 @@ impl Engine {
     }
 
     fn verb_run(&self) -> CmdResult {
-        // An EVENT, not a local flag write. The daemon owns the run intent.
-        let _ = self.rpc("session/play", json!({}));
-        CmdResult::text("RUN — free-running.")
+        // An EVENT, not a local flag write; and the reply's message is printed as sent.
+        let v = self.rpc("session/play", json!({})).unwrap_or_default();
+        CmdResult::text(
+            v.get("message").and_then(|m| m.as_str()).unwrap_or("RUN").to_string(),
+        )
     }
 
     fn verb_pause(&self) -> CmdResult {
         let v = self.rpc("session/pause", json!({})).unwrap_or_default();
-        let pc = v.get("pc").and_then(|p| p.as_u64()).unwrap_or(0) as u16;
-        // Pause is where you look at the numbers, so pause prints the buffer range the
-        // daemon sent with the reply.
-        let range = v
-            .get("transport")
-            .and_then(|t| t.get("range"))
-            .and_then(|r| r.as_str())
-            .unwrap_or("");
-        if range.is_empty() {
-            CmdResult::text(format!("PAUSE @ PC=${pc:04X}."))
-        } else {
-            CmdResult::text(format!("PAUSE @ PC=${pc:04X}.\n{range}"))
-        }
+        CmdResult::text(
+            v.get("message").and_then(|m| m.as_str()).unwrap_or("PAUSE").to_string(),
+        )
     }
 
     fn verb_step(&self) -> CmdResult {
@@ -507,23 +499,18 @@ impl Engine {
     /// rewinding means the machine is NOT running, so gating the pump on `running`
     /// alone deadlocked it.
     pub fn transport_toggle(&self) -> CmdResult {
-        // ONE event. The decision — pause everything, or resume forward from wherever we
-        // stand — is the daemon's, because only the daemon knows the whole state. The
-        // client used to read two flags and issue two verbs, which is how F11 came to
-        // need three presses to get from rewind-playing back to playing.
+        // ONE event, ONE message, printed verbatim. The decision AND the wording are the
+        // daemon's, because only it knows the whole state — and because a client that
+        // assembles the text will assemble it differently at its second call site, which
+        // is exactly how the buffer range showed up on `/pause` but not on F11.
         let v = self.rpc("transport/toggle", json!({})).unwrap_or_default();
         self.resync_after_transport_move();
-        let line = v.get("line").and_then(|l| l.as_str()).unwrap_or("");
-        let range = if v.get("action").and_then(|a| a.as_str()) == Some("pause") {
-            v.get("range").and_then(|r| r.as_str()).unwrap_or("")
-        } else {
-            ""
-        };
-        if range.is_empty() {
-            CmdResult::text(line.to_string())
-        } else {
-            CmdResult::text(format!("{line}\n{range}"))
-        }
+        CmdResult::text(
+            v.get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("transport: no reply")
+                .to_string(),
+        )
     }
 
     /// Send a transport verb. The client does not track what it did — the daemon's
