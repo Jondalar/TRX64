@@ -273,16 +273,28 @@ pub fn key_verb(f: u8, _running: bool) -> Option<&'static str> {
 /// ```
 ///
 /// The last row is the one that was broken.
-pub fn f11_verb(running: bool, playing: bool, rewound: bool) -> &'static str {
-    if running {
-        "/pause"
-    } else if playing {
-        "pause"
+pub fn f11_verb(running: bool, playing: bool, rewound: bool) -> F11 {
+    // MOVING is the union of both run-reasons. Reading them separately is what made F11
+    // need two presses to get from rewind-playing back to playing: the first press hit
+    // `/pause` (because the host flag was still set), the second hit the transport
+    // `pause`, and only the third played. One question — "is anything moving?" — and one
+    // answer that stops BOTH.
+    if running || playing {
+        F11::StopEverything
     } else if rewound {
-        "play fwd"
+        F11::Resume("play fwd")
     } else {
-        "/run"
+        F11::Resume("/run")
     }
+}
+
+/// What F11 decided. `StopEverything` needs two verbs (the machine and the transport),
+/// which is why this is not a `&str` — expressing it as one string is what let the two
+/// halves get out of step in the first place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum F11 {
+    StopEverything,
+    Resume(&'static str),
 }
 
 #[cfg(test)]

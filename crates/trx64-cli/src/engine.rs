@@ -560,10 +560,24 @@ impl Engine {
     /// rewinding means the machine is NOT running, so gating the pump on `running`
     /// alone deadlocked it.
     pub fn transport_toggle(&self) -> CmdResult {
+        use trx64_daemon::transport::F11;
         let (playing, rewound) = self.transport_where();
         let running = self.running.load(Ordering::SeqCst);
-        let verb = trx64_daemon::transport::f11_verb(running, playing, rewound);
-        let r = self.exec_line(verb);
+        let r = match trx64_daemon::transport::f11_verb(running, playing, rewound) {
+            // Stop BOTH run-reasons in one press. Clearing only one is what made F11
+            // read as "pause" twice in a row before it would play again.
+            F11::StopEverything => {
+                if playing {
+                    let _ = self.exec_line("pause");
+                }
+                if running {
+                    self.exec_line("/pause")
+                } else {
+                    CmdResult::text("PAUSE")
+                }
+            }
+            F11::Resume(v) => self.exec_line(v),
+        };
         self.sync_transport_pump();
         r
     }

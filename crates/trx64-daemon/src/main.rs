@@ -14596,6 +14596,31 @@ fn transport_move_to(st: &mut State, index: usize) -> Result<Value, String> {
 /// Step `delta` anchors (negative = back). Stops at the ends rather than wrapping.
 fn transport_step(st: &mut State, delta: i64) -> Result<Value, String> {
     let ids = transport_anchor_ids(st);
+    // Spec 808 — stepping FORWARD from the head has no anchor to land on, and refusing
+    // was the wrong answer: "one frame further" is a perfectly good thing to ask for
+    // whether or not a recording happens to lie underneath. So run the emulation for one
+    // frame and stop, which is what single-stepping a paused machine means anyway. The
+    // per-frame pump then captures it, so the ring grows by exactly the frame you asked
+    // to see.
+    let at_head = st.transport.cursor.is_none();
+    if delta > 0 && at_head {
+        let frame_no = st.ctrl_frame;
+        {
+            let (w, h, indices) = st.session.machine.render_canvas_indices();
+            stream_maybe_autocapture(st, frame_no, w, h, &indices);
+        }
+        let mut sink = trx64_core::NullSink;
+        st.session.machine.run_for_full(
+            crate::streaming::CYC_PER_FRAME * delta as u64,
+            &mut sink,
+            |_, _, _, _, _, _, _| {},
+        );
+        st.ctrl_frame = st.ctrl_frame.wrapping_add(delta as u64);
+        st.transport.mode = transport::TransportMode::StepFwd;
+        let mut out = transport_status(st);
+        out["ranLive"] = json!(delta);
+        return Ok(out);
+    }
     let pos = transport::locate(&ids, st.transport.cursor.as_deref()).ok_or_else(|| {
         "transport: no anchors yet — the ring fills while the machine RUNS \
          (`cadence 1` = one per frame; `rewind` shows the count)"
@@ -17359,6 +17384,72 @@ mod batch1_tests {
         // sight — which is the whole point of the parity requirement.
         let out = mon(&st, "frame -2").expect("step back");
         assert!(out.contains("STEP"), "{out}");
+    }
+
+    /// The PICTURE must move. Everything on screen renders from `vic.displayed`, and
+    /// 807 removed the framebuffer from the anchors — so a rewind that restores RAM and
+    /// chips correctly can still leave a frozen image, which is exactly what it did.
+    /// This asserts the visible bytes actually differ across a backward step.
+    #[test]
+    fn stepping_back_changes_what_is_on_the_screen() {
+        // Needs ROMs: without a KERNAL the VIC never draws anything and every canvas is
+        // uniformly black, which would make this pass for the wrong reason.
+        let rom_dir = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../C64ReverseEngineeringMCP/resources/roms"
+        ));
+        if !rom_dir.join("kernal-901227-03.bin").exists() {
+            eprintln!("skip stepping_back_changes_what_is_on_the_screen: ROMs absent");
+            return;
+        }
+        let st = make_state();
+        {
+            let mut g = st.lock().unwrap();
+            g.session.machine.boot_from_dir(rom_dir).expect("boot ROMs");
+            let mut sink = trx64_core::NullSink;
+            g.session.machine.run_for_full(3_000_000, &mut sink, |_, _, _, _, _, _, _| {});
+        }
+        // Give each anchor a visibly different screen: poke screen RAM, then capture.
+        {
+            let mut g = st.lock().unwrap();
+            for i in 0..8u64 {
+                let row: Vec<u8> = (0..40).map(|c| (i as u8).wrapping_add(c as u8)).collect();
+                g.session.machine.poke(0x0400, &row);
+                // Draw a frame so `displayed` reflects the poke, then capture THAT.
+                let mut sink = trx64_core::NullSink;
+                g.session.machine.run_for_full(
+                    crate::streaming::CYC_PER_FRAME,
+                    &mut sink,
+                    |_, _, _, _, _, _, _| {},
+                );
+                let cp = capture_live_checkpoint(&mut g.session);
+                g.checkpoint_ring.capture(cp, i, i * 19_656).unwrap();
+            }
+        }
+        let screen_now = st.lock().unwrap().session.machine.render_canvas_indices().2;
+
+        mon(&st, "frame -4").expect("back 4");
+        let screen_back = st.lock().unwrap().session.machine.render_canvas_indices().2;
+        assert_ne!(
+            screen_now, screen_back,
+            "the rendered canvas must CHANGE when stepping back — if it does not, the \
+             transport is moving RAM while the screen stays frozen, which is what a user \
+             sees as 'it does not play backwards'"
+        );
+
+        // Landing on the SAME anchor twice must show the same picture — the regeneration
+        // has to be deterministic, or backward playback would shimmer. (Compared against
+        // an intermediate anchor, not the head: the head releases the cursor and the
+        // machine runs on, so its picture is legitimately one frame further along.)
+        mon(&st, "frame +2").expect("fwd 2");
+        let screen_mid_a = st.lock().unwrap().session.machine.render_canvas_indices().2;
+        mon(&st, "frame -2").expect("back 2");
+        mon(&st, "frame +2").expect("fwd 2 again");
+        let screen_mid_b = st.lock().unwrap().session.machine.render_canvas_indices().2;
+        assert_eq!(
+            screen_mid_a, screen_mid_b,
+            "the same anchor must regenerate the same picture every time"
+        );
     }
 
     /// G2 — parity. Every transport action reachable as a monitor verb is reachable over

@@ -173,9 +173,24 @@ bug until the diagram existed:
 | F11 "paused" but the machine kept running | the key ran the transport `pause` (stop playback) instead of the cockpit `/pause` (stop machine) |
 | after a reset, rewinding undid the reset | reset TRUNCATED the ring; it must DISCARD it — a reset replaces the machine, so every anchor describes one that is gone |
 
-**F11 is therefore a decision, not a mapping** (`transport::f11_verb`): if anything is
-moving, stop it; otherwise resume from where we are, and "resume" is `play fwd` when
-rewound and `/run` at the head. The four rows are one match arm each and one test each.
+**F11 is therefore a decision, not a mapping** (`transport::f11_verb`), and it is a
+**two-state toggle**: the question is "is anything moving?", where *moving* is the union
+of both run-reasons. Reading them separately made F11 need three presses to get from
+rewind-playing back to playing — the first cleared the host run flag, the second cleared
+the transport, and only the third played. `StopEverything` clears both.
+
+```
+    moving = machine running  OR  transport playing
+
+    moving  → stop both
+    still   → go: `play fwd` when rewound, `/run` at the head
+```
+
+**And a forward step at the head runs the emulation.** Refusing it (there is no anchor
+ahead) was the wrong answer: "one frame further" is a reasonable thing to ask for whether
+or not a recording lies underneath, and it is what single-stepping a paused machine has
+always meant. The per-frame capture then records that frame, so the ring grows by exactly
+the frame you asked to see.
 
 **And a reset is not a divergence.** Truncation is for *diverging* from a rewound
 position — the anchors before the cursor stay valid. A reset, a power cycle or a media
