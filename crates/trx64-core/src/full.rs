@@ -384,18 +384,31 @@ impl<'a> FullBus<'a> {
                 (v & 0x0f) | 0xf0
             }
             0xdc00..=0xdcff => {
-                // CIA1 PA ($DC00) carries the keyboard COLUMN drive output AND
-                // joystick port 2 (bits 0-4, active-low). VICE c64cia1.c:337
-                // read_ciapa: byte = (val & (PRA|~DDRA)) & read_joyport_dig(JOY2),
-                // where `val` is the keyboard back-scan (= 0xff in the dominant
-                // case — KERNAL never drives PB columns). c64re cia1.ts:86-92
-                // collapses this to `((PRA | ~DDRA) & joy2) & 0xff`. The joystick
-                // pulls bits LOW via the final AND, regardless of DDR / PR latch.
+                // CIA1 PA ($DC00) carries the keyboard COLUMN lines AND joystick
+                // port 2 (bits 0-4, active-low). VICE c64cia1.c:337 read_ciapa:
+                // byte = (val & (PRA|~DDRA)) & read_joyport_dig(JOY2), where
+                // `val` is the keyboard BACK-SCAN — the columns pulled low by the
+                // keys sitting on whichever rows port B is driving.
+                //
+                // That back-scan used to be assumed 0xff, on the grounds that the
+                // KERNAL never drives PB. The KERNAL does not; games do. A title we
+                // scans the matrix both ways in its IRQ — DDRB=$ff, PRB=$00, read
+                // $DC00 — and bails out the instant it reads $ff, so with the
+                // assumption baked in NO key ever reached the game. Measured on
+                // the live machine: its handler ran 477 times and queued nothing.
+                //
+                // `pb_out` is what port B is actually driving (= VICE `old_pb`),
+                // ANDed with joystick 1, which pulls the same lines low.
                 if (addr & 0xf) == crate::cia::CIA_PRA as u16 {
                     let pra = self.cia1.peek(0xdc00);
                     let ddra = self.cia1.peek(0xdc02);
-                    let joy = crate::keyboard::joystick_active_low_mask(&self.joystick2);
-                    ((pra | !ddra) & joy) & 0xff
+                    let prb = self.cia1.peek(0xdc01);
+                    let ddrb = self.cia1.peek(0xdc03);
+                    let joy1 = crate::keyboard::joystick_active_low_mask(&self.joystick1);
+                    let pb_out = ((prb | !ddrb) & joy1) & 0xff;
+                    let val = self.keyboard.read_columns_for_pb(self.clk, pb_out);
+                    let joy2 = crate::keyboard::joystick_active_low_mask(&self.joystick2);
+                    ((val & ((pra | !ddra) & 0xff)) & joy2) & 0xff
                 }
                 // CIA1 PB ($DC01) carries the keyboard ROW lines AND joystick
                 // port 1 (bits 0-4, active-low). VICE c64cia1.c:425-431 read_ciapb:
@@ -975,6 +988,70 @@ mod joystick_gate_tests {
             );
             assert_eq!(bus.io_read(0xdc00), 0xff & !0x05, "joy2 up+left → PA bits 0+2 low");
         }
+    }
+
+    /// A real title's own IRQ scan, at the bus. The game drives the ROWS and reads
+    /// the COLUMNS, then the other way round, to build a full key code:
+    ///
+    /// ```text
+    /// $50be  STX $dc03    ; DDRB = $ff   port B output
+    /// $50c1  STY $dc01    ; PRB  = $00   drive every row
+    /// $50c4  STY $dc02    ; DDRA = $00   port A input
+    /// $50c7  LDA $dc00    ; read the columns
+    /// ```
+    ///
+    /// `$DC00` used to answer `$ff` here whatever was pressed, because the
+    /// back-scan was assumed away ("the KERNAL never drives PB columns"). The
+    /// scanner reads that, treats it as "no key", and returns — so SPACE, and
+    /// every other key, was invisible to the game.
+    #[test]
+    fn dc00_pa_read_sees_a_key_when_the_game_drives_the_rows() {
+        let mut ram = [0u8; 0x10000];
+        let basic = [0u8; 0x2000];
+        let kernal = [0u8; 0x2000];
+        let chargen = [0u8; 0x1000];
+        let mut io = [0u8; 0x1000];
+        let mut vic = VicII::new();
+        let mut cia1 = Cia::new();
+        let mut cia2 = Cia::new();
+        let tab = crate::cia::new_table();
+        let mut sid_regs = [0u8; 32];
+        let mut sid = Sid6581::new();
+        let mct = build_memconfig_table();
+        let mut drive = crate::drive::Drive1541::new();
+        let mut iec = crate::iec::IecCore::new();
+
+        let mut kb = KeyboardMatrix::new();
+        kb.key_down("SPACE"); // column 7, row 4
+
+        let mut bus = make_bus(
+            &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
+            &mut cia2, &tab, &mut sid_regs, &mut sid, &mct, &mut drive, &mut iec,
+            &kb, JoystickState::default(), JoystickState::default(),
+        );
+
+        // The game's sequence, verbatim.
+        bus.io_write(0xdc03, 0xff); // DDRB = $ff, port B drives
+        bus.io_write(0xdc01, 0x00); // PRB  = $00, every row low
+        bus.io_write(0xdc02, 0x00); // DDRA = $00, port A reads
+        assert_eq!(
+            bus.io_read(0xdc00),
+            0xff & !(1 << 7),
+            "SPACE sits on column 7 — it must pull PA7 low"
+        );
+
+        // And the ordinary direction still answers, unchanged.
+        bus.io_write(0xdc02, 0xff); // DDRA = $ff, port A drives
+        bus.io_write(0xdc00, 0x00); // PRA  = $00, every column low
+        bus.io_write(0xdc03, 0x00); // DDRB = $00, port B reads
+        assert_eq!(bus.io_read(0xdc01), 0xff & !(1 << 4), "SPACE is on row 4");
+
+        // Nothing pressed on the driven rows → nothing pulled. (Drive only row 0;
+        // SPACE is on row 4.)
+        bus.io_write(0xdc03, 0xff);
+        bus.io_write(0xdc01, 0xff & !(1 << 0));
+        bus.io_write(0xdc02, 0x00);
+        assert_eq!(bus.io_read(0xdc00), 0xff, "a row with no key pressed pulls nothing");
     }
 
     #[test]

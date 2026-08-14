@@ -1037,6 +1037,66 @@ impl Default for Drive1541 {
 mod tests {
     use super::*;
 
+    /// BUG-045 follow-up — the drive's activity LED is the LED, not the motor.
+    ///
+    /// `session/drive_status` used to report `ledOn = motorOn`, which is a
+    /// different fact: the motor keeps spinning through idle waits and spin-down,
+    /// so a drive doing nothing looked busy and a drive working looked the same.
+    /// The real line is VIA2 PB bit 3, and it is only driven when DDRB says that
+    /// pin is an output.
+    #[test]
+    fn the_activity_led_is_pb3_and_not_the_motor() {
+        use crate::viacore::{VIA_DDRB, VIA_PRB};
+        let mut d = Drive1541::new();
+        d.via2.via[VIA_DDRB] = 0xff; // every PB pin an output
+
+        // Motor on (bit 2), LED off — the state that used to read as "busy".
+        d.via2.via[VIA_PRB] = 0x04;
+        assert!(!d.led_on(), "a spinning motor is not an active LED");
+
+        // LED on, motor off — the state that used to be invisible.
+        d.via2.via[VIA_PRB] = 0x08;
+        assert!(d.led_on(), "PB3 high with PB3 an output means the LED is lit");
+
+        // A pin that is an INPUT drives nothing, whatever the register holds.
+        d.via2.via[VIA_DDRB] = 0xff & !0x08;
+        assert!(!d.led_on(), "PB3 as an input cannot light the LED");
+    }
+
+    /// The LED's brightness is a DUTY CYCLE, integrated — not the level sampled
+    /// at whatever moment a client happened to poll. A fastloader pulses the LED
+    /// far faster than anyone polls; sampling it turns "working" into a coin flip.
+    #[test]
+    fn led_brightness_integrates_the_duty_cycle() {
+        let mut r = crate::rotation::Rotation::new();
+
+        // Held on for the whole period → full brightness.
+        r.led_last_change_clk = 0;
+        r.led_last_uiupdate_clk = 0;
+        assert_eq!(r.led_pwm(1000, true), 1000, "on for the whole period");
+
+        // Held off for the whole period → dark.
+        assert_eq!(r.led_pwm(2000, false), 0, "off for the whole period");
+
+        // On for half of it: 500/1000 linear, bent by the perceptual square root
+        // VICE applies (drive.c:910-915) → ~707, i.e. clearly bright rather than
+        // "half", which is the point of the curve.
+        r.led_active_ticks = 500;
+        let pwm = r.led_pwm(3000, false);
+        assert!(
+            (700..=715).contains(&pwm),
+            "a 50% duty cycle must read as clearly lit, got {pwm}"
+        );
+
+        // Reading CONSUMES the accumulator — the question is "since you last asked".
+        assert_eq!(r.led_active_ticks, 0);
+
+        // More on-time than the period (a reset while lit) clamps instead of
+        // overflowing past 1000 — drive.c:902-907 guards the same case.
+        r.led_active_ticks = 10_000;
+        assert_eq!(r.led_pwm(4000, false), 1000);
+    }
+
     #[test]
     fn drive_bus_ram_mirror() {
         let mut d = Drive1541::new();

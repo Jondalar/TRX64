@@ -8588,7 +8588,15 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
         }
 
         "session/state" => {
-            let st = state.lock().unwrap();
+            let mut st = state.lock().unwrap();
+            // The device panels ride along, composed under THIS lock. A cockpit
+            // showing CPU, VIC and drive in one row would otherwise poll three
+            // RPCs per refresh and take the daemon's lock three times to draw one
+            // frame — which is how the input loop ended up competing with the
+            // emulation thread (BUG-044). Taken first, before the read borrows.
+            let drive_json = drive_status_json(&mut st);
+            let cart_json_live = cart_status_json(&mut st);
+            let st = st;
             // Spec 771.2 — report the REAL run/pause state + last stop reason (was
             // hardcoded "paused", which kept the UI's seed poll permanently frozen).
             // Mirrors session/state in ws-server.ts (runState/stopReason/controlOwner).
@@ -8720,6 +8728,10 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 obj.insert("name".to_string(), json!(n));
             }
             state_json["media"] = json!({ "cart": cart_json, "disk": media_entry(&disk_path) });
+            // `media` says what is INSERTED (a path, a size, an mtime). `device`
+            // says what those devices are DOING right now — the LED, the head, the
+            // bank. Two different questions, and a panel needs the second one.
+            state_json["device"] = json!({ "drive8": drive_json, "cart": cart_json_live });
             Response::ok(id, state_json)
         }
 
@@ -9038,58 +9050,11 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
         }
 
         // session/drive_status — drive LED/motor/track/PC + IEC bus snapshot
-        // (ws-server.ts:1499). c64re's vice probe lacks a motor flag and approximates
-        // motorOn from the LED; TRX64 is the mirror — the motor bit
-        // (rotation.byte_ready_active & BRA_MOTOR_ON) is public but the LED (VIA2 PB3)
-        // is not, so ledOn is derived from motorOn (DOS lights the LED while the motor
-        // spins — c64re's own stated rationale, inverted). rwMode defaults read.
-        // Shape matches the TS exactly.
+        // (ws-server.ts:1499). Composed by `drive_status_json`, which `session/state`
+        // uses too, so no client has to take the lock twice to draw one panel.
         "session/drive_status" => {
-            use trx64_core::rotation::BRA_MOTOR_ON;
-            let st = state.lock().unwrap();
-            let m = &st.session.machine;
-            let drv = &m.drive8;
-            let half_track = (drv.rotation.current_half_track & 0xff) as u64;
-            let track = half_track / 2;
-            // T2.3 — sector under the GCR read head (ws-server.ts:1519-1524):
-            // viceSectorUnderHead returns -1 for no header / empty track; the TS
-            // keeps `sector` at 0 in that case (only assigns when `sec >= 0`).
-            let sector: u64 = {
-                let sec = drv.rotation.sector_under_head();
-                if sec >= 0 { sec as u64 } else { 0 }
-            };
-            let motor_on = (drv.rotation.byte_ready_active & BRA_MOTOR_ON) != 0;
-            let led_on = motor_on;
-            let led_pwm: u64 = if led_on { 1000 } else { 0 };
-            let drive_pc = drv.core.reg_pc as u64;
-            let c64_pc = m.cpu6510.reg_pc;
-            let dd00pra = m.cia2.peek(0xdd00) as u64;
-            let dd00ddr = m.cia2.peek(0xdd02) as u64;
-            // Transfer-mode heuristic (ws-server.ts:1551): KERNAL serial bands vs
-            // the drive idle wait-loop vs custom.
-            let transfer_mode = if (0xE000..=0xFFFF).contains(&c64_pc) {
-                "kernal"
-            } else if (0xF400..=0xF800).contains(&c64_pc) {
-                "kernal"
-            } else if (0xEBFD..=0xECC0).contains(&drv.core.reg_pc) {
-                "idle"
-            } else {
-                "custom"
-            };
-            Response::ok(id, json!({
-                "device": 8,
-                "ledOn": led_on,
-                "ledFlashing": false,
-                "ledPwm": led_pwm,
-                "motorOn": motor_on,
-                "rwMode": "read",
-                "halfTrack": half_track,
-                "track": track,
-                "sector": sector,
-                "drivePc": drive_pc,
-                "dd00": { "pra": dd00pra, "ddr": dd00ddr },
-                "transferMode": transfer_mode
-            }))
+            let mut st = state.lock().unwrap();
+            Response::ok(id, drive_status_json(&mut st))
         }
 
         // session/cart_status — live cartridge status (ws-server.ts:1581). Returns
@@ -9102,55 +9067,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
         // booted is false (no cartBootedFrom tracking in TRX64).
         "session/cart_status" => {
             let mut st = state.lock().unwrap();
-            // Spec 709.13 — sourceName is the mounted FILE name (TS = getCartridgeMedia().name,
-            // ws-server.ts:1581), NOT the cartridge_image CRT-header name. The CRT header name
-            // is baked at build time and shared across a project's derived carts, so reporting
-            // it makes the CART label look stale/cached + wrong (e.g. "WASTELAND EF MENU POC"
-            // for every wasteland cart). The mounted file path is the backend truth.
-            let cart_path = st.session.cart_path.clone();
-            let m = &st.session.machine;
-            match m.cartridge.as_ref() {
-                None => Response::ok(id, Value::Null),
-                Some(cart) => {
-                    let type_str = mapper_type_str(cart.mapper_type());
-                    let bank = cart.get_state().current_bank as u64;
-                    let lines = cart.get_lines();
-                    let mapped = lines.exrom == 0 || lines.game == 0;
-                    let source_name = if cart_path.is_empty() {
-                        None
-                    } else {
-                        Some(
-                            std::path::Path::new(&cart_path)
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| cart_path.clone()),
-                        )
-                    };
-                    // BUG-042 write-LED: track writableGeneration across polls.
-                    let gen = cart.writable_generation();
-                    if gen != st.cart_led_gen {
-                        st.cart_led_gen = gen;
-                        st.cart_led_last_write_at = Some(std::time::Instant::now());
-                    }
-                    let write_held = st.cart_led_last_write_at
-                        .map(|t| t.elapsed() < std::time::Duration::from_millis(1200))
-                        .unwrap_or(false);
-                    let activity: &str = if write_held {
-                        "write"
-                    } else if mapped {
-                        "read"
-                    } else {
-                        "idle"
-                    };
-                    Response::ok(id, json!({
-                        "type": type_str,
-                        "bank": bank,
-                        "activity": activity,
-                        "booted": false,
-                        "sourceName": source_name
-                    }))
-                }
-            }
+            Response::ok(id, cart_status_json(&mut st))
         }
 
         // session/drive_power — drive 8 cold re-init (ws-server.ts:1620). Single
@@ -14086,8 +14003,13 @@ impl MediaKind {
     }
 }
 
-/// The four legal `.d64` lengths (35/35+errors/40/40+errors tracks).
-const D64_SIZES: [usize; 4] = [174_848, 175_531, 196_608, 197_376];
+/// Is this a legal `.d64` length?
+///
+/// Delegates to the core's VICE walk ([`trx64_core::gcr::d64_tracks_for_len`],
+/// = `disk_image_check_for_d64`, fsimage-probe.c:83-122): 35..42 tracks, each
+/// extra track 17 blocks, each length legal bare or with an error map. The old
+/// four-entry table named only 35 and 40 and silently rejected 36-39/41/42 —
+/// and, worse, said "D64" for a 40-track image the encoder then truncated to 35.
 
 /// BUG-041 — does a PRG want to be RUN?
 ///
@@ -14142,8 +14064,8 @@ pub(crate) fn detect_media_kind(bytes: &[u8], name: &str) -> Result<MediaKind, S
     if bytes.len() >= 8 && &bytes[..8] == trx64_core::native_snapshot::NATIVE_SNAPSHOT_MAGIC {
         return Ok(MediaKind::Snapshot);
     }
-    // 2. Size — a .d64 has no magic but exactly four legal lengths.
-    if D64_SIZES.contains(&bytes.len()) {
+    // 2. Size — a .d64 has no magic, but its length names its track count.
+    if trx64_core::gcr::d64_tracks_for_len(bytes.len()).is_some() {
         return Ok(MediaKind::D64);
     }
     // 3. Last resort. A PRG is never a positive match; it is what is left.
@@ -14263,6 +14185,133 @@ fn persist_outgoing_disk(st: &mut State) -> Option<String> {
 /// the new one, else the outgoing disk's writes are lost (audit ws-media-0). No-op
 /// outgoing-persist on the first mount (no disk attached). Records the new path as
 /// the session's disk identity. Returns the persisted-outgoing host path, if any.
+/// The live drive-8 panel: LED, motor, head position, drive PC, the IEC port and
+/// the transfer-mode guess. One composition, used by `session/drive_status` AND
+/// by `session/state`.
+///
+/// It lives in one function because a client that wants CPU, VIC and drive in the
+/// same panel must not have to take the daemon's lock three times to draw one
+/// frame — that is how the cockpit ended up competing with the emulation thread
+/// for the lock (BUG-044).
+///
+/// The LED is the REAL one: VIA2 PB bit 3, the line a 1541 actually lights, with
+/// its duty cycle integrated the way VICE does it (`Rotation::led_pwm`). It used
+/// to be derived from the motor, which is a different fact and a much worse one:
+/// the motor keeps spinning through idle waits and spin-down, so a drive that was
+/// doing nothing reported a steady bright green, and there was no way to see it
+/// work. `rwMode` was likewise a hardcoded "read", which put the write state out
+/// of reach of every client.
+///
+/// `&mut` because the LED read-out consumes its accumulator — the honest answer is
+/// "how busy since you last asked".
+fn drive_status_json(st: &mut State) -> Value {
+    use trx64_core::rotation::BRA_MOTOR_ON;
+    let drive_clk = st.session.machine.drive8.drive_clk;
+    let led_on = st.session.machine.drive8.led_on();
+    let led_pwm = st.session.machine.drive8.rotation.led_pwm(drive_clk, led_on) as u64;
+
+    let m = &st.session.machine;
+    let drv = &m.drive8;
+    let half_track = (drv.rotation.current_half_track & 0xff) as u64;
+    let track = half_track / 2;
+    // T2.3 — sector under the GCR read head (ws-server.ts:1519-1524):
+    // viceSectorUnderHead returns -1 for no header / empty track; the TS
+    // keeps `sector` at 0 in that case (only assigns when `sec >= 0`).
+    let sector: u64 = {
+        let sec = drv.rotation.sector_under_head();
+        if sec >= 0 { sec as u64 } else { 0 }
+    };
+    let motor_on = (drv.rotation.byte_ready_active & BRA_MOTOR_ON) != 0;
+    // rotation.read_write_mode: true = read (drivetypes.ts:534, "0 = write").
+    let rw_mode = if drv.rotation.read_write_mode { "read" } else { "write" };
+    let drive_pc = drv.core.reg_pc as u64;
+    let c64_pc = m.cpu6510.reg_pc;
+    let dd00pra = m.cia2.peek(0xdd00) as u64;
+    let dd00ddr = m.cia2.peek(0xdd02) as u64;
+    // Transfer-mode heuristic (ws-server.ts:1551): KERNAL serial bands vs
+    // the drive idle wait-loop vs custom.
+    let transfer_mode = if (0xE000..=0xFFFF).contains(&c64_pc) {
+        "kernal"
+    } else if (0xF400..=0xF800).contains(&c64_pc) {
+        "kernal"
+    } else if (0xEBFD..=0xECC0).contains(&drv.core.reg_pc) {
+        "idle"
+    } else {
+        "custom"
+    };
+    json!({
+        "device": 8,
+        "ledOn": led_on,
+        "ledFlashing": false,
+        "ledPwm": led_pwm,
+        "motorOn": motor_on,
+        "rwMode": rw_mode,
+        "halfTrack": half_track,
+        "track": track,
+        "sector": sector,
+        "drivePc": drive_pc,
+        "dd00": { "pra": dd00pra, "ddr": dd00ddr },
+        "transferMode": transfer_mode
+    })
+}
+
+/// The live cartridge panel, or `null` when the port is empty. Same rationale as
+/// [`drive_status_json`]: composed once, served by `session/cart_status` and
+/// carried inside `session/state`.
+fn cart_status_json(st: &mut State) -> Value {
+    // Spec 709.13 — sourceName is the mounted FILE name (TS = getCartridgeMedia().name,
+    // ws-server.ts:1581), NOT the cartridge_image CRT-header name. The CRT header name
+    // is baked at build time and shared across a project's derived carts, so reporting
+    // it makes the CART label look stale/cached + wrong (e.g. "WASTELAND EF MENU POC"
+    // for every wasteland cart). The mounted file path is the backend truth.
+    let cart_path = st.session.cart_path.clone();
+    let (type_str, bank, mapped, gen) = match st.session.machine.cartridge.as_ref() {
+        None => return Value::Null,
+        Some(cart) => {
+            let lines = cart.get_lines();
+            (
+                mapper_type_str(cart.mapper_type()),
+                cart.get_state().current_bank as u64,
+                lines.exrom == 0 || lines.game == 0,
+                cart.writable_generation(),
+            )
+        }
+    };
+    let source_name = if cart_path.is_empty() {
+        None
+    } else {
+        Some(
+            std::path::Path::new(&cart_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| cart_path.clone()),
+        )
+    };
+    // BUG-042 write-LED: track writableGeneration across polls.
+    if gen != st.cart_led_gen {
+        st.cart_led_gen = gen;
+        st.cart_led_last_write_at = Some(std::time::Instant::now());
+    }
+    let write_held = st
+        .cart_led_last_write_at
+        .map(|t| t.elapsed() < std::time::Duration::from_millis(1200))
+        .unwrap_or(false);
+    let activity: &str = if write_held {
+        "write"
+    } else if mapped {
+        "read"
+    } else {
+        "idle"
+    };
+    json!({
+        "type": type_str,
+        "bank": bank,
+        "activity": activity,
+        "booted": false,
+        "sourceName": source_name
+    })
+}
+
 fn mount_disk_media(st: &mut State, image: DiskImage, new_path: &str) -> Option<String> {
     // Implicit eject: persist + detach the outgoing disk first (mount-disk-media.ts:
     // 77-82). Only when a disk is actually attached (first mount → None).
@@ -17956,6 +18005,37 @@ mod batch1_tests {
         assert!(s["dd00"]["ddr"].is_u64());
         assert!(s["transferMode"].is_string());
 
+        // `rwMode` REPORTS the drive; it used to be the string "read", hardcoded,
+        // so no client could ever see a write.
+        st.lock().unwrap().session.machine.drive8.rotation.read_write_mode = false;
+        let w = call(&st, "session/drive_status", json!({}));
+        assert_eq!(w["rwMode"], json!("write"), "a writing drive must say so");
+        st.lock().unwrap().session.machine.drive8.rotation.read_write_mode = true;
+
+        // A spinning motor with a dark LED reads as an IDLE drive — it used to
+        // read as a busy one, because `ledOn` was `motorOn`. Asserted where the
+        // VIA registers are reachable: `the_activity_led_is_pb3_and_not_the_motor`
+        // in trx64-core/src/drive.rs.
+        {
+            let mut g = st.lock().unwrap();
+            g.session.machine.drive8.rotation.byte_ready_active |=
+                trx64_core::rotation::BRA_MOTOR_ON;
+        }
+        let idle = call(&st, "session/drive_status", json!({}));
+        assert_eq!(idle["motorOn"], json!(true), "the motor is spinning");
+        assert_eq!(idle["ledOn"], json!(false), "but the drive is not working");
+
+        // And the same panel rides inside session/state, so a cockpit drawing CPU,
+        // VIC and drive in one row takes the lock ONCE per frame instead of three
+        // times (BUG-044's open half was exactly this contention).
+        let full = call(&st, "session/state", json!({}));
+        for k in ["ledOn", "motorOn", "rwMode", "track", "sector", "drivePc", "transferMode"] {
+            assert!(!full["device"]["drive8"][k].is_null(), "state.device.drive8.{k}");
+        }
+        assert_eq!(full["device"]["drive8"]["motorOn"], json!(true));
+        // No cart inserted → the cart panel is null, not an empty object.
+        assert!(full["device"]["cart"].is_null(), "an empty port reports null");
+
         let p = call(&st, "session/drive_power", json!({}));
         assert_eq!(p["device"], json!(8));
         assert_eq!(p["reinitialized"], json!(true));
@@ -18716,13 +18796,50 @@ mod batch1_tests {
         snap.extend_from_slice(&[0u8; 64]);
         assert_eq!(detect_media_kind(&snap, "x.prg").unwrap(), MediaKind::Snapshot);
 
-        // A .d64 has no magic — it has exactly four legal lengths.
-        let d64 = vec![0u8; 174_848];
-        assert_eq!(detect_media_kind(&d64, "anything.bin").unwrap(), MediaKind::D64);
+        // A .d64 has no magic — its LENGTH names its track count, 35..42, bare or
+        // with an error map. Every one of those is a disk, not a PRG.
+        for tracks in 35u8..=42 {
+            let blocks = 683 + (tracks as usize - 35) * 17;
+            for len in [blocks * 256, blocks * 256 + blocks] {
+                assert_eq!(
+                    detect_media_kind(&vec![0u8; len], "anything.bin").unwrap(),
+                    MediaKind::D64,
+                    "{tracks}-track d64 ({len} bytes) must be a disk"
+                );
+            }
+        }
+        // The shape that regressed, named explicitly.
+        assert_eq!(detect_media_kind(&vec![0u8; 196_608], "sideA.d64").unwrap(), MediaKind::D64);
 
         // And a PRG is never a positive match: it is what is left.
         let prg = vec![0x00, 0xC0, 0xA9, 0x00, 0x60];
         assert!(matches!(detect_media_kind(&prg, "x.d64").unwrap(), MediaKind::Prg { .. }));
+    }
+
+    /// BUG-045 — mounting a 40-track image must make its extra tracks READABLE, not
+    /// just accepted. The bug was one layer below detection: `media/mount` said "d64"
+    /// for a 196608-byte file and the GCR encoder then truncated it to 35 tracks, so
+    /// the loader stepped to track 36 and found an unformatted 0x55 fill.
+    #[test]
+    fn a_mounted_40_track_disk_carries_its_extra_tracks() {
+        // A 40-track image whose track 36-40 sectors are distinguishable from fill.
+        let mut bytes = vec![0u8; 196_608];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        assert_eq!(detect_media_kind(&bytes, "sideA.d64").unwrap(), MediaKind::D64);
+
+        let img = trx64_core::gcr::GcrImage::from_d64(&bytes);
+        for track in 36u8..=40 {
+            let raw = &img.tracks[(track as usize) * 2 - 2];
+            for sector in 0..trx64_core::gcr::d64_sectors_per_track(track) {
+                let mut decoded = [0u8; 256];
+                let rf = trx64_core::gcr::gcr_read_sector(raw, &mut decoded, sector);
+                assert_eq!(rf, trx64_core::gcr::CBMDOS_FDC_ERR_OK, "T{track} S{sector}");
+                let off = trx64_core::gcr::d64_linear_sector(track, sector, 40).unwrap() * 256;
+                assert_eq!(&decoded[..], &bytes[off..off + 256], "T{track} S{sector}");
+            }
+        }
     }
 
     /// The autostart rule, checked rather than assumed. `$0801` plus a valid BASIC line
