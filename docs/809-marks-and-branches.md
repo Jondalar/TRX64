@@ -156,6 +156,79 @@ asm-file <path>          the same from a file
 that, it is a `.prg` and `bload` already exists. This is the small door: "these six
 instructions, at this address".
 
+## §5b The API, and what the TUI does with it
+
+808 taught this the hard way: the daemon owns the state and the clients render it, so the
+SHAPE OF THE REPLY IS THE DESIGN. Writing the verbs and leaving "there is an RPC twin" as a
+gate is how a client ends up composing messages again.
+
+### RPC
+
+```
+mark/set      { name }              -> Mark
+mark/list     {}                    -> { marks: [Mark], cap, used, windowCost }
+mark/drop     { name }              -> { dropped, marks: [Mark] }
+
+branch/define { name, mark, patches[], cycles } -> Branch
+branch/patch  { name, patch }                   -> Branch
+branch/run    { name }                          -> Run
+branch/runAll { mark }                          -> { runs: [Run] }
+branch/diff   { a, b, mask? }                   -> Verdict   (794)
+
+asm/block     { origin, source }     -> { bytes, origin, labels, errors[] }
+```
+
+```
+Mark  { name, anchorId, cycle, frame, secondsBack, message }
+Run   { branch, mark, instance, state: queued|running|done|failed,
+        cycles, endAnchorId, message }
+```
+
+Every reply carries `message` — a ready-to-print line. That is not decoration; it is the
+one rule that came out of 808, where the buffer range appeared on `/pause` and not on F11
+because two client call sites assembled the same text from different fields.
+
+`transport/status` gains `nearestMark: { name, framesAway }` so the transport line can show
+it without a second call.
+
+### TUI — no new panel
+
+The cockpit's panels are full and the log is where sequences belong. Marks and branches are
+sequences, so:
+
+```
+> mark alpha
+MARK alpha @ Cycle 10757570 Frame 500  (-0.4s)   ·   3 marks · window 59.9s of 60.0
+
+> marks
+  alpha        Cycle 10757570  Frame  500   -0.4s
+  before-boss  Cycle  8120004  Frame  368   -1.3s
+  intro-end    Cycle  1204880  Frame   61   -6.5s
+  3 of 32 marks · window 59.9s of 60.0
+
+> branch run-all alpha
+  patch-dec     running   inst 2
+  patch-nop     running   inst 3
+  patch-jsr     done      inst 4   240000 cyc
+  patch-lda     failed    inst 5   JAM @ $8514
+  4 branches from alpha · 1 done · 1 failed · 2 running
+```
+
+The transport line gains the nearest mark, because while scrubbing the useful question is
+"how far am I from a mark", not the absolute frame:
+
+```
+ REPLAY  ◀◀  frame 340/3000   -53.2s   ·   alpha +160
+```
+
+**Deliberately not a panel.** A panel costs rows the machine state is using, and it would
+have to be kept live — which means polling, which means the client asking questions it does
+not need to ask. A mark list is read when you ask for it.
+
+**And the C64RE UI gets the same objects**, which is the point of the RPC being designed
+rather than gated: a marks sidebar and a branch grid are the natural rendering there, and
+they need no endpoint the TUI does not already use.
+
 ## §6 What 809 does NOT do
 
 - **No goals, no assertions, no acceptance.** A branch run returns a state and a diff. What
