@@ -37,41 +37,34 @@ and `trx64-daemon`. C64 ROMs are not included; point at your own with `--rom-dir
 brew install jondalar/tap/trx64
 ```
 
-From source: `cargo build --release`. macOS, Linux and Windows all build natively —
-MSVC included; the release binaries are built that way.
+From source: `cargo build --release`. Builds natively on all three, MSVC included.
 
 ---
 
 ## Capabilities
 
-- **Rewind** — play the machine backwards. Every step is a real restore, so registers,
-  RAM and the drive are correct at each frame, and you can run on from where you stop.
-- **Reverse stepping** — `rstep` undoes the last instructions byte-exact. An always-on
-  ring keeps the recent past; nothing to arm in advance.
-- **`whowrote <addr>`** — who last wrote here: PC, cycle, old → new.
-- **JAM triage** — on a crash the monitor prints the chain: crash PC → wild jump → the
-  stack corruptor.
-- **Observers** — watch an address for exec, read or write, with a condition and an
-  action, and *without halting the machine*. They watch the **address**, not the
-  instruction: a write through `($fb),y`, a read through `($f0,x)` and a `jmp ($0314)` all
-  trigger, because the hooks sit after the addressing mode is resolved.
-- **Traces** — capture CPU / drive / IEC / memory to a binary log, index it, query it as
-  swimlanes, memory maps or data-flow taint.
-- **Marks & sandboxes** — name a point, come back to it, branch from it, throw the branch
-  away.
-- **Cartridges incl. Save-to-Flash** — EasyFlash, Ocean, Magic Desk, GMOD2/3, MegaByter.
-  Flash and EEPROM writes persist across reset and through a snapshot.
-- **Shared sessions** — one machine, several clients. A human and an agent drive the same
-  live C64 at once.
-- **Disks** — `.d64` / `.g64`, 35 to 42 tracks, with drive-side GCR writes persisted back
-  to the host file.
+- **Rewind** — play the machine backwards frame by frame, stop anywhere, run on. Each
+  step restores registers, RAM, I/O and the drive.
+- **Reverse stepping** — `rstep` undoes the last instructions, byte-exact. The ring is
+  always on; nothing to arm.
+- **`whowrote <addr>`** — PC, cycle, old → new.
+- **JAM triage** — crash PC → wild jump → stack corruptor.
+- **Observers** — watch an address for exec, read or write; condition, action, no halt.
+  Indirect addressing included: `sta ($fb),y`, `lda ($f0,x)`, `jmp ($0314)`.
+- **Traces** — CPU, drive, IEC and memory to a binary log; query as swimlanes, memory
+  maps or data-flow taint.
+- **Marks & sandboxes** — name a point, jump back to it, branch, discard.
+- **Cartridges** — EasyFlash, Ocean, Magic Desk, GMOD2/3, MegaByter. Flash and EEPROM
+  writes survive a reset and a snapshot round trip.
+- **Disks** — `.d64` / `.g64`, 35 to 42 tracks. Drive-side GCR writes reach the host file.
+- **Shared sessions** — one machine, several clients, human and agent at once.
+- **Snapshots** — `.c64re` full machine, `.c64rering` the reverse-debug buffers.
 
 ---
 
 ## Standalone: the CLI cockpit
 
-`trx64cli` is a complete emulator on its own — a terminal cockpit plus a native window, no
-daemon, no server.
+A complete emulator in one binary: terminal cockpit plus a native window.
 
 ```sh
 trx64cli                      # cockpit
@@ -125,26 +118,26 @@ JSON-RPC 2.0 over WebSocket. One machine per process, shared by every client.
 ```
 
 A typical flow: `session/create` → `debug/run` → `monitor/exec` / `trace/*` / `vic/inspect`
-→ `checkpoint/*` to scrub → `snapshot/dump` to persist. `--stream` adds the per-frame
-driver (video, breakpoints, JAM auto-break, recorder); omit it for pure request/response.
+→ `checkpoint/*` to scrub → `snapshot/dump` to persist.
+
+`--stream` adds the per-frame driver: video, breakpoints, JAM auto-break, recorder.
 
 For embedding, `trx64-ffi` exposes a typed uniffi library (Swift bindings) —
 [`crates/trx64-ffi/API.md`](crates/trx64-ffi/API.md).
 
-**Formats:** `.c64re` (full machine snapshot), `.c64rering` (the reverse-debug rings),
-`.c64retrace` (binary trace log). VICE `.vsf` imports; export is not faithful.
+**Formats:** `.c64re` machine snapshot, `.c64rering` reverse-debug buffers, `.c64retrace`
+trace log. VICE `.vsf` imports.
 
 ---
 
 ## Contributing
 
-This is my personal emulator, written for my own reverse-engineering work. You will want
-things it does not do.
+My personal emulator, written for my own reverse-engineering work. You will want things
+it does not do.
 
-**Open an issue** — bugs, missing hardware behaviour, a title that misbehaves. A concrete
-repro beats a feature description: which image, what you did, what happened. Pull requests
-welcome. I cannot offer support, and I do not work from feature requests without either
-code or a testable requirement.
+**Open an issue** — bugs, missing hardware behaviour, a title that misbehaves. Say which
+image, what you did, what happened. Pull requests welcome. I cannot offer support, and I
+do not work from feature requests without code or a testable requirement.
 
 ---
 
