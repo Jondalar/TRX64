@@ -32,12 +32,6 @@ pub const CYC_PER_FRAME: u64 = 19_656;
 #[derive(Clone)]
 pub struct Engine {
     state: SharedState,
-    /// Host-side run flag (the pump advances the machine while this is true). This is
-    /// the AUTHORITY for the cockpit's RUN/PAUSE indicator, distinct from the
-    /// controller's `session.running` (which we keep paused so `session/run` is legal).
-    running: Arc<AtomicBool>,
-    /// Warp pacing flag (8× frame budget per pump tick when set).
-    warp: Arc<AtomicBool>,
     /// Set true when `quit` is issued — the pump + window observe it to shut down.
     quit: Arc<AtomicBool>,
     /// Monotonic generation bumped on every machine-mutating verb, so the window's
@@ -68,8 +62,6 @@ impl Engine {
     pub fn new(state: SharedState) -> Self {
         Self {
             state,
-            running: Arc::new(AtomicBool::new(false)),
-            warp: Arc::new(AtomicBool::new(false)),
             quit: Arc::new(AtomicBool::new(false)),
             epoch: Arc::new(AtomicU64::new(0)),
             joystick_mode: Arc::new(AtomicU8::new(0)),
@@ -87,19 +79,20 @@ impl Engine {
         &self.state
     }
 
+    /// Asks the DAEMON. There is no client-side run flag any more — that is the whole
+    /// point of the 808 rebuild. A cached mirror was tried and immediately went stale in
+    /// any path that did not pump, which is the same class of bug as the flag it replaced.
     pub fn is_running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
-    }
-    pub fn is_warp(&self) -> bool {
-        self.warp.load(Ordering::SeqCst)
-    }
-    /// Whether the DAEMON controller (`session.running`) is running — distinct from the
-    /// host run flag. The pump reads this to adopt daemon-side run intents (a disk/CRT
-    /// mount resume, monitor `g`/`x`) into the host pump (see [`Self::pump_frame`]).
-    fn controller_running(&self) -> bool {
         self.rpc("session/state", json!({}))
             .ok()
             .and_then(|v| v.get("runState").and_then(|r| r.as_str()).map(|s| s == "running"))
+            .unwrap_or(false)
+    }
+    /// Reads the DAEMON. The cockpit does not keep its own pacing flag.
+    pub fn is_warp(&self) -> bool {
+        self.rpc("session/state", json!({}))
+            .ok()
+            .and_then(|v| v.get("warp").and_then(|w| w.as_bool()))
             .unwrap_or(false)
     }
     pub fn should_quit(&self) -> bool {
@@ -148,47 +141,28 @@ impl Engine {
     /// the machine runs at true PAL real-time and SID production matches 44100 Hz, like
     /// the SwiftUI AppModel pump; a fixed 50 fps budget drifted slow → audio crackle).
     pub fn pump_frame(&self, base_cycles: u64) -> u64 {
-        // Reconcile the dual run-state. The CLI host pump is the clock, so the daemon
-        // controller MUST stay paused (`session/run` refuses while `session.running`
-        // is set). But a daemon op the CLI doesn't own can flip it true: a disk/CRT
-        // mount resumes (`media/mount`), and the monitor `g`/`x` continue does too.
-        // Treat that as a RUN INTENT — adopt the host run flag and force the controller
-        // back to paused — so mount and `g` actually run, and `session/run` stays
-        // legal. (Clearing the host flag on the resulting error was the "stuck PAUSED /
-        // can't resume after mount" bug.)
-        if self.controller_running() {
-            self.running.store(true, Ordering::SeqCst);
-            let _ = self.rpc("debug/pause", json!({ "source": "cli" }));
-        }
-        if !self.running.load(Ordering::SeqCst) {
-            return 0;
-        }
-        let budget = if self.warp.load(Ordering::SeqCst) {
-            base_cycles.saturating_mul(8)
-        } else {
-            base_cycles
-        };
-        if budget == 0 {
-            return 0; // no wall-clock time elapsed this tick — nothing to advance
-        }
-        match self.rpc("session/run", json!({ "cycles": budget })) {
+        // Spec 808 rebuild — the client hands over the real time that passed and renders
+        // what comes back. It does NOT decide whether the machine should advance, whether
+        // the transport should step, or how fast either happens. All of that is one
+        // decision in `session/tick`, in the one place that knows the whole state.
+        //
+        // What this replaces: a client-side `running` flag that called itself "the
+        // one client-side run flag that claimed to outrank the daemon's, plus a
+        // `transport_playing` flag, plus a reconciliation hack for when they disagreed.
+        // Every 808 state bug lived in that seam.
+        match self.rpc("session/tick", json!({ "cycles": base_cycles })) {
             Ok(v) => {
-                // A breakpoint/observer hit halts the run early — reflect it as PAUSE.
-                // Spec 764 — a KIL/JAM also halts the run early (`jam` object in the
-                // reply): clear the host run flag so the pump STOPS re-issuing
-                // session/run on the jammed CPU (the spin/hang) and the cockpit shows
-                // PAUSED at the KIL. The daemon already pushed debug/stopped reason=jam.
-                if v.get("breakpoint").is_some() || v.get("jam").is_some() {
-                    self.running.store(false, Ordering::SeqCst);
+                // Follow the daemon's audio epoch every tick. This is how power, reset
+                // and a CRT mount reach the audio path without the client knowing they
+                // are audio-relevant.
+                if let Some(e) = v.get("audioEpoch").and_then(|e| e.as_u64()) {
+                    if e != self.epoch.load(Ordering::SeqCst) {
+                        self.epoch.store(e, Ordering::SeqCst);
+                    }
                 }
                 v.get("c64Cycles").and_then(|c| c.as_u64()).unwrap_or(0)
             }
-            Err(_) => {
-                // A residual controller-running race — re-pause it and skip this tick.
-                // KEEP the host flag so the next tick resumes (never strand the machine).
-                let _ = self.rpc("debug/pause", json!({ "source": "cli" }));
-                0
-            }
+            Err(_) => 0,
         }
     }
 
@@ -294,7 +268,6 @@ impl Engine {
                 self.bump_epoch();
                 match r {
                     Ok(v) => {
-                        self.running.store(true, Ordering::SeqCst);
                         CmdResult::text(format!(
                             "POWER ON — full init @ PC=${:04X}, running.",
                             v.get("pc").and_then(|p| p.as_u64()).unwrap_or(0)
@@ -305,7 +278,6 @@ impl Engine {
             }
             Some("off") => {
                 // Everything off, no live state (blank dead machine, media registry kept).
-                self.running.store(false, Ordering::SeqCst);
                 let r = self.rpc("session/power", json!({ "op": "off" }));
                 self.bump_epoch();
                 match r {
@@ -327,8 +299,8 @@ impl Engine {
         let r = self.rpc("session/reset", json!({ "mode": mode }));
         self.bump_epoch();
         // A real machine reset boots + runs — don't leave it frozen at the reset
-        // vector. Set the host run flag so the pump drives it (like `power on`).
-        self.running.store(true, Ordering::SeqCst);
+        // vector. The RUN INTENT is the daemon's, so this is an event, not a flag write.
+        let _ = self.rpc("session/play", json!({}));
         match r {
             Ok(v) => CmdResult::text(format!(
                 "RESET ({label}) @ PC=${:04X}, running.",
@@ -339,20 +311,23 @@ impl Engine {
     }
 
     fn verb_run(&self) -> CmdResult {
-        self.running.store(true, Ordering::SeqCst);
-        CmdResult::text("RUN — free-running.")
+        // An EVENT, not a local flag write; and the reply's message is printed as sent.
+        let v = self.rpc("session/play", json!({})).unwrap_or_default();
+        CmdResult::text(
+            v.get("message").and_then(|m| m.as_str()).unwrap_or("RUN").to_string(),
+        )
     }
 
     fn verb_pause(&self) -> CmdResult {
-        self.running.store(false, Ordering::SeqCst);
-        // Sync the controller's stop info so monitor `r`/`bt` reflect a clean stop.
-        let _ = self.rpc("debug/pause", json!({ "source": "cli" }));
-        let pc = self.cur_pc();
-        CmdResult::text(format!("PAUSE @ PC=${pc:04X}."))
+        let v = self.rpc("session/pause", json!({})).unwrap_or_default();
+        CmdResult::text(
+            v.get("message").and_then(|m| m.as_str()).unwrap_or("PAUSE").to_string(),
+        )
     }
 
     fn verb_step(&self) -> CmdResult {
-        self.running.store(false, Ordering::SeqCst);
+        // Stepping implies stopped. Tell the daemon; do not remember it here.
+        let _ = self.rpc("session/pause", json!({}));
         match self.rpc("debug/step", json!({ "source": "cli" })) {
             Ok(_) => {
                 let pc = self.cur_pc();
@@ -368,17 +343,13 @@ impl Engine {
         }
         match self.rpc("media/mount", json!({ "path": path })) {
             Ok(v) => {
-                // CLI-FEEL S7 — reconcile the dual run-state after the mount. A CRT
-                // mount power-cycles the DAEMON into running (reply `paused:false`); adopt
-                // that into the host run flag so the cockpit's pump resumes IMMEDIATELY
-                // (the freshly cold-booted cart runs) instead of only after pump_frame's
-                // next controller-running poll. A disk mount is a live device op that does
-                // NOT change run-state — the reply reports the machine's REAL `paused`, so
-                // a running machine stays running and a paused one stays paused (no false
-                // resume). We therefore only ever SET the flag when the daemon says it is
-                // running, never clear it.
+                // A CRT mount power-cycles the machine into running; a disk mount is a
+                // live device op that does not change run-state. Either way the DAEMON
+                // decides and reports it in `paused`, and this only forwards that as an
+                // intent. (This used to reconcile a client-side run flag against the
+                // daemon's — the seam Spec 808's rebuild removed.)
                 if v.get("paused").and_then(|p| p.as_bool()) == Some(false) {
-                    self.running.store(true, Ordering::SeqCst);
+                    let _ = self.rpc("session/play", json!({}));
                 }
                 CmdResult::text(format!("MOUNT {path} → {}", compact(&v)))
             }
@@ -398,7 +369,7 @@ impl Engine {
                 // adopt it into the host run flag so the cockpit resumes immediately (same
                 // reconcile as verb_mount).
                 if v.get("paused").and_then(|p| p.as_bool()) == Some(false) {
-                    self.running.store(true, Ordering::SeqCst);
+                    let _ = self.rpc("session/play", json!({}));
                 }
                 let role = v
                     .get("detail")
@@ -434,7 +405,7 @@ impl Engine {
         self.bump_epoch();
         match r {
             Ok(v) => {
-                self.running.store(true, Ordering::SeqCst);
+                let _ = self.rpc("session/play", json!({}));
                 CmdResult::text(format!("RUN {path} (autostart) → {}", compact(&v)))
             }
             Err(e) => CmdResult::text(format!("run {path} failed: {e}")),
@@ -442,14 +413,16 @@ impl Engine {
     }
 
     fn verb_warp(&self, sub: Option<&str>) -> CmdResult {
+        // Events, not local flags. Pacing is machine state and belongs to the daemon, or
+        // the two front-ends would each pace independently.
         match sub.map(|s| s.to_ascii_lowercase()).as_deref() {
             Some("on") => {
-                self.warp.store(true, Ordering::SeqCst);
+                let _ = self.rpc("session/warp", json!({ "on": true }));
                 let _ = self.rpc("session/set_pacing", json!({ "mode": "warp", "ratio": 8.0 }));
                 CmdResult::text("WARP ON (8×).")
             }
             Some("off") | None => {
-                self.warp.store(false, Ordering::SeqCst);
+                let _ = self.rpc("session/warp", json!({ "on": false }));
                 let _ = self.rpc("session/set_pacing", json!({ "mode": "pal", "ratio": 1.0 }));
                 CmdResult::text("WARP OFF (PAL real-time).")
             }
@@ -525,6 +498,62 @@ impl Engine {
             Ok(v) => CmdResult::text(format!("RINGLOAD ← {path} {}", compact(&v))),
             Err(e) => CmdResult::text(format!("ringload failed: {e}")),
         }
+    }
+
+    /// Spec 808 — F11, the universal go/stop. A DECISION, not a key mapping: what
+    /// "resume" means depends on where the transport stands, and the daemon owns that.
+    /// One `transport/status` call per keypress (not per frame), then the verb.
+    ///
+    /// Also the only place the pump's second run-reason gets armed: starting playback
+    /// has to switch the pump on, or the tick that steps the transport never fires —
+    /// rewinding means the machine is NOT running, so gating the pump on `running`
+    /// alone deadlocked it.
+    pub fn transport_toggle(&self) -> CmdResult {
+        // ONE event, ONE message, printed verbatim. The decision AND the wording are the
+        // daemon's, because only it knows the whole state — and because a client that
+        // assembles the text will assemble it differently at its second call site, which
+        // is exactly how the buffer range showed up on `/pause` but not on F11.
+        let v = self.rpc("transport/toggle", json!({})).unwrap_or_default();
+        self.resync_after_transport_move();
+        CmdResult::text(
+            v.get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("transport: no reply")
+                .to_string(),
+        )
+    }
+
+    /// Send a transport verb. The client does not track what it did — the daemon's
+    /// reply is the truth and the next tick renders it.
+    pub fn transport_key(&self, verb: &str) -> CmdResult {
+        let r = self.exec_line(verb);
+        self.resync_after_transport_move();
+        r
+    }
+
+    /// The audio queue is filled from the machine's clock, so any op that makes that
+    /// clock discontinuous — power, reset, a restore, a transport move, pause, play —
+    /// leaves queued sound belonging to a time we left. That is what the doubled audio
+    /// on resume was.
+    ///
+    /// The client does NOT keep the list of which verbs those are. The DAEMON bumps an
+    /// `audioEpoch` and this follows it: the list grows (the transport added four), a
+    /// second front-end would have to learn it independently, and a missed entry is
+    /// silent — you simply hear the old sound over the new position.
+    fn follow_daemon_audio_epoch(&self) {
+        let daemon = self
+            .rpc("session/state", json!({}))
+            .ok()
+            .and_then(|v| v.get("audioEpoch").and_then(|e| e.as_u64()))
+            .unwrap_or(0);
+        if daemon != self.epoch.load(Ordering::SeqCst) {
+            self.epoch.store(daemon, Ordering::SeqCst);
+        }
+    }
+
+    /// Kept as the name the transport paths call; it now just follows the daemon.
+    fn resync_after_transport_move(&self) {
+        self.follow_daemon_audio_epoch();
     }
 
     fn verb_monitor(&self, command: &str) -> CmdResult {
@@ -612,7 +641,15 @@ impl Engine {
     /// Read `session/state` into a flat snapshot for the TUI panels.
     pub fn snapshot(&self) -> StateSnapshot {
         let v = self.rpc("session/state", json!({})).unwrap_or(Value::Null);
-        StateSnapshot::from_json(&v, self.is_running(), self.is_warp())
+        // Both flags come out of the DAEMON's reply. Reading them from client-side
+        // atomics is what let the header say PAUSE while the machine was running.
+        let running = v
+            .get("runState")
+            .and_then(|r| r.as_str())
+            .map(|s| s == "running")
+            .unwrap_or(false);
+        let warp = v.get("warp").and_then(|w| w.as_bool()).unwrap_or(false);
+        StateSnapshot::from_json(&v, running, warp)
     }
 
     fn cur_pc(&self) -> u16 {
@@ -644,6 +681,13 @@ pub struct StateSnapshot {
     pub irq_vec: u16,
     pub nmi_vec: u16,
     pub stop_reason: Option<String>,
+    /// Spec 808 — what the transport is doing, for the MACHINE header. The user presses
+    /// a key and expects the header to name that key's action: PLAY, PAUSE, REWIND,
+    /// STEP. "PAUSED" alone answered a different question.
+    pub transport_mode: Option<String>,
+    pub transport_line: Option<String>,
+    /// "back" | "fwd" | "none" — the header shows REWIND only when actually going back.
+    pub transport_direction: Option<String>,
 }
 
 impl StateSnapshot {
@@ -661,6 +705,21 @@ impl StateSnapshot {
         StateSnapshot {
             running,
             warp,
+            transport_mode: v
+                .get("transport")
+                .and_then(|t| t.get("mode"))
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string()),
+            transport_line: v
+                .get("transport")
+                .and_then(|t| t.get("line"))
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string()),
+            transport_direction: v
+                .get("transport")
+                .and_then(|t| t.get("direction"))
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string()),
             c64_cycles: u(&["c64Cycles"]),
             drive_cycles: u(&["driveCycles"]),
             pc: u(&["cpu", "pc"]) as u16,

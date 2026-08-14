@@ -16,12 +16,18 @@
 //!   it packs the big typed-array buffers (RAM) into one pre-allocated slab so the
 //!   old-gen object graph never grows. Rust has no GC and no such churn, and the
 //!   TRX64 RuntimeCheckpoint is a `serde_json::Value` tree (ADR-077/078) — not a
-//!   typed-array payload. So this port stores the FULL checkpoint `Value` per entry
-//!   (the Rust analog of the TS `MachineSnapshot`), which restore consumes via
-//!   `restore_runtime_checkpoint`. The slab is an INTERNAL storage detail of the TS
-//!   side; `SLOT_BYTES`/capacity/eviction/stats are reproduced so the ring's
+//!   typed-array payload. So this port originally stored the FULL checkpoint `Value`
+//!   per entry. `SLOT_BYTES`/capacity/eviction/stats are reproduced so the ring's
 //!   OBSERVABLE policy (how many entries fit, which gets evicted, the stats numbers)
 //!   matches. The disk-image pool IS ported (it changes which entries share bytes).
+//!
+//!   Spec 807 revisited that storage decision with a measurement rather than an
+//!   argument. Rust has no GC, but `serde_json::Value` has its own tax: a live tree
+//!   cost **11× its rendered size** (111 KiB resident for 9.9 KiB of chip state), and
+//!   a ring of 500 entries reported 32 MiB while holding 102. So an entry now keeps
+//!   its big buffers RAW (`raw`, `disk_pool`) and its residual tree as COMPACT BYTES,
+//!   rebuilt into a `Value` only in `restore_snapshot`. Same tree out, ~2.6× less
+//!   resident: capture runs 50×/s at cadence 1, restore runs when a human clicks.
 //!
 //! TRANSIENT: in-memory only. NOT persistence (Spec 707 `.c64re` dump does that).
 //! Zero-cost when unused: an empty ring holds an empty Vec — no slab, no allocation
@@ -50,7 +56,21 @@ pub const DEFAULT_CHECKPOINT_RING_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Spec 772 — default ring retention in seconds (the UI scrub window). 1:1 with the
 /// c64re `DEFAULT_CHECKPOINT_RING_SECONDS` (runtime-checkpoint-ring.ts).
-pub const DEFAULT_CHECKPOINT_RING_SECONDS: f64 = 10.0;
+pub const DEFAULT_CHECKPOINT_RING_SECONDS: f64 = 60.0;
+
+/// Measured resident cost of one anchor after Spec 807 (~98 KiB). Used to size the byte
+/// budget from the requested window instead of pinning it at 32 MiB — that constant was
+/// 512 slots, which happened to be just over the 500 a ten-second window needs, so
+/// nothing noticed. Ask for sixty seconds and the ring would have evicted at 512 and
+/// silently kept ten.
+pub const ANCHOR_BYTES_ESTIMATE: u64 = 100 * 1024;
+
+/// The byte budget a window of `max_entries` anchors actually needs, with a little head
+/// room. The budget is a SAFETY CEILING, so it must never be the thing that decides the
+/// window — the entry cap is.
+pub fn checkpoint_ring_budget_for(max_entries: u64) -> u64 {
+    (max_entries.max(1) + 16) * ANCHOR_BYTES_ESTIMATE
+}
 
 /// Spec 772 — max LIVE entries the ring retains = `ceil(seconds / (cadenceFrames/50))`
 /// (PAL 50 fps). At the 10s / 25-frame default that is **20**. Clamped ≥ 1. 1:1 with
@@ -113,11 +133,82 @@ impl RuntimeCheckpointRef {
 /// runtime-checkpoint-ring.ts:94-107 — the stored ring entry (ref + payload).
 struct RingEntry {
     r: RuntimeCheckpointRef,
-    /// The FULL RuntimeCheckpoint payload tree, with the pooled media slots NULLED
-    /// (their bytes live once in `disk_pool`, keyed by `blob_hashes`).
-    payload: Value,
+    /// The residual RuntimeCheckpoint tree — pooled media slots NULLED (their bytes
+    /// live once in `disk_pool`, keyed by `blob_hashes`), `RAW_SLOTS` blobs moved out
+    /// to `raw` — held as **compact JSON bytes, not a live `Value`** (Spec 807 §4.2).
+    ///
+    /// This is the single biggest line item in a ring entry, and it was invisible.
+    /// Measured (`perf_bench bench_checkpoint_entry_cost_split`, 500 clones each):
+    ///
+    /// ```text
+    ///   raw RAM per entry                64.2 KiB   (irreducible — it is the state)
+    ///   residual tree as a live Value   111.1 KiB
+    ///   the same tree, rendered           9.9 KiB   → the Value costs 11× its content
+    /// ```
+    ///
+    /// A `serde_json::Value` pays for every node: a `Map` with `String` keys, an
+    /// enum per scalar, a separate allocation per string. Ten kilobytes of chip state
+    /// become a hundred. Holding the bytes instead costs what the bytes cost, and
+    /// `serde_json::from_slice` rebuilds the identical tree in `restore_snapshot`.
+    ///
+    /// Bytes rather than a modelled struct ON PURPOSE: the payload carries fields no
+    /// struct here owns (`_ringDriveDiskBytes`, `vicProvenance`, `media`, `audio`,
+    /// `alarmsMaincpu`, `cartState`, the joystick/paddle blocks, and whatever a future
+    /// spec adds). Modelling them would make the ring a second schema that has to be
+    /// kept in step with `c64re_snapshot`, and the first field anyone forgot would be
+    /// silently dropped on restore. Round-tripping the bytes cannot lose a field.
+    payload: Vec<u8>,
     /// runtime-checkpoint-ring.ts:106 — pooled-slot → content hash for each blob.
     blob_hashes: HashMap<String, String>,
+    /// Spec 807 §4.3 — the big base64 blobs that are NOT media, held as raw bytes.
+    ///
+    /// Measured: a lean entry cost **208.9 KiB resident** while the ring accounted
+    /// 64.0 KiB, because a live `serde_json::Value` costs ~2.2× its rendered form and
+    /// the 64 KiB of RAM lived inside it as an 87 KiB base64 `String`. Moving those
+    /// bytes out of the tree is where the ring's memory goes back.
+    ///
+    /// Deliberately NOT content-addressed like `disk_pool`: RAM differs on essentially
+    /// every frame, so a sha256 over 64 KiB per capture would cost more than the whole
+    /// capture and never hit. Media is the opposite (unchanged across a whole ring) and
+    /// stays pooled.
+    raw: Vec<(&'static str, Vec<u8>)>,
+}
+
+/// Spec 807 §4.3 — payload paths whose `{ $ta }` blob is moved out of the JSON tree
+/// into `RingEntry::raw`. Dotted paths are resolved one level deep.
+///
+/// `ram` is always present and is the whole point. The two framebuffers are present
+/// only on an explicit full `checkpoint/capture` (the per-frame producers omit them
+/// entirely since Spec 807 §4.1) — but when they are there they are 216 KiB each, so
+/// they are worth the same treatment.
+const RAW_SLOTS: [&str; 3] = [
+    "ram",
+    "vicPresentation.literalPortFb",
+    "vicPresentation.literalPortFbStable",
+];
+
+/// Read a `RAW_SLOTS` path out of a payload tree (one level of nesting).
+fn raw_slot_get<'a>(payload: &'a Value, path: &str) -> Option<&'a Value> {
+    match path.split_once('.') {
+        Some((parent, child)) => payload.get(parent)?.get(child),
+        None => payload.get(path),
+    }
+}
+
+/// Write a `RAW_SLOTS` path into a payload tree (one level of nesting). No-op when the
+/// parent object is absent, which is how a checkpoint without `vicPresentation` stays
+/// legal.
+fn raw_slot_set(payload: &mut Value, path: &str, v: Value) {
+    match path.split_once('.') {
+        Some((parent, child)) => {
+            if let Some(p) = payload.get_mut(parent) {
+                if p.is_object() {
+                    p[child] = v;
+                }
+            }
+        }
+        None => payload[path] = v,
+    }
 }
 
 /// runtime-checkpoint-ring.ts:114-129 — ring telemetry.
@@ -211,6 +302,44 @@ impl RuntimeCheckpointRing {
         Self::with_budget(DEFAULT_CHECKPOINT_RING_BUDGET_BYTES)
     }
 
+    /// Spec 807 §4.6 — retune the live-entry cap without discarding the ring.
+    ///
+    /// The cap is `ceil(seconds / (cadence/50))`, so changing the capture cadence
+    /// changes it. Before this existed, `checkpoint_ring_max_entries()` was evaluated
+    /// ONCE at daemon start while `checkpoint_capture_every_frames()` was read per
+    /// frame — so a cadence change could not move the cap, and cadence 1 into a cap of
+    /// 20 would have silently shrunk a 10-second window to 0.4 s with nothing turning
+    /// red. Lowering the cap evicts oldest-unpinned immediately, exactly as a capture
+    /// would; raising it just makes room.
+    pub fn set_max_entries(&mut self, max_entries: u64) -> u64 {
+        self.max_entries = max_entries.max(1);
+        // Grow the byte bound with the entry cap. Eviction fires on whichever bound hits
+        // first, so leaving the budget behind would mean asking for sixty seconds and
+        // quietly getting ten — the cap says 3000, the slab says 512, and the slab wins.
+        let want_budget = checkpoint_ring_budget_for(self.max_entries);
+        if want_budget > self.budget_bytes {
+            let extra = (want_budget - self.budget_bytes) / SLOT_BYTES;
+            let base = self.slot_count;
+            for i in 0..extra {
+                self.free_slots.push(base + i);
+            }
+            self.slot_count += extra;
+            self.budget_bytes = want_budget;
+        }
+        while (self.entries.len() as u64) > self.max_entries {
+            match self.entries.iter().position(|e| !e.r.pinned) {
+                Some(i) => self.remove_entry_at(i),
+                None => break, // all pinned — the pins win, as everywhere else
+            }
+        }
+        self.max_entries
+    }
+
+    /// The current live-entry cap.
+    pub fn max_entries(&self) -> u64 {
+        self.max_entries
+    }
+
     pub fn budget_bytes(&self) -> u64 {
         self.budget_bytes
     }
@@ -290,8 +419,33 @@ impl RuntimeCheckpointRing {
             }
         }
 
-        let byte_size =
-            SLOT_BYTES + fb_len.map_or(0, |_| FB_BYTES) + fb_stable_len.map_or(0, |_| FB_BYTES);
+        // Spec 807 §4.3 — move the big non-media base64 blobs OUT of the JSON tree and
+        // hold them as raw bytes. `restore_snapshot` re-encodes them, so every consumer
+        // still sees the identical tree; only the resident cost changes.
+        let mut raw: Vec<(&'static str, Vec<u8>)> = Vec::new();
+        for path in RAW_SLOTS {
+            if let Some(bytes) = ta_decode(raw_slot_get(&payload, path)) {
+                if !bytes.is_empty() {
+                    raw.push((path, bytes));
+                    raw_slot_set(&mut payload, path, Value::Null);
+                }
+            }
+        }
+
+        // Spec 807 §4.5 — account what the entry actually costs. The old figure was
+        // `SLOT_BYTES` (+ FB_BYTES per framebuffer), i.e. the RAW size of the payload's
+        // big buffers — but the entry held them base64'd inside a `Value`, so a lean
+        // entry really cost 208.9 KiB against 64.0 KiB accounted (3.3× under-report,
+        // `perf_bench bench_checkpoint_ring_resident_memory`). Now the big buffers ARE
+        // raw, so their real cost is their length; the remaining tree is charged a
+        // measured constant.
+        let raw_bytes: u64 = raw.iter().map(|(_, b)| b.len() as u64).sum();
+        // Spec 807 §4.2 — the residual tree is stored as compact JSON bytes, so its
+        // contribution is a MEASURED length rather than the `RESIDUAL_TREE_BYTES`
+        // estimate the previous step needed.
+        let payload_bytes = serde_json::to_vec(&payload)
+            .map_err(|e| format!("[checkpoint] capture: encode payload: {e}"))?;
+        let byte_size = raw_bytes + payload_bytes.len() as u64;
         let id = format!("cp_{frame}_{}", self.seq);
         self.seq += 1;
         let r = RuntimeCheckpointRef {
@@ -306,10 +460,12 @@ impl RuntimeCheckpointRing {
         // not retained (TRX64 stores the payload directly), but we keep slot
         // accounting (free_slots) consistent with the TS for the stats contract.
         let _ = slot_idx;
+        let _ = (fb_len, fb_stable_len); // validated above; no longer part of the size
         self.entries.push(RingEntry {
             r: r.clone(),
-            payload,
+            payload: payload_bytes,
             blob_hashes,
+            raw,
         });
         Ok(r)
     }
@@ -414,15 +570,20 @@ impl RuntimeCheckpointRing {
     /// pooled media slots REHYDRATED from the disk pool. None if `id` is unknown.
     pub fn restore_snapshot(&self, id: &str) -> Option<Value> {
         let e = self.entries.iter().find(|x| x.r.id == id)?;
-        if e.blob_hashes.is_empty() {
-            return Some(e.payload.clone());
-        }
-        let mut payload = e.payload.clone();
+        // Spec 807 §4.2 — rebuild the tree from the stored bytes. This is the cold
+        // path: capture runs 50×/s at cadence 1, restore runs when a human clicks.
+        let mut payload: Value = serde_json::from_slice(&e.payload).ok()?;
         for (slot, hash) in &e.blob_hashes {
             payload[slot.as_str()] = match self.disk_pool.get(hash) {
                 Some(p) => ta_encode(&p.bytes),
                 None => Value::Null,
             };
+        }
+        // Spec 807 §4.3 — re-encode the raw blobs into the tree. This is the ONE place
+        // the base64 cost is paid, and it is paid on the cold path: capture runs 50×/s
+        // at cadence 1, restore runs when a human clicks.
+        for (path, bytes) in &e.raw {
+            raw_slot_set(&mut payload, path, ta_encode(bytes));
         }
         Some(payload)
     }
@@ -520,6 +681,19 @@ impl RuntimeCheckpointRing {
                     }
                 }
             }
+            // Spec 807 §4.3 — and re-extract the big non-media blobs to raw bytes, so a
+            // ring loaded from a `.c64rering` costs the same memory as the live one it
+            // came from. Without this a `ringload` would silently be 3× the ring it
+            // dumped.
+            let mut raw: Vec<(&'static str, Vec<u8>)> = Vec::new();
+            for path in RAW_SLOTS {
+                if let Some(bytes) = ta_decode(raw_slot_get(&payload, path)) {
+                    if !bytes.is_empty() {
+                        raw.push((path, bytes));
+                        raw_slot_set(&mut payload, path, Value::Null);
+                    }
+                }
+            }
             ring.entries.push(RingEntry {
                 r: RuntimeCheckpointRef {
                     id: a.id.clone(),
@@ -529,8 +703,9 @@ impl RuntimeCheckpointRing {
                     byte_size: a.byte_size,
                     created_at_ms: a.created_at_ms,
                 },
-                payload,
+                payload: serde_json::to_vec(&payload).unwrap_or_default(),
                 blob_hashes,
+                raw,
             });
         }
         // Restore the seq counter (must be ≥ the count to never collide), and rebuild
@@ -553,7 +728,12 @@ impl RuntimeCheckpointRing {
         RuntimeCheckpointRingStats {
             count,
             pinned_count,
-            total_bytes: count * SLOT_BYTES + self.disk_pool_bytes,
+            // Spec 807 §4.5 — sum what the entries actually cost instead of assuming
+            // `SLOT_BYTES` each. Before, a ring of 500 lean entries reported 32 MiB and
+            // held 102 MiB; the entries now hold their big buffers raw, and `byte_size`
+            // is their real length plus the measured residual tree.
+            total_bytes: self.entries.iter().map(|e| e.r.byte_size).sum::<u64>()
+                + self.disk_pool_bytes,
             budget_bytes: self.budget_bytes,
             oldest_frame: self.entries.first().map(|e| e.r.frame),
             newest_frame: self.entries.last().map(|e| e.r.frame),

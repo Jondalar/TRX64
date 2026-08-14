@@ -373,15 +373,33 @@ fn run_loop(term: &mut Term, engine: &Engine, to_main: &Sender<UiToMain>) -> io:
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
-                    // HOST HOTKEY — F10 freezes/resumes, and does so from HERE as well as
-                    // from the emulator window, so the same key works wherever the focus
-                    // happens to be. The C64 keyboard has no F10 (only F1..F8), so it can
-                    // never be a key the machine wanted.
-                    if key.code == XKeyCode::F(10) {
-                        let running = engine.is_running();
-                        let r = engine.exec_line(if running { "/pause" } else { "/run" });
-                        if !r.output.is_empty() {
-                            cp.push_log(&r.output);
+                    // HOST HOTKEYS — F9..F12 are the rewind transport (Spec 808 §4).
+                    // The C64 keyboard has F1..F8 only (F2/F4/F6/F8 being SHIFT+F1/F3/F5/
+                    // F7), so these four physical keys can never be keys the machine
+                    // wanted. They work from HERE as well as from the emulator window, so
+                    // the same key does the same thing wherever the focus happens to be.
+                    //
+                    // The layout reads left-to-right as a transport, which is why pause
+                    // MOVED off F10 onto F11 — F10 was freeze/resume and is documented in
+                    // no .md in this repo, so nothing written down had to change:
+                    //
+                    //   F9  ◀|   one frame back      F11 ⏸/▶  pause / play
+                    //   F10 ◀◀   play backwards      F12 |▶   one frame forward
+                    //
+                    // No modifiers on purpose: Shift+F-keys are swallowed by some
+                    // terminals, and a control that silently does nothing on someone's
+                    // setup is worse than a verb they have to type.
+                    if let XKeyCode::F(n @ (9 | 10 | 11 | 12)) = key.code {
+                        let r = if n == 11 {
+                            Some(engine.transport_toggle())
+                        } else {
+                            trx64_daemon::transport::key_verb(n as u8, engine.is_running())
+                                .map(|v| engine.transport_key(v))
+                        };
+                        if let Some(r) = r {
+                            if !r.output.is_empty() {
+                                cp.push_log(&r.output);
+                            }
                         }
                         continue;
                     }
@@ -597,6 +615,8 @@ const MONITOR_VERBS: &[&str] = &[
     "map", "taint", "swimlane", "chis",
     // reverse-debug
     "rstep", "reverse", "whowrote", "triage", "revdepth", "diff", "ringdump", "ringload",
+    // checkpoint ring (Spec 807 §4.6) + rewind transport (Spec 808)
+    "cadence", "window", "play", "pause", "frame", "goto", "rewind",
     // knowledge
     "inspect", "xref", "sym",
 ];
@@ -897,10 +917,25 @@ fn draw_gauges(f: &mut Frame, area: Rect, s: &StateSnapshot) {
     f.render_widget(panel(cpu, "CPU"), cols[0]);
 
     // MACHINE panel
-    let (run_label, run_color) = if s.running {
-        ("● RUNNING", Color::Green)
-    } else {
-        ("■ PAUSED", Color::Red)
+    // Spec 808 — the header names the ACTION, not just the run flag. A user who presses
+    // F10 expects to read REWIND; "PAUSED" is true (the machine is not advancing) and
+    // answers a question nobody asked. The transport's own mode wins whenever it is
+    // doing something; RUNNING/PAUSED is what is left when it is not.
+    // The header shows the DIRECTION, not the machinery. A forward replay is PLAY even
+    // though it runs on the same anchors as a rewind — showing REWIND while it ran
+    // forward was the complaint, and it was right.
+    // Read the DIRECTION first, because it is the only field that knows which way we are
+    // going. Deriving the label from the mode meant a forward replay showed REWIND, and
+    // then a stale mode meant a resumed replay showed PAUSE — both times the header was
+    // answering from the wrong field.
+    let (run_label, run_color) = match (s.transport_direction.as_deref(), s.transport_mode.as_deref()) {
+        (Some("fwd"), _) => ("\u{25b6} PLAY", Color::Green),
+        (Some("back"), _) => ("\u{25c0}\u{25c0} REWIND", Color::Cyan),
+        (_, Some("STEP \u{25c0}")) => ("\u{25c0}| STEP BACK", Color::Cyan),
+        (_, Some("STEP \u{25b6}")) => ("|\u{25b6} STEP FWD", Color::Cyan),
+        (_, Some("CUT")) => ("\u{2702} CUT", Color::Yellow),
+        _ if s.running => ("\u{25b6} PLAY", Color::Green),
+        _ => ("\u{23f8} PAUSE", Color::Red),
     };
     let warp_label = if s.warp { "WARP 8×" } else { "PAL 1×" };
     let machine = vec![

@@ -421,3 +421,434 @@ fn bench_per_game_gate() {
         );
     }
 }
+
+// ── Workload 4: checkpoint capture cost (Spec 807 baseline) ─────────────────
+//
+// The stream loop calls `stream_maybe_autocapture` inside its per-frame lock
+// window (trx64-daemon streaming.rs:499), and the capture there builds a full
+// `serde_json::Value` tree with the 64 KiB RAM base64-encoded into a fresh
+// String (c64re_snapshot.rs ram_ta). At the default cadence of 25 frames that
+// is ~2 captures/s and invisible. At cadence 1 — which is what a per-frame
+// checkpoint (reverse playback) needs — it is 50/s per producer.
+//
+// This measures ONE capture in isolation, so Spec 807 has a before-number to be
+// judged against. It reports µs per capture and the rendered tree size; the
+// frame budget it has to fit inside is 20_000 µs (PAL 50 fps), and it shares
+// that budget with the entire emulation.
+#[test]
+#[ignore = "perf benchmark; run --release with --ignored --nocapture"]
+fn bench_checkpoint_capture() {
+    if !roms_present() {
+        eprintln!("skip bench_checkpoint_capture: ROMs absent at {ROM_DIR}");
+        return;
+    }
+    const CAPTURES: usize = 500; // = 10 s of ring at cadence 1
+
+    let mut m = Machine::new();
+    m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+    let mut sink = NullSink;
+    // Boot past READY so the captured state is a real machine, not a reset one.
+    m.run_for_full(3_000_000, &mut sink, |_, _, _, _, _, _, _| {});
+
+    // One capture up front for the size report (untimed).
+    let sample = trx64_core::c64re_snapshot::capture_runtime_checkpoint(
+        &m, "/tmp/bench.d64", "d64", None, None, None, None,
+    );
+    let rendered = serde_json::to_string(&sample).expect("render").len();
+    let ram_b64 = sample["ram"]["b64"].as_str().map(str::len).unwrap_or(0);
+
+    let mut per_capture_us = Vec::with_capacity(K_RUNS);
+    for run in 0..K_RUNS {
+        let t0 = Instant::now();
+        let mut sink_sum = 0usize; // keep the tree alive so nothing is optimised out
+        for _ in 0..CAPTURES {
+            let cp = trx64_core::c64re_snapshot::capture_runtime_checkpoint(
+                &m, "/tmp/bench.d64", "d64", None, None, None, None,
+            );
+            sink_sum += cp.as_object().map(|o| o.len()).unwrap_or(0);
+        }
+        let elapsed = t0.elapsed().as_secs_f64();
+        assert!(sink_sum > 0, "captures produced empty trees");
+        let us = elapsed * 1_000_000.0 / CAPTURES as f64;
+        per_capture_us.push(us);
+        eprintln!(
+            "  [capture run {}/{}] {CAPTURES} captures in {:.4}s  →  {:.1} µs/capture",
+            run + 1,
+            K_RUNS,
+            elapsed,
+            us
+        );
+    }
+
+    let min = per_capture_us.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = per_capture_us
+        .iter()
+        .cloned()
+        .fold(f64::NEG_INFINITY, f64::max);
+    let med = median(&mut per_capture_us.clone());
+    // Share of one PAL frame (20 ms) a single capture eats, and what 50/s costs.
+    let frame_pct = med / 20_000.0 * 100.0;
+    eprintln!("\n========== checkpoint capture (Spec 807 baseline) ==========");
+    eprintln!("  captures per timed run         : {CAPTURES}  (= 10 s of ring at cadence 1)");
+    eprintln!("  µs/capture  min/median/max     : {min:.1} / {med:.1} / {max:.1}");
+    eprintln!("  share of one PAL frame (20 ms) : {frame_pct:.2} %  per capture");
+    eprintln!("  at cadence 1, one producer     : {:.2} % of wall-clock", frame_pct);
+    eprintln!("  at cadence 1, ring + recorder  : {:.2} % of wall-clock", frame_pct * 2.0);
+    eprintln!("  rendered tree (JSON string)    : {rendered} bytes");
+    eprintln!("  of which base64 RAM            : {ram_b64} bytes  (raw 65536)");
+    eprintln!(
+        "  RAW (machine-parseable): checkpoint_capture k={} n={} min_us={:.3} med_us={:.3} max_us={:.3} tree_bytes={} ram_b64_bytes={}",
+        K_RUNS, CAPTURES, min, med, max, rendered, ram_b64
+    );
+}
+
+/// Spec 807 — WHERE the checkpoint tree's bytes are. Reports each top-level field's
+/// rendered size, largest first, so the optimisation target is chosen by measurement
+/// rather than by assumption. (RAM is the obvious suspect and is NOT the biggest.)
+#[test]
+#[ignore = "perf benchmark; run --release with --ignored --nocapture"]
+fn bench_checkpoint_field_sizes() {
+    if !roms_present() {
+        eprintln!("skip bench_checkpoint_field_sizes: ROMs absent at {ROM_DIR}");
+        return;
+    }
+    let mut m = Machine::new();
+    m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+    let mut sink = NullSink;
+    m.run_for_full(3_000_000, &mut sink, |_, _, _, _, _, _, _| {});
+
+    let cp = trx64_core::c64re_snapshot::capture_runtime_checkpoint(
+        &m, "/tmp/bench.d64", "d64", None, None, None, None,
+    );
+    let total = serde_json::to_string(&cp).expect("render").len();
+
+    let mut rows: Vec<(String, usize)> = cp
+        .as_object()
+        .expect("object")
+        .iter()
+        .map(|(k, v)| (k.clone(), serde_json::to_string(v).map(|s| s.len()).unwrap_or(0)))
+        .collect();
+    rows.sort_by_key(|r| std::cmp::Reverse(r.1));
+
+    eprintln!("\n========== checkpoint tree field sizes (Spec 807) ==========");
+    eprintln!("  total rendered: {total} bytes");
+    for (k, n) in &rows {
+        if *n < 64 {
+            continue;
+        }
+        eprintln!("  {:>9} B  {:>5.1} %  {k}", n, *n as f64 / total as f64 * 100.0);
+    }
+    // Second level for the biggest field, so a fat sub-node is named too.
+    if let Some((top_key, _)) = rows.first() {
+        if let Some(obj) = cp[top_key].as_object() {
+            let mut sub: Vec<(String, usize)> = obj
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::to_string(v).map(|s| s.len()).unwrap_or(0)))
+                .collect();
+            sub.sort_by_key(|r| std::cmp::Reverse(r.1));
+            eprintln!("  ── inside `{top_key}`:");
+            for (k, n) in sub.iter().take(8) {
+                if *n < 64 {
+                    continue;
+                }
+                eprintln!("     {:>9} B  {k}", n);
+            }
+        }
+    }
+}
+
+/// Spec 807 — the framebuffer waste. `capture_recorder_anchor_payload` (the ring's
+/// per-frame producer, trx64-daemon main.rs:14930) calls `capture_runtime_checkpoint`
+/// and then NULLS `vicPresentation.literalPortFb`/`literalPortFbStable` — after the
+/// capture has already base64-encoded both (2 × 162 240 raw → 2 × 216 349 chars).
+/// This times that sub-capture on its own, so the discarded work has a number.
+#[test]
+#[ignore = "perf benchmark; run --release with --ignored --nocapture"]
+fn bench_checkpoint_framebuffer_waste() {
+    if !roms_present() {
+        eprintln!("skip bench_checkpoint_framebuffer_waste: ROMs absent at {ROM_DIR}");
+        return;
+    }
+    const N: usize = 500;
+    let mut m = Machine::new();
+    m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+    let mut sink = NullSink;
+    m.run_for_full(3_000_000, &mut sink, |_, _, _, _, _, _, _| {});
+
+    let mut vp_us = Vec::with_capacity(K_RUNS);
+    let mut ram_us = Vec::with_capacity(K_RUNS);
+    for _ in 0..K_RUNS {
+        let t0 = Instant::now();
+        let mut acc = 0usize;
+        for _ in 0..N {
+            let vp = trx64_core::c64re_snapshot::capture_vic_presentation(&m);
+            acc += serde_json::to_value(vp).map(|v| v.as_object().map(|o| o.len()).unwrap_or(0)).unwrap_or(0);
+        }
+        vp_us.push(t0.elapsed().as_secs_f64() * 1_000_000.0 / N as f64);
+        assert!(acc > 0);
+
+        let t1 = Instant::now();
+        let mut acc2 = 0usize;
+        for _ in 0..N {
+            acc2 += trx64_core::c64re_snapshot::ram_ta(&m)["b64"].as_str().map(str::len).unwrap_or(0);
+        }
+        ram_us.push(t1.elapsed().as_secs_f64() * 1_000_000.0 / N as f64);
+        assert!(acc2 > 0);
+    }
+    let vp_med = median(&mut vp_us.clone());
+    let ram_med = median(&mut ram_us.clone());
+    eprintln!("\n========== checkpoint sub-costs (Spec 807) ==========");
+    eprintln!("  capture_vic_presentation (BUILT then NULLED by the ring) : {vp_med:.1} µs");
+    eprintln!("  ram_ta (64 KiB → base64)                                 : {ram_med:.1} µs");
+    eprintln!(
+        "  RAW (machine-parseable): checkpoint_subcosts vp_us={:.3} ram_us={:.3}",
+        vp_med, ram_med
+    );
+}
+
+/// Spec 807 §4.1 — the after-number for slice 1: the same capture with
+/// `omit_framebuffer = true`, which is what both per-frame producers now run.
+#[test]
+#[ignore = "perf benchmark; run --release with --ignored --nocapture"]
+fn bench_checkpoint_capture_omit_fb() {
+    if !roms_present() {
+        eprintln!("skip bench_checkpoint_capture_omit_fb: ROMs absent at {ROM_DIR}");
+        return;
+    }
+    const CAPTURES: usize = 500;
+    let mut m = Machine::new();
+    m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+    let mut sink = NullSink;
+    m.run_for_full(3_000_000, &mut sink, |_, _, _, _, _, _, _| {});
+
+    let sample = trx64_core::c64re_snapshot::capture_runtime_checkpoint_opts(
+        &m, "/tmp/bench.d64", "d64", None, None, None, None, true,
+    );
+    assert!(
+        sample["vicPresentation"]["literalPortFb"].is_null(),
+        "omit_framebuffer=true must not encode literalPortFb"
+    );
+    let rendered = serde_json::to_string(&sample).expect("render").len();
+
+    let mut us = Vec::with_capacity(K_RUNS);
+    for _ in 0..K_RUNS {
+        let t0 = Instant::now();
+        let mut acc = 0usize;
+        for _ in 0..CAPTURES {
+            let cp = trx64_core::c64re_snapshot::capture_runtime_checkpoint_opts(
+                &m, "/tmp/bench.d64", "d64", None, None, None, None, true,
+            );
+            acc += cp.as_object().map(|o| o.len()).unwrap_or(0);
+        }
+        assert!(acc > 0);
+        us.push(t0.elapsed().as_secs_f64() * 1_000_000.0 / CAPTURES as f64);
+    }
+    let min = us.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = us.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let med = median(&mut us.clone());
+    eprintln!("\n========== checkpoint capture, omit_framebuffer (Spec 807 §4.1) ==========");
+    eprintln!("  µs/capture  min/median/max     : {min:.1} / {med:.1} / {max:.1}");
+    eprintln!("  share of one PAL frame (20 ms) : {:.2} % per capture", med / 20_000.0 * 100.0);
+    eprintln!("  rendered tree (JSON string)    : {rendered} bytes");
+    eprintln!(
+        "  RAW (machine-parseable): checkpoint_capture_omitfb k={} n={} min_us={:.3} med_us={:.3} max_us={:.3} tree_bytes={}",
+        K_RUNS, CAPTURES, min, med, max, rendered
+    );
+}
+
+/// Spec 807 §4.3 — does the JSON tree actually cost MEMORY? The rendered string is
+/// 97 583 B for a lean entry, but the ring holds a live `serde_json::Value`, where
+/// every field is a `String` key into a `Map` and every RAM byte lives inside one big
+/// base64 `String`. If the resident cost is close to the rendered size, slices 2-5 buy
+/// little and the spec should say so. This fills a ring with 500 lean entries (10 s at
+/// cadence 1) and reports process RSS before and after.
+#[test]
+#[ignore = "perf benchmark; run --release with --ignored --nocapture"]
+fn bench_checkpoint_ring_resident_memory() {
+    if !roms_present() {
+        eprintln!("skip bench_checkpoint_ring_resident_memory: ROMs absent at {ROM_DIR}");
+        return;
+    }
+    fn rss_kb() -> u64 {
+        // macOS: `ps -o rss= -p <pid>` in KiB. Linux: /proc/self/statm page count.
+        if let Ok(s) = std::fs::read_to_string("/proc/self/statm") {
+            let rss_pages: u64 = s.split_whitespace().nth(1).and_then(|t| t.parse().ok()).unwrap_or(0);
+            return rss_pages * 4;
+        }
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output();
+        out.ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    }
+
+    const N: usize = 500;
+    let mut m = Machine::new();
+    m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+    let mut sink = NullSink;
+    m.run_for_full(3_000_000, &mut sink, |_, _, _, _, _, _, _| {});
+
+    let rendered = serde_json::to_string(
+        &trx64_core::c64re_snapshot::capture_runtime_checkpoint_opts(
+            &m, "/tmp/b.d64", "d64", None, None, None, None, true,
+        ),
+    )
+    .unwrap()
+    .len();
+
+    // A ring big enough to hold all N (byte budget is the secondary bound).
+    let mut ring = trx64_core::checkpoint_ring::RuntimeCheckpointRing::with_budget_and_max_entries(
+        (N as u64 + 8) * trx64_core::checkpoint_ring::SLOT_BYTES,
+        N as u64 + 8,
+    );
+    let before = rss_kb();
+    let t0 = Instant::now();
+    for i in 0..N {
+        let cp = trx64_core::c64re_snapshot::capture_runtime_checkpoint_opts(
+            &m, "/tmp/b.d64", "d64", None, None, None, None, true,
+        );
+        ring.capture(cp, i as u64, i as u64 * 19_656).expect("capture");
+    }
+    let capture_us = t0.elapsed().as_secs_f64() * 1_000_000.0 / N as f64;
+    let after = rss_kb();
+    let held = ring.list().len();
+    assert_eq!(held, N, "ring dropped entries: {held} of {N}");
+
+    let delta_kb = after.saturating_sub(before);
+    let per_entry_kb = delta_kb as f64 / N as f64;
+    let accounted_kb = trx64_core::checkpoint_ring::SLOT_BYTES as f64 / 1024.0;
+    eprintln!("\n========== checkpoint ring resident memory (Spec 807 §4.3) ==========");
+    eprintln!("  entries held                   : {held}  (= 10 s at cadence 1)");
+    eprintln!("  capture+store, END TO END      : {capture_us:.1} µs  ({:.2} % of a PAL frame)", capture_us / 20_000.0 * 100.0);
+    eprintln!("  RSS before / after             : {before} / {after} KiB");
+    eprintln!("  RSS delta                      : {delta_kb} KiB  ({:.1} MiB)", delta_kb as f64 / 1024.0);
+    eprintln!("  per entry, RESIDENT            : {per_entry_kb:.1} KiB");
+    eprintln!("  per entry, rendered JSON       : {:.1} KiB", rendered as f64 / 1024.0);
+    eprintln!("  per entry, ring ACCOUNTS       : {accounted_kb:.1} KiB  (SLOT_BYTES)");
+    eprintln!("  raw state would be (~RAM+chips): ~70 KiB");
+    eprintln!(
+        "  RAW (machine-parseable): ring_resident n={} rss_delta_kb={} per_entry_kb={:.2} rendered_b={} accounted_kb={:.1}",
+        N, delta_kb, per_entry_kb, rendered, accounted_kb
+    );
+}
+
+/// Spec 807 §4.3 follow-up — WHERE the resident cost of a ring entry actually is.
+///
+/// Moving the 64 KiB RAM out of the tree only took an entry from 208.9 to 192.4 KiB
+/// (8 %), which means the 87 KiB base64 String was NOT the dominant cost and the
+/// spec's "3× reduction" projection was wrong. This isolates the two halves: 500
+/// copies of the raw RAM alone, then 500 copies of the residual tree alone.
+#[test]
+#[ignore = "perf benchmark; run --release with --ignored --nocapture"]
+fn bench_checkpoint_entry_cost_split() {
+    if !roms_present() {
+        eprintln!("skip bench_checkpoint_entry_cost_split: ROMs absent at {ROM_DIR}");
+        return;
+    }
+    fn rss_kb() -> u64 {
+        if let Ok(s) = std::fs::read_to_string("/proc/self/statm") {
+            let p: u64 = s.split_whitespace().nth(1).and_then(|t| t.parse().ok()).unwrap_or(0);
+            return p * 4;
+        }
+        std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    }
+    const N: usize = 500;
+
+    let mut m = Machine::new();
+    m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+    let mut sink = NullSink;
+    m.run_for_full(3_000_000, &mut sink, |_, _, _, _, _, _, _| {});
+
+    // Half A: the raw RAM, 500×.
+    let a0 = rss_kb();
+    let rams: Vec<Vec<u8>> = (0..N).map(|_| m.ram.to_vec()).collect();
+    let a1 = rss_kb();
+    assert_eq!(rams.len(), N);
+
+    // Half B: the residual tree (a lean checkpoint with `ram` nulled), 500×.
+    let mut lean = trx64_core::c64re_snapshot::capture_runtime_checkpoint_opts(
+        &m, "/tmp/b.d64", "d64", None, None, None, None, true,
+    );
+    lean["ram"] = serde_json::Value::Null;
+    let residual_rendered = serde_json::to_string(&lean).unwrap().len();
+    let b0 = rss_kb();
+    let trees: Vec<serde_json::Value> = (0..N).map(|_| lean.clone()).collect();
+    let b1 = rss_kb();
+    assert_eq!(trees.len(), N);
+
+    let ram_kb = (a1.saturating_sub(a0)) as f64 / N as f64;
+    let tree_kb = (b1.saturating_sub(b0)) as f64 / N as f64;
+    eprintln!("\n========== ring entry cost, split (Spec 807 §4.3) ==========");
+    eprintln!("  raw RAM per entry              : {ram_kb:.1} KiB   (64.0 expected)");
+    eprintln!("  residual JSON tree per entry   : {tree_kb:.1} KiB");
+    eprintln!("  residual tree, RENDERED        : {:.1} KiB", residual_rendered as f64 / 1024.0);
+    eprintln!("  → the tree costs {:.0}× its rendered size", tree_kb / (residual_rendered as f64 / 1024.0));
+    eprintln!(
+        "  RAW (machine-parseable): entry_split n={} ram_kb={:.2} tree_kb={:.2} residual_rendered_b={}",
+        N, ram_kb, tree_kb, residual_rendered
+    );
+}
+
+/// Rewind-transport question — what does ONE step of backward playback cost if every
+/// frame is a REAL restore? If a restore fits in a PAL frame with room to spare, then
+/// playback can simply move the machine and every existing viewer (the TUI's `/window`,
+/// the C64RE UI, screenshots, register panels) follows for free, with nothing new built.
+#[test]
+#[ignore = "perf benchmark; run --release with --ignored --nocapture"]
+fn bench_checkpoint_restore_step() {
+    if !roms_present() {
+        eprintln!("skip bench_checkpoint_restore_step: ROMs absent at {ROM_DIR}");
+        return;
+    }
+    const N: usize = 200;
+    let mut m = Machine::new();
+    m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+    let mut sink = NullSink;
+    m.run_for_full(3_000_000, &mut sink, |_, _, _, _, _, _, _| {});
+
+    let mut ring = trx64_core::checkpoint_ring::RuntimeCheckpointRing::with_budget_and_max_entries(
+        (N as u64 + 8) * trx64_core::checkpoint_ring::SLOT_BYTES,
+        N as u64 + 8,
+    );
+    let mut ids = Vec::with_capacity(N);
+    for i in 0..N {
+        let cp = trx64_core::c64re_snapshot::capture_runtime_checkpoint_opts(
+            &m, "/tmp/b.d64", "d64", None, None, None, None, true,
+        );
+        ids.push(ring.capture(cp, i as u64, i as u64 * 19_656).expect("capture").id);
+    }
+
+    // Walk the ring BACKWARDS, restoring each anchor — this is exactly what one second
+    // of backward playback does at cadence 1.
+    let mut target = Machine::new();
+    target.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+    let mut us = Vec::with_capacity(K_RUNS);
+    for _ in 0..K_RUNS {
+        let t0 = Instant::now();
+        for id in ids.iter().rev() {
+            let cp = ring.restore_snapshot(id).expect("snapshot");
+            trx64_core::c64re_snapshot::restore_runtime_checkpoint(&mut target, &cp)
+                .expect("restore");
+        }
+        us.push(t0.elapsed().as_secs_f64() * 1_000_000.0 / N as f64);
+    }
+    let med = median(&mut us.clone());
+    let min = us.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = us.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    eprintln!("\n========== one backward-playback step (restore) ==========");
+    eprintln!("  µs/step  min/median/max        : {min:.1} / {med:.1} / {max:.1}");
+    eprintln!("  share of one PAL frame (20 ms) : {:.2} %", med / 20_000.0 * 100.0);
+    eprintln!("  at 50 steps/s                  : {:.1} % of wall-clock", med / 20_000.0 * 100.0);
+    eprintln!(
+        "  RAW (machine-parseable): restore_step k={} n={} min_us={:.3} med_us={:.3} max_us={:.3}",
+        K_RUNS, N, min, med, max
+    );
+}

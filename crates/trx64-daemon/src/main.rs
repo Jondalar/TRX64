@@ -35,6 +35,8 @@ pub mod observers;
 pub mod project_knowledge;
 pub mod snapshot_diff;
 pub mod streaming;
+/// Spec 808 — the rewind transport (play the machine backwards).
+pub mod transport;
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -395,6 +397,49 @@ pub struct State {
     /// filmstrip/scrub depends on a populated ring; without this loop it is sparse.
     /// Skipped while a mounted medium is dirty + non-persistable (Spec 709.13).
     autocapture_frames_since: u64,
+    /// Spec 808 — emulated cycles since the last auto-capture. CYCLES, not calls: the
+    /// CLI cockpit pumps 200×/s, so counting calls recorded 200 anchors a second and a
+    /// 500-anchor ring covered 2.5 seconds instead of ten.
+    autocapture_cycles_since: u64,
+    /// Spec 808 rebuild — THE run intent. The daemon owns whether the machine should
+    /// advance; clients send `session/play` / `session/pause` and render what comes back.
+    ///
+    /// Before this the CLI cockpit held its own `running: AtomicBool` whose own comment
+    /// called it "the AUTHORITY … distinct from the controller's `session.running`" —
+    /// two truths about one fact, with a reconciliation hack in the pump for when they
+    /// drifted. Every state bug in 808 came out of that seam: F11 needing three presses,
+    /// the header showing PAUSE while cycles ran, `play back` doing nothing at all.
+    /// TRX64 is a daemon with N clients that must have feature parity; a client that
+    /// remembers anything about the machine has to have its memory reconciled forever.
+    ///
+    /// Distinct from `session.running`, which stays what it was: the AUTONOMOUS loop's
+    /// flag (debug/run), which must be false for a manual tick to be legal.
+    play_intent: bool,
+    /// Spec 808 rebuild — daemon-owned pacing (8× budget per tick). Was a client atomic.
+    warp: bool,
+    /// Spec 808 — AUDIO EPOCH. Bumped by every op that makes the machine's clock
+    /// discontinuous: power, reset, a checkpoint restore, any transport move, pause and
+    /// play. Clients watch it and drop their reSID queue when it changes.
+    ///
+    /// It lives here for the same reason everything else does: the client must not have
+    /// to know WHICH verbs break audio continuity. That list grows (the transport added
+    /// four), a second front-end would have to learn it independently, and a missed entry
+    /// is silent — you just hear the old sound play over the new position.
+    audio_epoch: u64,
+    /// Spec 807 §4.6 — the LIVE capture cadence, in stream-loop frames. Seeded from
+    /// `C64RE_CHECKPOINT_CADENCE_FRAMES` (default 25) and changed at runtime by the
+    /// `cadence` monitor verb, which retunes the ring's entry cap in the same call.
+    /// Before this field the cadence was re-read from the env on every frame while the
+    /// cap was fixed at start-up, so the two could not stay consistent.
+    checkpoint_cadence_frames: u64,
+    /// Spec 808 — the rewind transport: cursor, play state, mode. The DAEMON owns the
+    /// playback loop (decision 1), so this lives here and both front-ends only display
+    /// it. While `cursor` is set the transport is placing the machine and the stream
+    /// loop must not advance emulation.
+    transport: transport::Transport,
+    /// Spec 807 §4.6 — the ring's retention window in seconds (the scrub window).
+    /// Seeded from `C64RE_CHECKPOINT_RING_SECONDS` (default 10).
+    checkpoint_window_seconds: f64,
     /// Spec 766.5b (audit background-workers-async-0 + ws-checkpoint-scrub-7) —
     /// recorder auto-feed cadence: capture one CORE-ONLY (omitMedia) recorder anchor
     /// every CHECKPOINT_CAPTURE_EVERY_FRAMES stream-loop frames while a recorder is
@@ -3349,6 +3394,31 @@ fn monitor_write(st: &mut State, addr: u16, bytes: &[u8], lens: &str) {
 }
 
 fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
+    // Spec 808 §3.4 — an intervention while rewound is what truncates the future.
+    // WATCHING is free (play/frame/goto move the machine but keep the anchors); CHANGING
+    // it is not. These are the monitor verbs that change machine state, so this is where
+    // the one timeline gets cut, and `transport_truncate_on_intervention` records how
+    // many anchors went so the CUT mode can report a number rather than a shrug.
+    {
+        let verb = command.trim().split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+        // A reset REPLACES the machine — the anchors are about a machine that no longer
+        // exists, so they go entirely (see `transport_discard_timeline`). Everything else
+        // here merely diverges from a rewound position and truncates the future.
+        if verb == "reset" {
+            transport_discard_timeline(st, "reset");
+        }
+        const MUTATORS: [&str; 11] = [
+            "wr", "a", "f", "c", "t", "r", "g", "x", "step", "n", "next",
+        ];
+        if MUTATORS.contains(&verb.as_str()) {
+            // `r` with no argument only READS the registers; only `r <reg>=<v>` writes.
+            let writes = verb != "r" || command.contains('=');
+            if writes {
+                transport_truncate_on_intervention(st);
+            }
+        }
+    }
+
     // Clear any prompt carried from a prior command; a modal verb re-sets it below.
     st.mon.pending_prompt = None;
     let cmd = command.trim().to_string();
@@ -5346,6 +5416,196 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
         // no arg, REPORT the current depth. Setting it DISCARDS current history (fresh
         // ring) — it affects capture from now on only and cannot retroactively extend
         // history. `TRX64_REVERSE_SECONDS` stays the boot default.
+        // Spec 807 §4.6 — `cadence [frames] [seconds]`: the checkpoint ring's counterpart
+        // to `revdepth`. The ring is what a rewind/scrub actually reads, and until now it
+        // had NO monitor verb at all — capture rate and window were env-only, so changing
+        // either meant restarting the daemon and losing the machine.
+        //
+        // The two settings are coupled: max_entries = ceil(seconds / (cadence/50)). Setting
+        // one without the other is the trap this verb exists to close — cadence 1 against a
+        // cap sized for cadence 25 turns a 10-second window into 0.4 s, and nothing goes
+        // red. So this always sets both.
+        // ── Spec 808 — the rewind transport ────────────────────────────────────
+        // These five verbs ARE the API: the TUI keys (F9-F12) and the C64RE ribbon are
+        // two thin callers of exactly this surface, which is what makes feature parity
+        // a property of the design rather than a thing someone has to maintain (§2).
+        //
+        // NOTE `goto` here is the TRANSPORT goto (a position on the timeline). The
+        // `api/call` method of the same name sets the CPU's PC — different surface,
+        // different namespace, and they never meet.
+        "play" => {
+            let dir = match toks.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
+                Some("back") | Some("b") | Some("rev") => transport::Direction::Back,
+                Some("fwd") | Some("f") | Some("forward") | None => transport::Direction::Fwd,
+                Some(other) => {
+                    return Err(format!("play: `{other}`? usage: play back|fwd [speed]"))
+                }
+            };
+            let speed = toks
+                .get(2)
+                .and_then(|t| t.trim().trim_end_matches('x').parse::<u32>().ok())
+                .unwrap_or(1);
+            let out = transport_play(st, dir, speed)?;
+            Ok(transport_reply(&out))
+        }
+
+        "pause" => {
+            let out = transport_pause(st);
+            Ok(transport_reply(&out))
+        }
+
+        "frame" => {
+            let Some(arg) = toks.get(1) else {
+                return Ok(transport_reply(&transport_status(st)));
+            };
+            let t = arg.trim();
+            let delta: i64 = t
+                .parse()
+                .map_err(|_| format!("frame: `{t}`? usage: frame -N | frame +N"))?;
+            let stepped = transport_step(st, delta)?;
+            // A single step announces itself as a STEP, not as REPLAY: the user pressed
+            // a step key and the header should acknowledge that key rather than the
+            // machinery it happens to share. Only while rewound — at the head LIVE is
+            // the truth.
+            if st.transport.holds_the_machine() {
+                st.transport.mode = if delta < 0 {
+                    transport::TransportMode::StepBack
+                } else {
+                    transport::TransportMode::StepFwd
+                };
+            }
+            let mut out = transport_status(st);
+            // Carry the end-of-ring note across the mode rewrite — the whole point of it
+            // is that a refused move must not look like a move.
+            if stepped.get("hitEnd").is_some() {
+                out["hitEnd"] = json!(true);
+                out["line"] = json!(format!(
+                    "{}   (end of the ring)",
+                    out["line"].as_str().unwrap_or("")
+                ));
+            }
+            Ok(transport_reply(&out))
+        }
+
+        "goto" => {
+            let Some(target) = toks.get(1) else {
+                return Err("goto: usage: goto <frame> | goto c<cycle>".into());
+            };
+            let out = transport_goto(st, target)?;
+            Ok(transport_reply(&out))
+        }
+
+        "rewind" => {
+            let out = transport_status(st);
+            let ids = transport_anchor_ids(st);
+            let mut lines = vec![
+                out["line"].as_str().unwrap_or("").to_string(),
+                transport::KEY_LEGEND.to_string(),
+            ];
+            // Say how much rewind is ACTUALLY there, in seconds, next to how much was
+            // configured. "500 anchors" and "10s window" are settings; the first number
+            // is the only one that answers "how far back can I go right now".
+            lines.push(transport_range_line(st));
+            lines.push(format!(
+                "  cap {} anchors   cadence every {} frame(s)   window {:.1}s",
+                st.checkpoint_ring.max_entries(),
+                st.checkpoint_cadence_frames.max(1),
+                st.checkpoint_window_seconds
+            ));
+            if ids.is_empty() {
+                lines.push(
+                    "  nothing captured yet — `cadence 1` gives one anchor per frame".into(),
+                );
+            }
+            lines.push("  play back|fwd [speed] · pause · frame -N|+N · goto <frame|c<cycle>>".into());
+            Ok(lines.join("\n"))
+        }
+
+        // `window <seconds>` — the same knob from the other side: how far back you want
+        // to be able to go. Keeps the cadence and recomputes the cap and the budget.
+        "window" => {
+            let secs = toks
+                .get(1)
+                .and_then(|t| t.trim().trim_end_matches('s').parse::<f64>().ok());
+            match secs {
+                None => Ok(format!(
+                    "window: {:.1}s at every-{}-frames \u{2192} cap {} anchors\n  {}",
+                    st.checkpoint_window_seconds,
+                    st.checkpoint_cadence_frames.max(1),
+                    st.checkpoint_ring.max_entries(),
+                    transport_range_line(st)
+                )),
+                Some(v) if v.is_finite() && v > 0.0 => {
+                    let secs = v.min(600.0);
+                    st.checkpoint_window_seconds = secs;
+                    let frames = st.checkpoint_cadence_frames.max(1);
+                    let want =
+                        trx64_core::checkpoint_ring::checkpoint_ring_max_entries(secs, frames);
+                    let cap = st.checkpoint_ring.set_max_entries(want);
+                    Ok(format!(
+                        "window: {secs:.1}s at every-{frames}-frames \u{2192} cap {cap} anchors\n  \
+                         ~{:.0} MiB when full (~98 KiB/anchor, measured)   budget now {} MiB",
+                        (cap as f64 * 98.0) / 1024.0,
+                        st.checkpoint_ring.budget_bytes() / (1024 * 1024)
+                    ))
+                }
+                Some(_) => Err("window: seconds must be > 0 (max 600)".into()),
+            }
+        }
+
+        "cadence" => {
+            let live = |st: &State| -> (u64, f64, u64, usize) {
+                (
+                    st.checkpoint_cadence_frames.max(1),
+                    st.checkpoint_window_seconds,
+                    st.checkpoint_ring.max_entries(),
+                    st.checkpoint_ring.list().len(),
+                )
+            };
+            let parse_num = |t: Option<&String>| -> Option<f64> {
+                t.and_then(|x| x.trim().trim_start_matches('$').parse::<f64>().ok())
+            };
+            match parse_num(toks.get(1)) {
+                None => {
+                    let (cad, secs, cap, held) = live(st);
+                    Ok(format!(
+                        "cadence: every {cad} frame(s) = {:.1} capture(s)/s, window {secs:.1}s \u{2192} cap {cap} entries ({held} held)\n                           (`cadence <frames> [seconds]` to change, e.g. `cadence 1` for a checkpoint every frame)",
+                        50.0 / cad as f64
+                    ))
+                }
+                Some(f) => {
+                    let frames = (f.max(1.0).min(3000.0)) as u64;
+                    let secs = parse_num(toks.get(2))
+                        .filter(|v| v.is_finite() && *v > 0.0)
+                        .map(|v| v.min(600.0))
+                        .unwrap_or(st.checkpoint_window_seconds);
+                    st.checkpoint_cadence_frames = frames;
+                    st.checkpoint_window_seconds = secs;
+                    let want = trx64_core::checkpoint_ring::checkpoint_ring_max_entries(secs, frames);
+                    // `set_max_entries` grows the byte bound with the cap — eviction
+                    // fires on whichever bound hits first, so a cap without a budget
+                    // means asking for sixty seconds and quietly getting ten.
+                    let cap = st.checkpoint_ring.set_max_entries(want);
+                    let held = st.checkpoint_ring.list().len();
+                    let mut out = vec![format!(
+                        "cadence: every {frames} frame(s) = {:.1} capture(s)/s, window {secs:.1}s \u{2192} cap {cap} entries ({held} held)",
+                        50.0 / frames as f64
+                    )];
+                    // The honest part: say what it will cost before it costs it. ~98 KiB
+                    // resident per entry, measured (Spec 807 perf_bench).
+                    let mib = (cap as f64 * 98.0) / 1024.0;
+                    out.push(format!(
+                        "  ~{mib:.0} MiB when full (~98 KiB/entry, measured)   budget now {} MiB",
+                        st.checkpoint_ring.budget_bytes() / (1024 * 1024)
+                    ));
+                    if frames == 1 {
+                        out.push("  every frame: this is the per-frame checkpoint the reverse-playback work needs".into());
+                    }
+                    Ok(out.join("\n"))
+                }
+            }
+        }
+
         "revdepth" => {
             let mb = |bytes: u64| (bytes as f64) / (1024.0 * 1024.0);
             match toks.get(1).and_then(|s| s.trim_start_matches('$').parse::<u64>().ok()) {
@@ -6648,6 +6908,18 @@ fn monitor_help_text() -> String {
         "    traprules <path> | traprules [clear]   load/list/clear project on-trap dump rules (JSON {pc,label,dump:[[name,addr,len]],decode}); auto-emits `label: name=$XX (decode)` on reaching that PC (JAM / breakpoint)",
         "    revdepth [seconds]        report / set the always-on reverse-ring depth: rebuilds the delta+cpuhistory rings (DISCARDS history; future capture only; 1..=600s). TRX64_REVERSE_SECONDS = boot default",
         "    diff <idA> <idB>          typed by-ID diff of two checkpoint anchors (RAM runs + per-chip register changes). READ-ONLY (live machine unchanged). ids from `checkpoint/list`",
+        "  REWIND TRANSPORT (Spec 808 — plays the MACHINE backwards, not cached pictures)",
+        "    play back|fwd [speed]     play through the anchors; every step is a real restore, so registers/memory/drive are correct at every frame. `play fwd` at the head just runs.",
+        "    pause                     stop where you are — the machine IS there, no second step needed",
+        "    frame -N | +N             step N anchors (stops at the ends, never wraps)",
+        "    goto <frame> | goto c<cyc>  jump to a position; a cycle lands on the anchor at-or-before it",
+        "    rewind                    mode + position + window + anchors held, and the key legend",
+        "    keys: F9 one back | F10 play back | F11 pause/play | F12 one forward",
+        "    Watching is free: replaying keeps the anchors. Only an INTERVENTION (a write, a key, a resumed run) truncates the future — the mode line then says CUT and how many anchors went.",
+        "  CHECKPOINT RING (the scrub/filmstrip buffer — full machine states, NOT the delta ring)",
+        "    cadence                   report the capture rate, window, entry cap and how many anchors are held",
+        "    window [seconds]          how far back you want to reach (default 60s, max 600) — recomputes the cap AND the byte budget",
+        "    cadence <frames> [secs]   set the rate AND retune the cap together (`cadence 1` = one full checkpoint per frame). States the expected memory (~98 KiB/anchor) before spending it. 1..=3000 frames, window 1..=600s",
         "    ringdump <path>           serialize the WHOLE reverse-debug buffer (checkpoint+delta+cpuhistory rings) → one gzipped .c64rering file (the tester->dev hand-off)",
         "    ringload <path>           restore a .c64rering: reconstruct the rings + restore the machine to its current anchor; scrub/rstep/whowrote/chis/diff then work on it",
         "  KNOWLEDGE (reads the project _analysis.json that covers the address)",
@@ -7988,6 +8260,54 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                     "session is running under the autonomous loop; use debug/pause before manual session/run",
                 );
             }
+            let cycles_budget_hint = req
+                .params
+                .get("cycles")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(crate::streaming::CYC_PER_FRAME);
+            // Spec 808 — ONE rule, both clocks: while the transport holds the machine,
+            // nothing else advances it. The daemon's stream loop honours this in
+            // streaming.rs; the in-process CLI cockpit pumps through session/run
+            // instead, so the same check has to live here or `play back` would set a
+            // flag nobody ticks and a running pump would advance ON TOP of a restore.
+            // Ticking here means the transport steps at whatever rate its host pumps,
+            // which is the same 50/s in both.
+            if transport_tick(&mut st, cycles_budget_hint) {
+                let v = transport_status(&st);
+                return Response::ok(
+                    id,
+                    json!({
+                        "c64Cycles": 0,
+                        "transport": v,
+                    }),
+                );
+            }
+            // Spec 808 — and the SAME reasoning for the per-frame background work: the
+            // daemon's stream loop calls `stream_maybe_autocapture`, but the in-process
+            // CLI cockpit pumps here instead, so under `trx64cli` the checkpoint ring
+            // never filled at all and every transport verb answered "the ring is empty".
+            // Whoever pumps the machine also feeds the ring; there is no third place
+            // that could.
+            {
+                // The daemon's stream loop hosts the per-frame background work
+                // (streaming.rs ~397): cart write-back, disk write-back, the checkpoint
+                // ring, the recorder feed. The in-process `trx64cli` cockpit does NOT
+                // run that loop — it pumps here — so under the CLI NONE of it happened:
+                // the ring stayed empty (every transport verb said so), and a game that
+                // saved to its cart or disk never reached the host file. Same root
+                // cause, three symptoms, found in one session.
+                //
+                // Whoever pumps the machine owns the frame, and the frame includes this
+                // work. Both hosts now call the same four helpers; there is no third
+                // place a future host could forget.
+                let now = now_ms();
+                stream_maybe_autopersist_cart(&mut st, now);
+                stream_maybe_autopersist_disk(&mut st, now);
+                let frame_no = st.ctrl_frame;
+                let (w, h, indices) = st.session.machine.render_canvas_indices();
+                stream_maybe_autocapture(&mut st, frame_no, cycles_budget_hint, w, h, &indices);
+                stream_maybe_feed_recorder(&mut st, frame_no);
+            }
             let cycles = req
                 .params
                 .get("cycles")
@@ -8081,7 +8401,11 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             // Spec 771.2 — report the REAL run/pause state + last stop reason (was
             // hardcoded "paused", which kept the UI's seed poll permanently frozen).
             // Mirrors session/state in ws-server.ts (runState/stopReason/controlOwner).
-            let run_state = if st.session.running { "running" } else { "paused" };
+            // Spec 808 rebuild — the RUN INTENT is what a user calls "running", and it
+            // lives here. `session.running` is the AUTONOMOUS loop's flag, a different
+            // question; reporting that as the cockpit's RUN/PAUSE is what let a client
+            // keep its own answer and then disagree with the machine.
+            let run_state = if st.play_intent || st.session.running { "running" } else { "paused" };
             let stop_reason = st.ctrl_stop.as_ref().map(|s| s.reason);
             // Spec 771.2 (T1.1) — live audio is streaming when the hub is on AND running.
             let streaming = st.streaming_enabled && st.session.running;
@@ -8104,6 +8428,9 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             let sid_regs: Vec<u64> = machine.sid_regs[0..25].iter().map(|b| *b as u64).collect();
             let mut state_json = json!({
                 "c64Cycles": machine.clk,
+                "transport": transport_status(&st),
+                "warp": st.warp,
+                "audioEpoch": st.audio_epoch,
                 "driveCycles": machine.drive8.drive_clk,
                 "mode": "true-drive",
                 "runState": run_state,
@@ -8425,6 +8752,8 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
         //   soft → warm_reset ($FCE2, RAM + media preserved, I/O chips reset)
         //   cold → power_off → power_on (fresh full init; inserted media kept)
         "session/reset" => {
+            // A reset restarts the machine: the queued audio is from before it.
+            state.lock().unwrap().audio_epoch += 1;
             let mode = req.params.get("mode").and_then(|v| v.as_str()).unwrap_or("cold");
             let mut st = state.lock().unwrap();
             let out_mode = if mode == "soft" { "soft" } else { "cold" };
@@ -8459,11 +8788,26 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
         // Spec 786 — explicit power verbs. `on` = full init (no-op if already
         // on), `off` = dead machine, no live state (no-op if already off).
         "session/power" => {
+            // Spec 808 rebuild — powering on RUNS the machine. That is machine state,
+            // so it is set here; the CLI used to set its own flag, which is precisely the
+            // seam this rebuild removes (a second front-end would never have learned it).
             let op = req.params.get("op").and_then(|v| v.as_str()).unwrap_or("");
             let mut st = state.lock().unwrap();
             match op {
-                "on" => do_power_on(&mut st),
-                "off" => do_power_off(&mut st),
+                "on" => {
+                    do_power_on(&mut st);
+                    st.audio_epoch = st.audio_epoch.wrapping_add(1);
+                    // Powering on RUNS the machine, and a fresh machine has no past —
+                    // the ring's anchors describe one that no longer exists.
+                    st.play_intent = true;
+                    transport_discard_timeline(&mut st, "power on");
+                }
+                "off" => {
+                    do_power_off(&mut st);
+                    st.audio_epoch = st.audio_epoch.wrapping_add(1);
+                    st.play_intent = false;
+                    transport_discard_timeline(&mut st, "power off");
+                }
                 _ => return Response::err(id, -32602, "session/power: op must be \"on\" or \"off\""),
             }
             let powered = st.session.powered;
@@ -11904,6 +12248,260 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
         }
 
         // checkpoint/pin — { ref, stats }; errors on unknown id (= c64re throw).
+        // ── Spec 808 — the rewind transport over RPC ───────────────────────────
+        // The parity half (§2/G2): every transport action reachable as a monitor verb is
+        // reachable here, with the SAME status object back, so the C64RE ribbon renders
+        // from data instead of parsing the terminal line.
+        // ── Spec 808 rebuild — the daemon decides what a frame is ──────────────
+        //
+        // ONE tick, ONE decision, in the ONE place that knows everything:
+        //
+        //     transport playing  -> step an anchor (paced by wall clock)
+        //     play_intent        -> advance the emulation
+        //     neither            -> nothing
+        //
+        // Clients hand over the real time elapsed and render the reply. They no longer
+        // hold a run flag, decide what a key means, or set the frame cadence — which is
+        // what made the CLI record 200 anchors a second and the header disagree with the
+        // machine.
+        "session/tick" => {
+            let mut st = state.lock().unwrap();
+            // ADOPT a daemon-side run intent instead of refusing it.
+            //
+            // `session.running` is the autonomous loop's flag, and several daemon ops set
+            // it as a side effect: power on, reset, a CRT mount (which power-cycles).
+            // Refusing the tick then froze the machine after every one of those — the
+            // regression the owner hit immediately.
+            //
+            // The CLI used to reconcile this by forcing the controller back to paused
+            // from OUTSIDE. That reconciliation was right; its location was not. It lives
+            // here now, where the flags do: a controller run is a RUN INTENT, so adopt it
+            // and hand the clock back to the tick loop.
+            if st.session.running {
+                st.play_intent = true;
+                st.session.running = false;
+            }
+            let elapsed = req
+                .params
+                .get("cycles")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(crate::streaming::CYC_PER_FRAME);
+            let budget = if st.warp { elapsed.saturating_mul(8) } else { elapsed };
+
+            // 1. The transport owns the frame while it is rewound or playing back.
+            if transport_tick(&mut st, budget) {
+                let v = transport_status(&st);
+                return Response::ok(id, json!({
+                    "c64Cycles": 0, "transport": v, "running": false,
+                    "audioEpoch": st.audio_epoch,
+                }));
+            }
+            // 2. Otherwise the machine advances — but only if someone asked it to.
+            if !st.play_intent || budget == 0 {
+                let v = transport_status(&st);
+                return Response::ok(id, json!({
+                    "c64Cycles": 0, "transport": v, "running": false,
+                    "audioEpoch": st.audio_epoch,
+                }));
+            }
+            {
+                let now = now_ms();
+                stream_maybe_autopersist_cart(&mut st, now);
+                stream_maybe_autopersist_disk(&mut st, now);
+                let frame_no = st.ctrl_frame;
+                let (w, h, indices) = st.session.machine.render_canvas_indices();
+                stream_maybe_autocapture(&mut st, frame_no, budget, w, h, &indices);
+                stream_maybe_feed_recorder(&mut st, frame_no);
+            }
+            let advanced = stream_debug_gated_advance(&mut st, budget);
+            st.ctrl_frame = st.ctrl_frame.wrapping_add(1);
+            // A breakpoint or JAM stops the machine — and it stops it HERE, so every
+            // client learns about it from the same reply instead of inferring it.
+            if st.ctrl_stop.is_some() {
+                st.play_intent = false;
+            }
+            let v = transport_status(&st);
+            Response::ok(id, json!({
+                "c64Cycles": advanced,
+                "transport": v,
+                "running": st.play_intent,
+                "cycles": st.session.machine.c64_core.clk,
+                "audioEpoch": st.audio_epoch,
+            }))
+        }
+
+        // The run intent, owned here. `session/play` and `session/pause` replace the
+        // client's private run flag.
+        "session/play" => {
+            let mut st = state.lock().unwrap();
+            st.play_intent = true;
+            st.ctrl_stop = None;
+            st.audio_epoch = st.audio_epoch.wrapping_add(1);
+            // Spec 808 decision 4, REVERSED by the owner 2026-08-13: PLAY means the
+            // EMULATION runs from here, not a replay of the anchors ahead.
+            //
+            // Replaying them first was the "watching never costs you your recording"
+            // option, and it is the one he flagged at the time as the less safe of the
+            // two because replaying and running look identical on screen. Having used it:
+            // pressing play after a rewind means "carry on from this moment", and a
+            // player that instead re-showed the next four seconds before coming alive is
+            // answering a question nobody asked. So the future is cut here, visibly, and
+            // the machine runs.
+            if st.transport.holds_the_machine() {
+                transport_truncate_on_intervention(&mut st);
+            }
+            let v = transport_status(&st);
+            Response::ok(id, json!({
+                "running": true,
+                "transport": v,
+                "message": "RUN \u{2014} free-running.",
+            }))
+        }
+        "session/pause" => {
+            let mut st = state.lock().unwrap();
+            st.play_intent = false;
+            st.transport.playing = None;
+            st.audio_epoch = st.audio_epoch.wrapping_add(1);
+            let pc = st.session.machine.c64_core.reg_pc;
+            let cycles = st.session.machine.clk;
+            st.ctrl_stop = Some(CtrlStop { reason: "pause", pc, cycles });
+            let v = transport_status(&st);
+            let message = format!(
+                "PAUSE @ PC=${pc:04X}.\n{}",
+                v["range"].as_str().unwrap_or("")
+            );
+            Response::ok(id, json!({ "running": false, "pc": pc, "transport": v, "message": message }))
+        }
+        "session/warp" => {
+            let mut st = state.lock().unwrap();
+            if let Some(on) = req.params.get("on").and_then(|v| v.as_bool()) {
+                st.warp = on;
+            }
+            Response::ok(id, json!({ "warp": st.warp }))
+        }
+
+        // F11, decided HERE. The client sends one event and renders one message; it does
+        // not read two flags and issue two verbs, which is how it came to need three
+        // presses to get from rewind-playing back to playing.
+        "transport/toggle" => {
+            let mut st = state.lock().unwrap();
+            let playing = st.play_intent || st.transport.playing.is_some();
+            st.audio_epoch = st.audio_epoch.wrapping_add(1);
+            let out = if playing {
+                st.play_intent = false;
+                st.transport.playing = None;
+                let pc = st.session.machine.c64_core.reg_pc;
+                let cycles = st.session.machine.clk;
+                st.ctrl_stop = Some(CtrlStop { reason: "pause", pc, cycles });
+                let mut v = transport_status(&st);
+                v["action"] = json!("pause");
+                // ONE ready-to-print message. The client prints `message` verbatim and
+                // assembles nothing: assembling it there is why the buffer range appeared
+                // on `/pause` and not on F11 — two call sites, two different fields, one
+                // of them forgotten.
+                v["message"] = json!(format!(
+                    "PAUSE @ PC=${pc:04X}.\n{}",
+                    v["range"].as_str().unwrap_or("")
+                ));
+                v
+            } else {
+                // Resuming is ALWAYS forward, and forward means the EMULATION runs
+                // from here — not a replay of the anchors ahead (owner, 2026-08-13).
+                st.play_intent = true;
+                st.ctrl_stop = None;
+                let cut = if st.transport.holds_the_machine() {
+                    transport_truncate_on_intervention(&mut st);
+                    st.transport.last_cut
+                } else {
+                    0
+                };
+                let mut v = transport_status(&st);
+                v["action"] = json!("play");
+                v["cut"] = json!(cut);
+                v["message"] = json!(if cut > 0 {
+                    format!(
+                        "PLAY \u{25b6} emulating from here \u{2014} dropped {cut} anchor(s) ahead.\n{}",
+                        v["range"].as_str().unwrap_or("")
+                    )
+                } else {
+                    format!(
+                        "PLAY \u{25b6} forward.\n{}",
+                        v["range"].as_str().unwrap_or("")
+                    )
+                });
+                v
+            };
+            Response::ok(id, out)
+        }
+
+        "transport/status" => {
+            let st = state.lock().unwrap();
+            Response::ok(id, transport_status(&st))
+        }
+        "transport/play" => {
+            let dir = match req.params.get("direction").and_then(|v| v.as_str()) {
+                Some("back") => transport::Direction::Back,
+                Some("fwd") | None => transport::Direction::Fwd,
+                Some(other) => {
+                    return Response::err(
+                        id,
+                        -32602,
+                        format!("transport/play: direction must be back|fwd, got {other}"),
+                    )
+                }
+            };
+            let speed = req.params.get("speed").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+            let mut st = state.lock().unwrap();
+            match transport_play(&mut st, dir, speed) {
+                Ok(v) => Response::ok(id, v),
+                Err(e) => Response::err(id, -32001, e),
+            }
+        }
+        "transport/pause" => {
+            let mut st = state.lock().unwrap();
+            let v = transport_pause(&mut st);
+            Response::ok(id, v)
+        }
+        "transport/frame" => {
+            let delta = match req.params.get("delta").and_then(|v| v.as_i64()) {
+                Some(d) => d,
+                None => return Response::err(id, -32602, "transport/frame: delta required"),
+            };
+            let mut st = state.lock().unwrap();
+            match transport_step(&mut st, delta) {
+                Ok(v) => Response::ok(id, v),
+                Err(e) => Response::err(id, -32001, e),
+            }
+        }
+        "transport/goto" => {
+            // Accepts { frame: N } or { cycle: N } — or { target: "N" | "c<N>" } so the
+            // monitor verb and the RPC take literally the same string.
+            let target = req
+                .params
+                .get("target")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| req.params.get("frame").and_then(|v| v.as_u64()).map(|n| n.to_string()))
+                .or_else(|| {
+                    req.params
+                        .get("cycle")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| format!("c{n}"))
+                });
+            let Some(target) = target else {
+                return Response::err(
+                    id,
+                    -32602,
+                    "transport/goto: one of target | frame | cycle required",
+                );
+            };
+            let mut st = state.lock().unwrap();
+            match transport_goto(&mut st, &target) {
+                Ok(v) => Response::ok(id, v),
+                Err(e) => Response::err(id, -32001, e),
+            }
+        }
+
         "checkpoint/pin" => {
             let cp_id = match req.params.get("id").and_then(|v| v.as_str()) {
                 Some(s) if !s.is_empty() => s.to_string(),
@@ -13209,7 +13807,16 @@ fn checkpoint_capture_every_frames() -> u64 {
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&n| n >= 1)
-        .unwrap_or(25)
+        // Spec 808 — DEFAULT 1: one full checkpoint per frame.
+        //
+        // It was 25 (two anchors a second) because a checkpoint used to be expensive.
+        // 807 measured what it actually costs now — 64 µs to capture, 98 KiB resident,
+        // so 10 s of per-frame history is ~48 MiB and ~1 % of wall-clock — and at 25 the
+        // ring holds TWENTY anchors, i.e. **0.4 seconds** of rewind. That is not a
+        // shorter version of the feature, it is no feature: `play back` reaches the
+        // oldest frame before you let go of the key. A default that has to be changed
+        // before the thing works is a default that is wrong.
+        .unwrap_or(1)
 }
 
 /// Spec 772 — ring retention in seconds (default 10), env-overridable via
@@ -13219,7 +13826,10 @@ fn checkpoint_ring_seconds() -> f64 {
         .ok()
         .and_then(|s| s.trim().parse::<f64>().ok())
         .filter(|&n| n > 0.0)
-        .unwrap_or(10.0)
+        // Spec 808 — DEFAULT from the core constant, not a second copy here. Ten seconds
+        // turned out to be simply too short to work with; sixty is the default now, and
+        // `window <seconds>` changes it live.
+        .unwrap_or(trx64_core::checkpoint_ring::DEFAULT_CHECKPOINT_RING_SECONDS)
 }
 
 /// Spec 772 — max LIVE ring entries (the UI-scrub cap) = ceil(seconds / (cadence/50))
@@ -13375,15 +13985,29 @@ pub(crate) fn stream_maybe_autopersist_disk(st: &mut State, now_ms: u64) {
 /// ring. SKIPS while a mounted medium is dirty + non-persistable (Spec 709.13).
 /// Isolated: a capture failure NEVER kills the loop (the ring returns Err on a
 /// gap, never panics). Disable with C64RE_CHECKPOINT_AUTOCAPTURE=0.
-pub(crate) fn stream_maybe_autocapture(st: &mut State, frame: u64, canvas_w: usize, canvas_h: usize, canvas_indices: &[u8]) {
+pub(crate) fn stream_maybe_autocapture(st: &mut State, frame: u64, elapsed_cycles: u64, canvas_w: usize, canvas_h: usize, canvas_indices: &[u8]) {
     if std::env::var("C64RE_CHECKPOINT_AUTOCAPTURE").as_deref() == Ok("0") {
         return;
     }
-    st.autocapture_frames_since = st.autocapture_frames_since.wrapping_add(1);
-    if st.autocapture_frames_since < checkpoint_capture_every_frames() {
+    // Spec 808 — count EMULATED CYCLES, not calls.
+    //
+    // This used to add 1 per call, which is right only if the caller calls once per
+    // frame. The daemon's stream loop does; the in-process CLI cockpit pumps every 5 ms
+    // — 200 calls a second — so at cadence 1 it captured 200 anchors a second instead of
+    // 50, and a 500-anchor ring covered TWO AND A HALF SECONDS instead of ten. The
+    // symptom was "I only get about 2 seconds back", and it was not the playback speed:
+    // the recording itself was four times too dense.
+    //
+    // Cycles are the honest unit. One PAL frame is 19656 of them however often anyone
+    // calls, and a caller that hands over a whole frame's worth still captures once.
+    st.autocapture_cycles_since = st
+        .autocapture_cycles_since
+        .wrapping_add(elapsed_cycles.max(1));
+    let per_capture = crate::streaming::CYC_PER_FRAME * st.checkpoint_cadence_frames.max(1);
+    if st.autocapture_cycles_since < per_capture {
         return;
     }
-    st.autocapture_frames_since = 0;
+    st.autocapture_cycles_since = 0;
     // Spec 709.13 — skip (a ring gap beats a corrupt checkpoint) while a mounted
     // medium is dirty + non-persistable.
     if non_persistable_dirty_media(st).is_some() {
@@ -14148,6 +14772,411 @@ fn capture_live_checkpoint(session: &mut Session) -> Value {
         cp["_ringDriveDiskBytes"] = trx64_core::native_snapshot::ta_u8(&bytes);
     }
     cp
+}
+
+
+/// Render a transport status Value as the two-line terminal answer (§4): the state line
+/// plus the key legend. One helper so every verb answers identically — a transport that
+/// describes itself differently depending on which key you pressed is the same class of
+/// confusion §5 is about.
+fn transport_reply(status: &Value) -> String {
+    // ONE line. The legend belongs on `rewind` and on entering the transport, not on
+    // every keypress — F9 held down printed two lines per frame and buried the log it
+    // was supposed to sit next to.
+    status["line"].as_str().unwrap_or("").to_string()
+}
+
+// ── Spec 808 — rewind transport operations ─────────────────────────────────────
+//
+// Every one of these ends with the machine STANDING on an anchor (or at the head).
+// There is no "show a picture and restore later" path: a step is a restore, measured at
+// 177 µs, so the machine is always genuinely where the transport says it is. That is
+// what makes the TUI's `/window`, the C64RE UI and every register panel correct for
+// free, and it is why §2's feature parity costs nothing.
+
+/// PAL master clock — for turning a cycle delta into the "-3.2s" the status line shows.
+const TRANSPORT_PAL_HZ: f64 = 985_248.444;
+
+/// The ring's anchors, oldest-first, as `(id, frame, cycles)`.
+fn transport_anchor_ids(st: &State) -> Vec<(String, u64, u64)> {
+    st.checkpoint_ring
+        .list()
+        .into_iter()
+        .map(|r| (r.id, r.frame, r.cycles))
+        .collect()
+}
+
+/// How far behind the head a position is, in seconds of emulated time.
+fn transport_seconds_behind(ids: &[(String, u64, u64)], pos: &transport::Position) -> f64 {
+    match ids.last() {
+        Some((_, _, head_cycles)) => {
+            (head_cycles.saturating_sub(pos.cycles)) as f64 / TRANSPORT_PAL_HZ
+        }
+        None => 0.0,
+    }
+}
+
+/// The status both surfaces render. Never fails — an empty ring is a legitimate answer
+/// ("no anchors yet"), not an error, because a freshly booted daemon is in exactly that
+/// state and the transport line should say so rather than blow up.
+fn transport_status(st: &State) -> Value {
+    let ids = transport_anchor_ids(st);
+    let pos = transport::locate(&ids, st.transport.cursor.as_deref());
+    let secs = pos.as_ref().map(|p| transport_seconds_behind(&ids, p)).unwrap_or(0.0);
+    let mut v = transport::status_json(&st.transport, pos.as_ref(), secs);
+    // The range rides EVERY status, not just the transport `pause` verb — F11 runs the
+    // cockpit `/pause`, so hanging it off the verb meant it was never actually seen.
+    v["range"] = json!(transport_range_line(st));
+    v
+}
+
+/// Place the machine on anchor `index`. The single point where the transport touches
+/// the machine — `frame`, `goto`, `play` and the per-frame tick all come through here,
+/// so there is one restore path to get right and one place the mode is decided.
+fn transport_move_to(st: &mut State, index: usize) -> Result<Value, String> {
+    let ids = transport_anchor_ids(st);
+    if ids.is_empty() {
+        return Err("transport: the checkpoint ring is empty — nothing to rewind to \
+                    (`cadence` sets the capture rate)"
+            .into());
+    }
+    let index = index.min(ids.len() - 1);
+    let (id, _, _) = ids[index].clone();
+    let at_head = index + 1 == ids.len();
+
+    let cp = st
+        .checkpoint_ring
+        .restore_snapshot(&id)
+        .ok_or_else(|| format!("transport: anchor {id} is gone (evicted)"))?;
+    restore_live_checkpoint(&mut st.session, &cp)?;
+    // The clock just jumped; whatever is queued belongs to a time we left.
+    st.audio_epoch = st.audio_epoch.wrapping_add(1);
+
+    // Spec 808 — REGENERATE THE PICTURE.
+    //
+    // 807 §4.1 stopped storing the two VIC framebuffers in an anchor because they cost
+    // 114 of every 167 µs and the ring threw them away. The comment justifying it called
+    // them "a derivable shadow, regenerated by re-sim on scrub" — and nothing ever
+    // re-simulated. So rewinding restored RAM, chips and drive correctly while the
+    // SCREEN stayed frozen on whatever was last drawn: the cycle counter ran backwards
+    // and the picture did not move. Two correct decisions that were wrong together.
+    //
+    // Everything on screen (`/window`, screenshots, the UI) renders from
+    // `vic.displayed`, and there is no synthesiser that can rebuild it from RAM + VIC
+    // registers — only the emulation draws it. So: run ONE frame to draw it, keep the
+    // result, and restore the anchor again so the machine still stands exactly where the
+    // transport says. ~100 µs for the frame plus a second restore; at 50 steps/s the
+    // whole step is ~2 % of wall-clock, which is what buys a moving picture.
+    {
+        let mut sink = trx64_core::NullSink;
+        // TWO frames, and keep the second. An anchor lands wherever the raster happened
+        // to be, so the first frame drawn after it is PARTIAL — the top belongs to the
+        // frame that was already half-drawn and the bottom to the new one. That seam is
+        // the striping you see while scrubbing. The second frame starts at a real frame
+        // boundary and is whole.
+        st.session.machine.run_for_full(
+            crate::streaming::CYC_PER_FRAME * 2,
+            &mut sink,
+            |_, _, _, _, _, _, _| {},
+        );
+        let drawn = st.session.machine.vic.displayed.clone();
+        restore_live_checkpoint(&mut st.session, &cp)?;
+        st.session.machine.vic.displayed = drawn;
+    }
+
+    // At the head the transport lets go: the stream loop owns the machine again and new
+    // anchors are recorded. Anywhere else it holds on, and the mode says REPLAY — the
+    // anchors ahead are still intact and can be played forward.
+    st.transport.cursor = if at_head { None } else { Some(id) };
+    st.transport.mode = if at_head {
+        transport::TransportMode::Live
+    } else {
+        transport::TransportMode::Replay
+    };
+    if at_head {
+        st.transport.playing = None;
+    }
+    st.transport.last_cut = 0;
+    Ok(transport_status(st))
+}
+
+/// Step `delta` anchors (negative = back). Stops at the ends rather than wrapping.
+fn transport_step(st: &mut State, delta: i64) -> Result<Value, String> {
+    let ids = transport_anchor_ids(st);
+    // Spec 808 — stepping FORWARD from the head has no anchor to land on, and refusing
+    // was the wrong answer: "one frame further" is a perfectly good thing to ask for
+    // whether or not a recording happens to lie underneath. So run the emulation for one
+    // frame and stop, which is what single-stepping a paused machine means anyway. The
+    // per-frame pump then captures it, so the ring grows by exactly the frame you asked
+    // to see.
+    let at_head = st.transport.cursor.is_none();
+    if delta > 0 && at_head {
+        let frame_no = st.ctrl_frame;
+        {
+            let (w, h, indices) = st.session.machine.render_canvas_indices();
+            stream_maybe_autocapture(st, frame_no, crate::streaming::CYC_PER_FRAME, w, h, &indices);
+        }
+        let mut sink = trx64_core::NullSink;
+        st.session.machine.run_for_full(
+            crate::streaming::CYC_PER_FRAME * delta as u64,
+            &mut sink,
+            |_, _, _, _, _, _, _| {},
+        );
+        st.ctrl_frame = st.ctrl_frame.wrapping_add(delta as u64);
+        st.transport.mode = transport::TransportMode::StepFwd;
+        let mut out = transport_status(st);
+        out["ranLive"] = json!(delta);
+        return Ok(out);
+    }
+    let pos = transport::locate(&ids, st.transport.cursor.as_deref()).ok_or_else(|| {
+        "transport: no anchors yet — the ring fills while the machine RUNS \
+         (`cadence 1` = one per frame; `rewind` shows the count)"
+            .to_string()
+    })?;
+    let (next, hit_end) = transport::step_index(pos.index, delta, pos.total);
+    let mut out = transport_move_to(st, next)?;
+    if hit_end {
+        // Say so, with the numbers. A transport that quietly refuses to move looks
+        // identical to one that moved and landed on an identical frame — and "it does
+        // not reach the bottom of the buffer" is exactly the complaint those two produce.
+        st.transport.playing = None;
+        out["hitEnd"] = json!(true);
+        out["line"] = json!(format!(
+            "{}   (END OF BUFFER)\n{}",
+            out["line"].as_str().unwrap_or(""),
+            transport_range_line(st)
+        ));
+    }
+    Ok(out)
+}
+
+/// Jump to an exact frame index (1-based, as the status line shows) or CPU cycle. A
+/// cycle target lands on the anchor at-or-before it: anchors are frame-granular, and
+/// pretending otherwise would report a cycle the machine is not actually at.
+fn transport_goto(st: &mut State, target: &str) -> Result<Value, String> {
+    let ids = transport_anchor_ids(st);
+    if ids.is_empty() {
+        return Err("transport: the checkpoint ring is empty".into());
+    }
+    let t = target.trim();
+    let index = if let Some(cyc) = t.strip_prefix('c').or_else(|| t.strip_prefix('@')) {
+        let want: u64 = cyc
+            .trim()
+            .parse()
+            .map_err(|_| format!("goto: `{t}` is not a cycle (use c<number> or @<number>)"))?;
+        // at-or-before, so the machine is never claimed to be ahead of where it is
+        ids.iter()
+            .rposition(|(_, _, c)| *c <= want)
+            .ok_or_else(|| {
+                format!(
+                    "goto: cycle {want} is older than the ring (oldest anchor is at cycle {})",
+                    ids[0].2
+                )
+            })?
+    } else {
+        let n: usize = t
+            .parse()
+            .map_err(|_| format!("goto: `{t}` is neither a frame number nor c<cycle>"))?;
+        if n == 0 || n > ids.len() {
+            return Err(format!("goto: frame {n} is outside 1..={}", ids.len()));
+        }
+        n - 1
+    };
+    transport_move_to(st, index)
+}
+
+/// Start playing. Speed multiplies the per-frame step count; 1× at cadence 1 is 50
+/// steps/s, i.e. real time.
+fn transport_play(st: &mut State, dir: transport::Direction, speed: u32) -> Result<Value, String> {
+    let ids = transport_anchor_ids(st);
+    if ids.is_empty() {
+        return Err("transport: no anchors yet — let the machine run first \
+                    (`cadence 1` captures one per frame; `rewind` shows the count)"
+            .into());
+    }
+    st.transport.speed = speed.clamp(1, 16);
+    // Playing forward FROM the head is just running: hand the machine back rather than
+    // pretending to replay anchors that do not exist yet.
+    let pos = transport::locate(&ids, st.transport.cursor.as_deref());
+    let at_head = pos.as_ref().map(|p| p.index + 1 == p.total).unwrap_or(true);
+    if dir == transport::Direction::Fwd && at_head {
+        st.transport.cursor = None;
+        st.transport.playing = None;
+        st.transport.mode = transport::TransportMode::Live;
+        return Ok(transport_status(st));
+    }
+    // Playing back FROM the head: take hold of the machine at the head anchor first, so
+    // the first tick steps from a known position.
+    if st.transport.cursor.is_none() {
+        if let Some(p) = pos {
+            let (id, _, _) = ids[p.index].clone();
+            st.transport.cursor = Some(id);
+        }
+    }
+    st.transport.playing = Some(dir);
+    st.transport.last_step_ms = now_ms();
+    st.transport.mode = transport::TransportMode::Replay;
+    let mut out = transport_status(st);
+    // Say how much rewind there actually IS. At the default cadence of 25 the ring holds
+    // 20 anchors = 0.4 s, so `play back` reaches the oldest frame before you let go of
+    // the key and then looks stuck. That is the cadence, not a fault, and the reply has
+    // to say so rather than leave the user pressing the key harder.
+    let span = ids.len() as f64 * st.checkpoint_cadence_frames.max(1) as f64 / 50.0;
+    if span < 2.0 {
+        out["line"] = json!(format!(
+            "{}\n  only {:.1}s of rewind here ({} anchors at every-{}-frames) \u{2014} `cadence 1` gives the full window",
+            out["line"].as_str().unwrap_or(""),
+            span,
+            ids.len(),
+            st.checkpoint_cadence_frames.max(1)
+        ));
+    }
+    Ok(out)
+}
+
+/// The buffer, in facts: which cycle it starts at, which it ends at, how much that is
+/// in seconds, and where the cursor sits inside it.
+///
+/// Added because three rounds of "it does not go back far enough" were argued from
+/// inference on both sides. Two numbers and a span settle it; a description does not.
+fn transport_range_line(st: &State) -> String {
+    let ids = transport_anchor_ids(st);
+    if ids.is_empty() {
+        return "RINGBUFFER SIZE: empty (fills while the machine runs)".to_string();
+    }
+    let first = ids[0].2;
+    let last = ids[ids.len() - 1].2;
+    let span = last.saturating_sub(first);
+    let secs = span as f64 / TRANSPORT_PAL_HZ;
+    let live = st.session.machine.c64_core.clk;
+    let n = ids.len();
+    let pos = transport::locate(&ids, st.transport.cursor.as_deref());
+    let at = pos
+        .as_ref()
+        .map(|p| format!("Cycle {} Frame {}", p.cycles, p.index + 1))
+        .unwrap_or_else(|| format!("Cycle {live} (live head)"));
+    // Is the recording CONTINUOUS? Anchors should sit exactly one cadence apart. A bigger
+    // step means frames were not captured — the machine was paused, an op skipped the
+    // capture, or something evicted mid-run. Reporting the worst gap turns "something is
+    // missing at the start" from an argument into a number.
+    let expect = crate::streaming::CYC_PER_FRAME * st.checkpoint_cadence_frames.max(1);
+    let mut worst = 0u64;
+    let mut worst_at = 0u64;
+    let mut gaps = 0usize;
+    for w in ids.windows(2) {
+        let d = w[1].2.saturating_sub(w[0].2);
+        if d > expect {
+            gaps += 1;
+            if d > worst {
+                worst = d;
+                worst_at = w[0].2;
+            }
+        }
+    }
+    let continuity = if gaps == 0 {
+        format!("continuous (every {expect} cyc)")
+    } else {
+        format!(
+            "{gaps} GAP(S) — worst {worst} cyc ({:.2}s) after Cycle {worst_at}, expected {expect}",
+            worst as f64 / TRANSPORT_PAL_HZ
+        )
+    };
+    // How far back the window reaches from NOW — the number actually being asked about
+    // when someone says "the beginning is missing".
+    let behind = live.saturating_sub(first) as f64 / TRANSPORT_PAL_HZ;
+    format!(
+        "RINGBUFFER SIZE {n} (starts at Cycle {first} Frame 1 // ends at Cycle {last} Frame {n})\n           span {span} cyc = {secs:.2}s   ·   cursor at {at}   ·   machine now Cycle {live}\n           reaches {behind:.2}s back from now   ·   {continuity}"
+    )
+}
+
+/// Stop where we are. Not a restore: the machine is ALREADY on this anchor (decision 2),
+/// which is why "pause and inspect" needs no second step.
+fn transport_pause(st: &mut State) -> Value {
+    st.transport.playing = None;
+    let mut out = transport_status(st);
+    out["line"] = json!(format!(
+        "{}\n{}",
+        out["line"].as_str().unwrap_or(""),
+        out["range"].as_str().unwrap_or("")
+    ));
+    out
+}
+
+/// One transport tick, called by the stream loop per frame while playing. Returns true
+/// when the transport consumed the frame (so the loop must NOT advance emulation).
+pub(crate) fn transport_tick(st: &mut State, budget_cycles: u64) -> bool {
+    let Some(dir) = st.transport.playing else {
+        return st.transport.holds_the_machine();
+    };
+    // Pace against the WALL CLOCK, directly. Earlier this accumulated the cycle budget
+    // the caller passed, which is only as trustworthy as the caller: a ten-second ring
+    // still emptied in about two seconds. Real milliseconds cannot be got wrong by
+    // whoever is driving the pump.
+    let now = now_ms();
+    if st.transport.last_step_ms == 0 {
+        st.transport.last_step_ms = now;
+    }
+    let ms_per_step = (20u64 / st.transport.speed.max(1) as u64).max(1); // 20 ms = PAL frame
+    let due = now.saturating_sub(st.transport.last_step_ms) / ms_per_step;
+    if due == 0 {
+        let _ = budget_cycles;
+        return st.transport.holds_the_machine();
+    }
+    st.transport.last_step_ms = now;
+    let mut remaining = due.min(4); // never binge after a stall
+    let mut moved = false;
+    while remaining > 0 {
+        remaining -= 1;
+        let delta = match dir {
+            transport::Direction::Back => -1,
+            transport::Direction::Fwd => 1,
+        };
+        // A failed step stops playback rather than retrying forever on a broken ring.
+        if transport_step(st, delta).is_err() {
+            st.transport.playing = None;
+            break;
+        }
+        moved = true;
+        if st.transport.playing.is_none() {
+            break; // hit an end, or reached the head and handed the machine back
+        }
+    }
+    let _ = moved;
+    st.transport.holds_the_machine()
+}
+
+/// Called from every path that CHANGES the machine while the transport is rewound — a
+/// key, the joystick, a monitor write, a resumed run. Decision 4 says watching is free
+/// and only intervention costs you the recording, so this is the one place the future
+/// is truncated, and it records how many anchors went so §5 can report it.
+/// A reset, a power cycle or a media change does not DIVERGE the timeline — it replaces
+/// the machine. The anchors describe a machine that no longer exists, and restoring one
+/// would put back a pre-reset state and make the reset look like it never happened.
+/// So those clear the ring outright rather than truncating it.
+pub(crate) fn transport_discard_timeline(st: &mut State, why: &str) {
+    st.audio_epoch = st.audio_epoch.wrapping_add(1);
+    let had = st.checkpoint_ring.list().len() as u64;
+    st.checkpoint_ring.clear();
+    st.transport = transport::Transport::default();
+    st.autocapture_frames_since = 0;
+    // Deliberately NOT printed: the daemon shares a terminal with the TUI, which draws
+    // boxes at absolute positions, and stderr from here lands inside them. `rewind` will
+    // truthfully report 0 anchors, which is the same information without the mess.
+    let _ = (had, why);
+}
+
+pub(crate) fn transport_truncate_on_intervention(st: &mut State) {
+    if !st.transport.holds_the_machine() {
+        return;
+    }
+    let Some(id) = st.transport.cursor.clone() else {
+        return;
+    };
+    let dropped = st.checkpoint_ring.truncate_after(&id, true);
+    st.transport.cursor = None;
+    st.transport.playing = None;
+    st.transport.mode = transport::TransportMode::Cut;
+    st.transport.last_cut = dropped;
 }
 
 /// Restore the live machine from a ring checkpoint Value (re-attaching the embedded
@@ -14942,33 +15971,72 @@ fn capture_recorder_anchor_payload(session: &mut Session) -> Value {
     // Pass no drive blobs / cart blobs → the checkpoint tree omits the big GCR/disk
     // overlay + the cart bytes/flash (the omitMedia anchor); the disk image + cart
     // bytes ride the recorder's medium stream instead (gen-gated).
-    let mut cp = trx64_core::c64re_snapshot::capture_runtime_checkpoint(
+    // Spec 807 §4.1 — omit_framebuffer=true: the two VIC framebuffers are NOT encoded
+    // in the first place. They used to be built here and nulled below, which cost
+    // 114 µs of every 167 µs capture (perf_bench bench_checkpoint_framebuffer_waste)
+    // for bytes discarded five lines later. This is the SAME discipline the nulling
+    // expressed (BUG-049 / Spec 765 §8: the anchor is RAM + chip state, framebuffers
+    // are a derivable shadow) — just applied before the work instead of after it.
+    // Spec 808 — the CART'S WRITABLE FLASH RIDES THE ANCHOR.
+    //
+    // It used to be omitted like the other media, and that broke a rewind on a
+    // cartridge: boot from CRT, pause, rewind, play, and the game no longer got past its
+    // intro. Two reasons, both fatal on their own:
+    //
+    //   1. A game that WRITES its flash (a save, a playthrough cart) leaves the flash in
+    //      the future while the CPU is restored into the past. `cartState` restores the
+    //      bank register; the bytes behind it were never captured.
+    //   2. The picture regeneration runs two frames of REAL code after each restore
+    //      (§4a), and real code can write flash. The re-restore afterwards cannot undo
+    //      what it is not carrying — so every scrub step could quietly mutate the cart.
+    //
+    // It is affordable because the ring pools these blobs content-addressed: an unchanged
+    // flash across all 500 anchors is ONE copy, and only an actual write adds another.
+    // `driveDiskImage` (the mutable GCR overlay) stays omitted — it changes on every
+    // write, so content-addressing would not dedup it; the same hole exists for a
+    // disk-writing title and is recorded in §8 rather than pretended away.
+    // BOTH cart blobs, not just the flash.
+    //
+    // `restore_runtime_checkpoint` is "the sole cart authority (re-attaches from
+    // `cartBytes`, or `detach_cart`)" — the code's own words. So an anchor with
+    // `cartBytes: null` does not merely fail to restore the cart, it EJECTS it: rewind
+    // on a CRT and the next reset lands in BASIC, with nothing left to load from.
+    //
+    // The `.crt` bytes never change during a session, so the ring's content-addressed
+    // pool stores exactly ONE copy for the whole window regardless of its length. The
+    // flash rides for the separate reason in §7b (a game that writes it, plus the
+    // picture-regeneration frames).
+    let (cart_bytes, cart_flash) = capture_cart_blobs(&mut session.machine);
+    let mut cp = trx64_core::c64re_snapshot::capture_runtime_checkpoint_opts(
         &session.machine,
         &disk_path,
         &disk_format,
         None,
         None,
-        None,
-        None,
+        cart_bytes.as_deref(),
+        cart_flash.as_deref(),
+        true,
     );
-    // Null any large media slots the checkpoint may carry (omitMedia anchor).
-    for slot in ["driveDiskImage", "cartBytes", "cartFlash"] {
-        if cp.get(slot).is_some() {
-            cp[slot] = Value::Null;
-        }
+    // The GCR overlay is the only slot still omitted here (see above).
+    if cp.get("driveDiskImage").is_some() {
+        cp["driveDiskImage"] = Value::Null;
     }
     // omitFramebuffer (runtime-controller.ts:839/847): the two VIC framebuffers
     // (~317 KiB) are a DERIVABLE shadow — regenerated by re-sim on scrub/dump
-    // (Spec 765 §8). Null them so the per-anchor codec body stays small (the
-    // BUG-049 discipline: the anchor is RAM + chip state, not framebuffers). Without
-    // this the codec body exceeds the recorder ring's anchor slot.
-    if let Some(vp) = cp.get_mut("vicPresentation") {
-        for fb in ["literalPortFb", "literalPortFbStable"] {
-            if vp.get(fb).is_some() {
-                vp[fb] = Value::Null;
-            }
-        }
-    }
+    // (Spec 765 §8). They must be absent so the per-anchor codec body stays small;
+    // without that the body exceeds the recorder ring's anchor slot.
+    //
+    // Spec 807: the capture above no longer encodes them (omit_framebuffer=true), so
+    // they arrive Null already. This assert keeps the contract enforced at the seam
+    // rather than assumed — if a future capture path stops honouring the flag, the
+    // anchor must not silently grow by 317 KiB.
+    debug_assert!(
+        cp.get("vicPresentation")
+            .and_then(|vp| vp.get("literalPortFb"))
+            .map(|v| v.is_null())
+            .unwrap_or(true),
+        "anchor payload carries a framebuffer — omit_framebuffer was not honoured"
+    );
     cp
 }
 
@@ -15451,7 +16519,7 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         // 20 = 10s @ 0.5s cadence, env-overridable) on top of the 32 MiB byte budget,
         // evict-oldest on whichever-first. Deep history = the recorder, not this ring.
         checkpoint_ring: trx64_core::checkpoint_ring::RuntimeCheckpointRing::with_budget_and_max_entries(
-            trx64_core::checkpoint_ring::DEFAULT_CHECKPOINT_RING_BUDGET_BYTES,
+            trx64_core::checkpoint_ring::checkpoint_ring_budget_for(checkpoint_ring_max_entries()),
             checkpoint_ring_max_entries(),
         ),
         inspect_evidence: Vec::new(),
@@ -15482,10 +16550,17 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         cart_ap_settle_at_ms: 0,
         cart_ap_done_gen: 0,
         disk_ap_pending: false,
+        checkpoint_cadence_frames: checkpoint_capture_every_frames(),
+        transport: transport::Transport::default(),
+        checkpoint_window_seconds: checkpoint_ring_seconds(),
         disk_ap_settle_at_ms: 0,
         disk_ap_seen_hash: None,
         disk_ap_done_hash: None,
         autocapture_frames_since: 0,
+        autocapture_cycles_since: 0,
+        play_intent: false,
+        warp: false,
+        audio_epoch: 0,
         recorder_frames_since: 0,
         candidates: std::collections::HashMap::new(),
         candidate_seq: 0,
@@ -16011,7 +17086,7 @@ mod batch1_tests {
         // 20 = 10s @ 0.5s cadence, env-overridable) on top of the 32 MiB byte budget,
         // evict-oldest on whichever-first. Deep history = the recorder, not this ring.
         checkpoint_ring: trx64_core::checkpoint_ring::RuntimeCheckpointRing::with_budget_and_max_entries(
-            trx64_core::checkpoint_ring::DEFAULT_CHECKPOINT_RING_BUDGET_BYTES,
+            trx64_core::checkpoint_ring::checkpoint_ring_budget_for(checkpoint_ring_max_entries()),
             checkpoint_ring_max_entries(),
         ),
             inspect_evidence: Vec::new(),
@@ -16042,10 +17117,17 @@ mod batch1_tests {
             cart_ap_settle_at_ms: 0,
             cart_ap_done_gen: 0,
             disk_ap_pending: false,
+        checkpoint_cadence_frames: checkpoint_capture_every_frames(),
+        transport: transport::Transport::default(),
+        checkpoint_window_seconds: checkpoint_ring_seconds(),
             disk_ap_settle_at_ms: 0,
             disk_ap_seen_hash: None,
             disk_ap_done_hash: None,
             autocapture_frames_since: 0,
+            autocapture_cycles_since: 0,
+            play_intent: false,
+            warp: false,
+            audio_epoch: 0,
             recorder_frames_since: 0,
         candidates: std::collections::HashMap::new(),
         candidate_seq: 0,
@@ -16511,6 +17593,675 @@ mod batch1_tests {
         run_monitor(&mut g, cmd)
     }
 
+    // ── Spec 808 — rewind transport gates ──────────────────────────────────────
+
+    /// Fill the ring with `n` anchors from the live machine, advancing it between each
+    /// so every anchor is a genuinely different state (an identical-state ring would
+    /// make the exactness gate below pass for the wrong reason).
+    fn fill_anchors(st: &SharedState, n: usize) {
+        let mut g = st.lock().unwrap();
+        for i in 0..n {
+            g.session.machine.poke(0x0400 + i as u16, &[i as u8]);
+            let cp = capture_live_checkpoint(&mut g.session);
+            g.checkpoint_ring.capture(cp, i as u64, i as u64 * 19_656).unwrap();
+        }
+    }
+
+    /// G1 — a backward step is EXACT, not approximate. §1's whole design rests on this:
+    /// if a restore were lossy, "the machine follows for free" would be a lie and every
+    /// register panel would show something subtly wrong.
+    #[test]
+    fn stepping_back_and_forward_returns_the_identical_machine() {
+        let st = make_state();
+        fill_anchors(&st, 8);
+        let (ram_before, pc_before, clk_before) = {
+            let g = st.lock().unwrap();
+            (
+                g.session.machine.ram.to_vec(),
+                g.session.machine.c64_core.reg_pc,
+                g.session.machine.c64_core.clk,
+            )
+        };
+
+        mon(&st, "frame -3").expect("back 3");
+        {
+            let g = st.lock().unwrap();
+            assert_ne!(
+                g.session.machine.ram.as_ref().as_slice(), ram_before.as_slice(),
+                "stepping back must actually MOVE the machine — if RAM is unchanged the \
+                 transport is showing pictures, not restoring"
+            );
+        }
+        mon(&st, "frame +3").expect("fwd 3");
+
+        let g = st.lock().unwrap();
+        assert_eq!(g.session.machine.ram.as_ref(), ram_before.as_slice(), "RAM must return byte-exact");
+        assert_eq!(g.session.machine.c64_core.reg_pc, pc_before, "PC must return");
+        assert_eq!(g.session.machine.c64_core.clk, clk_before, "the clock must return");
+    }
+
+    /// G4 — the mode cannot lie. REPLAY while standing on intact anchors, LIVE at the
+    /// head, CUT with a count the instant an intervention truncates. §5 exists because
+    /// replaying and running live look identical on screen; this is what makes them
+    /// distinguishable.
+    #[test]
+    fn the_mode_says_replay_then_live_then_cut_with_a_count() {
+        let st = make_state();
+        fill_anchors(&st, 10);
+
+        // At the head after filling: LIVE, nothing behind us.
+        let head = mon(&st, "rewind").expect("rewind");
+        assert!(head.contains("LIVE"), "{head}");
+        assert!(head.contains("frame 10/10"), "{head}");
+
+        // Rewound: REPLAY, and the anchors are all still there.
+        let back = mon(&st, "frame -4").expect("back");
+        assert!(back.contains("STEP"), "a single step says STEP, not REPLAY: {back}");
+        assert!(back.contains("frame 6/10"), "{back}");
+        assert_eq!(st.lock().unwrap().checkpoint_ring.list().len(), 10, "watching must not cut");
+
+        // Forward to the head again: LIVE, still nothing lost.
+        let fwd = mon(&st, "frame +4").expect("fwd");
+        assert!(fwd.contains("LIVE"), "{fwd}");
+        assert_eq!(st.lock().unwrap().checkpoint_ring.list().len(), 10);
+
+        // Rewind, then INTERVENE: the future goes, and the mode says how much.
+        mon(&st, "frame -4").expect("back again");
+        mon(&st, "wr ram 0400 ff").expect("write");
+        let cut = mon(&st, "rewind").expect("rewind after write");
+        assert!(cut.contains("CUT"), "an intervention must announce itself: {cut}");
+        assert!(cut.contains("-4 anchors"), "and say how many went: {cut}");
+        assert_eq!(
+            st.lock().unwrap().checkpoint_ring.list().len(),
+            6,
+            "the four anchors ahead of the cursor must be gone"
+        );
+    }
+
+    /// G1b — `goto` by frame and by cycle land where they say, and a cycle lands on the
+    /// anchor AT-OR-BEFORE it rather than rounding forward (which would report the
+    /// machine as being somewhere it is not).
+    #[test]
+    fn goto_takes_a_frame_or_a_cycle_and_never_rounds_forward() {
+        let st = make_state();
+        fill_anchors(&st, 10);
+
+        let by_frame = mon(&st, "goto 3").expect("goto 3");
+        assert!(by_frame.contains("frame 3/10"), "{by_frame}");
+
+        // Anchor k sits at cycle k*19656. Ask for one cycle PAST anchor 5 (index 4).
+        let by_cycle = mon(&st, &format!("goto c{}", 4 * 19_656 + 1)).expect("goto cycle");
+        assert!(
+            by_cycle.contains("frame 5/10"),
+            "a cycle between anchors must land on the one BEFORE it: {by_cycle}"
+        );
+
+        assert!(mon(&st, "goto 0").is_err(), "frame 0 does not exist (1-based)");
+        assert!(mon(&st, "goto 99").is_err(), "past the end must be an error, not a clamp");
+        // The oldest anchor here sits at cycle 0, so nothing can be older than the ring
+        // — cycle 0 and cycle 1 both land on it. The "older than the ring" error path is
+        // covered by the ring having wrapped, which needs a separately-seeded ring.
+        assert!(mon(&st, "goto c0").expect("goto c0").contains("frame 1/10"));
+        {
+            // A ring whose oldest anchor is NOT at zero: now "before the ring" exists.
+            let st2 = make_state();
+            {
+                let mut g = st2.lock().unwrap();
+                for i in 0..3u64 {
+                    let cp = capture_live_checkpoint(&mut g.session);
+                    g.checkpoint_ring
+                        .capture(cp, i, 5_000_000 + i * 19_656)
+                        .unwrap();
+                }
+            }
+            let err = mon(&st2, "goto c1000").expect_err("before the ring must be an error");
+            assert!(err.contains("older than the ring"), "{err}");
+        }
+    }
+
+    /// G1c — the ends clamp and SAY they clamped. A transport that quietly refuses to
+    /// move is indistinguishable from one that moved onto an identical frame.
+    #[test]
+    fn playing_past_the_ends_stops_and_says_so() {
+        let st = make_state();
+        fill_anchors(&st, 5);
+        let out = mon(&st, "frame -99").expect("back past the start");
+        assert!(out.contains("frame 1/5"), "{out}");
+        assert!(out.contains("end of the ring"), "hitting the end must be stated: {out}");
+        // And playback stops rather than spinning at the wall.
+        assert!(st.lock().unwrap().transport.playing.is_none());
+    }
+
+    /// The in-process CLI cockpit pumps the machine through `session/run`, not through
+    /// the daemon's stream loop. So the transport has to be honoured there too, or
+    /// `play back` in `trx64cli` would set a flag nobody ticks — and a running pump
+    /// would advance the machine ON TOP of a restore, which is exactly the divergence
+    /// only an intervention is allowed to cause. Found by smoke-testing the built
+    /// binary rather than by reading, which is why it has a test of its own.
+    #[test]
+    fn session_run_does_not_advance_while_the_transport_holds_the_machine() {
+        let st = make_state();
+        fill_anchors(&st, 8);
+        mon(&st, "frame -3").expect("back");
+        let clk_before = st.lock().unwrap().session.machine.c64_core.clk;
+
+        let r = call(&st, "session/run", json!({ "cycles": 19_656 }));
+        assert_eq!(r["c64Cycles"], json!(0), "the pump must not advance a rewound machine");
+        assert!(r["transport"].is_object(), "and it must say why: {r}");
+
+        // Nothing moved.
+        assert_eq!(st.lock().unwrap().session.machine.c64_core.clk, clk_before);
+
+        // Playing back: pump ticks STEP the transport instead of advancing the machine.
+        // Paced by WALL CLOCK (one anchor per 20 ms at 1x), not one per call — the
+        // caller's cycle budget proved untrustworthy, a ten-second ring emptied in two.
+        // So the test waits real time rather than counting calls.
+        mon(&st, "play back").expect("play back");
+        let before = call(&st, "transport/status", json!({}))["frameIndex"].as_u64().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(45));
+        call(&st, "session/run", json!({ "cycles": 19_656 }));
+        let after = call(&st, "transport/status", json!({}))["frameIndex"].as_u64().unwrap();
+        assert!(
+            after < before,
+            "after 45 ms of playback the transport must have stepped back              (was {before}, now {after})"
+        );
+        assert!(
+            before - after <= 4,
+            "and must not binge after a wait: {} steps for 45 ms",
+            before - after
+        );
+
+        // And once handed back at the head, the pump advances normally again.
+        mon(&st, "goto 8").expect("goto head");
+        let clk_head = st.lock().unwrap().session.machine.c64_core.clk;
+        let _ = clk_head;
+        let r2 = call(&st, "session/run", json!({ "cycles": 19_656 }));
+        assert!(
+            r2["transport"].is_null(),
+            "at the head session/run must NOT be intercepted any more — the pump owns \
+             the machine again: {r2}"
+        );
+        // (Whether the CPU then executes anything is this fixture's business, not the
+        // transport's: make_state() has no ROMs, so `c64Cycles` reports the budget and
+        // the clock does not move. The contract under test is the handover.)
+    }
+
+    /// The pump path must do the SAME per-frame work as the stream loop. Three bugs in
+    /// one session came from it not doing so: the checkpoint ring stayed empty under
+    /// `trx64cli` (so every transport verb answered "no anchors"), and a cart or disk
+    /// the game wrote never reached the host file. The daemon's stream loop had all
+    /// four helpers; the CLI cockpit pumps through `session/run` and had none.
+    #[test]
+    fn the_pump_path_does_the_same_per_frame_work_as_the_stream_loop() {
+        let st = make_state();
+        // One anchor per pumped frame, so a handful of pumps must fill the ring.
+        mon(&st, "cadence 1").expect("cadence 1");
+        assert_eq!(st.lock().unwrap().checkpoint_ring.list().len(), 0, "starts empty");
+
+        for _ in 0..5 {
+            call(&st, "session/run", json!({ "cycles": 19_656 }));
+        }
+        let n = st.lock().unwrap().checkpoint_ring.list().len();
+        assert!(
+            n >= 5,
+            "pumping must FEED the ring — got {n} anchors after 5 frames. An empty ring \
+             here is the bug that made every transport verb say 'no anchors yet' under \
+             the in-process cockpit."
+        );
+
+        // And the transport works off what the pump captured, with no stream loop in
+        // sight — which is the whole point of the parity requirement.
+        let out = mon(&st, "frame -2").expect("step back");
+        assert!(out.contains("STEP"), "{out}");
+    }
+
+    /// The PICTURE must move. Everything on screen renders from `vic.displayed`, and
+    /// 807 removed the framebuffer from the anchors — so a rewind that restores RAM and
+    /// chips correctly can still leave a frozen image, which is exactly what it did.
+    /// This asserts the visible bytes actually differ across a backward step.
+    #[test]
+    fn stepping_back_changes_what_is_on_the_screen() {
+        // Needs ROMs: without a KERNAL the VIC never draws anything and every canvas is
+        // uniformly black, which would make this pass for the wrong reason.
+        let rom_dir = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../C64ReverseEngineeringMCP/resources/roms"
+        ));
+        if !rom_dir.join("kernal-901227-03.bin").exists() {
+            eprintln!("skip stepping_back_changes_what_is_on_the_screen: ROMs absent");
+            return;
+        }
+        let st = make_state();
+        {
+            let mut g = st.lock().unwrap();
+            g.session.machine.boot_from_dir(rom_dir).expect("boot ROMs");
+            let mut sink = trx64_core::NullSink;
+            g.session.machine.run_for_full(3_000_000, &mut sink, |_, _, _, _, _, _, _| {});
+        }
+        // Give each anchor a visibly different screen: poke screen RAM, then capture.
+        {
+            let mut g = st.lock().unwrap();
+            for i in 0..8u64 {
+                let row: Vec<u8> = (0..40).map(|c| (i as u8).wrapping_add(c as u8)).collect();
+                g.session.machine.poke(0x0400, &row);
+                // Draw a frame so `displayed` reflects the poke, then capture THAT.
+                let mut sink = trx64_core::NullSink;
+                g.session.machine.run_for_full(
+                    crate::streaming::CYC_PER_FRAME,
+                    &mut sink,
+                    |_, _, _, _, _, _, _| {},
+                );
+                let cp = capture_live_checkpoint(&mut g.session);
+                g.checkpoint_ring.capture(cp, i, i * 19_656).unwrap();
+            }
+        }
+        let screen_now = st.lock().unwrap().session.machine.render_canvas_indices().2;
+
+        mon(&st, "frame -4").expect("back 4");
+        let screen_back = st.lock().unwrap().session.machine.render_canvas_indices().2;
+        assert_ne!(
+            screen_now, screen_back,
+            "the rendered canvas must CHANGE when stepping back — if it does not, the \
+             transport is moving RAM while the screen stays frozen, which is what a user \
+             sees as 'it does not play backwards'"
+        );
+
+        // Landing on the SAME anchor twice must show the same picture — the regeneration
+        // has to be deterministic, or backward playback would shimmer. (Compared against
+        // an intermediate anchor, not the head: the head releases the cursor and the
+        // machine runs on, so its picture is legitimately one frame further along.)
+        mon(&st, "frame +2").expect("fwd 2");
+        let screen_mid_a = st.lock().unwrap().session.machine.render_canvas_indices().2;
+        mon(&st, "frame -2").expect("back 2");
+        mon(&st, "frame +2").expect("fwd 2 again");
+        let screen_mid_b = st.lock().unwrap().session.machine.render_canvas_indices().2;
+        assert_eq!(
+            screen_mid_a, screen_mid_b,
+            "the same anchor must regenerate the same picture every time"
+        );
+    }
+
+    /// How much rewind do you ACTUALLY get? The owner measured ~2 seconds where the
+    /// settings promise 10, so this pumps a full window's worth and counts.
+    #[test]
+    fn pumping_a_full_window_fills_the_whole_ring() {
+        let st = make_state();
+        // A short window on purpose: this asserts that a cap is REACHED, and pumping the
+        // 60-second default would be 3000 frames of test for the same statement.
+        mon(&st, "window 10").expect("window 10");
+        let want = {
+            let g = st.lock().unwrap();
+            g.checkpoint_ring.max_entries()
+        };
+        assert_eq!(want, 500, "10 s at cadence 1");
+
+        for _ in 0..want {
+            call(&st, "session/run", json!({ "cycles": 19_656 }));
+        }
+        let g = st.lock().unwrap();
+        let held = g.checkpoint_ring.list().len() as u64;
+        let stats = g.checkpoint_ring.stats();
+        assert_eq!(
+            held, want,
+            "pumped {want} frames and the ring holds {held} — anchors are being dropped \
+             before the cap. total_bytes={} budget={}",
+            stats.total_bytes,
+            g.checkpoint_ring.budget_bytes()
+        );
+    }
+
+    /// The recording DENSITY must follow emulated time, not the caller's call rate.
+    ///
+    /// This is the bug behind "I only get about two seconds back". The auto-capture
+    /// counted CALLS: right for the daemon's stream loop (one call per frame), wrong for
+    /// the CLI cockpit, which pumps every 5 ms. At cadence 1 that recorded 200 anchors a
+    /// second instead of 50, so a 500-anchor ring covered 2.5 seconds — and playing it
+    /// back at a real 50/s then looked four times too slow, which was the other half of
+    /// the same complaint.
+    #[test]
+    fn recording_density_follows_emulated_time_not_the_call_rate() {
+        // One second of emulated time, delivered in 200 small pumps like the CLI does.
+        let st = make_state();
+        let quarter = crate::streaming::CYC_PER_FRAME / 4;
+        for _ in 0..200 {
+            call(&st, "session/run", json!({ "cycles": quarter }));
+        }
+        let dense = st.lock().unwrap().checkpoint_ring.list().len();
+
+        // The same second delivered as 50 whole frames, like the stream loop does.
+        let st2 = make_state();
+        for _ in 0..50 {
+            call(&st2, "session/run", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+        }
+        let coarse = st2.lock().unwrap().checkpoint_ring.list().len();
+
+        assert_eq!(
+            dense, coarse,
+            "one second of emulated time must record the same number of anchors however \
+             it is delivered — {dense} via 200 small pumps vs {coarse} via 50 frames"
+        );
+        assert!(
+            (48..=52).contains(&dense),
+            "and that number is ~50 at cadence 1 (PAL), got {dense}"
+        );
+    }
+
+    /// Every door that RESTARTS the machine must leave it running. Power on, reset and
+    /// a CRT mount all set the controller's `session.running` as a side effect, and the
+    /// tick used to REFUSE in that state — so the machine froze after each of them the
+    /// moment the client's reconciliation was removed. One test per door, because the
+    /// regression was invisible until someone pressed the button.
+    #[test]
+    fn every_restart_door_leaves_the_machine_running() {
+        // A CRT mount is the third door and behaves the same (it power-cycles), but it
+        // needs a real .crt on the machine, and the samples are third-party property that
+        // is never committed. Power and reset exercise the identical path.
+        for door in ["power", "reset"] {
+            let st = make_state();
+            match door {
+                "power" => {
+                    call(&st, "session/power", json!({ "op": "on" }));
+                }
+                "reset" => {
+                    call(&st, "session/power", json!({ "op": "on" }));
+                    call(&st, "session/reset", json!({ "mode": "warm" }));
+                }
+                _ => unreachable!(),
+            }
+            let before = st.lock().unwrap().session.machine.c64_core.clk;
+            let r = call(&st, "session/tick", json!({ "cycles": 19_656 }));
+            assert!(
+                r.get("error").is_none(),
+                "{door}: the tick must not refuse — it froze the machine: {r}"
+            );
+            assert_eq!(
+                r["running"], json!(true),
+                "{door}: must leave the machine RUNNING"
+            );
+            let after = st.lock().unwrap().session.machine.c64_core.clk;
+            assert!(
+                after > before,
+                "{door}: the machine must actually advance ({before} -> {after})"
+            );
+        }
+    }
+
+    /// A window you ASK for is a window you GET. The byte budget was a fixed 32 MiB —
+    /// 512 slots — which happens to be just over the 500 a ten-second window needs, so
+    /// nothing ever noticed it was the real limit. Ask for sixty seconds and the cap says
+    /// 3000 while the slab says 512, and the slab wins silently.
+    #[test]
+    fn a_longer_window_is_actually_honoured_not_clipped_by_the_budget() {
+        let st = make_state();
+        mon(&st, "window 60").expect("window 60");
+        {
+            let g = st.lock().unwrap();
+            assert_eq!(g.checkpoint_ring.max_entries(), 3000, "60 s at cadence 1");
+            assert!(
+                g.checkpoint_ring.budget_bytes() >= 3000 * 100 * 1024,
+                "the byte budget must follow the cap, or it evicts first: {} bytes",
+                g.checkpoint_ring.budget_bytes()
+            );
+        }
+        // And it must really hold that many, not just claim to.
+        for _ in 0..1200 {
+            call(&st, "session/run", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+        }
+        let held = st.lock().unwrap().checkpoint_ring.list().len();
+        assert_eq!(
+            held, 1200,
+            "1200 pumped frames must all be held under a 3000 cap — got {held}, which \
+             means a bound other than the cap is evicting"
+        );
+    }
+
+    /// Every clock discontinuity must bump the AUDIO EPOCH, or the reSID queue plays
+    /// sound from a time the machine has left — the doubled audio on resume. The list of
+    /// such ops grows (the transport added four), so it is asserted rather than trusted,
+    /// and it is asserted HERE because a client must never have to keep that list.
+    #[test]
+    fn every_clock_discontinuity_bumps_the_audio_epoch() {
+        let st = make_state();
+        call(&st, "session/power", json!({ "op": "on" }));
+        for _ in 0..8 {
+            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+        }
+        let epoch = |st: &SharedState| -> u64 {
+            call(st, "session/state", json!({}))["audioEpoch"].as_u64().unwrap()
+        };
+
+        let mut last = epoch(&st);
+        for (label, run) in [
+            ("pause", 0u8),
+            ("play", 1),
+            ("toggle", 2),
+            ("step back", 3),
+            ("reset", 4),
+            ("power off", 5),
+        ] {
+            match run {
+                0 => { call(&st, "session/pause", json!({})); }
+                1 => { call(&st, "session/play", json!({})); }
+                2 => { call(&st, "transport/toggle", json!({})); }
+                3 => { let _ = mon(&st, "frame -1"); }
+                4 => { call(&st, "session/reset", json!({ "mode": "warm" })); }
+                _ => { call(&st, "session/power", json!({ "op": "off" })); }
+            }
+            let now = epoch(&st);
+            assert!(
+                now != last,
+                "`{label}` makes the clock discontinuous and must bump the audio epoch \
+                 (stayed at {last}) — otherwise the queue plays the old position"
+            );
+            last = now;
+        }
+    }
+
+    /// A rewind must not EJECT the cartridge. `restore_runtime_checkpoint` is, in the
+    /// code's own words, "the sole cart authority (re-attaches from `cartBytes`, or
+    /// `detach_cart`)" — so an anchor without those bytes does not merely fail to restore
+    /// the cart, it removes it. Symptom: rewind on a CRT, then a reset lands in BASIC
+    /// with nothing left to load from.
+    #[test]
+    fn a_rewind_does_not_eject_the_cartridge() {
+        let st = make_state();
+        // A minimal well-formed CRT is more setup than this test needs; what it pins is
+        // the CONTRACT, which is that the anchor carries the cart blobs whenever a cart
+        // is attached. With no cart attached both are legitimately absent.
+        {
+            let mut g = st.lock().unwrap();
+            let cp = capture_recorder_anchor_payload(&mut g.session);
+            let has_cart = g.session.machine.cartridge.is_some();
+            if has_cart {
+                assert!(
+                    !cp["cartBytes"].is_null(),
+                    "an anchor taken with a cart attached MUST carry cartBytes — a null \
+                     there is an eject on restore, not a missing optimisation"
+                );
+            } else {
+                assert!(cp["cartBytes"].is_null(), "no cart, no bytes");
+            }
+            // The GCR overlay is the one slot deliberately omitted (§7b).
+            assert!(
+                cp["driveDiskImage"].is_null(),
+                "the mutable GCR overlay stays out of the anchor by design"
+            );
+        }
+    }
+
+    /// PLAY after a rewind runs the EMULATION from here — it does not replay the anchors
+    /// ahead. The spec shipped the other way first (decision 4), the owner used it, and
+    /// reversed it: pressing play means "carry on from this moment", and a player that
+    /// re-shows the next four seconds before coming alive answers a question nobody
+    /// asked. The future is therefore cut, visibly.
+    #[test]
+    fn play_after_a_rewind_emulates_from_here_and_cuts_the_future() {
+        let st = make_state();
+        fill_anchors(&st, 20);
+        mon(&st, "frame -8").expect("back 8");
+        assert_eq!(st.lock().unwrap().checkpoint_ring.list().len(), 20, "watching costs nothing");
+
+        let r = call(&st, "transport/toggle", json!({}));
+        assert_eq!(r["action"], json!("play"));
+        assert_eq!(r["cut"], json!(8), "the eight anchors ahead must be dropped");
+        assert!(
+            r["message"].as_str().unwrap().contains("emulating from here"),
+            "and it must SAY so, because playing and replaying look identical: {}",
+            r["message"]
+        );
+
+        let g = st.lock().unwrap();
+        assert_eq!(g.checkpoint_ring.list().len(), 12, "20 - 8 dropped");
+        assert!(!g.transport.holds_the_machine(), "the machine is live again");
+        assert!(g.play_intent, "and it is running");
+    }
+
+    /// G2 — parity. Every transport action reachable as a monitor verb is reachable over
+    /// RPC with the same status object back, so the C64RE ribbon renders from data
+    /// instead of parsing the terminal line. This is the gate that keeps the two
+    /// front-ends from drifting apart.
+    #[test]
+    fn every_transport_verb_has_an_rpc_twin() {
+        let st = make_state();
+        fill_anchors(&st, 10);
+
+        let v = call(&st, "transport/status", json!({}));
+        assert_eq!(v["mode"], json!("LIVE"));
+        assert_eq!(v["frameTotal"], json!(10));
+        for field in ["mode", "playing", "speed", "frameIndex", "frameTotal", "atHead", "line", "keys"] {
+            assert!(!v[field].is_null() || field == "playing", "status must carry `{field}`");
+        }
+
+        let f = call(&st, "transport/frame", json!({ "delta": -4 }));
+        assert_eq!(f["frameIndex"], json!(6));
+        assert_eq!(f["mode"], json!("REPLAY"));
+
+        let g = call(&st, "transport/goto", json!({ "frame": 2 }));
+        assert_eq!(g["frameIndex"], json!(2));
+        let gc = call(&st, "transport/goto", json!({ "cycle": 4 * 19_656 }));
+        assert_eq!(gc["frameIndex"], json!(5));
+
+        let p = call(&st, "transport/play", json!({ "direction": "back", "speed": 2 }));
+        assert_eq!(p["playing"], json!("back"));
+        assert_eq!(p["speed"], json!(2));
+
+        let pause = call(&st, "transport/pause", json!({}));
+        assert!(pause["playing"].is_null(), "pause must clear the play state");
+
+        // The monitor verb and the RPC must agree about where we are.
+        let via_verb = mon(&st, "rewind").expect("rewind");
+        let via_rpc = call(&st, "transport/status", json!({}));
+        assert!(
+            via_verb.contains(via_rpc["line"].as_str().unwrap()),
+            "the two surfaces must describe the same position:\n  verb: {via_verb}\n  rpc: {}",
+            via_rpc["line"]
+        );
+    }
+
+    /// G3 — the keys are documented where a user looks. 807 shipped a verb that was
+    /// tab-completable and absent from the help; that is not repeated here.
+    #[test]
+    fn the_transport_is_in_the_help_text() {
+        let st = make_state();
+        let help = mon(&st, "help").expect("help");
+        for needle in ["play back", "pause", "frame -N", "goto", "rewind", "F9", "F10", "F11", "F12"] {
+            assert!(help.contains(needle), "help must mention `{needle}`");
+        }
+    }
+
+    /// The transport must hand the machine BACK at the head, or the stream loop would
+    /// never advance again and the emulator would look frozen with no error anywhere.
+    #[test]
+    fn reaching_the_head_releases_the_machine() {
+        let st = make_state();
+        fill_anchors(&st, 6);
+        mon(&st, "frame -3").expect("back");
+        assert!(st.lock().unwrap().transport.holds_the_machine(), "rewound holds it");
+        mon(&st, "frame +3").expect("fwd to head");
+        assert!(
+            !st.lock().unwrap().transport.holds_the_machine(),
+            "at the head the stream loop must own the machine again"
+        );
+    }
+
+    /// Spec 807 §4.6 — `cadence` sets the capture rate AND the ring's entry cap in one
+    /// call, because setting either alone is the bug the verb exists to prevent.
+    ///
+    /// Before 807 the cadence was read from the env every frame while the cap was fixed
+    /// at daemon start, so they could not agree: cadence 1 against a cap sized for
+    /// cadence 25 turns a 10-second scrub window into 0.4 s, and nothing reports a
+    /// problem — the ring just evicts 24 of every 25 captures.
+    #[test]
+    fn cadence_moves_the_capture_rate_and_the_ring_cap_together() {
+        let st = make_state();
+        // Bare verb reports without changing anything.
+        // Spec 808 changed the DEFAULT to 1 — at 25 the ring held 20 anchors, i.e. 0.4 s
+        // of rewind, which is not a shorter version of the feature but no feature.
+        // Pin the window so this tests the RELATION, not whatever the default happens
+        // to be (it moved from 10 s to 60 s when 10 proved too short to work with).
+        mon(&st, "window 10").expect("window 10");
+        let before = mon(&st, "cadence").expect("cadence");
+        assert!(before.starts_with("cadence: every 1 frame(s)"), "{before}");
+        let cap_before = st.lock().unwrap().checkpoint_ring.max_entries();
+        assert_eq!(cap_before, 500, "10 s at every-frame = 500 entries");
+
+        // Turning it DOWN is the interesting direction now: fewer anchors, smaller cap.
+        let coarse = mon(&st, "cadence 25").expect("cadence 25");
+        assert!(coarse.contains("every 25 frame(s)"), "{coarse}");
+        assert!(coarse.contains("cap 20 entries"), "{coarse}");
+        assert_eq!(st.lock().unwrap().checkpoint_ring.max_entries(), 20);
+
+        // And back to every frame.
+        let out = mon(&st, "cadence 1").expect("cadence 1");
+        assert!(out.contains("every 1 frame(s)"), "{out}");
+        assert!(out.contains("cap 500 entries"), "{out}");
+        {
+            let g = st.lock().unwrap();
+            assert_eq!(g.checkpoint_cadence_frames, 1, "the live cadence must follow");
+            assert_eq!(
+                g.checkpoint_ring.max_entries(),
+                500,
+                "the cap must follow the cadence IN THE SAME CALL — this is the whole point"
+            );
+        }
+
+        // A window change recomputes too, and the estimate is stated, not left to be
+        // discovered when RSS climbs.
+        let out2 = mon(&st, "cadence 1 2").expect("cadence 1 2");
+        assert!(out2.contains("cap 100 entries"), "{out2}");
+        assert!(out2.contains("MiB when full"), "must say what it costs: {out2}");
+
+        // Nonsense is clamped, never accepted.
+        let out3 = mon(&st, "cadence 0").expect("cadence 0");
+        assert!(out3.contains("every 1 frame(s)"), "0 clamps to 1: {out3}");
+    }
+
+    /// Spec 807 §4.6 — lowering the cap evicts immediately rather than waiting for the
+    /// next capture, so `cadence` cannot leave the ring over its own limit.
+    #[test]
+    fn lowering_the_cadence_cap_evicts_at_once() {
+        let st = make_state();
+        mon(&st, "window 10").expect("window 10");
+        mon(&st, "cadence 1").expect("cadence 1");
+        {
+            let mut g = st.lock().unwrap();
+            for i in 0..12u64 {
+                let cp = capture_live_checkpoint(&mut g.session);
+                g.checkpoint_ring.capture(cp, i, i * 19_656).expect("capture");
+            }
+            assert_eq!(g.checkpoint_ring.list().len(), 12);
+        }
+        // 10 s at every-50-frames = 10 entries: two must go, oldest first.
+        mon(&st, "cadence 50").expect("cadence 50");
+        let g = st.lock().unwrap();
+        assert_eq!(g.checkpoint_ring.list().len(), 10, "cap must be enforced at once");
+        assert_eq!(
+            g.checkpoint_ring.list()[0].frame,
+            2,
+            "eviction is oldest-first, so frames 0 and 1 are the ones that go"
+        );
+    }
+
     #[test]
     fn write_verbs_reach_io_not_the_ram_underneath() {
         // `wr d020 00` must black the border. All three write verbs used the core's
@@ -16957,11 +18708,29 @@ mod batch1_tests {
         let cp_id = cap["ref"]["id"].as_str().unwrap().to_string();
         assert!(cp_id.starts_with("cp_"), "id is cp_<frame>_<seq>: {cp_id}");
         assert_eq!(cap["ref"]["pinned"], json!(false));
-        // byteSize = RAM (65536) + 2 framebuffers (2*162240): TRX64's
-        // capture_runtime_checkpoint always captures the present framebuffers
-        // (the c64re EXPLICIT-capture path; the auto-cadence omitFramebuffer path
-        // is not used here). = 390016.
-        assert_eq!(cap["ref"]["byteSize"], json!(390016));
+        // byteSize = the RAW buffers, charged exactly — RAM (65536) + 2 framebuffers
+        // (2*162240) = 390016 — PLUS the residual chip-state tree, which is now a
+        // measured length rather than an omission (Spec 807 §4.2/§4.5).
+        //
+        // The explicit-capture path DOES carry the framebuffers (the per-frame
+        // auto-cadence path omits them since 807 §4.1; this is not that path). What
+        // changed is that all three ride as RAW bytes instead of base64 inside a live
+        // `Value`, and the tree they used to hide in is finally charged. The old figure
+        // counted the buffers and pretended the rest of the entry was free — which is
+        // how a ring of 500 entries reported 32 MiB while holding 102.
+        //
+        // Asserted as a RANGE, not a magic constant: the residual tree's exact encoded
+        // length is not a contract, and pinning it would make every future field
+        // addition look like a regression. What IS the contract: the raw buffers are
+        // charged in full, and the tree is small.
+        const RAW_BUFFERS: u64 = 65536 + 2 * 162240;
+        let byte_size = cap["ref"]["byteSize"].as_u64().unwrap();
+        assert!(
+            byte_size > RAW_BUFFERS && byte_size < RAW_BUFFERS + 32 * 1024,
+            "byteSize {byte_size} must be the raw buffers ({RAW_BUFFERS}) plus a small \
+             residual tree — under means the tree is uncharged again, way over means it \
+             is not compact"
+        );
         assert_eq!(cap["stats"]["count"], json!(1));
         assert_eq!(cap["stats"]["slotBytes"], json!(65536));
 
@@ -18567,7 +20336,7 @@ mod batch1_tests {
         let total = checkpoint_capture_every_frames() * windows + 2;
         for frame in 0..total {
             let mut st = state.lock().unwrap();
-            stream_maybe_autocapture(&mut st, frame, cw, ch, &canvas);
+            stream_maybe_autocapture(&mut st, frame, crate::streaming::CYC_PER_FRAME, cw, ch, &canvas);
         }
         let st = state.lock().unwrap();
         let n = st.checkpoint_ring.list().len();
@@ -18575,12 +20344,21 @@ mod batch1_tests {
             n as u64 >= windows,
             "ring accumulated multiple auto-captures (got {n}, want >= {windows}) WITHOUT any explicit checkpoint/capture"
         );
-        // Each accumulated ref carries the auto-cadence frame (proves these came
-        // from the per-frame hook, not an explicit capture).
-        assert!(
-            st.checkpoint_ring.list().iter().all(|r| r.frame > 0 || r.cycles == 0),
-            "auto-captures stamped with the stream-loop frame"
-        );
+        // Each accumulated ref carries the auto-cadence frame, and consecutive refs are
+        // exactly one cadence apart — which is what proves they came from the per-frame
+        // hook rather than an explicit capture. (The old check was `frame > 0`, which
+        // only held because the default cadence was 25 and so the first capture landed
+        // on frame 24. Spec 808 made the default 1, the first capture lands on frame 0,
+        // and the proxy broke while the behaviour was correct.)
+        let frames: Vec<u64> = st.checkpoint_ring.list().iter().map(|r| r.frame).collect();
+        let cad = checkpoint_capture_every_frames();
+        for w in frames.windows(2) {
+            assert_eq!(
+                w[1] - w[0],
+                cad,
+                "auto-captures must be exactly one cadence apart: {frames:?} at cadence {cad}"
+            );
+        }
         // Spec 769.5a — EVERY auto-anchor (framebuffer-OMITTED) now has a stored
         // thumbnail: the thumb store has one entry per live ring ref (the bug was
         // ~4-of-~70). 96×68, real picture.
@@ -18608,7 +20386,7 @@ mod batch1_tests {
         let total = checkpoint_capture_every_frames() * 5 + 2;
         for frame in 0..total {
             let mut st = state.lock().unwrap();
-            stream_maybe_autocapture(&mut st, frame, cw, ch, &canvas);
+            stream_maybe_autocapture(&mut st, frame, crate::streaming::CYC_PER_FRAME, cw, ch, &canvas);
         }
         let list = call(&state, "checkpoint/list", json!({}));
         let ring_n = list["checkpoints"].as_array().unwrap().len();

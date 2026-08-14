@@ -184,7 +184,11 @@ impl App {
         if let Some(w) = &self.window {
             w.request_redraw();
         }
-        eprintln!("[trx64-cli] emulator window open — play here, debug in the cockpit.");
+        // SILENT. The emulator window shares a terminal with the TUI, and the TUI OWNS
+        // that terminal — it draws boxes at absolute positions. Anything printed to
+        // stderr from here lands inside those boxes and stays until a full repaint: the
+        // "RUNNING[trx64-cli] emulator window clos..." smeared across the MACHINE panel
+        // was exactly this. The cockpit already says the window is open.
     }
 
     fn render(&mut self) {
@@ -259,18 +263,41 @@ impl App {
             return;
         }
 
-        // HOST HOTKEYS — F9..F12. The C64 keyboard has F1..F8 only (F2/F4/F6/F8 being
-        // SHIFT+F1/F3/F5/F7), so these four physical keys cannot collide with anything
-        // the emulated machine can see. F10 freezes/resumes: the one control you want
-        // without taking your hands off the game, and the reason it is a key at all
-        // rather than only a monitor verb.
+        // HOST HOTKEYS — F9..F12 are the rewind transport (Spec 808 §4). The C64
+        // keyboard has F1..F8 only (F2/F4/F6/F8 being SHIFT+F1/F3/F5/F7), so these four
+        // physical keys cannot collide with anything the emulated machine can see.
+        //
+        //   F9  ◀|   one frame back      F11 ⏸/▶  pause / play
+        //   F10 ◀◀   play backwards      F12 |▶   one frame forward
+        //
+        // These are the controls you want without taking your hands off the game, which
+        // is why they are keys at all and not only monitor verbs.
+        //
+        // The SAME mapping lives in `tui.rs` — deliberately, not by accident: the two
+        // surfaces have separate key paths (winit here, crossterm there) and the whole
+        // point of a host hotkey is that it does the same thing wherever the focus
+        // happens to be. Changing one without the other is how F10 kept pausing after
+        // 808 moved pause to F11.
         if let PhysicalKey::Code(code) = event.physical_key {
-            if matches!(code, KeyCode::F10) {
+            if matches!(
+                code,
+                KeyCode::F9 | KeyCode::F10 | KeyCode::F11 | KeyCode::F12
+            ) {
                 if pressed {
-                    let running = self.engine.is_running();
-                    let r = self.engine.exec_line(if running { "/pause" } else { "/run" });
-                    if !r.output.is_empty() {
-                        eprintln!("[F10] {}", r.output.trim());
+                    let f = match code {
+                        KeyCode::F9 => 9u8,
+                        KeyCode::F10 => 10,
+                        KeyCode::F11 => 11,
+                        _ => 12,
+                    };
+                    // SILENT (the TUI owns this terminal). F11 is a decision the engine
+                    // makes from the daemon's transport state; the others are fixed.
+                    if f == 11 {
+                        let _ = self.engine.transport_toggle();
+                    } else if let Some(v) =
+                        trx64_daemon::transport::key_verb(f, self.engine.is_running())
+                    {
+                        let _ = self.engine.transport_key(v);
                     }
                 }
                 return; // never reaches the C64 matrix
@@ -396,7 +423,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.surface = None;
                 self.window = None;
                 el.set_control_flow(ControlFlow::Wait);
-                eprintln!("[trx64-cli] emulator window closed — cockpit still running.");
+                // SILENT — the cockpit's own status already reflects the closed window.
             }
             WindowEvent::RedrawRequested => {
                 self.render();
