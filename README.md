@@ -51,6 +51,10 @@ MSVC included; the release binaries are built that way.
 - **`whowrote <addr>`** — who last wrote here: PC, cycle, old → new.
 - **JAM triage** — on a crash the monitor prints the chain: crash PC → wild jump → the
   stack corruptor.
+- **Observers** — watch an address for exec, read or write, with a condition and an
+  action, and *without halting the machine*. They watch the **address**, not the
+  instruction: a write through `($fb),y`, a read through `($f0,x)` and a `jmp ($0314)` all
+  trigger, because the hooks sit after the addressing mode is resolved.
 - **Traces** — capture CPU / drive / IEC / memory to a binary log, index it, query it as
   swimlanes, memory maps or data-flow taint.
 - **Marks & sandboxes** — name a point, come back to it, branch from it, throw the branch
