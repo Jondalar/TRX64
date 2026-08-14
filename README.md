@@ -130,14 +130,14 @@ trace log. VICE `.vsf` imports.
 
 ---
 
-## Contributing
+## What to expect
 
-My personal emulator, written for my own reverse-engineering work. You will want things
-it does not do.
+This is my (dkl / Jondalar) personal emulator I developed for my own needs when
+reverse engineering C64 games. You might need different features or things -
+and you are invited to contribute code. Use issues and PRs here on GitHub please.
 
-**Open an issue** — bugs, missing hardware behaviour, a title that misbehaves. Say which
-image, what you did, what happened. Pull requests welcome. I cannot offer support, and I
-do not work from feature requests without code or a testable requirement.
+I will not answer feature requests without code / structured requirements and I
+am not able to give support.
 
 ---
 
