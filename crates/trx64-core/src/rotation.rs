@@ -162,6 +162,25 @@ pub struct Rotation {
     pub byte_ready_edge: u8,
     /// drivetypes.ts:514 — byte_ready_level.
     pub byte_ready_level: u8,
+    /// drive.c:889-922 / via2d.c:212-217 — the activity LED's DUTY CYCLE.
+    ///
+    /// The LED's level lives in VIA2 PB bit 3 and is read straight off the
+    /// registers ([`crate::drive::Drive1541::led_on`]) so it cannot go stale.
+    /// What cannot be read off a register is how much of the last period the LED
+    /// was ON, and that is the whole signal: the DOS pulses it, and a fastloader
+    /// pulses it fast. Sampling the level once per poll turns a working drive
+    /// into a coin flip; VICE integrates instead, and so does this.
+    ///
+    /// Accumulated at every PB write (where the previous level is known from
+    /// `poldpb`) and once more at read-out — the same two places VICE does it.
+    pub led_active_ticks: u64,
+    /// The clock at the last LED accounting point (VICE `led_last_change_clk`).
+    pub led_last_change_clk: u64,
+    /// The clock at the last read-out (VICE `led_last_uiupdate_clk`).
+    pub led_last_uiupdate_clk: u64,
+    /// Last computed PWM, reported again when two read-outs land on the same
+    /// cycle (VICE returns early on `led_period == 0` and leaves the UI as it is).
+    pub led_last_pwm: u32,
     /// drivetypes.ts:540 — attach_clk (0 = settled).
     pub attach_clk: u64,
     /// drivetypes.ts:544 — attach_detach_clk.
@@ -261,6 +280,10 @@ impl Rotation {
             gcr_read: 0,
             byte_ready_edge: 0,
             byte_ready_level: 0,
+            led_active_ticks: 0,
+            led_last_change_clk: 0,
+            led_last_uiupdate_clk: 0,
+            led_last_pwm: 0,
             attach_clk: 0,
             attach_detach_clk: 0,
             req_ref_cycles: 0,
@@ -1098,6 +1121,43 @@ impl Rotation {
         self.set_half_track(ht);
         self.attach_clk = if clk == 0 { 1 } else { clk };
         self.rotation_last_clk = clk;
+    }
+
+    /// Read out the activity LED's brightness for the last period, 0..1000.
+    ///
+    /// PORT OF: `drive_led_update` (drive.c:888-922). Close the open interval
+    /// (the LED was `on_now` since `led_last_change_clk`), divide the accumulated
+    /// on-time by the period since the last read-out, and bend the result with
+    /// the square-root curve VICE applies because the eye perceives brightness
+    /// far earlier in the duty cycle than linearly.
+    ///
+    /// `&mut self` because reading CONSUMES the accumulator — the answer is
+    /// "how busy since you last asked", which is the only question with a stable
+    /// meaning when several clients poll at different rates.
+    pub fn led_pwm(&mut self, clk: u64, on_now: bool) -> u32 {
+        if on_now {
+            self.led_active_ticks += clk.wrapping_sub(self.led_last_change_clk);
+        }
+        self.led_last_change_clk = clk;
+
+        let period = clk.wrapping_sub(self.led_last_uiupdate_clk);
+        self.led_last_uiupdate_clk = clk;
+        if period == 0 {
+            // drive.c:898 — no time passed, so there is nothing to average over.
+            return self.led_last_pwm;
+        }
+
+        // drive.c:902-909 — clamp, because a reset or an attach can leave more
+        // on-time on the books than the period it is measured against.
+        let raw = if self.led_active_ticks > period {
+            1000u64
+        } else {
+            self.led_active_ticks * 1000 / period
+        };
+        self.led_active_ticks = 0;
+        let pwm = (1000.0 * (raw as f64 / 1000.0).sqrt()) as u32;
+        self.led_last_pwm = pwm;
+        pwm
     }
 
     /// Detach the disk. VICE's `drive_image_detach` flushes any dirty track

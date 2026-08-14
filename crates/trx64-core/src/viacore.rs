@@ -2100,9 +2100,16 @@ impl<'a> ViaBackend for Via2dBackend<'a> {
         let clk = ctx.clk;
         self.drive.rotate_disk(clk);
 
-        // via2d.c:212-217 — LED status (PB.3) — headless: rotation has no led
-        // fields; the LED is observation-only and has no behavioural impact on
-        // the LOAD path. Omitted (matches the distilled port).
+        // via2d.c:212-217 — LED status (PB.3). No behavioural impact on the LOAD
+        // path, which is why it was omitted for a long time — but it is the one
+        // at-a-glance answer to "is the drive working", so the DUTY CYCLE is
+        // accounted here exactly where VICE accounts it. The previous level is
+        // `poldpb & 0x08`; VICE keeps it in `drive->led_status`, which we do not
+        // need to mirror because the caller hands us the old port byte.
+        if poldpb & 0x08 != 0 {
+            self.drive.led_active_ticks += clk.wrapping_sub(self.drive.led_last_change_clk);
+        }
+        self.drive.led_last_change_clk = clk;
 
         // via2d.c:219-249 — stepper formula from current_half_track.
         let track_number = self.drive.current_half_track.wrapping_sub(2);
