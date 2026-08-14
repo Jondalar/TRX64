@@ -5482,6 +5482,33 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             Ok("RUN \u{2014} free-running.".to_string())
         }
 
+        // BUG-041 — "what IS this file?", answered from the content.
+        //
+        // Named `identify` rather than `mount` on purpose: the monitor runs with the
+        // state locked, and `media/open` acts by re-dispatching to the handler that owns
+        // each type, which needs it unlocked. A verb that half-mounted would be worse
+        // than one that honestly answers a different question. Acting is `media/open`
+        // over RPC; the monitor tells you what you have.
+        "identify" | "whatis" => {
+            let Some(arg) = toks.get(1) else {
+                return Err("identify: usage: identify <path>".into());
+            };
+            let path = resolve_fs_path_with_state(st, arg);
+            let bytes = std::fs::read(&path).map_err(|e| format!("identify: {path}: {e}"))?;
+            let kind = detect_media_kind(&bytes, &path).map_err(|e| format!("identify: {e}"))?;
+            let note = match kind {
+                MediaKind::Prg { autostart: true } => "  BASIC line at $0801 \u{2192} opening it types RUN",
+                MediaKind::Prg { autostart: false } => "  no BASIC line at $0801 \u{2192} opening it loads only",
+                MediaKind::Snapshot => "  a whole machine \u{2014} opening it REPLACES the session",
+                _ => "",
+            };
+            Ok(format!(
+                "identify: {path}\n  {} ({} bytes){note}",
+                kind.as_str(),
+                bytes.len()
+            ))
+        }
+
         "warp" => {
             match toks.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
                 Some("on") => {
@@ -6954,7 +6981,8 @@ fn monitor_help_text() -> String {
         "    run                       resume the machine (from a rewound point: cuts the anchors ahead)",
         "    pause                     stop the machine AND the transport; prints the ringbuffer range",
         "    warp on|off               8\u{00d7} pacing / PAL real-time",
-        "    reset [warm|cold] · power on|off      (mount/eject: see BUG-041, folded in there)",
+        "    reset [warm|cold] · power on|off",
+        "    identify <path>           what a file IS, from its content: c64re|crt|g64|d64|prg (+ whether a PRG would autostart)",
         "  REWIND TRANSPORT (Spec 808 — plays the MACHINE backwards, not cached pictures)",
         "    play back|fwd [speed]     play through the anchors; every step is a real restore, so registers/memory/drive are correct at every frame. `play fwd` at the head just runs.",
         "    pause                     stop where you are — the machine IS there, no second step needed",
@@ -8155,6 +8183,34 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
 }
 
 // ── RPC method dispatch ───────────────────────────────────────────────────────
+
+
+/// BUG-041 — `media/open` dispatches to the handler that already owns each type, rather
+/// than growing a second copy of it. Re-dispatching keeps the dirty-media guard, the
+/// power-cycle policy and the media events in ONE place per type, and tags the reply with
+/// what the content turned out to be.
+fn delegate_media_open(
+    state: &SharedState,
+    req: &Request,
+    method: &str,
+    path: &str,
+    kind: &str,
+    message: &str,
+) -> Response {
+    let inner = Request {
+        jsonrpc: req.jsonrpc.clone(),
+        id: req.id.clone(),
+        method: method.to_string(),
+        params: json!({ "path": path }),
+    };
+    let mut r = dispatch(inner, state);
+    if let Some(v) = r.result.as_mut() {
+        v["kind"] = json!(kind);
+        v["path"] = json!(path);
+        v["message"] = json!(message);
+    }
+    r
+}
 
 pub fn dispatch(req: Request, state: &SharedState) -> Response {
     let id = req.id.clone();
@@ -10698,6 +10754,69 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             }))
         }
 
+        // BUG-041 — ONE door for "put this in the machine", whatever it is.
+        //
+        // Session start used to REQUIRE a disk path that a shared attach never acted on,
+        // and had no cart, PRG or snapshot equivalent — so starting from a cartridge meant
+        // naming a `.g64` nobody uses to satisfy a schema, then mounting the CRT.
+        //
+        // The type is decided by CONTENT, and the per-type behaviour is decided HERE, in
+        // the daemon: a client passes a path and renders the reply. Putting it in the MCP
+        // tool would mean the next client (the C64RE UI, a script, the TUI) reimplements
+        // it with a different edge case at $0801.
+        "media/open" => {
+            let Some(path_in) = req.params.get("path").and_then(|v| v.as_str()) else {
+                return Response::err(id, -32602, "media/open: missing path");
+            };
+            let path_str = { let st = state.lock().unwrap(); resolve_fs_path_with_state(&st, path_in) };
+            let bytes = match std::fs::read(&path_str) {
+                Ok(b) => b,
+                Err(e) => return Response::err(id, -32602, format!("media/open: {path_str}: {e}")),
+            };
+            let kind = match detect_media_kind(&bytes, &path_str) {
+                Ok(k) => k,
+                Err(e) => return Response::err(id, -32602, format!("media/open: {e}")),
+            };
+            match kind {
+                // A snapshot is not media — it REPLACES the machine.
+                MediaKind::Snapshot => delegate_media_open(
+                    state, &req, "snapshot/undump", &path_str,
+                    "c64re",
+                    &format!("UNDUMP {path_str} \u{2014} the machine is now this snapshot."),
+                ),
+                MediaKind::Cartridge | MediaKind::G64 | MediaKind::D64 => delegate_media_open(
+                    state, &req, "media/mount", &path_str,
+                    kind.as_str(),
+                    &format!("MOUNT {path_str} ({})", kind.as_str()),
+                ),
+                MediaKind::Prg { autostart } => {
+                    let mut st = state.lock().unwrap();
+                    let load = u16::from_le_bytes([bytes[0], bytes[1]]);
+                    st.session.machine.poke(load, &bytes[2..]);
+                    st.session.injected = true;
+                    let msg = if autostart {
+                        // $0801 + a valid BASIC line: type RUN. This covers SYS-stub
+                        // releases too — the stub IS how they are meant to start.
+                        st.type_buffer.extend_from_slice(b"RUN\r");
+                        st.play_intent = true;
+                        format!(
+                            "LOAD {path_str} \u{2192} ${load:04X} ({} bytes), BASIC at $0801 \u{2014} RUN",
+                            bytes.len() - 2
+                        )
+                    } else {
+                        format!(
+                            "LOAD {path_str} \u{2192} ${load:04X} ({} bytes) \u{2014} no BASIC line at $0801, not started",
+                            bytes.len() - 2
+                        )
+                    };
+                    Response::ok(id, json!({
+                        "kind": "prg", "path": path_str, "loadAddress": load,
+                        "autostart": autostart, "message": msg,
+                    }))
+                }
+            }
+        }
+
         "media/mount" => {
             let path_str = match req.params.get("path").and_then(|v| v.as_str()) {
                 Some(p) => p.to_string(),
@@ -10716,11 +10835,20 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             // Inspector CART dropdown mounts a .crt through media/mount (slot 0). The old
             // handler ignored the extension and ALWAYS attached as a d64 disk on drive8,
             // so a CRT could never be inserted. .c64re is a snapshot, not media.
-            let lower = path_str.to_lowercase();
-            if lower.ends_with(".c64re") {
-                return Response::err(id, -32602, "media/mount: .c64re is a runtime snapshot, not media — use snapshot/undump.");
+            // BUG-041 — ask the FILE, not the filename. `ends_with(".crt")` is a question
+            // about a name: a renamed cart, a `.bin` that is really a CRT, or a `.d64`
+            // written by a tool that chose another suffix all answered wrong.
+            let kind = match detect_media_kind(&bytes, &path_str) {
+                Ok(k) => k,
+                Err(e) => return Response::err(id, -32602, format!("media/mount: {e}")),
+            };
+            if kind == MediaKind::Snapshot {
+                return Response::err(id, -32602, "media/mount: this is a runtime snapshot (.c64re), not media — use snapshot/undump.");
             }
-            if lower.ends_with(".crt") {
+            if matches!(kind, MediaKind::Prg { .. }) {
+                return Response::err(id, -32602, "media/mount: this is a PRG, not media — use `load`, or start a session with media_path.");
+            }
+            if kind == MediaKind::Cartridge {
                 // Spec 709.12 — CRT insert = attach cart → power-cycle → resume (so the
                 // cart executes). Same primitives as media/ingress kind:crt.
                 let crt_name = path_str.split('/').last().unwrap_or("cartridge.crt").to_string();
@@ -10782,9 +10910,8 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             }
 
             let disk_name = path_str.split('/').last().unwrap_or("disk").to_string();
-            let format_str = if disk_name.to_lowercase().ends_with(".g64")
-                || (bytes.len() >= 8 && &bytes[..8] == b"GCR-1541")
-            {
+            // BUG-041 — the same content answer decides the format.
+            let format_str = if kind == MediaKind::G64 {
                 "g64"
             } else {
                 "d64"
@@ -13680,6 +13807,109 @@ fn non_persistable_dirty_media(st: &State) -> Option<String> {
         );
     }
     None
+}
+
+
+// ── BUG-041 — what IS this file? ───────────────────────────────────────────────
+//
+// Detection is by CONTENT, with the extension only as a tiebreak for what content
+// cannot decide. The old path asked `lower.ends_with(".crt")`, which is a question
+// about a filename, not about a file — and it had no answer at all for `.prg` or for
+// starting a session from a snapshot.
+//
+// Order matters and is not arbitrary. Magic first, because it is proof. Then size,
+// because a `.d64` has no magic but has exactly four legal lengths. `.prg` is LAST and
+// is never a positive match — it is "none of the others", since a PRG is two bytes of
+// load address followed by data and can look like anything.
+
+/// What a media file turned out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MediaKind {
+    /// A whole machine (Spec 707). Not media at all — it replaces the session.
+    Snapshot,
+    Cartridge,
+    G64,
+    D64,
+    /// A program. `autostart` is true when it loads at $0801 behind a valid BASIC line.
+    Prg { autostart: bool },
+}
+
+impl MediaKind {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            MediaKind::Snapshot => "c64re",
+            MediaKind::Cartridge => "crt",
+            MediaKind::G64 => "g64",
+            MediaKind::D64 => "d64",
+            MediaKind::Prg { .. } => "prg",
+        }
+    }
+}
+
+/// The four legal `.d64` lengths (35/35+errors/40/40+errors tracks).
+const D64_SIZES: [usize; 4] = [174_848, 175_531, 196_608, 197_376];
+
+/// BUG-041 — does a PRG want to be RUN?
+///
+/// The owner's rule: load address exactly `$0801` **and** a valid BASIC line at the
+/// front → type `RUN` + RETURN. Otherwise load and leave it alone.
+///
+/// This is better than it first looks. Most machine-code PRGs also load at `$0801`
+/// behind a stub (`10 SYS 2061`), and that stub IS how they are meant to be started —
+/// so one rule covers BASIC programs and SYS-stub releases without a special case. A
+/// PRG at `$C000` has no defined entry point, and loading it and stopping is the honest
+/// answer rather than a guess.
+///
+/// "Valid BASIC line" is CHECKED, never assumed: a forward link pointer that lands
+/// inside the loaded data, a line number, and a `$00` terminator. Anything failing means
+/// load-only — a PRG at `$0801` with garbage at the front is broken or exotic, and `RUN`
+/// on it is a bet, not a behaviour.
+pub(crate) fn prg_wants_autostart(bytes: &[u8]) -> bool {
+    if bytes.len() < 8 {
+        return false;
+    }
+    let load = u16::from_le_bytes([bytes[0], bytes[1]]);
+    if load != 0x0801 {
+        return false;
+    }
+    let link = u16::from_le_bytes([bytes[2], bytes[3]]);
+    // Forward, and inside what we loaded.
+    let end = 0x0801u32 + (bytes.len() as u32 - 2);
+    if (link as u32) <= 0x0801 || (link as u32) >= end {
+        return false;
+    }
+    // The line must terminate. Walk from the line number to the link target.
+    let line_end = (link as usize).saturating_sub(0x0801) + 2;
+    if line_end == 0 || line_end > bytes.len() {
+        return false;
+    }
+    bytes[line_end - 1] == 0x00
+}
+
+/// Identify a media file by content. `name` is consulted ONLY where content cannot
+/// decide, and never to override a magic hit.
+pub(crate) fn detect_media_kind(bytes: &[u8], name: &str) -> Result<MediaKind, String> {
+    if bytes.len() < 2 {
+        return Err(format!("{name}: too short to identify ({} bytes)", bytes.len()));
+    }
+    // 1. Magic — proof.
+    if bytes.len() >= 8 && &bytes[..8] == b"GCR-1541" {
+        return Ok(MediaKind::G64);
+    }
+    if bytes.len() >= 16 && &bytes[..16] == b"C64 CARTRIDGE   " {
+        return Ok(MediaKind::Cartridge);
+    }
+    if bytes.len() >= 8 && &bytes[..8] == trx64_core::native_snapshot::NATIVE_SNAPSHOT_MAGIC {
+        return Ok(MediaKind::Snapshot);
+    }
+    // 2. Size — a .d64 has no magic but exactly four legal lengths.
+    if D64_SIZES.contains(&bytes.len()) {
+        return Ok(MediaKind::D64);
+    }
+    // 3. Last resort. A PRG is never a positive match; it is what is left.
+    Ok(MediaKind::Prg {
+        autostart: prg_wants_autostart(bytes),
+    })
 }
 
 /// Resolve a user file path the way the monitor FILE shell does (resolveFsPath):
@@ -18206,6 +18436,60 @@ mod batch1_tests {
         for needle in ["MACHINE", "run ", "pause ", "warp on|off"] {
             assert!(help.contains(needle), "help must mention `{needle}`");
         }
+    }
+
+    /// BUG-041 — a file is identified by its CONTENT, and a PRG autostarts only when the
+    /// C64 itself would consider it startable.
+    #[test]
+    fn media_is_identified_by_content_not_by_filename() {
+        // Magic wins, whatever the name says.
+        let mut g64 = b"GCR-1541".to_vec();
+        g64.extend_from_slice(&[0u8; 64]);
+        assert_eq!(detect_media_kind(&g64, "totally-a-cart.crt").unwrap(), MediaKind::G64);
+
+        let mut crt = b"C64 CARTRIDGE   ".to_vec();
+        crt.extend_from_slice(&[0u8; 64]);
+        assert_eq!(detect_media_kind(&crt, "disk.d64").unwrap(), MediaKind::Cartridge);
+
+        let mut snap = trx64_core::native_snapshot::NATIVE_SNAPSHOT_MAGIC.to_vec();
+        snap.extend_from_slice(&[0u8; 64]);
+        assert_eq!(detect_media_kind(&snap, "x.prg").unwrap(), MediaKind::Snapshot);
+
+        // A .d64 has no magic — it has exactly four legal lengths.
+        let d64 = vec![0u8; 174_848];
+        assert_eq!(detect_media_kind(&d64, "anything.bin").unwrap(), MediaKind::D64);
+
+        // And a PRG is never a positive match: it is what is left.
+        let prg = vec![0x00, 0xC0, 0xA9, 0x00, 0x60];
+        assert!(matches!(detect_media_kind(&prg, "x.d64").unwrap(), MediaKind::Prg { .. }));
+    }
+
+    /// The autostart rule, checked rather than assumed. `$0801` plus a valid BASIC line
+    /// means RUN — which covers SYS-stub releases, since the stub IS how they start.
+    #[test]
+    fn a_prg_autostarts_only_when_the_c64_would_start_it() {
+        // `10 SYS 2061` at $0801: link → $080C, line 10, tokens, $00 terminator.
+        let stub: Vec<u8> = vec![
+            0x01, 0x08, // load $0801
+            0x0C, 0x08, // link -> $080C
+            0x0A, 0x00, // line 10
+            0x9E, 0x32, 0x30, 0x36, 0x31, // SYS 2061
+            0x00, // end of line
+            0x00, 0x00, // end of program
+        ];
+        assert!(prg_wants_autostart(&stub), "a SYS stub is how these are meant to start");
+
+        // Machine code at $C000 has no defined entry — load it and stop.
+        let mc: Vec<u8> = vec![0x00, 0xC0, 0xA9, 0x00, 0x8D, 0x20, 0xD0, 0x60];
+        assert!(!prg_wants_autostart(&mc), "$C000 has no entry point to guess at");
+
+        // $0801 with garbage: broken or exotic. RUN on it is a bet, not a behaviour.
+        let garbage: Vec<u8> = vec![0x01, 0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        assert!(!prg_wants_autostart(&garbage), "a backward/out-of-range link is not a BASIC line");
+
+        // A link pointing before the load address is not forward.
+        let backward: Vec<u8> = vec![0x01, 0x08, 0x00, 0x08, 0x0A, 0x00, 0x00, 0x00];
+        assert!(!prg_wants_autostart(&backward));
     }
 
     /// G2 — parity. Every transport action reachable as a monitor verb is reachable over
