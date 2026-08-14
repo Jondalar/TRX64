@@ -198,26 +198,62 @@ impl KeyboardMatrix {
     /// is byte-identical to the events-only path.
     pub fn read_rows_for_pa(&self, now: u64, pa_value: u8) -> u8 {
         let mut row_mask: u8 = 0xff;
-        // Queued events (type_text / timed-window).
+        self.for_each_active_key(now, |col, row| {
+            if pa_value & (1 << col) == 0 {
+                row_mask &= !(1 << row);
+            }
+        });
+        row_mask
+    }
+
+    /// The OTHER direction: active column mask (active-low) for the rows driven
+    /// low by `pb_value`. The mirror of [`read_rows_for_pa`], because the matrix
+    /// is a grid of switches and a switch does not care which side is driven.
+    ///
+    /// PORT OF: the first loop of VICE `read_ciapa` (c64cia1.c:298-320), which
+    /// walks the port-B lines being driven and pulls down the port-A lines each
+    /// pressed key connects them to (`rev_keyarr`).
+    ///
+    /// This existed nowhere, and the `$DC00` read said so in its own comment:
+    /// *"the keyboard back-scan (= 0xff in the dominant case — KERNAL never
+    /// drives PB columns)"*. True of the KERNAL, false of games: the title's IRQ
+    /// scanner drives PB, reads PA, and bails out the moment it reads `$ff` — so
+    /// no key it ever pressed reached the game.
+    ///
+    /// Ghost keys are NOT modelled, here or in [`read_rows_for_pa`]. VICE
+    /// eliminates them in this direction (the `tmp & PRB & DDRB` branch) and
+    /// force-lows them in the other (`ciapb_forcelow`); both directions here are
+    /// the plain per-key OR. Adding it to one side only would make the two
+    /// disagree, which is worse than a known, symmetric gap.
+    pub fn read_columns_for_pb(&self, now: u64, pb_value: u8) -> u8 {
+        let mut col_mask: u8 = 0xff;
+        self.for_each_active_key(now, |col, row| {
+            if pb_value & (1 << row) == 0 {
+                col_mask &= !(1 << col);
+            }
+        });
+        col_mask
+    }
+
+    /// Every key held down at `now`, as its `(column, row)` matrix position —
+    /// the timed events (`type_text`, cycle-window gated) and the Spec 310 held
+    /// set together. Both scan directions read the same switches, so they walk
+    /// the same iteration.
+    fn for_each_active_key(&self, now: u64, mut f: impl FnMut(u8, u8)) {
         for ev in &self.events {
             if now < ev.start_cycle || now >= ev.end_cycle {
                 continue;
             }
             if let Some((col, row)) = key_matrix(&ev.key) {
-                if pa_value & (1 << col) == 0 {
-                    row_mask &= !(1 << row);
-                }
+                f(col, row);
             }
         }
         // Spec 310 — held keys (browser passthrough), no cycle gating.
         for key in &self.live_pressed {
             if let Some((col, row)) = key_matrix(key) {
-                if pa_value & (1 << col) == 0 {
-                    row_mask &= !(1 << row);
-                }
+                f(col, row);
             }
         }
-        row_mask
     }
 }
 
@@ -273,6 +309,48 @@ pub fn joystick_active_low_mask(s: &JoystickState) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The matrix is a grid of switches, and a switch does not care which side
+    /// is driven. Reading it BACKWARDS — drive the rows, read the columns — must
+    /// see the same key.
+    ///
+    /// A real title's IRQ scanner does exactly this, and it is why no key ever
+    /// reached the game: the back-scan was not modelled and returned $ff.
+    #[test]
+    fn the_matrix_reads_the_same_key_from_either_side() {
+        let mut kb = KeyboardMatrix::new();
+        kb.key_down("SPACE"); // col 7, row 4
+
+        // Forward: drive column 7, read the rows → row 4 pulled low.
+        let pa_col7 = 0xff & !(1 << 7);
+        assert_eq!(kb.read_rows_for_pa(0, pa_col7), 0xff & !(1 << 4));
+
+        // Backward: drive row 4, read the columns → column 7 pulled low.
+        let pb_row4 = 0xff & !(1 << 4);
+        assert_eq!(
+            kb.read_columns_for_pb(0, pb_row4),
+            0xff & !(1 << 7),
+            "SPACE must be visible when the ROWS are driven"
+        );
+
+        // A row the key is not on pulls nothing.
+        assert_eq!(kb.read_columns_for_pb(0, 0xff & !(1 << 3)), 0xff);
+        // Nothing driven at all pulls nothing.
+        assert_eq!(kb.read_columns_for_pb(0, 0xff), 0xff);
+        // Every row driven (PRB = $00) — the title's actual first half-scan.
+        assert_eq!(kb.read_columns_for_pb(0, 0x00), 0xff & !(1 << 7));
+    }
+
+    /// Timed events (`type_text`) feed the back-scan too, on the same cycle
+    /// window — one iteration over the switches serves both directions.
+    #[test]
+    fn the_back_scan_sees_typed_keys_within_their_window() {
+        let mut kb = KeyboardMatrix::new();
+        kb.type_text(0, "L", 100, 50); // col 5, row 2
+        let pb_row2 = 0xff & !(1 << 2);
+        assert_eq!(kb.read_columns_for_pb(0, pb_row2), 0xff & !(1 << 5));
+        assert_eq!(kb.read_columns_for_pb(150, pb_row2), 0xff, "expired");
+    }
 
     #[test]
     fn type_load_directory_resolves_quote_with_shift() {
