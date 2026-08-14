@@ -1,217 +1,143 @@
 # TRX64
 
-**A headless, API-first, cycle-accurate Commodore 64 + 1541 runtime — a faithful,
-enhanced port of VICE built to be driven by humans, tools, and LLM agents alike.**
-Talk to it over WebSocket JSON-RPC or embed it in-process, then do what a normal
-emulator can't: snapshot and rewind the machine, step *backwards* through code, and
-ask a live trace who corrupted the stack — all cycle by cycle.
+A headless, cycle-accurate Commodore 64 + 1541 runtime. Snapshot the machine, rewind it,
+step backwards, and ask a live trace who wrote an address — over JSON-RPC, in a terminal,
+or embedded.
 
-It runs the same scene software a real C64 does — multi-stage cracks, custom
-fastloaders, EasyFlash cartridges — and its fidelity is gated against VICE on every
-change.
+It runs real scene software: multi-stage cracks, custom fastloaders, EasyFlash carts.
 
----
-
-## Why TRX64
-
-A normal emulator runs code. TRX64 lets you *interrogate* it:
-
-- **Time-travel debugging** — a checkpoint ring snapshots the machine continuously;
-  scrub back to the exact cycle a fastloader flips a bank, then run on.
-- **Reverse stepping** — `rstep` undoes the last instructions and restores CPU + RAM
-  + I/O **byte-exact**. An always-on ring keeps the last ~10 s of instructions and
-  writes, so it works with no pre-arming.
-- **`whowrote <addr>`** — ask the trace who last wrote an address (PC + cycle +
-  old→new value). The fastest way to find what corrupted the stack.
-- **JAM auto-triage** — on a crash, the monitor prints the causal chain:
-  crash PC → the wild jump → the stack corruptor.
-- **A forensic trace firehose** — capture CPU / drive / IEC / memory to a binary
-  log, index it, and query it as swimlanes, memory maps, or data-flow taint.
-- **Faithful cartridges, including Save-to-Flash** — EasyFlash and the commercial
-  CRT families (Ocean, Magic Desk, GMOD2/3, MegaByter …) run on source-faithful
-  mapper cores. Writable flash and EEPROM genuinely persist: an EasyFlash
-  *Save to Flash* survives a reset and round-trips through a snapshot.
-- **Shared human + LLM sessions** — one machine per process, co-driven. A person and
-  an agent inspect, step, and steer the *same* live C64 at the same time.
-- **API-first** — every capability above is one JSON-RPC method. No GUI assumptions,
-  no hidden state: scriptable by a tool, an LLM, or your own frontend.
-
-## What to expect
-
-This is my (dkl / Jondalar) personal emulator I developed for my own needs when
-reverse engineering C64 games. You might need different features or things - 
-and you are invited to contribute code. Use PR mechanisms here on GitHub please.
-
-I will not answer feature requests without code / structured requirements and I 
-am not able to give support.
+**Sibling project:** [C64RE](https://github.com/Jondalar/C64ReverseEngineeringMCP) is the
+reverse-engineering workbench; TRX64 is the runtime it drives. Capability lives here,
+meaning and memory live there. Either works without the other.
 
 ---
 
-## Quick start
+## Install
 
-```bash
-cargo build --release
-./target/release/trx64-daemon --project <dir> --port 4312 [--stream]
+Binaries for macOS, Linux and Windows (x86_64 + arm64):
+**[Releases](https://github.com/Jondalar/TRX64/releases)** — each archive holds `trx64cli`
+and `trx64-daemon`. C64 ROMs are not included; point at your own with `--rom-dir`.
+
+```sh
+brew install jondalar/tap/trx64
 ```
 
-- `--project <dir>` — working directory for media, snapshots, and traces.
-- `--port <p>` — the WebSocket port (C64RE's default is 4312).
-- `--stream` — run the continuous per-frame driver for live free-run (video frames,
-  breakpoints, JAM auto-break, recorder, observers). Omit it for a pure
-  request/response core.
+From source: `cargo build --release`. On Windows use the **GNU** toolchain — the vendored
+reSID is GCC/Clang C++ and does not build under MSVC:
 
-**Windows: use the GNU toolchain, not MSVC.** The vendored reSID is GCC/Clang C++ and
-does not compile under MSVC (`cl` fails building `resid`; the `-std:c++11 D9002` warning
-is just the symptom). Build with MinGW-w64:
-
+```sh
+rustup default stable-x86_64-pc-windows-gnu   # + MinGW-w64 g++ on PATH
 ```
-rustup default stable-x86_64-pc-windows-gnu   # (or: cargo build --target x86_64-pc-windows-gnu)
-# + a MinGW-w64 g++ on PATH (e.g. MSYS2: pacman -S mingw-w64-x86_64-toolchain)
-cargo build --release
-```
-
-macOS and Linux build natively (clang / gcc) with no extra setup. Cross-building the
-Windows + Linux binaries from a Mac is scripted in `scripts/build-cli-dist.sh`.
 
 ---
 
-## Three ways to use it
+## Capabilities
 
-Leitregel: Capability → TRX64, Meaning/Memory → C64RE.
-
-TRX64 is one runtime with three front doors:
-
-- **As a daemon** — the `trx64-daemon` binary serves WebSocket JSON-RPC. This is
-  C64RE's **default** runtime backend: C64RE auto-discovers a running
-  `trx64-daemon` (and spawns one if none is found), and any other client or LLM
-  connects the same way. (The legacy `TRX64=1 ./ui.sh restart` opt-in is no longer
-  required.)
-- **In-process (typed)** — the `trx64-ffi` crate exposes a typed library (uniffi →
-  Swift bindings) so a native app embeds the runtime directly, no subprocess. See
-  [`crates/trx64-ffi/API.md`](crates/trx64-ffi/API.md). A native macOS frontend is in
-  progress on top of it.
-- **`trx64-cli`** — a cross-platform terminal **cockpit + emulator window** that embeds
-  the runtime in-process (Rust → Rust, no daemon/WS/FFI). Play in a native window, debug
-  in a TUI, drive it with `/`-commands + the full monitor. See
-  [`crates/trx64-cli/README.md`](crates/trx64-cli/README.md).
+- **Rewind** — play the machine backwards. Every step is a real restore, so registers,
+  RAM and the drive are correct at each frame, and you can run on from where you stop.
+- **Reverse stepping** — `rstep` undoes the last instructions byte-exact. An always-on
+  ring keeps the recent past; nothing to arm in advance.
+- **`whowrote <addr>`** — who last wrote here: PC, cycle, old → new.
+- **JAM triage** — on a crash the monitor prints the chain: crash PC → wild jump → the
+  stack corruptor.
+- **Traces** — capture CPU / drive / IEC / memory to a binary log, index it, query it as
+  swimlanes, memory maps or data-flow taint.
+- **Marks & sandboxes** — name a point, come back to it, branch from it, throw the branch
+  away.
+- **Cartridges incl. Save-to-Flash** — EasyFlash, Ocean, Magic Desk, GMOD2/3, MegaByter.
+  Flash and EEPROM writes persist across reset and through a snapshot.
+- **Shared sessions** — one machine, several clients. A human and an agent drive the same
+  live C64 at once.
+- **Disks** — `.d64` / `.g64`, 35 to 42 tracks, with drive-side GCR writes persisted back
+  to the host file.
 
 ---
 
-## The API
+## Standalone: the CLI cockpit
 
-Everything is **JSON-RPC 2.0**. One request:
+`trx64cli` is a complete emulator on its own — a terminal cockpit plus a native window, no
+daemon, no server.
+
+```sh
+trx64cli                      # cockpit
+trx64cli --window             # cockpit + emulator window
+trx64cli mon "d c000"         # one-shot, prints and exits
+trx64cli disasm game.prg      # static disassembly, no machine, no ROMs
+```
+
+Three namespaces on one command line: `/` drives the machine, `!` the filesystem, and a
+bare line goes to the monitor. Tab completes all three.
+
+```
+/power on · /reset · /run · /pause · /warp on · /mount game.d64 · /window
+F9 ◀| one frame back   F10 ◀◀ play back   F11 ⏸/▶   F12 |▶ one frame forward
+```
+
+Details: [`crates/trx64-cli/README.md`](crates/trx64-cli/README.md).
+
+---
+
+## Monitor
+
+A VICE superset, ~128 verbs, on every front end. Full reference: **[MONITOR.md](MONITOR.md)**;
+`help` prints the live list.
+
+| | |
+|---|---|
+| **Run** | `g [addr]` go · `z`/`n` step into/over · `until <addr>` · `ret` |
+| **Memory** | `m`/`d`/`a` dump / disassemble / assemble · `>` write · `f` fill · `t` transfer · `h` hunt |
+| **Bank lens** | `m io d000`, `m ram e000` — see what the CPU sees, or the RAM under it |
+| **Breakpoints** | `bk` exec · `wa`/`ws` watch read/write · `obs` non-halting observers |
+| **CPU** | `r` registers · `chis` history · `bt` backtrace · `flow` IRQ/NMI focus |
+| **Reverse** | `rstep` step back · `whowrote <addr>` · `chis` · `crash` triage |
+| **Time** | `mark <name>` · `goto <name>` · `frame ±N` · `play back\|fwd` · `cadence` · `window <s>` |
+| **State** | `dump`/`undump` `.c64re` · `ringdump`/`ringload` · `trace on\|off` |
+| **Analysis** | `map` memory map · `taint` · `swimlane` · `diff <a> <b>` |
+| **Drive** | `device drive8` then `r`/`m`/`d` — the 1541's own 6502 |
+
+---
+
+## Daemon & API
+
+```sh
+trx64-daemon --project <dir> --port 4312 [--stream]
+```
+
+JSON-RPC 2.0 over WebSocket. One machine per process, shared by every client.
 
 ```json
 { "jsonrpc": "2.0", "id": 1, "method": "session/create", "params": { "pal": true } }
 ```
 
-There is **one machine per process**, shared by every connected client. A typical
-flow: `session/create` → `debug/run` → inspect via `monitor/exec` / `trace/*` /
-`vic/inspect` → `checkpoint/*` to scrub → `snapshot/dump` to persist.
+A typical flow: `session/create` → `debug/run` → `monitor/exec` / `trace/*` / `vic/inspect`
+→ `checkpoint/*` to scrub → `snapshot/dump` to persist. `--stream` adds the per-frame
+driver (video, breakpoints, JAM auto-break, recorder); omit it for pure request/response.
 
-The surface, by area:
+For embedding, `trx64-ffi` exposes a typed uniffi library (Swift bindings) —
+[`crates/trx64-ffi/API.md`](crates/trx64-ffi/API.md).
 
-- **Session & run** — create/state/reset/screenshot; run, pause, step, run an exact
-  cycle budget; pacing (`realtime` or `warp` 8× fast-forward); execution breakpoints.
-- **Input** — keys, typed text, joystick, and load/autostart a `.prg`.
-- **Media** — mount/swap/unmount disks (`.d64`/`.g64`) and cartridges (`.crt`)
-  through one checkpointing ingress (cartridge fidelity above).
-- **Trace** — start a capture over chosen domains, index it, query it, or carve a
-  trace for an exact cycle window straight out of the always-on ring. Two domains
-  are armed-only READ-SET lanes rather than firehoses: `drive-mechanism` records
-  which physical block the 1541 actually latched bytes off, `cart-read` which
-  cartridge bank served which reads and over which part of its 8 KB window.
-- **Checkpoint / scrub & snapshots** — the ring-bound rewind (a 10 s
-  scrub-filmstrip) plus full-machine snapshots to `.c64re`.
-- **Reverse-debug** — `reverse_step`, `who_wrote`, `crash_triage`, and live CPU
-  history (`chis`).
-- **Recorder, branching & audio** — bounded data-stream recorder, snapshot-tree /
-  overlay-run / branch promotion, scenarios, and audio export.
-
-### The monitor
-
-A single method — `monitor/exec` — drives a full interactive monitor (~128 verbs, a
-VICE superset): run/step, bank-aware dump/disassemble/assemble, breakpoints and
-observers, dynamic and flow disassembly, transfer/compare/hunt, interrupt-flow and
-backtrace, tracing, memory-map / taint / swimlanes, and the reverse-debug verbs
-above. **[MONITOR.md](MONITOR.md)** is the full command reference (tables per category
-+ the bank lens, the reverse-debug ring, checkpoint ring, traces, and a walkthrough);
-`help` prints the live verb list.
+**Formats:** `.c64re` (full machine snapshot), `.c64rering` (the reverse-debug rings),
+`.c64retrace` (binary trace log). VICE `.vsf` imports; export is not faithful.
 
 ---
 
-## Interchange formats
+## Contributing
 
-Two binary formats move a machine between instances — daemon ↔ embedded app ↔ the
-parity oracle:
+This is my personal emulator, written for my own reverse-engineering work. You will want
+things it does not do.
 
-- **`.c64re`** — a full machine snapshot (CPU, RAM, VIC, CIA, SID, drive).
-- **`.c64retrace`** — the binary trace log.
-
-Both are written byte-faithfully to the C64RE contract. TRX64 also imports VICE
-`.vsf` snapshots; it does not export a faithful `.vsf`.
-
----
-
-## Architecture
-
-Separation of concerns *is* the performance — the core stays monomorphized and
-branch-free:
-
-```
-trx64-daemon   tokio · WS JSON-RPC 2.0 · binary frames · the stream loop
-trx64-ffi      typed uniffi bindings for in-process embedding (e.g. Swift)
-trx64-session  session lifecycle · run control · snapshot / rewind · warp
-trx64-trace    TraceOp encoder → .c64retrace (the immovable format)
-trx64-static   machine-free capability: 6502 decode (`trx64cli disasm`; later media parse, classifiers)
-trx64-core     pure, deterministic, synchronous emulation · zero-cost Observer · Clone-able state
-```
-
-The 1541 drive runs a **separate** 6502 core (`crates/trx64-core/src/vice1541/` +
-`drive_6510core.rs`), kept faithful under the Spec-612 port-fidelity doctrine.
+**Open an issue** — bugs, missing hardware behaviour, a title that misbehaves. A concrete
+repro beats a feature description: which image, what you did, what happened. Pull requests
+welcome. I cannot offer support, and I do not work from feature requests without either
+code or a testable requirement.
 
 ---
 
-## Faithfulness
+## License
 
-TRX64's emulation cores are a **source-faithful port of VICE** — one C file maps to
-one Rust file, one function to one function, names preserved — so behaviour can be
-diffed against VICE cycle by cycle. That correctness discipline is what makes the
-time-travel and reverse-debug features trustworthy: a rewound or reverse-stepped
-machine is the *real* machine state, not an approximation.
+**GPL-3.0-or-later** — see [LICENSE](LICENSE). The emulation cores are a source-faithful
+port of [VICE](https://vice-emu.sourceforge.io/) (GPL-2.0-or-later, used under "or later").
+Credits in [THANKS.md](THANKS.md).
 
-### Quality gate (local, enforced on push — Spec 783)
-
-Regression protection without cloud CI. One command runs the whole gate and exits
-non-zero on any red (quiet on green, first-failure-loud):
-
-```sh
-./scripts/gate.sh            # clippy → rust gate tests → 7-game gate → conformance
-./scripts/install-hooks.sh   # one-time: sets core.hooksPath=hooks (idempotent)
-```
-
-`hooks/pre-push` runs the gate and **blocks a red push**; the 771.6 version-pin runs it
-first too, so only a green state is ever frozen. The gate is:
-
-- **rust gate tests** (release) — `iso_vic_gate` + `vic_collision_gate` + `cart_mapper_gate` (blocking).
-- **7-game behavioral gate** (release, ~25 s) — gates on the 7/7 PASS verdict; refreshes the
-  `traces/gate_*` screenshots. SKIPs loudly (never a false green) if the C64RE ROMs/samples are absent.
-- **clippy** — non-blocking today (pre-existing warning backlog); `GATE_CLIPPY_STRICT=1` enforces it.
-- **WS conformance** (`tools/oracle`, TS↔TRX64) — opt-in via `GATE_CONFORMANCE=1` (heavy; drives the C64RE oracle).
-
-Bypass a single deliberate WIP push with **`GATE_SKIP=1 git push`** (loud warning, never the default).
-
----
-
-## License & Credits
-
-TRX64 is licensed under the **GNU General Public License v3.0 or later**
-(`GPL-3.0-or-later`). See [LICENSE](LICENSE).
-
-The emulation cores are a source-faithful port of
-[VICE](https://vice-emu.sourceforge.io/) (GPL-2.0-or-later; TRX64 uses the "or later"
-permission). Full credits — VICE, C64RE, the scene, and ROM/media notices — are in
-[THANKS.md](THANKS.md).
-
-> At the request of Count Zero on behalf of the CSDb staff, any CSDb association has
-> been removed. For TRX64 or C64RE, please reach out via GitHub.
+> At the request of Count Zero on behalf of the CSDb staff, any CSDb association has been
+> removed. For TRX64 or C64RE, please reach out via GitHub.

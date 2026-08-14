@@ -129,7 +129,7 @@ you care about across interrupts.
 - `log [fields]` — append a log line (non-halting). Fields: `a x y sp pc fl` or `$addr[:w]` (`:w` = 16-bit). E.g. `do log $fd $fe $ff a x y`.
 - `mark ["label"]` — drop a trace bookmark on hit (default label = the observer name).
 - `cmd "<monitor command>"` — run any monitor command on each hit.
-- `trace [domains]\|off` — start / stop a scoped trace capture (**bracket model**). Domains: `c64-cpu drive8-cpu iec vic memory drive-mechanism cart-read` (default `c64-cpu memory`); `do trace off` stops. The last two are the armed-only READ-SET lanes — `drive-mechanism` records which physical block the 1541 latched bytes off (Spec 784), `cart-read` which cartridge bank served which reads (Spec 785). Neither runs unless its domain is named.
+- `trace [domains]\|off` — start / stop a scoped trace capture (**bracket model**). Domains: `c64-cpu drive8-cpu iec vic memory drive-mechanism cart-read` (default `c64-cpu memory`); `do trace off` stops. The last two are the armed-only READ-SET lanes — `drive-mechanism` records which physical block the 1541 latched bytes off, `cart-read` which cartridge bank served which reads. Neither runs unless its domain is named.
 
 **Trace-bracket example** — capture only the `$4000..$4100` region, driven by exec events:
 

@@ -23,7 +23,7 @@ cargo run -p trx64-cli --release -- --window
 # one-shot: run a single command, print, exit (scripting / CI)
 cargo run -p trx64-cli --release -- mon "d c000"
 
-# static disasm of a PRG / raw image — machine-free, no ROMs (capability-cut step 1)
+# static disasm of a PRG / raw image — machine-free, no ROMs
 cargo run -p trx64-cli --release -- disasm game.prg
 cargo run -p trx64-cli --release -- disasm dump.bin --load-address '$c000' --count 32 --json
 ```
@@ -203,7 +203,7 @@ window, debug in the cockpit at the same time**.
 - **Audio** — the runtime's persistent reSID engine, drained per frame into a ring and
   played via cpal (pre-roll + governor, underrun = silence; mirrors the SwiftUI app's
   AudioOutput).
-- **Keyboard** — the **C64RE Spec 310 symbolic mapping**: printable keys map by the
+- **Keyboard** — **symbolic mapping**: printable keys map by the
   host-layout-resolved character (correct on QWERTZ etc. — no Y/Z swap, right
   punctuation); special keys (RETURN, DEL, RUN/STOP, the left-edge keys, function keys)
   map by physical position; the **arrow keys are the cursor keys**.
