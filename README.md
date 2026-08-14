@@ -49,7 +49,7 @@ From source: `cargo build --release`. Builds natively on all three, MSVC include
   always on; nothing to arm.
 - **`whowrote <addr>`** — PC, cycle, old → new.
 - **JAM triage** — crash PC → wild jump → stack corruptor.
-- **Observers** — watch an address for exec, read or write; condition, action, no halt.
+- **Observers** — watch an address for exec, read or write; condition, action.
   Indirect addressing included: `sta ($fb),y`, `lda ($f0,x)`, `jmp ($0314)`.
 - **Traces** — CPU, drive, IEC and memory to a binary log; query as swimlanes, memory
   maps or data-flow taint.
@@ -95,7 +95,7 @@ A VICE superset, ~128 verbs, on every front end. Full reference: **[MONITOR.md](
 | **Run** | `g [addr]` go · `z`/`n` step into/over · `until <addr>` · `ret` |
 | **Memory** | `m`/`d`/`a` dump / disassemble / assemble · `>` write · `f` fill · `t` transfer · `h` hunt |
 | **Bank lens** | `m io d000`, `m ram e000` — see what the CPU sees, or the RAM under it |
-| **Breakpoints** | `bk` exec · `wa`/`ws` watch read/write · `obs` non-halting observers |
+| **Breakpoints** | `bk` exec · `wa`/`ws` watch read/write · `obs` conditional observers |
 | **CPU** | `r` registers · `chis` history · `bt` backtrace · `flow` IRQ/NMI focus |
 | **Reverse** | `rstep` step back · `whowrote <addr>` · `chis` · `crash` triage |
 | **Time** | `mark <name>` · `goto <name>` · `frame ±N` · `play back\|fwd` · `cadence` · `window <s>` |
