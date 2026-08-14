@@ -14086,8 +14086,13 @@ impl MediaKind {
     }
 }
 
-/// The four legal `.d64` lengths (35/35+errors/40/40+errors tracks).
-const D64_SIZES: [usize; 4] = [174_848, 175_531, 196_608, 197_376];
+/// Is this a legal `.d64` length?
+///
+/// Delegates to the core's VICE walk ([`trx64_core::gcr::d64_tracks_for_len`],
+/// = `disk_image_check_for_d64`, fsimage-probe.c:83-122): 35..42 tracks, each
+/// extra track 17 blocks, each length legal bare or with an error map. The old
+/// four-entry table named only 35 and 40 and silently rejected 36-39/41/42 —
+/// and, worse, said "D64" for a 40-track image the encoder then truncated to 35.
 
 /// BUG-041 — does a PRG want to be RUN?
 ///
@@ -14142,8 +14147,8 @@ pub(crate) fn detect_media_kind(bytes: &[u8], name: &str) -> Result<MediaKind, S
     if bytes.len() >= 8 && &bytes[..8] == trx64_core::native_snapshot::NATIVE_SNAPSHOT_MAGIC {
         return Ok(MediaKind::Snapshot);
     }
-    // 2. Size — a .d64 has no magic but exactly four legal lengths.
-    if D64_SIZES.contains(&bytes.len()) {
+    // 2. Size — a .d64 has no magic, but its length names its track count.
+    if trx64_core::gcr::d64_tracks_for_len(bytes.len()).is_some() {
         return Ok(MediaKind::D64);
     }
     // 3. Last resort. A PRG is never a positive match; it is what is left.
@@ -18716,13 +18721,50 @@ mod batch1_tests {
         snap.extend_from_slice(&[0u8; 64]);
         assert_eq!(detect_media_kind(&snap, "x.prg").unwrap(), MediaKind::Snapshot);
 
-        // A .d64 has no magic — it has exactly four legal lengths.
-        let d64 = vec![0u8; 174_848];
-        assert_eq!(detect_media_kind(&d64, "anything.bin").unwrap(), MediaKind::D64);
+        // A .d64 has no magic — its LENGTH names its track count, 35..42, bare or
+        // with an error map. Every one of those is a disk, not a PRG.
+        for tracks in 35u8..=42 {
+            let blocks = 683 + (tracks as usize - 35) * 17;
+            for len in [blocks * 256, blocks * 256 + blocks] {
+                assert_eq!(
+                    detect_media_kind(&vec![0u8; len], "anything.bin").unwrap(),
+                    MediaKind::D64,
+                    "{tracks}-track d64 ({len} bytes) must be a disk"
+                );
+            }
+        }
+        // The shape that regressed, named explicitly.
+        assert_eq!(detect_media_kind(&vec![0u8; 196_608], "sideA.d64").unwrap(), MediaKind::D64);
 
         // And a PRG is never a positive match: it is what is left.
         let prg = vec![0x00, 0xC0, 0xA9, 0x00, 0x60];
         assert!(matches!(detect_media_kind(&prg, "x.d64").unwrap(), MediaKind::Prg { .. }));
+    }
+
+    /// BUG-045 — mounting a 40-track image must make its extra tracks READABLE, not
+    /// just accepted. The bug was one layer below detection: `media/mount` said "d64"
+    /// for a 196608-byte file and the GCR encoder then truncated it to 35 tracks, so
+    /// the loader stepped to track 36 and found an unformatted 0x55 fill.
+    #[test]
+    fn a_mounted_40_track_disk_carries_its_extra_tracks() {
+        // A 40-track image whose track 36-40 sectors are distinguishable from fill.
+        let mut bytes = vec![0u8; 196_608];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        assert_eq!(detect_media_kind(&bytes, "sideA.d64").unwrap(), MediaKind::D64);
+
+        let img = trx64_core::gcr::GcrImage::from_d64(&bytes);
+        for track in 36u8..=40 {
+            let raw = &img.tracks[(track as usize) * 2 - 2];
+            for sector in 0..trx64_core::gcr::d64_sectors_per_track(track) {
+                let mut decoded = [0u8; 256];
+                let rf = trx64_core::gcr::gcr_read_sector(raw, &mut decoded, sector);
+                assert_eq!(rf, trx64_core::gcr::CBMDOS_FDC_ERR_OK, "T{track} S{sector}");
+                let off = trx64_core::gcr::d64_linear_sector(track, sector, 40).unwrap() * 256;
+                assert_eq!(&decoded[..], &bytes[off..off + 256], "T{track} S{sector}");
+            }
+        }
     }
 
     /// The autostart rule, checked rather than assumed. `$0801` plus a valid BASIC line

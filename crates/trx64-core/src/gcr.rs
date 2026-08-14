@@ -7,17 +7,21 @@
 //! layout (sync + header + header-gap + sync + data + inter-sector gap), which
 //! the rotating-disk model (rotation.rs) then streams to VIA2.
 //!
-//! Geometry (D64, 35 tracks, 256 bytes/sector):
+//! Geometry (D64, 256 bytes/sector):
 //!   zone = (t<31) + (t<25) + (t<18)   → index into the 4-entry zone tables
 //!   tracks  1-17 → zone 3 → 21 sectors → 7692 raw GCR bytes, gap  8
 //!   tracks 18-24 → zone 2 → 19 sectors → 7142 raw GCR bytes, gap 17
 //!   tracks 25-30 → zone 1 → 18 sectors → 6666 raw GCR bytes, gap 12
-//!   tracks 31-35 → zone 0 → 17 sectors → 6250 raw GCR bytes, gap  9
+//!   tracks 31-42 → zone 0 → 17 sectors → 6250 raw GCR bytes, gap  9
 //!   headergap = 9, synclen = 5 (all zones).
 //!
+//! How many of those tracks an image CARRIES is a property of the image, not of
+//! the format: 35 is the common case, and 36..42 are ordinary — VICE derives the
+//! count from the file length ([`d64_tracks_for_len`]) and so does this module.
+//!
 //! Half-track indexing: track N (1-based) → even slot `N*2-2`; the following odd
-//! slot is empty. 1541 uses 84 half-track slots (42 nominal tracks); tracks
-//! beyond the 35 in a D64 are 0x55-filled.
+//! slot is empty. 1541 uses 84 half-track slots (42 nominal tracks); tracks the
+//! image does not carry are 0x55-filled.
 
 // ── CBMDOS FDC error codes (gcr.ts:30-54 / cbmdos.h:105-117) ─────────────────
 pub const CBMDOS_FDC_ERR_OK: u8 = 1;
@@ -77,6 +81,50 @@ const BAM_ID_1541: usize = 162;
 pub const DRIVE_HALFTRACKS_1541: usize = 84;
 /// Number of data tracks in a standard 35-track D64.
 pub const D64_TRACKS: u8 = 35;
+/// VICE `MAX_TRACKS_1541` — a `.d64` may carry up to 42 data tracks
+/// (fsimage-probe.c:119). 35 is the *common* case, never the only one.
+pub const MAX_TRACKS_1541: u8 = 42;
+/// Blocks in a standard 35-track D64 (`D64_FILE_SIZE_35 / 256`).
+const D64_BLOCKS_35: usize = 683;
+
+/// How many data tracks does a `.d64` of this length carry, and does it carry an
+/// error map?
+///
+/// PORT OF: VICE `disk_image_check_for_d64` (fsimage-probe.c:83-122) — walk from
+/// 35 up to 42, every extra track adding 17 blocks (tracks 35..42 all sit in
+/// speed zone 0), and match the file length either bare (`blocks * 256`) or with
+/// one error byte per block (`blocks * 256 + blocks`). `None` when the length is
+/// no legal D64 at all.
+///
+/// This exists because the track count is a property of the IMAGE, not of the
+/// format. Real releases ship 40-track disks (196608 bytes = 768 blocks) whose
+/// tracks 36-40 are ~99% full of game data; a hardcoded 35 dropped 85 blocks per
+/// disk into an empty 0x55 track and the loader found unformatted nothing.
+pub fn d64_tracks_for_len(len: usize) -> Option<(u8, bool)> {
+    let mut tracks = D64_TRACKS;
+    let mut blocks = D64_BLOCKS_35;
+    loop {
+        if len == blocks * 256 {
+            return Some((tracks, false));
+        }
+        if len == blocks * 256 + blocks {
+            return Some((tracks, true));
+        }
+        tracks += 1;
+        blocks += 17;
+        if tracks > MAX_TRACKS_1541 {
+            return None;
+        }
+    }
+}
+
+/// The track count to encode/decode a `.d64` of this length with. Unknown lengths
+/// fall back to the 35-track standard — the same shape they had before the walk
+/// existed, so a malformed image degrades rather than panics.
+#[inline]
+pub fn d64_tracks_of(bytes: &[u8]) -> u8 {
+    d64_tracks_for_len(bytes.len()).map(|(t, _)| t).unwrap_or(D64_TRACKS)
+}
 
 /// Speed zone for a 1-based D64 track (disk_image_speed_map, D64 branch).
 #[inline]
@@ -99,9 +147,13 @@ pub fn d64_raw_track_size(track: u8) -> usize {
 
 /// Linear sector index (0-based) of (track, sector) in the D64 file, or `None`
 /// if out of range (disk_image_check_sector, fsimage_dxx.ts:276-289).
+///
+/// `tracks` is the image's OWN track count ([`d64_tracks_of`]) — VICE compares
+/// against `image->tracks`, not against a constant, because 35..42 are all legal.
+/// Pass [`D64_TRACKS`] when the image is known to be the 35-track standard.
 #[inline]
-pub fn d64_linear_sector(track: u8, sector: u8) -> Option<usize> {
-    if track < 1 || track > D64_TRACKS {
+pub fn d64_linear_sector(track: u8, sector: u8, tracks: u8) -> Option<usize> {
+    if track < 1 || track > tracks {
         return None;
     }
     if sector >= d64_sectors_per_track(track) {
@@ -228,12 +280,18 @@ pub struct GcrImage {
 }
 
 impl GcrImage {
-    /// Build the GCR image from a raw 35-track D64 (`bytes` = 683*256 = 174848).
+    /// Build the GCR image from a raw D64 of 35..42 tracks — the count comes from
+    /// `bytes.len()` ([`d64_tracks_of`]), the way VICE sets `image->tracks`.
     /// Byte-exact port of `fsimage_read_dxx_image` (fsimage_dxx.ts:455-568) for the
     /// D64 path: disk ID from the BAM, per-sector codec, inter-track skew rotation.
     pub fn from_d64(bytes: &[u8]) -> Self {
+        // The image's OWN track count, from its length (VICE `image->tracks`).
+        // 35 is the common case; 40-track releases are ordinary and their extra
+        // tracks carry data like any other.
+        let d64_tracks = d64_tracks_of(bytes);
+
         // Disk ID from the BAM (track 18, sector 0, bytes 0xA2/0xA3). Defaults 0xA0.
-        let (id1, id2) = match d64_linear_sector(BAM_TRACK_1541, BAM_SECTOR_1541) {
+        let (id1, id2) = match d64_linear_sector(BAM_TRACK_1541, BAM_SECTOR_1541, d64_tracks) {
             Some(lin) => {
                 let off = lin * 256;
                 if off + BAM_ID_1541 + 1 < bytes.len() {
@@ -253,11 +311,11 @@ impl GcrImage {
         let mut trackoffset: usize = 0;
 
         // Loop nominal tracks 1..=42 (max_half_tracks/2 = 84/2). Tracks beyond the
-        // 35 in the D64 get the 0x55-fill empty path.
+        // ones this image actually carries get the 0x55-fill empty path.
         let nominal_tracks = DRIVE_HALFTRACKS_1541 / 2; // 42
         for track in 1..=nominal_tracks as u8 {
             let half_track = (track as usize) * 2 - 2;
-            let track_size = if track <= D64_TRACKS {
+            let track_size = if track <= d64_tracks {
                 d64_raw_track_size(track)
             } else {
                 // Empty tracks adopt zone-0 raw size (the loop still allocates
@@ -268,7 +326,7 @@ impl GcrImage {
 
             let mut ptr = vec![0u8; track_size];
 
-            if track <= D64_TRACKS {
+            if track <= d64_tracks {
                 let gap = GAP_SIZE_D64[d64_speed_zone(track)];
                 let headergap = HEADER_GAP_D64;
                 let synclen = SYNC_LEN_D64;
@@ -278,7 +336,7 @@ impl GcrImage {
                 let mut ptr_off = 0usize;
 
                 for sector in 0..max_sector {
-                    if let Some(lin) = d64_linear_sector(track, sector) {
+                    if let Some(lin) = d64_linear_sector(track, sector, d64_tracks) {
                         let off = lin * 256;
                         let mut sec_buf = [0u8; 256];
                         if off + 256 <= bytes.len() {
@@ -756,27 +814,33 @@ fn write_gcr_half_track(bytes: &mut Vec<u8>, half_track: usize, raw: &GcrTrack, 
 /// sector of the written track via [`gcr_read_sector`] and write the 256-byte
 /// sectors back into the raw `.d64` image `bytes` at the linear sector offset.
 ///
-/// The per-sector error-info map (`fsimage.error_info`) is OUT OF SCOPE for a
-/// plain D64 (TRX64 mounts 174848-byte D64s with no error map); VICE only
-/// touches it when `error_info.map != NULL`, which is never the case here, so
-/// the error-map branches are correctly skipped (they are no-ops for a
-/// map-less image, matching VICE's `if (fsimage->error_info.map ...)` guards).
+/// The per-sector error-info map (`fsimage.error_info`) is NOT applied. A D64
+/// may carry one — [`d64_tracks_for_len`] reports whether it does — and an image
+/// with a map mounts and reads from its DATA area exactly like one without; only
+/// the recorded per-sector errors are ignored, so a disk whose protection relies
+/// on a deliberate read error reads back clean. VICE guards every error-map
+/// branch with `if (fsimage->error_info.map ...)`, which is the branch this port
+/// takes; carrying the map is its own piece of work, not a silent omission.
 ///
 /// `read_only` mirrors `image->read_only` (rejects the write). The track
-/// `half_track/2` must be in range [1,35]; out-of-range returns -1. Returns 0
-/// on success, -1 on error.
+/// `half_track/2` must be one the IMAGE carries (`[1, image->tracks]`, 35..42
+/// depending on its length); out-of-range returns -1. Returns 0 on success, -1
+/// on error.
 fn write_dxx_half_track(bytes: &mut [u8], half_track: usize, raw: &GcrTrack, read_only: bool) -> i32 {
     if read_only {
         return -1;
     }
     let track = (half_track / 2) as u8;
 
-    // disk_image_sector_per_track / disk_image_check_sector (D64).
-    if track < 1 || track > D64_TRACKS {
+    // disk_image_sector_per_track / disk_image_check_sector (D64). The bound is
+    // the image's own track count — a 40-track image must be able to write back
+    // tracks 36-40, which a hardcoded 35 silently dropped on the floor.
+    let d64_tracks = d64_tracks_of(bytes);
+    if track < 1 || track > d64_tracks {
         return -1;
     }
     let max_sector = d64_sectors_per_track(track);
-    let sectors = match d64_linear_sector(track, 0) {
+    let sectors = match d64_linear_sector(track, 0, d64_tracks) {
         Some(s) => s,
         None => return -1,
     };
@@ -1084,15 +1148,15 @@ mod tests {
 
     #[test]
     fn linear_sector_offsets() {
-        assert_eq!(d64_linear_sector(1, 0), Some(0));
-        assert_eq!(d64_linear_sector(1, 20), Some(20));
-        assert_eq!(d64_linear_sector(2, 0), Some(21));
+        assert_eq!(d64_linear_sector(1, 0, D64_TRACKS), Some(0));
+        assert_eq!(d64_linear_sector(1, 20, D64_TRACKS), Some(20));
+        assert_eq!(d64_linear_sector(2, 0, D64_TRACKS), Some(21));
         // track 18 sector 0 = sum of tracks 1..17 (17*21 = 357)
-        assert_eq!(d64_linear_sector(18, 0), Some(357));
+        assert_eq!(d64_linear_sector(18, 0, D64_TRACKS), Some(357));
         // last sector: track 35 sector 16 = 682
-        assert_eq!(d64_linear_sector(35, 16), Some(682));
-        assert_eq!(d64_linear_sector(35, 17), None);
-        assert_eq!(d64_linear_sector(36, 0), None);
+        assert_eq!(d64_linear_sector(35, 16, D64_TRACKS), Some(682));
+        assert_eq!(d64_linear_sector(35, 17, D64_TRACKS), None);
+        assert_eq!(d64_linear_sector(36, 0, D64_TRACKS), None);
     }
 
     #[test]
@@ -1320,10 +1384,17 @@ mod tests {
     /// round-trip can be byte-checked. Sector (t,s) byte i = (t ^ s ^ i) & 0xff
     /// (with a sane BAM disk ID at T18 S0 so from_d64 reads it).
     fn synthetic_d64() -> Vec<u8> {
-        let mut d = vec![0u8; 683 * 256];
-        for track in 1..=D64_TRACKS {
+        synthetic_d64_tracks(D64_TRACKS)
+    }
+
+    /// The same, for an image of `tracks` tracks (35..=42) — every track it
+    /// carries is filled, including the ones past 35.
+    fn synthetic_d64_tracks(tracks: u8) -> Vec<u8> {
+        let blocks: usize = (1..=tracks).map(|t| d64_sectors_per_track(t) as usize).sum();
+        let mut d = vec![0u8; blocks * 256];
+        for track in 1..=tracks {
             for sector in 0..d64_sectors_per_track(track) {
-                let lin = d64_linear_sector(track, sector).unwrap();
+                let lin = d64_linear_sector(track, sector, tracks).unwrap();
                 let off = lin * 256;
                 for i in 0..256 {
                     d[off + i] = (track ^ sector ^ (i as u8)) & 0xff;
@@ -1331,10 +1402,109 @@ mod tests {
             }
         }
         // Disk ID at T18 S0 0xA2/0xA3 (so from_d64's header IDs are stable).
-        let bam = d64_linear_sector(18, 0).unwrap() * 256;
+        let bam = d64_linear_sector(18, 0, tracks).unwrap() * 256;
         d[bam + BAM_ID_1541] = 0x41;
         d[bam + BAM_ID_1541 + 1] = 0x42;
         d
+    }
+
+    /// A `.d64`'s LENGTH names its track count — it is not a constant.
+    ///
+    /// 1:1 with VICE `disk_image_check_for_d64` (fsimage-probe.c:83-122). The
+    /// regression this pins: a real release is 196608 bytes = 40 tracks, and
+    /// a hardcoded 35 dropped tracks 36-40 — 85 blocks per disk that the game
+    /// actually reads.
+    #[test]
+    fn a_d64_length_names_its_track_count() {
+        // The two standards, bare and with an error map.
+        assert_eq!(d64_tracks_for_len(174_848), Some((35, false)));
+        assert_eq!(d64_tracks_for_len(175_531), Some((35, true)));
+        assert_eq!(d64_tracks_for_len(196_608), Some((40, false)), "a real 40-track release");
+        assert_eq!(d64_tracks_for_len(197_376), Some((40, true)));
+
+        // Every count in between is legal too — the old four-entry table said no.
+        for tracks in 35u8..=42 {
+            let blocks = 683 + (tracks as usize - 35) * 17;
+            assert_eq!(
+                d64_tracks_for_len(blocks * 256),
+                Some((tracks, false)),
+                "{tracks}-track image must be recognised"
+            );
+            assert_eq!(
+                d64_tracks_for_len(blocks * 256 + blocks),
+                Some((tracks, true)),
+                "{tracks}-track image with error map must be recognised"
+            );
+        }
+
+        // Past 42 and anything off-grid is not a D64.
+        assert_eq!(d64_tracks_for_len(0), None);
+        assert_eq!(d64_tracks_for_len(174_847), None);
+        assert_eq!(d64_tracks_for_len(683 * 256 + 8 * 17 * 256), None); // 43 tracks
+    }
+
+    /// A 40-track image's extra tracks must ENCODE — the bug was that they were
+    /// replaced by an empty 0x55 fill, so a loader stepping to track 36 found an
+    /// unformatted track and stalled.
+    #[test]
+    fn a_40_track_d64_encodes_the_tracks_past_35() {
+        let d64 = synthetic_d64_tracks(40);
+        assert_eq!(d64.len(), 196_608, "40 tracks = 768 blocks");
+        let img = GcrImage::from_d64(&d64);
+
+        for track in 36u8..=40 {
+            let slot = (track as usize) * 2 - 2;
+            let raw = &img.tracks[slot];
+            for sector in 0..d64_sectors_per_track(track) {
+                let mut decoded = [0u8; 256];
+                let rf = gcr_read_sector(raw, &mut decoded, sector);
+                assert_eq!(rf, CBMDOS_FDC_ERR_OK, "T{track} S{sector} must decode OK");
+                let off = d64_linear_sector(track, sector, 40).unwrap() * 256;
+                assert_eq!(
+                    &decoded[..],
+                    &d64[off..off + 256],
+                    "T{track} S{sector} must carry the image's bytes, not a 0x55 fill"
+                );
+            }
+        }
+    }
+
+    /// The other direction stays intact: on a 35-track image, track 36 is still
+    /// the empty fill. Widening the bound must not invent tracks that are not
+    /// in the file.
+    #[test]
+    fn a_35_track_d64_leaves_track_36_empty() {
+        let d64 = synthetic_d64();
+        let img = GcrImage::from_d64(&d64);
+        let raw = &img.tracks[36 * 2 - 2];
+        assert!(
+            raw.data.iter().all(|&b| b == 0x55),
+            "track 36 of a 35-track image is unformatted"
+        );
+        assert_eq!(d64_linear_sector(36, 0, D64_TRACKS), None);
+    }
+
+    /// Write-back must reach the extra tracks too. A 40-track image that saves a
+    /// game writes to tracks the old bound rejected with -1, silently losing it.
+    #[test]
+    fn d64_write_back_reaches_track_40() {
+        let d64 = synthetic_d64_tracks(40);
+        let mut img = GcrImage::from_d64(&d64);
+        let mut bytes = d64.clone();
+
+        let track: u8 = 40;
+        let sector: u8 = 3;
+        let new_sector: Vec<u8> = (0..256).map(|i| (0x5Au16.wrapping_add(i as u16)) as u8).collect();
+
+        let slot = (track as usize) * 2 - 2;
+        let rf = gcr_write_sector(&mut img.tracks[slot], &new_sector, sector);
+        assert_eq!(rf, CBMDOS_FDC_ERR_OK, "gcr_write_sector OK on T40");
+
+        let res = img.write_half_track(WritebackKind::D64, &mut bytes, (track as usize) * 2, false);
+        assert_eq!(res, 0, "write_half_track must accept T40 on a 40-track image");
+
+        let off = d64_linear_sector(track, sector, 40).unwrap() * 256;
+        assert_eq!(&bytes[off..off + 256], &new_sector[..], "T40 write persisted");
     }
 
     /// The GCR codec must round-trip every sector of a D64: encode (from_d64) →
@@ -1353,7 +1523,7 @@ mod tests {
                     rf, CBMDOS_FDC_ERR_OK,
                     "T{track} S{sector} must decode OK (rf={rf})"
                 );
-                let lin = d64_linear_sector(track, sector).unwrap();
+                let lin = d64_linear_sector(track, sector, D64_TRACKS).unwrap();
                 let off = lin * 256;
                 assert_eq!(
                     &decoded[..],
@@ -1390,7 +1560,7 @@ mod tests {
         assert_eq!(res, 0, "write_half_track OK");
 
         // The image bytes now carry the new sector at its linear offset.
-        let lin = d64_linear_sector(track, sector).unwrap();
+        let lin = d64_linear_sector(track, sector, D64_TRACKS).unwrap();
         let off = lin * 256;
         assert_eq!(&bytes[off..off + 256], &new_sector[..], "written sector persisted");
 
@@ -1401,7 +1571,7 @@ mod tests {
             if s == sector {
                 continue;
             }
-            let lin = d64_linear_sector(track, s).unwrap();
+            let lin = d64_linear_sector(track, s, D64_TRACKS).unwrap();
             let off = lin * 256;
             assert_eq!(
                 &bytes[off..off + 256],

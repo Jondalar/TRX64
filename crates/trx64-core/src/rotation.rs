@@ -1280,7 +1280,7 @@ mod tests {
         let mut d = vec![0u8; 683 * 256];
         for track in 1..=D64_TRACKS {
             for sector in 0..d64_sectors_per_track(track) {
-                let off = d64_linear_sector(track, sector).unwrap() * 256;
+                let off = d64_linear_sector(track, sector, D64_TRACKS).unwrap() * 256;
                 for i in 0..256 {
                     d[off + i] = (track ^ sector ^ (i as u8)) & 0xff;
                 }
@@ -1334,7 +1334,9 @@ mod tests {
     /// re-mount (the behavioral "a sector write reaches the image" proof).
     #[test]
     fn rotation_sector_write_round_trips_through_writeback() {
-        use crate::gcr::{d64_linear_sector, gcr_read_sector, gcr_write_sector, CBMDOS_FDC_ERR_OK};
+        use crate::gcr::{
+            d64_linear_sector, gcr_read_sector, gcr_write_sector, CBMDOS_FDC_ERR_OK, D64_TRACKS,
+        };
         let d64 = synthetic_d64();
         let mut img = GcrImage::from_d64(&d64);
 
@@ -1354,7 +1356,7 @@ mod tests {
 
         // Flush + take the synced bytes.
         let bytes = r.writeback_bytes_synced().expect("writeback bytes");
-        let off = d64_linear_sector(track, sector).unwrap() * 256;
+        let off = d64_linear_sector(track, sector, D64_TRACKS).unwrap() * 256;
         assert_eq!(&bytes[off..off + 256], &new_sector[..], "sector write reached the .d64");
 
         // Re-mount the mutated image → the new sector decodes back.

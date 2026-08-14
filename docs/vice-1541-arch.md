@@ -1167,7 +1167,18 @@ tracks (modeled in G64).
 
 Logical layout: 35 tracks × variable sectors × 256 bytes = **174848
 bytes** standard. Optional 683-byte error map appended → 175531 bytes
-("D64 with errors"). Some 40-track images: 196608 / 197376 bytes.
+("D64 with errors").
+
+**The track count is a property of the IMAGE, not of the format.** A D64
+carries **35 to 42** tracks; every track past 35 adds 17 blocks (they all
+sit in speed zone 0). `disk_image_check_for_d64` (fsimage-probe.c:83-122)
+walks 35→42 and matches the file length either bare (`blocks * 256`) or
+with one error byte per block (`blocks * 256 + blocks`), then sets
+`image->tracks`. 40-track releases are ordinary — real titles ship them, and
+its tracks 36-40 are ~99% full of game data.
+
+Do not hardcode 35 anywhere downstream. TRX64 did, in the GCR encoder, and
+silently replaced 85 blocks per disk with an empty 0x55 track.
 
 On attach, `fsimage-gcr.c` walks each track:
 1. Allocate GCR buffer of zone-appropriate size.
@@ -1204,7 +1215,9 @@ imaging tools. Most accurate, largest file size, slowest emulation.
 
 `disk_image_attach_log()` opens the file, reads the header signature:
 
-- 174848 / 175531 bytes → D64
+- length on the 35..42-track grid, bare or with error map → D64
+  (174848 / 175531 for 35 tracks, 196608 / 197376 for 40, and every
+  count in between)
 - header `GCR-1541` → G64
 - header `GCR-1571` → G71
 - header `P64-1541` → P64
