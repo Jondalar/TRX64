@@ -45,6 +45,18 @@ pub enum MapperType {
     Ocean,
     /// Writable flash mappers (the WRITABLE tier).
     EasyFlash, // CARTRIDGE_EASYFLASH (hw 0x20)
+    /// Internal development vehicle for 4 MB CRT simulation. Cart type 232,
+    /// TRX64 only.
+    ///
+    /// An EasyFlash with an eight-bit `$DE00` bank register: 256 banks × 16 KB =
+    /// 4 MB in two 2 MB chips. Mode register, jumper, IO2 RAM, EAPI and the
+    /// programming rules are unchanged.
+    ///
+    /// Not hardware. No board exists for it, and nothing outside TRX64 reads type
+    /// 232. Use it to develop against 4 MB before deciding how the content ships.
+    /// The separate id is what keeps a 4 MB dev cart from being read as a 1 MB
+    /// EasyFlash — do not write one of these as type 32.
+    EasyFlashXl,
     Gmod2,     // CARTRIDGE_GMOD2 (hw 0x3c) — flash + M93C86 EEPROM
     MegaByter, // CARTRIDGE_MEGABYTER (hw 0x56) — MX29F800CB flash, ROML only
     C64MegaCart, // CARTRIDGE_C64MEGACART (hw 61, martinpiper fork) — M29F160FT flash
@@ -535,6 +547,9 @@ fn infer_mapper_type(
         85 => Some(MapperType::MagicDesk16), // ts:248-249 CARTRIDGE_MAGIC_DESK_16
         // ts:250-259 — flash/serial families. The WRITABLE tier now builds these:
         32 => Some(MapperType::EasyFlash),  // CARTRIDGE_EASYFLASH
+        // Internal development vehicle for 4 MB CRT simulation. Not a hardware
+        // cartridge and not a VICE id — see MapperType::EasyFlashXl.
+        232 => Some(MapperType::EasyFlashXl),
         60 => Some(MapperType::Gmod2),      // CARTRIDGE_GMOD2 (flash + M93C86)
         86 => Some(MapperType::MegaByter),  // CARTRIDGE_MEGABYTER (MX29F800CB)
         // CARTRIDGE_GMOD4 — the number moved twice upstream (an older summary says
@@ -597,8 +612,8 @@ impl std::fmt::Display for CrtError {
             CrtError::UnknownCartType(s) => {
                 write!(
                     f,
-                    "Unknown cart type '{s}'. Valid: a VICE numeric id (5, 19, 32, 60, 85, 86, 61, -2, -3, -6, 0) \
-                     or a mnemonic (ef/easyflash, gmod2, megabyter/mb, c64megacart/c64mc, magicdesk/md, md16, ocean, 8k, 16k, ultimax, crt/auto)."
+                    "Unknown cart type '{s}'. Valid: a VICE numeric id (5, 19, 32, 60, 85, 86, 61, -2, -3, -6, 0), the TRX64 id 232, \
+                     or a mnemonic (ef/easyflash, efxl, gmod2, megabyter/mb, c64megacart/c64mc, magicdesk/md, md16, ocean, 8k, 16k, ultimax, crt/auto)."
                 )
             }
             CrtError::BinTypeAmbiguous => {
@@ -1142,15 +1157,40 @@ pub struct EasyFlashMapper {
     io_ram: [u8; 256], // VICE easyflash_ram ($DF00 IO2)
     lo_flash: Flash040,
     hi_flash: Flash040,
+    /// What `$DE00` keeps of a bank write. `0x3f` is EasyFlash and the hardware;
+    /// `0xff` is the XL variant (cart type 232, emulator-only).
+    bank_mask: u8,
+    /// Which of the two this instance is. One struct serves both, so
+    /// `mapper_type()` reads this rather than returning a constant — otherwise
+    /// `identify` and the daemon status report a 4 MB dev cart as an EasyFlash.
+    mapper_type: MapperType,
 }
 
 impl EasyFlashMapper {
     pub fn new(image: &ParsedCartridgeImage) -> Self {
-        let lo_data = build_linear_chip_data(image, |b| b.roml.as_ref(), 64);
+        Self::with_geometry(image, 0x3f, 64, FLASH040B, MapperType::EasyFlash)
+    }
+
+    /// Internal development vehicle for 4 MB CRT simulation — see
+    /// [`MapperType::EasyFlashXl`]. 256 banks of 16 KB in two 2 MB chips.
+    /// Identical to EasyFlash apart from the wider bank register and the sector
+    /// decode, so EAPI and hand-written flash routines keep working.
+    pub fn new_xl(image: &ParsedCartridgeImage) -> Self {
+        Self::with_geometry(image, 0xff, 256, crate::flash040::FLASH040B_XL, MapperType::EasyFlashXl)
+    }
+
+    fn with_geometry(
+        image: &ParsedCartridgeImage,
+        bank_mask: u8,
+        min_banks: usize,
+        flash: crate::flash040::Flash040Type,
+        mapper_type: MapperType,
+    ) -> Self {
+        let lo_data = build_linear_chip_data(image, |b| b.roml.as_ref(), min_banks);
         let mut hi_data = build_linear_chip_data(
             image,
             |b| b.romh_a000.as_ref().or(b.romh_e000.as_ref()),
-            64,
+            min_banks,
         );
         // ts:840-849 — if the EAPI signature "eapi" is in hi bank-0 $1800, replace
         // the cart's EAPI with VICE's known-good eapiam29f040 block.
@@ -1173,8 +1213,10 @@ impl EasyFlashMapper {
             register02: 0,
             jumper: 0,
             io_ram,
-            lo_flash: Flash040::new(lo_data, "easyflash-lo", FLASH040B),
-            hi_flash: Flash040::new(hi_data, "easyflash-hi", FLASH040B),
+            lo_flash: Flash040::new(lo_data, "easyflash-lo", flash),
+            hi_flash: Flash040::new(hi_data, "easyflash-hi", flash),
+            bank_mask,
+            mapper_type,
         }
     }
 
@@ -1205,7 +1247,7 @@ impl EasyFlashMapper {
 
 impl CartMapper for EasyFlashMapper {
     fn mapper_type(&self) -> MapperType {
-        MapperType::EasyFlash
+        self.mapper_type
     }
     /// ts:877-884 — lines per the current memconfig mode.
     fn get_lines(&self) -> CartLines {
@@ -1262,7 +1304,7 @@ impl CartMapper for EasyFlashMapper {
             if address & 2 != 0 {
                 self.register02 = value & 0x87;
             } else {
-                self.current_bank = (value & 0x3f) as u16;
+                self.current_bank = (value & self.bank_mask) as u16;
             }
             return true;
         }
@@ -1928,6 +1970,7 @@ pub fn mapper_from_image(
         MapperType::MagicDesk16 => Ok(Box::new(MagicDesk16Mapper::new(image))),
         MapperType::Ocean => Ok(Box::new(OceanMapper::new(image))),
         MapperType::EasyFlash => Ok(Box::new(EasyFlashMapper::new(image))),
+        MapperType::EasyFlashXl => Ok(Box::new(EasyFlashMapper::new_xl(image))),
         MapperType::Gmod2 => Ok(Box::new(Gmod2Mapper::new(image))),
         MapperType::MegaByter => Ok(Box::new(MegabyterMapper::new(image))),
         MapperType::C64MegaCart => Ok(Box::new(C64MegaCartMapper::new(image))),
@@ -2415,6 +2458,7 @@ fn bin_geometry(mapper_type: MapperType) -> Result<BinGeometry, CrtError> {
         // max_banks mirror the mapper build_linear_chip_data bank_count:
         //   EasyFlash 64 (cart.rs new()), Gmod2 64, Megabyter 128, C64MegaCart 256.
         MapperType::EasyFlash => BinGeometry { bank_unit: 0x4000, layout: Roml16kRomhA000, exrom: 1, game: 0, max_banks: 64 },
+        MapperType::EasyFlashXl => BinGeometry { bank_unit: 0x4000, layout: Roml16kRomhA000, exrom: 1, game: 0, max_banks: 256 },
         MapperType::Gmod2 => BinGeometry { bank_unit: 0x2000, layout: Roml8k, exrom: 0, game: 1, max_banks: 64 },
         MapperType::MegaByter => BinGeometry { bank_unit: 0x2000, layout: Roml8k, exrom: 0, game: 1, max_banks: 128 },
         MapperType::C64MegaCart => BinGeometry { bank_unit: 0x2000, layout: Roml8k, exrom: 0, game: 1, max_banks: 256 },
@@ -2576,6 +2620,7 @@ pub fn resolve_cart_type(s: &str) -> Result<CartType, CrtError> {
     // Mnemonic (LLM-friendly).
     let mt = match t.as_str() {
         "ef" | "easyflash" => MapperType::EasyFlash,
+        "efxl" | "easyflashxl" => MapperType::EasyFlashXl,
         "gmod2" => MapperType::Gmod2,
         "megabyter" | "mb" => MapperType::MegaByter,
         "c64megacart" | "c64mc" => MapperType::C64MegaCart,

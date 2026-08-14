@@ -13653,6 +13653,7 @@ fn mapper_type_str(t: trx64_core::cart::MapperType) -> &'static str {
         MagicDesk => "magicdesk",
         MagicDesk16 => "magicdesk16",
         EasyFlash => "easyflash",
+        EasyFlashXl => "easyflash_xl",
         Gmod2 => "gmod2",
         MegaByter => "megabyter",
         C64MegaCart => "c64megacart",

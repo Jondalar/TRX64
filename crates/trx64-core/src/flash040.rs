@@ -86,6 +86,35 @@ pub const FLASH040B: Flash040Type = Flash040Type {
     erase_chip_cycles: 8_000_000,
 };
 
+/// EasyFlash XL (TRX64 cart type 232) — an AM29F040B widened to 2 MB per chip.
+///
+/// Internal development vehicle for 4 MB CRT simulation — not a real part. The XL
+/// mapper is an EasyFlash with a wider bank register, so its chips hold 256 banks
+/// of 8 KB instead of 64. Everything the chip reports about itself is left as the
+/// B type reports it, so EAPI and hand-written flash routines behave unchanged.
+///
+/// The sector decode has to move with the size. `sector_mask: 0x70000` is three
+/// bits: eight 64 KB sectors, 512 KB. On a 2 MB array that drops every address
+/// bit above A18, so an erase in bank 200 lands on bank 8's sector. Five bits
+/// (`0x1f0000`) give the 32 sectors a 2 MB part has.
+pub const FLASH040B_XL: Flash040Type = Flash040Type {
+    manufacturer_id: 0x01,
+    device_id: 0xa4,
+    device_id_addr: 1,
+    size: 0x200000,
+    sector_mask: 0x1f0000,
+    sector_size: 0x10000,
+    sector_shift: 16,
+    magic1_addr: 0x555,
+    magic2_addr: 0x2aa,
+    magic1_mask: 0x7ff,
+    magic2_mask: 0x7ff,
+    status_toggle_bits: 0x40,
+    erase_sector_timeout_cycles: 50,
+    erase_sector_cycles: 1_000_000,
+    erase_chip_cycles: 8_000_000,
+};
+
 /// ts:563-569 — M29F160FT (FLASH040_TYPE_160, martinpiper fork) — C64MegaCart.
 /// 2MB, device id 0xd2 at addr 2, magic 0xaaa/0x555 mask 0xfff.
 pub const FLASH040_160: Flash040Type = Flash040Type {
