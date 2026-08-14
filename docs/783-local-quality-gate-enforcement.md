@@ -47,6 +47,23 @@ a committed `hooks/` dir + `git config core.hooksPath hooks` + a one-line instal
 (`scripts/install-hooks.sh`, idempotent) so both machines get it. An escape hatch
 `GATE_SKIP=1 git push` exists for deliberate WIP pushes (loud warning), never the default.
 
+**It reads the push first (2026-08-14).** As first written the hook gated every push,
+so nine commits of Markdown spent a full clippy + release-test + 7-game run proving
+that documentation had not broken the emulator. A gate belongs to a change, not to an
+operation. The hook now resolves each pushed ref from stdin
+(`<local-ref> <local-sha> <remote-ref> <remote-sha>`), collects the changed paths, and
+skips when **every** one of them is inert.
+
+The test is a whitelist of inert files — `.md`, `.txt`, images, `LICENSE`, `THANKS.md`,
+`.gitignore` — and **not** a blacklist of code. Anything unrecognised runs the gate: a
+new file type, a `Cargo.toml`, a build script, a vendored `.cpp`, an unresolvable range,
+an empty stdin. Guessing wrong that way costs a build; guessing wrong the other way
+ships a red push. A branch deletion carries no files and is marked as such, so deleting
+one branch while pushing code to another still gates on the code.
+
+`GATE_DRYRUN=1 git push` prints the decision and the files behind it without running
+anything.
+
 ### 783.3 — mandatory-green before the pin
 The 771.6 version-pin (TRX64 tag + SHA → `runtime/TRX64_VERSION`) runs `gate.sh`
 first; **no tag/SHA is pinned on a red gate** ("freeze only a green state").
