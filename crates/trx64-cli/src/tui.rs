@@ -343,8 +343,20 @@ fn run_loop(term: &mut Term, engine: &Engine, to_main: &Sender<UiToMain>) -> io:
     let mut last_state = Instant::now();
 
     loop {
-        // Refresh the live panel snapshot ~20 Hz (cheap dispatch read).
-        if last_state.elapsed() >= Duration::from_millis(50) {
+        // Refresh the live panel snapshot ~20 Hz.
+        //
+        // BUG-044 — this must NEVER make a keystroke wait. `snapshot()` is an RPC that
+        // takes the daemon's state lock, and since the capture cadence became 1 (Spec
+        // 808's 60-second window) the pump holds that lock 50 times a second doing a full
+        // checkpoint, plus auto-persist and the recorder feed. Input then arrives late and
+        // an Enter appears to do nothing until the third or eighth try.
+        //
+        // The panel is DISPLAY. A frame of stale machine state is invisible; a swallowed
+        // keystroke is not. So: drain the input queue FIRST, and only refresh the panel
+        // when nothing is waiting. Same rule as everywhere else today — the client renders
+        // what it last heard and never blocks on the machine to do it.
+        let input_waiting = event::poll(Duration::from_millis(0)).unwrap_or(false);
+        if !input_waiting && last_state.elapsed() >= Duration::from_millis(50) {
             cp.snap = engine.snapshot();
             last_state = Instant::now();
         }

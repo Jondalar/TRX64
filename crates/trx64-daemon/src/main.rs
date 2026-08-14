@@ -8474,6 +8474,11 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             // never filled at all and every transport verb answered "the ring is empty".
             // Whoever pumps the machine also feeds the ring; there is no third place
             // that could.
+            // BUG-044 — the per-frame background work runs AFTER the advance and is
+            // skipped when another caller is waiting, so a busy pump cannot starve the
+            // cockpit's input. At cadence 1 this block is a full checkpoint 50 times a
+            // second; before Spec 808 it was twice. A missed capture is one anchor in a
+            // 3000-anchor ring; a missed keystroke is a cockpit that looks broken.
             {
                 // The daemon's stream loop hosts the per-frame background work
                 // (streaming.rs ~397): cart write-back, disk write-back, the checkpoint
