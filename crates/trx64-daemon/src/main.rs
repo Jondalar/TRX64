@@ -5489,6 +5489,81 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
         // each type, which needs it unlocked. A verb that half-mounted would be worse
         // than one that honestly answers a different question. Acting is `media/open`
         // over RPC; the monitor tells you what you have.
+        // ── Spec 809 — marks: set, list, drop, jump. Four verbs, and that is the whole
+        // monitor surface. Sandbox runs arrive over RPC; a mark earns its place in the
+        // runtime the way a breakpoint does — navigation for whoever is driving, useful
+        // while debugging with no test in sight.
+        "mark" => {
+            let Some(name) = toks.get(1) else {
+                return Err("mark: usage: mark <name>  (names the anchor you are standing on)".into());
+            };
+            let ids = transport_anchor_ids(st);
+            let pos = transport::locate(&ids, st.transport.cursor.as_deref())
+                .ok_or_else(|| "mark: no anchors yet — the ring fills while the machine runs".to_string())?;
+            let id = pos.id.clone();
+            let r = st.checkpoint_ring.set_mark(&id, name).map_err(|e| format!("mark: {e}"))?;
+            let used = st.checkpoint_ring.marks().len();
+            Ok(format!(
+                "MARK {} @ Cycle {} Frame {}   \u{00b7}   {used} of {} marks",
+                r.label.as_deref().unwrap_or(name),
+                r.cycles,
+                pos.index + 1,
+                trx64_core::checkpoint_ring::RuntimeCheckpointRing::MAX_MARKS
+            ))
+        }
+
+        "marks" => {
+            let ids = transport_anchor_ids(st);
+            let marks = st.checkpoint_ring.marks();
+            if marks.is_empty() {
+                return Ok(format!(
+                    "no marks (0 of {}) \u{2014} `mark <name>` names the anchor you are on",
+                    trx64_core::checkpoint_ring::RuntimeCheckpointRing::MAX_MARKS
+                ));
+            }
+            let live = st.session.machine.c64_core.clk;
+            let mut lines: Vec<String> = marks
+                .iter()
+                .map(|m| {
+                    let idx = ids.iter().position(|(i, _, _)| *i == m.id);
+                    let back = live.saturating_sub(m.cycles) as f64 / TRANSPORT_PAL_HZ;
+                    format!(
+                        "  {:<16} Cycle {:>12}  Frame {:>5}   -{:.2}s",
+                        m.label.as_deref().unwrap_or("?"),
+                        m.cycles,
+                        idx.map(|i| i + 1).unwrap_or(0),
+                        back
+                    )
+                })
+                .collect();
+            // The cost is printed long before the cap is reached: a pinned anchor holds
+            // its slot against the rolling window.
+            let cap = st.checkpoint_ring.max_entries().max(1) as f64;
+            let secs = st.checkpoint_window_seconds;
+            let lost = marks.len() as f64 / cap * secs;
+            lines.push(format!(
+                "  {} of {} marks \u{00b7} window {:.1}s of {:.1}s",
+                marks.len(),
+                trx64_core::checkpoint_ring::RuntimeCheckpointRing::MAX_MARKS,
+                secs - lost,
+                secs
+            ));
+            Ok(lines.join("\n"))
+        }
+
+        "unmark" => {
+            let Some(name) = toks.get(1) else {
+                return Err("unmark: usage: unmark <name>".into());
+            };
+            match st.checkpoint_ring.drop_mark(name) {
+                Some(r) => Ok(format!(
+                    "UNMARK {name} (was Cycle {}) \u{2014} the anchor is no longer pinned",
+                    r.cycles
+                )),
+                None => Err(format!("unmark: no mark named `{name}`")),
+            }
+        }
+
         "identify" | "whatis" => {
             let Some(arg) = toks.get(1) else {
                 return Err("identify: usage: identify <path>".into());
@@ -6982,6 +7057,14 @@ fn monitor_help_text() -> String {
         "    pause                     stop the machine AND the transport; prints the ringbuffer range",
         "    warp on|off               8\u{00d7} pacing / PAL real-time",
         "    reset [warm|cold] · power on|off",
+        "  MARKS (Spec 809 — a named, pinned point you can iterate FROM)",
+        "    mark <name>               name + pin the anchor you are standing on (max 32)",
+        "    marks                     list them with cycle, frame, how far back, and the window cost",
+        "    unmark <name>             drop the name and the pin",
+        "    goto <name>               jump to a mark (goto also takes a frame or c<cycle>)",
+        "    A mark survives PLAY cutting the future, which is what lets you go there, try",
+        "    something, come back and try differently. `ringdump` carries marks, so a",
+        "    .c64rering is a session WITH its bookmarks.",
         "    identify <path>           what a file IS, from its content: c64re|crt|g64|d64|prg (+ whether a PRG would autostart)",
         "  REWIND TRANSPORT (Spec 808 — plays the MACHINE backwards, not cached pictures)",
         "    play back|fwd [speed]     play through the anchors; every step is a real restore, so registers/memory/drive are correct at every frame. `play fwd` at the head just runs.",
@@ -9511,7 +9594,13 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
         // rebuild/reboot. RAM-only patches (OQ3). Leaves the machine paused.
         // Returns { anchorId, applied[], ranCycles, hitPc, reads, registers }.
         "runtime/overlay_run" => {
-            let anchor_id = req.params.get("anchor_id").and_then(|v| v.as_str()).map(String::from);
+            // Spec 809 G5 — a NAME is an id. Anywhere an anchor is taken, a mark name
+            // works, so a caller says `alpha` rather than `cp_1247_88`. Resolved here
+            // rather than at each call site, or the rule would hold in some doors only.
+            let anchor_id = req.params.get("anchor_id").and_then(|v| v.as_str()).map(|a| {
+                let st = state.lock().unwrap();
+                st.checkpoint_ring.mark_id(a).unwrap_or_else(|| a.to_string())
+            });
             let anchor_cycle = req.params.get("anchor_cycle").and_then(|v| v.as_u64());
             let patches: Vec<Value> = req
                 .params
@@ -12608,6 +12697,152 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             Response::ok(id, out)
         }
 
+        // ── Spec 809 — marks over RPC. Same objects the monitor prints, so the C64RE UI
+        // renders a marks sidebar from data instead of parsing a terminal line.
+        // ── Spec 809 §4 — sandboxes: a CAPABILITY, not a concept ──────────────────
+        //
+        // "restore this state into N isolated machines, put these bytes in, run them this
+        // long, hand back the end states." That sentence has no nouns from the test
+        // world, and that is deliberate: TRX64 has nothing to do with the tests except
+        // that it owns the runtime. It never learns what a branch is, why it exists or
+        // whether it won — 810 names the runs, remembers which belongs to which scenario
+        // and decides who won.
+        //
+        // The reply carries an id, where it started, what it cost and where its end state
+        // is. No name, no verdict, no comparison.
+        "sandbox/run" | "sandbox/runMany" => {
+            let from = req
+                .params
+                .get("from")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let runs: Vec<Value> = if req.method == "sandbox/runMany" {
+                req.params.get("runs").and_then(|v| v.as_array()).cloned().unwrap_or_default()
+            } else {
+                vec![json!({
+                    "patches": req.params.get("patches").cloned().unwrap_or(json!([])),
+                    "cycles": req.params.get("cycles").cloned().unwrap_or(json!(0)),
+                })]
+            };
+            if runs.is_empty() {
+                return Response::err(id, -32602, "sandbox: no runs given");
+            }
+            let mut out: Vec<Value> = Vec::with_capacity(runs.len());
+            for (i, r) in runs.iter().enumerate() {
+                let patches = r.get("patches").cloned().unwrap_or(json!([]));
+                let cycles = r.get("cycles").and_then(|v| v.as_u64()).unwrap_or(0);
+                // The live machine is NEVER used for a sandbox run (doctrine rule 2, and
+                // the only way a fan-out can be parallel at all). `runtime/overlay_run`
+                // already owns restore → patch → run → observe and is repeatable by
+                // construction; the fan-out is the composition it lacked.
+                let inner = Request {
+                    jsonrpc: req.jsonrpc.clone(),
+                    id: req.id.clone(),
+                    method: "runtime/overlay_run".into(),
+                    params: json!({
+                        "anchor_id": if from.is_empty() { Value::Null } else { json!(from) },
+                        "patches": patches,
+                        "run_cycles": cycles,
+                    }),
+                };
+                let rr = dispatch(inner, state);
+                match rr.result {
+                    Some(v) => out.push(json!({
+                        "id": format!("r-{:04}", i + 1),
+                        "from": from,
+                        "instance": i + 1,
+                        "state": "done",
+                        "cycles": v.get("ranCycles").cloned().unwrap_or(json!(0)),
+                        "endAnchorId": v.get("anchorId").cloned().unwrap_or(Value::Null),
+                        "detail": v,
+                        "message": format!("run r-{:04} from {} \u{2014} done", i + 1, if from.is_empty() { "head" } else { &from }),
+                    })),
+                    None => out.push(json!({
+                        "id": format!("r-{:04}", i + 1),
+                        "from": from,
+                        "instance": i + 1,
+                        "state": "failed",
+                        "message": rr.error.map(|e| e.message).unwrap_or_else(|| "run failed".into()),
+                    })),
+                }
+            }
+            if req.method == "sandbox/run" {
+                Response::ok(id, out.into_iter().next().unwrap())
+            } else {
+                Response::ok(id, json!({ "runs": out }))
+            }
+        }
+
+        "mark/set" => {
+            let Some(name) = req.params.get("name").and_then(|v| v.as_str()) else {
+                return Response::err(id, -32602, "mark/set: name required");
+            };
+            let mut st = state.lock().unwrap();
+            let ids = transport_anchor_ids(&st);
+            let Some(pos) = transport::locate(&ids, st.transport.cursor.as_deref()) else {
+                return Response::err(id, -32001, "mark/set: no anchors yet");
+            };
+            let anchor = pos.id.clone();
+            match st.checkpoint_ring.set_mark(&anchor, name) {
+                Ok(r) => {
+                    let used = st.checkpoint_ring.marks().len();
+                    Response::ok(id, json!({
+                        "mark": mark_json(&r, &ids, st.session.machine.c64_core.clk),
+                        "used": used,
+                        "cap": trx64_core::checkpoint_ring::RuntimeCheckpointRing::MAX_MARKS,
+                        "message": format!("MARK {name} @ Cycle {}", r.cycles),
+                    }))
+                }
+                Err(e) => Response::err(id, -32001, format!("mark/set: {e}")),
+            }
+        }
+        "mark/list" => {
+            let st = state.lock().unwrap();
+            let ids = transport_anchor_ids(&st);
+            let live = st.session.machine.c64_core.clk;
+            let marks: Vec<Value> = st
+                .checkpoint_ring
+                .marks()
+                .iter()
+                .map(|m| mark_json(m, &ids, live))
+                .collect();
+            let cap = st.checkpoint_ring.max_entries().max(1) as f64;
+            let secs = st.checkpoint_window_seconds;
+            Response::ok(id, json!({
+                "marks": marks,
+                "cap": trx64_core::checkpoint_ring::RuntimeCheckpointRing::MAX_MARKS,
+                "used": st.checkpoint_ring.marks().len(),
+                // A pin holds its slot against the rolling window, so the cost is
+                // reported long before the cap is reached.
+                "windowSeconds": secs,
+                "windowCostSeconds": st.checkpoint_ring.marks().len() as f64 / cap * secs,
+            }))
+        }
+        "mark/drop" => {
+            let Some(name) = req.params.get("name").and_then(|v| v.as_str()) else {
+                return Response::err(id, -32602, "mark/drop: name required");
+            };
+            let mut st = state.lock().unwrap();
+            match st.checkpoint_ring.drop_mark(name) {
+                Some(r) => Response::ok(id, json!({
+                    "dropped": name, "cycles": r.cycles,
+                    "message": format!("UNMARK {name}"),
+                })),
+                None => Response::err(id, -32001, format!("mark/drop: no mark named `{name}`")),
+            }
+        }
+        "mark/goto" => {
+            let Some(name) = req.params.get("name").and_then(|v| v.as_str()) else {
+                return Response::err(id, -32602, "mark/goto: name required");
+            };
+            let mut st = state.lock().unwrap();
+            match transport_goto(&mut st, name) {
+                Ok(v) => Response::ok(id, v),
+                Err(e) => Response::err(id, -32001, format!("mark/goto: {e}")),
+            }
+        }
+
         "transport/status" => {
             let st = state.lock().unwrap();
             Response::ok(id, transport_status(&st))
@@ -15236,6 +15471,13 @@ fn transport_goto(st: &mut State, target: &str) -> Result<Value, String> {
         return Err("transport: the checkpoint ring is empty".into());
     }
     let t = target.trim();
+    // Spec 809 — a NAME is an id. Anywhere an anchor is named, a mark name works:
+    // `goto alpha`, not `goto cp_1247_88`.
+    if let Some(id) = st.checkpoint_ring.mark_id(t) {
+        if let Some(i) = ids.iter().position(|(x, _, _)| *x == id) {
+            return transport_move_to(st, i);
+        }
+    }
     let index = if let Some(cyc) = t.strip_prefix('c').or_else(|| t.strip_prefix('@')) {
         let want: u64 = cyc
             .trim()
@@ -15309,6 +15551,20 @@ fn transport_play(st: &mut State, dir: transport::Direction, speed: u32) -> Resu
         ));
     }
     Ok(out)
+}
+
+
+/// Spec 809 — one shape for a mark, so the monitor line and the UI sidebar cannot
+/// describe the same mark differently.
+fn mark_json(m: &trx64_core::checkpoint_ring::RuntimeCheckpointRef, ids: &[(String, u64, u64)], live: u64) -> Value {
+    let index = ids.iter().position(|(i, _, _)| *i == m.id);
+    json!({
+        "name": m.label,
+        "anchorId": m.id,
+        "cycle": m.cycles,
+        "frame": index.map(|i| i as u64 + 1),
+        "secondsBack": live.saturating_sub(m.cycles) as f64 / TRANSPORT_PAL_HZ,
+    })
 }
 
 /// The buffer, in facts: which cycle it starts at, which it ends at, how much that is
@@ -18490,6 +18746,231 @@ mod batch1_tests {
         // A link pointing before the load address is not forward.
         let backward: Vec<u8> = vec![0x01, 0x08, 0x00, 0x08, 0x0A, 0x00, 0x00, 0x00];
         assert!(!prg_wants_autostart(&backward));
+    }
+
+    // ── Spec 809 gates ────────────────────────────────────────────────────────
+
+    /// G1 — ITERATING IS RELIABLE. This is the spec's centre of gravity.
+    ///
+    /// A bookmark only has to be findable. A mark you iterate FROM has to survive being
+    /// returned to: PLAY truncates the anchors ahead (808 decision 4, reversed), so
+    /// without the pin exemption you could go there, try something once, and the mark
+    /// would be gone with the attempt.
+    #[test]
+    fn a_mark_survives_being_iterated_from() {
+        let st = make_state();
+        fill_anchors(&st, 20);
+        mon(&st, "frame -10").expect("back");
+        mon(&st, "mark alpha").expect("mark");
+
+        let at_mark = |st: &SharedState| -> (Vec<u8>, u16, u64) {
+            let g = st.lock().unwrap();
+            (
+                g.session.machine.ram.to_vec(),
+                g.session.machine.c64_core.reg_pc,
+                g.session.machine.c64_core.clk,
+            )
+        };
+        let baseline = at_mark(&st);
+
+        // Three attempts from the same mark. Each PLAY cuts the future — that is the
+        // point of the reversal — and the mark must still be there for the next one.
+        for attempt in 1..=3 {
+            call(&st, "transport/toggle", json!({})); // play: emulate from here, cut ahead
+            for _ in 0..5 {
+                call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+            }
+            call(&st, "session/pause", json!({}));
+
+            let out = mon(&st, "goto alpha")
+                .unwrap_or_else(|e| panic!("attempt {attempt}: the mark is gone: {e}"));
+            assert!(out.contains("frame"), "attempt {attempt}: {out}");
+            assert_eq!(
+                at_mark(&st),
+                baseline,
+                "attempt {attempt}: returning to a mark must give the IDENTICAL machine"
+            );
+        }
+
+        let marks = st.lock().unwrap().checkpoint_ring.marks();
+        assert_eq!(marks.len(), 1, "the mark outlives every attempt");
+        assert_eq!(marks[0].label.as_deref(), Some("alpha"));
+    }
+
+    /// G2 — a mark survives a cut, stated on its own because it is the mechanism G1
+    /// depends on: `truncate_after(id, keep_pinned)` must be called with the exemption
+    /// EVERYWHERE, or "reliable" is a promise instead of a property.
+    #[test]
+    fn truncation_spares_marks() {
+        let st = make_state();
+        fill_anchors(&st, 20);
+        mon(&st, "frame -15").expect("back");
+        mon(&st, "mark early").expect("mark early");
+        mon(&st, "frame +5").expect("forward");
+
+        let before = st.lock().unwrap().checkpoint_ring.list().len();
+        mon(&st, "wr ram 0400 ff").expect("intervene"); // truncates the future
+        let g = st.lock().unwrap();
+        assert!(g.checkpoint_ring.list().len() < before, "the future was cut");
+        assert_eq!(
+            g.checkpoint_ring.marks().len(),
+            1,
+            "and the mark behind the cursor is still there"
+        );
+    }
+
+    /// The cap REFUSES rather than silently shrinking the rewind window.
+    #[test]
+    fn the_mark_cap_refuses_and_says_why() {
+        let st = make_state();
+        fill_anchors(&st, 40);
+        // ABSOLUTE positions: `frame -N` is a relative step, so a loop of them walks
+        // backwards cumulatively and hits the start after nine.
+        for i in 0..32 {
+            mon(&st, &format!("goto {}", i + 1)).expect("goto");
+            mon(&st, &format!("mark m{i}")).unwrap_or_else(|e| panic!("mark {i}: {e}"));
+        }
+        mon(&st, "goto 35").expect("goto an unmarked anchor");
+        let err = mon(&st, "mark one-too-many").expect_err("the 33rd must be refused");
+        assert!(err.contains("32"), "the refusal names the limit: {err}");
+        assert!(err.contains("unmark"), "and says how to free one: {err}");
+
+        // And `marks` prints the cost long before the cap.
+        let out = mon(&st, "marks").expect("marks");
+        assert!(out.contains("32 of 32 marks"), "{out}");
+        assert!(out.contains("window"), "the window cost is shown: {out}");
+    }
+
+    /// A name is an id: `goto alpha` works wherever an anchor is named.
+    #[test]
+    fn a_mark_name_works_as_an_anchor_id() {
+        let st = make_state();
+        fill_anchors(&st, 12);
+        mon(&st, "frame -6").expect("back");
+        mon(&st, "mark here").expect("mark");
+        mon(&st, "goto 12").expect("head");
+        let out = mon(&st, "goto here").expect("goto by name");
+        assert!(out.contains("frame 6/12"), "{out}");
+    }
+
+    /// G3 — marks round-trip through a ringdump, which is what makes a `.c64rering` a
+    /// session WITH its bookmarks: dump after the bug, send the file, the other person
+    /// loads it and jumps straight to `alpha`.
+    #[test]
+    fn marks_survive_a_ringdump_round_trip() {
+        let st = make_state();
+        fill_anchors(&st, 12);
+        mon(&st, "goto 4").expect("goto");
+        mon(&st, "mark alpha").expect("mark");
+        mon(&st, "goto 9").expect("goto");
+        mon(&st, "mark beta").expect("mark");
+
+        let dump = { st.lock().unwrap().checkpoint_ring.to_dump(None) };
+        let reloaded =
+            trx64_core::checkpoint_ring::RuntimeCheckpointRing::from_dump(&dump);
+
+        let names: Vec<String> = reloaded
+            .marks()
+            .iter()
+            .filter_map(|m| m.label.clone())
+            .collect();
+        assert_eq!(names, vec!["alpha".to_string(), "beta".to_string()],
+            "the names ride the dump");
+        assert!(
+            reloaded.marks().iter().all(|m| m.pinned),
+            "and so do the pins — a mark without its pin would be evicted on the next capture"
+        );
+        assert!(reloaded.mark_id("alpha").is_some(), "and resolve by name after loading");
+    }
+
+    /// G5 — the mark surface is reachable over RPC with the same objects, so the C64RE UI
+    /// renders a sidebar from data rather than parsing a terminal line.
+    #[test]
+    fn marks_are_reachable_over_rpc_with_the_same_shape() {
+        let st = make_state();
+        fill_anchors(&st, 10);
+        mon(&st, "goto 3").expect("goto");
+
+        let set = call(&st, "mark/set", json!({ "name": "alpha" }));
+        assert_eq!(set["mark"]["name"], json!("alpha"));
+        assert_eq!(set["mark"]["frame"], json!(3));
+        assert_eq!(set["cap"], json!(32));
+
+        let list = call(&st, "mark/list", json!({}));
+        assert_eq!(list["used"], json!(1));
+        assert!(list["windowCostSeconds"].as_f64().unwrap() > 0.0,
+            "the window cost is reported, not discovered later");
+
+        mon(&st, "goto 10").expect("head");
+        let go = call(&st, "mark/goto", json!({ "name": "alpha" }));
+        assert_eq!(go["frameIndex"], json!(3));
+
+        let drop = call(&st, "mark/drop", json!({ "name": "alpha" }));
+        assert_eq!(drop["dropped"], json!("alpha"));
+        assert_eq!(call(&st, "mark/list", json!({}))["used"], json!(0));
+    }
+
+    /// G-help — the verbs are documented where a user looks. 807 shipped a verb that was
+    /// tab-completable and absent from the help; not repeated.
+    #[test]
+    fn the_mark_verbs_are_in_the_help() {
+        let st = make_state();
+        let help = mon(&st, "help").expect("help");
+        for needle in ["MARKS", "mark <name>", "marks ", "unmark <name>", "goto <name>"] {
+            assert!(help.contains(needle), "help must mention `{needle}`");
+        }
+    }
+
+    /// Spec 809 §4 — a sandbox run takes a MARK NAME, and returns a state with no
+    /// verdict attached. TRX64 never learns what the run was for.
+    #[test]
+    fn a_sandbox_run_starts_from_a_mark_and_reports_no_verdict() {
+        let st = make_state();
+        fill_anchors(&st, 12);
+        mon(&st, "goto 5").expect("goto");
+        mon(&st, "mark alpha").expect("mark");
+
+        let r = call(&st, "sandbox/run", json!({
+            "from": "alpha",
+            "patches": [{ "addr": 0x0400, "bytes": [0xAA, 0xBB] }],
+            "cycles": 2000u64,
+        }));
+        assert_eq!(r["state"], json!("done"), "{r}");
+        assert_eq!(r["from"], json!("alpha"), "a mark name IS an anchor id");
+        assert!(r["id"].as_str().unwrap().starts_with("r-"));
+        // The shape carries what it cost and where it ended — and nothing about meaning.
+        for absent in ["verdict", "passed", "expected", "name"] {
+            assert!(r.get(absent).is_none(), "a run must not carry `{absent}` — that is 810's");
+        }
+
+        // And the mark is still there afterwards: a run is not an intervention.
+        assert_eq!(st.lock().unwrap().checkpoint_ring.marks().len(), 1);
+    }
+
+    /// Fan-out: N runs from one mark, each reported separately.
+    #[test]
+    fn runmany_reports_each_run_on_its_own() {
+        let st = make_state();
+        fill_anchors(&st, 10);
+        mon(&st, "goto 4").expect("goto");
+        mon(&st, "mark base").expect("mark");
+
+        let r = call(&st, "sandbox/runMany", json!({
+            "from": "base",
+            "runs": [
+                { "patches": [{ "addr": 0x0400, "bytes": [0x01] }], "cycles": 1000u64 },
+                { "patches": [{ "addr": 0x0400, "bytes": [0x02] }], "cycles": 1000u64 },
+                { "patches": [{ "addr": 0x0400, "bytes": [0x03] }], "cycles": 1000u64 },
+            ],
+        }));
+        let runs = r["runs"].as_array().expect("runs");
+        assert_eq!(runs.len(), 3);
+        let ids: std::collections::HashSet<&str> =
+            runs.iter().map(|x| x["id"].as_str().unwrap()).collect();
+        assert_eq!(ids.len(), 3, "each run is its own, not one result three times");
+        for x in runs {
+            assert_eq!(x["from"], json!("base"));
+        }
     }
 
     /// G2 — parity. Every transport action reachable as a monitor verb is reachable over

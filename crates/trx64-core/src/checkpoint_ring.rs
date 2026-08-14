@@ -103,6 +103,13 @@ const POOLED_BLOB_SLOTS: [&str; 4] =
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeCheckpointRef {
     pub id: String,
+    /// Spec 809 — a human name for this anchor, or `None`.
+    ///
+    /// An id like `cp_1247_88` is not something a person returns to. A mark is a NAME on
+    /// an anchor plus a pin, and the pin is what makes it survive: PLAY truncates the
+    /// anchors ahead (808 decision 4, reversed), so without the exemption you could
+    /// iterate from a mark exactly once.
+    pub label: Option<String>,
     /// Controller frame counter at capture.
     pub frame: u64,
     /// CPU cycle count at capture.
@@ -121,6 +128,7 @@ impl RuntimeCheckpointRef {
     pub fn to_json(&self) -> Value {
         serde_json::json!({
             "id": self.id,
+            "label": self.label,
             "frame": self.frame,
             "cycles": self.cycles,
             "pinned": self.pinned,
@@ -335,6 +343,82 @@ impl RuntimeCheckpointRing {
         self.max_entries
     }
 
+    /// Spec 809 — how many marks may exist. 32, and the cap REFUSES.
+    ///
+    /// Not thrift: 32 pins against 3000 anchors costs about a fifth of a second of
+    /// window. The reason is the failure mode. A pin is exempt from eviction, so
+    /// unlimited marks let the rewind window shrink SILENTLY, and you find out when a
+    /// rewind comes up short and looks broken rather than short. A refusal you read beats
+    /// a degradation you discover.
+    pub const MAX_MARKS: usize = 32;
+
+    /// Name + pin the anchor `id`. Returns the updated ref, or why not.
+    pub fn set_mark(&mut self, id: &str, name: &str) -> Result<RuntimeCheckpointRef, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("a mark needs a name".into());
+        }
+        if let Some(other) = self
+            .entries
+            .iter()
+            .find(|e| e.r.label.as_deref() == Some(name) && e.r.id != id)
+        {
+            return Err(format!(
+                "`{name}` is already a mark (frame {}, cyc {}) — drop it first or pick another name",
+                other.r.frame, other.r.cycles
+            ));
+        }
+        let used = self.marks().len();
+        let already = self
+            .entries
+            .iter()
+            .any(|e| e.r.id == id && e.r.label.is_some());
+        if used >= Self::MAX_MARKS && !already {
+            return Err(format!(
+                "{used} marks is the limit ({}) — a pinned anchor holds its slot against \
+                 the rolling window, so unlimited marks would shrink the rewind window \
+                 without saying so. `unmark <name>` to free one",
+                Self::MAX_MARKS
+            ));
+        }
+        let e = self
+            .entries
+            .iter_mut()
+            .find(|e| e.r.id == id)
+            .ok_or_else(|| format!("no anchor {id}"))?;
+        e.r.label = Some(name.to_string());
+        e.r.pinned = true;
+        Ok(e.r.clone())
+    }
+
+    /// Drop a mark by name: the label and the pin both go.
+    pub fn drop_mark(&mut self, name: &str) -> Option<RuntimeCheckpointRef> {
+        let e = self
+            .entries
+            .iter_mut()
+            .find(|e| e.r.label.as_deref() == Some(name))?;
+        e.r.label = None;
+        e.r.pinned = false;
+        Some(e.r.clone())
+    }
+
+    /// Every marked anchor, oldest first.
+    pub fn marks(&self) -> Vec<RuntimeCheckpointRef> {
+        self.entries
+            .iter()
+            .filter(|e| e.r.label.is_some())
+            .map(|e| e.r.clone())
+            .collect()
+    }
+
+    /// Resolve a mark name to its anchor id.
+    pub fn mark_id(&self, name: &str) -> Option<String> {
+        self.entries
+            .iter()
+            .find(|e| e.r.label.as_deref() == Some(name))
+            .map(|e| e.r.id.clone())
+    }
+
     /// The current live-entry cap.
     pub fn max_entries(&self) -> u64 {
         self.max_entries
@@ -450,6 +534,7 @@ impl RuntimeCheckpointRing {
         self.seq += 1;
         let r = RuntimeCheckpointRef {
             id,
+            label: None,
             frame,
             cycles,
             pinned: false,
@@ -629,6 +714,7 @@ impl RuntimeCheckpointRing {
             .iter()
             .map(|e| CheckpointAnchorDump {
                 id: e.r.id.clone(),
+                label: e.r.label.clone(),
                 frame: e.r.frame,
                 cycles: e.r.cycles,
                 pinned: e.r.pinned,
@@ -697,6 +783,7 @@ impl RuntimeCheckpointRing {
             ring.entries.push(RingEntry {
                 r: RuntimeCheckpointRef {
                     id: a.id.clone(),
+                    label: a.label.clone(),
                     frame: a.frame,
                     cycles: a.cycles,
                     pinned: a.pinned,
@@ -760,6 +847,11 @@ impl Default for RuntimeCheckpointRing {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointAnchorDump {
     pub id: String,
+    /// Spec 809 — the mark's name rides the dump, so a `.c64rering` is a session WITH
+    /// its bookmarks: dump after the bug, send the file, the other person loads it and
+    /// jumps straight to `alpha`.
+    #[serde(default)]
+    pub label: Option<String>,
     pub frame: u64,
     pub cycles: u64,
     pub pinned: bool,
