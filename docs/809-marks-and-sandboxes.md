@@ -1,6 +1,7 @@
 # Spec 809 — Marks and sandboxes: a fixed point, and N machines from it
 
-**Status:** PROPOSED
+**Status:** PARTLY BUILT — marks (§3) and the sandbox capability (§4) shipped with all
+their gates. Open: copy-on-write media folders per run (§4) and multi-line assembly (§5).
 **Repos:** TRX64 only. The goals, the acceptance and the BDD layer are **810** in C64RE —
 this spec knows nothing about what "correct" means.
 **Number:** 809 (shared board `C64ReverseEngineeringMCP/specs/README.md`).
