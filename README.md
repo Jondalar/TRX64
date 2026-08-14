@@ -1,18 +1,25 @@
 # TRX64
 
 A headless, cycle-accurate Commodore 64 + 1541 runtime. Snapshot the machine, rewind it,
-step backwards, and ask a live trace who wrote an address — over JSON-RPC, in a terminal,
-or embedded.
+step backwards, and ask a live trace who wrote an address.
+
+**One daemon, one API, N front ends.** Headless and API-first: every capability is a
+JSON-RPC method, so a script or an LLM agent drives it as completely as a person does. One
+machine per process, shared by every client connected to it.
+
+Humans get front ends on top: **`trx64cli`**, a terminal cockpit with a native emulator
+window that links the runtime in-process, and
+**[C64RE](https://github.com/Jondalar/C64ReverseEngineeringMCP)**, a reverse-engineering
+workbench in the browser that talks to the daemon over the socket. Same verbs either way.
 
 It runs real scene software: multi-stage cracks, custom fastloaders, EasyFlash carts.
 
 ![The trx64cli cockpit and the emulator window](docs/img/cockpit.png)
 
-*`trx64cli` — terminal cockpit, native emulator window, no daemon.*
+*`trx64cli` — terminal cockpit, native emulator window, standalone.*
 
-**Sibling project:** [C64RE](https://github.com/Jondalar/C64ReverseEngineeringMCP) is the
-reverse-engineering workbench; TRX64 is the runtime it drives. Capability lives here,
-meaning and memory live there. Either works without the other.
+C64RE is the sibling project: capability lives here, meaning and memory live there. Either
+works without the other.
 
 ![The C64RE workbench driving TRX64](docs/img/c64re-workbench.png)
 
