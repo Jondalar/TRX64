@@ -413,18 +413,19 @@ impl Engine {
     }
 
     fn verb_warp(&self, sub: Option<&str>) -> CmdResult {
-        // Events, not local flags. Pacing is machine state and belongs to the daemon, or
-        // the two front-ends would each pace independently.
+        // BUG-040 — the cockpit `/warp` runs the DAEMON's `warp` verb, so both
+        // front-ends execute one implementation and print one wording. The `/` prefix is
+        // input sugar; the verb behind it is shared.
         match sub.map(|s| s.to_ascii_lowercase()).as_deref() {
             Some("on") => {
-                let _ = self.rpc("session/warp", json!({ "on": true }));
+                let r = self.verb_monitor("warp on");
                 let _ = self.rpc("session/set_pacing", json!({ "mode": "warp", "ratio": 8.0 }));
-                CmdResult::text("WARP ON (8×).")
+                r
             }
             Some("off") | None => {
-                let _ = self.rpc("session/warp", json!({ "on": false }));
+                let r = self.verb_monitor("warp off");
                 let _ = self.rpc("session/set_pacing", json!({ "mode": "pal", "ratio": 1.0 }));
-                CmdResult::text("WARP OFF (PAL real-time).")
+                r
             }
             Some(other) => CmdResult::text(format!("warp: unknown '{other}' (use on|off)")),
         }

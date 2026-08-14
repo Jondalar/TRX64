@@ -5449,9 +5449,51 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             Ok(transport_reply(&out))
         }
 
+        // BUG-040 — `pause` means ONE thing on every surface: stop the machine AND stop
+        // the transport. It used to be the transport pause only (Spec 808), so the same
+        // word stopped a replay here and the machine in the cockpit's `/pause`. A word
+        // that means two things depending on where you type it is worse than a missing
+        // verb, because nothing tells you which one you got.
         "pause" => {
-            let out = transport_pause(st);
-            Ok(transport_reply(&out))
+            st.play_intent = false;
+            st.transport.playing = None;
+            st.audio_epoch = st.audio_epoch.wrapping_add(1);
+            let pc = st.session.machine.c64_core.reg_pc;
+            let cycles = st.session.machine.clk;
+            st.ctrl_stop = Some(CtrlStop { reason: "pause", pc, cycles });
+            let v = transport_status(st);
+            Ok(format!(
+                "PAUSE @ PC=${pc:04X}.\n{}",
+                v["range"].as_str().unwrap_or("")
+            ))
+        }
+
+        // BUG-040 — the machine-state verbs live HERE, so both front-ends have them.
+        // `run`, `warp`, `mount` and `eject` existed only as cockpit `/verbs`, which the
+        // daemon never sees — so the C64RE monitor answered `unknown command: /pause` and
+        // had no way to resume a machine at all.
+        "run" => {
+            st.play_intent = true;
+            st.ctrl_stop = None;
+            if st.transport.holds_the_machine() {
+                transport_truncate_on_intervention(st);
+            }
+            st.audio_epoch = st.audio_epoch.wrapping_add(1);
+            Ok("RUN \u{2014} free-running.".to_string())
+        }
+
+        "warp" => {
+            match toks.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
+                Some("on") => {
+                    st.warp = true;
+                    Ok("WARP ON (8\u{00d7}).".to_string())
+                }
+                Some("off") | None => {
+                    st.warp = false;
+                    Ok("WARP OFF (PAL real-time).".to_string())
+                }
+                Some(other) => Err(format!("warp: unknown '{other}' (use on|off)")),
+            }
         }
 
         "frame" => {
@@ -6908,6 +6950,11 @@ fn monitor_help_text() -> String {
         "    traprules <path> | traprules [clear]   load/list/clear project on-trap dump rules (JSON {pc,label,dump:[[name,addr,len]],decode}); auto-emits `label: name=$XX (decode)` on reaching that PC (JAM / breakpoint)",
         "    revdepth [seconds]        report / set the always-on reverse-ring depth: rebuilds the delta+cpuhistory rings (DISCARDS history; future capture only; 1..=600s). TRX64_REVERSE_SECONDS = boot default",
         "    diff <idA> <idB>          typed by-ID diff of two checkpoint anchors (RAM runs + per-chip register changes). READ-ONLY (live machine unchanged). ids from `checkpoint/list`",
+        "  MACHINE (the same verbs on every front-end — the cockpit\'s `/` prefix is input sugar)",
+        "    run                       resume the machine (from a rewound point: cuts the anchors ahead)",
+        "    pause                     stop the machine AND the transport; prints the ringbuffer range",
+        "    warp on|off               8\u{00d7} pacing / PAL real-time",
+        "    reset [warm|cold] · power on|off      (mount/eject: see BUG-041, folded in there)",
         "  REWIND TRANSPORT (Spec 808 — plays the MACHINE backwards, not cached pictures)",
         "    play back|fwd [speed]     play through the anchors; every step is a real restore, so registers/memory/drive are correct at every frame. `play fwd` at the head just runs.",
         "    pause                     stop where you are — the machine IS there, no second step needed",
@@ -18114,6 +18161,51 @@ mod batch1_tests {
         assert_eq!(g.checkpoint_ring.list().len(), 12, "20 - 8 dropped");
         assert!(!g.transport.holds_the_machine(), "the machine is live again");
         assert!(g.play_intent, "and it is running");
+    }
+
+    /// BUG-040 — the machine-state verbs exist in the DAEMON, so both front-ends have
+    /// them. `/pause` answered `unknown command` in the C64RE monitor because the `/`
+    /// prefix is a cockpit convention the daemon never sees, and `run`/`warp` had no
+    /// daemon verb at all — so that front-end could not resume a machine.
+    ///
+    /// And `pause` means ONE thing now. It used to be the Spec 808 transport pause here
+    /// while the cockpit's `/pause` stopped the machine: same word, two meanings, two
+    /// surfaces, and nothing telling you which one you got.
+    #[test]
+    fn machine_verbs_exist_in_the_daemon_and_pause_means_one_thing() {
+        let st = make_state();
+        call(&st, "session/power", json!({ "op": "on" }));
+        for _ in 0..4 {
+            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+        }
+
+        // `pause` stops BOTH the machine and the transport, and reports the buffer.
+        mon(&st, "play back").expect("play back");
+        let out = mon(&st, "pause").expect("pause");
+        assert!(out.contains("PAUSE @ PC="), "{out}");
+        assert!(out.contains("RINGBUFFER SIZE"), "pause prints the range: {out}");
+        {
+            let g = st.lock().unwrap();
+            assert!(!g.play_intent, "pause must stop the MACHINE");
+            assert!(g.transport.playing.is_none(), "and the transport");
+        }
+
+        // `run` resumes it — the verb that did not exist here at all.
+        let out = mon(&st, "run").expect("run");
+        assert!(out.contains("RUN"), "{out}");
+        assert!(st.lock().unwrap().play_intent, "run must set the run intent");
+
+        // `warp` is daemon state now, not a client atomic.
+        mon(&st, "warp on").expect("warp on");
+        assert!(st.lock().unwrap().warp);
+        mon(&st, "warp off").expect("warp off");
+        assert!(!st.lock().unwrap().warp);
+
+        // And they are documented where a user looks.
+        let help = mon(&st, "help").expect("help");
+        for needle in ["MACHINE", "run ", "pause ", "warp on|off"] {
+            assert!(help.contains(needle), "help must mention `{needle}`");
+        }
     }
 
     /// G2 — parity. Every transport action reachable as a monitor verb is reachable over
