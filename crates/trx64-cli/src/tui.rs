@@ -688,6 +688,12 @@ fn autocomplete(cp: &mut Cockpit, engine: &Engine) {
         }
     }
     cp.cursor = cp.line_char_len();
+    // BUG-043 — completing DETACHES the line from history, exactly as typing a character,
+    // backspace and delete already do. Without this, a line recalled with Up and then
+    // Tab-completed stays attached: the next Up/Down silently replaces what you edited
+    // with the history entry, so you see the line you meant and the buffer holds the one
+    // you recalled. `/mount .../map_s1.d64` on screen, `map_s2.d64` executed.
+    cp.hist_idx = None;
 }
 
 /// Pure verb completion. Returns the (possibly completed) line and the candidate lines
@@ -2180,4 +2186,42 @@ monitor (VICE-superset):
         assert_eq!(d_col, g_col, "d description must align to the verb-row desc column");
         assert_eq!(bk_col, g_col, "bk description must align to the verb-row desc column");
     }
+    /// BUG-043 — every path that REWRITES the input line must detach it from history.
+    ///
+    /// Typing, backspace and delete each clear `hist_idx`, with the comment "editing a
+    /// recalled line detaches it". `autocomplete` did not. So a line recalled with Up and
+    /// then Tab-completed stayed attached, and the next Up/Down silently replaced what had
+    /// been edited with the history entry: the screen shows the line you meant and the
+    /// buffer holds the one you recalled. Reported as `/mount .../map_s1.d64` typed and
+    /// `map_s2.d64` executed, three times running.
+    ///
+    /// Checked at the SOURCE because that is where the invariant can break: the next
+    /// editing verb someone adds will forget it for exactly the reason Tab did, and a
+    /// behavioural test would only cover the paths that already exist.
+    #[test]
+    fn every_line_rewriting_path_detaches_from_history() {
+        let src = include_str!("tui.rs");
+        // `autocomplete` is the one that regressed; pin it explicitly.
+        let auto = src
+            .split("fn autocomplete(")
+            .nth(1)
+            .expect("autocomplete exists");
+        let body = &auto[..auto.find("\n}\n").expect("autocomplete body")];
+        assert!(
+            body.contains("hist_idx = None"),
+            "autocomplete rewrites the line, so it must detach it from history — \
+             without this an arrow key afterwards discards the edit silently"
+        );
+
+        // And the three that were already right stay right.
+        for path in ["cp.insert_char(c);", "cp.backspace();", "cp.delete_at();"] {
+            let at = src.find(path).unwrap_or_else(|| panic!("{path} still exists"));
+            let after = &src[at..(at + 200).min(src.len())];
+            assert!(
+                after.contains("hist_idx = None"),
+                "`{path}` must be followed by detaching the line from history"
+            );
+        }
+    }
+
 }
