@@ -1,4 +1,4 @@
-# Spec 809 — Marks and branches: a fixed point you can iterate from
+# Spec 809 — Marks and sandboxes: a fixed point, and N machines from it
 
 **Status:** PROPOSED
 **Repos:** TRX64 only. The goals, the acceptance and the BDD layer are **810** in C64RE —
@@ -13,8 +13,10 @@ instances), 794 (whitebox component-diff), 796 (candidate patch-sets).
 >   geprüft werden sollen
 > - TRX64 stellt dann Sandboxes n-mal, um die einzelnen Bäume abzuarbeiten
 
-809 is the first and third bullets. The middle one — *what* is checked and what the goal
-is — is 810.
+809 is the first and third bullets, and **only the capability in them**. TRX64 has nothing
+to do with the tests except that it owns the runtime: it offers a named point and N isolated
+machines from it, and never learns what a branch is, why it exists or whether it won. The
+middle bullet — and the naming, the bookkeeping and the verdict — is 810.
 
 ---
 
@@ -40,11 +42,12 @@ existing pieces are used rather than re-derived.
    from Alpha", and an id that means nothing is not something a human returns to.
 2. **A mark that survives being returned to.** See §2 — this is the requirement that makes
    it a mark rather than a bookmark, and it is not free.
-3. **Branches as a first-class thing.** `overlay_run` runs ONE patch-set once. "Try these
-   four from Alpha and give me the four end states" is composition nobody owns yet.
-4. **Source in, bytes out.** Only one line at a time exists. A branch is a patch, a patch
-   is usually a few instructions, and typing them one at a time through `a` is not a loop
-   anybody will run twice.
+3. **Fan-out.** `overlay_run` runs ONE patch-set once, on the live machine. "Give me four
+   isolated machines from Alpha, these bytes in each, and the four end states" is
+   composition nobody owns yet.
+4. **Source in, bytes out.** Only one line at a time exists. A patch is usually a few
+   instructions, and typing them one at a time through `a` is not a loop anybody will run
+   twice.
 
 ## §2 The requirement that shapes everything: iterating must be reliable
 
@@ -70,12 +73,18 @@ each run lands on an identical state, and the mark is still there afterwards.
 
 ## §3 Marks
 
+**The monitor surface is exactly four verbs** — set, list, drop, jump. Nothing about
+sandboxes or scenarios is typed by a human here; that is C64RE's, over RPC.
+
 ```
 mark <name>              name + pin the anchor the transport is standing on
 marks                    list: name · cycle · frame · how far back · pinned-cost
 unmark <name>            drop the name and the pin
 goto <name>              jump there (the verb already takes a frame or a cycle)
 ```
+
+A mark earns its place in the runtime the same way a breakpoint does: it is a navigation
+aid for whoever is driving, useful while debugging with no test in sight.
 
 - `label: Option<String>` on `RuntimeCheckpointRef` and in the ring dump format.
 - **`ringdump` carries them.** The dump already round-trips `pinned` per anchor; adding the
@@ -89,56 +98,62 @@ the 60-second window rolls past it. Twenty marks is nothing against 3000 anchors
 hundred silently shrinks the rewind window. `marks` reports the cost, and the cap is 32 —
 see §8.
 
-## §4 Branches
+## §4 Sandboxes — a capability, not a concept
+
+**TRX64 has nothing to do with the tests, except that it owns the runtime and therefore the
+capability.** The first draft of this section got that wrong: it had branches as named,
+declared objects with a lifecycle and a registry, and a `run-all` over "every branch on this
+mark". That is scenario vocabulary. It would have made TRX64 know what a branch *is*, why it
+exists and whether it won — none of which is its business.
+
+What it offers instead is one sentence with no nouns from that world:
+
+> restore this state into N isolated machines, put these bytes in, run them this long, hand
+> back the end states
 
 ```
-branch <name> from <mark>      declare a branch: a patch-set applied at a mark
-branch patch <name> ...        add to it (RAM, or a cart bank — 795)
-branch run <name> [cycles]     one scratch instance, run, return the end state
-branch run-all <mark>          every branch on that mark, in parallel (787)
-branch diff <a> <b>            794 verdict between two branch outcomes
+sandbox/run { from, patches[], cycles }        -> one end state
+sandbox/runMany { from, runs: [{patches[], cycles}] }  -> N end states, in parallel
 ```
 
-A branch is **a mark plus a patch-set plus a run budget**. 796's candidate store is that
-object already; what it lacks is the binding to a *named* point and the fan-out.
+- `from` is a mark name or an anchor id.
+- `patches` are address+bytes (RAM, or a cart bank — 795).
+- The reply is a state reference plus what it cost. **No name, no verdict, no comparison.**
 
-**Fan-out uses 787's scratch instances.** The concept doc has it: *"N scenarios in PARALLEL
-= N scratch instances (Spec 787: 1 live + N scratch)"*. The live machine is never used for
-a branch run — doctrine rule 2, and also the only way `run-all` can be parallel at all.
+One call, no lifecycle, no registry. C64RE names the runs, remembers which belongs to which
+scenario, decides what to compare and who won. It calls this N times, or once with N.
 
-**A branch that writes media writes into its OWN folder.** Copy-on-write, created lazily —
-the folder appears the first time a branch actually dirties something, and a branch that
-only reads never makes one.
+**Fan-out is 787's scratch instances.** The concept doc: *"N scenarios in PARALLEL = N
+scratch instances (Spec 787: 1 live + N scratch)"*. The live machine is never used for a
+sandbox run — doctrine rule 2, and the only way the fan-out can be parallel at all.
+
+**A sandbox that writes media writes into its OWN folder.** Copy-on-write, created lazily —
+the folder appears the first time a run actually dirties something, and a run that only
+reads never makes one.
 
 ```
-<project>/branches/<mark>/<branch>/<run>/    e.g. branches/alpha/patch-dec/003/
+<project>/sandbox/<run-id>/
     game.d64        only if this run wrote to it
     cart.crt        only if this run wrote flash
 ```
 
-The originals are never touched. Four branches saving a game in parallel write four files,
-not one file four times — which is what would happen today, because TRX64 mounts everything
-writable and persists dirty tracks straight into the ORIGINAL image (that behaviour is a
-known defect, and this is the shape that contains it).
+The originals are never touched. Four runs saving a game in parallel write four files, not
+one file four times — which is what would happen today, because TRX64 mounts everything
+writable and persists dirty tracks straight into the ORIGINAL image (a known defect, and
+this is the shape that contains it).
 
-The alternative — show branches the media read-only — was rejected for a specific reason:
-it fails SILENTLY. A branch testing the save routine would run green because its write went
-nowhere, and a green run that proved nothing is worse than no run.
+The alternative — show sandboxes read-only media — was rejected because it fails SILENTLY.
+A run exercising the save routine would come back clean because its write went nowhere, and
+a clean result that proved nothing is worse than none.
 
-Half of this exists: `savecrt` writes a cart image out and `undump` reads a whole machine
-back, so the cartridge side already has its mechanism. What 809 adds is the same for the
-1541 medium, plus the folder convention that keeps runs apart.
-
-**And a winner ships its folder.** If branch 3 wins and its correctness involved a written
-disk, that disk is part of the answer — 797's build-ready delta is incomplete without it.
-
-**Provenance is not optional.** When branch 3 wins, it must be derivable *which* mark,
-*which* patch-set and *which* source produced it. 796 stores the patch-set and 797 turns it
-into a build-ready delta; the chain exists and only needs the mark on its front.
+Half of it exists: `savecrt` writes a cart image out and `undump` reads a whole machine
+back, so the cartridge side has its mechanism. 809 adds the same for the 1541 medium plus
+the folder convention that keeps runs apart. The folder is part of the run's result, so a
+caller that cares about a written disk can fetch it.
 
 ## §5 Source in, bytes out
 
-The assembler assembles **one line**. A branch is typically a handful of instructions with
+The assembler assembles **one line**. A patch is typically a handful of instructions with
 at least one label, and typing them through `a` one at a time is not a loop anyone runs
 twice.
 
@@ -150,9 +165,9 @@ asm-file <path>          the same from a file
 - Multi-line, labels, `.byte`/`.word`, `*=`/`.org`. Two passes: collect labels, then emit.
 - Documented NMOS set only, as today. The undocumented table stays out of the assemble
   index — reading it back is `d`'s job, writing it is not v1's.
-- Output is bytes + a load address, which is exactly what `branch patch` takes.
+- Output is bytes + a load address, which is exactly what `sandbox/run` takes as a patch.
 
-**Explicitly not a build system.** No includes, no macros, no linker. If a branch needs
+**Explicitly not a build system.** No includes, no macros, no linker. If a patch needs
 that, it is a `.prg` and `bload` already exists. This is the small door: "these six
 instructions, at this address".
 
@@ -168,33 +183,34 @@ gate is how a client ends up composing messages again.
 mark/set      { name }              -> Mark
 mark/list     {}                    -> { marks: [Mark], cap, used, windowCost }
 mark/drop     { name }              -> { dropped, marks: [Mark] }
+mark/goto     { name }              -> transport status (808)
 
-branch/define { name, mark, patches[], cycles } -> Branch
-branch/patch  { name, patch }                   -> Branch
-branch/run    { name }                          -> Run
-branch/runAll { mark }                          -> { runs: [Run] }
-branch/diff   { a, b, mask? }                   -> Verdict   (794)
+sandbox/run     { from, patches[], cycles }              -> Run
+sandbox/runMany { from, runs: [{patches[], cycles}] }    -> { runs: [Run] }
 
-asm/block     { origin, source }     -> { bytes, origin, labels, errors[] }
+asm/block     { origin, source }    -> { bytes, origin, labels, errors[] }
 ```
 
 ```
 Mark  { name, anchorId, cycle, frame, secondsBack, message }
-Run   { branch, mark, instance, state: queued|running|done|failed,
-        cycles, endAnchorId, message }
+Run   { id, from, instance, state: queued|running|done|failed,
+        cycles, endAnchorId, folder?, message }
 ```
 
-Every reply carries `message` — a ready-to-print line. That is not decoration; it is the
-one rule that came out of 808, where the buffer range appeared on `/pause` and not on F11
-because two client call sites assembled the same text from different fields.
+`Run` carries no name and no verdict — an id, where it started, what it cost and where its
+end state is. Naming it, remembering it and judging it are 810's.
+
+Every reply carries `message`, a ready-to-print line. Not decoration: it is the rule that
+came out of 808, where the buffer range appeared on `/pause` and not on F11 because two
+client call sites assembled the same text from different fields.
 
 `transport/status` gains `nearestMark: { name, framesAway }` so the transport line can show
 it without a second call.
 
 ### TUI — no new panel
 
-The cockpit's panels are full and the log is where sequences belong. Marks and branches are
-sequences, so:
+The cockpit's panels are full and the log is where sequences belong. Marks are a
+sequence, so:
 
 ```
 > mark alpha
@@ -206,12 +222,16 @@ MARK alpha @ Cycle 10757570 Frame 500  (-0.4s)   ·   3 marks · window 59.9s of
   intro-end    Cycle  1204880  Frame   61   -6.5s
   3 of 32 marks · window 59.9s of 60.0
 
-> branch run-all alpha
-  patch-dec     running   inst 2
-  patch-nop     running   inst 3
-  patch-jsr     done      inst 4   240000 cyc
-  patch-lda     failed    inst 5   JAM @ $8514
-  4 branches from alpha · 1 done · 1 failed · 2 running
+```
+
+Sandbox runs are not typed here at all — they arrive over RPC from C64RE. If a human wants
+to see what is running, that is a status read, not a control surface:
+
+```
+> sandboxes
+  r-0041  from alpha  running  inst 2
+  r-0042  from alpha  done     inst 3   240000 cyc
+  2 runs · 1 live machine + 2 scratch
 ```
 
 The transport line gains the nearest mark, because while scrubbing the useful question is
@@ -225,14 +245,17 @@ The transport line gains the nearest mark, because while scrubbing the useful qu
 have to be kept live — which means polling, which means the client asking questions it does
 not need to ask. A mark list is read when you ask for it.
 
-**And the C64RE UI gets the same objects**, which is the point of the RPC being designed
-rather than gated: a marks sidebar and a branch grid are the natural rendering there, and
-they need no endpoint the TUI does not already use.
+**And the C64RE UI gets the same objects**, which is the point of designing the RPC rather
+than gating it: a marks sidebar and a run grid are the natural rendering there, and they
+need no endpoint the TUI does not already use.
 
 ## §6 What 809 does NOT do
 
-- **No goals, no assertions, no acceptance.** A branch run returns a state and a diff. What
-  "correct" means is 810, in C64RE. TRX64 must not learn the word "expected".
+- **No goals, no assertions, no acceptance.** A sandbox run returns a state and what it
+  cost. What "correct" means is 810, in C64RE. TRX64 must not learn the word "expected".
+- **No branches.** A branch is a named thing that belongs to a scenario and can win. That
+  is 810's object. TRX64 takes bytes and a budget and hands back a state; it does not know
+  the run had a purpose.
 - **No exclusion mask policy.** 794 has the mechanism. WHICH fields are legitimately allowed
   to move (cycle counters, raster position, TOD) belongs to the criterion, i.e. 810 — or
   every test would carry its own mask and no two would be comparable.
@@ -251,10 +274,10 @@ they need no endpoint the TUI does not already use.
 - **G5 — a name is an id.** Every door that takes an anchor id takes a mark name.
 - **G6 — the assembler round-trips.** Assemble a block, disassemble it with `d`, get the
   source back for the documented set. Labels resolve forwards and backwards.
-- **G7 — fan-out isolates.** `run-all` with N branches touches the live machine not at all:
+- **G7 — fan-out isolates.** `runMany` with N runs touches the live machine not at all:
   its cycle count and state are identical before and after.
-- **G7b — and it isolates the FILES.** Run N branches that each write the disk; afterwards
-  the original image is byte-identical to before, and each branch's folder holds its own
+- **G7b — and it isolates the FILES.** Run N sandboxes that each write the disk; afterwards
+  the original image is byte-identical to before, and each run's folder holds its own
   divergent copy. Asserted with a real write, not by reading the mount flags — the flags
   said read-write and everyone believed the comment instead.
 - **G8 — board + the client-owns-no-state gate** stay green.
