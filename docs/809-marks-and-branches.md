@@ -86,8 +86,8 @@ goto <name>              jump there (the verb already takes a frame or a cycle)
 
 **A pin costs window.** A pinned anchor is exempt from eviction, so it holds its slot while
 the 60-second window rolls past it. Twenty marks is nothing against 3000 anchors; two
-hundred silently shrinks the rewind window. `marks` reports the cost, and there is a cap —
-see the refinement question in §7.
+hundred silently shrinks the rewind window. `marks` reports the cost, and the cap is 32 —
+see §8.
 
 ## §4 Branches
 
