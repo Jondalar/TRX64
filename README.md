@@ -6,9 +6,17 @@ or embedded.
 
 It runs real scene software: multi-stage cracks, custom fastloaders, EasyFlash carts.
 
+![The trx64cli cockpit and the emulator window](docs/img/cockpit.png)
+
+*`trx64cli` — terminal cockpit, native emulator window, no daemon.*
+
 **Sibling project:** [C64RE](https://github.com/Jondalar/C64ReverseEngineeringMCP) is the
 reverse-engineering workbench; TRX64 is the runtime it drives. Capability lives here,
 meaning and memory live there. Either works without the other.
+
+![The C64RE workbench driving TRX64](docs/img/c64re-workbench.png)
+
+*The same machine through C64RE — live CPU, VIC, SID, drive and cart panels.*
 
 ---
 
