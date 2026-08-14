@@ -16,8 +16,8 @@
 # Windows is green as of 2026-08-10 — it needed a shim for reSID's gcc-only branch hints
 # (see crates/trx64-core/resid_msvc_prelude.h), and the bundled DuckDB turned out to
 # compile under MSVC untouched. Linux joins in the same pass, built in a container to pin
-# its glibc floor (see the matrix entry). That completes the three desktop targets, and
-# makes the Linux half of scripts/build-cli-dist.sh redundant.
+# its glibc floor (see the matrix entry). All three desktop targets are covered here, so
+# there is no local cross-build to keep alongside it.
 #
 # arm64 followed for Windows and Linux once testing moved onto guests running on an Apple
 # Silicon host, where an x86_64 build does not run at all. macOS is arm64 already.
@@ -105,9 +105,7 @@ jobs:
           # least as new as the one it was linked against. Bookworm pins that floor at 2.36
           # (Debian 12, Ubuntu 22.04 and anything newer), where ubuntu-latest would raise it
           # to whatever GitHub ships this month and quietly lock out older desktops. It also
-          # keeps the floor independent of GitHub retiring runner labels, and it is the same
-          # image scripts/build-cli-dist.sh has always used for the handout builds, so this
-          # is not a new, unproven combination.
+          # keeps the floor independent of GitHub retiring runner labels.
           - os: ubuntu-latest
             target: linux-x86_64
             archive: tar.gz
