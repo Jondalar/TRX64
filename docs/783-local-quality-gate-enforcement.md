@@ -1,12 +1,15 @@
 # Spec 783 — Local Quality-Gate Enforcement (no cloud CI)
 
-**Status:** HALF BUILT (measured 2026-08-12). The gates all exist —
-`seven_game_gate.rs`, `iso_vic_gate.rs`, `vic_collision_gate.rs`, `cart_mapper_gate.rs`,
-`tools/oracle/src/conformance.ts` and 7/7 screenshot oracles. The ENFORCEMENT does not:
-`.git/hooks/` is empty and no `core.hooksPath` is set. This spec says of itself "they
-exist — this is wiring + enforcement", and the wiring is the missing half. Consequence,
-stated plainly: the regression protection that CLAUDE.md and every runtime commit point
-at holds only because someone runs `cargo test` by hand. **Repo:** TRX64.
+**Status:** BUILT (re-measured 2026-08-14). `core.hooksPath=hooks` is set and the hook
+fires on push — the 2026-08-12 reading of "gates exist, nothing enforces them" was taken
+before `scripts/install-hooks.sh` had been run on this machine. It now also decides
+whether a given push needs the gate at all (783.2 below).
+
+Worth stating because it was nearly removed on the opposite belief: **nothing else runs
+these tests.** The Gitea action on the NAS is `workflow_dispatch` and builds an image;
+the two GitHub workflows build release binaries and bump the Homebrew tap. No cloud CI
+runs `cargo test` or `gate.sh`. This hook is the only thing between a red workspace and
+`main`. **Repo:** TRX64.
 **Shared cross-repo numbering** (registry = C64RE `specs/README.md`).
 
 ## Motivation
@@ -63,12 +66,11 @@ nothing to gate" has to stay distinguishable from "we could not look" — the se
 the gate. So deleting one branch while pushing code to `main` in the same command still
 gates on the code.
 
-The test is a whitelist of inert files — `.md`, `.txt`, images, `LICENSE`, `THANKS.md`,
-`.gitignore` — and **not** a blacklist of code. Anything unrecognised runs the gate: a
-new file type, a `Cargo.toml`, a build script, a vendored `.cpp`, an unresolvable range,
-an empty stdin. Guessing wrong that way costs a build; guessing wrong the other way
-ships a red push. A branch deletion carries no files and is marked as such, so deleting
-one branch while pushing code to another still gates on the code.
+The code test is a whitelist of inert files — `.md`, `.txt`, images, `LICENSE`,
+`THANKS.md`, `.gitignore` — and **not** a blacklist of code. Anything unrecognised runs
+the gate: a new file type, a `Cargo.toml`, a build script, a vendored `.cpp`, an
+unresolvable range, an empty stdin. Guessing wrong that way costs a build; guessing
+wrong the other way ships a red push.
 
 `GATE_DRYRUN=1 git push` prints the decision and the files behind it without running
 anything.
