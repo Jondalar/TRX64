@@ -156,10 +156,15 @@ instructions, at this address".
   its cycle count and state are identical before and after.
 - **G8 — board + the client-owns-no-state gate** stay green.
 
-## §8 Open — the refinement question
+## §8 Decided in refinement
 
-**How many pins may exist, and what happens at the limit?** A pin holds its slot against a
-rolling window, so marks and rewind depth trade against each other. Options: a hard cap
-with a refusal; a soft cap that warns in `marks`; or no cap and the window is simply
-allowed to shrink with the arithmetic stated. This is the one thing in 809 that is a
-policy rather than a mechanism.
+**Marks are capped, and the cap refuses.** 32 of them; the 33rd is rejected with the
+count and the instruction to release one. Not for thrift — 32 pins against 3000 anchors
+costs about a fifth of a second of window. The reason is the failure mode: a pin is exempt
+from eviction, so unlimited marks let the rewind window shrink **silently**, and you find
+out when a rewind comes up short and looks broken. That is the exact class of defect that
+cost a full day in 808 — a bound that was real, invisible and blamed on something else.
+A refusal you read beats a degradation you discover.
+
+`marks` still prints the arithmetic (`18 marks · window 59.8s of 60.0`), so the cost is
+visible long before the cap is reached.
