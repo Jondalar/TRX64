@@ -1,18 +1,17 @@
 # TRX64
 
-A headless, cycle-accurate Commodore 64 + 1541 runtime. Snapshot the machine, rewind it,
-step backwards, and ask a live trace who wrote an address.
+A headless, cycle-accurate Commodore 64 + 1541 runtime in Rust.
 
-**One daemon, one API, N front ends.** Headless and API-first: every capability is a
+**A daemon + API, N front ends.** Headless, API-first: every capability is a
 JSON-RPC method, so a script or an LLM agent drives it as completely as a person does. One
 machine per process, shared by every client connected to it.
 
-Humans get front ends on top: **`trx64cli`**, a terminal cockpit with a native emulator
+Several user interfaces: **`trx64cli`**, a terminal cockpit with a native emulator
 window that links the runtime in-process, and
 **[C64RE](https://github.com/Jondalar/C64ReverseEngineeringMCP)**, a reverse-engineering
-workbench in the browser that talks to the daemon over the socket. Same verbs either way.
+workbench in the browser.
 
-It runs real scene software: multi-stage cracks, custom fastloaders, EasyFlash carts.
+Tested against multi-stage games, custom fastloaders and cartridges.
 
 ![The trx64cli cockpit and the emulator window](docs/img/cockpit.png)
 
@@ -23,36 +22,35 @@ works without the other.
 
 ![The C64RE workbench driving TRX64](docs/img/c64re-workbench.png)
 
-*The same machine through C64RE — live CPU, VIC, SID, drive and cart panels.*
+*C64RE — embedded via WS in the browser, live CPU, VIC, SID, drive and cart panels.*
 
 ---
 
 ## Install
 
 Binaries for macOS, Linux and Windows (x86_64 + arm64):
-**[Releases](https://github.com/Jondalar/TRX64/releases)** — each archive holds `trx64cli`
+**[Releases](https://github.com/Jondalar/TRX64/releases)** — archives hold `trx64cli`
 and `trx64-daemon`. C64 ROMs are not included; point at your own with `--rom-dir`.
 
 ```sh
 brew install jondalar/tap/trx64
 ```
 
-From source: `cargo build --release`. Builds natively on all three, MSVC included.
+From source: `cargo build --release`. Builds natively (for Windows it uses MSVC).
 
 ---
 
 ## Capabilities
 
-- **Rewind** — play the machine backwards frame by frame, stop anywhere, run on. Each
-  step restores registers, RAM, I/O and the drive.
-- **Reverse stepping** — `rstep` undoes the last instructions, byte-exact. The ring is
-  always on; nothing to arm.
-- **`whowrote <addr>`** — PC, cycle, old → new.
-- **JAM triage** — crash PC → wild jump → stack corruptor.
-- **Observers** — watch an address for exec, read or write; condition, action.
-  Indirect addressing included: `sta ($fb),y`, `lda ($f0,x)`, `jmp ($0314)`.
+- **Rewind** — play the machine backwards, stop anywhere, run on. Each
+  step restores registers, RAM, I/O and the medium
+- **Reverse stepping** — `rstep` undoes the last instructions, byte-exact
+- **`whowrote <addr>`** — PC, cycle, old → new
+- **JAM triage** — crash PC → wild jump → stack corruptor
+- **Observers** — watch an address for exec, read or write; condition, action
+  Indirect addressing included: `sta ($fb),y`, `lda ($f0,x)`, `jmp ($5000)`
 - **Traces** — CPU, drive, IEC and memory to a binary log; query as swimlanes, memory
-  maps or data-flow taint.
+  maps or data-flow taint
 - **Marks & sandboxes** — name a point, jump back to it, branch, discard.
 - **Cartridges** — EasyFlash, Ocean, Magic Desk, GMOD2/3, MegaByter. Flash and EEPROM
   writes survive a reset and a snapshot round trip.
@@ -60,11 +58,13 @@ From source: `cargo build --release`. Builds natively on all three, MSVC include
 - **Shared sessions** — one machine, several clients, human and agent at once.
 - **Snapshots** — `.c64re` full machine, `.c64rering` the reverse-debug buffers.
 
+TRX64 includes reSID, DuckDB and by default uses 300 MB RAM for 60 seconds machine ringbuffer (you can configure this, see parameters)
+
 ---
 
 ## Standalone: the CLI cockpit
 
-A complete emulator in one binary: terminal cockpit plus a native window.
+Terminal cockpit plus a native window in modern TUI style.
 
 ```sh
 trx64cli                      # cockpit
@@ -73,8 +73,10 @@ trx64cli mon "d c000"         # one-shot, prints and exits
 trx64cli disasm game.prg      # static disassembly, no machine, no ROMs
 ```
 
-Three namespaces on one command line: `/` drives the machine, `!` the filesystem, and a
-bare line goes to the monitor. Tab completes all three.
+Three namespaces on one command line: 
+`/` drives the machine
+`!` the filesystem
+bare line goes to the monitor 
 
 ```
 /power on · /reset · /run · /pause · /warp on · /mount game.d64 · /window
@@ -85,9 +87,9 @@ Details: [`crates/trx64-cli/README.md`](crates/trx64-cli/README.md).
 
 ---
 
-## Monitor
+## Monitor commands
 
-A VICE superset, ~128 verbs, on every front end. Full reference: **[MONITOR.md](MONITOR.md)**;
+Superset based on VICE, ~128 verbs. Full reference: **[MONITOR.md](MONITOR.md)**;
 `help` prints the live list.
 
 | | |
@@ -111,7 +113,7 @@ A VICE superset, ~128 verbs, on every front end. Full reference: **[MONITOR.md](
 trx64-daemon --project <dir> --port 4312 [--stream]
 ```
 
-JSON-RPC 2.0 over WebSocket. One machine per process, shared by every client.
+JSON-RPC 2.0 over WebSocket. One machine per process.
 
 ```json
 { "jsonrpc": "2.0", "id": 1, "method": "session/create", "params": { "pal": true } }
@@ -122,7 +124,7 @@ A typical flow: `session/create` → `debug/run` → `monitor/exec` / `trace/*` 
 
 `--stream` adds the per-frame driver: video, breakpoints, JAM auto-break, recorder.
 
-For embedding, `trx64-ffi` exposes a typed uniffi library (Swift bindings) —
+For embedding in the Apple universe, `trx64-ffi` exposes a typed uniffi library (Swift bindings) —
 [`crates/trx64-ffi/API.md`](crates/trx64-ffi/API.md).
 
 **Formats:** `.c64re` machine snapshot, `.c64rering` reverse-debug buffers, `.c64retrace`
@@ -134,10 +136,11 @@ trace log. VICE `.vsf` imports.
 
 This is my (dkl / Jondalar) personal emulator I developed for my own needs when
 reverse engineering C64 games. You might need different features or things -
-and you are invited to contribute code. Use issues and PRs here on GitHub please.
+and you are invited to contribute code. Use issues here on GitHub please. PRs only to contributors,
+please reach out if you want to send code.
 
-I will not answer feature requests without code / structured requirements and I
-am not able to give support.
+I will not answer feature requests without sample code / structured requirements and I
+have no capabilities to give real support.
 
 ---
 
