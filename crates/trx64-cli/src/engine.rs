@@ -689,6 +689,41 @@ pub struct StateSnapshot {
     pub transport_line: Option<String>,
     /// "back" | "fwd" | "none" — the header shows REWIND only when actually going back.
     pub transport_direction: Option<String>,
+    /// What drive 8 is DOING, from `session/state.device.drive8` — the same block
+    /// `session/drive_status` serves, carried along so the cockpit draws its whole
+    /// row from ONE snapshot instead of three RPCs (BUG-044).
+    pub drive: DriveSnapshot,
+    /// The cartridge panel, `None` when the port is empty.
+    pub cart: Option<CartSnapshot>,
+}
+
+/// Drive 8's live panel. `led_pwm` is a DUTY CYCLE over the period since the last
+/// poll (0..1000), not a level — see `Rotation::led_pwm` in the core.
+#[derive(Clone, Debug, Default)]
+pub struct DriveSnapshot {
+    pub present: bool,
+    pub led_on: bool,
+    pub led_pwm: u16,
+    pub motor_on: bool,
+    /// "read" | "write" — what the drive's read/write mode says.
+    pub rw_mode: String,
+    pub half_track: u16,
+    pub track: u16,
+    pub sector: u16,
+    pub drive_pc: u16,
+    pub dd00_pra: u8,
+    pub dd00_ddr: u8,
+    /// "kernal" | "idle" | "custom".
+    pub transfer_mode: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CartSnapshot {
+    pub mapper: String,
+    pub bank: u16,
+    /// "write" | "read" | "idle".
+    pub activity: String,
+    pub source_name: Option<String>,
 }
 
 impl StateSnapshot {
@@ -737,6 +772,56 @@ impl StateSnapshot {
             irq_vec: u(&["vectors", "irq"]) as u16,
             nmi_vec: u(&["vectors", "nmi"]) as u16,
             stop_reason: v.get("stopReason").and_then(|s| s.as_str()).map(|s| s.to_string()),
+            drive: {
+                let d = v.get("device").and_then(|d| d.get("drive8"));
+                let b = |k: &str| d.and_then(|d| d.get(k)).and_then(|x| x.as_bool()).unwrap_or(false);
+                let n = |k: &str| d.and_then(|d| d.get(k)).and_then(|x| x.as_u64()).unwrap_or(0);
+                let s = |k: &str, dflt: &str| {
+                    d.and_then(|d| d.get(k))
+                        .and_then(|x| x.as_str())
+                        .unwrap_or(dflt)
+                        .to_string()
+                };
+                DriveSnapshot {
+                    present: d.is_some(),
+                    led_on: b("ledOn"),
+                    led_pwm: n("ledPwm") as u16,
+                    motor_on: b("motorOn"),
+                    rw_mode: s("rwMode", "read"),
+                    half_track: n("halfTrack") as u16,
+                    track: n("track") as u16,
+                    sector: n("sector") as u16,
+                    drive_pc: n("drivePc") as u16,
+                    dd00_pra: d
+                        .and_then(|d| d.get("dd00"))
+                        .and_then(|x| x.get("pra"))
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0) as u8,
+                    dd00_ddr: d
+                        .and_then(|d| d.get("dd00"))
+                        .and_then(|x| x.get("ddr"))
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0) as u8,
+                    transfer_mode: s("transferMode", "-"),
+                }
+            },
+            cart: v
+                .get("device")
+                .and_then(|d| d.get("cart"))
+                .filter(|c| !c.is_null())
+                .map(|c| CartSnapshot {
+                    mapper: c.get("type").and_then(|x| x.as_str()).unwrap_or("?").to_string(),
+                    bank: c.get("bank").and_then(|x| x.as_u64()).unwrap_or(0) as u16,
+                    activity: c
+                        .get("activity")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("idle")
+                        .to_string(),
+                    source_name: c
+                        .get("sourceName")
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string()),
+                }),
         }
     }
 

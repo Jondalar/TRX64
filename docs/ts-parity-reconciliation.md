@@ -29,8 +29,10 @@ Method-set: TS 90 / TRX64 87. All findings verified against source.
 |---|---|---|---|
 | **`runtime/call`** | ❌ MISSING | UI Snapshots/Scenarios/Trace tabs call it (AgentQueryApi facade) | add dispatch → op allowlist |
 | `debug/observer_log` | ❌ | drain infra EXISTS in observers.rs, never called in run_debug_control | drain pending_log/marks/cmds after run + broadcast |
-| `session/drive_status.sector` | ❌ | hardcoded 0 (TODO) | GCR sector-under-head decoder (HIGH) |
-| `session/cart_status` write-LED | ⚠️ | no `writableGeneration`; activity never "write" | port write-pulse counter (BUG-042) |
+| `session/drive_status.sector` | ✅ | `rotation.sector_under_head()`; -1 (no header / empty track) reported as 0, as the TS does | done |
+| `session/drive_status` LED + rwMode | ✅ | was `ledOn = motorOn` and a hardcoded `"read"` — the motor keeps spinning through idle waits, so a busy drive and an idle one looked identical, and no client could see a write. Now VIA2 PB3 (`Drive1541::led_on`) with the duty cycle integrated per VICE `drive_led_update`, and `rwMode` from `rotation.read_write_mode` | done (BUG-045 follow-up) |
+| `session/state.device` | ✅ | drive + cart panels ride inside `session/state`, composed under ONE lock, so a cockpit row is one RPC rather than three (BUG-044) | done |
+| `session/cart_status` write-LED | ✅ | `writable_generation` tracked across polls; activity reaches "write" | done (BUG-042) |
 | `media/cart_persisted` broadcast | ❌ | never fired; TS auto-persists per-frame | hook persist + broadcast |
 | `session/input_status` joystick | ❌ | hardcoded released | wire to joystick model (dep Tier-1 joystick) |
 | `trace/run/start` | ❌ MISSING | definition-id trace start (vs start_domains) | add handler (reuse start_domains) |

@@ -1,9 +1,10 @@
 //! The ratatui cockpit — live panels + a command line, on a worker thread.
 //!
 //! Layout (top→bottom):
-//!   ┌ CPU ───────────┐┌ MACHINE ───────┐┌ VIC ───────────┐
-//!   │ PC A X Y SP P  ││ run/pause warp ││ raster mode bg ││   (3 side-by-side gauges)
-//!   └────────────────┘└────────────────┘└────────────────┘
+//!   ┌ CPU ────────┐┌ MACHINE ────┐┌ VIC ────────┐┌ MEDIA ──────┐
+//!   │ PC A X Y P  ││ play  warp  ││ raster mode ││ ● D8  T/S   ││ (4 side-by-side
+//!   │             ││             ││             ││ ● CART bank ││  gauges)
+//!   └─────────────┘└─────────────┘└─────────────┘└─────────────┘
 //!   ┌ FLOW / VECTORS ────────────────────────────────────┐  (one line)
 //!   ┌ OUTPUT / LOG ──────────────────────────────────────┐  (scrolling, fills)
 //!   ┌ command: > _ ──────────────────────────────────────┐  (input line)
@@ -900,13 +901,40 @@ fn draw(f: &mut Frame, cp: &Cockpit) {
     draw_input(f, rows[3], cp);
 }
 
+/// The activity LED, as a terminal has to draw it.
+///
+/// The web UI paints the drive LED with a colour AND an opacity taken from the
+/// PWM duty cycle. A terminal has no alpha, so the duty cycle maps onto the one
+/// brightness axis it does have: BOLD for lit, DIM for faint. The colours are the
+/// web UI's, kept the same on purpose — grey `#444`, motor yellow `#e0c040`, read
+/// green `#40d060`, write red `#e04040` — so the two front-ends mean the same
+/// thing by the same light.
+fn led_span(on: bool, pwm: u16, motor_on: bool, writing: bool) -> Span<'static> {
+    // Mirrors driveLedClass (InspectorPanel.tsx:95-104): below 50 the LED is dark,
+    // and a dark LED over a spinning motor is its own state — the drive is powered
+    // and turning, but it is not working.
+    let (color, modifier) = if pwm < 50 && !on {
+        if motor_on {
+            (Color::Yellow, Modifier::empty())
+        } else {
+            (Color::DarkGray, Modifier::empty())
+        }
+    } else {
+        let c = if writing { Color::Red } else { Color::Green };
+        // 700 is the web UI's own full/dim threshold.
+        (c, if pwm >= 700 { Modifier::BOLD } else { Modifier::DIM })
+    };
+    Span::styled("\u{25cf}", Style::default().fg(color).add_modifier(modifier))
+}
+
 fn draw_gauges(f: &mut Frame, area: Rect, s: &StateSnapshot) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(40),
-            Constraint::Percentage(28),
-            Constraint::Percentage(32),
+            Constraint::Percentage(30),
+            Constraint::Percentage(21),
+            Constraint::Percentage(24),
+            Constraint::Percentage(25),
         ])
         .split(area);
 
@@ -989,6 +1017,62 @@ fn draw_gauges(f: &mut Frame, area: Rect, s: &StateSnapshot) {
         ]),
     ];
     f.render_widget(panel(vic, "VIC"), cols[2]);
+
+    // MEDIA panel — the two devices, each with its LED.
+    //
+    // Split rather than "whichever is inserted": an EasyFlash session has a cart
+    // AND a drive, and hiding one of them behind the other is how you end up
+    // watching the wrong device. An absent device says so.
+    let dim = Style::default().fg(Color::DarkGray);
+    let val = Style::default().fg(Color::White);
+    let writing = s.drive.rw_mode == "write";
+
+    let mut media: Vec<Line> = Vec::with_capacity(4);
+    media.push(Line::from(vec![
+        led_span(s.drive.led_on, s.drive.led_pwm, s.drive.motor_on, writing),
+        Span::styled(" D8 ", dim),
+        Span::styled(format!("{}/{:02}", s.drive.track, s.drive.sector), val),
+        Span::styled("  ", dim),
+        Span::styled(format!("${:04X}", s.drive.drive_pc), Style::default().fg(Color::Cyan)),
+    ]));
+    media.push(Line::from(vec![
+        Span::styled("   xfer ", dim),
+        Span::styled(
+            s.drive.transfer_mode.clone(),
+            // A custom transfer is a fastloader talking; the KERNAL is the slow
+            // path; idle is the drive waiting. Worth telling apart at a glance.
+            Style::default().fg(match s.drive.transfer_mode.as_str() {
+                "custom" => Color::Magenta,
+                "kernal" => Color::White,
+                _ => Color::DarkGray,
+            }),
+        ),
+    ]));
+
+    match &s.cart {
+        Some(c) => {
+            // BUG-042 cart-LED semantics, unchanged from the web UI: a flash write
+            // is red, a mapped-and-read cart is yellow, an inserted quiet one green.
+            let (color, modifier) = match c.activity.as_str() {
+                "write" => (Color::Red, Modifier::BOLD),
+                "read" => (Color::Yellow, Modifier::empty()),
+                _ => (Color::Green, Modifier::empty()),
+            };
+            media.push(Line::from(vec![
+                Span::styled("\u{25cf}", Style::default().fg(color).add_modifier(modifier)),
+                Span::styled(" CART ", dim),
+                Span::styled(c.mapper.clone(), val),
+                Span::styled(" bk", dim),
+                Span::styled(format!("{:02}", c.bank), val),
+            ]));
+        }
+        None => media.push(Line::from(vec![
+            Span::styled("\u{25cf}", Style::default().fg(Color::DarkGray)),
+            Span::styled(" CART ", dim),
+            Span::styled("— empty —", dim),
+        ])),
+    }
+    f.render_widget(panel(media, "MEDIA"), cols[3]);
 }
 
 fn draw_flow(f: &mut Frame, area: Rect, s: &StateSnapshot) {
@@ -1377,6 +1461,33 @@ fn format_help_lines(raw: &str, width: usize) -> Vec<LogLine> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cockpit LED means what the web UI's LED means — same states, same
+    /// colours, with the duty cycle mapped onto BOLD/DIM because a terminal has
+    /// no alpha channel. If these two drift, the two front-ends describe the same
+    /// drive differently, which is the failure BUG-040 is about one layer up.
+    #[test]
+    fn the_led_says_the_same_thing_as_the_web_ui() {
+        let style = |on, pwm, motor, writing| led_span(on, pwm, motor, writing).style;
+
+        // Dark and still: grey (.wb-led.off, #444).
+        assert_eq!(style(false, 0, false, false).fg, Some(Color::DarkGray));
+
+        // Dark but SPINNING: yellow (.wb-led.motor, #e0c040) — powered and turning,
+        // and not working. This state was literally unreachable while ledPwm was
+        // derived from motorOn.
+        assert_eq!(style(false, 0, true, false).fg, Some(Color::Yellow));
+
+        // Reading: green (.wb-led.read, #40d060), bright above the web UI's own
+        // 700 threshold and dim below it.
+        assert_eq!(style(true, 1000, true, false).fg, Some(Color::Green));
+        assert!(style(true, 1000, true, false).add_modifier.contains(Modifier::BOLD));
+        assert!(style(true, 300, true, false).add_modifier.contains(Modifier::DIM));
+
+        // Writing: red (.wb-led.write, #e04040) — unreachable before, because
+        // rwMode was the hardcoded string "read".
+        assert_eq!(style(true, 1000, true, true).fg, Some(Color::Red));
+    }
 
     #[test]
     fn line_editor_cursor_insert_backspace_delete() {

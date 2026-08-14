@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
+use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, KeyCode, PhysicalKey};
@@ -99,6 +99,41 @@ pub fn main_thread_loop(engine: &Engine, rx: Receiver<UiToMain>, open_at_launch:
 /// The C64 displayed canvas is 384×272; open at 2× by default.
 const CANVAS_W: u32 = 384;
 const CANVAS_H: u32 = 272;
+
+/// The size this window should snap back to after a resize, or `None` when it is
+/// already on the canvas's aspect ratio.
+///
+/// `prev` is the size before this resize, so the axis the user actually dragged
+/// can be identified and kept: pull the window wider and it stays that wide while
+/// the height follows; pull it taller and the width follows. Without that the
+/// snap fights the drag, because correcting the "wrong" axis moves the corner the
+/// mouse is holding.
+///
+/// One pixel of slack, because integer division cannot always land exactly and a
+/// snap that is never satisfied would resize on every frame.
+fn aspect_snap(w: u32, h: u32, prev: (u32, u32)) -> Option<(u32, u32)> {
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let want_h = (w as u64 * CANVAS_H as u64 / CANVAS_W as u64) as u32;
+    if want_h.abs_diff(h) <= 1 {
+        return None; // already on the ratio
+    }
+    let dw = w.abs_diff(prev.0);
+    let dh = h.abs_diff(prev.1);
+    let (nw, nh) = if dw >= dh {
+        (w, want_h)
+    } else {
+        ((h as u64 * CANVAS_W as u64 / CANVAS_H as u64) as u32, h)
+    };
+    // Below one whole canvas there is nothing sensible to keep, and clamping a
+    // single axis would break the very ratio this exists to hold. The minimum is
+    // itself on the ratio, so snap to it whole.
+    if nw < CANVAS_W || nh < CANVAS_H {
+        return Some((CANVAS_W, CANVAS_H));
+    }
+    Some((nw, nh))
+}
 const FRAME: Duration = Duration::from_millis(20); // ~50 Hz
 
 struct App {
@@ -112,6 +147,9 @@ struct App {
     joy: JoyState,
     /// Whether a host Shift is held — drives the symbolic char mapping (Spec 310).
     shift_held: bool,
+    /// Inner size before the last resize, so the aspect snap can tell WHICH edge
+    /// the user dragged and keep that one. See `aspect_snap`.
+    last_size: (u32, u32),
 }
 
 #[derive(Default, Clone, Copy, PartialEq)]
@@ -134,6 +172,7 @@ impl App {
             next_frame: Instant::now(),
             joy: JoyState::default(),
             shift_held: false,
+            last_size: (CANVAS_W * 2, CANVAS_H * 2),
         }
     }
 
@@ -433,8 +472,24 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::KeyboardInput { event, is_synthetic, .. } => {
                 self.handle_key(&event, is_synthetic);
             }
-            WindowEvent::Resized(_) => {
+            WindowEvent::Resized(size) => {
+                // Hold the picture's shape. The blit scales x and y independently
+                // to fill the surface, so any drag that does not happen to land on
+                // 384:272 stretches the C64 — a wider window gave wider sprites.
+                //
+                // Snapping the WINDOW is the fix rather than letterboxing inside
+                // it: the window is born on the ratio (768x544), the picture fills
+                // it completely today, and it should keep doing both. No black
+                // bars, nothing to decide.
+                //
+                // winit has no aspect constraint, so this corrects after the drag
+                // instead of constraining it. The axis that moved more wins, so a
+                // horizontal drag keeps its width and a vertical drag its height.
                 if let Some(w) = &self.window {
+                    if let Some(want) = aspect_snap(size.width, size.height, self.last_size) {
+                        let _ = w.request_inner_size(PhysicalSize::new(want.0, want.1));
+                    }
+                    self.last_size = (size.width, size.height);
                     w.request_redraw();
                 }
             }
@@ -465,7 +520,7 @@ impl ApplicationHandler<UserEvent> for App {
 
 #[cfg(test)]
 mod tests {
-    use super::accepts;
+    use super::{accepts, aspect_snap, CANVAS_H, CANVAS_W};
 
     #[test]
     fn synthetic_presses_are_dropped_but_synthetic_releases_are_not() {
@@ -480,5 +535,34 @@ mod tests {
         // ...but the WM_KILLFOCUS half is the safety net that lifts keys still held when
         // focus goes away. Dropping it would leave the C64 repeating that key forever.
         assert!(accepts(true, false), "a synthetic release MUST still reach the machine");
+    }
+
+    /// The window holds the picture's shape. The blit scales x and y separately,
+    /// so a free-form drag stretched the C64 — wider window, wider sprites.
+    #[test]
+    fn resizing_holds_the_aspect_ratio() {
+        let born = (CANVAS_W * 2, CANVAS_H * 2); // 768x544, the launch size
+
+        // Already on the ratio: nothing to do, or the window would resize forever.
+        assert_eq!(aspect_snap(768, 544, born), None);
+        assert_eq!(aspect_snap(1152, 816, born), None, "3x is on the ratio too");
+
+        // Dragged WIDER: the width is what the user is holding, so it stays and
+        // the height follows.
+        assert_eq!(aspect_snap(1000, 544, born), Some((1000, 708)));
+
+        // Dragged TALLER: the height stays and the width follows. Correcting the
+        // other axis here would move the corner under the mouse.
+        assert_eq!(aspect_snap(768, 700, born), Some((988, 700)));
+
+        // Never below one whole canvas, and never by clamping ONE axis — that
+        // would break the ratio this exists to hold. Snap to the minimum whole.
+        assert_eq!(
+            aspect_snap(CANVAS_W, 40, (CANVAS_W, CANVAS_H)),
+            Some((CANVAS_W, CANVAS_H))
+        );
+
+        // A degenerate size (minimise) is not something to correct.
+        assert_eq!(aspect_snap(0, 0, born), None);
     }
 }
