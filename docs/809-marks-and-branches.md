@@ -106,6 +106,32 @@ object already; what it lacks is the binding to a *named* point and the fan-out.
 = N scratch instances (Spec 787: 1 live + N scratch)"*. The live machine is never used for
 a branch run — doctrine rule 2, and also the only way `run-all` can be parallel at all.
 
+**A branch that writes media writes into its OWN folder.** Copy-on-write, created lazily —
+the folder appears the first time a branch actually dirties something, and a branch that
+only reads never makes one.
+
+```
+<project>/branches/<mark>/<branch>/<run>/    e.g. branches/alpha/patch-dec/003/
+    game.d64        only if this run wrote to it
+    cart.crt        only if this run wrote flash
+```
+
+The originals are never touched. Four branches saving a game in parallel write four files,
+not one file four times — which is what would happen today, because TRX64 mounts everything
+writable and persists dirty tracks straight into the ORIGINAL image (that behaviour is a
+known defect, and this is the shape that contains it).
+
+The alternative — show branches the media read-only — was rejected for a specific reason:
+it fails SILENTLY. A branch testing the save routine would run green because its write went
+nowhere, and a green run that proved nothing is worse than no run.
+
+Half of this exists: `savecrt` writes a cart image out and `undump` reads a whole machine
+back, so the cartridge side already has its mechanism. What 809 adds is the same for the
+1541 medium, plus the folder convention that keeps runs apart.
+
+**And a winner ships its folder.** If branch 3 wins and its correctness involved a written
+disk, that disk is part of the answer — 797's build-ready delta is incomplete without it.
+
 **Provenance is not optional.** When branch 3 wins, it must be derivable *which* mark,
 *which* patch-set and *which* source produced it. 796 stores the patch-set and 797 turns it
 into a build-ready delta; the chain exists and only needs the mark on its front.
@@ -154,6 +180,10 @@ instructions, at this address".
   source back for the documented set. Labels resolve forwards and backwards.
 - **G7 — fan-out isolates.** `run-all` with N branches touches the live machine not at all:
   its cycle count and state are identical before and after.
+- **G7b — and it isolates the FILES.** Run N branches that each write the disk; afterwards
+  the original image is byte-identical to before, and each branch's folder holds its own
+  divergent copy. Asserted with a real write, not by reading the mount flags — the flags
+  said read-write and everyone believed the comment instead.
 - **G8 — board + the client-owns-no-state gate** stay green.
 
 ## §8 Decided in refinement
