@@ -80,6 +80,16 @@ pub struct FullScBus<'a, 'o, 'w, 'h, O: Observer> {
     /// raw read yields the same pre-increment clk). See `core_pc` for the safety
     /// argument.
     pub core_clk: *const u64,
+    /// BUG-042 — live registers of the executing core, for the `AccessCtx` handed to
+    /// `on_access`. Same disjoint-field raw-pointer pattern (and same safety argument)
+    /// as `core_pc`/`core_clk` above: the core invokes the bus synchronously and holds
+    /// no live `&mut` to its register file at the instant a bus method reads it.
+    ///
+    /// Without this an observer condition (`if a==$06`) was evaluated against a snapshot
+    /// taken once per RUN SEGMENT, so it tested the accumulator of some earlier
+    /// instruction — firing on the wrong events and missing the right ones, with output
+    /// that looked entirely normal.
+    pub core_regs: *const crate::c64_6510core::C64Core6510,
     /// Fetch-capture from `debug_maincpu` (called by the core right after the
     /// opcode + operands are fetched, BEFORE the opcode body runs). The run loop
     /// reads it back to emit the `on_instruction` CPU_STEP record with the right
@@ -157,6 +167,24 @@ impl<'a, 'o, 'w, 'h, O: Observer> FullScBus<'a, 'o, 'w, 'h, O> {
     }
 }
 
+impl<'a, 'o, 'w, 'h, O: Observer> FullScBus<'a, 'o, 'w, 'h, O> {
+    /// BUG-042 — the per-access truth for `on_access`: pc/clk as the bus records them,
+    /// registers as the core holds them at this instant.
+    #[inline]
+    fn access_ctx(&self) -> crate::AccessCtx {
+        let c = unsafe { &*self.core_regs };
+        crate::AccessCtx {
+            pc: self.pc(),
+            clk: self.clk(),
+            a: c.reg_a,
+            x: c.reg_x,
+            y: c.reg_y,
+            sp: c.reg_sp,
+            p: c.reg_p,
+        }
+    }
+}
+
 impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O> {
     /// LOAD path (mainc64cpu.c:359-363) real read. Reuses [`FullBus`]'s banked
     /// read dispatch EXACTLY, then emits the `on_bus(Read)` record (+ any chip
@@ -180,7 +208,7 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
         // None when no watchpoint armed = a single zero-cost branch.
         if let Some(w) = self.access_watch {
             if w[addr as usize] != 0 {
-                self.halt_requested |= self.obs.on_access(BusKind::Read, addr, v);
+                self.halt_requested |= { let cx = self.access_ctx(); self.obs.on_access(BusKind::Read, addr, v, cx) };
             }
         }
         v
@@ -245,7 +273,7 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
         // A hit sets halt_requested; the run loop stops at the next boundary.
         if let Some(w) = self.access_watch {
             if w[addr as usize] != 0 {
-                self.halt_requested |= self.obs.on_access(BusKind::Write, addr, value);
+                self.halt_requested |= { let cx = self.access_ctx(); self.obs.on_access(BusKind::Write, addr, value, cx) };
             }
         }
     }

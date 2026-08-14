@@ -73,6 +73,31 @@ pub use vic::VicII;
 /// Three faces, one mechanism:
 /// - [`NullSink`] — tracing off; the compiler eliminates the hooks entirely.
 /// - `FrameSink` (in `trx64-trace`) — forensic firehose → `.c64retrace`.
+/// BUG-042 — the per-access truth, handed to `on_access` at the moment of the access.
+///
+/// `on_access` used to take only `(kind, addr, value)`, so the observer registry had
+/// nowhere to get a cycle, a PC or the registers from — and read them instead from a
+/// snapshot refreshed ONCE PER RUN SEGMENT. Every event in a segment therefore carried
+/// the same `cyc`/`pc`/`a`: ~130 consecutive hits stamped `cyc=24578787 pc=$093C a=$06`.
+/// A 6502 `sta` costs at least three cycles, so that was impossible on its face.
+///
+/// The registers matter as much as the stamps, and less visibly: the same stale snapshot
+/// is what register CONDITIONS (`if a==$06`) were evaluated against, so an observer could
+/// fire on the wrong events and miss the right ones while its output looked normal.
+///
+/// These are the values AT the access: `pc`/`clk` as the bus records them, and the
+/// registers as the executing core holds them at that instant.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AccessCtx {
+    pub pc: u16,
+    pub clk: u64,
+    pub a: u8,
+    pub x: u8,
+    pub y: u8,
+    pub sp: u8,
+    pub p: u8,
+}
+
 /// - `ProbeSet` (Phase 2) — mutation-search verdicts, no firehose.
 pub trait Observer {
     /// Fired once per retired instruction (= TS `onInstructionComplete`).
@@ -106,7 +131,7 @@ pub trait Observer {
     /// OUTSIDE the core; the default returns `false` (observe only, never halt) so
     /// existing observers compile unchanged and NullSink stays zero-cost.
     #[inline]
-    fn on_access(&mut self, _kind: BusKind, _addr: u16, _value: u8) -> bool {
+    fn on_access(&mut self, _kind: BusKind, _addr: u16, _value: u8, _cx: AccessCtx) -> bool {
         false
     }
     /// Fired when the VIC observes a register write that the TS `vic` trace
@@ -180,7 +205,7 @@ impl Observer for NullSink {
     #[inline(always)]
     fn on_interrupt(&mut self, _: u16, _: u64) {}
     #[inline(always)]
-    fn on_access(&mut self, _: BusKind, _: u16, _: u8) -> bool {
+    fn on_access(&mut self, _: BusKind, _: u16, _: u8, _: AccessCtx) -> bool {
         false
     }
 }
@@ -1969,6 +1994,7 @@ impl Machine {
             {
                 let core_pc: *const u16 = &self.c64_core.reg_pc;
                 let core_clk: *const u64 = &self.c64_core.clk;
+                let core_regs: *const c64_6510core::C64Core6510 = &self.c64_core;
                 let fb = full::FullBus {
                     ram: &mut self.ram,
                     basic_rom: &self.basic_rom,
@@ -2012,6 +2038,7 @@ impl Machine {
                     delta_ring: Some(&mut self.delta_ring),
                     core_pc,
                     core_clk,
+                    core_regs,
                     fetch: None,
                     cur_op: (self.c64_core.reg_pc, 0),
                     fetched: false,

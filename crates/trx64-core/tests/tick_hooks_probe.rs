@@ -61,7 +61,7 @@ impl Observer for ProbeSink {
     fn on_interrupt(&mut self, vector: u16, clk: u64) {
         self.interrupts.push((vector, clk));
     }
-    fn on_access(&mut self, kind: BusKind, addr: u16, value: u8) -> bool {
+    fn on_access(&mut self, kind: BusKind, addr: u16, value: u8, _cx: trx64_core::AccessCtx) -> bool {
         self.accesses.push((kind, addr, value));
         if self.halt_on_write && !self.halt_fired && kind == BusKind::Write {
             self.halt_fired = true;
