@@ -2974,10 +2974,10 @@ impl<A: Observer, B: Observer> Observer for TeeObserver<'_, A, B> {
         self.a.on_interrupt(vector, clk);
         self.b.on_interrupt(vector, clk);
     }
-    fn on_access(&mut self, kind: BusKind, addr: u16, value: u8) -> bool {
+    fn on_access(&mut self, kind: BusKind, addr: u16, value: u8, cx: trx64_core::AccessCtx) -> bool {
         // Evaluate BOTH (no short-circuit) so each sink sees every access; halt if either asks.
-        let halt_a = self.a.on_access(kind, addr, value);
-        let halt_b = self.b.on_access(kind, addr, value);
+        let halt_a = self.a.on_access(kind, addr, value, cx);
+        let halt_b = self.b.on_access(kind, addr, value, cx);
         halt_a || halt_b
     }
     fn on_vic_reg(&mut self, clk: u64, raster_y: u16, kind: u8, value: u8) {

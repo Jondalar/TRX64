@@ -706,7 +706,7 @@ impl ObserverRegistry {
             if !o.enabled || o.trigger != ObsTrigger::Exec || pc < o.lo || pc > o.hi {
                 continue;
             }
-            if !self.matches(idx, pc, pc, 0) {
+            if !self.matches(idx, pc, pc, 0, None) {
                 continue;
             }
             if self.fire(idx, pc, None, None) {
@@ -724,22 +724,23 @@ impl ObserverRegistry {
     /// ts:217 — `onAccess(kind, addr, value)`. Called by the core bus hook
     /// (via the [`CoreObserver`] impl) during an instruction. Sets
     /// `halt_requested` if a break matched; honored at the NEXT boundary.
-    pub fn on_access_policy(&mut self, kind: BusKind, addr: u16, value: u8) {
+    pub fn on_access_policy(&mut self, kind: BusKind, addr: u16, value: u8, cx: trx64_core::AccessCtx) {
         let want = if kind == BusKind::Write {
             ObsTrigger::Store
         } else {
             ObsTrigger::Load
         };
-        let pc = self.env.pc;
+        // BUG-042 — this instruction's PC, not the segment's.
+        let pc = cx.pc;
         for idx in 0..self.observers.len() {
             let o = &self.observers[idx];
             if !o.enabled || o.trigger != want || addr < o.lo || addr > o.hi {
                 continue;
             }
-            if !self.matches(idx, pc, addr, value) {
+            if !self.matches(idx, pc, addr, value, Some(cx)) {
                 continue;
             }
-            if self.fire(idx, pc, Some(value), Some(addr)) {
+            if self.fire_at(idx, pc, Some(value), Some(addr), Some(cx)) {
                 self.halt_requested = true;
                 let want_str = if want == ObsTrigger::Store { "store" } else { "load" };
                 self.last_halt = Some(HaltInfo {
@@ -753,20 +754,36 @@ impl ObserverRegistry {
 
     /// ts:231 — `matches(o, pc, addr, value): boolean`. cond + ignore-count gate;
     /// bumps `hits` when it actually triggers.
-    fn matches(&mut self, idx: usize, pc: u16, addr: u16, value: u8) -> bool {
+    fn matches(
+        &mut self,
+        idx: usize,
+        pc: u16,
+        addr: u16,
+        value: u8,
+        cx: Option<trx64_core::AccessCtx>,
+    ) -> bool {
         if let Some(cond) = self.observers[idx].cond.clone() {
             let e = self.env;
+            // BUG-042 — registers come from THIS access when we have them (a bus hit);
+            // `self.env` remains the fallback for exec-trigger observers, where the
+            // segment snapshot IS the right state (the core halts before the opcode and
+            // the env is refreshed at that boundary). Raster line stays from the env:
+            // it is not part of the CPU's register file.
+            let (ra, rx, ry, rsp, rfl, rcy) = match cx {
+                Some(c) => (c.a, c.x, c.y, c.sp, c.p, c.clk),
+                None => (e.a, e.x, e.y, e.sp, e.fl, e.cy),
+            };
             let env = CondEnv {
-                a: e.a as i64,
-                x: e.x as i64,
-                y: e.y as i64,
+                a: ra as i64,
+                x: rx as i64,
+                y: ry as i64,
                 pc: (pc & 0xffff) as i64,
-                sp: e.sp as i64,
-                fl: e.fl as i64,
+                sp: rsp as i64,
+                fl: rfl as i64,
                 rl: e.rl as i64,
                 val: (value & 0xff) as i64,
                 addr: (addr & 0xffff) as i64,
-                cy: e.cy as i64,
+                cy: rcy as i64,
             };
             if eval_node(&cond, &env) == 0 {
                 return false;
@@ -784,6 +801,22 @@ impl ObserverRegistry {
     /// ts:245 — `fire(o, pc, value?, addr?): boolean`. Run the action; return
     /// true if it requests a halt (break).
     fn fire(&mut self, idx: usize, pc: u16, value: Option<u8>, addr: Option<u16>) -> bool {
+        // Exec-trigger path: the core halts BEFORE the opcode and the env is refreshed at
+        // that boundary, so the segment snapshot IS this instruction's state.
+        self.fire_at(idx, pc, value, addr, None)
+    }
+
+    /// BUG-042 — `fire` with the per-access truth. `cx` is `Some` on a bus hit, where the
+    /// segment snapshot is stale by up to a whole run segment, and `None` on the exec
+    /// path, where it is not.
+    fn fire_at(
+        &mut self,
+        idx: usize,
+        pc: u16,
+        value: Option<u8>,
+        addr: Option<u16>,
+        cx: Option<trx64_core::AccessCtx>,
+    ) -> bool {
         let action = self.observers[idx].action;
         match action {
             ObsAction::Break => true,
@@ -823,14 +856,19 @@ impl ObserverRegistry {
                     };
                     format!("{t} ${:04X}=${:02X}", addr.unwrap_or(0), value.unwrap_or(0))
                 };
+                // BUG-042 — the accumulator and cycle of THIS access, not of whatever
+                // the segment started with. These two fields are what the report saw
+                // repeating across ~130 consecutive events.
+                let a_now = cx.map(|c| c.a).unwrap_or(self.env.a);
+                let cy_now = cx.map(|c| c.clk).unwrap_or(self.env.cy);
                 let fields = match self.observers[idx].log_exprs.clone() {
-                    Some(exprs) if !exprs.is_empty() => self.render_log_exprs(&exprs, pc),
-                    _ => format!("pc=${:04X} a=${:02X}", pc, self.env.a),
+                    Some(exprs) if !exprs.is_empty() => self.render_log_exprs_at(&exprs, pc, cx),
+                    _ => format!("pc=${:04X} a=${:02X}", pc, a_now),
                 };
                 let name = self.observers[idx].name.clone();
                 self.push_log(format!(
                     "obs {name}: {where_str}  {fields} cyc={}",
-                    self.env.cy
+                    cy_now
                 ));
                 false
             }
@@ -853,16 +891,30 @@ impl ObserverRegistry {
     /// closure the caller wires when available — here we render against the
     /// snapshot registers and leave mem peeks as the byte the daemon resolves).
     fn render_log_exprs(&self, exprs: &[LogExpr], pc: u16) -> String {
+        self.render_log_exprs_at(exprs, pc, None)
+    }
+
+    /// BUG-042 — render with the per-access registers when we have them.
+    fn render_log_exprs_at(
+        &self,
+        exprs: &[LogExpr],
+        pc: u16,
+        cx: Option<trx64_core::AccessCtx>,
+    ) -> String {
         let e = self.env;
+        let (ra, rx, ry, rsp, rfl) = match cx {
+            Some(c) => (c.a, c.x, c.y, c.sp, c.p),
+            None => (e.a, e.x, e.y, e.sp, e.fl),
+        };
         exprs
             .iter()
             .map(|ex| match ex {
                 LogExpr::Reg(RegName::Pc) => format!("pc=${:04X}", pc),
-                LogExpr::Reg(RegName::A) => format!("a={:02X}", e.a),
-                LogExpr::Reg(RegName::X) => format!("x={:02X}", e.x),
-                LogExpr::Reg(RegName::Y) => format!("y={:02X}", e.y),
-                LogExpr::Reg(RegName::Sp) => format!("sp={:02X}", e.sp),
-                LogExpr::Reg(RegName::Fl) => format!("fl={:02X}", e.fl),
+                LogExpr::Reg(RegName::A) => format!("a={:02X}", ra),
+                LogExpr::Reg(RegName::X) => format!("x={:02X}", rx),
+                LogExpr::Reg(RegName::Y) => format!("y={:02X}", ry),
+                LogExpr::Reg(RegName::Sp) => format!("sp={:02X}", rsp),
+                LogExpr::Reg(RegName::Fl) => format!("fl={:02X}", rfl),
                 LogExpr::Mem { addr, word } => {
                     // Mem peeks resolved by the daemon are not available inside the
                     // registry; the daemon-rendered path is used for live logs. Here
@@ -928,10 +980,15 @@ impl CoreObserver for ObserverRegistry {
     }
     fn on_bus(&mut self, _kind: BusKind, _addr: u16, _value: u8, _pc: u16, _clk: u64, _old: u8) {}
     fn on_interrupt(&mut self, _vector: u16, _clk: u64) {}
-    fn on_access(&mut self, kind: BusKind, addr: u16, value: u8) -> bool {
+    fn on_access(&mut self, kind: BusKind, addr: u16, value: u8, cx: trx64_core::AccessCtx) -> bool {
         // The core only calls this when access_watch[addr] != 0 (the gate), so we
         // pay the policy eval ONLY on the exact watched addresses.
-        self.on_access_policy(kind, addr, value);
+        //
+        // BUG-042 — `cx` carries the pc/clk/registers OF THIS ACCESS. Before it, the
+        // policy read `self.env`, refreshed once per run SEGMENT, so every event in a
+        // segment shared one stamp and every register condition tested some earlier
+        // instruction's accumulator.
+        self.on_access_policy(kind, addr, value, cx);
         // Returning halt_requested tells the run loop to stop at the NEXT boundary.
         self.halt_requested
     }
@@ -1197,7 +1254,7 @@ mod tests {
         fn on_instruction(&mut self, _: u16, _: u8, _: u8, _: u8, _: u8, _: u8, _: u8, _: u8, _: u8, _: u64) {}
         fn on_bus(&mut self, _: BusKind, _: u16, _: u8, _: u16, _: u64, _: u8) {}
         fn on_interrupt(&mut self, _: u16, _: u64) {}
-        fn on_access(&mut self, kind: BusKind, addr: u16, _value: u8) -> bool {
+        fn on_access(&mut self, kind: BusKind, addr: u16, _value: u8, _cx: trx64_core::AccessCtx) -> bool {
             if kind == BusKind::Write && self.first_write.is_none() {
                 self.first_write = Some(addr);
             }
