@@ -22,12 +22,8 @@ and `trx64-daemon`. C64 ROMs are not included; point at your own with `--rom-dir
 brew install jondalar/tap/trx64
 ```
 
-From source: `cargo build --release`. On Windows use the **GNU** toolchain — the vendored
-reSID is GCC/Clang C++ and does not build under MSVC:
-
-```sh
-rustup default stable-x86_64-pc-windows-gnu   # + MinGW-w64 g++ on PATH
-```
+From source: `cargo build --release`. macOS, Linux and Windows all build natively —
+MSVC included; the release binaries are built that way.
 
 ---
 

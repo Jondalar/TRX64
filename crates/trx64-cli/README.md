@@ -6,8 +6,7 @@ window** (winit + cpal) to play and watch the live machine. No daemon, no WebSoc
 FFI — it links the runtime library and calls it directly. One machine, shared by the
 cockpit, the per-frame pump, and the window.
 
-It runs on macOS, Linux, and Windows (winit + cpal + ratatui are all cross-platform);
-the only build wrinkle is the vendored reSID C++, handled by the cross-build chain.
+It runs on macOS, Linux, and Windows, x86_64 and arm64.
 
 ---
 
@@ -50,23 +49,18 @@ on. `/pause` freezes it; `/run` resumes.
 
 ## Install — run it as `trx64cli`
 
-The binary is named **`trx64cli`** (no dash). Two ways to get it on your shell, all three
-OSes:
-
-**Self-compile (needs Rust)** — the simplest path:
+The binary is named **`trx64cli`** (no dash). Three ways to get it, all platforms:
 
 ```bash
-cargo install --path crates/trx64-cli
+brew install jondalar/tap/trx64
 ```
 
-`cargo install` builds in release mode and drops `trx64cli` into `~/.cargo/bin`
-(`%USERPROFILE%\.cargo\bin\trx64cli.exe` on Windows), which rustup already put on your
-`PATH`. Then run **`trx64cli`** from any shell — macOS, Linux, Windows.
+**Prebuilt** — [Releases](https://github.com/Jondalar/TRX64/releases), macOS / Linux /
+Windows, x86_64 and arm64. Unpack and put `trx64cli` on your `PATH`.
 
-**Prebuilt (no Rust)** — the maintainer cross-builds a `trx64cli` per OS (macOS arm64
-natively; Linux + Windows from the Mac via the Apple `container` chain — reSID C++
-compiles inside a Linux container) and hands the binaries out directly. Drop the one for
-your OS on your `PATH`.
+**From source** — `cargo install --path crates/trx64-cli` builds in release mode and drops
+it into `~/.cargo/bin` (`%USERPROFILE%\.cargo\bin\trx64cli.exe` on Windows), which rustup
+already put on your `PATH`.
 
 > **ROMs are not bundled.** `trx64cli` needs `resources/roms` (KERNAL/BASIC/CHARGEN +
 > 1541) — Commodore IP, never shipped in the binary or a release. Install them separately
