@@ -5,14 +5,24 @@
 # so both machines enforce it.
 #
 # IT LOOKS AT WHAT YOU ARE PUSHING FIRST. A gate belongs to a change, not to an
-# operation: pushing nine commits of Markdown used to spend a full clippy +
-# release-test + 7-game run proving that documentation had not broken the
-# emulator. Editing a README must not cost a build.
+# operation, and two questions decide it:
 #
-# The test is a whitelist of INERT files, not a blacklist of code. Anything the
-# list does not recognise runs the gate — a new file type, a Cargo.toml, a build
-# script, a vendored .cpp. Guessing wrong in that direction costs time; guessing
-# wrong in the other direction ships a red push.
+#   1. Does this push reach a PROTECTED branch? Only main is released from and
+#      consumed by anyone else. A feature branch is work in progress; making it
+#      pay for a gate taxes the wrong moment, and the merge into main gates it
+#      anyway.
+#   2. Does it carry CODE? Pushing nine commits of Markdown used to spend a full
+#      clippy + release-test + 7-game run proving that documentation had not
+#      broken the emulator.
+#
+# The code test is a whitelist of INERT files, not a blacklist of code. Anything
+# the list does not recognise runs the gate — a new file type, a Cargo.toml, a
+# build script, a vendored .cpp. Guessing wrong in that direction costs time;
+# guessing wrong in the other direction ships a red push to main.
+#
+# NOTE: nothing else runs these tests. The Gitea action on the NAS is manual and
+# builds an image; the GitHub workflows build release binaries and bump the tap.
+# This hook is the only thing standing between a red workspace and main.
 #
 # Escape hatch for a deliberate WIP push (LOUD warning, never the default):
 #   GATE_SKIP=1 git push
@@ -53,6 +63,16 @@ CHANGED=$(
       printf 'BRANCH-DELETION\n'
       continue
     fi
+    # Only a protected branch is worth gating. A tag push carries no new commits
+    # of its own, and a feature branch gates when it merges.
+    # (`if`, not `case`: a case pattern's `)` inside $( ) breaks the parser here.)
+    if [ "$_remote_ref" != "refs/heads/main" ] &&
+       [ "$_remote_ref" != "refs/heads/master" ]; then
+      # Marked, not dropped: "we looked and it does not need gating" must be
+      # distinguishable from "we could not look", which runs the gate.
+      printf 'NOT-A-PROTECTED-BRANCH\n'
+      continue
+    fi
     if [ -z "$remote_sha" ] || [ "$remote_sha" = "$ZERO" ]; then
       # New branch — no range to diff. Take every commit not already on a remote.
       for sha in $(git rev-list "$local_sha" --not --remotes 2>/dev/null); do
@@ -78,7 +98,7 @@ for f in $CHANGED; do
     *.md|*.markdown|*.txt|\
     *.png|*.jpg|*.jpeg|*.gif|*.svg|*.webp|\
     LICENSE|LICENSE.*|THANKS.md|AUTHORS.txt|.gitignore|.gitattributes|\
-    BRANCH-DELETION)
+    BRANCH-DELETION|NOT-A-PROTECTED-BRANCH)
       ;;
     *)
       NEEDS_GATE=1
@@ -89,7 +109,7 @@ done
 
 if [ "$NEEDS_GATE" = "0" ]; then
   COUNT=$(printf '%s\n' "$CHANGED" | wc -l | tr -d ' ')
-  printf '\n=== quality gate skipped — %s file(s), none of them code ===\n\n' "$COUNT" >&2
+  printf '\n=== quality gate skipped — %s file(s), no code on a protected branch ===\n\n' "$COUNT" >&2
   [ "${GATE_DRYRUN:-0}" = "1" ] && printf '%s\n' "$CHANGED" >&2
   exit 0
 fi
@@ -101,7 +121,7 @@ if [ "${GATE_DRYRUN:-0}" = "1" ]; then
       *.md|*.markdown|*.txt|\
       *.png|*.jpg|*.jpeg|*.gif|*.svg|*.webp|\
       LICENSE|LICENSE.*|THANKS.md|AUTHORS.txt|.gitignore|.gitattributes|\
-      BRANCH-DELETION) ;;
+      BRANCH-DELETION|NOT-A-PROTECTED-BRANCH) ;;
       *) printf '    %s\n' "$f" >&2 ;;
     esac
   done

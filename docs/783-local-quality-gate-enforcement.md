@@ -50,9 +50,18 @@ a committed `hooks/` dir + `git config core.hooksPath hooks` + a one-line instal
 **It reads the push first (2026-08-14).** As first written the hook gated every push,
 so nine commits of Markdown spent a full clippy + release-test + 7-game run proving
 that documentation had not broken the emulator. A gate belongs to a change, not to an
-operation. The hook now resolves each pushed ref from stdin
-(`<local-ref> <local-sha> <remote-ref> <remote-sha>`), collects the changed paths, and
-skips when **every** one of them is inert.
+operation. Two questions now decide it, per pushed ref, from stdin
+(`<local-ref> <local-sha> <remote-ref> <remote-sha>`):
+
+1. **Does it reach a protected branch?** Only `main` (or `master`) is released from and
+   consumed by anyone else. A feature branch is work in progress, and it gates when it
+   merges; a tag carries no commits of its own.
+2. **Does it carry code?** Skip when every changed path is inert.
+
+Both answers are MARKED rather than silently dropped, because "we looked and there is
+nothing to gate" has to stay distinguishable from "we could not look" — the second runs
+the gate. So deleting one branch while pushing code to `main` in the same command still
+gates on the code.
 
 The test is a whitelist of inert files — `.md`, `.txt`, images, `LICENSE`, `THANKS.md`,
 `.gitignore` — and **not** a blacklist of code. Anything unrecognised runs the gate: a
