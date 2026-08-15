@@ -232,7 +232,7 @@ The pump loop lived in the client too, so the CLIENT set the frame cadence.
    session/tick { cycles }        <- clients hand over the real time that passed
 
      transport playing  ->  step an anchor (paced by the wall clock)
-     play_intent        ->  advance the emulation
+     session.running    ->  advance the emulation
      neither            ->  nothing
 
    session/play · session/pause · session/warp · transport/toggle
@@ -252,6 +252,22 @@ the give-away phrasings ("AUTHORITY … distinct from", "reconcile the dual").
 the same functionality in both. Parity is FREE when both render the same daemon state.
 The moment a client owns something, parity becomes a thing somebody maintains by hand,
 forever, and drifts the first time nobody looks.
+
+**And it was only half done — BUG-048, 2026-08-15.** The client's flag went; the daemon
+kept a second one. `play_intent` was what the tick and the transport read, while
+`debug/run`, `debug/continue` and the `--stream` loop ran on `session.running`, and
+`session/state` reported the OR of the two. The same seam, one layer down: a machine
+started with `debug/run` and paused with F11 kept consuming cycles, and `runState` said
+"running" for a machine nobody was advancing.
+
+The comment on the field even declared the split deliberate — *"which must be false for a
+manual tick to be legal"* — while the tick, three thousand lines away, adopted the flag
+instead of refusing it. A rule stated in a doc comment and enforced nowhere is not a rule.
+
+There is ONE flag now, `session.running`. The tick's adopt block is gone; with one flag
+there is nothing to translate. The lesson generalises past this file: removing a duplicate
+from the client does not make a fact single-sourced if the server still holds two copies of
+it.
 
 ## §5 The mode indicator is load-bearing
 

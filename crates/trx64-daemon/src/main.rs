@@ -401,20 +401,16 @@ pub struct State {
     /// CLI cockpit pumps 200×/s, so counting calls recorded 200 anchors a second and a
     /// 500-anchor ring covered 2.5 seconds instead of ten.
     autocapture_cycles_since: u64,
-    /// Spec 808 rebuild — THE run intent. The daemon owns whether the machine should
-    /// advance; clients send `session/play` / `session/pause` and render what comes back.
-    ///
-    /// Before this the CLI cockpit held its own `running: AtomicBool` whose own comment
-    /// called it "the AUTHORITY … distinct from the controller's `session.running`" —
-    /// two truths about one fact, with a reconciliation hack in the pump for when they
-    /// drifted. Every state bug in 808 came out of that seam: F11 needing three presses,
-    /// the header showing PAUSE while cycles ran, `play back` doing nothing at all.
-    /// TRX64 is a daemon with N clients that must have feature parity; a client that
-    /// remembers anything about the machine has to have its memory reconciled forever.
-    ///
-    /// Distinct from `session.running`, which stays what it was: the AUTONOMOUS loop's
-    /// flag (debug/run), which must be false for a manual tick to be legal.
-    play_intent: bool,
+    // Spec 808 rebuild — THE run intent used to live here, as `play_intent`, beside
+    // `session.running`. Two fields for one fact: `session/tick` and the transport read
+    // one, `debug/run` and the --stream loop the other, and `session/state` reported
+    // their OR. Pause cleared one flag and the machine kept pumping cycles through the
+    // other, which is exactly the bug 808 set out to kill when it removed the CLI's
+    // private `running: AtomicBool`. Removing the client's copy and keeping a second one
+    // here fixed the seam a client-width and left it open a daemon-width.
+    //
+    // There is ONE flag now: `session.running`. Everything that starts the machine sets
+    // it, everything that stops the machine clears it, and `session/state` reports it.
     /// Spec 808 rebuild — daemon-owned pacing (8× budget per tick). Was a client atomic.
     warp: bool,
     /// Spec 808 — AUDIO EPOCH. Bumped by every op that makes the machine's clock
@@ -5455,7 +5451,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
         // that means two things depending on where you type it is worse than a missing
         // verb, because nothing tells you which one you got.
         "pause" => {
-            st.play_intent = false;
+            st.session.running = false;
             st.transport.playing = None;
             st.audio_epoch = st.audio_epoch.wrapping_add(1);
             let pc = st.session.machine.c64_core.reg_pc;
@@ -5473,7 +5469,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
         // daemon never sees — so the C64RE monitor answered `unknown command: /pause` and
         // had no way to resume a machine at all.
         "run" => {
-            st.play_intent = true;
+            st.session.running = true;
             st.ctrl_stop = None;
             if st.transport.holds_the_machine() {
                 transport_truncate_on_intervention(st);
@@ -8600,11 +8596,10 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             // Spec 771.2 — report the REAL run/pause state + last stop reason (was
             // hardcoded "paused", which kept the UI's seed poll permanently frozen).
             // Mirrors session/state in ws-server.ts (runState/stopReason/controlOwner).
-            // Spec 808 rebuild — the RUN INTENT is what a user calls "running", and it
-            // lives here. `session.running` is the AUTONOMOUS loop's flag, a different
-            // question; reporting that as the cockpit's RUN/PAUSE is what let a client
-            // keep its own answer and then disagree with the machine.
-            let run_state = if st.play_intent || st.session.running { "running" } else { "paused" };
+            // ONE flag, read straight. This was `play_intent || session.running` — an OR
+            // over two independently-set fields, so it answered "running" for a machine
+            // that had been paused through the other one.
+            let run_state = if st.session.running { "running" } else { "paused" };
             let stop_reason = st.ctrl_stop.as_ref().map(|s| s.reason);
             // Spec 771.2 (T1.1) — live audio is streaming when the hub is on AND running.
             let streaming = st.streaming_enabled && st.session.running;
@@ -9002,13 +8997,13 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                     st.audio_epoch = st.audio_epoch.wrapping_add(1);
                     // Powering on RUNS the machine, and a fresh machine has no past —
                     // the ring's anchors describe one that no longer exists.
-                    st.play_intent = true;
+                    st.session.running = true;
                     transport_discard_timeline(&mut st, "power on");
                 }
                 "off" => {
                     do_power_off(&mut st);
                     st.audio_epoch = st.audio_epoch.wrapping_add(1);
-                    st.play_intent = false;
+                    st.session.running = false;
                     transport_discard_timeline(&mut st, "power off");
                 }
                 _ => return Response::err(id, -32602, "session/power: op must be \"on\" or \"off\""),
@@ -10809,7 +10804,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                         // $0801 + a valid BASIC line: type RUN. This covers SYS-stub
                         // releases too — the stub IS how they are meant to start.
                         st.type_buffer.extend_from_slice(b"RUN\r");
-                        st.play_intent = true;
+                        st.session.running = true;
                         format!(
                             "LOAD {path_str} \u{2192} ${load:04X} ({} bytes), BASIC at $0801 \u{2014} RUN",
                             bytes.len() - 2
@@ -12442,7 +12437,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
         // ONE tick, ONE decision, in the ONE place that knows everything:
         //
         //     transport playing  -> step an anchor (paced by wall clock)
-        //     play_intent        -> advance the emulation
+        //     session.running    -> advance the emulation
         //     neither            -> nothing
         //
         // Clients hand over the real time elapsed and render the reply. They no longer
@@ -12451,21 +12446,10 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
         // machine.
         "session/tick" => {
             let mut st = state.lock().unwrap();
-            // ADOPT a daemon-side run intent instead of refusing it.
-            //
-            // `session.running` is the autonomous loop's flag, and several daemon ops set
-            // it as a side effect: power on, reset, a CRT mount (which power-cycles).
-            // Refusing the tick then froze the machine after every one of those — the
-            // regression the owner hit immediately.
-            //
-            // The CLI used to reconcile this by forcing the controller back to paused
-            // from OUTSIDE. That reconciliation was right; its location was not. It lives
-            // here now, where the flags do: a controller run is a RUN INTENT, so adopt it
-            // and hand the clock back to the tick loop.
-            if st.session.running {
-                st.play_intent = true;
-                st.session.running = false;
-            }
+            // There used to be an ADOPT block here: `if session.running { play_intent =
+            // true; session.running = false }`, translating the other flag into this
+            // one on every tick. With one flag there is nothing to translate — power on,
+            // reset and a CRT mount set the same field the tick reads.
             let elapsed = req
                 .params
                 .get("cycles")
@@ -12482,7 +12466,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 }));
             }
             // 2. Otherwise the machine advances — but only if someone asked it to.
-            if !st.play_intent || budget == 0 {
+            if !st.session.running || budget == 0 {
                 let v = transport_status(&st);
                 return Response::ok(id, json!({
                     "c64Cycles": 0, "transport": v, "running": false,
@@ -12503,13 +12487,13 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             // A breakpoint or JAM stops the machine — and it stops it HERE, so every
             // client learns about it from the same reply instead of inferring it.
             if st.ctrl_stop.is_some() {
-                st.play_intent = false;
+                st.session.running = false;
             }
             let v = transport_status(&st);
             Response::ok(id, json!({
                 "c64Cycles": advanced,
                 "transport": v,
-                "running": st.play_intent,
+                "running": st.session.running,
                 "cycles": st.session.machine.c64_core.clk,
                 "audioEpoch": st.audio_epoch,
             }))
@@ -12519,7 +12503,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
         // client's private run flag.
         "session/play" => {
             let mut st = state.lock().unwrap();
-            st.play_intent = true;
+            st.session.running = true;
             st.ctrl_stop = None;
             st.audio_epoch = st.audio_epoch.wrapping_add(1);
             // Spec 808 decision 4, REVERSED by the owner 2026-08-13: PLAY means the
@@ -12544,7 +12528,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
         }
         "session/pause" => {
             let mut st = state.lock().unwrap();
-            st.play_intent = false;
+            st.session.running = false;
             st.transport.playing = None;
             st.audio_epoch = st.audio_epoch.wrapping_add(1);
             let pc = st.session.machine.c64_core.reg_pc;
@@ -12570,10 +12554,10 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
         // presses to get from rewind-playing back to playing.
         "transport/toggle" => {
             let mut st = state.lock().unwrap();
-            let playing = st.play_intent || st.transport.playing.is_some();
+            let playing = st.session.running || st.transport.playing.is_some();
             st.audio_epoch = st.audio_epoch.wrapping_add(1);
             let out = if playing {
-                st.play_intent = false;
+                st.session.running = false;
                 st.transport.playing = None;
                 let pc = st.session.machine.c64_core.reg_pc;
                 let cycles = st.session.machine.clk;
@@ -12592,7 +12576,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             } else {
                 // Resuming is ALWAYS forward, and forward means the EMULATION runs
                 // from here — not a replay of the anchors ahead (owner, 2026-08-13).
-                st.play_intent = true;
+                st.session.running = true;
                 st.ctrl_stop = None;
                 let cut = if st.transport.holds_the_machine() {
                     transport_truncate_on_intervention(&mut st);
@@ -17146,7 +17130,6 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         disk_ap_done_hash: None,
         autocapture_frames_since: 0,
         autocapture_cycles_since: 0,
-        play_intent: false,
         warp: false,
         audio_epoch: 0,
         recorder_frames_since: 0,
@@ -17713,7 +17696,6 @@ mod batch1_tests {
             disk_ap_done_hash: None,
             autocapture_frames_since: 0,
             autocapture_cycles_since: 0,
-            play_intent: false,
             warp: false,
             audio_epoch: 0,
             recorder_frames_since: 0,
@@ -18732,7 +18714,82 @@ mod batch1_tests {
         let g = st.lock().unwrap();
         assert_eq!(g.checkpoint_ring.list().len(), 12, "20 - 8 dropped");
         assert!(!g.transport.holds_the_machine(), "the machine is live again");
-        assert!(g.play_intent, "and it is running");
+        assert!(g.session.running, "and it is running");
+    }
+
+    /// BUG-048 — ONE run flag. The daemon carried two, `play_intent` and
+    /// `session.running`, set and cleared by different verbs:
+    ///
+    ///   * `session/tick` and the transport advanced on `play_intent`
+    ///   * `debug/run` / `debug/continue` and the --stream loop on `session.running`
+    ///   * `session/state` reported the OR of the two
+    ///
+    /// So a machine started through one and paused through the other kept pumping
+    /// cycles, and the state said "running" for a machine nobody was advancing. Spec 808
+    /// removed the CLI's private copy of this flag for exactly this reason and left the
+    /// daemon's second copy in place.
+    ///
+    /// The test drives the machine the way the WL editor does — `debug/run`, not
+    /// `session/play` — and pauses it the way F11 does, through the transport.
+    #[test]
+    fn pause_stops_a_machine_started_by_the_debugger() {
+        let st = make_state();
+        call(&st, "session/power", json!({ "op": "on" }));
+
+        // Start it through the DEBUGGER. This used to set only `session.running`.
+        call(&st, "debug/run", json!({}));
+        assert!(st.lock().unwrap().session.running, "debug/run must start the machine");
+        assert_eq!(
+            call(&st, "session/state", json!({}))["runState"],
+            json!("running")
+        );
+
+        // Advance a few frames so "stopped" is a real change, not the start state.
+        for _ in 0..4 {
+            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+        }
+        let ran = st.lock().unwrap().session.machine.clk;
+        assert!(ran > 0, "the tick must have advanced the machine at all");
+
+        // Pause it through the TRANSPORT — F11's verb, the other flag's owner.
+        let out = call(&st, "transport/toggle", json!({}));
+        assert_eq!(out["action"], json!("pause"), "F11 on a running machine pauses it");
+        assert!(
+            !st.lock().unwrap().session.running,
+            "pause must stop the machine WHOEVER started it — this is the bug"
+        );
+
+        // And the machine must actually stand still.
+        let before = st.lock().unwrap().session.machine.clk;
+        for _ in 0..4 {
+            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+        }
+        assert_eq!(
+            st.lock().unwrap().session.machine.clk,
+            before,
+            "a paused machine must not consume cycles"
+        );
+
+        // …and say so. This was `play_intent || session.running`, so it answered
+        // "running" here.
+        assert_eq!(
+            call(&st, "session/state", json!({}))["runState"],
+            json!("paused"),
+            "runState comes from ONE flag, not an OR over two"
+        );
+
+        // The reverse direction, through the debugger's own pause verb.
+        call(&st, "session/play", json!({}));
+        assert!(st.lock().unwrap().session.running);
+        call(&st, "debug/pause", json!({}));
+        assert!(
+            !st.lock().unwrap().session.running,
+            "debug/pause must stop a machine started by session/play"
+        );
+        assert_eq!(
+            call(&st, "session/state", json!({}))["runState"],
+            json!("paused")
+        );
     }
 
     /// BUG-040 — the machine-state verbs exist in the DAEMON, so both front-ends have
@@ -18758,14 +18815,14 @@ mod batch1_tests {
         assert!(out.contains("RINGBUFFER SIZE"), "pause prints the range: {out}");
         {
             let g = st.lock().unwrap();
-            assert!(!g.play_intent, "pause must stop the MACHINE");
+            assert!(!g.session.running, "pause must stop the MACHINE");
             assert!(g.transport.playing.is_none(), "and the transport");
         }
 
         // `run` resumes it — the verb that did not exist here at all.
         let out = mon(&st, "run").expect("run");
         assert!(out.contains("RUN"), "{out}");
-        assert!(st.lock().unwrap().play_intent, "run must set the run intent");
+        assert!(st.lock().unwrap().session.running, "run must set the run intent");
 
         // `warp` is daemon state now, not a client atomic.
         mon(&st, "warp on").expect("warp on");
