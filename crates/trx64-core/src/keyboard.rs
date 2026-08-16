@@ -306,6 +306,53 @@ pub fn joystick_active_low_mask(s: &JoystickState) -> u8 {
     mask & 0xff
 }
 
+/// What CIA1 port A ($DC00) actually presents on its pins: the post-DDR latch,
+/// the keyboard back-scan, and joystick port 2 pulling bits low.
+/// VICE `c64cia1.c:337 read_ciapa` — `(val & (PRA|~DDRA)) & read_joyport_dig(JOY2)`,
+/// where `val` is the column read for whatever port B is driving (`old_pb`, itself
+/// ANDed with joystick 1).
+///
+/// This lives here, once, because it had been written out twice — in the CPU's
+/// `FullBus::io_read` and NOT in the side-effect-free `Machine::read_full`, which
+/// returned the bare CIA latch instead. The monitor therefore could not see a
+/// keypress or a joystick at all: `m dc00` answered with the last value the
+/// KERNAL wrote, and every attempt to debug input by reading $DC00 measured
+/// nothing. Reading these two registers has no side effect (unlike $DC0D), so
+/// the peek has no reason to give a different answer than the CPU gets.
+pub fn cia1_pa_pins(
+    kb: &KeyboardMatrix,
+    now: u64,
+    pra: u8,
+    ddra: u8,
+    prb: u8,
+    ddrb: u8,
+    joy1: &JoystickState,
+    joy2: &JoystickState,
+) -> u8 {
+    let pb_out = ((prb | !ddrb) & joystick_active_low_mask(joy1)) & 0xff;
+    let val = kb.read_columns_for_pb(now, pb_out);
+    ((val & ((pra | !ddra) & 0xff)) & joystick_active_low_mask(joy2)) & 0xff
+}
+
+/// What CIA1 port B ($DC01) presents: the keyboard rows for whatever port A is
+/// driving, the driven-high latch bits, and joystick port 1.
+/// VICE `c64cia1.c:425-431 read_ciapb` — `((val & (PRB|~DDRB)) | (DDRB & PRB)) & JOY1`.
+/// Same story as [`cia1_pa_pins`]: one copy, used by the CPU read and the peek.
+pub fn cia1_pb_pins(
+    kb: &KeyboardMatrix,
+    now: u64,
+    pra: u8,
+    ddra: u8,
+    prb: u8,
+    ddrb: u8,
+    joy1: &JoystickState,
+) -> u8 {
+    let pa_out = (pra | !ddra) & 0xff;
+    let val = kb.read_rows_for_pa(now, pa_out);
+    let val_out_hi = ddrb & prb;
+    (((val & ((prb | !ddrb) & 0xff)) | val_out_hi) & joystick_active_low_mask(joy1)) & 0xff
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

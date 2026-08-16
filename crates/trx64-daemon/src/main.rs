@@ -8889,14 +8889,23 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             Response::ok(id, json!({ "ok": true, "pressed": pressed, "freeRunWarning": warning }))
         }
 
-        // session/release_keys — release all held keys (ws-server.ts:1455). The TS
-        // also clears BOTH joysticks on release-all (focus-loss policy,
-        // ws-server.ts:1459-1461). Shape: TS `{ ok: true }`.
+        // session/release_keys — release all held keys (ws-server.ts:1455).
+        //
+        // BUG-049 — it used to clear BOTH joysticks too, inherited from the TS
+        // focus-loss policy (ws-server.ts:1459-1461). That policy is right for ONE
+        // client and wrong for a shared machine: the browser sends this on window
+        // blur and on every input-effect teardown, so a human alt-tabbing silently
+        // threw away a joystick the LLM was holding through `runtime_joystick`.
+        // Measured at CPU level: $DC00 went $F7 → $FF across this call.
+        //
+        // A client losing focus knows only that ITS OWN keys should go up. It knows
+        // nothing about the other client's stick, so it may not speak for it.
+        // Clearing a joystick has its own verb, `session/joystick_clear`, which
+        // takes a `port` — that is what a focus-loss handler should call for the
+        // port it drives. Shape unchanged: TS `{ ok: true }`.
         "session/release_keys" => {
             let mut st = state.lock().unwrap();
             st.session.machine.keyboard.release_keys();
-            st.session.machine.joystick1 = trx64_core::keyboard::JoystickState::default();
-            st.session.machine.joystick2 = trx64_core::keyboard::JoystickState::default();
             Response::ok(id, json!({ "ok": true }))
         }
 
@@ -18790,6 +18799,65 @@ mod batch1_tests {
             call(&st, "session/state", json!({}))["runState"],
             json!("paused")
         );
+    }
+
+    /// BUG-049 — a client's focus loss must not throw away another client's input,
+    /// and a side-effect-free read of $DC00 must show what the CPU would see.
+    ///
+    /// Reported by a user driving a shared session: `runtime_joystick` worked at the
+    /// title screen and did nothing in gameplay, while the browser UI's own
+    /// WASD→port-2 path worked in the same session at the same time. It read like the
+    /// MCP path was broken. It was not — measured end to end, the tool's own call
+    /// reaches the CPU ($FF → $F7 → $EE). What broke it was the browser sending
+    /// `session/release_keys` on window blur and on every input-effect teardown,
+    /// which cleared BOTH joysticks globally. The UI never noticed because it
+    /// re-sends its whole stick on every key event; the tool sets it once.
+    ///
+    /// The register readback that was supposed to prove it hid the evidence: $DC00
+    /// went through `cia1.peek`, the bare latch, so it showed the last value the
+    /// KERNAL wrote and never a joystick or a key.
+    #[test]
+    fn a_joystick_survives_another_clients_focus_loss_and_is_visible_to_a_peek() {
+        let st = make_state();
+        call(&st, "session/power", json!({ "op": "on" }));
+        for _ in 0..8 {
+            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+        }
+
+        let dc00 = || st.lock().unwrap().session.machine.read_full(0xdc00);
+        let idle = dc00();
+
+        // Port 2 → CIA1 PA. RIGHT is bit 3, active low.
+        call(&st, "session/joystick_set", json!({ "port": 2, "right": true, "source": "llm" }));
+        assert_eq!(
+            dc00() & 0x08,
+            0,
+            "a peek of $DC00 must show the joystick the CPU sees — it read the bare \
+             CIA latch (${idle:02x}) before, so input was invisible to the monitor"
+        );
+
+        // The browser's blur handler. It speaks for its own keys, not for a stick
+        // another client is holding.
+        call(&st, "session/release_keys", json!({}));
+        assert_eq!(
+            dc00() & 0x08,
+            0,
+            "release_keys must not clear a joystick — this is the bug: the human \
+             alt-tabs and the agent's held direction disappears"
+        );
+
+        // Clearing it has its own verb, and that one still works.
+        call(&st, "session/joystick_clear", json!({ "port": 2 }));
+        assert_ne!(dc00() & 0x08, 0, "joystick_clear port 2 must release it");
+
+        // Port 1 → CIA1 PB, and it is a separate port with a separate clear.
+        call(&st, "session/joystick_set", json!({ "port": 1, "fire": true, "source": "llm" }));
+        let dc01 = || st.lock().unwrap().session.machine.read_full(0xdc01);
+        assert_eq!(dc01() & 0x10, 0, "port 1 fire → $DC01 bit 4 low, via the peek");
+        call(&st, "session/release_keys", json!({}));
+        assert_eq!(dc01() & 0x10, 0, "and port 1 survives release_keys too");
+        call(&st, "session/joystick_clear", json!({}));
+        assert_ne!(dc01() & 0x10, 0, "joystick_clear with no port clears both");
     }
 
     /// BUG-040 — the machine-state verbs exist in the DAEMON, so both front-ends have

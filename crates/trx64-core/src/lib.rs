@@ -1530,6 +1530,33 @@ impl Machine {
     /// session/state vectors). RAM / BASIC / KERNAL / CHARGEN / IO per memconfig;
     /// I/O reads use the register PEEK (no IRQ-latch clears), color RAM low
     /// nibble + $F0 open bus. Reads $00/$01 as the latched port.
+    /// $DC00/$DC01 are PINS, not just latches — the keyboard matrix and the two
+    /// joysticks pull them low, and `cia1.peek` returns the latch alone. So a
+    /// side-effect-free read of $DC00 answered with whatever the KERNAL last wrote
+    /// while scanning, and showed neither a held key nor a joystick. Anyone
+    /// debugging input through the monitor was measuring nothing and could not tell.
+    ///
+    /// Neither register has a read side effect — that is $DC0D, the interrupt
+    /// latch, which still goes to `peek` untouched. So there is no reason for the
+    /// peek to answer differently than the CPU does, and it now calls the same
+    /// function the CPU read calls.
+    fn cia1_pin_peek(&self, addr: u16) -> u8 {
+        let pra = self.cia1.peek(0xdc00);
+        let ddra = self.cia1.peek(0xdc02);
+        let prb = self.cia1.peek(0xdc01);
+        let ddrb = self.cia1.peek(0xdc03);
+        match addr & 0xff0f {
+            0xdc00 => crate::keyboard::cia1_pa_pins(
+                &self.keyboard, self.clk, pra, ddra, prb, ddrb,
+                &self.joystick1, &self.joystick2,
+            ),
+            0xdc01 => crate::keyboard::cia1_pb_pins(
+                &self.keyboard, self.clk, pra, ddra, prb, ddrb, &self.joystick1,
+            ),
+            _ => self.cia1.peek(addr),
+        }
+    }
+
     pub fn read_full(&self, addr: u16) -> u8 {
         match addr {
             0x0000 => self.port_dir,
@@ -1567,7 +1594,7 @@ impl Machine {
                         0xd000..=0xd3ff => self.vic.read_reg(addr as u8),
                         0xd400..=0xd7ff => self.sid_regs[(addr as usize - 0xd400) & 0x1f],
                         0xd800..=0xdbff => (self.io_shadow[(addr as usize) - 0xd000] & 0x0f) | 0xf0,
-                        0xdc00..=0xdcff => self.cia1.peek(addr),
+                        0xdc00..=0xdcff => self.cia1_pin_peek(addr),
                         0xdd00..=0xddff => self.cia2.peek(addr),
                         _ => self.io_shadow[(addr as usize) - 0xd000],
                     }
@@ -1621,7 +1648,7 @@ impl Machine {
                         0xd000..=0xd3ff => self.vic.read_reg(addr as u8),
                         0xd400..=0xd7ff => self.sid_regs[(addr as usize - 0xd400) & 0x1f],
                         0xd800..=0xdbff => (self.io_shadow[(addr as usize) - 0xd000] & 0x0f) | 0xf0,
-                        0xdc00..=0xdcff => self.cia1.peek(addr),
+                        0xdc00..=0xdcff => self.cia1_pin_peek(addr),
                         0xdd00..=0xddff => self.cia2.peek(addr),
                         _ => self.io_shadow[(addr as usize) - 0xd000],
                     }

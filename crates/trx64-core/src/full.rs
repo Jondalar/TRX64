@@ -400,15 +400,16 @@ impl<'a> FullBus<'a> {
                 // `pb_out` is what port B is actually driving (= VICE `old_pb`),
                 // ANDed with joystick 1, which pulls the same lines low.
                 if (addr & 0xf) == crate::cia::CIA_PRA as u16 {
-                    let pra = self.cia1.peek(0xdc00);
-                    let ddra = self.cia1.peek(0xdc02);
-                    let prb = self.cia1.peek(0xdc01);
-                    let ddrb = self.cia1.peek(0xdc03);
-                    let joy1 = crate::keyboard::joystick_active_low_mask(&self.joystick1);
-                    let pb_out = ((prb | !ddrb) & joy1) & 0xff;
-                    let val = self.keyboard.read_columns_for_pb(self.clk, pb_out);
-                    let joy2 = crate::keyboard::joystick_active_low_mask(&self.joystick2);
-                    ((val & ((pra | !ddra) & 0xff)) & joy2) & 0xff
+                    crate::keyboard::cia1_pa_pins(
+                        self.keyboard,
+                        self.clk,
+                        self.cia1.peek(0xdc00),
+                        self.cia1.peek(0xdc02),
+                        self.cia1.peek(0xdc01),
+                        self.cia1.peek(0xdc03),
+                        &self.joystick1,
+                        &self.joystick2,
+                    )
                 }
                 // CIA1 PB ($DC01) carries the keyboard ROW lines AND joystick
                 // port 1 (bits 0-4, active-low). VICE c64cia1.c:425-431 read_ciapb:
@@ -419,15 +420,15 @@ impl<'a> FullBus<'a> {
                 // compute the full formula + joy1 AND for fidelity (c64re
                 // cia1.ts:101-112).
                 else if (addr & 0xf) == crate::cia::CIA_PRB as u16 {
-                    let pra = self.cia1.peek(0xdc00);
-                    let ddra = self.cia1.peek(0xdc02);
-                    let prb = self.cia1.peek(0xdc01);
-                    let ddrb = self.cia1.peek(0xdc03);
-                    let pa_out = (pra | !ddra) & 0xff;
-                    let val = self.keyboard.read_rows_for_pa(self.clk, pa_out);
-                    let val_out_hi = ddrb & prb;
-                    let joy_mask = crate::keyboard::joystick_active_low_mask(&self.joystick1);
-                    (((val & ((prb | !ddrb) & 0xff)) | val_out_hi) & joy_mask) & 0xff
+                    crate::keyboard::cia1_pb_pins(
+                        self.keyboard,
+                        self.clk,
+                        self.cia1.peek(0xdc00),
+                        self.cia1.peek(0xdc02),
+                        self.cia1.peek(0xdc01),
+                        self.cia1.peek(0xdc03),
+                        &self.joystick1,
+                    )
                 } else {
                     self.cia1.read(addr, self.clk, self.cia_table)
                 }
