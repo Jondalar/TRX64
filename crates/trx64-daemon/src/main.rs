@@ -413,6 +413,14 @@ pub struct State {
     // it, everything that stops the machine clears it, and `session/state` reports it.
     /// Spec 808 rebuild — daemon-owned pacing (8× budget per tick). Was a client atomic.
     warp: bool,
+    /// Show the FIRST frame drawn after an anchor instead of the second. The second is
+    /// whole and the first usually carries a seam where the anchor cut into the raster —
+    /// but a one-frame event only exists in the first, so a clean picture is the wrong
+    /// default when you are hunting a raster bug. Off by default; `raw` in the transport.
+    transport_raw_frame: bool,
+    /// Which of the two the last transport move actually kept, reported in the status so
+    /// nobody has to guess whether they are looking at N+1 or N+2.
+    transport_shown_frame: &'static str,
     /// Spec 808 — AUDIO EPOCH. Bumped by every op that makes the machine's clock
     /// discontinuous: power, reset, a checkpoint restore, any transport move, pause and
     /// play. Clients watch it and drop their reSID queue when it changes.
@@ -5594,6 +5602,27 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             }
         }
 
+        // An anchor stores no picture — the transport redraws one by running the
+        // emulation forward from it. It draws two and keeps the second, because the
+        // first is cut into by wherever the anchor landed in the raster. The cost is
+        // that a ONE-FRAME event exists only in the first, so stepping onto it showed a
+        // screen where the flash was already over. `rawframe on` keeps the first.
+        "rawframe" => {
+            match toks.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
+                Some("on") => {
+                    st.transport_raw_frame = true;
+                    Ok("RAW FRAME ON \u{2014} showing the FIRST frame after the anchor \
+                        (seam included; this is where a one-frame event lives)."
+                        .to_string())
+                }
+                Some("off") | None => {
+                    st.transport_raw_frame = false;
+                    Ok("RAW FRAME OFF \u{2014} showing the second, whole frame.".to_string())
+                }
+                Some(other) => Err(format!("rawframe: unknown '{other}' (use on|off)")),
+            }
+        }
+
         "frame" => {
             let Some(arg) = toks.get(1) else {
                 return Ok(transport_reply(&transport_status(st)));
@@ -7052,6 +7081,7 @@ fn monitor_help_text() -> String {
         "    run                       resume the machine (from a rewound point: cuts the anchors ahead)",
         "    pause                     stop the machine AND the transport; prints the ringbuffer range",
         "    warp on|off               8\u{00d7} pacing / PAL real-time",
+        "    rawframe on|off           an anchor stores no picture, so stepping onto one REDRAWS it: two frames, keep the second, because the first is cut into wherever the anchor landed in the raster. That discards a ONE-FRAME event — a border opened for a frame, a bad raster split — so it looks like the ring never caught it. `on` keeps the FIRST frame, seam and all. Anchors that sit on a frame boundary use the first either way (whole, nothing lost). `transport/status` reports which you are looking at as `shownFrame`.",
         "    reset [warm|cold] · power on|off",
         "  MARKS (Spec 809 — a named, pinned point you can iterate FROM)",
         "    mark <name>               name + pin the anchor you are standing on (max 32)",
@@ -12786,6 +12816,19 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             let v = transport_pause(&mut st);
             Response::ok(id, v)
         }
+        // transport/raw_frame { on } — show the FIRST frame drawn after an anchor
+        // instead of the second. The second is clean; the first carries the seam where
+        // the anchor cut into the raster, and it is the only one that contains a
+        // one-frame event. Hunting a VIC bug that flashes for a single frame, you want
+        // the first. `{}` reports the current setting without changing it.
+        "transport/raw_frame" => {
+            let mut st = state.lock().unwrap();
+            if let Some(on) = req.params.get("on").and_then(|v| v.as_bool()) {
+                st.transport_raw_frame = on;
+            }
+            let v = transport_status(&st);
+            Response::ok(id, v)
+        }
         "transport/frame" => {
             let delta = match req.params.get("delta").and_then(|v| v.as_i64()) {
                 Some(d) => d,
@@ -15387,6 +15430,12 @@ fn transport_status(st: &State) -> Value {
     // The range rides EVERY status, not just the transport `pause` verb — F11 runs the
     // cockpit `/pause`, so hanging it off the verb meant it was never actually seen.
     v["range"] = json!(transport_range_line(st));
+    // WHICH of the two regenerated frames you are looking at. An anchor carries no
+    // picture, so the transport draws one — and if it draws two and keeps the clean one,
+    // a single-frame event is invisible. Saying which is shown turns that from a mystery
+    // into a setting.
+    v["shownFrame"] = json!(st.transport_shown_frame);
+    v["rawFrame"] = json!(st.transport_raw_frame);
     v
 }
 
@@ -15429,19 +15478,48 @@ fn transport_move_to(st: &mut State, index: usize) -> Result<Value, String> {
     // whole step is ~2 % of wall-clock, which is what buys a moving picture.
     {
         let mut sink = trx64_core::NullSink;
-        // TWO frames, and keep the second. An anchor lands wherever the raster happened
-        // to be, so the first frame drawn after it is PARTIAL — the top belongs to the
-        // frame that was already half-drawn and the bottom to the new one. That seam is
-        // the striping you see while scrubbing. The second frame starts at a real frame
-        // boundary and is whole.
+        // An anchor lands wherever the raster happened to be, so the FIRST frame drawn
+        // after it is usually partial — the top belongs to the frame that was already
+        // half-drawn, the bottom to the new one. That seam is the striping you see while
+        // scrubbing, which is why this used to draw two frames and keep the second.
+        //
+        // Keeping the second throws the first away, and a ONE-FRAME event lives in the
+        // first. Stepping onto the anchor of a single-frame flash — a border opened for
+        // one frame, a raster split gone wrong, $D020 painted over the screen once —
+        // showed the picture of frame N+2, with the event already over. It was not too
+        // short to catch. It was discarded by construction, and it looked like the ring
+        // had not recorded it. (Owner, chasing exactly such a VIC bug.)
+        //
+        // Two changes:
+        //
+        //   * If the anchor sits ON a frame boundary, one frame is already whole. Draw
+        //     one and keep it — no seam, and nothing lost. This is the common case at
+        //     cadence 1, where anchors are captured by the per-frame pump.
+        //   * Otherwise draw both and keep whichever the caller asked for. The default
+        //     stays the clean second frame; `raw` keeps the first, seam and all. For a
+        //     raster bug the seam IS the information.
+        let on_boundary = st.session.machine.vic.raster_line == 0
+            && st.session.machine.vic.raster_cycle <= 1;
+        let want_first = on_boundary || st.transport_raw_frame;
         st.session.machine.run_for_full(
-            crate::streaming::CYC_PER_FRAME * 2,
+            crate::streaming::CYC_PER_FRAME,
             &mut sink,
             |_, _, _, _, _, _, _| {},
         );
-        let drawn = st.session.machine.vic.displayed.clone();
+        let first = st.session.machine.vic.displayed.clone();
+        let drawn = if want_first {
+            first
+        } else {
+            st.session.machine.run_for_full(
+                crate::streaming::CYC_PER_FRAME,
+                &mut sink,
+                |_, _, _, _, _, _, _| {},
+            );
+            st.session.machine.vic.displayed.clone()
+        };
         restore_live_checkpoint(&mut st.session, &cp)?;
         st.session.machine.vic.displayed = drawn;
+        st.transport_shown_frame = if want_first { "first" } else { "second" };
     }
 
     // At the head the transport lets go: the stream loop owns the machine again and new
@@ -17140,6 +17218,8 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         autocapture_frames_since: 0,
         autocapture_cycles_since: 0,
         warp: false,
+        transport_raw_frame: false,
+        transport_shown_frame: "second",
         audio_epoch: 0,
         recorder_frames_since: 0,
         candidates: std::collections::HashMap::new(),
@@ -17706,6 +17786,8 @@ mod batch1_tests {
             autocapture_frames_since: 0,
             autocapture_cycles_since: 0,
             warp: false,
+        transport_raw_frame: false,
+        transport_shown_frame: "second",
             audio_epoch: 0,
             recorder_frames_since: 0,
         candidates: std::collections::HashMap::new(),
@@ -18799,6 +18881,79 @@ mod batch1_tests {
             call(&st, "session/state", json!({}))["runState"],
             json!("paused")
         );
+    }
+
+    /// A one-frame event must be reachable from the ring.
+    ///
+    /// An anchor carries no framebuffer (807 §4.1 dropped them — they cost 114 of every
+    /// 167 µs), so stepping onto one REDRAWS the picture by running the emulation
+    /// forward from it. It ran two frames and kept the second, because an anchor lands
+    /// wherever the raster happened to be and the first frame is cut in half by the seam.
+    ///
+    /// That is a clean picture of the WRONG frame. Everything that lives for exactly one
+    /// frame — a border opened for a frame, a raster split gone wrong — is in the frame
+    /// that gets thrown away, so stepping back onto it showed the flash already over. It
+    /// reads as "the ring did not record it", which is the one thing it definitely did.
+    ///
+    /// The probe paints the border with the KERNAL jiffy counter, so the border colour
+    /// changes by exactly one per frame and the picture SAYS which frame it is:
+    ///
+    /// ```text
+    ///   C000  A5 A2      LDA $A2      ; jiffy low byte, +1 per frame
+    ///   C002  8D 20 D0   STA $D020
+    ///   C005  4C 00 C0   JMP $C000
+    /// ```
+    #[test]
+    fn stepping_onto_an_anchor_can_show_the_frame_that_was_thrown_away() {
+        let st = make_state();
+        call(&st, "session/power", json!({ "op": "on" }));
+        // Boot far enough that the KERNAL is running its jiffy IRQ.
+        for _ in 0..90 {
+            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+        }
+        mon(&st, "wr c000 a5 a2 8d 20 d0 4c 00 c0").expect("poke the probe");
+        mon(&st, "g c000").expect("run it");
+        for _ in 0..12 {
+            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+        }
+
+        // The border pixel of whatever the transport just drew. Top-left is border.
+        let border = || {
+            let g = st.lock().unwrap();
+            let (_w, _h, idx) = g.session.machine.render_canvas_indices();
+            idx[0]
+        };
+
+        let clean = call(&st, "transport/frame", json!({ "delta": -4 }));
+        let clean_shown = clean["shownFrame"].as_str().unwrap_or("").to_string();
+        let clean_border = border();
+
+        // Same anchor, asking for the frame that used to be discarded.
+        call(&st, "transport/raw_frame", json!({ "on": true }));
+        let raw = call(&st, "transport/frame", json!({ "delta": 0 }));
+        assert_eq!(raw["shownFrame"], json!("first"), "raw must keep the FIRST frame");
+        assert_eq!(raw["rawFrame"], json!(true), "and say so in the status");
+        let raw_border = border();
+
+        if clean_shown == "second" {
+            // The anchor sat mid-frame, so the two really are different frames — and the
+            // border colour, which advances once per frame, proves it at pixel level.
+            assert_ne!(
+                raw_border, clean_border,
+                "first and second frame must be DIFFERENT pictures — if they match, the \
+                 discarded frame was never actually drawn and a one-frame event stays \
+                 invisible (border ${clean_border:02x})"
+            );
+        } else {
+            // The anchor was on a frame boundary: the first frame is already whole, so
+            // it is used either way and nothing was ever thrown away here.
+            assert_eq!(clean_shown, "first");
+            assert_eq!(raw_border, clean_border);
+        }
+
+        call(&st, "transport/raw_frame", json!({ "on": false }));
+        let back = call(&st, "transport/status", json!({}));
+        assert_eq!(back["rawFrame"], json!(false), "and it turns back off");
     }
 
     /// BUG-049 — a client's focus loss must not throw away another client's input,

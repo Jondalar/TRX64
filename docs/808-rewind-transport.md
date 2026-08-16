@@ -198,6 +198,27 @@ or not a recording lies underneath, and it is what single-stepping a paused mach
 always meant. The per-frame capture then records that frame, so the ring grows by exactly
 the frame you asked to see.
 
+**Which frame you are shown — and why that is a choice.** An anchor carries no picture
+(§4a dropped the two framebuffers: they cost 114 of every 167 µs), so landing on one
+redraws it by running the emulation forward. Since an anchor lands wherever the raster
+happened to be, the first frame drawn after it is usually cut in half — the top belongs
+to the frame that was already half-drawn. So the transport drew **two** and kept the
+second, which is whole.
+
+That is a clean picture of the wrong frame, and it hides an entire class of thing. A
+border opened for one frame, a raster split that fails for one frame, `$D020` painted
+across the screen once — all of it lives in the frame that was discarded. Stepping back
+onto the anchor showed the flash already over, which reads as *the ring never caught it*.
+The ring caught it; the redraw threw it away.
+
+- An anchor **on** a frame boundary draws one frame and keeps it: whole, and nothing
+  lost. One comparison, and it is free.
+- Otherwise the default is still the clean second frame, and `rawframe on` (RPC
+  `transport/raw_frame`) keeps the first instead, seam and all. When you are chasing a
+  raster bug the seam is not noise, it is the measurement.
+- `transport/status` reports `shownFrame` either way, so nothing has to be inferred from
+  what the picture looks like.
+
 **And a reset is not a divergence.** Truncation is for *diverging* from a rewound
 position — the anchors before the cursor stay valid. A reset, a power cycle or a media
 swap replaces the machine, so the whole ring goes.
@@ -322,8 +343,8 @@ along with what it would cost to switch.
 
 ## §7b Side effects a restore cannot undo
 
-The picture regeneration (§4a) runs two frames of **real code** after each restore. Real
-code writes things. Anything it writes that the anchor does not carry is a mutation the
+The picture regeneration (§4a) runs one or two frames of **real code** after each restore.
+Real code writes things. Anything it writes that the anchor does not carry is a mutation the
 re-restore cannot undo — so every scrub step would quietly change it.
 
 - **Cart flash: fixed.** It rides every anchor now. It had to: a game that saves to its
