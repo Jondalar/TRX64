@@ -788,6 +788,22 @@ impl IecCore {
         self.iecbus.drv_port
     }
 
+    /// ts: `iecbus.drv_bus[unit]` — one device's contribution to the wired-AND, in
+    /// `cpu_bus` bit positions (0x80 DATA, 0x40 CLK; 1 = released, 0 = pulled low).
+    /// Read-only, for the monitor: "who is holding this line down" is otherwise
+    /// unanswerable from outside, and it is the first question every IEC stall asks.
+    #[inline]
+    pub fn drv_bus(&self, unit: usize) -> u8 {
+        self.iecbus.drv_bus.get(unit).copied().unwrap_or(0xff)
+    }
+
+    /// ts: `iecbus.drv_data[unit]` — the raw inverted VIA1 PB output last folded in
+    /// from that drive (vice `store_prb`: `*drive_data = ~byte`).
+    #[inline]
+    pub fn drv_data(&self, unit: usize) -> u8 {
+        self.iecbus.drv_data.get(unit).copied().unwrap_or(0)
+    }
+
     /// Refresh `drv_data[8]` from the drive's CURRENT VIA1 PB output WITHOUT folding
     /// the wired-AND bus or updating ports. CROSS-DOMAIN accommodation (NOT a VICE
     /// function): in TRX64 the drive's VIA1 is a separate borrow, so the catch-up

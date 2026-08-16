@@ -982,13 +982,34 @@ impl Drive1541 {
 
     pub fn drive_peek(&self, addr: u16) -> u8 {
         match addr {
-            0x0000..=0x7FFF => {
-                if (0x1800..=0x1BFF).contains(&addr) || (0x1C00..=0x1FFF).contains(&addr) {
-                    0 // VIA window: peek is side-effect-free → no register read
+            // VIA1 ($1800) — the IEC port, and the register that answers "who is
+            // holding DATA low". The whole window used to peek as `0`, both DDRs
+            // included, which is impossible for a running 1541 and read as a fact.
+            //
+            // PRB is composed here rather than through the backend so the peek can
+            // stay `&self`: it is the same expression `Via1dBackend::read_prb` uses
+            // (via1d1541.c:345-350) —
+            //     tmp  = (drv_port ^ 0x85) | 0x1a | driveid
+            //     byte = (PRB & DDRB) | (tmp & ~DDRB)
+            // — and it reads the IEC core, which has no state to disturb.
+            0x1800..=0x1BFF => {
+                let a = (addr & 0xf) as usize;
+                if a == crate::viacore::VIA_PRB {
+                    let ctx = &self.via1;
+                    let tmp = ((self.via1_iecbus.drv_port ^ 0x85) | 0x1a) & 0xff;
+                    let ddrb = ctx.via[crate::viacore::VIA_DDRB];
+                    ((ctx.via[crate::viacore::VIA_PRB] & ddrb) | (tmp & !ddrb)) & 0xff
                 } else {
-                    self.ram[(addr & 0x07FF) as usize]
+                    viacore::viacore_peek_no_hooks(&self.via1, addr)
                 }
             }
+            // VIA2 ($1C00) — the disk controller. Its port reads TURN THE DISK
+            // (`rotate_disk`, and they clear `byte_ready_level`), so a debugger may
+            // not call them: inspecting the drive would change it. Latches, DDRs,
+            // timers and IFR/IER are exact; PRA/PRB report what the VIA drives
+            // rather than what the head sees.
+            0x1C00..=0x1FFF => viacore::viacore_peek_no_hooks(&self.via2, addr),
+            0x0000..=0x7FFF => self.ram[(addr & 0x07FF) as usize],
             0x8000..=0xFFFF => self.rom[(addr & 0x7FFF) as usize],
         }
     }

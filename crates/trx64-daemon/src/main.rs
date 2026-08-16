@@ -5111,6 +5111,87 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             Ok(lines.join("\n").trim_end().to_string())
         }
 
+        // ---- IEC BUS ---------------------------------------------------------------
+        //
+        // Three wires and a wired-AND, and until now nothing showed them. A serial
+        // stall is always the same question — WHICH line is low and WHO is holding it
+        // — and it was unanswerable from outside: `m dd00` returns the CIA latch, the
+        // drive's $1800 peeked as zero, and the bus state lives in the IEC core where
+        // no verb reached. Diagnosing a hang meant single-stepping the KERNAL until an
+        // `LDA $DD00` landed in the accumulator, one byte at a time.
+        //
+        // A released line reads 1 and a device pulls it to 0, so "who is low" is a
+        // per-device answer, not a bus-wide one. That is why the table has a column
+        // per driver rather than a single state.
+        "iec" => {
+            let m = &st.session.machine;
+            let cpu_bus = m.iec.cpu_bus();
+            let cpu_port = m.iec.cpu_port();
+            let drv_port = m.iec.drv_port();
+            let drv_bus8 = m.iec.drv_bus(8);
+            let drv_data8 = m.iec.drv_data(8);
+
+            // cpu_bus / cpu_port bit positions (c64iec.c iec_update_cpu_bus).
+            const DATA: u8 = 0x80;
+            const CLK: u8 = 0x40;
+            const ATN: u8 = 0x10;
+            let lvl = |v: u8, bit: u8| if v & bit != 0 { "high" } else { "LOW " };
+            let pull = |v: u8, bit: u8| if v & bit != 0 { "-" } else { "pulls" };
+
+            let mut out = vec![
+                "IEC BUS  (a released line is high; any device may pull it low)".to_string(),
+                "  line   bus     C64     drive 8".to_string(),
+                format!(
+                    "  ATN    {}    {}   {}",
+                    lvl(cpu_bus, ATN),
+                    pull(cpu_bus, ATN),
+                    "-      (ATN is C64-only)"
+                ),
+                format!(
+                    "  CLK    {}    {}   {}",
+                    lvl(cpu_port, CLK),
+                    pull(cpu_bus, CLK),
+                    pull(drv_bus8, CLK)
+                ),
+                format!(
+                    "  DATA   {}    {}   {}",
+                    lvl(cpu_port, DATA),
+                    pull(cpu_bus, DATA),
+                    pull(drv_bus8, DATA)
+                ),
+                String::new(),
+                format!(
+                    "  cpu_bus=${cpu_bus:02x}  cpu_port=${cpu_port:02x}  \
+                     drv_bus[8]=${drv_bus8:02x}  drv_port=${drv_port:02x}  \
+                     drv_data[8]=${drv_data8:02x}"
+                ),
+            ];
+
+            // Both ends, as the CPUs actually see them — not as the latches read.
+            let dd00 = m.read_full(0xdd00);
+            let dd02 = m.peek_lens(0xdd02, "io");
+            out.push(format!(
+                "  C64  $DD00 = ${dd00:02x} (DDR ${dd02:02x})   bit7 DATA in={} bit6 CLK in={} \
+                 bit3 ATN out={}",
+                (dd00 >> 7) & 1,
+                (dd00 >> 6) & 1,
+                (dd02 & 0x08 != 0) as u8 * ((m.peek_lens(0xdd00, "io") >> 3) & 1)
+            ));
+            let v1800 = st.session.machine.drive8.drive_peek(0x1800);
+            let d1802 = st.session.machine.drive8.drive_peek(0x1802);
+            out.push(format!(
+                "  1541 $1800 = ${v1800:02x} (DDR ${d1802:02x})   bit7 ATN in={} bit4 ATNA={} \
+                 bit3 CLK out={} bit2 CLK in={} bit1 DATA out={} bit0 DATA in={}",
+                (v1800 >> 7) & 1,
+                (v1800 >> 4) & 1,
+                (v1800 >> 3) & 1,
+                (v1800 >> 2) & 1,
+                (v1800 >> 1) & 1,
+                v1800 & 1
+            ));
+            Ok(out.join("\n"))
+        }
+
         // ---- Flow FOCUS (monitor-shell.ts:1075-1099) --------------------------------
         //
         // The port took `flow` — the panel that DISPLAYS the focus — and left behind the
@@ -7031,6 +7112,7 @@ fn monitor_help_text() -> String {
         "    df [-i] [a] [n]  follow-disasm: walk control flow (static); -i asks at branches (df t|f|b)",
         "    screen           decode the 40x25 text screen (real screen pointer)",
         "    io [1|addr]      I/O area per device: register hex (peek) + state details (VICE io)",
+        "    iec              the serial bus: ATN/CLK/DATA, their level, and WHICH side is pulling each one low, plus both ends as their CPUs see them ($DD00 and the 1541's $1800). A released line is high and any device may pull it low, so \"who is low\" is per-device, not a bus-wide state. Answers the only question an IEC stall ever asks.",
         "    bitmap <a> [w h] [hires|charset|sprite]  render a RAM range to a PNG (scrub gfx)",
         "    bank [lens]      show/set the sticky default lens for m/d",
         "    wr [lens] <a> <b..>  write exactly these bytes from a",
@@ -18881,6 +18963,61 @@ mod batch1_tests {
             call(&st, "session/state", json!({}))["runState"],
             json!("paused")
         );
+    }
+
+    /// The instruments must not lie about the serial bus.
+    ///
+    /// Chasing a loader that hung on `BIT $DD00 / BVS`, every reading available from
+    /// outside the machine was false or absent:
+    ///
+    ///   * `m dd00` returned the CIA latch. Bits 6 and 7 ARE the CLK and DATA lines,
+    ///     and they were not in it — so the register the CPU was spinning on read
+    ///     back as a value that should have let it out.
+    ///   * the drive's whole `$1800` window peeked as `0`, both DDRs included. That
+    ///     is impossible for a running 1541 and there was nothing to say so.
+    ///   * nothing showed the bus itself: which line is low, and which side is
+    ///     holding it. That is the only question an IEC stall ever asks.
+    ///
+    /// The value had to be obtained by single-stepping the KERNAL until an
+    /// `LDA $DD00` landed in the accumulator. One byte, by hand.
+    #[test]
+    fn the_serial_bus_is_visible_from_outside_the_machine() {
+        let st = make_state();
+        call(&st, "session/power", json!({ "op": "on" }));
+        for _ in 0..120 {
+            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+        }
+
+        {
+            let g = st.lock().unwrap();
+            let m = &g.session.machine;
+
+            // The 1541 ROM programs VIA1 PB as %00011010 — CLK out, DATA out, ATNA.
+            // The peek used to answer 0 here, DDR included.
+            assert_eq!(
+                m.drive8.drive_peek(0x1802),
+                0x1a,
+                "the drive's VIA1 DDRB must be readable — a running 1541 never has 0 here"
+            );
+
+            // $DC00/$DD00 peeks must agree with what the CPU's own read composes.
+            // For CIA2 that means the IEC lines are in bits 6 and 7.
+            let dd00 = m.read_full(0xdd00);
+            let latch = m.peek_lens(0xdd02, "io"); // DDR, unaffected either way
+            assert_eq!(latch, 0x3f, "KERNAL programs CIA2 DDRA = $3f");
+            let pins = m.iec.cpu_port();
+            assert_eq!(
+                dd00 & 0xc0,
+                pins & 0xc0,
+                "$DD00 bits 6/7 must BE the CLK/DATA lines, not the latch"
+            );
+        }
+
+        // And the bus has a view of its own.
+        let out = mon(&st, "iec").expect("iec");
+        for needle in ["ATN", "CLK", "DATA", "cpu_port=", "$DD00", "$1800"] {
+            assert!(out.contains(needle), "`iec` must show {needle}:\n{out}");
+        }
     }
 
     /// A one-frame event must be reachable from the ring.

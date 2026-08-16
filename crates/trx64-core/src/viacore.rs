@@ -1383,6 +1383,39 @@ pub fn viacore_peek(ctx: &mut ViaContext, backend: &mut dyn ViaBackend, addr: u1
 // =============================================================================
 
 // PORT OF: viacore.ts:981-1019 (viacore_set_cb1)
+/// `viacore_peek` without the port-read hooks — for a VIA whose `read_pra`/
+/// `read_prb` are not free.
+///
+/// The 1541's VIA2 is the disk controller: its port reads call `rotate_disk`,
+/// sample the GCR head and clear `byte_ready_level`. That is correct for the CPU
+/// and wrong for a debugger — inspecting $1C00 would turn the disk. So the pin
+/// half is dropped and the register latches are reported as they stand: DDRs,
+/// timers, IFR/IER and the output latches are all real, and PRA/PRB show what the
+/// VIA is DRIVING rather than what the pins read.
+///
+/// Use [`viacore_peek`] for a VIA whose hooks are pure (the 1541's VIA1, which
+/// only folds the IEC bus) — there the pins are free and worth having.
+pub fn viacore_peek_no_hooks(ctx: &ViaContext, addr: u16) -> u8 {
+    let a = (addr & 0xf) as usize;
+    match a {
+        VIA_PRA | VIA_PRA_NHS => ctx.via[VIA_PRA],
+        VIA_PRB => {
+            let mut byte = ctx.via[VIA_PRB];
+            if ctx.via[VIA_ACR] & VIA_ACR_T1_PB7_USED != 0 {
+                byte = ((byte & 0x7f) | ctx.t1_pb7) & 0xff;
+            }
+            byte
+        }
+        VIA_T1CL => (viacore_t1(ctx, ctx.clk) & 0xff) as u8,
+        VIA_T1CH => ((viacore_t1(ctx, ctx.clk) >> 8) & 0xff) as u8,
+        VIA_T2CL => (viacore_t2(ctx, ctx.clk) & 0xff) as u8,
+        VIA_T2CH => ((viacore_t2(ctx, ctx.clk) >> 8) & 0xff) as u8,
+        VIA_IFR => ctx.ifr & 0xff,
+        VIA_IER => (ctx.ier | 0x80) & 0xff,
+        _ => ctx.via[a],
+    }
+}
+
 pub fn viacore_set_cb1(ctx: &mut ViaContext, backend: &mut dyn ViaBackend, data: u32) {
     let data_bool = data != 0;
     if data_bool != ctx.cb1_in_state {

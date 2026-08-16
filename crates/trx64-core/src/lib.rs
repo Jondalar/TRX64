@@ -1557,6 +1557,27 @@ impl Machine {
         }
     }
 
+    /// $DD00 is PINS too. Bits 6 and 7 are the IEC CLK IN and DATA IN lines, and
+    /// `cia2.peek` returns only the latch — so a monitor read of $DD00 showed the
+    /// byte the CPU last WROTE and nothing about the bus. Debugging a serial stall
+    /// through it means reading a number that cannot answer the question: a KERNAL
+    /// loop spinning on DATA looked, from the monitor, like it was spinning on a
+    /// value that should have let it out.
+    ///
+    /// The CPU's own read ([`full::FullBus::io_read`]) also flushes the drive
+    /// forward and records an indirection access. A peek does neither — it reads
+    /// the bus as it stands. Bits 0-5 come from the latch exactly as the CPU sees
+    /// them.
+    fn cia2_pin_peek(&self, addr: u16) -> u8 {
+        if (addr & 0xff0f) != 0xdd00 {
+            return self.cia2.peek(addr);
+        }
+        let pins = self.iec.iecbus_callback_read(self.clk);
+        let pra = self.cia2.peek(0xdd00);
+        let ddra = self.cia2.peek(0xdd02);
+        (((pra | !ddra) & 0x3f) | pins) & 0xff
+    }
+
     pub fn read_full(&self, addr: u16) -> u8 {
         match addr {
             0x0000 => self.port_dir,
@@ -1595,7 +1616,7 @@ impl Machine {
                         0xd400..=0xd7ff => self.sid_regs[(addr as usize - 0xd400) & 0x1f],
                         0xd800..=0xdbff => (self.io_shadow[(addr as usize) - 0xd000] & 0x0f) | 0xf0,
                         0xdc00..=0xdcff => self.cia1_pin_peek(addr),
-                        0xdd00..=0xddff => self.cia2.peek(addr),
+                        0xdd00..=0xddff => self.cia2_pin_peek(addr),
                         _ => self.io_shadow[(addr as usize) - 0xd000],
                     }
                 } else if self.memconfig.char_rom {
@@ -1649,7 +1670,7 @@ impl Machine {
                         0xd400..=0xd7ff => self.sid_regs[(addr as usize - 0xd400) & 0x1f],
                         0xd800..=0xdbff => (self.io_shadow[(addr as usize) - 0xd000] & 0x0f) | 0xf0,
                         0xdc00..=0xdcff => self.cia1_pin_peek(addr),
-                        0xdd00..=0xddff => self.cia2.peek(addr),
+                        0xdd00..=0xddff => self.cia2_pin_peek(addr),
                         _ => self.io_shadow[(addr as usize) - 0xd000],
                     }
                 } else {
