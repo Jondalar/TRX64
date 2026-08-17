@@ -9206,6 +9206,79 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             Response::ok(id, json!({ "dataUrl": url, "width": w, "height": h }))
         }
 
+        // Spec 812 — the displayed frame as raw 4-bit COLOUR INDICES plus the
+        // palette that pairs with it. `session/screenshot` hands out a PNG, which
+        // a reel builder would only have to decode again; the VIC's own index
+        // buffer is what a GIF stores, so this is the capture path for a capture
+        // scenario. Same frozen `displayed` buffer, same 384×272 crop.
+        "session/frame_indices" => {
+            let st = state.lock().unwrap();
+            let (w, h, indices) = st.session.machine.render_canvas_indices();
+            let palette: Vec<u8> = trx64_core::render::COLODORE
+                .iter()
+                .flat_map(|c| c.iter().copied())
+                .collect();
+            Response::ok(id, json!({
+                "width": w as u64,
+                "height": h as u64,
+                "palette": base64_encode(&palette),
+                "indices": base64_encode(&indices),
+                "c64Cycles": st.session.machine.clk,
+                "rasterLine": st.session.machine.vic.raster_line as u64,
+                "rasterCycle": st.session.machine.vic.raster_cycle as u64,
+            }))
+        }
+
+        // Spec 812 §4 — advance to the next frame boundary, so a shot captures a
+        // WHOLE frame. `displayed` is the frozen previous frame; asked for it in
+        // mid-frame, a capture returns the one before the interesting one (the
+        // lesson 808 already paid for). Reports the cycle it actually landed on,
+        // so a reel is re-derivable from its own manifest.
+        //
+        // The boundary is detected by WATCHING the raster wrap rather than
+        // arithmetic on the cycle counter: a single-cycle budget still completes
+        // the instruction in flight, so `raster_cycle` can step over any exact
+        // value we might aim at. A wrap cannot be stepped over.
+        "session/advance_to_frame" => {
+            let mut st = state.lock().unwrap();
+            if st.session.running {
+                return Response::err(
+                    id,
+                    -32002,
+                    "session/advance_to_frame: pause first — a running machine has no \
+                     boundary to stop on",
+                );
+            }
+            let start = st.session.machine.clk;
+            // Two frames of slack: at most one to reach the wrap, plus room for a
+            // long instruction straddling it.
+            let cap = 2 * 19_656u64 + 128;
+            let mut prev_line = st.session.machine.vic.raster_line;
+            let mut landed = prev_line == 0;
+            while !landed && st.session.machine.clk.saturating_sub(start) < cap {
+                run_cycle_budget(&mut st.session, 1);
+                let line = st.session.machine.vic.raster_line;
+                landed = line == 0 && prev_line != 0;
+                prev_line = line;
+            }
+            if !landed {
+                return Response::err(
+                    id,
+                    -32003,
+                    format!(
+                        "session/advance_to_frame: no raster wrap within {cap} cycles — \
+                         the VIC is not sweeping (raster stuck at line {prev_line})"
+                    ),
+                );
+            }
+            Response::ok(id, json!({
+                "c64Cycles": st.session.machine.clk,
+                "cyclesAdvanced": st.session.machine.clk.saturating_sub(start),
+                "rasterLine": st.session.machine.vic.raster_line as u64,
+                "rasterCycle": st.session.machine.vic.raster_cycle as u64,
+            }))
+        }
+
         "runtime/render_screen" => {
             // Pixel-art upscale: scale 1/2/4 nearest-neighbour. Returns the same
             // {dataUrl,width,height} envelope as session/screenshot.

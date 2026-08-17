@@ -28,6 +28,7 @@ pub mod flash040;
 pub mod full;
 pub mod full_sc;
 pub mod gcr;
+pub mod gif89a;
 pub mod iec;
 pub mod keyboard;
 pub mod m93c86;
