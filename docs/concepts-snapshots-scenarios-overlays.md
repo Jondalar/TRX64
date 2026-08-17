@@ -191,15 +191,11 @@ VSF ⇄ `.c64re` import+export incl. drive+keyboard (791).
 
 **DESIGNED, NOT BUILT — the gap-closing backlog:**
 
-1. **776 — recorded intervention branch + outcome-diff** (the big one, and the REAL
-   overlay gap). Turns the ephemeral `runtime_overlay_run` into a first-class *branch
-   object* (pinned checkpoint + ordered interventions + provenance) with
-   `diff_branch_outcome(baseline, intervention)`. Merges + retires C64RE 711 + 712.
-   Composes the existing `diffCheckpoints` / ring primitives. (The UI already has
-   `SnapshotTreeView` to render branches — the engine/branch object is what's missing.)
-2. **762 — snapshot-diff cheat finder.** Diff two pinned anchors' RAM + an Inspector
-   pixel-mark → locate a lives/energy decrementer → synthesize a cheat overlay. A payoff
-   app of 776 + the ring.
+1. ~~**776 — recorded intervention branch + outcome-diff**~~ — **SUPERSEDED 2026-08-12.**
+   Its subject, the active experiment loop, is the CANDIDATE (796): baseline anchor +
+   accumulating patch-set + bound replay, with the no-patch run cached as the reference
+   and a 794 diff after every run. Do not build a second branch object; see §6.
+2. ~~**762 — snapshot-diff cheat finder**~~ — subsumed by **798**.
 3. **766 §10 firehose convergence** — fold the trace onto the *same* shared-memory
    firehose as the ring (one producer, many consumers), reconciling lossy-recorder vs.
    no-drop-trace.
@@ -211,3 +207,96 @@ VSF ⇄ `.c64re` import+export incl. drive+keyboard (791).
 **Meaning layer (C64RE, always the last step, never a side effect):** turning a validated
 branch into a `FindingRecord` / `PatchRecipe` / provenance edge; "export a cracked image"
 is an explicit C64RE build op, not an overlay-test byproduct.
+
+---
+
+## 6. The vocabulary — one word per thing
+
+Added 2026-08-17. Fifteen months of specs grew several names for the same object and
+one name for several objects, and that is not a tidiness problem: 810 and 796 were
+about to build a second "branch" because neither could see that the other already
+had one. This section fixes ONE word per concept and names the code behind it. A
+spec that needs a different word has to change this table first.
+
+### The timeline
+
+| Word | Is | Lives in |
+|---|---|---|
+| **checkpoint** | one full machine state captured by the always-on ring, at the ring's cadence | `checkpoint_ring.rs` (805.B/765/807) |
+| **anchor** | the ID of a checkpoint, as used to name a point to return to | `anchor_id` / `cp_<n>_<n>` throughout the transport |
+| **mark** | an anchor a human NAMED and pinned, so it survives PLAY cutting the future | `mark/set\|list\|drop\|goto` (809) |
+| **snapshot** | a `.c64re` FILE — a checkpoint written out, media embedded, portable | `native_snapshot.rs` (707) |
+
+Not synonyms. A checkpoint is in memory and expires; a mark is a checkpoint with a
+name and a reservation; a snapshot is a file you can send someone. "Anchor" is the
+identifier, not a fourth kind of thing.
+
+### The intervention
+
+| Word | Is | Lives in |
+|---|---|---|
+| **patch** | bytes for ONE target `(space, bank, addr)`, plus the source they were assembled from | `Patch` (796) |
+| **overlay** | applying a patch-set into a restored state, so modified code runs without touching the original medium | 795, `runtime/overlay_run` (769.2) |
+| **delta** | a patch-set shaped for delivery — the thing that becomes a crack or a fix | 797 |
+
+"Intervention" was 776's word for the same idea and 776 is SUPERSEDED (2026-08-12).
+Do not reintroduce it.
+
+### The experiment — and the collision that mattered
+
+| Word | Is | Lives in |
+|---|---|---|
+| **candidate** | a baseline anchor + an accumulating patch-set + a bound replay, with the no-patch run cached as its reference | `State.candidates` (796), 7 MCP tools |
+| **branch** | ~~a second name for the same object~~ | — |
+
+**Decided here: a candidate is the branch.** 810 planned to own "the branch — its
+name, its patch-set, which scenario it serves, whether it won", and three of those
+four already exist as a candidate. Building a second object beside it would give the
+repo two things with one job, which is the trap 810 §4b was itself written about.
+What 810 adds is the two fields 796 has no use for — a NAME and WON — not a new
+model.
+
+`SnapshotBranch` in `rewind.rs` keeps the word for the snapshot TREE's edges (768,
+`promote_branch`). That is a graph edge, not an experiment; it is the one surviving
+other use and it does not travel.
+
+### The script
+
+**"Scenario" carried three meanings and now carries one.**
+
+| Meaning | Word now | Lives in |
+|---|---|---|
+| a `.feature` file: Given/When/Then, driven steps, criteria | **scenario** | `scenario-gherkin.ts` (810 + 812) |
+| timed inputs at absolute cycles + a cycle budget, replayed deterministically | **replay** | `scenario_player.rs`, `run_scenario` (231) |
+| `RuntimeScenarioSchema` — define-once-run-many with breakpoints, no goal | *dead* | Spec 030, whose spec file no longer exists |
+
+The middle one is what a candidate binds and what makes its runs comparable; calling
+it a scenario is why 810 §4b had to explain which scenario it meant. The third is the
+leftover 810 §4b names, still in `types.ts` with a store and a tool, awaiting a
+deliberate removal.
+
+### The judgement
+
+| Word | Is | Lives in |
+|---|---|---|
+| **criterion** | one `Then` line: what must hold. Byte-exact or verbal | 810 |
+| **mask** | what may legitimately differ — cycles, raster, TOD. Belongs to the CRITERION, never the run | 794 provides it, 810 §3 places it |
+| **acceptance** | a human said "yes, that is right" once, and the resulting state was frozen as the reference | 810 (types only; no store yet) |
+| **verdict** | the result of comparing a run against a reference | 796 returns one; 810 wants one |
+
+**The two references are different questions, and this is the sharpest line in the
+whole area.** A candidate's cached baseline is *the same replay without my patch* —
+"did my code change anything". An acceptance's baseline is *the state a human
+approved* — "does the machine still reach what we agreed was right". Same diff
+engine, different reference, and using 796's for an acceptance would silently answer
+the wrong question.
+
+### The output
+
+| Word | Is | Lives in |
+|---|---|---|
+| **capture** | one frame taken out of a machine, on a frame boundary, with the cycle it came from | 812 |
+| **reel** | captures assembled into one GIF89a for a release | 812 |
+
+A capture is not a screenshot: a screenshot is a PNG for a human to look at now, a
+capture carries its palette indices and its cycle so a reel can be rebuilt from it.
