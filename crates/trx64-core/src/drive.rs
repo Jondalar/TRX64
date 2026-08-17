@@ -91,6 +91,9 @@ struct DriveBus<'a> {
     /// (SYNC), the stepper/motor/speed-zone from store_prb, and the byte-ready
     /// (SO) handshake consumed by the drive CPU's V flag.
     rotation: &'a mut Rotation,
+    /// VICE `drv->cpu->cpu_last_data` — the last byte on the drive's data bus, and
+    /// therefore what an UNMAPPED address reads back (`drive_read_free`).
+    cpu_last_data: &'a mut u8,
     /// Pending `drive_cpu_set_overflow` request raised by a VIA2 store side-effect
     /// (set_ca2 on the PCR CA2 edge / store_prb on the motor edge — via2d.c
     /// set_ca2 → drive_cpu_set_overflow, store_prb motor branch). VICE delivers the
@@ -284,21 +287,47 @@ impl<'a> DriveCore6510Bus for DriveBus<'a> {
                 // PRA ($1801) through `read_pra`; IFR/IER follow 6522 semantics so
                 // the drive IRQ handler ($FE6C LDA $180D) sees the real CA1/timer
                 // flags. viacore_read dispatches any due alarms itself (rclk = clk).
-                if (0x1800..=0x1BFF).contains(&addr) {
-                    return self.via1_read(addr);
+                // The 1541 address decode is NOT a continuous RAM mirror. VICE builds
+                // it in `memiec_init` (drive/iec/memiec.c:137-155) by filling the whole
+                // table with `drive_read_free` and then overlaying, in 2 KB / 1 KB
+                // windows:
+                //
+                //   $0000-$07FF  RAM            $1800-$1BFF  VIA1   $1C00-$1FFF  VIA2
+                //   $2000-$27FF  RAM mirror     $3800-$3BFF  VIA1   $3C00-$3FFF  VIA2
+                //   $4000-$47FF  RAM mirror     $5800-$5BFF  VIA1   $5C00-$5FFF  VIA2
+                //   $6000-$67FF  RAM mirror     $7800-$7BFF  VIA1   $7C00-$7FFF  VIA2
+                //
+                // Everything else below $8000 stays unmapped and reads the open bus.
+                // This used to be `ram[addr & 0x7ff]` for the whole of $0000-$7FFF
+                // with only the $1800/$1C00 windows carved out — so THREE of the four
+                // VIA images were plain RAM here. Drive code that reaches a VIA
+                // through a mirror (a routine ORs $6000 onto its pointers, or walks
+                // $7C00 to save a byte) then wrote into RAM and toggled no line at
+                // all — including CLK, which is what the C64 sits waiting for.
+                let page = addr >> 8;
+                if matches!(page & 0x1f, 0x18..=0x1b) {
+                    let v = self.via1_read(addr);
+                    *self.cpu_last_data = v;
+                    return v;
                 }
-                // VIA2: $1C00-$1FFF — the 1:1-ported viacore (viacore.rs). PRA
-                // ($1C01) / PRB ($1C00) reads sample the rotating disk through the
-                // via2d read_pra/read_prb hooks (GCR_read / sync | wps | 0x6f) and
-                // clear byte_ready_level inside the backend. viacore_read dispatches
-                // any due alarms itself (rclk = clk) for PRB/timer/IFR regs.
-                if (0x1C00..=0x1FFF).contains(&addr) {
-                    return self.via2_read(addr);
+                if matches!(page & 0x1f, 0x1c..=0x1f) {
+                    let v = self.via2_read(addr);
+                    *self.cpu_last_data = v;
+                    return v;
                 }
-                // RAM mirrors: $0000-$07FF and all mirrors up to $7FFF
-                self.ram[(addr & 0x07FF) as usize]
+                if (page & 0x1f) < 0x08 {
+                    let v = self.ram[(addr & 0x07FF) as usize];
+                    *self.cpu_last_data = v;
+                    return v;
+                }
+                // Unmapped — `drive_read_free` returns cpu_last_data.
+                *self.cpu_last_data
             }
-            0x8000..=0xFFFF => self.rom[(addr & 0x7FFF) as usize],
+            0x8000..=0xFFFF => {
+                let v = self.rom[(addr & 0x7FFF) as usize];
+                *self.cpu_last_data = v;
+                v
+            }
         }
     }
 
@@ -310,9 +339,16 @@ impl<'a> DriveCore6510Bus for DriveBus<'a> {
         // store_prb/store_pcr port hooks keep the FULL `ctx.clk` (= the live drive
         // clock the bus syncs into `ctx.clk` via `viaN_with_backend`). The viacore
         // reads `ctx.clk` itself; no manual rclk subtraction is needed here.
+        // Every store puts the byte on the bus first — `drive_store_free` does it
+        // even for an unmapped address (drivemem.c:81-85), which is what makes the
+        // next open-bus READ return it.
+        *self.cpu_last_data = val;
         match addr {
             0x0000..=0x7FFF => {
-                if (0x1800..=0x1BFF).contains(&addr) {
+                // Same window map as `read` — see the comment there. The decode
+                // repeats every $2000, so the page's low five bits select it.
+                let page = addr >> 8;
+                if matches!(page & 0x1f, 0x18..=0x1b) {
                     // viacore_store applies its own write_offset (= 1) so rclk =
                     // ctx.clk - 1 for the register/timer/IFR/IRQ logic. The IEC
                     // side-effect (store_prb) folds the drive's composed PB output
@@ -325,7 +361,7 @@ impl<'a> DriveCore6510Bus for DriveBus<'a> {
                     self.via1_store(addr, val);
                     return;
                 }
-                if (0x1C00..=0x1FFF).contains(&addr) {
+                if matches!(page & 0x1f, 0x1c..=0x1f) {
                     // viacore_store applies its own write_offset (= 1) so rclk =
                     // ctx.clk - 1 for the register/timer/IFR/IRQ logic, while the
                     // store_prb/store_pcr rotation hooks read the FULL ctx.clk —
@@ -334,8 +370,10 @@ impl<'a> DriveCore6510Bus for DriveBus<'a> {
                     self.via2_store(addr, val);
                     return;
                 }
-                // RAM mirrors — write to the base 2 KB
-                self.ram[(addr & 0x07FF) as usize] = val;
+                if (page & 0x1f) < 0x08 {
+                    self.ram[(addr & 0x07FF) as usize] = val;
+                }
+                // Unmapped: the byte is on the bus and goes nowhere else.
             }
             0x8000..=0xFFFF => {
                 // ROM write: silently ignored (open bus)
@@ -387,6 +425,13 @@ pub struct Drive1541 {
     via2_irq: Via2Irq,
     /// Monotonic drive clock (mirrors cpu.clk after each run).
     pub drive_clk: u64,
+    /// VICE `drv->cpu->cpu_last_data` — the last byte that was on the drive's data
+    /// bus. Every mapped read and store updates it, and it is what an UNMAPPED
+    /// address returns (`drive_read_free`, drivemem.c:75-91). The 1541's address
+    /// decode leaves large holes ($0800-$17FF, $2800-$37FF, $4800-$57FF,
+    /// $6800-$77FF) and reading one of those on real hardware yields whatever the
+    /// bus last carried, not RAM.
+    pub cpu_last_data: u8,
     /// Last sampled PC for drive8-cpu deduplication (sampleDrivePc pattern).
     last_sample_pc: Option<u16>,
     /// VICE drive-sync fixed-point accumulator (drivecpu.c:383-390 `cycle_accum`).
@@ -503,6 +548,7 @@ impl Drive1541 {
             via2: new_via2_ctx(),
             via2_irq: Via2Irq::new(),
             drive_clk: 0,
+            cpu_last_data: 0,
             last_sample_pc: None,
             sync_accum: 0,
             stop_clk: 0,
@@ -746,6 +792,7 @@ impl Drive1541 {
             via2_irq: &mut self.via2_irq,
             clk_ptr,
             rotation: &mut self.rotation,
+            cpu_last_data: &mut self.cpu_last_data,
             pending_set_overflow: false,
         };
         // Run whole instructions while the drive clock is behind the stop target
@@ -1009,7 +1056,31 @@ impl Drive1541 {
             // timers and IFR/IER are exact; PRA/PRB report what the VIA drives
             // rather than what the head sees.
             0x1C00..=0x1FFF => viacore::viacore_peek_no_hooks(&self.via2, addr),
-            0x0000..=0x7FFF => self.ram[(addr & 0x07FF) as usize],
+            // The rest of the 1541 decode, same windows as `read`/`write`: the VIAs
+            // appear FOUR times ($1800/$3800/$5800/$7800 and $1C00/$3C00/$5C00/
+            // $7C00), RAM only in 2 KB blocks every 8 KB, and the gaps are open bus.
+            // A debugger that showed RAM where the chip has a VIA mirror would be
+            // describing a machine nobody is running.
+            0x0000..=0x7FFF => {
+                let page = addr >> 8;
+                match page & 0x1f {
+                    0x18..=0x1b => {
+                        let a = (addr & 0xf) as usize;
+                        if a == crate::viacore::VIA_PRB {
+                            let ctx = &self.via1;
+                            let tmp = ((self.via1_iecbus.drv_port ^ 0x85) | 0x1a) & 0xff;
+                            let ddrb = ctx.via[crate::viacore::VIA_DDRB];
+                            ((ctx.via[crate::viacore::VIA_PRB] & ddrb) | (tmp & !ddrb)) & 0xff
+                        } else {
+                            viacore::viacore_peek_no_hooks(&self.via1, addr)
+                        }
+                    }
+                    0x1c..=0x1f => viacore::viacore_peek_no_hooks(&self.via2, addr),
+                    z if z < 0x08 => self.ram[(addr & 0x07FF) as usize],
+                    // `drive_peek_free` — the open bus, reported and not invented.
+                    _ => self.cpu_last_data,
+                }
+            }
             0x8000..=0xFFFF => self.rom[(addr & 0x7FFF) as usize],
         }
     }
@@ -1134,12 +1205,77 @@ mod tests {
                 via2_irq: &mut d.via2_irq,
                 clk_ptr: &mut clk,
                 rotation: &mut d.rotation,
+                cpu_last_data: &mut d.cpu_last_data,
                 pending_set_overflow: false,
             };
             bus.write(0x0010, 0xAB);
-            assert_eq!(bus.read(0x0810), 0xAB, "$0810 should mirror $0010");
-            assert_eq!(bus.read(0x2010), 0xAB, "$2010 should mirror $0010");
+
+            // The RAM mirrors are 2 KB blocks every 8 KB — VICE `memiec_init`
+            // overlays $0000-$07FF, $2000-$27FF, $4000-$47FF, $6000-$67FF and
+            // NOTHING in between.
+            assert_eq!(bus.read(0x2010), 0xAB, "$2010 mirrors $0010");
+            assert_eq!(bus.read(0x4010), 0xAB, "$4010 mirrors $0010");
+            assert_eq!(bus.read(0x6010), 0xAB, "$6010 mirrors $0010");
+
+            // $0810 is NOT a mirror. This assertion used to read
+            //     assert_eq!(bus.read(0x0810), 0xAB, "$0810 should mirror $0010");
+            // and it is why the wrong decode survived: the whole of $0000-$7FFF
+            // was RAM here except the two VIA windows, so $0800-$17FF answered
+            // from RAM instead of the open bus — and three of the FOUR VIA images
+            // ($3800/$5800/$7800 and $3C00/$5C00/$7C00) were RAM as well. Drive
+            // code that reaches a VIA through a mirror wrote into RAM and pulled
+            // no line at all.
+            bus.write(0x0011, 0x5A); // put a known byte on the bus
+            assert_eq!(
+                bus.read(0x0810),
+                0x5A,
+                "$0810 is unmapped — it reads the open bus (cpu_last_data), not RAM"
+            );
+            assert_eq!(bus.read(0x2810), 0x5A, "$2810 is unmapped too");
+            assert_eq!(bus.read(0x4810), 0x5A, "$4810 is unmapped too");
+            assert_eq!(bus.read(0x6810), 0x5A, "$6810 is unmapped too");
         }
+    }
+
+    /// The 1541 has ONE VIA1 and ONE VIA2, and the address decoder shows each of
+    /// them four times below $8000. Reaching a VIA through a mirror must land on
+    /// the chip — it is a common way for drive code to save a byte, and if the
+    /// mirror is RAM the write is swallowed and no bus line moves.
+    #[test]
+    fn the_drive_vias_appear_at_all_four_of_their_addresses() {
+        let mut d = Drive1541::new();
+        let mut clk: u64 = 0;
+        let mut bus = DriveBus {
+            ram: &mut d.ram,
+            rom: &d.rom,
+            via1: &mut d.via1,
+            via1_irq: &mut d.via1_irq,
+            via1_iecbus: &mut d.via1_iecbus,
+            via2: &mut d.via2,
+            via2_irq: &mut d.via2_irq,
+            clk_ptr: &mut clk,
+            rotation: &mut d.rotation,
+            cpu_last_data: &mut d.cpu_last_data,
+            pending_set_overflow: false,
+        };
+
+        // VIA1: write the DDRB latch through the base window, read it back through
+        // each mirror. A RAM mirror would answer with whatever RAM holds there.
+        bus.write(0x1802, 0x5a);
+        for a in [0x1802u16, 0x3802, 0x5802, 0x7802] {
+            assert_eq!(bus.read(a), 0x5a, "VIA1 DDRB through ${a:04X}");
+        }
+        // ...and a write through a MIRROR reaches the same register.
+        bus.write(0x7802, 0xa5);
+        assert_eq!(bus.read(0x1802), 0xa5, "a write through $7802 reaches VIA1");
+
+        // VIA2 the same, through its four windows.
+        bus.write(0x1c02, 0x3c);
+        for a in [0x1c02u16, 0x3c02, 0x5c02, 0x7c02] {
+            assert_eq!(bus.read(a), 0x3c, "VIA2 DDRB through ${a:04X}");
+        }
+        bus.write(0x5c02, 0xc3);
+        assert_eq!(bus.read(0x1c02), 0xc3, "a write through $5C02 reaches VIA2");
     }
 
     #[test]
@@ -1163,6 +1299,7 @@ mod tests {
             via2_irq: &mut d.via2_irq,
             clk_ptr: &mut clk,
             rotation: &mut d.rotation,
+            cpu_last_data: &mut d.cpu_last_data,
             pending_set_overflow: false,
         };
         // The FIRST $1800 PB write fires store_prb (composed out 0xff != oldpb 0,
@@ -1214,6 +1351,7 @@ mod tests {
             via2_irq: &mut d.via2_irq,
             clk_ptr: &mut clk,
             rotation: &mut d.rotation,
+            cpu_last_data: &mut d.cpu_last_data,
             pending_set_overflow: false,
         };
         assert_eq!(
@@ -1424,6 +1562,7 @@ mod tests {
             via2_irq: &mut d.via2_irq,
             clk_ptr: &mut clk,
             rotation: &mut d.rotation,
+            cpu_last_data: &mut d.cpu_last_data,
             pending_set_overflow: false,
         };
         assert_eq!(bus.read(0xC010), 0xEA);
