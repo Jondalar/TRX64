@@ -19053,6 +19053,85 @@ mod batch1_tests {
     ///
     /// The value had to be obtained by single-stepping the KERNAL until an
     /// `LDA $DD00` landed in the accumulator. One byte, by hand.
+    /// A capture has to be able to ask for a WHOLE frame.
+    ///
+    /// `displayed` is the frozen PREVIOUS frame, so a capture taken mid-frame hands
+    /// back the picture before the interesting one — the lesson 808 already paid
+    /// for. `session/advance_to_frame` runs to the next raster wrap and reports the
+    /// cycle it landed on, so whoever is driving can say where a picture came from.
+    ///
+    /// The boundary is found by WATCHING the wrap, not by arithmetic on the cycle
+    /// counter: a one-cycle budget still finishes the instruction in flight, so
+    /// `raster_cycle` can step over any exact value we might aim at. A wrap cannot
+    /// be stepped over.
+    #[test]
+    fn advancing_to_a_frame_lands_on_the_raster_wrap() {
+        let st = make_state();
+        call(&st, "session/power", json!({ "op": "on" }));
+        for _ in 0..8 {
+            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+        }
+        // The transport owns the clock here; a running machine has no boundary to
+        // stop on, and the RPC says so rather than racing.
+        call(&st, "debug/pause", json!({ "source": "test" }));
+
+        // From an arbitrary mid-frame position, not a lucky one.
+        call(&st, "session/run", json!({ "cycles": 7_777 }));
+        let before = st.lock().unwrap().session.machine.vic.raster_line;
+        assert_ne!(before, 0, "the test needs to start mid-frame to mean anything");
+
+        let r = call(&st, "session/advance_to_frame", json!({}));
+        assert_eq!(r["rasterLine"].as_u64(), Some(0), "a capture point is a frame boundary");
+        assert!(
+            r["cyclesAdvanced"].as_u64().unwrap() > 0,
+            "it had to move to get there"
+        );
+
+        // Idempotent: already on a boundary means zero cycles, not a whole frame.
+        let again = call(&st, "session/advance_to_frame", json!({}));
+        assert_eq!(again["cyclesAdvanced"].as_u64(), Some(0), "already there");
+
+        // And the frame it hands out is the machine's own canvas, palette included,
+        // so nobody downstream has to decode a PNG to get at pixels.
+        let f = call(&st, "session/frame_indices", json!({}));
+        assert_eq!(f["width"].as_u64(), Some(384));
+        assert_eq!(f["height"].as_u64(), Some(272));
+        let px = base64_decode(f["indices"].as_str().unwrap()).expect("indices");
+        assert_eq!(px.len(), 384 * 272, "one byte per pixel");
+        assert!(px.iter().all(|b| *b < 16), "every pixel is a 4-bit colour index");
+        let pal = base64_decode(f["palette"].as_str().unwrap()).expect("palette");
+        assert_eq!(pal.len(), 48, "16 RGB entries — a GIF colour table, as it stands");
+    }
+
+    /// A joystick held for N frames is visible to CIA1 for N frames.
+    ///
+    /// This is the machine half of the thing that made a menu pick the wrong entry:
+    /// a press with no stated end is held until some later call happens to clear
+    /// it, and a menu that samples once per frame scrolls through the whole list.
+    /// Whoever schedules the press owns the duration; what the MACHINE must
+    /// guarantee is that the press is seen for exactly as long as it is set.
+    #[test]
+    fn a_held_joystick_is_seen_for_every_frame_it_is_held() {
+        let st = make_state();
+        call(&st, "session/power", json!({ "op": "on" }));
+        for _ in 0..8 {
+            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+        }
+        // Port 2 → CIA1 PA; FIRE is bit 4, active low.
+        let fire_low = || st.lock().unwrap().session.machine.read_full(0xdc00) & 0x10 == 0;
+        assert!(!fire_low(), "nothing is pressed to begin with");
+
+        call(&st, "session/joystick_set", json!({ "port": 2, "fire": true, "source": "llm" }));
+        for f in 0..3 {
+            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+            assert!(fire_low(), "frame {f} of a 3-frame press must see the stick");
+        }
+
+        call(&st, "session/joystick_clear", json!({ "port": 2 }));
+        call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+        assert!(!fire_low(), "and released after, without touching the other port");
+    }
+
     #[test]
     fn the_serial_bus_is_visible_from_outside_the_machine() {
         let st = make_state();

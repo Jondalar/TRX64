@@ -12,7 +12,6 @@ pub mod boot_cmd;
 pub mod convert_cmd;
 pub mod diff_cmd;
 pub mod disasm_cmd;
-pub mod reel_cmd;
 pub mod sandbox_cmd;
 pub mod engine;
 pub mod ftcolor;

@@ -29,7 +29,6 @@ use trx64_cli::boot_cmd;
 use trx64_cli::convert_cmd;
 use trx64_cli::diff_cmd;
 use trx64_cli::disasm_cmd::{self, DisasmArgs};
-use trx64_cli::reel_cmd;
 use trx64_cli::sandbox_cmd;
 use trx64_cli::engine::Engine;
 use trx64_cli::tui::{self, UiToMain};
@@ -307,36 +306,6 @@ enum Command {
         trace_domains: String,
     },
 
-    /// Spec 812 — run a capture scenario in an isolated machine and write the reel.
-    ///
-    /// The scenario is JSON: a medium, and a list of steps that each carry their own
-    /// duration (`wait`, `type`, `joy` with `frames`, `waitUntil` with a mandatory
-    /// `timeoutFrames`, `shot`). Every schedule point is an absolute machine cycle,
-    /// so the same file replays to the same bytes — unlike a recipe of "press this,
-    /// then run about two million instructions", which is two seconds with the stick
-    /// held and lands somewhere new every time.
-    ///
-    /// Runs in THIS process on its own machine (Spec 787 scratch instance): no
-    /// daemon, no port, never the shared session. E.g.
-    ///   trx64cli reel --scenario release.json --out release.gif --manifest release.json.out
-    Reel {
-        /// The capture scenario (JSON).
-        #[arg(long)]
-        scenario: String,
-        /// Output GIF89a path.
-        #[arg(long)]
-        out: String,
-        /// Also write the run report (frames, cycles, dropped frames) as JSON.
-        #[arg(long)]
-        manifest: Option<String>,
-        /// Also write each captured frame's raw colour indices into this directory
-        /// (384×272 bytes per frame) — for comparing a reel against its source.
-        #[arg(long = "frames-dir")]
-        frames_dir: Option<String>,
-        /// Emit the report as JSON on stdout instead of a human summary.
-        #[arg(long, default_value_t = false)]
-        json: bool,
-    },
 }
 
 fn main() {
@@ -462,46 +431,6 @@ fn main() {
             render.as_deref(), trace.as_deref(), trace_domains,
         ) {
             Ok(out) => println!("{out}"),
-            Err(e) => {
-                eprintln!("{e}");
-                std::process::exit(2);
-            }
-        }
-        return;
-    }
-
-    // ── Capture scenario → reel (Spec 812; isolated scratch instance) ──────────
-    if let Some(Command::Reel { scenario, out, manifest, frames_dir, json }) = &cli.cmd {
-        match reel_cmd::run_reel(
-            &rom_dir,
-            scenario,
-            out,
-            manifest.as_deref(),
-            frames_dir.as_deref(),
-        ) {
-            Ok(report) => {
-                if *json {
-                    println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
-                } else {
-                    let g = |k: &str| report.get(k).cloned().unwrap_or(serde_json::Value::Null);
-                    println!(
-                        "{} → {} ({} bytes / {} max, {}×{}, {} frames, {} cs delay)",
-                        g("name"), g("gif"), g("bytes"), g("maxBytes"),
-                        g("width"), g("height"), g("frames"), g("delayCentiseconds"),
-                    );
-                    if let Some(d) = report.get("dropped").and_then(|v| v.as_array()) {
-                        if !d.is_empty() {
-                            println!("dropped to fit the byte budget: {}",
-                                serde_json::to_string(d).unwrap_or_default());
-                        }
-                    }
-                    if let Some(lines) = report.get("log").and_then(|v| v.as_array()) {
-                        for l in lines {
-                            println!("  {}", l.as_str().unwrap_or_default());
-                        }
-                    }
-                }
-            }
             Err(e) => {
                 eprintln!("{e}");
                 std::process::exit(2);
