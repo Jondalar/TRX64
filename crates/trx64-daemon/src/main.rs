@@ -21929,8 +21929,27 @@ mod batch1_tests {
                 backing_path: Some(d64_path.to_string_lossy().to_string()),
                 read_only: false,
             });
-            // Drive a real bit-level write at the parked head (track 18) → dirties
-            // a GCR track exactly as the engine's WRITE path does.
+            // Write a real SECTOR at the parked head (track 18), then dirty the
+            // track the way the engine's write path does.
+            //
+            // This used to flip a single bit (`write_one_bit_for_test(1)`) and
+            // prove persistence by asserting the file CHANGED. That only worked
+            // because a stray bit shredded the sector's GCR framing and the
+            // write-back stored the failed decode — which is exactly the data loss
+            // `a_sector_that_cannot_be_decoded_keeps_its_bytes` now forbids. A
+            // sector that cannot be read back is left alone, so a lone flipped bit
+            // no longer changes the image, and it never should have.
+            let sector: Vec<u8> = (0..256).map(|i| (0x40u16 + i as u16) as u8).collect();
+            {
+                let rot = &mut st.session.machine.drive8.rotation;
+                let ht = rot.current_half_track as usize;
+                let img = rot.image.as_mut().expect("image attached");
+                assert_eq!(
+                    trx64_core::gcr::gcr_write_sector(&mut img.tracks[ht - 2], &sector, 0),
+                    trx64_core::gcr::CBMDOS_FDC_ERR_OK,
+                    "the sector encode must succeed"
+                );
+            }
             st.session.machine.drive8.rotation.write_one_bit_for_test(1);
             assert!(
                 st.session.machine.drive8.rotation.has_dirty_track(),

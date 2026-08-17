@@ -2113,11 +2113,23 @@ impl<'a> ViaBackend for Via2dBackend<'a> {
         }
         let drv = &mut *self.drive;
         drv.rotate_disk(ctx.clk);
-        // VICE: GCR_write_value = byte. The Rust rotation has no write-value field
-        // (D64 write path is out of scope here); the write value is unused on the
-        // read-only LOAD path, so this is a no-op (NOT folded into gcr_read, which
-        // would corrupt the read byte).
-        let _ = byte;
+        // via2d.c:187 — `via2p->drive->GCR_write_value = byte;`
+        //
+        // This is THE byte the drive writes to the disk: the DOS stores each GCR
+        // byte to $1C01 and the rotation engine latches it into `last_write_data`
+        // at the next byte boundary (`last_write_data = GCR_write_value`, both
+        // engines' write branches).
+        //
+        // It used to be dropped on the floor, under a comment saying the write
+        // value "is unused on the read-only LOAD path". The field exists and both
+        // write branches read it — so every byte the drive ever wrote came from a
+        // value nothing had set. A SAVE reported SAVING and then READY, and the
+        // very next LOAD of the same file said FILE NOT FOUND: the drive could not
+        // read back anything it had written, because it had written a constant.
+        // For a title that saves mid-run this also breaks the RUN: the loader
+        // writes, reads back, gets a data-block error, and executes whatever is in
+        // the buffer.
+        drv.gcr_write_value = byte;
         drv.byte_ready_level = 0;
     }
 
@@ -2254,8 +2266,13 @@ impl<'a> ViaBackend for Via2dBackend<'a> {
         if !self.has_image {
             return None; // VICE drv always live; no image → 0xff (None).
         }
-        // IF: add bus read delay — req_ref_cycles has no effect in the simple D64
-        // engine (omitted, as in the distilled port).
+        // via2d.c:472 — `via2p->drive->req_ref_cycles = BUS_READ_DELAY;` before the
+        // rotate. It was omitted here on the argument that the simple D64 engine
+        // ignores it (it does — `rotation_1541_simple` zeroes it first). But the
+        // CIRCUIT engine consumes it as `ref_advance` in `rotation_1541_gcr_cycle`,
+        // which is real time on the read channel, and that engine now actually runs
+        // for a G64. VICE sets it unconditionally in both port reads; so do we.
+        self.drive.req_ref_cycles = crate::rotation::BUS_READ_DELAY as u64;
         self.drive.byte_read(ctx.clk);
         // VICE: byte = ((GCR_read & ~DDRA) | (PRA & DDRA));
         let ddra = ctx.via[VIA_DDRA];
@@ -2271,6 +2288,8 @@ impl<'a> ViaBackend for Via2dBackend<'a> {
             return None;
         }
         let clk = ctx.clk;
+        // via2d.c:494 — the same bus read delay as read_pra.
+        self.drive.req_ref_cycles = crate::rotation::BUS_READ_DELAY as u64;
         self.drive.rotate_disk(clk);
         let sync = self.drive.sync_found(); // already 0 or 0x80
         let wps = if self.drive_writeprotect_sense(clk) {
