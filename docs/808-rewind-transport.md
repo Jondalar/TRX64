@@ -1,6 +1,15 @@
 # Spec 808 — Rewind transport: play the machine backwards
 
-**Status:** PROPOSED
+**Status:** PARTLY BUILT — the TRX64 half is in and has been for days, and this line said
+PROPOSED the whole time, which is the drift rule 9 exists for. Built: the daemon owns the
+transport state (§4b), the monitor verbs, `transport/play|pause|goto|frame|toggle|status`,
+F9–F12 in the TUI and the emulator window off ONE shared key table, the frame lens (a
+capture on an anchor can show the frame the redraw used to throw away), and — 2026-08-17 —
+`transport/key`, so a client HANDS OVER the key and the daemon answers what it did or that
+it dropped it. Web-UI F9–F12 go through that door.
+**Open:** the C64RE ribbon in the scrub UI (§4) — the browser has the keys now and no
+visible transport controls, so the four actions are discoverable only from the terminal's
+legend.
 **Repos:** TRX64 (daemon transport + monitor verbs + TUI keys) and C64RE (the ribbon in the
 existing scrub UI). Feature parity is a requirement, not a nice-to-have — see §2.
 **Number:** 808 (shared board `C64ReverseEngineeringMCP/specs/README.md`).

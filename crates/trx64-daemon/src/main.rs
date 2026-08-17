@@ -12746,6 +12746,80 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
         // F11, decided HERE. The client sends one event and renders one message; it does
         // not read two flags and issue two verbs, which is how it came to need three
         // presses to get from rewind-playing back to playing.
+        // A client hands over the key it was pressed; the DAEMON decides what it
+        // means, or says it dropped it.
+        //
+        // The decision table has always lived here (`transport::key_verb`, one
+        // table so that moving pause from F10 to F11 could not update the terminal
+        // and leave the emulator window behind). It was only ever reachable
+        // IN-PROCESS, though: over the wire there are verbs — play, pause, goto,
+        // frame — and no door through which a client can simply say "F9". So a WS
+        // client had to carry its own copy of the mapping, which is the client
+        // deciding, which is the thing the shared table exists to prevent. The
+        // browser never carried one, so F9..F12 did nothing there at all.
+        //
+        // Any F-number is accepted and answered. `handled:false` with a reason is a
+        // real answer — a key the machine has no use for must be reported as
+        // dropped, not swallowed in silence, or the next client to go quiet leaves
+        // nobody able to tell "not mapped" from "broken".
+        "transport/key" => {
+            let Some(f) = req.params.get("key").and_then(|v| v.as_u64()) else {
+                return Response::err(id, -32602, "transport/key: key required (the F-number, e.g. 9)");
+            };
+            let f = f as u8;
+
+            // F11 is not a verb, it is a decision that depends on the whole state
+            // (playing → pause; paused → forward, which at the head is just run on).
+            // Mapping it to a fixed string was wrong in two of the four states.
+            if f == 11 {
+                let mut r = dispatch(
+                    Request {
+                        jsonrpc: "2.0".into(),
+                        id: req.id.clone(),
+                        method: "transport/toggle".into(),
+                        params: json!({}),
+                    },
+                    state,
+                );
+                if let Some(v) = r.result.as_mut() {
+                    v["handled"] = json!(true);
+                    v["key"] = json!(f);
+                }
+                return r;
+            }
+
+            let running = { state.lock().unwrap().session.running };
+            let Some(verb) = transport::key_verb(f, running) else {
+                return Response::ok(id, json!({
+                    "handled": false,
+                    "key": f,
+                    "reason": format!(
+                        "F{f} is not a transport key — the transport is F9 (frame back), \
+                         F10 (play backwards), F11 (pause/play), F12 (frame forward)"
+                    ),
+                }));
+            };
+
+            // The same path the terminal front-end takes: the table names a monitor
+            // verb, and the verb is what runs. One behaviour, not two.
+            let mut r = dispatch(
+                Request {
+                    jsonrpc: "2.0".into(),
+                    id: req.id.clone(),
+                    method: "monitor/exec".into(),
+                    params: json!({ "command": verb }),
+                },
+                state,
+            );
+            if let Some(v) = r.result.as_mut() {
+                v["handled"] = json!(true);
+                v["key"] = json!(f);
+                v["verb"] = json!(verb);
+                v["transport"] = transport_status(&state.lock().unwrap());
+            }
+            r
+        }
+
         "transport/toggle" => {
             let mut st = state.lock().unwrap();
             let playing = st.session.running || st.transport.playing.is_some();
@@ -19053,6 +19127,58 @@ mod batch1_tests {
     ///
     /// The value had to be obtained by single-stepping the KERNAL until an
     /// `LDA $DD00` landed in the accumulator. One byte, by hand.
+    /// A client hands over the key; the daemon decides, or says it dropped it.
+    ///
+    /// The table was already shared — and reachable only in-process. Over the wire
+    /// there were verbs and no door for a key, so a WS client had to carry its own
+    /// copy of the mapping. The browser never did, so F9..F12 were dead there while
+    /// working in the terminal: the same physical key, two behaviours, which is
+    /// exactly what one shared table was supposed to make impossible.
+    #[test]
+    fn the_daemon_decides_what_a_transport_key_means() {
+        let st = make_state();
+        call(&st, "session/power", json!({ "op": "on" }));
+        for _ in 0..8 {
+            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+        }
+
+        // F11 is a DECISION, not a verb: playing → pause, paused → play forward.
+        // Its answer has to say which of the two it just did.
+        call(&st, "debug/run", json!({ "source": "test" }));
+        let pause = call(&st, "transport/key", json!({ "key": 11 }));
+        assert_eq!(pause["handled"], json!(true));
+        assert_eq!(pause["action"], json!("pause"), "a running machine pauses");
+        assert!(!st.lock().unwrap().session.running);
+
+        let play = call(&st, "transport/key", json!({ "key": 11 }));
+        assert_eq!(play["handled"], json!(true));
+        assert_ne!(play["action"], json!("pause"), "and a paused one plays");
+
+        // F9 and F12 ARE verbs, and the reply names the one the daemon chose — a
+        // client that had to know "F9 means frame -1" would be deciding.
+        call(&st, "transport/key", json!({ "key": 11 })); // back to paused
+        let back = call(&st, "transport/key", json!({ "key": 9 }));
+        assert_eq!(back["handled"], json!(true));
+        assert_eq!(back["verb"], json!("frame -1"));
+        let fwd = call(&st, "transport/key", json!({ "key": 12 }));
+        assert_eq!(fwd["verb"], json!("frame +1"));
+        assert!(!fwd["transport"].is_null(), "the reply carries the new transport state");
+
+        // A key with no transport meaning is REPORTED as dropped. Silence would
+        // leave the next client unable to tell "not mapped" from "broken" — which
+        // is how F9..F12 sat dead in the browser without anyone noticing.
+        let dropped = call(&st, "transport/key", json!({ "key": 5 }));
+        assert_eq!(dropped["handled"], json!(false));
+        assert!(
+            dropped["reason"].as_str().unwrap_or("").contains("F9"),
+            "a dropped key says what the transport keys actually are: {dropped:?}"
+        );
+
+        // And a request with no key at all is an error, not a guess.
+        let err = call_err(&st, "transport/key", json!({}));
+        assert!(err.message.contains("key required"), "{err:?}");
+    }
+
     /// A capture has to be able to ask for a WHOLE frame.
     ///
     /// `displayed` is the frozen PREVIOUS frame, so a capture taken mid-frame hands
