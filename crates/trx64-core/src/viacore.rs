@@ -2254,8 +2254,13 @@ impl<'a> ViaBackend for Via2dBackend<'a> {
         if !self.has_image {
             return None; // VICE drv always live; no image → 0xff (None).
         }
-        // IF: add bus read delay — req_ref_cycles has no effect in the simple D64
-        // engine (omitted, as in the distilled port).
+        // via2d.c:472 — `via2p->drive->req_ref_cycles = BUS_READ_DELAY;` before the
+        // rotate. It was omitted here on the argument that the simple D64 engine
+        // ignores it (it does — `rotation_1541_simple` zeroes it first). But the
+        // CIRCUIT engine consumes it as `ref_advance` in `rotation_1541_gcr_cycle`,
+        // which is real time on the read channel, and that engine now actually runs
+        // for a G64. VICE sets it unconditionally in both port reads; so do we.
+        self.drive.req_ref_cycles = crate::rotation::BUS_READ_DELAY as u64;
         self.drive.byte_read(ctx.clk);
         // VICE: byte = ((GCR_read & ~DDRA) | (PRA & DDRA));
         let ddra = ctx.via[VIA_DDRA];
@@ -2271,6 +2276,8 @@ impl<'a> ViaBackend for Via2dBackend<'a> {
             return None;
         }
         let clk = ctx.clk;
+        // via2d.c:494 — the same bus read delay as read_pra.
+        self.drive.req_ref_cycles = crate::rotation::BUS_READ_DELAY as u64;
         self.drive.rotate_disk(clk);
         let sync = self.drive.sync_found(); // already 0 or 0x80
         let wps = if self.drive_writeprotect_sense(clk) {

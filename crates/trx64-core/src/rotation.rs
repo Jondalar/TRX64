@@ -1100,6 +1100,27 @@ impl Rotation {
     ) {
         self.image = Some(image);
         self.gcr_image_loaded = 1;
+        // VICE `drive_image_attach` (driveimage.c:222) decides HERE which of the
+        // two rotation engines this medium runs on, and it re-decides on every
+        // attach — including back to 0 for a dxx image:
+        //
+        //   complicated_image_loaded = (P64 || G64 || G71)
+        //
+        // `docs/vice-1541-arch.md:231` writes that rule down and it was never
+        // implemented: the flag was only ever SET (by a write, or a snapshot
+        // restore) and never cleared, so it stayed at its power-on 0. Measured
+        // across the 7-game gate, five of the seven titles — every G64 — ran on
+        // `rotation_1541_simple` while VICE runs the read-channel circuit for
+        // exactly those images. The protected loaders were green against a
+        // channel VICE does not use for them.
+        //
+        // A caller that hands over a writeback kind tells us what the medium IS;
+        // without one (a raw GcrImage, e.g. a synthesised fixture) keep the
+        // conservative simple engine, which is what a dxx image gets.
+        self.complicated_image_loaded = match writeback.as_ref().map(|(_, k, _)| k) {
+            Some(WritebackKind::G64) => 1,
+            _ => 0,
+        };
         self.gcr_current_track_size = 0;
         self.gcr_head_offset = 0;
         match writeback {
