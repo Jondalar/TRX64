@@ -609,6 +609,19 @@ fn gcr_find_sector_header(raw: &GcrTrack, sector: u8) -> i64 {
         if p2 == p {
             break;
         }
+        // No further sync on this track: there is no header here to decode.
+        //
+        // VICE reaches this with a negative `p` too and hands it to
+        // `gcr_decode_block`, where `p >> 3` indexes the track buffer from
+        // BEFORE its start — undefined behaviour that happens to read something
+        // and move on. The `p2 == p` guard above only catches it when the FIRST
+        // search already failed; once a sync has been found, a later search that
+        // finds none walks straight into the decode. Rust indexes that as
+        // 0xffff_ffff_ffff_ffff and panics, which took the whole daemon down the
+        // moment a track lost its syncs.
+        if p < 0 {
+            break;
+        }
         if p2 < 0 {
             p2 = p;
         }
@@ -845,15 +858,46 @@ fn write_dxx_half_track(bytes: &mut [u8], half_track: usize, raw: &GcrTrack, rea
         None => return -1,
     };
 
-    // ts:374-399 — decode each sector via gcr_read_sector into a track buffer.
+    // Decode each sector of the track (VICE fsimage_dxx_write_half_track:78-102).
+    //
+    // A write-back rewrites the WHOLE track, so every sector on it passes through
+    // this decode — including the ones the drive never touched. When a decode
+    // FAILS, VICE writes the failed result and records the reason in the image's
+    // error-info map, creating the map if the image has none:
+    //
+    //     rf = gcr_read_sector(raw, &buffer[sector * 256], sector);
+    //     if (rf != CBMDOS_FDC_ERR_OK) { log_error("Could not find data sector…");
+    //                                    /* create map if it does not exist */ }
+    //     if (map != NULL) map[sectors + sector] = rf;
+    //
+    // We have no error map. Writing the failed decode WITHOUT one is not "matching
+    // VICE" — it is the destructive half of VICE's behaviour with the half that
+    // records it left out, and it is silent. Measured: one game that saves its
+    // high score turned four sectors of track 18 — the BAM and three directory
+    // sectors — into GCR-looking rubbish, and the disk would not boot again. The
+    // BAM came back with link $13$01 and DOS byte $12 where a BAM has $12$01 and
+    // 'A'.
+    //
+    // So a sector that does not decode KEEPS the bytes already in the image. The
+    // drive cannot have written a sector it cannot read back, and the previous
+    // content is the best evidence we hold. The count is returned so a caller can
+    // say so out loud.
     let mut buffer = vec![0u8; max_sector as usize * 256];
+    let offset_for = |sector: u8| (sectors + sector as usize) * 256;
+    let mut undecodable = 0i32;
     for sector in 0..max_sector {
         let mut tmp = [0u8; 256];
-        // rf is computed (and would feed the error map) but a map-less plain D64
-        // ignores it — the decoded bytes are always written, matching VICE.
-        let _rf = gcr_read_sector(raw, &mut tmp, sector);
+        let rf = gcr_read_sector(raw, &mut tmp, sector);
         let base = sector as usize * 256;
-        buffer[base..base + 256].copy_from_slice(&tmp);
+        if rf == CBMDOS_FDC_ERR_OK {
+            buffer[base..base + 256].copy_from_slice(&tmp);
+        } else {
+            undecodable += 1;
+            let o = offset_for(sector);
+            if o + 256 <= bytes.len() {
+                buffer[base..base + 256].copy_from_slice(&bytes[o..o + 256]);
+            }
+        }
     }
 
     // ts:400-406 — write the whole track at the linear sector offset.
@@ -863,7 +907,7 @@ fn write_dxx_half_track(bytes: &mut [u8], half_track: usize, raw: &GcrTrack, rea
     }
     // ts:407-424 — error-info map writeback skipped (map is null for plain D64).
     // ts:425-428 — fflush (no-op) + hostFlush (daemon writes at media/persist).
-    0
+    undecodable
 }
 
 /// PORT OF: util.c (util_word_to_le_buf) — 16-bit LE store into `buf[0..2]`.

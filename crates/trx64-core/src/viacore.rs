@@ -2113,11 +2113,23 @@ impl<'a> ViaBackend for Via2dBackend<'a> {
         }
         let drv = &mut *self.drive;
         drv.rotate_disk(ctx.clk);
-        // VICE: GCR_write_value = byte. The Rust rotation has no write-value field
-        // (D64 write path is out of scope here); the write value is unused on the
-        // read-only LOAD path, so this is a no-op (NOT folded into gcr_read, which
-        // would corrupt the read byte).
-        let _ = byte;
+        // via2d.c:187 — `via2p->drive->GCR_write_value = byte;`
+        //
+        // This is THE byte the drive writes to the disk: the DOS stores each GCR
+        // byte to $1C01 and the rotation engine latches it into `last_write_data`
+        // at the next byte boundary (`last_write_data = GCR_write_value`, both
+        // engines' write branches).
+        //
+        // It used to be dropped on the floor, under a comment saying the write
+        // value "is unused on the read-only LOAD path". The field exists and both
+        // write branches read it — so every byte the drive ever wrote came from a
+        // value nothing had set. A SAVE reported SAVING and then READY, and the
+        // very next LOAD of the same file said FILE NOT FOUND: the drive could not
+        // read back anything it had written, because it had written a constant.
+        // For a title that saves mid-run this also breaks the RUN: the loader
+        // writes, reads back, gets a data-block error, and executes whatever is in
+        // the buffer.
+        drv.gcr_write_value = byte;
         drv.byte_ready_level = 0;
     }
 
