@@ -473,13 +473,21 @@ impl<'a> FullBus<'a> {
     }
 
     /// VIC bank base from CIA2 port-A bits 0-1 (= Machine::vic_bank_base):
-    /// `bank = 3 - (PA & DDRA & 3); base = bank * $4000`. Used by the per-cycle
-    /// VIC fetch view (tick/check_ba) + the static collision recompute.
+    /// PORT OF: `core/ciacore.c:810` + `c64/c64cia2.c:150-151`. The byte the CIA
+    /// puts on port A is `PRA | ~DDRA` — an INPUT pin contributes 1, because the
+    /// pin floats high on the pull-up, not 0. `store_ciapa` then takes `~byte & 3`.
+    /// Masking with `PRA & DDRA` instead reads an input bank bit as 0 and lands the
+    /// VIC 3 banks away: the KERNAL leaves `DDRA = $3F` so both forms agree, but a
+    /// fastloader that drives $DD00 itself (Spindle writes `DDRA = $3C`) leaves the
+    /// bank bits as inputs and every fetch goes to the wrong 16 KB.
+    ///
+    /// Used by the per-cycle VIC fetch view (tick/check_ba) + the static collision
+    /// recompute.
     #[inline]
     pub(crate) fn vic_bank_base(&self) -> u16 {
         let pra = self.cia2.peek(0xdd00);
         let ddra = self.cia2.peek(0xdd02);
-        let bank = ((pra & ddra & 0x03) ^ 0x03) as u16;
+        let bank = (((pra | !ddra) & 0x03) ^ 0x03) as u16;
         bank.wrapping_mul(0x4000)
     }
 
@@ -501,7 +509,7 @@ impl<'a> FullBus<'a> {
         // VIC bank base from CIA2 port-A bits 0-1 (= Machine::vic_bank_base).
         let pra = self.cia2.peek(0xdd00);
         let ddra = self.cia2.peek(0xdd02);
-        let bank = ((pra & ddra & 0x03) ^ 0x03) as u16;
+        let bank = (((pra | !ddra) & 0x03) ^ 0x03) as u16;
         let bank_base = bank.wrapping_mul(0x4000);
 
         let inp = crate::render::RenderInput {
