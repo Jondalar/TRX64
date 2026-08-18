@@ -8725,9 +8725,16 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             let screen_ptr = (((d018 >> 4) & 0xf) as u64) << 10;
             let chargen_ptr = (((d018 >> 1) & 7) as u64) << 11;
             let bitmap_ptr = if d018 & 8 != 0 { 0x2000u64 } else { 0 };
-            let cia2_pra = machine.cia2.peek(0xdd00);
-            let cia2_ddra = machine.cia2.peek(0xdd02);
-            let bank = ((cia2_pra & cia2_ddra & 3) ^ 3) as u64;
+            // BUG-051 — a FIFTH copy of the bank formula lived here, with the same
+            // `PRA & DDRA` mistake: an input pin read 0 instead of the 1 its pull-up
+            // puts there, so a fastloader that drives $DD00 itself was reported three
+            // banks off. Ask the machine, which owns the rule, rather than restating it.
+            let bank = (machine.vic_bank_base() / 0x4000) as u64;
+            // Spec 813 — the ABSOLUTE bases, so a consumer never has to redo the bank
+            // arithmetic (and get it wrong the way this line just did).
+            let screen_base = machine.vic_bank_base() as u64 + screen_ptr;
+            let chargen_base = machine.vic_bank_base() as u64 + chargen_ptr;
+            let bitmap_base = machine.vic_bank_base() as u64 + bitmap_ptr;
             let rd16 = |a: u16| -> u64 {
                 machine.read_full(a) as u64 | ((machine.read_full(a.wrapping_add(1)) as u64) << 8)
             };
@@ -8757,6 +8764,10 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                     "screenPtr": screen_ptr,
                     "chargenPtr": chargen_ptr,
                     "bitmapPtr": bitmap_ptr,
+                    "screenBase": screen_base,
+                    "chargenBase": chargen_base,
+                    "bitmapBase": bitmap_base,
+                    "colorBase": 0xd800u64,
                     "border": (v(0x20) & 0xf) as u64,
                     "background": (v(0x21) & 0xf) as u64
                 },
@@ -9226,6 +9237,67 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 "c64Cycles": st.session.machine.clk,
                 "rasterLine": st.session.machine.vic.raster_line as u64,
                 "rasterCycle": st.session.machine.vic.raster_cycle as u64,
+            }))
+        }
+
+        // Spec 813 §8 — a bulk, side-effect-free byte read at the current cycle.
+        // A predicate that is evaluated once per FRAME cannot go through
+        // `monitor/exec` and parse a hex dump out of formatted text, and that text
+        // path cannot name a lens either, so RAM under I/O and the colour-RAM
+        // read-back form are simply not expressible. This is one machine fact:
+        // these addresses, right now, through that lens.
+        //
+        // `lens` per range, defaulting to "cpu" (the live PLA-banked view the CPU
+        // itself would see): "ram" reads under everything, "io" the chip
+        // registers + colour RAM in their read-back form, "rom"/"cart" the rest.
+        "session/read_memory" => {
+            let st = state.lock().unwrap();
+            let ranges = match req.params.get("ranges").and_then(|v| v.as_array()) {
+                Some(r) => r,
+                None => return Response::err(id, -32602, "read_memory: `ranges` must be an array of {addr, len, lens?}"),
+            };
+            // Bound the answer: a caller asking for the whole address space per frame
+            // is a mistake, and a silent 64 KB per frame would look like a slow
+            // predicate rather than a wrong one.
+            // 32 KiB: a text screen with its colour RAM is 2 KiB, a bitmap 8 KiB.
+            // Reading the whole address space per frame is the mistake this rejects.
+            const MAX_TOTAL: u64 = 32 * 1024;
+            let mut total: u64 = 0;
+            let mut chunks: Vec<serde_json::Value> = Vec::with_capacity(ranges.len());
+            for r in ranges {
+                let addr = match r.get("addr").and_then(|v| v.as_u64()) {
+                    Some(a) if a <= 0xffff => a as u16,
+                    _ => return Response::err(id, -32602, "read_memory: each range needs `addr` in $0000..$FFFF"),
+                };
+                let len = match r.get("len").and_then(|v| v.as_u64()) {
+                    Some(l) if l >= 1 && l <= 0x10000 => l,
+                    _ => return Response::err(id, -32602, "read_memory: each range needs `len` in 1..=65536"),
+                };
+                total += len;
+                if total > MAX_TOTAL {
+                    return Response::err(id, -32602, &format!(
+                        "read_memory: {total} bytes asked for, {MAX_TOTAL} is the cap — a per-frame predicate reads a region, not the machine"
+                    ));
+                }
+                let lens = r.get("lens").and_then(|v| v.as_str()).unwrap_or("cpu");
+                let mut bytes = Vec::with_capacity(len as usize);
+                for i in 0..len {
+                    // Wraps at $FFFF like the 6510 does, rather than truncating the
+                    // range and silently answering something shorter.
+                    let a = addr.wrapping_add((i & 0xffff) as u16);
+                    bytes.push(st.session.machine.peek_lens(a, lens));
+                }
+                chunks.push(json!({
+                    "addr": addr as u64,
+                    "len": len,
+                    "lens": lens,
+                    "bytes": base64_encode(&bytes),
+                }));
+            }
+            Response::ok(id, json!({
+                "chunks": chunks,
+                "c64Cycles": st.session.machine.clk,
+                "rasterLine": st.session.machine.vic.raster_line as u64,
             }))
         }
 
@@ -19179,6 +19251,133 @@ mod batch1_tests {
         assert!(err.message.contains("key required"), "{err:?}");
     }
 
+    /// Spec 813 — `session/state` reports the ABSOLUTE VIC bases, and the bank it
+    /// reports comes from the machine rather than from a fifth copy of the formula.
+    ///
+    /// BUG-051 had four copies of `(PRA & DDRA & 3) ^ 3`; this was the fifth, and it
+    /// survived the fix because nothing gated `session/state`'s VIC block. A consumer
+    /// that has to add `bank * $4000` to a $D018 offset itself is a consumer that will
+    /// eventually get it wrong, so the absolute bases are reported too.
+    #[test]
+    fn state_reports_the_absolute_vic_bases_and_the_machines_own_bank() {
+        let st = make_state();
+        call(&st, "session/power", json!({ "op": "on" }));
+        for _ in 0..8 {
+            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+        }
+        call(&st, "debug/pause", json!({ "source": "test" }));
+
+        let s = call(&st, "session/state", json!({}));
+        let want_base = st.lock().unwrap().session.machine.vic_bank_base() as u64;
+        assert_eq!(s["vic"]["bank"].as_u64(), Some(want_base / 0x4000), "the bank is the machine's");
+        assert_eq!(
+            s["vic"]["screenBase"].as_u64(),
+            Some(want_base + s["vic"]["screenPtr"].as_u64().unwrap()),
+            "screenBase is absolute: bank + the $D018 offset"
+        );
+        assert_eq!(s["vic"]["colorBase"].as_u64(), Some(0xd800), "colour RAM does not move");
+
+        // Drive the bank bits the way a fastloader does — DDRA = $3C leaves both as
+        // INPUTS, and the pull-ups make the bank 0. Under the old formula this
+        // reported bank 3, and every address derived from it was 48 KB out.
+        {
+            let mut g = st.lock().unwrap();
+            g.session.machine.write_full(0xdd02, 0x3c);
+            g.session.machine.write_full(0xdd00, 0x00);
+        }
+        let after = call(&st, "session/state", json!({}));
+        assert_eq!(after["vic"]["bank"].as_u64(), Some(0), "both bank bits floating high = bank 0");
+        assert_eq!(
+            after["vic"]["screenBase"].as_u64(),
+            after["vic"]["screenPtr"].as_u64(),
+            "with bank 0 the absolute base IS the offset"
+        );
+    }
+
+    /// Spec 813 §8 — a predicate evaluated once per frame needs BYTES, and it needs
+    /// to say through which lens.
+    ///
+    /// The monitor can print memory, but printing it means formatting it and then
+    /// parsing the format back — and the text path cannot name a lens at all, so RAM
+    /// under I/O and the colour-RAM read-back form are not expressible there. This
+    /// gate pins both halves: the bytes match `peek_lens`, and the lens changes the
+    /// answer where the C64 says it must.
+    #[test]
+    fn read_memory_returns_bytes_through_the_lens_it_was_asked_for() {
+        let st = make_state();
+        call(&st, "session/power", json!({ "op": "on" }));
+        for _ in 0..8 {
+            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+        }
+        call(&st, "debug/pause", json!({ "source": "test" }));
+
+        // A known pattern in plain RAM, written where nothing else will touch it.
+        {
+            let mut g = st.lock().unwrap();
+            for i in 0..8u16 {
+                g.session.machine.poke(0xc000 + i, &[(0x40 + i) as u8]);
+            }
+        }
+
+        let r = call(&st, "session/read_memory", json!({
+            "ranges": [{ "addr": 0xc000, "len": 8 }]
+        }));
+        let ch = r["chunks"].as_array().expect("chunks");
+        assert_eq!(ch.len(), 1);
+        let bytes = base64_decode(ch[0]["bytes"].as_str().unwrap()).expect("bytes");
+        assert_eq!(bytes, vec![0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47]);
+        assert_eq!(ch[0]["lens"].as_str(), Some("cpu"), "cpu is the default lens");
+        assert!(r["c64Cycles"].as_u64().unwrap() > 0, "the answer is stamped with its cycle");
+
+        // Several ranges in ONE call — a region is a set of ranges, not one span.
+        let multi = call(&st, "session/read_memory", json!({
+            "ranges": [
+                { "addr": 0xc000, "len": 2 },
+                { "addr": 0xc004, "len": 2 },
+            ]
+        }));
+        let mc = multi["chunks"].as_array().expect("chunks");
+        assert_eq!(mc.len(), 2, "each range comes back as its own chunk");
+        assert_eq!(base64_decode(mc[1]["bytes"].as_str().unwrap()).unwrap(), vec![0x44, 0x45]);
+
+        // The lens is load-bearing: at $D000 the CPU sees I/O and "ram" sees the RAM
+        // underneath. Answering one for the other is how a region compare goes
+        // quietly wrong (BUG-051 was the same confusion one layer down).
+        {
+            let mut g = st.lock().unwrap();
+            g.session.machine.poke(0xd020, &[0x5a]);
+        }
+        let under = call(&st, "session/read_memory", json!({
+            "ranges": [{ "addr": 0xd020, "len": 1, "lens": "ram" }]
+        }));
+        let io = call(&st, "session/read_memory", json!({
+            "ranges": [{ "addr": 0xd020, "len": 1, "lens": "io" }]
+        }));
+        let under_b = base64_decode(under["chunks"][0]["bytes"].as_str().unwrap()).unwrap();
+        let io_b = base64_decode(io["chunks"][0]["bytes"].as_str().unwrap()).unwrap();
+        assert_eq!(under_b, vec![0x5a], "the ram lens reads under I/O");
+        assert_ne!(io_b, under_b, "the io lens reads the register, not the RAM beneath it");
+
+        // Colour RAM comes back in its read-back form (high nibble set), which is
+        // what a comparison against a live machine has to match.
+        let col = call(&st, "session/read_memory", json!({
+            "ranges": [{ "addr": 0xd800, "len": 4, "lens": "io" }]
+        }));
+        let col_b = base64_decode(col["chunks"][0]["bytes"].as_str().unwrap()).unwrap();
+        assert!(col_b.iter().all(|b| b & 0xf0 == 0xf0), "colour RAM reads back as $Fx: {col_b:?}");
+
+        // A caller asking for the machine instead of a region is a mistake, and it
+        // fails as one rather than becoming a slow predicate nobody can explain.
+        let too_much = call_err(&st, "session/read_memory", json!({
+            "ranges": [{ "addr": 0x0000, "len": 0x10000 }]
+        }));
+        assert_eq!(too_much.code, -32602);
+        assert!(too_much.message.contains("cap"), "the error says what the limit is: {}", too_much.message);
+
+        let no_ranges = call_err(&st, "session/read_memory", json!({}));
+        assert_eq!(no_ranges.code, -32602);
+    }
+
     /// A capture has to be able to ask for a WHOLE frame.
     ///
     /// `displayed` is the frozen PREVIOUS frame, so a capture taken mid-frame hands
@@ -20995,8 +21194,13 @@ mod batch1_tests {
         let cp_id = o["checkpointId"].as_str().expect("checkpointId").to_string();
         assert!(cp_id.starts_with("cp_"));
         assert_eq!(o["frame"]["mode"], json!("standard_text"));
-        assert_eq!(o["frame"]["bankBase"], json!(0xC000));
-        assert_eq!(o["frame"]["screenBase"], json!(0xC000));
+        // BUG-051 — a freshly created machine has CIA2 DDRA = $00, so BOTH VIC bank
+        // bits are inputs, both pins float high on their pull-ups, and the bank is 0.
+        // This test used to assert $C000, which is what the old `PRA & DDRA` formula
+        // answered for an input pin: it froze the bug instead of catching it. Bank 0
+        // is also the default a booted C64 lands on, so $C000 was never right here.
+        assert_eq!(o["frame"]["bankBase"], json!(0x0000));
+        assert_eq!(o["frame"]["screenBase"], json!(0x0000));
         assert_eq!(o["frame"]["displayWidth"], json!(320));
         assert_eq!(o["frame"]["colorBase"], json!(0xd800));
         assert_eq!(o["geometry"]["visible"]["width"], json!(384));
@@ -21010,9 +21214,9 @@ mod batch1_tests {
         assert_eq!(at["node"]["type"], json!("text_cell"));
         assert_eq!(at["node"]["mode"], json!("standard_text"));
         assert_eq!(at["node"]["cell"], json!({ "col": 0, "row": 0, "index": 0 }));
-        // screen RAM ref @ $C000 (bank 3, d018=0), charset ref present.
+        // screen RAM ref @ $0000 (bank 0, d018=0), charset ref present.
         let refs = at["node"]["refs"].as_array().unwrap();
-        assert!(refs.iter().any(|r| r["kind"] == "screen_ram" && r["addr"] == 0xC000));
+        assert!(refs.iter().any(|r| r["kind"] == "screen_ram" && r["addr"] == 0x0000));
         assert!(refs.iter().any(|r| r["kind"] == "charset"));
 
         // a VISIBLE-frame pixel in the open border → border node.

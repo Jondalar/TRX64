@@ -73,7 +73,7 @@ else
 fi
 
 # ── [2/4] rust gate tests (asserting, fast) ──────────────────────────────────
-printf '[2/4] rust gate tests (iso_vic + vic_collision + cart_mapper, release)\n'
+printf '[2/4] rust gate tests (iso_vic + vic_collision + cart_mapper + the daemon suite, release)\n'
 command -v cargo >/dev/null 2>&1 || die_red "cargo not on PATH — cannot run gate tests" ""
 TLOG=$(mktmp)
 if cargo test --release -p trx64-core \
@@ -82,6 +82,17 @@ if cargo test --release -p trx64-core \
   green "unit gates: $(grep -cE 'test result: ok' "$TLOG") suites ok ($(grep -oE '[0-9]+ passed' "$TLOG" | awk '{s+=$1} END{print s}') tests)"
 else
   die_red "a rust gate test FAILED" "$TLOG"
+fi
+
+# The daemon's own suite. It was NOT in this gate, and that is how a green push put
+# a red test on main: the BUG-051 VIC-bank fix changed what a fresh machine's bank
+# is, a daemon test had frozen the old (wrong) value, and nothing here looked. The
+# daemon is the entire agent-facing surface — every MCP tool goes through it.
+DLOG=$(mktmp)
+if cargo test --release -p trx64-daemon >"$DLOG" 2>&1; then
+  green "daemon suite: $(grep -oE '[0-9]+ passed' "$DLOG" | awk '{s+=$1} END{print s}') tests ok"
+else
+  die_red "a trx64-daemon test FAILED" "$DLOG"
 fi
 
 # ── [3/4] 7-game behavioral gate ─────────────────────────────────────────────
