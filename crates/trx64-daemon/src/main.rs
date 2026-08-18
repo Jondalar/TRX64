@@ -8725,9 +8725,16 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             let screen_ptr = (((d018 >> 4) & 0xf) as u64) << 10;
             let chargen_ptr = (((d018 >> 1) & 7) as u64) << 11;
             let bitmap_ptr = if d018 & 8 != 0 { 0x2000u64 } else { 0 };
-            let cia2_pra = machine.cia2.peek(0xdd00);
-            let cia2_ddra = machine.cia2.peek(0xdd02);
-            let bank = ((cia2_pra & cia2_ddra & 3) ^ 3) as u64;
+            // BUG-051 — a FIFTH copy of the bank formula lived here, with the same
+            // `PRA & DDRA` mistake: an input pin read 0 instead of the 1 its pull-up
+            // puts there, so a fastloader that drives $DD00 itself was reported three
+            // banks off. Ask the machine, which owns the rule, rather than restating it.
+            let bank = (machine.vic_bank_base() / 0x4000) as u64;
+            // Spec 813 — the ABSOLUTE bases, so a consumer never has to redo the bank
+            // arithmetic (and get it wrong the way this line just did).
+            let screen_base = machine.vic_bank_base() as u64 + screen_ptr;
+            let chargen_base = machine.vic_bank_base() as u64 + chargen_ptr;
+            let bitmap_base = machine.vic_bank_base() as u64 + bitmap_ptr;
             let rd16 = |a: u16| -> u64 {
                 machine.read_full(a) as u64 | ((machine.read_full(a.wrapping_add(1)) as u64) << 8)
             };
@@ -8757,6 +8764,10 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                     "screenPtr": screen_ptr,
                     "chargenPtr": chargen_ptr,
                     "bitmapPtr": bitmap_ptr,
+                    "screenBase": screen_base,
+                    "chargenBase": chargen_base,
+                    "bitmapBase": bitmap_base,
+                    "colorBase": 0xd800u64,
                     "border": (v(0x20) & 0xf) as u64,
                     "background": (v(0x21) & 0xf) as u64
                 },
@@ -19238,6 +19249,49 @@ mod batch1_tests {
         // And a request with no key at all is an error, not a guess.
         let err = call_err(&st, "transport/key", json!({}));
         assert!(err.message.contains("key required"), "{err:?}");
+    }
+
+    /// Spec 813 — `session/state` reports the ABSOLUTE VIC bases, and the bank it
+    /// reports comes from the machine rather than from a fifth copy of the formula.
+    ///
+    /// BUG-051 had four copies of `(PRA & DDRA & 3) ^ 3`; this was the fifth, and it
+    /// survived the fix because nothing gated `session/state`'s VIC block. A consumer
+    /// that has to add `bank * $4000` to a $D018 offset itself is a consumer that will
+    /// eventually get it wrong, so the absolute bases are reported too.
+    #[test]
+    fn state_reports_the_absolute_vic_bases_and_the_machines_own_bank() {
+        let st = make_state();
+        call(&st, "session/power", json!({ "op": "on" }));
+        for _ in 0..8 {
+            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+        }
+        call(&st, "debug/pause", json!({ "source": "test" }));
+
+        let s = call(&st, "session/state", json!({}));
+        let want_base = st.lock().unwrap().session.machine.vic_bank_base() as u64;
+        assert_eq!(s["vic"]["bank"].as_u64(), Some(want_base / 0x4000), "the bank is the machine's");
+        assert_eq!(
+            s["vic"]["screenBase"].as_u64(),
+            Some(want_base + s["vic"]["screenPtr"].as_u64().unwrap()),
+            "screenBase is absolute: bank + the $D018 offset"
+        );
+        assert_eq!(s["vic"]["colorBase"].as_u64(), Some(0xd800), "colour RAM does not move");
+
+        // Drive the bank bits the way a fastloader does — DDRA = $3C leaves both as
+        // INPUTS, and the pull-ups make the bank 0. Under the old formula this
+        // reported bank 3, and every address derived from it was 48 KB out.
+        {
+            let mut g = st.lock().unwrap();
+            g.session.machine.write_full(0xdd02, 0x3c);
+            g.session.machine.write_full(0xdd00, 0x00);
+        }
+        let after = call(&st, "session/state", json!({}));
+        assert_eq!(after["vic"]["bank"].as_u64(), Some(0), "both bank bits floating high = bank 0");
+        assert_eq!(
+            after["vic"]["screenBase"].as_u64(),
+            after["vic"]["screenPtr"].as_u64(),
+            "with bank 0 the absolute base IS the offset"
+        );
     }
 
     /// Spec 813 §8 — a predicate evaluated once per frame needs BYTES, and it needs
