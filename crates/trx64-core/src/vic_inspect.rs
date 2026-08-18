@@ -63,15 +63,21 @@ fn ram_at(ram: &[u8], addr: i64) -> i64 {
     (ram.get((addr as usize) & 0xffff).copied().unwrap_or(0)) as i64 & 0xff
 }
 
-/// vic-inspect.ts:60 — `bankBaseOf = (3 - (cp.cia2.c_cia[0] & 0x03)) * 0x4000`.
+/// vic-inspect.ts:60 — `bankBaseOf`. The TS read the PRA latch alone; that is
+/// wrong for the same reason `Machine::vic_bank_base` was (`core/ciacore.c:810`):
+/// the byte on port A is `PRA | ~DDRA`, so a bank bit configured as an INPUT
+/// contributes 1 (the pin floats high), not whatever the latch happens to hold.
 fn bank_base_of(cp: &Value) -> i64 {
-    let c = cp
-        .get("cia2")
-        .and_then(|v| v.get("c_cia"))
-        .and_then(|a| a.get(0))
-        .and_then(|n| n.as_i64())
-        .unwrap_or(0);
-    (3 - (c & 0x03)) * 0x4000
+    let reg = |i: usize| {
+        cp.get("cia2")
+            .and_then(|v| v.get("c_cia"))
+            .and_then(|a| a.get(i))
+            .and_then(|n| n.as_i64())
+            .unwrap_or(0)
+    };
+    let pra = reg(0) as u8;
+    let ddra = reg(2) as u8;
+    (3 - ((pra | !ddra) as i64 & 0x03)) * 0x4000
 }
 
 // ── types (vic-inspect-types.ts) ────────────────────────────────────────────────
