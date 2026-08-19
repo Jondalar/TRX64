@@ -61,3 +61,28 @@ fn one_bit_input_one_bit_driven_mixes_pin_and_latch() {
     // PRA bit 0 = 1 -> %11 -> bank 0.
     assert_eq!(bank_after(0x01, 0x3d), 0x0000);
 }
+
+/// Spec 815 — the probe as the GAME runs it: through the BUS, not by poking the
+/// chip. The first gate wrote via `vic.write_reg` directly and passed while the
+/// real detection failed, which is the whole lesson of testing the wrong door.
+#[test]
+fn the_turbo_probe_works_through_the_cpu_bus() {
+    use trx64_core::vic::SpeedProfile;
+    let mut m = Machine::new();
+    m.set_speed_profile(SpeedProfile::C128);
+    // I/O visible, as the KERNAL leaves it.
+    m.write_full(0x0000, 0x2f);
+    m.write_full(0x0001, 0x37);
+
+    m.write_full(0xd02f, 0xfe);
+    m.write_full(0xd030, 0xfe);
+    let a2f = m.read_full(0xd02f);
+    let a30 = m.read_full(0xd030);
+    assert_eq!(a2f, a30, "after $FE the pair must read EQUAL (got $2F=${a2f:02X} $30=${a30:02X})");
+
+    m.write_full(0xd02f, 0x00);
+    m.write_full(0xd030, 0x00);
+    let b2f = m.read_full(0xd02f);
+    let b30 = m.read_full(0xd030);
+    assert_eq!(b2f ^ b30, 0x04, "after $00 the pair must differ by $04 (got $2F=${b2f:02X} $30=${b30:02X})");
+}

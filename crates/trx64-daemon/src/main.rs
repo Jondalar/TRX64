@@ -191,6 +191,13 @@ struct TrapRule {
 /// Singleton session, kept in memory for the daemon's lifetime.
 pub struct State {
     session: Session,
+    /// Spec 815 — which machine this SESSION claims to be. It lives here, not on
+    /// the chip, because it survives a power-cycle: power-cycling a C128 gives you
+    /// a C128. The first cut kept it on the VIC, so a mount (which power-cycles)
+    /// silently dropped it — and a cartridge probes in its boot stub, during the
+    /// very warm-up that power-on runs. The flag looked set and the detection had
+    /// already failed.
+    speed_profile: trx64_core::vic::SpeedProfile,
     breakpoints: Breakpoints,
     /// The breakpoint/watchpoint POLICY (cond-AST, hit/ignore, watch tables).
     /// Re-synced from `breakpoints` before each run; drives the core's debug gates.
@@ -1665,6 +1672,9 @@ fn do_power_on(st: &mut State) {
             roms.display()
         );
     }
+    // Spec 815 — the fresh machine inherits the session's claim. Power-cycling a
+    // C128 does not hand you a C64, and a cartridge probes during the warm-up below.
+    st.session.machine.set_speed_profile(st.speed_profile);
     st.machine_generation += 1; // Spec 786 audio fix — signal the streaming loop to re-hook the fresh SID.
     // The audio epoch belongs HERE, not at the call sites. It was bumped by the
     // `session/power` RPC and NOT by the monitor `power` verb — same function, two
@@ -5735,8 +5745,11 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                     };
                     match SpeedProfile::parse(want) {
                         Some(p) => {
-                            m.set_speed_profile(p);
-                            Ok(report(m))
+                            // The SESSION claims it; the machine is told. A fresh
+                            // machine (power-cycle, mount) inherits it in do_power_on.
+                            st.speed_profile = p;
+                            st.session.machine.set_speed_profile(p);
+                            Ok(report(&st.session.machine))
                         }
                         None => Err(format!("turbo mode: unknown '{want}' (use c64 | 128 | u64)")),
                     }
@@ -9374,7 +9387,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             let mut st = state.lock().unwrap();
             if let Some(m) = req.params.get("mode").and_then(|v| v.as_str()) {
                 match SpeedProfile::parse(m) {
-                    Some(p) => st.session.machine.set_speed_profile(p),
+                    Some(p) => { st.speed_profile = p; st.session.machine.set_speed_profile(p); }
                     None => return Response::err(id, -32602, &format!(
                         "session/turbo: unknown mode '{m}' (c64 | 128 | u64)"
                     )),
@@ -17639,6 +17652,7 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         session.running = true;
     }
     State {
+        speed_profile: trx64_core::vic::SpeedProfile::C64,
         session,
         breakpoints: Breakpoints::new(),
         observers: observers::ObserverRegistry::new(),
@@ -18207,6 +18221,7 @@ mod batch1_tests {
 
     fn make_state() -> SharedState {
         Arc::new(Mutex::new(State {
+            speed_profile: trx64_core::vic::SpeedProfile::C64,
             session: Session::new("integrated-1"),
             breakpoints: Breakpoints::new(),
             observers: observers::ObserverRegistry::new(),
@@ -19469,11 +19484,17 @@ mod batch1_tests {
         );
     }
 
-    /// A mount power-cycles the machine, and a power-cycle builds fresh chips. The
-    /// CLI sets the profile AFTER the mount for exactly that reason; this pins the
-    /// behaviour so the ordering cannot quietly stop mattering.
+    /// Spec 815 — the claim is the SESSION's and survives a power-cycle.
+    ///
+    /// The first cut kept it on the VIC, so a mount — which power-cycles — silently
+    /// dropped it. That is not a detail: `do_power_on` warms the boot by five million
+    /// cycles, and a cartridge probes for a turbo machine in its boot stub, inside
+    /// exactly that warm-up. The flag was set, the run looked fine, and the detection
+    /// had already answered "plain C64" before anyone could see it.
+    ///
+    /// Power-cycling a C128 gives you a C128. This pins that.
     #[test]
-    fn a_mount_clears_the_profile_which_is_why_the_cli_sets_it_after() {
+    fn the_machine_claim_survives_a_power_cycle_because_a_cartridge_probes_during_boot() {
         use trx64_core::vic::SpeedProfile;
         let st = make_state();
         call(&st, "session/power", json!({ "op": "on" }));
@@ -19482,16 +19503,18 @@ mod batch1_tests {
         call(&st, "session/turbo", json!({ "mode": "128" }));
         assert_eq!(st.lock().unwrap().session.machine.speed_profile(), SpeedProfile::C128);
 
-        // A power-cycle is fresh chips (Spec 786) — the claim goes with them.
         call(&st, "session/power", json!({ "op": "off" }));
         call(&st, "session/power", json!({ "op": "on" }));
         assert_eq!(
             st.lock().unwrap().session.machine.speed_profile(),
-            SpeedProfile::C64,
-            "a power-cycle is a different machine; set the profile after it, not before"
+            SpeedProfile::C128,
+            "the fresh machine inherits the session's claim — otherwise a mount eats it"
         );
+        // And the probe still answers on the fresh chip, which is the point.
+        let d = |a: u8| st.lock().unwrap().session.machine.vic.read_reg(a);
+        assert_eq!(d(0x30) & 0xfc, 0xfc, "the VIC-IIe pair is live after the cycle");
 
-        // A RESET is not a power-cycle, and there the claim must survive.
+        // A warm reset keeps it too.
         call(&st, "session/turbo", json!({ "mode": "u64" }));
         st.lock().unwrap().session.machine.warm_reset();
         assert_eq!(st.lock().unwrap().session.machine.speed_profile(), SpeedProfile::U64);

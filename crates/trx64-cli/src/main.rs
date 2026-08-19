@@ -112,6 +112,11 @@ enum Command {
         /// a `.crt`. Omit (or `auto`/`crt`) to auto-detect.
         #[arg(long = "cart-type")]
         cart_type: Option<String>,
+        /// Spec 815 — which machine this claims to be (`c64` | `128` | `u64`), so a
+        /// routine that PROBES for a turbo machine can be exercised here instead of
+        /// only through a full boot.
+        #[arg(long)]
+        turbo: Option<String>,
         /// Attach a disk on the cold machine (.d64/.g64; for a drive-reading routine).
         #[arg(long)]
         disk: Option<String>,
@@ -346,7 +351,7 @@ fn main() {
     if let Some(Command::Sandbox {
         seed, cart, cart_type, disk, load, load_hex, entry, harvest, zp, sentinel, io, stub_addr,
         cyc_cap, instr_cap, direct_entry, reg_a, reg_x, reg_y, reg_sp, reg_p, stream_hook, stream,
-        stream_hex, json, batch,
+        stream_hex, json, batch, turbo,
     }) = &cli.cmd
     {
         // Spec 805 — batch mode: N runs, one process start. Mutually exclusive with the
@@ -368,7 +373,7 @@ fn main() {
         match sandbox_cmd::run_sandbox_cli(
             &rom_dir, seed.as_deref(), cart.as_deref(), cart_type.as_deref(), disk.as_deref(), load,
             load_hex, *entry, harvest, zp, *sentinel, io.as_deref(), *stub_addr, *cyc_cap,
-            *instr_cap, *direct_entry, reg_a.as_deref(), reg_x.as_deref(), reg_y.as_deref(),
+            *instr_cap, turbo.as_deref(), *direct_entry, reg_a.as_deref(), reg_x.as_deref(), reg_y.as_deref(),
             reg_sp.as_deref(), reg_p.as_deref(), stream.as_deref(), stream_hex.as_deref(),
             stream_hook, *json,
         ) {

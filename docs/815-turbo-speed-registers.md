@@ -97,8 +97,10 @@ One switch sets everything above, and it is off by default:
 | `128` | VIC-IIe masks | open bus | stored, no effect yet (§3) |
 | `u64` | reads `$FF` | read/write | stored, no effect yet (§3) |
 
-- as a parameter — `session/turbo { mode, on, speed }` on the daemon, and
-  `trx64cli boot --turbo 128 [--turbo-on]` for a one-shot
+- as a parameter — `session/turbo { mode, on, speed }` on the daemon,
+  `trx64cli boot --turbo 128 [--turbo-on]` for a one-shot, and
+  `trx64cli sandbox --turbo 128` so a probing ROUTINE can be exercised without a
+  full boot (also per batch item, as `"turbo"`)
 - as a monitor verb, so a human can flip it mid-session and watch what a release
   does differently
 
@@ -119,18 +121,24 @@ after.
 - The default profile is unchanged: `$D02F`-`$D03F` read `$FF`, writes do nothing.
   Every existing VIC gate covers this by continuing to pass.
 - On `128`: write `$FE`, read `$D02F` == `$D030`; write `$00`, read them `$F8` and
-  `$FC`. That is the probe, run as the probe.
+  `$FC` (XOR `$04`). That is the probe, run as the probe — and run through the CPU
+  BUS, not by poking the chip. The first gate poked `vic.write_reg` directly and
+  passed while the real detection failed: testing the wrong door proves the wrong
+  thing.
 - On `128`: the speed bit is readable back and reported, and setting it changes
   nothing else — the gate asserts the picture is IDENTICAL with the bit set and
   clear, which is what makes §3 a visible hole rather than a forgotten one.
 - On `u64`: `$D031` round-trips and `$D030` reads `$FF`, so the type-2 detection
   path resolves.
-- The profile survives a warm reset and is cleared by `Machine::new`.
-- A mount POWER-CYCLES the machine, and a power-cycle is fresh chips (Spec 786), so
-  the claim goes with them. `trx64cli boot` therefore sets the profile AFTER the
-  mount and before the first cycle; a gate pins that, so the ordering cannot quietly
-  stop mattering. Set before the mount, the flag would be silently ignored — which
-  is the worst of both, because the run looks like it worked.
+- The claim is the SESSION's and survives BOTH a warm reset and a power-cycle;
+  only a new session starts at `c64`. The first cut kept it on the chip, where a
+  power-cycle dropped it — and that is not a detail, because `do_power_on` warms
+  the boot by five million cycles and **a cartridge probes in its boot stub, inside
+  exactly that warm-up**. The flag was set, the run looked fine, and the detection
+  had already answered "plain C64". `trx64cli boot` therefore sets the claim BEFORE
+  the mount.
+- The speed BIT is a register, so a power-cycle clears it — correctly. `--turbo-on`
+  is applied after the mount for that reason.
 
 ## §6 What this spec does not do
 

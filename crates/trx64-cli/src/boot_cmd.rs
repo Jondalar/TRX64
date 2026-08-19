@@ -57,6 +57,16 @@ pub fn run_boot(
     let engine = boot_engine(rom_dir).map_err(|e| format!("{e}"))?;
     let mut log: Vec<String> = Vec::new();
 
+    // Spec 815 — BEFORE the mount. A cartridge probes for a turbo machine in its
+    // boot stub, and `media/mount` power-cycles + warms the boot by five million
+    // cycles: by the time the mount returns, the stub has already asked and been
+    // told "plain C64". The claim is the session's and survives the power-cycle, so
+    // setting it first is both possible and the only order that works.
+    if !turbo.eq_ignore_ascii_case("c64") || turbo_on {
+        let t = engine.rpc("session/turbo", json!({ "mode": turbo }))?;
+        log.push(format!("turbo mode {turbo}: {}", compact(&t)));
+    }
+
     // Mount the medium — power-cycles THIS process's machine only (cold boot).
     let m = engine.rpc("media/mount", json!({ "path": disk }))?;
     log.push(format!("mount {disk}: {}", compact(&m)));
@@ -65,17 +75,12 @@ pub fn run_boot(
     // refuses while running, and a mount can flip it on).
     let _ = engine.rpc("debug/pause", json!({ "source": "cli-boot" }));
 
-    // Spec 815 — AFTER the mount, because a mount power-cycles this machine and a
-    // power-cycle builds fresh chips; set before it, the profile would be gone by
-    // the time anything ran. Still before the first cycle, which is what matters:
-    // the release probes once, in its boot stub, and latches the answer.
-    if !turbo.eq_ignore_ascii_case("c64") || turbo_on {
-        let t = engine.rpc("session/turbo", json!({ "mode": turbo }))?;
-        log.push(format!("turbo mode {turbo}: {}", compact(&t)));
-        if turbo_on {
-            let o = engine.rpc("session/turbo", json!({ "on": true }))?;
-            log.push(format!("turbo on: {}", compact(&o)));
-        }
+    // The speed BIT, unlike the claim, is a register — and a power-cycle clears a
+    // register, correctly. So it goes on after the mount. (A release sets it itself
+    // when it decides to; this flag is for driving the path by hand.)
+    if turbo_on {
+        let o = engine.rpc("session/turbo", json!({ "on": true }))?;
+        log.push(format!("turbo on: {}", compact(&o)));
     }
 
     // Optional capture over the WHOLE boot, started after the mount (a mount
