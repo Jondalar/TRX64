@@ -5669,6 +5669,105 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             ))
         }
 
+        // Spec 815 §4 — which machine this session claims to be, so a release's
+        // turbo code path becomes reachable at all. Bare `turbo` REPORTS: a verb
+        // that silently flips state when you meant to look gets used wrong once and
+        // distrusted after.
+        "turbo" => {
+            use trx64_core::vic::SpeedProfile;
+            let m = &mut st.session.machine;
+            let report = |m: &trx64_core::Machine| -> String {
+                let p = m.speed_profile();
+                let mut out = format!(
+                    "turbo: machine={}  speed bit={}",
+                    p.name(),
+                    if m.turbo_engaged() { "SET" } else { "clear" },
+                );
+                match p {
+                    SpeedProfile::C64 => out.push_str(
+                        "\n  $D02F-$D03F are open bus, as on a C64 — a release probing for a \
+                         turbo machine gets $FF and takes its plain path.\n  `turbo mode 128` or \
+                         `turbo mode u64` to answer the probe.",
+                    ),
+                    SpeedProfile::C128 => out.push_str(&format!(
+                        "\n  $D02F=${:02X} $D030=${:02X} (VIC-IIe read-back masks)",
+                        m.vic.read_reg(0x2f),
+                        m.vic.read_reg(0x30),
+                    )),
+                    SpeedProfile::U64 => out.push_str(&format!(
+                        "\n  $D031=${:02X}, $D030 open bus",
+                        m.vic.read_reg(0x31),
+                    )),
+                }
+                if m.turbo_engaged() {
+                    out.push_str(
+                        "\n  NOTE the speed bit is STORED, not acted on: the CPU still runs at \
+                         1 MHz and the picture is unchanged (Spec 815 §3, deliberately unbuilt).",
+                    );
+                }
+                out
+            };
+            match toks.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
+                None | Some("status") => Ok(report(m)),
+                Some("mode") => {
+                    let want = match toks.get(2) {
+                        Some(w) => w,
+                        None => return Err("turbo mode: which one? c64 | 128 | u64".to_string()),
+                    };
+                    match SpeedProfile::parse(want) {
+                        Some(p) => {
+                            m.set_speed_profile(p);
+                            Ok(report(m))
+                        }
+                        None => Err(format!("turbo mode: unknown '{want}' (use c64 | 128 | u64)")),
+                    }
+                }
+                Some(state @ ("on" | "off")) => {
+                    let on = state == "on";
+                    match m.speed_profile() {
+                        SpeedProfile::C64 => Err(
+                            "turbo on: this session claims to be a plain C64, where the speed \
+                             register does not exist. `turbo mode 128` or `turbo mode u64` first."
+                                .to_string(),
+                        ),
+                        SpeedProfile::C128 => {
+                            let v = if on { 0x01 } else { 0x00 };
+                            m.vic.write_reg(0x30, v);
+                            Ok(report(m))
+                        }
+                        SpeedProfile::U64 => {
+                            let v = if on { 0x0e } else { 0x00 };
+                            m.vic.write_reg(0x31, v);
+                            Ok(report(m))
+                        }
+                    }
+                }
+                Some("speed") => {
+                    if m.speed_profile() != SpeedProfile::U64 {
+                        return Err(
+                            "turbo speed: the extended speed register is $D031, which only the \
+                             u64 profile has. `turbo mode u64` first, or use `turbo on|off` on 128."
+                                .to_string(),
+                        );
+                    }
+                    // Hex, like every other number in this monitor.
+                    let n = match toks.get(2).and_then(|t| parse_hex(t)) {
+                        Some(n) if n <= 0xff => n as u8,
+                        _ => return Err(
+                            "turbo speed: one byte in HEX, like the rest of this monitor \
+                             ($00-$FF; $00 = off)".to_string(),
+                        ),
+                    };
+                    m.vic.write_reg(0x31, n);
+                    Ok(report(m))
+                }
+                Some(other) => Err(format!(
+                    "turbo: unknown '{other}' (use `turbo`, `turbo mode c64|128|u64`, \
+                     `turbo on|off`, `turbo speed N`)"
+                )),
+            }
+        }
+
         "warp" => {
             match toks.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
                 Some("on") => {
@@ -7165,6 +7264,11 @@ fn monitor_help_text() -> String {
         "    warp on|off               8\u{00d7} pacing / PAL real-time",
         "    rawframe on|off           an anchor stores no picture, so stepping onto one REDRAWS it: two frames, keep the second, because the first is cut into wherever the anchor landed in the raster. That discards a ONE-FRAME event — a border opened for a frame, a bad raster split — so it looks like the ring never caught it. `on` keeps the FIRST frame, seam and all. Anchors that sit on a frame boundary use the first either way (whole, nothing lost). `transport/status` reports which you are looking at as `shownFrame`.",
         "    reset [warm|cold] · power on|off",
+        "    turbo                     Spec 815 — which machine this session CLAIMS to be, so a release's turbo code path is reachable at all. A C64 answers $FF at $D02F-$D03F, the probe fails, and everything behind it is dead code.",
+        "    turbo mode c64|128|u64    c64 (default) = open bus. 128 = the VIC-IIe pair $D02F/$D030 with VICE's read-back masks. u64 = an extended speed register at $D031. Survives a reset: it is machine identity, not chip state.",
+        "    turbo on|off              set/clear the speed bit the way the release would ($D030 bit 0, or $D031)",
+        "    turbo speed $NN           the extended speed value (u64 profile)",
+        "                              The speed bit is STORED, not acted on: the CPU still runs at 1 MHz and the picture is unchanged. What a set bit does to the display is Spec 815 §3 and is unbuilt on purpose — guessing it would put behaviour here that exists nowhere else.",
         "  MARKS (Spec 809 — a named, pinned point you can iterate FROM)",
         "    mark <name>               name + pin the anchor you are standing on (max 32)",
         "    marks                     list them with cycle, frame, how far back, and the window cost",
@@ -9237,6 +9341,54 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 "c64Cycles": st.session.machine.clk,
                 "rasterLine": st.session.machine.vic.raster_line as u64,
                 "rasterCycle": st.session.machine.vic.raster_cycle as u64,
+            }))
+        }
+
+        // Spec 815 §4 — the parameter half of the turbo switch, for a scripted or
+        // headless run. The monitor verb `turbo` is the same thing for a human.
+        "session/turbo" => {
+            use trx64_core::vic::SpeedProfile;
+            let mut st = state.lock().unwrap();
+            if let Some(m) = req.params.get("mode").and_then(|v| v.as_str()) {
+                match SpeedProfile::parse(m) {
+                    Some(p) => st.session.machine.set_speed_profile(p),
+                    None => return Response::err(id, -32602, &format!(
+                        "session/turbo: unknown mode '{m}' (c64 | 128 | u64)"
+                    )),
+                }
+            }
+            let profile = st.session.machine.speed_profile();
+            if let Some(on) = req.params.get("on").and_then(|v| v.as_bool()) {
+                match profile {
+                    SpeedProfile::C64 => return Response::err(id, -32602,
+                        "session/turbo: this session claims to be a plain C64, where the speed \
+                         register does not exist — set mode to 128 or u64 first"),
+                    SpeedProfile::C128 => st.session.machine.vic.write_reg(0x30, u8::from(on)),
+                    SpeedProfile::U64 => st.session.machine.vic.write_reg(0x31, if on { 0x0e } else { 0 }),
+                }
+            }
+            if let Some(sp) = req.params.get("speed").and_then(|v| v.as_u64()) {
+                if profile != SpeedProfile::U64 {
+                    return Response::err(id, -32602,
+                        "session/turbo: `speed` is the extended register $D031, which only the \
+                         u64 profile has");
+                }
+                if sp > 0xff {
+                    return Response::err(id, -32602, "session/turbo: `speed` is one byte, 0..255");
+                }
+                st.session.machine.vic.write_reg(0x31, sp as u8);
+            }
+            let m = &st.session.machine;
+            Response::ok(id, json!({
+                "mode": m.speed_profile().name(),
+                "engaged": m.turbo_engaged(),
+                "d02f": m.vic.read_reg(0x2f) as u64,
+                "d030": m.vic.read_reg(0x30) as u64,
+                "d031": m.vic.read_reg(0x31) as u64,
+                // Say it in the answer, every time: a caller that reads `engaged`
+                // and assumes the machine got faster has been misled by us.
+                "note": "the speed bit is STORED, not acted on — the CPU still runs at 1 MHz and \
+                         the picture is unchanged (Spec 815 §3, unbuilt on purpose)",
             }))
         }
 
@@ -19292,6 +19444,123 @@ mod batch1_tests {
             after["vic"]["screenPtr"].as_u64(),
             "with bank 0 the absolute base IS the offset"
         );
+    }
+
+    /// The monitor verb, because a human flips this mid-session and a parameter is
+    /// no help there. Bare `turbo` REPORTS: a verb that silently flips state when
+    /// you meant to look gets used wrong once and distrusted after.
+    #[test]
+    fn the_turbo_verb_reports_before_it_changes_anything() {
+        let st = make_state();
+        call(&st, "session/power", json!({ "op": "on" }));
+        call(&st, "debug/pause", json!({ "source": "test" }));
+        let mon = |st: &SharedState, c: &str| -> String {
+            let r = call(st, "monitor/exec", json!({ "command": c }));
+            r["output"].as_str().unwrap_or_default().to_string()
+        };
+
+        let bare = mon(&st, "turbo");
+        assert!(bare.contains("machine=c64"), "bare turbo reports: {bare}");
+        assert!(bare.contains("open bus"), "and says why a probe fails here: {bare}");
+        assert!(!st.lock().unwrap().session.machine.turbo_engaged(), "reporting changed nothing");
+
+        assert!(mon(&st, "turbo mode 128").contains("machine=128"));
+        let on = mon(&st, "turbo on");
+        assert!(on.contains("speed bit=SET"), "{on}");
+        assert!(on.contains("STORED, not acted on"), "it says what it is NOT: {on}");
+        assert!(mon(&st, "turbo off").contains("speed bit=clear"));
+
+        assert!(mon(&st, "turbo mode u64").contains("machine=u64"));
+        assert!(mon(&st, "turbo speed $0e").contains("$D031=$0E"));
+
+        // The mistakes, each answered with the way out rather than a bare "no".
+        let err = |st: &SharedState, c: &str| -> String {
+            let r = call(st, "monitor/exec", json!({ "command": c }));
+            r["error"].as_str().unwrap_or_default().to_string()
+        };
+        mon(&st, "turbo mode c64");
+        assert!(err(&st, "turbo on").contains("mode 128"), "refusal names the fix");
+        assert!(err(&st, "turbo speed $01").contains("u64"), "so does this one");
+        assert!(err(&st, "turbo mode c65").contains("c64 | 128 | u64"));
+        assert!(err(&st, "turbo sideways").contains("turbo mode"));
+    }
+
+    /// Spec 815 — the probes a C64 release makes before it takes a turbo path.
+    ///
+    /// On a plain C64 every one of those reads is $FF, the probe fails, and the whole
+    /// turbo half of a release is dead code no amount of playing will reach. This gate
+    /// runs the actual probe, as the probe: the two OR masks from `vicii-mem.c:960-980`
+    /// ARE the detection.
+    #[test]
+    fn turbo_profiles_answer_the_probes_a_release_makes() {
+        use trx64_core::vic::SpeedProfile;
+        let st = make_state();
+        call(&st, "session/power", json!({ "op": "on" }));
+        call(&st, "debug/pause", json!({ "source": "test" }));
+
+        let d = |st: &SharedState, a: u8| -> u8 { st.lock().unwrap().session.machine.vic.read_reg(a) };
+        let w = |st: &SharedState, a: u8, v: u8| { st.lock().unwrap().session.machine.vic.write_reg(a, v); };
+
+        // Default: a C64. Open bus, and writes do nothing.
+        assert_eq!(d(&st, 0x2f), 0xff);
+        assert_eq!(d(&st, 0x30), 0xff);
+        assert_eq!(d(&st, 0x31), 0xff);
+        w(&st, 0x30, 0x01);
+        assert_eq!(d(&st, 0x30), 0xff, "a C64 has no speed register to write");
+        assert!(!st.lock().unwrap().session.machine.turbo_engaged());
+
+        // The VIC-IIe pair. THE probe: $FE -> equal; $00 -> differ by exactly $04.
+        let r = call(&st, "session/turbo", json!({ "mode": "128" }));
+        assert_eq!(r["mode"].as_str(), Some("128"));
+        w(&st, 0x2f, 0xfe);
+        w(&st, 0x30, 0xfe);
+        assert_eq!(d(&st, 0x2f), d(&st, 0x30), "after $FE the pair reads equal");
+        w(&st, 0x2f, 0x00);
+        w(&st, 0x30, 0x00);
+        assert_eq!(d(&st, 0x2f), 0xf8);
+        assert_eq!(d(&st, 0x30), 0xfc);
+        assert_eq!(d(&st, 0x30) - d(&st, 0x2f), 0x04, "and after $00 by exactly $04");
+        assert_eq!(d(&st, 0x31), 0xff, "the VIC-IIe has no $D031");
+
+        // The speed bit round-trips and is reported.
+        w(&st, 0x30, 0x01);
+        assert!(st.lock().unwrap().session.machine.turbo_engaged());
+        let s = call(&st, "session/turbo", json!({}));
+        assert_eq!(s["engaged"].as_bool(), Some(true));
+        assert!(s["note"].as_str().unwrap().contains("STORED, not acted on"),
+                "the answer says what it is NOT, every time");
+
+        // §3 is a HOLE, and this is what keeps it visible: setting the bit changes
+        // nothing about the machine. The day it does, this assertion fails and
+        // whoever changed it has to say so.
+        let before = st.lock().unwrap().session.machine.render_canvas_indices().2;
+        w(&st, 0x30, 0x00);
+        let after = st.lock().unwrap().session.machine.render_canvas_indices().2;
+        assert_eq!(before, after, "the speed bit does not touch the picture (Spec 815 §3, unbuilt)");
+
+        // The extended register: readable, while $D030 stays open bus — which is
+        // exactly what the type-2 probe distinguishes on.
+        call(&st, "session/turbo", json!({ "mode": "u64" }));
+        assert_eq!(d(&st, 0x30), 0xff, "$D030 is open bus on this profile");
+        let sp = call(&st, "session/turbo", json!({ "speed": 0x0e }));
+        assert_eq!(sp["d031"].as_u64(), Some(0x0e), "$D031 round-trips");
+        assert_eq!(sp["engaged"].as_bool(), Some(true));
+
+        // Identity, not chip state: a reset does not turn a C128 back into a C64.
+        call(&st, "session/turbo", json!({ "mode": "128" }));
+        st.lock().unwrap().session.machine.warm_reset();
+        assert_eq!(
+            st.lock().unwrap().session.machine.speed_profile(),
+            SpeedProfile::C128,
+            "the profile survives a reset — a release that re-probes must get the same answer"
+        );
+        assert!(!st.lock().unwrap().session.machine.turbo_engaged(), "but the speed bit does not");
+
+        // Turning it on where it does not exist is refused, with what to do instead.
+        call(&st, "session/turbo", json!({ "mode": "c64" }));
+        let e = call_err(&st, "session/turbo", json!({ "on": true }));
+        assert_eq!(e.code, -32602);
+        assert!(e.message.contains("128 or u64"), "the refusal says the way out: {}", e.message);
     }
 
     /// Spec 813 §8 — a predicate evaluated once per frame needs BYTES, and it needs

@@ -1063,7 +1063,12 @@ impl Machine {
         self.cia2 = Cia::new();
         self.cia1.clk = self.clk;
         self.cia2.clk = self.clk;
+        // Spec 815 — which machine this claims to be is IDENTITY, not chip state.
+        // Pressing RESET on a C128 does not turn it into a C64, and a release that
+        // re-probes after its own reset must get the same answer.
+        let profile = self.vic.speed_profile;
         self.vic = VicII::new();
+        self.vic.speed_profile = profile;
         // ts:707-708 + ts:773 — reset the 1541 in lockstep with the C64. A warm
         // reset is the C64's RESET line; the drive has its OWN power, so "the 1541
         // disk stays mounted" (ts:773). TRX64's `Drive1541::cold_reset` drops the
@@ -1698,6 +1703,28 @@ impl Machine {
     /// VIC 3 banks away: the KERNAL leaves `DDRA = $3F` so both forms agree, but a
     /// fastloader that drives $DD00 itself (Spindle writes `DDRA = $3C`) leaves the
     /// bank bits as inputs and every fetch goes to the wrong 16 KB.
+    /// Spec 815 §4 — which machine this session claims to be. Survives a reset;
+    /// only `Machine::new` clears it.
+    pub fn set_speed_profile(&mut self, profile: crate::vic::SpeedProfile) {
+        self.vic.speed_profile = profile;
+        // Leaving a stale speed bit behind would make the next probe answer for a
+        // machine that is no longer being claimed.
+        self.vic.fastmode = 0;
+        self.vic.regs[0x2f] = 0;
+        self.vic.regs[0x30] = 0;
+        self.vic.regs[0x31] = 0;
+    }
+
+    pub fn speed_profile(&self) -> crate::vic::SpeedProfile {
+        self.vic.speed_profile
+    }
+
+    /// The speed bit as a release would see it: set by $D030 bit 0 (VIC-IIe) or by
+    /// a non-zero $D031 (extended). STORED ONLY — Spec 815 §3 is unbuilt.
+    pub fn turbo_engaged(&self) -> bool {
+        self.vic.fastmode != 0
+    }
+
     pub fn vic_bank_base(&self) -> u16 {
         let pra = self.cia2.peek(0xdd00);
         let ddra = self.cia2.peek(0xdd02);
