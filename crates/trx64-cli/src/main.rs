@@ -304,6 +304,18 @@ enum Command {
         /// are the firehose, and on a full boot they are enormous.
         #[arg(long, default_value = "cart-read")]
         trace_domains: String,
+        /// Spec 815 — which machine this claims to be, for a release that PROBES
+        /// before taking a turbo code path: `c64` (default), `128` (the VIC-IIe
+        /// $D02F/$D030 pair), `u64` (an extended $D031). On a plain C64 those reads
+        /// are $FF, the probe fails, and the whole turbo half of the release is
+        /// never reached.
+        #[arg(long, default_value = "c64")]
+        turbo: String,
+        /// Set the speed bit right after mounting, as the release would. Needs
+        /// --turbo 128 or u64. NOTE it is stored, not acted on: the CPU still runs
+        /// at 1 MHz (Spec 815 §3).
+        #[arg(long, default_value_t = false)]
+        turbo_on: bool,
     },
 
 }
@@ -424,11 +436,12 @@ fn main() {
     // ── Boot-and-dump one-shot (isolated scratch instance → .c64re fixture) ─────
     if let Some(Command::Boot {
         disk, warmup, type_text, type_gap, cycles, chunk, dump, render, trace, trace_domains,
+        turbo, turbo_on,
     }) = &cli.cmd
     {
         match boot_cmd::run_boot(
             &rom_dir, disk, *warmup, type_text, *type_gap, *cycles, *chunk, dump,
-            render.as_deref(), trace.as_deref(), trace_domains,
+            render.as_deref(), trace.as_deref(), trace_domains, turbo, *turbo_on,
         ) {
             Ok(out) => println!("{out}"),
             Err(e) => {

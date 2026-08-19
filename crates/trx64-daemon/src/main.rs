@@ -19446,6 +19446,34 @@ mod batch1_tests {
         );
     }
 
+    /// A mount power-cycles the machine, and a power-cycle builds fresh chips. The
+    /// CLI sets the profile AFTER the mount for exactly that reason; this pins the
+    /// behaviour so the ordering cannot quietly stop mattering.
+    #[test]
+    fn a_mount_clears_the_profile_which_is_why_the_cli_sets_it_after() {
+        use trx64_core::vic::SpeedProfile;
+        let st = make_state();
+        call(&st, "session/power", json!({ "op": "on" }));
+        call(&st, "debug/pause", json!({ "source": "test" }));
+
+        call(&st, "session/turbo", json!({ "mode": "128" }));
+        assert_eq!(st.lock().unwrap().session.machine.speed_profile(), SpeedProfile::C128);
+
+        // A power-cycle is fresh chips (Spec 786) — the claim goes with them.
+        call(&st, "session/power", json!({ "op": "off" }));
+        call(&st, "session/power", json!({ "op": "on" }));
+        assert_eq!(
+            st.lock().unwrap().session.machine.speed_profile(),
+            SpeedProfile::C64,
+            "a power-cycle is a different machine; set the profile after it, not before"
+        );
+
+        // A RESET is not a power-cycle, and there the claim must survive.
+        call(&st, "session/turbo", json!({ "mode": "u64" }));
+        st.lock().unwrap().session.machine.warm_reset();
+        assert_eq!(st.lock().unwrap().session.machine.speed_profile(), SpeedProfile::U64);
+    }
+
     /// The monitor verb, because a human flips this mid-session and a parameter is
     /// no help there. Bare `turbo` REPORTS: a verb that silently flips state when
     /// you meant to look gets used wrong once and distrusted after.

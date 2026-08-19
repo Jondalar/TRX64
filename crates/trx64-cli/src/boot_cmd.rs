@@ -51,6 +51,8 @@ pub fn run_boot(
     render: Option<&str>,
     trace: Option<&str>,
     trace_domains: &str,
+    turbo: &str,
+    turbo_on: bool,
 ) -> Result<String, String> {
     let engine = boot_engine(rom_dir).map_err(|e| format!("{e}"))?;
     let mut log: Vec<String> = Vec::new();
@@ -62,6 +64,19 @@ pub fn run_boot(
     // Force the controller paused so session/run may drive cycles directly (it
     // refuses while running, and a mount can flip it on).
     let _ = engine.rpc("debug/pause", json!({ "source": "cli-boot" }));
+
+    // Spec 815 — AFTER the mount, because a mount power-cycles this machine and a
+    // power-cycle builds fresh chips; set before it, the profile would be gone by
+    // the time anything ran. Still before the first cycle, which is what matters:
+    // the release probes once, in its boot stub, and latches the answer.
+    if !turbo.eq_ignore_ascii_case("c64") || turbo_on {
+        let t = engine.rpc("session/turbo", json!({ "mode": turbo }))?;
+        log.push(format!("turbo mode {turbo}: {}", compact(&t)));
+        if turbo_on {
+            let o = engine.rpc("session/turbo", json!({ "on": true }))?;
+            log.push(format!("turbo on: {}", compact(&o)));
+        }
+    }
 
     // Optional capture over the WHOLE boot, started after the mount (a mount
     // power-cycles the machine, which would finalize an already-running trace).

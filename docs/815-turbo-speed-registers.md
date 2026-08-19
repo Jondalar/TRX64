@@ -97,7 +97,8 @@ One switch sets everything above, and it is off by default:
 | `128` | VIC-IIe masks | open bus | stored, no effect yet (§3) |
 | `u64` | reads `$FF` | read/write | stored, no effect yet (§3) |
 
-- as a parameter, so a scripted or headless run can select it
+- as a parameter — `session/turbo { mode, on, speed }` on the daemon, and
+  `trx64cli boot --turbo 128 [--turbo-on]` for a one-shot
 - as a monitor verb, so a human can flip it mid-session and watch what a release
   does differently
 
@@ -125,6 +126,11 @@ after.
 - On `u64`: `$D031` round-trips and `$D030` reads `$FF`, so the type-2 detection
   path resolves.
 - The profile survives a warm reset and is cleared by `Machine::new`.
+- A mount POWER-CYCLES the machine, and a power-cycle is fresh chips (Spec 786), so
+  the claim goes with them. `trx64cli boot` therefore sets the profile AFTER the
+  mount and before the first cycle; a gate pins that, so the ordering cannot quietly
+  stop mattering. Set before the mount, the flag would be silently ignored — which
+  is the worst of both, because the run looks like it worked.
 
 ## §6 What this spec does not do
 
