@@ -51,9 +51,21 @@ pub fn run_boot(
     render: Option<&str>,
     trace: Option<&str>,
     trace_domains: &str,
+    turbo: &str,
+    turbo_on: bool,
 ) -> Result<String, String> {
     let engine = boot_engine(rom_dir).map_err(|e| format!("{e}"))?;
     let mut log: Vec<String> = Vec::new();
+
+    // Spec 815 — BEFORE the mount. A cartridge probes for a turbo machine in its
+    // boot stub, and `media/mount` power-cycles + warms the boot by five million
+    // cycles: by the time the mount returns, the stub has already asked and been
+    // told "plain C64". The claim is the session's and survives the power-cycle, so
+    // setting it first is both possible and the only order that works.
+    if !turbo.eq_ignore_ascii_case("c64") || turbo_on {
+        let t = engine.rpc("session/turbo", json!({ "mode": turbo }))?;
+        log.push(format!("turbo mode {turbo}: {}", compact(&t)));
+    }
 
     // Mount the medium — power-cycles THIS process's machine only (cold boot).
     let m = engine.rpc("media/mount", json!({ "path": disk }))?;
@@ -62,6 +74,14 @@ pub fn run_boot(
     // Force the controller paused so session/run may drive cycles directly (it
     // refuses while running, and a mount can flip it on).
     let _ = engine.rpc("debug/pause", json!({ "source": "cli-boot" }));
+
+    // The speed BIT, unlike the claim, is a register — and a power-cycle clears a
+    // register, correctly. So it goes on after the mount. (A release sets it itself
+    // when it decides to; this flag is for driving the path by hand.)
+    if turbo_on {
+        let o = engine.rpc("session/turbo", json!({ "on": true }))?;
+        log.push(format!("turbo on: {}", compact(&o)));
+    }
 
     // Optional capture over the WHOLE boot, started after the mount (a mount
     // power-cycles the machine, which would finalize an already-running trace).

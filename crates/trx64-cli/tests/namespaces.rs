@@ -100,16 +100,21 @@ fn umount_aliases_eject() {
     assert!(eject.contains("EJECT"), "eject output: {eject}");
 }
 
-/// `/undump` is an alias of `/restore` — same code path (usage message on no-arg).
+/// `/restore`, `/undump` and `/loadsnapshot` are the same verb — and they are the
+/// DAEMON's aliases now, not the cockpit's. The cockpit used to map them itself,
+/// which is exactly how a word can exist on one front-end and not the other.
 #[test]
 fn undump_aliases_restore() {
     let Some(engine) = engine_or_skip() else { return };
 
-    let restore = engine.exec_line("/restore").output;
-    let undump = engine.exec_line("/undump").output;
-    assert_eq!(restore, undump, "/undump and /restore take the same path");
-    let loadsnapshot = engine.exec_line("/loadsnapshot").output;
-    assert_eq!(restore, loadsnapshot, "/loadsnapshot and /restore take the same path");
+    // The cockpit no longer normalises aliases — the daemon owns them, so each verb
+    // answers in its own name. What has to hold is that all three ARE the verb: they
+    // reach the snapshot path and ask for a .c64re, rather than being unknown.
+    for v in ["/restore", "/undump", "/loadsnapshot"] {
+        let out = engine.exec_line(v).output;
+        assert!(out.contains(".c64re"), "{v} must reach the snapshot verb: {out}");
+        assert!(!out.contains("unknown command"), "{v} is not a cockpit-local alias any more: {out}");
+    }
 }
 
 /// `/snapshot` is an alias of `/dump` — our runtime snapshot IS the .c64re dump, so an
@@ -118,11 +123,12 @@ fn undump_aliases_restore() {
 fn snapshot_aliases_dump() {
     let Some(engine) = engine_or_skip() else { return };
 
-    let dump = engine.exec_line("/dump").output;
-    let snapshot = engine.exec_line("/snapshot").output;
-    assert_eq!(dump, snapshot, "/snapshot and /dump take the same path");
-    assert!(!dump.contains("unknown"), "/dump is a known verb: {dump}");
-    assert!(!snapshot.contains("unknown"), "/snapshot is a known verb: {snapshot}");
+    // Same verb, answering in its own name (the daemon owns the aliases now).
+    for v in ["/dump", "/snapshot"] {
+        let out = engine.exec_line(v).output;
+        assert!(out.contains(".c64re"), "{v} must reach the snapshot verb: {out}");
+        assert!(!out.contains("unknown"), "{v} is a known verb: {out}");
+    }
 }
 
 /// `/settings` returns a non-empty read-only status summary.

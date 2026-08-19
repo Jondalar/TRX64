@@ -647,6 +647,40 @@ pub enum VicRegKind {
 // =============================================================================
 // SECTION — the VIC-II state (viciitypes.h struct vicii_s subset).
 // =============================================================================
+/// Spec 815 §4 — which machine this session claims to be, for the handful of
+/// probes a C64 release makes before it takes a turbo code path. Default `C64`,
+/// where $D02F-$D03F are open bus and every existing gate is unchanged.
+///
+/// This is NOT a C128 or an Ultimate: no VDC, no MMU, no faster clock. It answers
+/// the probe, so the other half of a release's code becomes reachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpeedProfile {
+    #[default]
+    C64,
+    /// VIC-IIe: $D02F/$D030 exist with VICE's read-back masks.
+    C128,
+    /// An extended speed register at $D031; $D030 stays open bus.
+    U64,
+}
+
+impl SpeedProfile {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "c64" | "64" | "off" | "none" => Some(Self::C64),
+            "c128" | "128" | "c128-c64mode" => Some(Self::C128),
+            "u64" | "c64u" | "ultimate" | "turbo" => Some(Self::U64),
+            _ => None,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::C64 => "c64",
+            Self::C128 => "128",
+            Self::U64 => "u64",
+        }
+    }
+}
+
 
 /// VERBATIM per-cycle VIC-II state. Field names follow VICE's `vicii` struct
 /// (viciitypes.h). The public fields used by render.rs / vsf.rs / the daemon
@@ -657,6 +691,16 @@ pub enum VicRegKind {
 pub struct VicII {
     /// $D000-$D03F register file (vicii.regs[0x40]).
     pub regs: [u8; 0x40],
+
+    /// Spec 815 — which machine this claims to be. Default C64: $D02F-$D03F are
+    /// open bus and nothing below this line does anything.
+    pub speed_profile: SpeedProfile,
+    /// PORT OF: `vicii-mem.c:976` — `vicii.fastmode = value & 1`. STORED AND
+    /// REPORTED ONLY. What a set speed bit does to the picture is Spec 815 §3 and
+    /// is deliberately unbuilt: the one open question about it changes the
+    /// implementation, and guessing would put behaviour here that exists nowhere
+    /// else.
+    pub fastmode: u8,
 
     /// Cycle # within the current line (vicii.raster_cycle), 0..62 PAL.
     pub raster_cycle: u16,
@@ -823,6 +867,8 @@ impl VicII {
     pub fn new() -> Self {
         let mut v = VicII {
             regs: [0u8; 0x40],
+            speed_profile: SpeedProfile::C64,
+            fastmode: 0,
             raster_cycle: 0,
             cycle_flags: 0,
             raster_line: 0,
@@ -1815,6 +1861,21 @@ impl VicII {
                 self.regs[addr as usize] = v4;
                 self.color_reg_store(addr, v4);
             }
+            // Spec 815 §2 — d02f_store / d030_store (`vicii-mem.c:960-980`), and
+            // only on the VIC-IIe profile. `fastmode` is STORED, not acted on:
+            // what a set speed bit does to the picture is §3, and it is unbuilt on
+            // purpose until hardware says which of two models is right.
+            0x2f if self.speed_profile == SpeedProfile::C128 => {
+                self.regs[0x2f] = value | 0xf8;
+            }
+            0x30 if self.speed_profile == SpeedProfile::C128 => {
+                self.regs[0x30] = value | 0xfc;
+                self.fastmode = value & 1;
+            }
+            0x31 if self.speed_profile == SpeedProfile::U64 => {
+                self.regs[0x31] = value;
+                self.fastmode = u8::from(value != 0);
+            }
             // default — unused (vicii-mem.c:333 `/* unused */ break`). VICE does
             // NOT write the reg file here; addr is already masked to 0x3f so all
             // offsets above $2E are unused (no $D02F-$D03F effect at non-DTV).
@@ -1899,6 +1960,18 @@ impl VicII {
             0x27 | 0x28 | 0x29 | 0x2a | 0x2b | 0x2c | 0x2d | 0x2e => {
                 self.regs[addr as usize] | 0xf0
             }
+            // Spec 815 §2 — the probe registers. On the default profile they are
+            // open bus, exactly as a C64's are, and every existing gate stays true.
+            //
+            // PORT OF: `vicii-mem.c:960-980`. The two OR masks ARE the detection: a
+            // release writes $FE and reads both back as $FE, writes $00 and reads
+            // $F8 / $FC — a difference of exactly $04. Nothing else about the
+            // machine has to be true for the probe to answer correctly.
+            0x2f if self.speed_profile == SpeedProfile::C128 => self.regs[0x2f] | 0xf8,
+            0x30 if self.speed_profile == SpeedProfile::C128 => self.regs[0x30] | 0xfc,
+            // The extended speed register: readable (so the type-2 probe resolves)
+            // while $D030 stays open bus, which is what that probe distinguishes on.
+            0x31 if self.speed_profile == SpeedProfile::U64 => self.regs[0x31],
             _ => 0xff,
         }
     }

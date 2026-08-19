@@ -124,9 +124,6 @@ impl Engine {
         Ok(result.unwrap_or(Value::Null))
     }
 
-    fn bump_epoch(&self) {
-        self.epoch.fetch_add(1, Ordering::SeqCst);
-    }
 
     // ── the per-frame pump (called by the pump thread) ─────────────────────────
 
@@ -225,117 +222,59 @@ impl Engine {
             .to_string();
 
         match verb.as_str() {
-            "power" => self.verb_power(rest.first().copied()),
-            "reset" => self.verb_reset(rest.first().copied()),
-            "run" => {
-                // `/run` with no arg = resume; `/run <prg>` = load+autostart.
-                if arg.is_empty() {
-                    self.verb_run()
-                } else {
-                    self.verb_run_prg(&arg)
-                }
-            }
-            "pause" => self.verb_pause(),
-            "step" => self.verb_step(),
-            "mount" => self.verb_mount(&arg),
-            "eject" | "umount" => self.verb_eject(),
-            "load" => self.verb_load(&arg),
-            "warp" => self.verb_warp(rest.first().copied()),
-            "joystick" | "joy" => self.verb_joystick(rest.first().copied()),
+            // The ONLY verbs that stay here are the ones the daemon cannot answer,
+            // because they are about THIS terminal rather than about the machine.
+            //
+            // Everything else — power, reset, run, pause, step, warp, load, dump,
+            // restore, ringdump, ringload, turbo, and every verb the daemon grows
+            // tomorrow — is forwarded verbatim. The cockpit used to reimplement each
+            // one: its own argument validation ("power: unknown sub 'x'"), its own
+            // reply text, sometimes its own extra RPCs. That made this front-end a
+            // second authority on what a verb means and what counts as valid, and a
+            // second authority drifts — which is BUG-040, and which is why `turbo`
+            // shipped in the daemon and read "unknown command" here.
+            //
+            // `window` is NOT forwarded even though the daemon has a verb by that
+            // name: there it sets the checkpoint-ring window in seconds. Forwarding
+            // it would silently retune the ring when someone asked for a window.
             "window" => CmdResult { output: "opening emulator window…".into(), open_window: true, quit: false },
-            "dump" | "snapshot" => self.verb_dump(&arg),
-            "restore" | "undump" | "loadsnapshot" => self.verb_restore(&arg),
-            "ringdump" => self.verb_ringdump(&arg),
-            "ringload" => self.verb_ringload(&arg),
             "settings" => self.verb_settings(),
             "help" => CmdResult::text(help_text()),
             "quit" | "exit" => {
                 self.quit.store(true, Ordering::SeqCst);
                 CmdResult { output: "bye.".into(), open_window: false, quit: true }
             }
-            // Unknown /verb — DON'T fall through to the monitor (the user explicitly
-            // used the VM namespace); point them at /help.
-            other => CmdResult::text(format!("unknown command: /{other} — try /help")),
-        }
-    }
 
-    fn verb_power(&self, sub: Option<&str>) -> CmdResult {
-        // Spec 786 — power is a first-class primitive on the daemon.
-        match sub.map(|s| s.to_ascii_lowercase()).as_deref() {
-            Some("on") | None => {
-                // Full init (fresh machine, inserted media re-attached), running.
-                let r = self.rpc("session/power", json!({ "op": "on" }));
-                self.bump_epoch();
-                match r {
-                    Ok(v) => {
-                        CmdResult::text(format!(
-                            "POWER ON — full init @ PC=${:04X}, running.",
-                            v.get("pc").and_then(|p| p.as_u64()).unwrap_or(0)
-                        ))
-                    }
-                    Err(e) => CmdResult::text(format!("power on failed: {e}")),
-                }
+            // Media and input have no monitor verb yet — the media handlers are a
+            // 170-line block inside the RPC dispatch and have to be extracted first
+            // (BUG-041 says so in as many words). Until then these stay as THIN
+            // calls: no validation, no invented message, just the RPC and whatever
+            // the daemon says back.
+            "mount" => self.verb_mount(&arg),
+            "eject" | "umount" => self.verb_eject(),
+            "joystick" | "joy" => self.verb_joystick(rest.first().copied()),
+
+            other => {
+                let forwarded = if rest.is_empty() {
+                    other.to_string()
+                } else {
+                    format!("{other} {}", rest.join(" "))
+                };
+                let out = self.verb_monitor(&forwarded);
+                // A forwarded verb can power-cycle or reset the machine, and the
+                // audio epoch is this front-end's follow-state. Following the daemon
+                // afterwards is not validation — it is the client catching up with
+                // the authority, which is the only thing a client should be doing.
+                self.follow_daemon_audio_epoch();
+                out
             }
-            Some("off") => {
-                // Everything off, no live state (blank dead machine, media registry kept).
-                let r = self.rpc("session/power", json!({ "op": "off" }));
-                self.bump_epoch();
-                match r {
-                    Ok(_) => CmdResult::text("POWER OFF — machine off (no live state)."),
-                    Err(e) => CmdResult::text(format!("power off failed: {e}")),
-                }
-            }
-            Some(other) => CmdResult::text(format!("power: unknown sub '{other}' (use on|off)")),
         }
     }
 
-    fn verb_reset(&self, sub: Option<&str>) -> CmdResult {
-        // Spec 786 — reset [warm|cold]; DEFAULT warm (RESET line → $FCE2, RAM +
-        // media kept). `cold` = power-cycle (power_off → power_on, fresh DRAM+chips).
-        let (mode, label) = match sub.map(|s| s.to_ascii_lowercase()).as_deref() {
-            Some("cold") => ("cold", "cold"),
-            _ => ("soft", "warm"),
-        };
-        let r = self.rpc("session/reset", json!({ "mode": mode }));
-        self.bump_epoch();
-        // A real machine reset boots + runs — don't leave it frozen at the reset
-        // vector. The RUN INTENT is the daemon's, so this is an event, not a flag write.
-        let _ = self.rpc("session/play", json!({}));
-        match r {
-            Ok(v) => CmdResult::text(format!(
-                "RESET ({label}) @ PC=${:04X}, running.",
-                v.get("pc").and_then(|p| p.as_u64()).unwrap_or(0)
-            )),
-            Err(e) => CmdResult::text(format!("reset failed: {e}")),
-        }
-    }
 
-    fn verb_run(&self) -> CmdResult {
-        // An EVENT, not a local flag write; and the reply's message is printed as sent.
-        let v = self.rpc("session/play", json!({})).unwrap_or_default();
-        CmdResult::text(
-            v.get("message").and_then(|m| m.as_str()).unwrap_or("RUN").to_string(),
-        )
-    }
 
-    fn verb_pause(&self) -> CmdResult {
-        let v = self.rpc("session/pause", json!({})).unwrap_or_default();
-        CmdResult::text(
-            v.get("message").and_then(|m| m.as_str()).unwrap_or("PAUSE").to_string(),
-        )
-    }
 
-    fn verb_step(&self) -> CmdResult {
-        // Stepping implies stopped. Tell the daemon; do not remember it here.
-        let _ = self.rpc("session/pause", json!({}));
-        match self.rpc("debug/step", json!({ "source": "cli" })) {
-            Ok(_) => {
-                let pc = self.cur_pc();
-                CmdResult::text(format!("STEP → PC=${pc:04X}."))
-            }
-            Err(e) => CmdResult::text(format!("step failed: {e}")),
-        }
-    }
+
 
     fn verb_mount(&self, path: &str) -> CmdResult {
         if path.is_empty() {
@@ -382,54 +321,8 @@ impl Engine {
         }
     }
 
-    fn verb_load(&self, path: &str) -> CmdResult {
-        if path.is_empty() {
-            return CmdResult::text("load <prg> — needs a .prg path.");
-        }
-        match self.rpc("session/load_prg", json!({ "prg_path": path })) {
-            Ok(v) => CmdResult::text(format!("LOAD {path} → {}", compact(&v))),
-            Err(e) => CmdResult::text(format!("load failed: {e}")),
-        }
-    }
 
-    fn verb_run_prg(&self, path: &str) -> CmdResult {
-        // run <prg> = load + autostart, then free-run. Use session/load_prg then
-        // runtime/run_prg via the file's bytes for the autostart semantics.
-        let bytes = match std::fs::read(path) {
-            Ok(b) => b,
-            Err(e) => return CmdResult::text(format!("run {path}: read failed: {e}")),
-        };
-        use base64::Engine as _;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        let r = self.rpc("runtime/run_prg", json!({ "bytes_b64": b64 }));
-        self.bump_epoch();
-        match r {
-            Ok(v) => {
-                let _ = self.rpc("session/play", json!({}));
-                CmdResult::text(format!("RUN {path} (autostart) → {}", compact(&v)))
-            }
-            Err(e) => CmdResult::text(format!("run {path} failed: {e}")),
-        }
-    }
 
-    fn verb_warp(&self, sub: Option<&str>) -> CmdResult {
-        // BUG-040 — the cockpit `/warp` runs the DAEMON's `warp` verb, so both
-        // front-ends execute one implementation and print one wording. The `/` prefix is
-        // input sugar; the verb behind it is shared.
-        match sub.map(|s| s.to_ascii_lowercase()).as_deref() {
-            Some("on") => {
-                let r = self.verb_monitor("warp on");
-                let _ = self.rpc("session/set_pacing", json!({ "mode": "warp", "ratio": 8.0 }));
-                r
-            }
-            Some("off") | None => {
-                let r = self.verb_monitor("warp off");
-                let _ = self.rpc("session/set_pacing", json!({ "mode": "pal", "ratio": 1.0 }));
-                r
-            }
-            Some(other) => CmdResult::text(format!("warp: unknown '{other}' (use on|off)")),
-        }
-    }
 
     fn verb_joystick(&self, sub: Option<&str>) -> CmdResult {
         // C64RE Spec 310: when ON, the window routes WASD+Space to the joystick; when
@@ -457,49 +350,9 @@ impl Engine {
         CmdResult::text(label)
     }
 
-    fn verb_dump(&self, path: &str) -> CmdResult {
-        if path.is_empty() {
-            return CmdResult::text("dump <path> — writes a .c64re snapshot (alias: snapshot).");
-        }
-        match self.rpc("snapshot/dump", json!({ "path": path })) {
-            Ok(v) => CmdResult::text(format!("DUMP → {path} {}", compact(&v))),
-            Err(e) => CmdResult::text(format!("dump failed: {e}")),
-        }
-    }
 
-    fn verb_restore(&self, path: &str) -> CmdResult {
-        if path.is_empty() {
-            return CmdResult::text("restore <path> — loads a .c64re snapshot (aliases: undump, loadsnapshot).");
-        }
-        let r = self.rpc("snapshot/undump", json!({ "path": path }));
-        self.bump_epoch();
-        match r {
-            Ok(v) => CmdResult::text(format!("RESTORE ← {path} {}", compact(&v))),
-            Err(e) => CmdResult::text(format!("restore failed: {e}")),
-        }
-    }
 
-    fn verb_ringdump(&self, path: &str) -> CmdResult {
-        if path.is_empty() {
-            return CmdResult::text("ringdump <path> — writes a .c64rering reverse-debug buffer.");
-        }
-        match self.rpc("ringbuffer/dump", json!({ "path": path })) {
-            Ok(v) => CmdResult::text(format!("RINGDUMP → {path} {}", compact(&v))),
-            Err(e) => CmdResult::text(format!("ringdump failed: {e}")),
-        }
-    }
 
-    fn verb_ringload(&self, path: &str) -> CmdResult {
-        if path.is_empty() {
-            return CmdResult::text("ringload <path> — loads a .c64rering reverse-debug buffer.");
-        }
-        let r = self.rpc("ringbuffer/restore", json!({ "path": path }));
-        self.bump_epoch();
-        match r {
-            Ok(v) => CmdResult::text(format!("RINGLOAD ← {path} {}", compact(&v))),
-            Err(e) => CmdResult::text(format!("ringload failed: {e}")),
-        }
-    }
 
     /// Spec 808 — F11, the universal go/stop. A DECISION, not a key mapping: what
     /// "resume" means depends on where the transport stands, and the daemon owns that.

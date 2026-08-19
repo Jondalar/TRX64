@@ -191,6 +191,13 @@ struct TrapRule {
 /// Singleton session, kept in memory for the daemon's lifetime.
 pub struct State {
     session: Session,
+    /// Spec 815 — which machine this SESSION claims to be. It lives here, not on
+    /// the chip, because it survives a power-cycle: power-cycling a C128 gives you
+    /// a C128. The first cut kept it on the VIC, so a mount (which power-cycles)
+    /// silently dropped it — and a cartridge probes in its boot stub, during the
+    /// very warm-up that power-on runs. The flag looked set and the detection had
+    /// already failed.
+    speed_profile: trx64_core::vic::SpeedProfile,
     breakpoints: Breakpoints,
     /// The breakpoint/watchpoint POLICY (cond-AST, hit/ignore, watch tables).
     /// Re-synced from `breakpoints` before each run; drives the core's debug gates.
@@ -1665,7 +1672,16 @@ fn do_power_on(st: &mut State) {
             roms.display()
         );
     }
+    // Spec 815 — the fresh machine inherits the session's claim. Power-cycling a
+    // C128 does not hand you a C64, and a cartridge probes during the warm-up below.
+    st.session.machine.set_speed_profile(st.speed_profile);
     st.machine_generation += 1; // Spec 786 audio fix — signal the streaming loop to re-hook the fresh SID.
+    // The audio epoch belongs HERE, not at the call sites. It was bumped by the
+    // `session/power` RPC and NOT by the monitor `power` verb — same function, two
+    // callers, one of them incomplete — so powering on from the monitor left every
+    // client following a stale epoch and the SID hook was never reinstalled. A
+    // client cannot be expected to know which door it came through.
+    st.audio_epoch = st.audio_epoch.wrapping_add(1);
     st.checkpoint_ring.clear();
     st.ctrl_stop = None;
     st.ctrl_frame += 1;
@@ -1689,11 +1705,22 @@ fn do_power_on(st: &mut State) {
         run_cycle_budget(&mut st.session, 5_000_000);
     }
     st.notify.broadcast("audio/flush", json!({ "session_id": st.session.id }));
+    // Spec 808 — powering on RUNS the machine, and a fresh machine has no past: the
+    // ring's anchors describe one that no longer exists. Both belong to the
+    // TRANSITION, not to whichever door was used. The comment at the session/power
+    // RPC already said the CLI must not set its own flag "because a second front-end
+    // would never have learned it" — and then the same seam was left between that
+    // RPC and the monitor verb, so `power on` from the monitor left the machine
+    // stopped with a stale timeline.
+    st.session.running = true;
+    transport_discard_timeline(st, "power on");
 }
 
 /// Spec 786 — power the machine OFF (dead, no live state) + the same
 /// housekeeping minus the boot warm-up (a powered-off machine runs nothing).
 fn do_power_off(st: &mut State) {
+    // See do_power_on: the epoch belongs to the transition, not to the caller.
+    st.audio_epoch = st.audio_epoch.wrapping_add(1);
     // Bug #2 fix (2026-07-10): power-OFF is the machine's terminal state ("AUS
     // komplett") — finalize any active trace FIRST so it is flushed to `.c64retrace`
     // + background-indexed, instead of stranding the buffer in RAM (lost on the next
@@ -1712,6 +1739,8 @@ fn do_power_off(st: &mut State) {
     st.mon.disasm_cursor = None;
     st.mon.mem_cursor = None;
     st.notify.broadcast("audio/flush", json!({ "session_id": st.session.id }));
+    st.session.running = false;
+    transport_discard_timeline(st, "power off");
 }
 
 /// Spec 786 power-cycle specialised for a state RESTORE (the `.c64re` cold
@@ -5669,6 +5698,108 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             ))
         }
 
+        // Spec 815 §4 — which machine this session claims to be, so a release's
+        // turbo code path becomes reachable at all. Bare `turbo` REPORTS: a verb
+        // that silently flips state when you meant to look gets used wrong once and
+        // distrusted after.
+        "turbo" => {
+            use trx64_core::vic::SpeedProfile;
+            let m = &mut st.session.machine;
+            let report = |m: &trx64_core::Machine| -> String {
+                let p = m.speed_profile();
+                let mut out = format!(
+                    "turbo: machine={}  speed bit={}",
+                    p.name(),
+                    if m.turbo_engaged() { "SET" } else { "clear" },
+                );
+                match p {
+                    SpeedProfile::C64 => out.push_str(
+                        "\n  $D02F-$D03F are open bus, as on a C64 — a release probing for a \
+                         turbo machine gets $FF and takes its plain path.\n  `turbo mode 128` or \
+                         `turbo mode u64` to answer the probe.",
+                    ),
+                    SpeedProfile::C128 => out.push_str(&format!(
+                        "\n  $D02F=${:02X} $D030=${:02X} (VIC-IIe read-back masks)",
+                        m.vic.read_reg(0x2f),
+                        m.vic.read_reg(0x30),
+                    )),
+                    SpeedProfile::U64 => out.push_str(&format!(
+                        "\n  $D031=${:02X}, $D030 open bus",
+                        m.vic.read_reg(0x31),
+                    )),
+                }
+                if m.turbo_engaged() {
+                    out.push_str(
+                        "\n  NOTE the speed bit is STORED, not acted on: the CPU still runs at \
+                         1 MHz and the picture is unchanged (Spec 815 §3, deliberately unbuilt).",
+                    );
+                }
+                out
+            };
+            match toks.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
+                None | Some("status") => Ok(report(m)),
+                Some("mode") => {
+                    let want = match toks.get(2) {
+                        Some(w) => w,
+                        None => return Err("turbo mode: which one? c64 | 128 | u64".to_string()),
+                    };
+                    match SpeedProfile::parse(want) {
+                        Some(p) => {
+                            // The SESSION claims it; the machine is told. A fresh
+                            // machine (power-cycle, mount) inherits it in do_power_on.
+                            st.speed_profile = p;
+                            st.session.machine.set_speed_profile(p);
+                            Ok(report(&st.session.machine))
+                        }
+                        None => Err(format!("turbo mode: unknown '{want}' (use c64 | 128 | u64)")),
+                    }
+                }
+                Some(state @ ("on" | "off")) => {
+                    let on = state == "on";
+                    match m.speed_profile() {
+                        SpeedProfile::C64 => Err(
+                            "turbo on: this session claims to be a plain C64, where the speed \
+                             register does not exist. `turbo mode 128` or `turbo mode u64` first."
+                                .to_string(),
+                        ),
+                        SpeedProfile::C128 => {
+                            let v = if on { 0x01 } else { 0x00 };
+                            m.vic.write_reg(0x30, v);
+                            Ok(report(m))
+                        }
+                        SpeedProfile::U64 => {
+                            let v = if on { 0x0e } else { 0x00 };
+                            m.vic.write_reg(0x31, v);
+                            Ok(report(m))
+                        }
+                    }
+                }
+                Some("speed") => {
+                    if m.speed_profile() != SpeedProfile::U64 {
+                        return Err(
+                            "turbo speed: the extended speed register is $D031, which only the \
+                             u64 profile has. `turbo mode u64` first, or use `turbo on|off` on 128."
+                                .to_string(),
+                        );
+                    }
+                    // Hex, like every other number in this monitor.
+                    let n = match toks.get(2).and_then(|t| parse_hex(t)) {
+                        Some(n) if n <= 0xff => n as u8,
+                        _ => return Err(
+                            "turbo speed: one byte in HEX, like the rest of this monitor \
+                             ($00-$FF; $00 = off)".to_string(),
+                        ),
+                    };
+                    m.vic.write_reg(0x31, n);
+                    Ok(report(m))
+                }
+                Some(other) => Err(format!(
+                    "turbo: unknown '{other}' (use `turbo`, `turbo mode c64|128|u64`, \
+                     `turbo on|off`, `turbo speed N`)"
+                )),
+            }
+        }
+
         "warp" => {
             match toks.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
                 Some("on") => {
@@ -6137,7 +6268,10 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 Some("cold") => {
                     do_power_off(st);
                     do_power_on(st);
-                    Ok("reset cold (power-cycle)".to_string())
+                    Ok(format!(
+                        "RESET (cold) \u{2014} power-cycle @ PC=${:04X}, running.",
+                        st.session.machine.cpu6510.reg_pc
+                    ))
                 }
                 _ => {
                     // warm = HW RESET line: $FCE2 via $FFFC, RAM + media preserved.
@@ -6150,18 +6284,28 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                     st.stream_broke_on_jam = false;
                     st.mon.disasm_cursor = None;
                     st.mon.mem_cursor = None;
-                    Ok("reset warm ($FCE2)".to_string())
+                    // A real machine reset boots and RUNS; leaving it frozen at the
+                    // reset vector was the cockpit's job to undo, and the cockpit is a
+                    // pipe now.
+                    st.session.running = true;
+                    Ok(format!(
+                        "RESET (warm) \u{2014} $FCE2 @ PC=${:04X}, running.",
+                        st.session.machine.cpu6510.reg_pc
+                    ))
                 }
             }
         }
         "power" => match toks.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
             Some("on") => {
                 do_power_on(st);
-                Ok(format!("power on (powered={})", st.session.powered))
+                Ok(format!(
+                    "POWER ON \u{2014} full init @ PC=${:04X}, running.",
+                    st.session.machine.cpu6510.reg_pc
+                ))
             }
             Some("off") => {
                 do_power_off(st);
-                Ok(format!("power off (powered={})", st.session.powered))
+                Ok("POWER OFF \u{2014} machine off (no live state).".to_string())
             }
             _ => Ok("power on|off".to_string()),
         },
@@ -6598,7 +6742,9 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
         // `snapshot`/`loadsnapshot` are aliases: our runtime snapshot IS the `.c64re`
         // dump. An agent that reached for "snapshot" (VICE terminology) gets the same
         // capability instead of `unknown command: snapshot`.
-        "dump" | "snapshot" | "undump" | "loadsnapshot" => {
+        // `restore` was a COCKPIT-only alias for undump. With the clients reduced to
+        // pipes the alias has to live here, or the word simply stops existing.
+        "dump" | "snapshot" | "undump" | "loadsnapshot" | "restore" => {
             let (file, _rest) = parse_file_cmd();
             let path = match file {
                 Some(p) => resolve_fs_path(&p),
@@ -7165,6 +7311,11 @@ fn monitor_help_text() -> String {
         "    warp on|off               8\u{00d7} pacing / PAL real-time",
         "    rawframe on|off           an anchor stores no picture, so stepping onto one REDRAWS it: two frames, keep the second, because the first is cut into wherever the anchor landed in the raster. That discards a ONE-FRAME event — a border opened for a frame, a bad raster split — so it looks like the ring never caught it. `on` keeps the FIRST frame, seam and all. Anchors that sit on a frame boundary use the first either way (whole, nothing lost). `transport/status` reports which you are looking at as `shownFrame`.",
         "    reset [warm|cold] · power on|off",
+        "    turbo                     Spec 815 — which machine this session CLAIMS to be, so a release's turbo code path is reachable at all. A C64 answers $FF at $D02F-$D03F, the probe fails, and everything behind it is dead code.",
+        "    turbo mode c64|128|u64    c64 (default) = open bus. 128 = the VIC-IIe pair $D02F/$D030 with VICE's read-back masks. u64 = an extended speed register at $D031. Survives a reset: it is machine identity, not chip state.",
+        "    turbo on|off              set/clear the speed bit the way the release would ($D030 bit 0, or $D031)",
+        "    turbo speed $NN           the extended speed value (u64 profile)",
+        "                              The speed bit is STORED, not acted on: the CPU still runs at 1 MHz and the picture is unchanged. What a set bit does to the display is Spec 815 §3 and is unbuilt on purpose — guessing it would put behaviour here that exists nowhere else.",
         "  MARKS (Spec 809 — a named, pinned point you can iterate FROM)",
         "    mark <name>               name + pin the anchor you are standing on (max 32)",
         "    marks                     list them with cycle, frame, how far back, and the window cost",
@@ -9124,20 +9275,9 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             let op = req.params.get("op").and_then(|v| v.as_str()).unwrap_or("");
             let mut st = state.lock().unwrap();
             match op {
-                "on" => {
-                    do_power_on(&mut st);
-                    st.audio_epoch = st.audio_epoch.wrapping_add(1);
-                    // Powering on RUNS the machine, and a fresh machine has no past —
-                    // the ring's anchors describe one that no longer exists.
-                    st.session.running = true;
-                    transport_discard_timeline(&mut st, "power on");
-                }
-                "off" => {
-                    do_power_off(&mut st);
-                    st.audio_epoch = st.audio_epoch.wrapping_add(1);
-                    st.session.running = false;
-                    transport_discard_timeline(&mut st, "power off");
-                }
+                // The transition owns running + the timeline (see do_power_on).
+                "on" => do_power_on(&mut st),
+                "off" => do_power_off(&mut st),
                 _ => return Response::err(id, -32602, "session/power: op must be \"on\" or \"off\""),
             }
             let powered = st.session.powered;
@@ -9237,6 +9377,54 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 "c64Cycles": st.session.machine.clk,
                 "rasterLine": st.session.machine.vic.raster_line as u64,
                 "rasterCycle": st.session.machine.vic.raster_cycle as u64,
+            }))
+        }
+
+        // Spec 815 §4 — the parameter half of the turbo switch, for a scripted or
+        // headless run. The monitor verb `turbo` is the same thing for a human.
+        "session/turbo" => {
+            use trx64_core::vic::SpeedProfile;
+            let mut st = state.lock().unwrap();
+            if let Some(m) = req.params.get("mode").and_then(|v| v.as_str()) {
+                match SpeedProfile::parse(m) {
+                    Some(p) => { st.speed_profile = p; st.session.machine.set_speed_profile(p); }
+                    None => return Response::err(id, -32602, &format!(
+                        "session/turbo: unknown mode '{m}' (c64 | 128 | u64)"
+                    )),
+                }
+            }
+            let profile = st.session.machine.speed_profile();
+            if let Some(on) = req.params.get("on").and_then(|v| v.as_bool()) {
+                match profile {
+                    SpeedProfile::C64 => return Response::err(id, -32602,
+                        "session/turbo: this session claims to be a plain C64, where the speed \
+                         register does not exist — set mode to 128 or u64 first"),
+                    SpeedProfile::C128 => st.session.machine.vic.write_reg(0x30, u8::from(on)),
+                    SpeedProfile::U64 => st.session.machine.vic.write_reg(0x31, if on { 0x0e } else { 0 }),
+                }
+            }
+            if let Some(sp) = req.params.get("speed").and_then(|v| v.as_u64()) {
+                if profile != SpeedProfile::U64 {
+                    return Response::err(id, -32602,
+                        "session/turbo: `speed` is the extended register $D031, which only the \
+                         u64 profile has");
+                }
+                if sp > 0xff {
+                    return Response::err(id, -32602, "session/turbo: `speed` is one byte, 0..255");
+                }
+                st.session.machine.vic.write_reg(0x31, sp as u8);
+            }
+            let m = &st.session.machine;
+            Response::ok(id, json!({
+                "mode": m.speed_profile().name(),
+                "engaged": m.turbo_engaged(),
+                "d02f": m.vic.read_reg(0x2f) as u64,
+                "d030": m.vic.read_reg(0x30) as u64,
+                "d031": m.vic.read_reg(0x31) as u64,
+                // Say it in the answer, every time: a caller that reads `engaged`
+                // and assumes the machine got faster has been misled by us.
+                "note": "the speed bit is STORED, not acted on — the CPU still runs at 1 MHz and \
+                         the picture is unchanged (Spec 815 §3, unbuilt on purpose)",
             }))
         }
 
@@ -17464,6 +17652,7 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         session.running = true;
     }
     State {
+        speed_profile: trx64_core::vic::SpeedProfile::C64,
         session,
         breakpoints: Breakpoints::new(),
         observers: observers::ObserverRegistry::new(),
@@ -18032,6 +18221,7 @@ mod batch1_tests {
 
     fn make_state() -> SharedState {
         Arc::new(Mutex::new(State {
+            speed_profile: trx64_core::vic::SpeedProfile::C64,
             session: Session::new("integrated-1"),
             breakpoints: Breakpoints::new(),
             observers: observers::ObserverRegistry::new(),
@@ -19292,6 +19482,159 @@ mod batch1_tests {
             after["vic"]["screenPtr"].as_u64(),
             "with bank 0 the absolute base IS the offset"
         );
+    }
+
+    /// Spec 815 — the claim is the SESSION's and survives a power-cycle.
+    ///
+    /// The first cut kept it on the VIC, so a mount — which power-cycles — silently
+    /// dropped it. That is not a detail: `do_power_on` warms the boot by five million
+    /// cycles, and a cartridge probes for a turbo machine in its boot stub, inside
+    /// exactly that warm-up. The flag was set, the run looked fine, and the detection
+    /// had already answered "plain C64" before anyone could see it.
+    ///
+    /// Power-cycling a C128 gives you a C128. This pins that.
+    #[test]
+    fn the_machine_claim_survives_a_power_cycle_because_a_cartridge_probes_during_boot() {
+        use trx64_core::vic::SpeedProfile;
+        let st = make_state();
+        call(&st, "session/power", json!({ "op": "on" }));
+        call(&st, "debug/pause", json!({ "source": "test" }));
+
+        call(&st, "session/turbo", json!({ "mode": "128" }));
+        assert_eq!(st.lock().unwrap().session.machine.speed_profile(), SpeedProfile::C128);
+
+        call(&st, "session/power", json!({ "op": "off" }));
+        call(&st, "session/power", json!({ "op": "on" }));
+        assert_eq!(
+            st.lock().unwrap().session.machine.speed_profile(),
+            SpeedProfile::C128,
+            "the fresh machine inherits the session's claim — otherwise a mount eats it"
+        );
+        // And the probe still answers on the fresh chip, which is the point.
+        let d = |a: u8| st.lock().unwrap().session.machine.vic.read_reg(a);
+        assert_eq!(d(0x30) & 0xfc, 0xfc, "the VIC-IIe pair is live after the cycle");
+
+        // A warm reset keeps it too.
+        call(&st, "session/turbo", json!({ "mode": "u64" }));
+        st.lock().unwrap().session.machine.warm_reset();
+        assert_eq!(st.lock().unwrap().session.machine.speed_profile(), SpeedProfile::U64);
+    }
+
+    /// The monitor verb, because a human flips this mid-session and a parameter is
+    /// no help there. Bare `turbo` REPORTS: a verb that silently flips state when
+    /// you meant to look gets used wrong once and distrusted after.
+    #[test]
+    fn the_turbo_verb_reports_before_it_changes_anything() {
+        let st = make_state();
+        call(&st, "session/power", json!({ "op": "on" }));
+        call(&st, "debug/pause", json!({ "source": "test" }));
+        let mon = |st: &SharedState, c: &str| -> String {
+            let r = call(st, "monitor/exec", json!({ "command": c }));
+            r["output"].as_str().unwrap_or_default().to_string()
+        };
+
+        let bare = mon(&st, "turbo");
+        assert!(bare.contains("machine=c64"), "bare turbo reports: {bare}");
+        assert!(bare.contains("open bus"), "and says why a probe fails here: {bare}");
+        assert!(!st.lock().unwrap().session.machine.turbo_engaged(), "reporting changed nothing");
+
+        assert!(mon(&st, "turbo mode 128").contains("machine=128"));
+        let on = mon(&st, "turbo on");
+        assert!(on.contains("speed bit=SET"), "{on}");
+        assert!(on.contains("STORED, not acted on"), "it says what it is NOT: {on}");
+        assert!(mon(&st, "turbo off").contains("speed bit=clear"));
+
+        assert!(mon(&st, "turbo mode u64").contains("machine=u64"));
+        assert!(mon(&st, "turbo speed $0e").contains("$D031=$0E"));
+
+        // The mistakes, each answered with the way out rather than a bare "no".
+        let err = |st: &SharedState, c: &str| -> String {
+            let r = call(st, "monitor/exec", json!({ "command": c }));
+            r["error"].as_str().unwrap_or_default().to_string()
+        };
+        mon(&st, "turbo mode c64");
+        assert!(err(&st, "turbo on").contains("mode 128"), "refusal names the fix");
+        assert!(err(&st, "turbo speed $01").contains("u64"), "so does this one");
+        assert!(err(&st, "turbo mode c65").contains("c64 | 128 | u64"));
+        assert!(err(&st, "turbo sideways").contains("turbo mode"));
+    }
+
+    /// Spec 815 — the probes a C64 release makes before it takes a turbo path.
+    ///
+    /// On a plain C64 every one of those reads is $FF, the probe fails, and the whole
+    /// turbo half of a release is dead code no amount of playing will reach. This gate
+    /// runs the actual probe, as the probe: the two OR masks from `vicii-mem.c:960-980`
+    /// ARE the detection.
+    #[test]
+    fn turbo_profiles_answer_the_probes_a_release_makes() {
+        use trx64_core::vic::SpeedProfile;
+        let st = make_state();
+        call(&st, "session/power", json!({ "op": "on" }));
+        call(&st, "debug/pause", json!({ "source": "test" }));
+
+        let d = |st: &SharedState, a: u8| -> u8 { st.lock().unwrap().session.machine.vic.read_reg(a) };
+        let w = |st: &SharedState, a: u8, v: u8| { st.lock().unwrap().session.machine.vic.write_reg(a, v); };
+
+        // Default: a C64. Open bus, and writes do nothing.
+        assert_eq!(d(&st, 0x2f), 0xff);
+        assert_eq!(d(&st, 0x30), 0xff);
+        assert_eq!(d(&st, 0x31), 0xff);
+        w(&st, 0x30, 0x01);
+        assert_eq!(d(&st, 0x30), 0xff, "a C64 has no speed register to write");
+        assert!(!st.lock().unwrap().session.machine.turbo_engaged());
+
+        // The VIC-IIe pair. THE probe: $FE -> equal; $00 -> differ by exactly $04.
+        let r = call(&st, "session/turbo", json!({ "mode": "128" }));
+        assert_eq!(r["mode"].as_str(), Some("128"));
+        w(&st, 0x2f, 0xfe);
+        w(&st, 0x30, 0xfe);
+        assert_eq!(d(&st, 0x2f), d(&st, 0x30), "after $FE the pair reads equal");
+        w(&st, 0x2f, 0x00);
+        w(&st, 0x30, 0x00);
+        assert_eq!(d(&st, 0x2f), 0xf8);
+        assert_eq!(d(&st, 0x30), 0xfc);
+        assert_eq!(d(&st, 0x30) - d(&st, 0x2f), 0x04, "and after $00 by exactly $04");
+        assert_eq!(d(&st, 0x31), 0xff, "the VIC-IIe has no $D031");
+
+        // The speed bit round-trips and is reported.
+        w(&st, 0x30, 0x01);
+        assert!(st.lock().unwrap().session.machine.turbo_engaged());
+        let s = call(&st, "session/turbo", json!({}));
+        assert_eq!(s["engaged"].as_bool(), Some(true));
+        assert!(s["note"].as_str().unwrap().contains("STORED, not acted on"),
+                "the answer says what it is NOT, every time");
+
+        // §3 is a HOLE, and this is what keeps it visible: setting the bit changes
+        // nothing about the machine. The day it does, this assertion fails and
+        // whoever changed it has to say so.
+        let before = st.lock().unwrap().session.machine.render_canvas_indices().2;
+        w(&st, 0x30, 0x00);
+        let after = st.lock().unwrap().session.machine.render_canvas_indices().2;
+        assert_eq!(before, after, "the speed bit does not touch the picture (Spec 815 §3, unbuilt)");
+
+        // The extended register: readable, while $D030 stays open bus — which is
+        // exactly what the type-2 probe distinguishes on.
+        call(&st, "session/turbo", json!({ "mode": "u64" }));
+        assert_eq!(d(&st, 0x30), 0xff, "$D030 is open bus on this profile");
+        let sp = call(&st, "session/turbo", json!({ "speed": 0x0e }));
+        assert_eq!(sp["d031"].as_u64(), Some(0x0e), "$D031 round-trips");
+        assert_eq!(sp["engaged"].as_bool(), Some(true));
+
+        // Identity, not chip state: a reset does not turn a C128 back into a C64.
+        call(&st, "session/turbo", json!({ "mode": "128" }));
+        st.lock().unwrap().session.machine.warm_reset();
+        assert_eq!(
+            st.lock().unwrap().session.machine.speed_profile(),
+            SpeedProfile::C128,
+            "the profile survives a reset — a release that re-probes must get the same answer"
+        );
+        assert!(!st.lock().unwrap().session.machine.turbo_engaged(), "but the speed bit does not");
+
+        // Turning it on where it does not exist is refused, with what to do instead.
+        call(&st, "session/turbo", json!({ "mode": "c64" }));
+        let e = call_err(&st, "session/turbo", json!({ "on": true }));
+        assert_eq!(e.code, -32602);
+        assert!(e.message.contains("128 or u64"), "the refusal says the way out: {}", e.message);
     }
 
     /// Spec 813 §8 — a predicate evaluated once per frame needs BYTES, and it needs

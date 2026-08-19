@@ -223,6 +223,10 @@ pub struct SandboxArgs {
     pub stub_addr: u16,
     pub cyc_cap: u64,
     pub instr_cap: u64,
+    /// Spec 815 — which machine this claims to be (`c64` | `128` | `u64`), so a
+    /// routine that PROBES for a turbo machine can be exercised here instead of
+    /// only through a full boot. `None` = c64.
+    pub turbo: Option<String>,
     /// Direct-entry mode (TS-faithful): PC=entry + reg-seed + staged RTS sentinel,
     /// instead of the `jsr entry` stub. Auto-enabled when any `reg_*` is set.
     pub direct_entry: bool,
@@ -275,6 +279,7 @@ pub fn run_sandbox_cli(
     stub_addr: Option<u16>,
     cyc_cap: Option<u64>,
     instr_cap: Option<u64>,
+    turbo: Option<&str>,
     direct_entry: bool,
     reg_a: Option<&str>,
     reg_x: Option<&str>,
@@ -316,6 +321,7 @@ pub fn run_sandbox_cli(
             .transpose()
     };
     run_sandbox(&SandboxArgs {
+        turbo: turbo.map(|s| s.to_string()),
         rom_dir: rom_dir.to_path_buf(),
         seed: seed.map(|s| s.to_string()),
         cart: cart.map(|s| s.to_string()),
@@ -435,6 +441,14 @@ pub fn run_sandbox(args: &SandboxArgs) -> Result<String, String> {
     let mut m = Machine::new();
     m.boot_from_dir(&args.rom_dir)
         .map_err(|e| format!("boot ROMs from {}: {e:?}", args.rom_dir.display()))?;
+    // Spec 815 — set BEFORE the seed is restored and before anything runs: a routine
+    // that probes does it on its first pass, and a scratch machine has no second one.
+    if let Some(t) = args.turbo.as_deref() {
+        match trx64_core::vic::SpeedProfile::parse(t) {
+            Some(p) => m.set_speed_profile(p),
+            None => return Err(format!("--turbo: unknown '{t}' (use c64 | 128 | u64)")),
+        }
+    }
 
     // Optional seed: restore a .c64re snapshot into the booted machine (a loader-
     // resident state), then run the routine on top of it. Mirrors the daemon undump:
@@ -950,6 +964,8 @@ pub fn run_sandbox_batch(rom_dir: &Path, spec_path: &str) -> Result<String, Stri
                     stub_addr,
                     item.get("cycCap").and_then(|v| v.as_u64()),
                     item.get("instrCap").and_then(|v| v.as_u64()),
+                    // Spec 815 — a batch item may claim its own machine.
+                    item.get("turbo").and_then(|v| v.as_str()),
                     item.get("directEntry").and_then(|v| v.as_bool()).unwrap_or(false),
                     str_field(&item, "regA"),
                     str_field(&item, "regX"),
@@ -1073,6 +1089,7 @@ mod tests {
 
     fn base_args(rom_dir: PathBuf) -> SandboxArgs {
         SandboxArgs {
+            turbo: None,
             rom_dir,
             seed: None,
             cart: None,
