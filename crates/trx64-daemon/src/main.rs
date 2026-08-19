@@ -1666,6 +1666,12 @@ fn do_power_on(st: &mut State) {
         );
     }
     st.machine_generation += 1; // Spec 786 audio fix — signal the streaming loop to re-hook the fresh SID.
+    // The audio epoch belongs HERE, not at the call sites. It was bumped by the
+    // `session/power` RPC and NOT by the monitor `power` verb — same function, two
+    // callers, one of them incomplete — so powering on from the monitor left every
+    // client following a stale epoch and the SID hook was never reinstalled. A
+    // client cannot be expected to know which door it came through.
+    st.audio_epoch = st.audio_epoch.wrapping_add(1);
     st.checkpoint_ring.clear();
     st.ctrl_stop = None;
     st.ctrl_frame += 1;
@@ -1689,11 +1695,22 @@ fn do_power_on(st: &mut State) {
         run_cycle_budget(&mut st.session, 5_000_000);
     }
     st.notify.broadcast("audio/flush", json!({ "session_id": st.session.id }));
+    // Spec 808 — powering on RUNS the machine, and a fresh machine has no past: the
+    // ring's anchors describe one that no longer exists. Both belong to the
+    // TRANSITION, not to whichever door was used. The comment at the session/power
+    // RPC already said the CLI must not set its own flag "because a second front-end
+    // would never have learned it" — and then the same seam was left between that
+    // RPC and the monitor verb, so `power on` from the monitor left the machine
+    // stopped with a stale timeline.
+    st.session.running = true;
+    transport_discard_timeline(st, "power on");
 }
 
 /// Spec 786 — power the machine OFF (dead, no live state) + the same
 /// housekeeping minus the boot warm-up (a powered-off machine runs nothing).
 fn do_power_off(st: &mut State) {
+    // See do_power_on: the epoch belongs to the transition, not to the caller.
+    st.audio_epoch = st.audio_epoch.wrapping_add(1);
     // Bug #2 fix (2026-07-10): power-OFF is the machine's terminal state ("AUS
     // komplett") — finalize any active trace FIRST so it is flushed to `.c64retrace`
     // + background-indexed, instead of stranding the buffer in RAM (lost on the next
@@ -1712,6 +1729,8 @@ fn do_power_off(st: &mut State) {
     st.mon.disasm_cursor = None;
     st.mon.mem_cursor = None;
     st.notify.broadcast("audio/flush", json!({ "session_id": st.session.id }));
+    st.session.running = false;
+    transport_discard_timeline(st, "power off");
 }
 
 /// Spec 786 power-cycle specialised for a state RESTORE (the `.c64re` cold
@@ -6236,7 +6255,10 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 Some("cold") => {
                     do_power_off(st);
                     do_power_on(st);
-                    Ok("reset cold (power-cycle)".to_string())
+                    Ok(format!(
+                        "RESET (cold) \u{2014} power-cycle @ PC=${:04X}, running.",
+                        st.session.machine.cpu6510.reg_pc
+                    ))
                 }
                 _ => {
                     // warm = HW RESET line: $FCE2 via $FFFC, RAM + media preserved.
@@ -6249,18 +6271,28 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                     st.stream_broke_on_jam = false;
                     st.mon.disasm_cursor = None;
                     st.mon.mem_cursor = None;
-                    Ok("reset warm ($FCE2)".to_string())
+                    // A real machine reset boots and RUNS; leaving it frozen at the
+                    // reset vector was the cockpit's job to undo, and the cockpit is a
+                    // pipe now.
+                    st.session.running = true;
+                    Ok(format!(
+                        "RESET (warm) \u{2014} $FCE2 @ PC=${:04X}, running.",
+                        st.session.machine.cpu6510.reg_pc
+                    ))
                 }
             }
         }
         "power" => match toks.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
             Some("on") => {
                 do_power_on(st);
-                Ok(format!("power on (powered={})", st.session.powered))
+                Ok(format!(
+                    "POWER ON \u{2014} full init @ PC=${:04X}, running.",
+                    st.session.machine.cpu6510.reg_pc
+                ))
             }
             Some("off") => {
                 do_power_off(st);
-                Ok(format!("power off (powered={})", st.session.powered))
+                Ok("POWER OFF \u{2014} machine off (no live state).".to_string())
             }
             _ => Ok("power on|off".to_string()),
         },
@@ -6697,7 +6729,9 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
         // `snapshot`/`loadsnapshot` are aliases: our runtime snapshot IS the `.c64re`
         // dump. An agent that reached for "snapshot" (VICE terminology) gets the same
         // capability instead of `unknown command: snapshot`.
-        "dump" | "snapshot" | "undump" | "loadsnapshot" => {
+        // `restore` was a COCKPIT-only alias for undump. With the clients reduced to
+        // pipes the alias has to live here, or the word simply stops existing.
+        "dump" | "snapshot" | "undump" | "loadsnapshot" | "restore" => {
             let (file, _rest) = parse_file_cmd();
             let path = match file {
                 Some(p) => resolve_fs_path(&p),
@@ -9228,20 +9262,9 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             let op = req.params.get("op").and_then(|v| v.as_str()).unwrap_or("");
             let mut st = state.lock().unwrap();
             match op {
-                "on" => {
-                    do_power_on(&mut st);
-                    st.audio_epoch = st.audio_epoch.wrapping_add(1);
-                    // Powering on RUNS the machine, and a fresh machine has no past —
-                    // the ring's anchors describe one that no longer exists.
-                    st.session.running = true;
-                    transport_discard_timeline(&mut st, "power on");
-                }
-                "off" => {
-                    do_power_off(&mut st);
-                    st.audio_epoch = st.audio_epoch.wrapping_add(1);
-                    st.session.running = false;
-                    transport_discard_timeline(&mut st, "power off");
-                }
+                // The transition owns running + the timeline (see do_power_on).
+                "on" => do_power_on(&mut st),
+                "off" => do_power_off(&mut st),
                 _ => return Response::err(id, -32602, "session/power: op must be \"on\" or \"off\""),
             }
             let powered = st.session.powered;
