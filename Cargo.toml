@@ -27,7 +27,7 @@ edition = "2021"
 #     EXPECTED_RUNTIME_PROTOCOL;
 #   - the `.c64re` snapshot `schemaVersion`.
 # Bump this one freely: 0.x → minor for features, patch for fixes.
-version = "0.4.2"
+version = "0.5.0"
 license = "GPL-3.0-or-later"
 
 # TRX64 — Rust drop-in for the C64ReverseEngineeringMCP headless runtime.
