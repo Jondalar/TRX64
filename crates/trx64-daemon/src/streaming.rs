@@ -334,6 +334,14 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
     let period = frame_period();
     let mut frame_seq: u32 = 0;
     let mut audio_seq: u32 = 0;
+    // The master clock of the LAST frame this loop presented. A paused machine can
+    // still MOVE — the rewind transport steps it (F9/F12), replays it (F10), a monitor
+    // `z`/`n` advances it — and nothing was pushing a frame for any of that, so the
+    // browser kept showing the picture from the moment of the pause and every one of
+    // those keys looked dead. The terminal front-end never noticed because it renders
+    // from its own poll. Comparing the clock is what tells "the machine moved" from
+    // "the machine is frozen", and only a move costs a render.
+    let mut last_present_clk: u64 = 0;
     // Epoch-anchored pacing: schedule each frame at an absolute target time so the
     // pace doesn't drift (matches c64re's accumulated-target sleep). If we fall
     // far behind (>100 ms), re-base the epoch instead of spinning to catch up.
@@ -531,6 +539,10 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
                 }),
             );
 
+            // Keep the paused-present baseline current while running, so the first
+            // frame after a pause is not presented twice.
+            last_present_clk = st.session.machine.clk;
+
             // Drop the lock before building the (larger) wire buffers + sleeping.
             drop(st);
 
@@ -562,12 +574,36 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
             // and we consume it ONCE here: render the (already-restored) live frame,
             // push exactly one BIN_VIC (binary only — TS pushFrame on restore emits no
             // JSON), then clear the flag (no continuous push — the machine stays frozen).
+            //
+            // And a paused machine is not a MOTIONLESS one. The rewind transport moves
+            // it while the emulation stands still: F9/F12 step it one anchor, F10
+            // replays it backwards, `goto` places it. That advance happened inside a
+            // JSON-RPC handler, this loop was the only thing that pushes pictures, and
+            // it was pushing none — so the browser kept the frame from the moment of the
+            // pause and the transport keys looked broken. They were not; nobody was
+            // presenting the result. Two things follow, both here:
+            //
+            //   1. `play back` sets a DIRECTION and leaves the stepping to the pump.
+            //      The pump only ticked the transport in the running branch, so a
+            //      backwards replay from a paused machine never took a single step.
+            //   2. A present is owed whenever the machine MOVED — which the master
+            //      clock answers exactly, and cheaply. `force_present_frame` stays for
+            //      the case a move cannot be seen in the clock (a restore to the same
+            //      cycle, a memory write from the monitor).
             let vic_msg = {
                 let mut st = state.lock().unwrap();
-                if !st.force_present_frame {
+                // (1) — the transport paces itself against the wall clock, so calling it
+                // once per loop iteration is the same cadence it gets while running.
+                if st.transport.playing.is_some() {
+                    crate::transport_tick(&mut st, CYC_PER_FRAME);
+                }
+                // (2)
+                let clk = st.session.machine.clk;
+                if !paused_present_due(st.force_present_frame, clk, last_present_clk) {
                     None
                 } else {
                     st.force_present_frame = false;
+                    last_present_clk = clk;
                     let cpu_cycle = st.session.machine.c64_core.clk as u32;
                     let (w, h, indices) = st.session.machine.render_canvas_indices();
                     // Binary VIC frame ONLY — 1:1 with TS pushFrame on restore (no JSON
@@ -602,9 +638,39 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
     }
 }
 
+/// Does a PAUSED machine owe the clients a picture?
+///
+/// Two reasons, and the second is the one the transport keys needed. A forced
+/// present is an explicit request from a handler that moved the machine without
+/// moving the clock (`checkpoint/restore` to the same cycle, a monitor memory
+/// write). A changed master clock is the general answer: the machine advanced or
+/// was placed somewhere else, so what the client is showing is stale.
+///
+/// Deliberately NOT "present every iteration while paused": rendering the canvas
+/// costs real time (the multicolour-bitmap path especially), and a frozen machine
+/// would be paying it fifty times a second to redraw the identical picture.
+fn paused_present_due(force: bool, clk: u64, last_presented_clk: u64) -> bool {
+    force || clk != last_presented_clk
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spec 808 — F9/F10/F12 moved the machine and the browser kept showing the frame
+    /// from the moment of the pause, because the pump only pushed pictures in the
+    /// running branch. The rule that fixes it, on its own.
+    #[test]
+    fn a_paused_machine_that_moved_owes_a_frame() {
+        // Frozen: same clock, nothing forced → no render, no push.
+        assert!(!paused_present_due(false, 1000, 1000));
+        // Moved: the transport stepped it to another anchor.
+        assert!(paused_present_due(false, 980, 1000));
+        // Moved forward: `frame +1` at the head runs one frame live.
+        assert!(paused_present_due(false, 1020, 1000));
+        // Forced: a restore that landed on the SAME cycle still repaints.
+        assert!(paused_present_due(true, 1000, 1000));
+    }
 
     #[test]
     fn vic_frame_wire_layout_matches_tap() {

@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Spec-board drift gate.
 #
 # TRX64 had no board until 2026-08-12: status lived only inside each spec, nothing

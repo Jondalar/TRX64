@@ -19441,6 +19441,50 @@ mod batch1_tests {
         assert!(err.message.contains("key required"), "{err:?}");
     }
 
+    /// F10 — `play back` from a PAUSED machine took no step at all.
+    ///
+    /// `play back` sets a DIRECTION and leaves the stepping to the stream pump, and the
+    /// pump only ticked the transport inside its `if running` branch. So the one state
+    /// you press F10 in — paused, wanting to see what just happened — was the one state
+    /// nothing moved in. The key set a flag and the picture never changed.
+    ///
+    /// The pump now ticks the transport while paused too. This gates the tick itself:
+    /// a paused machine with a direction set MOVES.
+    #[test]
+    fn play_back_steps_a_paused_machine() {
+        let st = make_state();
+        call(&st, "session/power", json!({ "op": "on" }));
+        // One anchor per frame, so a short run leaves something to play back through.
+        mon(&st, "cadence 1").expect("cadence 1");
+        for _ in 0..12 {
+            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+        }
+        mon(&st, "pause").expect("pause");
+        assert!(!st.lock().unwrap().session.running, "the machine is paused");
+
+        mon(&st, "play back").expect("play back");
+        let before = {
+            let g = st.lock().unwrap();
+            assert!(g.transport.playing.is_some(), "a direction is set");
+            g.session.machine.clk
+        };
+
+        // The transport paces against the WALL clock (20 ms per step), so give it one
+        // step's worth of real time — the same thing the pump gives it.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        {
+            let mut g = st.lock().unwrap();
+            crate::transport_tick(&mut g, crate::streaming::CYC_PER_FRAME);
+        }
+
+        let after = st.lock().unwrap().session.machine.clk;
+        assert_ne!(after, before, "a tick with a direction set must MOVE the machine");
+        assert!(
+            st.lock().unwrap().transport.holds_the_machine(),
+            "and the transport is holding it, which is what the picture must show"
+        );
+    }
+
     /// Spec 813 — `session/state` reports the ABSOLUTE VIC bases, and the bank it
     /// reports comes from the machine rather than from a fifth copy of the formula.
     ///
