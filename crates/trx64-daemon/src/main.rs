@@ -198,6 +198,15 @@ pub struct State {
     /// very warm-up that power-on runs. The flag looked set and the detection had
     /// already failed.
     speed_profile: trx64_core::vic::SpeedProfile,
+    /// Spec 814 §2 — the armed input journal. `None` = not recording, which is the
+    /// default and costs nothing.
+    ///
+    /// It lives in the DAEMON because the cycle is the only part of a recorded input
+    /// that matters and the daemon is the only party that knows it. A UI that stamps
+    /// its own click records the WebSocket round-trip and its render loop; replay that
+    /// and the press lands somewhere else on the machine. The browser may say WHAT was
+    /// pressed. It may never say WHEN.
+    input_journal: Option<InputJournal>,
     breakpoints: Breakpoints,
     /// The breakpoint/watchpoint POLICY (cond-AST, hit/ignore, watch tables).
     /// Re-synced from `breakpoints` before each run; drives the core's debug gates.
@@ -8559,6 +8568,10 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
     // Spec 767 (live-view) — flip the shared-session control owner to whoever issued this
     // OPERATING command (green border when the LLM is co-driving) BEFORE the handler runs.
     note_operating_owner_for(&req, state);
+    // Spec 814 §2 — and record it, if a recording is armed. Same hook, because the two
+    // questions ("who is driving?" and "what did the machine receive?") are answered by
+    // the same request and must not drift apart.
+    note_input_journal(&req, state);
     match req.method.as_str() {
         "ping" => {
             // Handshake payload: `runtime_version` is the WIRE-PROTOCOL epoch a client
@@ -13022,6 +13035,40 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
         // real answer — a key the machine has no use for must be reported as
         // dropped, not swallowed in silence, or the next client to go quiet leaves
         // nobody able to tell "not mapped" from "broken".
+        // Spec 814 §2 — the armed input journal, and the ONLY new machine fact the
+        // recorder needs.
+        //
+        //   arm: true   start a fresh recording (drops anything previous)
+        //   arm: false  stop, and return what was recorded
+        //   (omitted)   look without touching — a verb that flips state when you
+        //               meant to look is one that gets used wrong once and distrusted
+        //               after (the same rule as bare `turbo`, Spec 815 §4)
+        "session/input_journal" => {
+            let mut st = state.lock().unwrap();
+            match req.params.get("arm").and_then(|v| v.as_bool()) {
+                Some(true) => {
+                    let cycle = st.session.machine.clk;
+                    st.input_journal = Some(InputJournal {
+                        armed_at_cycle: cycle,
+                        entries: Vec::new(),
+                        dropped: 0,
+                    });
+                    Response::ok(id, input_journal_json(&st))
+                }
+                Some(false) => {
+                    // Report the recording, THEN disarm — a stop that returned an empty
+                    // journal because it cleared first is a whole session lost to an
+                    // ordering detail.
+                    let out = input_journal_json(&st);
+                    st.input_journal = None;
+                    let mut out = out;
+                    out["armed"] = json!(false);
+                    Response::ok(id, out)
+                }
+                None => Response::ok(id, input_journal_json(&st)),
+            }
+        }
+
         "transport/key" => {
             let Some(f) = req.params.get("key").and_then(|v| v.as_u64()) else {
                 return Response::err(id, -32602, "transport/key: key required (the F-number, e.g. 9)");
@@ -15659,6 +15706,107 @@ pub(crate) fn set_control_owner(st: &mut State, owner: &str) {
     }
 }
 
+/// Spec 814 — one recorded input: what the machine received, and the cycle it received
+/// it on.
+#[derive(Clone, Debug)]
+pub(crate) struct InputJournalEntry {
+    /// The master clock when the daemon applied it. NOT a wall-clock time and NOT a
+    /// client timestamp — see the note on `State::input_journal`.
+    cycle: u64,
+    /// `key` | `joystick` | `insert`. Three kinds, because these are the three things a
+    /// C64 can RECEIVE. Scrubbing, rewinding and poking memory are things done TO the
+    /// machine by an operator; a scenario that replayed them would not be replaying a
+    /// session (Spec 814 §8).
+    kind: &'static str,
+    /// `human` | `llm`. The session is SHARED, so a recording is what happened to this
+    /// machine, all of it — and then says where each piece came from. Recording only the
+    /// human's half would drop the LLM's load and break the replay two lines later.
+    source: &'static str,
+    /// The method that produced it, so an unexpected entry can be traced back.
+    method: String,
+    /// Kind-specific payload: the typed text, the port + bits, the medium path.
+    detail: Value,
+}
+
+/// Spec 814 §2 — the armed journal.
+#[derive(Clone, Debug)]
+pub(crate) struct InputJournal {
+    armed_at_cycle: u64,
+    entries: Vec<InputJournalEntry>,
+    /// How many entries were dropped after the cap. A forgotten armed recorder must not
+    /// grow without bound, and it must not silently lose the end of the session either —
+    /// a truncated recording that does not SAY it is truncated is a recording that
+    /// replays to the wrong place and blames the runtime.
+    dropped: u64,
+}
+
+/// The cap. Generous for any real recording (a long play-through is hundreds of inputs),
+/// small enough that a recorder left armed overnight costs nothing worth noticing.
+const INPUT_JOURNAL_MAX: usize = 20_000;
+
+/// Which methods put something INTO the machine. Everything else — a run, a pause, a
+/// checkpoint, a monitor read — is an operator action, not an input, and is deliberately
+/// absent (Spec 814 §8).
+fn input_journal_kind(method: &str) -> Option<&'static str> {
+    match method {
+        "session/type" | "session/key_down" | "session/key_up" | "session/release_keys" => Some("key"),
+        "session/joystick_set" | "session/joystick_clear" => Some("joystick"),
+        "media/mount" | "media/swap" => Some("insert"),
+        _ => None,
+    }
+}
+
+/// Spec 814 §2 — record one input, if a journal is armed.
+///
+/// Called from the SAME pre-dispatch hook that flips the control owner, so there is one
+/// place that sees every input with its `source` — rather than a `journal.push()` in each
+/// handler, which is the shape that leaves one handler out and nobody notices until a
+/// replay is missing a keystroke.
+fn note_input_journal(req: &Request, state: &SharedState) {
+    let Some(kind) = input_journal_kind(req.method.as_str()) else { return };
+    let mut st = state.lock().unwrap();
+    let cycle = st.session.machine.clk;
+    let source = owner_from_source(&req.params);
+    let Some(j) = st.input_journal.as_mut() else { return };
+    if j.entries.len() >= INPUT_JOURNAL_MAX {
+        j.dropped += 1;
+        return;
+    }
+    // The detail is the request's own params minus the routing noise, so a kind that
+    // grows a field does not need this function edited.
+    let mut detail = req.params.clone();
+    if let Some(o) = detail.as_object_mut() {
+        o.remove("session_id");
+        o.remove("source");
+    }
+    j.entries.push(InputJournalEntry {
+        cycle,
+        kind,
+        source,
+        method: req.method.clone(),
+        detail,
+    });
+}
+
+fn input_journal_json(st: &State) -> Value {
+    match st.input_journal.as_ref() {
+        None => json!({ "armed": false, "entries": [], "dropped": 0 }),
+        Some(j) => json!({
+            "armed": true,
+            "armedAtCycle": j.armed_at_cycle,
+            "cycle": st.session.machine.clk,
+            "dropped": j.dropped,
+            "entries": j.entries.iter().map(|e| json!({
+                "cycle": e.cycle,
+                "kind": e.kind,
+                "source": e.source,
+                "method": e.method,
+                "detail": e.detail,
+            })).collect::<Vec<_>>(),
+        }),
+    }
+}
+
 /// T1.2 — derive control owner from a `source` param value, mirroring TS:
 /// `source === "llm" ? "llm" : "human"` (ws-server.ts:987).
 fn owner_from_source(params: &Value) -> &'static str {
@@ -17653,6 +17801,7 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
     }
     State {
         speed_profile: trx64_core::vic::SpeedProfile::C64,
+        input_journal: None,
         session,
         breakpoints: Breakpoints::new(),
         observers: observers::ObserverRegistry::new(),
@@ -18222,6 +18371,7 @@ mod batch1_tests {
     fn make_state() -> SharedState {
         Arc::new(Mutex::new(State {
             speed_profile: trx64_core::vic::SpeedProfile::C64,
+            input_journal: None,
             session: Session::new("integrated-1"),
             breakpoints: Breakpoints::new(),
             observers: observers::ObserverRegistry::new(),
@@ -19439,6 +19589,73 @@ mod batch1_tests {
         // And a request with no key at all is an error, not a guess.
         let err = call_err(&st, "transport/key", json!({}));
         assert!(err.message.contains("key required"), "{err:?}");
+    }
+
+    /// Spec 814 §2 — the daemon stamps, never the browser.
+    ///
+    /// The whole recorder rests on this: a recorded press is worth something only if it
+    /// carries the cycle it actually landed on. If the UI timestamped its own click, the
+    /// recording would be a measurement of the WebSocket round-trip and the render loop,
+    /// and replaying it would put the press somewhere else on the machine.
+    #[test]
+    fn the_input_journal_stamps_cycles_and_says_who() {
+        let st = make_state();
+        call(&st, "session/power", json!({ "op": "on" }));
+
+        // Not armed = not recording, and looking is free.
+        let idle = call(&st, "session/input_journal", json!({}));
+        assert_eq!(idle["armed"], json!(false));
+        call(&st, "session/type", json!({ "text": "X", "source": "human" }));
+        assert_eq!(
+            call(&st, "session/input_journal", json!({}))["entries"].as_array().unwrap().len(),
+            0,
+            "an unarmed journal records nothing"
+        );
+
+        let armed = call(&st, "session/input_journal", json!({ "arm": true }));
+        assert_eq!(armed["armed"], json!(true));
+        let armed_at = armed["armedAtCycle"].as_u64().unwrap();
+
+        // A human types, the machine runs, an LLM taps the stick, a disk goes in.
+        call(&st, "session/type", json!({ "text": "RUN", "source": "human" }));
+        for _ in 0..3 {
+            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+        }
+        call(&st, "session/joystick_set", json!({ "port": 2, "fire": true, "source": "llm" }));
+
+        // Watching is not input: a pause, a step and a monitor read must leave no trace,
+        // or the replay would try to "press" them.
+        call(&st, "debug/pause", json!({ "source": "human" }));
+        mon(&st, "r").expect("r");
+
+        let out = call(&st, "session/input_journal", json!({ "arm": false }));
+        assert_eq!(out["armed"], json!(false), "stopping disarms");
+        let es = out["entries"].as_array().unwrap();
+        assert_eq!(es.len(), 2, "two inputs, and nothing else: {es:?}");
+
+        assert_eq!(es[0]["kind"], json!("key"));
+        assert_eq!(es[0]["source"], json!("human"));
+        assert_eq!(es[0]["detail"]["text"], json!("RUN"));
+        assert!(es[0]["cycle"].as_u64().unwrap() >= armed_at);
+
+        assert_eq!(es[1]["kind"], json!("joystick"));
+        assert_eq!(es[1]["source"], json!("llm"), "the LLM's half is recorded and MARKED");
+        assert_eq!(es[1]["detail"]["port"], json!(2));
+        assert!(
+            es[1]["cycle"].as_u64().unwrap() > es[0]["cycle"].as_u64().unwrap(),
+            "three frames of machine time separate them, and the journal knows it"
+        );
+
+        // The routing noise is not part of the input.
+        assert!(es[0]["detail"].get("session_id").is_none());
+        assert!(es[0]["detail"].get("source").is_none());
+
+        // And a stopped journal is gone, not lingering to be picked up by the next
+        // recording.
+        assert_eq!(
+            call(&st, "session/input_journal", json!({}))["entries"].as_array().unwrap().len(),
+            0
+        );
     }
 
     /// F10 — `play back` from a PAUSED machine took no step at all.
