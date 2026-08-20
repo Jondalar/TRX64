@@ -131,6 +131,23 @@ fi
 
 printf '\n=== pre-push quality gate ===\n' >&2
 if "$REPO_ROOT/scripts/gate.sh" >&2; then
+  # Owner's standing rule: every push clears the build cache. Not "when it gets big" —
+  # every time, because the only reason it was ever noticed is that someone looked. It
+  # reached 45 GB in one day of test runs, and before that 57.
+  #
+  # `target/debug` only, never a full `cargo clean`: /usr/local/bin/trx64cli is a symlink
+  # straight into `target/release/`, so wiping that leaves the owner's own command
+  # pointing at nothing. Everything here builds --release; the debug tree is pure
+  # accumulation from `cargo test`.
+  #
+  # It runs AFTER the gate, so the gate's own compile is not paid for twice, and it is
+  # deliberately not conditional on size: a rule with a threshold is a rule someone
+  # argues with.
+  if [ -d "$REPO_ROOT/target/debug" ]; then
+    freed=$(du -sh "$REPO_ROOT/target/debug" 2>/dev/null | cut -f1)
+    rm -rf "$REPO_ROOT/target/debug"
+    printf '    build cache cleared: target/debug (%s freed)\n' "${freed:-?}" >&2
+  fi
   printf '=== gate GREEN — push allowed ===\n\n' >&2
   exit 0
 fi
