@@ -241,6 +241,20 @@ impl StreamHub {
         let id = inner.next_id;
         inner.next_id += 1;
         inner.subscribers.push(Subscriber { id, out });
+        // Spec 837 — a new client gets a picture even if the machine is paused.
+        //
+        // The render + broadcast below sits inside `if running`, so a PAUSED
+        // machine pushes nothing at all: a client arriving during a pause — a
+        // page reload, or this loop restarting because the last client had left
+        // — never receives a first frame and sits on "No frame yet" forever
+        // while every other reading says the machine is healthy. An `undump` is
+        // the common way in, because it deliberately leaves the session paused
+        // (its own test asserts exactly that).
+        //
+        // A paused machine HAS a picture; it just is not changing. So reuse the
+        // one-shot the restore path already established rather than inventing a
+        // second concept: ask for exactly one present, here, on arrival.
+        self.state.lock().unwrap().force_present_frame = true;
         // First subscriber → start the loop.
         if inner.stop.is_none() {
             let stop = Arc::new(AtomicBool::new(false));

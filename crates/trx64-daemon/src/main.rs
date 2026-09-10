@@ -21571,6 +21571,32 @@ mod batch1_tests {
     }
 
     #[test]
+    fn a_client_arriving_while_paused_gets_a_frame() {
+        // Spec 837 — the operations that leave a paused machine (undump,
+        // checkpoint restore) each ask for one present, and have since a
+        // 2026-07-15 regression. Nothing asked on ARRIVAL: the render sits
+        // inside `if running`, the loop starts on the first subscriber and
+        // stops when the last one leaves, so a cockpit that reloads while the
+        // machine is paused starts a loop that renders nothing and sits on the
+        // "no frame yet" placeholder for ever — while every other reading says
+        // the machine is healthy. That cost the reporter a whole session,
+        // because killing the daemon was the only cure anyone knew.
+        let st = make_state();
+        {
+            let mut g = st.lock().unwrap();
+            g.session.running = false;
+            g.force_present_frame = false;
+        }
+        let hub = crate::streaming::StreamHub::new(Arc::clone(&st));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let _sub = hub.subscribe(tx);
+        assert!(
+            st.lock().unwrap().force_present_frame,
+            "subscribing must request one present — a paused machine sends no frame on its own"
+        );
+    }
+
+    #[test]
     fn snapshot_undump_requests_one_shot_frame_present() {
         // Regression (2026-07-15): a `.c64re` undump on a PAUSED machine must refresh the
         // canvas to the RESTORED frame. The `--stream` paused loop only advances a
