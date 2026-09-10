@@ -96,8 +96,20 @@ fn umount_aliases_eject() {
 
     let eject = engine.exec_line("/eject").output;
     let umount = engine.exec_line("/umount").output;
-    assert_eq!(eject, umount, "/umount and /eject take the same path");
-    assert!(eject.contains("EJECT"), "eject output: {eject}");
+
+    // Spec 839 — these used to be compared byte-for-byte, and could be, because the
+    // COCKPIT wrote the reply ("EJECT — {role} unmounted."). It does not any more: both
+    // verbs forward to the daemon's `media/unmount`, and the daemon answers with what it
+    // actually did, including the checkpoint ids it took before and after. Two ejects are
+    // two events, so those ids differ — that is the answer being true, not the alias
+    // being broken. What has to hold is that both words reach the SAME verb and get the
+    // same account of it.
+    for (name, out) in [("/eject", &eject), ("/umount", &umount)] {
+        assert!(out.starts_with("EJECT —"), "{name} output: {out}");
+        assert!(out.contains("\"operation\": \"eject\""), "{name} did not reach the eject op: {out}");
+        assert!(out.contains("\"role\": \"drive8\""), "{name} did not target the drive: {out}");
+        assert!(out.contains("the drive keeps running"), "{name} did not say what a disk eject does: {out}");
+    }
 }
 
 /// `/restore`, `/undump` and `/loadsnapshot` are the same verb — and they are the
