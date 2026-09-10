@@ -458,14 +458,36 @@ impl<'a> FullBus<'a> {
             }
             // $DE00-$DFFF — cart IO1/IO2 (ts:407-410). The cart is consulted ONLY
             // when I/O is visible (guaranteed: io_read is reached only via the io
-            // branch). Some ⇒ the mapper byte; None (or no cart) ⇒ the open-bus
-            // shadow. The read-only mappers (MagicDesk/Ocean) are write-only here
-            // (no IO read) so they return None ⇒ shadow, byte-identical to no-cart.
+            // branch). Some ⇒ the mapper byte; None (or no cart, or a write-only
+            // mapper like MagicDesk/Ocean) ⇒ THE OPEN BUS.
+            //
+            // The open bus is the VIC's last phi1 fetch, not a shadow of what was
+            // last written here. PORT OF: `viciisc/vicii-phi1.c:34` —
+            // `uint8_t vicii_read_phi1(void) { return vicii.last_read_phi1; }` —
+            // which is what `c64io.c:353-354` returns when no I/O device claims the
+            // read.
+            //
+            // What this replaces, and why it mattered: the fallback used to be
+            // `self.io[...]`, the write-through shadow that `io_write` stores for
+            // the whole $D000-$DFFF window. That made an EMPTY expansion port
+            // behave like RAM — write $55 to $DF00, read $55 back, for ever. Every
+            // program that probes for a cartridge or an REU by writing a pattern
+            // and reading it back was told the device is present. The 17xx REU
+            // probe in a Level-Squeezer "+E" cruncher is the case that surfaced it
+            // (issue #19): on real hardware the read-back is a raster-dependent
+            // phi1 byte that practically never matches, the probe fails, and the
+            // program takes its no-REU path; here it matched, and the cruncher
+            // drove a device that was not there.
+            //
+            // The shadow is still WRITTEN (io_write stores the whole window in one
+            // line, and $D800-$DBFF colour RAM genuinely needs it) — it is simply
+            // no longer what this range READS.
             _ => {
                 if (0xde00..=0xdfff).contains(&addr) {
                     if let Some(v) = self.cart_read(addr) {
                         return v;
                     }
+                    return self.vic.last_read_phi1;
                 }
                 self.io[(addr as usize) - 0xd000]
             }

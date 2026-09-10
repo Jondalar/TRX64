@@ -1622,7 +1622,13 @@ impl Machine {
                         0xd800..=0xdbff => (self.io_shadow[(addr as usize) - 0xd000] & 0x0f) | 0xf0,
                         0xdc00..=0xdcff => self.cia1_pin_peek(addr),
                         0xdd00..=0xddff => self.cia2_pin_peek(addr),
-                        _ => self.io_shadow[(addr as usize) - 0xd000],
+                        // $DE00-$DFFF with nothing claiming it is the OPEN BUS, and
+                        // a monitor must show what the CPU would actually read.
+                        // Showing `io_shadow` here was the same defect BUG-049 hit
+                        // from the other side: the readback that was supposed to
+                        // settle an argument showed the last value written and
+                        // never the truth, so it hid the evidence instead.
+                        _ => self.vic.last_read_phi1,
                     }
                 } else if self.memconfig.char_rom {
                     self.char_rom[(addr as usize) - 0xd000]
@@ -1676,16 +1682,24 @@ impl Machine {
                         0xd800..=0xdbff => (self.io_shadow[(addr as usize) - 0xd000] & 0x0f) | 0xf0,
                         0xdc00..=0xdcff => self.cia1_pin_peek(addr),
                         0xdd00..=0xddff => self.cia2_pin_peek(addr),
-                        _ => self.io_shadow[(addr as usize) - 0xd000],
+                        // $DE00-$DFFF with nothing claiming it is the OPEN BUS, and
+                        // a monitor must show what the CPU would actually read.
+                        // Showing `io_shadow` here was the same defect BUG-049 hit
+                        // from the other side: the readback that was supposed to
+                        // settle an argument showed the last value written and
+                        // never the truth, so it hid the evidence instead.
+                        _ => self.vic.last_read_phi1,
                     }
                 } else {
                     self.ram[addr as usize]
                 }
             }
             // cart: best-effort fallback (no side-effect-free mapper peek yet).
+            // With no mapper answering, the honest value is the open bus, not the
+            // write-through shadow — see the `io` lens above.
             "cart" => {
                 if (0xde00..=0xdfff).contains(&addr) {
-                    self.io_shadow[(addr as usize) - 0xd000]
+                    self.vic.last_read_phi1
                 } else {
                     self.ram[addr as usize]
                 }
@@ -2436,6 +2450,53 @@ mod ring_exhaustion_tests {
         for i in 0..n {
             m.delta_ring.begin(0x1000 + (i as u16 & 0xff), 0, 0, 0, 0xff, 0, i);
             m.delta_ring.commit();
+        }
+    }
+
+    /// Issue #19 / Spec 840 — an EMPTY expansion port is not RAM.
+    ///
+    /// `$DE00-$DFFF` with no cartridge is the open bus: the VIC's last phi1 fetch.
+    /// It used to return the write-through I/O shadow, so writing a byte there and
+    /// reading it back returned that byte — for ever. Every program that probes for
+    /// a cartridge or an REU by writing a pattern and reading it back was told the
+    /// device is present, on a machine with an empty port.
+    ///
+    /// The probe is written the way real detection code writes it, on purpose: two
+    /// different patterns, because a single one can match the bus by luck.
+    #[test]
+    fn an_empty_expansion_port_reads_the_open_bus_not_what_was_written() {
+        let mut m = Machine::new();
+
+        // Give the VIC something recognisable to have fetched, so "the open bus"
+        // is a value we can name rather than an incidental zero.
+        m.vic.last_read_phi1 = 0x3c;
+
+        for (addr, pattern) in [(0xde00u16, 0x55u8), (0xdf00, 0xaa), (0xdf00, 0x55)] {
+            m.write_full(addr, pattern);
+            // read_full_live is the CPU's own path (it builds a FullBus and calls
+            // io_read); read_full is the side-effect-free peek. Both must agree.
+            let read_back = m.read_full_live(addr);
+            assert_eq!(read_back, m.read_full(addr), "peek and CPU disagree at ${addr:04x}");
+            assert_ne!(
+                read_back, pattern,
+                "an empty expansion port answered ${addr:04x} with the byte just \
+                 written (${pattern:02x}) — that is RAM behaviour, and it tells every \
+                 REU/cartridge probe that a device is present"
+            );
+            assert_eq!(
+                read_back, 0x3c,
+                "${addr:04x} must read the open bus (the VIC's last phi1 fetch)"
+            );
+        }
+
+        // And the monitor must not disagree with the CPU about it — the BUG-049
+        // lesson: a readback that shows the last value written hides the evidence
+        // it was supposed to provide.
+        for lens in ["io", "cart"] {
+            assert_eq!(
+                m.peek_lens(0xdf00, lens), 0x3c,
+                "the `{lens}` lens shows a phantom value the CPU never reads"
+            );
         }
     }
 
