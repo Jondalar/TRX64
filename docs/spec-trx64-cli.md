@@ -27,6 +27,14 @@ cockpit: live panels + a command line you drive the machine from.
     `power on` / `power off` (cold boot / shut down), `reset [cold|warm]`, `run` / `pause` /
     `step`, `mount <path>` / `eject`, `load <prg>` / `run <prg>`, `warp on|off`,
     `window` (spawn the emulator window — see part 2), `dump`/`restore`, `help`, `quit`.
+    **These are DAEMON verbs, not cockpit verbs (Spec 839).** The cockpit forwards them
+    verbatim to `monitor/exec` and implements none of them, because a front-end that
+    decides what `mount` means is a second authority and a second authority drifts
+    (BUG-040: `turbo` shipped in the daemon and read "unknown command" here). The only
+    verbs the cockpit still owns are the ones about THIS terminal — `window`, `settings`,
+    `joystick` (whether WASD types or steers), `help`, `quit`. Everything else, including
+    `mount`/`eject`/`drive`/`cart`/`drivepower`/`recent`, resolves in the daemon, so the
+    web UI and C64RE's `runtime_monitor` get each verb the moment the cockpit does.
   - **Monitor syntax passthrough:** any monitor verb (`d`, `m`, `r`, `bk`, `g`, `trace`,
     `rstep`, `whowrote`, `diff`, …) → `monitor/exec` → the output pane. The full
     ~128-verb VICE-superset is available verbatim alongside the high-level verbs.

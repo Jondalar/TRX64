@@ -7301,6 +7301,7 @@ fn monitor_help_text() -> String {
         "    trace on|off|status|mark   live trace gate",
         "    tracedb start|stop|status|mark   declarative trace",
         "    traceindex [path]   build the .duckdb index for the current/last (or <path>) .c64retrace so it is queryable (oldest->newest, no event cap)",
+        "    tracering <s> <e> [path]  build a .c64retrace from the ALWAYS-ON reverse ring, AFTER the fact — the window you did not arm a trace for. `revdepth` says how far back the ring reaches; a start older than that silently begins where the ring does.",
         "  ANALYSIS (need a trace — `trace on` first)",
         "    map [cpu]        memory map: free RAM / persistence surface",
         "    taint <a> [cyc]  data-flow taint backward from (cyc,addr)",
@@ -7314,6 +7315,13 @@ fn monitor_help_text() -> String {
         "    traprules <path> | traprules [clear]   load/list/clear project on-trap dump rules (JSON {pc,label,dump:[[name,addr,len]],decode}); auto-emits `label: name=$XX (decode)` on reaching that PC (JAM / breakpoint)",
         "    revdepth [seconds]        report / set the always-on reverse-ring depth: rebuilds the delta+cpuhistory rings (DISCARDS history; future capture only; 1..=600s). TRX64_REVERSE_SECONDS = boot default",
         "    diff <idA> <idB>          typed by-ID diff of two checkpoint anchors (RAM runs + per-chip register changes). READ-ONLY (live machine unchanged). ids from `checkpoint/list`",
+        "  MEDIA + DRIVE (Spec 839 — the same verbs on every front-end; the cockpit used to own these)",
+        "    mount <path>              put a .d64/.g64/.crt/.prg/.c64re in the machine. The TYPE comes from the file's CONTENT, not its extension; a relative path resolves against `pwd`/`cd`. A cartridge power-cycles, a disk does not.",
+        "    eject [cart|disk]         take it out. Bare `eject` targets whatever is actually in (cartridge first, else the disk). Both persist to the host file FIRST — a disk eject leaves the drive turning, a cartridge eject cold-resets the machine (that is what pulling a cart does).",
+        "    drive                     drive 8 live status: motor, track, LED, what is mounted, whether it is dirty",
+        "    cart                      cartridge live status: type, bank, read/write activity — null when nothing is inserted",
+        "    drivepower                cold-reset the drive 6502 ONLY (DOS re-runs power-on init). The C64 side is untouched. Every scrap of drive-side state goes: open channels, a fastloader's uploaded drivecode, a half-written sector. It is the way out of a wedged fastloader without power-cycling the machine someone is watching.",
+        "    recent                    the media this daemon has had mounted lately (daemon state, not project history)",
         "  MACHINE (the same verbs on every front-end — the cockpit\'s `/` prefix is input sugar)",
         "    run                       resume the machine (from a rewound point: cuts the anchors ahead)",
         "    pause                     stop the machine AND the transport; prints the ringbuffer range",
@@ -8563,6 +8571,126 @@ fn delegate_media_open(
     r
 }
 
+/// Spec 839 — the MACHINE verbs the cockpit used to own.
+///
+/// `crates/trx64-cli/src/engine.rs` forwards every `/`-verb to `monitor/exec` and
+/// keeps only what is about THAT terminal, because a second front-end authority on
+/// what a verb means drifts (BUG-040, and why `turbo` shipped here and read
+/// "unknown command" there). Three verbs were exempt, with a reason: "media and
+/// input have no monitor verb yet — the media handlers are a 170-line block inside
+/// the RPC dispatch and have to be extracted first". The media handlers do not need
+/// extracting: `dispatch` is callable in-process, which is exactly what
+/// `delegate_media_open` above already does. So these verbs are a FORWARD, not a
+/// reimplementation — the RPC stays the single authority on what each one means,
+/// and every front-end (cockpit, web UI, C64RE's `runtime_monitor`) gets them at
+/// the same moment.
+///
+/// This runs in the `monitor/exec` arm BEFORE the state lock is taken:
+/// `run_monitor` takes `&mut State` with the lock held, and re-entering `dispatch`
+/// from inside it would deadlock on the daemon's own mutex. `e2e:839-monitor`
+/// covers that, because it is the one mistake this design is a step away from.
+///
+/// Returns `None` for anything it does not own, so the monitor's ~128 verbs are
+/// untouched. No verb here may shadow one of them; `forwarded_verbs_shadow_no_monitor_verb`
+/// asserts it.
+fn monitor_forward(req: &Request, command: &str, state: &SharedState) -> Option<Response> {
+    let mut it = command.trim().split_whitespace();
+    let verb = it.next()?.to_ascii_lowercase();
+    let rest: Vec<&str> = it.collect();
+    let joined = rest.join(" ");
+    let arg = joined
+        .strip_prefix('"').and_then(|s| s.strip_suffix('"'))
+        .or_else(|| joined.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(&joined)
+        .trim()
+        .to_string();
+
+    let (method, params, headline) = match verb.as_str() {
+        "mount" => {
+            if arg.is_empty() {
+                return Some(monitor_text(req,
+                    "mount <path> — a .d64/.g64/.crt/.prg or a .c64re snapshot. The TYPE is \
+                     read from the file's CONTENT, not its extension. A relative path \
+                     resolves against the monitor's own working directory (`pwd` / `cd`). \
+                     A cartridge mount power-cycles the machine; a disk mount does not."));
+            }
+            ("media/open", json!({ "path": arg }), "MOUNT".to_string())
+        }
+        "eject" | "umount" => {
+            let role = match arg.to_ascii_lowercase().as_str() {
+                "" | "auto" => "auto",
+                "cart" | "crt" | "cartridge" => "cartridge",
+                "disk" | "drive8" | "8" => "drive8",
+                other => return Some(monitor_text(req, &format!(
+                    "eject: unknown target '{other}' — use `eject cart`, `eject disk`, \
+                     or `eject` for whatever is actually in the machine."))),
+            };
+            ("media/unmount", json!({ "role": role }), "EJECT".to_string())
+        }
+        "drive" => ("session/drive_status", json!({}), "DRIVE 8".to_string()),
+        "cart" => ("session/cart_status", json!({}), "CARTRIDGE".to_string()),
+        "drivepower" => ("session/drive_power", json!({}), "DRIVE 8 POWER".to_string()),
+        "recent" => ("media/recent", json!({}), "RECENT MEDIA".to_string()),
+        "tracering" => {
+            let parse = |s: &str| -> Option<u64> {
+                let s = s.trim();
+                let s = s.strip_prefix('c').unwrap_or(s);
+                if let Some(h) = s.strip_prefix('$') { u64::from_str_radix(h, 16).ok() }
+                else if let Some(h) = s.strip_prefix("0x") { u64::from_str_radix(h, 16).ok() }
+                else { s.parse::<u64>().ok() }
+            };
+            let (Some(start), Some(end)) = (rest.first().and_then(|s| parse(s)),
+                                            rest.get(1).and_then(|s| parse(s))) else {
+                return Some(monitor_text(req,
+                    "tracering <startCycle> <endCycle> [path] — build a .c64retrace from the \
+                     ALWAYS-ON reverse ring, after the fact, for a window you did not arm a \
+                     trace for. The window must still be IN the ring: `revdepth` reports how \
+                     far back it reaches, and a start older than that is not an error you can \
+                     see, it is a trace that starts where the ring does. Cycles take $hex, \
+                     0xhex, decimal or a c-prefix."));
+            };
+            let mut p = json!({ "cycle_start": start, "cycle_end": end });
+            if let Some(path) = rest.get(2) { p["output_path"] = json!(path); }
+            ("trace/build_from_ring", p, "TRACE FROM RING".to_string())
+        }
+        _ => return None,
+    };
+
+    let inner = Request {
+        jsonrpc: req.jsonrpc.clone(),
+        id: req.id.clone(),
+        method: method.to_string(),
+        params,
+    };
+    let r = dispatch(inner, state);
+    if let Some(e) = r.error {
+        return Some(Response::ok(req.id.clone(), json!({ "error": format!("{verb}: {}", e.message) })));
+    }
+    let body = r.result.unwrap_or(Value::Null);
+    let mut out = format!("{headline} — {}", serde_json::to_string_pretty(&body).unwrap_or_default());
+    // The two ejects are not alike, and the difference is the whole reason a caller
+    // asks: pulling a cartridge cold-resets the machine, pulling a disk leaves the
+    // drive turning. Both persist to the host file first, so neither loses writes.
+    if verb == "eject" || verb == "umount" {
+        let role = body.get("detail").and_then(|d| d.get("role")).and_then(|r| r.as_str()).unwrap_or("drive8");
+        out.push_str(if role == "cartridge" {
+            "\ncartridge pulled — flash/EEPROM was written back to the host .crt first, and the \
+             machine COLD-RESET (that is what pulling a cart does). To save the flash and keep \
+             playing, use media/persist role=cartridge instead."
+        } else {
+            "\ndisk ejected — dirty sectors were written back to the host image first; the drive \
+             keeps running and senses the door."
+        });
+    }
+    Some(monitor_text(req, &out))
+}
+
+/// `monitor/exec` answers `{output}` or `{error}` — keep that shape for forwards too,
+/// so a client cannot tell a forwarded verb from a native one (which is the point).
+fn monitor_text(req: &Request, text: &str) -> Response {
+    Response::ok(req.id.clone(), json!({ "output": text }))
+}
+
 pub fn dispatch(req: Request, state: &SharedState) -> Response {
     let id = req.id.clone();
     // Spec 767 (live-view) — flip the shared-session control owner to whoever issued this
@@ -9571,13 +9699,19 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
 
         // CPU-isolated inject + register-set monitor (subset: wr, r, r reg=val).
         "monitor/exec" => {
-            let mut st = state.lock().unwrap();
             let cmd = req
                 .params
                 .get("command")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            // Spec 839 — the forwarded MACHINE verbs (mount/eject/drive/cart/…) are
+            // resolved here, BEFORE the lock: they re-enter `dispatch`, and doing that
+            // from inside `run_monitor` (which holds `&mut State`) deadlocks.
+            if let Some(forwarded) = monitor_forward(&req, &cmd, state) {
+                return forwarded;
+            }
+            let mut st = state.lock().unwrap();
             let res = run_monitor(&mut st, &cmd);
             // Forward the modal `prompt` (= TS `MonitorResult.prompt`) when a modal verb
             // (`a` assemble / `df -i`) set one — so the wire reply matches the TS
@@ -18926,6 +19060,108 @@ mod batch1_tests {
         run_monitor(&mut g, cmd)
     }
 
+    // ── Spec 839 — the machine verbs the cockpit used to own ───────────────────
+    //
+    // These MUST go through `dispatch("monitor/exec")`, not the `mon` helper above:
+    // `mon` locks the state and calls `run_monitor` directly, which is precisely the
+    // path a forwarded verb does NOT take. Testing through `mon` would pass while the
+    // real thing deadlocked.
+
+    fn mon_exec(st: &SharedState, cmd: &str) -> String {
+        let resp = dispatch(
+            Request { jsonrpc: "2.0".into(), id: json!(1), method: "monitor/exec".into(),
+                      params: json!({ "command": cmd }) },
+            st,
+        );
+        assert!(resp.error.is_none(), "monitor/exec {cmd}: {:?}", resp.error);
+        let body = resp.result.unwrap_or(Value::Null);
+        body.get("output").or_else(|| body.get("error"))
+            .and_then(|v| v.as_str()).unwrap_or("").to_string()
+    }
+
+    /// The one mistake this design is a step away from: `run_monitor` holds `&mut State`,
+    /// so a forwarded verb that re-entered `dispatch` from inside it would deadlock on the
+    /// daemon's own mutex — and a deadlock is not a failing assertion, it is a test run
+    /// that never ends. Every forwarded verb is exercised here for that reason alone.
+    #[test]
+    fn a_forwarded_verb_reaches_its_rpc_without_deadlocking() {
+        let st = make_state();
+        call(&st, "session/power", json!({ "op": "on" }));
+        for verb in ["drive", "cart", "recent", "eject", "drivepower"] {
+            let out = mon_exec(&st, verb);
+            assert!(!out.is_empty(), "`{verb}` answered nothing");
+        }
+    }
+
+    /// A forwarded verb must not hide one of the monitor's own ~128. The intercept runs
+    /// FIRST, so any collision would silently shadow the native verb — and the failure
+    /// would look like the native one had been deleted.
+    #[test]
+    fn a_forwarded_verb_never_shadows_a_monitor_verb() {
+        let st = make_state();
+        for verb in ["mount", "eject", "umount", "drive", "cart", "drivepower", "recent", "tracering"] {
+            let native = mon(&st, verb);
+            assert!(
+                native.as_ref().err().is_some_and(|e| e.starts_with("unknown command")),
+                "`{verb}` is ALSO a native monitor verb — the Spec 839 intercept would \
+                 shadow it. Got: {native:?}"
+            );
+        }
+    }
+
+    /// `drive` and `cart` are the ones C64RE's `runtime_session_status` claimed to report
+    /// and did not. They have to carry the actual machine state, not an ack.
+    #[test]
+    fn drive_and_cart_report_the_live_machine() {
+        let st = make_state();
+        call(&st, "session/power", json!({ "op": "on" }));
+        let drive = mon_exec(&st, "drive");
+        assert!(drive.starts_with("DRIVE 8"), "{drive}");
+        for key in ["track", "motorOn", "ledOn"] {
+            assert!(drive.contains(key), "drive status is missing `{key}`:\n{drive}");
+        }
+        // No cartridge inserted: the daemon answers null, and that IS the answer.
+        let cart = mon_exec(&st, "cart");
+        assert!(cart.starts_with("CARTRIDGE"), "{cart}");
+    }
+
+    /// Pulling a cartridge and ejecting a disk are not the same act, and the difference
+    /// (one cold-resets the machine, one does not) is the thing a caller needs told.
+    #[test]
+    fn eject_says_which_of_the_two_ejects_it_did() {
+        let st = make_state();
+        call(&st, "session/power", json!({ "op": "on" }));
+        let out = mon_exec(&st, "eject");
+        assert!(
+            out.contains("disk ejected") || out.contains("cartridge pulled") || out.starts_with("eject:"),
+            "eject said nothing about what it ejected:\n{out}"
+        );
+        let bad = mon_exec(&st, "eject sideways");
+        assert!(bad.contains("unknown target"), "{bad}");
+    }
+
+    /// A verb that needs an argument explains itself rather than failing — the monitor is
+    /// the surface an LLM reaches through `runtime_monitor`, and "mount" with no path is a
+    /// question, not an error.
+    #[test]
+    fn an_argumentless_verb_explains_itself() {
+        let st = make_state();
+        let mount = mon_exec(&st, "mount");
+        assert!(mount.contains("CONTENT"), "{mount}");
+        let ring = mon_exec(&st, "tracering");
+        assert!(ring.contains("revdepth"), "{ring}");
+    }
+
+    /// The help text is the only place a caller learns a verb exists. Spec 835: undescribed
+    /// is invisible, and invisible reach is no reach.
+    #[test]
+    fn every_forwarded_verb_is_in_the_help() {
+        let help = monitor_help_text();
+        for verb in ["mount ", "eject ", "drive ", "cart ", "drivepower", "recent", "tracering"] {
+            assert!(help.contains(verb), "`{verb}` is reachable and unmentioned in `help`");
+        }
+    }
+
     // ── Spec 808 — rewind transport gates ──────────────────────────────────────
 
     /// Fill the ring with `n` anchors from the live machine, advancing it between each
@@ -20981,7 +21217,19 @@ mod batch1_tests {
             if !line.starts_with("    ") {
                 continue;
             }
-            let first = line.trim_start().split_whitespace().next().unwrap_or("");
+            // Spec 839 — skip CONTINUATION lines. A help entry's follow-on prose is
+            // indented like a verb line ("actions: …", "log fields: …", "cond: …",
+            // "keys: F9 …", "something, come back and try differently"), so the parser
+            // was reading six of those as verbs. They answered "unknown command" while
+            // this gate only looked for "unknown verb", so it passed on a coverage set
+            // that was six words wider than the monitor. A label ends in `:` and a
+            // sentence fragment ends in `,`; neither is a verb.
+            let mut toks = line.trim_start().split_whitespace();
+            let first = toks.next().unwrap_or("");
+            let second = toks.next().unwrap_or("");
+            if first.ends_with(':') || first.ends_with(',') || second.ends_with(':') {
+                continue;
+            }
             for part in first.split('|') {
                 let v: String =
                     part.chars().take_while(|c| c.is_ascii_lowercase() || *c == '_').collect();
@@ -21005,11 +21253,17 @@ mod batch1_tests {
         for v in &verbs {
             // Bare invocation: most verbs answer with a usage error, which is fine — the
             // question here is only whether the dispatcher knows the word at all.
-            let reply = match mon(&st, v) {
-                Ok(o) => o,
-                Err(e) => e,
-            };
-            if reply.contains("unknown verb") {
+            //
+            // Spec 839 — this goes through `monitor/exec`, not `run_monitor` directly.
+            // The forwarded verbs (mount/eject/drive/cart/drivepower/recent/tracering)
+            // are resolved in that handler before the lock, so asking `run_monitor`
+            // about them would report every one of them as missing. `monitor/exec` is
+            // also what an actual caller reaches, which is the surface this gate is
+            // about. Both wordings are checked: `run_monitor`'s fallthrough says
+            // "unknown command", and the older ported paths say "unknown verb" —
+            // matching only one of them is how an advertised-but-dead verb hides.
+            let reply = mon_exec(&st, v);
+            if reply.contains("unknown verb") || reply.contains("unknown command") {
                 unknown.push(v.clone());
             }
         }

@@ -209,17 +209,10 @@ impl Engine {
         let mut parts = vm.split_whitespace();
         let verb = parts.next().unwrap_or("").to_ascii_lowercase();
         let rest: Vec<&str> = parts.collect();
-        // Strip ONE surrounding pair of matched quotes so `/mount "a b.crt"` yields the
-        // path `a b.crt`, not the literal `"a b.crt"` (the quotes were kept in the path →
-        // file-not-found). `/mount a b.crt` (no quotes) already worked — join handles the
-        // space — so this only rescues the quoted form.
-        let joined = rest.join(" ");
-        let arg = joined
-            .strip_prefix('"')
-            .and_then(|s| s.strip_suffix('"'))
-            .or_else(|| joined.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
-            .unwrap_or(&joined)
-            .to_string();
+        // Spec 839 — the quote-stripping that used to live here (`/mount "a b.crt"`
+        // must yield `a b.crt`, not the literal quotes) moved into the daemon's
+        // forwarding layer with the verb it served. A quoted argument now reaches the
+        // daemon verbatim and is unwrapped there, once, for every front-end.
 
         match verb.as_str() {
             // The ONLY verbs that stay here are the ones the daemon cannot answer,
@@ -245,13 +238,20 @@ impl Engine {
                 CmdResult { output: "bye.".into(), open_window: false, quit: true }
             }
 
-            // Media and input have no monitor verb yet — the media handlers are a
-            // 170-line block inside the RPC dispatch and have to be extracted first
-            // (BUG-041 says so in as many words). Until then these stay as THIN
-            // calls: no validation, no invented message, just the RPC and whatever
-            // the daemon says back.
-            "mount" => self.verb_mount(&arg),
-            "eject" | "umount" => self.verb_eject(),
+            // Spec 839 — `mount` and `eject` are GONE from here. They were the last
+            // two machine verbs this front-end still owned, exempted because "the
+            // media handlers are a 170-line block inside the RPC dispatch and have
+            // to be extracted first". They never needed extracting: the daemon now
+            // forwards `mount`/`eject`/`drive`/`cart`/`drivepower`/`recent` from
+            // `monitor/exec` into the same RPCs, so they fall through with every
+            // other machine verb and the cockpit stops being a second authority on
+            // what `mount` means.
+            //
+            // `joystick` STAYS, and does not belong in that group: it is not a
+            // machine verb at all. It sets whether THIS terminal routes WASD+Space
+            // to the joystick or types them as keys — a property of this front-end's
+            // keyboard, like `window` and `settings`. The daemon has no opinion on
+            // it and should not grow one.
             "joystick" | "joy" => self.verb_joystick(rest.first().copied()),
 
             other => {
@@ -276,53 +276,14 @@ impl Engine {
 
 
 
-    fn verb_mount(&self, path: &str) -> CmdResult {
-        if path.is_empty() {
-            return CmdResult::text("mount <path> — needs a .d64/.g64/.crt path.");
-        }
-        match self.rpc("media/mount", json!({ "path": path })) {
-            Ok(v) => {
-                // A CRT mount power-cycles the machine into running; a disk mount is a
-                // live device op that does not change run-state. Either way the DAEMON
-                // decides and reports it in `paused`, and this only forwards that as an
-                // intent. (This used to reconcile a client-side run flag against the
-                // daemon's — the seam Spec 808's rebuild removed.)
-                if v.get("paused").and_then(|p| p.as_bool()) == Some(false) {
-                    let _ = self.rpc("session/play", json!({}));
-                }
-                CmdResult::text(format!("MOUNT {path} → {}", compact(&v)))
-            }
-            Err(e) => CmdResult::text(format!("mount failed: {e}")),
-        }
-    }
-
-    fn verb_eject(&self) -> CmdResult {
-        // CLI-FEEL S7 — smart target. The cockpit can't know what's mounted without a
-        // round-trip, so it sends role:"auto" and the daemon resolves it against the live
-        // machine: a cartridge is ejected if one is inserted, else the disk on drive8.
-        // (The old `{}` payload made the daemon default to drive8, so `/eject` on a
-        // cart-only machine tried to unmount an absent disk and left the cart in.)
-        match self.rpc("media/unmount", json!({ "role": "auto" })) {
-            Ok(v) => {
-                // A cart eject power-cycles the daemon into running (`paused:false`) —
-                // adopt it into the host run flag so the cockpit resumes immediately (same
-                // reconcile as verb_mount).
-                if v.get("paused").and_then(|p| p.as_bool()) == Some(false) {
-                    let _ = self.rpc("session/play", json!({}));
-                }
-                let role = v
-                    .get("detail")
-                    .and_then(|d| d.get("role"))
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("drive8");
-                CmdResult::text(format!("EJECT — {role} unmounted."))
-            }
-            Err(e) => CmdResult::text(format!("eject failed: {e}")),
-        }
-    }
-
-
-
+    // Spec 839 — `verb_mount` and `verb_eject` lived here and are gone. Both ended
+    // with the same client-side reconcile: if the daemon's reply said `paused:false`,
+    // send `session/play` "to adopt it into the host run flag". Nothing needs it any
+    // more, and it was doing harm rather than nothing: the pump is unconditional
+    // (`session/tick` decides whether the machine advances), a cart mount or eject
+    // power-cycles through `do_power_off`/`do_power_on`, which already clear the ring
+    // and bump the audio epoch — and `session/play` would then cut a future that had
+    // just been discarded. The daemon reports what it did; the cockpit prints it.
 
     fn verb_joystick(&self, sub: Option<&str>) -> CmdResult {
         // C64RE Spec 310: when ON, the window routes WASD+Space to the joystick; when
@@ -690,16 +651,6 @@ impl StateSnapshot {
                 s.push(c.to_ascii_lowercase());
             }
         }
-        s
-    }
-}
-
-/// Compact a JSON value to a short one-line summary for the log pane.
-fn compact(v: &Value) -> String {
-    let s = serde_json::to_string(v).unwrap_or_default();
-    if s.len() > 160 {
-        format!("{}…", &s[..160])
-    } else {
         s
     }
 }
