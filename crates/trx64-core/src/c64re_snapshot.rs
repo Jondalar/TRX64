@@ -726,6 +726,43 @@ use crate::native_snapshot::{ta_u32, ta_u32_decode};
 use crate::render::FB_W;
 
 /// Read TRX64's `m.vic` + color RAM into the c64re `LiteralVicSnapshot` shape.
+/// Spec 843 D1 — the per-raster-line register record, in the shape
+/// `vic_inspect::parse_provenance` already reads (`{ lines: [{ line, d011, d016,
+/// d018, bank, sprites }] }`).
+///
+/// Only lines the beam actually passed this frame are emitted. A line still holding
+/// the previous frame's record is LEFT OUT rather than sent as though it were
+/// current — the resolver falls back to the frozen registers for it, which is the
+/// same answer it always gave, and an absent line is an honest gap where a stale one
+/// would be a plausible lie.
+///
+/// `sprites` is empty: per-line sprite position/pointer capture is not built, and an
+/// empty array is what the parser expects for "none recorded".
+pub fn capture_vic_provenance(m: &Machine) -> serde_json::Value {
+    let lines: Vec<serde_json::Value> = m
+        .vic
+        .provenance
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.captured)
+        .map(|(line, p)| {
+            serde_json::json!({
+                "line": line as i64,
+                "d011": p.d011 as i64,
+                "d016": p.d016 as i64,
+                "d018": p.d018 as i64,
+                // The resolver's `derive_bases` takes the bank BASE, not the index.
+                "bank": p.vbank as i64,
+                "sprites": serde_json::Value::Array(Vec::new()),
+            })
+        })
+        .collect();
+    if lines.is_empty() {
+        return serde_json::Value::Null;
+    }
+    serde_json::json!({ "lines": lines })
+}
+
 pub fn capture_vic(m: &Machine) -> VicSnapshot {
     let v = &m.vic;
     let color_ram = read_color_ram(m);
@@ -1361,7 +1398,12 @@ pub fn capture_runtime_checkpoint_with(
         "paddles": [0, 0, 0, 0],
         "vic": serde_json::to_value(capture_vic(m)).unwrap(),
         "vicPresentation": serde_json::to_value(capture_vic_presentation_opts(m, omit_framebuffer)).unwrap(),
-        "vicProvenance": serde_json::Value::Null,
+        // Spec 843 D1 — what drove each raster line of this frame. Was hardcoded
+        // `Null` here, which made `vic_inspect`'s per-line override dead code: the
+        // type existed, the parser existed, the resolver branch existed, and nothing
+        // ever wrote the record — so every pixel on a raster-split screen resolved
+        // against whichever split happened to be last when the frame ended.
+        "vicProvenance": capture_vic_provenance(m),
         "drive1541": drive1541.map(ta_u8).unwrap_or(serde_json::Value::Null),
         "driveDiskImage": drive_disk_image.map(ta_u8).unwrap_or(serde_json::Value::Null),
         // Spec 714.5 (formats-state-2): the attached cartridge's original .crt bytes +

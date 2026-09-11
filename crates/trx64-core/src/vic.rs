@@ -87,6 +87,22 @@ pub const NUM_SPRITES: usize = 8;
 
 // ── Register offsets ($D000 + n), masked to 6 bits in the $D000-$D3FF window ───
 
+/// Spec 843 D1 — the register state that drew ONE raster line.
+///
+/// Recorded at the start of every line, so a frozen frame can be asked "what drew
+/// line 137" instead of "what do the registers say now". `captured` distinguishes a
+/// line the beam has actually passed this frame from one still holding last frame's
+/// record — an honest gap beats a plausible wrong answer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProvenanceRegs {
+    pub d011: u8,
+    pub d016: u8,
+    pub d018: u8,
+    /// VIC bank BASE (0 / $4000 / $8000 / $C000), not the 0-3 index.
+    pub vbank: u16,
+    pub captured: bool,
+}
+
 pub const R_CTRL1: u8 = 0x11; // $D011 — YSCROLL(0..2) RSEL DEN BMM ECM RST8
 pub const R_RASTER: u8 = 0x12; // $D012 — raster compare low 8 bits
 pub const R_SP_ENABLE: u8 = 0x15; // $D015 — sprite enable
@@ -727,6 +743,20 @@ pub struct VicII {
     /// $D000-$D03F register file (vicii.regs[0x40]).
     pub regs: [u8; 0x40],
 
+    /// Spec 843 D1 — what actually drove each raster line of the frame being drawn.
+    ///
+    /// `$D011`, `$D016`, `$D018` and the VIC bank are NOT frame constants: a raster
+    /// split changes them mid-frame, and a screen with a bitmap above a text box has
+    /// one. Resolving a pixel against the eight registers as they stand at capture
+    /// time answers for whichever split happened to be last — which is why
+    /// `vic_inspect` had a `ProvenanceLine` type and a per-line override that could
+    /// never fire: nothing ever wrote the record.
+    ///
+    /// One entry per PAL raster line, rewritten in place each frame — no allocation
+    /// per frame (Spec 765's rule), and the array is exactly the shape the inspect
+    /// resolver already parses.
+    pub provenance: [ProvenanceRegs; PAL_SCREEN_HEIGHT as usize],
+
     /// Spec 815 — which machine this claims to be. Default C64: $D02F-$D03F are
     /// open bus and nothing below this line does anything.
     pub speed_profile: SpeedProfile,
@@ -918,6 +948,7 @@ impl VicII {
     pub fn new() -> Self {
         let mut v = VicII {
             regs: [0u8; 0x40],
+            provenance: [ProvenanceRegs::default(); PAL_SCREEN_HEIGHT as usize],
             speed_profile: SpeedProfile::C64,
             fastmode: 0,
             u64_regs_en: 0x01,
@@ -1348,6 +1379,23 @@ impl VicII {
     /// pipeline, which render.rs handles statically.)
     pub fn tick(&mut self, mem: &VicMemView) -> bool {
         let mut ba_low = false;
+
+        // Spec 843 D1 — record what drives THIS line, at its first cycle, before any
+        // of it is used. `mem.vbank` is only in scope here (it lives on the borrowed
+        // view, not on the VIC), which is why the record is taken in `tick` and not
+        // in `vicii_draw_cycle` where the line number is reset.
+        if self.raster_cycle == 0 {
+            let line = self.raster_line as usize;
+            if line < self.provenance.len() {
+                self.provenance[line] = ProvenanceRegs {
+                    d011: self.regs[R_CTRL1 as usize],
+                    d016: self.regs[R_CTRL2 as usize],
+                    d018: self.regs[R_MEM_PTR as usize],
+                    vbank: mem.vbank,
+                    captured: true,
+                };
+            }
+        }
 
         // vicii-cycle.c:383 vicii_fetch_sprites — Phi2 sprite data fetch for the
         // PREVIOUS cycle's flags. Reads sprite data via mem.vic_phi2 into
@@ -2435,4 +2483,30 @@ mod tests {
             a.clk
         );
     }
+    /// Spec 843 D1 — the record is WRITTEN, and it is written per line.
+    ///
+    /// The resolver could always honour a per-line record; nothing ever produced one.
+    /// This is the half that was missing: run a frame, change `$D018` partway down
+    /// the way a raster IRQ does, and the two halves must hold different values.
+    #[test]
+    fn a_mid_frame_register_change_lands_in_that_line_and_not_the_others() {
+        let mut v = VicII::new();
+        v.regs[R_MEM_PTR as usize] = 0x14; // screen $0400
+
+        // Run to a known line, flip $D018 as a raster split would, run on.
+        while v.raster_line != 100 || v.raster_cycle != 0 { v.tick(&nm()); }
+        tick_n(&mut v, 63 * 40); // lines 100..139 with the first value
+        v.regs[R_MEM_PTR as usize] = 0x34; // screen $0c00
+        tick_n(&mut v, 63 * 40); // lines 140..179 with the second
+
+        assert!(v.provenance[100].captured, "line 100 was passed and must be recorded");
+        assert_eq!(v.provenance[100].d018, 0x14, "the top half kept its own $D018");
+        assert_eq!(v.provenance[150].d018, 0x34, "the bottom half has the split's value");
+        assert_ne!(v.provenance[100].d018, v.provenance[150].d018,
+            "a frame is not one register state — that is the whole point of the record");
+
+        // A line the beam has not reached is absent, not a stale guess.
+        assert!(!v.provenance[250].captured, "an unvisited line stays uncaptured");
+    }
+
 }
