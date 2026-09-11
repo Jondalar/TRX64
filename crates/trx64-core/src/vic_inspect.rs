@@ -54,7 +54,7 @@ fn color_ram(cp: &Value, idx: usize) -> i64 {
 
 /// The decoded RAM blob (the `{ $ta }` Uint8Array). Decoded once per resolve; the
 /// TS holds `cp.ram` as a live Uint8Array. None when the checkpoint has no RAM.
-fn decode_ram(cp: &Value) -> Option<Vec<u8>> {
+pub fn decode_ram(cp: &Value) -> Option<Vec<u8>> {
     cp.get("ram").and_then(crate::native_snapshot::ta_u8_decode)
 }
 
@@ -656,6 +656,61 @@ fn resolve_visible_node_at_inner(cp: &Value, ram: &[u8], vx: f64, vy: f64, prove
 }
 
 /// vic-inspect.ts:322-338 — `resolveVisibleRegion(cp, region, provenance?)`.
+/// Spec 843 D6 — coalesce a region's node set into contiguous SOURCE RANGES.
+///
+/// A region resolves to one node per sampled point, and the UI used to render those
+/// as glyph rows — which in bitmap mode is a column of empty strings, because a
+/// bitmap node has no character value. The useful answer is not "these 48 points"
+/// but "charset $2000+800, screen $cc00+1000, colour $d800+1000": the byte ranges
+/// the rectangle is a view OF.
+///
+/// That is also the unit the rest of the chain speaks. A graph finding carries an
+/// address range, an extract IS a range, and a patch targets one — so coalescing
+/// here is what turns a rubber band into something that can be named, ripped and
+/// injected.
+///
+/// Ranges are merged per `kind` when they touch or overlap; a gap leaves two
+/// entries, because a gap is real (two sprites, two tile runs) and papering over it
+/// would claim bytes the selection never covered.
+pub fn coalesce_region_ranges(nodes: &[VisualNode]) -> Vec<Value> {
+    use std::collections::BTreeMap;
+    // kind -> sorted (start, end_inclusive), carrying the bank of the first ref.
+    let mut spans: BTreeMap<&'static str, (Option<i64>, Vec<(i64, i64)>)> = BTreeMap::new();
+    for n in nodes {
+        for r in &n.refs {
+            let e = spans.entry(r.kind).or_insert((r.bank, Vec::new()));
+            if e.0.is_none() {
+                e.0 = r.bank;
+            }
+            e.1.push((r.addr, r.addr + r.length.max(1) - 1));
+        }
+    }
+    let mut out = Vec::new();
+    for (kind, (bank, mut list)) in spans {
+        list.sort_unstable();
+        let mut merged: Vec<(i64, i64)> = Vec::new();
+        for (s, e) in list {
+            match merged.last_mut() {
+                // `s <= last.1 + 1` merges touching ranges as well as overlapping
+                // ones: cell N and cell N+1 of a charset are one run, not two.
+                Some(last) if s <= last.1 + 1 => last.1 = last.1.max(e),
+                _ => merged.push((s, e)),
+            }
+        }
+        for (s, e) in merged {
+            let mut o = serde_json::Map::new();
+            o.insert("kind".into(), json!(kind));
+            o.insert("addr".into(), json!(s));
+            o.insert("length".into(), json!(e - s + 1));
+            if let Some(b) = bank {
+                o.insert("bank".into(), json!(b));
+            }
+            out.push(Value::Object(o));
+        }
+    }
+    out
+}
+
 /// Samples in VISIBLE space (8px step), dedups by type:value:cellIndex:rasterLine.
 pub fn resolve_visible_region(cp: &Value, region: (f64, f64, f64, f64), provenance: Option<&Value>) -> Vec<VisualNode> {
     let ram = decode_ram(cp).unwrap_or_default();

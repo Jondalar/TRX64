@@ -13156,6 +13156,39 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
 
         // vic/inspect/region — resolve a VISIBLE-frame region to distinct nodes.
         // ws-server.ts:1140-1145. { nodes }.
+        // Spec 843 D9 — read a byte range out of a FROZEN checkpoint.
+        //
+        // Ripping a screen element means taking the bytes that drew the picture, and
+        // those live in the checkpoint the Inspect overlay pinned — not in the live
+        // machine, which has moved on. `session/read_memory` reads the live machine;
+        // nothing read a checkpoint, so a rip would either have had to restore the
+        // machine (destroying where the human was) or settle for bytes that are no
+        // longer the ones on screen.
+        "checkpoint/read_memory" => {
+            let cp_id = match req.params.get("checkpoint_id").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return Response::err(id, -32602, "checkpoint/read_memory: checkpoint_id required"),
+            };
+            let addr = req.params.get("addr").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let len = req.params.get("length").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            if len == 0 || len > 0x10000 {
+                return Response::err(id, -32602, "checkpoint/read_memory: length must be 1..=65536");
+            }
+            let st = state.lock().unwrap();
+            let cp = match cp_for_inspect(&st, &cp_id) {
+                Ok(cp) => cp,
+                Err(e) => return Response::err(id, -32001, e),
+            };
+            let ram = match trx64_core::vic_inspect::decode_ram(&cp) {
+                Some(r) => r,
+                None => return Response::err(id, -32001, format!("checkpoint {cp_id} carries no RAM image")),
+            };
+            // Wraps at $FFFF like the machine does, rather than truncating and
+            // handing back a short buffer the caller has to notice.
+            let bytes: Vec<u64> = (0..len).map(|i| ram[(addr + i) & 0xffff] as u64).collect();
+            Response::ok(id, json!({ "addr": addr, "length": len, "bytes": bytes }))
+        }
+
         "vic/inspect/region" => {
             let cp_id = match req.params.get("checkpoint_id").and_then(|v| v.as_str()) {
                 Some(s) if !s.is_empty() => s.to_string(),
@@ -13175,7 +13208,14 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             };
             let prov = cp.get("vicProvenance").cloned().filter(|p| !p.is_null());
             let nodes = trx64_core::vic_inspect::resolve_visible_region(&cp, region, prov.as_ref());
-            Response::ok(id, json!({ "nodes": nodes.iter().map(|n| n.to_json()).collect::<Vec<_>>() }))
+            // Spec 843 D6 — also answer with the SOURCE RANGES the rectangle is a view
+            // of. The node list is per sampled point and says nothing a caller can
+            // name, rip or patch; a range is all three.
+            let ranges = trx64_core::vic_inspect::coalesce_region_ranges(&nodes);
+            Response::ok(id, json!({
+                "nodes": nodes.iter().map(|n| n.to_json()).collect::<Vec<_>>(),
+                "ranges": ranges,
+            }))
         }
 
         // vic/inspect/at_capture — frozen-pixel provenance. Captures+pins a
@@ -13260,6 +13300,30 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 "result": result,
                 "knowledge": knowledge,
                 "medium": { "ref": medium_ref, "candidateCount": cand_count },
+                // Spec 843 D11 — say what was SEARCHED, so `runtime_generated` stops
+                // reading as a result. It is usually the absence of a search.
+                //
+                // The matcher hashes the RAW medium at fixed strides (64 B sprites,
+                // 2 KB charsets, 8 KB bitmaps). On a D64 a file's bytes live in
+                // 254-byte chunks with sector links, so a contiguous charset or
+                // bitmap does not exist in the image at all; on a G64 the bytes are
+                // GCR. Add a packer and even an aligned sprite will not match. The
+                // trace-derived path (J2) that would answer these cases is not
+                // ported. None of that is visible from a one-word classification,
+                // and a caller who cannot see it reads "no match" as "this tool
+                // knows nothing".
+                "search": {
+                    "scanned": medium_ref.clone().unwrap_or_else(|| "nothing — no disk in drive 8".into()),
+                    "method": "exact byte-hash of the raw medium at fixed strides (J1)",
+                    "candidates": cand_count,
+                    "limits": [
+                        "only drive 8 is searched — a cartridge, a tape or a PRG in RAM is never scanned",
+                        "a D64 stores files in 254-byte chunks with sector links, so a contiguous 2 KB charset or 8 KB bitmap is not present in the image",
+                        "a G64 holds GCR, which never matches decoded bytes",
+                        "packed or crunched data does not appear in the image in the form it has on screen",
+                        "the trace-derived chain (J2) that would resolve those cases is not ported"
+                    ],
+                },
             }))
         }
 
