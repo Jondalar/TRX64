@@ -739,12 +739,30 @@ use crate::render::FB_W;
 /// `sprites` is empty: per-line sprite position/pointer capture is not built, and an
 /// empty array is what the parser expects for "none recorded".
 pub fn capture_vic_provenance(m: &Machine) -> serde_json::Value {
+    // Emit only the lines where the register state CHANGED.
+    //
+    // A frame is 312 lines and a screen has two or three raster splits, so writing
+    // every line costs ~19 KiB of JSON per checkpoint — 20% on top of a ~98 KiB
+    // anchor, which the ring pays for in a shorter rewind window. The record is
+    // properly a list of CHANGES: the resolver takes the last entry at or before the
+    // line it wants, so two entries describe a bitmap-over-text screen exactly as
+    // well as 312 did.
+    let mut prev: Option<crate::vic::ProvenanceRegs> = None;
     let lines: Vec<serde_json::Value> = m
         .vic
         .provenance
         .iter()
         .enumerate()
         .filter(|(_, p)| p.captured)
+        .filter(|(_, p)| {
+            let changed = prev.as_ref().map(|q| {
+                q.d011 != p.d011 || q.d016 != p.d016 || q.d018 != p.d018 || q.vbank != p.vbank
+            }).unwrap_or(true);
+            if changed {
+                prev = Some(**p);
+            }
+            changed
+        })
         .map(|(line, p)| {
             serde_json::json!({
                 "line": line as i64,

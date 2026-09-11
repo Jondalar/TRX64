@@ -451,7 +451,11 @@ fn resolve_node_at(cp: &Value, ram: &[u8], x: i64, y: i64, provenance: &[Provena
     let mut raster: Option<(i64, Option<i64>)> = None;
     if !provenance.is_empty() {
         let line = FIRST_DISPLAY_RASTER + y;
-        if let Some(ln) = provenance.iter().find(|l| l.line == line) {
+        // Spec 843 D1 — the record is a list of CHANGES, not one entry per line (a
+        // frame is 312 lines and a screen has two or three splits; writing them all
+        // cost 20% of a checkpoint). So the state for a line is the last entry AT OR
+        // BEFORE it — the split that was in force when the beam got there.
+        if let Some(ln) = provenance.iter().filter(|l| l.line <= line).max_by_key(|l| l.line) {
             bases = derive_bases(ln.d011, ln.d016, ln.d018, ln.bank);
             raster = Some((line, None));
         }
@@ -1392,6 +1396,36 @@ mod tests {
         let cs2 = node2.refs.iter().find(|r| r.kind == "charset").expect("a charset ref");
         assert!(cs2.bytes.is_none(), "a ROM-shadow charset reports no run rather than RAM residue");
         assert_eq!(cs2.note.as_deref(), Some("char ROM shadow"));
+    }
+
+    /// Spec 843 D1 — a CHANGE record, not one entry per line, and a line between two
+    /// splits still resolves.
+    ///
+    /// Writing all 312 lines cost ~19 KiB of JSON per checkpoint — 20% on top of a
+    /// ~98 KiB anchor, paid by the ring in a shorter rewind window. Two entries
+    /// describe a bitmap-over-text screen exactly as well, PROVIDED the resolver
+    /// takes the last entry at or before the line rather than an exact match.
+    #[test]
+    fn a_line_between_two_splits_takes_the_split_in_force() {
+        let mut cp = mk_text_cp(0x41, 0x01);
+        cp["vic"]["regs"][0x18] = json!(0x34); // frozen: the bottom split
+
+        // TWO entries for the whole frame, the way the capture now emits them.
+        let prov = json!({ "lines": [
+            { "line": FIRST_DISPLAY_RASTER, "d011": 0x1b, "d016": 0xc8, "d018": 0x14, "bank": 0, "sprites": [] },
+            { "line": FIRST_DISPLAY_RASTER + 100, "d011": 0x1b, "d016": 0xc8, "d018": 0x34, "bank": 0, "sprites": [] },
+        ]});
+
+        let screen_of = |n: &VisualNode| -> i64 {
+            n.refs.iter().find(|r| r.kind == "screen_ram").expect("a screen_ram ref").addr
+        };
+        // y=8 → raster 59: no entry of its own, and it must take the FIRST split.
+        let top = resolve_node_at_display(&cp, 0, 8, Some(&prov));
+        assert_eq!(screen_of(&top), 0x0400 + 40,
+            "a line with no entry of its own takes the last split at or before it");
+        // y=160 → raster 211: after the second entry.
+        let bottom = resolve_node_at_display(&cp, 0, 160, Some(&prov));
+        assert_eq!(screen_of(&bottom), 0x0c00 + 800, "…and below the split, the second one");
     }
 
 }
