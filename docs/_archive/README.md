@@ -77,6 +77,28 @@ end up half-done.
 trace that needs a second process to be readable is a trace that is unreadable whenever
 that process is missing.
 
+## A paused machine still has a picture — 837
+
+Issue #13: a cockpit stuck on "No frame yet" after an `undump`, curable only by killing the daemon.
+The stream renders only while the machine runs, so a client that ARRIVED during a pause started a loop
+that drew nothing, for ever. Every operation that leaves a machine paused already asked for a present;
+nothing asked on arrival.
+
+**Decision:** a new subscriber sets the existing `force_present_frame` one-shot — one frame on arrival,
+not a stream, and no second mechanism beside the one the paused branch already had. Noticing a stream
+that dies while the machine runs is C64RE's half.
+
+## The empty expansion port — 840
+
+Found while scoping issue #19 (REU): with no cartridge, `$DE00-$DFFF` read the write-through I/O
+shadow, so an empty port behaved like RAM and every write-read-compare probe found a device that was
+not there.
+
+**Decision:** an unclaimed read there returns the VIC's last phi1 fetch (`viciisc/vicii-phi1.c:34`), at
+all four sites — the CPU read, the peek, both monitor lenses — because a debugger that shows the last
+write hides exactly the evidence it exists to show. Spec 850 builds on it: a device that declines a read
+leaves the open bus, never the shadow.
+
 ---
 
 Everything here is finished. If a row's subject turns out to be open after all, it needs
