@@ -3465,6 +3465,114 @@ fn monitor_write(st: &mut State, addr: u16, bytes: &[u8], lens: &str) {
     }
 }
 
+/// Spec 852 D6 — the monitor's `uci` report.
+fn uci_report(m: &trx64_core::Machine) -> String {
+    let Some(s) = m.uci_status() else {
+        return format!(
+            "uci: machine={} — no command interface: the UCI block is part of the u64 profile \
+             (Spec 852). `turbo mode u64`, or start the daemon with --machine u64.",
+            m.speed_profile().name()
+        );
+    };
+    let yn = |b: bool| if b { "yes" } else { "no" };
+    let state = match s.state {
+        0 => "00 idle",
+        1 => "01 busy (the firmware has the command)",
+        2 => "10 data, last",
+        _ => "11 data, more to come",
+    };
+    let mut out = if s.enabled {
+        format!(
+            "uci: machine=u64  block=ENABLED  window=${:04X}-${:04X} (control ${:04X})",
+            s.window,
+            s.window + 7,
+            s.window + 4
+        )
+    } else {
+        "uci: machine=u64  block=disabled — the window reads open bus (the firmware's power-on \
+         default; without a firmware nothing enables it)"
+            .to_string()
+    };
+    out.push_str(&format!(
+        "\n  slot base=${:02X}  routed io1={} io2={}  bus id=${:02X}",
+        s.slot_base,
+        yn(s.routed_io1),
+        yn(s.routed_io2),
+        s.bus_id
+    ));
+    out.push_str(&format!(
+        "\n  state={state}  control=${:02X}  response valid={}  status valid={}  error={}  \
+         abort={}  data accepted={}  new command={}",
+        s.status_byte,
+        yn(s.response_valid),
+        yn(s.status_valid),
+        yn(s.error),
+        yn(s.abort),
+        yn(s.data_accepted),
+        yn(s.new_command)
+    ));
+    out.push_str(&format!(
+        "\n  command length={}  response ptr=${:03X} len={}  status ptr=${:03X} len={}",
+        s.command_length, s.response_pointer, s.response_length, s.status_pointer, s.status_length
+    ));
+    out.push_str(&format!(
+        "\n  lines: irq={} (command irq enable={})  freeze={}  trigger={}  firmware irq={} (mask %{:03b})",
+        yn(s.irq),
+        yn(s.cmd_irq_en),
+        yn(s.freeze),
+        yn(s.trigger),
+        yn(s.firmware_irq),
+        s.irq_mask
+    ));
+    out.push_str(&format!(
+        "\n  events not taken by a firmware: c64_reset={} unlock={}",
+        yn(s.pending.c64_reset),
+        yn(s.pending.unlock)
+    ));
+    out
+}
+
+/// Spec 852 D6 — `session/uci`.
+fn uci_status_json(m: &trx64_core::Machine) -> Value {
+    let Some(s) = m.uci_status() else {
+        return json!({
+            "machine": m.speed_profile().name(),
+            "present": false,
+            "note": "the UCI block is part of the u64 profile (Spec 852)",
+        });
+    };
+    json!({
+        "machine": m.speed_profile().name(),
+        "present": true,
+        "enabled": s.enabled,
+        "slotBase": s.slot_base,
+        "window": s.window,
+        "control": s.window + 4,
+        "routed": { "io1": s.routed_io1, "io2": s.routed_io2 },
+        "busId": s.bus_id,
+        "statusByte": s.status_byte,
+        "state": s.state,
+        "responseValid": s.response_valid,
+        "statusValid": s.status_valid,
+        "error": s.error,
+        "abort": s.abort,
+        "dataAccepted": s.data_accepted,
+        "newCommand": s.new_command,
+        "commandLength": s.command_length,
+        "responsePointer": s.response_pointer,
+        "responseLength": s.response_length,
+        "statusPointer": s.status_pointer,
+        "statusLength": s.status_length,
+        "irq": s.irq,
+        "cmdIrqEn": s.cmd_irq_en,
+        "freeze": s.freeze,
+        "trigger": s.trigger,
+        "firmwareIrq": s.firmware_irq,
+        "irqMask": s.irq_mask,
+        "pending": { "c64Reset": s.pending.c64_reset, "unlock": s.pending.unlock },
+    })
+}
+
 fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
     // Spec 808 §3.4 — an intervention while rewound is what truncates the future.
     // WATCHING is free (play/frame/goto move the machine but keep the anchors); CHANGING
@@ -5737,6 +5845,21 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             ))
         }
 
+        // Spec 852 D6 — the Ultimate Command Interface, read-only. Without it a program
+        // hung in a UCI handshake is a black box. The firmware side is an API
+        // (`Uci::fw_read`/`fw_write`), not a verb: a monitor that could validate a
+        // command would be a firmware, and none exists here.
+        "uci" => {
+            if toks.len() > 1 {
+                return Err(format!(
+                    "uci: read-only — bare `uci` reports the block. The firmware side is an API a \
+                     host maps onto CMD_IF_BASE, not a monitor verb.\n{}",
+                    uci_report(&st.session.machine)
+                ));
+            }
+            Ok(uci_report(&st.session.machine))
+        }
+
         // Spec 815 §4 — which machine this session claims to be, so a release's
         // turbo code path becomes reachable at all. Bare `turbo` REPORTS: a verb
         // that silently flips state when you meant to look gets used wrong once and
@@ -7365,6 +7488,7 @@ fn monitor_help_text() -> String {
         "    turbo on|off              set/clear the speed bit the way the release would ($D030 bit 0, or $D031)",
         "    turbo speed $NN           the extended speed value (u64 profile)",
         "                              The speed bit is STORED, not acted on: the CPU still runs at 1 MHz and the picture is unchanged. What a set bit does to the display is Spec 815 §3 and is unbuilt on purpose — guessing it would put behaviour here that exists nowhere else.",
+        "    uci                       Spec 852 — the Ultimate Command Interface on the u64 profile, read-only: enabled, window, state, pointers, lengths, the IRQ and freeze lines, events the firmware has not taken. Disabled without a firmware, so the window reads open bus.",
         "  MARKS (Spec 809 — a named, pinned point you can iterate FROM)",
         "    mark <name>               name + pin the anchor you are standing on (max 32)",
         "    marks                     list them with cycle, frame, how far back, and the window cost",
@@ -9551,6 +9675,13 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 "rasterLine": st.session.machine.vic.raster_line as u64,
                 "rasterCycle": st.session.machine.vic.raster_cycle as u64,
             }))
+        }
+
+        // Spec 852 D6 — the UCI block as data, the same facts the monitor verb `uci` prints.
+        // Read-only: pending events are shown, not taken.
+        "session/uci" => {
+            let st = state.lock().unwrap();
+            Response::ok(id, uci_status_json(&st.session.machine))
         }
 
         // Spec 815 §4 — the parameter half of the turbo switch, for a scripted or
@@ -16885,6 +17016,9 @@ fn undump_native_snapshot(st: &mut State, path: &str) -> Result<UndumpResult, St
     if let Some(p) = machine_profile_from_model(&read.manifest.machine.model) {
         st.speed_profile = p;
         st.session.machine.vic.speed_profile = p;
+        // Spec 852 — a `u64` comes back with its UCI block, at power-on (D7): the block is
+        // not in the dump.
+        st.session.machine.sync_profile_device();
     }
     let pc = st.session.machine.c64_core.reg_pc;
     let cycle = st.session.machine.c64_core.clk;
@@ -20104,6 +20238,79 @@ mod batch1_tests {
         call(&st, "session/turbo", json!({ "mode": "u64" }));
         st.lock().unwrap().session.machine.warm_reset();
         assert_eq!(st.lock().unwrap().session.machine.speed_profile(), SpeedProfile::U64);
+    }
+
+    /// Spec 852 D6/D7 — the UCI block is visible, read-only, through the verb and the RPC;
+    /// and every restore — a checkpoint, an undump — puts it back to power-on, because the
+    /// block is in no snapshot and its other half lives in a firmware.
+    #[test]
+    fn the_uci_block_is_visible_read_only_and_a_restore_resets_it() {
+        let st = make_state();
+        call(&st, "session/power", json!({ "op": "on" }));
+        call(&st, "debug/pause", json!({ "source": "test" }));
+
+        let r = call(&st, "session/uci", json!({}));
+        assert_eq!(r["present"], json!(false), "a c64 has no block");
+        assert!(mon_exec(&st, "uci").contains("u64 profile"));
+
+        call(&st, "session/turbo", json!({ "mode": "u64" }));
+        let r = call(&st, "session/uci", json!({}));
+        assert_eq!((r["present"].clone(), r["enabled"].clone()), (json!(true), json!(false)));
+        assert!(mon_exec(&st, "uci").contains("disabled"));
+
+        // The firmware enables it at $DF1C; a command byte and PUSH arrive.
+        let enable_and_push = |st: &SharedState| {
+            let mut g = st.lock().unwrap();
+            let m = &mut g.session.machine;
+            let u = m.uci_mut().unwrap();
+            u.fw_write(0, 0x47);
+            u.fw_write(1, 1);
+            m.write_full(0x0001, 0x37);
+            m.write_full(0xdf1d, 0x42);
+            m.write_full(0xdf1c, 0x01);
+        };
+        enable_and_push(&st);
+        let r = call(&st, "session/uci", json!({}));
+        assert_eq!(r["enabled"], json!(true));
+        assert_eq!(r["state"], json!(1));
+        assert_eq!(r["commandLength"], json!(1));
+        assert_eq!(r["control"], json!(0xdf1c));
+        let text = mon_exec(&st, "uci");
+        assert!(text.contains("ENABLED") && text.contains("$DF18-$DF1F") && text.contains("state=01"), "{text}");
+        assert_eq!(call(&st, "session/uci", json!({})), r, "looking changes nothing");
+        assert!(mon_exec(&st, "uci validate").contains("read-only"));
+
+        let cp_id = call(&st, "checkpoint/capture", json!({}))["ref"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        call(&st, "checkpoint/restore", json!({ "id": cp_id }));
+        let r = call(&st, "session/uci", json!({}));
+        assert_eq!(
+            (r["present"].clone(), r["enabled"].clone(), r["state"].clone()),
+            (json!(true), json!(false), json!(0)),
+            "a checkpoint restore gives a power-on block"
+        );
+
+        enable_and_push(&st);
+        let dir = std::env::temp_dir().join("trx64-spec852-uci");
+        let _ = std::fs::create_dir_all(&dir);
+        let snap = dir.join("uci.c64re");
+        call(&st, "snapshot/dump", json!({ "path": snap.to_string_lossy() }));
+        call(&st, "snapshot/undump", json!({ "path": snap.to_string_lossy() }));
+        let r = call(&st, "session/uci", json!({}));
+        assert_eq!(
+            (r["machine"].clone(), r["present"].clone(), r["enabled"].clone()),
+            (json!("u64"), json!(true), json!(false)),
+            "an undumped u64 comes back with its block, at power-on"
+        );
+
+        enable_and_push(&st);
+        call(&st, "session/power", json!({ "op": "off" }));
+        call(&st, "session/power", json!({ "op": "on" }));
+        call(&st, "debug/pause", json!({ "source": "test" }));
+        let r = call(&st, "session/uci", json!({}));
+        assert_eq!((r["present"].clone(), r["enabled"].clone()), (json!(true), json!(false)), "a power cycle too");
     }
 
     /// The monitor verb, because a human flips this mid-session and a parameter is

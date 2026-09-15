@@ -126,6 +126,21 @@ ported from VICE's TurboMaster, so timers, raster, rings and traces never learn 
 stock machine pays nothing. What the closed core does not reveal — `$D031` read-back, I/O stretching,
 the exact `$D0BC` value — is modelled minimally and gated, not guessed richly.
 
+## The Ultimate Command Interface as U64 hardware — 852
+
+The owner decided where UCI lives: in TRX64, as part of the U64, with no fake cartridge and no separate
+model inside UE2 — the block is one open VHDL entity on every Ultimate firmware target.
+`command_protocol.vhd` was ported one to one onto 850's port: registers whose reads have side effects,
+the IRQ, freeze as the hold line, the `$FF00` trigger and the `$D038`/`$D036` unlock through the snoop,
+and the firmware side as an API a host maps onto `CMD_IF_BASE`.
+
+**Decision:** the `u64` profile owns the block, disabled at power-on as the firmware itself defaults, so
+standalone TRX64 reads the open bus and a program probing for UCI takes its no-UCI path instead of
+waiting on a server that does not exist. The block survives a C64 reset — only the FPGA reset clears it
+— and is in no snapshot: its other half is the firmware, so every restore puts it back to power-on. What
+only the hardware can answer stays a stated assumption: what the unlock tolerates in between, and that a
+read the VIC stretched counts once per cycle its address was on the bus (4 on a badline, not 44).
+
 ---
 
 Everything here is finished. If a row's subject turns out to be open after all, it needs

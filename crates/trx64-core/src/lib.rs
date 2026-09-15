@@ -46,6 +46,8 @@ pub mod sid;
 /// `flash040`, which models the parallel-flash families ($AAA/$555 unlock).
 pub mod spi_flash;
 pub mod tables;
+/// Spec 852 — the Ultimate Command Interface, the U64 profile's own device on the port.
+pub mod uci;
 pub mod vic;
 pub mod vic_draw;
 pub mod vic_inspect;
@@ -68,6 +70,7 @@ pub use iec::IecCore;
 pub use resid_audio::{SidAudioEngine, SidWriteRecord, WavFormat};
 pub use resid_ffi::{Resid, ResidConfig};
 pub use sid::Sid6581;
+pub use uci::{Uci, UciEvents, UciStatus};
 pub use vic::VicII;
 
 /// Zero-cost observation hook, inlined into the core step loop.
@@ -552,6 +555,10 @@ pub struct Machine {
     /// Spec 850 D7 — the host's hold on the 6510, or None. A device's `hold` line holds
     /// the CPU too; see [`Machine::effective_hold`].
     pub hold: Option<crate::expansion::Hold>,
+    /// Spec 852 D4 — a C64 reset happened that the UCI block has not been told about. No
+    /// reset ever calls a device (850), so `cold_reset` only raises this and
+    /// [`Machine::uci_mut`] hands it to the block, where `take_events` reports it.
+    uci_c64_reset: bool,
 
     /// Always-on CPU-history ring (reverse-debug Phase 1a). Fed per retired
     /// instruction from `run_for_full_capped_dbg` (the single full-machine choke
@@ -737,6 +744,7 @@ impl Machine {
             expansion_snoop: None,
             expansion_host_lines: crate::expansion::PortLines::default(),
             hold: None,
+            uci_c64_reset: false,
             cpu_history: crate::cpu_history::CpuHistoryRing::new(),
             delta_ring: crate::delta_ring::DeltaRing::new(),
             head_trace_armed: false,
@@ -1009,6 +1017,10 @@ impl Machine {
         if let Some(cart) = self.cartridge.as_mut() {
             cart.reset();
         }
+        // Spec 852 D4 — the UCI block survives a C64 reset (only the FPGA reset clears it,
+        // `command_protocol.vhd:292-306`), but the firmware must hear about it. The block
+        // is not called here; `uci_mut` hands it the news.
+        self.uci_c64_reset = true;
         // Recompute the live memconfig from the port latches + cart EXROM/GAME
         // lines (= memPlaConfigChanged, ts:854-871). No cart ⇒ idx (port|0x18),
         // byte-identical to the prior hard-coded no-cart index.
@@ -1315,6 +1327,42 @@ impl Machine {
         let old = std::mem::replace(&mut *self.port_profile, dev);
         self.refresh_expansion_snoop();
         old
+    }
+
+    // ── Spec 852 — the UCI block behind the profile place ──────────────────────────────
+
+    /// The Ultimate Command Interface, Some on the `u64` profile.
+    pub fn uci(&self) -> Option<&crate::uci::Uci> {
+        let dev: &dyn crate::expansion::ExpansionDevice = self.port_profile.as_deref()?;
+        dev.as_any().downcast_ref::<crate::uci::Uci>()
+    }
+
+    /// The block for the firmware side (`fw_read`/`fw_write`/`take_events`/`set_routed`).
+    /// A C64 reset since the last call is handed to it first, so `take_events` reports it.
+    pub fn uci_mut(&mut self) -> Option<&mut crate::uci::Uci> {
+        let dev: &mut dyn crate::expansion::ExpansionDevice = self.port_profile.0.as_deref_mut()?;
+        let uci = dev.as_any_mut().downcast_mut::<crate::uci::Uci>()?;
+        if std::mem::take(&mut self.uci_c64_reset) {
+            uci.note_c64_reset();
+        }
+        Some(uci)
+    }
+
+    /// The block's state for the monitor and the daemon, events not yet taken included.
+    /// Takes nothing.
+    pub fn uci_status(&self) -> Option<crate::uci::UciStatus> {
+        let mut s = self.uci()?.status();
+        s.pending.c64_reset |= self.uci_c64_reset;
+        Some(s)
+    }
+
+    /// Spec 852 D7 — the block is not in any snapshot, ring or dump; its other half is the
+    /// firmware's state in the host. A restore puts it back to power-on (disabled).
+    pub fn reset_uci_to_power_on(&mut self) {
+        if let Some(uci) = self.uci_mut() {
+            uci.reset_to_power_on();
+        }
+        self.uci_c64_reset = false;
     }
 
     /// Rebuild the snoop set from both devices. Called on attach; call it again if a
@@ -1929,6 +1977,23 @@ impl Machine {
         self.c64_core.turbo_div = 1;
         self.c64_core.turbo_phase = 0;
         self.c64_core.turbo_badline = true;
+        self.sync_profile_device();
+    }
+
+    /// Spec 852 — the `u64` profile owns the UCI block. Entering it installs a fresh block
+    /// unless one is already there (a second `set_speed_profile(U64)` keeps its state);
+    /// leaving it removes the block. Call after setting `vic.speed_profile` directly, as
+    /// an undump does to keep the restored VIC registers.
+    pub fn sync_profile_device(&mut self) {
+        if self.vic.speed_profile == crate::vic::SpeedProfile::U64 {
+            if self.uci().is_none() {
+                self.set_port_profile_device(Some(Box::new(crate::uci::Uci::new())));
+                // A fresh block has heard of no reset.
+                self.uci_c64_reset = false;
+            }
+        } else if self.uci().is_some() {
+            self.set_port_profile_device(None);
+        }
     }
 
     /// Spec 851 D1 — the machine this is: `c64`, `128`, or `u64` (U64, Elite II, C64

@@ -1,8 +1,9 @@
 # Spec 852 — The Ultimate Command Interface as U64 hardware
 
-**Status:** PROPOSED 2026-09-15
+**Status:** BUILT 2026-09-16 — `uci_gate` 15/15, full gate green (67 gate tests, daemon 378, seven
+games 7/7), core lib 295/0; a stock C64 pays nothing measurable (§8).
 **Repos:** TRX64 (`trx64-core`, `trx64-daemon`). UE2 serves the firmware side through the API in D3.
-**Number:** 852 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`).
+**Number:** 852 (registry: `../../../C64ReverseEngineeringMCP/specs/README.md`).
 **Depends on:** Spec 850 (the port hooks it sits on) and Spec 851 (the `u64` profile that contains it).
 **Origin:** the owner, 2026-09-15, deciding where UCI lives: in TRX64, as part of the U64 machine, and
 "kein Fake-CRT-Workaround". The UCI block is identical on every Ultimate: `command_intf` is built for
@@ -182,3 +183,60 @@ through the CPU bus:
 - An UCI server inside TRX64 (a DOS target on host files, say). Possible later; it would be a firmware
   replacement, and none exists.
 - The exact U64 answers to D4's unlock rule and D5's stretch count, which only the hardware knows.
+
+## §8 As built
+
+**Where it lives.** `crates/trx64-core/src/uci.rs` — `trx64_core::uci::{Uci, UciEvents, UciStatus}` —
+rather than §2's `src/u64/uci.rs`: the core has no `u64` module, and the profile's other parts live in
+`vic.rs` and `c64_6510core.rs`. `lib.rs`: `set_speed_profile` → `sync_profile_device` installs and
+removes the block; `uci`, `uci_mut`, `uci_status`, `reset_uci_to_power_on`; the reset flag `cold_reset`
+raises. `c64re_snapshot.rs`: `restore_runtime_checkpoint` resets the block. Daemon: the monitor verb
+`uci`, the RPC `session/uci`, and the undump re-installing the block for a `u64` dump. Gate:
+`crates/trx64-core/tests/uci_gate.rs` (15 tests covering every §4 case), in `scripts/gate.sh` step
+[2/4]; daemon test `the_uci_block_is_visible_read_only_and_a_restore_resets_it`.
+
+**What the build settled against §2-§3.**
+- **The C64 reset event.** No reset calls a device (850), so `cold_reset` — and `warm_reset`, which goes
+  through it — raises a flag on the machine, and `Machine::uci_mut()` hands it to the block before
+  returning it: `m.uci_mut().unwrap().take_events()` reports it exactly as D3 has it, and `uci_status()`
+  shows it without taking it. Booting raises it too (`boot_from_dir` runs `cold_reset`): a power-on
+  resets the C64. A freshly installed block has heard of no reset.
+- **The profile owns the block through `set_speed_profile`.** The daemon's `do_power_on` and `turbo mode`
+  both go through it, so a power cycle builds a new block; entering `u64` again keeps the block that is
+  there; leaving the profile removes it. The undump sets the profile claim directly to keep the restored
+  VIC registers (851) and so came back *without* a block — it now calls `sync_profile_device`.
+- **D7 in one place.** Every restore — `checkpoint/restore` and the transport, the monitor's `sd`,
+  scenario seeds, `snapshot/undump`, `trx64cli sandbox --seed` — ends in `restore_runtime_checkpoint`,
+  which resets the block to power-on. The host's routing (`set_routed`) survives it: that is the U64 bus
+  multiplexer's state, not the block's.
+- **The valid flags are computed where they are looked at** — the control register, the `$DF1E`/`$DF1F`
+  data mux, `fw_read(3)` — which is what the FPGA has registered long before the C64's next access, and
+  what lets `fw_read` take `&self`.
+- **Stretched reads.** The CPU gets the byte at the pointer as it stood before the read; the pointer then
+  advances `stalled_on_bus + 1` times, clamped. Which byte the U64 latches at the end of a stretch is part
+  of D5's assumption.
+- **What counts as a C64 write.** The unlock detector sees only what the device is shown: the snooped
+  `$FF00`/`$D036`/`$D038`, whatever the banking, and `$DE00-$DFFF` with I/O banked in. A write elsewhere
+  between the two keys — to RAM, say — is invisible and does not re-arm; megabyter writes nothing in
+  between. `Host` writes count for neither the unlock nor the `$FF00` trigger (the FPGA takes the
+  trigger from a C64 write cycle, `slot_server_v4.vhd:863`). A host access to the register window does
+  act — `write_full($DF1D)` stores a byte, a `sidefx on` read advances the pointer — because a live
+  monitor access asks for exactly that.
+- **The firmware window** decodes as `command_interface.vhd` splits it: 0x000-0x7FF are the sixteen
+  registers, repeating every 16 bytes (their decode looks at address bits 3:0 only), 0x800-0xFFF the RAM,
+  anything above reads 0 — not only D3's 0x000-0x00F. `bus_id` is not in the VHDL reset block;
+  `Uci::new` starts it at 0, as the FPGA configuration does.
+- **D6** is one `UciStatus` behind both the verb and the RPC. Bare `uci` reports; `uci <anything>` refuses
+  and says the firmware side is an API.
+- Two first drafts of the gate were wrong and the block right: the identify probe's own `LDA $DF1E`/`$DF1F`
+  had already advanced both pointers (byte available or not), and the firmware ISR's flags include the
+  state bits, of which `IRQMASK_SET` uses only 2:0.
+
+**Measured.** Over two frames of `LDA $DF1E / JMP` with the display on: 5302 reads unstalled and 7 on a
+badline, each 43 stolen cycles with 3 on the bus — each advanced the pointer 4 times, not 44. Full gate
+green: 67 gate tests, daemon 378, seven games 7/7; core lib 295/0; `trx64-cli` 109/0. `perf_bench` pure
+headless, 30 M cycles, median of seven, the branch and the `b99a639` baseline alternated in three rounds:
+branch 11.225 / 11.211, 11.170 / 11.266, 11.240 / 11.119 MHz; baseline 11.366 / 11.368, 11.107 / 11.153,
+11.233 / 11.252 MHz. Means 11.205 against 11.247 (−0.4 %), while the baseline alone drifted 2 % between
+rounds and the sign flipped from round to round: noise. Nothing on a `c64` machine's run path changed — the
+block exists only on `u64`, and `cold_reset` sets one flag.

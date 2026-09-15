@@ -1420,6 +1420,11 @@ pub fn restore_runtime_checkpoint(
         }
     }
 
+    // Spec 852 D7 — the UCI block is in no checkpoint: its other half is the firmware's
+    // state in the host, and restoring one half gives a handshake neither side
+    // remembers. Every restore puts it back to power-on (disabled).
+    m.reset_uci_to_power_on();
+
     // Hand back the decoded `drive1541` blob for the caller's logging/diagnostics.
     Ok(drive_blob)
 }
