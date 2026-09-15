@@ -94,7 +94,7 @@ through 850's snoop (D5), including the RMW dummy write — the FPGA sees every 
 
 ```rust
 impl Uci {
-    pub fn fw_read(&mut self, off: u16) -> u8;        // 0x000-0x00F registers, 0x800-0xFFF RAM
+    pub fn fw_read(&self, off: u16) -> u8;            // 0x000-0x00F registers, 0x800-0xFFF RAM; no side effects
     pub fn fw_write(&mut self, off: u16, value: u8);
     pub fn fw_irq(&self) -> bool;                     // ITU low bit 4, a level
     pub fn take_events(&mut self) -> UciEvents;       // since the last call
@@ -113,14 +113,17 @@ is when a host between runs is able to write anyway.
 - `unlock` — `$AB` written to `$D038`, then `$CD` to `$D036` (`megabyter.tas`, "exact order, nothing in
   between"). The firmware's `unlock_irq` then maps the internal bus, enables UCI at `$DF1C` and clears
   `$D038` (`u64_config.cc:1012-1019`). The rule is modelled as: the next C64 write after `$D038 = $AB`
-  is `$D036 = $CD`, any other write re-arms. What the closed core accepts in between is not known.
+  is `$D036 = $CD`, any other C64 write re-arms. Only `Cpu` and `Dummy` writes count: a host write is the
+  firmware's DMA while the C64 runs and is not on the C64 bus, so it neither advances nor re-arms the
+  sequence. What the closed core accepts in between is not known.
   Standalone TRX64 raises the event and does nothing else: without a firmware nothing enables the block,
   and a UCI that answers `$C9` with no server behind it would hang every program that probes it.
 
-**D5 — stretched reads.** `slot_slave.vhd` qualifies every PHI2 cycle, so on a U2+ a read of 6 or 7
-stretched over n BA cycles advances the pointer n+1 times. The port does that, from 850's `stalled`
-count. Whether the U64's internal bus does the same is closed; the gate records it so one measurement on
-the owner's U64 settles it.
+**D5 — stretched reads.** `slot_slave.vhd` latches an I/O read per PHI2 cycle from R/W and IO1/IO2
+(`:131-142`). During a BA stall those are active only while AEC is high; once AEC falls the VIC drives
+the address and the PLA selects no I/O. So a read of 6 or 7 advances the pointer `stalled_on_bus + 1`
+times (850's count), not once per stolen cycle — which would be about forty on a badline. Whether the
+U64's internal bus behaves like the U2+ cartridge is closed and stays an assumption.
 
 **D6 — visibility.** A read-only monitor verb `uci`: profile, enabled, window, state, pointers, lengths,
 the two lines. The daemon's `session/uci` returns the same. Without it, a hung UCI program is a black box.
@@ -154,7 +157,8 @@ through the CPU bus:
 - **Reset:** `warm_reset` during a pending command keeps state and ERROR and sets `c64_reset`; a power
   cycle clears the block.
 - **Unlock:** `$AB → $D038`, `$CD → $D036` sets `unlock`; with a write in between it does not.
-- **Stretched read:** `LDA $DF1E` timed onto a badline advances the pointer `stalled + 1` times.
+- **Stretched read:** `LDA $DF1E` timed onto a badline advances the pointer `stalled_on_bus + 1` times,
+  never once per stolen cycle.
 
 ## §5 UE2
 
@@ -164,8 +168,13 @@ through the CPU bus:
 - The planned ue2-core model of `command_protocol.vhd` (S15 §3 item 1) and the bridge window decode
   (item 5) are not built; S15 steps 1-2 disappear.
 - `C64_BUS_INTERNAL`/`EXTERNAL` routing stays in the bridge (it is the U64 bus multiplexer, and the
-  bridge already models it for `--cart-slot`); it decides whether TRX64's window is on the bus, through a
-  `Uci::set_routed(bool)` that D1 honours.
+  bridge already models it for `--cart-slot`); it decides whether TRX64's window is on the bus, through
+  `Uci::set_routed(io1: bool, io2: bool)` — bits 0 and 1 of `C64_BUS_INTERNAL`, which gate IO1 and IO2
+  separately (`c64.cc:1536-1590`; `unlock_irq` sets bit 1 "to reach UCI", `u64_config.cc:1015-1016`). D1
+  applies the bit of the range the window decodes to: IO1 for `$DE18`, IO2 for `$DF18`/`$DFF8`. The
+  bridge feeds it from core-config offset `0x2B`. Standalone TRX64 routes both.
+- The profile goes in at construction: `Machine::set_machine_profile(u64)` right after `Machine::new()`,
+  before power-on. `CAPAB_COMMAND_INTF` is reported only when `uci()` is `Some`.
 
 ## §6 Not in this spec
 

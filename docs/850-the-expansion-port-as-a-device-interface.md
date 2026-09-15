@@ -43,7 +43,7 @@ interface.
 | R4 write snoop | **accepted, through the same device** | Not a second registry. VICE has exactly this hook: `mainc64cpu.c:288-305`, `STORE` and `STORE_DUMMY` call `reu_dma` on `$FF00`. TRX64's core says it is "folded into the implementor" (`c64_6510core.rs:470-472`); it never was. |
 | R5 interrupt sources | **changed: one source, not two** | VICE allocates one source per device (`c64cart.c:1424` "Cartridge", `reu.c:579` "REU"), and a source carries `IK_IRQ` and `IK_NMI` independently. One `INT_SRC_EXPANSION` does what two would. |
 | R6 CPU hold | **accepted, plus a reset flavour** | The chips-only loop moves from the bridge (`c64-bridge` `run_chips`) into TRX64. The bridge needs "reset held" too, and it is a hardware fact, not a UE2 wish: the 6569 has no reset pin, so the VIC runs while CPU, CIAs and SID do not. |
-| Open Q1 — stretched reads | **the device decides** | The FPGA counts every PHI2 cycle (`slot_slave.vhd:143-144`); VICE reads once after the BA steal. TRX64 hands the device the number of cycles stolen immediately before the read. What a stalled cycle *means* is the device's policy; *that* it stalled is the machine's fact. |
+| Open Q1 — stretched reads | **the device decides** | The FPGA counts every PHI2 cycle with IO1/IO2 active (`slot_slave.vhd:131-144`); VICE reads once after the BA steal. But a BA-stalled read is on the bus only while AEC is still high: once AEC falls the VIC drives the address and the PLA selects no I/O (UE2's review, 2026-09-15). So TRX64 hands the device two counts — the cycles stolen before the read, and those of them in which the CPU still drove the address. What a stalled cycle *means* is the device's policy; *that* it stalled, and whether it was on the bus, is the machine's fact. |
 | Open Q2 — R1 or the fake cartridge | **R1** | The fake cartridge goes. |
 
 ## §3 Design
@@ -59,6 +59,9 @@ pub struct Access {
     pub kind: AccessKind,
     /// Cycles the BA steal took immediately before this read (0 for writes and host access).
     pub stalled: u32,
+    /// Those of `stalled` in which AEC was still high, so the CPU's address — and IO1/IO2 — was on the
+    /// bus. The rest the VIC owned.
+    pub stalled_on_bus: u32,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -106,8 +109,9 @@ and the bus test in `full.rs`).
 - Dummy reads and RMW dummy writes already go through `Bus::read`/`Bus::write`, so they reach the
   device with no extra site. `FullScBus::read_raw_dummy`/`write_raw_dummy` set `access_kind = Dummy`;
   `read_full_live`/`write_full` set `Host`.
-- `stalled`: `FullScBus::check_ba` keeps the count it returns; the next `read_raw` passes it and resets
-  it.
+- `stalled` / `stalled_on_bus`: `FullScBus::check_ba` keeps both counts from the steal — the VIC knows
+  per stolen cycle whether AEC had already fallen (its prefetch countdown after BA goes low) — and the
+  next read passes them and resets them.
 
 ### D3 — peek (R2)
 
@@ -181,8 +185,9 @@ proves the wrong door), plus:
 - **R6:** hold `Cpu` for 19 656 cycles: `$D012` passes through every line, CIA1 timer A counts, PC and
   registers are unchanged, `write_full($0400, x)` lands; after release execution continues at the same
   PC. Hold `Reset`: the VIC runs, CIA1 timer A does not count.
-- **Stalled read:** `LDA $DF1E` timed onto a badline reports `stalled > 0`; the same read off a badline
-  reports 0.
+- **Stalled read:** `LDA $DF1E` timed onto a badline reports `stalled > 0` and `stalled_on_bus` at most
+  4 — the three cycles after BA falls, and the one in which it rises again — and below `stalled`; the
+  same read off a badline reports 0 for both.
 
 ## §5 What UE2 does with it
 
