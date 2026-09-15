@@ -4,9 +4,11 @@
 **Repos:** TRX64 (`trx64-core`, `trx64-daemon`, `trx64-cli`). UE2 maps the firmware's speed settings onto it.
 **Number:** 851 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`).
 **Depends on:** Spec 815 (it extends the profile 815 built and replaces its §6 limit "does not make the
-CPU faster"). Independent of 850; both are needed for UE2.
+CPU faster"). The `u64` profile contains the UCI block of Spec 852, which sits on Spec 850's port.
 **Origin:** the owner, 2026-09-15, on the UCI requirements: "ein Startparameter --mode UE2 oder so wäre
-gut … Turbo usw dann auch gleich implementieren, soweit möglich."
+gut … Turbo usw dann auch gleich implementieren, soweit möglich", then: "kein Fake-CRT-Workaround … beim
+Start des TRX64 einen Parameter, Default C64, optional U64/UE2/128", and the mode is simply "I emulate an
+Ultimate, or I don't".
 
 ---
 
@@ -23,16 +25,23 @@ Spec 815 built `SpeedProfile { C64, C128, U64 }` as the session's claim, settabl
 
 ## §2 The start parameter
 
-**D1.** `--machine c64|128|u64` on `trx64-daemon` and on `trx64cli boot`/`sandbox`, applied BEFORE
-power-on. 815 §5 recorded why that order matters: a cartridge probes in its boot stub, inside the
-power-on warm-up, and a claim set afterwards arrives after the answer was given. `--turbo` stays as an
-alias.
+**D1.** `--machine c64|u64|128` on `trx64-daemon` and on `trx64cli boot`/`sandbox`, default `c64`,
+applied BEFORE power-on. 815 §5 recorded why that order matters: a cartridge probes in its boot stub,
+inside the power-on warm-up, and a claim set afterwards arrives after the answer was given. `--turbo`
+stays as an alias. A library user (UE2) constructs the machine with the same profile through the core
+API.
 
-Named after the machine, not the consumer. UE2 does not run the daemon; it links `trx64-core` and calls
-`Machine::set_speed_profile(U64)` itself, so a flag called `ue2` would be read by nobody who runs UE2,
-and TRX64 would start knowing about one of its users.
+| Value | What the machine is |
+|---|---|
+| `c64` | a C64. Default; bit-identical to today. |
+| `u64` (also `c64u`, `ue2`) | an Ultimate: U64, U64 Elite II and C64 Ultimate are one machine here. It brings the turbo registers and the faster CPU (§3, §4) and the UCI block (Spec 852). `ue2` is not a separate machine — it is this one, with a firmware behind it. |
+| `128` | 815's probe profile: the VIC-IIe register masks, nothing else. |
 
-*Open — the owner's call:* the name and whether the flag bundles anything beyond the profile (§6).
+The Ultimates differ in the speed table only, so that is a parameter, not a machine:
+`--speed-table u64ii` (U64 Elite II and C64 Ultimate, the default) or `u64` (the first U64).
+
+The profile is recorded in the `.c64re` dump and the checkpoint ring as `machine_model`, which reads
+`c64-pal` today, so a restored session knows which machine it was.
 
 ## §3 The registers — what is known, and from where
 
@@ -82,9 +91,8 @@ ring, rewind and trace store are keyed on. That is the one thing that must not c
 - **Interrupt delays** stay stamped in `clk`, as in VICE's TurboMaster. At 48 MHz the 6510's two-cycle
   delay is a few CPU cycles longer than on hardware. Stated, not fixed.
 
-**Performance, stated before it is measured.** Every emulated second costs N× the CPU work. TRX64 runs
-at about 13.4 emulated MHz on this Mac (`docs/perf-compare.md`), so up to about 12 MHz stays real-time;
-16 MHz and above run slower than real time, 64 MHz at about a fifth. The gate records the numbers.
+**Cost.** A faster CPU costs proportionally more host time; where real time ends depends on the host
+and is not a limit of this design. The one performance rule is that the divider costs nothing at 1 MHz.
 
 ## §5 Gates
 
@@ -100,17 +108,15 @@ at about 13.4 emulated MHz on this Mac (`docs/perf-compare.md`), so up to about 
 - **Interrupts:** a raster IRQ is taken at 48 MHz, and RTI returns to the loop.
 - **Start parameter:** `trx64-daemon --machine u64` answers the `$D031` probe inside the power-on warm-up
   (the 815 §5 trap, run as the probe).
-- **Performance:** emulated MHz at 1, 4, 16, 48 and 64 MHz go into `docs/perf-compare.md`.
+- **1 MHz costs nothing:** on `c64` and on `u64` at 1 MHz, `docs/perf-compare.md` stays within noise.
+- **Profile in a dump:** a `u64` session dumped and undumped comes back as `u64`.
 
 ## §6 UE2
 
-UE2's `C64Port` latches the core-config speed registers today (S14 §5.3, "TURBO/SPEED latched only"). The
-bridge maps them onto `Machine::set_u64_turbo(regs_en, speed_prefer)` with the U64-II table, and ue2emu
-runs turbo.
-
-Whether `--machine u64` should also switch on the 850 port device by default is not a machine fact: the
-device belongs to the host. So it does not. That is the part of the owner's `--mode UE2` idea this spec
-leaves to UE2.
+UE2 constructs the machine with the `u64` profile; the UCI block comes with it (Spec 852), and nothing is
+attached from outside. Its `C64Port` latches the core-config speed registers today (S14 §5.3,
+"TURBO/SPEED latched only"); the bridge maps them onto `Machine::set_u64_turbo(regs_en, speed_prefer)`,
+and ue2emu runs turbo.
 
 ## §7 Not in this spec
 

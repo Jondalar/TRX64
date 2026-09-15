@@ -1,7 +1,8 @@
 # Spec 850 — The expansion port as a device interface
 
 **Status:** PROPOSED 2026-09-15
-**Repos:** TRX64 (`trx64-core`). UE2 consumes it (`u64-emulator/crates/c64-bridge`). C64RE gains nothing.
+**Repos:** TRX64 (`trx64-core`). Its first user is TRX64's own UCI block on the `u64` profile (Spec 852);
+a host such as UE2 (`u64-emulator/crates/c64-bridge`) may attach a device of its own. C64RE gains nothing.
 **Number:** 850 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`).
 **Depends on:** nothing. With no device attached every hook is an `Option` that is `None`, so a stock
 session stays bit-identical and pays one predicted branch (the BUG-049 discipline).
@@ -25,7 +26,12 @@ everywhere — `BankInfo.cartridge_attached`, the VSF export lines, `cold_reset`
 
 None of the six asks is specific to UCI. An REU (issue #19), an ACIA, a sampler, and the cartridge
 IRQ UE2 currently parks on the RESTORE source are all *a device on the port*. So this spec builds the
-interface; UCI stays in UE2 (its S15).
+interface, and nothing on it is a cartridge.
+
+Its first device is TRX64's own. The owner decided (2026-09-15) that the U64's hardware lives in TRX64,
+with no fake cartridge plugged in from outside: the UCI block is part of the `u64` profile (Spec 851)
+and is specified in Spec 852. A host device — UE2's cartridge slot, a future REU — uses the same
+interface.
 
 ## §2 The requirements, judged
 
@@ -78,8 +84,12 @@ pub trait ExpansionDevice: Send {
 }
 ```
 
-`Machine` gains `pub expansion: Option<Box<dyn ExpansionDevice>>` beside `cartridge`, and a 65 536-bit
-snoop set built from `snoop_addresses()` by `Machine::attach_expansion`. Attaching changes none of
+`Machine` gains a port with two places beside `cartridge`: the profile's own device (the UCI block on
+`u64`, Spec 852) and `pub expansion: Option<Box<dyn ExpansionDevice>>` for a host. A read asks the
+profile's device first, and its `Some` wins over the host device and over the cartridge — on the
+hardware the UCI's register answer is tested before cartridge I/O data (`slot_slave.vhd:292-301`).
+Writes and snoops reach both. A 65 536-bit snoop set is built from both devices' `snoop_addresses()`
+when either changes. Attaching changes none of
 `cartridge.is_some()`, `pla_index()`, `BankInfo`, the VSF export, or reset behaviour; `cold_reset` and
 `warm_reset` never call the device (UCI survives a C64 reset, `command_protocol.vhd:292-306`).
 
@@ -134,8 +144,10 @@ continues unchanged — `$D036` still reaches the VIC, `$FF00` still lands in RA
 
 `Machine::hold: Option<Hold>`, `enum Hold { Cpu, Reset }`.
 
-- Entered by the host (`set_hold`) or by the device (`lines().hold`, checked at every instruction
-  boundary — effective at the next one at the latest). Released by the host. For UCI an
+- The hold is the host's hold (`set_hold`) OR a device's `lines().hold`, checked at every instruction
+  boundary — effective at the next one at the latest. Each side releases its own: the host by
+  `set_hold(None)`, a device by dropping its line (the UCI block drops freeze when the firmware
+  validates, Spec 852). For UCI an
   instruction-boundary stop is exact: PUSH_CMD and the `$FF00` write happen in the last cycle of their
   instruction.
 - While held, the run loop advances per cycle without executing the 6510: the VIC always; CIAs, SID and
@@ -174,14 +186,16 @@ proves the wrong door), plus:
 
 ## §5 What UE2 does with it
 
-S15 step 2 — the fake cartridge with no cartridge, the watch-table stops, the `$FF00` access-watch — is
-not built. The bridge goes from step 1 straight to step 3 on a TRX64 pin that contains this spec, and
-deletes `run_chips`, the shared RESTORE source, and `CartProxy`-without-a-cartridge.
+S15 steps 1 and 2 — the fake cartridge with no cartridge, the watch-table stops, the `$FF00`
+access-watch — are not built, and neither is S15's own model of `command_protocol.vhd`: that is Spec 852,
+inside TRX64. What the bridge uses from this spec directly: `Hold` for the firmware's C64 STOP (its
+`run_chips` goes), `set_expansion_lines` for its cartridge's IRQ/NMI (the shared RESTORE source goes),
+and a host device if its cartridge slot wants one. `CartProxy`-without-a-cartridge goes.
 
 ## §6 Not in this spec
 
-- UCI itself (UE2 S15).
+- UCI itself — Spec 852.
 - The U64 as a machine profile and its turbo (Spec 851).
-- Device state in TRX64's checkpoint ring, rewind or `.c64re` dumps: the device belongs to the host, and
-  a restore puts back the machine, not the device. A host that needs rewind across a device carries its
-  own state.
+- A host device's state in TRX64's checkpoint ring, rewind or `.c64re` dumps: the device belongs to the
+  host, and a restore puts back the machine, not the device. A profile's own device decides for itself
+  (Spec 852 D7 for the UCI block).
