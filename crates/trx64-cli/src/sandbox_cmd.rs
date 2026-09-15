@@ -808,6 +808,11 @@ fn execute_sandbox(m: &mut Machine, args: &SandboxArgs) -> SandboxOutcome {
                 ok = true;
                 break;
             }
+            RunStop::Device => {
+                stop_reason = "device";
+                ok = false;
+                break;
+            }
             RunStop::CycleBudget | RunStop::Completed | RunStop::Observer => {
                 stop_reason = "max_steps";
                 ok = false;

@@ -142,7 +142,7 @@ pub const CLOCK_MAX: u64 = u64::MAX;
 /// (VICE registers vicii first, then the CIAs, then restore — but only the count
 /// and per-source independence matter, since `set_irq`/`set_nmi` key off
 /// `int_num` and the global edge is `nirq`/`nnmi` aggregated). Index = int_num.
-pub const C64_NUM_INT_SOURCES: usize = 4;
+pub const C64_NUM_INT_SOURCES: usize = 5;
 
 /// VIC-II raster/sprite IRQ source index (int_num).
 pub const INT_SRC_VIC: usize = 0;
@@ -153,6 +153,10 @@ pub const INT_SRC_CIA2: usize = 2;
 /// RESTORE-key NMI source index (int_num). Inert in the headless machine (no
 /// keyboard RESTORE wired into the NMI line), reserved for completeness.
 pub const INT_SRC_RESTORE: usize = 3;
+/// Spec 850 D6 — the expansion port's IRQ and NMI (int_num). One source carries both,
+/// as VICE allocates one per device (`c64cart.c:1424` "Cartridge", `reu.c:579` "REU"):
+/// `pending_int[]` holds IK_IRQ and IK_NMI independently.
+pub const INT_SRC_EXPANSION: usize = 4;
 
 // SC: REWIND_FETCH_OPCODE is a NO-OP for x64sc (c64cpusc.c:42 `/*clock-=2*/`).
 // We model it as a no-op accordingly.
@@ -544,6 +548,23 @@ pub trait C64Core6510Bus {
     fn vic_irq_line(&self) -> bool {
         false
     }
+    /// Spec 850 D6 — the expansion port's lines, sampled per cycle like the CIAs' and
+    /// the VIC's, so a device line that falls on a `$DF1E` read is seen at that cycle.
+    #[inline]
+    fn expansion_irq_line(&self) -> bool {
+        false
+    }
+    #[inline]
+    fn expansion_nmi_line(&self) -> bool {
+        false
+    }
+    /// Whether the port has anything to report this run. False on a stock machine, and
+    /// then `clk_inc` skips the two expansion samples — the 1 MHz path must not pay for
+    /// a port nobody uses.
+    #[inline]
+    fn expansion_active(&self) -> bool {
+        false
+    }
 
     /// PORT OF: mainc64cpu.c:778 ROM_TRAP_HANDLER() = traps_handler(). Returns 0
     /// if handled in place, a replacement opcode (>0, <0xffffffff) to replay, or
@@ -810,6 +831,10 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
         self.int.set_nmi(INT_SRC_CIA2, self.bus.cia2_nmi_line(), clk);
         self.int.set_irq(INT_SRC_CIA1, self.bus.cia1_irq_line(), clk);
         self.int.set_irq(INT_SRC_VIC, self.bus.vic_irq_line(), clk);
+        if self.bus.expansion_active() {
+            self.int.set_irq(INT_SRC_EXPANSION, self.bus.expansion_irq_line(), clk);
+            self.int.set_nmi(INT_SRC_EXPANSION, self.bus.expansion_nmi_line(), clk);
+        }
         if self.int.irq_clk <= self.core.clk {
             self.int.irq_delay_cycles += 1;
         }

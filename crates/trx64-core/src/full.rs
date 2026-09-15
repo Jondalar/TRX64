@@ -226,6 +226,29 @@ pub struct FullBus<'a> {
     /// cartridge never sees it and it must not be counted. A write to RAM under a
     /// banked-in cart ROM would otherwise fabricate one cart read per store.
     pub cart_account_suspend: bool,
+    /// Spec 850 — the machine profile's own device on the expansion port (Spec 852's UCI
+    /// block on the `u64` profile), or None.
+    pub port_profile: Option<&'a mut Box<dyn crate::expansion::ExpansionDevice>>,
+    /// Spec 850 — a host's device on the expansion port, or None.
+    pub port_host: Option<&'a mut Box<dyn crate::expansion::ExpansionDevice>>,
+    /// Spec 850 D5 — addresses whose writes the port's devices see whatever the banking;
+    /// None when nobody snoops, which keeps the write path one branch.
+    pub snoop: Option<&'a crate::expansion::SnoopSet>,
+    /// Spec 850 — the kind of access being served, set per access by `full_sc`; `Host`
+    /// on the monitor paths.
+    pub access_kind: crate::expansion::AccessKind,
+    /// Spec 850 — the BA steal before the pending read: all stolen cycles, and those with
+    /// AEC still high. Cleared after every access.
+    pub stalled: u32,
+    pub stalled_on_bus: u32,
+    /// Spec 850 D4 — a device asked the run to end at the next instruction boundary.
+    pub device_stop: bool,
+    /// Spec 850 D6 — the IRQ/NMI the host itself drives onto the port.
+    pub host_lines: crate::expansion::PortLines,
+    /// Spec 850 — `Machine::port_active` at construction: a device, a host line, or an
+    /// expansion interrupt still pending. Constant for the run, so the per-cycle sample
+    /// costs one load on a stock machine.
+    pub port_active: bool,
 }
 
 impl<'a> FullBus<'a> {
@@ -484,10 +507,9 @@ impl<'a> FullBus<'a> {
             // no longer what this range READS.
             _ => {
                 if (0xde00..=0xdfff).contains(&addr) {
-                    if let Some(v) = self.cart_read(addr) {
-                        return v;
-                    }
-                    return self.vic.last_read_phi1;
+                    // Spec 850 — the port's devices see the read too, and answer
+                    // before the cartridge; with none attached this is the line above.
+                    return self.port_read(addr);
                 }
                 self.io[(addr as usize) - 0xd000]
             }
@@ -614,8 +636,13 @@ impl<'a> FullBus<'a> {
             // reconfig. A non-consumed write (or no cart) falls to the io shadow
             // (already stored at the top of io_write) — byte-identical to no-cart.
             _ => {
-                if (0xde00..=0xdfff).contains(&addr) && self.cart_write(addr, value) {
-                    self.pla_config_changed();
+                if (0xde00..=0xdfff).contains(&addr) {
+                    if self.cart_write(addr, value) {
+                        self.pla_config_changed();
+                    }
+                    // Spec 850 D2 — in addition to the cartridge, never instead of it:
+                    // the device does not change whether the cartridge consumed it.
+                    self.port_write(addr, value);
                 }
             }
         }
@@ -623,6 +650,84 @@ impl<'a> FullBus<'a> {
 }
 
 impl<'a> FullBus<'a> {
+    // ── Spec 850 — the expansion port's devices ─────────────────────────────────────
+
+    #[inline]
+    fn port_access(&self, addr: u16, read: bool) -> crate::expansion::Access {
+        crate::expansion::Access {
+            addr,
+            clk: self.clk,
+            kind: self.access_kind,
+            stalled: if read { self.stalled } else { 0 },
+            stalled_on_bus: if read { self.stalled_on_bus } else { 0 },
+        }
+    }
+
+    /// A `$DE00-$DFFF` read with I/O banked in. Every device sees it; the profile's device
+    /// answers first, then the host's, then the cartridge, then the open bus.
+    #[inline]
+    fn port_read(&mut self, addr: u16) -> u8 {
+        let cart = self.cart_read(addr);
+        if self.port_profile.is_none() && self.port_host.is_none() {
+            return cart.unwrap_or(self.vic.last_read_phi1);
+        }
+        let a = self.port_access(addr, true);
+        let mut answer = None;
+        if let Some(d) = self.port_profile.as_mut() {
+            answer = d.read(a, cart);
+            self.device_stop |= d.take_stop();
+        }
+        if let Some(d) = self.port_host.as_mut() {
+            let v = d.read(a, cart);
+            self.device_stop |= d.take_stop();
+            answer = answer.or(v);
+        }
+        answer.or(cart).unwrap_or(self.vic.last_read_phi1)
+    }
+
+    #[inline]
+    fn port_write(&mut self, addr: u16, value: u8) {
+        if self.port_profile.is_none() && self.port_host.is_none() {
+            return;
+        }
+        let a = self.port_access(addr, false);
+        if let Some(d) = self.port_profile.as_mut() {
+            d.write(a, value);
+            self.device_stop |= d.take_stop();
+        }
+        if let Some(d) = self.port_host.as_mut() {
+            d.write(a, value);
+            self.device_stop |= d.take_stop();
+        }
+    }
+
+    /// Spec 850 D5 — a write to a snooped address, reported before banking decides where
+    /// it lands. Covers the real write, the RMW dummy write-back and host writes alike.
+    #[cold]
+    fn port_snoop(&mut self, addr: u16, value: u8) {
+        let a = self.port_access(addr, false);
+        if let Some(d) = self.port_profile.as_mut() {
+            d.snoop_write(a, value);
+            self.device_stop |= d.take_stop();
+        }
+        if let Some(d) = self.port_host.as_mut() {
+            d.snoop_write(a, value);
+            self.device_stop |= d.take_stop();
+        }
+    }
+
+    /// Spec 850 D6 — the port's lines: the host's own, ORed with every device's.
+    #[inline]
+    pub fn port_lines(&self) -> crate::expansion::PortLines {
+        let mut lines = self.host_lines;
+        if let Some(d) = self.port_profile.as_ref() {
+            lines = lines.or(d.lines());
+        }
+        if let Some(d) = self.port_host.as_ref() {
+            lines = lines.or(d.lines());
+        }
+        lines
+    }
 
     /// True when the attached cartridge holds ULTIMAX permanently but resolves the
     /// windows itself (GMod4 and, later, GMod3). Such a cart declines the windows it does
@@ -785,6 +890,14 @@ impl<'a> Bus for FullBus<'a> {
 
     #[inline]
     fn write(&mut self, addr: u16, value: u8) {
+        // Spec 850 D5 — VICE's `$FF00` REU hook (`mainc64cpu.c:288-305`, STORE and
+        // STORE_DUMMY), generalised: a registered address is reported whatever the
+        // banking, before the write goes wherever it goes.
+        if let Some(s) = self.snoop {
+            if s.contains(addr) {
+                self.port_snoop(addr, value);
+            }
+        }
         match addr {
             0x0000 => {
                 self.port_dir = value;
@@ -967,6 +1080,15 @@ mod joystick_gate_tests {
             cartridge: None,
             cart_reads: None,
             cart_account_suspend: false,
+            port_profile: None,
+            port_host: None,
+            snoop: None,
+            access_kind: crate::expansion::AccessKind::Cpu,
+            stalled: 0,
+            stalled_on_bus: 0,
+            device_stop: false,
+            host_lines: crate::expansion::PortLines::default(),
+            port_active: false,
         }
     }
 

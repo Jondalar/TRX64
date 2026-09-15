@@ -777,6 +777,11 @@ pub struct VicII {
     /// `vicii_cycle()` returned, consumed by the next `check_ba` / `steal_cycles`.
     pub ba_low_flag: bool,
 
+    /// Spec 850 — of the cycles the last `steal_cycles` took, those in which AEC was
+    /// still high (`prefetch_cycles` not yet run down), so the CPU's address stayed on
+    /// the bus. The rest the VIC owned.
+    pub last_steal_on_bus: u32,
+
     // ── Per-cycle fetch results (vicii-types.h vbuf/cbuf/gbuf) ─────────────────
     // Populated by the Φ1/Φ2 fetches inside tick(); consumed by the draw pipeline.
     /// Graphics shift-register source byte (vicii.gbuf) from the last g-fetch.
@@ -901,6 +906,7 @@ impl VicII {
             frame: 0,
             irq_line: false,
             ba_low_flag: false,
+            last_steal_on_bus: 0,
             // Per-cycle fetch results.
             gbuf: 0,
             vbuf: [0u8; 40],
@@ -1743,12 +1749,18 @@ impl VicII {
         if !self.ba_low_flag {
             return 0;
         }
+        self.last_steal_on_bus = 0;
         let mut stolen: u32 = 0;
         loop {
             // VICE order: maincpu_clk++ (the caller folds `stolen` into clk) THEN
             // vicii_cycle(). Each tick() is one stolen cycle that re-samples BA.
             let ba = self.tick(mem);
             stolen += 1;
+            // Spec 850 — AEC follows BA down three cycles late (`prefetch_cycles`), and
+            // comes back up with it. While it is high the CPU still drives the address.
+            if self.prefetch_cycles != 0 {
+                self.last_steal_on_bus += 1;
+            }
             if !ba {
                 break;
             }

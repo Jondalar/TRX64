@@ -195,6 +195,10 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
     fn read_raw(&mut self, addr: u16) -> u8 {
         self.sync_clk();
         let v = crate::cpu::Bus::read(&mut self.fb, addr);
+        if self.fb.stalled != 0 {
+            self.fb.stalled = 0;
+            self.fb.stalled_on_bus = 0;
+        }
         let pc = self.pc();
         let clk = self.clk();
         let mut se: Vec<(u16, u8)> = Vec::new();
@@ -286,6 +290,10 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
     fn read_raw_fetch(&mut self, addr: u16) -> u8 {
         self.sync_clk();
         let v = crate::cpu::Bus::read(&mut self.fb, addr);
+        if self.fb.stalled != 0 {
+            self.fb.stalled = 0;
+            self.fb.stalled_on_bus = 0;
+        }
         let pc = self.pc();
         let clk = self.clk();
         self.obs.on_bus(BusKind::Fetch, addr, v, pc, clk, 0);
@@ -301,7 +309,15 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
     #[inline]
     fn read_raw_dummy(&mut self, addr: u16) -> u8 {
         self.sync_clk();
+        // Spec 850 — `Cpu` is the standing kind; only the dummy paths flip it, and flip
+        // it back, so the real accesses pay nothing for it.
+        self.fb.access_kind = crate::expansion::AccessKind::Dummy;
         let v = crate::cpu::Bus::read(&mut self.fb, addr);
+        self.fb.access_kind = crate::expansion::AccessKind::Cpu;
+        if self.fb.stalled != 0 {
+            self.fb.stalled = 0;
+            self.fb.stalled_on_bus = 0;
+        }
         let pc = self.pc();
         let clk = self.clk();
         self.obs.on_bus(BusKind::DummyRead, addr, v, pc, clk, 0);
@@ -324,7 +340,9 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
         } else {
             0
         };
+        self.fb.access_kind = crate::expansion::AccessKind::Dummy;
         crate::cpu::Bus::write(&mut self.fb, addr, value);
+        self.fb.access_kind = crate::expansion::AccessKind::Cpu;
         let pc = self.pc();
         let clk = self.clk();
         self.obs.on_bus(BusKind::DummyWrite, addr, value, pc, clk, old);
@@ -347,7 +365,13 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
     #[inline]
     fn check_ba(&mut self, _last_opcode_info: &mut u32, _check_ba_low: bool) -> u64 {
         self.sync_clk();
-        crate::cpu::Bus::check_ba_before_read(&mut self.fb) as u64
+        let stolen = crate::cpu::Bus::check_ba_before_read(&mut self.fb);
+        // Spec 850 — the stall the next read is stretched over, handed to the port.
+        if stolen != 0 {
+            self.fb.stalled = stolen;
+            self.fb.stalled_on_bus = self.fb.vic.last_steal_on_bus;
+        }
+        stolen as u64
     }
 
     /// CLK_INC's per-cycle VIC tick (c64cpusc.c:47-51). The core has already
@@ -400,6 +424,18 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
     #[inline]
     fn vic_irq_line(&self) -> bool {
         self.fb.vic.irq_line
+    }
+    #[inline]
+    fn expansion_irq_line(&self) -> bool {
+        self.fb.port_lines().irq
+    }
+    #[inline]
+    fn expansion_nmi_line(&self) -> bool {
+        self.fb.port_lines().nmi
+    }
+    #[inline]
+    fn expansion_active(&self) -> bool {
+        self.fb.port_active
     }
 
     /// cpu_reset (mainc64cpu.c:631-651) — invoked on the IK_RESET dispatch. The

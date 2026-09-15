@@ -99,6 +99,21 @@ all four sites — the CPU read, the peek, both monitor lenses — because a deb
 write hides exactly the evidence it exists to show. Spec 850 builds on it: a device that declines a read
 leaves the open bus, never the shadow.
 
+## The expansion port as a device interface — 850
+
+UE2 runs the Ultimate firmware on TRX64 and needed the Ultimate Command Interface on the port; the only
+way in was a fake cartridge, which the machine then believed in everywhere. None of the six requests was
+specific to UCI, so the port got an interface: a place for the machine profile's own device and one for
+a host's, side-effect-free peeks, `RunStop::Device`, a write snoop that sees `$FF00` whatever the banking
+(VICE's REU hook, which TRX64's core had claimed and never had), one `INT_SRC_EXPANSION` sampled per
+cycle, and CPU hold as a run state with a reset flavour.
+
+**Decision:** nothing on the port is a cartridge, and a stock machine pays nothing for the port existing.
+The second half was measured, not assumed: the first build cost 6 % and was brought back to noise by
+putting every port step behind one flag computed per run. A device is told how long a read was stalled
+and how much of that stall had its address on the bus (43 and 3 on a badline); what that means is the
+device's business. A DMA engine is not part of this — the REU spec ports VICE's `reu.c`.
+
 ---
 
 Everything here is finished. If a row's subject turns out to be open after all, it needs

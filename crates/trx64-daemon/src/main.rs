@@ -3169,6 +3169,17 @@ fn run_until_break(
                     cycles_elapsed: session.machine.clk.wrapping_sub(start_clk),
                 };
             }
+            trx64_core::RunStop::Device => {
+                // Spec 850 — a device on the expansion port asked the run to end.
+                let pc = session.machine.c64_core.reg_pc;
+                return BreakRun {
+                    halted: true,
+                    reason: "device",
+                    which: None,
+                    pc,
+                    cycles_elapsed: session.machine.clk.wrapping_sub(start_clk),
+                };
+            }
             trx64_core::RunStop::CycleBudget | trx64_core::RunStop::Completed => {
                 // Segment finished without a hit; loop re-checks the total budget.
                 if seg_cap != u64::MAX && session.machine.clk == start_clk {

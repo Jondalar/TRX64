@@ -1,11 +1,12 @@
 # Spec 850 — The expansion port as a device interface
 
-**Status:** PROPOSED 2026-09-15
+**Status:** BUILT 2026-09-15 — `expansion_port_gate` 16/16, full gate green (43 gate tests, daemon
+374, seven games 7/7), core lib 295/0; no measurable cost on a stock machine (§7).
 **Repos:** TRX64 (`trx64-core`). Its first user is TRX64's own UCI block on the `u64` profile (Spec 852);
 a host such as UE2 (`u64-emulator/crates/c64-bridge`) may attach a device of its own. C64RE gains nothing.
-**Number:** 850 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`).
-**Depends on:** nothing. With no device attached every hook is an `Option` that is `None`, so a stock
-session stays bit-identical and pays one predicted branch (the BUG-049 discipline).
+**Number:** 850 (registry: `../../../C64ReverseEngineeringMCP/specs/README.md`).
+**Depends on:** nothing. With nothing on the port the port work is skipped behind one flag computed per
+run, so a stock session stays bit-identical and pays nothing measurable (the BUG-049 discipline).
 **Origin:** UE2's `docs/specs/trx64-uci-requirements.md` (R1–R6), written against trx64-core `69c9b30`.
 HEAD is `a448229`, three Spec 843 commits later; none of them touches the lines that document cites
 (re-read 2026-09-15).
@@ -87,8 +88,10 @@ pub trait ExpansionDevice: Send {
 }
 ```
 
+As built the trait also carries `clone_device` (default None) and an `AsAny` supertrait, see §7.
+
 `Machine` gains a port with two places beside `cartridge`: the profile's own device (the UCI block on
-`u64`, Spec 852) and `pub expansion: Option<Box<dyn ExpansionDevice>>` for a host. A read asks the
+`u64`, Spec 852, `port_profile`) and `expansion` for a host, both `PortSlot`s. A read asks the
 profile's device first, and its `Some` wins over the host device and over the cartridge — on the
 hardware the UCI's register answer is tested before cartridge I/O data (`slot_slave.vhd:292-301`).
 Writes and snoops reach both. A 65 536-bit snoop set is built from both devices' `snoop_addresses()`
@@ -204,3 +207,39 @@ and a host device if its cartridge slot wants one. `CartProxy`-without-a-cartrid
 - A host device's state in TRX64's checkpoint ring, rewind or `.c64re` dumps: the device belongs to the
   host, and a restore puts back the machine, not the device. A profile's own device decides for itself
   (Spec 852 D7 for the UCI block).
+- A DMA engine — a device reading and writing the C64 bus while the CPU is held, as an REU does. The
+  hold here runs the chips; it gives the device no bus. That belongs to the REU spec, which ports VICE's
+  `reu.c` (owner, 2026-09-15).
+
+## §7 As built
+
+**Where it lives.** `trx64-core/src/expansion.rs` (the trait, `Access`, `PortLines`, `Hold`, `SnoopSet`,
+`PortSlot`); `full.rs` `port_read`/`port_write`/`port_snoop`/`port_lines`; `full_sc.rs` sets the access
+kind and hands over the stall; `lib.rs` the two places, `attach_expansion`, `set_port_profile_device`,
+`set_expansion_lines`, `set_hold`, `effective_hold`, `run_held`, and `RunStop::Device`;
+`c64_6510core.rs` `INT_SRC_EXPANSION` and the per-cycle sample; `vic.rs` `last_steal_on_bus`; the daemon
+and CLI name the new stop reason `device`. Gate: `crates/trx64-core/tests/expansion_port_gate.rs`, now
+in `scripts/gate.sh`.
+
+**What the build changed against §3.**
+- `Machine` is `Clone`, and a boxed device is not. The places are `PortSlot`s: they behave as the
+  `Option` they wrap, and a cloned machine asks the device for a copy (`clone_device`, default None — a
+  host's device is the host's, and a sandbox copy must not share it; the UCI block will copy itself).
+- `AsAny` lets Spec 852 reach the concrete block behind the profile place (`Machine::uci`).
+- **The first measurement was 6 % slower on a stock machine**, against a claim of "one predicted branch":
+  two interrupt samples per cycle, the port refresh and hold check per instruction, and bookkeeping per
+  bus access. Now all of it sits behind `port_active` — a device, a host line, or an expansion interrupt
+  still pending — computed once per run, since devices and host lines only change between runs. The
+  access kind is `Cpu` standing and only the dummy paths flip it; the stall is written only when the
+  VIC stole cycles.
+- The stall is two counts, per UE2's review. On a badline the gate measures 43 stolen cycles, 3 of them
+  with AEC high.
+- The R5 gate raises the line with a write, as the UCI does once it answers. A line asserted from the
+  first cycle is taken before the program's own `SEI`, through a vector nobody has set yet — that is the
+  machine being right and the first draft of the test being wrong.
+- The R6 gate samples the raster every 21 cycles: a 63-cycle sample lands on one phase of every line and
+  sees line 0 still reading 311.
+
+**Cost, measured.** `perf_bench` pure headless, 30 M cycles, median of seven, the baseline worktree at
+`69c9b30` and the branch alternated to cancel drift: 850 at 11.540 / 11.532 MHz, baseline at 11.473 /
+11.645 MHz. Within noise.

@@ -1183,6 +1183,7 @@ mod tests {
                     m.run_for_full_capped(999_999, 1, &mut null, |_, _, _, _, _, _, _| {});
                 }
                 RunStop::Observer => return (true, m.c64_core.reg_pc, "observer"),
+                RunStop::Device => return (true, m.c64_core.reg_pc, "device"),
                 RunStop::CycleBudget | RunStop::Completed => {}
             }
         }

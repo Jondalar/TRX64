@@ -24,6 +24,7 @@ pub mod delta_ring;
 pub mod drive;
 pub mod drive_6510core;
 pub mod drive_snapshot;
+pub mod expansion;
 pub mod flash040;
 pub mod full;
 pub mod full_sc;
@@ -61,6 +62,7 @@ pub use crash_triage::{
 };
 pub use delta_ring::{CallerChain, DeltaEntry, DeltaRing, LoopOnset, WriteRec};
 pub use drive::Drive1541;
+pub use expansion::{Access, AccessKind, ExpansionDevice, Hold, PortLines, SnoopSet};
 pub use full::{Bank8, BankA, BankE, FullBus, MemConfig};
 pub use iec::IecCore;
 pub use resid_audio::{SidAudioEngine, SidWriteRecord, WavFormat};
@@ -179,6 +181,9 @@ pub enum RunStop {
     /// "at the trigger" state). The CPU is at the instruction boundary AFTER the
     /// watched access.
     Observer,
+    /// Spec 850 D4 — a device on the expansion port asked, during the last instruction,
+    /// for the run to end; honored at the NEXT boundary, like `Observer`.
+    Device,
 }
 
 /// No-op observer. Hooks compile away to nothing when tracing is off.
@@ -532,6 +537,22 @@ pub struct Machine {
     /// for the attach record), or None.
     pub cartridge_image: Option<crate::cart::ParsedCartridgeImage>,
 
+    /// Spec 850 — a host's device on the expansion port, or None. Beside `cartridge`, not
+    /// instead of it: attaching one changes neither `cartridge`, the PLA index, BankInfo,
+    /// the VSF export nor reset behaviour, and no reset ever calls it.
+    pub expansion: crate::expansion::PortSlot,
+    /// Spec 850 — the machine profile's own device on the port (Spec 852's UCI block on
+    /// the `u64` profile), or None. Asked before the host device on every read.
+    pub port_profile: crate::expansion::PortSlot,
+    /// Spec 850 D5 — the union of both devices' snooped addresses; None when empty.
+    pub expansion_snoop: Option<Box<crate::expansion::SnoopSet>>,
+    /// Spec 850 D6 — the IRQ/NMI the host itself drives onto the port (a cartridge's
+    /// lines, say), ORed with the devices' lines on `INT_SRC_EXPANSION`.
+    pub expansion_host_lines: crate::expansion::PortLines,
+    /// Spec 850 D7 — the host's hold on the 6510, or None. A device's `hold` line holds
+    /// the CPU too; see [`Machine::effective_hold`].
+    pub hold: Option<crate::expansion::Hold>,
+
     /// Always-on CPU-history ring (reverse-debug Phase 1a). Fed per retired
     /// instruction from `run_for_full_capped_dbg` (the single full-machine choke
     /// point) so the monitor `chis` verb has the last N executed instructions LIVE,
@@ -711,6 +732,11 @@ impl Machine {
             drive_c64_ref: 0,
             cartridge: None,
             cartridge_image: None,
+            expansion: crate::expansion::PortSlot::default(),
+            port_profile: crate::expansion::PortSlot::default(),
+            expansion_snoop: None,
+            expansion_host_lines: crate::expansion::PortLines::default(),
+            hold: None,
             cpu_history: crate::cpu_history::CpuHistoryRing::new(),
             delta_ring: crate::delta_ring::DeltaRing::new(),
             head_trace_armed: false,
@@ -1146,6 +1172,7 @@ impl Machine {
     /// persisted back exactly as `run_for_full_capped_dbg` does after an instruction.
     pub fn write_full(&mut self, addr: u16, val: u8) {
         let table = self.cia_table.clone();
+        let port_active = self.port_active();
         let mut fb = full::FullBus {
             ram: &mut self.ram,
             basic_rom: &self.basic_rom,
@@ -1179,6 +1206,15 @@ impl Machine {
             // enter the cart read-set.
             cart_reads: None,
             cart_account_suspend: false,
+            port_profile: self.port_profile.as_mut(),
+            port_host: self.expansion.as_mut(),
+            snoop: self.expansion_snoop.as_deref(),
+            access_kind: crate::expansion::AccessKind::Host,
+            stalled: 0,
+            stalled_on_bus: 0,
+            device_stop: false,
+            host_lines: self.expansion_host_lines,
+            port_active,
         };
         fb.write(addr, val);
         self.memconfig = fb.config;
@@ -1197,6 +1233,7 @@ impl Machine {
     /// Goes through `FullBus::read`, the same code the CPU executes.
     pub fn read_full_live(&mut self, addr: u16) -> u8 {
         let table = self.cia_table.clone();
+        let port_active = self.port_active();
         let mut fb = full::FullBus {
             ram: &mut self.ram,
             basic_rom: &self.basic_rom,
@@ -1228,6 +1265,15 @@ impl Machine {
             // enter the cart read-set.
             cart_reads: None,
             cart_account_suspend: false,
+            port_profile: self.port_profile.as_mut(),
+            port_host: self.expansion.as_mut(),
+            snoop: self.expansion_snoop.as_deref(),
+            access_kind: crate::expansion::AccessKind::Host,
+            stalled: 0,
+            stalled_on_bus: 0,
+            device_stop: false,
+            host_lines: self.expansion_host_lines,
+            port_active,
         };
         let v = fb.read(addr);
         self.memconfig = fb.config;
@@ -1235,6 +1281,145 @@ impl Machine {
         self.port_data = fb.port_data;
         self.cia2_pa_out = fb.cia2_pa_out;
         v
+    }
+
+    // ── Spec 850 — the expansion port ───────────────────────────────────────────────
+
+    /// Attach a host device to the expansion port and return the one it replaces.
+    pub fn attach_expansion(
+        &mut self,
+        dev: Box<dyn crate::expansion::ExpansionDevice>,
+    ) -> Option<Box<dyn crate::expansion::ExpansionDevice>> {
+        let old = self.expansion.replace(dev);
+        self.refresh_expansion_snoop();
+        old
+    }
+
+    pub fn detach_expansion(&mut self) -> Option<Box<dyn crate::expansion::ExpansionDevice>> {
+        let old = self.expansion.take();
+        self.refresh_expansion_snoop();
+        old
+    }
+
+    /// Install or remove the machine profile's own device (Spec 852's UCI block).
+    pub fn set_port_profile_device(
+        &mut self,
+        dev: Option<Box<dyn crate::expansion::ExpansionDevice>>,
+    ) -> Option<Box<dyn crate::expansion::ExpansionDevice>> {
+        let old = std::mem::replace(&mut *self.port_profile, dev);
+        self.refresh_expansion_snoop();
+        old
+    }
+
+    /// Rebuild the snoop set from both devices. Called on attach; call it again if a
+    /// device changes the addresses it snoops.
+    pub fn refresh_expansion_snoop(&mut self) {
+        let mut set = crate::expansion::SnoopSet::default();
+        for dev in [self.port_profile.as_ref(), self.expansion.as_ref()].into_iter().flatten() {
+            for &addr in dev.snoop_addresses() {
+                set.insert(addr);
+            }
+        }
+        self.expansion_snoop = if set.is_empty() { None } else { Some(Box::new(set)) };
+    }
+
+    /// Spec 850 D6 — the IRQ/NMI the host itself drives onto the port. Takes effect at the
+    /// next instruction boundary.
+    pub fn set_expansion_lines(&mut self, irq: bool, nmi: bool) {
+        self.expansion_host_lines.irq = irq;
+        self.expansion_host_lines.nmi = nmi;
+    }
+
+    /// The port's lines now: the host's own, ORed with both devices'.
+    pub fn expansion_lines(&self) -> crate::expansion::PortLines {
+        let mut lines = self.expansion_host_lines;
+        if let Some(dev) = self.port_profile.as_ref() {
+            lines = lines.or(dev.lines());
+        }
+        if let Some(dev) = self.expansion.as_ref() {
+            lines = lines.or(dev.lines());
+        }
+        lines
+    }
+
+    /// Spec 850 — whether the port has anything to say this run: a device, a host line,
+    /// or an expansion interrupt still pending from before. False on a stock machine, and
+    /// then the per-cycle and per-instruction port work is skipped.
+    #[inline]
+    fn port_active(&self) -> bool {
+        self.port_profile.is_some()
+            || self.expansion.is_some()
+            || self.expansion_host_lines != crate::expansion::PortLines::default()
+            || self.c64_int.pending_int[c64_6510core::INT_SRC_EXPANSION] != 0
+    }
+
+    /// Spec 850 D7 — hold or release the 6510 from the host.
+    pub fn set_hold(&mut self, hold: Option<crate::expansion::Hold>) {
+        self.hold = hold;
+    }
+
+    /// The hold in force: the host's, else `Cpu` while a device holds its line.
+    pub fn effective_hold(&self) -> Option<crate::expansion::Hold> {
+        self.hold
+            .or_else(|| self.expansion_lines().hold.then_some(crate::expansion::Hold::Cpu))
+    }
+
+    /// Spec 850 D3 — `$DE00-$DFFF` without side effects: the cartridge's peek, then the
+    /// profile's device, then the host's, then the open bus.
+    fn port_peek(&self, addr: u16) -> u8 {
+        let cart = self.cart_peek_byte(addr);
+        let mut answer = None;
+        if let Some(dev) = self.port_profile.as_ref() {
+            answer = dev.peek(addr, cart);
+        }
+        if let Some(dev) = self.expansion.as_ref() {
+            answer = answer.or(dev.peek(addr, cart));
+        }
+        answer.or(cart).unwrap_or(self.vic.last_read_phi1)
+    }
+
+    /// Spec 850 D7 — advance `cycles` with the 6510 held, per cycle as the SC bus's
+    /// `clk_inc` + `vic_cycle` do, the CPU registers untouched. `Cpu`: VIC, CIAs, SID and
+    /// drive 8 run. `Reset`: the VIC alone; the drive's reference is moved along so the
+    /// next run does not fast-forward it through the hold.
+    ///
+    /// Port reference: VICE holds the CPU for DMA by stealing cycles while the chips run
+    /// (`mainc64cpu.c:122-125`) and services `IK_DMA` at the boundary (`6510core.c:523`).
+    fn run_held(&mut self, hold: crate::expansion::Hold, cycles: u64) {
+        let table = self.cia_table.clone();
+        let start = self.c64_core.clk;
+        let end = start.wrapping_add(cycles);
+        let chips = hold == crate::expansion::Hold::Cpu;
+        while self.c64_core.clk < end {
+            self.c64_core.clk = self.c64_core.clk.wrapping_add(1);
+            let clk = self.c64_core.clk;
+            let vbank = self.vic_bank_base();
+            let view = crate::vic::VicMemView {
+                ram: &self.ram,
+                char_rom: Some(&self.char_rom),
+                color_ram: &self.io_shadow[0x0800..0x0c00],
+                vbank,
+            };
+            self.vic.tick(&view);
+            if chips {
+                self.cia1.clk = clk;
+                self.cia2.clk = clk;
+                self.cia1.tick(&table);
+                self.cia2.tick(&table);
+            }
+        }
+        let clk = self.c64_core.clk;
+        if chips {
+            self.cia1.update_to(clk, &table);
+            self.cia2.update_to(clk, &table);
+            self.sid.tick(clk.wrapping_sub(start), &self.sid_regs);
+            self.drive8.iec_drv_port = self.iec.iecbus.drv_port;
+            self.drive8.iec_cpu_bus = self.iec.iecbus.cpu_bus;
+            self.drive_c64_ref = self.drive8.catch_up_to(clk, self.drive_c64_ref);
+            self.iec.iec_drive_write((!self.drive8.via1_pb_iec_output()) & 0xff, 0);
+        } else {
+            self.drive_c64_ref = clk;
+        }
     }
 
     /// Set the program counter (CPU-isolated: no boot, atomic PC write).
@@ -1628,7 +1813,9 @@ impl Machine {
                         // from the other side: the readback that was supposed to
                         // settle an argument showed the last value written and
                         // never the truth, so it hid the evidence instead.
-                        _ => self.vic.last_read_phi1,
+                        // Spec 850 D3 — the cartridge's side-effect-free peek and the
+                        // port's devices before that open bus.
+                        _ => self.port_peek(addr),
                     }
                 } else if self.memconfig.char_rom {
                     self.char_rom[(addr as usize) - 0xd000]
@@ -1659,12 +1846,9 @@ impl Machine {
     ///          else raw RAM (memory-bus.ts `peekRom`).
     ///   io   → side-effect-free I/O register peek for $D000-$DFFF, else raw RAM
     ///          (memory-bus.ts `peekIo`).
-    ///   cart → cartridge ROM byte for the cart windows + cart IO ($DE00-$DFFF)
-    ///          via the mapper's side-effect-free peek, else open bus / RAM
-    ///          (memory-bus.ts `peekCart`). TRX64 cart mappers expose no
-    ///          side-effect-free peek yet, so this is best-effort: cart IO pages
-    ///          fall back to the I/O shadow and cart ROM windows to raw RAM
-    ///          (documented limit, same spirit as the TS fallback).
+    ///   cart → cart IO ($DE00-$DFFF) through the mapper's side-effect-free
+    ///          `CartMapper::peek` and the expansion port's devices (Spec 850 D3),
+    ///          else the open bus; outside it, raw RAM (memory-bus.ts `peekCart`).
     pub fn peek_lens(&self, addr: u16, lens: &str) -> u8 {
         match lens {
             "ram" => self.ram[addr as usize],
@@ -1688,18 +1872,17 @@ impl Machine {
                         // from the other side: the readback that was supposed to
                         // settle an argument showed the last value written and
                         // never the truth, so it hid the evidence instead.
-                        _ => self.vic.last_read_phi1,
+                        _ => self.port_peek(addr),
                     }
                 } else {
                     self.ram[addr as usize]
                 }
             }
-            // cart: best-effort fallback (no side-effect-free mapper peek yet).
-            // With no mapper answering, the honest value is the open bus, not the
-            // write-through shadow — see the `io` lens above.
+            // cart: the mapper's side-effect-free peek, then the port's devices (Spec
+            // 850 D3), then the open bus — never the write-through shadow.
             "cart" => {
                 if (0xde00..=0xdfff).contains(&addr) {
-                    self.vic.last_read_phi1
+                    self.port_peek(addr)
                 } else {
                     self.ram[addr as usize]
                 }
@@ -1985,19 +2168,21 @@ impl Machine {
     /// FULL-MACHINE run with an explicit instruction cap.
     ///
     /// Plain (no-debug) entry point: delegates to [`run_for_full_capped_dbg`] with
-    /// no breakpoints/watch armed. All pre-existing callers stay source-compatible;
-    /// the `RunStop` is discarded and the hot path is byte-identical (the `None`
-    /// gates monomorphize away).
+    /// no breakpoints/watch armed. Returns the `RunStop` (Spec 850: a device on the
+    /// expansion port can end a run, and the caller has to be able to tell that from a
+    /// spent budget); a caller that ignores it compiles unchanged, and the hot path is
+    /// byte-identical (the `None` gates monomorphize away).
     pub fn run_for_full_capped<O: Observer, F>(
         &mut self,
         budget: u64,
         max_instructions: u64,
         obs: &mut O,
         on_drive_step: F,
-    ) where
+    ) -> RunStop
+    where
         F: FnMut(u16, u8, u8, u8, u8, u8, u64),
     {
-        self.run_for_full_capped_dbg(budget, max_instructions, None, None, None, obs, on_drive_step);
+        self.run_for_full_capped_dbg(budget, max_instructions, None, None, None, obs, on_drive_step)
     }
 
     /// Debug-capable variant of [`run_for_full_capped`]. Adds three gates, all
@@ -2035,6 +2220,11 @@ impl Machine {
         // the right rclk.
         self.cia1.clk = self.c64_core.clk;
         self.cia2.clk = self.c64_core.clk;
+        // Spec 850 — devices and host lines only change between runs, so this holds for
+        // the whole loop; on a stock machine every port step below is skipped.
+        let port_active = self.port_active();
+        // A host hold, like the devices, only changes between runs.
+        let hold_possible = port_active || self.hold.is_some();
         loop {
             // TOP-of-body checks in the TS order (integrated-session.ts:972-984):
             // instruction cap (for-guard) FIRST, then breakpoint → cycle-budget →
@@ -2044,6 +2234,19 @@ impl Machine {
             // which is unobservable — both just break the loop).
             if executed >= max_instructions {
                 break;
+            }
+            // Spec 850 D7 — a held 6510 does not execute. The rest of the machine runs out
+            // the cycle budget; a breakpoint or the instruction cap mean nothing while
+            // nothing executes.
+            if hold_possible {
+                if let Some(hold) = self.effective_hold() {
+                    let elapsed = self.c64_core.clk.wrapping_sub(start);
+                    if elapsed < budget {
+                        self.run_held(hold, budget - elapsed);
+                    }
+                    stop = RunStop::CycleBudget;
+                    break;
+                }
             }
             let pc = self.c64_core.reg_pc;
             if let Some(bp) = breakpoints {
@@ -2081,6 +2284,13 @@ impl Machine {
             self.c64_int.set_irq(c64_6510core::INT_SRC_VIC, self.vic.irq_line, now);
             self.c64_int.set_irq(c64_6510core::INT_SRC_CIA1, self.cia1.irq_asserted(), now);
             self.c64_int.set_nmi(c64_6510core::INT_SRC_CIA2, self.cia2.irq_asserted(), now);
+            // Spec 850 D6 — the expansion port's lines on their own source; the per-cycle
+            // sample inside `clk_inc` catches a change in the middle of an instruction.
+            if port_active {
+                let port = self.expansion_lines();
+                self.c64_int.set_irq(c64_6510core::INT_SRC_EXPANSION, port.irq, now);
+                self.c64_int.set_nmi(c64_6510core::INT_SRC_EXPANSION, port.nmi, now);
+            }
 
             // Run a whole instruction over the SC bus (the verbatim core threads the
             // VIC tick + BA steal + interrupt-delay counters into every access).
@@ -2123,6 +2333,15 @@ impl Machine {
                         None
                     },
                     cart_account_suspend: false,
+                    port_profile: self.port_profile.as_mut(),
+                    port_host: self.expansion.as_mut(),
+                    snoop: self.expansion_snoop.as_deref(),
+                    access_kind: crate::expansion::AccessKind::Cpu,
+                    stalled: 0,
+                    stalled_on_bus: 0,
+                    device_stop: false,
+                    host_lines: self.expansion_host_lines,
+                    port_active,
                 };
                 let mut bus = full_sc::FullScBus {
                     fb,
@@ -2145,6 +2364,9 @@ impl Machine {
                 // so the machine state is consistent, then break after the iteration.
                 if bus.halt_requested {
                     stop = RunStop::Observer;
+                }
+                if port_active && bus.fb.device_stop {
+                    stop = RunStop::Device;
                 }
                 // Persist bus-mutated banking/port state back to the Machine.
                 self.memconfig = bus.fb.config;
@@ -2209,7 +2431,7 @@ impl Machine {
             // boundary AFTER the post-instruction drive/SID sync (= TS
             // integrated-session.ts:989-992: haltRequested honored after
             // stepC64Instruction, with the machine left in the post-access state).
-            if stop == RunStop::Observer {
+            if stop == RunStop::Observer || stop == RunStop::Device {
                 break;
             }
         }

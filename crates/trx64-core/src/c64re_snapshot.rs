@@ -548,10 +548,13 @@ pub fn restore_iec(m: &mut Machine, s: &IecSnapshot) {
 }
 
 /// Canonical c64re maincpu interrupt-source names, in TRX64's `pending_int[]`
-/// index order (c64_6510core.rs INT_SRC_*: VIC=0, CIA1=1, CIA2=2, RESTORE=3).
-/// The c64re side restores `intNames`/`pendingInt` wholesale (kernel restore
-/// line 1037-1038), so emitting a fixed-order array round-trips both ways.
-const INT_SOURCE_NAMES: [&str; 4] = ["vic-irq", "CIA1", "CIA2", "restore-nmi"];
+/// index order (c64_6510core.rs INT_SRC_*: VIC=0, CIA1=1, CIA2=2, RESTORE=3,
+/// EXPANSION=4). The c64re side restores `intNames`/`pendingInt` wholesale (kernel
+/// restore line 1037-1038), so emitting a fixed-order array round-trips both ways.
+/// Spec 850 added "expansion"; a dump written before it has no such name, and the
+/// restore by name below leaves that slot clear.
+const INT_SOURCE_NAMES: [&str; crate::c64_6510core::C64_NUM_INT_SOURCES] =
+    ["vic-irq", "CIA1", "CIA2", "restore-nmi", "expansion"];
 
 /// Read TRX64's `c64_int` (distilled IntStatus) into the c64re `cpuIntStatus`
 /// shape. The c64re model is a name-indexed list; TRX64 is a fixed [u32;4] per
@@ -579,7 +582,7 @@ pub fn capture_int_status(m: &Machine) -> IntStatusSnapshot {
 pub fn restore_int_status(m: &mut Machine, s: &IntStatusSnapshot) {
     let cs = &mut m.c64_int;
     // Map by name when names are present (cross-runtime); else positional.
-    let mut pend = [0u32; 4];
+    let mut pend = [0u32; crate::c64_6510core::C64_NUM_INT_SOURCES];
     if s.int_names.len() == s.pending_int.len() && !s.int_names.is_empty() {
         for (name, &p) in s.int_names.iter().zip(s.pending_int.iter()) {
             if let Some(idx) = INT_SOURCE_NAMES.iter().position(|n| n == name) {
@@ -587,7 +590,7 @@ pub fn restore_int_status(m: &mut Machine, s: &IntStatusSnapshot) {
             }
         }
     } else {
-        for (i, &p) in s.pending_int.iter().enumerate().take(4) {
+        for (i, &p) in s.pending_int.iter().enumerate().take(crate::c64_6510core::C64_NUM_INT_SOURCES) {
             pend[i] = p as u32;
         }
     }
@@ -1445,7 +1448,7 @@ mod tests {
         m.vic.regs[0x11] = 0x1b;
         m.vic.raster_line = 100;
         m.c64_int.nirq = 1;
-        m.c64_int.pending_int = [0, 0x02, 0, 0];
+        m.c64_int.pending_int = [0, 0x02, 0, 0, 0];
         m.keyboard.key_down("A");
 
         let cp = capture_runtime_checkpoint(&m, "/tmp/x.g64", "g64", None, None, None, None);
@@ -1726,14 +1729,14 @@ mod tests {
     #[test]
     fn int_status_roundtrip_by_name() {
         let mut m = Machine::new();
-        m.c64_int.pending_int = [0, 0x02, 0, 0]; // CIA1 IRQ asserted
+        m.c64_int.pending_int = [0, 0x02, 0, 0, 0]; // CIA1 IRQ asserted
         m.c64_int.nirq = 1;
         m.c64_int.irq_delay_cycles = 3;
         m.c64_int.global_pending_int = 0x42;
 
         let snap = capture_int_status(&m);
-        assert_eq!(snap.int_names, vec!["vic-irq", "CIA1", "CIA2", "restore-nmi"]);
-        assert_eq!(snap.pending_int, vec![0, 0x02, 0, 0]);
+        assert_eq!(snap.int_names, vec!["vic-irq", "CIA1", "CIA2", "restore-nmi", "expansion"]);
+        assert_eq!(snap.pending_int, vec![0, 0x02, 0, 0, 0]);
         assert_eq!(snap.nirq, 1);
 
         // Simulate a c64re dump with a DIFFERENT source order.
