@@ -77,7 +77,7 @@ printf '[2/4] rust gate tests (iso_vic + vic_collision + cart_mapper + expansion
 command -v cargo >/dev/null 2>&1 || die_red "cargo not on PATH — cannot run gate tests" ""
 TLOG=$(mktmp)
 if cargo test --release -p trx64-core \
-     --test iso_vic_gate --test vic_collision_gate --test cart_mapper_gate --test expansion_port_gate \
+     --test iso_vic_gate --test vic_collision_gate --test cart_mapper_gate --test expansion_port_gate --test u64_turbo_gate \
      >"$TLOG" 2>&1; then
   green "unit gates: $(grep -cE 'test result: ok' "$TLOG") suites ok ($(grep -oE '[0-9]+ passed' "$TLOG" | awk '{s+=$1} END{print s}') tests)"
 else

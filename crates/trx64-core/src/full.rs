@@ -379,6 +379,10 @@ impl<'a> FullBus<'a> {
     fn io_read(&mut self, addr: u16) -> u8 {
         match addr {
             0xd000..=0xd3ff => {
+                // Spec 851 — the U64's SuperCPU detection sits at a full address.
+                if let Some(v) = self.vic.u64_extra_read(addr) {
+                    return v;
+                }
                 // $D01E (sprite-sprite) / $D01F (sprite-background) collision
                 // registers (mirrored every $40): compute the live collision
                 // latches from the current frozen state, fire the collision IRQ on

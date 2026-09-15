@@ -112,10 +112,10 @@ enum Command {
         /// a `.crt`. Omit (or `auto`/`crt`) to auto-detect.
         #[arg(long = "cart-type")]
         cart_type: Option<String>,
-        /// Spec 815 — which machine this claims to be (`c64` | `128` | `u64`), so a
-        /// routine that PROBES for a turbo machine can be exercised here instead of
-        /// only through a full boot.
-        #[arg(long)]
+        /// Spec 815/851 — which machine this is (`c64` | `128` | `u64`), so a routine
+        /// that PROBES for a turbo machine can be exercised here instead of only through
+        /// a full boot. `--machine` is the same flag.
+        #[arg(long, visible_alias = "machine")]
         turbo: Option<String>,
         /// Attach a disk on the cold machine (.d64/.g64; for a drive-reading routine).
         #[arg(long)]
@@ -313,12 +313,12 @@ enum Command {
         /// before taking a turbo code path: `c64` (default), `128` (the VIC-IIe
         /// $D02F/$D030 pair), `u64` (an extended $D031). On a plain C64 those reads
         /// are $FF, the probe fails, and the whole turbo half of the release is
-        /// never reached.
-        #[arg(long, default_value = "c64")]
+        /// never reached. `--machine` is the same flag (Spec 851).
+        #[arg(long, default_value = "c64", visible_alias = "machine")]
         turbo: String,
         /// Set the speed bit right after mounting, as the release would. Needs
-        /// --turbo 128 or u64. NOTE it is stored, not acted on: the CPU still runs
-        /// at 1 MHz (Spec 815 §3).
+        /// --turbo 128 or u64. On u64 the CPU really runs faster (Spec 851, 4 MHz);
+        /// on 128 the bit is stored only (Spec 815 §3).
         #[arg(long, default_value_t = false)]
         turbo_on: bool,
     },

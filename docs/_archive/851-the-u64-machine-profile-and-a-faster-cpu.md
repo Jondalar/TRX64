@@ -1,8 +1,10 @@
 # Spec 851 — The U64 machine profile, and a CPU that is actually faster
 
-**Status:** PROPOSED 2026-09-15
+**Status:** BUILT 2026-09-16 — `u64_turbo_gate` 9/9, full gate green (52 gate tests, daemon 376,
+seven games 7/7), core lib 295/0; 1 MHz costs nothing measurable (§8). The UCI block the `u64` profile
+carries is Spec 852.
 **Repos:** TRX64 (`trx64-core`, `trx64-daemon`, `trx64-cli`). UE2 maps the firmware's speed settings onto it.
-**Number:** 851 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`).
+**Number:** 851 (registry: `../../../C64ReverseEngineeringMCP/specs/README.md`).
 **Depends on:** Spec 815 (it extends the profile 815 built and replaces its §6 limit "does not make the
 CPU faster"). The `u64` profile contains the UCI block of Spec 852, which sits on Spec 850's port.
 **Origin:** the owner, 2026-09-15, on the UCI requirements: "ein Startparameter --mode UE2 oder so wäre
@@ -124,3 +126,30 @@ and ue2emu runs turbo.
 - A 65816 or SuperCPU memory map. `$D0BC` answers the detection probe; nothing behind it exists.
 - Anything in the closed U64 core beyond the firmware and the manual. Every assumption above names the
   measurement that would replace it.
+
+## §8 As built
+
+**Where it lives.** `vic.rs`: `U64SpeedTable`, the enable word and preferred speed on the VIC
+(`u64_regs_en`, `u64_speed_prefer`, `u64_d031_written`), `u64_speed()`, `u64_extra_read()` for
+`$D0BC-$D0BF`. `c64_6510core.rs`: `turbo_div`/`turbo_phase`/`turbo_badline` and the divider in
+`clk_inc`, the badline skip in `check_ba`. `lib.rs`: `set_machine_profile`, `set_u64_turbo`,
+`set_u64_speed_table`, `turbo_divider`, the divider refreshed at each instruction boundary, the settings
+carried across `warm_reset`, `run_for_full`'s instruction cap scaled by the divider. Daemon:
+`--machine`, `--speed-table`, the dump manifest's `machine_model` (`u64-pal`), undump restoring the
+profile. CLI: `--machine` as an alias of `--turbo`. Gate: `crates/trx64-core/tests/u64_turbo_gate.rs`,
+in `scripts/gate.sh`.
+
+**What the build settled.**
+- A run capped by instructions ends early at turbo speed: every `budget / 2 + 1000` cap in the core,
+  the daemon's breakpoint segment and the observer registry now scales by `turbo_divider()`.
+- `turbo on` writes `$83` (4 MHz, badline timing), not 815's `$0e`: the bit now really speeds the CPU
+  up, and 48 MHz behind a monitor verb is a surprise, not a test.
+- The dump manifest said `c64-pal` for every machine. It names the profile now, and undump sets the
+  claim without touching the restored VIC registers. The enable word and preferred speed are not in the
+  dump; a restored `u64` session starts from the menu default.
+- Interrupt delays stay counted in PHI2 cycles, as in VICE's TurboMaster.
+
+**Measured.** 4 MHz runs 7138 loops per frame against 1785 at 1 MHz (3.999×). Badline timing off at 4
+MHz: 7138 against 6748 with it. At 16 MHz CIA1 timer A and the raster agree with 1 MHz at the same
+`clk`; a raster IRQ is taken and returned from at 48 MHz. `perf_bench` pure headless, alternated with the
+850 baseline: 11.525 / 11.394 MHz against 11.450 / 11.433 MHz.

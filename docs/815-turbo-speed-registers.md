@@ -146,5 +146,9 @@ after.
   sets the speed bit takes its turbo code path, and its timing tables are then wrong
   in a way the real machine would not be. That is a limitation to state, not to hide
   — and it is not fixable by half: a 2 MHz core is its own piece of work.
+  **Superseded for `u64` by Spec 851** (2026-09-16): that profile's CPU now runs at the
+  speed the firmware's layout selects, and `$D031` reads speed index | badline timing
+  << 7 — this spec read any non-zero value as engaged, so `$80` (1 MHz) counted as
+  turbo. The `128` profile still stores its bit and nothing more.
 - **It does not emulate a C128.** No VDC, no 80 columns, no MMU, no native mode.
   This is a C64 that answers the probes a C64 release makes.

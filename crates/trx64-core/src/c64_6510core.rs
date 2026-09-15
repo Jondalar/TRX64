@@ -649,6 +649,15 @@ pub struct C64Core6510 {
     pub last_opcode_addr: u16,
     /// maincpu_jammed (m64:515).
     pub is_jammed: bool,
+
+    /// Spec 851 D3 — CPU cycles per PHI2 cycle (1 = a 1 MHz 6510). Port of VICE's
+    /// TurboMaster (`turbomaster.c:338-349`): the CPU counts its own cycles and advances
+    /// `clk` — the PHI2 clock everything else is keyed on — only on every Nth.
+    pub turbo_div: u32,
+    pub turbo_phase: u32,
+    /// Spec 851 — badline timing: with it the CPU waits out a BA stall like a 6510; without
+    /// it a turbo CPU runs through.
+    pub turbo_badline: bool,
 }
 
 impl Default for C64Core6510 {
@@ -677,6 +686,9 @@ impl C64Core6510 {
             last_opcode_info: 0,
             last_opcode_addr: 0,
             is_jammed: false,
+            turbo_div: 1,
+            turbo_phase: 0,
+            turbo_badline: true,
         }
     }
 
@@ -810,6 +822,16 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
     /// irq_delay_cycles / nmi_delay_cycles when the matching *_clk <= clk.
     #[inline]
     fn clk_inc(&mut self) {
+        // Spec 851 D3 — `turbomaster_clk_inc`: below the divider this CPU cycle is not a
+        // PHI2 cycle — no alarms, no line samples, no clk, no VIC tick. The interrupt delay
+        // stays counted in PHI2 cycles, as in VICE's TurboMaster.
+        if self.core.turbo_div > 1 {
+            self.core.turbo_phase += 1;
+            if self.core.turbo_phase < self.core.turbo_div {
+                return;
+            }
+            self.core.turbo_phase = 0;
+        }
         // interrupt_delay() — m64:97-110.
         let clk = self.core.clk;
         self.bus.interrupt_delay_alarms(clk);
@@ -856,6 +878,10 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
     /// LOAD_CHECK_BA_LOW context for SH*.
     #[inline]
     fn check_ba(&mut self) {
+        // Spec 851 — without badline timing a turbo CPU does not wait for the VIC.
+        if self.core.turbo_div > 1 && !self.core.turbo_badline {
+            return;
+        }
         let mut loi = self.core.last_opcode_info;
         let stolen = self.bus.check_ba(&mut loi, false);
         self.core.last_opcode_info = loi;
@@ -866,6 +892,9 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
     /// by the SH* stores so maincpu_steal_cycles can set ENABLES_IRQ on a steal.
     #[inline]
     fn check_ba_low(&mut self) {
+        if self.core.turbo_div > 1 && !self.core.turbo_badline {
+            return;
+        }
         let mut loi = self.core.last_opcode_info;
         let stolen = self.bus.check_ba(&mut loi, true);
         self.core.last_opcode_info = loi;

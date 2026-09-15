@@ -668,7 +668,11 @@ impl SpeedProfile {
         match s.trim().to_ascii_lowercase().as_str() {
             "c64" | "64" | "off" | "none" => Some(Self::C64),
             "c128" | "128" | "c128-c64mode" => Some(Self::C128),
-            "u64" | "c64u" | "ultimate" | "turbo" => Some(Self::U64),
+            // Spec 851 — U64, Elite II and C64 Ultimate are one machine here; UE2 is that
+            // machine with a firmware behind it, not another one.
+            "u64" | "c64u" | "ultimate" | "turbo" | "ue2" | "u64ii" | "u64-ii" | "c64-ultimate" => {
+                Some(Self::U64)
+            }
             _ => None,
         }
     }
@@ -677,6 +681,37 @@ impl SpeedProfile {
             Self::C64 => "c64",
             Self::C128 => "128",
             Self::U64 => "u64",
+        }
+    }
+}
+
+/// Spec 851 — the Ultimates differ in their CPU speed table only (`u64_config.cc:321-322`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum U64SpeedTable {
+    /// The first Ultimate 64: 1 2 3 4 5 6 8 10 12 14 16 20 24 32 40 48 MHz.
+    U64,
+    /// U64 Elite II and C64 Ultimate: 1 2 3 4 6 8 10 12 14 16 20 24 32 40 48 64 MHz.
+    #[default]
+    U64II,
+}
+
+impl U64SpeedTable {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "u64" | "u64e" | "elite" => Some(Self::U64),
+            "u64ii" | "u64-ii" | "elite2" | "c64u" | "ultimate" => Some(Self::U64II),
+            _ => None,
+        }
+    }
+
+    /// MHz for a speed index, 1 MHz standing for one PHI2 cycle.
+    pub fn mhz(self, index: u8) -> u32 {
+        const U64: [u32; 16] = [1, 2, 3, 4, 5, 6, 8, 10, 12, 14, 16, 20, 24, 32, 40, 48];
+        const U64II: [u32; 16] = [1, 2, 3, 4, 6, 8, 10, 12, 14, 16, 20, 24, 32, 40, 48, 64];
+        let i = usize::from(index.min(15));
+        match self {
+            Self::U64 => U64[i],
+            Self::U64II => U64II[i],
         }
     }
 }
@@ -701,6 +736,17 @@ pub struct VicII {
     /// implementation, and guessing would put behaviour here that exists nowhere
     /// else.
     pub fastmode: u8,
+    /// Spec 851 — the firmware's enable word `C64_TURBOREGS_EN` (`u64_config.cc:1631`): bit 0
+    /// the U64 turbo register `$D031`, bit 1 SuperCPU detection at `$D0BC`, bit 2 the
+    /// TurboEnable bit `$D030`. A firmware setting, so a C64 reset keeps it.
+    pub u64_regs_en: u8,
+    /// Spec 851 — `C64_SPEED_PREFER` (`u64_config.cc:1630`): bits 0-6 speed index, bit 7
+    /// badline timing. `$80` is the menu's "Off".
+    pub u64_speed_prefer: u8,
+    /// Spec 851 — `$D031` has been written since the last reset; until then it reads, and
+    /// runs at, the preferred speed.
+    pub u64_d031_written: bool,
+    pub u64_speed_table: U64SpeedTable,
 
     /// Cycle # within the current line (vicii.raster_cycle), 0..62 PAL.
     pub raster_cycle: u16,
@@ -874,6 +920,10 @@ impl VicII {
             regs: [0u8; 0x40],
             speed_profile: SpeedProfile::C64,
             fastmode: 0,
+            u64_regs_en: 0x01,
+            u64_speed_prefer: 0x80,
+            u64_d031_written: false,
+            u64_speed_table: U64SpeedTable::U64II,
             raster_cycle: 0,
             cycle_flags: 0,
             raster_line: 0,
@@ -1884,9 +1934,16 @@ impl VicII {
                 self.regs[0x30] = value | 0xfc;
                 self.fastmode = value & 1;
             }
-            0x31 if self.speed_profile == SpeedProfile::U64 => {
+            // Spec 851 — the U64's turbo registers, each only with its bit in the
+            // firmware's enable word. `$D031` is speed index | badline timing << 7: bit 7
+            // is not speed, so `$80` (1 MHz, badline timing) is not turbo — 815 read any
+            // non-zero value as engaged.
+            0x30 if self.speed_profile == SpeedProfile::U64 && self.u64_regs_en & 0x04 != 0 => {
+                self.regs[0x30] = value | 0xfc;
+            }
+            0x31 if self.speed_profile == SpeedProfile::U64 && self.u64_regs_en & 0x01 != 0 => {
                 self.regs[0x31] = value;
-                self.fastmode = u8::from(value != 0);
+                self.u64_d031_written = true;
             }
             // default — unused (vicii-mem.c:333 `/* unused */ break`). VICE does
             // NOT write the reg file here; addr is already masked to 0x3f so all
@@ -1983,8 +2040,50 @@ impl VicII {
             0x30 if self.speed_profile == SpeedProfile::C128 => self.regs[0x30] | 0xfc,
             // The extended speed register: readable (so the type-2 probe resolves)
             // while $D030 stays open bus, which is what that probe distinguishes on.
-            0x31 if self.speed_profile == SpeedProfile::U64 => self.regs[0x31],
+            // Spec 851 — read-back is not documented anywhere open: `$D030` reads bit 0
+            // with VICE's VIC-IIe mask, `$D031` the whole byte. Assumptions, gated.
+            0x30 if self.speed_profile == SpeedProfile::U64 && self.u64_regs_en & 0x04 != 0 => {
+                self.regs[0x30] | 0xfc
+            }
+            0x31 if self.speed_profile == SpeedProfile::U64 && self.u64_regs_en & 0x01 != 0 => {
+                self.u64_d031()
+            }
             _ => 0xff,
+        }
+    }
+
+    /// Spec 851 — `$D031` as it reads: the last write, or the preferred speed before one.
+    pub fn u64_d031(&self) -> u8 {
+        if self.u64_d031_written {
+            self.regs[0x31]
+        } else {
+            self.u64_speed_prefer
+        }
+    }
+
+    /// Spec 851 D2 — the speed the Ultimate runs at: (speed index, badline timing).
+    /// `$D031` while its enable bit is set, else the preferred speed; in TurboEnable mode
+    /// `$D030` bit 0 switches between that and 1 MHz. A plain C64 is (0, true).
+    pub fn u64_speed(&self) -> (u8, bool) {
+        if self.speed_profile != SpeedProfile::U64 {
+            return (0, true);
+        }
+        let base = if self.u64_regs_en & 0x01 != 0 { self.u64_d031() } else { self.u64_speed_prefer };
+        let v = if self.u64_regs_en & 0x04 != 0 && self.regs[0x30] & 0x01 == 0 { base & 0x80 } else { base };
+        (v & 0x7f, v & 0x80 != 0)
+    }
+
+    /// Spec 851 — SuperCPU detection at `$D0BC-$D0BF`, only with bit 1 of the enable word.
+    /// A SuperCPU reads `dosext << 7 | ramlink << 6` there (VICE `scpu64mem.c:671-676`);
+    /// neither exists here, so `$00` — not the `$FF` a plain C64's open bus gives.
+    pub fn u64_extra_read(&self, addr: u16) -> Option<u8> {
+        if self.speed_profile == SpeedProfile::U64
+            && self.u64_regs_en & 0x02 != 0
+            && (0xd0bc..=0xd0bf).contains(&addr)
+        {
+            Some(0x00)
+        } else {
+            None
         }
     }
 

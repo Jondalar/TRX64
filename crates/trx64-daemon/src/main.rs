@@ -66,6 +66,17 @@ struct Cli {
     /// and headless tool daemons. The product/UI daemon omits this → streams by default.
     #[arg(long, default_value_t = false)]
     headless: bool,
+
+    /// Spec 851 — which machine this is, applied before anything runs: `c64` (default),
+    /// `u64` (also `c64u`, `ue2`: U64, Elite II and C64 Ultimate — turbo registers and a
+    /// faster CPU), or `128` (the VIC-IIe probe profile).
+    #[arg(long, default_value = "c64")]
+    machine: String,
+
+    /// Spec 851 — the Ultimate's CPU speed table: `u64ii` (Elite II / C64 Ultimate,
+    /// default) or `u64` (the first Ultimate 64).
+    #[arg(long, default_value = "u64ii")]
+    speed_table: String,
 }
 
 // ── JSON-RPC 2.0 wire types ───────────────────────────────────────────────────
@@ -198,6 +209,9 @@ pub struct State {
     /// very warm-up that power-on runs. The flag looked set and the detection had
     /// already failed.
     speed_profile: trx64_core::vic::SpeedProfile,
+    /// Spec 851 — the Ultimate's speed table, kept beside the profile for the same reason:
+    /// a power-cycle builds a fresh machine.
+    u64_speed_table: trx64_core::vic::U64SpeedTable,
     /// Spec 814 §2 — the armed input journal. `None` = not recording, which is the
     /// default and costs nothing.
     ///
@@ -1684,6 +1698,7 @@ fn do_power_on(st: &mut State) {
     // Spec 815 — the fresh machine inherits the session's claim. Power-cycling a
     // C128 does not hand you a C64, and a cartridge probes during the warm-up below.
     st.session.machine.set_speed_profile(st.speed_profile);
+    st.session.machine.set_u64_speed_table(st.u64_speed_table);
     st.machine_generation += 1; // Spec 786 audio fix — signal the streaming loop to re-hook the fresh SID.
     // The audio epoch belongs HERE, not at the call sites. It was bumped by the
     // `session/power` RPC and NOT by the monitor `power` verb — same function, two
@@ -3088,7 +3103,11 @@ fn run_until_break(
         } else {
             seg_cap.max(1)
         });
-        let max_instr = if seg_cap == 1 { 1 } else { seg_budget.div_ceil(2) + 1000 };
+        let max_instr = if seg_cap == 1 {
+            1
+        } else {
+            seg_budget.div_ceil(2) * session.machine.turbo_divider() + 1000
+        };
 
         // Refresh the env from the current (segment-start) CPU + raster state so
         // exec/access conditions eval against it.
@@ -5788,7 +5807,9 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                             Ok(report(m))
                         }
                         SpeedProfile::U64 => {
-                            let v = if on { 0x0e } else { 0x00 };
+                            // Spec 851 — 4 MHz with badline timing: the speed bit now really
+                            // runs the CPU faster, so `on` picks one that stays real-time.
+                            let v = if on { 0x83 } else { 0x80 };
                             m.vic.write_reg(0x31, v);
                             Ok(report(m))
                         }
@@ -6810,7 +6831,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                             trx64_core::c64re_snapshot::RUNTIME_CHECKPOINT_SCHEMA_VERSION,
                         media: media_inputs,
                         runtime_version: RUNTIME_VERSION.to_string(),
-                        machine_model: "c64-pal".to_string(),
+                        machine_model: machine_model_name(m.speed_profile()).to_string(),
                         provenance: None,
                         pc,
                         cycle,
@@ -9552,7 +9573,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                         "session/turbo: this session claims to be a plain C64, where the speed \
                          register does not exist — set mode to 128 or u64 first"),
                     SpeedProfile::C128 => st.session.machine.vic.write_reg(0x30, u8::from(on)),
-                    SpeedProfile::U64 => st.session.machine.vic.write_reg(0x31, if on { 0x0e } else { 0 }),
+                    SpeedProfile::U64 => st.session.machine.vic.write_reg(0x31, if on { 0x83 } else { 0x80 }),
                 }
             }
             if let Some(sp) = req.params.get("speed").and_then(|v| v.as_u64()) {
@@ -13870,6 +13891,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 }))
                 .collect();
             let breakpoints = st.breakpoints.entries.len() as u64;
+            let model_name = machine_model_name(st.session.machine.speed_profile());
             drop(st);
 
             let bytes = trx64_core::native_snapshot::write_native_snapshot(
@@ -13878,7 +13900,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                     schema_version: schema_version as i64,
                     media: media_inputs,
                     runtime_version: RUNTIME_VERSION.to_string(),
-                    machine_model: "c64-pal".to_string(),
+                    machine_model: model_name.to_string(),
                     provenance: Some(json!({ "checkpointId": format!("recorder:{seq}") })),
                     pc,
                     cycle,
@@ -13968,6 +13990,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             // sha256/bytes) — matches c64re's DumpResult.media.
             let media_summary = gather_snapshot_media(&st.session);
             let breakpoints = st.breakpoints.entries.len() as u64;
+            let model_name = machine_model_name(st.session.machine.speed_profile());
             drop(st);
 
             let bytes = trx64_core::native_snapshot::write_native_snapshot(
@@ -13976,7 +13999,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                     schema_version: trx64_core::c64re_snapshot::RUNTIME_CHECKPOINT_SCHEMA_VERSION,
                     media: media_inputs,
                     runtime_version: RUNTIME_VERSION.to_string(),
-                    machine_model: "c64-pal".to_string(),
+                    machine_model: model_name.to_string(),
                     provenance: None,
                     pc,
                     cycle,
@@ -16687,6 +16710,34 @@ struct UndumpResult {
 /// re-attaches the embedded drive8 media onto the fresh machine, then restores the
 /// checkpoint on top. Leaves the session PAUSED. Errors are returned WITHOUT a
 /// prefix — each caller adds its own (`undump:` / `snapshot/undump:`).
+/// Spec 851 — the dump manifest's machine model. It read `c64-pal` for every dump before
+/// the profile existed, so a restore could not know it had been an Ultimate.
+fn machine_model_name(p: trx64_core::vic::SpeedProfile) -> &'static str {
+    match p {
+        trx64_core::vic::SpeedProfile::C64 => "c64-pal",
+        trx64_core::vic::SpeedProfile::C128 => "c128-pal",
+        trx64_core::vic::SpeedProfile::U64 => "u64-pal",
+    }
+}
+
+fn machine_profile_from_model(model: &str) -> Option<trx64_core::vic::SpeedProfile> {
+    trx64_core::vic::SpeedProfile::parse(model.split('-').next().unwrap_or(model))
+}
+
+#[cfg(test)]
+mod machine_model_tests {
+    use super::*;
+    use trx64_core::vic::SpeedProfile;
+
+    #[test]
+    fn a_machine_model_names_its_profile_and_reads_back() {
+        for p in [SpeedProfile::C64, SpeedProfile::C128, SpeedProfile::U64] {
+            assert_eq!(machine_profile_from_model(machine_model_name(p)), Some(p));
+        }
+        assert_eq!(machine_profile_from_model("c64-ntsc"), Some(SpeedProfile::C64));
+    }
+}
+
 fn undump_native_snapshot(st: &mut State, path: &str) -> Result<UndumpResult, String> {
     let file_bytes =
         std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
@@ -16829,6 +16880,12 @@ fn undump_native_snapshot(st: &mut State, path: &str) -> Result<UndumpResult, St
         }
     }
 
+    // Spec 851 — the dump says which machine it was. Only the claim is set: the restored
+    // VIC registers stay as restored.
+    if let Some(p) = machine_profile_from_model(&read.manifest.machine.model) {
+        st.speed_profile = p;
+        st.session.machine.vic.speed_profile = p;
+    }
     let pc = st.session.machine.c64_core.reg_pc;
     let cycle = st.session.machine.c64_core.clk;
     st.session.running = false;
@@ -17946,6 +18003,7 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
     }
     State {
         speed_profile: trx64_core::vic::SpeedProfile::C64,
+        u64_speed_table: trx64_core::vic::U64SpeedTable::U64II,
         input_journal: None,
         session,
         breakpoints: Breakpoints::new(),
@@ -18369,7 +18427,26 @@ async fn main() {
     // connect-time auto-run are always on. `--headless` is the sole opt-out (byte-exact oracle
     // / conformance / tool daemons that want a silent, deterministic, no-auto-run machine).
     let streaming_on = !cli.headless;
+    // Spec 851 D1 — the machine is set before any client can make it run.
+    let Some(machine_profile) = trx64_core::vic::SpeedProfile::parse(&cli.machine) else {
+        eprintln!("[trx64] --machine: unknown '{}' (c64 | u64 | 128)", cli.machine);
+        std::process::exit(2);
+    };
+    let Some(speed_table) = trx64_core::vic::U64SpeedTable::parse(&cli.speed_table) else {
+        eprintln!("[trx64] --speed-table: unknown '{}' (u64ii | u64)", cli.speed_table);
+        std::process::exit(2);
+    };
     let state: SharedState = Arc::new(Mutex::new(build_state(session, streaming_on)));
+    {
+        let mut st = state.lock().unwrap();
+        st.speed_profile = machine_profile;
+        st.u64_speed_table = speed_table;
+        st.session.machine.set_machine_profile(machine_profile);
+        st.session.machine.set_u64_speed_table(speed_table);
+    }
+    if machine_profile != trx64_core::vic::SpeedProfile::C64 {
+        eprintln!("[trx64] machine = {}", machine_profile.name());
+    }
 
     // The singleton live A/V stream hub (ADR-073): one pacing loop drives the singleton
     // machine and broadcasts BIN_VIC/BIN_AUDIO to all connected clients. Spec 767 — created
@@ -18516,6 +18593,7 @@ mod batch1_tests {
     fn make_state() -> SharedState {
         Arc::new(Mutex::new(State {
             speed_profile: trx64_core::vic::SpeedProfile::C64,
+        u64_speed_table: trx64_core::vic::U64SpeedTable::U64II,
             input_journal: None,
             session: Session::new("integrated-1"),
             breakpoints: Breakpoints::new(),

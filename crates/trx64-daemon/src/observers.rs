@@ -1165,7 +1165,7 @@ mod tests {
             let aw = reg.access_watch_owned();
             let stop = m.run_for_full_capped_dbg(
                 budget - elapsed,
-                (budget - elapsed).div_ceil(2) + 1000,
+                (budget - elapsed).div_ceil(2) * m.turbo_divider() + 1000,
                 bp_set.as_ref(),
                 None,
                 aw.as_deref(),

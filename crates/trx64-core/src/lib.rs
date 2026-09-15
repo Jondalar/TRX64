@@ -1093,8 +1093,14 @@ impl Machine {
         // Pressing RESET on a C128 does not turn it into a C64, and a release that
         // re-probes after its own reset must get the same answer.
         let profile = self.vic.speed_profile;
+        // Spec 851 — the Ultimate's turbo settings are the firmware's, not the C64's; the
+        // reset clears only the C64-side `$D030`/`$D031`.
+        let (regs_en, prefer, table) = (self.vic.u64_regs_en, self.vic.u64_speed_prefer, self.vic.u64_speed_table);
         self.vic = VicII::new();
         self.vic.speed_profile = profile;
+        self.vic.u64_regs_en = regs_en;
+        self.vic.u64_speed_prefer = prefer;
+        self.vic.u64_speed_table = table;
         // ts:707-708 + ts:773 — reset the 1541 in lockstep with the C64. A warm
         // reset is the C64's RESET line; the drive has its OWN power, so "the 1541
         // disk stays mounted" (ts:773). TRX64's `Drive1541::cold_reset` drops the
@@ -1802,7 +1808,9 @@ impl Machine {
             0xd000..=0xdfff => {
                 if self.memconfig.io {
                     match addr {
-                        0xd000..=0xd3ff => self.vic.read_reg(addr as u8),
+                        0xd000..=0xd3ff => {
+                            self.vic.u64_extra_read(addr).unwrap_or_else(|| self.vic.read_reg(addr as u8))
+                        }
                         0xd400..=0xd7ff => self.sid_regs[(addr as usize - 0xd400) & 0x1f],
                         0xd800..=0xdbff => (self.io_shadow[(addr as usize) - 0xd000] & 0x0f) | 0xf0,
                         0xdc00..=0xdcff => self.cia1_pin_peek(addr),
@@ -1861,7 +1869,9 @@ impl Machine {
             "io" => {
                 if (0xd000..=0xdfff).contains(&addr) {
                     match addr {
-                        0xd000..=0xd3ff => self.vic.read_reg(addr as u8),
+                        0xd000..=0xd3ff => {
+                            self.vic.u64_extra_read(addr).unwrap_or_else(|| self.vic.read_reg(addr as u8))
+                        }
                         0xd400..=0xd7ff => self.sid_regs[(addr as usize - 0xd400) & 0x1f],
                         0xd800..=0xdbff => (self.io_shadow[(addr as usize) - 0xd000] & 0x0f) | 0xf0,
                         0xdc00..=0xdcff => self.cia1_pin_peek(addr),
@@ -1910,16 +1920,53 @@ impl Machine {
         self.vic.regs[0x2f] = 0;
         self.vic.regs[0x30] = 0;
         self.vic.regs[0x31] = 0;
+        self.vic.u64_d031_written = false;
+        if profile == crate::vic::SpeedProfile::U64 {
+            // Spec 851 D2 — as the menu's "U64 Turbo Registers" at 1 MHz, badline timing on.
+            self.vic.u64_regs_en = 0x01;
+            self.vic.u64_speed_prefer = 0x80;
+        }
+        self.c64_core.turbo_div = 1;
+        self.c64_core.turbo_phase = 0;
+        self.c64_core.turbo_badline = true;
+    }
+
+    /// Spec 851 D1 — the machine this is: `c64`, `128`, or `u64` (U64, Elite II, C64
+    /// Ultimate). Set it before power-on; a cartridge probes in its boot stub.
+    pub fn set_machine_profile(&mut self, profile: crate::vic::SpeedProfile) {
+        self.set_speed_profile(profile);
     }
 
     pub fn speed_profile(&self) -> crate::vic::SpeedProfile {
         self.vic.speed_profile
     }
 
-    /// The speed bit as a release would see it: set by $D030 bit 0 (VIC-IIe) or by
-    /// a non-zero $D031 (extended). STORED ONLY — Spec 815 §3 is unbuilt.
+    /// Spec 851 — the firmware's turbo settings, as `setCpuSpeed` writes them
+    /// (`u64_config.cc:1634-1636`): the enable word and the preferred speed, applied on
+    /// its `C64_SPEED_UPDATE` strobe. Only meaningful on the `u64` profile.
+    pub fn set_u64_turbo(&mut self, regs_en: u8, speed_prefer: u8) {
+        self.vic.u64_regs_en = regs_en;
+        self.vic.u64_speed_prefer = speed_prefer;
+    }
+
+    pub fn set_u64_speed_table(&mut self, table: crate::vic::U64SpeedTable) {
+        self.vic.u64_speed_table = table;
+    }
+
+    /// Spec 851 — CPU cycles per PHI2 cycle right now (1 on anything but a turbo `u64`).
+    /// Callers that cap a run by instructions scale the cap by it.
+    pub fn turbo_divider(&self) -> u64 {
+        let (index, _) = self.vic.u64_speed();
+        u64::from(self.vic.u64_speed_table.mhz(index))
+    }
+
+    /// The speed bit as a release would see it: `$D030` bit 0 on the VIC-IIe; on the
+    /// Ultimate a speed index above 1 MHz (Spec 851 — bit 7 of `$D031` is badline timing).
     pub fn turbo_engaged(&self) -> bool {
-        self.vic.fastmode != 0
+        match self.vic.speed_profile {
+            crate::vic::SpeedProfile::U64 => self.vic.u64_speed().0 != 0,
+            _ => self.vic.fastmode != 0,
+        }
     }
 
     pub fn vic_bank_base(&self) -> u16 {
@@ -2161,7 +2208,8 @@ impl Machine {
     where
         F: FnMut(u16, u8, u8, u8, u8, u8, u64),
     {
-        let max_instructions = budget.div_ceil(2) + 1000;
+        // Spec 851 — a faster CPU executes more instructions per PHI2 cycle.
+        let max_instructions = budget.div_ceil(2) * self.turbo_divider() + 1000;
         self.run_for_full_capped(budget, max_instructions, obs, on_drive_step);
     }
 
@@ -2290,6 +2338,13 @@ impl Machine {
                 let port = self.expansion_lines();
                 self.c64_int.set_irq(c64_6510core::INT_SRC_EXPANSION, port.irq, now);
                 self.c64_int.set_nmi(c64_6510core::INT_SRC_EXPANSION, port.nmi, now);
+            }
+            // Spec 851 D3 — the Ultimate's speed, read at the boundary: a `$D031` write
+            // takes effect with the next instruction.
+            if self.vic.speed_profile == crate::vic::SpeedProfile::U64 {
+                let (index, badline) = self.vic.u64_speed();
+                self.c64_core.turbo_div = self.vic.u64_speed_table.mhz(index);
+                self.c64_core.turbo_badline = badline;
             }
 
             // Run a whole instruction over the SC bus (the verbatim core threads the

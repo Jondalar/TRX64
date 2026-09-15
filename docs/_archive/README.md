@@ -114,6 +114,18 @@ putting every port step behind one flag computed per run. A device is told how l
 and how much of that stall had its address on the bus (43 and 3 on a badline); what that means is the
 device's business. A DMA engine is not part of this — the REU spec ports VICE's `reu.c`.
 
+## The U64 machine profile and a faster CPU — 851
+
+The owner wanted one start parameter — "Default C64, optional U64/UE2/128" — and turbo while at it.
+`--machine c64|u64|128`: `u64` is one machine for U64, Elite II and C64 Ultimate, which differ only in
+the speed table. The turbo registers follow the firmware's own layout, which exposed 815 reading
+`$D031 = $80` (1 MHz, badline timing) as turbo.
+
+**Decision:** `clk` stays the PHI2 clock everything is keyed on. A faster CPU is a divider in `clk_inc`,
+ported from VICE's TurboMaster, so timers, raster, rings and traces never learn the CPU got faster, and a
+stock machine pays nothing. What the closed core does not reveal — `$D031` read-back, I/O stretching,
+the exact `$D0BC` value — is modelled minimally and gated, not guessed richly.
+
 ---
 
 Everything here is finished. If a row's subject turns out to be open after all, it needs
