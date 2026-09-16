@@ -66,7 +66,10 @@ pub use crash_triage::{
 };
 pub use delta_ring::{CallerChain, DeltaEntry, DeltaRing, LoopOnset, WriteRec};
 pub use drive::Drive1541;
-pub use expansion::{Access, AccessKind, ExpansionChain, ExpansionDevice, Hold, PortLines, SnoopSet};
+pub use expansion::{
+    Access, AccessKind, ExpansionChain, ExpansionDevice, ExpansionRam, Hold, OwnedRam, PortLines,
+    SnoopSet,
+};
 pub use full::{Bank8, BankA, BankE, FullBus, MemConfig};
 pub use iec::IecCore;
 pub use resid_audio::{SidAudioEngine, SidWriteRecord, WavFormat};
@@ -1327,6 +1330,34 @@ impl Machine {
         old
     }
 
+    /// Spec 853 D1 — remove ONE device, whether it sits bare on the port or inside a
+    /// chain, and leave everything else and its state alone. `detach_expansion` above
+    /// takes the whole place, which on a chain means everything on it.
+    pub fn detach_expansion_device<T: 'static>(
+        &mut self,
+    ) -> Option<Box<dyn crate::expansion::ExpansionDevice>> {
+        let mut slot = self.expansion.take();
+        let mut out = None;
+        let bare = slot.as_ref().map(|d| d.as_ref().as_any().is::<T>()).unwrap_or(false);
+        if bare {
+            out = slot.take();
+        } else if let Some(dev) = slot.as_mut() {
+            if let Some(chain) =
+                dev.as_mut().as_any_mut().downcast_mut::<crate::expansion::ExpansionChain>()
+            {
+                out = chain.remove::<T>();
+            }
+        }
+        self.expansion.0 = slot;
+        self.refresh_expansion_snoop();
+        out
+    }
+
+    /// The REU, off the port, with everything else on it untouched.
+    pub fn detach_reu(&mut self) -> Option<Box<dyn crate::expansion::ExpansionDevice>> {
+        self.detach_expansion_device::<crate::reu::Reu>()
+    }
+
     /// Install or remove the machine profile's own device (Spec 852's UCI block).
     pub fn set_port_profile_device(
         &mut self,
@@ -1361,17 +1392,10 @@ impl Machine {
     /// is its own reader rather than a 16-bit hole into a 24-bit space. Reads are always
     /// side-effect-free — the RAM is memory, not a register file.
     pub fn expansion_ram_slice(&self, offset: u32, len: u32) -> Option<Vec<u8>> {
-        let ram: &[u8] = if let Some(r) = self.reu() {
-            r.ram()
-        } else {
-            self.georam()?.ram()
-        };
-        let start = offset as usize;
-        if start >= ram.len() {
-            return Some(Vec::new());
+        if let Some(r) = self.reu() {
+            return Some(r.ram_slice(offset, len));
         }
-        let end = (start + len as usize).min(ram.len());
-        Some(ram[start..end].to_vec())
+        Some(self.georam()?.ram_slice(offset, len))
     }
 
     /// Spec 853 D9 — load a `.reu` image into the attached device. Never written back:
@@ -1379,16 +1403,51 @@ impl Machine {
     /// own `REUImageWrite` is off by default. A short image fills from the start and
     /// leaves the rest; a long one is truncated.
     pub fn load_expansion_image(&mut self, bytes: &[u8]) -> Result<usize, String> {
-        let ram: &mut [u8] = if self.reu().is_some() {
-            self.reu_mut().expect("checked").ram_mut()
-        } else if self.georam().is_some() {
-            self.georam_mut().expect("checked").ram_mut()
-        } else {
-            return Err("no expansion device attached".to_string());
-        };
-        let n = bytes.len().min(ram.len());
-        ram[..n].copy_from_slice(&bytes[..n]);
-        Ok(n)
+        if let Some(r) = self.reu_mut() {
+            return Ok(r.write_ram(0, bytes) as usize);
+        }
+        if let Some(g) = self.georam_mut() {
+            return Ok(g.write_ram(0, bytes) as usize);
+        }
+        Err("no expansion device attached".to_string())
+    }
+
+    /// Spec 854 D2 — attach a device whose RAM belongs to the caller. `size_kb` is what
+    /// the REC believes is fitted; the store decides what is actually there.
+    pub fn attach_reu_borrowed(
+        &mut self,
+        size_kb: u32,
+        store: Box<dyn crate::expansion::ExpansionRam>,
+    ) -> bool {
+        if !self.attach_reu(size_kb) {
+            return false;
+        }
+        self.reu_mut().expect("just attached").set_store(Some(store));
+        true
+    }
+
+    pub fn attach_georam_borrowed(
+        &mut self,
+        size_kb: u32,
+        store: Box<dyn crate::expansion::ExpansionRam>,
+    ) -> bool {
+        if !self.attach_georam(size_kb) {
+            return false;
+        }
+        self.georam_mut().expect("just attached").set_store(Some(store));
+        true
+    }
+
+    /// Lend a store, take it back (`None`), or swap it — without rebuilding the device.
+    /// Returns the store that was there.
+    pub fn set_expansion_ram(
+        &mut self,
+        store: Option<Box<dyn crate::expansion::ExpansionRam>>,
+    ) -> Option<Box<dyn crate::expansion::ExpansionRam>> {
+        if let Some(r) = self.reu_mut() {
+            return r.set_store(store);
+        }
+        self.georam_mut()?.set_store(store)
     }
 
     /// Is there a device whose RAM a checkpoint would have to carry?
@@ -1617,6 +1676,14 @@ impl Machine {
             }
         }
         self.expansion_snoop = if set.is_empty() { None } else { Some(Box::new(set)) };
+    }
+
+    /// Spec 853 D1 — is this address still snooped by anything on the port?
+    ///
+    /// The write path pays for a snooped address, so a device that has left must stop
+    /// registering one. Being able to ASK is what makes that testable rather than assumed.
+    pub fn expansion_snoop_registered(&self, addr: u16) -> bool {
+        self.expansion_snoop.as_ref().map(|s| s.contains(addr)).unwrap_or(false)
     }
 
     /// Spec 850 D6 — the IRQ/NMI the host itself drives onto the port. Takes effect at the

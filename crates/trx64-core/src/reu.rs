@@ -14,7 +14,7 @@
 //! `MAINCPU_BA_LOW_REU` and lets `maincpu_steal_cycles()` call `reu_dma_start()`
 //! (`mainc64cpu.c:122-125`).
 
-use crate::expansion::{Access, AccessKind, ExpansionDevice, PortLines};
+use crate::expansion::{Access, AccessKind, ExpansionDevice, ExpansionRam, OwnedRam, PortLines};
 
 // ── registers (reu.c:129-141) ──────────────────────────────────────────────────────
 
@@ -170,7 +170,9 @@ pub struct Reu {
     rec: Rec,
     opt: RecOptions,
     size_kb: u32,
-    ram: Vec<u8>,
+    /// Spec 854 — where the bytes live. `None` is a host that has lent nothing right
+    /// now, which behaves exactly as 853's no-DRAM case: reads give the latch, writes drop.
+    store: Option<Box<dyn ExpansionRam>>,
     /// The latch that drives the bus for addresses with no DRAM behind them
     /// (`floating_bus_value`, reu.c:261).
     floating_bus: u8,
@@ -192,7 +194,7 @@ impl Clone for Reu {
             rec: self.rec.clone(),
             opt: self.opt,
             size_kb: self.size_kb,
-            ram: self.ram.clone(),
+            store: self.store.as_ref().and_then(|s| s.clone_ram()),
             floating_bus: self.floating_bus,
             irq: self.irq,
             pending: self.pending,
@@ -213,7 +215,7 @@ impl Reu {
             rec: Rec::default(),
             opt,
             size_kb,
-            ram: vec![0; (size_kb as usize) << 10],
+            store: Some(Box::new(OwnedRam::new((size_kb as usize) << 10))),
             floating_bus: 0xFF,
             irq: false,
             pending: None,
@@ -225,24 +227,86 @@ impl Reu {
         Some(reu)
     }
 
+    /// An REU whose RAM belongs to the caller (Spec 854), ready to be put on the port
+    /// beside whatever is already there with `Machine::attach_expansion_also`.
+    pub fn new_with_store(size_kb: u32, store: Box<dyn ExpansionRam>) -> Option<Self> {
+        let mut reu = Reu::new(size_kb)?;
+        reu.set_store(Some(store));
+        Some(reu)
+    }
+
     pub fn size_kb(&self) -> u32 {
         self.size_kb
     }
 
-    pub fn ram(&self) -> &[u8] {
-        &self.ram
+    /// Spec 854 D6 — `&[u8]` cannot survive a store behind a trait object, so the RAM is
+    /// reached a byte or a window at a time instead.
+    pub fn ram_len(&self) -> u32 {
+        self.store.as_ref().map(|s| s.len()).unwrap_or(0)
     }
 
-    pub fn ram_mut(&mut self) -> &mut [u8] {
-        &mut self.ram
+    pub fn ram_byte(&self, off: u32) -> u8 {
+        self.store.as_ref().map(|s| s.read(off)).unwrap_or(self.floating_bus)
+    }
+
+    pub fn set_ram_byte(&mut self, off: u32, value: u8) {
+        if let Some(s) = self.store.as_mut() {
+            s.write(off, value);
+        }
+    }
+
+    pub fn ram_slice(&self, off: u32, len: u32) -> Vec<u8> {
+        match self.store.as_ref() {
+            None => Vec::new(),
+            Some(s) => {
+                let end = off.saturating_add(len).min(s.len());
+                (off..end).map(|a| s.read(a)).collect()
+            }
+        }
+    }
+
+
+    /// Bulk write. A byte at a time through a trait object is fine once at startup and
+    /// silly everywhere else.
+    pub fn write_ram(&mut self, off: u32, bytes: &[u8]) -> u32 {
+        let n = (bytes.len() as u32).min(self.ram_len().saturating_sub(off));
+        if let Some(s) = self.store.as_mut() {
+            for (i, b) in bytes.iter().take(n as usize).enumerate() {
+                s.write(off + i as u32, *b);
+            }
+        }
+        n
+    }
+
+    /// Spec 854 D7 — a borrowed store is in no snapshot.
+    pub fn ram_is_owned(&self) -> bool {
+        self.store.as_ref().map(|s| s.is_owned()).unwrap_or(false)
+    }
+
+    /// Spec 854 D2 — hand the store over, take it back, or swap it, without rebuilding
+    /// the device or disturbing a single register.
+    pub fn set_store(&mut self, store: Option<Box<dyn ExpansionRam>>) -> Option<Box<dyn ExpansionRam>> {
+        std::mem::replace(&mut self.store, store)
+    }
+
+    /// Spec 854 D4 — the firmware moves `C64_REU_SIZE` at runtime. Only the REC's idea of
+    /// how much DRAM is fitted changes; the store and its contents are untouched.
+    pub fn set_size_kb(&mut self, size_kb: u32) -> bool {
+        match RecOptions::for_size(size_kb) {
+            Some(opt) => {
+                self.opt = opt;
+                self.size_kb = size_kb;
+                self.rec.status = (self.rec.status & !STATUS_256K_CHIPS) | opt.status_preset;
+                true
+            }
+            None => false,
+        }
     }
 
     /// reu.c:602-615. Note what it does NOT do: the RAM is untouched, and the `$FF00`
     /// trigger comes up DISABLED — software enables it deliberately.
     pub fn reset(&mut self) {
-        let ram_keeps = std::mem::take(&mut self.ram);
         self.rec = Rec::default();
-        self.ram = ram_keeps;
         self.rec.status = (self.rec.status & !STATUS_256K_CHIPS) | self.opt.status_preset;
         self.rec.command = CMD_FF00_TRIGGER_DISABLED;
         self.rec.transfer_length = 0xFFFF;
@@ -263,7 +327,9 @@ impl Reu {
     fn store_to_reu(&mut self, reu_addr: u32, value: u8) {
         let a = reu_addr & (self.opt.dram_wrap_around - 1);
         if a < self.opt.not_backedup_addresses {
-            self.ram[a as usize] = value;
+            if let Some(s) = self.store.as_mut() {
+                s.write(a, value);
+            }
         }
     }
 
@@ -271,7 +337,8 @@ impl Reu {
     fn read_from_reu(&self, reu_addr: u32) -> u8 {
         let a = reu_addr & (self.opt.dram_wrap_around - 1);
         if a < self.opt.not_backedup_addresses {
-            self.ram[a as usize]
+            // Nothing lent behaves as no DRAM: the latch, never a panic (D3).
+            self.store.as_ref().map(|s| s.read(a)).unwrap_or(self.floating_bus)
         } else {
             self.floating_bus
         }
@@ -854,7 +921,7 @@ mod tests {
         setup(&mut reu, 0x1000, 0, 64);
         armed(&mut reu, CMD_TYPE_TO_REU);
         reu.run_dma(&mut bus);
-        assert_eq!(&reu.ram[0..64], &bus.mem[0x1000..0x1040]);
+        assert_eq!(reu.ram_slice(0, 64), &bus.mem[0x1000..0x1040]);
 
         for b in bus.mem[0x1000..0x1040].iter_mut() {
             *b = 0;
@@ -884,13 +951,13 @@ mod tests {
         let mut bus = FlatBus::new();
         bus.mem[0x2000] = 0xAA;
         bus.mem[0x2001] = 0xBB;
-        reu.ram[0] = 0x11;
-        reu.ram[1] = 0x22;
+        reu.set_ram_byte(0, 0x11);
+        reu.set_ram_byte(1, 0x22);
         setup(&mut reu, 0x2000, 0, 2);
         armed(&mut reu, CMD_TYPE_SWAP);
         reu.run_dma(&mut bus);
         assert_eq!((bus.mem[0x2000], bus.mem[0x2001]), (0x11, 0x22));
-        assert_eq!((reu.ram[0], reu.ram[1]), (0xAA, 0xBB));
+        assert_eq!((reu.ram_byte(0), reu.ram_byte(1)), (0xAA, 0xBB));
     }
 
     #[test]
@@ -899,7 +966,7 @@ mod tests {
         let mut bus = FlatBus::new();
         for i in 0..16usize {
             bus.mem[0x3000 + i] = i as u8;
-            reu.ram[i] = i as u8;
+            reu.set_ram_byte(i as u32, i as u8);
         }
         setup(&mut reu, 0x3000, 0, 16);
         armed(&mut reu, CMD_TYPE_VERIFY);
@@ -914,9 +981,9 @@ mod tests {
         let mut bus = FlatBus::new();
         for i in 0..16usize {
             bus.mem[0x3000 + i] = i as u8;
-            reu.ram[i] = i as u8;
+            reu.set_ram_byte(i as u32, i as u8);
         }
-        reu.ram[4] = 0xFF;
+        reu.set_ram_byte(4, 0xFF);
         setup(&mut reu, 0x3000, 0, 16);
         armed(&mut reu, CMD_TYPE_VERIFY);
         reu.run_dma(&mut bus);
@@ -980,7 +1047,7 @@ mod tests {
         reu.snoop_write(a(1000), 0x37);
         assert!(reu.dma_pending());
         reu.run_dma(&mut bus);
-        assert_eq!(reu.ram[0], 0x77);
+        assert_eq!(reu.ram_byte(0), 0x77);
         // And it is not armed any more, so a second $FF00 does nothing.
         reu.snoop_write(a(1001), 0x37);
         assert!(!reu.dma_pending());
@@ -1029,7 +1096,7 @@ mod tests {
         reu.io_write(REG_ADDR_CONTROL, ADDR_CONTROL_FIX_C64);
         armed(&mut reu, CMD_TYPE_TO_REU);
         reu.run_dma(&mut bus);
-        assert_eq!(&reu.ram[0..4], &[0x42, 0x42, 0x42, 0x42]);
+        assert_eq!(reu.ram_slice(0, 4), &[0x42, 0x42, 0x42, 0x42]);
         assert_eq!(reu.rec.base_computer, 0x6000);
     }
 

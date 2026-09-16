@@ -9,7 +9,6 @@
 use trx64_core::{Machine, NullSink, RunStop};
 
 // ── the REU's C64-side registers ──────────────────────────────────────────────────
-const STATUS: u16 = 0xDF00;
 const COMMAND: u16 = 0xDF01;
 const BASE_LO: u16 = 0xDF02;
 const BASE_HI: u16 = 0xDF03;
@@ -127,7 +126,7 @@ fn stash_then_fetch_round_trips_through_the_bus() {
     fill(&mut m, 0x1000, &src);
 
     transfer(&mut m, 0x1000, 0, 64, TYPE_STASH);
-    assert_eq!(&m.reu().unwrap().ram()[0..64], &src[..]);
+    assert_eq!(m.reu().unwrap().ram_slice(0, 64), &src[..]);
 
     fill(&mut m, 0x1000, &[0u8; 64]);
     transfer(&mut m, 0x1000, 0, 64, TYPE_FETCH);
@@ -140,11 +139,11 @@ fn stash_then_fetch_round_trips_through_the_bus() {
 fn swap_exchanges_both_sides() {
     let mut m = machine_with_reu(512);
     fill(&mut m, 0x2000, &[0xAA, 0xBB]);
-    m.reu_mut().unwrap().ram_mut()[0..2].copy_from_slice(&[0x11, 0x22]);
+    m.reu_mut().unwrap().write_ram(0, &[0x11, 0x22]);
 
     transfer(&mut m, 0x2000, 0, 2, TYPE_SWAP);
     assert_eq!((m.read_full(0x2000), m.read_full(0x2001)), (0x11, 0x22));
-    assert_eq!(&m.reu().unwrap().ram()[0..2], &[0xAA, 0xBB]);
+    assert_eq!(m.reu().unwrap().ram_slice(0, 2), &[0xAA, 0xBB]);
 }
 
 #[test]
@@ -152,7 +151,7 @@ fn verify_sets_end_of_block_when_equal_and_the_error_bit_when_not() {
     let mut m = machine_with_reu(512);
     let data: Vec<u8> = (0..16u8).collect();
     fill(&mut m, 0x3000, &data);
-    m.reu_mut().unwrap().ram_mut()[0..16].copy_from_slice(&data);
+    m.reu_mut().unwrap().write_ram(0, &data);
 
     transfer(&mut m, 0x3000, 0, 16, TYPE_VERIFY);
     let s = m.reu().unwrap().status();
@@ -162,8 +161,8 @@ fn verify_sets_end_of_block_when_equal_and_the_error_bit_when_not() {
     // A mismatch in the middle: the error bit, and NO end-of-block.
     let mut m = machine_with_reu(512);
     fill(&mut m, 0x3000, &data);
-    m.reu_mut().unwrap().ram_mut()[0..16].copy_from_slice(&data);
-    m.reu_mut().unwrap().ram_mut()[4] = 0xFF;
+    m.reu_mut().unwrap().write_ram(0, &data);
+    m.reu_mut().unwrap().set_ram_byte(4, 0xFF);
     transfer(&mut m, 0x3000, 0, 16, TYPE_VERIFY);
     let s = m.reu().unwrap().status();
     assert_ne!(s.status & ST_VERIFY_ERROR, 0);
@@ -216,7 +215,7 @@ fn a_fixed_c64_address_reads_the_same_byte_every_time() {
     jmp_self(&mut p);
     let n = instrs(&p);
     run_at(&mut m, &p, n);
-    assert_eq!(&m.reu().unwrap().ram()[0..4], &[0x42, 0x42, 0x42, 0x42]);
+    assert_eq!(m.reu().unwrap().ram_slice(0, 4), &[0x42, 0x42, 0x42, 0x42]);
 }
 
 // ── the $FF00 trigger ─────────────────────────────────────────────────────────────
@@ -245,7 +244,7 @@ fn an_armed_transfer_waits_for_ff00_and_then_runs_once() {
     fill(&mut m, 0x4000, &[0x77]);
     // STA $FF00 — one write cycle.
     armed_then(&mut m, &[0xA9, 0x37, 0x8D, 0x00, 0xFF], 2);
-    assert_eq!(m.reu().unwrap().ram()[0], 0x77, "the $FF00 write ran it");
+    assert_eq!(m.reu().unwrap().ram_byte(0), 0x77, "the $FF00 write ran it");
     let s = m.reu().unwrap().status();
     assert!(!s.armed_for_ff00 && !s.dma_pending, "and it is not armed any more");
 }
@@ -257,10 +256,10 @@ fn an_rmw_write_to_ff00_runs_exactly_one_transfer() {
     // address would have advanced, so byte 0 would stay and byte 1 would be written.
     let mut m = machine_with_reu(512);
     fill(&mut m, 0x4000, &[0x77]);
-    m.reu_mut().unwrap().ram_mut()[1] = 0xEE;
+    m.reu_mut().unwrap().set_ram_byte(1, 0xEE);
     armed_then(&mut m, &[0xEE, 0x00, 0xFF], 2); // INC $FF00
-    assert_eq!(m.reu().unwrap().ram()[0], 0x77);
-    assert_eq!(m.reu().unwrap().ram()[1], 0xEE, "a second transfer would have moved this");
+    assert_eq!(m.reu().unwrap().ram_byte(0), 0x77);
+    assert_eq!(m.reu().unwrap().ram_byte(1), 0xEE, "a second transfer would have moved this");
 }
 
 #[test]
@@ -274,7 +273,7 @@ fn with_the_trigger_disabled_an_ff00_write_does_nothing() {
     jmp_self(&mut p);
     let n = instrs(&p);
     run_at(&mut m, &p, n);
-    assert_eq!(m.reu().unwrap().ram()[0], 0x00, "nothing was armed, so nothing ran");
+    assert_eq!(m.reu().unwrap().ram_byte(0), 0x00, "nothing was armed, so nothing ran");
 }
 
 // ── what a transfer costs, and what it leaves alone ───────────────────────────────
@@ -395,7 +394,7 @@ fn the_georam_window_reads_and_writes_through_the_bus() {
     assert_eq!(m.read_full(0x0400), 0x5A);
     let g = m.georam().unwrap();
     assert_eq!((g.bank(), g.window()), (3, 2));
-    assert_eq!(g.ram()[3 * 16384 + 2 * 256 + 0x10], 0x5A);
+    assert_eq!(g.ram_byte(3 * 16384 + 2 * 256 + 0x10), 0x5A);
 }
 
 #[test]
@@ -456,20 +455,20 @@ fn ring_entry(m: &Machine) -> serde_json::Value {
 #[test]
 fn a_dump_carries_the_reu_ram_and_an_undump_brings_it_back() {
     let mut m = machine_with_reu(512);
-    m.reu_mut().unwrap().ram_mut()[0..4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+    m.reu_mut().unwrap().write_ram(0, &[0xDE, 0xAD, 0xBE, 0xEF]);
     let cp = dump(&m);
 
     let mut fresh = Machine::new();
     restore_runtime_checkpoint(&mut fresh, &cp).expect("undump");
     assert_eq!(fresh.reu().map(|r| r.size_kb()), Some(512), "the undump re-attached it");
-    assert_eq!(&fresh.reu().unwrap().ram()[0..4], &[0xDE, 0xAD, 0xBE, 0xEF]);
+    assert_eq!(fresh.reu().unwrap().ram_slice(0, 4), &[0xDE, 0xAD, 0xBE, 0xEF]);
     assert!(!fresh.expansion_ram_uncovered(), "a dump covers the RAM");
 }
 
 #[test]
 fn a_ring_entry_carries_the_registers_but_not_the_ram() {
     let mut m = machine_with_reu(512);
-    m.reu_mut().unwrap().ram_mut()[0] = 0x11;
+    m.reu_mut().unwrap().set_ram_byte(0, 0x11);
     transfer(&mut m, 0x1000, 0x40, 4, TYPE_STASH); // leaves the registers somewhere known
     let base_after = m.reu().unwrap().status().base_computer;
     let cp = ring_entry(&m);
@@ -479,9 +478,9 @@ fn a_ring_entry_carries_the_registers_but_not_the_ram() {
     assert!(ram_node.is_null(), "the ring omits the expansion RAM");
 
     // Restoring it leaves the RAM alone — and says the restore was partial.
-    m.reu_mut().unwrap().ram_mut()[0] = 0x99;
+    m.reu_mut().unwrap().set_ram_byte(0, 0x99);
     restore_runtime_checkpoint(&mut m, &cp).expect("restore");
-    assert_eq!(m.reu().unwrap().ram()[0], 0x99, "the RAM was not touched");
+    assert_eq!(m.reu().unwrap().ram_byte(0), 0x99, "the RAM was not touched");
     assert_eq!(m.reu().unwrap().status().base_computer, base_after, "the registers came back");
     assert!(m.expansion_ram_uncovered(), "and the machine says the RAM is not covered");
 }
@@ -491,13 +490,13 @@ fn a_checkpoint_without_the_node_does_not_eject_the_device() {
     // The cartridge's rule is "no node means detach". For a device that is not a
     // cartridge that would be an ejection nobody asked for.
     let mut m = machine_with_reu(512);
-    m.reu_mut().unwrap().ram_mut()[0] = 0x5A;
+    m.reu_mut().unwrap().set_ram_byte(0, 0x5A);
     let mut cp = dump(&m);
     cp.as_object_mut().unwrap().remove("expansion"); // a pre-853 .c64re
 
     restore_runtime_checkpoint(&mut m, &cp).expect("restore");
     assert!(m.reu().is_some(), "still attached");
-    assert_eq!(m.reu().unwrap().ram()[0], 0x5A, "and untouched");
+    assert_eq!(m.reu().unwrap().ram_byte(0), 0x5A, "and untouched");
     assert!(m.expansion_ram_uncovered(), "but the restore covered nothing of it");
 }
 
@@ -506,14 +505,14 @@ fn a_georam_round_trips_through_a_dump() {
     let mut m = Machine::new();
     assert!(m.attach_georam(512));
     m.georam_mut().unwrap().restore_registers(2, 3);
-    m.georam_mut().unwrap().ram_mut()[3 * 16384 + 2 * 256] = 0x7E;
+    m.georam_mut().unwrap().set_ram_byte(3 * 16384 + 2 * 256, 0x7E);
     let cp = dump(&m);
 
     let mut fresh = Machine::new();
     restore_runtime_checkpoint(&mut fresh, &cp).expect("undump");
     let g = fresh.georam().expect("re-attached");
     assert_eq!((g.window(), g.bank(), g.size_kb()), (2, 3, 512));
-    assert_eq!(g.ram()[3 * 16384 + 2 * 256], 0x7E);
+    assert_eq!(g.ram_byte(3 * 16384 + 2 * 256), 0x7E);
 }
 
 // ── Spec 853 D1 — several devices in one place ────────────────────────────────────
@@ -597,7 +596,7 @@ fn a_chain_unions_the_snoop_addresses_of_its_members() {
     // is that registering an address still WORKS through the chain.
     let seen = snooped.lock().unwrap().clone();
     assert!(seen.iter().any(|(a, v)| *a == 0xD020 && *v == 0x0E), "the tap's own address: {seen:?}");
-    assert_eq!(m.reu().unwrap().ram()[0], 0x77, "and the REU's $FF00 trigger still ran");
+    assert_eq!(m.reu().unwrap().ram_byte(0), 0x77, "and the REU's $FF00 trigger still ran");
 }
 
 #[test]
@@ -611,7 +610,7 @@ fn a_transfer_runs_from_inside_a_chain() {
 
     fill(&mut m, 0x1000, &[0xC5, 0xC6]);
     transfer(&mut m, 0x1000, 0, 2, TYPE_STASH);
-    assert_eq!(&m.reu().unwrap().ram()[0..2], &[0xC5, 0xC6]);
+    assert_eq!(m.reu().unwrap().ram_slice(0, 2), &[0xC5, 0xC6]);
 }
 
 #[test]
@@ -643,9 +642,9 @@ fn an_image_preloads_the_ram_and_is_never_written_back() {
     let mut m = machine_with_reu(512);
     let img: Vec<u8> = (0..=255u8).collect();
     assert_eq!(m.load_expansion_image(&img).unwrap(), 256);
-    assert_eq!(&m.reu().unwrap().ram()[0..256], &img[..]);
+    assert_eq!(m.reu().unwrap().ram_slice(0, 256), &img[..]);
     // The rest is untouched, not padded from the image.
-    assert_eq!(m.reu().unwrap().ram()[256], 0);
+    assert_eq!(m.reu().unwrap().ram_byte(256), 0);
 
     // An image larger than the device is truncated rather than refused.
     let big = vec![0xAB; 1024 * 1024];
@@ -662,7 +661,7 @@ fn loading_an_image_without_a_device_is_an_error_not_a_silent_no_op() {
 #[test]
 fn the_ram_window_reads_without_touching_anything() {
     let mut m = machine_with_reu(512);
-    m.reu_mut().unwrap().ram_mut()[0x1000..0x1004].copy_from_slice(&[1, 2, 3, 4]);
+    m.reu_mut().unwrap().write_ram(0x1000, &[1, 2, 3, 4]);
 
     assert_eq!(m.expansion_ram_slice(0x1000, 4).unwrap(), vec![1, 2, 3, 4]);
     // Past the end is empty, not a panic and not a wrap.
@@ -683,7 +682,228 @@ fn the_ram_window_reads_without_touching_anything() {
 fn the_window_works_for_a_georam_too() {
     let mut m = Machine::new();
     assert!(m.attach_georam(512));
-    m.georam_mut().unwrap().ram_mut()[0] = 0x7F;
+    m.georam_mut().unwrap().set_ram_byte(0, 0x7F);
     assert_eq!(m.expansion_ram_slice(0, 1).unwrap(), vec![0x7F]);
     assert!(Machine::new().expansion_ram_slice(0, 1).is_none(), "no device, no window");
+}
+
+// ── Spec 854 — the expansion RAM the host owns ─────────────────────────────────────
+
+use trx64_core::ExpansionRam;
+
+/// A store that belongs to the "host": the test can read the very bytes the device
+/// wrote, which is the whole point — on a U64 those bytes are the firmware's DDR.
+#[derive(Clone)]
+struct HostRam(Arc<Mutex<Vec<u8>>>);
+
+impl HostRam {
+    fn new(bytes: usize) -> Self {
+        HostRam(Arc::new(Mutex::new(vec![0; bytes])))
+    }
+    fn at(&self, off: usize) -> u8 {
+        self.0.lock().unwrap()[off]
+    }
+    fn set(&self, off: usize, v: u8) {
+        self.0.lock().unwrap()[off] = v;
+    }
+}
+
+impl ExpansionRam for HostRam {
+    fn len(&self) -> u32 {
+        self.0.lock().unwrap().len() as u32
+    }
+    fn read(&self, off: u32) -> u8 {
+        self.0.lock().unwrap().get(off as usize).copied().unwrap_or(0)
+    }
+    fn write(&mut self, off: u32, value: u8) {
+        if let Some(b) = self.0.lock().unwrap().get_mut(off as usize) {
+            *b = value;
+        }
+    }
+    // No clone_ram and no is_owned: the bytes belong to the host.
+}
+
+#[test]
+fn a_transfer_lands_in_the_hosts_own_memory() {
+    let host = HostRam::new(512 * 1024);
+    let mut m = Machine::new();
+    assert!(m.attach_reu_borrowed(512, Box::new(host.clone())));
+
+    fill(&mut m, 0x1000, &[0xDE, 0xAD, 0xBE, 0xEF]);
+    transfer(&mut m, 0x1000, 0, 4, TYPE_STASH);
+
+    // The host reads its OWN buffer — not a copy the device kept.
+    assert_eq!([host.at(0), host.at(1), host.at(2), host.at(3)], [0xDE, 0xAD, 0xBE, 0xEF]);
+
+    // And what the host writes is what the C64 fetches back.
+    host.set(0, 0x11);
+    transfer(&mut m, 0x2000, 0, 1, TYPE_FETCH);
+    assert_eq!(m.read_full(0x2000), 0x11, "the firmware's preload is what the C64 sees");
+}
+
+#[test]
+fn nothing_lent_is_the_no_dram_case_not_a_panic() {
+    let mut m = Machine::new();
+    assert!(m.attach_reu(512));
+    m.set_expansion_ram(None);
+
+    fill(&mut m, 0x1000, &[0x5A, 0x5A]);
+    transfer(&mut m, 0x1000, 0, 2, TYPE_STASH); // writes go nowhere
+    transfer(&mut m, 0x3000, 0, 2, TYPE_FETCH); // reads give the latch
+
+    // The transfer still COMPLETED: end-of-block is set and the registers moved.
+    let s = m.reu().unwrap().status();
+    assert_ne!(s.status & ST_END_OF_BLOCK, 0);
+    assert_eq!(s.base_computer, 0x3002);
+    assert_eq!(m.reu().unwrap().ram_len(), 0, "no store, no RAM");
+}
+
+#[test]
+fn a_store_can_be_swapped_without_disturbing_a_register() {
+    let a = HostRam::new(512 * 1024);
+    let b = HostRam::new(512 * 1024);
+    b.set(0, 0x42);
+
+    let mut m = Machine::new();
+    assert!(m.attach_reu_borrowed(512, Box::new(a.clone())));
+    let before = m.reu().unwrap().status();
+
+    let returned = m.set_expansion_ram(Some(Box::new(b.clone())));
+    assert!(returned.is_some(), "the old store comes back");
+    assert_eq!(m.reu().unwrap().status(), before, "and no register moved");
+
+    transfer(&mut m, 0x4000, 0, 1, TYPE_FETCH);
+    assert_eq!(m.read_full(0x4000), 0x42, "the NEW store is what the next transfer sees");
+}
+
+#[test]
+fn the_size_moves_at_runtime_without_dropping_the_contents() {
+    let host = HostRam::new(512 * 1024);
+    host.set(0x100, 0x77);
+    let mut m = Machine::new();
+    assert!(m.attach_reu_borrowed(512, Box::new(host.clone())));
+
+    // The firmware writes C64_REU_SIZE: 512 KiB -> 128 KiB.
+    assert!(m.reu_mut().unwrap().set_size_kb(128));
+    assert_eq!(m.reu().unwrap().status().size_kb, 128);
+    assert_eq!(host.at(0x100), 0x77, "the store was not dropped");
+
+    // And the REC now reports 64K chips, as a 1700 does.
+    assert_eq!(m.reu().unwrap().status().status & 0x10, 0, "64K chips after the shrink");
+    assert!(!m.reu_mut().unwrap().set_size_kb(384), "a size no REU had is refused");
+}
+
+#[test]
+fn a_georam_over_the_same_store_sees_the_same_bytes() {
+    let host = HostRam::new(512 * 1024);
+    let mut m = Machine::new();
+    assert!(m.attach_reu_borrowed(512, Box::new(host.clone())));
+    fill(&mut m, 0x1000, &[0x9A]);
+    transfer(&mut m, 0x1000, 0, 1, TYPE_STASH);
+
+    // Same setting, same region on a U64: swap the device, keep the store.
+    assert!(m.attach_georam_borrowed(512, Box::new(host.clone())));
+    assert_eq!(m.georam().unwrap().ram_byte(0), 0x9A, "one region, two devices");
+}
+
+#[test]
+fn a_borrowed_store_is_in_no_snapshot() {
+    let host = HostRam::new(512 * 1024);
+    host.set(0, 0xC3);
+    let mut m = Machine::new();
+    assert!(m.attach_reu_borrowed(512, Box::new(host.clone())));
+
+    let cp = dump(&m);
+    let ram_node = cp.get("expansion").and_then(|e| e.get("ram")).cloned().unwrap();
+    assert!(ram_node.is_null(), "the host's memory image is not ours to carry");
+
+    // Restoring it leaves the host's bytes alone and reports the gap.
+    host.set(0, 0xD4);
+    restore_runtime_checkpoint(&mut m, &cp).expect("restore");
+    assert_eq!(host.at(0), 0xD4, "the host's memory was not overwritten");
+    assert!(m.expansion_ram_uncovered(), "and the machine says so");
+}
+
+#[test]
+fn an_owned_store_still_rides_a_dump() {
+    // The standalone case must be untouched by all of the above.
+    let mut m = machine_with_reu(512);
+    m.reu_mut().unwrap().set_ram_byte(0, 0xEE);
+    let cp = dump(&m);
+    assert!(!cp["expansion"]["ram"].is_null(), "an owned store is still carried");
+
+    let mut fresh = Machine::new();
+    restore_runtime_checkpoint(&mut fresh, &cp).expect("undump");
+    assert_eq!(fresh.reu().unwrap().ram_byte(0), 0xEE);
+    assert!(!fresh.expansion_ram_uncovered());
+}
+
+// ── UE2's three questions, answered as gates ───────────────────────────────────────
+
+#[test]
+fn attaching_an_reu_installs_only_an_reu() {
+    // UE2 serves GeoRAM itself out of its cartridge logic, so a second model answering
+    // IO1 would fight it. The REU must claim IO2 and nothing else.
+    let host = HostRam::new(512 * 1024);
+    let mut m = Machine::new();
+    assert!(m.attach_reu_borrowed(512, Box::new(host)));
+    assert!(m.georam().is_none(), "no GeoRAM comes along for the ride");
+
+    // $DE00 is not ours: with nothing else on the port it reads the open bus (840),
+    // never a register.
+    let mut p = Vec::new();
+    lda_sta(&mut p, 0x55, 0xDE00);
+    p.extend_from_slice(&[0xAD, 0x00, 0xDE, 0x8D, 0x00, 0x04]);
+    jmp_self(&mut p);
+    run_at(&mut m, &p, 4);
+    assert_ne!(m.read_full(0x0400), 0x55, "the REU must not answer IO1");
+}
+
+#[test]
+fn detaching_the_reu_leaves_the_rest_of_the_chain_alone() {
+    let host = HostRam::new(512 * 1024);
+    let mut m = Machine::new();
+    let (t, log, snooped) = tap(0xDE00, Some(0x99));
+    m.attach_expansion(t); // tap() already boxes it
+    m.attach_expansion_also(Box::new(
+        trx64_core::Reu::new_with_store(512, Box::new(host.clone())).unwrap(),
+    ));
+    assert!(m.reu().is_some());
+
+    // The firmware turns C64_REU_ENABLE off mid-run.
+    assert!(m.detach_reu().is_some(), "the REU comes off");
+    assert!(m.reu().is_none());
+
+    // The other device is still there, still answering, still recording.
+    let mut p = Vec::new();
+    p.extend_from_slice(&[0xAD, 0x00, 0xDE, 0x8D, 0x00, 0x04]);
+    lda_sta(&mut p, 0x01, 0xDE00);
+    lda_sta(&mut p, 0x0E, 0xD020);
+    jmp_self(&mut p);
+    let n = instrs(&p) + 1;
+    run_at(&mut m, &p, n);
+    assert_eq!(m.read_full(0x0400), 0x99, "the tap still answers");
+    assert_eq!(log.lock().unwrap().len(), 1, "and still sees writes");
+    assert!(
+        snooped.lock().unwrap().iter().any(|(a, _)| *a == 0xD020),
+        "and its snoop still fires after the removal"
+    );
+
+    // And the REU can come back without disturbing the tap.
+    m.attach_expansion_also(Box::new(
+        trx64_core::Reu::new_with_store(512, Box::new(host)).unwrap(),
+    ));
+    assert!(m.reu().is_some(), "enable flips back on");
+    assert_eq!(m.read_full(0x0400), 0x99);
+}
+
+#[test]
+fn removing_the_last_snooper_stops_the_snoop() {
+    // $FF00 is snooped only because the REU asks for it. Once it is gone, nothing
+    // should still be registering it — otherwise the write path pays for a device that
+    // left.
+    let mut m = machine_with_reu(512);
+    assert!(m.expansion_snoop_registered(0xFF00), "armed while the REU is on");
+    m.detach_reu();
+    assert!(!m.expansion_snoop_registered(0xFF00), "and not after it leaves");
 }
