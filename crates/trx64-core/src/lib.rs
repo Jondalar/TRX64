@@ -66,7 +66,7 @@ pub use crash_triage::{
 };
 pub use delta_ring::{CallerChain, DeltaEntry, DeltaRing, LoopOnset, WriteRec};
 pub use drive::Drive1541;
-pub use expansion::{Access, AccessKind, ExpansionDevice, Hold, PortLines, SnoopSet};
+pub use expansion::{Access, AccessKind, ExpansionChain, ExpansionDevice, Hold, PortLines, SnoopSet};
 pub use full::{Bank8, BankA, BankE, FullBus, MemConfig};
 pub use iec::IecCore;
 pub use resid_audio::{SidAudioEngine, SidWriteRecord, WavFormat};
@@ -1354,6 +1354,43 @@ impl Machine {
         self.expansion_ram_uncovered = v;
     }
 
+    /// Spec 853 D11 — look at the expansion RAM.
+    ///
+    /// Deliberately NOT a `peek_lens`: that door takes a `u16`, and an REU holds up to
+    /// 16 MB. A lens keyed on a C64 address cannot address expansion RAM at all, so this
+    /// is its own reader rather than a 16-bit hole into a 24-bit space. Reads are always
+    /// side-effect-free — the RAM is memory, not a register file.
+    pub fn expansion_ram_slice(&self, offset: u32, len: u32) -> Option<Vec<u8>> {
+        let ram: &[u8] = if let Some(r) = self.reu() {
+            r.ram()
+        } else {
+            self.georam()?.ram()
+        };
+        let start = offset as usize;
+        if start >= ram.len() {
+            return Some(Vec::new());
+        }
+        let end = (start + len as usize).min(ram.len());
+        Some(ram[start..end].to_vec())
+    }
+
+    /// Spec 853 D9 — load a `.reu` image into the attached device. Never written back:
+    /// the owner's ruling is that nothing goes to the filesystem on its own, and VICE's
+    /// own `REUImageWrite` is off by default. A short image fills from the start and
+    /// leaves the rest; a long one is truncated.
+    pub fn load_expansion_image(&mut self, bytes: &[u8]) -> Result<usize, String> {
+        let ram: &mut [u8] = if self.reu().is_some() {
+            self.reu_mut().expect("checked").ram_mut()
+        } else if self.georam().is_some() {
+            self.georam_mut().expect("checked").ram_mut()
+        } else {
+            return Err("no expansion device attached".to_string());
+        };
+        let n = bytes.len().min(ram.len());
+        ram[..n].copy_from_slice(&bytes[..n]);
+        Ok(n)
+    }
+
     /// Is there a device whose RAM a checkpoint would have to carry?
     pub fn expansion_has_ram(&self) -> bool {
         self.reu().is_some() || self.georam().is_some()
@@ -1383,26 +1420,73 @@ impl Machine {
         }
     }
 
-    /// The REU on the port, if that is what is attached.
-    pub fn reu(&self) -> Option<&crate::reu::Reu> {
+    /// Spec 853 D1 — add a device WITHOUT evicting what is already there.
+    ///
+    /// `attach_expansion` replaces, which is right when one thing sits on the port and
+    /// wrong as soon as two do. This folds the existing device and the new one into an
+    /// [`ExpansionChain`], so a host can keep its own device while the machine carries an
+    /// REU. With nothing attached it is exactly `attach_expansion`.
+    pub fn attach_expansion_also(&mut self, dev: Box<dyn crate::expansion::ExpansionDevice>) {
+        match self.expansion.take() {
+            None => {
+                self.attach_expansion(dev);
+            }
+            Some(mut existing) => {
+                // Already a chain: extend it THROUGH the box. A trait object cannot be
+                // upcast to `Any` to unbox it, and nesting chains would work but leaves a
+                // shape nobody expects when they look.
+                if let Some(chain) =
+                    existing.as_mut().as_any_mut().downcast_mut::<crate::expansion::ExpansionChain>()
+                {
+                    chain.push(dev);
+                    self.attach_expansion(existing);
+                } else {
+                    let chain = crate::expansion::ExpansionChain::new().with(existing).with(dev);
+                    self.attach_expansion(Box::new(chain));
+                }
+            }
+        }
+    }
+
+    /// Spec 853 D1 — the device on the port, or the one inside the chain that is.
+    ///
+    /// Once a second device is added the top box is an [`ExpansionChain`], so a bare
+    /// downcast finds nothing. Every accessor goes through here for that reason: a
+    /// chained REU is still the machine's REU.
+    fn port_find<T: 'static>(&self) -> Option<&T> {
         let dev: &dyn crate::expansion::ExpansionDevice = self.expansion.as_deref()?;
-        dev.as_any().downcast_ref::<crate::reu::Reu>()
+        if let Some(t) = dev.as_any().downcast_ref::<T>() {
+            return Some(t);
+        }
+        dev.as_any().downcast_ref::<crate::expansion::ExpansionChain>()?.find::<T>()
+    }
+
+    fn port_find_mut<T: 'static>(&mut self) -> Option<&mut T> {
+        let dev: &mut dyn crate::expansion::ExpansionDevice = self.expansion.0.as_deref_mut()?;
+        if dev.as_any().downcast_ref::<T>().is_some() {
+            return dev.as_any_mut().downcast_mut::<T>();
+        }
+        dev.as_any_mut()
+            .downcast_mut::<crate::expansion::ExpansionChain>()?
+            .find_mut::<T>()
+    }
+
+    /// The REU on the port, if one is attached — directly or inside a chain.
+    pub fn reu(&self) -> Option<&crate::reu::Reu> {
+        self.port_find::<crate::reu::Reu>()
     }
 
     pub fn reu_mut(&mut self) -> Option<&mut crate::reu::Reu> {
-        let dev: &mut dyn crate::expansion::ExpansionDevice = self.expansion.0.as_deref_mut()?;
-        dev.as_any_mut().downcast_mut::<crate::reu::Reu>()
+        self.port_find_mut::<crate::reu::Reu>()
     }
 
-    /// The GeoRAM on the port, if that is what is attached.
+    /// The GeoRAM on the port, if one is attached — directly or inside a chain.
     pub fn georam(&self) -> Option<&crate::georam::GeoRam> {
-        let dev: &dyn crate::expansion::ExpansionDevice = self.expansion.as_deref()?;
-        dev.as_any().downcast_ref::<crate::georam::GeoRam>()
+        self.port_find::<crate::georam::GeoRam>()
     }
 
     pub fn georam_mut(&mut self) -> Option<&mut crate::georam::GeoRam> {
-        let dev: &mut dyn crate::expansion::ExpansionDevice = self.expansion.0.as_deref_mut()?;
-        dev.as_any_mut().downcast_mut::<crate::georam::GeoRam>()
+        self.port_find_mut::<crate::georam::GeoRam>()
     }
 
     /// Spec 853 D3 — run a transfer a device has armed, at the instruction boundary.
@@ -1462,7 +1546,19 @@ impl Machine {
                 host_lines: self.expansion_host_lines,
                 port_active,
             };
-            if let Some(reu) = dev.as_any_mut().downcast_mut::<crate::reu::Reu>() {
+            // Same reason as `port_find_mut`: with a second device on the port the box
+            // taken here is the chain, and a bare downcast would arm a transfer that then
+            // never ran.
+            let chained: Option<&mut crate::reu::Reu> =
+                if dev.as_ref().as_any().downcast_ref::<crate::reu::Reu>().is_some() {
+                    dev.as_mut().as_any_mut().downcast_mut::<crate::reu::Reu>()
+                } else {
+                    dev.as_mut()
+                        .as_any_mut()
+                        .downcast_mut::<crate::expansion::ExpansionChain>()
+                        .and_then(|c| c.find_mut::<crate::reu::Reu>())
+                };
+            if let Some(reu) = chained {
                 reu.run_dma(&mut fb);
             }
             self.c64_core.clk = fb.clk;

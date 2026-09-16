@@ -88,6 +88,12 @@ struct Cli {
     /// banks). The port holds one device, so this and `--reu` are alternatives.
     #[arg(long)]
     georam: Option<u32>,
+
+    /// Spec 853 D9 — preload the expansion RAM from a file. Read once at startup and
+    /// NEVER written back: an REU is DRAM, not flash, and nothing here writes to the
+    /// filesystem on its own (VICE's own REUImageWrite is off by default too).
+    #[arg(long, value_name = "FILE")]
+    reu_image: Option<String>,
 }
 
 // ── JSON-RPC 2.0 wire types ───────────────────────────────────────────────────
@@ -9810,7 +9816,17 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
         // Spec 853 D11 — the expansion device as data, the same facts as the `reu` verb.
         "session/reu" => {
             let st = state.lock().unwrap();
-            Response::ok(id, reu_status_json(&st.session.machine))
+            let mut out = reu_status_json(&st.session.machine);
+            // An optional window into the RAM. Capped, because 16 MB through JSON helps
+            // nobody; ask again with a further offset.
+            if let Some(off) = req.params.get("offset").and_then(|v| v.as_u64()) {
+                let len = req.params.get("length").and_then(|v| v.as_u64()).unwrap_or(256).min(4096);
+                if let Some(bytes) = st.session.machine.expansion_ram_slice(off as u32, len as u32) {
+                    out["ramOffset"] = json!(off);
+                    out["ram"] = json!(bytes);
+                }
+            }
+            Response::ok(id, out)
         }
 
         "session/uci" => {
@@ -18731,6 +18747,21 @@ async fn main() {
                 std::process::exit(2);
             }
             eprintln!("[trx64] GeoRAM attached: {kb} KiB");
+        }
+        if let Some(path) = cli.reu_image.as_deref() {
+            match std::fs::read(path) {
+                Ok(bytes) => match st.session.machine.load_expansion_image(&bytes) {
+                    Ok(n) => eprintln!("[trx64] expansion image: {n} bytes from {path}"),
+                    Err(e) => {
+                        eprintln!("[trx64] --reu-image: {e} (use --reu or --georam first)");
+                        std::process::exit(2);
+                    }
+                },
+                Err(e) => {
+                    eprintln!("[trx64] --reu-image: cannot read {path}: {e}");
+                    std::process::exit(2);
+                }
+            }
         }
         st.u64_speed_table = speed_table;
         st.session.machine.set_machine_profile(machine_profile);

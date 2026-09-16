@@ -515,3 +515,175 @@ fn a_georam_round_trips_through_a_dump() {
     assert_eq!((g.window(), g.bank(), g.size_kb()), (2, 3, 512));
     assert_eq!(g.ram()[3 * 16384 + 2 * 256], 0x7E);
 }
+
+// ── Spec 853 D1 — several devices in one place ────────────────────────────────────
+
+use std::sync::{Arc, Mutex};
+use trx64_core::{Access, ExpansionChain, ExpansionDevice, PortLines};
+
+/// A device that answers one address and records everything it is shown.
+struct Tap {
+    addr: u16,
+    answer: Option<u8>,
+    log: Arc<Mutex<Vec<(u16, u8)>>>,
+    snooped: Arc<Mutex<Vec<(u16, u8)>>>,
+}
+
+impl ExpansionDevice for Tap {
+    fn read(&mut self, a: Access, _cart: Option<u8>) -> Option<u8> {
+        if a.addr == self.addr { self.answer } else { None }
+    }
+    fn peek(&self, addr: u16, _cart: Option<u8>) -> Option<u8> {
+        if addr == self.addr { self.answer } else { None }
+    }
+    fn write(&mut self, a: Access, value: u8) {
+        self.log.lock().unwrap().push((a.addr, value));
+    }
+    fn snoop_addresses(&self) -> &[u16] {
+        &[0xD020]
+    }
+    fn snoop_write(&mut self, a: Access, value: u8) {
+        self.snooped.lock().unwrap().push((a.addr, value));
+    }
+    fn lines(&self) -> PortLines {
+        PortLines::default()
+    }
+}
+
+fn tap(addr: u16, answer: Option<u8>) -> (Box<Tap>, Arc<Mutex<Vec<(u16, u8)>>>, Arc<Mutex<Vec<(u16, u8)>>>) {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let snooped = Arc::new(Mutex::new(Vec::new()));
+    (Box::new(Tap { addr, answer, log: log.clone(), snooped: snooped.clone() }), log, snooped)
+}
+
+#[test]
+fn a_chain_lets_every_device_see_a_write_and_the_first_answer_win() {
+    let mut m = Machine::new();
+    let (a, a_log, _) = tap(0xDE00, Some(0x11));
+    let (b, b_log, _) = tap(0xDE00, Some(0x22));
+    m.attach_expansion(Box::new(ExpansionChain::new().with(a).with(b)));
+
+    let mut p = Vec::new();
+    lda_sta(&mut p, 0x5A, 0xDE00);
+    p.extend_from_slice(&[0xAD, 0x00, 0xDE, 0x8D, 0x00, 0x04]);
+    jmp_self(&mut p);
+    run_at(&mut m, &p, 4);
+
+    assert_eq!(m.read_full(0x0400), 0x11, "the FIRST device's answer stands");
+    assert_eq!(a_log.lock().unwrap().len(), 1, "and both saw the write");
+    assert_eq!(b_log.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn a_chain_unions_the_snoop_addresses_of_its_members() {
+    let mut m = machine_with_reu(512);
+    // The REU snoops $FF00; the tap snoops $D020. Both must still be reported.
+    let reu = m.detach_expansion().expect("attached above");
+    let (t, _, snooped) = tap(0xDE00, None);
+    m.attach_expansion(Box::new(ExpansionChain::new().with(reu).with(t)));
+
+    fill(&mut m, 0x4000, &[0x77]);
+    let mut p = setup(0x4000, 0, 1);
+    lda_sta(&mut p, TYPE_STASH | EXECUTE, COMMAND); // armed for $FF00
+    lda_sta(&mut p, 0x0E, 0xD020); // the tap's address
+    p.extend_from_slice(&[0xA9, 0x37, 0x8D, 0x00, 0xFF]); // STA $FF00
+    jmp_self(&mut p);
+    let n = instrs(&p);
+    run_at(&mut m, &p, n);
+
+    // Both snooped addresses reach BOTH members: 850's `port_snoop` already hands every
+    // snooped write to every place, and on the real port every device sees every bus
+    // cycle. So the tap is shown the $FF00 write as well as its own $D020 — what matters
+    // is that registering an address still WORKS through the chain.
+    let seen = snooped.lock().unwrap().clone();
+    assert!(seen.iter().any(|(a, v)| *a == 0xD020 && *v == 0x0E), "the tap's own address: {seen:?}");
+    assert_eq!(m.reu().unwrap().ram()[0], 0x77, "and the REU's $FF00 trigger still ran");
+}
+
+#[test]
+fn a_transfer_runs_from_inside_a_chain() {
+    // dma_pending has to survive the fan-out, or the run loop never asks the REU.
+    let mut m = Machine::new();
+    let (t, _, _) = tap(0xDE00, None);
+    let mut chain = ExpansionChain::new().with(t);
+    chain.push(Box::new(trx64_core::Reu::new(512).unwrap()));
+    m.attach_expansion(Box::new(chain));
+
+    fill(&mut m, 0x1000, &[0xC5, 0xC6]);
+    transfer(&mut m, 0x1000, 0, 2, TYPE_STASH);
+    assert_eq!(&m.reu().unwrap().ram()[0..2], &[0xC5, 0xC6]);
+}
+
+#[test]
+fn attaching_also_keeps_what_was_already_there() {
+    let mut m = machine_with_reu(512);
+    let (t, log, _) = tap(0xDE00, Some(0x99));
+    m.attach_expansion_also(t);
+
+    // Both are reachable: the REU through its accessor, the tap by answering.
+    assert!(m.reu().is_some(), "the REU was not evicted");
+    let mut p = Vec::new();
+    p.extend_from_slice(&[0xAD, 0x00, 0xDE, 0x8D, 0x00, 0x04]);
+    lda_sta(&mut p, 0x01, 0xDE00);
+    jmp_self(&mut p);
+    run_at(&mut m, &p, 4);
+    assert_eq!(m.read_full(0x0400), 0x99, "the added device answers");
+    assert_eq!(log.lock().unwrap().len(), 1);
+
+    // And a third one lands in the SAME chain rather than nesting.
+    let (t2, _, _) = tap(0xDE01, Some(0x88));
+    m.attach_expansion_also(t2);
+    assert!(m.reu().is_some(), "still there after a third");
+}
+
+// ── Spec 853 D9/D11 — preload, and looking at the RAM ──────────────────────────────
+
+#[test]
+fn an_image_preloads_the_ram_and_is_never_written_back() {
+    let mut m = machine_with_reu(512);
+    let img: Vec<u8> = (0..=255u8).collect();
+    assert_eq!(m.load_expansion_image(&img).unwrap(), 256);
+    assert_eq!(&m.reu().unwrap().ram()[0..256], &img[..]);
+    // The rest is untouched, not padded from the image.
+    assert_eq!(m.reu().unwrap().ram()[256], 0);
+
+    // An image larger than the device is truncated rather than refused.
+    let big = vec![0xAB; 1024 * 1024];
+    let mut small = machine_with_reu(128);
+    assert_eq!(small.load_expansion_image(&big).unwrap(), 128 * 1024);
+}
+
+#[test]
+fn loading_an_image_without_a_device_is_an_error_not_a_silent_no_op() {
+    let mut m = Machine::new();
+    assert!(m.load_expansion_image(&[1, 2, 3]).is_err());
+}
+
+#[test]
+fn the_ram_window_reads_without_touching_anything() {
+    let mut m = machine_with_reu(512);
+    m.reu_mut().unwrap().ram_mut()[0x1000..0x1004].copy_from_slice(&[1, 2, 3, 4]);
+
+    assert_eq!(m.expansion_ram_slice(0x1000, 4).unwrap(), vec![1, 2, 3, 4]);
+    // Past the end is empty, not a panic and not a wrap.
+    assert!(m.expansion_ram_slice(0x0800_0000, 16).unwrap().is_empty());
+    // A window that runs off the end is clamped.
+    let tail = m.expansion_ram_slice(512 * 1024 - 2, 64).unwrap();
+    assert_eq!(tail.len(), 2);
+
+    // And it is a peek: a hundred reads change nothing.
+    let before = m.reu().unwrap().status();
+    for _ in 0..100 {
+        m.expansion_ram_slice(0, 16);
+    }
+    assert_eq!(m.reu().unwrap().status(), before);
+}
+
+#[test]
+fn the_window_works_for_a_georam_too() {
+    let mut m = Machine::new();
+    assert!(m.attach_georam(512));
+    m.georam_mut().unwrap().ram_mut()[0] = 0x7F;
+    assert_eq!(m.expansion_ram_slice(0, 1).unwrap(), vec![0x7F]);
+    assert!(Machine::new().expansion_ram_slice(0, 1).is_none(), "no device, no window");
+}
