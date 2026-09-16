@@ -51,6 +51,11 @@ pub const CIA_CR_FORCE_LOAD: u8 = 0x10;
 pub const CIA_CRA_SPMODE_OUT: u8 = 0x40;
 pub const CIA_CRB_INMODE_TA: u8 = 0x40; // CRB bit6: count TA underflows
 pub const CIA_CRB_ALARM: u8 = 0x80;
+/// CRA bit 7 — the TOD input is 50 Hz mains; clear means 60 Hz.
+pub const CIA_CRA_TODIN_50HZ: u8 = 0x80;
+/// The PAL system clock `tick()` is called at, and what the TOD divider is derived from
+/// (VICE `ticks_per_sec`). 6569 only — NTSC is a separate machine, not a knob.
+pub const PAL_CYCLES_PER_SEC: u32 = 985_248;
 
 // IRQ-mask / ICR flag bits.
 pub const CIA_IM_SET: u8 = 0x80;
@@ -384,9 +389,19 @@ pub struct Cia {
     pub irqflags: u8,
     /// This chip's master clock (advanced via `tick`).
     pub clk: u64,
-    /// TOD running counter (10ths/sec/min/hr as BCD in regs 8..11). Stage-1: a
-    /// simple 60Hz-or-50Hz divider sourced off the CPU clock, deterministic.
-    pub tod_prescaler: u32,
+    /// Cycles left until the next mains tick (VICE `todclk` − now, with
+    /// `todticks = ticks_per_sec / power_freq`). The BCD registers 8..11 are the clock.
+    pub tod_clk: u32,
+    /// The 3-bit ring counter that divides mains ticks down to tenths (VICE
+    /// `todtickcounter`). It is NOT `ticks_per_sec / 10`: the divider matches at 4 for
+    /// 50 Hz and 5 for 60 Hz, and the ring has six states.
+    pub tod_tick_counter: u8,
+    /// Writing the hour register stops the clock; writing tenths starts it again
+    /// (VICE `todstopped`). A CIA comes up stopped.
+    pub tod_stopped: bool,
+    /// The alarm compare (VICE `todalarm`): CRB bit 7 routes a TOD write here instead of
+    /// to the clock, and an exact match raises `CIA_IM_TOD`.
+    pub tod_alarm: [u8; 4],
     /// Latched TOD snapshot (VICE todlatch) — reading HR latches, reading 10ths
     /// unlatches, so an in-progress read is coherent.
     pub tod_latched: bool,
@@ -406,7 +421,10 @@ impl Default for Cia {
             tb: Ciat::default(),
             irqflags: 0,
             clk: 0,
-            tod_prescaler: 0,
+            tod_clk: PAL_CYCLES_PER_SEC / 60,
+            tod_tick_counter: 0,
+            tod_stopped: true,
+            tod_alarm: [0u8; 4],
             tod_latched: false,
             tod_latch: [0u8; 4],
             ta_alarmclk: CLOCK_NEVER,
@@ -548,13 +566,104 @@ impl Cia {
     /// collapses long idle spans into O(1) per call.
     pub fn tick(&mut self, tab: &[u16; CIAT_TABLEN]) {
         self.clk = self.clk.wrapping_add(1);
-        // TOD prescaler — VICE drives TOD off the 50/60 Hz power line, divided
-        // from the system clock. For the isolation gate the absolute rate must
-        // match the TS divider; cia-tod.ts uses todticks = cyclesPerSec/powerFreq.
-        // PAL: 985248 / (CRA bit7 ? 50 : 60). We advance a free-running prescaler
-        // and tick the BCD TOD when it wraps.
-        self.tod_prescaler = self.tod_prescaler.wrapping_add(1);
         let _ = tab;
+        // VICE drives TOD off the mains, not off the CPU: `todticks = ticks_per_sec /
+        // power_freq`. Until this was written the prescaler below was incremented and
+        // read by nobody, so the clock never moved — invisible on a stock C64, where
+        // little software reads TOD, and fatal on `u64`, where the timers and the raster
+        // are CPU-clocked and TOD is the only thing still carrying real time.
+        // Measured, not assumed: the first cut used `saturating_sub` plus a compare twice
+        // per cycle (CIA1 and CIA2) and cost 1.6 % throughput in an alternating A/B — the
+        // sign never flipped across three rounds, which is what separates a real cost from
+        // this host's ~2 % drift. A plain decrement with the reload folded into the same
+        // branch is what the hot path can afford; the mains frequency is read only when
+        // the counter actually fires, because CRA bit 7 changes about never.
+        self.tod_clk -= 1;
+        if self.tod_clk == 0 {
+            self.tod_reload_and_tick();
+        }
+    }
+
+    /// One mains tick (VICE `ciacore_inttod`): the ring counter divides it down to a
+    /// tenth, and a tenth advances the BCD chain. VICE's mains-drift correction
+    /// (`power_ticks`, TODRANDOM) is deliberately NOT ported — it models a real grid
+    /// wobbling around 50 Hz, and a deterministic emulator wants a steady tick.
+    #[cold]
+    #[inline(never)]
+    fn tod_reload_and_tick(&mut self) {
+        let freq = if self.regs[CIA_CRA] & CIA_CRA_TODIN_50HZ != 0 { 50 } else { 60 };
+        self.tod_clk = PAL_CYCLES_PER_SEC / freq;
+        self.tod_mains_tick();
+    }
+
+    fn tod_mains_tick(&mut self) {
+        if self.tod_stopped {
+            return;
+        }
+        // The 3-bit ring goes 000, 001, 011, 111, 110, 100. It matches at 4 for 50 Hz
+        // and 5 for 60 Hz; after a match the tenth increments and the ring restarts.
+        let match_at = if self.regs[CIA_CRA] & CIA_CRA_TODIN_50HZ != 0 { 4 } else { 5 };
+        if self.tod_tick_counter != match_at {
+            self.tod_tick_counter += 1;
+            if self.tod_tick_counter > 5 {
+                self.tod_tick_counter = 0;
+            }
+            return;
+        }
+        self.tod_tick_counter = 0;
+
+        // Advance the BCD chain. Each nibble is 4 bits except the high seconds and
+        // minutes digits, which are 3.
+        let mut ts = self.regs[CIA_TOD_TEN] & 0x0f;
+        let mut sl = self.regs[CIA_TOD_SEC] & 0x0f;
+        let mut sh = (self.regs[CIA_TOD_SEC] >> 4) & 0x07;
+        let mut ml = self.regs[CIA_TOD_MIN] & 0x0f;
+        let mut mh = (self.regs[CIA_TOD_MIN] >> 4) & 0x07;
+        let mut hl = self.regs[CIA_TOD_HR] & 0x0f;
+        let mut hh = (self.regs[CIA_TOD_HR] >> 4) & 0x01;
+        let mut pm = self.regs[CIA_TOD_HR] & 0x80;
+
+        ts = (ts + 1) & 0x0f;
+        if ts == 10 {
+            ts = 0;
+            sl = (sl + 1) & 0x0f;
+            if sl == 10 {
+                sl = 0;
+                sh = (sh + 1) & 0x07;
+                if sh == 6 {
+                    sh = 0;
+                    ml = (ml + 1) & 0x0f;
+                    if ml == 10 {
+                        ml = 0;
+                        mh = (mh + 1) & 0x07;
+                        if mh == 6 {
+                            mh = 0;
+                            // Hours run 1..12: 09:59:59 -> 10:00:00, 12:59:59 -> 01:00:00,
+                            // and AM/PM toggles on reaching 12.
+                            if (hh == 1 && hl == 2) || (hh == 0 && hl == 9) {
+                                hl = hh;
+                                hh ^= 1;
+                            } else {
+                                hl = (hl + 1) & 0x0f;
+                                if hh == 1 && hl == 2 {
+                                    pm ^= 0x80;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.regs[CIA_TOD_TEN] = ts;
+        self.regs[CIA_TOD_SEC] = sl | (sh << 4);
+        self.regs[CIA_TOD_MIN] = ml | (mh << 4);
+        self.regs[CIA_TOD_HR] = hl | (hh << 4) | pm;
+
+        // VICE check_ciatodalarm: an exact match on all four raises the flag.
+        if self.tod_alarm == self.regs[CIA_TOD_TEN..=CIA_TOD_HR] {
+            self.irqflags |= CIA_IM_TOD;
+        }
     }
 
     /// Re-arm both timer alarms after a snapshot restore that set the register file
@@ -731,17 +840,33 @@ impl Cia {
     /// + clock stop on HR write / restart on TEN write. CRB-bit7 (alarm-vs-clock)
     /// is not split here — the gate writes the clock registers.
     fn tod_store(&mut self, a: usize, byte: u8) {
+        let alarm = self.regs[CIA_CRB] & CIA_CRB_ALARM != 0;
         let mut v = byte;
         if a == CIA_TOD_HR {
             v &= 0x9f;
-            // Flip AM/PM when writing hour 12 (clock, not alarm).
-            if (v & 0x1f) == 0x12 {
+            // The AM/PM flip on hour 12 happens when setting the TIME, never the alarm.
+            if !alarm && (v & 0x1f) == 0x12 {
                 v ^= 0x80;
             }
         } else if a == CIA_TOD_MIN || a == CIA_TOD_SEC {
             v &= 0x7f;
         } else if a == CIA_TOD_TEN {
             v &= 0x0f;
+        }
+        if alarm {
+            // CRB bit 7 routes the write to the compare registers, and the clock keeps
+            // running underneath.
+            self.tod_alarm[a - CIA_TOD_TEN] = v;
+            return;
+        }
+        // Writing the hour stops the clock; writing tenths starts it again with a fresh
+        // ring, which is how software sets a time without it advancing mid-write.
+        if a == CIA_TOD_TEN && self.tod_stopped {
+            self.tod_tick_counter = 0;
+            self.tod_stopped = false;
+        }
+        if a == CIA_TOD_HR {
+            self.tod_stopped = true;
         }
         self.regs[a] = v;
     }
