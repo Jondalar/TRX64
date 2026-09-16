@@ -77,6 +77,17 @@ struct Cli {
     /// default) or `u64` (the first Ultimate 64).
     #[arg(long, default_value = "u64ii")]
     speed_table: String,
+
+    /// Spec 853 — attach a 17xx REU of this many KiB before anything runs: 128 (1700),
+    /// 256 (1764), 512 (1750), or an oversized 1024..16384 with the wraparound bug a
+    /// real 1750XL has. A CORE device, so this works on `c64` as well as `u64`.
+    #[arg(long)]
+    reu: Option<u32>,
+
+    /// Spec 853 — attach a GeoRAM of this many KiB instead (a whole number of 16 KiB
+    /// banks). The port holds one device, so this and `--reu` are alternatives.
+    #[arg(long)]
+    georam: Option<u32>,
 }
 
 // ── JSON-RPC 2.0 wire types ───────────────────────────────────────────────────
@@ -3465,6 +3476,107 @@ fn monitor_write(st: &mut State, addr: u16, bytes: &[u8], lens: &str) {
     }
 }
 
+/// Spec 853 D11 — the monitor's `reu` report. Without it a stalled transfer is a black
+/// box, which is the complaint 852 D6 answered for UCI.
+fn reu_report(m: &trx64_core::Machine) -> String {
+    let yn = |b: bool| if b { "yes" } else { "no" };
+    if let Some(s) = m.reu().map(|r| r.status()) {
+        let kind = match s.status & 0x10 {
+            0 => "1700-class (64K chips)",
+            _ => "1764/1750-class (256K chips)",
+        };
+        let ttype = match s.command & 0x03 {
+            0 => "stash (C64 -> REU)",
+            1 => "fetch (REU -> C64)",
+            2 => "swap",
+            _ => "verify",
+        };
+        let mut out = format!(
+            "reu: {} KiB, {kind}\n  status   ${:02X}  verify-error {}  end-of-block {}  irq-pending {}\n",
+            s.size_kb,
+            s.status,
+            yn(s.status & 0x20 != 0),
+            yn(s.status & 0x40 != 0),
+            yn(s.status & 0x80 != 0),
+        );
+        out.push_str(&format!(
+            "  command  ${:02X}  {ttype}  autoload {}  $FF00-trigger {}\n",
+            s.command,
+            yn(s.command & 0x20 != 0),
+            if s.command & 0x10 != 0 { "disabled" } else { "enabled" },
+        ));
+        out.push_str(&format!(
+            "  C64 ${:04X}  REU ${:02X}:{:04X}  length ${:04X}\n",
+            s.base_computer, s.bank_reu, s.base_reu, s.transfer_length
+        ));
+        out.push_str(&format!(
+            "  int-mask ${:02X}  addr-control ${:02X}  IRQ line {}\n",
+            s.int_mask, s.address_control, yn(s.irq)
+        ));
+        out.push_str(&format!(
+            "  armed for $FF00 {}  transfer pending {}\n",
+            yn(s.armed_for_ff00),
+            yn(s.dma_pending)
+        ));
+        if m.expansion_ram_uncovered() {
+            out.push_str(
+                "  NOTE the last restore did NOT cover the REU RAM (Spec 853 D7): the ring\n                 \x20      carries the registers, never the 16 MB. The C64 is restored, this is not.\n",
+            );
+        }
+        return out;
+    }
+    if let Some(g) = m.georam().map(|x| x.status()) {
+        let mut out = format!(
+            "georam: {} KiB, bank {} window {} -> ${:06X}\n  window at $DE00-$DEFF; the two registers at $DFFE/$DFFF are WRITE ONLY\n",
+            g.size_kb,
+            g.bank,
+            g.window,
+            g.bank as u32 * 16384 + g.window as u32 * 256
+        );
+        if m.expansion_ram_uncovered() {
+            out.push_str("  NOTE the last restore did NOT cover the GeoRAM RAM (Spec 853 D7).\n");
+        }
+        return out;
+    }
+    "reu: nothing on the expansion port. Start the daemon with --reu 512 (or --georam 512); \
+     an empty port reads the open bus, not RAM (Spec 840)."
+        .to_string()
+}
+
+/// Spec 853 D11 — `session/reu`, the same facts as data.
+fn reu_status_json(m: &trx64_core::Machine) -> Value {
+    if let Some(s) = m.reu().map(|r| r.status()) {
+        return json!({
+            "kind": "reu",
+            "present": true,
+            "sizeKb": s.size_kb,
+            "status": s.status,
+            "command": s.command,
+            "baseComputer": s.base_computer,
+            "baseReu": s.base_reu,
+            "bankReu": s.bank_reu,
+            "transferLength": s.transfer_length,
+            "intMask": s.int_mask,
+            "addressControl": s.address_control,
+            "irq": s.irq,
+            "armedForFf00": s.armed_for_ff00,
+            "dmaPending": s.dma_pending,
+            "ramUncoveredByLastRestore": m.expansion_ram_uncovered(),
+        });
+    }
+    if let Some(g) = m.georam().map(|x| x.status()) {
+        return json!({
+            "kind": "georam",
+            "present": true,
+            "sizeKb": g.size_kb,
+            "bank": g.bank,
+            "window": g.window,
+            "ramUncoveredByLastRestore": m.expansion_ram_uncovered(),
+        });
+    }
+    json!({ "present": false, "note": "nothing on the expansion port (Spec 853)" })
+}
+
 /// Spec 852 D6 — the monitor's `uci` report.
 fn uci_report(m: &trx64_core::Machine) -> String {
     let Some(s) = m.uci_status() else {
@@ -5849,6 +5961,22 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
         // hung in a UCI handshake is a black box. The firmware side is an API
         // (`Uci::fw_read`/`fw_write`), not a verb: a monitor that could validate a
         // command would be a firmware, and none exists here.
+        // Spec 853 D11 — the REU/GeoRAM as a report. Read-only for the same reason `uci`
+        // is: a verb that silently changes the device when you meant to look gets used
+        // wrong once and distrusted after (815 §4).
+        "reu" | "georam" => {
+            if toks.len() > 1 {
+                return Err(format!(
+                    "{}: read-only — bare `{}` reports the device. Attach one at startup with \
+                     --reu / --georam.\n{}",
+                    toks[0],
+                    toks[0],
+                    reu_report(&st.session.machine)
+                ));
+            }
+            Ok(reu_report(&st.session.machine))
+        }
+
         "uci" => {
             if toks.len() > 1 {
                 return Err(format!(
@@ -9679,6 +9807,12 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
 
         // Spec 852 D6 — the UCI block as data, the same facts the monitor verb `uci` prints.
         // Read-only: pending events are shown, not taken.
+        // Spec 853 D11 — the expansion device as data, the same facts as the `reu` verb.
+        "session/reu" => {
+            let st = state.lock().unwrap();
+            Response::ok(id, reu_status_json(&st.session.machine))
+        }
+
         "session/uci" => {
             let st = state.lock().unwrap();
             Response::ok(id, uci_status_json(&st.session.machine))
@@ -18578,6 +18712,26 @@ async fn main() {
     {
         let mut st = state.lock().unwrap();
         st.speed_profile = machine_profile;
+        // Spec 853 — the port device goes on before power-on, for the same reason 851's
+        // profile does: a program probes for it in its boot stub, inside the warm-up.
+        if let Some(kb) = cli.reu {
+            if !st.session.machine.attach_reu(kb) {
+                eprintln!("[trx64] --reu: {kb} KiB is not an REU size (128 | 256 | 512 | 1024..16384)");
+                std::process::exit(2);
+            }
+            eprintln!("[trx64] REU attached: {kb} KiB");
+        }
+        if let Some(kb) = cli.georam {
+            if cli.reu.is_some() {
+                eprintln!("[trx64] --georam and --reu: the port holds one device, not both");
+                std::process::exit(2);
+            }
+            if !st.session.machine.attach_georam(kb) {
+                eprintln!("[trx64] --georam: {kb} KiB is not a whole number of 16 KiB banks");
+                std::process::exit(2);
+            }
+            eprintln!("[trx64] GeoRAM attached: {kb} KiB");
+        }
         st.u64_speed_table = speed_table;
         st.session.machine.set_machine_profile(machine_profile);
         st.session.machine.set_u64_speed_table(speed_table);
@@ -19293,6 +19447,55 @@ mod batch1_tests {
     // `mon` locks the state and calls `run_monitor` directly, which is precisely the
     // path a forwarded verb does NOT take. Testing through `mon` would pass while the
     // real thing deadlocked.
+
+    // ── Spec 853 D11 — the expansion device is visible, and read-only ──────────
+    //
+    // Without this the REU is reachable only by attaching it at startup and then
+    // guessing: a stalled transfer would be a black box, which is exactly the
+    // complaint 852 D6 answered for UCI.
+
+    #[test]
+    fn the_reu_reports_itself_and_refuses_to_be_driven() {
+        let st = make_state();
+
+        // Nothing attached: say so, and say what an empty port actually reads.
+        let out = mon_exec(&st, "reu");
+        assert!(out.contains("nothing on the expansion port"), "{out}");
+        assert!(out.contains("open bus"), "the 840 fact belongs in the hint: {out}");
+        assert_eq!(call(&st, "session/reu", json!({}))["present"], json!(false));
+
+        // Attach one the way `--reu 512` does.
+        assert!(st.lock().unwrap().session.machine.attach_reu(512));
+
+        let out = mon_exec(&st, "reu");
+        assert!(out.contains("512 KiB"), "{out}");
+        assert!(out.contains("stash") || out.contains("verify"), "the command is decoded: {out}");
+
+        let r = call(&st, "session/reu", json!({}));
+        assert_eq!(r["kind"], json!("reu"));
+        assert_eq!(r["present"], json!(true));
+        assert_eq!(r["sizeKb"], json!(512));
+        assert_eq!(r["dmaPending"], json!(false));
+        assert_eq!(r["ramUncoveredByLastRestore"], json!(false));
+
+        // Read-only: an argument is refused rather than silently doing something.
+        let err = mon(&st, "reu 512").expect_err("an argument must be refused");
+        assert!(err.contains("read-only"), "{err}");
+    }
+
+    #[test]
+    fn a_georam_reports_as_itself() {
+        let st = make_state();
+        assert!(st.lock().unwrap().session.machine.attach_georam(512));
+
+        let out = mon_exec(&st, "georam");
+        assert!(out.contains("512 KiB"), "{out}");
+        assert!(out.contains("WRITE ONLY"), "the register quirk is the point: {out}");
+
+        let r = call(&st, "session/reu", json!({}));
+        assert_eq!(r["kind"], json!("georam"));
+        assert_eq!(r["sizeKb"], json!(512));
+    }
 
     fn mon_exec(st: &SharedState, cmd: &str) -> String {
         let resp = dispatch(
