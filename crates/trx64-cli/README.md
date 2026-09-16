@@ -75,7 +75,7 @@ The command line has three namespaces, picked by the first character:
 
 | You type | Goes to |
 |---|---|
-| a **bare line** (`d c000`, `r`, `bk e000`, `g`, `trace on`, `whowrote d020`) | the **monitor** — the full ~128-verb VICE superset |
+| a **bare line** (`d c000`, `r`, `bk e000`, `g`, `trace on`, `whowrote d020`) | the **monitor** — the full 123-verb VICE superset |
 | a **`/`-prefixed** line (`/run`, `/mount disk.d64`, `/reset`) | a **VM / machine command** |
 | a **`!`-prefixed** line (`!ls`, `!cd docs`, `!load "game.prg"`) | the **filesystem** — the monitor's file shell, re-prefixed |
 

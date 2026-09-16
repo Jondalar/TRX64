@@ -95,7 +95,7 @@ Details: [`crates/trx64-cli/README.md`](crates/trx64-cli/README.md).
 
 ## Monitor commands
 
-Superset based on VICE, ~130 verbs. Full reference: **[MONITOR.md](MONITOR.md)**;
+Superset based on VICE, 123 verbs. Full reference: **[MONITOR.md](MONITOR.md)**;
 `help` prints the live list.
 
 | | |
@@ -117,8 +117,11 @@ Superset based on VICE, ~130 verbs. Full reference: **[MONITOR.md](MONITOR.md)**
 ## Daemon & API
 
 ```sh
-trx64-daemon --project <dir> --port 4312 [--stream]
-trx64-daemon --machine u64 --reu 512        # an Ultimate with a 512 KiB REU
+trx64-daemon --project <dir> --port 4312      # A/V streams by default
+trx64-daemon --machine u64 --reu 512          # an Ultimate with a 512 KiB REU
+trx64-daemon --georam 512                     # GeoRAM instead — the port holds one device
+trx64-daemon --machine u64 --speed-table u64  # the first Ultimate 64 (default: u64ii)
+trx64-daemon --headless                       # no A/V, no auto-run: command-driven only
 ```
 
 JSON-RPC 2.0 over WebSocket. One machine per process.
@@ -130,7 +133,9 @@ JSON-RPC 2.0 over WebSocket. One machine per process.
 A typical flow: `session/create` → `debug/run` → `monitor/exec` / `trace/*` / `vic/inspect`
 → `checkpoint/*` to scrub → `snapshot/dump` to persist.
 
-`--stream` adds the per-frame driver: video, breakpoints, JAM auto-break, recorder.
+The per-frame driver — video, breakpoints, JAM auto-break, recorder — is on by default.
+`--headless` opts out: no A/V push, no auto-run on connect, and the machine advances only
+on an explicit `session/run`. That is the mode for byte-exact oracle and tool daemons.
 
 For embedding in the Apple universe, `trx64-ffi` exposes a typed uniffi library (Swift bindings) —
 [`crates/trx64-ffi/API.md`](crates/trx64-ffi/API.md).
