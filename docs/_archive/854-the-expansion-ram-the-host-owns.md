@@ -1,6 +1,6 @@
 # Spec 854 — The expansion RAM the host owns
 
-**Status:** PROPOSED 2026-09-16.
+**Status:** BUILT 2026-09-16.
 **Repos:** TRX64 only.
 **Number:** 854 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`).
 **Depends on:** Spec 853 (the REU and GeoRAM as port devices). This is additive — a second
@@ -124,3 +124,38 @@ The bridge maps rather than lends a copy: it forwards `C64_REU_ENABLE` and
   `--reu 512` keeps meaning what it means today.
 - **The battery-backed GeoRAM** (853 §6) — still out.
 - **Writing a borrowed store to disk.** It is the host's memory; the host persists it.
+
+## §7 As built
+
+**Where it lives.** `ExpansionRam` + `OwnedRam` in `expansion.rs`; the store itself in
+`Reu` and `GeoRam` as `Option<Box<dyn ExpansionRam>>`. On `Machine`:
+`attach_reu_borrowed`, `attach_georam_borrowed`, `set_expansion_ram`. Gate: the 854 cases
+in `tests/reu_gate.rs` (38 total with 853's).
+
+**What the build settled against §3.**
+
+- **The seam was already there.** 853 had put every REU access to its own RAM behind
+  `store_to_reu` and `read_from_reu`, so swapping the storage touched two functions and
+  nothing else inside the device. That was luck turned into design by 853, not by this
+  spec, and it is why 854 is small.
+- **D6 cost 38 call sites**, 10 in production code and 28 in 853's gate fixtures. A regex
+  pass did them and the compiler found exactly the two it could not: `usize` loop indices
+  handed to a `u32` offset. Nothing subtle survived, which is what a mechanical change
+  should look like.
+- **A bulk `write_ram` was added** after the first cut wrote images a byte at a time
+  through a trait object. Once at startup that is fine; in the snapshot restore it is not.
+- **`is_owned()` lives on the STORE, not on the device.** The snapshot asks the bytes who
+  they belong to rather than the device what mode it is in, so a host that lends an owned
+  store gets the honest answer without the device tracking a second flag.
+- **No daemon change, and that is deliberate.** `--reu 512` still means an owned store;
+  the borrowed mode is an embedding API for a host that runs the core in-process, and a
+  flag for it would describe a machine the daemon cannot be.
+- **D3 needed no new concept.** "Nothing lent" reads the floating-bus latch and drops
+  writes, which is exactly what 853 already did for an address with no DRAM behind it. The
+  gate asserts a transfer against no store still COMPLETES — end-of-block set, registers
+  where a finished transfer leaves them.
+
+**Measured.** `reu_gate` 38/38, full gate green (7 suites / 105 tests, daemon 382, seven
+games 7/7), core lib 321. The decisive case is `a_transfer_lands_in_the_hosts_own_memory`:
+the host reads the very bytes the device wrote, and a host write is what the C64 fetches
+back — the two-copies problem UE2 found, demonstrated gone.

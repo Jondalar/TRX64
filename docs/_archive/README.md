@@ -170,6 +170,29 @@ Slot, where any number coexist because they claim no `game`/`exrom` and map only
 IO1/IO2 — and the core did not have to be opened for it, because a device that holds
 several satisfies the same trait.
 
+## The expansion RAM the host owns — 854
+
+UE2's integration of 853 was green, and it came back with the one thing 853 §5 had left to
+the bridge: on the U64 the REU's RAM is the firmware's DDR, and the firmware preloads an
+image by writing there with its own CPU. A device that allocates its own sixteen megabytes
+gives two copies, and every preload lands in the one the C64 never reads.
+
+**Decision:** 853 stays closed and this is a SECOND storage mode, not a correction. Owning
+the RAM is right for a standalone machine and is what makes a `.c64re` dump round-trip;
+854 adds the borrowed store, the same shape the bridge already uses for the cartridge.
+
+**Decision:** the store is a trait the device HOLDS, not a borrow threaded through a call.
+GeoRAM decided it — it reads its RAM on every `$DE00-$DEFF` access, not only during a
+transfer, so a store passed into `run_dma` would serve the REU and not it. And a `'static`
+device cannot hold a `&mut [u8]` without putting a lifetime on `Machine` and every call
+site in the crate.
+
+**Decision:** "nothing lent" is not an error state. It reads the floating-bus latch and
+drops writes — the behaviour 853 already had for an address with no DRAM behind it — so a
+bridge that lends only around bus accesses is in the normal case between them, not a
+broken one. And a borrowed store is in no snapshot: those bytes belong to the host's memory
+image, which persists them itself.
+
 ---
 
 Everything here is finished. If a row's subject turns out to be open after all, it needs

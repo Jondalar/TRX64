@@ -1292,14 +1292,24 @@ fn expansion_node(m: &Machine, omit_ram: bool) -> serde_json::Value {
             "kind": "reu",
             "sizeKb": reu.size_kb(),
             "regs": reu.snapshot_registers().to_vec(),
-            "ram": if omit_ram { serde_json::Value::Null } else { ta_u8(reu.ram()) },
+            // Spec 854 D7 — a BORROWED store is in no snapshot either: those bytes are the
+            // host's memory image, which persists them itself.
+            "ram": if omit_ram || !reu.ram_is_owned() {
+                serde_json::Value::Null
+            } else {
+                ta_u8(&reu.ram_slice(0, reu.ram_len()))
+            },
         })
     } else if let Some(g) = m.georam() {
         json!({
             "kind": "georam",
             "sizeKb": g.size_kb(),
             "regs": [g.window(), g.bank()],
-            "ram": if omit_ram { serde_json::Value::Null } else { ta_u8(g.ram()) },
+            "ram": if omit_ram || !g.ram_is_owned() {
+                serde_json::Value::Null
+            } else {
+                ta_u8(&g.ram_slice(0, g.ram_len()))
+            },
         })
     } else {
         serde_json::Value::Null
@@ -1523,11 +1533,9 @@ pub fn restore_runtime_checkpoint(
             match node.get("ram").and_then(ta_u8_decode) {
                 Some(bytes) if !bytes.is_empty() => {
                     if let Some(reu) = m.reu_mut() {
-                        let n = bytes.len().min(reu.ram().len());
-                        reu.ram_mut()[..n].copy_from_slice(&bytes[..n]);
+                        reu.write_ram(0, &bytes);
                     } else if let Some(g) = m.georam_mut() {
-                        let n = bytes.len().min(g.ram().len());
-                        g.ram_mut()[..n].copy_from_slice(&bytes[..n]);
+                        g.write_ram(0, &bytes);
                     }
                     m.set_expansion_ram_uncovered(false);
                 }

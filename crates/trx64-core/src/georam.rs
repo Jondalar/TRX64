@@ -10,7 +10,7 @@
 //! The battery-backed variant (BBG), where retaining the contents IS the hardware's
 //! behaviour, is deliberately out of scope (853 §6, D9).
 
-use crate::expansion::{Access, ExpansionDevice};
+use crate::expansion::{Access, ExpansionDevice, ExpansionRam, OwnedRam};
 
 /// The window lives in IO1; the two registers at the top of IO2, mirrored down to
 /// `$DF80` (`georam_io2_device`, georam.c:159-173).
@@ -18,7 +18,9 @@ const IO2_REGS_BASE: u16 = 0xDF80;
 
 /// A GeoRAM: `size_kb` KiB of RAM behind a 256-byte window.
 pub struct GeoRam {
-    ram: Vec<u8>,
+    /// Spec 854 — the same borrowed store the REU takes. On a U64 both are the same
+    /// setting over the same DDR region, so lending both the same store IS that sharing.
+    store: Option<Box<dyn ExpansionRam>>,
     size_kb: u32,
     /// `georam[0]` — the window, 0..63.
     window: u8,
@@ -28,7 +30,12 @@ pub struct GeoRam {
 
 impl Clone for GeoRam {
     fn clone(&self) -> Self {
-        GeoRam { ram: self.ram.clone(), size_kb: self.size_kb, window: self.window, bank: self.bank }
+        GeoRam {
+            store: self.store.as_ref().and_then(|s| s.clone_ram()),
+            size_kb: self.size_kb,
+            window: self.window,
+            bank: self.bank,
+        }
     }
 }
 
@@ -40,7 +47,7 @@ impl GeoRam {
             return None;
         }
         Some(GeoRam {
-            ram: vec![0; (size_kb as usize) << 10],
+            store: Some(Box::new(OwnedRam::new((size_kb as usize) << 10))),
             size_kb,
             window: 0,
             bank: 0,
@@ -51,12 +58,49 @@ impl GeoRam {
         self.size_kb
     }
 
-    pub fn ram(&self) -> &[u8] {
-        &self.ram
+    pub fn ram_len(&self) -> u32 {
+        self.store.as_ref().map(|s| s.len()).unwrap_or(0)
     }
 
-    pub fn ram_mut(&mut self) -> &mut [u8] {
-        &mut self.ram
+    pub fn ram_byte(&self, off: u32) -> u8 {
+        self.store.as_ref().map(|s| s.read(off)).unwrap_or(0)
+    }
+
+    pub fn set_ram_byte(&mut self, off: u32, value: u8) {
+        if let Some(s) = self.store.as_mut() {
+            s.write(off, value);
+        }
+    }
+
+    pub fn ram_slice(&self, off: u32, len: u32) -> Vec<u8> {
+        match self.store.as_ref() {
+            None => Vec::new(),
+            Some(s) => {
+                let end = off.saturating_add(len).min(s.len());
+                (off..end).map(|a| s.read(a)).collect()
+            }
+        }
+    }
+
+
+    /// Bulk write. A byte at a time through a trait object is fine once at startup and
+    /// silly everywhere else.
+    pub fn write_ram(&mut self, off: u32, bytes: &[u8]) -> u32 {
+        let n = (bytes.len() as u32).min(self.ram_len().saturating_sub(off));
+        if let Some(s) = self.store.as_mut() {
+            for (i, b) in bytes.iter().take(n as usize).enumerate() {
+                s.write(off + i as u32, *b);
+            }
+        }
+        n
+    }
+
+    pub fn ram_is_owned(&self) -> bool {
+        self.store.as_ref().map(|s| s.is_owned()).unwrap_or(false)
+    }
+
+    pub fn set_store(&mut self, store: Option<Box<dyn ExpansionRam>>) -> Option<Box<dyn ExpansionRam>> {
+        std::mem::replace(&mut self.store, store)
     }
 
     pub fn window(&self) -> u8 {
@@ -68,8 +112,8 @@ impl GeoRam {
     }
 
     /// georam.c:191-198 — `georam_ram[(bank * 16384) + (window * 256) + addr]`.
-    fn offset(&self, addr: u16) -> usize {
-        (self.bank as usize) * 16384 + (self.window as usize) * 256 + (addr & 0xFF) as usize
+    fn offset(&self, addr: u16) -> u32 {
+        (self.bank as u32) * 16384 + (self.window as u32) * 256 + (addr & 0xFF) as u32
     }
 
     /// georam.c:213-229. The wrap is repeated subtraction, not a mask — with a size that
@@ -113,7 +157,7 @@ impl ExpansionDevice for GeoRam {
     fn read(&mut self, a: Access, _cart: Option<u8>) -> Option<u8> {
         match a.addr & 0xFF00 {
             // IO1: the window. Always valid.
-            0xDE00 => Some(self.ram[self.offset(a.addr)]),
+            0xDE00 => Some(self.ram_byte(self.offset(a.addr))),
             // IO2: the registers are WRITE ONLY — a read is never valid.
             _ => None,
         }
@@ -121,7 +165,7 @@ impl ExpansionDevice for GeoRam {
 
     fn peek(&self, addr: u16, _cart: Option<u8>) -> Option<u8> {
         match addr & 0xFF00 {
-            0xDE00 => Some(self.ram[self.offset(addr)]),
+            0xDE00 => Some(self.ram_byte(self.offset(addr))),
             // georam.c:200-206 — the peek door does show the two registers.
             _ if addr >= IO2_REGS_BASE => {
                 if addr & 0xFFFE == 0xDFFE {
@@ -138,7 +182,7 @@ impl ExpansionDevice for GeoRam {
         match a.addr & 0xFF00 {
             0xDE00 => {
                 let off = self.offset(a.addr);
-                self.ram[off] = value;
+                self.set_ram_byte(off, value);
             }
             _ if a.addr >= IO2_REGS_BASE => self.store_reg(a.addr, value),
             _ => {}
@@ -166,8 +210,8 @@ mod tests {
         g.write(a(0xDEFF), 0x22);
         assert_eq!(g.read(a(0xDE00), None), Some(0x11));
         assert_eq!(g.read(a(0xDEFF), None), Some(0x22));
-        assert_eq!(g.ram[0], 0x11);
-        assert_eq!(g.ram[255], 0x22);
+        assert_eq!(g.ram_byte(0), 0x11);
+        assert_eq!(g.ram_byte(255), 0x22);
     }
 
     #[test]
@@ -185,7 +229,7 @@ mod tests {
         g.write(a(0xDE10), 0x5A);
         assert_eq!(g.bank, 3);
         assert_eq!(g.window, 2);
-        assert_eq!(g.ram[3 * 16384 + 2 * 256 + 0x10], 0x5A);
+        assert_eq!(g.ram_byte(3 * 16384 + 2 * 256 + 0x10), 0x5A);
     }
 
     #[test]

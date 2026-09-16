@@ -308,3 +308,63 @@ impl SnoopSet {
         self.bits.iter().all(|w| *w == 0)
     }
 }
+
+// ── Spec 854 — the expansion RAM the host owns ────────────────────────────────────
+
+/// Where an expansion device's RAM actually lives.
+///
+/// 853 gave the REU a `Vec<u8>` of its own, which is right for a standalone machine and
+/// is what makes a `.c64re` dump round-trip. It is wrong inside a host: on the U64 the
+/// REU's RAM IS the firmware's DDR, and the firmware preloads an image by writing there
+/// with its own CPU — so a device that allocates its own gives two copies, and every
+/// preload lands in the one the C64 never reads.
+///
+/// This is a trait the device HOLDS, not a borrow threaded through a call, for two
+/// reasons. GeoRAM reads its RAM on every `$DE00-$DEFF` access rather than only during a
+/// transfer, so a store handed to `run_dma` would serve the REU and not it. And a
+/// `'static` device cannot hold a `&mut [u8]` without putting a lifetime on `Machine` and
+/// every call site in the crate.
+pub trait ExpansionRam: Send {
+    fn len(&self) -> u32;
+    fn read(&self, off: u32) -> u8;
+    fn write(&mut self, off: u32, value: u8);
+    /// A copy for a cloned machine, or `None` when the bytes belong to a host — the same
+    /// rule `ExpansionDevice::clone_device` follows.
+    fn clone_ram(&self) -> Option<Box<dyn ExpansionRam>> {
+        None
+    }
+    /// True when this device owns the bytes. A borrowed store is in no snapshot: its
+    /// contents belong to the host's memory image, which has its own persistence.
+    fn is_owned(&self) -> bool {
+        false
+    }
+}
+
+/// The store a standalone machine gets.
+pub struct OwnedRam(pub Vec<u8>);
+
+impl OwnedRam {
+    pub fn new(bytes: usize) -> Self {
+        OwnedRam(vec![0; bytes])
+    }
+}
+
+impl ExpansionRam for OwnedRam {
+    fn len(&self) -> u32 {
+        self.0.len() as u32
+    }
+    fn read(&self, off: u32) -> u8 {
+        self.0.get(off as usize).copied().unwrap_or(0)
+    }
+    fn write(&mut self, off: u32, value: u8) {
+        if let Some(b) = self.0.get_mut(off as usize) {
+            *b = value;
+        }
+    }
+    fn clone_ram(&self) -> Option<Box<dyn ExpansionRam>> {
+        Some(Box::new(OwnedRam(self.0.clone())))
+    }
+    fn is_owned(&self) -> bool {
+        true
+    }
+}
