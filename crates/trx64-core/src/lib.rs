@@ -47,6 +47,8 @@ pub mod sid;
 pub mod spi_flash;
 pub mod tables;
 /// Spec 852 — the Ultimate Command Interface, the U64 profile's own device on the port.
+pub mod georam;
+pub mod reu;
 pub mod uci;
 pub mod vic;
 pub mod vic_draw;
@@ -70,6 +72,8 @@ pub use iec::IecCore;
 pub use resid_audio::{SidAudioEngine, SidWriteRecord, WavFormat};
 pub use resid_ffi::{Resid, ResidConfig};
 pub use sid::Sid6581;
+pub use georam::{GeoRam, GeoRamStatus};
+pub use reu::{DmaBus, Reu, ReuStatus};
 pub use uci::{Uci, UciEvents, UciStatus};
 pub use vic::VicII;
 
@@ -1329,6 +1333,124 @@ impl Machine {
         old
     }
 
+    // ── Spec 853 — the REU and GeoRAM ─────────────────────────────────────────────────
+
+    /// Attach a 17xx REU of `size_kb` KiB (128/256/512, or an oversized 1024..16384).
+    /// A CORE device: this works on every profile, not only `u64` (owner, 2026-09-16).
+    /// Returns false for a size no REU ever had.
+    pub fn attach_reu(&mut self, size_kb: u32) -> bool {
+        match crate::reu::Reu::new(size_kb) {
+            Some(reu) => {
+                self.attach_expansion(Box::new(reu));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Attach a GeoRAM of `size_kb` KiB (a whole number of 16 KiB banks).
+    pub fn attach_georam(&mut self, size_kb: u32) -> bool {
+        match crate::georam::GeoRam::new(size_kb) {
+            Some(g) => {
+                self.attach_expansion(Box::new(g));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The REU on the port, if that is what is attached.
+    pub fn reu(&self) -> Option<&crate::reu::Reu> {
+        let dev: &dyn crate::expansion::ExpansionDevice = self.expansion.as_deref()?;
+        dev.as_any().downcast_ref::<crate::reu::Reu>()
+    }
+
+    pub fn reu_mut(&mut self) -> Option<&mut crate::reu::Reu> {
+        let dev: &mut dyn crate::expansion::ExpansionDevice = self.expansion.0.as_deref_mut()?;
+        dev.as_any_mut().downcast_mut::<crate::reu::Reu>()
+    }
+
+    /// The GeoRAM on the port, if that is what is attached.
+    pub fn georam(&self) -> Option<&crate::georam::GeoRam> {
+        let dev: &dyn crate::expansion::ExpansionDevice = self.expansion.as_deref()?;
+        dev.as_any().downcast_ref::<crate::georam::GeoRam>()
+    }
+
+    pub fn georam_mut(&mut self) -> Option<&mut crate::georam::GeoRam> {
+        let dev: &mut dyn crate::expansion::ExpansionDevice = self.expansion.0.as_deref_mut()?;
+        dev.as_any_mut().downcast_mut::<crate::georam::GeoRam>()
+    }
+
+    /// Spec 853 D3 — run a transfer a device has armed, at the instruction boundary.
+    ///
+    /// The device is TAKEN OUT of its place for the duration: the transfer drives the
+    /// same `FullBus` the CPU executes through, and a bus master does not answer its own
+    /// cycles. That is also what VICE's `reu_dma_active` amounts to — while a transfer
+    /// runs, the registers read 0 and ignore writes.
+    ///
+    /// Cycles land on `c64_core.clk`, so the caller's SID tick and drive catch-up cover
+    /// the transfer without knowing it happened.
+    pub fn run_pending_dma(&mut self) {
+        let mut dev = match self.expansion.take() {
+            Some(d) => d,
+            None => return,
+        };
+        {
+            let table = self.cia_table.clone();
+            let port_active = self.port_active();
+            let mut fb = full::FullBus {
+                ram: &mut self.ram,
+                basic_rom: &self.basic_rom,
+                kernal_rom: &self.kernal_rom,
+                char_rom: &self.char_rom,
+                io: &mut self.io_shadow,
+                vic: &mut self.vic,
+                cia1: &mut self.cia1,
+                cia2: &mut self.cia2,
+                cia_table: &table,
+                sid_regs: &mut self.sid_regs,
+                sid: &mut self.sid,
+                config: self.memconfig,
+                memconfig_table: &self.memconfig_table,
+                port_dir: self.port_dir,
+                port_data: self.port_data,
+                clk: self.c64_core.clk,
+                cia2_pa_out: self.cia2_pa_out,
+                side_effects: Vec::new(),
+                read_side_effects: Vec::new(),
+                drive: &mut self.drive8,
+                iec: &mut self.iec,
+                keyboard: &self.keyboard,
+                joystick1: self.joystick1,
+                joystick2: self.joystick2,
+                drive_c64_ref: self.drive_c64_ref,
+                cartridge: self.cartridge.as_mut(),
+                cart_reads: None,
+                cart_account_suspend: false,
+                port_profile: self.port_profile.as_mut(),
+                port_host: None,
+                snoop: self.expansion_snoop.as_deref(),
+                // A DMA cycle IS a bus cycle, not a host reaching in between instructions.
+                access_kind: crate::expansion::AccessKind::Cpu,
+                stalled: 0,
+                stalled_on_bus: 0,
+                device_stop: false,
+                host_lines: self.expansion_host_lines,
+                port_active,
+            };
+            if let Some(reu) = dev.as_any_mut().downcast_mut::<crate::reu::Reu>() {
+                reu.run_dma(&mut fb);
+            }
+            self.c64_core.clk = fb.clk;
+            self.memconfig = fb.config;
+            self.port_dir = fb.port_dir;
+            self.port_data = fb.port_data;
+            self.cia2_pa_out = fb.cia2_pa_out;
+            self.drive_c64_ref = fb.drive_c64_ref;
+        }
+        self.expansion.replace(dev);
+    }
+
     // ── Spec 852 — the UCI block behind the profile place ──────────────────────────────
 
     /// The Ultimate Command Interface, Some on the `u64` profile.
@@ -2496,6 +2618,14 @@ impl Machine {
                 // Persist the push-flush reference (the drive may have been advanced
                 // mid-instruction by a $DD00 access inside the FullBus).
                 self.drive_c64_ref = bus.fb.drive_c64_ref;
+            }
+            // Spec 853 D3 — a bus master that armed a transfer runs it HERE, before the
+            // cycle cost is taken: its cycles then fold into the SID tick and the drive
+            // catch-up below, which is what makes a transfer invisible to everything that
+            // only watches `clk`. On a stock machine `port_active` is false and this is
+            // one already-computed bool.
+            if port_active && self.expansion.as_ref().is_some_and(|d| d.dma_pending()) {
+                self.run_pending_dma();
             }
             // Tick SID by this instruction's cycle cost — wall-clock batch tick
             // matching TS integrated-session.ts:946 `sid.tick(totalCycles)`.

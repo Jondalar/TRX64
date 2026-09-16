@@ -118,6 +118,12 @@ pub trait ExpansionDevice: AsAny + Send {
     fn take_stop(&mut self) -> bool {
         false
     }
+    /// Spec 853 — a bus master with a transfer waiting. Asked at every instruction
+    /// boundary while the port is active, so it is a vtable call and never a downcast.
+    /// A device that only answers the bus never overrides it.
+    fn dma_pending(&self) -> bool {
+        false
+    }
     /// A copy for a cloned machine, or None. Default None: a host's device belongs to
     /// the host, and a copy of the machine — a sandbox, a scratch instance — must not
     /// share it. A profile's device that is part of the machine (Spec 852's UCI block)
