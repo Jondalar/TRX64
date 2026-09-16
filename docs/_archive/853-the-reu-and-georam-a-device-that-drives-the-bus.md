@@ -1,6 +1,6 @@
 # Spec 853 — The REU and GeoRAM: a device that drives the bus
 
-**Status:** PROPOSED 2026-09-16.
+**Status:** BUILT 2026-09-16.
 **Repos:** TRX64 only. C64RE gains nothing: this is a machine fact.
 **Number:** 853 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`).
 **Depends on:** Spec 850 (the port as a device interface) for the device place, the
@@ -251,3 +251,51 @@ storage or maps the host's. That choice is the bridge's and is not settled here.
 - **Writing an REU image back to disk** (owner, 2026-09-16).
 - **Expansion RAM in the checkpoint ring** (owner, 2026-09-16), and therefore full rewind
   fidelity for REU software.
+
+## §7 As built
+
+**Where it lives.** `crates/trx64-core/src/reu.rs` (the 17xx and its DMA),
+`georam.rs`, `ExpansionChain` in `expansion.rs`, `DmaBus for FullBus` in `full.rs`,
+and on `Machine`: `attach_reu`/`attach_georam`/`attach_expansion_also`, `reu`/`georam`
+(and their `_mut`), `run_pending_dma`, `expansion_ram_slice`, `load_expansion_image`,
+`expansion_ram_uncovered`. Daemon: `--reu`/`--georam`/`--reu-image`, the monitor verb
+`reu` (and `georam`), and `session/reu` with an optional RAM window. Gate:
+`tests/reu_gate.rs`, 31 cases, in `scripts/gate.sh` step [2/4].
+
+**What the build settled against §3.**
+
+- **The DMA runs at the instruction boundary, not from inside the device's `write`.** A
+  device has no bus there. The command write ARMS; the run loop asks `dma_pending()` — a
+  vtable call, never a downcast — and runs the transfer before the instruction's cycle
+  cost is taken, so those cycles fold into the SID tick and the drive catch-up and
+  nothing that watches `clk` learns a transfer happened.
+- **The `$FF00` trigger needed no latch.** VICE carries `reu_dma_triggered` because its
+  CPU-core hook can fire twice; 850's snoop reports both write cycles of an RMW, one
+  cycle apart. But arming is a STATE: the first write consumes it, the second finds
+  `Immediate` and does nothing. The first cut latched per cycle, which was wrong twice
+  over — the cycles are not the same, and VICE's own flag is per instruction.
+- **D1's chain hid a Rust trap worth recording.** `AsAny` has a blanket impl for every
+  `T: Any`, and `Box<dyn ExpansionDevice>` is itself such a `T` — so `as_any()` on the
+  BOX returns the box as the concrete type and every downcast silently fails. The chain's
+  lookups, `attach_expansion_also` and `run_pending_dma` all deref to `&dyn
+  ExpansionDevice` first. Three gate cases failed on exactly this and were right to.
+- **The chain fans a snooped write out to every member**, not only to the one that
+  registered the address. That is what 850's two places already did, and on the real port
+  every device sees every bus cycle. A gate case assumed per-device filtering and was
+  corrected, not the code.
+- **D11 is not a `peek_lens`.** That door takes a `u16` and an REU holds up to 16 MB, so
+  a lens keyed on a C64 address cannot address expansion RAM at all. The window is its
+  own reader (`expansion_ram_slice`), surfaced on `session/reu` rather than the verb, so
+  the verb stays the pure report 815 §4 asks for.
+- **`--georam` beside `--reu` is refused.** The port holds one device, and silently
+  dropping one of two explicit flags gives the person a machine they did not ask for.
+
+**Measured.** The stock machine pays nothing: a gate case asserts a program's cycle count
+is identical with and without an idle REU attached, and `perf_bench` pure headless reads
+11.373 MHz median (11.254 / 11.373 / 11.432) against 851's 11.53/11.39 and 852's
+11.21/11.25 — inside the band this host drifts in between rounds. Full gate green: 7
+suites / 98 gate tests, daemon 382, seven games 7/7; core lib 321.
+
+**Still assumptions, deliberately.** Where VICE and the Ultimate's VHDL differ the port
+follows VICE, and what only hardware could settle is not guessed: the owner's rule stands
+that nothing here is measured against a real machine until a real problem demands it.

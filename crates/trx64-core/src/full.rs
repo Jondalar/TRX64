@@ -1261,3 +1261,45 @@ mod joystick_gate_tests {
         }
     }
 }
+
+// ── Spec 853 — the bus a DMA device drives ────────────────────────────────────────
+//
+// Spec 850 gave a device the hold and no bus. This is the bus: the SAME `FullBus` the
+// CPU executes through, so a transfer sees the machine's banking, its I/O and its
+// cartridge exactly as an instruction would.
+//
+// The three clock calls are VICE's `reu_ba` callbacks (`reu.c:590-599`) one for one:
+// `clk_inc` is `maincpu_clk++` with the per-cycle VIC tick CLK_INC does, `ba_low` is
+// `reu_ba.check()` reading the flag the last `vicii_cycle()` latched, and `steal` is
+// `reu_ba.steal()`.
+impl<'a> crate::reu::DmaBus for FullBus<'a> {
+    fn dma_read(&mut self, addr: u16) -> u8 {
+        crate::cpu::Bus::read(self, addr)
+    }
+
+    fn dma_write(&mut self, addr: u16, value: u8) {
+        crate::cpu::Bus::write(self, addr, value)
+    }
+
+    fn clk_inc(&mut self) {
+        self.clk = self.clk.wrapping_add(1);
+        let vbank = self.vic_bank_base();
+        let view = crate::vic::VicMemView {
+            ram: self.ram,
+            char_rom: Some(self.char_rom),
+            color_ram: &self.io[0x0800..0x0c00],
+            vbank,
+        };
+        self.vic.tick(&view);
+        self.cia1.clk = self.clk;
+        self.cia2.clk = self.clk;
+    }
+
+    fn ba_low(&mut self) -> bool {
+        self.vic.ba_low_flag
+    }
+
+    fn steal(&mut self) {
+        crate::cpu::Bus::check_ba_before_read(self);
+    }
+}

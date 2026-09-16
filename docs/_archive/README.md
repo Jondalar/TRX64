@@ -141,6 +141,35 @@ waiting on a server that does not exist. The block survives a C64 reset — only
 only the hardware can answer stays a stated assumption: what the unlock tolerates in between, and that a
 read the VIC stretched counts once per cycle its address was on the bus (4 on a badline, not 44).
 
+## A device that drives the bus — 853
+
+Issue #19 asked for the REU and was closed by 840: the cruncher jammed because an empty
+port echoed writes, not because an REU was missing. What remained was the feature, and it
+is a want rather than a defect — which is why it could wait for the decisions instead of
+being rushed.
+
+**Decision:** VICE's `reu.c` is the reference, ported exactly, including the parts that
+read like mistakes — the 1700's own wrap, the "hacked REU" above 512 KB where the REC chip
+still wraps at 512 KB, the Half-Autoload-Bug, and verify's three documented weirdnesses.
+Where VICE and the Ultimate's closed VHDL differ, VICE wins.
+
+**Decision (owner, 2026-09-16):** the REU is a CORE device, on `c64` and not only `u64`;
+its RAM is OUT of the checkpoint ring and IN the `.c64re` dump; nothing is written back to
+the filesystem; GeoRAM is in scope, because it is the same shelf at the opposite cost — no
+DMA at all, 723 lines against `reu.c`'s 1688.
+
+**Decision:** ring and snapshot are two different things, and the split is an option on
+the one capture rather than a second serializer — Spec 807 had drawn that line already.
+16 MB in a 32 MiB ring would not shrink it, it would destroy it. And where a restore
+cannot cover the expansion RAM it SAYS so: 792's lesson was that the silence is the
+defect, not the gap. That is also why an absent node leaves the device alone instead of
+ejecting it the way a missing cartridge node does.
+
+**Decision:** 850's two device places became a list. VICE answered this first with its IO
+Slot, where any number coexist because they claim no `game`/`exrom` and map only into
+IO1/IO2 — and the core did not have to be opened for it, because a device that holds
+several satisfies the same trait.
+
 ---
 
 Everything here is finished. If a row's subject turns out to be open after all, it needs

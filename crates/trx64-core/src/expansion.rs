@@ -118,12 +118,141 @@ pub trait ExpansionDevice: AsAny + Send {
     fn take_stop(&mut self) -> bool {
         false
     }
+    /// Spec 853 — a bus master with a transfer waiting. Asked at every instruction
+    /// boundary while the port is active, so it is a vtable call and never a downcast.
+    /// A device that only answers the bus never overrides it.
+    fn dma_pending(&self) -> bool {
+        false
+    }
     /// A copy for a cloned machine, or None. Default None: a host's device belongs to
     /// the host, and a copy of the machine — a sandbox, a scratch instance — must not
     /// share it. A profile's device that is part of the machine (Spec 852's UCI block)
     /// returns a copy of itself.
     fn clone_device(&self) -> Option<Box<dyn ExpansionDevice>> {
         None
+    }
+}
+
+/// Spec 853 D1 — several devices in one place.
+///
+/// 850 gave the port two places: the machine profile's own device and a host's. That was
+/// enough while one thing sat on it. A `u64` running the UCI block (profile) with an REU
+/// attached, inside a host that wants its own device, is three devices in two places.
+///
+/// VICE answers this with a LIST, not a third slot: its REU and GeoRAM live in the "IO
+/// Slot", where "any number of 'IO Slot' carts can be, in theory, active at a time"
+/// (`c64cart.c:180-210`), because they claim no `game`/`exrom` and map only into IO1/IO2.
+/// That is exactly the shape of every device this port carries.
+///
+/// The core did not have to be opened for it: `ExpansionDevice` is a trait, so a device
+/// that holds several and fans out satisfies the same contract. Order is insertion order
+/// and the first non-`None` read answer wins, which is the rule one place already had.
+#[derive(Default)]
+pub struct ExpansionChain {
+    devices: Vec<Box<dyn ExpansionDevice>>,
+    snoop: Vec<u16>,
+}
+
+impl ExpansionChain {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, dev: Box<dyn ExpansionDevice>) {
+        for &a in dev.snoop_addresses() {
+            if !self.snoop.contains(&a) {
+                self.snoop.push(a);
+            }
+        }
+        self.devices.push(dev);
+    }
+
+    pub fn with(mut self, dev: Box<dyn ExpansionDevice>) -> Self {
+        self.push(dev);
+        self
+    }
+
+    pub fn len(&self) -> usize {
+        self.devices.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.devices.is_empty()
+    }
+
+    /// The first device of this concrete type, for `Machine::reu()` and friends.
+    ///
+    /// NOTE `d.as_ref()` is load-bearing. `AsAny` has a blanket impl for every `T: Any`,
+    /// and `Box<dyn ExpansionDevice>` is itself such a `T` — so calling `as_any()` on the
+    /// BOX hands back the box as the concrete type and every downcast quietly fails. The
+    /// deref to `&dyn ExpansionDevice` is what makes the device's own type visible.
+    pub fn find<T: 'static>(&self) -> Option<&T> {
+        self.devices.iter().find_map(|d| d.as_ref().as_any().downcast_ref::<T>())
+    }
+
+    pub fn find_mut<T: 'static>(&mut self) -> Option<&mut T> {
+        self.devices.iter_mut().find_map(|d| d.as_mut().as_any_mut().downcast_mut::<T>())
+    }
+}
+
+impl ExpansionDevice for ExpansionChain {
+    fn read(&mut self, a: Access, cart: Option<u8>) -> Option<u8> {
+        let mut answer = None;
+        // EVERY device sees the access — a read has side effects on more than the one
+        // that answers it — and the first answer stands.
+        for d in self.devices.iter_mut() {
+            let v = d.read(a, cart);
+            answer = answer.or(v);
+        }
+        answer
+    }
+
+    fn peek(&self, addr: u16, cart: Option<u8>) -> Option<u8> {
+        self.devices.iter().find_map(|d| d.peek(addr, cart))
+    }
+
+    fn write(&mut self, a: Access, value: u8) {
+        for d in self.devices.iter_mut() {
+            d.write(a, value);
+        }
+    }
+
+    fn snoop_addresses(&self) -> &[u16] {
+        &self.snoop
+    }
+
+    fn snoop_write(&mut self, a: Access, value: u8) {
+        for d in self.devices.iter_mut() {
+            d.snoop_write(a, value);
+        }
+    }
+
+    fn lines(&self) -> PortLines {
+        self.devices.iter().fold(PortLines::default(), |acc, d| acc.or(d.lines()))
+    }
+
+    fn take_stop(&mut self) -> bool {
+        // Poll every one: the flag is a one-shot and a device that is never asked keeps
+        // it for ever.
+        let mut stop = false;
+        for d in self.devices.iter_mut() {
+            stop |= d.take_stop();
+        }
+        stop
+    }
+
+    fn dma_pending(&self) -> bool {
+        self.devices.iter().any(|d| d.dma_pending())
+    }
+
+    fn clone_device(&self) -> Option<Box<dyn ExpansionDevice>> {
+        // All or nothing: a chain that silently dropped the members a host owns would
+        // hand back a machine that is not the one that was copied.
+        let mut out = ExpansionChain::new();
+        for d in &self.devices {
+            out.push(d.clone_device()?);
+        }
+        Some(Box::new(out))
     }
 }
 

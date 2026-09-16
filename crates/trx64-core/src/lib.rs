@@ -47,6 +47,8 @@ pub mod sid;
 pub mod spi_flash;
 pub mod tables;
 /// Spec 852 — the Ultimate Command Interface, the U64 profile's own device on the port.
+pub mod georam;
+pub mod reu;
 pub mod uci;
 pub mod vic;
 pub mod vic_draw;
@@ -64,12 +66,14 @@ pub use crash_triage::{
 };
 pub use delta_ring::{CallerChain, DeltaEntry, DeltaRing, LoopOnset, WriteRec};
 pub use drive::Drive1541;
-pub use expansion::{Access, AccessKind, ExpansionDevice, Hold, PortLines, SnoopSet};
+pub use expansion::{Access, AccessKind, ExpansionChain, ExpansionDevice, Hold, PortLines, SnoopSet};
 pub use full::{Bank8, BankA, BankE, FullBus, MemConfig};
 pub use iec::IecCore;
 pub use resid_audio::{SidAudioEngine, SidWriteRecord, WavFormat};
 pub use resid_ffi::{Resid, ResidConfig};
 pub use sid::Sid6581;
+pub use georam::{GeoRam, GeoRamStatus};
+pub use reu::{DmaBus, Reu, ReuStatus};
 pub use uci::{Uci, UciEvents, UciStatus};
 pub use vic::VicII;
 
@@ -555,6 +559,9 @@ pub struct Machine {
     /// Spec 850 D7 — the host's hold on the 6510, or None. A device's `hold` line holds
     /// the CPU too; see [`Machine::effective_hold`].
     pub hold: Option<crate::expansion::Hold>,
+
+    /// Spec 853 D7 — the last restore could not put the expansion RAM back.
+    pub(crate) expansion_ram_uncovered: bool,
     /// Spec 852 D4 — a C64 reset happened that the UCI block has not been told about. No
     /// reset ever calls a device (850), so `cold_reset` only raises this and
     /// [`Machine::uci_mut`] hands it to the block, where `take_events` reports it.
@@ -743,6 +750,7 @@ impl Machine {
             port_profile: crate::expansion::PortSlot::default(),
             expansion_snoop: None,
             expansion_host_lines: crate::expansion::PortLines::default(),
+            expansion_ram_uncovered: false,
             hold: None,
             uci_c64_reset: false,
             cpu_history: crate::cpu_history::CpuHistoryRing::new(),
@@ -1327,6 +1335,240 @@ impl Machine {
         let old = std::mem::replace(&mut *self.port_profile, dev);
         self.refresh_expansion_snoop();
         old
+    }
+
+    // ── Spec 853 — the REU and GeoRAM ─────────────────────────────────────────────────
+
+    /// Spec 853 D7 — did the last restore leave the expansion RAM behind?
+    ///
+    /// The owner's ruling: 16 MB of REU RAM is out of the checkpoint ring (it would not
+    /// shrink a 32 MiB / 64 KiB ring, it would destroy it) and in the `.c64re` dump. So a
+    /// rewind puts the C64 back and leaves the expansion RAM where it is, and the machine
+    /// is then half restored. Bug 792's lesson was that the SILENCE is the defect, not the
+    /// gap: every surface that restores says so, rather than looking clean.
+    pub fn expansion_ram_uncovered(&self) -> bool {
+        self.expansion_ram_uncovered
+    }
+
+    pub(crate) fn set_expansion_ram_uncovered(&mut self, v: bool) {
+        self.expansion_ram_uncovered = v;
+    }
+
+    /// Spec 853 D11 — look at the expansion RAM.
+    ///
+    /// Deliberately NOT a `peek_lens`: that door takes a `u16`, and an REU holds up to
+    /// 16 MB. A lens keyed on a C64 address cannot address expansion RAM at all, so this
+    /// is its own reader rather than a 16-bit hole into a 24-bit space. Reads are always
+    /// side-effect-free — the RAM is memory, not a register file.
+    pub fn expansion_ram_slice(&self, offset: u32, len: u32) -> Option<Vec<u8>> {
+        let ram: &[u8] = if let Some(r) = self.reu() {
+            r.ram()
+        } else {
+            self.georam()?.ram()
+        };
+        let start = offset as usize;
+        if start >= ram.len() {
+            return Some(Vec::new());
+        }
+        let end = (start + len as usize).min(ram.len());
+        Some(ram[start..end].to_vec())
+    }
+
+    /// Spec 853 D9 — load a `.reu` image into the attached device. Never written back:
+    /// the owner's ruling is that nothing goes to the filesystem on its own, and VICE's
+    /// own `REUImageWrite` is off by default. A short image fills from the start and
+    /// leaves the rest; a long one is truncated.
+    pub fn load_expansion_image(&mut self, bytes: &[u8]) -> Result<usize, String> {
+        let ram: &mut [u8] = if self.reu().is_some() {
+            self.reu_mut().expect("checked").ram_mut()
+        } else if self.georam().is_some() {
+            self.georam_mut().expect("checked").ram_mut()
+        } else {
+            return Err("no expansion device attached".to_string());
+        };
+        let n = bytes.len().min(ram.len());
+        ram[..n].copy_from_slice(&bytes[..n]);
+        Ok(n)
+    }
+
+    /// Is there a device whose RAM a checkpoint would have to carry?
+    pub fn expansion_has_ram(&self) -> bool {
+        self.reu().is_some() || self.georam().is_some()
+    }
+
+    /// Attach a 17xx REU of `size_kb` KiB (128/256/512, or an oversized 1024..16384).
+    /// A CORE device: this works on every profile, not only `u64` (owner, 2026-09-16).
+    /// Returns false for a size no REU ever had.
+    pub fn attach_reu(&mut self, size_kb: u32) -> bool {
+        match crate::reu::Reu::new(size_kb) {
+            Some(reu) => {
+                self.attach_expansion(Box::new(reu));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Attach a GeoRAM of `size_kb` KiB (a whole number of 16 KiB banks).
+    pub fn attach_georam(&mut self, size_kb: u32) -> bool {
+        match crate::georam::GeoRam::new(size_kb) {
+            Some(g) => {
+                self.attach_expansion(Box::new(g));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Spec 853 D1 — add a device WITHOUT evicting what is already there.
+    ///
+    /// `attach_expansion` replaces, which is right when one thing sits on the port and
+    /// wrong as soon as two do. This folds the existing device and the new one into an
+    /// [`ExpansionChain`], so a host can keep its own device while the machine carries an
+    /// REU. With nothing attached it is exactly `attach_expansion`.
+    pub fn attach_expansion_also(&mut self, dev: Box<dyn crate::expansion::ExpansionDevice>) {
+        match self.expansion.take() {
+            None => {
+                self.attach_expansion(dev);
+            }
+            Some(mut existing) => {
+                // Already a chain: extend it THROUGH the box. A trait object cannot be
+                // upcast to `Any` to unbox it, and nesting chains would work but leaves a
+                // shape nobody expects when they look.
+                if let Some(chain) =
+                    existing.as_mut().as_any_mut().downcast_mut::<crate::expansion::ExpansionChain>()
+                {
+                    chain.push(dev);
+                    self.attach_expansion(existing);
+                } else {
+                    let chain = crate::expansion::ExpansionChain::new().with(existing).with(dev);
+                    self.attach_expansion(Box::new(chain));
+                }
+            }
+        }
+    }
+
+    /// Spec 853 D1 — the device on the port, or the one inside the chain that is.
+    ///
+    /// Once a second device is added the top box is an [`ExpansionChain`], so a bare
+    /// downcast finds nothing. Every accessor goes through here for that reason: a
+    /// chained REU is still the machine's REU.
+    fn port_find<T: 'static>(&self) -> Option<&T> {
+        let dev: &dyn crate::expansion::ExpansionDevice = self.expansion.as_deref()?;
+        if let Some(t) = dev.as_any().downcast_ref::<T>() {
+            return Some(t);
+        }
+        dev.as_any().downcast_ref::<crate::expansion::ExpansionChain>()?.find::<T>()
+    }
+
+    fn port_find_mut<T: 'static>(&mut self) -> Option<&mut T> {
+        let dev: &mut dyn crate::expansion::ExpansionDevice = self.expansion.0.as_deref_mut()?;
+        if dev.as_any().downcast_ref::<T>().is_some() {
+            return dev.as_any_mut().downcast_mut::<T>();
+        }
+        dev.as_any_mut()
+            .downcast_mut::<crate::expansion::ExpansionChain>()?
+            .find_mut::<T>()
+    }
+
+    /// The REU on the port, if one is attached — directly or inside a chain.
+    pub fn reu(&self) -> Option<&crate::reu::Reu> {
+        self.port_find::<crate::reu::Reu>()
+    }
+
+    pub fn reu_mut(&mut self) -> Option<&mut crate::reu::Reu> {
+        self.port_find_mut::<crate::reu::Reu>()
+    }
+
+    /// The GeoRAM on the port, if one is attached — directly or inside a chain.
+    pub fn georam(&self) -> Option<&crate::georam::GeoRam> {
+        self.port_find::<crate::georam::GeoRam>()
+    }
+
+    pub fn georam_mut(&mut self) -> Option<&mut crate::georam::GeoRam> {
+        self.port_find_mut::<crate::georam::GeoRam>()
+    }
+
+    /// Spec 853 D3 — run a transfer a device has armed, at the instruction boundary.
+    ///
+    /// The device is TAKEN OUT of its place for the duration: the transfer drives the
+    /// same `FullBus` the CPU executes through, and a bus master does not answer its own
+    /// cycles. That is also what VICE's `reu_dma_active` amounts to — while a transfer
+    /// runs, the registers read 0 and ignore writes.
+    ///
+    /// Cycles land on `c64_core.clk`, so the caller's SID tick and drive catch-up cover
+    /// the transfer without knowing it happened.
+    pub fn run_pending_dma(&mut self) {
+        let mut dev = match self.expansion.take() {
+            Some(d) => d,
+            None => return,
+        };
+        {
+            let table = self.cia_table.clone();
+            let port_active = self.port_active();
+            let mut fb = full::FullBus {
+                ram: &mut self.ram,
+                basic_rom: &self.basic_rom,
+                kernal_rom: &self.kernal_rom,
+                char_rom: &self.char_rom,
+                io: &mut self.io_shadow,
+                vic: &mut self.vic,
+                cia1: &mut self.cia1,
+                cia2: &mut self.cia2,
+                cia_table: &table,
+                sid_regs: &mut self.sid_regs,
+                sid: &mut self.sid,
+                config: self.memconfig,
+                memconfig_table: &self.memconfig_table,
+                port_dir: self.port_dir,
+                port_data: self.port_data,
+                clk: self.c64_core.clk,
+                cia2_pa_out: self.cia2_pa_out,
+                side_effects: Vec::new(),
+                read_side_effects: Vec::new(),
+                drive: &mut self.drive8,
+                iec: &mut self.iec,
+                keyboard: &self.keyboard,
+                joystick1: self.joystick1,
+                joystick2: self.joystick2,
+                drive_c64_ref: self.drive_c64_ref,
+                cartridge: self.cartridge.as_mut(),
+                cart_reads: None,
+                cart_account_suspend: false,
+                port_profile: self.port_profile.as_mut(),
+                port_host: None,
+                snoop: self.expansion_snoop.as_deref(),
+                // A DMA cycle IS a bus cycle, not a host reaching in between instructions.
+                access_kind: crate::expansion::AccessKind::Cpu,
+                stalled: 0,
+                stalled_on_bus: 0,
+                device_stop: false,
+                host_lines: self.expansion_host_lines,
+                port_active,
+            };
+            // Same reason as `port_find_mut`: with a second device on the port the box
+            // taken here is the chain, and a bare downcast would arm a transfer that then
+            // never ran.
+            let chained: Option<&mut crate::reu::Reu> =
+                if dev.as_ref().as_any().downcast_ref::<crate::reu::Reu>().is_some() {
+                    dev.as_mut().as_any_mut().downcast_mut::<crate::reu::Reu>()
+                } else {
+                    dev.as_mut()
+                        .as_any_mut()
+                        .downcast_mut::<crate::expansion::ExpansionChain>()
+                        .and_then(|c| c.find_mut::<crate::reu::Reu>())
+                };
+            if let Some(reu) = chained {
+                reu.run_dma(&mut fb);
+            }
+            self.c64_core.clk = fb.clk;
+            self.memconfig = fb.config;
+            self.port_dir = fb.port_dir;
+            self.port_data = fb.port_data;
+            self.cia2_pa_out = fb.cia2_pa_out;
+            self.drive_c64_ref = fb.drive_c64_ref;
+        }
+        self.expansion.replace(dev);
     }
 
     // ── Spec 852 — the UCI block behind the profile place ──────────────────────────────
@@ -2496,6 +2738,14 @@ impl Machine {
                 // Persist the push-flush reference (the drive may have been advanced
                 // mid-instruction by a $DD00 access inside the FullBus).
                 self.drive_c64_ref = bus.fb.drive_c64_ref;
+            }
+            // Spec 853 D3 — a bus master that armed a transfer runs it HERE, before the
+            // cycle cost is taken: its cycles then fold into the SID tick and the drive
+            // catch-up below, which is what makes a transfer invisible to everything that
+            // only watches `clk`. On a stock machine `port_active` is false and this is
+            // one already-computed bool.
+            if port_active && self.expansion.as_ref().is_some_and(|d| d.dma_pending()) {
+                self.run_pending_dma();
             }
             // Tick SID by this instruction's cycle cost — wall-clock batch tick
             // matching TS integrated-session.ts:946 `sid.tick(totalCycles)`.
