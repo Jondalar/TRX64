@@ -156,18 +156,24 @@ fn r1_a_page_crossing_dummy_read_reaches_the_device_first() {
     );
 }
 
+/// 850 R1 originally read "no reset EVER calls the device", and that was too broad. The
+/// rule it was written for is the UCI block, which must survive a C64 reset — only the
+/// FPGA reset clears it. But the connector really does carry /RESET, and VICE resets the
+/// REU with the cartridge, so the choice belongs to the device: `ExpansionDevice::reset`
+/// defaults to nothing, and a device that stays silent keeps exactly 850's behaviour.
+/// This case now pins that default; `reu_gate` pins the other half.
 #[test]
-fn r1_no_reset_ever_calls_the_device() {
+fn r1_a_device_that_declines_the_reset_is_not_called() {
     let log = log_with(|_| {});
     let mut m = Machine::new();
     attach(&mut m, &log, &[0xff00]);
     m.cold_reset();
     m.warm_reset();
     let l = log.lock().unwrap();
-    assert!(l.reads.is_empty() && l.writes.is_empty() && l.snoops.is_empty(), "no call on reset");
+    assert!(l.reads.is_empty() && l.writes.is_empty() && l.snoops.is_empty(), "no access on reset");
     drop(l);
     assert!(m.cartridge.is_none());
-    assert!(m.expansion.is_some(), "the device survives the reset");
+    assert!(m.expansion.is_some(), "and the device survives the reset");
 }
 
 #[test]

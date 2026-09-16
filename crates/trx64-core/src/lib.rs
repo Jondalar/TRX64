@@ -1028,9 +1028,18 @@ impl Machine {
         if let Some(cart) = self.cartridge.as_mut() {
             cart.reset();
         }
+        // The port's /RESET line reaches whatever is out there — each device decides what
+        // that means for it (`ExpansionDevice::reset`, default nothing). An REU takes it;
+        // the UCI block does not, which is why 852 D4 still holds below.
+        if let Some(dev) = self.port_profile.0.as_deref_mut() {
+            dev.reset();
+        }
+        if let Some(dev) = self.expansion.0.as_deref_mut() {
+            dev.reset();
+        }
         // Spec 852 D4 — the UCI block survives a C64 reset (only the FPGA reset clears it,
         // `command_protocol.vhd:292-306`), but the firmware must hear about it. The block
-        // is not called here; `uci_mut` hands it the news.
+        // itself declines the reset above; `uci_mut` hands it the news.
         self.uci_c64_reset = true;
         // Recompute the live memconfig from the port latches + cart EXROM/GAME
         // lines (= memPlaConfigChanged, ts:854-871). No cart ⇒ idx (port|0x18),

@@ -63,7 +63,7 @@ impl GeoRam {
     }
 
     pub fn ram_byte(&self, off: u32) -> u8 {
-        self.store.as_ref().map(|s| s.read(off)).unwrap_or(0)
+        self.store.as_ref().and_then(|s| s.read(off)).unwrap_or(0)
     }
 
     pub fn set_ram_byte(&mut self, off: u32, value: u8) {
@@ -77,7 +77,7 @@ impl GeoRam {
             None => Vec::new(),
             Some(s) => {
                 let end = off.saturating_add(len).min(s.len());
-                (off..end).map(|a| s.read(a)).collect()
+                (off..end).map(|a| s.read(a).unwrap_or(0)).collect()
             }
         }
     }

@@ -118,6 +118,15 @@ The bridge maps rather than lends a copy: it forwards `C64_REU_ENABLE` and
 `C64_REU_SIZE` (0-7 → 128 KiB … 16 MB) and hands TRX64 a store over
 `REU_MEMORY_BASE 0x1000000`. GeoRAM at `TYPE 0x1F` lends the same store.
 
+**Corrected after UE2 implemented it (2026-09-16).** The paragraph above read as though a
+host could hand over the borrow it already has, and it cannot compile that way. The device
+holds the store for its own lifetime, while a bridge that lends its DDR *per access* has a
+borrow that only exists for the length of that access. Those two lifetimes do not meet.
+What a host actually needs is an independently shared cell — a pointer or handle it owns
+and rewrites on every lend — with `ExpansionRam` implemented over that cell, so the device's
+long-lived store reaches whatever is currently lent. Saying "hands TRX64 a store" hid that
+step, and the next integrator would have hit the same wall.
+
 ## §6 Not in this spec
 
 - **Changing what a standalone TRX64 does.** The owned store stays the default, and
