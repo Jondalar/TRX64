@@ -90,6 +90,12 @@ impl GeoRam {
         }
     }
 
+    /// Put back the two registers a snapshot carried.
+    pub fn restore_registers(&mut self, window: u8, bank: u8) {
+        self.window = window;
+        self.bank = bank;
+    }
+
     pub fn status(&self) -> GeoRamStatus {
         GeoRamStatus { size_kb: self.size_kb, bank: self.bank, window: self.window }
     }

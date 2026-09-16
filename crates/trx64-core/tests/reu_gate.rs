@@ -428,3 +428,90 @@ fn georam_steals_no_cycles() {
     assert_eq!(plain.c64_core.clk, with_geo.c64_core.clk, "no DMA means no cycles");
 }
 
+
+// ── Spec 853 D6/D7 — the ring and the dump are two different things ────────────────
+
+use trx64_core::c64re_snapshot::{
+    capture_runtime_checkpoint, capture_runtime_checkpoint_with, restore_runtime_checkpoint,
+    CaptureOpts,
+};
+
+fn dump(m: &Machine) -> serde_json::Value {
+    capture_runtime_checkpoint(m, "", "", None, None, None, None)
+}
+
+fn ring_entry(m: &Machine) -> serde_json::Value {
+    capture_runtime_checkpoint_with(
+        m,
+        "",
+        "",
+        None,
+        None,
+        None,
+        None,
+        CaptureOpts { omit_framebuffer: true, omit_expansion_ram: true },
+    )
+}
+
+#[test]
+fn a_dump_carries_the_reu_ram_and_an_undump_brings_it_back() {
+    let mut m = machine_with_reu(512);
+    m.reu_mut().unwrap().ram_mut()[0..4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+    let cp = dump(&m);
+
+    let mut fresh = Machine::new();
+    restore_runtime_checkpoint(&mut fresh, &cp).expect("undump");
+    assert_eq!(fresh.reu().map(|r| r.size_kb()), Some(512), "the undump re-attached it");
+    assert_eq!(&fresh.reu().unwrap().ram()[0..4], &[0xDE, 0xAD, 0xBE, 0xEF]);
+    assert!(!fresh.expansion_ram_uncovered(), "a dump covers the RAM");
+}
+
+#[test]
+fn a_ring_entry_carries_the_registers_but_not_the_ram() {
+    let mut m = machine_with_reu(512);
+    m.reu_mut().unwrap().ram_mut()[0] = 0x11;
+    transfer(&mut m, 0x1000, 0x40, 4, TYPE_STASH); // leaves the registers somewhere known
+    let base_after = m.reu().unwrap().status().base_computer;
+    let cp = ring_entry(&m);
+
+    // The ring entry must not be carrying 512 KiB.
+    let ram_node = cp.get("expansion").and_then(|e| e.get("ram")).cloned().unwrap();
+    assert!(ram_node.is_null(), "the ring omits the expansion RAM");
+
+    // Restoring it leaves the RAM alone — and says the restore was partial.
+    m.reu_mut().unwrap().ram_mut()[0] = 0x99;
+    restore_runtime_checkpoint(&mut m, &cp).expect("restore");
+    assert_eq!(m.reu().unwrap().ram()[0], 0x99, "the RAM was not touched");
+    assert_eq!(m.reu().unwrap().status().base_computer, base_after, "the registers came back");
+    assert!(m.expansion_ram_uncovered(), "and the machine says the RAM is not covered");
+}
+
+#[test]
+fn a_checkpoint_without_the_node_does_not_eject_the_device() {
+    // The cartridge's rule is "no node means detach". For a device that is not a
+    // cartridge that would be an ejection nobody asked for.
+    let mut m = machine_with_reu(512);
+    m.reu_mut().unwrap().ram_mut()[0] = 0x5A;
+    let mut cp = dump(&m);
+    cp.as_object_mut().unwrap().remove("expansion"); // a pre-853 .c64re
+
+    restore_runtime_checkpoint(&mut m, &cp).expect("restore");
+    assert!(m.reu().is_some(), "still attached");
+    assert_eq!(m.reu().unwrap().ram()[0], 0x5A, "and untouched");
+    assert!(m.expansion_ram_uncovered(), "but the restore covered nothing of it");
+}
+
+#[test]
+fn a_georam_round_trips_through_a_dump() {
+    let mut m = Machine::new();
+    assert!(m.attach_georam(512));
+    m.georam_mut().unwrap().restore_registers(2, 3);
+    m.georam_mut().unwrap().ram_mut()[3 * 16384 + 2 * 256] = 0x7E;
+    let cp = dump(&m);
+
+    let mut fresh = Machine::new();
+    restore_runtime_checkpoint(&mut fresh, &cp).expect("undump");
+    let g = fresh.georam().expect("re-attached");
+    assert_eq!((g.window(), g.bank(), g.size_kb()), (2, 3, 512));
+    assert_eq!(g.ram()[3 * 16384 + 2 * 256], 0x7E);
+}

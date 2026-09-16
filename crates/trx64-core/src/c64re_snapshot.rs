@@ -1157,6 +1157,16 @@ pub fn restore_ram_ta(m: &mut Machine, node: &serde_json::Value) -> bool {
 /// — non-null whenever a cartridge is attached (cart_bytes) / has a writable port
 /// (cart_flash); None ⇒ no cartridge / read-only mapper. Lost-on-dump before this fix
 /// (both were hardcoded null).
+/// Spec 853 D6 — what a capture may leave out. Two different questions, and they are
+/// asked by different callers: the per-frame ring wants both omissions, a `.c64re` dump
+/// wants neither. `omit_framebuffer` is Spec 807's; `omit_expansion_ram` is the owner's
+/// ruling that 16 MB of REU RAM belongs in a dump and never in a 32 MiB ring.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CaptureOpts {
+    pub omit_framebuffer: bool,
+    pub omit_expansion_ram: bool,
+}
+
 pub fn capture_runtime_checkpoint(
     m: &Machine,
     disk_path: &str,
@@ -1166,7 +1176,7 @@ pub fn capture_runtime_checkpoint(
     cart_bytes: Option<&[u8]>,
     cart_flash: Option<&[u8]>,
 ) -> serde_json::Value {
-    capture_runtime_checkpoint_opts(
+    capture_runtime_checkpoint_with(
         m,
         disk_path,
         image_format,
@@ -1174,7 +1184,7 @@ pub fn capture_runtime_checkpoint(
         drive_disk_image,
         cart_bytes,
         cart_flash,
-        false,
+        CaptureOpts::default(),
     )
 }
 
@@ -1197,6 +1207,31 @@ pub fn capture_runtime_checkpoint_opts(
     cart_flash: Option<&[u8]>,
     omit_framebuffer: bool,
 ) -> serde_json::Value {
+    capture_runtime_checkpoint_with(
+        m,
+        disk_path,
+        image_format,
+        drive1541,
+        drive_disk_image,
+        cart_bytes,
+        cart_flash,
+        CaptureOpts { omit_framebuffer, omit_expansion_ram: false },
+    )
+}
+
+/// The capture, with every omission named. See [`CaptureOpts`].
+#[allow(clippy::too_many_arguments)]
+pub fn capture_runtime_checkpoint_with(
+    m: &Machine,
+    disk_path: &str,
+    image_format: &str,
+    drive1541: Option<&[u8]>,
+    drive_disk_image: Option<&[u8]>,
+    cart_bytes: Option<&[u8]>,
+    cart_flash: Option<&[u8]>,
+    opts: CaptureOpts,
+) -> serde_json::Value {
+    let omit_framebuffer = opts.omit_framebuffer;
     use serde_json::json;
     let keys = m.keyboard.pressed_keys();
     json!({
@@ -1239,9 +1274,36 @@ pub fn capture_runtime_checkpoint_opts(
             .as_ref()
             .map(|c| serde_json::to_value(capture_cart_state(c.as_ref())).unwrap())
             .unwrap_or(serde_json::Value::Null),
+        // Spec 853 D6 — the expansion device's continuation. The REGISTERS always ride
+        // (sixteen bytes are nobody's problem); the RAM is what the owner ruled out of the
+        // ring, because 16 MB in a 32 MiB / 64 KiB ring does not shrink it, it destroys it.
+        // A node with `ram: null` therefore means "this was a ring entry", NOT "no device".
+        "expansion": expansion_node(m, opts.omit_expansion_ram),
         "media": { "diskPath": disk_path, "imageFormat": image_format },
         "audio": serde_json::Value::Null,
     })
+}
+
+/// Spec 853 D6 — `{ kind, sizeKb, regs, ram }`, or Null with no device on the port.
+fn expansion_node(m: &Machine, omit_ram: bool) -> serde_json::Value {
+    use serde_json::json;
+    if let Some(reu) = m.reu() {
+        json!({
+            "kind": "reu",
+            "sizeKb": reu.size_kb(),
+            "regs": reu.snapshot_registers().to_vec(),
+            "ram": if omit_ram { serde_json::Value::Null } else { ta_u8(reu.ram()) },
+        })
+    } else if let Some(g) = m.georam() {
+        json!({
+            "kind": "georam",
+            "sizeKb": g.size_kb(),
+            "regs": [g.window(), g.bank()],
+            "ram": if omit_ram { serde_json::Value::Null } else { ta_u8(g.ram()) },
+        })
+    } else {
+        serde_json::Value::Null
+    }
 }
 
 /// Restore the full machine from a RuntimeCheckpoint payload tree. Order mirrors
@@ -1417,6 +1479,66 @@ pub fn restore_runtime_checkpoint(
         _ => {
             // No cartridge in the checkpoint → ensure none is attached.
             m.detach_cart();
+        }
+    }
+
+    // Spec 853 D6/D7 — the expansion device.
+    //
+    // NOTE what this deliberately does NOT do: copy the cartridge's `_ => detach` above.
+    // An absent node means the checkpoint knows nothing about the port, not that the port
+    // is empty — a pre-853 `.c64re`, or a ring entry. Ejecting a device because a
+    // checkpoint predates it is the bug that comment warns about, one device along.
+    match cp.get("expansion") {
+        Some(node) if !node.is_null() => {
+            let kind = node.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            let size_kb = node.get("sizeKb").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let regs: Vec<u8> = node
+                .get("regs")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_u64()).map(|x| x as u8).collect())
+                .unwrap_or_default();
+            // Bring the right device back if it is not already there.
+            match kind {
+                "reu" => {
+                    if m.reu().map(|r| r.size_kb()) != Some(size_kb) {
+                        m.attach_reu(size_kb);
+                    }
+                    if let Some(reu) = m.reu_mut() {
+                        reu.restore_registers(&regs);
+                    }
+                }
+                "georam" => {
+                    if m.georam().map(|g| g.size_kb()) != Some(size_kb) {
+                        m.attach_georam(size_kb);
+                    }
+                    if let Some(g) = m.georam_mut() {
+                        g.restore_registers(*regs.first().unwrap_or(&0), *regs.get(1).unwrap_or(&0));
+                    }
+                }
+                _ => {}
+            }
+            // The RAM rides a dump and never the ring. `ram: null` is a ring entry: the
+            // registers came back and the RAM did not, so the machine is half restored
+            // and says so rather than looking clean (bug 792's lesson).
+            match node.get("ram").and_then(ta_u8_decode) {
+                Some(bytes) if !bytes.is_empty() => {
+                    if let Some(reu) = m.reu_mut() {
+                        let n = bytes.len().min(reu.ram().len());
+                        reu.ram_mut()[..n].copy_from_slice(&bytes[..n]);
+                    } else if let Some(g) = m.georam_mut() {
+                        let n = bytes.len().min(g.ram().len());
+                        g.ram_mut()[..n].copy_from_slice(&bytes[..n]);
+                    }
+                    m.set_expansion_ram_uncovered(false);
+                }
+                _ => m.set_expansion_ram_uncovered(true),
+            }
+        }
+        // No node at all: leave whatever is on the port exactly as it is. If something is
+        // there, this restore did not cover its RAM either.
+        _ => {
+            let has = m.expansion_has_ram();
+            m.set_expansion_ram_uncovered(has);
         }
     }
 

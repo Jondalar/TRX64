@@ -559,6 +559,9 @@ pub struct Machine {
     /// Spec 850 D7 — the host's hold on the 6510, or None. A device's `hold` line holds
     /// the CPU too; see [`Machine::effective_hold`].
     pub hold: Option<crate::expansion::Hold>,
+
+    /// Spec 853 D7 — the last restore could not put the expansion RAM back.
+    pub(crate) expansion_ram_uncovered: bool,
     /// Spec 852 D4 — a C64 reset happened that the UCI block has not been told about. No
     /// reset ever calls a device (850), so `cold_reset` only raises this and
     /// [`Machine::uci_mut`] hands it to the block, where `take_events` reports it.
@@ -747,6 +750,7 @@ impl Machine {
             port_profile: crate::expansion::PortSlot::default(),
             expansion_snoop: None,
             expansion_host_lines: crate::expansion::PortLines::default(),
+            expansion_ram_uncovered: false,
             hold: None,
             uci_c64_reset: false,
             cpu_history: crate::cpu_history::CpuHistoryRing::new(),
@@ -1334,6 +1338,26 @@ impl Machine {
     }
 
     // ── Spec 853 — the REU and GeoRAM ─────────────────────────────────────────────────
+
+    /// Spec 853 D7 — did the last restore leave the expansion RAM behind?
+    ///
+    /// The owner's ruling: 16 MB of REU RAM is out of the checkpoint ring (it would not
+    /// shrink a 32 MiB / 64 KiB ring, it would destroy it) and in the `.c64re` dump. So a
+    /// rewind puts the C64 back and leaves the expansion RAM where it is, and the machine
+    /// is then half restored. Bug 792's lesson was that the SILENCE is the defect, not the
+    /// gap: every surface that restores says so, rather than looking clean.
+    pub fn expansion_ram_uncovered(&self) -> bool {
+        self.expansion_ram_uncovered
+    }
+
+    pub(crate) fn set_expansion_ram_uncovered(&mut self, v: bool) {
+        self.expansion_ram_uncovered = v;
+    }
+
+    /// Is there a device whose RAM a checkpoint would have to carry?
+    pub fn expansion_has_ram(&self) -> bool {
+        self.reu().is_some() || self.georam().is_some()
+    }
 
     /// Attach a 17xx REU of `size_kb` KiB (128/256/512, or an oversized 1024..16384).
     /// A CORE device: this works on every profile, not only `u64` (owner, 2026-09-16).

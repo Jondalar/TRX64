@@ -17639,7 +17639,11 @@ fn capture_recorder_anchor_payload(session: &mut Session) -> Value {
     // flash rides for the separate reason in §7b (a game that writes it, plus the
     // picture-regeneration frames).
     let (cart_bytes, cart_flash) = capture_cart_blobs(&mut session.machine);
-    let mut cp = trx64_core::c64re_snapshot::capture_runtime_checkpoint_opts(
+    // Spec 853 D6 — the ring omits the expansion RAM as well as the framebuffer. This is
+    // the ONE caller that does: every persisting path (dump, vsf, undump round-trips)
+    // carries it, because a `.c64re` pays the 16 MB once and a ring entry would pay it
+    // five hundred times.
+    let mut cp = trx64_core::c64re_snapshot::capture_runtime_checkpoint_with(
         &session.machine,
         &disk_path,
         &disk_format,
@@ -17647,7 +17651,7 @@ fn capture_recorder_anchor_payload(session: &mut Session) -> Value {
         None,
         cart_bytes.as_deref(),
         cart_flash.as_deref(),
-        true,
+        trx64_core::c64re_snapshot::CaptureOpts { omit_framebuffer: true, omit_expansion_ram: true },
     );
     // The GCR overlay is the only slot still omitted here (see above).
     if cp.get("driveDiskImage").is_some() {

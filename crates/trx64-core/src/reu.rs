@@ -661,6 +661,21 @@ impl Reu {
         }
     }
 
+    /// Put back the 16 register bytes a snapshot carried. The status register is read
+    /// only from the C64 side, so it is restored directly rather than through the write
+    /// door — a snapshot must come back as it went in, not as a program could have made it.
+    pub fn restore_registers(&mut self, regs: &[u8]) {
+        for (i, v) in regs.iter().enumerate().take(16) {
+            if i as u16 == REG_STATUS {
+                self.rec.status = *v;
+            } else {
+                self.store_without_sideeffects(i as u16, *v);
+            }
+        }
+        // A restored status can carry a pending interrupt; the line follows it.
+        self.irq = self.rec.status & STATUS_INTERRUPT_PENDING != 0;
+    }
+
     /// The 16 register bytes a snapshot carries, read without side effects
     /// (`reu_write_snapshot_module`, reu.c:1591-1618).
     pub fn snapshot_registers(&self) -> [u8; 16] {
