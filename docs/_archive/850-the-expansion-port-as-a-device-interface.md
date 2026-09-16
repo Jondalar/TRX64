@@ -160,6 +160,12 @@ continues unchanged — `$D036` still reaches the VIC, `$FF00` still lands in RA
 - While held, the run loop advances per cycle without executing the 6510: the VIC always; CIAs, SID and
   drive 8 for `Cpu`, the VIC alone for `Reset`. `clk` advances, the CPU registers do not change, and
   `read_full_live`/`write_full` work.
+- `Reset` does not merely skip the drive, it carries `drive_c64_ref` forward to `clk`, so the drive is
+  parked and does not catch the held interval up afterwards. This hold is C64-shaped, and that is a
+  stated limit: on a U64 the drive's own RESET bit 1 (`use_c64_reset`, `drive_registers.vhd`) decides
+  whether the C64's reset reaches the drive at all, and TRX64 models no such bit. A host that wants a
+  drive running through a held C64 reset restores `drive_c64_ref` and clocks the drive itself — UE2's
+  bridge does exactly that.
 - Port reference: VICE holds the CPU for DMA by stealing cycles (`mainc64cpu.c:122-125`,
   `MAINCPU_BA_LOW_REU`) and services `IK_DMA` at the boundary (`6510core.c:523-527`); `IK_DMA` is
   already defined in TRX64 (`c64_6510core.rs:115`) and unused. The bridge's `run_chips` is the same

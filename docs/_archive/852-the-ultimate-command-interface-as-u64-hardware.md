@@ -95,13 +95,18 @@ through 850's snoop (D5), including the RMW dummy write — the FPGA sees every 
 
 ```rust
 impl Uci {
-    pub fn fw_read(&self, off: u16) -> u8;            // 0x000-0x00F registers, 0x800-0xFFF RAM; no side effects
+    pub fn fw_read(&self, off: u16) -> u8;            // 0x000-0x7FF registers (decode is bits 3:0, so they
+                                                      // repeat every 16 bytes), 0x800-0xFFF RAM, above reads 0;
+                                                      // no side effects. See §8.
     pub fn fw_write(&mut self, off: u16, value: u8);
     pub fn fw_irq(&self) -> bool;                     // ITU low bit 4, a level
     pub fn take_events(&mut self) -> UciEvents;       // since the last call
 }
 pub struct UciEvents { pub c64_reset: bool, pub unlock: bool }
-// Machine::uci() / uci_mut() -> Option<&(mut) Uci>, Some on the u64 profile
+// Machine::uci() / uci_mut() -> Option<&(mut) Uci>, Some on the u64 profile.
+// uci_mut() also hands the block any pending C64 reset before returning it: it QUEUES
+// that event (take_events reports it), it never consumes one. So a caller that only
+// wants set_routed transfers the reset too, and loses nothing by it.
 ```
 
 A firmware write that changes `freeze` or the IRQ takes effect at the next instruction boundary, which
@@ -119,6 +124,13 @@ is when a host between runs is able to write anyway.
   sequence. What the closed core accepts in between is not known.
   Standalone TRX64 raises the event and does nothing else: without a firmware nothing enables the block,
   and a UCI that answers `$C9` with no server behind it would hang every program that probes it.
+
+**Neither event is a level, and TRX64 raises no interrupt for either.** `take_events` drains both
+(`uci.rs`, a `mem::take`), so each is delivered exactly once and nothing here re-raises it. The only
+level this block computes is `fw_irq()`, the command handshake. A host that models the ITU — where the
+unlock arrives as a high IRQ with no ack register — therefore owns both raising that level and dropping
+it again; UE2 drops it on the firmware's write of 0 to `$D038`, which is UE2 policy, not a fact about
+the hardware.
 
 **D5 — stretched reads.** `slot_slave.vhd` latches an I/O read per PHI2 cycle from R/W and IO1/IO2
 (`:131-142`). During a BA stall those are active only while AEC is high; once AEC falls the VIC drives
