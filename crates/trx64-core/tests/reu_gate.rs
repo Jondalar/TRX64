@@ -949,3 +949,40 @@ fn a_warm_reset_does_the_same_and_the_device_stays_on_the_port() {
     assert_eq!(m.reu().unwrap().status().transfer_length, 0xFFFF);
     assert_eq!(m.reu().unwrap().ram_byte(0x100), 0x3C, "an owned store survives too");
 }
+
+// ── Ein Transfer gehört in keinen Ring ─────────────────────────────────────────────
+//
+// The checkpoint ring excludes expansion RAM on purpose (853 D6). The reverse-debug
+// ring excludes DMA writes only STRUCTURALLY: the ring hangs off FullScBus, and a
+// transfer drives FullBus. Nothing enforces that, so a later change routing the DMA
+// through the SC bus would let one 16 MB transfer flush the entire history a user was
+// about to rstep through — and no test would go red. This makes it enforced.
+
+#[test]
+fn a_transfer_leaves_the_reverse_debug_ring_alone() {
+    let mut m = machine_with_reu(512);
+    m.delta_ring.set_enabled(true);
+
+    // A difference test, not an absolute one: the setup program is the same for both
+    // transfers, so the ring must grow by the same amount whatever the transfer SIZE.
+    // If DMA writes were recorded the two would differ by 16368.
+    fill(&mut m, 0x2000, &[0xAB; 64]);
+
+    let before_small = m.delta_ring.len();
+    transfer(&mut m, 0x2000, 0, 16, TYPE_STASH);
+    let grew_small = m.delta_ring.len() - before_small;
+
+    let before_big = m.delta_ring.len();
+    transfer(&mut m, 0x2000, 0, 16384, TYPE_STASH);
+    let grew_big = m.delta_ring.len() - before_big;
+
+    assert!(grew_small > 0, "the setup instructions themselves are recorded, as they should be");
+    // Within a couple of instructions: the two setups differ by one store (a length
+    // high byte of 0 vs 0x40). What matters is that 16 KiB of DMA does not add 16384.
+    assert!(
+        grew_big <= grew_small + 2,
+        "a 16 KiB transfer grew the ring by {grew_big} against {grew_small} for 16 bytes — \
+         DMA writes are reaching the reverse-debug ring and will flush the user's history"
+    );
+    assert_eq!(m.reu().unwrap().ram_byte(0), 0xAB, "while the transfer really happened");
+}
