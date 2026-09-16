@@ -389,9 +389,17 @@ pub struct Cia {
     pub irqflags: u8,
     /// This chip's master clock (advanced via `tick`).
     pub clk: u64,
-    /// Cycles left until the next mains tick (VICE `todclk` − now, with
-    /// `todticks = ticks_per_sec / power_freq`). The BCD registers 8..11 are the clock.
-    pub tod_clk: u32,
+    /// The `clk` at which the next mains tick falls due (VICE `todclk`). A TARGET, not a
+    /// countdown: five sites advance `cia*.clk` by assignment without calling `tick()`
+    /// (`full.rs:988`, `:1010`, `:1285`, `full_sc.rs:165`, `:392`), and a counter of calls
+    /// loses every cycle that arrives that way — badline steals being 5.09 % of a PAL
+    /// frame. Anything that moves `clk` is caught up by `tod_catch_up`.
+    pub tod_clk: u64,
+    /// The mains frequency on the wire. A property of the MACHINE — PAL is 50 Hz — not of
+    /// CRA: bit 7 tells the chip which divider the software picked, it does not say what
+    /// the grid supplies. Picking the wrong divider is exactly how TOD runs at 5/6 on real
+    /// hardware, and deriving the frequency from CRA hid that.
+    pub tod_power_freq: u32,
     /// The 3-bit ring counter that divides mains ticks down to tenths (VICE
     /// `todtickcounter`). It is NOT `ticks_per_sec / 10`: the divider matches at 4 for
     /// 50 Hz and 5 for 60 Hz, and the ring has six states.
@@ -421,7 +429,8 @@ impl Default for Cia {
             tb: Ciat::default(),
             irqflags: 0,
             clk: 0,
-            tod_clk: PAL_CYCLES_PER_SEC / 60,
+            tod_clk: (PAL_CYCLES_PER_SEC / 50) as u64,
+            tod_power_freq: 50,
             tod_tick_counter: 0,
             tod_stopped: true,
             tod_alarm: [0u8; 4],
@@ -578,9 +587,32 @@ impl Cia {
         // this host's ~2 % drift. A plain decrement with the reload folded into the same
         // branch is what the hot path can afford; the mains frequency is read only when
         // the counter actually fires, because CRA bit 7 changes about never.
-        self.tod_clk -= 1;
-        if self.tod_clk == 0 {
-            self.tod_reload_and_tick();
+        self.tod_catch_up();
+    }
+
+    /// Run TOD forward to `self.clk`. Cheap in the common case — one compare — and correct
+    /// however `clk` got here, which a counter of `tick()` calls was not.
+    #[inline]
+    pub fn tod_catch_up(&mut self) {
+        if self.clk >= self.tod_clk {
+            self.tod_run_due();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn tod_run_due(&mut self) {
+        let per_tick = (PAL_CYCLES_PER_SEC / self.tod_power_freq.max(1)) as u64;
+        // A jump can owe several ticks; a fresh machine owes none.
+        let mut guard = 0;
+        while self.clk >= self.tod_clk && guard < 4096 {
+            self.tod_clk = self.tod_clk.wrapping_add(per_tick);
+            self.tod_mains_tick();
+            guard += 1;
+        }
+        if guard >= 4096 {
+            // A restore or a warp landed far in the future: re-base instead of grinding.
+            self.tod_clk = self.clk.wrapping_add(per_tick);
         }
     }
 
@@ -588,14 +620,6 @@ impl Cia {
     /// tenth, and a tenth advances the BCD chain. VICE's mains-drift correction
     /// (`power_ticks`, TODRANDOM) is deliberately NOT ported — it models a real grid
     /// wobbling around 50 Hz, and a deterministic emulator wants a steady tick.
-    #[cold]
-    #[inline(never)]
-    fn tod_reload_and_tick(&mut self) {
-        let freq = if self.regs[CIA_CRA] & CIA_CRA_TODIN_50HZ != 0 { 50 } else { 60 };
-        self.tod_clk = PAL_CYCLES_PER_SEC / freq;
-        self.tod_mains_tick();
-    }
-
     fn tod_mains_tick(&mut self) {
         if self.tod_stopped {
             return;

@@ -381,10 +381,11 @@ pub fn capture_cia(cia: &Cia) -> CiaSnapshot {
         todlatched: cia.tod_latched as i64,
         todstopped: cia.tod_stopped as i64,
         todticks: cia.tod_clk as i64,
+        // `power_ticks` carries the mains frequency; it was unused before.
         todclk: clk,
         todtickcounter: cia.tod_tick_counter as i64,
         power_tickcounter: 0,
-        power_ticks: 0,
+        power_ticks: cia.tod_power_freq as i64,
         old_pa: 0xff,
         old_pb: 0xff,
         read_clk: clk,
@@ -427,7 +428,10 @@ pub fn restore_cia(cia: &mut Cia, s: &CiaSnapshot, tab: &[u16; crate::cia::CIAT_
     cia.tod_tick_counter = s.todtickcounter as u8;
     // A pre-TOD dump wrote 0 here; a running clock needs a non-zero countdown or it
     // would fire on the very next cycle.
-    cia.tod_clk = if s.todticks > 0 { s.todticks as u32 } else { crate::cia::PAL_CYCLES_PER_SEC / 60 };
+    cia.tod_power_freq = if s.power_ticks > 0 { s.power_ticks as u32 } else { 50 };
+    // A target clk, so re-base it onto the restored clock rather than trusting an old
+    // absolute value from a dump written before TOD ran.
+    cia.tod_clk = cia.clk.wrapping_add((crate::cia::PAL_CYCLES_PER_SEC / cia.tod_power_freq.max(1)) as u64);
     // Re-derive the cached alarm clk = the PREDICTED next-underflow clk (VICE
     // ciat_set_alarm), NOT `ta.clk` (the timer's last-update clk). The old
     // `= ta.clk` set the alarm to ~now, so the dispatch `while ta_alarmclk <= rclk`
