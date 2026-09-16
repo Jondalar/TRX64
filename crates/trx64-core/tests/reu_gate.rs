@@ -712,8 +712,8 @@ impl ExpansionRam for HostRam {
     fn len(&self) -> u32 {
         self.0.lock().unwrap().len() as u32
     }
-    fn read(&self, off: u32) -> u8 {
-        self.0.lock().unwrap().get(off as usize).copied().unwrap_or(0)
+    fn read(&self, off: u32) -> Option<u8> {
+        self.0.lock().unwrap().get(off as usize).copied()
     }
     fn write(&mut self, off: u32, value: u8) {
         if let Some(b) = self.0.lock().unwrap().get_mut(off as usize) {
@@ -906,4 +906,46 @@ fn removing_the_last_snooper_stops_the_snoop() {
     assert!(m.expansion_snoop_registered(0xFF00), "armed while the REU is on");
     m.detach_reu();
     assert!(!m.expansion_snoop_registered(0xFF00), "and not after it leaves");
+}
+
+// ── Der Port führt /RESET, und die REU nimmt ihn an ────────────────────────────────
+
+#[test]
+fn a_c64_reset_resets_the_rec_and_leaves_the_ram_alone() {
+    // VICE resets the REU with the cartridge (`c64carthooks.c:2412` -> `reu_reset`), because
+    // the expansion connector carries /RESET. The second half is what matters for a host:
+    // the DRAM keeps every byte, so resetting the machine must not wipe memory that was lent.
+    let host = HostRam::new(512 * 1024);
+    let mut m = Machine::new();
+    assert!(m.attach_reu_borrowed(512, Box::new(host.clone())));
+
+    // Put the REC somewhere far from power-on, and put a byte in the store.
+    fill(&mut m, 0x1000, &[0xA5, 0x5A]);
+    transfer(&mut m, 0x1000, 0, 2, TYPE_STASH);
+    let before = m.reu().unwrap().status();
+    assert_ne!(before.base_computer, 0, "the registers moved");
+    assert_eq!(host.at(0), 0xA5);
+
+    m.cold_reset();
+
+    let after = m.reu().unwrap().status();
+    assert_eq!(after.command & 0x10, 0x10, "the $FF00 trigger comes up disabled again");
+    assert_eq!(after.transfer_length, 0xFFFF, "length back to power-on");
+    assert_eq!(after.base_computer, 0, "and the C64 base with it");
+    assert!(!after.irq, "no line left asserted");
+
+    // The store is untouched — this is the half a host depends on.
+    assert_eq!((host.at(0), host.at(1)), (0xA5, 0x5A), "a reset must not wipe lent memory");
+    assert!(m.reu().is_some(), "and the device is still on the port");
+}
+
+#[test]
+fn a_warm_reset_does_the_same_and_the_device_stays_on_the_port() {
+    let mut m = machine_with_reu(512);
+    // Mark a byte the transfer below does NOT touch: it stashes into offset 0.
+    m.reu_mut().unwrap().set_ram_byte(0x100, 0x3C);
+    transfer(&mut m, 0x1000, 0, 1, TYPE_STASH);
+    m.warm_reset();
+    assert_eq!(m.reu().unwrap().status().transfer_length, 0xFFFF);
+    assert_eq!(m.reu().unwrap().ram_byte(0x100), 0x3C, "an owned store survives too");
 }

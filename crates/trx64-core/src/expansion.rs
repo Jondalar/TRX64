@@ -131,6 +131,15 @@ pub trait ExpansionDevice: AsAny + Send {
     fn clone_device(&self) -> Option<Box<dyn ExpansionDevice>> {
         None
     }
+    /// The expansion port's /RESET line reached this device.
+    ///
+    /// Default: nothing. 850 made "no reset calls a device" a BLANKET rule, which was
+    /// adopted for the UCI block and is right there — `command_protocol.vhd:292-306`, only
+    /// the FPGA system reset clears it, and a C64 reset must leave it standing. It is
+    /// wrong for anything that is really out on the port: the connector carries /RESET, and
+    /// VICE resets the REU with the cartridge (`c64carthooks.c:2412`). So the choice is the
+    /// DEVICE's, not the machine's, and a device that says nothing keeps 850's behaviour.
+    fn reset(&mut self) {}
 }
 
 /// Spec 853 D1 — several devices in one place.
@@ -269,6 +278,12 @@ impl ExpansionDevice for ExpansionChain {
         self.devices.iter().any(|d| d.dma_pending())
     }
 
+    fn reset(&mut self) {
+        for d in self.devices.iter_mut() {
+            d.reset();
+        }
+    }
+
     fn clone_device(&self) -> Option<Box<dyn ExpansionDevice>> {
         // All or nothing: a chain that silently dropped the members a host owns would
         // hand back a machine that is not the one that was copied.
@@ -350,7 +365,15 @@ impl SnoopSet {
 /// every call site in the crate.
 pub trait ExpansionRam: Send {
     fn len(&self) -> u32;
-    fn read(&self, off: u32) -> u8;
+    /// `None` means "nothing backs this address" — the store is not lent right now, or the
+    /// offset is past what is fitted. The DEVICE then supplies its own not-backed value,
+    /// which for an REU is the floating-bus latch.
+    ///
+    /// This returns an `Option` because a bare `u8` cannot say it. UE2 found that the hard
+    /// way: it had to return `0xFF` and note that this was correct only because it happened
+    /// to match `Reu`'s default — a host picking any other value would have disagreed with
+    /// the device silently, which is the worst shape a defect can take.
+    fn read(&self, off: u32) -> Option<u8>;
     fn write(&mut self, off: u32, value: u8);
     /// A copy for a cloned machine, or `None` when the bytes belong to a host — the same
     /// rule `ExpansionDevice::clone_device` follows.
@@ -377,8 +400,8 @@ impl ExpansionRam for OwnedRam {
     fn len(&self) -> u32 {
         self.0.len() as u32
     }
-    fn read(&self, off: u32) -> u8 {
-        self.0.get(off as usize).copied().unwrap_or(0)
+    fn read(&self, off: u32) -> Option<u8> {
+        self.0.get(off as usize).copied()
     }
     fn write(&mut self, off: u32, value: u8) {
         if let Some(b) = self.0.get_mut(off as usize) {

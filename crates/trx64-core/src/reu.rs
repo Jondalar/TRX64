@@ -246,7 +246,7 @@ impl Reu {
     }
 
     pub fn ram_byte(&self, off: u32) -> u8 {
-        self.store.as_ref().map(|s| s.read(off)).unwrap_or(self.floating_bus)
+        self.store.as_ref().and_then(|s| s.read(off)).unwrap_or(self.floating_bus)
     }
 
     pub fn set_ram_byte(&mut self, off: u32, value: u8) {
@@ -260,7 +260,7 @@ impl Reu {
             None => Vec::new(),
             Some(s) => {
                 let end = off.saturating_add(len).min(s.len());
-                (off..end).map(|a| s.read(a)).collect()
+                (off..end).map(|a| s.read(a).unwrap_or(self.floating_bus)).collect()
             }
         }
     }
@@ -338,7 +338,7 @@ impl Reu {
         let a = reu_addr & (self.opt.dram_wrap_around - 1);
         if a < self.opt.not_backedup_addresses {
             // Nothing lent behaves as no DRAM: the latch, never a panic (D3).
-            self.store.as_ref().map(|s| s.read(a)).unwrap_or(self.floating_bus)
+            self.store.as_ref().and_then(|s| s.read(a)).unwrap_or(self.floating_bus)
         } else {
             self.floating_bus
         }
@@ -826,6 +826,14 @@ impl ExpansionDevice for Reu {
 
     fn dma_pending(&self) -> bool {
         Reu::dma_pending(self)
+    }
+
+    /// An REU is out on the connector, so the C64's /RESET reaches it: the REC returns to
+    /// power-on and the DRAM keeps every byte (VICE `reu_reset`, reu.c:602). That second
+    /// half matters for a borrowed store — resetting the machine must not touch memory a
+    /// host lent us.
+    fn reset(&mut self) {
+        Reu::reset(self);
     }
 
     fn clone_device(&self) -> Option<Box<dyn ExpansionDevice>> {

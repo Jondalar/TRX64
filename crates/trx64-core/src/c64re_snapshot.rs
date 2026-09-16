@@ -376,14 +376,14 @@ pub fn capture_cia(cia: &Cia) -> CiaSnapshot {
         sp_in_state: 0,
         cnt_in_state: 0,
         cnt_out_state: 0,
-        todalarm: vec![0, 0, 0, 0],
+        todalarm: cia.tod_alarm.iter().map(|&b| b as i64).collect(),
         todlatch: cia.tod_latch.iter().map(|&b| b as i64).collect(),
         todlatched: cia.tod_latched as i64,
-        todstopped: 0,
-        todticks: 0,
+        todstopped: cia.tod_stopped as i64,
+        todticks: cia.tod_clk as i64,
         todclk: clk,
-        todtickcounter: 0,
-        power_tickcounter: cia.tod_prescaler as i64,
+        todtickcounter: cia.tod_tick_counter as i64,
+        power_tickcounter: 0,
         power_ticks: 0,
         old_pa: 0xff,
         old_pb: 0xff,
@@ -420,7 +420,14 @@ pub fn restore_cia(cia: &mut Cia, s: &CiaSnapshot, tab: &[u16; crate::cia::CIAT_
         cia.tod_latch[i] = s.todlatch.get(i).copied().unwrap_or(0) as u8;
     }
     cia.tod_latched = s.todlatched != 0;
-    cia.tod_prescaler = s.power_tickcounter as u32;
+    for i in 0..4 {
+        cia.tod_alarm[i] = s.todalarm.get(i).copied().unwrap_or(0) as u8;
+    }
+    cia.tod_stopped = s.todstopped != 0;
+    cia.tod_tick_counter = s.todtickcounter as u8;
+    // A pre-TOD dump wrote 0 here; a running clock needs a non-zero countdown or it
+    // would fire on the very next cycle.
+    cia.tod_clk = if s.todticks > 0 { s.todticks as u32 } else { crate::cia::PAL_CYCLES_PER_SEC / 60 };
     // Re-derive the cached alarm clk = the PREDICTED next-underflow clk (VICE
     // ciat_set_alarm), NOT `ta.clk` (the timer's last-update clk). The old
     // `= ta.clk` set the alarm to ~now, so the dispatch `while ta_alarmclk <= rclk`
