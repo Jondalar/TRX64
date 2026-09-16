@@ -62,7 +62,9 @@ From source: `cargo build --release`. Builds natively (for Windows it uses MSVC)
 - **Shared sessions** — one machine, several clients, human and agent at once.
 - **Snapshots** — `.c64re` full machine, `.c64rering` the reverse-debug buffers.
 
-TRX64 includes reSID, DuckDB and by default uses 300 MB RAM for 60 seconds machine ringbuffer (you can configure this, see parameters)
+TRX64 includes reSID and DuckDB. The always-on reverse-debug ring costs ~93 MB at its
+default depth of 10 seconds; `revdepth <s>` changes it, and 60 seconds is closer to a
+gigabyte.
 
 ---
 
