@@ -1330,6 +1330,34 @@ impl Machine {
         old
     }
 
+    /// Spec 853 D1 — remove ONE device, whether it sits bare on the port or inside a
+    /// chain, and leave everything else and its state alone. `detach_expansion` above
+    /// takes the whole place, which on a chain means everything on it.
+    pub fn detach_expansion_device<T: 'static>(
+        &mut self,
+    ) -> Option<Box<dyn crate::expansion::ExpansionDevice>> {
+        let mut slot = self.expansion.take();
+        let mut out = None;
+        let bare = slot.as_ref().map(|d| d.as_ref().as_any().is::<T>()).unwrap_or(false);
+        if bare {
+            out = slot.take();
+        } else if let Some(dev) = slot.as_mut() {
+            if let Some(chain) =
+                dev.as_mut().as_any_mut().downcast_mut::<crate::expansion::ExpansionChain>()
+            {
+                out = chain.remove::<T>();
+            }
+        }
+        self.expansion.0 = slot;
+        self.refresh_expansion_snoop();
+        out
+    }
+
+    /// The REU, off the port, with everything else on it untouched.
+    pub fn detach_reu(&mut self) -> Option<Box<dyn crate::expansion::ExpansionDevice>> {
+        self.detach_expansion_device::<crate::reu::Reu>()
+    }
+
     /// Install or remove the machine profile's own device (Spec 852's UCI block).
     pub fn set_port_profile_device(
         &mut self,
@@ -1648,6 +1676,14 @@ impl Machine {
             }
         }
         self.expansion_snoop = if set.is_empty() { None } else { Some(Box::new(set)) };
+    }
+
+    /// Spec 853 D1 — is this address still snooped by anything on the port?
+    ///
+    /// The write path pays for a snooped address, so a device that has left must stop
+    /// registering one. Being able to ASK is what makes that testable rather than assumed.
+    pub fn expansion_snoop_registered(&self, addr: u16) -> bool {
+        self.expansion_snoop.as_ref().map(|s| s.contains(addr)).unwrap_or(false)
     }
 
     /// Spec 850 D6 — the IRQ/NMI the host itself drives onto the port. Takes effect at the

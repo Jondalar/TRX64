@@ -172,6 +172,30 @@ impl ExpansionChain {
         self
     }
 
+    /// Remove the first device of this type, leaving every other member — and its state —
+    /// exactly where it was. A chain that can only grow is unusable for a host whose
+    /// devices come and go: on a U64 the firmware turns `C64_REU_ENABLE` on and off while
+    /// the machine runs.
+    pub fn remove<T: 'static>(&mut self) -> Option<Box<dyn ExpansionDevice>> {
+        let idx = self.devices.iter().position(|d| d.as_ref().as_any().is::<T>())?;
+        let dev = self.devices.remove(idx);
+        self.rebuild_snoop();
+        Some(dev)
+    }
+
+    /// The cached union is only correct while the membership is. Rebuilt on every removal
+    /// so an address nobody registers any more stops being snooped.
+    fn rebuild_snoop(&mut self) {
+        self.snoop.clear();
+        for d in &self.devices {
+            for &a in d.snoop_addresses() {
+                if !self.snoop.contains(&a) {
+                    self.snoop.push(a);
+                }
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.devices.len()
     }

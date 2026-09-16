@@ -227,6 +227,14 @@ impl Reu {
         Some(reu)
     }
 
+    /// An REU whose RAM belongs to the caller (Spec 854), ready to be put on the port
+    /// beside whatever is already there with `Machine::attach_expansion_also`.
+    pub fn new_with_store(size_kb: u32, store: Box<dyn ExpansionRam>) -> Option<Self> {
+        let mut reu = Reu::new(size_kb)?;
+        reu.set_store(Some(store));
+        Some(reu)
+    }
+
     pub fn size_kb(&self) -> u32 {
         self.size_kb
     }

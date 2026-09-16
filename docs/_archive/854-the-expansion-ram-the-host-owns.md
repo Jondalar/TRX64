@@ -159,3 +159,37 @@ in `tests/reu_gate.rs` (38 total with 853's).
 games 7/7), core lib 321. The decisive case is `a_transfer_lands_in_the_hosts_own_memory`:
 the host reads the very bytes the device wrote, and a host write is what the C64 fetches
 back — the two-copies problem UE2 found, demonstrated gone.
+
+## §8 What UE2's integration asked to have written down
+
+UE2 serves GeoRAM itself: on the U64 it is part of the FPGA's cartridge logic (type `0x1F`
+out of guest DDR), not a separate device, so its bridge will use 854's REU half and not the
+GeoRAM half. Two models answering `$DE00-$DEFF` would fight. That makes three properties
+load-bearing for a host, and none of them should rest on luck:
+
+- **The REU claims IO2 and nothing else.** `attach_reu_borrowed` installs exactly one
+  device, and `Reu::read`/`write` return `None` for any address whose high byte is not
+  `$DF`, so IO1 is untouched. Gated: with an REU attached, a write-then-read at `$DE00`
+  does not come back.
+- **Precedence is 850 D2's, inherited unchanged.** A read is answered profile device, then
+  host device, then cartridge, then the open bus, and the FIRST non-`None` answer stands —
+  so a port device beats a cartridge that also decodes IO2. A write is different and worth
+  saying separately: every device sees it **in addition to** the cartridge, and a device
+  does not consume it.
+- **One device can leave without taking the others with it.** This was a real gap in 853
+  D1: the chain could grow and not shrink, and `detach_expansion` takes the whole place,
+  which on a chain means everything on it. `ExpansionChain::remove::<T>()` and
+  `Machine::detach_expansion_device::<T>()` / `detach_reu()` remove one member and leave
+  the rest and their state alone; the chain rebuilds its snoop union, so an address nobody
+  registers any more stops being snooped and the write path stops paying for it. A chain
+  that only grows is unusable for a host whose firmware turns `C64_REU_ENABLE` on and off
+  while the machine runs.
+
+`Reu::new_with_store(size_kb, store)` exists for the same reason: a host composes the
+borrowed REU into the chain beside its own device with `attach_expansion_also`, rather than
+`attach_reu_borrowed` replacing what is already on the port.
+
+Gated in `reu_gate`: 41 cases, `attaching_an_reu_installs_only_an_reu`,
+`detaching_the_reu_leaves_the_rest_of_the_chain_alone`,
+`removing_the_last_snooper_stops_the_snoop`. Full gate green (108 gate tests, daemon 382,
+seven games 7/7), core lib 321.

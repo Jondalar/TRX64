@@ -837,3 +837,73 @@ fn an_owned_store_still_rides_a_dump() {
     assert_eq!(fresh.reu().unwrap().ram_byte(0), 0xEE);
     assert!(!fresh.expansion_ram_uncovered());
 }
+
+// ── UE2's three questions, answered as gates ───────────────────────────────────────
+
+#[test]
+fn attaching_an_reu_installs_only_an_reu() {
+    // UE2 serves GeoRAM itself out of its cartridge logic, so a second model answering
+    // IO1 would fight it. The REU must claim IO2 and nothing else.
+    let host = HostRam::new(512 * 1024);
+    let mut m = Machine::new();
+    assert!(m.attach_reu_borrowed(512, Box::new(host)));
+    assert!(m.georam().is_none(), "no GeoRAM comes along for the ride");
+
+    // $DE00 is not ours: with nothing else on the port it reads the open bus (840),
+    // never a register.
+    let mut p = Vec::new();
+    lda_sta(&mut p, 0x55, 0xDE00);
+    p.extend_from_slice(&[0xAD, 0x00, 0xDE, 0x8D, 0x00, 0x04]);
+    jmp_self(&mut p);
+    run_at(&mut m, &p, 4);
+    assert_ne!(m.read_full(0x0400), 0x55, "the REU must not answer IO1");
+}
+
+#[test]
+fn detaching_the_reu_leaves_the_rest_of_the_chain_alone() {
+    let host = HostRam::new(512 * 1024);
+    let mut m = Machine::new();
+    let (t, log, snooped) = tap(0xDE00, Some(0x99));
+    m.attach_expansion(t); // tap() already boxes it
+    m.attach_expansion_also(Box::new(
+        trx64_core::Reu::new_with_store(512, Box::new(host.clone())).unwrap(),
+    ));
+    assert!(m.reu().is_some());
+
+    // The firmware turns C64_REU_ENABLE off mid-run.
+    assert!(m.detach_reu().is_some(), "the REU comes off");
+    assert!(m.reu().is_none());
+
+    // The other device is still there, still answering, still recording.
+    let mut p = Vec::new();
+    p.extend_from_slice(&[0xAD, 0x00, 0xDE, 0x8D, 0x00, 0x04]);
+    lda_sta(&mut p, 0x01, 0xDE00);
+    lda_sta(&mut p, 0x0E, 0xD020);
+    jmp_self(&mut p);
+    let n = instrs(&p) + 1;
+    run_at(&mut m, &p, n);
+    assert_eq!(m.read_full(0x0400), 0x99, "the tap still answers");
+    assert_eq!(log.lock().unwrap().len(), 1, "and still sees writes");
+    assert!(
+        snooped.lock().unwrap().iter().any(|(a, _)| *a == 0xD020),
+        "and its snoop still fires after the removal"
+    );
+
+    // And the REU can come back without disturbing the tap.
+    m.attach_expansion_also(Box::new(
+        trx64_core::Reu::new_with_store(512, Box::new(host)).unwrap(),
+    ));
+    assert!(m.reu().is_some(), "enable flips back on");
+    assert_eq!(m.read_full(0x0400), 0x99);
+}
+
+#[test]
+fn removing_the_last_snooper_stops_the_snoop() {
+    // $FF00 is snooped only because the REU asks for it. Once it is gone, nothing
+    // should still be registering it — otherwise the write path pays for a device that
+    // left.
+    let mut m = machine_with_reu(512);
+    assert!(m.expansion_snoop_registered(0xFF00), "armed while the REU is on");
+    m.detach_reu();
+    assert!(!m.expansion_snoop_registered(0xFF00), "and not after it leaves");
+}
