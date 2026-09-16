@@ -158,6 +158,13 @@ obs cap_off when exec $4100 do trace off              # stop at $4100
 | `tracedb start\|stop\|status\|mark` | declarative trace |
 | `traceindex [path]` | build the queryable `.duckdb` index for a `.c64retrace` |
 
+### Expansion port  (read-only — these report, they never change the device)
+| command | what it does |
+|---|---|
+| `reu` / `georam` | the attached device decoded: size, transfer type, trigger, pending |
+| `uci` | the Ultimate Command Interface: state, pointers, lines |
+| `turbo` | which machine this session claims to be, and the speed that is set |
+
 ### Analysis  (need a trace — `trace on` first)
 | command | what it does |
 |---|---|

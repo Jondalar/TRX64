@@ -55,6 +55,10 @@ From source: `cargo build --release`. Builds natively (for Windows it uses MSVC)
 - **Cartridges** — EasyFlash, Ocean, Magic Desk, GMOD2/3, MegaByter. Flash and EEPROM
   writes survive a reset and a snapshot round trip.
 - **Disks** — `.d64` / `.g64`, 35 to 42 tracks. Drive-side GCR writes reach the host file.
+- **Expansion port** — REU (1700/1764/1750, oversized to 16 MB), GeoRAM, and the Ultimate
+  Command Interface. Devices, not cartridges: several at once, and a host can lend its own RAM.
+- **Machines** — `--machine c64|u64|128`. `u64` is the Ultimate 64 / Elite II / C64 Ultimate:
+  the turbo registers, and a CPU that really runs — the firmware's own speed table, to 64 MHz.
 - **Shared sessions** — one machine, several clients, human and agent at once.
 - **Snapshots** — `.c64re` full machine, `.c64rering` the reverse-debug buffers.
 
@@ -89,7 +93,7 @@ Details: [`crates/trx64-cli/README.md`](crates/trx64-cli/README.md).
 
 ## Monitor commands
 
-Superset based on VICE, ~128 verbs. Full reference: **[MONITOR.md](MONITOR.md)**;
+Superset based on VICE, ~130 verbs. Full reference: **[MONITOR.md](MONITOR.md)**;
 `help` prints the live list.
 
 | | |
@@ -104,6 +108,7 @@ Superset based on VICE, ~128 verbs. Full reference: **[MONITOR.md](MONITOR.md)**
 | **State** | `dump`/`undump` `.c64re` · `ringdump`/`ringload` · `trace on\|off` |
 | **Analysis** | `map` memory map · `taint` · `swimlane` · `diff <a> <b>` |
 | **Drive** | `device drive8` then `r`/`m`/`d` — the 1541's own 6502 |
+| **Expansion** | `reu` / `georam` the device decoded · `uci` the command interface · `turbo` the machine |
 
 ---
 
@@ -111,6 +116,7 @@ Superset based on VICE, ~128 verbs. Full reference: **[MONITOR.md](MONITOR.md)**
 
 ```sh
 trx64-daemon --project <dir> --port 4312 [--stream]
+trx64-daemon --machine u64 --reu 512        # an Ultimate with a 512 KiB REU
 ```
 
 JSON-RPC 2.0 over WebSocket. One machine per process.
@@ -128,7 +134,7 @@ For embedding in the Apple universe, `trx64-ffi` exposes a typed uniffi library 
 [`crates/trx64-ffi/API.md`](crates/trx64-ffi/API.md).
 
 **Formats:** `.c64re` machine snapshot, `.c64rering` reverse-debug buffers, `.c64retrace`
-trace log. VICE `.vsf` imports.
+trace log. VICE `.vsf` imports, `.reu` images load with `--reu-image`.
 
 ---
 
