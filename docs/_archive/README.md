@@ -229,5 +229,8 @@ every bus record and every interrupt — a batched instruction that kept the pre
 pre-fetch state was invisible in the machine state and wrong in every trace, and only the bus
 records caught it. Both failure kinds were provoked before the gate was trusted.
 
-Measured on a RAM loop at 64 MHz: 0.86× → 1.40× real time with the reverse rings off. The
-rings stay per instruction; that cost is theirs and has its own switch.
+Measured on a RAM loop at 64 MHz: 0.86× → 1.40× real time with the reverse rings off. On the
+real thing — UltimateDemo2026 at 64 MHz in UE2 — 0.72–0.98× became real time in every window,
+and the audio underruns stopped. The rings stay per instruction; that cost is theirs and has
+its own switch. What dominates now is the CIA timer update, which this change barely touched:
+its cost is the real per-PHI2 advance, not the repeats.

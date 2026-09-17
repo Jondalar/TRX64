@@ -1,6 +1,6 @@
 # Spec 856 — Turbo pays per instruction
 
-**Status:** BUILT 2026-09-17 — D0 cleared (bound ≈ 1.6×), D1–D4 built; 64 MHz 0.86× → 1.40× real time on a RAM loop, 1 MHz unchanged. See §8.
+**Status:** BUILT 2026-09-17 — D0 cleared (bound ≈ 1.6×), D1–D4 built; UltimateDemo2026 at 64 MHz now holds real time in UE2 (was 0.72–0.98×), 1 MHz unchanged. See §8.
 **Repo:** TRX64 (`trx64-core`). UE2 consumes the result and measures it; it builds nothing here.
 **Number:** 856 (registry: `../../../C64ReverseEngineeringMCP/specs/README.md`).
 **Depends on:** Spec 851 D3 (the turbo divider this spec leaves untouched).
@@ -232,5 +232,37 @@ both processor-port addresses, read and write. **D4** is `Machine::turbo_fast_pa
 - **The reverse rings stay per instruction.** With them on, 64 MHz is 1.09× instead of 1.40×.
 - **`DeltaRing::commit` is still an out-of-line call per instruction when disabled**, ~1 % in
   UE2's profile. Outside this spec.
-- **Not re-profiled after the change.** Which share is largest now is an open reading, not a
-  finding; the next profile of the demo answers it.
+- **The CIA timer update is now the largest single item and barely moved** — see below. The
+  repeats at unchanged `clk` were not where its cost was.
+
+**Confirmed on the demo (UE2, same host, same conditions as the D0 run).** UE2 0.3.0 with the
+core at `a6e0465`, UltimateDemo2026 v1.0.1 at 64 MHz, headless, real time, audio on, four
+15 s emulated windows. Emulated / wall, and the process's CPU:
+
+| window | before (`1ce84b0`) | after (`a6e0465`) |
+|---|---|---|
+| 1 | 0.846 @ 100 % | **1.000** @ 76 % |
+| 2 | 0.772 @ 99 % | **0.999** @ 85 % |
+| 3 | 0.718 @ 100 % | **0.999** @ 69 % |
+| 4 | 0.982 @ 99 % | **0.997** @ 97 % |
+
+Real time in every window, and the owner heard the audio underruns stop. Two caveats from UE2:
+the windows are placed by wall time, so a faster run is further into the demo in the same
+window; and window 4 at 97 % leaves little headroom.
+
+Profile of the emulation thread, share of all samples (after includes idle time where it runs
+ahead, so its shares read lower):
+
+| where | before | after |
+|---|---|---|
+| run loop self | 15–17 % | 5–11 % |
+| expansion chain lines + `dma_pending` | 8–9 % | 2–5 % |
+| `Ciat::update` + `Cia::update_ta` | 16–18 % | **12–16 %** |
+| `full_sc::execute_one` self | 11–13 % | 11–14 % |
+| 6510 decode / `clk_inc` / operand access | 14–15 % | 14–16 % |
+| `FullBus::read` | 8–9 % | 8–13 % |
+| VIC tick incl. draw | 4–5 % | 5–6 % |
+
+The two items this spec aimed at dropped as intended. The CIA update did not, which says its
+cost was never the no-op repeats at an unchanged clock but the real per-PHI2 advance. It is now
+the largest single item; after it, everything left is per instruction.
