@@ -62,6 +62,13 @@ pub struct CpuSnapshot {
     pub so_line: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jammed: Option<bool>,
+    /// Spec 851's turbo divider counts CPU cycles below each PHI2 cycle, and a restore that
+    /// drops the count starts the next PHI2 edge after a different number of CPU cycles — so
+    /// the restored machine runs a different instruction sequence from the one captured.
+    /// Written only when non-zero, so a 1 MHz checkpoint is byte-identical to before; an
+    /// older checkpoint reads as 0, which is what every restore used until now.
+    #[serde(rename = "turboPhase", default, skip_serializing_if = "Option::is_none")]
+    pub turbo_phase: Option<i64>,
 }
 
 // ── iec (runtime-checkpoint.ts:53-61) ──────────────────────────────────────────
@@ -564,6 +571,7 @@ pub fn capture_cpu(m: &Machine) -> CpuSnapshot {
         maincpu_ba_low_flags: Some(m.vic.ba_low_flag as i64),
         so_line: None,
         jammed: None,
+        turbo_phase: (c.turbo_phase != 0).then_some(i64::from(c.turbo_phase)),
     }
 }
 
@@ -586,6 +594,7 @@ pub fn restore_cpu(m: &mut Machine, s: &CpuSnapshot) {
     core.reg_sp = sp;
     core.set_status_composite(flags);
     core.clk = clk;
+    core.turbo_phase = s.turbo_phase.unwrap_or(0) as u32;
 
     let cpu = &mut m.cpu6510;
     cpu.reg_pc = pc;
