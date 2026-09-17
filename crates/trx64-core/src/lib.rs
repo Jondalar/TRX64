@@ -2924,8 +2924,14 @@ impl Machine {
             let now = self.c64_core.clk;
             self.cia1.checked_clk = now;
             self.cia2.checked_clk = now;
-            self.cia1.update_to(now, &table);
-            self.cia2.update_to(now, &table);
+            // Spec 857 D3 — the same comparison as `process_alarms`. The restamp below stays
+            // unconditional: it carries an acknowledge made inside the last PHI2 cycle (856 §3).
+            if !self.cia_alarm_check || self.cia1.alarm_due(now) {
+                self.cia1.update_to(now, &table);
+            }
+            if !self.cia_alarm_check || self.cia2.alarm_due(now) {
+                self.cia2.update_to(now, &table);
+            }
             self.c64_int.set_irq(c64_6510core::INT_SRC_VIC, self.vic.irq_line, now);
             self.c64_int.set_irq(c64_6510core::INT_SRC_CIA1, self.cia1.irq_asserted(), now);
             self.c64_int.set_nmi(c64_6510core::INT_SRC_CIA2, self.cia2.irq_asserted(), now);

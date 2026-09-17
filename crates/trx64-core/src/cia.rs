@@ -738,14 +738,6 @@ impl Cia {
         }
     }
 
-    /// Re-arm both timer alarms after a snapshot restore that set the register file
-    /// + `ta`/`tb` cnt/latch/clk directly (e.g. a VICE-VSF import — vsf.rs). Such a
-    /// restore leaves each `Ciat.state` at its stopped default and the cached
-    /// `ta_alarmclk`/`tb_alarmclk` at `CLOCK_NEVER`, so a RUNNING timer would never
-    /// fire its underflow IRQ again — the game's CIA-timer-driven logic (frame clock,
-    /// raster-split IRQ setup) silently stalls. Reconstruct each timer's control
-    /// state from CRA/CRB (`ciat_set_ctrl`) and predict the next underflow clk
-    /// (`ciat_set_alarm`) — the VICE `cia_snapshot_read_module` tail.
     /// Spec 857 D3 — VICE's alarm check (`6510dtvcore.c` prologue, `mainc64cpu.c:99`): is
     /// anything due at `clk`? Nothing due means `update_to` would only move counters that no
     /// reader looks at without catching up first. A running timer with no prediction counts
@@ -768,6 +760,14 @@ impl Cia {
         c
     }
 
+    /// Re-arm both timer alarms after a snapshot restore that set the register file
+    /// + `ta`/`tb` cnt/latch/clk directly (e.g. a VICE-VSF import — vsf.rs). Such a
+    /// restore leaves each `Ciat.state` at its stopped default and the cached
+    /// `ta_alarmclk`/`tb_alarmclk` at `CLOCK_NEVER`, so a RUNNING timer would never
+    /// fire its underflow IRQ again — the game's CIA-timer-driven logic (frame clock,
+    /// raster-split IRQ setup) silently stalls. Reconstruct each timer's control
+    /// state from CRA/CRB (`ciat_set_ctrl`) and predict the next underflow clk
+    /// (`ciat_set_alarm`) — the VICE `cia_snapshot_read_module` tail.
     pub fn restore_rearm_alarms(&mut self, tab: &[u16; CIAT_TABLEN]) {
         self.ta.set_ctrl(self.regs[CIA_CRA]);
         self.tb.set_ctrl(self.regs[CIA_CRB]);

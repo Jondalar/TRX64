@@ -1,6 +1,6 @@
 # Spec 857 — The CIA alarm is a comparison, not an update
 
-**Status:** PROPOSED 2026-09-17 — nothing built. Tried on branch `spec-857-cia-alarm-check`; `main` stays untouched until the gates and the measurement say so.
+**Status:** BUILT 2026-09-17 on branch `spec-857-cia-alarm-check`, **not merged** — D0–D4 built, full gate green, 1 MHz 10.53× → 13.33× and 64 MHz 0.97× → 1.22× real time. `main` is untouched until the owner decides. See §8.
 **Repo:** TRX64 (`trx64-core`).
 **Number:** 857 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`).
 **Depends on:** Spec 856 (its profile is what found this).
@@ -117,3 +117,46 @@ cycle takes (856 §3).
 - VICE's "skip alarms nobody needs" optimisation in `ciacore_intta` (it re-arms Timer A only
   when an IRQ, PB6, the shift register or a cascade wants it). Worth reading later; ours always
   re-arms, which is correct and slower.
+
+## §8 As built (2026-09-17, on the branch)
+
+**D0 — measured, alternating in one binary** (`bench_cia_alarm_check`, K = 9, the side that runs
+first alternates each pair):
+
+| load | check off | check on | wall | pairs faster |
+|---|---|---|---|---|
+| booted, READY prompt, KERNAL IRQ, 1 MHz | 10.53× | **13.33×** | −21.0 % | 9 / 9 |
+| RAM loop, 64 MHz | 0.97× | **1.22×** | −20.4 % | 9 / 9 |
+
+Well beyond the ~2 % drift, and every pair points the same way. It is the stock machine that
+gains as much as the turbo one, because the prologue ran the catch-up at 1 MHz too.
+
+**D1 — `cia_alarm_check_gate`, three cases, in `scripts/gate.sh`.** Lockstep equality every 7919
+cycles — instruction stream, bus records, interrupts, full checkpoint, `peek` of all 32
+registers — over Timer A continuous, Timer A with a timer read in the loop, one-shot, Timer B
+cascade at latches 0/1/2, CIA2 NMI, the TOD alarm, a checkpoint restored mid-count and a booted
+machine, each at 1 and 64 MHz. Plus frozen digests of the pre-857 behaviour.
+
+**The frozen digests earned their place twice.** First run: the restore case diverged at 64 MHz
+**on the code before 857 touched anything** — checkpoints did not carry `turbo_phase`, so a
+restored machine at turbo ran one instruction more in its first 7919 cycles. A defect since 851
+(v0.6.0), fixed in its own commit (`7ce542a`) so it can go to `main` without 857. Second: the
+first cut of D2 caught readers up to `Cia::clk`, which is the TOD tick counter and runs one
+ahead of the CPU after every `tick()`, and the digests moved at once.
+
+**Both failure kinds provoked before the gate was trusted.** Taking Timer B out of the alarm
+check turned the cascade case red; letting `peek` read the stored counters turned the timer and
+booted cases red. The restore case stays green under both — it compares two machines with the
+same setting, which is its job.
+
+**D2** as §3 states, corrected once (§2 no longer claims the restore needs re-arming).
+`checked_clk` is set at every alarm check, whether or not anything is due. **D3** in
+`FullScBus::process_alarms` and at the run loop boundary; the boundary's interrupt restamp is
+unchanged. **D4** is `Machine::cia_alarm_check` / `TRX64_CIA_ALARM_CHECK=0`.
+
+**Gate:** full gate green on the branch — 13 suites / 154 tests, daemon 382, seven games 7/7.
+Clippy: no warning on any line this branch added.
+
+**Open:** UE2 has not measured the branch on the demo. The lazy-arm clause in `alarm_due` means a
+Timer B counting Timer A underflows with nothing pending still catches up every time — correct,
+and no faster than before, for the rare program that uses the cascade.
