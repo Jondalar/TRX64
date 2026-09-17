@@ -41,19 +41,21 @@ alone — which is why batching the boundary in 856 left the CIA item where it w
 ## §2 Why the catch-up cannot simply become a comparison
 
 Updating every CIA every cycle hides two places where the port does not keep an alarm
-current, and one place where a reader relies on the timer being caught up. Found by reading;
-each would turn into a missed or late interrupt the moment the catch-up stops.
+current, and one place where a reader relies on the timer being caught up. Each would turn
+into a missed or late interrupt, or a wrong readout, the moment the catch-up stops.
 
-**1. Timer B counting Timer A underflows.** VICE's `ciat_single_step` (`ciatimer.h:382-389`)
-sets `CIAT_STEP` **and re-predicts the timer's alarm**. Ours (`cia.rs:276-280`) sets the step
-bit only. Today the next per-cycle `tb.update` consumes the step anyway. With an alarm check,
-Timer B's cascade underflow would wait for the next Timer A alarm or a register read.
+**1. Timer B's alarm is predicted and never fired.** VICE's `cia_update_tb` (`ciacore.c:317-344`)
+dispatches `ciacore_inttb` for every Timer B alarm up to the clock. Ours predicted
+`tb_alarmclk` on every register write and had no dispatch at all: `update_tb` only settled the
+counter. Timer B's underflows were latched because `update_to` caught Timer B up every cycle.
 
-**2. The `.c64re` restore.** `restore_cia` (`c64re_snapshot.rs:~420-445`) writes each timer's
-state, latch, count and clock directly and does not re-predict the alarms.
-`Cia::restore_rearm_alarms` (`cia.rs:701`) exists for exactly that and only the VSF import calls
-it. Today the lazy-arm branch in `update_ta` (`cia.rs:526`) repairs it on the next update, which
-is the next cycle.
+**2. Timer B counting Timer A underflows.** VICE's `ciat_single_step` (`ciatimer.h:382-389`)
+sets `CIAT_STEP` **and re-predicts the timer's alarm**. Ours (`cia.rs:276-280`) set the step
+bit only. The next per-cycle `tb.update` consumed the step anyway.
+
+*This section first named the `.c64re` restore as a third gap. It is not: `restore_cia`
+re-predicts both alarms at its end (`c64re_snapshot.rs:481-482`). The first reading stopped
+forty lines into the function.*
 
 **3. Readers that bypass the catch-up.** `Cia::peek` (`cia.rs:848-856`) returns `ta.cnt` /
 `tb.cnt` directly, and so does the snapshot capture. Both are correct today only because the
@@ -84,10 +86,13 @@ Plus `cia_tod_gate`, `snapshot_roundtrip_fidelity` and the seven games, unchange
 **D2 — Make the alarms carry what the catch-up carried.** Neutral on today's path, so D1 stays
 green before D3 exists:
 
+- Timer B gets its alarm handler (`inttb`, after `ciacore_inttb`) and `update_tb` dispatches it,
+  as `update_ta` already did for Timer A;
 - `Ciat::single_step` re-predicts the alarm, as VICE does;
-- `restore_cia` calls `restore_rearm_alarms`;
-- `peek` and the snapshot capture report counts caught up to the machine's clock, computed on a
-  copy so neither mutates.
+- `peek` and the snapshot capture report counts caught up on a copy, so neither mutates — to
+  `checked_clk`, the clock the machine last checked the alarms at, and **not** to `Cia::clk`,
+  which is the TOD tick counter and runs one ahead of the CPU after every `tick()`. The first
+  cut used `Cia::clk`; the frozen digests moved at once, which is what they are for.
 
 **D3 — The comparison.** `process_alarms` calls `update_to` for a CIA only when
 `ta_alarmclk <= clk || tb_alarmclk <= clk`. The boundary's catch-up goes the same way. Its

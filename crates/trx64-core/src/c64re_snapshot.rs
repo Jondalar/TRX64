@@ -370,6 +370,8 @@ fn alarmclk_from_json(v: i64) -> u64 {
 ///   - old_pa/old_pb = 0xff (VICE bug #1143, cia6526-vice.ts:416-418).
 ///   - tod power/tick counters = 0; todalarm = 0s.
 pub fn capture_cia(cia: &Cia) -> CiaSnapshot {
+    // Spec 857 D2: capture the timers as they stand at the CIA's clock, not at the last catch-up.
+    let cia = &cia.caught_up();
     let clk = cia.clk as i64;
     CiaSnapshot {
         v: 2,
@@ -478,6 +480,8 @@ pub fn restore_cia(cia: &mut Cia, s: &CiaSnapshot, tab: &[u16; crate::cia::CIAT_
     // ~3 frames from a byte-faithful restore). Stopped timer → NEVER.
     cia.ta_alarmclk = if cia.ta.is_running() { cia.ta.set_alarm(tab) } else { CLOCK_NEVER };
     cia.tb_alarmclk = if cia.tb.is_running() { cia.tb.set_alarm(tab) } else { CLOCK_NEVER };
+    // Spec 857 D2: readers catch up to this clock; the timers were captured caught up to it.
+    cia.checked_clk = cia.ta.clk.max(cia.tb.clk);
 }
 
 /// Read TRX64's SID (`sid` voice state + `sid_regs`) into the c64re `SidSnapshot`.

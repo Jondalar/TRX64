@@ -1951,6 +1951,8 @@ impl Machine {
         }
         let clk = self.c64_core.clk;
         if chips {
+            self.cia1.checked_clk = clk;
+            self.cia2.checked_clk = clk;
             self.cia1.update_to(clk, &table);
             self.cia2.update_to(clk, &table);
             self.sid.tick(clk.wrapping_sub(start), &self.sid_regs);
@@ -2920,6 +2922,8 @@ impl Machine {
             // set_irq_line semantics, which stamped at self.clk; the SC core's
             // set_irq/set_nmi re-stamp only on the nirq/nnmi 0→1 edge).
             let now = self.c64_core.clk;
+            self.cia1.checked_clk = now;
+            self.cia2.checked_clk = now;
             self.cia1.update_to(now, &table);
             self.cia2.update_to(now, &table);
             self.c64_int.set_irq(c64_6510core::INT_SRC_VIC, self.vic.irq_line, now);

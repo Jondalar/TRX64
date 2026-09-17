@@ -87,6 +87,13 @@ pub fn new_table() -> CiaTable {
     std::sync::Arc::from(build_table())
 }
 
+/// Spec 857 D2 — the same table for readers that are handed none (`Cia::peek`, snapshot
+/// capture). There is only one table: a pure function of the index.
+fn shared_table() -> &'static [u16; CIAT_TABLEN] {
+    static TABLE: std::sync::OnceLock<Box<[u16; CIAT_TABLEN]>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(build_table)
+}
+
 const CIAT_CR_MASK: u16 = 0x039;
 const CIAT_CR_START: u16 = 0x001;
 const CIAT_CR_ONESHOT: u16 = 0x008;
@@ -419,6 +426,10 @@ pub struct Cia {
     /// Drives the lazy alarm-dispatch cascade (TB counts TA underflows).
     pub ta_alarmclk: u64,
     pub tb_alarmclk: u64,
+    /// Spec 857 D2 — the clock the machine last checked this CIA's alarms at (every prologue,
+    /// every cycle, every run boundary). The timers are current at this clock on the old path
+    /// and may lag behind it on the alarm check; `caught_up` reads them as of here.
+    pub checked_clk: u64,
 }
 
 impl Default for Cia {
@@ -438,6 +449,7 @@ impl Default for Cia {
             tod_latch: [0u8; 4],
             ta_alarmclk: CLOCK_NEVER,
             tb_alarmclk: CLOCK_NEVER,
+            checked_clk: 0,
         }
     }
 }
@@ -491,8 +503,29 @@ impl Cia {
 
     /// VICE cia_do_step_tb (ciacore.c:277-285) — set TB's STEP bit (cascade). The
     /// decrement is realised lazily by the next `tb.update`.
-    fn do_step_tb(&mut self) {
-        self.tb.single_step();
+    ///
+    /// Spec 857 D2: VICE's `ciat_single_step` (ciatimer.h:382-389) also re-predicts the
+    /// timer's alarm, so the step's underflow has a clock something will fire at. The port
+    /// set the bit only; the per-cycle catch-up consumed it on the next cycle regardless,
+    /// which hid the gap until an alarm check stopped doing that catch-up.
+    fn do_step_tb(&mut self, tab: &[u16; CIAT_TABLEN]) {
+        if self.tb.is_running() {
+            self.tb.single_step();
+            self.ciat_set_alarm_tb(tab);
+        }
+    }
+
+    /// VICE ciacore_inttb (ciacore.c:1539-1568) — the TB underflow alarm callback.
+    ///
+    /// Spec 857 D2: the port predicted `tb_alarmclk` on every register write and never fired
+    /// it. Timer B's underflows were latched only because `update_to` caught Timer B up every
+    /// cycle. Re-arms whenever TB is still running, the same choice `intta` makes.
+    fn inttb(&mut self, rclk: u64, tab: &[u16; CIAT_TABLEN]) {
+        self.do_update_tb(rclk, tab);
+        self.tb_alarmclk = CLOCK_NEVER;
+        if self.tb.is_running() {
+            self.ciat_set_alarm_tb(tab);
+        }
     }
 
     /// VICE ciacore_intta (ciacore.c:1458-1515) — the TA underflow alarm callback.
@@ -514,7 +547,7 @@ impl Cia {
         // any prior STEP), then set a fresh STEP for THIS underflow.
         if self.tb_cascade() {
             self.update_tb(rclk, tab);
-            self.do_step_tb();
+            self.do_step_tb(tab);
         }
     }
 
@@ -557,9 +590,24 @@ impl Cia {
         if self.tb_cascade() {
             self.update_ta(rclk, tab);
         }
-        // Settle TB to rclk. In cascade mode there is no TB phi2 alarm, so this just
-        // advances TB to rclk consuming a pending STEP into at most one decrement.
-        self.do_update_tb(rclk, tab);
+        // VICE cia_update_tb (ciacore.c:317-344): fire every TB alarm up to rclk, then settle.
+        // Mirrors `update_ta`, lazy arm included.
+        if self.tb_alarmclk == CLOCK_NEVER && self.tb.is_running() {
+            self.ciat_set_alarm_tb(tab);
+        }
+        let mut last_tmp: u64 = CLOCK_NEVER;
+        while self.tb_alarmclk <= rclk && self.tb_alarmclk != CLOCK_NEVER {
+            let aclk = self.tb_alarmclk;
+            self.inttb(aclk, tab);
+            last_tmp = aclk;
+            if self.tb_alarmclk == aclk {
+                self.tb_alarmclk = CLOCK_NEVER;
+                break;
+            }
+        }
+        if last_tmp != rclk {
+            self.do_update_tb(rclk, tab);
+        }
     }
 
     /// Advance both timers to `rclk`. TA underflows cascade into TB automatically
@@ -698,6 +746,28 @@ impl Cia {
     /// raster-split IRQ setup) silently stalls. Reconstruct each timer's control
     /// state from CRA/CRB (`ciat_set_ctrl`) and predict the next underflow clk
     /// (`ciat_set_alarm`) — the VICE `cia_snapshot_read_module` tail.
+    /// Spec 857 D3 — VICE's alarm check (`6510dtvcore.c` prologue, `mainc64cpu.c:99`): is
+    /// anything due at `clk`? Nothing due means `update_to` would only move counters that no
+    /// reader looks at without catching up first. A running timer with no prediction counts
+    /// as due, which is exactly when `update_ta`/`update_tb` would arm it lazily.
+    #[inline]
+    pub fn alarm_due(&self, clk: u64) -> bool {
+        self.ta_alarmclk <= clk
+            || self.tb_alarmclk <= clk
+            || (self.ta_alarmclk == CLOCK_NEVER && self.ta.is_running())
+            || (self.tb_alarmclk == CLOCK_NEVER && self.tb.is_running())
+    }
+
+    /// Spec 857 D2 — this CIA with both timers caught up to the last clock the machine checked
+    /// its alarms at, on a copy. For readers that must not mutate and must not depend on
+    /// whether that check found anything due. NOT `self.clk`: that is the TOD tick counter,
+    /// one ahead of the CPU clock after every `tick()`.
+    pub fn caught_up(&self) -> Cia {
+        let mut c = self.clone();
+        c.update_to(self.checked_clk, shared_table());
+        c
+    }
+
     pub fn restore_rearm_alarms(&mut self, tab: &[u16; CIAT_TABLEN]) {
         self.ta.set_ctrl(self.regs[CIA_CRA]);
         self.tb.set_ctrl(self.regs[CIA_CRB]);
@@ -847,6 +917,14 @@ impl Cia {
     /// Peek a register without side effects (for snapshot / state readers).
     pub fn peek(&self, addr: u16) -> u8 {
         let a = (addr & 0xf) as usize;
+        // Spec 857 D2: the counters and the ICR latch are only as current as the last catch-up.
+        if matches!(a, CIA_TAL | CIA_TAH | CIA_TBL | CIA_TBH | CIA_ICR) {
+            return self.caught_up().peek_stored(a);
+        }
+        self.peek_stored(a)
+    }
+
+    fn peek_stored(&self, a: usize) -> u8 {
         match a {
             CIA_TAL => (self.ta.cnt & 0xff) as u8,
             CIA_TAH => (self.ta.cnt >> 8) as u8,

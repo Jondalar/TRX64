@@ -402,6 +402,8 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
     #[inline]
     fn process_alarms(&mut self, clk: u64) {
         let table: &[u16; CIAT_TABLEN] = self.fb.cia_table;
+        self.fb.cia1.checked_clk = clk;
+        self.fb.cia2.checked_clk = clk;
         self.fb.cia1.update_to(clk, table);
         self.fb.cia2.update_to(clk, table);
     }
