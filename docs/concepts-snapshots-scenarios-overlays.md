@@ -47,10 +47,16 @@ below.
 ## 0. The foundation — ONE state object
 
 Everything stands on a single machine-state model, the `RuntimeCheckpoint` (Spec 705.A;
-`runtime-checkpoint.ts` / `checkpoint_ring.rs`). Full-system, atomic at a CPU
-instruction boundary: RAM + banking, CPU + `$00/$01`, CIA1/2, **SID synthesis state**
-(not PCM), IEC core, IRQ/NMI, kbd/joy/paddles, the literal-port VIC + framebuffer, the
-**maincpu alarm schedule**, the VICE-drive module + the mutable disk image, cart flash.
+`checkpoint_ring.rs`). Full-system, atomic at a CPU instruction boundary: RAM + banking,
+CPU + `$00/$01` + the turbo phase, CIA1/2, **SID synthesis state** (not PCM, and one entry
+per chip since Spec 855), IEC core, IRQ/NMI, kbd/joy/paddles, the literal-port VIC +
+framebuffer, the VICE-drive module + the mutable disk image, cart flash.
+
+**What it deliberately does NOT carry: a maincpu alarm schedule.** `alarmsMaincpu` is
+always empty — there is no VICE alarm context here, interrupts are the distilled
+`IntStatus`, and the CIA timers' own underflow predictions (Spec 857) are derived from the
+timer state and recomputed on restore. An earlier version of this line listed the alarm
+schedule as part of the checkpoint; it never was.
 
 **Discipline: one object, many serializations — never a second state model.** Two
 fidelity rules fall out and recur everywhere:

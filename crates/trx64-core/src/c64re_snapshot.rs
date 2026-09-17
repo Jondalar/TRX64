@@ -17,18 +17,26 @@
 //! from the register file + RAM + CPU + timer state which IS captured):
 //!   - cpu:           1:1 (pc/a/x/y/sp/flags/cycles + maincpu_ba_low_flags).
 //!   - ram/cpuPort*:  1:1.
-//!   - cia1/cia2:     register file + timers (state/latch/cnt/clk) + irqflags +
-//!                    ta/tb alarm clk are 1:1; the IFR delay-line pipeline, the
-//!                    SDR submodule, and the extended TOD fields are DISTILLED
-//!                    (emitted as the VICE-default placeholders — see CiaSnapshot).
+//!   - cia1/cia2:     register file + timers (state/latch/cnt/clk) + irqflags are
+//!                    1:1; the IFR delay-line pipeline, the SDR submodule, and the
+//!                    extended TOD fields are DISTILLED (emitted as the VICE-default
+//!                    placeholders — see CiaSnapshot). The ta/tb ALARM CLOCKS are not
+//!                    captured at all: they are a prediction derived from the timer
+//!                    state, so `restore_cia` re-predicts them (an older note here
+//!                    claimed they were 1:1 — CiaSnapshot has no such field).
 //!   - sid:           regs[32] + voice state 1:1 (gateflip=0 at a boundary).
 //!   - iec:           1:1.
 //!   - cpuIntStatus:  TRX64's [u32;4] per-source model mapped to the c64re
 //!                    pendingInt/intNames arrays (canonical source names).
-//!   - alarmsMaincpu: [] — TRX64's maincpu is NOT alarm-driven (distilled
-//!                    IntStatus, not the VICE alarm context). The drive's VIA
-//!                    alarms ride the drive blob, exactly as runtime-checkpoint.ts
-//!                    documents.
+//!   - alarmsMaincpu: [] — there is no VICE alarm CONTEXT here: interrupts are the
+//!                    distilled IntStatus. Since Spec 857 each CIA predicts and fires
+//!                    its own timer underflow alarm, but that prediction is derived
+//!                    state and is recomputed on restore, never serialized. The
+//!                    drive's VIA alarms ride the drive blob, exactly as
+//!                    runtime-checkpoint.ts documents.
+//!   - cpu.turboPhase: the CPU cycles counted below the current PHI2 cycle at turbo
+//!                    (Spec 851's divider). Written only when non-zero, so a 1 MHz
+//!                    checkpoint is unchanged and an older one restores as 0.
 
 use serde::{Deserialize, Serialize};
 

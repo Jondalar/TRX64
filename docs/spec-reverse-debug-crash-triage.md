@@ -91,7 +91,8 @@ the actual UX the user described.)
   — the instructions+deltas are always in the ring; the `.c64retrace` file is an **on-demand
   DUMP** of the ring (a persisted slice), not a separate capture you arm beforehand. So a
   crash's run-up is ALWAYS reverse-debuggable.
-- **Depth = 10 seconds** of always-on full-delta history (≈3M instructions + ~3M writes ≈
+- **Depth = 10 seconds** (of a 1 MHz machine — the ring counts INSTRUCTIONS, so at turbo it
+  covers that many seconds of CPU time: about a sixtieth of the wall time at 64 MHz) of always-on full-delta history (≈3M instructions + ~3M writes ≈
   100–150 MB). Tunable via env. Phase 1a shipped the CPU-only ring (~0.85s, 6 MB); this
   extends it to the full deltas at 10s.
 - **One ring serves all live reads:** chis (done) + swimlane/map/taint + reverse_step +
