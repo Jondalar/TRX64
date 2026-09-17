@@ -609,6 +609,10 @@ pub struct Machine {
     /// every instruction advances `clk`. Env kill-switch `TRX64_TURBO_FASTPATH=0`, read at
     /// `Machine::new`; the field can be flipped at any time.
     pub turbo_fast_path: bool,
+    /// Spec 857 D4 — check CIA alarms by comparison, as VICE does, instead of catching both
+    /// timers up to the clock in every instruction prologue and every cycle. Env kill-switch
+    /// `TRX64_CIA_ALARM_CHECK=0`, read at `Machine::new`; the field can be flipped at any time.
+    pub cia_alarm_check: bool,
     /// Spec 784 loader-lens — armed-on-command 1541 disk-mechanism head trace. OFF by
     /// default (does NOT run with the always-on CPU ring). When armed, a `(drv_clk,
     /// halftrack, sector)` sample is pushed whenever the sector under the head changes,
@@ -785,6 +789,10 @@ impl Machine {
             delta_ring: crate::delta_ring::DeltaRing::new(),
             turbo_fast_path: !matches!(
                 std::env::var("TRX64_TURBO_FASTPATH").map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+                Ok("0") | Ok("off") | Ok("false") | Ok("no")
+            ),
+            cia_alarm_check: !matches!(
+                std::env::var("TRX64_CIA_ALARM_CHECK").map(|v| v.trim().to_ascii_lowercase()).as_deref(),
                 Ok("0") | Ok("off") | Ok("false") | Ok("no")
             ),
             head_trace_armed: false,
@@ -1401,6 +1409,7 @@ impl Machine {
             host_lines: self.expansion_host_lines,
             port_active,
             io_touched: false,
+            cia_alarm_check: self.cia_alarm_check,
         };
         fb.write(addr, val);
         self.memconfig = fb.config;
@@ -1465,6 +1474,7 @@ impl Machine {
             host_lines: self.expansion_host_lines,
             port_active,
             io_touched: false,
+            cia_alarm_check: self.cia_alarm_check,
         };
         let v = fb.read(addr);
         self.memconfig = fb.config;
@@ -1771,6 +1781,7 @@ impl Machine {
                 host_lines: self.expansion_host_lines,
                 port_active,
                 io_touched: false,
+                cia_alarm_check: self.cia_alarm_check,
             };
             // Same reason as `port_find_mut`: with a second device on the port the box
             // taken here is the chain, and a bare downcast would arm a transfer that then
@@ -2986,6 +2997,7 @@ impl Machine {
                     host_lines: self.expansion_host_lines,
                     port_active,
                     io_touched: false,
+                    cia_alarm_check: self.cia_alarm_check,
                 };
                 let mut bus = full_sc::FullScBus {
                     fb,
