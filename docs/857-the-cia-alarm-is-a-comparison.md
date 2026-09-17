@@ -171,7 +171,7 @@ A fresh profile says where it went: `Ciat::update` + `Cia::update_ta` are **0.0 
 the top thirty, from 15.9 % on a6e0465. Everything else keeps its absolute cost and rises as a
 share of a smaller total. Function: 435 workspace tests, cartridge smoke 27/27 with the Action
 Replay freeze, upstream `uci-targets`, and mandelbrot-upic with turbo — all identical with the
-check off and on. The one apparent divergence, two mandelbrot frames differing, reproduces
+check off and on, and the demo's audio judged clean by ear on the 857 build. The one apparent divergence, two mandelbrot frames differing, reproduces
 between two runs of the SAME build: the picture cycles palettes and the phase follows the start
 timing.
 
