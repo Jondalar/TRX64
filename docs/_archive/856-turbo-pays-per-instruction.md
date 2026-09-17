@@ -1,8 +1,8 @@
 # Spec 856 — Turbo pays per instruction
 
-**Status:** PROPOSED 2026-09-17 — nothing built. D0 decides whether anything is.
+**Status:** BUILT 2026-09-17 — D0 cleared (bound ≈ 1.6×), D1–D4 built; 64 MHz 0.86× → 1.40× real time on a RAM loop, 1 MHz unchanged. See §8.
 **Repo:** TRX64 (`trx64-core`). UE2 consumes the result and measures it; it builds nothing here.
-**Number:** 856 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`).
+**Number:** 856 (registry: `../../../C64ReverseEngineeringMCP/specs/README.md`).
 **Depends on:** Spec 851 D3 (the turbo divider this spec leaves untouched).
 **Origin:** the owner, 2026-09-17, on the UE2 emulator: the core holds up at 1 MHz and
 collapses as the MHz setting goes up. Is that the price of a faster CPU, or something we
@@ -126,7 +126,7 @@ way to rule the fast path out when a turbo title misbehaves, without a rebuild.
 |---|---|
 | a stock C64 / 1 MHz | none — see D3 |
 | turbo, RAM-only code (depackers, maths, plasma, 3D) | the boundary block runs about once per PHI2 cycle instead of once per instruction |
-| turbo, IO-heavy code | little — every IO access still forces the sync, which is what keeps §3 correct |
+| turbo, IO-heavy code | less — every IO access still ends the batch, which is what keeps §3 correct; §8 has the measured number |
 | the 1541 and fastloaders | none — the drive follows `clk`, and `$DD00` is IO |
 | observers, trace, breakpoints | none — they sit inside `execute_one` or in the inner loop's stop checks |
 | reverse rings | unchanged and independent — if enabled they still record every instruction |
@@ -156,3 +156,81 @@ does not change it; it is written down so nobody reads the depth as seconds at t
   a real title demands one.
 - **The 94 %** rests on an assumed mean instruction length. D0 replaces it with the measured
   fraction.
+
+## §8 As built (2026-09-17)
+
+**D0 — measured in two places, and it cleared.** UE2 ran UltimateDemo2026 at 64 MHz on an
+Apple M4 — REU 16 MB, UCI and Ultimate Audio on the port, rings already off (UE2 turns them off
+before it builds the `Machine`) — at **0.72–0.98× real time**, the emulation thread at 99–100 %
+of one core. Its `sample` profile of that thread:
+
+| where | share |
+|---|---|
+| run loop self (the inlined boundary work, bus build included) | ~16 % |
+| `Ciat::update` + `Cia::update_ta` | 16–18 % |
+| expansion chain lines + `dma_pending` | 7–8 % |
+| `full_sc::execute_one` self | ~12 % |
+| 6510 decode + `clk_inc` + operand access | ~15 % |
+| `FullBus::read` | ~9 % |
+| VIC tick incl. draw | 4–5 % |
+| SID tick | 1–2 % |
+| `DeltaRing::commit` (disabled, still an out-of-line call) | ~1 % |
+
+The boundary share is about 40 % of the thread; with §2's 94 % the bound is ≈ 1.6×, above the
+1.5× threshold. **The deviation from §4:** D0 asked for the split before building. The split
+came from UE2's profile, the build followed, and the before/after bench below is the check
+that the bound was real rather than an artefact of inlining.
+
+**Measured, `bench_turbo_scaling`** (bare machine, no IRQs, `run_for_full` per PAL frame,
+median of 5, both runs on the same host, rt-x = emulated / wall):
+
+| load | MHz | rings | before | after |
+|---|---|---|---|---|
+| RAM loop | 1 | off | 11.80× | 11.82× |
+| RAM loop | 16 | off | 2.83× | 3.77× |
+| RAM loop | 48 | off | 1.07× | 1.72× |
+| RAM loop | 64 | off | **0.86×** | **1.40×** |
+| RAM loop | 64 | on | 0.77× | 1.09× |
+| `LDA $D012` every third instruction | 64 | off | 0.79× | 1.07× |
+| `LDA $D012` every third instruction | 64 | on | 0.71× | 0.89× |
+
+At 1 MHz nothing moved beyond noise, which is what D3 promised. The IO loop gains less and
+still gains: two instructions in three stay inside the batch.
+
+**D1 — five cases in `turbo_fastpath_gate`, green on the old loop before the new one existed:**
+acknowledge-once for CIA1 (`$DC0D`) and the raster (`$D019`) at 1 and 64 MHz, badline timing on
+and off; and exact equality with the fast path off and on, frame by frame, for a mixed IRQ+IO
+workload, the same with a 16 MB REU on the port, and a booted machine (KERNAL IRQ, keyboard
+scan, drive). The equality hashes every instruction, every bus record and every interrupt and
+compares the full runtime checkpoint.
+
+**Both kinds of failure were provoked, not assumed.** Dropping the IO break turned all five
+red — the handlers storm. Dropping the pre-fetch reset (next item) turned the three equality
+cases red and left the two acknowledge cases green, which is why the equality gate hashes bus
+records and not only instructions.
+
+**D3 needed one thing §4 did not name.** `FullScBus` carries per-instruction state that a fresh
+bus starts clear: `fetched`, which decides whether a bus record carries the live PC (the
+interrupt prologue) or the synthetic post-fetch one. An instruction batched into the same bus
+without resetting it attributes its fetch to the previous opcode — invisible in the machine
+state, wrong in every trace. The inner loop resets `fetched` and `cur_op` before each
+instruction. A stop condition found inside the batch (instruction cap, breakpoint, exec-watch)
+breaks out and leaves the stop to the top of the loop, so the order of checks is the old one.
+
+**D2** sets the flag in `io_read`, `io_write`, `cart_read`, `cart_write`, `port_snoop` and on
+both processor-port addresses, read and write. **D4** is `Machine::turbo_fast_path` plus
+`TRX64_TURBO_FASTPATH=0`.
+
+**Gate:** `turbo_fastpath_gate` is in `scripts/gate.sh`. Full gate green after the change —
+12 suites / 151 tests, daemon 382, seven games 7/7.
+
+**Named limits:**
+- **Code running from cartridge ROM gets no fast path.** Every fetch from ROML/ROMH goes
+  through `cart_read`, which sets the flag. Conservative on purpose — some mappers bank on a
+  read — and liftable with a per-mapper "reads have no side effects" answer. Not needed for
+  anything measured here.
+- **The reverse rings stay per instruction.** With them on, 64 MHz is 1.09× instead of 1.40×.
+- **`DeltaRing::commit` is still an out-of-line call per instruction when disabled**, ~1 % in
+  UE2's profile. Outside this spec.
+- **Not re-profiled after the change.** Which share is largest now is an open reading, not a
+  finding; the next profile of the demo answers it.

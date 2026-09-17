@@ -261,6 +261,13 @@ pub struct FullBus<'a> {
     /// expansion interrupt still pending. Constant for the run, so the per-cycle sample
     /// costs one load on a stock machine.
     pub port_active: bool,
+    /// Spec 856 D2 — set by any access that is not a plain RAM or plain ROM read: IO while
+    /// it is mapped, a cartridge window, the processor port, a snooped address. The turbo
+    /// fast path runs instructions back to back only while this stays clear, because an
+    /// IRQ acknowledge inside one PHI2 cycle reaches `IntStatus` through nothing but the
+    /// boundary restamp. Conservative on purpose: a false positive costs one sync, a
+    /// missed one storms every handler.
+    pub io_touched: bool,
 }
 
 impl<'a> FullBus<'a> {
@@ -389,6 +396,7 @@ impl<'a> FullBus<'a> {
     /// I/O read dispatch ($D000-$DFFF, IO config). Mirrors memory-bus.ts read().
     #[inline]
     fn io_read(&mut self, addr: u16) -> u8 {
+        self.io_touched = true;
         match addr {
             0xd000..=0xd3ff => {
                 // Spec 851 — the U64's SuperCPU detection sits at a full address.
@@ -612,6 +620,7 @@ impl<'a> FullBus<'a> {
     /// I/O write dispatch ($D000-$DFFF, IO config).
     #[inline]
     fn io_write(&mut self, addr: u16, value: u8) {
+        self.io_touched = true;
         // Keep the open-bus shadow for unclaimed-register reads.
         self.io[(addr as usize) - 0xd000] = value;
         match addr {
@@ -801,6 +810,7 @@ impl<'a> FullBus<'a> {
     /// it lands. Covers the real write, the RMW dummy write-back and host writes alike.
     #[cold]
     fn port_snoop(&mut self, addr: u16, value: u8) {
+        self.io_touched = true;
         let a = self.port_access(addr, false);
         if let Some(d) = self.port_profile.as_mut() {
             d.snoop_write(a, value);
@@ -855,6 +865,7 @@ impl<'a> FullBus<'a> {
     /// read-only mappers ignore both and do a pure array index.
     #[inline]
     fn cart_read(&mut self, addr: u16) -> Option<u8> {
+        self.io_touched = true;
         let bi = self.get_bank_info();
         let clk = self.clk;
         let served = match self.cartridge.as_mut() {
@@ -887,6 +898,7 @@ impl<'a> FullBus<'a> {
     /// drives the flash erase-alarm schedule.
     #[inline]
     fn cart_write(&mut self, addr: u16, value: u8) -> bool {
+        self.io_touched = true;
         let bi = self.get_bank_info();
         let clk = self.clk;
         match self.cartridge.as_mut() {
@@ -900,8 +912,14 @@ impl<'a> Bus for FullBus<'a> {
     #[inline]
     fn read(&mut self, addr: u16) -> u8 {
         match addr {
-            0x0000 => self.port_dir,
-            0x0001 => self.cpu_port_data_read(),
+            0x0000 => {
+                self.io_touched = true;
+                self.port_dir
+            }
+            0x0001 => {
+                self.io_touched = true;
+                self.cpu_port_data_read()
+            }
             // $1000-$7FFF — ultimax open bus (board != MAX keeps $0000-$0FFF RAM).
             // No-cart: ultimax=false ⇒ RAM (byte-identical to the prior path).
             0x0002..=0x7fff => {
@@ -996,11 +1014,13 @@ impl<'a> Bus for FullBus<'a> {
         }
         match addr {
             0x0000 => {
+                self.io_touched = true;
                 self.port_dir = value;
                 self.ram[0] = value;
                 self.pla_config_changed();
             }
             0x0001 => {
+                self.io_touched = true;
                 self.port_data = value;
                 self.ram[1] = value;
                 self.pla_config_changed();
@@ -1194,6 +1214,7 @@ mod joystick_gate_tests {
             device_stop: false,
             host_lines: crate::expansion::PortLines::default(),
             port_active: false,
+            io_touched: false,
         }
     }
 

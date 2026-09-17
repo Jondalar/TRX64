@@ -6,7 +6,7 @@
 # Quiet on green, first-failure-loud on red (fail-fast). Steps:
 #
 #   [1/4] clippy            (lint — NON-BLOCKING by default; pre-existing backlog)
-#   [2/4] rust gate tests   (iso_vic_gate + vic_collision_gate + cart_mapper_gate + expansion_port_gate + u64_turbo_gate + uci_gate + reu_gate + cia_tod_gate, release)
+#   [2/4] rust gate tests   (iso_vic_gate + vic_collision_gate + cart_mapper_gate + expansion_port_gate + u64_turbo_gate + turbo_fastpath_gate + uci_gate + reu_gate + cia_tod_gate, release)
 #   [3/4] 7-game gate       (behavioral, release — gates on the printed VERDICT)
 #   [4/4] WS conformance     (TS↔TRX64 oracle — reachability-checked + OPT-IN)
 #
@@ -73,11 +73,11 @@ else
 fi
 
 # ── [2/4] rust gate tests (asserting, fast) ──────────────────────────────────
-printf '[2/4] rust gate tests (iso_vic + vic_collision + cart_mapper + expansion_port + u64_turbo + uci + reu + cia_tod + the daemon suite, release)\n'
+printf '[2/4] rust gate tests (iso_vic + vic_collision + cart_mapper + expansion_port + u64_turbo + turbo_fastpath + uci + reu + cia_tod + the daemon suite, release)\n'
 command -v cargo >/dev/null 2>&1 || die_red "cargo not on PATH — cannot run gate tests" ""
 TLOG=$(mktmp)
 if cargo test --release -p trx64-core \
-     --test iso_vic_gate --test vic_collision_gate --test cart_mapper_gate --test expansion_port_gate --test u64_turbo_gate --test uci_gate --test reu_gate --test cia_tod_gate --test sid_multi_gate \
+     --test iso_vic_gate --test vic_collision_gate --test cart_mapper_gate --test expansion_port_gate --test u64_turbo_gate --test turbo_fastpath_gate --test uci_gate --test reu_gate --test cia_tod_gate --test sid_multi_gate \
      --test snapshot_roundtrip_fidelity --test resid_oracle \
      >"$TLOG" 2>&1; then
   green "unit gates: $(grep -cE 'test result: ok' "$TLOG") suites ok ($(grep -oE '[0-9]+ passed' "$TLOG" | awk '{s+=$1} END{print s}') tests)"

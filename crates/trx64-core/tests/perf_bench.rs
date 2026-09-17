@@ -852,3 +852,78 @@ fn bench_checkpoint_restore_step() {
         K_RUNS, N, min, med, max
     );
 }
+
+// ── Workload 7: turbo scaling (Spec 856 D0) ──────────────────────────────────
+//
+// What a faster CPU costs in wall time. Spec 851's turbo is CPU-only: VIC, CIAs, SID and
+// the drive stay on PHI2, so at N MHz one emulated second holds N× the 6502 work. The
+// question D0 answers is how much MORE than that we pay, and where.
+//
+// Two workloads, both from a bare machine with no interrupts armed, run in PAL frames the
+// way a host emulator paces itself (`run_for_full(FRAME)`):
+//   - RAM: `INC $FB / BNE / INC $FC / JMP` — never touches IO, the best case for any
+//     boundary saving;
+//   - IO:  `LDA $D012 / STA $FB / JMP` — one VIC read per iteration, the worst case.
+// Each at 1 / 16 / 48 / 64 MHz (U64-II table, badline timing on), reverse rings on and off.
+// Reported per configuration: the real-time multiple and the CPU MHz actually emulated.
+//
+//   cargo test -p trx64-core --release --test perf_bench bench_turbo_scaling -- --ignored --nocapture
+#[test]
+#[ignore = "perf benchmark; run --release with --ignored --nocapture"]
+fn bench_turbo_scaling() {
+    use trx64_core::vic::SpeedProfile;
+    const FRAME: u64 = 19_656;
+    const RAM_LOOP: [u8; 9] = [0xe6, 0xfb, 0xd0, 0x02, 0xe6, 0xfc, 0x4c, 0x00, 0xc0];
+    const IO_LOOP: [u8; 8] = [0xad, 0x12, 0xd0, 0x85, 0xfb, 0x4c, 0x00, 0xc0];
+    let frames = env_budget("TRX64_TURBO_FRAMES", 25);
+    let k = env_budget("TRX64_TURBO_K", 5) as usize;
+    // (label, $D031 speed byte on the U64-II table, MHz) — bit 7 = badline timing.
+    let speeds: [(&str, u8, u64); 4] = [("1", 0x80, 1), ("16", 0x89, 16), ("48", 0x8e, 48), ("64", 0x8f, 64)];
+
+    let run_once = |code: &[u8], prefer: u8, rings: bool, fast: Option<bool>| -> f64 {
+        let mut m = Machine::new();
+        m.set_machine_profile(SpeedProfile::U64);
+        m.set_u64_turbo(0x00, prefer);
+        m.cpu_history.set_enabled(rings);
+        m.delta_ring.set_enabled(rings);
+        if let Some(on) = fast {
+            m.turbo_fast_path = on;
+        }
+        m.poke(0xc000, code);
+        m.write_full(0x0001, 0x37);
+        m.c64_core.reg_pc = 0xc000;
+        let mut sink = NullSink;
+        // One untimed frame so the speed has been read at a boundary and caches are warm.
+        m.run_for_full(FRAME, &mut sink, |_, _, _, _, _, _, _| {});
+        let t0 = Instant::now();
+        for _ in 0..frames {
+            m.run_for_full(FRAME, &mut sink, |_, _, _, _, _, _, _| {});
+        }
+        t0.elapsed().as_secs_f64()
+    };
+
+    let emulated_secs = (frames * FRAME) as f64 / PAL_HZ;
+    eprintln!("\n========== WORKLOAD 7 — turbo scaling (Spec 856 D0) ==========");
+    eprintln!("  {frames} PAL frames per run ({emulated_secs:.3} s emulated), K = {k}, median reported");
+    eprintln!("  {:<4} {:>4} {:<5} {:<5} {:>9} {:>11}", "load", "MHz", "rings", "fast", "rt-x", "CPU MHz");
+    for (load, code) in [("RAM", &RAM_LOOP[..]), ("IO", &IO_LOOP[..])] {
+        for (label, prefer, mhz) in speeds {
+            for rings in [true, false] {
+                for fast in [false, true] {
+                    let mut v: Vec<f64> = (0..k).map(|_| run_once(code, prefer, rings, Some(fast))).collect();
+                    let med = median(&mut v);
+                    let rtx = emulated_secs / med;
+                    let cpu_mhz = rtx * PAL_HZ * mhz as f64 / 1_000_000.0;
+                    eprintln!(
+                        "  {load:<4} {label:>4} {:<5} {:<5} {rtx:>8.2}x {cpu_mhz:>11.2}",
+                        if rings { "on" } else { "off" },
+                        if fast { "on" } else { "off" }
+                    );
+                    eprintln!(
+                        "  RAW: turbo load={load} mhz={label} rings={rings} fast={fast} frames={frames} k={k} med_s={med:.6} rtx={rtx:.4} cpu_mhz={cpu_mhz:.3}"
+                    );
+                }
+            }
+        }
+    }
+}

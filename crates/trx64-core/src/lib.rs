@@ -603,6 +603,12 @@ pub struct Machine {
     /// Like `cpu_history`: live-timeline state, NOT machine state — `Clone` is empty,
     /// never serialized.
     pub delta_ring: crate::delta_ring::DeltaRing,
+    /// Spec 856 D4 — the turbo fast path. With a turbo divider above 1, instructions that
+    /// neither advance `clk` nor touch anything but RAM run back to back inside one bus,
+    /// and the boundary sync runs once when one of them does. No effect at 1 MHz: there
+    /// every instruction advances `clk`. Env kill-switch `TRX64_TURBO_FASTPATH=0`, read at
+    /// `Machine::new`; the field can be flipped at any time.
+    pub turbo_fast_path: bool,
     /// Spec 784 loader-lens — armed-on-command 1541 disk-mechanism head trace. OFF by
     /// default (does NOT run with the always-on CPU ring). When armed, a `(drv_clk,
     /// halftrack, sector)` sample is pushed whenever the sector under the head changes,
@@ -777,6 +783,10 @@ impl Machine {
             uci_c64_reset: false,
             cpu_history: crate::cpu_history::CpuHistoryRing::new(),
             delta_ring: crate::delta_ring::DeltaRing::new(),
+            turbo_fast_path: !matches!(
+                std::env::var("TRX64_TURBO_FASTPATH").map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+                Ok("0") | Ok("off") | Ok("false") | Ok("no")
+            ),
             head_trace_armed: false,
             head_trace: Vec::new(),
             head_trace_last: None,
@@ -1390,6 +1400,7 @@ impl Machine {
             device_stop: false,
             host_lines: self.expansion_host_lines,
             port_active,
+            io_touched: false,
         };
         fb.write(addr, val);
         self.memconfig = fb.config;
@@ -1453,6 +1464,7 @@ impl Machine {
             device_stop: false,
             host_lines: self.expansion_host_lines,
             port_active,
+            io_touched: false,
         };
         let v = fb.read(addr);
         self.memconfig = fb.config;
@@ -1758,6 +1770,7 @@ impl Machine {
                 device_stop: false,
                 host_lines: self.expansion_host_lines,
                 port_active,
+                io_touched: false,
             };
             // Same reason as `port_find_mut`: with a second device on the port the box
             // taken here is the chain, and a bare downcast would arm a transfer that then
@@ -2915,6 +2928,8 @@ impl Machine {
                 self.c64_core.turbo_div = self.vic.u64_speed_table.mhz(index);
                 self.c64_core.turbo_badline = badline;
             }
+            // Spec 856 D3 — decided per boundary, because the speed above is.
+            let fast_path = self.turbo_fast_path && self.c64_core.turbo_div > 1;
 
             // Run a whole instruction over the SC bus (the verbatim core threads the
             // VIC tick + BA steal + interrupt-delay counters into every access).
@@ -2970,6 +2985,7 @@ impl Machine {
                     device_stop: false,
                     host_lines: self.expansion_host_lines,
                     port_active,
+                    io_touched: false,
                 };
                 let mut bus = full_sc::FullScBus {
                     fb,
@@ -2986,6 +3002,44 @@ impl Machine {
                     halt_requested: false,
                 };
                 full_sc::execute_one(&mut self.c64_core, &mut bus, &mut self.c64_int);
+                // Spec 856 D3 — the turbo fast path. Below the divider an instruction usually
+                // leaves `clk` where it was, and then everything this loop does around it —
+                // CIA catch-up, the interrupt restamp, the drive and SID sync, rebuilding
+                // this bus — would find nothing new. So while the clock has not moved and
+                // nothing but RAM was touched, run the next instruction inside the same bus.
+                // The first PHI2 edge or IO access ends the batch and the boundary block
+                // below runs once for all of it. At a divider of 1 every instruction moves
+                // `clk`, so this never iterates (`fast_path` is false there anyway).
+                //
+                // IO has to end the batch, not only a clock edge: an IRQ acknowledge inside
+                // one PHI2 cycle reaches `IntStatus` through nothing but the restamp at the
+                // top of this loop (Spec 856 §3).
+                if fast_path {
+                    loop {
+                        if self.c64_core.clk != c64_clk_before
+                            || bus.fb.io_touched
+                            || bus.halt_requested
+                            || bus.fb.device_stop
+                        {
+                            break;
+                        }
+                        // What the top of the loop would stop on before the next instruction.
+                        // Breaking here leaves it to the top, so the order is unchanged.
+                        let next = self.c64_core.reg_pc;
+                        if executed + 1 >= max_instructions
+                            || breakpoints.is_some_and(|bp| bp.contains(&next))
+                            || exec_watch.is_some_and(|w| w[next as usize] != 0)
+                        {
+                            break;
+                        }
+                        executed += 1;
+                        // A fresh bus starts each instruction pre-fetch: the prologue's
+                        // interrupt accesses carry the live PC, not the last opcode's.
+                        bus.fetched = false;
+                        bus.cur_op = (next, 0);
+                        full_sc::execute_one(&mut self.c64_core, &mut bus, &mut self.c64_int);
+                    }
+                }
                 // Honor a watchpoint hit from this instruction at the boundary
                 // (= TS integrated-session.ts:989 obs.haltRequested). Latch the
                 // reason; we still finish the post-instruction drive/SID sync below

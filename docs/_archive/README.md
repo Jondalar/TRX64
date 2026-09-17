@@ -206,3 +206,28 @@ image, which persists them itself.
 Everything here is finished. If a row's subject turns out to be open after all, it needs
 a NEW number from the registry — not a reopening, because a spec that closes twice
 teaches everyone that "closed" means nothing.
+
+## A faster CPU pays per PHI2 cycle, not per instruction — 856
+
+The owner, on the UE2 emulator: the core holds at 1 MHz and collapses as the MHz setting goes
+up. 851's turbo is CPU-only, so 64 MHz is 64× the 6502 work, and that part is simply the price
+of a software CPU. What was charged on top: the run loop synchronised at every INSTRUCTION
+boundary — CIA catch-up, interrupt restamp, drive and SID sync, the bus rebuilt — and at
+64 MHz almost all of those boundaries find `clk` where it was. UE2's profile of a real 64 MHz
+demo put that work at about 40 % of the emulation thread.
+
+**Decision:** batch instructions inside one bus while the clock has not moved AND nothing but
+RAM was touched. "The clock moved" alone is not enough: within one PHI2 cycle the boundary
+restamp is the only path an IRQ acknowledge has to `IntStatus`, and without it every handler
+at 64 MHz storms. The access flag is deliberately conservative — IO, cartridge windows, the
+processor port, snooped addresses — so cartridge-ROM code gets no fast path; a false positive
+costs one sync, a missed one breaks interrupts.
+
+**Decision:** at a divider of 1 the batch cannot run twice, so the stock machine's path is the
+one it had. The gate is exact equality, fast path off against on, over the instruction stream,
+every bus record and every interrupt — a batched instruction that kept the previous opcode's
+pre-fetch state was invisible in the machine state and wrong in every trace, and only the bus
+records caught it. Both failure kinds were provoked before the gate was trusted.
+
+Measured on a RAM loop at 64 MHz: 0.86× → 1.40× real time with the reverse rings off. The
+rings stay per instruction; that cost is theirs and has its own switch.
