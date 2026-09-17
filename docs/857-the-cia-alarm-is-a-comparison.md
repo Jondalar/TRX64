@@ -157,6 +157,31 @@ unchanged. **D4** is `Machine::cia_alarm_check` / `TRX64_CIA_ALARM_CHECK=0`.
 **Gate:** full gate green on the branch — 13 suites / 154 tests, daemon 382, seven games 7/7.
 Clippy: no warning on any line this branch added.
 
-**Open:** UE2 has not measured the branch on the demo. The lazy-arm clause in `alarm_due` means a
-Timer B counting Timer A underflows with nothing pending still catches up every time — correct,
-and no faster than before, for the rare program that uses the cascade.
+**Confirmed by UE2 on the demo** (UltimateDemo2026 at 64 MHz, run D conditions, idle skip off,
+one run each). Emulated/wall stays at real time and the cost is what moved — process CPU per
+window:
+
+| | window 1 | 2 | 3 | 4 |
+|---|---|---|---|---|
+| a6e0465 (run D) | 75.9 % | 85.2 % | 69.1 % | 96.5 % |
+| **857 branch** | **66.3 %** | **74.2 %** | **59.1 %** | **80.8 %** |
+| 857 branch, check off | 86.2 % | 94.3 % | 72.6 % | 99.4 % |
+
+A fresh profile says where it went: `Ciat::update` + `Cia::update_ta` are **0.0 %** and out of
+the top thirty, from 15.9 % on a6e0465. Everything else keeps its absolute cost and rises as a
+share of a smaller total. Function: 435 workspace tests, cartridge smoke 27/27 with the Action
+Replay freeze, upstream `uci-targets`, and mandelbrot-upic with turbo — all identical with the
+check off and on. The one apparent divergence, two mandelbrot frames differing, reproduces
+between two runs of the SAME build: the picture cycles palettes and the phase follows the start
+timing.
+
+**Open, and measured by nobody yet: the check-off path looks slower than before 857.** UE2's
+third row sits above run D in every window and dips below real time in the last one. If that is
+real it is D2's cost — `update_tb` now dispatches alarms and arms lazily where it only settled a
+counter before — and it would mean the kill switch is worse than the code it falls back to. One
+run each and `ps` noise cannot tell them apart; it needs the alternating worktree A/B against
+`main`.
+
+**Also open:** the lazy-arm clause in `alarm_due` means a Timer B counting Timer A underflows
+with nothing pending still catches up every time — correct, and no faster than before, for the
+rare program that uses the cascade.
