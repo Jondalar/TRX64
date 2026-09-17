@@ -1,8 +1,8 @@
 # Spec 857 — The CIA alarm is a comparison, not an update
 
-**Status:** BUILT 2026-09-17 on branch `spec-857-cia-alarm-check`, **not merged** — D0–D4 built, full gate green, 1 MHz 10.53× → 13.33× and 64 MHz 0.97× → 1.22× real time. `main` is untouched until the owner decides. See §8.
+**Status:** BUILT 2026-09-17, merged to `main` and released in 0.7.3 — D0–D4, full gate green. 1 MHz 10.53× → 13.33× and 64 MHz 0.97× → 1.22× real time here; on UE2's demo the process CPU per window fell from 76/85/69/97 % to 66/74/59/81 %. See §8.
 **Repo:** TRX64 (`trx64-core`).
-**Number:** 857 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`).
+**Number:** 857 (registry: `../../../C64ReverseEngineeringMCP/specs/README.md`).
 **Depends on:** Spec 856 (its profile is what found this).
 **Origin:** UE2's profile after 856, 2026-09-17. With the boundary work batched, UltimateDemo2026
 at 64 MHz holds real time, and the CIA timer update is the largest single item left at

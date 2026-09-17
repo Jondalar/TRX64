@@ -234,3 +234,34 @@ real thing — UltimateDemo2026 at 64 MHz in UE2 — 0.72–0.98× became real t
 and the audio underruns stopped. The rings stay per instruction; that cost is theirs and has
 its own switch. What dominates now is the CIA timer update, which this change barely touched:
 its cost is the real per-PHI2 advance, not the repeats.
+
+## The CIA alarm is a comparison, not an update — 857
+
+UE2's profile after 856 left one item at the top: the CIA timer update, 12–16 % of the
+emulation thread, which 856 had barely moved. VICE's cycle-exact core checks alarms in every
+instruction prologue and every cycle by COMPARING against the next pending alarm; TRX64 has no
+alarm context and called `Cia::update_to` there instead — which is VICE's register-access
+catch-up. At 64 MHz that ran about thirty-six times per PHI2 cycle, at 1 MHz three times.
+
+**Decision:** catch a CIA up only when an alarm is due, and treat a running timer with no
+prediction as due — exactly the case the old code repaired lazily. Measured, alternating A/B,
+9 of 9 pairs: booted at 1 MHz 10.53× → 13.33× real time, RAM loop at 64 MHz 0.97× → 1.22×. On
+UE2's demo the process CPU per window fell from 76/85/69/97 % to 66/74/59/81 % and
+`Ciat::update` left the profile's top thirty entirely.
+
+**Decision:** the alarms must first carry what the catch-up carried, in its own commit and
+provably neutral. Timer B's alarm was predicted on every write and never dispatched; a cascade
+step did not re-predict it; `peek` and the snapshot capture read counters that were current only
+because of the catch-up. Those readers now work on a copy caught up to `checked_clk`, the clock
+the machine last checked the alarms at — **not** `Cia::clk`, which is the TOD tick counter and
+runs one ahead of the CPU.
+
+**The gate that made this safe is two things, not one.** Lockstep equality between check off and
+check on cannot show that the preparation left the old path alone, because it moves both sides
+at once. So the gate also freezes digests of the pre-857 behaviour. They earned it twice: they
+caught the `Cia::clk` mistake immediately, and the restore case diverged at 64 MHz on untouched
+code — checkpoints did not carry the turbo phase, a defect since 851, fixed in its own commit.
+
+**Open at merge:** UE2's single run puts the CHECK-OFF path slightly above pre-857, which would
+be the preparation's cost on the kill-switch path. Nobody has measured it with the alternating
+worktree A/B.
