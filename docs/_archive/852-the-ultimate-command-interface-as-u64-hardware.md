@@ -274,7 +274,9 @@ raises. `c64re_snapshot.rs`: `restore_runtime_checkpoint` resets the block. Daem
   state bits, of which `IRQMASK_SET` uses only 2:0.
 
 **Measured.** Over two frames of `LDA $DF1E / JMP` with the display on: 5302 reads unstalled and 7 on a
-badline, each 43 stolen cycles with 3 on the bus — each advanced the pointer 4 times, not 44. Full gate
+badline, each 43 stolen cycles with 3 on the bus — each advanced the pointer 4 times, not 44 (**that
+behaviour is the defect, corrected in 0.7.2: it advances ONCE. The stall figures themselves still
+hold — see the DISPROVED note under D5**). Full gate
 green: 67 gate tests, daemon 378, seven games 7/7; core lib 295/0; `trx64-cli` 109/0. `perf_bench` pure
 headless, 30 M cycles, median of seven, the branch and the `b99a639` baseline alternated in three rounds:
 branch 11.225 / 11.211, 11.170 / 11.266, 11.240 / 11.119 MHz; baseline 11.366 / 11.368, 11.107 / 11.153,

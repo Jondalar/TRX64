@@ -44,7 +44,7 @@ interface.
 | R4 write snoop | **accepted, through the same device** | Not a second registry. VICE has exactly this hook: `mainc64cpu.c:288-305`, `STORE` and `STORE_DUMMY` call `reu_dma` on `$FF00`. TRX64's core says it is "folded into the implementor" (`c64_6510core.rs:470-472`); it never was. |
 | R5 interrupt sources | **changed: one source, not two** | VICE allocates one source per device (`c64cart.c:1424` "Cartridge", `reu.c:579` "REU"), and a source carries `IK_IRQ` and `IK_NMI` independently. One `INT_SRC_EXPANSION` does what two would. |
 | R6 CPU hold | **accepted, plus a reset flavour** | The chips-only loop moves from the bridge (`c64-bridge` `run_chips`) into TRX64. The bridge needs "reset held" too, and it is a hardware fact, not a UE2 wish: the 6569 has no reset pin, so the VIC runs while CPU, CIAs and SID do not. |
-| Open Q1 — stretched reads | **the device decides** | The FPGA counts every PHI2 cycle with IO1/IO2 active (`slot_slave.vhd:131-144`); VICE reads once after the BA steal. But a BA-stalled read is on the bus only while AEC is still high: once AEC falls the VIC drives the address and the PLA selects no I/O (UE2's review, 2026-09-15). So TRX64 hands the device two counts — the cycles stolen before the read, and those of them in which the CPU still drove the address. What a stalled cycle *means* is the device's policy; *that* it stalled, and whether it was on the bus, is the machine's fact. |
+| Open Q1 — stretched reads | **the device decides** | The FPGA counts every PHI2 cycle with IO1/IO2 active (`slot_slave.vhd:131-144`); VICE reads once after the BA steal. But a BA-stalled read is on the bus only while AEC is still high: once AEC falls the VIC drives the address and the PLA selects no I/O (UE2's review, 2026-09-15). So TRX64 hands the device two counts — the cycles stolen before the read, and those of them in which the CPU still drove the address. What a stalled cycle *means* is the device's policy; *that* it stalled, and whether it was on the bus, is the machine's fact. — **Moot since 2026-09-17 (0.7.2): no device has such a policy any more.** The one that did — the UCI — advanced its pointer `stalled_on_bus + 1` times on 852 D5's assumption, real software disproved it (a UCI DOS read lost a byte per stalled read), and it now advances by exactly one. `stalled_on_bus` has no production consumer left; it survives as this spec's `Access` contract, which `expansion_port_gate` still checks the producer against. The answer to Q1 stands as an interface decision and is no longer a live question. |
 | Open Q2 — R1 or the fake cartridge | **R1** | The fake cartridge goes. |
 
 ## §3 Design
@@ -98,6 +98,16 @@ Writes and snoops reach both. A 65 536-bit snoop set is built from both devices'
 when either changes. Attaching changes none of
 `cartridge.is_some()`, `pla_index()`, `BankInfo`, the VSF export, or reset behaviour; `cold_reset` and
 `warm_reset` never call the device (UCI survives a C64 reset, `command_protocol.vhd:292-306`).
+
+> **CORRECTED 2026-09-16 (0.7.1), `19dfbd6`.** The sentence above is false as written, and it was the
+> rule the defect came from. `cold_reset` DOES call the device — `dev.reset()` on both places, and
+> `warm_reset` delegates to it. What survives a C64 reset survives because `ExpansionDevice::reset`
+> **defaults to doing nothing** and the UCI keeps that default (852 D4), not because no call is made.
+> The blanket rule was adopted for the UCI, where it is right — only the FPGA reset clears that block —
+> and was wrong for an REU, which sits behind the port's /RESET line like everything else; VICE's
+> `cartridge_reset` calls `reu_reset` (`c64carthooks.c:2412`). So the decision is per device: a default
+> that does nothing, overridden where the hardware says otherwise. The REU takes it, its registers go to
+> power-on, its DRAM is left alone.
 
 `FullBus` carries `expansion: Option<&mut Box<dyn ExpansionDevice>>`, `snoop: Option<&SnoopSet>` and
 `access_kind` at its four construction sites (`lib.rs` `write_full`, `read_full_live`, the run loop,
@@ -182,7 +192,8 @@ proves the wrong door), plus:
   the write and the read, A holds its byte. Device answers None: A is the open bus. `$01=$34`: no call.
   Cartridge and device: the device receives the cartridge byte and decides. `LDX #$1F / LDA $DEFF,X`: a
   `Dummy` read at `$DE1E`, then a `Cpu` read at `$DF1E`. `cold_reset`/`warm_reset`: no call,
-  `cartridge` stays `None`.
+  `cartridge` stays `None`. — **Corrected 2026-09-16 (0.7.1): both DO call `ExpansionDevice::reset`,
+  whose default does nothing. `cartridge` stays `None` as stated. See the note under §3.**
 - **R2:** 100 × `read_full($DF1E)` leave the device unchanged.
 - **R3:** `STA $DF1C` (device requests a stop) then `INC $D020`: the run ends with PC at the INC and
   `$D020` unchanged, reason `RunStop::Device`.

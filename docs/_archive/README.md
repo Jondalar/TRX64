@@ -141,6 +141,14 @@ waiting on a server that does not exist. The block survives a C64 reset — only
 only the hardware can answer stays a stated assumption: what the unlock tolerates in between, and that a
 read the VIC stretched counts once per cycle its address was on the bus (4 on a badline, not 44).
 
+**The second of those is DISPROVED, 2026-09-17, fixed in 0.7.2.** A read the VIC stretched counts ONCE,
+not once per cycle on the bus. The assumption lost the C64 a byte on every stalled read: UBoot64 asked
+for its own 24480-byte file over UCI DOS, got 24279, and hung waiting for a remainder the firmware had
+already sent — stopping at a byte that moved with the badline every run. A BA-stretched read is one 6502
+bus cycle, so one completed read consumes one byte. The gate case that should have caught it asserted
+the assumption itself and therefore confirmed it; it is now two cases, one of them a difference test.
+The unlock question stands. Detail under Spec 852's DISPROVED note.
+
 ## A device that drives the bus — 853
 
 Issue #19 asked for the REU and was closed by 840: the cruncher jammed because an empty
