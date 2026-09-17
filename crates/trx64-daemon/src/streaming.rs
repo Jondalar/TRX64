@@ -27,9 +27,11 @@
 //! connects (the daemon IS the producer). The streaming loop owns the machine for
 //! its lifetime and paces to real-time (~50 fps PAL).
 //!
-//! THREADING: `SidAudioEngine` holds the process-wide reSID `MutexGuard` and is
+//! THREADING: `SidAudioEngine` owns a reSID engine through a raw pointer and is
 //! therefore `!Send`, so the streaming loop runs on a dedicated OS thread (not a
-//! tokio task) that owns the engine locally. The SID `write_trace` hook captures
+//! tokio task) that owns the engine locally. (Before Spec 855 it was `!Send` for
+//! a different reason — it held the process-wide reSID `MutexGuard`, back when
+//! the shim had one global SID. The guard is gone; the thread rule is not.) The SID `write_trace` hook captures
 //! only a `Send` `(addr,value)` byte buffer; the loop drains it per frame into the
 //! engine (verbatim the `scramble_av_record.rs` harness pattern). Built binary
 //! messages are handed to the async WS writer via a tokio mpsc channel.

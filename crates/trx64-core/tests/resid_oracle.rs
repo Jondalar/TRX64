@@ -104,15 +104,18 @@ fn fnv1a(pcm: &[i16]) -> u32 {
 }
 
 /// Pass threshold for GATE A: 1 % of full scale (32768). The engine is normally
-/// byte-identical to the golden, but the shim's ONE module-global `reSID::SID` is only
-/// pristine on its FIRST use in a process: `resid_reinit()` (placement-new) leaves a small
-/// static-table reconstruct residual, which `resid_pcm_deterministic` already documents and
-/// tolerates (`INPROC_RECONSTRUCT_BOUND`). Because the tests run in PARALLEL, whichever one
-/// reaches the global SID first is a race — so a byte-identity assertion here failed
-/// intermittently (±2 LSB at a couple of early samples = 0.006 % full scale, inaudible) with
-/// nothing actually wrong. Gate on an audible-difference threshold instead; the exact delta
-/// is always reported, so a real synthesis/FFI break (which is orders of magnitude larger)
-/// still fails loudly.
+/// byte-identical to the golden, but a small static-table reconstruct residual remains —
+/// reSID builds its filter and FIR tables with libm at construction, and rebuilding them
+/// in-process does not land on the same last bit every time. `resid_pcm_deterministic`
+/// documents and bounds that at `INPROC_RECONSTRUCT_BOUND` (±2 LSB observed at a couple of
+/// early samples = 0.006 % full scale, inaudible). Gate on an audible-difference threshold
+/// instead; the exact delta is always reported, so a real synthesis/FFI break (which is
+/// orders of magnitude larger) still fails loudly.
+///
+/// Until Spec 855 this comment also blamed a RACE: the shim had one module-global
+/// `reSID::SID`, only the first user in a process got it pristine, and the tests run in
+/// parallel. That half is obsolete — every `Resid` now owns its own C++ engine and they
+/// share nothing. The residual above is what is actually left, and it is reSID's, not ours.
 const GATE_A_FULL_SCALE_1PCT: i32 = 327; // 32768 / 100
 
 /// GATE A — TRX64's native reSID matches the committed native golden (this is the engine
@@ -220,8 +223,10 @@ fn gate_b_c64re_within_libm_bound() {
 /// `model_filter`, `model_dac`) on the FIRST `SID` construction in a process.
 /// Re-constructing the SID in the SAME process (e.g. several engines in one test
 /// binary) leaves a tiny resampler residual (≤6 LSB, sub-perceptual) — a
-/// known reSID/native-toolchain property, NOT a port bug, and NOT reachable on
-/// the single-SID-per-process runtime path. The two-in-process runs below are
+/// known reSID/native-toolchain property, NOT a port bug. It used to be out of
+/// reach on the runtime path, which drove one SID per process; Spec 855 makes
+/// several engines per process routine, so `sid_multi_gate` bounds it there too
+/// rather than demanding an identity reSID does not offer. The two runs below are
 /// therefore asserted within that bound, while the HARD per-process determinism
 /// is GATE A (first construction == golden, identical across processes).
 const INPROC_RECONSTRUCT_BOUND: i32 = 8;

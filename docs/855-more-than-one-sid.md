@@ -1,6 +1,6 @@
 # Spec 855 — More than one SID
 
-**Status:** PROPOSED 2026-09-17.
+**Status:** PARTLY BUILT 2026-09-17 — D1 (handles in the shim) is built and gated; D2–D8 open. See §8.
 **Repos:** TRX64 (`trx64-core`) builds the core half. UE2 (`u64-emulator/crates/c64-bridge`)
 builds its own: the UltiSID register face, the address decode it already owns, and its mixer.
 **Number:** 855 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`).
@@ -158,3 +158,43 @@ default**, and the host states it per mapping.
 That is a deliberate application of what this repo learned on 2026-09-17: the UCI pointer defect
 was an unverified assumption, and its gate confirmed it because the test was written from the
 same assumption. A configurable precedence cannot repeat that. A hardcoded one can.
+
+## §8 As built — D1 only
+
+**Shipped: the shim takes handles.** `resid_new()`/`resid_delete(h)` plus an `_h` form of every
+entry point; the legacy names remain as wrappers on a default instance, so c64re's WASM build and
+`resid_oracle`'s byte-identity are untouched. `RESID_GUARD` is gone, `Resid` owns its engine and
+frees it on drop, and `resid_state_size` stays handle-free because `sizeof(SID::State)` belongs to
+the type. Gate: `sid_multi_gate`, four cases, in `scripts/gate.sh`.
+
+**Two defects found by building it, both mine, both in the spec's own subject matter.**
+
+*The engine was born full of rubbish.* reSID's constructor does not initialise everything it owns —
+the resampler's FIR ring is only ever written by `clock()`, which is why `resid_reinit` exists at
+all. While the shim held one FILE-SCOPE instance that was invisible: a global lives in BSS and
+starts zeroed. Moving the same object to the heap with `new Ctx()` runs the constructor and nothing
+else, so those bytes became whatever the allocator last left there. Two engines built identically
+then produced different audio, and an engine nobody had written to produced sound. Both were
+observed, not theorised. `resid_new` now zeroes its storage and `resid_reinit_h` does the same
+before rebuilding, which is what its own comment had been claiming all along.
+
+*The snapshot blob differed from itself.* `resid_read_state` memset a local `State` and then
+ASSIGNED the captured one into it, on the reasoning that the implicit copy-assignment writes only
+the named members. The standard permits that reading but does not require it: for a trivially
+copyable type the compiler may copy the whole object, padding included. It had survived because
+both captures came through one identical call path; a heap context changed the path and the same
+state captured twice differed by one byte. reSID's `State` has exactly one hole — `bool
+hold_zero[3]` is three bytes and the `cycle_count` behind it needs four-byte alignment — and it is
+now zeroed explicitly via `offsetof`, so determinism is constructed rather than lucky.
+
+**One gate case of mine was too strict and was corrected, not the code.** The first draft demanded
+byte-identity between successive engines. It failed at ±2 LSB: reSID builds its filter and FIR
+tables with libm at construction, and rebuilding them in one process does not land on the same last
+bit. `resid_oracle` had already met this and bounded it at `INPROC_RECONSTRUCT_BOUND`; the case now
+asserts the exact sample COUNT and that bound, which is the honest claim. 855 also makes that
+residual routine rather than exotic — several engines per process is the normal case now — and the
+oracle's comment saying otherwise was corrected with it.
+
+**Still open: D2–D8.** The decode table, per-chip `Sid6581`, the write trace's new signature, the
+host read/peek override, the envelope getter, the UltiSID model mapping, and the snapshot chip
+count. Nothing of UE2's half is started either.
