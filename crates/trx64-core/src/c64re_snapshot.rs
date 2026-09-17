@@ -172,11 +172,27 @@ pub struct SidVoiceSnapshot {
     pub rv: i64,
 }
 
+/// Spec 855 D8 — one of the EXTRA chips (1..n). Chip 0 stays the flat `regs` +
+/// `voices` above, which is what c64re and every dump written before 855 expect.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SidChipSnapshot {
+    pub regs: Vec<i64>,                // [32]
+    pub voices: Vec<SidVoiceSnapshot>, // [3]
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SidSnapshot {
     pub v: i64, // = 2
     pub regs: Vec<i64>, // [32]
     pub voices: Vec<SidVoiceSnapshot>, // [3]
+    /// Spec 855 D8 — chips 1.., absent on a machine that has only one SID.
+    ///
+    /// `default` so a dump written before 855 still deserialises, and
+    /// `skip_serializing_if` so a stock machine writes no new key at all: the
+    /// node stays byte-identical for everyone who has one SID, which is still
+    /// every c64re session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chips: Vec<SidChipSnapshot>,
 }
 
 // ── vic (vicii-snapshot.ts:32-83 — LiteralVicSnapshot) ─────────────────────────
@@ -471,11 +487,53 @@ pub fn capture_sid(m: &Machine) -> SidSnapshot {
             gateflip: gf as i64, prev_gate: pg as i64, rv: rv as i64,
         });
     }
-    SidSnapshot { v: 2, regs, voices }
+    // Spec 855 D8 — chips 1.. ride along; empty on a one-SID machine, so the
+    // serialised node is unchanged for every existing session.
+    let chips = m
+        .sid_extra
+        .iter()
+        .map(|c| SidChipSnapshot {
+            regs: c.regs.iter().map(|&b| b as i64).collect(),
+            voices: (0..3)
+                .map(|i| {
+                    let (f, fs, pw, noise, wt, a, d, su, r, sy, am, av, ca, gf, pg, rv) =
+                        c.engine.c64re_voice(i);
+                    SidVoiceSnapshot {
+                        f: f as i64, fs: fs as i64, pw: pw as i64, noise: noise as i64,
+                        wt_select: wt as i64, attack: a as i64, decay: d as i64,
+                        sustain: su as i64, release: r as i64, sync: sy as i64,
+                        adsrm: am as i64, adsr_value: av as i64, cycle_accum: ca as i64,
+                        gateflip: gf as i64, prev_gate: pg as i64, rv: rv as i64,
+                    }
+                })
+                .collect(),
+        })
+        .collect();
+    SidSnapshot { v: 2, regs, voices, chips }
 }
 
 /// Restore TRX64's SID from the c64re `SidSnapshot`.
 pub fn restore_sid(m: &mut Machine, s: &SidSnapshot) {
+    // Spec 855 D8 — extra chips first, growing the machine to fit what the dump
+    // carries. A dump from before 855 has none and this is a no-op, so a restore
+    // onto a one-SID machine is exactly what it always was.
+    while m.sid_extra.len() < s.chips.len() {
+        m.sid_extra.push(crate::sid::SidChip::new());
+    }
+    for (c, snap) in m.sid_extra.iter_mut().zip(s.chips.iter()) {
+        for i in 0..32 {
+            c.regs[i] = snap.regs.get(i).copied().unwrap_or(0) as u8;
+        }
+        for (i, vc) in snap.voices.iter().enumerate().take(3) {
+            c.engine.c64re_set_voice(
+                i,
+                vc.f as u32, vc.fs as u32, vc.pw as u32, vc.noise as u8, vc.wt_select as u8,
+                vc.attack as u8, vc.decay as u8, vc.sustain as u8, vc.release as u8,
+                vc.sync as u8, vc.adsrm as u8, vc.adsr_value as u8, vc.cycle_accum as u32,
+                vc.gateflip as u8, vc.prev_gate as u8, vc.rv as u32,
+            );
+        }
+    }
     for i in 0..32 {
         m.sid_regs[i] = s.regs.get(i).copied().unwrap_or(0) as u8;
     }

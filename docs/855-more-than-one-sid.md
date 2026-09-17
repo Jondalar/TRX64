@@ -162,7 +162,7 @@ That is a deliberate application of what this repo learned on 2026-09-17: the UC
 was an unverified assumption, and its gate confirmed it because the test was written from the
 same assumption. A configurable precedence cannot repeat that. A hardcoded one can.
 
-## §8 As built — D1, D2, D3 and D6
+## §8 As built — the whole of TRX64's half
 
 **Shipped: the shim takes handles.** `resid_new()`/`resid_delete(h)` plus an `_h` form of every
 entry point; the legacy names remain as wrappers on a default instance, so c64re's WASM build and
@@ -239,5 +239,43 @@ the same machine. The case that sets the clock to a recognisable number rather t
 `0 == 0` is what found it. (The CIA arms still read the mirror. That is older than this spec and
 there is no evidence it is unintended, so it is recorded here and not quietly changed.)
 
-**Still open: D5, D7, D8.** The host read/peek override, the UltiSID model mapping, and the
-snapshot chip count. Nothing of UE2's half is started either.
+**Shipped in slice 4: D5 and D8, and D7 resolved without code.**
+
+**D5** is `SidHostAccess` on the machine: one `read` and one `peek`, each taking `(chip, reg)` and
+returning `Option<u8>`, `Some` winning and `None` falling through — 850's precedence rather than a
+second idiom. One pair for the machine and not one per chip, for D4's reason: per chip a host
+would re-install on every remap.
+
+**The two halves have different bounds, and that is the contract showing through the types.**
+`read` is `FnMut` because the bus dispatch holds `&mut self` and a real read may advance the host's
+protocol. `peek` is `Fn`, because `read_full` and `peek_lens` take `&self` — and a peek is
+side-effect-free by definition, so being unable to mutate is the rule enforced rather than a
+limitation. Changing those two to `&mut self` to allow an `FnMut` peek was the alternative and was
+rejected: they are widely used public reads, and the restriction is the correct one.
+
+The gate drives the read path with real 6502 code, deliberately. `read_full` is a PEEK and never
+reaches the bus read, so a case built on it would claim to test the read override while testing the
+peek one. And one case asserts that a peek does NOT run the read hook, which is the whole reason
+there are two.
+
+**D7 needs no code in TRX64, and that is the finding rather than a gap.** `WAVES` selects the reSID
+chip model, and since D1 that is already per instance: `ResidConfig { model }`, one per engine, set
+by whoever builds the engine — which for UE2 is UE2, driving `Resid` directly. The resonance
+switch, the digi level and the 1024-entry filter curve have no reSID equivalent and are modelled
+nowhere, which §3 D7 states and this repo means. Storing them so a host could set and read them
+back unchanged would add dead fields that advertise a capability we do not have; a host that wants
+to remember its own settings can remember them. The gap is stated, not furnished.
+
+**D8** extends the `.c64re` snapshot: `SidChipSnapshot` for chips 1.., carried on `SidSnapshot` as
+`chips` with `serde(default, skip_serializing_if = "Vec::is_empty")`. A dump written before 855
+still deserialises, and a one-SID machine writes no new key at all — so the node stays
+byte-identical for every existing c64re session.
+
+**The VSF export deliberately still says one SID.** VICE's SID module puts `num_sids` in front of a
+register block, and the layout for several is something I have not read. Writing a count this code
+cannot back up would be the plausible-looking lie this repo keeps catching, so `vsf_export` is
+unchanged and this sentence is why. UE2 does not use VSF.
+
+**TRX64's half of 855 is complete: D1, D2, D3, D4, D5, D6, and D7 by resolution.** `sid_multi_gate`
+has sixteen cases in `scripts/gate.sh`. UE2's half — the UltiSID register face, the resolution into
+the table, its ARMSID protocol behind D5, and its mixer — is theirs and unstarted.

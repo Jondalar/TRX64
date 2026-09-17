@@ -514,6 +514,10 @@ pub struct Machine {
     /// Spec 855 D4 — the audio subscriber, one for the whole machine rather than
     /// one per engine. Dropped on clone, so a COW fork starts audio-silent.
     pub sid_trace: crate::sid::SidTrace,
+    /// Spec 855 D5 — a host's read/peek overrides, so it can answer for a chip
+    /// the core does not model (UE2's ARMSID configuration mode). Dropped on
+    /// clone: a fork answers from the core.
+    pub sid_host: crate::sid::SidHostAccess,
     /// CPU-port latches ($00 direction / $01 value). Power-on $2F / $37.
     pub port_dir: u8,
     pub port_data: u8,
@@ -750,6 +754,7 @@ impl Machine {
             sid_extra: Vec::new(),
             sid_map: Vec::new(),
             sid_trace: crate::sid::SidTrace::default(),
+            sid_host: crate::sid::SidHostAccess::default(),
             port_dir: 0x2f,
             port_data: 0x37,
             memconfig: full::build_memconfig_table()[0x1f],
@@ -1186,6 +1191,23 @@ impl Machine {
     /// the I/O shadow. This lets a render scenario program the VIC + colour RAM on
     /// the CPU-isolated (flat-bus) inject path, where ordinary `STA $D0xx` would
     /// land in RAM instead of the chip. Out-of-range addresses fall back to RAM.
+    /// Spec 855 D5 — install (or clear) a host's answer for SID reads.
+    ///
+    /// `read` sees a real bus read and may advance the host's protocol state;
+    /// `peek` must not, and its `Fn` bound is the type system saying so. `Some`
+    /// wins, `None` falls through to the core — 850's precedence, unchanged.
+    ///
+    /// Install both or the monitor will disagree with the C64: without the peek
+    /// half a debugger prints the core's register shadow while the program reads
+    /// the host's answer.
+    pub fn set_sid_host_access(
+        &mut self,
+        read: Option<Box<dyn FnMut(u8, usize) -> Option<u8> + Send>>,
+        peek: Option<Box<dyn Fn(u8, usize) -> Option<u8> + Send + Sync>>,
+    ) {
+        self.sid_host = crate::sid::SidHostAccess { read, peek };
+    }
+
     /// Spec 855 D4 — install (or clear) the audio subscriber: every SID register
     /// write in CPU order, as `(chip, reg, value, clk)`.
     ///
@@ -1337,6 +1359,7 @@ impl Machine {
             sid_extra: &mut self.sid_extra,
             sid_map: &self.sid_map,
             sid_trace: &mut self.sid_trace,
+            sid_host: &mut self.sid_host,
             config: self.memconfig,
             memconfig_table: &self.memconfig_table,
             port_dir: self.port_dir,
@@ -1401,6 +1424,7 @@ impl Machine {
             sid_extra: &mut self.sid_extra,
             sid_map: &self.sid_map,
             sid_trace: &mut self.sid_trace,
+            sid_host: &mut self.sid_host,
             config: self.memconfig,
             memconfig_table: &self.memconfig_table,
             port_dir: self.port_dir,
@@ -1706,6 +1730,7 @@ impl Machine {
                 sid_extra: &mut self.sid_extra,
                 sid_map: &self.sid_map,
                 sid_trace: &mut self.sid_trace,
+                sid_host: &mut self.sid_host,
                 config: self.memconfig,
                 memconfig_table: &self.memconfig_table,
                 port_dir: self.port_dir,
@@ -2310,13 +2335,20 @@ impl Machine {
                         }
                         // Spec 855: a peek shows the register shadow of whichever
                         // chip owns the address — and only the shadow, because a
-                        // peek has no side effects and never runs a model.
-                        0xd400..=0xd7ff => match crate::sid::resolve_sid(&self.sid_map, addr) {
-                            Some((chip, reg)) => {
-                                self.sid_chip_regs(chip).map(|r| r[reg]).unwrap_or(0xff)
+                        // peek has no side effects and never runs a model. D5's
+                        // host peek answers first where one is installed, so the
+                        // monitor shows what the C64 would actually read instead
+                        // of quietly disagreeing with it.
+                        0xd400..=0xd7ff => {
+                            let (chip, reg) = match crate::sid::resolve_sid(&self.sid_map, addr) {
+                                Some(hit) => hit,
+                                None => (0, (addr as usize - 0xd400) & 0x1f),
+                            };
+                            match self.sid_host.peek(chip, reg) {
+                                Some(v) => v,
+                                None => self.sid_chip_regs(chip).map(|r| r[reg]).unwrap_or(0xff),
                             }
-                            None => self.sid_regs[(addr as usize - 0xd400) & 0x1f],
-                        },
+                        }
                         0xd800..=0xdbff => (self.io_shadow[(addr as usize) - 0xd000] & 0x0f) | 0xf0,
                         0xdc00..=0xdcff => self.cia1_pin_peek(addr),
                         0xdd00..=0xddff => self.cia2_pin_peek(addr),
@@ -2379,13 +2411,20 @@ impl Machine {
                         }
                         // Spec 855: a peek shows the register shadow of whichever
                         // chip owns the address — and only the shadow, because a
-                        // peek has no side effects and never runs a model.
-                        0xd400..=0xd7ff => match crate::sid::resolve_sid(&self.sid_map, addr) {
-                            Some((chip, reg)) => {
-                                self.sid_chip_regs(chip).map(|r| r[reg]).unwrap_or(0xff)
+                        // peek has no side effects and never runs a model. D5's
+                        // host peek answers first where one is installed, so the
+                        // monitor shows what the C64 would actually read instead
+                        // of quietly disagreeing with it.
+                        0xd400..=0xd7ff => {
+                            let (chip, reg) = match crate::sid::resolve_sid(&self.sid_map, addr) {
+                                Some(hit) => hit,
+                                None => (0, (addr as usize - 0xd400) & 0x1f),
+                            };
+                            match self.sid_host.peek(chip, reg) {
+                                Some(v) => v,
+                                None => self.sid_chip_regs(chip).map(|r| r[reg]).unwrap_or(0xff),
                             }
-                            None => self.sid_regs[(addr as usize - 0xd400) & 0x1f],
-                        },
+                        }
                         0xd800..=0xdbff => (self.io_shadow[(addr as usize) - 0xd000] & 0x0f) | 0xf0,
                         0xdc00..=0xdcff => self.cia1_pin_peek(addr),
                         0xdd00..=0xddff => self.cia2_pin_peek(addr),
@@ -2898,6 +2937,7 @@ impl Machine {
                     sid_extra: &mut self.sid_extra,
                     sid_map: &self.sid_map,
                     sid_trace: &mut self.sid_trace,
+                    sid_host: &mut self.sid_host,
                     config: self.memconfig,
                     memconfig_table: &self.memconfig_table,
                     port_dir: self.port_dir,

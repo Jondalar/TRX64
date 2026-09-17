@@ -698,3 +698,73 @@ impl core::fmt::Debug for SidTrace {
         f.debug_tuple("SidTrace").field(&self.0.as_ref().map(|_| "Some(<fn>)")).finish()
     }
 }
+
+// ── Spec 855 D5 — a host may answer for a chip ────────────────────────────────
+
+/// Read and peek overrides, so a host can answer for a chip the core does not
+/// model.
+///
+/// UE2 needs this because an emulated ARMSID in its configuration mode must
+/// answer `$1B`/`$1C` from its own protocol rather than from `Sid6581`. Today
+/// only the firmware probes that, over DMA, which the bridge answers itself — a
+/// C64 program probing through the CPU would read our fastsid and get it wrong.
+///
+/// ONE hook pair for the machine, taking the chip as a parameter, rather than a
+/// pair per chip: the same reason D4's write trace lives here. Per chip, a host
+/// would have to install N of them and re-install on every firmware remap.
+///
+/// `Some` wins and `None` falls through to the core, exactly as
+/// `ExpansionDevice::read` behaves under Spec 850 — one idiom in this codebase
+/// rather than a second one invented here.
+///
+/// THE TWO HALVES HAVE DIFFERENT BOUNDS, and that is the contract showing
+/// through the types. `read` is `FnMut` because the bus dispatch holds `&mut
+/// self` and a real read may advance the host's own protocol state. `peek` is
+/// `Fn`, because `Machine::read_full` and `peek_lens` take `&self`: a peek is
+/// side-effect-free by definition, so being unable to mutate is not a
+/// restriction, it is the rule enforced.
+///
+/// Without the peek half the monitor would show the core's register shadow
+/// while the C64 receives the host's answer. A quiet disagreement between what
+/// a debugger prints and what the program reads is the kind of thing that costs
+/// somebody an afternoon, which is why 850 grew the same pair.
+#[derive(Default)]
+pub struct SidHostAccess {
+    /// Answer a bus READ of `(chip, reg)`, or fall through with `None`.
+    pub read: Option<Box<dyn FnMut(u8, usize) -> Option<u8> + Send>>,
+    /// Answer a side-effect-free PEEK of `(chip, reg)`, or fall through.
+    pub peek: Option<Box<dyn Fn(u8, usize) -> Option<u8> + Send + Sync>>,
+}
+
+impl SidHostAccess {
+    #[inline]
+    pub fn read(&mut self, chip: u8, reg: usize) -> Option<u8> {
+        self.read.as_mut().and_then(|f| f(chip, reg))
+    }
+
+    #[inline]
+    pub fn peek(&self, chip: u8, reg: usize) -> Option<u8> {
+        self.peek.as_ref().and_then(|f| f(chip, reg))
+    }
+
+    #[inline]
+    pub fn is_installed(&self) -> bool {
+        self.read.is_some() || self.peek.is_some()
+    }
+}
+
+impl Clone for SidHostAccess {
+    /// Transport plumbing, not register state: a fork answers from the core.
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl core::fmt::Debug for SidHostAccess {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SidHostAccess")
+            .field("read", &self.read.as_ref().map(|_| "Some(<fn>)"))
+            .field("peek", &self.peek.as_ref().map(|_| "Some(<fn>)"))
+            .finish()
+    }
+}

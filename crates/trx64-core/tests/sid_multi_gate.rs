@@ -313,3 +313,76 @@ fn clearing_the_trace_stops_it_and_a_clone_never_had_it() {
     assert_eq!(got.len(), 1, "only the write made while installed: {got:?}");
     assert_eq!(got[0].2, 0x11);
 }
+
+// ── Slice 4 (D5) — a host may answer for a chip ───────────────────────────────
+//
+// The bus read path is driven with real 6502 code on purpose: `read_full` is a
+// PEEK and never reaches it, so a test that used `read_full` would claim to
+// check the read override while checking the peek override.
+
+use trx64_core::NullSink;
+
+/// `LDA $D41B / STA $0400 / JMP *` at $C000.
+const READ_OSC3: [u8; 9] = [0xad, 0x1b, 0xd4, 0x8d, 0x00, 0x04, 0x4c, 0x06, 0xc0];
+
+fn run_instrs(m: &mut Machine, n: u64) {
+    m.run_for_full_capped(n * 64, n, &mut NullSink, |_, _, _, _, _, _, _| {});
+}
+
+#[test]
+fn a_host_answers_a_bus_read() {
+    let mut m = Machine::new();
+    m.set_sid_host_access(
+        Some(Box::new(|chip, reg| if (chip, reg) == (0, 0x1b) { Some(0x5a) } else { None })),
+        None,
+    );
+    m.poke(0xc000, &READ_OSC3);
+    m.write_full(0x0001, 0x37);
+    m.c64_core.reg_pc = 0xc000;
+    run_instrs(&mut m, 3);
+
+    assert_eq!(m.read_full(0x0400), 0x5a, "the host's byte reached the CPU, not the fastsid's");
+}
+
+#[test]
+fn a_peek_asks_the_peek_hook_and_never_the_read_hook() {
+    let reads = Arc::new(Mutex::new(0usize));
+    let counted = Arc::clone(&reads);
+
+    let mut m = Machine::new();
+    m.set_sid_host_access(
+        Some(Box::new(move |_chip, _reg| {
+            *counted.lock().unwrap() += 1;
+            Some(0x11)
+        })),
+        Some(Box::new(|chip, reg| if (chip, reg) == (0, 0x1b) { Some(0x22) } else { None })),
+    );
+
+    assert_eq!(m.read_full(0xd41b), 0x22, "the monitor sees the host's answer");
+    assert_eq!(
+        *reads.lock().unwrap(),
+        0,
+        "a peek must not run the READ hook — that is the whole point of having two"
+    );
+}
+
+#[test]
+fn without_a_host_the_core_still_answers() {
+    let mut m = Machine::new();
+    m.poke(0xc000, &READ_OSC3);
+    m.write_full(0x0001, 0x37);
+    m.c64_core.reg_pc = 0xc000;
+    run_instrs(&mut m, 3);
+    let from_core = m.read_full(0x0400);
+
+    // The same machine with a host that declines everything must be identical:
+    // `None` falls through, exactly as `ExpansionDevice::read` does under 850.
+    let mut n = Machine::new();
+    n.set_sid_host_access(Some(Box::new(|_c, _r| None)), Some(Box::new(|_c, _r| None)));
+    n.poke(0xc000, &READ_OSC3);
+    n.write_full(0x0001, 0x37);
+    n.c64_core.reg_pc = 0xc000;
+    run_instrs(&mut n, 3);
+
+    assert_eq!(n.read_full(0x0400), from_core, "declining is the same as not being there");
+}
