@@ -429,9 +429,24 @@ pub fn restore_cia(cia: &mut Cia, s: &CiaSnapshot, tab: &[u16; crate::cia::CIAT_
     // A pre-TOD dump wrote 0 here; a running clock needs a non-zero countdown or it
     // would fire on the very next cycle.
     cia.tod_power_freq = if s.power_ticks > 0 { s.power_ticks as u32 } else { 50 };
-    // A target clk, so re-base it onto the restored clock rather than trusting an old
-    // absolute value from a dump written before TOD ran.
-    cia.tod_clk = cia.clk.wrapping_add((crate::cia::PAL_CYCLES_PER_SEC / cia.tod_power_freq.max(1)) as u64);
+    // A target clk, so it is re-based onto the restored clock rather than trusting an
+    // old absolute value from a dump written before TOD ran. The PHASE has to survive
+    // that re-basing, and until now it did not: this line recomputed a whole period,
+    // so a machine captured 2 000 cycles from its next tenth came back with a fresh
+    // 19 704 ahead of it. `snapshot_roundtrip_fidelity` measured the gap at ~17 300
+    // cycles on all three scenarios and had been red since the day TOD stopped being a
+    // countdown — unnoticed because that suite is not in the gate, which is now fixed.
+    //
+    // Capture writes the pair: `todticks` is the target and `todclk` is the clock it
+    // was measured against, so their difference is what was actually left to run.
+    // A pre-TOD dump has `todticks` 0 and still gets the full period.
+    let tod_period = (crate::cia::PAL_CYCLES_PER_SEC / cia.tod_power_freq.max(1)) as u64;
+    let remaining = (s.todticks - s.todclk).clamp(0, tod_period as i64) as u64;
+    cia.tod_clk = cia.clk.wrapping_add(if s.todticks > 0 && remaining > 0 {
+        remaining
+    } else {
+        tod_period
+    });
     // Re-derive the cached alarm clk = the PREDICTED next-underflow clk (VICE
     // ciat_set_alarm), NOT `ta.clk` (the timer's last-update clk). The old
     // `= ta.clk` set the alarm to ~now, so the dispatch `while ta_alarmclk <= rclk`
