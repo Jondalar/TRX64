@@ -159,7 +159,7 @@ That is a deliberate application of what this repo learned on 2026-09-17: the UC
 was an unverified assumption, and its gate confirmed it because the test was written from the
 same assumption. A configurable precedence cannot repeat that. A hardcoded one can.
 
-## §8 As built — D1 only
+## §8 As built — D1, D2, D3 and D6
 
 **Shipped: the shim takes handles.** `resid_new()`/`resid_delete(h)` plus an `_h` form of every
 entry point; the legacy names remain as wrappers on a default instance, so c64re's WASM build and
@@ -195,6 +195,28 @@ asserts the exact sample COUNT and that bound, which is the honest claim. 855 al
 residual routine rather than exotic — several engines per process is the normal case now — and the
 oracle's comment saying otherwise was corrected with it.
 
-**Still open: D2–D8.** The decode table, per-chip `Sid6581`, the write trace's new signature, the
-host read/peek override, the envelope getter, the UltiSID model mapping, and the snapshot chip
-count. Nothing of UE2's half is started either.
+**Shipped in slice 2: D2, D3 and D6.** `SidChip` and `SidMapping`, resolved by `resolve_sid`;
+`Machine::set_sid_map` takes the host's resolved windows and the crate learns nothing about U64
+registers. Chip 0 stays `sid_regs` + `sid` and extra chips live in `sid_extra` — the asymmetry is
+deliberate, because making chip 0 a list element would force the snapshot, the VSF export, the
+monitor and the bus to index for no behavioural gain. `cold_reset` resets every chip and KEEPS the
+table, per D2. The routing went everywhere the old `& 0x1f` was and not merely the obvious two: bus
+read and write, `poke_io`, both monitor peek paths, and the reverse-debug UNDO path, where putting
+a second chip's write back into chip 0's shadow would corrupt both silently and only while
+rewinding. `$DE00-$DFFF` honours §7's per-window bool, with the simple reading written into the
+code: ahead means the SID answers first, behind means the chain wins outright, because `port_read`
+resolves to a byte rather than an `Option`. D6's envelope getter reads the fastsid model.
+
+**A defect this slice UNCOVERED but did not cause.** `snapshot_roundtrip_fidelity` was red on
+`main` — `cia1/cia2.todticks` off by ~17 300 cycles on every scenario — and had been since TOD
+stopped being a countdown earlier the same day. The restore re-based the target clk by recomputing
+a WHOLE period, so a machine captured part-way through a tenth came back with a fresh one. Capture
+stores the pair (`todticks`, `todclk`), so the remaining interval is their difference; that is what
+is restored now, and a pre-TOD dump still gets the full period. Bounded by bisection rather than
+assumed: green at `5f93646`, red at `790c2c9`. It hid because that suite was not in `scripts/gate.sh`
+— neither was `resid_oracle`, which went red in slice 1 for a different reason. **Both are in the
+gate now**, which is the actual fix for the pattern.
+
+**Still open: D4, D5, D7, D8.** The write trace's `(chip, reg, value, clk)` signature, the host
+read/peek override, the UltiSID model mapping, and the snapshot chip count. Nothing of UE2's half
+is started either.
