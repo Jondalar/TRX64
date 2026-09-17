@@ -138,6 +138,25 @@ the address and the PLA selects no I/O. So a read of 6 or 7 advances the pointer
 times (850's count), not once per stolen cycle — which would be about forty on a badline. Whether the
 U64's internal bus behaves like the U2+ cartridge is closed and stays an assumption.
 
+> **DISPROVED 2026-09-17, fixed in 0.7.2.** The assumption above was wrong, and it said of itself
+> that it was an assumption. The pointer advances by exactly ONE per completed C64 read.
+>
+> UE2 found it with UBoot64 v3.0.1: a UCI DOS read of a 24480-byte `DMBSLT.CFG` delivered 24279
+> bytes, the C64 re-issued `DOS_CMD_READ_DATA` without a new `OPEN_FILE`, the file was at EOF, the
+> firmware answered zero-length and the C64 waited for ever. The stop byte moved every run — 24261,
+> 24270, 24279, 24285, 24289, 24324 — which is the badline dependency in plain sight. Verified by
+> advancing once per read in a scratch copy: UBoot64 reaches its menu.
+>
+> The reasoning needs no VHDL. A BA-stretched read is ONE 6502 bus cycle: address and R/W are held
+> across the stretch, the data is taken at its end. One completed read consumes one byte. Any other
+> model loses bytes on every badline, and real Ultimates do not lose them. The contract is the one
+> UE2 named: the count the C64 reads equals the length the firmware validated.
+>
+> The gate case that should have caught this asserted `stalled_on_bus + 1` — the code's own model —
+> so it confirmed the defect. Its replacement is a difference test: screen on and screen blanked
+> must deliver the same bytes. Third time this repo has learned that an absolute assertion cannot
+> catch a consistently wrong count.
+
 **D6 — visibility.** A read-only monitor verb `uci`: profile, enabled, window, state, pointers, lengths,
 the two lines. The daemon's `session/uci` returns the same. Without it, a hung UCI program is a black box.
 
@@ -171,7 +190,15 @@ through the CPU bus:
   cycle clears the block.
 - **Unlock:** `$AB → $D038`, `$CD → $D036` sets `unlock`; with a write in between it does not.
 - **Stretched read:** `LDA $DF1E` timed onto a badline advances the pointer `stalled_on_bus + 1` times,
-  never once per stolen cycle.
+  never once per stolen cycle. — **Replaced 2026-09-17 (0.7.2): this case asserted the defect.** Two
+  cases now. A stretched read advances the pointer by exactly ONE, still driven one instruction at a
+  time over two frames, because only a read whose stall had AEC HIGH can tell the two models apart and
+  those are rare (7 in 5309 under D5's own measurement). And the contract: a 200-byte transfer that
+  crosses badlines delivers the same bytes with the display on and blanked. The second deliberately does
+  not require the port read itself to be the stretched access — a badline's steal is taken by the FIRST
+  access on the line, and the loop's opcode fetches come from RAM, so the read carrying it is almost
+  never the one at `$DF1E`. A guard demanding otherwise cannot be met; this one asserts the raster lines
+  the transfer actually crossed.
 
 ## §5 UE2
 
@@ -226,7 +253,9 @@ raises. `c64re_snapshot.rs`: `restore_runtime_checkpoint` resets the block. Daem
   what lets `fw_read` take `&self`.
 - **Stretched reads.** The CPU gets the byte at the pointer as it stood before the read; the pointer then
   advances `stalled_on_bus + 1` times, clamped. Which byte the U64 latches at the end of a stretch is part
-  of D5's assumption.
+  of D5's assumption. — **Corrected 2026-09-17 (0.7.2): it advances by exactly ONE per completed read.
+  See the DISPROVED note under D5; `stalled_on_bus` no longer has a production consumer, and stays only
+  as 850's `Access` contract, which `expansion_port_gate` still checks the producer against.**
 - **What counts as a C64 write.** The unlock detector sees only what the device is shown: the snooped
   `$FF00`/`$D036`/`$D038`, whatever the banking, and `$DE00-$DFFF` with I/O banked in. A write elsewhere
   between the two keys — to RAM, say — is invisible and does not re-arm; megabyter writes nothing in

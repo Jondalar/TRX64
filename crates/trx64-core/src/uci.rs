@@ -477,14 +477,23 @@ impl Uci {
 
 impl ExpansionDevice for Uci {
     /// `:97-106` for the value, then `:174-189`: a read of the response or status register
-    /// turns the command IRQ off and advances its pointer, byte available or not. A read
-    /// the VIC stretched is on the bus `stalled_on_bus + 1` cycles, and the FPGA counts
-    /// each (Spec 852 D5).
+    /// turns the command IRQ off and advances its pointer by ONE, byte available or not.
+    ///
+    /// Until 0.7.2 it advanced `stalled_on_bus + 1` times. That was 852 D5, which said of
+    /// itself that it "stays an assumption" — it was never a port of anything. Real software
+    /// disproved it: a UCI DOS read of a 24480-byte file delivered 24279 bytes and the C64
+    /// then hung waiting for a remainder the firmware had already sent, stopping at a byte
+    /// that moved with the badline on every run (24261, 24270, 24279, 24285, 24289, 24324).
+    ///
+    /// A BA-stretched read is ONE 6502 bus cycle: the address and R/W are held across the
+    /// stretch and the data is taken at its end. One completed read therefore consumes one
+    /// byte. Any other model loses bytes on every badline, and the contract this block owes
+    /// the C64 is that the count it reads equals the length the firmware validated.
     fn read(&mut self, a: Access, _cart: Option<u8>) -> Option<u8> {
         let reg = self.decode(a.addr)?;
         let value = self.c64_value(reg);
         let advance = |ptr: &mut u16, end: u16| {
-            *ptr = (u32::from(*ptr) + a.stalled_on_bus + 1).min(u32::from(end)) as u16;
+            *ptr = (*ptr).saturating_add(1).min(end);
         };
         match reg {
             SLOT_RESPONSE => {

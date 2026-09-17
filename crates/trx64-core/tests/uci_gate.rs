@@ -608,8 +608,98 @@ impl ExpansionDevice for Tap {
     fn write(&mut self, _a: Access, _value: u8) {}
 }
 
+/// Spec 852 D5, corrected in 0.7.2 — and a DIFFERENCE test, in the shape the TOD gate had
+/// to learn: the same queued response read with the display ON and BLANKED must deliver the
+/// SAME bytes. An absolute assertion can be satisfied by a pointer that loses bytes
+/// consistently; two runs agreeing cannot.
+///
+/// The case this replaces asserted `after - before == stalled_on_bus + 1` — the model the
+/// code itself held. Gate and code encoded one unverified assumption, so the gate confirmed
+/// the defect instead of catching it. UBoot64 found what it could not: a 24480-byte file
+/// arrived 201 bytes short, at a byte that moved with the badline on every run.
 #[test]
-fn a_read_stretched_by_a_badline_advances_the_pointer_once_per_cycle_on_the_bus() {
+fn a_badline_stretched_transfer_delivers_every_byte_the_firmware_queued() {
+    const N: u16 = 200;
+    let queued: Vec<u8> = (0..N).map(|i| (i.wrapping_mul(7) as u8) ^ 0x5a).collect();
+
+    // The transfer must START inside the display window, or it runs entirely in the top
+    // border where nothing steals and the case proves nothing (it said so, loudly, when
+    // this was written without the wait). Raster $50 = 80, well inside 48..247; with the
+    // display blanked the raster still counts, so the same program serves both runs.
+    //
+    // $C000: wait for raster $50, then
+    //        LDX #0 / loop: LDA $DF1E / STA $0400,X / INX / CPX #N / BNE loop / JMP *
+    let prog: Vec<u8> = vec![
+        0xad, 0x12, 0xd0, // wait: LDA $D012
+        0xc9, 0x50, //             CMP #$50
+        0xd0, 0xf9, //             BNE wait
+        0xa2, 0x00, //       LDX #$00
+        0xad, 0x1e, 0xdf, // loop: LDA $DF1E
+        0x9d, 0x00, 0x04, //       STA $0400,X
+        0xe8, //                   INX
+        0xe0, N as u8, //          CPX #N
+        0xd0, 0xf5, //             BNE loop
+        0x4c, 0x14, 0xc0, // JMP *
+    ];
+
+    let run = |d011: u8| -> (Vec<u8>, u16, Vec<Access>) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut m = u64_machine();
+        firmware_init(&mut m);
+        firmware_copy_result(&mut m, &queued, b"00,OK", true);
+        uci(&mut m).fw_write(IRQMASK_CLEAR, CMD_NEW_COMMAND);
+        m.attach_expansion(Box::new(Tap(log.clone())));
+        m.write_full(0xd011, d011);
+        run_at(&mut m, 0xc000, 0x37, &prog, 12000);
+        let got = bytes(&m, 0x0400, N);
+        let ptr = m.uci_status().unwrap().response_pointer;
+        let reads: Vec<Access> =
+            log.lock().unwrap().iter().copied().filter(|a| a.addr == 0xdf1e).collect();
+        (got, ptr, reads)
+    };
+
+    let (on, ptr_on, reads_on) = run(0x1b); // display on: badlines steal cycles
+    let (off, ptr_off, _) = run(0x0b); // blanked: nothing steals
+
+    assert_eq!(reads_on.len(), N as usize, "one bus read per LDA");
+    // The coverage this case CAN guarantee: the transfer ran inside the display window and
+    // crossed badline rasters, so the C64 was reading while the VIC was stealing.
+    //
+    // It deliberately does NOT require the `$DF1E` read itself to be the stretched access.
+    // A badline's steal is absorbed by the FIRST access on the line, and the loop's opcode
+    // fetches come from RAM, which this Tap never sees — so the read that carries the stall
+    // is almost never the port read. Even the two-instruction loop in the case below finds
+    // only a handful in thousands. Requiring it here would be a guard that cannot be met.
+    // PAL: 63 cycles × 312 lines; badlines are `raster & 7 == YSCROLL` (3) inside 48..=247.
+    let line = |a: &Access| (a.clk / 63) % 312;
+    let badlines: Vec<u64> =
+        reads_on.iter().map(line).filter(|l| (48..=247).contains(l) && l % 8 == 3).collect();
+    assert!(
+        !badlines.is_empty(),
+        "the transfer never crossed a badline — it ran at raster {}..={} and proves nothing",
+        reads_on.iter().map(line).min().unwrap_or(0),
+        reads_on.iter().map(line).max().unwrap_or(0),
+    );
+
+    assert_eq!(on, off, "the display must not change which bytes the C64 receives");
+    assert_eq!(on, queued, "every byte the firmware queued reaches the C64, in order");
+    assert_eq!(
+        (ptr_on, ptr_off),
+        (896 + N, 896 + N),
+        "one advance per completed read, badlines or not"
+    );
+}
+
+/// The other half, and the one that actually distinguishes the fix: a read whose stall had
+/// AEC still HIGH. Only those reads carried the old `stalled_on_bus + 1`; a read stretched
+/// with AEC low advanced by one even before 0.7.2, so it cannot tell the two models apart.
+///
+/// Those are RARE — a badline steals ~43 cycles and only ~3 of them keep AEC high, so the
+/// measurement under D5 found 7 in 5309 reads. That is why this runs two frames one
+/// instruction at a time, the way the case it replaces did, instead of over one transfer:
+/// a 200-byte transfer expects about one such read and reliably finds none.
+#[test]
+fn a_read_stretched_with_the_address_still_on_the_bus_advances_the_pointer_exactly_once() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let mut m = u64_machine();
     firmware_init(&mut m);
@@ -630,7 +720,7 @@ fn a_read_stretched_by_a_badline_advances_the_pointer_once_per_cycle_on_the_bus(
         let reads: Vec<Access> = log.lock().unwrap().iter().copied().filter(|a| a.addr == 0xdf1e).collect();
         assert_eq!(reads.len(), 1);
         let a = reads[0];
-        assert_eq!(u32::from(after - before), a.stalled_on_bus + 1, "one advance per cycle on the bus: {a:?}");
+        assert_eq!(after - before, 1, "one completed read consumes one byte, whatever the VIC stole: {a:?}");
         assert!(a.stalled == 0 || a.stalled_on_bus < a.stalled, "never once per stolen cycle: {a:?}");
         *stalls.entry((a.stalled, a.stalled_on_bus)).or_default() += 1;
         if after > 1700 {
@@ -638,6 +728,9 @@ fn a_read_stretched_by_a_badline_advances_the_pointer_once_per_cycle_on_the_bus(
         }
         run_on(&mut m, 1); // JMP
     }
-    assert!(stalls.keys().any(|(s, on_bus)| *s > 1 && *on_bus > 0), "some reads landed on a badline: {stalls:?}");
+    assert!(
+        stalls.keys().any(|(s, on_bus)| *s > 1 && *on_bus > 0),
+        "no read was stretched with AEC high — the distinguishing case never occurred: {stalls:?}"
+    );
     eprintln!("(stalled, on the bus) → reads: {stalls:?}");
 }
