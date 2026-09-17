@@ -572,10 +572,12 @@ pub struct State {
 /// C64RE Spec 768 (persistent engine on a worker, fed by a write-ring, producing a
 /// PCM ring).
 struct AudioRenderThread {
-    /// SID register writes captured by the `set_write_trace` hook since the last
-    /// drain (CPU order, $D4xx offset masked to 0x00..0x1f). Shared with the hook
-    /// (`Box<dyn FnMut + Send>`); drained + cleared every pull, then sent (with the
-    /// window's `d_cycles`) over the write-ring.
+    /// SID register writes captured by the machine's `set_sid_write_trace` hook
+    /// since the last drain (CPU order, register masked to 0x00..0x1f). The hook
+    /// reports `(chip, reg, value, clk)` since Spec 855; this buffer keeps the
+    /// `(reg, value)` pair because the audio path here drives chip 0 only. Shared
+    /// with the hook (`Box<dyn FnMut + Send>`); drained + cleared every pull, then
+    /// sent (with the window's `d_cycles`) over the write-ring.
     writes: std::sync::Arc<std::sync::Mutex<Vec<(u8, u8)>>>,
     /// The write-ring (emu→render). Each `audioDrain()` sends `(window writes in CPU
     /// order, d_cycles for that window)`; the render thread replays them into the
@@ -15925,9 +15927,8 @@ fn export_session_audio(
         let w = Arc::clone(&writes);
         session
             .machine
-            .sid
-            .set_write_trace(Some(Box::new(move |addr, value| {
-                w.lock().unwrap().push((addr, value));
+            .set_sid_write_trace(Some(Box::new(move |_chip, reg, value, _clk| {
+                w.lock().unwrap().push((reg, value));
             })));
         // Prime reSID with the current SID register file (live state, not power-on).
         for reg in 0u8..=0x18 {
@@ -15964,7 +15965,7 @@ fn export_session_audio(
     }
 
     // Restore the byte-exact (None) write-trace path.
-    session.machine.sid.set_write_trace(None);
+    session.machine.set_sid_write_trace(None);
 
     let wav = engine.export_wav(WavFormat { sample_rate, channels: 2 });
     std::fs::write(out_path, &wav).map_err(|e| format!("write {out_path}: {e}"))?;
@@ -18448,8 +18449,8 @@ pub const AUDIO_SAMPLE_RATE: u32 = 44_100;
 ///
 /// PERSISTENT-ENGINE render thread (mirrors the `--stream` loop / C64RE Spec 768):
 ///
-/// First call: install the additive SID `set_write_trace` hook (capturing $D4xx
-/// writes into a shared buffer) + spawn the render thread. The render thread
+/// First call: install the additive SID `set_sid_write_trace` hook (capturing
+/// $D4xx writes into a shared buffer) + spawn the render thread. The render thread
 /// constructs ONE `SidAudioEngine`, primes it from the live SID register file (so the
 /// stream starts from the live state, not power-on silence), then loops draining the
 /// write-ring: replay the window's writes (CPU order) → `record_boundary(d_cycles)`
@@ -18481,9 +18482,8 @@ pub fn pull_audio_drain(state: &SharedState) -> AudioDrainData {
             let w = std::sync::Arc::clone(&writes);
             st.session
                 .machine
-                .sid
-                .set_write_trace(Some(Box::new(move |addr, value| {
-                    w.lock().unwrap().push((addr, value));
+                .set_sid_write_trace(Some(Box::new(move |_chip, reg, value, _clk| {
+                    w.lock().unwrap().push((reg, value));
                 })));
         }
         st.audio_hooked_generation = st.machine_generation;
@@ -18609,9 +18609,8 @@ pub fn pull_audio_drain(state: &SharedState) -> AudioDrainData {
         if let Some(w) = w {
             st.session
                 .machine
-                .sid
-                .set_write_trace(Some(Box::new(move |addr, value| {
-                    w.lock().unwrap().push((addr, value));
+                .set_sid_write_trace(Some(Box::new(move |_chip, reg, value, _clk| {
+                    w.lock().unwrap().push((reg, value));
                 })));
         }
         st.audio_hooked_generation = st.machine_generation;

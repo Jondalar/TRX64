@@ -76,8 +76,11 @@ per chip. Chip 0 is bit-identical to today.
 takes `FnMut(u8, u8)` — register and value, with neither address nor cycle. With N chips anywhere
 in `$D400-$D7FF` and `$DE00-$DFFF`, a host cannot tell which instance to clock. The raw address
 is deliberately **not** passed: the host built the table, so chip plus register gives it back.
-Three installing call sites exist outside `sid.rs`, all in our own daemon
-(`streaming.rs:333`, `:395`, `main.rs:15929`).
+**Seven** installing call sites exist outside `sid.rs` — `streaming.rs` ×2, `main.rs` ×3 and the
+core's own `scramble_av_record` recording ×1, plus three that clear the hook. The figure said
+THREE here until D4 was built, and that was my undercount from one early grep; it is also what UE2
+was told when the interface was agreed. Not a large number either way, but a number in a spec is a
+claim like any other.
 
 **D5 — a host may answer reads for a chip, and peek beside it.** An emulated ARMSID in its
 configuration mode must answer `$1B`/`$1C` from the host's protocol, not from our `Sid6581`.
@@ -217,6 +220,24 @@ assumed: green at `5f93646`, red at `790c2c9`. It hid because that suite was not
 — neither was `resid_oracle`, which went red in slice 1 for a different reason. **Both are in the
 gate now**, which is the actual fix for the pattern.
 
-**Still open: D4, D5, D7, D8.** The write trace's `(chip, reg, value, clk)` signature, the host
-read/peek override, the UltiSID model mapping, and the snapshot chip count. Nothing of UE2's half
-is started either.
+**Shipped in slice 3: D4.** The hook is `SidTrace` on `Machine`, carrying `(chip, reg, value, clk)`,
+and `Sid6581` is back to being only what the 6502 can see — `Clone` and `Debug` are derived again.
+
+It lives on the machine rather than the engine for two reasons, and the second is the one that
+decided it. Per engine a host would install N hooks and re-install on every firmware remap. And
+`Sid6581::write` is reached from the bus, from `poke_io` and from the isolated `SidBus`, so moving
+the call to the bus dispatch — which is where the chip and the cycle are — would have silently
+stopped tracing host pokes. A monitor write to `$D418` would have gone quiet with nothing to show
+for it. One hook at the machine, fired by the bus dispatch and by `poke_io`, is the shape that
+keeps every path. `SidBus` alone is not traced: it is an isolated test bus with no audio, and that
+is a decision rather than an oversight.
+
+**The gate caught one of mine.** The `poke_io` stamp first read `cpu6510.clk`, copied from the CIA
+arms beside it. That field is a MIRROR, correct only after `cpu6510.clk = c64_core.clk` runs; the
+bus stamps `c64_core.clk`, so a poke and a bus write would have reported two different clocks for
+the same machine. The case that sets the clock to a recognisable number rather than asserting
+`0 == 0` is what found it. (The CIA arms still read the mirror. That is older than this spec and
+there is no evidence it is unintended, so it is recorded here and not quietly changed.)
+
+**Still open: D5, D7, D8.** The host read/peek override, the UltiSID model mapping, and the
+snapshot chip count. Nothing of UE2's half is started either.

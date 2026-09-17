@@ -511,6 +511,9 @@ pub struct Machine {
     /// `cold_reset`), because the firmware that owns it rewrites it on every
     /// reset and a self-clearing table would race that.
     pub sid_map: Vec<crate::sid::SidMapping>,
+    /// Spec 855 D4 — the audio subscriber, one for the whole machine rather than
+    /// one per engine. Dropped on clone, so a COW fork starts audio-silent.
+    pub sid_trace: crate::sid::SidTrace,
     /// CPU-port latches ($00 direction / $01 value). Power-on $2F / $37.
     pub port_dir: u8,
     pub port_data: u8,
@@ -746,6 +749,7 @@ impl Machine {
             sid: Sid6581::new(),
             sid_extra: Vec::new(),
             sid_map: Vec::new(),
+            sid_trace: crate::sid::SidTrace::default(),
             port_dir: 0x2f,
             port_data: 0x37,
             memconfig: full::build_memconfig_table()[0x1f],
@@ -1182,6 +1186,21 @@ impl Machine {
     /// the I/O shadow. This lets a render scenario program the VIC + colour RAM on
     /// the CPU-isolated (flat-bus) inject path, where ordinary `STA $D0xx` would
     /// land in RAM instead of the chip. Out-of-range addresses fall back to RAM.
+    /// Spec 855 D4 — install (or clear) the audio subscriber: every SID register
+    /// write in CPU order, as `(chip, reg, value, clk)`.
+    ///
+    /// One hook for the machine, not one per engine. A subscriber needs to know
+    /// which chip wrote in order to clock the right instance, and per-engine
+    /// hooks would have to be re-installed every time the firmware remaps. The
+    /// raw address is not passed: the host built the decode table, so chip plus
+    /// register gives it back, and passing both invites them to disagree.
+    pub fn set_sid_write_trace(
+        &mut self,
+        hook: Option<Box<dyn FnMut(u8, u8, u8, u64) + Send>>,
+    ) {
+        self.sid_trace = crate::sid::SidTrace(hook);
+    }
+
     // ── Spec 855 D2 — the host's SID decode table ───────────────────────────────
     //
     // The host resolves its own hardware and hands the result over; this crate
@@ -1245,6 +1264,19 @@ impl Machine {
                         Some(hit) => hit,
                         None => (0, (a as usize - 0xd400) & 0x1f),
                     };
+                    // Spec 855 D4 — a host poke reaches a register file, so it is
+                    // a SID write and the subscriber hears it. Moving the hook to
+                    // the bus alone would have silently stopped tracing these: a
+                    // monitor write to $D418 would go quiet with nothing to show
+                    // for it.
+                    // `c64_core.clk` and NOT `cpu6510.clk`: the latter is a mirror
+                    // that is only correct after a sync (`cpu6510.clk =
+                    // c64_core.clk`), and the bus stamps `c64_core.clk` too — a
+                    // poke and a bus write must not report two different clocks
+                    // for the same machine. The first draft copied `cpu6510` from
+                    // the CIA arms below and the gate caught it reporting 0.
+                    let clk = self.c64_core.clk;
+                    self.sid_trace.fire(chip, reg, *b, clk);
                     if chip == 0 {
                         self.sid_regs[reg] = *b;
                         self.sid.write(reg, *b, &self.sid_regs);
@@ -1304,6 +1336,7 @@ impl Machine {
             sid: &mut self.sid,
             sid_extra: &mut self.sid_extra,
             sid_map: &self.sid_map,
+            sid_trace: &mut self.sid_trace,
             config: self.memconfig,
             memconfig_table: &self.memconfig_table,
             port_dir: self.port_dir,
@@ -1367,6 +1400,7 @@ impl Machine {
             sid: &mut self.sid,
             sid_extra: &mut self.sid_extra,
             sid_map: &self.sid_map,
+            sid_trace: &mut self.sid_trace,
             config: self.memconfig,
             memconfig_table: &self.memconfig_table,
             port_dir: self.port_dir,
@@ -1671,6 +1705,7 @@ impl Machine {
                 sid: &mut self.sid,
                 sid_extra: &mut self.sid_extra,
                 sid_map: &self.sid_map,
+                sid_trace: &mut self.sid_trace,
                 config: self.memconfig,
                 memconfig_table: &self.memconfig_table,
                 port_dir: self.port_dir,
@@ -2862,6 +2897,7 @@ impl Machine {
                     sid: &mut self.sid,
                     sid_extra: &mut self.sid_extra,
                     sid_map: &self.sid_map,
+                    sid_trace: &mut self.sid_trace,
                     config: self.memconfig,
                     memconfig_table: &self.memconfig_table,
                     port_dir: self.port_dir,

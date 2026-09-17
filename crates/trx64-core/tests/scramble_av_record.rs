@@ -154,8 +154,11 @@ fn scramble_av_record() {
     let writes: Arc<Mutex<Vec<(u8, u8)>>> = Arc::new(Mutex::new(Vec::new()));
     {
         let w = Arc::clone(&writes);
-        m.sid.set_write_trace(Some(Box::new(move |addr, value| {
-            w.lock().unwrap().push((addr, value));
+        // Spec 855 D4 — the hook is the machine's now and carries
+        // `(chip, reg, value, clk)`. This recording drives chip 0 only, so the
+        // buffer keeps its `(reg, value)` shape and the rest is ignored.
+        m.set_sid_write_trace(Some(Box::new(move |_chip, reg, value, _clk| {
+            w.lock().unwrap().push((reg, value));
         })));
     }
     // Prime reSID with the CURRENT SID register file so the engine starts from
@@ -211,7 +214,7 @@ fn scramble_av_record() {
 
     // Drop the audio hook before we finish (good hygiene; the Machine is dropped
     // anyway, but this releases the Arc clone held in the closure).
-    m.sid.set_write_trace(None);
+    m.set_sid_write_trace(None);
 
     eprintln!(
         "Recorded {frames} frames @ {w}x{h}; mono PCM samples={} (~{:.2}s of audio)",

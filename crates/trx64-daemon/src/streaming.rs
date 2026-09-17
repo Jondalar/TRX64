@@ -332,8 +332,8 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
         // the Arc<Mutex<Vec>> byte buffer (the engine itself stays on this thread).
         let w = Arc::clone(&writes);
         let mut st = state.lock().unwrap();
-        st.session.machine.sid.set_write_trace(Some(Box::new(move |addr, value| {
-            w.lock().unwrap().push((addr, value));
+        st.session.machine.set_sid_write_trace(Some(Box::new(move |_chip, reg, value, _clk| {
+            w.lock().unwrap().push((reg, value));
         })));
         // Prime reSID with the CURRENT SID register file so the stream starts from
         // the live state (frequencies/PW/control already set), not power-on silence.
@@ -394,9 +394,11 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
             if st.machine_generation != last_machine_generation {
                 last_machine_generation = st.machine_generation;
                 let w = Arc::clone(&writes);
-                st.session.machine.sid.set_write_trace(Some(Box::new(move |addr, value| {
-                    w.lock().unwrap().push((addr, value));
-                })));
+                st.session.machine.set_sid_write_trace(Some(Box::new(
+                    move |_chip, reg, value, _clk| {
+                        w.lock().unwrap().push((reg, value));
+                    },
+                )));
                 for reg in 0u8..=0x18 {
                     let v = st.session.machine.read_full(0xD400 + reg as u16);
                     engine.record_write(reg, v);
@@ -650,7 +652,7 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
     // ── Teardown: clear the SID hook so the byte-exact (None) path is restored. ──
     let teardown = state.lock();
     if let Ok(mut st) = teardown {
-        st.session.machine.sid.set_write_trace(None);
+        st.session.machine.set_sid_write_trace(None);
     }
 }
 

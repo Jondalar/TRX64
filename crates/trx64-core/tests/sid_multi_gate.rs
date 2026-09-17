@@ -227,3 +227,89 @@ fn an_envelope_can_be_read_per_chip() {
     assert_eq!(m.sid_envelope(2, 0), None, "no such chip");
     assert_eq!(m.sid_envelope(0, 3), None, "no such voice");
 }
+
+// ── Slice 3 (D4) — the write trace ────────────────────────────────────────────
+
+use std::sync::{Arc, Mutex};
+
+type Traced = Arc<Mutex<Vec<(u8, u8, u8, u64)>>>;
+
+fn trace_into(m: &mut Machine) -> Traced {
+    let seen: Traced = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    m.set_sid_write_trace(Some(Box::new(move |chip, reg, value, clk| {
+        sink.lock().unwrap().push((chip, reg, value, clk));
+    })));
+    seen
+}
+
+#[test]
+fn the_trace_says_which_chip_took_the_write() {
+    let mut m = Machine::new();
+    m.set_sid_map(vec![
+        SidMapping::window(0xd400, 0, true),
+        SidMapping::window(0xde00, 1, false),
+    ]);
+    let seen = trace_into(&mut m);
+
+    m.write_full(0xd405, 0x11);
+    m.write_full(0xde05, 0xaa);
+
+    let got = seen.lock().unwrap().clone();
+    assert_eq!(got.len(), 2, "one record per write: {got:?}");
+    assert_eq!((got[0].0, got[0].1, got[0].2), (0, 0x05, 0x11));
+    assert_eq!((got[1].0, got[1].1, got[1].2), (1, 0x05, 0xaa), "the second chip, not the first");
+}
+
+#[test]
+fn the_trace_carries_the_cycle() {
+    let mut m = Machine::new();
+    // Set the clock to something recognisable rather than asserting 0 == 0, which
+    // would pass whether or not the cycle were plumbed at all.
+    m.c64_core.clk = 12_345;
+    let seen = trace_into(&mut m);
+
+    m.poke_io(0xd418, &[0x0f]);
+
+    let got = seen.lock().unwrap().clone();
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].3, 12_345, "the cycle the write happened on");
+}
+
+#[test]
+fn a_host_poke_is_a_sid_write_and_is_heard() {
+    // The reason D4 keeps the hook at the machine instead of moving it to the bus
+    // dispatch: `poke_io` does not go through the bus, so a bus-only hook would
+    // have stopped reporting monitor writes. A $D418 poke changing the volume
+    // with nothing in the audio stream to show for it is the kind of silence
+    // nobody notices until a recording is wrong.
+    let mut m = Machine::new();
+    let seen = trace_into(&mut m);
+
+    m.poke_io(0xd418, &[0x0f]);
+    m.write_full(0xd404, 0x21);
+
+    let got = seen.lock().unwrap().clone();
+    assert_eq!(got.len(), 2, "the poke AND the bus write, in order: {got:?}");
+    assert_eq!((got[0].0, got[0].1, got[0].2), (0, 0x18, 0x0f), "the poke");
+    assert_eq!((got[1].0, got[1].1, got[1].2), (0, 0x04, 0x21), "the bus write");
+}
+
+#[test]
+fn clearing_the_trace_stops_it_and_a_clone_never_had_it() {
+    let mut m = Machine::new();
+    let seen = trace_into(&mut m);
+    m.write_full(0xd405, 0x11);
+
+    // A fork starts audio-silent: the subscriber is transport plumbing, not
+    // register state, so `Clone` drops it — the same rule `Sid6581` used to hold.
+    let mut forked = m.clone();
+    forked.write_full(0xd405, 0x22);
+
+    m.set_sid_write_trace(None);
+    m.write_full(0xd405, 0x33);
+
+    let got = seen.lock().unwrap().clone();
+    assert_eq!(got.len(), 1, "only the write made while installed: {got:?}");
+    assert_eq!(got[0].2, 0x11);
+}

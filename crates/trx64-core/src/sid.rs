@@ -159,43 +159,21 @@ impl Voice {
 ///
 /// Clone-able with the Machine for Phase-2 COW forks.
 ///
-/// `Clone`/`Debug` are implemented MANUALLY (not derived) because of the
-/// optional `write_trace` audio hook: a `Box<dyn FnMut>` is neither `Clone` nor
-/// `Debug`. The hook is AUDIO-tier transport plumbing, not register state — a
-/// COW fork / byte-exact path legitimately starts with NO audio subscriber, so
-/// `clone()` drops it (→ `None`). This keeps the in-tick fastsid register engine
-/// byte-exact and the hook strictly additive + zero-cost when `None`.
+/// Spec 855 D4 — `Clone` and `Debug` are DERIVED again. They used to be written
+/// by hand because this struct carried the audio `write_trace` hook, and a
+/// `Box<dyn FnMut>` is neither. The hook has moved to `Machine` as [`SidTrace`]:
+/// with several chips a subscriber wants to know WHICH one wrote, and installing
+/// one hook per engine would mean re-installing on every firmware remap. The
+/// engine is back to being only what the 6502 can see.
+#[derive(Clone, Debug)]
 pub struct Sid6581 {
     pub voices: [Voice; 3],
-    /// Optional AUDIO subscriber, invoked on every register `write(reg, value)`
-    /// (reg already masked to 0x00..0x1f). 1:1 with the TS `sid.ts` `writeTrace`:
-    /// the reSID audio engine subscribes here to feed its write-stream. `None`
-    /// on all trace / byte-exact / snapshot paths (zero cost). Not part of the
-    /// register state — never serialized, dropped on clone.
-    pub write_trace: Option<Box<dyn FnMut(u8, u8) + Send>>,
-}
-
-impl Clone for Sid6581 {
-    /// Clones the register/voice state only; the audio hook is transport-level
-    /// and intentionally NOT carried to the clone (forks start audio-silent).
-    fn clone(&self) -> Self {
-        Self { voices: self.voices.clone(), write_trace: None }
-    }
-}
-
-impl core::fmt::Debug for Sid6581 {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Sid6581")
-            .field("voices", &self.voices)
-            .field("write_trace", &self.write_trace.as_ref().map(|_| "Some(<fn>)"))
-            .finish()
-    }
 }
 
 impl Sid6581 {
     /// Create at power-on defaults (voices zeroed, LFSR seeded with NSEED).
     pub fn new() -> Self {
-        Self { voices: [Voice::new(), Voice::new(), Voice::new()], write_trace: None }
+        Self { voices: [Voice::new(), Voice::new(), Voice::new()] }
     }
 
     /// VICE: fastsid_reset() — clear all voice state to power-on defaults.
@@ -204,12 +182,6 @@ impl Sid6581 {
     /// as the TS `Resid.reset()` keeping its `writeTrace`).
     pub fn reset(&mut self) {
         self.voices = [Voice::new(), Voice::new(), Voice::new()];
-    }
-
-    /// Install (or clear) the AUDIO write-trace subscriber. 1:1 with the TS
-    /// `sid.ts` `set writeTrace`. Additive: `None` ⇒ zero-cost, byte-exact.
-    pub fn set_write_trace(&mut self, hook: Option<Box<dyn FnMut(u8, u8) + Send>>) {
-        self.write_trace = hook;
     }
 
     // ── Register write dispatch ────────────────────────────────────────────────
@@ -224,14 +196,10 @@ impl Sid6581 {
     /// filter/volume registers 0x15-0x18 and read-only 0x19-0x1f are no-ops here
     /// (caller stores the raw byte into the shadow; we model no filter audio).
     pub fn write(&mut self, reg: usize, value: u8, regs: &[u8; 32]) {
-        // AUDIO tier (additive, zero-cost when None): notify the reSID write
-        // stream of EVERY register write, in CPU order — 1:1 with the TS
-        // `sid.ts` writeTrace. reSID needs filter/vol writes too, so this fires
-        // for all regs, before the fastsid voice dispatch below. Does NOT touch
-        // the byte-exact register engine.
-        if let Some(hook) = self.write_trace.as_mut() {
-            hook(reg as u8 & 0x1f, value);
-        }
+        // Spec 855 D4 — the audio subscriber used to be notified HERE. It now
+        // lives on `Machine` as `SidTrace` and is fired by the paths that know
+        // which chip they are writing to and at which cycle: the bus dispatch
+        // and `poke_io`. This engine is once again only what the 6502 sees.
         match reg {
             0x00..=0x06 => self.apply_voice_write(0, reg, value, regs),
             0x07..=0x0d => self.apply_voice_write(1, reg - 7, value, regs),
@@ -670,5 +638,63 @@ mod spec855_tests {
     fn the_first_matching_window_wins() {
         let map = [SidMapping::window(0xde00, 1, false), SidMapping::window(0xde00, 3, false)];
         assert_eq!(resolve_sid(&map, 0xde05), Some((1, 0x05)), "the order the host gave");
+    }
+}
+
+// ── Spec 855 D4 — the write trace ─────────────────────────────────────────────
+
+/// The audio subscriber: every SID register write, in CPU order, as
+/// `(chip, reg, value, clk)`.
+///
+/// Until 855 this was `FnMut(u8, u8)` living on `Sid6581` — register and value,
+/// with neither the chip nor the cycle. With one SID that was enough. With
+/// several it is not: a host cannot tell which engine to clock, which is UE2's
+/// "gap 3", and it had been pairing the hook with an observer just to recover
+/// the cycle.
+///
+/// The ADDRESS is deliberately not passed. The host built the decode table, so
+/// chip plus register gives it back, and passing both invites them to disagree.
+///
+/// WHY IT LIVES ON THE MACHINE AND NOT ON THE ENGINE. Per engine, a host would
+/// have to install N hooks and re-install them every time the firmware remaps —
+/// and `Sid6581::write` is reached from the bus, from `poke_io` and from the
+/// isolated `SidBus`, so moving the call to the bus dispatch instead would
+/// silently stop tracing host pokes. A monitor write to `$D418` would go quiet
+/// without anything reporting it. One hook, at the machine, fired by every path
+/// that reaches a register file.
+///
+/// A newtype rather than a bare field because `Box<dyn FnMut>` is not `Clone`
+/// and `Machine`'s `#[derive(Clone)]` is load-bearing — it is the COW fork base.
+/// Cloning drops the subscriber, exactly as `Sid6581` already does: a fork
+/// starts audio-silent, which is the honest default for a branch nobody is
+/// listening to.
+#[derive(Default)]
+pub struct SidTrace(pub Option<Box<dyn FnMut(u8, u8, u8, u64) + Send>>);
+
+impl SidTrace {
+    /// Fire the hook if one is installed. Zero cost when `None`.
+    #[inline]
+    pub fn fire(&mut self, chip: u8, reg: usize, value: u8, clk: u64) {
+        if let Some(hook) = self.0.as_mut() {
+            hook(chip, (reg as u8) & 0x1f, value, clk);
+        }
+    }
+
+    #[inline]
+    pub fn is_installed(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+impl Clone for SidTrace {
+    /// Transport plumbing, not register state: a clone carries no subscriber.
+    fn clone(&self) -> Self {
+        Self(None)
+    }
+}
+
+impl core::fmt::Debug for SidTrace {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("SidTrace").field(&self.0.as_ref().map(|_| "Some(<fn>)")).finish()
     }
 }

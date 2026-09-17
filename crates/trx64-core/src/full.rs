@@ -179,6 +179,8 @@ pub struct FullBus<'a> {
     /// Spec 855 D2 — the host's decode table. Empty means the pre-855 machine:
     /// `$D400-$D7FF` mirrored onto chip 0 and nothing claimed in `$DE00-$DFFF`.
     pub sid_map: &'a [crate::sid::SidMapping],
+    /// Spec 855 D4 — the machine's audio subscriber, borrowed for this run.
+    pub sid_trace: &'a mut crate::sid::SidTrace,
     /// Live memconfig (selected by $00/$01 writes).
     pub config: MemConfig,
     pub memconfig_table: &'a [MemConfig; 32],
@@ -718,6 +720,11 @@ impl<'a> FullBus<'a> {
     /// chip 0 has always done it.
     #[inline]
     fn sid_chip_write(&mut self, chip: u8, reg: usize, value: u8) {
+        // Spec 855 D4 — every bus write to a SID register, in CPU order, with the
+        // chip that took it and the cycle it happened on. Before the dispatch, as
+        // the engine-level hook it replaces also fired before its voice write.
+        // Both address ranges land here, so this is the one place the bus needs.
+        self.sid_trace.fire(chip, reg, value, self.clk);
         if chip == 0 {
             self.sid_regs[reg] = value;
             self.sid.write(reg, value, self.sid_regs);
@@ -1124,6 +1131,7 @@ mod joystick_gate_tests {
         tab: &'a [u16; CIAT_TABLEN],
         sid_regs: &'a mut [u8; 32],
         sid: &'a mut Sid6581,
+        sid_trace: &'a mut crate::sid::SidTrace,
         mct: &'a [MemConfig; 32],
         drive: &'a mut crate::drive::Drive1541,
         iec: &'a mut crate::iec::IecCore,
@@ -1148,6 +1156,7 @@ mod joystick_gate_tests {
             // parameters nobody would pass.
             sid_extra: &mut [],
             sid_map: &[],
+            sid_trace,
             config: mct[0x1f],
             memconfig_table: mct,
             port_dir: 0x2f,
@@ -1192,6 +1201,7 @@ mod joystick_gate_tests {
         let tab = crate::cia::new_table();
         let mut sid_regs = [0u8; 32];
         let mut sid = Sid6581::new();
+        let mut sid_trace = crate::sid::SidTrace::default();
         let mct = build_memconfig_table();
         let mut drive = crate::drive::Drive1541::new();
         let mut iec = crate::iec::IecCore::new();
@@ -1201,7 +1211,7 @@ mod joystick_gate_tests {
         {
             let mut bus = make_bus(
                 &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
-                &mut cia2, &tab, &mut sid_regs, &mut sid, &mct, &mut drive, &mut iec,
+                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mct, &mut drive, &mut iec,
                 &kb, JoystickState::default(), JoystickState::default(),
             );
             assert_eq!(bus.io_read(0xdc00), 0xff, "released joy2 → all PA bits high");
@@ -1211,7 +1221,7 @@ mod joystick_gate_tests {
             let joy2 = JoystickState { fire: true, ..Default::default() };
             let mut bus = make_bus(
                 &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
-                &mut cia2, &tab, &mut sid_regs, &mut sid, &mct, &mut drive, &mut iec,
+                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mct, &mut drive, &mut iec,
                 &kb, JoystickState::default(), joy2,
             );
             assert_eq!(bus.io_read(0xdc00), 0xff & !(1 << 4), "joy2 fire → PA bit4 low");
@@ -1221,7 +1231,7 @@ mod joystick_gate_tests {
             let joy2 = JoystickState { up: true, left: true, ..Default::default() };
             let mut bus = make_bus(
                 &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
-                &mut cia2, &tab, &mut sid_regs, &mut sid, &mct, &mut drive, &mut iec,
+                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mct, &mut drive, &mut iec,
                 &kb, JoystickState::default(), joy2,
             );
             assert_eq!(bus.io_read(0xdc00), 0xff & !0x05, "joy2 up+left → PA bits 0+2 low");
@@ -1255,6 +1265,7 @@ mod joystick_gate_tests {
         let tab = crate::cia::new_table();
         let mut sid_regs = [0u8; 32];
         let mut sid = Sid6581::new();
+        let mut sid_trace = crate::sid::SidTrace::default();
         let mct = build_memconfig_table();
         let mut drive = crate::drive::Drive1541::new();
         let mut iec = crate::iec::IecCore::new();
@@ -1264,7 +1275,7 @@ mod joystick_gate_tests {
 
         let mut bus = make_bus(
             &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
-            &mut cia2, &tab, &mut sid_regs, &mut sid, &mct, &mut drive, &mut iec,
+            &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mct, &mut drive, &mut iec,
             &kb, JoystickState::default(), JoystickState::default(),
         );
 
@@ -1307,6 +1318,7 @@ mod joystick_gate_tests {
         let tab = crate::cia::new_table();
         let mut sid_regs = [0u8; 32];
         let mut sid = Sid6581::new();
+        let mut sid_trace = crate::sid::SidTrace::default();
         let mct = build_memconfig_table();
         let mut drive = crate::drive::Drive1541::new();
         let mut iec = crate::iec::IecCore::new();
@@ -1315,7 +1327,7 @@ mod joystick_gate_tests {
         {
             let mut bus = make_bus(
                 &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
-                &mut cia2, &tab, &mut sid_regs, &mut sid, &mct, &mut drive, &mut iec,
+                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mct, &mut drive, &mut iec,
                 &kb, JoystickState::default(), JoystickState::default(),
             );
             assert_eq!(bus.io_read(0xdc01), 0xff, "released joy1 → all PB bits high");
@@ -1325,7 +1337,7 @@ mod joystick_gate_tests {
             let joy1 = JoystickState { right: true, ..Default::default() };
             let mut bus = make_bus(
                 &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
-                &mut cia2, &tab, &mut sid_regs, &mut sid, &mct, &mut drive, &mut iec,
+                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mct, &mut drive, &mut iec,
                 &kb, joy1, JoystickState::default(),
             );
             assert_eq!(bus.io_read(0xdc01), 0xff & !(1 << 3), "joy1 right → PB bit3 low");
@@ -1335,7 +1347,7 @@ mod joystick_gate_tests {
             let joy1 = JoystickState { down: true, fire: true, ..Default::default() };
             let mut bus = make_bus(
                 &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
-                &mut cia2, &tab, &mut sid_regs, &mut sid, &mct, &mut drive, &mut iec,
+                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mct, &mut drive, &mut iec,
                 &kb, joy1, JoystickState::default(),
             );
             assert_eq!(bus.io_read(0xdc01), 0xff & !0x12, "joy1 down+fire → PB bits 1+4 low");
