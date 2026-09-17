@@ -39,7 +39,11 @@ The gates exist **as `cargo test`**. The only gap = nobody is *forced* to run th
   non-blocking / at a baseline and flag the cleanup as follow-up** (do not red the
   whole gate on legacy warnings),
 - `cargo test` for the gate tests (`seven_game_gate`, `iso_vic_gate`,
-  `vic_collision_gate`, `cart_mapper_gate`) — release profile,
+  `vic_collision_gate`, `cart_mapper_gate`) — release profile. That list was the one this
+  spec shipped with. It has grown: `scripts/gate.sh` now runs thirteen unit suites plus the
+  seven-game gate — the expansion port, u64 turbo, the turbo fast path, the CIA alarm check,
+  UCI, REU, CIA TOD, multi-SID, the snapshot round-trip and the reSID oracle joined it.
+  **`scripts/gate.sh` is the authority, never this line.**
 - the `tools/oracle` conformance run (node),
 - screenshot compare vs `traces/gate_*_trx64.png` (if not already inside the game gate).
 One command, GREEN/RED, quiet on green, first-failure-loud on red.

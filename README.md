@@ -143,6 +143,20 @@ For embedding in the Apple universe, `trx64-ffi` exposes a typed uniffi library 
 **Formats:** `.c64re` machine snapshot, `.c64rering` reverse-debug buffers, `.c64retrace`
 trace log. VICE `.vsf` imports, `.reu` images load with `--reu-image`.
 
+### Environment switches
+
+Everything below is read once, when a machine is built. Each defaults to ON and is turned off
+with `0`, `off`, `false` or `no` — they exist to take a feature out of the hot path, or to put
+the old behaviour back when something misbehaves.
+
+| variable | default | what it does |
+|---|---|---|
+| `TRX64_CPUHISTORY` | on | The always-on reverse-debug rings: the last N instructions (`chis`) and the full-delta undo ring behind `reverse_step` / `who_wrote`. Off means both are inert — no recording, no reverse step, no ring dump. The per-frame checkpoint ring and its rewind transport are a different thing and stay. |
+| `TRX64_REVERSE_SECONDS` | `10` | How deep those rings reach, in seconds of a 1 MHz machine. At turbo the same ring covers that many seconds of CPU time, so at 64 MHz it is about a sixtieth of the wall time. |
+| `TRX64_TURBO_FASTPATH` | on | Spec 856. Above 1 MHz, instructions that neither advance the PHI2 clock nor touch anything but RAM run back to back inside one bus. No effect at 1 MHz. |
+| `TRX64_CIA_ALARM_CHECK` | on | Spec 857. Catch a CIA up only when one of its timer alarms is due, as VICE's core does, instead of on every instruction and every cycle. |
+| `TRX64_BIND` | `127.0.0.1` | The address the daemon binds. `0.0.0.0` in the container image. |
+
 ---
 
 ## What to expect

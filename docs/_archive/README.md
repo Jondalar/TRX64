@@ -262,6 +262,8 @@ at once. So the gate also freezes digests of the pre-857 behaviour. They earned 
 caught the `Cia::clk` mistake immediately, and the restore case diverged at 64 MHz on untouched
 code — checkpoints did not carry the turbo phase, a defect since 851, fixed in its own commit.
 
-**Open at merge:** UE2's single run puts the CHECK-OFF path slightly above pre-857, which would
-be the preparation's cost on the kill-switch path. Nobody has measured it with the alternating
-worktree A/B.
+**Measured after the release, alternating against a `v0.7.2` worktree:** +18 % warp throughput on
+a stock 1 MHz machine (4 of 4 pairs), and with the check switched off **6 % below 0.7.2** (3 of
+3). The preparation is not free, so the kill switch is a fallback for behaviour, not a way back
+to the old speed — UE2 had seen the same in their measurement and could not separate it from
+noise.

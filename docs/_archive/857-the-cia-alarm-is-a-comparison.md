@@ -175,12 +175,22 @@ check off and on, and the demo's audio judged clean by ear on the 857 build. The
 between two runs of the SAME build: the picture cycles palettes and the phase follows the start
 timing.
 
-**Open, and measured by nobody yet: the check-off path looks slower than before 857.** UE2's
-third row sits above run D in every window and dips below real time in the last one. If that is
-real it is D2's cost — `update_tb` now dispatches alarms and arms lazily where it only settled a
-counter before — and it would mean the kill switch is worse than the code it falls back to. One
-run each and `ps` noise cannot tell them apart; it needs the alternating worktree A/B against
-`main`.
+**Measured against 0.7.2 after the release** (`bench_pure_headless`, 10 M cycles, a worktree at
+`v0.7.2` and this tree alternated, the host busy with other work so only the pairing counts):
+
+| | 0.7.2 | 0.7.3 | |
+|---|---|---|---|
+| default | 11.23 / 11.03 / 11.26 / 11.12 MHz | **13.30 / 13.10 / 13.18 / 13.16 MHz** | **+18 %, 4 of 4 pairs** |
+| `TRX64_CIA_ALARM_CHECK=0` | 11.06 / 11.06 / 10.97 MHz | 10.07 / 10.50 / 10.32 MHz | **−6 %, 3 of 3 pairs** |
+
+So the headline against the previous release is **+18 %**, not the +27 % the check-off row
+suggests — that row is D2 without D3, and it is **slower than 0.7.2 by about 6 %**. UE2 saw the
+same thing in their E2 row and could not separate it from `ps` noise; it is real.
+
+**That makes the kill switch a fallback, not an equivalent.** Turning the check off does not
+restore 0.7.2's speed, it lands below it, because Timer B's alarm dispatch and the lazy arming
+stay on both paths. Fine for what a kill switch is for — getting behaviour back when something
+misbehaves — and worth knowing before anyone reaches for it as a performance control.
 
 **Also open:** the lazy-arm clause in `alarm_due` means a Timer B counting Timer A underflows
 with nothing pending still catches up every time — correct, and no faster than before, for the

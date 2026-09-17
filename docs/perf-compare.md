@@ -32,6 +32,20 @@ either side; the harness is bench/test/doc only.
 MHz = emulated-C64 MHz = cycles ÷ wall-seconds ÷ 1e6. Real-time multiple =
 emulated MHz ÷ 0.985248 MHz (PAL master clock).
 
+> **Dated. Re-measured 2026-09-17 on TRX64 0.7.3** (`bench_pure_headless`, alternating against a
+> worktree at `v0.7.2`, 10 M cycles, on a host that was NOT idle — other work was running, so
+> only the pairing is meaningful, never the absolute number):
+>
+> | | 0.7.2 | 0.7.3 |
+> |---|---|---|
+> | pure headless | 11.03–11.26 MHz | **13.10–13.30 MHz** (+18 %, 4 of 4 pairs) |
+>
+> Spec 857 is the difference: the CIA alarm became a comparison. **The c64re side of the table
+> above cannot be re-run** — the TypeScript core was deleted in Spec 806 — so the ratio column
+> stays a record of what was measured in August 2026 and is not a current claim. The absolute
+> TRX64 figure in the table (13.435 MHz) was taken on an idle machine and should be compared
+> only with other idle-machine numbers.
+
 **Per-side detail (median of timed runs):**
 
 | side | workload | budget (cyc) | wall (s) | MHz | notes |
