@@ -268,6 +268,9 @@ pub struct FullBus<'a> {
     /// boundary restamp. Conservative on purpose: a false positive costs one sync, a
     /// missed one storms every handler.
     pub io_touched: bool,
+    /// Spec 857 D4 — `Machine::cia_alarm_check` for this run: `process_alarms` compares
+    /// against the CIAs' predicted alarm clocks instead of catching them up every time.
+    pub cia_alarm_check: bool,
 }
 
 impl<'a> FullBus<'a> {
@@ -1215,6 +1218,7 @@ mod joystick_gate_tests {
             host_lines: crate::expansion::PortLines::default(),
             port_active: false,
             io_touched: false,
+            cia_alarm_check: false,
         }
     }
 

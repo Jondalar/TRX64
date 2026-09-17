@@ -609,6 +609,10 @@ pub struct Machine {
     /// every instruction advances `clk`. Env kill-switch `TRX64_TURBO_FASTPATH=0`, read at
     /// `Machine::new`; the field can be flipped at any time.
     pub turbo_fast_path: bool,
+    /// Spec 857 D4 — check CIA alarms by comparison, as VICE does, instead of catching both
+    /// timers up to the clock in every instruction prologue and every cycle. Env kill-switch
+    /// `TRX64_CIA_ALARM_CHECK=0`, read at `Machine::new`; the field can be flipped at any time.
+    pub cia_alarm_check: bool,
     /// Spec 784 loader-lens — armed-on-command 1541 disk-mechanism head trace. OFF by
     /// default (does NOT run with the always-on CPU ring). When armed, a `(drv_clk,
     /// halftrack, sector)` sample is pushed whenever the sector under the head changes,
@@ -785,6 +789,10 @@ impl Machine {
             delta_ring: crate::delta_ring::DeltaRing::new(),
             turbo_fast_path: !matches!(
                 std::env::var("TRX64_TURBO_FASTPATH").map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+                Ok("0") | Ok("off") | Ok("false") | Ok("no")
+            ),
+            cia_alarm_check: !matches!(
+                std::env::var("TRX64_CIA_ALARM_CHECK").map(|v| v.trim().to_ascii_lowercase()).as_deref(),
                 Ok("0") | Ok("off") | Ok("false") | Ok("no")
             ),
             head_trace_armed: false,
@@ -1401,6 +1409,7 @@ impl Machine {
             host_lines: self.expansion_host_lines,
             port_active,
             io_touched: false,
+            cia_alarm_check: self.cia_alarm_check,
         };
         fb.write(addr, val);
         self.memconfig = fb.config;
@@ -1465,6 +1474,7 @@ impl Machine {
             host_lines: self.expansion_host_lines,
             port_active,
             io_touched: false,
+            cia_alarm_check: self.cia_alarm_check,
         };
         let v = fb.read(addr);
         self.memconfig = fb.config;
@@ -1771,6 +1781,7 @@ impl Machine {
                 host_lines: self.expansion_host_lines,
                 port_active,
                 io_touched: false,
+                cia_alarm_check: self.cia_alarm_check,
             };
             // Same reason as `port_find_mut`: with a second device on the port the box
             // taken here is the chain, and a bare downcast would arm a transfer that then
@@ -1940,6 +1951,8 @@ impl Machine {
         }
         let clk = self.c64_core.clk;
         if chips {
+            self.cia1.checked_clk = clk;
+            self.cia2.checked_clk = clk;
             self.cia1.update_to(clk, &table);
             self.cia2.update_to(clk, &table);
             self.sid.tick(clk.wrapping_sub(start), &self.sid_regs);
@@ -2909,8 +2922,16 @@ impl Machine {
             // set_irq_line semantics, which stamped at self.clk; the SC core's
             // set_irq/set_nmi re-stamp only on the nirq/nnmi 0→1 edge).
             let now = self.c64_core.clk;
-            self.cia1.update_to(now, &table);
-            self.cia2.update_to(now, &table);
+            self.cia1.checked_clk = now;
+            self.cia2.checked_clk = now;
+            // Spec 857 D3 — the same comparison as `process_alarms`. The restamp below stays
+            // unconditional: it carries an acknowledge made inside the last PHI2 cycle (856 §3).
+            if !self.cia_alarm_check || self.cia1.alarm_due(now) {
+                self.cia1.update_to(now, &table);
+            }
+            if !self.cia_alarm_check || self.cia2.alarm_due(now) {
+                self.cia2.update_to(now, &table);
+            }
             self.c64_int.set_irq(c64_6510core::INT_SRC_VIC, self.vic.irq_line, now);
             self.c64_int.set_irq(c64_6510core::INT_SRC_CIA1, self.cia1.irq_asserted(), now);
             self.c64_int.set_nmi(c64_6510core::INT_SRC_CIA2, self.cia2.irq_asserted(), now);
@@ -2986,6 +3007,7 @@ impl Machine {
                     host_lines: self.expansion_host_lines,
                     port_active,
                     io_touched: false,
+                    cia_alarm_check: self.cia_alarm_check,
                 };
                 let mut bus = full_sc::FullScBus {
                     fb,

@@ -402,8 +402,19 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
     #[inline]
     fn process_alarms(&mut self, clk: u64) {
         let table: &[u16; CIAT_TABLEN] = self.fb.cia_table;
-        self.fb.cia1.update_to(clk, table);
-        self.fb.cia2.update_to(clk, table);
+        self.fb.cia1.checked_clk = clk;
+        self.fb.cia2.checked_clk = clk;
+        // Spec 857 D3 — VICE compares against the next pending alarm here and dispatches only
+        // what is due (`6510dtvcore.c` prologue, `mainc64cpu.c:99`). Catching both timers up
+        // every time is its register-access path, and at 64 MHz it ran ~36 times per PHI2
+        // cycle. Nothing due means nothing a reader could see without catching up itself.
+        let check = self.fb.cia_alarm_check;
+        if !check || self.fb.cia1.alarm_due(clk) {
+            self.fb.cia1.update_to(clk, table);
+        }
+        if !check || self.fb.cia2.alarm_due(clk) {
+            self.fb.cia2.update_to(clk, table);
+        }
     }
 
     /// PER-CYCLE line levels the SC core samples inside `clk_inc` to stamp the
