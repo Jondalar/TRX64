@@ -168,9 +168,17 @@ pub struct FullBus<'a> {
     pub cia2: &'a mut Cia,
     pub cia_table: &'a [u16; CIAT_TABLEN],
     /// 32-byte SID register shadow ($D400-$D41F) — write-only store for parity.
+    /// Spec 855: this is CHIP 0, the one every existing path already names.
     pub sid_regs: &'a mut [u8; 32],
     /// SID 6581 oscillator + envelope state machine (for $D41B osc3 / $D41C env3).
+    /// Spec 855: chip 0's model.
     pub sid: &'a mut Sid6581,
+    /// Spec 855 D3 — chips 1.., each with its own register file and model.
+    /// Empty on a stock machine, and then nothing below costs anything.
+    pub sid_extra: &'a mut [crate::sid::SidChip],
+    /// Spec 855 D2 — the host's decode table. Empty means the pre-855 machine:
+    /// `$D400-$D7FF` mirrored onto chip 0 and nothing claimed in `$DE00-$DFFF`.
+    pub sid_map: &'a [crate::sid::SidMapping],
     /// Live memconfig (selected by $00/$01 writes).
     pub config: MemConfig,
     pub memconfig_table: &'a [MemConfig; 32],
@@ -402,8 +410,15 @@ impl<'a> FullBus<'a> {
                 // $D41B (OSC3) → voice-3 oscillator output MSB (live computed).
                 // $D41C (ENV3) → voice-3 envelope value (live computed).
                 // All other registers: write-only shadow byte (B-level round-trip).
-                let reg = (addr as usize - 0xd400) & 0x1f;
-                self.sid.read(reg, self.sid_regs)
+                //
+                // Spec 855: a host table may put another chip in this range, and
+                // OSC3/ENV3 are per chip. With no table this is chip 0 and the
+                // masking below is what it always was.
+                let (chip, reg) = match crate::sid::resolve_sid(self.sid_map, addr) {
+                    Some(hit) => hit,
+                    None => (0, (addr as usize - 0xd400) & 0x1f),
+                };
+                self.sid_chip_read(chip, reg)
             }
             0xd800..=0xdbff => {
                 // Color RAM: low nibble stored in `io` shadow, high nibble open bus ($F0).
@@ -511,6 +526,25 @@ impl<'a> FullBus<'a> {
             // no longer what this range READS.
             _ => {
                 if (0xde00..=0xdfff).contains(&addr) {
+                    // Spec 855 §7 — a host may map a SID in here, where it shares
+                    // the range with the expansion chain: a cartridge, the UCI,
+                    // the REU's mirror, a sampler. Which decode sits in front is
+                    // NOT settled — the U64-II top level that would show it is not
+                    // in the open firmware tree — so the host says so per window
+                    // and nothing is assumed here.
+                    //
+                    // `ahead_of_expansion` therefore means exactly what it says:
+                    // the SID answers first. The other way round the chain wins
+                    // outright and the SID is not consulted, which is the simple
+                    // reading — `port_read` resolves to a byte rather than an
+                    // Option, so "the chain first, the SID if nobody answered"
+                    // cannot be expressed without reshaping it. When somebody
+                    // reads the RTL, that is the decision to revisit.
+                    if let Some((chip, reg)) = crate::sid::resolve_sid(self.sid_map, addr) {
+                        if self.sid_map.iter().any(|m| m.contains(addr) && m.ahead_of_expansion) {
+                            return self.sid_chip_read(chip, reg);
+                        }
+                    }
                     // Spec 850 — the port's devices see the read too, and answer
                     // before the cartridge; with none attached this is the line above.
                     return self.port_read(addr);
@@ -579,9 +613,11 @@ impl<'a> FullBus<'a> {
         match addr {
             0xd000..=0xd3ff => self.vic.write_reg(addr as u8, value),
             0xd400..=0xd7ff => {
-                let reg = (addr as usize - 0xd400) & 0x1f;
-                self.sid_regs[reg] = value;
-                self.sid.write(reg, value, self.sid_regs);
+                let (chip, reg) = match crate::sid::resolve_sid(self.sid_map, addr) {
+                    Some(hit) => hit,
+                    None => (0, (addr as usize - 0xd400) & 0x1f),
+                };
+                self.sid_chip_write(chip, reg, value);
             }
             0xd800..=0xdbff => { /* color RAM: shadow already stored above */ }
             0xdc00..=0xdcff => self.cia1.write(addr, value, self.clk, self.cia_table),
@@ -647,6 +683,13 @@ impl<'a> FullBus<'a> {
                     // Spec 850 D2 — in addition to the cartridge, never instead of it:
                     // the device does not change whether the cartridge consumed it.
                     self.port_write(addr, value);
+                    // Spec 855 — and a SID mapped here takes it too, for the same
+                    // reason and by the same rule. A write reaches everything that
+                    // decodes the address; only READS have to pick a winner, which
+                    // is what `ahead_of_expansion` is for.
+                    if let Some((chip, reg)) = crate::sid::resolve_sid(self.sid_map, addr) {
+                        self.sid_chip_write(chip, reg, value);
+                    }
                 }
             }
         }
@@ -654,6 +697,39 @@ impl<'a> FullBus<'a> {
 }
 
 impl<'a> FullBus<'a> {
+    // ── Spec 855 — one of several SIDs ──────────────────────────────────────────────
+
+    /// Read register `reg` of `chip`. Chip 0 is the machine's own SID; anything
+    /// else indexes `sid_extra`. An out-of-range chip reads the open bus rather
+    /// than panicking: the table comes from a host, and a machine must not die
+    /// because someone mapped a chip it does not have.
+    #[inline]
+    fn sid_chip_read(&mut self, chip: u8, reg: usize) -> u8 {
+        if chip == 0 {
+            return self.sid.read(reg, self.sid_regs);
+        }
+        match self.sid_extra.get(chip as usize - 1) {
+            Some(c) => c.engine.read(reg, &c.regs),
+            None => 0xff,
+        }
+    }
+
+    /// Write register `reg` of `chip`, shadow first then the model, exactly as
+    /// chip 0 has always done it.
+    #[inline]
+    fn sid_chip_write(&mut self, chip: u8, reg: usize, value: u8) {
+        if chip == 0 {
+            self.sid_regs[reg] = value;
+            self.sid.write(reg, value, self.sid_regs);
+            return;
+        }
+        if let Some(c) = self.sid_extra.get_mut(chip as usize - 1) {
+            c.regs[reg] = value;
+            let regs = c.regs;
+            c.engine.write(reg, value, &regs);
+        }
+    }
+
     // ── Spec 850 — the expansion port's devices ─────────────────────────────────────
 
     #[inline]
@@ -1067,6 +1143,11 @@ mod joystick_gate_tests {
             cia_table: tab,
             sid_regs,
             sid,
+            // Spec 855 — this helper is a chip-0 bus and has no callers in the
+            // tree; empty slices keep it honest rather than growing it two
+            // parameters nobody would pass.
+            sid_extra: &mut [],
+            sid_map: &[],
             config: mct[0x1f],
             memconfig_table: mct,
             port_dir: 0x2f,

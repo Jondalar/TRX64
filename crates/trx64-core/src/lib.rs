@@ -503,6 +503,14 @@ pub struct Machine {
     /// Ticked per instruction in `run_for_full` and `run_for_sid*` paths.
     /// The register file lives in `sid_regs`; this struct holds internal state.
     pub sid: Sid6581,
+    /// Spec 855 D3 — SID chips 1.., each with its own register file and model.
+    /// Chip 0 is `sid_regs` + `sid` above; this is empty on a stock machine.
+    pub sid_extra: Vec<crate::sid::SidChip>,
+    /// Spec 855 D2 — the host's decode table, set through `set_sid_map`. Empty
+    /// means the pre-855 machine. A cold reset does NOT clear it (see
+    /// `cold_reset`), because the firmware that owns it rewrites it on every
+    /// reset and a self-clearing table would race that.
+    pub sid_map: Vec<crate::sid::SidMapping>,
     /// CPU-port latches ($00 direction / $01 value). Power-on $2F / $37.
     pub port_dir: u8,
     pub port_data: u8,
@@ -736,6 +744,8 @@ impl Machine {
             io_shadow: Box::new([0u8; 0x1000]),
             sid_regs: [0u8; 32],
             sid: Sid6581::new(),
+            sid_extra: Vec::new(),
+            sid_map: Vec::new(),
             port_dir: 0x2f,
             port_data: 0x37,
             memconfig: full::build_memconfig_table()[0x1f],
@@ -1081,6 +1091,13 @@ impl Machine {
         // SID: reset register file + voice state to power-on defaults.
         self.sid_regs = [0u8; 32];
         self.sid.reset();
+        // Spec 855 D3 — every other chip takes the same reset. The DECODE TABLE
+        // deliberately does not: on a U64 the firmware rewrites it in its own
+        // reset task, and a table that cleared itself here would race that and
+        // leave the C64 addressing chips that had just vanished.
+        for chip in self.sid_extra.iter_mut() {
+            chip.reset();
+        }
         // reverse-debug Phase 1a — a cold reset is a timeline boundary: drop the
         // CPU-history ring so `chis` never presents pre-reset instructions as
         // continuous with the fresh boot (report the boundary, don't fake it). The
@@ -1165,15 +1182,77 @@ impl Machine {
     /// the I/O shadow. This lets a render scenario program the VIC + colour RAM on
     /// the CPU-isolated (flat-bus) inject path, where ordinary `STA $D0xx` would
     /// land in RAM instead of the chip. Out-of-range addresses fall back to RAM.
+    // ── Spec 855 D2 — the host's SID decode table ───────────────────────────────
+    //
+    // The host resolves its own hardware and hands the result over; this crate
+    // never learns what a U64 register is. Nothing here bakes in VICE's
+    // `Sid2..8AddressStart` defaults: an empty table is the pre-855 machine.
+
+    /// Install the decode table, growing the chip list to cover it.
+    ///
+    /// Callable at any time — on a U64 the firmware rewrites the mapping in its
+    /// reset task, so this is not a construction-time decision. Chips are only
+    /// ever ADDED here: shrinking on a remap would throw away a chip's state
+    /// because the host happened to move an address.
+    pub fn set_sid_map(&mut self, map: Vec<crate::sid::SidMapping>) {
+        let needed = map.iter().map(|m| m.chip as usize).max().unwrap_or(0);
+        while self.sid_extra.len() < needed {
+            self.sid_extra.push(crate::sid::SidChip::new());
+        }
+        self.sid_map = map;
+    }
+
+    /// The table as it stands.
+    pub fn sid_map(&self) -> &[crate::sid::SidMapping] {
+        &self.sid_map
+    }
+
+    /// How many SIDs this machine has, chip 0 included. Always at least 1.
+    pub fn sid_chip_count(&self) -> usize {
+        1 + self.sid_extra.len()
+    }
+
+    /// Read a chip's register shadow without side effects — the monitor's view.
+    /// `None` for a chip that does not exist.
+    pub fn sid_chip_regs(&self, chip: u8) -> Option<&[u8; 32]> {
+        if chip == 0 {
+            return Some(&self.sid_regs);
+        }
+        self.sid_extra.get(chip as usize - 1).map(|c| &c.regs)
+    }
+
+    /// Spec 855 D6 — a voice's envelope level, 0..255, for a host that drives an
+    /// LED strip or any other cosmetic readout. This is the fastsid model's
+    /// value, the one that already answers `$D41C`; reSID keeps its own and the
+    /// two will not agree to the last bit.
+    pub fn sid_envelope(&self, chip: u8, voice: usize) -> Option<u8> {
+        if voice >= 3 {
+            return None;
+        }
+        if chip == 0 {
+            return Some(self.sid.voices[voice].adsr_value);
+        }
+        self.sid_extra.get(chip as usize - 1).map(|c| c.engine.voices[voice].adsr_value)
+    }
+
     pub fn poke_io(&mut self, addr: u16, bytes: &[u8]) {
         for (i, b) in bytes.iter().enumerate() {
             let a = addr.wrapping_add(i as u16);
             match a {
                 0xd000..=0xd3ff => self.vic.write_reg(a as u8, *b),
                 0xd400..=0xd7ff => {
-                    let reg = (a as usize - 0xd400) & 0x1f;
-                    self.sid_regs[reg] = *b;
-                    self.sid.write(reg, *b, &self.sid_regs);
+                    let (chip, reg) = match crate::sid::resolve_sid(&self.sid_map, a) {
+                        Some(hit) => hit,
+                        None => (0, (a as usize - 0xd400) & 0x1f),
+                    };
+                    if chip == 0 {
+                        self.sid_regs[reg] = *b;
+                        self.sid.write(reg, *b, &self.sid_regs);
+                    } else if let Some(c) = self.sid_extra.get_mut(chip as usize - 1) {
+                        c.regs[reg] = *b;
+                        let regs = c.regs;
+                        c.engine.write(reg, *b, &regs);
+                    }
                 }
                 0xd800..=0xdbff => {
                     // Colour RAM: only the low nibble is stored, in the I/O shadow.
@@ -1223,6 +1302,8 @@ impl Machine {
             cia_table: &table,
             sid_regs: &mut self.sid_regs,
             sid: &mut self.sid,
+            sid_extra: &mut self.sid_extra,
+            sid_map: &self.sid_map,
             config: self.memconfig,
             memconfig_table: &self.memconfig_table,
             port_dir: self.port_dir,
@@ -1284,6 +1365,8 @@ impl Machine {
             cia_table: &table,
             sid_regs: &mut self.sid_regs,
             sid: &mut self.sid,
+            sid_extra: &mut self.sid_extra,
+            sid_map: &self.sid_map,
             config: self.memconfig,
             memconfig_table: &self.memconfig_table,
             port_dir: self.port_dir,
@@ -1586,6 +1669,8 @@ impl Machine {
                 cia_table: &table,
                 sid_regs: &mut self.sid_regs,
                 sid: &mut self.sid,
+                sid_extra: &mut self.sid_extra,
+                sid_map: &self.sid_map,
                 config: self.memconfig,
                 memconfig_table: &self.memconfig_table,
                 port_dir: self.port_dir,
@@ -1834,7 +1919,18 @@ impl Machine {
                 match addr {
                     0xd000..=0xd3ff => self.vic.write_reg(addr as u8, old),
                     0xd400..=0xd7ff => {
-                        self.sid_regs[(addr as usize - 0xd400) & 0x1f] = old;
+                        // Spec 855 — undo the byte in the chip that took it. Putting
+                        // a second chip's write back into chip 0's shadow would
+                        // corrupt both, silently, and only while rewinding.
+                        match crate::sid::resolve_sid(&self.sid_map, addr) {
+                            Some((chip, reg)) if chip != 0 => {
+                                if let Some(c) = self.sid_extra.get_mut(chip as usize - 1) {
+                                    c.regs[reg] = old;
+                                }
+                            }
+                            Some((_, reg)) => self.sid_regs[reg] = old,
+                            None => self.sid_regs[(addr as usize - 0xd400) & 0x1f] = old,
+                        }
                     }
                     0xd800..=0xdbff => {
                         self.io_shadow[(addr as usize) - 0xd000] = old & 0x0f;
@@ -2177,7 +2273,15 @@ impl Machine {
                         0xd000..=0xd3ff => {
                             self.vic.u64_extra_read(addr).unwrap_or_else(|| self.vic.read_reg(addr as u8))
                         }
-                        0xd400..=0xd7ff => self.sid_regs[(addr as usize - 0xd400) & 0x1f],
+                        // Spec 855: a peek shows the register shadow of whichever
+                        // chip owns the address — and only the shadow, because a
+                        // peek has no side effects and never runs a model.
+                        0xd400..=0xd7ff => match crate::sid::resolve_sid(&self.sid_map, addr) {
+                            Some((chip, reg)) => {
+                                self.sid_chip_regs(chip).map(|r| r[reg]).unwrap_or(0xff)
+                            }
+                            None => self.sid_regs[(addr as usize - 0xd400) & 0x1f],
+                        },
                         0xd800..=0xdbff => (self.io_shadow[(addr as usize) - 0xd000] & 0x0f) | 0xf0,
                         0xdc00..=0xdcff => self.cia1_pin_peek(addr),
                         0xdd00..=0xddff => self.cia2_pin_peek(addr),
@@ -2238,7 +2342,15 @@ impl Machine {
                         0xd000..=0xd3ff => {
                             self.vic.u64_extra_read(addr).unwrap_or_else(|| self.vic.read_reg(addr as u8))
                         }
-                        0xd400..=0xd7ff => self.sid_regs[(addr as usize - 0xd400) & 0x1f],
+                        // Spec 855: a peek shows the register shadow of whichever
+                        // chip owns the address — and only the shadow, because a
+                        // peek has no side effects and never runs a model.
+                        0xd400..=0xd7ff => match crate::sid::resolve_sid(&self.sid_map, addr) {
+                            Some((chip, reg)) => {
+                                self.sid_chip_regs(chip).map(|r| r[reg]).unwrap_or(0xff)
+                            }
+                            None => self.sid_regs[(addr as usize - 0xd400) & 0x1f],
+                        },
                         0xd800..=0xdbff => (self.io_shadow[(addr as usize) - 0xd000] & 0x0f) | 0xf0,
                         0xdc00..=0xdcff => self.cia1_pin_peek(addr),
                         0xdd00..=0xddff => self.cia2_pin_peek(addr),
@@ -2748,6 +2860,8 @@ impl Machine {
                     cia_table: &table,
                     sid_regs: &mut self.sid_regs,
                     sid: &mut self.sid,
+                    sid_extra: &mut self.sid_extra,
+                    sid_map: &self.sid_map,
                     config: self.memconfig,
                     memconfig_table: &self.memconfig_table,
                     port_dir: self.port_dir,

@@ -541,3 +541,134 @@ impl Default for Sid6581 {
         Self::new()
     }
 }
+
+// ── Spec 855 — more than one SID ──────────────────────────────────────────────
+//
+// A U64-II decodes four SID targets and its firmware assigns their addresses at
+// runtime, rewriting them on every C64 reset. So the core carries N chips and a
+// table that says which address belongs to which, and it learns nothing about
+// the host's registers: the host RESOLVES its own hardware into `SidMapping`s
+// and hands them over. No VICE defaults are baked in here — an empty table means
+// exactly the pre-855 machine, `$D400-$D7FF` mirrored onto chip 0.
+
+/// One SID: its 32-byte register file and the oscillator/envelope model that
+/// answers `$D41B`/`$D41C` for it.
+///
+/// Chip 0 is NOT one of these. It stays `Machine::sid_regs` + `Machine::sid`,
+/// where every existing path — the snapshot, the VSF export, the monitor, the
+/// bus — already names it. Making it an element of a list would force all of
+/// them to index for no behavioural gain, and 855 D3 asks for chip 0 to be
+/// bit-identical to before rather than merely equivalent.
+#[derive(Clone, Debug, Default)]
+pub struct SidChip {
+    /// Register shadow, the same 32 write-only bytes chip 0 keeps in `sid_regs`.
+    pub regs: [u8; 32],
+    /// Oscillator + envelope state. `$D41B`/`$D41C` are per chip, which is the
+    /// whole reason an extra chip needs a model at all and not just storage.
+    pub engine: Sid6581,
+}
+
+impl SidChip {
+    pub fn new() -> Self {
+        Self { regs: [0u8; 32], engine: Sid6581::new() }
+    }
+
+    /// Power-on: register file cleared, voice state reset. Matches what
+    /// `cold_reset` does to chip 0.
+    pub fn reset(&mut self) {
+        self.regs = [0u8; 32];
+        self.engine.reset();
+    }
+}
+
+/// One decoded window: `start..=end` belongs to `chip`.
+///
+/// The host builds these. On a U64 that means resolving `>>4` base registers,
+/// the A11..A4 masks, the enable bits, `EMUSID_SPLIT`/`ADDRSEL` and
+/// `0x01 = unmapped` — none of which this crate knows or wants to know.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SidMapping {
+    /// First address of the window, inclusive.
+    pub start: u16,
+    /// Last address of the window, inclusive.
+    pub end: u16,
+    /// 0 = the machine's own SID; 1.. = `Machine::sid_extra[chip - 1]`.
+    pub chip: u8,
+    /// Spec 855 §7, and deliberately WITHOUT a default. A window in
+    /// `$DE00-$DFFF` shares the address space with the expansion chain — a
+    /// cartridge, the UCI, the REU's mirror, a host's sampler — and whether the
+    /// SID decode sits ahead of that chain or behind it is not something either
+    /// side of this interface can currently demonstrate: the U64-II top level
+    /// that would settle it is not in the open firmware tree, and the open U2+
+    /// top has no UltiSID. So the host states it per window and can match the
+    /// RTL when someone reads it. Hardcoding either guess here would repeat the
+    /// UCI pointer defect, which was an unverified assumption whose own gate
+    /// confirmed it.
+    pub ahead_of_expansion: bool,
+}
+
+impl SidMapping {
+    /// A 32-byte window at `start` for `chip`, the shape a SID actually occupies.
+    pub fn window(start: u16, chip: u8, ahead_of_expansion: bool) -> Self {
+        Self { start, end: start.wrapping_add(0x1f), chip, ahead_of_expansion }
+    }
+
+    #[inline]
+    pub fn contains(&self, addr: u16) -> bool {
+        addr >= self.start && addr <= self.end
+    }
+
+    /// The register this address hits within the window. Masked to 0x00..0x1f,
+    /// so a window wider than 32 bytes mirrors, exactly as a real SID does
+    /// across `$D400-$D7FF`.
+    #[inline]
+    pub fn reg(&self, addr: u16) -> usize {
+        (addr.wrapping_sub(self.start) as usize) & 0x1f
+    }
+}
+
+/// Resolve an address against the table: `(chip, register)`, or `None` when no
+/// window claims it.
+///
+/// First match wins, so a host that overlaps two windows gets the order it gave
+/// rather than a rule invented here. An empty table resolves nothing, which is
+/// what keeps a stock machine on the pre-855 path.
+#[inline]
+pub fn resolve_sid(map: &[SidMapping], addr: u16) -> Option<(u8, usize)> {
+    map.iter().find(|m| m.contains(addr)).map(|m| (m.chip, m.reg(addr)))
+}
+
+#[cfg(test)]
+mod spec855_tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_table_claims_nothing() {
+        assert_eq!(resolve_sid(&[], 0xd400), None);
+    }
+
+    #[test]
+    fn a_window_resolves_to_its_chip_and_register() {
+        let map = [SidMapping::window(0xd400, 0, true), SidMapping::window(0xde00, 1, false)];
+        assert_eq!(resolve_sid(&map, 0xd400), Some((0, 0x00)));
+        assert_eq!(resolve_sid(&map, 0xd41b), Some((0, 0x1b)));
+        assert_eq!(resolve_sid(&map, 0xde04), Some((1, 0x04)));
+        assert_eq!(resolve_sid(&map, 0xdf00), None, "an address nobody claimed");
+    }
+
+    #[test]
+    fn a_wide_window_mirrors_every_thirty_two_bytes() {
+        // The U64's A11..A4 mask can open a 256-byte window; a SID has 32
+        // registers, so the rest is mirror — the same thing $D400-$D7FF does.
+        let wide = SidMapping { start: 0xde00, end: 0xdeff, chip: 2, ahead_of_expansion: false };
+        assert_eq!(resolve_sid(&[wide], 0xde00), Some((2, 0x00)));
+        assert_eq!(resolve_sid(&[wide], 0xde20), Some((2, 0x00)), "mirrored");
+        assert_eq!(resolve_sid(&[wide], 0xde3b), Some((2, 0x1b)));
+    }
+
+    #[test]
+    fn the_first_matching_window_wins() {
+        let map = [SidMapping::window(0xde00, 1, false), SidMapping::window(0xde00, 3, false)];
+        assert_eq!(resolve_sid(&map, 0xde05), Some((1, 0x05)), "the order the host gave");
+    }
+}
