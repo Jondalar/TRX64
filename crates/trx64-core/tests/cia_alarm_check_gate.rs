@@ -234,27 +234,33 @@ fn lockstep(label: &str, off: &mut Machine, on: &mut Machine, steps: u64) -> u64
 /// did not carry the turbo phase (a defect since 851, the restore case diverged), and the fix
 /// adds `turboPhase` to every turbo checkpoint, which the digests hash. The 1 MHz digests are
 /// the same on both sides of that fix.
+///
+/// All re-recorded for Spec 843 D1, which fills `vicProvenance` in every checkpoint (it was
+/// a hardcoded `null`). With that one field set back to `null` the digests are exactly the
+/// ones recorded before — checked on the 843 branch before re-recording — so nothing the CIA
+/// does moved; only the checkpoint says more. The same gate found that a restored machine
+/// lost the record (restore did not read it back), fixed in `restore_vic_provenance`.
 const GOLDEN: &[(&str, u64)] = &[
-    ("ta_irq@1", 0xeb8c471add473e93),
-    ("ta_irq@64", 0x1dbaeacbf449ffd4),
-    ("ta_irq_timer_read@1", 0x3b94f420d388aa37),
-    ("ta_irq_timer_read@64", 0x220abf525a33dde8),
-    ("ta_oneshot@1", 0x95c78fa476a7040e),
-    ("ta_oneshot@64", 0x0175c84a8519dee9),
-    ("tb_cascade_l0@1", 0xba45fdd6074076a4),
-    ("tb_cascade_l0@64", 0x1d43231f67e94951),
-    ("tb_cascade_l1@1", 0x7527a0026829aae5),
-    ("tb_cascade_l1@64", 0xfaea9cc703252b4d),
-    ("tb_cascade_l2@1", 0xf5478c095dafc40b),
-    ("tb_cascade_l2@64", 0x2f9bf78c1c67fadc),
-    ("cia2_nmi@1", 0x7d0969a1d566aa84),
-    ("cia2_nmi@64", 0x80adda8c34b4d2df),
-    ("tod_alarm@1", 0x8582b697f9099e9d),
-    ("tod_alarm@64", 0xf3404fd9fe194463),
-    ("restore_cascade@1/check=false", 0xfdf59937121c0af6),
-    ("restore_cascade@64/check=false", 0x014e94347ee88189),
-    ("booted@1", 0x4d9b117b0414029b),
-    ("booted@64", 0xb7108a7b81851d09),
+    ("ta_irq@1", 0xe32345655ea52187),
+    ("ta_irq@64", 0xadb11d1855244666),
+    ("ta_irq_timer_read@1", 0x82b1452c59e244c7),
+    ("ta_irq_timer_read@64", 0x19d89ec55685fbac),
+    ("ta_oneshot@1", 0xe5b6f8ff84cbca64),
+    ("ta_oneshot@64", 0x5a728a3419f3b721),
+    ("tb_cascade_l0@1", 0xa3b68baf80d90fd8),
+    ("tb_cascade_l0@64", 0xb912f024f4e9c963),
+    ("tb_cascade_l1@1", 0x390ad349e24c3a37),
+    ("tb_cascade_l1@64", 0xef1d58e66456d18f),
+    ("tb_cascade_l2@1", 0x42064c33bfaf60f5),
+    ("tb_cascade_l2@64", 0xd6615a1f77292b24),
+    ("cia2_nmi@1", 0x50afb16bdf9d38ae),
+    ("cia2_nmi@64", 0x7c8c199d6268906b),
+    ("tod_alarm@1", 0x0a9b7d74247126c1),
+    ("tod_alarm@64", 0x1b0c4ac908d38231),
+    ("restore_cascade@1/check=false", 0x734ab0a82991ce2e),
+    ("restore_cascade@64/check=false", 0xaa2af63572b908c7),
+    ("booted@1", 0xc9fc1a34eda0ea27),
+    ("booted@64", 0x8de5229be9032c33),
 ];
 
 fn golden(label: &str, digest: u64, printed: &mut Vec<String>) {

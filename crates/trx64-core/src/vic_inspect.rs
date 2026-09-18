@@ -679,7 +679,8 @@ fn resolve_visible_node_at_inner(cp: &Value, ram: &[u8], vx: f64, vy: f64, prove
 pub fn coalesce_region_ranges(nodes: &[VisualNode]) -> Vec<Value> {
     use std::collections::BTreeMap;
     // kind -> sorted (start, end_inclusive), carrying the bank of the first ref.
-    let mut spans: BTreeMap<&'static str, (Option<i64>, Vec<(i64, i64)>)> = BTreeMap::new();
+    type Spans = (Option<i64>, Vec<(i64, i64)>);
+    let mut spans: BTreeMap<&'static str, Spans> = BTreeMap::new();
     for n in nodes {
         for r in &n.refs {
             let e = spans.entry(r.kind).or_insert((r.bank, Vec::new()));

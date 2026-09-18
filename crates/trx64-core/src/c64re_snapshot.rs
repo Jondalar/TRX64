@@ -781,6 +781,52 @@ pub fn capture_vic_provenance(m: &Machine) -> serde_json::Value {
     serde_json::json!({ "lines": lines })
 }
 
+/// The inverse of [`capture_vic_provenance`]. The record is a list of CHANGES, so line `L`
+/// takes the last entry at or before it; lines before the first entry were not captured.
+/// Capturing again after this yields the same list — the checkpoint round-trips.
+///
+/// Without it a restored machine started with an empty record and re-captured only the
+/// lines the beam passed after the restore, so the same machine state produced a different
+/// checkpoint depending on whether it had been restored (found by the Spec 857 gate, which
+/// compares a restored machine with one that ran through).
+pub fn restore_vic_provenance(m: &mut Machine, p: Option<&serde_json::Value>) {
+    let mut entries: Vec<(usize, crate::vic::ProvenanceRegs)> = p
+        .and_then(|v| v.get("lines"))
+        .and_then(|l| l.as_array())
+        .map(|lines| {
+            lines
+                .iter()
+                .filter_map(|e| {
+                    let g = |k: &str| e.get(k).and_then(|v| v.as_i64());
+                    Some((
+                        g("line")? as usize,
+                        crate::vic::ProvenanceRegs {
+                            d011: g("d011")? as u8,
+                            d016: g("d016")? as u8,
+                            d018: g("d018")? as u8,
+                            vbank: g("bank")? as u16,
+                            captured: true,
+                        },
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    entries.sort_by_key(|(l, _)| *l);
+    let mut cur: Option<crate::vic::ProvenanceRegs> = None;
+    let mut next = entries.iter().peekable();
+    for (line, slot) in m.vic.provenance.iter_mut().enumerate() {
+        while let Some((l, regs)) = next.peek() {
+            if *l > line {
+                break;
+            }
+            cur = Some(*regs);
+            next.next();
+        }
+        *slot = cur.unwrap_or_default();
+    }
+}
+
 pub fn capture_vic(m: &Machine) -> VicSnapshot {
     let v = &m.vic;
     let color_ram = read_color_ram(m);
@@ -1577,6 +1623,7 @@ pub fn restore_runtime_checkpoint(
             serde_json::from_value(c.clone()).map_err(|e| format!("restore vicPresentation: {e}"))?;
         restore_vic_presentation(m, &s);
     }
+    restore_vic_provenance(m, cp.get("vicProvenance"));
 
     // Sync the legacy shadow + machine clk (matches vsf load tail).
     m.sync_after_monitor();
