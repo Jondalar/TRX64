@@ -713,6 +713,24 @@ impl<'a> FullBus<'a> {
 }
 
 impl<'a> FullBus<'a> {
+    /// `check_ba_before_read` over `steal_cycles_g::<REC>` (Spec 859).
+    pub(crate) fn check_ba_g<const REC: bool>(&mut self) -> u32 {
+        let vbank = self.vic_bank_base();
+        let view = crate::vic::VicMemView {
+            ram: self.ram,
+            char_rom: Some(self.char_rom),
+            color_ram: &self.io[0x0800..0x0c00],
+            vbank,
+        };
+        let stolen = self.vic.steal_cycles_g::<REC>(&view);
+        if stolen != 0 {
+            self.clk = self.clk.wrapping_add(stolen as u64);
+            self.cia1.clk = self.clk;
+            self.cia2.clk = self.clk;
+        }
+        stolen
+    }
+
     // ── Spec 855 — one of several SIDs ──────────────────────────────────────────────
 
     /// Read register `reg` of `chip`. Chip 0 is the machine's own SID; anything
@@ -1113,20 +1131,7 @@ impl<'a> Bus for FullBus<'a> {
     /// CIA timers stay phase-aligned with the stretched CPU read).
     #[inline]
     fn check_ba_before_read(&mut self) -> u32 {
-        let vbank = self.vic_bank_base();
-        let view = crate::vic::VicMemView {
-            ram: self.ram,
-            char_rom: Some(self.char_rom),
-            color_ram: &self.io[0x0800..0x0c00],
-            vbank,
-        };
-        let stolen = self.vic.steal_cycles(&view);
-        if stolen != 0 {
-            self.clk = self.clk.wrapping_add(stolen as u64);
-            self.cia1.clk = self.clk;
-            self.cia2.clk = self.clk;
-        }
-        stolen
+        self.check_ba_g::<false>()
     }
 
     #[inline]

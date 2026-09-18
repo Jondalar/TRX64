@@ -291,6 +291,9 @@ pub struct State {
     /// (single session). The c64re `inspectEvidence` map; survives ring reuse,
     /// lost on session close.
     inspect_evidence: Vec<Value>,
+    /// Spec 859 — the last recorded frame, keyed by the inspect checkpoint it answers for.
+    /// Clicking through the lines of one frozen picture answers from here.
+    line_trace_cache: Option<(String, std::sync::Arc<trx64_core::vic_line_trace::LineTraceFrame>)>,
     /// Spec 710.4 — VIC-provenance capture toggle (the c64re
     /// `session.setVicProvenanceCapture`). TRX64 captures no provenance sidecar
     /// yet, so this flag is stored for the wire contract only (inert until the
@@ -3033,6 +3036,8 @@ struct TeeObserver<'a, A: Observer, B: Observer> {
 }
 
 impl<A: Observer, B: Observer> Observer for TeeObserver<'_, A, B> {
+    // Spec 859 — a tee records the VIC if either side does.
+    const RECORDS_VIC: bool = A::RECORDS_VIC || B::RECORDS_VIC;
     #[allow(clippy::too_many_arguments)]
     fn on_instruction(&mut self, pc: u16, opcode: u8, b1: u8, b2: u8, a: u8, x: u8, y: u8, sp: u8, p: u8, clk: u64) {
         self.a.on_instruction(pc, opcode, b1, b2, a, x, y, sp, p, clk);
@@ -9074,6 +9079,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             st.checkpoint_thumbs.clear();
             st.checkpoint_thumb_order.clear();
             st.inspect_evidence.clear();
+            st.line_trace_cache = None;
             st.input_journal = None;
             st.recorder = None;
             st.last_trace_path = None;
@@ -13154,6 +13160,44 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             Response::ok(id, json!({ "node": node.to_json() }))
         }
 
+        // Spec 859 — the raster line as the VIC saw it. Replays the frame on screen in a
+        // CLONE of the machine with the per-cycle recorder armed; the live machine is not
+        // touched. `{ checkpoint_id, from?, to? }` (lines, default 0..=0) →
+        // `{ frame: {which, verified, …}, lines: [...] }`. One frame is cached per
+        // checkpoint, so stepping through the lines of one picture replays once.
+        "vic/line_trace" => {
+            let cp_id = match req.params.get("checkpoint_id").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return Response::err(id, -32602, "vic/line_trace: checkpoint_id required"),
+            };
+            let from = req.params.get("from").and_then(|v| v.as_u64()).unwrap_or(0).min(311) as u16;
+            let to = req.params.get("to").and_then(|v| v.as_u64()).map(|t| t.min(311) as u16).unwrap_or(from).max(from);
+            if to - from > 31 {
+                return Response::err(id, -32602, "vic/line_trace: at most 32 lines per call");
+            }
+            let cached = {
+                let st = state.lock().unwrap();
+                st.line_trace_cache.as_ref().filter(|(k, _)| *k == cp_id).map(|(_, f)| f.clone())
+            };
+            let frame = match cached {
+                Some(f) => f,
+                None => match line_trace_record(state, &cp_id) {
+                    Ok(f) => {
+                        let f = std::sync::Arc::new(f);
+                        state.lock().unwrap().line_trace_cache = Some((cp_id.clone(), f.clone()));
+                        f
+                    }
+                    Err(e) => return Response::err(id, -32001, format!("vic/line_trace: {e}")),
+                },
+            };
+            let lines = frame.lines_json(from, to, |i| {
+                let bytes = [i.opcode, i.b1, i.b2];
+                let d = trx64_static::disasm6502::disasm_one(i.pc, |a| bytes[a.wrapping_sub(i.pc) as usize % 3]);
+                format!("{} {}", d.mnemonic, d.operand).trim_end().to_string()
+            });
+            Response::ok(id, json!({ "checkpointId": cp_id, "frame": frame.header_json(), "lines": lines }))
+        }
+
         // vic/inspect/region — resolve a VISIBLE-frame region to distinct nodes.
         // ws-server.ts:1140-1145. { nodes }.
         // Spec 843 D9 — read a byte range out of a FROZEN checkpoint.
@@ -16538,6 +16582,50 @@ fn cp_for_inspect(st: &State, id: &str) -> Result<Value, String> {
     Ok(cp)
 }
 
+/// Spec 859 — record the frame a frozen inspect checkpoint shows.
+///
+/// The picture is `vic.displayed`: the frame that ended before the checkpoint. A clone of the
+/// machine is restored from the latest ring anchor at or before that frame's first cycle,
+/// replayed with the recorder armed, and its freshly published picture compared with the
+/// checkpoint's (`verified`). Without an anchor that reaches back, the NEXT frame is recorded
+/// from the checkpoint itself, labelled `next`, with nothing to verify against. The state
+/// lock is held only to take the snapshots and the clone; the replay runs without it.
+fn line_trace_record(
+    state: &SharedState,
+    cp_id: &str,
+) -> Result<trx64_core::vic_line_trace::LineTraceFrame, String> {
+    use trx64_core::vic_line_trace::{self as lt, FrameWhich};
+    let (mut scratch, frozen, anchor) = {
+        let st = state.lock().unwrap();
+        let frozen = cp_for_inspect(&st, cp_id)?;
+        let refs = st.checkpoint_ring.list();
+        (st.session.machine.clone(), frozen, refs)
+    };
+    restore_checkpoint_into(&mut scratch, &frozen)?;
+    // The picture the checkpoint shows, from the checkpoint itself — not from the clone,
+    // which keeps the live machine's framebuffer where a checkpoint carries none.
+    let reference = frozen
+        .get("vicPresentation")
+        .and_then(|p| p.get("literalPortFbStable"))
+        .and_then(trx64_core::native_snapshot::ta_u8_decode)
+        .filter(|fb| fb.len() >= trx64_core::render::FB_W * trx64_core::render::FB_H);
+    let displayed_start = lt::displayed_frame_start(&scratch);
+    let next_start = scratch.c64_core.clk - lt::frame_position(&scratch) + lt::CYCLES_PER_FRAME;
+    let best = anchor.iter().filter(|r| r.cycles <= displayed_start).max_by_key(|r| r.cycles).map(|r| r.id.clone());
+    let anchor_cp = match &best {
+        Some(aid) => state.lock().unwrap().checkpoint_ring.restore_snapshot(aid),
+        None => None,
+    };
+    match anchor_cp {
+        Some(a) => {
+            restore_checkpoint_into(&mut scratch, &a)?;
+            lt::record_frame(&mut scratch, displayed_start, FrameWhich::Displayed, reference.as_deref())
+        }
+        // `scratch` already stands at the frozen checkpoint.
+        None => lt::record_frame(&mut scratch, next_start, FrameWhich::Next, None),
+    }
+}
+
 /// Wall-clock ms since epoch (ws-server.ts `Date.now()` for `promotedAtMs`).
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -17069,6 +17157,14 @@ pub(crate) fn transport_truncate_on_intervention(st: &mut State) {
 /// drive8 disk first, then `restore_runtime_checkpoint`). Mirrors snapshot/undump.
 /// Returns Ok(()) on success. Leaves the session paused (a restore is a pause point).
 fn restore_live_checkpoint(session: &mut Session, cp: &Value) -> Result<(), String> {
+    restore_checkpoint_into(&mut session.machine, cp)?;
+    session.running = false;
+    Ok(())
+}
+
+/// Restore a ring checkpoint into ANY machine — the live one, or a scratch clone that must
+/// not disturb it (Spec 859's replay).
+fn restore_checkpoint_into(machine: &mut trx64_core::Machine, cp: &Value) -> Result<(), String> {
     // Re-attach the embedded clean disk image FIRST (so the drive's GCR baseline is
     // present before restore_runtime_checkpoint overlays the mutable GCR content).
     if let Some(bytes) = cp
@@ -17088,16 +17184,14 @@ fn restore_live_checkpoint(session: &mut Session, cp: &Value) -> Result<(), Stri
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(String::from);
-        session.machine.drive8.attach_disk(DiskImage {
+        machine.drive8.attach_disk(DiskImage {
             kind,
             bytes,
             backing_path,
             read_only: false,
         });
     }
-    trx64_core::c64re_snapshot::restore_runtime_checkpoint(&mut session.machine, cp)?;
-    session.running = false;
-    Ok(())
+    trx64_core::c64re_snapshot::restore_runtime_checkpoint(machine, cp).map(|_| ())
 }
 
 /// One re-attached drive8 medium restored by `undump_native_snapshot`, in a shape
@@ -18453,6 +18547,7 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
             checkpoint_ring_max_entries(),
         ),
         inspect_evidence: Vec::new(),
+        line_trace_cache: None,
         vic_provenance_enabled: false,
         trace_definitions: std::collections::HashMap::new(),
         recorder: None,
@@ -19076,6 +19171,7 @@ mod batch1_tests {
             checkpoint_ring_max_entries(),
         ),
             inspect_evidence: Vec::new(),
+            line_trace_cache: None,
             vic_provenance_enabled: false,
             trace_definitions: std::collections::HashMap::new(),
             recorder: None,
@@ -19982,6 +20078,60 @@ mod batch1_tests {
         // sight — which is the whole point of the parity requirement.
         let out = mon(&st, "frame -2").expect("step back");
         assert!(out.contains("STEP"), "{out}");
+    }
+
+    /// Spec 859 — `vic/line_trace` records the frame on screen from a ring anchor in a clone,
+    /// verifies it against the checkpoint's picture, and leaves the live machine where it was.
+    #[test]
+    fn line_trace_records_the_frame_on_screen_without_touching_the_live_machine() {
+        let rom_dir = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../C64ReverseEngineeringMCP/resources/roms"
+        ));
+        if !rom_dir.join("kernal-901227-03.bin").exists() {
+            eprintln!("skip line_trace: ROMs absent");
+            return;
+        }
+        let st = make_state();
+        {
+            let mut g = st.lock().unwrap();
+            g.session.machine.boot_from_dir(rom_dir).expect("boot ROMs");
+            let mut sink = trx64_core::NullSink;
+            g.session.machine.run_for_full(3_000_000, &mut sink, |_, _, _, _, _, _, _| {});
+        }
+        // An anchor, then a few frames on, then freeze mid-frame.
+        call(&st, "checkpoint/capture", json!({}));
+        {
+            let mut g = st.lock().unwrap();
+            let mut sink = trx64_core::NullSink;
+            g.session.machine.run_for_full(3 * 19_656 + 4_321, &mut sink, |_, _, _, _, _, _, _| {});
+        }
+        let o = call(&st, "vic/inspect/open", json!({}));
+        let cp = o["checkpointId"].as_str().unwrap().to_string();
+        let live_clk = st.lock().unwrap().session.machine.c64_core.clk;
+
+        let t = call(&st, "vic/line_trace", json!({ "checkpoint_id": cp, "from": 100, "to": 101 }));
+        assert_eq!(t["frame"]["which"], json!("displayed"));
+        assert_eq!(t["frame"]["verified"], json!(true), "{}", t["frame"]);
+        let lines = t["lines"].as_array().unwrap();
+        assert_eq!(lines.len(), 2);
+        for (k, l) in lines.iter().enumerate() {
+            assert_eq!(l["line"], json!(100 + k));
+            let cyc = l["cycles"].as_array().unwrap();
+            assert_eq!(cyc.len(), 63);
+            assert_eq!(cyc[0]["c"], json!(1));
+            assert_eq!(cyc[62]["c"], json!(63));
+            assert!(!l["instructions"].as_array().unwrap().is_empty(), "the CPU ran on line {}", 100 + k);
+        }
+        assert_eq!(st.lock().unwrap().session.machine.c64_core.clk, live_clk, "the live machine moved");
+
+        // Second call answers from the cache (same frame start), and bad lines show.
+        let t2 = call(&st, "vic/line_trace", json!({ "checkpoint_id": cp, "from": 51, "to": 51 }));
+        assert_eq!(t2["frame"]["startClk"], t["frame"]["startClk"]);
+        assert_eq!(t2["lines"][0]["badLine"], json!(true));
+        // Missing id / too many lines are refused.
+        assert_eq!(call_err(&st, "vic/line_trace", json!({})).code, -32602);
+        assert_eq!(call_err(&st, "vic/line_trace", json!({ "checkpoint_id": cp, "from": 0, "to": 40 })).code, -32602);
     }
 
     /// The PICTURE must move. Everything on screen renders from `vic.displayed`, and

@@ -757,6 +757,11 @@ pub struct VicII {
     /// resolver already parses.
     pub provenance: [ProvenanceRegs; PAL_SCREEN_HEIGHT as usize],
 
+    /// Spec 859 — the per-cycle recorder, armed only inside a scratch replay
+    /// (`vic_line_trace::record_frame`). `None` on the live path: the two hooks in `tick`
+    /// are then one untaken branch each.
+    pub line_rec: Option<Box<crate::vic_line_trace::VicCycleRecorder>>,
+
     /// Spec 815 — which machine this claims to be. Default C64: $D02F-$D03F are
     /// open bus and nothing below this line does anything.
     pub speed_profile: SpeedProfile,
@@ -949,6 +954,7 @@ impl VicII {
         let mut v = VicII {
             regs: [0u8; 0x40],
             provenance: [ProvenanceRegs::default(); PAL_SCREEN_HEIGHT as usize],
+            line_rec: None,
             speed_profile: SpeedProfile::C64,
             fastmode: 0,
             u64_regs_en: 0x01,
@@ -1377,7 +1383,15 @@ impl VicII {
     /// effects that the TIMING depends on (vc/rc/vmli/idle, sprite mc) ARE
     /// reproduced inline below. Memory-content fetches feed only the pixel
     /// pipeline, which render.rs handles statically.)
+    #[inline]
     pub fn tick(&mut self, mem: &VicMemView) -> bool {
+        self.tick_g::<false>(mem)
+    }
+
+    /// `tick`, with the Spec 859 recorder hooks compiled in when `REC`. The live path is
+    /// `tick` = `tick_g::<false>`, which contains no recorder code at all; only a run whose
+    /// observer records (`Observer::RECORDS_VIC`) instantiates the other one.
+    pub fn tick_g<const REC: bool>(&mut self, mem: &VicMemView) -> bool {
         let mut ba_low = false;
 
         // Spec 843 D1 — record what drives THIS line, at its first cycle, before any
@@ -1410,6 +1424,11 @@ impl VicII {
         // vicii-cycle.c:392 — Next cycle + load cycle_flags.
         self.next_vicii_cycle();
         self.cycle_flags = self.cycle_table[self.raster_cycle as usize];
+
+        // Spec 859 — the Φ1 access is taken before the fetch advances VC/VMLI/MC.
+        if REC && self.line_rec.is_some() {
+            self.line_rec_phi1();
+        }
 
         // ── Start of Phi1 ──
         // vicii-cycle.c:402 cycle_phi1_fetch — the Phi1 fetch: graphics/idle-gfx
@@ -1569,7 +1588,127 @@ impl VicII {
         // |= vicii_cycle()). Set-only on true (CLK_INC clears the VICII bit
         // first via `&= ~MAINCPU_BA_LOW_VICII`, then OR's this).
         self.ba_low_flag = ba_low;
+        if REC && self.line_rec.is_some() {
+            self.line_rec_cycle(ba_low, mem.vbank);
+        }
         ba_low
+    }
+
+    // =========================================================================
+    // SECTION — Spec 859 recorder hooks. Cold: reached only while a scratch replay
+    // records. They read the chip; they change nothing it computes.
+    // =========================================================================
+
+    /// Before the Φ1 fetch: what it is about to read, and — for the cycle before — whether
+    /// the Φ2 sprite fetch at the top of this tick took the bus.
+    #[cold]
+    #[inline(never)]
+    fn line_rec_phi1(&mut self) {
+        let flags = self.cycle_flags;
+        let access = self.phi1_access(flags);
+        let sprite_dma = self.sprite_dma;
+        let blocked = self.prefetch_cycles != 0;
+        let Some(rec) = self.line_rec.as_deref_mut() else { return };
+        // vicii_fetch_sprites ran on the PREVIOUS cycle's flags: that was its Φ2.
+        let prev = rec.prev_flags;
+        if cycle_is_sprite_ptr_dma0(prev) || cycle_is_sprite_dma1_dma2(prev) {
+            let i = cycle_get_sprite_num(prev);
+            if sprite_dma & (1 << i) != 0 {
+                if let Some(last) = rec.cycles.last_mut() {
+                    last.phi2 = crate::vic_line_trace::Phi2Kind::SpriteData;
+                    last.phi2_sprite = i as u8;
+                    last.phi2_blocked = blocked;
+                }
+            }
+        }
+        rec.prev_flags = flags;
+        rec.pending_phi1 = access;
+    }
+
+    /// The Φ1 access `cycle_phi1_fetch` makes for `flags`, with the address formed the way
+    /// the fetch forms it (the same helpers).
+    fn phi1_access(&self, flags: u32) -> crate::vic_line_trace::Phi1Access {
+        use crate::vic_line_trace::{Phi1Access, Phi1Kind};
+        if cycle_is_fetch_g(flags) {
+            return if !self.idle_state {
+                Phi1Access { kind: Phi1Kind::Graphics, sprite: 0, addr: self.graphics_fetch_addr() }
+            } else {
+                Phi1Access { kind: Phi1Kind::IdleGraphics, sprite: 0, addr: self.idle_gfx_addr() }
+            };
+        }
+        if cycle_is_sprite_ptr_dma0(flags) {
+            let s = cycle_get_sprite_num(flags);
+            return Phi1Access { kind: Phi1Kind::SpritePointer, sprite: s as u8, addr: self.v_fetch_addr(0x3f8 + s as u16) };
+        }
+        if cycle_is_sprite_dma1_dma2(flags) {
+            let s = cycle_get_sprite_num(flags);
+            return if self.sprite_dma & (1 << s) != 0 {
+                let addr = ((self.sprite[s].pointer as u16) << 6).wrapping_add(self.sprite[s].mc as u16);
+                Phi1Access { kind: Phi1Kind::SpriteData, sprite: s as u8, addr }
+            } else {
+                Phi1Access { kind: Phi1Kind::Idle, sprite: s as u8, addr: 0x3fff }
+            };
+        }
+        if cycle_is_refresh(flags) {
+            return Phi1Access { kind: Phi1Kind::Refresh, sprite: 0, addr: 0x3f00u16.wrapping_add(self.refresh_counter as u16) };
+        }
+        Phi1Access { kind: Phi1Kind::Idle, sprite: 0, addr: 0x3fff }
+    }
+
+    /// End of the tick: the whole cycle.
+    #[cold]
+    #[inline(never)]
+    fn line_rec_cycle(&mut self, ba_low: bool, vbank: u16) {
+        use crate::vic_line_trace::{Phi2Kind, VicCycle};
+        let Some(p1) = self.line_rec.as_deref().map(|r| r.pending_phi1) else { return };
+        let abs = |a: u16| a.wrapping_add(vbank);
+        let c_access = self.bad_line && cycle_may_fetch_c(self.cycle_flags);
+        let line = if self.raster_cycle == 0 && self.start_of_frame { 0 } else { self.raster_line };
+        let mut mc = [0u8; NUM_SPRITES];
+        let mut mcbase = [0u8; NUM_SPRITES];
+        for i in 0..NUM_SPRITES {
+            mc[i] = self.sprite[i].mc;
+            mcbase[i] = self.sprite[i].mcbase;
+        }
+        let rec = VicCycle {
+            clk: 0,
+            line,
+            raster: self.raster_line,
+            cycle: self.raster_cycle as u8 + 1,
+            phi1: p1.kind,
+            phi1_sprite: p1.sprite,
+            phi1_addr: abs(p1.addr),
+            phi1_rom: (abs(p1.addr) & 0x7000) == 0x1000,
+            phi1_data: self.last_read_phi1,
+            phi2: if c_access { Phi2Kind::Matrix } else { Phi2Kind::Cpu },
+            phi2_sprite: 0,
+            phi2_addr: if c_access { abs(self.v_fetch_addr(self.vc)) } else { 0 },
+            phi2_data: if c_access { self.vbuf[self.vmli as usize % 40] } else { 0 },
+            phi2_blocked: c_access && self.prefetch_cycles != 0,
+            ba: ba_low,
+            aec: ba_low && self.prefetch_cycles == 0,
+            bad_line: self.bad_line,
+            idle: self.idle_state,
+            vc: self.vc,
+            vcbase: self.vcbase,
+            rc: self.rc,
+            vmli: self.vmli,
+            sprite_dma: self.sprite_dma,
+            sprite_display: self.sprite_display_bits,
+            mc,
+            mcbase,
+            main_border: self.main_border,
+            vertical_border: self.vborder,
+            fb_x: self.dbuf_offset.saturating_sub(8) as u16,
+            fb_line: self.dbuf_line as u16,
+            d011: self.regs[R_CTRL1 as usize],
+            d016: self.regs[R_CTRL2 as usize],
+            d018: self.regs[R_MEM_PTR as usize],
+            vbank,
+        };
+        if let Some(r) = self.line_rec.as_deref_mut() {
+            r.push(rec);
+        }
     }
 
     /// PORT OF: vicii-cycle.c:165 check_vborder_top.
@@ -1723,18 +1862,25 @@ impl VicII {
     /// when ECM (reg11 bit6) else $3FFF. Stores gbuf.
     #[inline]
     fn vicii_fetch_idle_gfx(&mut self, mem: &VicMemView) -> u8 {
+        let data = mem.vic_phi1(self.idle_gfx_addr());
+        self.gbuf = data;
+        data
+    }
+
+    /// The idle-state g-access address: `$39FF` with ECM, else `$3FFF`. Shared by the fetch
+    /// and the Spec 859 recorder.
+    #[inline]
+    fn idle_gfx_addr(&self) -> u16 {
         let reg11 = if self.color_latency {
             self.regs[R_CTRL1 as usize]
         } else {
             self.reg11_delay
         };
-        let data = if reg11 & 0x40 != 0 {
-            mem.vic_phi1(0x39ff)
+        if reg11 & 0x40 != 0 {
+            0x39ff
         } else {
-            mem.vic_phi1(0x3fff)
-        };
-        self.gbuf = data;
-        data
+            0x3fff
+        }
     }
 
     /// PORT OF: vicii-fetch.c:234 vicii_fetch_graphics — the display-state g-access
@@ -1742,6 +1888,17 @@ impl VicII {
     /// vmli + vc.
     #[inline]
     fn vicii_fetch_graphics(&mut self, mem: &VicMemView) -> u8 {
+        let data = mem.vic_phi1(self.graphics_fetch_addr());
+        self.gbuf = data;
+        self.vmli += 1;
+        self.vc = (self.vc + 1) & 0x3ff;
+        data
+    }
+
+    /// The display-state g-access address, 6569 fetch magic included. Shared by the fetch
+    /// and the Spec 859 recorder.
+    #[inline]
+    fn graphics_fetch_addr(&self) -> u16 {
         let mut addr: u16;
         if self.color_latency {
             let mode = self.regs[R_CTRL1 as usize] | (self.reg11_delay & 0x20);
@@ -1758,11 +1915,7 @@ impl VicII {
         } else {
             addr = self.g_fetch_addr(self.reg11_delay);
         }
-        let data = mem.vic_phi1(addr);
-        self.gbuf = data;
-        self.vmli += 1;
-        self.vc = (self.vc + 1) & 0x3ff;
-        data
+        addr
     }
 
     /// PORT OF: vicii-fetch.c:275 vicii_fetch_sprite_pointer.
@@ -1843,7 +1996,13 @@ impl VicII {
     /// `tick()`, so the loop ends precisely when `cycle_is_fetch_ba` (or the
     /// sprite BA mask) goes false — which is why the badline-stalled
     /// `STA ($F3),Y` at $E4DD costs 48, not 49.
+    #[inline]
     pub fn steal_cycles(&mut self, mem: &VicMemView) -> u32 {
+        self.steal_cycles_g::<false>(mem)
+    }
+
+    /// `steal_cycles` over `tick_g::<REC>` (Spec 859).
+    pub fn steal_cycles_g<const REC: bool>(&mut self, mem: &VicMemView) -> u32 {
         if !self.ba_low_flag {
             return 0;
         }
@@ -1852,7 +2011,7 @@ impl VicII {
         loop {
             // VICE order: maincpu_clk++ (the caller folds `stolen` into clk) THEN
             // vicii_cycle(). Each tick() is one stolen cycle that re-samples BA.
-            let ba = self.tick(mem);
+            let ba = self.tick_g::<REC>(mem);
             stolen += 1;
             // Spec 850 — AEC follows BA down three cycles late (`prefetch_cycles`), and
             // comes back up with it. While it is high the CPU still drives the address.

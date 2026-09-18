@@ -365,7 +365,11 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
     #[inline]
     fn check_ba(&mut self, _last_opcode_info: &mut u32, _check_ba_low: bool) -> u64 {
         self.sync_clk();
-        let stolen = crate::cpu::Bus::check_ba_before_read(&mut self.fb);
+        let stolen = if O::RECORDS_VIC {
+            self.fb.check_ba_g::<true>()
+        } else {
+            crate::cpu::Bus::check_ba_before_read(&mut self.fb)
+        };
         // Spec 850 — the stall the next read is stretched over, handed to the port.
         if stolen != 0 {
             self.fb.stalled = stolen;
@@ -387,7 +391,11 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
             color_ram: &self.fb.io[0x0800..0x0c00],
             vbank,
         };
-        self.fb.vic.tick(&view);
+        if O::RECORDS_VIC {
+            self.fb.vic.tick_g::<true>(&view);
+        } else {
+            self.fb.vic.tick(&view);
+        }
         self.fb.clk = clk;
         self.fb.cia1.clk = clk;
         self.fb.cia2.clk = clk;
