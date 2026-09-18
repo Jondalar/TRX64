@@ -1157,12 +1157,8 @@ fn project_dir() -> PathBuf {
 /// scenario registry (scenario-registry.ts: project `scenarios/` dir). Mirrors the
 /// `fs_project_dir` resolution in run_monitor.
 fn resolve_project_dir() -> Option<PathBuf> {
-    std::env::args()
-        .skip_while(|a| a != "--project")
-        .nth(1)
-        .filter(|p| !p.is_empty())
-        .or_else(|| std::env::var("C64RE_PROJECT_DIR").ok())
-        .map(PathBuf::from)
+    // Spec 858 D1 — one source for the project, which `project/set` can move.
+    project_knowledge::bound_project().map(PathBuf::from)
 }
 
 /// The project-local `scenarios/` directory (file-backed registry store), or None
@@ -3442,12 +3438,7 @@ fn land_line(line: &str, tag: &str, cyc: u64, flow: FlowKind, why: StopWhy) -> S
 /// resolving a path but wrong as a licence to WRITE. The label verbs persist into
 /// `knowledge/` under this directory, so they ask this first.
 fn project_is_bound() -> bool {
-    std::env::args()
-        .skip_while(|a| a != "--project")
-        .nth(1)
-        .filter(|p| !p.is_empty())
-        .or_else(|| std::env::var("C64RE_PROJECT_DIR").ok().filter(|p| !p.is_empty()))
-        .is_some()
+    project_knowledge::bound_project().is_some()
 }
 
 /// A monitor read through the bank lens, honouring the `sidefx` toggle.
@@ -3785,18 +3776,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
     // joins a RELATIVE arg against the cwd; an ABSOLUTE arg passes through unchanged —
     // NOT a hard jail, exactly as the TS resolveFsPath (which only DEFAULTS relative
     // paths; `..`/abs escape freely, so TRX64 must not jail what TS doesn't).
-    let fs_project_dir = || -> String {
-        std::env::args()
-            .skip_while(|a| a != "--project")
-            .nth(1)
-            .filter(|p| !p.is_empty())
-            .or_else(|| std::env::var("C64RE_PROJECT_DIR").ok())
-            .unwrap_or_else(|| {
-                std::env::current_dir()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default()
-            })
-    };
+    let fs_project_dir = project_knowledge::active_project_dir;
     let fs_cwd_now = st.mon.fs_cwd.clone().unwrap_or_else(fs_project_dir);
     let resolve_fs_path = |arg: &str| -> String {
         if std::path::Path::new(arg).is_absolute() {
@@ -8997,10 +8977,121 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             // Handshake payload: `runtime_version` is the WIRE-PROTOCOL epoch a client
             // hard-checks; `version` is the product build, reported so a consumer can say
             // WHICH build it is talking to (two builds can share an epoch yet differ).
+            //
+            // Spec 858 D2 — and the project it serves, so a client learns in the handshake it
+            // already makes whether it is looking at the same project as the daemon. `null`
+            // when nothing named one.
             Response::ok(
                 id,
-                json!({ "runtime_version": RUNTIME_VERSION, "version": env!("CARGO_PKG_VERSION") }),
+                json!({
+                    "runtime_version": RUNTIME_VERSION,
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "project": project_knowledge::bound_project(),
+                }),
             )
+        }
+
+        // Spec 858 D3 — move this daemon to another project, in place.
+        //
+        // The daemon is shared, and the machine in it belongs to whoever started it for
+        // whichever project. A workspace that attaches for a DIFFERENT project used to get a
+        // daemon that silently scanned the wrong folder (the empty cartridge picker that found
+        // this). The workspace now asks the human first (`dry_run` tells it what would be
+        // lost) and then calls this: persist and eject the outgoing media exactly as
+        // `media/unmount` does, drop what belongs to the old session, switch, power-cycle,
+        // and tell every client.
+        "project/set" => {
+            let raw = req.params.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let dry_run = req.params.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+            if raw.is_empty() {
+                return Response::err(id, -32602, "project/set: `path` is required");
+            }
+            let requested = match std::fs::canonicalize(raw) {
+                Ok(p) if p.is_dir() => p.to_string_lossy().to_string(),
+                Ok(_) => return Response::err(id, -32602, format!("project/set: not a directory: {raw}")),
+                Err(e) => return Response::err(id, -32602, format!("project/set: {raw}: {e}")),
+            };
+            let previous = project_knowledge::bound_project();
+            let previous_canon = previous
+                .as_deref()
+                .and_then(|p| std::fs::canonicalize(p).ok())
+                .map(|p| p.to_string_lossy().to_string())
+                .or_else(|| previous.clone());
+            let same = previous_canon.as_deref() == Some(requested.as_str());
+            let mut st = state.lock().unwrap();
+            let blocked = non_persistable_dirty_media(&st);
+            if dry_run || same {
+                let media = json!({
+                    "disk": (!st.session.disk_path.is_empty()).then(|| st.session.disk_path.clone()),
+                    "cart": (!st.session.cart_path.is_empty()).then(|| st.session.cart_path.clone()),
+                    "blocked": blocked,
+                });
+                return Response::ok(id, json!({
+                    "changed": false,
+                    "same": same,
+                    "current": previous_canon,
+                    "requested": requested,
+                    "media": media,
+                }));
+            }
+            // 1) Nothing is changed if the outgoing media cannot be kept.
+            if let Some(reason) = blocked {
+                return Response::err(id, -32602, format!(
+                    "project/set: cannot leave the current project — {reason}. Nothing was changed."
+                ));
+            }
+            // A powered-off machine holds its media in the session; powering on puts them
+            // back in the machine, so one path persists and ejects both cases.
+            if !st.session.powered {
+                do_power_on(&mut st);
+            }
+            // 2) Write the outgoing media back to their files and eject them.
+            let mut persisted = json!({});
+            if st.session.machine.drive8.get_attached_disk().is_some() {
+                if let Some(p) = persist_outgoing_disk(&mut st) {
+                    persisted["disk"] = json!(p);
+                }
+                st.session.machine.drive8.detach_disk();
+                st.session.disk_path = String::new();
+            }
+            let cart_path = st.session.cart_path.clone();
+            if !cart_path.is_empty() {
+                if let Some(p) = persist_cart_for_eject(&mut st, &cart_path) {
+                    persisted["cart"] = json!(p);
+                }
+            }
+            do_power_off(&mut st);
+            st.session.clear_inserted_cart();
+            st.session.inserted_disk = None;
+            // 3) What belonged to the old project's session. Machine configuration — the
+            //    profile, the speed table, an attached REU, trace definitions, pacing,
+            //    streaming — is not project state and stays.
+            st.recent_media.clear();
+            st.scenarios.clear();
+            st.candidates.clear();
+            st.media_events.clear();
+            st.batches.clear();
+            st.checkpoint_thumbs.clear();
+            st.checkpoint_thumb_order.clear();
+            st.inspect_evidence.clear();
+            st.input_journal = None;
+            st.recorder = None;
+            st.last_trace_path = None;
+            st.last_run_id = None;
+            st.mon.fs_cwd = None;
+            // 4) Switch, 5) power up fresh, 6) tell every client.
+            project_knowledge::set_project_override(requested.clone());
+            do_power_on(&mut st);
+            st.notify.broadcast("project/changed", json!({
+                "project": requested,
+                "previous": previous_canon,
+            }));
+            Response::ok(id, json!({
+                "changed": true,
+                "project": requested,
+                "previous": previous_canon,
+                "persisted": persisted,
+            }))
         }
 
         "session/create" => {
@@ -11188,10 +11279,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 .or_else(|_| std::env::var("USERPROFILE"))
                 .unwrap_or_default();
             let downloads_path = if home.is_empty() { String::new() } else { format!("{home}/Downloads") };
-            let project_path = std::env::args()
-                .skip_while(|a| a != "--project")
-                .nth(1)
-                .unwrap_or_default();
+            let project_path = project_knowledge::bound_project().unwrap_or_default();
             let roots = json!([
                 { "label": "samples", "path": samples_path, "exists": std::path::Path::new(&samples_path).exists() },
                 { "label": "project", "path": project_path, "exists": !project_path.is_empty() && std::path::Path::new(&project_path).exists() },
@@ -15107,16 +15195,7 @@ fn resolve_fs_path_with_state(st: &State, arg: &str) -> String {
         return arg.to_string();
     }
     let cwd = st.mon.fs_cwd.clone().unwrap_or_else(|| {
-        std::env::args()
-            .skip_while(|a| a != "--project")
-            .nth(1)
-            .filter(|p| !p.is_empty())
-            .or_else(|| std::env::var("C64RE_PROJECT_DIR").ok())
-            .unwrap_or_else(|| {
-                std::env::current_dir()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default()
-            })
+        project_knowledge::active_project_dir()
     });
     std::path::Path::new(&cwd).join(arg).to_string_lossy().to_string()
 }
@@ -15773,10 +15852,7 @@ fn scan_recent_media(recent: &[RecentMedia]) -> Vec<Value> {
     };
 
     // The active project dir (same source as media/list_paths' "project" root).
-    let project_path = std::env::args()
-        .skip_while(|a| a != "--project")
-        .nth(1)
-        .unwrap_or_default();
+    let project_path = project_knowledge::bound_project().unwrap_or_default();
 
     // BUG-013 — the picker must show ONLY active-project media in PRODUCTION mode.
     // TRX64 has no `--dev-samples` flag (Spec 771 — the external bin is ALWAYS
@@ -23052,6 +23128,105 @@ mod batch1_tests {
         assert_eq!(arr[1]["operation"], json!("eject"));
         // Each event carries the MediaIngressEvent shape (cycle present).
         assert!(arr[0]["cycle"].is_number());
+    }
+
+    // ── Spec 858 — the daemon serves the project you are looking at ─────────────────
+
+    /// Two fresh, canonical project directories for one test.
+    fn project_dirs_858(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("trx64_858_{tag}_{}", std::process::id()));
+        let (a, b) = (base.join("alpha"), base.join("beta"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        (std::fs::canonicalize(&a).unwrap(), std::fs::canonicalize(&b).unwrap(), base)
+    }
+
+    fn recent_paths(st: &SharedState) -> Vec<String> {
+        call(st, "media/recent", json!({}))
+            .as_array()
+            .expect("media/recent → array")
+            .iter()
+            .filter_map(|e| e["path"].as_str().map(String::from))
+            .collect()
+    }
+
+    #[test]
+    fn project_set_refuses_what_is_not_a_directory() {
+        let st = make_state();
+        assert_eq!(call_err(&st, "project/set", json!({})).code, -32602, "no path");
+        assert_eq!(
+            call_err(&st, "project/set", json!({ "path": "/definitely/not/here/trx64-858" })).code,
+            -32602,
+            "missing path"
+        );
+        let f = std::env::temp_dir().join(format!("trx64_858_file_{}", std::process::id()));
+        std::fs::write(&f, b"x").unwrap();
+        assert_eq!(call_err(&st, "project/set", json!({ "path": f.to_str().unwrap() })).code, -32602, "a file");
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn ping_names_the_project_and_project_set_moves_everything_that_follows_it() {
+        let st = make_state();
+        let (a, b, base) = project_dirs_858("move");
+        let (a_s, b_s) = (a.to_str().unwrap().to_string(), b.to_str().unwrap().to_string());
+        std::fs::write(a.join("alpha.d64"), vec![0u8; 174_848]).unwrap();
+        std::fs::write(b.join("beta.d64"), vec![0u8; 174_848]).unwrap();
+
+        let first = call(&st, "project/set", json!({ "path": a_s }));
+        assert_eq!(first["changed"], json!(true));
+        assert_eq!(call(&st, "ping", json!({}))["project"], json!(a_s), "ping names the project");
+
+        let again = call(&st, "project/set", json!({ "path": a_s }));
+        assert_eq!((again["changed"].clone(), again["same"].clone()), (json!(false), json!(true)), "same project is a no-op");
+
+        let in_a = recent_paths(&st);
+        assert!(in_a.iter().any(|p| p.ends_with("/alpha.d64")), "the picker sees the project it serves: {in_a:?}");
+        assert!(!in_a.iter().any(|p| p.ends_with("/beta.d64")), "and nothing of another: {in_a:?}");
+
+        // A mounted disk, and a dry run that must say so and change nothing.
+        call(&st, "media/mount", json!({ "path": a.join("alpha.d64").to_str().unwrap() }));
+        let dry = call(&st, "project/set", json!({ "path": b_s, "dry_run": true }));
+        assert_eq!(dry["changed"], json!(false));
+        assert_eq!(dry["same"], json!(false));
+        assert_eq!(dry["current"], json!(a_s));
+        assert_eq!(dry["requested"], json!(b_s));
+        assert!(dry["media"]["disk"].as_str().unwrap_or("").ends_with("alpha.d64"), "dry run names the mounted disk: {dry}");
+        assert_eq!(call(&st, "ping", json!({}))["project"], json!(a_s), "a dry run moved nothing");
+        assert!(!st.lock().unwrap().session.disk_path.is_empty(), "and ejected nothing");
+
+        // The real move: the disk goes, the pickers follow, every client is told.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let _sub = st.lock().unwrap().notify.subscribe(tx);
+        let moved = call(&st, "project/set", json!({ "path": b_s }));
+        assert_eq!(moved["changed"], json!(true));
+        assert_eq!(moved["previous"], json!(a_s));
+        assert_eq!(moved["project"], json!(b_s));
+        {
+            let s = st.lock().unwrap();
+            assert!(s.session.disk_path.is_empty(), "the outgoing disk is ejected");
+            assert!(s.session.machine.drive8.get_attached_disk().is_none(), "and not in the drive");
+            assert!(s.session.powered, "the machine comes back up");
+        }
+        let in_b = recent_paths(&st);
+        assert!(in_b.iter().any(|p| p.ends_with("/beta.d64")), "the picker follows the move: {in_b:?}");
+        assert!(!in_b.iter().any(|p| p.ends_with("/alpha.d64")), "the old project's media are gone, recents included: {in_b:?}");
+        let roots = call(&st, "media/list_paths", json!({}));
+        let project_root = roots.as_array().unwrap().iter().find(|r| r["label"] == json!("project")).unwrap();
+        assert_eq!(project_root["path"], json!(b_s), "the browser's project root follows too");
+        let mut told = false;
+        while let Ok(msg) = rx.try_recv() {
+            if let tokio_tungstenite::tungstenite::Message::Text(t) = msg {
+                let v: Value = serde_json::from_str(&t).unwrap();
+                if v["method"] == json!("project/changed") {
+                    assert_eq!(v["params"]["project"], json!(b_s));
+                    assert_eq!(v["params"]["previous"], json!(a_s));
+                    told = true;
+                }
+            }
+        }
+        assert!(told, "project/changed was broadcast");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
