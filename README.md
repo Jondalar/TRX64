@@ -124,7 +124,9 @@ trx64-daemon --machine u64 --speed-table u64  # the first Ultimate 64 (default: 
 trx64-daemon --headless                       # no A/V, no auto-run: command-driven only
 ```
 
-JSON-RPC 2.0 over WebSocket. One machine per process.
+JSON-RPC 2.0 over WebSocket. One machine per process, serving one project: `ping` names it,
+and `project/set` moves the daemon to another one in place — media written back and ejected,
+the machine cold-started, every client told (`project/changed`).
 
 ```json
 { "jsonrpc": "2.0", "id": 1, "method": "session/create", "params": { "pal": true } }
