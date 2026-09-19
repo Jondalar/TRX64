@@ -13175,20 +13175,9 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             if to - from > 31 {
                 return Response::err(id, -32602, "vic/line_trace: at most 32 lines per call");
             }
-            let cached = {
-                let st = state.lock().unwrap();
-                st.line_trace_cache.as_ref().filter(|(k, _)| *k == cp_id).map(|(_, f)| f.clone())
-            };
-            let frame = match cached {
-                Some(f) => f,
-                None => match line_trace_record(state, &cp_id) {
-                    Ok(f) => {
-                        let f = std::sync::Arc::new(f);
-                        state.lock().unwrap().line_trace_cache = Some((cp_id.clone(), f.clone()));
-                        f
-                    }
-                    Err(e) => return Response::err(id, -32001, format!("vic/line_trace: {e}")),
-                },
+            let frame = match line_trace_frame(state, &cp_id) {
+                Ok(f) => f,
+                Err(e) => return Response::err(id, -32001, format!("vic/line_trace: {e}")),
             };
             let lines = frame.lines_json(from, to, |i| {
                 let bytes = [i.opcode, i.b1, i.b2];
@@ -13196,6 +13185,25 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 format!("{} {}", d.mnemonic, d.operand).trim_end().to_string()
             });
             Response::ok(id, json!({ "checkpointId": cp_id, "frame": frame.header_json(), "lines": lines }))
+        }
+
+        // Spec 860 — the frozen frame as a view: the grid (a cell per line × cycle), every
+        // store that reached the VIC with where it lands, the objects on the screen with their
+        // bytes, and the techniques the record shows. Same recorded frame as vic/line_trace.
+        "vic/frame_map" => {
+            let cp_id = match req.params.get("checkpoint_id").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return Response::err(id, -32602, "vic/frame_map: checkpoint_id required"),
+            };
+            let include_cells = req.params.get("include_cells").and_then(|v| v.as_bool()).unwrap_or(true);
+            match line_trace_frame(state, &cp_id) {
+                Ok(f) => {
+                    let mut out = f.frame_map_json(include_cells);
+                    out["checkpointId"] = json!(cp_id);
+                    Response::ok(id, out)
+                }
+                Err(e) => Response::err(id, -32001, format!("vic/frame_map: {e}")),
+            }
         }
 
         // vic/inspect/region — resolve a VISIBLE-frame region to distinct nodes.
@@ -16580,6 +16588,23 @@ fn cp_for_inspect(st: &State, id: &str) -> Result<Value, String> {
         return Err(format!("vic/inspect: unknown or empty checkpoint {id}"));
     }
     Ok(cp)
+}
+
+/// Spec 859/860 — the recorded frame for a checkpoint, from the cache or a fresh replay.
+fn line_trace_frame(
+    state: &SharedState,
+    cp_id: &str,
+) -> Result<std::sync::Arc<trx64_core::vic_line_trace::LineTraceFrame>, String> {
+    let cached = {
+        let st = state.lock().unwrap();
+        st.line_trace_cache.as_ref().filter(|(k, _)| k == cp_id).map(|(_, f)| f.clone())
+    };
+    if let Some(f) = cached {
+        return Ok(f);
+    }
+    let f = std::sync::Arc::new(line_trace_record(state, cp_id)?);
+    state.lock().unwrap().line_trace_cache = Some((cp_id.to_string(), f.clone()));
+    Ok(f)
 }
 
 /// Spec 859 — record the frame a frozen inspect checkpoint shows.
@@ -20129,6 +20154,16 @@ mod batch1_tests {
         let t2 = call(&st, "vic/line_trace", json!({ "checkpoint_id": cp, "from": 51, "to": 51 }));
         assert_eq!(t2["frame"]["startClk"], t["frame"]["startClk"]);
         assert_eq!(t2["lines"][0]["badLine"], json!(true));
+        // Spec 860 — the frame map answers from the same recorded frame.
+        let fm = call(&st, "vic/frame_map", json!({ "checkpoint_id": cp }));
+        assert_eq!(fm["frame"]["startClk"], t["frame"]["startClk"]);
+        assert_eq!(fm["cells"].as_array().unwrap().len(), 312);
+        assert_eq!(fm["cells"][51].as_array().unwrap().len(), 63);
+        assert!(fm["objects"].as_array().unwrap().iter().any(|o| o["kind"] == "display" && o["rom"] == true));
+        assert_eq!(fm["techniques"], json!([]), "READY uses no trick");
+        let slim = call(&st, "vic/frame_map", json!({ "checkpoint_id": cp, "include_cells": false }));
+        assert!(slim.get("cells").is_none());
+        assert_eq!(call_err(&st, "vic/frame_map", json!({})).code, -32602);
         // Missing id / too many lines are refused.
         assert_eq!(call_err(&st, "vic/line_trace", json!({})).code, -32602);
         assert_eq!(call_err(&st, "vic/line_trace", json!({ "checkpoint_id": cp, "from": 0, "to": 40 })).code, -32602);

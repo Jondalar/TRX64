@@ -110,6 +110,28 @@ pub struct VicCycle {
     pub d016: u8,
     pub d018: u8,
     pub vbank: u16,
+
+    /// Spec 860 — for a display-state g-access: the cell it belongs to (VC before the fetch
+    /// advances it) and the cell's screen byte and colour-RAM nibble, as the fetch used them.
+    /// `phi1_data` is the graphics byte itself.
+    pub g_vc: u16,
+    pub g_char: u8,
+    pub g_color: u8,
+}
+
+/// Spec 860 — the sprite registers of one line, taken at cycle 20 (inside the line, after the
+/// pointer fetches that serve it).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LineSprites {
+    pub clk: u64,
+    pub line: u16,
+    /// 9-bit X per sprite.
+    pub x: [u16; 8],
+    pub pointer: [u8; 8],
+    pub color: [u8; 8],
+    pub mc: u8,
+    pub x_expand: u8,
+    pub y_expand: u8,
 }
 
 /// The Φ1 access a cycle is about to make, taken BEFORE the fetch (the fetch advances VC,
@@ -119,6 +141,9 @@ pub struct Phi1Access {
     pub kind: Phi1Kind,
     pub sprite: u8,
     pub addr: u16,
+    pub g_vc: u16,
+    pub g_char: u8,
+    pub g_color: u8,
 }
 
 /// Armed on `VicII::line_rec`. Collects one [`VicCycle`] per `tick`.
@@ -132,6 +157,10 @@ pub struct VicCycleRecorder {
     /// The previous cycle's flags: its Φ2 sprite fetch runs at the top of the next tick.
     pub(crate) prev_flags: u32,
     pub overflowed: bool,
+    /// Spec 860 — one entry per line.
+    pub lines: Vec<LineSprites>,
+    /// Spec 860 — every store that reached the VIC: (clk, register, value).
+    pub reg_writes: Vec<(u64, u8, u8)>,
 }
 
 impl VicCycleRecorder {
@@ -245,6 +274,9 @@ pub struct LineTraceFrame {
     pub cycles: Vec<VicCycle>,
     pub accesses: Vec<CpuAccess>,
     pub instructions: Vec<Instruction>,
+    /// Spec 860 — per line, the sprite registers; and every store that reached the VIC.
+    pub sprite_lines: Vec<LineSprites>,
+    pub reg_writes: Vec<(u64, u8, u8)>,
 }
 
 /// Where the VIC stands, as a position in its frame: `line * 63 + (cycle - 1)`, with cycle 1
@@ -332,7 +364,11 @@ pub fn record_frame(
     let accesses: Vec<CpuAccess> = obs.accesses.into_iter().filter(|a| a.clk >= start_clk && a.clk < end).collect();
     let instructions: Vec<Instruction> =
         obs.instructions.into_iter().filter(|i| i.end > start_clk && i.start < end).collect();
-    Ok(LineTraceFrame { which, start_clk, verified, anchor_clk, cycles, accesses, instructions })
+    let sprite_lines: Vec<LineSprites> =
+        rec.lines.into_iter().filter(|l| l.clk >= start_clk && l.clk < end).collect();
+    let reg_writes: Vec<(u64, u8, u8)> =
+        rec.reg_writes.into_iter().filter(|w| w.0 >= start_clk && w.0 < end).collect();
+    Ok(LineTraceFrame { which, start_clk, verified, anchor_clk, cycles, accesses, instructions, sprite_lines, reg_writes })
 }
 
 fn phi1_name(k: Phi1Kind) -> &'static str {
@@ -445,5 +481,638 @@ impl LineTraceFrame {
             "linesPerFrame": LINES_PER_FRAME,
             "fbOrigin": { "x": crate::render::CANVAS_X0, "y": crate::render::CANVAS_Y0 },
         })
+    }
+}
+
+// ── Spec 860 — the frame map: the grid, the writes, the objects ─────────────────────────
+
+/// Cell bits of the frame map (one `u16` per line × cycle).
+pub mod cell {
+    pub const BA: u16 = 1 << 0;
+    /// AEC low in Φ2: the VIC owns the bus.
+    pub const VIC_OWNS: u16 = 1 << 1;
+    /// BA low and no CPU access: the CPU is halted on a read.
+    pub const STALL: u16 = 1 << 2;
+    pub const C_ACCESS: u16 = 1 << 3;
+    pub const S_ACCESS: u16 = 1 << 4;
+    pub const P_ACCESS: u16 = 1 << 5;
+    pub const G_ACCESS: u16 = 1 << 6;
+    pub const REFRESH: u16 = 1 << 7;
+    pub const CPU_WRITE: u16 = 1 << 8;
+    pub const CPU_READ: u16 = 1 << 9;
+    pub const BAD_LINE: u16 = 1 << 10;
+    pub const VIC_WRITE: u16 = 1 << 11;
+    pub const IDLE_G: u16 = 1 << 12;
+}
+
+/// Registers whose value shapes the picture: a store to one inside the visible part of a line
+/// changes the picture from that pixel on.
+fn shapes_picture(reg: u8) -> bool {
+    matches!(reg, 0x00..=0x11 | 0x15..=0x18 | 0x1b..=0x1d | 0x20..=0x2e)
+}
+
+const VIS_X0: i64 = crate::render::CANVAS_X0 as i64;
+const VIS_Y0: i64 = crate::render::CANVAS_Y0 as i64;
+const VIS_W: i64 = 384;
+const VIS_H: i64 = 272;
+
+/// The display mode of a g-access, the per-cell multicolour bit included.
+fn g_mode(c: &VicCycle) -> &'static str {
+    let ecm = c.d011 & 0x40 != 0;
+    let bmm = c.d011 & 0x20 != 0;
+    let mcm = c.d016 & 0x10 != 0;
+    match (ecm, bmm, mcm) {
+        (false, false, false) => "text",
+        (false, false, true) => {
+            if c.g_color & 0x08 != 0 {
+                "text multicolour"
+            } else {
+                "text hires (in MC mode)"
+            }
+        }
+        (true, false, false) => "text ECM",
+        (false, true, false) => "bitmap",
+        (false, true, true) => "bitmap multicolour",
+        _ => "invalid mode",
+    }
+}
+
+/// One cell of the display as the frame drew it: a VC position on a run of lines.
+struct Cell {
+    col: usize,
+    vc: u16,
+    l0: u16,
+    l1: u16,
+    mode: &'static str,
+    screen: u16,
+    /// Charset base for text modes, bitmap base for bitmap modes.
+    data: u16,
+    bank: u16,
+    rom: bool,
+    xscroll: u8,
+    chr: u8,
+    nonempty: bool,
+}
+
+fn find(p: &mut [usize], x: usize) -> usize {
+    let mut r = x;
+    while p[r] != r {
+        r = p[r];
+    }
+    let mut y = x;
+    while p[y] != r {
+        let n = p[y];
+        p[y] = r;
+        y = n;
+    }
+    r
+}
+
+fn coalesce(mut spans: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    spans.sort();
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    for (a, b) in spans {
+        if let Some(last) = out.last_mut() {
+            if a <= last.1 + 1 {
+                last.1 = last.1.max(b);
+                continue;
+            }
+        }
+        out.push((a, b));
+    }
+    out
+}
+
+impl LineTraceFrame {
+    /// The visible-frame x of the pixels drawn in each cycle (1..=63), `None` outside the
+    /// visible window. The draw column of a cycle is the same on every line.
+    fn cycle_x(&self) -> Vec<Option<i64>> {
+        let base = 100 * CYCLES_PER_LINE as usize;
+        (0..CYCLES_PER_LINE as usize)
+            .map(|i| {
+                let c = &self.cycles[base + i];
+                let x = c.fb_x as i64 - VIS_X0;
+                (c.fb_line == 100 && (0..VIS_W).contains(&x)).then_some(x)
+            })
+            .collect()
+    }
+
+    /// Spec 860 — everything the frozen-frame view draws, from one recorded frame.
+    pub fn frame_map_json(&self, include_cells: bool) -> Value {
+        let cyc_x = self.cycle_x();
+        let n = CYCLES_PER_LINE as usize;
+
+        // CPU accesses per clk.
+        let mut acc_at: std::collections::HashMap<u64, (bool, bool)> = std::collections::HashMap::new();
+        for a in &self.accesses {
+            let e = acc_at.entry(a.clk).or_insert((false, false));
+            match a.kind {
+                BusKind::Write | BusKind::DummyWrite => e.0 = true,
+                _ => e.1 = true,
+            }
+        }
+        let clk_index = |clk: u64| -> Option<(usize, usize)> {
+            let i = clk.checked_sub(self.start_clk)? as usize;
+            (i < self.cycles.len()).then_some((i / n, i % n))
+        };
+        let vic_write_at: std::collections::HashSet<u64> = self.reg_writes.iter().map(|w| w.0).collect();
+
+        // ── cells + per-line summary ──
+        let mut cells: Vec<Vec<u16>> = Vec::with_capacity(LINES_PER_FRAME as usize);
+        let mut lines = Vec::with_capacity(LINES_PER_FRAME as usize);
+        for l in 0..LINES_PER_FRAME as usize {
+            let row = &self.cycles[l * n..l * n + n];
+            let bad = row.iter().any(|c| c.bad_line);
+            let (mut stalled, mut owned, mut ba_n) = (0u32, 0u32, 0u32);
+            let mut dma = 0u8;
+            let mut out = Vec::with_capacity(n);
+            for c in row {
+                let (w, r) = acc_at.get(&c.clk).copied().unwrap_or((false, false));
+                let mut b = 0u16;
+                if c.ba {
+                    b |= cell::BA;
+                    ba_n += 1;
+                }
+                if c.aec {
+                    b |= cell::VIC_OWNS;
+                    owned += 1;
+                }
+                if c.ba && !w && !r {
+                    b |= cell::STALL;
+                    stalled += 1;
+                }
+                if c.phi2 == Phi2Kind::Matrix {
+                    b |= cell::C_ACCESS;
+                }
+                if c.phi2 == Phi2Kind::SpriteData || c.phi1 == Phi1Kind::SpriteData {
+                    b |= cell::S_ACCESS;
+                }
+                match c.phi1 {
+                    Phi1Kind::SpritePointer => b |= cell::P_ACCESS,
+                    Phi1Kind::Graphics => b |= cell::G_ACCESS,
+                    Phi1Kind::IdleGraphics => b |= cell::IDLE_G,
+                    Phi1Kind::Refresh => b |= cell::REFRESH,
+                    _ => {}
+                }
+                if w {
+                    b |= cell::CPU_WRITE;
+                }
+                if r {
+                    b |= cell::CPU_READ;
+                }
+                if bad {
+                    b |= cell::BAD_LINE;
+                }
+                if vic_write_at.contains(&c.clk) {
+                    b |= cell::VIC_WRITE;
+                }
+                dma |= c.sprite_dma;
+                out.push(b);
+            }
+            lines.push(json!({ "line": l, "badLine": bad, "ba": ba_n, "stalled": stalled, "vicOwned": owned, "spriteDma": dma }));
+            cells.push(out);
+        }
+
+        // ── writes that reached the VIC ──
+        let writes: Vec<Value> = self
+            .reg_writes
+            .iter()
+            .filter_map(|&(clk, reg, value)| {
+                let (l, i) = clk_index(clk)?;
+                let x = cyc_x[i];
+                let visible_line = (VIS_Y0..VIS_Y0 + VIS_H).contains(&(l as i64));
+                let mid = shapes_picture(reg) && x.is_some() && visible_line;
+                Some(json!({
+                    "line": l,
+                    "cycle": i + 1,
+                    "reg": reg,
+                    "addr": 0xd000u16 + reg as u16,
+                    "value": value,
+                    "x": x,
+                    "shapesPicture": shapes_picture(reg),
+                    "midLine": mid,
+                }))
+            })
+            .collect();
+
+        // ── display objects: connected non-empty cells sharing mode and source ──
+        let mut cells_list: Vec<Cell> = Vec::new();
+        // per column: index of the open cell
+        let mut open: [Option<usize>; 40] = [None; 40];
+        for l in 0..LINES_PER_FRAME as usize {
+            let row = &self.cycles[l * n..l * n + n];
+            let mut seen = [false; 40];
+            for (j, c) in row.iter().filter(|c| c.phi1 == Phi1Kind::Graphics).enumerate().take(40) {
+                seen[j] = true;
+                let mode = g_mode(c);
+                let bitmap = c.d011 & 0x20 != 0;
+                let screen = c.vbank.wrapping_add(((c.d018 >> 4) as u16) * 0x400);
+                let data = if bitmap {
+                    c.vbank.wrapping_add(((c.d018 & 0x08) as u16) << 10)
+                } else {
+                    c.vbank.wrapping_add((((c.d018 >> 1) & 0x07) as u16) * 0x800)
+                };
+                let rom = !bitmap && c.vbank & 0x4000 == 0 && (data & 0x7000) == 0x1000;
+                let extend = open[j].and_then(|k| {
+                    let e = &cells_list[k];
+                    (e.vc == c.g_vc && e.l1 as usize + 1 == l && e.mode == mode && e.screen == screen && e.data == data)
+                        .then_some(k)
+                });
+                match extend {
+                    Some(k) => {
+                        let e = &mut cells_list[k];
+                        e.l1 = l as u16;
+                        e.nonempty |= c.phi1_data != 0;
+                    }
+                    None => {
+                        cells_list.push(Cell {
+                            col: j,
+                            vc: c.g_vc,
+                            l0: l as u16,
+                            l1: l as u16,
+                            mode,
+                            screen,
+                            data,
+                            bank: c.vbank,
+                            rom,
+                            xscroll: c.d016 & 0x07,
+                            chr: c.g_char,
+                            nonempty: c.phi1_data != 0,
+                        });
+                        open[j] = Some(cells_list.len() - 1);
+                    }
+                }
+            }
+            for (j, s) in seen.iter().enumerate() {
+                if !s {
+                    open[j] = None;
+                }
+            }
+        }
+        let same_key = |a: &Cell, b: &Cell| a.mode == b.mode && a.screen == b.screen && a.data == b.data && a.bank == b.bank;
+        let mut parent: Vec<usize> = (0..cells_list.len()).collect();
+        // Index cells by (row start line, column) for the neighbour search.
+        let mut by_pos: std::collections::HashMap<(u16, usize), usize> = std::collections::HashMap::new();
+        for (k, c) in cells_list.iter().enumerate() {
+            by_pos.insert((c.l0, c.col), k);
+        }
+        for k in 0..cells_list.len() {
+            if !cells_list[k].nonempty {
+                continue;
+            }
+            let (l0, l1, col) = (cells_list[k].l0, cells_list[k].l1, cells_list[k].col);
+            // Right neighbour, or across one empty cell of the same row.
+            for gap in [1usize, 2] {
+                if let Some(&m) = by_pos.get(&(l0, col + gap)) {
+                    if cells_list[m].nonempty && same_key(&cells_list[k], &cells_list[m]) {
+                        let (a, b) = (find(&mut parent, k), find(&mut parent, m));
+                        parent[a] = b;
+                        break;
+                    }
+                    if gap == 1 && cells_list[m].nonempty {
+                        break; // a different object sits right next to it
+                    }
+                }
+            }
+            // The cell directly below.
+            if let Some(&m) = by_pos.get(&(l1 + 1, col)) {
+                if cells_list[m].nonempty && same_key(&cells_list[k], &cells_list[m]) {
+                    let (a, b) = (find(&mut parent, k), find(&mut parent, m));
+                    parent[a] = b;
+                }
+            }
+        }
+        let mut groups: std::collections::BTreeMap<usize, Vec<usize>> = std::collections::BTreeMap::new();
+        for (k, c) in cells_list.iter().enumerate() {
+            if c.nonempty {
+                let r = find(&mut parent, k);
+                groups.entry(r).or_default().push(k);
+            }
+        }
+        let mut objects: Vec<Value> = Vec::new();
+        for ks in groups.values() {
+            let c0 = &cells_list[ks[0]];
+            let bitmap = c0.mode.starts_with("bitmap");
+            let (mut x0, mut x1, mut y0, mut y1) = (i64::MAX, i64::MIN, i64::MAX, i64::MIN);
+            let mut screen: Vec<(u32, u32)> = Vec::new();
+            let mut color: Vec<(u32, u32)> = Vec::new();
+            let mut data: Vec<(u32, u32)> = Vec::new();
+            let mut chars = std::collections::BTreeSet::new();
+            for &k in ks {
+                let c = &cells_list[k];
+                let x = 32 + 8 * c.col as i64 + c.xscroll as i64;
+                x0 = x0.min(x);
+                x1 = x1.max(x + 8);
+                y0 = y0.min(c.l0 as i64 - VIS_Y0);
+                y1 = y1.max(c.l1 as i64 + 1 - VIS_Y0);
+                let vc = (c.vc & 0x3ff) as u32;
+                screen.push((c.screen as u32 + vc, c.screen as u32 + vc));
+                color.push((0xd800 + vc, 0xd800 + vc));
+                if bitmap {
+                    let a = c.data as u32 + vc * 8;
+                    data.push((a, a + 7));
+                } else {
+                    chars.insert(c.chr);
+                    let ch = if c.mode == "text ECM" { c.chr & 0x3f } else { c.chr } as u32;
+                    let a = c.data as u32 + ch * 8;
+                    data.push((a, a + 7));
+                }
+            }
+            let rng = |v: Vec<(u32, u32)>| -> Vec<Value> {
+                coalesce(v).into_iter().map(|(a, b)| json!({ "addr": a, "length": b - a + 1 })).collect()
+            };
+            let cols = (x1 - x0) / 8;
+            let label = format!(
+                "{} · {} ${:04x}{} · screen ${:04x} · bank ${:04x} · {} cells",
+                c0.mode,
+                if bitmap { "bitmap" } else { "chars" },
+                c0.data,
+                if c0.rom { " (ROM)" } else { "" },
+                c0.screen,
+                c0.bank,
+                ks.len()
+            );
+            objects.push(json!({
+                "kind": "display",
+                "mode": c0.mode,
+                "label": label,
+                "x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0,
+                "cells": ks.len(),
+                "cols": cols,
+                "bank": c0.bank,
+                "screenBase": c0.screen,
+                "dataBase": c0.data,
+                "rom": c0.rom,
+                "chars": chars.len(),
+                "ranges": {
+                    "screen": rng(screen),
+                    "colour": rng(color),
+                    (if bitmap { "bitmap" } else { "charset" }): rng(data),
+                },
+            }));
+        }
+
+        // ── sprites: one frame per appearance ──
+        let sl: std::collections::HashMap<u16, &LineSprites> = self.sprite_lines.iter().map(|l| (l.line, l)).collect();
+        for i in 0..8usize {
+            let mut run: Option<(u16, u16, u16, u8, bool)> = None; // (first line, last line, x, pointer, xexp)
+            let flush = |run: Option<(u16, u16, u16, u8, bool)>, objects: &mut Vec<Value>| {
+                if let Some((a, b, x, ptr, xexp)) = run {
+                    let s = sl.get(&a).copied();
+                    let bank = self.cycles[a as usize * n].vbank;
+                    let d018 = self.cycles[a as usize * n + 20].d018;
+                    let screen = bank.wrapping_add(((d018 >> 4) as u16) * 0x400);
+                    let mc = s.map(|s| s.mc >> i & 1 == 1).unwrap_or(false);
+                    let yexp = s.map(|s| s.y_expand >> i & 1 == 1).unwrap_or(false);
+                    let color = s.map(|s| s.color[i]).unwrap_or(0);
+                    let block = bank as u32 + ptr as u32 * 64;
+                    let w = if xexp { 48 } else { 24 };
+                    objects.push(json!({
+                        "kind": "sprite",
+                        "sprite": i,
+                        "label": format!("sprite {i}{}{} · ptr ${ptr:02x} → ${block:04x} · x {x}", if mc { " · MC" } else { "" }, if xexp || yexp { " · expanded" } else { "" }),
+                        "x": x as i64 - 24 + 32, "y": a as i64 - VIS_Y0, "w": w, "h": (b - a + 1) as i64,
+                        "lines": [a, b],
+                        "pointer": ptr,
+                        "mc": mc, "xExpand": xexp, "yExpand": yexp, "color": color,
+                        "ranges": {
+                            "sprite": [{ "addr": block, "length": 63 }],
+                            "pointer": [{ "addr": screen as u32 + 0x3f8 + i as u32, "length": 1 }],
+                        },
+                    }));
+                }
+            };
+            // A sprite line is drawn from the bytes the chip fetched for it: the s-accesses of
+            // sprites 0–2 fall at the end of the line before (cycle 58 on), those of 3–7 at the
+            // start of the line itself. The display bit lags a line behind the last fetch, so
+            // it would add a 22nd line to a 21-line sprite.
+            let mut drawn = vec![false; LINES_PER_FRAME as usize + 1];
+            for (g, c) in self.cycles.iter().enumerate() {
+                let is_s = (c.phi1 == Phi1Kind::SpriteData && c.phi1_sprite as usize == i)
+                    || (c.phi2 == Phi2Kind::SpriteData && c.phi2_sprite as usize == i);
+                if is_s {
+                    let l = g / n + usize::from(c.cycle >= 58);
+                    if l < drawn.len() {
+                        drawn[l] = true;
+                    }
+                }
+            }
+            for (l, &shown) in drawn.iter().enumerate().take(LINES_PER_FRAME as usize) {
+                let st = sl.get(&(l as u16)).copied();
+                let cur = if shown { st.map(|s| (s.x[i], s.pointer[i], s.x_expand >> i & 1 == 1)) } else { None };
+                run = match (run, cur) {
+                    (Some((a, b, x, p, e)), Some((cx, cp, ce))) if cx == x && cp == p && ce == e && b as usize + 1 == l => Some((a, l as u16, x, p, e)),
+                    (prev, Some((cx, cp, ce))) => {
+                        flush(prev, &mut objects);
+                        Some((l as u16, l as u16, cx, cp, ce))
+                    }
+                    (prev, None) => {
+                        flush(prev, &mut objects);
+                        None
+                    }
+                };
+            }
+            flush(run, &mut objects);
+        }
+
+        let techniques = self.techniques(&objects, &writes);
+
+        let mut out = json!({
+            "frame": self.header_json(),
+            "techniques": techniques,
+            "geometry": { "visible": { "fbX": VIS_X0, "fbY": VIS_Y0, "w": VIS_W, "h": VIS_H }, "cycleX": cyc_x },
+            "cellBits": {
+                "ba": cell::BA, "vicOwns": cell::VIC_OWNS, "stall": cell::STALL, "cAccess": cell::C_ACCESS,
+                "sAccess": cell::S_ACCESS, "pAccess": cell::P_ACCESS, "gAccess": cell::G_ACCESS,
+                "refresh": cell::REFRESH, "cpuWrite": cell::CPU_WRITE, "cpuRead": cell::CPU_READ,
+                "badLine": cell::BAD_LINE, "vicWrite": cell::VIC_WRITE, "idleG": cell::IDLE_G,
+            },
+            "lines": lines,
+            "writes": writes,
+            "objects": objects,
+        });
+        if include_cells {
+            out["cells"] = json!(cells);
+        }
+        out
+    }
+}
+
+// ── Spec 860 — the techniques, as rules over the record ─────────────────────────────────
+//
+// Each rule is a predicate on what the chip did in this frame — bad lines, idle state,
+// border flip-flops, fetch cycles, sprite fetches, register stores — named after the
+// technique the demo-coding literature uses for it (Åkesson's VIC timing chart and MISC notes,
+// Bauer's VIC article, the vicspector trick reference). A rule fires only on the evidence; it
+// says which lines and why. None of them predicts anything.
+
+/// Runs of consecutive line numbers.
+fn runs(lines: &[usize]) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for &l in lines {
+        match out.last_mut() {
+            Some(r) if r.1 + 1 == l => r.1 = l,
+            _ => out.push((l, l)),
+        }
+    }
+    out
+}
+
+impl LineTraceFrame {
+    fn row(&self, l: usize) -> &[VicCycle] {
+        let n = CYCLES_PER_LINE as usize;
+        &self.cycles[l * n..l * n + n]
+    }
+
+    fn techniques(&self, objects: &[Value], writes: &[Value]) -> Vec<Value> {
+        let mut out: Vec<Value> = Vec::new();
+        let mut push = |rule: &str, name: &str, a: usize, b: usize, detail: String, source: &str| {
+            out.push(json!({ "rule": rule, "name": name, "lines": [a, b], "detail": detail, "source": source }));
+        };
+        let nl = LINES_PER_FRAME as usize;
+        let visible = |l: usize| (VIS_Y0 as usize..(VIS_Y0 + VIS_H) as usize).contains(&l);
+
+        // Split: the mode or the memory the VIC reads changes between two lines.
+        let key = |r: &[VicCycle]| {
+            let c = &r[20];
+            (c.d011 & 0x60, c.d016 & 0x10, c.d018, c.vbank)
+        };
+        let mut split_lines = Vec::new();
+        let mut split_detail: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
+        for l in 1..nl {
+            let (a, b) = (key(self.row(l - 1)), key(self.row(l)));
+            if a != b && visible(l) {
+                let mut d = Vec::new();
+                if a.0 != b.0 || a.1 != b.1 {
+                    d.push(format!("mode {}→{}", g_mode(&self.row(l - 1)[20]), g_mode(&self.row(l)[20])));
+                }
+                if a.2 != b.2 {
+                    d.push(format!("$D018 ${:02x}→${:02x}", a.2, b.2));
+                }
+                if a.3 != b.3 {
+                    d.push(format!("bank ${:04x}→${:04x}", a.3, b.3));
+                }
+                split_lines.push(l);
+                split_detail.insert(l, d.join(", "));
+            }
+        }
+        for (a, b) in runs(&split_lines) {
+            if a == b {
+                push("split", "Raster split", a, b, format!("at line {a}: {}", split_detail[&a]), "a register change between two lines");
+            } else {
+                push("split", "Split on every line", a, b, format!("{} lines change mode or memory, first: {}", b - a + 1, split_detail[&a]), "a register change on every line — FLI-style");
+            }
+        }
+
+        // FLI: a bad line on consecutive lines. A plain screen has one in eight.
+        let bad: Vec<usize> = (0..nl).filter(|&l| self.row(l).iter().any(|c| c.bad_line)).collect();
+        for (a, b) in runs(&bad) {
+            if b - a + 1 >= 4 {
+                let d018: std::collections::BTreeSet<u8> = (a..=b).map(|l| self.row(l)[20].d018).collect();
+                push("fli", "FLI", a, b, format!("{} consecutive bad lines, {} different $D018 values", b - a + 1, d018.len()), "Åkesson, VIC timing chart: a bad line forced on every line");
+            }
+        }
+
+        // FLD: idle lines inside the display window, between two display rows — the next bad
+        // line was pushed down.
+        let display = |l: usize| self.row(l).iter().any(|c| c.phi1 == Phi1Kind::Graphics);
+        let idle = |l: usize| self.row(l).iter().any(|c| c.phi1 == Phi1Kind::IdleGraphics) && !display(l);
+        let first_disp = (0..nl).find(|&l| display(l));
+        let last_disp = (0..nl).rev().find(|&l| display(l));
+        if let (Some(f), Some(e)) = (first_disp, last_disp) {
+            let gaps: Vec<usize> = (f..=e).filter(|&l| idle(l)).collect();
+            for (a, b) in runs(&gaps) {
+                push("fld", "FLD", a, b, format!("{} idle lines between display rows — the bad line was pushed down", b - a + 1), "vicspector trick reference: FLD");
+            }
+        }
+
+        // Linecrunch: a display row that ends before its eighth line and the next row starts
+        // straight after it.
+        let row_start = |l: usize| self.row(l).iter().find(|c| c.phi1 == Phi1Kind::Graphics).map(|c| c.g_vc);
+        let mut l = 0;
+        while l < nl {
+            let Some(vc) = row_start(l) else {
+                l += 1;
+                continue;
+            };
+            let mut e = l;
+            while e + 1 < nl && row_start(e + 1) == Some(vc) {
+                e += 1;
+            }
+            let len = e - l + 1;
+            if len < 8 && e + 1 < nl && row_start(e + 1).is_some() && first_disp != Some(l) {
+                push("linecrunch", "Linecrunch", l, e, format!("a character row of {len} lines, the next row starts at line {}", e + 1), "vicspector trick reference: linecrunch");
+            }
+            l = e + 1;
+        }
+
+        // DMA delay (VSP): a bad line whose c-accesses do not start at cycle 15.
+        for &l in &bad {
+            if let Some(c) = self.row(l).iter().find(|c| c.phi2 == Phi2Kind::Matrix) {
+                if c.cycle != 15 {
+                    push("dma_delay", "DMA delay (VSP)", l, l, format!("the c-accesses start at cycle {} instead of 15", c.cycle), "vicspector trick reference: DMA delay");
+                }
+            }
+        }
+
+        // Side borders open: the vertical border is off and the main border flip-flop never
+        // closes at the right edge.
+        let side: Vec<usize> = (0..nl)
+            .filter(|&l| visible(l))
+            .filter(|&l| {
+                let r = self.row(l);
+                !r[29].vertical_border && r[56..63].iter().all(|c| !c.main_border)
+            })
+            .collect();
+        for (a, b) in runs(&side) {
+            push("side_border", "Side borders open", a, b, format!("{} lines where the main border never closes", b - a + 1), "vicspector trick reference: opening the side borders");
+        }
+
+        // Top/bottom border open: lines outside the display window where the vertical border
+        // flip-flop is off.
+        let tb: Vec<usize> = (0..nl)
+            .filter(|&l| visible(l))
+            .filter(|&l| {
+                let r = self.row(l);
+                let rsel = r[20].d011 & 0x08 != 0;
+                let (top, bottom) = if rsel { (51, 250) } else { (55, 246) };
+                (l < top || l > bottom) && !r[29].vertical_border
+            })
+            .collect();
+        for (a, b) in runs(&tb) {
+            push("tb_border", "Top/bottom border open", a, b, format!("{} lines outside the display window with the vertical border off", b - a + 1), "Bauer, VIC article: the vertical border flip-flop");
+        }
+
+        // Sprites: a multiplexer, and heights that are not 21 (or 42 expanded).
+        let mut by_sprite: std::collections::BTreeMap<u64, Vec<&Value>> = std::collections::BTreeMap::new();
+        for o in objects.iter().filter(|o| o["kind"] == "sprite") {
+            by_sprite.entry(o["sprite"].as_u64().unwrap_or(0)).or_default().push(o);
+        }
+        for (i, fs) in &by_sprite {
+            if fs.len() >= 2 {
+                let a = fs[0]["lines"][0].as_u64().unwrap_or(0) as usize;
+                let b = fs[fs.len() - 1]["lines"][1].as_u64().unwrap_or(0) as usize;
+                push("multiplexer", "Sprite multiplexer", a, b, format!("sprite {i} is drawn {} times in the frame", fs.len()), "one sprite reused down the screen");
+            }
+            for f in fs {
+                let (a, b) = (f["lines"][0].as_u64().unwrap_or(0) as usize, f["lines"][1].as_u64().unwrap_or(0) as usize);
+                let h = b - a + 1;
+                let want = if f["yExpand"] == true { 42 } else { 21 };
+                if h != want && a > 0 && b + 1 < nl {
+                    push("sprite_height", if h < want { "Sprite crunch" } else { "Sprite stretch" }, a, b, format!("sprite {i} is {h} lines high, not {want}"), "Åkesson, MISC notes: sprite crunch and stretch");
+                }
+            }
+        }
+
+        // Mid-line stores to a register that shapes the picture.
+        let mut mid: std::collections::BTreeMap<u64, Vec<usize>> = std::collections::BTreeMap::new();
+        for w in writes.iter().filter(|w| w["midLine"] == true) {
+            mid.entry(w["reg"].as_u64().unwrap_or(0)).or_default().push(w["line"].as_u64().unwrap_or(0) as usize);
+        }
+        for (reg, ls) in mid {
+            let (a, b) = (ls[0], ls[ls.len() - 1]);
+            push("mid_line", "Mid-line change", a, b, format!("{} store(s) to $D0{reg:02X} inside the visible part of a line", ls.len()), "the change starts at the pixel the store lands on");
+        }
+        out
     }
 }

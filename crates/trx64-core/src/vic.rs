@@ -1631,28 +1631,36 @@ impl VicII {
         use crate::vic_line_trace::{Phi1Access, Phi1Kind};
         if cycle_is_fetch_g(flags) {
             return if !self.idle_state {
-                Phi1Access { kind: Phi1Kind::Graphics, sprite: 0, addr: self.graphics_fetch_addr() }
+                let m = (self.vmli as usize).min(39);
+                Phi1Access {
+                    kind: Phi1Kind::Graphics,
+                    sprite: 0,
+                    addr: self.graphics_fetch_addr(),
+                    g_vc: self.vc,
+                    g_char: self.vbuf[m],
+                    g_color: self.cbuf[m],
+                }
             } else {
-                Phi1Access { kind: Phi1Kind::IdleGraphics, sprite: 0, addr: self.idle_gfx_addr() }
+                Phi1Access { kind: Phi1Kind::IdleGraphics, sprite: 0, addr: self.idle_gfx_addr(), ..Default::default() }
             };
         }
         if cycle_is_sprite_ptr_dma0(flags) {
             let s = cycle_get_sprite_num(flags);
-            return Phi1Access { kind: Phi1Kind::SpritePointer, sprite: s as u8, addr: self.v_fetch_addr(0x3f8 + s as u16) };
+            return Phi1Access { kind: Phi1Kind::SpritePointer, sprite: s as u8, addr: self.v_fetch_addr(0x3f8 + s as u16), ..Default::default() };
         }
         if cycle_is_sprite_dma1_dma2(flags) {
             let s = cycle_get_sprite_num(flags);
             return if self.sprite_dma & (1 << s) != 0 {
                 let addr = ((self.sprite[s].pointer as u16) << 6).wrapping_add(self.sprite[s].mc as u16);
-                Phi1Access { kind: Phi1Kind::SpriteData, sprite: s as u8, addr }
+                Phi1Access { kind: Phi1Kind::SpriteData, sprite: s as u8, addr, ..Default::default() }
             } else {
-                Phi1Access { kind: Phi1Kind::Idle, sprite: s as u8, addr: 0x3fff }
+                Phi1Access { kind: Phi1Kind::Idle, sprite: s as u8, addr: 0x3fff, ..Default::default() }
             };
         }
         if cycle_is_refresh(flags) {
-            return Phi1Access { kind: Phi1Kind::Refresh, sprite: 0, addr: 0x3f00u16.wrapping_add(self.refresh_counter as u16) };
+            return Phi1Access { kind: Phi1Kind::Refresh, sprite: 0, addr: 0x3f00u16.wrapping_add(self.refresh_counter as u16), ..Default::default() };
         }
-        Phi1Access { kind: Phi1Kind::Idle, sprite: 0, addr: 0x3fff }
+        Phi1Access { kind: Phi1Kind::Idle, sprite: 0, addr: 0x3fff, ..Default::default() }
     }
 
     /// End of the tick: the whole cycle.
@@ -1705,9 +1713,37 @@ impl VicII {
             d016: self.regs[R_CTRL2 as usize],
             d018: self.regs[R_MEM_PTR as usize],
             vbank,
+            g_vc: p1.g_vc,
+            g_char: p1.g_char,
+            g_color: p1.g_color,
         };
+        // Spec 860 — the line's sprite registers, once per line (cycle 20).
+        let sprites = (self.raster_cycle == 19).then(|| {
+            let mut x = [0u16; NUM_SPRITES];
+            let mut pointer = [0u8; NUM_SPRITES];
+            let mut color = [0u8; NUM_SPRITES];
+            for i in 0..NUM_SPRITES {
+                x[i] = self.regs[2 * i] as u16 | (((self.regs[0x10] >> i) & 1) as u16) << 8;
+                pointer[i] = self.sprite[i].pointer;
+                color[i] = self.regs[0x27 + i] & 0x0f;
+            }
+            crate::vic_line_trace::LineSprites {
+                clk: 0,
+                line,
+                x,
+                pointer,
+                color,
+                mc: self.regs[0x1c],
+                x_expand: self.regs[0x1d],
+                y_expand: self.regs[0x17],
+            }
+        });
         if let Some(r) = self.line_rec.as_deref_mut() {
             r.push(rec);
+            if let Some(mut ls) = sprites {
+                ls.clk = r.clk;
+                r.lines.push(ls);
+            }
         }
     }
 
@@ -2047,6 +2083,11 @@ impl VicII {
     /// 6 bits). Reproduces the register side effects timing depends on.
     pub fn write_reg(&mut self, offset: u8, value: u8) {
         let addr = offset & 0x3f;
+        // Spec 860 — a store that reached the VIC, for the frame map. Register writes are
+        // rare next to cycles; this test is not on the per-cycle path.
+        if let Some(r) = self.line_rec.as_deref_mut() {
+            r.reg_writes.push((r.clk, addr, value));
+        }
         // vicii-mem.c:339 — last_bus_phi2 = value.
         self.last_bus_phi2 = value;
 

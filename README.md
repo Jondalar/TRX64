@@ -128,7 +128,9 @@ JSON-RPC 2.0 over WebSocket. One machine per process, serving one project: `ping
 and `project/set` moves the daemon to another one in place — media written back and ejected,
 the machine cold-started, every client told (`project/changed`).
 `vic/line_trace` answers, for a frozen inspect checkpoint, what the VIC and the CPU did on a
-raster line cycle by cycle — replayed in a clone of the machine, never on the live one.
+raster line cycle by cycle — replayed in a clone of the machine, never on the live one —
+and `vic/frame_map` the whole frame: the cell grid, the stores to the VIC, the objects on the
+screen with their memory, and the raster techniques the frame uses.
 
 ```json
 { "jsonrpc": "2.0", "id": 1, "method": "session/create", "params": { "pal": true } }
