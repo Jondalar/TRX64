@@ -62,6 +62,8 @@ pub(crate) use daemon::{
     stream_maybe_feed_recorder,
     // Spec 863 — the A/V hello the stream sends a client on subscribe.
     av_hello,
+    // Spec 863 — the stream loop catches a model change the transport made.
+    sync_model_identity,
     // Spec 808 — the rewind transport's per-frame tick, called by the stream loop.
     transport_tick,
 };

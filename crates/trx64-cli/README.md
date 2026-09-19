@@ -19,6 +19,9 @@ cargo run -p trx64-cli --release
 # cockpit + the emulator window at launch
 cargo run -p trx64-cli --release -- --window
 
+# an NTSC C64 (`--model c64-ntsc`; also c64-paln) — cockpit, mon, boot and sandbox alike
+cargo run -p trx64-cli --release -- --video ntsc --window
+
 # one-shot: run a single command, print, exit (scripting / CI)
 cargo run -p trx64-cli --release -- mon "d c000"
 
@@ -99,7 +102,7 @@ filesystem verbs sit behind `!`, like a coding tool's shell escape.
 | `/pause` · `/step` | freeze / single-step one instruction |
 | `/mount <path>` · `/eject` (`/umount`) | insert a `.d64`/`.g64` (disk swaps live) or `.crt` (cold-boots) / eject the cart or unmount drive 8 |
 | `/load <prg>` | load a `.prg` into RAM (no run) |
-| `/warp on\|off` | 8× / real-time PAL pacing |
+| `/warp on\|off` | 8× / real-time pacing (the model's frame rate) |
 | `/joystick off\|port1\|port2` | route WASD+Space to the joystick (off = type) |
 | `/window` | spawn the native emulator window |
 | `/dump <path>` · `/restore <path>` (`/undump`) | write / load a `.c64re` snapshot |
@@ -213,8 +216,8 @@ window, debug in the cockpit at the same time**.
 ## Run-state model
 
 The host pump is the clock: a `/run`/`/pause` flag drives a per-frame loop that advances
-the machine by **real wall-clock time** (so it runs at true PAL rate and audio stays at
-44100 Hz). Daemon-side run intents are reconciled automatically — `/mount` and the
+the machine by **real wall-clock time** (so it runs at the model's true rate — PAL or NTSC
+— and audio stays at 44100 Hz). Daemon-side run intents are reconciled automatically — `/mount` and the
 monitor `g`/`x` continue both resume the machine. A **JAM/KIL** halts cleanly (PC frozen
 at the opcode, the FLOW line shows the stop) instead of hanging, so you can then
 `whowrote` / `rstep` / triage the crash.

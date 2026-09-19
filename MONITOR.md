@@ -93,6 +93,8 @@ you care about across interrupts.
 | `flow` | the interrupt/trap flow-frame stack |
 | `bt` | backtrace (stack scan + flow frames) |
 | `reset` | cold reset |
+| `model` | which C64 this is — PAL, NTSC or PAL-N: the VIC-II, the frame (cycles × lines), the clock, the frame rate, the canvas — and every model this build knows, with what the ones that cannot run are missing |
+| `model <row>` | switch the running machine to another model (`c64-pal`, `c64-ntsc`, `c64-paln`) at the next frame boundary. Not a power cycle: the program keeps its state and the standard it detected at boot; `reset` or `power off`/`power on` afterwards for a clean start on the new model. The model survives resets and power cycles, and a snapshot or checkpoint restores the model it was taken on |
 
 ### Memory  (prefix any with a bank `lens`)
 | command | what it does |

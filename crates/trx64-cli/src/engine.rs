@@ -390,7 +390,7 @@ impl Engine {
     /// `session/cart_status` rpcs (no machine mutation).
     fn verb_settings(&self) -> CmdResult {
         let running = if self.is_running() { "running" } else { "paused" };
-        let pacing = if self.is_warp() { "warp (8×)" } else { "PAL real-time (1×)" };
+        let pacing = if self.is_warp() { "warp (8×)" } else { "real time (1×)" };
         let joy = match self.joystick_mode() {
             0 => "off (WASD/Space type normally)".to_string(),
             p => format!("port {p} (WASD = directions, Space = fire)"),
@@ -505,6 +505,8 @@ pub struct StateSnapshot {
     pub drive: DriveSnapshot,
     /// The cartridge panel, `None` when the port is empty.
     pub cart: Option<CartSnapshot>,
+    /// Spec 863 — the video standard of the machine's model (`pal`, `ntsc`, `pal-n`).
+    pub video_standard: String,
 }
 
 /// Drive 8's live panel. `led_pwm` is a DUTY CYCLE over the period since the last
@@ -551,6 +553,7 @@ impl StateSnapshot {
         StateSnapshot {
             running,
             warp,
+            video_standard: v.get("videoStandard").and_then(|s| s.as_str()).unwrap_or("pal").to_string(),
             transport_mode: v
                 .get("transport")
                 .and_then(|t| t.get("mode"))
@@ -673,7 +676,7 @@ Tab completes verbs in all three namespaces + paths for path arguments.
   /mount <path>        mount a .d64/.g64/.crt
   /eject | /umount     eject the cartridge or unmount drive8
   /load <prg>          load a .prg into RAM (no run)
-  /warp on|off         8× / real-time PAL pacing
+  /warp on|off         8× / real-time pacing (the model's frame rate)
   /joystick off|port1|port2   route WASD+Space to the joystick (off = type)
   /window              spawn the native emulator window
   /dump | /snapshot <path>   write a .c64re snapshot

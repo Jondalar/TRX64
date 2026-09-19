@@ -252,7 +252,7 @@ impl StreamHub {
                 "method": "av/hello",
                 "params": crate::av_hello(&st),
             });
-            let _ = out.send(Message::Text(hello.to_string().into()));
+            let _ = out.send(Message::Text(hello.to_string()));
         }
         inner.subscribers.push(Subscriber { id, out });
         // Spec 837 — a new client gets a picture even if the machine is paused.
@@ -405,6 +405,10 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
             let mut st = state.lock().unwrap();
             // Spec 863 — a model switch (or a restore across one) moved the clock and the
             // frame: re-sample reSID at the new clock, and pace to the new frame from here.
+            // The transport restores anchors from this loop, outside any request: a step
+            // across a switch lands on the other model here, and the session and clients
+            // learn it here too.
+            crate::sync_model_identity(&mut st);
             let now_timing = st.session.machine.timing();
             if now_timing != timing {
                 timing = now_timing;

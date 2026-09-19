@@ -3345,6 +3345,25 @@ mod tests {
         assert_eq!(v.irq_status & IRQ_RASTER, 0, "line 263 never fires");
     }
 
+    /// Spec 863 — DISPLAY_X0 and SPRITE_DBUF_X0 re-derived from each family's own table:
+    /// display column 0 is the Φ1 row marked Vis(0) (cycle 17, 136 px in) and sprite X 0
+    /// lies 24 px left of it on every family; past NTSC's repeated $184 a sprite lands one
+    /// cycle further right. PAL is the calibrated straight line it always was.
+    #[test]
+    fn the_sprite_and_display_origins_come_from_each_table() {
+        for f in [CycleFamily::Pal, CycleFamily::Ntsc, CycleFamily::NtscOld] {
+            assert_eq!(display_dbuf_x0(f), crate::render::DISPLAY_X0, "{f:?}");
+            assert_eq!(sprite_dbuf_x0(f), crate::render::SPRITE_DBUF_X0, "{f:?}");
+            assert_eq!(sprite_dbuf_x(f, 24), crate::render::DISPLAY_X0, "{f:?}: X 24 = column 0");
+        }
+        for x in 0..0x200u16 {
+            assert_eq!(sprite_dbuf_x(CycleFamily::Pal, x), 112 + x as usize, "PAL x={x:#x}");
+        }
+        assert_eq!(sprite_dbuf_x(CycleFamily::Ntsc, 0x187), 112 + 0x187);
+        assert_eq!(sprite_dbuf_x(CycleFamily::Ntsc, 0x188), 112 + 0x188 + 8, "past the repeated $184");
+        assert_eq!(sprite_dbuf_x(CycleFamily::Ntsc, 0x190), 112 + 0x190 + 8);
+    }
+
     /// A PAL-N chip is the NTSC table over 312 lines: 20 280 cycles a frame.
     #[test]
     fn a_paln_frame_is_20280_cycles() {

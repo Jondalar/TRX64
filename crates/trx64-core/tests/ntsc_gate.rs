@@ -410,3 +410,33 @@ fn an_ntsc_raster_bar_at_line_5_is_at_the_bottom() {
     let top: usize = (0..200).map(row_red).sum();
     assert_eq!(top, 0, "and not at the top");
 }
+
+/// The frame the NTSC picture shows starts at the vsync line (12), not at line 0: replaying
+/// from an earlier state to `displayed_frame_start` draws exactly the picture on screen,
+/// wherever in the frame the machine was frozen — before the swap, on it, just after it.
+#[test]
+fn an_ntsc_replay_reproduces_the_picture_on_screen() {
+    if !roms() {
+        return;
+    }
+    let anchor = booted("c64-ntsc");
+    for off in [0u64, 1, 2, 64, 65, 777, 5_000, 11 * 65 + 64, 12 * 65, 17_094] {
+        let mut live = anchor.clone();
+        live.run_for_full(3 * 17_095 + off, &mut NullSink, |_, _, _, _, _, _, _| {});
+        let start = vic_line_trace::displayed_frame_start(&live);
+        assert!(start > anchor.c64_core.clk);
+        let mut s = anchor.clone();
+        let f = vic_line_trace::record_frame(&mut s, start, FrameWhich::Displayed, Some(&live.vic.displayed[..]))
+            .expect("record");
+        assert_eq!(f.cycles[0].line, 12, "a displayed NTSC frame starts at the vsync line");
+        assert_eq!(f.verified, Some(true), "frozen {off} cycles into the fourth frame (line {} cycle {})",
+            live.vic.raster_line, live.vic.raster_cycle + 1);
+        // The frame map lays the lines out by raster line, 65 cycles each.
+        let fm = f.frame_map_json(true);
+        assert_eq!(fm["cells"].as_array().unwrap().len(), 263);
+        assert_eq!(fm["cells"][100].as_array().unwrap().len(), 65);
+        assert_eq!(fm["frame"]["firstLine"], 12);
+        assert_eq!(fm["geometry"]["visible"]["h"], 247);
+    }
+}
+

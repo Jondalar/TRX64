@@ -233,6 +233,10 @@ struct TrapRule {
 #[cfg(test)]
 const PAL_FRAME: u64 = 19_656;
 
+/// One audio window sent to the render thread: the SID writes in CPU order, the cycles
+/// they span, and the machine's Φ2 clock (Spec 863 — a switch re-samples reSID).
+type AudioWindow = (Vec<(u8, u8)>, u32, u32);
+
 /// Spec 863 — the pacing modes, by what they mean. Real time is the MODEL's frame rate
 /// (50.12 fps PAL, 59.83 NTSC), so the mode is "realtime"; "pal", what it was called while
 /// PAL was the only machine, is still accepted. `None` = not a mode.
@@ -621,7 +625,7 @@ struct AudioRenderThread {
     /// never crosses here — only the data).
     /// (writes, cycles, the machine's Φ2 clock) — the clock rides along so a model switch
     /// re-samples the persistent engine (Spec 863 D3).
-    tx: std::sync::mpsc::Sender<(Vec<(u8, u8)>, u32, u32)>,
+    tx: std::sync::mpsc::Sender<AudioWindow>,
     /// The PCM ring (render→main). The render thread pushes the reSID PCM it produced;
     /// `audioDrain()` pops accumulated samples (FIFO). NO engine access on drain.
     pcm: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<i16>>>,
@@ -6194,7 +6198,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 }
                 Some("off") | None => {
                     st.warp = false;
-                    Ok("WARP OFF (PAL real-time).".to_string())
+                    Ok("WARP OFF (real time — the model's frame rate).".to_string())
                 }
                 Some(other) => Err(format!("warp: unknown '{other}' (use on|off)")),
             }
@@ -12364,7 +12368,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
         }
 
         // c64re audio/export (ws-server.ts:1704): run the session for duration_sec
-        // PAL seconds, harvest reSID PCM, write a stereo WAV → { out_path,
+        // seconds of the machine's clock, harvest reSID PCM, write a stereo WAV → { out_path,
         // duration_sec, sample_rate, samples, bytes }. TRX64 drives the SAME
         // SidAudioEngine the streaming loop uses: install the additive $D4xx write
         // hook, run the machine in ~1024-sample slices (= exportSessionAudio cadence),
@@ -15649,7 +15653,7 @@ fn capture_media_checkpoint(st: &mut State) -> Option<String> {
 // per-frame lock window (gen/hash checks are cheap; the actual persist/capture is
 // throttled/debounced), and the stream loop only calls them while `running`.
 
-/// BUG-040 cart auto-persist debounce in stream-loop FRAMES (~50 fps PAL). The TS
+/// BUG-040 cart auto-persist debounce (was stream-loop FRAMES, ~50 fps PAL). The TS
 /// debounce is CART_AUTOPERSIST_DEBOUNCE_MS = 5_000 (runtime-controller.ts:100) —
 /// long enough to coalesce an EAPI write/erase burst, short enough that a crash
 /// loses little. (audit ws-media-3 / background-workers-async-10): WALL-CLOCK ms,
@@ -19126,7 +19130,7 @@ pub fn pull_audio_drain(state: &SharedState) -> AudioDrainData {
         let resid_cfg = ResidConfig::for_model(st.session.machine.model());
 
         // Write-ring (emu→render) + PCM ring (render→main) + stop flag + progress.
-        let (tx, rx) = std::sync::mpsc::channel::<(Vec<(u8, u8)>, u32, u32)>();
+        let (tx, rx) = std::sync::mpsc::channel::<AudioWindow>();
         let pcm: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<i16>>> =
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

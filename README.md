@@ -59,6 +59,14 @@ From source: `cargo build --release`. Builds natively (for Windows it uses MSVC)
   Command Interface. Devices, not cartridges: several at once, and a host can lend its own RAM.
 - **Machines** — `--machine c64|u64|128`. `u64` is the Ultimate 64 / Elite II / C64 Ultimate:
   the turbo registers, and a CPU that really runs — the firmware's own speed table, to 64 MHz.
+- **PAL and NTSC** — `--model c64-pal|c64-ntsc|c64-paln` (or `--video pal|ntsc`). A C64 model
+  is a row of `crates/trx64-core/models.toml`: the VIC-II and its cycle table, the frame, the
+  clock, the mains the TOD counts, the ROMs. NTSC is the 6567R8 — 65 cycles × 263 lines at
+  1 022 730 Hz, ~59.83 frames/s, a 384×247 picture whose bottom rows are raster lines 0–11.
+  `model <row>` switches a running machine at the next frame; the program keeps its state and
+  the standard it detected at boot. The C64C and first-revision rows are listed but need parts
+  TRX64 does not have yet (the 6526A CIA, the custom-IC glue, KERNAL rev1/rev2), and are refused
+  by name.
 - **Shared sessions** — one machine, several clients, human and agent at once.
 - **Snapshots** — `.c64re` full machine, `.c64rering` the reverse-debug buffers.
 
@@ -121,6 +129,7 @@ trx64-daemon --project <dir> --port 4312      # A/V streams by default
 trx64-daemon --machine u64 --reu 512          # an Ultimate with a 512 KiB REU
 trx64-daemon --georam 512                     # GeoRAM instead — the port holds one device
 trx64-daemon --machine u64 --speed-table u64  # the first Ultimate 64 (default: u64ii)
+trx64-daemon --model c64-ntsc                 # an NTSC C64 (--video ntsc is the same)
 trx64-daemon --headless                       # no A/V, no auto-run: command-driven only
 ```
 
@@ -133,8 +142,14 @@ and `vic/frame_map` the whole frame: the cell grid, the stores to the VIC, the o
 screen with their memory, and the raster techniques the frame uses.
 
 ```json
-{ "jsonrpc": "2.0", "id": 1, "method": "session/create", "params": { "pal": true } }
+{ "jsonrpc": "2.0", "id": 1, "method": "session/create", "params": { "model": "c64-pal" } }
 ```
+
+`session/models` lists every model with whether it runs here and what it lacks;
+`session/model { "name": "c64-ntsc" }` switches the running machine at the next frame
+boundary. `session/state` says which machine it is: `model`, `videoStandard`, `chip`,
+`cyclesPerLine`, `linesPerFrame`, `cyclesPerFrame`, `cpuHz`, `frameRate`. Snapshots and
+checkpoints record the model, and restoring one puts the machine back on it.
 
 A typical flow: `session/create` → `debug/run` → `monitor/exec` / `trace/*` / `vic/inspect`
 → `checkpoint/*` to scrub → `snapshot/dump` to persist.

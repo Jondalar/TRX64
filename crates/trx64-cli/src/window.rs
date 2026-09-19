@@ -19,7 +19,8 @@
 //! VIDEO: per redraw, pull the palette+index frame (`pull_frame_buffer` — the model's
 //! canvas, 384×272 PAL, 384×247 NTSC),
 //! expand through the 16-colour LUT → RGBA(0RGB u32) → softbuffer blit, scaled to the
-//! window. ~50 Hz via `ControlFlow::WaitUntil`.
+//! window, once per frame at the model's rate (~50 Hz PAL, ~60 Hz NTSC) via
+//! `ControlFlow::WaitUntil`.
 //! INPUT: host keyboard → c64re matrix ids (`session/key_down`/`key_up`); arrows +
 //! space/lalt → joystick port 2 (`session/joystick_*`).
 

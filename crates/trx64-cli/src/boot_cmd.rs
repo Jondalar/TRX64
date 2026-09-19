@@ -55,7 +55,7 @@ pub fn run_boot(
     turbo: &str,
     turbo_on: bool,
 ) -> Result<String, String> {
-    let engine = boot_engine_with_model(rom_dir, model).map_err(|e| format!("{e}"))?;
+    let engine = boot_engine_with_model(rom_dir, model)?;
     let hz = model.timing.cpu_hz as u64;
     let mut log: Vec<String> = Vec::new();
 

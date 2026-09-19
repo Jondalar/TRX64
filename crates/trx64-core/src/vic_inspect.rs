@@ -1252,6 +1252,31 @@ mod tests {
         assert_eq!(charset.note.as_deref(), Some("char ROM shadow"));
     }
 
+    /// Spec 863 — an NTSC checkpoint (VIC-II model 3, the 6567R8) is read on the NTSC
+    /// window: 384 × 247 from line 28, display origin (32, 23), and a sprite on raster
+    /// line 5 sits at the BOTTOM of the canvas (row 263 + 5 − 28 = 240), not the top.
+    #[test]
+    fn an_ntsc_checkpoint_is_read_on_the_ntsc_window() {
+        let mut cp = mk_text_cp(0x41, 0x01);
+        assert_eq!(visible_frame(&cp), (384, 272, 32, 35), "PAL");
+        cp["vic"]["model"] = json!(3);
+        assert_eq!(visible_frame(&cp), (384, 247, 32, 23), "NTSC");
+        // Cell (0,0) is still display (4,4) → visible (36, 4 + 23).
+        let node = resolve_visible_node_at(&cp, 36.0, 27.0, None);
+        assert_eq!((node.node_type, node.cell), ("text_cell", Some((0, 0, 0))));
+        // Sprite 0 at Y = 4: its first line is raster 5, drawn at canvas row 240.
+        let mut regs: Vec<i64> = cp["vic"]["regs"].as_array().unwrap().iter().map(|v| v.as_i64().unwrap()).collect();
+        regs[0x00] = 100;
+        regs[0x01] = 4;
+        regs[0x15] = 0x01;
+        cp["vic"]["regs"] = json!(regs);
+        let node = resolve_visible_node_at(&cp, (100 - 24 + 32) as f64 + 2.0, 241.0, None);
+        assert_eq!(node.node_type, "sprite_bounds", "{node:?}");
+        assert_eq!(node.raster.map(|r| r.0), Some(6), "canvas row 241 is raster line 6");
+        let top = resolve_visible_node_at(&cp, (100 - 24 + 32) as f64 + 2.0, 3.0, None);
+        assert_ne!(top.node_type, "sprite_bounds", "not at the top");
+    }
+
     #[test]
     fn border_pixel_resolves_to_border_node() {
         let cp = mk_text_cp(0x41, 0x01);
