@@ -184,7 +184,7 @@ obs cap_off when exec $4100 do trace off              # stop at $4100
 | `ringdump <path>` | serialize the whole reverse-debug buffer → one gzipped `.c64rering` |
 | `ringload <path>` | restore a `.c64rering` + the machine; scrub/rstep/whowrote/chis/diff then work on it |
 
-### Names — none here (Spec 804)
+### Names — none here
 TRX64 is a runtime and holds no symbols: there is no `label`, `note`, `sym`, `inspect`,
 `xref`, `save_labels` or `load_labels`. Every `monitor/exec` reply instead says WHERE it
 printed each address — `spans: [{line, start, end, addr, space, role, lens?, len?}]` plus the

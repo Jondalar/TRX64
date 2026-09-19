@@ -331,7 +331,7 @@ already has a play connection has a debugger for free.
 ← {"jsonrpc":"2.0","id":8,"result":{"error":"map: no trace store — …"}}
 ```
 
-**Every reply also carries `spans` and `machine`** (Spec 804). `spans` says where the reply
+**Every reply also carries `spans` and `machine`.** `spans` says where the reply
 printed each address — `{line, start, end, addr, space, role, lens?, len?}`, `start`/`end`
 in UTF-16 units of that line, `space` `c64`|`drive8`, `role` `pc`|`target`|`operand`|`memory`
 — so a consumer that wants names never parses a column. `machine` is the device and the
@@ -347,7 +347,7 @@ return `prompt`.
 
 | purpose | verbs |
 |---|---|
-| CPU + memory state | `r` (registers) · `m <from> [to]` (hex dump) · `d <addr>` (disassemble). No names: every reply carries `spans` (where it printed each address) and `machine` (device + banking) — a consumer that wants names joins them itself (Spec 804) |
+| CPU + memory state | `r` (registers) · `m <from> [to]` (hex dump) · `d <addr>` (disassemble). No names: every reply carries `spans` (where it printed each address) and `machine` (device + banking) — a consumer that wants names joins them itself |
 | stop / resume / step | `g` (go) · `z` (step) · `si`/`so` (step in/over) · `ret` · `until <addr>` |
 | breakpoints + watches | `bk <addr>` · `watch`/`watch_read`/`watch_write` · `del`/`toggle`/`ignore` |
 | what just happened | `chis` (CPU history from the live ring) · `bt` (backtrace) · `whowrote <addr>` |
