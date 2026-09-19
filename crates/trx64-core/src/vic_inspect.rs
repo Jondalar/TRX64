@@ -54,7 +54,7 @@ fn color_ram(cp: &Value, idx: usize) -> i64 {
 
 /// The decoded RAM blob (the `{ $ta }` Uint8Array). Decoded once per resolve; the
 /// TS holds `cp.ram` as a live Uint8Array. None when the checkpoint has no RAM.
-fn decode_ram(cp: &Value) -> Option<Vec<u8>> {
+pub fn decode_ram(cp: &Value) -> Option<Vec<u8>> {
     cp.get("ram").and_then(crate::native_snapshot::ta_u8_decode)
 }
 
@@ -62,6 +62,20 @@ fn decode_ram(cp: &Value) -> Option<Vec<u8>> {
 fn ram_at(ram: &[u8], addr: i64) -> i64 {
     (ram.get((addr as usize) & 0xffff).copied().unwrap_or(0)) as i64 & 0xff
 }
+
+/// Spec 843 D2 — the run of bytes a multi-byte ref names, read from the frozen RAM.
+///
+/// A charset ref may point into the char ROM shadow ($1000/$9000 as the VIC sees it),
+/// which is not in this RAM image — there the run is left absent rather than filled
+/// with whatever RAM happens to hold underneath, because a plausible wrong swatch is
+/// worse than none.
+fn byte_run(ram: &[u8], addr: i64, len: i64, from_rom_shadow: bool) -> Option<Vec<u8>> {
+    if from_rom_shadow {
+        return None;
+    }
+    Some((0..len).map(|i| ram_at(ram, addr + i) as u8).collect())
+}
+
 
 /// vic-inspect.ts:60 — `bankBaseOf`. The TS read the PRA latch alone; that is
 /// wrong for the same reason `Machine::vic_bank_base` was (`core/ciacore.c:810`):
@@ -114,6 +128,14 @@ pub struct MemoryRef {
     pub addr: i64,
     pub length: i64,
     pub value: Option<i64>,
+    /// Spec 843 D2 — the RUN of bytes this ref describes, when it is more than one.
+    ///
+    /// `value` is a single byte, so the 8-byte `bitmap` and `charset` refs carried
+    /// `None`: the bytes that ARE the picture were named and never sent, and no
+    /// consumer could draw the cell or extract the range from what came back.
+    /// Single-byte refs keep using `value` alone, so the wire stays 1:1 for every
+    /// existing reader.
+    pub bytes: Option<Vec<u8>>,
     pub bank: Option<i64>,
     pub note: Option<String>,
 }
@@ -127,6 +149,9 @@ impl MemoryRef {
         // Only emit value/bank/note when present (TS omits undefined keys).
         if let Some(v) = self.value {
             o.insert("value".into(), json!(v));
+        }
+        if let Some(bs) = &self.bytes {
+            o.insert("bytes".into(), json!(bs));
         }
         if let Some(b) = self.bank {
             o.insert("bank".into(), json!(b));
@@ -376,11 +401,11 @@ fn sprite_bounds_at(cp: &Value, ram: &[u8], snap: &VicInspectSnapshot, x: i64, y
             let ptr_addr = snap.screen_base + 0x3f8 + i;
             let ptr = ram_at(ram, ptr_addr);
             let refs = vec![
-                MemoryRef { kind: "sprite_ptr", addr: ptr_addr, length: 1, value: Some(ptr), bank: Some(snap.bank_base), note: None },
-                MemoryRef { kind: "sprite_data", addr: snap.bank_base + ptr * 64, length: 63, value: None, bank: Some(snap.bank_base), note: Some("bounding-box hit; not pixel-exact (no transparency/priority)".into()) },
-                MemoryRef { kind: "vic_reg", addr: 0xd000 + i * 2, length: 1, value: Some(sx & 0xff), bank: None, note: Some("sprite X".into()) },
-                MemoryRef { kind: "vic_reg", addr: 0xd001 + i * 2, length: 1, value: Some(sy), bank: None, note: Some("sprite Y".into()) },
-                MemoryRef { kind: "vic_reg", addr: 0xd027 + i, length: 1, value: Some(reg(cp, (0x27 + i) as usize) & 0x0f), bank: None, note: Some("sprite color".into()) },
+                MemoryRef { kind: "sprite_ptr", addr: ptr_addr, length: 1, value: Some(ptr), bytes: None, bank: Some(snap.bank_base), note: None },
+                MemoryRef { kind: "sprite_data", addr: snap.bank_base + ptr * 64, length: 63, value: None, bytes: None, bank: Some(snap.bank_base), note: Some("bounding-box hit; not pixel-exact (no transparency/priority)".into()) },
+                MemoryRef { kind: "vic_reg", addr: 0xd000 + i * 2, length: 1, value: Some(sx & 0xff), bytes: None, bank: None, note: Some("sprite X".into()) },
+                MemoryRef { kind: "vic_reg", addr: 0xd001 + i * 2, length: 1, value: Some(sy), bytes: None, bank: None, note: Some("sprite Y".into()) },
+                MemoryRef { kind: "vic_reg", addr: 0xd027 + i, length: 1, value: Some(reg(cp, (0x27 + i) as usize) & 0x0f), bytes: None, bank: None, note: Some("sprite color".into()) },
             ];
             return Some(VisualNode {
                 node_type: "sprite_bounds",
@@ -426,7 +451,11 @@ fn resolve_node_at(cp: &Value, ram: &[u8], x: i64, y: i64, provenance: &[Provena
     let mut raster: Option<(i64, Option<i64>)> = None;
     if !provenance.is_empty() {
         let line = FIRST_DISPLAY_RASTER + y;
-        if let Some(ln) = provenance.iter().find(|l| l.line == line) {
+        // Spec 843 D1 — the record is a list of CHANGES, not one entry per line (a
+        // frame is 312 lines and a screen has two or three splits; writing them all
+        // cost 20% of a checkpoint). So the state for a line is the last entry AT OR
+        // BEFORE it — the split that was in force when the beam got there.
+        if let Some(ln) = provenance.iter().filter(|l| l.line <= line).max_by_key(|l| l.line) {
             bases = derive_bases(ln.d011, ln.d016, ln.d018, ln.bank);
             raster = Some((line, None));
         }
@@ -439,13 +468,14 @@ fn resolve_node_at(cp: &Value, ram: &[u8], x: i64, y: i64, provenance: &[Provena
 
     if bases.mode.is_bitmap() {
         let screen_addr = bases.screen_base + index;
-        refs.push(MemoryRef { kind: "screen_ram", addr: screen_addr, length: 1, value: Some(ram_at(ram, screen_addr)), bank: Some(bases.bank_base), note: Some("fg/bg colour nibbles".into()) });
-        refs.push(MemoryRef { kind: "bitmap", addr: bases.bitmap_base + index * 8, length: 8, value: None, bank: Some(bases.bank_base), note: None });
+        refs.push(MemoryRef { kind: "screen_ram", addr: screen_addr, length: 1, value: Some(ram_at(ram, screen_addr)), bytes: None, bank: Some(bases.bank_base), note: Some("fg/bg colour nibbles".into()) });
+        let bitmap_addr = bases.bitmap_base + index * 8;
+        refs.push(MemoryRef { kind: "bitmap", addr: bitmap_addr, length: 8, value: None, bytes: byte_run(ram, bitmap_addr, 8, false), bank: Some(bases.bank_base), note: None });
         if bases.mode == VicInspectMode::MulticolorBitmap {
-            refs.push(MemoryRef { kind: "color_ram", addr: 0xd800 + index, length: 1, value: Some(color_ram(cp, index as usize)), bank: None, note: None });
+            refs.push(MemoryRef { kind: "color_ram", addr: 0xd800 + index, length: 1, value: Some(color_ram(cp, index as usize)), bytes: None, bank: None, note: None });
         }
-        refs.push(MemoryRef { kind: "vic_reg", addr: 0xd011, length: 1, value: Some(reg(cp, 0x11)), bank: None, note: None });
-        refs.push(MemoryRef { kind: "vic_reg", addr: 0xd018, length: 1, value: Some(reg(cp, 0x18)), bank: None, note: None });
+        refs.push(MemoryRef { kind: "vic_reg", addr: 0xd011, length: 1, value: Some(reg(cp, 0x11)), bytes: None, bank: None, note: None });
+        refs.push(MemoryRef { kind: "vic_reg", addr: 0xd018, length: 1, value: Some(reg(cp, 0x18)), bytes: None, bank: None, note: None });
         return VisualNode {
             node_type: "bitmap_cell",
             pixel: (x, y),
@@ -462,10 +492,11 @@ fn resolve_node_at(cp: &Value, ram: &[u8], x: i64, y: i64, provenance: &[Provena
     let screen_addr = bases.screen_base + index;
     let code = ram_at(ram, screen_addr);
     let color_index = color_ram(cp, index as usize);
-    refs.push(MemoryRef { kind: "screen_ram", addr: screen_addr, length: 1, value: Some(code), bank: Some(bases.bank_base), note: None });
-    refs.push(MemoryRef { kind: "color_ram", addr: 0xd800 + index, length: 1, value: Some(color_index), bank: None, note: None });
-    refs.push(MemoryRef { kind: "charset", addr: bases.char_base + code * 8, length: 8, value: None, bank: Some(bases.bank_base), note: if bases.char_rom_shadow { Some("char ROM shadow".into()) } else { None } });
-    refs.push(MemoryRef { kind: "vic_reg", addr: 0xd018, length: 1, value: Some(reg(cp, 0x18)), bank: None, note: None });
+    refs.push(MemoryRef { kind: "screen_ram", addr: screen_addr, length: 1, value: Some(code), bytes: None, bank: Some(bases.bank_base), note: None });
+    refs.push(MemoryRef { kind: "color_ram", addr: 0xd800 + index, length: 1, value: Some(color_index), bytes: None, bank: None, note: None });
+    let char_addr = bases.char_base + code * 8;
+    refs.push(MemoryRef { kind: "charset", addr: char_addr, length: 8, value: None, bytes: byte_run(ram, char_addr, 8, bases.char_rom_shadow), bank: Some(bases.bank_base), note: if bases.char_rom_shadow { Some("char ROM shadow".into()) } else { None } });
+    refs.push(MemoryRef { kind: "vic_reg", addr: 0xd018, length: 1, value: Some(reg(cp, 0x18)), bytes: None, bank: None, note: None });
     VisualNode {
         node_type: "text_cell",
         pixel: (x, y),
@@ -511,11 +542,11 @@ fn make_sprite_node(
         if in_border { "; OPEN BORDER" } else { "" }
     );
     let refs = vec![
-        MemoryRef { kind: "sprite_ptr", addr: ptr_addr, length: 1, value: Some(ptr), bank: Some(bank_base), note: None },
-        MemoryRef { kind: "sprite_data", addr: bank_base + ptr * 64, length: 63, value: None, bank: Some(bank_base), note: Some(data_note) },
-        MemoryRef { kind: "vic_reg", addr: 0xd000 + i * 2, length: 1, value: Some(sx & 0xff), bank: None, note: Some("sprite X".into()) },
-        MemoryRef { kind: "vic_reg", addr: 0xd001 + i * 2, length: 1, value: Some(sy), bank: None, note: Some("sprite Y (raster)".into()) },
-        MemoryRef { kind: "vic_reg", addr: 0xd027 + i, length: 1, value: Some(color & 0x0f), bank: None, note: Some("sprite color".into()) },
+        MemoryRef { kind: "sprite_ptr", addr: ptr_addr, length: 1, value: Some(ptr), bytes: None, bank: Some(bank_base), note: None },
+        MemoryRef { kind: "sprite_data", addr: bank_base + ptr * 64, length: 63, value: None, bytes: None, bank: Some(bank_base), note: Some(data_note) },
+        MemoryRef { kind: "vic_reg", addr: 0xd000 + i * 2, length: 1, value: Some(sx & 0xff), bytes: None, bank: None, note: Some("sprite X".into()) },
+        MemoryRef { kind: "vic_reg", addr: 0xd001 + i * 2, length: 1, value: Some(sy), bytes: None, bank: None, note: Some("sprite Y (raster)".into()) },
+        MemoryRef { kind: "vic_reg", addr: 0xd027 + i, length: 1, value: Some(color & 0x0f), bytes: None, bank: None, note: Some("sprite color".into()) },
     ];
     VisualNode {
         node_type: "sprite_bounds",
@@ -624,11 +655,67 @@ fn resolve_visible_node_at_inner(cp: &Value, ram: &[u8], vx: f64, vy: f64, prove
         mode: snap.mode,
         value: None,
         color_index: Some(snap.border),
-        refs: vec![MemoryRef { kind: "vic_reg", addr: 0xd020, length: 1, value: Some(snap.border), bank: None, note: Some("border colour".into()) }],
+        refs: vec![MemoryRef { kind: "vic_reg", addr: 0xd020, length: 1, value: Some(snap.border), bytes: None, bank: None, note: Some("border colour".into()) }],
     }
 }
 
 /// vic-inspect.ts:322-338 — `resolveVisibleRegion(cp, region, provenance?)`.
+/// Spec 843 D6 — coalesce a region's node set into contiguous SOURCE RANGES.
+///
+/// A region resolves to one node per sampled point, and the UI used to render those
+/// as glyph rows — which in bitmap mode is a column of empty strings, because a
+/// bitmap node has no character value. The useful answer is not "these 48 points"
+/// but "charset $2000+800, screen $cc00+1000, colour $d800+1000": the byte ranges
+/// the rectangle is a view OF.
+///
+/// That is also the unit the rest of the chain speaks. A graph finding carries an
+/// address range, an extract IS a range, and a patch targets one — so coalescing
+/// here is what turns a rubber band into something that can be named, ripped and
+/// injected.
+///
+/// Ranges are merged per `kind` when they touch or overlap; a gap leaves two
+/// entries, because a gap is real (two sprites, two tile runs) and papering over it
+/// would claim bytes the selection never covered.
+pub fn coalesce_region_ranges(nodes: &[VisualNode]) -> Vec<Value> {
+    use std::collections::BTreeMap;
+    // kind -> sorted (start, end_inclusive), carrying the bank of the first ref.
+    type Spans = (Option<i64>, Vec<(i64, i64)>);
+    let mut spans: BTreeMap<&'static str, Spans> = BTreeMap::new();
+    for n in nodes {
+        for r in &n.refs {
+            let e = spans.entry(r.kind).or_insert((r.bank, Vec::new()));
+            if e.0.is_none() {
+                e.0 = r.bank;
+            }
+            e.1.push((r.addr, r.addr + r.length.max(1) - 1));
+        }
+    }
+    let mut out = Vec::new();
+    for (kind, (bank, mut list)) in spans {
+        list.sort_unstable();
+        let mut merged: Vec<(i64, i64)> = Vec::new();
+        for (s, e) in list {
+            match merged.last_mut() {
+                // `s <= last.1 + 1` merges touching ranges as well as overlapping
+                // ones: cell N and cell N+1 of a charset are one run, not two.
+                Some(last) if s <= last.1 + 1 => last.1 = last.1.max(e),
+                _ => merged.push((s, e)),
+            }
+        }
+        for (s, e) in merged {
+            let mut o = serde_json::Map::new();
+            o.insert("kind".into(), json!(kind));
+            o.insert("addr".into(), json!(s));
+            o.insert("length".into(), json!(e - s + 1));
+            if let Some(b) = bank {
+                o.insert("bank".into(), json!(b));
+            }
+            out.push(Value::Object(o));
+        }
+    }
+    out
+}
+
 /// Samples in VISIBLE space (8px step), dedups by type:value:cellIndex:rasterLine.
 pub fn resolve_visible_region(cp: &Value, region: (f64, f64, f64, f64), provenance: Option<&Value>) -> Vec<VisualNode> {
     let ram = decode_ram(cp).unwrap_or_default();
@@ -1214,4 +1301,132 @@ mod tests {
         let (result, _k) = resolve_visual_origin(&cp, &node, &cands, "sess1");
         assert_eq!(result["classification"], "exact_asset", "charset bytes match the candidate");
     }
+    /// Spec 843 D1 — a raster split, the case the whole feature exists for.
+    ///
+    /// Two different `$D018` values on two lines: the top half draws its screen from
+    /// `$0400`, the bottom half from `$0c00`. A pixel in each half must resolve
+    /// against ITS line, not against whichever value the frozen registers happen to
+    /// hold — which for a real frame is always the LAST split, because that is what
+    /// the machine was left in when the frame ended.
+    ///
+    /// Fails by construction before the provenance record is captured: without it
+    /// both halves answer with the frozen `$D018` and the two screen addresses come
+    /// out identical.
+    #[test]
+    fn a_raster_split_resolves_each_half_against_its_own_line() {
+        // Frozen registers say screen $0c00 — the state the BOTTOM split left behind.
+        let mut cp = mk_text_cp(0x41, 0x01);
+        cp["vic"]["regs"][0x18] = json!(0x34); // screen $0c00 (3<<4), char $1000
+
+        let top_y = 8i64;    // display row 1  → raster 59
+        let bottom_y = 160i64; // display row 20 → raster 211
+
+        // The provenance the capture now writes: the top lines ran with $0400.
+        let mut lines = Vec::new();
+        for y in 0..200i64 {
+            let d018 = if y < 100 { 0x14 } else { 0x34 }; // $0400 above, $0c00 below
+            lines.push(json!({
+                "line": FIRST_DISPLAY_RASTER + y,
+                "d011": 0x1b, "d016": 0xc8, "d018": d018,
+                "bank": 0, "sprites": [],
+            }));
+        }
+        let prov = json!({ "lines": lines });
+
+        let top = resolve_node_at_display(&cp, 0, top_y, Some(&prov));
+        let bottom = resolve_node_at_display(&cp, 0, bottom_y, Some(&prov));
+
+        let screen_of = |n: &VisualNode| -> i64 {
+            n.refs.iter().find(|r| r.kind == "screen_ram").expect("a screen_ram ref").addr
+        };
+        // Row 1 col 0 → index 40; row 20 col 0 → index 800.
+        assert_eq!(screen_of(&top), 0x0400 + 40,
+            "the top half must resolve against ITS line's $D018 ($0400), not the frozen one");
+        assert_eq!(screen_of(&bottom), 0x0c00 + 800,
+            "the bottom half resolves against its own line ($0c00)");
+        assert_ne!(screen_of(&top) - 40, screen_of(&bottom) - 800,
+            "the two halves must not share a base — that is the bug this gate exists for");
+
+        // And without provenance both fall back to the frozen register, which is the
+        // old behaviour and exactly the wrong answer for the top half.
+        let top_frozen = resolve_node_at_display(&cp, 0, top_y, None);
+        assert_eq!(screen_of(&top_frozen), 0x0c00 + 40,
+            "with no provenance the top half answers with the bottom split's base");
+    }
+
+    /// Spec 843 D2 — the bytes that ARE the picture come back.
+    ///
+    /// `bitmap` and `charset` refs are 8 bytes long and carried `value: None`, so the
+    /// only thing a consumer got was an address. Nothing could draw the cell, and a
+    /// rip had nothing to rip.
+    #[test]
+    fn a_multi_byte_ref_carries_its_run() {
+        // `ram` is a typed-array blob in the checkpoint, so the glyph goes in before
+        // the fixture is built, not by indexing the JSON afterwards.
+        let glyph: Vec<u8> = vec![0x18, 0x3c, 0x66, 0x66, 0x7e, 0x66, 0x66, 0x00];
+        let mut ram = vec![0u8; 0x10000];
+        ram[0x0400] = 0x41;
+        for (i, b) in glyph.iter().enumerate() {
+            ram[0x2000 + 0x41 * 8 + i] = *b;
+        }
+        let regs: Vec<i64> = {
+            let mut r = vec![0i64; 0x40];
+            r[0x11] = 0x1b;
+            r[0x16] = 0xc8;
+            r[0x18] = 0x18; // screen $0400, char $2000 — RAM, not the ROM shadow
+            r
+        };
+        let cp = json!({
+            "ram": crate::native_snapshot::ta_u8(&ram),
+            "vic": { "regs": regs, "color_ram": vec![1i64; 0x400] },
+            "cia2": { "c_cia": [0x3f, 0, 0, 0] },
+            "media": Value::Null,
+        });
+
+        let node = resolve_node_at_display(&cp, 0, 0, None);
+        let cs = node.refs.iter().find(|r| r.kind == "charset").expect("a charset ref");
+        assert_eq!(cs.length, 8);
+        assert_eq!(cs.bytes.as_deref(), Some(&glyph[..]),
+            "the eight bytes of the glyph must be on the wire, not just its address");
+
+        // The ROM shadow has no bytes in this image, and says so rather than
+        // inventing a swatch from the RAM underneath.
+        let mut shadow = mk_text_cp(0x41, 0x01);
+        shadow["vic"]["regs"][0x18] = json!(0x14); // char $1000 = ROM shadow
+        let node2 = resolve_node_at_display(&shadow, 0, 0, None);
+        let cs2 = node2.refs.iter().find(|r| r.kind == "charset").expect("a charset ref");
+        assert!(cs2.bytes.is_none(), "a ROM-shadow charset reports no run rather than RAM residue");
+        assert_eq!(cs2.note.as_deref(), Some("char ROM shadow"));
+    }
+
+    /// Spec 843 D1 — a CHANGE record, not one entry per line, and a line between two
+    /// splits still resolves.
+    ///
+    /// Writing all 312 lines cost ~19 KiB of JSON per checkpoint — 20% on top of a
+    /// ~98 KiB anchor, paid by the ring in a shorter rewind window. Two entries
+    /// describe a bitmap-over-text screen exactly as well, PROVIDED the resolver
+    /// takes the last entry at or before the line rather than an exact match.
+    #[test]
+    fn a_line_between_two_splits_takes_the_split_in_force() {
+        let mut cp = mk_text_cp(0x41, 0x01);
+        cp["vic"]["regs"][0x18] = json!(0x34); // frozen: the bottom split
+
+        // TWO entries for the whole frame, the way the capture now emits them.
+        let prov = json!({ "lines": [
+            { "line": FIRST_DISPLAY_RASTER, "d011": 0x1b, "d016": 0xc8, "d018": 0x14, "bank": 0, "sprites": [] },
+            { "line": FIRST_DISPLAY_RASTER + 100, "d011": 0x1b, "d016": 0xc8, "d018": 0x34, "bank": 0, "sprites": [] },
+        ]});
+
+        let screen_of = |n: &VisualNode| -> i64 {
+            n.refs.iter().find(|r| r.kind == "screen_ram").expect("a screen_ram ref").addr
+        };
+        // y=8 → raster 59: no entry of its own, and it must take the FIRST split.
+        let top = resolve_node_at_display(&cp, 0, 8, Some(&prov));
+        assert_eq!(screen_of(&top), 0x0400 + 40,
+            "a line with no entry of its own takes the last split at or before it");
+        // y=160 → raster 211: after the second entry.
+        let bottom = resolve_node_at_display(&cp, 0, 160, Some(&prov));
+        assert_eq!(screen_of(&bottom), 0x0c00 + 800, "…and below the split, the second one");
+    }
+
 }

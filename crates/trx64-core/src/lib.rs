@@ -53,6 +53,7 @@ pub mod uci;
 pub mod vic;
 pub mod vic_draw;
 pub mod vic_inspect;
+pub mod vic_line_trace;
 pub mod viacore;
 pub mod vice_snapshot_stream;
 pub mod vsf;
@@ -157,6 +158,10 @@ pub trait Observer {
     /// default is a no-op and the daemon's domain filter never enables it.
     #[inline]
     fn on_vic_reg(&mut self, _clk: u64, _raster_y: u16, _kind: u8, _value: u8) {}
+    /// Spec 859 — this observer records the VIC cycle by cycle. The full-machine bus then
+    /// ticks the VIC through `tick_g::<true>`; every other observer gets the plain `tick`,
+    /// with no recorder code in it. Compile-time, so the live path pays nothing.
+    const RECORDS_VIC: bool = false;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

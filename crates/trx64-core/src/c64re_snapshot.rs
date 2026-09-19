@@ -726,6 +726,107 @@ use crate::native_snapshot::{ta_u32, ta_u32_decode};
 use crate::render::FB_W;
 
 /// Read TRX64's `m.vic` + color RAM into the c64re `LiteralVicSnapshot` shape.
+/// Spec 843 D1 — the per-raster-line register record, in the shape
+/// `vic_inspect::parse_provenance` already reads (`{ lines: [{ line, d011, d016,
+/// d018, bank, sprites }] }`).
+///
+/// Only lines the beam actually passed this frame are emitted. A line still holding
+/// the previous frame's record is LEFT OUT rather than sent as though it were
+/// current — the resolver falls back to the frozen registers for it, which is the
+/// same answer it always gave, and an absent line is an honest gap where a stale one
+/// would be a plausible lie.
+///
+/// `sprites` is empty: per-line sprite position/pointer capture is not built, and an
+/// empty array is what the parser expects for "none recorded".
+pub fn capture_vic_provenance(m: &Machine) -> serde_json::Value {
+    // Emit only the lines where the register state CHANGED.
+    //
+    // A frame is 312 lines and a screen has two or three raster splits, so writing
+    // every line costs ~19 KiB of JSON per checkpoint — 20% on top of a ~98 KiB
+    // anchor, which the ring pays for in a shorter rewind window. The record is
+    // properly a list of CHANGES: the resolver takes the last entry at or before the
+    // line it wants, so two entries describe a bitmap-over-text screen exactly as
+    // well as 312 did.
+    let mut prev: Option<crate::vic::ProvenanceRegs> = None;
+    let lines: Vec<serde_json::Value> = m
+        .vic
+        .provenance
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.captured)
+        .filter(|(_, p)| {
+            let changed = prev.as_ref().map(|q| {
+                q.d011 != p.d011 || q.d016 != p.d016 || q.d018 != p.d018 || q.vbank != p.vbank
+            }).unwrap_or(true);
+            if changed {
+                prev = Some(**p);
+            }
+            changed
+        })
+        .map(|(line, p)| {
+            serde_json::json!({
+                "line": line as i64,
+                "d011": p.d011 as i64,
+                "d016": p.d016 as i64,
+                "d018": p.d018 as i64,
+                // The resolver's `derive_bases` takes the bank BASE, not the index.
+                "bank": p.vbank as i64,
+                "sprites": serde_json::Value::Array(Vec::new()),
+            })
+        })
+        .collect();
+    if lines.is_empty() {
+        return serde_json::Value::Null;
+    }
+    serde_json::json!({ "lines": lines })
+}
+
+/// The inverse of [`capture_vic_provenance`]. The record is a list of CHANGES, so line `L`
+/// takes the last entry at or before it; lines before the first entry were not captured.
+/// Capturing again after this yields the same list — the checkpoint round-trips.
+///
+/// Without it a restored machine started with an empty record and re-captured only the
+/// lines the beam passed after the restore, so the same machine state produced a different
+/// checkpoint depending on whether it had been restored (found by the Spec 857 gate, which
+/// compares a restored machine with one that ran through).
+pub fn restore_vic_provenance(m: &mut Machine, p: Option<&serde_json::Value>) {
+    let mut entries: Vec<(usize, crate::vic::ProvenanceRegs)> = p
+        .and_then(|v| v.get("lines"))
+        .and_then(|l| l.as_array())
+        .map(|lines| {
+            lines
+                .iter()
+                .filter_map(|e| {
+                    let g = |k: &str| e.get(k).and_then(|v| v.as_i64());
+                    Some((
+                        g("line")? as usize,
+                        crate::vic::ProvenanceRegs {
+                            d011: g("d011")? as u8,
+                            d016: g("d016")? as u8,
+                            d018: g("d018")? as u8,
+                            vbank: g("bank")? as u16,
+                            captured: true,
+                        },
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    entries.sort_by_key(|(l, _)| *l);
+    let mut cur: Option<crate::vic::ProvenanceRegs> = None;
+    let mut next = entries.iter().peekable();
+    for (line, slot) in m.vic.provenance.iter_mut().enumerate() {
+        while let Some((l, regs)) = next.peek() {
+            if *l > line {
+                break;
+            }
+            cur = Some(*regs);
+            next.next();
+        }
+        *slot = cur.unwrap_or_default();
+    }
+}
+
 pub fn capture_vic(m: &Machine) -> VicSnapshot {
     let v = &m.vic;
     let color_ram = read_color_ram(m);
@@ -1361,7 +1462,12 @@ pub fn capture_runtime_checkpoint_with(
         "paddles": [0, 0, 0, 0],
         "vic": serde_json::to_value(capture_vic(m)).unwrap(),
         "vicPresentation": serde_json::to_value(capture_vic_presentation_opts(m, omit_framebuffer)).unwrap(),
-        "vicProvenance": serde_json::Value::Null,
+        // Spec 843 D1 — what drove each raster line of this frame. Was hardcoded
+        // `Null` here, which made `vic_inspect`'s per-line override dead code: the
+        // type existed, the parser existed, the resolver branch existed, and nothing
+        // ever wrote the record — so every pixel on a raster-split screen resolved
+        // against whichever split happened to be last when the frame ended.
+        "vicProvenance": capture_vic_provenance(m),
         "drive1541": drive1541.map(ta_u8).unwrap_or(serde_json::Value::Null),
         "driveDiskImage": drive_disk_image.map(ta_u8).unwrap_or(serde_json::Value::Null),
         // Spec 714.5 (formats-state-2): the attached cartridge's original .crt bytes +
@@ -1517,6 +1623,7 @@ pub fn restore_runtime_checkpoint(
             serde_json::from_value(c.clone()).map_err(|e| format!("restore vicPresentation: {e}"))?;
         restore_vic_presentation(m, &s);
     }
+    restore_vic_provenance(m, cp.get("vicProvenance"));
 
     // Sync the legacy shadow + machine clk (matches vsf load tail).
     m.sync_after_monitor();
