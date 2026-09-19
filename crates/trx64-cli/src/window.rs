@@ -16,7 +16,8 @@
 //! window lazily. No window exists until `window` is invoked (or `--window` requests
 //! one at launch). `UiToMain::Quit` → `UserEvent::Quit` exits the loop.
 //!
-//! VIDEO: per redraw, pull the 384×272 palette+index frame (`pull_frame_buffer`),
+//! VIDEO: per redraw, pull the palette+index frame (`pull_frame_buffer` — the model's
+//! canvas, 384×272 PAL, 384×247 NTSC),
 //! expand through the 16-colour LUT → RGBA(0RGB u32) → softbuffer blit, scaled to the
 //! window. ~50 Hz via `ControlFlow::WaitUntil`.
 //! INPUT: host keyboard → c64re matrix ids (`session/key_down`/`key_up`); arrows +
@@ -96,9 +97,12 @@ pub fn main_thread_loop(engine: &Engine, rx: Receiver<UiToMain>, open_at_launch:
     }
 }
 
-/// The C64 displayed canvas is 384×272; open at 2× by default.
-const CANVAS_W: u32 = 384;
-const CANVAS_H: u32 = 272;
+/// The displayed canvas of the machine's model (384×272 PAL, 384×247 NTSC); the window
+/// opens at 2× it and keeps its shape.
+fn model_canvas(engine: &Engine) -> (u32, u32) {
+    let w = &trx64_daemon::machine_model(engine.shared_state()).window;
+    (w.width() as u32, w.height() as u32)
+}
 
 /// The size this window should snap back to after a resize, or `None` when it is
 /// already on the canvas's aspect ratio.
@@ -111,11 +115,12 @@ const CANVAS_H: u32 = 272;
 ///
 /// One pixel of slack, because integer division cannot always land exactly and a
 /// snap that is never satisfied would resize on every frame.
-fn aspect_snap(w: u32, h: u32, prev: (u32, u32)) -> Option<(u32, u32)> {
-    if w == 0 || h == 0 {
+fn aspect_snap(w: u32, h: u32, prev: (u32, u32), canvas: (u32, u32)) -> Option<(u32, u32)> {
+    let (canvas_w, canvas_h) = canvas;
+    if w == 0 || h == 0 || canvas_w == 0 || canvas_h == 0 {
         return None;
     }
-    let want_h = (w as u64 * CANVAS_H as u64 / CANVAS_W as u64) as u32;
+    let want_h = (w as u64 * canvas_h as u64 / canvas_w as u64) as u32;
     if want_h.abs_diff(h) <= 1 {
         return None; // already on the ratio
     }
@@ -124,17 +129,16 @@ fn aspect_snap(w: u32, h: u32, prev: (u32, u32)) -> Option<(u32, u32)> {
     let (nw, nh) = if dw >= dh {
         (w, want_h)
     } else {
-        ((h as u64 * CANVAS_W as u64 / CANVAS_H as u64) as u32, h)
+        ((h as u64 * canvas_w as u64 / canvas_h as u64) as u32, h)
     };
     // Below one whole canvas there is nothing sensible to keep, and clamping a
     // single axis would break the very ratio this exists to hold. The minimum is
     // itself on the ratio, so snap to it whole.
-    if nw < CANVAS_W || nh < CANVAS_H {
-        return Some((CANVAS_W, CANVAS_H));
+    if nw < canvas_w || nh < canvas_h {
+        return Some((canvas_w, canvas_h));
     }
     Some((nw, nh))
 }
-const FRAME: Duration = Duration::from_millis(20); // ~50 Hz
 
 struct App {
     engine: Engine,
@@ -150,6 +154,9 @@ struct App {
     /// Inner size before the last resize, so the aspect snap can tell WHICH edge
     /// the user dragged and keep that one. See `aspect_snap`.
     last_size: (u32, u32),
+    /// The canvas the frames arrive at (the model's) — followed when a model switch
+    /// changes it.
+    canvas: (u32, u32),
 }
 
 #[derive(Default, Clone, Copy, PartialEq)]
@@ -163,6 +170,7 @@ struct JoyState {
 
 impl App {
     fn new(engine: Engine, open_at_launch: bool) -> Self {
+        let canvas = model_canvas(&engine);
         Self {
             engine,
             open_pending: open_at_launch,
@@ -172,7 +180,8 @@ impl App {
             next_frame: Instant::now(),
             joy: JoyState::default(),
             shift_held: false,
-            last_size: (CANVAS_W * 2, CANVAS_H * 2),
+            last_size: (canvas.0 * 2, canvas.1 * 2),
+            canvas,
         }
     }
 
@@ -184,10 +193,12 @@ impl App {
             }
             return;
         }
+        self.canvas = model_canvas(&self.engine);
+        let (cw, ch) = self.canvas;
         let attrs = Window::default_attributes()
             .with_title("TRX64 — C64")
-            .with_inner_size(LogicalSize::new((CANVAS_W * 2) as f64, (CANVAS_H * 2) as f64))
-            .with_min_inner_size(LogicalSize::new(CANVAS_W as f64, CANVAS_H as f64));
+            .with_inner_size(LogicalSize::new((cw * 2) as f64, (ch * 2) as f64))
+            .with_min_inner_size(LogicalSize::new(cw as f64, ch as f64));
         let window = match el.create_window(attrs) {
             Ok(w) => Rc::new(w),
             Err(e) => {
@@ -247,6 +258,14 @@ impl App {
         let fb = trx64_daemon::pull_frame_buffer(self.engine.shared_state());
         let src_w = fb.width.max(1);
         let src_h = fb.height.max(1);
+        // A model switch changes the canvas: hold the new shape from here on.
+        if (src_w as u32, src_h as u32) != self.canvas {
+            self.canvas = (src_w as u32, src_h as u32);
+            window.set_min_inner_size(Some(LogicalSize::new(src_w as f64, src_h as f64)));
+            if let Some(want) = aspect_snap(win_w, win_h, (win_w, win_h), self.canvas) {
+                let _ = window.request_inner_size(PhysicalSize::new(want.0, want.1));
+            }
+        }
         // 16-entry 0x00RGB LUT from the 48-byte palette.
         let mut lut = [0u32; 256];
         for i in 0..16usize {
@@ -486,7 +505,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // instead of constraining it. The axis that moved more wins, so a
                 // horizontal drag keeps its width and a vertical drag its height.
                 if let Some(w) = &self.window {
-                    if let Some(want) = aspect_snap(size.width, size.height, self.last_size) {
+                    if let Some(want) = aspect_snap(size.width, size.height, self.last_size, self.canvas) {
                         let _ = w.request_inner_size(PhysicalSize::new(want.0, want.1));
                     }
                     self.last_size = (size.width, size.height);
@@ -506,10 +525,11 @@ impl ApplicationHandler<UserEvent> for App {
             el.set_control_flow(ControlFlow::Wait);
             return;
         }
-        // ~50 Hz redraw cadence.
+        // One redraw per frame at the model's nominal rate (20 ms PAL, 16 ms NTSC).
         let now = Instant::now();
         if now >= self.next_frame {
-            self.next_frame = now + FRAME;
+            let ms = trx64_daemon::machine_model(self.engine.shared_state()).timing.nominal_frame_ms();
+            self.next_frame = now + Duration::from_millis(ms);
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
@@ -520,7 +540,12 @@ impl ApplicationHandler<UserEvent> for App {
 
 #[cfg(test)]
 mod tests {
-    use super::{accepts, aspect_snap, CANVAS_H, CANVAS_W};
+    use super::{accepts, aspect_snap};
+
+    /// The PAL canvas these cases were written against.
+    const CANVAS_W: u32 = 384;
+    const CANVAS_H: u32 = 272;
+    const PAL: (u32, u32) = (CANVAS_W, CANVAS_H);
 
     #[test]
     fn synthetic_presses_are_dropped_but_synthetic_releases_are_not() {
@@ -544,25 +569,28 @@ mod tests {
         let born = (CANVAS_W * 2, CANVAS_H * 2); // 768x544, the launch size
 
         // Already on the ratio: nothing to do, or the window would resize forever.
-        assert_eq!(aspect_snap(768, 544, born), None);
-        assert_eq!(aspect_snap(1152, 816, born), None, "3x is on the ratio too");
+        assert_eq!(aspect_snap(768, 544, born, PAL), None);
+        assert_eq!(aspect_snap(1152, 816, born, PAL), None, "3x is on the ratio too");
 
         // Dragged WIDER: the width is what the user is holding, so it stays and
         // the height follows.
-        assert_eq!(aspect_snap(1000, 544, born), Some((1000, 708)));
+        assert_eq!(aspect_snap(1000, 544, born, PAL), Some((1000, 708)));
 
         // Dragged TALLER: the height stays and the width follows. Correcting the
         // other axis here would move the corner under the mouse.
-        assert_eq!(aspect_snap(768, 700, born), Some((988, 700)));
+        assert_eq!(aspect_snap(768, 700, born, PAL), Some((988, 700)));
 
         // Never below one whole canvas, and never by clamping ONE axis — that
         // would break the ratio this exists to hold. Snap to the minimum whole.
         assert_eq!(
-            aspect_snap(CANVAS_W, 40, (CANVAS_W, CANVAS_H)),
+            aspect_snap(CANVAS_W, 40, (CANVAS_W, CANVAS_H), PAL),
             Some((CANVAS_W, CANVAS_H))
         );
+        // The NTSC canvas (384×247) has its own shape.
+        assert_eq!(aspect_snap(768, 494, (768, 494), (384, 247)), None);
+        assert_eq!(aspect_snap(768, 544, (768, 494), (384, 247)), Some((845, 544)));
 
         // A degenerate size (minimise) is not something to correct.
-        assert_eq!(aspect_snap(0, 0, born), None);
+        assert_eq!(aspect_snap(0, 0, born, PAL), None);
     }
 }

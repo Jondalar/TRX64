@@ -33,7 +33,7 @@ use trx64_cli::sandbox_cmd;
 use trx64_cli::engine::Engine;
 use trx64_cli::tui::{self, UiToMain};
 use trx64_cli::window;
-use trx64_cli::{boot_engine, default_rom_dir};
+use trx64_cli::{boot_engine_with_model, default_rom_dir};
 
 #[derive(Parser, Debug)]
 #[command(name = "trx64-cli", version, about = "Cross-platform CLI cockpit + emulator window for the TRX64 runtime (in-process).")]
@@ -47,6 +47,18 @@ struct Cli {
     /// $C64RE_ROOT/resources/roms (matching the daemon's resolution).
     #[arg(long)]
     rom_dir: Option<PathBuf>,
+
+    /// Which C64 this is — a `models.toml` row (`c64-pal` default, `c64-ntsc`,
+    /// `c64-paln`, …), applied before anything runs: the cockpit, `mon`, `boot` and
+    /// `sandbox` all build their machine on it. A row that needs a building block this
+    /// build lacks is refused with the block's name.
+    #[arg(long, global = true)]
+    model: Option<String>,
+
+    /// Shorthand for the two base models: `pal` (c64-pal) or `ntsc` (c64-ntsc).
+    /// Overrides `--model`.
+    #[arg(long, global = true, value_parser = ["pal", "ntsc"])]
+    video: Option<String>,
 
     #[command(subcommand)]
     cmd: Option<Command>,
@@ -287,7 +299,7 @@ enum Command {
         /// Cycles to run after EACH --type so its command completes (default 40_000_000).
         #[arg(long, default_value_t = 40_000_000)]
         type_gap: u64,
-        /// Final settle cycles after the last --type (~985248/s PAL). Default 90_000_000.
+        /// Final settle cycles after the last --type (~985248/s PAL, ~1022730/s NTSC). Default 90_000_000.
         #[arg(long, default_value_t = 90_000_000)]
         cycles: u64,
         /// Per session/run-call cycle chunk (default 10_000_000).
@@ -328,6 +340,16 @@ enum Command {
 fn main() {
     let cli = Cli::parse();
     let rom_dir = cli.rom_dir.clone().unwrap_or_else(default_rom_dir);
+    // Spec 863 — the model first: every machine this process builds is built on it.
+    let model_name = cli.video.as_deref().or(cli.model.as_deref());
+    let model = match model_name.map(trx64_core::model::resolve) {
+        None => trx64_core::model::default_model(),
+        Some(Ok(m)) => m,
+        Some(Err(e)) => {
+            eprintln!("--model: {e}");
+            std::process::exit(2);
+        }
+    };
 
     // ── Static one-shot: disasm (no machine, no ROMs, no TUI) ──────────────────
     if let Some(Command::Disasm { file, load_address, start, count, json }) = &cli.cmd {
@@ -357,7 +379,7 @@ fn main() {
         // Spec 805 — batch mode: N runs, one process start. Mutually exclusive with the
         // single-run flags, which the spec file carries per item instead.
         if let Some(spec_path) = batch {
-            match sandbox_cmd::run_sandbox_batch(&rom_dir, spec_path) {
+            match sandbox_cmd::run_sandbox_batch(&rom_dir, spec_path, model_name) {
                 Ok(out) => println!("{out}"),
                 Err(e) => {
                     eprintln!("{e}");
@@ -373,7 +395,7 @@ fn main() {
         match sandbox_cmd::run_sandbox_cli(
             &rom_dir, seed.as_deref(), cart.as_deref(), cart_type.as_deref(), disk.as_deref(), load,
             load_hex, *entry, harvest, zp, *sentinel, io.as_deref(), *stub_addr, *cyc_cap,
-            *instr_cap, turbo.as_deref(), *direct_entry, reg_a.as_deref(), reg_x.as_deref(), reg_y.as_deref(),
+            *instr_cap, turbo.as_deref(), model_name, *direct_entry, reg_a.as_deref(), reg_x.as_deref(), reg_y.as_deref(),
             reg_sp.as_deref(), reg_p.as_deref(), stream.as_deref(), stream_hex.as_deref(),
             stream_hook, *json,
         ) {
@@ -445,7 +467,7 @@ fn main() {
     }) = &cli.cmd
     {
         match boot_cmd::run_boot(
-            &rom_dir, disk, *warmup, type_text, *type_gap, *cycles, *chunk, dump,
+            &rom_dir, model, disk, *warmup, type_text, *type_gap, *cycles, *chunk, dump,
             render.as_deref(), trace.as_deref(), trace_domains, turbo, *turbo_on,
         ) {
             Ok(out) => println!("{out}"),
@@ -460,7 +482,7 @@ fn main() {
     // ── One-shot mode (no TUI, no window) ──────────────────────────────────────
     if let Some(Command::Mon { command }) = &cli.cmd {
         let line = command.join(" ");
-        let engine = match boot_engine(&rom_dir) {
+        let engine = match boot_engine_with_model(&rom_dir, model) {
             Ok(e) => e,
             Err(e) => {
                 eprintln!("{e}");
@@ -475,7 +497,7 @@ fn main() {
     }
 
     // ── Interactive: cockpit (+ optional window) ────────────────────────────────
-    let engine = match boot_engine(&rom_dir) {
+    let engine = match boot_engine_with_model(&rom_dir, model) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("{e}");
@@ -492,15 +514,14 @@ fn main() {
     let pump_engine = engine.clone();
     let pump = thread::spawn(move || {
         // Pace by WALL-CLOCK, like the SwiftUI AppModel pump: each tick advances the
-        // cycles for the REAL time elapsed (`elapsed × PAL_CPU_HZ`), so the machine runs
-        // at true PAL real-time and SID output matches 44100 Hz exactly. A fixed 50 fps
-        // budget (19656 × 50 = 982800 cyc/s) ran slightly slow vs PAL's 985248 cyc/s →
-        // SID production ≈ 43990/s < the 44100 output rate → the audio ring slowly
-        // drained → constant underrun = crackle. A catch-up cap avoids a huge jump after
-        // a stall; the ~5 ms tick also matches the audio drain cadence (steady, not
-        // bursty). `pump_frame` no-ops while paused (host run flag clear).
-        const PAL_CPU_HZ: f64 = 985_248.0; // PAL 6569 system clock
-        const MAX_CATCHUP: u64 = 19_656 * 2; // ~2 frames
+        // cycles for the REAL time elapsed (`elapsed × the model's clock` — 985 248 Hz PAL,
+        // 1 022 730 Hz NTSC), so the machine runs at true real time and SID output matches
+        // 44100 Hz exactly. A fixed 50 fps budget (19656 × 50 = 982800 cyc/s) ran slightly
+        // slow vs PAL's 985248 cyc/s → SID production ≈ 43990/s < the 44100 output rate →
+        // the audio ring slowly drained → constant underrun = crackle. A catch-up cap (two
+        // frames) avoids a huge jump after a stall; the ~5 ms tick also matches the audio
+        // drain cadence (steady, not bursty). `pump_frame` no-ops while paused (host run
+        // flag clear). The clock is read every tick, so a model switch changes the pace.
         let tick = Duration::from_millis(5);
         let mut last = std::time::Instant::now();
         loop {
@@ -510,7 +531,8 @@ fn main() {
             let now = std::time::Instant::now();
             let elapsed = now.duration_since(last).as_secs_f64();
             last = now;
-            let cycles = ((elapsed * PAL_CPU_HZ) as u64).min(MAX_CATCHUP);
+            let t = trx64_daemon::machine_model(pump_engine.shared_state()).timing;
+            let cycles = ((elapsed * t.cpu_hz as f64) as u64).min(2 * t.cycles_per_frame);
             pump_engine.pump_frame(cycles);
             thread::sleep(tick);
         }

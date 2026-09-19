@@ -14,7 +14,7 @@
 //! controller `running` flag, and `session/run` REFUSES while `running==true` (so two
 //! clocks can't double-advance). The host (us) owns the per-frame loop. So the
 //! Engine keeps its OWN `running` flag (`AtomicBool`); the pump thread, while that
-//! flag is set, advances the machine one PAL frame at a time via `session/run`
+//! flag is set, advances the machine one frame at a time via `session/run`
 //! (which honours breakpoints + JAM) WITHOUT flipping the controller flag — exactly
 //! the FFI pattern. `pause` clears the flag.
 
@@ -23,10 +23,6 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use trx64_daemon::{dispatch, Request, Response, SharedState};
-
-/// One PAL frame ≈ 312 lines × 63 cycles = 19656; the daemon's `session/run`
-/// default budget is 19705. We advance one frame's worth per pump tick.
-pub const CYC_PER_FRAME: u64 = 19_656;
 
 /// The shared, cloneable handle to the in-process machine.
 #[derive(Clone)]
@@ -134,8 +130,8 @@ impl Engine {
     /// returns early with a `breakpoint` object — we then clear the host run flag so
     /// the cockpit shows PAUSED at the hit.
     /// Advance the machine by `base_cycles` (the host pump passes the cycles for the
-    /// REAL wall-clock time elapsed since the last tick — `elapsed × PAL_CPU_HZ` — so
-    /// the machine runs at true PAL real-time and SID production matches 44100 Hz, like
+    /// REAL wall-clock time elapsed since the last tick — `elapsed × the model's clock` —
+    /// so the machine runs at true real time and SID production matches 44100 Hz, like
     /// the SwiftUI AppModel pump; a fixed 50 fps budget drifted slow → audio crackle).
     pub fn pump_frame(&self, base_cycles: u64) -> u64 {
         // Spec 808 rebuild — the client hands over the real time that passed and renders

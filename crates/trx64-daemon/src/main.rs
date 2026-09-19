@@ -13757,10 +13757,12 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             match req.params.get("arm").and_then(|v| v.as_bool()) {
                 Some(true) => {
                     let cycle = st.session.machine.clk;
+                    let model = st.session.machine.model().name.as_str();
                     st.input_journal = Some(InputJournal {
                         armed_at_cycle: cycle,
                         entries: Vec::new(),
                         dropped: 0,
+                        model,
                     });
                     Response::ok(id, input_journal_json(&st))
                 }
@@ -16313,6 +16315,18 @@ fn serialise_batch_results(entry: &BatchEntry) -> Value {
 /// Returns a ReplayResult-shaped object (`ramHash`, `cyclesRan`, plus the start/end
 /// PC + cycle for cross-checking). A re-run on the same build hashes identically.
 fn run_scenario(st: &mut State, scenario: &Value) -> Result<Value, String> {
+    // Spec 863 — a scenario recorded on one model does not replay on another: its inputs
+    // are stamped in cycles of that machine's clock and frame. Refuse, naming both.
+    if let Some(recorded) = scenario.get("model").and_then(|v| v.as_str()) {
+        let here = st.session.machine.model();
+        let same = trx64_core::model::find(recorded).is_some_and(|m| std::ptr::eq(m, here));
+        if !same {
+            return Err(format!(
+                "scenario was recorded on {recorded}, this machine is {} — its inputs are timed in the other machine's cycles",
+                here.name
+            ));
+        }
+    }
     use trx64_core::scenario_player::ScenarioPlayer;
 
     // (1) Restore the start snapshot if one is provided. `startSnapshot` may be a
@@ -16463,6 +16477,9 @@ pub(crate) struct InputJournal {
     /// a truncated recording that does not SAY it is truncated is a recording that
     /// replays to the wrong place and blames the runtime.
     dropped: u64,
+    /// Spec 863 — the model the recording was made on. An input stamped by cycle means
+    /// nothing on a machine with another clock and another frame, so a replay names it.
+    model: &'static str,
 }
 
 /// The cap. Generous for any real recording (a long play-through is hundreds of inputs),
@@ -16520,6 +16537,7 @@ fn input_journal_json(st: &State) -> Value {
             "armed": true,
             "armedAtCycle": j.armed_at_cycle,
             "cycle": st.session.machine.clk,
+            "model": j.model,
             "dropped": j.dropped,
             "entries": j.entries.iter().map(|e| json!({
                 "cycle": e.cycle,
@@ -18980,6 +18998,13 @@ pub fn create_embedded_state_with_model(
     let boot = session.boot(rom_dir);
     let state = Arc::new(Mutex::new(build_state(session, false)));
     boot.map(|()| state)
+}
+
+/// Spec 863 — which C64 an embedded state's machine is: its row, with the timing (clock,
+/// frame) and the display window (the canvas the frames have). A host that paces or sizes
+/// by it — the CLI's pump and window — asks here instead of assuming PAL.
+pub fn machine_model(state: &SharedState) -> &'static trx64_core::model::C64Model {
+    state.lock().unwrap().session.machine.model()
 }
 
 /// The active [`NotifyHub`] for an embedded state — the single event-broadcast hub
@@ -24896,5 +24921,243 @@ mod batch1_tests {
         assert_eq!(ps[0]["space"], json!("roml"));
         assert_eq!(ps[0]["source"], json!("nop"));
     }
-}
 
+    // ── Spec 863 — models: the list, the switch, identity through reset, power and rewind ──
+
+    /// A ROM-booted, headless machine of the default model, warmed to READY.
+    fn booted_state() -> Option<SharedState> {
+        let roms = rom_dir();
+        if !roms.join("kernal-901227-03.bin").exists() {
+            eprintln!("[skip] 863 test: ROMs absent at {}", roms.display());
+            return None;
+        }
+        let st = make_state();
+        {
+            let mut g = st.lock().unwrap();
+            g.session.boot(&roms).expect("boot ROMs");
+            run_cycle_budget(&mut g.session, 3_000_000);
+        }
+        Some(st)
+    }
+
+    /// Acceptance 8 — every row of `models.toml` is listed, with whether it runs and what it
+    /// lacks; the session says which one it is.
+    #[test]
+    fn session_models_lists_every_row_and_what_it_lacks() {
+        let st = make_state();
+        let r = call(&st, "session/models", json!({}));
+        let rows = r["models"].as_array().unwrap();
+        assert_eq!(rows.len(), 7);
+        assert_eq!(r["current"], json!("c64-pal"));
+        let row = |n: &str| rows.iter().find(|m| m["name"] == json!(n)).unwrap().clone();
+        assert_eq!(row("c64-pal")["runs"], json!(true));
+        assert_eq!(row("c64-ntsc")["cyclesPerFrame"], json!(17095));
+        assert_eq!(row("c64-paln")["cpuHz"], json!(1_023_440));
+        assert_eq!(row("c64c-pal")["runs"], json!(false));
+        assert!(row("c64c-pal")["missing"].as_array().unwrap().contains(&json!("6526A CIA")));
+        // Choosing it is refused, by name, and changes nothing.
+        let e = call_err(&st, "session/model", json!({ "name": "c64c-pal" }));
+        assert!(e.message.contains("6526A"), "{}", e.message);
+        let e = call_err(&st, "session/model", json!({ "name": "c64-secam" }));
+        assert!(e.message.contains("unknown model"), "{}", e.message);
+        assert_eq!(call(&st, "session/state", json!({}))["model"], json!("c64-pal"));
+    }
+
+    /// Acceptance 7 — a running PAL program switched to NTSC keeps its RAM, CPU, CIA and SID
+    /// state bit-identical (field by field), the VIC continues at line 0 of 263, the next
+    /// frame is 17 095 cycles, the model survives reset and power off/on, and rewinding to
+    /// a checkpoint from before the switch makes the machine PAL again.
+    #[test]
+    fn the_switch_is_a_transplant_and_rewind_undoes_it() {
+        let Some(st) = booted_state() else { return };
+        // A PAL anchor to rewind to.
+        let anchor = call(&st, "checkpoint/capture", json!({}))["ref"]["id"].as_str().unwrap().to_string();
+        let anchor_ram = st.lock().unwrap().session.machine.ram.clone();
+        run_cycle_budget(&mut st.lock().unwrap().session, 50_000);
+
+        // Stand at the boundary first so the comparison is of the switch alone.
+        call(&st, "session/advance_to_frame", json!({}));
+        let before = st.lock().unwrap().session.machine.clone();
+        let mut hello = probe_notifications(&st);
+        let r = call(&st, "session/model", json!({ "name": "c64-ntsc" }));
+        assert_eq!(r["switched"], json!(true));
+        assert_eq!(r["from"], json!("c64-pal"));
+        assert_eq!(r["model"], json!("c64-ntsc"));
+        for k in ["cpu", "ram", "cia", "sid"] {
+            assert_eq!(r["kept"][k], json!(true), "kept {k}");
+        }
+        {
+            let g = st.lock().unwrap();
+            let (a, b) = (&g.session.machine, &before);
+            assert_eq!((a.c64_core.reg_pc, a.c64_core.reg_a, a.c64_core.reg_x, a.c64_core.reg_y, a.c64_core.reg_sp),
+                       (b.c64_core.reg_pc, b.c64_core.reg_a, b.c64_core.reg_x, b.c64_core.reg_y, b.c64_core.reg_sp));
+            assert_eq!(a.c64_core.status(), b.c64_core.status());
+            assert_eq!(a.clk, b.clk, "no cycle ran in the switch");
+            assert!(a.ram[..] == b.ram[..], "RAM");
+            assert_eq!((a.cia1.regs, a.cia2.regs), (b.cia1.regs, b.cia2.regs), "CIA registers");
+            assert_eq!((a.cia1.ta.read_timer(), a.cia1.tb.read_timer()), (b.cia1.ta.read_timer(), b.cia1.tb.read_timer()));
+            assert_eq!((a.cia2.ta.read_timer(), a.cia2.tb.read_timer()), (b.cia2.ta.read_timer(), b.cia2.tb.read_timer()));
+            assert_eq!(a.sid_regs, b.sid_regs, "SID registers");
+            assert_eq!(a.drive8.drive_clk, b.drive8.drive_clk, "the drive keeps its own clock");
+            assert_eq!(a.vic.regs, b.vic.regs, "VIC registers");
+            assert_eq!(a.vic.raster_line, 0, "the VIC continues at line 0");
+            assert_eq!((a.vic.cycles_per_line(), a.vic.screen_height()), (65, 263));
+            assert_eq!((a.cia1.tod_power_freq, a.drive8.sync_factor), (60, 64079));
+        }
+        // Every client was told.
+        let pushed = drain_notifications(&mut hello);
+        let h = pushed.iter().find(|(m, _)| m == "av/hello").expect("av/hello on the switch");
+        assert_eq!(h.1["model"], json!("c64-ntsc"));
+        assert_eq!(h.1["canvas"], json!({ "width": 384, "height": 247 }));
+
+        // The frame is 17 095 cycles from here on: over three and a bit frames, the raster
+        // position moves by exactly the cycles run, modulo 17 095 (65 × 263).
+        let pos = |st: &SharedState| {
+            let g = st.lock().unwrap();
+            let m = &g.session.machine;
+            (m.clk, trx64_core::vic_line_trace::frame_position(m), m.vic.raster_line)
+        };
+        let (clk0, fp0, line0) = pos(&st);
+        assert_eq!(line0, 0);
+        call(&st, "session/run", json!({ "cycles": 3 * 17_095 + 1_234 }));
+        let (clk1, fp1, _) = pos(&st);
+        assert_eq!((fp1 + 17_095 - fp0) % 17_095, (clk1 - clk0) % 17_095, "a frame is 17 095 cycles");
+        assert!(clk1 - clk0 >= 3 * 17_095 + 1_234);
+
+        // State reports it.
+        let s = call(&st, "session/state", json!({}));
+        assert_eq!((s["model"].clone(), s["videoStandard"].clone(), s["chip"].clone()), (json!("c64-ntsc"), json!("ntsc"), json!("6567R8")));
+        assert_eq!((s["cyclesPerLine"].clone(), s["linesPerFrame"].clone(), s["cyclesPerFrame"].clone()), (json!(65), json!(263), json!(17095)));
+        assert_eq!(s["cpuHz"], json!(1_022_730));
+        assert!((s["frameRate"].as_f64().unwrap() - 59.826).abs() < 0.001);
+        assert_eq!(call(&st, "monitor/state", json!({}))["model"], json!("c64-ntsc"));
+
+        // Rewinding to the anchor from before the switch makes the machine PAL again, with
+        // the anchor's state.
+        call(&st, "checkpoint/restore", json!({ "id": anchor }));
+        {
+            let g = st.lock().unwrap();
+            assert_eq!(g.session.machine.model().name, "c64-pal", "rewound onto PAL");
+            assert_eq!(g.session.model.name, "c64-pal", "and the session is PAL again");
+            assert_eq!(g.session.machine.vic.cycles_per_line(), 63);
+            assert!(g.session.machine.ram[..] == anchor_ram[..], "the anchor's RAM");
+        }
+        assert_eq!(call(&st, "session/state", json!({}))["model"], json!("c64-pal"));
+
+        // Back to NTSC: it survives a warm reset, a cold reset and a power cycle.
+        call(&st, "session/model", json!({ "name": "c64-ntsc" }));
+        call(&st, "session/reset", json!({ "mode": "soft" }));
+        assert_eq!(st.lock().unwrap().session.machine.model().name, "c64-ntsc", "warm reset");
+        call(&st, "session/reset", json!({ "mode": "cold" }));
+        assert_eq!(st.lock().unwrap().session.machine.model().name, "c64-ntsc", "cold reset");
+        call(&st, "session/power", json!({ "op": "off" }));
+        call(&st, "session/power", json!({ "op": "on" }));
+        {
+            let g = st.lock().unwrap();
+            assert_eq!(g.session.machine.model().name, "c64-ntsc", "power cycle");
+            assert_eq!(g.session.machine.ram[0x02a6], 0, "and it boots as NTSC");
+        }
+    }
+
+    /// Acceptance 7 — `c64-ntsc` round-trips through dump/undump, and a snapshot of a row
+    /// that cannot run here is refused by name — nothing panics, nothing changes.
+    #[test]
+    fn ntsc_round_trips_through_dump_and_a_foreign_row_is_refused() {
+        let Some(st) = booted_state() else { return };
+        call(&st, "session/model", json!({ "name": "ntsc" }));
+        run_cycle_budget(&mut st.lock().unwrap().session, 200_000);
+        let dir = std::env::temp_dir().join(format!("trx64-863-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ntsc.c64re");
+        let d = call(&st, "snapshot/dump", json!({ "path": path.to_string_lossy() }));
+        assert_eq!(d["machine"], json!("c64-ntsc"));
+        let (pc, ram) = {
+            let g = st.lock().unwrap();
+            (g.session.machine.c64_core.reg_pc, g.session.machine.ram.clone())
+        };
+        call(&st, "session/model", json!({ "name": "pal" }));
+        call(&st, "snapshot/undump", json!({ "path": path.to_string_lossy() }));
+        {
+            let g = st.lock().unwrap();
+            assert_eq!(g.session.machine.model().name, "c64-ntsc", "undump puts it back on NTSC");
+            assert_eq!(g.session.machine.c64_core.reg_pc, pc);
+            assert!(g.session.machine.ram[..] == ram[..]);
+        }
+
+        // A checkpoint claiming a C64C (8565, VICE model 1) is refused naming the 6526A.
+        let mut cp = {
+            let g = st.lock().unwrap();
+            trx64_core::c64re_snapshot::capture_runtime_checkpoint(&g.session.machine, "", "", None, None, None, None)
+        };
+        cp["vic"]["model"] = json!(1);
+        let before_clk = st.lock().unwrap().session.machine.clk;
+        let e = {
+            let mut g = st.lock().unwrap();
+            restore_live_checkpoint(&mut g.session, &cp).unwrap_err()
+        };
+        assert!(e.contains("6526A"), "{e}");
+        // A position the row does not have (cycle 64 on the 63-cycle PAL line) is refused.
+        cp["vic"]["model"] = json!(0);
+        cp["vic"]["raster_cycle"] = json!(63);
+        let e = {
+            let mut g = st.lock().unwrap();
+            restore_live_checkpoint(&mut g.session, &cp).unwrap_err()
+        };
+        assert!(e.contains("cycle 64"), "{e}");
+        let g = st.lock().unwrap();
+        assert_eq!(g.session.machine.clk, before_clk, "a refused restore changes nothing");
+        assert_eq!(g.session.machine.model().name, "c64-ntsc");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Acceptance 9 — an NTSC frame goes out at the NTSC canvas size in the BIN_VIC header,
+    /// and the stream paces to the model's rate (~59.83 frames a second).
+    #[test]
+    fn an_ntsc_frame_carries_its_canvas_in_the_bin_vic_header() {
+        let Some(st) = booted_state() else { return };
+        // session/create {model} STARTS the machine as that model — a power-on on the row.
+        let r = call(&st, "session/create", json!({ "model": "c64-ntsc" }));
+        assert_eq!(r["model"], json!("c64-ntsc"));
+        run_cycle_budget(&mut st.lock().unwrap().session, 3 * 17_095);
+        let g = st.lock().unwrap();
+        assert_eq!(g.session.machine.ram[0x02a6], 0, "it booted as NTSC");
+        let (w, h, idx) = g.session.machine.render_canvas_indices();
+        let msg = crate::streaming::build_vic_frame(0, 0, &idx, w as u16, h as u16);
+        let p = &msg[5..];
+        assert_eq!((u16::from_le_bytes([p[0], p[1]]), u16::from_le_bytes([p[2], p[3]])), (384, 247));
+        let hello = av_hello(&g);
+        assert!((hello["frameRate"].as_f64().unwrap() - 59.826).abs() < 0.001);
+        assert_eq!(hello["cyclesPerFrame"], json!(17095));
+    }
+
+    /// The monitor verb reports the model and the rows, and switches.
+    #[test]
+    fn the_monitor_model_verb_reports_and_switches() {
+        let Some(st) = booted_state() else { return };
+        let out = call(&st, "monitor/exec", json!({ "command": "model" }))["output"].as_str().unwrap().to_string();
+        assert!(out.contains("c64-pal") && out.contains("c64-ntsc") && out.contains("6526A"), "{out}");
+        let out = call(&st, "monitor/exec", json!({ "command": "model c64-ntsc" }))["output"].as_str().unwrap().to_string();
+        assert!(out.contains("c64-pal → c64-ntsc"), "{out}");
+        assert_eq!(st.lock().unwrap().session.machine.model().name, "c64-ntsc");
+    }
+
+    /// Pacing is "realtime" now — the model's rate — and "pal" is still accepted.
+    #[test]
+    fn pacing_pal_is_an_alias_of_realtime() {
+        let st = make_state();
+        let r = call(&st, "session/set_pacing", json!({ "mode": "pal" }));
+        assert_eq!(r["pacing"]["mode"], json!("realtime"));
+        let r = call(&st, "session/set_pacing", json!({ "mode": "warp" }));
+        assert_eq!(r["pacing"]["mode"], json!("warp"));
+        call_err(&st, "session/set_pacing", json!({ "mode": "ntsc" }));
+    }
+
+    /// A scenario recorded on one model refuses to replay on another, naming both.
+    #[test]
+    fn a_scenario_from_another_model_is_refused() {
+        let st = make_state();
+        let mut g = st.lock().unwrap();
+        let e = run_scenario(&mut g, &json!({ "model": "c64-ntsc", "cycleBudget": 10, "inputs": [] })).unwrap_err();
+        assert!(e.contains("c64-ntsc") && e.contains("c64-pal"), "{e}");
+    }
+}

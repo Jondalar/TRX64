@@ -19,7 +19,7 @@ use std::path::Path;
 use base64::Engine as _;
 use serde_json::json;
 
-use crate::boot_engine;
+use crate::boot_engine_with_model;
 use crate::engine::Engine;
 
 fn compact(v: &serde_json::Value) -> String {
@@ -41,6 +41,7 @@ fn run_cycles(engine: &Engine, total: u64, chunk: u64) -> Result<(), String> {
 #[allow(clippy::too_many_arguments)]
 pub fn run_boot(
     rom_dir: &Path,
+    model: &'static trx64_core::model::C64Model,
     disk: &str,
     warmup: u64,
     types: &[String],
@@ -54,7 +55,8 @@ pub fn run_boot(
     turbo: &str,
     turbo_on: bool,
 ) -> Result<String, String> {
-    let engine = boot_engine(rom_dir).map_err(|e| format!("{e}"))?;
+    let engine = boot_engine_with_model(rom_dir, model).map_err(|e| format!("{e}"))?;
+    let hz = model.timing.cpu_hz as u64;
     let mut log: Vec<String> = Vec::new();
 
     // Spec 815 — BEFORE the mount. A cartridge probes for a turbo machine in its
@@ -99,7 +101,7 @@ pub fn run_boot(
 
     // Warm up to the READY prompt BEFORE typing (keys are scheduled from now on).
     run_cycles(&engine, warmup, chunk)?;
-    log.push(format!("warmup {warmup} cycles (~{}s → READY)", warmup / 985_248));
+    log.push(format!("warmup {warmup} cycles (~{}s → READY)", warmup / hz));
 
     // Each --type: queue keys (raw control chars — session/type does NOT decode
     // escapes, so convert literal \r/\n → RETURN here), then run --type-gap so the
@@ -114,7 +116,7 @@ pub fn run_boot(
 
     // Final settle (game boots / reaches an in-play state).
     run_cycles(&engine, cycles, chunk)?;
-    log.push(format!("settle {cycles} cycles (~{}s PAL)", cycles / 985_248));
+    log.push(format!("settle {cycles} cycles (~{}s {})", cycles / hz, model.name));
 
     // Optional screenshot (verify what actually booted) — decode the render_screen
     // data-URL PNG and write it.

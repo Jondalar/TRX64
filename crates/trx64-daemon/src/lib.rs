@@ -20,7 +20,8 @@ mod daemon;
 
 // The embed surface consumed by `trx64-ffi`.
 pub use daemon::{
-    build_state, create_embedded_state, create_embedded_state_with_model, dispatch, notify_hub,
+    build_state, create_embedded_state, create_embedded_state_with_model, dispatch, machine_model,
+    notify_hub,
     Request, Response, RpcError,
     SharedState, State,
 };

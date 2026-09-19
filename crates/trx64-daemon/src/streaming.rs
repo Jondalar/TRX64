@@ -718,6 +718,17 @@ mod tests {
         assert!(paused_present_due(true, 1000, 1000));
     }
 
+    /// Spec 863 — real time is the model's frame rate: ~59.83 frames a second on NTSC, and
+    /// on PAL exactly the period the loop always slept.
+    #[test]
+    fn the_pace_is_the_models_frame_rate() {
+        let ntsc = trx64_core::model::resolve("c64-ntsc").unwrap().timing;
+        let p = frame_period(&ntsc).as_secs_f64();
+        assert!((1.0 / p - 59.826).abs() < 0.001, "{}", 1.0 / p);
+        let pal = trx64_core::model::default_model().timing;
+        assert_eq!(frame_period(&pal), Duration::from_secs_f64(19656.0 / 985_248.0));
+    }
+
     #[test]
     fn vic_frame_wire_layout_matches_tap() {
         // 2×2 indices for a compact check (the real frame is 384×272).
