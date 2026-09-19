@@ -15157,8 +15157,15 @@ fn scenario_summary_src(s: &Value, source: &str, file_path: &str) -> Value {
     // absolute on-disk path of the scenario JSON) — a missing field vs the TS authority
     // (audit ws-trace-monitor-misc-20). For an in-memory-only scenario the TS registry
     // has no on-disk file yet, so `file_path` is "" there.
+    //
+    // Spec 863 — and `model`, the machine the scenario was recorded on (a recording carries
+    // the model its input journal was armed on). Its `cycleBudget` and input cycles are that
+    // machine's cycles, so a client turning them into seconds needs that machine's clock,
+    // not the running one's. `null` for a scenario that names no model: it replays on
+    // whichever machine runs it.
     json!({
         "id": s.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+        "model": s.get("model").and_then(|v| v.as_str()),
         "diskPath": s.get("diskPath").and_then(|v| v.as_str()).unwrap_or(""),
         "mode": s.get("mode").and_then(|v| v.as_str()).unwrap_or("true-drive"),
         "cycleBudget": s.get("cycleBudget").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -23749,6 +23756,28 @@ mod batch1_tests {
         assert_eq!(call(&st, "runtime/scenario_delete", json!({ "id": "boot-test" }))["deleted"], json!(true));
         assert_eq!(call(&st, "runtime/scenario_delete", json!({ "id": "boot-test" }))["deleted"], json!(false));
         assert_eq!(call(&st, "runtime/scenario_list", json!({})), json!([]));
+    }
+
+    /// Spec 863 — a summary says which machine the scenario was recorded on, so a client
+    /// counts its cycles in THAT machine's clock; a scenario that names none says `null`.
+    #[test]
+    fn scenario_summaries_carry_the_recorded_model() {
+        let st = make_state();
+        // A scenario made from a recording carries the model its journal was armed on.
+        call(&st, "session/model", json!({ "name": "c64-ntsc" }));
+        let journal = call(&st, "session/input_journal", json!({ "arm": true }));
+        assert_eq!(journal["model"], json!("c64-ntsc"));
+        call(&st, "session/model", json!({ "name": "c64-pal" }));
+        let recorded = json!({
+            "id": "rec", "diskPath": "", "cycleBudget": 17_095 * 60, "inputs": [],
+            "model": journal["model"],
+        });
+        call(&st, "runtime/scenario_save", json!({ "scenario": recorded }));
+        call(&st, "runtime/scenario_save", json!({ "scenario": { "id": "plain", "diskPath": "", "cycleBudget": 100, "inputs": [] } }));
+        let list = call(&st, "runtime/scenario_list", json!({}));
+        let by = |id: &str| list.as_array().unwrap().iter().find(|s| s["id"] == json!(id)).unwrap().clone();
+        assert_eq!(by("rec")["model"], json!("c64-ntsc"), "the recorded machine, not the running one (c64-pal)");
+        assert!(by("plain").get("model").is_some_and(|m| m.is_null()), "a scenario without a model says null");
     }
 
     #[test]

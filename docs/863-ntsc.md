@@ -335,7 +335,7 @@ refused, naming both.
 **Wire.** Additive: `session/models`, `session/model`, `session/create.model`, the identity
 fields in `session/state` / `monitor/state` / `session/create`, `av/hello`, `frame.model`,
 `firstLine`, `displayWindow` and `geometry.visible.{lastLine,wraps}` in the frame map, `model`
-in the input journal and the sandbox JSON. One VALUE changed: `pacing.mode` reads `"realtime"`
+in the input journal, the sandbox JSON and the `runtime/scenario_list` summaries. One VALUE changed: `pacing.mode` reads `"realtime"`
 where it read `"pal"` (`"pal"` is still accepted on input). No field changed shape; the epoch
 stays `trx64-runtime/2`.
 
@@ -354,6 +354,14 @@ entries at 10 s, +4.1 MiB. Tests: `the_ring_holds_its_seconds_on_every_model` (`
 `the_reverse_ring_holds_its_seconds_on_every_model_and_a_switch_keeps_it` (`ntsc_gate.rs`: the
 knob reports the seconds it was given on each row, a PAL machine with history switched to NTSC
 keeps capacity and entries).
+
+**The scenario list names the recorded model.** A `runtime/scenario_list` summary carries `model`
+— the machine the scenario was recorded on (a recording carries the model its input journal was
+armed on), `null` for a scenario that names none — so a client turns `cycleBudget` into seconds
+with the RECORDED machine's clock. C64RE's Export tab does (`scenarioDuration`), falling back to
+the running machine's clock only for a runtime without the field, and says so on the tab. Tests:
+`scenario_summaries_carry_the_recorded_model` (daemon; an NTSC-recorded scenario listed while the
+machine is PAL), C64RE `e2e:863-model` and `smoke:863`.
 
 **Acceptance, item by item (§6):**
 
