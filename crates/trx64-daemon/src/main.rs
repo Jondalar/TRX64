@@ -9107,13 +9107,16 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             // boot-time construct is the only attached=false; clients never observe it.
             let attached = true;
             // Spec 863 — `model` chooses the C64 the session is. Asking for the model it
-            // already is attaches; asking for another starts that machine (a fresh power-on
-            // on the new row — a session STARTS as a model, it is not switched into one:
-            // `session/model` is the switch). A row that cannot run is refused by name.
+            // already is attaches. Asking for another SWITCHES the shared machine the one
+            // way a model ever changes on it — at the next frame boundary, as the transplant
+            // `session/model` does, never a power cycle (the owner: "Switch von PAL → NTSC
+            // oder umgekehrt immer nur bei neuem Frame"). A machine that is off becomes that
+            // model at its next power-on. A row that cannot run is refused by name.
             // (`pal`, the old boolean, is still accepted and ignored.)
+            let mut model_switch = Value::Null;
             if let Some(name) = req.params.get("model").and_then(|v| v.as_str()) {
-                match trx64_core::model::resolve(name) {
-                    Ok(row) => start_session_model(&mut st, row),
+                match switch_session_model(&mut st, name) {
+                    Ok(v) => model_switch = v,
                     Err(e) => return Response::err(id, -32602, format!("session/create: {e}")),
                 }
             }
@@ -9209,6 +9212,9 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 "trace": trace_val
             });
             merge_identity(&mut reply, st.session.machine.model());
+            if !model_switch.is_null() {
+                reply["modelSwitch"] = model_switch;
+            }
             Response::ok(id, reply)
         }
 
@@ -25119,12 +25125,18 @@ mod batch1_tests {
     #[test]
     fn an_ntsc_frame_carries_its_canvas_in_the_bin_vic_header() {
         let Some(st) = booted_state() else { return };
-        // session/create {model} STARTS the machine as that model — a power-on on the row.
+        // session/create {model} on a running PAL machine SWITCHES it at the frame
+        // boundary (never a power cycle); a cold start on the row is the power button.
         let r = call(&st, "session/create", json!({ "model": "c64-ntsc" }));
         assert_eq!(r["model"], json!("c64-ntsc"));
+        assert_eq!(r["modelSwitch"]["switched"], json!(true));
+        assert_eq!(r["modelSwitch"]["switchedAt"]["rasterLine"], json!(0));
+        assert_eq!(r["modelSwitch"]["kept"]["ram"], json!(true));
+        call(&st, "session/power", json!({ "op": "off" }));
+        call(&st, "session/power", json!({ "op": "on" }));
         run_cycle_budget(&mut st.lock().unwrap().session, 3 * 17_095);
         let g = st.lock().unwrap();
-        assert_eq!(g.session.machine.ram[0x02a6], 0, "it booted as NTSC");
+        assert_eq!(g.session.machine.ram[0x02a6], 0, "a cold start on the NTSC row detects NTSC");
         let (w, h, idx) = g.session.machine.render_canvas_indices();
         let msg = crate::streaming::build_vic_frame(0, 0, &idx, w as u16, h as u16);
         let p = &msg[5..];
