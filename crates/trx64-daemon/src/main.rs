@@ -3272,7 +3272,7 @@ fn run_isolated_segment(
 // T2.8 — the 6502 disasm formatters (1:1 ports of disasm6502.ts `disasmLine`,
 // plus the Spec 754 §3.3f labeled variant) moved to the shared static-capability
 // crate (capability-cut migration step 1): `trx64-static/src/disasm6502.rs`.
-// The daemon, `trx64cli disasm` and (later) `trx64-mcp` share ONE decoder.
+// The daemon and `trx64cli disasm` share ONE decoder.
 use trx64_static::disasm6502::{disasm_line_ts, disasm_line_ts_labeled};
 
 /// reverse-debug Phase 1a — render the LIVE CPU-history ring (`Machine::cpu_history`)

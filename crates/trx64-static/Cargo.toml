@@ -1,8 +1,7 @@
-# trx64-static — static (machine-free) capability: decode / parse / classify.
-# Capability-cut Q2-C crate (docs/capability-cut-decisions.md): static capability
-# lives in a lib crate, NOT the daemon. Started by migration step 1 (the 6502
-# raw-decode dedupe). Consumers: trx64-daemon (monitor verbs), trx64-cli
-# (`trx64cli disasm`), later trx64-mcp (façade).
+# trx64-static — the machine-free 6502 decoder the runtime uses.
+# Capability-cut step 1 (docs/capability-cut-decisions.md): one decoder shared by
+# trx64-daemon (monitor verbs) and trx64-cli (`trx64cli disasm`). Static analysis
+# is C64RE's (revised 2026-09-19); nothing else moves here.
 
 [package]
 name = "trx64-static"

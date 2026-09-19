@@ -95,10 +95,10 @@ via monitor), `runtime_step_*` / `until` / `follow_path`, `runtime_media_*`,
 disk/CRT/G64 extraction + inspection, `inspect_address_range` / `ram_report` /
 `c64ref_lookup`, the project layer (`project_*`, `save_*`, `list_*`, `link_*`), the agent
 layer (`agent_*`), `build_*`, payload/cart-chunk tools, the wiki.
-*(Reconciled with `capability-cut-decisions.md`, 2026-06-29: the tool surface and
-the meaning layer stay C64RE, but the static decode/parse/classify **capability**
-underneath these tools migrates phased into `trx64-static` — see the cut doc's
-migration order; C64RE-side registration = C64RE Spec 774.)*
+*(Reconciled with `capability-cut-decisions.md`: the 2026-06-29 plan to migrate the
+static decode/parse/classify capability underneath these tools into `trx64-static` was
+undone 2026-09-19 — TRX64 is a runtime, and the analysis stays C64RE's, in TS. C64RE
+Spec 774 is closed.)*
 
 **Hybrid — decide explicitly:**
 - **`trace_store_*` + the DuckDB store.** TRX64 *emits* the `.c64retrace` stream; C64RE
@@ -145,11 +145,9 @@ Each step is independently shippable + reversible.
 - **Naming:** "TRX64 runtime MCP" vs a product name.
 
 ## 7. Non-goals
-- No big-bang rewrite of the analysis pipeline. ~~It stays in C64RE as-is~~ —
-  superseded by `capability-cut-decisions.md` (2026-06-29): the semantic layer
-  stays in C64RE permanently; the static decode/parse/classify capability
-  migrates *phased* into `trx64-static` (step 1 = shared 6502 decode +
-  `trx64cli disasm`, shipped 2026-07-02), TS path retired only after parity.
+- No rewrite of the analysis pipeline. It stays in C64RE, in TS (`capability-cut-decisions.md`,
+  revised 2026-09-19: the phased migration into `trx64-static` is WON'T-DO; only the 6502
+  decoder the runtime's monitor uses lives there, shipped 2026-07-02).
 - No second machine / no change to one-machine-per-process.
 - The web UI stays browser-based in C64RE (not ported to native).
 
