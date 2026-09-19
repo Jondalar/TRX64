@@ -235,6 +235,20 @@ and the audio underruns stopped. The rings stay per instruction; that cost is th
 its own switch. What dominates now is the CIA timer update, which this change barely touched:
 its cost is the real per-PHI2 advance, not the repeats.
 
+## More than one SID — 855
+
+A C64 program could only ever talk to one SID at `$D400`, while the U64 decodes up to eight
+across `$D400-$D7FF` and `$DE00-$DFFF` from its firmware's socket and UltiSID registers.
+
+**Decision:** TRX64 carries N SID instances and a per-block mapping (a 32-byte block to a chip,
+optionally ahead of the expansion port); the host builds the map. TRX64's half — handles, the
+map, reads through chip 0's model, the host door for the others, the `.c64re` snapshot — was
+gated in `sid_multi_gate` (sixteen cases). UE2 built its half against it: the map from the
+firmware's decoders, one reSID per receiver, the mixer, readback through the door; checked by
+unit tests, a bridge test, firmware-in-the-loop smokes (a second SID alone at 1000.0 Hz) and an
+8-SID demo by ear. Closed 2026-09-19 when UE2 confirmed; stereo, filter curves and socket 2 stay
+deliberately unbuilt on UE2's side. Spec: [855-more-than-one-sid.md](855-more-than-one-sid.md).
+
 ## The CIA alarm is a comparison, not an update — 857
 
 UE2's profile after 856 left one item at the top: the CIA timer update, 12–16 % of the

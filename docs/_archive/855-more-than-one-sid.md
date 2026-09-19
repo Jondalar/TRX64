@@ -1,6 +1,6 @@
 # Spec 855 — More than one SID
 
-**Status:** PARTLY BUILT 2026-09-17 — D1 (handles in the shim) is built and gated; D2–D8 open. See §8.
+**Status:** BUILT — CLOSED 2026-09-19. TRX64's half in 0.7.x (§8), UE2's half in UE2 0.3.0 (§9).
 **Repos:** TRX64 (`trx64-core`) builds the core half. UE2 (`u64-emulator/crates/c64-bridge`)
 builds its own: the UltiSID register face, the address decode it already owns, and its mixer.
 **Number:** 855 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`).
@@ -279,3 +279,37 @@ unchanged and this sentence is why. UE2 does not use VSF.
 **TRX64's half of 855 is complete: D1, D2, D3, D4, D5, D6, and D7 by resolution.** `sid_multi_gate`
 has sixteen cases in `scripts/gate.sh`. UE2's half — the UltiSID register face, the resolution into
 the table, its ARMSID protocol behind D5, and its mixer — is theirs and unstarted.
+
+## §9 As built — UE2's half (confirmed by the UE2 session, 2026-09-19)
+
+UE2 spec `docs/specs/S17-ultisid.md`, commit `cbbae9e` (GitHub mirror `41b8dd0`), released in
+UE2 0.3.0; the SID engines moved to their own thread with a live audio device in `eaac1f3`
+(0.3.2). UE2 0.3.4 pins TRX64 0.7.3.
+
+- **The map** comes from the firmware's latched decoders — socket 1/2 and UltiSID 1/2 BASE/MASK,
+  the socket enables, split instances A–D per UltiSID. For every 32-byte block of `$D400-$D7FF`
+  and `$DE00-$DFFF` UE2 computes every receiver that hits it. Distinct receiver sets become
+  TRX64 chips (the set holding UltiSID 1-A is chip 0), one `SidMapping` per block; `$DE`/`$DF`
+  only when something receives them, with `ahead_of_expansion`. Writes fan out to every
+  receiver of a chip's group; firmware DMA writes are re-stamped with the live cycle (D4).
+- **One reSID per receiver** that got a write; model from its UltiSID's WAVES or the ARMSID mode,
+  a model change rebuilds the engine and replays its registers; all engines clocked in one loop.
+- **Reads:** chip 0 from TRX64's model (D3); OSC3/ENV3 of chips 1+ through the host door (D5)
+  from a cached readback; ARMSID config through the door.
+- **Mixer** bytes `0x10100500+0x00..0x13` → per-channel mono gain.
+
+Checked by unit tests (boot map, 1- and 2-SID player maps, splits, socket enables, group
+numbering, fan-out, per-UltiSID model, mixer gains, chip-1 ENV3 readback, ARMSID readback), a
+bridge test (UltiSID 2 at `$D420` sounds, chip 0 silent), two firmware-in-the-loop smokes (the
+firmware SID player on a PSID whose second SID alone plays 1000 Hz — WAV analysis 1000.0 Hz —
+rechecked on TRX64 0.7.3), and by ear on an 8-SID demo.
+
+**Deliberately not built on UE2's side:** RES/DIGI/filter curves (D7), stereo (pan pairs summed
+to mono), socket 2 and the second SID of a dual chip, `C64_VOICE_ADSR`, the speaker and
+sampler/drive/tape mixer channels, readback of chips 1+ without an audio sink, and SID
+readback through monitor peeks of `$DE00-$DFFF` (855 §4).
+
+**Open, and not answerable from the open sources:** which decoder wins a read when several hit
+(UE2 reads the group's first receiver); four real instances per UltiSID or mirroring;
+`ahead_of_expansion` for `$DE`/`$DF`; the left/right labels of the mixer bytes (irrelevant in
+mono). None of them blocks anything built.
