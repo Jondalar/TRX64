@@ -331,6 +331,13 @@ already has a play connection has a debugger for free.
 ← {"jsonrpc":"2.0","id":8,"result":{"error":"map: no trace store — …"}}
 ```
 
+**Every reply also carries `spans` and `machine`** (Spec 804). `spans` says where the reply
+printed each address — `{line, start, end, addr, space, role, lens?, len?}`, `start`/`end`
+in UTF-16 units of that line, `space` `c64`|`drive8`, `role` `pc`|`target`|`operand`|`memory`
+— so a consumer that wants names never parses a column. `machine` is the device and the
+banking state (`cpuPortDirection`, `cpuPortValue`, `exrom`, `game`, `cartBank`);
+`monitor/state` returns it without running a command. TRX64 itself holds no symbols.
+
 Read only `output` and every failed command looks like it silently did nothing. (Our own
 CLI cockpit had exactly that bug: monitor errors rendered as blank lines, which hid a real
 fault through two rounds of debugging.) Always check `error` first. A modal verb may also
@@ -340,11 +347,11 @@ return `prompt`.
 
 | purpose | verbs |
 |---|---|
-| CPU + memory state | `r` (registers) · `m <from> [to]` (hex dump) · `d <addr>` (disassemble) · `sym`/`label` |
+| CPU + memory state | `r` (registers) · `m <from> [to]` (hex dump) · `d <addr>` (disassemble). No names: every reply carries `spans` (where it printed each address) and `machine` (device + banking) — a consumer that wants names joins them itself (Spec 804) |
 | stop / resume / step | `g` (go) · `z` (step) · `si`/`so` (step in/over) · `ret` · `until <addr>` |
 | breakpoints + watches | `bk <addr>` · `watch`/`watch_read`/`watch_write` · `del`/`toggle`/`ignore` |
 | what just happened | `chis` (CPU history from the live ring) · `bt` (backtrace) · `whowrote <addr>` |
-| analysis | `map` (memory map) · `swimlane [from to]` · `taint <addr>` · `xref` |
+| analysis | `map` (memory map) · `swimlane [from to]` · `taint <addr>` |
 | media | `crt`/`disk` (status) · `swapcrt` · `eject` |
 | state capture | `dump`/`undump` (`.c64re`) · `ringdump`/`ringload` (whole reverse-debug buffer) |
 | the rest | `help` — the full reference, rendered by the daemon |

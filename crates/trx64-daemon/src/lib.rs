@@ -42,8 +42,8 @@ pub fn resid_construct_count() -> u64 {
     trx64_core::resid_ffi::resid_construct_count()
 }
 
-// `main.rs`'s submodules (streaming.rs, project_knowledge.rs) reference a handful of
-// items by the CRATE-ROOT path (`crate::stream_*`, `crate::now_iso8601_utc`). In the
+// `main.rs`'s submodules (streaming.rs) reference a handful of
+// items by the CRATE-ROOT path (`crate::stream_*`). In the
 // `[[bin]]` those live at the crate root (main.rs IS the root); in this `[lib]` they
 // live inside the `daemon` module. Re-export them at the lib root so `crate::X`
 // resolves identically in both compilation contexts. Crate-internal only — NOT part
@@ -55,7 +55,7 @@ pub fn resid_construct_count() -> u64 {
 pub use daemon::transport;
 
 pub(crate) use daemon::{
-    maybe_autopause_capped_run, now_iso8601_utc, set_control_owner, stream_debug_gated_advance,
+    maybe_autopause_capped_run, set_control_owner, stream_debug_gated_advance,
     stream_maybe_autocapture, stream_maybe_autopersist_cart, stream_maybe_autopersist_disk,
     stream_maybe_feed_recorder,
     // Spec 808 — the rewind transport's per-frame tick, called by the stream loop.
