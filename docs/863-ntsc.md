@@ -324,8 +324,11 @@ switch makes the session PAL again) and re-sizes the checkpoint ring for the fra
 manifest's `machine.model` is the row name on the `c64` profile (`c64-pal` reads as it always
 did) and profile-prefixed otherwise (`u64-ntsc`); the drive snapshot writes VICE's
 `MachineVideoStandard` for NTSC/PAL-N and keeps the facade's 0 for PAL. `session/create {model}`
-STARTS the session as that model (a power-on on the row when it differs); `session/model` is the
-switch. The A/V hello is a JSON notification `av/hello`, sent on subscribe and on every model
+on another model **switches** the shared machine at the frame boundary exactly as `session/model`
+does — the owner: "Switch von PAL → NTSC oder umgekehrt immer nur bei neuem Frame" — and replies
+with `modelSwitch` (from, switchedAt, kept); a model never changes by a power cycle. A clean start
+on the new model is the power button after the switch; a machine that is off becomes the model at
+its next power-on. The A/V hello is a JSON notification `av/hello`, sent on subscribe and on every model
 change. The input journal records the model it was armed on; a scenario naming another model is
 refused, naming both.
 
