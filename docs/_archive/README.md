@@ -296,3 +296,26 @@ the real machine shows bars with colour RAM intact, and whether they are stable 
 the model. There is no C128 to measure on, so that half is closed **deliberately unbuilt** and
 the gate asserting an IDENTICAL picture marks the hole. Closed 2026-09-19. Spec:
 [815-turbo-speed-registers.md](815-turbo-speed-registers.md).
+
+## The local quality gate — 783
+
+The gates existed (the seven-game gate, `iso_vic_gate`, `vic_collision_gate`, `cart_mapper_gate`,
+the conformance oracle, the screenshot oracles) and nothing ran them.
+
+**Decision:** no CI; the gate runs locally. `core.hooksPath=hooks` points git at `hooks/pre-push`,
+which calls `scripts/gate.sh` and blocks the push on red; 783.2 decides which pushes need the
+full gate. The hook is the only thing that runs the tests. Built 2026-08-14. Spec:
+[783-local-quality-gate-enforcement.md](783-local-quality-gate-enforcement.md).
+
+## The binary checkpoint ring — 807
+
+The per-frame capture encoded two VIC framebuffers it then threw away, and a ring entry held a
+live `serde_json::Value`.
+
+**Decision:** move the file format off the per-frame path — JSON + base64 is how a checkpoint is
+persisted and transmitted, not how it is held. Capture 167 → 64 µs, ring entry 208.9 → 97.7 KiB,
+and a `cadence` verb sets capture rate and ring cap together. The spec's premise did not survive
+its baseline: JSON was never the CPU barrier, it was an 11× memory tax. The `.c64re` format and
+every WS response stayed byte-identical. One measured follow-up is left in §8 (a base64 round
+trip between capture and ring, ~50 µs, not blocking). Merged to main. Spec:
+[807-binary-checkpoint-ring.md](807-binary-checkpoint-ring.md).

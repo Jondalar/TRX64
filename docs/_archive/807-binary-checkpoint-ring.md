@@ -4,7 +4,7 @@
 ring now reports what it holds. One measured follow-up is named in §8.
 **Repos:** TRX64 only (`trx64-core` capture/ring, `trx64-daemon` stream loop). No C64RE-side
 work — the `.c64re` file format and every WS response stay byte-identical.
-**Number:** 807 (shared board `C64ReverseEngineeringMCP/specs/README.md`).
+**Number:** 807 (shared board `../../../C64ReverseEngineeringMCP/specs/README.md`).
 **Framing:** not "optimise the checkpoint ring" but **move a file format off the per-frame
 path**. JSON + base64 is how a checkpoint is *persisted* and *transmitted*; it became how a
 checkpoint is *held in memory* because the TypeScript original had no third option. Rust
