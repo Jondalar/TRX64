@@ -2,8 +2,9 @@
 
 **Status:** PARTLY BUILT 2026-08-18 — §2 (the registers and their read-back), §4
 (the machine profile, as a parameter AND a monitor verb) are in. §3 — what a set
-speed bit DOES to the picture — is deliberately NOT built and is the one that
-matters; it waits on a hardware answer, see §5.
+speed bit DOES to the picture — is **answered for the `u64` profile** (2026-09-19: nothing;
+the VIC keeps its slots, see §3.1) and stays open **only for the `128` profile** (VIC-IIe
+in 2 MHz mode), where it waits on a hardware answer, see §5.
 **Repos:** TRX64 only. C64RE gains nothing: this is a machine fact.
 **Number:** 815 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`).
 **Depends on:** nothing. Default OFF, so a plain C64 session is bit-identical to
@@ -86,6 +87,30 @@ implementation:
 Building it on a guess would put behaviour in this emulator that exists nowhere
 else, and a later session would "discover" it. That is the same failure as a test
 that freezes a bug as its expected value.
+
+### §3.1 The U64 — answered: turbo does not touch the picture (2026-09-19)
+
+Asked through the UE2 session. The authoritative source is Gideon Zweijtzer in
+[GideonZ/1541ultimate#665](https://github.com/GideonZ/1541ultimate/issues/665) (2026-03-23):
+*"In the U64 design, the VIC will always get priority, regardless of the badline setting. This
+allows the VIC to produce correct graphics while turbo is on, unlike the C128 which cannot
+display VIC graphics in 2 MHz mode."*
+
+- The internal bus has 48 slots per µs on the U64 (64 on the C64U). The VIC owns its slots
+  through a priority encoder — Φ1, plus Φ2 on bad lines and sprite DMA; the turbo CPU gets the
+  rest.
+- BA is never changed by a setting (the VIC may fetch from the cartridge port).
+- "Badline Timing" (`C64_SPEED_PREFER` bit 7, the image of `$D031` bit 7) only decides whether
+  the CPU halts while BA is low: on, C64 timing; off, the CPU keeps running on internal
+  addresses. External-bus accesses (real SIDs, the cartridge) still go at 1 MHz and only while BA
+  is high — the stall on bad lines that was #665's bug, fixed in the FPGA by 2026-05-05.
+- The VIC and the arbiter are in the closed FPGA; the open firmware only sets the registers
+  (`software/u64/u64_config.cc:387-393`, `:1605-1637`).
+
+So on the `u64` profile the right model is **no effect on the picture**, which is what TRX64
+does. UE2 has run UltimateDemo2026 and an 8-SID demo at 64 MHz on TRX64 without bars. The
+reported symptom — bars where text or bitmap should be, colour RAM right — is the C128's
+2 MHz behaviour, and it is the `128` profile that §3 is still about.
 
 ## §4 The profile is a parameter and a monitor verb
 
