@@ -281,3 +281,18 @@ a stock 1 MHz machine (4 of 4 pairs), and with the check switched off **6 % belo
 3). The preparation is not free, so the kill switch is a fallback for behaviour, not a way back
 to the old speed — UE2 had seen the same in their measurement and could not separate it from
 noise.
+
+## Turbo/speed registers — 815
+
+A C64 release PROBES for a turbo machine — `$D031`, then the `$D02F`/`$D030` pair — and on a
+plain C64 every one of those reads `$FF`, so its whole turbo half is unreachable.
+
+**Decision:** the registers with VICE's read-back masks, and a machine profile (`c64` default,
+`128`, `u64`) as both a parameter and a monitor verb; the claim belongs to the session and
+survives reset and power-cycle, because a cartridge probes inside the boot warm-up. What a set
+speed bit does to the PICTURE split by profile: on `u64` nothing — the VIC keeps its bus slots
+(Gideon Zweijtzer, 1541ultimate#665, via UE2 2026-09-19), which is what TRX64 does; on `128`
+the real machine shows bars with colour RAM intact, and whether they are stable or move decides
+the model. There is no C128 to measure on, so that half is closed **deliberately unbuilt** and
+the gate asserting an IDENTICAL picture marks the hole. Closed 2026-09-19. Spec:
+[815-turbo-speed-registers.md](815-turbo-speed-registers.md).

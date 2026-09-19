@@ -3,7 +3,7 @@
 **Status:** BUILT — CLOSED 2026-09-19. TRX64's half in 0.7.x (§8), UE2's half in UE2 0.3.0 (§9).
 **Repos:** TRX64 (`trx64-core`) builds the core half. UE2 (`u64-emulator/crates/c64-bridge`)
 builds its own: the UltiSID register face, the address decode it already owns, and its mixer.
-**Number:** 855 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`).
+**Number:** 855 (registry: `../../../C64ReverseEngineeringMCP/specs/README.md`).
 **Depends on:** nothing structural. Additive to Spec 703's two-tier SID — the register/readback
 engine on the CPU tick, reSID in an audio tier the 6502 cannot observe.
 **Origin:** the owner's question, 2026-09-17, followed by an API negotiated with the UE2 session

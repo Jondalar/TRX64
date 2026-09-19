@@ -1,12 +1,11 @@
 # Spec 815 — Turbo/speed registers: the machines a C64 release detects
 
-**Status:** PARTLY BUILT 2026-08-18 — §2 (the registers and their read-back), §4
-(the machine profile, as a parameter AND a monitor verb) are in. §3 — what a set
-speed bit DOES to the picture — is **answered for the `u64` profile** (2026-09-19: nothing;
-the VIC keeps its slots, see §3.1) and stays open **only for the `128` profile** (VIC-IIe
-in 2 MHz mode), where it waits on a hardware answer, see §5.
+**Status:** BUILT — CLOSED 2026-09-19. §2 (the registers and their read-back) and §4 (the
+machine profile, as a parameter AND a monitor verb) are in. §3 — what a set speed bit DOES to
+the picture — is answered for the `u64` profile (nothing; the VIC keeps its slots, §3.1) and
+closed **deliberately unbuilt** for the `128` profile (§3.2): there is no C128 to measure on.
 **Repos:** TRX64 only. C64RE gains nothing: this is a machine fact.
-**Number:** 815 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`).
+**Number:** 815 (registry: `../../../C64ReverseEngineeringMCP/specs/README.md`).
 **Depends on:** nothing. Default OFF, so a plain C64 session is bit-identical to
 before.
 **Origin:** a peer RE session, 2026-08-18: an EasyFlash release offers a turbo mode
@@ -57,7 +56,7 @@ published detection distinguishes on, and nothing more is claimed.
 On the default profile all of `$D02F`-`$D03F` stay open bus (`$FF`), which is what
 a C64 does and what every existing gate expects.
 
-## §3 What a set speed bit DOES — NOT BUILT, and that is deliberate
+## §3 What a set speed bit DOES — unbuilt for `128`, and that is deliberate
 
 VICE models the CPU half of 2 MHz mode: `vicii-clock-stretch.c` (203 lines,
 half-cycle accounting) and two conditions in `vicii-fetch.c:159,473` that skip the
@@ -110,7 +109,16 @@ display VIC graphics in 2 MHz mode."*
 So on the `u64` profile the right model is **no effect on the picture**, which is what TRX64
 does. UE2 has run UltimateDemo2026 and an 8-SID demo at 64 MHz on TRX64 without bars. The
 reported symptom — bars where text or bitmap should be, colour RAM right — is the C128's
-2 MHz behaviour, and it is the `128` profile that §3 is still about.
+2 MHz behaviour, and it is the `128` profile that §3 is about — closed unbuilt, §3.2.
+
+### §3.2 The 128 — closed unbuilt (2026-09-19)
+
+The one fact the model needs — are the bars stable frame to frame, or do they move — can only
+come from a real C128 in 2 MHz mode, and there is none to measure on. The owner closed the
+spec on that: the `128` profile stores its speed bit, reports it, and leaves the picture
+alone. That is wrong for a real C128 and it stays wrong on purpose; the gate that asserts the
+picture is IDENTICAL with the bit set is the marker, so a later session finds the hole
+described instead of discovering it. Reopen only with a hardware observation in hand.
 
 ## §4 The profile is a parameter and a monitor verb
 
@@ -140,6 +148,7 @@ Bare `turbo` reports rather than toggling: "which machine does this session clai
 to be" is the question worth being able to ask, and a verb that silently flips
 state when you meant to look is a verb that gets used wrong once and distrusted
 after.
+
 
 ## §5 Gates
 
