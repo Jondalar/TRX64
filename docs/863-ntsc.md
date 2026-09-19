@@ -1,6 +1,6 @@
 # Spec 863 — NTSC: a second video standard, chosen before power-on
 
-**Status:** BUILT (TRX64 half, 2026-09-19, branch `spec-863-ntsc`) — `models.toml` with VICE's seven rows (`c64-pal`, `c64-ntsc`, `c64-paln` run), the three cycle tables ported 1:1, `Machine::timing()` as the one source, NTSC's wrapped window, the frame-boundary switch, the model in every snapshot; every §6 item has a test (§10). Gate GREEN: 16 core suites / 516 tests, daemon suite 416 tests, 7-game 7/7 with the screenshots byte-identical to the pre-863 build, clippy at the 402-line backlog. **C64RE half BUILT** (C64RE branch `spec-863-ntsc`): a Live-tab model selector from `session/models` (unrunnable rows disabled with the missing block; it asks, then `session/model`; cancel sends nothing); `model` on `runtime_session_start` (replaces `pal`), `runtime_sandbox_run`, `runtime_scene_reel`; `knowledge/project.json → machine.model` (`project_init` default `c64-pal`) passed as `--model` by the one spawn resolver; every frame count reads the machine's timing (`PAL_CYCLES_PER_FRAME` removed); recorded scenarios carry their model and are refused on another one naming both; the VIC view and line strip take their geometry from the recorder header. §7 1–4 tested in `smoke:863` (40/40) and `e2e:863-model` (43/43, CI). Both branches merge together — the C64RE side refuses to guess PAL against a pre-863 runtime.
+**Status:** BUILT (TRX64 half, 2026-09-19, branch `spec-863-ntsc`) — `models.toml` with VICE's seven rows (`c64-pal`, `c64-ntsc`, `c64-paln` run), the three cycle tables ported 1:1, `Machine::timing()` as the one source, NTSC's wrapped window, the frame-boundary switch, the model in every snapshot; every §6 item has a test (§10). Gate GREEN: 16 core suites / 519 tests, daemon suite 422 tests, 7-game 7/7 with the screenshots byte-identical to the pre-863 build, clippy at the 404-line backlog (nothing on a line this spec's follow-ups touched). Follow-ups closed the same day (§10): the reverse-debug ring holds its seconds on every model, the scenario list names the recorded model, a switch while recording is journaled and replayed at its cycle. **C64RE half BUILT** (C64RE branch `spec-863-ntsc`): a Live-tab model selector from `session/models` (unrunnable rows disabled with the missing block; it asks, then `session/model`; cancel sends nothing); `model` on `runtime_session_start` (replaces `pal`), `runtime_sandbox_run`, `runtime_scene_reel`; `knowledge/project.json → machine.model` (`project_init` default `c64-pal`) passed as `--model` by the one spawn resolver; every frame count reads the machine's timing (`PAL_CYCLES_PER_FRAME` removed); recorded scenarios carry their model and are refused on another one naming both; the VIC view and line strip take their geometry from the recorder header. §7 1–4 tested in `smoke:863` (50/50) and `e2e:863-model` (61/61, CI). Both branches merge together — the C64RE side refuses to guess PAL against a pre-863 runtime.
 **Repos:** TRX64 (the machine) + C64RE (the switch, and every place that counts in frames).
 **Number:** 863 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`).
 **Depends on:** nothing structural. Follows the path Spec 851 laid for the machine profile.
@@ -335,7 +335,9 @@ refused, naming both.
 **Wire.** Additive: `session/models`, `session/model`, `session/create.model`, the identity
 fields in `session/state` / `monitor/state` / `session/create`, `av/hello`, `frame.model`,
 `firstLine`, `displayWindow` and `geometry.visible.{lastLine,wraps}` in the frame map, `model`
-in the input journal, the sandbox JSON and the `runtime/scenario_list` summaries. One VALUE changed: `pacing.mode` reads `"realtime"`
+in the input journal, the sandbox JSON and the `runtime/scenario_list` summaries; journal entries
+of `kind: "model"`, and `runtime/scenario_run` inputs of `kind: "model"` with `modelSwitches` and
+`model` in its result. One VALUE changed: `pacing.mode` reads `"realtime"`
 where it read `"pal"` (`"pal"` is still accepted on input). No field changed shape; the epoch
 stays `trx64-runtime/2`.
 
@@ -362,6 +364,25 @@ with the RECORDED machine's clock. C64RE's Export tab does (`scenarioDuration`),
 the running machine's clock only for a runtime without the field, and says so on the tab. Tests:
 `scenario_summaries_carry_the_recorded_model` (daemon; an NTSC-recorded scenario listed while the
 machine is PAL), C64RE `e2e:863-model` and `smoke:863`.
+
+**A switch while recording is in the recording.** The input journal records a model switch as
+an entry `kind: "model"` at the cycle it happened on — after the advance, so a frame boundary by
+construction — with `detail.name` / `detail.from`, who asked and through which door
+(`session/model`, `session/create`, the monitor's `model`; on a machine that is off,
+`atPowerOn`). The transplant is one function on the session, `switch_at_frame_boundary`, which
+the live switch and the replay share: `runtime/scenario_run` takes an input `kind: "model"`
+(payload: the row) and performs it at its cycle — the scenario player's `Model` step; durations
+after it count the new model's frames — and reports `modelSwitches` and the model it ended on. A
+scenario still starts on the model it names and is refused on another, naming both. C64RE writes
+the step `the machine switches to <row>` where the journal has the switch (the wait before it
+rounded down, so it ends inside the frame the switch closes; a press held across it split
+there), runs it through `session/model` in the reel and sandbox runners, and counts the frames
+after it in the new model's frames; REC no longer warns about a switch. Tests:
+`a_switch_while_recording_is_journaled_and_replays_at_the_same_cycle` (a live run from a restore,
+switched mid-frame, a press after it; the journal turned into a scenario replays the switch at
+the same cycle and ends on the same cycle, RAM hash and raster position),
+`a_switch_of_a_machine_that_is_off_is_journaled`, `a_model_step_switches_and_later_frames_are_the_new_models`
+(`scenario_player.rs`); C64RE `e2e:863-model`, `smoke:863`, `smoke:814`.
 
 **Acceptance, item by item (§6):**
 

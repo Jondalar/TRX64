@@ -6071,19 +6071,23 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
         // <row>` switches the running machine at the next frame boundary (not a power cycle).
         "model" | "models" => match toks.get(1) {
             None => Ok(model_report(st)),
-            Some(name) => switch_session_model(st, name).map(|v| {
-                format!(
-                    "model: {} → {} at line {} cycle {} (c64Cycles {}) — the running program keeps its \
-                     state and the standard it detected at boot; `reset` or `power off`/`on` for a \
-                     clean start as {}",
-                    v["from"].as_str().unwrap_or("?"),
-                    v["model"].as_str().unwrap_or("?"),
-                    v["switchedAt"]["rasterLine"],
-                    v["switchedAt"]["rasterCycle"],
-                    v["switchedAt"]["c64Cycles"],
-                    v["model"].as_str().unwrap_or("?"),
-                )
-            }),
+            // `monitor/exec` is an operating method, so the owner is whoever sent it.
+            Some(name) => {
+                let source = if st.control_owner == "llm" { "llm" } else { "human" };
+                switch_session_model(st, name, source, "monitor/exec").map(|v| {
+                    format!(
+                        "model: {} → {} at line {} cycle {} (c64Cycles {}) — the running program keeps its \
+                         state and the standard it detected at boot; `reset` or `power off`/`on` for a \
+                         clean start as {}",
+                        v["from"].as_str().unwrap_or("?"),
+                        v["model"].as_str().unwrap_or("?"),
+                        v["switchedAt"]["rasterLine"],
+                        v["switchedAt"]["rasterCycle"],
+                        v["switchedAt"]["c64Cycles"],
+                        v["model"].as_str().unwrap_or("?"),
+                    )
+                })
+            }
         },
 
         // Spec 815 §4 — which machine this session claims to be, so a release's
@@ -9115,7 +9119,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             // (`pal`, the old boolean, is still accepted and ignored.)
             let mut model_switch = Value::Null;
             if let Some(name) = req.params.get("model").and_then(|v| v.as_str()) {
-                match switch_session_model(&mut st, name) {
+                match switch_session_model(&mut st, name, owner_from_source(&req.params), "session/create") {
                     Ok(v) => model_switch = v,
                     Err(e) => return Response::err(id, -32602, format!("session/create: {e}")),
                 }
@@ -9237,7 +9241,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 return Response::err(id, -32602, "session/model: `name` is required (a models.toml row)");
             };
             let mut st = state.lock().unwrap();
-            match switch_session_model(&mut st, name) {
+            match switch_session_model(&mut st, name, owner_from_source(&req.params), "session/model") {
                 Ok(v) => Response::ok(id, v),
                 Err(e) => Response::err(id, -32602, format!("session/model: {e}")),
             }
@@ -15988,6 +15992,8 @@ fn store_checkpoint_thumb(st: &mut State, id: String, thumb: CheckpointThumb) {
 /// advances the machine `cycleBudget` cycles (composite macros).
 struct MachineScenarioTarget<'a> {
     session: &'a mut Session,
+    /// Spec 863 — every model switch the replay performed: `{ cycle, from, name }`.
+    switches: Vec<Value>,
 }
 
 impl<'a> trx64_core::scenario_player::ScenarioTarget for MachineScenarioTarget<'a> {
@@ -16011,6 +16017,23 @@ impl<'a> trx64_core::scenario_player::ScenarioTarget for MachineScenarioTarget<'
     fn trigger_restore_nmi(&mut self) {}
     fn run_for(&mut self, cycles: u64) {
         run_cycle_budget(self.session, cycles);
+    }
+    /// Spec 863 — the transplant a live `session/model` performs, at the cycle the
+    /// recording performed it (the player fires it there; the machine is at a frame
+    /// boundary by construction, so the advance is zero).
+    fn switch_model(&mut self, name: &str) -> Result<u64, String> {
+        let row = trx64_core::model::resolve(name)?;
+        let from = self.session.machine.model();
+        if !std::ptr::eq(from, row) {
+            let t = switch_at_frame_boundary(self.session, row)?;
+            self.switches.push(json!({
+                "cycle": t["switchedAt"]["c64Cycles"],
+                "rasterLine": t["switchedAt"]["rasterLine"],
+                "from": from.name,
+                "name": row.name,
+            }));
+        }
+        Ok(row.timing.cycles_per_frame)
     }
 }
 
@@ -16038,6 +16061,12 @@ fn scenario_steps_from_inputs(inputs: &[Value]) -> Vec<trx64_core::scenario_play
             },
             "joystick1" => ScenarioStepKind::Joy1 { state: joy(&payload) },
             "joystick2" => ScenarioStepKind::Joy2 { state: joy(&payload) },
+            // Spec 863 — a model switch, as the input journal recorded it: the payload is
+            // the row's name (or `{ name }`, the journal entry's detail).
+            "model" => match payload.as_str().or_else(|| payload.get("name").and_then(|v| v.as_str())) {
+                Some(name) => ScenarioStepKind::Model { name: name.to_string() },
+                None => continue,
+            },
             _ => continue, // unknown input kind → skip (forward-compatible)
         };
         out.push(ScenarioStep {
@@ -16404,11 +16433,15 @@ fn run_scenario(st: &mut State, scenario: &Value) -> Result<Value, String> {
 
     let mut target = MachineScenarioTarget {
         session: &mut st.session,
+        switches: Vec::new(),
     };
     loop {
         let now = target.session.machine.cpu6510.clk;
         // Fire any due inputs as of `now`.
         player.tick(&mut target, now);
+        if let Some(why) = player.failure() {
+            return Err(format!("the replay stopped at cycle {now}: {why}"));
+        }
         if now >= end_clk {
             break;
         }
@@ -16432,6 +16465,11 @@ fn run_scenario(st: &mut State, scenario: &Value) -> Result<Value, String> {
     // Fire any inputs that landed exactly at the end.
     let final_now = target.session.machine.cpu6510.clk;
     player.tick(&mut target, final_now);
+    if let Some(why) = player.failure() {
+        return Err(format!("the replay stopped at cycle {final_now}: {why}"));
+    }
+
+    let switches = std::mem::take(&mut target.switches);
 
     // (4) Hash the end RAM (scenario.ts:165 — sha256(c64Bus.ram)).
     let end_clk_actual = st.session.machine.cpu6510.clk;
@@ -16446,6 +16484,9 @@ fn run_scenario(st: &mut State, scenario: &Value) -> Result<Value, String> {
         "endCycle": end_clk_actual,
         "startPc": start_pc,
         "endPc": end_pc,
+        // Spec 863 — where the replay switched models, and what it ended on.
+        "modelSwitches": switches,
+        "model": st.session.machine.model().name,
     }))
 }
 
@@ -16469,10 +16510,13 @@ pub(crate) struct InputJournalEntry {
     /// The master clock when the daemon applied it. NOT a wall-clock time and NOT a
     /// client timestamp — see the note on `State::input_journal`.
     cycle: u64,
-    /// `key` | `joystick` | `insert`. Three kinds, because these are the three things a
-    /// C64 can RECEIVE. Scrubbing, rewinding and poking memory are things done TO the
-    /// machine by an operator; a scenario that replayed them would not be replaying a
-    /// session (Spec 814 §8).
+    /// `key` | `joystick` | `insert` — the three things a C64 can RECEIVE — and `model`.
+    /// Scrubbing, rewinding and poking memory are things done TO the machine by an
+    /// operator; a scenario that replayed them would not be replaying a session (Spec 814
+    /// §8). A model switch is done to the machine too, but it changes what every later
+    /// cycle and frame of the recording means, so a replay has to perform it: it is
+    /// recorded at the cycle it happened on (a frame boundary), with `detail.name` the row
+    /// and `detail.from` the row before (Spec 863).
     kind: &'static str,
     /// `human` | `llm`. The session is SHARED, so a recording is what happened to this
     /// machine, all of it — and then says where each piece came from. Recording only the
@@ -17545,7 +17589,17 @@ fn start_session_model(st: &mut State, row: &'static trx64_core::model::C64Model
 /// (it continues at line 0 of the new geometry), the TOD's mains tick, the drive's catch-up
 /// ratio, reSID's clock. The running program keeps the standard it detected at boot.
 /// A machine that is switched off just becomes that model at its next power-on.
-pub(crate) fn switch_session_model(st: &mut State, name: &str) -> Result<Value, String> {
+///
+/// `source` and `method` say who asked and through which door, for the input journal: an
+/// armed recording records the switch as an event at the cycle it happened on (a frame
+/// boundary, by construction), so a replay of the recording performs the same transplant
+/// at the same cycle.
+pub(crate) fn switch_session_model(
+    st: &mut State,
+    name: &str,
+    source: &'static str,
+    method: &str,
+) -> Result<Value, String> {
     let row = trx64_core::model::resolve(name)?;
     let from = st.session.machine.model();
     let mut out = json!({ "from": from.name, "switched": false });
@@ -17558,6 +17612,8 @@ pub(crate) fn switch_session_model(st: &mut State, name: &str) -> Result<Value, 
         out["switched"] = json!(true);
         out["atPowerOn"] = json!(true);
         merge_identity(&mut out, row);
+        let at = st.session.machine.clk;
+        note_model_switch(st, at, from, row, source, method, true);
         return Ok(out);
     }
     // A rewound transport holds the machine; switching it is an intervention like any
@@ -17565,13 +17621,52 @@ pub(crate) fn switch_session_model(st: &mut State, name: &str) -> Result<Value, 
     transport_truncate_on_intervention(st);
     let was_running = st.session.running;
     st.session.running = false;
-    advance_to_frame_boundary(&mut st.session)?;
-    let before = st.session.machine.clone();
-    if let Err(e) = st.session.machine.switch_model(row) {
-        st.session.running = was_running;
-        return Err(e);
+    let transplant = switch_at_frame_boundary(&mut st.session, row);
+    st.session.running = was_running;
+    let t = transplant?;
+    out["switched"] = json!(true);
+    out["switchedAt"] = t["switchedAt"].clone();
+    out["kept"] = t["kept"].clone();
+    merge_identity(&mut out, row);
+    st.force_present_frame = true;
+    let at = st.session.machine.clk;
+    note_model_switch(st, at, from, row, source, method, false);
+    Ok(out)
+}
+
+/// Spec 863 — record a model switch in the armed input journal, at the cycle it happened.
+fn note_model_switch(
+    st: &mut State,
+    cycle: u64,
+    from: &'static trx64_core::model::C64Model,
+    to: &'static trx64_core::model::C64Model,
+    source: &'static str,
+    method: &str,
+    at_power_on: bool,
+) {
+    let Some(j) = st.input_journal.as_mut() else { return };
+    if j.entries.len() >= INPUT_JOURNAL_MAX {
+        j.dropped += 1;
+        return;
     }
-    let after = &st.session.machine;
+    let mut detail = json!({ "name": to.name, "from": from.name });
+    if at_power_on {
+        detail["atPowerOn"] = json!(true);
+    }
+    j.entries.push(InputJournalEntry { cycle, kind: "model", source, method: method.to_string(), detail });
+}
+
+/// The transplant itself (Spec 863 D5), on the session alone so a replay performs exactly
+/// the switch a live request does: advance to the frame boundary (raster line 0), carry the
+/// machine onto `row`, and say what was kept. The caller pauses and resumes.
+fn switch_at_frame_boundary(
+    session: &mut Session,
+    row: &'static trx64_core::model::C64Model,
+) -> Result<Value, String> {
+    advance_to_frame_boundary(session)?;
+    let before = session.machine.clone();
+    session.machine.switch_model(row)?;
+    let after = &session.machine;
     let kept = json!({
         "cpu": before.c64_core.reg_pc == after.c64_core.reg_pc
             && before.c64_core.reg_a == after.c64_core.reg_a
@@ -17592,18 +17687,13 @@ pub(crate) fn switch_session_model(st: &mut State, name: &str) -> Result<Value, 
             }),
         "sid": before.sid_regs == after.sid_regs,
     });
-    out["switched"] = json!(true);
-    out["switchedAt"] = json!({
+    let switched_at = json!({
         "c64Cycles": after.clk,
         "rasterLine": after.vic.raster_line,
         "rasterCycle": after.vic.raster_cycle + 1,
     });
-    out["kept"] = kept;
-    merge_identity(&mut out, row);
-    st.session.model = row;
-    st.force_present_frame = true;
-    st.session.running = was_running;
-    Ok(out)
+    session.model = row;
+    Ok(json!({ "switchedAt": switched_at, "kept": kept }))
 }
 
 /// The monitor's `model` answer: this machine, and every row.
@@ -25204,5 +25294,96 @@ mod batch1_tests {
         let mut g = st.lock().unwrap();
         let e = run_scenario(&mut g, &json!({ "model": "c64-ntsc", "cycleBudget": 10, "inputs": [] })).unwrap_err();
         assert!(e.contains("c64-ntsc") && e.contains("c64-pal"), "{e}");
+    }
+
+    /// A switch while recording: the journal records it as an event at the cycle it
+    /// happened on — a frame boundary, by construction — and a replay of the recording
+    /// performs the same transplant at the same cycle, so it ends where the live run ended.
+    #[test]
+    fn a_switch_while_recording_is_journaled_and_replays_at_the_same_cycle() {
+        let Some(st) = booted_state() else { return };
+        let dir = std::env::temp_dir().join(format!("trx64-863-rec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("start.c64re");
+        call(&st, "snapshot/dump", json!({ "path": path.to_string_lossy() }));
+        // The live run starts from the very restore the replay makes.
+        {
+            let mut g = st.lock().unwrap();
+            let read = trx64_core::native_snapshot::read_native_snapshot(&std::fs::read(&path).unwrap()).unwrap();
+            trx64_core::c64re_snapshot::restore_runtime_checkpoint(&mut g.session.machine, &read.checkpoint).unwrap();
+        }
+        let start = st.lock().unwrap().session.machine.cpu6510.clk;
+
+        let armed = call(&st, "session/input_journal", json!({ "arm": true }));
+        assert_eq!(armed["model"], json!("c64-pal"), "the journal says what it was armed on");
+        run_cycle_budget(&mut st.lock().unwrap().session, 50_000); // mid-frame
+        let r = call(&st, "session/model", json!({ "name": "c64-ntsc", "source": "llm" }));
+        let switched_at = r["switchedAt"]["c64Cycles"].as_u64().unwrap();
+        assert_eq!(r["switchedAt"]["rasterLine"], json!(0));
+        run_cycle_budget(&mut st.lock().unwrap().session, 17_095 + 777);
+        call(&st, "session/joystick_set", json!({ "port": 2, "fire": true }));
+        run_cycle_budget(&mut st.lock().unwrap().session, 3 * 17_095);
+        call(&st, "session/joystick_clear", json!({ "port": 2 }));
+        run_cycle_budget(&mut st.lock().unwrap().session, 5_000);
+        let (end, ram, line, cycle) = {
+            let g = st.lock().unwrap();
+            let m = &g.session.machine;
+            (m.cpu6510.clk, sha256_hex(&m.ram[..]), m.vic.raster_line, m.vic.raster_cycle)
+        };
+        let j = call(&st, "session/input_journal", json!({ "arm": false }));
+        let es = j["entries"].as_array().unwrap().clone();
+
+        // The switch is IN the recording, at its cycle, said by whom and through which door.
+        let sw: Vec<&Value> = es.iter().filter(|e| e["kind"] == json!("model")).collect();
+        assert_eq!(sw.len(), 1, "{es:?}");
+        assert_eq!(sw[0]["cycle"].as_u64(), Some(switched_at), "journaled at the cycle it happened on");
+        assert_eq!((sw[0]["detail"]["name"].clone(), sw[0]["detail"]["from"].clone()), (json!("c64-ntsc"), json!("c64-pal")));
+        assert_eq!((sw[0]["source"].clone(), sw[0]["method"].clone()), (json!("llm"), json!("session/model")));
+        assert!(switched_at > start + 50_000 && switched_at - (start + 50_000) < 19_656 + 16, "the next frame boundary");
+
+        // The recording, as a scenario: the model it started on, the inputs at their cycles.
+        let inputs: Vec<Value> = es
+            .iter()
+            .map(|e| match e["kind"].as_str().unwrap() {
+                "model" => json!({ "atCycle": e["cycle"], "kind": "model", "payload": e["detail"]["name"] }),
+                "joystick" if e["method"] == json!("session/joystick_clear") => json!({ "atCycle": e["cycle"], "kind": "joystick2", "payload": {} }),
+                "joystick" => json!({ "atCycle": e["cycle"], "kind": "joystick2", "payload": e["detail"] }),
+                k => panic!("unexpected {k}"),
+            })
+            .collect();
+        let scenario = json!({
+            "id": "rec-switch", "model": j["model"], "startSnapshot": path.to_string_lossy(),
+            "cycleBudget": end - start, "inputs": inputs,
+        });
+        // A recording is replayed on the model it STARTED on.
+        let e = call_err(&st, "runtime/scenario_run", json!({ "scenario": scenario }));
+        assert!(e.message.contains("recorded on c64-pal") && e.message.contains("c64-ntsc"), "{}", e.message);
+        call(&st, "session/model", json!({ "name": "c64-pal" }));
+
+        let rep = call(&st, "runtime/scenario_run", json!({ "scenario": scenario }));
+        assert_eq!(rep["modelSwitches"][0]["cycle"].as_u64(), Some(switched_at), "the same transplant at the same cycle: {rep}");
+        assert_eq!(rep["modelSwitches"][0]["rasterLine"], json!(0));
+        assert_eq!(rep["model"], json!("c64-ntsc"));
+        assert_eq!(rep["endCycle"].as_u64(), Some(end));
+        assert_eq!(rep["ramHash"].as_str(), Some(ram.as_str()), "the replay ends where the live run ended");
+        let g = st.lock().unwrap();
+        assert_eq!((g.session.machine.vic.raster_line, g.session.machine.vic.raster_cycle), (line, cycle));
+        assert_eq!(g.session.machine.vic.cycles_per_line(), 65);
+        drop(g);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A switch of a machine that is off is journaled too — it decides which machine the
+    /// recording's later cycles belong to.
+    #[test]
+    fn a_switch_of_a_machine_that_is_off_is_journaled() {
+        let st = make_state();
+        call(&st, "session/input_journal", json!({ "arm": true }));
+        call(&st, "monitor/exec", json!({ "command": "model c64-ntsc" }));
+        let j = call(&st, "session/input_journal", json!({ "arm": false }));
+        let e = &j["entries"][0];
+        assert_eq!((e["kind"].clone(), e["detail"]["name"].clone()), (json!("model"), json!("c64-ntsc")));
+        assert_eq!(e["method"], json!("monitor/exec"));
+        assert_eq!(e["detail"]["atPowerOn"], json!(true), "it becomes that model at its next power-on");
     }
 }
