@@ -35,6 +35,17 @@ The C64RE TS runtime also served as the golden oracle for TRX64's behavioral
 parity (the differential conformance gate). Thanks to the C64RE project for the
 contract, the test corpus, and the shared vision.
 
+## vicspector, Linus Åkesson, Christian Bauer — the VIC-II, cycle by cycle
+
+The per-cycle record behind `vic/line_trace` and `vic/frame_map` (Specs 859/860) is drawn in
+C64RE in the layout of [vicspector](https://github.com/elysium64/vicspector) by elysium64 (MIT),
+an interactive map of one VIC-II raster line. The raster techniques the frame map names — FLI,
+FLD, linecrunch, DMA delay (VSP), open borders, sprite crunch and stretch — are rules over what
+the chip did, named after the literature vicspector builds on: Linus Åkesson's
+[VIC-II timing chart](https://www.linusakesson.net/programming/vic-timing/) and
+[MISC notes](https://www.linusakesson.net/scene/lunatico/misc.php), and Christian Bauer's
+[VIC-II article](https://ist.uwaterloo.ca/~schepers/MJK/ascii/VIC-Article.txt). Thank you.
+
 ## The C64 scene & primary sources
 
 Thanks to the Commodore 64 community — crackers, demosceners, and documenters —
