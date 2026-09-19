@@ -2226,7 +2226,7 @@ impl Machine {
     pub fn set_reverse_depth(&mut self, seconds: usize) -> ReverseDepthInfo {
         let secs = seconds.max(1);
         let (entry_cap, writes_cap) = crate::delta_ring::DeltaRing::caps_for_seconds(secs);
-        let cpu_cap = secs * crate::delta_ring::INSTR_PER_SECOND;
+        let cpu_cap = secs * crate::delta_ring::ring_instr_per_second();
         self.delta_ring.resize(entry_cap, writes_cap);
         self.cpu_history.resize(cpu_cap);
         // RAM bytes: delta entries (24 B) + delta writes (4 B) + cpu-history (24 B).
@@ -2250,7 +2250,7 @@ impl Machine {
         let entry_cap = self.delta_ring.entry_capacity();
         let writes_cap = self.delta_ring.writes_capacity();
         let cpu_cap = self.cpu_history.capacity();
-        let seconds = (entry_cap / crate::delta_ring::INSTR_PER_SECOND).max(1);
+        let seconds = (entry_cap / crate::delta_ring::ring_instr_per_second()).max(1);
         let ram_bytes =
             entry_cap * std::mem::size_of::<crate::delta_ring::DeltaEntry>()
                 + writes_cap * std::mem::size_of::<crate::delta_ring::WriteRec>()

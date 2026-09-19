@@ -375,6 +375,55 @@ fn paln_is_a_row_and_c64c_is_refused_by_name() {
     }
 }
 
+// ── the reverse-debug ring ────────────────────────────────────────────────────────────
+
+/// The always-on reverse-debug ring holds its nominal seconds on every model, and a switch
+/// leaves it alone. It is sized at the fastest runnable clock, so the 10 s default is 10 s
+/// on NTSC and PAL-N (PAL's own rate held them ~9.6 s) and no resize — which would drop the
+/// history — is needed when the model changes.
+#[test]
+fn the_reverse_ring_holds_its_seconds_on_every_model_and_a_switch_keeps_it() {
+    use trx64_core::delta_ring::{instr_per_second_at, DEFAULT_REVERSE_SECONDS};
+    for name in ["c64-pal", "c64-ntsc", "c64-paln"] {
+        let row = model::resolve(name).unwrap();
+        let m = Machine::new_with_model(row);
+        let info = m.reverse_depth_info();
+        let held = info.delta_entry_capacity as f64 / instr_per_second_at(row.timing.cpu_hz) as f64;
+        assert!(held >= DEFAULT_REVERSE_SECONDS as f64, "{name} holds {held:.3} s");
+        assert_eq!(info.seconds, DEFAULT_REVERSE_SECONDS, "{name} reports the seconds it was given");
+    }
+    // The knob holds what it is set to, on whichever model it is set.
+    let mut m = Machine::new_with_model(model::resolve("c64-ntsc").unwrap());
+    let info = m.set_reverse_depth(30);
+    assert!(info.delta_entry_capacity as f64 / instr_per_second_at(1_022_730) as f64 >= 30.0);
+    assert_eq!(m.reverse_depth_info().seconds, 30);
+
+    if !roms() {
+        return;
+    }
+    // A PAL machine with history, switched to NTSC at the frame boundary: same ring, same
+    // entries, nothing dropped.
+    let mut m = booted("c64-pal");
+    let mut prev = m.vic.raster_line;
+    loop {
+        m.run_for_full(1, &mut NullSink, |_, _, _, _, _, _, _| {});
+        let line = m.vic.raster_line;
+        if line == 0 && prev != 0 {
+            break;
+        }
+        prev = line;
+    }
+    let (cap, len, newest) = (m.delta_ring.entry_capacity(), m.delta_ring.len(), m.delta_ring.newest());
+    assert!(len > 0, "the booted machine has reverse history");
+    m.switch_model(model::resolve("c64-ntsc").unwrap()).expect("switch at the frame boundary");
+    assert_eq!(m.model().name, "c64-ntsc");
+    assert_eq!(
+        (m.delta_ring.entry_capacity(), m.delta_ring.len(), m.delta_ring.newest()),
+        (cap, len, newest),
+        "the switch keeps the ring — its capacity and its history"
+    );
+}
+
 // ── §6.9 — the picture ────────────────────────────────────────────────────────────────
 
 /// Acceptance 9 — the NTSC canvas is 384 × 247, and its bottom rows are raster lines 0-11

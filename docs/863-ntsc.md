@@ -341,8 +341,19 @@ stays `trx64-runtime/2`.
 
 **Left out, on purpose:** the C64RE half (§4, §7) — built in C64RE against this branch; the
 blocks the refused rows need; the NTSC colour decoder, pixel aspect, datasette/RS-232 rates and
-turbo on NTSC (§5). The reverse-debug ring is still sized by an instructions-per-second estimate
-(`delta_ring::INSTR_PER_SECOND`), so on NTSC its nominal 10 s hold ~9.6 s.
+turbo on NTSC (§5).
+
+**The reverse-debug ring holds its seconds on every model.** It is sized by an
+instructions-per-second estimate; the estimate is PAL's 300 000/s scaled to the fastest clock a
+runnable row has (PAL-N, 1 023 440 Hz → 311 630/s — `delta_ring::ring_instr_per_second`), so the
+10 s default is ≥ 10 s on NTSC and PAL-N (PAL's own figure held them ~9.6 s). One size for every
+model rather than a resize on a switch: `DeltaRing::resize` drops the history by contract, so a
+ring that followed the model would lose the whole reverse window at every switch and every rewind
+across one, and nothing in an entry is tied to the model. PAL pays 3.9 % — 3 000 000 → 3 116 300
+entries at 10 s, +4.1 MiB. Tests: `the_ring_holds_its_seconds_on_every_model` (`delta_ring.rs`),
+`the_reverse_ring_holds_its_seconds_on_every_model_and_a_switch_keeps_it` (`ntsc_gate.rs`: the
+knob reports the seconds it was given on each row, a PAL machine with history switched to NTSC
+keeps capacity and entries).
 
 **Acceptance, item by item (§6):**
 
