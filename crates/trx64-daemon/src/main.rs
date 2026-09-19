@@ -1015,7 +1015,7 @@ struct BatchEntry {
 /// The wire-protocol version this daemon speaks (Spec 800 §D). Bump the integer ONLY on a
 /// wire-breaking change, in lockstep with C64RE's EXPECTED_RUNTIME_PROTOCOL — the client
 /// requires an EXACT match and hard-fails otherwise. Returned by `ping` for the handshake.
-const RUNTIME_VERSION: &str = "trx64-runtime/1";
+const RUNTIME_VERSION: &str = "trx64-runtime/2";
 
 const MAX_MEDIA_EVENTS: usize = 256;
 

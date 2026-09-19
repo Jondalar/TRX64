@@ -82,7 +82,7 @@ pub fn run_convert(
         checkpoint,
         schema_version: RUNTIME_CHECKPOINT_SCHEMA_VERSION,
         media: Vec::new(),
-        runtime_version: "trx64-runtime/1".to_string(),
+        runtime_version: "trx64-runtime/2".to_string(),
         machine_model: "c64-pal".to_string(),
         provenance: None,
         pc,
