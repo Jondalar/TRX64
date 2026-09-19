@@ -375,8 +375,8 @@ the live switch and the replay share: `runtime/scenario_run` takes an input `kin
 after it count the new model's frames — and reports `modelSwitches` and the model it ended on. A
 scenario still starts on the model it names and is refused on another, naming both. C64RE writes
 the step `the machine switches to <row>` where the journal has the switch (the wait before it
-rounded down, so it ends inside the frame the switch closes; a press held across it split
-there), runs it through `session/model` in the reel and sandbox runners, and counts the frames
+rounded down, so it ends inside the frame the switch closes; a press held across it is
+held through it, written as `I start holding …` / `I release …`), runs it through `session/model` in the reel and sandbox runners, and counts the frames
 after it in the new model's frames; REC no longer warns about a switch. Tests:
 `a_switch_while_recording_is_journaled_and_replays_at_the_same_cycle` (a live run from a restore,
 switched mid-frame, a press after it; the journal turned into a scenario replays the switch at
