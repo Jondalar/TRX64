@@ -1,6 +1,6 @@
 # Spec 863 — NTSC: a second video standard, chosen before power-on
 
-**Status:** PROPOSED (2026-09-19) — Q1 (models are configuration) and Q2 (switch at the frame boundary) settled; Q3 open (§9).
+**Status:** READY (2026-09-19) — all three questions settled (§9): models are configuration, the switch is a transplant at the frame boundary, the palette stays Colodore.
 **Repos:** TRX64 (the machine) + C64RE (the switch, and every place that counts in frames).
 **Number:** 863 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`).
 **Depends on:** nothing structural. Follows the path Spec 851 laid for the machine profile.
@@ -203,8 +203,8 @@ window is drawn as the recorder describes it.
 
 - **PAL stays bit-identical.** No PAL output, timing or snapshot changes; every existing
   gate passes unchanged. This is the first acceptance item, not the last.
-- **Not in v1:** the NTSC colour decoder (VICE's YIQ path and CRT filter) — the palette stays
-  Colodore for both, and §9 Q3 decides whether that holds; pixel aspect; the lightpen beyond
+- **Not in this spec:** the NTSC colour decoder (VICE's YIQ path and CRT filter) — the palette
+  stays Colodore for every model (§9 Q3); pixel aspect; the lightpen beyond
   its retrigger X; datasette and RS-232 rates; turbo profiles on NTSC (851's clock divider
   keeps `clk` as PHI2 — nothing prevents it, nothing tests it); C128.
 
@@ -274,4 +274,6 @@ for R8, 16 768 for R56A); `docs/vice-iec-arc42.md:603-605` quotes sync factors 6
 2. ~~Switching at runtime.~~ **Settled 2026-09-19:** at the frame boundary, as a transplant
    (freeze → capture → rebuild on the new row → restore), not a power cycle (D5); the model is
    part of every snapshot and checkpoint (D6).
-3. **Colour.** Keep Colodore for NTSC in v1, or bring an NTSC palette / VICE's YIQ decoder?
+3. ~~Colour.~~ **Settled 2026-09-19:** the palette stays Colodore for every model ("Lass mal die
+   Palette"). VICE itself gives the 6567R8 the same palette as the 6569 (`vicii-color.c:630-649`);
+   its NTSC difference is the optional YIQ/CRT path, which stays out.
