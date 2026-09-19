@@ -1,6 +1,6 @@
 # Spec 863 — NTSC: a second video standard, chosen before power-on
 
-**Status:** PROPOSED (2026-09-19) — open questions in §9, to be settled one at a time.
+**Status:** PROPOSED (2026-09-19) — Q1 settled (models are configuration); Q2, Q3 open (§9).
 **Repos:** TRX64 (the machine) + C64RE (the switch, and every place that counts in frames).
 **Number:** 863 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`).
 **Depends on:** nothing structural. Follows the path Spec 851 laid for the machine profile.
@@ -57,8 +57,8 @@ sets the PAL/NTSC flag from whatever line count the VIC produces.
 | C64 OLD NTSC | 6567R56A | 64 × 262 | 16 768 | 1 022 730 | 60.993 | 60 Hz | `cycle_tab_ntsc_old` |
 | C64 PAL-N (Drean) | 6572 | 65 × 312 | 20 280 | 1 023 440 | 50.466 | 50 Hz | `cycle_tab_ntsc` |
 
-v1 builds **C64 NTSC (6567R8)**; §9 Q1 decides whether R56A and PAL-N come along — the model
-record in §3 makes each of them a row, not a rewrite.
+All of these are rows of one model file (§3 D1); which of them run is decided by the building
+blocks that exist, not by this spec.
 
 What the 65-cycle line changes (VICE `cycle_tab_ntsc`, `vicii-chip-model.c:272-403`):
 cycles 11–57 are identical to PAL (refresh 11–15, BA 12–54, c-access Φ2 15–54, g-access Φ1
@@ -71,12 +71,35 @@ and the compare stays edge-triggered.
 
 ## §3 TRX64 — one timing record, one source
 
-**D1 — a video model record.** `VideoModel { chip, cycles_per_line, lines, cycle_table,
-cpu_hz, tod_hz, color_latency, lightpen_retrigger_x, display_window }`, one constant per
-row of §2, the cycle tables ported **1:1 from VICE** with their xpos column. The table stops
-being part of the type: `cycle_table` becomes a slice/array of 65 with `cycles_per_line`
-deciding how much of it runs. Derived and never stored twice: `cycles_per_frame`,
-`frame_rate`, `frame_period`, `drive_sync_factor = floor(65536e6 / cpu_hz)` (66517 / 64079).
+**D1 — a C64 model is configuration, not code.** The owner, on which NTSC machines: "wenn
+wir das gleich in eine Property auslagern können — dann ist doch jeder weitere C64-Subtyp nur
+Config." So the model is a **data file**, `crates/trx64-core/models.toml` (embedded at build,
+parsed at startup), one row per model, mirroring VICE's model table (`c64scmodel.c:105-191`):
+name and aliases, VIC chip, cycle-table family, raster lines, CPU Hz, TOD mains Hz,
+`color_latency`, lightpen retrigger X, display window, CIA model, SID model, glue logic, KERNAL /
+BASIC / chargen file names. Derived, never written in a row: `cycles_per_line` (from the
+family), `cycles_per_frame`, frame rate, `drive_sync_factor = floor(65536e6 / cpu_hz)`
+(66517 / 64079).
+
+Code holds only the **building blocks** a row can name: the cycle-table families, ported 1:1
+from VICE with their xpos column (`pal` today; `ntsc` and `ntsc_old` with this spec), the
+6569/8565 `color_latency` path, reSID's 6581/8580. A row that names a block TRX64 does not have
+is **refused at startup with the block's name** — never silently mapped to something close.
+Today that refuses the 6526A CIA, the custom-IC glue logic and KERNAL rev1/rev2 (not in the ROM
+set), so of VICE's rows these run once 863 is built:
+
+| row | chip / family | CIA / SID | runs after 863 |
+|---|---|---|---|
+| `c64-pal` (default) | 6569 / pal | 6526 / 6581 | yes — today's machine |
+| `c64-ntsc` | 6567R8 / ntsc | 6526 / 6581 | **yes — the point of this spec** |
+| `c64-paln` (Drean) | 6572 / ntsc, 312 lines | 6526 / 6581 | yes |
+| `c64c-pal`, `c64c-ntsc` | 8565, 8562 | **6526A** / 8580 | no — needs the 6526A and custom glue |
+| `c64-old-pal` | 6569R1 / pal | 6526 / 6581 | no — needs KERNAL rev2 (and 6569R1's lightpen/lumas) |
+| `c64-old-ntsc` | 6567R56A / ntsc_old | 6526 / 6581 | no — needs KERNAL rev1 |
+
+Each "no" becomes a yes by building its block — never by editing the engine for that model.
+The cycle tables become data the VIC indexes (65 entries, `cycles_per_line` deciding how many
+run), no longer part of the type.
 
 **D2 — the machine carries it and everyone reads it.** `Machine::timing()` is the one
 answer to "how long is a frame, how fast is the clock". Every copy in §1's table goes:
@@ -102,12 +125,14 @@ vic_line_trace) and the thumbnail path read it. The canvas size follows VICE's N
 the web player and the CLI blit already honour it). `SPRITE_DBUF_X0` and `DISPLAY_X0` are
 re-derived for the NTSC xpos, not assumed.
 
-**D5 — choosing the standard.** Orthogonal to the machine profile (a U64 can be NTSC):
-- daemon `--video pal|ntsc` (default `pal`), applied **before** any cycle runs — the same
-  place `--machine` is applied, before the warm-up in `do_power_on`;
-- `trx64cli --video`, sandbox batch items, `session/create` (whose `pal` flag is accepted
-  and ignored today) — all the same field;
-- a runtime switch, `session/video {standard}` and a monitor verb `video pal|ntsc`, which is
+**D5 — choosing the model.** Orthogonal to the machine profile (a U64 can be NTSC):
+- daemon `--model <row>` (default `c64-pal`; `--video pal|ntsc` as shorthand for the two
+  base rows), applied **before** any cycle runs — the same place `--machine` is applied,
+  before the warm-up in `do_power_on`;
+- `trx64cli --model`, sandbox batch items, `session/create` (whose `pal` flag is accepted
+  and ignored today) — all the same field; `session/models` lists the rows and which of
+  them run;
+- a runtime switch, `session/model {name}` and a monitor verb `model <row>`, which is
   **a power cycle**: VICE does exactly this (`machine_change_timing` ends in
   `MACHINE_RESET_MODE_POWER_CYCLE`), RAM is not kept, the drives reset;
 - the standard is session identity like 815's claim: it survives a warm reset (which
@@ -122,7 +147,7 @@ conversion, as VICE refuses (`SNAPSHOT_VICII_MODEL_MISMATCH`). The latent panic 
 restored `raster_cycle ≥ cycles_per_line` is rejected before it can index the table.
 
 **D7 — the state says what the machine is.** `session/state`, `monitor/state` and the A/V
-hello carry `videoStandard`, `chip`, `cyclesPerLine`, `linesPerFrame`, `cyclesPerFrame`,
+hello carry `model`, `videoStandard`, `chip`, `cyclesPerLine`, `linesPerFrame`, `cyclesPerFrame`,
 `cpuHz`, `frameRate`. The line recorder's header already has fields for chip,
 cyclesPerLine, linesPerFrame and fbOrigin — they stop being constants.
 
@@ -135,15 +160,16 @@ the timing record; the trick rules read cycle positions from the cycle table's f
 ## §4 C64RE — the switch, and every place that counts in frames
 
 **C1 — the switch.**
-- The Live tab's machine controls get a **PAL / NTSC** control beside the power button. It
-  says what it does ("switching is a power cycle — the machine restarts") and asks before it
-  does it. It calls `session/video`; it never talks to the runtime about anything else.
-- MCP: `runtime_session_start` gets `video: "pal" | "ntsc"` (replacing the `pal` boolean
-  that today says "NTSC is not supported"); `runtime_sandbox_run` the same per run; the
-  monitor verb is reachable through `runtime_monitor` as for every verb (TRX64 owns it).
-- **A project remembers its standard.** `knowledge/project.json` → `machine.videoStandard`,
-  set by `project_init` (default PAL) or later; the workspace launcher starts the daemon with
-  `--video` from it, so an NTSC release boots as NTSC without anyone remembering to switch.
+- The Live tab's machine controls get a **model** selector beside the power button, filled
+  from `session/models` (rows that cannot run are shown, disabled, with the missing block).
+  It says what it does ("switching is a power cycle — the machine restarts") and asks before
+  it does it. It calls `session/model`; it keeps no list of models of its own.
+- MCP: `runtime_session_start` gets `model` (replacing the `pal` boolean that today says
+  "NTSC is not supported"); `runtime_sandbox_run` the same per run; the monitor verb is
+  reachable through `runtime_monitor` as for every verb (TRX64 owns it).
+- **A project remembers its model.** `knowledge/project.json` → `machine.model`, set by
+  `project_init` (default `c64-pal`) or later; the workspace launcher starts the daemon with
+  `--model` from it, so an NTSC release boots as NTSC without anyone remembering to switch.
 
 **C2 — nothing in C64RE assumes 19656.** Every frame count reads the runtime's timing
 (D7): `PAL_CYCLES_PER_FRAME` in `scenario-gherkin.ts` and its users (`reel/run-sandbox`,
@@ -182,10 +208,14 @@ window is drawn as the recorder describes it.
    a D64 `LOAD` completes on NTSC (the drive ratio).
 6. **Stolen cycles.** On an NTSC bad line with sprites 0 and 3 on, the line recorder shows
    the BA/stall cycles where VICE's table puts them (sprite 0 from 56, sprite 3 at 1 and 65).
-7. **Identity.** `--video ntsc` survives `reset` and `power off/on`; a PAL snapshot restored
+7. **Identity.** `--model c64-ntsc` survives `reset` and `power off/on`; a PAL snapshot restored
    into an NTSC session is refused with both names and no panic, and vice versa; `c64-ntsc`
    round-trips through dump/undump.
-8. **The picture.** An NTSC frame arrives with the NTSC canvas size in the BIN_VIC header, at
+8. **Models are rows.** `models.toml` parses; `session/models` lists every row with whether
+   it runs; `--model c64c-pal` is refused at startup naming the missing block (6526A), and
+   `--model c64-paln` runs 65 × 312 at 1 023 440 Hz with a 50 Hz TOD — without a line of
+   engine code written for it.
+9. **The picture.** An NTSC frame arrives with the NTSC canvas size in the BIN_VIC header, at
    ~59.83 frames/s in real-time pacing; the bottom rows are raster lines 0–11 of the same
    displayed frame (a raster bar at line 5 shows at the bottom, not the top).
 
@@ -193,8 +223,8 @@ window is drawn as the recorder describes it.
 
 1. The Live-tab control switches the running session after a confirmation, and the machine
    comes back NTSC (`session/state.videoStandard`); cancelling changes nothing.
-2. `runtime_session_start { video: "ntsc" }` starts an NTSC machine; the project's
-   `machine.videoStandard` makes the workspace start NTSC.
+2. `runtime_session_start { model: "c64-ntsc" }` starts an NTSC machine; the project's
+   `machine.model` makes the workspace start NTSC.
 3. A scenario recorded on PAL refuses to replay on NTSC, naming both; `hold_frames: 60` on
    NTSC holds 60 × 17 095 cycles.
 4. The VIC view on an NTSC frame draws 65 cycles × 263 lines, with the wrapped window where
@@ -202,9 +232,9 @@ window is drawn as the recorder describes it.
 
 ## §8 Files (sketch)
 
-TRX64: `vic.rs` (the model record, the tables, the field), `render.rs` / `vic_inspect.rs` /
+TRX64: `models.toml` (the rows) + its loader, `vic.rs` (the table families, the field), `render.rs` / `vic_inspect.rs` /
 `vic_line_trace.rs` (the display window), `cia.rs`, `drive.rs`, `resid_ffi.rs`, `lib.rs`
-(`timing()`, warm reset, the setter), `streaming.rs`, `main.rs` (flags, `session/video`, the
+(`timing()`, warm reset, the setter), `streaming.rs`, `main.rs` (flags, `session/model` + `session/models`, the
 monitor verb, state, snapshot identity, every `CYC_PER_FRAME`), `c64re_snapshot.rs`,
 `native_snapshot.rs`, `vsf*.rs`, `drive_snapshot.rs`, `scenario_player.rs`, the CLI (`--video`,
 pump, window). C64RE: `MachineControls.tsx`, `headless.ts`, `runtime-sandbox.ts`,
@@ -217,8 +247,9 @@ for R8, 16 768 for R56A); `docs/vice-iec-arc42.md:603-605` quotes sync factors 6
 
 ## §9 Open questions — one at a time
 
-1. **Which NTSC machines?** 6567R8 only, or also the old NTSC 6567R56A (64 cycles, rev1
-   KERNAL) and PAL-N 6572 (Drean)? Each is a row in D1 plus its gates.
+1. ~~Which NTSC machines?~~ **Settled 2026-09-19:** every C64 model is a row of one model
+   file (D1); a row runs when the blocks it names exist. After 863: `c64-pal`, `c64-ntsc`,
+   `c64-paln`.
 2. **Switching at runtime.** A power cycle from the Live tab (VICE's behaviour, RAM lost) —
    or only at start (daemon flag / project default), no runtime switch at all?
 3. **Colour.** Keep Colodore for NTSC in v1, or bring an NTSC palette / VICE's YIQ decoder?
