@@ -20,7 +20,8 @@ mod daemon;
 
 // The embed surface consumed by `trx64-ffi`.
 pub use daemon::{
-    build_state, create_embedded_state, dispatch, notify_hub, Request, Response, RpcError,
+    build_state, create_embedded_state, create_embedded_state_with_model, dispatch, notify_hub,
+    Request, Response, RpcError,
     SharedState, State,
 };
 
@@ -58,6 +59,8 @@ pub(crate) use daemon::{
     maybe_autopause_capped_run, set_control_owner, stream_debug_gated_advance,
     stream_maybe_autocapture, stream_maybe_autopersist_cart, stream_maybe_autopersist_disk,
     stream_maybe_feed_recorder,
+    // Spec 863 — the A/V hello the stream sends a client on subscribe.
+    av_hello,
     // Spec 808 — the rewind transport's per-frame tick, called by the stream loop.
     transport_tick,
 };

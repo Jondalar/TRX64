@@ -44,13 +44,16 @@ pub const COLODORE: [[u8; 3]; 16] = [
 // ── Internal draw-buffer geometry (= VICE viciisc, vicii-draw-cycle.c) ─────────
 /// Internal draw buffer width: 65 cycles × 8 px (= VICII_DRAW_BUFFER_SIZE 520).
 pub const FB_W: usize = 520;
-/// PAL raster lines.
-pub const FB_H: usize = 312;
+/// Framebuffer rows: the tallest frame a model has (PAL's 312 lines). A wrapped NTSC
+/// window uses rows up to its last displayed line (274).
+pub const FB_H: usize = crate::model::MAX_RASTER_LINES;
 
 /// X of display column 0 inside the 520-wide draw buffer (CALIBRATED: the TS
 /// golden puts display col 0 at screenshot-canvas X 32, canvas starts at dbuf
 /// X 104, so dbuf X = 104 + 32 = 136). Equivalently 17 cycles of border precede
-/// the first visible graphics pixel.
+/// the first visible graphics pixel. Spec 863: derived from each family's table in
+/// [`crate::vic::display_dbuf_x0`] — 136 on all three (the display starts at cycle 17
+/// on every family); a test holds this to it.
 pub const DISPLAY_X0: usize = 136;
 /// Y (raster line) of display row 0 = VICII_25ROW_START_LINE 0x33 = 51.
 pub const DISPLAY_Y0: usize = 51;
@@ -74,16 +77,15 @@ pub const DISPLAY_H: usize = 200;
 /// Draw-buffer X of sprite X-coordinate 0 (CALIBRATED vs the TS oracle: a sprite
 /// with X register `sx` lands its leftmost pixel at canvas X `sx + 8`, and canvas
 /// X 0 = dbuf X 104, so dbuf X = sx + 8 + 104 = sx + 112). Equivalently sprite
-/// X 24 ($18) = display col 0 = dbuf X 136 = the left display edge.
+/// X 24 ($18) = display col 0 = dbuf X 136 = the left display edge. Spec 863: derived
+/// per family in [`crate::vic::sprite_dbuf_x`], which also carries NTSC's repeated
+/// xpos ($184 twice → a sprite at X ≥ $188 lands 8 px further right).
 pub const SPRITE_DBUF_X0: usize = 112;
 
 // ── Screenshot crop (= renderLiteralPortRgba, integrated-session.ts) ───────────
-/// VICE x64sc PAL canvas: X = dbuf[104..488] (384 px, balanced 32 L/R borders),
-/// Y = fb[16..288] (272 px, first displayed PAL line = 16).
-pub const CANVAS_X0: usize = 104;
-pub const CANVAS_W: usize = 384;
-pub const CANVAS_Y0: usize = 16;
-pub const CANVAS_H: usize = 272;
+// Spec 863: the crop is the model's display window (`model::DisplayWindow`), not a
+// constant — PAL's is dbuf[104..488] × fb[16..288] = 384 × 272; NTSC's is 384 × 247,
+// rows 28..=274, the last twelve being raster lines 0-11 drawn below the frame.
 
 /// VIC graphics mode (ECM<<2 | BMM<<1 | MCM), the 3-bit mode select that drives
 /// the per-pixel colour logic.
@@ -118,6 +120,9 @@ pub struct RenderInput<'a> {
     pub color_ram: &'a [u8; 0x0400],
     /// VIC bank base (0, $4000, $8000, $C000) = (3 - CIA2_PA[1:0]) * $4000.
     pub bank_base: u16,
+    /// Spec 863 — the model: the cycle-table family places the sprites, the display
+    /// window maps raster lines to framebuffer rows.
+    pub model: &'static crate::model::C64Model,
 }
 
 impl<'a> RenderInput<'a> {
@@ -419,12 +424,16 @@ fn render_sprites(inp: &RenderInput, fb: &mut [u8], fg: &[u8], mut sprmask: Opti
         let ptr = inp.ram[screen_base.wrapping_add(0x3f8 + s as u16) as usize] as u16;
         let data_base = inp.bank_base.wrapping_add(ptr.wrapping_mul(64));
 
-        let dbuf_x0 = sx + SPRITE_DBUF_X0;
+        let dbuf_x0 = crate::vic::sprite_dbuf_x(inp.model.cycle_family, sx as u16);
         let height = if is_ye { 42 } else { 21 };
+        let lines = inp.model.timing.lines_per_frame as usize;
 
         for row in 0..height {
             let data_row = if is_ye { row / 2 } else { row };
-            let line = sy + 1 + row;
+            // Spec 863 — the sprite's raster line wraps with the frame, and a wrapped window
+            // (NTSC) draws the lines before its first below the frame. On PAL both are the
+            // identity (a sprite ends by line 298 < 312).
+            let line = inp.model.window.row_of_line(((sy + 1 + row) % lines) as u16) as usize;
             if line >= FB_H {
                 break;
             }
@@ -667,62 +676,54 @@ fn pixels_for_cell(
     (out, fg)
 }
 
-/// Crop the internal index buffer to the VICE PAL screenshot canvas and convert
-/// to RGBA (colodore). Returns (width, height, rgba). This is exactly what
-/// `renderLiteralPortRgba` produces in the TS oracle.
-pub fn index_buffer_to_canvas_rgba(fb: &[u8]) -> (usize, usize, Vec<u8>) {
-    let mut rgba = vec![0u8; CANVAS_W * CANVAS_H * 4];
-    for cy in 0..CANVAS_H {
-        let sy = cy + CANVAS_Y0;
-        if sy >= FB_H {
-            continue;
-        }
-        for cx in 0..CANVAS_W {
-            let sx = cx + CANVAS_X0;
-            if sx >= FB_W {
-                continue;
-            }
-            let idx = (fb[sy * FB_W + sx] & 0x0f) as usize;
-            let [r, g, b] = COLODORE[idx];
-            let off = (cy * CANVAS_W + cx) * 4;
-            rgba[off] = r;
-            rgba[off + 1] = g;
-            rgba[off + 2] = b;
-            rgba[off + 3] = 0xff;
-        }
+/// Crop the internal index buffer to the model's display window and convert to RGBA
+/// (colodore). Returns (width, height, rgba). On PAL this is exactly what
+/// `renderLiteralPortRgba` produces in the TS oracle (384 × 272 from row 16).
+pub fn index_buffer_to_canvas_rgba(fb: &[u8], window: &crate::model::DisplayWindow) -> (usize, usize, Vec<u8>) {
+    let (w, h, idx) = index_buffer_to_canvas_indices(fb, window);
+    let mut rgba = vec![0u8; w * h * 4];
+    for (i, &c) in idx.iter().enumerate() {
+        let [r, g, b] = COLODORE[c as usize];
+        let off = i * 4;
+        rgba[off] = r;
+        rgba[off + 1] = g;
+        rgba[off + 2] = b;
+        rgba[off + 3] = 0xff;
     }
-    (CANVAS_W, CANVAS_H, rgba)
+    (w, h, rgba)
 }
 
-/// Crop the internal index buffer to the VICE PAL screenshot canvas and return
-/// the raw 4-bit COLOUR INDICES (one byte per pixel, each masked `& 0x0f`) —
-/// NOT palettized. This is the `fmt 1` (palette-indexed) live-stream source: it
-/// matches the TS oracle's `renderLiteralPortIndexed` crop exactly (same origin
-/// (CANVAS_X0, CANVAS_Y0), same 384×272 window, same `& 0x0f`). The 48-byte RGB
-/// palette to pair with it is [`COLODORE`] serialized R,G,B in index order.
+/// Crop the internal index buffer to the model's display window and return the raw 4-bit
+/// COLOUR INDICES (one byte per pixel, each masked `& 0x0f`) — NOT palettized. This is the
+/// `fmt 1` (palette-indexed) live-stream source. On PAL it matches the TS oracle's
+/// `renderLiteralPortIndexed` crop exactly (origin (104, 16), 384×272, `& 0x0f`). A
+/// wrapped window (NTSC) is contiguous in the buffer — its lines 0-11 were drawn into the
+/// rows below the frame — so the crop is still one run of rows. The 48-byte RGB palette
+/// to pair with it is [`COLODORE`] serialized R,G,B in index order.
 /// Returns (width, height, indices).
-pub fn index_buffer_to_canvas_indices(fb: &[u8]) -> (usize, usize, Vec<u8>) {
-    let mut idx = vec![0u8; CANVAS_W * CANVAS_H];
-    for cy in 0..CANVAS_H {
-        let sy = cy + CANVAS_Y0;
+pub fn index_buffer_to_canvas_indices(fb: &[u8], window: &crate::model::DisplayWindow) -> (usize, usize, Vec<u8>) {
+    let (w, h, x0, y0) = (window.width(), window.height(), window.x0(), window.first_line as usize);
+    let mut idx = vec![0u8; w * h];
+    for cy in 0..h {
+        let sy = cy + y0;
         if sy >= FB_H {
             continue;
         }
-        for cx in 0..CANVAS_W {
-            let sx = cx + CANVAS_X0;
+        for cx in 0..w {
+            let sx = cx + x0;
             if sx >= FB_W {
                 continue;
             }
-            idx[cy * CANVAS_W + cx] = fb[sy * FB_W + sx] & 0x0f;
+            idx[cy * w + cx] = fb[sy * FB_W + sx] & 0x0f;
         }
     }
-    (CANVAS_W, CANVAS_H, idx)
+    (w, h, idx)
 }
 
-/// One-shot: render a frozen machine state to the VICE PAL canvas RGBA.
+/// One-shot: render a frozen machine state to the model's canvas RGBA.
 pub fn render_canvas_rgba(inp: &RenderInput) -> (usize, usize, Vec<u8>) {
     let fb = render_index_buffer(inp);
-    index_buffer_to_canvas_rgba(&fb)
+    index_buffer_to_canvas_rgba(&fb, &inp.model.window)
 }
 
 #[cfg(test)]
@@ -744,9 +745,9 @@ mod tests {
         let mut regs = [0u8; 0x40];
         regs[0x20] = 14; // border light blue
         // DEN=0 → whole canvas is border.
-        let inp = RenderInput { regs: &regs, ram: &ram, char_rom: &char_rom, color_ram: &color_ram, bank_base: 0 };
+        let inp = RenderInput { regs: &regs, ram: &ram, char_rom: &char_rom, color_ram: &color_ram, bank_base: 0, model: crate::model::default_model() };
         let (w, h, rgba) = render_canvas_rgba(&inp);
-        assert_eq!((w, h), (CANVAS_W, CANVAS_H));
+        assert_eq!((w, h), (384, 272));
         let lb = COLODORE[14];
         for i in (0..rgba.len()).step_by(4) {
             assert_eq!(&rgba[i..i + 3], &lb[..]);
@@ -767,11 +768,11 @@ mod tests {
         regs[0x18] = 0x14; // screen $0400, char $1000
         regs[0x20] = 14;
         regs[0x21] = 6;
-        let inp = RenderInput { regs: &regs, ram: &ram, char_rom: &char_rom, color_ram: &color_ram, bank_base: 0 };
+        let inp = RenderInput { regs: &regs, ram: &ram, char_rom: &char_rom, color_ram: &color_ram, bank_base: 0, model: crate::model::default_model() };
         let fb = render_index_buffer(&inp);
-        let (_w, _h, rgba) = index_buffer_to_canvas_rgba(&fb);
+        let (_w, _h, rgba) = index_buffer_to_canvas_rgba(&fb, &crate::model::default_model().window);
         let at = |x: usize, y: usize| {
-            let o = (y * CANVAS_W + x) * 4;
+            let o = (y * 384 + x) * 4;
             [rgba[o], rgba[o + 1], rgba[o + 2]]
         };
         let bg = COLODORE[6];
@@ -802,7 +803,7 @@ mod tests {
         regs[0x18] = 0x14; // screen $0400, char $1000
         regs[0x20] = 14;
         regs[0x21] = 6; // bg blue
-        let inp = RenderInput { regs: &regs, ram: &ram, char_rom: &char_rom, color_ram: &color_ram, bank_base: 0 };
+        let inp = RenderInput { regs: &regs, ram: &ram, char_rom: &char_rom, color_ram: &color_ram, bank_base: 0, model: crate::model::default_model() };
         let fb = render_index_buffer(&inp);
         // display row 0 = fb line 51; col 0 starts at dbuf X 136.
         let base = 51 * FB_W + DISPLAY_X0;
@@ -828,7 +829,7 @@ mod sprite_tests {
         regs[0x00] = 0x60; regs[0x01] = 0x60; // X=96 Y=96
         regs[0x15] = 0x01; // enable
         regs[0x27] = 2;    // red
-        let inp = RenderInput { regs: &regs, ram: &ram, char_rom: &char_rom, color_ram: &color_ram, bank_base: 0 };
+        let inp = RenderInput { regs: &regs, ram: &ram, char_rom: &char_rom, color_ram: &color_ram, bank_base: 0, model: crate::model::default_model() };
         let fb = render_index_buffer(&inp);
         // expect red (2) at dbuf (line = 0x60+1 = 97, x = 0x60+112 = 208)
         let off = 97 * FB_W + 208;
@@ -866,7 +867,7 @@ mod sprite_tests {
         regs[0x15] = 0x03; // enable 0+1
         regs[0x27] = 2; // sprite0 red
         regs[0x28] = 7; // sprite1 yellow
-        let inp = RenderInput { regs: &regs, ram: &ram, char_rom: &char_rom, color_ram: &color_ram, bank_base: 0 };
+        let inp = RenderInput { regs: &regs, ram: &ram, char_rom: &char_rom, color_ram: &color_ram, bank_base: 0, model: crate::model::default_model() };
         let (ss, sb) = render_collisions(&inp);
         assert_eq!(ss, 0x03, "sprite-sprite $D01E = bits 0+1 (overlap)");
         assert_eq!(sb, 0x00, "sprite-background $D01F = 0 (blank background)");
@@ -901,7 +902,7 @@ mod sprite_tests {
         regs[0x01] = 0x32; // sprite0 Y=50 → first row line 51 (= display row 0)
         regs[0x15] = 0x01; // enable sprite 0
         regs[0x27] = 2; // red
-        let inp = RenderInput { regs: &regs, ram: &ram, char_rom: &char_rom, color_ram: &color_ram, bank_base: 0 };
+        let inp = RenderInput { regs: &regs, ram: &ram, char_rom: &char_rom, color_ram: &color_ram, bank_base: 0, model: crate::model::default_model() };
         let (ss, sb) = render_collisions(&inp);
         assert_eq!(sb, 0x01, "sprite-background $D01F = bit 0 (sprite over fg char)");
         assert_eq!(ss, 0x00, "sprite-sprite $D01E = 0 (single sprite)");
@@ -939,7 +940,7 @@ mod sprite_tests {
         regs[0x01] = 0x32; // sprite0 Y=50 → display row 0 (line 51)
         regs[0x15] = 0x01; // enable sprite 0
         regs[0x27] = 2;
-        let inp = RenderInput { regs: &regs, ram: &ram, char_rom: &char_rom, color_ram: &color_ram, bank_base: 0 };
+        let inp = RenderInput { regs: &regs, ram: &ram, char_rom: &char_rom, color_ram: &color_ram, bank_base: 0, model: crate::model::default_model() };
         assert_eq!(inp.mode(), VicMode::Invalid, "ECM+BMM = invalid mode");
         // The cell (0,0) display pixel renders BLACK (index 0).
         let fb = render_index_buffer(&inp);

@@ -72,17 +72,18 @@ pub fn checkpoint_ring_budget_for(max_entries: u64) -> u64 {
     (max_entries.max(1) + 16) * ANCHOR_BYTES_ESTIMATE
 }
 
-/// Spec 772 — max LIVE entries the ring retains = `ceil(seconds / (cadenceFrames/50))`
-/// (PAL 50 fps). At the 10s / 25-frame default that is **20**. Clamped ≥ 1. 1:1 with
-/// the c64re `checkpointRingMaxEntries` (runtime-checkpoint-ring.ts).
-pub fn checkpoint_ring_max_entries(seconds: f64, cadence_frames: u64) -> u64 {
+/// Spec 772 — max LIVE entries the ring retains = `ceil(seconds / (cadenceFrames/fps))`
+/// with the model's nominal frame rate (Spec 863: 50 PAL, 60 NTSC). At the 10s / 25-frame
+/// PAL default that is **20**. Clamped ≥ 1. 1:1 with the c64re `checkpointRingMaxEntries`
+/// (runtime-checkpoint-ring.ts).
+pub fn checkpoint_ring_max_entries(seconds: f64, cadence_frames: u64, nominal_fps: u32) -> u64 {
     let sec = if seconds.is_finite() && seconds > 0.0 {
         seconds
     } else {
         DEFAULT_CHECKPOINT_RING_SECONDS
     };
     let cad = if cadence_frames >= 1 { cadence_frames } else { 25 } as f64;
-    let seconds_per_capture = cad / 50.0; // PAL 50fps
+    let seconds_per_capture = cad / nominal_fps.max(1) as f64;
     ((sec / seconds_per_capture).ceil() as u64).max(1)
 }
 

@@ -520,7 +520,7 @@ pub(crate) fn vicii_draw_cycle(v: &mut VicII) {
     // flushes a single-line buffer per line; we accumulate into a full frame.)
     if v.raster_cycle == 1 {
         v.dbuf_offset = 0;
-        v.dbuf_line = v.raster_line as usize;
+        v.dbuf_line = v.draw_row();
     }
 
     let cycle_flags = v.cycle_flags_pipe;

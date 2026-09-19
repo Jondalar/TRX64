@@ -615,6 +615,7 @@ impl<'a> FullBus<'a> {
             char_rom: self.char_rom,
             color_ram: &color_ram,
             bank_base,
+            model: self.vic.model(),
         };
         let (ss, sb) = crate::render::render_collisions(&inp);
         self.vic.apply_collisions(ss, sb);

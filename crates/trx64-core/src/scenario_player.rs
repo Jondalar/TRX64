@@ -20,10 +20,10 @@
 //! session/joystick_set). The scheduling, sort order, and `tick`/`remaining`/`reset`
 //! contract are byte-for-byte the TS.
 //!
-//! PAL frame = 19656 cycles (scenario-player.ts:16 / DEFAULT below), NTSC = 17030.
-
-/// scenario-player.ts:34 — default PAL cycles per frame.
-pub const DEFAULT_CYCLES_PER_FRAME: u64 = 19656;
+//! A frame is the machine's (Spec 863: `Machine::timing().cycles_per_frame` — 19 656 on
+//! PAL, 17 095 on NTSC 6567R8, 16 768 on the old 6567R56A, 20 280 on PAL-N); the caller
+//! passes it. There is no default: an `at_frame` step means nothing without the machine it
+//! was recorded on.
 
 /// scenario-player.ts:22-27 — joystick state (all fields optional / default
 /// false). Re-export of the canonical `keyboard::JoystickState` (the TS golden
@@ -102,8 +102,8 @@ impl ScenarioPlayer {
     /// ascending (`at_cycle`, or `at_frame * cyclesPerFrame`, or 0). A STABLE sort
     /// preserves the relative order of equal-cycle steps (matching the TS Array.sort,
     /// which is stable in V8).
-    pub fn new(mut steps: Vec<ScenarioStep>, cycles_per_frame: Option<u64>) -> Self {
-        let cpf = cycles_per_frame.unwrap_or(DEFAULT_CYCLES_PER_FRAME);
+    pub fn new(mut steps: Vec<ScenarioStep>, cycles_per_frame: u64) -> Self {
+        let cpf = cycles_per_frame.max(1);
         steps.sort_by_key(|s| abs_cycle(s, cpf));
         Self {
             steps,
@@ -182,6 +182,9 @@ fn abs_cycle(s: &ScenarioStep, cycles_per_frame: u64) -> u64 {
 mod tests {
     use super::*;
 
+    /// The default model's frame (`c64-pal`).
+    const PAL_FRAME: u64 = 19656;
+
     /// A recording target: logs every dispatched action (and advances a clock for
     /// composite run_for).
     #[derive(Default)]
@@ -241,7 +244,7 @@ mod tests {
                 },
             ),
         ];
-        let mut p = ScenarioPlayer::new(steps, None);
+        let mut p = ScenarioPlayer::new(steps, PAL_FRAME);
         let mut t = LogTarget::default();
         assert_eq!(p.tick(&mut t, 500), 0, "none due yet");
         assert_eq!(p.tick(&mut t, 1500), 1, "A due");
@@ -259,7 +262,7 @@ mod tests {
             at_frame: Some(2),
             kind: ScenarioStepKind::Restore,
         }];
-        let mut p = ScenarioPlayer::new(steps, None);
+        let mut p = ScenarioPlayer::new(steps, PAL_FRAME);
         assert_eq!(p.next_due_cycle(), Some(39312));
         let mut t = LogTarget::default();
         assert_eq!(p.tick(&mut t, 39311), 0);
@@ -283,7 +286,7 @@ mod tests {
             },
         ];
         let steps = vec![step(0, ScenarioStepKind::JoystickScript { port: 1, sequence: seq })];
-        let mut p = ScenarioPlayer::new(steps, Some(100));
+        let mut p = ScenarioPlayer::new(steps, 100);
         let mut t = LogTarget::default();
         assert_eq!(p.tick(&mut t, 0), 1);
         // Each entry: set joystick1 then run_for(duration*100).
@@ -294,7 +297,7 @@ mod tests {
     #[test]
     fn reset_replays_from_start() {
         let steps = vec![step(0, ScenarioStepKind::Type { text: "X".into() })];
-        let mut p = ScenarioPlayer::new(steps, None);
+        let mut p = ScenarioPlayer::new(steps, PAL_FRAME);
         let mut t = LogTarget::default();
         p.tick(&mut t, 0);
         assert_eq!(p.remaining(), 0);
@@ -316,7 +319,7 @@ mod tests {
             ]
         };
         let run = || {
-            let mut p = ScenarioPlayer::new(mk(), None);
+            let mut p = ScenarioPlayer::new(mk(), PAL_FRAME);
             let mut t = LogTarget::default();
             for cycle in (0..=400).step_by(50) {
                 p.tick(&mut t, cycle);

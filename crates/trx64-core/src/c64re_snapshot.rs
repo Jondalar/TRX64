@@ -461,7 +461,11 @@ pub fn restore_cia(cia: &mut Cia, s: &CiaSnapshot, tab: &[u16; crate::cia::CIAT_
     cia.tod_tick_counter = s.todtickcounter as u8;
     // A pre-TOD dump wrote 0 here; a running clock needs a non-zero countdown or it
     // would fire on the very next cycle.
-    cia.tod_power_freq = if s.power_ticks > 0 { s.power_ticks as u32 } else { 50 };
+    // A pre-TOD dump wrote 0 there: keep the mains the model put on the chip (Spec 863 —
+    // the restore applied the snapshot's row before any chip state).
+    if s.power_ticks > 0 {
+        cia.tod_power_freq = s.power_ticks as u32;
+    }
     // A target clk, so it is re-based onto the restored clock rather than trusting an
     // old absolute value from a dump written before TOD ran. The PHASE has to survive
     // that re-basing, and until now it did not: this line recomputed a whole period,
@@ -473,7 +477,7 @@ pub fn restore_cia(cia: &mut Cia, s: &CiaSnapshot, tab: &[u16; crate::cia::CIAT_
     // Capture writes the pair: `todticks` is the target and `todclk` is the clock it
     // was measured against, so their difference is what was actually left to run.
     // A pre-TOD dump has `todticks` 0 and still gets the full period.
-    let tod_period = (crate::cia::PAL_CYCLES_PER_SEC / cia.tod_power_freq.max(1)) as u64;
+    let tod_period = cia.tod_period();
     let remaining = (s.todticks - s.todclk).clamp(0, tod_period as i64) as u64;
     cia.tod_clk = cia.clk.wrapping_add(if s.todticks > 0 && remaining > 0 {
         remaining
@@ -852,7 +856,10 @@ pub fn capture_vic(m: &Machine) -> VicSnapshot {
         .collect();
 
     VicSnapshot {
-        model: 0, // VICII_MODEL_MARKER (vicii-snapshot.ts:88)
+        // VICE's VIC-II model number (`vicii-snapshot.c:125-126`, `vicii.h` VICII_MODEL_*):
+        // 0 = 6569 (c64-pal), 3 = 6567R8 (c64-ntsc), 6 = 6572 (c64-paln). Spec 863 D6 — one
+        // row per chip, so this names the row the state was captured on.
+        model: m.model().vicii_id as i64,
         regs: v.regs.iter().map(|&b| b as i64).collect(),
         raster_cycle: v.raster_cycle as i64,
         cycle_flags: v.cycle_flags as i64,
@@ -902,7 +909,21 @@ pub fn capture_vic(m: &Machine) -> VicSnapshot {
 /// Restore TRX64's `m.vic` + color RAM from a c64re `LiteralVicSnapshot`.
 /// The full-frame `dbuf` accumulator + `displayed` come from `vicPresentation`;
 /// here the 520-byte draw line writes into the current `dbuf_line` row.
-pub fn restore_vic(m: &mut Machine, s: &VicSnapshot) {
+///
+/// Spec 863 — the machine must already stand on the snapshot's row
+/// ([`restore_runtime_checkpoint`] puts it there). A raster position that row does not
+/// have is refused: it would index past the cycle table.
+pub fn restore_vic(m: &mut Machine, s: &VicSnapshot) -> Result<(), String> {
+    if s.raster_line < 0 || s.raster_cycle < 0 || !m.vic.fits(s.raster_line as u16, s.raster_cycle as u16) {
+        return Err(format!(
+            "restore vic: line {} cycle {} is not a position on the {} ({} × {})",
+            s.raster_line,
+            s.raster_cycle + 1,
+            m.model().name,
+            m.vic.cycles_per_line(),
+            m.vic.screen_height()
+        ));
+    }
     {
         let v = &mut m.vic;
         for (i, &b) in s.regs.iter().enumerate().take(0x40) {
@@ -968,6 +989,19 @@ pub fn restore_vic(m: &mut Machine, s: &VicSnapshot) {
     // literal-port VIC's colour). Only sync the io_shadow oracle mirror; do NOT overwrite
     // `mem[$D800]` with this field (also_ram=false) — that corrupted Highpool's colours.
     write_color_ram(m, &s.color_ram.iter().map(|&b| b as u8).collect::<Vec<u8>>(), false);
+    Ok(())
+}
+
+/// Spec 863 D6 — the row a checkpoint was captured on, from its VIC snapshot's model byte.
+/// `Ok(None)` for a checkpoint without a VIC node (nothing to say). An unknown chip, or a
+/// row that cannot run here, is refused by name.
+pub fn checkpoint_model(cp: &serde_json::Value) -> Result<Option<&'static crate::model::C64Model>, String> {
+    let Some(v) = cp.get("vic") else { return Ok(None) };
+    let id = v.get("model").and_then(|x| x.as_i64()).unwrap_or(0);
+    if !(0..=255).contains(&id) {
+        return Err(format!("the snapshot's VIC-II model {id} is not a known C64 model"));
+    }
+    crate::model::for_snapshot(id as u8).map(Some)
 }
 
 /// Read the `vicPresentation` seam: the two 520×312 color-index framebuffers
@@ -1545,6 +1579,27 @@ pub fn restore_runtime_checkpoint(
         ));
     }
 
+    // Spec 863 D6 — the checkpoint says which C64 it was. Put the machine back on that row
+    // BEFORE any state is loaded (the D5 transplant run backwards: rewinding across a model
+    // switch makes the machine what it was). A row that cannot run here, or a raster
+    // position the row does not have, is refused here — before anything is overwritten.
+    if let Some(model) = checkpoint_model(cp).map_err(|e| format!("restore: {e}"))? {
+        let v = &cp["vic"];
+        let line = v.get("raster_line").and_then(|x| x.as_i64()).unwrap_or(0);
+        let cycle = v.get("raster_cycle").and_then(|x| x.as_i64()).unwrap_or(0);
+        let t = model.timing;
+        if line < 0 || cycle < 0 || line >= t.lines_per_frame as i64 || cycle >= t.cycles_per_line as i64 {
+            return Err(format!(
+                "restore: the VIC stands at line {line} cycle {} — {} has {} lines of {} cycles",
+                cycle + 1,
+                model.name,
+                t.lines_per_frame,
+                t.cycles_per_line
+            ));
+        }
+        m.put_on_model(model).map_err(|e| format!("restore: {e}"))?;
+    }
+
     // RAM + CPU port (recompute PLA memconfig).
     if let Some(node) = cp.get("ram") {
         restore_ram_ta(m, node);
@@ -1616,7 +1671,7 @@ pub fn restore_runtime_checkpoint(
     if let Some(c) = cp.get("vic") {
         let s: VicSnapshot =
             serde_json::from_value(c.clone()).map_err(|e| format!("restore vic: {e}"))?;
-        restore_vic(m, &s);
+        restore_vic(m, &s)?;
     }
     if let Some(c) = cp.get("vicPresentation") {
         let s: VicPresentationSnapshot =
@@ -2127,7 +2182,7 @@ mod tests {
 
         let mut m2 = Machine::new();
         m2.vic.dbuf_line = 5; // restore writes the draw-line into the current row
-        restore_vic(&mut m2, &snap);
+        restore_vic(&mut m2, &snap).unwrap();
         assert_eq!(m2.vic.regs[0x11], 0x1b);
         assert_eq!(m2.vic.raster_line, 137);
         assert_eq!(m2.vic.raster_cycle, 22);

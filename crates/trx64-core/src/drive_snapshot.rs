@@ -74,6 +74,21 @@ const DRIVE_TYPE_1541: u32 = 1541;
 /// module). The c64re facade reports `MachineVideoStandard = MACHINE_SYNC_PAL = 0`.
 const MACHINE_SYNC_PAL: u32 = 0;
 
+/// Spec 863 D6 — the DRIVE module's `MachineVideoStandard` for the machine the drive is in,
+/// read off the drive's own catch-up ratio (the model sets both together). PAL keeps the
+/// c64re facade's 0; the others are VICE's `MACHINE_SYNC_*` (NTSC 2, old NTSC 3, PAL-N 4).
+fn machine_sync_of(drive: &Drive1541) -> u32 {
+    use crate::model::VideoStandard;
+    crate::model::models()
+        .iter()
+        .find(|m| m.runs() && m.timing.drive_sync_factor == drive.sync_factor)
+        .map(|m| match m.video {
+            VideoStandard::Pal => MACHINE_SYNC_PAL,
+            v => v.vice_sync(),
+        })
+        .unwrap_or(MACHINE_SYNC_PAL)
+}
+
 // GCRIMAGE track indexing: the on-wire entry index IS the 0-based slot index, the
 // SAME in TRX64 and c64re (both store `tracks[slot]` = data for half-track slot+2;
 // c64re fsimage_gcr.ts:314 read_half_track(half_track+2, tracks[half_track])). The
@@ -198,8 +213,8 @@ fn write_drive_module(drive: &mut Drive1541, s: &mut SnapshotT) {
     // has_tde = 1, has_drives = 1 (single 1541).
     s.smw_b(&mut m, 1);
     s.smw_b(&mut m, 1);
-    // sync_factor (MachineVideoStandard) — PAL.
-    s.smw_dw(&mut m, MACHINE_SYNC_PAL);
+    // sync_factor (MachineVideoStandard) — the machine's standard.
+    s.smw_dw(&mut m, machine_sync_of(drive));
 
     let r = &drive.rotation;
     let half_track_word =
@@ -306,6 +321,8 @@ fn read_drive_module(
         s.module_close(&m);
         return Ok(None);
     }
+    // MachineVideoStandard: the drive's ratio follows the MACHINE's row, which the
+    // checkpoint restore already applied — the record here is informational.
     let _sync_factor = rdw!();
 
     let attach_clk = rclk!();

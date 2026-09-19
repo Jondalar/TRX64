@@ -438,6 +438,11 @@ pub struct Drive1541 {
     /// Low 16 fractional bits of accumulated `sync_factor * c64_cycles`; the carry
     /// out of bit 16 is the integer number of drive cycles to advance `stop_clk`.
     sync_accum: u32,
+    /// VICE `drv->cpud->sync_factor` (drivesync.c:53-62): `floor(65536 * 1e6 / cpu_hz)`,
+    /// the 16.16 ratio of drive cycles to C64 cycles. The 1541 runs at a true 1 MHz on
+    /// every machine; only this ratio follows the C64's clock (Spec 863 — the model's,
+    /// 66517 PAL, 64079 NTSC). A drive reset keeps it: it is the machine's, not the drive's.
+    pub sync_factor: u32,
     /// Absolute drive clock the CPU may run up to (VICE `cpu->stop_clk`). The drive
     /// 6502 executes whole instructions while `cpu.clk < stop_clk`.
     stop_clk: u64,
@@ -511,12 +516,12 @@ fn new_via2_ctx() -> ViaContext {
     via
 }
 
-/// PAL drive sync factor (VICE drivesync.c:53-62 `drive_set_machine_parameter`):
-///   sync_factor = floor(65536 * 1_000_000 / cycles_per_sec)
-/// with the C64 PAL clock cycles_per_sec = 985_248 (vice1541-facade.ts:319). The
-/// 1541's `clock_frequency` is 1, so `drv.cpud.sync_factor` = sync_factor * 1.
-/// floor(65536 * 1e6 / 985248) = 66517.
-const DRIVE_SYNC_FACTOR_PAL: u32 = 66517;
+/// The default model's drive sync factor (VICE drivesync.c:53-62
+/// `drive_set_machine_parameter`): `sync_factor = floor(65536 * 1_000_000 / cycles_per_sec)`
+/// with the `c64-pal` clock 985 248 → 66517. The 1541's `clock_frequency` is 1, so
+/// `drv.cpud.sync_factor` = sync_factor * 1. A machine sets its model's
+/// (`Timing::drive_sync_factor`).
+const DEFAULT_SYNC_FACTOR: u32 = 66517;
 
 /// 6502 hardware-reset sequence cost the drive consumes before the first opcode
 /// fetch (VICE drivecpu.c:165-184 `cpu_reset` → `drv->clk_ptr = 6`).
@@ -551,6 +556,7 @@ impl Drive1541 {
             cpu_last_data: 0,
             last_sample_pc: None,
             sync_accum: 0,
+            sync_factor: DEFAULT_SYNC_FACTOR,
             stop_clk: 0,
             reset_pending: true,
             iec_drv_port: 0x85,
@@ -652,7 +658,7 @@ impl Drive1541 {
     }
 
     /// Advance the drive's `stop_clk` target by `c64_cycles` of main-CPU time,
-    /// applying the VICE PAL sync factor (drivecpu.c:383-390). The integer carry out
+    /// applying the machine's sync factor (drivecpu.c:383-390). The integer carry out
     /// of the 16-bit fixed-point accumulator is the number of drive cycles to add.
     #[inline]
     fn advance_stop_clk(&mut self, c64_cycles: u64) {
@@ -664,7 +670,7 @@ impl Drive1541 {
             remaining -= tcycles as u64;
             self.sync_accum = self
                 .sync_accum
-                .wrapping_add(DRIVE_SYNC_FACTOR_PAL.wrapping_mul(tcycles));
+                .wrapping_add(self.sync_factor.wrapping_mul(tcycles));
             self.stop_clk = self.stop_clk.wrapping_add((self.sync_accum >> 16) as u64);
             self.sync_accum &= 0xFFFF;
         }

@@ -65,20 +65,22 @@
 // to preserve the full VICE accessor set for the later renderer step.
 #![allow(dead_code)]
 
-// ── PAL 6569 timing constants (vicii-timing.c / vicii-chip-model.c) ────────────
+// ── Timing constants (viciitypes.h) ─────────────────────────────────────────────
+// The line length and the frame height are the model's (Spec 863): `cycles_per_line`
+// comes from the row's cycle-table family, `screen_height` from its raster lines.
 
-/// PAL: 63 cycles per raster line. (chip_model_mos6569r3.cycles_per_line)
-pub const PAL_CYCLES_PER_LINE: u16 = 63;
-/// PAL: 312 raster lines. (chip_model_mos6569r3.num_raster_lines = screen_height)
-pub const PAL_SCREEN_HEIGHT: u16 = 312;
+use crate::model::{CycleFamily, DisplayWindow, MAX_CYCLES_PER_LINE, MAX_RASTER_LINES};
+
 /// First line on which a badline can occur (viciitypes.h VICII_FIRST_DMA_LINE).
 pub const FIRST_DMA_LINE: u16 = 0x30;
 /// Last line on which a badline can occur (viciitypes.h VICII_LAST_DMA_LINE).
 pub const LAST_DMA_LINE: u16 = 0xf7;
 
-/// vicii-cycle.c VICII_PAL_CYCLE(c) = c-1 (PAL cycle 1..63 → table index 0..62).
+/// viciitypes.h `VICII_PAL_CYCLE(c) = c - 1`: a 1-based cycle number → the table index.
+/// PAL only by name — VICE uses it for every family (the end-of-line, start-of-frame and
+/// VSP cycles are the same numbers on all of them).
 #[inline]
-const fn pal_cycle(c: u16) -> u16 {
+const fn cycle_index(c: u16) -> u16 {
     c - 1
 }
 
@@ -328,15 +330,17 @@ fn cycle_is_check_border_r(flags: u32, csel: bool) -> bool {
 }
 
 // =============================================================================
-// SECTION — the PAL cycle table (vicii-chip-model.c cycle_tab_pal).
+// SECTION — the cycle tables (vicii-chip-model.c cycle_tab_pal / _ntsc / _ntsc_old).
 //
-// PORT OF: vicii-chip-model.c:111-238 (cycle_tab_pal) + :579-811
-// (vicii_chip_model_set, which folds the Phi1+Phi2 rows of each PAL cycle into
-// one `cycle_table[cycle-1]` u32 entry). We precompute the SAME 63-entry table
-// at compile time below (cycle index 0..62 = VICII_PAL_CYCLE(1..63)).
+// PORT OF: vicii-chip-model.c:111-238 (cycle_tab_pal), :272-403 (cycle_tab_ntsc),
+// :437-566 (cycle_tab_ntsc_old) + :579-811 (vicii_chip_model_set, which folds the
+// Phi1+Phi2 rows of each cycle into one `cycle_table[cycle-1]` u32 entry). Spec 863: the
+// three families are the building blocks a `models.toml` row names; the VIC indexes
+// the one its row names, and `cycles_per_line` decides how many entries run.
 //
-// Each source row is { cycle, xpos, visible, fetch, ba, flags }. The encoder
-// (chip-model.c:730-808) merges the two phases:
+// Each source row is { cycle, xpos, visible, fetch, ba, flags }, every column carried —
+// the xpos column is the table's, not a formula (NTSC repeats $184 three times). The
+// encoder (chip-model.c:730-808) merges the two phases:
 //   entry |= (ba_phi1 & BaSpr_M) << SPRITE_BA_MASK_B
 //   entry |= (ba_phi1 & BaFetch) ? FETCH_BA_M : 0
 //   Phi1 fetch type → PHI1_*; FetchC (Phi2) → PHI2_FETCH_C_M | VISIBLE_M
@@ -344,7 +348,19 @@ fn cycle_is_check_border_r(flags: u32, csel: bool) -> bool {
 // =============================================================================
 
 /// Source-table row constants (vicii-chip-model.c #defines, lines 53-97).
-mod tab {
+pub(crate) mod tab {
+    // Cycle column: Phi1(x) = x, Phi2(x) = x | 0x80.
+    pub const fn phi1(c: u8) -> u8 {
+        c
+    }
+    pub const fn phi2(c: u8) -> u8 {
+        c | 0x80
+    }
+    // Visible column: Vis(x) = x | 0x80, None = 0.
+    pub const fn vis(x: u16) -> u16 {
+        x | 0x80
+    }
+
     // Fetch field (FetchType_M | FetchSprNum_M).
     pub const NONE: u16 = 0;
     pub const SPR_PTR: u16 = 0x100; // | sprite num
@@ -389,200 +405,494 @@ mod tab {
     }
 }
 
-/// One row of cycle_tab_pal: (xpos, fetch, ba, flags). The `cycle`/`visible`
-/// columns are not needed by the timing/BA model (visible/xpos feed the pixel
-/// renderer, deferred). Pairs of rows (Phi1, Phi2) per PAL cycle.
-struct Row {
-    fetch: u16,
-    ba: u16,
-    flags: u16,
+/// One row of a VICE cycle table (`struct ViciiCycle`, vicii-chip-model.c:44-51).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Row {
+    /// `Phi1(c)` = c, `Phi2(c)` = c | 0x80.
+    pub cycle: u8,
+    pub xpos: u16,
+    /// `Vis(x)` = x | 0x80 — the display column the cycle's pixels belong to. Log-only in
+    /// VICE (`vicii_chip_model_set` never reads it); carried so the table is VICE's.
+    pub visible: u16,
+    pub fetch: u16,
+    pub ba: u16,
+    pub flags: u16,
 }
-const fn r(fetch: u16, ba: u16, flags: u16) -> Row {
-    Row { fetch, ba, flags }
+const fn r(cycle: u8, xpos: u16, visible: u16, fetch: u16, ba: u16, flags: u16) -> Row {
+    Row { cycle, xpos, visible, fetch, ba, flags }
 }
 
-/// PORT OF: vicii-chip-model.c:111-238 cycle_tab_pal (PAL, 63 cycles × 2 phases).
-/// Index 2*(cycle-1)+phi. Only the (fetch, ba, flags) columns are carried.
+/// PORT OF: `vicii-chip-model.c` `cycle_tab_pal` — 126 rows (63 cycles, Φ1 then Φ2), every column.
 #[rustfmt::skip]
-const CYCLE_TAB_PAL: [Row; 126] = {
+pub(crate) const CYCLE_TAB_PAL: [Row; 126] = {
     use tab::*;
     [
-        // Phi1(1),  Phi2(1)
-        r(SPR_PTR|3,  spr2(3,4),    NONE),               r(SPR_DMA0|3, spr2(3,4),    NONE),
-        // Phi1(2),  Phi2(2)
-        r(SPR_DMA1|3, spr3(3,4,5),  NONE),               r(SPR_DMA2|3, spr3(3,4,5),  NONE),
-        // Phi1(3),  Phi2(3)
-        r(SPR_PTR|4,  spr2(4,5),    NONE),               r(SPR_DMA0|4, spr2(4,5),    NONE),
-        // Phi1(4),  Phi2(4)
-        r(SPR_DMA1|4, spr3(4,5,6),  NONE),               r(SPR_DMA2|4, spr3(4,5,6),  NONE),
-        // Phi1(5),  Phi2(5)
-        r(SPR_PTR|5,  spr2(5,6),    NONE),               r(SPR_DMA0|5, spr2(5,6),    NONE),
-        // Phi1(6),  Phi2(6)
-        r(SPR_DMA1|5, spr3(5,6,7),  NONE),               r(SPR_DMA2|5, spr3(5,6,7),  NONE),
-        // Phi1(7),  Phi2(7)
-        r(SPR_PTR|6,  spr2(6,7),    NONE),               r(SPR_DMA0|6, spr2(6,7),    NONE),
-        // Phi1(8),  Phi2(8)
-        r(SPR_DMA1|6, spr2(6,7),    NONE),               r(SPR_DMA2|6, spr2(6,7),    NONE),
-        // Phi1(9),  Phi2(9)
-        r(SPR_PTR|7,  spr1(7),      NONE),               r(SPR_DMA0|7, spr1(7),      NONE),
-        // Phi1(10), Phi2(10)
-        r(SPR_DMA1|7, spr1(7),      NONE),               r(SPR_DMA2|7, spr1(7),      NONE),
-        // Phi1(11), Phi2(11)
-        r(REFRESH,    NONE,         NONE),               r(NONE,       NONE,         NONE),
-        // Phi1(12), Phi2(12)
-        r(REFRESH,    BA_FETCH,     NONE),               r(NONE,       BA_FETCH,     NONE),
-        // Phi1(13), Phi2(13)
-        r(REFRESH,    BA_FETCH,     NONE),               r(NONE,       BA_FETCH,     NONE),
-        // Phi1(14), Phi2(14)
-        r(REFRESH,    BA_FETCH,     NONE),               r(NONE,       BA_FETCH,     UPDATE_VC),
-        // Phi1(15), Phi2(15)
-        r(REFRESH,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     CHK_SPR_CRUNCH),
-        // Phi1(16), Phi2(16)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     UPDATE_MCBASE),
-        // Phi1(17), Phi2(17)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     CHK_BRD_L1),
-        // Phi1(18), Phi2(18)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     CHK_BRD_L0),
-        // Phi1(19), Phi2(19)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(20), Phi2(20)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(21), Phi2(21)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(22), Phi2(22)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(23), Phi2(23)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(24), Phi2(24)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(25), Phi2(25)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(26), Phi2(26)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(27), Phi2(27)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(28), Phi2(28)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(29), Phi2(29)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(30), Phi2(30)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(31), Phi2(31)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(32), Phi2(32)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(33), Phi2(33)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(34), Phi2(34)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(35), Phi2(35)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(36), Phi2(36)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(37), Phi2(37)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(38), Phi2(38)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(39), Phi2(39)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(40), Phi2(40)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(41), Phi2(41)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(42), Phi2(42)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(43), Phi2(43)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(44), Phi2(44)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(45), Phi2(45)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(46), Phi2(46)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(47), Phi2(47)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(48), Phi2(48)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(49), Phi2(49)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(50), Phi2(50)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(51), Phi2(51)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(52), Phi2(52)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(53), Phi2(53)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(54), Phi2(54)
-        r(FETCH_G,    BA_FETCH,     NONE),               r(FETCH_C,    BA_FETCH,     NONE),
-        // Phi1(55), Phi2(55)
-        r(FETCH_G,    spr1(0),      CHK_SPR_DMA),        r(NONE,       spr1(0),      NONE),
-        // Phi1(56), Phi2(56)
-        r(IDLE,       spr1(0),      CHK_SPR_DMA),        r(NONE,       spr1(0),      CHK_BRD_R0|CHK_SPR_EXP),
-        // Phi1(57), Phi2(57)
-        r(IDLE,       spr2(0,1),    NONE),               r(NONE,       spr2(0,1),    CHK_BRD_R1),
-        // Phi1(58), Phi2(58)
-        r(SPR_PTR|0,  spr2(0,1),    CHK_SPR_DISP),       r(SPR_DMA0|0, spr2(0,1),    UPDATE_RC),
-        // Phi1(59), Phi2(59)
-        r(SPR_DMA1|0, spr3(0,1,2),  NONE),               r(SPR_DMA2|0, spr3(0,1,2),  NONE),
-        // Phi1(60), Phi2(60)
-        r(SPR_PTR|1,  spr2(1,2),    NONE),               r(SPR_DMA0|1, spr2(1,2),    NONE),
-        // Phi1(61), Phi2(61)
-        r(SPR_DMA1|1, spr3(1,2,3),  NONE),               r(SPR_DMA2|1, spr3(1,2,3),  NONE),
-        // Phi1(62), Phi2(62)
-        r(SPR_PTR|2,  spr2(2,3),    NONE),               r(SPR_DMA0|2, spr2(2,3),    NONE),
-        // Phi1(63), Phi2(63)
-        r(SPR_DMA1|2, spr3(2,3,4),  NONE),               r(SPR_DMA2|2, spr3(2,3,4),  NONE),
+        r(phi1(1), 0x194, NONE, SPR_PTR|3, spr2(3,4), NONE),
+        r(phi2(1), 0x198, NONE, SPR_DMA0|3, spr2(3,4), NONE),
+        r(phi1(2), 0x19c, NONE, SPR_DMA1|3, spr3(3,4,5), NONE),
+        r(phi2(2), 0x1a0, NONE, SPR_DMA2|3, spr3(3,4,5), NONE),
+        r(phi1(3), 0x1a4, NONE, SPR_PTR|4, spr2(4,5), NONE),
+        r(phi2(3), 0x1a8, NONE, SPR_DMA0|4, spr2(4,5), NONE),
+        r(phi1(4), 0x1ac, NONE, SPR_DMA1|4, spr3(4,5,6), NONE),
+        r(phi2(4), 0x1b0, NONE, SPR_DMA2|4, spr3(4,5,6), NONE),
+        r(phi1(5), 0x1b4, NONE, SPR_PTR|5, spr2(5,6), NONE),
+        r(phi2(5), 0x1b8, NONE, SPR_DMA0|5, spr2(5,6), NONE),
+        r(phi1(6), 0x1bc, NONE, SPR_DMA1|5, spr3(5,6,7), NONE),
+        r(phi2(6), 0x1c0, NONE, SPR_DMA2|5, spr3(5,6,7), NONE),
+        r(phi1(7), 0x1c4, NONE, SPR_PTR|6, spr2(6,7), NONE),
+        r(phi2(7), 0x1c8, NONE, SPR_DMA0|6, spr2(6,7), NONE),
+        r(phi1(8), 0x1cc, NONE, SPR_DMA1|6, spr2(6,7), NONE),
+        r(phi2(8), 0x1d0, NONE, SPR_DMA2|6, spr2(6,7), NONE),
+        r(phi1(9), 0x1d4, NONE, SPR_PTR|7, spr1(7), NONE),
+        r(phi2(9), 0x1d8, NONE, SPR_DMA0|7, spr1(7), NONE),
+        r(phi1(10), 0x1dc, NONE, SPR_DMA1|7, spr1(7), NONE),
+        r(phi2(10), 0x1e0, NONE, SPR_DMA2|7, spr1(7), NONE),
+        r(phi1(11), 0x1e4, NONE, REFRESH, NONE, NONE),
+        r(phi2(11), 0x1e8, NONE, NONE, NONE, NONE),
+        r(phi1(12), 0x1ec, NONE, REFRESH, BA_FETCH, NONE),
+        r(phi2(12), 0x1f0, NONE, NONE, BA_FETCH, NONE),
+        r(phi1(13), 0x1f4, NONE, REFRESH, BA_FETCH, NONE),
+        r(phi2(13), 0x000, NONE, NONE, BA_FETCH, NONE),
+        r(phi1(14), 0x004, NONE, REFRESH, BA_FETCH, NONE),
+        r(phi2(14), 0x008, NONE, NONE, BA_FETCH, UPDATE_VC),
+        r(phi1(15), 0x00c, NONE, REFRESH, BA_FETCH, NONE),
+        r(phi2(15), 0x010, NONE, FETCH_C, BA_FETCH, CHK_SPR_CRUNCH),
+        r(phi1(16), 0x014, NONE, FETCH_G, BA_FETCH, NONE),
+        r(phi2(16), 0x018, vis(0), FETCH_C, BA_FETCH, UPDATE_MCBASE),
+        r(phi1(17), 0x01c, vis(0), FETCH_G, BA_FETCH, NONE),
+        r(phi2(17), 0x020, vis(1), FETCH_C, BA_FETCH, CHK_BRD_L1),
+        r(phi1(18), 0x024, vis(1), FETCH_G, BA_FETCH, NONE),
+        r(phi2(18), 0x028, vis(2), FETCH_C, BA_FETCH, CHK_BRD_L0),
+        r(phi1(19), 0x02c, vis(2), FETCH_G, BA_FETCH, NONE),
+        r(phi2(19), 0x030, vis(3), FETCH_C, BA_FETCH, NONE),
+        r(phi1(20), 0x034, vis(3), FETCH_G, BA_FETCH, NONE),
+        r(phi2(20), 0x038, vis(4), FETCH_C, BA_FETCH, NONE),
+        r(phi1(21), 0x03c, vis(4), FETCH_G, BA_FETCH, NONE),
+        r(phi2(21), 0x040, vis(5), FETCH_C, BA_FETCH, NONE),
+        r(phi1(22), 0x044, vis(5), FETCH_G, BA_FETCH, NONE),
+        r(phi2(22), 0x048, vis(6), FETCH_C, BA_FETCH, NONE),
+        r(phi1(23), 0x04c, vis(6), FETCH_G, BA_FETCH, NONE),
+        r(phi2(23), 0x050, vis(7), FETCH_C, BA_FETCH, NONE),
+        r(phi1(24), 0x054, vis(7), FETCH_G, BA_FETCH, NONE),
+        r(phi2(24), 0x058, vis(8), FETCH_C, BA_FETCH, NONE),
+        r(phi1(25), 0x05c, vis(8), FETCH_G, BA_FETCH, NONE),
+        r(phi2(25), 0x060, vis(9), FETCH_C, BA_FETCH, NONE),
+        r(phi1(26), 0x064, vis(9), FETCH_G, BA_FETCH, NONE),
+        r(phi2(26), 0x068, vis(10), FETCH_C, BA_FETCH, NONE),
+        r(phi1(27), 0x06c, vis(10), FETCH_G, BA_FETCH, NONE),
+        r(phi2(27), 0x070, vis(11), FETCH_C, BA_FETCH, NONE),
+        r(phi1(28), 0x074, vis(11), FETCH_G, BA_FETCH, NONE),
+        r(phi2(28), 0x078, vis(12), FETCH_C, BA_FETCH, NONE),
+        r(phi1(29), 0x07c, vis(12), FETCH_G, BA_FETCH, NONE),
+        r(phi2(29), 0x080, vis(13), FETCH_C, BA_FETCH, NONE),
+        r(phi1(30), 0x084, vis(13), FETCH_G, BA_FETCH, NONE),
+        r(phi2(30), 0x088, vis(14), FETCH_C, BA_FETCH, NONE),
+        r(phi1(31), 0x08c, vis(14), FETCH_G, BA_FETCH, NONE),
+        r(phi2(31), 0x090, vis(15), FETCH_C, BA_FETCH, NONE),
+        r(phi1(32), 0x094, vis(15), FETCH_G, BA_FETCH, NONE),
+        r(phi2(32), 0x098, vis(16), FETCH_C, BA_FETCH, NONE),
+        r(phi1(33), 0x09c, vis(16), FETCH_G, BA_FETCH, NONE),
+        r(phi2(33), 0x0a0, vis(17), FETCH_C, BA_FETCH, NONE),
+        r(phi1(34), 0x0a4, vis(17), FETCH_G, BA_FETCH, NONE),
+        r(phi2(34), 0x0a8, vis(18), FETCH_C, BA_FETCH, NONE),
+        r(phi1(35), 0x0ac, vis(18), FETCH_G, BA_FETCH, NONE),
+        r(phi2(35), 0x0b0, vis(19), FETCH_C, BA_FETCH, NONE),
+        r(phi1(36), 0x0b4, vis(19), FETCH_G, BA_FETCH, NONE),
+        r(phi2(36), 0x0b8, vis(20), FETCH_C, BA_FETCH, NONE),
+        r(phi1(37), 0x0bc, vis(20), FETCH_G, BA_FETCH, NONE),
+        r(phi2(37), 0x0c0, vis(21), FETCH_C, BA_FETCH, NONE),
+        r(phi1(38), 0x0c4, vis(21), FETCH_G, BA_FETCH, NONE),
+        r(phi2(38), 0x0c8, vis(22), FETCH_C, BA_FETCH, NONE),
+        r(phi1(39), 0x0cc, vis(22), FETCH_G, BA_FETCH, NONE),
+        r(phi2(39), 0x0d0, vis(23), FETCH_C, BA_FETCH, NONE),
+        r(phi1(40), 0x0d4, vis(23), FETCH_G, BA_FETCH, NONE),
+        r(phi2(40), 0x0d8, vis(24), FETCH_C, BA_FETCH, NONE),
+        r(phi1(41), 0x0dc, vis(24), FETCH_G, BA_FETCH, NONE),
+        r(phi2(41), 0x0e0, vis(25), FETCH_C, BA_FETCH, NONE),
+        r(phi1(42), 0x0e4, vis(25), FETCH_G, BA_FETCH, NONE),
+        r(phi2(42), 0x0e8, vis(26), FETCH_C, BA_FETCH, NONE),
+        r(phi1(43), 0x0ec, vis(26), FETCH_G, BA_FETCH, NONE),
+        r(phi2(43), 0x0f0, vis(27), FETCH_C, BA_FETCH, NONE),
+        r(phi1(44), 0x0f4, vis(27), FETCH_G, BA_FETCH, NONE),
+        r(phi2(44), 0x0f8, vis(28), FETCH_C, BA_FETCH, NONE),
+        r(phi1(45), 0x0fc, vis(28), FETCH_G, BA_FETCH, NONE),
+        r(phi2(45), 0x100, vis(29), FETCH_C, BA_FETCH, NONE),
+        r(phi1(46), 0x104, vis(29), FETCH_G, BA_FETCH, NONE),
+        r(phi2(46), 0x108, vis(30), FETCH_C, BA_FETCH, NONE),
+        r(phi1(47), 0x10c, vis(30), FETCH_G, BA_FETCH, NONE),
+        r(phi2(47), 0x110, vis(31), FETCH_C, BA_FETCH, NONE),
+        r(phi1(48), 0x114, vis(31), FETCH_G, BA_FETCH, NONE),
+        r(phi2(48), 0x118, vis(32), FETCH_C, BA_FETCH, NONE),
+        r(phi1(49), 0x11c, vis(32), FETCH_G, BA_FETCH, NONE),
+        r(phi2(49), 0x120, vis(33), FETCH_C, BA_FETCH, NONE),
+        r(phi1(50), 0x124, vis(33), FETCH_G, BA_FETCH, NONE),
+        r(phi2(50), 0x128, vis(34), FETCH_C, BA_FETCH, NONE),
+        r(phi1(51), 0x12c, vis(34), FETCH_G, BA_FETCH, NONE),
+        r(phi2(51), 0x130, vis(35), FETCH_C, BA_FETCH, NONE),
+        r(phi1(52), 0x134, vis(35), FETCH_G, BA_FETCH, NONE),
+        r(phi2(52), 0x138, vis(36), FETCH_C, BA_FETCH, NONE),
+        r(phi1(53), 0x13c, vis(36), FETCH_G, BA_FETCH, NONE),
+        r(phi2(53), 0x140, vis(37), FETCH_C, BA_FETCH, NONE),
+        r(phi1(54), 0x144, vis(37), FETCH_G, BA_FETCH, NONE),
+        r(phi2(54), 0x148, vis(38), FETCH_C, BA_FETCH, NONE),
+        r(phi1(55), 0x14c, vis(38), FETCH_G, spr1(0), CHK_SPR_DMA),
+        r(phi2(55), 0x150, vis(39), NONE, spr1(0), NONE),
+        r(phi1(56), 0x154, vis(39), IDLE, spr1(0), CHK_SPR_DMA),
+        r(phi2(56), 0x158, NONE, NONE, spr1(0), CHK_BRD_R0|CHK_SPR_EXP),
+        r(phi1(57), 0x15c, NONE, IDLE, spr2(0,1), NONE),
+        r(phi2(57), 0x160, NONE, NONE, spr2(0,1), CHK_BRD_R1),
+        r(phi1(58), 0x164, NONE, SPR_PTR|0, spr2(0,1), CHK_SPR_DISP),
+        r(phi2(58), 0x168, NONE, SPR_DMA0|0, spr2(0,1), UPDATE_RC),
+        r(phi1(59), 0x16c, NONE, SPR_DMA1|0, spr3(0,1,2), NONE),
+        r(phi2(59), 0x170, NONE, SPR_DMA2|0, spr3(0,1,2), NONE),
+        r(phi1(60), 0x174, NONE, SPR_PTR|1, spr2(1,2), NONE),
+        r(phi2(60), 0x178, NONE, SPR_DMA0|1, spr2(1,2), NONE),
+        r(phi1(61), 0x17c, NONE, SPR_DMA1|1, spr3(1,2,3), NONE),
+        r(phi2(61), 0x180, NONE, SPR_DMA2|1, spr3(1,2,3), NONE),
+        r(phi1(62), 0x184, NONE, SPR_PTR|2, spr2(2,3), NONE),
+        r(phi2(62), 0x188, NONE, SPR_DMA0|2, spr2(2,3), NONE),
+        r(phi1(63), 0x18c, NONE, SPR_DMA1|2, spr3(2,3,4), NONE),
+        r(phi2(63), 0x190, NONE, SPR_DMA2|2, spr3(2,3,4), NONE),
     ]
 };
 
-/// Build the compiled 63-entry `cycle_table[]` from `CYCLE_TAB_PAL`.
-/// PORT OF: vicii-chip-model.c:729-809 (the per-cycle Phi1+Phi2 fold).
-fn build_cycle_table() -> [u32; PAL_CYCLES_PER_LINE as usize] {
-    let mut table = [0u32; PAL_CYCLES_PER_LINE as usize];
-    for cyc in 0..PAL_CYCLES_PER_LINE as usize {
-        let phi1 = &CYCLE_TAB_PAL[cyc * 2]; // Phi1 row
-        let phi2 = &CYCLE_TAB_PAL[cyc * 2 + 1]; // Phi2 row
-        let f = (phi1.flags | phi2.flags) as u32;
+/// PORT OF: `vicii-chip-model.c` `cycle_tab_ntsc` — 130 rows (65 cycles, Φ1 then Φ2), every column.
+#[rustfmt::skip]
+pub(crate) const CYCLE_TAB_NTSC: [Row; 130] = {
+    use tab::*;
+    [
+        r(phi1(1), 0x19c, NONE, SPR_DMA1|3, spr3(3,4,5), NONE),
+        r(phi2(1), 0x1a0, NONE, SPR_DMA2|3, spr3(3,4,5), NONE),
+        r(phi1(2), 0x1a4, NONE, SPR_PTR|4, spr2(4,5), NONE),
+        r(phi2(2), 0x1a8, NONE, SPR_DMA0|4, spr2(4,5), NONE),
+        r(phi1(3), 0x1ac, NONE, SPR_DMA1|4, spr3(4,5,6), NONE),
+        r(phi2(3), 0x1b0, NONE, SPR_DMA2|4, spr3(4,5,6), NONE),
+        r(phi1(4), 0x1b4, NONE, SPR_PTR|5, spr2(5,6), NONE),
+        r(phi2(4), 0x1b8, NONE, SPR_DMA0|5, spr2(5,6), NONE),
+        r(phi1(5), 0x1bc, NONE, SPR_DMA1|5, spr3(5,6,7), NONE),
+        r(phi2(5), 0x1c0, NONE, SPR_DMA2|5, spr3(5,6,7), NONE),
+        r(phi1(6), 0x1c4, NONE, SPR_PTR|6, spr2(6,7), NONE),
+        r(phi2(6), 0x1c8, NONE, SPR_DMA0|6, spr2(6,7), NONE),
+        r(phi1(7), 0x1cc, NONE, SPR_DMA1|6, spr2(6,7), NONE),
+        r(phi2(7), 0x1d0, NONE, SPR_DMA2|6, spr2(6,7), NONE),
+        r(phi1(8), 0x1d4, NONE, SPR_PTR|7, spr1(7), NONE),
+        r(phi2(8), 0x1d8, NONE, SPR_DMA0|7, spr1(7), NONE),
+        r(phi1(9), 0x1dc, NONE, SPR_DMA1|7, spr1(7), NONE),
+        r(phi2(9), 0x1e0, NONE, SPR_DMA2|7, spr1(7), NONE),
+        r(phi1(10), 0x1e4, NONE, IDLE, NONE, NONE),
+        r(phi2(10), 0x1e8, NONE, NONE, NONE, NONE),
+        r(phi1(11), 0x1ec, NONE, REFRESH, NONE, NONE),
+        r(phi2(11), 0x1f0, NONE, NONE, NONE, NONE),
+        r(phi1(12), 0x1f4, NONE, REFRESH, BA_FETCH, NONE),
+        r(phi2(12), 0x1f8, NONE, NONE, BA_FETCH, NONE),
+        r(phi1(13), 0x1fc, NONE, REFRESH, BA_FETCH, NONE),
+        r(phi2(13), 0x000, NONE, NONE, BA_FETCH, NONE),
+        r(phi1(14), 0x004, NONE, REFRESH, BA_FETCH, NONE),
+        r(phi2(14), 0x008, NONE, NONE, BA_FETCH, UPDATE_VC),
+        r(phi1(15), 0x00c, NONE, REFRESH, BA_FETCH, NONE),
+        r(phi2(15), 0x010, NONE, FETCH_C, BA_FETCH, CHK_SPR_CRUNCH),
+        r(phi1(16), 0x014, NONE, FETCH_G, BA_FETCH, NONE),
+        r(phi2(16), 0x018, vis(0), FETCH_C, BA_FETCH, UPDATE_MCBASE),
+        r(phi1(17), 0x01c, vis(0), FETCH_G, BA_FETCH, NONE),
+        r(phi2(17), 0x020, vis(1), FETCH_C, BA_FETCH, CHK_BRD_L1),
+        r(phi1(18), 0x024, vis(1), FETCH_G, BA_FETCH, NONE),
+        r(phi2(18), 0x028, vis(2), FETCH_C, BA_FETCH, CHK_BRD_L0),
+        r(phi1(19), 0x02c, vis(2), FETCH_G, BA_FETCH, NONE),
+        r(phi2(19), 0x030, vis(3), FETCH_C, BA_FETCH, NONE),
+        r(phi1(20), 0x034, vis(3), FETCH_G, BA_FETCH, NONE),
+        r(phi2(20), 0x038, vis(4), FETCH_C, BA_FETCH, NONE),
+        r(phi1(21), 0x03c, vis(4), FETCH_G, BA_FETCH, NONE),
+        r(phi2(21), 0x040, vis(5), FETCH_C, BA_FETCH, NONE),
+        r(phi1(22), 0x044, vis(5), FETCH_G, BA_FETCH, NONE),
+        r(phi2(22), 0x048, vis(6), FETCH_C, BA_FETCH, NONE),
+        r(phi1(23), 0x04c, vis(6), FETCH_G, BA_FETCH, NONE),
+        r(phi2(23), 0x050, vis(7), FETCH_C, BA_FETCH, NONE),
+        r(phi1(24), 0x054, vis(7), FETCH_G, BA_FETCH, NONE),
+        r(phi2(24), 0x058, vis(8), FETCH_C, BA_FETCH, NONE),
+        r(phi1(25), 0x05c, vis(8), FETCH_G, BA_FETCH, NONE),
+        r(phi2(25), 0x060, vis(9), FETCH_C, BA_FETCH, NONE),
+        r(phi1(26), 0x064, vis(9), FETCH_G, BA_FETCH, NONE),
+        r(phi2(26), 0x068, vis(10), FETCH_C, BA_FETCH, NONE),
+        r(phi1(27), 0x06c, vis(10), FETCH_G, BA_FETCH, NONE),
+        r(phi2(27), 0x070, vis(11), FETCH_C, BA_FETCH, NONE),
+        r(phi1(28), 0x074, vis(11), FETCH_G, BA_FETCH, NONE),
+        r(phi2(28), 0x078, vis(12), FETCH_C, BA_FETCH, NONE),
+        r(phi1(29), 0x07c, vis(12), FETCH_G, BA_FETCH, NONE),
+        r(phi2(29), 0x080, vis(13), FETCH_C, BA_FETCH, NONE),
+        r(phi1(30), 0x084, vis(13), FETCH_G, BA_FETCH, NONE),
+        r(phi2(30), 0x088, vis(14), FETCH_C, BA_FETCH, NONE),
+        r(phi1(31), 0x08c, vis(14), FETCH_G, BA_FETCH, NONE),
+        r(phi2(31), 0x090, vis(15), FETCH_C, BA_FETCH, NONE),
+        r(phi1(32), 0x094, vis(15), FETCH_G, BA_FETCH, NONE),
+        r(phi2(32), 0x098, vis(16), FETCH_C, BA_FETCH, NONE),
+        r(phi1(33), 0x09c, vis(16), FETCH_G, BA_FETCH, NONE),
+        r(phi2(33), 0x0a0, vis(17), FETCH_C, BA_FETCH, NONE),
+        r(phi1(34), 0x0a4, vis(17), FETCH_G, BA_FETCH, NONE),
+        r(phi2(34), 0x0a8, vis(18), FETCH_C, BA_FETCH, NONE),
+        r(phi1(35), 0x0ac, vis(18), FETCH_G, BA_FETCH, NONE),
+        r(phi2(35), 0x0b0, vis(19), FETCH_C, BA_FETCH, NONE),
+        r(phi1(36), 0x0b4, vis(19), FETCH_G, BA_FETCH, NONE),
+        r(phi2(36), 0x0b8, vis(20), FETCH_C, BA_FETCH, NONE),
+        r(phi1(37), 0x0bc, vis(20), FETCH_G, BA_FETCH, NONE),
+        r(phi2(37), 0x0c0, vis(21), FETCH_C, BA_FETCH, NONE),
+        r(phi1(38), 0x0c4, vis(21), FETCH_G, BA_FETCH, NONE),
+        r(phi2(38), 0x0c8, vis(22), FETCH_C, BA_FETCH, NONE),
+        r(phi1(39), 0x0cc, vis(22), FETCH_G, BA_FETCH, NONE),
+        r(phi2(39), 0x0d0, vis(23), FETCH_C, BA_FETCH, NONE),
+        r(phi1(40), 0x0d4, vis(23), FETCH_G, BA_FETCH, NONE),
+        r(phi2(40), 0x0d8, vis(24), FETCH_C, BA_FETCH, NONE),
+        r(phi1(41), 0x0dc, vis(24), FETCH_G, BA_FETCH, NONE),
+        r(phi2(41), 0x0e0, vis(25), FETCH_C, BA_FETCH, NONE),
+        r(phi1(42), 0x0e4, vis(25), FETCH_G, BA_FETCH, NONE),
+        r(phi2(42), 0x0e8, vis(26), FETCH_C, BA_FETCH, NONE),
+        r(phi1(43), 0x0ec, vis(26), FETCH_G, BA_FETCH, NONE),
+        r(phi2(43), 0x0f0, vis(27), FETCH_C, BA_FETCH, NONE),
+        r(phi1(44), 0x0f4, vis(27), FETCH_G, BA_FETCH, NONE),
+        r(phi2(44), 0x0f8, vis(28), FETCH_C, BA_FETCH, NONE),
+        r(phi1(45), 0x0fc, vis(28), FETCH_G, BA_FETCH, NONE),
+        r(phi2(45), 0x100, vis(29), FETCH_C, BA_FETCH, NONE),
+        r(phi1(46), 0x104, vis(29), FETCH_G, BA_FETCH, NONE),
+        r(phi2(46), 0x108, vis(30), FETCH_C, BA_FETCH, NONE),
+        r(phi1(47), 0x10c, vis(30), FETCH_G, BA_FETCH, NONE),
+        r(phi2(47), 0x110, vis(31), FETCH_C, BA_FETCH, NONE),
+        r(phi1(48), 0x114, vis(31), FETCH_G, BA_FETCH, NONE),
+        r(phi2(48), 0x118, vis(32), FETCH_C, BA_FETCH, NONE),
+        r(phi1(49), 0x11c, vis(32), FETCH_G, BA_FETCH, NONE),
+        r(phi2(49), 0x120, vis(33), FETCH_C, BA_FETCH, NONE),
+        r(phi1(50), 0x124, vis(33), FETCH_G, BA_FETCH, NONE),
+        r(phi2(50), 0x128, vis(34), FETCH_C, BA_FETCH, NONE),
+        r(phi1(51), 0x12c, vis(34), FETCH_G, BA_FETCH, NONE),
+        r(phi2(51), 0x130, vis(35), FETCH_C, BA_FETCH, NONE),
+        r(phi1(52), 0x134, vis(35), FETCH_G, BA_FETCH, NONE),
+        r(phi2(52), 0x138, vis(36), FETCH_C, BA_FETCH, NONE),
+        r(phi1(53), 0x13c, vis(36), FETCH_G, BA_FETCH, NONE),
+        r(phi2(53), 0x140, vis(37), FETCH_C, BA_FETCH, NONE),
+        r(phi1(54), 0x144, vis(37), FETCH_G, BA_FETCH, NONE),
+        r(phi2(54), 0x148, vis(38), FETCH_C, BA_FETCH, NONE),
+        r(phi1(55), 0x14c, vis(38), FETCH_G, NONE, NONE),
+        r(phi2(55), 0x150, vis(39), NONE, NONE, NONE),
+        r(phi1(56), 0x154, vis(39), IDLE, spr1(0), CHK_SPR_DMA),
+        r(phi2(56), 0x158, NONE, NONE, spr1(0), CHK_BRD_R0|CHK_SPR_EXP),
+        r(phi1(57), 0x15c, NONE, IDLE, spr1(0), CHK_SPR_DMA),
+        r(phi2(57), 0x160, NONE, NONE, spr1(0), CHK_BRD_R1),
+        r(phi1(58), 0x164, NONE, IDLE, spr2(0,1), NONE),
+        r(phi2(58), 0x168, NONE, NONE, spr2(0,1), UPDATE_RC),
+        r(phi1(59), 0x16c, NONE, SPR_PTR|0, spr2(0,1), CHK_SPR_DISP),
+        r(phi2(59), 0x170, NONE, SPR_DMA0|0, spr2(0,1), NONE),
+        r(phi1(60), 0x174, NONE, SPR_DMA1|0, spr3(0,1,2), NONE),
+        r(phi2(60), 0x178, NONE, SPR_DMA2|0, spr3(0,1,2), NONE),
+        r(phi1(61), 0x17c, NONE, SPR_PTR|1, spr2(1,2), NONE),
+        r(phi2(61), 0x180, NONE, SPR_DMA0|1, spr2(1,2), NONE),
+        r(phi1(62), 0x184, NONE, SPR_DMA1|1, spr3(1,2,3), NONE),
+        r(phi2(62), 0x184, NONE, SPR_DMA2|1, spr3(1,2,3), NONE),
+        r(phi1(63), 0x184, NONE, SPR_PTR|2, spr2(2,3), NONE),
+        r(phi2(63), 0x188, NONE, SPR_DMA0|2, spr2(2,3), NONE),
+        r(phi1(64), 0x18c, NONE, SPR_DMA1|2, spr3(2,3,4), NONE),
+        r(phi2(64), 0x190, NONE, SPR_DMA2|2, spr3(2,3,4), NONE),
+        r(phi1(65), 0x194, NONE, SPR_PTR|3, spr2(3,4), NONE),
+        r(phi2(65), 0x198, NONE, SPR_DMA0|3, spr2(3,4), NONE),
+    ]
+};
 
+/// PORT OF: `vicii-chip-model.c` `cycle_tab_ntsc_old` — 128 rows (64 cycles, Φ1 then Φ2), every column.
+#[rustfmt::skip]
+pub(crate) const CYCLE_TAB_NTSC_OLD: [Row; 128] = {
+    use tab::*;
+    [
+        r(phi1(1), 0x19c, NONE, SPR_PTR|3, spr2(3,4), NONE),
+        r(phi2(1), 0x1a0, NONE, SPR_DMA0|3, spr2(3,4), NONE),
+        r(phi1(2), 0x1a4, NONE, SPR_DMA1|3, spr3(3,4,5), NONE),
+        r(phi2(2), 0x1a8, NONE, SPR_DMA2|3, spr3(3,4,5), NONE),
+        r(phi1(3), 0x1ac, NONE, SPR_PTR|4, spr2(4,5), NONE),
+        r(phi2(3), 0x1b0, NONE, SPR_DMA0|4, spr2(4,5), NONE),
+        r(phi1(4), 0x1b4, NONE, SPR_DMA1|4, spr3(4,5,6), NONE),
+        r(phi2(4), 0x1b8, NONE, SPR_DMA2|4, spr3(4,5,6), NONE),
+        r(phi1(5), 0x1bc, NONE, SPR_PTR|5, spr2(5,6), NONE),
+        r(phi2(5), 0x1c0, NONE, SPR_DMA0|5, spr2(5,6), NONE),
+        r(phi1(6), 0x1c4, NONE, SPR_DMA1|5, spr3(5,6,7), NONE),
+        r(phi2(6), 0x1c8, NONE, SPR_DMA2|5, spr3(5,6,7), NONE),
+        r(phi1(7), 0x1cc, NONE, SPR_PTR|6, spr2(6,7), NONE),
+        r(phi2(7), 0x1d0, NONE, SPR_DMA0|6, spr2(6,7), NONE),
+        r(phi1(8), 0x1d4, NONE, SPR_DMA1|6, spr2(6,7), NONE),
+        r(phi2(8), 0x1d8, NONE, SPR_DMA2|6, spr2(6,7), NONE),
+        r(phi1(9), 0x1dc, NONE, SPR_PTR|7, spr1(7), NONE),
+        r(phi2(9), 0x1e0, NONE, SPR_DMA0|7, spr1(7), NONE),
+        r(phi1(10), 0x1e4, NONE, SPR_DMA1|7, spr1(7), NONE),
+        r(phi2(10), 0x1e8, NONE, SPR_DMA2|7, spr1(7), NONE),
+        r(phi1(11), 0x1ec, NONE, REFRESH, NONE, NONE),
+        r(phi2(11), 0x1f0, NONE, NONE, NONE, NONE),
+        r(phi1(12), 0x1f4, NONE, REFRESH, BA_FETCH, NONE),
+        r(phi2(12), 0x1f8, NONE, NONE, BA_FETCH, NONE),
+        r(phi1(13), 0x1fc, NONE, REFRESH, BA_FETCH, NONE),
+        r(phi2(13), 0x000, NONE, NONE, BA_FETCH, NONE),
+        r(phi1(14), 0x004, NONE, REFRESH, BA_FETCH, NONE),
+        r(phi2(14), 0x008, NONE, NONE, BA_FETCH, UPDATE_VC),
+        r(phi1(15), 0x00c, NONE, REFRESH, BA_FETCH, NONE),
+        r(phi2(15), 0x010, NONE, FETCH_C, BA_FETCH, CHK_SPR_CRUNCH),
+        r(phi1(16), 0x014, NONE, FETCH_G, BA_FETCH, NONE),
+        r(phi2(16), 0x018, vis(0), FETCH_C, BA_FETCH, UPDATE_MCBASE),
+        r(phi1(17), 0x01c, vis(0), FETCH_G, BA_FETCH, NONE),
+        r(phi2(17), 0x020, vis(1), FETCH_C, BA_FETCH, CHK_BRD_L1),
+        r(phi1(18), 0x024, vis(1), FETCH_G, BA_FETCH, NONE),
+        r(phi2(18), 0x028, vis(2), FETCH_C, BA_FETCH, CHK_BRD_L0),
+        r(phi1(19), 0x02c, vis(2), FETCH_G, BA_FETCH, NONE),
+        r(phi2(19), 0x030, vis(3), FETCH_C, BA_FETCH, NONE),
+        r(phi1(20), 0x034, vis(3), FETCH_G, BA_FETCH, NONE),
+        r(phi2(20), 0x038, vis(4), FETCH_C, BA_FETCH, NONE),
+        r(phi1(21), 0x03c, vis(4), FETCH_G, BA_FETCH, NONE),
+        r(phi2(21), 0x040, vis(5), FETCH_C, BA_FETCH, NONE),
+        r(phi1(22), 0x044, vis(5), FETCH_G, BA_FETCH, NONE),
+        r(phi2(22), 0x048, vis(6), FETCH_C, BA_FETCH, NONE),
+        r(phi1(23), 0x04c, vis(6), FETCH_G, BA_FETCH, NONE),
+        r(phi2(23), 0x050, vis(7), FETCH_C, BA_FETCH, NONE),
+        r(phi1(24), 0x054, vis(7), FETCH_G, BA_FETCH, NONE),
+        r(phi2(24), 0x058, vis(8), FETCH_C, BA_FETCH, NONE),
+        r(phi1(25), 0x05c, vis(8), FETCH_G, BA_FETCH, NONE),
+        r(phi2(25), 0x060, vis(9), FETCH_C, BA_FETCH, NONE),
+        r(phi1(26), 0x064, vis(9), FETCH_G, BA_FETCH, NONE),
+        r(phi2(26), 0x068, vis(10), FETCH_C, BA_FETCH, NONE),
+        r(phi1(27), 0x06c, vis(10), FETCH_G, BA_FETCH, NONE),
+        r(phi2(27), 0x070, vis(11), FETCH_C, BA_FETCH, NONE),
+        r(phi1(28), 0x074, vis(11), FETCH_G, BA_FETCH, NONE),
+        r(phi2(28), 0x078, vis(12), FETCH_C, BA_FETCH, NONE),
+        r(phi1(29), 0x07c, vis(12), FETCH_G, BA_FETCH, NONE),
+        r(phi2(29), 0x080, vis(13), FETCH_C, BA_FETCH, NONE),
+        r(phi1(30), 0x084, vis(13), FETCH_G, BA_FETCH, NONE),
+        r(phi2(30), 0x088, vis(14), FETCH_C, BA_FETCH, NONE),
+        r(phi1(31), 0x08c, vis(14), FETCH_G, BA_FETCH, NONE),
+        r(phi2(31), 0x090, vis(15), FETCH_C, BA_FETCH, NONE),
+        r(phi1(32), 0x094, vis(15), FETCH_G, BA_FETCH, NONE),
+        r(phi2(32), 0x098, vis(16), FETCH_C, BA_FETCH, NONE),
+        r(phi1(33), 0x09c, vis(16), FETCH_G, BA_FETCH, NONE),
+        r(phi2(33), 0x0a0, vis(17), FETCH_C, BA_FETCH, NONE),
+        r(phi1(34), 0x0a4, vis(17), FETCH_G, BA_FETCH, NONE),
+        r(phi2(34), 0x0a8, vis(18), FETCH_C, BA_FETCH, NONE),
+        r(phi1(35), 0x0ac, vis(18), FETCH_G, BA_FETCH, NONE),
+        r(phi2(35), 0x0b0, vis(19), FETCH_C, BA_FETCH, NONE),
+        r(phi1(36), 0x0b4, vis(19), FETCH_G, BA_FETCH, NONE),
+        r(phi2(36), 0x0b8, vis(20), FETCH_C, BA_FETCH, NONE),
+        r(phi1(37), 0x0bc, vis(20), FETCH_G, BA_FETCH, NONE),
+        r(phi2(37), 0x0c0, vis(21), FETCH_C, BA_FETCH, NONE),
+        r(phi1(38), 0x0c4, vis(21), FETCH_G, BA_FETCH, NONE),
+        r(phi2(38), 0x0c8, vis(22), FETCH_C, BA_FETCH, NONE),
+        r(phi1(39), 0x0cc, vis(22), FETCH_G, BA_FETCH, NONE),
+        r(phi2(39), 0x0d0, vis(23), FETCH_C, BA_FETCH, NONE),
+        r(phi1(40), 0x0d4, vis(23), FETCH_G, BA_FETCH, NONE),
+        r(phi2(40), 0x0d8, vis(24), FETCH_C, BA_FETCH, NONE),
+        r(phi1(41), 0x0dc, vis(24), FETCH_G, BA_FETCH, NONE),
+        r(phi2(41), 0x0e0, vis(25), FETCH_C, BA_FETCH, NONE),
+        r(phi1(42), 0x0e4, vis(25), FETCH_G, BA_FETCH, NONE),
+        r(phi2(42), 0x0e8, vis(26), FETCH_C, BA_FETCH, NONE),
+        r(phi1(43), 0x0ec, vis(26), FETCH_G, BA_FETCH, NONE),
+        r(phi2(43), 0x0f0, vis(27), FETCH_C, BA_FETCH, NONE),
+        r(phi1(44), 0x0f4, vis(27), FETCH_G, BA_FETCH, NONE),
+        r(phi2(44), 0x0f8, vis(28), FETCH_C, BA_FETCH, NONE),
+        r(phi1(45), 0x0fc, vis(28), FETCH_G, BA_FETCH, NONE),
+        r(phi2(45), 0x100, vis(29), FETCH_C, BA_FETCH, NONE),
+        r(phi1(46), 0x104, vis(29), FETCH_G, BA_FETCH, NONE),
+        r(phi2(46), 0x108, vis(30), FETCH_C, BA_FETCH, NONE),
+        r(phi1(47), 0x10c, vis(30), FETCH_G, BA_FETCH, NONE),
+        r(phi2(47), 0x110, vis(31), FETCH_C, BA_FETCH, NONE),
+        r(phi1(48), 0x114, vis(31), FETCH_G, BA_FETCH, NONE),
+        r(phi2(48), 0x118, vis(32), FETCH_C, BA_FETCH, NONE),
+        r(phi1(49), 0x11c, vis(32), FETCH_G, BA_FETCH, NONE),
+        r(phi2(49), 0x120, vis(33), FETCH_C, BA_FETCH, NONE),
+        r(phi1(50), 0x124, vis(33), FETCH_G, BA_FETCH, NONE),
+        r(phi2(50), 0x128, vis(34), FETCH_C, BA_FETCH, NONE),
+        r(phi1(51), 0x12c, vis(34), FETCH_G, BA_FETCH, NONE),
+        r(phi2(51), 0x130, vis(35), FETCH_C, BA_FETCH, NONE),
+        r(phi1(52), 0x134, vis(35), FETCH_G, BA_FETCH, NONE),
+        r(phi2(52), 0x138, vis(36), FETCH_C, BA_FETCH, NONE),
+        r(phi1(53), 0x13c, vis(36), FETCH_G, BA_FETCH, NONE),
+        r(phi2(53), 0x140, vis(37), FETCH_C, BA_FETCH, NONE),
+        r(phi1(54), 0x144, vis(37), FETCH_G, BA_FETCH, NONE),
+        r(phi2(54), 0x148, vis(38), FETCH_C, BA_FETCH, NONE),
+        r(phi1(55), 0x14c, vis(38), FETCH_G, NONE, NONE),
+        r(phi2(55), 0x150, vis(39), NONE, NONE, NONE),
+        r(phi1(56), 0x154, vis(39), IDLE, spr1(0), CHK_SPR_DMA),
+        r(phi2(56), 0x158, NONE, NONE, spr1(0), CHK_BRD_R0|CHK_SPR_EXP),
+        r(phi1(57), 0x15c, NONE, IDLE, spr1(0), CHK_SPR_DMA),
+        r(phi2(57), 0x160, NONE, NONE, spr1(0), CHK_BRD_R1),
+        r(phi1(58), 0x164, NONE, IDLE, spr2(0,1), CHK_SPR_DISP),
+        r(phi2(58), 0x168, NONE, NONE, spr2(0,1), UPDATE_RC),
+        r(phi1(59), 0x16c, NONE, SPR_PTR|0, spr2(0,1), NONE),
+        r(phi2(59), 0x170, NONE, SPR_DMA0|0, spr2(0,1), NONE),
+        r(phi1(60), 0x174, NONE, SPR_DMA1|0, spr3(0,1,2), NONE),
+        r(phi2(60), 0x178, NONE, SPR_DMA2|0, spr3(0,1,2), NONE),
+        r(phi1(61), 0x17c, NONE, SPR_PTR|1, spr2(1,2), NONE),
+        r(phi2(61), 0x180, NONE, SPR_DMA0|1, spr2(1,2), NONE),
+        r(phi1(62), 0x184, NONE, SPR_DMA1|1, spr3(1,2,3), NONE),
+        r(phi2(62), 0x188, NONE, SPR_DMA2|1, spr3(1,2,3), NONE),
+        r(phi1(63), 0x18c, NONE, SPR_PTR|2, spr2(2,3), NONE),
+        r(phi2(63), 0x190, NONE, SPR_DMA0|2, spr2(2,3), NONE),
+        r(phi1(64), 0x194, NONE, SPR_DMA1|2, spr3(2,3,4), NONE),
+        r(phi2(64), 0x198, NONE, SPR_DMA2|2, spr3(2,3,4), NONE),
+    ]
+};
+
+/// The source rows of a family.
+pub fn cycle_tab(family: CycleFamily) -> &'static [Row] {
+    match family {
+        CycleFamily::Pal => &CYCLE_TAB_PAL,
+        CycleFamily::Ntsc => &CYCLE_TAB_NTSC,
+        CycleFamily::NtscOld => &CYCLE_TAB_NTSC_OLD,
+    }
+}
+
+/// Build the compiled `cycle_table[]` of a family (entries past its `cycles_per_line`
+/// stay 0 and never run).
+/// PORT OF: vicii-chip-model.c:579-811 `vicii_chip_model_set` (the per-cycle Phi1+Phi2
+/// fold): walk the rows, collect each phase's columns by the row's own phase bit, and on
+/// the Phi2 row write `cycle_table[cycle - 1]`.
+pub fn build_cycle_table(family: CycleFamily) -> [u32; MAX_CYCLES_PER_LINE] {
+    let mut table = [0u32; MAX_CYCLES_PER_LINE];
+    let mut xpos_phi = [0u16; 2];
+    let mut fetch_phi = [0u16; 2];
+    let mut ba_phi = [0u16; 2];
+    let mut flags_phi = [0u16; 2];
+    for row in cycle_tab(family) {
+        let phi = if row.cycle & 0x80 != 0 { 1 } else { 0 };
+        let cycle = (row.cycle & 0x7f) as usize;
+        xpos_phi[phi] = row.xpos;
+        fetch_phi[phi] = row.fetch;
+        ba_phi[phi] = row.ba;
+        flags_phi[phi] = row.flags;
+        if phi == 0 {
+            continue;
+        }
+        let f = (flags_phi[0] | flags_phi[1]) as u32;
         let mut entry: u32 = 0;
 
         // chip-model.c:735-736 — BA from Phi1.
-        entry |= ((phi1.ba & tab::BA_SPR_M) as u32) << SPRITE_BA_MASK_B;
-        entry |= if phi1.ba & tab::BA_FETCH != 0 { FETCH_BA_M } else { 0 };
+        entry |= ((ba_phi[0] & tab::BA_SPR_M) as u32) << SPRITE_BA_MASK_B;
+        entry |= if ba_phi[0] & tab::BA_FETCH != 0 { FETCH_BA_M } else { 0 };
 
         // chip-model.c:738-760 — Phi1 fetch type → PHI1_* + sprite num.
-        match phi1.fetch & tab::FETCH_TYPE_M {
+        match fetch_phi[0] & tab::FETCH_TYPE_M {
             tab::SPR_PTR => {
                 entry |= PHI1_SPR_PTR;
-                entry |= ((phi1.fetch & tab::FETCH_SPR_NUM_M) as u32) << PHI1_SPR_NUM_B;
+                entry |= ((fetch_phi[0] & tab::FETCH_SPR_NUM_M) as u32) << PHI1_SPR_NUM_B;
             }
             tab::SPR_DMA1 => {
                 entry |= PHI1_SPR_DMA1;
-                entry |= ((phi1.fetch & tab::FETCH_SPR_NUM_M) as u32) << PHI1_SPR_NUM_B;
+                entry |= ((fetch_phi[0] & tab::FETCH_SPR_NUM_M) as u32) << PHI1_SPR_NUM_B;
             }
             tab::REFRESH => entry |= PHI1_REFRESH,
             tab::FETCH_G => entry |= PHI1_FETCH_G,
             _ => entry |= PHI1_IDLE,
         }
 
-        // chip-model.c:761-765 — FetchC (Phi2) → PHI2_FETCH_C_M | VISIBLE_M.
-        // (VICE sets VISIBLE_M *only* from FetchC; the cycle_tab `visible` column is
-        // cosmetic/log-only — vicii_chip_model_set never reads it. So this single
-        // FetchC test is the complete + verbatim VISIBLE_M encode.)
-        if phi2.fetch & tab::FETCH_TYPE_M == tab::FETCH_C {
+        // chip-model.c:761-765 — FetchC (Phi2) → PHI2_FETCH_C_M | VISIBLE_M. (VICE sets
+        // VISIBLE_M only from FetchC; the `visible` column is log-only.)
+        if fetch_phi[1] & tab::FETCH_TYPE_M == tab::FETCH_C {
             entry |= PHI2_FETCH_C_M;
             entry |= VISIBLE_M;
         }
 
-        // chip-model.c:767 — xpos (Phi1): `entry |= ((xpos>>3) << XPOS_B) & XPOS_M`.
-        // The per-cycle pixel pipeline (vic_draw) reads it via cycle_get_xpos for the
-        // sprite-trigger position. The Phi1 xpos column of cycle_tab_pal is the exact
-        // linear progression `(0x194 + 8*c) % 0x1f8` (verified against all 63 Phi1
-        // rows of chip-model.ts); xpos wraps modulo 0x1f8 (= 63×8). Encoded from the
-        // formula rather than carrying a redundant 126-row column.
-        let xpos_phi1 = (0x194u32 + 8 * cyc as u32) % 0x1f8;
-        entry |= ((xpos_phi1 >> 3) << XPOS_B) & XPOS_M;
+        // chip-model.c:767 — xpos (Phi1): `entry |= ((xpos>>3) << XPOS_B) & XPOS_M`. The
+        // per-cycle pixel pipeline (vic_draw) reads it back via cycle_get_xpos for the
+        // sprite trigger.
+        entry |= (((xpos_phi[0] as u32) >> 3) << XPOS_B) & XPOS_M;
 
         // chip-model.c:769-792 — VC/RC + sprite flags.
         if f & tab::UPDATE_VC as u32 != 0 {
@@ -621,9 +931,104 @@ fn build_cycle_table() -> [u32; PAL_CYCLES_PER_LINE as usize] {
             entry |= CHECK_BRD_R | CHECK_BRD_CSEL;
         }
 
-        table[cyc] = entry;
+        if (1..=MAX_CYCLES_PER_LINE).contains(&cycle) {
+            table[cycle - 1] = entry;
+        }
     }
     table
+}
+
+/// Where, in a family's line, the things a reader of the record looks for happen — read
+/// from the compiled flags, never from literal PAL cycle numbers. 1-based cycles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LineGeometry {
+    pub cycles_per_line: u16,
+    /// First c-access (Φ2 FetchC): 15 on every family.
+    pub first_c: u16,
+    /// First g-access (Φ1 FetchG): 16 on every family.
+    pub first_g: u16,
+    /// Sprite 0's pointer fetch — from here on, a line's sprite fetches serve the NEXT
+    /// line (PAL 58, NTSC 59).
+    pub spr0_ptr: u16,
+    /// The last right-border check (ChkBrdR1, CSEL=1): 57 on every family.
+    pub brd_r1: u16,
+}
+
+impl LineGeometry {
+    pub fn of(family: CycleFamily) -> Self {
+        let t = build_cycle_table(family);
+        let cpl = family.cycles_per_line();
+        let find = |p: &dyn Fn(u32) -> bool| -> u16 {
+            (0..cpl as usize).find(|&i| p(t[i])).map(|i| i as u16 + 1).unwrap_or(0)
+        };
+        LineGeometry {
+            cycles_per_line: cpl,
+            first_c: find(&|f| cycle_may_fetch_c(f)),
+            first_g: find(&|f| cycle_is_fetch_g(f)),
+            spr0_ptr: find(&|f| cycle_is_sprite_ptr_dma0(f) && cycle_get_sprite_num(f) == 0),
+            brd_r1: find(&|f| f & CHECK_BRD_R != 0 && f & CHECK_BRD_CSEL != 0),
+        }
+    }
+    /// The cycle a line's per-line register state is sampled at: the fifth g-access,
+    /// inside the display fetches and after every pointer fetch that serves the line
+    /// (cycle 20 on every family — the recorder's `LineSprites`).
+    pub fn sample_cycle(&self) -> u16 {
+        self.first_g + 4
+    }
+}
+
+/// The Φ1 rows of a family, in line order: (1-based cycle, xpos, visible column).
+fn phi1_rows(family: CycleFamily) -> impl Iterator<Item = (u16, u16, u16)> {
+    cycle_tab(family)
+        .iter()
+        .filter(|r| r.cycle & 0x80 == 0)
+        .map(|r| (r.cycle as u16, r.xpos, r.visible))
+}
+
+/// Spec 863 — the draw-buffer X of display column 0, from the table: the cycle whose Φ1
+/// row is `Vis(0)` (cycle 17 on every family) × 8 px. The draw buffer's column 0 is the
+/// line's cycle 2 and the draw lags two cycles through the pipeline, so cycle c's pixels
+/// land at 8·c — VICE's `DBUF_OFFSET + screen_leftborderwidth` = 17 · 8 = 136.
+pub fn display_dbuf_x0(family: CycleFamily) -> usize {
+    phi1_rows(family).find(|&(_, _, vis)| vis == tab::vis(0)).map(|(c, _, _)| 8 * c as usize).unwrap_or(0)
+}
+
+/// Spec 863 — the draw-buffer X of sprite X coordinate 0: display column 0 is where the
+/// sprite coordinate is the xpos of that same Φ1 row ($1C → 24), so X 0 lies 24 px left
+/// of it (112 on every family).
+pub fn sprite_dbuf_x0(family: CycleFamily) -> usize {
+    let (_, xpos, _) = phi1_rows(family).find(|&(_, _, vis)| vis == tab::vis(0)).unwrap_or((0, 0, 0));
+    display_dbuf_x0(family) - (xpos & 0x1f8) as usize
+}
+
+/// Spec 863 — the draw-buffer X a sprite with X coordinate `x` starts at, from the family's
+/// xpos column. The coordinate runs 8 px per cycle from X 0; where the table repeats an
+/// xpos (NTSC: $184 on Φ1 62 and Φ1 63), every coordinate past it lands one cycle — 8 px —
+/// further right. PAL has no repeat, so this is `112 + x`, the calibrated line it always
+/// was (including its straight continuation past the line end).
+pub fn sprite_dbuf_x(family: CycleFamily, x: u16) -> usize {
+    let bucket = x & 0x1f8;
+    let rows: Vec<(u16, u16, u16)> = phi1_rows(family).collect();
+    let start = rows.iter().position(|&(_, xpos, _)| xpos & 0x1f8 == 0).unwrap_or(0);
+    let mut repeats = 0usize;
+    let mut prev: Option<u16> = None;
+    for k in 0..rows.len() {
+        let b = rows[(start + k) % rows.len()].1 & 0x1f8;
+        if let Some(p) = prev {
+            if b == p {
+                repeats += 1;
+                continue;
+            }
+            if b < p {
+                break; // xpos wrapped: `x` lies past the line, continue straight
+            }
+        }
+        if b >= bucket {
+            break;
+        }
+        prev = Some(b);
+    }
+    sprite_dbuf_x0(family) + x as usize + 8 * repeats
 }
 
 // =============================================================================
@@ -752,10 +1157,10 @@ pub struct VicII {
     /// `vic_inspect` had a `ProvenanceLine` type and a per-line override that could
     /// never fire: nothing ever wrote the record.
     ///
-    /// One entry per PAL raster line, rewritten in place each frame — no allocation
-    /// per frame (Spec 765's rule), and the array is exactly the shape the inspect
-    /// resolver already parses.
-    pub provenance: [ProvenanceRegs; PAL_SCREEN_HEIGHT as usize],
+    /// One entry per raster line (sized for the tallest frame a model has), rewritten
+    /// in place each frame — no allocation per frame (Spec 765's rule), and the array is
+    /// exactly the shape the inspect resolver already parses.
+    pub provenance: [ProvenanceRegs; MAX_RASTER_LINES],
 
     /// Spec 859 — the per-cycle recorder, armed only inside a scratch replay
     /// (`vic_line_trace::record_frame`). `None` on the live path: the two hooks in `tick`
@@ -871,7 +1276,8 @@ pub struct VicII {
     pub vbuf: [u8; 40],
     /// Colour line buffer (vicii.cbuf[40]) — low nibble per cell.
     pub cbuf: [u8; 40],
-    /// Chip color latency (vicii.color_latency): true = 6569 PAL (the live path).
+    /// Chip color latency (vicii.color_latency): true = the 6569 family (6569, 6567R8,
+    /// 6572), false = the 8565/8562 path. The model's (Spec 863).
     pub color_latency: bool,
 
     // ── Per-cycle pixel pipeline state (vicii-draw-cycle.c module statics) ─────
@@ -933,12 +1339,23 @@ pub struct VicII {
     /// dbuf_offset reset so the lagged draw lands on the right line).
     pub(crate) dbuf_line: usize,
 
-    /// Compiled PAL cycle table (vicii.cycle_table). Built at `new()`.
-    cycle_table: [u32; PAL_CYCLES_PER_LINE as usize],
-    /// cycles_per_line (vicii.cycles_per_line) — 63 PAL.
+    /// Compiled cycle table (vicii.cycle_table) of the model's family. Spec 863: data the
+    /// VIC indexes, not part of the type — `cycles_per_line` decides how many entries run.
+    cycle_table: [u32; MAX_CYCLES_PER_LINE],
+    /// cycles_per_line (vicii.cycles_per_line) — 63 PAL, 65 NTSC.
     cycles_per_line: u16,
-    /// screen_height (vicii.screen_height) — 312 PAL.
+    /// screen_height (vicii.screen_height) — 312 PAL, 263 NTSC.
     screen_height: u16,
+    /// The family `cycle_table` was built from.
+    family: CycleFamily,
+    /// The displayed window (the model's). A wrapped window (NTSC) draws the frame's
+    /// first lines below its last, and the displayed buffer swaps at its vsync line
+    /// instead of at the frame wrap (VICE `vicii.c:440-452`).
+    window: DisplayWindow,
+    /// Where the recorder's per-line reads happen, from the table's flags.
+    pub(crate) geom: LineGeometry,
+    /// The row all of the above came from.
+    model: &'static crate::model::C64Model,
 }
 
 impl Default for VicII {
@@ -948,12 +1365,18 @@ impl Default for VicII {
 }
 
 impl VicII {
-    /// PORT OF: vicii_init (vicii.c) + vicii_reset (viciisc/vicii.c:77-133) +
-    /// vicii.c:240 sprite exp_flop=1 + the chip-model build. Power-on defaults.
+    /// A power-on VIC-II of the default model (`c64-pal`).
     pub fn new() -> Self {
+        Self::new_for(crate::model::default_model())
+    }
+
+    /// PORT OF: vicii_init (vicii.c) + vicii_reset (viciisc/vicii.c:77-133) +
+    /// vicii.c:240 sprite exp_flop=1 + the chip-model build (`vicii_chip_model_set`,
+    /// Spec 863: the model's row). Power-on defaults.
+    pub fn new_for(model: &'static crate::model::C64Model) -> Self {
         let mut v = VicII {
             regs: [0u8; 0x40],
-            provenance: [ProvenanceRegs::default(); PAL_SCREEN_HEIGHT as usize],
+            provenance: [ProvenanceRegs::default(); MAX_RASTER_LINES],
             line_rec: None,
             speed_profile: SpeedProfile::C64,
             fastmode: 0,
@@ -998,7 +1421,7 @@ impl VicII {
             gbuf: 0,
             vbuf: [0u8; 40],
             cbuf: [0u8; 40],
-            color_latency: true, // 6569 PAL (chip_model_mos6569r3.color_latency = 1).
+            color_latency: model.color_latency,
             // Draw-pipeline state (vicii_draw_cycle_init, vicii-draw-cycle.ts:736-755).
             gbuf_pipe0_reg: 0,
             cbuf_pipe0_reg: 0,
@@ -1041,9 +1464,13 @@ impl VicII {
             displayed: Box::new([0u8; crate::render::FB_W * crate::render::FB_H]),
             dbuf_offset: 0,
             dbuf_line: 0,
-            cycle_table: build_cycle_table(),
-            cycles_per_line: PAL_CYCLES_PER_LINE,
-            screen_height: PAL_SCREEN_HEIGHT,
+            cycle_table: build_cycle_table(model.cycle_family),
+            cycles_per_line: model.timing.cycles_per_line,
+            screen_height: model.timing.lines_per_frame,
+            family: model.cycle_family,
+            window: model.window,
+            geom: LineGeometry::of(model.cycle_family),
+            model,
         };
         // vicii.c:240 — Y-expansion flip-flops init to 1.
         for s in v.sprite.iter_mut() {
@@ -1056,6 +1483,86 @@ impl VicII {
             v.cregs[i] = i as u8;
         }
         v
+    }
+
+    /// Spec 863 — put a RUNNING chip on another model's geometry, keeping every value it
+    /// holds (registers, counters, sprite and draw state, both framebuffers). The table,
+    /// the line length, the frame height, the colour-latency path and the window are the
+    /// row's from here on; the flags of the cycle in hand are re-read from the new table,
+    /// since the old table's entry for this cycle means something else in the new one.
+    ///
+    /// The caller stands the chip where both geometries agree it can be — the frame
+    /// boundary — and [`fits`](Self::fits) says whether it does.
+    pub fn set_model(&mut self, model: &'static crate::model::C64Model) {
+        let changed = self.family != model.cycle_family;
+        self.cycle_table = build_cycle_table(model.cycle_family);
+        self.cycles_per_line = model.timing.cycles_per_line;
+        self.screen_height = model.timing.lines_per_frame;
+        self.family = model.cycle_family;
+        self.window = model.window;
+        self.geom = LineGeometry::of(model.cycle_family);
+        self.color_latency = model.color_latency;
+        self.model = model;
+        if changed {
+            let cpl = self.cycles_per_line as usize;
+            let rc = self.raster_cycle as usize % cpl;
+            self.cycle_flags = self.cycle_table[rc];
+            self.cycle_flags_pipe = self.cycle_table[(rc + cpl - 1) % cpl];
+        }
+    }
+
+    /// Does a raster position exist on this chip's geometry? A restored position that
+    /// does not would index past the cycle table.
+    pub fn fits(&self, raster_line: u16, raster_cycle: u16) -> bool {
+        raster_cycle < self.cycles_per_line && raster_line < self.screen_height
+    }
+
+    /// The row this chip is built on.
+    pub fn model(&self) -> &'static crate::model::C64Model {
+        self.model
+    }
+    pub fn cycles_per_line(&self) -> u16 {
+        self.cycles_per_line
+    }
+    pub fn screen_height(&self) -> u16 {
+        self.screen_height
+    }
+    pub fn cycle_family(&self) -> CycleFamily {
+        self.family
+    }
+    pub fn window(&self) -> &DisplayWindow {
+        &self.window
+    }
+    pub fn line_geometry(&self) -> LineGeometry {
+        self.geom
+    }
+    /// The framebuffer row the line starting now is drawn into (cycle 2, where the draw
+    /// resets its offset).
+    ///
+    /// A wrapped window (NTSC) draws the lines before its first displayed line below the
+    /// frame, as VICE's `raster_draw_buffer_ptr_update` does, so the picture is one
+    /// contiguous run of rows. There the first line of a frame must be counted as line 0:
+    /// the raster counter still reads the last line in this cycle (it resets in the Φ2
+    /// half of it) and line 0 is on screen. A window that ends inside the frame (PAL)
+    /// keeps the historical row — the counter's value — because rows 0 and 311 are
+    /// outside it and the framebuffer bytes stay what they always were.
+    #[inline]
+    pub(crate) fn draw_row(&self) -> usize {
+        if self.window.wraps() {
+            let line = if self.start_of_frame { 0 } else { self.raster_line };
+            self.window.row_of_line(line) as usize
+        } else {
+            self.raster_line as usize
+        }
+    }
+
+    /// The compiled table entry of a 0-based cycle (0 past the line's end).
+    pub fn cycle_table_entry(&self, index: usize) -> u32 {
+        if index < self.cycles_per_line as usize {
+            self.cycle_table[index]
+        } else {
+            0
+        }
     }
 
     // ── .c64re native snapshot: draw-cycle pipeline (additive — ADR-077) ──────
@@ -1330,15 +1837,28 @@ impl VicII {
         // line via vicii_raster_draw_handler; the per-frame swap is the equivalent
         // publish point for our full-frame accumulator.) The now-stale `dbuf` is
         // overwritten line-by-line over the next frame.
-        std::mem::swap(&mut self.dbuf, &mut self.displayed);
+        //
+        // Spec 863 — only where the window ends inside the frame. A wrapped window (NTSC)
+        // shows this frame's first lines at the bottom of the picture, so the picture is
+        // complete at its vsync line, not here (see `vicii_cycle_end_of_line`).
+        if !self.window.wraps() {
+            std::mem::swap(&mut self.dbuf, &mut self.displayed);
+        }
         // light_pen.triggered = 0 / retrigger — deferred (light pen not modeled).
     }
 
     /// PORT OF: vicii-cycle.c:220 vicii_cycle_end_of_line.
     #[inline]
     fn vicii_cycle_end_of_line(&mut self) {
-        // vicii_raster_draw_handler() — frame-buffer flush; deferred (render.rs
-        // draws statically). The start_of_frame latch is the only timing effect.
+        // vicii_raster_draw_handler() — the line just drawn is `raster_line`. On a wrapped
+        // window (NTSC) VICE's vsync comes after the last displayed line, not at line 0
+        // (`vicii.c:448-452`: `current_line == last_displayed_line - screen_height + 1`),
+        // and that is where the picture is complete: publish it here.
+        if let Some(vsync) = self.window.vsync_line() {
+            if self.raster_line + 1 == vsync {
+                std::mem::swap(&mut self.dbuf, &mut self.displayed);
+            }
+        }
         if self.raster_line == self.screen_height - 1 {
             self.start_of_frame = true;
         }
@@ -1474,17 +1994,17 @@ impl VicII {
         // ── End of Phi1 / Start of Phi2 ──
 
         // vicii-cycle.c:448-451 — end-of-line / start-of-line at PAL cycle 1.
-        if self.raster_cycle == pal_cycle(1) {
+        if self.raster_cycle == cycle_index(1) {
             self.vicii_cycle_end_of_line();
             self.vicii_cycle_start_of_line();
         }
 
         // vicii-cycle.c:453-461 — start-of-frame (cycle 2) or raster_line++ (cycle 1).
         if self.start_of_frame {
-            if self.raster_cycle == pal_cycle(2) {
+            if self.raster_cycle == cycle_index(2) {
                 self.vicii_cycle_start_of_frame();
             }
-        } else if self.raster_cycle == pal_cycle(1) {
+        } else if self.raster_cycle == cycle_index(1) {
             self.raster_line += 1;
         }
 
@@ -1501,7 +2021,7 @@ impl VicII {
         // vicii-cycle.c:477-482 — vertical border flags.
         self.check_vborder_top(self.raster_line);
         self.check_vborder_bottom(self.raster_line);
-        if self.raster_cycle == pal_cycle(1) {
+        if self.raster_cycle == cycle_index(1) {
             self.vborder = self.set_vborder;
         }
 
@@ -1717,8 +2237,10 @@ impl VicII {
             g_char: p1.g_char,
             g_color: p1.g_color,
         };
-        // Spec 860 — the line's sprite registers, once per line (cycle 20).
-        let sprites = (self.raster_cycle == 19).then(|| {
+        // Spec 860 — the line's sprite registers, once per line (cycle 20: inside the
+        // display fetches, after every pointer fetch that serves the line — Spec 863 reads
+        // it from the table's flags).
+        let sprites = (self.raster_cycle + 1 == self.geom.sample_cycle()).then(|| {
             let mut x = [0u16; NUM_SPRITES];
             let mut pointer = [0u8; NUM_SPRITES];
             let mut color = [0u8; NUM_SPRITES];
@@ -2415,7 +2937,7 @@ mod tests {
     fn cycle_table_ba_window_matches_vice_pal() {
         // VICE cycle_tab_pal: BaFetch set on PAL cycles 12..54 (table index
         // 11..53) at the matrix-fetch BA, and the sprite BA masks elsewhere.
-        let t = build_cycle_table();
+        let t = build_cycle_table(CycleFamily::Pal);
         // Cycle index 11 (PAL cycle 12) is the first BaFetch.
         assert!(cycle_is_fetch_ba(t[11]), "PAL cycle 12 = first BaFetch");
         assert!(cycle_is_fetch_ba(t[53]), "PAL cycle 54 = last BaFetch");
@@ -2429,7 +2951,7 @@ mod tests {
 
     #[test]
     fn cycle_table_flags_positions() {
-        let t = build_cycle_table();
+        let t = build_cycle_table(CycleFamily::Pal);
         // UpdateVc on PAL cycle 14 (index 13).
         assert!(cycle_is_update_vc(t[13]));
         // UpdateRc + ChkSprDisp on PAL cycle 58 (index 57).
@@ -2488,7 +3010,8 @@ mod tests {
 
     #[test]
     fn pal_frame_is_19656_cycles() {
-        assert_eq!(PAL_CYCLES_PER_LINE as u32 * PAL_SCREEN_HEIGHT as u32, 19656);
+        let v = VicII::new();
+        assert_eq!(v.cycles_per_line() as u32 * v.screen_height() as u32, 19656);
     }
 
     #[test]
@@ -2522,16 +3045,16 @@ mod tests {
             v.tick(&nm());
         }
         let mut ba_cycles = Vec::new();
-        for _ in 0..PAL_CYCLES_PER_LINE {
+        for _ in 0..v.cycles_per_line() {
             let ba = v.tick(&nm());
             if ba {
                 ba_cycles.push(v.raster_cycle);
             }
         }
         // On a badline BA is low for the matrix fetch window: PAL cycles 12..54.
-        assert!(ba_cycles.contains(&pal_cycle(12)), "BA low at cycle 12");
-        assert!(ba_cycles.contains(&pal_cycle(54)), "BA low through cycle 54");
-        assert!(!ba_cycles.contains(&pal_cycle(11)), "BA high at cycle 11 (refresh)");
+        assert!(ba_cycles.contains(&cycle_index(12)), "BA low at cycle 12");
+        assert!(ba_cycles.contains(&cycle_index(54)), "BA low through cycle 54");
+        assert!(!ba_cycles.contains(&cycle_index(11)), "BA high at cycle 11 (refresh)");
         assert!(!ba_cycles.contains(&0), "BA high at start of line");
     }
 
@@ -2598,7 +3121,7 @@ mod tests {
         v.write_reg(R_SP_ENABLE, 0x01);
         v.write_reg(0x01, 100); // sprite 0 Y
         // DMA turns on at check_sprite_dma (cycles 55/56) of the matching Y line.
-        while !(v.raster_line == 100 && v.raster_cycle == pal_cycle(57)) {
+        while !(v.raster_line == 100 && v.raster_cycle == cycle_index(57)) {
             v.tick(&nm());
         }
         assert_eq!(v.sprite_dma & 0x01, 0x01, "sprite 0 DMA on at its Y line");
@@ -2709,4 +3232,150 @@ mod tests {
         assert!(!v.provenance[250].captured, "an unvisited line stays uncaptured");
     }
 
+    // ── Spec 863 — the NTSC family and the frame it makes ──────────────────────────
+
+    fn ntsc() -> VicII {
+        VicII::new_for(crate::model::resolve("c64-ntsc").unwrap())
+    }
+
+    /// The PAL table the port builds is the one TRX64 had: the xpos column the table now
+    /// carries is exactly the formula it replaced, and the whole compiled table hashes to
+    /// what the formula-built one did (FNV-1a over the 63 entries, computed from the
+    /// pre-863 builder).
+    #[test]
+    fn the_pal_table_is_the_one_trx64_had() {
+        let t = build_cycle_table(CycleFamily::Pal);
+        for (i, row) in cycle_tab(CycleFamily::Pal).iter().enumerate().filter(|(i, _)| i % 2 == 0) {
+            let cyc = (i / 2) as u16;
+            assert_eq!(row.xpos, (0x194 + 8 * cyc) % 0x1f8, "PAL Phi1({}) xpos", cyc + 1);
+        }
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for e in &t[..63] {
+            for b in e.to_le_bytes() {
+                h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        assert_eq!(h, PAL_TABLE_FNV, "compiled PAL table changed");
+        assert!(t[63..].iter().all(|&e| e == 0), "PAL has 63 entries");
+    }
+
+    /// Spec §2: what the 65-cycle line changes, read from the compiled NTSC table.
+    #[test]
+    fn the_ntsc_table_is_pal_with_two_idle_cycles() {
+        let p = build_cycle_table(CycleFamily::Pal);
+        let n = build_cycle_table(CycleFamily::Ntsc);
+        // Cycles 11-54 fetch, BA and check alike; the xpos column joins PAL's from cycle 14
+        // (11-13 read $1EC/$1F4/$1FC on NTSC against $1E4/$1EC/$1F4). 55-57 differ only in
+        // the sprite-0 BA and ChkSprDma that moved one cycle later.
+        for c in 11..=54usize {
+            assert_eq!(n[c - 1] & !XPOS_M, p[c - 1] & !XPOS_M, "cycle {c}");
+            if c >= 14 {
+                assert_eq!(n[c - 1], p[c - 1], "cycle {c}, xpos included");
+            }
+        }
+        // Idle at 10 and at 58.
+        assert!(!cycle_is_sprite_ptr_dma0(n[9]) && !cycle_is_sprite_dma1_dma2(n[9]) && !cycle_is_refresh(n[9]));
+        assert_eq!(cycle_get_sprite_ba_mask(n[9]), 0, "no BA at 10");
+        assert!(!cycle_is_sprite_ptr_dma0(n[57]) && !cycle_is_sprite_dma1_dma2(n[57]), "58 idle");
+        // Sprite 3 DMA at 1 (its pointer at 65), sprites 4-7 one cycle earlier than PAL.
+        assert!(cycle_is_sprite_dma1_dma2(n[0]) && cycle_get_sprite_num(n[0]) == 3);
+        assert!(cycle_is_sprite_ptr_dma0(n[64]) && cycle_get_sprite_num(n[64]) == 3);
+        for (s, c) in [(4usize, 2usize), (5, 4), (6, 6), (7, 8)] {
+            assert!(cycle_is_sprite_ptr_dma0(n[c - 1]) && cycle_get_sprite_num(n[c - 1]) == s, "s{s} ptr at {c}");
+        }
+        // Sprites 0-2 one cycle later: s0 59-60, s1 61-62, s2 63-64.
+        for (s, c) in [(0usize, 59usize), (1, 61), (2, 63)] {
+            assert!(cycle_is_sprite_ptr_dma0(n[c - 1]) && cycle_get_sprite_num(n[c - 1]) == s, "s{s} ptr at {c}");
+        }
+        // ChkSprDma 56/57, ChkSprDisp 59, sprite-0 BA from 56, UpdateRc still 58.
+        assert!(cycle_is_check_spr_dma(n[55]) && cycle_is_check_spr_dma(n[56]));
+        assert!(!cycle_is_check_spr_dma(n[54]));
+        assert!(cycle_is_check_spr_disp(n[58]) && !cycle_is_check_spr_disp(n[57]));
+        assert_eq!(cycle_get_sprite_ba_mask(n[54]), 0, "no sprite BA at 55 on NTSC");
+        assert_eq!(cycle_get_sprite_ba_mask(n[55]), 1, "sprite 0 BA from 56");
+        assert!(cycle_is_update_rc(n[57]));
+        // xpos from the table: $19C at cycle 1, $184 on Phi1 62 and Phi1 63.
+        assert_eq!(cycle_get_xpos(n[0]), 0x198, "$19C >> 3 << 3");
+        assert_eq!(cycle_get_xpos(n[61]), 0x180);
+        assert_eq!(cycle_get_xpos(n[62]), 0x180, "the repeated $184");
+        assert_eq!(cycle_get_xpos(n[63]), 0x188);
+        assert_eq!(n[65..].len(), 0);
+        let g = LineGeometry::of(CycleFamily::Ntsc);
+        assert_eq!((g.first_c, g.first_g, g.spr0_ptr, g.brd_r1, g.sample_cycle()), (15, 16, 59, 57, 20));
+        let g = LineGeometry::of(CycleFamily::Pal);
+        assert_eq!((g.first_c, g.first_g, g.spr0_ptr, g.brd_r1, g.sample_cycle()), (15, 16, 58, 57, 20));
+    }
+
+    /// Acceptance 3 — an NTSC frame is 17 095 cycles, the raster wraps at 263, line 0
+    /// appears at cycle 2, and a raster IRQ on line 262 fires while one on 263 never does.
+    #[test]
+    fn an_ntsc_frame_is_17095_cycles_and_wraps_at_263() {
+        let mut a = ntsc();
+        let mut b = ntsc();
+        tick_n(&mut a, 5000);
+        tick_n(&mut b, 5000 + 17095);
+        assert_eq!((a.raster_line, a.raster_cycle), (b.raster_line, b.raster_cycle), "periodic at 17095");
+        assert_eq!(b.frame, a.frame + 1);
+
+        // Walk to the wrap: the last line is 262, then 0 — seen at cycle 2 (index 1).
+        let mut v = ntsc();
+        let mut max_line = 0;
+        while !(v.raster_line == 262 && v.raster_cycle == 64) {
+            max_line = max_line.max(v.raster_line);
+            v.tick(&nm());
+        }
+        assert_eq!(max_line, 262);
+        v.tick(&nm()); // cycle 1 of the next line: the counter still reads 262
+        assert_eq!((v.raster_line, v.raster_cycle), (262, 0));
+        v.tick(&nm()); // cycle 2: line 0
+        assert_eq!((v.raster_line, v.raster_cycle), (0, 1));
+
+        // A raster IRQ on 262 fires; on 263 (a line the frame does not have) never.
+        let mut v = ntsc();
+        v.write_reg(R_IRQ_MASK, 0x01);
+        v.write_reg(R_CTRL1, 0x80);
+        v.write_reg(R_RASTER, (262 - 256) as u8);
+        tick_n(&mut v, 17095 + 100);
+        assert!(v.irq_status & IRQ_RASTER != 0, "line 262 fires");
+        let mut v = ntsc();
+        v.write_reg(R_IRQ_MASK, 0x01);
+        v.write_reg(R_CTRL1, 0x80);
+        v.write_reg(R_RASTER, (263 - 256) as u8);
+        tick_n(&mut v, 3 * 17095);
+        assert_eq!(v.irq_status & IRQ_RASTER, 0, "line 263 never fires");
+    }
+
+    /// A PAL-N chip is the NTSC table over 312 lines: 20 280 cycles a frame.
+    #[test]
+    fn a_paln_frame_is_20280_cycles() {
+        let m = crate::model::resolve("c64-paln").unwrap();
+        let mut a = VicII::new_for(m);
+        let mut b = VicII::new_for(m);
+        tick_n(&mut a, 7000);
+        tick_n(&mut b, 7000 + 20280);
+        assert_eq!((a.raster_line, a.raster_cycle), (b.raster_line, b.raster_cycle));
+        assert_eq!(b.frame, a.frame + 1);
+        assert_eq!((a.cycles_per_line(), a.screen_height()), (65, 312));
+    }
+
+    /// The model switch re-reads the cycle in hand from the new table and keeps every
+    /// value; a position the new geometry does not have is reported, not indexed.
+    #[test]
+    fn set_model_keeps_state_and_rereads_the_flags() {
+        let mut v = VicII::new();
+        tick_n(&mut v, 19656 * 2 + 3);
+        let (line, cycle, regs) = (v.raster_line, v.raster_cycle, v.regs);
+        let n = crate::model::resolve("c64-ntsc").unwrap();
+        v.set_model(n);
+        assert_eq!((v.raster_line, v.raster_cycle, v.regs), (line, cycle, regs));
+        assert_eq!(v.cycle_flags, build_cycle_table(CycleFamily::Ntsc)[cycle as usize]);
+        assert!(!v.fits(0, 65) && v.fits(262, 64) && !v.fits(263, 0));
+        let p = VicII::new();
+        assert!(!p.fits(0, 63) && !p.fits(0, 64) && p.fits(311, 62));
+    }
 }
+
+/// FNV-1a of the compiled PAL table as the pre-863 builder produced it (xpos from the
+/// formula `(0x194 + 8c) % 0x1f8`, the rest from the rows).
+#[cfg(test)]
+const PAL_TABLE_FNV: u64 = 0xc49a_5dd2_ef2a_bbcd;

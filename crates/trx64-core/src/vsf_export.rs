@@ -180,7 +180,7 @@ fn sid(m: &Machine) -> Vec<u8> {
 fn vic_iisc(m: &Machine) -> Vec<u8> {
     let v = &m.vic;
     let mut w = W::new();
-    w.b(0); // model (sanity byte)
+    w.b(m.model().vicii_id); // model (VICE VICII_MODEL_*: 0 = 6569, 3 = 6567R8, 6 = 6572)
     w.ba(&v.regs[0..64]); // 64 registers
     w.dw(v.raster_cycle as u32);
     w.dw(v.cycle_flags);
