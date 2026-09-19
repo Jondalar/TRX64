@@ -1,6 +1,6 @@
 # Spec 863 — NTSC: a second video standard, chosen before power-on
 
-**Status:** READY (2026-09-19) — all three questions settled (§9): models are configuration, the switch is a transplant at the frame boundary, the palette stays Colodore.
+**Status:** BUILT (TRX64 half, 2026-09-19, branch `spec-863-ntsc`) — `models.toml` with VICE's seven rows (`c64-pal`, `c64-ntsc`, `c64-paln` run), the three cycle tables ported 1:1, `Machine::timing()` as the one source, NTSC's wrapped window, the frame-boundary switch, the model in every snapshot; every §6 item has a test (§10). Gate GREEN: 16 core suites / 519 tests, daemon suite 422 tests, 7-game 7/7 with the screenshots byte-identical to the pre-863 build, clippy at the 404-line backlog (nothing on a line this spec's follow-ups touched). Follow-ups closed the same day (§10): the reverse-debug ring holds its seconds on every model, the scenario list names the recorded model, a switch while recording is journaled and replayed at its cycle. **C64RE half BUILT** (C64RE branch `spec-863-ntsc`): a Live-tab model selector from `session/models` (unrunnable rows disabled with the missing block; it asks, then `session/model`; cancel sends nothing); `model` on `runtime_session_start` (replaces `pal`), `runtime_sandbox_run`, `runtime_scene_reel`; `knowledge/project.json → machine.model` (`project_init` default `c64-pal`) passed as `--model` by the one spawn resolver; every frame count reads the machine's timing (`PAL_CYCLES_PER_FRAME` removed); recorded scenarios carry their model and are refused on another one naming both; the VIC view and line strip take their geometry from the recorder header. §7 1–4 tested in `smoke:863` (50/50) and `e2e:863-model` (61/61, CI). Both branches merge together — the C64RE side refuses to guess PAL against a pre-863 runtime.
 **Repos:** TRX64 (the machine) + C64RE (the switch, and every place that counts in frames).
 **Number:** 863 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`).
 **Depends on:** nothing structural. Follows the path Spec 851 laid for the machine profile.
@@ -277,3 +277,123 @@ for R8, 16 768 for R56A); `docs/vice-iec-arc42.md:603-605` quotes sync factors 6
 3. ~~Colour.~~ **Settled 2026-09-19:** the palette stays Colodore for every model ("Lass mal die
    Palette"). VICE itself gives the 6567R8 the same palette as the 6569 (`vicii-color.c:630-649`);
    its NTSC difference is the optional YIQ/CRT path, which stays out.
+
+## §10 As built — TRX64 half (2026-09-19, branch `spec-863-ntsc`)
+
+**Rows.** `crates/trx64-core/models.toml` carries VICE's seven C64 rows; `model.rs` parses and
+validates them once (unknown fields, families, chips, a second row per chip, a window the
+framebuffer cannot hold are errors; the daemon and CLI check the file at startup and exit
+cleanly). A row that names a block TRX64 lacks is listed with `missing` and refused by name:
+`c64c-pal`/`c64c-ntsc` (6526A CIA, custom-IC glue logic), `c64-old-pal` (KERNAL rev2 — not in
+the ROM set; 6569R1 light-pen IRQ mode and luminances), `c64-old-ntsc` (KERNAL rev1; the
+6567R56A's). The rows are identified in snapshots by their VIC-II (VICE `VICII_MODEL_*`), so the
+file keeps one row per chip.
+
+**Tables.** `cycle_tab_pal`, `cycle_tab_ntsc`, `cycle_tab_ntsc_old` are in `vic.rs` row for row,
+every column including xpos and the log-only `visible`; `ntsc_gate` compares all 384 rows with
+VICE's source text. The compiled PAL table hashes to the pre-863 formula-built one. The VIC
+holds a 65-entry table; `cycles_per_line` decides how many run. `LineGeometry` reads the first
+c-/g-access, sprite 0's pointer fetch and the last right-border check from the flags; the line
+recorder's trick rules and sample points use it. `sprite_dbuf_x`/`display_dbuf_x0` derive the
+two calibrated origins from each table (136/112 on all three; NTSC sprites at X ≥ $188 land 8 px
+further right, past the repeated $184).
+
+**The picture.** A wrapped window draws lines before its first line into the rows below the
+frame (VICE `raster_draw_buffer_ptr_update`), so NTSC's canvas is rows 28–274, 384×247, one
+contiguous crop; the displayed buffer swaps at the end of line 11 (VICE's vsync at line 12).
+PAL keeps its swap at the frame wrap and its historical draw row for the frame's first line
+(rows 0 and 311 are outside every PAL window — the framebuffer bytes are unchanged). A displayed
+NTSC frame for the recorder starts at line 12; `frame_map.cells` stay indexed by raster line.
+
+**The switch is in place.** `session/model` / `model <row>` pause, advance to the raster wrap,
+and call `Machine::switch_model`: every value in the machine stays where it is and only what the
+row decides is replaced — the VIC's table and frame (the flags of the cycle in hand re-read from
+the new table), the CIAs' TOD tick rate, the drive's catch-up ratio; reSID is re-sampled by the
+stream (and the CLI's render thread) when it sees the new clock. This is §3 D5's
+capture → rebuild → restore with the copy elided: the rebuilt machine would be this one with
+those fields replaced. The reply reports `kept: {cpu, ram, cia, sid}`, and a daemon test compares
+the machine field by field across the switch. A restore runs the same step first
+(`put_on_model` from the checkpoint's VIC model byte), after checking that the snapshot's raster
+position exists on that row — which is what retires the latent `raster_cycle ≥ cycles_per_line`
+panic (the compact VSF, which carries no model, is checked against the machine's own row).
+
+**Identity.** Session identity like the machine profile: `Session.model` builds every machine
+the session makes (power-on, power-off blank), a warm reset rebuilds VIC and CIAs on the
+machine's row, and after any request the daemon adopts the machine's row (a rewind across a
+switch makes the session PAL again) and re-sizes the checkpoint ring for the frame rate. The dump
+manifest's `machine.model` is the row name on the `c64` profile (`c64-pal` reads as it always
+did) and profile-prefixed otherwise (`u64-ntsc`); the drive snapshot writes VICE's
+`MachineVideoStandard` for NTSC/PAL-N and keeps the facade's 0 for PAL. `session/create {model}`
+on another model **switches** the shared machine at the frame boundary exactly as `session/model`
+does — the owner: "Switch von PAL → NTSC oder umgekehrt immer nur bei neuem Frame" — and replies
+with `modelSwitch` (from, switchedAt, kept); a model never changes by a power cycle. A clean start
+on the new model is the power button after the switch; a machine that is off becomes the model at
+its next power-on. The A/V hello is a JSON notification `av/hello`, sent on subscribe and on every model
+change. The input journal records the model it was armed on; a scenario naming another model is
+refused, naming both.
+
+**Wire.** Additive: `session/models`, `session/model`, `session/create.model`, the identity
+fields in `session/state` / `monitor/state` / `session/create`, `av/hello`, `frame.model`,
+`firstLine`, `displayWindow` and `geometry.visible.{lastLine,wraps}` in the frame map, `model`
+in the input journal, the sandbox JSON and the `runtime/scenario_list` summaries; journal entries
+of `kind: "model"`, and `runtime/scenario_run` inputs of `kind: "model"` with `modelSwitches` and
+`model` in its result. One VALUE changed: `pacing.mode` reads `"realtime"`
+where it read `"pal"` (`"pal"` is still accepted on input). No field changed shape; the epoch
+stays `trx64-runtime/2`.
+
+**Left out, on purpose:** the C64RE half (§4, §7) — built in C64RE against this branch; the
+blocks the refused rows need; the NTSC colour decoder, pixel aspect, datasette/RS-232 rates and
+turbo on NTSC (§5).
+
+**The reverse-debug ring holds its seconds on every model.** It is sized by an
+instructions-per-second estimate; the estimate is PAL's 300 000/s scaled to the fastest clock a
+runnable row has (PAL-N, 1 023 440 Hz → 311 630/s — `delta_ring::ring_instr_per_second`), so the
+10 s default is ≥ 10 s on NTSC and PAL-N (PAL's own figure held them ~9.6 s). One size for every
+model rather than a resize on a switch: `DeltaRing::resize` drops the history by contract, so a
+ring that followed the model would lose the whole reverse window at every switch and every rewind
+across one, and nothing in an entry is tied to the model. PAL pays 3.9 % — 3 000 000 → 3 116 300
+entries at 10 s, +4.1 MiB. Tests: `the_ring_holds_its_seconds_on_every_model` (`delta_ring.rs`),
+`the_reverse_ring_holds_its_seconds_on_every_model_and_a_switch_keeps_it` (`ntsc_gate.rs`: the
+knob reports the seconds it was given on each row, a PAL machine with history switched to NTSC
+keeps capacity and entries).
+
+**The scenario list names the recorded model.** A `runtime/scenario_list` summary carries `model`
+— the machine the scenario was recorded on (a recording carries the model its input journal was
+armed on), `null` for a scenario that names none — so a client turns `cycleBudget` into seconds
+with the RECORDED machine's clock. C64RE's Export tab does (`scenarioDuration`), falling back to
+the running machine's clock only for a runtime without the field, and says so on the tab. Tests:
+`scenario_summaries_carry_the_recorded_model` (daemon; an NTSC-recorded scenario listed while the
+machine is PAL), C64RE `e2e:863-model` and `smoke:863`.
+
+**A switch while recording is in the recording.** The input journal records a model switch as
+an entry `kind: "model"` at the cycle it happened on — after the advance, so a frame boundary by
+construction — with `detail.name` / `detail.from`, who asked and through which door
+(`session/model`, `session/create`, the monitor's `model`; on a machine that is off,
+`atPowerOn`). The transplant is one function on the session, `switch_at_frame_boundary`, which
+the live switch and the replay share: `runtime/scenario_run` takes an input `kind: "model"`
+(payload: the row) and performs it at its cycle — the scenario player's `Model` step; durations
+after it count the new model's frames — and reports `modelSwitches` and the model it ended on. A
+scenario still starts on the model it names and is refused on another, naming both. C64RE writes
+the step `the machine switches to <row>` where the journal has the switch (the wait before it
+rounded down, so it ends inside the frame the switch closes; a press held across it is
+held through it, written as `I start holding …` / `I release …`), runs it through `session/model` in the reel and sandbox runners, and counts the frames
+after it in the new model's frames; REC no longer warns about a switch. Tests:
+`a_switch_while_recording_is_journaled_and_replays_at_the_same_cycle` (a live run from a restore,
+switched mid-frame, a press after it; the journal turned into a scenario replays the switch at
+the same cycle and ends on the same cycle, RAM hash and raster position),
+`a_switch_of_a_machine_that_is_off_is_journaled`, `a_model_step_switches_and_later_frames_are_the_new_models`
+(`scenario_player.rs`); C64RE `e2e:863-model`, `smoke:863`, `smoke:814`.
+
+**Acceptance, item by item (§6):**
+
+| § | test | where |
+|---|---|---|
+| 1 | the full gate; `the_pal_table_is_the_one_trx64_had` (compiled table hash); the 7-game screenshots and a boot + 40 M-cycle disk-game fingerprint (state, checkpoint JSON, VSF, canvas, frame map) compared byte for byte with the pre-863 build | `scripts/gate.sh`, `vic.rs` |
+| 2 | `the_cycle_tables_are_vices_row_by_row` — all three families, 384 rows, every column, against VICE's source; `the_ntsc_table_is_pal_with_two_idle_cycles` | `ntsc_gate.rs`, `vic.rs` |
+| 3 | `an_ntsc_frame_is_17095_cycles_and_wraps_at_263` (periodicity, wrap at 263, line 0 at cycle 2, raster IRQ on 262 fires, on 263 never); `a_paln_frame_is_20280_cycles` | `vic.rs` |
+| 4 | `a_cold_boot_detects_the_standard_from_the_same_kernal` ($02A6 = 0 NTSC, 1 PAL, one 901227-03) | `ntsc_gate.rs` |
+| 5 | `tod_counts_sixty_mains_ticks_a_second_on_ntsc` (and CRA7 still picks the divider); `resid_samples_at_the_ntsc_clock` (pitch ratio 1 022 730 / 985 248); `a_d64_load_completes_on_ntsc` (same bytes as PAL; drive factor 64079) | `ntsc_gate.rs` |
+| 6 | `ntsc_stolen_cycles_are_where_vices_table_puts_them` (bad line with sprites 0 and 3: BA 12–54, released at 55, sprite 0 from 56, sprite 3's s-accesses at 65 and 1) | `ntsc_gate.rs` |
+| 7 | `the_switch_is_a_transplant_and_rewind_undoes_it` (field-by-field state across the switch, line 0 of 263, 17 095-cycle frames, warm/cold reset and power cycle keep it, rewind to a PAL anchor makes it PAL with the anchor's RAM); `ntsc_round_trips_through_dump_and_a_foreign_row_is_refused` (dump/undump; a C64C checkpoint refused naming the 6526A; cycle 64 on PAL refused; nothing changes); `set_model_keeps_state_and_rereads_the_flags` | daemon `main.rs`, `vic.rs` |
+| 8 | `models_toml_parses_and_every_row_is_checked`, `the_three_rows_that_run_and_why_the_others_do_not`, `session_models_lists_every_row_and_what_it_lacks`, `a_row_that_cannot_run_is_refused_at_startup_by_name` (the real binary, `--model c64c-pal` → 6526A), `a_row_that_runs_starts_the_daemon_on_it` and `paln_is_a_row_and_c64c_is_refused_by_name` (65 × 312, 1 023 440 Hz, 50 Hz TOD) | `model.rs`, daemon, `ntsc_gate.rs` |
+| 9 | `an_ntsc_frame_carries_its_canvas_in_the_bin_vic_header` (384 × 247, ~59.83 fps), `the_pace_is_the_models_frame_rate`, `an_ntsc_raster_bar_at_line_5_is_at_the_bottom`, `an_ntsc_replay_reproduces_the_picture_on_screen`, `an_ntsc_checkpoint_is_read_on_the_ntsc_window` | daemon, `streaming.rs`, `ntsc_gate.rs`, `vic_inspect.rs` |

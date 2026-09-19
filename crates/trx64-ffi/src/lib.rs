@@ -182,7 +182,8 @@ impl Runtime {
     // ── session ──────────────────────────────────────────────────────────────
 
     /// Create (attach to) the singleton session. `pal` is accepted for the wire
-    /// contract; the singleton machine is PAL and is not reconstructed on attach.
+    /// contract and ignored: the singleton machine is not reconstructed on attach (the
+    /// model is `session/create {model}`'s field, and `session/model` switches it).
     pub fn create_session(&self, pal: bool) -> Result<SessionInfo, Trx64Error> {
         let v = self.rpc("session/create", json!({ "pal": pal }))?;
         decode(v)
@@ -232,9 +233,10 @@ impl Runtime {
     // `[Int16]`, so no base64 and no JSON on the hot path.
 
     /// The CURRENT displayed frame at FULL resolution as a palette + index image (the
-    /// 384×272 VICE PAL canvas — the SAME `displayed` buffer `screenshot()` and the
-    /// scrub thumbnails come from, here full-res + un-palettized). Pull this once per
-    /// video frame (~50 Hz) and blit it. See [`FrameBuffer`] for the draw recipe.
+    /// model's canvas — 384×272 PAL, 384×247 NTSC; the SAME `displayed` buffer
+    /// `screenshot()` and the scrub thumbnails come from, here full-res + un-palettized).
+    /// Pull this once per video frame (~50 Hz PAL, ~60 Hz NTSC) and blit it at the
+    /// `width`/`height` it carries. See [`FrameBuffer`] for the draw recipe.
     pub fn frame_buffer(&self) -> FrameBuffer {
         let fb = pull_frame_buffer(&self.state);
         FrameBuffer {

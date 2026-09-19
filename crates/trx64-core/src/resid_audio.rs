@@ -92,6 +92,17 @@ impl SidAudioEngine {
         Self::new(ResidConfig::default())
     }
 
+    /// Spec 863 D3 — re-sample at another Φ2 clock (a model switch). Pending writes and
+    /// boundaries recorded so far were clocked on the old machine: flush them first.
+    pub fn set_clock_freq(&mut self, clock_freq: f64) {
+        self.resid.set_clock_freq(clock_freq);
+    }
+
+    /// The Φ2 clock the engine samples at.
+    pub fn clock_freq(&self) -> f64 {
+        self.resid.config().clock_freq
+    }
+
     /// Reset the engine: re-init reSID + clear the stream and PCM buffer.
     pub fn reset(&mut self) {
         self.resid.reset();

@@ -83,7 +83,8 @@ pub fn run_convert(
         schema_version: RUNTIME_CHECKPOINT_SCHEMA_VERSION,
         media: Vec::new(),
         runtime_version: "trx64-runtime/2".to_string(),
-        machine_model: "c64-pal".to_string(),
+        // Spec 863 — the VSF's VIC-II model put the machine on its row.
+        machine_model: m.model().name.clone(),
         provenance: None,
         pc,
         cycle,

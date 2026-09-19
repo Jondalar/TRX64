@@ -1,7 +1,7 @@
 //! streaming.rs — live A/V binary push for `ws-av-tap.mjs` (ADR-073).
 //!
 //! The RuntimeController parity gap: the Node daemon's `ws-server.ts` pushes, per
-//! emulated PAL frame, two BINARY WebSocket messages to every connected client —
+//! emulated frame, two BINARY WebSocket messages to every connected client —
 //! a VIC video frame (`BIN_VIC = 0x01`, palette-indexed) and a reSID audio chunk
 //! (`BIN_AUDIO = 0x02`, s16le stereo 44100 Hz). The TRX64 daemon had neither. This
 //! module ports that push 1:1 so the user's read-only tap (which sends NO commands)
@@ -14,7 +14,8 @@
 //!     The consumer does `data.subarray(5)` — exactly a 5-byte header.
 //!
 //!   BIN_VIC = 0x01 payload (fmt 1, palette-indexed):
-//!     [w:u16 LE=384][h:u16 LE=272][fmt:u8=1][rsvd:u8=0][cycle:u32 LE]
+//!     [w:u16 LE][h:u16 LE][fmt:u8=1][rsvd:u8=0][cycle:u32 LE]
+//!     (the model's canvas: 384×272 PAL, 384×247 NTSC — Spec 863)
 //!     [48 B palette = 16×(R,G,B)][w*h index bytes, each & 0x0f]
 //!     (palette at offset 10, indices at offset 58 — matches the tap's palOff/idxOff).
 //!     `cycle` = the C64 CPU cycle counter (LE u32), NOT the frame number.
@@ -25,7 +26,13 @@
 //! TRIGGER: c64re relies on the browser sending `debug/run` + `audio/start`; the
 //! tap sends nothing. So THIS daemon auto-starts the stream when the first client
 //! connects (the daemon IS the producer). The streaming loop owns the machine for
-//! its lifetime and paces to real-time (~50 fps PAL).
+//! its lifetime and paces to real time — the model's frame rate (50.12 fps PAL, 59.83
+//! NTSC), read every frame so a model switch changes the pace (Spec 863).
+//!
+//!   AV_HELLO (JSON notification `av/hello`): sent to a client when it subscribes and to
+//!     every client when the machine's model changes — the model, the video standard,
+//!     the chip, the frame geometry, the clock and the canvas the frames that follow
+//!     have.
 //!
 //! THREADING: `SidAudioEngine` owns a reSID engine through a raw pointer and is
 //! therefore `!Send`, so the streaming loop runs on a dedicated OS thread (not a
@@ -58,17 +65,11 @@ pub const BIN_AUDIO: u8 = 0x02;
 /// fmt 1 = palette-indexed VIC frame (the only format the tap decodes).
 const VIC_FMT_INDEXED: u8 = 1;
 
-/// PAL Φ2 cycles per frame (312 rasterlines × 63 cycles = 19656). Canonical PAL
-/// frame length used by the project's av-record harness; one frame per push.
-/// Public so the `checkpoint/restore` render-flag path (main.rs) can re-sim exactly
-/// one PAL frame to regenerate a framebuffer-omitted anchor's picture.
-pub const CYC_PER_FRAME: u64 = 19656;
-/// PAL Φ2 clock (Hz) — used to derive the real-time frame period from the cycle
-/// budget, so the pace stays self-consistent with the cycles actually run.
-const PAL_CYCLES_PER_SEC: f64 = 985_248.0;
-/// Real-time wall period of one emulated frame (≈ 19.95 ms → ~50.12 fps PAL).
-fn frame_period() -> Duration {
-    Duration::from_secs_f64(CYC_PER_FRAME as f64 / PAL_CYCLES_PER_SEC)
+/// Real-time wall period of one emulated frame: the model's frame over its clock
+/// (19656 / 985248 ≈ 19.95 ms → ~50.12 fps PAL; 17095 / 1022730 ≈ 16.72 ms → ~59.83 fps
+/// NTSC), so the pace stays self-consistent with the cycles actually run.
+fn frame_period(t: &trx64_core::model::Timing) -> Duration {
+    Duration::from_secs_f64(t.cycles_per_frame as f64 / t.cpu_hz as f64)
 }
 
 /// Build a BIN_VIC (0x01) binary WS message from the machine's current displayed
@@ -242,6 +243,17 @@ impl StreamHub {
         let mut inner = self.inner.lock().unwrap();
         let id = inner.next_id;
         inner.next_id += 1;
+        // Spec 863 — the A/V hello: say what the frames that follow are (model, standard,
+        // chip, frame, clock, canvas) before the first one arrives.
+        {
+            let st = self.state.lock().unwrap();
+            let hello = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "av/hello",
+                "params": crate::av_hello(&st),
+            });
+            let _ = out.send(Message::Text(hello.to_string()));
+        }
         inner.subscribers.push(Subscriber { id, out });
         // Spec 837 — a new client gets a picture even if the machine is paused.
         //
@@ -319,7 +331,11 @@ impl Drop for StreamSub {
 fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
     let state = hub.state.clone();
     // ── reSID audio engine (owned on this thread; !Send) + the Send write hook ──
-    let mut engine = SidAudioEngine::new(ResidConfig::default());
+    // Spec 863 D3 — reSID samples at the model's clock with its SID.
+    let mut engine = {
+        let st = state.lock().unwrap();
+        SidAudioEngine::new(ResidConfig::for_model(st.session.machine.model()))
+    };
     let writes: Arc<Mutex<Vec<(u8, u8)>>> = Arc::new(Mutex::new(Vec::new()));
     // Track the machine-rebuild generation (bumped by do_power_on / do_power_off).
     // Spec 786 rebuilds the machine (Machine::new() → a fresh SID with NO write-trace
@@ -347,7 +363,8 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
     engine.flush();
     let _ = engine.take_pcm(); // discard priming silence
 
-    let period = frame_period();
+    let mut timing = state.lock().unwrap().session.machine.timing();
+    let mut period = frame_period(&timing);
     let mut frame_seq: u32 = 0;
     let mut audio_seq: u32 = 0;
     // The master clock of the LAST frame this loop presented. A paused machine can
@@ -386,6 +403,20 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
         // 8× cycles per presented frame (fast-forward at 50fps video), else real-time.
         let (running, warp) = {
             let mut st = state.lock().unwrap();
+            // Spec 863 — a model switch (or a restore across one) moved the clock and the
+            // frame: re-sample reSID at the new clock, and pace to the new frame from here.
+            // The transport restores anchors from this loop, outside any request: a step
+            // across a switch lands on the other model here, and the session and clients
+            // learn it here too.
+            crate::sync_model_identity(&mut st);
+            let now_timing = st.session.machine.timing();
+            if now_timing != timing {
+                timing = now_timing;
+                period = frame_period(&timing);
+                epoch = Instant::now();
+                frames_since_epoch = 0;
+                engine.set_clock_freq(timing.cpu_hz as f64);
+            }
             // Spec 786 audio fix — a power-cycle (cold reset / cart insert-eject /
             // /power) rebuilds the machine into a fresh SID with no write-trace hook.
             // Detect via machine_generation and RE-ATTACH the capture hook + re-prime
@@ -461,7 +492,7 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
         }
 
         if running {
-        // ── Run one PAL frame + render + drain this frame's SID writes ──
+        // ── Run one frame + render + drain this frame's SID writes ──
         // Lock the shared State only for this window; release before sleeping so
         // other JSON-RPC requests (and disk mounts) interleave between frames.
         let (vic_msg, audio_msg) = {
@@ -478,7 +509,8 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
             // returns the cycles ACTUALLY advanced (a halt may stop mid-frame, so
             // audio runs over exactly that window). When no bp/observer is armed it
             // is the historical plain advance (byte-identical).
-            let budget = if warp { CYC_PER_FRAME * 8 } else { CYC_PER_FRAME };
+            let frame = timing.cycles_per_frame;
+            let budget = if warp { frame * 8 } else { frame };
             // Spec 808 — the rewind transport owns the frame while it is rewound. When
             // it does, emulation must NOT advance: the transport is placing the machine
             // on an anchor itself (a real restore, 177 us), and advancing on top of that
@@ -507,7 +539,7 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
             engine.flush();
             let mono = engine.take_pcm();
 
-            // Video: crop the per-cycle displayed buffer → 384×272 4-bit indices.
+            // Video: crop the per-cycle displayed buffer → the model's canvas, 4-bit indices.
             let (w, h, indices) = st.session.machine.render_canvas_indices();
 
             // ── BACKGROUND-LOOP layer (the c64re RuntimeController per-frame
@@ -613,7 +645,7 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
                 // (1) — the transport paces itself against the wall clock, so calling it
                 // once per loop iteration is the same cadence it gets while running.
                 if st.transport.playing.is_some() {
-                    crate::transport_tick(&mut st, CYC_PER_FRAME);
+                    crate::transport_tick(&mut st, timing.cycles_per_frame);
                 }
                 // (2)
                 let clk = st.session.machine.clk;
@@ -688,6 +720,17 @@ mod tests {
         assert!(paused_present_due(false, 1020, 1000));
         // Forced: a restore that landed on the SAME cycle still repaints.
         assert!(paused_present_due(true, 1000, 1000));
+    }
+
+    /// Spec 863 — real time is the model's frame rate: ~59.83 frames a second on NTSC, and
+    /// on PAL exactly the period the loop always slept.
+    #[test]
+    fn the_pace_is_the_models_frame_rate() {
+        let ntsc = trx64_core::model::resolve("c64-ntsc").unwrap().timing;
+        let p = frame_period(&ntsc).as_secs_f64();
+        assert!((1.0 / p - 59.826).abs() < 0.001, "{}", 1.0 / p);
+        let pal = trx64_core::model::default_model().timing;
+        assert_eq!(frame_period(&pal), Duration::from_secs_f64(19656.0 / 985_248.0));
     }
 
     #[test]

@@ -135,7 +135,16 @@ pub fn rom_missing_help(tried: &Path, err: &dyn std::fmt::Display) -> String {
 
 /// Boot a fresh in-process machine from `rom_dir` and wrap it in an [`Engine`].
 pub fn boot_engine(rom_dir: &Path) -> Result<Engine, String> {
-    let state = trx64_daemon::create_embedded_state(rom_dir)
+    boot_engine_with_model(rom_dir, trx64_core::model::default_model())
+}
+
+/// [`boot_engine`] on a chosen model (`--model`, Spec 863): the machine is built on the
+/// row before it boots, so nothing ever runs on another.
+pub fn boot_engine_with_model(
+    rom_dir: &Path,
+    model: &'static trx64_core::model::C64Model,
+) -> Result<Engine, String> {
+    let state = trx64_daemon::create_embedded_state_with_model(rom_dir, model)
         .map_err(|e| rom_missing_help(rom_dir, &e))?;
     Ok(Engine::new(state))
 }

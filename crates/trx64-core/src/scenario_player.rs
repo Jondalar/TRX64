@@ -20,10 +20,10 @@
 //! session/joystick_set). The scheduling, sort order, and `tick`/`remaining`/`reset`
 //! contract are byte-for-byte the TS.
 //!
-//! PAL frame = 19656 cycles (scenario-player.ts:16 / DEFAULT below), NTSC = 17030.
-
-/// scenario-player.ts:34 — default PAL cycles per frame.
-pub const DEFAULT_CYCLES_PER_FRAME: u64 = 19656;
+//! A frame is the machine's (Spec 863: `Machine::timing().cycles_per_frame` — 19 656 on
+//! PAL, 17 095 on NTSC 6567R8, 16 768 on the old 6567R56A, 20 280 on PAL-N); the caller
+//! passes it. There is no default: an `at_frame` step means nothing without the machine it
+//! was recorded on.
 
 /// scenario-player.ts:22-27 — joystick state (all fields optional / default
 /// false). Re-export of the canonical `keyboard::JoystickState` (the TS golden
@@ -61,6 +61,13 @@ pub enum ScenarioStepKind {
         port: u8,
         sequence: Vec<JoystickScriptEntry>,
     },
+    /// Spec 863 — the machine switches to the model `name` at the frame boundary, as a
+    /// recording's journal saw it. Scheduled at the cycle the recording switched on (a
+    /// frame boundary), so the replay performs the same transplant at the same cycle; the
+    /// frames the steps after it count are the new model's.
+    Model {
+        name: String,
+    },
 }
 
 /// scenario-player.ts:20-27 — a step = an optional schedule + a kind.
@@ -88,13 +95,28 @@ pub trait ScenarioTarget {
     fn trigger_restore_nmi(&mut self);
     /// scenario-player.ts:98 — session.runFor(cycles) (composite-macro inline run).
     fn run_for(&mut self, cycles: u64);
+    /// Spec 863 — switch the machine to the model `name` at the frame boundary. Returns the
+    /// new model's cycles per frame, or why it could not switch. A target that cannot
+    /// switch models says so.
+    fn switch_model(&mut self, name: &str) -> Result<u64, String> {
+        Err(format!("this replay target cannot switch the machine to {name}"))
+    }
 }
 
 /// scenario-player.ts:34 — `class ScenarioPlayer`.
 pub struct ScenarioPlayer {
     steps: Vec<ScenarioStep>,
+    /// The frame an `at_frame` schedule counts in: the model the scenario STARTS on (the
+    /// schedule is sorted once, up front). A scenario that switches models schedules by
+    /// cycle — a recording does.
     cycles_per_frame: u64,
+    /// The frame a duration counts in: the model the machine is on NOW — it follows a
+    /// `Model` step.
+    frame_now: u64,
     next_idx: usize,
+    /// Why a step could not be performed (a `Model` step the target refused). The player
+    /// stops there; the caller reads it with `failure`.
+    failure: Option<String>,
 }
 
 impl ScenarioPlayer {
@@ -102,21 +124,33 @@ impl ScenarioPlayer {
     /// ascending (`at_cycle`, or `at_frame * cyclesPerFrame`, or 0). A STABLE sort
     /// preserves the relative order of equal-cycle steps (matching the TS Array.sort,
     /// which is stable in V8).
-    pub fn new(mut steps: Vec<ScenarioStep>, cycles_per_frame: Option<u64>) -> Self {
-        let cpf = cycles_per_frame.unwrap_or(DEFAULT_CYCLES_PER_FRAME);
+    pub fn new(mut steps: Vec<ScenarioStep>, cycles_per_frame: u64) -> Self {
+        let cpf = cycles_per_frame.max(1);
         steps.sort_by_key(|s| abs_cycle(s, cpf));
         Self {
             steps,
             cycles_per_frame: cpf,
+            frame_now: cpf,
             next_idx: 0,
+            failure: None,
         }
+    }
+
+    /// Why the replay stopped short, if a step could not be performed.
+    pub fn failure(&self) -> Option<&str> {
+        self.failure.as_deref()
+    }
+
+    /// The frame length durations count in now (the current model's).
+    pub fn cycles_per_frame_now(&self) -> u64 {
+        self.frame_now
     }
 
     /// scenario-player.ts:56-67 — `tick(target, currentCycle)`. Apply every step
     /// that has come due as of `current_cycle`. Returns the count fired.
     pub fn tick<T: ScenarioTarget>(&mut self, target: &mut T, current_cycle: u64) -> usize {
         let mut fired = 0;
-        while self.next_idx < self.steps.len() {
+        while self.failure.is_none() && self.next_idx < self.steps.len() {
             let due_at = abs_cycle(&self.steps[self.next_idx], self.cycles_per_frame);
             if current_cycle < due_at {
                 break;
@@ -138,6 +172,8 @@ impl ScenarioPlayer {
     /// scenario-player.ts:70 — `reset()`.
     pub fn reset(&mut self) {
         self.next_idx = 0;
+        self.frame_now = self.cycles_per_frame;
+        self.failure = None;
     }
 
     /// The absolute cycle each step fires at (for the caller to drive its run loop
@@ -149,7 +185,7 @@ impl ScenarioPlayer {
     }
 
     /// scenario-player.ts:72-103 — `dispatch(target, step)`.
-    fn dispatch<T: ScenarioTarget>(&self, target: &mut T, step: &ScenarioStep) {
+    fn dispatch<T: ScenarioTarget>(&mut self, target: &mut T, step: &ScenarioStep) {
         match &step.kind {
             ScenarioStepKind::Type { text } => target.type_text(text),
             ScenarioStepKind::Joy1 { state } => target.set_joystick1(*state),
@@ -165,9 +201,13 @@ impl ScenarioPlayer {
                     } else {
                         target.set_joystick2(entry.state);
                     }
-                    target.run_for(entry.duration_frames * self.cycles_per_frame);
+                    target.run_for(entry.duration_frames * self.frame_now);
                 }
             }
+            ScenarioStepKind::Model { name } => match target.switch_model(name) {
+                Ok(cpf) => self.frame_now = cpf.max(1),
+                Err(why) => self.failure = Some(why),
+            },
         }
     }
 }
@@ -181,6 +221,9 @@ fn abs_cycle(s: &ScenarioStep, cycles_per_frame: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default model's frame (`c64-pal`).
+    const PAL_FRAME: u64 = 19656;
 
     /// A recording target: logs every dispatched action (and advances a clock for
     /// composite run_for).
@@ -241,7 +284,7 @@ mod tests {
                 },
             ),
         ];
-        let mut p = ScenarioPlayer::new(steps, None);
+        let mut p = ScenarioPlayer::new(steps, PAL_FRAME);
         let mut t = LogTarget::default();
         assert_eq!(p.tick(&mut t, 500), 0, "none due yet");
         assert_eq!(p.tick(&mut t, 1500), 1, "A due");
@@ -259,7 +302,7 @@ mod tests {
             at_frame: Some(2),
             kind: ScenarioStepKind::Restore,
         }];
-        let mut p = ScenarioPlayer::new(steps, None);
+        let mut p = ScenarioPlayer::new(steps, PAL_FRAME);
         assert_eq!(p.next_due_cycle(), Some(39312));
         let mut t = LogTarget::default();
         assert_eq!(p.tick(&mut t, 39311), 0);
@@ -283,7 +326,7 @@ mod tests {
             },
         ];
         let steps = vec![step(0, ScenarioStepKind::JoystickScript { port: 1, sequence: seq })];
-        let mut p = ScenarioPlayer::new(steps, Some(100));
+        let mut p = ScenarioPlayer::new(steps, 100);
         let mut t = LogTarget::default();
         assert_eq!(p.tick(&mut t, 0), 1);
         // Each entry: set joystick1 then run_for(duration*100).
@@ -294,7 +337,7 @@ mod tests {
     #[test]
     fn reset_replays_from_start() {
         let steps = vec![step(0, ScenarioStepKind::Type { text: "X".into() })];
-        let mut p = ScenarioPlayer::new(steps, None);
+        let mut p = ScenarioPlayer::new(steps, PAL_FRAME);
         let mut t = LogTarget::default();
         p.tick(&mut t, 0);
         assert_eq!(p.remaining(), 0);
@@ -316,7 +359,7 @@ mod tests {
             ]
         };
         let run = || {
-            let mut p = ScenarioPlayer::new(mk(), None);
+            let mut p = ScenarioPlayer::new(mk(), PAL_FRAME);
             let mut t = LogTarget::default();
             for cycle in (0..=400).step_by(50) {
                 p.tick(&mut t, cycle);
@@ -324,5 +367,65 @@ mod tests {
             t.log
         };
         assert_eq!(run(), run(), "deterministic dispatch order");
+    }
+
+    /// Spec 863 — a `Model` step switches the machine at its cycle, and the durations after
+    /// it count the new model's frames; a target that refuses the switch stops the replay
+    /// there and says why.
+    #[test]
+    fn a_model_step_switches_and_later_frames_are_the_new_models() {
+        struct Switcher {
+            log: Vec<String>,
+        }
+        impl ScenarioTarget for Switcher {
+            fn type_text(&mut self, text: &str) {
+                self.log.push(format!("type:{text}"));
+            }
+            fn set_joystick1(&mut self, _: JoystickState) {}
+            fn set_joystick2(&mut self, s: JoystickState) {
+                self.log.push(format!("joy2:{}", s.fire));
+            }
+            fn set_paddle(&mut self, _: u8, _: i64) {}
+            fn trigger_restore_nmi(&mut self) {}
+            fn run_for(&mut self, cycles: u64) {
+                self.log.push(format!("run:{cycles}"));
+            }
+            fn switch_model(&mut self, name: &str) -> Result<u64, String> {
+                self.log.push(format!("model:{name}"));
+                match name {
+                    "c64-ntsc" => Ok(17_095),
+                    _ => Err(format!("{name} cannot run here")),
+                }
+            }
+        }
+        let press = |frames| ScenarioStepKind::JoystickScript {
+            port: 2,
+            sequence: vec![JoystickScriptEntry { state: JoystickState { fire: true, ..Default::default() }, duration_frames: frames }],
+        };
+        let steps = vec![
+            step(100, press(1)),
+            step(PAL_FRAME * 3, ScenarioStepKind::Model { name: "c64-ntsc".into() }),
+            step(PAL_FRAME * 3 + 500, press(2)),
+            step(PAL_FRAME * 4, ScenarioStepKind::Model { name: "c64c-pal".into() }),
+            step(PAL_FRAME * 5, ScenarioStepKind::Type { text: "never".into() }),
+        ];
+        let mut p = ScenarioPlayer::new(steps, PAL_FRAME);
+        let mut t = Switcher { log: Vec::new() };
+        p.tick(&mut t, PAL_FRAME * 3 - 1);
+        assert_eq!(p.cycles_per_frame_now(), PAL_FRAME);
+        p.tick(&mut t, PAL_FRAME * 3);
+        assert_eq!(p.cycles_per_frame_now(), 17_095, "the frame is the new model's from the switch on");
+        p.tick(&mut t, PAL_FRAME * 10);
+        assert_eq!(
+            t.log,
+            vec!["joy2:true", "run:19656", "model:c64-ntsc", "joy2:true", "run:34190", "model:c64c-pal"],
+            "a press after the switch lasts NTSC frames; the refused switch stops the replay"
+        );
+        assert_eq!(p.failure(), Some("c64c-pal cannot run here"));
+        assert_eq!(p.remaining(), 1, "nothing after the refusal ran");
+        // The default target cannot switch, and says so.
+        let mut p = ScenarioPlayer::new(vec![step(0, ScenarioStepKind::Model { name: "c64-ntsc".into() })], PAL_FRAME);
+        p.tick(&mut LogTarget::default(), 0);
+        assert!(p.failure().unwrap().contains("c64-ntsc"));
     }
 }

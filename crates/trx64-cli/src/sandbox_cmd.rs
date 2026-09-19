@@ -227,6 +227,9 @@ pub struct SandboxArgs {
     /// routine that PROBES for a turbo machine can be exercised here instead of
     /// only through a full boot. `None` = c64.
     pub turbo: Option<String>,
+    /// Spec 863 — which C64 (a `models.toml` row); `None` = the default (`c64-pal`). A
+    /// `--seed` snapshot puts the machine on the row it was taken on.
+    pub model: Option<String>,
     /// Direct-entry mode (TS-faithful): PC=entry + reg-seed + staged RTS sentinel,
     /// instead of the `jsr entry` stub. Auto-enabled when any `reg_*` is set.
     pub direct_entry: bool,
@@ -280,6 +283,7 @@ pub fn run_sandbox_cli(
     cyc_cap: Option<u64>,
     instr_cap: Option<u64>,
     turbo: Option<&str>,
+    model: Option<&str>,
     direct_entry: bool,
     reg_a: Option<&str>,
     reg_x: Option<&str>,
@@ -322,6 +326,7 @@ pub fn run_sandbox_cli(
     };
     run_sandbox(&SandboxArgs {
         turbo: turbo.map(|s| s.to_string()),
+        model: model.map(|s| s.to_string()),
         rom_dir: rom_dir.to_path_buf(),
         seed: seed.map(|s| s.to_string()),
         cart: cart.map(|s| s.to_string()),
@@ -438,7 +443,12 @@ struct SandboxOutcome {
 }
 
 pub fn run_sandbox(args: &SandboxArgs) -> Result<String, String> {
-    let mut m = Machine::new();
+    // Spec 863 — the machine is built on the model before anything runs.
+    let row = match args.model.as_deref() {
+        Some(n) => trx64_core::model::resolve(n).map_err(|e| format!("--model: {e}"))?,
+        None => trx64_core::model::default_model(),
+    };
+    let mut m = Machine::new_with_model(row);
     m.boot_from_dir(&args.rom_dir)
         .map_err(|e| format!("boot ROMs from {}: {e:?}", args.rom_dir.display()))?;
     // Spec 815 — set BEFORE the seed is restored and before anything runs: a routine
@@ -552,6 +562,8 @@ pub fn run_sandbox(args: &SandboxArgs) -> Result<String, String> {
     if args.json {
         let out = json!({
             "ok": outcome.ok,
+            // Spec 863 — the model the routine ran on (a seed's, if one was restored).
+            "model": m.model().name,
             "stopReason": outcome.stop_reason,
             "pc": outcome.pc,
             "cycles": outcome.cycles,
@@ -910,7 +922,9 @@ fn str_list(item: &serde_json::Value, key: &str) -> Vec<String> {
 /// Returns a JSON object `{ "runs": [ { index, ok, result | error }, … ] }`.
 /// A failing item is reported and does not abort the batch — a depack campaign
 /// wants the 100 that worked plus the name of the one that did not.
-pub fn run_sandbox_batch(rom_dir: &Path, spec_path: &str) -> Result<String, String> {
+/// `default_model` (the command line's `--model`) applies to every item that does not
+/// name its own `model`.
+pub fn run_sandbox_batch(rom_dir: &Path, spec_path: &str, default_model: Option<&str>) -> Result<String, String> {
     let text = std::fs::read_to_string(spec_path)
         .map_err(|e| format!("read --batch {spec_path}: {e}"))?;
     let spec: serde_json::Value = serde_json::from_str(&text)
@@ -933,6 +947,7 @@ pub fn run_sandbox_batch(rom_dir: &Path, spec_path: &str) -> Result<String, Stri
             continue;
         }
         let rom_dir = rom_dir.to_path_buf();
+        let default_model = default_model.map(String::from);
         // Fresh thread per item — see ISOLATION above.
         let handle = std::thread::Builder::new()
             .name(format!("sandbox-batch-{index}"))
@@ -971,6 +986,8 @@ pub fn run_sandbox_batch(rom_dir: &Path, spec_path: &str) -> Result<String, Stri
                     item.get("instrCap").and_then(|v| v.as_u64()),
                     // Spec 815 — a batch item may claim its own machine.
                     item.get("turbo").and_then(|v| v.as_str()),
+                    // Spec 863 — and its own model.
+                    item.get("model").and_then(|v| v.as_str()).or(default_model.as_deref()),
                     item.get("directEntry").and_then(|v| v.as_bool()).unwrap_or(false),
                     str_field(&item, "regA"),
                     str_field(&item, "regX"),
@@ -1095,6 +1112,7 @@ mod tests {
     fn base_args(rom_dir: PathBuf) -> SandboxArgs {
         SandboxArgs {
             turbo: None,
+            model: None,
             rom_dir,
             seed: None,
             cart: None,
@@ -1401,5 +1419,32 @@ mod tests {
         assert_eq!(harvests[0]["hex"], "cccc");
         assert_eq!(harvests[1]["addr"], 0x4002);
         assert_eq!(harvests[1]["hex"], "cccc");
+    }
+
+    /// Spec 863 — a batch item runs on its own model, the command line's `--model` is the
+    /// default for the rest, and a row that cannot run is that item's error, by name.
+    #[test]
+    fn a_batch_item_runs_on_its_own_model() {
+        let Some(rom_dir) = rom_dir_or_skip() else { return };
+        let dir = std::env::temp_dir().join(format!("trx64-863-sbx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = dir.join("batch.json");
+        let item = |model: Option<&str>| {
+            let mut v = serde_json::json!({ "entry": "$c000", "directEntry": true, "io": "$34",
+                "loadHex": ["$c000=60"], "harvest": ["$c000:1"] });
+            if let Some(m) = model {
+                v["model"] = serde_json::json!(m);
+            }
+            v
+        };
+        let runs = serde_json::json!({ "runs": [item(None), item(Some("ntsc")), item(Some("c64c-pal"))] });
+        std::fs::write(&spec, runs.to_string()).unwrap();
+        let out = run_sandbox_batch(&rom_dir, spec.to_str().unwrap(), Some("c64-paln")).expect("batch");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["runs"][0]["result"]["model"], "c64-paln", "the command line's model");
+        assert_eq!(v["runs"][1]["result"]["model"], "c64-ntsc", "the item's own");
+        assert_eq!(v["runs"][2]["ok"], false);
+        assert!(v["runs"][2]["error"].as_str().unwrap().contains("6526A"), "{}", v["runs"][2]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,0 +1,196 @@
+# The C64 models TRX64 knows about — one row per model.
+#
+# A model is configuration, not code. Each row names the building blocks a machine is
+# made of; the engine holds only the blocks (the VIC-II cycle-table families, the two
+# colour-latency paths of the draw, reSID's 6581/8580, the 6526 CIA, the ROM set) and
+# reads everything else from here. A row that names a block TRX64 does not have is
+# listed, but refused when chosen, with the block's name — never mapped to something
+# close. Adding a model is adding a row; if it needs a block that does not exist yet,
+# that block is built, not the engine taught about the model.
+#
+# The rows mirror VICE's model table (c64/c64scmodel.c `c64models[]`) and chip records
+# (viciisc/vicii-chip-model.c, viciisc/vicii-timing.h, c64/c64.h). Nothing below is
+# derived; what can be derived is not written here (cycles per line comes from the
+# cycle table, cycles per frame / frame rate / drive sync factor from the numbers).
+#
+# Fields:
+#   name, aliases    what `--model` accepts; `--video pal|ntsc` are aliases of the base rows
+#   title            what a person reads
+#   default          the machine a fresh session is (exactly one row)
+#   video            the video standard: pal | ntsc | ntsc-old | pal-n (VICE MACHINE_SYNC_*)
+#   vicii            the VIC-II chip
+#   cycle_table      the fetch schedule family: pal (63) | ntsc (65) | ntsc-old (64)
+#   raster_lines     lines per frame
+#   cpu_hz           the system clock (PHI2), Hz
+#   tod_hz           the mains tick the CIAs' time-of-day clock counts (CRA bit 7 only
+#                    picks the divider)
+#   color_latency    the 6569-family colour pipeline (true) or the 8565 one (false)
+#   lightpen_retrigger_x  VICE `x_extra_bits` on a light-pen retrigger
+#   lightpen_irq, luminances   "new" | "old" (the 6569R1/6567R56A variants)
+#   display_window   first and last displayed raster line (VICE "normal" borders). A last
+#                    line past the frame wraps: those lines are drawn at the bottom.
+#   border           left and right border width in pixels (VICE "normal" borders)
+#   cia, sid, glue   the 6526 variant, the SID, the glue logic
+#   kernal, basic, chargen   ROM file names
+
+[[model]]
+name = "c64-pal"
+aliases = ["pal", "c64"]
+title = "C64 PAL"
+default = true
+video = "pal"
+vicii = "6569"
+cycle_table = "pal"
+raster_lines = 312
+cpu_hz = 985248
+tod_hz = 50
+color_latency = true
+lightpen_retrigger_x = 2
+lightpen_irq = "new"
+luminances = "new"
+display_window = [16, 287]
+border = [32, 32]
+cia = "6526"
+sid = "6581"
+glue = "discrete"
+kernal = "kernal-901227-03.bin"
+basic = "basic-901226-01.bin"
+chargen = "chargen-901225-01.bin"
+
+[[model]]
+name = "c64-ntsc"
+aliases = ["ntsc"]
+title = "C64 NTSC"
+video = "ntsc"
+vicii = "6567R8"
+cycle_table = "ntsc"
+raster_lines = 263
+cpu_hz = 1022730
+tod_hz = 60
+color_latency = true
+lightpen_retrigger_x = 2
+lightpen_irq = "new"
+luminances = "new"
+display_window = [28, 274]
+border = [32, 32]
+cia = "6526"
+sid = "6581"
+glue = "discrete"
+kernal = "kernal-901227-03.bin"
+basic = "basic-901226-01.bin"
+chargen = "chargen-901225-01.bin"
+
+[[model]]
+name = "c64-paln"
+aliases = ["paln", "pal-n", "drean"]
+title = "C64 PAL-N (Drean)"
+video = "pal-n"
+vicii = "6572"
+cycle_table = "ntsc"
+raster_lines = 312
+cpu_hz = 1023440
+tod_hz = 50
+color_latency = true
+lightpen_retrigger_x = 2
+lightpen_irq = "new"
+luminances = "new"
+display_window = [16, 287]
+border = [32, 32]
+cia = "6526"
+sid = "6581"
+glue = "discrete"
+kernal = "kernal-901227-03.bin"
+basic = "basic-901226-01.bin"
+chargen = "chargen-901225-01.bin"
+
+[[model]]
+name = "c64c-pal"
+aliases = ["c64c"]
+title = "C64C PAL"
+video = "pal"
+vicii = "8565"
+cycle_table = "pal"
+raster_lines = 312
+cpu_hz = 985248
+tod_hz = 50
+color_latency = false
+lightpen_retrigger_x = 1
+lightpen_irq = "new"
+luminances = "new"
+display_window = [16, 287]
+border = [32, 32]
+cia = "6526A"
+sid = "8580"
+glue = "custom-ic"
+kernal = "kernal-901227-03.bin"
+basic = "basic-901226-01.bin"
+chargen = "chargen-901225-01.bin"
+
+[[model]]
+name = "c64c-ntsc"
+aliases = []
+title = "C64C NTSC"
+video = "ntsc"
+vicii = "8562"
+cycle_table = "ntsc"
+raster_lines = 263
+cpu_hz = 1022730
+tod_hz = 60
+color_latency = false
+lightpen_retrigger_x = 1
+lightpen_irq = "new"
+luminances = "new"
+display_window = [28, 274]
+border = [32, 32]
+cia = "6526A"
+sid = "8580"
+glue = "custom-ic"
+kernal = "kernal-901227-03.bin"
+basic = "basic-901226-01.bin"
+chargen = "chargen-901225-01.bin"
+
+[[model]]
+name = "c64-old-pal"
+aliases = ["oldpal"]
+title = "C64 old PAL"
+video = "pal"
+vicii = "6569R1"
+cycle_table = "pal"
+raster_lines = 312
+cpu_hz = 985248
+tod_hz = 50
+color_latency = true
+lightpen_retrigger_x = 2
+lightpen_irq = "old"
+luminances = "old"
+display_window = [16, 287]
+border = [32, 32]
+cia = "6526"
+sid = "6581"
+glue = "discrete"
+kernal = "kernal-901227-02.bin"
+basic = "basic-901226-01.bin"
+chargen = "chargen-901225-01.bin"
+
+[[model]]
+name = "c64-old-ntsc"
+aliases = ["oldntsc"]
+title = "C64 old NTSC"
+video = "ntsc-old"
+vicii = "6567R56A"
+cycle_table = "ntsc-old"
+raster_lines = 262
+cpu_hz = 1022730
+tod_hz = 60
+color_latency = true
+lightpen_retrigger_x = 2
+lightpen_irq = "old"
+luminances = "old"
+display_window = [28, 274]
+border = [32, 32]
+cia = "6526"
+sid = "6581"
+glue = "discrete"
+kernal = "kernal-901227-01.bin"
+basic = "basic-901226-01.bin"
+chargen = "chargen-901225-01.bin"

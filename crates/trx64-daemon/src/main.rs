@@ -79,6 +79,17 @@ struct Cli {
     #[arg(long, default_value = "u64ii")]
     speed_table: String,
 
+    /// Spec 863 — which C64 this is, applied before any cycle runs: a `models.toml` row
+    /// (`c64-pal` default, `c64-ntsc`, `c64-paln`, …). A row that needs a building block
+    /// this build lacks is refused at startup with the block's name.
+    #[arg(long, default_value = "c64-pal")]
+    model: String,
+
+    /// Spec 863 — shorthand for the two base rows: `pal` (= c64-pal) or `ntsc`
+    /// (= c64-ntsc). Overrides `--model`.
+    #[arg(long, value_parser = ["pal", "ntsc"])]
+    video: Option<String>,
+
     /// Spec 853 — attach a 17xx REU of this many KiB before anything runs: 128 (1700),
     /// 256 (1764), 512 (1750), or an oversized 1024..16384 with the wraparound bug a
     /// real 1750XL has. A CORE device, so this works on `c64` as well as `u64`.
@@ -215,6 +226,27 @@ struct TrapRule {
     /// Optional human decode line appended in parentheses (e.g.
     /// "k2 bit7 => DIRECT-overlay miss"). Empty = omitted.
     decode: String,
+}
+
+/// The `c64-pal` frame (312 × 63), for the tests that drive the default machine a frame at
+/// a time. Code asks the machine (`Machine::timing`).
+#[cfg(test)]
+const PAL_FRAME: u64 = 19_656;
+
+/// One audio window sent to the render thread: the SID writes in CPU order, the cycles
+/// they span, and the machine's Φ2 clock (Spec 863 — a switch re-samples reSID).
+type AudioWindow = (Vec<(u8, u8)>, u32, u32);
+
+/// Spec 863 — the pacing modes, by what they mean. Real time is the MODEL's frame rate
+/// (50.12 fps PAL, 59.83 NTSC), so the mode is "realtime"; "pal", what it was called while
+/// PAL was the only machine, is still accepted. `None` = not a mode.
+pub(crate) fn canonical_pacing(mode: &str) -> Option<&'static str> {
+    match mode {
+        "realtime" | "pal" => Some("realtime"),
+        "warp" => Some("warp"),
+        "fixed-ratio" => Some("fixed-ratio"),
+        _ => None,
+    }
 }
 
 /// Singleton session, kept in memory for the daemon's lifetime.
@@ -360,8 +392,12 @@ pub struct State {
     /// reports sid.streaming truthfully (live audio = streaming_enabled && running),
     /// mirroring TS `audioStreams.has(session_id)`. Was hardcoded false → SID light OFF.
     streaming_enabled: bool,
-    /// T1.3 — current pacing mode (RuntimeController.pacing.mode). One of "pal",
-    /// "warp", "fixed-ratio". Stored here because TRX64 has no autonomous pacing
+    /// Spec 863 — the model the clients were last told about (`av/hello`). A request that
+    /// leaves the machine on another row — a switch, a rewind across one, an undump or a
+    /// VSF of another model — is caught against this once it returns.
+    announced_model: &'static trx64_core::model::C64Model,
+    /// T1.3 — current pacing mode (RuntimeController.pacing.mode). One of "realtime"
+    /// (Spec 863; "pal" is accepted as its old name), "warp", "fixed-ratio". Stored here because TRX64 has no autonomous pacing
     /// loop; session/set_pacing sets it and debug/state reads it back exactly as the
     /// TS RuntimeController does (build_debug_state mirrors c.state()).
     pacing_mode: String,
@@ -587,7 +623,9 @@ struct AudioRenderThread {
     /// order, d_cycles for that window)`; the render thread replays them into the
     /// persistent engine, closes the boundary, flushes → PCM. `Send` (the engine
     /// never crosses here — only the data).
-    tx: std::sync::mpsc::Sender<(Vec<(u8, u8)>, u32)>,
+    /// (writes, cycles, the machine's Φ2 clock) — the clock rides along so a model switch
+    /// re-samples the persistent engine (Spec 863 D3).
+    tx: std::sync::mpsc::Sender<AudioWindow>,
     /// The PCM ring (render→main). The render thread pushes the reSID PCM it produced;
     /// `audioDrain()` pops accumulated samples (FIFO). NO engine access on drain.
     pcm: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<i16>>>,
@@ -5940,7 +5978,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 .iter()
                 .map(|m| {
                     let idx = ids.iter().position(|(i, _, _)| *i == m.id);
-                    let back = live.saturating_sub(m.cycles) as f64 / TRANSPORT_PAL_HZ;
+                    let back = st.session.machine.timing().seconds(live.saturating_sub(m.cycles));
                     format!(
                         "  {:<16} Cycle {:>12}  Frame {:>5}   -{:.2}s",
                         m.label.as_deref().unwrap_or("?"),
@@ -6028,6 +6066,29 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             }
             Ok(uci_report(&st.session.machine))
         }
+
+        // Spec 863 — which C64 this is. Bare `model` reports it and lists the rows; `model
+        // <row>` switches the running machine at the next frame boundary (not a power cycle).
+        "model" | "models" => match toks.get(1) {
+            None => Ok(model_report(st)),
+            // `monitor/exec` is an operating method, so the owner is whoever sent it.
+            Some(name) => {
+                let source = if st.control_owner == "llm" { "llm" } else { "human" };
+                switch_session_model(st, name, source, "monitor/exec").map(|v| {
+                    format!(
+                        "model: {} → {} at line {} cycle {} (c64Cycles {}) — the running program keeps its \
+                         state and the standard it detected at boot; `reset` or `power off`/`on` for a \
+                         clean start as {}",
+                        v["from"].as_str().unwrap_or("?"),
+                        v["model"].as_str().unwrap_or("?"),
+                        v["switchedAt"]["rasterLine"],
+                        v["switchedAt"]["rasterCycle"],
+                        v["switchedAt"]["c64Cycles"],
+                        v["model"].as_str().unwrap_or("?"),
+                    )
+                })
+            }
+        },
 
         // Spec 815 §4 — which machine this session claims to be, so a release's
         // turbo code path becomes reachable at all. Bare `turbo` REPORTS: a verb
@@ -6141,7 +6202,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 }
                 Some("off") | None => {
                     st.warp = false;
-                    Ok("WARP OFF (PAL real-time).".to_string())
+                    Ok("WARP OFF (real time — the model's frame rate).".to_string())
                 }
                 Some(other) => Err(format!("warp: unknown '{other}' (use on|off)")),
             }
@@ -6253,8 +6314,11 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                     let secs = v.min(600.0);
                     st.checkpoint_window_seconds = secs;
                     let frames = st.checkpoint_cadence_frames.max(1);
-                    let want =
-                        trx64_core::checkpoint_ring::checkpoint_ring_max_entries(secs, frames);
+                    let want = trx64_core::checkpoint_ring::checkpoint_ring_max_entries(
+                        secs,
+                        frames,
+                        st.session.machine.timing().nominal_fps,
+                    );
                     let cap = st.checkpoint_ring.set_max_entries(want);
                     Ok(format!(
                         "window: {secs:.1}s at every-{frames}-frames \u{2192} cap {cap} anchors\n  \
@@ -6284,7 +6348,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                     let (cad, secs, cap, held) = live(st);
                     Ok(format!(
                         "cadence: every {cad} frame(s) = {:.1} capture(s)/s, window {secs:.1}s \u{2192} cap {cap} entries ({held} held)\n                           (`cadence <frames> [seconds]` to change, e.g. `cadence 1` for a checkpoint every frame)",
-                        50.0 / cad as f64
+                        st.session.machine.timing().nominal_fps as f64 / cad as f64
                     ))
                 }
                 Some(f) => {
@@ -6295,7 +6359,11 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                         .unwrap_or(st.checkpoint_window_seconds);
                     st.checkpoint_cadence_frames = frames;
                     st.checkpoint_window_seconds = secs;
-                    let want = trx64_core::checkpoint_ring::checkpoint_ring_max_entries(secs, frames);
+                    let want = trx64_core::checkpoint_ring::checkpoint_ring_max_entries(
+                        secs,
+                        frames,
+                        st.session.machine.timing().nominal_fps,
+                    );
                     // `set_max_entries` grows the byte bound with the cap — eviction
                     // fires on whichever bound hits first, so a cap without a budget
                     // means asking for sixty seconds and quietly getting ten.
@@ -6303,7 +6371,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                     let held = st.checkpoint_ring.list().len();
                     let mut out = vec![format!(
                         "cadence: every {frames} frame(s) = {:.1} capture(s)/s, window {secs:.1}s \u{2192} cap {cap} entries ({held} held)",
-                        50.0 / frames as f64
+                        st.session.machine.timing().nominal_fps as f64 / frames as f64
                     )];
                     // The honest part: say what it will cost before it costs it. ~98 KiB
                     // resident per entry, measured (Spec 807 perf_bench).
@@ -7003,6 +7071,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 );
                 let cycle = m.c64_core.clk as i64;
                 let pc = m.c64_core.reg_pc as i64;
+                let machine_name = machine_model_name(m.speed_profile(), m.model());
                 let bytes = trx64_core::native_snapshot::write_native_snapshot(
                     trx64_core::native_snapshot::WriteNativeSnapshotArgs {
                         checkpoint,
@@ -7010,7 +7079,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                             trx64_core::c64re_snapshot::RUNTIME_CHECKPOINT_SCHEMA_VERSION,
                         media: media_inputs,
                         runtime_version: RUNTIME_VERSION.to_string(),
-                        machine_model: machine_model_name(m.speed_profile()).to_string(),
+                        machine_model: machine_name.clone(),
                         provenance: None,
                         pc,
                         cycle,
@@ -7037,7 +7106,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                         Ok(format!(
                             // `format=vN` closes the summary, as the reference does — a tool sanity-checking
                             // which snapshot version it just wrote had nothing to look at.
-                            "dumped {path}\n  cycle={cycle} pc=${:04x} machine=c64-pal\n  media: {media}\n  file={:.1}KB breakpoints={breakpoints} format=v{}",
+                            "dumped {path}\n  cycle={cycle} pc=${:04x} machine={machine_name}\n  media: {media}\n  file={:.1}KB breakpoints={breakpoints} format=v{}",
                             pc,
                             bytes.len() as f64 / 1024.0,
                             trx64_core::native_snapshot::NATIVE_SNAPSHOT_FORMAT_VERSION
@@ -7536,9 +7605,11 @@ fn monitor_help_text() -> String {
         "  MACHINE (the same verbs on every front-end — the cockpit\'s `/` prefix is input sugar)",
         "    run                       resume the machine (from a rewound point: cuts the anchors ahead)",
         "    pause                     stop the machine AND the transport; prints the ringbuffer range",
-        "    warp on|off               8\u{00d7} pacing / PAL real-time",
+        "    warp on|off               8\u{00d7} pacing / real time (the model's frame rate)",
         "    rawframe on|off           an anchor stores no picture, so stepping onto one REDRAWS it: two frames, keep the second, because the first is cut into wherever the anchor landed in the raster. That discards a ONE-FRAME event — a border opened for a frame, a bad raster split — so it looks like the ring never caught it. `on` keeps the FIRST frame, seam and all. Anchors that sit on a frame boundary use the first either way (whole, nothing lost). `transport/status` reports which you are looking at as `shownFrame`.",
         "    reset [warm|cold] · power on|off",
+        "    model                     which C64 this is (model, video standard, VIC-II, frame, clock), and every model this build knows — with what a model that cannot run is missing",
+        "    model <row>               switch the running machine to another model (c64-pal, c64-ntsc, c64-paln …) at the next frame boundary. Not a power cycle: the program keeps its state and the standard it detected at boot; `reset` or `power off`/`on` afterwards for a clean start on the new model. The model survives reset and power cycles.",
         "    turbo                     Spec 815 — which machine this session CLAIMS to be, so a release's turbo code path is reachable at all. A C64 answers $FF at $D02F-$D03F, the probe fails, and everything behind it is dead code.",
         "    turbo mode c64|128|u64    c64 (default) = open bus. 128 = the VIC-IIe pair $D02F/$D030 with VICE's read-back masks. u64 = an extended speed register at $D031. Survives a reset: it is machine identity, not chip state.",
         "    turbo on|off              set/clear the speed bit the way the release would ($D030 bit 0, or $D031)",
@@ -8890,6 +8961,17 @@ fn monitor_text(req: &Request, text: &str) -> Response {
 }
 
 pub fn dispatch(req: Request, state: &SharedState) -> Response {
+    let r = dispatch_request(req, state);
+    // Spec 863 — whatever the request did (a model switch, a rewind across one, an undump
+    // or a VSF of another model), the session and every client learn the machine's model
+    // here, in one place, instead of at every door that can change it.
+    if let Ok(mut st) = state.lock() {
+        sync_model_identity(&mut st);
+    }
+    r
+}
+
+fn dispatch_request(req: Request, state: &SharedState) -> Response {
     let id = req.id.clone();
     // Spec 767 (live-view) — flip the shared-session control owner to whoever issued this
     // OPERATING command (green border when the LLM is co-driving) BEFORE the handler runs.
@@ -9028,6 +9110,20 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             // TS runtimeSessions.start → attached=true when a machine is present). The
             // boot-time construct is the only attached=false; clients never observe it.
             let attached = true;
+            // Spec 863 — `model` chooses the C64 the session is. Asking for the model it
+            // already is attaches. Asking for another SWITCHES the shared machine the one
+            // way a model ever changes on it — at the next frame boundary, as the transplant
+            // `session/model` does, never a power cycle (the owner: "Switch von PAL → NTSC
+            // oder umgekehrt immer nur bei neuem Frame"). A machine that is off becomes that
+            // model at its next power-on. A row that cannot run is refused by name.
+            // (`pal`, the old boolean, is still accepted and ignored.)
+            let mut model_switch = Value::Null;
+            if let Some(name) = req.params.get("model").and_then(|v| v.as_str()) {
+                match switch_session_model(&mut st, name, owner_from_source(&req.params), "session/create") {
+                    Ok(v) => model_switch = v,
+                    Err(e) => return Response::err(id, -32602, format!("session/create: {e}")),
+                }
+            }
             // audit ws-session-debug-6 — session/create HONOURS trace_out/trace_domains
             // (+ device_id/pal/start_track/write_protected). TS (ws-server.ts:608-633):
             // threads all params; when trace_out is set it opens a session trace
@@ -9110,7 +9206,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             let pc = cpu.pc as u64;
             let c64_cycles = st.session.machine.clk;
             let disk_path = st.session.disk_path.clone();
-            Response::ok(id, json!({
+            let mut reply = json!({
                 "sessionId": "integrated-1",
                 "mode": "true-drive",
                 "diskPath": disk_path,
@@ -9118,7 +9214,37 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 "c64Cycles": c64_cycles,
                 "pc": pc,
                 "trace": trace_val
-            }))
+            });
+            merge_identity(&mut reply, st.session.machine.model());
+            if !model_switch.is_null() {
+                reply["modelSwitch"] = model_switch;
+            }
+            Response::ok(id, reply)
+        }
+
+        // Spec 863 — every row of `models.toml`, runnable or not (with the block it lacks),
+        // and which one the session is.
+        "session/models" => {
+            let st = state.lock().unwrap();
+            let current = st.session.machine.model().name.clone();
+            let rows: Vec<Value> = trx64_core::model::models().iter().map(trx64_core::model::row_json).collect();
+            Response::ok(id, json!({ "models": rows, "current": current }))
+        }
+
+        // Spec 863 D5 — switch the running machine to another model at the frame boundary:
+        // pause, advance to line 0, carry the whole state onto the new row, run on. Not a
+        // power cycle — the running program keeps its state and the standard it detected
+        // at boot. `{ name }`.
+        "session/model" => {
+            let Some(name) = req.params.get("name").or_else(|| req.params.get("model")).and_then(|v| v.as_str())
+            else {
+                return Response::err(id, -32602, "session/model: `name` is required (a models.toml row)");
+            };
+            let mut st = state.lock().unwrap();
+            match switch_session_model(&mut st, name, owner_from_source(&req.params), "session/model") {
+                Ok(v) => Response::ok(id, v),
+                Err(e) => Response::err(id, -32602, format!("session/model: {e}")),
+            }
         }
 
         "session/list" => {
@@ -9160,7 +9286,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 .params
                 .get("cycles")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(crate::streaming::CYC_PER_FRAME);
+                .unwrap_or(st.session.machine.timing().cycles_per_frame);
             // Spec 808 — ONE rule, both clocks: while the transport holds the machine,
             // nothing else advances it. The daemon's stream loop honours this in
             // streaming.rs; the in-process CLI cockpit pumps through session/run
@@ -9385,6 +9511,8 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             // TS session/state (ws-server.ts:531) emits stopReason ONLY when set
             // (stopInfo?.reason → undefined omits the key).
             if let Some(r) = stop_reason { state_json["stopReason"] = json!(r); }
+            // Spec 863 D7 — what the machine is: model, video standard, chip, frame, clock.
+            merge_identity(&mut state_json, machine.model());
             // Spec 767 (live-view) — report the shared-session control owner so the UI can
             // SEED the border colour on (re)connect (it otherwise only learns the owner
             // from the one-shot `debug/control` broadcast, missed on a late attach).
@@ -9743,7 +9871,9 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
         }
 
         // session/set_pacing — T1.3. TS ws-server.ts:1378.
-        // Validates mode ∈ {"pal","warp","fixed-ratio"} (-32602 on bad mode).
+        // Validates mode ∈ {"realtime" (alias "pal"),"warp","fixed-ratio"} (-32602 on bad
+        // mode). Spec 863 — real time is the model's frame rate, not PAL's: the mode is
+        // "realtime", and "pal" (what it used to be called) is still accepted.
         // Calls ctrl.setPacing(mode, ratio): stores mode unconditionally; stores ratio
         // only if it is truthy AND > 0 (mirrors runtime-controller.ts:329-331).
         // TRX64 has no autonomous pacing loop (no resetPaceEpoch), so we only update
@@ -9753,9 +9883,10 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 Some(m) => m.to_string(),
                 None => return Response::err(id, -32602, "bad pacing mode: null"),
             };
-            if !matches!(mode.as_str(), "pal" | "warp" | "fixed-ratio") {
+            let Some(mode) = canonical_pacing(&mode) else {
                 return Response::err(id, -32602, format!("bad pacing mode: {mode}"));
-            }
+            };
+            let mode = mode.to_string();
             let ratio = req.params.get("ratio").and_then(|v| v.as_f64());
             let mut st = state.lock().unwrap();
             st.pacing_mode = mode;
@@ -9996,26 +10127,8 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 );
             }
             let start = st.session.machine.clk;
-            // Two frames of slack: at most one to reach the wrap, plus room for a
-            // long instruction straddling it.
-            let cap = 2 * 19_656u64 + 128;
-            let mut prev_line = st.session.machine.vic.raster_line;
-            let mut landed = prev_line == 0;
-            while !landed && st.session.machine.clk.saturating_sub(start) < cap {
-                run_cycle_budget(&mut st.session, 1);
-                let line = st.session.machine.vic.raster_line;
-                landed = line == 0 && prev_line != 0;
-                prev_line = line;
-            }
-            if !landed {
-                return Response::err(
-                    id,
-                    -32003,
-                    format!(
-                        "session/advance_to_frame: no raster wrap within {cap} cycles — \
-                         the VIC is not sweeping (raster stuck at line {prev_line})"
-                    ),
-                );
+            if let Err(e) = advance_to_frame_boundary(&mut st.session) {
+                return Response::err(id, -32003, format!("session/advance_to_frame: {e}"));
             }
             Response::ok(id, json!({
                 "c64Cycles": st.session.machine.clk,
@@ -10095,6 +10208,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             let st = state.lock().unwrap();
             let mut body = monitor_machine_json(&st);
             body["asmCursor"] = json!(st.mon.asm_cursor);
+            merge_identity(&mut body, st.session.machine.model());
             Response::ok(id, body)
         }
 
@@ -10190,6 +10304,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 Some(cyc) => {
                     st.run_cap_clk = Some(st.session.machine.clk.saturating_add(cyc));
                     if let Some(pace) = req.params.get("pace").and_then(|v| v.as_str()) {
+                        let pace = canonical_pacing(pace).unwrap_or(pace);
                         if pace != st.pacing_mode {
                             st.run_cap_restore_pace = Some(st.pacing_mode.clone());
                             st.pacing_mode = pace.to_string();
@@ -12263,7 +12378,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
         }
 
         // c64re audio/export (ws-server.ts:1704): run the session for duration_sec
-        // PAL seconds, harvest reSID PCM, write a stereo WAV → { out_path,
+        // seconds of the machine's clock, harvest reSID PCM, write a stereo WAV → { out_path,
         // duration_sec, sample_rate, samples, bytes }. TRX64 drives the SAME
         // SidAudioEngine the streaming loop uses: install the additive $D4xx write
         // hook, run the machine in ~1024-sample slices (= exportSessionAudio cadence),
@@ -12994,11 +13109,14 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 req.params.get("y").and_then(|v| v.as_u64()),
             ) {
                 (Some(x), Some(y)) if x < 320 && y < 200 => {
-                    let (_w, _h, rgba) = m.render_canvas_rgba();
-                    // Display origin in the 384×272 canvas is (32, 35).
-                    let cx = 32 + x as usize;
-                    let cy = 35 + y as usize;
-                    let off = (cy * trx64_core::render::CANVAS_W + cx) * 4;
+                    let (cw, _h, rgba) = m.render_canvas_rgba();
+                    // Display origin in the canvas: the left border's width, and display
+                    // row 0 (raster 51) below the window's first line — (32, 35) on PAL,
+                    // (32, 23) on NTSC.
+                    let win = &m.model().window;
+                    let cx = win.border_left as usize + x as usize;
+                    let cy = (51 - win.first_line as usize) + y as usize;
+                    let off = (cy * cw + cx) * 4;
                     json!({ "x": x, "y": y, "rgba": [rgba[off], rgba[off+1], rgba[off+2], rgba[off+3]] })
                 }
                 _ => serde_json::Value::Null,
@@ -13012,8 +13130,8 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 "bitmap": bitmap,
                 "border": (v(0x20) & 0xf) as u64,
                 "background": (v(0x21) & 0xf) as u64,
-                "width": trx64_core::render::CANVAS_W,
-                "height": trx64_core::render::CANVAS_H,
+                "width": m.model().window.width(),
+                "height": m.model().window.height(),
                 "pixel": pixel
             }))
         }
@@ -13077,6 +13195,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 None => return Response::err(id, -32001, "vic/inspect/open: capture vanished from ring"),
             };
             let frame_snap = trx64_core::vic_inspect::build_vic_inspect_snapshot(&snapshot).to_json();
+            let vis = trx64_core::vic_inspect::visible_frame(&snapshot);
             let provenance = snapshot.get("vicProvenance").cloned().filter(|p| !p.is_null());
             let run_state = if st.session.running { "running" } else { "paused" };
             Response::ok(id, json!({
@@ -13085,8 +13204,8 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 "provenance": provenance,
                 "runState": run_state,
                 "geometry": {
-                    "visible": { "width": trx64_core::vic_inspect::VISIBLE_FRAME_W, "height": trx64_core::vic_inspect::VISIBLE_FRAME_H },
-                    "displayOrigin": { "x": trx64_core::vic_inspect::DISPLAY_ORIGIN_X, "y": trx64_core::vic_inspect::DISPLAY_ORIGIN_Y },
+                    "visible": { "width": vis.0, "height": vis.1 },
+                    "displayOrigin": { "x": vis.2, "y": vis.3 },
                     "cell": { "w": 8, "h": 8, "cols": 40, "rows": 25 },
                 },
             }))
@@ -13525,7 +13644,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 .params
                 .get("cycles")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(crate::streaming::CYC_PER_FRAME);
+                .unwrap_or(st.session.machine.timing().cycles_per_frame);
             let budget = if st.warp { elapsed.saturating_mul(8) } else { elapsed };
 
             // 1. The transport owns the frame while it is rewound or playing back.
@@ -13652,10 +13771,12 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             match req.params.get("arm").and_then(|v| v.as_bool()) {
                 Some(true) => {
                     let cycle = st.session.machine.clk;
+                    let model = st.session.machine.model().name.as_str();
                     st.input_journal = Some(InputJournal {
                         armed_at_cycle: cycle,
                         entries: Vec::new(),
                         dropped: 0,
+                        model,
                     });
                     Response::ok(id, input_journal_json(&st))
                 }
@@ -13873,7 +13994,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 Ok(r) => {
                     let used = st.checkpoint_ring.marks().len();
                     Response::ok(id, json!({
-                        "mark": mark_json(&r, &ids, st.session.machine.c64_core.clk),
+                        "mark": mark_json(&r, &ids, st.session.machine.c64_core.clk, &st.session.machine.timing()),
                         "used": used,
                         "cap": trx64_core::checkpoint_ring::RuntimeCheckpointRing::MAX_MARKS,
                         "message": format!("MARK {name} @ Cycle {}", r.cycles),
@@ -13890,7 +14011,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 .checkpoint_ring
                 .marks()
                 .iter()
-                .map(|m| mark_json(m, &ids, live))
+                .map(|m| mark_json(m, &ids, live, &st.session.machine.timing()))
                 .collect();
             let cap = st.checkpoint_ring.max_entries().max(1) as f64;
             let secs = st.checkpoint_window_seconds;
@@ -14093,12 +14214,13 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             // Audit ws-checkpoint-scrub-2 — an auto-capture anchor OMITS the two VIC
             // framebuffers (BUG-049 — they are a derivable shadow), so a paused restore
             // would leave the live `displayed` buffer stale/black. Honour render:true by
-            // re-simulating ONE PAL frame after the state restore so the framebuffer is
+            // re-simulating ONE frame after the state restore so the framebuffer is
             // regenerated from the rolled-back RAM/VIC state (runtime-controller.ts:599-601
             // `runFor(PAL_CYCLES_PER_FRAME)`). The ~1-frame advance is invisible in a
             // paused preview; the exact-state path (runtime_rewind) passes no render.
             if render {
-                run_cycle_budget(&mut st.session, crate::streaming::CYC_PER_FRAME);
+                let frame = st.session.machine.timing().cycles_per_frame;
+                run_cycle_budget(&mut st.session, frame);
             }
             let restored = st.checkpoint_ring.get(&cp_id).map(|r| r.to_json());
             // Run-state resolution (runtime-controller.ts:541-552/588):
@@ -14329,7 +14451,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                 }))
                 .collect();
             let breakpoints = st.breakpoints.entries.len() as u64;
-            let model_name = machine_model_name(st.session.machine.speed_profile());
+            let model_name = machine_model_name(st.session.machine.speed_profile(), st.session.machine.model());
             drop(st);
 
             let bytes = trx64_core::native_snapshot::write_native_snapshot(
@@ -14352,7 +14474,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                     "path": path,
                     "cycle": cycle as u64,
                     "pc": pc as u64,
-                    "machine": "c64-pal",
+                    "machine": model_name,
                     "media": media_summary,
                     "fileBytes": bytes.len() as u64,
                     "breakpoints": breakpoints
@@ -14428,7 +14550,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             // sha256/bytes) — matches c64re's DumpResult.media.
             let media_summary = gather_snapshot_media(&st.session);
             let breakpoints = st.breakpoints.entries.len() as u64;
-            let model_name = machine_model_name(st.session.machine.speed_profile());
+            let model_name = machine_model_name(st.session.machine.speed_profile(), st.session.machine.model());
             drop(st);
 
             let bytes = trx64_core::native_snapshot::write_native_snapshot(
@@ -14451,7 +14573,7 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                     "path": path,
                     "cycle": cycle as u64,
                     "pc": pc as u64,
-                    "machine": "c64-pal",
+                    "machine": model_name,
                     "media": media_summary,
                     "fileBytes": bytes.len() as u64,
                     "breakpoints": breakpoints
@@ -15039,8 +15161,15 @@ fn scenario_summary_src(s: &Value, source: &str, file_path: &str) -> Value {
     // absolute on-disk path of the scenario JSON) — a missing field vs the TS authority
     // (audit ws-trace-monitor-misc-20). For an in-memory-only scenario the TS registry
     // has no on-disk file yet, so `file_path` is "" there.
+    //
+    // Spec 863 — and `model`, the machine the scenario was recorded on (a recording carries
+    // the model its input journal was armed on). Its `cycleBudget` and input cycles are that
+    // machine's cycles, so a client turning them into seconds needs that machine's clock,
+    // not the running one's. `null` for a scenario that names no model: it replays on
+    // whichever machine runs it.
     json!({
         "id": s.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+        "model": s.get("model").and_then(|v| v.as_str()),
         "diskPath": s.get("diskPath").and_then(|v| v.as_str()).unwrap_or(""),
         "mode": s.get("mode").and_then(|v| v.as_str()).unwrap_or("true-drive"),
         "cycleBudget": s.get("cycleBudget").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -15541,7 +15670,7 @@ fn capture_media_checkpoint(st: &mut State) -> Option<String> {
 // per-frame lock window (gen/hash checks are cheap; the actual persist/capture is
 // throttled/debounced), and the stream loop only calls them while `running`.
 
-/// BUG-040 cart auto-persist debounce in stream-loop FRAMES (~50 fps PAL). The TS
+/// BUG-040 cart auto-persist debounce (was stream-loop FRAMES, ~50 fps PAL). The TS
 /// debounce is CART_AUTOPERSIST_DEBOUNCE_MS = 5_000 (runtime-controller.ts:100) —
 /// long enough to coalesce an EAPI write/erase burst, short enough that a crash
 /// loses little. (audit ws-media-3 / background-workers-async-10): WALL-CLOCK ms,
@@ -15591,14 +15720,16 @@ fn checkpoint_ring_seconds() -> f64 {
         .unwrap_or(trx64_core::checkpoint_ring::DEFAULT_CHECKPOINT_RING_SECONDS)
 }
 
-/// Spec 772 — max LIVE ring entries (the UI-scrub cap) = ceil(seconds / (cadence/50))
-/// (PAL 50 fps). At the 10s / 25-frame default that is 20. 1:1 with the c64re
+/// Spec 772 — max LIVE ring entries (the UI-scrub cap) = ceil(seconds / (cadence/fps)) at
+/// the default model's nominal rate (the session's own is applied when it is set — see
+/// `apply_ring_rate`). At the 10s / 25-frame PAL default that is 20. 1:1 with the c64re
 /// `checkpointRingMaxEntries` (runtime-checkpoint-ring.ts). Clamped ≥ 1.
 fn checkpoint_ring_max_entries() -> u64 {
-    let seconds = checkpoint_ring_seconds();
-    let cadence = checkpoint_capture_every_frames() as f64;
-    let seconds_per_capture = cadence / 50.0; // PAL 50fps
-    ((seconds / seconds_per_capture).ceil() as u64).max(1)
+    trx64_core::checkpoint_ring::checkpoint_ring_max_entries(
+        checkpoint_ring_seconds(),
+        checkpoint_capture_every_frames(),
+        trx64_core::model::default_model().timing.nominal_fps,
+    )
 }
 
 /// ITEM 1 — cart auto-persist (.crt lazy writeback). = maybeAutoPersistCart
@@ -15757,12 +15888,13 @@ pub(crate) fn stream_maybe_autocapture(st: &mut State, frame: u64, elapsed_cycle
     // symptom was "I only get about 2 seconds back", and it was not the playback speed:
     // the recording itself was four times too dense.
     //
-    // Cycles are the honest unit. One PAL frame is 19656 of them however often anyone
-    // calls, and a caller that hands over a whole frame's worth still captures once.
+    // Cycles are the honest unit. One frame is the model's frame (19 656 PAL, 17 095 NTSC)
+    // however often anyone calls, and a caller that hands over a whole frame's worth still
+    // captures once.
     st.autocapture_cycles_since = st
         .autocapture_cycles_since
         .wrapping_add(elapsed_cycles.max(1));
-    let per_capture = crate::streaming::CYC_PER_FRAME * st.checkpoint_cadence_frames.max(1);
+    let per_capture = st.session.machine.timing().cycles_per_frame * st.checkpoint_cadence_frames.max(1);
     if st.autocapture_cycles_since < per_capture {
         return;
     }
@@ -15860,6 +15992,8 @@ fn store_checkpoint_thumb(st: &mut State, id: String, thumb: CheckpointThumb) {
 /// advances the machine `cycleBudget` cycles (composite macros).
 struct MachineScenarioTarget<'a> {
     session: &'a mut Session,
+    /// Spec 863 — every model switch the replay performed: `{ cycle, from, name }`.
+    switches: Vec<Value>,
 }
 
 impl<'a> trx64_core::scenario_player::ScenarioTarget for MachineScenarioTarget<'a> {
@@ -15883,6 +16017,23 @@ impl<'a> trx64_core::scenario_player::ScenarioTarget for MachineScenarioTarget<'
     fn trigger_restore_nmi(&mut self) {}
     fn run_for(&mut self, cycles: u64) {
         run_cycle_budget(self.session, cycles);
+    }
+    /// Spec 863 — the transplant a live `session/model` performs, at the cycle the
+    /// recording performed it (the player fires it there; the machine is at a frame
+    /// boundary by construction, so the advance is zero).
+    fn switch_model(&mut self, name: &str) -> Result<u64, String> {
+        let row = trx64_core::model::resolve(name)?;
+        let from = self.session.machine.model();
+        if !std::ptr::eq(from, row) {
+            let t = switch_at_frame_boundary(self.session, row)?;
+            self.switches.push(json!({
+                "cycle": t["switchedAt"]["c64Cycles"],
+                "rasterLine": t["switchedAt"]["rasterLine"],
+                "from": from.name,
+                "name": row.name,
+            }));
+        }
+        Ok(row.timing.cycles_per_frame)
     }
 }
 
@@ -15910,6 +16061,12 @@ fn scenario_steps_from_inputs(inputs: &[Value]) -> Vec<trx64_core::scenario_play
             },
             "joystick1" => ScenarioStepKind::Joy1 { state: joy(&payload) },
             "joystick2" => ScenarioStepKind::Joy2 { state: joy(&payload) },
+            // Spec 863 — a model switch, as the input journal recorded it: the payload is
+            // the row's name (or `{ name }`, the journal entry's detail).
+            "model" => match payload.as_str().or_else(|| payload.get("name").and_then(|v| v.as_str())) {
+                Some(name) => ScenarioStepKind::Model { name: name.to_string() },
+                None => continue,
+            },
             _ => continue, // unknown input kind → skip (forward-compatible)
         };
         out.push(ScenarioStep {
@@ -16069,7 +16226,7 @@ fn scan_recent_media(recent: &[RecentMedia]) -> Vec<Value> {
 
 // ── Spec 263 — one-shot audio export ─────────────────────────────────────────
 // audio/export driver (= exportSessionAudio, audio/export.ts): run the session for
-// `duration_sec` PAL seconds, harvesting reSID PCM into a stereo WAV. Drives the
+// `duration_sec` seconds of the machine's clock, harvesting reSID PCM into a stereo WAV. Drives the
 // SAME SidAudioEngine the live stream uses (streaming.rs): install the additive
 // $D4xx write-trace hook, run the machine in ~1024-sample slices, record the writes
 // then a frame boundary per slice, flush, and finally export_wav. Returns the c64re
@@ -16082,10 +16239,10 @@ fn export_session_audio(
     use trx64_core::resid_audio::{SidAudioEngine, WavFormat};
     use trx64_core::resid_ffi::ResidConfig;
 
-    const PAL_CYCLES_PER_SEC: f64 = 985_248.0;
+    let cycles_per_sec = session.machine.timing().cpu_hz as f64;
     let sample_rate: u32 = 44100;
 
-    let mut engine = SidAudioEngine::new(ResidConfig::default());
+    let mut engine = SidAudioEngine::new(ResidConfig::for_model(session.machine.model()));
     // The Send write-trace hook captures only (addr,value) bytes (the engine stays
     // on this thread). Drained into the engine per slice, exactly like streaming.rs.
     let writes: Arc<Mutex<Vec<(u8, u8)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -16106,9 +16263,9 @@ fn export_session_audio(
     engine.flush();
     let _ = engine.take_pcm(); // discard priming silence
 
-    let total_cycles = (duration_sec * PAL_CYCLES_PER_SEC).floor() as u64;
+    let total_cycles = (duration_sec * cycles_per_sec).floor() as u64;
     // ~1024 samples worth of cycles per slice (= exportSessionAudio sliceCycles).
-    let slice_cycles = ((1024.0 * PAL_CYCLES_PER_SEC) / sample_rate as f64).floor() as u64;
+    let slice_cycles = ((1024.0 * cycles_per_sec) / sample_rate as f64).floor() as u64;
     let slice_cycles = slice_cycles.max(1);
 
     let mut consumed: u64 = 0;
@@ -16204,6 +16361,18 @@ fn serialise_batch_results(entry: &BatchEntry) -> Value {
 /// Returns a ReplayResult-shaped object (`ramHash`, `cyclesRan`, plus the start/end
 /// PC + cycle for cross-checking). A re-run on the same build hashes identically.
 fn run_scenario(st: &mut State, scenario: &Value) -> Result<Value, String> {
+    // Spec 863 — a scenario recorded on one model does not replay on another: its inputs
+    // are stamped in cycles of that machine's clock and frame. Refuse, naming both.
+    if let Some(recorded) = scenario.get("model").and_then(|v| v.as_str()) {
+        let here = st.session.machine.model();
+        let same = trx64_core::model::find(recorded).is_some_and(|m| std::ptr::eq(m, here));
+        if !same {
+            return Err(format!(
+                "scenario was recorded on {recorded}, this machine is {} — its inputs are timed in the other machine's cycles",
+                here.name
+            ));
+        }
+    }
     use trx64_core::scenario_player::ScenarioPlayer;
 
     // (1) Restore the start snapshot if one is provided. `startSnapshot` may be a
@@ -16250,7 +16419,7 @@ fn run_scenario(st: &mut State, scenario: &Value) -> Result<Value, String> {
         .cloned()
         .unwrap_or_default();
     let steps = scenario_steps_from_inputs(&inputs);
-    let mut player = ScenarioPlayer::new(steps, None);
+    let mut player = ScenarioPlayer::new(steps, st.session.machine.timing().cycles_per_frame);
 
     // (3) Run cycleBudget cycles from the current clock, firing inputs at their
     // cycles. Run in segments bounded by the next due input (scenario.ts:123-146).
@@ -16264,11 +16433,15 @@ fn run_scenario(st: &mut State, scenario: &Value) -> Result<Value, String> {
 
     let mut target = MachineScenarioTarget {
         session: &mut st.session,
+        switches: Vec::new(),
     };
     loop {
         let now = target.session.machine.cpu6510.clk;
         // Fire any due inputs as of `now`.
         player.tick(&mut target, now);
+        if let Some(why) = player.failure() {
+            return Err(format!("the replay stopped at cycle {now}: {why}"));
+        }
         if now >= end_clk {
             break;
         }
@@ -16292,6 +16465,11 @@ fn run_scenario(st: &mut State, scenario: &Value) -> Result<Value, String> {
     // Fire any inputs that landed exactly at the end.
     let final_now = target.session.machine.cpu6510.clk;
     player.tick(&mut target, final_now);
+    if let Some(why) = player.failure() {
+        return Err(format!("the replay stopped at cycle {final_now}: {why}"));
+    }
+
+    let switches = std::mem::take(&mut target.switches);
 
     // (4) Hash the end RAM (scenario.ts:165 — sha256(c64Bus.ram)).
     let end_clk_actual = st.session.machine.cpu6510.clk;
@@ -16306,6 +16484,9 @@ fn run_scenario(st: &mut State, scenario: &Value) -> Result<Value, String> {
         "endCycle": end_clk_actual,
         "startPc": start_pc,
         "endPc": end_pc,
+        // Spec 863 — where the replay switched models, and what it ended on.
+        "modelSwitches": switches,
+        "model": st.session.machine.model().name,
     }))
 }
 
@@ -16329,10 +16510,13 @@ pub(crate) struct InputJournalEntry {
     /// The master clock when the daemon applied it. NOT a wall-clock time and NOT a
     /// client timestamp — see the note on `State::input_journal`.
     cycle: u64,
-    /// `key` | `joystick` | `insert`. Three kinds, because these are the three things a
-    /// C64 can RECEIVE. Scrubbing, rewinding and poking memory are things done TO the
-    /// machine by an operator; a scenario that replayed them would not be replaying a
-    /// session (Spec 814 §8).
+    /// `key` | `joystick` | `insert` — the three things a C64 can RECEIVE — and `model`.
+    /// Scrubbing, rewinding and poking memory are things done TO the machine by an
+    /// operator; a scenario that replayed them would not be replaying a session (Spec 814
+    /// §8). A model switch is done to the machine too, but it changes what every later
+    /// cycle and frame of the recording means, so a replay has to perform it: it is
+    /// recorded at the cycle it happened on (a frame boundary), with `detail.name` the row
+    /// and `detail.from` the row before (Spec 863).
     kind: &'static str,
     /// `human` | `llm`. The session is SHARED, so a recording is what happened to this
     /// machine, all of it — and then says where each piece came from. Recording only the
@@ -16354,6 +16538,9 @@ pub(crate) struct InputJournal {
     /// a truncated recording that does not SAY it is truncated is a recording that
     /// replays to the wrong place and blames the runtime.
     dropped: u64,
+    /// Spec 863 — the model the recording was made on. An input stamped by cycle means
+    /// nothing on a machine with another clock and another frame, so a replay names it.
+    model: &'static str,
 }
 
 /// The cap. Generous for any real recording (a long play-through is hundreds of inputs),
@@ -16411,6 +16598,7 @@ fn input_journal_json(st: &State) -> Value {
             "armed": true,
             "armedAtCycle": j.armed_at_cycle,
             "cycle": st.session.machine.clk,
+            "model": j.model,
             "dropped": j.dropped,
             "entries": j.entries.iter().map(|e| json!({
                 "cycle": e.cycle,
@@ -16609,7 +16797,7 @@ fn line_trace_record(
         .and_then(trx64_core::native_snapshot::ta_u8_decode)
         .filter(|fb| fb.len() >= trx64_core::render::FB_W * trx64_core::render::FB_H);
     let displayed_start = lt::displayed_frame_start(&scratch);
-    let next_start = scratch.c64_core.clk - lt::frame_position(&scratch) + lt::CYCLES_PER_FRAME;
+    let next_start = lt::next_frame_start(&scratch);
     let best = anchor.iter().filter(|r| r.cycles <= displayed_start).max_by_key(|r| r.cycles).map(|r| r.id.clone());
     let anchor_cp = match &best {
         Some(aid) => state.lock().unwrap().checkpoint_ring.restore_snapshot(aid),
@@ -16711,8 +16899,6 @@ fn transport_reply(status: &Value) -> String {
 // what makes the TUI's `/window`, the C64RE UI and every register panel correct for
 // free, and it is why §2's feature parity costs nothing.
 
-/// PAL master clock — for turning a cycle delta into the "-3.2s" the status line shows.
-const TRANSPORT_PAL_HZ: f64 = 985_248.444;
 
 /// The ring's anchors, oldest-first, as `(id, frame, cycles)`.
 fn transport_anchor_ids(st: &State) -> Vec<(String, u64, u64)> {
@@ -16723,12 +16909,11 @@ fn transport_anchor_ids(st: &State) -> Vec<(String, u64, u64)> {
         .collect()
 }
 
-/// How far behind the head a position is, in seconds of emulated time.
-fn transport_seconds_behind(ids: &[(String, u64, u64)], pos: &transport::Position) -> f64 {
+/// How far behind the head a position is, in seconds of emulated time (the machine's
+/// clock — Spec 863).
+fn transport_seconds_behind(ids: &[(String, u64, u64)], pos: &transport::Position, t: &trx64_core::model::Timing) -> f64 {
     match ids.last() {
-        Some((_, _, head_cycles)) => {
-            (head_cycles.saturating_sub(pos.cycles)) as f64 / TRANSPORT_PAL_HZ
-        }
+        Some((_, _, head_cycles)) => t.seconds(head_cycles.saturating_sub(pos.cycles)),
         None => 0.0,
     }
 }
@@ -16739,7 +16924,8 @@ fn transport_seconds_behind(ids: &[(String, u64, u64)], pos: &transport::Positio
 fn transport_status(st: &State) -> Value {
     let ids = transport_anchor_ids(st);
     let pos = transport::locate(&ids, st.transport.cursor.as_deref());
-    let secs = pos.as_ref().map(|p| transport_seconds_behind(&ids, p)).unwrap_or(0.0);
+    let t = st.session.machine.timing();
+    let secs = pos.as_ref().map(|p| transport_seconds_behind(&ids, p, &t)).unwrap_or(0.0);
     let mut v = transport::status_json(&st.transport, pos.as_ref(), secs);
     // The range rides EVERY status, not just the transport `pause` verb — F11 runs the
     // cockpit `/pause`, so hanging it off the verb meant it was never actually seen.
@@ -16812,23 +16998,18 @@ fn transport_move_to(st: &mut State, index: usize) -> Result<Value, String> {
         //   * Otherwise draw both and keep whichever the caller asked for. The default
         //     stays the clean second frame; `raw` keeps the first, seam and all. For a
         //     raster bug the seam IS the information.
-        let on_boundary = st.session.machine.vic.raster_line == 0
+        // (The displayed frame's boundary: line 0 on PAL, the vsync line — 12 — on NTSC.)
+        let first_line = st.session.machine.model().window.vsync_line().unwrap_or(0);
+        let on_boundary = st.session.machine.vic.raster_line == first_line
             && st.session.machine.vic.raster_cycle <= 1;
         let want_first = on_boundary || st.transport_raw_frame;
-        st.session.machine.run_for_full(
-            crate::streaming::CYC_PER_FRAME,
-            &mut sink,
-            |_, _, _, _, _, _, _| {},
-        );
+        let frame = st.session.machine.timing().cycles_per_frame;
+        st.session.machine.run_for_full(frame, &mut sink, |_, _, _, _, _, _, _| {});
         let first = st.session.machine.vic.displayed.clone();
         let drawn = if want_first {
             first
         } else {
-            st.session.machine.run_for_full(
-                crate::streaming::CYC_PER_FRAME,
-                &mut sink,
-                |_, _, _, _, _, _, _| {},
-            );
+            st.session.machine.run_for_full(frame, &mut sink, |_, _, _, _, _, _, _| {});
             st.session.machine.vic.displayed.clone()
         };
         restore_live_checkpoint(&mut st.session, &cp)?;
@@ -16866,11 +17047,12 @@ fn transport_step(st: &mut State, delta: i64) -> Result<Value, String> {
         let frame_no = st.ctrl_frame;
         {
             let (w, h, indices) = st.session.machine.render_canvas_indices();
-            stream_maybe_autocapture(st, frame_no, crate::streaming::CYC_PER_FRAME, w, h, &indices);
+            let frame = st.session.machine.timing().cycles_per_frame;
+            stream_maybe_autocapture(st, frame_no, frame, w, h, &indices);
         }
         let mut sink = trx64_core::NullSink;
         st.session.machine.run_for_full(
-            crate::streaming::CYC_PER_FRAME * delta as u64,
+            st.session.machine.timing().cycles_per_frame * delta as u64,
             &mut sink,
             |_, _, _, _, _, _, _| {},
         );
@@ -16980,7 +17162,8 @@ fn transport_play(st: &mut State, dir: transport::Direction, speed: u32) -> Resu
     // 20 anchors = 0.4 s, so `play back` reaches the oldest frame before you let go of
     // the key and then looks stuck. That is the cadence, not a fault, and the reply has
     // to say so rather than leave the user pressing the key harder.
-    let span = ids.len() as f64 * st.checkpoint_cadence_frames.max(1) as f64 / 50.0;
+    let span = ids.len() as f64 * st.checkpoint_cadence_frames.max(1) as f64
+        / st.session.machine.timing().nominal_fps as f64;
     if span < 2.0 {
         out["line"] = json!(format!(
             "{}\n  only {:.1}s of rewind here ({} anchors at every-{}-frames) \u{2014} `cadence 1` gives the full window",
@@ -16996,14 +17179,19 @@ fn transport_play(st: &mut State, dir: transport::Direction, speed: u32) -> Resu
 
 /// Spec 809 — one shape for a mark, so the monitor line and the UI sidebar cannot
 /// describe the same mark differently.
-fn mark_json(m: &trx64_core::checkpoint_ring::RuntimeCheckpointRef, ids: &[(String, u64, u64)], live: u64) -> Value {
+fn mark_json(
+    m: &trx64_core::checkpoint_ring::RuntimeCheckpointRef,
+    ids: &[(String, u64, u64)],
+    live: u64,
+    t: &trx64_core::model::Timing,
+) -> Value {
     let index = ids.iter().position(|(i, _, _)| *i == m.id);
     json!({
         "name": m.label,
         "anchorId": m.id,
         "cycle": m.cycles,
         "frame": index.map(|i| i as u64 + 1),
-        "secondsBack": live.saturating_sub(m.cycles) as f64 / TRANSPORT_PAL_HZ,
+        "secondsBack": t.seconds(live.saturating_sub(m.cycles)),
     })
 }
 
@@ -17020,7 +17208,8 @@ fn transport_range_line(st: &State) -> String {
     let first = ids[0].2;
     let last = ids[ids.len() - 1].2;
     let span = last.saturating_sub(first);
-    let secs = span as f64 / TRANSPORT_PAL_HZ;
+    let t = st.session.machine.timing();
+    let secs = t.seconds(span);
     let live = st.session.machine.c64_core.clk;
     let n = ids.len();
     let pos = transport::locate(&ids, st.transport.cursor.as_deref());
@@ -17032,7 +17221,7 @@ fn transport_range_line(st: &State) -> String {
     // step means frames were not captured — the machine was paused, an op skipped the
     // capture, or something evicted mid-run. Reporting the worst gap turns "something is
     // missing at the start" from an argument into a number.
-    let expect = crate::streaming::CYC_PER_FRAME * st.checkpoint_cadence_frames.max(1);
+    let expect = t.cycles_per_frame * st.checkpoint_cadence_frames.max(1);
     let mut worst = 0u64;
     let mut worst_at = 0u64;
     let mut gaps = 0usize;
@@ -17051,12 +17240,12 @@ fn transport_range_line(st: &State) -> String {
     } else {
         format!(
             "{gaps} GAP(S) — worst {worst} cyc ({:.2}s) after Cycle {worst_at}, expected {expect}",
-            worst as f64 / TRANSPORT_PAL_HZ
+            t.seconds(worst)
         )
     };
     // How far back the window reaches from NOW — the number actually being asked about
     // when someone says "the beginning is missing".
-    let behind = live.saturating_sub(first) as f64 / TRANSPORT_PAL_HZ;
+    let behind = t.seconds(live.saturating_sub(first));
     format!(
         "RINGBUFFER SIZE {n} (starts at Cycle {first} Frame 1 // ends at Cycle {last} Frame {n})\n           span {span} cyc = {secs:.2}s   ·   cursor at {at}   ·   machine now Cycle {live}\n           reaches {behind:.2}s back from now   ·   {continuity}"
     )
@@ -17089,7 +17278,9 @@ pub(crate) fn transport_tick(st: &mut State, budget_cycles: u64) -> bool {
     if st.transport.last_step_ms == 0 {
         st.transport.last_step_ms = now;
     }
-    let ms_per_step = (20u64 / st.transport.speed.max(1) as u64).max(1); // 20 ms = PAL frame
+    // One frame of wall time at the model's nominal rate (20 ms PAL, 16 ms NTSC).
+    let frame_ms = st.session.machine.timing().nominal_frame_ms();
+    let ms_per_step = (frame_ms / st.transport.speed.max(1) as u64).max(1);
     let due = now.saturating_sub(st.transport.last_step_ms) / ms_per_step;
     if due == 0 {
         let _ = budget_cycles;
@@ -17227,16 +17418,44 @@ struct UndumpResult {
 /// prefix — each caller adds its own (`undump:` / `snapshot/undump:`).
 /// Spec 851 — the dump manifest's machine model. It read `c64-pal` for every dump before
 /// the profile existed, so a restore could not know it had been an Ultimate.
-fn machine_model_name(p: trx64_core::vic::SpeedProfile) -> &'static str {
-    match p {
-        trx64_core::vic::SpeedProfile::C64 => "c64-pal",
-        trx64_core::vic::SpeedProfile::C128 => "c128-pal",
-        trx64_core::vic::SpeedProfile::U64 => "u64-pal",
+///
+/// Spec 863 — and which C64: the model row. On the `c64` profile it IS the row name
+/// (`c64-pal`, `c64-ntsc`, `c64-paln`); on the other profiles the profile replaces the
+/// row's `c64` (`u64-ntsc`, `c128-pal`), so a PAL dump reads exactly as it always did.
+fn machine_model_name(p: trx64_core::vic::SpeedProfile, model: &trx64_core::model::C64Model) -> String {
+    let prefix = match p {
+        trx64_core::vic::SpeedProfile::C64 => return model.name.clone(),
+        trx64_core::vic::SpeedProfile::C128 => "c128",
+        trx64_core::vic::SpeedProfile::U64 => "u64",
+    };
+    match model.name.strip_prefix("c64-") {
+        Some(rest) => format!("{prefix}-{rest}"),
+        None => format!("{prefix}-{}", model.name),
     }
 }
 
+/// The profile a dump's machine model names (Spec 851). Everything after the `-` is the
+/// model row — see [`model_from_machine_name`].
 fn machine_profile_from_model(model: &str) -> Option<trx64_core::vic::SpeedProfile> {
+    if trx64_core::model::find(model).is_some() {
+        return Some(trx64_core::vic::SpeedProfile::C64);
+    }
     trx64_core::vic::SpeedProfile::parse(model.split('-').next().unwrap_or(model))
+}
+
+/// Spec 863 D6 — the row a dump's machine model names, no longer truncated at the `-`:
+/// `c64-ntsc` is an NTSC C64, `u64-ntsc` an NTSC Ultimate. Unknown, or a row that cannot
+/// run here, is refused by name.
+fn model_from_machine_name(name: &str) -> Result<&'static trx64_core::model::C64Model, String> {
+    if trx64_core::model::find(name).is_some() {
+        return trx64_core::model::resolve(name);
+    }
+    match name.split_once('-') {
+        Some((profile, rest)) if trx64_core::vic::SpeedProfile::parse(profile).is_some() => {
+            trx64_core::model::resolve(&format!("c64-{rest}"))
+        }
+        _ => trx64_core::model::resolve(name),
+    }
 }
 
 #[cfg(test)]
@@ -17246,17 +17465,273 @@ mod machine_model_tests {
 
     #[test]
     fn a_machine_model_names_its_profile_and_reads_back() {
+        let pal = trx64_core::model::default_model();
         for p in [SpeedProfile::C64, SpeedProfile::C128, SpeedProfile::U64] {
-            assert_eq!(machine_profile_from_model(machine_model_name(p)), Some(p));
+            assert_eq!(machine_profile_from_model(&machine_model_name(p, pal)), Some(p));
         }
+        assert_eq!(machine_model_name(SpeedProfile::C64, pal), "c64-pal", "a PAL dump reads as it always did");
+        assert_eq!(machine_model_name(SpeedProfile::U64, pal), "u64-pal");
         assert_eq!(machine_profile_from_model("c64-ntsc"), Some(SpeedProfile::C64));
     }
+
+    /// Spec 863 D6 — the row survives the name, all the way back.
+    #[test]
+    fn the_model_row_reads_back_from_the_machine_name() {
+        for row in ["c64-pal", "c64-ntsc", "c64-paln"] {
+            let m = trx64_core::model::resolve(row).unwrap();
+            for p in [SpeedProfile::C64, SpeedProfile::C128, SpeedProfile::U64] {
+                let name = machine_model_name(p, m);
+                assert_eq!(model_from_machine_name(&name).unwrap().name, row, "{name}");
+                assert_eq!(machine_profile_from_model(&name), Some(p), "{name}");
+            }
+        }
+        let e = model_from_machine_name("c64c-pal").unwrap_err();
+        assert!(e.contains("6526A"), "{e}");
+        assert!(model_from_machine_name("c64-secam").unwrap_err().contains("unknown model"));
+    }
+}
+
+// ── Spec 863 — the model: identity, the switch, and what every client is told ──────────
+
+/// Spec 863 D7 — the machine's identity fields, merged into a state reply: `model`,
+/// `videoStandard`, `chip`, `cyclesPerLine`, `linesPerFrame`, `cyclesPerFrame`, `cpuHz`,
+/// `frameRate`, `canvas`.
+fn merge_identity(v: &mut Value, model: &trx64_core::model::C64Model) {
+    if let Some(o) = v.as_object_mut() {
+        for (k, x) in trx64_core::model::identity_json(model) {
+            o.insert(k, x);
+        }
+    }
+}
+
+/// Spec 863 D7 — the A/V hello: what the frames on the stream are. Sent to a client when it
+/// subscribes and to all of them when the model changes.
+pub(crate) fn av_hello(st: &State) -> Value {
+    let mut v = json!({ "session_id": st.session.id });
+    merge_identity(&mut v, st.session.machine.model());
+    v
+}
+
+/// The checkpoint ring's window is in seconds; at another frame rate it takes another
+/// number of anchors.
+fn apply_ring_rate(st: &mut State) {
+    let want = trx64_core::checkpoint_ring::checkpoint_ring_max_entries(
+        st.checkpoint_window_seconds,
+        st.checkpoint_cadence_frames,
+        st.session.machine.timing().nominal_fps,
+    );
+    st.checkpoint_ring.set_max_entries(want);
+}
+
+/// Spec 863 — if the machine is on another row than the clients were told (a switch, a
+/// restore of a checkpoint or dump taken on another model), the session takes it as its
+/// identity — a power cycle then builds that machine again — the ring is re-sized for the
+/// frame rate, and every client gets the new A/V hello.
+pub(crate) fn sync_model_identity(st: &mut State) {
+    if std::ptr::eq(st.session.machine.model(), st.announced_model) {
+        return;
+    }
+    st.session.adopt_machine_model();
+    st.announced_model = st.session.machine.model();
+    apply_ring_rate(st);
+    let hello = av_hello(st);
+    st.notify.broadcast("av/hello", hello);
+}
+
+/// Advance a PAUSED machine to the next raster wrap (line 0): the frame boundary. Watches
+/// the wrap rather than aiming at a cycle number: a single-cycle budget still completes the
+/// instruction in flight, so `raster_cycle` can step over any exact value, a wrap cannot.
+fn advance_to_frame_boundary(session: &mut Session) -> Result<(), String> {
+    let start = session.machine.clk;
+    // Two frames of slack: at most one to reach the wrap, plus room for a long
+    // instruction straddling it.
+    let cap = 2 * session.machine.timing().cycles_per_frame + 128;
+    let mut prev_line = session.machine.vic.raster_line;
+    let mut landed = prev_line == 0;
+    while !landed && session.machine.clk.saturating_sub(start) < cap {
+        run_cycle_budget(session, 1);
+        let line = session.machine.vic.raster_line;
+        landed = line == 0 && prev_line != 0;
+        prev_line = line;
+    }
+    if !landed {
+        return Err(format!(
+            "no raster wrap within {cap} cycles — the VIC is not sweeping (raster stuck at line {prev_line})"
+        ));
+    }
+    Ok(())
+}
+
+/// Spec 863 D5 — a session STARTS as a model (`--model`, `session/create {model}`): the
+/// machine is built on the row and powered on, so nothing ever ran on another one. Same
+/// row: nothing happens.
+fn start_session_model(st: &mut State, row: &'static trx64_core::model::C64Model) {
+    if std::ptr::eq(st.session.model, row) && std::ptr::eq(st.session.machine.model(), row) {
+        return;
+    }
+    st.session.model = row;
+    if st.session.powered {
+        do_power_off(st);
+        do_power_on(st);
+    } else {
+        st.session.machine = trx64_core::Machine::new_with_model(row);
+        let (p, t) = (st.speed_profile, st.u64_speed_table);
+        st.session.machine.set_speed_profile(p);
+        st.session.machine.set_u64_speed_table(t);
+    }
+}
+
+/// Spec 863 D5 — the switch: the running machine moves to another model at the frame
+/// boundary, as a transplant, not a power cycle. Pause → advance to line 0 → carry the
+/// whole machine state onto the new row → run on (if it was running). CPU, RAM, the CIAs'
+/// registers and timers, the SID's registers, the drive, every framebuffer: kept, and the
+/// reply says so, field by field. What the row decides changes: the VIC's table and frame
+/// (it continues at line 0 of the new geometry), the TOD's mains tick, the drive's catch-up
+/// ratio, reSID's clock. The running program keeps the standard it detected at boot.
+/// A machine that is switched off just becomes that model at its next power-on.
+///
+/// `source` and `method` say who asked and through which door, for the input journal: an
+/// armed recording records the switch as an event at the cycle it happened on (a frame
+/// boundary, by construction), so a replay of the recording performs the same transplant
+/// at the same cycle.
+pub(crate) fn switch_session_model(
+    st: &mut State,
+    name: &str,
+    source: &'static str,
+    method: &str,
+) -> Result<Value, String> {
+    let row = trx64_core::model::resolve(name)?;
+    let from = st.session.machine.model();
+    let mut out = json!({ "from": from.name, "switched": false });
+    if std::ptr::eq(from, row) {
+        merge_identity(&mut out, row);
+        return Ok(out);
+    }
+    if !st.session.powered {
+        start_session_model(st, row);
+        out["switched"] = json!(true);
+        out["atPowerOn"] = json!(true);
+        merge_identity(&mut out, row);
+        let at = st.session.machine.clk;
+        note_model_switch(st, at, from, row, source, method, true);
+        return Ok(out);
+    }
+    // A rewound transport holds the machine; switching it is an intervention like any
+    // other change — the anchors ahead describe a future on the old machine.
+    transport_truncate_on_intervention(st);
+    let was_running = st.session.running;
+    st.session.running = false;
+    let transplant = switch_at_frame_boundary(&mut st.session, row);
+    st.session.running = was_running;
+    let t = transplant?;
+    out["switched"] = json!(true);
+    out["switchedAt"] = t["switchedAt"].clone();
+    out["kept"] = t["kept"].clone();
+    merge_identity(&mut out, row);
+    st.force_present_frame = true;
+    let at = st.session.machine.clk;
+    note_model_switch(st, at, from, row, source, method, false);
+    Ok(out)
+}
+
+/// Spec 863 — record a model switch in the armed input journal, at the cycle it happened.
+fn note_model_switch(
+    st: &mut State,
+    cycle: u64,
+    from: &'static trx64_core::model::C64Model,
+    to: &'static trx64_core::model::C64Model,
+    source: &'static str,
+    method: &str,
+    at_power_on: bool,
+) {
+    let Some(j) = st.input_journal.as_mut() else { return };
+    if j.entries.len() >= INPUT_JOURNAL_MAX {
+        j.dropped += 1;
+        return;
+    }
+    let mut detail = json!({ "name": to.name, "from": from.name });
+    if at_power_on {
+        detail["atPowerOn"] = json!(true);
+    }
+    j.entries.push(InputJournalEntry { cycle, kind: "model", source, method: method.to_string(), detail });
+}
+
+/// The transplant itself (Spec 863 D5), on the session alone so a replay performs exactly
+/// the switch a live request does: advance to the frame boundary (raster line 0), carry the
+/// machine onto `row`, and say what was kept. The caller pauses and resumes.
+fn switch_at_frame_boundary(
+    session: &mut Session,
+    row: &'static trx64_core::model::C64Model,
+) -> Result<Value, String> {
+    advance_to_frame_boundary(session)?;
+    let before = session.machine.clone();
+    session.machine.switch_model(row)?;
+    let after = &session.machine;
+    let kept = json!({
+        "cpu": before.c64_core.reg_pc == after.c64_core.reg_pc
+            && before.c64_core.reg_a == after.c64_core.reg_a
+            && before.c64_core.reg_x == after.c64_core.reg_x
+            && before.c64_core.reg_y == after.c64_core.reg_y
+            && before.c64_core.reg_sp == after.c64_core.reg_sp
+            && before.c64_core.status() == after.c64_core.status()
+            && before.c64_core.clk == after.c64_core.clk,
+        "ram": before.ram[..] == after.ram[..],
+        "cia": before.cia1.regs == after.cia1.regs && before.cia2.regs == after.cia2.regs
+            && [&before.cia1, &before.cia2].iter().zip([&after.cia1, &after.cia2]).all(|(b, a)| {
+                b.ta.read_timer() == a.ta.read_timer()
+                    && b.tb.read_timer() == a.tb.read_timer()
+                    && b.ta.latch == a.ta.latch
+                    && b.tb.latch == a.tb.latch
+                    && b.irqflags == a.irqflags
+                    && b.tod_clk == a.tod_clk
+            }),
+        "sid": before.sid_regs == after.sid_regs,
+    });
+    let switched_at = json!({
+        "c64Cycles": after.clk,
+        "rasterLine": after.vic.raster_line,
+        "rasterCycle": after.vic.raster_cycle + 1,
+    });
+    session.model = row;
+    Ok(json!({ "switchedAt": switched_at, "kept": kept }))
+}
+
+/// The monitor's `model` answer: this machine, and every row.
+fn model_report(st: &State) -> String {
+    let m = st.session.machine.model();
+    let t = m.timing;
+    let mut out = format!(
+        "model: {} ({})  VIC-II {}  {} × {} = {} cycles/frame  {} Hz  {:.3} fps  TOD {} Hz  canvas {}×{}",
+        m.name,
+        m.video.name(),
+        m.vicii,
+        t.cycles_per_line,
+        t.lines_per_frame,
+        t.cycles_per_frame,
+        t.cpu_hz,
+        t.frame_rate,
+        t.tod_hz,
+        m.window.width(),
+        m.window.height(),
+    );
+    for r in trx64_core::model::models() {
+        let mark = if std::ptr::eq(r, m) { "*" } else { " " };
+        let why = if r.runs() { String::new() } else { format!("  — needs {}", r.missing.join(", ")) };
+        out.push_str(&format!("\n  {mark} {:<13} {}{why}", r.name, r.title));
+    }
+    out.push_str("\n  `model <row>` switches at the next frame boundary (the program keeps its state).");
+    out
 }
 
 fn undump_native_snapshot(st: &mut State, path: &str) -> Result<UndumpResult, String> {
     let file_bytes =
         std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     let read = trx64_core::native_snapshot::read_native_snapshot(&file_bytes)?;
+
+    // Spec 863 D6 — the dump says which C64 it was. A row that cannot run here is refused
+    // by name BEFORE anything is torn down; otherwise the fresh machine below is built on it.
+    let row = model_from_machine_name(&read.manifest.machine.model)?;
+    st.session.model = row;
 
     // Fresh chips FIRST (Spec 786): clears the stale internal chip state the field
     // restore cannot, resets the SID, re-hooks audio. Does not clear the ring.
@@ -18377,9 +18852,10 @@ fn checkpoint_thumbnail(cp: &Value) -> Option<(usize, usize, Vec<u8>, Vec<u8>)> 
     if fb.len() < trx64_core::render::FB_W * trx64_core::render::FB_H {
         return None;
     }
-    // Crop to the 384×272 VICE PAL canvas (palette-indexed, each & 0x0f) — exactly
-    // the c64re `renderLiteralPortIndexed` crop the live thumbnail samples.
-    let (cw, ch, canvas) = trx64_core::render::index_buffer_to_canvas_indices(&fb);
+    // Crop to the checkpoint's model's canvas (palette-indexed, each & 0x0f; 384×272 on
+    // PAL) — exactly the c64re `renderLiteralPortIndexed` crop the live thumbnail samples.
+    let window = trx64_core::vic_inspect::window_of(cp);
+    let (cw, ch, canvas) = trx64_core::render::index_buffer_to_canvas_indices(&fb, &window);
     let ow = cw / THUMB_FACTOR;
     let oh = ch / THUMB_FACTOR;
     if ow == 0 || oh == 0 {
@@ -18523,7 +18999,9 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
     if streaming_on {
         session.running = true;
     }
-    State {
+    let model = session.model;
+    let mut st = State {
+        announced_model: model,
         speed_profile: trx64_core::vic::SpeedProfile::C64,
         u64_speed_table: trx64_core::vic::U64SpeedTable::U64II,
         input_journal: None,
@@ -18559,7 +19037,7 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         batches: std::collections::HashMap::new(),
         notify: streaming::NotifyHub::new(),
         streaming_enabled: streaming_on,
-        pacing_mode: "pal".to_string(),
+        pacing_mode: "realtime".to_string(),
         pacing_ratio: 1.0,
         control_owner: "human".to_string(),
         last_llm_activity: None,
@@ -18597,7 +19075,13 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         force_present_frame: false,
         audio_render: None,
         trap_rules: std::collections::HashMap::new(),
+    };
+    // Spec 863 — the ring's window is seconds; at another model's frame rate that is
+    // another number of anchors.
+    if model.timing.nominal_fps != trx64_core::model::default_model().timing.nominal_fps {
+        apply_ring_rate(&mut st);
     }
+    st
 }
 
 /// Boot a fresh singleton session + cold-reset the machine from `rom_dir`, then wrap
@@ -18607,10 +19091,27 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
 pub fn create_embedded_state(
     rom_dir: &std::path::Path,
 ) -> Result<SharedState, trx64_core::RomError> {
-    let mut session = Session::new("integrated-1");
+    create_embedded_state_with_model(rom_dir, trx64_core::model::default_model())
+}
+
+/// [`create_embedded_state`] for a chosen model (Spec 863): the machine is built on the row
+/// before it boots, so nothing ever runs on another. Pass a row from
+/// `trx64_core::model::resolve`, which refuses one that cannot run.
+pub fn create_embedded_state_with_model(
+    rom_dir: &std::path::Path,
+    model: &'static trx64_core::model::C64Model,
+) -> Result<SharedState, trx64_core::RomError> {
+    let mut session = Session::new_with_model("integrated-1", model);
     let boot = session.boot(rom_dir);
     let state = Arc::new(Mutex::new(build_state(session, false)));
     boot.map(|()| state)
+}
+
+/// Spec 863 — which C64 an embedded state's machine is: its row, with the timing (clock,
+/// frame) and the display window (the canvas the frames have). A host that paces or sizes
+/// by it — the CLI's pump and window — asks here instead of assuming PAL.
+pub fn machine_model(state: &SharedState) -> &'static trx64_core::model::C64Model {
+    state.lock().unwrap().session.machine.model()
 }
 
 /// The active [`NotifyHub`] for an embedded state — the single event-broadcast hub
@@ -18729,9 +19230,10 @@ pub fn pull_audio_drain(state: &SharedState) -> AudioDrainData {
             prime.push((reg, v));
         }
         let last_clk = st.session.machine.c64_core.clk;
+        let resid_cfg = ResidConfig::for_model(st.session.machine.model());
 
         // Write-ring (emu→render) + PCM ring (render→main) + stop flag + progress.
-        let (tx, rx) = std::sync::mpsc::channel::<(Vec<(u8, u8)>, u32)>();
+        let (tx, rx) = std::sync::mpsc::channel::<AudioWindow>();
         let pcm: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<i16>>> =
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -18754,7 +19256,7 @@ pub fn pull_audio_drain(state: &SharedState) -> AudioDrainData {
                 // for the thread's whole life (never reconstructed). The MutexGuard it
                 // holds (RESID_GUARD) makes it !Send → it cannot leave this thread, which
                 // is exactly the contract. This is the streaming-loop / Spec-768 shape.
-                let mut engine = SidAudioEngine::new(ResidConfig::default());
+                let mut engine = SidAudioEngine::new(resid_cfg);
                 // Prime: apply the live register snapshot, emit nothing, discard silence.
                 for (reg, v) in &prime {
                     engine.record_write(*reg, *v);
@@ -18772,7 +19274,9 @@ pub fn pull_audio_drain(state: &SharedState) -> AudioDrainData {
                     // Poll the write-ring with a timeout so the stop flag is honored even
                     // when the host is not pulling audio.
                     match rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                        Ok((window_writes, d_cycles)) => {
+                        Ok((window_writes, d_cycles, clock_hz)) => {
+                            // Spec 863 — a model switch moved the clock: re-sample.
+                            engine.set_clock_freq(clock_hz as f64);
                             // Drain THIS window: replay writes (CPU order) → boundary →
                             // flush → PCM, on the PERSISTENT engine. Identical to the
                             // stream loop's per-frame sequence.
@@ -18852,6 +19356,7 @@ pub fn pull_audio_drain(state: &SharedState) -> AudioDrainData {
 
     // ── Subsequent drain: send this window to the render thread, pop accumulated PCM ──
     let clk_now = st.session.machine.c64_core.clk;
+    let clock_hz = st.session.machine.timing().cpu_hz;
     let render = st.audio_render.as_mut().expect("audio_render present");
     let d_cycles = clk_now.wrapping_sub(render.last_clk);
     render.last_clk = clk_now;
@@ -18869,7 +19374,7 @@ pub fn pull_audio_drain(state: &SharedState) -> AudioDrainData {
     let processed = std::sync::Arc::clone(&render.processed_cycles);
     // Send the window. If the render thread is gone (shouldn't happen while State is
     // alive), the send errors — return whatever PCM is already buffered.
-    let _ = render.tx.send((captured, d_cycles_u32));
+    let _ = render.tx.send((captured, d_cycles_u32, clock_hz));
 
     // Wait (bounded) for the render thread to consume the window we just sent, so this
     // pull returns the PCM for the cycles that elapsed before it (deterministic for a
@@ -18924,11 +19429,38 @@ async fn main() {
 
     eprintln!("[trx64] project = {:?}", cli.project);
 
+    // Spec 863 — which C64 this is, before anything is built: every machine the session
+    // makes is made on this row. The model file is checked here so a broken one is a clean
+    // exit, and a row that needs a block this build lacks is refused by name.
+    if let Err(e) = trx64_core::model::check() {
+        eprintln!("[trx64] {e}");
+        std::process::exit(2);
+    }
+    let model_name = cli.video.as_deref().unwrap_or(&cli.model);
+    let model = match trx64_core::model::resolve(model_name) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("[trx64] --model: {e}");
+            std::process::exit(2);
+        }
+    };
+    if !model.is_default() {
+        eprintln!(
+            "[trx64] model = {} ({}, VIC-II {}, {} × {} at {} Hz)",
+            model.name,
+            model.video.name(),
+            model.vicii,
+            model.timing.cycles_per_line,
+            model.timing.lines_per_frame,
+            model.timing.cpu_hz
+        );
+    }
+
     // Boot the singleton session.
     let roms = rom_dir();
     eprintln!("[trx64] loading ROMs from {}", roms.display());
 
-    let mut session = Session::new("integrated-1");
+    let mut session = Session::new_with_model("integrated-1", model);
     match session.boot(&roms) {
         Ok(()) => {
             eprintln!(
@@ -19009,7 +19541,10 @@ async fn main() {
     // BY DEFAULT (the C64's work is always visible); only `--headless` skips it → None, so a
     // silent deterministic machine never auto-runs on connect (byte-exact oracle stays clean).
     let hub: Option<Arc<streaming::StreamHub>> = if streaming_on {
-        eprintln!("[trx64] live A/V push ON (default): clients auto-subscribed at ~50fps (--headless to disable)");
+        eprintln!(
+            "[trx64] live A/V push ON (default): clients auto-subscribed at ~{:.2} fps (--headless to disable)",
+            model.timing.frame_rate
+        );
         Some(streaming::StreamHub::new(Arc::clone(&state)))
     } else {
         eprintln!("[trx64] --headless: silent deterministic machine (no A/V push, no auto-run)");
@@ -19151,6 +19686,7 @@ mod batch1_tests {
             speed_profile: trx64_core::vic::SpeedProfile::C64,
         u64_speed_table: trx64_core::vic::U64SpeedTable::U64II,
             input_journal: None,
+            announced_model: trx64_core::model::default_model(),
             session: Session::new("integrated-1"),
             breakpoints: Breakpoints::new(),
             observers: observers::ObserverRegistry::new(),
@@ -19185,7 +19721,7 @@ mod batch1_tests {
             streaming_enabled: false,
             cart_led_gen: 0,
             cart_led_last_write_at: None,
-            pacing_mode: "pal".to_string(),
+            pacing_mode: "realtime".to_string(),
             pacing_ratio: 1.0,
             control_owner: "human".to_string(),
             last_llm_activity: None,
@@ -19456,7 +19992,7 @@ mod batch1_tests {
         let st = make_state();
         let r = call(&st, "debug/state", json!({}));
         assert_eq!(r["runState"], json!("paused"));
-        assert_eq!(r["pacing"]["mode"], json!("pal"));
+        assert_eq!(r["pacing"]["mode"], json!("realtime"));
         // T1.3: pacing_ratio is stored as f64 (1.0); json!(1) is an integer
         // literal — compare as f64 to avoid serde_json Number type mismatch.
         assert_eq!(r["pacing"]["ratio"].as_f64(), Some(1.0));
@@ -20346,7 +20882,7 @@ mod batch1_tests {
                 // Draw a frame so `displayed` reflects the poke, then capture THAT.
                 let mut sink = trx64_core::NullSink;
                 g.session.machine.run_for_full(
-                    crate::streaming::CYC_PER_FRAME,
+                    PAL_FRAME,
                     &mut sink,
                     |_, _, _, _, _, _, _| {},
                 );
@@ -20421,7 +20957,7 @@ mod batch1_tests {
     fn recording_density_follows_emulated_time_not_the_call_rate() {
         // One second of emulated time, delivered in 200 small pumps like the CLI does.
         let st = make_state();
-        let quarter = crate::streaming::CYC_PER_FRAME / 4;
+        let quarter = PAL_FRAME / 4;
         for _ in 0..200 {
             call(&st, "session/run", json!({ "cycles": quarter }));
         }
@@ -20430,7 +20966,7 @@ mod batch1_tests {
         // The same second delivered as 50 whole frames, like the stream loop does.
         let st2 = make_state();
         for _ in 0..50 {
-            call(&st2, "session/run", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+            call(&st2, "session/run", json!({ "cycles": PAL_FRAME }));
         }
         let coarse = st2.lock().unwrap().checkpoint_ring.list().len();
 
@@ -20504,7 +21040,7 @@ mod batch1_tests {
         }
         // And it must really hold that many, not just claim to.
         for _ in 0..1200 {
-            call(&st, "session/run", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+            call(&st, "session/run", json!({ "cycles": PAL_FRAME }));
         }
         let held = st.lock().unwrap().checkpoint_ring.list().len();
         assert_eq!(
@@ -20523,7 +21059,7 @@ mod batch1_tests {
         let st = make_state();
         call(&st, "session/power", json!({ "op": "on" }));
         for _ in 0..8 {
-            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+            call(&st, "session/tick", json!({ "cycles": PAL_FRAME }));
         }
         let epoch = |st: &SharedState| -> u64 {
             call(st, "session/state", json!({}))["audioEpoch"].as_u64().unwrap()
@@ -20644,7 +21180,7 @@ mod batch1_tests {
 
         // Advance a few frames so "stopped" is a real change, not the start state.
         for _ in 0..4 {
-            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+            call(&st, "session/tick", json!({ "cycles": PAL_FRAME }));
         }
         let ran = st.lock().unwrap().session.machine.clk;
         assert!(ran > 0, "the tick must have advanced the machine at all");
@@ -20660,7 +21196,7 @@ mod batch1_tests {
         // And the machine must actually stand still.
         let before = st.lock().unwrap().session.machine.clk;
         for _ in 0..4 {
-            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+            call(&st, "session/tick", json!({ "cycles": PAL_FRAME }));
         }
         assert_eq!(
             st.lock().unwrap().session.machine.clk,
@@ -20717,7 +21253,7 @@ mod batch1_tests {
         let st = make_state();
         call(&st, "session/power", json!({ "op": "on" }));
         for _ in 0..8 {
-            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+            call(&st, "session/tick", json!({ "cycles": PAL_FRAME }));
         }
 
         // F11 is a DECISION, not a verb: playing → pause, paused → play forward.
@@ -20785,7 +21321,7 @@ mod batch1_tests {
         // A human types, the machine runs, an LLM taps the stick, a disk goes in.
         call(&st, "session/type", json!({ "text": "RUN", "source": "human" }));
         for _ in 0..3 {
-            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+            call(&st, "session/tick", json!({ "cycles": PAL_FRAME }));
         }
         call(&st, "session/joystick_set", json!({ "port": 2, "fire": true, "source": "llm" }));
 
@@ -20840,7 +21376,7 @@ mod batch1_tests {
         // One anchor per frame, so a short run leaves something to play back through.
         mon(&st, "cadence 1").expect("cadence 1");
         for _ in 0..12 {
-            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+            call(&st, "session/tick", json!({ "cycles": PAL_FRAME }));
         }
         mon(&st, "pause").expect("pause");
         assert!(!st.lock().unwrap().session.running, "the machine is paused");
@@ -20857,7 +21393,7 @@ mod batch1_tests {
         std::thread::sleep(std::time::Duration::from_millis(30));
         {
             let mut g = st.lock().unwrap();
-            crate::transport_tick(&mut g, crate::streaming::CYC_PER_FRAME);
+            crate::transport_tick(&mut g, PAL_FRAME);
         }
 
         let after = st.lock().unwrap().session.machine.clk;
@@ -20880,7 +21416,7 @@ mod batch1_tests {
         let st = make_state();
         call(&st, "session/power", json!({ "op": "on" }));
         for _ in 0..8 {
-            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+            call(&st, "session/tick", json!({ "cycles": PAL_FRAME }));
         }
         call(&st, "debug/pause", json!({ "source": "test" }));
 
@@ -21150,7 +21686,7 @@ mod batch1_tests {
         let st = make_state();
         call(&st, "session/power", json!({ "op": "on" }));
         for _ in 0..8 {
-            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+            call(&st, "session/tick", json!({ "cycles": PAL_FRAME }));
         }
         call(&st, "debug/pause", json!({ "source": "test" }));
 
@@ -21237,7 +21773,7 @@ mod batch1_tests {
         let st = make_state();
         call(&st, "session/power", json!({ "op": "on" }));
         for _ in 0..8 {
-            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+            call(&st, "session/tick", json!({ "cycles": PAL_FRAME }));
         }
         // The transport owns the clock here; a running machine has no boundary to
         // stop on, and the RPC says so rather than racing.
@@ -21283,7 +21819,7 @@ mod batch1_tests {
         let st = make_state();
         call(&st, "session/power", json!({ "op": "on" }));
         for _ in 0..8 {
-            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+            call(&st, "session/tick", json!({ "cycles": PAL_FRAME }));
         }
         // Port 2 → CIA1 PA; FIRE is bit 4, active low.
         let fire_low = || st.lock().unwrap().session.machine.read_full(0xdc00) & 0x10 == 0;
@@ -21291,12 +21827,12 @@ mod batch1_tests {
 
         call(&st, "session/joystick_set", json!({ "port": 2, "fire": true, "source": "llm" }));
         for f in 0..3 {
-            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+            call(&st, "session/tick", json!({ "cycles": PAL_FRAME }));
             assert!(fire_low(), "frame {f} of a 3-frame press must see the stick");
         }
 
         call(&st, "session/joystick_clear", json!({ "port": 2 }));
-        call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+        call(&st, "session/tick", json!({ "cycles": PAL_FRAME }));
         assert!(!fire_low(), "and released after, without touching the other port");
     }
 
@@ -21305,7 +21841,7 @@ mod batch1_tests {
         let st = make_state();
         call(&st, "session/power", json!({ "op": "on" }));
         for _ in 0..120 {
-            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+            call(&st, "session/tick", json!({ "cycles": PAL_FRAME }));
         }
 
         {
@@ -21366,12 +21902,12 @@ mod batch1_tests {
         call(&st, "session/power", json!({ "op": "on" }));
         // Boot far enough that the KERNAL is running its jiffy IRQ.
         for _ in 0..90 {
-            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+            call(&st, "session/tick", json!({ "cycles": PAL_FRAME }));
         }
         mon(&st, "wr c000 a5 a2 8d 20 d0 4c 00 c0").expect("poke the probe");
         mon(&st, "g c000").expect("run it");
         for _ in 0..12 {
-            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+            call(&st, "session/tick", json!({ "cycles": PAL_FRAME }));
         }
 
         // The border pixel of whatever the transport just drew. Top-left is border.
@@ -21433,7 +21969,7 @@ mod batch1_tests {
         let st = make_state();
         call(&st, "session/power", json!({ "op": "on" }));
         for _ in 0..8 {
-            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+            call(&st, "session/tick", json!({ "cycles": PAL_FRAME }));
         }
 
         let dc00 = || st.lock().unwrap().session.machine.read_full(0xdc00);
@@ -21485,7 +22021,7 @@ mod batch1_tests {
         let st = make_state();
         call(&st, "session/power", json!({ "op": "on" }));
         for _ in 0..4 {
-            call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+            call(&st, "session/tick", json!({ "cycles": PAL_FRAME }));
         }
 
         // `pause` stops BOTH the machine and the transport, and reports the buffer.
@@ -21638,7 +22174,7 @@ mod batch1_tests {
         for attempt in 1..=3 {
             call(&st, "transport/toggle", json!({})); // play: emulate from here, cut ahead
             for _ in 0..5 {
-                call(&st, "session/tick", json!({ "cycles": crate::streaming::CYC_PER_FRAME }));
+                call(&st, "session/tick", json!({ "cycles": PAL_FRAME }));
             }
             call(&st, "session/pause", json!({}));
 
@@ -22927,7 +23463,7 @@ mod batch1_tests {
             assert!(g.session.machine.full_assembled, "VIC-ticked machine");
             // Run to a real, painted screen (KERNAL boot + BASIC banner ≈ 2 frames of
             // border + a drawn READY. ~30 PAL frames is plenty and sub-second native).
-            run_cycle_budget(&mut g.session, crate::streaming::CYC_PER_FRAME * 30);
+            run_cycle_budget(&mut g.session, PAL_FRAME * 30);
         }
         // Capture an anchor whose stored payload OMITS the framebuffer — exactly the
         // auto-cadence anchor (capture_recorder_anchor_payload nulls the vicPresentation
@@ -23310,6 +23846,28 @@ mod batch1_tests {
         assert_eq!(call(&st, "runtime/scenario_delete", json!({ "id": "boot-test" }))["deleted"], json!(true));
         assert_eq!(call(&st, "runtime/scenario_delete", json!({ "id": "boot-test" }))["deleted"], json!(false));
         assert_eq!(call(&st, "runtime/scenario_list", json!({})), json!([]));
+    }
+
+    /// Spec 863 — a summary says which machine the scenario was recorded on, so a client
+    /// counts its cycles in THAT machine's clock; a scenario that names none says `null`.
+    #[test]
+    fn scenario_summaries_carry_the_recorded_model() {
+        let st = make_state();
+        // A scenario made from a recording carries the model its journal was armed on.
+        call(&st, "session/model", json!({ "name": "c64-ntsc" }));
+        let journal = call(&st, "session/input_journal", json!({ "arm": true }));
+        assert_eq!(journal["model"], json!("c64-ntsc"));
+        call(&st, "session/model", json!({ "name": "c64-pal" }));
+        let recorded = json!({
+            "id": "rec", "diskPath": "", "cycleBudget": 17_095 * 60, "inputs": [],
+            "model": journal["model"],
+        });
+        call(&st, "runtime/scenario_save", json!({ "scenario": recorded }));
+        call(&st, "runtime/scenario_save", json!({ "scenario": { "id": "plain", "diskPath": "", "cycleBudget": 100, "inputs": [] } }));
+        let list = call(&st, "runtime/scenario_list", json!({}));
+        let by = |id: &str| list.as_array().unwrap().iter().find(|s| s["id"] == json!(id)).unwrap().clone();
+        assert_eq!(by("rec")["model"], json!("c64-ntsc"), "the recorded machine, not the running one (c64-pal)");
+        assert!(by("plain").get("model").is_some_and(|m| m.is_null()), "a scenario without a model says null");
     }
 
     #[test]
@@ -24207,14 +24765,14 @@ mod batch1_tests {
         // A synthetic non-uniform live canvas (384×272 4-bit), so the downscaled
         // thumbnail is a real picture (>1 distinct index), like the live stream loop
         // passes its just-rendered frame.
-        let (cw, ch) = (trx64_core::render::CANVAS_W, trx64_core::render::CANVAS_H);
+        let (cw, ch) = (384usize, 272usize);
         let canvas: Vec<u8> = (0..cw * ch).map(|i| (i % 16) as u8).collect();
         // Run enough frames for ~6 capture windows (~3 s @ 50 fps, cadence 25).
         let windows = 6u64;
         let total = checkpoint_capture_every_frames() * windows + 2;
         for frame in 0..total {
             let mut st = state.lock().unwrap();
-            stream_maybe_autocapture(&mut st, frame, crate::streaming::CYC_PER_FRAME, cw, ch, &canvas);
+            stream_maybe_autocapture(&mut st, frame, PAL_FRAME, cw, ch, &canvas);
         }
         let st = state.lock().unwrap();
         let n = st.checkpoint_ring.list().len();
@@ -24259,12 +24817,12 @@ mod batch1_tests {
     #[test]
     fn thumbnails_count_matches_ring_for_omit_framebuffer_autoanchors() {
         let state = make_state();
-        let (cw, ch) = (trx64_core::render::CANVAS_W, trx64_core::render::CANVAS_H);
+        let (cw, ch) = (384usize, 272usize);
         let canvas: Vec<u8> = (0..cw * ch).map(|i| (i % 16) as u8).collect();
         let total = checkpoint_capture_every_frames() * 5 + 2;
         for frame in 0..total {
             let mut st = state.lock().unwrap();
-            stream_maybe_autocapture(&mut st, frame, crate::streaming::CYC_PER_FRAME, cw, ch, &canvas);
+            stream_maybe_autocapture(&mut st, frame, PAL_FRAME, cw, ch, &canvas);
         }
         let list = call(&state, "checkpoint/list", json!({}));
         let ring_n = list["checkpoints"].as_array().unwrap().len();
@@ -24492,5 +25050,340 @@ mod batch1_tests {
         assert_eq!(ps[0]["space"], json!("roml"));
         assert_eq!(ps[0]["source"], json!("nop"));
     }
-}
 
+    // ── Spec 863 — models: the list, the switch, identity through reset, power and rewind ──
+
+    /// A ROM-booted, headless machine of the default model, warmed to READY.
+    fn booted_state() -> Option<SharedState> {
+        let roms = rom_dir();
+        if !roms.join("kernal-901227-03.bin").exists() {
+            eprintln!("[skip] 863 test: ROMs absent at {}", roms.display());
+            return None;
+        }
+        let st = make_state();
+        {
+            let mut g = st.lock().unwrap();
+            g.session.boot(&roms).expect("boot ROMs");
+            run_cycle_budget(&mut g.session, 3_000_000);
+        }
+        Some(st)
+    }
+
+    /// Acceptance 8 — every row of `models.toml` is listed, with whether it runs and what it
+    /// lacks; the session says which one it is.
+    #[test]
+    fn session_models_lists_every_row_and_what_it_lacks() {
+        let st = make_state();
+        let r = call(&st, "session/models", json!({}));
+        let rows = r["models"].as_array().unwrap();
+        assert_eq!(rows.len(), 7);
+        assert_eq!(r["current"], json!("c64-pal"));
+        let row = |n: &str| rows.iter().find(|m| m["name"] == json!(n)).unwrap().clone();
+        assert_eq!(row("c64-pal")["runs"], json!(true));
+        assert_eq!(row("c64-ntsc")["cyclesPerFrame"], json!(17095));
+        assert_eq!(row("c64-paln")["cpuHz"], json!(1_023_440));
+        assert_eq!(row("c64c-pal")["runs"], json!(false));
+        assert!(row("c64c-pal")["missing"].as_array().unwrap().contains(&json!("6526A CIA")));
+        // Choosing it is refused, by name, and changes nothing.
+        let e = call_err(&st, "session/model", json!({ "name": "c64c-pal" }));
+        assert!(e.message.contains("6526A"), "{}", e.message);
+        let e = call_err(&st, "session/model", json!({ "name": "c64-secam" }));
+        assert!(e.message.contains("unknown model"), "{}", e.message);
+        assert_eq!(call(&st, "session/state", json!({}))["model"], json!("c64-pal"));
+    }
+
+    /// Acceptance 7 — a running PAL program switched to NTSC keeps its RAM, CPU, CIA and SID
+    /// state bit-identical (field by field), the VIC continues at line 0 of 263, the next
+    /// frame is 17 095 cycles, the model survives reset and power off/on, and rewinding to
+    /// a checkpoint from before the switch makes the machine PAL again.
+    #[test]
+    fn the_switch_is_a_transplant_and_rewind_undoes_it() {
+        let Some(st) = booted_state() else { return };
+        // A PAL anchor to rewind to.
+        let anchor = call(&st, "checkpoint/capture", json!({}))["ref"]["id"].as_str().unwrap().to_string();
+        let anchor_ram = st.lock().unwrap().session.machine.ram.clone();
+        run_cycle_budget(&mut st.lock().unwrap().session, 50_000);
+
+        // Stand at the boundary first so the comparison is of the switch alone.
+        call(&st, "session/advance_to_frame", json!({}));
+        let before = st.lock().unwrap().session.machine.clone();
+        let mut hello = probe_notifications(&st);
+        let r = call(&st, "session/model", json!({ "name": "c64-ntsc" }));
+        assert_eq!(r["switched"], json!(true));
+        assert_eq!(r["from"], json!("c64-pal"));
+        assert_eq!(r["model"], json!("c64-ntsc"));
+        for k in ["cpu", "ram", "cia", "sid"] {
+            assert_eq!(r["kept"][k], json!(true), "kept {k}");
+        }
+        {
+            let g = st.lock().unwrap();
+            let (a, b) = (&g.session.machine, &before);
+            assert_eq!((a.c64_core.reg_pc, a.c64_core.reg_a, a.c64_core.reg_x, a.c64_core.reg_y, a.c64_core.reg_sp),
+                       (b.c64_core.reg_pc, b.c64_core.reg_a, b.c64_core.reg_x, b.c64_core.reg_y, b.c64_core.reg_sp));
+            assert_eq!(a.c64_core.status(), b.c64_core.status());
+            assert_eq!(a.clk, b.clk, "no cycle ran in the switch");
+            assert!(a.ram[..] == b.ram[..], "RAM");
+            assert_eq!((a.cia1.regs, a.cia2.regs), (b.cia1.regs, b.cia2.regs), "CIA registers");
+            assert_eq!((a.cia1.ta.read_timer(), a.cia1.tb.read_timer()), (b.cia1.ta.read_timer(), b.cia1.tb.read_timer()));
+            assert_eq!((a.cia2.ta.read_timer(), a.cia2.tb.read_timer()), (b.cia2.ta.read_timer(), b.cia2.tb.read_timer()));
+            assert_eq!(a.sid_regs, b.sid_regs, "SID registers");
+            assert_eq!(a.drive8.drive_clk, b.drive8.drive_clk, "the drive keeps its own clock");
+            assert_eq!(a.vic.regs, b.vic.regs, "VIC registers");
+            assert_eq!(a.vic.raster_line, 0, "the VIC continues at line 0");
+            assert_eq!((a.vic.cycles_per_line(), a.vic.screen_height()), (65, 263));
+            assert_eq!((a.cia1.tod_power_freq, a.drive8.sync_factor), (60, 64079));
+        }
+        // Every client was told.
+        let pushed = drain_notifications(&mut hello);
+        let h = pushed.iter().find(|(m, _)| m == "av/hello").expect("av/hello on the switch");
+        assert_eq!(h.1["model"], json!("c64-ntsc"));
+        assert_eq!(h.1["canvas"], json!({ "width": 384, "height": 247 }));
+
+        // The frame is 17 095 cycles from here on: over three and a bit frames, the raster
+        // position moves by exactly the cycles run, modulo 17 095 (65 × 263).
+        let pos = |st: &SharedState| {
+            let g = st.lock().unwrap();
+            let m = &g.session.machine;
+            (m.clk, trx64_core::vic_line_trace::frame_position(m), m.vic.raster_line)
+        };
+        let (clk0, fp0, line0) = pos(&st);
+        assert_eq!(line0, 0);
+        call(&st, "session/run", json!({ "cycles": 3 * 17_095 + 1_234 }));
+        let (clk1, fp1, _) = pos(&st);
+        assert_eq!((fp1 + 17_095 - fp0) % 17_095, (clk1 - clk0) % 17_095, "a frame is 17 095 cycles");
+        assert!(clk1 - clk0 >= 3 * 17_095 + 1_234);
+
+        // State reports it.
+        let s = call(&st, "session/state", json!({}));
+        assert_eq!((s["model"].clone(), s["videoStandard"].clone(), s["chip"].clone()), (json!("c64-ntsc"), json!("ntsc"), json!("6567R8")));
+        assert_eq!((s["cyclesPerLine"].clone(), s["linesPerFrame"].clone(), s["cyclesPerFrame"].clone()), (json!(65), json!(263), json!(17095)));
+        assert_eq!(s["cpuHz"], json!(1_022_730));
+        assert!((s["frameRate"].as_f64().unwrap() - 59.826).abs() < 0.001);
+        assert_eq!(call(&st, "monitor/state", json!({}))["model"], json!("c64-ntsc"));
+
+        // Rewinding to the anchor from before the switch makes the machine PAL again, with
+        // the anchor's state.
+        call(&st, "checkpoint/restore", json!({ "id": anchor }));
+        {
+            let g = st.lock().unwrap();
+            assert_eq!(g.session.machine.model().name, "c64-pal", "rewound onto PAL");
+            assert_eq!(g.session.model.name, "c64-pal", "and the session is PAL again");
+            assert_eq!(g.session.machine.vic.cycles_per_line(), 63);
+            assert!(g.session.machine.ram[..] == anchor_ram[..], "the anchor's RAM");
+        }
+        assert_eq!(call(&st, "session/state", json!({}))["model"], json!("c64-pal"));
+
+        // Back to NTSC: it survives a warm reset, a cold reset and a power cycle.
+        call(&st, "session/model", json!({ "name": "c64-ntsc" }));
+        call(&st, "session/reset", json!({ "mode": "soft" }));
+        assert_eq!(st.lock().unwrap().session.machine.model().name, "c64-ntsc", "warm reset");
+        call(&st, "session/reset", json!({ "mode": "cold" }));
+        assert_eq!(st.lock().unwrap().session.machine.model().name, "c64-ntsc", "cold reset");
+        call(&st, "session/power", json!({ "op": "off" }));
+        call(&st, "session/power", json!({ "op": "on" }));
+        {
+            let g = st.lock().unwrap();
+            assert_eq!(g.session.machine.model().name, "c64-ntsc", "power cycle");
+            assert_eq!(g.session.machine.ram[0x02a6], 0, "and it boots as NTSC");
+        }
+    }
+
+    /// Acceptance 7 — `c64-ntsc` round-trips through dump/undump, and a snapshot of a row
+    /// that cannot run here is refused by name — nothing panics, nothing changes.
+    #[test]
+    fn ntsc_round_trips_through_dump_and_a_foreign_row_is_refused() {
+        let Some(st) = booted_state() else { return };
+        call(&st, "session/model", json!({ "name": "ntsc" }));
+        run_cycle_budget(&mut st.lock().unwrap().session, 200_000);
+        let dir = std::env::temp_dir().join(format!("trx64-863-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ntsc.c64re");
+        let d = call(&st, "snapshot/dump", json!({ "path": path.to_string_lossy() }));
+        assert_eq!(d["machine"], json!("c64-ntsc"));
+        let (pc, ram) = {
+            let g = st.lock().unwrap();
+            (g.session.machine.c64_core.reg_pc, g.session.machine.ram.clone())
+        };
+        call(&st, "session/model", json!({ "name": "pal" }));
+        call(&st, "snapshot/undump", json!({ "path": path.to_string_lossy() }));
+        {
+            let g = st.lock().unwrap();
+            assert_eq!(g.session.machine.model().name, "c64-ntsc", "undump puts it back on NTSC");
+            assert_eq!(g.session.machine.c64_core.reg_pc, pc);
+            assert!(g.session.machine.ram[..] == ram[..]);
+        }
+
+        // A checkpoint claiming a C64C (8565, VICE model 1) is refused naming the 6526A.
+        let mut cp = {
+            let g = st.lock().unwrap();
+            trx64_core::c64re_snapshot::capture_runtime_checkpoint(&g.session.machine, "", "", None, None, None, None)
+        };
+        cp["vic"]["model"] = json!(1);
+        let before_clk = st.lock().unwrap().session.machine.clk;
+        let e = {
+            let mut g = st.lock().unwrap();
+            restore_live_checkpoint(&mut g.session, &cp).unwrap_err()
+        };
+        assert!(e.contains("6526A"), "{e}");
+        // A position the row does not have (cycle 64 on the 63-cycle PAL line) is refused.
+        cp["vic"]["model"] = json!(0);
+        cp["vic"]["raster_cycle"] = json!(63);
+        let e = {
+            let mut g = st.lock().unwrap();
+            restore_live_checkpoint(&mut g.session, &cp).unwrap_err()
+        };
+        assert!(e.contains("cycle 64"), "{e}");
+        let g = st.lock().unwrap();
+        assert_eq!(g.session.machine.clk, before_clk, "a refused restore changes nothing");
+        assert_eq!(g.session.machine.model().name, "c64-ntsc");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Acceptance 9 — an NTSC frame goes out at the NTSC canvas size in the BIN_VIC header,
+    /// and the stream paces to the model's rate (~59.83 frames a second).
+    #[test]
+    fn an_ntsc_frame_carries_its_canvas_in_the_bin_vic_header() {
+        let Some(st) = booted_state() else { return };
+        // session/create {model} on a running PAL machine SWITCHES it at the frame
+        // boundary (never a power cycle); a cold start on the row is the power button.
+        let r = call(&st, "session/create", json!({ "model": "c64-ntsc" }));
+        assert_eq!(r["model"], json!("c64-ntsc"));
+        assert_eq!(r["modelSwitch"]["switched"], json!(true));
+        assert_eq!(r["modelSwitch"]["switchedAt"]["rasterLine"], json!(0));
+        assert_eq!(r["modelSwitch"]["kept"]["ram"], json!(true));
+        call(&st, "session/power", json!({ "op": "off" }));
+        call(&st, "session/power", json!({ "op": "on" }));
+        run_cycle_budget(&mut st.lock().unwrap().session, 3 * 17_095);
+        let g = st.lock().unwrap();
+        assert_eq!(g.session.machine.ram[0x02a6], 0, "a cold start on the NTSC row detects NTSC");
+        let (w, h, idx) = g.session.machine.render_canvas_indices();
+        let msg = crate::streaming::build_vic_frame(0, 0, &idx, w as u16, h as u16);
+        let p = &msg[5..];
+        assert_eq!((u16::from_le_bytes([p[0], p[1]]), u16::from_le_bytes([p[2], p[3]])), (384, 247));
+        let hello = av_hello(&g);
+        assert!((hello["frameRate"].as_f64().unwrap() - 59.826).abs() < 0.001);
+        assert_eq!(hello["cyclesPerFrame"], json!(17095));
+    }
+
+    /// The monitor verb reports the model and the rows, and switches.
+    #[test]
+    fn the_monitor_model_verb_reports_and_switches() {
+        let Some(st) = booted_state() else { return };
+        let out = call(&st, "monitor/exec", json!({ "command": "model" }))["output"].as_str().unwrap().to_string();
+        assert!(out.contains("c64-pal") && out.contains("c64-ntsc") && out.contains("6526A"), "{out}");
+        let out = call(&st, "monitor/exec", json!({ "command": "model c64-ntsc" }))["output"].as_str().unwrap().to_string();
+        assert!(out.contains("c64-pal → c64-ntsc"), "{out}");
+        assert_eq!(st.lock().unwrap().session.machine.model().name, "c64-ntsc");
+    }
+
+    /// Pacing is "realtime" now — the model's rate — and "pal" is still accepted.
+    #[test]
+    fn pacing_pal_is_an_alias_of_realtime() {
+        let st = make_state();
+        let r = call(&st, "session/set_pacing", json!({ "mode": "pal" }));
+        assert_eq!(r["pacing"]["mode"], json!("realtime"));
+        let r = call(&st, "session/set_pacing", json!({ "mode": "warp" }));
+        assert_eq!(r["pacing"]["mode"], json!("warp"));
+        call_err(&st, "session/set_pacing", json!({ "mode": "ntsc" }));
+    }
+
+    /// A scenario recorded on one model refuses to replay on another, naming both.
+    #[test]
+    fn a_scenario_from_another_model_is_refused() {
+        let st = make_state();
+        let mut g = st.lock().unwrap();
+        let e = run_scenario(&mut g, &json!({ "model": "c64-ntsc", "cycleBudget": 10, "inputs": [] })).unwrap_err();
+        assert!(e.contains("c64-ntsc") && e.contains("c64-pal"), "{e}");
+    }
+
+    /// A switch while recording: the journal records it as an event at the cycle it
+    /// happened on — a frame boundary, by construction — and a replay of the recording
+    /// performs the same transplant at the same cycle, so it ends where the live run ended.
+    #[test]
+    fn a_switch_while_recording_is_journaled_and_replays_at_the_same_cycle() {
+        let Some(st) = booted_state() else { return };
+        let dir = std::env::temp_dir().join(format!("trx64-863-rec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("start.c64re");
+        call(&st, "snapshot/dump", json!({ "path": path.to_string_lossy() }));
+        // The live run starts from the very restore the replay makes.
+        {
+            let mut g = st.lock().unwrap();
+            let read = trx64_core::native_snapshot::read_native_snapshot(&std::fs::read(&path).unwrap()).unwrap();
+            trx64_core::c64re_snapshot::restore_runtime_checkpoint(&mut g.session.machine, &read.checkpoint).unwrap();
+        }
+        let start = st.lock().unwrap().session.machine.cpu6510.clk;
+
+        let armed = call(&st, "session/input_journal", json!({ "arm": true }));
+        assert_eq!(armed["model"], json!("c64-pal"), "the journal says what it was armed on");
+        run_cycle_budget(&mut st.lock().unwrap().session, 50_000); // mid-frame
+        let r = call(&st, "session/model", json!({ "name": "c64-ntsc", "source": "llm" }));
+        let switched_at = r["switchedAt"]["c64Cycles"].as_u64().unwrap();
+        assert_eq!(r["switchedAt"]["rasterLine"], json!(0));
+        run_cycle_budget(&mut st.lock().unwrap().session, 17_095 + 777);
+        call(&st, "session/joystick_set", json!({ "port": 2, "fire": true }));
+        run_cycle_budget(&mut st.lock().unwrap().session, 3 * 17_095);
+        call(&st, "session/joystick_clear", json!({ "port": 2 }));
+        run_cycle_budget(&mut st.lock().unwrap().session, 5_000);
+        let (end, ram, line, cycle) = {
+            let g = st.lock().unwrap();
+            let m = &g.session.machine;
+            (m.cpu6510.clk, sha256_hex(&m.ram[..]), m.vic.raster_line, m.vic.raster_cycle)
+        };
+        let j = call(&st, "session/input_journal", json!({ "arm": false }));
+        let es = j["entries"].as_array().unwrap().clone();
+
+        // The switch is IN the recording, at its cycle, said by whom and through which door.
+        let sw: Vec<&Value> = es.iter().filter(|e| e["kind"] == json!("model")).collect();
+        assert_eq!(sw.len(), 1, "{es:?}");
+        assert_eq!(sw[0]["cycle"].as_u64(), Some(switched_at), "journaled at the cycle it happened on");
+        assert_eq!((sw[0]["detail"]["name"].clone(), sw[0]["detail"]["from"].clone()), (json!("c64-ntsc"), json!("c64-pal")));
+        assert_eq!((sw[0]["source"].clone(), sw[0]["method"].clone()), (json!("llm"), json!("session/model")));
+        assert!(switched_at > start + 50_000 && switched_at - (start + 50_000) < 19_656 + 16, "the next frame boundary");
+
+        // The recording, as a scenario: the model it started on, the inputs at their cycles.
+        let inputs: Vec<Value> = es
+            .iter()
+            .map(|e| match e["kind"].as_str().unwrap() {
+                "model" => json!({ "atCycle": e["cycle"], "kind": "model", "payload": e["detail"]["name"] }),
+                "joystick" if e["method"] == json!("session/joystick_clear") => json!({ "atCycle": e["cycle"], "kind": "joystick2", "payload": {} }),
+                "joystick" => json!({ "atCycle": e["cycle"], "kind": "joystick2", "payload": e["detail"] }),
+                k => panic!("unexpected {k}"),
+            })
+            .collect();
+        let scenario = json!({
+            "id": "rec-switch", "model": j["model"], "startSnapshot": path.to_string_lossy(),
+            "cycleBudget": end - start, "inputs": inputs,
+        });
+        // A recording is replayed on the model it STARTED on.
+        let e = call_err(&st, "runtime/scenario_run", json!({ "scenario": scenario }));
+        assert!(e.message.contains("recorded on c64-pal") && e.message.contains("c64-ntsc"), "{}", e.message);
+        call(&st, "session/model", json!({ "name": "c64-pal" }));
+
+        let rep = call(&st, "runtime/scenario_run", json!({ "scenario": scenario }));
+        assert_eq!(rep["modelSwitches"][0]["cycle"].as_u64(), Some(switched_at), "the same transplant at the same cycle: {rep}");
+        assert_eq!(rep["modelSwitches"][0]["rasterLine"], json!(0));
+        assert_eq!(rep["model"], json!("c64-ntsc"));
+        assert_eq!(rep["endCycle"].as_u64(), Some(end));
+        assert_eq!(rep["ramHash"].as_str(), Some(ram.as_str()), "the replay ends where the live run ended");
+        let g = st.lock().unwrap();
+        assert_eq!((g.session.machine.vic.raster_line, g.session.machine.vic.raster_cycle), (line, cycle));
+        assert_eq!(g.session.machine.vic.cycles_per_line(), 65);
+        drop(g);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A switch of a machine that is off is journaled too — it decides which machine the
+    /// recording's later cycles belong to.
+    #[test]
+    fn a_switch_of_a_machine_that_is_off_is_journaled() {
+        let st = make_state();
+        call(&st, "session/input_journal", json!({ "arm": true }));
+        call(&st, "monitor/exec", json!({ "command": "model c64-ntsc" }));
+        let j = call(&st, "session/input_journal", json!({ "arm": false }));
+        let e = &j["entries"][0];
+        assert_eq!((e["kind"].clone(), e["detail"]["name"].clone()), (json!("model"), json!("c64-ntsc")));
+        assert_eq!(e["method"], json!("monitor/exec"));
+        assert_eq!(e["detail"]["atPowerOn"], json!(true), "it becomes that model at its next power-on");
+    }
+}

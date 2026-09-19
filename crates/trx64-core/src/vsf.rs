@@ -637,12 +637,22 @@ fn load_vicii(machine: &mut Machine, data: &[u8]) -> Result<(), String> {
     // allow_bad_lines at offset 87, bad_line at 88.
     vic.allow_bad_lines = data[87] != 0;
     vic.bad_line = data[88] != 0;
-    // raster_y at offset 89 (2 LE).
-    if let Some(ry) = read_u16_le(data, 89) {
-        vic.raster_line = ry;
+    // raster_y at offset 89 (2 LE), raster_cycle at offset 91. Spec 863 — this compact
+    // format carries no model: the position must exist on the machine's own row, or a
+    // cycle past the line's end would run off the cycle table.
+    let ry = read_u16_le(data, 89).unwrap_or(vic.raster_line);
+    let rc = data[91] as u16;
+    if !vic.fits(ry, rc) {
+        return Err(format!(
+            "VIC-II: line {ry} cycle {} is not a position on the {} ({} × {})",
+            rc + 1,
+            vic.model().name,
+            vic.cycles_per_line(),
+            vic.screen_height()
+        ));
     }
-    // raster_cycle at offset 91.
-    vic.raster_cycle = data[91] as u16;
+    vic.raster_line = ry;
+    vic.raster_cycle = rc;
     Ok(())
 }
 
@@ -1000,6 +1010,31 @@ fn load_vice_vsf(machine: &mut Machine, data: &[u8]) -> Result<VsfLoadResult, St
     let mut ignored = Vec::new();
     let mut errors: Vec<(String, String)> = Vec::new();
 
+    // Spec 863 D6 — the VIC-II module's first byte is VICE's VIC-II model
+    // (`vicii-snapshot.c:125-126`, VICII_MODEL_*: 0 = 6569, 3 = 6567R8, 6 = 6572). It names
+    // the C64 the dump was taken on; put the machine on that row before any chip state is
+    // loaded, and refuse — before anything is overwritten — a row that cannot run here or a
+    // raster position that row does not have.
+    if let Some(m) = vice_find_module(data, "VIC-II").or_else(|| vice_find_module(data, "VIC-IISC")) {
+        if m.data_len >= 1 + 64 + 12 {
+            let d = &data[m.data_start..m.data_start + m.data_len];
+            let model = crate::model::for_snapshot(d[0]).map_err(|e| format!("vsf: {e}"))?;
+            let dw = |o: usize| u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
+            let (cycle, line) = (dw(65), dw(73));
+            let t = model.timing;
+            if cycle >= t.cycles_per_line as u32 || line >= t.lines_per_frame as u32 {
+                return Err(format!(
+                    "vsf: the VIC stands at line {line} cycle {} — {} has {} lines of {} cycles",
+                    cycle + 1,
+                    model.name,
+                    t.lines_per_frame,
+                    t.cycles_per_line
+                ));
+            }
+            machine.put_on_model(model).map_err(|e| format!("vsf: {e}"))?;
+        }
+    }
+
     // ── C64MEM (must come before MAINCPU's memconfig is used) ──
     // VICE C64MEM v0.1: pport.data[0], pport.dir[1], exrom[2], game[3], RAM[4..].
     match vice_find_module(data, "C64MEM") {
@@ -1155,7 +1190,8 @@ fn load_vice_vsf(machine: &mut Machine, data: &[u8]) -> Result<VsfLoadResult, St
             // each a DWORD right after the registers) so the resumed frame starts where
             // VICE dumped it, not at line 0.
             let dw = |o: usize| u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
-            if d.len() >= 77 {
+            // (Spec 863 — the position was checked against the dump's row at the top.)
+            if d.len() >= 77 && machine.vic.fits(dw(73) as u16, dw(65) as u16) {
                 machine.vic.raster_cycle = dw(65) as u16;
                 machine.vic.cycle_flags = dw(69);
                 machine.vic.raster_line = dw(73) as u16;

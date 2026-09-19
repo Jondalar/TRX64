@@ -511,14 +511,47 @@ fn resolve_node_at(cp: &Value, ram: &[u8], x: i64, y: i64, provenance: &[Provena
 
 // ── visible-frame → display-area geometry (vic-inspect.ts:209-211) ──────────────
 
-/// vic-inspect.ts:209 — the rendered visible PAL window.
-pub const VISIBLE_FRAME_W: i64 = 384;
-pub const VISIBLE_FRAME_H: i64 = 272;
-/// vic-inspect.ts:210 — literal renderer crop: first visible raster line (fb Y0).
-const CANVAS_Y0: i64 = 16;
-/// vic-inspect.ts:211 — DISPLAY_ORIGIN = { x:32, y:35 }.
+// vic-inspect.ts:209-211 — the rendered visible window and the display origin in it.
+// Spec 863: the window is the checkpoint's model's (its VIC snapshot names the chip, the
+// chip names the row) — PAL 384 × 272 from line 16, display origin (32, 35); NTSC 384 × 247
+// from line 28, origin (32, 23), its last twelve rows raster lines 0-11.
+
+/// vic-inspect.ts:211 — DISPLAY_ORIGIN.x: the left border's width (32 on every model).
 pub const DISPLAY_ORIGIN_X: i64 = 32;
-pub const DISPLAY_ORIGIN_Y: i64 = FIRST_DISPLAY_RASTER - CANVAS_Y0; // 35
+
+/// The display window of the model a checkpoint was captured on (the default model's when
+/// the checkpoint names none).
+pub fn window_of(cp: &Value) -> crate::model::DisplayWindow {
+    cp.get("vic")
+        .and_then(|v| v.get("model"))
+        .and_then(|m| m.as_u64())
+        .and_then(|id| crate::model::by_vicii_id(id as u8))
+        .unwrap_or_else(crate::model::default_model)
+        .window
+}
+
+/// The visible frame a checkpoint's picture is: `(width, height, display origin x, y)`.
+pub fn visible_frame(cp: &Value) -> (i64, i64, i64, i64) {
+    let w = window_of(cp);
+    (w.width() as i64, w.height() as i64, w.border_left as i64, display_origin_y(&w))
+}
+
+/// vic-inspect.ts:211 — DISPLAY_ORIGIN.y: display row 0 (raster 51) on the canvas.
+fn display_origin_y(w: &crate::model::DisplayWindow) -> i64 {
+    FIRST_DISPLAY_RASTER - w.first_line as i64
+}
+
+/// The raster line a canvas row shows.
+fn raster_of_row(w: &crate::model::DisplayWindow, vy: f64) -> i64 {
+    let row = vy.round().max(0.0) as usize;
+    w.line_of_canvas_row(row) as i64
+}
+
+/// The canvas row a raster line is drawn on (a wrapped window puts lines 0.. at the bottom).
+fn row_of_raster(w: &crate::model::DisplayWindow, line: i64) -> i64 {
+    let lines = w.raster_lines as i64;
+    w.row_of_line(line.rem_euclid(lines) as u16) as i64 - w.first_line as i64
+}
 
 /// vic-inspect.ts:214-227 — build a `sprite_bounds` node (visible-frame variant).
 #[allow(clippy::too_many_arguments)]
@@ -534,8 +567,10 @@ fn make_sprite_node(
     vx: f64,
     vy: f64,
     multiplexed: bool,
+    win: &crate::model::DisplayWindow,
 ) -> VisualNode {
-    let in_border = vy < DISPLAY_ORIGIN_Y as f64 || vy >= (DISPLAY_ORIGIN_Y + 200) as f64;
+    let origin_y = display_origin_y(win);
+    let in_border = vy < origin_y as f64 || vy >= (origin_y + 200) as f64;
     let data_note = format!(
         "bounding-box; not pixel-exact{}{}",
         if multiplexed { "; MULTIPLEXED (per-raster)" } else { "" },
@@ -552,7 +587,7 @@ fn make_sprite_node(
         node_type: "sprite_bounds",
         pixel: (vx.round() as i64, vy.round() as i64),
         cell: None,
-        raster: Some((vy.round() as i64 + CANVAS_Y0, None)),
+        raster: Some((raster_of_row(win, vy), None)),
         mode,
         value: Some(i),
         color_index: Some(color & 0x0f),
@@ -570,18 +605,19 @@ fn sprite_bounds_at_visible(
     vy: f64,
     provenance: &[ProvenanceLine],
 ) -> Option<VisualNode> {
-    let raster = vy.round() as i64 + CANVAS_Y0;
+    let win = window_of(cp);
+    let raster = raster_of_row(&win, vy);
 
     // Multiplexer: per-raster sprite state is authoritative for THIS line.
     if let Some(ln) = provenance.iter().find(|l| l.line == raster) {
         for s in &ln.sprites {
             let bx = (s.x - 24 + DISPLAY_ORIGIN_X) as f64;
-            let by = (s.y - CANVAS_Y0) as f64;
+            let by = row_of_raster(&win, s.y) as f64;
             if vx >= bx && vx < bx + s.w as f64 && vy >= by && vy < by + s.h as f64 {
                 let lbank = ln.bank;
                 let lscreen = lbank + ((ln.d018 & 0xf0) >> 4) * 0x400;
                 return Some(make_sprite_node(
-                    s.i, s.x, s.y, s.ptr, s.color, lscreen + 0x3f8 + s.i, lbank, snap.mode, vx, vy, true,
+                    s.i, s.x, s.y, s.ptr, s.color, lscreen + 0x3f8 + s.i, lbank, snap.mode, vx, vy, true, &win,
                 ));
             }
         }
@@ -605,11 +641,11 @@ fn sprite_bounds_at_visible(
         let w = if (xexp & (1 << i)) != 0 { 48 } else { 24 };
         let h = if (yexp & (1 << i)) != 0 { 42 } else { 21 };
         let bx = (sx - 24 + DISPLAY_ORIGIN_X) as f64;
-        let by = (sy - CANVAS_Y0) as f64;
+        let by = row_of_raster(&win, sy + 1) as f64 - 1.0;
         if vx >= bx && vx < bx + w as f64 && vy >= by && vy < by + h as f64 {
             let ptr_addr = snap.screen_base + 0x3f8 + i;
             return Some(make_sprite_node(
-                i, sx, sy, ram_at(ram, ptr_addr), reg(cp, (0x27 + i) as usize), ptr_addr, snap.bank_base, snap.mode, vx, vy, false,
+                i, sx, sy, ram_at(ram, ptr_addr), reg(cp, (0x27 + i) as usize), ptr_addr, snap.bank_base, snap.mode, vx, vy, false, &win,
             ));
         }
     }
@@ -617,10 +653,10 @@ fn sprite_bounds_at_visible(
 }
 
 /// vic-inspect.ts:277-282 — visible-frame pixel → display-area pixel (clamped).
-fn visible_to_display(vx: f64, vy: f64) -> (i64, i64) {
+fn visible_to_display(vx: f64, vy: f64, origin_y: i64) -> (i64, i64) {
     (
         (vx.round() as i64 - DISPLAY_ORIGIN_X).clamp(0, 319),
-        (vy.round() as i64 - DISPLAY_ORIGIN_Y).clamp(0, 199),
+        (vy.round() as i64 - origin_y).clamp(0, 199),
     )
 }
 
@@ -638,12 +674,13 @@ fn resolve_visible_node_at_inner(cp: &Value, ram: &[u8], vx: f64, vy: f64, prove
         return sprite;
     }
 
+    let origin_y = display_origin_y(&window_of(cp));
     let in_display = vx >= DISPLAY_ORIGIN_X as f64
         && vx < (DISPLAY_ORIGIN_X + 320) as f64
-        && vy >= DISPLAY_ORIGIN_Y as f64
-        && vy < (DISPLAY_ORIGIN_Y + 200) as f64;
+        && vy >= origin_y as f64
+        && vy < (origin_y + 200) as f64;
     if in_display {
-        let (dx, dy) = visible_to_display(vx, vy);
+        let (dx, dy) = visible_to_display(vx, vy, origin_y);
         return resolve_node_at(cp, ram, dx, dy, provenance);
     }
     // open border, no sprite → border colour ($D020)
@@ -1213,6 +1250,31 @@ mod tests {
         let charset = node.refs.iter().find(|r| r.kind == "charset").unwrap();
         assert_eq!(charset.addr, 0x1000 + 0x41 * 8);
         assert_eq!(charset.note.as_deref(), Some("char ROM shadow"));
+    }
+
+    /// Spec 863 — an NTSC checkpoint (VIC-II model 3, the 6567R8) is read on the NTSC
+    /// window: 384 × 247 from line 28, display origin (32, 23), and a sprite on raster
+    /// line 5 sits at the BOTTOM of the canvas (row 263 + 5 − 28 = 240), not the top.
+    #[test]
+    fn an_ntsc_checkpoint_is_read_on_the_ntsc_window() {
+        let mut cp = mk_text_cp(0x41, 0x01);
+        assert_eq!(visible_frame(&cp), (384, 272, 32, 35), "PAL");
+        cp["vic"]["model"] = json!(3);
+        assert_eq!(visible_frame(&cp), (384, 247, 32, 23), "NTSC");
+        // Cell (0,0) is still display (4,4) → visible (36, 4 + 23).
+        let node = resolve_visible_node_at(&cp, 36.0, 27.0, None);
+        assert_eq!((node.node_type, node.cell), ("text_cell", Some((0, 0, 0))));
+        // Sprite 0 at Y = 4: its first line is raster 5, drawn at canvas row 240.
+        let mut regs: Vec<i64> = cp["vic"]["regs"].as_array().unwrap().iter().map(|v| v.as_i64().unwrap()).collect();
+        regs[0x00] = 100;
+        regs[0x01] = 4;
+        regs[0x15] = 0x01;
+        cp["vic"]["regs"] = json!(regs);
+        let node = resolve_visible_node_at(&cp, (100 - 24 + 32) as f64 + 2.0, 241.0, None);
+        assert_eq!(node.node_type, "sprite_bounds", "{node:?}");
+        assert_eq!(node.raster.map(|r| r.0), Some(6), "canvas row 241 is raster line 6");
+        let top = resolve_visible_node_at(&cp, (100 - 24 + 32) as f64 + 2.0, 3.0, None);
+        assert_ne!(top.node_type, "sprite_bounds", "not at the top");
     }
 
     #[test]

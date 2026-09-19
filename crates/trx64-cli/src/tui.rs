@@ -982,7 +982,7 @@ fn draw_gauges(f: &mut Frame, area: Rect, s: &StateSnapshot) {
         _ if s.running => ("\u{25b6} PLAY", Color::Green),
         _ => ("\u{23f8} PAUSE", Color::Red),
     };
-    let warp_label = if s.warp { "WARP 8×" } else { "PAL 1×" };
+    let warp_label = if s.warp { "WARP 8×".to_string() } else { format!("{} 1×", s.video_standard.to_uppercase()) };
     let machine = vec![
         Line::from(Span::styled(run_label, Style::default().fg(run_color).add_modifier(Modifier::BOLD))),
         Line::from(vec![

@@ -32,6 +32,7 @@ pub mod gcr;
 pub mod iec;
 pub mod keyboard;
 pub mod m93c86;
+pub mod model;
 pub mod native_snapshot;
 pub mod recorder;
 pub mod rewind;
@@ -346,6 +347,7 @@ impl<'a> VicBus<'a> {
             char_rom: &char_rom,
             color_ram: &color_ram,
             bank_base: 0,
+            model: self.vic.model(),
         };
         let (ss, sb) = render::render_collisions(&inp);
         self.vic.apply_collisions(ss, sb);
@@ -644,6 +646,13 @@ pub struct Machine {
     pub cart_read_armed: bool,
     /// The accumulator itself. See [`crate::cart::CartReadSet`].
     pub cart_read_set: crate::cart::CartReadSet,
+
+    /// Spec 863 — which C64 this is: a row of `models.toml`. It decides the VIC's cycle
+    /// table and frame, the CPU clock the CIAs' TOD and the drive's catch-up are measured
+    /// against, and the displayed window. Read it through [`Machine::timing`]; change it
+    /// with [`Machine::switch_model`] (a live machine) or by building one with
+    /// [`Machine::new_with_model`].
+    model: &'static crate::model::C64Model,
 }
 
 /// reverse-debug Phase 1b — the CPU state the machine landed on after a reverse-step
@@ -747,7 +756,17 @@ impl From<std::io::Error> for RomError {
 }
 
 impl Machine {
+    /// A powered-off machine of the default model (`c64-pal`).
     pub fn new() -> Self {
+        Self::new_with_model(crate::model::default_model())
+    }
+
+    /// A powered-off machine of `model` — fresh chips built on the row before any cycle
+    /// runs. Pass a row from [`crate::model::resolve`], which refuses one that cannot run.
+    pub fn new_with_model(model: &'static crate::model::C64Model) -> Self {
+        let t = model.timing;
+        let mut drive8 = Drive1541::new();
+        drive8.sync_factor = t.drive_sync_factor;
         Self {
             ram: Box::new([0u8; 0x10000]),
             clk: 0,
@@ -755,11 +774,11 @@ impl Machine {
             c64_core: c64_6510core::C64Core6510::new(),
             c64_int: c64_6510core::IntStatus::new(),
             cpu: Cpu::default(),
-            vic: VicII::new(),
-            cia1: Cia::new(),
-            cia2: Cia::new(),
+            vic: VicII::new_for(model),
+            cia1: Cia::new_timed(t.cpu_hz, t.tod_hz),
+            cia2: Cia::new_timed(t.cpu_hz, t.tod_hz),
             cia_table: cia::new_table(),
-            drive8: Drive1541::new(),
+            drive8,
             basic_rom: Box::new([0u8; 0x2000]),
             kernal_rom: Box::new([0u8; 0x2000]),
             char_rom: Box::new([0u8; 0x1000]),
@@ -807,7 +826,64 @@ impl Machine {
             sector_entry_read_count: 0,
             cart_read_armed: false,
             cart_read_set: crate::cart::CartReadSet::default(),
+            model,
         }
+    }
+
+    /// Spec 863 — the row this machine is.
+    pub fn model(&self) -> &'static crate::model::C64Model {
+        self.model
+    }
+
+    /// Spec 863 — how long a frame is and how fast the clock runs: the one answer.
+    pub fn timing(&self) -> crate::model::Timing {
+        self.model.timing
+    }
+
+    /// Spec 863 D5 — the transplant: put this RUNNING machine on another row, keeping its
+    /// whole state. CPU, RAM, the CIAs' registers and timers, the SID's registers, the
+    /// drive and every framebuffer are values and stay exactly what they are; what the row
+    /// decides changes: the VIC's cycle table and frame (it carries on at the line it is on
+    /// in the new geometry), the clock the TOD's mains tick and the drive's catch-up ratio
+    /// are measured against. Nothing is power-cycled — the running program keeps the
+    /// standard it detected at boot.
+    ///
+    /// The caller stands the machine at the frame boundary (line 0, the first cycles), the
+    /// one position every geometry has. A position the new row does not have, or a row
+    /// that cannot run here, is refused by name and nothing changes.
+    pub fn switch_model(&mut self, model: &'static crate::model::C64Model) -> Result<(), String> {
+        if let Some(why) = model.refusal() {
+            return Err(why);
+        }
+        let (line, cycle) = (self.vic.raster_line, self.vic.raster_cycle);
+        if cycle >= model.timing.cycles_per_line || line >= model.timing.lines_per_frame {
+            return Err(format!(
+                "the VIC stands at line {line}, cycle {} — {} has no such position (switch at the frame boundary)",
+                cycle + 1,
+                model.name
+            ));
+        }
+        self.put_on_model(model)
+    }
+
+    /// Put the machine on a row without asking where the VIC stands — for a restore, which
+    /// checks the SNAPSHOT's position (the one about to be loaded) instead of the live one.
+    pub fn put_on_model(&mut self, model: &'static crate::model::C64Model) -> Result<(), String> {
+        if let Some(why) = model.refusal() {
+            return Err(why);
+        }
+        if std::ptr::eq(self.model, model) {
+            return Ok(());
+        }
+        let t = model.timing;
+        self.vic.set_model(model);
+        // VICE `machine_change_timing` → `cia1_set_timing` / `cia2_set_timing` /
+        // `drive_set_machine_parameter` (c64.c:1344-1358).
+        self.cia1.set_timing(t.cpu_hz, t.tod_hz);
+        self.cia2.set_timing(t.cpu_hz, t.tod_hz);
+        self.drive8.sync_factor = t.drive_sync_factor;
+        self.model = model;
+        Ok(())
     }
 
     /// Mirror the live Cpu6510 register state into the legacy `cpu` snapshot +
@@ -1166,8 +1242,11 @@ impl Machine {
         // ts:724-726 — cold-reset the C64 I/O chips so a 2nd+ reset does not leave
         // CIA timers / IRQ state or an active VIC raster-IRQ from the previous run
         // (= the "no cursor / re-hijack after reset" recovery). Fresh power-on chips.
-        self.cia1 = Cia::new();
-        self.cia2 = Cia::new();
+        // Spec 863 — fresh chips of the SAME model: the standard is identity, like the
+        // profile below, and a reset does not change the crystal.
+        let t = self.model.timing;
+        self.cia1 = Cia::new_timed(t.cpu_hz, t.tod_hz);
+        self.cia2 = Cia::new_timed(t.cpu_hz, t.tod_hz);
         self.cia1.clk = self.clk;
         self.cia2.clk = self.clk;
         // Spec 815 — which machine this claims to be is IDENTITY, not chip state.
@@ -1177,7 +1256,7 @@ impl Machine {
         // Spec 851 — the Ultimate's turbo settings are the firmware's, not the C64's; the
         // reset clears only the C64-side `$D030`/`$D031`.
         let (regs_en, prefer, table) = (self.vic.u64_regs_en, self.vic.u64_speed_prefer, self.vic.u64_speed_table);
-        self.vic = VicII::new();
+        self.vic = VicII::new_for(self.model);
         self.vic.speed_profile = profile;
         self.vic.u64_regs_en = regs_en;
         self.vic.u64_speed_prefer = prefer;
@@ -2147,7 +2226,7 @@ impl Machine {
     pub fn set_reverse_depth(&mut self, seconds: usize) -> ReverseDepthInfo {
         let secs = seconds.max(1);
         let (entry_cap, writes_cap) = crate::delta_ring::DeltaRing::caps_for_seconds(secs);
-        let cpu_cap = secs * crate::delta_ring::INSTR_PER_SECOND;
+        let cpu_cap = secs * crate::delta_ring::ring_instr_per_second();
         self.delta_ring.resize(entry_cap, writes_cap);
         self.cpu_history.resize(cpu_cap);
         // RAM bytes: delta entries (24 B) + delta writes (4 B) + cpu-history (24 B).
@@ -2171,7 +2250,7 @@ impl Machine {
         let entry_cap = self.delta_ring.entry_capacity();
         let writes_cap = self.delta_ring.writes_capacity();
         let cpu_cap = self.cpu_history.capacity();
-        let seconds = (entry_cap / crate::delta_ring::INSTR_PER_SECOND).max(1);
+        let seconds = (entry_cap / crate::delta_ring::ring_instr_per_second()).max(1);
         let ram_bytes =
             entry_cap * std::mem::size_of::<crate::delta_ring::DeltaEntry>()
                 + writes_cap * std::mem::size_of::<crate::delta_ring::WriteRec>()
@@ -2576,7 +2655,7 @@ impl Machine {
         bank.wrapping_mul(0x4000)
     }
 
-    /// Render the displayed frame to the VICE PAL screenshot canvas (384×272 RGBA,
+    /// Render the displayed frame to the model's canvas (PAL 384×272, NTSC 384×247 RGBA,
     /// colodore). The image is the VIC's per-cycle-accumulated `displayed` buffer
     /// (the last COMPLETE frame swept by the raster), cropped + palettized exactly
     /// like the TS oracle's `renderLiteralPortRgba`. This is the VERBATIM per-cycle
@@ -2584,17 +2663,17 @@ impl Machine {
     /// render correctly (the prior static single-pass render could not). Returns
     /// (width, height, rgba).
     pub fn render_canvas_rgba(&self) -> (usize, usize, Vec<u8>) {
-        render::index_buffer_to_canvas_rgba(&self.vic.displayed[..])
+        render::index_buffer_to_canvas_rgba(&self.vic.displayed[..], &self.model.window)
     }
 
-    /// Render the displayed frame as raw 4-bit COLOUR INDICES (384×272, one byte
-    /// per pixel, each `& 0x0f`) — the `fmt 1` palette-indexed live-stream source.
+    /// Render the displayed frame as raw 4-bit COLOUR INDICES (the model's canvas, one
+    /// byte per pixel, each `& 0x0f`) — the `fmt 1` palette-indexed live-stream source.
     /// Same per-cycle `displayed` buffer + same crop as [`render_canvas_rgba`],
     /// but un-palettized (the consumer applies [`render::COLODORE`]). Used by the
     /// daemon's live A/V WS push (ADR-073); additive, no byte-exact path touched.
     /// Returns (width, height, indices).
     pub fn render_canvas_indices(&self) -> (usize, usize, Vec<u8>) {
-        render::index_buffer_to_canvas_indices(&self.vic.displayed[..])
+        render::index_buffer_to_canvas_indices(&self.vic.displayed[..], &self.model.window)
     }
 
     /// Compute the $D01E (sprite-sprite) / $D01F (sprite-background) collision
@@ -2618,6 +2697,7 @@ impl Machine {
             char_rom: &self.char_rom,
             color_ram: &color_ram,
             bank_base,
+            model: self.model,
         };
         let (ss, sb) = render::render_collisions(&inp);
         self.vic.apply_collisions(ss, sb);
@@ -2641,9 +2721,13 @@ impl Machine {
     pub fn boot_from_dir(&mut self, rom_dir: &Path) -> Result<(), RomError> {
         // Power-on DRAM fill FIRST, then ROM loads overwrite their windows.
         self.fill_power_on_ram();
-        self.load_kernal(&rom_dir.join("kernal-901227-03.bin"))?;
-        self.load_basic(&rom_dir.join("basic-901226-01.bin"))?;
-        self.load_chargen(&rom_dir.join("chargen-901225-01.bin"))?;
+        // Spec 863 — the model's ROM files. The runnable rows all name the ROM set's
+        // (C64 NTSC boots the same 901227-03 KERNAL as PAL: the KERNAL's own raster test
+        // sets $02A6 from the line count the VIC produces).
+        let m = self.model;
+        self.load_kernal(&rom_dir.join(&m.kernal))?;
+        self.load_basic(&rom_dir.join(&m.basic))?;
+        self.load_chargen(&rom_dir.join(&m.chargen))?;
         // Full machine assembled: ROMs are also in the separate arrays now, and
         // the FullBus is available via run_for_full*.
         self.full_assembled = true;
@@ -2915,7 +2999,7 @@ impl Machine {
             }
             // Drive catches up to the current C64 clock BEFORE the instruction
             // (= integrated-session.ts:898 catchUpDrive). Advances the drive's
-            // own clock via the PAL sync_factor.
+            // own clock via the model's sync_factor.
             let c64_clk_before = self.c64_core.clk;
 
             // Refresh cross-chip interrupt lines at the boundary into the verbatim
@@ -3357,8 +3441,8 @@ impl Machine {
                     break;
                 }
             }
-            // Drive advances by this C64 instruction's cycle cost, scaled by the PAL
-            // sync factor.
+            // Drive advances by this C64 instruction's cycle cost, scaled by the
+            // model's sync factor.
             let c64_cycles = self.cpu6510.clk.wrapping_sub(c64_clk_before);
             self.drive8.run_cycles(c64_cycles);
             // Sample drive PC (deduplicated).

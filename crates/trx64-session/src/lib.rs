@@ -62,6 +62,11 @@ pub struct Session {
     /// Spec 786 — media registry: disk image held while powered off (writes
     /// intact). Same off↔machine transplant as the cartridge.
     pub inserted_disk: Option<DiskImage>,
+    /// Spec 863 — which C64 this session is (a `models.toml` row). Session identity, like
+    /// the machine profile: every machine the session builds — power-on, the power-off
+    /// blank — is built on it, so it survives a power cycle; a warm reset keeps the
+    /// machine's own. Only a new session starts at the default.
+    pub model: &'static trx64_core::model::C64Model,
 }
 
 /// Trace bookkeeping for an active `.c64retrace` capture.
@@ -112,9 +117,15 @@ pub struct TraceState {
 
 impl Session {
     pub fn new(id: impl Into<String>) -> Self {
+        Self::new_with_model(id, trx64_core::model::default_model())
+    }
+
+    /// A session of `model` — the machine is built on the row before it boots, so nothing
+    /// ever runs on another. Pass a row from `trx64_core::model::resolve`.
+    pub fn new_with_model(id: impl Into<String>, model: &'static trx64_core::model::C64Model) -> Self {
         Self {
             id: id.into(),
-            machine: Machine::new(),
+            machine: Machine::new_with_model(model),
             running: false,
             injected: false,
             io_injected: false,
@@ -124,6 +135,7 @@ impl Session {
             powered: false,
             inserted_cart: None,
             inserted_disk: None,
+            model,
         }
     }
 
@@ -150,7 +162,7 @@ impl Session {
         if self.powered {
             return Ok(());
         }
-        let mut machine = Machine::new();
+        let mut machine = Machine::new_with_model(self.model);
         machine.boot_from_dir(rom_dir)?;
         // Re-insert the registered cartridge: transplant the live mapper +
         // image (flash preserved), then cold-reset so the machine re-vectors
@@ -196,7 +208,7 @@ impl Session {
         // then move the image into the registry.
         self.machine.drive8.flush_disk_writeback();
         self.inserted_disk = self.machine.drive8.disk.take();
-        self.machine = Machine::new();
+        self.machine = Machine::new_with_model(self.model);
         self.running = false;
         self.powered = false;
     }
@@ -232,6 +244,16 @@ impl Session {
     pub fn clear_inserted_cart(&mut self) {
         self.inserted_cart = None;
         self.cart_path = String::new();
+    }
+
+    /// Spec 863 — the session's identity follows the machine: after a restore put the
+    /// machine back on the row a snapshot was taken on, the session is that model too (a
+    /// power cycle then builds the same machine again). Returns whether it changed.
+    pub fn adopt_machine_model(&mut self) -> bool {
+        let m = self.machine.model();
+        let changed = !std::ptr::eq(m, self.model);
+        self.model = m;
+        changed
     }
 
     /// Native fast snapshot: clone the Machine (ADR-002).

@@ -14,7 +14,7 @@
 //! controller `running` flag, and `session/run` REFUSES while `running==true` (so two
 //! clocks can't double-advance). The host (us) owns the per-frame loop. So the
 //! Engine keeps its OWN `running` flag (`AtomicBool`); the pump thread, while that
-//! flag is set, advances the machine one PAL frame at a time via `session/run`
+//! flag is set, advances the machine one frame at a time via `session/run`
 //! (which honours breakpoints + JAM) WITHOUT flipping the controller flag — exactly
 //! the FFI pattern. `pause` clears the flag.
 
@@ -23,10 +23,6 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use trx64_daemon::{dispatch, Request, Response, SharedState};
-
-/// One PAL frame ≈ 312 lines × 63 cycles = 19656; the daemon's `session/run`
-/// default budget is 19705. We advance one frame's worth per pump tick.
-pub const CYC_PER_FRAME: u64 = 19_656;
 
 /// The shared, cloneable handle to the in-process machine.
 #[derive(Clone)]
@@ -134,8 +130,8 @@ impl Engine {
     /// returns early with a `breakpoint` object — we then clear the host run flag so
     /// the cockpit shows PAUSED at the hit.
     /// Advance the machine by `base_cycles` (the host pump passes the cycles for the
-    /// REAL wall-clock time elapsed since the last tick — `elapsed × PAL_CPU_HZ` — so
-    /// the machine runs at true PAL real-time and SID production matches 44100 Hz, like
+    /// REAL wall-clock time elapsed since the last tick — `elapsed × the model's clock` —
+    /// so the machine runs at true real time and SID production matches 44100 Hz, like
     /// the SwiftUI AppModel pump; a fixed 50 fps budget drifted slow → audio crackle).
     pub fn pump_frame(&self, base_cycles: u64) -> u64 {
         // Spec 808 rebuild — the client hands over the real time that passed and renders
@@ -394,7 +390,7 @@ impl Engine {
     /// `session/cart_status` rpcs (no machine mutation).
     fn verb_settings(&self) -> CmdResult {
         let running = if self.is_running() { "running" } else { "paused" };
-        let pacing = if self.is_warp() { "warp (8×)" } else { "PAL real-time (1×)" };
+        let pacing = if self.is_warp() { "warp (8×)" } else { "real time (1×)" };
         let joy = match self.joystick_mode() {
             0 => "off (WASD/Space type normally)".to_string(),
             p => format!("port {p} (WASD = directions, Space = fire)"),
@@ -509,6 +505,8 @@ pub struct StateSnapshot {
     pub drive: DriveSnapshot,
     /// The cartridge panel, `None` when the port is empty.
     pub cart: Option<CartSnapshot>,
+    /// Spec 863 — the video standard of the machine's model (`pal`, `ntsc`, `pal-n`).
+    pub video_standard: String,
 }
 
 /// Drive 8's live panel. `led_pwm` is a DUTY CYCLE over the period since the last
@@ -555,6 +553,7 @@ impl StateSnapshot {
         StateSnapshot {
             running,
             warp,
+            video_standard: v.get("videoStandard").and_then(|s| s.as_str()).unwrap_or("pal").to_string(),
             transport_mode: v
                 .get("transport")
                 .and_then(|t| t.get("mode"))
@@ -677,7 +676,7 @@ Tab completes verbs in all three namespaces + paths for path arguments.
   /mount <path>        mount a .d64/.g64/.crt
   /eject | /umount     eject the cartridge or unmount drive8
   /load <prg>          load a .prg into RAM (no run)
-  /warp on|off         8× / real-time PAL pacing
+  /warp on|off         8× / real-time pacing (the model's frame rate)
   /joystick off|port1|port2   route WASD+Space to the joystick (off = type)
   /window              spawn the native emulator window
   /dump | /snapshot <path>   write a .c64re snapshot

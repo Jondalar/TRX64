@@ -24,9 +24,12 @@
 //! + advances two cursors. NO allocation, NO formatting, one `enabled` branch. Both slabs
 //! are built once at `Machine::new` and never grow.
 //!
-//! MEMORY: sized for ~10 s of 6502 history. ~3M instr × 24 B (entry) + ~3M writes × 8 B
-//! ≈ 72 + 24 ≈ ~96 MB at the default; tunable via `TRX64_REVERSE_SECONDS` (default 10) and
-//! killed by `TRX64_CPUHISTORY=0` (shared kill-switch with Phase 1a — one knob).
+//! MEMORY: sized for ~10 s of 6502 history on every C64 model — the instruction rate is
+//! taken at the fastest runnable model's clock (`ring_instr_per_second`), so a model
+//! switch never shrinks the window. ~3.1M instr × 24 B (entry) + ~3.1M caller chains × 8 B
+//! + ~3.9M writes × 4 B ≈ 110 MiB at the default; tunable via `TRX64_REVERSE_SECONDS`
+//! (default 10) and killed by `TRX64_CPUHISTORY=0` (shared kill-switch with Phase 1a — one
+//! knob).
 //!
 //! CONTRACT (the hard one): reverse-step restores CPU + RAM + IO-register *bytes*, NOT chip
 //! internal counters (VIC raster / CIA timers / sprite-DMA). After a reverse-step the
@@ -185,10 +188,44 @@ pub const LOOP_WINDOW: usize = 8;
 /// `TRX64_REVERSE_SECONDS`.
 pub const DEFAULT_REVERSE_SECONDS: usize = 10;
 
-/// 6502 instructions per second at the PAL ~1 MHz clock, used to size the ring from
-/// the seconds budget. ~1M cyc/s ÷ ~3.5 cyc/instr ≈ ~300k instr/s; round to 300k so
-/// 10 s ≈ 3M instructions (the spec's figure).
+/// 6502 instructions per second at the PAL clock (985 248 Hz) — the estimate the ring is
+/// sized from. ~1M cyc/s ÷ ~3.5 cyc/instr ≈ ~300k instr/s; round to 300k so 10 s ≈ 3M
+/// instructions (the spec's figure). A faster clock retires more instructions a second,
+/// so the ring does not use this figure directly: see [`ring_instr_per_second`].
 pub const INSTR_PER_SECOND: usize = 300_000;
+
+/// The clock [`INSTR_PER_SECOND`] is the estimate for: PAL's.
+const INSTR_PER_SECOND_AT_HZ: u64 = 985_248;
+
+/// The instructions-per-second estimate at `cpu_hz`: the PAL figure scaled by the clock,
+/// rounded up.
+pub fn instr_per_second_at(cpu_hz: u32) -> usize {
+    (INSTR_PER_SECOND as u64 * cpu_hz as u64).div_ceil(INSTR_PER_SECOND_AT_HZ) as usize
+}
+
+/// The rate the ring is sized for, per second of hold: the estimate at the FASTEST clock
+/// of any model that runs here (today PAL-N's 1 023 440 Hz, 311 630 a second — PAL's own
+/// rate would hold ~9.6 s on NTSC and PAL-N).
+///
+/// Why one size for every model rather than a resize on a switch: `resize` rebuilds the
+/// slabs and drops the history by contract (it is the `revdepth` knob), so a ring that
+/// followed the model would lose its whole reverse-debug window at every switch and at
+/// every rewind across one. Nothing in the ring is tied to the model — an entry is one
+/// retired instruction and its writes — so a ring big enough for the fastest clock serves
+/// every row, a switch leaves it alone, and no model is ever short of its nominal seconds.
+/// What it costs on PAL: 3.9 % more entries (3 000 000 → 3 116 300 at 10 s), ~4.1 MiB.
+pub fn ring_instr_per_second() -> usize {
+    static RATE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *RATE.get_or_init(|| {
+        let fastest = crate::model::models()
+            .iter()
+            .filter(|m| m.runs())
+            .map(|m| m.timing.cpu_hz)
+            .max()
+            .unwrap_or(INSTR_PER_SECOND_AT_HZ as u32);
+        instr_per_second_at(fastest).max(INSTR_PER_SECOND)
+    })
+}
 
 /// Writes-slab over-provision factor relative to the entry count. Real code averages
 /// well under one write per instruction (loads/branches/compares write nothing), but
@@ -273,8 +310,7 @@ impl DeltaRing {
             Err(_) => DEFAULT_REVERSE_SECONDS,
         }
         .max(1);
-        let entry_cap = secs * INSTR_PER_SECOND;
-        let writes_cap = entry_cap * WRITES_PER_INSTR_NUM / WRITES_PER_INSTR_DEN;
+        let (entry_cap, writes_cap) = Self::caps_for_seconds(secs);
         Self::with_capacity(entry_cap, writes_cap)
     }
 
@@ -310,9 +346,11 @@ impl DeltaRing {
     /// Compute the (entry_cap, writes_cap) pair for a depth in seconds — the SAME
     /// sizing `new()` applies from `TRX64_REVERSE_SECONDS`, exposed so a runtime
     /// `set_reverse_depth` rebuilds the ring at a new depth with identical math.
+    /// Seconds are held on every model: the rate is [`ring_instr_per_second`], the fastest
+    /// runnable clock's.
     pub fn caps_for_seconds(secs: usize) -> (usize, usize) {
         let secs = secs.max(1);
-        let entry_cap = secs * INSTR_PER_SECOND;
+        let entry_cap = secs * ring_instr_per_second();
         let writes_cap = entry_cap * WRITES_PER_INSTR_NUM / WRITES_PER_INSTR_DEN;
         (entry_cap, writes_cap)
     }
@@ -1581,11 +1619,50 @@ mod tests {
     fn caps_for_seconds_matches_new_sizing() {
         // The per-second sizing the runtime knob uses must equal what `new()` derives.
         let (e, w) = DeltaRing::caps_for_seconds(10);
-        assert_eq!(e, 10 * INSTR_PER_SECOND);
+        assert_eq!(e, 10 * ring_instr_per_second());
         assert_eq!(w, e * WRITES_PER_INSTR_NUM / WRITES_PER_INSTR_DEN);
         // Clamp: 0 seconds floors to 1.
         let (e0, _w0) = DeltaRing::caps_for_seconds(0);
-        assert_eq!(e0, INSTR_PER_SECOND);
+        assert_eq!(e0, ring_instr_per_second());
+    }
+
+    /// Spec 863 — the nominal seconds hold on every C64 model, not only on PAL. The rate
+    /// is the estimate at the fastest runnable clock, so NTSC (1 022 730 Hz) and PAL-N
+    /// (1 023 440 Hz) hold their 10 s — PAL's own 300 000/s held them ~9.6 s — and PAL
+    /// holds a little more than it asks for.
+    #[test]
+    fn the_ring_holds_its_seconds_on_every_model() {
+        let hold = |cpu_hz: u32, secs: usize| {
+            let (e, _) = DeltaRing::caps_for_seconds(secs);
+            (e as f64 / instr_per_second_at(cpu_hz) as f64, ())
+        };
+        for m in crate::model::models().iter().filter(|m| m.runs()) {
+            for secs in [1usize, DEFAULT_REVERSE_SECONDS, 600] {
+                let (instr, _) = hold(m.timing.cpu_hz, secs);
+                assert!(instr >= secs as f64, "{} holds {instr:.3} s of {secs}", m.name);
+            }
+        }
+        for name in ["c64-ntsc", "c64-paln"] {
+            let m = crate::model::find(name).unwrap();
+            assert!(m.runs(), "{name} runs");
+            let (instr, _) = hold(m.timing.cpu_hz, DEFAULT_REVERSE_SECONDS);
+            assert!(instr >= DEFAULT_REVERSE_SECONDS as f64, "{name}: {instr:.3} s");
+            // What the PAL figure alone would have held — the gap this closes.
+            let pal_sized = (DEFAULT_REVERSE_SECONDS * INSTR_PER_SECOND) as f64 / instr_per_second_at(m.timing.cpu_hz) as f64;
+            assert!(pal_sized < 9.7, "{name} on a PAL-sized ring: {pal_sized:.3} s");
+        }
+        // The rate is PAL-N's clock (the fastest that runs) and PAL's sizing grows by it.
+        assert_eq!(instr_per_second_at(985_248), INSTR_PER_SECOND, "the PAL estimate is unchanged");
+        assert_eq!(ring_instr_per_second(), instr_per_second_at(1_023_440));
+        assert_eq!(ring_instr_per_second(), 311_630);
+        let (e, w) = DeltaRing::caps_for_seconds(DEFAULT_REVERSE_SECONDS);
+        assert_eq!((e, w), (3_116_300, 3_895_375));
+        let bytes = |e: usize, w: usize| {
+            e * (std::mem::size_of::<DeltaEntry>() + std::mem::size_of::<CallerChain>())
+                + w * std::mem::size_of::<WriteRec>()
+        };
+        let grew = bytes(e, w) - bytes(3_000_000, 3_750_000);
+        assert_eq!(grew, 4_303_100, "PAL pays ~4.1 MiB for the NTSC/PAL-N hold");
     }
 
     #[test]
@@ -1628,7 +1705,7 @@ mod tests {
         // reports a truthful cost. (This pins the per-second sizing the knob reports.)
         let secs = 10usize;
         let (e, w) = DeltaRing::caps_for_seconds(secs);
-        let cpu_cap = secs * INSTR_PER_SECOND; // cpu-history scaled to depth by the knob
+        let cpu_cap = secs * ring_instr_per_second(); // cpu-history scaled to depth by the knob
         let bytes = e * std::mem::size_of::<DeltaEntry>()
             + w * std::mem::size_of::<WriteRec>()
             + cpu_cap * std::mem::size_of::<crate::cpu_history::CpuHistEntry>();

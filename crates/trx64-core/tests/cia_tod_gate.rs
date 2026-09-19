@@ -12,9 +12,12 @@
 
 use trx64_core::cia::{
     Cia, CIAT_TABLEN, CIA_CRA_TODIN_50HZ, CIA_CRB_ALARM, CIA_ICR, CIA_IM_TOD, CIA_TOD_HR,
-    CIA_TOD_MIN, CIA_TOD_SEC, CIA_TOD_TEN, PAL_CYCLES_PER_SEC,
+    CIA_TOD_MIN, CIA_TOD_SEC, CIA_TOD_TEN,
 };
 use trx64_core::{Machine, NullSink};
+
+/// The PAL system clock this gate runs the chip at (the `c64-pal` row's).
+const PAL_CYCLES_PER_SEC: u32 = 985_248;
 
 /// TOD does not consult the timer transition table, so an empty one keeps this gate on
 /// the clock under test instead of widening a module's visibility for a test's sake.

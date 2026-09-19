@@ -12,7 +12,10 @@
 //!   * a replay from an earlier state reproduces the picture on screen (`verified`).
 
 use std::path::Path;
-use trx64_core::vic_line_trace::{self, FrameWhich, Phi1Kind, Phi2Kind, CYCLES_PER_FRAME};
+use trx64_core::vic_line_trace::{self, FrameWhich, Phi1Kind, Phi2Kind};
+
+/// The PAL frame this gate holds the recorder to (312 × 63).
+const CYCLES_PER_FRAME: u64 = 312 * 63;
 use trx64_core::{BusKind, Machine, NullSink};
 
 const ROM_DIR: &str =

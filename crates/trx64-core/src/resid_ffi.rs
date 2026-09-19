@@ -91,10 +91,14 @@ pub const SAMPLE_RESAMPLE_FASTMEM: i32 = 3;
 pub const MODEL_6581: i32 = 0;
 pub const MODEL_8580: i32 = 1;
 
-/// PAL Φ2 clock (Hz) — matches TS `PAL_CLOCK_FREQ`.
-pub const PAL_CLOCK_FREQ: f64 = 985248.0;
-/// NTSC Φ2 clock (Hz) — matches TS `NTSC_CLOCK_FREQ`.
-pub const NTSC_CLOCK_FREQ: f64 = 1022730.0;
+/// The default model's Φ2 clock (`c64-pal`, Hz) — what `ResidConfig::default()` samples
+/// at. A machine's own is `Machine::timing().cpu_hz` (Spec 863): build its engine with
+/// [`ResidConfig::for_model`].
+const DEFAULT_CLOCK_FREQ: f64 = 985248.0;
+/// The `c64-pal` Φ2 clock, as a public name: hosts that build on this crate and are PAL
+/// by construction (UE2's bridge) name it. Nothing in TRX64 reads it — the machine's
+/// clock is `Machine::timing().cpu_hz`.
+pub const PAL_CLOCK_FREQ: f64 = DEFAULT_CLOCK_FREQ;
 /// Default sample rate — matches TS `DEFAULT_SAMPLE_RATE`.
 pub const DEFAULT_SAMPLE_RATE: f64 = 44100.0;
 
@@ -130,7 +134,7 @@ impl Default for ResidConfig {
         let sample_rate = DEFAULT_SAMPLE_RATE;
         Self {
             model: MODEL_6581,
-            clock_freq: PAL_CLOCK_FREQ,
+            clock_freq: DEFAULT_CLOCK_FREQ,
             sample_rate,
             sampling_method: SAMPLE_RESAMPLE,
             filter: false,
@@ -140,6 +144,14 @@ impl Default for ResidConfig {
             passband: (sample_rate * 90.0) / 200.0,
             gain: 0.97,
         }
+    }
+}
+
+impl ResidConfig {
+    /// The default engine, sampling at a model's clock with its SID (Spec 863 D3: the
+    /// clock is the row's `cpu_hz`, the chip its `sid`).
+    pub fn for_model(model: &crate::model::C64Model) -> Self {
+        Self { model: model.resid_model(), clock_freq: model.timing.cpu_hz as f64, ..Self::default() }
     }
 }
 
@@ -193,6 +205,27 @@ impl Resid {
             resid_enable_filter_h(self.handle, self.cfg.filter as c_int);
             resid_adjust_filter_bias_h(self.handle, self.cfg.filter_bias);
             resid_enable_external_filter_h(self.handle, self.cfg.external_filter as c_int);
+            resid_set_sampling_h(
+                self.handle,
+                self.cfg.clock_freq,
+                self.cfg.sample_rate,
+                self.cfg.sampling_method,
+                self.cfg.passband,
+                self.cfg.gain,
+            );
+        }
+    }
+
+    /// Spec 863 D3 — re-sample at another Φ2 clock, keeping the synthesis state (VICE
+    /// `sid_set_machine_parameter` → `set_sampling_parameters`): the oscillators run on,
+    /// only the rate the output is taken at changes. A model switch calls this.
+    pub fn set_clock_freq(&mut self, clock_freq: f64) {
+        if clock_freq == self.cfg.clock_freq {
+            return;
+        }
+        self.cfg.clock_freq = clock_freq;
+        // SAFETY: plain FFI against our own instance.
+        unsafe {
             resid_set_sampling_h(
                 self.handle,
                 self.cfg.clock_freq,

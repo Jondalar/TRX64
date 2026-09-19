@@ -601,8 +601,8 @@ Cf. `vice-1541-arch.md` §5 for the full derivation. Summary:
 ```c
 /* src/drive/drivesync.c */
 sync_factor = (unsigned int)floor(65536.0 * (1000000.0 / host_cycles_per_sec));
-/* PAL host = 985248 Hz:  sync_factor ≈ 66514  (drive runs 1.0149× host) */
-/* NTSC host = 1022730 Hz: sync_factor ≈ 64092 (drive runs 0.978× host)  */
+/* PAL host = 985248 Hz:  sync_factor = 66517  (drive runs 1.0150× host) */
+/* NTSC host = 1022730 Hz: sync_factor = 64079 (drive runs 0.9778× host) */
 
 per-unit: drv->cpud->sync_factor = drv->clock_frequency * sync_factor;
 /* 1541 clock_frequency=1, 1581 clock_frequency=2 */

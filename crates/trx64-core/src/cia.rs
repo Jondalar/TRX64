@@ -53,9 +53,6 @@ pub const CIA_CRB_INMODE_TA: u8 = 0x40; // CRB bit6: count TA underflows
 pub const CIA_CRB_ALARM: u8 = 0x80;
 /// CRA bit 7 — the TOD input is 50 Hz mains; clear means 60 Hz.
 pub const CIA_CRA_TODIN_50HZ: u8 = 0x80;
-/// The PAL system clock `tick()` is called at, and what the TOD divider is derived from
-/// (VICE `ticks_per_sec`). 6569 only — NTSC is a separate machine, not a knob.
-pub const PAL_CYCLES_PER_SEC: u32 = 985_248;
 
 // IRQ-mask / ICR flag bits.
 pub const CIA_IM_SET: u8 = 0x80;
@@ -407,6 +404,10 @@ pub struct Cia {
     /// the grid supplies. Picking the wrong divider is exactly how TOD runs at 5/6 on real
     /// hardware, and deriving the frequency from CRA hid that.
     pub tod_power_freq: u32,
+    /// The system clock `tick()` is called at (VICE `ticks_per_sec`): the TOD's mains tick
+    /// falls every `ticks_per_sec / tod_power_freq` cycles. The model's (Spec 863) — PAL
+    /// 985 248, NTSC 1 022 730 — set with the mains frequency by [`Cia::set_timing`].
+    pub ticks_per_sec: u32,
     /// The 3-bit ring counter that divides mains ticks down to tenths (VICE
     /// `todtickcounter`). It is NOT `ticks_per_sec / 10`: the divider matches at 4 for
     /// 50 Hz and 5 for 60 Hz, and the ring has six states.
@@ -440,8 +441,9 @@ impl Default for Cia {
             tb: Ciat::default(),
             irqflags: 0,
             clk: 0,
-            tod_clk: (PAL_CYCLES_PER_SEC / 50) as u64,
+            tod_clk: (DEFAULT_TICKS_PER_SEC / 50) as u64,
             tod_power_freq: 50,
+            ticks_per_sec: DEFAULT_TICKS_PER_SEC,
             tod_tick_counter: 0,
             tod_stopped: true,
             tod_alarm: [0u8; 4],
@@ -454,9 +456,34 @@ impl Default for Cia {
     }
 }
 
+/// The default model's clock (`c64-pal`), what a bare `Cia::new()` ticks at. A machine
+/// sets its model's through [`Cia::set_timing`].
+const DEFAULT_TICKS_PER_SEC: u32 = 985_248;
+
 impl Cia {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A power-on CIA on a model's clock and mains (VICE `cia1_set_timing` at init).
+    pub fn new_timed(ticks_per_sec: u32, power_freq: u32) -> Self {
+        let mut c = Self::default();
+        c.set_timing(ticks_per_sec, power_freq);
+        c.tod_clk = c.tod_period();
+        c
+    }
+
+    /// VICE `ciacore_set_timing` / `cia1_set_timing(context, cycles_per_sec, power_freq)`:
+    /// the clock the chip is ticked at and the mains frequency the TOD counts. On a running
+    /// chip the tick already scheduled stands; every one after it comes at the new rate.
+    pub fn set_timing(&mut self, ticks_per_sec: u32, power_freq: u32) {
+        self.ticks_per_sec = ticks_per_sec.max(1);
+        self.tod_power_freq = power_freq.max(1);
+    }
+
+    /// Cycles between two mains ticks (VICE `todticks = ticks_per_sec / power_freq`).
+    pub fn tod_period(&self) -> u64 {
+        (self.ticks_per_sec / self.tod_power_freq.max(1)) as u64
     }
 
     // ── Alarm-driven timer cascade (port of VICE ciacore.c) ────────────────────
@@ -650,7 +677,7 @@ impl Cia {
     #[cold]
     #[inline(never)]
     fn tod_run_due(&mut self) {
-        let per_tick = (PAL_CYCLES_PER_SEC / self.tod_power_freq.max(1)) as u64;
+        let per_tick = self.tod_period();
         // A jump can owe several ticks; a fresh machine owes none.
         let mut guard = 0;
         while self.clk >= self.tod_clk && guard < 4096 {

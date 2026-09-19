@@ -371,7 +371,7 @@ pub struct Thumbnail {
 
 /// The current displayed frame at FULL resolution as a palette + index image
 /// (`frameBuffer()`). Same shape as a [`Thumbnail`]'s palette/indices, but full-res
-/// (the 384×272 VICE PAL canvas) and NOT base64 — `Vec<u8>` maps to Swift `Data`,
+/// (the model's canvas: 384×272 PAL, 384×247 NTSC) and NOT base64 — `Vec<u8>` maps to Swift `Data`,
 /// and this is an in-process pull (no JSON), so raw bytes are correct + fast.
 ///
 /// To draw: for each of `width*height` pixels, `i = indices[p]` (0..15) selects RGB

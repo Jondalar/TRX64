@@ -68,18 +68,20 @@ All are JSON-RPC `method`s. `params` shown; omit `session_id` (single machine).
 | method | params | returns / effect |
 |---|---|---|
 | `ping` | — | `{}` — liveness (use for the container healthcheck) |
-| `session/create` | — | attaches/creates the one machine; returns session id + state |
-| `session/state` | — | `{ c64Cycles, runState:"running"\|"paused", powered:bool, media:{cart,disk}, cpu:{pc,a,x,y,sp,flags}, vic:{…}, controlOwner, streamPump, … }` — see §3.1 |
+| `session/create` | `{ "model"?: "c64-pal"\|"c64-ntsc"\|… }` | attaches/creates the one machine; returns session id + state. With a `model` other than the machine's, starts that machine (a power-on on the new model) |
+| `session/state` | — | `{ c64Cycles, runState:"running"\|"paused", powered:bool, media:{cart,disk}, cpu:{pc,a,x,y,sp,flags}, vic:{…}, controlOwner, streamPump, model, videoStandard, chip, cyclesPerLine, linesPerFrame, cyclesPerFrame, cpuHz, frameRate, canvas:{width,height}, … }` — see §3.1 |
+| `session/models` | — | `{ models:[{ name, title, runs, missing, videoStandard, chip, cyclesPerLine, linesPerFrame, cyclesPerFrame, cpuHz, frameRate, … }], current }` — every C64 model, whether it runs here, and what a model that does not is missing |
+| `session/model` | `{ "name": "c64-ntsc" }` | switch the running machine to another model at the next frame boundary. Not a power cycle: the program keeps its RAM, CPU, CIA and SID state and the standard it detected at boot — a clean start on the new model is `session/reset` or a power cycle afterwards. Reply: `{ from, model, switched, switchedAt:{c64Cycles,rasterLine,rasterCycle}, kept:{cpu,ram,cia,sid}, … }` |
 | `media/mount` | `{ "path": "/play/x.crt" }` | mount `.crt`/`.d64`/`.g64`; a cart power-cycles + boots. Returns `{ detail:{ mapperType, name, … }, … }` |
 | `session/key_down` | `{ "key": "<NAME>" }` | press one C64 key (held). `key` = PETSCII name (§5) |
 | `session/key_up` | `{ "key": "<NAME>" }` | release it |
 | `session/joystick_set` | `{ "port":2, "up":bool, "down":bool, "left":bool, "right":bool, "fire":bool }` | set port-2 joystick lines (omit = false) |
 | `session/joystick_clear` | `{ "port":2 }` | release all lines |
-| `session/screenshot` | — | `{ dataUrl:"data:image/png;base64,…" }` — one PNG (384×272). For a thumbnail; the live view uses BIN_VIC, not this |
+| `session/screenshot` | — | `{ dataUrl:"data:image/png;base64,…" }` — one PNG at the model's canvas (384×272 PAL, 384×247 NTSC). For a thumbnail; the live view uses BIN_VIC, not this |
 | `session/close` | — | soft-close (machine + media stay; a later create re-attaches) |
 | `debug/pause` / `debug/run` | — | freeze / resume. NOTE: a manual `session/run` is refused while the machine free-runs (`-32001`) — pause first |
 | `session/power` | `{ "op":"off"\|"on" }` | the general switch. **off** stops the machine entirely (use it around a build that replaces the mounted file); **on** boots it back with whatever is registered |
-| `session/set_pacing` | `{ "mode":"pal"\|"warp"\|"fixed-ratio", "ratio":num }` | how fast the machine runs. `pal` = realtime, **`warp`** = as fast as the host allows (measured ~8× on a Mac; less on a NAS, where realtime already costs ~40 % of a core). Reported back in `session/state.pacing` |
+| `session/set_pacing` | `{ "mode":"realtime"\|"warp"\|"fixed-ratio", "ratio":num }` | how fast the machine runs. `realtime` = the model's own frame rate (~50.12/s PAL, ~59.83/s NTSC; `pal` is accepted as its old name), **`warp`** = as fast as the host allows (measured ~8× on a Mac; less on a NAS, where realtime already costs ~40 % of a core). Reported back in `session/state.pacing` |
 | `session/reset` | `{ "mode":"soft"\|"cold" }` | **soft** = hardware RESET line (RAM + media preserved). **cold** = full power-cycle. Default when `mode` is omitted: **cold** |
 | `snapshot/dump` | `{ "path":"/dumps/x.c64re" }` | write a full state snapshot (RAM + cart + flash + framebuffer). Written BY THE DAEMON, so the path must be writable **inside the container** — see §6.1 |
 | `snapshot/undump` | `{ "path":"…" }` | restore one (power-cycles) |
@@ -89,7 +91,10 @@ All are JSON-RPC `method`s. `params` shown; omit `session_id` (single machine).
 destructive ones. Reading state and pulling frames affects nobody.
 
 Server **notifications** the consumer may observe (all text, no `id`): `debug/running`,
-`debug/paused` (run-state changed → toggle a "running/paused" badge), `debug/stopped`.
+`debug/paused` (run-state changed → toggle a "running/paused" badge), `debug/stopped`, and
+`av/hello` — sent when a client subscribes to the A/V stream and again whenever the machine's
+model changes: `{ session_id, model, videoStandard, chip, cyclesPerLine, linesPerFrame,
+cyclesPerFrame, cpuHz, frameRate, canvas:{width,height} }` — what the frames that follow are.
 
 ### 3.1 `session/state.media` + `powered` — know what is in the machine
 
@@ -98,7 +103,7 @@ mounting a cart power-cycles, so a consumer that guesses reboots someone else's 
 
 ```json
 { "powered": true,
-  "pacing": { "mode": "pal", "ratio": 1 },
+  "pacing": { "mode": "realtime", "ratio": 1 },
   "media": { "cart": { "path": "/play/wl.crt", "name": "WASTELAND EF BY DKL/TREX",
                        "bytes": 1050688, "mtime": 1785766446 },
              "disk": null } }
@@ -127,7 +132,7 @@ Payload after the 5-byte envelope:
 ```
 offset  size            field
   0     u16 LE          w      (= 384)
-  2     u16 LE          h      (= 272)
+  2     u16 LE          h      (= 272 PAL, 247 NTSC — the model's canvas; honour it)
   4     u8              fmt    (= 1, palette-indexed — the only format)
   5     u8              rsvd   (= 0)
   6     u32 LE          cycle  (C64 CPU cycle count, truncated)
@@ -137,7 +142,7 @@ offset  size            field
 ```
 
 Decode to RGBA: `rgb = palette[(indices[p] & 0x0F)]`, alpha = 0xFF. Blit onto a
-384×272 canvas (`putImageData`). ~50 frames/s at PAL realtime; latest-frame-wins (drop
+w×h canvas (`putImageData`). ~50 frames/s at PAL realtime, ~60 on NTSC; latest-frame-wins (drop
 if you can't keep up).
 
 ### 4.2 BIN_AUDIO (0x02) — one audio chunk
@@ -304,7 +309,7 @@ the exact shape an editor embeds.
 **Building a client from scratch (non-JS / custom UI):** §4 (byte-exact frames) + §5
 (key names) are the full wire spec; `web/trx64-player.js` is the reference implementation
 to read. The Play loop is: connect WS → `session/create` → `media/mount` → blit BIN_VIC
-frames onto a 384×272 canvas → forward keys as §5 names.
+frames onto a canvas of the frame's own `w`×`h` (384×272 PAL, 384×247 NTSC) → forward keys as §5 names.
 
 ---
 
