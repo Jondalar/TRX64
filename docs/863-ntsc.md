@@ -1,6 +1,6 @@
 # Spec 863 — NTSC: a second video standard, chosen before power-on
 
-**Status:** PROPOSED (2026-09-19) — Q1 settled (models are configuration); Q2, Q3 open (§9).
+**Status:** PROPOSED (2026-09-19) — Q1 (models are configuration) and Q2 (switch at the frame boundary) settled; Q3 open (§9).
 **Repos:** TRX64 (the machine) + C64RE (the switch, and every place that counts in frames).
 **Number:** 863 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`).
 **Depends on:** nothing structural. Follows the path Spec 851 laid for the machine profile.
@@ -133,18 +133,33 @@ re-derived for the NTSC xpos, not assumed.
   and ignored today) — all the same field; `session/models` lists the rows and which of
   them run;
 - a runtime switch, `session/model {name}` and a monitor verb `model <row>`, which is
-  **a power cycle**: VICE does exactly this (`machine_change_timing` ends in
-  `MACHINE_RESET_MODE_POWER_CYCLE`), RAM is not kept, the drives reset;
+  **not** a power cycle. VICE power-cycles (`machine_change_timing` ends in
+  `MACHINE_RESET_MODE_POWER_CYCLE`) and a real machine would need another crystal; the owner:
+  "An der Framegrenze wäre gut — freeze, State halten, cycle, restore." So the switch is a
+  **transplant at the frame boundary**: pause → `advance_to_frame` (raster line 0, cycle 1 —
+  the VIC's most neutral point, before any display fetch) → capture the whole machine state →
+  build the machine on the new row → restore the captured state into it → run on. Nothing in
+  the state is tied to the standard: CPU, RAM, CIA registers and timers and SID registers are
+  values; the drive keeps its own clock and only its catch-up ratio moves; reSID is re-sampled
+  at the new clock; the TOD ticks at the new mains rate from here on. The VIC continues at line
+  0 of the new geometry.
+  What it means, said where it is shown: the running program detected its standard at boot —
+  `$02A6`, its timer values, its raster lines stay what they were. The switch shows **how this
+  running program behaves on the other machine**; a program that should boot as NTSC is
+  started with the power button or a reset after the switch;
 - the standard is session identity like 815's claim: it survives a warm reset (which
   rebuilds `VicII` and `Cia` — so it is re-applied there, as `speed_profile` is) and a
   power-cycle; only a new session starts at the default.
 
-**D6 — identity is recorded and enforced.** Every snapshot format records the chip:
-the native manifest's `machine.model` (`c64-pal` / `c64-ntsc`, no longer truncated at the
-`-`), the c64re `VicSnapshot.model`, the drive snapshot's sync, VSF export/import's VIC model
-byte. A restore into a machine of another standard is **refused** with both names — no
-conversion, as VICE refuses (`SNAPSHOT_VICII_MODEL_MISMATCH`). The latent panic goes: a
-restored `raster_cycle ≥ cycles_per_line` is rejected before it can index the table.
+**D6 — the model is part of the state.** Every snapshot format records the row: the native
+manifest's `machine.model` (`c64-pal` / `c64-ntsc` / …, no longer truncated at the `-`), the
+c64re `VicSnapshot.model`, the drive snapshot's sync, VSF export/import's VIC model byte, and
+every checkpoint-ring and recorder anchor. **A restore puts the machine back on the row it was
+captured on** — that is the D5 transplant run backwards, so rewinding across a switch just
+works: an anchor from before it is PAL and makes the machine PAL again. A row that cannot run
+here (§3 D1) is refused by name. The latent panic goes with it: geometry and state always
+arrive together, and a restored `raster_cycle ≥ cycles_per_line` is rejected before it could
+index the table.
 
 **D7 — the state says what the machine is.** `session/state`, `monitor/state` and the A/V
 hello carry `model`, `videoStandard`, `chip`, `cyclesPerLine`, `linesPerFrame`, `cyclesPerFrame`,
@@ -162,8 +177,9 @@ the timing record; the trick rules read cycle positions from the cycle table's f
 **C1 — the switch.**
 - The Live tab's machine controls get a **model** selector beside the power button, filled
   from `session/models` (rows that cannot run are shown, disabled, with the missing block).
-  It says what it does ("switching is a power cycle — the machine restarts") and asks before
-  it does it. It calls `session/model`; it keeps no list of models of its own.
+  It says what it does ("switches at the next frame; the running program keeps its state and
+  the standard it detected at boot — power-cycle for a clean NTSC start") and asks before it
+  does it. It calls `session/model`; it keeps no list of models of its own.
 - MCP: `runtime_session_start` gets `model` (replacing the `pal` boolean that today says
   "NTSC is not supported"); `runtime_sandbox_run` the same per run; the monitor verb is
   reachable through `runtime_monitor` as for every verb (TRX64 owns it).
@@ -208,9 +224,12 @@ window is drawn as the recorder describes it.
    a D64 `LOAD` completes on NTSC (the drive ratio).
 6. **Stolen cycles.** On an NTSC bad line with sprites 0 and 3 on, the line recorder shows
    the BA/stall cycles where VICE's table puts them (sprite 0 from 56, sprite 3 at 1 and 65).
-7. **Identity.** `--model c64-ntsc` survives `reset` and `power off/on`; a PAL snapshot restored
-   into an NTSC session is refused with both names and no panic, and vice versa; `c64-ntsc`
-   round-trips through dump/undump.
+7. **Identity and the transplant.** `--model c64-ntsc` survives `reset` and `power off/on`.
+   A running PAL program switched to NTSC keeps its RAM, CPU, CIA and SID state bit-identical
+   across the switch (compared field by field), the VIC continues at line 0 of 263, and the
+   next frame is 17 095 cycles. Rewinding to a checkpoint from before the switch makes the
+   machine PAL again with the checkpoint's state; `c64-ntsc` round-trips through dump/undump;
+   a snapshot of a row that cannot run here is refused by name, and nothing panics.
 8. **Models are rows.** `models.toml` parses; `session/models` lists every row with whether
    it runs; `--model c64c-pal` is refused at startup naming the missing block (6526A), and
    `--model c64-paln` runs 65 × 312 at 1 023 440 Hz with a 50 Hz TOD — without a line of
@@ -221,8 +240,10 @@ window is drawn as the recorder describes it.
 
 ## §7 Acceptance — C64RE
 
-1. The Live-tab control switches the running session after a confirmation, and the machine
-   comes back NTSC (`session/state.videoStandard`); cancelling changes nothing.
+1. The Live-tab selector switches the running session at the next frame boundary after a
+   confirmation that says what the switch keeps (the running program, its detected standard)
+   and what a cold start would do instead; the machine is NTSC afterwards
+   (`session/state.model`) with the program still running; cancelling changes nothing.
 2. `runtime_session_start { model: "c64-ntsc" }` starts an NTSC machine; the project's
    `machine.model` makes the workspace start NTSC.
 3. A scenario recorded on PAL refuses to replay on NTSC, naming both; `hold_frames: 60` on
@@ -250,6 +271,7 @@ for R8, 16 768 for R56A); `docs/vice-iec-arc42.md:603-605` quotes sync factors 6
 1. ~~Which NTSC machines?~~ **Settled 2026-09-19:** every C64 model is a row of one model
    file (D1); a row runs when the blocks it names exist. After 863: `c64-pal`, `c64-ntsc`,
    `c64-paln`.
-2. **Switching at runtime.** A power cycle from the Live tab (VICE's behaviour, RAM lost) —
-   or only at start (daemon flag / project default), no runtime switch at all?
+2. ~~Switching at runtime.~~ **Settled 2026-09-19:** at the frame boundary, as a transplant
+   (freeze → capture → rebuild on the new row → restore), not a power cycle (D5); the model is
+   part of every snapshot and checkpoint (D6).
 3. **Colour.** Keep Colodore for NTSC in v1, or bring an NTSC palette / VICE's YIQ decoder?
