@@ -26,10 +26,11 @@ way first — nine specs closed in one evening and not one needed building.
 | 809 | [Marks and sandboxes](809-marks-and-sandboxes.md) | **PARTLY BUILT** | Marks shipped: named + pinned anchors that survive PLAY cutting the future (the centre of gravity — three attempts from one mark give the identical machine and the mark outlives them), a cap of 32 that REFUSES rather than shrinking the window silently, labels riding the ringdump so a `.c64rering` is a session with its bookmarks, and a name working as an anchor id everywhere. Sandboxes shipped as a bare capability: `sandbox/run` / `runMany` return a state with no name, no verdict and no comparison — gated on carrying none of those, because 810 owns the meaning. Open: copy-on-write media folders per run, and multi-line assembly. |
 ---
 
-**804 moved to C64RE (2026-09-19).** TRX64 holds no symbols: names are joined in C64RE, which
-owns meaning. What TRX64 delivers for it — address spans on `monitor/exec`, the banking state, the
-structured `monitorDisasm` fields — is TRX64 work tracked there, in
-`../../C64ReverseEngineeringMCP/specs/804-symbols-joined-in-c64re.md`.
+**804 moved to C64RE (2026-09-19) and is built there.** TRX64 holds no symbols: names are
+joined in C64RE, which owns meaning. What TRX64 delivers for it — address spans on
+`monitor/exec`, the banking state (`monitor/state`), the structured `monitorDisasm` fields,
+`read_memory space:"drive8"` — is recorded in
+`../../C64ReverseEngineeringMCP/specs/_archive/804-symbols-joined-in-c64re.md`.
 
 **HALF BUILT** / **PARTLY BUILT** = a named part is open, and the row says which.
 **PROPOSED** = written down, nothing built.
