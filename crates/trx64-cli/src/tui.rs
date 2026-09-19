@@ -630,8 +630,7 @@ const MONITOR_VERBS: &[&str] = &[
     "rstep", "reverse", "whowrote", "triage", "revdepth", "diff", "ringdump", "ringload",
     // checkpoint ring (Spec 807 §4.6) + rewind transport (Spec 808)
     "cadence", "window", "play", "pause", "frame", "goto", "rewind",
-    // knowledge
-    "inspect", "xref", "sym",
+    // (Spec 804: no knowledge verbs — TRX64 holds no symbols; C64RE names addresses.)
 ];
 
 /// What a Tab press should complete for the current input line. Pure classification —

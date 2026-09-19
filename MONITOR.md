@@ -184,12 +184,14 @@ obs cap_off when exec $4100 do trace off              # stop at $4100
 | `ringdump <path>` | serialize the whole reverse-debug buffer → one gzipped `.c64rering` |
 | `ringload <path>` | restore a `.c64rering` + the machine; scrub/rstep/whowrote/chis/diff then work on it |
 
-### Knowledge  (reads the project `_analysis.json` covering the address)
-| command | what it does |
-|---|---|
-| `inspect <a> [stem]` | segment kind/label + xrefs at an address |
-| `xref <a> [stem]` | who calls/jumps/reads/writes an address (in + out) |
-| `sym <name> [stem]` | reverse lookup: named routine/label → address |
+### Names — none here (Spec 804)
+TRX64 is a runtime and holds no symbols: there is no `label`, `note`, `sym`, `inspect`,
+`xref`, `save_labels` or `load_labels`. Every `monitor/exec` reply instead says WHERE it
+printed each address — `spans: [{line, start, end, addr, space, role, lens?, len?}]` plus the
+banking state in `machine` — and C64RE, which owns meaning, joins the names: in its
+workbench monitor and in `runtime_monitor`. A name typed into a C64RE monitor command is
+substituted by C64RE before the command reaches TRX64 (`a 1000 jmp start` arrives as
+`a 1000 jmp $0810`). `trx64cli` on its own shows numbers.
 
 ### File  (rooted at the project dir)
 > In the **trx64cli cockpit** these File verbs are reached with a `!` prefix

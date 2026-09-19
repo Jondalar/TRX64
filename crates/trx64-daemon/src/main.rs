@@ -29,6 +29,7 @@ use trx64_core::{BusKind, NullSink, Observer};
 use trx64_session::{Session, TraceState};
 use trx64_trace::{FrameSink, TraceChannels, TracingObserver};
 
+pub mod addr_spans;
 pub mod assembler;
 pub mod candidate;
 pub mod observers;
@@ -1014,7 +1015,7 @@ struct BatchEntry {
 /// The wire-protocol version this daemon speaks (Spec 800 §D). Bump the integer ONLY on a
 /// wire-breaking change, in lockstep with C64RE's EXPECTED_RUNTIME_PROTOCOL — the client
 /// requires an EXACT match and hard-fails otherwise. Returned by `ping` for the handshake.
-const RUNTIME_VERSION: &str = "trx64-runtime/1";
+const RUNTIME_VERSION: &str = "trx64-runtime/2";
 
 const MAX_MEDIA_EVENTS: usize = 256;
 
@@ -3269,11 +3270,13 @@ fn run_isolated_segment(
     }
 }
 
-// T2.8 — the 6502 disasm formatters (1:1 ports of disasm6502.ts `disasmLine`,
-// plus the Spec 754 §3.3f labeled variant) moved to the shared static-capability
-// crate (capability-cut migration step 1): `trx64-static/src/disasm6502.rs`.
-// The daemon and `trx64cli disasm` share ONE decoder.
-use trx64_static::disasm6502::{disasm_line_ts, disasm_line_ts_labeled};
+// T2.8 — the 6502 disasm formatter (1:1 port of disasm6502.ts `disasmLine`) lives in
+// the shared static-capability crate (capability-cut migration step 1):
+// `trx64-static/src/disasm6502.rs`. The daemon and `trx64cli disasm` share ONE decoder.
+// Spec 804 — the monitor prints it MARKED (`addr_spans::disasm_line`): the text is the
+// same, and `monitor/exec` can say where each address is. The labelled variant is gone:
+// names are joined in C64RE, not here.
+use addr_spans::{Role as SpanRole, Space as SpanSpace};
 
 /// reverse-debug Phase 1a — render the LIVE CPU-history ring (`Machine::cpu_history`)
 /// as `chis` cpu-history rows. Each row disassembles the instruction FROM THE RING
@@ -3307,13 +3310,14 @@ fn format_chis_from_ring(entries: &[trx64_core::CpuHistEntry], header: &str) -> 
                 _ => 0,
             }
         };
-        let (_size, line) = disasm_line_ts(read, pc);
+        let (_size, line) = addr_spans::disasm_line(read, pc, SpanSpace::C64);
         // Pad the disasm to a fixed width so the registers land in clean columns
         // regardless of operand length (1–3 byte ops). 30 covers `$pc  bb bb bb
         // MNEMONIC ($nn),Y`; longer (rare) lines just shift right for that row.
+        // Padded by what a reader sees — the line carries address marks (Spec 804).
         out.push_str(&format!(
-            "c{:<10} {:<30}  a={:02x} x={:02x} y={:02x} sp={:02x} p={:02x}\n",
-            e.cycle, line, e.a, e.x, e.y, e.sp, e.p
+            "c{:<10} {}  a={:02x} x={:02x} y={:02x} sp={:02x} p={:02x}\n",
+            e.cycle, addr_spans::pad_right(&line, 30), e.a, e.x, e.y, e.sp, e.p
         ));
     }
     // Trim the trailing newline so the block has no blank tail line.
@@ -3388,9 +3392,8 @@ fn sc_to_ascii(sc: u8) -> char {
 /// 1:1 port of the dispatch + output text format of monitor-shell.ts
 /// `runMonitorCommand`. CORE verbs are wired to the daemon's State (breakpoints,
 /// the run loops, cursors/lens); DEFERRED verbs (map/taint/swimlane/chis from a
-/// trace store, inspect/xref/sym from a project index, label/note from a project
-/// workspace) ERROR exactly like the TS "bridge unavailable / no project" path —
-/// they are NOT faked. The TS `MonitorResult { output | error }` is collapsed to
+/// trace store) ERROR when their store is missing — they are NOT faked. There are no
+/// knowledge verbs (Spec 804: TRX64 holds no symbols). The TS `MonitorResult { output | error }` is collapsed to
 /// `Ok(output)` / `Err(error)` (the monitor/exec handler re-wraps to {output}/{error}).
 /// A monitor write through the bank lens the verb resolved.
 ///
@@ -3434,16 +3437,6 @@ fn land_line(line: &str, tag: &str, cyc: u64, flow: FlowKind, why: StopWhy) -> S
         StopWhy::Cap => ", CAP",
     };
     format!("{line}{flow_tag} ({tag}, {cyc} cyc{why})")
-}
-
-/// Was a project workspace actually named, or is the "project dir" just wherever the
-/// daemon happens to be running?
-///
-/// `fs_project_dir()` can never fail — it ends in `current_dir()` — which is right for
-/// resolving a path but wrong as a licence to WRITE. The label verbs persist into
-/// `knowledge/` under this directory, so they ask this first.
-fn project_is_bound() -> bool {
-    project_knowledge::bound_project().is_some()
 }
 
 /// A monitor read through the bank lens, honouring the `sidefx` toggle.
@@ -3689,7 +3682,19 @@ fn uci_status_json(m: &trx64_core::Machine) -> Value {
     })
 }
 
+/// The monitor as every in-process caller sees it: plain text. Observers, internal
+/// re-entry and the tests get exactly what the formatters print — the Spec 804 address
+/// marks are removed here. Only `monitor/exec` asks for them ([`run_monitor_marked`]),
+/// because only it returns the positions.
 fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
+    run_monitor_marked(st, command)
+        .map(|s| addr_spans::plain(&s))
+        .map_err(|e| addr_spans::plain(&e))
+}
+
+/// The monitor with its addresses MARKED (Spec 804). Callers other than `monitor/exec`
+/// use [`run_monitor`].
+fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
     // Spec 808 §3.4 — an intervention while rewound is what truncates the future.
     // WATCHING is free (play/frame/goto move the machine but keep the anchors); CHANGING
     // it is not. These are the monitor verbs that change machine state, so this is where
@@ -3882,9 +3887,10 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 return Ok(format!(
                     "1541 (drive 8)\n  \
                      ADDR AC XR YR SP NV-BDIZC  clk\n\
-                     .;{:04x} {:02x} {:02x} {:02x} {:02x} {}  {}\n  \
+                     .;{} {:02x} {:02x} {:02x} {:02x} {}  {}\n  \
                      track {} (halftrack {})  led {}",
-                    c.reg_pc, c.reg_a, c.reg_x, c.reg_y, c.reg_sp, flags_str, drv.drive_clk,
+                    addr_spans::mark(&format!("{:04x}", c.reg_pc), c.reg_pc, SpanSpace::Drive8, SpanRole::Pc, None, 1),
+                    c.reg_a, c.reg_x, c.reg_y, c.reg_sp, flags_str, drv.drive_clk,
                     track, halftrack,
                     if led { "on" } else { "off" }
                 ));
@@ -3967,14 +3973,23 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 // you look to find out. The tracker is right there and `flow`/`bt`
                 // already read it.
                 let flow = flow_now.tag().to_ascii_uppercase();
+                // Spec 804 — the PC and the vectors' contents are marked, so a client can
+                // name them without reading the panel's columns.
+                let (c64, pc_role, tgt, memr) = (SpanSpace::C64, SpanRole::Pc, SpanRole::Target, SpanRole::Memory);
                 Ok(format!(
                     "  ADDR AC XR YR SP NV-BDIZC  flow\n\
-                     .;{:04x} {:02x} {:02x} {:02x} {:02x} {}  {}\n  \
+                     .;{} {:02x} {:02x} {:02x} {:02x} {}  {}\n  \
                      port  $00=${:02x} $01=${:02x}  LORAM={} HIRAM={} CHAREN={}\n  \
-                     vectors  IRQ hw=${:04x}  CINV $0314->${:04x}     NMI hw=${:04x}  NMIV $0318->${:04x}",
-                    c.reg_pc, c.reg_a, c.reg_x, c.reg_y, c.reg_sp, flags_str, flow,
+                     vectors  IRQ hw={}  CINV {}->{}     NMI hw={}  NMIV {}->{}",
+                    addr_spans::mark(&format!("{:04x}", c.reg_pc), c.reg_pc, c64, pc_role, None, 1),
+                    c.reg_a, c.reg_x, c.reg_y, c.reg_sp, flags_str, flow,
                     ddr, port, loram, hiram, charen,
-                    irq_hw, cinv, nmi_hw, nmiv
+                    addr_spans::addr4(irq_hw, c64, tgt),
+                    addr_spans::addr4(0x0314, c64, memr),
+                    addr_spans::addr4(cinv, c64, tgt),
+                    addr_spans::addr4(nmi_hw, c64, tgt),
+                    addr_spans::addr4(0x0318, c64, memr),
+                    addr_spans::addr4(nmiv, c64, tgt)
                 ))
             }
         }
@@ -4030,6 +4045,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             while a <= end_u {
                 let mut bytes: Vec<String> = Vec::new();
                 let mut ascii = String::new();
+                let mut row_len: u16 = 0;
                 for j in 0..32u32 {
                     let aj = a + j;
                     if aj > end_u {
@@ -4044,16 +4060,25 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                     };
                     bytes.push(format!("{:02x}", b));
                     ascii.push(if (0x20..0x7f).contains(&b) { b as char } else { '.' });
+                    row_len += 1;
                 }
                 let lens_letter = if lens == "cpu" {
                     'C'
                 } else {
                     lens.chars().next().unwrap().to_ascii_uppercase()
                 };
+                // Spec 804 — the row address is a RANGE span: the row shows `row_len`
+                // bytes from it, read through `lens` (the drive has no lens).
+                let row_addr = (a & 0xffff) as u16;
+                let row_mark = if device == "drive8" {
+                    addr_spans::mark(&format!("{row_addr:04x}"), row_addr, SpanSpace::Drive8, SpanRole::Memory, None, row_len)
+                } else {
+                    addr_spans::mark(&format!("{row_addr:04x}"), row_addr, SpanSpace::C64, SpanRole::Memory, Some(&lens), row_len)
+                };
                 lines.push(format!(
-                    ">{}:{:04x}  {}  {}",
+                    ">{}:{}  {}  {}",
                     lens_letter,
-                    a & 0xffff,
+                    row_mark,
                     format!("{:<96}", bytes.join(" ")),
                     ascii
                 ));
@@ -4091,11 +4116,13 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 }
             }
             let pc = st.session.machine.cpu6510.reg_pc;
-            // Spec 754 §3.3f (Block F) — addr→name index (user labels) so the
-            // disassembly shows symbols alongside the addresses (= TS getLabels()).
-            let labels = project_knowledge::user_label_index(&fs_project_dir());
             // device drive8: disassemble the 1541 CPU address space (read-inspect).
             let on_drive = device == "drive8";
+            // Spec 804 — no names here: the addresses are marked with their space (and
+            // the lens they were read through), and C64RE names them. That is also what
+            // closes the old leak of C64 labels into the drive's listing.
+            let (space, span_lens) =
+                if on_drive { (SpanSpace::Drive8, None) } else { (SpanSpace::C64, Some(lens.as_str())) };
             // Peek, deliberately, even under `sidefx on`: the renderer wants a plain
             // `Fn(u16) -> u8`, and a side-effecting read cannot be one — it needs &mut.
             // Reading a whole listing through live I/O would also mean a disassembly
@@ -4115,7 +4142,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             if let Some(e) = end {
                 let e = e & 0xffff;
                 while a <= e && n < MAX {
-                    let (size, line) = disasm_line_ts_labeled(read, a, &labels);
+                    let (size, line) = addr_spans::disasm_line_in(read, a, space, span_lens);
                     lines.push(if a == pc { format!("{line} <-- PC") } else { line });
                     a = a.wrapping_add(size);
                     n += 1;
@@ -4131,7 +4158,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 }
             } else {
                 while n < 16 {
-                    let (size, line) = disasm_line_ts_labeled(read, a, &labels);
+                    let (size, line) = addr_spans::disasm_line_in(read, a, space, span_lens);
                     lines.push(if a == pc { format!("{line} <-- PC") } else { line });
                     a = a.wrapping_add(size);
                     n += 1;
@@ -4192,12 +4219,11 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             st.session.machine.sync_after_monitor();
             st.session.running = was_running;
             // Render each touched address once (first-seen order) + ×count for loops.
-            let labels = project_knowledge::user_label_index(&fs_project_dir());
             let read = |a: u16| st.session.machine.peek_lens(a, "cpu");
             let mut lines: Vec<String> = order
                 .iter()
                 .map(|&pc| {
-                    let (_, line) = disasm_line_ts_labeled(read, pc, &labels);
+                    let (_, line) = addr_spans::disasm_line(read, pc, SpanSpace::C64);
                     let c = *count.get(&pc).unwrap();
                     if c > 1 {
                         format!("{line}   x{c}")
@@ -4252,7 +4278,6 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 .and_then(|t| t.parse::<i64>().ok())
                 .unwrap_or(200)
                 .clamp(1, 100_000) as usize;
-            let labels = project_knowledge::user_label_index(&fs_project_dir());
             let read = |a: u16| st.session.machine.peek_lens(a, "cpu");
             let indent = |depth: usize| -> String { "  ".repeat(depth.min(8)) };
             let mut lines: Vec<String> = Vec::new();
@@ -4267,7 +4292,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 }
                 visited.insert(a);
                 let cf = classify_cf(read, a);
-                let (_, line) = disasm_line_ts_labeled(read, a, &labels);
+                let (_, line) = addr_spans::disasm_line(read, a, SpanSpace::C64);
                 lines.push(format!("{}{}", indent(stack.len()), line));
                 remaining -= 1;
                 match cf.kind {
@@ -4983,7 +5008,11 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                     } else {
                         let mut s = String::from("breakpoints:");
                         for e in list {
-                            s.push_str(&format!("\n  #{}  ${:04x}", e.num, e.pc));
+                            s.push_str(&format!(
+                                "\n  #{}  {}",
+                                e.num,
+                                addr_spans::addr4(e.pc, SpanSpace::C64, SpanRole::Pc)
+                            ));
                         }
                         s
                     })
@@ -5003,7 +5032,12 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                     let num = st.breakpoints.next_num;
                     st.breakpoints.next_num += 1;
                     st.breakpoints.entries.push(BpEntry { num, pc: addr, enabled: true });
-                    Ok(format!("bk #{} set at ${:04x} ({} total)", num, addr, st.breakpoints.entries.len()))
+                    Ok(format!(
+                        "bk #{} set at {} ({} total)",
+                        num,
+                        addr_spans::addr4(addr, SpanSpace::C64, SpanRole::Pc),
+                        st.breakpoints.entries.len()
+                    ))
                 }
             }
         }
@@ -5148,7 +5182,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             let cyc = st.session.machine.clk.wrapping_sub(clk0); // r.cyc (single step)
             let pc = st.session.machine.cpu6510.reg_pc;
             st.mon.disasm_cursor = Some(pc);
-            let (_, line) = disasm_line_ts(|a| st.session.machine.peek_lens(a, "cpu"), pc);
+            let (_, line) = addr_spans::disasm_line(|a| st.session.machine.peek_lens(a, "cpu"), pc, SpanSpace::C64);
             Ok(land_line(&line, "step", cyc, st.flow.current_flow(), StopWhy::Clean))
         }
         "n" | "next" | "so" => {
@@ -5204,7 +5238,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             }
             let pc = st.session.machine.cpu6510.reg_pc;
             st.mon.disasm_cursor = Some(pc);
-            let (_, line) = disasm_line_ts(|a| st.session.machine.peek_lens(a, "cpu"), pc);
+            let (_, line) = addr_spans::disasm_line(|a| st.session.machine.peek_lens(a, "cpu"), pc, SpanSpace::C64);
             Ok(land_line(&line, "next", r_cyc, st.flow.current_flow(), why))
         }
         "ret" | "return" => {
@@ -5244,7 +5278,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             }
             let pc = st.session.machine.cpu6510.reg_pc;
             st.mon.disasm_cursor = Some(pc);
-            let (_, line) = disasm_line_ts(|a| st.session.machine.peek_lens(a, "cpu"), pc);
+            let (_, line) = addr_spans::disasm_line(|a| st.session.machine.peek_lens(a, "cpu"), pc, SpanSpace::C64);
             Ok(land_line(&line, "return", last_cyc, st.flow.current_flow(), why))
         }
 
@@ -5494,10 +5528,10 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                             // This port's frame records the RETURN pc where the reference
                             // records the entry SP; report what we actually have.
                             format!(
-                                "  {}  enter=${:04x} ret=${:04x}",
+                                "  {}  enter={} ret={}",
                                 f.kind.tag(),
-                                f.entered_at_pc,
-                                f.return_pc
+                                addr_spans::addr4(f.entered_at_pc, SpanSpace::C64, SpanRole::Pc),
+                                addr_spans::addr4(f.return_pc, SpanSpace::C64, SpanRole::Pc)
                             )
                         })
                         .collect::<Vec<_>>()
@@ -5571,7 +5605,7 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             }
             let pc = st.session.machine.cpu6510.reg_pc;
             st.mon.disasm_cursor = Some(pc);
-            let (_, line) = disasm_line_ts(|a| st.session.machine.peek_lens(a, "cpu"), pc);
+            let (_, line) = addr_spans::disasm_line(|a| st.session.machine.peek_lens(a, "cpu"), pc, SpanSpace::C64);
             let tag = format!("{}:{}", if over { "nextf" } else { "stepf" }, want.tag());
             Ok(land_line(&line, &tag, cyc, st.flow.current_flow(), why))
         }
@@ -5590,7 +5624,12 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 let lo = m.peek_lens((a & 0xffff) as u16, "cpu") as u32;
                 let hi = m.peek_lens(((a + 1) & 0xffff) as u16, "cpu") as u32;
                 let ret = (((hi << 8) | lo) + 1) & 0xffff;
-                lines.push(format!("  ${:04x}: -> ${:04x}  (JSR return?)", a & 0xffff, ret));
+                // Spec 804 — the stack slot is memory, the return address is code.
+                lines.push(format!(
+                    "  {}: -> {}  (JSR return?)",
+                    addr_spans::addr4((a & 0xffff) as u16, SpanSpace::C64, SpanRole::Memory),
+                    addr_spans::addr4(ret as u16, SpanSpace::C64, SpanRole::Pc)
+                ));
                 found += 1;
                 a += 2;
             }
@@ -5602,7 +5641,11 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             if !st.flow.stack.is_empty() {
                 lines.push("flow frames (exact, from stepping):".to_string());
                 for fr in &st.flow.stack {
-                    lines.push(format!("  {} @ ${:04x}", fr.kind.tag(), fr.entered_at_pc));
+                    lines.push(format!(
+                        "  {} @ {}",
+                        fr.kind.tag(),
+                        addr_spans::addr4(fr.entered_at_pc, SpanSpace::C64, SpanRole::Pc)
+                    ));
                 }
             }
             Ok(lines.join("\n"))
@@ -5623,8 +5666,10 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 Ok(out) => {
                     let l = out.landed;
                     let mut lines = vec![format!(
-                        "reverse-step: undid {} instruction(s) → landed @ ${:04x}  A=${:02x} X=${:02x} Y=${:02x} SP=${:02x} P=${:02x}  cyc={}",
-                        out.steps_taken, l.pc, l.a, l.x, l.y, l.sp, l.p, l.cycle
+                        "reverse-step: undid {} instruction(s) → landed @ {}  A=${:02x} X=${:02x} Y=${:02x} SP=${:02x} P=${:02x}  cyc={}",
+                        out.steps_taken,
+                        addr_spans::addr4(l.pc, SpanSpace::C64, SpanRole::Pc),
+                        l.a, l.x, l.y, l.sp, l.p, l.cycle
                     )];
                     if out.undone_writes.is_empty() {
                         lines.push("  (no memory writes were rolled back)".to_string());
@@ -5632,8 +5677,9 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                         lines.push(format!("  rolled back {} write(s) (newest first):", out.undone_writes.len()));
                         for w in out.undone_writes.iter().take(32) {
                             lines.push(format!(
-                                "    ${:04x}: ${:02x} <- ${:02x}  (restored old)",
-                                w.addr, w.old_value, w.new_value
+                                "    {}: ${:02x} <- ${:02x}  (restored old)",
+                                addr_spans::addr4(w.addr, SpanSpace::C64, SpanRole::Memory),
+                                w.old_value, w.new_value
                             ));
                         }
                         if out.undone_writes.len() > 32 {
@@ -5678,8 +5724,8 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 return Ok(lines.join("\n"));
             }
             let mut lines = vec![format!(
-                "whowrote ${:04x}: {} writer(s) in the live ring (newest first):",
-                addr,
+                "whowrote {}: {} writer(s) in the live ring (newest first):",
+                addr_spans::addr4(addr, SpanSpace::C64, SpanRole::Memory),
                 hits.len()
             )];
             for h in &hits {
@@ -5689,13 +5735,15 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
                 // captured (an interrupt/early-boot write with an empty/unreadable stack).
                 let chain = h.caller_chain;
                 let mut line = format!(
-                    "  ${:04x} <- written by ${:04x} @ cyc {}  (${:02x} -> ${:02x})",
-                    h.addr, h.pc, h.cycle, h.old_value, h.new_value
+                    "  {} <- written by {} @ cyc {}  (${:02x} -> ${:02x})",
+                    addr_spans::addr4(h.addr, SpanSpace::C64, SpanRole::Memory),
+                    addr_spans::addr4(h.pc, SpanSpace::C64, SpanRole::Pc),
+                    h.cycle, h.old_value, h.new_value
                 );
                 if chain.depth > 0 {
                     let frames: Vec<String> = chain.frames[..chain.depth as usize]
                         .iter()
-                        .map(|f| format!("${f:04x}"))
+                        .map(|f| addr_spans::addr4(*f, SpanSpace::C64, SpanRole::Pc))
                         .collect();
                     line.push_str(&format!("   caller chain: {}", frames.join(" -> ")));
                 }
@@ -6897,123 +6945,10 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
             }
         }
 
-        // ---- Project-index reads (inspect/xref/sym) — audit ws-trace-monitor-misc-15. -
-        // TS wires `ctx.projectRead` (ws-server.ts:2135-2191): scan C64RE_PROJECT_DIR for
-        // the `*_analysis.json` covering the address, load its effective segments + the
-        // project-wide address/xref index, and answer inspect/xref/sym. TRX64's stub
-        // unconditionally errored. Fix: a faithful project-read bridge over the SAME on-
-        // disk analysis/annotation files (project_knowledge.rs). The project dir is the
-        // `--project` arg ?? C64RE_PROJECT_DIR (= fs_project_dir, 1:1 with the TS
-        // `process.env.C64RE_PROJECT_DIR` the daemon's run.ts sets from --project).
-        "inspect" => {
-            let addr = match parse_addr(toks.get(1)) {
-                Some(a) => a,
-                None => return Err("inspect: usage: inspect <addr> [artifact-stem]".into()),
-            };
-            Ok(project_knowledge::project_read_inspect(&fs_project_dir(), addr))
-        }
-        "xref" => {
-            let addr = match parse_addr(toks.get(1)) {
-                Some(a) => a,
-                None => return Err("xref: usage: xref <addr> [artifact-stem]".into()),
-            };
-            let stem = toks.get(2).map(|s| s.as_str());
-            Ok(project_knowledge::project_read_xref(&fs_project_dir(), addr, stem))
-        }
-        "sym" => {
-            let q = match toks.get(1) {
-                Some(q) => q.clone(),
-                None => return Err("sym: usage: sym <name> [artifact-stem]".into()),
-            };
-            let stem = toks.get(2).map(|s| s.as_str());
-            project_knowledge::project_read_sym(&fs_project_dir(), &q, stem)
-                .map_err(|e| format!("sym: {e}"))
-        }
-
-        // ---- Project-label writes (label/unlabel/note/save_labels/load_labels) —
-        // audit ws-trace-monitor-misc-16. TS wires `ctx.projectLabels`
-        // (ws-server.ts:2207-2258, ProjectKnowledgeService): persists a user label to
-        // `<project>/knowledge/labels.user.json` (+ a memory-address entity / a note
-        // finding) and round-trips a VICE `.sym`. TRX64's stub unconditionally errored.
-        // Fix: a faithful project-knowledge persistence bridge over the SAME store
-        // format/location (project_knowledge.rs). The label store always targets the
-        // project dir (= TS `this.projectDir ?? C64RE_PROJECT_DIR`, NOT the FS-shell
-        // cwd); the .sym FILE path resolves cwd-relative (= TS `resolveFsPath(file)`).
-        "label" | "unlabel" | "note" | "load_labels" | "ll" | "save_labels" | "sl" => {
-            // A BOUND project is required, as in the reference ("no project workspace
-            // bound (labels need a project)"). `fs_project_dir()` always resolves to
-            // something — it falls back to the daemon's own working directory — so
-            // without this check `label $1000 foo` silently wrote knowledge/ into
-            // whatever directory the daemon happened to be started from, and `unlabel`
-            // answered "no label matching …" when the truth was "you have no project".
-            if !project_is_bound() {
-                return Err(format!(
-                    "{op}: no project workspace bound (labels need a project — start the \
-                     daemon with --project <dir> or set C64RE_PROJECT_DIR)"
-                ));
-            }
-            let dir = fs_project_dir();
-            match op.as_str() {
-                "label" => {
-                    if toks.len() == 1 {
-                        return Ok(project_knowledge::project_labels_list(&dir));
-                    }
-                    let addr = match parse_addr(toks.get(1)) {
-                        Some(a) => a,
-                        None => return Err(
-                            "label: usage: label <addr> <name>  |  label (list)  |  unlabel <addr|name>"
-                                .into(),
-                        ),
-                    };
-                    let name = toks[2..].join(" ").trim().to_string();
-                    if name.is_empty() {
-                        return Err("label: a name is required — label <addr> <name>".into());
-                    }
-                    project_knowledge::project_labels_set(&dir, addr, &name)
-                }
-                "unlabel" => {
-                    let key = match toks.get(1) {
-                        Some(k) => k.clone(),
-                        None => return Err("unlabel: usage: unlabel <addr|name>".into()),
-                    };
-                    project_knowledge::project_labels_del(&dir, &key)
-                }
-                "note" => {
-                    // An EMPTY quoted text is a usage error, not an empty note — the
-                    // reference's `!text` guard treats "" as absent.
-                    let addr = parse_addr(toks.get(1));
-                    // note <addr> "<text>" — the text is the FIRST quoted run (= TS
-                    // cmd.matchAll(/"([^"]*)"/g)[0]).
-                    let text = quoted_first(&cmd);
-                    match (addr, text) {
-                        (Some(a), Some(t)) if !t.is_empty() => {
-                            project_knowledge::project_labels_note(&dir, a, &t)
-                        }
-                        _ => Err("note: usage: note <addr> \"<text>\"".into()),
-                    }
-                }
-                _ => {
-                    // save_labels / load_labels — the FILE resolves cwd-relative.
-                    let (file, _rest) = parse_file_cmd();
-                    let file = match file {
-                        Some(f) => resolve_fs_path(&f),
-                        None => {
-                            let verb = if op == "save_labels" || op == "sl" {
-                                "save_labels"
-                            } else {
-                                "load_labels"
-                            };
-                            return Err(format!("{op}: usage: {verb} \"<file.sym>\""));
-                        }
-                    };
-                    if op == "save_labels" || op == "sl" {
-                        project_knowledge::project_labels_save(&dir, &file)
-                    } else {
-                        project_knowledge::project_labels_load(&dir, &file)
-                    }
-                }
-            }
-        }
+        // ---- Spec 804 — no knowledge verbs. `label`/`unlabel`/`note`/`save_labels`/
+        // `load_labels`/`sym`/`inspect`/`xref` used to write into and read from the C64RE
+        // project. TRX64 holds no symbols: names are joined in C64RE from the address
+        // spans every `monitor/exec` reply carries. These words are unknown commands now.
 
         // ---- STATE: snapshot dump / undump (audit ws-trace-monitor-misc-9) ---------
         // monitor-shell.ts:279-296: `dump "<p.c64re>"` writes a runtime snapshot to
@@ -7633,10 +7568,8 @@ fn monitor_help_text() -> String {
         "    cadence <frames> [secs]   set the rate AND retune the cap together (`cadence 1` = one full checkpoint per frame). States the expected memory (~98 KiB/anchor) before spending it. 1..=3000 frames, window 1..=600s",
         "    ringdump <path>           serialize the WHOLE reverse-debug buffer (checkpoint+delta+cpuhistory rings) → one gzipped .c64rering file (the tester->dev hand-off)",
         "    ringload <path>           restore a .c64rering: reconstruct the rings + restore the machine to its current anchor; scrub/rstep/whowrote/chis/diff then work on it",
-        "  KNOWLEDGE (reads the project _analysis.json that covers the address)",
-        "    inspect <a> [stem]  segment kind/label + xrefs at a",
-        "    xref <a> [stem]     who calls/jumps/reads/writes a (in + out)",
-        "    sym <name> [stem]   reverse lookup: named routine/label -> address",
+        "  NAMES — none here: TRX64 holds no symbols. Every monitor/exec reply says WHERE it",
+        "  printed each address (spans: line, column, address, space, role); C64RE names them.",
         "  FILE (rooted at the project dir; relative paths off the session cwd)",
         "    pwd | cd [dir] | ls [dir]   FS shell (cd with no arg = project dir)",
         "    mkdir <dir> | rmdir <dir>   make / remove a directory",
@@ -7721,7 +7654,7 @@ fn assemble_at(st: &mut State, addr: u16, text: &str) -> Result<String, String> 
     st.mon.disasm_cursor = Some(next);
     st.mon.pending_prompt = Some(asm_prompt(next));
     let bytes_col: String = r.bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
-    let (_, back) = disasm_line_ts(|a| st.session.machine.peek_lens(a, "cpu"), addr);
+    let (_, back) = addr_spans::disasm_line(|a| st.session.machine.peek_lens(a, "cpu"), addr, SpanSpace::C64);
     Ok(format!("{:04x}  {:<11}  {}", addr, bytes_col, back))
 }
 
@@ -8255,13 +8188,23 @@ use trx64_static::disasm6502::instr_len;
 /// `monitorDisasm` wire shape — thin Value adapter over the shared decoder.
 fn disasm_one(addr: u16, read: impl Fn(u16) -> u8) -> Value {
     let d = trx64_static::disasm6502::disasm_one(addr, read);
-    json!({
+    let mut v = json!({
         "addr": d.addr as u64,
         "bytes": d.bytes.iter().map(|b| *b as u64).collect::<Vec<_>>(),
         "mnemonic": d.mnemonic,
         "operand": d.operand,
-        "text": d.text
-    })
+        "text": d.text,
+        "mode": d.mode,
+    });
+    // Spec 804 — the addresses as numbers, so a client never reads them out of
+    // `operand`/`text`. Absent when the instruction has none.
+    if let Some(t) = d.target {
+        v["target"] = json!(t);
+    }
+    if let Some(o) = d.operand_addr {
+        v["operandAddr"] = json!(o);
+    }
+    v
 }
 
 // ── api/call dispatch ─────────────────────────────────────────────────────────
@@ -8721,31 +8664,9 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
             Response::ok(id, json!([]))
         }
 
-        // ── Disasm linkage (Spec 235) — resolvePc / resolvePcs ───────────────────
-        // agent-api.ts:128-133 → resolve-pc.ts. Maps a PC (or list of PCs) to the
-        // project disasm knowledge at that address (routine / label / segment /
-        // source) read from `<artifactId>_analysis.json` + `<artifactId>_annotations
-        // .json` (the SAME on-disk files the inspect/xref/sym bridge reads). The TS
-        // facade signature is resolvePc(artifactId, pc): runtime/call carries args as
-        // [artifactId, pc] (resolvePcs: [artifactId, pcs[]]). Returns the ResolvedPc
-        // JSON byte-for-byte (absent layers omitted, like TS `undefined`).
-        "resolvePc" => {
-            let artifact_id = args.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let pc = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let dir = project_knowledge::active_project_dir();
-            Response::ok(id, project_knowledge::resolve_pc(&dir, &artifact_id, pc))
-        }
-
-        "resolvePcs" => {
-            let artifact_id = args.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let pcs: Vec<u32> = args
-                .get(1)
-                .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|p| p.as_u64().map(|n| n as u32)).collect())
-                .unwrap_or_default();
-            let dir = project_knowledge::active_project_dir();
-            Response::ok(id, json!(project_knowledge::resolve_pcs(&dir, &artifact_id, &pcs)))
-        }
+        // Spec 804 — `resolvePc` / `resolvePcs` are gone. They read the project's
+        // `*_analysis.json` / `*_annotations.json` / `*_disasm.asm` to name a PC; TRX64
+        // holds no symbols, and C64RE's `runtime_resolve_pc` answers from its graph.
 
         // ── Snapshot diff (Spec 246) — diffSnapshots / formatDiff ─────────────────
         // agent-api.ts:150-155 → snapshot-diff.ts. diffSnapshots(a, b) compares two
@@ -10021,19 +9942,31 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
                     ));
                 }
                 let lens = r.get("lens").and_then(|v| v.as_str()).unwrap_or("cpu");
+                // Spec 804 — `space: "drive8"` reads the 1541's address space (a peek,
+                // like the monitor's `m` under `device drive8`). The drive has no lens.
+                let drive = r.get("space").and_then(|v| v.as_str()) == Some("drive8");
                 let mut bytes = Vec::with_capacity(len as usize);
                 for i in 0..len {
                     // Wraps at $FFFF like the 6510 does, rather than truncating the
                     // range and silently answering something shorter.
                     let a = addr.wrapping_add((i & 0xffff) as u16);
-                    bytes.push(st.session.machine.peek_lens(a, lens));
+                    bytes.push(if drive {
+                        st.session.machine.drive8.drive_peek(a)
+                    } else {
+                        st.session.machine.peek_lens(a, lens)
+                    });
                 }
-                chunks.push(json!({
+                let mut chunk = json!({
                     "addr": addr as u64,
                     "len": len,
                     "lens": lens,
                     "bytes": base64_encode(&bytes),
-                }));
+                });
+                if drive {
+                    chunk["space"] = json!("drive8");
+                    chunk["lens"] = Value::Null;
+                }
+                chunks.push(chunk);
             }
             Response::ok(id, json!({
                 "chunks": chunks,
@@ -10120,31 +10053,49 @@ pub fn dispatch(req: Request, state: &SharedState) -> Response {
             // Spec 839 — the forwarded MACHINE verbs (mount/eject/drive/cart/…) are
             // resolved here, BEFORE the lock: they re-enter `dispatch`, and doing that
             // from inside `run_monitor` (which holds `&mut State`) deadlocks.
-            if let Some(forwarded) = monitor_forward(&req, &cmd, state) {
+            if let Some(mut forwarded) = monitor_forward(&req, &cmd, state) {
+                // A forward's text is the RPC's JSON; it prints no marked address. The
+                // reply still carries the contract's two keys, so a client never has to
+                // tell a forwarded verb from a native one.
+                if let Some(body) = forwarded.result.as_mut() {
+                    let st = state.lock().unwrap();
+                    body["spans"] = json!([]);
+                    body["machine"] = monitor_machine_json(&st);
+                }
                 return forwarded;
             }
             let mut st = state.lock().unwrap();
-            let res = run_monitor(&mut st, &cmd);
+            // Spec 804 — the marked run: the reply is stripped here, at the one exit, and
+            // the marks become `spans`. Every other caller gets `run_monitor`'s plain text.
+            let res = run_monitor_marked(&mut st, &cmd);
             // Forward the modal `prompt` (= TS `MonitorResult.prompt`) when a modal verb
             // (`a` assemble / `df -i`) set one — so the wire reply matches the TS
             // `runMonitorCommand` `{ output, prompt }` / `{ error, prompt }` shape.
             let prompt = st.mon.pending_prompt.take();
-            match res {
-                Ok(out) => {
-                    let mut body = json!({ "output": out });
-                    if let Some(p) = prompt {
-                        body["prompt"] = json!(p);
-                    }
-                    Response::ok(id, body)
-                }
-                Err(e) => {
-                    let mut body = json!({ "error": e });
-                    if let Some(p) = prompt {
-                        body["prompt"] = json!(p);
-                    }
-                    Response::ok(id, body)
-                }
+            let (key, raw) = match res {
+                Ok(out) => ("output", out),
+                Err(e) => ("error", e),
+            };
+            let (text, spans) = addr_spans::strip(&raw);
+            let mut body = json!({});
+            body[key] = json!(text);
+            body["spans"] = json!(spans.iter().map(|s| s.to_json()).collect::<Vec<_>>());
+            body["machine"] = monitor_machine_json(&st);
+            if let Some(p) = prompt {
+                body["prompt"] = json!(p);
             }
+            Response::ok(id, body)
+        }
+
+        // Spec 804 — the monitor's context without running a command: the device the
+        // next command acts on and the banking state. C64RE needs the device BEFORE it
+        // substitutes a name, and an empty `monitor/exec` is not a no-op (it leaves the
+        // assemble mode).
+        "monitor/state" => {
+            let st = state.lock().unwrap();
+            let mut body = monitor_machine_json(&st);
+            body["asmCursor"] = json!(st.mon.asm_cursor);
+            Response::ok(id, body)
         }
 
         // CLI-FEEL S3 — Tab path-completion backend for the trx64cli cockpit. This is
@@ -15477,6 +15428,29 @@ fn drive_status_json(st: &mut State) -> Value {
 /// The live cartridge panel, or `null` when the port is empty. Same rationale as
 /// [`drive_status_json`]: composed once, served by `session/cart_status` and
 /// carried inside `session/state`.
+/// Spec 804 — the banking state a client needs to decide WHICH payload is in memory at an
+/// address: the monitor's device, the CPU port (under the checkpoint's own field names —
+/// the same facts, not a second vocabulary for them), the cartridge lines and its bank.
+fn monitor_machine_json(st: &State) -> Value {
+    let m = &st.session.machine;
+    let (exrom, game, bank) = match m.cartridge.as_ref() {
+        Some(c) => {
+            let lines = c.get_lines();
+            (lines.exrom as u64, lines.game as u64, Some(c.get_state().current_bank as u64))
+        }
+        // An empty port: both lines pulled up, no bank.
+        None => (1, 1, None),
+    };
+    json!({
+        "device": st.mon.device,
+        "cpuPortDirection": m.port_dir as u64,
+        "cpuPortValue": m.port_data as u64,
+        "exrom": exrom,
+        "game": game,
+        "cartBank": bank,
+    })
+}
+
 fn cart_status_json(st: &mut State) -> Value {
     // Spec 709.13 — sourceName is the mounted FILE name (TS = getCartridgeMedia().name,
     // ws-server.ts:1581), NOT the cartridge_image CRT-header name. The CRT header name
@@ -19800,6 +19774,177 @@ mod batch1_tests {
             .and_then(|v| v.as_str()).unwrap_or("").to_string()
     }
 
+    // ── Spec 804 — the reply says WHERE it printed each address ─────────────────
+    //
+    // TRX64 holds no symbols. C64RE names addresses, and it must never find one by
+    // reading a text column — so `monitor/exec` says where they are. These pin the
+    // contract: a span's [start,end) cuts EXACTLY the printed address out of the reply,
+    // with the right value, space and role; and the text is the plain monitor text.
+
+    fn exec_body(st: &SharedState, cmd: &str) -> Value {
+        let resp = dispatch(
+            Request { jsonrpc: "2.0".into(), id: json!(1), method: "monitor/exec".into(),
+                      params: json!({ "command": cmd }) },
+            st,
+        );
+        assert!(resp.error.is_none(), "monitor/exec {cmd}: {:?}", resp.error);
+        resp.result.unwrap_or(Value::Null)
+    }
+
+    /// The text a span cuts out of the reply (UTF-16 offsets, as the contract says).
+    fn span_text(body: &Value, span: &Value) -> String {
+        let text = body["output"].as_str().or_else(|| body["error"].as_str()).unwrap();
+        let line = text.split('\n').nth(span["line"].as_u64().unwrap() as usize).unwrap();
+        let u: Vec<u16> = line.encode_utf16().collect();
+        let (s, e) = (span["start"].as_u64().unwrap() as usize, span["end"].as_u64().unwrap() as usize);
+        String::from_utf16(&u[s..e]).unwrap()
+    }
+
+    fn spans_of(body: &Value) -> Vec<Value> {
+        body["spans"].as_array().cloned().unwrap_or_default()
+    }
+
+    #[test]
+    fn a_disassembly_reply_carries_its_addresses_as_spans() {
+        let st = make_state();
+        st.lock().unwrap().session.machine.poke(0xc000, &[0x20, 0xd2, 0xff, 0xad, 0x20, 0xd0]);
+        let body = exec_body(&st, "d c000 c003");
+        // The text is exactly what every other caller of the monitor sees.
+        assert_eq!(body["output"].as_str().unwrap(), mon(&st, "d c000 c003").unwrap());
+        let spans = spans_of(&body);
+        let find = |addr: u64, role: &str| spans.iter().find(|s| s["addr"] == json!(addr) && s["role"] == json!(role)).cloned();
+        let own = find(0xc000, "pc").expect("the instruction's own address");
+        assert_eq!(span_text(&body, &own), "$c000");
+        assert_eq!(own["space"], json!("c64"));
+        let tgt = find(0xffd2, "target").expect("the JSR destination");
+        assert_eq!(span_text(&body, &tgt), "$ffd2");
+        let opd = find(0xd020, "operand").expect("the LDA operand");
+        assert_eq!(span_text(&body, &opd), "$d020");
+        // Every span is a printed `$xxxx` whose value is its `addr` — no guessing.
+        for s in &spans {
+            let t = span_text(&body, s);
+            assert_eq!(u64::from_str_radix(t.trim_start_matches('$'), 16).unwrap(), s["addr"].as_u64().unwrap(), "{t}");
+        }
+        // The banking state rides along.
+        assert_eq!(body["machine"]["device"], json!("c64"));
+        assert!(body["machine"]["cpuPortValue"].is_u64());
+    }
+
+    #[test]
+    fn a_memory_row_is_a_range_span_with_its_lens() {
+        let st = make_state();
+        let body = exec_body(&st, "m ram 1000 103f");
+        let spans = spans_of(&body);
+        assert_eq!(spans.len(), 2, "one span per row: {spans:?}");
+        assert_eq!(span_text(&body, &spans[0]), "1000");
+        assert_eq!(spans[0]["role"], json!("memory"));
+        assert_eq!(spans[0]["len"], json!(32));
+        assert_eq!(spans[0]["lens"], json!("ram"));
+        assert_eq!(spans[1]["addr"], json!(0x1020));
+        // The CPU's own view carries no lens key.
+        let body = exec_body(&st, "m 1000 101f");
+        assert!(spans_of(&body)[0].get("lens").is_none());
+    }
+
+    #[test]
+    fn registers_backtrace_and_the_drive_say_what_their_addresses_are() {
+        let st = make_state();
+        let r = exec_body(&st, "r");
+        let pc = st.lock().unwrap().session.machine.cpu6510.reg_pc as u64;
+        let pc_span = spans_of(&r).into_iter().find(|s| s["role"] == json!("pc")).expect("the PC");
+        assert_eq!(pc_span["addr"], json!(pc));
+        assert_eq!(span_text(&r, &pc_span), format!("{pc:04x}"));
+        assert!(spans_of(&r).iter().any(|s| s["role"] == json!("target")), "the vectors' contents");
+
+        let bt = exec_body(&st, "bt");
+        for s in spans_of(&bt) {
+            let role = s["role"].as_str().unwrap();
+            assert!(role == "memory" || role == "pc", "{s}");
+        }
+
+        // Under `device drive8` the SAME formatter marks the drive's space — which is
+        // what keeps a C64 name out of the drive listing.
+        exec_body(&st, "device drive8");
+        let d = exec_body(&st, "d 0500 0502");
+        assert_eq!(d["machine"]["device"], json!("drive8"));
+        let spans = spans_of(&d);
+        assert!(!spans.is_empty());
+        assert!(spans.iter().all(|s| s["space"] == json!("drive8")), "{spans:?}");
+        let m = exec_body(&st, "m 0500 051f");
+        assert_eq!(spans_of(&m)[0]["space"], json!("drive8"));
+        exec_body(&st, "device c64");
+    }
+
+    #[test]
+    fn a_verb_without_marked_output_answers_no_spans() {
+        let st = make_state();
+        let body = exec_body(&st, "help");
+        assert_eq!(body["spans"], json!([]));
+        let body = exec_body(&st, "nonsense");
+        assert!(body["error"].is_string());
+        assert_eq!(body["spans"], json!([]));
+        assert!(body["machine"].is_object());
+    }
+
+    #[test]
+    fn history_and_writes_mark_their_pcs_and_addresses() {
+        let st = make_state();
+        {
+            let mut g = st.lock().unwrap();
+            // LDA #$05 ; STA $0400 ; NOP — into the always-on rings the way the run loop
+            // feeds them (the test machine does not run).
+            g.session.machine.poke(0xc000, &[0xa9, 0x05, 0x8d, 0x00, 0x04, 0xea]);
+            g.session.machine.delta_ring.set_enabled(true);
+            g.session.machine.cpu_history.set_enabled(true);
+            g.session.machine.cpu_history.push(0xc000, 0xa9, 0x05, 0x8d, 5, 0, 0, 0xff, 0x20, 1000);
+            g.session.machine.delta_ring.begin(0xc002, 5, 0, 0, 0xff, 0x20, 1002);
+            g.session.machine.delta_ring.record_write(0x0400, 0x20, 0x05);
+            g.session.machine.delta_ring.commit();
+            g.session.machine.cpu_history.push(0xc002, 0x8d, 0x00, 0x04, 5, 0, 0, 0xff, 0x20, 1002);
+            g.session.machine.cpu_history.push(0xc005, 0xea, 0x00, 0x00, 5, 0, 0, 0xff, 0x20, 1006);
+        }
+        let chis = exec_body(&st, "chis");
+        assert_eq!(chis["output"].as_str(), mon(&st, "chis").ok().as_deref(), "columns untouched: {chis}");
+        assert!(spans_of(&chis).iter().any(|s| s["addr"] == json!(0xc002) && s["role"] == json!("pc")), "{chis}");
+        assert!(spans_of(&chis).iter().any(|s| s["addr"] == json!(0x0400) && s["role"] == json!("operand")));
+
+        let who = exec_body(&st, "whowrote 0400");
+        let spans = spans_of(&who);
+        assert!(spans.iter().any(|s| s["addr"] == json!(0x0400) && s["role"] == json!("memory")), "{who}");
+        let writer = spans.iter().find(|s| s["role"] == json!("pc")).expect("the writer's pc");
+        assert_eq!(writer["addr"], json!(0xc002));
+        assert_eq!(span_text(&who, writer), "$c002");
+
+        let back = exec_body(&st, "rstep 1");
+        assert!(spans_of(&back).iter().any(|s| s["role"] == json!("pc")), "{back}");
+    }
+
+    #[test]
+    fn monitor_state_answers_without_running_a_command() {
+        let st = make_state();
+        exec_body(&st, "a c000");
+        let s = call(&st, "monitor/state", json!({}));
+        assert_eq!(s["device"], json!("c64"));
+        assert_eq!(s["asmCursor"], json!(0xc000), "asking did not leave assemble mode");
+        assert!(s["cpuPortDirection"].is_u64());
+        exec_body(&st, "");
+    }
+
+    #[test]
+    fn structured_disassembly_and_drive_reads_carry_numbers() {
+        let st = make_state();
+        st.lock().unwrap().session.machine.poke(0xc000, &[0x20, 0xd2, 0xff, 0xad, 0x20, 0xd0]);
+        let d = call(&st, "api/call", json!({ "method": "monitorDisasm", "args": [0xc000, 2] }));
+        assert_eq!(d[0]["target"], json!(0xffd2));
+        assert!(d[0].get("operandAddr").is_none());
+        assert_eq!(d[1]["operandAddr"], json!(0xd020));
+        assert_eq!(d[1]["mode"], json!("abs"));
+        let r = call(&st, "session/read_memory", json!({ "ranges": [{ "addr": 0xc000, "len": 16, "space": "drive8" }] }));
+        assert_eq!(r["chunks"][0]["space"], json!("drive8"));
+        let r = call(&st, "session/read_memory", json!({ "ranges": [{ "addr": 0xc000, "len": 3 }] }));
+        assert!(r["chunks"][0].get("space").is_none());
+    }
+
     /// The one mistake this design is a step away from: `run_monitor` holds `&mut State`,
     /// so a forwarded verb that re-entered `dispatch` from inside it would deadlock on the
     /// daemon's own mutex — and a deadlock is not a failing assertion, it is a test run
@@ -21953,16 +22098,21 @@ mod batch1_tests {
     }
 
     #[test]
-    fn label_verbs_refuse_when_no_project_is_bound() {
-        // fs_project_dir() falls back to the daemon's own cwd, so without this guard
-        // `label` silently wrote knowledge/ into whatever directory it was started from.
+    fn the_knowledge_verbs_are_gone() {
+        // Spec 804 — TRX64 holds no symbols. These wrote into / read from the C64RE
+        // project; now they are words the monitor does not know, like any other.
         let st = make_state();
-        if project_is_bound() {
-            return; // a bound project is a legitimate environment; nothing to assert
-        }
-        for cmd in ["label $1000 foo", "unlabel $1000", "note $1000 \"x\"", "ll \"a.sym\""] {
+        for cmd in [
+            "label $1000 foo", "label", "unlabel $1000", "note $1000 \"x\"", "sl \"a.sym\"",
+            "save_labels \"a.sym\"", "ll \"a.sym\"", "load_labels \"a.sym\"", "sym foo",
+            "inspect 1000", "xref 1000",
+        ] {
             let e = mon(&st, cmd).unwrap_err();
-            assert!(e.contains("no project workspace bound"), "{cmd}: {e}");
+            assert!(e.contains("unknown command"), "{cmd}: {e}");
+        }
+        let help = monitor_help_text();
+        for gone in ["label <", "unlabel", "save_labels", "load_labels", "sym <", "inspect <", "xref <"] {
+            assert!(!help.contains(gone), "help still offers `{gone}`");
         }
     }
 
@@ -22040,17 +22190,6 @@ mod batch1_tests {
         let out = mon(&st, "mkdir foo \"bar baz\"").unwrap_or_default();
         assert!(!out.contains("bar baz"), "the bareword wins when the quote is not first: {out}");
         let _ = std::fs::remove_dir(std::path::Path::new("foo"));
-    }
-
-    #[test]
-    fn note_needs_actual_text() {
-        let st = make_state();
-        if project_is_bound() {
-            return;
-        }
-        // (No project bound → the guard fires first; the empty-text rule is asserted
-        // through the same usage error either way.)
-        assert!(mon(&st, "note $c000 \"\"").is_err());
     }
 
     /// EVERY verb the monitor's own help advertises must dispatch.
