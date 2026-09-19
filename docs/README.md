@@ -21,11 +21,15 @@ way first — nine specs closed in one evening and not one needed building.
 | # | Spec | Status | What is left |
 |---|---|---|---|
 | 803 | [Large cartridges](803-large-cartridges.md) | **PARTLY BUILT** | §5.1 (SPI flash) and §5.2 (GMod4) shipped 2026-08-09. Open: AGR (§6) and the vendor questions (§5.4). **No GMod3 sample exists** — not in hand, not in any archive looked at — so it means writing the first implementation AND the first test with hardware as the only oracle. The SPI core it needs is already paid for by GMod4. |
-| 804 | [Symbolized runtime](804-symbolized-runtime.md) | **PROPOSED** | Untouched — no `symbol*.rs` in any crate. |
 
 | 808 | [Rewind transport](808-rewind-transport.md) | **PARTLY BUILT** | Play the machine backwards. The design turns on one measurement — a full restore is **177 µs** — so backward playback moves the MACHINE rather than replaying cached pictures, and every existing viewer follows for free. Built: the daemon owns the transport state, the monitor verbs, `transport/play|pause|goto|frame|toggle|status`, F9–F12 in the TUI and the window off ONE shared key table, the frame lens (a capture on an anchor can show the frame the redraw threw away), and `transport/key` — a client hands over the KEY and the daemon answers what it did or that it dropped it, which is what the browser needed since it carried no copy of the table and F9–F12 were simply dead there. **This row said PROPOSED while all of that was shipped**; the spec said it too, so the board gate stayed green on two stale claims. Open: the C64RE ribbon in the scrub UI — the browser has the keys and no visible transport controls. |
 | 809 | [Marks and sandboxes](809-marks-and-sandboxes.md) | **PARTLY BUILT** | Marks shipped: named + pinned anchors that survive PLAY cutting the future (the centre of gravity — three attempts from one mark give the identical machine and the mark outlives them), a cap of 32 that REFUSES rather than shrinking the window silently, labels riding the ringdump so a `.c64rering` is a session with its bookmarks, and a name working as an anchor id everywhere. Sandboxes shipped as a bare capability: `sandbox/run` / `runMany` return a state with no name, no verdict and no comparison — gated on carrying none of those, because 810 owns the meaning. Open: copy-on-write media folders per run, and multi-line assembly. |
 ---
+
+**804 moved to C64RE (2026-09-19).** TRX64 holds no symbols: names are joined in C64RE, which
+owns meaning. What TRX64 delivers for it — address spans on `monitor/exec`, the banking state, the
+structured `monitorDisasm` fields — is TRX64 work tracked there, in
+`../../C64ReverseEngineeringMCP/specs/804-symbols-joined-in-c64re.md`.
 
 **HALF BUILT** / **PARTLY BUILT** = a named part is open, and the row says which.
 **PROPOSED** = written down, nothing built.
