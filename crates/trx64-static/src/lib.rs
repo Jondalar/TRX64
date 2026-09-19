@@ -1,6 +1,6 @@
 //! trx64-static — the machine-free 6502 decoder the runtime uses.
 //!
-//! Capability-cut migration step 1 (`docs/capability-cut-decisions.md`): the raw
+//! Capability-cut migration step 1 (`docs/_archive/capability-cut-decisions.md`): the raw
 //! 6502 decode/format layer, extracted from trx64-daemon so the daemon (monitor
 //! `d` / `chis` / flow walks) and the CLI (`trx64cli disasm`, ROM-free) share ONE
 //! disassembler. Depends only on `trx64-core` tables (MICROCODE_TABLE /

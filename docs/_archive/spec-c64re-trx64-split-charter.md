@@ -1,6 +1,11 @@
 # Charter — split C64RE into TRX64 (runtime+MCP) and C64RE (workbench)
 
-**Status:** CHARTER (planning — a goal to chew on, not a started task).
+**Status:** CLOSED 2026-09-19. The runtime half happened: TRX64 is the only runtime (C64RE
+Spec 806) and C64RE's `runtime_*` tools drive it over WS. The `trx64-mcp` half will not: the
+owner decided 2026-09-19 that there is no `trx64-mcp` — C64RE's MCP is the one server, and
+TRX64 is a runtime for `trx64cli`, C64RE and the UE2 emulator. The static-capability half
+is undone too (`capability-cut-decisions.md`). Everything below about `trx64-mcp` — §3's
+new crate, §6's open decisions, §8's "done when" — is the plan as it stood, not work.
 **One line:** make the architecture match what's already true — TRX64 is the C64
 **runtime** (emulator + debugger + a thin MCP façade); C64RE is the RE **workbench**
 (static analysis, semantics, project knowledge, the web UI) that *consumes* TRX64.
@@ -28,7 +33,7 @@ Two genuinely different concerns, today co-housed only for historical reasons:
 If a tool needs the **live machine**, it's TRX64. If it reads/writes the **analysis +
 project knowledge**, it's C64RE.
 
-**Leitregel: Capability → TRX64, Meaning/Memory → C64RE.** TRX64 is the strategic runtime base and the default backend process (the Rust daemon, auto-discovered/spawned) — it produces bytes, events and machine-state and owns runtime, instrument, reverse-debug, trace, checkpoints (`.c64re`/`.c64retrace`), daemon/FFI/CLI. C64RE is the reverse-engineering workbench — project knowledge, method/memory, analysis pipeline, semantic disassembly, findings/entities/questions, UI/orchestration, curation — it turns those bytes/events/state into knowledge. The TypeScript runtime in C64RE is a fallback / parity oracle, not the strategic base. Endstate: two MCP servers — `trx64-mcp` (instrument/runtime) and `c64re-mcp` (workbench/knowledge); today's C64RE `runtime_*` tools are a transition/proxy to the TRX64 backend, not their permanent home.
+**Leitregel: Capability → TRX64, Meaning/Memory → C64RE.** TRX64 is the strategic runtime base and the default backend process (the Rust daemon, auto-discovered/spawned) — it produces bytes, events and machine-state and owns runtime, instrument, reverse-debug, trace, checkpoints (`.c64re`/`.c64retrace`), daemon/FFI/CLI. C64RE is the reverse-engineering workbench — project knowledge, method/memory, analysis pipeline, semantic disassembly, findings/entities/questions, UI/orchestration, curation — it turns those bytes/events/state into knowledge. The TypeScript runtime in C64RE is a fallback / parity oracle, not the strategic base. One MCP server — C64RE's: its `runtime_*` tools are the permanent door to the TRX64 daemon, not a transition, and there is no `trx64-mcp` (decided 2026-09-19). TRX64's own surfaces are the daemon's WS protocol, `trx64cli`, and the crates the UE2 emulator builds on.
 
 ---
 

@@ -319,3 +319,16 @@ its baseline: JSON was never the CPU barrier, it was an 11× memory tax. The `.c
 every WS response stayed byte-identical. One measured follow-up is left in §8 (a base64 round
 trip between capture and ring, ~50 µs, not blocking). Merged to main. Spec:
 [807-binary-checkpoint-ring.md](807-binary-checkpoint-ring.md).
+
+## The split and the capability cut — the charter, 774
+
+The 2026-06-29 plan had three parts: TRX64 as the runtime, a `trx64-mcp` server beside
+C64RE's, and the static decode/parse/classify capability migrating into `trx64-static`.
+
+**Decision:** only the first survived. TRX64 is the only runtime (Spec 806) — for `trx64cli`,
+C64RE and the UE2 emulator — and C64RE's `runtime_*` tools are its permanent door. There is
+no `trx64-mcp` (owner, 2026-09-19). Static analysis stays C64RE's, in TS: media parsing was
+dropped 2026-08-11 (the drive must refuse what the workbench must read), the classifiers
+2026-09-19; `trx64-static` keeps only the decoder the runtime's monitor and `trx64cli disasm`
+use. Closed 2026-09-19. Docs: [spec-c64re-trx64-split-charter.md](spec-c64re-trx64-split-charter.md),
+[capability-cut-decisions.md](capability-cut-decisions.md).

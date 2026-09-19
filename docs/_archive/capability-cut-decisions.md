@@ -5,8 +5,8 @@ Companion to `spec-c64re-trx64-split-charter.md`. Date: 2026-06-29.
 > **Revised 2026-09-19 — TRX64 is a runtime.** The owner: TRX64 serves itself (`trx64cli`),
 > C64RE and the UE2 emulator, and none of them needs a static classifier. **Q1 is now A** —
 > the analyzers stay in C64RE, in TS, permanently. **Q2's static half is void:** `trx64-static`
-> holds only the 6502 decoder the runtime's own monitor and `trx64cli disasm` use; a
-> `trx64-mcp`, if one is ever built, fronts the runtime and nothing else. **Q3** was already
+> holds only the 6502 decoder the runtime's own monitor and `trx64cli disasm` use, and there
+> is no `trx64-mcp` at all (owner, same day) — C64RE's MCP is the one server. **Q3** was already
 > dropped (2026-08-11: drive and workbench read GCR by opposite rules). Migration step 1 stays
 > as built, step 2 is dropped, step 3 is WON'T-DO. C64RE Spec 774 is closed with this. The
 > text below is the 2026-06-29 reasoning, kept as the record of what was decided and undone.
@@ -19,7 +19,7 @@ The big allocations are done (see charter). Three questions remained open. They 
 
 **Runtime corollary:** the TRX64 Rust daemon is the default backend process (auto-discovered/spawned); the TypeScript runtime remaining in C64RE is fallback/oracle, not the product base.
 
-Two-MCP frame (settled): `trx64-mcp` = the instrument (wielded by human + LLM); `c64re-mcp` = the workbench/method/knowledge. The LLM holds both. The monitor's annotated disasm = a **join**: raw-decode (TRX64) ⊕ annotation-overlay (light-local in TRX64, or rich from C64RE when attached). "Overturn a finding from the monitor" = write to that shared annotation surface — works **without** embedding the heavy analyzer in the emulator.
+Two-MCP frame (settled 2026-06-29, **void 2026-09-19** — there is no `trx64-mcp`): `trx64-mcp` = the instrument (wielded by human + LLM); `c64re-mcp` = the workbench/method/knowledge. The LLM holds both. The monitor's annotated disasm = a **join**: raw-decode (TRX64) ⊕ annotation-overlay (light-local in TRX64, or rich from C64RE when attached). "Overturn a finding from the monitor" = write to that shared annotation surface — works **without** embedding the heavy analyzer in the emulator.
 
 ---
 

@@ -1,6 +1,6 @@
 //! Golden parity vs the TS oracle — `disasm_line_ts` must render byte-identical
 //! to C64RE `disasm6502.ts` `disasmLine` ("old TS path retired only after
-//! parity", capability-cut-decisions.md Migration order §4).
+//! parity", docs/_archive/capability-cut-decisions.md Migration order §4).
 //!
 //! Regenerate the goldens (all 256 opcodes × 2 placements incl. $fffe wrap):
 //!   cd ../C64ReverseEngineeringMCP && npx tsx ../TRX64/scripts/gen-disasm-goldens.mjs

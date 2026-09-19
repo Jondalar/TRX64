@@ -1,5 +1,5 @@
 # trx64-static — the machine-free 6502 decoder the runtime uses.
-# Capability-cut step 1 (docs/capability-cut-decisions.md): one decoder shared by
+# Capability-cut step 1 (docs/_archive/capability-cut-decisions.md): one decoder shared by
 # trx64-daemon (monitor verbs) and trx64-cli (`trx64cli disasm`). Static analysis
 # is C64RE's (revised 2026-09-19); nothing else moves here.
 
