@@ -1,0 +1,16 @@
+[package]
+name = "trx64-monitor"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+# Spec 864 — the monitor, as a library, so a second machine can have one.
+#
+# The dependency list is the spec's central claim and the gate that keeps it
+# honest: core and static, nothing else. A host brings its own transport, its own
+# timeline, its own media and its own trace sinks; none of that may leak in here.
+[dependencies]
+trx64-core = { path = "../trx64-core" }
+trx64-static = { path = "../trx64-static" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
