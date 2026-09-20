@@ -282,6 +282,25 @@ a stock 1 MHz machine (4 of 4 pairs), and with the check switched off **6 % belo
 to the old speed — UE2 had seen the same in their measurement and could not separate it from
 noise.
 
+## A second video standard — 863
+
+PAL/6569 was the only machine, by decision, and the frame length was a constant in both
+repos. The owner: "NTSC Mode support in TRX64 und ein Switch im C64RE dafür."
+
+**Decision:** a C64 model is a **row of `crates/trx64-core/models.toml`** — VICE's model
+table, read at startup; code holds only building blocks, and a row naming one that does not
+exist (the 6526A CIA, the custom glue logic, KERNAL rev1/rev2) is refused by name rather than
+approximated. `c64-pal`, `c64-ntsc` (6567R8: 65 cycles x 263 lines, 17095 cycles/frame,
+1022730 Hz, 60 Hz TOD) and `c64-paln` run; the three cycle-table families are ported 1:1 from
+VICE's chip model, `Machine::timing()` is the single source every frame and clock consumer
+reads, and NTSC's display window wraps past raster 0 where the chip puts it. PAL stayed
+bit-identical (the 7-game screenshots byte-for-byte). **A model change is never a power
+cycle:** it is a transplant at the frame boundary, so the program keeps RAM, CPU, CIA, SID and
+the standard it detected at boot — `session/model`, the monitor verb, the Live-tab selector
+and `session/create {model}` all go through it. Every snapshot, checkpoint and journal entry
+carries its model and restores onto it. The palette stays Colodore for every row. Closed
+2026-09-20 when both halves merged. Spec: [863-ntsc.md](863-ntsc.md).
+
 ## Turbo/speed registers — 815
 
 A C64 release PROBES for a turbo machine — `$D031`, then the `$D02F`/`$D030` pair — and on a
