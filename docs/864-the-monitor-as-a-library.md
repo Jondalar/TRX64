@@ -58,7 +58,7 @@ whole:
 | from | what |
 |---|---|
 | `main.rs` verb dispatch + formatting | every verb, its output shape, `help` |
-| `main.rs:675` `MonitorState` | cursors, device selection, `fs_cwd`, assemble mode, pending prompt |
+| `main.rs:675` `MonitorState` | cursors, device selection, assemble mode, pending prompt — **not** `fs_cwd` (§10.1) |
 | `main.rs:183` `Breakpoints` | the breakpoint/watchpoint surfaces the verbs edit |
 | `main.rs:788` `FlowTracker` | the interrupt/trap frame tracker behind `flow`/`focus` |
 | `main.rs` trap rules | `TrapRule` and its map |
@@ -77,10 +77,17 @@ pub trait MonitorHost {
     /// The C64. The one method with no default.
     fn machine(&mut self) -> &mut Machine;
 
-    /// A device's CPU view. `machine()` is the shorthand for `Device::C64`.
+    /// A device's CPU view (§3.1). `machine()` is the shorthand for `Device::C64`.
     /// A host answers what it has; the lib prints "not available on this host"
     /// for the rest, in the same sentence a missing timeline verb gets.
     fn cpu(&mut self, dev: Device) -> Option<&mut dyn CpuView> { … }
+
+    /// Resume, step, halt. The DEFAULTS drive the machine, which is what the
+    /// daemon wants; a host whose machine is driven by something else overrides
+    /// them (§5.1). The lib never advances a machine behind a host's back.
+    fn resume(&mut self, until: RunUntil) -> Result<StopInfo, String> { … }
+    fn step(&mut self, n: u64, over: bool) -> Result<StopInfo, String> { … }
+    fn set_halted(&mut self, halted: bool) -> Result<(), String> { … }
 
     /// What a verb did, AFTER it ran. Default: nothing.
     fn on_effect(&mut self, effect: Effect) {}
@@ -117,6 +124,40 @@ tables and the host ORs its own in. This is written into the trait, not left to 
 discovered — UE2 already runs its own access-watch table (they stop a run mid-catch-up
 after a C64 write to the UCI control register).
 
+### §3.1 `CpuView` — the register list AND the address width
+
+UE2's answer to §12, and it is the half I had underweighted: the register list is easy,
+the address space is not. Their firmware view is 32-bit — devices at `0x1004_0000` (where
+the UCI window lives), cartridge ROM at `0x03C0_0000`, config pages at `0xFE_8000`. A `u16`
+anywhere in the shared path and `device fw` can address none of it.
+
+```rust
+pub trait CpuView {
+    fn addr_bits(&self) -> u8;                       // 16 for the 6502, 32 for the RISC-V
+    fn read(&mut self, addr: u64) -> Option<u8>;
+    fn write(&mut self, addr: u64, v: u8) -> Result<(), String>;
+    fn registers(&self) -> Vec<Reg>;                 // name, width in bits, value
+    fn set_register(&mut self, name: &str, v: u64) -> Result<(), String>;
+    fn flags(&self) -> Option<FlagSpec>;             // None: this CPU has no flag register
+    fn disasm(&mut self, addr: u64) -> Option<(u8, String)>;  // None: no decoder here
+    fn banks(&self) -> &[&str];                      // empty: `bank` is not for this device
+}
+```
+
+The lib parses and formats addresses against `addr_bits`, so `m` and `d` on a 32-bit view
+neither truncate nor pad. Three consequences, each a refusal rather than a guess:
+
+- **Flags are an option, not an assumption.** `p`/`fl` renders a flag string for a CPU that
+  has one; the RISC-V does not, so the verb says so on that device.
+- **`r <reg>=<v>` is refusable per view**, not globally — a view may expose a register it
+  will not let you write.
+- **The debug machinery is a capability of the C64 view.** The watch tables are
+  `[u8; 0x10000]` (core lib.rs:2939-2940) — a 6502 shape, not a general one. So
+  breakpoints, exec/access watches and the observer registry apply to the C64 device, and
+  on another device the lib answers "not available on this device" rather than silently
+  watching the wrong 64 KB. UE2 debugs its RISC-V through its GDB stub, which is the right
+  tool for it.
+
 ## §4 D3 — Effect is classified in the lib
 
 Spec 808's rule — an intervention while rewound truncates the future — is daemon policy
@@ -125,12 +166,19 @@ special case: `r` only writes when the command contains `=`. That special case i
 proof the classification belongs to the parser. So:
 
 ```rust
-enum Effect { Reads, Mutates, ReplacesMachine }
+enum MachineEffect { Observes, Mutates, Replaces }
 ```
 
 The lib classifies each command and calls `on_effect`. The daemon truncates on `Mutates`
-and discards the timeline on `ReplacesMachine`; UE2 does nothing for either. No host ever
-sees a verb string, so no host can hold a stale verb list.
+and discards the timeline on `Replaces`; UE2 does nothing for either. No host ever sees a
+verb string, so no host can hold a stale verb list.
+
+**It is named for what it measures.** UE2's first host verb is `config` — it reads the
+Ultimate's flash config pages and can hand the firmware a settings delta, so it changes a
+great deal, and none of it is the C64. Under a name like `Reads` that declaration looks
+like a lie; under `MachineEffect::Observes` it is exactly true. The question this enum
+answers is "what did this do to the C64 and its timeline", not "did anything change
+anywhere".
 
 ## §5 D4 — Reset is intercepted, not announced
 
@@ -142,6 +190,27 @@ leave the firmware describing a machine that no longer exists. The daemon's
 implementation resets and then discards its timeline, keeping today's ordering rather than
 turning it into an effect fired at the wrong moment.
 
+### §5.1 Resuming, stepping and halting are host business too
+
+The same cut, one step further than I had drawn it. UE2's firmware is a second CPU with
+its own clock: when a C64 breakpoint hits there, the firmware keeps running and will
+notice a C64 that stopped answering. So "the machine halted" and "time stopped" are not
+the same statement, and only the host knows which one it can make.
+
+`g`, `until`, `step`/`z`/`n` therefore go through `resume`/`step`, and a halt is announced
+through `set_halted`. The defaults do what the daemon does today (`step_one_with_flow` and
+the segment runner), so the daemon's behaviour is unchanged; UE2 overrides them and routes
+through the firmware's own `C64_STOP` path, which keeps the firmware consistent with the
+machine it is hosting.
+
+**One arm, one-to-many core runs.** UE2's `run_cpu` is a loop, not a call: cartridge hints
+split a run, and since their UCI fix they deliberately halt mid-catch-up on a write to the
+control register and then continue. So the contract is `arm()` … *1..n* core runs …
+`after_advance()`, and re-arming between those runs is allowed: `sync_observers` preserves
+live hit and ignore counts across a rebuild (it snapshots the prior registry), which is
+the property that makes the loop safe. A contract of one core run per arm would have been
+wrong for the host that asked for this spec.
+
 ## §6 D5 — Host verbs register into the dispatch
 
 The lib sees every line first. It has to: `MonitorState` carries `asm_cursor` and
@@ -150,12 +219,13 @@ have to know when `a` swallows the next line and when an empty line exits a mode
 lib knowledge, and a second copy of it is how two hosts start behaving differently.
 
 ```rust
-fn register(&mut self, verb: &str, aliases: &[&str], help: &str, effect: Effect, handler: …);
+fn register(&mut self, verb: &str, aliases: &[&str], help: &str, effect: MachineEffect, handler: …);
 ```
 
 - A name or alias the lib owns is **refused at construction**, and so is one a previously
   registered host verb took. A collision is an error, never a silent last-wins.
-- A host verb declares its `Effect`; the default is `Reads`.
+- A host verb declares its `MachineEffect`; the default is `Observes` (§4) — a verb that
+  changes the host's own world but not the C64 declares exactly that.
 - Host verbs are **non-modal in v1**. Opening a mode means owning `asm_cursor` and
   `pending_prompt`; one owner of the prompt, or none.
 - They appear in `help` in their own section, and the port audit walks them like ours.
@@ -174,11 +244,13 @@ business being private to the daemon.
   text with its addresses marked and `run_monitor` is the `addr_spans::plain()` wrapper
   (main.rs:3727). C64RE joins symbol names onto those spans — that is how `d 1000` comes
   back with labels. Each host decides whether to strip; nobody strips before the wire.
-- **Machine identity (Spec 863).** A reply says which C64 it is on, from
-  `Machine::timing()` via `machine()`. A host answers truthfully rather than assuming PAL:
-  UE2 reports its U64 profile, the PAL-only core behind a firmware that may ask for 60 Hz,
-  and the CPU clock turbo currently gives. The monitor states what the machine IS, not
-  what a profile wishes.
+- **Machine identity (Spec 863) is captured per REPLY, never per session.** A reply says
+  which C64 it is on, from `Machine::timing()` via `machine()`. UE2's clock is whatever
+  turbo currently is and moves at runtime (`C64_SPEED_UPDATE`), so an identity struct
+  captured once at attach would be stale by the second command. A host answers truthfully
+  rather than assuming PAL, and reports rather than hides what it cannot do: UE2's core is
+  PAL-only, so a firmware asking for 60 Hz produces a warning in the reply, not a silent
+  approximation. The monitor states what the machine IS, not what a profile wishes.
 
 ## §9 D8 — The daemon is the first host, and nothing above it moves
 
@@ -207,6 +279,23 @@ that is the acceptance (§11.1).
   out of it), so `device drive8` behaves identically on both hosts. `fw` is the only
   genuinely new device.
 
+### §10.1 The filesystem verbs, and where the cwd lives
+
+UE2's answer to the second §12 question, and it is right: `fs_cwd` is not monitor state,
+it is shell state of a filesystem. A host without a filesystem never has a cwd, so
+carrying one it cannot use is carrying a lie. The cwd moves into the media/FS service with
+its verbs, and the lib hides those verbs entirely when the service is absent instead of
+printing a prompt about a directory that does not exist. `MonitorState` keeps what is
+genuinely about looking at a machine: the memory and disassembly cursors, the selected
+device, the assemble cursor, the side-effects flag, the pending prompt.
+
+One cut inside that cut, which UE2 spotted and I had not: `load`, `save`, `bload` and
+`bsave` are two halves glued together. The file half is the service; **the memory half is
+the lib plus the machine**, and it takes the same path as `wr`. Drawn that way a host with
+plain file access — UE2 is an ordinary host process — implements a handful of file calls
+and gets the verbs. Drawn the other way the whole verb leaves, and every host writes the
+memory half again, which is precisely the drift this spec exists to prevent.
+
 ## §11 Acceptance
 
 1. **The daemon's monitor answers exactly as it does today.** A golden transcript —
@@ -234,15 +323,36 @@ that is the acceptance (§11.1).
    trip both sides.
 8. **No dependency inversion.** `trx64-monitor` compiles against `trx64-core` and
    `trx64-static` alone — enforced by the crate graph, not by intention.
-9. The existing gates stay green: the daemon suite, the core suites, the 7-game
-   screenshots byte-identical.
-10. **UE2 runs the port audit over its bridge host** in its own `cargo test`. Drift shows
+9. **A 32-bit device.** The in-test host registers a fake device with `addr_bits() = 32`,
+   no flag register and no decoder. `m` and `d` address it without truncating, `p` says
+   the CPU has no flags, `d` says there is no decoder, and a breakpoint or watch on that
+   device is refused by name rather than applied to the C64's 64 KB.
+10. **Run control through the host.** The in-test host counts `resume`/`step`/`set_halted`
+    and refuses one of them; the lib never reaches the machine behind its back, proven by
+    the machine's cycle count being unchanged after a refused resume. A host that arms
+    once and performs three core runs before `after_advance()` keeps its hit and ignore
+    counts across all three.
+11. **Identity is per reply.** Two replies across a clock change report the two different
+    clocks. (On the daemon: a model switch at a frame boundary, Spec 863.)
+12. The existing gates stay green: the daemon suite, the core suites, the 7-game
+    screenshots byte-identical.
+13. **UE2 runs the port audit over its bridge host** in its own `cargo test`. Drift shows
     up on their side, in their CI, without me watching.
 
 ## §12 Open
 
-- The `CpuView` trait's exact shape (registers are a fixed set for the 6502; the RISC-V
-  has 32 plus CSRs). Probably: the lib formats what the view hands it, and the view
-  decides its own register list.
-- Whether `fs_cwd` and the FS verbs belong in the lib at all, or are entirely a media
-  service. They are lib state today because the daemon is the only host.
+Both original questions were answered by the host that asked for this spec, and their
+answers are folded in above: `CpuView` carries its address width as well as its register
+list (§3.1), and the filesystem verbs with their cwd are a service (§10.1).
+
+What is still open:
+
+- The `Reg` and `FlagSpec` shapes — how much the lib formats and how much the view hands
+  it pre-rendered. The rule is "the view decides its register list"; the boundary between
+  a value and its presentation still needs drawing.
+- Whether `RunUntil` and `StopInfo` are rich enough for a host that halts mid-catch-up and
+  resumes, or whether they need a host-opaque resume token.
+- The daemon's own `resume`/`step` defaults must reproduce `step_one_with_flow` exactly,
+  including what the flow tracker records. That is an extraction detail, but it is the one
+  most likely to change behaviour invisibly, so it gets its own line in the golden
+  transcript (§11.1).
