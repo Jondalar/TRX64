@@ -29,8 +29,13 @@ use trx64_core::{BusKind, NullSink, Observer};
 use trx64_session::{Session, TraceState};
 use trx64_trace::{FrameSink, TraceChannels, TracingObserver};
 
-pub mod addr_spans;
-pub mod assembler;
+/// Spec 864 — the marked spans are the library's API, not the daemon's formatting
+/// habit: the monitor marks the addresses it prints and each host decides whether to
+/// strip. The daemon still strips at the one `monitor/exec` exit.
+pub use trx64_monitor::addr_spans;
+/// Spec 864 — the one-line 6502 assembler behind `a` lives in `trx64-monitor` now; it
+/// only ever needed `trx64_core::tables`.
+pub use trx64_monitor::assembler;
 pub mod candidate;
 /// Spec 864 — the observer registry lives in `trx64-monitor` now. It was always a
 /// `trx64-core` observer and nothing in it reached above core; the daemon keeps the

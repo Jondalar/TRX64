@@ -17,13 +17,15 @@
 //! - `breakpoints`, `observers` — the debug policy, and the registry that IS a core
 //!   observer. The host installs it for an advance and hands back what it caught.
 //! - `assembler` — the one-line 6502 assembler behind `a`.
-//! - `spans` — the marked address spans (Spec 804) a reply carries, so a workbench can
-//!   join symbol names onto them.
+//! - [`addr_spans`] — the marked address spans (Spec 804) a reply carries, so a
+//!   workbench can join symbol names onto them.
 //! - `verbs` — the dispatch, the parsing, the output.
 //!
 //! What does NOT live here: who advances the machine. That is the one thing the two
 //! hosts genuinely disagree about, and the monitor never decides it.
 
+pub mod addr_spans;
+pub mod assembler;
 pub mod host;
 pub mod observers;
 
