@@ -283,7 +283,27 @@ live hit and ignore counts across a rebuild (it snapshots the prior registry), w
 the property that makes the loop safe. A contract of one core run per arm would have been
 wrong for the host that asked for this spec.
 
-## §6 D5 — Host verbs register into the dispatch
+## §6 D5 — Host verbs: the fall-through is the contract, and no API was needed
+
+**Superseded by what happened, 2026-09-20.** This section specified a registration API —
+`register(verb, aliases, help, effect, handler)`, names refused at construction, host
+verbs in their own `help` section. The second host built its verbs the day after v0.8.2
+without any of it, and the reason it works is the same reason the API was proposed.
+
+`try_exec` returns `None` only for a verb the library does not own, so a host puts its own
+dispatch **behind** that `None` rather than in front of the library. The modal concern
+that motivated registration is untouched: while the assemble cursor is armed the library
+answers `Some` for *every* line, so a host verb can never be typed into a mode by
+accident, and the prompt still has exactly one owner. UE2's `help` prints the library's
+list and then its own; `fw` and `clock` were their first two.
+
+So: no registration API, no host verb table in this crate, and no notion of any particular
+emulator in this tree — which is a better answer than the one this section proposed, and
+it cost nothing to find out. The API is not forbidden; it is simply not needed, and an API
+nobody needs is a surface that can drift. What the port audit walks is the `help` text,
+and a host that prints its verbs there is audited like any other.
+
+## §6a The original design, kept for the reasoning
 
 The lib sees every line first. It has to: `MonitorState` carries `asm_cursor` and
 `pending_prompt`, so the monitor is **modal**, and anything sitting in front of it would
