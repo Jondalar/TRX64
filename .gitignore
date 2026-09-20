@@ -32,3 +32,8 @@ docker/roms/
 # Deployment addressing — never in the repo (see docker/.env.example)
 docker/.env
 .env
+
+# Agent harness files — never shipped with the product.
+.claude/
+AGENTS.md
+CLAUDE.md
