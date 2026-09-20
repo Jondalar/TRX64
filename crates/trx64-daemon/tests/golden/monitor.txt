@@ -1,0 +1,642 @@
+# Spec 864 §11.1 — monitor golden transcript
+# Produced by tests/monitor_golden.rs against a cold-reset machine.
+# Re-bless with TRX64_GOLDEN_BLESS=1 and read the diff first.
+
+$ help
+monitor (VICE-superset):
+  EXEC
+    g [addr]         go/resume the run-loop (PC=addr); Pause button halts
+    x                exit/resume (= g)
+    until <addr>     run until PC=addr, then stop (synchronous)
+    z / step         step into — may enter IRQ/NMI (VICE-correct)
+    n / next         step over — skips JSR + runs THROUGH IRQ/NMI
+    ret / return     run until current frame returns (RTS/RTI)
+    focus [m]        flow focus: auto|main|irq|nmi|brk|clear (C64RE)
+    sf / nf          step into/over, stop only in focused flow (C64RE)
+    flow             interrupt/trap flow frame stack (panel)
+    bt               backtrace (stack scan + flow frames)
+    reset            cold reset
+  MEMORY (bank lens: cpu|ram|rom|io|cart, default cpu = what CPU sees)
+    m [lens] <a> [b] memory dump ($20/row + petscii; default len $800)
+    d [lens] [a] [end] disassemble: a..end range (VICE), or ~16 from a/PC
+    sd [n]           step+disasm: the REAL executed path, loops folded (dynamic)
+    df [-i] [a] [n]  follow-disasm: walk control flow (static); -i asks at branches (df t|f|b)
+    screen           decode the 40x25 text screen (real screen pointer)
+    io [1|addr]      I/O area per device: register hex (peek) + state details (VICE io)
+    iec              the serial bus: ATN/CLK/DATA, their level, and WHICH side is pulling each one low, plus both ends as their CPUs see them ($DD00 and the 1541's $1800). A released line is high and any device may pull it low, so "who is low" is per-device, not a bus-wide state. Answers the only question an IEC stall ever asks.
+    bitmap <a> [w h] [hires|charset|sprite]  render a RAM range to a PNG (scrub gfx)
+    bank [lens]      show/set the sticky default lens for m/d
+    wr [lens] <a> <b..>  write exactly these bytes from a
+    f <a> <b> <d..>  fill range a..b with repeating data
+    a <a> [instr]    assemble; `a c000` enters assemble mode (type lines, empty exits)
+    t <a> <b> <dst>  move/copy a..b to dst (overlap-safe)
+    c <a> <b> <dst>  compare a..b vs dst (list diffs)
+    h <a> <b> <d..>  hunt for a byte pattern (xx = wildcard)
+  BREAKPOINTS / OBSERVERS
+    bk               list breakpoints (#num $addr)
+    bk <a> | bk -<a> set / remove breakpoint (by addr)
+    del <n..> | del  delete by #num / delete all
+    obs <name> when exec|load|store <a[..b]> [if <cond>] do <action> [fields]
+      actions: break | log [fields] | mark ["label"] | cmd "<cmd>" | trace [domains]|off
+      log fields: a/x/y/sp/pc/fl or $addr[:w]  e.g. `do log $fd $fe $ff a x y`
+      trace domains: c64-cpu|drive8-cpu|iec|vic|memory (default c64-cpu+memory)
+        bracket: `obs c when exec $4000 do trace` … `obs c2 when exec $4100 do trace off`
+    obs | obs log    list observers / show log lines
+    obs <name> on|off|del   (name may glob: `obs * del` = all, `obs c* off`)
+    ignore <name> [n]
+      cond: a/x/y/pc/sp/fl/rl/val/addr  == != < > <= >= && || ( )
+  CPU
+    r                registers (+ flow + IRQ/NMI vectors)
+    r a=$42 x=$10    set registers (a/x/y/sp/pc/fl)
+    sidefx [on|off]  monitor read side effects (default off = peek)
+    device [c64|drive8]  target the C64 or the 1541 CPU (drive8 = read-inspect r/m/d)
+  STATE / TRACE
+    dump|snapshot <p>  write a .c64re snapshot; undump|loadsnapshot <p>  restore it
+    savecrt ["<p>"]  write live flash state to the mounted .crt (or to <p> as a copy)
+    swapcrt "<p>"    hot-swap the .crt, NO reset (same mapper: bank/ctrl carried) — build iteration
+    trace on|off|status|mark   live trace gate
+    tracedb start|stop|status|mark   declarative trace
+    traceindex [path]   build the .duckdb index for the current/last (or <path>) .c64retrace so it is queryable (oldest->newest, no event cap)
+    tracering <s> <e> [path]  build a .c64retrace from the ALWAYS-ON reverse ring, AFTER the fact — the window you did not arm a trace for. `revdepth` says how far back the ring reaches; a start older than that silently begins where the ring does.
+  ANALYSIS (need a trace — `trace on` first)
+    map [cpu]        memory map: free RAM / persistence surface
+    taint <a> [cyc]  data-flow taint backward from (cyc,addr)
+    swimlane [list|name] [s] [e]  trace lanes (cpu/irq/nmi/io/1541): list / newest / by name; tail ~2000cy
+                     `swimlane <s> <e>` with no covering trace → auto checkpoint-ring replay
+    chis [cyc] | chis <s> <e>  cpu instruction history: LIVE cpuhistory ring first (works while a trace is active), falls back to the captured trace; last N cyc (default 4000) or a window
+  REVERSE-DEBUG (always-on full-delta ring — no pre-arming; inspect-backward only)
+    rstep [n] | reverse [n]   UNDO the last n instructions (default 1): restore CPU+RAM+IO bytes to before them; reports the landed regs + writes rolled back
+    whowrote <addr> [n]       last n writer(s) of <addr> from the ring (newest first): PC + cycle + old->new + caller chain (top return frames -> identifies the CALLER of a shared store). Emits `ring_exhausted: true` + a depth hint on a miss past a wrapped ring.
+    triage [pc]               guided crash-triage: causal chain (crash -> wild RTS/JMP transfer -> stack corruptor) from the rings; auto-printed on a JAM. Confidence-tagged. Surfaces a PINNED `loop entry: $SRC -> $DST` for a tight-loop/halt; `ring_exhausted` when the transfer is older than the ring.
+    traprules <path> | traprules [clear]   load/list/clear project on-trap dump rules (JSON {pc,label,dump:[[name,addr,len]],decode}); auto-emits `label: name=$XX (decode)` on reaching that PC (JAM / breakpoint)
+    revdepth [seconds]        report / set the always-on reverse-ring depth: rebuilds the delta+cpuhistory rings (DISCARDS history; future capture only; 1..=600s). TRX64_REVERSE_SECONDS = boot default
+    diff <idA> <idB>          typed by-ID diff of two checkpoint anchors (RAM runs + per-chip register changes). READ-ONLY (live machine unchanged). ids from `checkpoint/list`
+  MEDIA + DRIVE (Spec 839 — the same verbs on every front-end; the cockpit used to own these)
+    mount <path>              put a .d64/.g64/.crt/.prg/.c64re in the machine. The TYPE comes from the file's CONTENT, not its extension; a relative path resolves against `pwd`/`cd`. A cartridge power-cycles, a disk does not.
+    eject [cart|disk]         take it out. Bare `eject` targets whatever is actually in (cartridge first, else the disk). Both persist to the host file FIRST — a disk eject leaves the drive turning, a cartridge eject cold-resets the machine (that is what pulling a cart does).
+    drive                     drive 8 live status: motor, track, LED, what is mounted, whether it is dirty
+    cart                      cartridge live status: type, bank, read/write activity — null when nothing is inserted
+    drivepower                cold-reset the drive 6502 ONLY (DOS re-runs power-on init). The C64 side is untouched. Every scrap of drive-side state goes: open channels, a fastloader's uploaded drivecode, a half-written sector. It is the way out of a wedged fastloader without power-cycling the machine someone is watching.
+    recent                    the media this daemon has had mounted lately (daemon state, not project history)
+  MACHINE (the same verbs on every front-end — the cockpit's `/` prefix is input sugar)
+    run                       resume the machine (from a rewound point: cuts the anchors ahead)
+    pause                     stop the machine AND the transport; prints the ringbuffer range
+    warp on|off               8× pacing / real time (the model's frame rate)
+    rawframe on|off           an anchor stores no picture, so stepping onto one REDRAWS it: two frames, keep the second, because the first is cut into wherever the anchor landed in the raster. That discards a ONE-FRAME event — a border opened for a frame, a bad raster split — so it looks like the ring never caught it. `on` keeps the FIRST frame, seam and all. Anchors that sit on a frame boundary use the first either way (whole, nothing lost). `transport/status` reports which you are looking at as `shownFrame`.
+    reset [warm|cold] · power on|off
+    model                     which C64 this is (model, video standard, VIC-II, frame, clock), and every model this build knows — with what a model that cannot run is missing
+    model <row>               switch the running machine to another model (c64-pal, c64-ntsc, c64-paln …) at the next frame boundary. Not a power cycle: the program keeps its state and the standard it detected at boot; `reset` or `power off`/`on` afterwards for a clean start on the new model. The model survives reset and power cycles.
+    turbo                     Spec 815 — which machine this session CLAIMS to be, so a release's turbo code path is reachable at all. A C64 answers $FF at $D02F-$D03F, the probe fails, and everything behind it is dead code.
+    turbo mode c64|128|u64    c64 (default) = open bus. 128 = the VIC-IIe pair $D02F/$D030 with VICE's read-back masks. u64 = an extended speed register at $D031. Survives a reset: it is machine identity, not chip state.
+    turbo on|off              set/clear the speed bit the way the release would ($D030 bit 0, or $D031)
+    turbo speed $NN           the extended speed value (u64 profile)
+                              The speed bit is STORED, not acted on: the CPU still runs at 1 MHz and the picture is unchanged. What a set bit does to the display is Spec 815 §3 and is unbuilt on purpose — guessing it would put behaviour here that exists nowhere else.
+    uci                       Spec 852 — the Ultimate Command Interface on the u64 profile, read-only: enabled, window, state, pointers, lengths, the IRQ and freeze lines, events the firmware has not taken. Disabled without a firmware, so the window reads open bus.
+  MARKS (Spec 809 — a named, pinned point you can iterate FROM)
+    mark <name>               name + pin the anchor you are standing on (max 32)
+    marks                     list them with cycle, frame, how far back, and the window cost
+    unmark <name>             drop the name and the pin
+    goto <name>               jump to a mark (goto also takes a frame or c<cycle>)
+    A mark survives PLAY cutting the future, which is what lets you go there, try
+    something, come back and try differently. `ringdump` carries marks, so a
+    .c64rering is a session WITH its bookmarks.
+    identify <path>           what a file IS, from its content: c64re|crt|g64|d64|prg (+ whether a PRG would autostart)
+  REWIND TRANSPORT (Spec 808 — plays the MACHINE backwards, not cached pictures)
+    play back|fwd [speed]     play through the anchors; every step is a real restore, so registers/memory/drive are correct at every frame. `play fwd` at the head just runs.
+    pause                     stop where you are — the machine IS there, no second step needed
+    frame -N | +N             step N anchors (stops at the ends, never wraps)
+    goto <frame> | goto c<cyc>  jump to a position; a cycle lands on the anchor at-or-before it
+    rewind                    mode + position + window + anchors held, and the key legend
+    keys: F9 one back | F10 play back | F11 pause/play | F12 one forward
+    Watching is free: replaying keeps the anchors. Only an INTERVENTION (a write, a key, a resumed run) truncates the future — the mode line then says CUT and how many anchors went.
+  CHECKPOINT RING (the scrub/filmstrip buffer — full machine states, NOT the delta ring)
+    cadence                   report the capture rate, window, entry cap and how many anchors are held
+    window [seconds]          how far back you want to reach (default 60s, max 600) — recomputes the cap AND the byte budget
+    cadence <frames> [secs]   set the rate AND retune the cap together (`cadence 1` = one full checkpoint per frame). States the expected memory (~98 KiB/anchor) before spending it. 1..=3000 frames, window 1..=600s
+    ringdump <path>           serialize the WHOLE reverse-debug buffer (checkpoint+delta+cpuhistory rings) → one gzipped .c64rering file (the tester->dev hand-off)
+    ringload <path>           restore a .c64rering: reconstruct the rings + restore the machine to its current anchor; scrub/rstep/whowrote/chis/diff then work on it
+  NAMES — none here: TRX64 holds no symbols. Every monitor/exec reply says WHERE it
+  printed each address (spans: line, column, address, space, role); C64RE names them.
+  FILE (rooted at the project dir; relative paths off the session cwd)
+    pwd | cd [dir] | ls [dir]   FS shell (cd with no arg = project dir)
+    mkdir <dir> | rmdir <dir>   make / remove a directory
+    load "<f>" [addr]   load a PRG into RAM (2-byte header, or override addr)
+    save "<f>" <a1> <a2>  save a1..a2 as a PRG (2-byte load addr = a1)
+    bload "<f>" <addr>   raw binary load (no header)
+    bsave "<f>" <a1> <a2>  raw binary save (no header)
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ r
+  ADDR AC XR YR SP NV-BDIZC  flow
+.;fce2 00 00 00 ff nv-bdizc  MAIN
+  port  $00=$2f $01=$37  LORAM=1 HIRAM=1 CHAREN=1
+  vectors  IRQ hw=$ff48  CINV $0314->$0000     NMI hw=$fe43  NMIV $0318->$0000
+   spans: 7
+     L1 2..6 $fce2 c64/pc/-
+     L3 18..23 $ff48 c64/target/-
+     L3 30..35 $0314 c64/memory/-
+     L3 37..42 $0000 c64/target/-
+     L3 54..59 $fe43 c64/target/-
+     L3 66..71 $0318 c64/memory/-
+     L3 73..78 $0000 c64/target/-
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ model
+model: c64-pal (pal)  VIC-II 6569  63 × 312 = 19656 cycles/frame  985248 Hz  50.125 fps  TOD 50 Hz  canvas 384×272
+  * c64-pal       C64 PAL
+    c64-ntsc      C64 NTSC
+    c64-paln      C64 PAL-N (Drean)
+    c64c-pal      C64C PAL  — needs 6526A CIA, custom-IC glue logic
+    c64c-ntsc     C64C NTSC  — needs 6526A CIA, custom-IC glue logic
+    c64-old-pal   C64 old PAL  — needs 6569R1 light-pen IRQ mode, 6569R1 luminances, KERNAL rev2 (kernal-901227-02.bin) — not in the ROM set
+    c64-old-ntsc  C64 old NTSC  — needs 6567R56A light-pen IRQ mode, 6567R56A luminances, KERNAL rev1 (kernal-901227-01.bin) — not in the ROM set
+  `model <row>` switches at the next frame boundary (the program keeps its state).
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ m e000 e03f
+>C:e000  85 56 20 0f bc a5 61 c9 88 90 03 20 d4 ba 20 cc bc a5 07 18 69 81 f0 f3 38 e9 01 48 a2 05 b5 69   .V ...a.... .. .....i...8..H...i
+>C:e020  b4 61 95 61 94 69 ca 10 f5 a5 56 85 70 20 53 b8 20 b4 bf a9 c4 a0 bf 20 59 e0 a9 00 85 6f 68 20   .a.a.i....V.p S. ...... Y....oh 
+   spans: 2
+     L0 3..7 $e000 c64/memory/-
+     L1 3..7 $e020 c64/memory/-
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ m rom e000 e00f
+>R:e000  85 56 20 0f bc a5 61 c9 88 90 03 20 d4 ba 20 cc                                                   .V ...a.... .. .
+   spans: 1
+     L0 3..7 $e000 c64/memory/rom
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ m ram 0400 040f
+>R:0400  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00                                                   ................
+   spans: 1
+     L0 3..7 $0400 c64/memory/ram
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ m io d000 d00f
+>I:d000  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00                                                   ................
+   spans: 1
+     L0 3..7 $d000 c64/memory/io
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ bank
+bank = cpu  (lens for m/d; one of cpu|ram|rom|io|cart)
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ bank rom
+bank = rom
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ bank
+bank = rom  (lens for m/d; one of cpu|ram|rom|io|cart)
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ bank cpu
+bank = cpu
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ d fce2 fcf0
+$fce2  a2 ff     LDX #$ff <-- PC
+$fce4  78        SEI
+$fce5  9a        TXS
+$fce6  d8        CLD
+$fce7  20 02 fd  JSR $fd02
+$fcea  d0 03     BNE $fcef
+$fcec  6c 00 80  JMP ($8000)
+$fcef  8e 16 d0  STX $d016
+   spans: 12
+     L0 0..5 $fce2 c64/pc/-
+     L1 0..5 $fce4 c64/pc/-
+     L2 0..5 $fce5 c64/pc/-
+     L3 0..5 $fce6 c64/pc/-
+     L4 0..5 $fce7 c64/pc/-
+     L4 21..26 $fd02 c64/target/-
+     L5 0..5 $fcea c64/pc/-
+     L5 21..26 $fcef c64/target/-
+     L6 0..5 $fcec c64/pc/-
+     L6 22..27 $8000 c64/operand/-
+     L7 0..5 $fcef c64/pc/-
+     L7 21..26 $d016 c64/operand/-
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ d e000 e010
+$e000  85 56     STA $56
+$e002  20 0f bc  JSR $bc0f
+$e005  a5 61     LDA $61
+$e007  c9 88     CMP #$88
+$e009  90 03     BCC $e00e
+$e00b  20 d4 ba  JSR $bad4
+$e00e  20 cc bc  JSR $bccc
+   spans: 13
+     L0 0..5 $e000 c64/pc/-
+     L0 21..24 $0056 c64/operand/-
+     L1 0..5 $e002 c64/pc/-
+     L1 21..26 $bc0f c64/target/-
+     L2 0..5 $e005 c64/pc/-
+     L2 21..24 $0061 c64/operand/-
+     L3 0..5 $e007 c64/pc/-
+     L4 0..5 $e009 c64/pc/-
+     L4 21..26 $e00e c64/target/-
+     L5 0..5 $e00b c64/pc/-
+     L5 21..26 $bad4 c64/target/-
+     L6 0..5 $e00e c64/pc/-
+     L6 21..26 $bccc c64/target/-
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ df fce2 8
+$fce2  a2 ff     LDX #$ff
+$fce4  78        SEI
+$fce5  9a        TXS
+$fce6  d8        CLD
+$fce7  20 02 fd  JSR $fd02
+  $fd02  a2 05     LDX #$05
+  $fd04  bd 0f fd  LDA $fd0f,x
+  $fd07  dd 03 80  CMP $8003,x
+-- df: reached step limit
+   spans: 11
+     L0 0..5 $fce2 c64/pc/-
+     L1 0..5 $fce4 c64/pc/-
+     L2 0..5 $fce5 c64/pc/-
+     L3 0..5 $fce6 c64/pc/-
+     L4 0..5 $fce7 c64/pc/-
+     L4 21..26 $fd02 c64/target/-
+     L5 2..7 $fd02 c64/pc/-
+     L6 2..7 $fd04 c64/pc/-
+     L6 23..28 $fd0f c64/operand/-
+     L7 2..7 $fd07 c64/pc/-
+     L7 23..28 $8003 c64/operand/-
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ screen
+screen @ $0000  (VIC bank $0000, $D018=$01)
+|@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+|@@@@@@@@@@@@@@@@@@@@@@@@................|
+|........................................|
+|........@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+|@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@........|
+|........................................|
+|................@@@@@@@@@@@@@@@@@@@@@@@@|
+|@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+|........................................|
+|........................@@@@@@@@@@@@@@@@|
+|@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+|@@@@@@@@................................|
+|................................@@@@@@@@|
+|@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+|@@@@@@@@@@@@@@@@........................|
+|........................................|
+|@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+|@@@@@@@@@@@@@@@@@@@@@@@@................|
+|........................................|
+|........@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+|@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@........|
+|........................................|
+|................@@@@@@@@@@@@@@@@@@@@@@@@|
+|@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+|........................................|
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ h e000 e100 a2 ff
+not found
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ c e000 e010 e000
+identical ($e000..$e010 == $e000)
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ wr 0400 01 02 03 04
+wrote 4 byte(s) @ $0400 (cpu)
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ m 0400 040f
+>C:0400  01 02 03 04 00 00 00 00 00 00 00 00 00 00 00 00                                                   ................
+   spans: 1
+     L0 3..7 $0400 c64/memory/-
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ f 0410 041f aa
+filled $0410..$041f (16 bytes, pattern 1)
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ m 0410 041f
+>C:0400  01 02 03 04 00 00 00 00 00 00 00 00 00 00 00 00 aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa   ................................
+   spans: 1
+     L0 3..7 $0400 c64/memory/-
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ t 0400 040f 0500
+moved 16 byte(s) $0400..$040f -> $0500
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ m 0500 050f
+>C:0500  01 02 03 04 00 00 00 00 00 00 00 00 00 00 00 00                                                   ................
+   spans: 1
+     L0 3..7 $0500 c64/memory/-
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ a 0600 lda #$01
+0600  a9 01        $0600  a9 01     LDA #$01
+   prompt: .0602  
+   spans: 1
+     L0 19..24 $0600 c64/pc/-
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ 
+
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ d 0600 0602
+$0600  a9 01     LDA #$01
+$0602  00        BRK
+   spans: 2
+     L0 0..5 $0600 c64/pc/-
+     L1 0..5 $0602 c64/pc/-
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ a 0610
+
+   prompt: .0610  
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ inx
+0610  e8           $0610  e8        INX
+   prompt: .0611  
+   spans: 1
+     L0 19..24 $0610 c64/pc/-
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ iny
+0611  c8           $0611  c8        INY
+   prompt: .0612  
+   spans: 1
+     L0 19..24 $0611 c64/pc/-
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ 
+
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ d 0610 0612
+$0610  e8        INX
+$0611  c8        INY
+$0612  00        BRK
+   spans: 3
+     L0 0..5 $0610 c64/pc/-
+     L1 0..5 $0611 c64/pc/-
+     L2 0..5 $0612 c64/pc/-
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ r a=42
+set a=$42
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ r
+  ADDR AC XR YR SP NV-BDIZC  flow
+.;fce2 42 00 00 ff nv-bdizc  MAIN
+  port  $00=$2f $01=$37  LORAM=1 HIRAM=1 CHAREN=1
+  vectors  IRQ hw=$ff48  CINV $0314->$0000     NMI hw=$fe43  NMIV $0318->$0000
+   spans: 7
+     L1 2..6 $fce2 c64/pc/-
+     L3 18..23 $ff48 c64/target/-
+     L3 30..35 $0314 c64/memory/-
+     L3 37..42 $0000 c64/target/-
+     L3 54..59 $fe43 c64/target/-
+     L3 66..71 $0318 c64/memory/-
+     L3 73..78 $0000 c64/target/-
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ r a=00
+set a=$00
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ bk
+no breakpoints (set: bk <addr>)
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ bk fce2
+bk #1 set at $fce2 (1 total)
+   spans: 1
+     L0 13..18 $fce2 c64/pc/-
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ bk
+breakpoints:
+  #1  $fce2
+   spans: 1
+     L1 6..11 $fce2 c64/pc/-
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ obs probe when exec $fce2 do log
+obs probe: exec $fce2 do log
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ o
+observers:
+  * probe  exec $fce2 do log  hits=0
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ obs probe del
+obs probe deleted
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ o
+no observers (obs <name> when exec|load|store <addr> [if <cond>] do break|log|mark|cmd|trace)
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ bk -fce2
+removed bp $fce2 (0 left)
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ bk
+no breakpoints (set: bk <addr>)
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ flow
+flow: current=main  focus=auto
+frames:
+  (main — no interrupt/trap frame active)
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ bt
+backtrace (live stack scan — best-effort; refine with `chis`):
+  $0100: -> $0001  (JSR return?)
+  $0102: -> $0001  (JSR return?)
+  $0104: -> $0001  (JSR return?)
+  $0106: -> $0001  (JSR return?)
+  $0108: -> $0001  (JSR return?)
+  $010a: -> $0001  (JSR return?)
+  $010c: -> $0001  (JSR return?)
+  $010e: -> $0001  (JSR return?)
+  $0110: -> $0001  (JSR return?)
+  $0112: -> $0001  (JSR return?)
+  $0114: -> $0001  (JSR return?)
+  $0116: -> $0001  (JSR return?)
+  $0118: -> $0001  (JSR return?)
+  $011a: -> $0001  (JSR return?)
+  $011c: -> $0001  (JSR return?)
+  $011e: -> $0001  (JSR return?)
+   spans: 32
+     L1 2..7 $0100 c64/memory/-
+     L1 12..17 $0001 c64/pc/-
+     L2 2..7 $0102 c64/memory/-
+     L2 12..17 $0001 c64/pc/-
+     L3 2..7 $0104 c64/memory/-
+     L3 12..17 $0001 c64/pc/-
+     L4 2..7 $0106 c64/memory/-
+     L4 12..17 $0001 c64/pc/-
+     L5 2..7 $0108 c64/memory/-
+     L5 12..17 $0001 c64/pc/-
+     L6 2..7 $010a c64/memory/-
+     L6 12..17 $0001 c64/pc/-
+     L7 2..7 $010c c64/memory/-
+     L7 12..17 $0001 c64/pc/-
+     L8 2..7 $010e c64/memory/-
+     L8 12..17 $0001 c64/pc/-
+     L9 2..7 $0110 c64/memory/-
+     L9 12..17 $0001 c64/pc/-
+     L10 2..7 $0112 c64/memory/-
+     L10 12..17 $0001 c64/pc/-
+     L11 2..7 $0114 c64/memory/-
+     L11 12..17 $0001 c64/pc/-
+     L12 2..7 $0116 c64/memory/-
+     L12 12..17 $0001 c64/pc/-
+     L13 2..7 $0118 c64/memory/-
+     L13 12..17 $0001 c64/pc/-
+     L14 2..7 $011a c64/memory/-
+     L14 12..17 $0001 c64/pc/-
+     L15 2..7 $011c c64/memory/-
+     L15 12..17 $0001 c64/pc/-
+     L16 2..7 $011e c64/memory/-
+     L16 12..17 $0001 c64/pc/-
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ focus
+focus = auto (current flow: main)
+flow stack:
+  (main — no interrupt/trap frame active)
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ r pc=fce2
+set pc=$fce2
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ z
+$fce4  78        SEI (step, 2 cyc)
+   spans: 1
+     L0 0..5 $fce4 c64/pc/-
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ z
+$fce5  9a        TXS (step, 2 cyc)
+   spans: 1
+     L0 0..5 $fce5 c64/pc/-
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ n
+$fce6  d8        CLD (next, 2 cyc)
+   spans: 1
+     L0 0..5 $fce6 c64/pc/-
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ r
+  ADDR AC XR YR SP NV-BDIZC  flow
+.;fce6 00 ff 00 ff Nv-bdIzc  MAIN
+  port  $00=$2f $01=$37  LORAM=1 HIRAM=1 CHAREN=1
+  vectors  IRQ hw=$ff48  CINV $0314->$0000     NMI hw=$fe43  NMIV $0318->$0000
+   spans: 7
+     L1 2..6 $fce6 c64/pc/-
+     L3 18..23 $ff48 c64/target/-
+     L3 30..35 $0314 c64/memory/-
+     L3 37..42 $0000 c64/target/-
+     L3 54..59 $fe43 c64/target/-
+     L3 66..71 $0318 c64/memory/-
+     L3 73..78 $0000 c64/target/-
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ sd 4
+$fce6  d8        CLD
+$fce7  20 02 fd  JSR $fd02
+$fd02  a2 05     LDX #$05
+$fd04  bd 0f fd  LDA $fd0f,x
+-- sd: 4 steps, 4 distinct addrs -> .C:fd07
+   spans: 6
+     L0 0..5 $fce6 c64/pc/-
+     L1 0..5 $fce7 c64/pc/-
+     L1 21..26 $fd02 c64/target/-
+     L2 0..5 $fd02 c64/pc/-
+     L3 0..5 $fd04 c64/pc/-
+     L3 21..26 $fd0f c64/operand/-
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ io
+VIC-II:
+  d000  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  d010  00 00 00 00 00 00 c0 00 01 70 f0 00 00 00 00 00
+  d020  f0 f0 f0 f0 f0 f0 f0 f0 f0 f0 f0 f0 f0 f0 f0 ff
+  d030  ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+
+SID:
+  d400  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  d410  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+CIA1:
+  dc00  ff ff 00 00 ff ff ff ff 00 00 00 00 00 00 00 00
+
+CIA2:
+  dd00  ff 00 00 00 ff ff ff ff 00 00 00 00 00 00 00 00
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ io 1
+VIC-II:
+  d000  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  d010  00 00 00 00 00 00 c0 00 01 70 f0 00 00 00 00 00
+  d020  f0 f0 f0 f0 f0 f0 f0 f0 f0 f0 f0 f0 f0 f0 f0 ff
+  d030  ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+  No details available.
+
+SID:
+  d400  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  d410  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  No details available.
+
+CIA1:
+  dc00  ff ff 00 00 ff ff ff ff 00 00 00 00 00 00 00 00
+  No details available.
+
+CIA2:
+  dd00  ff 00 00 00 ff ff ff ff 00 00 00 00 00 00 00 00
+  No details available.
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ iec
+IEC BUS  (a released line is high; any device may pull it low)
+  line   bus     C64     drive 8
+  ATN    high    -   -      (ATN is C64-only)
+  CLK    high    -   -
+  DATA   high    -   -
+
+  cpu_bus=$ff  cpu_port=$ff  drv_bus[8]=$ff  drv_port=$85  drv_data[8]=$ff
+  C64  $DD00 = $ff (DDR $00)   bit7 DATA in=1 bit6 CLK in=1 bit3 ATN out=0
+  1541 $1800 = $1a (DDR $00)   bit7 ATN in=0 bit4 ATNA=1 bit3 CLK out=1 bit2 CLK in=0 bit1 DATA out=1 bit0 DATA in=0
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ map
+map: no trace store, and the delta ring is empty — run the machine first (or capture explicitly with `trace on` … `trace off`).
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ chis
+chis: no cpu history — the live ring is empty (run the machine) and no trace store exists (run `trace on`). `chis` reads the live cpuhistory ring first, then the captured trace.
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ whowrote d020 3
+whowrote $d020: no writer in the live delta ring (window not covered, or never written since the last reset). Older history lives only in a finalized trace.
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ nosuchverb
+unknown command: nosuchverb. Try 'help'.
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ 
+
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
