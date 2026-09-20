@@ -204,6 +204,20 @@ pub trait MonitorHost {
     /// host decides what follows. Default: nothing follows.
     fn on_effect(&mut self, _effect: MachineEffect) {}
 
+    /// A write the monitor just performed, and the bank lens it went through ("ram",
+    /// "io", "cpu", "rom", "cart"). The WRITE itself is the library's — it is the
+    /// machine's own memory, and both hosts have the same `trx64_core::Machine`. What
+    /// it MEANS is the host's.
+    ///
+    /// This is not `on_effect` with extra words. `on_effect` says what one COMMAND did
+    /// to the timeline and is fired once, before the verb runs, because Spec 808's
+    /// truncation has to happen before a `g` starts appending anchors. This fires per
+    /// write, after it, and carries the lens, because the daemon's bus-selection gate
+    /// latches `injected` and `io_injected` SEPARATELY — an `io` write means the VIC
+    /// must be ticking, a `ram` write does not. One flag for both, or a notification
+    /// without the lens, would silently drop a booted machine onto the isolated core.
+    fn on_machine_write(&mut self, _lens: &str) {}
+
     /// Replace the machine. The default does the machine-level reset; a host that
     /// implements this is the only thing that runs, because a host whose firmware owns
     /// the reset line cannot be told about it afterwards.

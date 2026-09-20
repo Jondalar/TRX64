@@ -29,6 +29,7 @@ pub mod assembler;
 pub mod host;
 pub mod observers;
 pub mod session;
+pub mod verbs;
 
 pub use session::MonitorSession;
 

@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{json, Value};
 
-use crate::observers::{ObsSpec, ObserverRegistry};
+use crate::observers::{ObsAction, ObsSpec, ObsTrigger, ObserverRegistry};
 
 /// Simple numbered breakpoint (debug/break_* methods, numeric IDs).
 pub struct BpEntry {
@@ -332,5 +332,169 @@ impl MonitorSession {
 impl Default for MonitorSession {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── the arming handshake (Spec 864 §3) ───────────────────────────────────────
+//
+// The registry is the run-time source of truth the core's debug gates consult; the
+// breakpoint lists and the DSL store are the CRUD surfaces the verbs edit. A host
+// re-syncs before an advance and writes the counts back after it, and because the sync
+// preserves live hit and ignore counts it may re-arm between several core runs without
+// losing them — the property §5.1 leans on.
+
+/// Whether the current bp surface needs the breakpoint/observer driver at all.
+pub fn observers_armed(reg: &ObserverRegistry) -> bool {
+    reg.exec_active || reg.access_armed()
+}
+
+/// Re-sync the [`ObserverRegistry`] from the session's breakpoint surfaces
+/// (`api_entries` string-ids + numbered `entries`) AND the persistent monitor-DSL
+/// observer store, preserving each observer's accumulated `hits` / remaining
+/// `ignore_left`. The registry is the run-time SOURCE OF TRUTH the core's debug
+/// gates consult; the bp lists + the DSL store are the wire-shape CRUD stores.
+/// After a run, [`writeback_hits`] copies the real hit counts back.
+pub fn sync_observers(
+    bp: &Breakpoints,
+    dsl: &[ObsSpec],
+    dsl_disabled: &HashSet<String>,
+    reg: &mut ObserverRegistry,
+) {
+    // Snapshot current live counts so a rebuild doesn't reset them.
+    let prior: HashMap<String, (u64, u64)> = reg
+        .list()
+        .iter()
+        .map(|o| (o.name.clone(), (o.hits, o.ignore_left)))
+        .collect();
+    reg.clear();
+    // String-id breakpoints (addPcBreakpoint / mem watchpoints).
+    for e in &bp.api_entries {
+        if !e.enabled {
+            continue;
+        }
+        let (trigger, lo, hi, cond_src) = parse_api_bp(e);
+        let action = if e.action == "log" {
+            ObsAction::Log
+        } else {
+            ObsAction::Break
+        };
+        let _ = reg.add(ObsSpec {
+            name: e.id.clone(),
+            trigger,
+            lo,
+            hi,
+            cond_src,
+            action,
+            log_exprs: None,
+            cmd_src: None,
+            mark_label: None,
+            trace_scope: None,
+        });
+        // Restore live counts (default: fresh hits=0, ignore_left=ignore_count).
+        let (hits, ignore_left) = prior
+            .get(&e.id)
+            .copied()
+            .unwrap_or((e.hit_count, e.ignore_count as u64));
+        reg.set_counts(&e.id, hits, ignore_left);
+    }
+    // Numbered exec breakpoints (debug/break_add).
+    for e in &bp.entries {
+        if !e.enabled {
+            continue;
+        }
+        let name = format!("bp#{}", e.num);
+        let _ = reg.add(ObsSpec {
+            name: name.clone(),
+            trigger: ObsTrigger::Exec,
+            lo: e.pc,
+            hi: e.pc,
+            cond_src: None,
+            action: ObsAction::Break,
+            log_exprs: None,
+            cmd_src: None,
+            mark_label: None,
+            trace_scope: None,
+        });
+        let (hits, ignore_left) = prior.get(&name).copied().unwrap_or((0, 0));
+        reg.set_counts(&name, hits, ignore_left);
+    }
+    // Spec 754 §3.3e — persistent monitor-DSL observers (`obs … when … do …`). They
+    // survive across runs (the c64re ensureObservers() registry), so re-apply a clone
+    // of each onto the freshly-cleared registry, preserving live hit/ignore counts.
+    // Registered AFTER the bp-derived ones; a same-name DSL observer replaces a
+    // bp-derived one (add() replaces by name — DSL is the explicit, richer spec).
+    for spec in dsl {
+        let name = spec.name.clone();
+        // A DSL observer turned `off` is not re-armed (the c64re Observer.enabled=false).
+        if dsl_disabled.contains(&name) {
+            continue;
+        }
+        let _ = reg.add(spec.clone());
+        // Default for a DSL observer: keep accumulated counts; the `ignore` verb sets
+        // ignore_left on the live registry, mirrored back below — but a fresh rebuild
+        // restores from `prior` so the count is not lost mid-session.
+        if let Some((hits, ignore_left)) = prior.get(&name).copied() {
+            reg.set_counts(&name, hits, ignore_left);
+        }
+    }
+}
+
+/// Decode an [`ApiBpEntry`] into an observer trigger/range/cond. The `action`
+/// field overloads as the watchpoint kind: "watch_read"/"watch_write"/"watch"
+/// arm load/store observers; an `action` of the form "cond:<expr>" carries a
+/// raw condition (the compact way to express a conditional bp over the
+/// existing wire). Default = an exec breakpoint at the single PC.
+pub fn parse_api_bp(e: &ApiBpEntry) -> (ObsTrigger, u16, u16, Option<String>) {
+    if let Some(expr) = e.action.strip_prefix("cond:") {
+        return (
+            ObsTrigger::Exec,
+            e.pc,
+            e.pc,
+            Some(expr.to_string()),
+        );
+    }
+    match e.action.as_str() {
+        "watch_read" | "load" => (ObsTrigger::Load, e.pc, e.pc, None),
+        "watch_write" | "store" => (ObsTrigger::Store, e.pc, e.pc, None),
+        "watch" => {
+            // A read+write watch can't be one observer (single trigger); model it as
+            // a store watch (the common debugging case). A separate load observer can
+            // be added with action "watch_read" if needed.
+            (ObsTrigger::Store, e.pc, e.pc, None)
+        }
+        _ => (ObsTrigger::Exec, e.pc, e.pc, None),
+    }
+}
+
+/// Copy the real hit counts back from the registry into the session's bp surface
+/// after a run, so `listBreakpoints` / `debug/break_list` report the true counts.
+pub fn writeback_hits(bp: &mut Breakpoints, reg: &ObserverRegistry) {
+    for e in bp.api_entries.iter_mut() {
+        if let Some(o) = reg.get(&e.id) {
+            e.hit_count = o.hits;
+        }
+    }
+}
+
+impl MonitorSession {
+    /// Rebuild the live registry from this session's breakpoint surfaces and DSL store,
+    /// preserving the accumulated counts. Call before an advance.
+    pub fn sync_observers(&mut self) {
+        sync_observers(
+            &self.breakpoints,
+            &self.dsl_observers,
+            &self.dsl_disabled,
+            &mut self.observers,
+        );
+    }
+
+    /// Whether the current surface needs the breakpoint/observer driver at all.
+    pub fn observers_armed(&self) -> bool {
+        observers_armed(&self.observers)
+    }
+
+    /// Copy the real hit counts back after an advance.
+    pub fn writeback_hits(&mut self) {
+        writeback_hits(&mut self.breakpoints, &self.observers);
     }
 }
