@@ -48,6 +48,12 @@ pub struct Breakpoints {
     pub api_entries: Vec<ApiBpEntry>,
 }
 
+impl Default for Breakpoints {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Breakpoints {
     pub fn new() -> Self {
         Self { next_num: 1, entries: Vec::new(), api_entries: Vec::new() }
@@ -109,6 +115,12 @@ pub struct MonitorState {
     /// handler forwards it on the reply so a modal `a`/`df -i` prompt reaches the wire
     /// exactly as TS's `runMonitorCommand` returns `{ output, prompt }`.
     pub pending_prompt: Option<String>,
+}
+
+impl Default for MonitorState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MonitorState {
@@ -201,6 +213,12 @@ pub struct FlowTracker {
     /// stepping.ts:147 — focus mode string (auto|main|irq|nmi|brk|none). The
     /// `flow` panel renders it verbatim; `focus` verb sets it. Default "auto".
     pub focus: String,
+}
+
+impl Default for FlowTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FlowTracker {

@@ -1730,14 +1730,14 @@ fn exec_owned(
                 }
                 observers::ObsAction::Cmd => {
                     // do cmd "<monitor command>" — quoted command run on each hit.
-                    match quoted_first(&cmd) {
+                    match quoted_first(cmd) {
                         Some(c) if !c.is_empty() => cmd_src = Some(c),
                         _ => return Err(r#"obs: cmd: usage: ... do cmd "<monitor command>""#.into()),
                     }
                 }
                 observers::ObsAction::Mark => {
                     // do mark ["label"] — default label = the observer name.
-                    mark_label = Some(quoted_first(&cmd).unwrap_or_else(|| name.clone()));
+                    mark_label = Some(quoted_first(cmd).unwrap_or_else(|| name.clone()));
                 }
                 observers::ObsAction::Trace => {
                     // do trace off | do trace [domains...] — bracket model.
@@ -2364,10 +2364,10 @@ fn exec_owned(
                      --reu / --georam.\n{}",
                     toks[0],
                     toks[0],
-                    reu_report(&host.machine())
+                    reu_report(host.machine())
                 ));
             }
-            Ok(reu_report(&host.machine()))
+            Ok(reu_report(host.machine()))
         }
 
         "uci" => {
@@ -2375,10 +2375,10 @@ fn exec_owned(
                 return Err(format!(
                     "uci: read-only — bare `uci` reports the block. The firmware side is an API a \
                      host maps onto CMD_IF_BASE, not a monitor verb.\n{}",
-                    uci_report(&host.machine())
+                    uci_report(host.machine())
                 ));
             }
-            Ok(uci_report(&host.machine()))
+            Ok(uci_report(host.machine()))
         }
 
         // Spec 863 — which C64 this is. Bare `model` reports it and lists the rows; `model
