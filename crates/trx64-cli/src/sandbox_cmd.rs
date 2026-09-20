@@ -355,29 +355,51 @@ pub fn run_sandbox_cli(
 }
 
 /// Counts retired instructions and records the set of addresses written during the
-/// run. Real writes only (not the 6502 dummy-write cycle), and $0000-$01ff excluded
-/// — the CPU port ($00/$01) and the stack page (jsr/rts + pushes, PHP/PHA) are
-/// machinery, not the routine's output. Depack output lands in main RAM ($0200+).
+/// run. Real writes only (not the 6502 dummy-write cycle) — **every** real write,
+/// including the zero page and the stack.
+///
+/// It used to exclude `$0000-$01ff`, on the reasoning that the CPU port and the stack
+/// churn of `jsr`/`rts` are machinery rather than the routine's output. The reasoning
+/// held for the stack and was wrong about the zero page, which is exactly where 6502
+/// code keeps its working state: an autonomous session watched a run execute
+/// `INC $011C` and `STY $2D` and then be told the run "stored nothing", and had to
+/// infer the truth by diffing two images from a second process — which cannot see a
+/// store that writes a byte's existing value back. A write set that stays silent is
+/// worse than one with known noise in it.
+///
+/// The harness's own writes do not appear here, and with the floor gone that has to be
+/// said by construction rather than by an address range. On the direct-entry path the
+/// sentinel is staged into RAM before the run, so the CPU never performs it. On the stub
+/// path it IS performed: the stub executes `sta $01` and a `jsr` whose push lands on
+/// `$01FE`/`$01FF`. So the observer ARMS when the PC first reaches `entry` — everything
+/// the harness does to get there is setup, everything from there on is the routine. What
+/// does appear from the stack page is the routine's own pushes, which are its writes.
 struct SandboxObs {
     steps: u64,
     write_lo: Option<u16>,
     write_hi: Option<u16>,
-    /// One bit per 16-bit address; true = the routine wrote there (>$01ff). Scanned
-    /// at the end into contiguous runs for the JSON write-map.
+    /// The routine's first address. Nothing is recorded until the PC reaches it.
+    entry: u16,
+    /// Set the first time a bus event carries `entry` as its PC.
+    armed: bool,
+    /// One bit per 16-bit address; true = the routine wrote there. Scanned at the end
+    /// into contiguous runs for the JSON write-map.
     written: Box<[bool]>,
 }
 
 impl SandboxObs {
-    fn new() -> Self {
+    fn new(entry: u16) -> Self {
         Self {
             steps: 0,
             write_lo: None,
             write_hi: None,
+            entry,
+            armed: false,
             written: vec![false; 0x1_0000].into_boxed_slice(),
         }
     }
 
-    /// Sorted contiguous runs of the written address set (>$01ff).
+    /// Sorted contiguous runs of the written address set.
     fn runs(&self) -> Vec<(u16, u16)> {
         let addrs: Vec<u16> = (0..0x1_0000usize)
             .filter(|&a| self.written[a])
@@ -404,8 +426,11 @@ impl Observer for SandboxObs {
     ) {
         self.steps += 1;
     }
-    fn on_bus(&mut self, kind: BusKind, addr: u16, _value: u8, _pc: u16, _clk: u64, _old: u8) {
-        if matches!(kind, BusKind::Write) && addr > 0x01ff {
+    fn on_bus(&mut self, kind: BusKind, addr: u16, _value: u8, pc: u16, _clk: u64, _old: u8) {
+        if pc == self.entry {
+            self.armed = true;
+        }
+        if self.armed && matches!(kind, BusKind::Write) {
             self.write_lo = Some(self.write_lo.map_or(addr, |lo| lo.min(addr)));
             self.write_hi = Some(self.write_hi.map_or(addr, |hi| hi.max(addr)));
             self.written[addr as usize] = true;
@@ -732,7 +757,7 @@ fn execute_sandbox(m: &mut Machine, args: &SandboxArgs) -> SandboxOutcome {
     }
 
     let clk0 = m.c64_core.clk;
-    let mut obs = SandboxObs::new();
+    let mut obs = SandboxObs::new(args.entry);
 
     // Drive the run loop, servicing stream-hooks between segments. The caps
     // (cyc_cap / instr_cap) are tracked cumulatively so many hook re-entries still
@@ -1031,6 +1056,64 @@ pub fn run_sandbox_batch(rom_dir: &Path, spec_path: &str, default_model: Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BUG-056 — the write map used to start at $0200, so the zero page and the stack
+    /// were invisible. A run that demonstrably executed `INC $011C` and `STY $2D` was
+    /// reported as having stored nothing, and the only way to see the truth was to diff
+    /// two images from a second process — which misses a store that writes a byte's
+    /// existing value back.
+    ///
+    /// The observer is the whole mechanism, so it is what this pins: a write anywhere is
+    /// a write, and the staged sentinel is not a write at all because the CPU never
+    /// performs it.
+    #[test]
+    fn the_write_map_records_the_zero_page_and_the_stack() {
+        let mut obs = SandboxObs::new(0x1000);
+        // STY $2D — the working state a depacker keeps in the zero page.
+        obs.on_bus(BusKind::Write, 0x002d, 0x11, 0x1000, 1, 0x00);
+        // INC $011C — read-modify-write inside the stack page.
+        obs.on_bus(BusKind::Write, 0x011c, 0x02, 0x1003, 2, 0x01);
+        // And the one the old floor was actually built for: main RAM.
+        obs.on_bus(BusKind::Write, 0x2000, 0xaa, 0x1006, 3, 0x00);
+
+        assert!(obs.written[0x002d], "a zero-page store is a store");
+        assert!(obs.written[0x011c], "a stack-page store is a store");
+        assert!(obs.written[0x2000]);
+        assert_eq!(obs.write_lo, Some(0x002d), "the span starts at the lowest real write");
+        assert_eq!(obs.write_hi, Some(0x2000));
+        assert_eq!(obs.runs(), vec![(0x002d, 0x002d), (0x011c, 0x011c), (0x2000, 0x2000)]);
+    }
+
+    /// The stub is not the routine. It executes `sta $01` to set banking and a `jsr`
+    /// whose push lands on the stack, and neither is the routine's output — which is why
+    /// the observer arms at `entry` instead of filtering by address. Before the floor
+    /// came out this was hidden behind it; now it has to be true by construction.
+    #[test]
+    fn the_harness_stubs_own_writes_are_not_the_routines() {
+        let mut obs = SandboxObs::new(0xc000);
+        // The stub, running at $0800: sta $01, then the jsr's return-address push.
+        obs.on_bus(BusKind::Write, 0x0001, 0x34, 0x0803, 1, 0x37);
+        obs.on_bus(BusKind::Write, 0x01ff, 0x08, 0x0805, 2, 0x00);
+        obs.on_bus(BusKind::Write, 0x01fe, 0x08, 0x0805, 3, 0x00);
+        assert!(obs.runs().is_empty(), "nothing the stub does is the routine's output");
+
+        // The routine starts: its own zero-page store counts from here on.
+        obs.on_bus(BusKind::Write, 0x00fb, 0x01, 0xc000, 4, 0x00);
+        // And its own deeper push does too — that IS the routine writing.
+        obs.on_bus(BusKind::Write, 0x01fd, 0xc0, 0xc003, 5, 0x00);
+        assert_eq!(obs.runs(), vec![(0x00fb, 0x00fb), (0x01fd, 0x01fd)]);
+    }
+
+    /// A read is not a write, and the 6502's dummy-write cycle is not the routine's
+    /// output either — both would turn the map into noise if they landed in it.
+    #[test]
+    fn only_real_writes_are_recorded() {
+        let mut obs = SandboxObs::new(0x1000);
+        obs.on_bus(BusKind::Read, 0x00fb, 0x00, 0x1000, 1, 0x00);
+        assert!(!obs.written[0x00fb], "a read must not appear in a write map");
+        assert_eq!(obs.write_lo, None);
+        assert!(obs.runs().is_empty());
+    }
 
     #[test]
     fn parse_load_with_and_without_addr() {
