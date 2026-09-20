@@ -167,9 +167,14 @@ pub trait MonitorHost {
 
     // ── devices ──────────────────────────────────────────────────────────────
 
-    /// A device's CPU view. The default answers the two devices every host has and
-    /// nothing else; a host adds its own by overriding.
-    fn cpu(&mut self, dev: Device) -> Option<&mut dyn CpuView>;
+    /// A device's CPU view. The default answers nothing: the verbs that have moved
+    /// reach the two 6502s through [`Self::machine`] and `machine().drive8`, exactly as
+    /// they did before the extraction, and a host adds a view when it has a CPU those
+    /// cannot reach — the second host's 32-bit firmware core is the case this exists
+    /// for.
+    fn cpu(&mut self, _dev: Device) -> Option<&mut dyn CpuView> {
+        None
+    }
 
     /// The devices `device` will accept, for the error message and for `help`.
     fn devices(&self) -> Vec<Device> {
@@ -178,14 +183,27 @@ pub trait MonitorHost {
 
     // ── running ──────────────────────────────────────────────────────────────
 
-    /// Resume. The default drives the machine, which is what a host that owns its own
-    /// run loop wants. A host whose machine is driven by something else returns
-    /// `Resumed` and calls [`Self::on_stop`] later.
-    fn resume(&mut self, until: RunUntil) -> Result<Resumption, String>;
+    /// Resume. A host that owns its own run loop drives the machine here; a host whose
+    /// machine is driven by something else returns `Resumed` and calls
+    /// [`Self::on_stop`] later.
+    ///
+    /// §3 wanted the DEFAULT to drive the machine. It cannot, and the reason is worth
+    /// writing down rather than discovering twice: the daemon's step is
+    /// `step_one_with_flow`, which classifies the step and pushes or pops a frame on
+    /// the FlowTracker — and the FlowTracker lives in `MonitorSession`, which is the
+    /// library's state, not the host's. A default here would either skip that (and the
+    /// `flow` panel would go quietly wrong) or need the session passed in, which is a
+    /// signature change nobody has earned yet. So the default is the same sentence
+    /// every absent service gets, and a host that runs a machine says so.
+    fn resume(&mut self, _until: RunUntil) -> Result<Resumption, String> {
+        Err(self.unavailable("run control"))
+    }
 
     /// Step `n` instructions, `over` skipping a JSR's body. Both hosts can do this
     /// synchronously: one instruction out of band moves no other clock.
-    fn step(&mut self, n: u64, over: bool) -> Result<StopInfo, String>;
+    fn step(&mut self, _n: u64, _over: bool) -> Result<StopInfo, String> {
+        Err(self.unavailable("run control"))
+    }
 
     /// Halt or release the machine. A host implements it with whatever stop it has; the
     /// second host routes it through the firmware so the firmware stays consistent with

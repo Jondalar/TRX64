@@ -2931,26 +2931,10 @@ impl trx64_monitor::MonitorHost for DaemonHost<'_> {
         &mut self.session.machine
     }
 
-    fn cpu(&mut self, _dev: trx64_monitor::Device) -> Option<&mut dyn trx64_monitor::CpuView> {
-        // The verbs that have moved reach the two CPUs through `machine()` and
-        // `machine().drive8`, exactly as they did in the daemon. `CpuView` is the second
-        // host's door and this host has not needed it yet; answering `None` is honest,
-        // and a wrong answer here would be invisible to the transcript.
-        None
-    }
-
-    fn resume(
-        &mut self,
-        _until: trx64_monitor::RunUntil,
-    ) -> Result<trx64_monitor::Resumption, String> {
-        // Run control has not moved (§5.1): `g`, `until`, `z`, `n` and `ret` are still
-        // the daemon's own arms, driving the machine exactly as before.
-        Err("run control has not moved into the library yet".into())
-    }
-
-    fn step(&mut self, _n: u64, _over: bool) -> Result<trx64_monitor::StopInfo, String> {
-        Err("run control has not moved into the library yet".into())
-    }
+    // `cpu`, `resume` and `step` take the trait's defaults on purpose. `g`, `until`,
+    // `z`, `n`, `ret` and `sf` are still the daemon's own arms and drive the machine
+    // exactly as they did, so nothing in the library asks this host to run anything;
+    // claiming otherwise here would be a promise no verb keeps.
 
     /// Spec 808 §3.4 — an intervention while rewound is what truncates the future.
     /// Watching is free (play/frame/goto move the machine but keep the anchors);
