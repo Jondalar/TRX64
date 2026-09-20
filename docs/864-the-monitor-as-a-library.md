@@ -1,6 +1,9 @@
 # Spec 864 — The monitor as a library: one implementation, two machines
 
-**Status:** PROPOSED (2026-09-20)
+**Status:** PARTLY BUILT (2026-09-20, v0.8.1) — the crate, the host trait and the verbs
+that need nothing but a machine are in; run control, reset and everything that needs a
+timeline, a file or a trace sink are still the daemon's, because moving them would have
+meant inventing a service rather than extracting one (§9.1).
 **Repos:** TRX64 (the crate, the trait, the daemon as its first host). C64RE: **no
 change** — `runtime_monitor` keeps talking to `monitor/exec`, and §9 shows why its wire
 contract is untouched.
