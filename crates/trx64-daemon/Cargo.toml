@@ -18,6 +18,8 @@ path = "src/main.rs"
 [dependencies]
 trx64-core = { path = "../trx64-core" }
 trx64-static = { path = "../trx64-static" }
+# Spec 864 — the monitor is a library now; the daemon is its first host.
+trx64-monitor = { path = "../trx64-monitor" }
 trx64-trace = { path = "../trx64-trace" }
 trx64-session = { path = "../trx64-session" }
 # Spec 802 — NATIVE trace read. The daemon reads `.c64retrace` + queries the

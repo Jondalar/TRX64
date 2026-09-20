@@ -32,7 +32,11 @@ use trx64_trace::{FrameSink, TraceChannels, TracingObserver};
 pub mod addr_spans;
 pub mod assembler;
 pub mod candidate;
-pub mod observers;
+/// Spec 864 — the observer registry lives in `trx64-monitor` now. It was always a
+/// `trx64-core` observer and nothing in it reached above core; the daemon keeps the
+/// short path it has used since Spec 754 so no call site had to be rewritten to say
+/// where the file moved to.
+pub use trx64_monitor::observers;
 pub mod project_knowledge;
 pub mod snapshot_diff;
 pub mod streaming;

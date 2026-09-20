@@ -25,6 +25,7 @@
 //! hosts genuinely disagree about, and the monitor never decides it.
 
 pub mod host;
+pub mod observers;
 
 pub use host::{
     CpuView, Device, FlagSpec, Files, MachineEffect, MonitorHost, Reg, ResetKind, Resumption,

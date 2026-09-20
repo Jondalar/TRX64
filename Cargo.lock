@@ -3276,6 +3276,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "trx64-core",
+ "trx64-monitor",
  "trx64-session",
  "trx64-static",
  "trx64-trace",
@@ -3293,6 +3294,16 @@ dependencies = [
  "tokio-tungstenite",
  "trx64-daemon",
  "uniffi",
+]
+
+[[package]]
+name = "trx64-monitor"
+version = "0.8.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "trx64-core",
+ "trx64-static",
 ]
 
 [[package]]
