@@ -85,9 +85,13 @@ pub trait MonitorHost {
     /// Resume, step, halt. The DEFAULTS drive the machine, which is what the
     /// daemon wants; a host whose machine is driven by something else overrides
     /// them (§5.1). The lib never advances a machine behind a host's back.
-    fn resume(&mut self, until: RunUntil) -> Result<StopInfo, String> { … }
+    fn resume(&mut self, until: RunUntil) -> Result<Resumption, String> { … }
     fn step(&mut self, n: u64, over: bool) -> Result<StopInfo, String> { … }
     fn set_halted(&mut self, halted: bool) -> Result<(), String> { … }
+
+    /// A stop that arrived outside a command (§5.1). Default: nothing — the
+    /// daemon broadcasts it, UE2 answers its next `status` with it.
+    fn on_stop(&mut self, stop: &StopInfo) {}
 
     /// What a verb did, AFTER it ran. Default: nothing.
     fn on_effect(&mut self, effect: Effect) {}
@@ -202,6 +206,37 @@ through `set_halted`. The defaults do what the daemon does today (`step_one_with
 the segment runner), so the daemon's behaviour is unchanged; UE2 overrides them and routes
 through the firmware's own `C64_STOP` path, which keeps the firmware consistent with the
 machine it is hosting.
+
+**A resume may answer before the stop happens.** This is the deepest difference between
+the two hosts and it shapes the reply, not just the call. The daemon drives the machine,
+so `g` can block and answer "stopped at $XXXX". UE2 does not drive it — the firmware's
+clock does, and the C64 catches up in batches inside somebody else's advance. So there:
+
+```rust
+enum Resumption { Stopped(StopInfo), Resumed { until: RunUntil } }
+fn resume(&mut self, until: RunUntil) -> Result<Resumption, String>;
+```
+
+The daemon returns `Stopped` as it does today. UE2 returns `Resumed` at once and the
+breakpoint fires in a later advance, possibly milliseconds of firmware time later, so the
+lib must be able to print "running until …" — which is the real requirement on `RunUntil`:
+it has to be re-statable as a line a human reads, not merely matchable.
+
+**A stop may therefore arrive outside a command.** The host calls `after_advance` from
+wherever the halt actually happened, and the lib holds a `StopInfo` nobody asked for. It
+keeps it as the last stop in `MonitorState` and hands it to the host through `on_stop`,
+and the host decides where it surfaces: the daemon broadcasts it on its `NotifyHub`
+(streaming.rs:172), UE2 puts it on the control connection and answers the next `status`
+with it. The lib neither blocks nor invents a channel of its own.
+
+`step`, `z` and `n` keep the blocking shape on both hosts — one instruction with
+`max_instructions = 1`, out of band; the firmware's clock does not move and the C64 simply
+consumes a little of the lag it carries.
+
+UE2 also notes the consequence that is theirs rather than this spec's: a halted C64 under
+a running firmware is a state the real device never holds for long — the firmware polls
+the C64, serves the UCI and drives the drives, and will time things out. Bounding that
+halt is the UE2 host's business, and it is right that it is not the library's.
 
 **One arm, one-to-many core runs.** UE2's `run_cpu` is a loop, not a call: cartridge hints
 split a run, and since their UCI fix they deliberately halt mid-catch-up on a write to the
@@ -332,11 +367,15 @@ memory half again, which is precisely the drift this spec exists to prevent.
     the machine's cycle count being unchanged after a refused resume. A host that arms
     once and performs three core runs before `after_advance()` keeps its hit and ignore
     counts across all three.
-11. **Identity is per reply.** Two replies across a clock change report the two different
+11. **An asynchronous stop.** The in-test host returns `Resumed` from `resume` and calls
+    `after_advance` later, from outside any command: the lib prints "running until …" for
+    the resume, holds the stop when it arrives, hands it to `on_stop`, and the next
+    `status` states it. Nothing blocks and nothing is lost.
+12. **Identity is per reply.** Two replies across a clock change report the two different
     clocks. (On the daemon: a model switch at a frame boundary, Spec 863.)
-12. The existing gates stay green: the daemon suite, the core suites, the 7-game
+13. The existing gates stay green: the daemon suite, the core suites, the 7-game
     screenshots byte-identical.
-13. **UE2 runs the port audit over its bridge host** in its own `cargo test`. Drift shows
+14. **UE2 runs the port audit over its bridge host** in its own `cargo test`. Drift shows
     up on their side, in their CI, without me watching.
 
 ## §12 Open
@@ -350,8 +389,10 @@ What is still open:
 - The `Reg` and `FlagSpec` shapes — how much the lib formats and how much the view hands
   it pre-rendered. The rule is "the view decides its register list"; the boundary between
   a value and its presentation still needs drawing.
-- Whether `RunUntil` and `StopInfo` are rich enough for a host that halts mid-catch-up and
-  resumes, or whether they need a host-opaque resume token.
+- ~~a host-opaque resume token~~ — answered: no token. Everything needed to continue is
+  already in the machine and the loop state is derived, so a token would only be a second
+  place for two hosts to disagree. What was needed instead is a resume that may answer
+  before the stop (§5.1).
 - The daemon's own `resume`/`step` defaults must reproduce `step_one_with_flow` exactly,
   including what the flow tracker records. That is an extraction detail, but it is the one
   most likely to change behaviour invisibly, so it gets its own line in the golden
