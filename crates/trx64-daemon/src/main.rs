@@ -60,7 +60,8 @@ use trx64_monitor::session::{
 use trx64_monitor::verbs::{
     asm_prompt, assemble_at, classify_cf, format_trap_rule_emit, format_triage_lines,
     glob_full_match, mapper_type_str, monitor_help_text, monitor_read, monitor_write,
-    obs_do_desc, parse_hex, parse_trap_rules, quoted_first, sc_to_ascii, CfInfo, CfKind,
+    obs_do_desc, parse_hex, parse_trap_rules, quoted_first, reu_report, sc_to_ascii,
+    uci_report, CfInfo, CfKind,
 };
 pub mod project_knowledge;
 pub mod snapshot_diff;
@@ -2830,72 +2831,6 @@ fn land_line(line: &str, tag: &str, cyc: u64, flow: FlowKind, why: StopWhy) -> S
 }
 
 
-/// Spec 853 D11 — the monitor's `reu` report. Without it a stalled transfer is a black
-/// box, which is the complaint 852 D6 answered for UCI.
-fn reu_report(m: &trx64_core::Machine) -> String {
-    let yn = |b: bool| if b { "yes" } else { "no" };
-    if let Some(s) = m.reu().map(|r| r.status()) {
-        let kind = match s.status & 0x10 {
-            0 => "1700-class (64K chips)",
-            _ => "1764/1750-class (256K chips)",
-        };
-        let ttype = match s.command & 0x03 {
-            0 => "stash (C64 -> REU)",
-            1 => "fetch (REU -> C64)",
-            2 => "swap",
-            _ => "verify",
-        };
-        let mut out = format!(
-            "reu: {} KiB, {kind}\n  status   ${:02X}  verify-error {}  end-of-block {}  irq-pending {}\n",
-            s.size_kb,
-            s.status,
-            yn(s.status & 0x20 != 0),
-            yn(s.status & 0x40 != 0),
-            yn(s.status & 0x80 != 0),
-        );
-        out.push_str(&format!(
-            "  command  ${:02X}  {ttype}  autoload {}  $FF00-trigger {}\n",
-            s.command,
-            yn(s.command & 0x20 != 0),
-            if s.command & 0x10 != 0 { "disabled" } else { "enabled" },
-        ));
-        out.push_str(&format!(
-            "  C64 ${:04X}  REU ${:02X}:{:04X}  length ${:04X}\n",
-            s.base_computer, s.bank_reu, s.base_reu, s.transfer_length
-        ));
-        out.push_str(&format!(
-            "  int-mask ${:02X}  addr-control ${:02X}  IRQ line {}\n",
-            s.int_mask, s.address_control, yn(s.irq)
-        ));
-        out.push_str(&format!(
-            "  armed for $FF00 {}  transfer pending {}\n",
-            yn(s.armed_for_ff00),
-            yn(s.dma_pending)
-        ));
-        if m.expansion_ram_uncovered() {
-            out.push_str(
-                "  NOTE the last restore did NOT cover the REU RAM (Spec 853 D7): the ring\n                 \x20      carries the registers, never the 16 MB. The C64 is restored, this is not.\n",
-            );
-        }
-        return out;
-    }
-    if let Some(g) = m.georam().map(|x| x.status()) {
-        let mut out = format!(
-            "georam: {} KiB, bank {} window {} -> ${:06X}\n  window at $DE00-$DEFF; the two registers at $DFFE/$DFFF are WRITE ONLY\n",
-            g.size_kb,
-            g.bank,
-            g.window,
-            g.bank as u32 * 16384 + g.window as u32 * 256
-        );
-        if m.expansion_ram_uncovered() {
-            out.push_str("  NOTE the last restore did NOT cover the GeoRAM RAM (Spec 853 D7).\n");
-        }
-        return out;
-    }
-    "reu: nothing on the expansion port. Start the daemon with --reu 512 (or --georam 512); \
-     an empty port reads the open bus, not RAM (Spec 840)."
-        .to_string()
-}
 
 /// Spec 853 D11 — `session/reu`, the same facts as data.
 fn reu_status_json(m: &trx64_core::Machine) -> Value {
@@ -2931,72 +2866,6 @@ fn reu_status_json(m: &trx64_core::Machine) -> Value {
     json!({ "present": false, "note": "nothing on the expansion port (Spec 853)" })
 }
 
-/// Spec 852 D6 — the monitor's `uci` report.
-fn uci_report(m: &trx64_core::Machine) -> String {
-    let Some(s) = m.uci_status() else {
-        return format!(
-            "uci: machine={} — no command interface: the UCI block is part of the u64 profile \
-             (Spec 852). `turbo mode u64`, or start the daemon with --machine u64.",
-            m.speed_profile().name()
-        );
-    };
-    let yn = |b: bool| if b { "yes" } else { "no" };
-    let state = match s.state {
-        0 => "00 idle",
-        1 => "01 busy (the firmware has the command)",
-        2 => "10 data, last",
-        _ => "11 data, more to come",
-    };
-    let mut out = if s.enabled {
-        format!(
-            "uci: machine=u64  block=ENABLED  window=${:04X}-${:04X} (control ${:04X})",
-            s.window,
-            s.window + 7,
-            s.window + 4
-        )
-    } else {
-        "uci: machine=u64  block=disabled — the window reads open bus (the firmware's power-on \
-         default; without a firmware nothing enables it)"
-            .to_string()
-    };
-    out.push_str(&format!(
-        "\n  slot base=${:02X}  routed io1={} io2={}  bus id=${:02X}",
-        s.slot_base,
-        yn(s.routed_io1),
-        yn(s.routed_io2),
-        s.bus_id
-    ));
-    out.push_str(&format!(
-        "\n  state={state}  control=${:02X}  response valid={}  status valid={}  error={}  \
-         abort={}  data accepted={}  new command={}",
-        s.status_byte,
-        yn(s.response_valid),
-        yn(s.status_valid),
-        yn(s.error),
-        yn(s.abort),
-        yn(s.data_accepted),
-        yn(s.new_command)
-    ));
-    out.push_str(&format!(
-        "\n  command length={}  response ptr=${:03X} len={}  status ptr=${:03X} len={}",
-        s.command_length, s.response_pointer, s.response_length, s.status_pointer, s.status_length
-    ));
-    out.push_str(&format!(
-        "\n  lines: irq={} (command irq enable={})  freeze={}  trigger={}  firmware irq={} (mask %{:03b})",
-        yn(s.irq),
-        yn(s.cmd_irq_en),
-        yn(s.freeze),
-        yn(s.trigger),
-        yn(s.firmware_irq),
-        s.irq_mask
-    ));
-    out.push_str(&format!(
-        "\n  events not taken by a firmware: c64_reset={} unlock={}",
-        yn(s.pending.c64_reset),
-        yn(s.pending.unlock)
-    ));
-    out
-}
 
 /// Spec 852 D6 — `session/uci`.
 fn uci_status_json(m: &trx64_core::Machine) -> Value {
@@ -3050,6 +2919,11 @@ fn uci_status_json(m: &trx64_core::Machine) -> Value {
 /// a host method answering nothing would be a claim this host does not support.
 pub(crate) struct DaemonHost<'a> {
     pub(crate) session: &'a mut Session,
+    /// Spec 808's timeline, which is what an intervention consequences land on.
+    pub(crate) transport: &'a mut transport::Transport,
+    pub(crate) checkpoint_ring: &'a mut trx64_core::checkpoint_ring::RuntimeCheckpointRing,
+    pub(crate) audio_epoch: &'a mut u64,
+    pub(crate) autocapture_frames_since: &'a mut u64,
 }
 
 impl trx64_monitor::MonitorHost for DaemonHost<'_> {
@@ -3078,6 +2952,30 @@ impl trx64_monitor::MonitorHost for DaemonHost<'_> {
         Err("run control has not moved into the library yet".into())
     }
 
+    /// Spec 808 §3.4 — an intervention while rewound is what truncates the future.
+    /// Watching is free (play/frame/goto move the machine but keep the anchors);
+    /// changing it is not. A reset replaces the machine outright, so its anchors
+    /// describe something that no longer exists and go entirely.
+    ///
+    /// This fires BEFORE the verb runs, which is not decoration: `g` is a mutator and
+    /// it appends anchors while it runs, so a truncation afterwards would cut the very
+    /// anchors the command just made.
+    fn on_effect(&mut self, effect: trx64_monitor::MachineEffect) {
+        match effect {
+            trx64_monitor::MachineEffect::Observes => {}
+            trx64_monitor::MachineEffect::Mutates => {
+                timeline_truncate(self.checkpoint_ring, self.transport)
+            }
+            trx64_monitor::MachineEffect::Replaces => timeline_discard(
+                self.audio_epoch,
+                self.checkpoint_ring,
+                self.transport,
+                self.autocapture_frames_since,
+                "reset",
+            ),
+        }
+    }
+
     /// Spec 723's bus-selection gate reads these two latches, and it reads them
     /// SEPARATELY: an `io` write means the VIC has to be ticking, a plain `ram` write
     /// does not. That is why the lens comes with the notification.
@@ -3103,38 +3001,32 @@ fn run_monitor(st: &mut State, command: &str) -> Result<String, String> {
 /// The monitor with its addresses MARKED (Spec 804). Callers other than `monitor/exec`
 /// use [`run_monitor`].
 fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
-    // Spec 808 §3.4 — an intervention while rewound is what truncates the future.
-    // WATCHING is free (play/frame/goto move the machine but keep the anchors); CHANGING
-    // it is not. These are the monitor verbs that change machine state, so this is where
-    // the one timeline gets cut, and `transport_truncate_on_intervention` records how
-    // many anchors went so the CUT mode can report a number rather than a shrug.
+    // Spec 864 — the library sees the line first. It classifies what the command does
+    // to the machine and its timeline (§4), which is where Spec 808's truncation now
+    // comes from, and it owns the prompt, the assemble mode and the selected device,
+    // because that is what makes the monitor modal. Then it answers every verb that has
+    // moved into it; `None` = not one of its verbs, and the dispatch below takes it.
     {
-        let verb = command.trim().split_whitespace().next().unwrap_or("").to_ascii_lowercase();
-        // A reset REPLACES the machine — the anchors are about a machine that no longer
-        // exists, so they go entirely (see `transport_discard_timeline`). Everything else
-        // here merely diverges from a rewound position and truncates the future.
-        if verb == "reset" {
-            transport_discard_timeline(st, "reset");
-        }
-        const MUTATORS: [&str; 11] = [
-            "wr", "a", "f", "c", "t", "r", "g", "x", "step", "n", "next",
-        ];
-        if MUTATORS.contains(&verb.as_str()) {
-            // `r` with no argument only READS the registers; only `r <reg>=<v>` writes.
-            let writes = verb != "r" || command.contains('=');
-            if writes {
-                transport_truncate_on_intervention(st);
-            }
-        }
-    }
-
-    // Spec 864 — the library sees the line first. It owns the prompt, the assemble
-    // mode and the selected device, because that is what makes the monitor modal, and
-    // it answers every verb that has moved into it. `None` = not one of its verbs; the
-    // daemon's own dispatch below takes it.
-    {
-        let State { session, mon, .. } = &mut *st;
-        let mut host = DaemonHost { session };
+        let State {
+            session,
+            mon,
+            transport,
+            checkpoint_ring,
+            audio_epoch,
+            autocapture_frames_since,
+            ..
+        } = &mut *st;
+        let mut host = DaemonHost {
+            session,
+            transport,
+            checkpoint_ring,
+            audio_epoch,
+            autocapture_frames_since,
+        };
+        trx64_monitor::MonitorHost::on_effect(
+            &mut host,
+            trx64_monitor::verbs::classify(command),
+        );
         if let Some(r) = trx64_monitor::verbs::try_exec(mon, &mut host, command) {
             return r;
         }
@@ -3223,6 +3115,13 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
     };
 
     match op.as_str() {
+        // ---- Flow disassembly (Spec 754 §3.3k / audit ws-trace-monitor-misc-5) ----
+        // sd [n] — DYNAMIC: step n instructions from PC, render the REAL executed
+        // path (each touched address ONCE, loops folded to body + ×count), footer
+        // `-- sd: N steps, K distinct addrs -> .C:<land>`. 1:1 with monitor-flow-
+        // disasm.ts stepDisasm. Non-destructive: capture a machine checkpoint, step,
+        // render, then restore (the live shared session must not advance). Reuses the
+        // EXISTING step_one_instruction + disasm renderer (disasm_line_ts).
         "sd" => {
             let n = toks
                 .get(1)
@@ -3293,114 +3192,13 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             }
             Ok(lines.join("\n"))
         }
-        // df [-i] [addr] [n] — STATIC control-flow walk (addr-first, like `d`;
-        // default from the disasm cursor / PC). Follows JMP, descends JSR + returns
-        // on RTS, follows an indirect JMP, loop-guarded. Conditional branch defaults
-        // to fall-through + annotates the taken target. 1:1 with monitor-flow-disasm.ts
-        // followDisasm (the non-interactive walk; -i interactive resolution is the
-        // UI-prompt path and not exercised by the gate, so the walk runs to its limit).
-        "df" => {
-            let mut i = 1usize;
-            // `-i` is NOT implemented here. It used to be accepted and skipped, so the
-            // walk ran to its limit while the caller waited for a `branch t/f/b>` prompt
-            // that would never come — and a follow-up bare `t`/`f`/`b` then landed in the
-            // unrelated move/fill/break verbs. Say so instead of pretending.
-            //
-            // It is buildable: the modal channel exists (`pending_prompt` + the assemble
-            // cursor). It is a feature, not a port fix, so it is not smuggled in here.
-            if toks.get(i).map(|s| s.as_str()) == Some("-i") {
-                return Err(
-                    "df: -i (interactive branch walk) is not implemented — plain `df` walks \
-                     fall-through to its limit"
-                        .into(),
-                );
-            }
-            let default_addr = st.mon.state.disasm_cursor.unwrap_or(st.session.machine.cpu6510.reg_pc);
-            let addr = parse_addr(toks.get(i)).map(|a| {
-                i += 1;
-                a
-            });
-            let addr = addr.unwrap_or(default_addr);
-            let n = toks
-                .get(i)
-                .and_then(|t| t.parse::<i64>().ok())
-                .unwrap_or(200)
-                .clamp(1, 100_000) as usize;
-            let read = |a: u16| st.session.machine.peek_lens(a, "cpu");
-            let indent = |depth: usize| -> String { "  ".repeat(depth.min(8)) };
-            let mut lines: Vec<String> = Vec::new();
-            let mut a = addr & 0xffff;
-            let mut stack: Vec<u16> = Vec::new();
-            let mut visited: std::collections::HashSet<u16> = std::collections::HashSet::new();
-            let mut remaining = n;
-            while remaining > 0 {
-                if visited.contains(&a) {
-                    lines.push(format!("{}  | back to ${:04x} (loop)", indent(stack.len()), a));
-                    break;
-                }
-                visited.insert(a);
-                let cf = classify_cf(read, a);
-                let (_, line) = addr_spans::disasm_line(read, a, SpanSpace::C64);
-                lines.push(format!("{}{}", indent(stack.len()), line));
-                remaining -= 1;
-                match cf.kind {
-                    CfKind::Jmp => {
-                        a = cf.target.unwrap();
-                    }
-                    CfKind::JmpInd => {
-                        let p = cf.target.unwrap();
-                        let t = (read(p) as u16) | ((read(p.wrapping_add(1)) as u16) << 8);
-                        lines.push(format!("{}  -> (${:04x}) = ${:04x}", indent(stack.len()), p, t));
-                        a = t;
-                    }
-                    CfKind::Jsr => {
-                        stack.push(a.wrapping_add(cf.size));
-                        a = cf.target.unwrap();
-                    }
-                    CfKind::Rts | CfKind::Rti => {
-                        if let Some(ret) = stack.pop() {
-                            a = ret;
-                        } else {
-                            let kind = if matches!(cf.kind, CfKind::Rts) { "rts" } else { "rti" };
-                            lines.push(format!(
-                                "{}  (end — {kind}, call stack empty)",
-                                indent(stack.len())
-                            ));
-                            break;
-                        }
-                    }
-                    CfKind::Brk => {
-                        lines.push(format!("{}  (end — BRK)", indent(stack.len())));
-                        break;
-                    }
-                    CfKind::Branch => {
-                        let fall = a.wrapping_add(cf.size);
-                        // non-interactive default: fall-through + annotate the taken target.
-                        lines.push(format!(
-                            "{}  ; taken -> ${:04x}",
-                            indent(stack.len()),
-                            cf.target.unwrap()
-                        ));
-                        a = fall;
-                    }
-                    CfKind::Normal => {
-                        a = a.wrapping_add(cf.size);
-                    }
-                }
-            }
-            if remaining == 0 {
-                lines.push("-- df: reached step limit".to_string());
-            }
-            st.mon.state.disasm_cursor = Some(a);
-            Ok(lines.join("\n"))
-        }
-
-        // ---- screen — decode the 40x25 text screen (audit ws-trace-monitor-misc-10).
-        // Reads the LIVE screen pointer: VIC bank from CIA2 $DD00 (PA bits 0..1 are
-        // inverted) + the $D018 matrix nibble. Then decodes the 40×25 screen-RAM matrix
-        // (screen-code → ASCII) into a `|<40 chars>|` grid. 1:1 with monitor-shell.ts
-        // :731-742 (base computation, scToAscii, header, grid). $DD00/$D018 are read
-        // via the io lens; the matrix is read from RAM (the VIC reads RAM directly).
+        // ---- bitmap <addr> [w] [h] [hires|charset|sprite] — render a RAM range
+        // as an image (§3.3b, folds the Scrub tab). 1:1 with monitor-shell.ts:745-
+        // 767: the text console can't inline it, so it writes a PNG artifact +
+        // returns the path. w/h are DECIMAL counts (cells/rows/sprites per mode);
+        // addr is hex. (multicolor = v1.1.) The help advertised it but run_monitor
+        // had NO arm → `unknown command: bitmap` (the help LIED). charset/sprite
+        // are MODES of this verb (matching TS), not standalone verbs.
         "bitmap" | "bm" => {
             let addr = match parse_addr(toks.get(1)) {
                 Some(a) => a,
@@ -3442,7 +3240,12 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             ))
         }
 
-        // ---- f <start> <end> <data..> — fill the range, repeating the data. --
+        // ---- Go / resume (§3.1). g [addr] / x ; enters the run-loop. ---------
+        // TRX64 daemon is request/response with no autonomous loop. `g` mirrors
+        // the TS BUG-036 contract shape: set PC (if given), step past a parked
+        // breakpoint, mark running, and report ".C:PC (running — Pause to halt)".
+        // The actual advance happens on the next debug/run (the run-loop), exactly
+        // like TS where `ctrl.continue()` flips run-state and the tick loop runs.
         "g" | "x" => {
             if op == "g" {
                 if let Some(addr) = parse_addr(toks.get(1)) {
@@ -3653,15 +3456,16 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             Ok(land_line(&line, "return", last_cyc, st.mon.flow.current_flow(), why))
         }
 
-        // ---- flow / bt — Spec 754 §3.3h capability panels (audit misc-13). ----
-        // Both report LIVE machine state, not a constant. `flow` now renders the
-        // per-session FlowTracker (the interrupt/trap frame STACK, mutated per
-        // single-step by the z/n/ret handlers) — 1:1 with monitor-shell.ts:1103-1117
-        // (← FlowTracker.flowState(), stepping.ts:174-190). After a `z`-step accepts a
-        // hardware IRQ the panel reports current=irq + a frame line, then pops to main
-        // on the RTI. `bt` scans the ACTUAL 6502 stack page for JSR return-address
-        // candidates (buildBacktrace, backtrace.ts:23-40), so it too reflects the
-        // live SP + stack contents.
+        // ---- tracedb — run a STORED trace definition (monitor-shell.ts:445-470) ------
+        //
+        // `trace on` captures everything; `tracedb start "<id>"` runs a definition that
+        // was put into the registry (trace/definition/put) and records which one, so the
+        // resulting store says what it was capturing and why. The registry was ported;
+        // only the verb in front of it was missing.
+        //
+        // start/stop/status DELEGATE to the `trace` verb rather than repeating its ~60
+        // lines of store setup — two copies of that would drift, and drift is what this
+        // whole exercise is about.
         "tracedb" => {
             let sub = toks.get(1).map(|s| s.to_ascii_lowercase()).unwrap_or_default();
             match sub.as_str() {
@@ -3719,12 +3523,8 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             }
         }
 
-        // ---- io [1 | <addr>] — the I/O register map (monitor-shell.ts:375-411) -------
-        //
-        // One screen with every chip's registers side by side, which is what you want
-        // when the question is "what is the machine set to right now" rather than "what
-        // is at this address". Reads through the io lens, so it shows the register file
-        // even when the PLA currently banks I/O out.
+        // `sf`/`stepf` — step into, but keep stepping until we are back in the target
+        // flow. `nf`/`nextf` — the same, stepping OVER calls on the way.
         "sf" | "stepf" | "nf" | "nextf" => {
             st.session.running = false;
             let over = matches!(op.as_str(), "nf" | "nextf");
@@ -3781,6 +3581,11 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             let tag = format!("{}:{}", if over { "nextf" } else { "stepf" }, want.tag());
             Ok(land_line(&line, &tag, cyc, st.mon.flow.current_flow(), why))
         }
+        // reverse-debug Phase 1b — `rstep`/`reverse [n]`: UNDO the last n instructions
+        // from the always-on full-delta ring (default 1). Restores CPU + RAM +
+        // IO-register BYTES, NOT chip internal counters → INSPECT-backward only (to
+        // resume forward, restore a checkpoint anchor). Reports the landed PC/regs +
+        // the writes rolled back.
         "rstep" | "reverse" => {
             let n: usize = toks
                 .get(1)
@@ -3818,72 +3623,11 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             }
         }
 
-        // reverse-debug Phase 1b — `whowrote <addr>`: the stack-crash shortcut. Scan
-        // the always-on delta ring's writes BACKWARD for the last writer(s) of <addr>
-        // → the instruction PC + cycle + old→new bytes, newest first.
-        "whowrote" => {
-            let addr = match parse_addr(toks.get(1)) {
-                Some(a) => a,
-                None => return Err("whowrote: need an address, e.g. `whowrote 01f5`".into()),
-            };
-            let limit = toks
-                .get(2)
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(8)
-                .clamp(1, 64);
-            let hits = st.session.machine.who_wrote(addr, limit);
-            // TRX64 feature-request #3 — typed ring-exhaustion signal: a miss against a
-            // WRAPPED ring means "window too short" (the writer may be older than the
-            // ring), distinct from "never written / wrong address".
-            let exhaustion = st.session.machine.ring_exhaustion(!hits.is_empty());
-            if hits.is_empty() {
-                let mut lines = vec![format!(
-                    "whowrote ${addr:04x}: no writer in the live delta ring (window not covered, or never written since the last reset). Older history lives only in a finalized trace."
-                )];
-                if exhaustion.ring_exhausted {
-                    lines.push(format!(
-                        "ring_exhausted: true   revdepth={}s   hint: {}",
-                        exhaustion.revdepth_seconds, exhaustion.hint
-                    ));
-                }
-                return Ok(lines.join("\n"));
-            }
-            let mut lines = vec![format!(
-                "whowrote {}: {} writer(s) in the live ring (newest first):",
-                addr_spans::addr4(addr, SpanSpace::C64, SpanRole::Memory),
-                hits.len()
-            )];
-            for h in &hits {
-                // TRX64 feature-request #2 — append the CALLER CHAIN (top return-stack
-                // frames the writing instruction saw) so a write by a SHARED primitive is
-                // attributed to its call site, not just the leaf PC. `depth == 0` ⇒ none
-                // captured (an interrupt/early-boot write with an empty/unreadable stack).
-                let chain = h.caller_chain;
-                let mut line = format!(
-                    "  {} <- written by {} @ cyc {}  (${:02x} -> ${:02x})",
-                    addr_spans::addr4(h.addr, SpanSpace::C64, SpanRole::Memory),
-                    addr_spans::addr4(h.pc, SpanSpace::C64, SpanRole::Pc),
-                    h.cycle, h.old_value, h.new_value
-                );
-                if chain.depth > 0 {
-                    let frames: Vec<String> = chain.frames[..chain.depth as usize]
-                        .iter()
-                        .map(|f| addr_spans::addr4(*f, SpanSpace::C64, SpanRole::Pc))
-                        .collect();
-                    line.push_str(&format!("   caller chain: {}", frames.join(" -> ")));
-                }
-                lines.push(line);
-            }
-            Ok(lines.join("\n"))
-        }
-
-        // reverse-debug Phase 2 — `triage [pc]`: re-run the guided crash-triage on
-        // demand. Reads the always-on CPU-history + delta rings to reconstruct the
-        // causal chain (crash → wild control transfer → stack corruptor). With no arg it
-        // triages the LIVE (crashed) PC — the same chain the JAM drop-in auto-printed;
-        // pass a hex PC to triage a specific wild address. PRAGMATIC + HONEST: each step
-        // is confidence-tagged and a non-stack-pop transfer is reported without inventing
-        // a stack corruptor.
+        // TRX64 feature-request #4 — `traprules <path>` loads project-supplied on-trap
+        // dump rules from a JSON file; `traprules` (no arg) lists the loaded rules;
+        // `traprules clear` drops them. On reaching/halting at a rule's PC (JAM /
+        // breakpoint), the debugger auto-emits `label: name=$XX (decode)` reading the
+        // project-named diagnostic bytes — NO built-in engine knowledge in the core.
         "traprules" => {
             match toks.get(1).map(|s| s.as_str()) {
                 None => {
@@ -4099,37 +3843,6 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 kind.as_str(),
                 bytes.len()
             ))
-        }
-
-        // Spec 852 D6 — the Ultimate Command Interface, read-only. Without it a program
-        // hung in a UCI handshake is a black box. The firmware side is an API
-        // (`Uci::fw_read`/`fw_write`), not a verb: a monitor that could validate a
-        // command would be a firmware, and none exists here.
-        // Spec 853 D11 — the REU/GeoRAM as a report. Read-only for the same reason `uci`
-        // is: a verb that silently changes the device when you meant to look gets used
-        // wrong once and distrusted after (815 §4).
-        "reu" | "georam" => {
-            if toks.len() > 1 {
-                return Err(format!(
-                    "{}: read-only — bare `{}` reports the device. Attach one at startup with \
-                     --reu / --georam.\n{}",
-                    toks[0],
-                    toks[0],
-                    reu_report(&st.session.machine)
-                ));
-            }
-            Ok(reu_report(&st.session.machine))
-        }
-
-        "uci" => {
-            if toks.len() > 1 {
-                return Err(format!(
-                    "uci: read-only — bare `uci` reports the block. The firmware side is an API a \
-                     host maps onto CMD_IF_BASE, not a monitor verb.\n{}",
-                    uci_report(&st.session.machine)
-                ));
-            }
-            Ok(uci_report(&st.session.machine))
         }
 
         // Spec 863 — which C64 this is. Bare `model` reports it and lists the rows; `model
@@ -4449,37 +4162,6 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                         out.push("  every frame: this is the per-frame checkpoint the reverse-playback work needs".into());
                     }
                     Ok(out.join("\n"))
-                }
-            }
-        }
-
-        "revdepth" => {
-            let mb = |bytes: u64| (bytes as f64) / (1024.0 * 1024.0);
-            match toks.get(1).and_then(|s| s.trim_start_matches('$').parse::<u64>().ok()) {
-                None => {
-                    let info = st.session.machine.reverse_depth_info();
-                    Ok(format!(
-                        "revdepth: {}s (~{:.1} MB) — delta {} entries / {} writes, cpuhistory {} entries\n  (pass a number to rebuild, e.g. `revdepth 30`)",
-                        info.seconds, mb(info.ram_bytes),
-                        info.delta_entry_capacity, info.delta_write_capacity, info.cpu_history_capacity,
-                    ))
-                }
-                Some(s) => {
-                    let clamped = (s.max(1)).min(600) as usize;
-                    let info = st.session.machine.set_reverse_depth(clamped);
-                    let mut lines = vec![format!(
-                        "revdepth: rebuilt rings at {}s (~{:.1} MB) — delta {} entries / {} writes, cpuhistory {} entries",
-                        info.seconds, mb(info.ram_bytes),
-                        info.delta_entry_capacity, info.delta_write_capacity, info.cpu_history_capacity,
-                    )];
-                    if (s as usize) != info.seconds {
-                        lines.push(format!("  (requested {s}s clamped to {}s; allowed 1..=600)", info.seconds));
-                    }
-                    lines.push("  DISCARDED current history (fresh ring); affects capture FROM NOW ON only — cannot retroactively extend history.".into());
-                    if info.seconds > 120 {
-                        lines.push(format!("  WARNING: {}s costs ~{:.1} MB always-on ring RAM; multi-minute depths run into GBs.", info.seconds, mb(info.ram_bytes)));
-                    }
-                    Ok(lines.join("\n"))
                 }
             }
         }
@@ -15117,30 +14799,56 @@ pub(crate) fn transport_tick(st: &mut State, budget_cycles: u64) -> bool {
 /// the machine. The anchors describe a machine that no longer exists, and restoring one
 /// would put back a pre-reset state and make the reset look like it never happened.
 /// So those clear the ring outright rather than truncating it.
-pub(crate) fn transport_discard_timeline(st: &mut State, why: &str) {
-    st.audio_epoch = st.audio_epoch.wrapping_add(1);
-    let had = st.checkpoint_ring.list().len() as u64;
-    st.checkpoint_ring.clear();
-    st.transport = transport::Transport::default();
-    st.autocapture_frames_since = 0;
+/// Spec 864 §4 — the two timeline consequences, written against the pieces they touch
+/// rather than the whole `State`, so the daemon's own call sites and the monitor host's
+/// `on_effect` run the SAME code rather than two copies of it.
+pub(crate) fn timeline_discard(
+    audio_epoch: &mut u64,
+    ring: &mut trx64_core::checkpoint_ring::RuntimeCheckpointRing,
+    tp: &mut transport::Transport,
+    autocapture_frames_since: &mut u64,
+    why: &str,
+) {
+    *audio_epoch = audio_epoch.wrapping_add(1);
+    let had = ring.list().len() as u64;
+    ring.clear();
+    *tp = transport::Transport::default();
+    *autocapture_frames_since = 0;
     // Deliberately NOT printed: the daemon shares a terminal with the TUI, which draws
     // boxes at absolute positions, and stderr from here lands inside them. `rewind` will
     // truthfully report 0 anchors, which is the same information without the mess.
     let _ = (had, why);
 }
 
-pub(crate) fn transport_truncate_on_intervention(st: &mut State) {
-    if !st.transport.holds_the_machine() {
+pub(crate) fn timeline_truncate(
+    ring: &mut trx64_core::checkpoint_ring::RuntimeCheckpointRing,
+    tp: &mut transport::Transport,
+) {
+    if !tp.holds_the_machine() {
         return;
     }
-    let Some(id) = st.transport.cursor.clone() else {
+    let Some(id) = tp.cursor.clone() else {
         return;
     };
-    let dropped = st.checkpoint_ring.truncate_after(&id, true);
-    st.transport.cursor = None;
-    st.transport.playing = None;
-    st.transport.mode = transport::TransportMode::Cut;
-    st.transport.last_cut = dropped;
+    let dropped = ring.truncate_after(&id, true);
+    tp.cursor = None;
+    tp.playing = None;
+    tp.mode = transport::TransportMode::Cut;
+    tp.last_cut = dropped;
+}
+
+pub(crate) fn transport_discard_timeline(st: &mut State, why: &str) {
+    timeline_discard(
+        &mut st.audio_epoch,
+        &mut st.checkpoint_ring,
+        &mut st.transport,
+        &mut st.autocapture_frames_since,
+        why,
+    );
+}
+
+pub(crate) fn transport_truncate_on_intervention(st: &mut State) {
+    timeline_truncate(&mut st.checkpoint_ring, &mut st.transport);
 }
 
 /// Restore the live machine from a ring checkpoint Value (re-attaching the embedded
