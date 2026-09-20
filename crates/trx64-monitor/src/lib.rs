@@ -38,7 +38,12 @@ pub use host::{
     RunUntil, StopInfo, Timeline, Traces,
 };
 
-/// The crate's own version of "what happened", returned by [`exec`].
+/// The crate's own version of "what happened".
+///
+/// Not yet returned by anything: while the move is half done, [`verbs::try_exec`]
+/// answers with a plain `Option<Result<String, String>>` so a host can tell "not my
+/// verb" from "here is your text", and the prompt is read off the session. This is the
+/// shape the single door takes once the last verb has crossed.
 #[derive(Debug, Clone)]
 pub struct MonitorReply {
     /// What to show. Carries the marked address spans until a caller strips them.
@@ -50,12 +55,10 @@ pub struct MonitorReply {
     pub effect: MachineEffect,
 }
 
-/// Run one monitor command against a host.
+/// Run one monitor command against a host: [`verbs::try_exec`].
 ///
-/// This is the whole surface. A host owns its `MonitorSession` and calls this with the
-/// line the user typed; everything else in the crate is reached through it.
-pub fn exec<H: MonitorHost>(_host: &mut H, _command: &str) -> Result<MonitorReply, String> {
-    // The verb table moves here from the daemon; until it does, the door exists and says
-    // so rather than pretending to be finished.
-    Err("the verb table has not moved yet".into())
-}
+/// A host owns its [`MonitorSession`] and calls that with the line the user typed. It
+/// answers `None` for a verb this crate does not own yet, and the host's own dispatch
+/// takes it — the honest shape while the extraction is in progress, and the shape §6
+/// keeps afterwards for a host's own verbs.
+pub use verbs::try_exec as exec;
