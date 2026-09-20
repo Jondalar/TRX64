@@ -139,6 +139,23 @@ pub struct StopInfo {
     pub cycle: u64,
     /// "breakpoint #1", "observer probe", "step", "jam", "budget" — printed as given.
     pub reason: String,
+    /// One entry per instruction the host actually retired, in order.
+    ///
+    /// This is how the library keeps its own `FlowTracker` correct without reaching into
+    /// the host's run loop, and it is the answer to a shape the spec got wrong: a
+    /// default `step()` that drove the machine could not update the tracker, because the
+    /// tracker is the LIBRARY's state and a `&mut self` host method cannot reach it. A
+    /// host that steps knows what it stepped — whether an interrupt was dispatched,
+    /// whether it was an RTI, which PCs it went between — so it says so, and the library
+    /// applies it afterwards. Empty is honest for a host that cannot tell.
+    pub steps: Vec<crate::session::StepClass>,
+}
+
+impl StopInfo {
+    /// The common case: a stop with no per-instruction detail.
+    pub fn at(pc: u16, cycle: u64, reason: impl Into<String>) -> Self {
+        Self { pc, cycle, reason: reason.into(), steps: Vec::new() }
+    }
 }
 
 /// The answer to a resume. A host that drives its own machine returns `Stopped`; a host
@@ -218,8 +235,14 @@ pub trait MonitorHost {
 
     // ── consequences ─────────────────────────────────────────────────────────
 
-    /// What the command that just ran did to the machine. The library classifies; the
-    /// host decides what follows. Default: nothing follows.
+    /// What the command about to run will do to the machine. The library classifies;
+    /// the host decides what follows. Default: nothing follows.
+    ///
+    /// **Fired BEFORE the verb, not after.** The spec said "after" and the first host
+    /// proved it wrong: `g` classifies as `Mutates` and appends timeline anchors WHILE
+    /// it runs, so a truncation fired afterwards would cut the anchors the command had
+    /// just made. Nothing in the golden transcript would have shown it — the timeline is
+    /// not in the text — which is exactly why it is written here.
     fn on_effect(&mut self, _effect: MachineEffect) {}
 
     /// A write the monitor just performed, and the bank lens it went through ("ram",
@@ -236,17 +259,22 @@ pub trait MonitorHost {
     /// without the lens, would silently drop a booted machine onto the isolated core.
     fn on_machine_write(&mut self, _lens: &str) {}
 
-    /// Replace the machine. The default does the machine-level reset; a host that
-    /// implements this is the only thing that runs, because a host whose firmware owns
-    /// the reset line cannot be told about it afterwards.
-    fn reset(&mut self, kind: ResetKind) -> Result<String, String> {
-        match kind {
-            ResetKind::Warm => {
-                self.machine().warm_reset();
-                Ok("warm reset".into())
-            }
-            ResetKind::Cold => Err("this host has no cold reset".into()),
-        }
+    /// Replace the machine. **No default**, and that is a correction: the spec gave
+    /// this one, `Machine::warm_reset()`, and the first host showed the default would
+    /// have been WRONG rather than merely incomplete. The daemon's warm reset also
+    /// clears the keyboard, runs five million cycles and marks the machine running; its
+    /// cold reset re-attaches media, bumps the audio epoch and resets the transport.
+    /// Neither is expressible through `&mut Machine`, and a host that silently took the
+    /// weaker one would look reset without being reset.
+    ///
+    /// The library clears what is ITS state after a successful reset — the cursors, the
+    /// flow stack — so a host never has to know those exist.
+    ///
+    /// The default REFUSES. That is the correction: a default that does something
+    /// weaker than the host's real reset is worse than none, because the machine then
+    /// looks reset without being reset. A refusal is a sentence the user can act on.
+    fn reset(&mut self, _kind: ResetKind) -> Result<String, String> {
+        Err(self.unavailable("reset"))
     }
 
     // ── services a host may not have ─────────────────────────────────────────

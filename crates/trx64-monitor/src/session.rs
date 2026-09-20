@@ -161,7 +161,7 @@ impl MonitorState {
 /// FlowKind = main|irq|nmi|brk|trap (stepping.ts:39). BRK folds to its own `brk`
 /// kind (TS classifies BRK entry as `brk`); `trap` is vestigial in the single-path
 /// runtime. The 3-frame model (main/irq/nmi) plus `brk` matches stepping.ts.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlowKind {
     Main,
     Irq,
@@ -194,6 +194,7 @@ pub struct CpuFlowFrame {
 
 /// stepping.ts:78-103 — the classified result of one single step, used by
 /// [`FlowTracker::apply`]. `ev` is the StepEventType; `flow` is set only for `int`.
+#[derive(Debug, Clone)]
 pub struct StepClass {
     pub is_int: bool,
     pub is_rti: bool,

@@ -173,8 +173,22 @@ proof the classification belongs to the parser. So:
 enum MachineEffect { Observes, Mutates, Replaces }
 ```
 
-The lib classifies each command and calls `on_effect`. The daemon truncates on `Mutates`
-and discards the timeline on `Replaces`; UE2 does nothing for either. No host ever sees a
+The lib classifies each command and calls `on_effect` **before the verb runs**. That
+ordering is a correction the build forced: this section first said "after", and the first
+host showed why it cannot be. `g` classifies as `Mutates` and appends timeline anchors
+*while it runs*, so a truncation fired afterwards would cut the anchors the command had
+just made. Nothing in the golden transcript would have caught it — a timeline is not text.
+
+The daemon truncates on `Mutates` and discards the timeline on `Replaces`; UE2 does
+nothing for either.
+
+**A write needs its lens, and that is a second call.** `on_machine_write(lens)` fires per
+write, after it, naming the bank it went through. The write itself is the library's — it
+is `Machine`'s own memory and both hosts have the same one — but the daemon's bus
+selection latches `injected` and `io_injected` **separately**: an `io` write means the VIC
+has to be ticking, a `ram` write does not. `on_effect` fires once per command and carries
+no lens, so it cannot say this, and one flag for both would be the 2026-08-12
+observers-wreck-everything bug arriving by a new road. No host ever sees a
 verb string, so no host can hold a stale verb list.
 
 **It is named for what it measures.** UE2's first host verb is `config` — it reads the
@@ -187,8 +201,15 @@ anywhere".
 ## §5 D4 — Reset is intercepted, not announced
 
 The lib never calls `Machine::warm_reset` (core lib.rs:1237) itself. `reset()` on the
-trait has a default that does the machine-level reset, and a host that implements it
-replaces that entirely. UE2 must: their firmware owns `C64_STOP` and the reset line and
+trait **refuses by default**, and this too is a correction: the section first gave it the
+machine-level reset as its default, and the first host proved that default WRONG rather
+than merely incomplete. The daemon's warm reset also clears the keyboard, runs five
+million cycles, resets the flow stack and the cursors and marks the machine running; its
+cold reset is a whole-host power cycle — media re-attach, audio epoch, transport reset.
+Neither is expressible through `&mut Machine`, and a host that silently took the weaker
+one would look reset without being reset. A refusal is a sentence the user can act on; a
+half-reset is not. The library clears its OWN state (cursors, flow stack) after a
+successful reset, so no host has to know those exist. UE2 must: their firmware owns `C64_STOP` and the reset line and
 restores the cartridge afterwards, so a lib-side reset followed by a notification would
 leave the firmware describing a machine that no longer exists. The daemon's
 implementation resets and then discards its timeline, keeping today's ordering rather than
@@ -202,10 +223,23 @@ notice a C64 that stopped answering. So "the machine halted" and "time stopped" 
 the same statement, and only the host knows which one it can make.
 
 `g`, `until`, `step`/`z`/`n` therefore go through `resume`/`step`, and a halt is announced
-through `set_halted`. The defaults do what the daemon does today (`step_one_with_flow` and
-the segment runner), so the daemon's behaviour is unchanged; UE2 overrides them and routes
-through the firmware's own `C64_STOP` path, which keeps the firmware consistent with the
-machine it is hosting.
+through `set_halted`. UE2 overrides them and routes through the firmware's own `C64_STOP`
+path, which keeps the firmware consistent with the machine it is hosting.
+
+**Neither has a machine-driving default, and the reason is a shape this spec had wrong.**
+The daemon's step is `step_one_with_flow`: it classifies the step — was an interrupt
+dispatched, was it an RTI, which PCs did it go between — and pushes or pops a frame on the
+`FlowTracker`. That tracker is the LIBRARY's state, inside `MonitorSession`, and a
+`&mut self` host method cannot reach it. A default that drove the machine would therefore
+have left the `flow` panel quietly wrong on every host that took it — the worst kind of
+default, because it works.
+
+So the host says what it stepped and the library keeps its own books: `StopInfo` carries
+`steps: Vec<StepClass>`, one entry per retired instruction, and the library applies them
+to the tracker after the call returns. A host that cannot tell returns an empty vector,
+which is honest rather than wrong. The alternative — passing `&mut MonitorSession` into
+the host method — would have made every host import the library's state to implement a
+run loop, which is the coupling this whole spec exists to avoid.
 
 **A resume may answer before the stop happens.** This is the deepest difference between
 the two hosts and it shapes the reply, not just the call. The daemon drives the machine,
@@ -295,6 +329,41 @@ including the marked spans and the identity fields, is byte-for-byte what it is 
 which is why C64RE needs no change: `runtime_monitor` cannot tell the difference, and
 that is the acceptance (§11.1).
 
+### §9.1 As built, so far — and what is still in the daemon
+
+The extraction is deliberately partial, and the line it stopped at is the line where
+moving would have meant *inventing* a service rather than extracting one.
+
+**In the library:** `observers.rs`, `assembler.rs`, `addr_spans.rs` whole; `MonitorState`,
+`Breakpoints`, `FlowTracker` and the trap rules gathered into `MonitorSession`, which the
+daemon's `State` now holds as one field instead of five; the arming handshake; and the
+verbs that need nothing but a machine — `r wr m d screen f a t c h bank sidefx obs o
+ignore bk del flow io iec focus bt triage help df whowrote revdepth reu georam uci`, plus
+`device`/`dev` and the drive8 gate. The library sees **every** line first, so the modal
+prompt and the assemble mode are its business on both hosts; it returns "not my verb" only
+for what it does not own. `main.rs` went from 25 350 to 22 871 lines.
+
+**Still in the daemon, each for the same reason:** run control (`g x until z n ret sf`),
+`reset`/`power`, everything timeline (`play pause run mark marks frame goto rewind rstep
+sd diff cdiff ringdump ringload`), everything trace (`trace tracedb map taint traceindex
+swimlane chis`), everything media and file (`dump savecrt bitmap pwd cd ls load save
+bload bsave traprules`), and `model turbo warp`. Each needs a service the trait declares
+and nobody has implemented yet. The shapes of `Timeline`, `Files` and `Traces` in §3 are
+therefore still guesses, and two gaps are already visible: `Timeline` has nothing for
+"restore a checkpoint by id", which `cdiff` needs, and `Files` has no "write this file and
+give me back its path", which `bitmap` needs.
+
+**A constraint for any host author.** `try_exec(session, host, …)` needs the session and
+the host mutably at the same time, so they must be **disjoint borrows**. The daemon does
+it by destructuring its own `State` and handing the pieces to a `DaemonHost` of borrowed
+fields. A host that owns its `MonitorSession` inside the same struct its `MonitorHost`
+impl borrows will not compile — better said here than discovered after it is written.
+
+**`CpuView` is declared but not yet on any path.** The moved verbs still reach both 6502s
+through `machine()` and `machine().drive8`, exactly as they did in the daemon, so `r`/`m`
+/`d` under `device drive8` do not consult it. Wiring them through the view is real
+remaining work, and until it is done `device fw` cannot answer on any host.
+
 ## §10 Scope
 
 - **Not in this spec:** a second instruction set in `trx64-static`. UE2 wants `device fw`
@@ -351,7 +420,8 @@ memory half again, which is precisely the drift this spec exists to prevent.
    timeline.
 6. **Effects.** The in-test host records `on_effect`; `wr`, `a`, `f`, `c`, `t`, `g`, `x`,
    `step`, `n` and `r $xx=` classify as `Mutates`, `r` alone and every read verb as
-   `Reads`, `reset` as `ReplacesMachine`. The daemon's truncation numbers are unchanged
+   `Observes`, `reset` as `Replaces`. The host also records `on_machine_write` and sees
+   the lens each write went through. The daemon's truncation numbers are unchanged
    against today's transport tests.
 7. **Composition.** A test chains the armed registry with a second observer through the
    core `TeeObserver` and proves both see every callback, and that merged watch tables
