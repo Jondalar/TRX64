@@ -28,6 +28,9 @@ pub mod addr_spans;
 pub mod assembler;
 pub mod host;
 pub mod observers;
+pub mod session;
+
+pub use session::MonitorSession;
 
 pub use host::{
     CpuView, Device, FlagSpec, Files, MachineEffect, MonitorHost, Reg, ResetKind, Resumption,

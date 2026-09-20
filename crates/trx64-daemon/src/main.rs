@@ -42,6 +42,12 @@ pub mod candidate;
 /// short path it has used since Spec 754 so no call site had to be rewritten to say
 /// where the file moved to.
 pub use trx64_monitor::observers;
+/// Spec 864 — what the monitor remembers between two commands, now one field on
+/// `State` instead of five loose ones. The types keep their names here so the verb
+/// bodies read exactly as they did.
+use trx64_monitor::session::{
+    ApiBpEntry, BpEntry, Breakpoints, FlowKind, FlowTracker, MonitorSession, StepClass, TrapRule,
+};
 pub mod project_knowledge;
 pub mod snapshot_diff;
 pub mod streaming;
@@ -165,49 +171,6 @@ impl Response {
     }
 }
 
-// ── Breakpoint stores ─────────────────────────────────────────────────────────
-
-/// Simple numbered breakpoint (debug/break_* methods, numeric IDs).
-struct BpEntry {
-    num: u32,
-    pc: u16,
-    #[allow(dead_code)]
-    enabled: bool,
-}
-
-/// String-ID breakpoint (api/call addPcBreakpoint/listBreakpoints/removeBreakpoint).
-struct ApiBpEntry {
-    id: String,
-    pc: u16,
-    action: String,
-    enabled: bool,
-    hit_limit: Option<u32>,
-    /// `ignore <id> <n>` — skip the first N hits (VICE semantics, mirrored into
-    /// the registry observer's `ignore_left`).
-    ignore_count: u32,
-    /// Real hit count, copied back from the registry after each run.
-    hit_count: u64,
-}
-
-struct Breakpoints {
-    next_num: u32,
-    entries: Vec<BpEntry>,
-    api_entries: Vec<ApiBpEntry>,
-}
-
-impl Breakpoints {
-    fn new() -> Self {
-        Self { next_num: 1, entries: Vec::new(), api_entries: Vec::new() }
-    }
-
-    fn list_vice_json(&self) -> Value {
-        json!(self.entries.iter().map(|e| json!({
-            "num": e.num as u64,
-            "addr": e.pc as u64
-        })).collect::<Vec<_>>())
-    }
-}
-
 // ── Shared state ──────────────────────────────────────────────────────────────
 
 /// Stop reason for debug/pause.
@@ -218,24 +181,6 @@ struct CtrlStop {
     cycles: u64,
 }
 
-/// TRX64 feature-request #4 — one project-supplied on-trap dump rule. NO built-in
-/// engine knowledge lives in the core: the PROJECT tells the debugger which bytes are
-/// "the diagnosis" at a given trap PC. On reaching/halting at `pc`, the debugger reads
-/// each `dump` byte and auto-emits `label: name=$XX name2=$YY (decode)`. Loaded from a
-/// small JSON file via the `traprules <path>` verb. See `TRX64_FEATURE_REQUESTS.md` #4.
-#[derive(Clone, Debug)]
-struct TrapRule {
-    /// The trap PC this rule fires at (reached / halted-at / breakpoint).
-    pc: u16,
-    /// Human label for the trap (e.g. "loader miss").
-    label: String,
-    /// The diagnostic bytes to read + name: `(name, addr, len)`. `len` is 1..=8 bytes,
-    /// emitted as a single hex value (LE for len>1) under `name`.
-    dump: Vec<(String, u16, u8)>,
-    /// Optional human decode line appended in parentheses (e.g.
-    /// "k2 bit7 => DIRECT-overlay miss"). Empty = omitted.
-    decode: String,
-}
 
 /// The `c64-pal` frame (312 × 63), for the tests that drive the default machine a frame at
 /// a time. Code asks the machine (`Machine::timing`).
@@ -280,24 +225,6 @@ pub struct State {
     /// and the press lands somewhere else on the machine. The browser may say WHAT was
     /// pressed. It may never say WHEN.
     input_journal: Option<InputJournal>,
-    breakpoints: Breakpoints,
-    /// The breakpoint/watchpoint POLICY (cond-AST, hit/ignore, watch tables).
-    /// Re-synced from `breakpoints` before each run; drives the core's debug gates.
-    observers: observers::ObserverRegistry,
-    /// Spec 754 §3.3e — the persistent store of monitor-DSL observers registered via
-    /// `obs <name> when exec|load|store $ADDR [if <cond>] do break|log|mark|cmd|trace`
-    /// (= the c64re `session.ensureObservers()` registry, which survives across runs).
-    /// `sync_observers` rebuilds the live [`ObserverRegistry`] from the bp surfaces on
-    /// EVERY run, which would wipe DSL registrations — so they are kept HERE and
-    /// re-applied (cloned) onto the registry after the bp-derived ones. `o`/`reg`
-    /// lists them; `ignore <n>` / `obs <name> del` mutate them.
-    dsl_observers: Vec<observers::ObsSpec>,
-    /// Names of DSL observers currently DISABLED via `obs <name> off` (= the c64re
-    /// `Observer.enabled=false`). `ObsSpec` carries no enabled flag (the registry's
-    /// live `Observer` does, always re-armed enabled on `add`), so the disabled intent
-    /// is persisted here and consulted by `sync_observers` (a disabled DSL observer is
-    /// not re-applied). `obs <name> on` clears it; `del` removes the name entirely.
-    dsl_disabled: std::collections::HashSet<String>,
     /// Queued PETSCII chars for session/type (stub, count tracked only).
     #[allow(dead_code)]
     type_buffer: Vec<u8>,
@@ -568,15 +495,20 @@ pub struct State {
     /// insertion order for oldest-first eviction (a HashMap has no order).
     checkpoint_thumbs: std::collections::HashMap<String, CheckpointThumb>,
     checkpoint_thumb_order: std::collections::VecDeque<String>,
-    /// T2.8 — monitor-shell session-private cursor/lens state (= monitor-shell.ts
-    /// module-level `bankDefaults` / `memCursors` / `disasmCursors` / `sidefxOn`).
-    /// The daemon holds one session, so these are single-valued (not per-id maps).
-    mon: MonitorState,
-    /// Spec 623 §4.2/§4.3 — the per-session interrupt/trap flow-frame tracker (=
-    /// the c64re `RuntimeController.flow`, runtime-controller.ts:141). Backs the
-    /// monitor `flow`/`focus` panels; mutated per single-step by `step_one_with_flow`
-    /// from the `z`/`n`/`ret` handlers. PASSIVE — never advances the VM.
-    flow: FlowTracker,
+    /// Spec 864 — everything the monitor remembers between two commands: the cursors
+    /// and the selected device (`mon.state`), the breakpoint surfaces, the observer
+    /// registry with its DSL registrations, the interrupt-flow tracker behind
+    /// `flow`/`focus`, and the project's trap rules. It used to be five loose fields
+    /// on this struct, which is how long it took to notice it was one thing.
+    ///
+    /// The daemon is this session's HOST, not its owner in any deeper sense: a second
+    /// host holds exactly the same struct.
+    mon: MonitorSession,
+    /// The FILE mini-shell's cwd (= monitor-shell `fsShellCwd`). Spec 864 §10.1 keeps
+    /// it HERE rather than in `MonitorSession`: it is shell state of a filesystem, and
+    /// a host without a filesystem would be carrying a directory it cannot use. `None`
+    /// until `cd` sets it; a bare `pwd`/`ls` then roots at the project dir.
+    fs_cwd: Option<String>,
     /// Spec 764 — JAM (KIL) auto-break edge for the per-frame stream driver (=
     /// runtime-controller.ts:793 `brokeOnJam`). A jammed CPU keeps cycling clk with
     /// PC frozen, so the free-run advance never aborts on it; the stream loop detects
@@ -606,11 +538,6 @@ pub struct State {
     /// write-ring (emu→render) → persistent engine → PCM-ring (render→main). Off by
     /// default → zero cost until the app starts pulling audio. Joined on `State` drop.
     audio_render: Option<AudioRenderThread>,
-    /// TRX64 feature-request #4 — project-supplied on-trap dump rules, keyed by trap PC
-    /// (last write wins on a duplicate PC). Loaded via `traprules <path>`; consulted on
-    /// the JAM / breakpoint-at-PC paths to auto-emit `label: name=$XX (decode)`. Empty by
-    /// default (no built-in engine knowledge); session-scoped (lost on close).
-    trap_rules: std::collections::HashMap<u16, TrapRule>,
 }
 
 /// Live A/V PULL-API — persistent, `Send` handles for the FFI SID audio render
@@ -675,208 +602,7 @@ impl Drop for AudioRenderThread {
     }
 }
 
-/// T2.8 — the monitor-shell.ts module-level per-session state, collapsed for the
-/// daemon's single session. `bank_default` = sticky lens for m/d (monitor-shell
-/// `bankDefaults`, default "cpu"); `mem_cursor`/`disasm_cursor` = the shared
-/// per-session cursors so a bare `m`/`d` follows the latest dump/step
-/// (`memCursors`/`disasmCursors`); `sidefx_on` = side-effect read toggle
-/// (`sidefxOn`, default OFF → peek).
-struct MonitorState {
-    bank_default: String,
-    mem_cursor: Option<u16>,
-    disasm_cursor: Option<u16>,
-    sidefx_on: bool,
-    /// Sticky inspect target (= monitor-shell `deviceSel`, default "c64"). When
-    /// "drive8" the read-inspect verbs `r`/`m`/`d` target the 1541 drive CPU
-    /// (read-inspect ONLY — Spec 754 §3.3i); other verbs are blocked with a clear
-    /// message. `device c64|drive8` (or `dev`) flips it.
-    device: String,
-    /// FILE mini-shell session cwd (= monitor-shell `fsShellCwd` map, single-valued
-    /// for the daemon's one session). `None` until `cd` sets it; a bare `pwd`/`ls`
-    /// then roots at the project dir. Relative `load`/`save`/`bload`/`bsave`/`ls`/
-    /// `cd` paths resolve against this (else the project dir). Absolute paths pass
-    /// through unchanged — exactly like the TS `resolveFsPath` (which is NOT a hard
-    /// jail: it only defaults relative paths to the cwd; `..`/abs escape freely).
-    fs_cwd: Option<String>,
-    /// Spec 754 §3.3c — modal assemble cursor (= monitor-shell `asmCursors`). When
-    /// `Some(addr)` the monitor is in VICE-style `a` assemble mode: EVERY line is an
-    /// instruction assembled at the cursor (no verb dispatch); an empty line exits.
-    asm_cursor: Option<u16>,
-    /// The `MonitorResult.prompt` for the LAST command (= the TS modal `prompt`
-    /// field). Set per-command by `run_monitor` (cleared at entry); the `monitor/exec`
-    /// handler forwards it on the reply so a modal `a`/`df -i` prompt reaches the wire
-    /// exactly as TS's `runMonitorCommand` returns `{ output, prompt }`.
-    pending_prompt: Option<String>,
-}
 
-impl MonitorState {
-    fn new() -> Self {
-        Self {
-            bank_default: "cpu".to_string(),
-            mem_cursor: None,
-            disasm_cursor: None,
-            sidefx_on: false,
-            device: "c64".to_string(),
-            fs_cwd: None,
-            asm_cursor: None,
-            pending_prompt: None,
-        }
-    }
-}
-
-/// Spec 623 §4.2/§4.3 — the per-session control-flow tracker, a 1:1 port of the
-/// c64re TS `FlowTracker` (stepping.ts:145-281) that backs the monitor `flow`
-/// panel (monitor-shell.ts:1103-1117 ← `ctrl.flow.flowState()`). It maintains the
-/// interrupt/trap FRAME STACK so `flow` reports whether execution is currently in
-/// main / irq / nmi flow — the LIVE interrupt context, not a constant.
-///
-/// STEP-DRIVEN, exactly like TS: the stack is mutated by [`FlowTracker::apply`],
-/// which is called from the daemon's `z`/`step`/`n`/`ret` handlers after each
-/// single-step (the TS `apply()` runs from `stepInto`/`stepOver`/`runReturn`/…).
-/// A cold break from free-run leaves the stack empty → current=main (the documented
-/// best-effort cold state, stepping.ts:142-143). The classification mirrors
-/// `stepOne` (stepping.ts:78-103): an SP drop of exactly 3 across a step whose
-/// pre-opcode is not BRK is the unambiguous hardware IRQ/NMI dispatch (no other
-/// 6502 instruction pushes 3 bytes); BRK ($00) is a software interrupt entry; RTI
-/// ($40) pops the innermost frame AFTER the RTI runs in handler flow.
-///
-/// PASSIVE OBSERVER (Spec 723 observer-effect lesson): the tracker reads CPU regs
-/// the daemon already has post-step and reads the NMI vector via the non-side-effect
-/// `peek_lens` — it never advances the VM, so it has ZERO effect on byte-exact
-/// execution. The no-disk corpus is identical with it wired in.
-///
-/// FlowKind = main|irq|nmi|brk|trap (stepping.ts:39). BRK folds to its own `brk`
-/// kind (TS classifies BRK entry as `brk`); `trap` is vestigial in the single-path
-/// runtime. The 3-frame model (main/irq/nmi) plus `brk` matches stepping.ts.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FlowKind {
-    Main,
-    Irq,
-    Nmi,
-    Brk,
-}
-
-impl FlowKind {
-    /// The lowercase tag the TS render uses (`fr.kind` / `current=<kind>`).
-    fn tag(self) -> &'static str {
-        match self {
-            FlowKind::Main => "main",
-            FlowKind::Irq => "irq",
-            FlowKind::Nmi => "nmi",
-            FlowKind::Brk => "brk",
-        }
-    }
-}
-
-/// stepping.ts:44-51 — `CpuFlowFrame`. Field names mirror the TS interface; only the
-/// fields the `flow` panel renders are carried (`stepping.ts:185-189`):
-/// kind, enteredAtPc (→ `pc`), enteredAtCycle (→ `cyc`), returnPc (→ `ret`).
-#[derive(Clone, Copy)]
-struct CpuFlowFrame {
-    kind: FlowKind,
-    entered_at_pc: u16,
-    entered_at_cycle: u64,
-    return_pc: u16,
-}
-
-/// stepping.ts:78-103 — the classified result of one single step, used by
-/// [`FlowTracker::apply`]. `ev` is the StepEventType; `flow` is set only for `int`.
-struct StepClass {
-    is_int: bool,
-    is_rti: bool,
-    flow: FlowKind, // only meaningful when is_int
-    pc0: u16,
-    pc1: u16,
-    cycle_abs: u64,
-}
-
-/// 1:1 port of the TS `FlowTracker` (stepping.ts:145-190). Only the state the
-/// `flow` panel observes is carried; the stepping COMMANDS themselves stay in the
-/// daemon's existing `z`/`n`/`ret` handlers (which already mirror stepInto/
-/// stepOver/runReturn), and call [`FlowTracker::apply`] per single step.
-struct FlowTracker {
-    /// stepping.ts:146 — the interrupt/trap frame stack (innermost last).
-    stack: Vec<CpuFlowFrame>,
-    /// stepping.ts:147 — focus mode string (auto|main|irq|nmi|brk|none). The
-    /// `flow` panel renders it verbatim; `focus` verb sets it. Default "auto".
-    focus: String,
-}
-
-impl FlowTracker {
-    fn new() -> Self {
-        FlowTracker { stack: Vec::new(), focus: "auto".to_string() }
-    }
-
-    /// stepping.ts:149-151 — currentFlow(): the innermost frame's kind, else main.
-    fn current_flow(&self) -> FlowKind {
-        self.stack.last().map(|f| f.kind).unwrap_or(FlowKind::Main)
-    }
-
-    /// stepping.ts:154-156 — the flow the focus verbs actually aim at. `auto`/`none`
-    /// mean "whatever flow we are in right now"; anything else is that flow verbatim.
-    fn effective_focus(&self) -> FlowKind {
-        match self.focus.as_str() {
-            "main" => FlowKind::Main,
-            "irq" => FlowKind::Irq,
-            "nmi" => FlowKind::Nmi,
-            "brk" => FlowKind::Brk,
-            _ => self.current_flow(),
-        }
-    }
-
-    /// stepping.ts:158 — reset(): clear the frame stack (focus is left intact, as in
-    /// TS where `reset()` only nulls `stack`).
-    fn reset(&mut self) {
-        self.stack.clear();
-    }
-
-    /// stepping.ts:160-171 — apply(): mutate the stack from a classified step. An
-    /// `int` pushes a frame; an `rti` pops the innermost (AFTER the RTI ran in
-    /// handler flow); jsr/rts/normal don't change the interrupt-flow kind.
-    fn apply(&mut self, r: &StepClass) {
-        if r.is_int {
-            self.stack.push(CpuFlowFrame {
-                kind: r.flow,
-                entered_at_pc: r.pc1,
-                entered_at_cycle: r.cycle_abs,
-                return_pc: r.pc0,
-            });
-        } else if r.is_rti && !self.stack.is_empty() {
-            self.stack.pop();
-        }
-    }
-
-    /// monitor-shell.ts:1103-1117 — render the `flow` panel from flowState()
-    /// (stepping.ts:174-190). Identical text shape:
-    ///   `flow: current=<kind>  focus=<focus>\nframes:\n<lines | placeholder>`
-    /// where each frame line is
-    ///   `  <kind>  enter=$PPPP -> ret=$RRRR  cyc=<cycle>`.
-    fn render(&self) -> String {
-        let frames = if self.stack.is_empty() {
-            "  (main — no interrupt/trap frame active)".to_string()
-        } else {
-            self.stack
-                .iter()
-                .map(|f| {
-                    format!(
-                        "  {}  enter=${:04X} -> ret=${:04X}  cyc={}",
-                        f.kind.tag(),
-                        f.entered_at_pc,
-                        f.return_pc,
-                        f.entered_at_cycle
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        format!(
-            "flow: current={}  focus={}\nframes:\n{}",
-            self.current_flow().tag(),
-            self.focus,
-            frames
-        )
-    }
-}
 
 /// SINGLE-PATH bus-selection gate (Spec 723). The ONE predicate that decides whether a
 /// scenario runs on the FULL literal-VIC product machine (`run_for_full*`, the VIC the
@@ -1775,10 +1501,10 @@ fn do_power_on(st: &mut State) {
     st.checkpoint_ring.clear();
     st.ctrl_stop = None;
     st.ctrl_frame += 1;
-    st.flow.reset();
+    st.mon.flow.reset();
     st.stream_broke_on_jam = false;
-    st.mon.disasm_cursor = None;
-    st.mon.mem_cursor = None;
+    st.mon.state.disasm_cursor = None;
+    st.mon.state.mem_cursor = None;
     if st.streaming_enabled {
         // Spec 767 — LIVE A/V hub: STREAM the boot from cycle 0 so the user sees the WHOLE
         // intro (VICE-parity). The synchronous 5M warm-boot (the `else` below) runs the cart
@@ -1824,10 +1550,10 @@ fn do_power_off(st: &mut State) {
     st.checkpoint_ring.clear();
     st.ctrl_stop = None;
     st.ctrl_frame += 1;
-    st.flow.reset();
+    st.mon.flow.reset();
     st.stream_broke_on_jam = false;
-    st.mon.disasm_cursor = None;
-    st.mon.mem_cursor = None;
+    st.mon.state.disasm_cursor = None;
+    st.mon.state.mem_cursor = None;
     st.notify.broadcast("audio/flush", json!({ "session_id": st.session.id }));
     st.session.running = false;
     transport_discard_timeline(st, "power off");
@@ -1869,10 +1595,10 @@ fn power_cycle_for_restore(st: &mut State) {
     st.machine_generation += 1; // re-hook the fresh SID (streaming.rs `!=` check)
     st.ctrl_stop = None;
     st.ctrl_frame += 1;
-    st.flow.reset();
+    st.mon.flow.reset();
     st.stream_broke_on_jam = false;
-    st.mon.disasm_cursor = None;
-    st.mon.mem_cursor = None;
+    st.mon.state.disasm_cursor = None;
+    st.mon.state.mem_cursor = None;
     st.notify.broadcast("audio/flush", json!({ "session_id": st.session.id }));
 }
 
@@ -2478,7 +2204,7 @@ fn free_run_input_warning(st: &State) -> Option<String> {
 /// Returns the rendered emit (for a caller that also wants to attach it to a reply), or
 /// `None` when no rule matches. Read-only.
 fn maybe_emit_trap_rule(st: &State, pc: u16) -> Option<String> {
-    let rule = st.trap_rules.get(&pc)?;
+    let rule = st.mon.trap_rules.get(&pc)?;
     let emit = format_trap_rule_emit(rule, &st.session.machine);
     st.notify.broadcast(
         "debug/observer_log",
@@ -2515,7 +2241,7 @@ fn drain_and_broadcast_observer_log(st: &mut State) {
     let session_id = st.session.id.clone();
 
     // 1. pending_log (runtime-controller.ts:697-698)
-    let log_lines = st.observers.drain_pending_log();
+    let log_lines = st.mon.observers.drain_pending_log();
     if !log_lines.is_empty() {
         st.notify.broadcast("debug/observer_log", json!({
             "session_id": session_id,
@@ -2524,7 +2250,7 @@ fn drain_and_broadcast_observer_log(st: &mut State) {
     }
 
     // 2. pending_marks (runtime-controller.ts:702-710)
-    let marks = st.observers.drain_pending_marks();
+    let marks = st.mon.observers.drain_pending_marks();
     let trace_active = st.session.trace.is_some();
     let cycles = st.session.machine.clk;
     for label in marks {
@@ -2549,7 +2275,7 @@ fn drain_and_broadcast_observer_log(st: &mut State) {
 
     // 3. pending_cmds (runtime-controller.ts:711-725) — run synchronously
     //    (TS uses async/await but the wire shape is identical).
-    let cmds = st.observers.drain_pending_cmds();
+    let cmds = st.mon.observers.drain_pending_cmds();
     for cmd in cmds {
         // Run the monitor command, then broadcast — collect the lines first so the
         // run_monitor `&mut State` borrow ends before the `notify` borrow.
@@ -2572,7 +2298,7 @@ fn drain_and_broadcast_observer_log(st: &mut State) {
     //    (explicit lifecycle). The engine queues each fire into `pending_trace`; here
     //    we act on it via the SAME trace machinery the monitor `trace on/off` verb
     //    drives (TraceState + finalize_trace), and broadcast the lifecycle line.
-    let traces = st.observers.drain_pending_trace();
+    let traces = st.mon.observers.drain_pending_trace();
     for (off, domains, name) in traces {
         let line = if off {
             if st.session.trace.is_some() {
@@ -2611,13 +2337,14 @@ fn drain_and_broadcast_observer_log(st: &mut State) {
 /// `running` return (no advance) so the zero-cost / no-debug contract is unchanged.
 fn run_debug_control(id: Value, st: &mut State, frame: u64, _is_continue: bool) -> Response {
     {
-        let State { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } = &mut *st;
+        let MonitorSession { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } =
+            &mut st.mon;
         sync_observers(breakpoints, dsl_observers, dsl_disabled, reg);
     }
 
-    if !observers_armed(&st.observers) {
+    if !observers_armed(&st.mon.observers) {
         // No debug gate: historical behavior — report running, machine unchanged.
-        let bps = st.breakpoints.list_vice_json();
+        let bps = st.mon.breakpoints.list_vice_json();
         let pc = st.session.machine.c64_core.reg_pc as u64;
         let cycles = st.session.machine.clk;
         let (pacing_mode, pacing_ratio, control_owner) =
@@ -2642,7 +2369,7 @@ fn run_debug_control(id: Value, st: &mut State, frame: u64, _is_continue: bool) 
     // a perma-pause from the user's perspective.)
     {
         let pc = st.session.machine.c64_core.reg_pc;
-        if st.breakpoints.entries.iter().any(|e| e.enabled && e.pc == pc) {
+        if st.mon.breakpoints.entries.iter().any(|e| e.enabled && e.pc == pc) {
             step_one_instruction(&mut st.session);
         }
     }
@@ -2650,12 +2377,13 @@ fn run_debug_control(id: Value, st: &mut State, frame: u64, _is_continue: bool) 
     // Split the borrow of `st` so the registry can be passed as the core observer
     // while the session runs; scope it so the fields free up afterward.
     let run = {
-        let State { session, observers: reg, .. } = &mut *st;
+        let State { session, mon, .. } = &mut *st;
+        let reg = &mut mon.observers;
         let fm = full_machine_gate(session);
         run_until_break(session, reg, DEBUG_RUN_BUDGET, fm)
     };
     {
-        let State { breakpoints, observers: reg, .. } = &mut *st;
+        let MonitorSession { breakpoints, observers: reg, .. } = &mut st.mon;
         writeback_hits(breakpoints, reg);
     }
 
@@ -2664,13 +2392,13 @@ fn run_debug_control(id: Value, st: &mut State, frame: u64, _is_continue: bool) 
     // so nothing is lost, matching the TS tick() drain which runs before the halt check.
     drain_and_broadcast_observer_log(st);
 
-    let bps = st.breakpoints.list_vice_json();
+    let bps = st.mon.breakpoints.list_vice_json();
     let cycles = st.session.machine.clk;
     if run.halted {
         st.session.running = false;
         // Resolve a numeric breakpointId from the numbered bp store by PC, if any.
         let bp_num = st
-            .breakpoints
+            .mon.breakpoints
             .entries
             .iter()
             .find(|e| e.pc == run.pc)
@@ -2843,7 +2571,7 @@ pub(crate) fn check_and_handle_jam(st: &mut State) -> bool {
         // TRX64 feature-request #4 — if the project registered an on-trap dump rule for
         // this halt PC, auto-emit its decoded diagnostic (read-only) alongside the triage.
         let trap_emit = st
-            .trap_rules
+            .mon.trap_rules
             .get(&pc)
             .map(|r| format_trap_rule_emit(r, &st.session.machine));
         let session_id = st.session.id.clone();
@@ -2908,13 +2636,14 @@ pub(crate) fn stream_debug_gated_advance(st: &mut State, budget: u64) -> u32 {
     // Re-sync the observer registry from the bp surfaces (preserving live counts),
     // exactly like the one-shot run_debug_control entry.
     {
-        let State { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } = &mut *st;
+        let MonitorSession { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } =
+            &mut st.mon;
         sync_observers(breakpoints, dsl_observers, dsl_disabled, reg);
     }
 
     let clk_before = st.session.machine.c64_core.clk;
 
-    if !observers_armed(&st.observers) {
+    if !observers_armed(&st.mon.observers) {
         // ── No debug gate. When a trace is ACTIVE, the free-run advance must FEED the
         // firehose every frame (audit background-workers-async-5): the c64re tick()
         // drains traceRun once per completed frame so its worker writes the
@@ -2944,7 +2673,7 @@ pub(crate) fn stream_debug_gated_advance(st: &mut State, budget: u64) -> u32 {
         // frame's advance does not immediately re-trip the same address.
         {
             let pc = st.session.machine.c64_core.reg_pc;
-            if st.breakpoints.entries.iter().any(|e| e.enabled && e.pc == pc) {
+            if st.mon.breakpoints.entries.iter().any(|e| e.enabled && e.pc == pc) {
                 step_one_instruction(&mut st.session);
             }
         }
@@ -2963,12 +2692,13 @@ pub(crate) fn stream_debug_gated_advance(st: &mut State, budget: u64) -> u32 {
         // out — it needs the full path for the Spec 764 JAM detector (`c64_core.is_jammed`
         // is only driven there).
         let run = {
-            let State { session, observers: reg, .. } = &mut *st;
+            let State { session, mon, .. } = &mut *st;
+        let reg = &mut mon.observers;
             let fm = full_machine_gate(session);
             run_until_break(session, reg, budget, fm)
         };
         {
-            let State { breakpoints, observers: reg, .. } = &mut *st;
+            let MonitorSession { breakpoints, observers: reg, .. } = &mut st.mon;
             writeback_hits(breakpoints, reg);
         }
         // Drain observer side-effects accumulated this chunk (runtime-controller.ts:697-725)
@@ -2983,7 +2713,7 @@ pub(crate) fn stream_debug_gated_advance(st: &mut State, budget: u64) -> u32 {
             let cycles = st.session.machine.clk;
             st.ctrl_stop = Some(CtrlStop { reason: "breakpoint", pc: run.pc, cycles });
             let bp_num = st
-                .breakpoints
+                .mon.breakpoints
                 .entries
                 .iter()
                 .find(|e| e.pc == run.pc)
@@ -3455,7 +3185,7 @@ fn land_line(line: &str, tag: &str, cyc: u64, flow: FlowKind, why: StopWhy) -> S
 /// stored and never consulted here, which made the monitor's own `sidefx = on (monitor
 /// reads are LIVE — I/O side effects)` reply untrue.
 fn monitor_read(st: &mut State, addr: u16, lens: &str) -> u8 {
-    if st.mon.sidefx_on && matches!(lens, "cpu" | "io") {
+    if st.mon.state.sidefx_on && matches!(lens, "cpu" | "io") {
         st.session.machine.read_full_live(addr)
     } else {
         st.session.machine.peek_lens(addr, lens)
@@ -3729,7 +3459,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
     }
 
     // Clear any prompt carried from a prior command; a modal verb re-sets it below.
-    st.mon.pending_prompt = None;
+    st.mon.state.pending_prompt = None;
     let cmd = command.trim().to_string();
 
     // ---- Modal assemble interception (Spec 754 §3.3c). 1:1 with monitor-shell.ts
@@ -3738,16 +3468,16 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
     // the prompt (friendlier than VICE, which silently drops out — intentional). This
     // runs BEFORE the empty-line no-op below because in mode an empty line is the
     // explicit exit, not a no-op.
-    if let Some(at) = st.mon.asm_cursor {
+    if let Some(at) = st.mon.state.asm_cursor {
         if cmd.is_empty() {
-            st.mon.asm_cursor = None;
+            st.mon.state.asm_cursor = None;
             return Ok(String::new());
         }
         match assemble_at(st, at, &cmd) {
             Ok(out) => return Ok(out),
             Err(e) => {
                 // Re-show the prompt at the UNCHANGED cursor (cursor not advanced).
-                st.mon.pending_prompt = Some(asm_prompt(at));
+                st.mon.state.pending_prompt = Some(asm_prompt(at));
                 return Err(e);
             }
         }
@@ -3770,7 +3500,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
     };
     const LENSES: [&str; 5] = ["cpu", "ram", "rom", "io", "cart"];
     // lensOf: a bank word; `default` → the sticky default. None if absent/other.
-    let bank_default = st.mon.bank_default.clone();
+    let bank_default = st.mon.state.bank_default.clone();
     let lens_of = |t: Option<&String>| -> Option<String> {
         let t = t?;
         let l = t.to_ascii_lowercase();
@@ -3795,7 +3525,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
     // NOT a hard jail, exactly as the TS resolveFsPath (which only DEFAULTS relative
     // paths; `..`/abs escape freely, so TRX64 must not jail what TS doesn't).
     let fs_project_dir = project_knowledge::active_project_dir;
-    let fs_cwd_now = st.mon.fs_cwd.clone().unwrap_or_else(fs_project_dir);
+    let fs_cwd_now = st.fs_cwd.clone().unwrap_or_else(fs_project_dir);
     let resolve_fs_path = |arg: &str| -> String {
         if std::path::Path::new(arg).is_absolute() {
             arg.to_string()
@@ -3838,7 +3568,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
     // the read-inspect verbs r/m/d peek the 1541 drive CPU address space
     // (drive_peek); the C64 path is unchanged otherwise.
     // (closures borrow the machine; defined per-branch to satisfy the borrow checker)
-    let device = st.mon.device.clone();
+    let device = st.mon.state.device.clone();
 
     // ---- device target (Spec 754 §3.3i / audit ws-trace-monitor-misc-8) ----------
     // Sticky inspect target: `device` shows / `device c64|drive8` sets. While
@@ -3853,7 +3583,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             ));
         }
         if arg == "c64" || arg == "drive8" {
-            st.mon.device = arg.clone();
+            st.mon.state.device = arg.clone();
             return Ok(format!("device: {arg}"));
         }
         return Err("device: usage: device c64|drive8".into());
@@ -3869,7 +3599,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
     match op.as_str() {
         // ---- Registers (Spec 754 §3.3d). `r` shows; `r a=$42 x=$10` sets. ----
         "r" | "registers" => {
-            let flow_now = st.flow.current_flow();
+            let flow_now = st.mon.flow.current_flow();
             // audit ws-trace-monitor-misc-8 — device drive8: the 1541 CPU registers
             // (read-only). 1:1 with monitor-shell.ts:481-488 (drive_pc / a / x / y / sp
             // / flags / drive_clk + track/halftrack), so the panel is unambiguously the
@@ -3929,7 +3659,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                             // `g`/`step` resumes from here on the full-machine path (the TS
                             // `r pc=` sets the one CPU; TRX64 has two cores kept in sync).
                             st.session.machine.c64_core.reg_pc = v as u16;
-                            st.mon.disasm_cursor = Some(v as u16);
+                            st.mon.state.disasm_cursor = Some(v as u16);
                             done.push(format!("pc=${:04x}", v as u16));
                         }
                         "p" | "fl" | "flags" => {
@@ -4010,7 +3740,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             // ADDRESS and failed with "bad address", and the sticky `bank <lens>` default
             // had no effect on writes at all.
             let lens_tok = lens_of(toks.get(i));
-            let lens = lens_tok.clone().unwrap_or_else(|| st.mon.bank_default.clone());
+            let lens = lens_tok.clone().unwrap_or_else(|| st.mon.state.bank_default.clone());
             if lens_tok.is_some() {
                 i += 1;
             }
@@ -4033,7 +3763,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
         "m" | "mem" => {
             let mut i = 1;
             let lens_tok = lens_of(toks.get(i));
-            let lens = lens_tok.clone().unwrap_or_else(|| st.mon.bank_default.clone());
+            let lens = lens_tok.clone().unwrap_or_else(|| st.mon.state.bank_default.clone());
             if lens_tok.is_some() {
                 i += 1;
             }
@@ -4042,7 +3772,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             // success. Absent → cursor (the documented default); present-and-bad → say so.
             let start = match toks.get(i) {
                 Some(t) => parse_addr(Some(t)).ok_or_else(|| format!("m: bad address '{t}'"))?,
-                None => st.mon.mem_cursor.unwrap_or(0),
+                None => st.mon.state.mem_cursor.unwrap_or(0),
             };
             let end = parse_addr(toks.get(i + 1))
                 .unwrap_or_else(|| std::cmp::min(0xffff, start as u32 + 0x7ff) as u16);
@@ -4092,7 +3822,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 ));
                 a += 32;
             }
-            st.mon.mem_cursor = Some(((end as u32 + 1) & 0xffff) as u16);
+            st.mon.state.mem_cursor = Some(((end as u32 + 1) & 0xffff) as u16);
             Ok(lines.join("\n"))
         }
 
@@ -4100,17 +3830,17 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
         "d" | "disass" => {
             let mut i = 1;
             let lens_tok = lens_of(toks.get(i));
-            let lens = lens_tok.clone().unwrap_or_else(|| st.mon.bank_default.clone());
+            let lens = lens_tok.clone().unwrap_or_else(|| st.mon.state.bank_default.clone());
             if lens_tok.is_some() {
                 i += 1;
             }
-            let default_pc = if st.mon.device == "drive8" {
+            let default_pc = if st.mon.state.device == "drive8" {
                 st.session.machine.drive8.core.reg_pc
             } else {
                 st.session.machine.cpu6510.reg_pc
             };
             let start = parse_addr(toks.get(i))
-                .or(st.mon.disasm_cursor)
+                .or(st.mon.state.disasm_cursor)
                 .unwrap_or(default_pc);
             // `d <start> <end>` = RANGE (VICE). The 2nd arg, present, is an END addr.
             let end: Option<u16> = if toks.get(i + 1).is_some() {
@@ -4172,7 +3902,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                     n += 1;
                 }
             }
-            st.mon.disasm_cursor = Some(a);
+            st.mon.state.disasm_cursor = Some(a);
             Ok(lines.join("\n"))
         }
 
@@ -4275,7 +4005,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                         .into(),
                 );
             }
-            let default_addr = st.mon.disasm_cursor.unwrap_or(st.session.machine.cpu6510.reg_pc);
+            let default_addr = st.mon.state.disasm_cursor.unwrap_or(st.session.machine.cpu6510.reg_pc);
             let addr = parse_addr(toks.get(i)).map(|a| {
                 i += 1;
                 a
@@ -4351,7 +4081,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             if remaining == 0 {
                 lines.push("-- df: reached step limit".to_string());
             }
-            st.mon.disasm_cursor = Some(a);
+            st.mon.state.disasm_cursor = Some(a);
             Ok(lines.join("\n"))
         }
 
@@ -4466,9 +4196,9 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             )?;
             if toks.len() < 3 {
                 // Enter modal assemble at addr; the interception handles subsequent lines.
-                st.mon.asm_cursor = Some(addr);
-                st.mon.disasm_cursor = Some(addr);
-                st.mon.pending_prompt = Some(asm_prompt(addr));
+                st.mon.state.asm_cursor = Some(addr);
+                st.mon.state.disasm_cursor = Some(addr);
+                st.mon.state.pending_prompt = Some(asm_prompt(addr));
                 return Ok(String::new());
             }
             // Assemble the inline instruction (the rest of the line). This leaves the
@@ -4591,11 +4321,11 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             if arg.is_empty() {
                 return Ok(format!(
                     "bank = {}  (lens for m/d; one of cpu|ram|rom|io|cart)",
-                    st.mon.bank_default
+                    st.mon.state.bank_default
                 ));
             }
             if LENSES.contains(&arg.as_str()) {
-                st.mon.bank_default = arg.clone();
+                st.mon.state.bank_default = arg.clone();
                 Ok(format!("bank = {arg}"))
             } else {
                 Err(format!("bank: expected cpu|ram|rom|io|cart, got '{arg}'"))
@@ -4605,7 +4335,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
         // ---- sidefx [on|off|toggle] (§3.4). ----------------------------------
         "sidefx" => {
             let arg = toks.get(1).map(|s| s.to_ascii_lowercase()).unwrap_or_else(|| "toggle".into());
-            let cur = st.mon.sidefx_on;
+            let cur = st.mon.state.sidefx_on;
             let next = match arg.as_str() {
                 "on" => Some(true),
                 "off" => Some(false),
@@ -4613,7 +4343,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 _ => None,
             };
             let next = next.ok_or("sidefx: on|off|toggle")?;
-            st.mon.sidefx_on = next;
+            st.mon.state.sidefx_on = next;
             Ok(if next {
                 "sidefx = on (m/c/t/h read LIVE — I/O side effects; d/sd/bitmap stay peeks)"
                     .to_string()
@@ -4632,7 +4362,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
         //   ignore <name> [n]        skip the next n triggers
         // 1:1 with monitor-shell.ts:888-1001 (which dispatches `obs`/`o`/`ignore` —
         // there is NO `reg` verb, so TRX64 must not add one or it would diverge). The
-        // parsed spec is stored in `st.dsl_observers` (survives the per-run
+        // parsed spec is stored in `st.mon.dsl_observers` (survives the per-run
         // sync_observers rebuild) and re-applied onto the live registry every run;
         // `o` / bare `obs` list that store.
         "obs" | "o" | "ignore" => {
@@ -4682,7 +4412,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                     None => return Err("ignore: usage: ignore <name> [n]".into()),
                 };
                 let n: i64 = toks.get(2).and_then(|t| t.parse().ok()).unwrap_or(1);
-                let found = st.dsl_observers.iter().any(|o| o.name == name);
+                let found = st.mon.dsl_observers.iter().any(|o| o.name == name);
                 if !found {
                     return Ok(format!("no observer '{name}'"));
                 }
@@ -4693,7 +4423,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 // it), so there is nothing to arm — `set_ignore` returns false and the
                 // count used to vanish while the reply still said "skip next N". Report
                 // the real state instead of a number that will never take effect.
-                if !st.observers.set_ignore(&name, n) {
+                if !st.mon.observers.set_ignore(&name, n) {
                     return Ok(format!(
                         "ignore {name}: observer is off — `obs {name} on` first, then set the count"
                     ));
@@ -4707,23 +4437,24 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             if rest.is_empty() {
                 // sync so the live registry reflects current enabled/hits state.
                 {
-                    let State { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } = &mut *st;
+                    let MonitorSession { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } =
+            &mut st.mon;
                     sync_observers(breakpoints, dsl_observers, dsl_disabled, reg);
                 }
-                if st.dsl_observers.is_empty() {
+                if st.mon.dsl_observers.is_empty() {
                     return Ok("no observers (obs <name> when exec|load|store <addr> [if <cond>] do break|log|mark|cmd|trace)".into());
                 }
                 let lines: Vec<String> = st
-                    .dsl_observers
+                    .mon.dsl_observers
                     .iter()
-                    .map(|s| fmt_obs(s, &st.observers, &st.dsl_disabled))
+                    .map(|s| fmt_obs(s, &st.mon.observers, &st.mon.dsl_disabled))
                     .collect();
                 return Ok(format!("observers:\n{}", lines.join("\n")));
             }
 
             // `obs log` → recent `do log` ring.
             if rest[0].eq_ignore_ascii_case("log") {
-                let logs = &st.observers.logs;
+                let logs = &st.mon.observers.logs;
                 if logs.is_empty() {
                     return Ok("obs log: (empty)".into());
                 }
@@ -4745,7 +4476,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             // TS globMatches() regex (`^` + `*`→".*" + `?`→"." + `$`). Observer names
             // are plain identifiers (no regex metachars), so a direct glob walk suffices.
             let glob_matches = |st: &State| -> Vec<String> {
-                st.dsl_observers
+                st.mon.dsl_observers
                     .iter()
                     .map(|o| o.name.clone())
                     .filter(|n| glob_full_match(&name, n))
@@ -4761,25 +4492,27 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                         return Ok(format!("no observer matches '{name}'"));
                     }
                     for m in &matches {
-                        if sub == "off" { st.dsl_disabled.insert(m.clone()); }
-                        else { st.dsl_disabled.remove(m); }
+                        if sub == "off" { st.mon.dsl_disabled.insert(m.clone()); }
+                        else { st.mon.dsl_disabled.remove(m); }
                     }
                     {
-                        let State { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } = &mut *st;
+                        let MonitorSession { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } =
+            &mut st.mon;
                         sync_observers(breakpoints, dsl_observers, dsl_disabled, reg);
                     }
                     return Ok(format!("{sub} {}: {}", matches.len(), matches.join(", ")));
                 }
-                if !st.dsl_observers.iter().any(|o| o.name == name) {
+                if !st.mon.dsl_observers.iter().any(|o| o.name == name) {
                     return Ok(format!("no observer '{name}'"));
                 }
                 if sub == "off" {
-                    st.dsl_disabled.insert(name.clone());
+                    st.mon.dsl_disabled.insert(name.clone());
                 } else {
-                    st.dsl_disabled.remove(&name);
+                    st.mon.dsl_disabled.remove(&name);
                 }
                 {
-                    let State { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } = &mut *st;
+                    let MonitorSession { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } =
+            &mut st.mon;
                     sync_observers(breakpoints, dsl_observers, dsl_disabled, reg);
                 }
                 return Ok(format!("obs {name} {sub}"));
@@ -4793,17 +4526,17 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                         return Ok(format!("no observer matches '{name}'"));
                     }
                     for m in &matches {
-                        st.dsl_observers.retain(|o| &o.name != m);
-                        st.observers.remove(m);
-                        st.dsl_disabled.remove(m);
+                        st.mon.dsl_observers.retain(|o| &o.name != m);
+                        st.mon.observers.remove(m);
+                        st.mon.dsl_disabled.remove(m);
                     }
                     return Ok(format!("deleted {}: {}", matches.len(), matches.join(", ")));
                 }
-                let before = st.dsl_observers.len();
-                st.dsl_observers.retain(|o| o.name != name);
-                if st.dsl_observers.len() != before {
-                    st.observers.remove(&name);
-                    st.dsl_disabled.remove(&name);
+                let before = st.mon.dsl_observers.len();
+                st.mon.dsl_observers.retain(|o| o.name != name);
+                if st.mon.dsl_observers.len() != before {
+                    st.mon.observers.remove(&name);
+                    st.mon.dsl_disabled.remove(&name);
                     return Ok(format!("obs {name} deleted"));
                 }
                 return Ok(format!("no observer '{name}'"));
@@ -4979,15 +4712,16 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 trace_scope: trace_scope.clone(),
             };
             // Replace an existing same-name registration; else append.
-            if let Some(slot) = st.dsl_observers.iter_mut().find(|o| o.name == name) {
+            if let Some(slot) = st.mon.dsl_observers.iter_mut().find(|o| o.name == name) {
                 *slot = spec;
             } else {
-                st.dsl_observers.push(spec);
+                st.mon.dsl_observers.push(spec);
             }
             // Apply onto the live registry immediately so a running --stream loop arms it
             // on the next frame (sync_observers re-applies it thereafter).
             {
-                let State { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } = &mut *st;
+                let MonitorSession { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } =
+            &mut st.mon;
                 sync_observers(breakpoints, dsl_observers, dsl_disabled, reg);
             }
 
@@ -5002,7 +4736,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 format!("${lo:04x}")
             };
             let cond_disp = cond_src.map(|c| format!(" if {c}")).unwrap_or_default();
-            let do_disp = obs_do_desc(st.dsl_observers.last().unwrap());
+            let do_disp = obs_do_desc(st.mon.dsl_observers.last().unwrap());
             return Ok(format!("obs {name}: {trig_str} {range}{cond_disp} do {do_disp}"));
         }
 
@@ -5010,7 +4744,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             let t1 = toks.get(1);
             match t1 {
                 None => {
-                    let list = &st.breakpoints.entries;
+                    let list = &st.mon.breakpoints.entries;
                     Ok(if list.is_empty() {
                         "no breakpoints (set: bk <addr>)".to_string()
                     } else {
@@ -5026,25 +4760,25 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                     })
                 }
                 Some(t1) if t1.eq_ignore_ascii_case("clear") => {
-                    st.breakpoints.entries.clear();
+                    st.mon.breakpoints.entries.clear();
                     Ok("breakpoints cleared".to_string())
                 }
                 Some(t1) if t1.starts_with('-') => {
                     let a = parse_addr(Some(&t1[1..].to_string()))
                         .ok_or_else(|| format!("bad address: {t1}"))?;
-                    st.breakpoints.entries.retain(|e| e.pc != a);
-                    Ok(format!("removed bp ${:04x} ({} left)", a, st.breakpoints.entries.len()))
+                    st.mon.breakpoints.entries.retain(|e| e.pc != a);
+                    Ok(format!("removed bp ${:04x} ({} left)", a, st.mon.breakpoints.entries.len()))
                 }
                 Some(t1) => {
                     let addr = parse_addr(Some(t1)).ok_or_else(|| format!("bad address: {t1}"))?;
-                    let num = st.breakpoints.next_num;
-                    st.breakpoints.next_num += 1;
-                    st.breakpoints.entries.push(BpEntry { num, pc: addr, enabled: true });
+                    let num = st.mon.breakpoints.next_num;
+                    st.mon.breakpoints.next_num += 1;
+                    st.mon.breakpoints.entries.push(BpEntry { num, pc: addr, enabled: true });
                     Ok(format!(
                         "bk #{} set at {} ({} total)",
                         num,
                         addr_spans::addr4(addr, SpanSpace::C64, SpanRole::Pc),
-                        st.breakpoints.entries.len()
+                        st.mon.breakpoints.entries.len()
                     ))
                 }
             }
@@ -5053,7 +4787,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
         // ---- Delete breakpoint(s): del | del <num> ... ----------------------
         "del" | "delete" => {
             if toks.get(1).is_none() {
-                st.breakpoints.entries.clear();
+                st.mon.breakpoints.entries.clear();
                 return Ok("all breakpoints deleted".to_string());
             }
             let mut out: Vec<String> = Vec::new();
@@ -5061,9 +4795,9 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 match t.parse::<u32>() {
                     Err(_) => out.push(format!("bad checknum: {t}")),
                     Ok(num) => {
-                        let before = st.breakpoints.entries.len();
-                        st.breakpoints.entries.retain(|e| e.num != num);
-                        if st.breakpoints.entries.len() < before {
+                        let before = st.mon.breakpoints.entries.len();
+                        st.mon.breakpoints.entries.retain(|e| e.num != num);
+                        if st.mon.breakpoints.entries.len() < before {
                             out.push(format!("deleted #{num}"));
                         } else {
                             out.push(format!("no breakpoint #{num}"));
@@ -5097,8 +4831,8 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             // observer — the run could never get past that address, while a plain
             // breakpoint at the identical PC resumed fine. The reference carries the
             // observer half of this check explicitly.
-            let on_exec_obs = st.observers.exec_active && st.observers.exec_watch[gpc as usize] != 0;
-            if on_exec_obs || st.breakpoints.entries.iter().any(|e| e.pc == gpc) {
+            let on_exec_obs = st.mon.observers.exec_active && st.mon.observers.exec_watch[gpc as usize] != 0;
+            if on_exec_obs || st.mon.breakpoints.entries.iter().any(|e| e.pc == gpc) {
                 step_one_instruction(&mut st.session);
             }
             st.session.running = true;
@@ -5121,7 +4855,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             // bps = { addr } ∪ user breakpoints (VICE `until` respects bps).
             let mut bps: std::collections::HashSet<u16> = std::collections::HashSet::new();
             bps.insert(addr);
-            for e in &st.breakpoints.entries {
+            for e in &st.mon.breakpoints.entries {
                 bps.insert(e.pc);
             }
             if bps.contains(&st.session.machine.cpu6510.reg_pc) {
@@ -5158,7 +4892,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             }
             let cyc = st.session.machine.clk.wrapping_sub(start_clk);
             let pc = st.session.machine.cpu6510.reg_pc;
-            st.mon.disasm_cursor = Some(pc);
+            st.mon.state.disasm_cursor = Some(pc);
             Ok(if hit {
                 format!(
                     "until ${:04x} reached -> .C:{:04x} ({} instr, {} cyc)",
@@ -5186,12 +4920,12 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             let clk0 = st.session.machine.clk;
             // stepInto (stepping.ts:195-198): one instruction (may enter an IRQ/NMI),
             // tracked into the FlowTracker so `flow` reflects the live interrupt frame.
-            step_one_with_flow(&mut st.session, &mut st.flow);
+            step_one_with_flow(&mut st.session, &mut st.mon.flow);
             let cyc = st.session.machine.clk.wrapping_sub(clk0); // r.cyc (single step)
             let pc = st.session.machine.cpu6510.reg_pc;
-            st.mon.disasm_cursor = Some(pc);
+            st.mon.state.disasm_cursor = Some(pc);
             let (_, line) = addr_spans::disasm_line(|a| st.session.machine.peek_lens(a, "cpu"), pc, SpanSpace::C64);
-            Ok(land_line(&line, "step", cyc, st.flow.current_flow(), StopWhy::Clean))
+            Ok(land_line(&line, "step", cyc, st.mon.flow.current_flow(), StopWhy::Clean))
         }
         "n" | "next" | "so" => {
             st.session.running = false;
@@ -5200,7 +4934,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             let opcode = st.session.machine.peek_lens(start_pc, "cpu");
             let is_jsr = opcode == 0x20;
             let bp_set: std::collections::HashSet<u16> =
-                st.breakpoints.entries.iter().map(|e| e.pc).collect();
+                st.mon.breakpoints.entries.iter().map(|e| e.pc).collect();
             // Execute the instruction at PC; `r_cyc` = ITS own cost (the value TS
             // reports for `next`, even when it's a JSR — stepping.ts:217). Track the
             // single instruction into the FlowTracker UNLESS it's a JSR: stepOver
@@ -5211,7 +4945,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             if is_jsr {
                 step_one_instruction(&mut st.session);
             } else {
-                step_one_with_flow(&mut st.session, &mut st.flow);
+                step_one_with_flow(&mut st.session, &mut st.mon.flow);
             }
             let r_cyc = st.session.machine.clk.wrapping_sub(clk0);
             let mut why = StopWhy::Clean;
@@ -5245,15 +4979,15 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 }
             }
             let pc = st.session.machine.cpu6510.reg_pc;
-            st.mon.disasm_cursor = Some(pc);
+            st.mon.state.disasm_cursor = Some(pc);
             let (_, line) = addr_spans::disasm_line(|a| st.session.machine.peek_lens(a, "cpu"), pc, SpanSpace::C64);
-            Ok(land_line(&line, "next", r_cyc, st.flow.current_flow(), why))
+            Ok(land_line(&line, "next", r_cyc, st.mon.flow.current_flow(), why))
         }
         "ret" | "return" => {
             st.session.running = false;
             let sp0 = st.session.machine.cpu6510.reg_sp;
             let bp_set: std::collections::HashSet<u16> =
-                st.breakpoints.entries.iter().map(|e| e.pc).collect();
+                st.mon.breakpoints.entries.iter().map(|e| e.pc).collect();
             const SKIP_CAP: u64 = 5_000_000;
             let mut guard: u64 = 0;
             let mut last_cyc: u64 = 0;
@@ -5270,7 +5004,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 let clk0 = st.session.machine.clk;
                 // runReturn (stepping.ts:234-246) calls apply() on EVERY step, so the
                 // flow stack stays consistent across an interrupt taken mid-return.
-                step_one_with_flow(&mut st.session, &mut st.flow);
+                step_one_with_flow(&mut st.session, &mut st.mon.flow);
                 last_cyc = st.session.machine.clk.wrapping_sub(clk0); // r.cyc
                 guard += 1;
                 let pc = st.session.machine.cpu6510.reg_pc;
@@ -5285,9 +5019,9 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 }
             }
             let pc = st.session.machine.cpu6510.reg_pc;
-            st.mon.disasm_cursor = Some(pc);
+            st.mon.state.disasm_cursor = Some(pc);
             let (_, line) = addr_spans::disasm_line(|a| st.session.machine.peek_lens(a, "cpu"), pc, SpanSpace::C64);
-            Ok(land_line(&line, "return", last_cyc, st.flow.current_flow(), why))
+            Ok(land_line(&line, "return", last_cyc, st.mon.flow.current_flow(), why))
         }
 
         // ---- flow / bt — Spec 754 §3.3h capability panels (audit misc-13). ----
@@ -5304,7 +5038,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             //   `flow: current=<kind>  focus=<focus>\nframes:\n<lines | placeholder>`.
             // At the cold/rest state the stack is empty → current=main; after stepping
             // into an interrupt it is state-dependent (current=irq|nmi|brk + frames).
-            Ok(st.flow.render())
+            Ok(st.mon.flow.render())
         }
 
         // ---- tracedb — run a STORED trace definition (monitor-shell.ts:445-470) ------
@@ -5526,10 +5260,10 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
         "focus" => {
             let arg = toks.get(1).map(|s| s.to_ascii_lowercase()).unwrap_or_default();
             if arg.is_empty() {
-                let stack = if st.flow.stack.is_empty() {
+                let stack = if st.mon.flow.stack.is_empty() {
                     "  (main — no interrupt/trap frame active)".to_string()
                 } else {
-                    st.flow
+                    st.mon.flow
                         .stack
                         .iter()
                         .map(|f| {
@@ -5547,13 +5281,13 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 };
                 return Ok(format!(
                     "focus = {} (current flow: {})\nflow stack:\n{stack}",
-                    st.flow.focus,
-                    st.flow.current_flow().tag()
+                    st.mon.flow.focus,
+                    st.mon.flow.current_flow().tag()
                 ));
             }
             if matches!(arg.as_str(), "auto" | "main" | "irq" | "nmi" | "brk" | "none" | "clear") {
-                st.flow.focus = if arg == "clear" { "none".to_string() } else { arg };
-                Ok(format!("focus = {}", st.flow.focus))
+                st.mon.flow.focus = if arg == "clear" { "none".to_string() } else { arg };
+                Ok(format!("focus = {}", st.mon.flow.focus))
             } else {
                 Err(format!("focus: expected auto|main|irq|nmi|brk|clear, got '{arg}'"))
             }
@@ -5564,9 +5298,9 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
         "sf" | "stepf" | "nf" | "nextf" => {
             st.session.running = false;
             let over = matches!(op.as_str(), "nf" | "nextf");
-            let want = st.flow.effective_focus();
+            let want = st.mon.flow.effective_focus();
             let bp_set: std::collections::HashSet<u16> =
-                st.breakpoints.entries.iter().map(|e| e.pc).collect();
+                st.mon.breakpoints.entries.iter().map(|e| e.pc).collect();
             const FOCUS_CAP: u64 = 1_000_000;
             let mut guard: u64 = 0;
             let mut why = StopWhy::Cap;
@@ -5577,7 +5311,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 let sp0 = st.session.machine.cpu6510.reg_sp;
                 let was_jsr = st.session.machine.peek_lens(pc0, "cpu") == 0x20;
                 let clk0 = st.session.machine.clk;
-                step_one_with_flow(&mut st.session, &mut st.flow);
+                step_one_with_flow(&mut st.session, &mut st.mon.flow);
                 cyc = st.session.machine.clk.wrapping_sub(clk0);
                 if over && was_jsr {
                     // Run the callee out, exactly as `next` does, so a focus walk does
@@ -5593,7 +5327,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                         if bp_set.contains(&pc) {
                             break;
                         }
-                        step_one_with_flow(&mut st.session, &mut st.flow);
+                        step_one_with_flow(&mut st.session, &mut st.mon.flow);
                         iters += 1;
                     }
                 }
@@ -5602,7 +5336,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                     why = StopWhy::UserBp;
                     break;
                 }
-                if st.flow.current_flow() == want {
+                if st.mon.flow.current_flow() == want {
                     why = StopWhy::Clean;
                     break;
                 }
@@ -5612,10 +5346,10 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 }
             }
             let pc = st.session.machine.cpu6510.reg_pc;
-            st.mon.disasm_cursor = Some(pc);
+            st.mon.state.disasm_cursor = Some(pc);
             let (_, line) = addr_spans::disasm_line(|a| st.session.machine.peek_lens(a, "cpu"), pc, SpanSpace::C64);
             let tag = format!("{}:{}", if over { "nextf" } else { "stepf" }, want.tag());
-            Ok(land_line(&line, &tag, cyc, st.flow.current_flow(), why))
+            Ok(land_line(&line, &tag, cyc, st.mon.flow.current_flow(), why))
         }
         "bt" => {
             // buildBacktrace (backtrace.ts): scan $0100+((sp+1)&0xff) .. $01FF in
@@ -5646,9 +5380,9 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             }
             // backtrace.ts:35-38 — append the EXACT FlowTracker IRQ/NMI/BRK frames
             // (more than VICE) when the flow stack is non-empty.
-            if !st.flow.stack.is_empty() {
+            if !st.mon.flow.stack.is_empty() {
                 lines.push("flow frames (exact, from stepping):".to_string());
-                for fr in &st.flow.stack {
+                for fr in &st.mon.flow.stack {
                     lines.push(format!(
                         "  {} @ {}",
                         fr.kind.tag(),
@@ -5792,10 +5526,10 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
         "traprules" => {
             match toks.get(1).map(|s| s.as_str()) {
                 None => {
-                    if st.trap_rules.is_empty() {
+                    if st.mon.trap_rules.is_empty() {
                         return Ok("traprules: none loaded. `traprules <path.json>` loads project on-trap dump rules.".into());
                     }
-                    let mut rules: Vec<&TrapRule> = st.trap_rules.values().collect();
+                    let mut rules: Vec<&TrapRule> = st.mon.trap_rules.values().collect();
                     rules.sort_by_key(|r| r.pc);
                     let mut lines = vec![format!("traprules: {} rule(s):", rules.len())];
                     for r in rules {
@@ -5810,8 +5544,8 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                     Ok(lines.join("\n"))
                 }
                 Some("clear") => {
-                    let n = st.trap_rules.len();
-                    st.trap_rules.clear();
+                    let n = st.mon.trap_rules.len();
+                    st.mon.trap_rules.clear();
                     Ok(format!("traprules: cleared {n} rule(s)"))
                 }
                 Some(arg) => {
@@ -5823,11 +5557,11 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                     let rules = parse_trap_rules(&json)?;
                     let n = rules.len();
                     for r in rules {
-                        st.trap_rules.insert(r.pc, r);
+                        st.mon.trap_rules.insert(r.pc, r);
                     }
                     Ok(format!(
                         "traprules: loaded {n} rule(s) from {path} ({} total). They auto-emit on reaching their PC (JAM / breakpoint).",
-                        st.trap_rules.len()
+                        st.mon.trap_rules.len()
                     ))
                 }
             }
@@ -6651,10 +6385,10 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                     run_cycle_budget(&mut st.session, 5_000_000);
                     st.ctrl_stop = None;
                     st.ctrl_frame += 1;
-                    st.flow.reset();
+                    st.mon.flow.reset();
                     st.stream_broke_on_jam = false;
-                    st.mon.disasm_cursor = None;
-                    st.mon.mem_cursor = None;
+                    st.mon.state.disasm_cursor = None;
+                    st.mon.state.mem_cursor = None;
                     // A real machine reset boots and RUNS; leaving it frozen at the
                     // reset vector was the cockpit's job to undo, and the cockpit is a
                     // pipe now.
@@ -7032,7 +6766,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 let (cart_bytes, cart_flash) = capture_cart_blobs(&mut st.session.machine);
                 let media_inputs = gather_native_media_inputs(&st.session);
                 let media_summary = gather_snapshot_media(&st.session);
-                let breakpoints = st.breakpoints.entries.len();
+                let breakpoints = st.mon.breakpoints.entries.len();
                 let m = &st.session.machine;
                 let checkpoint = trx64_core::c64re_snapshot::capture_runtime_checkpoint(
                     m, &disk_path, &disk_format,
@@ -7088,7 +6822,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 // ── snapshot/undump (shared core — power-cycle → restore) ──────────
                 match undump_native_snapshot(st, &path) {
                     Ok(r) => {
-                        let breakpoints = st.breakpoints.entries.len();
+                        let breakpoints = st.mon.breakpoints.entries.len();
                         // formatUndumpSummary (= snapshot-persistence.ts:282-292).
                         let media = if r.media.is_empty() {
                             "none".to_string()
@@ -7308,7 +7042,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 None => fs_project_dir(),
             };
             match std::fs::metadata(&d) {
-                Ok(md) if md.is_dir() => { st.mon.fs_cwd = Some(d.clone()); Ok(d) }
+                Ok(md) if md.is_dir() => { st.fs_cwd = Some(d.clone()); Ok(d) }
                 Ok(_) => Err(format!("cd: not a directory: {d}")),
                 Err(_) => Err(format!("cd: no such directory: {d}")),
             }
@@ -7374,7 +7108,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             st.session.machine.poke(load_address, body);
             st.session.machine.sync_after_monitor();
             let end_address = load_address.wrapping_add(body.len() as u16).wrapping_sub(1);
-            st.mon.disasm_cursor = Some(load_address);
+            st.mon.state.disasm_cursor = Some(load_address);
             let bn = std::path::Path::new(&f).file_name()
                 .map(|n| n.to_string_lossy().to_string()).unwrap_or(f.clone());
             Ok(format!(
@@ -7424,7 +7158,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 n += 1;
             }
             st.session.machine.sync_after_monitor();
-            st.mon.disasm_cursor = Some(addr);
+            st.mon.state.disasm_cursor = Some(addr);
             let bn = std::path::Path::new(&f).file_name()
                 .map(|n| n.to_string_lossy().to_string()).unwrap_or(f.clone());
             let end = (addr as u32 + n.saturating_sub(1)) & 0xffff;
@@ -7691,9 +7425,9 @@ fn assemble_at(st: &mut State, addr: u16, text: &str) -> Result<String, String> 
     st.session.machine.poke(addr, &r.bytes);
     st.session.injected = true;
     let next = addr.wrapping_add(r.size);
-    st.mon.asm_cursor = Some(next);
-    st.mon.disasm_cursor = Some(next);
-    st.mon.pending_prompt = Some(asm_prompt(next));
+    st.mon.state.asm_cursor = Some(next);
+    st.mon.state.disasm_cursor = Some(next);
+    st.mon.state.pending_prompt = Some(asm_prompt(next));
     let bytes_col: String = r.bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
     let (_, back) = addr_spans::disasm_line(|a| st.session.machine.peek_lens(a, "cpu"), addr, SpanSpace::C64);
     Ok(format!("{:04x}  {:<11}  {}", addr, bytes_col, back))
@@ -8406,10 +8140,11 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
             // the ephemeral target as a temporary exec observer, drive the segment
             // run, and remove the ephemeral after.
             {
-                let State { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } = &mut *st;
+                let MonitorSession { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } =
+            &mut st.mon;
                 sync_observers(breakpoints, dsl_observers, dsl_disabled, reg);
             }
-            let _ = st.observers.add(observers::ObsSpec {
+            let _ = st.mon.observers.add(observers::ObsSpec {
                 name: "__until__".to_string(),
                 trigger: observers::ObsTrigger::Exec,
                 lo: target_addr,
@@ -8422,15 +8157,16 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
                 trace_scope: None,
             });
             let run = {
-                let State { session, observers: reg, .. } = &mut *st;
+                let State { session, mon, .. } = &mut *st;
+        let reg = &mut mon.observers;
                 let fm = full_machine_gate(session);
                 run_until_break(session, reg, cycle_budget, fm)
             };
             {
-                let State { breakpoints, observers: reg, .. } = &mut *st;
+                let MonitorSession { breakpoints, observers: reg, .. } = &mut st.mon;
                 writeback_hits(breakpoints, reg);
             }
-            st.observers.remove("__until__");
+            st.mon.observers.remove("__until__");
 
             let halted = run.halted;
             let budget_exhausted = !run.halted;
@@ -8453,8 +8189,8 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
             let action = args.get(2).and_then(|v| v.as_str()).unwrap_or("halt").to_string();
             let mut st = state.lock().unwrap();
             // Remove existing with same id before re-adding
-            st.breakpoints.api_entries.retain(|e| e.id != bp_id);
-            st.breakpoints.api_entries.push(ApiBpEntry {
+            st.mon.breakpoints.api_entries.retain(|e| e.id != bp_id);
+            st.mon.breakpoints.api_entries.push(ApiBpEntry {
                 id: bp_id.clone(),
                 pc,
                 action,
@@ -8469,10 +8205,10 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
         "listBreakpoints" => {
             // TS BreakpointManager.list() returns specs with hitCount and _ignoreRemaining set on add().
             let st = state.lock().unwrap();
-            let list: Vec<Value> = st.breakpoints.api_entries.iter().map(|e| {
+            let list: Vec<Value> = st.mon.breakpoints.api_entries.iter().map(|e| {
                 // Report the REAL hit count + remaining ignore from the registry
                 // observer (falls back to the bp-surface mirror when no run yet).
-                let (hits, ignore_rem) = st.observers.get(&e.id)
+                let (hits, ignore_rem) = st.mon.observers.get(&e.id)
                     .map(|o| (o.hits, o.ignore_left))
                     .unwrap_or((e.hit_count, e.ignore_count as u64));
                 let mut obj = json!({
@@ -8494,9 +8230,9 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
         "removeBreakpoint" => {
             let bp_id = args.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
             let mut st = state.lock().unwrap();
-            let before = st.breakpoints.api_entries.len();
-            st.breakpoints.api_entries.retain(|e| e.id != bp_id);
-            let removed = st.breakpoints.api_entries.len() < before;
+            let before = st.mon.breakpoints.api_entries.len();
+            st.mon.breakpoints.api_entries.retain(|e| e.id != bp_id);
+            let removed = st.mon.breakpoints.api_entries.len() < before;
             Response::ok(id, json!(removed))
         }
 
@@ -8642,8 +8378,8 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
             let hit_limit = spec.get("hitLimit").and_then(|v| v.as_u64()).map(|n| n as u32);
             let ignore_count = spec.get("ignoreCount").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             let mut st = state.lock().unwrap();
-            st.breakpoints.api_entries.retain(|e| e.id != bp_id);
-            st.breakpoints.api_entries.push(ApiBpEntry {
+            st.mon.breakpoints.api_entries.retain(|e| e.id != bp_id);
+            st.mon.breakpoints.api_entries.push(ApiBpEntry {
                 id: bp_id.clone(),
                 pc,
                 action,
@@ -8662,8 +8398,8 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
             let bp_id = args.first().and_then(|v| v.as_str()).unwrap_or("tp0").to_string();
             let pc = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u16;
             let mut st = state.lock().unwrap();
-            st.breakpoints.api_entries.retain(|e| e.id != bp_id);
-            st.breakpoints.api_entries.push(ApiBpEntry {
+            st.mon.breakpoints.api_entries.retain(|e| e.id != bp_id);
+            st.mon.breakpoints.api_entries.push(ApiBpEntry {
                 id: bp_id.clone(),
                 pc,
                 action: "trace".to_string(),
@@ -8680,7 +8416,7 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
             let bp_id = args.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
             let enabled = args.get(1).and_then(|v| v.as_bool()).unwrap_or(true);
             let mut st = state.lock().unwrap();
-            if let Some(e) = st.breakpoints.api_entries.iter_mut().find(|e| e.id == bp_id) {
+            if let Some(e) = st.mon.breakpoints.api_entries.iter_mut().find(|e| e.id == bp_id) {
                 e.enabled = enabled;
             }
             Response::void(id)
@@ -8691,7 +8427,7 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
             let bp_id = args.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
             let count = args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             let mut st = state.lock().unwrap();
-            if let Some(e) = st.breakpoints.api_entries.iter_mut().find(|e| e.id == bp_id) {
+            if let Some(e) = st.mon.breakpoints.api_entries.iter_mut().find(|e| e.id == bp_id) {
                 e.ignore_count = count;
             }
             Response::void(id)
@@ -9057,7 +8793,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             st.recorder = None;
             st.last_trace_path = None;
             st.last_run_id = None;
-            st.mon.fs_cwd = None;
+            st.fs_cwd = None;
             // 4) Switch, 5) power up fresh, 6) tell every client.
             project_knowledge::set_project_override(requested.clone());
             do_power_on(&mut st);
@@ -9319,25 +9055,27 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             // no-debug + trace-firehose paths (formats-state-6, background-workers-
             // async-5) are unchanged.
             {
-                let State { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } = &mut *st;
+                let MonitorSession { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } =
+            &mut st.mon;
                 sync_observers(breakpoints, dsl_observers, dsl_disabled, reg);
             }
-            if observers_armed(&st.observers) {
+            if observers_armed(&st.mon.observers) {
                 // runtime-controller.ts:277 / ws-server.ts:855 — step PAST a bp the PC is
                 // sitting ON so the run doesn't immediately re-trip the same address.
                 {
                     let pc = st.session.machine.c64_core.reg_pc;
-                    if st.breakpoints.entries.iter().any(|e| e.enabled && e.pc == pc) {
+                    if st.mon.breakpoints.entries.iter().any(|e| e.enabled && e.pc == pc) {
                         step_one_instruction(&mut st.session);
                     }
                 }
                 let run = {
-                    let State { session, observers: reg, .. } = &mut *st;
+                    let State { session, mon, .. } = &mut *st;
+        let reg = &mut mon.observers;
                     let fm = full_machine_gate(session);
                     run_until_break(session, reg, cycles, fm)
                 };
                 {
-                    let State { breakpoints, observers: reg, .. } = &mut *st;
+                    let MonitorSession { breakpoints, observers: reg, .. } = &mut st.mon;
                     writeback_hits(breakpoints, reg);
                 }
                 let cycles_now = st.session.machine.clk;
@@ -9345,7 +9083,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                     // bpNumForAddr returns 0 (NOT null) when no numbered bp matches
                     // (runtime-controller.ts:238) — match the TS reply exactly.
                     let bp_num = st
-                        .breakpoints
+                        .mon.breakpoints
                         .entries
                         .iter()
                         .find(|e| e.pc == run.pc)
@@ -9797,7 +9535,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 // FlowTracker frames are stale.
                 st.ctrl_stop = None;
                 st.ctrl_frame += 1;
-                st.flow.reset();
+                st.mon.flow.reset();
                 st.stream_broke_on_jam = false;
                 st.notify.broadcast("audio/flush", json!({ "session_id": st.session.id }));
             } else {
@@ -10154,7 +9892,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             // Forward the modal `prompt` (= TS `MonitorResult.prompt`) when a modal verb
             // (`a` assemble / `df -i`) set one — so the wire reply matches the TS
             // `runMonitorCommand` `{ output, prompt }` / `{ error, prompt }` shape.
-            let prompt = st.mon.pending_prompt.take();
+            let prompt = st.mon.state.pending_prompt.take();
             let (key, raw) = match res {
                 Ok(out) => ("output", out),
                 Err(e) => ("error", e),
@@ -10177,7 +9915,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
         "monitor/state" => {
             let st = state.lock().unwrap();
             let mut body = monitor_machine_json(&st);
-            body["asmCursor"] = json!(st.mon.asm_cursor);
+            body["asmCursor"] = json!(st.mon.state.asm_cursor);
             merge_identity(&mut body, st.session.machine.model());
             Response::ok(id, body)
         }
@@ -10314,7 +10052,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             st.session.running = false;
             st.ctrl_frame += 1;
             let frame = st.ctrl_frame;
-            let bps = st.breakpoints.list_vice_json();
+            let bps = st.mon.breakpoints.list_vice_json();
             let c = &st.session.machine.cpu6510;
             let pc = c.reg_pc as u64;
             let cycles = st.session.machine.clk;
@@ -10409,13 +10147,13 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
         "debug/break_add" => {
             let pc_val = req.params.get("pc").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
             let mut st = state.lock().unwrap();
-            let num = st.breakpoints.next_num;
-            st.breakpoints.next_num += 1;
-            st.breakpoints.entries.push(BpEntry { num, pc: pc_val, enabled: true });
+            let num = st.mon.breakpoints.next_num;
+            st.mon.breakpoints.next_num += 1;
+            st.mon.breakpoints.entries.push(BpEntry { num, pc: pc_val, enabled: true });
             // audit ws-session-debug-5 — emit `addr` (not `pc`) for each entry: TS
             // uniformly keys a breakpoint by `addr` (runtime-controller.ts
             // listBreakpoints → {num, addr}; ws-server.ts break_add/del/list echo it).
-            let list: Vec<Value> = st.breakpoints.entries.iter()
+            let list: Vec<Value> = st.mon.breakpoints.entries.iter()
                 .map(|e| json!({ "num": e.num, "addr": e.pc as u64 }))
                 .collect();
             Response::ok(id, json!({
@@ -10428,13 +10166,13 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             let del_id = req.params.get("id").and_then(|v| v.as_u64());
             let mut st = state.lock().unwrap();
             if let Some(n) = del_id {
-                st.breakpoints.entries.retain(|e| e.num != n as u32);
+                st.mon.breakpoints.entries.retain(|e| e.num != n as u32);
             } else {
                 // No id = delete all
-                st.breakpoints.entries.clear();
+                st.mon.breakpoints.entries.clear();
             }
             // audit ws-session-debug-5 — `addr` key (= TS), not `pc`.
-            let list: Vec<Value> = st.breakpoints.entries.iter()
+            let list: Vec<Value> = st.mon.breakpoints.entries.iter()
                 .map(|e| json!({ "num": e.num, "addr": e.pc as u64 }))
                 .collect();
             Response::ok(id, json!({
@@ -10446,7 +10184,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
         "debug/break_list" => {
             let st = state.lock().unwrap();
             // audit ws-session-debug-5 — `addr` key (= TS), not `pc`.
-            let list: Vec<Value> = st.breakpoints.entries.iter()
+            let list: Vec<Value> = st.mon.breakpoints.entries.iter()
                 .map(|e| json!({ "num": e.num, "addr": e.pc as u64 }))
                 .collect();
             Response::ok(id, json!({ "breakpoints": list }))
@@ -10678,10 +10416,11 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                     // Mirror the standing bp surface, add the ephemeral until_pc
                     // exec observer, run, then remove it — same pattern as `until`.
                     {
-                        let State { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } = &mut *st;
+                        let MonitorSession { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } =
+            &mut st.mon;
                         sync_observers(breakpoints, dsl_observers, dsl_disabled, reg);
                     }
-                    let _ = st.observers.add(observers::ObsSpec {
+                    let _ = st.mon.observers.add(observers::ObsSpec {
                         name: "__overlay_until__".to_string(),
                         trigger: observers::ObsTrigger::Exec,
                         lo: target,
@@ -10694,15 +10433,16 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                         trace_scope: None,
                     });
                     let run = {
-                        let State { session, observers: reg, .. } = &mut *st;
+                        let State { session, mon, .. } = &mut *st;
+        let reg = &mut mon.observers;
                         let fm = full_machine_gate(session);
                         run_until_break(session, reg, run_cycles, fm)
                     };
                     {
-                        let State { breakpoints, observers: reg, .. } = &mut *st;
+                        let MonitorSession { breakpoints, observers: reg, .. } = &mut st.mon;
                         writeback_hits(breakpoints, reg);
                     }
-                    st.observers.remove("__overlay_until__");
+                    st.mon.observers.remove("__overlay_until__");
                     // r.aborted === "breakpoint" → hitPc = r.lastPc.
                     if run.halted && run.reason == "breakpoint" {
                         hit_pc = Some(run.pc);
@@ -14420,7 +14160,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                     "bytes": m.bytes.as_ref().map(|b| b.len()).unwrap_or(0) as u64,
                 }))
                 .collect();
-            let breakpoints = st.breakpoints.entries.len() as u64;
+            let breakpoints = st.mon.breakpoints.entries.len() as u64;
             let model_name = machine_model_name(st.session.machine.speed_profile(), st.session.machine.model());
             drop(st);
 
@@ -14519,7 +14259,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             // The `media` summary for the WS response (role/format/sourceName/
             // sha256/bytes) — matches c64re's DumpResult.media.
             let media_summary = gather_snapshot_media(&st.session);
-            let breakpoints = st.breakpoints.entries.len() as u64;
+            let breakpoints = st.mon.breakpoints.entries.len() as u64;
             let model_name = machine_model_name(st.session.machine.speed_profile(), st.session.machine.model());
             drop(st);
 
@@ -14563,7 +14303,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             // a restore → the session is left paused.
             match undump_native_snapshot(&mut st, &path) {
                 Ok(r) => {
-                    let breakpoints = st.breakpoints.entries.len() as u64;
+                    let breakpoints = st.mon.breakpoints.entries.len() as u64;
                     let media_summary: Vec<Value> = r
                         .media
                         .iter()
@@ -15355,12 +15095,12 @@ pub(crate) fn detect_media_kind(bytes: &[u8], name: &str) -> Result<MediaKind, S
 /// Resolve a user file path the way the monitor FILE shell does (resolveFsPath):
 /// absolute → unchanged; relative → joined to the session cwd (`cd`) or the project
 /// dir when unset. Lets `/mount foo.crt` after `cd out` read .../out/foo.crt instead
-/// of the daemon's process cwd (the cockpit `cd` sets `st.mon.fs_cwd`).
+/// of the daemon's process cwd (the cockpit `cd` sets `st.fs_cwd`).
 fn resolve_fs_path_with_state(st: &State, arg: &str) -> String {
     if arg.is_empty() || std::path::Path::new(arg).is_absolute() {
         return arg.to_string();
     }
-    let cwd = st.mon.fs_cwd.clone().unwrap_or_else(|| {
+    let cwd = st.fs_cwd.clone().unwrap_or_else(|| {
         project_knowledge::active_project_dir()
     });
     std::path::Path::new(&cwd).join(arg).to_string_lossy().to_string()
@@ -15541,7 +15281,7 @@ fn monitor_machine_json(st: &State) -> Value {
         None => (1, 1, None),
     };
     json!({
-        "device": st.mon.device,
+        "device": st.mon.state.device,
         "cpuPortDirection": m.port_dir as u64,
         "cpuPortValue": m.port_data as u64,
         "exrom": exrom,
@@ -16674,7 +16414,7 @@ pub(crate) fn maybe_autopause_capped_run(st: &mut State) {
 /// from the live `State`. Shared by `debug/state` and `checkpoint/restore`'s
 /// `state` field so both report the identical shape.
 fn build_debug_state(st: &State) -> Value {
-    let bps = st.breakpoints.list_vice_json();
+    let bps = st.mon.breakpoints.list_vice_json();
     let pc = st.session.machine.cpu6510.reg_pc as u64;
     let cycles = st.session.machine.clk;
     let run_state = if st.session.running { "running" } else { "paused" };
@@ -17852,7 +17592,7 @@ fn undump_native_snapshot(st: &mut State, path: &str) -> Result<UndumpResult, St
     let pc = st.session.machine.c64_core.reg_pc;
     let cycle = st.session.machine.c64_core.clk;
     st.session.running = false;
-    st.mon.disasm_cursor = Some(pc); // bare `d` follows the restored PC
+    st.mon.state.disasm_cursor = Some(pc); // bare `d` follows the restored PC
     // Refresh the paused canvas to the RESTORED frame. The `--stream` paused loop is
     // otherwise silent (it only advances a running machine), so without this the UI
     // keeps showing the pre-undump picture — a restore that "looks borked / not 1:1".
@@ -18976,10 +18716,6 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         u64_speed_table: trx64_core::vic::U64SpeedTable::U64II,
         input_journal: None,
         session,
-        breakpoints: Breakpoints::new(),
-        observers: observers::ObserverRegistry::new(),
-        dsl_observers: Vec::new(),
-        dsl_disabled: std::collections::HashSet::new(),
         type_buffer: Vec::new(),
         ctrl_frame: 0, // incremented on each debug/run|pause|continue; first pause → 1
         machine_generation: 0,
@@ -19039,12 +18775,11 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         candidate_seq: 0,
         checkpoint_thumbs: std::collections::HashMap::new(),
         checkpoint_thumb_order: std::collections::VecDeque::new(),
-        mon: MonitorState::new(),
-        flow: FlowTracker::new(),
+        mon: MonitorSession::new(),
+        fs_cwd: None,
         stream_broke_on_jam: false,
         force_present_frame: false,
         audio_render: None,
-        trap_rules: std::collections::HashMap::new(),
     };
     // Spec 863 — the ring's window is seconds; at another model's frame rate that is
     // another number of anchors.
@@ -19658,10 +19393,6 @@ mod batch1_tests {
             input_journal: None,
             announced_model: trx64_core::model::default_model(),
             session: Session::new("integrated-1"),
-            breakpoints: Breakpoints::new(),
-            observers: observers::ObserverRegistry::new(),
-            dsl_observers: Vec::new(),
-            dsl_disabled: std::collections::HashSet::new(),
             type_buffer: Vec::new(),
             ctrl_frame: 0,
             machine_generation: 0,
@@ -19721,12 +19452,11 @@ mod batch1_tests {
         candidate_seq: 0,
             checkpoint_thumbs: std::collections::HashMap::new(),
             checkpoint_thumb_order: std::collections::VecDeque::new(),
-            mon: MonitorState::new(),
-            flow: FlowTracker::new(),
+            mon: MonitorSession::new(),
+            fs_cwd: None,
             stream_broke_on_jam: false,
             force_present_frame: false,
             audio_render: None,
-            trap_rules: std::collections::HashMap::new(),
         }))
     }
 
@@ -19819,7 +19549,7 @@ mod batch1_tests {
         std::fs::write(base.join("sub").join("inside.prg"), b"").unwrap();
 
         let st = make_state();
-        st.lock().unwrap().mon.fs_cwd = Some(base.to_string_lossy().to_string());
+        st.lock().unwrap().fs_cwd = Some(base.to_string_lossy().to_string());
 
         // Bare stem "a" → both .crt files, NOT the `sub` dir; common prefix "a".
         let r = call(&st, "fs/complete", json!({ "partial": "a" }));
@@ -22592,9 +22322,9 @@ mod batch1_tests {
         // LIVE" while every read stayed a side-effect-free peek.
         let st = make_state();
         assert!(mon(&st, "sidefx off").unwrap().contains("sidefx = off"));
-        assert!(!st.lock().unwrap().mon.sidefx_on);
+        assert!(!st.lock().unwrap().mon.state.sidefx_on);
         let on = mon(&st, "sidefx on").unwrap();
-        assert!(st.lock().unwrap().mon.sidefx_on, "toggle stored");
+        assert!(st.lock().unwrap().mon.state.sidefx_on, "toggle stored");
         // ...and the reply names the verbs it really covers, rather than promising
         // live reads for the whole monitor.
         assert!(on.contains("m/c/t/h"), "reply states its scope: {on}");
