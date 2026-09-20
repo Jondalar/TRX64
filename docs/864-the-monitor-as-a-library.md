@@ -1,6 +1,6 @@
 # Spec 864 — The monitor as a library: one implementation, two machines
 
-**Status:** PARTLY BUILT (2026-09-20, v0.8.1) — the crate, the host trait and the verbs
+**Status:** PARTLY BUILT (2026-09-20, v0.8.2) — the crate, the host trait and the verbs
 that need nothing but a machine are in; run control, reset and everything that needs a
 timeline, a file or a trace sink are still the daemon's, because moving them would have
 meant inventing a service rather than extracting one (§9.1).
@@ -361,6 +361,16 @@ the host mutably at the same time, so they must be **disjoint borrows**. The dae
 it by destructuring its own `State` and handing the pieces to a `DaemonHost` of borrowed
 fields. A host that owns its `MonitorSession` inside the same struct its `MonitorHost`
 impl borrows will not compile — better said here than discovered after it is written.
+
+**The second host found the first defect, and it was in `device`.** The verb compared its
+argument against the literals `c64` and `drive8`, so a host offering a third device could
+never be switched to it — `devices()` was called by nothing at all — and the read-inspect
+gate under it was keyed on the literal too, so a host device would have fallen through as
+if it were the C64. That last part is the one that matters: a refused write is loud, a
+write that lands on the wrong machine is silent. Fixed in v0.8.2: the list a host offers
+is the list the verb accepts and prints, and everything that is not `Device::C64` is
+read-inspect. The daemon's own output is unchanged, which the transcript shows by having
+gained lines and altered none.
 
 **`CpuView` is declared but not yet on any path.** The moved verbs still reach both 6502s
 through `machine()` and `machine().drive8`, exactly as they did in the daemon, so `r`/`m`

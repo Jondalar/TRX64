@@ -568,6 +568,35 @@ $fd04  bd 0f fd  LDA $fd0f,x
      L3 21..26 $fd0f c64/operand/-
    machine: c64 port $2f/$37 exrom 1 game 1 bank -
 
+$ device
+device: c64   (c64 | drive8 — anything but c64 is read-inspect r/m/d)
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ device drive8
+device: drive8
+   machine: drive8 port $2f/$37 exrom 1 game 1 bank -
+
+$ r
+1541 (drive 8)
+  ADDR AC XR YR SP NV-BDIZC  clk
+.;0000 00 00 00 00 nv-bdizc  0
+  track 18 (halftrack 36)  led off
+   spans: 1
+     L2 2..6 $0000 drive8/pc/-
+   machine: drive8 port $2f/$37 exrom 1 game 1 bank -
+
+$ wr 0400 01
+device drive8: read-inspect only (r/m/d). `device c64` first to use `wr`.
+   machine: drive8 port $2f/$37 exrom 1 game 1 bank -
+
+$ device c64
+device: c64
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ device nosuchdevice
+device: usage: device c64 | drive8
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
 $ io
 VIC-II:
   d000  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00

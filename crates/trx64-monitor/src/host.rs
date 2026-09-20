@@ -26,6 +26,29 @@ pub enum Device {
     Host(&'static str),
 }
 
+impl Device {
+    /// The name the user types, and the name the monitor prints.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Device::C64 => "c64",
+            Device::Drive8 => "drive8",
+            Device::Host(n) => n,
+        }
+    }
+
+    /// The device that name selects, among the ones this host offers. `None` is "no such
+    /// device here", which is a different answer from "no such device anywhere".
+    pub fn from_name(name: &str, offered: &[Device]) -> Option<Device> {
+        offered.iter().find(|d| d.name() == name).copied()
+    }
+
+    /// Only the C64 is fully driveable from the monitor: the write verbs, the stepping
+    /// and the debug gates are all about it. Every other device is read-inspect.
+    pub fn is_read_inspect(&self) -> bool {
+        !matches!(self, Device::C64)
+    }
+}
+
 /// One CPU register, as the view that owns it describes it.
 #[derive(Debug, Clone)]
 pub struct Reg {

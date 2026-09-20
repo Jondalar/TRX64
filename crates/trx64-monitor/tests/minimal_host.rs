@@ -163,3 +163,79 @@ fn the_selected_device_gates_the_verbs_the_library_does_not_own() {
     run(&mut mon, &mut host, "device c64").expect("back to the C64");
     assert!(try_exec(&mut mon, &mut host, "swapcrt").is_none(), "now it falls through");
 }
+
+// ── Spec 864, the second host's first finding ───────────────────────────────────
+//
+// `device` used to compare the argument against the literals "c64" and "drive8", so a
+// host that offered a third device could never be switched to it: the UE2 emulator's
+// `device fw` answered the usage line, and `devices()` was called by nothing at all. The
+// read-inspect gate under it was keyed on the literal too, so a host device would have
+// fallen through it as if it were the C64 — the one case where the wrong answer is
+// silent rather than loud.
+
+/// A host with a machine and one device of its own, which is exactly the shape the
+/// second host has.
+struct HostWithOwnDevice {
+    machine: Machine,
+}
+
+impl MonitorHost for HostWithOwnDevice {
+    fn machine(&mut self) -> &mut Machine {
+        &mut self.machine
+    }
+    fn devices(&self) -> Vec<trx64_monitor::Device> {
+        vec![
+            trx64_monitor::Device::C64,
+            trx64_monitor::Device::Drive8,
+            trx64_monitor::Device::Host("fw"),
+        ]
+    }
+}
+
+fn run_own(
+    mon: &mut MonitorSession,
+    host: &mut HostWithOwnDevice,
+    line: &str,
+) -> Result<String, String> {
+    try_exec(mon, host, line).unwrap_or_else(|| Err(format!("unknown verb: {line}")))
+}
+
+#[test]
+fn a_host_device_can_be_selected_and_is_listed() {
+    let mut host = HostWithOwnDevice { machine: Machine::new() };
+    let mut mon = MonitorSession::default();
+
+    let listed = run_own(&mut mon, &mut host, "device").expect("device lists");
+    assert!(
+        listed.contains("fw"),
+        "the host's own device must appear in the list it prints: {listed}"
+    );
+
+    let picked = run_own(&mut mon, &mut host, "device fw").expect("device fw is accepted");
+    assert!(picked.contains("fw"), "selecting the host's device answers with it: {picked}");
+    assert_eq!(mon.state.device, "fw");
+}
+
+#[test]
+fn a_device_the_host_does_not_offer_is_refused_with_the_ones_it_does() {
+    let mut host = HostWithOwnDevice { machine: Machine::new() };
+    let mut mon = MonitorSession::default();
+
+    let err = run_own(&mut mon, &mut host, "device nosuch").unwrap_err();
+    assert!(err.contains("c64"), "the refusal names what this host HAS: {err}");
+    assert!(err.contains("fw"), "including the host's own device: {err}");
+    assert_eq!(mon.state.device, "c64", "a refused selection changes nothing");
+}
+
+#[test]
+fn a_host_device_is_read_inspect_like_every_device_that_is_not_the_c64() {
+    let mut host = HostWithOwnDevice { machine: Machine::new() };
+    let mut mon = MonitorSession::default();
+
+    run_own(&mut mon, &mut host, "device fw").expect("select it");
+    let err = run_own(&mut mon, &mut host, "wr 0400 01").unwrap_err();
+    assert!(
+        err.contains("read-inspect"),
+        "a write under a host device must be blocked, not applied to the C64: {err}"
+    );
+}

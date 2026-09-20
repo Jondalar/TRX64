@@ -16,6 +16,7 @@ use trx64_static::disasm6502::instr_len;
 
 use crate::addr_spans::{self, Role as SpanRole, Space as SpanSpace};
 use crate::assembler;
+use crate::host::Device;
 use crate::host::{MachineEffect, MonitorHost};
 use crate::observers;
 use crate::session::{sync_observers, BpEntry, MonitorSession, MonitorState, TrapRule};
@@ -836,23 +837,35 @@ pub fn try_exec(
     // act on the 1541 CPU; every other verb is blocked with a clear message (so it
     // can't silently mutate the C64). 1:1 with monitor-shell.ts:233-245.
     if op == "device" || op == "dev" {
+        // Spec 864 — ASK THE HOST. This used to compare against the literals "c64" and
+        // "drive8", so a host that offered a third device could never be switched to it:
+        // the second host's `device fw` answered the usage line, and `devices()` was
+        // never called by anything. The list a host offers is now the list the verb
+        // accepts and the list it prints.
+        let offered = host.devices();
+        let names = offered.iter().map(|d| d.name()).collect::<Vec<_>>().join(" | ");
         let arg = toks.get(1).map(|s| s.to_ascii_lowercase()).unwrap_or_default();
         if arg.is_empty() {
             return Some(Ok(format!(
-                "device: {device}   (c64 | drive8 — drive8 = read-inspect r/m/d on the 1541 CPU)"
+                "device: {device}   ({names} — anything but c64 is read-inspect r/m/d)"
             )));
         }
-        if arg == "c64" || arg == "drive8" {
-            mon.state.device = arg.clone();
-            return Some(Ok(format!("device: {arg}")));
+        match Device::from_name(&arg, &offered) {
+            Some(d) => {
+                mon.state.device = d.name().to_string();
+                return Some(Ok(format!("device: {}", d.name())));
+            }
+            None => return Some(Err(format!("device: usage: device {names}"))),
         }
-        return Some(Err("device: usage: device c64|drive8".into()));
     }
-    // Spec 754 §3.3i — drive8 is read-inspect only: allow r/m/d (+ help/?). Anything
-    // else would act on the C64 → block it (matches monitor-shell.ts:243).
-    if device == "drive8" && !matches!(op.as_str(), "r" | "m" | "d" | "help" | "?") {
+    // Spec 754 §3.3i, generalised by Spec 864 — every device but the C64 is read-inspect:
+    // allow r/m/d (+ help/?), block anything that would act on the C64 instead. Keyed on
+    // the DEVICE rather than on the literal "drive8", so a host device is gated too
+    // instead of falling through as if it were the C64.
+    let selected = Device::from_name(&device, &host.devices()).unwrap_or(Device::C64);
+    if selected.is_read_inspect() && !matches!(op.as_str(), "r" | "m" | "d" | "help" | "?") {
         return Some(Err(format!(
-            "device drive8: read-inspect only (r/m/d). `device c64` first to use `{op}`."
+            "device {device}: read-inspect only (r/m/d). `device c64` first to use `{op}`."
         )));
     }
 

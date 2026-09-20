@@ -288,6 +288,13 @@ fn script() -> Vec<&'static str> {
         "n",
         "r",
         "sd 4",
+        // The device selector, and the read-inspect gate behind it
+        "device",
+        "device drive8",
+        "r",
+        "wr 0400 01",
+        "device c64",
+        "device nosuchdevice",
         // I/O and the bus
         "io",
         "io 1",
