@@ -1174,6 +1174,10 @@ pub struct VicII {
     /// here by the turbo CPU (`C64Core6510Bus::set_turbo_phase`). `div == 1` means a
     /// CPU that cannot see finer than PHI2, which is every machine but the U64 in turbo.
     pub turbo_phase: u32,
+    /// Spec 868 §9 trial — set by a `$D031` write, cleared when the CPU reads it at the
+    /// next instruction boundary. The edge model reloads the divider's counter on the
+    /// write; the shipped model ignores this entirely.
+    pub u64_d031_written_this_instruction: bool,
     pub turbo_div: u32,
     /// Spec 868 — the border colour in force at each of the eight pixels this PHI2 cycle
     /// draws. Armed only while a 64 MHz CPU is writing `$D020` more than once per cycle
@@ -1428,6 +1432,7 @@ impl VicII {
             line_rec: None,
             speed_profile: SpeedProfile::C64,
             turbo_phase: 0,
+            u64_d031_written_this_instruction: false,
             turbo_div: 1,
             subcycle_colour: None,
             fastmode: 0,
@@ -2765,6 +2770,8 @@ impl VicII {
             0x31 if self.speed_profile == SpeedProfile::U64 && self.u64_regs_en & 0x01 != 0 => {
                 self.regs[0x31] = value;
                 self.u64_d031_written = true;
+                // Spec 868 §9 trial — the edge model reloads the divider's counter here.
+                self.u64_d031_written_this_instruction = true;
             }
             // default — unused (vicii-mem.c:333 `/* unused */ break`). VICE does
             // NOT write the reg file here; addr is already masked to 0x3f so all

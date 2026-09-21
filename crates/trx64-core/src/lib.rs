@@ -662,6 +662,9 @@ pub struct Machine {
     /// and the boundary sync runs once when one of them does. No effect at 1 MHz: there
     /// every instruction advances `clk`. Env kill-switch `TRX64_TURBO_FASTPATH=0`, read at
     /// `Machine::new`; the field can be flipped at any time.
+    /// Spec 868 §9 trial — a `$D031` write takes effect at the next PHI2 edge instead of
+    /// from the next instruction. `TRX64_TURBO_EDGE_MODEL=1`.
+    pub turbo_edge_model: bool,
     pub turbo_fast_path: bool,
     /// Spec 857 D4 — check CIA alarms by comparison, as VICE does, instead of catching both
     /// timers up to the clock in every instruction prologue and every cycle. Env kill-switch
@@ -858,6 +861,12 @@ impl Machine {
             uci_c64_reset: false,
             cpu_history: crate::cpu_history::CpuHistoryRing::new(),
             delta_ring: crate::delta_ring::DeltaRing::new(),
+            // Spec 868 §9 trial — off unless asked for, so an ordinary run is the
+            // shipped model and nobody measures the trial by accident.
+            turbo_edge_model: matches!(
+                std::env::var("TRX64_TURBO_EDGE_MODEL").map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+                Ok("1") | Ok("on") | Ok("true") | Ok("yes")
+            ),
             turbo_fast_path: !matches!(
                 std::env::var("TRX64_TURBO_FASTPATH").map(|v| v.trim().to_ascii_lowercase()).as_deref(),
                 Ok("0") | Ok("off") | Ok("false") | Ok("no")
@@ -3004,10 +3013,41 @@ impl Machine {
         // there. Guessing would cost nothing visible today and be a lie in the tree —
         // the first version of this reset guessed, and the host that asked for it could
         // not tell the two apart from the picture either.
-        if div <= 1 {
-            self.c64_core.turbo_phase = 0;
+        // ── TRIAL, Spec 868 §9: the edge model ───────────────────────────────────
+        // `TRX64_TURBO_EDGE_MODEL=1` swaps the answer to "when does a $D031 write take
+        // effect". Both models live in one binary ON PURPOSE, so a comparison cannot be
+        // contaminated by a build difference — the host measuring this has been bitten
+        // twice by instruments that were themselves the variable.
+        //
+        // Edge model, two claims, and they stand or fall together:
+        //   1. The DIVIDER takes effect at the next PHI2 edge, not from the next
+        //      instruction. UPic's `sta`/`stx` pair both land inside one PHI2 cycle at
+        //      64 MHz, so the edge sees $8F and the CPU never runs slowly — the resync
+        //      costs nothing, which is what its author built it to do.
+        //   2. The WRITE reloads the divider's counter, so the phase restarts at the
+        //      store. Without this the resync would cost nothing and also DO nothing:
+        //      the machine would never observe divider 1 at an instruction boundary, and
+        //      §5a's reset — which keys on exactly that — would never fire again.
+        //
+        // The second claim is the one I cannot derive. It is hardware I have not
+        // measured, and the granularity number is what tests it: if the phase stops
+        // being realigned per row, the sub-pixel placement degrades and the host's
+        // colour-changes-per-line falls away from 43/94.
+        if self.turbo_edge_model {
+            if self.vic.u64_d031_written_this_instruction {
+                self.c64_core.turbo_phase = 0;
+                self.vic.u64_d031_written_this_instruction = false;
+            }
+            self.c64_core.pending_turbo_div = div;
+        } else {
+            if div <= 1 {
+                self.c64_core.turbo_phase = 0;
+            }
+            self.c64_core.turbo_div = div;
+            // Keep the two equal under the shipped model, so the PHI2-edge adoption in
+            // `clk_inc` is a no-op rather than a clobber with a stale value.
+            self.c64_core.pending_turbo_div = div;
         }
-        self.c64_core.turbo_div = div;
         self.c64_core.turbo_badline = badline;
     }
 

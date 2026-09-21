@@ -256,3 +256,48 @@ fn the_speed_change_pair_costs_four_phi2_cycles_in_our_model() {
          entirely at divider 1 and costs a full PHI2 cycle per its four cycles"
     );
 }
+
+/// Spec 868 §9 trial — the same resync pair under `TRX64_TURBO_EDGE_MODEL=1`.
+///
+/// Run with the flag set, this asserts the claim the trial exists to test: both stores
+/// land inside one PHI2 cycle at 64 MHz, so the edge sees $8F and the CPU never runs
+/// slowly. Four PHI2 becomes none, which is ~256 turbo cycles handed back to a row that
+/// has about 240 to spare.
+///
+/// It is `#[ignore]` because the flag is process-wide and the shipped-model test above
+/// must not see it:
+///
+///     TRX64_TURBO_EDGE_MODEL=1 cargo test -p trx64-core --test u64_turbo_gate \
+///       -- --ignored the_speed_change_pair_under_the_edge_model
+#[test]
+#[ignore = "trial: needs TRX64_TURBO_EDGE_MODEL=1"]
+fn the_speed_change_pair_under_the_edge_model_costs_nothing() {
+    assert!(
+        std::env::var("TRX64_TURBO_EDGE_MODEL").is_ok(),
+        "run this with TRX64_TURBO_EDGE_MODEL=1 or it proves nothing"
+    );
+
+    let mut m = u64_machine();
+    m.set_u64_speed_table(U64SpeedTable::U64II);
+    m.vic.u64_regs_en = 0x01;
+    assert!(m.turbo_edge_model, "the flag must have reached the machine");
+
+    m.vic.write_reg(0x31, 0x8f);
+    m.poke(0xc000, &[0xea, 0xea]);
+    m.c64_core.reg_pc = 0xc000;
+    m.run_for_full_capped(64 * 4, 2, &mut NullSink, |_, _, _, _, _, _, _| {});
+    assert!(m.c64_core.turbo_div > 1, "the machine must be in turbo to measure this");
+
+    m.poke(0xc100, &[0xa9, 0x80, 0xa2, 0x8f, 0x8d, 0x31, 0xd0, 0x8e, 0x31, 0xd0]);
+    m.c64_core.reg_pc = 0xc100;
+
+    let before = m.clk;
+    m.run_for_full_capped(64 * 64, 4, &mut NullSink, |_, _, _, _, _, _, _| {});
+    let phi2 = m.clk - before;
+
+    assert_eq!(
+        phi2, 0,
+        "under the edge model the pair stays inside one PHI2 cycle and costs nothing"
+    );
+    assert!(m.c64_core.turbo_div > 1, "and the machine is still at full speed");
+}
