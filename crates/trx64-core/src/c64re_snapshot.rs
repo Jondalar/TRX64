@@ -1680,6 +1680,24 @@ pub fn restore_runtime_checkpoint(
     }
     restore_vic_provenance(m, cp.get("vicProvenance"));
 
+    // Spec 868 §9 — the turbo divider is adopted at a PHI2 EDGE now, not at the next
+    // instruction boundary, so a restored machine that only learns its speed from
+    // `sync_turbo_from_vic` would run one PHI2 cycle at the wrong divider: that call sets
+    // the PENDING value and `clk_inc` adopts it an edge later. The checkpoint carries
+    // `$D031`, so put the CPU back at the speed that register names, in force
+    // immediately — which is what the old model did implicitly by recomputing the divider
+    // at every boundary. `cia_alarm_check_gate` is what catches this: a restored turbo
+    // machine has to continue identically to one that ran straight through, and it is the
+    // second time that gate has found the turbo state missing from a restore (the first
+    // was `turbo_phase`, a defect since 851).
+    if m.vic.speed_profile == crate::vic::SpeedProfile::U64 {
+        let (index, badline) = m.vic.u64_speed();
+        let div = m.vic.u64_speed_table.mhz(index);
+        m.c64_core.turbo_div = div;
+        m.c64_core.pending_turbo_div = div;
+        m.c64_core.turbo_badline = badline;
+    }
+
     // Sync the legacy shadow + machine clk (matches vsf load tail).
     m.sync_after_monitor();
     m.clk = m.c64_core.clk;
