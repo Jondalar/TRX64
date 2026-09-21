@@ -178,3 +178,60 @@ fn the_speed_tables_match_the_firmware() {
     assert_eq!(U64SpeedTable::U64II.mhz(15), 64);
     assert_eq!(U64SpeedTable::U64II.mhz(0x7f), 64, "a speed index past the table clamps");
 }
+
+// ── What a speed change costs ───────────────────────────────────────────────────
+//
+// Spec 868, from the UE2 session reading UPic's row loop: every picture row begins by
+// writing $D031 = $80 (index 0, 1 MHz) and immediately $8F (max). Aleksi calls it a
+// resync and built it to cost almost nothing — the row's cycle budget has about 240
+// turbo cycles of slack in 4032, so a pair that costs four PHI2 cycles (256 at this
+// divider) does not fit, the row runs past its raster line, and from then on the program
+// paints one picture row per two lines.
+//
+// This measures the charge with no program and no host involved: four instructions, one
+// PHI2 delta. What the HARDWARE does is a separate question (§9 of 868) — this settles
+// only what WE charge, which is the half that is ours.
+
+/// The resync pair, measured. **This asserts what WE charge, not what silicon does** —
+/// the two are known to differ and the difference is an open question in Spec 868 §9.
+///
+/// Four PHI2 cycles is ~256 turbo-cycle-equivalents at this divider. UPic's row has about
+/// 240 to spare in 4032, so under our accounting the row cannot fit its raster line, and
+/// the program paints one picture row per two lines — which is exactly what the UE2 host
+/// measures (232 of 480 rows), on every build.
+///
+/// The evidence that our model is the wrong one is not a datasheet: Aleksi built this pair
+/// against a real machine and the technique works there, so on hardware a turbo CPU can
+/// pass through index 0 without paying a whole PHI2 cycle per instruction. That points at
+/// the divider taking effect from the next CYCLE (or at the next PHI2 edge) rather than
+/// from the next instruction, which is what `sync_turbo_from_vic` does today. Changing it
+/// is a timing-model change and wants a measurement on the owner's U64 first.
+///
+/// So: if you change the model, this test fails, and it should. Update the number
+/// deliberately and say what settled it.
+#[test]
+fn the_speed_change_pair_costs_four_phi2_cycles_in_our_model() {
+    let mut m = u64_machine();
+    m.set_u64_speed_table(U64SpeedTable::U64II);
+    m.vic.u64_regs_en = 0x01;
+
+    m.vic.write_reg(0x31, 0x8f);
+    m.poke(0xc000, &[0xea, 0xea]);
+    m.c64_core.reg_pc = 0xc000;
+    m.run_for_full_capped(64 * 4, 2, &mut NullSink, |_, _, _, _, _, _, _| {});
+    assert!(m.c64_core.turbo_div > 1, "the machine must be in turbo to measure this");
+
+    // lda #$80 / ldx #$8f / sta $d031 / stx $d031 — UPic's resync, verbatim.
+    m.poke(0xc100, &[0xa9, 0x80, 0xa2, 0x8f, 0x8d, 0x31, 0xd0, 0x8e, 0x31, 0xd0]);
+    m.c64_core.reg_pc = 0xc100;
+
+    let before = m.clk;
+    m.run_for_full_capped(64 * 64, 4, &mut NullSink, |_, _, _, _, _, _, _| {});
+    let phi2 = m.clk - before;
+
+    assert_eq!(
+        phi2, 4,
+        "our model applies a $D031 write from the next INSTRUCTION, so the stx runs \
+         entirely at divider 1 and costs a full PHI2 cycle per its four cycles"
+    );
+}

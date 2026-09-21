@@ -207,6 +207,20 @@ Deterministic, and testable without hardware — the picture is a function of th
 
 ## §9 Open
 
+- **When does a `$D031` write take effect — next instruction, or next cycle?** Measured on
+  our side (`u64_turbo_gate.rs`): the resync pair costs **4 PHI2 cycles**, because 851
+  applies a speed write from the next INSTRUCTION, so the `stx` runs entirely at divider
+  1. That is ~256 turbo-cycle-equivalents in a row that has ~240 to spare, so under our
+  model UPic's row cannot fit its raster line — and the UE2 host measures exactly that,
+  232 of 480 picture rows, on every build including pre-868.
+
+  The evidence that the model is wrong is not a datasheet: Aleksi built the pair against a
+  real machine and the technique works there, so a turbo CPU can pass through index 0
+  without paying a PHI2 cycle per instruction. 851 recorded "the divider refreshed at each
+  instruction boundary" as a build decision with no source — a convenience, not a
+  measurement. Changing it is a timing-model change that touches every turbo program, so
+  it wants the owner's U64 first: run the pair in a loop and count instructions per frame
+  against a build without it.
 - **Does a change between two turbo speeds restart the divider?** Not documented, not
   measured, and currently modelled as "no" (§5a). A `DEN=1` program that switches between
   two turbo speeds mid-line and paints would answer it; so would the owner's U64.
