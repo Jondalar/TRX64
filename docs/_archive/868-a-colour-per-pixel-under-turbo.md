@@ -1,12 +1,12 @@
 # Spec 868 — A colour per pixel: what a 64 MHz CPU can do to `$D020`
 
-**Status:** BUILT (2026-09-21) — §8.3 confirmed on real firmware by the UE2 session
+**Status:** MERGED (2026-09-21) — §8.3 confirmed on real firmware by the UE2 session
 (run lengths of one colour collapse from 13-14 px to 1-2 px; colour changes per drawn line
 median 13 → 43), and §5a's timing model settled by the same host against a trial build
 (row period 126 → 63 PHI2, canvas 132 → 256 of 272 rows, granularity held). The picture is
 complete and correct.
 **Repo:** TRX64 only. C64RE: no change — it renders the frame TRX64 hands it.
-**Number:** 868 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`).
+**Number:** 868 (registry: `../../../C64ReverseEngineeringMCP/specs/README.md`).
 **Depends on:** Spec 851 (the U64 machine profile and the faster CPU), 856 (turbo pays
 per PHI2 cycle), and the VIC's cycle-exact draw path as ported from VICE.
 **Origin:** the UE2 emulator, 2026-09-21, running Xander Mol's *Mandelbrot Upic*
@@ -249,6 +249,23 @@ Deterministic, and testable without hardware — the picture is a function of th
   without halting is currently a convention a host discovers by reading, not a mode it can
   ask for; a `notify`-shaped door beside the halting one would have prevented both wrong
   answers. That door is owed to the monitor library (864).
+- **The residual streaks — where inside a PHI2 cycle does the counter reload?** A minority
+  of rows still land horizontally displaced. The UE2 session ruled out the obvious suspect
+  (a per-row `$D012` catch-up: the wait loop is 4 PHI2 and 38 reads for 285 of 288 rows,
+  the row period 63 PHI2 for 284 of 287) and then corrected the size of the displacement —
+  the figures were output pixels of a 640-wide render of a 384-pixel line, so the scale is
+  1.667 and the worst case is **4.8 source pixels**. One PHI2 cycle is eight. So every
+  residual displacement is SMALLER than one cycle: these are phase errors, and no
+  cycle-level accounting will explain them.
+
+  That puts them inside claim 2 rather than in the VIC, and it splits it in two. The
+  reload happens at the store, so a row's pixel stream starts at whatever sub-cycle offset
+  the wait loop left the CPU at, and each row shifts by a few pixels. Had the reload
+  instead aligned the phase to the next PHI2 EDGE, every row would start at zero and the
+  shifts would go away — and the three numbers that settled the model cannot tell the two
+  apart, because both realign per row. The streaks can. Proving it needs the phase visible
+  from the host's observer (`AccessCtx` carries no CPU state), which is a small addition to
+  the trace surface rather than a model question.
 - Whether the array should live on `VicII` or beside the CPU mirror. On the VIC is the
   obvious answer for the draw path; the store path is the CPU's side of the bus, so a
   measurement may say otherwise.
