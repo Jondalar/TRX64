@@ -447,11 +447,21 @@ fn draw_colors_6569(v: &mut VicII, base: usize, i: usize) {
     let token = v.pixel_buffer[lookup_index] as usize;
     // Spec 868 — the override belongs HERE, at the resolve, and not where the token was
     // placed. A token says WHICH register a pixel comes from; only this line says which
-    // VALUE. Riding the same lookup keeps the 6569's one-pixel colour latency intact:
-    // `lookup_index` is a pixel behind `i` by design, and a turbo store must be a pixel
-    // behind too, or the fast machine would draw sharper than the chip does.
+    // VALUE. Riding the same lookup keeps the 6569's one-pixel colour latency intact: a
+    // turbo store must be a pixel behind too, or the fast machine would draw sharper than
+    // the chip does.
+    //
+    // And the SLOT INDEX is `i`, not `lookup_index`. This call paints screen pixel
+    // `base + i + 1` — the value written here is emitted by the call that has `i ==
+    // lookup_index`, which for `i == 7` is the first call of the NEXT cycle. So slot `k`
+    // belongs to call `k`, and the whole array is one pixel late exactly as the register
+    // is. Using `lookup_index` put each cycle's slot 0 after its own slots 1..7: a
+    // rotation by one pixel every eight, invisible wherever a cycle writes one colour and
+    // a wrong pixel every eight in a picture where it writes eight. Found by the UE2
+    // session against real firmware — anomalous source columns at multiples of 8 only,
+    // column 360 wrong in 462 of 462 drawn rows.
     v.pixel_buffer[lookup_index] = match v.subcycle_colour {
-        Some(sc) if sc.reg as usize == token => sc.slots[lookup_index],
+        Some(sc) if sc.reg as usize == token => sc.slots[i],
         _ => v.cregs[token],
     };
     if base + i < FB_W * FB_H {
@@ -467,9 +477,11 @@ fn draw_colors_8565(v: &mut VicII, base: usize, i: usize) {
     if i == 0 && v.pixel_buffer[lookup_index] == v.draw_last_color_reg {
         v.pixel_buffer[lookup_index] = 0x0f;
     } else {
-        // Spec 868 — same override as the 6569 path, on this chip's own lookup (no
-        // latency here, hence no offset). The grey-dot branch above is untouched: it is
-        // about a register CHANGING mid-pixel, which is a different statement.
+        // Spec 868 — same override as the 6569 path, on this chip's own lookup. No
+        // latency here, so `lookup_index == i` and the slot index is `i` on both paths
+        // for the same reason: this call paints the pixel it resolves. The grey-dot
+        // branch above is untouched — it is about a register CHANGING mid-pixel, which is
+        // a different statement.
         let token = v.pixel_buffer[lookup_index] as usize;
         v.pixel_buffer[lookup_index] = match v.subcycle_colour {
             Some(sc) if sc.reg as usize == token => sc.slots[lookup_index],
@@ -601,6 +613,54 @@ mod tests {
         assert!(
             v.subcycle_colour.is_none(),
             "the slots are scratch for one cycle and are cleared with it"
+        );
+    }
+
+    /// The 6569 path, across cycle boundaries — the case the two tests around this one
+    /// cannot see, and the one that was wrong.
+    ///
+    /// On this chip the resolve is a pixel behind the token (`lookup_index = (i + 1) & 7`),
+    /// so the value a call resolves is emitted by the call with `i == lookup_index` — for
+    /// `i == 7` that is the FIRST call of the next cycle. Sixteen stores over two cycles
+    /// must therefore come out as sixteen consecutive pixels, and the boundary between
+    /// them must be invisible.
+    ///
+    /// It was not. With the slot taken at `lookup_index`, each cycle's slot 0 was emitted
+    /// after its own slots 1..7 — a one-pixel rotation every eight, which no single-cycle
+    /// test can show and which is invisible in any program that writes one colour per
+    /// cycle. UPic writes eight, and the UE2 session measured it against real firmware:
+    /// anomalous source columns at multiples of 8 and nowhere else, column 360 wrong in
+    /// 462 of 462 drawn rows, identical at two output scales.
+    #[test]
+    fn the_run_of_stores_is_unbroken_across_a_cycle_boundary() {
+        let mut v = VicII::new();
+        v.speed_profile = SpeedProfile::U64;
+        v.turbo_div = 64;
+        v.color_latency = true; // the 6569: one pixel of pipeline to carry
+        v.dbuf_line = 0;
+        v.dbuf_offset = 0;
+        v.render_buffer.fill(COL_D020);
+        v.pixel_buffer.fill(COL_D020);
+
+        // Two cycles, eight stores each, sixteen values that a 4-bit register can still
+        // tell apart. Then one idle cycle to flush the last pixel out of the pipeline.
+        for cycle in 0..2u8 {
+            for pixel in 0..8u32 {
+                v.turbo_phase = pixel * 8;
+                v.write_reg(0x20, cycle * 8 + pixel as u8);
+            }
+            draw_colors8(&mut v);
+        }
+        draw_colors8(&mut v);
+
+        // Pixel 0 of the frame is the pipeline's own start-up — nothing has been resolved
+        // into it yet — so the run begins at 1. From there it is every store, in order,
+        // with the cycle boundary between the eighth and the ninth showing nothing.
+        let run: Vec<u8> = (1..17).map(|i| v.dbuf[i]).collect();
+        assert_eq!(
+            run,
+            (0..16).collect::<Vec<u8>>(),
+            "sixteen stores, sixteen consecutive pixels, and no seam at the cycle boundary"
         );
     }
 

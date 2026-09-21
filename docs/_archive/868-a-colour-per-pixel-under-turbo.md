@@ -105,6 +105,19 @@ the token names the overridden register, the pixel takes `slots[i]` instead of
   must ride that same pipeline — it replaces the value the lookup yields, not the moment
   at which the lookup happens. Bypassing the pipeline would make the turbo path a pixel
   sharper than the machine is.
+- **The slot index is the call index, not the ring index.** This is the one place the
+  feature got the pipeline wrong. A resolve at call `i` writes the ring slot that the call
+  with `i == lookup_index` emits — and for `i == 7` that call is the FIRST of the next
+  PHI2 cycle. So call `i` paints screen pixel `base + i + 1`, slot `k` belongs to call `k`,
+  and the whole array ends up one pixel late exactly as the register is. Indexing the
+  slots by `lookup_index` instead put each cycle's slot 0 *after* its own slots 1..7: a
+  one-pixel rotation every eight pixels. Invisible wherever a cycle writes one colour, and
+  a wrong pixel every eight in a picture where it writes eight — which is why every unit
+  test passed and the picture did not. Found by the UE2 session measuring the rendered
+  frame: single-pixel anomalies at source columns that are multiples of 8 and nowhere
+  else, column 360 wrong in 462 of 462 drawn rows, identical at two output scales and
+  therefore in the canvas rather than the scaler. The 8565 path does not have it — no
+  latency there, so its lookup index already is the call index.
 - **`draw_border8` does not change at all.** It says *which register* a pixel comes from;
   it never said *which value*. Keeping the change on the resolve side means the same
   mechanism covers every path that resolves a colour token.
@@ -258,14 +271,18 @@ Deterministic, and testable without hardware — the picture is a function of th
   residual displacement is SMALLER than one cycle: these are phase errors, and no
   cycle-level accounting will explain them.
 
-  That puts them inside claim 2 rather than in the VIC, and it splits it in two. The
-  reload happens at the store, so a row's pixel stream starts at whatever sub-cycle offset
-  the wait loop left the CPU at, and each row shifts by a few pixels. Had the reload
-  instead aligned the phase to the next PHI2 EDGE, every row would start at zero and the
-  shifts would go away — and the three numbers that settled the model cannot tell the two
-  apart, because both realign per row. The streaks can. Proving it needs the phase visible
-  from the host's observer (`AccessCtx` carries no CPU state), which is a small addition to
-  the trace surface rather than a model question.
+  **It was not the phase, and that was measured rather than argued.** `vic.turbo_phase` is
+  a live mirror — `clk_inc` writes it on every turbo CPU cycle while the divider is engaged
+  — so the host read it through a pointer at the `$D031` store itself: **phase 10 in 598 of
+  600 rows at the `sta`, phase 3 in 600 of 600 at the `stx`**. Constant. Every row starts
+  at the same cycle and the same phase, so reload-at-store versus reload-at-edge cannot be
+  what the streaks showed. They were §4's slot-index defect, which is fixed.
+
+  The question that remains is the one nobody has an instrument for: whether the reload
+  happens at the store or is aligned to the following PHI2 edge. Both realign per row, both
+  produce the three numbers above, and with the phase constant per row neither leaves a
+  signature in the picture. It stays open, and it stays harmless — the two models differ
+  only for a program whose rows do NOT arrive at a constant phase.
 - Whether the array should live on `VicII` or beside the CPU mirror. On the VIC is the
   obvious answer for the draw path; the store path is the CPU's side of the bus, so a
   measurement may say otherwise.
