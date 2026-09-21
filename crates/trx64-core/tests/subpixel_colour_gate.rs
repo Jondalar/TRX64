@@ -181,6 +181,29 @@ fn a_speed_change_restarts_the_sub_cycle_counter() {
     );
 }
 
+/// Only index 0 is proved. Whether the hardware's divider restarts when one turbo speed
+/// replaces another — 64 to 16 without passing 1 — is undocumented and unmeasured, so the
+/// phase is left alone there rather than guessed at. UPic's resync goes through index 0,
+/// so nothing it needs depends on the unknown case.
+#[test]
+fn a_change_between_two_turbo_speeds_is_not_assumed_to_restart() {
+    let mut m = trx64_core::Machine::new();
+    m.vic.speed_profile = SpeedProfile::U64;
+    m.vic.u64_regs_en = 0x01;
+
+    m.vic.write_reg(0x31, 0x8f); // max
+    m.sync_turbo_from_vic();
+    m.c64_core.turbo_phase = 21;
+
+    m.vic.write_reg(0x31, 0x8a); // a slower turbo, still above 1 MHz
+    m.sync_turbo_from_vic();
+    assert!(m.c64_core.turbo_div > 1);
+    assert_eq!(
+        m.c64_core.turbo_phase, 21,
+        "unknown is not the same as zero — we do not invent a restart we have not measured"
+    );
+}
+
 /// The same speed twice is not a change, so a re-write of the value already in force must
 /// not silently re-align a CPU that is mid-cycle.
 #[test]

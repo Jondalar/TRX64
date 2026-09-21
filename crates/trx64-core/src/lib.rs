@@ -2994,7 +2994,17 @@ impl Machine {
         }
         let (index, badline) = self.vic.u64_speed();
         let div = self.vic.u64_speed_table.mhz(index);
-        if div != self.c64_core.turbo_div || div <= 1 {
+        // Only what is necessarily true. At 1 MHz a CPU cycle IS a PHI2 cycle, so it can
+        // only end on a boundary and the phase there is zero — that is arithmetic, not a
+        // model, and it is the whole of UPic's resync, which goes through index 0.
+        //
+        // A change BETWEEN two turbo speeds (say 64 → 16 without passing 1) is a
+        // different question: whether the hardware's divider restarts or keeps counting
+        // is not documented and we have not measured it. So the phase is left alone
+        // there. Guessing would cost nothing visible today and be a lie in the tree —
+        // the first version of this reset guessed, and the host that asked for it could
+        // not tell the two apart from the picture either.
+        if div <= 1 {
             self.c64_core.turbo_phase = 0;
         }
         self.c64_core.turbo_div = div;

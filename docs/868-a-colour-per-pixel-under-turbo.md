@@ -144,8 +144,15 @@ store per pixel needs the sub-cycle counter to start a row at a known place, or 
 At 1 MHz this is not a modelling choice. A CPU cycle **is** a PHI2 cycle there, so a cycle
 can only end on a boundary and the phase is zero by definition; re-engaging the divider
 therefore starts from zero. So `sync_turbo_from_vic` — the instruction-boundary read that
-851 already did — resets `turbo_phase` when the divider CHANGES or is 1. Re-writing the
-speed already in force is not a change and does not re-align a CPU mid-cycle.
+851 already did — resets `turbo_phase` **when the divider is 1**, which is the whole of
+UPic's resync because it goes through index 0.
+
+**And no further, on purpose.** The first version of this also reset on any divider
+change, including one turbo speed replacing another without passing 1. Whether the
+hardware's divider restarts there is undocumented and unmeasured, and the host that
+reported the resync could not separate the two from the picture either — its robust
+metric put both inside noise. So the unknown case leaves the phase alone. Guessing would
+have cost nothing visible and been a lie in the tree, which is the expensive kind.
 
 Before this spec nothing could observe the difference, because the whole cycle took one
 colour whatever the phase said. That is the shape of the bug this feature exposes rather
@@ -200,6 +207,9 @@ Deterministic, and testable without hardware — the picture is a function of th
 
 ## §9 Open
 
+- **Does a change between two turbo speeds restart the divider?** Not documented, not
+  measured, and currently modelled as "no" (§5a). A `DEN=1` program that switches between
+  two turbo speeds mid-line and paints would answer it; so would the owner's U64.
 - Whether the array should live on `VicII` or beside the CPU mirror. On the VIC is the
   obvious answer for the draw path; the store path is the CPU's side of the bus, so a
   measurement may say otherwise.
