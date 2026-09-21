@@ -141,15 +141,38 @@ pub struct VicMemView<'a> {
     pub color_ram: &'a [u8],
     /// VIC bank base (0 / $4000 / $8000 / $C000) = bank<<14.
     pub vbank: u16,
+    /// The cartridge's ROMH, when a REAL ultimax board is in force and the cart drives
+    /// the window (= VICE's non-NULL `ultimax_romh_phi1_ptr`). `None` on every ordinary
+    /// machine, which is the condition the whole ultimax branch is gated on.
+    pub romh: Option<&'a [u8]>,
 }
 
 impl<'a> VicMemView<'a> {
     /// PORT OF: vicii-fetch.c:50 fetch_phi1 (= fetch_phi2 — identical C64 wiring).
     /// `addr = ((addr + vbank) & $FFFF) | 0`; CHARGEN overlay when
     /// `(addr & $7000) == $1000` (banks 0 + 2). Else RAM.
+    ///
+    /// PORT OF: vicii.c:842-875 for the ULTIMAX branch. Under a real ultimax board the
+    /// VIC's fetches at $3000-$3FFF of EVERY bank come out of the cartridge's ROMH, at
+    /// `$1000 + (addr & $0FFF)` — so the chip sees only the UPPER half of the 8 KiB
+    /// window, which is the half a MAX cartridge puts its charset in. A13 is not driven
+    /// out to the cart; that asymmetry is the hardware, not a shortcut.
+    ///
+    /// And the CHARGEN overlay does not apply there at all: VICE jumps clean past the
+    /// `vaddr_chargen` test in the ultimax branch. That half matters as much as the
+    /// first — a MAX machine has no character ROM in the VIC's path, so leaving the
+    /// shadow in would paint a cart's charset window with C64 glyphs.
     #[inline]
     pub fn vic_phi1(&self, addr: u16) -> u8 {
         let a = addr.wrapping_add(self.vbank); // & 0xffff (u16) | 0 offset.
+        if let Some(romh) = self.romh {
+            return if (a & 0x3fff) >= 0x3000 {
+                // The window is 8 KiB and the VIC reaches its top 4 KiB.
+                romh.get((0x1000 + (a & 0x0fff)) as usize).copied().unwrap_or(0xff)
+            } else {
+                self.ram[a as usize]
+            };
+        }
         if (a & 0x7000) == 0x1000 {
             if let Some(cr) = self.char_rom {
                 return cr[(a & 0x0fff) as usize];
@@ -178,7 +201,7 @@ impl VicMemView<'static> {
     /// A view returning 0 for every read (no char ROM, flat zero colour RAM).
     #[inline]
     pub fn null() -> Self {
-        VicMemView { ram: &ZERO_RAM, char_rom: None, color_ram: &ZERO_RAM[..0x400], vbank: 0 }
+        VicMemView { ram: &ZERO_RAM, char_rom: None, color_ram: &ZERO_RAM[..0x400], vbank: 0, romh: None }
     }
 }
 
@@ -3010,6 +3033,101 @@ mod tests {
     /// pipeline renders an all-zero frame, which is harmless for these assertions.
     fn nm() -> VicMemView<'static> {
         VicMemView::null()
+    }
+
+    // ── The ultimax fetch window ───────────────────────────────────────────────
+    //
+    // A MAX-machine cartridge (GAME=0, EXROM=1) has RAM only at $0000-$0FFF, so its
+    // charset cannot live in memory — the VIC reads it out of the cart. Jupiter Lander
+    // is the case that found this missing: screen codes and colour RAM came through
+    // fine, because both are in real memory, and every glyph was blank.
+
+    /// $3000-$3FFF of each bank comes from the cart, and only the cart's UPPER 4 KiB:
+    /// A13 is not driven out to the expansion port, so the VIC reaches $F000-$FFFF of
+    /// an $E000 window and never the bottom half.
+    #[test]
+    fn ultimax_redirects_the_top_of_each_bank_to_the_cart() {
+        let mut ram = [0x11u8; 0x10000];
+        ram[0x3000] = 0x22; // what a machine WITHOUT the redirect would read
+        let mut romh = [0u8; 0x2000];
+        romh[0x0000] = 0xaa; // the half the VIC cannot see
+        romh[0x1000] = 0xbb; // $F000 — the first byte it can
+        romh[0x1fff] = 0xcc; // $FFFF — the last
+        let chars = [0x99u8; 0x1000];
+
+        let v = VicMemView {
+            ram: &ram,
+            char_rom: Some(&chars),
+            color_ram: &ram[0xd800..0xdc00],
+            vbank: 0,
+            romh: Some(&romh),
+        };
+        assert_eq!(v.vic_phi1(0x3000), 0xbb, "the window starts at the cart's $F000");
+        assert_eq!(v.vic_phi1(0x3fff), 0xcc);
+        assert_ne!(v.vic_phi1(0x3000), 0xaa, "and never the cart's bottom half");
+        assert_eq!(v.vic_phi1(0x2fff), 0x11, "below $3000 the VIC still reads RAM");
+    }
+
+    /// Every bank, not only bank 0 — the redirect is on the VIC's own address bits,
+    /// which is why the mask is $3FFF and not $FFFF.
+    #[test]
+    fn ultimax_redirects_in_every_vic_bank() {
+        let ram = [0x11u8; 0x10000];
+        let mut romh = [0u8; 0x2000];
+        romh[0x1234] = 0x77;
+        for bank in 0..4u16 {
+            let v = VicMemView {
+                ram: &ram,
+                char_rom: None,
+                color_ram: &ram[0xd800..0xdc00],
+                vbank: bank * 0x4000,
+                romh: Some(&romh),
+            };
+            assert_eq!(v.vic_phi1(0x3234), 0x77, "bank {bank} reaches the cart too");
+        }
+    }
+
+    /// The other half of the port, and the one that is easy to miss: under ultimax the
+    /// CHARGEN shadow does not exist. VICE jumps clean past the `vaddr_chargen` test in
+    /// its ultimax branch, and it has to — a MAX machine has no character ROM in the
+    /// VIC's path, so leaving the shadow in would paint C64 glyphs over the window a
+    /// cart's own charset is supposed to come through.
+    #[test]
+    fn ultimax_has_no_chargen_shadow() {
+        let ram = [0x11u8; 0x10000];
+        let chars = [0x99u8; 0x1000];
+        let romh = [0u8; 0x2000];
+
+        let plain = VicMemView {
+            ram: &ram,
+            char_rom: Some(&chars),
+            color_ram: &ram[0xd800..0xdc00],
+            vbank: 0,
+            romh: None,
+        };
+        assert_eq!(plain.vic_phi1(0x1000), 0x99, "an ordinary C64 sees CHARGEN here");
+
+        let ultimax = VicMemView { romh: Some(&romh), ..plain };
+        assert_eq!(ultimax.vic_phi1(0x1000), 0x11, "a MAX machine sees RAM, not glyphs");
+    }
+
+    /// With no cart driving the window the fetch is byte-identical to what it always
+    /// was — which is every machine in the corpus.
+    #[test]
+    fn without_a_cart_the_fetch_is_unchanged() {
+        let ram = [0x11u8; 0x10000];
+        let chars = [0x99u8; 0x1000];
+        let v = VicMemView {
+            ram: &ram,
+            char_rom: Some(&chars),
+            color_ram: &ram[0xd800..0xdc00],
+            vbank: 0,
+            romh: None,
+        };
+        assert_eq!(v.vic_phi1(0x1000), 0x99, "CHARGEN in banks 0 and 2");
+        assert_eq!(v.vic_phi1(0x9000), 0x99);
+        assert_eq!(v.vic_phi1(0x5000), 0x11, "and RAM in banks 1 and 3");
+        assert_eq!(v.vic_phi1(0x3000), 0x11, "$3000 is RAM without a cart");
     }
 
     fn tick_n(v: &mut VicII, n: usize) {

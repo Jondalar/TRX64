@@ -399,6 +399,10 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
             char_rom: Some(self.fb.char_rom),
             color_ram: &self.fb.io[0x0800..0x0c00],
             vbank,
+            romh: crate::full::vic_romh_window(
+                self.fb.config.ultimax,
+                self.fb.cartridge.as_deref(),
+            ),
         };
         if O::RECORDS_VIC {
             self.fb.vic.tick_g::<true>(&view);
