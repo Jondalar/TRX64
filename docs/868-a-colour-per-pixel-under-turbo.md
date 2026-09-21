@@ -212,11 +212,21 @@ Deterministic, and testable without hardware — the picture is a function of th
   applies a speed write from the next INSTRUCTION, so the `stx` runs entirely at divider
   1. That is ~256 turbo-cycle-equivalents for two stores.
 
-  **It was briefly believed to cost UPic every second picture row; it does not.** With the
-  access watch armed through the real API, that row loop measures one picture row per
-  raster line, 63 PHI2 cycles apart, for all 256 rows — the row fits. The earlier reading
-  rested on a hand count and an instrument that was never wired, and the host that
-  produced both withdrew them. What is left is a modelling question standing on its own.
+  **It costs UPic every second picture row**, and the measurement took three attempts
+  because the first two instruments perturbed what they measured. A hand count is
+  arithmetic. An access watch whose `on_access` returns `true` halts the run on every hit,
+  and with two `$D012` reads per row that is a halt every few cycles — it reported 63 PHI2
+  per row and consecutive lines, and it was measuring itself. The same watch returning
+  `false` reports **126 PHI2 between row-loop reads, 593 of 600 samples**: two raster lines
+  per picture row. The host's canvas agrees independently — 132 rows carry colour, on
+  every second raster line — and one byte written into the running program (its delay
+  loop, 115 turbo cycles shorter) takes the period to 63 and the canvas to 256 rows.
+
+  **A lesson worth keeping past this defect:** a halting gate cannot time anything. Our
+  `on_access` says "halt" by returning `true`, so observing without halting is a
+  convention a host discovers by reading rather than a mode it asks for. Two of the three
+  wrong answers here came from that. A `notify`-shaped door beside the halting one would
+  have prevented both.
 
   The evidence that the model is wrong is not a datasheet: Aleksi built the pair against a
   real machine and the technique works there, so a turbo CPU can pass through index 0

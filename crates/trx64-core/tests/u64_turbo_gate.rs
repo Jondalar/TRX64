@@ -199,12 +199,27 @@ fn the_speed_tables_match_the_firmware() {
 /// two stores, chosen without a source: 851 applies a speed write from the next
 /// INSTRUCTION, so the `stx` runs entirely at divider 1.
 ///
-/// **What this charge is NOT.** It was briefly believed to cost UPic every second picture
-/// row. It does not. Instrumented properly, that row loop lands one picture row per
-/// raster line, 63 PHI2 cycles apart, for all 256 rows — the row fits. That reading came
-/// from a hand count on one side and an access watch that was never wired on the other,
-/// and the host that produced both withdrew them. The charge is a modelling question on
-/// its own merits, with no picture riding on it.
+/// **What it costs, and how that was finally measured.** The charge is the last link in a
+/// chain that ends in a missing half of a picture, and it took three attempts to measure
+/// because the first two instruments changed the thing they measured:
+///
+/// - a hand count of the row loop said the row overruns its line — arithmetic, not a
+///   measurement;
+/// - an access watch that returned `true` from `on_access` halted the run on every hit,
+///   and with two `$D012` reads per row that is a halt every few cycles. It reported 63
+///   PHI2 per row and consecutive raster lines. The probe was measuring itself;
+/// - a watch armed the same way but returning `false` — observe, never halt — reports
+///   **126 PHI2 between row-loop reads, 593 of 600 samples**. Two raster lines per
+///   picture row. The host's canvas agrees independently: 132 rows carry colour, on
+///   every second raster line.
+///
+/// One byte written into the running program (its delay loop, 135 → 112 iterations,
+/// saving 115 turbo cycles) takes the period to 63 and the canvas to 256 rows. Against a
+/// row with roughly 240 turbo cycles of slack, our ~256-cycle charge for the `stx` is the
+/// difference.
+///
+/// So the number below is not bookkeeping: it is why a program written against real
+/// hardware renders half a picture here.
 ///
 /// The evidence that our model is the wrong one is not a datasheet: Aleksi built this pair
 /// against a real machine and the technique works there, so on hardware a turbo CPU can
