@@ -240,27 +240,38 @@ fn lockstep(label: &str, off: &mut Machine, on: &mut Machine, steps: u64) -> u64
 /// ones recorded before — checked on the 843 branch before re-recording — so nothing the CIA
 /// does moved; only the checkpoint says more. The same gate found that a restored machine
 /// lost the record (restore did not read it back), fixed in `restore_vic_provenance`.
+/// **Every `@64` digest re-recorded for Spec 868 §9 (2026-09-21), and not one `@1` digest
+/// moved.** A `$D031` write is adopted at the next PHI2 EDGE instead of from the next
+/// instruction, so a turbo machine reaches its speed a cycle earlier and every observable
+/// stream at 64 MHz shifts with it; at 1 MHz there is no divider to adopt and the digests
+/// are bit-for-bit the ones recorded before. That split is the evidence the change is
+/// confined to turbo — it is the same shape as the 7-game screenshot gate, one level down.
+///
+/// The same change made this gate earn its keep for the third time: `restore_cascade@64`
+/// failed on EQUALITY, not on its digest, because a restored machine only learned its
+/// speed at the next instruction boundary and spent a PHI2 cycle at the wrong divider.
+/// `restore_runtime_checkpoint` puts the divider back in force immediately now.
 const GOLDEN: &[(&str, u64)] = &[
     ("ta_irq@1", 0xe32345655ea52187),
-    ("ta_irq@64", 0xadb11d1855244666),
+    ("ta_irq@64", 0x103bd9367deaf0ae),
     ("ta_irq_timer_read@1", 0x82b1452c59e244c7),
-    ("ta_irq_timer_read@64", 0x19d89ec55685fbac),
+    ("ta_irq_timer_read@64", 0x505800baa5bb5916),
     ("ta_oneshot@1", 0xe5b6f8ff84cbca64),
-    ("ta_oneshot@64", 0x5a728a3419f3b721),
+    ("ta_oneshot@64", 0x1842ff65e4a3264a),
     ("tb_cascade_l0@1", 0xa3b68baf80d90fd8),
-    ("tb_cascade_l0@64", 0xb912f024f4e9c963),
+    ("tb_cascade_l0@64", 0x7715fc9bb4f39a31),
     ("tb_cascade_l1@1", 0x390ad349e24c3a37),
-    ("tb_cascade_l1@64", 0xef1d58e66456d18f),
+    ("tb_cascade_l1@64", 0x0ef43999b24d6d2b),
     ("tb_cascade_l2@1", 0x42064c33bfaf60f5),
-    ("tb_cascade_l2@64", 0xd6615a1f77292b24),
+    ("tb_cascade_l2@64", 0xafc4462d480d855e),
     ("cia2_nmi@1", 0x50afb16bdf9d38ae),
-    ("cia2_nmi@64", 0x7c8c199d6268906b),
+    ("cia2_nmi@64", 0x090e1a4cbf8358c3),
     ("tod_alarm@1", 0x0a9b7d74247126c1),
-    ("tod_alarm@64", 0x1b0c4ac908d38231),
+    ("tod_alarm@64", 0xda0e684ceaa882f2),
     ("restore_cascade@1/check=false", 0x734ab0a82991ce2e),
-    ("restore_cascade@64/check=false", 0xaa2af63572b908c7),
+    ("restore_cascade@64/check=false", 0x6381f6030a3b5d9f),
     ("booted@1", 0xc9fc1a34eda0ea27),
-    ("booted@64", 0x8de5229be9032c33),
+    ("booted@64", 0xf437d278235038d9),
 ];
 
 fn golden(label: &str, digest: u64, printed: &mut Vec<String>) {
