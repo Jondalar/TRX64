@@ -210,9 +210,13 @@ Deterministic, and testable without hardware — the picture is a function of th
 - **When does a `$D031` write take effect — next instruction, or next cycle?** Measured on
   our side (`u64_turbo_gate.rs`): the resync pair costs **4 PHI2 cycles**, because 851
   applies a speed write from the next INSTRUCTION, so the `stx` runs entirely at divider
-  1. That is ~256 turbo-cycle-equivalents in a row that has ~240 to spare, so under our
-  model UPic's row cannot fit its raster line — and the UE2 host measures exactly that,
-  232 of 480 picture rows, on every build including pre-868.
+  1. That is ~256 turbo-cycle-equivalents for two stores.
+
+  **It was briefly believed to cost UPic every second picture row; it does not.** With the
+  access watch armed through the real API, that row loop measures one picture row per
+  raster line, 63 PHI2 cycles apart, for all 256 rows — the row fits. The earlier reading
+  rested on a hand count and an instrument that was never wired, and the host that
+  produced both withdrew them. What is left is a modelling question standing on its own.
 
   The evidence that the model is wrong is not a datasheet: Aleksi built the pair against a
   real machine and the technique works there, so a turbo CPU can pass through index 0

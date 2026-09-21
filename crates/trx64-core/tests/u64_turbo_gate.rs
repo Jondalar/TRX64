@@ -195,10 +195,16 @@ fn the_speed_tables_match_the_firmware() {
 /// The resync pair, measured. **This asserts what WE charge, not what silicon does** —
 /// the two are known to differ and the difference is an open question in Spec 868 §9.
 ///
-/// Four PHI2 cycles is ~256 turbo-cycle-equivalents at this divider. UPic's row has about
-/// 240 to spare in 4032, so under our accounting the row cannot fit its raster line, and
-/// the program paints one picture row per two lines — which is exactly what the UE2 host
-/// measures (232 of 480 rows), on every build.
+/// Four PHI2 cycles is ~256 turbo-cycle-equivalents at this divider — a large charge for
+/// two stores, chosen without a source: 851 applies a speed write from the next
+/// INSTRUCTION, so the `stx` runs entirely at divider 1.
+///
+/// **What this charge is NOT.** It was briefly believed to cost UPic every second picture
+/// row. It does not. Instrumented properly, that row loop lands one picture row per
+/// raster line, 63 PHI2 cycles apart, for all 256 rows — the row fits. That reading came
+/// from a hand count on one side and an access watch that was never wired on the other,
+/// and the host that produced both withdrew them. The charge is a modelling question on
+/// its own merits, with no picture riding on it.
 ///
 /// The evidence that our model is the wrong one is not a datasheet: Aleksi built this pair
 /// against a real machine and the technique works there, so on hardware a turbo CPU can
