@@ -299,12 +299,27 @@ Deterministic, and testable without hardware — the picture is a function of th
   the frame is settled rather than caught mid-generation (the 60 s and 90 s captures are
   byte-identical and both give 6.71).
 
-  One hypothesis worth testing before inventing others: a store's phase is quantised to one
-  of eight slots, and UPic's row loop uses `abs,X`/`abs,Y` loads, which cost an extra CPU
-  cycle on a page crossing. A store that lands one turbo cycle late is an eighth of a pixel
-  late — invisible except where it crosses a slot boundary, which would scatter exactly
-  this way. The probe already exists: log the phase of each of a row's 384 stores and look
-  at the deltas. If they are 8, 8, 8, 9, 8 … rather than uniformly 8, that is the answer.
+  **One hypothesis was tested and is dead.** A store's phase is quantised to one of eight
+  slots, and UPic's row loop uses `abs,X`/`abs,Y` loads, which cost an extra CPU cycle on a
+  page crossing — a store landing one turbo cycle late would be an eighth of a pixel late,
+  invisible except where it crosses a slot boundary, which would scatter exactly this way.
+  Measured over 4000 consecutive `$D020` stores at divider 64, phase read at each store:
+  **3979 of 3989 deltas are exactly 8 turbo cycles, and not one is 9.** The writer does not
+  pay the page-crossing cycle because it is built not to — its nibble table is page-aligned
+  deliberately (the author's own comment says the alignment is required) and each column is
+  its own page, so no index crosses one. The ten outliers are +4, not +1, and at 0.25 % they
+  are too few by sevenfold to be 1.7 % of a row's pixels.
+
+  So geometry and timing are both ruled out and the residual has no hypothesis. The owner
+  stopped the search here (2026-09-21) — the picture is right, and a hundredfold gap on a
+  detector this crude is not worth an open-ended hunt. What survives is the model question,
+  which is worth keeping whatever the residual turns out to be: eight slots per cycle
+  quantises a store's position to eight turbo cycles at divider 64, and how the FPGA
+  resolves a store landing mid-pixel is not something either side can read.
+
+  Untried, if anyone returns to it: the anomalies should be a function of the row's source
+  bytes, so two rows with the same nibble pattern should be anomalous in the same columns
+  and two different rows should not.
 - **Changes per drawn row fell from 42 to 27 with the fix, and that is the fix working.**
   Every rotated pixel manufactured up to two extra colour changes — about 18 per row across
   the 8-pixel groups, against a drop of 15. Removing an artefact removes the changes it
