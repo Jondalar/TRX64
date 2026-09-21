@@ -191,6 +191,15 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
     /// side-effect reads, e.g. the $DD00 IEC `iecReadPins` indirection, emitted
     /// BEFORE this load's own record — matching the TS `emitC64Access`-then-read
     /// order `cpu.rs` reproduced).
+    /// Spec 868 — hand the sub-PHI2 position to the VIC, which is the only chip on this
+    /// bus that samples finer than a cycle. Two stores, and only while a turbo divider
+    /// is running: at 1 MHz this is never called.
+    #[inline]
+    fn set_turbo_phase(&mut self, phase: u32, div: u32) {
+        self.fb.vic.turbo_phase = phase;
+        self.fb.vic.turbo_div = div;
+    }
+
     #[inline]
     fn read_raw(&mut self, addr: u16) -> u8 {
         self.sync_clk();

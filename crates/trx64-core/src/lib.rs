@@ -2636,6 +2636,7 @@ impl Machine {
             self.vic.u64_speed_prefer = 0x80;
         }
         self.c64_core.turbo_div = 1;
+        self.c64_core.pending_turbo_div = 1;
         self.c64_core.turbo_phase = 0;
         self.c64_core.turbo_badline = true;
         self.sync_profile_device();
@@ -2978,6 +2979,48 @@ impl Machine {
     /// nothing and the result is `Completed`/`CycleBudget`, byte-identical to the
     /// plain path.
     #[allow(clippy::too_many_arguments)]
+    /// Spec 851 D3 / Spec 868 §9 — the Ultimate's speed, read at an instruction boundary
+    /// and adopted at the next PHI2 edge.
+    ///
+    /// 851 charged a `$D031` write to the NEXT INSTRUCTION. That was a convenience with no
+    /// source behind it, and UPic is the program that can tell the difference: its row loop
+    /// writes index 0 and straight back to max at the top of every picture row — Aleksi's
+    /// own comment calls it a resync — and on the instruction model that pair cost four
+    /// PHI2 cycles out of a row's sixty-three, so the machine ran out of line and the
+    /// picture arrived half-drawn.
+    ///
+    /// Two things happen here instead, and they were measured together on real U64 firmware
+    /// (UE2 session, 2026-09-21, one binary, the model the only variable): the row period
+    /// went 126 → 63 PHI2 and the canvas 132 → 256 of 272 rows, while the run-length
+    /// signature that says the phase is still being realigned per row held — 62% of colour
+    /// runs at three pixels or shorter, against 59% before.
+    ///
+    ///   1. **The divider takes effect at the next PHI2 edge.** Both stores of the resync
+    ///      pair land inside one PHI2 cycle at 64 MHz, so the edge sees `$8F` and the CPU
+    ///      never runs slowly — which is what the pair was written to do.
+    ///   2. **The write reloads the divider's counter**, so the sub-PHI2 phase restarts at
+    ///      the store. That is what the resync BUYS. The phase decides which pixel a store
+    ///      paints (868), so without a known starting place a row's 384 stores walk
+    ///      relative to the pixel clock and the picture shears. It is also why the reset
+    ///      cannot key on "the divider reached 1" as it first did: under this model the
+    ///      machine never observes divider 1 at an instruction boundary at all.
+    pub fn sync_turbo_from_vic(&mut self) {
+        if self.vic.speed_profile != crate::vic::SpeedProfile::U64 {
+            return;
+        }
+        let (index, badline) = self.vic.u64_speed();
+        let div = self.vic.u64_speed_table.mhz(index);
+        if self.vic.u64_d031_written_this_instruction {
+            self.c64_core.turbo_phase = 0;
+            self.vic.u64_d031_written_this_instruction = false;
+        }
+        // Deliberately NOT `turbo_div`: the adoption is at the PHI2 edge in `clk_inc`.
+        // Assigning it here would put the speed change back on the instruction boundary,
+        // which is the model this replaced.
+        self.c64_core.pending_turbo_div = div;
+        self.c64_core.turbo_badline = badline;
+    }
+
     pub fn run_for_full_capped_dbg<O: Observer, F>(
         &mut self,
         budget: u64,
@@ -3078,13 +3121,7 @@ impl Machine {
                 self.c64_int.set_irq(c64_6510core::INT_SRC_EXPANSION, port.irq, now);
                 self.c64_int.set_nmi(c64_6510core::INT_SRC_EXPANSION, port.nmi, now);
             }
-            // Spec 851 D3 — the Ultimate's speed, read at the boundary: a `$D031` write
-            // takes effect with the next instruction.
-            if self.vic.speed_profile == crate::vic::SpeedProfile::U64 {
-                let (index, badline) = self.vic.u64_speed();
-                self.c64_core.turbo_div = self.vic.u64_speed_table.mhz(index);
-                self.c64_core.turbo_badline = badline;
-            }
+            self.sync_turbo_from_vic();
             // Spec 856 D3 — decided per boundary, because the speed above is.
             let fast_path = self.turbo_fast_path && self.c64_core.turbo_div > 1;
 

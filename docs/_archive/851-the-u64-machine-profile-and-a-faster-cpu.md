@@ -139,6 +139,14 @@ carried across `warm_reset`, `run_for_full`'s instruction cap scaled by the divi
 profile. CLI: `--machine` as an alias of `--turbo`. Gate: `crates/trx64-core/tests/u64_turbo_gate.rs`,
 in `scripts/gate.sh`.
 
+> **Superseded on one point (Spec 868 §5a, 2026-09-21).** "The divider refreshed at each
+> instruction boundary" was a convenience with no source behind it, and it charged UPic's
+> per-row resync pair four PHI2 cycles — enough that the program ran out of raster line and
+> painted half a picture. The speed is still READ at the instruction boundary; it is now
+> ADOPTED at the next PHI2 edge, and the write reloads the divider's counter. Measured
+> against real U64 firmware with both models in one binary: row period 126 → 63 PHI2,
+> canvas 132 → 256 of 272 rows.
+
 **What the build settled.**
 - A run capped by instructions ends early at turbo speed: every `budget / 2 + 1000` cap in the core,
   the daemon's breakpoint segment and the observer registry now scales by `turbo_divider()`.
