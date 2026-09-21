@@ -662,9 +662,6 @@ pub struct Machine {
     /// and the boundary sync runs once when one of them does. No effect at 1 MHz: there
     /// every instruction advances `clk`. Env kill-switch `TRX64_TURBO_FASTPATH=0`, read at
     /// `Machine::new`; the field can be flipped at any time.
-    /// Spec 868 §9 trial — a `$D031` write takes effect at the next PHI2 edge instead of
-    /// from the next instruction. `TRX64_TURBO_EDGE_MODEL=1`.
-    pub turbo_edge_model: bool,
     pub turbo_fast_path: bool,
     /// Spec 857 D4 — check CIA alarms by comparison, as VICE does, instead of catching both
     /// timers up to the clock in every instruction prologue and every cycle. Env kill-switch
@@ -861,12 +858,6 @@ impl Machine {
             uci_c64_reset: false,
             cpu_history: crate::cpu_history::CpuHistoryRing::new(),
             delta_ring: crate::delta_ring::DeltaRing::new(),
-            // Spec 868 §9 trial — off unless asked for, so an ordinary run is the
-            // shipped model and nobody measures the trial by accident.
-            turbo_edge_model: matches!(
-                std::env::var("TRX64_TURBO_EDGE_MODEL").map(|v| v.trim().to_ascii_lowercase()).as_deref(),
-                Ok("1") | Ok("on") | Ok("true") | Ok("yes")
-            ),
             turbo_fast_path: !matches!(
                 std::env::var("TRX64_TURBO_FASTPATH").map(|v| v.trim().to_ascii_lowercase()).as_deref(),
                 Ok("0") | Ok("off") | Ok("false") | Ok("no")
@@ -2645,6 +2636,7 @@ impl Machine {
             self.vic.u64_speed_prefer = 0x80;
         }
         self.c64_core.turbo_div = 1;
+        self.c64_core.pending_turbo_div = 1;
         self.c64_core.turbo_phase = 0;
         self.c64_core.turbo_badline = true;
         self.sync_profile_device();
@@ -2987,67 +2979,45 @@ impl Machine {
     /// nothing and the result is `Completed`/`CycleBudget`, byte-identical to the
     /// plain path.
     #[allow(clippy::too_many_arguments)]
-    /// Spec 851 D3 — the Ultimate's speed, read at an instruction boundary: a `$D031`
-    /// write takes effect with the next instruction, not inside the one that wrote it.
+    /// Spec 851 D3 / Spec 868 §9 — the Ultimate's speed, read at an instruction boundary
+    /// and adopted at the next PHI2 edge.
     ///
-    /// Spec 868 — and a speed CHANGE restarts the sub-PHI2 counter. At 1 MHz that is not
-    /// a choice: a CPU cycle IS a PHI2 cycle there, so the next cycle can only begin on a
-    /// boundary and the phase is zero by definition. It is why UPic drops to index 0 and
-    /// straight back to max at the top of every picture row — Aleksi's own comment calls
-    /// it a resync, and without it the row's 384 stores walk relative to the pixel clock
-    /// and the picture shears. The phase was an invisible counter until the colour slots
-    /// made it decide which pixel a store paints; it is load-bearing now.
+    /// 851 charged a `$D031` write to the NEXT INSTRUCTION. That was a convenience with no
+    /// source behind it, and UPic is the program that can tell the difference: its row loop
+    /// writes index 0 and straight back to max at the top of every picture row — Aleksi's
+    /// own comment calls it a resync — and on the instruction model that pair cost four
+    /// PHI2 cycles out of a row's sixty-three, so the machine ran out of line and the
+    /// picture arrived half-drawn.
+    ///
+    /// Two things happen here instead, and they were measured together on real U64 firmware
+    /// (UE2 session, 2026-09-21, one binary, the model the only variable): the row period
+    /// went 126 → 63 PHI2 and the canvas 132 → 256 of 272 rows, while the run-length
+    /// signature that says the phase is still being realigned per row held — 62% of colour
+    /// runs at three pixels or shorter, against 59% before.
+    ///
+    ///   1. **The divider takes effect at the next PHI2 edge.** Both stores of the resync
+    ///      pair land inside one PHI2 cycle at 64 MHz, so the edge sees `$8F` and the CPU
+    ///      never runs slowly — which is what the pair was written to do.
+    ///   2. **The write reloads the divider's counter**, so the sub-PHI2 phase restarts at
+    ///      the store. That is what the resync BUYS. The phase decides which pixel a store
+    ///      paints (868), so without a known starting place a row's 384 stores walk
+    ///      relative to the pixel clock and the picture shears. It is also why the reset
+    ///      cannot key on "the divider reached 1" as it first did: under this model the
+    ///      machine never observes divider 1 at an instruction boundary at all.
     pub fn sync_turbo_from_vic(&mut self) {
         if self.vic.speed_profile != crate::vic::SpeedProfile::U64 {
             return;
         }
         let (index, badline) = self.vic.u64_speed();
         let div = self.vic.u64_speed_table.mhz(index);
-        // Only what is necessarily true. At 1 MHz a CPU cycle IS a PHI2 cycle, so it can
-        // only end on a boundary and the phase there is zero — that is arithmetic, not a
-        // model, and it is the whole of UPic's resync, which goes through index 0.
-        //
-        // A change BETWEEN two turbo speeds (say 64 → 16 without passing 1) is a
-        // different question: whether the hardware's divider restarts or keeps counting
-        // is not documented and we have not measured it. So the phase is left alone
-        // there. Guessing would cost nothing visible today and be a lie in the tree —
-        // the first version of this reset guessed, and the host that asked for it could
-        // not tell the two apart from the picture either.
-        // ── TRIAL, Spec 868 §9: the edge model ───────────────────────────────────
-        // `TRX64_TURBO_EDGE_MODEL=1` swaps the answer to "when does a $D031 write take
-        // effect". Both models live in one binary ON PURPOSE, so a comparison cannot be
-        // contaminated by a build difference — the host measuring this has been bitten
-        // twice by instruments that were themselves the variable.
-        //
-        // Edge model, two claims, and they stand or fall together:
-        //   1. The DIVIDER takes effect at the next PHI2 edge, not from the next
-        //      instruction. UPic's `sta`/`stx` pair both land inside one PHI2 cycle at
-        //      64 MHz, so the edge sees $8F and the CPU never runs slowly — the resync
-        //      costs nothing, which is what its author built it to do.
-        //   2. The WRITE reloads the divider's counter, so the phase restarts at the
-        //      store. Without this the resync would cost nothing and also DO nothing:
-        //      the machine would never observe divider 1 at an instruction boundary, and
-        //      §5a's reset — which keys on exactly that — would never fire again.
-        //
-        // The second claim is the one I cannot derive. It is hardware I have not
-        // measured, and the granularity number is what tests it: if the phase stops
-        // being realigned per row, the sub-pixel placement degrades and the host's
-        // colour-changes-per-line falls away from 43/94.
-        if self.turbo_edge_model {
-            if self.vic.u64_d031_written_this_instruction {
-                self.c64_core.turbo_phase = 0;
-                self.vic.u64_d031_written_this_instruction = false;
-            }
-            self.c64_core.pending_turbo_div = div;
-        } else {
-            if div <= 1 {
-                self.c64_core.turbo_phase = 0;
-            }
-            self.c64_core.turbo_div = div;
-            // Keep the two equal under the shipped model, so the PHI2-edge adoption in
-            // `clk_inc` is a no-op rather than a clobber with a stale value.
-            self.c64_core.pending_turbo_div = div;
+        if self.vic.u64_d031_written_this_instruction {
+            self.c64_core.turbo_phase = 0;
+            self.vic.u64_d031_written_this_instruction = false;
         }
+        // Deliberately NOT `turbo_div`: the adoption is at the PHI2 edge in `clk_inc`.
+        // Assigning it here would put the speed change back on the instruction boundary,
+        // which is the model this replaced.
+        self.c64_core.pending_turbo_div = div;
         self.c64_core.turbo_badline = badline;
     }
 

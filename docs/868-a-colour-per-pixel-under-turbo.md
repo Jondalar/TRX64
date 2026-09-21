@@ -2,7 +2,9 @@
 
 **Status:** BUILT (2026-09-21) — §8.3 confirmed on real firmware by the UE2 session
 (run lengths of one colour collapse from 13-14 px to 1-2 px; colour changes per drawn line
-median 13 → 43), pending merge.
+median 13 → 43), and §5a's timing model settled by the same host against a trial build
+(row period 126 → 63 PHI2, canvas 132 → 256 of 272 rows, granularity held). The picture is
+complete and correct.
 **Repo:** TRX64 only. C64RE: no change — it renders the frame TRX64 hands it.
 **Number:** 868 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`).
 **Depends on:** Spec 851 (the U64 machine profile and the faster CPU), 856 (turbo pays
@@ -122,11 +124,12 @@ PHI2 cycles at all, so the technique is inherently an Elite II / C64 Ultimate on
 a consequence of arithmetic, not a decision, and it needs no new machine type: the
 `U64SpeedTable::U64II` default already expresses it.
 
-## §5a D3a — A speed change restarts the phase
+## §5a D3a — The resync: when a `$D031` write takes effect, and what it reloads
 
-Found by the second host reading UPic's `render_frame()` after §8.3 had already passed,
-and it belongs to this spec rather than to 851: the phase was an invisible counter until
-the slots made it decide which pixel a store paints.
+Found by the second host reading UPic's `render_frame()` after §8.3 had already passed.
+It revises 851's turbo timing model, and it belongs to this spec rather than to that one:
+the phase was an invisible counter until the slots made it decide which pixel a store
+paints, and before this feature nothing could observe the difference at all.
 
 Every picture row begins with
 
@@ -141,18 +144,49 @@ and Aleksi's own comment calls it a **resync**. It has to be: a technique built 
 store per pixel needs the sub-cycle counter to start a row at a known place, or the row's
 384 stores walk relative to the pixel clock and the picture shears.
 
-At 1 MHz this is not a modelling choice. A CPU cycle **is** a PHI2 cycle there, so a cycle
-can only end on a boundary and the phase is zero by definition; re-engaging the divider
-therefore starts from zero. So `sync_turbo_from_vic` — the instruction-boundary read that
-851 already did — resets `turbo_phase` **when the divider is 1**, which is the whole of
-UPic's resync because it goes through index 0.
+**Two things happen when that pair runs, and they stand or fall together.**
 
-**And no further, on purpose.** The first version of this also reset on any divider
-change, including one turbo speed replacing another without passing 1. Whether the
-hardware's divider restarts there is undocumented and unmeasured, and the host that
-reported the resync could not separate the two from the picture either — its robust
-metric put both inside noise. So the unknown case leaves the phase alone. Guessing would
-have cost nothing visible and been a lie in the tree, which is the expensive kind.
+1. **The divider is adopted at the next PHI2 edge**, not from the next instruction. Both
+   stores land inside one PHI2 cycle at 64 MHz, so the edge sees `$8F` and the CPU never
+   runs slowly — the pair costs *nothing*, which is what its author built it to do. 851
+   charged it four PHI2 cycles, ~256 turbo-cycle-equivalents, against a row with about 240
+   of slack: the row overran its raster line and the program painted one picture row per
+   two lines. That was 851's "the divider refreshed at each instruction boundary", recorded
+   as a build decision with no source behind it.
+2. **The write reloads the divider's counter**, so the phase restarts at the store,
+   whatever speed was in force. This is the half that cannot be derived. It is also the
+   half that makes the resync *do* something: with claim 1 in place the machine never
+   observes divider 1 at an instruction boundary, so a reset keyed on "the divider is 1" —
+   which is what the first version of this section used, and which is sound arithmetic on
+   its own — can never fire again.
+
+**How it was settled, with no hardware timing measurement available** (owner, 2026-09-21).
+A trial build carried both models in **one binary**, selected by an environment variable,
+because the host measuring this had twice been misled by instruments that were themselves
+the variable and a second build would have been one more. The host ran UPic on real U64
+firmware, asserted the model from the machine rather than trusting the variable, and
+measured three numbers — two that claim 1 predicts, one that only claim 2 can produce:
+
+| | 851's model | this model |
+|---|---|---|
+| row period | 126 PHI2 (593/600) | **63 PHI2** (594/600) |
+| canvas rows carrying colour | 132 of 272 | **256 of 272** |
+| colour runs ≤ 3 px | 59.0 % | **62.0 %** |
+
+The third is the one that tests the reload. If the phase stopped being realigned per row,
+sub-pixel placement would decay towards the old eight-pixel quantisation; instead the
+run-length distribution moved the right way while twice as many rows were being drawn.
+And it is the picture: complete Mandelbrot, correct orientation, the satellite and the
+spike where the hardware capture has them.
+
+A program written against the real machine, rendering correctly or not, is the strongest
+evidence available to us.
+
+**What is still not measured:** whether one turbo speed replacing another — 64 → 16
+without passing 1 — reloads the counter too. The reload keys on the *write*, so it does,
+and the tests record that as a **consequence rather than a finding**. The alternative is a
+second mechanism, a reload for one written value and not another, with no evidence behind
+it and a divider that would have to be built strangely to behave that way.
 
 Before this spec nothing could observe the difference, because the whole cycle took one
 colour whatever the phase said. That is the shape of the bug this feature exposes rather
@@ -207,37 +241,14 @@ Deterministic, and testable without hardware — the picture is a function of th
 
 ## §9 Open
 
-- **When does a `$D031` write take effect — next instruction, or next cycle?** Measured on
-  our side (`u64_turbo_gate.rs`): the resync pair costs **4 PHI2 cycles**, because 851
-  applies a speed write from the next INSTRUCTION, so the `stx` runs entirely at divider
-  1. That is ~256 turbo-cycle-equivalents for two stores.
-
-  **It costs UPic every second picture row**, and the measurement took three attempts
-  because the first two instruments perturbed what they measured. A hand count is
-  arithmetic. An access watch whose `on_access` returns `true` halts the run on every hit,
-  and with two `$D012` reads per row that is a halt every few cycles — it reported 63 PHI2
-  per row and consecutive lines, and it was measuring itself. The same watch returning
-  `false` reports **126 PHI2 between row-loop reads, 593 of 600 samples**: two raster lines
-  per picture row. The host's canvas agrees independently — 132 rows carry colour, on
-  every second raster line — and one byte written into the running program (its delay
-  loop, 115 turbo cycles shorter) takes the period to 63 and the canvas to 256 rows.
-
-  **A lesson worth keeping past this defect:** a halting gate cannot time anything. Our
-  `on_access` says "halt" by returning `true`, so observing without halting is a
-  convention a host discovers by reading rather than a mode it asks for. Two of the three
-  wrong answers here came from that. A `notify`-shaped door beside the halting one would
-  have prevented both.
-
-  The evidence that the model is wrong is not a datasheet: Aleksi built the pair against a
-  real machine and the technique works there, so a turbo CPU can pass through index 0
-  without paying a PHI2 cycle per instruction. 851 recorded "the divider refreshed at each
-  instruction boundary" as a build decision with no source — a convenience, not a
-  measurement. Changing it is a timing-model change that touches every turbo program, so
-  it wants the owner's U64 first: run the pair in a loop and count instructions per frame
-  against a build without it.
-- **Does a change between two turbo speeds restart the divider?** Not documented, not
-  measured, and currently modelled as "no" (§5a). A `DEN=1` program that switches between
-  two turbo speeds mid-line and paints would answer it; so would the owner's U64.
+- **When does a `$D031` write take effect?** Answered in §5a: at the next PHI2 edge, and
+  the write reloads the counter. The two instruments that got this wrong first are worth
+  keeping past the defect — a hand count is arithmetic, not a measurement, and an access
+  watch whose `on_access` returns `true` halts the run on every hit, so with two `$D012`
+  reads per row it was timing itself. **A halting gate cannot time anything.** Observing
+  without halting is currently a convention a host discovers by reading, not a mode it can
+  ask for; a `notify`-shaped door beside the halting one would have prevented both wrong
+  answers. That door is owed to the monitor library (864).
 - Whether the array should live on `VicII` or beside the CPU mirror. On the VIC is the
   obvious answer for the draw path; the store path is the CPU's side of the bus, so a
   measurement may say otherwise.

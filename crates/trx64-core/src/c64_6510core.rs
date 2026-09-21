@@ -661,10 +661,10 @@ pub struct C64Core6510 {
     /// `clk` — the PHI2 clock everything else is keyed on — only on every Nth.
     pub turbo_div: u32,
     pub turbo_phase: u32,
-    /// Spec 868 §9 trial — the divider the CPU will adopt at the next PHI2 edge. Equal to
-    /// `turbo_div` except between a `$D031` write and that edge, and only under the edge
-    /// model; the shipped model applies a speed change from the next instruction and
-    /// never uses this.
+    /// Spec 868 §9 — the divider the CPU will adopt at the next PHI2 edge. Equal to
+    /// `turbo_div` except between a `$D031` write and that edge. A speed written mid-cycle
+    /// does not take hold until the cycle it was written in has finished, which is what
+    /// lets UPic's resync pair cost nothing.
     pub pending_turbo_div: u32,
     /// Spec 851 — badline timing: with it the CPU waits out a BA stall like a 6510; without
     /// it a turbo CPU runs through.
@@ -849,11 +849,10 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
             self.core.turbo_phase = 0;
             self.bus.set_turbo_phase(0, self.core.turbo_div);
         }
-        // Spec 868 §9 trial — THIS is a PHI2 edge, whatever the divider was on the way
-        // here, and it is where the edge model adopts a speed written since the last one.
-        // It has to sit outside the guard above: at divider 1 that branch is skipped
-        // entirely, so an adoption inside it could never take the machine OUT of 1 MHz.
-        // Under the shipped model the two values are always equal and this is a no-op.
+        // Spec 868 §9 — THIS is a PHI2 edge, whatever the divider was on the way here,
+        // and it is where a speed written since the last one is adopted. It has to sit
+        // outside the guard above: at divider 1 that branch is skipped entirely, so an
+        // adoption inside it could never take the machine OUT of 1 MHz.
         self.core.turbo_div = self.core.pending_turbo_div;
         // interrupt_delay() — m64:97-110.
         let clk = self.core.clk;

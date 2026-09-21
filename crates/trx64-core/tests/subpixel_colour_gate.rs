@@ -11,7 +11,8 @@
 //! matter most.
 
 use trx64_core::vic::{SubCycleColour, VicII};
-use trx64_core::vic::SpeedProfile;
+use trx64_core::vic::{SpeedProfile, U64SpeedTable};
+use trx64_core::NullSink;
 
 /// §8.1 — the mapping from sub-cycle phase to pixel, with no slack in it.
 #[test]
@@ -136,7 +137,7 @@ fn only_the_border_colour_is_sub_cycle_today() {
     assert!(vic.subcycle_colour.is_some());
 }
 
-// ── The resync ─────────────────────────────────────────────────────────────────
+// ── The resync ───────────────────────────────────────────────────────
 //
 // UPic's row loop writes $D031 = $80 (index 0, 1 MHz) and immediately $8F (max) at the
 // top of every picture row, and Aleksi's own comment calls it a resync. It is not
@@ -144,79 +145,86 @@ fn only_the_border_colour_is_sub_cycle_today() {
 // to start a row at a known place, or the 384 stores walk relative to the pixel clock and
 // the picture shears.
 //
-// The physics are why the model is simple. At 1 MHz a CPU cycle IS a PHI2 cycle, so a
-// cycle there can only end on a boundary: the phase at index 0 is zero by definition, and
-// re-engaging the divider therefore starts from zero. Found by the UE2 session reading
-// `render_frame()`, after the colour slots turned the phase from an invisible counter into
-// the thing that picks a pixel.
+// So the WRITE reloads the divider's counter — the phase restarts at the store — while the
+// divider itself is adopted at the next PHI2 EDGE, which is why the pair costs nothing.
+// The two halves stand or fall together and were measured together, on real U64 firmware
+// with both models in one binary and the model the only variable (UE2 session,
+// 2026-09-21): row period 126 → 63 PHI2, canvas 132 → 256 of 272 rows, and the run-length
+// signature that only holds while the phase is realigned per row held — 62% of colour runs
+// at three pixels or shorter, against 59%.
+//
+// The first version of this reset keyed on "the divider reached 1", which is arithmetic
+// (at 1 MHz a CPU cycle IS a PHI2 cycle, so the phase there is zero by definition) but
+// which cannot fire at all once a speed change is adopted at the edge: the machine never
+// observes divider 1 at an instruction boundary. Keying on the write is what survived.
 
-/// The phase a store is placed by must restart when the speed does, or every row after
-/// the first paints its pixels 1..63 cycles out of place.
+/// A U64 actually running at the top of its speed table, divider adopted.
+fn u64_in_turbo() -> trx64_core::Machine {
+    let mut m = trx64_core::Machine::new();
+    m.set_machine_profile(SpeedProfile::U64);
+    m.set_u64_speed_table(U64SpeedTable::U64II);
+    m.vic.u64_regs_en = 0x01;
+    m.vic.write_reg(0x31, 0x8f);
+    m.poke(0xc000, &[0xea, 0xea]);
+    m.c64_core.reg_pc = 0xc000;
+    m.run_for_full_capped(64 * 4, 2, &mut NullSink, |_, _, _, _, _, _, _| {});
+    assert!(m.c64_core.turbo_div > 1, "these tests measure a machine that is in turbo");
+    m
+}
+
+/// The phase a store is placed by must restart when the speed is written, or every row
+/// after the first paints its pixels 1..63 cycles out of place.
 #[test]
 fn a_speed_change_restarts_the_sub_cycle_counter() {
-    let mut m = trx64_core::Machine::new();
-    m.vic.speed_profile = SpeedProfile::U64;
-    m.vic.u64_regs_en = 0x01; // the U64 turbo registers answer
-
-    // Run up the divider, then leave the phase somewhere in the middle of a cycle, as a
-    // row's worth of stores would.
-    m.vic.write_reg(0x31, 0x8f);
+    let mut m = u64_in_turbo();
+    let fast = m.c64_core.turbo_div;
+    // Leave the phase in the middle of a cycle, as a row's worth of stores would.
     m.c64_core.turbo_phase = 37;
 
-    // The resync: index 0, then max again.
-    m.vic.write_reg(0x31, 0x80);
+    m.vic.write_reg(0x31, 0x80); // the resync: index 0 …
     m.sync_turbo_from_vic();
-    assert_eq!(m.c64_core.turbo_div, 1, "index 0 is 1 MHz");
+    assert_eq!(m.c64_core.turbo_phase, 0, "the write reloads the divider's counter");
+    assert_eq!(m.c64_core.pending_turbo_div, 1, "index 0 is 1 MHz");
     assert_eq!(
-        m.c64_core.turbo_phase, 0,
-        "at 1 MHz a cycle is a PHI2 cycle, so the phase is zero by definition"
+        m.c64_core.turbo_div, fast,
+        "… and it is not in force yet: the divider changes at the next PHI2 edge, which is \
+         why both stores of the pair land inside one cycle and cost nothing"
     );
 
-    m.vic.write_reg(0x31, 0x8f);
+    m.vic.write_reg(0x31, 0x8f); // … and straight back to max
     m.sync_turbo_from_vic();
-    assert!(m.c64_core.turbo_div > 1, "back to turbo");
+    assert_eq!(m.c64_core.pending_turbo_div, fast, "back to full speed");
     assert_eq!(
         m.c64_core.turbo_phase, 0,
         "and the row starts from a known place, which is what the resync buys"
     );
 }
 
-/// Only index 0 is proved. Whether the hardware's divider restarts when one turbo speed
-/// replaces another — 64 to 16 without passing 1 — is undocumented and unmeasured, so the
-/// phase is left alone there rather than guessed at. UPic's resync goes through index 0,
-/// so nothing it needs depends on the unknown case.
+/// The reload keys on the WRITE, not on the value, so 64 → 16 restarts the counter exactly
+/// as index 0 does. That case has not been measured on its own and this records it as a
+/// CONSEQUENCE, not a finding — the alternative is a second mechanism, a reload that
+/// happens for one written value and not another, with no evidence behind it and a divider
+/// that would have to be built strangely to behave that way.
 #[test]
-fn a_change_between_two_turbo_speeds_is_not_assumed_to_restart() {
-    let mut m = trx64_core::Machine::new();
-    m.vic.speed_profile = SpeedProfile::U64;
-    m.vic.u64_regs_en = 0x01;
-
-    m.vic.write_reg(0x31, 0x8f); // max
-    m.sync_turbo_from_vic();
+fn a_change_between_two_turbo_speeds_restarts_it_too() {
+    let mut m = u64_in_turbo();
     m.c64_core.turbo_phase = 21;
 
     m.vic.write_reg(0x31, 0x8a); // a slower turbo, still above 1 MHz
     m.sync_turbo_from_vic();
-    assert!(m.c64_core.turbo_div > 1);
-    assert_eq!(
-        m.c64_core.turbo_phase, 21,
-        "unknown is not the same as zero — we do not invent a restart we have not measured"
-    );
+    assert!(m.c64_core.pending_turbo_div > 1, "still a turbo speed");
+    assert_eq!(m.c64_core.turbo_phase, 0, "the counter is reloaded by the store");
 }
 
-/// The same speed twice is not a change, so a re-write of the value already in force must
-/// not silently re-align a CPU that is mid-cycle.
+/// Including a write of the value already in force: a register reload does not compare
+/// first. Stated as a test because this is exactly where the next reader will assume a
+/// no-op and add one.
 #[test]
-fn rewriting_the_same_speed_leaves_the_phase_alone() {
-    let mut m = trx64_core::Machine::new();
-    m.vic.speed_profile = SpeedProfile::U64;
-    m.vic.u64_regs_en = 0x01;
-
-    m.vic.write_reg(0x31, 0x8f);
-    m.sync_turbo_from_vic();
+fn rewriting_the_same_speed_restarts_it_as_well() {
+    let mut m = u64_in_turbo();
     m.c64_core.turbo_phase = 12;
 
     m.vic.write_reg(0x31, 0x8f);
     m.sync_turbo_from_vic();
-    assert_eq!(m.c64_core.turbo_phase, 12, "nothing changed, so nothing restarts");
+    assert_eq!(m.c64_core.turbo_phase, 0, "the store reloads the counter, value or not");
 }

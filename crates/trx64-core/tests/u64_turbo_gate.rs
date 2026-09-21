@@ -179,59 +179,51 @@ fn the_speed_tables_match_the_firmware() {
     assert_eq!(U64SpeedTable::U64II.mhz(0x7f), 64, "a speed index past the table clamps");
 }
 
-// ── What a speed change costs ───────────────────────────────────────────────────
+// ── What a speed change costs ───────────────────────────────────
 //
 // Spec 868, from the UE2 session reading UPic's row loop: every picture row begins by
 // writing $D031 = $80 (index 0, 1 MHz) and immediately $8F (max). Aleksi calls it a
 // resync and built it to cost almost nothing — the row's cycle budget has about 240
-// turbo cycles of slack in 4032, so a pair that costs four PHI2 cycles (256 at this
-// divider) does not fit, the row runs past its raster line, and from then on the program
-// paints one picture row per two lines.
+// turbo cycles of slack in 4032, so the four PHI2 cycles (256 at this divider) that 851
+// charged did not fit: the row ran past its raster line, and from then on the program
+// painted one picture row per two lines.
 //
 // This measures the charge with no program and no host involved: four instructions, one
-// PHI2 delta. What the HARDWARE does is a separate question (§9 of 868) — this settles
-// only what WE charge, which is the half that is ours.
+// PHI2 delta.
 
-/// The resync pair, measured. **This asserts what WE charge, not what silicon does** —
-/// the two are known to differ and the difference is an open question in Spec 868 §9.
+/// The resync pair, measured — and under the current model it costs **nothing**.
 ///
-/// Four PHI2 cycles is ~256 turbo-cycle-equivalents at this divider — a large charge for
-/// two stores, chosen without a source: 851 applies a speed write from the next
-/// INSTRUCTION, so the `stx` runs entirely at divider 1.
+/// 851 applied a `$D031` write from the next INSTRUCTION, chosen as a convenience with no
+/// source behind it, and that charged this pair four PHI2 cycles — ~256 turbo-cycle
+/// equivalents for two stores. 868 §9 replaced the model: the divider is adopted at the
+/// next PHI2 EDGE, so both stores land inside one cycle and the CPU never runs slowly,
+/// which is what Aleksi built the pair to do.
 ///
-/// **What it costs, and how that was finally measured.** The charge is the last link in a
-/// chain that ends in a missing half of a picture, and it took three attempts to measure
-/// because the first two instruments changed the thing they measured:
+/// **How that was settled, with no hardware timing measurement available.** The charge is
+/// the last link in a chain that ends in a missing half of a picture, and it took three
+/// attempts to measure because the first two instruments changed the thing they measured:
 ///
 /// - a hand count of the row loop said the row overruns its line — arithmetic, not a
 ///   measurement;
 /// - an access watch that returned `true` from `on_access` halted the run on every hit,
 ///   and with two `$D012` reads per row that is a halt every few cycles. It reported 63
 ///   PHI2 per row and consecutive raster lines. The probe was measuring itself;
-/// - a watch armed the same way but returning `false` — observe, never halt — reports
-///   **126 PHI2 between row-loop reads, 593 of 600 samples**. Two raster lines per
-///   picture row. The host's canvas agrees independently: 132 rows carry colour, on
-///   every second raster line.
+/// - a watch armed the same way but returning `false` — observe, never halt — reported
+///   **126 PHI2 between row-loop reads, 593 of 600 samples**: two raster lines per picture
+///   row, with the host's canvas agreeing independently at 132 rows carrying colour.
 ///
-/// One byte written into the running program (its delay loop, 135 → 112 iterations,
-/// saving 115 turbo cycles) takes the period to 63 and the canvas to 256 rows. Against a
-/// row with roughly 240 turbo cycles of slack, our ~256-cycle charge for the `stx` is the
-/// difference.
-///
-/// So the number below is not bookkeeping: it is why a program written against real
-/// hardware renders half a picture here.
-///
-/// The evidence that our model is the wrong one is not a datasheet: Aleksi built this pair
-/// against a real machine and the technique works there, so on hardware a turbo CPU can
-/// pass through index 0 without paying a whole PHI2 cycle per instruction. That points at
-/// the divider taking effect from the next CYCLE (or at the next PHI2 edge) rather than
-/// from the next instruction, which is what `sync_turbo_from_vic` does today. Changing it
-/// is a timing-model change and wants a measurement on the owner's U64 first.
+/// Then the arbiter, both models in one binary so the model was the only variable
+/// (UE2 session, 2026-09-21): **63 PHI2 per row, 594 of 600 samples, 256 of 272 canvas
+/// rows**, and the run-length signature that says the sub-PHI2 phase is still realigned
+/// per row held — 62% of colour runs at three pixels or shorter, against 59% before. A
+/// program written against the real machine renders correctly under this model and half a
+/// picture under the other; that is the strongest evidence available to us, and it is what
+/// took the number below from 4 to 0.
 ///
 /// So: if you change the model, this test fails, and it should. Update the number
 /// deliberately and say what settled it.
 #[test]
-fn the_speed_change_pair_costs_four_phi2_cycles_in_our_model() {
+fn the_speed_change_pair_costs_nothing() {
     let mut m = u64_machine();
     m.set_u64_speed_table(U64SpeedTable::U64II);
     m.vic.u64_regs_en = 0x01;
@@ -251,53 +243,8 @@ fn the_speed_change_pair_costs_four_phi2_cycles_in_our_model() {
     let phi2 = m.clk - before;
 
     assert_eq!(
-        phi2, 4,
-        "our model applies a $D031 write from the next INSTRUCTION, so the stx runs \
-         entirely at divider 1 and costs a full PHI2 cycle per its four cycles"
-    );
-}
-
-/// Spec 868 §9 trial — the same resync pair under `TRX64_TURBO_EDGE_MODEL=1`.
-///
-/// Run with the flag set, this asserts the claim the trial exists to test: both stores
-/// land inside one PHI2 cycle at 64 MHz, so the edge sees $8F and the CPU never runs
-/// slowly. Four PHI2 becomes none, which is ~256 turbo cycles handed back to a row that
-/// has about 240 to spare.
-///
-/// It is `#[ignore]` because the flag is process-wide and the shipped-model test above
-/// must not see it:
-///
-///     TRX64_TURBO_EDGE_MODEL=1 cargo test -p trx64-core --test u64_turbo_gate \
-///       -- --ignored the_speed_change_pair_under_the_edge_model
-#[test]
-#[ignore = "trial: needs TRX64_TURBO_EDGE_MODEL=1"]
-fn the_speed_change_pair_under_the_edge_model_costs_nothing() {
-    assert!(
-        std::env::var("TRX64_TURBO_EDGE_MODEL").is_ok(),
-        "run this with TRX64_TURBO_EDGE_MODEL=1 or it proves nothing"
-    );
-
-    let mut m = u64_machine();
-    m.set_u64_speed_table(U64SpeedTable::U64II);
-    m.vic.u64_regs_en = 0x01;
-    assert!(m.turbo_edge_model, "the flag must have reached the machine");
-
-    m.vic.write_reg(0x31, 0x8f);
-    m.poke(0xc000, &[0xea, 0xea]);
-    m.c64_core.reg_pc = 0xc000;
-    m.run_for_full_capped(64 * 4, 2, &mut NullSink, |_, _, _, _, _, _, _| {});
-    assert!(m.c64_core.turbo_div > 1, "the machine must be in turbo to measure this");
-
-    m.poke(0xc100, &[0xa9, 0x80, 0xa2, 0x8f, 0x8d, 0x31, 0xd0, 0x8e, 0x31, 0xd0]);
-    m.c64_core.reg_pc = 0xc100;
-
-    let before = m.clk;
-    m.run_for_full_capped(64 * 64, 4, &mut NullSink, |_, _, _, _, _, _, _| {});
-    let phi2 = m.clk - before;
-
-    assert_eq!(
         phi2, 0,
-        "under the edge model the pair stays inside one PHI2 cycle and costs nothing"
+        "the divider is adopted at the PHI2 edge, so the pair stays inside one cycle"
     );
     assert!(m.c64_core.turbo_div > 1, "and the machine is still at full speed");
 }

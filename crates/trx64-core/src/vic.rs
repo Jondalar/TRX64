@@ -1174,9 +1174,10 @@ pub struct VicII {
     /// here by the turbo CPU (`C64Core6510Bus::set_turbo_phase`). `div == 1` means a
     /// CPU that cannot see finer than PHI2, which is every machine but the U64 in turbo.
     pub turbo_phase: u32,
-    /// Spec 868 §9 trial — set by a `$D031` write, cleared when the CPU reads it at the
-    /// next instruction boundary. The edge model reloads the divider's counter on the
-    /// write; the shipped model ignores this entirely.
+    /// Spec 868 §9 — set by a `$D031` write, cleared when the CPU reads it at the next
+    /// instruction boundary. The write reloads the divider's counter, so the sub-PHI2
+    /// phase restarts there; that is what UPic's resync buys, and it is the only thing
+    /// that realigns the phase now that a speed change is adopted at the PHI2 edge.
     pub u64_d031_written_this_instruction: bool,
     pub turbo_div: u32,
     /// Spec 868 — the border colour in force at each of the eight pixels this PHI2 cycle
@@ -2770,7 +2771,8 @@ impl VicII {
             0x31 if self.speed_profile == SpeedProfile::U64 && self.u64_regs_en & 0x01 != 0 => {
                 self.regs[0x31] = value;
                 self.u64_d031_written = true;
-                // Spec 868 §9 trial — the edge model reloads the divider's counter here.
+                // Spec 868 §9 — the write reloads the divider's counter, so the
+                // sub-PHI2 phase restarts at this store.
                 self.u64_d031_written_this_instruction = true;
             }
             // default — unused (vicii-mem.c:333 `/* unused */ break`). VICE does
