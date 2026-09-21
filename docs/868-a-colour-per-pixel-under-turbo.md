@@ -1,6 +1,8 @@
 # Spec 868 — A colour per pixel: what a 64 MHz CPU can do to `$D020`
 
-**Status:** PROPOSED (2026-09-21)
+**Status:** BUILT (2026-09-21) — §8.3 confirmed on real firmware by the UE2 session
+(run lengths of one colour collapse from 13-14 px to 1-2 px; colour changes per drawn line
+median 13 → 43), pending merge.
 **Repo:** TRX64 only. C64RE: no change — it renders the frame TRX64 hands it.
 **Number:** 868 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`).
 **Depends on:** Spec 851 (the U64 machine profile and the faster CPU), 856 (turbo pays
@@ -119,6 +121,35 @@ At 48 MHz (the U64 mk1 speed table's top index) a line's 3072 CPU cycles do not 
 PHI2 cycles at all, so the technique is inherently an Elite II / C64 Ultimate one. That is
 a consequence of arithmetic, not a decision, and it needs no new machine type: the
 `U64SpeedTable::U64II` default already expresses it.
+
+## §5a D3a — A speed change restarts the phase
+
+Found by the second host reading UPic's `render_frame()` after §8.3 had already passed,
+and it belongs to this spec rather than to 851: the phase was an invisible counter until
+the slots made it decide which pixel a store paints.
+
+Every picture row begins with
+
+```asm
+    lda #$80        ; index 0 — 1 MHz
+    ldx #$8f        ; max again
+    sta $d031
+    stx $d031
+```
+
+and Aleksi's own comment calls it a **resync**. It has to be: a technique built on one
+store per pixel needs the sub-cycle counter to start a row at a known place, or the row's
+384 stores walk relative to the pixel clock and the picture shears.
+
+At 1 MHz this is not a modelling choice. A CPU cycle **is** a PHI2 cycle there, so a cycle
+can only end on a boundary and the phase is zero by definition; re-engaging the divider
+therefore starts from zero. So `sync_turbo_from_vic` — the instruction-boundary read that
+851 already did — resets `turbo_phase` when the divider CHANGES or is 1. Re-writing the
+speed already in force is not a change and does not re-align a CPU mid-cycle.
+
+Before this spec nothing could observe the difference, because the whole cycle took one
+colour whatever the phase said. That is the shape of the bug this feature exposes rather
+than causes.
 
 ## §6 D4 — `$D021` comes second, and on purpose
 

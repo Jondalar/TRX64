@@ -2978,6 +2978,29 @@ impl Machine {
     /// nothing and the result is `Completed`/`CycleBudget`, byte-identical to the
     /// plain path.
     #[allow(clippy::too_many_arguments)]
+    /// Spec 851 D3 — the Ultimate's speed, read at an instruction boundary: a `$D031`
+    /// write takes effect with the next instruction, not inside the one that wrote it.
+    ///
+    /// Spec 868 — and a speed CHANGE restarts the sub-PHI2 counter. At 1 MHz that is not
+    /// a choice: a CPU cycle IS a PHI2 cycle there, so the next cycle can only begin on a
+    /// boundary and the phase is zero by definition. It is why UPic drops to index 0 and
+    /// straight back to max at the top of every picture row — Aleksi's own comment calls
+    /// it a resync, and without it the row's 384 stores walk relative to the pixel clock
+    /// and the picture shears. The phase was an invisible counter until the colour slots
+    /// made it decide which pixel a store paints; it is load-bearing now.
+    pub fn sync_turbo_from_vic(&mut self) {
+        if self.vic.speed_profile != crate::vic::SpeedProfile::U64 {
+            return;
+        }
+        let (index, badline) = self.vic.u64_speed();
+        let div = self.vic.u64_speed_table.mhz(index);
+        if div != self.c64_core.turbo_div || div <= 1 {
+            self.c64_core.turbo_phase = 0;
+        }
+        self.c64_core.turbo_div = div;
+        self.c64_core.turbo_badline = badline;
+    }
+
     pub fn run_for_full_capped_dbg<O: Observer, F>(
         &mut self,
         budget: u64,
@@ -3078,13 +3101,7 @@ impl Machine {
                 self.c64_int.set_irq(c64_6510core::INT_SRC_EXPANSION, port.irq, now);
                 self.c64_int.set_nmi(c64_6510core::INT_SRC_EXPANSION, port.nmi, now);
             }
-            // Spec 851 D3 — the Ultimate's speed, read at the boundary: a `$D031` write
-            // takes effect with the next instruction.
-            if self.vic.speed_profile == crate::vic::SpeedProfile::U64 {
-                let (index, badline) = self.vic.u64_speed();
-                self.c64_core.turbo_div = self.vic.u64_speed_table.mhz(index);
-                self.c64_core.turbo_badline = badline;
-            }
+            self.sync_turbo_from_vic();
             // Spec 856 D3 — decided per boundary, because the speed above is.
             let fast_path = self.turbo_fast_path && self.c64_core.turbo_div > 1;
 

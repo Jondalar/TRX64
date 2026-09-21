@@ -135,3 +135,65 @@ fn only_the_border_colour_is_sub_cycle_today() {
     vic.write_reg(0x20, 0x02);
     assert!(vic.subcycle_colour.is_some());
 }
+
+// ── The resync ─────────────────────────────────────────────────────────────────
+//
+// UPic's row loop writes $D031 = $80 (index 0, 1 MHz) and immediately $8F (max) at the
+// top of every picture row, and Aleksi's own comment calls it a resync. It is not
+// decoration: a technique built on one store per pixel needs the CPU's sub-cycle counter
+// to start a row at a known place, or the 384 stores walk relative to the pixel clock and
+// the picture shears.
+//
+// The physics are why the model is simple. At 1 MHz a CPU cycle IS a PHI2 cycle, so a
+// cycle there can only end on a boundary: the phase at index 0 is zero by definition, and
+// re-engaging the divider therefore starts from zero. Found by the UE2 session reading
+// `render_frame()`, after the colour slots turned the phase from an invisible counter into
+// the thing that picks a pixel.
+
+/// The phase a store is placed by must restart when the speed does, or every row after
+/// the first paints its pixels 1..63 cycles out of place.
+#[test]
+fn a_speed_change_restarts_the_sub_cycle_counter() {
+    let mut m = trx64_core::Machine::new();
+    m.vic.speed_profile = SpeedProfile::U64;
+    m.vic.u64_regs_en = 0x01; // the U64 turbo registers answer
+
+    // Run up the divider, then leave the phase somewhere in the middle of a cycle, as a
+    // row's worth of stores would.
+    m.vic.write_reg(0x31, 0x8f);
+    m.c64_core.turbo_phase = 37;
+
+    // The resync: index 0, then max again.
+    m.vic.write_reg(0x31, 0x80);
+    m.sync_turbo_from_vic();
+    assert_eq!(m.c64_core.turbo_div, 1, "index 0 is 1 MHz");
+    assert_eq!(
+        m.c64_core.turbo_phase, 0,
+        "at 1 MHz a cycle is a PHI2 cycle, so the phase is zero by definition"
+    );
+
+    m.vic.write_reg(0x31, 0x8f);
+    m.sync_turbo_from_vic();
+    assert!(m.c64_core.turbo_div > 1, "back to turbo");
+    assert_eq!(
+        m.c64_core.turbo_phase, 0,
+        "and the row starts from a known place, which is what the resync buys"
+    );
+}
+
+/// The same speed twice is not a change, so a re-write of the value already in force must
+/// not silently re-align a CPU that is mid-cycle.
+#[test]
+fn rewriting_the_same_speed_leaves_the_phase_alone() {
+    let mut m = trx64_core::Machine::new();
+    m.vic.speed_profile = SpeedProfile::U64;
+    m.vic.u64_regs_en = 0x01;
+
+    m.vic.write_reg(0x31, 0x8f);
+    m.sync_turbo_from_vic();
+    m.c64_core.turbo_phase = 12;
+
+    m.vic.write_reg(0x31, 0x8f);
+    m.sync_turbo_from_vic();
+    assert_eq!(m.c64_core.turbo_phase, 12, "nothing changed, so nothing restarts");
+}
