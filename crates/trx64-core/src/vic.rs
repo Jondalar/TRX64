@@ -1170,6 +1170,16 @@ pub struct VicII {
     /// Spec 815 — which machine this claims to be. Default C64: $D02F-$D03F are
     /// open bus and nothing below this line does anything.
     pub speed_profile: SpeedProfile,
+    /// Spec 868 — the sub-PHI2 position of the CPU cycle currently storing, mirrored
+    /// here by the turbo CPU (`C64Core6510Bus::set_turbo_phase`). `div == 1` means a
+    /// CPU that cannot see finer than PHI2, which is every machine but the U64 in turbo.
+    pub turbo_phase: u32,
+    pub turbo_div: u32,
+    /// Spec 868 — the border colour in force at each of the eight pixels this PHI2 cycle
+    /// draws. Armed only while a 64 MHz CPU is writing `$D020` more than once per cycle
+    /// (UPic paints a border picture that way); `None` everywhere else, and then the
+    /// colour resolve is exactly what it always was.
+    pub subcycle_colour: Option<SubCycleColour>,
     /// PORT OF: `vicii-mem.c:976` — `vicii.fastmode = value & 1`. STORED AND
     /// REPORTED ONLY. What a set speed bit does to the picture is Spec 815 §3 and
     /// is deliberately unbuilt: the one open question about it changes the
@@ -1364,6 +1374,44 @@ impl Default for VicII {
     }
 }
 
+/// Spec 868 — eight colour values, one per pixel of a PHI2 cycle.
+///
+/// A 1 MHz 6510 cannot write a register twice in a cycle, so VICE keeps one latch and so
+/// did we. A 64 MHz U64 CPU can write it eight times, once per pixel the cycle draws, and
+/// the FPGA VIC samples the border colour at the pixel clock — which is what turns
+/// Aleksi Eeben's UPic into a 384-pixel-wide picture.
+///
+/// A store at pixel `k` fills `slots[k..8]`: the register holds its value until something
+/// replaces it, so an unwritten slot is not "no colour", it is the previous one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SubCycleColour {
+    /// The register these slots stand for — `0x20` ($D020) today.
+    pub reg: u8,
+    pub slots: [u8; 8],
+}
+
+impl SubCycleColour {
+    /// Which of the cycle's eight pixels a store at this phase belongs to.
+    ///
+    /// At 64 MHz that is 64 CPU cycles per PHI2 cycle and 8 per pixel, which is exactly
+    /// what UPic's unrolled loop spends per pixel — the mapping has no slack in it.
+    #[inline]
+    pub fn pixel_for(phase: u32, div: u32) -> usize {
+        if div <= 1 {
+            return 0;
+        }
+        ((phase * 8 / div) as usize).min(7)
+    }
+
+    /// The value in force from `pixel` to the end of the cycle.
+    #[inline]
+    pub fn set_from(&mut self, pixel: usize, value: u8) {
+        for slot in self.slots.iter_mut().skip(pixel) {
+            *slot = value;
+        }
+    }
+}
+
 impl VicII {
     /// A power-on VIC-II of the default model (`c64-pal`).
     pub fn new() -> Self {
@@ -1379,6 +1427,9 @@ impl VicII {
             provenance: [ProvenanceRegs::default(); MAX_RASTER_LINES],
             line_rec: None,
             speed_profile: SpeedProfile::C64,
+            turbo_phase: 0,
+            turbo_div: 1,
+            subcycle_colour: None,
             fastmode: 0,
             u64_regs_en: 0x01,
             u64_speed_prefer: 0x80,
@@ -2751,12 +2802,37 @@ impl VicII {
     /// already stored in regs.
     #[inline]
     fn color_reg_store(&mut self, addr: u8, v4: u8) {
+        // Spec 868 — a CPU that can write this register more than once per PHI2 cycle
+        // is saying something the single latch below cannot hold. Gated on the U64
+        // profile AND a divider above one, so every C64 and C128 keeps VICE's model
+        // exactly: same code, same order, same bytes.
+        if addr == 0x20 && self.turbo_div > 1 && self.speed_profile == SpeedProfile::U64 {
+            let pixel = SubCycleColour::pixel_for(self.turbo_phase, self.turbo_div);
+            let slots = self.subcycle_colour.get_or_insert(SubCycleColour {
+                reg: addr,
+                // Before the first store this cycle, every pixel still shows what the
+                // register already held.
+                slots: [self.cregs[addr as usize]; 8],
+            });
+            slots.set_from(pixel, v4);
+        }
+
         self.last_color_reg = addr;
         self.last_color_value = v4;
         // vicii_monitor_colreg_store: cregs[reg]=value + draw_last_color_reg/value.
         self.cregs[addr as usize] = v4;
         self.draw_last_color_reg = addr;
         self.draw_last_color_value = v4;
+    }
+
+    /// The value a colour register currently holds ($D020-$D02E, by $D000-offset).
+    ///
+    /// The register file is crate-private because everything inside reaches it directly;
+    /// this is the read door for a caller outside — a gate asserting what the CPU last
+    /// wrote, where the per-pixel slots (Spec 868) deliberately do NOT apply.
+    #[inline]
+    pub fn colour_register(&self, reg: u8) -> u8 {
+        self.cregs[(reg & 0x2f) as usize]
     }
 
     /// PORT OF: vicii-mem.c:492 read_raster_y.

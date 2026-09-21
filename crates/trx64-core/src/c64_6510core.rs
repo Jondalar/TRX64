@@ -470,6 +470,12 @@ pub trait C64Core6510Bus {
     /// `read`/`write` perform the check_ba() themselves OR the core calls
     /// `check_ba()` then `read_raw`. We expose BOTH the raw access and check_ba
     /// so the core reproduces the exact VICE ordering.
+    /// Spec 868 — where inside a PHI2 cycle this CPU cycle sits. Called only while
+    /// the turbo divider is above one; a chip that samples finer than PHI2 (the VIC's
+    /// colour registers) needs it at the moment of the store. Default no-op.
+    #[inline]
+    fn set_turbo_phase(&mut self, _phase: u32, _div: u32) {}
+
     fn read_raw(&mut self, addr: u16) -> u8;
     /// PORT OF: mainc64cpu.c:372-380 STORE (raw write tab). reu_dma($ff00) hook
     /// is folded into the implementor.
@@ -828,9 +834,14 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
         if self.core.turbo_div > 1 {
             self.core.turbo_phase += 1;
             if self.core.turbo_phase < self.core.turbo_div {
+                // Spec 868 — the sub-PHI2 position, which was already known here and
+                // simply never passed on. A chip that can see finer than PHI2 (the VIC's
+                // colour registers) needs it at the moment of the store, not afterwards.
+                self.bus.set_turbo_phase(self.core.turbo_phase, self.core.turbo_div);
                 return;
             }
             self.core.turbo_phase = 0;
+            self.bus.set_turbo_phase(0, self.core.turbo_div);
         }
         // interrupt_delay() — m64:97-110.
         let clk = self.core.clk;

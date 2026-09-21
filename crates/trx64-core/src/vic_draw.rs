@@ -444,7 +444,16 @@ fn update_cregs(v: &mut VicII) {
 #[inline]
 fn draw_colors_6569(v: &mut VicII, base: usize, i: usize) {
     let lookup_index = (i + 1) & 0x07;
-    v.pixel_buffer[lookup_index] = v.cregs[v.pixel_buffer[lookup_index] as usize];
+    let token = v.pixel_buffer[lookup_index] as usize;
+    // Spec 868 — the override belongs HERE, at the resolve, and not where the token was
+    // placed. A token says WHICH register a pixel comes from; only this line says which
+    // VALUE. Riding the same lookup keeps the 6569's one-pixel colour latency intact:
+    // `lookup_index` is a pixel behind `i` by design, and a turbo store must be a pixel
+    // behind too, or the fast machine would draw sharper than the chip does.
+    v.pixel_buffer[lookup_index] = match v.subcycle_colour {
+        Some(sc) if sc.reg as usize == token => sc.slots[lookup_index],
+        _ => v.cregs[token],
+    };
     if base + i < FB_W * FB_H {
         v.dbuf[base + i] = v.pixel_buffer[i];
     }
@@ -458,7 +467,14 @@ fn draw_colors_8565(v: &mut VicII, base: usize, i: usize) {
     if i == 0 && v.pixel_buffer[lookup_index] == v.draw_last_color_reg {
         v.pixel_buffer[lookup_index] = 0x0f;
     } else {
-        v.pixel_buffer[lookup_index] = v.cregs[v.pixel_buffer[lookup_index] as usize];
+        // Spec 868 — same override as the 6569 path, on this chip's own lookup (no
+        // latency here, hence no offset). The grey-dot branch above is untouched: it is
+        // about a register CHANGING mid-pixel, which is a different statement.
+        let token = v.pixel_buffer[lookup_index] as usize;
+        v.pixel_buffer[lookup_index] = match v.subcycle_colour {
+            Some(sc) if sc.reg as usize == token => sc.slots[lookup_index],
+            _ => v.cregs[token],
+        };
     }
     if base + i < FB_W * FB_H {
         v.dbuf[base + i] = v.pixel_buffer[i];
@@ -504,6 +520,12 @@ fn draw_colors8(v: &mut VicII) {
     }
     v.dbuf_offset += 8;
 
+    // Spec 868 — the slots are scratch for ONE PHI2 cycle: the pixels they described
+    // have just been laid down. `cregs` already holds the last value the CPU wrote, so
+    // everything that reads the register outside this path — a monitor `io`, a snapshot,
+    // the next cycle's first pixel — sees what it saw before.
+    v.subcycle_colour = None;
+
     update_cregs(v);
 }
 
@@ -531,4 +553,82 @@ pub(crate) fn vicii_draw_cycle(v: &mut VicII) {
     draw_colors8(v);
 
     v.cycle_flags_pipe = v.cycle_flags;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vic::{SpeedProfile, SubCycleColour};
+
+    /// Spec 868 — the proof that matters: eight values written inside one PHI2 cycle
+    /// come out as eight different pixels in the frame buffer, which is what makes UPic
+    /// a picture rather than a 48-wide smear.
+    ///
+    /// It drives the colour resolve directly, because that is where the override lives;
+    /// the border path above only says WHICH register each pixel comes from.
+    #[test]
+    fn eight_border_values_paint_eight_pixels() {
+        let mut v = VicII::new();
+        v.speed_profile = SpeedProfile::U64;
+        v.turbo_div = 64;
+        v.color_latency = false; // the 8565 path: no one-pixel pipeline to unwind here
+        v.dbuf_line = 0;
+        v.dbuf_offset = 0;
+
+        // The whole cycle is border, as UPic arranges with DEN=0.
+        v.render_buffer.fill(COL_D020);
+        v.pixel_buffer.fill(COL_D020);
+
+        // Eight stores, one per pixel, exactly as the unrolled loop produces them.
+        for pixel in 0..8u32 {
+            v.turbo_phase = pixel * 8;
+            v.write_reg(0x20, (pixel as u8) + 1);
+        }
+
+        draw_colors8(&mut v);
+
+        let row: Vec<u8> = (0..8).map(|i| v.dbuf[i]).collect();
+        // Pixel 0 is the 8565's grey dot, not a miss: `draw_colors_8565` replaces the
+        // first pixel with $0f when the register it names was written in this very
+        // cycle, which is the chip's own behaviour and was here before Spec 868. Pixels
+        // 1..7 are the eight values arriving one per pixel — the thing that could not
+        // happen before.
+        assert_eq!(
+            row,
+            vec![0x0f, 2, 3, 4, 5, 6, 7, 8],
+            "each pixel takes the value in force when the VIC sampled it"
+        );
+        assert!(
+            v.subcycle_colour.is_none(),
+            "the slots are scratch for one cycle and are cleared with it"
+        );
+    }
+
+    /// The same eight stores on a 1 MHz machine: one value for the whole cycle, which is
+    /// the behaviour every C64 in the corpus depends on.
+    #[test]
+    fn without_turbo_the_cycle_is_one_colour() {
+        let mut v = VicII::new();
+        v.speed_profile = SpeedProfile::C64;
+        v.turbo_div = 1;
+        v.color_latency = false;
+        v.dbuf_line = 0;
+        v.dbuf_offset = 0;
+        v.render_buffer.fill(COL_D020);
+        v.pixel_buffer.fill(COL_D020);
+
+        for value in 1..=8u8 {
+            v.write_reg(0x20, value);
+        }
+        draw_colors8(&mut v);
+
+        let row: Vec<u8> = (0..8).map(|i| v.dbuf[i]).collect();
+        // Same grey dot at pixel 0, same reason; the other seven are ONE colour, because
+        // a 6510 cannot say more than one thing per cycle.
+        assert_eq!(
+            row,
+            vec![0x0f, 8, 8, 8, 8, 8, 8, 8],
+            "one latch, one colour, seven identical pixels behind the grey dot"
+        );
+    }
 }
