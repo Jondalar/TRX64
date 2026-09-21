@@ -360,6 +360,8 @@ impl<'a> Bus for VicBus<'a> {
             char_rom: None,
             color_ram: &self.mem[0xd800..0xdc00],
             vbank: 0,
+            // The chip-isolated bus has no expansion port, so no ultimax and no cart.
+            romh: None,
         };
         self.vic.tick(&view);
     }
@@ -372,6 +374,8 @@ impl<'a> Bus for VicBus<'a> {
             char_rom: None,
             color_ram: &self.mem[0xd800..0xdc00],
             vbank: 0,
+            // The chip-isolated bus has no expansion port, so no ultimax and no cart.
+            romh: None,
         };
         self.vic.steal_cycles(&view)
     }
@@ -2066,11 +2070,16 @@ impl Machine {
             self.c64_core.clk = self.c64_core.clk.wrapping_add(1);
             let clk = self.c64_core.clk;
             let vbank = self.vic_bank_base();
+            // Resolved BEFORE the view, so the borrow is of `memconfig` + `cartridge`
+            // and not of the whole machine — `vic.tick` needs `&mut self.vic`.
+            let romh =
+                crate::full::vic_romh_window(self.memconfig.ultimax, self.cartridge.as_ref());
             let view = crate::vic::VicMemView {
                 ram: &self.ram,
                 char_rom: Some(&self.char_rom),
                 color_ram: &self.io_shadow[0x0800..0x0c00],
                 vbank,
+                romh,
             };
             self.vic.tick(&view);
             if chips {

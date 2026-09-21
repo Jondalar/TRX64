@@ -112,6 +112,25 @@ change outside the mapper: `CartMapper::fake_ultimax()` (default false) plus the
 fallbacks it gates — our bus showed open bus at `$C000`/`$E000` for a declined window,
 correct for a real ultimax cart and wrong for this one. GMod3 will need the same.
 
+**Addendum, 2026-09-21 — the other half of ultimax was missing, and only the VIC could see
+it.** `fake_ultimax()` fixed what the CPU reads through a declined window. Nothing fixed
+what the **VIC** reads: under a real ultimax board the chip's own fetches at `$3000-$3FFF`
+of every bank come out of the cartridge's ROMH, at `$1000 + (addr & $0FFF)`, and the
+CHARGEN shadow does not apply there at all (`vicii.c:842-875`). Our `VicMemView` had
+neither — it read RAM and still laid the character ROM over `$1000-$1FFF`.
+
+It went unnoticed because no cartridge in the corpus exercises it. EasyFlash and GMod2 are
+in ultimax only long enough to fetch a reset vector; their boot code switches to 8K or 16K
+and copies to RAM, after which the VIC reads ordinary memory. A MAX-machine cartridge never
+leaves ultimax, and RAM exists only at `$0000-$0FFF` there, so its charset has nowhere to
+live but the cart. Found on Jupiter Lander: screen codes and colour RAM came through
+correctly, because both are in real memory, and every single glyph was blank.
+
+`CartMapper::vic_romh()` answers it, default `None` — VICE's NULL `ultimax_romh_phi1_ptr`.
+Implemented for the classic families, EasyFlash and C64MegaCart. Deliberately `None` for
+GMod2 and MegaByter, whose ultimax mode exists only to open a flash programming window and
+serves no ROM there, and for the fake-ultimax carts, which resolve their own windows.
+
 Three things that are easy to get backwards, now pinned by tests: the ROM-enable bits are
 **inverted**; reset deliberately does **not** clear the banking registers (the hardware
 leaves them undefined and the vendor documentation requires software to initialise them,

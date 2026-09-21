@@ -401,6 +401,28 @@ pub trait CartMapper: Send {
     fn fake_ultimax(&self) -> bool {
         false
     }
+
+    /// The 8 KiB this cart drives through the ULTIMAX ROMH window ($E000-$FFFF), for
+    /// the bank in force right now — what the VIC-II sees, not what the CPU reads.
+    ///
+    /// Under ultimax the VIC's own fetches in $3000-$3FFF of every bank come out of
+    /// the cart's ROMH instead of RAM (`vicii.c:842-875`). That is not a nicety: RAM
+    /// exists only at $0000-$0FFF there, so a cart whose charset lives in ROMH — a
+    /// MAX-machine game like Jupiter Lander — has nowhere else to put it.
+    ///
+    /// `None` is VICE's NULL `ultimax_romh_phi1_ptr`: this cart does not drive the
+    /// window, and the fetch falls back to the ordinary map. Default for every mapper,
+    /// so a family that has not been taught this keeps exactly the behaviour it had.
+    /// It stays `None` for the mappers whose ultimax mode exists only to open a flash
+    /// programming window and serves no ROM there (GMOD2, MegaByter) and for the
+    /// fake-ultimax carts, which resolve their windows themselves.
+    ///
+    /// Flash-backed carts hand back the raw array, as VICE does — the VIC is not a
+    /// bus master the command FSM answers to, so a chip mid-erase shows the VIC its
+    /// bytes rather than a status register.
+    fn vic_romh(&self) -> Option<&[u8]> {
+        None
+    }
     /// Whether this mapper's flash/EEPROM has been mutated since attach (= the TS
     /// isWritableDirty). Read-only mappers are never dirty.
     fn is_writable_dirty(&self) -> bool {
@@ -838,6 +860,15 @@ impl CartMapper for NormalMapper {
     fn mapper_type(&self) -> MapperType {
         self.base.mapper_type
     }
+    /// The classic families: whichever bank is in force, and only when the header's
+    /// lines actually put ROMH at $E000 — a 16K cart's ROMH lives at $A000 and the VIC
+    /// never sees it.
+    fn vic_romh(&self) -> Option<&[u8]> {
+        if !self.base.romh_e000_visible {
+            return None;
+        }
+        self.base.banks.get(&self.base.current_bank)?.romh_e000.as_ref().map(|b| &b[..])
+    }
     /// ts:349-354 — static GAME/EXROM from the CRT header.
     fn get_lines(&self) -> CartLines {
         CartLines { exrom: self.base.exrom, game: self.base.game }
@@ -1246,6 +1277,12 @@ impl EasyFlashMapper {
 }
 
 impl CartMapper for EasyFlashMapper {
+    /// The hi flash at the current bank — the same window `read` serves at $E000,
+    /// taken straight from the array (`chip_offset($E000)` is `bank << 13`).
+    fn vic_romh(&self) -> Option<&[u8]> {
+        let off = self.chip_offset(0xe000) as usize;
+        self.hi_flash.data.get(off..off + 0x2000)
+    }
     fn mapper_type(&self) -> MapperType {
         self.mapper_type
     }
@@ -1842,6 +1879,11 @@ impl C64MegaCartMapper {
 }
 
 impl CartMapper for C64MegaCartMapper {
+    /// One flash serves both windows here, so the VIC sees what a $E000 read would.
+    fn vic_romh(&self) -> Option<&[u8]> {
+        let off = self.flash_offset(0xe000) as usize;
+        self.flash.data.get(off..off + 0x2000)
+    }
     fn mapper_type(&self) -> MapperType {
         MapperType::C64MegaCart
     }

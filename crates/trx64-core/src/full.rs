@@ -273,6 +273,33 @@ pub struct FullBus<'a> {
     pub cia_alarm_check: bool,
 }
 
+/// The ROMH the VIC fetches through under a REAL ultimax board, or `None` for every
+/// ordinary machine (= VICE's `export.ultimax_phi1` gate plus a non-NULL
+/// `ultimax_romh_phi1_ptr`).
+///
+/// Three conditions, and all three are load-bearing. The board must actually be in
+/// ultimax (GAME=0, EXROM=1). The cart must not be a FAKE-ultimax one — GMod3 and GMod4
+/// hold the lines permanently and resolve their own windows, so the VIC reads the
+/// ordinary map there exactly as the CPU does (VICE's `mem_read_without_ultimax`). And
+/// the mapper must drive $E000 at all: the families whose ultimax mode exists only to
+/// open a flash programming window answer `None`, and the fetch falls back — VICE's
+/// NULL pointer, spelled as an `Option`.
+///
+/// A free function and not a method on purpose: `&self` borrows the WHOLE bus, and the
+/// view is built beside a `&mut self.vic`. Taking the two fields it needs keeps the
+/// borrows disjoint, which is the same reason `VicMemView` exists at all.
+#[inline]
+pub(crate) fn vic_romh_window<'c>(
+    ultimax: bool,
+    cart: Option<&'c Box<dyn crate::cart::CartMapper>>,
+) -> Option<&'c [u8]> {
+    let c = cart?;
+    if !ultimax || c.fake_ultimax() {
+        return None;
+    }
+    c.vic_romh()
+}
+
 impl<'a> FullBus<'a> {
     /// Recompute the live memconfig from the $00/$01 latches + cartridge EXROM/GAME
     /// lines (= memory-bus.ts memPlaConfigChanged, ts:854-871, VERBATIM).
@@ -717,11 +744,13 @@ impl<'a> FullBus<'a> {
     /// `check_ba_before_read` over `steal_cycles_g::<REC>` (Spec 859).
     pub(crate) fn check_ba_g<const REC: bool>(&mut self) -> u32 {
         let vbank = self.vic_bank_base();
+        let romh = vic_romh_window(self.config.ultimax, self.cartridge.as_deref());
         let view = crate::vic::VicMemView {
             ram: self.ram,
             char_rom: Some(self.char_rom),
             color_ram: &self.io[0x0800..0x0c00],
             vbank,
+            romh,
         };
         let stolen = self.vic.steal_cycles_g::<REC>(&view);
         if stolen != 0 {
@@ -1112,11 +1141,13 @@ impl<'a> Bus for FullBus<'a> {
     #[inline]
     fn tick(&mut self) {
         let vbank = self.vic_bank_base();
+        let romh = vic_romh_window(self.config.ultimax, self.cartridge.as_deref());
         let view = crate::vic::VicMemView {
             ram: self.ram,
             char_rom: Some(self.char_rom),
             color_ram: &self.io[0x0800..0x0c00],
             vbank,
+            romh,
         };
         self.vic.tick(&view);
         self.clk = self.clk.wrapping_add(1);
@@ -1422,11 +1453,13 @@ impl<'a> crate::reu::DmaBus for FullBus<'a> {
     fn clk_inc(&mut self) {
         self.clk = self.clk.wrapping_add(1);
         let vbank = self.vic_bank_base();
+        let romh = vic_romh_window(self.config.ultimax, self.cartridge.as_deref());
         let view = crate::vic::VicMemView {
             ram: self.ram,
             char_rom: Some(self.char_rom),
             color_ram: &self.io[0x0800..0x0c00],
             vbank,
+            romh,
         };
         self.vic.tick(&view);
         self.cia1.clk = self.clk;
