@@ -283,6 +283,34 @@ Deterministic, and testable without hardware — the picture is a function of th
   produce the three numbers above, and with the phase constant per row neither leaves a
   signature in the picture. It stays open, and it stays harmless — the two models differ
   only for a program whose rows do NOT arrive at a constant phase.
+- **The residual, after the slot index was fixed: ~100× the hardware's rate, and no
+  hypothesis yet.** Verified on `main` by the UE2 session with a detector that samples one
+  point per source pixel, run at 1080p so the rate is comparable with Xander's hardware
+  capture (3.75 output pixels per source pixel against his 3.67):
+
+  | | anomalies per source row | worst column |
+  |---|---|---|
+  | before the fix | 38.82 | 360, in 1039 of 1039 rows |
+  | after | **6.71** | 45 of 1039 |
+  | his hardware capture | 0.07 | — |
+
+  Column 360 is quiet, 0 of 462 rows against 462 of 462, so the boundary question is
+  closed. What is left is spread thin across many columns, nothing at a multiple of 8, and
+  the frame is settled rather than caught mid-generation (the 60 s and 90 s captures are
+  byte-identical and both give 6.71).
+
+  One hypothesis worth testing before inventing others: a store's phase is quantised to one
+  of eight slots, and UPic's row loop uses `abs,X`/`abs,Y` loads, which cost an extra CPU
+  cycle on a page crossing. A store that lands one turbo cycle late is an eighth of a pixel
+  late — invisible except where it crosses a slot boundary, which would scatter exactly
+  this way. The probe already exists: log the phase of each of a row's 384 stores and look
+  at the deltas. If they are 8, 8, 8, 9, 8 … rather than uniformly 8, that is the answer.
+- **Changes per drawn row fell from 42 to 27 with the fix, and that is the fix working.**
+  Every rotated pixel manufactured up to two extra colour changes — about 18 per row across
+  the 8-pixel groups, against a drop of 15. Removing an artefact removes the changes it
+  invented, so the number going DOWN is what confirms it. Worth stating because the same
+  metric going UP is what confirmed §8.3, and a reader will otherwise read the fall as a
+  regression.
 - Whether the array should live on `VicII` or beside the CPU mirror. On the VIC is the
   obvious answer for the draw path; the store path is the CPU's side of the bus, so a
   measurement may say otherwise.
