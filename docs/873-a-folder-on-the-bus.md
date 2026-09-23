@@ -7,8 +7,8 @@ says "next free 872" and does not list this spec yet).
 **Depends on:** Spec 870 (the drive as a part: power, reset line, unit 8-11), Spec 871 (two
 drive positions on one bus, units on the wire, the refusal of two devices at one unit).
 **Enables:** game ports whose files live in a host folder and load through the stock KERNAL
-from a device that needs no 1541 drivecode. A later spec may open disk images inside the
-folder (§12).
+from a device that needs no 1541 drivecode. Disk images are not opened inside the folder,
+now or later (§12).
 **Origin:** the owner, 2026-09-23. A target for ports: a game that loads from this device
 loads through the serial protocol only, so a port that runs from it has provably shed its
 drivecode. It must live on the same line-level bus as the 1541s — timing the C64 sees must
@@ -222,11 +222,11 @@ States as VICE names them, with the timing profile of §6. What it does:
 ## §6 D4 — Timing profile
 
 One table, C64 cycles derived from µs with the machine's clock (PAL/NTSC, Spec 863), as
-VICE's `US2CYCLES`. **Default = VICE's numbers**: they are the ones proven against the stock
-KERNAL on the VICE bus TRX64 ports. The Ultimate's are shown because they are a real
-device's and run against the same KERNAL.
+VICE's `US2CYCLES`. **Default = the Ultimate's numbers** (owner, 2026-09-23): TRX64 is the
+Ultimate's core, and these are a real device's, running against the stock KERNAL. VICE's are
+kept as the second profile.
 
-| name | default (VICE) | Ultimate | what |
+| name | VICE | default (Ultimate) | what |
 |---|---|---|---|
 | `t_atn_ack` | at the next evaluation | immediate (vector) | ATN low → DATA low |
 | `t_atn_settle` | 100 µs | 20 µs | ignore lines after ATN falls |
@@ -238,7 +238,7 @@ device's and run against the same KERNAL.
 | `t_frame_ack` | 1000 µs | 1000 µs | talker: wait for the listener's ack |
 
 - The profile is **data, not code**, and carried in the checkpoint, so a test can run the
-  device at the slow edge and a host can choose the Ultimate's numbers.
+  device at either edge and a host can choose VICE's numbers.
 - **The KERNAL's margins are to be read off the ROM at build**, not taken from a timing
   chart: device-present after ATN, the frame-ack wait as talker, and the EOI timeout as
   listener are CIA-timer loops in the KERNAL, and the gate (§11.9) asserts the device's
@@ -271,9 +271,9 @@ an OPEN on a channel in use closes the old one first. Command buffer 58 bytes as
 | `UI`, `UJ`, `U:` | `73` power-on message, channels closed |
 | `N:…` | refused `31` (a folder is not formatted) |
 | `C:new=old…` | refused `31` in this spec (§12) |
-| **`M-W`, `M-E`, `M-R`, `B-E`, `U3`-`U8`** | **refused `31,SYNTAX ERROR`**, nothing stored, nothing run |
-| `B-R`, `B-W`, `U1`, `U2`, `B-A`, `B-F`, `B-P`, `#` buffer open | refused `31` — there are no blocks |
-| `P` (REL position), anything else | `31` |
+| **`M-W`, `M-E`, `M-R`, `U3`-`U8`** | **refused `33,SYNTAX ERROR`** as the Ultimate (`cbmdos_parser.cc:333-352`, `cbmdos_parser_test.cc:190`), nothing stored, nothing run |
+| `B-R`, `B-W`, `B-E`, `U1`, `U2`, `B-A`, `B-F`, `B-P`, `#` buffer open | refused `78,BLOCK ACCESS DENIED` as the Ultimate (`iec_drive.cc:84`) — there are no blocks |
+| `P` (REL position), anything else | `33`, the Ultimate's unknown-command answer (`cbmdos_parser.cc:667`) |
 
 There is no drive CPU, so memory commands are refused rather than answered `OK` as VICE
 does: a port that still uploads drivecode must fail here, visibly, not hang later waiting
@@ -323,38 +323,27 @@ out of this spec (§12).
 
 ## §9 D7 — Writes, checkpoints, restore
 
-The checkpoint must reproduce the device. A host folder is outside the machine and changes
-under it, so the device keeps everything a restore needs **inside its own state**, and the
-host is touched in two places only: reads when a file or directory is opened, writes when
-the device persists.
+**Decided by the owner, 2026-09-23:** a folder is a hard disk — it can be any size. Its
+contents are **not** in a checkpoint and **not** in the ring; the machine holds only the
+pointer to it. The host folder is the one truth, and rewinding the machine never changes it.
 
-- **Reads.** Opening a file for read reads the whole file into the channel (limit 16 MiB,
-  larger → `52,FILE TOO LARGE`). Opening a directory builds the complete listing bytes at
-  once. From then on the channel serves from its buffer; a checkpoint taken mid-LOAD
-  carries the buffer and the position, and a restore finishes the LOAD without the host.
-- **Writes** collect in the channel and are committed at CLOSE into the device's
-  **overlay**: the set of changes since attach — files written, scratched, renamed,
-  directories made and removed — each written file with its bytes, each overwritten or
-  scratched file with its **before-image**. Reads go through the overlay first, then the
-  host. A write never closed (reset, detach, power) is dropped; nothing half-written
-  exists anywhere.
-- **Persist** makes the host folder equal *attach-time folder + overlay*: it writes the
-  overlay's files and applies its scratches, renames and directories. It runs on the same
-  triggers as a disk's auto-persist (debounced after a commit, on detach, project switch,
-  session close — the daemon's `DiskAutoPersist` model) and on request.
-- **A checkpoint carries:** unit, root path (as information), timing profile, line state
-  machine (state, flags, byte, primary/secondary, pending timeouts as absolute cycles, its
-  current pull), per channel (mode, type, name, buffer, position, EOI flag, status), the
-  command buffer, the status string, the current directory, the boot file, the read-only
-  flag, and the overlay. Buffers and overlay files go into the content-addressed pool the
-  ring already keeps for disk images (`checkpoint_ring.rs`, Spec 714.4), so the ring's 50
-  captures a second do not copy a folder each time.
-- **Restore** puts all of that back and re-binds the root path. A restore that drops an
-  overlay entry makes the next persist **undo it on the host** — delete a file the device
-  created, put back a before-image it overwrote or scratched. That is what a rewound disk
-  image does to its host file today (the whole image is rewritten), carried over to a
-  folder. The device only ever deletes or rewrites files **it** wrote; a host file it
-  never touched is never touched.
+- **Reads** come from the host as the channel needs them. A channel holds the host path and
+  its position, not the file. A directory listing is built at open and kept (it is small
+  and must not change under a LOAD of `"$"`).
+- **Writes go to the host.** A write channel writes to its host file; CLOSE finishes it.
+  Scratch, rename, MD and RD act on the host at once. There is no overlay and no
+  persist step.
+- **A checkpoint carries** the device, not the disk: unit, root path, timing profile, line
+  state machine (state, flags, byte, primary/secondary, pending timeouts as absolute
+  cycles, its current pull), per channel (mode, type, host path, position, EOI flag,
+  status, and the bytes of the current not-yet-written chunk), the command buffer, the
+  status string, the current directory, the listing of an open `"$"`, the boot file and the
+  read-only flag. Bounded by 16 channels — independent of the folder's size.
+- **Restore** puts that back and re-opens each channel's host file at its position. The
+  host is whatever it is now: a file written after the checkpoint stays; a file scratched
+  after it is gone, and a channel that pointed at it restores to `62,FILE NOT FOUND`. A
+  write channel restored mid-SAVE continues writing at its position. This is the price of
+  a hard disk and it is accepted: the folder is not rewound.
 - **Absent → as built.** A checkpoint without the node restores with no folder attached; a
   machine with no folder attached writes no node — every existing checkpoint and the
   `cia_alarm_check_gate` digests stay as they are (the 871 rule).
@@ -364,13 +353,13 @@ the device persists.
 ## §10 D8 — Daemon and core surface
 
 - **Core:** `folder_device.rs` holds the state machine and the DOS. It reads the host only
-  through a `FolderSource` trait (list, stat, read) the host supplies, and writes nothing:
-  the overlay is handed out by `take_persist_plan()` and applied by whoever owns the disk.
+  and writes it only through a `FolderSource` trait (list, stat, read, write, scratch,
+  rename, mkdir, rmdir) the host supplies.
   `Machine::attach_folder(unit, source, opts)` / `detach_folder(unit)` with the refusal of
   §3. The daemon owns host I/O, as it owns disk persistence.
 - **Wire:** `device/folder_attach {unit, path, read_only?, boot?}`,
-  `device/folder_detach {unit}`, `device/folder_persist {unit}`; `session/state` gains
-  `folders: [{unit, path, read_only, dirty}]`. `media/*` keeps meaning disks.
+  `device/folder_detach {unit}`; `session/state` gains
+  `folders: [{unit, path, read_only}]`. `media/*` keeps meaning disks.
 - **Monitor:** a folder device has no CPU and is not a `Device` to select. The `iec` verb
   gains its slot in the per-device column (who is holding the line), and a `folder [unit]`
   verb prints its protocol state, open channels and last status.
@@ -387,14 +376,14 @@ the device persists.
    counts, `DIR`, BLOCKS FREE line — the free count taken from the same host query).
 2. **KERNAL load.** `LOAD"FILE",9,1` byte-identical to the host file; `LOAD"*",9,1` loads
    the boot file, and without one the first PRG; a missing name → `?FILE NOT FOUND`.
-3. **KERNAL save.** `SAVE"NEW",9` → after persist `new.prg` byte-identical on the host;
+3. **KERNAL save.** `SAVE"NEW",9` → after CLOSE `new.prg` byte-identical on the host;
    `SAVE` over an existing name → `63,FILE EXISTS`; `SAVE"@0:NEW",9` replaces.
 4. **Command channel.** Power-on status `73`; `S:`, `R:`, `CD`/`MD`/`RD`, `UI` each with
-   the §7 answer and the expected host result after persist; `M-W` + `M-E` answer `31`,
+   the §7 answer and the expected host result; `M-W` + `M-E` answer `33`, `B-R` answers `78`,
    store nothing, and the device is still usable after.
 5. **SEQ and a copy.** `OPEN 2,9,2,"F,S,W"` / `PRINT#` / `CLOSE`, read back with `GET#`, all
    256 byte values; and 871's 8 → 9 BASIC copy with a D64 in drive 8 and the folder at 9,
-   byte-identical after persist.
+   byte-identical on the host.
 6. **Not present, not in the way.** Detached: `LOAD"$",9` → DEVICE NOT PRESENT. Attached at
    9 with the 1541 at 8: `LOAD"$",8` unchanged and, after every transaction on 8, the
    device's slot is released.
@@ -406,11 +395,12 @@ the device persists.
    expected to differ that matches fails too.
 8. **Checkpoints.** Mid-LOAD from 9 and mid-SAVE to 9, through a `.c64re` container into a
    freshly booted machine: restored state equal, the restored run finishes byte-identical
-   and in cycle lockstep for 500 frames with the straight run. A restore to before a SAVE
-   and a persist leave the host without the file; to before a scratch, with it back.
+   and in cycle lockstep for 500 frames with the straight run (host folder unchanged in
+   between). A restore to before a SAVE leaves the host file in place; a checkpoint holds
+   no file contents, whatever the folder's size.
 9. **Timing against the KERNAL.** The margins read off the ROM (§6) asserted against the
-   device's worst case; the gate's load/save tests pass again with the profile at its slow
-   edge (the Ultimate's numbers).
+   device's worst case; the gate's load/save tests pass with the default (Ultimate) profile
+   and again with VICE's.
 10. **Nothing else moved.** Every existing drive and bus gate byte-identical with no folder
     attached; `cia_alarm_check_gate` digests unchanged.
 
@@ -427,34 +417,29 @@ the device persists.
 
 - **In:** a line-level folder device at units 8-11 beside the two 1541 positions; the
   standard serial protocol; LOAD/SAVE, channels 0-15, the §7 commands, subdirectories;
-  the host mapping of §8; the overlay, persist and checkpoint of §9; daemon and monitor
+  the host mapping of §8; the write-through and checkpoint of §9; daemon and monitor
   surface.
 - **Out:** every fast protocol — JiffyDOS (the device answers the JiffyDOS probe as a plain
   CBM device, so a JiffyDOS KERNAL falls back), the Ultimate's Warp, 1571/1581 burst over
   SRQ, parallel cables, SpeedDOS/DolphinDOS; REL files; `C:` copy; partitions (`CP`,
   `/`); CMD path prefixes in file names (`//DIR/:NAME`); P00/S00 containers; disk images
-  opened as directories; the printer at 4/5; units outside 8-11; C64RE's media tools.
+  opened as directories — not in a later spec either: the owner decided (2026-09-23) that a
+  user mounts a D64/D81 directly in a drive; the printer at 4/5; units outside 8-11; C64RE's media tools.
 
 ## §13 Open
 
-- **Disk images inside the folder.** Shown here as plain files (a `.d64` lists as PRG
-  `GAME.D64` and loads its raw bytes). The Ultimate descends into them
-  (`iec_channel.cc:911-918`); VICE attaches an image to a unit instead of a folder. Leaning:
-  a later spec — `CD:GAME.D64` opens it read-only through the D64/D81 reader the media code
-  has, listed as `DIR`. Owner's call whether that is wanted at all for ports.
-- **The refusal code.** `31,SYNTAX ERROR` is what a CBM drive says for a command it does
-  not know, so a program branching on the number sees a stock code. The Ultimate uses 33
-  for M-commands and a custom 76/78 elsewhere. Keep 31, or a distinct number a human spots
-  in the status (e.g. `76,NO DRIVE CPU`)?
-- **Persist after a rewind deletes files the device wrote.** §9 decides it as the disk
-  analogue. The alternative — persist only forward, a rewind never removes a host file —
-  is simpler and never deletes anything, at the price that the host folder and a restored
-  machine disagree.
-- **Default timing profile.** VICE's (decided above) or the Ultimate's, which is a real
-  device's?
-- **Boot file.** An attach-time `boot` for `"*"` is decided; whether the folder should also
-  honour a marker file (so the choice travels with the folder) is not.
+- **Disk images inside the folder — DECIDED 2026-09-23: never.** A `.d64` or `.d81` in the
+  folder is a plain file (lists as PRG `GAME.D64`, loads its raw bytes). The Ultimate descends
+  into them (`iec_channel.cc:911-918`); TRX64 does not, and no later spec will. A user who
+  wants the image mounts it directly in a drive.
+- **The refusal code — DECIDED 2026-09-23: as the Ultimate.** Memory and user-jump commands
+  and anything unknown answer `33`; block commands answer `78,BLOCK ACCESS DENIED` (§7).
+- **Rewind and the host — DECIDED 2026-09-23: the folder is not rewound.** A folder is a
+  hard disk of any size: not in the dump, not in the ring, only the pointer (§9).
+- **Default timing profile — DECIDED 2026-09-23: the Ultimate's** (§6); VICE's is the
+  second profile.
+- **Boot file — DECIDED 2026-09-23: attach-time only.** No marker file in the folder.
 - **UE2.** The U64 firmware has its own Software IEC (§2). If UE2 wants it, the choice is
   between emulating the firmware's IEC processor (the firmware's DOS runs) and mapping the
-  U64's Software IEC onto this device (TRX64's DOS runs). Not decided here; nothing in this
-  spec prevents either.
+  U64's Software IEC onto this device (TRX64's DOS runs). **Left open by the owner
+  (2026-09-23) until UE2 asks**; nothing in this spec prevents either.
