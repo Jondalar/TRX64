@@ -71,6 +71,9 @@ pub struct Session {
     /// Spec 871 — position B's jumpers and power across a power cycle (`None`: B as a
     /// machine is built — off, jumpers at 9).
     pub drive_b_state: Option<(u8, bool)>,
+    /// Spec 873 — the folder devices across a power cycle: a folder on the bus is a
+    /// device of its own, like drive B, and a C64 power cut does not unplug it.
+    pub folders_held: Vec<trx64_core::folder_device::FolderDevice>,
     /// Spec 863 — which C64 this session is (a `models.toml` row). Session identity, like
     /// the machine profile: every machine the session builds — power-on, the power-off
     /// blank — is built on it, so it survives a power cycle; a warm reset keeps the
@@ -147,6 +150,7 @@ impl Session {
             inserted_disk_b: None,
             inserted_disk_unreported: [false; 2],
             drive_b_state: None,
+            folders_held: Vec::new(),
             model,
         }
     }
@@ -204,6 +208,11 @@ impl Session {
                 let _ = machine.set_drive_power(trx64_core::drive::DrivePosition::B, true);
             }
         }
+        // Spec 873 — the folder devices come back on the bus.
+        let folders = std::mem::take(&mut self.folders_held);
+        if !folders.is_empty() {
+            machine.reattach_folders(folders);
+        }
         self.machine = machine;
         self.running = true;
         self.powered = true;
@@ -240,6 +249,7 @@ impl Session {
         self.inserted_disk_b = self.machine.drive_b.disk.take();
         self.inserted_disk_unreported = [unreported_a, unreported_b];
         self.drive_b_state = Some((self.machine.drive_b.unit_jumpers(), self.machine.drive_b.powered()));
+        self.folders_held = std::mem::take(&mut self.machine.folders);
         self.machine = Machine::new_with_model(self.model);
         self.running = false;
         self.powered = false;

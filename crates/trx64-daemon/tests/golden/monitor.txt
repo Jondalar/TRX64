@@ -24,6 +24,7 @@ monitor (VICE-superset):
     screen           decode the 40x25 text screen (real screen pointer)
     io [1|addr]      I/O area per device: register hex (peek) + state details (VICE io)
     iec              the serial bus: ATN/CLK/DATA, their level, and WHICH side is pulling each one low, plus both ends as their CPUs see them ($DD00 and the 1541's $1800). A released line is high and any device may pull it low, so "who is low" is per-device, not a bus-wide state. Answers the only question an IEC stall ever asks.
+    folder [unit]    a folder device on the bus: its protocol state, open channels and last status
     bitmap <a> [w h] [hires|charset|sprite]  render a RAM range to a PNG (scrub gfx)
     bank [lens]      show/set the sticky default lens for m/d
     wr [lens] <a> <b..>  write exactly these bytes from a

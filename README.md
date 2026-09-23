@@ -55,6 +55,10 @@ From source: `cargo build --release`. Builds natively (for Windows it uses MSVC)
 - **Cartridges** — EasyFlash, Ocean, Magic Desk, GMOD2/3, MegaByter. Flash and EEPROM
   writes survive a reset and a snapshot round trip.
 - **Disks** — `.d64` / `.g64`, 35 to 42 tracks. Drive-side GCR writes reach the host file.
+- **A folder on the bus** — a host directory as an IEC device at unit 8-11, beside the
+  1541s, on the real serial lines (`device/folder_attach`). The stock KERNAL loads, saves
+  and lists through it; memory commands are refused, so a program that still uploads
+  drivecode stops visibly. The folder is a hard disk: never in a snapshot, never rewound.
 - **Expansion port** — REU (1700/1764/1750, oversized to 16 MB), GeoRAM, and the Ultimate
   Command Interface. Devices, not cartridges: several at once, and a host can lend its own RAM.
 - **Machines** — `--machine c64|u64|128`. `u64` is the Ultimate 64 / Elite II / C64 Ultimate:
@@ -117,7 +121,7 @@ Superset based on VICE, 123 verbs. Full reference: **[MONITOR.md](MONITOR.md)**;
 | **Time** | `mark <name>` · `goto <name>` · `frame ±N` · `play back\|fwd` · `cadence` · `window <s>` |
 | **State** | `dump`/`undump` `.c64re` · `ringdump`/`ringload` · `trace on\|off` |
 | **Analysis** | `map` memory map · `taint` · `swimlane` · `diff <a> <b>` |
-| **Drive** | `device drive8` then `r`/`m`/`d` — the 1541's own 6502 |
+| **Drive** | `device drive8` then `r`/`m`/`d` — the 1541's own 6502 · `folder [unit]` a folder device |
 | **Expansion** | `reu` / `georam` the device decoded · `uci` the command interface · `turbo` the machine |
 
 ---

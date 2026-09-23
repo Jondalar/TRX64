@@ -1108,3 +1108,230 @@ fn checkpoint_with_the_folder_alone_on_the_bus() {
     finish(&mut r);
     assert_eq!(ram(&r, 0xc000, big.len() - 2), big[2..], "restored run loaded");
 }
+
+// ── §11.11 — characterisation: the seven games from a folder ────────────────────────
+
+const GAMES: &[(&str, &str)] = &[
+    ("scramble", "scramble_infinity.d64"),
+    ("polarbear", "POLARBEAR.d64"),
+    ("motm", "motm.g64"),
+    ("greenberet", "green_beret[ocean_1986](!).g64"),
+    ("impossible2", "impossible_mission_ii[epyx_1987](!).g64"),
+    ("lastninja", "last_ninja_remix_s1[system3_1991].g64"),
+    ("maniac", "maniac_mansion_s1[activision_1987](german)(manual)(!).g64"),
+];
+
+/// A sector of a D64 or a standard-GCR sector of a G64; `None` when it does not decode.
+fn read_sector(img: &[u8], g64: Option<&trx64_core::gcr::GcrImage>, t: u8, s: u8) -> Option<Vec<u8>> {
+    match g64 {
+        None => {
+            if t == 0 || t > 35 || s as usize >= sectors_per_track(t) {
+                return None;
+            }
+            let o = sector_offset(t, s);
+            img.get(o..o + 256).map(|b| b.to_vec())
+        }
+        Some(g) => {
+            let tr = g.tracks.get(t as usize * 2 - 2)?;
+            let mut buf = vec![0u8; 256];
+            (trx64_core::gcr::gcr_read_sector(tr, &mut buf, s) == trx64_core::gcr::CBMDOS_FDC_ERR_OK).then_some(buf)
+        }
+    }
+}
+
+/// The files the disk's own directory lists (PRG/SEQ/USR), in directory order, each
+/// followed through its sector chain as far as it decodes.
+fn extract_files(img: &[u8], is_g64: bool) -> Vec<(Vec<u8>, u8, Vec<u8>)> {
+    let g = is_g64.then(|| trx64_core::gcr::GcrImage::from_g64(img));
+    let mut out = Vec::new();
+    let (mut t, mut s) = (18u8, 1u8);
+    let mut seen = std::collections::HashSet::new();
+    while t != 0 && seen.insert((t, s)) {
+        let Some(dir) = read_sector(img, g.as_ref(), t, s) else { break };
+        for k in 0..8 {
+            let e = &dir[k * 32..k * 32 + 32];
+            let ftype = e[2];
+            if ftype & 0x80 == 0 || !(1..=3).contains(&(ftype & 7)) {
+                continue;
+            }
+            let name: Vec<u8> = e[5..21].iter().copied().take_while(|&b| b != 0xa0).collect();
+            let (mut ft, mut fs) = (e[3], e[4]);
+            let mut data = Vec::new();
+            let mut chain = std::collections::HashSet::new();
+            while ft != 0 && chain.insert((ft, fs)) {
+                let Some(b) = read_sector(img, g.as_ref(), ft, fs) else { break };
+                if b[0] == 0 {
+                    data.extend_from_slice(&b[2..=(b[1] as usize).clamp(1, 255)]);
+                    break;
+                }
+                data.extend_from_slice(&b[2..]);
+                ft = b[0];
+                fs = b[1];
+            }
+            out.push((name, ftype & 7, data));
+        }
+        t = dir[0];
+        s = dir[1];
+    }
+    out
+}
+
+struct FromFolder {
+    name: &'static str,
+    files: usize,
+    kernal_stage: String,
+    stop: String,
+    refused: Vec<String>,
+}
+
+/// §11.11 — drive A off, the game's files in a folder at 8 (its first directory entry as
+/// the boot file), `LOAD"*",8,1` + `RUN`, 60 M cycles.
+fn from_folder(name: &'static str, file: &str) -> Option<FromFolder> {
+    let bytes = std::fs::read(format!("{SAMPLES}/{file}")).ok()?;
+    let files = extract_files(&bytes, file.ends_with(".g64"));
+    let dir = TempFolder::new(&format!("game-{name}"));
+    let mut boot = None;
+    for (n, t, data) in &files {
+        let ext = match t {
+            1 => ".seq",
+            3 => ".usr",
+            _ => ".prg",
+        };
+        let host = trx64_core::folder_device::petscii_to_host(n) + ext;
+        if boot.is_none() && *t == 2 {
+            boot = Some(host.clone());
+        }
+        dir.put(&host, data);
+    }
+    let mut m = Machine::new();
+    m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+    m.drive8.set_power(false);
+    m.sync_drive_slots();
+    m.attach_folder(8, dir.source(), FolderOpts { boot: boot.clone(), ..Default::default() }).unwrap();
+    frames(&mut m, 170);
+    type_in(&mut m, b"\x93LOAD\"*\",8,1\r");
+    let mut sink = NullSink;
+    let mut streak = 0;
+    let mut returned = false;
+    for _ in 0..3000 {
+        m.run_for_full(50_000, &mut sink, |_, _, _, _, _, _, _| {});
+        let pc = m.cpu6510.reg_pc;
+        if (0xE5C0..=0xE5F0).contains(&pc) && m.read_full(0x00c6) == 0 {
+            streak += 1;
+            if streak >= 3 {
+                returned = true;
+                break;
+            }
+        } else {
+            streak = 0;
+        }
+    }
+    let scr = screen(&m);
+    let end = m.read_full(0xae) as u16 | (m.read_full(0xaf) as u16) << 8;
+    let kernal_stage = if scr.contains("ERROR") {
+        format!("no — {}", scr.lines().find(|l| l.contains("ERROR")).unwrap_or("").trim())
+    } else if returned && scr.contains("LOADING") {
+        format!("yes — `{}` to READY, end ${end:04X}", boot.as_deref().unwrap_or("?").trim())
+    } else {
+        format!("yes — `{}` chained on (C64 at ${:04X})", boot.as_deref().unwrap_or("?").trim(), m.cpu6510.reg_pc)
+    };
+    if returned {
+        type_in(&mut m, b"RUN\r");
+    }
+    let mut total = 0u64;
+    while total < 60_000_000 {
+        m.run_for_full(1_000_000, &mut sink, |_, _, _, _, _, _, _| {});
+        total += 1_000_000;
+    }
+    let refused: Vec<String> = m.folder_mut(8).unwrap().take_events().into_iter().map(|e| e.text).collect();
+    let text: String = screen(&m).lines().filter(|l| !l.trim().is_empty()).take(6).collect::<Vec<_>>().join(" / ");
+    let f = m.folder(8).unwrap();
+    let stop = format!(
+        "C64 ${:04X}; folder {}; status {}; screen: {}",
+        m.cpu6510.reg_pc,
+        if f.line.flags == 0 { "idle".to_string() } else { format!("flags ${:02X}", f.line.flags) },
+        f.status_text(),
+        if text.is_empty() { "-".into() } else { text }
+    );
+    Some(FromFolder { name, files: files.len(), kernal_stage, stop, refused })
+}
+
+#[test]
+#[ignore = "characterisation §11.11; run with --ignored --nocapture"]
+fn characterise_the_seven_games_from_a_folder() {
+    need_roms!();
+    let rows: Vec<FromFolder> = std::thread::scope(|s| {
+        let hs: Vec<_> = GAMES.iter().map(|(n, f)| s.spawn(move || from_folder(n, f))).collect();
+        hs.into_iter().filter_map(|h| h.join().unwrap()).collect()
+    });
+    // Runs of the same refused command are folded: "M-W ×16 ($0500…$06E0)".
+    let fold = |ev: &[String]| -> String {
+        let mut out: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < ev.len() {
+            let kind = ev[i].trim_start_matches("refused ").split(' ').next().unwrap_or("").to_string();
+            let mut j = i;
+            while j + 1 < ev.len() && ev[j + 1].trim_start_matches("refused ").starts_with(&format!("{kind} ")) && kind == "M-W" {
+                j += 1;
+            }
+            if j > i {
+                let a = ev[i].rsplit(' ').next().unwrap_or("");
+                let b = ev[j].rsplit(' ').next().unwrap_or("");
+                out.push(format!("{kind} ×{} ({a}…{b})", j - i + 1));
+            } else {
+                out.push(ev[i].trim_start_matches("refused ").to_string());
+            }
+            i = j + 1;
+        }
+        if out.is_empty() { "-".into() } else { out.join(", ") }
+    };
+    eprintln!("\n| game | files | KERNAL stage | refused | where it stops |");
+    eprintln!("|---|---|---|---|---|");
+    for r in &rows {
+        let stop: String = r.stop.chars().take(160).collect();
+        eprintln!("| {} | {} | {} | {} | {} |", r.name, r.files, r.kernal_stage, fold(&r.refused), stop);
+    }
+}
+
+// ── §11.12 — characterisation: cost ─────────────────────────────────────────────────
+
+fn timed(folder: Option<bool>) -> f64 {
+    use std::time::Instant;
+    let f = TempFolder::new("cost");
+    f.put("big.prg", &data_prg(30_000, 1));
+    let mut m = Machine::new();
+    m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+    if folder.is_some() {
+        m.attach_folder(9, f.source(), FolderOpts::default()).unwrap();
+    }
+    frames(&mut m, 130);
+    let bytes = std::fs::read(format!("{SAMPLES}/scramble_infinity.d64")).expect("scramble sample");
+    m.drive8.attach_disk(disk(bytes));
+    frames(&mut m, 40);
+    if folder == Some(true) {
+        type_in(&mut m, b"LOAD\"BIG\",9,1\r");
+    } else {
+        type_in(&mut m, b"LOAD\"*\",8,1\r");
+    }
+    let n = 1500u32;
+    let t0 = Instant::now();
+    frames(&mut m, n);
+    t0.elapsed().as_secs_f64() * 1000.0 / n as f64
+}
+
+#[test]
+#[ignore = "characterisation §11.12; run with --ignored --nocapture (release)"]
+fn characterise_the_cost_of_a_folder() {
+    need_roms!();
+    let (mut none, mut idle, mut serving) = (f64::MAX, f64::MAX, f64::MAX);
+    for _ in 0..3 {
+        none = none.min(timed(None));
+        idle = idle.min(timed(Some(false)));
+        serving = serving.min(timed(Some(true)));
+    }
+    eprintln!(
+        "\nframe time, 1500 frames, best of 3:\n  no folder, LOAD\"*\",8,1 of scramble: {none:.3} ms/frame\n  idle folder at 9, same load: {idle:.3} ms/frame (x{:.3})\n  folder at 9 serving LOAD\"BIG\",9,1: {serving:.3} ms/frame (x{:.3})",
+        idle / none,
+        serving / none
+    );
+}
