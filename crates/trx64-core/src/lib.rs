@@ -1185,13 +1185,7 @@ impl Machine {
     }
 
     pub fn cold_reset(&mut self) {
-        // BUG-061 — the RESET line drops the C64 back to 1 MHz. On the Ultimate the turbo
-        // is the firmware's setting and the firmware applies it to a machine that has
-        // already come up; a C64 does not boot at 64 MHz, and one that did would win the
-        // KERNAL's raster race at `$FF5E` and decide it was an NTSC machine.
-        // `warm_reset` gets this for free — it builds a fresh VIC — but a cold reset
-        // keeps the chip, so it has to say so.
-        self.vic.u64_speed_applied = false;
+        self.arm_u64_reset_hold();
         // CPU-port power-on latches must be set BEFORE the memconfig/vector compute
         // so the banking is the boot config (set again below for clarity/order with
         // the rest of the reset, but needed here for the cart-aware memconfig).
@@ -1319,6 +1313,8 @@ impl Machine {
         self.vic.u64_regs_en = regs_en;
         self.vic.u64_speed_prefer = prefer;
         self.vic.u64_speed_table = table;
+        // The fresh VIC has no hold; the reset this IS has to arm it (BUG-061).
+        self.arm_u64_reset_hold();
         // ts:707-708 + ts:773 — reset the 1541 in lockstep with the C64. A warm
         // reset is the C64's RESET line; the drive has its OWN power, so "the 1541
         // disk stays mounted" (ts:773). TRX64's `Drive1541::cold_reset` drops the
@@ -2687,14 +2683,24 @@ impl Machine {
     /// Spec 851 — the firmware's turbo settings, as `setCpuSpeed` writes them
     /// (`u64_config.cc:1634-1636`): the enable word and the preferred speed, applied on
     /// its `C64_SPEED_UPDATE` strobe. Only meaningful on the `u64` profile.
+    /// BUG-061 — the Ultimate holds its C64 at 1 MHz for 2.06 s after a reset. Measured
+    /// on the owner's device, reset-anchored, the same at 16 and at 64 MHz and stable over
+    /// runs; the length is a TIME, so it is taken from this model's clock. Only the U64
+    /// profile has it — a stock C64 has no turbo to hold back.
+    fn arm_u64_reset_hold(&mut self) {
+        const HOLD_SECONDS: f64 = 2.06;
+        self.vic.u64_reset_hold = if self.vic.speed_profile == crate::vic::SpeedProfile::U64 {
+            (self.model.timing.cpu_hz as f64 * HOLD_SECONDS) as u32
+        } else {
+            0
+        };
+    }
+
     pub fn set_u64_turbo(&mut self, regs_en: u8, speed_prefer: u8) {
         self.vic.u64_regs_en = regs_en;
         self.vic.u64_speed_prefer = speed_prefer;
-        // BUG-061 — this call IS the firmware's `C64_SPEED_UPDATE` strobe, so it applies
-        // the setting to a machine that is already up. A RESET undoes that, and the
-        // firmware has to strobe again — which on the device it does, a few seconds after
-        // the C64 has booted and decided what continent it is on.
-        self.vic.u64_speed_applied = true;
+        // A strobe inside the post-reset hold is not lost: the setting stands and applies
+        // when the hold ends (BUG-061 — the firmware strobes 445 cycles after release).
     }
 
     pub fn set_u64_speed_table(&mut self, table: crate::vic::U64SpeedTable) {
