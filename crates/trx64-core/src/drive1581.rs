@@ -727,3 +727,43 @@ impl Drive1581 {
         self.number = number;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Spec 872 D1 — the map: RAM at $0000-$1FFF, nothing at $2000-$3FFF (the open bus:
+    /// the last byte on it), the CIA every 16 bytes through $4000-$5FFF, the WD every 4
+    /// through $6000-$7FFF, the ROM from $8000, which a write does not reach.
+    #[test]
+    fn the_map_has_an_open_bus_and_mirrors() {
+        let mut d = Drive1581::new(0);
+        let mut rom = vec![0u8; 0x8000];
+        rom[0] = 0x42;
+        d.set_rom(&rom).unwrap();
+        d.power_on(0);
+        let mut clk = 100u64;
+        let core_clk: *mut u64 = &mut clk;
+        let mut bus = Bus1581 {
+            ram: &mut d.ram,
+            rom: &d.rom,
+            cia: &mut d.cia,
+            ports: ports_of!(d, 0, 0),
+            clk_ptr: core_clk,
+            cpu_last_data: &mut d.cpu_last_data,
+        };
+        bus.write(0x1fff, 0x5a);
+        assert_eq!(bus.read(0x1fff), 0x5a, "RAM to $1FFF");
+        bus.write(0x0010, 0x77);
+        assert_eq!(bus.read(0x2010), 0x77, "$2000-$3FFF reads the open bus");
+        bus.write(0x3456, 0x13);
+        assert_eq!(bus.read(0x3ffe), 0x13, "a write there only puts its byte on the bus");
+        assert_eq!(bus.read(0x0010), 0x77, "and reaches no RAM");
+        bus.write(0x4003, 0xa5); // DDRB
+        assert_eq!(bus.read(0x5ff3), 0xa5, "the CIA every 16 bytes");
+        bus.write(0x7ffd, 0x21); // WD track register through the last mirror
+        assert_eq!(bus.read(0x6001), 0x21, "the WD every 4 bytes");
+        bus.write(0x8000, 0x00);
+        assert_eq!(bus.read(0x8000), 0x42, "the ROM ignores a write");
+    }
+}

@@ -406,8 +406,12 @@ pub fn save_vice_vsf(m: &mut Machine) -> Vec<u8> {
 
     // 1541 drive (DRIVE8/9/10/11 + DRIVECPU0 + 1541VIA1D0 + VIA2D0). Our
     // `capture_drive1541` already emits these in VICE's module format (Spec 612).
-    let drive_blob = crate::drive_snapshot::capture_drive1541(&mut m.drive8);
-    append_drive_modules(&mut out, &drive_blob);
+    // Spec 872 — the export stays a 1541 thing: a 1581 in position A is not written
+    // (its DRIVECPU layout is TRX64's, and nothing here was checked against VICE's).
+    if m.drive8.board_1581().is_none() {
+        let drive_blob = crate::drive_snapshot::capture_drive1541(&mut m.drive8);
+        append_drive_modules(&mut out, &drive_blob);
+    }
 
     // KEYBOARD (the key-matrix latch) so VICE resumes with the same keys held.
     module(&mut out, "KEYBOARD", 0, 0, &keyboard(m));

@@ -717,6 +717,42 @@ mod tests {
         assert_eq!(crc, 0, "the data CRC checks");
     }
 
+    /// Spec 872 §4 / §10.6 — an image with the error block: every sector is built from its
+    /// own bytes whatever its error byte says, and a write-back leaves the block as it was.
+    #[test]
+    fn d81_error_bytes_are_kept_and_ignored() {
+        let mut img = d81_with(|t, s| (t + s) as u8);
+        img.resize(822_400, 0);
+        for (i, e) in img[819_200..].iter_mut().enumerate() {
+            *e = if i % 3 == 0 { 0x05 } else { 0x01 }; // 5 = a hard (data CRC) error in VICE
+        }
+        let errors = img[819_200..].to_vec();
+        let mut f = Fdd::new(0);
+        f.image_attach(img, false);
+        assert_eq!(f.image_tracks, 80);
+        f.set_motor(true);
+        f.track = 2;
+        f.select_head(1); // logical track 3, sectors 0-19
+        let _ = f.read();
+        // Physical sector 1 = logical 3/0 and 3/1: its own fill bytes, CRC good.
+        let data = 32 + 12 + 3 + 1 + 4 + 2 + 22 + 12 + 3 + 1;
+        assert_eq!(f.raw.data[data], 3, "3/0 from its own bytes");
+        assert_eq!(f.raw.data[data + 256], 4, "3/1 from its own bytes");
+        let mut crc = 0xe295;
+        for &b in &f.raw.data[data..data + 514] {
+            crc = fdd_crc(crc, b);
+        }
+        assert_eq!(crc, 0, "a valid data CRC whatever the error byte");
+        // A written track goes back without touching the error block.
+        f.raw.data[data] = 0x99;
+        f.raw.dirty = true;
+        f.flush_raw();
+        let out = f.image.as_ref().unwrap();
+        assert_eq!(out.len(), 822_400);
+        assert_eq!(out[(2 * 40) * 256], 0x99, "3/0 written");
+        assert_eq!(&out[819_200..], &errors[..], "the error block as it was");
+    }
+
     /// A written track decodes back into the image — the sectors change, nothing else.
     #[test]
     fn a_dirty_track_flushes_into_its_own_sectors() {
