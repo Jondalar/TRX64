@@ -18,10 +18,19 @@
 //! Run all:
 //!   cargo test -p trx64-core --test seven_game_gate -- --ignored --nocapture
 //!
-//! Spec 871 — the same gate with a second drive on the bus: `GATE_DRIVE_B=9` powers
-//! drive position B at unit 9 with a blank disk in it, idle, before the LOAD. The
-//! gate itself does not change; the screenshots go to `gate_<name>_trx64_b9.png`.
-//! Unset (the default) the machine has one drive, as before.
+//! What this verdict does NOT check: the picture. PASS needs game code live or
+//! >= 8 colours on screen; nothing compares the frame with a reference, so a game
+//! that reaches its code with a corrupt or wrong picture passes. `scripts/gate.sh`
+//! diffs the PNGs against the previous run's, and only as a note.
+//!
+//! Spec 871 — `GATE_DRIVE_B=<unit>`: each game runs twice, B off and then drive
+//! position B powered at that unit with a blank disk in it, idle, switched on with
+//! the C64. The B-off run is the unchanged gate above and writes the usual PNG; the
+//! B-on run writes `gate_<name>_trx64_b<unit>.png` and is judged by its PICTURE: the
+//! frame must equal the B-off frame of the same build byte for byte, unless the game
+//! carries a named expectation in `B_ON_EXPECTED` saying why it differs. A game that
+//! is expected to differ and matches fails too — the expectation is stale then.
+//! Unset (the default) the machine has one drive and each game runs once, as before.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -84,10 +93,15 @@ struct GateResult {
     /// Top boundary PCs post-RUN (for divergence pinning on FAIL).
     top_c64_pcs: Vec<(u16, u64)>,
     png_path: String,
+    /// The frame written to `png_path` (the canvas, RGBA).
+    rgba: Vec<u8>,
+    width: usize,
+    /// The unit drive B sat at, `None` for the one-drive run.
+    drive_b: Option<u8>,
 }
 
 /// Run one game end-to-end and report behavioral state.
-fn run_game(file: &str, kind: DiskKind, name: &str) -> Option<GateResult> {
+fn run_game(file: &str, kind: DiskKind, name: &str, drive_b: Option<u8>) -> Option<GateResult> {
     if !roms_present() {
         eprintln!("skip {name}: ROMs absent");
         return None;
@@ -106,7 +120,9 @@ fn run_game(file: &str, kind: DiskKind, name: &str) -> Option<GateResult> {
     let mut sink = NullSink;
     // Spec 871 — optionally a second 1541 on the bus, switched on with the C64 so its
     // DOS has finished its power-on routine and sits idle by the time of the LOAD.
-    let drive_b = drive_b_from_env(&mut m);
+    if let Some(unit) = drive_b {
+        power_drive_b(&mut m, unit);
+    }
 
     // Boot to BASIC READY.
     m.run_for_full(2_500_000, &mut sink, |_, _, _, _, _, _, _| {});
@@ -279,13 +295,19 @@ fn run_game(file: &str, kind: DiskKind, name: &str) -> Option<GateResult> {
         screen_nonblank: nonblank,
         top_c64_pcs: top,
         png_path,
+        rgba: out_rgba,
+        width: w,
+        drive_b,
     })
 }
 
-/// Spec 871 — `GATE_DRIVE_B=<unit>`: power drive position B at that unit with a
-/// blank disk in it. Returns the unit, or `None` when the variable is unset.
-fn drive_b_from_env(m: &mut Machine) -> Option<u8> {
-    let unit: u8 = std::env::var("GATE_DRIVE_B").ok()?.parse().expect("GATE_DRIVE_B = a unit number");
+/// Spec 871 — the unit in `GATE_DRIVE_B`, or `None` when the variable is unset.
+fn drive_b_from_env() -> Option<u8> {
+    Some(std::env::var("GATE_DRIVE_B").ok()?.parse().expect("GATE_DRIVE_B = a unit number"))
+}
+
+/// Power drive position B at `unit` with a blank disk in it.
+fn power_drive_b(m: &mut Machine, unit: u8) {
     use trx64_core::drive::DrivePosition;
     m.set_drive_unit(DrivePosition::B, unit).expect("drive B unit");
     m.drive_b.attach_disk(DiskImage {
@@ -295,7 +317,96 @@ fn drive_b_from_env(m: &mut Machine) -> Option<u8> {
         read_only: false,
     });
     m.set_drive_power(DrivePosition::B, true).expect("drive B on");
-    Some(unit)
+}
+
+/// What the B-on frame is expected to be, against the same game's B-off frame.
+enum BOn {
+    /// Byte-identical: an idle second drive leaves the game alone.
+    Identical,
+    /// Differs anywhere: the game's own loader is broken by the second drive.
+    Differs(&'static str),
+    /// Differs, but only inside this box (x0, y0, x1, y1 inclusive, canvas pixels):
+    /// the game runs the same, shifted in time; anything outside the box is a failure.
+    DiffersWithin(&'static str, (usize, usize, usize, usize)),
+}
+
+/// Every 1541 on the bus answers ATN — the ATN-acknowledge gate pulls DATA in
+/// hardware the moment ATN falls, addressed or not, then its DOS runs its ATN routine
+/// (VICE iecbus.c conf3, via1d1541.c store_prb). Nothing isolates an idle drive. So:
+fn b_on_expected(name: &str) -> BOn {
+    match name {
+        // Its loader at $0380 asserts ATN as its request line (~2 000 edges per
+        // emulated second); drive 9 pulls DATA on each — the title never draws.
+        "greenberet" => BOn::Differs("ATN-toggling fastloader ($0380-$038A); an idle drive 9 answers every ATN and pulls DATA"),
+        // Its in-game loader asserts ATN a few times per block (C64 $4270-$4290);
+        // drive 9 pulls DATA in its ATN IRQ — the title bitmap arrives corrupt.
+        "motm" => BOn::Differs("ATN-toggling in-game loader ($4270-$4290); an idle drive 9 answers every ATN and pulls DATA"),
+        // The first file comes in through the KERNAL. Every command byte under ATN is
+        // received by drive 9 too, and the C64 waits for the slower listener: first
+        // divergence at C64 cycle 24 540 206 (C64 in $ED23 vs $ED33, drive 9 in its
+        // ATN code at $E8EF). The game runs the same, later; the frame differs only
+        // in the blinking "Loading" label, caught in the other phase.
+        "scramble" => BOn::DiffersWithin(
+            "KERNAL serial load shifted by drive 9's ATN handshake; only the \"Loading\" label's blink phase differs",
+            (298, 239, 351, 248),
+        ),
+        _ => BOn::Identical,
+    }
+}
+
+/// The B-on frame against the B-off frame: `Ok(summary)` when the expectation holds.
+fn judge_b_on(name: &str, off: &GateResult, on: &GateResult) -> Result<String, String> {
+    let w = off.width;
+    let mut n = 0usize;
+    let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0usize, 0usize);
+    for (i, (p, q)) in off.rgba.chunks_exact(4).zip(on.rgba.chunks_exact(4)).enumerate() {
+        if p != q {
+            let (x, y) = (i % w, i / w);
+            n += 1;
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x);
+            y1 = y1.max(y);
+        }
+    }
+    let same = n == 0 && off.rgba.len() == on.rgba.len();
+    let diff = if same {
+        "byte-identical to B off".to_string()
+    } else {
+        format!("differs from B off in {n} px, box x {x0}..={x1} y {y0}..={y1}")
+    };
+    match b_on_expected(name) {
+        BOn::Identical if same => Ok(diff),
+        BOn::Identical => Err(format!("{diff} — expected byte-identical")),
+        BOn::Differs(why) if !same => Ok(format!("{diff} — expected: {why}")),
+        BOn::Differs(why) => Err(format!("{diff} — expected to DIFFER ({why}); the expectation is stale")),
+        BOn::DiffersWithin(why, (bx0, by0, bx1, by1)) => {
+            if same {
+                Err(format!("{diff} — expected to differ inside x {bx0}..={bx1} y {by0}..={by1} ({why}); the expectation is stale"))
+            } else if x0 >= bx0 && x1 <= bx1 && y0 >= by0 && y1 <= by1 {
+                Ok(format!("{diff} — expected inside x {bx0}..={bx1} y {by0}..={by1}: {why}"))
+            } else {
+                Err(format!("{diff} — outside the expected box x {bx0}..={bx1} y {by0}..={by1} ({why})"))
+            }
+        }
+    }
+}
+
+/// One game through the gate: B off as always; with `GATE_DRIVE_B` set, then B on,
+/// judged against the B-off frame.
+fn gate_game(file: &str, kind: DiskKind, name: &str) {
+    let Some(off) = run_game(file, kind.clone(), name, None) else { return };
+    report(&off);
+    let Some(unit) = drive_b_from_env() else { return };
+    let Some(on) = run_game(file, kind, name, Some(unit)) else { return };
+    report(&on);
+    match judge_b_on(name, &off, &on) {
+        Ok(s) => eprintln!("B-ON VERDICT: PASS {name}: {s}"),
+        Err(s) => {
+            eprintln!("B-ON VERDICT: FAIL {name}: {s}");
+            panic!("B-on gate, {name}: {s}");
+        }
+    }
 }
 
 fn report(r: &GateResult) {
@@ -316,8 +427,18 @@ fn report(r: &GateResult) {
     } else {
         "FAIL (stuck, blank screen — load never reached game)"
     };
-    eprintln!("\n========== {} ({:?}) ==========", r.name, r.kind);
-    eprintln!("VERDICT: {verdict}");
+    // The B-on run's reachability is printed, not counted: its verdict is the
+    // picture comparison (`B-ON VERDICT`), and `VERDICT:` lines are what gate.sh counts.
+    match r.drive_b {
+        None => {
+            eprintln!("\n========== {} ({:?}) ==========", r.name, r.kind);
+            eprintln!("VERDICT: {verdict}");
+        }
+        Some(unit) => {
+            eprintln!("\n========== {} ({:?}) — drive B on at {unit} ==========", r.name, r.kind);
+            eprintln!("  reachability (not the B-on verdict): {verdict}");
+        }
+    }
     eprintln!(
         "  game_live={} first_game_pc={} final_pc=${:04X}",
         r.game_live,
@@ -344,9 +465,7 @@ macro_rules! game_test {
         #[test]
         #[ignore = "behavioral 7-game gate; run with --ignored --nocapture"]
         fn $fn() {
-            if let Some(r) = run_game($file, $kind, $name) {
-                report(&r);
-            }
+            gate_game($file, $kind, $name);
         }
     };
 }

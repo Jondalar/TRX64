@@ -218,28 +218,42 @@ trace (Spec 784), the `iec` monitor verb's drive column, and the VICE `.vsf` exp
 daemon tests in `main.rs` (`batch1_tests`), monitor `minimal_host.rs`.
 
 1. **7-game gate.** B off (unchanged gate): **7/7 PASS**, all seven screenshots
-   byte-identical to 870's (which match main's). `GATE_DRIVE_B=9` — B switched on WITH the
-   C64 at unit 9, a blank disk in it, idle: **7/7 PASS by the gate's criterion**, with
-   polarbear, impossible2, lastninja, maniac byte-identical to B off and scramble's title
-   intact. **Two are not really passes, and the gate cannot see it:**
-   - **Green Beret** reaches its loader (PC sustained at `$0385`, so "game code live in
-     RAM") but never draws its title — the screenshot is noise. Its loader, read from RAM:
+   byte-identical to 870's (which match main's). The B-off verdict does not look at the
+   picture: PASS is game code sustained in RAM or >= 8 colours on screen, and the PNGs
+   are only diffed against the previous run as a note in `scripts/gate.sh`. A game that
+   reaches its code with a wrong picture passes it.
+
+   **With B on (`GATE_DRIVE_B=9`)** the first build of this gate reported 7/7 PASS by
+   that same criterion, although Green Beret never drew its title and MOTM showed a
+   corrupt bitmap — a false green. Corrected: each game now runs B off and then B on in
+   the same process, and the B-on run is judged by its PICTURE against the B-off frame of
+   the same build, pixel for pixel. Result, as run: **7/7 as expected — 4 byte-identical
+   (polarbear, impossible2, lastninja, maniac), 3 expected to differ**, each named in
+   `b_on_expected` with its reason; a game expected to differ that matches fails too.
+   - **Green Beret** — differs everywhere (58 931 px). Its loader, read from RAM:
      `$0380 LDA #$0A / STA $DD00` asserts ATN, `$0385 LDA $DD00 / BPL $0385` waits for DATA
      high, `$038A LDA #$02 / STA $DD00` releases ATN, then four `LDA $DD00` 2-bit reads.
      ATN is its request line — measured, ~2 000 ATN edges per emulated second while it loads.
-   - **Murder on the Mississippi** loads its title into a corrupt bitmap and stops there.
-     Its in-game loader asserts ATN too (C64 `$4270`-`$4290`), a few times per block;
+   - **Murder on the Mississippi** — the title bitmap arrives corrupt (30 029 px). Its
+     in-game loader asserts ATN too (C64 `$4270`-`$4290`), a few times per block;
      measured, e.g. at C64 cycle 30 398 888 drive 9 answers (DATA pulled, B in its ATN IRQ
-     at `$FE68`) and pulls DATA again 300 cycles later from `$E9AD`; the B-on and B-off
-     machines, level until then, diverge within that million cycles.
+     at `$FE68`) and pulls DATA again 300 cycles later from `$E9AD`.
+   - **Scramble** — not byte-identical either, which the first write-up missed (it said
+     "title intact"). It loads its first file through the KERNAL; every command byte under
+     ATN is received by drive 9 as well and the C64 waits for the slower listener. First
+     divergence from the B-off run at C64 cycle 24 540 206 (C64 at `$ED23` vs `$ED33`,
+     drive 9 in its ATN code at `$E8EF`). The game runs the same, later; the frame
+     differs in 388 px, all inside the blinking "Loading" label (x 298-351, y 239-248),
+     caught in the other phase. The gate allows a difference only inside that box.
+
    **Cause:** a 1541 answers every ATN — in hardware first (the ATN-acknowledge gate pulls
-   DATA the instant ATN falls, before any software runs), then in its DOS ATN routine. A
-   second, idle 1541 therefore pulls DATA whenever an ATN-signalling loader raises ATN.
-   This is the 1541's circuit and DOS as ported from VICE, not something 871 adds: the
-   other five games are unaffected (four byte-identical screenshots, scramble's title
-   intact). The spec's expectation "a real bus with a passive second
-   1541 on it does not break these loaders" holds for five of the seven; for Green Beret
-   and MOTM the modelled physics says it does.
+   DATA the instant ATN falls, before any software runs), then in its DOS ATN routine
+   (VICE iecbus.c conf3, via1d1541.c store_prb: nothing isolates an idle drive). A second,
+   idle 1541 therefore pulls DATA whenever a loader raises ATN, and stretches every KERNAL
+   handshake it takes part in. This is the 1541's circuit and DOS as ported from VICE, not
+   something 871 adds. The spec's expectation "a real bus with a passive second 1541 on it
+   does not break these loaders" holds for five of the seven, byte-identical for four; for
+   Green Beret and MOTM the modelled physics says it does break them.
    - **Also found:** B switched on 0.8 s before a `LOAD` (its DOS still in its power-on
      routine) made all seven hang in the KERNAL (`$ED5A`/`$EEA9`): an ATN that falls
      before the DOS has set VIA1's CA1 edge is never serviced, and the ATN-acknowledge
