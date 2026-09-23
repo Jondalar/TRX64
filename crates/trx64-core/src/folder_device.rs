@@ -10,7 +10,7 @@
 //!   * the **DOS** — channels 0-15, the command channel, the host mapping of §8.
 //!
 //! The device reads and writes the host only through [`FolderSource`]. It is clocked at
-//! every sync point the drives have (`folders_sync`), event-driven on the C64 clock:
+//! every sync point the drives have (as an `IecDevice`, Spec 874), event-driven on the C64 clock:
 //! between two sync points it runs every timed transition under the lines it saw
 //! last, then takes the new lines at the sync point.
 
@@ -1745,25 +1745,46 @@ impl FolderDevice {
     }
 }
 
-// ── on the bus (§4) ─────────────────────────────────────────────────────────────────
+// ── on the bus (§4) — Spec 874: the first `IecDevice` ─────────────────────────────
 
-/// Spec 873 §4 — run every attached folder device up to C64 cycle `t` against the lines
-/// as they now stand, write each pull into its slot, fold once. Called at each sync
-/// point after the drives have been fed, run and written back.
-pub fn folders_sync(folders: &mut [FolderDevice], iec: &mut crate::iec::IecCore, t: u64) {
-    for f in folders.iter_mut() {
-        let slot = f.unit as usize;
-        let mut others = iec.iecbus.cpu_bus;
-        for u in 4..(8 + crate::iec::NUM_DISK_UNITS) {
-            if u != slot {
-                others &= iec.iecbus.drv_bus[u];
-            }
-        }
-        let atn_low = iec.iecbus.cpu_bus & 0x10 == 0;
-        f.advance(t, others | 0x3f, atn_low);
-        iec.iecbus.drv_bus[slot] = f.line.pull;
+/// Spec 874 §9 — the folder as an [`IecDevice`], byte-identical with Spec 873's direct
+/// calls: `clock_to` is `advance` with the byte Spec 873's sync built (`0x3f` | CLK | DATA), `outputs` is its
+/// pull, `rebase` is what attach and reattach set by hand.
+impl crate::iec_device::IecDevice for FolderDevice {
+    fn name(&self) -> String {
+        format!("folder {}", self.unit)
     }
-    iec.iec_update_ports();
+
+    fn clock_to(&mut self, clk: u64, bus: crate::iec_device::IecLines) {
+        let others = 0x3f | ((bus.clk as u8) << 6) | ((bus.data as u8) << 7);
+        self.advance(clk, others, !bus.atn);
+    }
+
+    fn outputs(&self) -> crate::iec_device::IecOut {
+        crate::iec_device::IecOut { clk: self.line.pull & W_CLK == 0, data: self.line.pull & W_DATA == 0 }
+    }
+
+    fn rebase(&mut self, clk: u64, bus: crate::iec_device::IecLines) {
+        self.line.now = clk;
+        self.line.timeout = self.line.timeout.min(clk);
+        self.line.atn_low = !bus.atn;
+    }
+
+    fn units(&self) -> u16 {
+        1 << self.unit
+    }
+
+    fn set_cpu_hz(&mut self, hz: u32) {
+        self.cpu_hz = hz;
+    }
+
+    fn c64_reset(&mut self) {
+        self.reset_from_c64();
+    }
+
+    fn clone_device(&self) -> Option<Box<dyn crate::iec_device::IecDevice>> {
+        Some(Box::new(self.clone()))
+    }
 }
 
 #[cfg(test)]

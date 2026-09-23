@@ -79,6 +79,9 @@ pub enum Hold {
 pub trait AsAny {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
+    /// The box itself as `Any`, to take a concrete device back out (Spec 874's restore
+    /// takes the folders out of the device list this way).
+    fn into_any_box(self: Box<Self>) -> Box<dyn Any>;
 }
 
 impl<T: Any> AsAny for T {
@@ -86,6 +89,9 @@ impl<T: Any> AsAny for T {
         self
     }
     fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+    fn into_any_box(self: Box<Self>) -> Box<dyn Any> {
         self
     }
 }

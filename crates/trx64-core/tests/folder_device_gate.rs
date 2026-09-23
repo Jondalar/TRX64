@@ -815,7 +815,7 @@ fn state_diff(a: &Machine, b: &Machine) -> String {
     if pcs(a) != pcs(b) {
         out.push(format!("PCs {:04X?} vs {:04X?}", pcs(a), pcs(b)));
     }
-    let dev = |m: &Machine| serde_json::to_value(&m.folders).unwrap();
+    let dev = |m: &Machine| serde_json::to_value(&m.folders()).unwrap();
     if dev(a) != dev(b) {
         out.push(format!("folder device {} vs {}", dev(a), dev(b)));
     }
@@ -920,7 +920,7 @@ fn a_checkpoint_without_folders_restores_with_none() {
     assert!(cp.get("folders").is_none(), "a machine without folders writes no node");
     let mut r = booted(Some(d8), at9(&f));
     restore_runtime_checkpoint(&mut r, &cp).unwrap();
-    assert!(r.folders.is_empty());
+    assert!(r.folders().is_empty());
     assert_eq!(r.iec.iecbus_callback, IecbusCallback::Conf1);
     assert!(load_dir(&mut r, 9).contains("DEVICE NOT PRESENT"));
 }

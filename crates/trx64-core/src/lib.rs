@@ -34,6 +34,7 @@ pub mod full;
 pub mod full_sc;
 pub mod gcr;
 pub mod iec;
+pub mod iec_device;
 pub mod keyboard;
 pub mod m93c86;
 pub mod model;
@@ -514,7 +515,6 @@ impl<'a> Bus for SidBus<'a> {
 ///
 /// `Clone` is intentional and load-bearing: a clone is the cheap COW fork base for
 /// Phase-2 parallel mutation search (`explore()`), thousands of branches feasible.
-#[derive(Clone)]
 pub struct Machine {
     pub ram: Box<[u8; 0x10000]>,
     /// Monotonic cycle counter (CLOCK, never wraps — per Spec 743).
@@ -554,10 +554,11 @@ pub struct Machine {
     /// Switch it on through [`Machine::set_drive_power`], which refuses a unit
     /// number the other position already answers to.
     pub drive_b: Drive1541,
-    /// Spec 873 — folder devices on the bus, one per unit, none by default. A device
-    /// without a drive CPU, backed by a host folder, advanced at every sync point the
-    /// drives have. Attach through [`Machine::attach_folder`].
-    pub folders: Vec<crate::folder_device::FolderDevice>,
+    /// Spec 873/874 — the IEC devices on the bus, in slot order, none by default: the
+    /// folder devices (Spec 873) and a host's own ([`crate::iec_device::IecDevice`]).
+    /// Each is advanced at every sync point the drives have. Attach through
+    /// [`Machine::attach_folder`] / [`Machine::attach_iec_device`].
+    pub iec_devices: crate::iec_device::IecDevices,
 
     // ── Full-machine (FullBus) state (ADR-021) ──────────────────────────────
     /// BASIC ROM in a SEPARATE array (the RAM under $A000-$BFFF keeps its DRAM
@@ -722,6 +723,74 @@ pub struct Machine {
     model: &'static crate::model::C64Model,
 }
 
+/// `Clone` by hand, for one thing a derive cannot do (Spec 874 §7): an IEC device that
+/// gives no copy leaves a vacancy in the clone, and the vacancy's slot must be released
+/// in the clone's bus at once, not at its first sync point. Every field is listed, so a
+/// new field that is forgotten here does not compile.
+impl Clone for Machine {
+    fn clone(&self) -> Self {
+        let mut m = Machine {
+            ram: self.ram.clone(),
+            clk: self.clk.clone(),
+            cpu6510: self.cpu6510.clone(),
+            c64_core: self.c64_core.clone(),
+            c64_int: self.c64_int.clone(),
+            cpu: self.cpu.clone(),
+            vic: self.vic.clone(),
+            cia1: self.cia1.clone(),
+            cia2: self.cia2.clone(),
+            cia_table: self.cia_table.clone(),
+            drive8: self.drive8.clone(),
+            drive_b: self.drive_b.clone(),
+            iec_devices: self.iec_devices.clone(),
+            basic_rom: self.basic_rom.clone(),
+            kernal_rom: self.kernal_rom.clone(),
+            char_rom: self.char_rom.clone(),
+            io_shadow: self.io_shadow.clone(),
+            sid_regs: self.sid_regs.clone(),
+            sid: self.sid.clone(),
+            sid_extra: self.sid_extra.clone(),
+            sid_map: self.sid_map.clone(),
+            sid_trace: self.sid_trace.clone(),
+            sid_host: self.sid_host.clone(),
+            port_dir: self.port_dir.clone(),
+            port_data: self.port_data.clone(),
+            memconfig: self.memconfig.clone(),
+            memconfig_table: self.memconfig_table.clone(),
+            full_assembled: self.full_assembled.clone(),
+            cia2_pa_out: self.cia2_pa_out.clone(),
+            iec: self.iec.clone(),
+            keyboard: self.keyboard.clone(),
+            joystick1: self.joystick1.clone(),
+            joystick2: self.joystick2.clone(),
+            drive_c64_ref: self.drive_c64_ref.clone(),
+            cartridge: self.cartridge.clone(),
+            cartridge_image: self.cartridge_image.clone(),
+            expansion: self.expansion.clone(),
+            port_profile: self.port_profile.clone(),
+            expansion_snoop: self.expansion_snoop.clone(),
+            expansion_host_lines: self.expansion_host_lines.clone(),
+            hold: self.hold.clone(),
+            expansion_ram_uncovered: self.expansion_ram_uncovered.clone(),
+            uci_c64_reset: self.uci_c64_reset.clone(),
+            cpu_history: self.cpu_history.clone(),
+            delta_ring: self.delta_ring.clone(),
+            turbo_fast_path: self.turbo_fast_path.clone(),
+            cia_alarm_check: self.cia_alarm_check.clone(),
+            head_trace_armed: self.head_trace_armed.clone(),
+            head_trace: self.head_trace.clone(),
+            head_trace_last: self.head_trace_last.clone(),
+            block_reads: self.block_reads.clone(),
+            sector_entry_read_count: self.sector_entry_read_count.clone(),
+            cart_read_armed: self.cart_read_armed.clone(),
+            cart_read_set: self.cart_read_set.clone(),
+            model: self.model,
+        };
+        m.release_vacant_iec_slots();
+        m
+    }
+}
+
 /// reverse-debug Phase 1b — the CPU state the machine landed on after a reverse-step
 /// (the PRE-state of the oldest instruction undone). `p` is the COMPOSITE status.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -878,7 +947,7 @@ impl Machine {
             full_assembled: false,
             cia2_pa_out: 0xff,
             iec: IecCore::new(),
-            folders: Vec::new(),
+            iec_devices: Default::default(),
             keyboard: crate::keyboard::KeyboardMatrix::new(),
             joystick1: crate::keyboard::JoystickState::default(),
             joystick2: crate::keyboard::JoystickState::default(),
@@ -966,9 +1035,9 @@ impl Machine {
         self.cia2.set_timing(t.cpu_hz, t.tod_hz);
         self.drive8.sync_factor = t.drive_sync_factor;
         self.drive_b.sync_factor = t.drive_sync_factor;
-        // Spec 873 §6 — the folder devices' µs are cycles of this clock.
-        for f in self.folders.iter_mut() {
-            f.cpu_hz = t.cpu_hz;
+        // Spec 873 §6 / 874 §7 — the IEC devices' µs are cycles of this clock.
+        for s in self.iec_devices.iter_mut() {
+            s.dev.set_cpu_hz(t.cpu_hz);
         }
         self.model = model;
         Ok(())
@@ -1288,16 +1357,16 @@ impl Machine {
         // are there (another unit, a second drive, or none while off / held). A no-op
         // on a stock machine.
         self.sync_drive_slots();
-        // Spec 873 — the fresh IEC core knows no folder device; give it back the ones
-        // attached (their slots, their pulls). The C64's RESET reaches them over the
-        // RESET line (`reset_from_c64`), which releases their lines.
-        if !self.folders.is_empty() {
-            let units = self.folder_units();
+        // Spec 873/874 — the fresh IEC core knows no IEC device; give it back the ones
+        // attached (their slots, their pulls). The C64's RESET reaches each as
+        // `c64_reset` — a folder takes it over its RESET line, which releases its lines.
+        if !self.iec_devices.is_empty() {
+            let slots = self.iec_devices.slots();
             let pa = self.cia2_pa_out;
-            self.iec.set_folder_units(units, pa);
-            for f in self.folders.iter_mut() {
-                f.reset_from_c64();
-                self.iec.iecbus.drv_bus[f.unit as usize] = f.pull();
+            self.iec.set_device_slots(slots, pa);
+            for s in self.iec_devices.iter_mut() {
+                s.dev.c64_reset();
+                self.iec.iecbus.drv_bus[s.slot as usize] = s.dev.outputs().slot_byte();
             }
             self.iec.iec_update_ports();
         }
@@ -1578,7 +1647,7 @@ impl Machine {
             read_side_effects: Vec::new(),
             drive: &mut self.drive8,
             drive_b: &mut self.drive_b,
-            folders: &mut self.folders,
+            iec_devices: &mut self.iec_devices,
             iec: &mut self.iec,
             keyboard: &self.keyboard,
             joystick1: self.joystick1,
@@ -1645,7 +1714,7 @@ impl Machine {
             read_side_effects: Vec::new(),
             drive: &mut self.drive8,
             drive_b: &mut self.drive_b,
-            folders: &mut self.folders,
+            iec_devices: &mut self.iec_devices,
             iec: &mut self.iec,
             keyboard: &self.keyboard,
             joystick1: self.joystick1,
@@ -1955,7 +2024,7 @@ impl Machine {
                 read_side_effects: Vec::new(),
                 drive: &mut self.drive8,
                 drive_b: &mut self.drive_b,
-                folders: &mut self.folders,
+                iec_devices: &mut self.iec_devices,
                 iec: &mut self.iec,
                 keyboard: &self.keyboard,
                 joystick1: self.joystick1,
@@ -2158,6 +2227,11 @@ impl Machine {
             self.catch_up_drives(clk);
         } else {
             self.drive_c64_ref = clk;
+            // Spec 874 §6 — the IEC devices keep time through a reset hold (the U64
+            // holds the C64 2.06 s while its FPGA runs); the drives stand still (850 D7).
+            if !self.iec_devices.is_empty() {
+                crate::iec_device::iec_devices_sync(&mut self.iec_devices, &mut self.iec, clk);
+            }
         }
     }
 
@@ -2863,23 +2937,154 @@ impl Machine {
             self.cia2_pa_out,
         );
         crate::drive::pair_fold_into_iec(&self.drive8, &self.drive_b, &mut self.iec, self.cia2_pa_out);
-        // Spec 873 §4 — then the folder devices; none attached = this one test.
-        if !self.folders.is_empty() {
-            crate::folder_device::folders_sync(&mut self.folders, &mut self.iec, clk);
+        // Spec 873 §4 / 874 §5 — then the IEC devices; none attached = this one test.
+        if !self.iec_devices.is_empty() {
+            crate::iec_device::iec_devices_sync(&mut self.iec_devices, &mut self.iec, clk);
         }
     }
 
-    // ── Spec 873 — folder devices ───────────────────────────────────────────────────
+    // ── Spec 874 — IEC devices: a host's own and the folders ─────────────────────────
 
-    /// The units that carry a folder device, a bit per unit.
-    fn folder_units(&self) -> u16 {
-        self.folders.iter().fold(0u16, |m, f| m | (1 << f.unit))
+    /// The lines at `slot` as everybody else drives them, for a device's `rebase`.
+    fn iec_lines_without(&self, slot: u8) -> crate::iec_device::IecLines {
+        crate::iec_device::lines_without(&self.iec, slot as usize)
     }
+
+    /// Spec 874 §4 — who already takes `unit` from a newcomer: a powered drive (at that
+    /// unit now or from its next reset) or an IEC device (its slot 8-11 or a claim).
+    fn unit_occupant(&self, unit: u8) -> Option<String> {
+        use crate::drive::DrivePosition::{A, B};
+        for p in [A, B] {
+            let d = self.drive(p);
+            if d.powered() && (d.unit() == unit || d.unit_jumpers() == unit) {
+                return Some(format!("drive position {} is powered at unit {unit}", p.name()));
+            }
+        }
+        self.iec_devices.claimant_of_unit(unit).map(|s| {
+            if s.slot == unit {
+                format!("{} stands at slot {unit}", s.dev.name())
+            } else {
+                format!("{} at slot {} answers to unit {unit}", s.dev.name(), s.slot)
+            }
+        })
+    }
+
+    /// Spec 874 D2 — put a host's device on the bus at `slot` (4-11). Slots 4-7 take no
+    /// unit; at 8-11 the slot is also its unit. Refused, by name, for a slot outside
+    /// 4-11, a slot a powered drive or another device holds, and a unit it claims
+    /// (`units()`) that a powered drive or another device answers to.
+    ///
+    /// Attached means on the bus from now: it gets the model's clock rate and a
+    /// `rebase` to the machine's clock and lines, and its pull goes into its slot.
+    pub fn attach_iec_device(&mut self, slot: u8, mut dev: Box<dyn crate::iec_device::IecDevice>) -> Result<(), String> {
+        let name = dev.name();
+        if !(4..=11).contains(&slot) {
+            return Err(format!("{name}: an IEC device stands at slot 4-11, not {slot}"));
+        }
+        if let Some(d) = self.iec_devices.get(slot) {
+            return Err(format!("{name} cannot stand at slot {slot}: {} stands there", d.name()));
+        }
+        if (8..=11).contains(&slot) {
+            if let Some(who) = self.unit_occupant(slot) {
+                return Err(format!("{name} cannot stand at slot {slot}: {who}"));
+            }
+        }
+        let claims = dev.units() & !(1 << slot);
+        for unit in 0..16u8 {
+            if claims & (1 << unit) != 0 {
+                if let Some(who) = self.unit_occupant(unit) {
+                    return Err(format!("{name} cannot answer to unit {unit}: {who}"));
+                }
+            }
+        }
+        dev.set_cpu_hz(self.model.timing.cpu_hz);
+        dev.rebase(self.c64_core.clk, self.iec_lines_without(slot));
+        self.iec_devices.insert(slot, dev);
+        self.iec.set_device_slots(self.iec_devices.slots(), self.cia2_pa_out);
+        let byte = self.iec_devices.get(slot).expect("just inserted").outputs().slot_byte();
+        self.iec.iecbus.drv_bus[slot as usize] = byte;
+        self.iec.iec_update_ports();
+        Ok(())
+    }
+
+    /// Spec 874 D2 — take the device at `slot` off the bus and hand it back. Its slot is
+    /// released (`0xff`) and the map loses it; its name leaves
+    /// [`Self::iec_devices_uncovered`].
+    pub fn detach_iec_device(&mut self, slot: u8) -> Result<Box<dyn crate::iec_device::IecDevice>, String> {
+        let Some(dev) = self.iec_devices.remove(slot) else {
+            return Err(format!("no IEC device at slot {slot}"));
+        };
+        self.iec.set_device_slots(self.iec_devices.slots(), self.cia2_pa_out);
+        Ok(dev)
+    }
+
+    /// Spec 874 D8 — the device at `slot` as its own type, between runs.
+    pub fn iec_device_as<T: crate::iec_device::IecDevice + 'static>(&self, slot: u8) -> Option<&T> {
+        self.iec_devices.get(slot)?.as_any().downcast_ref::<T>()
+    }
+
+    /// Spec 874 D8 — the device at `slot` as its own type, mutable.
+    pub fn iec_device_as_mut<T: crate::iec_device::IecDevice + 'static>(&mut self, slot: u8) -> Option<&mut T> {
+        self.iec_devices.get_mut(slot)?.as_any_mut().downcast_mut::<T>()
+    }
+
+    /// Spec 874 D6 — the devices the last restore or clone did not cover, by name: an
+    /// opted-out device (no `checkpoint`), a vacancy a clone left, a device a
+    /// checkpoint listed that is not attached. Empty when everything was covered.
+    pub fn iec_devices_uncovered(&self) -> &[String] {
+        self.iec_devices.uncovered()
+    }
+
+    /// Spec 874 §7 — take every IEC device off this machine, for a C64 power cycle (the
+    /// devices have their own power, as a drive does). The slots are released.
+    pub fn take_iec_devices(&mut self) -> crate::iec_device::IecDevices {
+        let devs = std::mem::take(&mut self.iec_devices);
+        self.iec.set_device_slots(0, self.cia2_pa_out);
+        devs
+    }
+
+    /// A vacancy a clone left pulls nothing: its slot is released and the bus folded.
+    fn release_vacant_iec_slots(&mut self) {
+        let mut any = false;
+        for s in self.iec_devices.iter().filter(|s| s.is_vacant()) {
+            self.iec.iecbus.drv_bus[s.slot as usize] = s.dev.outputs().slot_byte();
+            any = true;
+        }
+        if any {
+            self.iec.iec_update_ports();
+        }
+    }
+
+    /// Spec 874 §7 — put IEC devices that lived through a C64 power cycle on this
+    /// machine's bus: the clock rate, a `rebase` to this machine's clock and lines, the
+    /// power-on's RESET (`c64_reset`), their slots and pulls, one fold. A device whose
+    /// slot is taken here is dropped.
+    pub fn reattach_iec_devices(&mut self, mut devs: crate::iec_device::IecDevices) {
+        let hz = self.model.timing.cpu_hz;
+        let now = self.c64_core.clk;
+        for mut s in devs.take_where(|_| true) {
+            if self.iec_devices.get(s.slot).is_some() {
+                continue;
+            }
+            let lines = self.iec_lines_without(s.slot);
+            s.dev.set_cpu_hz(hz);
+            s.dev.rebase(now, lines);
+            s.dev.c64_reset();
+            self.iec_devices.insert(s.slot, s.dev);
+        }
+        self.iec.set_device_slots(self.iec_devices.slots(), self.cia2_pa_out);
+        for s in self.iec_devices.iter() {
+            self.iec.iecbus.drv_bus[s.slot as usize] = s.dev.outputs().slot_byte();
+        }
+        self.iec.iec_update_ports();
+    }
+
+    // ── Spec 873 — folder devices (the first IEC device) ─────────────────────────────
 
     /// Spec 873 D1 — put a folder device at `unit` (8-11). Attached means powered: it
     /// is on the bus from now. Refused, by name, for a unit outside 8-11, a unit that
-    /// already has a folder device, and a unit a powered drive answers to (now or from
-    /// its next reset).
+    /// already has a folder device, a unit a powered drive answers to (now or from its
+    /// next reset), and (Spec 874) a unit an IEC device stands at or claims.
     pub fn attach_folder(
         &mut self,
         unit: u8,
@@ -2889,7 +3094,7 @@ impl Machine {
         if !(8..=11).contains(&unit) {
             return Err(format!("a folder device stands at unit 8-11, not {unit}"));
         }
-        if self.folders.iter().any(|f| f.unit == unit) {
+        if self.folder(unit).is_some() {
             return Err(format!("unit {unit} already has a folder device"));
         }
         use crate::drive::DrivePosition::{A, B};
@@ -2902,63 +3107,47 @@ impl Machine {
                 ));
             }
         }
-        let mut dev = crate::folder_device::FolderDevice::new(unit, source, &opts, self.model.timing.cpu_hz);
-        let now = self.c64_core.clk;
-        dev.line.now = now;
-        dev.line.atn_low = self.iec.iecbus.cpu_bus & 0x10 == 0;
-        self.folders.push(dev);
-        self.folders.sort_by_key(|f| f.unit);
-        let units = self.folder_units();
-        self.iec.set_folder_units(units, self.cia2_pa_out);
-        Ok(())
+        if let Some(who) = self.unit_occupant(unit) {
+            return Err(format!("a folder device cannot answer to unit {unit}: {who}"));
+        }
+        let dev = crate::folder_device::FolderDevice::new(unit, source, &opts, self.model.timing.cpu_hz);
+        self.attach_iec_device(unit, Box::new(dev))
     }
 
     /// Spec 873 D1 — take the folder device at `unit` off the bus. Open write channels
     /// are finished on the host first; the slot is released.
     pub fn detach_folder(&mut self, unit: u8) -> Result<(), String> {
-        let Some(i) = self.folders.iter().position(|f| f.unit == unit) else {
+        if self.folder(unit).is_none() {
             return Err(format!("no folder device at unit {unit}"));
-        };
-        let mut dev = self.folders.remove(i);
-        dev.close_all();
-        let units = self.folder_units();
-        self.iec.set_folder_units(units, self.cia2_pa_out);
+        }
+        let mut dev = self.detach_iec_device(unit)?;
+        if let Some(f) = dev.as_mut().as_any_mut().downcast_mut::<crate::folder_device::FolderDevice>() {
+            f.close_all();
+        }
         Ok(())
-    }
-
-    /// Spec 873 — put folder devices that lived through a C64 power cycle back on this
-    /// machine's bus (a folder device has its own power, as a drive does). The C64's
-    /// power-on pulses the RESET line: each device takes it as a reset when connected.
-    pub fn reattach_folders(&mut self, devs: Vec<crate::folder_device::FolderDevice>) {
-        let hz = self.model.timing.cpu_hz;
-        let now = self.c64_core.clk;
-        for mut d in devs {
-            if self.folders.iter().any(|f| f.unit == d.unit) {
-                continue;
-            }
-            d.cpu_hz = hz;
-            d.line.now = now;
-            d.line.timeout = d.line.timeout.min(now);
-            d.reset_from_c64();
-            self.folders.push(d);
-        }
-        self.folders.sort_by_key(|f| f.unit);
-        let units = self.folder_units();
-        self.iec.set_folder_units(units, self.cia2_pa_out);
-        for f in &self.folders {
-            self.iec.iecbus.drv_bus[f.unit as usize] = f.pull();
-        }
-        self.iec.iec_update_ports();
     }
 
     /// The folder device at `unit`, if any.
     pub fn folder(&self, unit: u8) -> Option<&crate::folder_device::FolderDevice> {
-        self.folders.iter().find(|f| f.unit == unit)
+        self.iec_device_as::<crate::folder_device::FolderDevice>(unit)
     }
 
     /// The folder device at `unit`, mutable.
     pub fn folder_mut(&mut self, unit: u8) -> Option<&mut crate::folder_device::FolderDevice> {
-        self.folders.iter_mut().find(|f| f.unit == unit)
+        self.iec_device_as_mut::<crate::folder_device::FolderDevice>(unit)
+    }
+
+    /// The folder devices, in unit order.
+    pub fn folders(&self) -> Vec<&crate::folder_device::FolderDevice> {
+        self.iec_devices.iter().filter_map(|s| s.dev.as_ref().as_any().downcast_ref::<crate::folder_device::FolderDevice>()).collect()
+    }
+
+    /// The folder devices, in unit order, mutable.
+    pub fn folders_mut(&mut self) -> Vec<&mut crate::folder_device::FolderDevice> {
+        self.iec_devices
+            .iter_mut()
+            .filter_map(|s| s.dev.as_mut().as_any_mut().downcast_mut::<crate::folder_device::FolderDevice>())
+            .collect()
     }
 
     /// The drive in position `pos`.
@@ -3007,11 +3196,16 @@ impl Machine {
     fn unit_claimed_by_other(&self, pos: crate::drive::DrivePosition, unit: u8) -> Option<String> {
         use crate::drive::DrivePosition::{A, B};
         // Spec 873 D1 — a folder device at that unit claims it as a drive would.
-        if self.folders.iter().any(|f| f.unit == unit) {
+        if self.folder(unit).is_some() {
             return Some(format!(
                 "drive position {} cannot answer to unit {unit}: a folder device is attached at unit {unit}",
                 pos.name()
             ));
+        }
+        // Spec 874 D2 — so does an IEC device standing at that slot or claiming it.
+        if let Some(s) = self.iec_devices.claimant_of_unit(unit) {
+            let how = if s.slot == unit { format!("stands at slot {unit}") } else { format!("at slot {} answers to unit {unit}", s.slot) };
+            return Some(format!("drive position {} cannot answer to unit {unit}: {} {how}", pos.name(), s.dev.name()));
         }
         let other = if pos == A { B } else { A };
         let d = self.drive(other);
@@ -3492,7 +3686,7 @@ impl Machine {
                     read_side_effects: Vec::new(),
                     drive: &mut self.drive8,
                     drive_b: &mut self.drive_b,
-                    folders: &mut self.folders,
+                    iec_devices: &mut self.iec_devices,
                     iec: &mut self.iec,
                     keyboard: &self.keyboard,
                     joystick1: self.joystick1,
