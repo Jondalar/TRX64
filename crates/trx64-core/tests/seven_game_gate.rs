@@ -17,6 +17,11 @@
 //!   cargo test -p trx64-core --test seven_game_gate <name> -- --ignored --nocapture
 //! Run all:
 //!   cargo test -p trx64-core --test seven_game_gate -- --ignored --nocapture
+//!
+//! Spec 871 — the same gate with a second drive on the bus: `GATE_DRIVE_B=9` powers
+//! drive position B at unit 9 with a blank disk in it, idle, before the LOAD. The
+//! gate itself does not change; the screenshots go to `gate_<name>_trx64_b9.png`.
+//! Unset (the default) the machine has one drive, as before.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -99,6 +104,9 @@ fn run_game(file: &str, kind: DiskKind, name: &str) -> Option<GateResult> {
     let mut m = Machine::new();
     m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
     let mut sink = NullSink;
+    // Spec 871 — optionally a second 1541 on the bus, switched on with the C64 so its
+    // DOS has finished its power-on routine and sits idle by the time of the LOAD.
+    let drive_b = drive_b_from_env(&mut m);
 
     // Boot to BASIC READY.
     m.run_for_full(2_500_000, &mut sink, |_, _, _, _, _, _, _| {});
@@ -227,7 +235,20 @@ fn run_game(file: &str, kind: DiskKind, name: &str) -> Option<GateResult> {
     }
     let out_rgba = best_rgba.unwrap_or(final_rgba);
     let png = encode_png_rgba(w as u32, h as u32, &out_rgba);
-    let png_path = format!("{TRACES}/gate_{name}_trx64.png");
+    let png_path = match drive_b {
+        Some(unit) => format!("{TRACES}/gate_{name}_trx64_b{unit}.png"),
+        None => format!("{TRACES}/gate_{name}_trx64.png"),
+    };
+    if let Some(unit) = drive_b {
+        let b = &m.drive_b;
+        eprintln!(
+            "  drive B: unit {unit} powered={} clk={} motor={} half_track={} (idle = motor off, head on 18)",
+            b.powered(),
+            b.drive_clk,
+            b.ports().motor_on,
+            b.half_track()
+        );
+    }
     std::fs::write(&png_path, &png).expect("write PNG");
 
     // Screen text non-blank count (title chars).
@@ -259,6 +280,22 @@ fn run_game(file: &str, kind: DiskKind, name: &str) -> Option<GateResult> {
         top_c64_pcs: top,
         png_path,
     })
+}
+
+/// Spec 871 — `GATE_DRIVE_B=<unit>`: power drive position B at that unit with a
+/// blank disk in it. Returns the unit, or `None` when the variable is unset.
+fn drive_b_from_env(m: &mut Machine) -> Option<u8> {
+    let unit: u8 = std::env::var("GATE_DRIVE_B").ok()?.parse().expect("GATE_DRIVE_B = a unit number");
+    use trx64_core::drive::DrivePosition;
+    m.set_drive_unit(DrivePosition::B, unit).expect("drive B unit");
+    m.drive_b.attach_disk(DiskImage {
+        kind: DiskKind::D64,
+        bytes: vec![0u8; 174_848],
+        backing_path: None,
+        read_only: false,
+    });
+    m.set_drive_power(DrivePosition::B, true).expect("drive B on");
+    Some(unit)
 }
 
 fn report(r: &GateResult) {
