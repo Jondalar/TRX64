@@ -62,6 +62,11 @@ pub struct Session {
     /// Spec 786 — media registry: disk image held while powered off (writes
     /// intact). Same off↔machine transplant as the cartridge.
     pub inserted_disk: Option<DiskImage>,
+    /// Spec 871 — the disk in drive position B, held the same way.
+    pub inserted_disk_b: Option<DiskImage>,
+    /// Spec 871 — position B's jumpers and power across a power cycle (`None`: B as a
+    /// machine is built — off, jumpers at 9).
+    pub drive_b_state: Option<(u8, bool)>,
     /// Spec 863 — which C64 this session is (a `models.toml` row). Session identity, like
     /// the machine profile: every machine the session builds — power-on, the power-off
     /// blank — is built on it, so it survives a power cycle; a warm reset keeps the
@@ -135,6 +140,8 @@ impl Session {
             powered: false,
             inserted_cart: None,
             inserted_disk: None,
+            inserted_disk_b: None,
+            drive_b_state: None,
             model,
         }
     }
@@ -178,6 +185,18 @@ impl Session {
         if let Some(disk) = self.inserted_disk.take() {
             machine.drive8.attach_disk(disk);
         }
+        // Spec 871 — drive position B is a device of its own: a C64 power cycle does
+        // not unplug it. Its disk goes back in, its jumpers stand where they stood, and
+        // if it was on it comes up again (its DOS from power-on, as the C64's does).
+        if let Some(disk) = self.inserted_disk_b.take() {
+            machine.drive_b.attach_disk(disk);
+        }
+        if let Some((jumpers, powered)) = self.drive_b_state.take() {
+            let _ = machine.drive_b.set_unit(jumpers);
+            if powered {
+                let _ = machine.set_drive_power(trx64_core::drive::DrivePosition::B, true);
+            }
+        }
         self.machine = machine;
         self.running = true;
         self.powered = true;
@@ -208,6 +227,10 @@ impl Session {
         // then move the image into the registry.
         self.machine.drive8.flush_disk_writeback();
         self.inserted_disk = self.machine.drive8.disk.take();
+        // Spec 871 — position B's disk, jumpers and power survive the C64's power cut.
+        self.machine.drive_b.flush_disk_writeback();
+        self.inserted_disk_b = self.machine.drive_b.disk.take();
+        self.drive_b_state = Some((self.machine.drive_b.unit_jumpers(), self.machine.drive_b.powered()));
         self.machine = Machine::new_with_model(self.model);
         self.running = false;
         self.powered = false;

@@ -49,7 +49,7 @@ monitor (VICE-superset):
     r                registers (+ flow + IRQ/NMI vectors)
     r a=$42 x=$10    set registers (a/x/y/sp/pc/fl)
     sidefx [on|off]  monitor read side effects (default off = peek)
-    device [c64|drive8]  target the C64 or the 1541 CPU (drive8 = read-inspect r/m/d)
+    device [c64|drive<unit>]  target the C64 or a 1541 CPU by its unit (drive8, drive9 … = read-inspect r/m/d)
   STATE / TRACE
     dump|snapshot <p>  write a .c64re snapshot; undump|loadsnapshot <p>  restore it
     savecrt ["<p>"]  write live flash state to the mounted .crt (or to <p> as a copy)

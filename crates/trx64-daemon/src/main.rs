@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
-use trx64_core::drive::{DiskImage, DiskKind};
+use trx64_core::drive::{DiskImage, DiskKind, DrivePosition};
 use trx64_core::{BusKind, NullSink, Observer};
 use trx64_session::{Session, TraceState};
 use trx64_trace::{FrameSink, TraceChannels, TracingObserver};
@@ -429,6 +429,8 @@ pub struct State {
     disk_ap_settle_at_ms: u64,
     disk_ap_seen_hash: Option<String>,
     disk_ap_done_hash: Option<String>,
+    /// Spec 871 — the same settle/done bookkeeping for the disk in drive position B.
+    disk_ap_b: DiskAutoPersist,
     /// Spec 705.B — auto-capture cadence: capture a render-anchor (framebuffer-
     /// OMITTED, BUG-049) into the checkpoint ring every CHECKPOINT_CAPTURE_EVERY_FRAMES
     /// stream-loop frames (= CHECKPOINT_AUTOCAPTURE, runtime-controller.ts:157). The
@@ -6372,19 +6374,37 @@ fn monitor_forward(req: &Request, command: &str, state: &SharedState) -> Option<
             ("media/open", json!({ "path": arg }), "MOUNT".to_string())
         }
         "eject" | "umount" => {
-            let role = match arg.to_ascii_lowercase().as_str() {
-                "" | "auto" => "auto",
-                "cart" | "crt" | "cartridge" => "cartridge",
-                "disk" | "drive8" | "8" => "drive8",
-                other => return Some(monitor_text(req, &format!(
+            let lower = arg.to_ascii_lowercase();
+            // Spec 871 — `eject 9` / `eject drive9`: the disk in the drive at that unit.
+            let unit = lower.strip_prefix("drive").unwrap_or(&lower).parse::<u8>().ok();
+            let role = match (lower.as_str(), unit) {
+                ("" | "auto", _) => "auto".to_string(),
+                ("cart" | "crt" | "cartridge", _) => "cartridge".to_string(),
+                ("disk", _) => "drive8".to_string(),
+                (_, Some(u)) => format!("drive{u}"),
+                (other, None) => return Some(monitor_text(req, &format!(
                     "eject: unknown target '{other}' — use `eject cart`, `eject disk`, \
-                     or `eject` for whatever is actually in the machine."))),
+                     `eject 9` for the drive at a unit, or `eject` for whatever is \
+                     actually in the machine."))),
             };
             ("media/unmount", json!({ "role": role }), "EJECT".to_string())
         }
-        "drive" => ("session/drive_status", json!({}), "DRIVE 8".to_string()),
+        // Spec 871 — `drive [unit]`, `drivepower [unit] [on|off]`: the drive at that unit.
+        "drive" => {
+            let unit = rest.first().and_then(|u| u.trim_start_matches("drive").parse::<u64>().ok()).unwrap_or(8);
+            ("session/drive_status", json!({ "unit": unit }), format!("DRIVE {unit}"))
+        }
         "cart" => ("session/cart_status", json!({}), "CARTRIDGE".to_string()),
-        "drivepower" => ("session/drive_power", json!({}), "DRIVE 8 POWER".to_string()),
+        "drivepower" => {
+            let unit = rest.iter().find_map(|u| u.trim_start_matches("drive").parse::<u64>().ok()).unwrap_or(8);
+            let mut p = json!({ "unit": unit });
+            match rest.iter().map(|t| t.to_ascii_lowercase()).find(|t| t == "on" || t == "off").as_deref() {
+                Some("on") => p["on"] = json!(true),
+                Some("off") => p["on"] = json!(false),
+                _ => {}
+            }
+            ("session/drive_power", p, format!("DRIVE {unit} POWER"))
+        }
         "recent" => ("media/recent", json!({}), "RECENT MEDIA".to_string()),
         "tracering" => {
             let parse = |s: &str| -> Option<u64> {
@@ -6548,6 +6568,14 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 st.session.machine.drive8.detach_disk();
                 st.session.disk_path = String::new();
             }
+            // Spec 871 — and the disk in drive position B. B itself (power, jumpers) is
+            // machine configuration and stays, like the profile.
+            if st.session.machine.drive_b.get_attached_disk().is_some() {
+                if let Some(p) = persist_outgoing_disk_at(&mut st, DrivePosition::B) {
+                    persisted["diskB"] = json!(p);
+                }
+                st.session.machine.drive_b.detach_disk();
+            }
             let cart_path = st.session.cart_path.clone();
             if !cart_path.is_empty() {
                 if let Some(p) = persist_cart_for_eject(&mut st, &cart_path) {
@@ -6557,6 +6585,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             do_power_off(&mut st);
             st.session.clear_inserted_cart();
             st.session.inserted_disk = None;
+            st.session.inserted_disk_b = None;
             // 3) What belonged to the old project's session. Machine configuration — the
             //    profile, the speed table, an attached REU, trace definitions, pacing,
             //    streaming — is not project state and stays.
@@ -6919,6 +6948,13 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             // frame — which is how the input loop ended up competing with the
             // emulation thread (BUG-044). Taken first, before the read borrows.
             let drive_json = drive_status_json(&mut st);
+            // Spec 871 — position B's panel, when it is on, under its unit.
+            let drive_b_json = if st.session.machine.drive_b.powered() {
+                let unit = st.session.machine.drive_b.unit();
+                Some((format!("drive{unit}"), drive_status_json_at(&mut st, DrivePosition::B)))
+            } else {
+                None
+            };
             let cart_json_live = cart_status_json(&mut st);
             let st = st;
             // Spec 771.2 — report the REAL run/pause state + last stop reason (was
@@ -7068,6 +7104,11 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             // says what those devices are DOING right now — the LED, the head, the
             // bank. Two different questions, and a panel needs the second one.
             state_json["device"] = json!({ "drive8": drive_json, "cart": cart_json_live });
+            if let Some((key, panel)) = drive_b_json {
+                state_json["device"][key] = panel;
+            }
+            // Spec 871 — both drive positions: unit, power, disk.
+            state_json["drives"] = drives_json(&st);
             Response::ok(id, state_json)
         }
 
@@ -7390,8 +7431,17 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
         // (ws-server.ts:1499). Composed by `drive_status_json`, which `session/state`
         // uses too, so no client has to take the lock twice to draw one panel.
         "session/drive_status" => {
+            // Spec 871 — `unit` (default 8) picks the drive.
+            let unit = match unit_param(&req.params) {
+                Ok(u) => u,
+                Err(e) => return Response::err(id, -32602, format!("session/drive_status: {e}")),
+            };
             let mut st = state.lock().unwrap();
-            Response::ok(id, drive_status_json(&mut st))
+            let pos = match drive_position(&st, unit) {
+                Ok(p) => p,
+                Err(e) => return Response::err(id, -32602, format!("session/drive_status: {e}")),
+            };
+            Response::ok(id, drive_status_json_at(&mut st, pos))
         }
 
         // session/cart_status — live cartridge status (ws-server.ts:1581). Returns
@@ -7411,13 +7461,82 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
         // press = cold reset of the drive 6502 (DOS re-runs power-on init).
         // Parity: TS includes "mode" only when reinitialized=true (success path).
         // TRX64 has no fallback, so always reinitialized=true + mode.
+        //
+        // Spec 871 — `unit` (default 8) addresses the drive. With `on` it switches that
+        // drive's power (Spec 870 D1): on is refused, naming the other position, when a
+        // powered drive already answers to the unit it would come up at. Without `on`
+        // it is the cold re-init it always was.
         "session/drive_power" => {
+            let unit = match unit_param(&req.params) {
+                Ok(u) => u,
+                Err(e) => return Response::err(id, -32602, format!("session/drive_power: {e}")),
+            };
             let mut st = state.lock().unwrap();
-            st.session.machine.drive8.cold_reset();
+            let pos = match drive_position(&st, unit) {
+                Ok(p) => p,
+                Err(e) => return Response::err(id, -32602, format!("session/drive_power: {e}")),
+            };
+            match req.params.get("on").and_then(|v| v.as_bool()) {
+                Some(on) => {
+                    if let Err(e) = st.session.machine.set_drive_power(pos, on) {
+                        return Response::err(id, -32602, format!("session/drive_power: {e}"));
+                    }
+                    let d = st.session.machine.drive(pos);
+                    Response::ok(id, json!({
+                        "device": if d.powered() { d.unit() } else { d.unit_jumpers() },
+                        "powered": d.powered(),
+                    }))
+                }
+                None => {
+                    // Exactly the re-init it was for drive 8 (`cold_reset`, which also
+                    // leaves the mechanism empty), now for the drive at `unit`.
+                    st.session.machine.drive_mut(pos).cold_reset();
+                    st.session.machine.sync_drive_slots();
+                    Response::ok(id, json!({
+                        "device": unit,
+                        "reinitialized": true,
+                        "mode": "trx64"
+                    }))
+                }
+            }
+        }
+
+        // Spec 871 — set the device-ID jumpers of the drive at `unit` to `to` (8-11,
+        // Spec 870 D4: read by its DOS at its next reset or power-on). Refused, naming
+        // the other position, when the other drive position already answers to `to` —
+        // on the wire a drive is addressed by its unit, so two positions may not share
+        // one even while one of them is off.
+        "session/drive_unit" => {
+            let unit = match unit_param(&req.params) {
+                Ok(u) => u,
+                Err(e) => return Response::err(id, -32602, format!("session/drive_unit: {e}")),
+            };
+            let Some(to) = req.params.get("to").and_then(|v| v.as_u64()) else {
+                return Response::err(id, -32602, "session/drive_unit: missing `to` (8-11)");
+            };
+            let mut st = state.lock().unwrap();
+            let pos = match drive_position(&st, unit) {
+                Ok(p) => p,
+                Err(e) => return Response::err(id, -32602, format!("session/drive_unit: {e}")),
+            };
+            let other = if pos == DrivePosition::A { DrivePosition::B } else { DrivePosition::A };
+            let od = st.session.machine.drive(other);
+            let other_unit = if od.powered() { od.unit() } else { od.unit_jumpers() };
+            if other_unit as u64 == to {
+                return Response::err(id, -32602, format!(
+                    "session/drive_unit: drive position {} cannot answer to unit {to}: position {} is at unit {to}",
+                    pos.name(), other.name()
+                ));
+            }
+            let to = to.min(255) as u8;
+            if let Err(e) = st.session.machine.set_drive_unit(pos, to) {
+                return Response::err(id, -32602, format!("session/drive_unit: {e}"));
+            }
+            let d = st.session.machine.drive(pos);
             Response::ok(id, json!({
-                "device": 8,
-                "reinitialized": true,
-                "mode": "trx64"
+                "device": d.unit(),
+                "jumpers": d.unit_jumpers(),
+                "inForce": d.unit() == d.unit_jumpers(),
             }))
         }
 
@@ -7563,14 +7682,27 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 let lens = r.get("lens").and_then(|v| v.as_str()).unwrap_or("cpu");
                 // Spec 804 — `space: "drive8"` reads the 1541's address space (a peek,
                 // like the monitor's `m` under `device drive8`). The drive has no lens.
-                let drive = r.get("space").and_then(|v| v.as_str()) == Some("drive8");
+                // Spec 871 — `drive9` (… `drive11`) reads the drive at that unit; `drive8`
+                // is the one at 8, and position A as it always was when nothing is there.
+                let space = r.get("space").and_then(|v| v.as_str()).unwrap_or("");
+                let drive_pos = match space.strip_prefix("drive").and_then(|u| u.parse::<u8>().ok()) {
+                    None => None,
+                    Some(unit) => match st.session.machine.position_at_unit(unit) {
+                        Some(p) => Some(p),
+                        None if unit == 8 => Some(DrivePosition::A),
+                        None => return Response::err(id, -32602, format!(
+                            "session/read_memory: no powered drive at unit {unit}"
+                        )),
+                    },
+                };
+                let drive = drive_pos.is_some();
                 let mut bytes = Vec::with_capacity(len as usize);
                 for i in 0..len {
                     // Wraps at $FFFF like the 6510 does, rather than truncating the
                     // range and silently answering something shorter.
                     let a = addr.wrapping_add((i & 0xffff) as u16);
-                    bytes.push(if drive {
-                        st.session.machine.drive8.drive_peek(a)
+                    bytes.push(if let Some(pos) = drive_pos {
+                        st.session.machine.drive(pos).drive_peek(a)
                     } else {
                         st.session.machine.peek_lens(a, lens)
                     });
@@ -7582,7 +7714,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                     "bytes": base64_encode(&bytes),
                 });
                 if drive {
-                    chunk["space"] = json!("drive8");
+                    chunk["space"] = json!(space);
                     chunk["lens"] = Value::Null;
                 }
                 chunks.push(chunk);
@@ -8988,11 +9120,14 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             let resume_if_running = req.params.get("resumeIfRunning").and_then(|v| v.as_bool())
                 .unwrap_or(kind == "crt");
 
-            // --- drive9 hard reject (v1 drive8-only), ingress.ts:96-100 ---
-            let slot = req.params.get("slot").and_then(|v| v.as_u64());
-            if role == "drive9" || role == "9" || slot == Some(9) {
-                return Response::err(id, -32602, "media-ingress: drive 9 is not supported in v1 (drive8-only). Request rejected, not registered.");
-            }
+            // Spec 871 — the drive a disk op addresses, by unit (`unit`, a `slot` of 8-11,
+            // or a `driveN` role; 8 by default). The v1 drive-9 refusal is gone: the
+            // machine has a second drive position.
+            let is_drive_role = role.starts_with("drive") || role.parse::<u8>().is_ok();
+            let unit = match unit_param(&req.params) {
+                Ok(u) => u,
+                Err(e) => return Response::err(id, -32602, format!("media-ingress: {e}")),
+            };
 
             // --- resolve bytes up-front for non-eject (the .c64re guard reads them),
             //     ingress.ts:102-109 + buildIngressRequest byte resolution ---
@@ -9050,8 +9185,18 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 }));
             }
 
+            // Spec 871 — the position the unit names, for a disk or a drive eject.
+            let pos = if kind == "disk" || (kind == "eject" && is_drive_role) {
+                match drive_position(&st, unit) {
+                    Ok(p) => p,
+                    Err(e) => return Response::err(id, -32602, format!("media-ingress: {e}")),
+                }
+            } else {
+                DrivePosition::A
+            };
             // --- mediaPresent + needBefore + checkpoint-before, ingress.ts:145-152 ---
             let media_present = st.session.machine.drive8.get_attached_disk().is_some()
+                || st.session.machine.drive_b.get_attached_disk().is_some()
                 || st.session.machine.cartridge.is_some();
             let need_before = was_running || media_present;
             let before_id = if need_before { capture_media_checkpoint(&mut st) } else { None };
@@ -9076,18 +9221,24 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                         sha256 = Some(sha256_hex(&bytes));
                         let backing_path = path.clone();
                         let disk_kind = if fmt == "g64" { DiskKind::G64 } else { DiskKind::D64 };
-                        st.session.machine.drive8.attach_disk(DiskImage {
+                        st.session.machine.drive_mut(pos).attach_disk(DiskImage {
                             kind: disk_kind, bytes, backing_path: backing_path.clone(), read_only: false,
                         });
-                        st.session.disk_path = path.clone().unwrap_or_default();
+                        if pos == DrivePosition::A {
+                            st.session.disk_path = path.clone().unwrap_or_default();
+                        }
+                        detail.insert("unit".to_string(), json!(unit));
                         detail.insert("name".to_string(), json!(disk_name));
                         if let Some(ref bp) = backing_path { detail.insert("backingPath".to_string(), json!(bp)); }
                         None
                     }
                     "eject" => {
-                        if role == "drive8" {
-                            st.session.machine.drive8.detach_disk();
-                            st.session.disk_path = String::new();
+                        if is_drive_role {
+                            st.session.machine.drive_mut(pos).detach_disk();
+                            if pos == DrivePosition::A {
+                                st.session.disk_path = String::new();
+                            }
+                            detail.insert("unit".to_string(), json!(unit));
                         } else {
                             // BUG-023-cart / Spec 742 — write programmed flash back to the
                             // host .crt BEFORE detaching (ingress.ts:190-204).
@@ -9240,9 +9391,12 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             // eject; slot 9 rejected; else drive8. The old handler ignored slot and
             // ALWAYS ejected drive8, so the UI's ejectSlot(0) removed the disk instead
             // of the cartridge (and the cart never came out).
-            if slot == Some(9) {
-                return Response::err(id, -32602, "media/unmount: drive 9 not supported (v1 drive8-only)");
-            }
+            // Spec 871 — a disk eject addresses a drive by unit (`unit`, slot 8-11, or a
+            // `driveN` role; 8 by default). The v1 drive-9 refusal is gone.
+            let unit = match unit_param(&req.params) {
+                Ok(u) => u,
+                Err(e) => return Response::err(id, -32602, format!("media/unmount: {e}")),
+            };
             let mut st = state.lock().unwrap();
             // CLI-FEEL S7 — the cockpit `/eject` sends role:"auto" (it can't know what's
             // mounted without a round-trip); resolve it HERE against the live machine so
@@ -9254,7 +9408,16 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             } else {
                 role_param == Some("cartridge") || slot == Some(0)
             };
-            let role = if is_cart { "cartridge" } else { "drive8" };
+            let pos = if is_cart {
+                DrivePosition::A
+            } else {
+                match drive_position(&st, unit) {
+                    Ok(p) => p,
+                    Err(e) => return Response::err(id, -32602, format!("media/unmount: {e}")),
+                }
+            };
+            let drive_role = format!("drive{unit}");
+            let role = if is_cart { "cartridge" } else { drive_role.as_str() };
             let was_running = st.session.running;
             // audit ws-media-0 — eject also routes through the ingress boundary
             // (= ingestMedia kind:eject, ingress.ts:185): dirty-media guard +
@@ -9290,9 +9453,11 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 // Persist the outgoing disk's dirty writes to its host file BEFORE
                 // detach (the data-loss fix — detach_disk only flushes into disk.bytes,
                 // not the host file). Then detach.
-                persisted_outgoing = persist_outgoing_disk(&mut st);
-                st.session.machine.drive8.detach_disk();
-                st.session.disk_path = String::new();
+                persisted_outgoing = persist_outgoing_disk_at(&mut st, pos);
+                st.session.machine.drive_mut(pos).detach_disk();
+                if pos == DrivePosition::A {
+                    st.session.disk_path = String::new();
+                }
             }
             let after_id = if is_cart { None } else { capture_media_checkpoint(&mut st) };
             if let Some(ref b) = before_id { st.checkpoint_ring.pin(b); }
@@ -9497,7 +9662,16 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 read_only: false,
             };
 
+            // Spec 871 — which drive, by unit (default 8).
+            let unit = match unit_param(&req.params) {
+                Ok(u) => u,
+                Err(e) => return Response::err(id, -32602, format!("media/mount: {e}")),
+            };
             let mut st = state.lock().unwrap();
+            let pos = match drive_position(&st, unit) {
+                Ok(p) => p,
+                Err(e) => return Response::err(id, -32602, format!("media/mount: {e}")),
+            };
             // audit ws-media-0 — route the disk mount through the ingress boundary
             // (= ingestMedia, ingress.ts:91), NOT a bare drive8.attach_disk:
             //  1. dirty-media guard (Spec 709.13) — no branching intervention while a
@@ -9514,13 +9688,14 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 ));
             }
             let media_present = st.session.machine.drive8.get_attached_disk().is_some()
+                || st.session.machine.drive_b.get_attached_disk().is_some()
                 || st.session.machine.cartridge.is_some();
             let before_id = if media_present { capture_media_checkpoint(&mut st) } else { None };
             // audit ws-media-8 — record the mounted disk in the recents store (newest-
             // first, cap 10, mountedAt), 1:1 with TS addRecent (recent-files.ts) on
             // every ingest, so media/recent overlays it ahead of the dir scan.
             add_recent_media(&mut st, &path_str, format_str);
-            let persisted_outgoing = mount_disk_media(&mut st, image, &path_str);
+            let persisted_outgoing = mount_disk_media_at(&mut st, pos, image, &path_str);
             let after_id = capture_media_checkpoint(&mut st);
             if let Some(ref b) = before_id { st.checkpoint_ring.pin(b); }
             if let Some(ref a) = after_id { st.checkpoint_ring.pin(a); }
@@ -9529,7 +9704,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             let event = json!({
                 "cycle": cycle,
                 "operation": "disk",
-                "role": "drive8",
+                "role": format!("drive{unit}"),
                 "format": format_str,
                 "sha256": sha256,
                 "resetPolicy": null,
@@ -9551,7 +9726,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             Response::ok(id, json!({
                 "mountedPath": path_str,
                 "type": format_str,
-                "slot": 8u64,
+                "slot": unit as u64,
                 "sha256": sha256,
                 "event": event,
                 "detail": detail,
@@ -9654,7 +9829,16 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 read_only: false,
             };
 
+            // Spec 871 — which drive, by unit (default 8).
+            let unit = match unit_param(&req.params) {
+                Ok(u) => u,
+                Err(e) => return Response::err(id, -32602, format!("media/swap: {e}")),
+            };
             let mut st = state.lock().unwrap();
+            let pos = match drive_position(&st, unit) {
+                Ok(p) => p,
+                Err(e) => return Response::err(id, -32602, format!("media/swap: {e}")),
+            };
             // audit ws-media-0 — route the disk mount through the ingress boundary
             // (= ingestMedia, ingress.ts:91), NOT a bare drive8.attach_disk:
             //  1. dirty-media guard (Spec 709.13) — no branching intervention while a
@@ -9671,11 +9855,12 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 ));
             }
             let media_present = st.session.machine.drive8.get_attached_disk().is_some()
+                || st.session.machine.drive_b.get_attached_disk().is_some()
                 || st.session.machine.cartridge.is_some();
             let before_id = if media_present { capture_media_checkpoint(&mut st) } else { None };
             // audit ws-media-8 — record the swapped-in disk in the recents store.
             add_recent_media(&mut st, &path_str, format_str);
-            let persisted_outgoing = mount_disk_media(&mut st, image, &path_str);
+            let persisted_outgoing = mount_disk_media_at(&mut st, pos, image, &path_str);
             let after_id = capture_media_checkpoint(&mut st);
             if let Some(ref b) = before_id { st.checkpoint_ring.pin(b); }
             if let Some(ref a) = after_id { st.checkpoint_ring.pin(a); }
@@ -9684,7 +9869,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             let event = json!({
                 "cycle": cycle,
                 "operation": "disk",
-                "role": "drive8",
+                "role": format!("drive{unit}"),
                 "format": format_str,
                 "sha256": sha256,
                 "resetPolicy": null,
@@ -9706,7 +9891,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             Response::ok(id, json!({
                 "mountedPath": path_str,
                 "type": format_str,
-                "slot": 8u64,
+                "slot": unit as u64,
                 "sha256": sha256,
                 "event": event,
                 "detail": detail,
@@ -9774,12 +9959,21 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 }
             }
 
+            // Spec 871 — the drive whose disk is persisted, by unit (default 8).
+            let unit = match unit_param(&req.params) {
+                Ok(u) => u,
+                Err(e) => return Response::err(id, -32602, format!("media/persist: {e}")),
+            };
             let mut st = state.lock().unwrap();
+            let pos = match drive_position(&st, unit) {
+                Ok(p) => p,
+                Err(e) => return Response::err(id, -32602, format!("media/persist: {e}")),
+            };
             // Flush any in-flight drive write (dirty GCR track) back into
             // disk.bytes before persisting — 1:1 with VICE flushing
             // drive_gcr_data_writeback_all before reading fsimage->fd.
-            st.session.machine.drive8.flush_disk_writeback();
-            let result = match st.session.machine.drive8.get_attached_disk() {
+            st.session.machine.drive_mut(pos).flush_disk_writeback();
+            let result = match st.session.machine.drive(pos).get_attached_disk() {
                 None => {
                     Ok(json!({ "written": false, "reason": "no backing path or not mounted" }))
                 }
@@ -12925,11 +13119,16 @@ fn persist_cart_for_eject(st: &mut State, backing_path: &str) -> Option<String> 
 /// is skipped (no write). Returns the written path on a real write so the caller
 /// can stamp `detail["diskPersisted"]`.
 fn persist_outgoing_disk(st: &mut State) -> Option<String> {
+    persist_outgoing_disk_at(st, DrivePosition::A)
+}
+
+/// [`persist_outgoing_disk`] for the drive in `pos` (Spec 871).
+fn persist_outgoing_disk_at(st: &mut State, pos: DrivePosition) -> Option<String> {
     // Flush any pending dirty GCR track into `disk.bytes` first (= VICE
     // `drive_gcr_data_writeback_all` before reading `fsimage->fd`). Cheap no-op
     // when nothing is dirty.
-    st.session.machine.drive8.flush_disk_writeback();
-    let disk = st.session.machine.drive8.get_attached_disk()?;
+    st.session.machine.drive_mut(pos).flush_disk_writeback();
+    let disk = st.session.machine.drive(pos).get_attached_disk()?;
     if disk.read_only {
         return None; // never overwrite a read-only image (mount-disk-media.ts:52)
     }
@@ -12970,13 +13169,19 @@ fn persist_outgoing_disk(st: &mut State) -> Option<String> {
 /// `&mut` because the LED read-out consumes its accumulator — the honest answer is
 /// "how busy since you last asked".
 fn drive_status_json(st: &mut State) -> Value {
+    drive_status_json_at(st, DrivePosition::A)
+}
+
+/// [`drive_status_json`] for the drive in `pos` (Spec 871). `device` is the unit it
+/// answers to; `powered` says whether it is on at all.
+fn drive_status_json_at(st: &mut State, pos: DrivePosition) -> Value {
     use trx64_core::rotation::BRA_MOTOR_ON;
-    let drive_clk = st.session.machine.drive8.drive_clk;
-    let led_on = st.session.machine.drive8.led_on();
-    let led_pwm = st.session.machine.drive8.rotation.led_pwm(drive_clk, led_on) as u64;
+    let drive_clk = st.session.machine.drive(pos).drive_clk;
+    let led_on = st.session.machine.drive(pos).led_on();
+    let led_pwm = st.session.machine.drive_mut(pos).rotation.led_pwm(drive_clk, led_on) as u64;
 
     let m = &st.session.machine;
-    let drv = &m.drive8;
+    let drv = m.drive(pos);
     let half_track = (drv.rotation.current_half_track & 0xff) as u64;
     let track = half_track / 2;
     // T2.3 — sector under the GCR read head (ws-server.ts:1519-1524):
@@ -13005,7 +13210,8 @@ fn drive_status_json(st: &mut State) -> Value {
         "custom"
     };
     json!({
-        "device": 8,
+        "device": drv.unit(),
+        "powered": drv.powered(),
         "ledOn": led_on,
         "ledFlashing": false,
         "ledPwm": led_pwm,
@@ -13100,19 +13306,80 @@ fn cart_status_json(st: &mut State) -> Value {
     })
 }
 
-fn mount_disk_media(st: &mut State, image: DiskImage, new_path: &str) -> Option<String> {
+/// THE single disk-media attach (Spec 742 / BUG-023, see the note above
+/// `drive_status_json`), into the drive in `pos` (Spec 871). The session's `disk_path`
+/// is position A's; B's medium is known by the image's own backing path.
+fn mount_disk_media_at(st: &mut State, pos: DrivePosition, image: DiskImage, new_path: &str) -> Option<String> {
     // Implicit eject: persist + detach the outgoing disk first (mount-disk-media.ts:
     // 77-82). Only when a disk is actually attached (first mount → None).
-    let persisted_outgoing = if st.session.machine.drive8.get_attached_disk().is_some() {
-        let p = persist_outgoing_disk(st);
-        st.session.machine.drive8.detach_disk();
+    let persisted_outgoing = if st.session.machine.drive(pos).get_attached_disk().is_some() {
+        let p = persist_outgoing_disk_at(st, pos);
+        st.session.machine.drive_mut(pos).detach_disk();
         p
     } else {
         None
     };
-    st.session.machine.drive8.attach_disk(image);
-    st.session.disk_path = new_path.to_string();
+    st.session.machine.drive_mut(pos).attach_disk(image);
+    if pos == DrivePosition::A {
+        st.session.disk_path = new_path.to_string();
+    }
     persisted_outgoing
+}
+
+/// Spec 871 — the drive unit a request addresses: `unit`, else a `slot` of 8-11, else a
+/// `role` of `drive<N>` (or a bare number); 8 when none says. Units, not positions, are
+/// what the wire carries (§8): a user types `LOAD"$",9`.
+fn unit_param(params: &Value) -> Result<u8, String> {
+    let from_role = |r: &str| -> Option<u64> { r.strip_prefix("drive").unwrap_or(r).parse().ok() };
+    let unit = params
+        .get("unit")
+        .and_then(|v| v.as_u64())
+        .or_else(|| params.get("slot").and_then(|v| v.as_u64()).filter(|s| (8..=11).contains(s)))
+        .or_else(|| params.get("role").and_then(|v| v.as_str()).and_then(from_role))
+        .unwrap_or(8);
+    if (8..=11).contains(&unit) {
+        Ok(unit as u8)
+    } else {
+        Err(format!("unit {unit}: a drive answers to 8-11"))
+    }
+}
+
+/// Spec 871 — the drive position at `unit`: the powered drive answering there, else a
+/// drive that is off with its jumpers there (a disk may go into a switched-off drive).
+fn drive_position(st: &State, unit: u8) -> Result<DrivePosition, String> {
+    st.session
+        .machine
+        .position_for_media(unit)
+        .ok_or_else(|| format!("no drive at unit {unit}"))
+}
+
+/// Spec 871 — one line per drive position for `session/state`: the unit it answers to
+/// (its jumpers while off), whether it is powered, and what disk is in it.
+fn drives_json(st: &State) -> Value {
+    let m = &st.session.machine;
+    let list: Vec<Value> = [DrivePosition::A, DrivePosition::B]
+        .into_iter()
+        .map(|pos| {
+            let d = m.drive(pos);
+            let path = d
+                .get_attached_disk()
+                .map(|disk| {
+                    disk.backing_path
+                        .clone()
+                        .filter(|p| !p.is_empty())
+                        .unwrap_or_else(|| if pos == DrivePosition::A { st.session.disk_path.clone() } else { String::new() })
+                });
+            json!({
+                "unit": if d.powered() { d.unit() } else { d.unit_jumpers() },
+                "powered": d.powered(),
+                "disk": match path {
+                    None => Value::Null,
+                    Some(p) => json!({ "path": p }),
+                },
+            })
+        })
+        .collect();
+    Value::Array(list)
 }
 
 /// Spec 709.13 — capture a real before/after checkpoint into the ring and return
@@ -13268,23 +13535,54 @@ pub(crate) fn stream_maybe_autopersist_cart(st: &mut State, now_ms: u64) {
 /// pause still reaches the host file (audit ws-media-3); content-hash gen (no
 /// diskWriteGen facade in TRX64). Called EVERY stream-loop iteration (running or paused).
 pub(crate) fn stream_maybe_autopersist_disk(st: &mut State, now_ms: u64) {
+    let mut ap = DiskAutoPersist {
+        pending: st.disk_ap_pending,
+        settle_at_ms: st.disk_ap_settle_at_ms,
+        seen_hash: st.disk_ap_seen_hash.take(),
+        done_hash: st.disk_ap_done_hash.take(),
+    };
+    autopersist_disk_at(st, DrivePosition::A, &mut ap, now_ms);
+    st.disk_ap_pending = ap.pending;
+    st.disk_ap_settle_at_ms = ap.settle_at_ms;
+    st.disk_ap_seen_hash = ap.seen_hash;
+    st.disk_ap_done_hash = ap.done_hash;
+    // Spec 871 — drive position B's disk, the same way. Nothing to do while B has
+    // no disk: the flush below is a flag test.
+    if st.session.machine.drive_b.disk.is_some() || st.disk_ap_b.pending {
+        let mut ap = std::mem::take(&mut st.disk_ap_b);
+        autopersist_disk_at(st, DrivePosition::B, &mut ap, now_ms);
+        st.disk_ap_b = ap;
+    }
+}
+
+/// The settle/done bookkeeping of the lazy host-file write for one drive's disk.
+#[derive(Default, Clone, Debug)]
+pub(crate) struct DiskAutoPersist {
+    pending: bool,
+    settle_at_ms: u64,
+    seen_hash: Option<String>,
+    done_hash: Option<String>,
+}
+
+/// [`stream_maybe_autopersist_disk`] for the disk in drive position `pos`.
+fn autopersist_disk_at(st: &mut State, pos: DrivePosition, ap: &mut DiskAutoPersist, now_ms: u64) {
     // Cheap gate: flush any pending dirty GCR track into `disk.bytes` (VICE
     // drive_gcr_data_writeback_all → fsimage->fd). Returns true ONCE per dirty
     // burst — that arms the debounce; the flag then drops, so on later frames the
     // flush is a no-op but we keep debouncing on the now-stable `disk.bytes`.
-    if st.session.machine.drive8.flush_disk_writeback() {
-        st.disk_ap_pending = true;
+    if st.session.machine.drive_mut(pos).flush_disk_writeback() {
+        ap.pending = true;
     }
     // Nothing armed → no drive write has happened → no host I/O (true no-op for a
     // clean, never-written disk: no hash, no fs::write).
-    if !st.disk_ap_pending {
+    if !ap.pending {
         return;
     }
     // Confirm writable + path-backed (the persist guards). A non-writable target
     // (no disk / read-only / no backing path) disarms — the dirty track already
     // mirrored into disk.bytes (it rides the .c64re/ring), it just can't lazily
     // reach a host file. Read metadata under the borrow, then drop.
-    let target = match st.session.machine.drive8.get_attached_disk() {
+    let target = match st.session.machine.drive_mut(pos).get_attached_disk() {
         None => None,
         Some(d) if d.read_only => None,
         Some(d) => match &d.backing_path {
@@ -13295,33 +13593,33 @@ pub(crate) fn stream_maybe_autopersist_disk(st: &mut State, now_ms: u64) {
     let (backing_path, hash) = match target {
         Some(t) => t,
         None => {
-            st.disk_ap_pending = false; // can't lazily write a host file here
+            ap.pending = false; // can't lazily write a host file here
             return;
         }
     };
     // Content-hash gen: changed since last poll → re-arm the settle window (a SAVE
     // is a burst of track writes; coalesce them into one host write).
-    if Some(&hash) != st.disk_ap_seen_hash.as_ref() {
-        st.disk_ap_seen_hash = Some(hash);
-        st.disk_ap_settle_at_ms = now_ms;
+    if Some(&hash) != ap.seen_hash.as_ref() {
+        ap.seen_hash = Some(hash);
+        ap.settle_at_ms = now_ms;
         return;
     }
-    if Some(&hash) == st.disk_ap_done_hash.as_ref() {
+    if Some(&hash) == ap.done_hash.as_ref() {
         return; // already written
     }
-    if now_ms.saturating_sub(st.disk_ap_settle_at_ms) < DISK_AUTOPERSIST_DEBOUNCE_MS {
+    if now_ms.saturating_sub(ap.settle_at_ms) < DISK_AUTOPERSIST_DEBOUNCE_MS {
         return;
     }
     // Settled → write the host disk file (= media/persist disk branch, minus the
     // response envelope). Snapshot the bytes, drop the borrow before the I/O.
-    let bytes = match st.session.machine.drive8.get_attached_disk() {
+    let bytes = match st.session.machine.drive_mut(pos).get_attached_disk() {
         Some(d) => d.bytes.clone(),
         None => return,
     };
     match std::fs::write(&backing_path, &bytes) {
         Ok(()) => {
-            st.disk_ap_done_hash = Some(hash);
-            st.disk_ap_pending = false; // settled + written; re-armed on the next drive write
+            ap.done_hash = Some(hash);
+            ap.pending = false; // settled + written; re-armed on the next drive write
             let session_id = st.session.id.clone();
             st.notify.broadcast(
                 "media/disk_persisted",
@@ -16546,6 +16844,7 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         disk_ap_settle_at_ms: 0,
         disk_ap_seen_hash: None,
         disk_ap_done_hash: None,
+        disk_ap_b: DiskAutoPersist::default(),
         autocapture_frames_since: 0,
         autocapture_cycles_since: 0,
         warp: false,
@@ -17223,6 +17522,7 @@ mod batch1_tests {
             disk_ap_settle_at_ms: 0,
             disk_ap_seen_hash: None,
             disk_ap_done_hash: None,
+            disk_ap_b: DiskAutoPersist::default(),
             autocapture_frames_since: 0,
             autocapture_cycles_since: 0,
             warp: false,
@@ -22867,5 +23167,139 @@ mod batch1_tests {
         assert_eq!((e["kind"].clone(), e["detail"]["name"].clone()), (json!("model"), json!("c64-ntsc")));
         assert_eq!(e["method"], json!("monitor/exec"));
         assert_eq!(e["detail"]["atPowerOn"], json!(true), "it becomes that model at its next power-on");
+    }
+
+    // ── Spec 871 — a second drive on the bus: the wire addresses drives by unit ──────
+
+    /// A formatted, empty D64 whose disk name is `name` — enough for the DOS to list.
+    fn named_d64(name: &[u8]) -> Vec<u8> {
+        let spt = |t: usize| match t { 1..=17 => 21, 18..=24 => 19, 25..=30 => 18, _ => 17 };
+        let mut d = vec![0u8; 174_848];
+        let bam: usize = (1..18).map(spt).sum::<usize>() * 256;
+        d[bam] = 18;
+        d[bam + 1] = 1;
+        d[bam + 2] = 0x41;
+        for t in 1..=35usize {
+            let n = spt(t);
+            let used: u32 = if t == 18 { 0b11 } else { 0 };
+            let free: u32 = ((1u32 << n) - 1) & !used;
+            let e = bam + 4 + (t - 1) * 4;
+            d[e] = free.count_ones() as u8;
+            d[e + 1] = free as u8;
+            d[e + 2] = (free >> 8) as u8;
+            d[e + 3] = (free >> 16) as u8;
+        }
+        for i in 0..16 {
+            d[bam + 0x90 + i] = *name.get(i).unwrap_or(&0xa0);
+        }
+        d[bam + 256 + 1] = 0xff;
+        d
+    }
+
+    /// Booted, with drive position B switched on at 9 and given time for its DOS to
+    /// reach its idle loop (a 1541 needs about a second from power-on).
+    fn booted_with_drive_nine() -> Option<SharedState> {
+        let st = booted_state()?;
+        let r = call(&st, "session/drive_power", json!({ "unit": 9, "on": true }));
+        assert_eq!((r["device"].clone(), r["powered"].clone()), (json!(9), json!(true)));
+        run_cycle_budget(&mut st.lock().unwrap().session, 2_000_000);
+        Some(st)
+    }
+
+    #[test]
+    fn a_disk_goes_into_the_drive_at_the_unit_the_wire_names() {
+        let Some(st) = booted_with_drive_nine() else { return };
+        let dir = std::env::temp_dir().join(format!("trx64-871-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (p8, p9) = (dir.join("eight.d64"), dir.join("nine.d64"));
+        std::fs::write(&p8, named_d64(b"EIGHT")).unwrap();
+        std::fs::write(&p9, named_d64(b"NINE")).unwrap();
+
+        // The v1 refusal is gone: role drive9 is a disk for unit 9.
+        call(&st, "media/ingress", json!({ "kind": "disk", "path": p9.to_str().unwrap(), "role": "drive9" }));
+        call(&st, "media/mount", json!({ "path": p8.to_str().unwrap() }));
+        {
+            let g = st.lock().unwrap();
+            let m = &g.session.machine;
+            assert_eq!(m.drive_b.get_attached_disk().and_then(|d| d.backing_path.clone()).as_deref(), p9.to_str());
+            assert_eq!(m.drive8.get_attached_disk().and_then(|d| d.backing_path.clone()).as_deref(), p8.to_str());
+        }
+        let state = call(&st, "session/state", json!({}));
+        assert_eq!(state["drives"][1]["unit"], json!(9));
+        assert_eq!(state["drives"][1]["powered"], json!(true));
+        assert_eq!(state["drives"][1]["disk"]["path"], json!(p9.to_str().unwrap()));
+        assert_eq!(state["device"]["drive9"]["device"], json!(9), "B's panel under its unit");
+        let s9 = call(&st, "session/drive_status", json!({ "unit": 9 }));
+        assert_eq!((s9["device"].clone(), s9["powered"].clone()), (json!(9), json!(true)));
+
+        // Persist and eject by unit: B's file, and only B's.
+        let before8 = std::fs::read(&p8).unwrap();
+        st.lock().unwrap().session.machine.drive_b.disk.as_mut().unwrap().bytes[0] = 0x55;
+        let r = call(&st, "media/persist", json!({ "unit": 9 }));
+        assert_eq!((r["written"].clone(), r["path"].clone()), (json!(true), json!(p9.to_str().unwrap())));
+        assert_eq!(std::fs::read(&p9).unwrap()[0], 0x55, "B's host file");
+        assert_eq!(std::fs::read(&p8).unwrap(), before8, "A's host file untouched");
+        let r = call(&st, "media/unmount", json!({ "unit": 9 }));
+        assert_eq!(r["detail"]["role"], json!("drive9"));
+        {
+            let g = st.lock().unwrap();
+            assert!(g.session.machine.drive_b.get_attached_disk().is_none(), "B ejected");
+            assert!(g.session.machine.drive8.get_attached_disk().is_some(), "A keeps its disk");
+        }
+        // A unit with no drive is refused by name.
+        let e = call_err(&st, "media/mount", json!({ "path": p9.to_str().unwrap(), "unit": 10 }));
+        assert!(e.message.contains("no drive at unit 10"), "{}", e.message);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_positions_at_one_unit_are_refused_naming_the_other() {
+        let Some(st) = booted_state() else { return };
+        // B is off with its jumpers at 9; moving them to 8 would put two drives at 8.
+        let e = call_err(&st, "session/drive_unit", json!({ "unit": 9, "to": 8 }));
+        assert!(e.message.contains("position A") && e.message.contains("unit 8"), "{}", e.message);
+        // Somewhere free is fine, and it is where B then comes up.
+        let r = call(&st, "session/drive_unit", json!({ "unit": 9, "to": 10 }));
+        assert_eq!(r["jumpers"], json!(10));
+        let r = call(&st, "session/drive_power", json!({ "unit": 10, "on": true }));
+        assert_eq!((r["device"].clone(), r["powered"].clone()), (json!(10), json!(true)));
+        // And A may not move onto B.
+        let e = call_err(&st, "session/drive_unit", json!({ "unit": 8, "to": 10 }));
+        assert!(e.message.contains("position B"), "{}", e.message);
+    }
+
+    #[test]
+    fn the_monitor_reaches_drive_nine() {
+        let Some(st) = booted_with_drive_nine() else { return };
+        let out = mon_exec(&st, "device");
+        assert!(out.contains("drive9"), "device offers drive 9: {out}");
+        mon_exec(&st, "device drive9");
+        let r = mon_exec(&st, "r");
+        assert!(r.contains("1541 (drive 9)"), "{r}");
+        mon_exec(&st, "device c64");
+        let d = mon_exec(&st, "drive 9");
+        assert!(d.contains("DRIVE 9"), "{d}");
+        mon_exec(&st, "drivepower 9 off");
+        assert!(!st.lock().unwrap().session.machine.drive_b.powered(), "drivepower 9 off");
+        let out = mon_exec(&st, "device");
+        assert!(!out.contains("drive9"), "an off drive is not offered: {out}");
+    }
+
+    #[test]
+    fn drive_nine_survives_a_power_cycle_of_the_c64() {
+        let Some(st) = booted_with_drive_nine() else { return };
+        st.lock().unwrap().session.machine.drive_b.attach_disk(trx64_core::drive::DiskImage {
+            kind: trx64_core::drive::DiskKind::D64,
+            bytes: named_d64(b"KEEP"),
+            backing_path: None,
+            read_only: false,
+        });
+        call(&st, "session/power", json!({ "op": "off" }));
+        call(&st, "session/power", json!({ "op": "on" }));
+        let g = st.lock().unwrap();
+        let b = &g.session.machine.drive_b;
+        assert!(b.powered() && b.unit() == 9, "B is on at 9 again");
+        assert!(b.get_attached_disk().is_some(), "with its disk");
+        assert_eq!((g.session.machine.iec.drive_slot, g.session.machine.iec.drive_slot_b), (Some(8), Some(9)));
     }
 }
