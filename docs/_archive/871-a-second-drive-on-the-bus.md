@@ -1,9 +1,9 @@
 # Spec 871 — A second drive on the bus
 
-**Status:** BUILT (on branch spec-871-second-drive, not merged)
+**Status:** MERGED (2026-09-23, v0.8.8)
 **Repos:** TRX64. C64RE: no change in this spec — its media tools keep addressing drive 8
 until a separate request asks for more.
-**Number:** 871 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`).
+**Number:** 871 (registry: `../../../C64ReverseEngineeringMCP/specs/README.md`).
 **Depends on:** Spec 870 (power, own reset, ROM from bytes, unit number). Without 870 a
 second drive would be a second copy of everything 870 fixes.
 **Origin:** the UE2 emulator, 2026-09-23. The U64 has two FPGA drives, A and B, each with

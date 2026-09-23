@@ -1,8 +1,8 @@
 # Spec 870 — The drive as a part: power, reset, ROM and unit number
 
-**Status:** BUILT (on branch spec-870-drive-as-a-part, not merged)
+**Status:** MERGED (2026-09-23, v0.8.8)
 **Repos:** TRX64 only. C64RE: no change.
-**Number:** 870 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`).
+**Number:** 870 (registry: `../../../C64ReverseEngineeringMCP/specs/README.md`).
 **Depends on:** the 1541 port (`drive.rs`, `iec.rs`, `viacore.rs`), Spec 850 (the hold a
 device can put on the machine), Spec 863 (the drive's sync factor per model).
 **Enables:** Spec 871 (a second drive on the bus). 1571 and 1581 get their own specs later.
