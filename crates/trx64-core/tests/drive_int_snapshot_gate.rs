@@ -448,3 +448,35 @@ fn a_capture_leaves_the_machine_it_describes_alone() {
         }
     }
 }
+
+// ── BUG-062: a drive whose motor has not run since power-on ─────────────────────
+
+/// Booted to READY with drive 8 empty, the disk inserted afterwards, and drive 8 never
+/// asked for anything: its DOS drove the motor pin low at its reset (`$F260`) while no
+/// disk was in. Captured there, restored, and then both machines type the same `LOAD` —
+/// the drive spins up for the first time after the restore. They must stay in lockstep.
+///
+/// Red before the fix (apart after frame 47): VIA2's port-B stores were skipped while
+/// the drive had no disk, so the DOS's "motor off" never reached the rotation, which
+/// kept its power-on "running" while the pin said off. The restore re-derived the motor
+/// from the pin (VICE's `undump_prb`), and the two machines disagreed on where the disk
+/// was. VICE never skips them: its drive is live with or without a disk.
+#[test]
+fn a_drive_that_never_spun_restores_cycle_for_cycle() {
+    need_roms!();
+    let img = disk_with_big_prg(60);
+    let mut m = Machine::new();
+    m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+    frames(&mut m, 130);
+    m.drive8.attach_disk(disk(img.clone()));
+    frames(&mut m, 40);
+    assert!(!m.drive8.ports().motor_on, "the DOS has switched the motor pin off");
+    let cp = through_c64re(&capture(&mut m));
+    let mut r = restored(&cp, img);
+    for x in [&mut m, &mut r] {
+        type_in(x, b"LOAD\"BIG\",8,1\r");
+    }
+    if let Err(e) = lockstep(&mut m, &mut r) {
+        panic!("a never-spun drive: the restored machine left the straight run — {e}");
+    }
+}

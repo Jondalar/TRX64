@@ -481,7 +481,10 @@ fn drive_active_roundtrip() {
     for (i, b) in b"LOAD\"$\",8\r".iter().enumerate() {
         m.poke(0x0277 + i as u16, &[*b]);
     }
-    m.poke(0x00c6, &[9]);
+    // Ten keys: the RETURN is the tenth. With nine the command was typed but never
+    // entered, and the test passed only because the rotation of a drive that got its
+    // disk after boot kept running with the motor off (BUG-062).
+    m.poke(0x00c6, &[10]);
     m.run_for_full(4_000_000, &mut sink, |_, _, _, _, _, _, _| {});
 
     let ht_after = m.drive8.rotation.current_half_track;
