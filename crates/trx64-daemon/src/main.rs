@@ -424,7 +424,9 @@ pub struct State {
     /// write first flushes a dirty GCR track into `disk.bytes` (flush_disk_writeback
     /// returns true ONCE then clears the dirty flag), so subsequent frames keep
     /// debouncing on the now-stable `disk.bytes` content hash even though the track
-    /// is no longer dirty. Cleared after the host file is written.
+    /// is no longer dirty. Cleared after the host file is written. Because the
+    /// flush reports a write only once, nothing but a path that writes the disk may
+    /// flush the live drive; a reader takes `Drive1541::disk_as_written`.
     disk_ap_pending: bool,
     disk_ap_settle_at_ms: u64,
     disk_ap_seen_hash: Option<String>,
@@ -4349,18 +4351,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                         "createdAt": now_iso8601_utc(),
                     }))
                     .unwrap_or_default();
-                    st.session.machine.drive8.flush_disk_writeback();
-                    let (media_sha, media_name) = match st.session.machine.drive8.get_attached_disk() {
-                        Some(disk) => (
-                            sha256_hex(&disk.bytes),
-                            disk.backing_path
-                                .as_ref()
-                                .and_then(|p| p.rsplit('/').next())
-                                .map(String::from)
-                                .unwrap_or_default(),
-                        ),
-                        None => (String::new(), String::new()),
-                    };
+                    let (media_sha, media_name) = drive8_media_identity(&st.session.machine.drive8);
                     let start_wall_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis())
@@ -6675,18 +6666,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                     "createdAt": "",
                 }))
                 .unwrap_or_default();
-                st.session.machine.drive8.flush_disk_writeback();
-                let (media_sha, media_name) = match st.session.machine.drive8.get_attached_disk() {
-                    Some(disk) => (
-                        sha256_hex(&disk.bytes),
-                        disk.backing_path
-                            .as_ref()
-                            .and_then(|p| p.rsplit('/').next())
-                            .map(String::from)
-                            .unwrap_or_default(),
-                    ),
-                    None => (String::new(), String::new()),
-                };
+                let (media_sha, media_name) = drive8_media_identity(&st.session.machine.drive8);
                 let start_wall_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis())
@@ -10257,20 +10237,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 "createdAt": now_iso8601_utc(),
             }))
             .unwrap_or_default();
-            // Flush any in-flight drive write so the captured media SHA reflects the
-            // current image bytes (VICE flushes before reading fsimage->fd).
-            st.session.machine.drive8.flush_disk_writeback();
-            let (media_sha, media_name) = match st.session.machine.drive8.get_attached_disk() {
-                Some(disk) => (
-                    sha256_hex(&disk.bytes),
-                    disk.backing_path
-                        .as_ref()
-                        .and_then(|p| p.rsplit('/').next())
-                        .map(String::from)
-                        .unwrap_or_default(),
-                ),
-                None => (String::new(), String::new()),
-            };
+            let (media_sha, media_name) = drive8_media_identity(&st.session.machine.drive8);
             let start_wall_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis())
@@ -10466,21 +10433,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 "createdAt": "",
             }))
             .unwrap_or_default();
-            // Capture the mounted-media identity (= TS gatherMediaIdentity → run.media):
-            // sha256 + basename of the attached disk (empty when none). flush first so
-            // the captured SHA reflects any pending write-back.
-            st.session.machine.drive8.flush_disk_writeback();
-            let (media_sha, media_name) = match st.session.machine.drive8.get_attached_disk() {
-                Some(disk) => (
-                    sha256_hex(&disk.bytes),
-                    disk.backing_path
-                        .as_ref()
-                        .and_then(|p| p.rsplit('/').next())
-                        .map(String::from)
-                        .unwrap_or_default(),
-                ),
-                None => (String::new(), String::new()),
-            };
+            let (media_sha, media_name) = drive8_media_identity(&st.session.machine.drive8);
             let start_wall_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis())
@@ -13109,6 +13062,30 @@ fn persist_cart_for_eject(st: &mut State, backing_path: &str) -> Option<String> 
     match std::fs::write(backing_path, &img) {
         Ok(()) => Some(backing_path.to_string()),
         Err(_) => None,
+    }
+}
+
+/// The mounted medium's identity a trace records (= TS `gatherMediaIdentity` →
+/// `run.media`): sha256 of the disk as the drive has written it, and the backing
+/// file's basename; both empty without a disk.
+///
+/// Read from [`Drive1541::disk_as_written`], a copy — never by flushing the live
+/// drive. A flush reports a newly written track exactly once, and that report is
+/// what arms the lazy host-file write (`autopersist_disk_at`); a flush taken here
+/// to compute a hash would swallow it and the write would never reach the file.
+///
+/// [`Drive1541::disk_as_written`]: trx64_core::drive::Drive1541::disk_as_written
+fn drive8_media_identity(drive: &trx64_core::drive::Drive1541) -> (String, String) {
+    match drive.disk_as_written() {
+        Some(disk) => (
+            sha256_hex(&disk.bytes),
+            disk.backing_path
+                .as_ref()
+                .and_then(|p| p.rsplit('/').next())
+                .map(String::from)
+                .unwrap_or_default(),
+        ),
+        None => (String::new(), String::new()),
     }
 }
 
@@ -22584,6 +22561,118 @@ mod batch1_tests {
         }
         assert!(has_both(&std::fs::read(&d64_path).unwrap()), "the persisted file holds both tracks");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A handler that only READS drive 8's disk (a trace start recording the medium's
+    /// sha256) must see the disk as written and must not flush the live drive: the
+    /// flush reports a newly written track once, and that report is what arms the
+    /// lazy host-file write. `reader` runs the handler on a disk with one sector
+    /// written and its track still dirty, and returns the sha256 it recorded.
+    ///
+    /// The lazy write is checked FIRST, then the live drive's state, so a flush
+    /// restored in the handler fails on the data that never reached the file.
+    fn a_disk_reader_leaves_the_lazy_write(tag: &str, reader: impl FnOnce(&SharedState, &std::path::Path) -> String) {
+        use trx64_core::gcr::{gcr_write_sector, CBMDOS_FDC_ERR_OK};
+        let dir = std::env::temp_dir().join(format!("trx64_reader_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d64_path = dir.join("user.d64");
+        let blank = vec![0u8; 174_848];
+        std::fs::write(&d64_path, &blank).unwrap();
+        let t18s7 = (357 + 7) * 256; // 17 tracks of 21 sectors before track 18
+        let data: Vec<u8> = (0..256).map(|i| (i as u8) ^ 0xa5).collect();
+
+        let state = make_state();
+        {
+            let mut st = state.lock().unwrap();
+            st.session.machine.drive8.attach_disk(DiskImage {
+                kind: DiskKind::D64,
+                bytes: blank.clone(),
+                backing_path: Some(d64_path.to_string_lossy().to_string()),
+                read_only: false,
+            });
+            let rot = &mut st.session.machine.drive8.rotation;
+            let ht = rot.current_half_track as usize;
+            assert_eq!(ht, 36, "the head is parked on track 18");
+            let img = rot.image.as_mut().unwrap();
+            assert_eq!(gcr_write_sector(&mut img.tracks[ht - 2], &data, 7), CBMDOS_FDC_ERR_OK);
+            rot.write_one_bit_for_test(1);
+            assert!(rot.has_dirty_track(), "track 18 is dirty");
+        }
+        let expected = {
+            let st = state.lock().unwrap();
+            let written = st.session.machine.drive8.disk_as_written().unwrap().bytes;
+            assert_eq!(written[t18s7..t18s7 + 256], data[..], "the disk as written holds the sector");
+            sha256_hex(&written)
+        };
+        assert_ne!(expected, sha256_hex(&blank));
+
+        let sha = reader(&state, &dir);
+
+        let (still_dirty, image_behind) = {
+            let st = state.lock().unwrap();
+            let d = &st.session.machine.drive8;
+            (d.rotation.has_dirty_track(), d.get_attached_disk().unwrap().bytes == blank)
+        };
+        {
+            let mut st = state.lock().unwrap();
+            stream_maybe_autopersist_disk(&mut st, 0);
+            stream_maybe_autopersist_disk(&mut st, 10);
+            stream_maybe_autopersist_disk(&mut st, DISK_AUTOPERSIST_DEBOUNCE_MS + 11);
+        }
+        let file = std::fs::read(&d64_path).unwrap();
+        assert_eq!(file[t18s7..t18s7 + 256], data[..], "{tag}: the lazy host-file write reached the disk file");
+        assert_eq!(sha, expected, "{tag}: the recorded sha256 is the disk as written");
+        assert!(still_dirty, "{tag}: the handler left track 18 dirty");
+        assert!(image_behind, "{tag}: the handler did not flush into the drive's disk image");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trace_start_domains_reads_the_disk_without_flushing_it() {
+        a_disk_reader_leaves_the_lazy_write("start_domains", |state, dir| {
+            let out = dir.join("t.duckdb");
+            let r = call(state, "trace/start_domains", json!({ "output": out.to_str().unwrap() }));
+            state.lock().unwrap().session.trace = None;
+            r["run"]["media"]["sha256"].as_str().unwrap().to_string()
+        });
+    }
+
+    #[test]
+    fn trace_run_start_reads_the_disk_without_flushing_it() {
+        a_disk_reader_leaves_the_lazy_write("run_start", |state, dir| {
+            let def = json!({
+                "id": "reader", "version": 1, "name": "reader",
+                "domains": ["memory"],
+                "triggers": [{ "kind": "mem-access", "access": "any", "from": 0, "to": 0xffff }],
+                "captures": [{ "kind": "mem-row" }],
+                "retention": "evidence"
+            });
+            assert_eq!(call(state, "trace/definition/put", json!({ "definition": def }))["ok"], json!(true));
+            let out = dir.join("t.duckdb");
+            let r = call(state, "trace/run/start", json!({ "definition_id": "reader", "output": out.to_str().unwrap() }));
+            state.lock().unwrap().session.trace = None;
+            r["run"]["media"]["sha256"].as_str().unwrap().to_string()
+        });
+    }
+
+    #[test]
+    fn session_create_with_a_trace_reads_the_disk_without_flushing_it() {
+        a_disk_reader_leaves_the_lazy_write("session_create", |state, dir| {
+            let out = dir.join("t.duckdb");
+            call(state, "session/create", json!({ "trace_out": out.to_str().unwrap() }));
+            let t = state.lock().unwrap().session.trace.take().expect("session/create opened a trace");
+            t.media_sha
+        });
+    }
+
+    #[test]
+    fn monitor_trace_on_reads_the_disk_without_flushing_it() {
+        a_disk_reader_leaves_the_lazy_write("monitor_trace_on", |state, _dir| {
+            call(state, "monitor/exec", json!({ "command": "trace on" }));
+            let t = state.lock().unwrap().session.trace.take().expect("`trace on` opened a trace");
+            t.media_sha
+        });
     }
 
     /// audit ws-media-8 DIRECT PROOF — the recents store is newest-first, deduped by

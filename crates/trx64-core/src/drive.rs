@@ -1250,12 +1250,15 @@ impl Drive1541 {
 
     /// Get a reference to the currently attached disk image, if any.
     ///
-    /// This does NOT flush in-flight drive writes (it borrows `&self`). Callers
-    /// that read `disk.bytes` for persist / sha / snapshot MUST call
-    /// [`flush_disk_writeback`] first (the daemon does), mirroring VICE flushing
-    /// `drive_gcr_data_writeback_all` before reading `fsimage->fd`. Metadata-only
-    /// callers (backing path, kind) need no flush.
+    /// This does NOT flush in-flight drive writes (it borrows `&self`): `bytes`
+    /// may be behind the drive. A caller that WRITES the disk to its file flushes
+    /// first ([`flush_disk_writeback`], VICE `drive_gcr_data_writeback_all` before
+    /// reading `fsimage->fd`). A caller that only reads the content — a hash, a
+    /// snapshot — takes [`disk_as_written`] instead: a flush reports a new write
+    /// once, and the daemon's lazy host-file write arms itself on that report.
+    /// Metadata-only callers (backing path, kind) need neither.
     /// [`flush_disk_writeback`]: Drive1541::flush_disk_writeback
+    /// [`disk_as_written`]: Drive1541::disk_as_written
     pub fn get_attached_disk(&self) -> Option<&DiskImage> {
         self.disk.as_ref()
     }
