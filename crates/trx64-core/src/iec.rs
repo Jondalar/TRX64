@@ -251,15 +251,19 @@ pub struct IecCore {
     pub iecbus_device: [u8; IECBUS_NUM],
     /// ts: iecbus.ts:139-143 active read/write callback pair (vice fn pointers).
     pub iecbus_callback: IecbusCallback,
-    /// Per-unit drive `type` (ts: `diskunit_context[dnr].type`). Single-1541 shape:
-    /// unit 8 = Drive1541, rest unused. Drives the conf1/2/3 `switch (unit.type)`.
+    /// Per-unit drive `type` (ts: `diskunit_context[dnr].type`). Every slot is a
+    /// 1541: the machine's two drive positions (Spec 871) are 1541s wherever they
+    /// stand. Drives the conf1/2/3 `switch (unit.type)`.
     pub unit_type: [DriveType; IECBUS_NUM],
     /// `c64iec.ts:110` `c64iec_active` (vice: `int c64iec_active = 1;`).
     pub c64iec_active: u8,
-    /// Spec 870 — the bus slot the machine's one true drive occupies, `None` when it
-    /// drives nothing (off / held in reset). `new()` = `Some(8)`, the stock machine.
-    /// Kept in step with the drive by [`IecCore::sync_drive_slot`].
+    /// Spec 870 — the bus slot drive position A occupies, `None` when it drives
+    /// nothing (off / held in reset). `new()` = `Some(8)`, the stock machine.
+    /// Kept in step with the drives by [`IecCore::sync_drive_slots`].
     pub drive_slot: Option<usize>,
+    /// Spec 871 — the bus slot drive position B occupies. `new()` = `None`: B is off
+    /// on every machine that does not switch it on.
+    pub drive_slot_b: Option<usize>,
 }
 
 impl Default for IecCore {
@@ -291,6 +295,7 @@ impl IecCore {
             unit_type: [DriveType::Drive1541; IECBUS_NUM],
             c64iec_active: 1,
             drive_slot: Some(8),
+            drive_slot_b: None,
         };
         s.iecbus_init();
         // Power-on cpu_bus/cpu_port released (memset 0xff already set them); the
@@ -828,55 +833,77 @@ impl IecCore {
         self.iecbus.drv_data[slot] = (!pb_out) & 0xff;
     }
 
-    /// Spec 870 — put the device map in step with the machine's one true drive:
-    /// `slot` = the unit it answers to, or `None` when it drives nothing (off, held
-    /// in reset). A no-op when nothing changed, which on the stock machine is always.
+    /// Spec 870/871 — put the device map in step with the machine's two drive
+    /// positions: `a` / `b` = the unit each answers to, or `None` when it drives
+    /// nothing (off, held in reset). A no-op when nothing changed, which on the stock
+    /// machine (A at 8, B off) is always. The machine never hands both the same slot —
+    /// it refuses that configuration (Spec 871 D2) and keeps B off the bus if it
+    /// arises anyway.
     ///
-    /// The map is what `iecbus_status_set` would build for a single true drive at
-    /// that unit — `iecbus_device[slot] = TRUEDRIVE`, the rest NONE, the callback
-    /// recomputed (Conf1 for 8, Conf2 for 9, Conf3 for 10/11, Conf0 for none) — set
-    /// directly rather than through the function-static arrays, which are shared by
-    /// every machine on the thread. A slot the drive leaves is released the way VICE
-    /// `iec_drive_port_default` releases it (`drv_bus = drv_data = 0xff`).
+    /// The map is what `iecbus_status_set` would build for true drives at those units
+    /// — `iecbus_device[slot] = TRUEDRIVE` for each, the rest NONE, the callback
+    /// recomputed (Conf1 for 8 alone, Conf2 for 9 alone, Conf3 for 10/11 or for two
+    /// drives, Conf0 for none) — set directly rather than through the function-static
+    /// arrays, which are shared by every machine on the thread. A slot a drive leaves
+    /// is released the way VICE `iec_drive_port_default` releases it
+    /// (`drv_bus = drv_data = 0xff`).
     ///
     /// `c64_pa_out` is the CIA2 port-A output. Conf0 reads the C64's own lines from
     /// `iec_fast_1541`, so leaving the bus seeds it with the byte a `$DD00` write would
     /// have stored; joining it re-derives `cpu_bus` and `iec_old_atn` from that byte
     /// (`iecbus_cpu_undump`), which Conf0 had stopped maintaining.
-    pub fn sync_drive_slot(&mut self, slot: Option<usize>, c64_pa_out: u8) {
-        if self.drive_slot == slot {
+    #[inline]
+    pub fn sync_drive_slots(&mut self, a: Option<usize>, b: Option<usize>, c64_pa_out: u8) {
+        let b = if b.is_some() && b == a { None } else { b };
+        if self.drive_slot == a && self.drive_slot_b == b {
             return;
         }
-        let was_on_bus = self.drive_slot.is_some();
-        self.adopt_drive_slot(slot);
+        self.sync_drive_slots_changed(a, b, c64_pa_out);
+    }
+
+    #[cold]
+    fn sync_drive_slots_changed(&mut self, a: Option<usize>, b: Option<usize>, c64_pa_out: u8) {
+        let was_on_bus = self.drive_slot.is_some() || self.drive_slot_b.is_some();
+        self.adopt_drive_slots(a, b);
         let data = (!c64_pa_out) & 0xff;
-        match slot {
-            Some(_) => {
-                if !was_on_bus {
-                    self.iecbus_cpu_undump(data);
-                }
-                self.iec_update_ports();
+        if a.is_some() || b.is_some() {
+            if !was_on_bus {
+                self.iecbus_cpu_undump(data);
             }
-            None => self.iecbus_cpu_write_conf0(data, 0),
+            self.iec_update_ports();
+        } else {
+            self.iecbus_cpu_write_conf0(data, 0);
         }
     }
 
-    /// The device-map half of [`Self::sync_drive_slot`], touching no line state
+    /// Spec 870 — [`Self::sync_drive_slots`] for a machine whose position B is off.
+    pub fn sync_drive_slot(&mut self, slot: Option<usize>, c64_pa_out: u8) {
+        self.sync_drive_slots(slot, None, c64_pa_out);
+    }
+
+    /// The device-map half of [`Self::sync_drive_slots`], touching no line state
     /// beyond releasing the slots nobody occupies — for a checkpoint restore, whose
     /// IEC lines were captured with that map in force.
-    pub fn adopt_drive_slot(&mut self, slot: Option<usize>) {
+    pub fn adopt_drive_slots(&mut self, a: Option<usize>, b: Option<usize>) {
+        let b = if b.is_some() && b == a { None } else { b };
         for s in 8..(8 + NUM_DISK_UNITS) {
-            if Some(s) != slot {
+            if Some(s) != a && Some(s) != b {
                 self.iecbus_device[s] = IECBUS_DEVICE_NONE;
                 self.iecbus.drv_bus[s] = 0xff;
                 self.iecbus.drv_data[s] = 0xff;
             }
         }
-        if let Some(s) = slot {
+        for s in [a, b].into_iter().flatten() {
             self.iecbus_device[s] = IECBUS_DEVICE_TRUEDRIVE;
         }
         self.calculate_callback_index();
-        self.drive_slot = slot;
+        self.drive_slot = a;
+        self.drive_slot_b = b;
+    }
+
+    /// Spec 870 — [`Self::adopt_drive_slots`] with position B off.
+    pub fn adopt_drive_slot(&mut self, slot: Option<usize>) {
+        self.adopt_drive_slots(slot, None);
     }
 }
 

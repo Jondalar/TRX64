@@ -155,6 +155,7 @@ pub fn restore_drive1541(drive: &mut Drive1541, blob: &[u8]) -> Result<(), Strin
         drive.rotation.gcr_head_offset = gcr_head_offset;
     }
     drive.snapshot_sync_drive_clk();
+    drive.snapshot_clear_pending_reset();
     Ok(())
 }
 

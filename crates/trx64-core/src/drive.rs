@@ -463,6 +463,15 @@ pub struct Drive1541 {
     /// `$1800` read reflects its own pull (= via1d1541.c store_prb). Power-on 0xff
     /// (all released).
     pub iec_cpu_bus: u8,
+    /// Spec 871 — every device's contribution to the wired-AND (`iecbus.drv_bus`) as
+    /// the machine's IEC core held it when this catch-up began. VICE's via1d1541
+    /// `store_prb` folds against the one global `iecbus`, so a drive's own store sees
+    /// the other drive's pull; here each drive runs on its own `v_iecbus`, and this is
+    /// what puts the other slots into it. Fed by [`Self::feed_iec`] for both drives
+    /// before either runs, so the order the two are advanced in cannot change what
+    /// either reads. On a machine with one drive every other slot is released (0xff),
+    /// which is what `v_iecbus` already held.
+    iec_drv_bus: [u8; crate::iec::IECBUS_NUM],
     /// Pending 6502 hardware-reset sequence. VICE fires `cpu_reset` (drivecpu.c:165)
     /// from the 6510 core's IK_RESET dispatch on the FIRST execute round, which sets
     /// `clk_ptr = 6` (the ~6-cycle reset sequence the chip consumes before the first
@@ -587,6 +596,7 @@ impl Drive1541 {
             reset_pending: true,
             iec_drv_port: 0x85,
             iec_cpu_bus: 0xff,
+            iec_drv_bus: [0xff; crate::iec::IECBUS_NUM],
             disk: None,
             rotation: Rotation::new(),
             powered: true,
@@ -599,6 +609,18 @@ impl Drive1541 {
             atn_stop_origin: None,
             atn_stop_latest: 0,
         }
+    }
+
+    /// Spec 871 — the drive in position B as a machine is built: a complete 1541,
+    /// switched off, its jumpers at unit 9 (the U64's drive B default). Off, it is
+    /// neither clocked nor on the bus, so a machine with it is the machine without it.
+    pub fn new_position_b() -> Self {
+        let mut d = Self::new();
+        let p = DrivePart::default_for(DrivePosition::B);
+        d.powered = p.powered;
+        d.unit = p.unit;
+        d.unit_jumpers = p.unit_jumpers;
+        d
     }
 
     /// Load the 1541 DOS ROM from `rom_dir` — a convenience over [`Self::set_rom`].
@@ -652,26 +674,14 @@ impl Drive1541 {
         }
     }
 
-    /// Fold this drive's VIA1 port-B output into the machine's IEC core (= VICE
-    /// `iec_drive_write(~byte, dnr)`), first putting the core's device map in step
-    /// with the drive (`sync_drive_slot`, a compare on the stock machine). A drive
-    /// that is off or held folds nothing — the core does not see it.
+    /// Spec 871 — give the drive the bus as the IEC core holds it now, for the next
+    /// catch-up: the lines it reads (`drv_port`), the C64's intent (`cpu_bus`) and
+    /// every device's pull (`drv_bus`, see `iec_drv_bus`).
     #[inline]
-    pub fn fold_into_iec(&self, iec: &mut crate::iec::IecCore, c64_pa_out: u8) {
-        iec.sync_drive_slot(self.bus_slot(), c64_pa_out);
-        if let Some(slot) = self.bus_slot() {
-            iec.iec_drive_write((!self.via1_pb_iec_output()) & 0xff, slot - 8);
-        }
-    }
-
-    /// As [`Self::fold_into_iec`] but WITHOUT the wired-AND fold — the $DD00 write
-    /// path, which folds once itself (see `IecCore::drive_set_data_no_fold`).
-    #[inline]
-    pub fn set_iec_data_no_fold(&self, iec: &mut crate::iec::IecCore, c64_pa_out: u8) {
-        iec.sync_drive_slot(self.bus_slot(), c64_pa_out);
-        if let Some(slot) = self.bus_slot() {
-            iec.drive_set_data_no_fold_slot(slot, self.via1_pb_iec_output());
-        }
+    pub fn feed_iec(&mut self, iec: &crate::iec::IecCore) {
+        self.iec_drv_port = iec.iecbus.drv_port;
+        self.iec_cpu_bus = iec.iecbus.cpu_bus;
+        self.iec_drv_bus = iec.iecbus.drv_bus;
     }
 
     /// The reset sequence the drive's RESET input runs: flush a pending disk write,
@@ -1061,6 +1071,14 @@ impl Drive1541 {
         // `cpu_bus` so the drive sees its own CLK/DATA pull on the next read.
         self.via1_iecbus.cpu_bus = self.iec_cpu_bus;
         self.via1_iecbus.drv_port = self.iec_drv_port;
+        // Spec 871 — the other devices' pulls, so a `$1800` store re-folds against
+        // the whole bus (VICE's one global `iecbus`), not against this drive alone.
+        let own = self.unit as usize;
+        for slot in 8..(8 + crate::iec::NUM_DISK_UNITS) {
+            if slot != own {
+                self.via1_iecbus.drv_bus[slot] = self.iec_drv_bus[slot];
+            }
+        }
         // Disjoint split-borrow of `self`: `core`/`int`/`reset_pending` go to the
         // verbatim execute call; the rest (RAM/ROM/VIA/rotation/IEC) to the bus.
         let core = &mut self.core;
@@ -1312,6 +1330,17 @@ impl Drive1541 {
         self.drive_clk = self.core.clk;
     }
 
+    /// Spec 871 — a restored drive is mid-program, not at a reset. A drive that has
+    /// never run since its last `cold_reset` still has the hardware reset armed
+    /// (`reset_pending` + `IK_RESET`), and the DRIVECPU module does not carry the
+    /// interrupt status that would overwrite it, so its first catch-up after the
+    /// restore would run the reset sequence over the restored CPU. Position B is such
+    /// a drive whenever it was off until the restore.
+    pub(crate) fn snapshot_clear_pending_reset(&mut self) {
+        self.reset_pending = false;
+        self.int.global_pending_int &= !IK_RESET;
+    }
+
     /// Test-only: VIA2 IFR (for the drive_snapshot round-trip test).
     #[cfg(test)]
     pub(crate) fn via2_ifr_test(&self) -> u8 {
@@ -1478,6 +1507,114 @@ impl Default for DrivePart {
             atn_stop_origin: None,
             atn_stop_latest: 0,
         }
+    }
+}
+
+impl DrivePart {
+    /// Spec 871 — the part state a position starts in: A on at unit 8 (the stock
+    /// drive, [`DrivePart::default`]), B off with its jumpers at 9.
+    pub fn default_for(pos: DrivePosition) -> Self {
+        match pos {
+            DrivePosition::A => Self::default(),
+            DrivePosition::B => Self { powered: false, unit: 9, unit_jumpers: 9, ..Self::default() },
+        }
+    }
+}
+
+/// Spec 871 — the machine's two drive positions, as the U64 has them. Inside the
+/// machine a drive is a position; on the wire it is addressed by the unit number it
+/// answers to (§8, decided: unit numbers on the wire, positions inside).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DrivePosition {
+    /// `Machine::drive8` — the name is historical; A can stand at unit 8-11.
+    A,
+    /// `Machine::drive_b`.
+    B,
+}
+
+impl DrivePosition {
+    /// "A" / "B" — the name a refusal uses.
+    pub fn name(self) -> &'static str {
+        match self {
+            DrivePosition::A => "A",
+            DrivePosition::B => "B",
+        }
+    }
+}
+
+/// Spec 871 D2 — the IEC slots the two positions occupy: each drive's
+/// [`Drive1541::bus_slot`], except that B never shares A's (the machine refuses that
+/// configuration; if it arises anyway, B stays off the bus).
+#[inline]
+pub fn pair_bus_slots(a: &Drive1541, b: &Drive1541) -> (Option<usize>, Option<usize>) {
+    let sa = a.bus_slot();
+    let sb = b.bus_slot();
+    (sa, if sb.is_some() && sb == sa { None } else { sb })
+}
+
+/// Spec 871 D2 — catch both drives up to the C64-clock `target` and put their port-B
+/// outputs into their slots WITHOUT the wired-AND fold (the `$DD00` write path folds
+/// once itself). Both are fed the bus as it stands BEFORE either runs, and both run
+/// before either is written back, so the order they are advanced in cannot change
+/// what the bus reads. B that is not clocked costs two flag tests. Returns the new
+/// catch-up reference.
+#[inline]
+pub fn pair_catch_up(
+    a: &mut Drive1541,
+    b: &mut Drive1541,
+    iec: &mut crate::iec::IecCore,
+    target: u64,
+    c64_ref: u64,
+    c64_pa_out: u8,
+) -> u64 {
+    let (sa, sb) = pair_bus_slots(a, b);
+    iec.sync_drive_slots(sa, sb, c64_pa_out);
+    let b_runs = b.is_clocked();
+    a.feed_iec(iec);
+    if b_runs {
+        b.feed_iec(iec);
+    }
+    let r = a.catch_up_to(target, c64_ref);
+    if b_runs {
+        b.catch_up_to(target, c64_ref);
+    }
+    if let Some(slot) = sa {
+        iec.drive_set_data_no_fold_slot(slot, a.via1_pb_iec_output());
+    }
+    if let Some(slot) = sb {
+        iec.drive_set_data_no_fold_slot(slot, b.via1_pb_iec_output());
+    }
+    r
+}
+
+/// Spec 870/871 — fold both drives' VIA1 port-B outputs into the IEC core (= VICE
+/// `iec_drive_write(~byte, dnr)` per drive), each into its own slot; a drive that is
+/// off or held folds nothing. The wired-AND is the AND of every slot, so the order
+/// of the two folds does not matter.
+#[inline]
+pub fn pair_fold_into_iec(a: &Drive1541, b: &Drive1541, iec: &mut crate::iec::IecCore, c64_pa_out: u8) {
+    let (sa, sb) = pair_bus_slots(a, b);
+    iec.sync_drive_slots(sa, sb, c64_pa_out);
+    if let Some(slot) = sa {
+        iec.iec_drive_write((!a.via1_pb_iec_output()) & 0xff, slot - 8);
+    }
+    if let Some(slot) = sb {
+        iec.iec_drive_write((!b.via1_pb_iec_output()) & 0xff, slot - 8);
+    }
+}
+
+/// Spec 871 D2 — deliver an ATN edge the IEC core computed for drive number `dnr`
+/// (slot `dnr + 8`) to whichever position answers there.
+#[inline]
+pub fn pair_deliver_atn(a: &mut Drive1541, b: &mut Drive1541, dnr: usize, sig: u8) {
+    let (sa, sb) = pair_bus_slots(a, b);
+    let slot = Some(dnr + 8);
+    if sa == slot {
+        let clk = a.drive_clk;
+        a.atn_edge_to_via1_ca1(sig, clk);
+    } else if sb == slot {
+        let clk = b.drive_clk;
+        b.atn_edge_to_via1_ca1(sig, clk);
     }
 }
 
