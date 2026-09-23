@@ -73,10 +73,10 @@ monitor (VICE-superset):
     diff <idA> <idB>          typed by-ID diff of two checkpoint anchors (RAM runs + per-chip register changes). READ-ONLY (live machine unchanged). ids from `checkpoint/list`
   MEDIA + DRIVE (Spec 839 — the same verbs on every front-end; the cockpit used to own these)
     mount <path>              put a .d64/.g64/.crt/.prg/.c64re in the machine. The TYPE comes from the file's CONTENT, not its extension; a relative path resolves against `pwd`/`cd`. A cartridge power-cycles, a disk does not.
-    eject [cart|disk]         take it out. Bare `eject` targets whatever is actually in (cartridge first, else the disk). Both persist to the host file FIRST — a disk eject leaves the drive turning, a cartridge eject cold-resets the machine (that is what pulling a cart does).
-    drive                     drive 8 live status: motor, track, LED, what is mounted, whether it is dirty
+    eject [cart|disk|<unit>]  take it out (`eject 9`: the disk in the drive at unit 9). Bare `eject` targets whatever is actually in (cartridge first, else the disk). Both persist to the host file FIRST — a disk eject leaves the drive turning, a cartridge eject cold-resets the machine (that is what pulling a cart does).
+    drive [unit]              live status of the drive at that unit (default 8): motor, track, LED, what is mounted, whether it is dirty
     cart                      cartridge live status: type, bank, read/write activity — null when nothing is inserted
-    drivepower                cold-reset the drive 6502 ONLY (DOS re-runs power-on init). The C64 side is untouched. Every scrap of drive-side state goes: open channels, a fastloader's uploaded drivecode, a half-written sector. It is the way out of a wedged fastloader without power-cycling the machine someone is watching.
+    drivepower [unit] [on|off]  on/off switches that drive's power (a second drive at one unit is refused). Bare: power-on-reset the drive 6502 ONLY (DOS re-runs power-on init). The C64 side is untouched. Every scrap of drive-side state goes: open channels, a fastloader's uploaded drivecode, a half-written sector. It is the way out of a wedged fastloader without power-cycling the machine someone is watching.
     recent                    the media this daemon has had mounted lately (daemon state, not project history)
   MACHINE (the same verbs on every front-end — the cockpit's `/` prefix is input sugar)
     run                       resume the machine (from a rewound point: cuts the anchors ahead)
