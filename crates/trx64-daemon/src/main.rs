@@ -4775,7 +4775,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 let (disk_path, disk_format) = match st.session.machine.drive8.get_attached_disk() {
                     Some(d) => (
                         d.backing_path.clone().unwrap_or_default(),
-                        match d.kind { DiskKind::G64 => "g64", DiskKind::D64 => "d64" }.to_string(),
+                        d.kind.name().to_string(),
                     ),
                     None => (String::new(), String::new()),
                 };
@@ -7491,6 +7491,63 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             }
         }
 
+        // Spec 872 §7 — the board of the drive at `unit`: "1541" or "1581". Refused while
+        // that drive is powered, naming its position: the type is chosen at power-on.
+        // Off, the new board is built fresh (RAM zero, its own ROM at its power-on). A
+        // mounted medium that does not fit the new board is written back to its host
+        // file and ejected (`ejected` names it); one that fits stays.
+        "session/drive_type" => {
+            let unit = match unit_param(&req.params) {
+                Ok(u) => u,
+                Err(e) => return Response::err(id, -32602, format!("session/drive_type: {e}")),
+            };
+            let t = match req.params.get("type").map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())) {
+                Some(t) if t == "1541" => trx64_core::iec::DriveType::Drive1541,
+                Some(t) if t == "1581" => trx64_core::iec::DriveType::Drive1581,
+                Some(t) => return Response::err(id, -32602, format!("session/drive_type: type {t} is not a board a drive position can hold (1541 or 1581)")),
+                None => return Response::err(id, -32602, "session/drive_type: missing `type` (\"1541\" or \"1581\")"),
+            };
+            let mut st = state.lock().unwrap();
+            let pos = match drive_position(&st, unit) {
+                Ok(p) => p,
+                Err(e) => return Response::err(id, -32602, format!("session/drive_type: {e}")),
+            };
+            if st.session.machine.drive(pos).powered() {
+                return Response::err(id, -32602, format!(
+                    "session/drive_type: drive position {} (unit {unit}) is powered; switch it off before changing its type to {}",
+                    pos.name(),
+                    trx64_core::drive::board_name(t)
+                ));
+            }
+            // The write-back lands in the host file before a medium that will not fit
+            // leaves the drive.
+            let fits = st
+                .session
+                .machine
+                .drive(pos)
+                .get_attached_disk()
+                .map(|d| d.kind.board() == t)
+                .unwrap_or(true);
+            let persisted = if fits { None } else { persist_outgoing_disk_at(&mut st, pos) };
+            let ejected = match st.session.machine.set_drive_type(pos, t) {
+                Ok(e) => e,
+                Err(e) => return Response::err(id, -32602, format!("session/drive_type: {e}")),
+            };
+            if ejected.is_some() && pos == DrivePosition::A {
+                st.session.disk_path = String::new();
+            }
+            let d = st.session.machine.drive(pos);
+            Response::ok(id, json!({
+                "device": d.unit_jumpers(),
+                "type": trx64_core::drive::board_name(d.board_type()),
+                "ejected": ejected.map(|e| json!({
+                    "format": e.kind.name(),
+                    "path": e.backing_path,
+                    "persisted": persisted,
+                })),
+            }))
+        }
+
         // Spec 871 — set the device-ID jumpers of the drive at `unit` to `to` (8-11,
         // Spec 870 D4: read by its DOS at its next reset or power-on). Refused, naming
         // the other position, when the other drive position already answers to `to` —
@@ -8901,15 +8958,12 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             };
 
             let disk_name = path_str.split('/').last().unwrap_or("disk").to_string();
-            let format_str = if disk_name.to_lowercase().ends_with(".g64")
-                || (bytes.len() >= 8 && &bytes[..8] == b"GCR-1541")
-            {
-                "g64"
-            } else {
-                "d64"
+            let format_str = match disk_format_of(&disk_name, &bytes) {
+                Ok(f) => f,
+                Err(e) => return Response::err(id, -32602, format!("runtime/swap_disk_and_continue: {e}")),
             };
             let sha256 = sha256_hex(&bytes);
-            let disk_kind = if format_str == "g64" { DiskKind::G64 } else { DiskKind::D64 };
+            let disk_kind = disk_kind_from_format(format_str);
             let image = DiskImage {
                 kind: disk_kind,
                 bytes,
@@ -8918,7 +8972,9 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             };
 
             let mut st = state.lock().unwrap();
-            st.session.machine.drive8.attach_disk(image);
+            if let Err(e) = st.session.machine.drive8.mount(image) {
+                return Response::err(id, -32602, format!("runtime/swap_disk_and_continue: drive 8: {e}"));
+            }
             st.session.disk_path = path_str.clone();
             let cycle = st.session.machine.clk;
 
@@ -9202,18 +9258,23 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                         let disk_name = name.clone().unwrap_or_else(|| {
                             path.as_deref().and_then(|p| p.split('/').last()).unwrap_or("disk").to_string()
                         });
-                        // diskFormat, ingress.ts:66-73.
-                        let fmt = if disk_name.to_lowercase().ends_with(".g64")
-                            || (bytes.len() >= 8 && &bytes[..8] == b"GCR-1541") { "g64" }
-                        else if disk_name.to_lowercase().ends_with(".d64") { "d64" }
-                        else { "d64" };
+                        // diskFormat, ingress.ts:66-73 (+ Spec 872: a D81 by its size).
+                        let fmt = match disk_format_of(&disk_name, &bytes) {
+                            Ok(f) => f,
+                            Err(e) => return Some((-32602, format!("media-ingress: {e}"))),
+                        };
                         format = Some(fmt.to_string());
                         sha256 = Some(sha256_hex(&bytes));
                         let backing_path = path.clone();
-                        let disk_kind = if fmt == "g64" { DiskKind::G64 } else { DiskKind::D64 };
-                        st.session.machine.drive_mut(pos).attach_disk(DiskImage {
+                        let disk_kind = disk_kind_from_format(fmt);
+                        if let Err(e) = medium_fits_at(&st, pos, &disk_kind) {
+                            return Some((-32602, format!("media-ingress: {e}")));
+                        }
+                        if let Err(e) = st.session.machine.drive_mut(pos).mount(DiskImage {
                             kind: disk_kind, bytes, backing_path: backing_path.clone(), read_only: false,
-                        });
+                        }) {
+                            return Some((-32602, format!("media-ingress: {e}")));
+                        }
                         if pos == DrivePosition::A {
                             st.session.disk_path = path.clone().unwrap_or_default();
                         }
@@ -9511,7 +9572,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                     "c64re",
                     &format!("UNDUMP {path_str} \u{2014} the machine is now this snapshot."),
                 ),
-                MediaKind::Cartridge | MediaKind::G64 | MediaKind::D64 => delegate_media_open(
+                MediaKind::Cartridge | MediaKind::G64 | MediaKind::D64 | MediaKind::D81 => delegate_media_open(
                     state, &req, "media/mount", &path_str,
                     kind.as_str(),
                     &format!("MOUNT {path_str} ({})", kind.as_str()),
@@ -9638,13 +9699,13 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
 
             let disk_name = path_str.split('/').last().unwrap_or("disk").to_string();
             // BUG-041 — the same content answer decides the format.
-            let format_str = if kind == MediaKind::G64 {
-                "g64"
-            } else {
-                "d64"
+            let format_str = match kind {
+                MediaKind::G64 => "g64",
+                MediaKind::D81 => "d81",
+                _ => "d64",
             };
             let sha256 = sha256_hex(&bytes);
-            let disk_kind = if format_str == "g64" { DiskKind::G64 } else { DiskKind::D64 };
+            let disk_kind = disk_kind_from_format(format_str);
             let image = DiskImage {
                 kind: disk_kind,
                 bytes,
@@ -9685,7 +9746,10 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             // first, cap 10, mountedAt), 1:1 with TS addRecent (recent-files.ts) on
             // every ingest, so media/recent overlays it ahead of the dir scan.
             add_recent_media(&mut st, &path_str, format_str);
-            let persisted_outgoing = mount_disk_media_at(&mut st, pos, image, &path_str);
+            let persisted_outgoing = match mount_disk_media_at(&mut st, pos, image, &path_str) {
+                Ok(p) => p,
+                Err(e) => return Response::err(id, -32602, format!("media: {e}")),
+            };
             let after_id = capture_media_checkpoint(&mut st);
             if let Some(ref b) = before_id { st.checkpoint_ring.pin(b); }
             if let Some(ref a) = after_id { st.checkpoint_ring.pin(a); }
@@ -9803,15 +9867,12 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             }
 
             let disk_name = path_str.split('/').last().unwrap_or("disk").to_string();
-            let format_str = if disk_name.to_lowercase().ends_with(".g64")
-                || (bytes.len() >= 8 && &bytes[..8] == b"GCR-1541")
-            {
-                "g64"
-            } else {
-                "d64"
+            let format_str = match disk_format_of(&disk_name, &bytes) {
+                Ok(f) => f,
+                Err(e) => return Response::err(id, -32602, format!("media/swap: {e}")),
             };
             let sha256 = sha256_hex(&bytes);
-            let disk_kind = if format_str == "g64" { DiskKind::G64 } else { DiskKind::D64 };
+            let disk_kind = disk_kind_from_format(format_str);
             let image = DiskImage {
                 kind: disk_kind,
                 bytes,
@@ -9850,7 +9911,10 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             let before_id = if media_present { capture_media_checkpoint(&mut st) } else { None };
             // audit ws-media-8 — record the swapped-in disk in the recents store.
             add_recent_media(&mut st, &path_str, format_str);
-            let persisted_outgoing = mount_disk_media_at(&mut st, pos, image, &path_str);
+            let persisted_outgoing = match mount_disk_media_at(&mut st, pos, image, &path_str) {
+                Ok(p) => p,
+                Err(e) => return Response::err(id, -32602, format!("media: {e}")),
+            };
             let after_id = capture_media_checkpoint(&mut st);
             if let Some(ref b) = before_id { st.checkpoint_ring.pin(b); }
             if let Some(ref a) = after_id { st.checkpoint_ring.pin(a); }
@@ -11050,10 +11114,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             // report the lazy host-file write arms on.
             let (candidates, medium_ref) = match st.session.machine.drive8.disk_as_written() {
                 Some(d) if !d.bytes.is_empty() => {
-                    let kind = match d.kind {
-                        trx64_core::drive::DiskKind::G64 => "g64",
-                        trx64_core::drive::DiskKind::D64 => "d64",
-                    };
+                    let kind = d.kind.name();
                     (
                         trx64_core::vic_inspect::extract_asset_candidates(&d.bytes, "session", Some(kind)),
                         Some(kind.to_string()),
@@ -12166,7 +12227,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             let (disk_path, disk_format) = match st.session.machine.drive8.get_attached_disk() {
                 Some(d) => (
                     d.backing_path.clone().unwrap_or_default(),
-                    match d.kind { DiskKind::G64 => "g64", DiskKind::D64 => "d64" }.to_string(),
+                    d.kind.name().to_string(),
                 ),
                 None => (String::new(), String::new()),
             };
@@ -12601,10 +12662,7 @@ fn gather_snapshot_media(session: &Session) -> Vec<Value> {
     // The disk as the dump embeds it (`gather_native_media_inputs`), so the summary's
     // sha256 names the bytes in the file.
     if let Some(disk) = m.drive8.disk_as_written() {
-        let format = match disk.kind {
-            DiskKind::G64 => "g64",
-            DiskKind::D64 => "d64",
-        };
+        let format = disk.kind.name();
         let source_name = disk
             .backing_path
             .as_ref()
@@ -12644,7 +12702,7 @@ fn gather_native_media_inputs(
     // has written folded in, built on a copy (the live drive is not flushed). An
     // undump mounts it whole.
     if let Some(disk) = m.drive8.disk_as_written() {
-        let format = match disk.kind { DiskKind::G64 => "g64", DiskKind::D64 => "d64" };
+        let format = disk.kind.name();
         let source_name = disk
             .backing_path
             .as_ref()
@@ -12740,10 +12798,7 @@ fn gather_recorder_media_inputs(
                 .map(String::from)
                 .or_else(|| {
                     session.machine.drive8.get_attached_disk().map(|d| {
-                        match d.kind {
-                            DiskKind::G64 => "g64",
-                            DiskKind::D64 => "d64",
-                        }
+                        d.kind.name()
                         .to_string()
                     })
                 })
@@ -12924,6 +12979,9 @@ pub(crate) enum MediaKind {
     Cartridge,
     G64,
     D64,
+    /// Spec 872 — a 1581 image: one of the eight D81 sizes (80-83 tracks, with or
+    /// without error bytes).
+    D81,
     /// A program. `autostart` is true when it loads at $0801 behind a valid BASIC line.
     Prg { autostart: bool },
 }
@@ -12935,6 +12993,7 @@ impl MediaKind {
             MediaKind::Cartridge => "crt",
             MediaKind::G64 => "g64",
             MediaKind::D64 => "d64",
+            MediaKind::D81 => "d81",
             MediaKind::Prg { .. } => "prg",
         }
     }
@@ -13004,6 +13063,19 @@ pub(crate) fn detect_media_kind(bytes: &[u8], name: &str) -> Result<MediaKind, S
     // 2. Size — a .d64 has no magic, but its length names its track count.
     if trx64_core::gcr::d64_tracks_for_len(bytes.len()).is_some() {
         return Ok(MediaKind::D64);
+    }
+    // Spec 872 — a .d81 neither: its length is one of eight (80-83 tracks, with or
+    // without error bytes), none of which a D64, a G64 or a PRG can have. A name that
+    // says .d81 on a length that is none of them is refused rather than guessed.
+    if trx64_core::fdd::d81_geometry(bytes.len()).is_some() {
+        return Ok(MediaKind::D81);
+    }
+    if name.to_lowercase().ends_with(".d81") {
+        return Err(format!(
+            "{name}: {} bytes is not a D81 size (80-83 tracks, with or without error bytes: {:?})",
+            bytes.len(),
+            trx64_core::fdd::D81_SIZES
+        ));
     }
     // 3. Last resort. A PRG is never a positive match; it is what is left.
     Ok(MediaKind::Prg {
@@ -13169,6 +13241,38 @@ fn drive_status_json(st: &mut State) -> Value {
 /// answers to; `powered` says whether it is on at all.
 fn drive_status_json_at(st: &mut State, pos: DrivePosition) -> Value {
     use trx64_core::rotation::BRA_MOTOR_ON;
+    // Spec 872 — a 1581 has no GCR rotation: its panel is the CIA's glue (motor, LED,
+    // side) and the WD's registers, the head in physical track and side.
+    if let Some(b) = st.session.machine.drive(pos).board_1581() {
+        let m = &st.session.machine;
+        let drv = m.drive(pos);
+        let p = b.ports();
+        let w = b.wd();
+        let (track, side) = b.head();
+        let c64_pc = m.cpu6510.reg_pc;
+        // WRITE SECTOR ($Ax/$Bx) or WRITE TRACK ($Fx) in progress.
+        let writing = w.busy && (w.command & 0xe0 == 0xa0 || w.command & 0xf0 == 0xf0);
+        return json!({
+            "device": drv.unit(),
+            "powered": drv.powered(),
+            "type": "1581",
+            "ledOn": p.activity_led,
+            "ledFlashing": false,
+            "ledPwm": if p.activity_led { 1000 } else { 0 },
+            "motorOn": p.motor_on,
+            "rwMode": if writing { "write" } else { "read" },
+            "halfTrack": (track as u64 + 1) * 2,
+            "track": track as u64 + 1,
+            "physicalTrack": track,
+            "side": side,
+            "sector": w.sector,
+            "drivePc": b.core.reg_pc as u64,
+            "wd": { "track": w.track, "sector": w.sector, "data": w.data, "status": w.status, "command": w.command, "busy": w.busy },
+            "diskChanged": p.disk_changed,
+            "dd00": { "pra": m.cia2.peek(0xdd00) as u64, "ddr": m.cia2.peek(0xdd02) as u64 },
+            "transferMode": if (0xE000..=0xFFFF).contains(&c64_pc) { "kernal" } else { "custom" },
+        });
+    }
     let drive_clk = st.session.machine.drive(pos).drive_clk;
     let led_on = st.session.machine.drive(pos).led_on();
     let led_pwm = st.session.machine.drive_mut(pos).rotation.led_pwm(drive_clk, led_on) as u64;
@@ -13205,6 +13309,7 @@ fn drive_status_json_at(st: &mut State, pos: DrivePosition) -> Value {
     json!({
         "device": drv.unit(),
         "powered": drv.powered(),
+        "type": "1541",
         "ledOn": led_on,
         "ledFlashing": false,
         "ledPwm": led_pwm,
@@ -13302,7 +13407,9 @@ fn cart_status_json(st: &mut State) -> Value {
 /// THE single disk-media attach (Spec 742 / BUG-023, see the note above
 /// `drive_status_json`), into the drive in `pos` (Spec 871). The session's `disk_path`
 /// is position A's; B's medium is known by the image's own backing path.
-fn mount_disk_media_at(st: &mut State, pos: DrivePosition, image: DiskImage, new_path: &str) -> Option<String> {
+fn mount_disk_media_at(st: &mut State, pos: DrivePosition, image: DiskImage, new_path: &str) -> Result<Option<String>, String> {
+    // Spec 872 — a medium that does not fit the drive is refused before anything moves.
+    medium_fits_at(st, pos, &image.kind)?;
     // Implicit eject: persist + detach the outgoing disk first (mount-disk-media.ts:
     // 77-82). Only when a disk is actually attached (first mount → None).
     let persisted_outgoing = if st.session.machine.drive(pos).get_attached_disk().is_some() {
@@ -13312,11 +13419,11 @@ fn mount_disk_media_at(st: &mut State, pos: DrivePosition, image: DiskImage, new
     } else {
         None
     };
-    st.session.machine.drive_mut(pos).attach_disk(image);
+    st.session.machine.drive_mut(pos).mount(image)?;
     if pos == DrivePosition::A {
         st.session.disk_path = new_path.to_string();
     }
-    persisted_outgoing
+    Ok(persisted_outgoing)
 }
 
 /// Spec 871 — the drive unit a request addresses: `unit`, else a `slot` of 8-11, else a
@@ -13346,6 +13453,46 @@ fn drive_position(st: &State, unit: u8) -> Result<DrivePosition, String> {
         .ok_or_else(|| format!("no drive at unit {unit}"))
 }
 
+/// Spec 872 — the disk kind a media format string names ("d64", "g64", "d81"; anything
+/// else is the G64 the older paths defaulted to).
+fn disk_kind_from_format(fmt: &str) -> DiskKind {
+    match fmt {
+        "d64" => DiskKind::D64,
+        "d81" => DiskKind::D81,
+        _ => DiskKind::G64,
+    }
+}
+
+/// Spec 872 — the disk format of a file by its content, then its name: the G64 magic,
+/// a D81 size, a `.g64` name; otherwise a D64. A `.d81` name on a length that is not a
+/// D81 size is refused.
+fn disk_format_of(name: &str, bytes: &[u8]) -> Result<&'static str, String> {
+    if bytes.len() >= 8 && &bytes[..8] == b"GCR-1541" {
+        return Ok("g64");
+    }
+    if trx64_core::fdd::d81_geometry(bytes.len()).is_some() {
+        return Ok("d81");
+    }
+    let lower = name.to_lowercase();
+    if lower.ends_with(".d81") {
+        return Err(format!(
+            "{name}: {} bytes is not a D81 size (80-83 tracks, with or without error bytes)",
+            bytes.len()
+        ));
+    }
+    Ok(if lower.ends_with(".g64") { "g64" } else { "d64" })
+}
+
+/// Spec 872 §5/§7 — the medium must fit the drive at that unit: a D81 into a 1581, a
+/// D64 or G64 into a 1541. The refusal names the drive's type.
+fn medium_fits_at(st: &State, pos: DrivePosition, kind: &DiskKind) -> Result<(), String> {
+    let unit = {
+        let d = st.session.machine.drive(pos);
+        if d.powered() { d.unit() } else { d.unit_jumpers() }
+    };
+    st.session.machine.drive(pos).medium_fits(kind).map_err(|e| format!("drive {unit}: {e}"))
+}
+
 /// Spec 871 — one line per drive position for `session/state`: the unit it answers to
 /// (its jumpers while off), whether it is powered, and what disk is in it.
 fn drives_json(st: &State) -> Value {
@@ -13365,6 +13512,7 @@ fn drives_json(st: &State) -> Value {
             json!({
                 "unit": if d.powered() { d.unit() } else { d.unit_jumpers() },
                 "powered": d.powered(),
+                "type": trx64_core::drive::board_name(d.board_type()),
                 "disk": match path {
                     None => Value::Null,
                     Some(p) => json!({ "path": p }),
@@ -14151,17 +14299,15 @@ fn run_scenario(st: &mut State, scenario: &Value) -> Result<Value, String> {
                 let file_bytes = std::fs::read(path)
                     .map_err(|e| format!("cannot read startSnapshot {path}: {e}"))?;
                 let read = trx64_core::native_snapshot::read_native_snapshot(&file_bytes)?;
-                // Re-attach embedded drive8 media, then restore the checkpoint.
+                // Re-attach embedded drive8 media, then restore the checkpoint. The
+                // board types first (Spec 872): a D81 goes only into a 1581.
+                trx64_core::c64re_snapshot::prepare_drive_types(&mut st.session.machine, &read.checkpoint);
                 for rm in &read.media {
                     if rm.reference.role != "drive8" {
                         continue;
                     }
                     if let Some(bytes) = &rm.bytes {
-                        let kind = if rm.reference.format == "d64" {
-                            DiskKind::D64
-                        } else {
-                            DiskKind::G64
-                        };
+                        let kind = disk_kind_from_format(&rm.reference.format);
                         st.session.machine.drive8.attach_disk(DiskImage {
                             kind,
                             bytes: bytes.clone(),
@@ -14596,10 +14742,7 @@ fn capture_live_checkpoint(session: &mut Session) -> Value {
     let (disk_path, disk_format) = match session.machine.drive8.get_attached_disk() {
         Some(d) => (
             d.backing_path.clone().unwrap_or_default(),
-            match d.kind {
-                DiskKind::G64 => "g64",
-                DiskKind::D64 => "d64",
-            }
+            d.kind.name()
             .to_string(),
         ),
         None => (String::new(), String::new()),
@@ -15142,6 +15285,8 @@ fn restore_live_checkpoint(session: &mut Session, cp: &Value) -> Result<(), Stri
 /// Restore a ring checkpoint into ANY machine — the live one, or a scratch clone that must
 /// not disturb it (Spec 859's replay).
 fn restore_checkpoint_into(machine: &mut trx64_core::Machine, cp: &Value) -> Result<(), String> {
+    // Spec 872 — the board types first: a D81 goes only into a 1581.
+    trx64_core::c64re_snapshot::prepare_drive_types(machine, cp);
     // Re-attach the embedded disk image (as written at the capture) FIRST, so the
     // drive's GCR baseline and its write-back image are present before
     // restore_runtime_checkpoint overlays the head/rotation-exact GCR content.
@@ -15155,7 +15300,7 @@ fn restore_checkpoint_into(machine: &mut trx64_core::Machine, cp: &Value) -> Res
             .and_then(|mm| mm.get("imageFormat"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let kind = if format == "d64" { DiskKind::D64 } else { DiskKind::G64 };
+        let kind = disk_kind_from_format(format);
         let backing_path = cp
             .get("media")
             .and_then(|mm| mm.get("diskPath"))
@@ -15543,7 +15688,9 @@ fn undump_native_snapshot(st: &mut State, path: &str) -> Result<UndumpResult, St
     };
     let mut materialized_any = false;
 
-    // Re-attach the embedded drive8 media onto the fresh machine, then restore.
+    // Re-attach the embedded drive8 media onto the fresh machine, then restore. The
+    // board types first (Spec 872): a D81 goes only into a 1581.
+    trx64_core::c64re_snapshot::prepare_drive_types(&mut st.session.machine, &read.checkpoint);
     let mut media = Vec::new();
     for rm in &read.media {
         if rm.reference.role != "drive8" {
@@ -15558,7 +15705,7 @@ fn undump_native_snapshot(st: &mut State, path: &str) -> Result<UndumpResult, St
                 ))
             }
         };
-        let kind = if rm.reference.format == "d64" { DiskKind::D64 } else { DiskKind::G64 };
+        let kind = disk_kind_from_format(&rm.reference.format);
         let len = bytes.len() as u64;
         // Write the disk out to `<name>_media/<file>` and mount THAT (file-backed).
         let fname = rm
@@ -16239,10 +16386,7 @@ fn capture_recorder_anchor_payload(session: &mut Session) -> Value {
     let (disk_path, disk_format) = match session.machine.drive8.get_attached_disk() {
         Some(d) => (
             d.backing_path.clone().unwrap_or_default(),
-            match d.kind {
-                DiskKind::G64 => "g64",
-                DiskKind::D64 => "d64",
-            }
+            d.kind.name()
             .to_string(),
         ),
         None => (String::new(), String::new()),
@@ -23746,5 +23890,114 @@ mod batch1_tests {
         assert!(b.powered() && b.unit() == 9, "B is on at 9 again");
         assert!(b.get_attached_disk().is_some(), "with its disk");
         assert_eq!((g.session.machine.iec.drive_slot, g.session.machine.iec.drive_slot_b), (Some(8), Some(9)));
+    }
+
+    // ── Spec 872 — a 1581 on the wire ──────────────────────────────────────────
+
+    /// The 1581 DOS, from the ROM directory or VICE's `data/DRIVES` (Commodore IP, not
+    /// bundled).
+    fn rom_1581() -> Option<Vec<u8>> {
+        let vice = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../vice/vice/data/DRIVES");
+        [rom_dir(), PathBuf::from(vice)]
+            .iter()
+            .find_map(|d| std::fs::read(d.join("dos1581-318045-02.bin")).ok())
+    }
+
+    fn temp_file(name: &str, bytes: &[u8]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("trx64-872-{}-{name}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join(name);
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    #[test]
+    fn a_type_change_is_refused_while_powered_naming_the_position() {
+        let Some(st) = booted_state() else { return };
+        let e = call_err(&st, "session/drive_type", json!({ "unit": 8, "type": "1581" }));
+        assert!(e.message.contains("position A") && e.message.contains("switch it off"), "{}", e.message);
+        let e = call_err(&st, "session/drive_type", json!({ "unit": 8, "type": "1571" }));
+        assert!(e.message.contains("1571"), "{}", e.message);
+        call(&st, "session/drive_power", json!({ "unit": 8, "on": false }));
+        let r = call(&st, "session/drive_type", json!({ "unit": 8, "type": "1581" }));
+        assert_eq!(r["type"], json!("1581"));
+        let state = call(&st, "session/state", json!({}));
+        assert_eq!(state["drives"][0]["type"], json!("1581"));
+        assert_eq!(state["drives"][1]["type"], json!("1541"));
+        let r = call(&st, "session/drive_type", json!({ "unit": 8, "type": 1541 }));
+        assert_eq!(r["type"], json!("1541"), "a number works too");
+    }
+
+    #[test]
+    fn a_d81_fits_a_1581_and_a_1541_refuses_it_naming_its_type() {
+        let Some(st) = booted_state() else { return };
+        let d81 = temp_file("blank.d81", &vec![0u8; 819_200]);
+        let e = call_err(&st, "media/mount", json!({ "path": d81.to_str().unwrap(), "unit": 8 }));
+        assert!(e.message.contains("D81") && e.message.contains("1541"), "{}", e.message);
+        // B off at 9 → a 1581; the D81 goes in.
+        call(&st, "session/drive_type", json!({ "unit": 9, "type": "1581" }));
+        let r = call(&st, "media/mount", json!({ "path": d81.to_str().unwrap(), "unit": 9 }));
+        assert_eq!(r["event"]["format"], json!("d81"), "{r}");
+        {
+            let g = st.lock().unwrap();
+            let b = &g.session.machine.drive_b;
+            assert_eq!(b.get_attached_disk().map(|d| d.kind.clone()), Some(trx64_core::drive::DiskKind::D81));
+        }
+        // A D64 does not fit the 1581.
+        let d64 = temp_file("blank.d64", &named_d64(b"X"));
+        let e = call_err(&st, "media/mount", json!({ "path": d64.to_str().unwrap(), "unit": 9 }));
+        assert!(e.message.contains("1581") && e.message.contains("D64"), "{}", e.message);
+        // A .d81 name on a length that is not a D81 size is refused, not guessed.
+        let bad = temp_file("short.d81", &vec![0u8; 800_000]);
+        let e = call_err(&st, "media/ingress", json!({ "kind": "disk", "path": bad.to_str().unwrap(), "name": "short.d81", "unit": 9 }));
+        assert!(e.message.contains("not a D81 size"), "{}", e.message);
+        // Changing B back to a 1541 ejects the D81 (it does not fit), named in the reply.
+        let r = call(&st, "session/drive_type", json!({ "unit": 9, "type": "1541" }));
+        assert_eq!(r["ejected"]["format"], json!("d81"), "{r}");
+        assert!(st.lock().unwrap().session.machine.drive_b.get_attached_disk().is_none());
+    }
+
+    #[test]
+    fn the_monitor_and_the_status_show_a_1581() {
+        let Some(st) = booted_state() else { return };
+        let Some(rom) = rom_1581() else {
+            eprintln!("[skip] 872 monitor test: no 1581 DOS");
+            return;
+        };
+        call(&st, "session/drive_type", json!({ "unit": 9, "type": "1581" }));
+        st.lock().unwrap().session.machine.drive_b.set_rom_1581(&rom).unwrap();
+        call(&st, "session/drive_power", json!({ "unit": 9, "on": true }));
+        {
+            let mut g = st.lock().unwrap();
+            run_cycle_budget(&mut g.session, 2_000_000);
+        }
+        mon_exec(&st, "device drive9");
+        let r = mon_exec(&st, "r");
+        assert!(r.contains("1581 (drive 9)") && r.contains("wd track"), "{r}");
+        let m = mon_exec(&st, "m 8000 8001");
+        assert!(m.to_ascii_lowercase().contains(&format!("{:02x}", rom[0])), "the ROM at $8000: {m}");
+        mon_exec(&st, "device c64");
+        let d = call(&st, "session/drive_status", json!({ "unit": 9 }));
+        assert_eq!(d["type"], json!("1581"), "{d}");
+        let r = call(&st, "session/read_memory", json!({ "ranges": [{ "addr": 0x8000, "len": 2, "space": "drive9" }] }));
+        let bytes = base64_decode(r["chunks"][0]["bytes"].as_str().unwrap()).unwrap();
+        assert_eq!(bytes, rom[..2].to_vec(), "space drive9 reads the 1581's map: {r}");
+    }
+
+    #[test]
+    fn a_1581_survives_a_power_cycle_of_the_c64() {
+        let Some(st) = booted_state() else { return };
+        call(&st, "session/drive_power", json!({ "unit": 8, "on": false }));
+        call(&st, "session/drive_type", json!({ "unit": 8, "type": "1581" }));
+        call(&st, "session/drive_power", json!({ "unit": 8, "on": true }));
+        call(&st, "session/drive_type", json!({ "unit": 9, "type": "1581" }));
+        call(&st, "session/power", json!({ "op": "off" }));
+        call(&st, "session/power", json!({ "op": "on" }));
+        let g = st.lock().unwrap();
+        let m = &g.session.machine;
+        assert_eq!(m.drive8.board_type(), trx64_core::iec::DriveType::Drive1581, "A is still a 1581");
+        assert!(m.drive8.powered() && m.drive8.unit() == 8, "and on at 8");
+        assert_eq!(m.drive_b.board_type(), trx64_core::iec::DriveType::Drive1581, "B is still a 1581");
+        assert_eq!(m.iec.unit_type[8], trx64_core::iec::DriveType::Drive1581);
     }
 }

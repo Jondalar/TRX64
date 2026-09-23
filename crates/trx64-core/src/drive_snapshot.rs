@@ -124,6 +124,9 @@ fn machine_sync_of(drive: &Drive1541) -> u32 {
 /// Module order: DRIVE8, DRIVECPU0, 1541VIA1D0, VIA2D0. Returns the raw bytes the
 /// `.c64re` checkpoint stores as the `cp.drive1541` `$ta` node.
 pub fn capture_drive1541(drive: &mut Drive1541) -> Vec<u8> {
+    if drive.board_1581().is_some() {
+        return capture_1581(drive);
+    }
     // The rotation runs lazily: it catches up to the drive clock at the next VIA2
     // access. A restore catches it up in the VIA2 undump (undump_pcr → rotate_disk)
     // — but at that point the read/write mode, motor and speed zone are still the
@@ -167,6 +170,14 @@ fn write_drive_stub_module(s: &mut SnapshotT, n: u32) {
 /// Restore the live drive from a `drive1541` blob (= c64re `drive1541.restore()`).
 /// Returns Ok on success; Err(reason) on a malformed/incompatible blob.
 pub fn restore_drive1541(drive: &mut Drive1541, blob: &[u8]) -> Result<(), String> {
+    // Spec 872 — the blob says which board it was taken from (the DRIVE module's `type`);
+    // the position holds that board afterwards.
+    if blob_drive_type(blob) == Some(DRIVE_TYPE_1581) {
+        return restore_1581(drive, blob);
+    }
+    if drive.board_1581().is_some() {
+        drive.force_board_type(crate::iec::DriveType::Drive1541);
+    }
     let mut s = SnapshotT::open_in_memory(blob);
     // VICE drive_snapshot_read_module order: the DRIVE module (GCR_head_offset read
     // straight into the drive, drive-snapshot.c:436; the snap_* rotation fields into
@@ -667,6 +678,9 @@ fn read_via_modules(drive: &mut Drive1541, s: &mut SnapshotT) -> Result<(), Stri
 /// Build the `driveDiskImage` blob (= c64re `drive1541.snapshotDiskImage()`), or
 /// `None` when no GCR image is loaded.
 pub fn capture_drive_disk_image(drive: &Drive1541) -> Option<Vec<u8>> {
+    if drive.board_1581().is_some() {
+        return capture_image_1581(drive);
+    }
     let img = drive.rotation.image.as_ref()?;
     if drive.rotation.gcr_image_loaded == 0 {
         return None;
@@ -711,6 +725,9 @@ pub fn capture_drive_disk_image(drive: &Drive1541) -> Option<Vec<u8>> {
 /// `restoreDiskImage`). Overwrites the per-half-track GCR bytes; a no-op return is
 /// Ok when the GCRIMAGE0 module is absent (drive kept at its baseline).
 pub fn restore_drive_disk_image(drive: &mut Drive1541, blob: &[u8]) -> Result<(), String> {
+    if SnapshotT::open_in_memory(blob).module_open(IMAGE_MODULE).is_some() {
+        return restore_image_1581(drive, blob);
+    }
     let mut s = SnapshotT::open_in_memory(blob);
     let opened = match s.module_open("GCRIMAGE0") {
         Some(o) => o,
@@ -818,6 +835,269 @@ pub fn ensure_disk_attached(drive: &mut Drive1541, bytes: &[u8], kind: DiskKind)
         backing_path: None,
         read_only: false,
     });
+}
+
+// =============================================================================
+// Spec 872 §6 — the 1581 blob: DRIVE8 (type 1581), DRIVECPU0 (0x2000 RAM),
+// CIA1581D0, WD17700 + FDD0, in VICE's order for DRIVE_TYPE_1581
+// (drive-snapshot.c:162-354, iec.c:271-280). Every position's blob uses unit 0's
+// names, as the 1541's does.
+// =============================================================================
+
+/// VICE `DRIVE_TYPE_1581`.
+const DRIVE_TYPE_1581: u32 = 1581;
+/// drive-snapshot.c:643-644 IMAGE_SNAP_MAJOR / _MINOR, and the module name for unit 0.
+const IMAGE_SNAP_MAJOR: u8 = 1;
+const IMAGE_SNAP_MINOR: u8 = 0;
+const IMAGE_MODULE: &str = "IMAGE0";
+
+/// The DRIVE module's `type` (and `None` when the dump carries no true drive).
+fn blob_drive_type(blob: &[u8]) -> Option<u32> {
+    let mut s = SnapshotT::open_in_memory(blob);
+    let (_m, _major, _minor) = s.module_open("DRIVE8")?;
+    let has_tde = s.smr_b()?;
+    if has_tde == 0 {
+        return None;
+    }
+    let _has_drives = s.smr_b()?;
+    let _sync = s.smr_dw()?;
+    let _attach_clk = s.smr_clock()?;
+    let _brl = s.smr_b()?;
+    let _cf = s.smr_b()?;
+    let _ht = s.smr_w()?;
+    let _detach = s.smr_clock()?;
+    let _ext = s.smr_b()?;
+    let _gho = s.smr_dw()?;
+    let _gr = s.smr_b()?;
+    let _gw = s.smr_b()?;
+    let _idle = s.smr_b()?;
+    let _pc = s.smr_b()?;
+    let _ro = s.smr_b()?;
+    let _rtp = s.smr_dw()?;
+    s.smr_dw()
+}
+
+/// The DRIVE8 module for a 1581: the field list VICE writes for every drive
+/// (drive-snapshot.c:204-272). A 1581 has no GCR rotation, so those fields are the
+/// zeros of a rotation that never ran; `clock_frequency` is 2, the half-track word
+/// fdd.c's `(track + 1) * 2`.
+fn write_drive_module_1581(drive: &Drive1541, s: &mut SnapshotT) {
+    let b = drive.board_1581().expect("a 1581 board");
+    let mut m = s.module_create("DRIVE8", DRIVE_SNAP_MAJOR, DRIVE_SNAP_MINOR);
+    s.smw_b(&mut m, 1); // has_tde
+    s.smw_b(&mut m, 1); // has_drives
+    s.smw_dw(&mut m, machine_sync_of(drive));
+    s.smw_clock(&mut m, 0); // attach_clk
+    s.smw_b(&mut m, 0); // byte_ready_level
+    s.smw_b(&mut m, crate::drive1581::CLOCK_FREQUENCY_1581 as u8);
+    s.smw_w(&mut m, ((b.head().0 as u16) + 1) * 2);
+    s.smw_clock(&mut m, 0); // detach_clk
+    s.smw_b(&mut m, 0); // extend_image_policy
+    s.smw_dw(&mut m, 0); // GCR_head_offset
+    s.smw_b(&mut m, 0); // GCR_read
+    s.smw_b(&mut m, 0); // GCR_write_value
+    s.smw_b(&mut m, 0); // idling_method
+    s.smw_b(&mut m, 0); // parallel_cable
+    s.smw_b(&mut m, b.read_only as u8);
+    s.smw_dw(&mut m, 0); // rotation_table_ptr
+    s.smw_dw(&mut m, DRIVE_TYPE_1581);
+    s.smw_dw(&mut m, 0); // accum
+    s.smw_clock(&mut m, 0); // rotation_last_clk
+    for _ in 0..2 {
+        s.smw_dw(&mut m, 0); // bit_counter, zero_count
+    }
+    s.smw_w(&mut m, 0); // last_read_data
+    s.smw_b(&mut m, 0); // last_write_data
+    for _ in 0..14 {
+        // seed, speed_zone, ue7_dcba, ue7_counter, uf4_counter, fr_randcount,
+        // filter_counter, filter_state, filter_last_state, write_flux,
+        // PulseHeadPosition, xorShift32, so_delay, cycle_index
+        s.smw_dw(&mut m, 0);
+    }
+    s.smw_clock(&mut m, 0); // ref_advance
+    s.smw_dw(&mut m, 0); // req_ref_cycles
+    s.smw_clock(&mut m, 0); // attach_detach_clk
+    s.smw_b(&mut m, 0); // byte_ready_edge
+    s.smw_b(&mut m, 0); // byte_ready_active
+    s.module_close(&m);
+}
+
+/// DRIVECPU0 for a 1581: the 1541's 1.4 layout with the 1581's `0x2000` RAM
+/// (drivecpu.c:616-621) and `cpu_last_data`.
+fn write_drivecpu_module_1581(drive: &Drive1541, s: &mut SnapshotT) {
+    let b = drive.board_1581().expect("a 1581 board");
+    let mut m = s.module_create("DRIVECPU0", DRIVECPU_SNAP_MAJOR, DRIVECPU_SNAP_MINOR);
+    let c = &b.core;
+    s.smw_clock(&mut m, c.clk);
+    s.smw_b(&mut m, c.reg_a);
+    s.smw_b(&mut m, c.reg_x);
+    s.smw_b(&mut m, c.reg_y);
+    s.smw_b(&mut m, c.reg_sp);
+    s.smw_w(&mut m, c.reg_pc);
+    s.smw_b(&mut m, c.status());
+    s.smw_dw(&mut m, c.last_opcode_info);
+    s.smw_clock(&mut m, c.clk);
+    s.smw_clock(&mut m, b.snapshot_sync_accum() as u64);
+    s.smw_clock(&mut m, 0);
+    s.smw_clock(&mut m, b.snapshot_stop_clk());
+    s.smw_b(&mut m, b.cpu_last_data);
+    s.smw_ba(&mut m, b.ram(), 0x2000);
+    let int = &b.int;
+    s.smw_clock(&mut m, int.irq_clk);
+    s.smw_clock(&mut m, int.nmi_clk);
+    s.smw_clock(&mut m, int.irq_pending_clk);
+    s.smw_clock(&mut m, 0);
+    s.smw_clock(&mut m, 0);
+    s.smw_dw(&mut m, int.nirq);
+    s.smw_dw(&mut m, int.nnmi);
+    s.smw_dw(&mut m, int.global_pending_int);
+    s.module_close(&m);
+}
+
+fn capture_1581(drive: &mut Drive1541) -> Vec<u8> {
+    let mut s = SnapshotT::create_in_memory();
+    // The CIA module brings its timers and delay line up to the drive clock first,
+    // as ciacore_snapshot_write_module does; take that before the CPU is written so
+    // the interrupt status the CPU module carries includes what it raised.
+    let mut cia = SnapshotT::create_in_memory();
+    drive.board_1581_mut().unwrap().snapshot_write_cia(&mut cia);
+    write_drive_module_1581(drive, &mut s);
+    write_drive_stub_module(&mut s, 9);
+    write_drive_stub_module(&mut s, 10);
+    write_drive_stub_module(&mut s, 11);
+    write_drivecpu_module_1581(drive, &mut s);
+    let cia_bytes = cia.to_bytes();
+    s.buf.truncate(s.pos);
+    s.buf.extend_from_slice(&cia_bytes);
+    s.pos = s.buf.len();
+    drive.board_1581().unwrap().wd.snapshot_write_module(&mut s);
+    s.to_bytes()
+}
+
+fn restore_1581(drive: &mut Drive1541, blob: &[u8]) -> Result<(), String> {
+    drive.force_board_type(crate::iec::DriveType::Drive1581);
+    let dnr = (drive.unit() - 8) as usize;
+    let mut s = SnapshotT::open_in_memory(blob);
+    // DRIVE8: the fields a 1581 uses are its type and the medium's read-only flag;
+    // the medium is the host's (mounted before this), so nothing else is taken.
+    {
+        let (m, major, minor) = s.module_open("DRIVE8").ok_or("drive_snapshot: DRIVE8 module missing")?;
+        if snapshot_version_is_bigger(major, minor, DRIVE_SNAP_MAJOR, DRIVE_SNAP_MINOR) {
+            return Err("drive_snapshot: DRIVE8 module higher version".into());
+        }
+        s.module_close(&m);
+    }
+    let (m, major, minor) = s.module_open("DRIVECPU0").ok_or("drive_snapshot: DRIVECPU0 module missing")?;
+    if major != DRIVECPU_SNAP_MAJOR {
+        return Err(format!("drive_snapshot: DRIVECPU0 module version {major}.{minor}"));
+    }
+    macro_rules! r {
+        ($e:expr) => {
+            $e.ok_or("drive_snapshot: DRIVECPU0 truncated")?
+        };
+    }
+    let clk = r!(s.smr_clock());
+    let a = r!(s.smr_b());
+    let x = r!(s.smr_b());
+    let y = r!(s.smr_b());
+    let sp = r!(s.smr_b());
+    let pc = r!(s.smr_w());
+    let status = r!(s.smr_b());
+    let last_opcode_info = r!(s.smr_dw());
+    let _last_clk = r!(s.smr_clock());
+    let cycle_accum = r!(s.smr_clock());
+    let _last_exc = r!(s.smr_clock());
+    let stop_clk = r!(s.smr_clock());
+    let cpu_last_data = r!(s.smr_b());
+    let mut ram = vec![0u8; 0x2000];
+    if !s.smr_ba(&mut ram, 0x2000) {
+        return Err("drive_snapshot: DRIVECPU0 truncated (RAM)".into());
+    }
+    let int_block = if minor >= DRIVECPU_SNAP_MINOR_INT {
+        let irq_clk = r!(s.smr_clock());
+        let nmi_clk = r!(s.smr_clock());
+        let irq_pending_clk = r!(s.smr_clock());
+        let _ = r!(s.smr_clock());
+        let _ = r!(s.smr_clock());
+        let nirq = r!(s.smr_dw());
+        let nnmi = r!(s.smr_dw());
+        let gpi = r!(s.smr_dw());
+        Some((irq_clk, nmi_clk, irq_pending_clk, nirq, nnmi, gpi))
+    } else {
+        None
+    };
+    s.module_close(&m);
+
+    let b = drive.board_1581_mut().unwrap();
+    b.set_number(dnr);
+    b.core.clk = clk;
+    b.core.reg_a = a;
+    b.core.reg_x = x;
+    b.core.reg_y = y;
+    b.core.reg_sp = sp;
+    b.core.reg_pc = pc;
+    b.core.set_status_composite(status);
+    b.core.last_opcode_info = last_opcode_info;
+    b.snapshot_set_sync_accum((cycle_accum & 0xffff_ffff) as u32);
+    b.snapshot_set_stop_clk(stop_clk);
+    b.cpu_last_data = cpu_last_data;
+    b.ram_mut().copy_from_slice(&ram);
+    b.int = crate::drive_6510core::IntStatus::new();
+    b.int.last_opcode_info_ptr = last_opcode_info;
+    if let Some((irq_clk, nmi_clk, irq_pending_clk, nirq, nnmi, gpi)) = int_block {
+        b.int.irq_clk = irq_clk;
+        b.int.nmi_clk = nmi_clk;
+        b.int.irq_pending_clk = irq_pending_clk;
+        b.int.nirq = nirq;
+        b.int.nnmi = nnmi;
+        b.int.global_pending_int = gpi;
+    }
+    b.snapshot_read_cia(&mut s)?;
+    b.wd.snapshot_read_module(&mut s)?;
+    b.resync_iec_output();
+    b.drive_clk = b.core.clk;
+    b.snapshot_clear_pending_reset();
+    let dc = b.drive_clk;
+    drive.drive_clk = dc;
+    Ok(())
+}
+
+/// The `IMAGE0` module (drive-snapshot.c:656-721): the type word, then the D81 as
+/// written — the sectors, and the error block when the mounted image has one (a
+/// TRX64 extension appended after VICE's layout; a module's size bounds it).
+fn capture_image_1581(drive: &Drive1541) -> Option<Vec<u8>> {
+    let d = drive.disk_as_written()?;
+    let mut s = SnapshotT::create_in_memory();
+    let mut m = s.module_create(IMAGE_MODULE, IMAGE_SNAP_MAJOR, IMAGE_SNAP_MINOR);
+    s.smw_w(&mut m, DRIVE_TYPE_1581 as u16);
+    s.smw_ba(&mut m, &d.bytes, d.bytes.len());
+    s.module_close(&m);
+    Some(s.to_bytes())
+}
+
+/// Put the D81 an `IMAGE0` module carries into the position's medium, without touching
+/// the mechanism (the FDD module restored the head, the latch and the resident track).
+fn restore_image_1581(drive: &mut Drive1541, blob: &[u8]) -> Result<(), String> {
+    let mut s = SnapshotT::open_in_memory(blob);
+    let (m, major, minor) = s.module_open(IMAGE_MODULE).ok_or("drive_snapshot: IMAGE0 missing")?;
+    if major != IMAGE_SNAP_MAJOR {
+        return Err(format!("drive_snapshot: IMAGE0 module version {major}.{minor}"));
+    }
+    let t = s.smr_w().ok_or("drive_snapshot: IMAGE0 truncated")?;
+    if t as u32 != DRIVE_TYPE_1581 {
+        return Err(format!("drive_snapshot: IMAGE0 carries a type {t} image; this reader knows 1581"));
+    }
+    let len = (m.size as usize).saturating_sub(16 + 1 + 1 + 4 + 2);
+    if crate::fdd::d81_geometry(len).is_none() {
+        return Err(format!("drive_snapshot: IMAGE0 carries {len} bytes, not a D81 size"));
+    }
+    let mut bytes = vec![0u8; len];
+    if !s.smr_ba(&mut bytes, len) {
+        return Err("drive_snapshot: IMAGE0 truncated (sectors)".into());
+    }
+    s.module_close(&m);
+    drive.restore_medium_1581(bytes);
+    Ok(())
 }
 
 #[cfg(test)]

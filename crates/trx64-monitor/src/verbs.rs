@@ -933,7 +933,7 @@ fn exec_owned(
             if let Some(unit) = Device::drive_unit(&device) {
                 let m = host.machine();
                 let drv = m.drive(m.position_at_unit(unit).ok_or("no drive at that unit")?);
-                let c = &drv.core;
+                let c = drv.cpu();
                 let flags = c.status();
                 let names = ['N', 'V', '-', 'B', 'D', 'I', 'Z', 'C'];
                 let flags_str: String = names
@@ -944,6 +944,27 @@ fn exec_owned(
                     })
                     .collect();
                 let led = drv.led_on();
+                // Spec 872 — a 1581: its head in physical track and side, the WD's
+                // registers and the CIA's glue, instead of a GCR half-track.
+                if let Some(b) = drv.board_1581() {
+                    let (t, side) = b.head();
+                    let w = b.wd();
+                    let p = b.ports();
+                    return Ok(format!(
+                        "1581 (drive {unit})\n  \
+                         ADDR AC XR YR SP NV-BDIZC  clk\n\
+                         .;{} {:02x} {:02x} {:02x} {:02x} {}  {}\n  \
+                         track {} side {} (logical track {})  motor {}  led {}\n  \
+                         wd track {:02x} sector {:02x} data {:02x} status {:02x} cmd {:02x}{}",
+                        addr_spans::mark(&format!("{:04x}", c.reg_pc), c.reg_pc, SpanSpace::Drive(unit), SpanRole::Pc, None, 1),
+                        c.reg_a, c.reg_x, c.reg_y, c.reg_sp, flags_str, drv.drive_clk,
+                        t, side, t as u32 + 1,
+                        if p.motor_on { "on" } else { "off" },
+                        if led { "on" } else { "off" },
+                        w.track, w.sector, w.data, w.status, w.command,
+                        if w.busy { "  busy" } else { "" }
+                    ));
+                }
                 let halftrack = drv.rotation.current_half_track;
                 // NO `+ 1`: the field's own doc says "current_half_track (2..=84).
                 // Power-on 36 (T18)", so half-track 36 IS track 18. The extra one showed
@@ -1164,7 +1185,7 @@ fn exec_owned(
             }
             let default_pc = if let Some(unit) = Device::drive_unit(&mon.state.device) {
                 let m = host.machine();
-                m.drive(m.position_at_unit(unit).ok_or("no drive at that unit")?).core.reg_pc
+                m.drive(m.position_at_unit(unit).ok_or("no drive at that unit")?).cpu().reg_pc
             } else {
                 host.machine().cpu6510.reg_pc
             };

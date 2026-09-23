@@ -1,6 +1,6 @@
 # TRX64
 
-A headless, cycle-accurate Commodore 64 + 1541 runtime in Rust.
+A headless, cycle-accurate Commodore 64 + 1541 / 1581 runtime in Rust.
 
 **A daemon + API, N front ends.** Headless, API-first: every capability is a
 JSON-RPC method, so a script or an LLM agent drives it as completely as a person does. One
@@ -54,7 +54,10 @@ From source: `cargo build --release`. Builds natively (for Windows it uses MSVC)
 - **Marks & sandboxes** — name a point, jump back to it, branch, discard.
 - **Cartridges** — EasyFlash, Ocean, Magic Desk, GMOD2/3, MegaByter. Flash and EEPROM
   writes survive a reset and a snapshot round trip.
-- **Disks** — `.d64` / `.g64`, 35 to 42 tracks. Drive-side GCR writes reach the host file.
+- **Disks** — `.d64` / `.g64`, 35 to 42 tracks, in a 1541; `.d81`, 80 to 83 tracks, in a 1581.
+  Two drive positions, each a 1541 or a 1581, chosen with the drive switched off. Drive-side
+  writes reach the host file. The 1581 DOS (`dos1581-318045-02.bin`, or `1581.bin`) is
+  not included; put it in the ROM directory.
 - **Expansion port** — REU (1700/1764/1750, oversized to 16 MB), GeoRAM, and the Ultimate
   Command Interface. Devices, not cartridges: several at once, and a host can lend its own RAM.
 - **Machines** — `--machine c64|u64|128`. `u64` is the Ultimate 64 / Elite II / C64 Ultimate:
@@ -117,7 +120,7 @@ Superset based on VICE, 123 verbs. Full reference: **[MONITOR.md](MONITOR.md)**;
 | **Time** | `mark <name>` · `goto <name>` · `frame ±N` · `play back\|fwd` · `cadence` · `window <s>` |
 | **State** | `dump`/`undump` `.c64re` · `ringdump`/`ringload` · `trace on\|off` |
 | **Analysis** | `map` memory map · `taint` · `swimlane` · `diff <a> <b>` |
-| **Drive** | `device drive8` then `r`/`m`/`d` — the 1541's own 6502 |
+| **Drive** | `device drive8` then `r`/`m`/`d` — the drive's own 6502, 1541 or 1581 |
 | **Expansion** | `reu` / `georam` the device decoded · `uci` the command interface · `turbo` the machine |
 
 ---

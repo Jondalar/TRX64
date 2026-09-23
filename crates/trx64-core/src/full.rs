@@ -714,12 +714,9 @@ impl<'a> FullBus<'a> {
                         // ATN-acknowledge (drive auto-pulls DATA) is already folded by
                         // the recompute_drv_bus cpu_bus term inside the conf1 write.
                         for (dnr, edge) in atn_edges {
-                            if let crate::iec::AtnEdge::Via1Ca1 { sig } = edge {
-                                // Spec 871: to the drive at that unit — both see ATN.
-                                crate::drive::pair_deliver_atn(self.drive, self.drive_b, dnr, sig);
-                            }
-                            // Other AtnEdge variants (1581/2000/4000/CMDHD) are
-                            // unreachable: both drive positions are 1541s.
+                            // Spec 871: to the drive at that unit — both see ATN. Spec
+                            // 872: VIA1 CA1 for a 1541, the CIA's FLAG for a 1581.
+                            crate::drive::pair_deliver_atn_edge(self.drive, self.drive_b, dnr, edge);
                         }
                     }
                 }
