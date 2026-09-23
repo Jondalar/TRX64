@@ -1,6 +1,6 @@
 # Spec 871 — A second drive on the bus
 
-**Status:** PROPOSED (2026-09-23)
+**Status:** BUILT (on branch spec-871-second-drive, not merged)
 **Repos:** TRX64. C64RE: no change in this spec — its media tools keep addressing drive 8
 until a separate request asks for more.
 **Number:** 871 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`).
@@ -116,6 +116,193 @@ spec may change what happens on drive 8.
 
 ## §8 Open
 
-- Whether "position" should be visible on the wire at all, or only unit numbers. Unit
-  numbers alone are enough for everything in §7; positions matter only to a host that
-  mirrors the U64's A/B registers. Leaning: unit numbers on the wire, positions inside.
+- ~~Whether "position" should be visible on the wire at all, or only unit numbers.~~
+  Decided with the leaning: **unit numbers on the wire, positions inside.** Every daemon
+  surface takes a unit; `DrivePosition` exists only in the core API (and in the refusal
+  text, which names the position so a U64-mirroring host can map it to its A/B
+  registers).
+
+## §9 As built (2026-09-23, branch `spec-871-second-drive`, on top of 870 incl. d5c66b0)
+
+**Where it lives.** `Machine::drive_b` beside `Machine::drive8`; `drive8` is position A
+and keeps its name (documented as historical — A may stand at unit 8-11). B is built by
+`Drive1541::new_position_b()`: off, jumpers at 9 (`DrivePart::default_for(B)`), same
+sync factor as A. `IecCore` carries `drive_slot` (A) and `drive_slot_b` (B);
+`sync_drive_slots(a, b, pa)` / `adopt_drive_slots(a, b)` build the device map
+`iecbus_status_set` would for the true drives present — Conf1/Conf2 for one drive at 8/9,
+Conf3 for two (or for 10/11), Conf0 for none. The one-drive `sync_drive_slot` /
+`adopt_drive_slot` remain as wrappers with B off.
+
+**One bus, two devices (D2).** Every sync point goes through three free functions in
+`drive.rs`: `pair_catch_up` feeds both drives the bus as it stands (`feed_iec`: `drv_port`,
+`cpu_bus` and every slot's `drv_bus`), runs A, runs B, and only then writes both ports
+back; `pair_fold_into_iec` folds both; `pair_deliver_atn` hands each ATN edge the IEC core
+computed (per unit, as VICE's conf3 loop does) to the drive at that unit. Used by the
+`$DD00` read/write paths in `full.rs` and by the end-of-instruction catch-up in `lib.rs`
+(`Machine::catch_up_drives`). One `drive_c64_ref` serves both: they are always advanced
+together. **B off costs two flag tests** per sync point: not fed, not run, not folded.
+
+- **Decided, not stated:** each drive's own `v_iecbus` now carries the other devices'
+  pulls (copied into the slots other than its own before it runs). VICE's `via1d1541`
+  `store_prb` folds against the ONE global `iecbus`; TRX64 gives each drive its own copy,
+  and without the copy a drive's `$1800` store would compute the lines as if it were
+  alone. On a one-drive machine every other slot is released (`0xff`), which is what the
+  copy already held — byte-identical, and the 7-game screenshots say so.
+- **Refusal.** `Machine::set_drive_power(pos, on)` refuses switching on when the other
+  position is powered at the unit this drive's jumpers would bring it up at;
+  `Machine::set_drive_unit(pos, unit)` refuses a powered drive's jumpers onto the other
+  powered drive's unit. The message names both: "drive position B cannot answer to unit
+  8: position A is powered at unit 8". The drive's own `set_power`/`set_unit` do not
+  know the other position; if a collision arises through them anyway, B stays off the
+  bus (`pair_bus_slots`). The daemon is stricter, see below.
+- **RESET line** reaches both (`warm_reset` → `reset_from_c64` for A and B).
+- **ROM (870 d5c66b0, merged).** B follows the power-on rule: `boot_from_dir` gives B the
+  same DOS and runs `power_on_reset()` for B only when B is on with the machine; off, the
+  DOS waits in `rom_next` until `set_power(true)`. A checkpoint restore that switches B on
+  (it was off before the restore) is B's power-on for the ROM (`latch_rom`, now
+  `pub(crate)`).
+
+**Checkpoints.** A `driveB` node — `drivePart`, the drive core blob, B's disk as mounted
+(kind, bytes, backing path, read-only: the host keeps no record of B's medium, so the
+image rides) and the GCR overlay. **Omitted while B is as built** (off, no disk, stock
+part), so every checkpoint of a one-drive machine is the tree it was — the
+`cia_alarm_check_gate` digests did not move. No node restores B as built (detach, part
+default). The capture reads B from a clone (`capture_drive1541` re-syncs VIA clocks).
+
+- **Found and fixed on the way:** `restore_drive1541` left a never-run drive's pending
+  hardware reset armed (`reset_pending` + `IK_RESET` survive `cold_reset` until the first
+  catch-up, and the DRIVECPU module does not carry the interrupt status that would
+  overwrite them). The first catch-up after the restore then ran the reset sequence over
+  the restored CPU (clock to 6 under a restored `stop_clk` of millions) — the restored
+  machine hung. It hit B whenever B was off until the restore, and position A too when a
+  checkpoint is restored into a freshly booted machine that has not run (measured: the
+  same hang with one drive). `snapshot_clear_pending_reset` after every drive restore.
+
+**Media and surfaces (D3) — the daemon.** The drive-9 refusal is gone. A unit comes from
+`unit`, else a `slot` of 8-11, else a `role` of `driveN` (or a bare number); default 8.
+The position is `Machine::position_for_media(unit)`: the powered drive at that unit, else
+a drive that is off with its jumpers there. `media/ingress`, `media/mount`, `media/swap`,
+`media/unmount`, `media/persist`, `session/drive_status` take it; the session's
+`disk_path` stays A's, B's medium is its image's backing path. The dirty-media guard is
+cart-only and unchanged. Auto-persist runs for B's disk as for A's (`DiskAutoPersist`
+per position). A C64 power cycle (cart insert/eject, `session/power`) keeps B's disk,
+jumpers and power (`Session::inserted_disk_b`, `drive_b_state`); a project switch
+persists and ejects B's disk like A's.
+
+- `session/drive_power {unit?, on?}` — with `on`: `set_drive_power` (refusal as above);
+  without: the press it was, `power_on_reset()` of the drive at `unit`.
+- `session/drive_unit {unit, to}` (new) — set the jumpers of the drive at `unit`.
+  **Stricter than the core:** refused, naming the other position, when the other position
+  is at `to` even while off — on the wire a drive is addressed by its unit, so two
+  positions may not share one at all. Swapping A and B therefore goes through a third
+  unit.
+- `session/state` gains `drives: [{unit, powered, disk: {path}|null}]` (A first; the unit
+  of an off drive is its jumpers) and `device.drive<unit>` for B when it is on.
+- `session/read_memory` reads `space: "drive<unit>"`; `drive8` still reads A when nothing
+  is powered at 8.
+- Monitor forwards: `drive [unit]`, `drivepower [unit] [on|off]`, `eject <unit>`.
+
+**Monitor.** `Device::Drive8` became `Device::Drive(unit)`; `MonitorHost::devices()` now
+takes `&mut self` and by default offers the C64 plus `drive<unit>` for every POWERED
+position — "the drives the machine has on its bus" (decided: an off drive is not
+offered). `device drive9` → `r`/`m`/`d` read that drive; a drive selected and later
+switched off is said so instead of answering for the C64. Address spans carry the unit.
+The UE2 host needs a one-word change if it overrides `devices()`.
+
+**Not extended to B (unchanged, A only):** the `drive8-cpu` trace domain and the head
+trace (Spec 784), the `iec` monitor verb's drive column, and the VICE `.vsf` export.
+
+## §9.1 Acceptance, as run
+
+`crates/trx64-core/tests/second_drive_gate.rs` (8 run by default, 6 ignored heavy),
+daemon tests in `main.rs` (`batch1_tests`), monitor `minimal_host.rs`.
+
+1. **7-game gate.** B off (unchanged gate): **7/7 PASS**, all seven screenshots
+   byte-identical to 870's (which match main's). `GATE_DRIVE_B=9` — B switched on WITH the
+   C64 at unit 9, a blank disk in it, idle: **7/7 PASS by the gate's criterion**, with
+   polarbear, impossible2, lastninja, maniac byte-identical to B off and scramble's title
+   intact. **Two are not really passes, and the gate cannot see it:**
+   - **Green Beret** reaches its loader (PC sustained at `$0385`, so "game code live in
+     RAM") but never draws its title — the screenshot is noise. Its loader, read from RAM:
+     `$0380 LDA #$0A / STA $DD00` asserts ATN, `$0385 LDA $DD00 / BPL $0385` waits for DATA
+     high, `$038A LDA #$02 / STA $DD00` releases ATN, then four `LDA $DD00` 2-bit reads.
+     ATN is its request line — measured, ~2 000 ATN edges per emulated second while it loads.
+   - **Murder on the Mississippi** loads its title into a corrupt bitmap and stops there.
+     Its in-game loader asserts ATN too (C64 `$4270`-`$4290`), a few times per block;
+     measured, e.g. at C64 cycle 30 398 888 drive 9 answers (DATA pulled, B in its ATN IRQ
+     at `$FE68`) and pulls DATA again 300 cycles later from `$E9AD`; the B-on and B-off
+     machines, level until then, diverge within that million cycles.
+   **Cause:** a 1541 answers every ATN — in hardware first (the ATN-acknowledge gate pulls
+   DATA the instant ATN falls, before any software runs), then in its DOS ATN routine. A
+   second, idle 1541 therefore pulls DATA whenever an ATN-signalling loader raises ATN.
+   This is the 1541's circuit and DOS as ported from VICE, not something 871 adds: the
+   other five games are unaffected (four byte-identical screenshots, scramble's title
+   intact). The spec's expectation "a real bus with a passive second
+   1541 on it does not break these loaders" holds for five of the seven; for Green Beret
+   and MOTM the modelled physics says it does.
+   - **Also found:** B switched on 0.8 s before a `LOAD` (its DOS still in its power-on
+     routine) made all seven hang in the KERNAL (`$ED5A`/`$EEA9`): an ATN that falls
+     before the DOS has set VIA1's CA1 edge is never serviced, and the ATN-acknowledge
+     gate holds DATA from then on. A drive is switched on with the C64 or given ~1 s; the
+     gate and the tests do that.
+2. **Two disks, two drives** — `two_drives_list_their_own_disks`: pass (Conf3 in force).
+3. **KERNAL load and save on 9** — `kernal_load_and_save_on_nine`: `LOAD"FILE",9` equals
+   B's PRG byte for byte; `SAVE"NEW",9` is byte-identical in B's image after the
+   write-back; A's image unchanged. Pass.
+4. **A copy between them** — `basic_copy_from_eight_to_nine`: every byte value incl.
+   CHR$(0), 300 bytes, 8 → 9 through `GET#`/`PRINT#`; byte-identical SEQ in B's image,
+   source unchanged. Pass.
+5. **B off is today** — the B-off 7-game screenshots above; the drive gates
+   (`drive_part_gate`, `drive_write_readback_gate`, …) unchanged and green;
+   `b_off_is_not_clocked_and_not_on_the_bus` (B's clock stays 0, Conf1, no `driveB`).
+6. **Same number refused** — `the_same_unit_twice_is_refused_naming_the_other`, and on the
+   wire `two_positions_at_one_unit_are_refused_naming_the_other`. Pass.
+7. **Checkpoints** — `two_drives_mid_transfer_round_trip_a_checkpoint`: mid-copy (both
+   files open) through a `.c64re` container into a freshly booted machine; the restored
+   state equals the captured one (C64 RAM, both drive RAMs, all clocks and PCs, bus map),
+   and the restored run finishes the copy byte-identical. **Not asserted: cycle-lockstep
+   continuation** — it does not hold for one drive either (measured: one-drive restore
+   parts after 50 frames, two drives after 450), because TRX64's DRIVECPU module leaves
+   out the drive CPU's interrupt status, which VICE's `drivecpu_snapshot_write_module`
+   writes (`interrupt_write_snapshot`). Pre-existing; a checkpoint-format change, not 871.
+   `an_older_checkpoint_restores_with_b_off`: pass. Also
+   `position_b_takes_its_rom_at_its_own_power_on` (870 rule for B).
+
+**§7.8 — the seven games from drive 9** (A off, B at 9, `LOAD"*",9,1` + `RUN`, 100 M
+cycles, judged as the 7-game gate judges; `characterise_the_seven_games_from_nine`):
+
+| game | KERNAL stage | fastloader stage | where it stops |
+|---|---|---|---|
+| scramble | loads (chains on) | **boots** — title + game live; drive 9 runs code in its RAM, head moves | in the game |
+| polarbear | loads (chains on) | **boots** — game live, same picture as from 8; drive 9 runs code in its RAM | in the game |
+| motm | loads (chains on) | no — drive 9 never runs code in its RAM, head never moves | C64 `$EA0E` (IRQ over a blank screen); its loader talks to 8 |
+| greenberet | loads (chains to its loader at `$0385`) | **boots** — title rendered (15 colours); drive 9 runs code in its RAM | title |
+| impossible2 | loads the first file (to READY, end `$0314`) | no — the next file is never found; drive 9 idle | "SEARCHING FOR IMP", READY |
+| lastninja | loads (chains on) | **boots** — title + game live; drive 9's head moves, no drive code in its RAM | in the game |
+| maniac | loads (chains to `$0406`) | no — drive 9 never runs code in its RAM, head never moves after RUN | C64 waiting at `$0406`; its loader talks to 8 |
+
+Four boot fully from 9 — **scramble, polarbear, greenberet, lastninja** — and each is now
+a regression test (`from_nine_*`, ignored like the 7-game gate). Green Beret boots from 9
+alone and breaks with an idle drive 9 beside drive 8: its loader takes the unit from `$BA`,
+but it signals with ATN, which every drive on the bus answers.
+
+**§7.9 — cost** (`characterise_the_cost_of_a_second_drive`, release, `LOAD"*",8,1` of
+scramble, 1500 frames, best of 3): **B off 1.661 ms/frame** (B's drive clock stays 0),
+**B on at 9, idle with a disk, 1.834 ms/frame — ×1.10**. An idle second drive costs ~10 %
+of a frame here, less than "doubles the drive share" because the DOS idle loop is cheap.
+
+**Shown red** with the change taken out, each test then green again: B not caught up
+(gates 2/3/4/7 and 6's load), B's port not folded (same), ATN not delivered to B (gate 2),
+B built on (gate 5), no collision check (gate 6), no `driveB` capture (gate 7), an older
+checkpoint leaving B as it is (gate 7b), the restore not latching B's ROM (gate 7), the
+pending reset kept on restore (gate 7 hangs), `set_power` not latching (B-ROM test); on
+the wire: the drive-9 refusal put back, `devices()` offering drive 8 only (daemon and
+`minimal_host`), `drive_unit` without its refusal, B not carried over a power cycle.
+
+**Suites.** `cargo test -p trx64-core --no-fail-fast`: **624 passed, 0 failed, 57
+ignored** (870: 616; +8 `second_drive_gate`). `cargo test -p trx64-daemon`: **389 passed,
+0 failed** (870: 381; +4 tests, compiled into both the lib and the bin target). Monitor
+golden (with `TRX64_ROM_DIR`) re-blessed for the three help lines only. Two probes (`drive_sector_read`,
+`gcr_sync_probe`) booted a bare `Drive1541` with `cold_reset` and ran an empty ROM since
+870's d5c66b0 — red on the 870 branch too; they now boot with `power_on_reset()`.
+
