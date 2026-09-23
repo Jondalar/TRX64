@@ -23,10 +23,23 @@
 //!      mutable disk content (the GCRIMAGE0 module).
 //!
 //! Field parity notes (vs drive-snapshot.c / drivecpu.c / the c64re facade):
-//!   - The c64re facade wires `interrupt_write_snapshot`/`_read_snapshot`/
-//!     `_write_new_snapshot`/`_read_new_snapshot` ALL to no-ops returning 0, so the
-//!     DRIVECPU module carries NO interrupt sub-blocks — just the header regs +
-//!     0x800 RAM. We match exactly (drivecpu.ts:1006/1045 hooks are no-ops).
+//!   - DRIVECPU0 is 1.4: the 1.3 fields and the 0x800 RAM, then the drive CPU's
+//!     interrupt status — VICE's `interrupt_write_snapshot` fields (irq_clk,
+//!     nmi_clk, irq_pending_clk, num_last_stolen_cycles, last_stolen_cycles_clk)
+//!     followed by `interrupt_write_new_snapshot`'s (nirq, nnmi, global_pending_int).
+//!     VICE writes the first group before the RAM and the second after it
+//!     (drivecpu.c:599/629); here both sit at the END of the module, so a reader
+//!     from before 1.4 — which finds the module by name and skips to its recorded
+//!     size on close — reads the RAM where it always was and never sees them. The
+//!     byte layout is therefore NOT VICE's; the fields and their meaning are.
+//!     Until 1.4 the block was left out (the c64re facade this was ported from had
+//!     the interrupt snapshot hooks as no-ops), and a restored drive left an
+//!     uninterrupted one within frames. A 1.3 module restores with the drive's
+//!     interrupt status reset.
+//!   - GCRIMAGE0 is 3.2: one byte appended, `complicated_image_loaded` (which
+//!     rotation engine runs), which VICE neither saves nor restores (it forces 1).
+//!   - The capture catches the lazy rotation up to the drive clock first, so the
+//!     VIA2 undump on restore has no lag to rotate in the wrong read/write mode.
 //!   - `vdrive_snapshot_module_write/read`, `machine_drive_rom_setup_image`,
 //!     `ieee_drive_snapshot_*` are no-ops in the c64re facade → the `drive1541`
 //!     blob is exactly DRIVE8 + DRIVECPU0 + 1541VIA1D0 + VIA2D0 in that order.
@@ -47,13 +60,21 @@ use crate::viacore;
 const DRIVE_SNAP_MAJOR: u8 = 2;
 const DRIVE_SNAP_MINOR: u8 = 0;
 
-/// drivecpu.c:565-566 — SNAP_MAJOR / SNAP_MINOR (1.3 added cpu_last_data).
+/// drivecpu.c:565-566 — SNAP_MAJOR / SNAP_MINOR (1.3 added cpu_last_data). 1.4 is
+/// TRX64's: the interrupt status appended at the end of the module (VICE is at 1.3
+/// with the same fields in the middle — see the module doc).
 const DRIVECPU_SNAP_MAJOR: u8 = 1;
-const DRIVECPU_SNAP_MINOR: u8 = 3;
+const DRIVECPU_SNAP_MINOR: u8 = 4;
+/// The first DRIVECPU minor that carries the interrupt status.
+const DRIVECPU_SNAP_MINOR_INT: u8 = 4;
 
-/// drive-snapshot.c:857-858 — GCRIMAGE_SNAP_MAJOR / _MINOR.
+/// drive-snapshot.c:857-858 — GCRIMAGE_SNAP_MAJOR / _MINOR. 3.2 is TRX64's: one
+/// byte appended at the end of the module, `complicated_image_loaded` (see
+/// `restore_drive_disk_image`).
 const GCRIMAGE_SNAP_MAJOR: u8 = 3;
-const GCRIMAGE_SNAP_MINOR: u8 = 1;
+const GCRIMAGE_SNAP_MINOR: u8 = 2;
+/// The first GCRIMAGE minor that carries `complicated_image_loaded`.
+const GCRIMAGE_SNAP_MINOR_ENGINE: u8 = 2;
 
 /// drivetypes.ts:110 — DRIVE_HALFTRACKS_1571 (the half-track multiplier folded into
 /// the saved `current_half_track + side*DRIVE_HALFTRACKS_1571` word).
@@ -103,6 +124,15 @@ fn machine_sync_of(drive: &Drive1541) -> u32 {
 /// Module order: DRIVE8, DRIVECPU0, 1541VIA1D0, VIA2D0. Returns the raw bytes the
 /// `.c64re` checkpoint stores as the `cp.drive1541` `$ta` node.
 pub fn capture_drive1541(drive: &mut Drive1541) -> Vec<u8> {
+    // The rotation runs lazily: it catches up to the drive clock at the next VIA2
+    // access. A restore catches it up in the VIA2 undump (undump_pcr → rotate_disk)
+    // — but at that point the read/write mode, motor and speed zone are still the
+    // restoring machine's, so the lag would be rotated in the wrong mode (a drive
+    // writing when captured read its lag back instead: the restored disk and head
+    // parted from the straight run). Catching the rotation up here first leaves no
+    // lag for the undump to rotate. It is the rotation any VIA2 access would do now;
+    // the rotation is the same whether it runs in one stretch or two.
+    drive.snapshot_catch_up_rotation();
     let mut s = SnapshotT::create_in_memory();
     write_drive_module(drive, &mut s);
     // VICE drive_snapshot_write_module walks ALL NUM_DISK_UNITS (drives 8..11) and
@@ -138,21 +168,32 @@ fn write_drive_stub_module(s: &mut SnapshotT, n: u32) {
 /// Returns Ok on success; Err(reason) on a malformed/incompatible blob.
 pub fn restore_drive1541(drive: &mut Drive1541, blob: &[u8]) -> Result<(), String> {
     let mut s = SnapshotT::open_in_memory(blob);
-    // VICE drive_snapshot_read_module order: read the DRIVE module rotation fields,
-    // then drivecpu, then VIA — and re-establish the head position (drive_set_
-    // half_track + GCR_head_offset) LAST (drive-snapshot.c:601-620, AFTER the VIA
-    // undump). The VIA2 undump_prb/undump_pcr call rotation_rotate_disk, which would
-    // move the head if applied before; deferring the head set matches VICE exactly.
+    // VICE drive_snapshot_read_module order: the DRIVE module (GCR_head_offset read
+    // straight into the drive, drive-snapshot.c:436; the snap_* rotation fields into
+    // the rotation by rotation_table_set, :479), then DRIVECPU, then the VIAs. The
+    // VIA2 undump (undump_pcr → via2d_update_pcr) calls rotation_rotate_disk, which
+    // advances the head from the restored offset up to the restored drive clock —
+    // exactly the rotation the uninterrupted drive does lazily at its next access.
+    // So the head must be in place BEFORE the VIA read: setting it afterwards (as
+    // this did until the DRIVECPU 1.4 change) threw that advance away while keeping
+    // the advanced rotation clock, and the restored head ran behind.
+    // VICE calls drive_set_half_track only at the very end (:617), so its undump
+    // rotate reads from whatever track was current before the restore; here the
+    // track is set first too, so that rotate reads the captured track.
     let head = read_drive_module(drive, &mut s)?;
-    read_drivecpu_module(drive, &mut s)?;
-    read_via_modules(drive, &mut s)?;
     if let Some((half_track, gcr_head_offset)) = head {
-        // drive_set_half_track re-resolves the active track size + GCR_track_start_ptr.
+        // drive_set_half_track re-resolves the active track size + GCR_track_start_ptr
+        // (and rescales the old offset, which the saved one then replaces).
         drive.rotation.set_half_track(half_track);
-        // VICE restores GCR_head_offset directly (drive-snapshot.c:440 sets it into
-        // the drive_t; set_half_track only rescales, then the saved value is the
-        // authoritative head position at the snapshot instant).
         drive.rotation.gcr_head_offset = gcr_head_offset;
+    }
+    let carried_int = read_drivecpu_module(drive, &mut s)?;
+    read_via_modules(drive, &mut s)?;
+    if carried_int {
+        // interrupt_restore_irq's pending_int half (the VIA reads just set the level).
+        // Without the module's status the reset `pending_int` stays clear, so the next
+        // instruction boundary takes each asserted source as a fresh edge.
+        drive.snapshot_restore_pending_int();
     }
     drive.snapshot_sync_drive_clk();
     drive.snapshot_clear_pending_reset();
@@ -279,9 +320,9 @@ fn write_drive_module(drive: &mut Drive1541, s: &mut SnapshotT) {
 
 /// Read the DRIVE8 module into the live rotation. Applies every rotation field
 /// EXCEPT the head position (`current_half_track` / `gcr_head_offset`), which the
-/// caller re-establishes LAST via `set_half_track` (VICE order — after the VIA
-/// undump's rotate). Returns `Some((half_track, gcr_head_offset))` for that final
-/// step, or `None` when the dump carried no true-drive-emulation (has_tde=0).
+/// caller sets via `set_half_track` before the VIA read (see `restore_drive1541`).
+/// Returns `Some((half_track, gcr_head_offset))` for that step, or `None` when the
+/// dump carried no true-drive-emulation (has_tde=0).
 fn read_drive_module(
     drive: &mut Drive1541,
     s: &mut SnapshotT,
@@ -373,8 +414,7 @@ fn read_drive_module(
     s.module_close(&m);
 
     // Apply every rotation field EXCEPT the head position (current_half_track +
-    // gcr_head_offset), which the caller re-establishes LAST (VICE order: after the
-    // VIA undump's rotate_disk). side handling (drive-snapshot.c:607-616) is 1571
+    // gcr_head_offset), which the caller sets next, before the VIA read. side handling (drive-snapshot.c:607-616) is 1571
     // only; the 1541 keeps side 0, so half_track_word == current_half_track.
     let r = &mut drive.rotation;
     r.attach_clk = attach_clk;
@@ -415,13 +455,16 @@ fn read_drive_module(
 }
 
 // =============================================================================
-// DRIVECPU<n> module — drivecpu.c:568-640 / :642-737 (no interrupt sub-blocks)
+// DRIVECPU<n> module — drivecpu.c:568-640 / :642-737
 // =============================================================================
 //
-// drivecpu.c:934-953 format (1.3): CLOCK clk; B a,x,y,sp; W pc; B status;
-// DW last_opcode_info; CLOCK last_clk, cycle_accum, last_exc_cycles, stop_clk;
-// B cpu_last_data; ARRAY drive RAM (0x800 for the 1541). The c64re facade wires
-// the interrupt snapshot hooks to no-ops, so NO interrupt block follows the RAM.
+// 1.3 (drivecpu.c:540-562 without its interrupt blocks): CLOCK clk; B a,x,y,sp;
+// W pc; B status; DW last_opcode_info; CLOCK last_clk, cycle_accum,
+// last_exc_cycles, stop_clk; B cpu_last_data; ARRAY drive RAM (0x800, 1541).
+// 1.4 appends the interrupt status (interrupt.c:385-410):
+//   CLOCK irq_clk, nmi_clk, irq_pending_clk, num_last_stolen_cycles,
+//         last_stolen_cycles_clk                       (interrupt_write_snapshot)
+//   DW    nirq, nnmi, global_pending_int               (interrupt_write_new_snapshot)
 
 fn write_drivecpu_module(drive: &mut Drive1541, s: &mut SnapshotT) {
     let mut m = s.module_create("DRIVECPU0", DRIVECPU_SNAP_MAJOR, DRIVECPU_SNAP_MINOR);
@@ -459,14 +502,37 @@ fn write_drivecpu_module(drive: &mut Drive1541, s: &mut SnapshotT) {
     let ram = *drive.snapshot_ram();
     s.smw_ba(&mut m, &ram, 0x800);
 
+    // 1.4 — the interrupt status, at the end (module doc). The drive CPU has no DMA,
+    // so nothing ever steals its cycles: num_last_stolen_cycles and
+    // last_stolen_cycles_clk keep interrupt_cpu_status_reset's 0 (only dma.c sets
+    // them, for the main CPU) and TRX64's IntStatus has no field for them.
+    let int = &drive.int;
+    s.smw_clock(&mut m, int.irq_clk);
+    s.smw_clock(&mut m, int.nmi_clk);
+    s.smw_clock(&mut m, int.irq_pending_clk);
+    s.smw_clock(&mut m, 0); // num_last_stolen_cycles
+    s.smw_clock(&mut m, 0); // last_stolen_cycles_clk
+    s.smw_dw(&mut m, int.nirq);
+    s.smw_dw(&mut m, int.nnmi);
+    s.smw_dw(&mut m, int.global_pending_int);
+
     s.module_close(&m);
 }
 
-fn read_drivecpu_module(drive: &mut Drive1541, s: &mut SnapshotT) -> Result<(), String> {
-    let (m, _major, _minor) = s
+/// Read DRIVECPU0 into the drive. Returns whether the module carried the interrupt
+/// status (1.4 on); without it the status is reset.
+fn read_drivecpu_module(drive: &mut Drive1541, s: &mut SnapshotT) -> Result<bool, String> {
+    let (m, major, minor) = s
         .module_open("DRIVECPU0")
         .ok_or("drive_snapshot: DRIVECPU0 module missing")?;
-    let _ = m;
+    // A major we do not know is a layout we cannot read. A newer minor of major 1
+    // only appends (the rule 1.4 follows), so its known prefix is read and the rest
+    // skipped by `module_close`.
+    if major != DRIVECPU_SNAP_MAJOR {
+        return Err(format!(
+            "drive_snapshot: DRIVECPU0 module version {major}.{minor} — this reader knows major {DRIVECPU_SNAP_MAJOR} only"
+        ));
+    }
 
     macro_rules! rb {
         () => {
@@ -510,6 +576,26 @@ fn read_drivecpu_module(drive: &mut Drive1541, s: &mut SnapshotT) -> Result<(), 
         return Err("drive_snapshot: DRIVECPU0 truncated (RAM)".into());
     }
 
+    // 1.4 — the interrupt status. interrupt_read_snapshot first clears what it does
+    // not carry (pending_int[], global_pending_int, nirq, nnmi — reset and trap are
+    // not modelled), then reads; interrupt_read_new_snapshot restores the counts and
+    // the pending mask. drivecpu_snapshot_read_module has reset the whole status
+    // before (interrupt_cpu_status_reset), which is what an older module leaves.
+    let carried_int = minor >= DRIVECPU_SNAP_MINOR_INT;
+    let int_block = if carried_int {
+        let irq_clk = rclk!();
+        let nmi_clk = rclk!();
+        let irq_pending_clk = rclk!();
+        let _num_last_stolen_cycles = rclk!(); // no IntStatus field — the drive never steals
+        let _last_stolen_cycles_clk = rclk!();
+        let nirq = rdw!();
+        let nnmi = rdw!();
+        let global_pending_int = rdw!();
+        Some((irq_clk, nmi_clk, irq_pending_clk, nirq, nnmi, global_pending_int))
+    } else {
+        None
+    };
+
     s.module_close(&m);
 
     drive.core.clk = clk;
@@ -524,7 +610,20 @@ fn read_drivecpu_module(drive: &mut Drive1541, s: &mut SnapshotT) -> Result<(), 
     drive.snapshot_set_stop_clk(stop_clk);
     *drive.snapshot_ram_mut() = ram;
 
-    Ok(())
+    // interrupt_cpu_status_reset (IntStatus::new), keeping the opcode-info mirror
+    // in step with the core as VICE keeps `last_opcode_info_ptr` across the reset.
+    drive.int = crate::drive_6510core::IntStatus::new();
+    drive.int.last_opcode_info_ptr = last_opcode_info;
+    if let Some((irq_clk, nmi_clk, irq_pending_clk, nirq, nnmi, global_pending_int)) = int_block {
+        drive.int.irq_clk = irq_clk;
+        drive.int.nmi_clk = nmi_clk;
+        drive.int.irq_pending_clk = irq_pending_clk;
+        drive.int.nirq = nirq;
+        drive.int.nnmi = nnmi;
+        drive.int.global_pending_int = global_pending_int;
+    }
+
+    Ok(carried_int)
 }
 
 // =============================================================================
@@ -601,6 +700,8 @@ pub fn capture_drive_disk_image(drive: &Drive1541) -> Option<Vec<u8>> {
             }
         }
     }
+    // 3.2 — which rotation engine the drive runs, at the end of the module.
+    s.smw_b(&mut m, drive.rotation.complicated_image_loaded as u8);
 
     s.module_close(&m);
     Some(s.to_bytes())
@@ -617,8 +718,13 @@ pub fn restore_drive_disk_image(drive: &mut Drive1541, blob: &[u8]) -> Result<()
     };
     let (m, major, minor) = opened;
     let _ = m;
-    if snapshot_version_is_bigger(major, minor, GCRIMAGE_SNAP_MAJOR, GCRIMAGE_SNAP_MINOR) {
-        return Err("drive_snapshot: GCRIMAGE0 higher version".into());
+    // As DRIVECPU0: an unknown major is refused by name; a newer minor of major 3
+    // only appends, so its known prefix is read and `module_close` skips the rest.
+    // (TRX64 before 3.2 refuses any higher version, 3.2 included — loudly.)
+    if major != GCRIMAGE_SNAP_MAJOR {
+        return Err(format!(
+            "drive_snapshot: GCRIMAGE0 module version {major}.{minor} — this reader knows major {GCRIMAGE_SNAP_MAJOR} only"
+        ));
     }
 
     let num_half_tracks = s
@@ -662,10 +768,22 @@ pub fn restore_drive_disk_image(drive: &mut Drive1541, blob: &[u8]) -> Result<()
             t.size = 0;
         }
     }
+    // Which rotation engine runs: a D64 starts on the simple one and switches to the
+    // GCR circuit for good at its first write (rotation.c:1098); a G64 runs the
+    // circuit from the attach. VICE's drive_snapshot_read_gcrimage_module sets 1
+    // unconditionally ("TODO: verify if it's really like this", :983) and does not
+    // save it, so a restored D64 drive that had never written ran the other engine
+    // and left the uninterrupted drive within a frame. From 3.2 the module carries
+    // it; an older one gets VICE's 1.
+    let complicated = if minor >= GCRIMAGE_SNAP_MINOR_ENGINE {
+        s.smr_b().ok_or("drive_snapshot: GCRIMAGE0 truncated (complicated_image_loaded)")? as i32
+    } else {
+        1
+    };
     s.module_close(&m);
 
     drive.rotation.gcr_image_loaded = 1;
-    drive.rotation.complicated_image_loaded = 1;
+    drive.rotation.complicated_image_loaded = complicated;
     // Re-resolve the active track size for the current head WITHOUT rescaling the
     // head offset. The drive1541 blob already restored `current_half_track` +
     // `gcr_head_offset` via its own drive_set_half_track + the explicit head value;
@@ -780,9 +898,6 @@ mod tests {
         });
         drive.run_cycles(2_000_000);
 
-        let head = drive.rotation.gcr_head_offset;
-        let half_track = drive.rotation.current_half_track;
-        let track_size = drive.rotation.gcr_current_track_size;
         let pc = drive.core.reg_pc;
         // VICE's drive_snapshot_read_module order means VIA2 undump_prb re-derives
         // speed_zone from (PRB | ~DDRB) >> 5 & 3 AFTER the DRIVE module — so the
@@ -794,6 +909,11 @@ mod tests {
         let blob = capture_drive1541(&mut drive);
         let disk_blob = capture_drive_disk_image(&drive).expect("disk image blob");
         assert!(!disk_blob.is_empty());
+        // Read after the capture: it catches the lazy rotation up to the drive clock,
+        // so the head the blob describes is the one the drive has now.
+        let head = drive.rotation.gcr_head_offset;
+        let half_track = drive.rotation.current_half_track;
+        let track_size = drive.rotation.gcr_current_track_size;
 
         // Sample a known GCR byte from the current track for content comparison.
         let cur_slot = (half_track as usize) - 2;

@@ -1562,7 +1562,9 @@ fn drive_b_node(m: &Machine) -> Option<serde_json::Value> {
             "readOnly": d.read_only,
         })
     });
-    let overlay = crate::drive_snapshot::capture_drive_disk_image(b);
+    // From the copy: the capture caught its rotation up, which in write mode puts
+    // bits on the track — the overlay must be that disk.
+    let overlay = crate::drive_snapshot::capture_drive_disk_image(&copy);
     Some(json!({
         "drivePart": serde_json::to_value(part).unwrap(),
         "drive1541": ta_u8(&blob),

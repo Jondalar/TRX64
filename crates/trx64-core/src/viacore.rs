@@ -379,7 +379,8 @@ pub trait ViaBackend {
     /// set_int (via2d.c:112-121). `ctx.set_int?.(ctx, int_num, value, rclk)` →
     /// interrupt_set_irq(int_status, int_num, value, rclk).
     fn set_int(&mut self, _ctx: &ViaContext, _int_num: u32, _value: u32, _rclk: u64) {}
-    /// restore_int (via2d.c:123-130). No-op for the headless drive (snapshot only).
+    /// restore_int (via2d.c:123-130), called by the snapshot read. No-op by default;
+    /// the two drive VIA backends implement it.
     fn restore_int(&mut self, _ctx: &ViaContext, _int_num: u32, _value: u32) {}
     /// set_ca2 (via2d.c:72-93). `ctx.set_ca2?.(ctx, state)`.
     fn set_ca2(&mut self, _ctx: &ViaContext, _state: u32) {}
@@ -2103,8 +2104,17 @@ impl<'a> ViaBackend for Via2dBackend<'a> {
         self.irq.set(value != 0, rclk);
     }
 
-    // PORT OF: via2d.ts:265-275 (restore_int) — no-op for headless.
-    fn restore_int(&mut self, _ctx: &ViaContext, _int_num: u32, _value: u32) {}
+    // PORT OF: iecieee/via2d.c:123-130 restore_int → interrupt_restore_irq(int_status, int_num,
+    // value) (interrupt.c:191-198): the source's IRQ level comes back from the
+    // restored IFR & IER, no clock is stamped. TRX64 keeps a source's level in this
+    // mirror; the drive restore then sets `pending_int[int_num]` from it (the other
+    // half of interrupt_restore_irq), so the next boundary sees no edge. The stamp
+    // is only read on an edge — an older blob, whose interrupt status is reset,
+    // takes the edge at the restore clock.
+    fn restore_int(&mut self, ctx: &ViaContext, _int_num: u32, value: u32) {
+        self.irq.active = value != 0;
+        self.irq.stamp = if value != 0 { ctx.clk } else { u64::MAX };
+    }
 
     // PORT OF: via2d.ts:355-368 (store_pra)
     fn store_pra(&mut self, ctx: &mut ViaContext, byte: u8, _oldpa: u8, _addr: usize) {
@@ -2403,8 +2413,12 @@ impl<'a> ViaBackend for Via1dBackend<'a> {
         self.irq.set(value != 0, rclk);
     }
 
-    // PORT OF: via1d1541.ts:421-431 (restore_int — static). No-op for headless.
-    fn restore_int(&mut self, _ctx: &ViaContext, _int_num: u32, _value: u32) {}
+    // PORT OF: via1d1541.c:102-107 restore_int → interrupt_restore_irq — see
+    // Via2dBackend::restore_int.
+    fn restore_int(&mut self, ctx: &ViaContext, _int_num: u32, value: u32) {
+        self.irq.active = value != 0;
+        self.irq.stamp = if value != 0 { ctx.clk } else { u64::MAX };
+    }
 
     // PORT OF: via1d1541.ts:482-530 (store_pra — static).
     // The 1541 (default) branch has NO parallel cable installed, so store_pra

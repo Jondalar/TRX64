@@ -274,11 +274,14 @@ daemon tests in `main.rs` (`batch1_tests`), monitor `minimal_host.rs`.
 7. **Checkpoints** — `two_drives_mid_transfer_round_trip_a_checkpoint`: mid-copy (both
    files open) through a `.c64re` container into a freshly booted machine; the restored
    state equals the captured one (C64 RAM, both drive RAMs, all clocks and PCs, bus map),
-   and the restored run finishes the copy byte-identical. **Not asserted: cycle-lockstep
-   continuation** — it does not hold for one drive either (measured: one-drive restore
-   parts after 50 frames, two drives after 450), because TRX64's DRIVECPU module leaves
-   out the drive CPU's interrupt status, which VICE's `drivecpu_snapshot_write_module`
-   writes (`interrupt_write_snapshot`). Pre-existing; a checkpoint-format change, not 871.
+   and the restored run finishes the copy byte-identical. As built on 871 the
+   restored machine parted from the straight run after ~450 frames, put down then to the
+   drive CPU's interrupt status missing from DRIVECPU. Fixed on `fix-drive-int-snapshot`,
+   where measuring found the causes elsewhere — the VIAs' IRQ levels not restored, the
+   head placed after the VIA undump's rotation, the rotation engine forced to the GCR
+   circuit on restore, and the rotation lag rotated in the restoring machine's
+   read/write mode (the interrupt block is written too, VICE's fields, but no capture
+   tried needs it). The test now asserts 500 frames of cycle-for-cycle lockstep.
    `an_older_checkpoint_restores_with_b_off`: pass. Also
    `position_b_takes_its_rom_at_its_own_power_on` (870 rule for B).
 

@@ -1345,12 +1345,35 @@ impl Drive1541 {
         self.drive_clk = self.core.clk;
     }
 
+    /// Bring the disk rotation up to the drive clock (what a VIA2 access does first).
+    pub(crate) fn snapshot_catch_up_rotation(&mut self) {
+        let clk = self.core.clk;
+        self.rotation.rotate_disk(clk);
+    }
+
+    /// The second half of VICE's `interrupt_restore_irq` (interrupt.c:191-198),
+    /// which the VIA snapshot read calls through `restore_int`: each source's
+    /// `pending_int` IRQ bit follows the level its VIA was restored with (the VIA
+    /// backends' `restore_int` already set the level mirror). `nirq`, `irq_clk` and
+    /// `global_pending_int` are not touched — they came from the DRIVECPU module.
+    pub(crate) fn snapshot_restore_pending_int(&mut self) {
+        use crate::drive_6510core::IK_IRQ;
+        for (n, active) in [self.via1_irq.active, self.via2_irq.active].into_iter().enumerate() {
+            if active {
+                self.int.pending_int[n] |= IK_IRQ;
+            } else {
+                self.int.pending_int[n] &= !IK_IRQ;
+            }
+        }
+    }
+
     /// Spec 871 — a restored drive is mid-program, not at a reset. A drive that has
     /// never run since its last `cold_reset` still has the hardware reset armed
-    /// (`reset_pending` + `IK_RESET`), and the DRIVECPU module does not carry the
-    /// interrupt status that would overwrite it, so its first catch-up after the
-    /// restore would run the reset sequence over the restored CPU. Position B is such
-    /// a drive whenever it was off until the restore.
+    /// (`reset_pending` + `IK_RESET`). `reset_pending` is TRX64's own latch and rides
+    /// no module, and a DRIVECPU module older than 1.4 carries no interrupt status to
+    /// overwrite `IK_RESET`, so without this its first catch-up after the restore
+    /// would run the reset sequence over the restored CPU. Position B is such a drive
+    /// whenever it was off until the restore.
     pub(crate) fn snapshot_clear_pending_reset(&mut self) {
         self.reset_pending = false;
         self.int.global_pending_int &= !IK_RESET;

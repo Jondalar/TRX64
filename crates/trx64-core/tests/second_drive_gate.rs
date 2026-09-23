@@ -542,11 +542,20 @@ fn two_drives_mid_transfer_round_trip_a_checkpoint() {
     let d = state_diff(&r, &m);
     assert!(d.is_empty(), "restored ≠ captured: {d}");
 
-    // Both run the copy to its end. Cycle-for-cycle lockstep is not what is asked
-    // here and does not hold for one drive either: TRX64's DRIVECPU module leaves out
-    // the drive CPU's interrupt status (VICE writes it), so a restored drive and the
-    // one that ran straight through part after some frames. What must hold: the
-    // transfer both drives were in the middle of survives the dump.
+    // Cycle for cycle: the restored machine and the one that ran straight on stay the
+    // same machine for 500 frames — both drives writing and reading mid-copy
+    // (drive_int_snapshot_gate holds the same for loads).
+    {
+        let (mut a, mut b) = (m.clone(), r.clone());
+        for f in 1..=500 {
+            frames(&mut a, 1);
+            frames(&mut b, 1);
+            let d = state_diff(&a, &b);
+            assert!(d.is_empty(), "restored and straight apart after frame {f}: {d}");
+        }
+    }
+    // Both run the copy to its end: the transfer both drives were in the middle of
+    // survives the dump.
     for mach in [&mut m, &mut r] {
         for _ in 0..20_000 {
             frames(mach, 1);
