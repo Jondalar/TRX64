@@ -484,6 +484,11 @@ pub struct Drive1541 {
     /// move folds a dirty track into the rotation's write-back image without
     /// touching `disk.bytes`; this is how [`Self::flush_disk_writeback`] knows.
     disk_synced_gen: u64,
+    /// `disk.bytes` holds a write no [`Self::flush_disk_writeback`] has reported
+    /// yet. Written into `disk.bytes` and reported to whoever writes the host file
+    /// are two facts: the drive's reset and power switch do the first and leave the
+    /// second to the next flush, and the flag rides through the reset with the disk.
+    disk_write_unreported: bool,
     /// The rotating GCR disk model (head position, bit-stream, byte-ready). Holds
     /// the per-track GCR bitstream for a mounted D64 (`rotation.image`).
     pub rotation: Rotation,
@@ -603,6 +608,7 @@ impl Drive1541 {
             iec_drv_bus: [0xff; crate::iec::IECBUS_NUM],
             disk: None,
             disk_synced_gen: 0,
+            disk_write_unreported: false,
             rotation: Rotation::new(),
             powered: true,
             reset_held: false,
@@ -691,15 +697,17 @@ impl Drive1541 {
         self.iec_drv_bus = iec.iecbus.drv_bus;
     }
 
-    /// The reset sequence the drive's RESET input runs: flush a pending disk write,
-    /// reset the electronics (`cold_reset`), keep the disk — it is a medium in the
-    /// mechanism, not state of the electronics.
+    /// The reset sequence the drive's RESET input runs: bring a pending disk write
+    /// into the image, reset the electronics (`cold_reset`), keep the disk — it is a
+    /// medium in the mechanism, not state of the electronics. A write the image
+    /// takes here is still reported by the next [`Self::flush_disk_writeback`].
     fn reset_keeping_disk(&mut self) {
-        self.flush_disk_writeback();
+        self.sync_disk_bytes();
         let mounted_disk = self.disk.take();
+        let unreported = self.disk_write_unreported;
         self.cold_reset();
         if let Some(image) = mounted_disk {
-            self.attach_disk(image);
+            self.attach_disk_with_unreported_write(image, unreported);
         }
     }
 
@@ -738,8 +746,9 @@ impl Drive1541 {
 
     /// Spec 870 D1 — switch the drive on or off.
     ///
-    /// Off: a pending disk write is flushed into the image (VICE `drive_disable`),
-    /// then the drive is neither clocked nor on the bus. On from off is a power-on:
+    /// Off: a pending disk write is brought into the image (VICE `drive_disable`),
+    /// then the drive is neither clocked nor on the bus; the next
+    /// [`Self::flush_disk_writeback`] still reports it. On from off is a power-on:
     /// RAM cleared (VICE allocates it zeroed), CPU and VIAs through their reset, the
     /// disk kept. Setting the state it already has changes nothing.
     pub fn set_power(&mut self, on: bool) {
@@ -753,7 +762,7 @@ impl Drive1541 {
             self.latch_rom();
             self.reset_keeping_disk();
         } else {
-            self.flush_disk_writeback();
+            self.sync_disk_bytes();
             self.powered = false;
         }
     }
@@ -1181,6 +1190,14 @@ impl Drive1541 {
     /// D64 encoder produces, so the rotation engine reads it identically —
     /// including half-tracks + copy-protection.
     pub fn attach_disk(&mut self, image: DiskImage) {
+        self.attach_disk_with_unreported_write(image, false);
+    }
+
+    /// [`Self::attach_disk`] for a disk that goes back into a drive with a write in
+    /// `image.bytes` that the flush which took it there did not report (the flush's
+    /// `true`) — a reset keeping the disk, a C64 power cycle carrying it through the
+    /// media registry. The next [`Self::flush_disk_writeback`] reports it.
+    pub fn attach_disk_with_unreported_write(&mut self, image: DiskImage, unreported: bool) {
         let (gcr, wb_kind) = match image.kind {
             DiskKind::D64 => (Some(GcrImage::from_d64(&image.bytes)), WritebackKind::D64),
             DiskKind::G64 => (Some(GcrImage::from_g64(&image.bytes)), WritebackKind::G64),
@@ -1198,11 +1215,13 @@ impl Drive1541 {
         }
         self.disk = Some(image);
         self.disk_synced_gen = self.rotation.writeback_gen;
+        self.disk_write_unreported = unreported;
     }
 
     /// Detach (eject) the disk from this drive. Flushes any pending dirty track
     /// back into `disk.bytes` first (VICE `drive_image_detach` →
-    /// `drive_gcr_data_writeback`), so an eject persists a pending write.
+    /// `drive_gcr_data_writeback`); the image leaves the drive with it, and the
+    /// caller that wants it in the host file persists before the eject.
     pub fn detach_disk(&mut self) {
         self.flush_disk_writeback();
         self.disk = None;
@@ -1214,19 +1233,26 @@ impl Drive1541 {
     /// `drive_gcr_data_writeback_all` before `fsimage->fd` is read), and copy it out
     /// whenever a track has been folded in since the last time — by this flush or
     /// by a head move, which folds the track it leaves without asking anyone.
-    /// Cheap no-op when nothing was written. Returns whether bytes changed.
+    /// Cheap no-op when nothing was written. Returns whether `disk.bytes` holds a
+    /// write no flush has reported before: one this flush brought in, or one the
+    /// drive's reset or power switch brought in since the last flush. Each write is
+    /// reported once — the daemon's lazy host-file write arms on that report.
     pub fn flush_disk_writeback(&mut self) -> bool {
+        self.sync_disk_bytes();
+        std::mem::take(&mut self.disk_write_unreported)
+    }
+
+    /// The drive's own half of [`Self::flush_disk_writeback`]: bring `disk.bytes` up
+    /// to the write-back image and note a write it took as not yet reported.
+    fn sync_disk_bytes(&mut self) {
         self.rotation.drive_gcr_data_writeback_all();
         if self.rotation.writeback_gen == self.disk_synced_gen {
-            return false;
+            return;
         }
         self.disk_synced_gen = self.rotation.writeback_gen;
-        match (self.rotation.writeback_bytes.as_ref(), self.disk.as_mut()) {
-            (Some(synced), Some(disk)) => {
-                disk.bytes.clone_from(synced);
-                true
-            }
-            _ => false,
+        if let (Some(synced), Some(disk)) = (self.rotation.writeback_bytes.as_ref(), self.disk.as_mut()) {
+            disk.bytes.clone_from(synced);
+            self.disk_write_unreported = true;
         }
     }
 

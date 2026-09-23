@@ -11037,7 +11037,9 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             // Spec 721 — extract AssetCandidates from the mounted medium (sprite/
             // charset/bitmap block hashes). No medium → empty set → honest
             // runtime_generated (same as c64re with nothing mounted / no match).
-            let (candidates, medium_ref) = match st.session.machine.drive8.get_attached_disk() {
+            // The disk as written, built on a copy: a flush here would swallow the
+            // report the lazy host-file write arms on.
+            let (candidates, medium_ref) = match st.session.machine.drive8.disk_as_written() {
                 Some(d) if !d.bytes.is_empty() => {
                     let kind = match d.kind {
                         trx64_core::drive::DiskKind::G64 => "g64",
@@ -13558,6 +13560,15 @@ fn autopersist_disk_at(st: &mut State, pos: DrivePosition, ap: &mut DiskAutoPers
     // Nothing armed → no drive write has happened → no host I/O (true no-op for a
     // clean, never-written disk: no hash, no fs::write).
     if !ap.pending {
+        return;
+    }
+    // The C64 switched off: its disks sit in the media registry, not gone. The armed
+    // write waits for the power-on that puts them back into their drives.
+    let in_registry = match pos {
+        DrivePosition::A => st.session.inserted_disk.is_some(),
+        DrivePosition::B => st.session.inserted_disk_b.is_some(),
+    };
+    if in_registry && st.session.machine.drive(pos).get_attached_disk().is_none() {
         return;
     }
     // Confirm writable + path-backed (the persist guards). A non-writable target
@@ -22572,6 +22583,17 @@ mod batch1_tests {
     /// The lazy write is checked FIRST, then the live drive's state, so a flush
     /// restored in the handler fails on the data that never reached the file.
     fn a_disk_reader_leaves_the_lazy_write(tag: &str, reader: impl FnOnce(&SharedState, &std::path::Path) -> String) {
+        a_disk_reader_sees_the_disk_as_written(tag, reader, |disk| sha256_hex(disk));
+    }
+
+    /// [`a_disk_reader_leaves_the_lazy_write`] for a handler whose answer is not a
+    /// sha256: `expect` computes, from the disk image, what the handler must return —
+    /// it must differ between the blank disk and the disk as written.
+    fn a_disk_reader_sees_the_disk_as_written<R: PartialEq + std::fmt::Debug>(
+        tag: &str,
+        reader: impl FnOnce(&SharedState, &std::path::Path) -> R,
+        expect: impl Fn(&[u8]) -> R,
+    ) {
         use trx64_core::gcr::{gcr_write_sector, CBMDOS_FDC_ERR_OK};
         let dir = std::env::temp_dir().join(format!("trx64_reader_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -22603,11 +22625,11 @@ mod batch1_tests {
             let st = state.lock().unwrap();
             let written = st.session.machine.drive8.disk_as_written().unwrap().bytes;
             assert_eq!(written[t18s7..t18s7 + 256], data[..], "the disk as written holds the sector");
-            sha256_hex(&written)
+            expect(&written)
         };
-        assert_ne!(expected, sha256_hex(&blank));
+        assert_ne!(expected, expect(&blank));
 
-        let sha = reader(&state, &dir);
+        let seen = reader(&state, &dir);
 
         let (still_dirty, image_behind) = {
             let st = state.lock().unwrap();
@@ -22622,7 +22644,7 @@ mod batch1_tests {
         }
         let file = std::fs::read(&d64_path).unwrap();
         assert_eq!(file[t18s7..t18s7 + 256], data[..], "{tag}: the lazy host-file write reached the disk file");
-        assert_eq!(sha, expected, "{tag}: the recorded sha256 is the disk as written");
+        assert_eq!(seen, expected, "{tag}: the handler saw the disk as written");
         assert!(still_dirty, "{tag}: the handler left track 18 dirty");
         assert!(image_behind, "{tag}: the handler did not flush into the drive's disk image");
         let _ = std::fs::remove_dir_all(&dir);
@@ -22673,6 +22695,234 @@ mod batch1_tests {
             let t = state.lock().unwrap().session.trace.take().expect("`trace on` opened a trace");
             t.media_sha
         });
+    }
+
+    /// The visual-origin join searches drive 8's disk for asset candidates. It only
+    /// reads the disk, so it searches the disk as written and leaves the live drive
+    /// alone. A blank disk has no candidate block (no block holds three distinct byte
+    /// values); the written sector puts four sprite blocks, one charset and one bitmap
+    /// block into the image.
+    #[test]
+    fn vic_inspect_origin_searches_the_disk_as_written() {
+        a_disk_reader_sees_the_disk_as_written(
+            "inspect_origin",
+            |state, _dir| {
+                let cp_id = call(state, "checkpoint/capture", json!({}))["ref"]["id"].as_str().unwrap().to_string();
+                let r = call(state, "vic/inspect/origin", json!({ "checkpoint_id": cp_id, "x": 0, "y": 0 }));
+                r["medium"]["candidateCount"].as_u64().unwrap()
+            },
+            |disk| trx64_core::vic_inspect::extract_asset_candidates(disk, "session", Some("d64")).len() as u64,
+        );
+    }
+
+    // ── a write reaches the user's file through resets and power cycles ─────────
+
+    /// A 35-track D64's worth of zeros, and where sector 7 of track 18 sits in it.
+    const BLANK_D64_LEN: usize = 174_848;
+    const T18S7: usize = (357 + 7) * 256; // 17 tracks of 21 sectors before track 18
+
+    /// A state whose machine is powered, with the drive in `pos` switched on and a
+    /// writable blank D64 backed by `path` in it.
+    fn state_with_backed_disk(pos: DrivePosition, path: &std::path::Path) -> SharedState {
+        let state = make_state();
+        {
+            let mut st = state.lock().unwrap();
+            st.session.powered = true;
+            st.session.machine.set_drive_power(pos, true).unwrap();
+            st.session.machine.drive_mut(pos).attach_disk(DiskImage {
+                kind: DiskKind::D64,
+                bytes: vec![0u8; BLANK_D64_LEN],
+                backing_path: Some(path.to_string_lossy().to_string()),
+                read_only: false,
+            });
+        }
+        state
+    }
+
+    /// Run the lazy host-file write's polls on a wall clock that starts at `t0`, past
+    /// the debounce.
+    fn run_autopersist_polls(state: &SharedState, t0: u64) {
+        let mut st = state.lock().unwrap();
+        stream_maybe_autopersist_disk(&mut st, t0);
+        stream_maybe_autopersist_disk(&mut st, t0 + 10);
+        stream_maybe_autopersist_disk(&mut st, t0 + DISK_AUTOPERSIST_DEBOUNCE_MS + 11);
+    }
+
+    /// A write that has reached the drive but not yet the user's disk file must still
+    /// reach the file through the lazy host-file write, whatever happens between the
+    /// write and the write's first poll. `between` runs after sector 7 of track 18 is
+    /// written on the disk in `pos` (its track still dirty in the drive).
+    fn a_write_reaches_the_file_across(tag: &str, pos: DrivePosition, between: impl FnOnce(&SharedState)) {
+        use trx64_core::gcr::{gcr_write_sector, CBMDOS_FDC_ERR_OK};
+        let dir = std::env::temp_dir().join(format!("trx64_across_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d64_path = dir.join("user.d64");
+        std::fs::write(&d64_path, vec![0u8; BLANK_D64_LEN]).unwrap();
+        let data: Vec<u8> = (0..256).map(|i| (i as u8) ^ 0x5a).collect();
+
+        let state = state_with_backed_disk(pos, &d64_path);
+        {
+            let mut st = state.lock().unwrap();
+            let rot = &mut st.session.machine.drive_mut(pos).rotation;
+            let ht = rot.current_half_track as usize;
+            assert_eq!(ht, 36, "the head is parked on track 18");
+            let img = rot.image.as_mut().unwrap();
+            assert_eq!(gcr_write_sector(&mut img.tracks[ht - 2], &data, 7), CBMDOS_FDC_ERR_OK);
+            rot.write_one_bit_for_test(1);
+            assert!(rot.has_dirty_track(), "track 18 is dirty");
+        }
+
+        between(&state);
+
+        run_autopersist_polls(&state, 1_000);
+        let file = std::fs::read(&d64_path).unwrap();
+        assert_eq!(file[T18S7..T18S7 + 256], data[..], "{tag}: the lazy host-file write reached the disk file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_write_reaches_the_file_across_a_drive_reset() {
+        a_write_reaches_the_file_across("reset_a", DrivePosition::A, |state| {
+            state.lock().unwrap().session.machine.drive8.reset();
+        });
+        a_write_reaches_the_file_across("reset_b", DrivePosition::B, |state| {
+            state.lock().unwrap().session.machine.drive_b.reset();
+        });
+    }
+
+    #[test]
+    fn a_write_reaches_the_file_across_a_held_drive_reset() {
+        a_write_reaches_the_file_across("held_a", DrivePosition::A, |state| {
+            let mut st = state.lock().unwrap();
+            st.session.machine.drive8.set_reset_held(true);
+            st.session.machine.drive8.set_reset_held(false);
+        });
+    }
+
+    #[test]
+    fn a_write_reaches_the_file_across_a_drive_power_cycle() {
+        for (tag, pos, unit) in [("power_a", DrivePosition::A, 8), ("power_b", DrivePosition::B, 9)] {
+            a_write_reaches_the_file_across(tag, pos, |state| {
+                call(state, "session/drive_power", json!({ "unit": unit, "on": false }));
+                call(state, "session/drive_power", json!({ "unit": unit, "on": true }));
+            });
+        }
+    }
+
+    /// The drive switched off is still a disk in a mechanism: polled while it is
+    /// off, the write still lands.
+    #[test]
+    fn a_write_reaches_the_file_while_the_drive_is_off() {
+        a_write_reaches_the_file_across("off_a", DrivePosition::A, |state| {
+            call(state, "session/drive_power", json!({ "unit": 8, "on": false }));
+        });
+    }
+
+    #[test]
+    fn a_write_reaches_the_file_across_a_c64_reset_on_the_reset_line() {
+        for (tag, pos) in [("warm_a", DrivePosition::A), ("warm_b", DrivePosition::B)] {
+            a_write_reaches_the_file_across(tag, pos, |state| {
+                let mut st = state.lock().unwrap();
+                assert!(st.session.machine.drive(pos).reset_line_connected(), "the reset line is connected");
+                st.session.warm_reset();
+            });
+        }
+    }
+
+    #[test]
+    fn a_write_reaches_the_file_across_a_c64_power_cycle() {
+        for (tag, pos) in [("c64power_a", DrivePosition::A), ("c64power_b", DrivePosition::B)] {
+            a_write_reaches_the_file_across(tag, pos, |state| {
+                let mut st = state.lock().unwrap();
+                st.session.power_off();
+                st.session.power_on(&rom_dir()).expect("ROMs");
+            });
+        }
+    }
+
+    /// Armed before the C64 is switched off, polled while it is off: the disk sits in
+    /// the media registry, not in a drive, and the write still lands after power-on.
+    #[test]
+    fn an_armed_write_reaches_the_file_across_a_c64_power_off() {
+        a_write_reaches_the_file_across("c64off_armed", DrivePosition::A, |state| {
+            {
+                let mut st = state.lock().unwrap();
+                stream_maybe_autopersist_disk(&mut st, 0); // arms
+                st.session.power_off();
+                stream_maybe_autopersist_disk(&mut st, 5); // polled while off
+                st.session.power_on(&rom_dir()).expect("ROMs");
+            }
+        });
+    }
+
+    /// Nothing written, nothing written back: resets and power cycles on a clean disk
+    /// never touch the user's file. The file holds bytes that differ from the disk's,
+    /// so any host write would show.
+    #[test]
+    fn a_reset_on_a_clean_disk_writes_nothing() {
+        for pos in [DrivePosition::A, DrivePosition::B] {
+            let dir = std::env::temp_dir().join(format!("trx64_clean_{:?}_{}", pos, std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let d64_path = dir.join("user.d64");
+            let sentinel = vec![0xeeu8; BLANK_D64_LEN];
+            std::fs::write(&d64_path, &sentinel).unwrap();
+            let state = state_with_backed_disk(pos, &d64_path);
+            let unit = if pos == DrivePosition::A { 8 } else { 9 };
+            {
+                let mut st = state.lock().unwrap();
+                st.session.machine.drive_mut(pos).reset();
+                st.session.machine.drive_mut(pos).set_reset_held(true);
+                st.session.machine.drive_mut(pos).set_reset_held(false);
+            }
+            call(&state, "session/drive_power", json!({ "unit": unit, "on": false }));
+            call(&state, "session/drive_power", json!({ "unit": unit, "on": true }));
+            {
+                let mut st = state.lock().unwrap();
+                st.session.warm_reset();
+                st.session.power_off();
+                st.session.power_on(&rom_dir()).expect("ROMs");
+            }
+            run_autopersist_polls(&state, 0);
+            assert!(std::fs::read(&d64_path).unwrap() == sentinel, "{pos:?}: no write reached the file");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A write already in the file is not written again by a reset after it.
+    #[test]
+    fn a_reset_after_the_write_landed_writes_nothing_more() {
+        let dir = std::env::temp_dir().join(format!("trx64_landed2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d64_path = dir.join("user.d64");
+        std::fs::write(&d64_path, vec![0u8; BLANK_D64_LEN]).unwrap();
+        let state = state_with_backed_disk(DrivePosition::A, &d64_path);
+        {
+            let mut st = state.lock().unwrap();
+            let rot = &mut st.session.machine.drive8.rotation;
+            let ht = rot.current_half_track as usize;
+            let img = rot.image.as_mut().unwrap();
+            let data: Vec<u8> = (0..256).map(|i| i as u8).collect();
+            assert_eq!(
+                trx64_core::gcr::gcr_write_sector(&mut img.tracks[ht - 2], &data, 7),
+                trx64_core::gcr::CBMDOS_FDC_ERR_OK
+            );
+            rot.write_one_bit_for_test(1);
+        }
+        run_autopersist_polls(&state, 0);
+        // The user's own edit to the file after the write landed must survive.
+        let edited = vec![0x11u8; BLANK_D64_LEN];
+        std::fs::write(&d64_path, &edited).unwrap();
+        {
+            let mut st = state.lock().unwrap();
+            st.session.machine.drive8.reset();
+            st.session.warm_reset();
+        }
+        run_autopersist_polls(&state, 10_000);
+        assert!(std::fs::read(&d64_path).unwrap() == edited, "a reset did not write the disk again");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// audit ws-media-8 DIRECT PROOF — the recents store is newest-first, deduped by

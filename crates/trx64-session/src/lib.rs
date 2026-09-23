@@ -64,6 +64,10 @@ pub struct Session {
     pub inserted_disk: Option<DiskImage>,
     /// Spec 871 — the disk in drive position B, held the same way.
     pub inserted_disk_b: Option<DiskImage>,
+    /// Whether the flush that took the registered disk (A, B) out of its drive
+    /// reported a write. The report goes back into the drive with the disk, so the
+    /// daemon's lazy host-file write still arms on it after the power cycle.
+    pub inserted_disk_unreported: [bool; 2],
     /// Spec 871 — position B's jumpers and power across a power cycle (`None`: B as a
     /// machine is built — off, jumpers at 9).
     pub drive_b_state: Option<(u8, bool)>,
@@ -141,6 +145,7 @@ impl Session {
             inserted_cart: None,
             inserted_disk: None,
             inserted_disk_b: None,
+            inserted_disk_unreported: [false; 2],
             drive_b_state: None,
             model,
         }
@@ -181,15 +186,17 @@ impl Session {
             machine.cartridge_image = Some(cart.image);
             machine.cold_reset();
         }
-        // Re-attach the registered disk (writes intact).
+        // Re-attach the registered disk (writes intact, an unreported write still
+        // unreported).
+        let [unreported_a, unreported_b] = std::mem::take(&mut self.inserted_disk_unreported);
         if let Some(disk) = self.inserted_disk.take() {
-            machine.drive8.attach_disk(disk);
+            machine.drive8.attach_disk_with_unreported_write(disk, unreported_a);
         }
         // Spec 871 — drive position B is a device of its own: a C64 power cycle does
         // not unplug it. Its disk goes back in, its jumpers stand where they stood, and
         // if it was on it comes up again (its DOS from power-on, as the C64's does).
         if let Some(disk) = self.inserted_disk_b.take() {
-            machine.drive_b.attach_disk(disk);
+            machine.drive_b.attach_disk_with_unreported_write(disk, unreported_b);
         }
         if let Some((jumpers, powered)) = self.drive_b_state.take() {
             let _ = machine.drive_b.set_unit(jumpers);
@@ -224,12 +231,14 @@ impl Session {
             self.inserted_cart = Some(InsertedCart { image, mapper, path: self.cart_path.clone() });
         }
         // Physical disk survives: flush in-flight writes into the image bytes,
-        // then move the image into the registry.
-        self.machine.drive8.flush_disk_writeback();
+        // then move the image — and whether the flush reported a write — into the
+        // registry.
+        let unreported_a = self.machine.drive8.flush_disk_writeback();
         self.inserted_disk = self.machine.drive8.disk.take();
         // Spec 871 — position B's disk, jumpers and power survive the C64's power cut.
-        self.machine.drive_b.flush_disk_writeback();
+        let unreported_b = self.machine.drive_b.flush_disk_writeback();
         self.inserted_disk_b = self.machine.drive_b.disk.take();
+        self.inserted_disk_unreported = [unreported_a, unreported_b];
         self.drive_b_state = Some((self.machine.drive_b.unit_jumpers(), self.machine.drive_b.powered()));
         self.machine = Machine::new_with_model(self.model);
         self.running = false;
