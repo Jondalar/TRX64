@@ -50,7 +50,7 @@ fn gcr_sync_cadence_probe() {
 
     let mut drive = Drive1541::new();
     drive.load_rom(Path::new(ROM_DIR)).unwrap();
-    drive.cold_reset();
+    drive.power_on_reset(); // Spec 870: a given ROM comes into force at power-on
     drive.run_cycles(1_200_000);
     drive.attach_disk(DiskImage {
         kind: DiskKind::D64,

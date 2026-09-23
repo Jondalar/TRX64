@@ -77,7 +77,7 @@ fn drive_reads_t18s0_byte_exact_status_ok() {
 
     let mut drive = Drive1541::new();
     drive.load_rom(rom_dir).expect("load DOS ROM");
-    drive.cold_reset();
+    drive.power_on_reset(); // Spec 870: a given ROM comes into force at power-on
 
     // Boot the drive to its idle loop (DOS init + IRQ controller).
     drive.run_cycles(1_200_000);
