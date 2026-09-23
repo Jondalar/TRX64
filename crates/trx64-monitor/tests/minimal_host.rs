@@ -164,6 +164,36 @@ fn the_selected_device_gates_the_verbs_the_library_does_not_own() {
     assert!(try_exec(&mut mon, &mut host, "swapcrt").is_none(), "now it falls through");
 }
 
+// ── Spec 871 — `device` offers the drives the machine has ──────────────────────
+
+#[test]
+fn device_offers_every_powered_drive_by_its_unit() {
+    use trx64_core::drive::DrivePosition;
+    let mut mon = MonitorSession::new();
+    let mut host = BareHost::new();
+
+    // One drive: the list is what it was.
+    let listed = run(&mut mon, &mut host, "device").expect("device");
+    assert!(listed.contains("c64 | drive8") && !listed.contains("drive9"), "{listed}");
+    assert!(run(&mut mon, &mut host, "device drive9").is_err(), "nothing at 9 yet");
+
+    // Position B on at 9: offered, selectable, and r/m/d read that drive.
+    host.machine.set_drive_power(DrivePosition::B, true).expect("B at 9");
+    host.machine.drive_b.drive_ram_write(0x0300, 0x5a);
+    let listed = run(&mut mon, &mut host, "device").expect("device");
+    assert!(listed.contains("c64 | drive8 | drive9"), "{listed}");
+    run(&mut mon, &mut host, "device drive9").expect("select drive 9");
+    let r = run(&mut mon, &mut host, "r").expect("registers");
+    assert!(r.contains("1541 (drive 9)"), "{r}");
+    let m = run(&mut mon, &mut host, "m 0300 0300").expect("memory");
+    assert!(m.contains("5a"), "drive 9's RAM, not drive 8's: {m}");
+
+    // Switched off under the selection: said so, not answered for the C64.
+    host.machine.set_drive_power(DrivePosition::B, false).unwrap();
+    let e = run(&mut mon, &mut host, "r").expect_err("no drive at 9 now");
+    assert!(e.contains("no powered drive"), "{e}");
+}
+
 // ── Spec 864, the second host's first finding ───────────────────────────────────
 //
 // `device` used to compare the argument against the literals "c64" and "drive8", so a
@@ -183,10 +213,10 @@ impl MonitorHost for HostWithOwnDevice {
     fn machine(&mut self) -> &mut Machine {
         &mut self.machine
     }
-    fn devices(&self) -> Vec<trx64_monitor::Device> {
+    fn devices(&mut self) -> Vec<trx64_monitor::Device> {
         vec![
             trx64_monitor::Device::C64,
-            trx64_monitor::Device::Drive8,
+            trx64_monitor::Device::Drive(8),
             trx64_monitor::Device::Host("fw"),
         ]
     }

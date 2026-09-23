@@ -374,7 +374,7 @@ pub fn monitor_help_text() -> String {
         "    r                registers (+ flow + IRQ/NMI vectors)",
         "    r a=$42 x=$10    set registers (a/x/y/sp/pc/fl)",
         "    sidefx [on|off]  monitor read side effects (default off = peek)",
-        "    device [c64|drive8]  target the C64 or the 1541 CPU (drive8 = read-inspect r/m/d)",
+        "    device [c64|drive<unit>]  target the C64 or a 1541 CPU by its unit (drive8, drive9 … = read-inspect r/m/d)",
         "  STATE / TRACE",
         "    dump|snapshot <p>  write a .c64re snapshot; undump|loadsnapshot <p>  restore it",
         "    savecrt [\"<p>\"]  write live flash state to the mounted .crt (or to <p> as a copy)",
@@ -862,7 +862,15 @@ pub fn try_exec(
     // allow r/m/d (+ help/?), block anything that would act on the C64 instead. Keyed on
     // the DEVICE rather than on the literal "drive8", so a host device is gated too
     // instead of falling through as if it were the C64.
-    let selected = Device::from_name(&device, &host.devices()).unwrap_or(Device::C64);
+    let offered = host.devices();
+    if Device::drive_unit(&device).is_some() && Device::from_name(&device, &offered).is_none() {
+        // The drive selected earlier was switched off or moved: say so, rather than
+        // letting r/m/d answer for the C64 under a drive's name.
+        return Some(Err(format!(
+            "device {device}: no powered drive answers to that unit now. `device` lists what is there."
+        )));
+    }
+    let selected = Device::from_name(&device, &offered).unwrap_or(Device::C64);
     if selected.is_read_inspect() && !matches!(op.as_str(), "r" | "m" | "d" | "help" | "?") {
         return Some(Err(format!(
             "device {device}: read-inspect only (r/m/d). `device c64` first to use `{op}`."
@@ -922,8 +930,9 @@ fn exec_owned(
             // (read-only). 1:1 with monitor-shell.ts:481-488 (drive_pc / a / x / y / sp
             // / flags / drive_clk + track/halftrack), so the panel is unambiguously the
             // DRIVE core (header "1541 (drive 8)"), distinct from the C64 panel.
-            if device == "drive8" {
-                let drv = &host.machine().drive8;
+            if let Some(unit) = Device::drive_unit(&device) {
+                let m = host.machine();
+                let drv = m.drive(m.position_at_unit(unit).ok_or("no drive at that unit")?);
                 let c = &drv.core;
                 let flags = c.status();
                 let names = ['N', 'V', '-', 'B', 'D', 'I', 'Z', 'C'];
@@ -941,11 +950,11 @@ fn exec_owned(
                 // the head a whole track further out than it was.
                 let track = halftrack / 2;
                 return Ok(format!(
-                    "1541 (drive 8)\n  \
+                    "1541 (drive {unit})\n  \
                      ADDR AC XR YR SP NV-BDIZC  clk\n\
                      .;{} {:02x} {:02x} {:02x} {:02x} {}  {}\n  \
                      track {} (halftrack {})  led {}",
-                    addr_spans::mark(&format!("{:04x}", c.reg_pc), c.reg_pc, SpanSpace::Drive8, SpanRole::Pc, None, 1),
+                    addr_spans::mark(&format!("{:04x}", c.reg_pc), c.reg_pc, SpanSpace::Drive(unit), SpanRole::Pc, None, 1),
                     c.reg_a, c.reg_x, c.reg_y, c.reg_sp, flags_str, drv.drive_clk,
                     track, halftrack,
                     if led { "on" } else { "off" }
@@ -1109,8 +1118,9 @@ fn exec_owned(
                     }
                     // device drive8: peek the 1541 CPU address space (read-inspect),
                     // else the C64 banked lens (monitor-shell.ts:150-156 driveProbe).
-                    let b = if device == "drive8" {
-                        host.machine().drive8.drive_peek((aj & 0xffff) as u16)
+                    let b = if let Some(unit) = Device::drive_unit(&device) {
+                        let m = host.machine();
+                        m.drive(m.position_at_unit(unit).ok_or("no drive at that unit")?).drive_peek((aj & 0xffff) as u16)
                     } else {
                         monitor_read(&mon.state, host.machine(), (aj & 0xffff) as u16, &lens)
                     };
@@ -1126,8 +1136,8 @@ fn exec_owned(
                 // Spec 804 — the row address is a RANGE span: the row shows `row_len`
                 // bytes from it, read through `lens` (the drive has no lens).
                 let row_addr = (a & 0xffff) as u16;
-                let row_mark = if device == "drive8" {
-                    addr_spans::mark(&format!("{row_addr:04x}"), row_addr, SpanSpace::Drive8, SpanRole::Memory, None, row_len)
+                let row_mark = if let Some(unit) = Device::drive_unit(&device) {
+                    addr_spans::mark(&format!("{row_addr:04x}"), row_addr, SpanSpace::Drive(unit), SpanRole::Memory, None, row_len)
                 } else {
                     addr_spans::mark(&format!("{row_addr:04x}"), row_addr, SpanSpace::C64, SpanRole::Memory, Some(&lens), row_len)
                 };
@@ -1152,8 +1162,9 @@ fn exec_owned(
             if lens_tok.is_some() {
                 i += 1;
             }
-            let default_pc = if mon.state.device == "drive8" {
-                host.machine().drive8.core.reg_pc
+            let default_pc = if let Some(unit) = Device::drive_unit(&mon.state.device) {
+                let m = host.machine();
+                m.drive(m.position_at_unit(unit).ok_or("no drive at that unit")?).core.reg_pc
             } else {
                 host.machine().cpu6510.reg_pc
             };
@@ -1173,12 +1184,12 @@ fn exec_owned(
             }
             let pc = host.machine().cpu6510.reg_pc;
             // device drive8: disassemble the 1541 CPU address space (read-inspect).
-            let on_drive = device == "drive8";
+            let drive_unit = Device::drive_unit(&device);
             // Spec 804 — no names here: the addresses are marked with their space (and
             // the lens they were read through), and C64RE names them. That is also what
             // closes the old leak of C64 labels into the drive's listing.
             let (space, span_lens) =
-                if on_drive { (SpanSpace::Drive8, None) } else { (SpanSpace::C64, Some(lens.as_str())) };
+                match drive_unit { Some(u) => (SpanSpace::Drive(u), None), None => (SpanSpace::C64, Some(lens.as_str())) };
             // Peek, deliberately, even under `sidefx on`: the renderer wants a plain
             // `Fn(u16) -> u8`, and a side-effecting read cannot be one — it needs &mut.
             // Reading a whole listing through live I/O would also mean a disassembly
@@ -1187,9 +1198,13 @@ fn exec_owned(
             // `host.machine()` hands out `&mut Machine`, so a closure that calls it is
             // `FnMut`; the renderer wants `Fn`. Reborrow it shared once, here.
             let mach: &Machine = host.machine();
+            let drive = match drive_unit {
+                Some(u) => Some(mach.drive(mach.position_at_unit(u).ok_or("no drive at that unit")?)),
+                None => None,
+            };
             let read = |x: u16| {
-                if on_drive {
-                    mach.drive8.drive_peek(x)
+                if let Some(drv) = drive {
+                    drv.drive_peek(x)
                 } else {
                     mach.peek_lens(x, &lens)
                 }
