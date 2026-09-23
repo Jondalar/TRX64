@@ -787,6 +787,8 @@ pub enum RomError {
     Io(std::io::Error),
     /// ROM file had unexpected size (got, expected).
     BadSize(usize, usize),
+    /// Spec 870 D3 — a 1541 ROM that is neither 16 KiB nor 32 KiB (got).
+    BadDriveRomSize(usize),
 }
 
 impl std::fmt::Display for RomError {
@@ -794,6 +796,10 @@ impl std::fmt::Display for RomError {
         match self {
             RomError::Io(e) => write!(f, "ROM I/O error: {e}"),
             RomError::BadSize(got, exp) => write!(f, "ROM size mismatch: got {got}, expected {exp}"),
+            RomError::BadDriveRomSize(got) => write!(
+                f,
+                "1541 ROM size {got} bytes refused: give 16384 (at $C000) or 32768 ($8000-$FFFF)"
+            ),
         }
     }
 }
@@ -1247,6 +1253,9 @@ impl Machine {
         self.joystick1 = crate::keyboard::JoystickState::default();
         self.joystick2 = crate::keyboard::JoystickState::default();
         self.cia2_pa_out = 0xff;
+        // Spec 870 — the fresh IEC core knows a drive at unit 8; tell it the one that
+        // is there (another unit, or none while off / held). A no-op on a stock machine.
+        self.iec.sync_drive_slot(self.drive8.bus_slot(), self.cia2_pa_out);
         self.drive_c64_ref = 0;
         // SID: reset register file + voice state to power-on defaults.
         self.sid_regs = [0u8; 32];
@@ -1315,19 +1324,13 @@ impl Machine {
         self.vic.u64_speed_table = table;
         // The fresh VIC has no hold; the reset this IS has to arm it (BUG-061).
         self.arm_u64_reset_hold();
-        // ts:707-708 + ts:773 — reset the 1541 in lockstep with the C64. A warm
-        // reset is the C64's RESET line; the drive has its OWN power, so "the 1541
-        // disk stays mounted" (ts:773). TRX64's `Drive1541::cold_reset` drops the
-        // disk (it models a drive POWER-cycle, drive.rs:602-603), so we preserve +
-        // re-attach the image across the reset to match TS: flush any in-flight
-        // write back into the image bytes first, cold-reset the drive (re-runs its
-        // ROM to a known head/track), then re-mount the same disk.
-        self.drive8.flush_disk_writeback();
-        let mounted_disk = self.drive8.disk.take();
-        self.drive8.cold_reset();
-        if let Some(image) = mounted_disk {
-            self.drive8.attach_disk(image);
-        }
+        // ts:707-708 + ts:773 — the C64's RESET reaches the 1541 over the IEC RESET
+        // line (Spec 870 D2): with the line connected — the default — the drive runs
+        // its own reset sequence (flush a pending write, reset the electronics, keep
+        // the disk); cut, the drive carries on where it was. A drive that is off
+        // ignores it.
+        self.drive8.reset_from_c64();
+        self.iec.sync_drive_slot(self.drive8.bus_slot(), self.cia2_pa_out);
         self.sync_snapshot();
     }
 
@@ -2102,7 +2105,7 @@ impl Machine {
             self.drive8.iec_drv_port = self.iec.iecbus.drv_port;
             self.drive8.iec_cpu_bus = self.iec.iecbus.cpu_bus;
             self.drive_c64_ref = self.drive8.catch_up_to(clk, self.drive_c64_ref);
-            self.iec.iec_drive_write((!self.drive8.via1_pb_iec_output()) & 0xff, 0);
+            self.drive8.fold_into_iec(&mut self.iec, self.cia2_pa_out);
         } else {
             self.drive_c64_ref = clk;
         }
@@ -2811,6 +2814,7 @@ impl Machine {
         // (bus open; CPU will JAM immediately, which is a valid isolated state).
         let _ = self.drive8.load_rom(rom_dir);
         self.drive8.cold_reset();
+        self.iec.sync_drive_slot(self.drive8.bus_slot(), self.cia2_pa_out);
         Ok(())
     }
 
@@ -3305,7 +3309,8 @@ impl Machine {
             self.drive_c64_ref = self.drive8.catch_up_to(self.c64_core.clk, self.drive_c64_ref);
             // = via1d1541.c store_prb / iec_drive_write(~byte): fold the drive's PB
             // output (inverted) into the bus + iec_update_ports for the next $DD00 read.
-            self.iec.iec_drive_write((!self.drive8.via1_pb_iec_output()) & 0xff, 0);
+            // Spec 870: into the drive's own slot, and not at all while it is off or held.
+            self.drive8.fold_into_iec(&mut self.iec, self.cia2_pa_out);
             if let Some((pc, a, x, y, sp, p, drv_clk)) = self.drive8.sample_pc_change() {
                 on_drive_step(pc, a, x, y, sp, p, drv_clk);
                 // Spec 784 — armed-on-command 1541 head-position sample (loader-lens

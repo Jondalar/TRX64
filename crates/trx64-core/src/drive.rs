@@ -101,6 +101,10 @@ struct DriveBus<'a> {
     /// the bus borrow can't touch `cpu`, so we latch it here and `step_instruction`
     /// folds it into `reg_p` after the store cycle completes. `true` ⇒ set V.
     pending_set_overflow: bool,
+    /// `via1p->number` / `via2p->number` — the drive number the VIA backends are
+    /// built with (unit − 8). It sets the device-ID jumper bits VIA1 port B reads
+    /// (`(number << 5) & 0x60`) and the IEC bus slot (`number + 8`). Spec 870 D4.
+    number: usize,
 }
 
 impl<'a> DriveBus<'a> {
@@ -144,7 +148,7 @@ impl<'a> DriveBus<'a> {
     ) -> R {
         self.via1.clk = self.clk();
         let mut backend = Via1dBackend {
-            number: 0,
+            number: self.number,
             iecbus: self.via1_iecbus,
             irq: self.via1_irq,
         };
@@ -187,7 +191,7 @@ impl<'a> DriveBus<'a> {
         let has_image = self.rotation.image.is_some();
         let mut backend = Via2dBackend {
             drive: self.rotation,
-            number: 0,
+            number: self.number,
             irq: self.via2_irq,
             pending_set_overflow: false,
             has_image,
@@ -470,6 +474,28 @@ pub struct Drive1541 {
     /// The rotating GCR disk model (head position, bit-stream, byte-ready). Holds
     /// the per-track GCR bitstream for a mounted D64 (`rotation.image`).
     pub rotation: Rotation,
+
+    // ── Spec 870 — the drive as a part ──────────────────────────────────────
+    /// D1 — power. Off: not clocked, not on the IEC bus. Default on.
+    powered: bool,
+    /// D2 — the drive's own reset input held low. Not clocked, not on the bus.
+    reset_held: bool,
+    /// D2a — powered, clock frozen, outputs kept (the U64's `stop_when_frozen`).
+    stopped: bool,
+    /// D2 — whether the C64's RESET reaches this drive (the IEC RESET line).
+    reset_line_connected: bool,
+    /// D4 — the unit number the drive answers to, 8-11: the device-ID jumpers as
+    /// the DOS read them at the drive's last reset. Sets the VIA backends' `number`
+    /// (unit − 8) and the IEC bus slot.
+    unit: u8,
+    /// D4 — where the jumpers stand now. Latched into `unit` at the next reset.
+    unit_jumpers: u8,
+    /// D3 — a ROM given but not yet in force: it replaces `rom` at the next reset.
+    rom_next: Option<Box<[u8; 0x8000]>>,
+    /// D2a — ATN edges that arrived while stopped: the CA1 level the VIA last saw
+    /// (`None` = no edge arrived) and the latest level. See `atn_edge_to_via1_ca1`.
+    atn_stop_origin: Option<u8>,
+    atn_stop_latest: u8,
 }
 
 /// Build a powered-on VIA1 `ViaContext` (via1d1541.ts:805-943
@@ -563,22 +589,252 @@ impl Drive1541 {
             iec_cpu_bus: 0xff,
             disk: None,
             rotation: Rotation::new(),
+            powered: true,
+            reset_held: false,
+            stopped: false,
+            reset_line_connected: true,
+            unit: 8,
+            unit_jumpers: 8,
+            rom_next: None,
+            atn_stop_origin: None,
+            atn_stop_latest: 0,
         }
     }
 
-    /// Load the 16 KB 1541 DOS ROM from `rom_dir`.
+    /// Load the 1541 DOS ROM from `rom_dir` — a convenience over [`Self::set_rom`].
     ///
-    /// Tries `dos1541-325302-01+901229-05.bin` first, then the alias `1541.bin`.
-    /// On success the file bytes land at `rom[0x4000..0x8000]`.
+    /// Tries `dos1541-325302-01+901229-05.bin` first, then the alias `1541.bin`, and
+    /// hands the bytes to `set_rom`: in force from the drive's next reset.
     /// On failure returns `RomError` — caller may choose to continue with zeroed ROM.
     pub fn load_rom(&mut self, rom_dir: &std::path::Path) -> Result<(), RomError> {
         let data = std::fs::read(rom_dir.join("dos1541-325302-01+901229-05.bin"))
             .or_else(|_| std::fs::read(rom_dir.join("1541.bin")))?;
-        if data.len() != 0x4000 {
-            return Err(RomError::BadSize(data.len(), 0x4000));
+        self.set_rom(&data)
+    }
+
+    /// Spec 870 D3 — give the drive its ROM as bytes. 16 KiB goes to `$C000-$FFFF`
+    /// (`$8000-$BFFF` stays zero, as the file loader always left it); 32 KiB is the
+    /// whole `$8000-$FFFF`. Any other size is refused and nothing changes.
+    ///
+    /// The ROM takes effect at the drive's next reset (power-on included) — a
+    /// running program never has its ROM swapped under it.
+    pub fn set_rom(&mut self, bytes: &[u8]) -> Result<(), RomError> {
+        let mut rom = Box::new([0u8; 0x8000]);
+        match bytes.len() {
+            0x4000 => rom[0x4000..0x8000].copy_from_slice(bytes),
+            0x8000 => rom.copy_from_slice(bytes),
+            n => return Err(RomError::BadDriveRomSize(n)),
         }
-        self.rom[0x4000..0x8000].copy_from_slice(&data);
+        self.rom_next = Some(rom);
         Ok(())
+    }
+
+    /// The drive number the VIA backends use (VICE `via1p->number`): unit − 8.
+    #[inline]
+    fn dnr(&self) -> usize {
+        (self.unit - 8) as usize
+    }
+
+    /// Spec 870 — whether the drive runs at all: powered, not held, not stopped.
+    #[inline]
+    pub fn is_clocked(&self) -> bool {
+        self.powered && !self.reset_held && !self.stopped
+    }
+
+    /// Spec 870 — the IEC slot this drive drives, or `None` when it drives nothing
+    /// (off, or held in reset). A stopped drive keeps its slot: its outputs stand.
+    #[inline]
+    pub fn bus_slot(&self) -> Option<usize> {
+        if self.powered && !self.reset_held {
+            Some(self.unit as usize)
+        } else {
+            None
+        }
+    }
+
+    /// Fold this drive's VIA1 port-B output into the machine's IEC core (= VICE
+    /// `iec_drive_write(~byte, dnr)`), first putting the core's device map in step
+    /// with the drive (`sync_drive_slot`, a compare on the stock machine). A drive
+    /// that is off or held folds nothing — the core does not see it.
+    #[inline]
+    pub fn fold_into_iec(&self, iec: &mut crate::iec::IecCore, c64_pa_out: u8) {
+        iec.sync_drive_slot(self.bus_slot(), c64_pa_out);
+        if let Some(slot) = self.bus_slot() {
+            iec.iec_drive_write((!self.via1_pb_iec_output()) & 0xff, slot - 8);
+        }
+    }
+
+    /// As [`Self::fold_into_iec`] but WITHOUT the wired-AND fold — the $DD00 write
+    /// path, which folds once itself (see `IecCore::drive_set_data_no_fold`).
+    #[inline]
+    pub fn set_iec_data_no_fold(&self, iec: &mut crate::iec::IecCore, c64_pa_out: u8) {
+        iec.sync_drive_slot(self.bus_slot(), c64_pa_out);
+        if let Some(slot) = self.bus_slot() {
+            iec.drive_set_data_no_fold_slot(slot, self.via1_pb_iec_output());
+        }
+    }
+
+    /// The reset sequence the drive's RESET input runs: flush a pending disk write,
+    /// reset the electronics (`cold_reset`), keep the disk — it is a medium in the
+    /// mechanism, not state of the electronics.
+    fn reset_keeping_disk(&mut self) {
+        self.flush_disk_writeback();
+        let mounted_disk = self.disk.take();
+        self.cold_reset();
+        if let Some(image) = mounted_disk {
+            self.attach_disk(image);
+        }
+    }
+
+    /// Spec 870 D2 — a pulse on the drive's own RESET input. A drive without power
+    /// ignores it. The reset reaches a stopped drive too — RESET is not a clocked
+    /// input — and it stays stopped, standing at the reset state.
+    pub fn reset(&mut self) {
+        if self.powered {
+            self.reset_keeping_disk();
+        }
+    }
+
+    /// Spec 870 D2 — the C64's RESET, as it arrives over the IEC RESET line: a drive
+    /// reset when the line is connected, nothing when it is not.
+    pub fn reset_from_c64(&mut self) {
+        if self.reset_line_connected {
+            self.reset();
+        }
+    }
+
+    /// Spec 870 D1 — switch the drive on or off.
+    ///
+    /// Off: a pending disk write is flushed into the image (VICE `drive_disable`),
+    /// then the drive is neither clocked nor on the bus. On from off is a power-on:
+    /// RAM cleared (VICE allocates it zeroed), CPU and VIAs through their reset, the
+    /// disk kept. Setting the state it already has changes nothing.
+    pub fn set_power(&mut self, on: bool) {
+        if on == self.powered {
+            return;
+        }
+        if on {
+            self.powered = true;
+            self.ram.fill(0);
+            self.cpu_last_data = 0;
+            self.reset_keeping_disk();
+        } else {
+            self.flush_disk_writeback();
+            self.powered = false;
+        }
+    }
+
+    /// Spec 870 D2 — hold the drive's RESET input low, or release it. Held: not
+    /// clocked, the electronics at their reset state, nothing driven on the bus.
+    /// Release runs the reset sequence. Without power only the flag moves.
+    pub fn set_reset_held(&mut self, held: bool) {
+        if held == self.reset_held {
+            return;
+        }
+        self.reset_held = held;
+        if self.powered {
+            self.reset_keeping_disk();
+        }
+    }
+
+    /// Spec 870 D2a — stop the drive's clock, or let it run again.
+    ///
+    /// Stopped: no cycle runs — no catch-up, no rotation — and its VIA outputs keep
+    /// driving the IEC lines as they were. Released, it continues where it stood, no
+    /// reset; the C64 time it was stopped does not happen to it (`run_cycles` never
+    /// advanced its target, and the catch-up reference moved on without it). An ATN
+    /// change that arrived while stopped is delivered to VIA1 CA1 now, once, if the
+    /// line ended up somewhere other than where the VIA last saw it.
+    pub fn set_stopped(&mut self, stopped: bool) {
+        if stopped == self.stopped {
+            return;
+        }
+        self.stopped = stopped;
+        if !stopped {
+            if let Some(origin) = self.atn_stop_origin.take() {
+                let latest = self.atn_stop_latest;
+                if latest != origin {
+                    let clk = self.core.clk;
+                    self.atn_edge_to_via1_ca1(latest, clk);
+                }
+            }
+        }
+    }
+
+    /// Spec 870 D2 — connect or cut the IEC RESET line between the C64 and this drive.
+    pub fn set_reset_line_connected(&mut self, connected: bool) {
+        self.reset_line_connected = connected;
+    }
+
+    /// Spec 870 D4 — set the device-ID jumpers to `unit` (8-11). The DOS reads them
+    /// at reset, so the drive answers to the new number from its next reset on.
+    /// Anything outside 8-11 is refused by name: a 1541 has no jumper for it.
+    pub fn set_unit(&mut self, unit: u8) -> Result<(), String> {
+        if !(8..=11).contains(&unit) {
+            return Err(format!(
+                "unit {unit} is not a 1541 jumper setting (8-11); a higher number is the DOS's, set after reset"
+            ));
+        }
+        self.unit_jumpers = unit;
+        Ok(())
+    }
+
+    // ── Spec 870 D5 — read-only state ──────────────────────────────────────────
+
+    /// Powered (D1).
+    pub fn powered(&self) -> bool {
+        self.powered
+    }
+    /// Held in reset (D2).
+    pub fn reset_held(&self) -> bool {
+        self.reset_held
+    }
+    /// Stopped (D2a).
+    pub fn stopped(&self) -> bool {
+        self.stopped
+    }
+    /// The IEC RESET line to the C64 is connected (D2).
+    pub fn reset_line_connected(&self) -> bool {
+        self.reset_line_connected
+    }
+    /// The unit number the drive answers to — the jumpers as of its last reset (D4).
+    pub fn unit(&self) -> u8 {
+        self.unit
+    }
+    /// Where the jumpers stand now; differs from `unit()` until the next reset (D4).
+    pub fn unit_jumpers(&self) -> u8 {
+        self.unit_jumpers
+    }
+    /// The 2 KiB drive RAM, whole.
+    pub fn ram(&self) -> &[u8] {
+        &self.ram[..]
+    }
+    /// The head's current half-track (2 = track 1).
+    pub fn half_track(&self) -> u32 {
+        self.rotation.current_half_track
+    }
+
+    /// The VIA ports as the pins see them. Outputs are the composed `ORx | !DDRx`
+    /// byte the chip hands its port hooks — what the IEC lines and the mechanism
+    /// act on (VIA2's is `oldpb`, the byte its `store_prb` last received).
+    pub fn ports(&self) -> DrivePorts {
+        use crate::viacore::{VIA_DDRA, VIA_PCR, VIA_PRA};
+        let via2_pb = self.via2.oldpb;
+        let pcr = self.via2.via[VIA_PCR];
+        DrivePorts {
+            via1_pa: self.drive_peek(0x1801),
+            via1_pb: self.drive_peek(0x1800),
+            via1_pb_out: self.via1_pb_iec_output(),
+            via2_pa_out: (self.via2.via[VIA_PRA] | !self.via2.via[VIA_DDRA]) & 0xff,
+            via2_pb_out: via2_pb,
+            via2_pcr: pcr,
+            motor_on: via2_pb & 0x04 != 0,
+            led_on: self.led_on(),
+            step_phase: via2_pb & 0x03,
+            density: (via2_pb >> 5) & 0x03,
+            // via2d_update_pcr: `read_write_mode = pcrval & 0x20` — bit 5 clear is write.
+            write_mode: pcr & 0x20 == 0,
+        }
     }
 
     /// Cold-reset the drive 6502 (VICE drivecpu_reset, drivecpu.c:193-211). Unlike
@@ -589,6 +845,15 @@ impl Drive1541 {
     /// reset and the first opcode (SEI) are atomic within one execute call, so the
     /// first sampled record is $EAA1@8 (not a spurious $EAA0@6) — exactly VICE.
     pub fn cold_reset(&mut self) {
+        // Spec 870 D3/D4 — what the reset brings into force: a ROM given since the
+        // last reset, and the device-ID jumpers as they stand now (the DOS reads them
+        // during its reset).
+        if let Some(rom) = self.rom_next.take() {
+            self.rom = rom;
+        }
+        self.unit = self.unit_jumpers;
+        self.atn_stop_origin = None;
+        let dnr = self.dnr();
         // Power-on register state (drivecpu cpu_regs init `{pc,ac,xr,yr,sp,flags=0}`,
         // sp=0). The drive 6502 powers on with SP=0; the IK_RESET dispatch does NOT
         // push (unlike an IRQ), so SP stays 0 through boot until the ROM's own TXS.
@@ -623,7 +888,7 @@ impl Drive1541 {
         {
             self.via1.clk = 0;
             let mut backend = Via1dBackend {
-                number: 0,
+                number: dnr,
                 iecbus: &mut self.via1_iecbus,
                 irq: &mut self.via1_irq,
             };
@@ -640,7 +905,7 @@ impl Drive1541 {
             self.via2.clk = 0;
             let mut backend = Via2dBackend {
                 drive: &mut self.rotation,
-                number: 0,
+                number: dnr,
                 irq: &mut self.via2_irq,
                 pending_set_overflow: false,
                 has_image: false,
@@ -652,7 +917,9 @@ impl Drive1541 {
         // whole drive_clk schedule into phase with the golden without touching the
         // shared C64 reset path.
         self.advance_stop_clk(C64_RESET_DRIVE_OFFSET);
-        // A real 1541 loses its disk on power cycle. Don't preserve disk across reset.
+        // The electronics' reset knows nothing of a disk: the rotation model starts
+        // empty. A caller that keeps the medium across the reset re-attaches it (the
+        // drive's own `reset` / `set_power` do; `Machine::boot_from_dir` has none yet).
         self.disk = None;
         self.rotation = Rotation::new();
     }
@@ -709,7 +976,7 @@ impl Drive1541 {
     /// `via1.via[VIA_PRB] | !via1.via[VIA_DDRB]`; both agree once store_prb ran.)
     #[inline]
     pub fn via1_pb_iec_output(&self) -> u8 {
-        (!self.via1_iecbus.drv_data[8]) & 0xff
+        (!self.via1_iecbus.drv_data[self.unit as usize]) & 0xff
     }
 
     /// DIAGNOSTIC: snapshot the drive VIA1 IRQ/CA1 state for the ATN-IRQ probe.
@@ -739,9 +1006,20 @@ impl Drive1541 {
     /// the distilled `signal_ca1`.
     #[inline]
     pub fn atn_edge_to_via1_ca1(&mut self, sig: u8, clk: u64) {
+        // Spec 870 §3a — a stopped drive's VIAs are not clocked, so they latch no
+        // edge. Remember where ATN stood and where it went; `set_stopped(false)`
+        // delivers the net change, the one a clocked edge detector sees on resume.
+        if self.stopped {
+            if self.atn_stop_origin.is_none() {
+                self.atn_stop_origin = Some(if sig != 0 { 0 } else { crate::iec::VIA_SIG_RISE });
+            }
+            self.atn_stop_latest = sig;
+            return;
+        }
+        let dnr = self.dnr();
         self.via1.clk = clk;
         let mut backend = Via1dBackend {
-            number: 0,
+            number: dnr,
             iecbus: &mut self.via1_iecbus,
             irq: &mut self.via1_irq,
         };
@@ -767,6 +1045,12 @@ impl Drive1541 {
     /// that is now dispatched by the verbatim core's IK_RESET path (cpu_reset → clk=6
     /// + JMP $FFFC), folded into the first execute call exactly like drivecpu.c.
     pub fn run_cycles(&mut self, n: u64) {
+        // Spec 870 — off, held in reset or stopped: no cycle runs, and the target does
+        // not move either, so a drive let run again continues from where it stood
+        // instead of replaying the C64 time it missed.
+        if !self.is_clocked() {
+            return;
+        }
         // Advance the drive-clock target for this slice of main-CPU time.
         self.advance_stop_clk(n);
         // Sync the C64-side IEC state into the drive's `v_iecbus` (= via1d1541's
@@ -788,6 +1072,7 @@ impl Drive1541 {
         // catch-up must be that exact clock at the access instant. `clk_ptr` is also
         // written by the `cpu_reset` hook (`*clk_ptr = 6`).
         let clk_ptr: *mut u64 = &mut core.clk;
+        let dnr = (self.unit - 8) as usize;
         let mut bus = DriveBus {
             ram: &mut self.ram,
             rom: &self.rom,
@@ -800,6 +1085,7 @@ impl Drive1541 {
             rotation: &mut self.rotation,
             cpu_last_data: &mut self.cpu_last_data,
             pending_set_overflow: false,
+            number: dnr,
         };
         // Run whole instructions while the drive clock is behind the stop target
         // (VICE drivecpu.c:393 — `while (*clk_ptr < stop_clk)`). Once `reset_pending`
@@ -839,7 +1125,8 @@ impl Drive1541 {
     /// Advance the drive to an ABSOLUTE C64-clock target (VICE
     /// drive_cpu_execute_one/all at the $DD00 read/write instant). `c64_ref` is the
     /// C64 clock the drive was last advanced up to; returns the new reference (=
-    /// `c64_clk`). A monotonic no-op when `c64_clk <= c64_ref`.
+    /// `c64_clk`). A monotonic no-op when `c64_clk <= c64_ref`. A drive that is not
+    /// clocked (Spec 870) runs nothing and is re-anchored all the same.
     #[inline]
     pub fn catch_up_to(&mut self, c64_clk: u64, c64_ref: u64) -> u64 {
         if c64_clk > c64_ref {
@@ -928,8 +1215,9 @@ impl Drive1541 {
         f: impl FnOnce(&mut ViaContext, &mut Via1dBackend) -> R,
     ) -> R {
         self.via1.clk = self.core.clk;
+        let dnr = self.dnr();
         let mut backend = Via1dBackend {
-            number: 0,
+            number: dnr,
             iecbus: &mut self.via1_iecbus,
             irq: &mut self.via1_irq,
         };
@@ -944,14 +1232,48 @@ impl Drive1541 {
     ) -> R {
         self.via2.clk = self.core.clk;
         let has_image = self.rotation.image.is_some();
+        let dnr = self.dnr();
         let mut backend = Via2dBackend {
             drive: &mut self.rotation,
-            number: 0,
+            number: dnr,
             irq: &mut self.via2_irq,
             pending_set_overflow: false,
             has_image,
         };
         f(&mut self.via2, &mut backend)
+    }
+
+    /// Spec 870 — the part state for a checkpoint.
+    pub fn part(&self) -> DrivePart {
+        DrivePart {
+            powered: self.powered,
+            reset_held: self.reset_held,
+            stopped: self.stopped,
+            reset_line_connected: self.reset_line_connected,
+            unit: self.unit,
+            unit_jumpers: self.unit_jumpers,
+            atn_stop_origin: self.atn_stop_origin,
+            atn_stop_latest: self.atn_stop_latest,
+        }
+    }
+
+    /// Spec 870 — put the part state back exactly (a restore: no reset runs, no
+    /// power-on clears RAM). A unit outside 8-11 is refused and nothing changes.
+    pub(crate) fn restore_part(&mut self, p: &DrivePart) -> Result<(), String> {
+        for u in [p.unit, p.unit_jumpers] {
+            if !(8..=11).contains(&u) {
+                return Err(format!("drivePart: unit {u} is not 8-11"));
+            }
+        }
+        self.powered = p.powered;
+        self.reset_held = p.reset_held;
+        self.stopped = p.stopped;
+        self.reset_line_connected = p.reset_line_connected;
+        self.unit = p.unit;
+        self.unit_jumpers = p.unit_jumpers;
+        self.atn_stop_origin = p.atn_stop_origin;
+        self.atn_stop_latest = p.atn_stop_latest;
+        Ok(())
     }
 
     /// Snapshot view of the 2 KB drive RAM (DRIVECPU module ARRAY field).
@@ -1013,13 +1335,6 @@ impl Drive1541 {
         self.ram[(addr & 0x07FF) as usize]
     }
 
-    /// Side-effect-free peek of the drive CPU's address space (= the monitor-shell
-    /// `driveProbe.peek` used by `device drive8` r/m/d). Mirrors the drive read map
-    /// (drive.rs:278-302) — RAM $0000-$07FF (mirrored to $7FFF), DOS ROM $8000-$FFFF
-    /// (rom[addr & 0x7FFF]) — but returns 0 for the VIA register windows ($1800-$1BFF
-    /// VIA1, $1C00-$1FFF VIA2) so a peek NEVER clears byte_ready/IFR or dispatches a
-    /// timer alarm (unlike `read`, which is a live bus access). Read-inspect only.
-    #[inline]
     /// The activity LED — VIA2 port B bit 3, driven only when DDRB says that pin is an
     /// output (VICE's `drive->led_status` is set from the same bit).
     ///
@@ -1033,7 +1348,14 @@ impl Drive1541 {
         (prb & ddrb & 0x08) != 0
     }
 
+    /// Side-effect-free peek of the drive CPU's address space (= the monitor-shell
+    /// `driveProbe.peek` used by `device drive8` r/m/d). Same decode as `read` — RAM
+    /// windows, the four VIA images, open bus, ROM — but the VIA registers are read
+    /// without their port hooks, so a peek never turns the disk, clears
+    /// byte_ready/IFR or dispatches a timer alarm. Read-inspect only.
     pub fn drive_peek(&self, addr: u16) -> u8 {
+        // via1d1541.c:345 — driveid = (number << 5) & 0x60, the device-ID jumpers.
+        let driveid = ((self.dnr() << 5) & 0x60) as u8;
         match addr {
             // VIA1 ($1800) — the IEC port, and the register that answers "who is
             // holding DATA low". The whole window used to peek as `0`, both DDRs
@@ -1049,7 +1371,7 @@ impl Drive1541 {
                 let a = (addr & 0xf) as usize;
                 if a == crate::viacore::VIA_PRB {
                     let ctx = &self.via1;
-                    let tmp = ((self.via1_iecbus.drv_port ^ 0x85) | 0x1a) & 0xff;
+                    let tmp = ((self.via1_iecbus.drv_port ^ 0x85) | 0x1a | driveid) & 0xff;
                     let ddrb = ctx.via[crate::viacore::VIA_DDRB];
                     ((ctx.via[crate::viacore::VIA_PRB] & ddrb) | (tmp & !ddrb)) & 0xff
                 } else {
@@ -1074,7 +1396,7 @@ impl Drive1541 {
                         let a = (addr & 0xf) as usize;
                         if a == crate::viacore::VIA_PRB {
                             let ctx = &self.via1;
-                            let tmp = ((self.via1_iecbus.drv_port ^ 0x85) | 0x1a) & 0xff;
+                            let tmp = ((self.via1_iecbus.drv_port ^ 0x85) | 0x1a | driveid) & 0xff;
                             let ddrb = ctx.via[crate::viacore::VIA_DDRB];
                             ((ctx.via[crate::viacore::VIA_PRB] & ddrb) | (tmp & !ddrb)) & 0xff
                         } else {
@@ -1123,6 +1445,69 @@ impl Drive1541 {
             self.drive_clk,
         ))
     }
+}
+
+/// Spec 870 — the drive-as-a-part state a checkpoint carries (`drivePart`): power,
+/// reset held, stopped, the reset-line connection and the unit number (in force and
+/// on the jumpers), plus the ATN change a stopped drive has not yet seen. A
+/// checkpoint without the node restores [`DrivePart::default`] — the stock drive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DrivePart {
+    pub powered: bool,
+    pub reset_held: bool,
+    pub stopped: bool,
+    pub reset_line_connected: bool,
+    pub unit: u8,
+    pub unit_jumpers: u8,
+    #[serde(default)]
+    pub atn_stop_origin: Option<u8>,
+    #[serde(default)]
+    pub atn_stop_latest: u8,
+}
+
+impl Default for DrivePart {
+    fn default() -> Self {
+        Self {
+            powered: true,
+            reset_held: false,
+            stopped: false,
+            reset_line_connected: true,
+            unit: 8,
+            unit_jumpers: 8,
+            atn_stop_origin: None,
+            atn_stop_latest: 0,
+        }
+    }
+}
+
+/// Spec 870 D5 — the drive's VIA ports as the pins see them, read without side
+/// effects. See [`Drive1541::ports`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DrivePorts {
+    /// VIA1 port A (`$1801`), unused on a 1541 without a parallel cable.
+    pub via1_pa: u8,
+    /// VIA1 port B as a `$1800` read would return it now: IEC inputs, jumpers, outputs.
+    pub via1_pb: u8,
+    /// VIA1 port B output driving the IEC lines: PB1 DATA, PB3 CLK, PB4 ATN-ack.
+    pub via1_pb_out: u8,
+    /// VIA2 port A output (the GCR byte latch toward the head in write mode).
+    pub via2_pa_out: u8,
+    /// VIA2 port B output the mechanism acts on: PB0-1 stepper, PB2 motor, PB3 LED,
+    /// PB5-6 density.
+    pub via2_pb_out: u8,
+    /// VIA2 PCR — CA2 byte-ready enable, CB2 read/write mode.
+    pub via2_pcr: u8,
+    /// Spindle motor on (VIA2 PB2).
+    pub motor_on: bool,
+    /// Activity LED lit — [`Drive1541::led_on`].
+    pub led_on: bool,
+    /// Stepper phase (VIA2 PB0-1).
+    pub step_phase: u8,
+    /// Density zone (VIA2 PB5-6), 0-3.
+    pub density: u8,
+    /// Write mode (VIA2 PCR bit 5 clear — CB2 low), as `via2d_update_pcr` reads it.
+    pub write_mode: bool,
 }
 
 impl Default for Drive1541 {
@@ -1213,6 +1598,7 @@ mod tests {
                 rotation: &mut d.rotation,
                 cpu_last_data: &mut d.cpu_last_data,
                 pending_set_overflow: false,
+                number: 0,
             };
             bus.write(0x0010, 0xAB);
 
@@ -1263,6 +1649,7 @@ mod tests {
             rotation: &mut d.rotation,
             cpu_last_data: &mut d.cpu_last_data,
             pending_set_overflow: false,
+            number: 0,
         };
 
         // VIA1: write the DDRB latch through the base window, read it back through
@@ -1307,6 +1694,7 @@ mod tests {
             rotation: &mut d.rotation,
             cpu_last_data: &mut d.cpu_last_data,
             pending_set_overflow: false,
+            number: 0,
         };
         // The FIRST $1800 PB write fires store_prb (composed out 0xff != oldpb 0,
         // the power-on reset value) and folds the drive's own pull into the iecbus:
@@ -1359,6 +1747,7 @@ mod tests {
             rotation: &mut d.rotation,
             cpu_last_data: &mut d.cpu_last_data,
             pending_set_overflow: false,
+            number: 0,
         };
         assert_eq!(
             bus.read(0x1C0C),
@@ -1570,6 +1959,7 @@ mod tests {
             rotation: &mut d.rotation,
             cpu_last_data: &mut d.cpu_last_data,
             pending_set_overflow: false,
+            number: 0,
         };
         assert_eq!(bus.read(0xC010), 0xEA);
     }

@@ -256,6 +256,10 @@ pub struct IecCore {
     pub unit_type: [DriveType; IECBUS_NUM],
     /// `c64iec.ts:110` `c64iec_active` (vice: `int c64iec_active = 1;`).
     pub c64iec_active: u8,
+    /// Spec 870 — the bus slot the machine's one true drive occupies, `None` when it
+    /// drives nothing (off / held in reset). `new()` = `Some(8)`, the stock machine.
+    /// Kept in step with the drive by [`IecCore::sync_drive_slot`].
+    pub drive_slot: Option<usize>,
 }
 
 impl Default for IecCore {
@@ -286,6 +290,7 @@ impl IecCore {
             iecbus_callback: IecbusCallback::Conf0,
             unit_type: [DriveType::Drive1541; IECBUS_NUM],
             c64iec_active: 1,
+            drive_slot: Some(8),
         };
         s.iecbus_init();
         // Power-on cpu_bus/cpu_port released (memset 0xff already set them); the
@@ -814,7 +819,64 @@ impl IecCore {
     /// store `~pb_out` exactly as VICE `store_prb` does (`*drive_data = ~byte`).
     #[inline]
     pub fn drive_set_data_no_fold(&mut self, pb_out: u8) {
-        self.iecbus.drv_data[8] = (!pb_out) & 0xff;
+        self.drive_set_data_no_fold_slot(8, pb_out);
+    }
+
+    /// [`Self::drive_set_data_no_fold`] for the drive in `slot` (8-11).
+    #[inline]
+    pub fn drive_set_data_no_fold_slot(&mut self, slot: usize, pb_out: u8) {
+        self.iecbus.drv_data[slot] = (!pb_out) & 0xff;
+    }
+
+    /// Spec 870 — put the device map in step with the machine's one true drive:
+    /// `slot` = the unit it answers to, or `None` when it drives nothing (off, held
+    /// in reset). A no-op when nothing changed, which on the stock machine is always.
+    ///
+    /// The map is what `iecbus_status_set` would build for a single true drive at
+    /// that unit — `iecbus_device[slot] = TRUEDRIVE`, the rest NONE, the callback
+    /// recomputed (Conf1 for 8, Conf2 for 9, Conf3 for 10/11, Conf0 for none) — set
+    /// directly rather than through the function-static arrays, which are shared by
+    /// every machine on the thread. A slot the drive leaves is released the way VICE
+    /// `iec_drive_port_default` releases it (`drv_bus = drv_data = 0xff`).
+    ///
+    /// `c64_pa_out` is the CIA2 port-A output. Conf0 reads the C64's own lines from
+    /// `iec_fast_1541`, so leaving the bus seeds it with the byte a `$DD00` write would
+    /// have stored; joining it re-derives `cpu_bus` and `iec_old_atn` from that byte
+    /// (`iecbus_cpu_undump`), which Conf0 had stopped maintaining.
+    pub fn sync_drive_slot(&mut self, slot: Option<usize>, c64_pa_out: u8) {
+        if self.drive_slot == slot {
+            return;
+        }
+        let was_on_bus = self.drive_slot.is_some();
+        self.adopt_drive_slot(slot);
+        let data = (!c64_pa_out) & 0xff;
+        match slot {
+            Some(_) => {
+                if !was_on_bus {
+                    self.iecbus_cpu_undump(data);
+                }
+                self.iec_update_ports();
+            }
+            None => self.iecbus_cpu_write_conf0(data, 0),
+        }
+    }
+
+    /// The device-map half of [`Self::sync_drive_slot`], touching no line state
+    /// beyond releasing the slots nobody occupies — for a checkpoint restore, whose
+    /// IEC lines were captured with that map in force.
+    pub fn adopt_drive_slot(&mut self, slot: Option<usize>) {
+        for s in 8..(8 + NUM_DISK_UNITS) {
+            if Some(s) != slot {
+                self.iecbus_device[s] = IECBUS_DEVICE_NONE;
+                self.iecbus.drv_bus[s] = 0xff;
+                self.iecbus.drv_data[s] = 0xff;
+            }
+        }
+        if let Some(s) = slot {
+            self.iecbus_device[s] = IECBUS_DEVICE_TRUEDRIVE;
+        }
+        self.calculate_callback_index();
+        self.drive_slot = slot;
     }
 }
 

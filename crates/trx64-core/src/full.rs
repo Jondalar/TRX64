@@ -396,8 +396,8 @@ impl<'a> FullBus<'a> {
         // VICE via1d1541.c store_prb / iec_drive_write(~byte): the drive's PB
         // output folds into the bus as `~pb_out` (iec.rs iec_drive_write inverts via
         // the `~data ^ cpu_bus` formula by receiving the already-inverted byte).
-        let pb_out = self.drive.via1_pb_iec_output();
-        self.iec.iec_drive_write((!pb_out) & 0xff, 0);
+        // Spec 870: into the drive's own slot, and not at all while it is off or held.
+        self.drive.fold_into_iec(self.iec, self.cia2_pa_out);
     }
 
     /// Catch the drive up to `target` and refresh `drv_data_8` from its live VIA1
@@ -419,8 +419,7 @@ impl<'a> FullBus<'a> {
         self.drive.iec_drv_port = self.iec.iecbus.drv_port;
         self.drive.iec_cpu_bus = self.iec.iecbus.cpu_bus;
         self.drive_c64_ref = self.drive.catch_up_to(target, self.drive_c64_ref);
-        let pb_out = self.drive.via1_pb_iec_output();
-        self.iec.drive_set_data_no_fold(pb_out);
+        self.drive.set_iec_data_no_fold(self.iec, self.cia2_pa_out);
     }
 
     /// I/O read dispatch ($D000-$DFFF, IO config). Mirrors memory-bus.ts read().
