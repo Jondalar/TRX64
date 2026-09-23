@@ -2144,10 +2144,12 @@ impl<'a> ViaBackend for Via2dBackend<'a> {
     }
 
     // PORT OF: via2d.ts:382-487 (store_prb)
+    //
+    // No `has_image` guard: VICE's drive is live with or without a disk, and the port
+    // drives the motor, the stepper and the zone either way. Skipping it while the
+    // drive was empty lost the DOS's power-on "motor off" when the disk came later,
+    // so the rotation ran while the pin said off (BUG-062).
     fn store_prb(&mut self, ctx: &mut ViaContext, byte: u8, poldpb: u8, _addr: usize) {
-        if !self.has_image {
-            return;
-        }
         let byte = byte & 0xff;
         let poldpb = poldpb & 0xff;
 
@@ -2243,11 +2245,8 @@ impl<'a> ViaBackend for Via2dBackend<'a> {
 
     // PORT OF: via2d.ts:490-498 (undump_prb — static). LED status (no-op headless)
     // + speed_zone_set + motor bit on byte_ready_active. NO stepper/begins (that is
-    // store_prb only). The `if (!drv) return` guard maps to has_image.
+    // store_prb only). Unguarded like store_prb: VICE's `drv` is never null.
     fn undump_prb(&mut self, _ctx: &mut ViaContext, byte: u8) {
-        if !self.has_image {
-            return;
-        }
         let drv = &mut *self.drive;
         // drv.led_status = (byte & 0x08) ? 1 : 0 — no led field headless.
         // rotation_speed_zone_set((byte >> 5) & 0x03, number).
