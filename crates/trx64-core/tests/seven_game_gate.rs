@@ -31,6 +31,12 @@
 //! carries a named expectation in `B_ON_EXPECTED` saying why it differs. A game that
 //! is expected to differ and matches fails too — the expectation is stale then.
 //! Unset (the default) the machine has one drive and each game runs once, as before.
+//!
+//! Spec 872 §9.12 — `GATE_DRIVE_B_TYPE=1581` with `GATE_DRIVE_B`: position B is a 1581
+//! (the 1581 DOS from `$TRX64_1581_ROM_DIR`, the ROM directory or VICE's
+//! `data/DRIVES`) with a blank D81, idle. A characterisation, not a gate: the B-on
+//! picture is judged against the B-off frame and printed, and where the two runs part
+//! the first divergence is printed too (`B-ON 1581:` lines); nothing fails on it.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -252,6 +258,7 @@ fn run_game(file: &str, kind: DiskKind, name: &str, drive_b: Option<u8>) -> Opti
     let out_rgba = best_rgba.unwrap_or(final_rgba);
     let png = encode_png_rgba(w as u32, h as u32, &out_rgba);
     let png_path = match drive_b {
+        Some(unit) if drive_b_is_1581() => format!("{TRACES}/gate_{name}_trx64_b{unit}_1581.png"),
         Some(unit) => format!("{TRACES}/gate_{name}_trx64_b{unit}.png"),
         None => format!("{TRACES}/gate_{name}_trx64.png"),
     };
@@ -301,6 +308,67 @@ fn run_game(file: &str, kind: DiskKind, name: &str, drive_b: Option<u8>) -> Opti
     })
 }
 
+/// Spec 872 — `GATE_DRIVE_B_TYPE=1581`: position B is a 1581.
+fn drive_b_is_1581() -> bool {
+    std::env::var("GATE_DRIVE_B_TYPE").as_deref() == Ok("1581")
+}
+
+/// The 1581 DOS (Commodore IP, not bundled).
+fn rom_1581() -> Option<Vec<u8>> {
+    let vice = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../vice/vice/data/DRIVES");
+    let mut dirs: Vec<String> = std::env::var("TRX64_1581_ROM_DIR").ok().into_iter().collect();
+    dirs.push(ROM_DIR.into());
+    dirs.push(vice.into());
+    dirs.iter().find_map(|d| std::fs::read(Path::new(d).join("dos1581-318045-02.bin")).ok())
+}
+
+/// Spec 872 §9.12 — where a run with B at `unit` first parts from the run without it:
+/// both machines are built alike up to `LOAD"*",8,1`, stepped frame by frame, and the
+/// first frame that differs is replayed one instruction at a time.
+fn first_divergence(file: &str, kind: DiskKind, unit: u8, max_frames: u32) -> String {
+    let bytes = std::fs::read(format!("{SAMPLES}/{file}")).expect("sample");
+    let build = |b: bool| {
+        let mut m = Machine::new();
+        m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+        let mut sink = NullSink;
+        if b {
+            power_drive_b(&mut m, unit);
+        }
+        m.run_for_full(2_500_000, &mut sink, |_, _, _, _, _, _, _| {});
+        m.drive8.attach_disk(DiskImage { kind: kind.clone(), bytes: bytes.clone(), backing_path: None, read_only: false });
+        m.run_for_full(800_000, &mut sink, |_, _, _, _, _, _, _| {});
+        inject_keys(&mut m, b"LOAD\"*\",8,1\r");
+        m
+    };
+    let (mut a, mut b) = (build(false), build(true));
+    let same = |a: &Machine, b: &Machine| a.c64_core.clk == b.c64_core.clk && a.cpu6510.reg_pc == b.cpu6510.reg_pc && a.ram[..] == b.ram[..];
+    let mut sink = NullSink;
+    for f in 0..max_frames {
+        let (pa, pb) = (a.clone(), b.clone());
+        a.run_for_full(19_656, &mut sink, |_, _, _, _, _, _, _| {});
+        b.run_for_full(19_656, &mut sink, |_, _, _, _, _, _, _| {});
+        if same(&a, &b) {
+            continue;
+        }
+        let (mut a, mut b) = (pa, pb);
+        for _ in 0..100_000 {
+            a.run_for_full(1, &mut sink, |_, _, _, _, _, _, _| {});
+            b.run_for_full(1, &mut sink, |_, _, _, _, _, _, _| {});
+            if a.c64_core.clk != b.c64_core.clk || a.cpu6510.reg_pc != b.cpu6510.reg_pc {
+                return format!(
+                    "first divergence in frame {f} after the LOAD, at C64 cycle {}: C64 ${:04X} (B off) vs ${:04X} (B on), drive {unit} at ${:04X}",
+                    a.c64_core.clk,
+                    a.cpu6510.reg_pc,
+                    b.cpu6510.reg_pc,
+                    b.drive_b.cpu().reg_pc
+                );
+            }
+        }
+        return format!("the runs part in frame {f} after the LOAD (C64 RAM), not at an instruction boundary");
+    }
+    format!("no divergence within {max_frames} frames after the LOAD")
+}
+
 /// Spec 871 — the unit in `GATE_DRIVE_B`, or `None` when the variable is unset.
 fn drive_b_from_env() -> Option<u8> {
     Some(std::env::var("GATE_DRIVE_B").ok()?.parse().expect("GATE_DRIVE_B = a unit number"))
@@ -310,6 +378,13 @@ fn drive_b_from_env() -> Option<u8> {
 fn power_drive_b(m: &mut Machine, unit: u8) {
     use trx64_core::drive::DrivePosition;
     m.set_drive_unit(DrivePosition::B, unit).expect("drive B unit");
+    if drive_b_is_1581() {
+        m.set_drive_type(DrivePosition::B, trx64_core::iec::DriveType::Drive1581).expect("B off: a 1581");
+        m.drive_b.set_rom_1581(&rom_1581().expect("GATE_DRIVE_B_TYPE=1581 needs the 1581 DOS")).unwrap();
+        m.drive_b.attach_disk(DiskImage { kind: DiskKind::D81, bytes: vec![0u8; 819_200], backing_path: None, read_only: false });
+        m.set_drive_power(DrivePosition::B, true).expect("drive B on");
+        return;
+    }
     m.drive_b.attach_disk(DiskImage {
         kind: DiskKind::D64,
         bytes: vec![0u8; 174_848],
@@ -398,8 +473,17 @@ fn gate_game(file: &str, kind: DiskKind, name: &str) {
     let Some(off) = run_game(file, kind.clone(), name, None) else { return };
     report(&off);
     let Some(unit) = drive_b_from_env() else { return };
-    let Some(on) = run_game(file, kind, name, Some(unit)) else { return };
+    let Some(on) = run_game(file, kind.clone(), name, Some(unit)) else { return };
     report(&on);
+    if drive_b_is_1581() {
+        // Spec 872 §9.12 — recorded, not judged.
+        let picture = match judge_b_on(name, &off, &on) {
+            Ok(s) | Err(s) => s,
+        };
+        eprintln!("B-ON 1581: {name}: {picture}");
+        eprintln!("B-ON 1581: {name}: {}", first_divergence(file, kind, unit, 3000));
+        return;
+    }
     match judge_b_on(name, &off, &on) {
         Ok(s) => eprintln!("B-ON VERDICT: PASS {name}: {s}"),
         Err(s) => {

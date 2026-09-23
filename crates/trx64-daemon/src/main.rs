@@ -13250,7 +13250,8 @@ fn drive_status_json_at(st: &mut State, pos: DrivePosition) -> Value {
         let w = b.wd();
         let (track, side) = b.head();
         let c64_pc = m.cpu6510.reg_pc;
-        let writing = w.busy && matches!(w.command & 0xe0, 0xa0) || w.busy && w.command & 0xf0 == 0xf0;
+        // WRITE SECTOR ($Ax/$Bx) or WRITE TRACK ($Fx) in progress.
+        let writing = w.busy && (w.command & 0xe0 == 0xa0 || w.command & 0xf0 == 0xf0);
         return json!({
             "device": drv.unit(),
             "powered": drv.powered(),

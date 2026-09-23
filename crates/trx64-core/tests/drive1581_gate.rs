@@ -1287,3 +1287,61 @@ fn a_seek_measured_by_the_drive_through_its_cia_timer() {
     let over = one as i64 - 24_000 - 96;
     assert!((-64..64).contains(&over), "one step at r1r0 = 01 costs {one} cycles ({over:+} off 24 096)");
 }
+
+// ── §9.13 — cost ────────────────────────────────────────────────────────────────
+
+const SAMPLES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/samples");
+
+/// Frame time of `LOAD"*",8,1` of scramble over 1500 frames with B off (0), a 1541
+/// idle at 9 (1) or a 1581 idle at 9 (2), and B's drive clock at the end.
+fn timed_load(b: u8) -> (f64, u64) {
+    let bytes = std::fs::read(format!("{SAMPLES}/scramble_infinity.d64")).expect("scramble sample");
+    let mut m = Machine::new();
+    m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+    match b {
+        1 => {
+            m.drive_b.attach_disk(DiskImage { kind: DiskKind::D64, bytes: d64_with(b"IDLE", &[]), backing_path: None, read_only: false });
+            m.set_drive_power(DrivePosition::B, true).unwrap();
+        }
+        2 => {
+            m.set_drive_type(DrivePosition::B, DriveType::Drive1581).unwrap();
+            m.drive_b.set_rom_1581(&rom_1581().unwrap()).unwrap();
+            m.drive_b.mount(d81(D81::new(b"IDLE", *b"ID").bytes)).unwrap();
+            m.set_drive_power(DrivePosition::B, true).unwrap();
+        }
+        _ => {}
+    }
+    frames(&mut m, 130);
+    m.drive8.attach_disk(DiskImage { kind: DiskKind::D64, bytes, backing_path: None, read_only: false });
+    frames(&mut m, 40);
+    type_in(&mut m, b"LOAD\"*\",8,1\r");
+    let n = 1500u32;
+    let t0 = std::time::Instant::now();
+    frames(&mut m, n);
+    (t0.elapsed().as_secs_f64() * 1000.0 / n as f64, m.drive_b.drive_clk)
+}
+
+#[test]
+#[ignore = "characterisation §9.13; run with --ignored --nocapture (release)"]
+fn characterise_the_cost_of_a_1581() {
+    need_roms!();
+    if !Path::new(SAMPLES).join("scramble_infinity.d64").exists() {
+        eprintln!("[skip] no scramble sample");
+        return;
+    }
+    let mut best = [f64::MAX; 3];
+    let mut clk = [0u64; 3];
+    for _ in 0..3 {
+        for b in 0..3u8 {
+            let (t, c) = timed_load(b);
+            best[b as usize] = best[b as usize].min(t);
+            clk[b as usize] = c;
+        }
+    }
+    eprintln!(
+        "\nframe time, LOAD\"*\",8,1 of scramble, 1500 frames, best of 3:\n  B off: {:.3} ms/frame (B drive clk {})\n  1541 idle at 9: {:.3} ms/frame (B drive clk {}) ×{:.2}\n  1581 idle at 9: {:.3} ms/frame (B drive clk {}) ×{:.2}",
+        best[0], clk[0], best[1], clk[1], best[1] / best[0], best[2], clk[2], best[2] / best[0]
+    );
+    assert_eq!(clk[0], 0, "B off runs no cycle");
+    assert!(clk[2] > clk[1] * 19 / 10 && clk[2] < clk[1] * 21 / 10, "a 1581 runs twice the drive cycles: {} vs {}", clk[2], clk[1]);
+}
