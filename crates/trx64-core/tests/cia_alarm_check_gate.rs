@@ -345,6 +345,11 @@ fn the_alarm_check_changes_nothing_on_a_booted_machine() {
         let label = format!("booted@{speed}");
         let boot = |m: &mut Machine| {
             m.boot_from_dir(std::path::Path::new(ROM_DIR)).expect("boot ROMs");
+            // BUG-061 — a reset drops the C64 to 1 MHz, so the firmware has to strobe its
+            // speed again once the machine is up. Without this line the `@64` workload
+            // below boots AND runs at 1 MHz, and a gate meant to prove the alarm check
+            // changes nothing at 64 MHz would quietly stop testing 64 MHz at all.
+            m.set_u64_turbo(0x00, prefer);
             m.run_for_full(120 * FRAME, &mut NullSink, |_, _, _, _, _, _, _| {});
         };
         let (mut off, mut on) = (machine(prefer, false), machine(prefer, true));
