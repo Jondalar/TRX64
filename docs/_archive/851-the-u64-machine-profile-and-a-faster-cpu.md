@@ -147,18 +147,18 @@ in `scripts/gate.sh`.
 > against real U64 firmware with both models in one binary: row period 126 → 63 PHI2,
 > canvas 132 → 256 of 272 rows.
 
-> **Superseded on a second point (BUG-061, 2026-09-23).** The preferred speed was treated
-> as a state of the machine: a C64 came out of reset already running at it. On the Ultimate
-> the turbo is the FIRMWARE's setting and the firmware applies it to a machine that has
-> already come up — measured on the owner's device, a program run right after a reset is
-> exactly as slow at 64 MHz as at 1 MHz for its first two seconds, then jumps by a factor
-> of 71 in the same boot. It matters because the KERNAL works out whether it is a PAL or an
-> NTSC machine by racing the CPU against the raster, so a C64 that boots at 16 MHz or
-> faster wins a race it must lose and runs its jiffy clock 3.3% slow for the rest of the
-> session. A reset now drops the C64 to 1 MHz and the speed takes effect when something
-> APPLIES it — a `$D031` write, or the firmware's strobe through `set_u64_turbo`. No timing
-> constant: the device's ~4.5 s is one observation of one firmware and stays in the bug
-> report. Gate: `crates/trx64-core/tests/u64_boot_speed_gate.rs`.
+> **Superseded on a second point (BUG-061, 2026-09-23).** A C64 came out of reset already
+> running at the preferred turbo speed. The Ultimate holds it at 1 MHz for **2.06 s after a
+> reset** — measured on the owner's device, the same at 16 and 64 MHz, stable over runs —
+> although its firmware strobes the speed only 445 cycles after reset release. A strobe
+> inside the hold has no effect; afterwards the last strobed speed applies; a change
+> without a reset applies at once. It matters because the KERNAL decides PAL or NTSC by
+> racing the CPU against the raster about 1.5 s after reset, inside the hold; without it a
+> turbo C64 detects NTSC from 16 MHz up and runs its jiffy clock 3.3% slow. The hold is
+> `vic.u64_reset_hold`, armed by every reset and counted in PHI2 from the model's clock.
+> A first fix (v0.8.6) assumed instead that the firmware applies the speed after the boot;
+> it does not, and that fix did nothing for a machine driven by the real firmware. Gate:
+> `crates/trx64-core/tests/u64_boot_speed_gate.rs`.
 
 **What the build settled.**
 - A run capped by instructions ends early at turbo speed: every `budget / 2 + 1000` cap in the core,

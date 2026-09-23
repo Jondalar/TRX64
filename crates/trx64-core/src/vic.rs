@@ -1221,24 +1221,24 @@ pub struct VicII {
     /// Spec 851 — `C64_SPEED_PREFER` (`u64_config.cc:1630`): bits 0-6 speed index, bit 7
     /// badline timing. `$80` is the menu's "Off".
     pub u64_speed_prefer: u8,
-    /// Spec 851 / BUG-061 — has the preferred speed been APPLIED to this C64 yet?
+    /// BUG-061 — PHI2 cycles left in the Ultimate's post-reset hold, during which the C64
+    /// runs at 1 MHz whatever speed is set. 0 = no hold.
     ///
-    /// On the Ultimate the turbo is the firmware's setting, and the firmware applies it
-    /// to a C64 that has already come up: the machine boots at 1 MHz and speeds up
-    /// afterwards. Measured on the owner's device — a program run right after a reset is
-    /// exactly as slow at 64 MHz as at 1 MHz for its first two seconds, then jumps by a
-    /// factor of 71 in the same boot.
+    /// Measured on the owner's C64 Ultimate: after `machine:reset` the machine stays at
+    /// 1 MHz for 2.06 s — at 16 MHz and at 64 MHz alike, stable across runs — although
+    /// the firmware strobes the speed only 445 cycles after reset release. A strobe inside
+    /// the hold has no effect; when the hold ends, the last strobed speed applies. A speed
+    /// change WITHOUT a reset takes effect at once.
     ///
-    /// That is not a detail. The KERNAL works out whether it is a PAL or an NTSC machine
-    /// by racing the CPU against the raster (`$FF5E`), so a C64 that boots at 64 MHz wins
-    /// a race it must lose and programs its jiffy clock for the wrong continent. The
-    /// device never does; we did, from 16 MHz up.
+    /// It matters because the KERNAL decides PAL or NTSC by racing the CPU against the
+    /// raster at `$FF5E`, about 1.5 s after reset — inside the hold. Without it a turbo C64
+    /// wins that race from 16 MHz up and programs its jiffy clock for NTSC.
     ///
-    /// Cleared by every reset, set when the speed is APPLIED — a `$D031` write, or the
-    /// firmware's own strobe through `set_u64_turbo`. No timing constant: the device's
-    /// ~4.5 s is one observation of one firmware and belongs in a bug report, not in a
-    /// model.
-    pub u64_speed_applied: bool,
+    /// Armed by the machine's reset paths (the hold is counted in time, so its length
+    /// comes from the model's clock), counted down once per VIC cycle = once per PHI2.
+    /// Unmeasured: whether a program's own `$D031` write inside the hold is honoured.
+    /// Modelled as not — the hold is on the CPU, not on who asked.
+    pub u64_reset_hold: u32,
     /// Spec 851 — `$D031` has been written since the last reset; until then it reads, and
     /// runs at, the preferred speed.
     pub u64_d031_written: bool,
@@ -1480,7 +1480,7 @@ impl VicII {
             fastmode: 0,
             u64_regs_en: 0x01,
             u64_speed_prefer: 0x80,
-            u64_speed_applied: false,
+            u64_reset_hold: 0,
             u64_d031_written: false,
             u64_speed_table: U64SpeedTable::U64II,
             raster_cycle: 0,
@@ -2012,6 +2012,10 @@ impl VicII {
     /// observer records (`Observer::RECORDS_VIC`) instantiates the other one.
     pub fn tick_g<const REC: bool>(&mut self, mem: &VicMemView) -> bool {
         let mut ba_low = false;
+        // BUG-061 — the Ultimate's post-reset hold counts PHI2, and this is one.
+        if self.u64_reset_hold > 0 {
+            self.u64_reset_hold -= 1;
+        }
 
         // Spec 843 D1 — record what drives THIS line, at its first cycle, before any
         // of it is used. `mem.vbank` is only in scope here (it lives on the borrowed
@@ -2813,9 +2817,6 @@ impl VicII {
             0x31 if self.speed_profile == SpeedProfile::U64 && self.u64_regs_en & 0x01 != 0 => {
                 self.regs[0x31] = value;
                 self.u64_d031_written = true;
-                // BUG-061 — a program writing the speed register IS the speed being
-                // applied; from here the machine runs at what it asked for.
-                self.u64_speed_applied = true;
                 // Spec 868 §9 — the write reloads the divider's counter, so the
                 // sub-PHI2 phase restarts at this store.
                 self.u64_d031_written_this_instruction = true;
@@ -2968,11 +2969,9 @@ impl VicII {
         if self.speed_profile != SpeedProfile::U64 {
             return (0, true);
         }
-        // BUG-061 — a C64 that has just come out of reset runs at 1 MHz until the
-        // firmware applies its speed, exactly as the device does. Without this the
-        // KERNAL's raster race at `$FF5E` runs under turbo and decides it is an NTSC
-        // machine.
-        if !self.u64_speed_applied {
+        // BUG-061 — inside the post-reset hold the C64 is a 1 MHz 6510, whatever is set.
+        // Afterwards the setting applies as it stands, which IS the last strobe.
+        if self.u64_reset_hold > 0 {
             return (0, true);
         }
         let base = if self.u64_regs_en & 0x01 != 0 { self.u64_d031() } else { self.u64_speed_prefer };

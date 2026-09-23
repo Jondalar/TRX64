@@ -251,6 +251,11 @@ fn lockstep(label: &str, off: &mut Machine, on: &mut Machine, steps: u64) -> u64
 /// failed on EQUALITY, not on its digest, because a restored machine only learned its
 /// speed at the next instruction boundary and spent a PHI2 cycle at the wrong divider.
 /// `restore_runtime_checkpoint` puts the divider back in force immediately now.
+/// **`booted@64` re-recorded for BUG-061 (2026-09-23), and it alone.** After a reset the
+/// Ultimate holds its C64 at 1 MHz for 2.06 s, and this is the only workload that boots —
+/// so its machine now spends most of the 120-frame settle at 1 MHz and reaches the
+/// lockstep in a different state. Every other digest, including every `@64` one that does
+/// not reset, is bit-identical to the line above.
 const GOLDEN: &[(&str, u64)] = &[
     ("ta_irq@1", 0xe32345655ea52187),
     ("ta_irq@64", 0x103bd9367deaf0ae),
@@ -271,7 +276,7 @@ const GOLDEN: &[(&str, u64)] = &[
     ("restore_cascade@1/check=false", 0x734ab0a82991ce2e),
     ("restore_cascade@64/check=false", 0x6381f6030a3b5d9f),
     ("booted@1", 0xc9fc1a34eda0ea27),
-    ("booted@64", 0xf437d278235038d9),
+    ("booted@64", 0x5296fe658776b17e),
 ];
 
 fn golden(label: &str, digest: u64, printed: &mut Vec<String>) {
@@ -345,10 +350,9 @@ fn the_alarm_check_changes_nothing_on_a_booted_machine() {
         let label = format!("booted@{speed}");
         let boot = |m: &mut Machine| {
             m.boot_from_dir(std::path::Path::new(ROM_DIR)).expect("boot ROMs");
-            // BUG-061 — a reset drops the C64 to 1 MHz, so the firmware has to strobe its
-            // speed again once the machine is up. Without this line the `@64` workload
-            // below boots AND runs at 1 MHz, and a gate meant to prove the alarm check
-            // changes nothing at 64 MHz would quietly stop testing 64 MHz at all.
+            // BUG-061 — after a reset the Ultimate holds its C64 at 1 MHz for 2.06 s; the
+            // 120-frame settle below outlasts it, so the `@64` workload is at 64 MHz by
+            // the time the lockstep starts.
             m.set_u64_turbo(0x00, prefer);
             m.run_for_full(120 * FRAME, &mut NullSink, |_, _, _, _, _, _, _| {});
         };
