@@ -311,6 +311,9 @@ pub struct State {
     /// but pins only the last PINNED_MEDIA_EVENTS checkpoints; TRX64 has no per-event
     /// checkpoint pins to leak, so a simple length cap suffices).
     media_events: Vec<Value>,
+    /// Spec 873 — what the folder devices refused (`unit 9 refused M-E $0500`), newest
+    /// last, bounded. Each is also broadcast as `device/folder_event` when it happens.
+    folder_events: Vec<Value>,
     /// Spec 265 / audit ws-media-8 — the recents store (= the c64re GLOBAL persisted
     /// recent-media store, recent-files.ts). `add_recent_media` pushes on EVERY mount/
     /// swap (newest-first, deduped by path, cap [`MAX_RECENT_MEDIA`]), stamping a
@@ -1955,6 +1958,7 @@ const DEBUG_RUN_BUDGET: u64 = 10_000_000;
 /// Called after every `run_until_break` and after every `step_one_instruction`
 /// so nothing is lost.
 fn drain_and_broadcast_observer_log(st: &mut State) {
+    drain_folder_events(st);
     let session_id = st.session.id.clone();
 
     // 1. pending_log (runtime-controller.ts:697-698)
@@ -2383,6 +2387,8 @@ pub(crate) fn stream_debug_gated_advance(st: &mut State, budget: u64) -> u32 {
                 .machine
                 .run_for_full(budget, &mut sink, |_, _, _, _, _, _, _| {});
         }
+        // Spec 873 — a folder device's refusals reach the clients on the free run too.
+        drain_folder_events(st);
     } else {
         // runtime-controller.ts:277 stepPastCurrentBreakpoint — if the PC currently
         // sits ON an enabled exec breakpoint (e.g. we just halted there and the user
@@ -6936,6 +6942,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 None
             };
             let cart_json_live = cart_status_json(&mut st);
+            drain_folder_events(&mut st);
             let st = st;
             // Spec 771.2 — report the REAL run/pause state + last stop reason (was
             // hardcoded "paused", which kept the UI's seed poll permanently frozen).
@@ -7089,6 +7096,9 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             }
             // Spec 871 — both drive positions: unit, power, disk.
             state_json["drives"] = drives_json(&st);
+            // Spec 873 — the folder devices on the bus.
+            state_json["folders"] = folders_json(&st);
+            state_json["folderEvents"] = Value::Array(st.folder_events.clone());
             Response::ok(id, state_json)
         }
 
@@ -7553,6 +7563,62 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
         // the other position, when the other drive position already answers to `to` —
         // on the wire a drive is addressed by its unit, so two positions may not share
         // one even while one of them is off.
+        // Spec 873 — put a folder device on the bus at `unit` (8-11), serving the host
+        // folder `path`. `read_only` (default false) answers 26 to every write; `boot`
+        // names the file `LOAD"*"` loads (a host path below the folder); `profile` is
+        // the timing profile, `ultimate` (default) or `vice`. Refused, by name, at a
+        // unit a drive or another folder device answers to.
+        "device/folder_attach" => {
+            let Some(unit) = req.params.get("unit").and_then(|v| v.as_u64()) else {
+                return Response::err(id, -32602, "device/folder_attach: missing `unit` (8-11)");
+            };
+            let Some(path) = req.params.get("path").and_then(|v| v.as_str()) else {
+                return Response::err(id, -32602, "device/folder_attach: missing `path`");
+            };
+            let profile = match req.params.get("profile").and_then(|v| v.as_str()) {
+                None => trx64_core::folder_device::TimingProfile::default(),
+                Some(n) => match trx64_core::folder_device::TimingProfile::by_name(n) {
+                    Some(p) => p,
+                    None => return Response::err(id, -32602, format!("device/folder_attach: profile {n:?}: `ultimate` or `vice`")),
+                },
+            };
+            let opts = trx64_core::folder_device::FolderOpts {
+                read_only: req.params.get("read_only").or_else(|| req.params.get("readOnly")).and_then(|v| v.as_bool()).unwrap_or(false),
+                boot: req.params.get("boot").and_then(|v| v.as_str()).map(String::from),
+                profile,
+            };
+            let src = match trx64_core::folder_device::HostFolder::new(path) {
+                Ok(s) => s,
+                Err(e) => return Response::err(id, -32602, format!("device/folder_attach: {path}: {e}")),
+            };
+            let mut st = state.lock().unwrap();
+            if unit > 255 {
+                return Response::err(id, -32602, format!("device/folder_attach: unit {unit}: a folder device stands at 8-11"));
+            }
+            if let Err(e) = st.session.machine.attach_folder(unit as u8, std::sync::Arc::new(src), opts) {
+                return Response::err(id, -32602, format!("device/folder_attach: {e}"));
+            }
+            let f = st.session.machine.folder(unit as u8).expect("just attached");
+            Response::ok(id, json!({
+                "unit": unit,
+                "path": f.root.to_string_lossy(),
+                "read_only": f.read_only(),
+                "profile": f.profile.name(),
+            }))
+        }
+
+        // Spec 873 — take the folder device at `unit` off the bus.
+        "device/folder_detach" => {
+            let Some(unit) = req.params.get("unit").and_then(|v| v.as_u64()) else {
+                return Response::err(id, -32602, "device/folder_detach: missing `unit`");
+            };
+            let mut st = state.lock().unwrap();
+            if let Err(e) = st.session.machine.detach_folder(unit.min(255) as u8) {
+                return Response::err(id, -32602, format!("device/folder_detach: {e}"));
+            }
+            Response::ok(id, json!({ "unit": unit, "detached": true }))
+        }
+
         "session/drive_unit" => {
             let unit = match unit_param(&req.params) {
                 Ok(u) => u,
@@ -13523,6 +13589,39 @@ fn drives_json(st: &State) -> Value {
     Value::Array(list)
 }
 
+/// Spec 873 — one line per folder device for `session/state`.
+fn folders_json(st: &State) -> Value {
+    Value::Array(
+        st.session
+            .machine
+            .folders
+            .iter()
+            .map(|f| json!({ "unit": f.unit, "path": f.root.to_string_lossy(), "read_only": f.read_only() }))
+            .collect(),
+    )
+}
+
+/// Spec 873 — hand the folder devices' refusals to every client and keep the last few.
+fn drain_folder_events(st: &mut State) {
+    if st.session.machine.folders.is_empty() {
+        return;
+    }
+    let mut events = Vec::new();
+    for f in st.session.machine.folders.iter_mut() {
+        events.extend(f.take_events());
+    }
+    for e in events {
+        let text = format!("unit {} {}", e.unit, e.text);
+        let v = json!({ "unit": e.unit, "text": text });
+        st.notify.broadcast("device/folder_event", v.clone());
+        st.folder_events.push(v);
+    }
+    let n = st.folder_events.len();
+    if n > 64 {
+        st.folder_events.drain(0..n - 64);
+    }
+}
+
 /// Spec 709.13 — capture a real before/after checkpoint into the ring and return
 /// its id (= the c64re `controller.captureCheckpoint()` → `ring.capture(...)`).
 /// None only on a capture error (the ring rejects a malformed payload); callers
@@ -16960,6 +17059,7 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         recorder_disk_hash: None,
         scenarios: std::collections::HashMap::new(),
         media_events: Vec::new(),
+        folder_events: Vec::new(),
         recent_media: Vec::new(),
         materialized_media: Vec::new(),
         batches: std::collections::HashMap::new(),
@@ -17638,6 +17738,7 @@ mod batch1_tests {
             recorder_disk_hash: None,
             scenarios: std::collections::HashMap::new(),
             media_events: Vec::new(),
+            folder_events: Vec::new(),
             recent_media: Vec::new(),
             materialized_media: Vec::new(),
             batches: std::collections::HashMap::new(),
@@ -23999,5 +24100,99 @@ mod batch1_tests {
         assert!(m.drive8.powered() && m.drive8.unit() == 8, "and on at 8");
         assert_eq!(m.drive_b.board_type(), trx64_core::iec::DriveType::Drive1581, "B is still a 1581");
         assert_eq!(m.iec.unit_type[8], trx64_core::iec::DriveType::Drive1581);
+    }
+
+    // ── Spec 873 — a folder on the bus, on the wire ──────────────────────────────────
+
+    struct TmpDir(std::path::PathBuf);
+    impl TmpDir {
+        fn new(tag: &str) -> TmpDir {
+            let p = std::env::temp_dir().join(format!("trx64-873-daemon-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            TmpDir(p)
+        }
+    }
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Type through the keyboard buffer and run until the buffer is consumed and `frames`
+    /// more frames have passed.
+    fn type_and_run(st: &SharedState, text: &[u8], frames: u64) {
+        for chunk in text.chunks(10) {
+            let mut g = st.lock().unwrap();
+            for _ in 0..200 {
+                if g.session.machine.read_full(0xc6) == 0 {
+                    break;
+                }
+                run_cycle_budget(&mut g.session, 19_656);
+            }
+            for (i, b) in chunk.iter().enumerate() {
+                g.session.machine.poke(0x0277 + i as u16, &[*b]);
+            }
+            g.session.machine.poke(0x00c6, &[chunk.len() as u8]);
+            run_cycle_budget(&mut g.session, 2 * 19_656);
+        }
+        let mut g = st.lock().unwrap();
+        run_cycle_budget(&mut g.session, frames * 19_656);
+    }
+
+    #[test]
+    fn a_folder_attaches_answers_and_detaches_on_the_wire() {
+        let Some(st) = booted_state() else { return };
+        let dir = TmpDir::new("wire");
+        std::fs::write(dir.0.join("hello.prg"), [0x00, 0xc0, 1, 2, 3]).unwrap();
+        let path = dir.0.to_str().unwrap();
+        // Unit 8 is drive A's: refused, naming it.
+        let e = call_err(&st, "device/folder_attach", json!({ "unit": 8, "path": path }));
+        assert!(e.message.contains("position A") && e.message.contains("unit 8"), "{}", e.message);
+        let e = call_err(&st, "device/folder_attach", json!({ "unit": 9, "path": "/nonexistent/trx64-873" }));
+        assert!(e.message.contains("folder_attach"), "{}", e.message);
+        let r = call(&st, "device/folder_attach", json!({ "unit": 9, "path": path, "profile": "vice" }));
+        assert_eq!((r["unit"].clone(), r["profile"].clone(), r["read_only"].clone()), (json!(9), json!("vice"), json!(false)));
+        call(&st, "device/folder_detach", json!({ "unit": 9 }));
+        assert!(call_err(&st, "device/folder_attach", json!({ "unit": 9, "path": path, "profile": "fast" })).message.contains("profile"));
+        let r = call(&st, "device/folder_attach", json!({ "unit": 9, "path": path }));
+        assert_eq!(r["profile"], json!("ultimate"), "the default profile");
+        let state = call(&st, "session/state", json!({}));
+        assert_eq!(state["folders"][0]["unit"], json!(9));
+        assert_eq!(state["folders"][0]["read_only"], json!(false));
+        // The C64 reaches it through the KERNAL: a load, then a memory command it refuses.
+        type_and_run(&st, b"LOAD\"HELLO\",9,1\r", 200);
+        assert_eq!(st.lock().unwrap().session.machine.read_full(0xc002), 3, "HELLO loaded from the folder");
+        type_and_run(&st, b"NEW\r", 10);
+        type_and_run(&st, b"OPEN15,9,15,\"M-E\"+CHR$(0)+CHR$(5):CLOSE15\r", 100);
+        let state = call(&st, "session/state", json!({}));
+        let ev = state["folderEvents"].as_array().unwrap();
+        assert!(ev.iter().any(|e| e["text"] == json!("unit 9 refused M-E $0500")), "{ev:?}");
+        // The monitor: its column in `iec`, its own `folder` view.
+        let iec = mon_exec(&st, "iec");
+        assert!(iec.contains("folder 9"), "{iec}");
+        let f = mon_exec(&st, "folder 9");
+        assert!(f.contains("folder unit 9") && f.contains("33,SYNTAX ERROR"), "{f}");
+        // Detached: gone from the state and the bus.
+        call(&st, "device/folder_detach", json!({ "unit": 9 }));
+        let state = call(&st, "session/state", json!({}));
+        assert_eq!(state["folders"], json!([]));
+        assert_eq!(mon_exec(&st, "folder"), "no folder device on the bus");
+        assert!(call_err(&st, "device/folder_detach", json!({ "unit": 9 })).message.contains("no folder device"));
+    }
+
+    #[test]
+    fn a_folder_lives_through_a_power_cycle() {
+        let Some(st) = booted_state() else { return };
+        let dir = TmpDir::new("power");
+        let path = dir.0.to_str().unwrap();
+        call(&st, "device/folder_attach", json!({ "unit": 10, "path": path, "read_only": true }));
+        call(&st, "session/power", json!({ "op": "off" }));
+        call(&st, "session/power", json!({ "op": "on" }));
+        let state = call(&st, "session/state", json!({}));
+        assert_eq!(state["folders"][0]["unit"], json!(10));
+        assert_eq!(state["folders"][0]["read_only"], json!(true));
+        let g = st.lock().unwrap();
+        assert_ne!(g.session.machine.iec.folder_units & (1 << 10), 0, "back on the bus");
     }
 }

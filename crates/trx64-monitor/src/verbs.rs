@@ -349,6 +349,7 @@ pub fn monitor_help_text() -> String {
         "    screen           decode the 40x25 text screen (real screen pointer)",
         "    io [1|addr]      I/O area per device: register hex (peek) + state details (VICE io)",
         "    iec              the serial bus: ATN/CLK/DATA, their level, and WHICH side is pulling each one low, plus both ends as their CPUs see them ($DD00 and the 1541's $1800). A released line is high and any device may pull it low, so \"who is low\" is per-device, not a bus-wide state. Answers the only question an IEC stall ever asks.",
+        "    folder [unit]    a folder device on the bus: its protocol state, open channels and last status",
         "    bitmap <a> [w h] [hires|charset|sprite]  render a RAM range to a PNG (scrub gfx)",
         "    bank [lens]      show/set the sticky default lens for m/d",
         "    wr [lens] <a> <b..>  write exactly these bytes from a",
@@ -739,7 +740,7 @@ pub fn classify(command: &str) -> MachineEffect {
 /// The verbs this crate owns today. A line whose verb is not here falls through to the
 /// host's own dispatch — the honest shape while the move is half done, and the shape
 /// §6 keeps afterwards for a host's own verbs.
-const OWNED: [&str; 41] = [
+const OWNED: [&str; 42] = [
     "r",
     "registers",
     "wr",
@@ -770,6 +771,7 @@ const OWNED: [&str; 41] = [
     "flow",
     "io",
     "iec",
+    "folder",
     "focus",
     "bt",
     "triage",
@@ -2038,9 +2040,15 @@ fn exec_owned(
             let lvl = |v: u8, bit: u8| if v & bit != 0 { "high" } else { "LOW " };
             let pull = |v: u8, bit: u8| if v & bit != 0 { "-" } else { "pulls" };
 
+            // Spec 873 — a column per folder device, when there is one: who is holding
+            // the line includes a device without a CPU.
+            let folders: Vec<(u8, u8)> = m.folders.iter().map(|f| (f.unit, m.iec.drv_bus(f.unit as usize))).collect();
+            let fhead: String = folders.iter().map(|(u, _)| format!("   folder {u}")).collect();
+            let fcol = |bit: u8| -> String { folders.iter().map(|&(_, b)| format!("   {:<8}", pull(b, bit))).collect::<String>().trim_end().to_string() };
+            let sep = |s: String| if s.is_empty() { s } else { format!("  {s}") };
             let mut out = vec![
                 "IEC BUS  (a released line is high; any device may pull it low)".to_string(),
-                "  line   bus     C64     drive 8".to_string(),
+                format!("  line   bus     C64     drive 8{fhead}"),
                 format!(
                     "  ATN    {}    {}   {}",
                     lvl(cpu_bus, ATN),
@@ -2048,16 +2056,18 @@ fn exec_owned(
                     "-      (ATN is C64-only)"
                 ),
                 format!(
-                    "  CLK    {}    {}   {}",
+                    "  CLK    {}    {}   {}{}",
                     lvl(cpu_port, CLK),
                     pull(cpu_bus, CLK),
-                    pull(drv_bus8, CLK)
+                    pull(drv_bus8, CLK),
+                    sep(fcol(CLK))
                 ),
                 format!(
-                    "  DATA   {}    {}   {}",
+                    "  DATA   {}    {}   {}{}",
                     lvl(cpu_port, DATA),
                     pull(cpu_bus, DATA),
-                    pull(drv_bus8, DATA)
+                    pull(drv_bus8, DATA),
+                    sep(fcol(DATA))
                 ),
                 String::new(),
                 format!(
@@ -2090,6 +2100,21 @@ fn exec_owned(
                 v1800 & 1
             ));
             Ok(out.join("\n"))
+        }
+
+        // Spec 873 — a folder device has no CPU and is not a `Device` to select; this is
+        // its view: protocol state, open channels, last status.
+        "folder" => {
+            let m = host.machine();
+            if m.folders.is_empty() {
+                return Ok("no folder device on the bus".to_string());
+            }
+            let want = toks.get(1).and_then(|t| t.trim_start_matches('#').parse::<u8>().ok());
+            let picked: Vec<String> = m.folders.iter().filter(|f| want.is_none_or(|u| u == f.unit)).map(|f| f.describe()).collect();
+            if picked.is_empty() {
+                return Err(format!("no folder device at unit {}", want.unwrap_or(0)));
+            }
+            Ok(picked.join("").trim_end().to_string())
         }
 
         // ---- Flow FOCUS (monitor-shell.ts:1075-1099) --------------------------------

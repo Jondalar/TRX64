@@ -105,6 +105,8 @@ you care about across interrupts.
 | `df [-i] [a] [n]` | follow-disasm: walk control flow statically (`-i` asks at branches) |
 | `screen` | decode the 40×25 text screen (real screen pointer) |
 | `io [1\|addr]` | I/O per device: register hex (peek) + decoded state |
+| `iec` | the serial bus: each line's level and which device pulls it (C64, drive 8, each folder device) |
+| `folder [unit]` | a folder device on the bus: its protocol state, open channels and last status. It has no CPU, so it is not a `device` to select |
 | `bitmap <a> [w h] [mode]` | render a RAM range to a PNG (`hires`/`charset`/`sprite`) |
 | `bank [lens]` | show / set the sticky default lens for `m`/`d` |
 | `wr [lens] <a> <b..>` | write exactly these bytes from a |

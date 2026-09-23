@@ -1,8 +1,8 @@
 # Spec 873 — A folder on the bus: an IEC device backed by a host directory
 
-**Status:** PROPOSED (2026-09-23)
+**Status:** MERGED 2026-09-23 (main, after v0.8.8) — as built in §14
 **Repos:** TRX64. C64RE: no change in this spec — its media tools keep addressing disks.
-**Number:** 873 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`; the board still
+**Number:** 873 (registry: `../../../C64ReverseEngineeringMCP/specs/README.md`; the board still
 says "next free 872" and does not list this spec yet).
 **Depends on:** Spec 870 (the drive as a part: power, reset line, unit 8-11), Spec 871 (two
 drive positions on one bus, units on the wire, the refusal of two devices at one unit).
@@ -187,10 +187,13 @@ States as VICE names them, with the timing profile of §6. What it does:
 - **ATN falls:** abort whatever it was doing (talking, listening, idle), release CLK, pull
   DATA within `t_atn_ack`, ignore the lines for `t_atn_settle`. **Every ATN is answered**,
   addressed or not — VICE (`serial-iec-device.c:279-290`) and the Ultimate
-  (`iec_code.iec:133-137`) both do, as does a 1541 in hardware. Consequence, stated now:
-  like an idle second 1541 (871 §9.1), an attached folder device will stretch or disturb
-  loaders that use ATN as a request line (Green Beret, MOTM). That is the modelled physics,
-  not a defect.
+  (`iec_code.iec:133-137`) both do, as does a 1541 in hardware. Consequence: like an
+  idle second 1541 (871 §9.1), an attached folder device disturbs a loader that uses ATN
+  as a request line (Green Beret) or holds ATN low without a byte (Maniac Mansion's drive-8
+  fastloader: the Ultimate's microcode keeps DATA pulled in `WAIT UNTIL CLK=0`), and,
+  answering on the Ultimate's clock rather than a 1541 DOS's, it changes the KERNAL's
+  schedule where it acknowledges sooner than drive 8. MOTM, which an idle drive 9 breaks,
+  it leaves alone (§14, measured). That is the modelled physics, not a defect.
 - **Bytes under ATN:** received with the listener handshake, acknowledged with DATA. After
   the first byte: `$20+u` LISTEN, `$40+u` TALK, `$3F` UNLISTEN, `$5F` UNTALK are taken;
   any other primary means "not for me" — release both lines and wait for ATN high. The
@@ -232,19 +235,35 @@ kept as the second profile.
 | `t_atn_settle` | 100 µs | 20 µs | ignore lines after ATN falls |
 | `t_eoi_detect` | 200 µs | 1475 µs | listener: CLK high this long = EOI |
 | `t_eoi_ack` | 60 µs | 70 µs | listener: DATA pulse acknowledging EOI |
+| `t_rx_ack` | 0 | 50 µs | listener: last CLK fall → frame ack (`RECEIVE_BYTE` `WAIT FOR 50 us`) — *added at build* |
+| `t_rx_ack_atn` | 0 | 5 µs | the same under ATN (`_normal_data` `WAIT FOR 5 us`) — *added at build* |
 | `t_turnaround` | 80 µs | 80 µs (`Tda`) | talker: CLK low → first ready-to-send |
+| `t_bit_lead` | 0 | 40 µs (`Tne`) | talker: ready-for-data → first bit — *added at build* |
 | `t_bit_low` / `t_bit_high` | 60 / 60 µs | 80 / 80 µs | talker: per bit |
 | `t_byte_gap` | 0 | 90 µs | talker: after an acknowledged byte |
 | `t_frame_ack` | 1000 µs | 1000 µs | talker: wait for the listener's ack |
 
+The three rows marked *added at build* are waits the Ultimate's microcode has and the
+table did not name (§2 lists `Tne` as "40 µs before the first bit"); without them the
+default profile would not be the Ultimate's.
+
 - The profile is **data, not code**, and carried in the checkpoint, so a test can run the
   device at either edge and a host can choose VICE's numbers.
-- **The KERNAL's margins are to be read off the ROM at build**, not taken from a timing
-  chart: device-present after ATN, the frame-ack wait as talker, and the EOI timeout as
-  listener are CIA-timer loops in the KERNAL, and the gate (§11.9) asserts the device's
-  worst case against the numbers read there. Orientation only, not yet read from code:
-  the published serial-bus timing gives ~1 ms for the first two and ~200-250 µs for the
-  third.
+- **The KERNAL's margins, read off the ROM (901227-03) at build** — the gate (§11.9)
+  checks the instruction bytes at each address and asserts the device's measured worst
+  case against these numbers (C64 cycles):
+
+  | margin | where | cycles |
+  |---|---|---|
+  | device present: ATN asserted → the DATA sample that decides DEVICE NOT PRESENT | `$ED33 STA $DD00`, then `$EE8E`, `$EE97`, W1MS `$EEB3` (`LDX #$B8`, a 5-cycle `DEX/BNE` loop), `$ED40` → `$EEA9 LDA $DD00`; 97 + 5·184 | **1017** |
+  | C64 as talker: no frame acknowledge = error | CIA1 timer B, `$ED92 LDA #$04 / STA $DC07`, low latch `$FF` | **1279** |
+  | C64 as listener: no CLK from the talker = EOI | timer B, `$EE20 LDA #$01 / STA $DC07`, low latch `$FF` | **511** |
+  | C64 as listener: longest gap between two samples of CLK while it waits for the first bit | the `$EE30` loop (`LDA $DC0D / AND / BNE / JSR $EEA9 / BMI`, 35 cycles) + a badline's 43-cycle stall | **78** |
+
+  Timer B's low latch is the CIA's reset value: the KERNAL writes `$DC06` only in the tape
+  code (`$FBB1`). So the EOI timeout is ~519 µs, not the ~200-250 µs the timing charts
+  give; the first two are ~1.03 ms and ~1.30 ms. The fourth margin was found at build
+  (§13, as built): a talker's first CLK-low phase must outlast it.
 
 ## §7 D5 — The DOS surface
 
@@ -390,9 +409,9 @@ pointer to it. The host folder is the one truth, and rewinding the machine never
 7. **A 1541 on 8 and the folder on 9 — the 7-game gate.** Unchanged gate with no folder:
    7/7, screenshots byte-identical to v0.8.8. Then each game again with an idle folder at
    9, judged by picture against its no-folder run as 871 §9.1 does; games expected to
-   differ named in the gate with their reason (candidates: Green Beret and MOTM, whose
-   loaders use ATN; Scramble, whose KERNAL stage every ATN listener slows) — a game
-   expected to differ that matches fails too.
+   differ named in the gate with their reason — a game expected to differ that matches
+   fails too. (The candidates named here before the build — Green Beret, MOTM, Scramble
+   for its slowed KERNAL stage — were two-thirds wrong; the measured list is in §14.)
 8. **Checkpoints.** Mid-LOAD from 9 and mid-SAVE to 9, through a `.c64re` container into a
    freshly booted machine: restored state equal, the restored run finishes byte-identical
    and in cycle lockstep for 500 frames with the straight run (host folder unchanged in
@@ -400,7 +419,11 @@ pointer to it. The host folder is the one truth, and rewinding the machine never
    no file contents, whatever the folder's size.
 9. **Timing against the KERNAL.** The margins read off the ROM (§6) asserted against the
    device's worst case; the gate's load/save tests pass with the default (Ultimate) profile
-   and again with VICE's.
+   and again with VICE's. **Proved impossible as written for VICE's profile with the
+   display on** (§14): its 60 µs half-bit is shorter than the KERNAL's 78-cycle poll gap
+   once a badline lands in it, and a device clocked at every sync point (§4) — unlike
+   VICE's, which moves one state per `$DD00` access — then loses bit 0. VICE's numbers are
+   gated with the display blanked; the default profile is gated as written.
 10. **Nothing else moved.** Every existing drive and bus gate byte-identical with no folder
     attached; `cia_alarm_check_gate` digests unchanged.
 
@@ -410,7 +433,8 @@ pointer to it. The host folder is the one truth, and rewinding the machine never
     folder at 8, `LOAD"*",8,1` / `RUN`. Per game: does the KERNAL stage load, where does it
     stop, and which refused command (`M-W`/`M-E`) it sent. Expected: every game with its
     own drivecode stops at the first `M-E`. That list is the port backlog this spec exists
-    for.
+    for. (Measured, §14: drivecode is started by `M-E`, by `U3`, and by `B-E` on a `#`
+    buffer — each game stops at the first of these, and the refusal names it.)
 12. **Cost** with no folder, an idle folder, and a folder serving a LOAD.
 
 ## §12 Scope — where this stops
@@ -443,3 +467,179 @@ pointer to it. The host folder is the one truth, and rewinding the machine never
   between emulating the firmware's IEC processor (the firmware's DOS runs) and mapping the
   U64's Software IEC onto this device (TRX64's DOS runs). **Left open by the owner
   (2026-09-23) until UE2 asks**; nothing in this spec prevents either.
+
+## §14 As built (2026-09-23, branch `spec-873-folder`)
+
+**Where it lives.** `crates/trx64-core/src/folder_device.rs`: the `FolderSource` trait
+(list, stat, read, write, scratch, rename, mkdir, rmdir, free space) and `HostFolder`, its
+`std::fs` implementation (free space through `statvfs` / `GetDiskFreeSpaceExW`); the
+`TimingProfile` (`ULTIMATE`, the default, and `VICE`); the DOS (`Dos`); the line machine
+(`Line`, VICE's state names plus one, `P_ACK`, for the delayed frame acknowledge); and
+`folders_sync`, the sync point. `Machine::folders` holds them (empty by default),
+`attach_folder` / `detach_folder` / `folder(_mut)` / `reattach_folders` manage them.
+`IecCore::folder_units` is the third input to the device map (`set_folder_units`;
+`adopt_drive_slots` leaves those slots alone and marks them `IECBUS_DEVICE_IECDEVICE`,
+which selects conf3). A new slot starts at `WRITE_CLK | WRITE_DATA`; a vacated one is
+released to `0xff`.
+
+**On the bus (§4).** `folders_sync` runs at the end of each instruction
+(`Machine::catch_up_drives`, after both drives are caught up and folded), on a `$DD00`
+read (after `iec_push_flush`), and on a `$DD00` write after the conf write has put the new
+C64 lines in (at `clk + 1`, the write instant). Each device is advanced by `advance(t,
+others, atn)`: every timed transition due before `t` under the lines it saw last, each
+settled at its due time, then the new lines at `t`; its pull is written into its slot and
+the ports are folded once. With no folder attached the whole of it is one
+`is_empty()` test.
+
+**Decided at build, not stated:**
+
+- *The talker does not consume a byte until it is acknowledged* (`peek` / `commit`), as a
+  1541 and the Ultimate (`READB` … `POPB` after the ack) do. VICE's `fsdrive_read` takes
+  the byte when it starts sending; an ATN that interrupts the frame would lose it.
+- *A command on channel 15 executes at UNLISTEN*, the same point as an OPEN (VICE
+  `fsdrive_unlisten`), not at its EOI as the Ultimate does.
+- *`CLOSE 15` closes every channel*, as a 1541 does.
+- *Host names outside the §8 mapping* (`_`, `~`, UTF-8 bytes) show as the PETSCII byte of
+  the same value; they still open, because lookups compare in PETSCII. A name the C64
+  writes is always mapped (`_` from the C64 becomes `%5F`).
+- *OPEN for write creates the host file at the OPEN* (empty, or truncated with `@`), so
+  `63` is decided there and the file exists while the C64 writes; the last partial chunk
+  reaches the host at CLOSE. Detach closes the channels (pending bytes written); a C64
+  reset drops them (§5); a restore replaces the device and writes nothing.
+- *Refusals are events*: `M-W $0500`, `M-E $0205`, `M-R $0300`, `U3`, `B-E`, `#0`,
+  `U0`, … (`FolderDevice::take_events`).
+- *CD not found* answers `39,SYNTAX ERROR` (the Ultimate's text for 39).
+- *The C64's RESET* resets the device in `cold_reset` (it rebuilds the IEC core), so
+  `warm_reset` and a power-on reach it; with the line cut it keeps its state and its pull.
+- *A C64 power cycle in the daemon* keeps the folder devices (`Session::folders_held`),
+  as drive B is kept.
+
+**Checkpoint.** A `folders` node: the serialised `FolderDevice` list (unit, root path,
+profile, reset line, line state with absolute timeouts and the lines last seen, DOS:
+channels as host path + position + type + unwritten chunk, open listing bytes, status and
+its read position, cwd, name and command buffers, boot file, read-only, clock rate).
+Omitted with no folder attached — every existing checkpoint and the
+`cia_alarm_check_gate` digests are unchanged. On restore each device gets its host back
+(the live machine's source for the same unit and root, else `HostFolder` at the root) and
+re-opens its read channels: a file gone since answers `62`. A 2 MiB file in the folder
+leaves the node under 16 KiB.
+
+**Wire and monitor.** `device/folder_attach {unit, path, read_only?, boot?, profile?}`
+(`profile`: `ultimate` | `vice`), `device/folder_detach {unit}`; `session/state` gains
+`folders: [{unit, path, read_only}]` and `folderEvents`; each refusal is broadcast as
+`device/folder_event {unit, text}`. Monitor: `iec` gains a column per folder device
+(byte-identical without one), `folder [unit]` prints protocol state, channels and status.
+The golden transcript was re-blessed for the one new help line.
+
+### §14.1 Acceptance, as run
+
+`crates/trx64-core/tests/folder_device_gate.rs` (13 run by default, 2 characterisations
+ignored), daemon tests in `main.rs` (`batch1_tests`), `seven_game_gate` with
+`GATE_FOLDER=9`.
+
+1. **Directory** — `directory_lists_the_folder_as_a_1541_would`: the listing bytes equal
+   the expected 1541 listing (header with the folder's last 16 characters, sorted
+   entries, `DIR`, a raw `.bin` as PRG with its extension, a mixed-case `.SEQ`, a 28-char
+   name cut at 16, the dot-file absent) byte for byte except the line links BASIC
+   relinks; BLOCKS FREE from the same host query (capped at 65535 on this volume).
+2. **KERNAL load** — `kernal_load_from_the_folder`: `LOAD"FILE",9,1` byte-identical;
+   `LOAD"*"` the first PRG without a boot file, the boot file with one; `?FILE NOT FOUND`.
+3. **KERNAL save** — `kernal_save_to_the_folder`: `new.prg` byte-identical after CLOSE;
+   `63,FILE EXISTS` over it, the file untouched; `@0:` replaces.
+4. **Command channel** — `the_command_channel`: `73` at power-on, `00` once read; `S:`
+   with a list and a wildcard (`01,FILES SCRATCHED,02`), `R:` (`00`/`62`/`63`), `MD`
+   (`00`/`63`), `CD:`/`CD←`/`CD/…/`/`CD//` (`00`/`39`), a SAVE into the subdirectory, `RD`
+   (`63` not empty, `00`); `M-W` and `M-E` answer `33` and are reported with their
+   address, `B-R` and `U1` answer `78`, `U3` `33`, `N:` `31`, `P` `33`; nothing reaches
+   the host; `UI` answers `73` and the device still lists.
+5. **SEQ and a copy** — `seq_every_byte_and_a_copy_from_eight`: 256 byte values through
+   `PRINT#` and back through `GET#` (ST 64 on the last), and 871's copy 8 → 9 byte-identical.
+6. **Not present, not in the way** — `not_present_and_not_in_the_way`: DEVICE NOT PRESENT
+   before attach and after detach (Conf1 and a released slot again); `LOAD"$",8` byte-
+   identical beside the folder, and the folder's slot never held a line while it was not
+   addressed (checked every instruction). Also `a_folder_and_a_drive_at_one_unit_are_refused`
+   (both directions, naming the position) and `read_only_attach_refuses_every_write` (26).
+7. **The seven games** — no folder: **7/7 PASS, all seven screenshots byte-identical to
+   v0.8.8's** (main's `traces/` of 17:24). Folder idle at 9 (`GATE_FOLDER=9`): **7/7 as
+   expected**, each named in `folder_expected`. As built: 4 byte-identical (motm,
+   impossible2, lastninja, maniac), 3 differing. **After the merge with BUG-062's fix**
+   (drive 8's disk no longer turns after boot, so every loader runs in another phase):
+   4 byte-identical (motm, impossible2, lastninja, polarbear), 3 differing (greenberet,
+   scramble, maniac) — Polar Bear's border difference and Maniac's hold below both
+   depended on that phase:
+   - **Green Beret** — differs (56 600 px): its loader asserts ATN as a request line
+     (`$0380`-`$038A`); the folder pulls DATA on each, as drive 9 did.
+   - **Scramble** — differs (the whole frame): its loader looks at device 9 with `M-R
+     $0300`, `M-E $0205`, `M-R $0300` before muting it; the folder refuses each with `33`
+     and the loader stops on "ERROR: Failed to mute device #09." Not the slowed KERNAL
+     stage the candidate list guessed.
+   - **Polar Bear** — differs in 104 px, two lines of the top border: the folder
+     acknowledges bytes under ATN within 5 µs, sooner than drive 8's DOS, and the KERNAL
+     moves on at the first acknowledge (first divergence C64 `$ED90`, UNLISTEN, cycle
+     330 833). The game runs the same on another schedule. Byte-identical after the merge
+     with BUG-062's fix: the bars land in the same phase.
+   - **Maniac Mansion** — after the merge: differs, "Diskettenfehler". Its drive-8
+     fastloader (after `M-W` ×16, `U3`) asserts ATN and holds it; the folder answers as
+     the Ultimate's microcode does and keeps DATA pulled (first pull 79.1 M cycles after
+     RUN, ~665 000 instructions of it), breaking the transfer. The real Software IEC
+     would do the same; the game loads from 8 alone.
+   - **MOTM** — byte-identical, although an idle drive 9 breaks it (871 §9.1).
+8. **Checkpoints** — `checkpoints_mid_load_and_mid_save`: mid-LOAD from 9 and mid-SAVE to
+   9 through a `.c64re` container into a freshly booted machine: restored state equal
+   (C64 and drive RAM, clocks, PCs, IEC lines, the whole device), 500 frames of
+   cycle-for-cycle lockstep, both runs finish byte-identical; a restore to before the
+   SAVE leaves `new.prg` in place and the rewound machine lists it; the 2 MiB file never
+   enters the checkpoint. `checkpoint_with_the_folder_alone_on_the_bus` (drive A off,
+   folder at 8): the same, 500 frames. `a_checkpoint_without_folders_restores_with_none`.
+   - **Found on the way, not 873's:** a 1541 that has not run its motor since its
+     power-on does not survive a checkpoint in lockstep. Its rotation keeps the reset
+     value (motor on, zone 0) while VIA2 says motor off; the restore re-derives motor and
+     zone from VIA2 (VICE's undump order), and the restored drive reads SYNC differently
+     at `$EC3F LDA $1C00` a few thousand instructions later. Measured without a folder
+     attached, identical divergence. The gate lets drive 8 list its disk once first.
+9. **Timing against the KERNAL** — `timing_against_the_kernal`: the margins of §6 read
+   off the ROM (1017 / 1279 / 511 / 78 cycles). Measured worst case over a LOAD and a SAVE,
+   instruction by instruction — ATN → DATA 0 cycles (answered at the `$DD00` write),
+   frame acknowledge 92 (Ultimate) / 0 (VICE), ready-for-data → first bit 85 / 0 — all
+   inside. The default profile's first CLK-low phase is 79 cycles against the 78-cycle
+   poll gap: it holds, by one cycle. **VICE's is 59 and does not**: with the display on,
+   a 2000-byte `LOAD` through VICE's profile arrives with extra bytes (`(b >> 1) | $80`
+   before the byte: the C64 missed bit 0); with the display blanked it is byte-identical.
+   `kernal_load_and_save_with_the_vice_profile` therefore runs with `$D011` bit 4 clear
+   (load, save round, directory) and the timing test asserts both facts.
+10. **Nothing else moved** — see the suites below; `cia_alarm_check_gate` digests unchanged.
+
+**§11.11 — the seven games from a folder** (`characterise_the_seven_games_from_a_folder`:
+drive A off, the files the disk's own directory lists extracted — D64 directly, G64
+through the standard-GCR sectors — into a folder at 8, the first PRG in directory order
+as the boot file, `LOAD"*",8,1`, `RUN` if it returned, 60 M cycles):
+
+| game | files | KERNAL stage | refused | where it stops |
+|---|---|---|---|---|
+| scramble | 1 | loads, READY | `U0`, `M-R $0300`, `M-E $0205`, `M-R $0300` | READY — "DEVICE INCOMPATIBLE" |
+| polarbear | 3 | loads, chains on | `M-W` ×3 (`$0500`…`$0540`), `M-E $0500`, `M-R $0543` | C64 `$1A2F`, its loader waiting; garbage on screen |
+| motm | 16 | loads, chains on | `#0`, `B-E` | C64 in the KERNAL, status `78` |
+| greenberet | 8 | its first entry (a binary name) loads, READY | — | `RUN` returns READY |
+| impossible2 | 3 | loads, chains on | `#`, `B-E` | "SEARCHING FOR IMP / LOADING", status `78` |
+| lastninja | 1 | loads, READY | `M-W` ×32 (`$0400`…`$07E0`), `M-E $0629` | C64 `$0DC2` |
+| maniac | 2 | loads, chains on | `M-W` ×16 (`$0500`…`$06E0`), `U3` | C64 `$1696` |
+
+Every game with drivecode stops at the command that would start it — `M-E` (polarbear,
+lastninja; scramble probes with one), `U3` (maniac) or `B-E` on a `#` buffer (motm,
+impossible2) — and the refusal names it. That is the port backlog.
+
+**§11.12 — cost** (`characterise_the_cost_of_a_folder`, release, 1500 frames, best of 3):
+no folder, `LOAD"*",8,1` of scramble **4.949 ms/frame**; an idle folder at 9, same load
+**5.125 ms/frame (×1.036)**; the folder at 9 serving `LOAD"BIG",9,1` (drive 8 idle)
+**3.368 ms/frame**.
+
+**Suites.** `cargo test --release --workspace --no-fail-fast` (with `TRX64_ROM_DIR`):
+**1418 passed, 0 failed, 60 ignored**; `trx64-core` alone 650 passed, 0 failed (before the
+last test additions). `cia_alarm_check_gate` green with its digests unchanged. 871's
+gates re-run: `GATE_DRIVE_B=9` seven-game gate 7/7 with the same expectations, the four
+`from_nine_*` boots green. `cargo clippy` clean for the new code (the warnings left in
+touched files predate this spec).
+
+**Open.** The board row (`../C64ReverseEngineeringMCP/specs/README.md`) still says
+PROPOSED; it follows at the merge. The drive checkpoint issue above (a never-spun 1541)
+is its own fix, not taken here.

@@ -29,6 +29,7 @@ pub mod drive_snapshot;
 pub mod expansion;
 pub mod fdd;
 pub mod flash040;
+pub mod folder_device;
 pub mod full;
 pub mod full_sc;
 pub mod gcr;
@@ -553,6 +554,10 @@ pub struct Machine {
     /// Switch it on through [`Machine::set_drive_power`], which refuses a unit
     /// number the other position already answers to.
     pub drive_b: Drive1541,
+    /// Spec 873 — folder devices on the bus, one per unit, none by default. A device
+    /// without a drive CPU, backed by a host folder, advanced at every sync point the
+    /// drives have. Attach through [`Machine::attach_folder`].
+    pub folders: Vec<crate::folder_device::FolderDevice>,
 
     // ── Full-machine (FullBus) state (ADR-021) ──────────────────────────────
     /// BASIC ROM in a SEPARATE array (the RAM under $A000-$BFFF keeps its DRAM
@@ -873,6 +878,7 @@ impl Machine {
             full_assembled: false,
             cia2_pa_out: 0xff,
             iec: IecCore::new(),
+            folders: Vec::new(),
             keyboard: crate::keyboard::KeyboardMatrix::new(),
             joystick1: crate::keyboard::JoystickState::default(),
             joystick2: crate::keyboard::JoystickState::default(),
@@ -960,6 +966,10 @@ impl Machine {
         self.cia2.set_timing(t.cpu_hz, t.tod_hz);
         self.drive8.sync_factor = t.drive_sync_factor;
         self.drive_b.sync_factor = t.drive_sync_factor;
+        // Spec 873 §6 — the folder devices' µs are cycles of this clock.
+        for f in self.folders.iter_mut() {
+            f.cpu_hz = t.cpu_hz;
+        }
         self.model = model;
         Ok(())
     }
@@ -1278,6 +1288,19 @@ impl Machine {
         // are there (another unit, a second drive, or none while off / held). A no-op
         // on a stock machine.
         self.sync_drive_slots();
+        // Spec 873 — the fresh IEC core knows no folder device; give it back the ones
+        // attached (their slots, their pulls). The C64's RESET reaches them over the
+        // RESET line (`reset_from_c64`), which releases their lines.
+        if !self.folders.is_empty() {
+            let units = self.folder_units();
+            let pa = self.cia2_pa_out;
+            self.iec.set_folder_units(units, pa);
+            for f in self.folders.iter_mut() {
+                f.reset_from_c64();
+                self.iec.iecbus.drv_bus[f.unit as usize] = f.pull();
+            }
+            self.iec.iec_update_ports();
+        }
         self.drive_c64_ref = 0;
         // SID: reset register file + voice state to power-on defaults.
         self.sid_regs = [0u8; 32];
@@ -1555,6 +1578,7 @@ impl Machine {
             read_side_effects: Vec::new(),
             drive: &mut self.drive8,
             drive_b: &mut self.drive_b,
+            folders: &mut self.folders,
             iec: &mut self.iec,
             keyboard: &self.keyboard,
             joystick1: self.joystick1,
@@ -1621,6 +1645,7 @@ impl Machine {
             read_side_effects: Vec::new(),
             drive: &mut self.drive8,
             drive_b: &mut self.drive_b,
+            folders: &mut self.folders,
             iec: &mut self.iec,
             keyboard: &self.keyboard,
             joystick1: self.joystick1,
@@ -1930,6 +1955,7 @@ impl Machine {
                 read_side_effects: Vec::new(),
                 drive: &mut self.drive8,
                 drive_b: &mut self.drive_b,
+                folders: &mut self.folders,
                 iec: &mut self.iec,
                 keyboard: &self.keyboard,
                 joystick1: self.joystick1,
@@ -2837,6 +2863,102 @@ impl Machine {
             self.cia2_pa_out,
         );
         crate::drive::pair_fold_into_iec(&self.drive8, &self.drive_b, &mut self.iec, self.cia2_pa_out);
+        // Spec 873 §4 — then the folder devices; none attached = this one test.
+        if !self.folders.is_empty() {
+            crate::folder_device::folders_sync(&mut self.folders, &mut self.iec, clk);
+        }
+    }
+
+    // ── Spec 873 — folder devices ───────────────────────────────────────────────────
+
+    /// The units that carry a folder device, a bit per unit.
+    fn folder_units(&self) -> u16 {
+        self.folders.iter().fold(0u16, |m, f| m | (1 << f.unit))
+    }
+
+    /// Spec 873 D1 — put a folder device at `unit` (8-11). Attached means powered: it
+    /// is on the bus from now. Refused, by name, for a unit outside 8-11, a unit that
+    /// already has a folder device, and a unit a powered drive answers to (now or from
+    /// its next reset).
+    pub fn attach_folder(
+        &mut self,
+        unit: u8,
+        source: std::sync::Arc<dyn crate::folder_device::FolderSource>,
+        opts: crate::folder_device::FolderOpts,
+    ) -> Result<(), String> {
+        if !(8..=11).contains(&unit) {
+            return Err(format!("a folder device stands at unit 8-11, not {unit}"));
+        }
+        if self.folders.iter().any(|f| f.unit == unit) {
+            return Err(format!("unit {unit} already has a folder device"));
+        }
+        use crate::drive::DrivePosition::{A, B};
+        for p in [A, B] {
+            let d = self.drive(p);
+            if d.powered() && (d.unit() == unit || d.unit_jumpers() == unit) {
+                return Err(format!(
+                    "a folder device cannot answer to unit {unit}: drive position {} is powered at unit {unit}",
+                    p.name()
+                ));
+            }
+        }
+        let mut dev = crate::folder_device::FolderDevice::new(unit, source, &opts, self.model.timing.cpu_hz);
+        let now = self.c64_core.clk;
+        dev.line.now = now;
+        dev.line.atn_low = self.iec.iecbus.cpu_bus & 0x10 == 0;
+        self.folders.push(dev);
+        self.folders.sort_by_key(|f| f.unit);
+        let units = self.folder_units();
+        self.iec.set_folder_units(units, self.cia2_pa_out);
+        Ok(())
+    }
+
+    /// Spec 873 D1 — take the folder device at `unit` off the bus. Open write channels
+    /// are finished on the host first; the slot is released.
+    pub fn detach_folder(&mut self, unit: u8) -> Result<(), String> {
+        let Some(i) = self.folders.iter().position(|f| f.unit == unit) else {
+            return Err(format!("no folder device at unit {unit}"));
+        };
+        let mut dev = self.folders.remove(i);
+        dev.close_all();
+        let units = self.folder_units();
+        self.iec.set_folder_units(units, self.cia2_pa_out);
+        Ok(())
+    }
+
+    /// Spec 873 — put folder devices that lived through a C64 power cycle back on this
+    /// machine's bus (a folder device has its own power, as a drive does). The C64's
+    /// power-on pulses the RESET line: each device takes it as a reset when connected.
+    pub fn reattach_folders(&mut self, devs: Vec<crate::folder_device::FolderDevice>) {
+        let hz = self.model.timing.cpu_hz;
+        let now = self.c64_core.clk;
+        for mut d in devs {
+            if self.folders.iter().any(|f| f.unit == d.unit) {
+                continue;
+            }
+            d.cpu_hz = hz;
+            d.line.now = now;
+            d.line.timeout = d.line.timeout.min(now);
+            d.reset_from_c64();
+            self.folders.push(d);
+        }
+        self.folders.sort_by_key(|f| f.unit);
+        let units = self.folder_units();
+        self.iec.set_folder_units(units, self.cia2_pa_out);
+        for f in &self.folders {
+            self.iec.iecbus.drv_bus[f.unit as usize] = f.pull();
+        }
+        self.iec.iec_update_ports();
+    }
+
+    /// The folder device at `unit`, if any.
+    pub fn folder(&self, unit: u8) -> Option<&crate::folder_device::FolderDevice> {
+        self.folders.iter().find(|f| f.unit == unit)
+    }
+
+    /// The folder device at `unit`, mutable.
+    pub fn folder_mut(&mut self, unit: u8) -> Option<&mut crate::folder_device::FolderDevice> {
+        self.folders.iter_mut().find(|f| f.unit == unit)
     }
 
     /// The drive in position `pos`.
@@ -2884,6 +3006,13 @@ impl Machine {
     /// `unit` now or from its next reset.
     fn unit_claimed_by_other(&self, pos: crate::drive::DrivePosition, unit: u8) -> Option<String> {
         use crate::drive::DrivePosition::{A, B};
+        // Spec 873 D1 — a folder device at that unit claims it as a drive would.
+        if self.folders.iter().any(|f| f.unit == unit) {
+            return Some(format!(
+                "drive position {} cannot answer to unit {unit}: a folder device is attached at unit {unit}",
+                pos.name()
+            ));
+        }
         let other = if pos == A { B } else { A };
         let d = self.drive(other);
         if d.powered() && (d.unit() == unit || d.unit_jumpers() == unit) {
@@ -3363,6 +3492,7 @@ impl Machine {
                     read_side_effects: Vec::new(),
                     drive: &mut self.drive8,
                     drive_b: &mut self.drive_b,
+                    folders: &mut self.folders,
                     iec: &mut self.iec,
                     keyboard: &self.keyboard,
                     joystick1: self.joystick1,

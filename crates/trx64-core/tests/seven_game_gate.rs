@@ -37,6 +37,11 @@
 //! `data/DRIVES`) with a blank D81, idle. A characterisation, not a gate: the B-on
 //! picture is judged against the B-off frame and printed, and where the two runs part
 //! the first divergence is printed too (`B-ON 1581:` lines); nothing fails on it.
+//!
+//! Spec 873 — `GATE_FOLDER=<unit>`: the same again with a folder device idle at that
+//! unit (a temp folder with one file in it) instead of drive B: the run writes
+//! `gate_<name>_trx64_f<unit>.png` and is judged by its picture against the no-folder
+//! frame, with its own named expectations (`FOLDER_EXPECTED`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -104,10 +109,16 @@ struct GateResult {
     width: usize,
     /// The unit drive B sat at, `None` for the one-drive run.
     drive_b: Option<u8>,
+    /// Spec 873 — the unit an idle folder device sat at.
+    folder: Option<u8>,
 }
 
 /// Run one game end-to-end and report behavioral state.
 fn run_game(file: &str, kind: DiskKind, name: &str, drive_b: Option<u8>) -> Option<GateResult> {
+    run_game_with(file, kind, name, drive_b, None)
+}
+
+fn run_game_with(file: &str, kind: DiskKind, name: &str, drive_b: Option<u8>, folder: Option<u8>) -> Option<GateResult> {
     if !roms_present() {
         eprintln!("skip {name}: ROMs absent");
         return None;
@@ -129,6 +140,8 @@ fn run_game(file: &str, kind: DiskKind, name: &str, drive_b: Option<u8>) -> Opti
     if let Some(unit) = drive_b {
         power_drive_b(&mut m, unit);
     }
+    // Spec 873 — optionally an idle folder device, attached with the C64.
+    let folder_dir = folder.map(|unit| attach_idle_folder(&mut m, unit, name));
 
     // Boot to BASIC READY.
     m.run_for_full(2_500_000, &mut sink, |_, _, _, _, _, _, _| {});
@@ -257,11 +270,20 @@ fn run_game(file: &str, kind: DiskKind, name: &str, drive_b: Option<u8>) -> Opti
     }
     let out_rgba = best_rgba.unwrap_or(final_rgba);
     let png = encode_png_rgba(w as u32, h as u32, &out_rgba);
-    let png_path = match drive_b {
-        Some(unit) if drive_b_is_1581() => format!("{TRACES}/gate_{name}_trx64_b{unit}_1581.png"),
-        Some(unit) => format!("{TRACES}/gate_{name}_trx64_b{unit}.png"),
-        None => format!("{TRACES}/gate_{name}_trx64.png"),
+    let png_path = match (drive_b, folder) {
+        (Some(unit), _) if drive_b_is_1581() => format!("{TRACES}/gate_{name}_trx64_b{unit}_1581.png"),
+        (Some(unit), _) => format!("{TRACES}/gate_{name}_trx64_b{unit}.png"),
+        (None, Some(unit)) => format!("{TRACES}/gate_{name}_trx64_f{unit}.png"),
+        (None, None) => format!("{TRACES}/gate_{name}_trx64.png"),
     };
+    if let Some(unit) = folder {
+        let f = m.folder_mut(unit).expect("the folder device");
+        let refused: Vec<String> = f.take_events().into_iter().map(|e| e.text).collect();
+        eprintln!("  folder: unit {unit}, line flags ${:02X}, status {}, refused {:?}", f.line.flags, f.status_text(), refused);
+    }
+    if let Some(d) = folder_dir {
+        let _ = std::fs::remove_dir_all(d);
+    }
     if let Some(unit) = drive_b {
         let b = &m.drive_b;
         eprintln!(
@@ -305,6 +327,7 @@ fn run_game(file: &str, kind: DiskKind, name: &str, drive_b: Option<u8>) -> Opti
         rgba: out_rgba,
         width: w,
         drive_b,
+        folder,
     })
 }
 
@@ -369,6 +392,22 @@ fn first_divergence(file: &str, kind: DiskKind, unit: u8, max_frames: u32) -> St
     format!("no divergence within {max_frames} frames after the LOAD")
 }
 
+/// Spec 873 — the unit in `GATE_FOLDER`, or `None` when the variable is unset.
+fn folder_from_env() -> Option<u8> {
+    Some(std::env::var("GATE_FOLDER").ok()?.parse().expect("GATE_FOLDER = a unit number"))
+}
+
+/// Attach an idle folder device at `unit`: a temp folder holding one file.
+fn attach_idle_folder(m: &mut Machine, unit: u8, name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("trx64-873-gate-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("idle.prg"), [0x01, 0x08, 0, 0]).unwrap();
+    let src = std::sync::Arc::new(trx64_core::folder_device::HostFolder::new(&dir).unwrap());
+    m.attach_folder(unit, src, Default::default()).expect("attach the folder");
+    dir
+}
+
 /// Spec 871 — the unit in `GATE_DRIVE_B`, or `None` when the variable is unset.
 fn drive_b_from_env() -> Option<u8> {
     Some(std::env::var("GATE_DRIVE_B").ok()?.parse().expect("GATE_DRIVE_B = a unit number"))
@@ -425,12 +464,53 @@ fn b_on_expected(name: &str) -> BOn {
             "KERNAL serial load shifted by drive 9's ATN handshake; only the \"Loading\" label's blink phase differs",
             (298, 239, 351, 248),
         ),
+        // Its KERNAL stage is received by drive 9 too and runs a few cycles later; the
+        // frame is caught on the loading screen, whose border colour bars then sit on
+        // another raster line (measured: y 35 against y 41). Identical before BUG-062's
+        // fix only by chance of phase: the disk in drive 8 then kept turning after boot.
+        "polarbear" => BOn::DiffersWithin(
+            "KERNAL stage shifted by drive 9's ATN handshake; the loading screen's border bars are caught in another phase",
+            (0, 35, 383, 41),
+        ),
+        _ => BOn::Identical,
+    }
+}
+
+/// Spec 873 — an idle folder device at 9 answers every ATN as a 1541 does (VICE
+/// serial-iec-device.c:279-290, the Ultimate's iec_code.iec:133-137), but on the
+/// Ultimate's clock, not a 1541 DOS's. Measured, game by game:
+fn folder_expected(name: &str) -> BOn {
+    match name {
+        // Its loader at $0380 asserts ATN as its request line; the folder pulls DATA on
+        // each as drive 9 did — the title never draws.
+        "greenberet" => BOn::Differs("ATN-toggling fastloader ($0380-$038A); the folder at 9 answers every ATN and pulls DATA"),
+        // Its loader looks at device 9 with memory commands before it mutes it (measured:
+        // `M-R $0300`, `M-E $0205`, `M-R $0300`); the folder refuses each with 33 and
+        // the loader stops on "ERROR: Failed to mute device #09."
+        "scramble" => BOn::Differs("the loader probes and mutes device 9 by M-R/M-E; the folder refuses them with 33 and the loader stops"),
+        // Its drive-8 fastloader (after `M-W`/`U3`) asserts ATN on the bus and holds it
+        // without sending a byte. The folder answers as the Ultimate's microcode does —
+        // DATA pulled, then `WAIT UNTIL CLK=0` ("Possibly forever!", iec_code.iec
+        // `atn_irq_vec`) — and keeps DATA pulled while ATN stays low (measured: the first
+        // pull 79.1 M cycles after RUN, then ~665 000 instructions of it), so the transfer
+        // from drive 8 breaks and the game shows "Diskettenfehler". Byte-identical before
+        // BUG-062's fix only by the phase of the loader. The game loads from 8 alone.
+        "maniac" => BOn::Differs("drive-8 fastloader holds ATN; the folder at 9 answers as the Ultimate does and holds DATA until a byte comes"),
+        // Polar Bear: its KERNAL stage runs on another schedule with the folder at 9 (the
+        // folder acknowledges bytes under ATN sooner than drive 8's DOS), but since
+        // BUG-062's fix the frame caught is byte-identical — the loading screen's border
+        // bars land in the same phase. Identical, like MOTM and Impossible Mission II.
+        // Unlike drive 9, the folder leaves its in-game ATN loader alone: byte-identical.
         _ => BOn::Identical,
     }
 }
 
 /// The B-on frame against the B-off frame: `Ok(summary)` when the expectation holds.
 fn judge_b_on(name: &str, off: &GateResult, on: &GateResult) -> Result<String, String> {
+    judge_against(b_on_expected(name), off, on)
+}
+
+fn judge_against(expected: BOn, off: &GateResult, on: &GateResult) -> Result<String, String> {
     let w = off.width;
     let mut n = 0usize;
     let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0usize, 0usize);
@@ -450,7 +530,7 @@ fn judge_b_on(name: &str, off: &GateResult, on: &GateResult) -> Result<String, S
     } else {
         format!("differs from B off in {n} px, box x {x0}..={x1} y {y0}..={y1}")
     };
-    match b_on_expected(name) {
+    match expected {
         BOn::Identical if same => Ok(diff),
         BOn::Identical => Err(format!("{diff} — expected byte-identical")),
         BOn::Differs(why) if !same => Ok(format!("{diff} — expected: {why}")),
@@ -472,6 +552,17 @@ fn judge_b_on(name: &str, off: &GateResult, on: &GateResult) -> Result<String, S
 fn gate_game(file: &str, kind: DiskKind, name: &str) {
     let Some(off) = run_game(file, kind.clone(), name, None) else { return };
     report(&off);
+    if let Some(unit) = folder_from_env() {
+        let Some(on) = run_game_with(file, kind.clone(), name, None, Some(unit)) else { return };
+        report(&on);
+        match judge_against(folder_expected(name), &off, &on) {
+            Ok(s) => eprintln!("FOLDER VERDICT: PASS {name}: {s}"),
+            Err(s) => {
+                eprintln!("FOLDER VERDICT: FAIL {name}: {s}");
+                panic!("folder gate, {name}: {s}");
+            }
+        }
+    }
     let Some(unit) = drive_b_from_env() else { return };
     let Some(on) = run_game(file, kind.clone(), name, Some(unit)) else { return };
     report(&on);
@@ -513,12 +604,16 @@ fn report(r: &GateResult) {
     };
     // The B-on run's reachability is printed, not counted: its verdict is the
     // picture comparison (`B-ON VERDICT`), and `VERDICT:` lines are what gate.sh counts.
-    match r.drive_b {
-        None => {
+    match (r.drive_b, r.folder) {
+        (None, Some(unit)) => {
+            eprintln!("\n========== {} ({:?}) — folder at {unit} ==========", r.name, r.kind);
+            eprintln!("  reachability (not the folder verdict): {verdict}");
+        }
+        (None, None) => {
             eprintln!("\n========== {} ({:?}) ==========", r.name, r.kind);
             eprintln!("VERDICT: {verdict}");
         }
-        Some(unit) => {
+        (Some(unit), _) => {
             eprintln!("\n========== {} ({:?}) — drive B on at {unit} ==========", r.name, r.kind);
             eprintln!("  reachability (not the B-on verdict): {verdict}");
         }

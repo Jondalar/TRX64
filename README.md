@@ -58,6 +58,10 @@ From source: `cargo build --release`. Builds natively (for Windows it uses MSVC)
   Two drive positions, each a 1541 or a 1581, chosen with the drive switched off. Drive-side
   writes reach the host file. The 1581 DOS (`dos1581-318045-02.bin`, or `1581.bin`) is
   not included; put it in the ROM directory.
+- **A folder on the bus** — a host directory as an IEC device at unit 8-11, beside the
+  1541s, on the real serial lines (`device/folder_attach`). The stock KERNAL loads, saves
+  and lists through it; memory commands are refused, so a program that still uploads
+  drivecode stops visibly. The folder is a hard disk: never in a snapshot, never rewound.
 - **Expansion port** — REU (1700/1764/1750, oversized to 16 MB), GeoRAM, and the Ultimate
   Command Interface. Devices, not cartridges: several at once, and a host can lend its own RAM.
 - **Machines** — `--machine c64|u64|128`. `u64` is the Ultimate 64 / Elite II / C64 Ultimate:
@@ -120,7 +124,7 @@ Superset based on VICE, 123 verbs. Full reference: **[MONITOR.md](MONITOR.md)**;
 | **Time** | `mark <name>` · `goto <name>` · `frame ±N` · `play back\|fwd` · `cadence` · `window <s>` |
 | **State** | `dump`/`undump` `.c64re` · `ringdump`/`ringload` · `trace on\|off` |
 | **Analysis** | `map` memory map · `taint` · `swimlane` · `diff <a> <b>` |
-| **Drive** | `device drive8` then `r`/`m`/`d` — the drive's own 6502, 1541 or 1581 |
+| **Drive** | `device drive8` then `r`/`m`/`d` — the drive's own 6502, 1541 or 1581 · `folder [unit]` a folder device |
 | **Expansion** | `reu` / `georam` the device decoded · `uci` the command interface · `turbo` the machine |
 
 ---
