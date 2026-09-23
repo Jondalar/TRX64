@@ -1586,6 +1586,7 @@ fn restore_drive_b(m: &mut Machine, node: Option<&serde_json::Value>) -> Result<
         }
         return Ok(());
     };
+    let was_powered = b.powered();
     b.detach_disk();
     if let Some(d) = node.get("disk").filter(|v| !v.is_null()) {
         let bytes = d.get("bytes").and_then(ta_u8_decode).ok_or("restore driveB: disk without bytes")?;
@@ -1611,7 +1612,14 @@ fn restore_drive_b(m: &mut Machine, node: Option<&serde_json::Value>) -> Result<
             .map_err(|e| format!("restore driveB.drivePart: {e}"))?,
         _ => DrivePart::default_for(DrivePosition::B),
     };
-    b.restore_part(&part)
+    b.restore_part(&part)?;
+    // The ROM is not in a checkpoint (Spec 870 §9): the host gives it. A B that the
+    // restore switches on had no power here, so the ROM it was given has not come into
+    // force yet — the restore is its power-on for that purpose.
+    if !was_powered && b.powered() {
+        b.latch_rom();
+    }
+    Ok(())
 }
 
 /// Spec 853 D6 — `{ kind, sizeKb, regs, ram }`, or Null with no device on the port.

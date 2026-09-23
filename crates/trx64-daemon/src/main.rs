@@ -7488,9 +7488,10 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                     }))
                 }
                 None => {
-                    // Exactly the re-init it was for drive 8 (`cold_reset`, which also
-                    // leaves the mechanism empty), now for the drive at `unit`.
-                    st.session.machine.drive_mut(pos).cold_reset();
+                    // The press it was for drive 8 (Spec 870: a power-on — the given ROM
+                    // comes into force — which also leaves the mechanism empty), now for
+                    // the drive at `unit`.
+                    st.session.machine.drive_mut(pos).power_on_reset();
                     st.session.machine.sync_drive_slots();
                     Response::ok(id, json!({
                         "device": unit,

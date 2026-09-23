@@ -2937,11 +2937,17 @@ impl Machine {
         // Drive ROM: non-fatal — if absent the drive runs with zeroed ROM
         // (bus open; CPU will JAM immediately, which is a valid isolated state).
         let _ = self.drive8.load_rom(rom_dir);
-        self.drive8.cold_reset();
-        // Spec 871 — position B gets the same DOS, so switching it on finds a ROM. Off,
-        // its reset is state only; nothing runs.
+        // The machine's power-on is the drive's power-on too: the ROM comes into force.
+        self.drive8.power_on_reset();
+        // Spec 871 — position B gets the same DOS. Its ROM, too, comes into force at
+        // B's power-on: here if B is on with the machine, else when it is switched on
+        // (`set_power`). Off, its reset is state only; nothing runs.
         let _ = self.drive_b.load_rom(rom_dir);
-        self.drive_b.cold_reset();
+        if self.drive_b.powered() {
+            self.drive_b.power_on_reset();
+        } else {
+            self.drive_b.cold_reset();
+        }
         self.sync_drive_slots();
         Ok(())
     }

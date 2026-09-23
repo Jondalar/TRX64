@@ -420,6 +420,35 @@ fn b_off_is_not_clocked_and_not_on_the_bus() {
     assert!(cp.get("driveB").is_none(), "a one-drive machine carries no driveB node");
 }
 
+// ── Spec 870 D3 for position B — its ROM comes into force at its power-on ────────
+
+#[test]
+fn position_b_takes_its_rom_at_its_own_power_on() {
+    need_roms!();
+    let mut m = Machine::new();
+    m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+    let dos = std::fs::read(Path::new(ROM_DIR).join(DOS_ROM)).expect("DOS ROM");
+    let marked = |b: u8| {
+        let mut r = dos.clone();
+        r[0] = b; // $C000
+        r
+    };
+    // Off since the machine came up: the DOS it was given waits for its power-on.
+    m.drive_b.set_rom(&marked(0x42)).unwrap();
+    m.set_drive_power(DrivePosition::B, true).unwrap();
+    assert_eq!(m.drive_b.drive_peek(0xc000), 0x42, "in force at B's power-on");
+    // A reset keeps the ROM a powered drive has.
+    m.drive_b.set_rom(&marked(0x43)).unwrap();
+    m.drive_b.reset();
+    assert_eq!(m.drive_b.drive_peek(0xc000), 0x42, "a reset is not a power-on");
+    // Off and on again: now the new one.
+    m.set_drive_power(DrivePosition::B, false).unwrap();
+    m.set_drive_power(DrivePosition::B, true).unwrap();
+    assert_eq!(m.drive_b.drive_peek(0xc000), 0x43, "the next power-on brings it in");
+    // A's ROM is not B's business.
+    assert_eq!(m.drive8.drive_peek(0xc000), dos[0], "A keeps the stock DOS");
+}
+
 // ── §7.6 — same number refused ──────────────────────────────────────────────────
 
 #[test]

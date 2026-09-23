@@ -626,7 +626,7 @@ impl Drive1541 {
     /// Load the 1541 DOS ROM from `rom_dir` — a convenience over [`Self::set_rom`].
     ///
     /// Tries `dos1541-325302-01+901229-05.bin` first, then the alias `1541.bin`, and
-    /// hands the bytes to `set_rom`: in force from the drive's next reset.
+    /// hands the bytes to `set_rom`: in force from the drive's next power-on.
     /// On failure returns `RomError` — caller may choose to continue with zeroed ROM.
     pub fn load_rom(&mut self, rom_dir: &std::path::Path) -> Result<(), RomError> {
         let data = std::fs::read(rom_dir.join("dos1541-325302-01+901229-05.bin"))
@@ -638,8 +638,10 @@ impl Drive1541 {
     /// (`$8000-$BFFF` stays zero, as the file loader always left it); 32 KiB is the
     /// whole `$8000-$FFFF`. Any other size is refused and nothing changes.
     ///
-    /// The ROM takes effect at the drive's next reset (power-on included) — a
-    /// running program never has its ROM swapped under it.
+    /// The ROM takes effect at the drive's next POWER-ON, and only then. A ROM is not
+    /// something a running drive changes: even a board with a ROM switch has to be
+    /// switched off and on for the other ROM to run, and a reset of a powered drive
+    /// keeps the ROM it has.
     pub fn set_rom(&mut self, bytes: &[u8]) -> Result<(), RomError> {
         let mut rom = Box::new([0u8; 0x8000]);
         match bytes.len() {
@@ -696,6 +698,22 @@ impl Drive1541 {
         }
     }
 
+    /// Spec 870 D3 — a ROM given since the last power-on comes into force. Called only
+    /// on the way into power, never from a reset.
+    pub(crate) fn latch_rom(&mut self) {
+        if let Some(rom) = self.rom_next.take() {
+            self.rom = rom;
+        }
+    }
+
+    /// Spec 870 D3 — the drive's power-on: the ROM given since the last power-on comes
+    /// into force, then the electronics start from their reset state. What the machine's
+    /// own power-on (`boot_from_dir`) and the daemon's `session/drive_power` press run.
+    pub fn power_on_reset(&mut self) {
+        self.latch_rom();
+        self.cold_reset();
+    }
+
     /// Spec 870 D2 — a pulse on the drive's own RESET input. A drive without power
     /// ignores it. The reset reaches a stopped drive too — RESET is not a clocked
     /// input — and it stays stopped, standing at the reset state.
@@ -727,6 +745,7 @@ impl Drive1541 {
             self.powered = true;
             self.ram.fill(0);
             self.cpu_last_data = 0;
+            self.latch_rom();
             self.reset_keeping_disk();
         } else {
             self.flush_disk_writeback();
@@ -855,12 +874,8 @@ impl Drive1541 {
     /// reset and the first opcode (SEI) are atomic within one execute call, so the
     /// first sampled record is $EAA1@8 (not a spurious $EAA0@6) — exactly VICE.
     pub fn cold_reset(&mut self) {
-        // Spec 870 D3/D4 — what the reset brings into force: a ROM given since the
-        // last reset, and the device-ID jumpers as they stand now (the DOS reads them
-        // during its reset).
-        if let Some(rom) = self.rom_next.take() {
-            self.rom = rom;
-        }
+        // Spec 870 D4 — the device-ID jumpers as they stand now: the DOS reads them
+        // during its reset. (The ROM is NOT taken here — see `latch_rom`.)
         self.unit = self.unit_jumpers;
         self.atn_stop_origin = None;
         let dnr = self.dnr();
