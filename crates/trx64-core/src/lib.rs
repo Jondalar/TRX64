@@ -728,6 +728,8 @@ pub struct Machine {
 /// in the clone's bus at once, not at its first sync point. Every field is listed, so a
 /// new field that is forgotten here does not compile.
 impl Clone for Machine {
+    // Every field by the same `.clone()`, Copy or not, so the list reads as one rule.
+    #[allow(clippy::clone_on_copy)]
     fn clone(&self) -> Self {
         let mut m = Machine {
             ram: self.ram.clone(),

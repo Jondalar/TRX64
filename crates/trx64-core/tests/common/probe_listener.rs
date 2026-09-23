@@ -222,7 +222,7 @@ impl ProbeListener {
                     self.line.state = BIT0;
                 }
             }
-            s if (BIT0..=BIT7W).contains(&s) && (s - BIT0) % 2 == 0 => {
+            s if (BIT0..=BIT7W).contains(&s) && (s - BIT0).is_multiple_of(2) => {
                 if clk_high {
                     let bit = 1u8 << ((s - BIT0) / 2);
                     self.line.byte = (self.line.byte & !bit) | if data_high { bit } else { 0 };
