@@ -3256,6 +3256,7 @@ dependencies = [
  "base64",
  "cc",
  "flate2",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

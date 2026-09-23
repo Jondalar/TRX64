@@ -1535,7 +1535,41 @@ pub fn capture_runtime_checkpoint_with(
     if let Some(node) = drive_b_node(m) {
         tree["driveB"] = node;
     }
+    // Spec 873 §9 — the folder devices: the device, never the disk. Unit, root path,
+    // profile, line state, channels (host path + position + the unwritten chunk), the
+    // command buffer, status, current directory, an open listing, boot file, read-only.
+    // No file contents, whatever the folder's size. Omitted when none is attached.
+    if !m.folders.is_empty() {
+        tree["folders"] = serde_json::to_value(&m.folders).unwrap();
+    }
     tree
+}
+
+/// Spec 873 §9 — put the folder devices back. Absent → none attached. Each device
+/// gets its host again — the live machine's source when it serves the same folder at
+/// the same unit, else the plain host folder at the root path — and re-opens its
+/// channels there: the host is whatever it is now.
+fn restore_folders(m: &mut Machine, node: Option<&serde_json::Value>) -> Result<(), String> {
+    use crate::folder_device::{FolderDevice, FolderSource, HostFolder};
+    let restored: Vec<FolderDevice> = match node {
+        Some(v) if !v.is_null() => serde_json::from_value(v.clone()).map_err(|e| format!("restore folders: {e}"))?,
+        _ => Vec::new(),
+    };
+    let live = std::mem::take(&mut m.folders);
+    let cpu_hz = m.timing().cpu_hz;
+    for mut f in restored {
+        let src: std::sync::Arc<dyn FolderSource> = match live.iter().find(|l| l.unit == f.unit && l.root == f.root).and_then(|l| l.source().cloned()) {
+            Some(s) => s,
+            None => std::sync::Arc::new(
+                HostFolder::new(&f.root).map_err(|e| format!("restore folders: unit {}: {}: {e}", f.unit, f.root.display()))?,
+            ),
+        };
+        f.reattach(src);
+        f.cpu_hz = cpu_hz;
+        m.folders.push(f);
+    }
+    m.folders.sort_by_key(|f| f.unit);
+    Ok(())
 }
 
 /// Spec 871 — position B's whole state: its part (`drivePart` shape), the drive core
@@ -1825,10 +1859,14 @@ pub fn restore_runtime_checkpoint(
     m.drive8.restore_part(&part)?;
     // Spec 871 — position B, then the device map for both.
     restore_drive_b(m, cp.get("driveB"))?;
+    // Spec 873 — the folder devices, then the device map for drives and folders.
+    restore_folders(m, cp.get("folders"))?;
+    let units = m.folders.iter().fold(0u16, |u, f| u | (1 << f.unit));
     let (slot, slot_b) = crate::drive::pair_bus_slots(&m.drive8, &m.drive_b);
-    if m.iec.drive_slot != slot || m.iec.drive_slot_b != slot_b {
+    if m.iec.drive_slot != slot || m.iec.drive_slot_b != slot_b || m.iec.folder_units != units {
+        m.iec.folder_units = units;
         m.iec.adopt_drive_slots(slot, slot_b);
-        if slot.is_none() && slot_b.is_none() {
+        if slot.is_none() && slot_b.is_none() && units == 0 {
             // Conf0 reads the C64's own lines from `iec_fast_1541`, which no checkpoint
             // carries: seed it from the restored CIA2 port A, as a `$DD00` write would.
             let pa = m.cia2.peek(0xdd00) | !m.cia2.peek(0xdd02);
