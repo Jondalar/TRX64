@@ -7468,11 +7468,20 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                     }))
                 }
                 None => {
-                    // The press it was for drive 8 (Spec 870: a power-on — the given ROM
-                    // comes into force — which also leaves the mechanism empty), now for
-                    // the drive at `unit`.
-                    st.session.machine.drive_mut(pos).power_on_reset();
-                    st.session.machine.sync_drive_slots();
+                    // The bare press is the drive's power switch pressed off and on again
+                    // (Spec 870 D1): the ROM given since the last power-on comes into
+                    // force, and the disk stays in the mechanism — a 1541 does not eject
+                    // its disk when switched off. A write not yet in the host file is kept
+                    // and still reaches it through the lazy write. (It used to empty the
+                    // mechanism and drop such a write.)
+                    if st.session.machine.drive(pos).powered() {
+                        if let Err(e) = st.session.machine.set_drive_power(pos, false) {
+                            return Response::err(id, -32602, format!("session/drive_power: {e}"));
+                        }
+                    }
+                    if let Err(e) = st.session.machine.set_drive_power(pos, true) {
+                        return Response::err(id, -32602, format!("session/drive_power: {e}"));
+                    }
                     Response::ok(id, json!({
                         "device": unit,
                         "reinitialized": true,
@@ -22806,6 +22815,20 @@ mod batch1_tests {
             a_write_reaches_the_file_across(tag, pos, |state| {
                 call(state, "session/drive_power", json!({ "unit": unit, "on": false }));
                 call(state, "session/drive_power", json!({ "unit": unit, "on": true }));
+            });
+        }
+    }
+
+    /// The bare power press (no `on`) is off-and-on: the disk stays in, and a write not
+    /// yet in the host file still lands. It used to empty the mechanism and drop it.
+    #[test]
+    fn a_write_reaches_the_file_across_the_bare_power_press() {
+        for (tag, pos, unit) in [("press_a", DrivePosition::A, 8), ("press_b", DrivePosition::B, 9)] {
+            a_write_reaches_the_file_across(tag, pos, |state| {
+                call(state, "session/drive_power", json!({ "unit": unit }));
+                let st = state.lock().unwrap();
+                assert!(st.session.machine.drive(pos).get_attached_disk().is_some(), "{tag}: the disk stays in");
+                assert!(st.session.machine.drive(pos).powered(), "{tag}: and the drive is on again");
             });
         }
     }
