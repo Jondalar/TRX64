@@ -41,6 +41,7 @@ fn vice_engine(kind: &DiskKind) -> &'static str {
     match kind {
         DiskKind::G64 => "rotation_1541_gcr (circuit)",
         DiskKind::D64 => "rotation_1541_simple",
+        DiskKind::D81 => "no rotation (a 1581)",
     }
 }
 

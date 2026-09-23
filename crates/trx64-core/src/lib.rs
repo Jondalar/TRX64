@@ -16,15 +16,18 @@ pub mod cart;
 pub mod checkpoint_diff;
 pub mod checkpoint_ring;
 pub mod cia;
+pub mod ciacore;
 pub mod user_dir;
 pub mod cpu;
 pub mod cpu_history;
 pub mod crash_triage;
 pub mod delta_ring;
 pub mod drive;
+pub mod drive1581;
 pub mod drive_6510core;
 pub mod drive_snapshot;
 pub mod expansion;
+pub mod fdd;
 pub mod flash040;
 pub mod full;
 pub mod full_sc;
@@ -56,6 +59,7 @@ pub mod vic_draw;
 pub mod vic_inspect;
 pub mod vic_line_trace;
 pub mod viacore;
+pub mod wd177x;
 pub mod vice_snapshot_stream;
 pub mod vsf;
 pub mod vsf_export;
@@ -796,6 +800,8 @@ pub enum RomError {
     BadSize(usize, usize),
     /// Spec 870 D3 — a 1541 ROM that is neither 16 KiB nor 32 KiB (got).
     BadDriveRomSize(usize),
+    /// Spec 872 §5 — a drive ROM of the wrong size for the named board type (got, type).
+    BadDriveRomSizeFor(usize, &'static str),
 }
 
 impl std::fmt::Display for RomError {
@@ -806,6 +812,10 @@ impl std::fmt::Display for RomError {
             RomError::BadDriveRomSize(got) => write!(
                 f,
                 "1541 ROM size {got} bytes refused: give 16384 (at $C000) or 32768 ($8000-$FFFF)"
+            ),
+            RomError::BadDriveRomSizeFor(got, t) => write!(
+                f,
+                "{t} ROM size {got} bytes refused: a {t} takes exactly 32768 ($8000-$FFFF)"
             ),
         }
     }
@@ -2810,6 +2820,7 @@ impl Machine {
     /// when nothing changed, which on the stock machine is always.
     pub fn sync_drive_slots(&mut self) {
         let (a, b) = crate::drive::pair_bus_slots(&self.drive8, &self.drive_b);
+        crate::drive::pair_slot_types(&self.drive8, &self.drive_b, a, b, &mut self.iec);
         self.iec.sync_drive_slots(a, b, self.cia2_pa_out);
     }
 
@@ -2914,6 +2925,32 @@ impl Machine {
         self.drive_mut(pos).set_unit(unit)
     }
 
+    /// Spec 872 §5 — choose the board in position `pos`: a 1541 or a 1581. Refused while
+    /// that position is powered, naming it: the type is chosen at power-on. Off, the new
+    /// board is built fresh — RAM zero and its own ROM (the one [`Drive1541::set_rom_1581`]
+    /// or `boot_from_dir` gave the position), in force at its power-on. A mounted medium
+    /// that does not fit the new board is written back and ejected, and returned: the
+    /// caller persists it. There is no automatic type switch on mount.
+    pub fn set_drive_type(
+        &mut self,
+        pos: crate::drive::DrivePosition,
+        t: crate::iec::DriveType,
+    ) -> Result<Option<crate::drive::DiskImage>, String> {
+        if !matches!(t, crate::iec::DriveType::Drive1541 | crate::iec::DriveType::Drive1581) {
+            return Err(format!("drive type {t:?} is not a board a position can hold (1541 or 1581)"));
+        }
+        if self.drive(pos).powered() {
+            return Err(format!(
+                "drive position {} is powered; switch it off before changing its type to {}",
+                pos.name(),
+                crate::drive::board_name(t)
+            ));
+        }
+        let ejected = self.drive_mut(pos).set_board_type(t)?;
+        self.sync_drive_slots();
+        Ok(ejected)
+    }
+
     /// Load all three standard C64 ROMs from `rom_dir` and perform a cold reset.
     /// Also loads the 1541 DOS ROM for the drive8 emulator (non-fatal if absent).
     ///
@@ -2937,6 +2974,10 @@ impl Machine {
         // Drive ROM: non-fatal — if absent the drive runs with zeroed ROM
         // (bus open; CPU will JAM immediately, which is a valid isolated state).
         let _ = self.drive8.load_rom(rom_dir);
+        // Spec 872 §7 — the 1581 DOS too, when it is in the directory (Commodore IP, not
+        // bundled; non-fatal like the 1541's). A position holds it for a 1581 board.
+        let _ = self.drive8.load_rom_1581(rom_dir);
+        let _ = self.drive_b.load_rom_1581(rom_dir);
         // The machine's power-on is the drive's power-on too: the ROM comes into force.
         self.drive8.power_on_reset();
         // Spec 871 — position B gets the same DOS. Its ROM, too, comes into force at

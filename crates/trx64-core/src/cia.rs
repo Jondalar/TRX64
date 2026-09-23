@@ -86,7 +86,7 @@ pub fn new_table() -> CiaTable {
 
 /// Spec 857 D2 — the same table for readers that are handed none (`Cia::peek`, snapshot
 /// capture). There is only one table: a pure function of the index.
-fn shared_table() -> &'static [u16; CIAT_TABLEN] {
+pub(crate) fn shared_table() -> &'static [u16; CIAT_TABLEN] {
     static TABLE: std::sync::OnceLock<Box<[u16; CIAT_TABLEN]>> = std::sync::OnceLock::new();
     TABLE.get_or_init(build_table)
 }

@@ -1543,7 +1543,7 @@ pub fn capture_runtime_checkpoint_with(
 /// itself rides) and the GCR overlay. `None` when B is off with no disk and its
 /// stock part — the node a one-drive machine does not carry.
 fn drive_b_node(m: &Machine) -> Option<serde_json::Value> {
-    use crate::drive::{DiskKind, DrivePart, DrivePosition};
+    use crate::drive::{DrivePart, DrivePosition};
     use serde_json::json;
     let b = &m.drive_b;
     let part = b.part();
@@ -1560,7 +1560,7 @@ fn drive_b_node(m: &Machine) -> Option<serde_json::Value> {
     // restore mounts it whole and nothing depends on what was dirty at the capture.
     let disk = copy.disk_as_written().map(|d| {
         json!({
-            "kind": match d.kind { DiskKind::D64 => "d64", DiskKind::G64 => "g64" },
+            "kind": d.kind.name(),
             "bytes": ta_u8(&d.bytes),
             "backingPath": d.backing_path,
             "readOnly": d.read_only,
@@ -1592,10 +1592,13 @@ fn restore_drive_b(m: &mut Machine, node: Option<&serde_json::Value>) -> Result<
     };
     let was_powered = b.powered();
     b.detach_disk();
+    // Spec 872 — the board first: the medium must fit it.
+    b.force_board_type(node_board_type(node.get("drivePart")));
     if let Some(d) = node.get("disk").filter(|v| !v.is_null()) {
         let bytes = d.get("bytes").and_then(ta_u8_decode).ok_or("restore driveB: disk without bytes")?;
         let kind = match d.get("kind").and_then(|k| k.as_str()) {
             Some("g64") => DiskKind::G64,
+            Some("d81") => DiskKind::D81,
             _ => DiskKind::D64,
         };
         b.attach_disk(DiskImage {
@@ -1624,6 +1627,29 @@ fn restore_drive_b(m: &mut Machine, node: Option<&serde_json::Value>) -> Result<
         b.latch_rom();
     }
     Ok(())
+}
+
+/// Spec 872 — the board type a `drivePart` node names (absent: a 1541).
+fn node_board_type(part: Option<&serde_json::Value>) -> crate::iec::DriveType {
+    match part.and_then(|p| p.get("boardType")).and_then(|t| t.as_u64()) {
+        Some(1581) => crate::iec::DriveType::Drive1581,
+        _ => crate::iec::DriveType::Drive1541,
+    }
+}
+
+/// Spec 872 §6 — put each position's board type to what checkpoint `cp` holds, before
+/// the host re-attaches the media it carries (a D81 fits only a 1581). A position whose
+/// type changes is built fresh; a medium that does not fit is ejected. Idempotent;
+/// `restore_runtime_checkpoint` runs it too.
+pub fn prepare_drive_types(m: &mut Machine, cp: &serde_json::Value) {
+    let a = node_board_type(cp.get("drivePart"));
+    if m.drive8.board_type() != a {
+        m.drive8.force_board_type(a);
+    }
+    let b = node_board_type(cp.get("driveB").and_then(|n| n.get("drivePart")));
+    if m.drive_b.board_type() != b {
+        m.drive_b.force_board_type(b);
+    }
 }
 
 /// Spec 853 D6 — `{ kind, sizeKb, regs, ram }`, or Null with no device on the port.
@@ -1806,6 +1832,7 @@ pub fn restore_runtime_checkpoint(
     // image a later persist writes — and the drive's GCR baseline is present;
     // `restore_drive_disk_image` overlays the head/rotation-exact GCR (§6.1
     // mutable-wins). A null/absent drive blob leaves the drive at its baseline.
+    prepare_drive_types(m, cp);
     let drive_blob = cp.get("drive1541").and_then(ta_u8_decode);
     if let Some(ref blob) = drive_blob {
         crate::drive_snapshot::restore_drive1541(&mut m.drive8, blob)?;

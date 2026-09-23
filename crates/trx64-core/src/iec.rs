@@ -409,6 +409,30 @@ impl IecCore {
         self.iec_update_ports();
     }
 
+    /// Spec 872 — [`Self::iec_drive_write`] for a drive of type `t`. A 1581's CIA port-B
+    /// store folds with the 1581 formula (cia1581d.c:153-183, the OR form of the ATN
+    /// acknowledge — the one `recompute_drv_bus_unit` carries); a 1541 folds exactly as
+    /// before.
+    #[inline]
+    pub fn iec_drive_write_typed(&mut self, data: u8, dnr: usize, t: DriveType) {
+        if t == DriveType::Drive1541 {
+            self.iec_drive_write(data, dnr);
+            return;
+        }
+        self.iecbus.drv_data[dnr + 8] = data;
+        self.recompute_drv_bus_unit(dnr + 8, t);
+        self.iec_update_ports();
+    }
+
+    /// Spec 872 — the type of the drive answering at `slot` (`diskunit_context[dnr]->
+    /// type`), for the conf1/2/3 `switch (unit->type)`.
+    #[inline]
+    pub fn set_slot_type(&mut self, slot: usize, t: DriveType) {
+        if let Some(e) = self.unit_type.get_mut(slot) {
+            *e = t;
+        }
+    }
+
     // =========================================================================
     // ts: c64iec.ts:237-239 (iec_drive_read)  vice: c64iec.c:152-155
     // =========================================================================
@@ -576,7 +600,8 @@ impl IecCore {
 
             for dnr in 0..NUM_DISK_UNITS {
                 if self.iecbus_device[8 + dnr] == IECBUS_DEVICE_TRUEDRIVE {
-                    let unit_type = self.unit_type[dnr];
+                    // `diskunit_context[dnr]->type` — the unit at slot dnr + 8.
+                    let unit_type = self.unit_type[8 + dnr];
                     edges.push((dnr, Self::atn_signal_for(unit_type, self.iec_old_atn)));
                 }
             }
@@ -585,7 +610,7 @@ impl IecCore {
         for dnr in 0..NUM_DISK_UNITS {
             if self.iecbus_device[8 + dnr] == IECBUS_DEVICE_TRUEDRIVE {
                 let unit_slot = dnr + 8;
-                let unit_type = self.unit_type[dnr];
+                let unit_type = self.unit_type[unit_slot];
                 self.recompute_drv_bus_unit(unit_slot, unit_type);
             }
         }

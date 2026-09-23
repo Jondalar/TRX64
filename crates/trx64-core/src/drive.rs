@@ -26,11 +26,40 @@ use crate::{
     RomError,
 };
 
-/// Disk image kind — D64 (standard 1541 format) or G64 (GCR nibble dump).
-#[derive(Clone, Debug)]
+/// Disk image kind — D64 (standard 1541 format), G64 (GCR nibble dump), or D81 (the
+/// 1581's sector image, Spec 872 D3: 80-83 tracks, with or without error bytes).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DiskKind {
     D64,
     G64,
+    D81,
+}
+
+impl DiskKind {
+    /// The board a medium of this kind goes into.
+    pub fn board(&self) -> crate::iec::DriveType {
+        match self {
+            DiskKind::D64 | DiskKind::G64 => crate::iec::DriveType::Drive1541,
+            DiskKind::D81 => crate::iec::DriveType::Drive1581,
+        }
+    }
+
+    /// "d64" / "g64" / "d81".
+    pub fn name(&self) -> &'static str {
+        match self {
+            DiskKind::D64 => "d64",
+            DiskKind::G64 => "g64",
+            DiskKind::D81 => "d81",
+        }
+    }
+}
+
+/// "1541" / "1581" — the name a refusal and the wire use for a board type.
+pub fn board_name(t: crate::iec::DriveType) -> &'static str {
+    match t {
+        crate::iec::DriveType::Drive1581 => "1581",
+        _ => "1541",
+    }
 }
 
 /// In-memory disk image attached to a drive. The GCR read path is out of scope
@@ -514,6 +543,16 @@ pub struct Drive1541 {
     /// (`None` = no edge arrived) and the latest level. See `atn_edge_to_via1_ca1`.
     atn_stop_origin: Option<u8>,
     atn_stop_latest: u8,
+
+    // ── Spec 872 — the board in this position ──────────────────────────────
+    /// `Some` when the position holds a 1581 (D1). The 1541 electronics above stay in
+    /// the struct and are neither clocked nor on the bus then; the part state (power,
+    /// reset, stopped, reset line, unit, jumpers) is the position's and means the same
+    /// thing for either board (§5).
+    board_1581: Option<Box<crate::drive1581::Drive1581>>,
+    /// The 1581 DOS this position has been given: what a 1581 board built here gets
+    /// as its ROM, in force at its power-on.
+    rom_1581: Option<Box<[u8; 0x8000]>>,
 }
 
 /// Build a powered-on VIA1 `ViaContext` (via1d1541.ts:805-943
@@ -619,6 +658,171 @@ impl Drive1541 {
             rom_next: None,
             atn_stop_origin: None,
             atn_stop_latest: 0,
+            board_1581: None,
+            rom_1581: None,
+        }
+    }
+
+    // ── Spec 872 — the board type ────────────────────────────────────────────
+
+    /// The board this position holds.
+    pub fn board_type(&self) -> crate::iec::DriveType {
+        if self.board_1581.is_some() {
+            crate::iec::DriveType::Drive1581
+        } else {
+            crate::iec::DriveType::Drive1541
+        }
+    }
+
+    /// The 1581 board, when the position holds one.
+    pub fn board_1581(&self) -> Option<&crate::drive1581::Drive1581> {
+        self.board_1581.as_deref()
+    }
+    pub fn board_1581_mut(&mut self) -> Option<&mut crate::drive1581::Drive1581> {
+        self.board_1581.as_deref_mut()
+    }
+
+    /// The drive CPU in force — the 1541's or the 1581's.
+    pub fn cpu(&self) -> &crate::drive_6510core::DriveCore6510 {
+        match &self.board_1581 {
+            Some(b) => &b.core,
+            None => &self.core,
+        }
+    }
+
+    /// Spec 872 §5 — change the board in this position. Refused while the drive is
+    /// powered: the type is chosen at power-on. Off, the new board is built fresh (RAM
+    /// zero, its own ROM — the 1581 DOS this position was given — in force at its
+    /// power-on). The mounted medium is kept only if it fits the new board; otherwise
+    /// it is written back and ejected, and returned to the caller, whose persist it is.
+    pub fn set_board_type(&mut self, t: crate::iec::DriveType) -> Result<Option<DiskImage>, String> {
+        if self.powered {
+            return Err(format!(
+                "the drive is powered; switch it off before changing its type to {}",
+                board_name(t)
+            ));
+        }
+        Ok(self.force_board_type(t))
+    }
+
+    /// [`Self::set_board_type`] without the power rule — a checkpoint restore, which
+    /// puts the type back whatever it was.
+    pub(crate) fn force_board_type(&mut self, t: crate::iec::DriveType) -> Option<DiskImage> {
+        use crate::iec::DriveType;
+        let t = if t == DriveType::Drive1581 { t } else { DriveType::Drive1541 };
+        if t == self.board_type() {
+            return None;
+        }
+        // Write-back first, into `disk.bytes`, whatever happens to the medium.
+        self.sync_disk_bytes();
+        let medium = self.disk.take();
+        let unreported = self.disk_write_unreported;
+        // Unmount it from the old board's mechanism without another write-back.
+        if let Some(b) = self.board_1581.as_mut() {
+            b.detach();
+        } else {
+            self.rotation.detach();
+        }
+        if t == DriveType::Drive1581 {
+            let mut b = Box::new(crate::drive1581::Drive1581::new(0));
+            if let Some(rom) = &self.rom_1581 {
+                let _ = b.set_rom(&rom[..]);
+            }
+            b.latch_rom();
+            b.set_number(self.dnr());
+            self.board_1581 = Some(b);
+        } else {
+            self.board_1581 = None;
+            self.ram.fill(0);
+        }
+        self.cpu_last_data = 0;
+        // Fresh electronics at their reset state; nothing runs while the drive is off.
+        self.cold_reset();
+        match medium {
+            Some(img) if img.kind.board() == t => {
+                self.attach_disk_with_unreported_write(img, unreported);
+                None
+            }
+            other => {
+                self.disk_write_unreported = false;
+                other
+            }
+        }
+    }
+
+    /// Spec 872 §7 — give this position the 1581 DOS: exactly 32 KiB, refused
+    /// otherwise, naming the size and the type. A 1581 board here takes it at its next
+    /// power-on; a 1541 here keeps it for when the position becomes a 1581.
+    pub fn set_rom_1581(&mut self, bytes: &[u8]) -> Result<(), RomError> {
+        if bytes.len() != 0x8000 {
+            return Err(RomError::BadDriveRomSizeFor(bytes.len(), "1581"));
+        }
+        let mut rom = Box::new([0u8; 0x8000]);
+        rom.copy_from_slice(bytes);
+        if let Some(b) = self.board_1581.as_mut() {
+            let _ = b.set_rom(bytes);
+        }
+        self.rom_1581 = Some(rom);
+        Ok(())
+    }
+
+    /// Load the 1581 DOS from `rom_dir`: `dos1581-318045-02.bin` (VICE's name), then
+    /// the aliases `1581.bin` and `1581.rom` (Ultimate's). Not bundled (Commodore IP).
+    pub fn load_rom_1581(&mut self, rom_dir: &std::path::Path) -> Result<(), RomError> {
+        let data = std::fs::read(rom_dir.join("dos1581-318045-02.bin"))
+            .or_else(|_| std::fs::read(rom_dir.join("1581.bin")))
+            .or_else(|_| std::fs::read(rom_dir.join("1581.rom")))?;
+        self.set_rom_1581(&data)
+    }
+
+    /// Whether a medium of `kind` fits the board in this position (§5): a D81 goes into
+    /// a 1581, a D64 or G64 into a 1541. The refusal names the board.
+    pub fn medium_fits(&self, kind: &DiskKind) -> Result<(), String> {
+        let t = self.board_type();
+        if kind.board() == t {
+            Ok(())
+        } else {
+            Err(format!(
+                "a {} does not fit a {}: {} media go into a {}",
+                kind.name().to_uppercase(),
+                board_name(t),
+                kind.name().to_uppercase(),
+                board_name(kind.board())
+            ))
+        }
+    }
+
+    /// Mount `image` if it fits the board ([`Self::medium_fits`]); refused otherwise and
+    /// nothing changes. What media verbs call.
+    pub fn mount(&mut self, image: DiskImage) -> Result<(), String> {
+        self.medium_fits(&image.kind)?;
+        if image.kind == DiskKind::D81 && crate::fdd::d81_geometry(image.bytes.len()).is_none() {
+            return Err(format!(
+                "{} bytes is not a D81 size (80-83 tracks, with or without error bytes)",
+                image.bytes.len()
+            ));
+        }
+        self.attach_disk(image);
+        Ok(())
+    }
+
+    /// Spec 872 §6 — a checkpoint's D81 (as written) into this 1581 position's medium,
+    /// leaving the mechanism as the restore put it. A mounted D81 keeps its backing
+    /// path and write-protect; with none mounted the image becomes the medium.
+    pub(crate) fn restore_medium_1581(&mut self, bytes: Vec<u8>) {
+        let Some(b) = self.board_1581.as_mut() else { return };
+        b.wd.fdd.image_tracks = crate::fdd::d81_geometry(bytes.len()).map(|g| g.0).unwrap_or(80);
+        b.wd.fdd.image = Some(bytes.clone());
+        self.disk_synced_gen = b.image_gen();
+        match self.disk.as_mut() {
+            Some(d) if d.kind == DiskKind::D81 => d.bytes = bytes,
+            _ => {
+                b.read_only = false;
+                self.disk = Some(DiskImage { kind: DiskKind::D81, bytes, backing_path: None, read_only: false });
+            }
+        }
+        if let (Some(d), Some(b)) = (self.disk.as_ref(), self.board_1581.as_mut()) {
+            b.read_only = d.read_only;
         }
     }
 
@@ -642,7 +846,7 @@ impl Drive1541 {
     pub fn load_rom(&mut self, rom_dir: &std::path::Path) -> Result<(), RomError> {
         let data = std::fs::read(rom_dir.join("dos1541-325302-01+901229-05.bin"))
             .or_else(|_| std::fs::read(rom_dir.join("1541.bin")))?;
-        self.set_rom(&data)
+        self.set_rom_1541(&data)
     }
 
     /// Spec 870 D3 — give the drive its ROM as bytes. 16 KiB goes to `$C000-$FFFF`
@@ -654,6 +858,17 @@ impl Drive1541 {
     /// switched off and on for the other ROM to run, and a reset of a powered drive
     /// keeps the ROM it has.
     pub fn set_rom(&mut self, bytes: &[u8]) -> Result<(), RomError> {
+        // Spec 872 §5 — a 1581 position takes exactly 32 KiB; 870's 16 KiB form stays
+        // a 1541 thing.
+        if self.board_1581.is_some() {
+            return self.set_rom_1581(bytes);
+        }
+        self.set_rom_1541(bytes)
+    }
+
+    /// The 1541 half of [`Self::set_rom`]: the 1541 electronics' ROM, whatever board the
+    /// position holds now (in force at the 1541's next power-on).
+    pub fn set_rom_1541(&mut self, bytes: &[u8]) -> Result<(), RomError> {
         let mut rom = Box::new([0u8; 0x8000]);
         match bytes.len() {
             0x4000 => rom[0x4000..0x8000].copy_from_slice(bytes),
@@ -703,6 +918,12 @@ impl Drive1541 {
     /// takes here is still reported by the next [`Self::flush_disk_writeback`].
     fn reset_keeping_disk(&mut self) {
         self.sync_disk_bytes();
+        if self.board_1581.is_some() {
+            // The 1581's reset does not touch the mechanism (Spec 872 §3): the medium
+            // stays mounted, the head where it is, the disk-change latch as it was.
+            self.cold_reset();
+            return;
+        }
         let mounted_disk = self.disk.take();
         let unreported = self.disk_write_unreported;
         self.cold_reset();
@@ -714,6 +935,10 @@ impl Drive1541 {
     /// Spec 870 D3 — a ROM given since the last power-on comes into force. Called only
     /// on the way into power, never from a reset.
     pub(crate) fn latch_rom(&mut self) {
+        if let Some(b) = self.board_1581.as_mut() {
+            b.latch_rom();
+            return;
+        }
         if let Some(rom) = self.rom_next.take() {
             self.rom = rom;
         }
@@ -759,6 +984,10 @@ impl Drive1541 {
             self.powered = true;
             self.ram.fill(0);
             self.cpu_last_data = 0;
+            if let Some(b) = self.board_1581.as_mut() {
+                b.ram_mut().fill(0);
+                b.cpu_last_data = 0;
+            }
             self.latch_rom();
             self.reset_keeping_disk();
         } else {
@@ -850,11 +1079,18 @@ impl Drive1541 {
     }
     /// The 2 KiB drive RAM, whole.
     pub fn ram(&self) -> &[u8] {
-        &self.ram[..]
+        match &self.board_1581 {
+            Some(b) => b.ram(),
+            None => &self.ram[..],
+        }
     }
     /// The head's current half-track (2 = track 1).
     pub fn half_track(&self) -> u32 {
-        self.rotation.current_half_track
+        match &self.board_1581 {
+            // fdd.c:708 `current_half_track = (track + 1) * 2`.
+            Some(b) => (b.head().0 as u32 + 1) * 2,
+            None => self.rotation.current_half_track,
+        }
     }
 
     /// The VIA ports as the pins see them. Outputs are the composed `ORx | !DDRx`
@@ -893,6 +1129,17 @@ impl Drive1541 {
         self.unit = self.unit_jumpers;
         self.atn_stop_origin = None;
         let dnr = self.dnr();
+        if let Some(b) = self.board_1581.as_mut() {
+            // Spec 872 — the 1581's electronics: CPU, CIA, WD (iec.c:108-111). The
+            // mechanism and the medium are not the electronics.
+            b.reset(dnr);
+            b.seed_reset_offset(self.sync_factor);
+            self.drive_clk = 0;
+            self.last_sample_pc = None;
+            self.iec_drv_port = 0x85;
+            self.iec_cpu_bus = 0xff;
+            return;
+        }
         // Power-on register state (drivecpu cpu_regs init `{pc,ac,xr,yr,sp,flags=0}`,
         // sp=0). The drive 6502 powers on with SP=0; the IK_RESET dispatch does NOT
         // push (unlike an IRQ), so SP stays 0 through boot until the ROM's own TXS.
@@ -1015,6 +1262,10 @@ impl Drive1541 {
     /// `via1.via[VIA_PRB] | !via1.via[VIA_DDRB]`; both agree once store_prb ran.)
     #[inline]
     pub fn via1_pb_iec_output(&self) -> u8 {
+        if let Some(b) = &self.board_1581 {
+            // Spec 872 — the 1581's CIA port B, the same `~drv_data[unit]` shape.
+            return b.pb_iec_output();
+        }
         (!self.via1_iecbus.drv_data[self.unit as usize]) & 0xff
     }
 
@@ -1055,6 +1306,15 @@ impl Drive1541 {
             self.atn_stop_latest = sig;
             return;
         }
+        if let Some(b) = self.board_1581.as_mut() {
+            // Spec 872 — the 1581 takes ATN on its CIA's FLAG pin, falling edge only
+            // (iecbus.c:250-252: `if (!iec_old_atn) ciacore_set_flag`). `sig` is RISE
+            // exactly when ATN is now low.
+            if sig != 0 {
+                b.atn_flag();
+            }
+            return;
+        }
         let dnr = self.dnr();
         self.via1.clk = clk;
         let mut backend = Via1dBackend {
@@ -1068,6 +1328,9 @@ impl Drive1541 {
 
     /// Reset PC from the ROM vector (re-read). Returns the resolved PC.
     pub fn reset_pc(&self) -> u16 {
+        if let Some(b) = &self.board_1581 {
+            return b.rom()[0x7ffc] as u16 | (b.rom()[0x7ffd] as u16) << 8;
+        }
         let lo = self.rom[0x7FFC] as u16;
         let hi = self.rom[0x7FFD] as u16;
         lo | (hi << 8)
@@ -1088,6 +1351,13 @@ impl Drive1541 {
         // not move either, so a drive let run again continues from where it stood
         // instead of replaying the C64 time it missed.
         if !self.is_clocked() {
+            return;
+        }
+        if let Some(b) = self.board_1581.as_mut() {
+            // Spec 872 — the 1581 board, at twice the 1541's ratio (clock_frequency 2).
+            let dnr = (self.unit - 8) as usize;
+            b.run_cycles(n, self.sync_factor, dnr, self.iec_drv_port, self.iec_cpu_bus, &self.iec_drv_bus);
+            self.drive_clk = b.drive_clk;
             return;
         }
         // Advance the drive-clock target for this slice of main-CPU time.
@@ -1198,9 +1468,25 @@ impl Drive1541 {
     /// `true`) — a reset keeping the disk, a C64 power cycle carrying it through the
     /// media registry. The next [`Self::flush_disk_writeback`] reports it.
     pub fn attach_disk_with_unreported_write(&mut self, image: DiskImage, unreported: bool) {
+        if let Err(e) = self.medium_fits(&image.kind) {
+            // A caller that can refuse goes through `mount`; this path has no answer to
+            // give, so the medium does not go in.
+            eprintln!("[drive] attach refused: {e}");
+            return;
+        }
+        if let Some(b) = self.board_1581.as_mut() {
+            // Spec 872 D3 — the D81 goes into the 1581's mechanism; `disk.bytes` stays
+            // the medium the host persists, the FDD's image the working copy.
+            b.attach(image.bytes.clone(), image.read_only);
+            self.disk_synced_gen = b.image_gen();
+            self.disk = Some(image);
+            self.disk_write_unreported = unreported;
+            return;
+        }
         let (gcr, wb_kind) = match image.kind {
             DiskKind::D64 => (Some(GcrImage::from_d64(&image.bytes)), WritebackKind::D64),
             DiskKind::G64 => (Some(GcrImage::from_g64(&image.bytes)), WritebackKind::G64),
+            DiskKind::D81 => (None, WritebackKind::D64),
         };
         if let Some(gcr) = gcr {
             // Wire the raw on-disk image bytes as the write-back target so a
@@ -1225,6 +1511,10 @@ impl Drive1541 {
     pub fn detach_disk(&mut self) {
         self.flush_disk_writeback();
         self.disk = None;
+        if let Some(b) = self.board_1581.as_mut() {
+            b.detach();
+            return;
+        }
         self.rotation.detach();
     }
 
@@ -1245,6 +1535,18 @@ impl Drive1541 {
     /// The drive's own half of [`Self::flush_disk_writeback`]: bring `disk.bytes` up
     /// to the write-back image and note a write it took as not yet reported.
     fn sync_disk_bytes(&mut self) {
+        if let Some(b) = self.board_1581.as_mut() {
+            b.flush();
+            if b.image_gen() == self.disk_synced_gen {
+                return;
+            }
+            self.disk_synced_gen = b.image_gen();
+            if let (Some(img), Some(disk)) = (b.image(), self.disk.as_mut()) {
+                disk.bytes.clone_from(img);
+                self.disk_write_unreported = true;
+            }
+            return;
+        }
         self.rotation.drive_gcr_data_writeback_all();
         if self.rotation.writeback_gen == self.disk_synced_gen {
             return;
@@ -1265,7 +1567,10 @@ impl Drive1541 {
     /// [`Rotation::writeback_image`]: crate::rotation::Rotation::writeback_image
     pub fn disk_as_written(&self) -> Option<DiskImage> {
         let disk = self.disk.as_ref()?;
-        let bytes = self.rotation.writeback_image().unwrap_or_else(|| disk.bytes.clone());
+        let bytes = match &self.board_1581 {
+            Some(b) => b.image_as_written().unwrap_or_else(|| disk.bytes.clone()),
+            None => self.rotation.writeback_image().unwrap_or_else(|| disk.bytes.clone()),
+        };
         Some(DiskImage {
             kind: disk.kind.clone(),
             bytes,
@@ -1342,6 +1647,7 @@ impl Drive1541 {
             unit_jumpers: self.unit_jumpers,
             atn_stop_origin: self.atn_stop_origin,
             atn_stop_latest: self.atn_stop_latest,
+            board_type: board_name(self.board_type()).parse().unwrap_or(1541),
         }
     }
 
@@ -1353,8 +1659,19 @@ impl Drive1541 {
                 return Err(format!("drivePart: unit {u} is not 8-11"));
             }
         }
+        // Spec 872 §6 — a position whose type changes on restore gets its power-on for
+        // the ROM (the path 871 built for B).
+        let t = if p.board_type == 1581 { crate::iec::DriveType::Drive1581 } else { crate::iec::DriveType::Drive1541 };
+        if t != self.board_type() {
+            self.force_board_type(t);
+            self.latch_rom();
+        }
         self.powered = p.powered;
         self.reset_held = p.reset_held;
+        if let Some(b) = self.board_1581.as_mut() {
+            b.set_number((p.unit - 8) as usize);
+            b.resync_iec_output();
+        }
         self.stopped = p.stopped;
         self.reset_line_connected = p.reset_line_connected;
         self.unit = p.unit;
@@ -1454,6 +1771,9 @@ impl Drive1541 {
     /// disk-read gate. No side effects.
     #[inline]
     pub fn drive_ram_read(&self, addr: u16) -> u8 {
+        if let Some(b) = &self.board_1581 {
+            return b.ram()[(addr & 0x1fff) as usize];
+        }
         self.ram[(addr & 0x07FF) as usize]
     }
 
@@ -1465,6 +1785,9 @@ impl Drive1541 {
     /// something". Derived here rather than mirrored into new state, so it cannot go
     /// stale.
     pub fn led_on(&self) -> bool {
+        if let Some(b) = &self.board_1581 {
+            return b.led_on();
+        }
         let prb = self.via2.via[crate::viacore::VIA_PRB];
         let ddrb = self.via2.via[crate::viacore::VIA_DDRB];
         (prb & ddrb & 0x08) != 0
@@ -1476,6 +1799,9 @@ impl Drive1541 {
     /// without their port hooks, so a peek never turns the disk, clears
     /// byte_ready/IFR or dispatches a timer alarm. Read-inspect only.
     pub fn drive_peek(&self, addr: u16) -> u8 {
+        if let Some(b) = &self.board_1581 {
+            return b.peek(addr);
+        }
         // via1d1541.c:345 — driveid = (number << 5) & 0x60, the device-ID jumpers.
         let driveid = ((self.dnr() << 5) & 0x60) as u8;
         match addr {
@@ -1540,6 +1866,10 @@ impl Drive1541 {
     /// a sector read without the full IEC command handshake.
     #[inline]
     pub fn drive_ram_write(&mut self, addr: u16, val: u8) {
+        if let Some(b) = self.board_1581.as_mut() {
+            b.ram_mut()[(addr & 0x1fff) as usize] = val;
+            return;
+        }
         self.ram[(addr & 0x07FF) as usize] = val;
     }
 
@@ -1552,6 +1882,9 @@ impl Drive1541 {
     ///
     /// Returns `(pc, a, x, y, sp, p, drive_clk)` on change, `None` if unchanged.
     pub fn sample_pc_change(&mut self) -> Option<(u16, u8, u8, u8, u8, u8, u64)> {
+        if let Some(b) = self.board_1581.as_mut() {
+            return b.sample_pc_change();
+        }
         let pc = self.core.reg_pc;
         if self.last_sample_pc == Some(pc) {
             return None;
@@ -1586,6 +1919,19 @@ pub struct DrivePart {
     pub atn_stop_origin: Option<u8>,
     #[serde(default)]
     pub atn_stop_latest: u8,
+    /// Spec 872 §6 — the board in the position: 1541 or 1581. Absent (a checkpoint from
+    /// before 872) is a 1541, and a 1541 is not written, so a checkpoint of a machine
+    /// without a 1581 is the tree it was.
+    #[serde(default = "board_type_1541", skip_serializing_if = "is_board_1541")]
+    pub board_type: u16,
+}
+
+fn board_type_1541() -> u16 {
+    1541
+}
+
+fn is_board_1541(t: &u16) -> bool {
+    *t == 1541
 }
 
 impl Default for DrivePart {
@@ -1599,6 +1945,7 @@ impl Default for DrivePart {
             unit_jumpers: 8,
             atn_stop_origin: None,
             atn_stop_latest: 0,
+            board_type: 1541,
         }
     }
 }
@@ -1645,6 +1992,18 @@ pub fn pair_bus_slots(a: &Drive1541, b: &Drive1541) -> (Option<usize>, Option<us
     (sa, if sb.is_some() && sb == sa { None } else { sb })
 }
 
+/// Spec 872 — tell the IEC core which board answers at each occupied slot, so the
+/// conf1/2/3 paths fold and signal ATN per type. Two array stores per sync point.
+#[inline]
+pub fn pair_slot_types(a: &Drive1541, b: &Drive1541, sa: Option<usize>, sb: Option<usize>, iec: &mut crate::iec::IecCore) {
+    if let Some(s) = sa {
+        iec.set_slot_type(s, a.board_type());
+    }
+    if let Some(s) = sb {
+        iec.set_slot_type(s, b.board_type());
+    }
+}
+
 /// Spec 871 D2 — catch both drives up to the C64-clock `target` and put their port-B
 /// outputs into their slots WITHOUT the wired-AND fold (the `$DD00` write path folds
 /// once itself). Both are fed the bus as it stands BEFORE either runs, and both run
@@ -1661,6 +2020,7 @@ pub fn pair_catch_up(
     c64_pa_out: u8,
 ) -> u64 {
     let (sa, sb) = pair_bus_slots(a, b);
+    pair_slot_types(a, b, sa, sb, iec);
     iec.sync_drive_slots(sa, sb, c64_pa_out);
     let b_runs = b.is_clocked();
     a.feed_iec(iec);
@@ -1687,17 +2047,40 @@ pub fn pair_catch_up(
 #[inline]
 pub fn pair_fold_into_iec(a: &Drive1541, b: &Drive1541, iec: &mut crate::iec::IecCore, c64_pa_out: u8) {
     let (sa, sb) = pair_bus_slots(a, b);
+    pair_slot_types(a, b, sa, sb, iec);
     iec.sync_drive_slots(sa, sb, c64_pa_out);
     if let Some(slot) = sa {
-        iec.iec_drive_write((!a.via1_pb_iec_output()) & 0xff, slot - 8);
+        iec.iec_drive_write_typed(!a.via1_pb_iec_output(), slot - 8, a.board_type());
     }
     if let Some(slot) = sb {
-        iec.iec_drive_write((!b.via1_pb_iec_output()) & 0xff, slot - 8);
+        iec.iec_drive_write_typed(!b.via1_pb_iec_output(), slot - 8, b.board_type());
     }
 }
 
 /// Spec 871 D2 — deliver an ATN edge the IEC core computed for drive number `dnr`
-/// (slot `dnr + 8`) to whichever position answers there.
+/// (slot `dnr + 8`) to whichever position answers there. `edge` is the IEC core's
+/// per-type decision: VIA1 CA1 for a 1541, the CIA's FLAG for a 1581 (Spec 872).
+#[inline]
+pub fn pair_deliver_atn_edge(a: &mut Drive1541, b: &mut Drive1541, dnr: usize, edge: crate::iec::AtnEdge) {
+    use crate::iec::AtnEdge;
+    let sig = match edge {
+        AtnEdge::Via1Ca1 { sig } => sig,
+        // `if (!iec_old_atn) ciacore_set_flag` — FLAG fires on the falling ATN only;
+        // carried as the CA1 code the stopped-drive bookkeeping already speaks.
+        AtnEdge::Cia1581Flag { fire } => {
+            if fire {
+                crate::iec::VIA_SIG_RISE
+            } else {
+                0
+            }
+        }
+        // No position holds a 2000/4000/CMD HD.
+        _ => return,
+    };
+    pair_deliver_atn(a, b, dnr, sig);
+}
+
+/// [`pair_deliver_atn_edge`] with the VIA1 CA1 edge code.
 #[inline]
 pub fn pair_deliver_atn(a: &mut Drive1541, b: &mut Drive1541, dnr: usize, sig: u8) {
     let (sa, sb) = pair_bus_slots(a, b);

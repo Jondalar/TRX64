@@ -110,6 +110,7 @@ fn directory(kind: DiskKind, bytes: &[u8]) -> Vec<u8> {
             assert_eq!(trx64_core::gcr::gcr_read_sector(&img.tracks[34], &mut s, 1), trx64_core::gcr::CBMDOS_FDC_ERR_OK, "18/1 decodes");
             s
         }
+        DiskKind::D81 => unreachable!("this gate mounts 1541 media only"),
     }
 }
 
@@ -236,6 +237,7 @@ fn capture(m: &mut Machine) -> (serde_json::Value, Option<DiskImage>) {
     let fmt = match a_disk.as_ref().map(|d| &d.kind) {
         Some(DiskKind::G64) => "g64",
         Some(DiskKind::D64) => "d64",
+        Some(DiskKind::D81) => "d81",
         None => "",
     };
     let cp = capture_runtime_checkpoint(m, "", fmt, Some(&blob), overlay.as_deref(), None, None);
