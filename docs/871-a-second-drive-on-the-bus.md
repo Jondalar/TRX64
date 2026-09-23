@@ -78,18 +78,41 @@ not optimised in this spec.
 
 ## §7 Acceptance
 
-1. **Two disks, two drives.** A at 8 and B at 9, each with its own D64: `LOAD"$",8` and
+There is no existing drive-9 test in the corpus, so the tests are written here. The owner's
+expectation, which the tests are built around: `$DD00` fastloaders are written for drive 8
+and will almost always run only from 8 — some may run from 9 when the disk is booted from
+9, if they take the device number from `$BA` instead of hard-coding it. Nothing in this
+spec may change what happens on drive 8.
+
+**Gate — must pass:**
+
+1. **The 7-game gate with B on.** The existing 7-game screenshot gate (fastloaders from
+   drive 8) run unchanged, and run again with B powered at unit 9 with a disk mounted and
+   idle. Both 7/7. A second device on the bus must not disturb a transfer it is not
+   addressed in. If a game fails only with B on, that is investigated before anything
+   else: a real bus with a passive second 1541 on it does not break these loaders.
+2. **Two disks, two drives.** A at 8 and B at 9, each with its own D64: `LOAD"$",8` and
    `LOAD"$",9` each list their own disk.
-2. **A copy between them.** A file copied from 8 to 9 with a plain BASIC loop
+3. **KERNAL load and save on 9.** `LOAD"FILE",9` loads a PRG byte-identical to the one in
+   B's image; `SAVE"NEW",9` writes a PRG that, after persist, is byte-identical in B's
+   image, and A's image is unchanged.
+4. **A copy between them.** A file copied from 8 to 9 with a plain BASIC loop
    (`OPEN 2,8,2,"F,S,R"` / `OPEN 3,9,3,"F,S,W"` / `GET#` / `PRINT#`) arrives byte-identical
    in B's image after persist.
-3. **B off is today.** The 7-game screenshot gate and every drive gate byte-identical with
-   B off.
-4. **Same number refused.** Powering B on at unit 8 while A is at 8 is refused, naming A.
-5. **Checkpoints.** Two drives with disks mid-transfer round-trip through dump/undump; an
+5. **B off is today.** The 7-game gate and every drive gate byte-identical to main with B
+   off (the default).
+6. **Same number refused.** Powering B on at unit 8 while A is at 8 is refused, naming A.
+7. **Checkpoints.** Two drives with disks mid-transfer round-trip through dump/undump; an
    older checkpoint restores with B off.
-6. **Cost reported.** Frame time with B off and on, on the same workload, written into
-   this spec.
+
+**Characterisation — recorded, not a pass/fail gate:**
+
+8. **The seven games booted from 9.** A off, the game's disk in B at unit 9,
+   `LOAD"*",9,1` and `RUN`. Recorded per game: does the KERNAL stage load, does the
+   fastloader stage load, where does it stop. Expected: most stop at the fastloader
+   because it talks to 8. Any game that boots fully from 9 is written down by name — that
+   game becomes the regression test for a fastloader on a drive other than 8.
+9. **Cost.** Frame time with B off and on, on the same workload.
 
 ## §8 Open
 
