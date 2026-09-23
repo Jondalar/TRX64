@@ -1185,6 +1185,13 @@ impl Machine {
     }
 
     pub fn cold_reset(&mut self) {
+        // BUG-061 — the RESET line drops the C64 back to 1 MHz. On the Ultimate the turbo
+        // is the firmware's setting and the firmware applies it to a machine that has
+        // already come up; a C64 does not boot at 64 MHz, and one that did would win the
+        // KERNAL's raster race at `$FF5E` and decide it was an NTSC machine.
+        // `warm_reset` gets this for free — it builds a fresh VIC — but a cold reset
+        // keeps the chip, so it has to say so.
+        self.vic.u64_speed_applied = false;
         // CPU-port power-on latches must be set BEFORE the memconfig/vector compute
         // so the banking is the boot config (set again below for clarity/order with
         // the rest of the reset, but needed here for the cart-aware memconfig).
@@ -2683,6 +2690,11 @@ impl Machine {
     pub fn set_u64_turbo(&mut self, regs_en: u8, speed_prefer: u8) {
         self.vic.u64_regs_en = regs_en;
         self.vic.u64_speed_prefer = speed_prefer;
+        // BUG-061 — this call IS the firmware's `C64_SPEED_UPDATE` strobe, so it applies
+        // the setting to a machine that is already up. A RESET undoes that, and the
+        // firmware has to strobe again — which on the device it does, a few seconds after
+        // the C64 has booted and decided what continent it is on.
+        self.vic.u64_speed_applied = true;
     }
 
     pub fn set_u64_speed_table(&mut self, table: crate::vic::U64SpeedTable) {

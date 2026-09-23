@@ -147,6 +147,19 @@ in `scripts/gate.sh`.
 > against real U64 firmware with both models in one binary: row period 126 → 63 PHI2,
 > canvas 132 → 256 of 272 rows.
 
+> **Superseded on a second point (BUG-061, 2026-09-23).** The preferred speed was treated
+> as a state of the machine: a C64 came out of reset already running at it. On the Ultimate
+> the turbo is the FIRMWARE's setting and the firmware applies it to a machine that has
+> already come up — measured on the owner's device, a program run right after a reset is
+> exactly as slow at 64 MHz as at 1 MHz for its first two seconds, then jumps by a factor
+> of 71 in the same boot. It matters because the KERNAL works out whether it is a PAL or an
+> NTSC machine by racing the CPU against the raster, so a C64 that boots at 16 MHz or
+> faster wins a race it must lose and runs its jiffy clock 3.3% slow for the rest of the
+> session. A reset now drops the C64 to 1 MHz and the speed takes effect when something
+> APPLIES it — a `$D031` write, or the firmware's strobe through `set_u64_turbo`. No timing
+> constant: the device's ~4.5 s is one observation of one firmware and stays in the bug
+> report. Gate: `crates/trx64-core/tests/u64_boot_speed_gate.rs`.
+
 **What the build settled.**
 - A run capped by instructions ends early at turbo speed: every `budget / 2 + 1000` cap in the core,
   the daemon's breakpoint segment and the observer registry now scales by `turbo_divider()`.
