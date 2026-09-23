@@ -71,6 +71,9 @@ pub struct Session {
     /// Spec 871 — position B's jumpers and power across a power cycle (`None`: B as a
     /// machine is built — off, jumpers at 9).
     pub drive_b_state: Option<(u8, bool)>,
+    /// Spec 872 — the board in positions A and B across a power cycle (`None`: both as a
+    /// machine is built, 1541s).
+    pub drive_types: Option<[trx64_core::iec::DriveType; 2]>,
     /// Spec 863 — which C64 this session is (a `models.toml` row). Session identity, like
     /// the machine profile: every machine the session builds — power-on, the power-off
     /// blank — is built on it, so it survives a power cycle; a warm reset keeps the
@@ -147,6 +150,7 @@ impl Session {
             inserted_disk_b: None,
             inserted_disk_unreported: [false; 2],
             drive_b_state: None,
+            drive_types: None,
             model,
         }
     }
@@ -186,11 +190,27 @@ impl Session {
             machine.cartridge_image = Some(cart.image);
             machine.cold_reset();
         }
+        // Spec 872 — each position keeps its board across the C64's power cycle: a 1581
+        // is a device of its own. The type is chosen with the drive off, so position A,
+        // which comes up on with the machine, goes off, changes and comes back on — its
+        // power-on — after its disk is back in.
+        let types = self.drive_types.take();
+        let a_1581 = matches!(types, Some([trx64_core::iec::DriveType::Drive1581, _]));
+        if a_1581 {
+            let _ = machine.set_drive_power(trx64_core::drive::DrivePosition::A, false);
+            let _ = machine.set_drive_type(trx64_core::drive::DrivePosition::A, trx64_core::iec::DriveType::Drive1581);
+        }
+        if let Some([_, b]) = types {
+            let _ = machine.set_drive_type(trx64_core::drive::DrivePosition::B, b);
+        }
         // Re-attach the registered disk (writes intact, an unreported write still
         // unreported).
         let [unreported_a, unreported_b] = std::mem::take(&mut self.inserted_disk_unreported);
         if let Some(disk) = self.inserted_disk.take() {
             machine.drive8.attach_disk_with_unreported_write(disk, unreported_a);
+        }
+        if a_1581 {
+            let _ = machine.set_drive_power(trx64_core::drive::DrivePosition::A, true);
         }
         // Spec 871 — drive position B is a device of its own: a C64 power cycle does
         // not unplug it. Its disk goes back in, its jumpers stand where they stood, and
@@ -240,6 +260,7 @@ impl Session {
         self.inserted_disk_b = self.machine.drive_b.disk.take();
         self.inserted_disk_unreported = [unreported_a, unreported_b];
         self.drive_b_state = Some((self.machine.drive_b.unit_jumpers(), self.machine.drive_b.powered()));
+        self.drive_types = Some([self.machine.drive8.board_type(), self.machine.drive_b.board_type()]);
         self.machine = Machine::new_with_model(self.model);
         self.running = false;
         self.powered = false;
