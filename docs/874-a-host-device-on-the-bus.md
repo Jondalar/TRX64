@@ -1,6 +1,6 @@
 # Spec 874 — A device of the host's own on the bus: a public IEC device trait
 
-**Status:** PROPOSED 2026-09-23
+**Status:** BUILT on branch spec-874-host-device (not merged) — 2026-09-23, as built in §15
 **Repos:** TRX64. C64RE: no change.
 **Number:** 874 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`, row present).
 **Depends on:** Spec 873 (the folder device, the `IECDEVICE` slot, conf3, the sync points),
@@ -417,7 +417,8 @@ machine.iec_devices_uncovered()                        // after a restore or a c
    original is untouched. A cloned machine with a folder carries the folder, as today.
 8. **Reset and model.** `c64_reset` on a C64 reset; `set_cpu_hz` at attach and on a switch
    to NTSC (Spec 863) and back.
-9. **The folder, byte-identical.** `folder_device_gate.rs` unchanged: 13 green, the two
+9. **The folder, byte-identical.** `folder_device_gate.rs` unchanged in substance (two
+   lines read `m.folders()` where they read the gone field `m.folders`, §15): 13 green, the two
    characterisations as recorded; the 873 checkpoints (mid-LOAD, mid-SAVE, folder alone)
    restore in 500-frame lockstep, including a `.c64re` written by 873's build.
 10. **The seven games.** Default: 7/7, screenshots byte-identical to main's. `GATE_FOLDER=9`:
@@ -474,3 +475,156 @@ slot 4, `rebase`, the opt-out, or `IecLines` meaning "the rest of the bus".
   (`iec_interface.cc:130-155`) when settings change and from the menu's IEC Reset
   (`iec_drive.cc:210`, `:257`). Nothing writes it on a C64 reset. So `c64_reset` stays a
   notification, and UE2 ignores it.
+
+## §15 As built (2026-09-23, branch `spec-874-host-device`)
+
+**Where it lives.** `crates/trx64-core/src/iec_device.rs`: `IecLines`, `IecOut`
+(`slot_byte`), the `IecDevice` trait exactly as §3, `VacantDevice` (what a clone holds in
+place of a device that gave no copy), `IecDevices` (slot-ordered list plus the uncovered
+names; its `Clone` asks each device for `clone_device`), `lines_without` and
+`iec_devices_sync`. `impl IecDevice for FolderDevice` is in `folder_device.rs`, where
+`folders_sync` used to be. `Machine::iec_devices` replaces `Machine::folders`,
+`FullBus::iec_devices` replaces `FullBus::folders`, `IecCore::device_slots` /
+`set_device_slots` replace `folder_units` / `set_folder_units`. `Session::iec_devices_held`
+replaces `folders_held`.
+
+**Surface.** `attach_iec_device`, `detach_iec_device`, `iec_device_as(_mut)`,
+`iec_devices_uncovered`, `take_iec_devices`, `reattach_iec_devices`. The folder keeps
+`attach_folder` / `detach_folder` / `folder` / `folder_mut`, and gains `folders()` /
+`folders_mut()` (the daemon, the monitor and the gates reach the folders through them).
+
+**Decided at build — the code proved the spec text short:**
+
+- *`Machine: Clone` is written by hand.* §7 asks for a vacancy with its slot released in
+  the clone. A derive clones fields one by one, and no field can reach another, so the
+  device list cannot release its slot in the cloned IEC core. The impl lists all 55
+  fields, so a forgotten new field does not compile. After the fields are cloned it calls
+  `release_vacant_iec_slots`. The released slot is visible at once, not first at the
+  clone's first sync point.
+- *`AsAny` gains `into_any_box`.* A restore takes the folders back out of the device list
+  as `FolderDevice`s, and that needs `Box<dyn IecDevice>` → `Box<dyn Any>`.
+- *The folder gate changes two lines.* `Machine::folders` was a field, and two lines of
+  `folder_device_gate.rs` read it (`serde_json::to_value(&m.folders)`,
+  `r.folders.is_empty()`). They now call `m.folders()`. A `Vec<&FolderDevice>`
+  serialises to the same JSON, so nothing else in the gate changed.
+- *Restore refuses a folder on a host's slot.* If a checkpoint's `folders` node puts a
+  folder at a unit whose slot a live host device holds, the restore fails and names the
+  device. A restore never removes a host's device (§8).
+- *The device map is re-adopted on every restore that involves a host device.* This
+  applies when the checkpoint has an `iecDevices` node, or when a live host device is
+  attached. Otherwise the `iec` node could leave a captured pull in a slot that nobody
+  stands in now: the mask would be unchanged, so the old compare would skip the adopt.
+  Without host devices the old condition stands, so checkpoints without them restore as
+  before.
+- *A vacancy keeps its units and is never covered.* A restore does not hand a vacancy its
+  node state, and the vacancy stays named. A node entry with no live device at its slot is
+  named too.
+- *`rebase` at a power cycle now sets the folder's `atn_low` to the new machine's ATN.*
+  `reattach_folders` left the old value. §9 said the next `clock_to` overwrites it before
+  any transition reads it. That holds for a connected RESET line: the reset leaves `due()`
+  as `None`. With the reset line cut, a due transition would now settle under the new
+  machine's ATN instead of the old one's. That is the correct value.
+- *Monitor `iec`:* one column per device, headed by `name()`, width
+  `max(len(name), 5)`. That is 8 for `folder 9`, so a folder's columns are byte-identical.
+- *Refusal texts:* `"<name>: an IEC device stands at slot 4-11, not <s>"`,
+  `"<name> cannot stand at slot <s>: <occupant>"`,
+  `"<name> cannot answer to unit <u>: <occupant>"`. The occupant is one of
+  `drive position A is powered at unit 8`, `folder 10 stands at slot 10` or
+  `probe at slot 4 answers to unit 9`. A drive refused by a device reads
+  `drive position B cannot answer to unit 9: probe at slot 4 answers to unit 9`. The
+  folder's own texts from 871/873 are unchanged.
+- *`detach_iec_device` on a folder's slot* hands the folder back without `close_all`.
+  `detach_folder` still closes its channels first.
+
+### §15.1 Acceptance, as run
+
+`crates/trx64-core/tests/iec_device_gate.rs` (13 tests plus 1 ignored characterisation),
+`tests/common/probe_listener.rs` (`ProbeListener`, shared with the seven-game gate),
+`seven_game_gate` with `GATE_PROBE=<slot>`.
+
+1. **Test device.** `ProbeListener` is the folder's listener half with the Ultimate
+   times and no DOS. It records every call (`Ev::Edge/Clock/Rebase/Reset/Hz`), has
+   `hold_data_until`, configurable `claims`, and `hooks` / `clonable` switches.
+2. **Cycle-exact at `$DD00`** (`cycle_exact_at_dd00_slot_4`, `_slot_9`). DATA is released
+   at every cycle *P* of one 14-cycle pass of `LDA $DD00 / STA $C100,X / INX / BNE`, which
+   is 14 runs per slot. In each run the first read that sees DATA high is the first read
+   at or after *P*. Every read cycle also has a `clock_to` at that exact cycle.
+3. **ATN edge** (`atn_edge_at_its_cycle`). There are four writes: `$DD00` assert and
+   release, `$DD02` assert and release. Each gives `Edge(W+1, level)`, directly followed by
+   `Clock(W+1)` with the same ATN. The `clock_to` before the edge is at or before `W+1`
+   under the old ATN. There are exactly four edges. The reads after the writes see
+   DATA low, high, low, high. `kernal_listen_nine_finds_the_probe`: the control run with
+   nobody at 9 gives ST `$80`. With the probe at 9, ST is 0, and the probe took `$29 $6F
+   $3F` under ATN.
+4. **Hold** (`clocked_through_a_cpu_hold`, `clocked_through_a_reset_hold`). Each held span
+   gives exactly one `clock_to`, at the span's end. After `Hold::Cpu`, the first read sees
+   a release that fell inside the span. After `Hold::Reset`, the release is on the bus.
+   `drive_eight_sees_slot_four_under_a_cpu_hold`: drive 8 runs its own `$1800` stores and
+   then reads `$1800` in one held slice. It sees the probe's DATA pull at slot 4. With the
+   old 8-11 copy loop the same test fails (measured: `$04`, DATA IN clear).
+5. **Refusals** (`refusals_name_the_occupant`): slots 3 and 12; slot 8 with drive A;
+   slot 9 with drive B's jumpers at 9, powered; a claim of 9 with drive B there; a folder's
+   slot and a folder's unit; a slot another device holds. In reverse: drive B powered at
+   9, and `attach_folder(9)`, each while the probe claims 9; and a drive at unit 11 while a
+   device stands at slot 11. Each refusal names its occupant.
+6. **Checkpoints** (`checkpoint_opt_out_is_named`, `checkpoint_hooks_round_trip`). A
+   machine without a host device writes no `iecDevices` key. With the probe it writes
+   `[{slot:4, name:"probe", units:0, state:null}]`. The restore goes back to the capture
+   clock. It leaves the probe attached, rebased once to that clock, and named uncovered.
+   The probe's slot then holds its live pull, `0xc0`, not the captured `0x40`, and the bus
+   is folded with it. Detaching the probe clears the name. With `hooks`, `restore` gets
+   back exactly what `checkpoint` gave, and nothing is uncovered.
+7. **Clone** (`clone_leaves_a_released_vacancy`). The clone has a vacancy at slot 4: the
+   slot is released (`0xc0`), `cpu_port` is folded, the name and map are the same, the
+   callback is unchanged, and the probe is named uncovered. The folder at 9 is carried.
+   The original is untouched. A clone of the clone keeps the vacancy and its name.
+8. **Reset and model** (`reset_and_model_reach_the_device`). At attach the probe gets
+   `Hz(pal)`, then `Rebase`. `warm_reset` gives `Reset`; afterwards the slot and map are
+   back. A switch to NTSC and back gives the rates `[pal, ntsc, pal]`.
+9. **Folder, byte-identical.** `folder_device_gate`: 13 passed. The characterisation
+   ran on main and on this branch on the same machine, today:
+   - main: 1.666 / 1.714 / 1.698 ms/frame (x1.029 idle).
+   - branch: 1.696 / 1.730 / 1.720 ms/frame (x1.020).
+
+   Both are within run-to-run noise. 873's 4.949 / 5.125 / 3.368 were measured under
+   other load.
+
+   **The 873 checkpoints across builds.** On main (a887368) three `.c64re` files were
+   written: mid-LOAD from 9, mid-SAVE to 9, and a folder alone at 8. Main's straight run
+   continued 500 frames. On this branch each file was restored into a fresh machine and
+   run 500 frames. The state was identical to main's straight run in C64 RAM, drive RAM,
+   both clocks, both PCs, `drv_bus`, `cpu_port` and the folder's JSON. That throwaway test
+   is not committed. Within one build, the gate's own mid-LOAD, mid-SAVE and alone
+   lockstep tests pass.
+10. **Seven games.** The baseline is main a887368 in a detached worktree, run with
+    `GATE_FOLDER=9 GATE_DRIVE_B=9`, which gives 21 PNGs. This branch was run with
+    `GATE_FOLDER=9 GATE_DRIVE_B=9 GATE_PROBE=4`: 7/7 pass. All 21 of main's PNGs
+    (default, `_f9`, `_b9`) are **byte-identical** (`cmp`). The folder verdicts match
+    873's `folder_expected` (4 identical; greenberet, scramble and maniac differ). The
+    B-on verdicts match 871's expectations.
+11. **Maniac Mansion with a host device.** The probe sits at slot 4 with no unit, beside
+    drive 8. Its picture differs from the no-device run (632 px, box x 34..=317
+    y 35..=42) and is **byte-identical to the `GATE_FOLDER=9` picture**. At the end the
+    probe is under ATN, holding DATA, having taken 85 bytes under ATN (none was for it).
+    Recorded for the other games (`PROBE:` lines, not judged): polarbear, motm,
+    impossible2 and lastninja are byte-identical; greenberet differs (its ATN-request
+    loader, as with the folder); scramble differs as well (102 086 px, the whole
+    frame). Its loader addresses device 9 (873 §14.1). Why a device with no unit changes
+    its picture was not investigated here; it is recorded, not judged.
+12. **Nothing else moved.** `cia_alarm_check_gate` is green with its digests unchanged.
+    `second_drive_gate`, `drive_part_gate` and `drive1581_gate` are green. The monitor's
+    golden transcript and the daemon's folder tests are in the workspace run below.
+13. **Cost.** In the same process (`characterise_the_cost_of_a_device`): no device
+    1.693, idle folder at 9 1.716 (x1.014), idle probe at slot 4 1.716 (x1.013), folder
+    serving 1.675 ms/frame.
+
+**Suites.** `cargo test --release --workspace --no-fail-fast` (with `TRX64_ROM_DIR`):
+**1468 passed, 1 failed, 62 ignored.** The one failure,
+`trx64-cli ring_as_trace_source::map_answers_from_the_ring_without_trace_on`, came from
+another run's `live_*.duckdb` in the shared runtime temp directory ("cannot skip opcode
+0xc6"). Rerun alone it passed: 6/6. `cargo clippy` shows nothing new on the touched
+code; the warnings left in touched files were there before this spec.
+
+**Open.** The board row (`../C64ReverseEngineeringMCP/specs/README.md`) follows at the
+merge. §14 is settled by UE2. The one thing left open is the scramble `PROBE:` difference
+(item 11), which is recorded and was not investigated.
