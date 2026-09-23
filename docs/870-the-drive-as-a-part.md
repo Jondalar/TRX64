@@ -65,6 +65,22 @@ switch's transient — a drive switched on is a drive that has just been switche
   clocked, CPU in reset; releasing it runs the reset sequence. Its IEC outputs are
   released while held, as a 1541 in reset drives nothing.
 
+## §3a D2a — Stopped: powered, clock frozen
+
+A third state beside off and reset, from the U64's own drive (`fpga/1541/vhdl_source`,
+UE2's reading): the drive's RESET register carries **bit 2 `stop_when_frozen`**, and
+`c1541_drive.vhd:164-165` gates the drive's whole 16 MHz tick with it while the C64 is
+frozen (menu, freeze, DMA load). `c1581_drive.vhd:163` does the same.
+
+- **Stopped** means: powered, **not clocked at all** — no catch-up on `$DD00`, no
+  `run_cycles`, no rotation. CPU, VIAs and head stand exactly where they were.
+- Its VIA outputs **keep driving the IEC lines as they were**. Stopped is not off: the bus
+  does not see the drive disappear.
+- Released, it resumes where it stood, **no reset**, and its clock re-anchors to the C64's
+  without replaying the gap — the time it was stopped did not happen to it.
+- A flag per drive, set and cleared by the host. TRX64 does not decide when to stop a
+  drive; the U64 couples it to its freeze, and that coupling is the host's.
+
 ## §4 D3 — The ROM is a value
 
 - The ROM is given as bytes: **16 KiB** (placed at `$C000`) or **32 KiB** (the whole
@@ -99,8 +115,8 @@ drive's own inputs (the disk, the bus, power, reset).
 
 ## §7 Scope — where this stops
 
-- **In:** power, own reset, reset-line connection, ROM from bytes (16 K / 32 K), unit
-  number 8-11, read accessors — for the one drive that exists today.
+- **In:** power, own reset, reset-line connection, stopped, ROM from bytes (16 K / 32 K),
+  unit number 8-11, read accessors — for the one drive that exists today.
 - **Out:** a second drive (Spec 871); 1571 and 1581 (their own specs); a disk surface fed
   from outside, write hooks and per-track bit time (decided against, 2026-09-23); a
   parallel cable; unit numbers above 11.
@@ -121,7 +137,10 @@ drive's own inputs (the disk, the bus, power, reset).
 6. **Unit number.** With the jumpers at 9, `LOAD"$",9` works and `LOAD"$",8` does not.
 7. **Nothing else moved.** The 7-game screenshot gate and every drive gate byte-identical
    with the defaults (on, connected, unit 8, stock ROM).
-8. **Checkpoints.** Power, held, connection and unit number survive dump/undump.
+8. **Stopped.** A drive stopped mid-transfer for a second of C64 time and released resumes
+   at the same PC with the same VIA and rotation state, and the transfer completes; while
+   stopped its IEC outputs are unchanged and no drive cycle runs.
+9. **Checkpoints.** Power, held, stopped, connection and unit number survive dump/undump.
 
 ## §9 Open
 
