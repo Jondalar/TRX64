@@ -87,8 +87,10 @@ frozen (menu, freeze, DMA load). `c1581_drive.vhd:163` does the same.
   `$8000-$FFFF`, for the ROMs that use it — JiffyDOS, SpeedDOS and friends ship as 32 K on
   some boards). Any other size is refused by name.
 - The file loader stays as a convenience on top of it and keeps its current names.
-- Changing the ROM of a powered drive takes effect at its next reset — the CPU is not
-  swapped under a running program.
+- A ROM given to a powered drive takes effect at its next **power-on**, and only then. A
+  reset keeps the ROM the drive has. That is the hardware: a ROM is fixed for as long as
+  the drive has power, and even a board with a ROM switch has to be switched off and on
+  for the other ROM to run (owner, 2026-09-23).
 
 ## §5 D4 — The unit number
 
@@ -207,7 +209,7 @@ drive's own inputs (the disk, the bus, power, reset).
   low-then-high while stopped delivers nothing.
 - **ROM.** `set_rom(&[u8])`: 16 KiB at `$C000` (lower half zero, see §9), 32 KiB for the
   whole `$8000-$FFFF`, anything else `RomError::BadDriveRomSize(n)` whose message names
-  the size. Pending until the drive's next reset. `load_rom(dir)` keeps its file names
+  the size. Pending until the drive's next power-on (`set_power(true)`, `power_on_reset`); a reset keeps the ROM. `load_rom(dir)` keeps its file names
   and now goes through `set_rom` (so a 32 K file loads too).
 - **Unit.** `set_unit(8..=11)`, anything else refused by name. Latched into `unit` at
   the next reset; the jumper bits `read_prb` returns and the bus slot follow `unit`.

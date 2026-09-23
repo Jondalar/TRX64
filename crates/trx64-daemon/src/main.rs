@@ -7413,7 +7413,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
         // TRX64 has no fallback, so always reinitialized=true + mode.
         "session/drive_power" => {
             let mut st = state.lock().unwrap();
-            st.session.machine.drive8.cold_reset();
+            st.session.machine.drive8.power_on_reset();
             Response::ok(id, json!({
                 "device": 8,
                 "reinitialized": true,

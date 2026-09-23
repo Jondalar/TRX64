@@ -2813,7 +2813,8 @@ impl Machine {
         // Drive ROM: non-fatal — if absent the drive runs with zeroed ROM
         // (bus open; CPU will JAM immediately, which is a valid isolated state).
         let _ = self.drive8.load_rom(rom_dir);
-        self.drive8.cold_reset();
+        // The machine's power-on is the drive's power-on too: the ROM comes into force.
+        self.drive8.power_on_reset();
         self.iec.sync_drive_slot(self.drive8.bus_slot(), self.cia2_pa_out);
         Ok(())
     }

@@ -249,21 +249,27 @@ fn the_rom_is_a_value_16k_or_32k() {
     let err = m_new_drive_rom_err(&vec![0u8; 0x6000]);
     assert!(err.contains("24576"), "the refusal names the size: {err}");
 
-    // 32 K: a marker in $8000-$BFFF, the DOS at $C000. It is in force from the reset.
+    // 32 K: a marker in $8000-$BFFF, the DOS at $C000. In force from the next POWER-ON,
+    // never from a reset — a powered drive keeps the ROM it has, as real hardware does
+    // (even a ROM switch needs the drive switched off and on).
     let mut big = vec![0u8; 0x8000];
     big[0] = 0x5a;
     big[0x4000..].copy_from_slice(&dos);
     let mut m = booted();
     m.drive8.set_rom(&big).expect("32 K accepted");
-    assert_eq!(m.drive8.drive_peek(0x8000), 0x00, "not before the drive's reset");
+    assert_eq!(m.drive8.drive_peek(0x8000), 0x00, "not while the drive stays powered");
     m.drive8.reset();
-    assert_eq!(m.drive8.drive_peek(0x8000), 0x5a, "32 K fills $8000-$FFFF");
+    assert_eq!(m.drive8.drive_peek(0x8000), 0x00, "a reset does not swap the ROM");
+    m.drive8.set_power(false);
+    m.drive8.set_power(true);
+    assert_eq!(m.drive8.drive_peek(0x8000), 0x5a, "32 K fills $8000-$FFFF after power-on");
     frames(&mut m, 60);
     assert_lists(&load_dir(&mut m, 8), "32 K ROM from bytes");
 
     // 16 K from bytes: $C000 up, $8000-$BFFF zero.
     m.drive8.set_rom(&dos).expect("16 K accepted");
-    m.drive8.reset();
+    m.drive8.set_power(false);
+    m.drive8.set_power(true);
     assert_eq!(m.drive8.drive_peek(0x8000), 0x00, "16 K leaves $8000-$BFFF zero");
     assert_eq!(m.drive8.drive_peek(0xfffc), dos[0x3ffc], "16 K sits at $C000");
     frames(&mut m, 60);
