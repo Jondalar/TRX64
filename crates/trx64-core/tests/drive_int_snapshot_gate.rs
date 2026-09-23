@@ -181,6 +181,9 @@ fn mid_load(two: bool) -> (Machine, Vec<u8>) {
 fn capture(m: &mut Machine) -> serde_json::Value {
     let blob = capture_drive1541(&mut m.drive8);
     let overlay = capture_drive_disk_image(&m.drive8);
+    // Drive 8's medium as the daemon embeds it beside the checkpoint (the `.c64re`
+    // media payload, the ring's `_ringDriveDiskBytes`): the disk as written.
+    let _medium = m.drive8.disk_as_written();
     capture_runtime_checkpoint(m, "", "d64", Some(&blob), overlay.as_deref(), None, None)
 }
 
@@ -364,8 +367,53 @@ fn the_rotation_engine_rides_gcrimage_and_a_3_1_blob_gets_the_circuit() {
     assert_eq!(d.rotation.complicated_image_loaded, 1, "3.1 gets VICE's circuit engine");
 }
 
-/// The capture brings each drive's lazy rotation up to its clock. That must not move
-/// the machine: a machine that was captured and its uncaptured twin stay in lockstep.
+/// A machine in the middle of a SAVE — `SAVE"S",<unit>` of 40 blocks, run until the
+/// saving drive has written a second track while the first sits folded in its
+/// write-back image: a track pending (dirty), the drive's `DiskImage` behind.
+fn mid_save(two: bool) -> Machine {
+    let img = disk_with_big_prg(60);
+    let mut m = Machine::new();
+    m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
+    if two {
+        m.drive_b.attach_disk(disk(img.clone()));
+        m.set_drive_power(DrivePosition::B, true).expect("B on at 9");
+    }
+    frames(&mut m, 130);
+    m.drive8.attach_disk(disk(img));
+    frames(&mut m, 40);
+    let len = 40 * 254 - 2;
+    for i in 0..len {
+        m.poke(0x0801 + i as u16, &[(i * 13) as u8]);
+    }
+    let end = 0x0801 + len as u16;
+    m.poke(0x002d, &[end as u8, (end >> 8) as u8]);
+    let unit = if two { 9 } else { 8 };
+    type_in(&mut m, format!("SAVE\"S\",{unit}\r").as_bytes());
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..4000 {
+        frames(&mut m, 1);
+        let r = &(if two { &m.drive_b } else { &m.drive8 }).rotation;
+        if r.has_dirty_track() {
+            seen.insert(r.dirty_half_track);
+            if seen.len() >= 2 {
+                return m;
+            }
+        }
+    }
+    panic!("the SAVE never reached a second track");
+}
+
+/// Everything about a drive's disk that the write-back reads or writes.
+fn disk_state(d: &trx64_core::drive::Drive1541) -> (i32, u32, u64, Option<Vec<u8>>, Option<Vec<u8>>) {
+    let r = &d.rotation;
+    (r.gcr_dirty_track, r.dirty_half_track, r.writeback_gen, r.writeback_bytes.clone(), d.disk.as_ref().map(|x| x.bytes.clone()))
+}
+
+/// The capture brings each drive's lazy rotation up to its clock and builds each
+/// drive's medium as written. That must not move the machine: a machine that was
+/// captured and its uncaptured twin stay in lockstep — mid-load, and mid-save with a
+/// track pending, where the capture leaves the pending track pending and the
+/// drive's disk image as far behind as it was.
 #[test]
 fn a_capture_leaves_the_machine_it_describes_alone() {
     need_roms!();
@@ -375,6 +423,28 @@ fn a_capture_leaves_the_machine_it_describes_alone() {
         let _ = capture(&mut m);
         if let Err(e) = lockstep(&mut twin, &mut m) {
             panic!("{} drive(s): the captured machine left its twin — {e}", if two { 2 } else { 1 });
+        }
+    }
+    for two in [false, true] {
+        let mut m = mid_save(two);
+        let saving = if two { &m.drive_b } else { &m.drive8 };
+        assert!(saving.rotation.has_dirty_track(), "a track is pending");
+        assert_ne!(
+            saving.disk_as_written().unwrap().bytes,
+            saving.get_attached_disk().unwrap().bytes,
+            "the disk as written is ahead of the drive's disk image"
+        );
+        let mut twin = m.clone();
+        let cp = capture(&mut m);
+        assert_eq!(cp.get("driveB").is_some(), two);
+        for (a, b) in [(&twin.drive8, &m.drive8), (&twin.drive_b, &m.drive_b)] {
+            assert!(disk_state(a) == disk_state(b), "{} drive(s): the capture changed a drive's disk state", if two { 2 } else { 1 });
+        }
+        if let Err(e) = lockstep(&mut twin, &mut m) {
+            panic!("{} drive(s), mid-save: the captured machine left its twin — {e}", if two { 2 } else { 1 });
+        }
+        for (a, b) in [(&twin.drive8, &m.drive8), (&twin.drive_b, &m.drive_b)] {
+            assert!(disk_state(a) == disk_state(b), "{} drive(s): the twins wrote different disks", if two { 2 } else { 1 });
         }
     }
 }

@@ -162,9 +162,21 @@ together. **B off costs two flag tests** per sync point: not fed, not run, not f
   (it was off before the restore) is B's power-on for the ROM (`latch_rom`, now
   `pub(crate)`).
 
-**Checkpoints.** A `driveB` node — `drivePart`, the drive core blob, B's disk as mounted
-(kind, bytes, backing path, read-only: the host keeps no record of B's medium, so the
-image rides) and the GCR overlay. **Omitted while B is as built** (off, no disk, stock
+**Checkpoints.** A `driveB` node — `drivePart`, the drive core blob, B's disk (kind,
+bytes, backing path, read-only: the host keeps no record of B's medium, so the image
+rides) and the GCR overlay. The disk rides **as written** (`fix-drive-int-snapshot`):
+the bytes a persist would write at the capture — every track the drive has written
+folded in, the pending dirty track included, in the mounted format — built on a copy by
+the write-back's own encoder (`Drive1541::disk_as_written` →
+`Rotation::writeback_image`). Drive 8's medium beside the checkpoint (the ring's
+`_ringDriveDiskBytes`, the `.c64re` media payload, the recorder's disk medium) is the
+same image, and a dump no longer flushes the live drive. A restore mounts the complete
+image, the GCR overlay then puts the head/rotation-exact tracks back, and no dirty flag
+needs to ride: a persist after the restore writes the whole disk. As first built the
+disk rode as mounted-plus-last-flush — a track written and left before the capture was
+missing from it, and from every persist after the restore (`drive_disk_checkpoint_gate`,
+red on all four cases, D64/G64 × A/B). Older checkpoints carry whatever image they
+carried and restore as before. **Omitted while B is as built** (off, no disk, stock
 part), so every checkpoint of a one-drive machine is the tree it was — the
 `cia_alarm_check_gate` digests did not move. No node restores B as built (detach, part
 default). The capture reads B from a clone (`capture_drive1541` re-syncs VIA clocks).

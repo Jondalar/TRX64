@@ -4780,7 +4780,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                     return Err(format!("{op}: {why}"));
                 }
                 // ── snapshot/dump core (= the WS handler, taking &mut st) ──────────
-                st.session.machine.drive8.flush_disk_writeback();
+                // No flush: the embedded medium is the disk as written, built on a copy.
                 let (disk_path, disk_format) = match st.session.machine.drive8.get_attached_disk() {
                     Some(d) => (
                         d.backing_path.clone().unwrap_or_default(),
@@ -12195,10 +12195,9 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 None => return Response::err(id, -32602, "snapshot/dump: path required"),
             };
             let mut st = state.lock().unwrap();
-            // Flush any in-flight drive write into disk.bytes so the embedded
-            // media + its SHA in the checkpoint reflect the current image
-            // (VICE flushes drive_gcr_data_writeback_all before snapshotting).
-            st.session.machine.drive8.flush_disk_writeback();
+            // No flush here: the embedded medium is the disk as written, built on a
+            // copy (`gather_native_media_inputs`). Flushing the live drive would
+            // swallow the dirty track the lazy host-file write arms on.
             // Disk path/format for the checkpoint `media` metadata.
             let (disk_path, disk_format) = match st.session.machine.drive8.get_attached_disk() {
                 Some(d) => (
@@ -12229,7 +12228,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             );
             let cycle = m.c64_core.clk as i64;
             let pc = m.c64_core.reg_pc as i64;
-            // Embedded media inputs (clean disk/cart bytes, role/format/sourceName).
+            // Embedded media inputs (disk as written, cart bytes, role/format/sourceName).
             let media_inputs = gather_native_media_inputs(&st.session);
             // The `media` summary for the WS response (role/format/sourceName/
             // sha256/bytes) — matches c64re's DumpResult.media.
@@ -12635,7 +12634,9 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
 fn gather_snapshot_media(session: &Session) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     let m = &session.machine;
-    if let Some(disk) = m.drive8.get_attached_disk() {
+    // The disk as the dump embeds it (`gather_native_media_inputs`), so the summary's
+    // sha256 names the bytes in the file.
+    if let Some(disk) = m.drive8.disk_as_written() {
         let format = match disk.kind {
             DiskKind::G64 => "g64",
             DiskKind::D64 => "d64",
@@ -12665,8 +12666,8 @@ fn gather_snapshot_media(session: &Session) -> Vec<Value> {
     out
 }
 
-/// Build the embedded-media INPUTS for the `.c64re` container (clean source
-/// bytes per role) — 1:1 with c64re snapshot-persistence.ts `gatherMedia`. The
+/// Build the embedded-media INPUTS for the `.c64re` container (the disk as
+/// written, the cartridge's source bytes) — 1:1 with c64re snapshot-persistence.ts `gatherMedia`. The
 /// drive8 disk + any attached cartridge ride as embedded payloads so an undump
 /// (TRX64 or c64re) re-establishes the media. sha256 is computed by the writer.
 fn gather_native_media_inputs(
@@ -12675,7 +12676,10 @@ fn gather_native_media_inputs(
     use trx64_core::native_snapshot::NativeSnapshotMediaInput;
     let mut out = Vec::new();
     let m = &session.machine;
-    if let Some(disk) = m.drive8.get_attached_disk() {
+    // The disk AS WRITTEN: the image a persist would write now, every track the drive
+    // has written folded in, built on a copy (the live drive is not flushed). An
+    // undump mounts it whole.
+    if let Some(disk) = m.drive8.disk_as_written() {
         let format = match disk.kind { DiskKind::G64 => "g64", DiskKind::D64 => "d64" };
         let source_name = disk
             .backing_path
@@ -12686,7 +12690,7 @@ fn gather_native_media_inputs(
             role: "drive8".to_string(),
             format: format.to_string(),
             source_name,
-            bytes: Some(disk.bytes.clone()),
+            bytes: Some(disk.bytes),
             sha256: None,
         });
     }
@@ -14587,8 +14591,8 @@ fn now_ms() -> u64 {
 }
 
 /// Capture the live machine into a self-contained RuntimeCheckpoint Value, with the
-/// attached drive8 disk EMBEDDED in the `driveDiskImage` blob so a later restore can
-/// re-attach it (matching snapshot/dump). Mirrors c64re `controller.captureCheckpoint`
+/// attached drive8 disk (as written) EMBEDDED under `_ringDriveDiskBytes` so a later
+/// restore can re-attach it (matching snapshot/dump). Mirrors c64re `controller.captureCheckpoint`
 /// → `ring.capture(kernel.snapshot(), frame, cycles)`.
 fn capture_live_checkpoint(session: &mut Session) -> Value {
     // Disk path/format for the checkpoint `media` metadata (= snapshot/dump).
@@ -14603,20 +14607,19 @@ fn capture_live_checkpoint(session: &mut Session) -> Value {
         ),
         None => (String::new(), String::new()),
     };
-    // The attached disk's clean bytes ride as the `driveDiskImage` pooled blob so a
-    // ring restore re-establishes the media without a sidecar file. (snapshot/dump
-    // embeds these in the .c64re mediaPayloads; the in-memory ring embeds them in
-    // the checkpoint tree, which the disk pool then dedups across entries.)
-    let attached_disk_bytes = session
-        .machine
-        .drive8
-        .get_attached_disk()
-        .map(|d| d.bytes.clone());
     // Drive blobs (drive1541 core + GCRIMAGE0 overlay), captured from the live drive.
     let drive1541_blob =
         trx64_core::drive_snapshot::capture_drive1541(&mut session.machine.drive8);
     let drive_disk_blob =
         trx64_core::drive_snapshot::capture_drive_disk_image(&session.machine.drive8);
+    // The attached disk rides the checkpoint tree so a ring restore re-establishes
+    // the media without a sidecar file (snapshot/dump embeds it in the .c64re
+    // mediaPayloads; the ring's pool dedups it across entries). It rides AS WRITTEN —
+    // the image a persist would write now, every track the drive has written folded
+    // in (`disk_as_written`, built on a copy: the live drive's dirty track stays
+    // dirty). A restore then mounts a complete image, and a persist after it writes
+    // the complete image, whatever was dirty at the capture.
+    let attached_disk_bytes = session.machine.drive8.disk_as_written().map(|d| d.bytes);
     // formats-state-2 — full ring anchor carries the cart bytes + writable flash too
     // (c64re's non-omitMedia checkpoint, headless-machine-kernel.ts:988-989).
     let (cart_bytes, cart_flash) = capture_cart_blobs(&mut session.machine);
@@ -14629,12 +14632,8 @@ fn capture_live_checkpoint(session: &mut Session) -> Value {
         cart_bytes.as_deref(),
         cart_flash.as_deref(),
     );
-    // Embed the clean disk bytes as `driveDiskImage` so the ring's content-addressed
-    // pool dedups them and a restore re-attaches the disk before restoring the drive
-    // GCR overlay (the drive_snapshot `driveDiskImage` field holds the MUTABLE GCR
-    // overlay, captured above; here we additionally carry the clean image to re-attach).
     if let Some(bytes) = attached_disk_bytes {
-        // The GCR overlay (drive_disk_blob) already rode `driveDiskImage`; the clean
+        // The GCR overlay (drive_disk_blob) already rode `driveDiskImage`; the disk
         // image rides a sibling field consumed only by the ring restore. Keep the
         // c64re `driveDiskImage` semantics untouched (mutable GCR overlay) and stash
         // the re-attach image under `_ringDriveDiskBytes` (a TRX64-private ring slot,
@@ -15146,8 +15145,9 @@ fn restore_live_checkpoint(session: &mut Session, cp: &Value) -> Result<(), Stri
 /// Restore a ring checkpoint into ANY machine — the live one, or a scratch clone that must
 /// not disturb it (Spec 859's replay).
 fn restore_checkpoint_into(machine: &mut trx64_core::Machine, cp: &Value) -> Result<(), String> {
-    // Re-attach the embedded clean disk image FIRST (so the drive's GCR baseline is
-    // present before restore_runtime_checkpoint overlays the mutable GCR content).
+    // Re-attach the embedded disk image (as written at the capture) FIRST, so the
+    // drive's GCR baseline and its write-back image are present before
+    // restore_runtime_checkpoint overlays the head/rotation-exact GCR content.
     if let Some(bytes) = cp
         .get("_ringDriveDiskBytes")
         .and_then(trx64_core::native_snapshot::ta_u8_decode)
@@ -16338,8 +16338,8 @@ fn build_recorder_media(
 ) -> Vec<trx64_core::recorder::medium_source::MediumDescriptor> {
     use trx64_core::recorder::medium_source::{MediumDescriptor, MediumKind};
     let mut out = Vec::new();
-    if let Some(disk) = session.machine.drive8.get_attached_disk() {
-        let bytes = disk.bytes.clone();
+    if let Some(disk) = session.machine.drive8.disk_as_written() {
+        let bytes = disk.bytes;
         let hash = sha256_hex(&bytes);
         // Bump the generation iff the disk content changed since the last capture.
         if disk_hash.as_deref() != Some(hash.as_str()) {
@@ -22501,6 +22501,88 @@ mod batch1_tests {
             assert!(st.disk_ap_done_hash.is_some(), "disk settle recorded as done");
         }
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Drive 8's disk rides a ring checkpoint and a `.c64re` dump AS WRITTEN. One
+    /// sector is written on track 18 and the head stepped to track 19 — which folds
+    /// track 18 into the drive's write-back image and leaves nothing dirty — then a
+    /// sector on track 19, left pending. Neither is in the drive's `DiskImage` yet.
+    /// The capture must carry both, write nothing to the disk file and leave the
+    /// live drive as it was; a restore followed at once by a persist writes both.
+    #[test]
+    fn a_checkpoint_carries_drive_8s_disk_as_written() {
+        use trx64_core::gcr::{gcr_write_sector, CBMDOS_FDC_ERR_OK};
+        let dir = std::env::temp_dir().join(format!("trx64_disk_as_written_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let d64_path = dir.join("user.d64");
+        let blank = vec![0u8; 174_848];
+        std::fs::write(&d64_path, &blank).unwrap();
+        let t18 = |s: usize| (357 + s) * 256; // 17 tracks of 21 sectors before track 18
+        let t19 = |s: usize| (357 + 19 + s) * 256;
+        let s18: Vec<u8> = (0..256).map(|i| (i as u8) ^ 0x3c).collect();
+        let s19: Vec<u8> = (0..256).map(|i| (i as u8).wrapping_mul(5)).collect();
+
+        let state = make_state();
+        {
+            let mut st = state.lock().unwrap();
+            st.session.machine.drive8.attach_disk(DiskImage {
+                kind: DiskKind::D64,
+                bytes: blank.clone(),
+                backing_path: Some(d64_path.to_string_lossy().to_string()),
+                read_only: false,
+            });
+            let rot = &mut st.session.machine.drive8.rotation;
+            for (sector, data) in [(5u8, &s18), (3u8, &s19)] {
+                let ht = rot.current_half_track as usize;
+                let img = rot.image.as_mut().unwrap();
+                assert_eq!(gcr_write_sector(&mut img.tracks[ht - 2], data, sector), CBMDOS_FDC_ERR_OK);
+                rot.write_one_bit_for_test(1);
+                if ht == 36 {
+                    rot.move_head(2);
+                }
+            }
+            assert!(rot.has_dirty_track(), "track 19 is pending");
+            assert!(st.session.machine.drive8.get_attached_disk().unwrap().bytes == blank, "the disk image is behind");
+        }
+        let before = std::fs::read(&d64_path).unwrap();
+        let before_t = std::fs::metadata(&d64_path).unwrap().modified().unwrap();
+
+        // The ring.
+        let cp = {
+            let mut st = state.lock().unwrap();
+            let cp = capture_live_checkpoint(&mut st.session);
+            let d = &st.session.machine.drive8;
+            assert!(d.rotation.has_dirty_track(), "the capture left track 19 pending");
+            assert!(d.get_attached_disk().unwrap().bytes == blank, "the capture did not flush the live drive");
+            cp
+        };
+        // A `.c64re` dump.
+        let dump = dir.join("m.c64re");
+        call(&state, "snapshot/dump", json!({ "path": dump.to_str().unwrap() }));
+        {
+            let st = state.lock().unwrap();
+            let d = &st.session.machine.drive8;
+            assert!(d.rotation.has_dirty_track(), "the dump left track 19 pending");
+            assert!(d.get_attached_disk().unwrap().bytes == blank, "the dump did not flush the live drive");
+        }
+        assert_eq!(std::fs::read(&d64_path).unwrap(), before, "no capture wrote the disk file");
+        assert_eq!(std::fs::metadata(&d64_path).unwrap().modified().unwrap(), before_t);
+
+        let has_both = |b: &[u8]| b[t18(5)..t18(6)] == s18[..] && b[t19(3)..t19(4)] == s19[..];
+        let file = trx64_core::native_snapshot::read_native_snapshot(&std::fs::read(&dump).unwrap()).unwrap();
+        let embedded = file.media.iter().find(|m| m.reference.role == "drive8").and_then(|m| m.bytes.clone()).unwrap();
+        assert!(has_both(&embedded), "the dump embeds the disk as written");
+
+        // Restore the ring checkpoint into a fresh machine and persist at once.
+        let fresh = make_state();
+        {
+            let mut st = fresh.lock().unwrap();
+            restore_checkpoint_into(&mut st.session.machine, &cp).unwrap();
+            assert!(!st.session.machine.drive8.rotation.has_dirty_track());
+            assert_eq!(persist_outgoing_disk_at(&mut st, DrivePosition::A).as_deref(), d64_path.to_str());
+        }
+        assert!(has_both(&std::fs::read(&d64_path).unwrap()), "the persisted file holds both tracks");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

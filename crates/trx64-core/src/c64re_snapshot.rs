@@ -1539,7 +1539,7 @@ pub fn capture_runtime_checkpoint_with(
 }
 
 /// Spec 871 — position B's whole state: its part (`drivePart` shape), the drive core
-/// blob, its disk as mounted (the host keeps no record of B's medium, so the image
+/// blob, its disk as written (the host keeps no record of B's medium, so the image
 /// itself rides) and the GCR overlay. `None` when B is off with no disk and its
 /// stock part — the node a one-drive machine does not carry.
 fn drive_b_node(m: &Machine) -> Option<serde_json::Value> {
@@ -1554,7 +1554,11 @@ fn drive_b_node(m: &Machine) -> Option<serde_json::Value> {
     // copy so a capture never touches the machine it describes.
     let mut copy = b.clone();
     let blob = crate::drive_snapshot::capture_drive1541(&mut copy);
-    let disk = b.disk.as_ref().map(|d| {
+    // From the copy: the capture caught its rotation up, which in write mode puts
+    // bits on the track — the image and the overlay must be that disk. The image is
+    // the one a persist would write now (every written track folded in), so a
+    // restore mounts it whole and nothing depends on what was dirty at the capture.
+    let disk = copy.disk_as_written().map(|d| {
         json!({
             "kind": match d.kind { DiskKind::D64 => "d64", DiskKind::G64 => "g64" },
             "bytes": ta_u8(&d.bytes),
@@ -1562,8 +1566,6 @@ fn drive_b_node(m: &Machine) -> Option<serde_json::Value> {
             "readOnly": d.read_only,
         })
     });
-    // From the copy: the capture caught its rotation up, which in write mode puts
-    // bits on the track — the overlay must be that disk.
     let overlay = crate::drive_snapshot::capture_drive_disk_image(&copy);
     Some(json!({
         "drivePart": serde_json::to_value(part).unwrap(),
@@ -1799,8 +1801,10 @@ pub fn restore_runtime_checkpoint(
 
     // Drive restore (part 4): the `drive1541` core blob (DRIVE8/DRIVECPU0/VIA1/VIA2)
     // then the `driveDiskImage` GCRIMAGE0 overlay. The caller (daemon) has already
-    // re-attached the embedded disk before this point, so the drive's GCR baseline
-    // is present; `restore_drive_disk_image` overlays the mutable content (§6.1
+    // re-attached the embedded disk before this point — the image as written
+    // (`Drive1541::disk_as_written` at the capture), so it is also the write-back
+    // image a later persist writes — and the drive's GCR baseline is present;
+    // `restore_drive_disk_image` overlays the head/rotation-exact GCR (§6.1
     // mutable-wins). A null/absent drive blob leaves the drive at its baseline.
     let drive_blob = cp.get("drive1541").and_then(ta_u8_decode);
     if let Some(ref blob) = drive_blob {

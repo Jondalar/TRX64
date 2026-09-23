@@ -480,6 +480,10 @@ pub struct Drive1541 {
     reset_pending: bool,
     /// Attached disk image (None = no disk in drive).
     pub disk: Option<DiskImage>,
+    /// The `rotation.writeback_gen` that `disk.bytes` was last brought up to. A head
+    /// move folds a dirty track into the rotation's write-back image without
+    /// touching `disk.bytes`; this is how [`Self::flush_disk_writeback`] knows.
+    disk_synced_gen: u64,
     /// The rotating GCR disk model (head position, bit-stream, byte-ready). Holds
     /// the per-track GCR bitstream for a mounted D64 (`rotation.image`).
     pub rotation: Rotation,
@@ -598,6 +602,7 @@ impl Drive1541 {
             iec_cpu_bus: 0xff,
             iec_drv_bus: [0xff; crate::iec::IECBUS_NUM],
             disk: None,
+            disk_synced_gen: 0,
             rotation: Rotation::new(),
             powered: true,
             reset_held: false,
@@ -1192,6 +1197,7 @@ impl Drive1541 {
             );
         }
         self.disk = Some(image);
+        self.disk_synced_gen = self.rotation.writeback_gen;
     }
 
     /// Detach (eject) the disk from this drive. Flushes any pending dirty track
@@ -1203,23 +1209,43 @@ impl Drive1541 {
         self.rotation.detach();
     }
 
-    /// Flush any pending dirty GCR track back into `self.disk.bytes` (the
-    /// authoritative on-disk image the daemon persists/hashes/snapshots). Mirrors
-    /// VICE `drive_gcr_data_writeback_all` being called before `fsimage->fd` is
-    /// read. Cheap no-op when nothing is dirty. Returns whether bytes changed.
+    /// Bring `self.disk.bytes` (the image the daemon persists/hashes/snapshots) up
+    /// to the drive's write-back image: flush the pending dirty track into it (VICE
+    /// `drive_gcr_data_writeback_all` before `fsimage->fd` is read), and copy it out
+    /// whenever a track has been folded in since the last time — by this flush or
+    /// by a head move, which folds the track it leaves without asking anyone.
+    /// Cheap no-op when nothing was written. Returns whether bytes changed.
     pub fn flush_disk_writeback(&mut self) -> bool {
-        if !self.rotation.has_dirty_track() {
+        self.rotation.drive_gcr_data_writeback_all();
+        if self.rotation.writeback_gen == self.disk_synced_gen {
             return false;
         }
-        // Serialize the dirty track into the rotation's write-back buffer, then
-        // mirror it into the DiskImage the daemon reads.
-        if let Some(synced) = self.rotation.writeback_bytes_synced() {
-            if let Some(disk) = self.disk.as_mut() {
-                disk.bytes = synced;
-                return true;
+        self.disk_synced_gen = self.rotation.writeback_gen;
+        match (self.rotation.writeback_bytes.as_ref(), self.disk.as_mut()) {
+            (Some(synced), Some(disk)) => {
+                disk.bytes.clone_from(synced);
+                true
             }
+            _ => false,
         }
-        false
+    }
+
+    /// The attached disk as a flush would leave it — the image a persist writes —
+    /// built on a copy: [`Rotation::writeback_image`] (the write-back image with the
+    /// pending dirty track folded in by the same encoder). The drive is left exactly
+    /// as it was: the dirty track stays dirty, `disk.bytes` is not brought up to
+    /// date. What a checkpoint embeds as the drive's medium. `None` without a disk.
+    ///
+    /// [`Rotation::writeback_image`]: crate::rotation::Rotation::writeback_image
+    pub fn disk_as_written(&self) -> Option<DiskImage> {
+        let disk = self.disk.as_ref()?;
+        let bytes = self.rotation.writeback_image().unwrap_or_else(|| disk.bytes.clone());
+        Some(DiskImage {
+            kind: disk.kind.clone(),
+            bytes,
+            backing_path: disk.backing_path.clone(),
+            read_only: disk.read_only,
+        })
     }
 
     /// Get a reference to the currently attached disk image, if any.
