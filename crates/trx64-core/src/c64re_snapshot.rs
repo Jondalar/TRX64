@@ -1503,6 +1503,9 @@ pub fn capture_runtime_checkpoint_with(
         // against whichever split happened to be last when the frame ended.
         "vicProvenance": capture_vic_provenance(m),
         "drive1541": drive1541.map(ta_u8).unwrap_or(serde_json::Value::Null),
+        // Spec 870 — power / held / stopped / reset line / unit. Additive: a
+        // checkpoint without it restores the stock drive (on, connected, unit 8).
+        "drivePart": serde_json::to_value(m.drive8.part()).unwrap(),
         "driveDiskImage": drive_disk_image.map(ta_u8).unwrap_or(serde_json::Value::Null),
         // Spec 714.5 (formats-state-2): the attached cartridge's original .crt bytes +
         // mutable flash image, as `{ $ta }` typed-array nodes (null = no cart / no
@@ -1713,6 +1716,26 @@ pub fn restore_runtime_checkpoint(
     }
     if let Some(disk_blob) = cp.get("driveDiskImage").and_then(ta_u8_decode) {
         crate::drive_snapshot::restore_drive_disk_image(&mut m.drive8, &disk_blob)?;
+    }
+    // Spec 870 — the drive as a part. Absent (a checkpoint from before 870) means the
+    // stock drive, NOT "keep whatever the live machine had": a restore is the state it
+    // names. The IEC core's device map follows, without touching the lines the `iec`
+    // node just restored — they were captured with that map in force.
+    let part = match cp.get("drivePart") {
+        Some(v) if !v.is_null() => serde_json::from_value::<crate::drive::DrivePart>(v.clone())
+            .map_err(|e| format!("restore drivePart: {e}"))?,
+        _ => crate::drive::DrivePart::default(),
+    };
+    m.drive8.restore_part(&part)?;
+    let slot = m.drive8.bus_slot();
+    if m.iec.drive_slot != slot {
+        m.iec.adopt_drive_slot(slot);
+        if slot.is_none() {
+            // Conf0 reads the C64's own lines from `iec_fast_1541`, which no checkpoint
+            // carries: seed it from the restored CIA2 port A, as a `$DD00` write would.
+            let pa = m.cia2.peek(0xdd00) | !m.cia2.peek(0xdd02);
+            m.iec.iecbus_cpu_write_conf0(!pa, 0);
+        }
     }
 
     // Re-anchor the drive's C64-clock catch-up reference to the restored anchor
