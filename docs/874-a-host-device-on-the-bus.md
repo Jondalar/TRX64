@@ -450,19 +450,27 @@ machine.iec_devices_uncovered()                        // after a restore or a c
   device that runs mid-instruction or below C64-cycle resolution; a daemon/wire verb or an
   FFI binding for host devices; UE2's processor itself (it lives in UE2's repo).
 
-## §14 Open
+## §14 Open — settled by UE2, 2026-09-23
 
-- **`units()` while running.** The U64 firmware can re-patch its device numbers at any time.
-  This spec checks claims only at configuration changes. If UE2 needs the machine to refuse
-  or report a claim that appears later, that is a notification from the device (a
-  `units_changed` flag read at instruction end), not built here. For UE2.
-- **A device that must end a run.** `ExpansionDevice::take_stop` lets a device stop the run
-  at the next instruction boundary (`expansion.rs:116-120`). The Ultimate's flow control is
-  honest (it holds DATA or CLK until the firmware has served its FIFO, 873 §2), so a host
-  that runs in slices does not need it. Added only if UE2 measures a case that does.
-- **Sync inside a held span.** Under a hold, devices and drives exchange lines once per
-  held span (§6). If UE2's firmware holds the C64 while its processor talks to a TRX64 1541
-  (drive to U64, the C64 not involved), a sub-span sync quantum may be needed. Not
-  measured; not built.
-- **The IEC RESET line for a host device.** `c64_reset` is a notification; whether the U64's
-  processor is reset by the C64's RESET is the firmware's wiring and UE2's call.
+UE2 answered all four. None of the answers changes the design. UE2 has no objection to
+slot 4, `rebase`, the opt-out, or `IecLines` meaning "the rest of the bus".
+
+- **`units()` while running — settled by UE2, 2026-09-23: checking at attach is enough.**
+  The firmware re-patches its device numbers only inside `IecInterface::configure`, and it
+  holds the engine in reset while it does. If UE2 needs a new claim, it re-attaches. There
+  is no `units_changed` flag.
+- **A device that must end a run — not needed (UE2, 2026-09-23).** The Ultimate's flow
+  control is honest: it holds DATA or CLK until the firmware has served its FIFO (873 §2).
+  A host that runs in slices therefore needs no `take_stop`. One would be added only if UE2
+  measures a case that does need it.
+- **Sync inside a held span — settled by UE2, 2026-09-23: once per held span is fine.** The
+  only mode that talks to a drive without the C64 is master mode: UltiCopy, drive-code
+  upload, or the engine driving ATN. Master mode is out of scope here (§13), and UE2's S30
+  leaves it out too. There is no sub-span quantum.
+- **The IEC RESET line for a host device — settled by UE2, 2026-09-23: not wired.** The C64's
+  RESET does not reset the U64's IEC processor. Its only resets are `sys_reset` (U2+ top
+  `ultimate_logic_32.vhd:1209`; the U64 top is not in the tree) and the firmware's
+  RESET_ENABLE register. That register is written from `IecInterface::configure` / `reset`
+  (`iec_interface.cc:130-155`) when settings change and from the menu's IEC Reset
+  (`iec_drive.cc:210`, `:257`). Nothing writes it on a C64 reset. So `c64_reset` stays a
+  notification, and UE2 ignores it.
