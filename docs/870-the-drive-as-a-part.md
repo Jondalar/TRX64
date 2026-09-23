@@ -1,6 +1,6 @@
 # Spec 870 — The drive as a part: power, reset, ROM and unit number
 
-**Status:** PROPOSED (2026-09-23)
+**Status:** BUILT (on branch spec-870-drive-as-a-part, not merged)
 **Repos:** TRX64 only. C64RE: no change.
 **Number:** 870 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`).
 **Depends on:** the 1541 port (`drive.rs`, `iec.rs`, `viacore.rs`), Spec 850 (the hold a
@@ -87,8 +87,10 @@ frozen (menu, freeze, DMA load). `c1581_drive.vhd:163` does the same.
   `$8000-$FFFF`, for the ROMs that use it — JiffyDOS, SpeedDOS and friends ship as 32 K on
   some boards). Any other size is refused by name.
 - The file loader stays as a convenience on top of it and keeps its current names.
-- Changing the ROM of a powered drive takes effect at its next reset — the CPU is not
-  swapped under a running program.
+- A ROM given to a powered drive takes effect at its next **power-on**, and only then. A
+  reset keeps the ROM the drive has. That is the hardware: a ROM is fixed for as long as
+  the drive has power, and even a board with a ROM switch has to be switched off and on
+  for the other ROM to run (owner, 2026-09-23).
 
 ## §5 D4 — The unit number
 
@@ -144,7 +146,96 @@ drive's own inputs (the disk, the bus, power, reset).
 
 ## §9 Open
 
-- Whether a checkpoint taken with a drive off should carry the drive's (meaningless) RAM,
-  or omit it. Omitting is smaller; carrying is simpler to restore. Decide when building.
-- The drive's power-on RAM pattern: VICE fills it; whether the real 1541 pattern matters
-  to any loader is unmeasured. Use VICE's until a disk says otherwise.
+- ~~Whether a checkpoint taken with a drive off should carry the drive's RAM.~~ Decided
+  at build: **carried**. The drive blob is captured exactly as before whatever the power
+  state; a restore needs no special case.
+- ~~The drive's power-on RAM pattern.~~ VICE allocates the unit context with
+  `lib_calloc`, so its pattern is zeros; power-on clears the 2 KiB to zero. Stays open
+  only in the sense the spec gave it: until a disk says otherwise.
+- **The drive ROM is not in a checkpoint** (neither is the C64's). Restoring a checkpoint
+  taken with a JiffyDOS drive into a machine with the stock ROM runs the drive on the
+  stock ROM. The host gives the ROM; whether a checkpoint should carry a non-stock one
+  is undecided.
+- **16 K at `$C000`, `$8000-$BFFF` zero.** VICE copies a 16 K image into the lower half
+  as well (`iecrom.c`, "ROM was loaded to the upper part of the buffer"), so its
+  `$8000-$BFFF` mirrors `$C000-$FFFF`. TRX64's file loader always left it zero and the
+  spec says "placed at `$C000`"; kept, so the stock machine does not move. Whether to
+  mirror is a separate decision.
+- **The VICE snapshot (`.vsf`) export** still writes the IEC lines of slot 8. A drive at
+  another unit or off exports wrongly there; the `.c64re` checkpoint is right.
+
+## §10 As built (2026-09-23, branch `spec-870-drive-as-a-part`)
+
+**Where it lives.** All state is on `Drive1541` (`drive.rs`); the machine only asks it.
+`powered`, `reset_held`, `stopped`, `reset_line_connected`, `unit` (in force) and
+`unit_jumpers` (as set), plus a pending ROM. The six `number: 0` VIA-backend sites take
+`unit − 8`.
+
+- **Not clocked** (off / held / stopped) is one gate at the top of `run_cycles`: no
+  cycle runs and the drive's `stop_clk` target does not move. `catch_up_to` still
+  returns the C64 clock, so the machine's catch-up reference moves on without the drive
+  — that is the "re-anchored without replaying the gap" of §3a, with no extra code on
+  release.
+- **On the bus** is `bus_slot()`: `Some(unit)` when powered and not held, `None`
+  otherwise. Every place that folded `iec_drive_write(~pb, 0)` now calls
+  `Drive1541::fold_into_iec` / `set_iec_data_no_fold`, which fold into the drive's own
+  slot and first run `IecCore::sync_drive_slot` — a one-compare no-op on the stock
+  machine. When the slot changes it sets the device map the way `iecbus_status_set`
+  would for a single true drive (Conf1 at 8, Conf2 at 9, Conf3 at 10/11, **Conf0 for
+  none**) and releases the vacated slot like `iec_drive_port_default`. It does this
+  directly, not through `iecbus_status_set`, whose function-static arrays are shared by
+  every machine on the thread.
+- **Off and held both leave the bus as Conf0** — VICE's "no device" callback, where the
+  C64 reads only its own outputs. Releasing the slot alone (Conf1 with `drv_bus = 0xff`)
+  is not enough: the 1541's ATN-acknowledge term would still pull DATA when the C64
+  asserts ATN, and the KERNAL would never say DEVICE NOT PRESENT. §3 says a drive in
+  reset drives nothing; taken literally, that includes the ATN-ack gate. Leaving Conf0
+  seeds `iec_fast_1541` from the C64's port; rejoining re-derives `cpu_bus` /
+  `iec_old_atn` from it (`iecbus_cpu_undump`), because Conf0 stops maintaining them.
+- **Reset.** `Drive1541::reset()` is the drive's RESET input: flush a pending disk
+  write, `cold_reset`, re-attach the disk (the sequence `warm_reset` used to do inline).
+  A drive without power ignores it. `warm_reset` calls `reset_from_c64()`, which resets
+  only with the line connected. `cold_reset` brings the pending ROM and the jumpers into
+  force.
+- **Held.** Asserting and releasing both run the reset sequence (a 6522's RES clears it
+  at once; release starts the CPU's sequence). Held without power only moves the flag.
+- **Power.** Off flushes the disk write-back (VICE `drive_disable`). On from off clears
+  RAM and `cpu_last_data`, then runs the reset sequence with the disk kept.
+- **Stopped — decisions the spec did not state.** (a) A reset pulse reaches a stopped
+  drive (RESET is not a clocked input); it stays stopped, standing at the reset state.
+  (b) ATN edges that arrive while stopped are not latched by VIA1 (its clock is
+  frozen). On release, if ATN ended somewhere other than where the VIA last saw it, the
+  one net edge is delivered — what a clocked edge detector sees on its first tick. ATN
+  low-then-high while stopped delivers nothing.
+- **ROM.** `set_rom(&[u8])`: 16 KiB at `$C000` (lower half zero, see §9), 32 KiB for the
+  whole `$8000-$FFFF`, anything else `RomError::BadDriveRomSize(n)` whose message names
+  the size. Pending until the drive's next power-on (`set_power(true)`, `power_on_reset`); a reset keeps the ROM. `load_rom(dir)` keeps its file names
+  and now goes through `set_rom` (so a 32 K file loads too).
+- **Unit.** `set_unit(8..=11)`, anything else refused by name. Latched into `unit` at
+  the next reset; the jumper bits `read_prb` returns and the bus slot follow `unit`.
+  `drive_peek($1800)` now includes the jumper bits too (it had left them out; 0 for
+  unit 8, so nothing moved).
+- **Accessors.** `ram() -> &[u8]`, `ports() -> DrivePorts` (VIA1 PA/PB-as-read/PB-out,
+  VIA2 PA/PB out, PCR, motor, LED, step phase, density, write mode), `half_track()`,
+  `powered()`, `reset_held()`, `stopped()`, `reset_line_connected()`, `unit()`,
+  `unit_jumpers()`, `part() -> DrivePart`. Write mode is `PCR bit 5 clear`, the bit
+  `via2d_update_pcr` reads. VIA2 PB is the composed `oldpb`, the byte the mechanism
+  acts on; `led_on` is the existing accessor unchanged.
+- **Checkpoint.** A new `drivePart` node (`DrivePart`, camelCase). A checkpoint without
+  it restores `DrivePart::default()` — the stock drive — not whatever the live machine
+  had. The IEC device map is adopted without touching the restored lines.
+- **Daemon.** Untouched; it compiles and behaves as before. No wire verbs (871).
+- **`cia_alarm_check_gate` goldens re-recorded.** Its digests hash the whole checkpoint
+  tree, so the new node moves every one of them. With `drivePart` left out of the
+  capture all twenty digests were the old ones — checked before re-recording — so the
+  machine did not move; only the checkpoint says more (the 843 precedent).
+
+**Gate.** `crates/trx64-core/tests/drive_part_gate.rs`, seven tests over the real KERNAL
+and DOS, each answered through `LOAD"$",n`: off → DEVICE NOT PRESENT and on → power-on
+with the disk kept (§8.1/8.2); held (§8.3); reset line connected / cut (§8.4); ROM 16 K,
+32 K, bad size, file loader (§8.5); unit 9 (§8.6); stopped mid-transfer for 50 frames
+(§8.8); checkpoint round-trip and old-checkpoint defaults (§8.9). Each was shown red
+with its change taken out. §8.7: the 7-game gate 7/7 PASS with all seven screenshots
+byte-identical to main's, the existing drive gates unchanged, `cargo test -p trx64-core`
+616 passed / 0 failed, the daemon suite 381 passed.
+

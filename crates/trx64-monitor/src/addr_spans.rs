@@ -3,7 +3,7 @@
 //! TRX64 holds no symbols; C64RE names addresses. It must never find an address by
 //! parsing a formatted text column, so the runtime says where its addresses are: every
 //! `monitor/exec` reply carries `spans` — per line, the column range, the address, its
-//! space (`c64` | `drive8`) and its role (`pc` | `target` | `operand` | `memory`).
+//! space (`c64` | `drive8` … `drive11`) and its role (`pc` | `target` | `operand` | `memory`).
 //!
 //! The runtime knows those positions because it formatted them. A formatter wraps an
 //! address it prints in an in-band MARK (private-use code points, never printable
@@ -27,14 +27,15 @@ const END: char = '\u{E002}';
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Space {
     C64,
-    Drive8,
+    /// A 1541, by the unit it answers to (Spec 871).
+    Drive(u8),
 }
 
 impl Space {
     fn as_str(self) -> &'static str {
         match self {
             Space::C64 => "c64",
-            Space::Drive8 => "drive8",
+            Space::Drive(u) => crate::host::Device::Drive(u).name(),
         }
     }
 }
@@ -237,9 +238,8 @@ fn parse_meta(meta: &str, line: usize, start: usize, end: usize) -> Option<AddrS
     let mut it = meta.split(',');
     let role = Role::from_str(it.next()?)?;
     let space = match it.next()? {
-        "drive8" => Space::Drive8,
         "c64" => Space::C64,
-        _ => return None,
+        other => Space::Drive(crate::host::Device::drive_unit(other)?),
     };
     let lens = it.next().filter(|l| !l.is_empty()).map(String::from);
     let addr = u16::from_str_radix(it.next()?, 16).ok()?;
@@ -290,7 +290,7 @@ mod tests {
 
     #[test]
     fn a_range_span_carries_its_length_and_lens() {
-        let m = mark("c000", 0xc000, Space::Drive8, Role::Memory, Some("ram"), 32);
+        let m = mark("c000", 0xc000, Space::Drive(8), Role::Memory, Some("ram"), 32);
         let (_, spans) = strip(&format!(">R:{m}  00 01"));
         assert_eq!(spans[0].to_json(), json!({
             "line": 0, "start": 3, "end": 7, "addr": 0xc000, "space": "drive8",

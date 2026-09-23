@@ -539,10 +539,16 @@ pub struct Machine {
     pub cia2: Cia,
     /// Shared CIA timer transition table (Arc → cheap to clone with the Machine).
     pub cia_table: cia::CiaTable,
-    /// 1541 floppy drive (isolation gate: ADR-012). Booted from DOS ROM, no IEC
-    /// wiring to the C64 in Phase 1. Ticked by `run_for_drive_sampled` when the
-    /// `drive8-cpu` trace domain is active.
+    /// Drive position A (Spec 871): the machine's first 1541, on at unit 8 by
+    /// default. The name is historical — since Spec 870 A can stand at unit 8-11, and
+    /// since 871 it has a neighbour; `drive8` stays so every caller keeps working.
+    /// The `drive8-cpu` trace domain and the head trace follow this position.
     pub drive8: Drive1541,
+    /// Drive position B (Spec 871): a second complete 1541 on the same IEC bus, off
+    /// by default with its jumpers at 9. Off it is neither clocked nor on the bus.
+    /// Switch it on through [`Machine::set_drive_power`], which refuses a unit
+    /// number the other position already answers to.
+    pub drive_b: Drive1541,
 
     // ── Full-machine (FullBus) state (ADR-021) ──────────────────────────────
     /// BASIC ROM in a SEPARATE array (the RAM under $A000-$BFFF keeps its DRAM
@@ -606,7 +612,8 @@ pub struct Machine {
     /// released. `session/joystick_set|clear|release_keys` mutate these.
     pub joystick1: crate::keyboard::JoystickState,
     pub joystick2: crate::keyboard::JoystickState,
-    /// Monotonic C64-clock reference the drive has been advanced up to. The
+    /// Monotonic C64-clock reference the drives have been advanced up to — one for
+    /// both positions, which are always caught up together (Spec 871). The
     /// push-flush catch-up advances the drive by `clk - drive_c64_ref` before
     /// sampling/applying the IEC lines on a $DD00 access (= VICE
     /// drive_cpu_execute_one/all at the exact C64 read/write instant).
@@ -787,6 +794,8 @@ pub enum RomError {
     Io(std::io::Error),
     /// ROM file had unexpected size (got, expected).
     BadSize(usize, usize),
+    /// Spec 870 D3 — a 1541 ROM that is neither 16 KiB nor 32 KiB (got).
+    BadDriveRomSize(usize),
 }
 
 impl std::fmt::Display for RomError {
@@ -794,6 +803,10 @@ impl std::fmt::Display for RomError {
         match self {
             RomError::Io(e) => write!(f, "ROM I/O error: {e}"),
             RomError::BadSize(got, exp) => write!(f, "ROM size mismatch: got {got}, expected {exp}"),
+            RomError::BadDriveRomSize(got) => write!(
+                f,
+                "1541 ROM size {got} bytes refused: give 16384 (at $C000) or 32768 ($8000-$FFFF)"
+            ),
         }
     }
 }
@@ -818,6 +831,8 @@ impl Machine {
         let t = model.timing;
         let mut drive8 = Drive1541::new();
         drive8.sync_factor = t.drive_sync_factor;
+        let mut drive_b = Drive1541::new_position_b();
+        drive_b.sync_factor = t.drive_sync_factor;
         Self {
             ram: Box::new([0u8; 0x10000]),
             clk: 0,
@@ -830,6 +845,7 @@ impl Machine {
             cia2: Cia::new_timed(t.cpu_hz, t.tod_hz),
             cia_table: cia::new_table(),
             drive8,
+            drive_b,
             basic_rom: Box::new([0u8; 0x2000]),
             kernal_rom: Box::new([0u8; 0x2000]),
             char_rom: Box::new([0u8; 0x1000]),
@@ -933,6 +949,7 @@ impl Machine {
         self.cia1.set_timing(t.cpu_hz, t.tod_hz);
         self.cia2.set_timing(t.cpu_hz, t.tod_hz);
         self.drive8.sync_factor = t.drive_sync_factor;
+        self.drive_b.sync_factor = t.drive_sync_factor;
         self.model = model;
         Ok(())
     }
@@ -1247,6 +1264,10 @@ impl Machine {
         self.joystick1 = crate::keyboard::JoystickState::default();
         self.joystick2 = crate::keyboard::JoystickState::default();
         self.cia2_pa_out = 0xff;
+        // Spec 870 — the fresh IEC core knows a drive at unit 8; tell it the ones that
+        // are there (another unit, a second drive, or none while off / held). A no-op
+        // on a stock machine.
+        self.sync_drive_slots();
         self.drive_c64_ref = 0;
         // SID: reset register file + voice state to power-on defaults.
         self.sid_regs = [0u8; 32];
@@ -1315,19 +1336,15 @@ impl Machine {
         self.vic.u64_speed_table = table;
         // The fresh VIC has no hold; the reset this IS has to arm it (BUG-061).
         self.arm_u64_reset_hold();
-        // ts:707-708 + ts:773 — reset the 1541 in lockstep with the C64. A warm
-        // reset is the C64's RESET line; the drive has its OWN power, so "the 1541
-        // disk stays mounted" (ts:773). TRX64's `Drive1541::cold_reset` drops the
-        // disk (it models a drive POWER-cycle, drive.rs:602-603), so we preserve +
-        // re-attach the image across the reset to match TS: flush any in-flight
-        // write back into the image bytes first, cold-reset the drive (re-runs its
-        // ROM to a known head/track), then re-mount the same disk.
-        self.drive8.flush_disk_writeback();
-        let mounted_disk = self.drive8.disk.take();
-        self.drive8.cold_reset();
-        if let Some(image) = mounted_disk {
-            self.drive8.attach_disk(image);
-        }
+        // ts:707-708 + ts:773 — the C64's RESET reaches the 1541 over the IEC RESET
+        // line (Spec 870 D2): with the line connected — the default — the drive runs
+        // its own reset sequence (flush a pending write, reset the electronics, keep
+        // the disk); cut, the drive carries on where it was. A drive that is off
+        // ignores it.
+        self.drive8.reset_from_c64();
+        // Spec 871 — the RESET line runs to every device on the bus.
+        self.drive_b.reset_from_c64();
+        self.sync_drive_slots();
         self.sync_snapshot();
     }
 
@@ -1527,6 +1544,7 @@ impl Machine {
             side_effects: Vec::new(),
             read_side_effects: Vec::new(),
             drive: &mut self.drive8,
+            drive_b: &mut self.drive_b,
             iec: &mut self.iec,
             keyboard: &self.keyboard,
             joystick1: self.joystick1,
@@ -1592,6 +1610,7 @@ impl Machine {
             side_effects: Vec::new(),
             read_side_effects: Vec::new(),
             drive: &mut self.drive8,
+            drive_b: &mut self.drive_b,
             iec: &mut self.iec,
             keyboard: &self.keyboard,
             joystick1: self.joystick1,
@@ -1900,6 +1919,7 @@ impl Machine {
                 side_effects: Vec::new(),
                 read_side_effects: Vec::new(),
                 drive: &mut self.drive8,
+                drive_b: &mut self.drive_b,
                 iec: &mut self.iec,
                 keyboard: &self.keyboard,
                 joystick1: self.joystick1,
@@ -2099,10 +2119,7 @@ impl Machine {
             self.cia1.update_to(clk, &table);
             self.cia2.update_to(clk, &table);
             self.sid.tick(clk.wrapping_sub(start), &self.sid_regs);
-            self.drive8.iec_drv_port = self.iec.iecbus.drv_port;
-            self.drive8.iec_cpu_bus = self.iec.iecbus.cpu_bus;
-            self.drive_c64_ref = self.drive8.catch_up_to(clk, self.drive_c64_ref);
-            self.iec.iec_drive_write((!self.drive8.via1_pb_iec_output()) & 0xff, 0);
+            self.catch_up_drives(clk);
         } else {
             self.drive_c64_ref = clk;
         }
@@ -2787,6 +2804,116 @@ impl Machine {
         self.clk
     }
 
+    // ── Spec 871 — two drive positions on one bus ────────────────────────────────
+
+    /// Put the IEC core's device map in step with both drive positions. A compare
+    /// when nothing changed, which on the stock machine is always.
+    pub fn sync_drive_slots(&mut self) {
+        let (a, b) = crate::drive::pair_bus_slots(&self.drive8, &self.drive_b);
+        self.iec.sync_drive_slots(a, b, self.cia2_pa_out);
+    }
+
+    /// Catch both drive positions up to the C64 clock `clk`, then fold both ports into
+    /// the bus — the sync point at the end of every instruction (Spec 871 D2).
+    #[inline]
+    pub(crate) fn catch_up_drives(&mut self, clk: u64) {
+        self.drive_c64_ref = crate::drive::pair_catch_up(
+            &mut self.drive8,
+            &mut self.drive_b,
+            &mut self.iec,
+            clk,
+            self.drive_c64_ref,
+            self.cia2_pa_out,
+        );
+        crate::drive::pair_fold_into_iec(&self.drive8, &self.drive_b, &mut self.iec, self.cia2_pa_out);
+    }
+
+    /// The drive in position `pos`.
+    pub fn drive(&self, pos: crate::drive::DrivePosition) -> &Drive1541 {
+        match pos {
+            crate::drive::DrivePosition::A => &self.drive8,
+            crate::drive::DrivePosition::B => &self.drive_b,
+        }
+    }
+
+    /// The drive in position `pos`, mutable. Its own setters do not know the other
+    /// position: switch power and set the unit through [`Self::set_drive_power`] /
+    /// [`Self::set_drive_unit`], which refuse a collision.
+    pub fn drive_mut(&mut self, pos: crate::drive::DrivePosition) -> &mut Drive1541 {
+        match pos {
+            crate::drive::DrivePosition::A => &mut self.drive8,
+            crate::drive::DrivePosition::B => &mut self.drive_b,
+        }
+    }
+
+    /// The position whose powered drive answers to `unit` — what `LOAD"$",9`
+    /// reaches. `None`: no powered drive there.
+    pub fn position_at_unit(&self, unit: u8) -> Option<crate::drive::DrivePosition> {
+        use crate::drive::DrivePosition::{A, B};
+        [A, B].into_iter().find(|&p| {
+            let d = self.drive(p);
+            d.powered() && d.unit() == unit
+        })
+    }
+
+    /// The position a unit number names for MEDIA: the powered drive answering
+    /// there, else a drive that is off but whose jumpers stand at that unit (a disk
+    /// can go into a drive that is switched off). `None`: no position is at `unit`.
+    pub fn position_for_media(&self, unit: u8) -> Option<crate::drive::DrivePosition> {
+        use crate::drive::DrivePosition::{A, B};
+        self.position_at_unit(unit).or_else(|| {
+            [A, B].into_iter().find(|&p| {
+                let d = self.drive(p);
+                !d.powered() && d.unit_jumpers() == unit
+            })
+        })
+    }
+
+    /// The other position's claim on `unit`, if it has one: powered, and answering to
+    /// `unit` now or from its next reset.
+    fn unit_claimed_by_other(&self, pos: crate::drive::DrivePosition, unit: u8) -> Option<String> {
+        use crate::drive::DrivePosition::{A, B};
+        let other = if pos == A { B } else { A };
+        let d = self.drive(other);
+        if d.powered() && (d.unit() == unit || d.unit_jumpers() == unit) {
+            Some(format!(
+                "drive position {} cannot answer to unit {unit}: position {} is powered at unit {unit}",
+                pos.name(),
+                other.name()
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Spec 871 D2 — switch the drive in `pos` on or off (Spec 870 D1 semantics).
+    /// Switching on is refused, naming the other position, when that position is
+    /// powered at the unit this drive's jumpers would bring it up at: two devices at
+    /// one address produce collisions no program relies on. Nothing changes then.
+    pub fn set_drive_power(&mut self, pos: crate::drive::DrivePosition, on: bool) -> Result<(), String> {
+        if on && !self.drive(pos).powered() {
+            let unit = self.drive(pos).unit_jumpers();
+            if let Some(e) = self.unit_claimed_by_other(pos, unit) {
+                return Err(e);
+            }
+        }
+        self.drive_mut(pos).set_power(on);
+        self.sync_drive_slots();
+        Ok(())
+    }
+
+    /// Spec 871 D2 — set the jumpers of the drive in `pos` (Spec 870 D4: in force at
+    /// its next reset). Refused, naming the other position, when this drive is
+    /// powered and the other position is powered at `unit`.
+    pub fn set_drive_unit(&mut self, pos: crate::drive::DrivePosition, unit: u8) -> Result<(), String> {
+        if self.drive(pos).powered() {
+            if let Some(e) = self.unit_claimed_by_other(pos, unit) {
+                return Err(e);
+            }
+        }
+        self.drive_mut(pos).set_unit(unit)
+    }
+
     /// Load all three standard C64 ROMs from `rom_dir` and perform a cold reset.
     /// Also loads the 1541 DOS ROM for the drive8 emulator (non-fatal if absent).
     ///
@@ -2810,7 +2937,18 @@ impl Machine {
         // Drive ROM: non-fatal — if absent the drive runs with zeroed ROM
         // (bus open; CPU will JAM immediately, which is a valid isolated state).
         let _ = self.drive8.load_rom(rom_dir);
-        self.drive8.cold_reset();
+        // The machine's power-on is the drive's power-on too: the ROM comes into force.
+        self.drive8.power_on_reset();
+        // Spec 871 — position B gets the same DOS. Its ROM, too, comes into force at
+        // B's power-on: here if B is on with the machine, else when it is switched on
+        // (`set_power`). Off, its reset is state only; nothing runs.
+        let _ = self.drive_b.load_rom(rom_dir);
+        if self.drive_b.powered() {
+            self.drive_b.power_on_reset();
+        } else {
+            self.drive_b.cold_reset();
+        }
+        self.sync_drive_slots();
         Ok(())
     }
 
@@ -3183,6 +3321,7 @@ impl Machine {
                     side_effects: Vec::new(),
                     read_side_effects: Vec::new(),
                     drive: &mut self.drive8,
+                    drive_b: &mut self.drive_b,
                     iec: &mut self.iec,
                     keyboard: &self.keyboard,
                     joystick1: self.joystick1,
@@ -3300,12 +3439,11 @@ impl Machine {
             // live bus state in first (so the drive's PB reads see the C64 lines),
             // then re-fold the drive's PB output into the IEC core for the next
             // instruction's $DD00 reads.
-            self.drive8.iec_drv_port = self.iec.iecbus.drv_port;
-            self.drive8.iec_cpu_bus = self.iec.iecbus.cpu_bus;
-            self.drive_c64_ref = self.drive8.catch_up_to(self.c64_core.clk, self.drive_c64_ref);
             // = via1d1541.c store_prb / iec_drive_write(~byte): fold the drive's PB
             // output (inverted) into the bus + iec_update_ports for the next $DD00 read.
-            self.iec.iec_drive_write((!self.drive8.via1_pb_iec_output()) & 0xff, 0);
+            // Spec 870: into the drive's own slot, and not at all while it is off or held.
+            // Spec 871: both positions caught up first, then both folded.
+            self.catch_up_drives(self.c64_core.clk);
             if let Some((pc, a, x, y, sp, p, drv_clk)) = self.drive8.sample_pc_change() {
                 on_drive_step(pc, a, x, y, sp, p, drv_clk);
                 // Spec 784 — armed-on-command 1541 head-position sample (loader-lens

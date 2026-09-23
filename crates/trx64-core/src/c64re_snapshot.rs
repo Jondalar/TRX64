@@ -1474,7 +1474,7 @@ pub fn capture_runtime_checkpoint_with(
     let omit_framebuffer = opts.omit_framebuffer;
     use serde_json::json;
     let keys = m.keyboard.pressed_keys();
-    json!({
+    let mut tree = json!({
         "schemaVersion": RUNTIME_CHECKPOINT_SCHEMA_VERSION,
         "atInstructionBoundary": true,
         "cpu": serde_json::to_value(capture_cpu(m)).unwrap(),
@@ -1503,6 +1503,9 @@ pub fn capture_runtime_checkpoint_with(
         // against whichever split happened to be last when the frame ended.
         "vicProvenance": capture_vic_provenance(m),
         "drive1541": drive1541.map(ta_u8).unwrap_or(serde_json::Value::Null),
+        // Spec 870 — power / held / stopped / reset line / unit. Additive: a
+        // checkpoint without it restores the stock drive (on, connected, unit 8).
+        "drivePart": serde_json::to_value(m.drive8.part()).unwrap(),
         "driveDiskImage": drive_disk_image.map(ta_u8).unwrap_or(serde_json::Value::Null),
         // Spec 714.5 (formats-state-2): the attached cartridge's original .crt bytes +
         // mutable flash image, as `{ $ta }` typed-array nodes (null = no cart / no
@@ -1526,7 +1529,101 @@ pub fn capture_runtime_checkpoint_with(
         "expansion": expansion_node(m, opts.omit_expansion_ram),
         "media": { "diskPath": disk_path, "imageFormat": image_format },
         "audio": serde_json::Value::Null,
-    })
+    });
+    // Spec 871 — drive position B. Omitted while B is as a machine is built (off, no
+    // disk, stock part), so every checkpoint of a one-drive machine is the one it was.
+    if let Some(node) = drive_b_node(m) {
+        tree["driveB"] = node;
+    }
+    tree
+}
+
+/// Spec 871 — position B's whole state: its part (`drivePart` shape), the drive core
+/// blob, its disk as written (the host keeps no record of B's medium, so the image
+/// itself rides) and the GCR overlay. `None` when B is off with no disk and its
+/// stock part — the node a one-drive machine does not carry.
+fn drive_b_node(m: &Machine) -> Option<serde_json::Value> {
+    use crate::drive::{DiskKind, DrivePart, DrivePosition};
+    use serde_json::json;
+    let b = &m.drive_b;
+    let part = b.part();
+    if part == DrivePart::default_for(DrivePosition::B) && b.disk.is_none() {
+        return None;
+    }
+    // `capture_drive1541` re-syncs the VIA clocks before it reads them; do that on a
+    // copy so a capture never touches the machine it describes.
+    let mut copy = b.clone();
+    let blob = crate::drive_snapshot::capture_drive1541(&mut copy);
+    // From the copy: the capture caught its rotation up, which in write mode puts
+    // bits on the track — the image and the overlay must be that disk. The image is
+    // the one a persist would write now (every written track folded in), so a
+    // restore mounts it whole and nothing depends on what was dirty at the capture.
+    let disk = copy.disk_as_written().map(|d| {
+        json!({
+            "kind": match d.kind { DiskKind::D64 => "d64", DiskKind::G64 => "g64" },
+            "bytes": ta_u8(&d.bytes),
+            "backingPath": d.backing_path,
+            "readOnly": d.read_only,
+        })
+    });
+    let overlay = crate::drive_snapshot::capture_drive_disk_image(&copy);
+    Some(json!({
+        "drivePart": serde_json::to_value(part).unwrap(),
+        "drive1541": ta_u8(&blob),
+        "disk": disk.unwrap_or(serde_json::Value::Null),
+        "driveDiskImage": overlay.map(|o| ta_u8(&o)).unwrap_or(serde_json::Value::Null),
+    }))
+}
+
+/// Spec 871 — restore position B from its node, or put B back as a machine is built
+/// when the checkpoint has none (a checkpoint from before 871, or of a one-drive
+/// machine): off, no disk, jumpers at 9. B's ROM and sync factor are the machine's
+/// and stay.
+fn restore_drive_b(m: &mut Machine, node: Option<&serde_json::Value>) -> Result<(), String> {
+    use crate::drive::{DiskImage, DiskKind, DrivePart, DrivePosition};
+    let node = node.filter(|v| !v.is_null());
+    let b = &mut m.drive_b;
+    let Some(node) = node else {
+        if b.part() != DrivePart::default_for(DrivePosition::B) || b.disk.is_some() {
+            b.detach_disk();
+            b.restore_part(&DrivePart::default_for(DrivePosition::B))?;
+        }
+        return Ok(());
+    };
+    let was_powered = b.powered();
+    b.detach_disk();
+    if let Some(d) = node.get("disk").filter(|v| !v.is_null()) {
+        let bytes = d.get("bytes").and_then(ta_u8_decode).ok_or("restore driveB: disk without bytes")?;
+        let kind = match d.get("kind").and_then(|k| k.as_str()) {
+            Some("g64") => DiskKind::G64,
+            _ => DiskKind::D64,
+        };
+        b.attach_disk(DiskImage {
+            kind,
+            bytes,
+            backing_path: d.get("backingPath").and_then(|p| p.as_str()).map(str::to_string),
+            read_only: d.get("readOnly").and_then(|r| r.as_bool()).unwrap_or(false),
+        });
+    }
+    if let Some(blob) = node.get("drive1541").and_then(ta_u8_decode) {
+        crate::drive_snapshot::restore_drive1541(b, &blob)?;
+    }
+    if let Some(overlay) = node.get("driveDiskImage").and_then(ta_u8_decode) {
+        crate::drive_snapshot::restore_drive_disk_image(b, &overlay)?;
+    }
+    let part = match node.get("drivePart") {
+        Some(v) if !v.is_null() => serde_json::from_value::<DrivePart>(v.clone())
+            .map_err(|e| format!("restore driveB.drivePart: {e}"))?,
+        _ => DrivePart::default_for(DrivePosition::B),
+    };
+    b.restore_part(&part)?;
+    // The ROM is not in a checkpoint (Spec 870 §9): the host gives it. A B that the
+    // restore switches on had no power here, so the ROM it was given has not come into
+    // force yet — the restore is its power-on for that purpose.
+    if !was_powered && b.powered() {
+        b.latch_rom();
+    }
+    Ok(())
 }
 
 /// Spec 853 D6 — `{ kind, sizeKb, regs, ram }`, or Null with no device on the port.
@@ -1704,8 +1801,10 @@ pub fn restore_runtime_checkpoint(
 
     // Drive restore (part 4): the `drive1541` core blob (DRIVE8/DRIVECPU0/VIA1/VIA2)
     // then the `driveDiskImage` GCRIMAGE0 overlay. The caller (daemon) has already
-    // re-attached the embedded disk before this point, so the drive's GCR baseline
-    // is present; `restore_drive_disk_image` overlays the mutable content (§6.1
+    // re-attached the embedded disk before this point — the image as written
+    // (`Drive1541::disk_as_written` at the capture), so it is also the write-back
+    // image a later persist writes — and the drive's GCR baseline is present;
+    // `restore_drive_disk_image` overlays the head/rotation-exact GCR (§6.1
     // mutable-wins). A null/absent drive blob leaves the drive at its baseline.
     let drive_blob = cp.get("drive1541").and_then(ta_u8_decode);
     if let Some(ref blob) = drive_blob {
@@ -1713,6 +1812,28 @@ pub fn restore_runtime_checkpoint(
     }
     if let Some(disk_blob) = cp.get("driveDiskImage").and_then(ta_u8_decode) {
         crate::drive_snapshot::restore_drive_disk_image(&mut m.drive8, &disk_blob)?;
+    }
+    // Spec 870 — the drive as a part. Absent (a checkpoint from before 870) means the
+    // stock drive, NOT "keep whatever the live machine had": a restore is the state it
+    // names. The IEC core's device map follows, without touching the lines the `iec`
+    // node just restored — they were captured with that map in force.
+    let part = match cp.get("drivePart") {
+        Some(v) if !v.is_null() => serde_json::from_value::<crate::drive::DrivePart>(v.clone())
+            .map_err(|e| format!("restore drivePart: {e}"))?,
+        _ => crate::drive::DrivePart::default(),
+    };
+    m.drive8.restore_part(&part)?;
+    // Spec 871 — position B, then the device map for both.
+    restore_drive_b(m, cp.get("driveB"))?;
+    let (slot, slot_b) = crate::drive::pair_bus_slots(&m.drive8, &m.drive_b);
+    if m.iec.drive_slot != slot || m.iec.drive_slot_b != slot_b {
+        m.iec.adopt_drive_slots(slot, slot_b);
+        if slot.is_none() && slot_b.is_none() {
+            // Conf0 reads the C64's own lines from `iec_fast_1541`, which no checkpoint
+            // carries: seed it from the restored CIA2 port A, as a `$DD00` write would.
+            let pa = m.cia2.peek(0xdd00) | !m.cia2.peek(0xdd02);
+            m.iec.iecbus_cpu_write_conf0(!pa, 0);
+        }
     }
 
     // Re-anchor the drive's C64-clock catch-up reference to the restored anchor

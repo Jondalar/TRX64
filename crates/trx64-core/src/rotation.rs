@@ -205,8 +205,9 @@ pub struct Rotation {
 
     // ── write-back target (the raw on-disk image bytes) ──────────────────────
     /// The raw `.g64`/`.d64` image bytes the dirty GCR track is serialized back
-    /// into (= VICE `fsimage->fd`). Mirrors `DiskImage.bytes`; populated at
-    /// [`attach`]. `None` ⇒ no write-back target (the in-memory GCR is the only
+    /// into (= VICE `fsimage->fd`). Populated at [`attach`]; the drive's
+    /// `DiskImage.bytes` is a copy that `Drive1541::flush_disk_writeback` brings up
+    /// to it (see `writeback_gen`). `None` ⇒ no write-back target (the in-memory GCR is the only
     /// copy, e.g. a snapshot-restored disk before its bytes are wired).
     pub writeback_bytes: Option<Vec<u8>>,
     /// Image format for the write-back dispatch (G64 byte serialization vs D64
@@ -217,6 +218,11 @@ pub struct Rotation {
     /// serializes THIS half-track (= VICE `drive_gcr_data_writeback` flushing
     /// `current_half_track` at the moment the head is about to move).
     pub dirty_half_track: u32,
+    /// Counts the tracks folded into `writeback_bytes`, so a holder of a copy of
+    /// that image (the drive's `DiskImage`) can tell it has fallen behind — a head
+    /// move folds a track in without anyone asking. Not VICE state: VICE's
+    /// `fsimage->fd` is the only copy.
+    pub writeback_gen: u64,
 
     /// Spec 784 loader-lens — NON-VICE, PASSIVE instrumentation. Monotonic count of
     /// GCR data bytes the drive has latched off the disk surface (bumped once per
@@ -297,6 +303,7 @@ impl Rotation {
             writeback_bytes: None,
             writeback_kind: None,
             dirty_half_track: 0,
+            writeback_gen: 0,
             gcr_read_count: 0,
         }
     }
@@ -1049,22 +1056,47 @@ impl Rotation {
         // equals `current_half_track` here (the flush precedes the step).
         let half_track = self.dirty_half_track as usize;
 
+        // No write-back target wired (e.g. snapshot-restored disk): the in-memory
+        // GCR already carries the write; nothing to serialize.
+        let folded = match self.writeback_bytes.take() {
+            Some(mut bytes) => {
+                let folded = self.fold_dirty_track(&mut bytes, half_track);
+                self.writeback_bytes = Some(bytes);
+                folded
+            }
+            None => false,
+        };
         // Always clear the dirty flag (matches every VICE return path).
         self.gcr_dirty_track = 0;
+        if folded {
+            self.writeback_gen = self.writeback_gen.wrapping_add(1);
+        }
+        folded
+    }
 
-        let (bytes, kind, read_only) = match (
-            self.writeback_bytes.as_mut(),
-            self.writeback_kind,
-        ) {
-            (Some(b), Some(k)) => (b, k, self.read_only != 0),
-            // No write-back target wired (e.g. snapshot-restored disk). The
-            // in-memory GCR already carries the write; nothing to serialize.
-            _ => return false,
-        };
+    /// Serialize `half_track`'s GCR into `bytes` in the mounted format — the one
+    /// encoder of the write-back, shared by the flush above and by
+    /// [`Self::writeback_image`]. False when there is no format to write in.
+    fn fold_dirty_track(&self, bytes: &mut Vec<u8>, half_track: usize) -> bool {
+        match (self.image.as_ref(), self.writeback_kind) {
+            (Some(image), Some(kind)) => {
+                image.write_half_track(kind, bytes, half_track, self.read_only != 0);
+                true
+            }
+            _ => false,
+        }
+    }
 
-        let image = self.image.as_ref().expect("image present (checked above)");
-        image.write_half_track(kind, bytes, half_track, read_only);
-        true
+    /// The on-disk image as a write-back would leave it now: the write-back image
+    /// with the pending dirty track folded in, built on a copy. Nothing on the
+    /// drive changes — the dirty track stays dirty, the write-back image stays as it
+    /// is. `None` without a write-back target.
+    pub fn writeback_image(&self) -> Option<Vec<u8>> {
+        let mut bytes = self.writeback_bytes.clone()?;
+        if self.image.is_some() && self.gcr_dirty_track != 0 {
+            self.fold_dirty_track(&mut bytes, self.dirty_half_track as usize);
+        }
+        Some(bytes)
     }
 
     /// Flush ALL pending dirty tracks (= VICE `drive_gcr_data_writeback_all`,

@@ -206,6 +206,9 @@ pub struct FullBus<'a> {
     /// The 1541 drive — borrowed so a $DD00 access can push-flush it to the exact
     /// C64 clock before sampling/applying the IEC lines (cross-domain sync).
     pub drive: &'a mut crate::drive::Drive1541,
+    /// Spec 871 — drive position B, on the same bus. Off by default: not clocked,
+    /// not folded.
+    pub drive_b: &'a mut crate::drive::Drive1541,
     /// IEC wired-AND core (C64 CIA2 PA ↔ drive VIA1 PB), borrowed from the Machine.
     pub iec: &'a mut crate::iec::IecCore,
     /// Keyboard matrix (CIA1 PA column drive ↔ PB row read). Read on a $DC01
@@ -217,7 +220,8 @@ pub struct FullBus<'a> {
     /// Joystick port 2 (CIA1 PA bits 0-4, active-low), folded into the $DC00 PA
     /// read. 1:1 with c64re `joystick2`. Copied by value (read-only this cycle).
     pub joystick2: crate::keyboard::JoystickState,
-    /// Monotonic C64-clock the drive has been advanced up to (push-flush reference).
+    /// Monotonic C64-clock the drives have been advanced up to (push-flush
+    /// reference). One for both positions: they are always caught up together.
     pub drive_c64_ref: u64,
     /// The attached cartridge mapper (= memory-bus.ts `cartridge`, ts:118), or
     /// None for the stock no-cart machine. Borrowed `&mut` because a $DE00-$DFFF
@@ -396,8 +400,9 @@ impl<'a> FullBus<'a> {
         // VICE via1d1541.c store_prb / iec_drive_write(~byte): the drive's PB
         // output folds into the bus as `~pb_out` (iec.rs iec_drive_write inverts via
         // the `~data ^ cpu_bus` formula by receiving the already-inverted byte).
-        let pb_out = self.drive.via1_pb_iec_output();
-        self.iec.iec_drive_write((!pb_out) & 0xff, 0);
+        // Spec 870: into the drive's own slot, and not at all while it is off or held.
+        // Spec 871: both positions, each into its slot.
+        crate::drive::pair_fold_into_iec(self.drive, self.drive_b, self.iec, self.cia2_pa_out);
     }
 
     /// Catch the drive up to `target` and refresh `drv_data_8` from its live VIA1
@@ -416,11 +421,15 @@ impl<'a> FullBus<'a> {
         // C64-side intent (cpu_bus) — constant across this catch-up — so a `$1800`
         // STORE inside the run re-folds the wired-AND and the drive sees its own
         // CLK/DATA pull on the next read (= via1d1541.c store_prb cross-domain sync).
-        self.drive.iec_drv_port = self.iec.iecbus.drv_port;
-        self.drive.iec_cpu_bus = self.iec.iecbus.cpu_bus;
-        self.drive_c64_ref = self.drive.catch_up_to(target, self.drive_c64_ref);
-        let pb_out = self.drive.via1_pb_iec_output();
-        self.iec.drive_set_data_no_fold(pb_out);
+        // Spec 871: both drive positions are caught up before either is written back.
+        self.drive_c64_ref = crate::drive::pair_catch_up(
+            self.drive,
+            self.drive_b,
+            self.iec,
+            target,
+            self.drive_c64_ref,
+            self.cia2_pa_out,
+        );
     }
 
     /// I/O read dispatch ($D000-$DFFF, IO config). Mirrors memory-bus.ts read().
@@ -704,13 +713,13 @@ impl<'a> FullBus<'a> {
                         // the drive clock the push-flush just reached. The hardware
                         // ATN-acknowledge (drive auto-pulls DATA) is already folded by
                         // the recompute_drv_bus cpu_bus term inside the conf1 write.
-                        for (_dnr, edge) in atn_edges {
+                        for (dnr, edge) in atn_edges {
                             if let crate::iec::AtnEdge::Via1Ca1 { sig } = edge {
-                                let dclk = self.drive.drive_clk;
-                                self.drive.atn_edge_to_via1_ca1(sig, dclk);
+                                // Spec 871: to the drive at that unit — both see ATN.
+                                crate::drive::pair_deliver_atn(self.drive, self.drive_b, dnr, sig);
                             }
                             // Other AtnEdge variants (1581/2000/4000/CMDHD) are
-                            // unreachable in the single-1541 shape (unit 8 = Drive1541).
+                            // unreachable: both drive positions are 1541s.
                         }
                     }
                 }
@@ -1204,6 +1213,7 @@ mod joystick_gate_tests {
         sid_host: &'a mut crate::sid::SidHostAccess,
         mct: &'a [MemConfig; 32],
         drive: &'a mut crate::drive::Drive1541,
+        drive_b: &'a mut crate::drive::Drive1541,
         iec: &'a mut crate::iec::IecCore,
         kb: &'a KeyboardMatrix,
         joy1: JoystickState,
@@ -1237,6 +1247,7 @@ mod joystick_gate_tests {
             side_effects: Vec::new(),
             read_side_effects: Vec::new(),
             drive,
+            drive_b,
             iec,
             keyboard: kb,
             joystick1: joy1,
@@ -1278,6 +1289,7 @@ mod joystick_gate_tests {
         let mut sid_host = crate::sid::SidHostAccess::default();
         let mct = build_memconfig_table();
         let mut drive = crate::drive::Drive1541::new();
+        let mut drive_b = crate::drive::Drive1541::new_position_b();
         let mut iec = crate::iec::IecCore::new();
         let kb = KeyboardMatrix::new();
 
@@ -1285,7 +1297,7 @@ mod joystick_gate_tests {
         {
             let mut bus = make_bus(
                 &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
-                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut iec,
+                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut drive_b, &mut iec,
                 &kb, JoystickState::default(), JoystickState::default(),
             );
             assert_eq!(bus.io_read(0xdc00), 0xff, "released joy2 → all PA bits high");
@@ -1295,7 +1307,7 @@ mod joystick_gate_tests {
             let joy2 = JoystickState { fire: true, ..Default::default() };
             let mut bus = make_bus(
                 &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
-                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut iec,
+                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut drive_b, &mut iec,
                 &kb, JoystickState::default(), joy2,
             );
             assert_eq!(bus.io_read(0xdc00), 0xff & !(1 << 4), "joy2 fire → PA bit4 low");
@@ -1305,7 +1317,7 @@ mod joystick_gate_tests {
             let joy2 = JoystickState { up: true, left: true, ..Default::default() };
             let mut bus = make_bus(
                 &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
-                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut iec,
+                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut drive_b, &mut iec,
                 &kb, JoystickState::default(), joy2,
             );
             assert_eq!(bus.io_read(0xdc00), 0xff & !0x05, "joy2 up+left → PA bits 0+2 low");
@@ -1343,6 +1355,7 @@ mod joystick_gate_tests {
         let mut sid_host = crate::sid::SidHostAccess::default();
         let mct = build_memconfig_table();
         let mut drive = crate::drive::Drive1541::new();
+        let mut drive_b = crate::drive::Drive1541::new_position_b();
         let mut iec = crate::iec::IecCore::new();
 
         let mut kb = KeyboardMatrix::new();
@@ -1350,7 +1363,7 @@ mod joystick_gate_tests {
 
         let mut bus = make_bus(
             &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
-            &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut iec,
+            &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut drive_b, &mut iec,
             &kb, JoystickState::default(), JoystickState::default(),
         );
 
@@ -1397,13 +1410,14 @@ mod joystick_gate_tests {
         let mut sid_host = crate::sid::SidHostAccess::default();
         let mct = build_memconfig_table();
         let mut drive = crate::drive::Drive1541::new();
+        let mut drive_b = crate::drive::Drive1541::new_position_b();
         let mut iec = crate::iec::IecCore::new();
         let kb = KeyboardMatrix::new();
 
         {
             let mut bus = make_bus(
                 &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
-                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut iec,
+                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut drive_b, &mut iec,
                 &kb, JoystickState::default(), JoystickState::default(),
             );
             assert_eq!(bus.io_read(0xdc01), 0xff, "released joy1 → all PB bits high");
@@ -1413,7 +1427,7 @@ mod joystick_gate_tests {
             let joy1 = JoystickState { right: true, ..Default::default() };
             let mut bus = make_bus(
                 &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
-                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut iec,
+                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut drive_b, &mut iec,
                 &kb, joy1, JoystickState::default(),
             );
             assert_eq!(bus.io_read(0xdc01), 0xff & !(1 << 3), "joy1 right → PB bit3 low");
@@ -1423,7 +1437,7 @@ mod joystick_gate_tests {
             let joy1 = JoystickState { down: true, fire: true, ..Default::default() };
             let mut bus = make_bus(
                 &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
-                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut iec,
+                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut drive_b, &mut iec,
                 &kb, joy1, JoystickState::default(),
             );
             assert_eq!(bus.io_read(0xdc01), 0xff & !0x12, "joy1 down+fire → PB bits 1+4 low");

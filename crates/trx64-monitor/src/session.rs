@@ -102,9 +102,9 @@ pub struct MonitorState {
     pub disasm_cursor: Option<u16>,
     pub sidefx_on: bool,
     /// Sticky inspect target (= monitor-shell `deviceSel`, default "c64"). When
-    /// "drive8" the read-inspect verbs `r`/`m`/`d` target the 1541 drive CPU
+    /// "drive8" / "drive9" … the read-inspect verbs `r`/`m`/`d` target that 1541's CPU
     /// (read-inspect ONLY — Spec 754 §3.3i); other verbs are blocked with a clear
-    /// message. `device c64|drive8` (or `dev`) flips it.
+    /// message. `device c64|drive<unit>` (or `dev`) flips it.
     pub device: String,
     /// Spec 754 §3.3c — modal assemble cursor (= monitor-shell `asmCursors`). When
     /// `Some(addr)` the monitor is in VICE-style `a` assemble mode: EVERY line is an

@@ -19,21 +19,31 @@ use trx64_core::Machine;
 pub enum Device {
     /// The C64's 6510.
     C64,
-    /// The 1541's 6502. On both hosts this is `Machine::drive8` — UE2 swaps the real
-    /// drive in and out of it, so the device means the same thing on both.
-    Drive8,
+    /// A 1541's 6502, by the unit it answers to (Spec 871): `drive8`, `drive9`, … —
+    /// whichever of the machine's two drive positions is powered at that unit. On UE2
+    /// the real drive is swapped in and out of position A, so the device means the
+    /// same thing on both hosts.
+    Drive(u8),
     /// Anything a host adds. The str is the name the user types after `device`.
     Host(&'static str),
 }
+
+/// The names `Device::Drive` answers to, unit 8 first.
+const DRIVE_NAMES: [&str; 4] = ["drive8", "drive9", "drive10", "drive11"];
 
 impl Device {
     /// The name the user types, and the name the monitor prints.
     pub fn name(&self) -> &'static str {
         match self {
             Device::C64 => "c64",
-            Device::Drive8 => "drive8",
+            Device::Drive(u) => DRIVE_NAMES.get((*u as usize).wrapping_sub(8)).copied().unwrap_or("drive?"),
             Device::Host(n) => n,
         }
+    }
+
+    /// The unit a `drive<N>` device name selects, whether or not a drive is there now.
+    pub fn drive_unit(name: &str) -> Option<u8> {
+        DRIVE_NAMES.iter().position(|n| *n == name).map(|i| 8 + i as u8)
     }
 
     /// The device that name selects, among the ones this host offers. `None` is "no such
@@ -208,7 +218,7 @@ pub trait MonitorHost {
     // ── devices ──────────────────────────────────────────────────────────────
 
     /// A device's CPU view. The default answers nothing: the verbs that have moved
-    /// reach the two 6502s through [`Self::machine`] and `machine().drive8`, exactly as
+    /// reach the 6502s through [`Self::machine`] and its drive positions, exactly as
     /// they did before the extraction, and a host adds a view when it has a CPU those
     /// cannot reach — the second host's 32-bit firmware core is the case this exists
     /// for.
@@ -216,9 +226,19 @@ pub trait MonitorHost {
         None
     }
 
-    /// The devices `device` will accept, for the error message and for `help`.
-    fn devices(&self) -> Vec<Device> {
-        vec![Device::C64, Device::Drive8]
+    /// The devices `device` will accept, for the error message and for `help`: the C64
+    /// and a `drive<unit>` for every drive position that is powered (Spec 871) — the
+    /// drives the machine has on its bus.
+    fn devices(&mut self) -> Vec<Device> {
+        let m = self.machine();
+        let mut out = vec![Device::C64];
+        for pos in [trx64_core::drive::DrivePosition::A, trx64_core::drive::DrivePosition::B] {
+            let d = m.drive(pos);
+            if d.powered() {
+                out.push(Device::Drive(d.unit()));
+            }
+        }
+        out
     }
 
     // ── running ──────────────────────────────────────────────────────────────
