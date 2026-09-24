@@ -1530,6 +1530,13 @@ pub fn capture_runtime_checkpoint_with(
         "media": { "diskPath": disk_path, "imageFormat": image_format },
         "audio": serde_json::Value::Null,
     });
+    // Spec 876 D6 — the POT lines: what is set on each port, the latch and the boundary
+    // it reflects. Omitted while nothing is set and the latch reads open, so every
+    // checkpoint of a machine without POT input is the one it was. The `paddles` node
+    // above is the TS shape's constant and stays one.
+    if let Some(node) = m.pot.checkpoint() {
+        tree["pot"] = node;
+    }
     // Spec 871 — drive position B. Omitted while B is as a machine is built (off, no
     // disk, stock part), so every checkpoint of a one-drive machine is the one it was.
     if let Some(node) = drive_b_node(m) {
@@ -2021,6 +2028,13 @@ pub fn restore_runtime_checkpoint(
     // Sync the legacy shadow + machine clk (matches vsf load tail).
     m.sync_after_monitor();
     m.clk = m.c64_core.clk;
+
+    // Spec 876 D6 — the POT lines, exactly; without a node (an older checkpoint, or the
+    // default) nothing is set and the latch reads open from the restored clock on.
+    match cp.get("pot") {
+        Some(node) if !node.is_null() => m.pot.restore(node)?,
+        _ => m.pot.reset_to_default(m.c64_core.clk),
+    }
 
     // Drive restore (part 4): the `drive1541` core blob (DRIVE8/DRIVECPU0/VIA1/VIA2)
     // then the `driveDiskImage` GCRIMAGE0 overlay. The caller (daemon) has already

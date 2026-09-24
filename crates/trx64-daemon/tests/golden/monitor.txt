@@ -25,6 +25,7 @@ monitor (VICE-superset):
     io [1|addr]      I/O area per device: register hex (peek) + state details (VICE io)
     iec              the serial bus: ATN/CLK/DATA, their level, and WHICH side is pulling each one low, plus both ends as their CPUs see them ($DD00 and the 1541's $1800). A released line is high and any device may pull it low, so "who is low" is per-device, not a bus-wide state. Answers the only question an IEC stall ever asks.
     folder [unit]    a folder device on the bus: its protocol state, open channels and last status
+    pot [<1|2> <x> <y> | <1|2> off]  the POT lines ($D419/$D41A): the selection CIA1 drives, each port's value or open, what a read answers now, cycles to the next sample, reads. With a port: set its x/y bytes (final, $FF = open) or clear it
     bitmap <a> [w h] [hires|charset|sprite]  render a RAM range to a PNG (scrub gfx)
     bank [lens]      show/set the sticky default lens for m/d
     wr [lens] <a> <b..>  write exactly these bytes from a
@@ -607,7 +608,7 @@ VIC-II:
 
 SID:
   d400  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-  d410  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  d410  00 00 00 00 00 00 00 00 00 ff ff 00 00 00 00 00
 
 CIA1:
   dc00  ff ff 00 00 ff ff ff ff 00 00 00 00 00 00 00 00
@@ -626,7 +627,7 @@ VIC-II:
 
 SID:
   d400  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-  d410  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  d410  00 00 00 00 00 00 00 00 00 ff ff 00 00 00 00 00
   No details available.
 
 CIA1:
@@ -660,6 +661,46 @@ chis: no cpu history — the live ring is empty (run the machine) and no trace s
 
 $ whowrote d020 3
 whowrote $d020: no writer in the live delta ring (window not covered, or never written since the last reset). Older history lives only in a finalized trace.
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ pot
+pot: selected both ports (parallel) (CIA1 port A out $ff: PA6=1 PA7=1)
+  port 1: open
+  port 2: open
+  latch: $d419=$ff $d41a=$ff
+  next sample in 512 cycles
+  reads: 0
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ pot 1 12 34
+pot: selected both ports (parallel) (CIA1 port A out $ff: PA6=1 PA7=1)
+  port 1: x=$12 y=$34
+  port 2: open
+  latch: $d419=$ff $d41a=$ff
+  next sample in 512 cycles
+  reads: 0
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ pot
+pot: selected both ports (parallel) (CIA1 port A out $ff: PA6=1 PA7=1)
+  port 1: x=$12 y=$34
+  port 2: open
+  latch: $d419=$ff $d41a=$ff
+  next sample in 512 cycles
+  reads: 0
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ pot 1 off
+pot: selected both ports (parallel) (CIA1 port A out $ff: PA6=1 PA7=1)
+  port 1: open
+  port 2: open
+  latch: $d419=$ff $d41a=$ff
+  next sample in 512 cycles
+  reads: 0
+   machine: c64 port $2f/$37 exrom 1 game 1 bank -
+
+$ pot 3 00 00
+pot: control port 1 or 2, not 3
    machine: c64 port $2f/$37 exrom 1 game 1 bank -
 
 $ nosuchverb

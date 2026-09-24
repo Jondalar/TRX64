@@ -379,6 +379,7 @@ pub fn monitor_help_text() -> String {
         "    io [1|addr]      I/O area per device: register hex (peek) + state details (VICE io)",
         "    iec              the serial bus: ATN/CLK/DATA, their level, and WHICH side is pulling each one low, plus both ends as their CPUs see them ($DD00 and the 1541's $1800). A released line is high and any device may pull it low, so \"who is low\" is per-device, not a bus-wide state. Answers the only question an IEC stall ever asks.",
         "    folder [unit]    a folder device on the bus: its protocol state, open channels and last status",
+        "    pot [<1|2> <x> <y> | <1|2> off]  the POT lines ($D419/$D41A): the selection CIA1 drives, each port's value or open, what a read answers now, cycles to the next sample, reads. With a port: set its x/y bytes (final, $FF = open) or clear it",
         "    bitmap <a> [w h] [hires|charset|sprite]  render a RAM range to a PNG (scrub gfx)",
         "    bank [lens]      show/set the sticky default lens for m/d",
         "    wr [lens] <a> <b..>  write exactly these bytes from a",
@@ -481,6 +482,29 @@ pub fn monitor_help_text() -> String {
         "    bsave \"<f>\" <a1> <a2>  raw binary save (no header)",
     ]
     .join("\n")
+}
+
+/// Spec 876 — the `pot` report.
+fn pot_report(m: &trx64_core::Machine) -> String {
+    let pa = m.cia1.pa_output();
+    let sel = trx64_core::pot::select(pa);
+    let which = ["neither port", "port 1", "port 2", "both ports (parallel)"][sel as usize];
+    let port = |p: u8| match m.pot(p) {
+        Some((x, y)) => format!("x=${x:02x} y=${y:02x}"),
+        None => "open".to_string(),
+    };
+    let clk = m.c64_core.clk;
+    format!(
+        "pot: selected {which} (CIA1 port A out ${pa:02x}: PA6={} PA7={})\n  port 1: {}\n  port 2: {}\n  latch: $d419=${:02x} $d41a=${:02x}\n  next sample in {} cycles\n  reads: {}",
+        (pa >> 6) & 1,
+        (pa >> 7) & 1,
+        port(1),
+        port(2),
+        m.pot_peek(0),
+        m.pot_peek(1),
+        trx64_core::pot::PotLines::cycles_to_next_sample(clk),
+        m.pot_lines().reads,
+    )
 }
 
 /// The first double-quoted substring of a command (= the TS
@@ -756,6 +780,10 @@ pub fn classify(command: &str) -> MachineEffect {
     const MUTATORS: [&str; 11] = [
         "wr", "a", "f", "c", "t", "r", "g", "x", "step", "n", "next",
     ];
+    // Spec 876 — `pot <port> …` changes what the C64 will read; bare `pot` only reports.
+    if verb == "pot" && command.split_whitespace().nth(1).is_some() {
+        return MachineEffect::Mutates;
+    }
     if MUTATORS.contains(&verb.as_str()) {
         // `r` with no argument only READS the registers; only `r <reg>=<v>` writes.
         // This one line is why the classification cannot live on the host side.
@@ -769,7 +797,7 @@ pub fn classify(command: &str) -> MachineEffect {
 /// The verbs this crate owns today. A line whose verb is not here falls through to the
 /// host's own dispatch — the honest shape while the move is half done, and the shape
 /// §6 keeps afterwards for a host's own verbs.
-const OWNED: [&str; 42] = [
+const OWNED: [&str; 43] = [
     "r",
     "registers",
     "wr",
@@ -810,6 +838,7 @@ const OWNED: [&str; 42] = [
     "reu",
     "georam",
     "uci",
+    "pot",
     "help",
     "?",
 ];
@@ -2484,6 +2513,32 @@ fn exec_owned(
                 ));
             }
             Ok(uci_report(host.machine()))
+        }
+
+        // Spec 876 — the POT lines. Bare `pot` reports; `pot <port> <x> <y>` / `pot <port>
+        // off` are the host's `set_pot` / `clear_pot`. The bytes are final: no mapping.
+        "pot" => {
+            let m = host.machine();
+            match toks.len() {
+                1 => {}
+                3 | 4 => {
+                    let port = toks[1].parse::<u8>().map_err(|_| format!("pot: control port 1 or 2, not {}", toks[1]))?;
+                    if toks.len() == 3 {
+                        if !toks[2].eq_ignore_ascii_case("off") {
+                            return Err("usage: pot [<1|2> <x> <y> | <1|2> off]".into());
+                        }
+                        m.clear_pot(port)?;
+                    } else {
+                        let byte = |t: &str| {
+                            parse_hex(t).filter(|v| *v <= 0xff).map(|v| v as u8).ok_or_else(|| format!("pot: not a byte: {t}"))
+                        };
+                        let (x, y) = (byte(&toks[2])?, byte(&toks[3])?);
+                        m.set_pot(port, x, y)?;
+                    }
+                }
+                _ => return Err("usage: pot [<1|2> <x> <y> | <1|2> off]".into()),
+            }
+            Ok(pot_report(m))
         }
 
         // Spec 863 — which C64 this is. Bare `model` reports it and lists the rows; `model
