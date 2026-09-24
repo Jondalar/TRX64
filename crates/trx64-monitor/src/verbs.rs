@@ -369,7 +369,7 @@ pub fn monitor_help_text() -> String {
         "    sf / nf          step into/over, stop only in focused flow (C64RE)",
         "    flow             interrupt/trap flow frame stack (panel)",
         "    bt               backtrace (stack scan + flow frames)",
-        "    reset            cold reset",
+        "    reset [cold]     warm reset (the RESET line, RAM kept); `reset cold` power-cycles",
         "  MEMORY (bank lens: cpu|ram|rom|io|cart, default cpu = what CPU sees)",
         "    m [lens] <a> [b] memory dump ($20/row + petscii; default len $800)",
         "    d [lens] [a] [end] disassemble: a..end range (VICE), or ~16 from a/PC",
@@ -405,7 +405,7 @@ pub fn monitor_help_text() -> String {
         "    r                registers (+ flow + IRQ/NMI vectors)",
         "    r a=$42 x=$10    set registers (a/x/y/sp/pc/fl)",
         "    sidefx [on|off]  monitor read side effects (default off = peek)",
-        "    device [c64|drive<unit>]  target the C64 or a 1541 CPU by its unit (drive8, drive9 … = read-inspect r/m/d)",
+        "    device [c64|drive<unit>]  target the C64 or the drive CPU at a unit, 1541 or 1581 (drive8 … drive11 = read-inspect r/m/d)",
         "  STATE / TRACE",
         "    dump|snapshot <p>  write a .c64re snapshot; undump|loadsnapshot <p>  restore it",
         "    savecrt [\"<p>\"]  write live flash state to the mounted .crt (or to <p> as a copy)",
@@ -427,8 +427,8 @@ pub fn monitor_help_text() -> String {
         "    traprules <path> | traprules [clear]   load/list/clear project on-trap dump rules (JSON {pc,label,dump:[[name,addr,len]],decode}); auto-emits `label: name=$XX (decode)` on reaching that PC (JAM / breakpoint)",
         "    revdepth [seconds]        report / set the always-on reverse-ring depth: rebuilds the delta+cpuhistory rings (DISCARDS history; future capture only; 1..=600s). TRX64_REVERSE_SECONDS = boot default",
         "    diff <idA> <idB>          typed by-ID diff of two checkpoint anchors (RAM runs + per-chip register changes). READ-ONLY (live machine unchanged). ids from `checkpoint/list`",
-        "  MEDIA + DRIVE (Spec 839 — the same verbs on every front-end; the cockpit used to own these)",
-        "    mount <path>              put a .d64/.g64/.crt/.prg/.c64re in the machine. The TYPE comes from the file's CONTENT, not its extension; a relative path resolves against `pwd`/`cd`. A cartridge power-cycles, a disk does not.",
+        "  MEDIA + DRIVE (the same verbs on every front-end)",
+        "    mount <path>              put a .d64/.g64/.d81/.crt/.prg/.c64re in the machine. The TYPE comes from the file's CONTENT, not its extension; a relative path resolves against `pwd`/`cd`. A cartridge power-cycles, a disk does not.",
         "    eject [cart|disk|<unit>]  take it out (`eject 9`: the disk in the drive at unit 9). Bare `eject` targets whatever is actually in (cartridge first, else the disk). Both persist to the host file FIRST — a disk eject leaves the drive turning, a cartridge eject cold-resets the machine (that is what pulling a cart does).",
         "    drive [unit]              live status of the drive at that unit (default 8): motor, track, LED, what is mounted, whether it is dirty",
         "    cart                      cartridge live status: type, bank, read/write activity — null when nothing is inserted",
@@ -442,13 +442,15 @@ pub fn monitor_help_text() -> String {
         "    reset [warm|cold] · power on|off",
         "    model                     which C64 this is (model, video standard, VIC-II, frame, clock), and every model this build knows — with what a model that cannot run is missing",
         "    model <row>               switch the running machine to another model (c64-pal, c64-ntsc, c64-paln …) at the next frame boundary. Not a power cycle: the program keeps its state and the standard it detected at boot; `reset` or `power off`/`on` afterwards for a clean start on the new model. The model survives reset and power cycles.",
-        "    turbo                     Spec 815 — which machine this session CLAIMS to be, so a release's turbo code path is reachable at all. A C64 answers $FF at $D02F-$D03F, the probe fails, and everything behind it is dead code.",
+        "    turbo                     which machine this session CLAIMS to be, so a release's turbo code path is reachable at all. A C64 answers $FF at $D02F-$D03F, the probe fails, and everything behind it is dead code.",
         "    turbo mode c64|128|u64    c64 (default) = open bus. 128 = the VIC-IIe pair $D02F/$D030 with VICE's read-back masks. u64 = an extended speed register at $D031. Survives a reset: it is machine identity, not chip state.",
         "    turbo on|off              set/clear the speed bit the way the release would ($D030 bit 0, or $D031)",
-        "    turbo speed $NN           the extended speed value (u64 profile)",
-        "                              The speed bit is STORED, not acted on: the CPU still runs at 1 MHz and the picture is unchanged. What a set bit does to the display is Spec 815 §3 and is unbuilt on purpose — guessing it would put behaviour here that exists nowhere else.",
-        "    uci                       Spec 852 — the Ultimate Command Interface on the u64 profile, read-only: enabled, window, state, pointers, lengths, the IRQ and freeze lines, events the firmware has not taken. Disabled without a firmware, so the window reads open bus.",
-        "  MARKS (Spec 809 — a named, pinned point you can iterate FROM)",
+        "    turbo speed $NN           the extended speed value (u64 profile): the CPU runs at the clock it selects from the speed table",
+        "                              On 128 the speed bit is STORED, not acted on: the CPU stays at 1 MHz and the picture is unchanged.",
+        "    reu                       the REU on the expansion port, read-only: size, status, command, addresses, length, IRQ line",
+        "    georam                    the GeoRAM, read-only: size, bank, window (either verb reports whichever device is attached)",
+        "    uci                       the Ultimate Command Interface on the u64 profile, read-only: enabled, window, state, pointers, lengths, the IRQ and freeze lines, events the firmware has not taken. Disabled without a firmware, so the window reads open bus.",
+        "  MARKS (a named, pinned point you can iterate FROM)",
         "    mark <name>               name + pin the anchor you are standing on (max 32)",
         "    marks                     list them with cycle, frame, how far back, and the window cost",
         "    unmark <name>             drop the name and the pin",
@@ -456,8 +458,8 @@ pub fn monitor_help_text() -> String {
         "    A mark survives PLAY cutting the future, which is what lets you go there, try",
         "    something, come back and try differently. `ringdump` carries marks, so a",
         "    .c64rering is a session WITH its bookmarks.",
-        "    identify <path>           what a file IS, from its content: c64re|crt|g64|d64|prg (+ whether a PRG would autostart)",
-        "  REWIND TRANSPORT (Spec 808 — plays the MACHINE backwards, not cached pictures)",
+        "    identify <path>           what a file IS, from its content: c64re|crt|g64|d64|d81|prg (+ whether a PRG would autostart)",
+        "  REWIND TRANSPORT (plays the MACHINE backwards, not cached pictures)",
         "    play back|fwd [speed]     play through the anchors; every step is a real restore, so registers/memory/drive are correct at every frame. `play fwd` at the head just runs.",
         "    pause                     stop where you are — the machine IS there, no second step needed",
         "    frame -N | +N             step N anchors (stops at the ends, never wraps)",
@@ -2082,8 +2084,6 @@ fn exec_owned(
             let cpu_bus = m.iec.cpu_bus();
             let cpu_port = m.iec.cpu_port();
             let drv_port = m.iec.drv_port();
-            let drv_bus8 = m.iec.drv_bus(8);
-            let drv_data8 = m.iec.drv_data(8);
 
             // cpu_bus / cpu_port bit positions (c64iec.c iec_update_cpu_bus).
             const DATA: u8 = 0x80;
@@ -2092,49 +2092,38 @@ fn exec_owned(
             let lvl = |v: u8, bit: u8| if v & bit != 0 { "high" } else { "LOW " };
             let pull = |v: u8, bit: u8| if v & bit != 0 { "-" } else { "pulls" };
 
-            // Spec 873/874 — a column per IEC device (a folder, a host's own), headed by
-            // its name, when there is one: who is holding the line includes a device
-            // without a CPU.
-            let devices: Vec<(String, u8)> = m.iec_devices.iter().map(|s| (s.dev.name(), m.iec.drv_bus(s.slot as usize))).collect();
-            let fhead: String = devices.iter().map(|(n, _)| format!("   {n}")).collect();
-            let fcol = |bit: u8| -> String {
-                devices
-                    .iter()
-                    .map(|(n, b)| format!("   {:<w$}", pull(*b, bit), w = n.chars().count().max(5)))
-                    .collect::<String>()
-                    .trim_end()
-                    .to_string()
+            // A column per drive on the bus — both positions, at whatever unit each
+            // answers to, 1541 or 1581 — then one per IEC device (a folder, a host's
+            // own), headed by its name: who is holding a line includes every one of them.
+            use trx64_core::drive::DrivePosition;
+            let (slot_a, slot_b) = trx64_core::drive::pair_bus_slots(m.drive(DrivePosition::A), m.drive(DrivePosition::B));
+            let drives: Vec<(usize, &trx64_core::drive::Drive1541)> = [(slot_a, DrivePosition::A), (slot_b, DrivePosition::B)]
+                .into_iter()
+                .filter_map(|(s, p)| s.map(|s| (s, m.drive(p))))
+                .collect();
+            let mut columns: Vec<(String, u8)> = drives.iter().map(|(s, _)| (format!("drive {s}"), m.iec.drv_bus(*s))).collect();
+            columns.extend(m.iec_devices.iter().map(|s| (s.dev.name(), m.iec.drv_bus(s.slot as usize))));
+            // Every column is at least as wide as "pulls", so a cell sits under its heading.
+            let width = |n: &str| n.chars().count().max(5);
+            let head: String = columns.iter().map(|(n, _)| format!("   {n:<w$}", w = width(n))).collect();
+            let row = |c64: &str, cells: String| format!("{c64:<5}{cells}").trim_end().to_string();
+            let col = |bit: u8| -> String {
+                columns.iter().map(|(n, b)| format!("   {:<w$}", pull(*b, bit), w = width(n))).collect()
             };
-            let sep = |s: String| if s.is_empty() { s } else { format!("  {s}") };
+            let raw: String = drives
+                .iter()
+                .map(|(s, _)| format!("  drv_bus[{s}]=${:02x}", m.iec.drv_bus(*s)))
+                .chain(std::iter::once(format!("  drv_port=${drv_port:02x}")))
+                .chain(drives.iter().map(|(s, _)| format!("  drv_data[{s}]=${:02x}", m.iec.drv_data(*s))))
+                .collect();
             let mut out = vec![
                 "IEC BUS  (a released line is high; any device may pull it low)".to_string(),
-                format!("  line   bus     C64     drive 8{fhead}"),
-                format!(
-                    "  ATN    {}    {}   {}",
-                    lvl(cpu_bus, ATN),
-                    pull(cpu_bus, ATN),
-                    "-      (ATN is C64-only)"
-                ),
-                format!(
-                    "  CLK    {}    {}   {}{}",
-                    lvl(cpu_port, CLK),
-                    pull(cpu_bus, CLK),
-                    pull(drv_bus8, CLK),
-                    sep(fcol(CLK))
-                ),
-                format!(
-                    "  DATA   {}    {}   {}{}",
-                    lvl(cpu_port, DATA),
-                    pull(cpu_bus, DATA),
-                    pull(drv_bus8, DATA),
-                    sep(fcol(DATA))
-                ),
+                format!("  line   bus     {}", row("C64", head)),
+                format!("  ATN    {}    {}", lvl(cpu_bus, ATN), row(pull(cpu_bus, ATN), "   (ATN is C64-only)".to_string())),
+                format!("  CLK    {}    {}", lvl(cpu_port, CLK), row(pull(cpu_bus, CLK), col(CLK))),
+                format!("  DATA   {}    {}", lvl(cpu_port, DATA), row(pull(cpu_bus, DATA), col(DATA))),
                 String::new(),
-                format!(
-                    "  cpu_bus=${cpu_bus:02x}  cpu_port=${cpu_port:02x}  \
-                     drv_bus[8]=${drv_bus8:02x}  drv_port=${drv_port:02x}  \
-                     drv_data[8]=${drv_data8:02x}"
-                ),
+                format!("  cpu_bus=${cpu_bus:02x}  cpu_port=${cpu_port:02x}{raw}"),
             ];
 
             // Both ends, as the CPUs actually see them — not as the latches read.
@@ -2147,18 +2136,26 @@ fn exec_owned(
                 (dd00 >> 6) & 1,
                 (dd02 & 0x08 != 0) as u8 * ((m.peek_lens(0xdd00, "io") >> 3) & 1)
             ));
-            let v1800 = host.machine().drive8.drive_peek(0x1800);
-            let d1802 = host.machine().drive8.drive_peek(0x1802);
-            out.push(format!(
-                "  1541 $1800 = ${v1800:02x} (DDR ${d1802:02x})   bit7 ATN in={} bit4 ATNA={} \
-                 bit3 CLK out={} bit2 CLK in={} bit1 DATA out={} bit0 DATA in={}",
-                (v1800 >> 7) & 1,
-                (v1800 >> 4) & 1,
-                (v1800 >> 3) & 1,
-                (v1800 >> 2) & 1,
-                (v1800 >> 1) & 1,
-                v1800 & 1
-            ));
+            // A 1541's serial port is VIA1 port B ($1800), a 1581's the CIA's ($4001);
+            // both use the same bits.
+            for (slot, d) in &drives {
+                let is_1581 = d.board_type() == trx64_core::iec::DriveType::Drive1581;
+                let (port, ddr) = if is_1581 { (0x4001, 0x4003) } else { (0x1800, 0x1802) };
+                let v = d.drive_peek(port);
+                let dv = d.drive_peek(ddr);
+                let board = trx64_core::drive::board_name(d.board_type());
+                let who = if *slot == 8 && !is_1581 { board.to_string() } else { format!("{board} unit {slot}") };
+                out.push(format!(
+                    "  {who} ${port:04X} = ${v:02x} (DDR ${dv:02x})   bit7 ATN in={} bit4 ATNA={} \
+                     bit3 CLK out={} bit2 CLK in={} bit1 DATA out={} bit0 DATA in={}",
+                    (v >> 7) & 1,
+                    (v >> 4) & 1,
+                    (v >> 3) & 1,
+                    (v >> 2) & 1,
+                    (v >> 1) & 1,
+                    v & 1
+                ));
+            }
             Ok(out.join("\n"))
         }
 

@@ -15,7 +15,7 @@ monitor (VICE-superset):
     sf / nf          step into/over, stop only in focused flow (C64RE)
     flow             interrupt/trap flow frame stack (panel)
     bt               backtrace (stack scan + flow frames)
-    reset            cold reset
+    reset [cold]     warm reset (the RESET line, RAM kept); `reset cold` power-cycles
   MEMORY (bank lens: cpu|ram|rom|io|cart, default cpu = what CPU sees)
     m [lens] <a> [b] memory dump ($20/row + petscii; default len $800)
     d [lens] [a] [end] disassemble: a..end range (VICE), or ~16 from a/PC
@@ -51,7 +51,7 @@ monitor (VICE-superset):
     r                registers (+ flow + IRQ/NMI vectors)
     r a=$42 x=$10    set registers (a/x/y/sp/pc/fl)
     sidefx [on|off]  monitor read side effects (default off = peek)
-    device [c64|drive<unit>]  target the C64 or a 1541 CPU by its unit (drive8, drive9 … = read-inspect r/m/d)
+    device [c64|drive<unit>]  target the C64 or the drive CPU at a unit, 1541 or 1581 (drive8 … drive11 = read-inspect r/m/d)
   STATE / TRACE
     dump|snapshot <p>  write a .c64re snapshot; undump|loadsnapshot <p>  restore it
     savecrt ["<p>"]  write live flash state to the mounted .crt (or to <p> as a copy)
@@ -73,8 +73,8 @@ monitor (VICE-superset):
     traprules <path> | traprules [clear]   load/list/clear project on-trap dump rules (JSON {pc,label,dump:[[name,addr,len]],decode}); auto-emits `label: name=$XX (decode)` on reaching that PC (JAM / breakpoint)
     revdepth [seconds]        report / set the always-on reverse-ring depth: rebuilds the delta+cpuhistory rings (DISCARDS history; future capture only; 1..=600s). TRX64_REVERSE_SECONDS = boot default
     diff <idA> <idB>          typed by-ID diff of two checkpoint anchors (RAM runs + per-chip register changes). READ-ONLY (live machine unchanged). ids from `checkpoint/list`
-  MEDIA + DRIVE (Spec 839 — the same verbs on every front-end; the cockpit used to own these)
-    mount <path>              put a .d64/.g64/.crt/.prg/.c64re in the machine. The TYPE comes from the file's CONTENT, not its extension; a relative path resolves against `pwd`/`cd`. A cartridge power-cycles, a disk does not.
+  MEDIA + DRIVE (the same verbs on every front-end)
+    mount <path>              put a .d64/.g64/.d81/.crt/.prg/.c64re in the machine. The TYPE comes from the file's CONTENT, not its extension; a relative path resolves against `pwd`/`cd`. A cartridge power-cycles, a disk does not.
     eject [cart|disk|<unit>]  take it out (`eject 9`: the disk in the drive at unit 9). Bare `eject` targets whatever is actually in (cartridge first, else the disk). Both persist to the host file FIRST — a disk eject leaves the drive turning, a cartridge eject cold-resets the machine (that is what pulling a cart does).
     drive [unit]              live status of the drive at that unit (default 8): motor, track, LED, what is mounted, whether it is dirty
     cart                      cartridge live status: type, bank, read/write activity — null when nothing is inserted
@@ -88,13 +88,15 @@ monitor (VICE-superset):
     reset [warm|cold] · power on|off
     model                     which C64 this is (model, video standard, VIC-II, frame, clock), and every model this build knows — with what a model that cannot run is missing
     model <row>               switch the running machine to another model (c64-pal, c64-ntsc, c64-paln …) at the next frame boundary. Not a power cycle: the program keeps its state and the standard it detected at boot; `reset` or `power off`/`on` afterwards for a clean start on the new model. The model survives reset and power cycles.
-    turbo                     Spec 815 — which machine this session CLAIMS to be, so a release's turbo code path is reachable at all. A C64 answers $FF at $D02F-$D03F, the probe fails, and everything behind it is dead code.
+    turbo                     which machine this session CLAIMS to be, so a release's turbo code path is reachable at all. A C64 answers $FF at $D02F-$D03F, the probe fails, and everything behind it is dead code.
     turbo mode c64|128|u64    c64 (default) = open bus. 128 = the VIC-IIe pair $D02F/$D030 with VICE's read-back masks. u64 = an extended speed register at $D031. Survives a reset: it is machine identity, not chip state.
     turbo on|off              set/clear the speed bit the way the release would ($D030 bit 0, or $D031)
-    turbo speed $NN           the extended speed value (u64 profile)
-                              The speed bit is STORED, not acted on: the CPU still runs at 1 MHz and the picture is unchanged. What a set bit does to the display is Spec 815 §3 and is unbuilt on purpose — guessing it would put behaviour here that exists nowhere else.
-    uci                       Spec 852 — the Ultimate Command Interface on the u64 profile, read-only: enabled, window, state, pointers, lengths, the IRQ and freeze lines, events the firmware has not taken. Disabled without a firmware, so the window reads open bus.
-  MARKS (Spec 809 — a named, pinned point you can iterate FROM)
+    turbo speed $NN           the extended speed value (u64 profile): the CPU runs at the clock it selects from the speed table
+                              On 128 the speed bit is STORED, not acted on: the CPU stays at 1 MHz and the picture is unchanged.
+    reu                       the REU on the expansion port, read-only: size, status, command, addresses, length, IRQ line
+    georam                    the GeoRAM, read-only: size, bank, window (either verb reports whichever device is attached)
+    uci                       the Ultimate Command Interface on the u64 profile, read-only: enabled, window, state, pointers, lengths, the IRQ and freeze lines, events the firmware has not taken. Disabled without a firmware, so the window reads open bus.
+  MARKS (a named, pinned point you can iterate FROM)
     mark <name>               name + pin the anchor you are standing on (max 32)
     marks                     list them with cycle, frame, how far back, and the window cost
     unmark <name>             drop the name and the pin
@@ -102,8 +104,8 @@ monitor (VICE-superset):
     A mark survives PLAY cutting the future, which is what lets you go there, try
     something, come back and try differently. `ringdump` carries marks, so a
     .c64rering is a session WITH its bookmarks.
-    identify <path>           what a file IS, from its content: c64re|crt|g64|d64|prg (+ whether a PRG would autostart)
-  REWIND TRANSPORT (Spec 808 — plays the MACHINE backwards, not cached pictures)
+    identify <path>           what a file IS, from its content: c64re|crt|g64|d64|d81|prg (+ whether a PRG would autostart)
+  REWIND TRANSPORT (plays the MACHINE backwards, not cached pictures)
     play back|fwd [speed]     play through the anchors; every step is a real restore, so registers/memory/drive are correct at every frame. `play fwd` at the head just runs.
     pause                     stop where you are — the machine IS there, no second step needed
     frame -N | +N             step N anchors (stops at the ends, never wraps)
@@ -642,9 +644,9 @@ CIA2:
 $ iec
 IEC BUS  (a released line is high; any device may pull it low)
   line   bus     C64     drive 8
-  ATN    high    -   -      (ATN is C64-only)
-  CLK    high    -   -
-  DATA   high    -   -
+  ATN    high    -       (ATN is C64-only)
+  CLK    high    -       -
+  DATA   high    -       -
 
   cpu_bus=$ff  cpu_port=$ff  drv_bus[8]=$ff  drv_port=$85  drv_data[8]=$ff
   C64  $DD00 = $ff (DDR $00)   bit7 DATA in=1 bit6 CLK in=1 bit3 ATN out=0

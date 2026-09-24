@@ -2249,7 +2249,7 @@ monitor (VICE-superset):
     g [addr]         go/resume the run-loop (PC=addr); Pause button halts
     x                exit/resume (= g)
     until <addr>     run until PC=addr, then stop (synchronous)
-    reset            cold reset
+    reset [cold]     warm reset (the RESET line, RAM kept); `reset cold` power-cycles
   MEMORY (bank lens: cpu|ram|rom|io|cart, default cpu = what CPU sees)
     m [lens] <a> [b] memory dump ($20/row + petscii; default len $800)
     d [lens] [a] [end] disassemble: a..end range (VICE), or ~16 from a/PC

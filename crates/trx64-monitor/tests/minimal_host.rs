@@ -194,6 +194,41 @@ fn device_offers_every_powered_drive_by_its_unit() {
     assert!(e.contains("no powered drive"), "{e}");
 }
 
+// ── `iec` shows every drive on the bus, not only unit 8 ─────────────────────────
+
+#[test]
+fn iec_shows_every_drive_on_the_bus() {
+    use trx64_core::drive::DrivePosition;
+    use trx64_core::iec::DriveType;
+    let mut mon = MonitorSession::new();
+    let mut host = BareHost::new();
+
+    // Drive A alone at 8: its column, its $1800 line, nothing at 9.
+    let out = run(&mut mon, &mut host, "iec").expect("iec");
+    assert!(out.contains("C64     drive 8") && !out.contains("drive 9"), "{out}");
+    assert!(out.contains("  1541 $1800 = "), "{out}");
+
+    // B on at 9: a column and a port line of its own.
+    host.machine.set_drive_power(DrivePosition::B, true).expect("B at 9");
+    let out = run(&mut mon, &mut host, "iec").expect("iec");
+    assert!(out.contains("drive 8   drive 9"), "{out}");
+    assert!(out.contains("drv_bus[9]=") && out.contains("drv_data[9]="), "{out}");
+    assert!(out.contains("  1541 unit 9 $1800 = "), "{out}");
+
+    // B as a 1581: its serial port is the CIA's port B.
+    host.machine.set_drive_power(DrivePosition::B, false).unwrap();
+    host.machine.set_drive_type(DrivePosition::B, DriveType::Drive1581).expect("1581 while off");
+    host.machine.set_drive_power(DrivePosition::B, true).expect("B at 9");
+    let out = run(&mut mon, &mut host, "iec").expect("iec");
+    assert!(out.contains("  1581 unit 9 $4001 = "), "{out}");
+
+    // Both off: no drive column, no drive port line.
+    host.machine.set_drive_power(DrivePosition::B, false).unwrap();
+    host.machine.set_drive_power(DrivePosition::A, false).unwrap();
+    let out = run(&mut mon, &mut host, "iec").expect("iec");
+    assert!(!out.contains("drive 8") && !out.contains("$1800"), "{out}");
+}
+
 // ── Spec 864, the second host's first finding ───────────────────────────────────
 //
 // `device` used to compare the argument against the literals "c64" and "drive8", so a

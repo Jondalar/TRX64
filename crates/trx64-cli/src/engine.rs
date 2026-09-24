@@ -7,7 +7,7 @@
 //! It carries the high-level "machine verb" layer (power/run/pause/step/mount/…)
 //! that maps each verb onto the SAME `dispatch()` JSON-RPC calls the WS daemon and
 //! the FFI use — there is NO second runtime path. Anything that is not a high-level
-//! verb is forwarded verbatim to `monitor/exec` (the ~128-verb VICE-superset).
+//! verb is forwarded verbatim to `monitor/exec` (the VICE-superset monitor).
 //!
 //! RUN-STATE MODEL (important — mirrors the FFI "embedded host drives the loop"
 //! contract). TRX64 has no autonomous pacing loop: `debug/run` only flips the
@@ -181,7 +181,7 @@ impl Engine {
             return self.verb_monitor(fs);
         }
         // `/`-prefixed = VM / high-level command (slash-command namespace); a bare
-        // line = monitor passthrough (the ~128-verb VICE-superset — the primary
+        // line = monitor passthrough (the VICE-superset monitor — the primary
         // surface, so you type `d c000` / `r` / `bk e000` directly).
         let vm = match line.strip_prefix('/') {
             Some(rest) => rest.trim(),
@@ -691,7 +691,7 @@ Tab completes verbs in all three namespaces + paths for path arguments.
   !pwd  !cd <dir>  !ls|!dir [dir]  !mkdir <dir>  !rmdir <dir>
   !load \"<f>\" [addr]  !save \"<f>\" <a1> <a2>  !bload \"<f>\" <addr>  !bsave \"<f>\" <a1> <a2>
 
-  bare line → the VICE-superset monitor (~128 verbs), e.g.:
+  bare line → the VICE-superset monitor, e.g.:
   d c000               disassemble    m 0400      memory dump
   r                    registers      bk e000     breakpoint
   g                    go             trace on    instruction trace

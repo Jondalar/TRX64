@@ -8,7 +8,7 @@
 //! Palette (agreed in the spec):
 //!   dir                                   → blue + bold
 //!   .crt                                  → yellow   (cartridge)
-//!   .d64 / .g64 / .p64                    → cyan     (disk image)
+//!   .d64 / .g64 / .d81 / .p64             → cyan     (disk image)
 //!   .prg / .bin                           → green    (program / raw)
 //!   .c64re / .c64retrace / .c64rering     → magenta  (snapshot / trace / ring)
 //!   .asm / .tass / .md / .json            → gray     (source / text)
@@ -26,7 +26,7 @@ use ratatui::style::{Color, Modifier, Style};
 pub enum Bucket {
     /// `.crt` — cartridge image.
     Cart,
-    /// `.d64` / `.g64` / `.p64` — disk image.
+    /// `.d64` / `.g64` / `.d81` / `.p64` — disk image.
     Disk,
     /// `.prg` / `.bin` — program / raw bytes.
     Program,
@@ -51,7 +51,7 @@ fn ext_of(name: &str) -> Option<String> {
 pub fn ext_bucket(name: &str) -> Bucket {
     match ext_of(name).as_deref() {
         Some("crt") => Bucket::Cart,
-        Some("d64") | Some("g64") | Some("p64") => Bucket::Disk,
+        Some("d64") | Some("g64") | Some("d81") | Some("p64") => Bucket::Disk,
         Some("prg") | Some("bin") => Bucket::Program,
         Some("c64re") | Some("c64retrace") | Some("c64rering") => Bucket::Snapshot,
         Some("asm") | Some("tass") | Some("md") | Some("json") => Bucket::Source,
@@ -85,6 +85,8 @@ mod tests {
         assert_eq!(ext_bucket("disk.d64"), Bucket::Disk);
         assert_eq!(ext_bucket("disk.g64"), Bucket::Disk);
         assert_eq!(ext_bucket("disk.p64"), Bucket::Disk);
+        assert_eq!(ext_bucket("disk.d81"), Bucket::Disk);
+        assert_eq!(ext_bucket("DISK.D81"), Bucket::Disk);
         assert_eq!(ext_bucket("loader.prg"), Bucket::Program);
         assert_eq!(ext_bucket("payload.bin"), Bucket::Program);
         assert_eq!(ext_bucket("snap.c64re"), Bucket::Snapshot);

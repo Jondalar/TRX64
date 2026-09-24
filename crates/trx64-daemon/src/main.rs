@@ -3893,10 +3893,12 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                     )),
                 }
                 if m.turbo_engaged() {
-                    out.push_str(
+                    out.push_str(if p == SpeedProfile::U64 {
+                        "\n  The CPU runs at the clock this setting selects from the speed table."
+                    } else {
                         "\n  NOTE the speed bit is STORED, not acted on: the CPU still runs at \
-                         1 MHz and the picture is unchanged (Spec 815 §3, deliberately unbuilt).",
-                    );
+                         1 MHz and the picture is unchanged."
+                    });
                 }
                 out
             };
@@ -6344,7 +6346,7 @@ fn delegate_media_open(
 /// from inside it would deadlock on the daemon's own mutex. `e2e:839-monitor`
 /// covers that, because it is the one mistake this design is a step away from.
 ///
-/// Returns `None` for anything it does not own, so the monitor's ~128 verbs are
+/// Returns `None` for anything it does not own, so the monitor's own verbs are
 /// untouched. No verb here may shadow one of them; `forwarded_verbs_shadow_no_monitor_verb`
 /// asserts it.
 fn monitor_forward(req: &Request, command: &str, state: &SharedState) -> Option<Response> {
@@ -7856,8 +7858,12 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 "d031": m.vic.read_reg(0x31) as u64,
                 // Say it in the answer, every time: a caller that reads `engaged`
                 // and assumes the machine got faster has been misled by us.
-                "note": "the speed bit is STORED, not acted on — the CPU still runs at 1 MHz and \
-                         the picture is unchanged (Spec 815 §3, unbuilt on purpose)",
+                "note": if m.speed_profile() == trx64_core::vic::SpeedProfile::U64 {
+                    "the CPU runs at the clock $D031 selects from the speed table"
+                } else {
+                    "the speed bit is STORED, not acted on — the CPU still runs at 1 MHz and \
+                     the picture is unchanged"
+                },
             }))
         }
 
@@ -18797,7 +18803,7 @@ mod batch1_tests {
         }
     }
 
-    /// A forwarded verb must not hide one of the monitor's own ~128. The intercept runs
+    /// A forwarded verb must not hide one of the monitor's own verbs. The intercept runs
     /// FIRST, so any collision would silently shadow the native verb — and the failure
     /// would look like the native one had been deleted.
     #[test]
