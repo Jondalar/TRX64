@@ -278,8 +278,7 @@ fn write_drive_module(drive: &mut Drive1541, s: &mut SnapshotT) {
     // clock_frequency = 1 for the 1541 (unit.clock_frequency).
     s.smw_b(&mut m, 1);
     s.smw_w(&mut m, half_track_word as u16);
-    // detach_clk — TRX64 has no detach window field; emit 0 (settled).
-    s.smw_clock(&mut m, 0);
+    s.smw_clock(&mut m, r.detach_clk);
     // extend_image_policy — TRX64 has no extend policy; emit 0.
     s.smw_b(&mut m, 0);
     s.smw_dw(&mut m, r.gcr_head_offset);
@@ -382,7 +381,7 @@ fn read_drive_module(
     let byte_ready_level = rb!();
     let _clock_frequency = rb!();
     let half_track_word = rw!() as u32;
-    let _detach_clk = rclk!();
+    let detach_clk = rclk!();
     let _extend_image_policy = rb!();
     let gcr_head_offset = rdw!();
     let gcr_read = rb!();
@@ -430,6 +429,7 @@ fn read_drive_module(
     let r = &mut drive.rotation;
     r.attach_clk = attach_clk;
     r.attach_detach_clk = attach_detach_clk;
+    r.detach_clk = detach_clk;
     r.byte_ready_level = byte_ready_level;
     r.gcr_read = gcr_read;
     r.gcr_write_value = gcr_write_value;

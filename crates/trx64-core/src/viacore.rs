@@ -2291,11 +2291,13 @@ impl<'a> ViaBackend for Via2dBackend<'a> {
         Some(byte)
     }
 
-    // PORT OF: via2d.ts:588-604 (read_prb)
+    // PORT OF: via2d.c:486-511 (read_prb)
+    //
+    // No `has_image` guard, as in `store_prb`: VICE reads the port with or without a
+    // disk. With the guard an empty drive read $FF, so the DOS never saw the
+    // write-protect sensor go dark while a disk was pulled out (`Rotation::eject`)
+    // and an eject went unnoticed until the next insert (BUG-064).
     fn read_prb(&mut self, ctx: &ViaContext) -> Option<u8> {
-        if !self.has_image {
-            return None;
-        }
         let clk = ctx.clk;
         // via2d.c:494 — the same bus read delay as read_pra.
         self.drive.req_ref_cycles = crate::rotation::BUS_READ_DELAY as u64;

@@ -54,8 +54,13 @@ pub const BRA_MOTOR_ON: u8 = 0x04;
 /// Settle delay after a fresh attach during which `rotation_byte_read` forces
 /// `GCR_read = 0` (DRIVE_ATTACH_DELAY = 3*600000).
 pub const DRIVE_ATTACH_DELAY: u64 = 3 * 600_000;
-/// Settle delay after a re-attach following a recent detach.
-pub const DRIVE_ATTACH_DETACH_DELAY: u64 = 6 * 600_000;
+/// Settle delay after a re-attach following a recent detach (drive.h:197,
+/// `3 * 400000`): the write-protect sensor stays lit this long before the
+/// attach window darkens it again.
+pub const DRIVE_ATTACH_DETACH_DELAY: u64 = 3 * 400_000;
+/// drive.h:193 — `DRIVE_DETACH_DELAY`: how long the sensor is dark while the
+/// disk is pulled out on a detach.
+pub const DRIVE_DETACH_DELAY: u64 = 3 * 200_000;
 
 // =============================================================================
 // SECTION 2 — file-private constants (rotation.c:43,45)
@@ -183,8 +188,12 @@ pub struct Rotation {
     pub led_last_pwm: u32,
     /// drivetypes.ts:540 — attach_clk (0 = settled).
     pub attach_clk: u64,
-    /// drivetypes.ts:544 — attach_detach_clk.
+    /// drive.h:295 — attach_detach_clk: set by an attach that follows a detach
+    /// whose window was still open (driveimage.c:187).
     pub attach_detach_clk: u64,
+    /// drive.h:291 — detach_clk: the clock of the last eject, cleared once the
+    /// write-protect sense has seen DRIVE_DETACH_DELAY pass (0 = settled).
+    pub detach_clk: u64,
     /// drivetypes.ts:574 — req_ref_cycles (IF: requested additional R cycles).
     pub req_ref_cycles: u64,
     /// drivetypes.ts:612 — rpm (300rpm = 30000).
@@ -292,6 +301,7 @@ impl Rotation {
             led_last_pwm: 0,
             attach_clk: 0,
             attach_detach_clk: 0,
+            detach_clk: 0,
             req_ref_cycles: 0,
             rpm: 30_000,
             wobble_sin_count: 0.0,
@@ -1173,6 +1183,11 @@ impl Rotation {
         self.current_half_track = 0; // force the != check in set_half_track
         self.set_half_track(ht);
         self.attach_clk = if clk == 0 { 1 } else { clk };
+        // driveimage.c:187 — an attach while the last detach is still on record opens
+        // the attach-after-detach window too.
+        if self.detach_clk > 0 {
+            self.attach_detach_clk = self.attach_clk;
+        }
         self.rotation_last_clk = clk;
     }
 
@@ -1228,6 +1243,15 @@ impl Rotation {
         self.dirty_half_track = 0;
     }
 
+    /// [`Self::detach`] as a disk EJECT at drive clock `clk`: the disk passing the
+    /// write-protect sensor on its way out darkens it for DRIVE_DETACH_DELAY
+    /// (driveimage.c:278 `drive->detach_clk = diskunit_clk`). This is how the DOS
+    /// notices a removal; a mechanism swap that is not an eject calls `detach`.
+    pub fn eject(&mut self, clk: u64) {
+        self.detach();
+        self.detach_clk = if clk == 0 { 1 } else { clk };
+    }
+
     /// Take the (possibly mutated) raw on-disk image bytes out for the daemon to
     /// persist / hash / snapshot. Flushes any pending dirty track first
     /// (= VICE `drive_gcr_data_writeback_all` before reading `fsimage->fd`), then
@@ -1265,11 +1289,24 @@ impl Rotation {
         self.gcr_read
     }
 
-    /// drive_writeprotect_sense (drive.ts) — returns 0x10 (write-enabled) /
-    /// 0x00 (write-protected), AND clears the spin-up `attach_clk` window once
-    /// DRIVE_ATTACH_DELAY has elapsed (the via2d read_prb WPS path). Only the
-    /// attach branch is modelled (a plain mounted D64 has no detach window).
+    /// PORT OF: drive-writeprotect.c:34-76 `drive_writeprotect_sense` — returns 0x10
+    /// (sensor lit: write-enabled, or no disk) / 0x00 (dark: write-protected, or a
+    /// disk passing the sensor), and clears each window once it has elapsed (the
+    /// via2d read_prb WPS path). The three windows in VICE's order: eject (dark),
+    /// attach-after-detach (lit), attach (dark).
     pub fn writeprotect_sense(&mut self, clk: u64) -> u8 {
+        if self.detach_clk != 0 {
+            if clk.wrapping_sub(self.detach_clk) < DRIVE_DETACH_DELAY {
+                return 0x0;
+            }
+            self.detach_clk = 0;
+        }
+        if self.attach_detach_clk != 0 {
+            if clk.wrapping_sub(self.attach_detach_clk) < DRIVE_ATTACH_DETACH_DELAY {
+                return 0x10;
+            }
+            self.attach_detach_clk = 0;
+        }
         if self.attach_clk != 0 {
             if clk.wrapping_sub(self.attach_clk) < DRIVE_ATTACH_DELAY {
                 return 0x0;
@@ -1494,6 +1531,41 @@ mod tests {
         assert!(!r.has_dirty_track(), "detach flushed the dirty track");
         assert!(r.image.is_none());
         assert!(r.writeback_bytes.is_none());
+    }
+
+    /// BUG-064 — an eject darkens the write-protect sensor for DRIVE_DETACH_DELAY
+    /// (that is what the DOS sees as a removal), and an insert right after it runs
+    /// VICE's attach-after-detach window: lit, then dark, then the disk's own state.
+    #[test]
+    fn eject_darkens_the_sensor_and_a_quick_insert_runs_the_detach_windows() {
+        let d64 = synthetic_d64();
+        let mut r = Rotation::new();
+        r.attach_with_writeback(GcrImage::from_d64(&d64), 0, Some((d64.clone(), WritebackKind::D64, false)));
+        r.attach_clk = 0;
+        assert_eq!(r.writeprotect_sense(10_000_000), 0x10, "a write-enabled disk: lit");
+        // A plain detach (a mechanism swap) leaves no window.
+        let mut plain = Rotation::new();
+        plain.detach();
+        assert_eq!(plain.writeprotect_sense(1), 0x10);
+
+        let t = 10_000_000;
+        r.eject(t);
+        assert_eq!(r.writeprotect_sense(t + 1), 0x0, "the disk passing the sensor");
+        assert_eq!(r.writeprotect_sense(t + DRIVE_DETACH_DELAY - 1), 0x0);
+        assert_eq!(r.writeprotect_sense(t + DRIVE_DETACH_DELAY), 0x10, "empty drive: lit");
+        assert_eq!(r.detach_clk, 0, "the window is consumed");
+
+        // An insert while the eject is still on record (nobody sensed its end).
+        let mut q = Rotation::new();
+        q.attach_with_writeback(GcrImage::from_d64(&d64), 0, Some((d64.clone(), WritebackKind::D64, false)));
+        q.attach_clk = 0;
+        q.eject(t);
+        q.attach_with_writeback(GcrImage::from_d64(&d64), t, Some((d64.clone(), WritebackKind::D64, false)));
+        assert_eq!(q.attach_detach_clk, t);
+        assert_eq!(q.writeprotect_sense(t + 1), 0x0, "still the eject window");
+        assert_eq!(q.writeprotect_sense(t + DRIVE_DETACH_DELAY), 0x10, "attach-after-detach: lit");
+        assert_eq!(q.writeprotect_sense(t + DRIVE_ATTACH_DETACH_DELAY), 0x0, "the attach window");
+        assert_eq!(q.writeprotect_sense(t + DRIVE_ATTACH_DELAY), 0x10, "settled on the disk");
     }
 
     /// A read-only mount rejects the write-back (the image bytes are untouched).
