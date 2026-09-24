@@ -253,6 +253,35 @@ pub fn sc_to_ascii(sc: u8) -> char {
     }
 }
 
+/// The 40x25 text screen as the monitor's `screen` verb decodes it.
+pub struct TextScreen {
+    /// The screen matrix address the rows were read from.
+    pub base: u16,
+    pub vic_bank: u16,
+    pub d018: u8,
+    /// 25 rows of 40 characters, screen code → ASCII by [`sc_to_ascii`].
+    pub rows: Vec<String>,
+}
+
+/// Decode the text screen at the LIVE screen pointer: VIC bank from CIA2 $DD00 (PA
+/// bits 0..1 are inverted) + the $D018 matrix nibble, the matrix read from RAM (the
+/// VIC reads RAM directly). Side-effect free (peek lanes). The monitor's `screen`
+/// verb and the daemon's `runtime/swap_disk_and_continue` both read the screen here.
+pub fn text_screen(m: &Machine) -> TextScreen {
+    let dd00 = m.peek_lens(0xdd00, "io") & 0x03;
+    let vic_bank = ((3 - dd00) as u16) * 0x4000;
+    let d018 = m.peek_lens(0xd018, "io");
+    let base = vic_bank.wrapping_add((((d018 >> 4) & 0x0f) as u16) * 0x0400);
+    let rows = (0u16..25)
+        .map(|row| {
+            (0u16..40)
+                .map(|col| sc_to_ascii(m.peek_lens(base.wrapping_add(row * 40 + col), "ram")))
+                .collect()
+        })
+        .collect();
+    TextScreen { base, vic_bank, d018, rows }
+}
+
 /// A monitor read through the bank lens, honouring the `sidefx` toggle.
 ///
 /// Default (`sidefx off`) is the peek lane — looking must not change the machine. With
@@ -1276,22 +1305,12 @@ fn exec_owned(
         // :731-742 (base computation, scToAscii, header, grid). $DD00/$D018 are read
         // via the io lens; the matrix is read from RAM (the VIC reads RAM directly).
         "screen" => {
-            let dd00 = host.machine().peek_lens(0xdd00, "io") & 0x03;
-            let vic_bank = ((3 - dd00) as u16) * 0x4000; // CIA2 PA bits 0..1 inverted
-            let d018 = host.machine().peek_lens(0xd018, "io");
-            let screen_base = vic_bank.wrapping_add((((d018 >> 4) & 0x0f) as u16) * 0x0400);
+            let t = text_screen(host.machine());
             let mut lines: Vec<String> = vec![format!(
                 "screen @ ${:04x}  (VIC bank ${:04x}, $D018=${:02x})",
-                screen_base, vic_bank, d018
+                t.base, t.vic_bank, t.d018
             )];
-            for row in 0u16..25 {
-                let mut line = String::new();
-                for col in 0u16..40 {
-                    let a = screen_base.wrapping_add(row * 40 + col);
-                    line.push(sc_to_ascii(host.machine().peek_lens(a, "ram")));
-                }
-                lines.push(format!("|{line}|"));
-            }
+            lines.extend(t.rows.iter().map(|r| format!("|{r}|")));
             Ok(lines.join("\n"))
         }
 

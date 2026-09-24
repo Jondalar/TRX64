@@ -9010,63 +9010,166 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             Response::ok(id, json!({ "count": cands.len(), "candidates": cands }))
         }
 
+        // BUG-064 — answer a game's "insert side N, press RETURN" the way a person at
+        // the machine does, with the machine running between the steps:
+        //   1. read the text screen (screenBefore);
+        //   2. eject the disk from the drive exactly as `media/unmount` does, then run
+        //      `settle_cycles` (the 1541's write-protect sensor goes dark as the disk
+        //      leaves; its DOS latches that as a disk change);
+        //   3. insert the new image exactly as `media/mount` does, then run
+        //      `settle_cycles` again;
+        //   4. type `confirm_input` (default RETURN, "" = no key), each key held
+        //      `confirm_hold_cycles` and released as long before the next one;
+        //   5. run `post_cycles`;
+        //   6. read the screen again (screenAfter) and compare.
+        // The machine is advanced by the stream loop's own advance
+        // (`stream_debug_gated_advance`) with the state lock held for the whole call,
+        // so the paced loop waits and then carries on (it re-bases its clock after a
+        // stall instead of catching up). Breakpoints, observers and a JAM stop it as
+        // they stop the free run; the reply then says which step it stopped in.
         "runtime/swap_disk_and_continue" => {
-            let path_str = match req.params.get("path").and_then(|v| v.as_str()) {
-                Some(p) => p.to_string(),
-                None => return Response::err(id, -32602, "runtime/swap_disk_and_continue: missing path"),
+            const V: &str = "runtime/swap_disk_and_continue";
+            let Some(path_in) = req.params.get("path").and_then(|v| v.as_str()) else {
+                return Response::err(id, -32602, format!("{V}: missing path"));
             };
-            let settle_cycles = req.params.get("settle_cycles").and_then(|v| v.as_u64()).unwrap_or(1_500_000);
-            let post_cycles = req.params.get("post_cycles").and_then(|v| v.as_u64()).unwrap_or(4_000_000);
-
+            let u64_param = |k: &str, d: u64| req.params.get(k).and_then(|v| v.as_u64()).unwrap_or(d);
+            let settle_cycles = u64_param("settle_cycles", 1_500_000);
+            let post_cycles = u64_param("post_cycles", 4_000_000);
+            // Long enough for a game that samples the keyboard every few frames: Ultima VI
+            // looks every 8 IRQ ticks (~160 000 cycles), which a 33 000-cycle press misses.
+            let confirm_hold_cycles = u64_param("confirm_hold_cycles", 400_000);
+            let confirm_input = req.params.get("confirm_input").and_then(|v| v.as_str()).unwrap_or("\r").to_string();
+            let unit = match unit_param(&req.params) {
+                Ok(u) => u,
+                Err(e) => return Response::err(id, -32602, format!("{V}: {e}")),
+            };
+            let path_str = { let st = state.lock().unwrap(); resolve_fs_path_with_state(&st, path_in) };
             let bytes = match std::fs::read(&path_str) {
                 Ok(b) => b,
-                Err(e) => return Response::err(id, -32602, format!("runtime/swap_disk_and_continue: file read {path_str}: {e}")),
+                Err(e) => return Response::err(id, -32602, format!("{V}: file read {path_str}: {e}")),
             };
-
-            let disk_name = path_str.split('/').last().unwrap_or("disk").to_string();
-            let format_str = match disk_format_of(&disk_name, &bytes) {
-                Ok(f) => f,
-                Err(e) => return Response::err(id, -32602, format!("runtime/swap_disk_and_continue: {e}")),
+            let format_str = match detect_media_kind(&bytes, &path_str) {
+                Ok(MediaKind::G64) => "g64",
+                Ok(MediaKind::D64) => "d64",
+                Ok(MediaKind::D81) => "d81",
+                Ok(other) => return Response::err(id, -32602, format!("{V}: {} is not a disk image", other.as_str())),
+                Err(e) => return Response::err(id, -32602, format!("{V}: {e}")),
             };
+            let disk_name = path_str.rsplit('/').next().unwrap_or("disk").to_string();
             let sha256 = sha256_hex(&bytes);
-            let disk_kind = disk_kind_from_format(format_str);
             let image = DiskImage {
-                kind: disk_kind,
+                kind: disk_kind_from_format(format_str),
                 bytes,
                 backing_path: Some(path_str.clone()),
                 read_only: false,
             };
 
             let mut st = state.lock().unwrap();
-            if let Err(e) = st.session.machine.drive8.mount(image) {
-                return Response::err(id, -32602, format!("runtime/swap_disk_and_continue: drive 8: {e}"));
+            if st.transport.holds_the_machine() {
+                return Response::err(id, -32001, format!(
+                    "{V}: the rewind transport holds the machine; hand it back (play to the head) first"
+                ));
             }
-            st.session.disk_path = path_str.clone();
-            let cycle = st.session.machine.clk;
+            if let Some(reason) = non_persistable_dirty_media(&st) {
+                return Response::err(id, -32602, format!("{V}: cannot apply a media change — {reason}."));
+            }
+            let pos = match drive_position(&st, unit) {
+                Ok(p) => p,
+                Err(e) => return Response::err(id, -32602, format!("{V}: {e}")),
+            };
+            // Refuse a disk that does not fit BEFORE the eject, or a refusal would leave
+            // the drive empty.
+            if let Err(e) = medium_fits_at(&st, pos, &image.kind) {
+                return Response::err(id, -32602, format!("{V}: {e}"));
+            }
+            let role = format!("drive{unit}");
+            let screen_before = trx64_monitor::verbs::text_screen(&st.session.machine).rows;
 
-            Response::ok(id, json!({
-                "ok": true,
-                "mounted": disk_name,
-                "screenBefore": "",
-                "screenAfter": "",
-                "promptCleared": false,
-                "advanced": false,
-                "detail": {
-                    "insert": {
-                        "cycle": cycle,
-                        "operation": "disk",
-                        "role": "drive8",
-                        "format": format_str,
-                        "sha256": sha256,
-                        "resetPolicy": null,
-                        "checkpointBeforeId": null,
-                        "checkpointAfterId": null
-                    },
-                    "settleCycles": settle_cycles,
-                    "postCycles": post_cycles,
-                    "hadPrompt": false,
-                    "stillPrompt": false
+            // One step of running: the cycles it really ran, and why it stopped early.
+            fn run_step(st: &mut State, step: &'static str, cycles: u64) -> (u64, Option<Value>) {
+                let before = st.session.machine.clk;
+                let _ = stream_debug_gated_advance(st, cycles);
+                let ran = st.session.machine.clk.wrapping_sub(before);
+                let m = &st.session.machine;
+                let stop = if m.c64_core.is_jammed || m.cpu6510.is_jammed() {
+                    Some(json!({ "step": step, "reason": "jam", "pc": jammed_pc(st) as u64 }))
+                } else {
+                    // A halt records itself in `ctrl_stop` at the cycle it stopped on.
+                    st.ctrl_stop
+                        .as_ref()
+                        .filter(|s| s.cycles > before)
+                        .map(|s| json!({ "step": step, "reason": s.reason, "pc": s.pc as u64 }))
+                };
+                (ran, stop)
+            }
+
+            let mut stopped: Option<Value> = None;
+            let (mut settle_after_eject, mut settle_after_insert, mut post_ran) = (0u64, 0u64, 0u64);
+            let (mut insert_event, mut confirm_cycle) = (Value::Null, Value::Null);
+            let mut persisted_outgoing: Option<String> = None;
+
+            // 2. Eject (nothing to eject in an empty drive: no eject, no settle).
+            let eject_event = if st.session.machine.drive(pos).get_attached_disk().is_some() {
+                let (event, persisted) = eject_disk_media_at(&mut st, pos, &role);
+                persisted_outgoing = persisted;
+                let (ran, stop) = run_step(&mut st, "settle-after-eject", settle_cycles);
+                settle_after_eject = ran;
+                stopped = stop;
+                event
+            } else {
+                Value::Null
+            };
+            // 3. Insert.
+            if stopped.is_none() {
+                match insert_disk_media_at(&mut st, pos, unit, image, &path_str, format_str, &sha256) {
+                    Ok((event, _)) => insert_event = event,
+                    Err(e) => return Response::err(id, -32602, format!("{V}: {e} (the old disk is out)")),
                 }
+                let (ran, stop) = run_step(&mut st, "settle-after-insert", settle_cycles);
+                settle_after_insert = ran;
+                stopped = stop;
+            }
+            // 4. Confirm, 5. run on.
+            if stopped.is_none() {
+                let now = st.session.machine.cpu6510.clk;
+                confirm_cycle = json!(st.session.machine.clk);
+                st.session.machine.keyboard.type_text(now, &confirm_input, confirm_hold_cycles, confirm_hold_cycles);
+                let (ran, stop) = run_step(&mut st, "post", post_cycles);
+                post_ran = ran;
+                stopped = stop;
+            }
+
+            // 6. Compare. The prompt line is the lowest non-blank row before the swap —
+            // where a "press RETURN" prompt, or the cursor after it, sits.
+            let screen_after = trx64_monitor::verbs::text_screen(&st.session.machine).rows;
+            let advanced = screen_after != screen_before;
+            let prompt_row = screen_before.iter().rposition(|r| !r.trim().is_empty());
+            let prompt_cleared = prompt_row.map(|r| screen_after[r] != screen_before[r]).unwrap_or(false);
+            let mut detail = json!({
+                "eject": eject_event,
+                "insert": insert_event,
+                "ejectCycle": eject_event.get("cycle").cloned().unwrap_or(Value::Null),
+                "insertCycle": insert_event.get("cycle").cloned().unwrap_or(Value::Null),
+                "confirmCycle": confirm_cycle,
+                "settleCycles": { "afterEject": settle_after_eject, "afterInsert": settle_after_insert },
+                "postCycles": post_ran,
+                "confirmInput": confirm_input,
+                "confirmHoldCycles": confirm_hold_cycles,
+            });
+            if let Some(p) = persisted_outgoing { detail["diskPersisted"] = json!(p); }
+            Response::ok(id, json!({
+                "ok": stopped.is_none(),
+                "mounted": disk_name,
+                "screenBefore": screen_before.join("\n"),
+                "screenAfter": screen_after.join("\n"),
+                "promptLine": prompt_row.map(|r| json!({
+                    "row": r as u64, "before": screen_before[r], "after": screen_after[r],
+                })),
+                "promptCleared": prompt_cleared,
+                "advanced": advanced,
+                "stopped": stopped,
+                "c64Cycles": st.session.machine.clk,
+                "detail": detail,
             }))
         }
 
@@ -9549,9 +9652,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             // to the old cart-inserted timeline and are dropped by the power-off, so
             // none are captured/pinned for a cart. A DISK unmount is a live device op
             // → capture before/after as before.
-            let before_id = if is_cart { None } else { capture_media_checkpoint(&mut st) };
-            let mut persisted_outgoing: Option<String> = None;
-            if is_cart {
+            let (event, persisted_outgoing) = if is_cart {
                 // Persist any programmed flash back to the .crt while the cart is still
                 // LIVE in the machine (before the power-off transplant).
                 let cart_path = st.session.cart_path.clone();
@@ -9566,31 +9667,21 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 let session_id = st.session.id.clone();
                 let (mode, ratio) = (st.pacing_mode.clone(), st.pacing_ratio);
                 st.notify.broadcast("debug/running", json!({ "session_id": session_id, "pacing": { "mode": mode, "ratio": ratio } }));
+                let event = json!({
+                    "cycle": st.session.machine.clk,
+                    "operation": "eject",
+                    "role": role,
+                    "format": Value::Null,
+                    "sha256": Value::Null,
+                    "resetPolicy": Value::Null,
+                    "checkpointBeforeId": Value::Null,
+                    "checkpointAfterId": Value::Null
+                });
+                push_media_event(&mut st, event.clone());
+                (event, None)
             } else {
-                // Persist the outgoing disk's dirty writes to its host file BEFORE
-                // detach (the data-loss fix — detach_disk only flushes into disk.bytes,
-                // not the host file). Then detach.
-                persisted_outgoing = persist_outgoing_disk_at(&mut st, pos);
-                st.session.machine.drive_mut(pos).detach_disk();
-                if pos == DrivePosition::A {
-                    st.session.disk_path = String::new();
-                }
-            }
-            let after_id = if is_cart { None } else { capture_media_checkpoint(&mut st) };
-            if let Some(ref b) = before_id { st.checkpoint_ring.pin(b); }
-            if let Some(ref a) = after_id { st.checkpoint_ring.pin(a); }
-            let cycle = st.session.machine.clk;
-            let event = json!({
-                "cycle": cycle,
-                "operation": "eject",
-                "role": role,
-                "format": Value::Null,
-                "sha256": Value::Null,
-                "resetPolicy": Value::Null,
-                "checkpointBeforeId": before_id,
-                "checkpointAfterId": after_id
-            });
-            push_media_event(&mut st, event.clone());
+                eject_disk_media_at(&mut st, pos, role)
+            };
             let mut detail = json!({ "role": role });
             if let Some(p) = persisted_outgoing { detail["diskPersisted"] = json!(p); }
             // audit ws-media-2 — report the REAL run-state, not a hardcoded `!is_cart`.
@@ -9804,34 +9895,11 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                     "media: cannot apply a media change — {reason}."
                 ));
             }
-            let media_present = st.session.machine.drive8.get_attached_disk().is_some()
-                || st.session.machine.drive_b.get_attached_disk().is_some()
-                || st.session.machine.cartridge.is_some();
-            let before_id = if media_present { capture_media_checkpoint(&mut st) } else { None };
-            // audit ws-media-8 — record the mounted disk in the recents store (newest-
-            // first, cap 10, mountedAt), 1:1 with TS addRecent (recent-files.ts) on
-            // every ingest, so media/recent overlays it ahead of the dir scan.
-            add_recent_media(&mut st, &path_str, format_str);
-            let persisted_outgoing = match mount_disk_media_at(&mut st, pos, image, &path_str) {
-                Ok(p) => p,
-                Err(e) => return Response::err(id, -32602, format!("media: {e}")),
-            };
-            let after_id = capture_media_checkpoint(&mut st);
-            if let Some(ref b) = before_id { st.checkpoint_ring.pin(b); }
-            if let Some(ref a) = after_id { st.checkpoint_ring.pin(a); }
-            let cycle = st.session.machine.clk;
-
-            let event = json!({
-                "cycle": cycle,
-                "operation": "disk",
-                "role": format!("drive{unit}"),
-                "format": format_str,
-                "sha256": sha256,
-                "resetPolicy": null,
-                "checkpointBeforeId": before_id,
-                "checkpointAfterId": after_id
-            });
-            push_media_event(&mut st, event.clone());
+            let (event, persisted_outgoing) =
+                match insert_disk_media_at(&mut st, pos, unit, image, &path_str, format_str, &sha256) {
+                    Ok(v) => v,
+                    Err(e) => return Response::err(id, -32602, format!("media: {e}")),
+                };
             let mut detail = json!({ "name": disk_name, "backingPath": path_str });
             if let Some(p) = persisted_outgoing { detail["diskPersisted"] = json!(p); }
             // audit ws-media-mount-pause (Spec 709 §2.2 / §709.13.1) — a DISK
@@ -13490,6 +13558,78 @@ fn mount_disk_media_at(st: &mut State, pos: DrivePosition, image: DiskImage, new
         st.session.disk_path = new_path.to_string();
     }
     Ok(persisted_outgoing)
+}
+
+/// The disk half of `media/unmount`, for the drive in `pos` answering as `role`
+/// (`drive<N>`): checkpoint before, the outgoing disk's writes persisted to its host
+/// file, the eject (which darkens the 1541's write-protect sensor — how its DOS
+/// notices the removal), checkpoint after, both pinned, and the media event recorded.
+/// The caller has run the dirty-media guard. Returns the event and the persisted path.
+fn eject_disk_media_at(st: &mut State, pos: DrivePosition, role: &str) -> (Value, Option<String>) {
+    let before_id = capture_media_checkpoint(st);
+    // Persist the outgoing disk's dirty writes to its host file BEFORE detach (the
+    // data-loss fix — detach_disk only flushes into disk.bytes, not the host file).
+    let persisted = persist_outgoing_disk_at(st, pos);
+    st.session.machine.drive_mut(pos).detach_disk();
+    if pos == DrivePosition::A {
+        st.session.disk_path = String::new();
+    }
+    let after_id = capture_media_checkpoint(st);
+    if let Some(ref b) = before_id { st.checkpoint_ring.pin(b); }
+    if let Some(ref a) = after_id { st.checkpoint_ring.pin(a); }
+    let event = json!({
+        "cycle": st.session.machine.clk,
+        "operation": "eject",
+        "role": role,
+        "format": Value::Null,
+        "sha256": Value::Null,
+        "resetPolicy": Value::Null,
+        "checkpointBeforeId": before_id,
+        "checkpointAfterId": after_id
+    });
+    push_media_event(st, event.clone());
+    (event, persisted)
+}
+
+/// The disk half of `media/mount`, into the drive in `pos` at `unit`: checkpoint
+/// before (when a medium is already present — an intervention, not a fresh root),
+/// the recents store, [`mount_disk_media_at`] (the outgoing disk persisted and
+/// detached, the new one mounted, the session's disk path), checkpoint after, both
+/// pinned, and the media event recorded. The caller has run the dirty-media guard.
+/// Returns the event and the path of an outgoing disk it persisted.
+fn insert_disk_media_at(
+    st: &mut State,
+    pos: DrivePosition,
+    unit: u8,
+    image: DiskImage,
+    path: &str,
+    format: &str,
+    sha256: &str,
+) -> Result<(Value, Option<String>), String> {
+    let media_present = st.session.machine.drive8.get_attached_disk().is_some()
+        || st.session.machine.drive_b.get_attached_disk().is_some()
+        || st.session.machine.cartridge.is_some();
+    let before_id = if media_present { capture_media_checkpoint(st) } else { None };
+    // audit ws-media-8 — record the mounted disk in the recents store (newest-first,
+    // cap 10, mountedAt), 1:1 with TS addRecent (recent-files.ts) on every ingest, so
+    // media/recent overlays it ahead of the dir scan.
+    add_recent_media(st, path, format);
+    let persisted = mount_disk_media_at(st, pos, image, path)?;
+    let after_id = capture_media_checkpoint(st);
+    if let Some(ref b) = before_id { st.checkpoint_ring.pin(b); }
+    if let Some(ref a) = after_id { st.checkpoint_ring.pin(a); }
+    let event = json!({
+        "cycle": st.session.machine.clk,
+        "operation": "disk",
+        "role": format!("drive{unit}"),
+        "format": format,
+        "sha256": sha256,
+        "resetPolicy": null,
+        "checkpointBeforeId": before_id,
+        "checkpointAfterId": after_id
+    });
+    push_media_event(st, event.clone());
+    Ok((event, persisted))
 }
 
 /// Spec 871 — the drive unit a request addresses: `unit`, else a `slot` of 8-11, else a
@@ -23884,6 +24024,194 @@ mod batch1_tests {
         }
         d[bam + 256 + 1] = 0xff;
         d
+    }
+
+    // ── BUG-064 — runtime/swap_disk_and_continue runs the swap the hardware way ──
+
+    /// Tokenise one BASIC line (keywords and operators outside quotes) — enough for
+    /// the swap test's two programs.
+    fn basic_line(text: &str) -> Vec<u8> {
+        const TOKENS: &[(&str, u8)] = &[
+            ("PRINT", 0x99), ("CHR$", 0xc7), ("PEEK", 0xc2), ("POKE", 0x97), ("GOTO", 0x89),
+            ("THEN", 0xa7), ("LOAD", 0x93), ("AND", 0xaf), ("IF", 0x8b),
+            ("+", 0xaa), ("-", 0xab), ("*", 0xac), (">", 0xb1), ("=", 0xb2), ("<", 0xb3),
+        ];
+        let (mut out, mut rest, mut quoted) = (Vec::new(), text, false);
+        while let Some(c) = rest.chars().next() {
+            if !quoted {
+                if let Some((kw, tok)) = TOKENS.iter().find(|(kw, _)| rest.starts_with(kw)) {
+                    out.push(*tok);
+                    rest = &rest[kw.len()..];
+                    continue;
+                }
+            }
+            if c == '"' {
+                quoted = !quoted;
+            }
+            out.push(c as u8);
+            rest = &rest[1..];
+        }
+        out
+    }
+
+    /// A BASIC program at $0801 as a PRG: `(line number, text)` pairs.
+    fn basic_prg(lines: &[(u16, &str)]) -> Vec<u8> {
+        let mut prg = vec![0x01, 0x08];
+        let mut addr = 0x0801u16;
+        for (n, text) in lines {
+            let body = basic_line(text);
+            let next = addr + 4 + body.len() as u16 + 1;
+            prg.extend_from_slice(&next.to_le_bytes());
+            prg.extend_from_slice(&n.to_le_bytes());
+            prg.extend_from_slice(&body);
+            prg.push(0);
+            addr = next;
+        }
+        prg.extend_from_slice(&[0, 0]);
+        prg
+    }
+
+    /// [`named_d64`] with one-block PRG files on track 17 (sector i for file i),
+    /// listed in the directory at 18/1.
+    fn d64_with_files(name: &[u8], files: &[(&[u8], Vec<u8>)]) -> Vec<u8> {
+        let spt = |t: usize| match t { 1..=17 => 21, 18..=24 => 19, 25..=30 => 18, _ => 17 };
+        let off = |t: usize, s: usize| ((1..t).map(spt).sum::<usize>() + s) * 256;
+        let mut d = named_d64(name);
+        let dir = off(18, 1);
+        for (i, (fname, prg)) in files.iter().enumerate() {
+            assert!(prg.len() <= 254 && i < 8, "one block each, one directory sector");
+            let blk = off(17, i);
+            d[blk] = 0;
+            d[blk + 1] = (prg.len() + 1) as u8; // last byte used
+            d[blk + 2..blk + 2 + prg.len()].copy_from_slice(prg);
+            let e = dir + i * 32;
+            d[e + 2] = 0x82; // PRG, closed
+            d[e + 3] = 17;
+            d[e + 4] = i as u8;
+            for j in 0..16 {
+                d[e + 5 + j] = *fname.get(j).unwrap_or(&0xa0);
+            }
+            d[e + 30] = 1;
+        }
+        d
+    }
+
+    fn screen_text(st: &SharedState) -> String {
+        trx64_monitor::verbs::text_screen(&st.lock().unwrap().session.machine).rows.join("\n")
+    }
+
+    /// Run until the text screen satisfies `done`, at most `max` cycles.
+    fn run_until_screen(st: &SharedState, done: impl Fn(&str) -> bool, max: u64) -> bool {
+        let mut ran = 0;
+        while ran < max {
+            if done(&screen_text(st)) {
+                return true;
+            }
+            run_cycle_budget(&mut st.lock().unwrap().session, 200_000);
+            ran += 200_000;
+        }
+        done(&screen_text(st))
+    }
+
+    /// Booted with disk A in drive 8, A's program loaded and RUN, waiting at its prompt.
+    /// The program reads the keyboard only every 8 jiffies (PEEK(197) after TI moved
+    /// by 8) and accepts RETURN only when two such samples in a row see it down — a
+    /// press shorter than one sampling period can never be accepted, whatever its
+    /// phase. On acceptance it clears the screen and chain-loads "B" from drive 8.
+    fn at_the_swap_prompt(dir: &std::path::Path) -> Option<(SharedState, std::path::PathBuf, std::path::PathBuf)> {
+        let st = booted_state()?;
+        let prog_a = basic_prg(&[
+            (10, "PRINT CHR$(147)\"INSERT DISK B, PRESS RETURN\""),
+            (20, "L=0"),
+            (30, "T=TI"),
+            (40, "IF TI-T<8 THEN 40"),
+            (50, "K=PEEK(197)=1"),
+            (60, "IF K AND L THEN 90"),
+            (70, "L=K:GOTO 30"),
+            (90, "POKE 198,0:PRINT CHR$(147);"),
+            (100, "LOAD\"B\",8"),
+        ]);
+        let prog_b = basic_prg(&[(10, "PRINT\"HELLO FROM DISK B\"")]);
+        let (pa, pb) = (dir.join("a.d64"), dir.join("b.d64"));
+        std::fs::write(&pa, d64_with_files(b"DISK A", &[(b"A", prog_a)])).unwrap();
+        std::fs::write(&pb, d64_with_files(b"DISK B", &[(b"B", prog_b)])).unwrap();
+        call(&st, "media/mount", json!({ "path": pa.to_str().unwrap() }));
+        call(&st, "session/type", json!({ "text": "LOAD\"A\",8\r" }));
+        let loaded = |s: &str| s.contains("LOADING") && s.lines().filter(|l| l.trim() == "READY.").count() == 2;
+        assert!(run_until_screen(&st, loaded, 30_000_000), "A loads: {}", screen_text(&st));
+        call(&st, "session/type", json!({ "text": "RUN\r" }));
+        assert!(run_until_screen(&st, |s| s.contains("PRESS RETURN"), 3_000_000), "the prompt: {}", screen_text(&st));
+        run_cycle_budget(&mut st.lock().unwrap().session, 500_000);
+        Some((st, pa, pb))
+    }
+
+    #[test]
+    fn swap_and_continue_ejects_settles_inserts_and_presses_return_long_enough() {
+        let dir = std::env::temp_dir().join(format!("trx64-bug064-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let Some((st, pa, pb)) = at_the_swap_prompt(&dir) else { return };
+        // Disk A was written before the swap; the eject must persist it like media/unmount.
+        let marker = std::fs::read(&pa).unwrap().len() - 1;
+        st.lock().unwrap().session.machine.drive8.disk.as_mut().unwrap().bytes[marker] = 0x64;
+        let r = call(&st, "runtime/swap_disk_and_continue", json!({
+            "path": pb.to_str().unwrap(), "post_cycles": 8_000_000,
+        }));
+        let d = &r["detail"];
+        assert_eq!(r["ok"], json!(true), "{r:#}");
+        assert!(r["screenBefore"].as_str().unwrap().contains("INSERT DISK B, PRESS RETURN"), "{r:#}");
+        assert!(r["screenAfter"].as_str().unwrap().contains("HELLO FROM DISK B"), "disk B's program ran: {r:#}");
+        assert_eq!((r["promptCleared"].clone(), r["advanced"].clone()), (json!(true), json!(true)));
+        assert_eq!(r["promptLine"]["before"], json!("INSERT DISK B, PRESS RETURN             "));
+        // The machine really ran between the steps.
+        let (eject, insert) = (d["ejectCycle"].as_u64().unwrap(), d["insertCycle"].as_u64().unwrap());
+        assert!(insert - eject >= 1_500_000, "eject {eject} → insert {insert}");
+        assert!(d["settleCycles"]["afterEject"].as_u64().unwrap() >= 1_500_000);
+        assert!(d["settleCycles"]["afterInsert"].as_u64().unwrap() >= 1_500_000);
+        assert!(d["postCycles"].as_u64().unwrap() >= 8_000_000);
+        assert_eq!(d["confirmHoldCycles"], json!(400_000));
+        assert!(d["confirmCycle"].as_u64().unwrap() >= insert + 1_500_000);
+        // The same bookkeeping as media/unmount + media/mount.
+        assert_eq!(d["eject"]["operation"], json!("eject"));
+        assert_eq!(d["insert"]["operation"], json!("disk"));
+        assert!(d["eject"]["checkpointAfterId"].is_string() && d["insert"]["checkpointAfterId"].is_string());
+        let events = call(&st, "media/events", json!({}));
+        let ops: Vec<Value> = events["events"].as_array().unwrap().iter().map(|e| e["operation"].clone()).collect();
+        assert!(ops.ends_with(&[json!("eject"), json!("disk")]), "{ops:?}");
+        assert_eq!(d["diskPersisted"], json!(pa.to_str().unwrap()));
+        assert_eq!(std::fs::read(&pa).unwrap()[marker], 0x64, "disk A's write reached its file");
+        assert_eq!(st.lock().unwrap().session.disk_path, pb.to_str().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The default hold is long because a short press is missed: the 33 000 cycles
+    /// `runtime_type` used to hold a key cannot span two of this program's samples.
+    #[test]
+    fn swap_and_continue_with_a_short_press_is_not_seen_by_a_slow_keyboard_poll() {
+        let dir = std::env::temp_dir().join(format!("trx64-bug064-short-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let Some((st, _pa, pb)) = at_the_swap_prompt(&dir) else { return };
+        let r = call(&st, "runtime/swap_disk_and_continue", json!({
+            "path": pb.to_str().unwrap(), "post_cycles": 8_000_000, "confirm_hold_cycles": 33_000,
+        }));
+        assert_eq!(r["detail"]["confirmHoldCycles"], json!(33_000));
+        assert!(r["screenAfter"].as_str().unwrap().contains("PRESS RETURN"), "{r:#}");
+        assert_eq!((r["promptCleared"].clone(), r["advanced"].clone()), (json!(false), json!(false)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The eject alone is sensed: the 1541's write-protect sensor goes dark as the disk
+    /// leaves, and its DOS latches that in its disk-change flag ($1C).
+    #[test]
+    fn an_eject_is_seen_by_the_drive_as_a_disk_change() {
+        let dir = std::env::temp_dir().join(format!("trx64-bug064-eject-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let Some((st, _pa, _pb)) = at_the_swap_prompt(&dir) else { return };
+        let flag = |st: &SharedState| st.lock().unwrap().session.machine.drive8.ram()[0x1c];
+        assert_eq!(flag(&st), 0, "the LOAD consumed the flag of the first insert");
+        call(&st, "media/unmount", json!({}));
+        run_cycle_budget(&mut st.lock().unwrap().session, 1_500_000);
+        assert_ne!(flag(&st), 0, "the DOS noticed the removal");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Booted, with drive position B switched on at 9 and given time for its DOS to
