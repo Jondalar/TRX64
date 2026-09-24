@@ -1,6 +1,6 @@
 # Spec 876 — The POT lines: paddles, mouse and extra fire buttons at `$D419`/`$D41A`
 
-**Status:** PROPOSED 2026-09-24
+**Status:** BUILT on branch spec-876-pot-lines (not merged) — as built in §15
 **Repos:** TRX64. C64RE: no change.
 **Number:** 876 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`, row present).
 **Depends on:** Spec 855 (several SIDs, `sid_chip_read`, the host read hook), Spec 851/856
@@ -184,7 +184,9 @@ impl Machine {
   The quotient is exact integer arithmetic in `u16`, rounded down. VICE computes the same
   quotient in `double` and truncates. Where the true quotient is a whole number, VICE's
   `double` could land a hair below and truncate one lower; §12.4 checks the table against
-  exact arithmetic.
+  exact arithmetic. *Measured* (`pot::tests::vice_double_path_against_exact`): it does, on
+  17 of the 64 516 pairs with both sides in `1..=254` — `(14,182)`, `(27,216)`, `(54,54)`,
+  `(58,58)` … — never by more than one.
 - **Only chip 0 has POT lines.** SIDs 1.. (Spec 855) read `$FF` on `$19`/`$1A`, as VICE's
   engines do. The constant in `Sid6581::read` becomes `0xff`, which also fixes the stale
   comment.
@@ -385,7 +387,9 @@ first-divergence explanation.
 8. **The KERNAL moves the mux** (characterisation, recorded). Port 1 = `(10,10)`,
    port 2 = `(200,200)`, KERNAL idle with the IRQ on. Every `$D419` value read over 100
    frames is in `{10, 200, 9, $FF}` (port 1, port 2, parallel, neither). The distribution is
-   recorded.
+   recorded. *As run:* 261 532 reads, `{10: 260 992, $FF: 540}` — the scan's short
+   port-2 and both-ports states never stood on a 512-cycle boundary in 100 frames; its
+   `$00` state (neither) did, 540 times.
 9. **Turbo.** On the `u64` profile at 48 MHz, test 3's sweep puts the boundaries on the
    same PHI2 cycles as at 1 MHz. `reads` counts every read once, with or without the fast
    path.
@@ -405,7 +409,10 @@ first-divergence explanation.
     picture is byte-identical. C64RE Spec 429 measured on the TS runtime that the six others
     read no POT; this re-measures it.
 14. **Surface.** The monitor golden transcript gains `pot` (help and output), and nothing
-    else in it moves. Daemon tests cover `pot_set`/`pot_clear` and `input_status.pots`.
+    else in it moves — except the `io` verb's SID row, which is §6's peek fix itself:
+    `$D419`/`$D41A` show `ff ff` (what the CPU reads) where they showed the register
+    shadow's `00 00`. The earlier sentence missed that `io` is one of the peek paths §6
+    names. Daemon tests cover `pot_set`/`pot_clear` and `input_status.pots`.
 15. **Nothing else moved.** `cia_alarm_check_gate` digests unchanged. `sid_multi_gate`,
     `u64_turbo_gate`, `turbo_fastpath_gate` and `ntsc_gate` green. Run the workspace suite.
 
@@ -442,3 +449,65 @@ C64U yet. That is UE2's bridge, not TRX64's.
 - **Where VICE's `$80` came from** in C64RE Spec 429's gold trace. The candidates are a
   configured paddle device answering a centred host axis (`mouse_paddle.c:170-171`) or a
   1351 at rest. This does not block: bit 7 is the same.
+
+## §15 As built (branch `spec-876-pot-lines`, 2026-09-24)
+
+**Commits.** `35f527b` core (`pot.rs`, the bus, peeks, `warm_reset`, the checkpoint node,
+`pot_gate`, the 7-game gate's POT line), `cef2bc2` surface (monitor `pot`, daemon verbs,
+golden), then these docs.
+
+**Where it went.**
+
+- `crates/trx64-core/src/pot.rs` — `PotLines` as §5, plus `seen: [u64; 4]`, a 256-bit set
+  of the values the CPU reads returned (a counter beside `reads`, not state, not
+  checkpointed), so the gate can print "the values seen". `select`, `parallel`, `settle`,
+  `read`, `peek`, `set`/`clear`, `checkpoint`/`restore`.
+- `FullBus` gains `pot: &mut PotLines`; `sid_chip_read` answers chip 0's `$19`/`$1A` from
+  it after the host hook; the `$DC00-$DCFF` write arm settles before a PRA/DDRA write.
+  `poke_io` settles the same way, `warm_reset` settles before anything else.
+- `Machine::set_pot` / `clear_pot` / `pot` / `pot_lines` / `pot_peek`. The machine-level
+  clock is `c64_core.clk` (the full machine's; `run_held` advances it, and it is what the
+  bus stamps). Both peek lanes go through one `sid_peek`: host peek, then chip 0's POT
+  latch, then **`$FF` on `$19`/`$1A` of chips 1..** (§6 named chip 0 only; the extra chips'
+  peek showed the shadow while the CPU read `$FF`), then the shadow.
+- The CPU-isolated inject path (`SidBus`) reads `Sid6581::read`, i.e. `$FF`, and has no
+  latch, as §6 said. The monitor's `pot` on that path reports from `c64_core.clk`.
+- Checkpoint: `pot` node only when not default; restore puts it back exactly, else
+  `reset_to_default(clk)`. `checkpoint_diff` files `pot` under `input`.
+- Monitor: `pot` in `OWNED` and the help; `pot <port> …` classifies as `Mutates` (864 §4:
+  it changes what the C64 reads next), bare `pot` observes. Values are hex (`$` optional).
+- Daemon: `session/pot_set {port, x, y}` (bytes checked, port refused with the core's
+  message), `session/pot_clear {port?}`, `input_status.pots`. Both verbs also journal as
+  input kind `"pot"` and count as operating methods, as the joystick verbs do.
+
+**Acceptance as run.**
+
+| § | Result |
+|---|---|
+| 12.1 | `$FF` by CPU read, peek and `io` lens under all five selections; chip 1 at `$D420` reads `$FF` while chip 0 reads the set `$12/$34`. |
+| 12.2 | PAL (98 525) and NTSC (102 273): held → `$12/$34` then `$56/$78`, peek and CPU `LDA`. Unheld, recorded: `$DC00` is back at `$7F` after 100 ms and both writes read port 1's `$12/$34` — the race `input_test.py` names. |
+| 12.3 | The `STA $DC00` fell on all 512 cycles of the window; every read obeys "port 2 before the first boundary after W, port 1 from it"; the one write on a boundary left that boundary old. `set_pot` between runs: 1 800 runs, 419 phases, 6 on a boundary cycle, all obey the rule. |
+| 12.4 | Table exact; VICE's `double` path is one lower on 17 pairs (§4). |
+| 12.5–12.7 | Pass. Last Ninja's sequence takes the intro with nothing set (power-on DDRA and port 1), the game with port 1 at `$00`. |
+| 12.8 | 261 532 reads over 100 frames: `{10: 260 992, $FF: 540}` (see §12.8). |
+| 12.9 | 48 MHz: an idle run moved the write over 511 phases; the rule holds in PHI2 cycles; `reads` equals the bus record; fast path on and off read identical `(cycle, value)` streams. |
+| 12.10 | `Hold::Cpu` and `Hold::Reset`: the first read after the hold sees the value set before it. |
+| 12.11 | No node by default (also after set→clear once sampled); restore mid-window (captured 3 cycles after a set, before its boundary) replays 500 frames of host input read-for-read, and the two machines end with equal checkpoints; a node-less checkpoint restores to nothing set, `$FF`, `sampled = clk >> 9`; a `.c64re` written by main 1b84320 (`tests/fixtures/pot/`, 2.2 KB) restores — its RAM holds main's `$80`, its continuation writes `$FF`. |
+| 12.12 | Clone reads what the original reads; `warm_reset` keeps both ports, DDRA `$00` selects both, the next sample is the parallel reading. |
+| 12.13 | Default, `GATE_DRIVE_B=9`, `GATE_FOLDER=9`: 7/7 each, **all 21 pictures byte-identical to main 1b84320**. POT reads: lastninja 671 in every run, every one `$FF` (bit 7 as with `$80`: `BMI` taken, the intro — the picture is the title, not Central Park); scramble, polarbear, motm, greenberet, impossible2, maniac **0** — Spec 429's TS measurement holds on TRX64. No gate expectation changed. |
+| 12.14 | Golden: the help line, the `pot` block, and the `io` SID row (§12.14's note). Daemon test `pot_set_and_clear_reach_d419_and_input_status`. |
+| 12.15 | `cia_alarm_check_gate` digests unchanged; `sid_multi_gate`, `u64_turbo_gate`, `turbo_fastpath_gate`, `ntsc_gate`, `snapshot_roundtrip_fidelity` green. Workspace `cargo test --release --workspace --no-fail-fast`: everything green but the known-flaky `trx64-ffi` `audio_persistent_engine_continuity`, which passed twice rerun alone. |
+| 16 | Cost, `perf_bench`, main and branch alternated, 7 runs each, under another agent's builds on the same machine: disk workload 10.35/10.01 MHz (main) vs 10.28/10.35 (branch); pure headless medians 11.82/11.71/9.41/11.91 (main) vs 11.44/10.35/12.11/11.49 (branch). The ranges overlap, the fastest single median is the branch's: within run-to-run noise. Nothing runs per cycle; a stock program pays one shift-and-compare per `$DC00`/`$DC02` write. |
+
+**Found on the way.**
+
+- `monitor_golden` finds its ROMs at `~/.trx64/roms` or `TRX64_ROM_DIR`; its sibling-path
+  fallback (4–5 levels up) does not reach `Tools/C64ReverseEngineeringMCP` from a checkout
+  in `Tools/`, so without either it SKIPs and prints so. Run with `TRX64_ROM_DIR`.
+
+**Open.**
+
+- The scenario player's `Paddle { idx, value }` step still lands in the daemon's empty
+  `set_paddle` stub. Mapping a TS paddle index and value onto `set_pot` is a mapping
+  decision, and §4 keeps mappings out of TRX64; it stays open until a scenario needs it.
+- §14's two questions are unchanged.
