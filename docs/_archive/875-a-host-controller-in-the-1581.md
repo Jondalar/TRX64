@@ -1,6 +1,6 @@
 # Spec 875 — A controller of the host's own in the 1581
 
-**Status:** BUILT on branch spec-875-host-fdc (not merged) — as built in §15
+**Status:** MERGED 2026-09-24 (main, v0.9.1) — as built in §15
 **Repos:** TRX64. C64RE: no change.
 **Number:** 875 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`, row present).
 **Depends on:** Spec 872 (the 1581 board, its CIA glue, the WD1772 and the MFM surface),
