@@ -78,6 +78,9 @@ pub struct Session {
     /// device on the bus has its own power, like drive B, and a C64 power cut does not
     /// unplug it.
     pub iec_devices_held: trx64_core::iec_device::IecDevices,
+    /// Spec 875 — the host's controllers in the 1581s at A and B across a power cycle:
+    /// part of the board, which is a device of its own.
+    pub fdc_held: [Option<Box<dyn trx64_core::fdc_controller::FdcController>>; 2],
     /// Spec 863 — which C64 this session is (a `models.toml` row). Session identity, like
     /// the machine profile: every machine the session builds — power-on, the power-off
     /// blank — is built on it, so it survives a power cycle; a warm reset keeps the
@@ -156,6 +159,7 @@ impl Session {
             drive_b_state: None,
             drive_types: None,
             iec_devices_held: Default::default(),
+            fdc_held: [None, None],
             model,
         }
     }
@@ -207,6 +211,18 @@ impl Session {
         }
         if let Some([_, b]) = types {
             let _ = machine.set_drive_type(trx64_core::drive::DrivePosition::B, b);
+        }
+        // Spec 875 §7 — the controllers go back into their boards while the positions
+        // are off (A was switched off above for its type; B is off as it is built),
+        // before the disks and before either comes back on: `rebase` here, `power(true)`
+        // and `drive_reset` at the power-on below.
+        let [fdc_a, fdc_b] = std::mem::take(&mut self.fdc_held);
+        for (pos, dev) in [(trx64_core::drive::DrivePosition::A, fdc_a), (trx64_core::drive::DrivePosition::B, fdc_b)] {
+            if let Some(dev) = dev {
+                if let Err(e) = machine.attach_fdc_controller(pos, dev) {
+                    eprintln!("[session] power_on: {e}");
+                }
+            }
         }
         // Re-attach the registered disk (writes intact, an unreported write still
         // unreported).
@@ -272,6 +288,7 @@ impl Session {
         self.drive_b_state = Some((self.machine.drive_b.unit_jumpers(), self.machine.drive_b.powered()));
         self.drive_types = Some([self.machine.drive8.board_type(), self.machine.drive_b.board_type()]);
         self.iec_devices_held = self.machine.take_iec_devices();
+        self.fdc_held = self.machine.take_fdc_controllers();
         self.machine = Machine::new_with_model(self.model);
         self.running = false;
         self.powered = false;

@@ -7,3 +7,9 @@ license.workspace = true
 [dependencies]
 trx64-core = { path = "../trx64-core" }
 trx64-trace = { path = "../trx64-trace" }
+
+[dev-dependencies]
+# Spec 875 — the test controller (trx64-core/tests/common/sector_fdc.rs) serialises its
+# checkpoint state.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

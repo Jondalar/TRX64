@@ -3311,6 +3311,8 @@ dependencies = [
 name = "trx64-session"
 version = "0.9.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "trx64-core",
  "trx64-trace",
 ]
