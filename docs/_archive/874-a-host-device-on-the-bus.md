@@ -1,6 +1,6 @@
 # Spec 874 — A device of the host's own on the bus: a public IEC device trait
 
-**Status:** BUILT on branch spec-874-host-device (not merged) — 2026-09-23, as built in §15
+**Status:** MERGED 2026-09-24 (main) — as built in §15
 **Repos:** TRX64. C64RE: no change.
 **Number:** 874 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`, row present).
 **Depends on:** Spec 873 (the folder device, the `IECDEVICE` slot, conf3, the sync points),
