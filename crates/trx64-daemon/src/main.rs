@@ -7540,6 +7540,67 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             }
         }
 
+        // Spec 871 — both drive positions' panels, A first: what `session/drive_status`
+        // answers for each, addressed by position rather than by unit, so a client can
+        // draw a switched-off B without knowing where its jumpers stand.
+        "session/drives" => {
+            let mut st = state.lock().unwrap();
+            let a = drive_status_json_at(&mut st, DrivePosition::A);
+            let b = drive_status_json_at(&mut st, DrivePosition::B);
+            Response::ok(id, json!([a, b]))
+        }
+
+        // Spec 870 D2 — the drive's own RESET input, at `unit`. Without `held`: one pulse
+        // (`Drive1541::reset` — the disk stays, a drive without power ignores it). With
+        // `held`: hold the line low or release it (release runs the reset sequence).
+        "session/drive_reset" => {
+            let unit = match unit_param(&req.params) {
+                Ok(u) => u,
+                Err(e) => return Response::err(id, -32602, format!("session/drive_reset: {e}")),
+            };
+            let mut st = state.lock().unwrap();
+            let pos = match drive_position(&st, unit) {
+                Ok(p) => p,
+                Err(e) => return Response::err(id, -32602, format!("session/drive_reset: {e}")),
+            };
+            let drv = st.session.machine.drive_mut(pos);
+            match req.params.get("held").and_then(|v| v.as_bool()) {
+                Some(held) => drv.set_reset_held(held),
+                None => drv.reset(),
+            }
+            let d = st.session.machine.drive(pos);
+            Response::ok(id, json!({
+                "device": if d.powered() { d.unit() } else { d.unit_jumpers() },
+                "powered": d.powered(),
+                "resetHeld": d.reset_held(),
+            }))
+        }
+
+        // Spec 870 D2a — stop the clock of the drive at `unit` (`stopped: true`) or let
+        // it run on where it stood (`false`). Stopped is powered, not clocked, its bus
+        // outputs held as they were.
+        "session/drive_stop" => {
+            let unit = match unit_param(&req.params) {
+                Ok(u) => u,
+                Err(e) => return Response::err(id, -32602, format!("session/drive_stop: {e}")),
+            };
+            let Some(stopped) = req.params.get("stopped").and_then(|v| v.as_bool()) else {
+                return Response::err(id, -32602, "session/drive_stop: missing `stopped` (true or false)");
+            };
+            let mut st = state.lock().unwrap();
+            let pos = match drive_position(&st, unit) {
+                Ok(p) => p,
+                Err(e) => return Response::err(id, -32602, format!("session/drive_stop: {e}")),
+            };
+            st.session.machine.drive_mut(pos).set_stopped(stopped);
+            let d = st.session.machine.drive(pos);
+            Response::ok(id, json!({
+                "device": if d.powered() { d.unit() } else { d.unit_jumpers() },
+                "powered": d.powered(),
+                "stopped": d.stopped(),
+            }))
+        }
+
         // Spec 872 §7 — the board of the drive at `unit`: "1541" or "1581". Refused while
         // that drive is powered, naming its position: the type is chosen at power-on.
         // Off, the new board is built fresh (RAM zero, its own ROM at its power-on). A
@@ -7642,6 +7703,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 "unit": unit,
                 "path": f.root.to_string_lossy(),
                 "read_only": f.read_only(),
+                "boot": f.dos.boot.as_ref().map(|b| b.join("/")),
                 "profile": f.profile.name(),
             }))
         }
@@ -7656,6 +7718,13 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 return Response::err(id, -32602, format!("device/folder_detach: {e}"));
             }
             Response::ok(id, json!({ "unit": unit, "detached": true }))
+        }
+
+        // Spec 873 — the folder devices on the bus, in unit order (the `folders` of
+        // `session/state`, without the rest of the state).
+        "device/folders" => {
+            let st = state.lock().unwrap();
+            Response::ok(id, folders_json(&st))
         }
 
         "session/drive_unit" => {
@@ -13411,7 +13480,9 @@ fn drive_status_json(st: &mut State) -> Value {
 }
 
 /// [`drive_status_json`] for the drive in `pos` (Spec 871). `device` is the unit it
-/// answers to; `powered` says whether it is on at all.
+/// answers to (as of its last reset), `unitJumpers` where its jumpers stand now;
+/// `powered`, `stopped` and `resetHeld` are the three Spec 870 states; `disk` is the
+/// medium in it (`{path, format}`, or null).
 fn drive_status_json_at(st: &mut State, pos: DrivePosition) -> Value {
     use trx64_core::rotation::BRA_MOTOR_ON;
     // Spec 872 — a 1581 has no GCR rotation: its panel is the CIA's glue (motor, LED,
@@ -13427,7 +13498,12 @@ fn drive_status_json_at(st: &mut State, pos: DrivePosition) -> Value {
         let writing = w.busy && (w.command & 0xe0 == 0xa0 || w.command & 0xf0 == 0xf0);
         return json!({
             "device": drv.unit(),
+            "position": pos.name(),
+            "unitJumpers": drv.unit_jumpers(),
             "powered": drv.powered(),
+            "stopped": drv.stopped(),
+            "resetHeld": drv.reset_held(),
+            "disk": drive_disk_json(st, pos),
             "type": "1581",
             "ledOn": p.activity_led,
             "ledFlashing": false,
@@ -13481,7 +13557,12 @@ fn drive_status_json_at(st: &mut State, pos: DrivePosition) -> Value {
     };
     json!({
         "device": drv.unit(),
+        "position": pos.name(),
+        "unitJumpers": drv.unit_jumpers(),
         "powered": drv.powered(),
+        "stopped": drv.stopped(),
+        "resetHeld": drv.reset_held(),
+        "disk": drive_disk_json(st, pos),
         "type": "1541",
         "ledOn": led_on,
         "ledFlashing": false,
@@ -13746,26 +13827,32 @@ fn drives_json(st: &State) -> Value {
         .into_iter()
         .map(|pos| {
             let d = m.drive(pos);
-            let path = d
-                .get_attached_disk()
-                .map(|disk| {
-                    disk.backing_path
-                        .clone()
-                        .filter(|p| !p.is_empty())
-                        .unwrap_or_else(|| if pos == DrivePosition::A { st.session.disk_path.clone() } else { String::new() })
-                });
             json!({
                 "unit": if d.powered() { d.unit() } else { d.unit_jumpers() },
                 "powered": d.powered(),
                 "type": trx64_core::drive::board_name(d.board_type()),
-                "disk": match path {
-                    None => Value::Null,
-                    Some(p) => json!({ "path": p }),
-                },
+                "disk": drive_disk_json(st, pos),
             })
         })
         .collect();
     Value::Array(list)
+}
+
+/// Spec 871/872 — the medium in the drive at `pos`: `{path, format}`, or null when it
+/// is empty. The path is the image's backing file; A falls back to the session's
+/// `disk_path` for an image that has none.
+fn drive_disk_json(st: &State, pos: DrivePosition) -> Value {
+    match st.session.machine.drive(pos).get_attached_disk() {
+        None => Value::Null,
+        Some(disk) => {
+            let path = disk
+                .backing_path
+                .clone()
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| if pos == DrivePosition::A { st.session.disk_path.clone() } else { String::new() });
+            json!({ "path": path, "format": disk.kind.name() })
+        }
+    }
 }
 
 /// Spec 873 — one line per folder device for `session/state`.
@@ -13775,7 +13862,15 @@ fn folders_json(st: &State) -> Value {
             .machine
             .folders()
             .into_iter()
-            .map(|f| json!({ "unit": f.unit, "path": f.root.to_string_lossy(), "read_only": f.read_only() }))
+            .map(|f| {
+                json!({
+                    "unit": f.unit,
+                    "path": f.root.to_string_lossy(),
+                    "read_only": f.read_only(),
+                    "boot": f.dos.boot.as_ref().map(|b| b.join("/")),
+                    "profile": f.profile.name(),
+                })
+            })
             .collect(),
     )
 }
@@ -24600,5 +24695,65 @@ mod batch1_tests {
         assert_eq!(state["folders"][0]["read_only"], json!(true));
         let g = st.lock().unwrap();
         assert_ne!(g.session.machine.iec.device_slots & (1 << 10), 0, "back on the bus");
+    }
+
+    // ── The per-position panel, reset, stop, folder list — the verbs a host needs to
+    //    drive both positions without `session/state` ─────────────────────────────────
+
+    #[test]
+    fn both_positions_report_their_panel_reset_and_stop() {
+        let Some(st) = booted_state() else { return };
+        let d = call(&st, "session/drives", json!({}));
+        assert_eq!(d.as_array().map(|a| a.len()), Some(2), "{d}");
+        assert_eq!((d[0]["position"].clone(), d[1]["position"].clone()), (json!("A"), json!("B")));
+        assert_eq!(d[1]["powered"], json!(false), "B comes up off");
+        assert_eq!(d[1]["unitJumpers"], json!(9));
+        for k in ["stopped", "resetHeld"] {
+            assert_eq!(d[0][k], json!(false), "{k}");
+        }
+        assert!(d[0]["disk"].is_null(), "no disk");
+
+        call(&st, "session/drive_power", json!({ "unit": 9, "on": true }));
+        let d64 = temp_file("panel.d64", &named_d64(b"PANEL"));
+        call(&st, "media/mount", json!({ "path": d64.to_str().unwrap(), "unit": 9 }));
+        let b = call(&st, "session/drive_status", json!({ "unit": 9 }));
+        assert_eq!((b["position"].clone(), b["device"].clone()), (json!("B"), json!(9)));
+        assert_eq!(b["disk"]["format"], json!("d64"), "{b}");
+        assert_eq!(b["disk"]["path"], json!(d64.to_str().unwrap()));
+        let state = call(&st, "session/state", json!({}));
+        assert_eq!(state["drives"][1]["disk"]["format"], json!("d64"), "the same disk line in the state");
+
+        let r = call(&st, "session/drive_stop", json!({ "unit": 9, "stopped": true }));
+        assert_eq!((r["stopped"].clone(), r["powered"].clone()), (json!(true), json!(true)));
+        assert!(st.lock().unwrap().session.machine.drive_b.stopped());
+        assert!(call_err(&st, "session/drive_stop", json!({ "unit": 9 })).message.contains("stopped"));
+        call(&st, "session/drive_stop", json!({ "unit": 9, "stopped": false }));
+
+        let r = call(&st, "session/drive_reset", json!({ "unit": 9, "held": true }));
+        assert_eq!(r["resetHeld"], json!(true));
+        assert_eq!(call(&st, "session/drives", json!({}))[1]["resetHeld"], json!(true));
+        let r = call(&st, "session/drive_reset", json!({ "unit": 9, "held": false }));
+        assert_eq!(r["resetHeld"], json!(false));
+        let r = call(&st, "session/drive_reset", json!({ "unit": 9 }));
+        assert_eq!((r["device"].clone(), r["resetHeld"].clone()), (json!(9), json!(false)));
+        assert!(call_err(&st, "session/drive_reset", json!({ "unit": 11 })).message.contains("no drive at unit 11"));
+    }
+
+    #[test]
+    fn device_folders_lists_what_is_attached() {
+        let Some(st) = booted_state() else { return };
+        let dir = TmpDir::new("list");
+        std::fs::create_dir_all(dir.0.join("games")).unwrap();
+        let path = dir.0.to_str().unwrap();
+        assert_eq!(call(&st, "device/folders", json!({})), json!([]));
+        let r = call(&st, "device/folder_attach", json!({ "unit": 10, "path": path, "read_only": true, "boot": "games/start.prg" }));
+        assert_eq!(r["boot"], json!("games/start.prg"), "{r}");
+        let f = call(&st, "device/folders", json!({}));
+        assert_eq!(f[0]["unit"], json!(10));
+        assert_eq!(f[0]["read_only"], json!(true));
+        assert_eq!(f[0]["boot"], json!("games/start.prg"));
+        assert_eq!(f[0]["profile"], json!("ultimate"));
+        call(&st, "device/folder_detach", json!({ "unit": 10 }));
+        assert_eq!(call(&st, "device/folders", json!({})), json!([]));
     }
 }

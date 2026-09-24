@@ -377,21 +377,24 @@ impl Runtime {
 
     // ── media ──────────────────────────────────────────────────────────────────
 
-    /// Mount a disk (.d64/.g64) or cartridge (.crt) from a host path. `slot` is
-    /// accepted for the wire contract (the drive is slot 8).
+    /// Mount a disk (.d64/.g64) or cartridge (.crt) from a host path. `slot` is not
+    /// sent: a disk goes to the drive at unit 8 (position A as it comes up). Use
+    /// [`Runtime::mount_at`] to address a unit.
     pub fn mount(&self, path: String, slot: u8) -> Result<MediaResult, Trx64Error> {
         let _ = slot;
         let v = self.rpc("media/mount", json!({ "path": path }))?;
         decode(v)
     }
 
-    /// Swap the mounted disk for another (drive stays attached).
+    /// Swap the disk in the drive at unit 8 for another ([`Runtime::swap_at`] takes
+    /// a unit).
     pub fn swap(&self, path: String) -> Result<MediaResult, Trx64Error> {
         let v = self.rpc("media/swap", json!({ "path": path }))?;
         decode(v)
     }
 
-    /// Unmount a slot. `role` = "drive8" (disk) or "cartridge"; default drive8.
+    /// Eject the disk from the drive at unit 8. `slot` is not sent, so this never
+    /// ejects the cartridge ([`Runtime::unmount_at`] takes a unit).
     pub fn unmount(&self, slot: u8) -> Result<UnmountResult, Trx64Error> {
         let _ = slot;
         let v = self.rpc("media/unmount", json!({}))?;
@@ -411,6 +414,135 @@ impl Runtime {
             return Ok(None);
         }
         Ok(Some(decode(v)?))
+    }
+
+    // ── drives (Specs 870–872) ─────────────────────────────────────────────────
+    //
+    // Two drive positions, A and B. The wire addresses a drive by the UNIT it answers
+    // to (8-11), as `LOAD"$",9` does: the powered drive at that unit, else a drive that
+    // is off with its jumpers there. Every call below is the daemon's own verb, so the
+    // refusals (a unit taken, a type change while powered, a medium that does not fit)
+    // are the daemon's, raised as `Trx64Error::Dispatch` with its message.
+
+    /// Both positions' panels, A first. Addressed by position, so a switched-off B
+    /// shows up without knowing where its jumpers stand.
+    pub fn drives(&self) -> Result<Vec<DriveStatus>, Trx64Error> {
+        let v = self.rpc("session/drives", json!({}))?;
+        decode(v)
+    }
+
+    /// The panel of the drive at `unit`.
+    pub fn drive_status(&self, unit: u8) -> Result<DriveStatus, Trx64Error> {
+        let v = self.rpc("session/drive_status", json!({ "unit": unit }))?;
+        decode(v)
+    }
+
+    /// Switch the drive at `unit` on or off. On is refused while another device
+    /// answers to the unit its jumpers would bring it up at.
+    pub fn drive_power(&self, unit: u8, on: bool) -> Result<DrivePowerResult, Trx64Error> {
+        let v = self.rpc("session/drive_power", json!({ "unit": unit, "on": on }))?;
+        decode(v)
+    }
+
+    /// Press the power switch of the drive at `unit` off and on again: a power-on
+    /// (RAM cleared, a ROM given since the last power-on in force), the disk kept.
+    pub fn drive_power_cycle(&self, unit: u8) -> Result<(), Trx64Error> {
+        self.rpc("session/drive_power", json!({ "unit": unit }))?;
+        Ok(())
+    }
+
+    /// The drive's own RESET input. `held = None`: one pulse (RAM and disk kept; a
+    /// drive without power ignores it). `Some(true)` holds it in reset (not clocked,
+    /// nothing driven on the bus); `Some(false)` releases it, running the reset.
+    pub fn drive_reset(&self, unit: u8, held: Option<bool>) -> Result<DriveResetResult, Trx64Error> {
+        let params = match held {
+            Some(h) => json!({ "unit": unit, "held": h }),
+            None => json!({ "unit": unit }),
+        };
+        let v = self.rpc("session/drive_reset", params)?;
+        decode(v)
+    }
+
+    /// Stop the clock of the drive at `unit` (`true`) or let it run on where it stood
+    /// (`false`, no reset). Stopped is powered: its bus outputs stay as they were.
+    pub fn drive_stop(&self, unit: u8, stopped: bool) -> Result<DriveStopResult, Trx64Error> {
+        let v = self.rpc("session/drive_stop", json!({ "unit": unit, "stopped": stopped }))?;
+        decode(v)
+    }
+
+    /// Set the jumpers of the drive at `unit` to `to` (8-11); in force at its next
+    /// reset or power-on. Refused while the other position is at `to`, on or off.
+    pub fn set_drive_unit(&self, unit: u8, to: u8) -> Result<DriveUnitResult, Trx64Error> {
+        let v = self.rpc("session/drive_unit", json!({ "unit": unit, "to": to }))?;
+        decode(v)
+    }
+
+    /// Choose the board of the drive at `unit`: `"1541"` or `"1581"`. Refused while
+    /// it is powered. A medium that does not fit the new board is written back and
+    /// ejected (`ejected`). A 1581 powers on with `dos1581-318045-02.bin` (or
+    /// `1581.bin` / `1581.rom`) from the ROM directory the runtime was built with.
+    pub fn set_drive_type(&self, unit: u8, drive_type: String) -> Result<DriveTypeResult, Trx64Error> {
+        let v = self.rpc("session/drive_type", json!({ "unit": unit, "type": drive_type }))?;
+        decode(v)
+    }
+
+    /// Mount a disk into the drive at `unit` (8-11): a D64/G64 into a 1541, a D81 into
+    /// a 1581 (the format is read from the file). A `.crt` path inserts the cartridge,
+    /// as [`Runtime::mount`] does.
+    pub fn mount_at(&self, path: String, unit: u8) -> Result<MediaResult, Trx64Error> {
+        let v = self.rpc("media/mount", json!({ "path": path, "unit": unit }))?;
+        decode(v)
+    }
+
+    /// Swap the disk in the drive at `unit` for another.
+    pub fn swap_at(&self, path: String, unit: u8) -> Result<MediaResult, Trx64Error> {
+        let v = self.rpc("media/swap", json!({ "path": path, "unit": unit }))?;
+        decode(v)
+    }
+
+    /// Eject the disk from the drive at `unit` (written back to its host file first).
+    pub fn unmount_at(&self, unit: u8) -> Result<UnmountResult, Trx64Error> {
+        let v = self.rpc("media/unmount", json!({ "unit": unit }))?;
+        decode(v)
+    }
+
+    // ── folder devices (Spec 873) ──────────────────────────────────────────────
+
+    /// Put a folder device on the bus at `unit` (8-11), serving the host directory
+    /// `path`. `read_only` answers every write with 26; `boot` names the file
+    /// `LOAD"*"` loads (a path below the folder); `profile` is the timing profile,
+    /// `"ultimate"` (default) or `"vice"`. Refused at a unit a drive or another folder
+    /// device answers to.
+    pub fn attach_folder(
+        &self,
+        unit: u8,
+        path: String,
+        read_only: bool,
+        boot: Option<String>,
+        profile: Option<String>,
+    ) -> Result<FolderInfo, Trx64Error> {
+        let mut params = json!({ "unit": unit, "path": path, "read_only": read_only });
+        if let Some(b) = boot {
+            params["boot"] = json!(b);
+        }
+        if let Some(p) = profile {
+            params["profile"] = json!(p);
+        }
+        let v = self.rpc("device/folder_attach", params)?;
+        decode(v)
+    }
+
+    /// Take the folder device at `unit` off the bus (open write channels are finished
+    /// on the host first).
+    pub fn detach_folder(&self, unit: u8) -> Result<(), Trx64Error> {
+        self.rpc("device/folder_detach", json!({ "unit": unit }))?;
+        Ok(())
+    }
+
+    /// The folder devices on the bus, in unit order.
+    pub fn folders(&self) -> Result<Vec<FolderInfo>, Trx64Error> {
+        let v = self.rpc("device/folders", json!({}))?;
+        decode(v)
     }
 
     // ── trace ──────────────────────────────────────────────────────────────────

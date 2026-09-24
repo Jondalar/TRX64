@@ -88,11 +88,51 @@ feed AVAudioEngine, fill an `AVAudioPCMBuffer`'s `int16ChannelData` with the ret
 
 | Method | Signature | Purpose |
 |--------|-----------|---------|
-| `mount` | `(path: String, slot: UInt8) throws -> MediaResult` | Mount a disk (.d64/.g64) or cartridge (.crt) from a host path. |
-| `swap` | `(path: String) throws -> MediaResult` | Swap the mounted disk (drive stays attached). |
-| `unmount` | `(slot: UInt8) throws -> UnmountResult` | Unmount the drive (slot 8). |
+| `mount` | `(path: String, slot: UInt8) throws -> MediaResult` | Mount a disk (.d64/.g64) or cartridge (.crt) from a host path. `slot` is not sent: a disk goes to the drive at unit 8 (position A as it comes up). |
+| `swap` | `(path: String) throws -> MediaResult` | Swap the disk in the drive at unit 8. |
+| `unmount` | `(slot: UInt8) throws -> UnmountResult` | Eject the disk from the drive at unit 8 (`slot` is not sent; never the cartridge). |
+| `mountAt` | `(path: String, unit: UInt8) throws -> MediaResult` | Mount a disk into the drive at `unit` (8-11): D64/G64 into a 1541, D81 into a 1581 (format read from the file); a medium that does not fit is refused, naming the drive's type. A `.crt` inserts the cartridge as `mount` does. |
+| `swapAt` | `(path: String, unit: UInt8) throws -> MediaResult` | Swap the disk in the drive at `unit`. |
+| `unmountAt` | `(unit: UInt8) throws -> UnmountResult` | Eject the disk from the drive at `unit` (written back to its host file first). |
 | `recentMedia` | `() throws -> [MediaEntry]` | Recent-media list (newest-first, mount timestamps). |
 | `cartStatus` | `() throws -> CartStatus?` | Attached cartridge status, or `nil` when no cart. |
+
+## drives
+
+Two drive positions, **A** and **B**, each a 1541 or a 1581. A drive is addressed by
+the **unit** it answers to (8-11) — the powered drive at that unit, else a drive that is
+off with its jumpers there — exactly as the wire and `LOAD"$",9` address it. A comes up
+powered at 8, B off with its jumpers at 9. Every call is the daemon's own verb, so every
+refusal (a unit already taken, a type change while powered, a medium that does not fit
+the board) is the daemon's, thrown as `Trx64Error.dispatch` with its message.
+
+| Method | Signature | Purpose |
+|--------|-----------|---------|
+| `drives` | `() throws -> [DriveStatus]` | Both positions' panels, A first — addressed by position, so a switched-off B shows without knowing its jumpers. (WS: `session/drives`.) |
+| `driveStatus` | `(unit: UInt8) throws -> DriveStatus` | The panel of the drive at `unit`. (WS: `session/drive_status {unit}`.) |
+| `drivePower` | `(unit: UInt8, on: Bool) throws -> DrivePowerResult` | Switch the drive at `unit` on or off. On is refused while another device answers to the unit its jumpers would bring it up at. Off keeps its disk. (WS: `session/drive_power {unit, on}`.) |
+| `drivePowerCycle` | `(unit: UInt8) throws` | The power switch pressed off and on: a power-on (RAM cleared, a ROM given since the last power-on in force), disk kept. (WS: `session/drive_power {unit}`.) |
+| `driveReset` | `(unit: UInt8, held: Bool?) throws -> DriveResetResult` | The drive's own RESET input. `nil`: one pulse (RAM and disk kept; ignored without power). `true`: hold it in reset (not clocked, nothing driven on the bus). `false`: release, running the reset. (WS: `session/drive_reset {unit, held?}`.) |
+| `driveStop` | `(unit: UInt8, stopped: Bool) throws -> DriveStopResult` | Stop the drive's clock (`true`: powered, not clocked, its bus outputs held as they were) or let it run on where it stood (`false`, no reset). (WS: `session/drive_stop {unit, stopped}`.) |
+| `setDriveUnit` | `(unit: UInt8, to: UInt8) throws -> DriveUnitResult` | Set the jumpers of the drive at `unit` to `to` (8-11); in force at its next reset or power-on. Refused while the other position is at `to`, on or off — swapping A and B goes through a third unit. (WS: `session/drive_unit {unit, to}`.) |
+| `setDriveType` | `(unit: UInt8, driveType: String) throws -> DriveTypeResult` | The board of the drive at `unit`: `"1541"` or `"1581"`. **Refused while the drive is powered** — switch it off first. Off, the board is built fresh; a mounted medium that does not fit it is written back and ejected (`ejected`). A 1581 runs `dos1581-318045-02.bin` (or `1581.bin` / `1581.rom`) from the `romDir` the runtime was built with — Commodore IP, not bundled; without it the position has no 1581 DOS and its CPU runs a zeroed ROM. (WS: `session/drive_type {unit, type}`.) |
+
+## folder devices
+
+A host directory on the serial bus as a device of its own — the stock KERNAL loads,
+saves and reads the directory from it.
+
+| Method | Signature | Purpose |
+|--------|-----------|---------|
+| `attachFolder` | `(unit: UInt8, path: String, readOnly: Bool, boot: String?, profile: String?) throws -> FolderInfo` | Put a folder device at `unit` (8-11) serving the host directory `path`. `readOnly` answers every write with 26 WRITE PROTECT ON; `boot` names the file `LOAD"*"` loads (a path below the folder; `nil` = the first PRG); `profile` is the bus timing, `"ultimate"` (default) or `"vice"`. Refused at a unit a powered drive or another folder device answers to. (WS: `device/folder_attach`.) |
+| `detachFolder` | `(unit: UInt8) throws` | Take the folder device at `unit` off the bus (open write channels are finished on the host first). (WS: `device/folder_detach`.) |
+| `folders` | `() throws -> [FolderInfo]` | The folder devices on the bus, in unit order. (WS: `device/folders`.) |
+
+**Not exposed: `IecDevice` and `FdcController`.** The core lets a Rust host put its own
+device on the IEC bus (`IecDevice`) or fit its own floppy controller into a 1581
+(`FdcController`). Both are Rust traits the host implements and the emulation calls
+into cycle by cycle; they are for Rust hosts linking `trx64-core` directly and are not
+part of the Swift surface.
 
 ## trace
 
@@ -195,8 +235,8 @@ feed AVAudioEngine, fill an `AVAudioPCMBuffer`'s `int16ChannelData` with the ret
 `loadAddress: UInt32`, `action: String`
 
 ### MediaResult
-`mountedPath: String`, `type: String` ("d64"|"g64"|"crt"), `sha256: String`,
-`paused: Bool`, `slot: UInt32?` (disk), `mapperType: String?` (cart)
+`mountedPath: String`, `type: String` ("d64"|"g64"|"d81"|"crt"), `sha256: String`,
+`paused: Bool`, `slot: UInt32?` (disk: the unit it went to), `mapperType: String?` (cart)
 
 ### UnmountResult
 `ok: Bool`, `paused: Bool`, `wasRunning: Bool`
@@ -207,6 +247,35 @@ feed AVAudioEngine, fill an `AVAudioPCMBuffer`'s `int16ChannelData` with the ret
 ### CartStatus
 `type: String`, `bank: UInt32`, `activity: String` ("write"|"read"|"idle"),
 `booted: Bool`, `sourceName: String?`
+
+### DriveStatus
+`position: String` ("A"|"B"), `device: UInt32` (the unit it answers to, as of its last
+reset), `unitJumpers: UInt32` (where the jumpers stand now), `type: String`
+("1541"|"1581"), `powered: Bool`, `stopped: Bool`, `resetHeld: Bool`, `motorOn: Bool`,
+`ledOn: Bool`, `ledPwm: UInt64` (LED duty since the last read, 0..1000), `rwMode: String`
+("read"|"write"), `halfTrack: UInt32`, `track: UInt32`, `side: UInt32`, `sector: UInt32`,
+`drivePc: UInt32`, `transferMode: String` ("kernal"|"idle"|"custom"), `disk: DriveDisk?`
+- **DriveDisk** — `path: String` (the host file), `format: String` ("d64"|"g64"|"d81")
+- Head: a 1541's `track` is `halfTrack / 2` and its `side` is 0; a 1581's `track` is its physical track + 1 and `side` its head.
+
+### DrivePowerResult
+`device: UInt32` (the unit when on, the jumpers when off), `powered: Bool`
+
+### DriveResetResult
+`device: UInt32`, `powered: Bool`, `resetHeld: Bool`
+
+### DriveStopResult
+`device: UInt32`, `powered: Bool`, `stopped: Bool`
+
+### DriveUnitResult
+`device: UInt32` (answers to now), `jumpers: UInt32`, `inForce: Bool` (`device == jumpers`)
+
+### DriveTypeResult
+`device: UInt32`, `type: String` ("1541"|"1581"), `ejected: EjectedDisk?`
+- **EjectedDisk** — `format: String`, `path: String?`, `persisted: String?` (the host file its pending writes went to)
+
+### FolderInfo
+`unit: UInt32`, `path: String`, `readOnly: Bool`, `boot: String?`, `profile: String` ("ultimate"|"vice")
 
 ### TraceRun
 `runId: String`, `definitionId: String`, `definitionVersion: Int64`,
@@ -326,7 +395,8 @@ Thrown by every typed method.
 ## Coverage note
 
 The typed surface covers the App-UI workflows (session / run / input / monitor /
-media / trace / checkpoint / reverse-debug / snapshot / events). The full TRX64
+media / drives / folder devices / trace / checkpoint / reverse-debug / snapshot /
+events). The full TRX64
 JSON-RPC surface is far larger; everything not typed above is reachable verbatim
 through `call(method:paramsJson:)`, which returns the raw JSON-RPC response string.
 Because both paths funnel through the one `dispatch()`, the typed methods and the

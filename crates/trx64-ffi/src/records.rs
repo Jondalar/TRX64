@@ -233,12 +233,12 @@ pub struct RunPrgResult {
 #[serde(rename_all = "camelCase")]
 pub struct MediaResult {
     pub mounted_path: String,
-    /// "d64" | "g64" | "crt".
+    /// "d64" | "g64" | "d81" | "crt".
     #[serde(rename = "type")]
     pub kind: String,
     pub sha256: String,
     pub paused: bool,
-    /// Disk slot (8) — absent for a cartridge.
+    /// The unit the disk went to (8-11) — absent for a cartridge.
     #[serde(default)]
     pub slot: Option<u32>,
     /// Cartridge mapper type — absent for a disk.
@@ -279,6 +279,139 @@ pub struct CartStatus {
     pub booted: bool,
     #[serde(default)]
     pub source_name: Option<String>,
+}
+
+// ── drives + folder devices (Specs 870–873) ─────────────────────────────────
+
+/// The medium in a drive position (`DriveStatus.disk`).
+#[derive(Debug, Clone, uniffi::Record, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DriveDisk {
+    /// The image's host file.
+    pub path: String,
+    /// "d64" | "g64" | "d81".
+    pub format: String,
+}
+
+/// One drive position's panel (`session/drive_status`, `session/drives` items). The
+/// head fields read the same on both boards: a 1541's `track` is `halfTrack / 2` and
+/// its `side` is 0; a 1581's `track` is its physical track + 1 and `side` its head.
+#[derive(Debug, Clone, uniffi::Record, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DriveStatus {
+    /// "A" | "B".
+    pub position: String,
+    /// The unit the drive answers to — its jumpers as of its last reset.
+    pub device: u32,
+    /// Where its jumpers stand now; differs from `device` until its next reset.
+    pub unit_jumpers: u32,
+    /// "1541" | "1581".
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub powered: bool,
+    /// Powered, clock frozen (Spec 870 D2a).
+    pub stopped: bool,
+    /// Its RESET input held low (Spec 870 D2).
+    pub reset_held: bool,
+    pub motor_on: bool,
+    pub led_on: bool,
+    /// LED duty since the last read, 0..1000.
+    pub led_pwm: u64,
+    /// "read" | "write".
+    pub rw_mode: String,
+    pub half_track: u32,
+    pub track: u32,
+    /// Head side (1581); 0 on a single-sided 1541.
+    #[serde(default)]
+    pub side: u32,
+    pub sector: u32,
+    pub drive_pc: u32,
+    /// "kernal" | "idle" | "custom" — a guess from the two PCs.
+    pub transfer_mode: String,
+    /// The medium in it, `None` when empty.
+    #[serde(default)]
+    pub disk: Option<DriveDisk>,
+}
+
+/// `session/drive_power {unit, on}` result.
+#[derive(Debug, Clone, uniffi::Record, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DrivePowerResult {
+    /// The unit it answers to when on, its jumpers when off.
+    pub device: u32,
+    pub powered: bool,
+}
+
+/// `session/drive_reset` result.
+#[derive(Debug, Clone, uniffi::Record, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DriveResetResult {
+    pub device: u32,
+    pub powered: bool,
+    pub reset_held: bool,
+}
+
+/// `session/drive_stop` result.
+#[derive(Debug, Clone, uniffi::Record, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DriveStopResult {
+    pub device: u32,
+    pub powered: bool,
+    pub stopped: bool,
+}
+
+/// `session/drive_unit` result.
+#[derive(Debug, Clone, uniffi::Record, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DriveUnitResult {
+    /// The unit it answers to now.
+    pub device: u32,
+    /// Where its jumpers stand.
+    pub jumpers: u32,
+    /// `device == jumpers` — false until the drive's next reset.
+    pub in_force: bool,
+}
+
+/// A medium a type change took out of the drive (it did not fit the new board).
+#[derive(Debug, Clone, uniffi::Record, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EjectedDisk {
+    pub format: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    /// The host file its pending writes were written back to, if any.
+    #[serde(default)]
+    pub persisted: Option<String>,
+}
+
+/// `session/drive_type` result.
+#[derive(Debug, Clone, uniffi::Record, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DriveTypeResult {
+    /// The position's jumpers (it is off).
+    pub device: u32,
+    /// "1541" | "1581".
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub ejected: Option<EjectedDisk>,
+}
+
+/// A folder device on the bus (`device/folder_attach` result, `device/folders` items).
+/// The daemon spells `read_only` in snake case here.
+#[derive(Debug, Clone, uniffi::Record, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderInfo {
+    pub unit: u32,
+    /// The host folder it serves.
+    pub path: String,
+    #[serde(rename = "read_only")]
+    pub read_only: bool,
+    /// The file `LOAD"*"` loads, a path below the folder; `None` = the first PRG.
+    #[serde(default)]
+    pub boot: Option<String>,
+    /// Timing profile: "ultimate" | "vice".
+    pub profile: String,
 }
 
 // ── trace ─────────────────────────────────────────────────────────────────────
