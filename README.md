@@ -28,9 +28,10 @@ works without the other.
 
 ## Install
 
-Binaries for macOS, Linux and Windows (x86_64 + arm64):
+Binaries for macOS (arm64), Linux (x86_64, arm64) and Windows (x86_64, arm64):
 **[Releases](https://github.com/Jondalar/TRX64/releases)** — archives hold `trx64cli`
-and `trx64-daemon`. C64 ROMs are not included; point at your own with `--rom-dir`.
+and `trx64-daemon`. C64 ROMs are not included: put your own in `~/.trx64/roms`, or point
+`trx64cli` at them with `--rom-dir`.
 
 ```sh
 brew install jondalar/tap/trx64
@@ -52,20 +53,22 @@ From source: `cargo build --release`. Builds natively (for Windows it uses MSVC)
 - **Traces** — CPU, drive, IEC and memory to a binary log; query as swimlanes, memory
   maps or data-flow taint
 - **Marks & sandboxes** — name a point, jump back to it, branch, discard.
-- **Cartridges** — EasyFlash, Ocean, Magic Desk, GMOD2/3, MegaByter. Flash and EEPROM
-  writes survive a reset and a snapshot round trip.
+- **Cartridges** — generic 8K/16K/Ultimax, Ocean, Magic Desk, Magic Desk 16, EasyFlash,
+  GMod2, GMod4, MegaByter, C64MegaCart. Flash and EEPROM writes survive a reset and a
+  snapshot round trip. GMod3 images are recognised and refused.
 - **Disks** — `.d64` / `.g64`, 35 to 42 tracks, in a 1541; `.d81`, 80 to 83 tracks, in a 1581.
   Two drive positions, each a 1541 or a 1581, chosen with the drive switched off. Drive-side
-  writes reach the host file. The 1581 DOS (`dos1581-318045-02.bin`, or `1581.bin`) is
-  not included; put it in the ROM directory.
+  writes reach the host file. Ejecting a disk from a 1541 darkens its write-protect sensor
+  first, so the DOS sees the disk change as it does on the drive. The 1581 DOS
+  (`dos1581-318045-02.bin`, or `1581.bin`) is not included; put it in the ROM directory.
 - **A folder on the bus** — a host directory as an IEC device at unit 8-11, beside the
   1541s, on the real serial lines (`device/folder_attach`). The stock KERNAL loads, saves
   and lists through it; memory commands are refused, so a program that still uploads
   drivecode stops visibly. The folder is a hard disk: never in a snapshot, never rewound.
 - **Expansion port** — REU (1700/1764/1750, oversized to 16 MB), GeoRAM, and the Ultimate
   Command Interface. Devices, not cartridges: several at once, and a host can lend its own RAM.
-- **Machines** — `--machine c64|u64|128`. `u64` is the Ultimate 64 / Elite II / C64 Ultimate:
-  the turbo registers, and a CPU that really runs — the firmware's own speed table, to 64 MHz.
+- **Machines** — `trx64-daemon --machine c64|u64|128`. `u64` is the Ultimate 64 / Elite II /
+  C64 Ultimate: the turbo registers, and a CPU that really runs — the firmware's own speed table, to 64 MHz.
 - **PAL and NTSC** — `--model c64-pal|c64-ntsc|c64-paln` (or `--video pal|ntsc`). A C64 model
   is a row of `crates/trx64-core/models.toml`: the VIC-II and its cycle table, the frame, the
   clock, the mains the TOD counts, the ROMs. NTSC is the 6567R8 — 65 cycles × 263 lines at
@@ -77,9 +80,9 @@ From source: `cargo build --release`. Builds natively (for Windows it uses MSVC)
 - **Shared sessions** — one machine, several clients, human and agent at once.
 - **Snapshots** — `.c64re` full machine, `.c64rering` the reverse-debug buffers.
 
-TRX64 includes reSID and DuckDB. The always-on reverse-debug ring costs ~120 MB at its
-default depth of 10 seconds — ten seconds on every C64 model, the faster NTSC clock
-included; `revdepth <s>` changes it, and 60 seconds is closer to a gigabyte.
+TRX64 includes reSID and DuckDB. The always-on reverse-debug rings cost ~92 MB at boot: ten
+seconds of undo history on every C64 model, the faster NTSC clock included. `revdepth <s>`
+rebuilds them to that depth throughout — ~158 MB at 10 seconds, ~945 MB at 60.
 
 ---
 
@@ -110,7 +113,7 @@ Details: [`crates/trx64-cli/README.md`](crates/trx64-cli/README.md).
 
 ## Monitor commands
 
-Superset based on VICE, 123 verbs. Full reference: **[MONITOR.md](MONITOR.md)**;
+Superset based on VICE. Full reference: **[MONITOR.md](MONITOR.md)**;
 `help` prints the live list.
 
 | | |
@@ -124,7 +127,7 @@ Superset based on VICE, 123 verbs. Full reference: **[MONITOR.md](MONITOR.md)**;
 | **Time** | `mark <name>` · `goto <name>` · `frame ±N` · `play back\|fwd` · `cadence` · `window <s>` |
 | **State** | `dump`/`undump` `.c64re` · `ringdump`/`ringload` · `trace on\|off` |
 | **Analysis** | `map` memory map · `taint` · `swimlane` · `diff <a> <b>` |
-| **Drive** | `device drive8` then `r`/`m`/`d` — the drive's own 6502, 1541 or 1581 · `folder [unit]` a folder device |
+| **Drive** | `device drive8` then `r`/`m`/`d` — the drive's own 6502, 1541 or 1581 · `iec` every device on the bus · `folder [unit]` a folder device |
 | **Expansion** | `reu` / `georam` the device decoded · `uci` the command interface · `turbo` the machine |
 
 ---
@@ -165,8 +168,12 @@ The per-frame driver — video, breakpoints, JAM auto-break, recorder — is on 
 `--headless` opts out: no A/V push, no auto-run on connect, and the machine advances only
 on an explicit `session/run`. That is the mode for byte-exact oracle and tool daemons.
 
-For embedding in the Apple universe, `trx64-ffi` exposes a typed uniffi library (Swift bindings) —
+For embedding in the Apple universe, `trx64-ffi` exposes a typed uniffi library (Swift bindings):
+both drive positions, 1541 or 1581, D81 media and folder devices included —
 [`crates/trx64-ffi/API.md`](crates/trx64-ffi/API.md).
+
+`runtime/swap_disk_and_continue` changes a disk the way a person does: eject, wait, insert,
+wait, press the key the program asks for, and report whether the screen moved on.
 
 **Embedding in Rust.** `trx64-core` is a library: build a `Machine`, feed it ROMs, run it. Beyond
 media and input it has these places where a host plugs in its own hardware:
@@ -191,7 +198,8 @@ A device or controller may keep its state out of snapshots; a snapshot then name
 left out.
 
 **Formats:** `.c64re` machine snapshot, `.c64rering` reverse-debug buffers, `.c64retrace`
-trace log. VICE `.vsf` imports, `.reu` images load with `--reu-image`.
+trace log. VICE `.vsf` snapshots convert both ways (`trx64cli convert-vsf`, `convert-c64re`);
+`.reu` images load with `--reu-image`.
 
 ### Environment switches
 

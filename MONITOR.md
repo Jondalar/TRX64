@@ -37,9 +37,11 @@ read the layer you mean:
 `bank [lens]` sets a sticky default so you don't repeat it. `sidefx on` makes monitor reads
 trigger I/O side effects; the default (`off`) is a clean **peek**.
 
-### `device` — C64 vs the 1541
-`device c64` (default) targets the main CPU. `device drive8` points `r`/`m`/`d` at the
-**1541's own 6502** for read-inspection — the drive runs a separate core.
+### `device` — C64 vs a drive
+`device c64` (default) targets the main CPU. `device drive8` (or `drive9` … `drive11`) points
+`r`/`m`/`d` at the **own 6502 of the drive at that unit**, 1541 or 1581, for read-inspection —
+each drive runs a separate core. Bare `device` lists what is there now: the C64 and every
+powered drive by its unit. A folder device has no CPU and is not a `device`.
 
 ### The reverse-debug ring — always on, no pre-arming
 TRX64 continuously records the recent past into a **bounded in-memory ring**, so you can
@@ -49,10 +51,11 @@ look **backward from a crash** without having set anything up first. It is two f
   its `old → new` value. Backs `rstep` (undo) and `whowrote` (who changed an address).
 - a **cpu-history ring** — per retired instruction: PC + opcode + registers. Backs `chis`.
 
-Depth is **wall-clock seconds** (`TRX64_REVERSE_SECONDS`, default 10 s ≈ ~90 MB), and you
-can change it live with `revdepth <seconds>` (1–600; this rebuilds the rings and discards
-the current history). The ring is **inspect-only**: `rstep` shows you the prior state, it
-does not resume from there.
+Depth is **seconds of CPU time** (`TRX64_REVERSE_SECONDS`, default 10 s). At boot the delta
+ring holds 10 s and the cpu-history ring 262 144 instructions, ~92 MB together.
+`revdepth <seconds>` (1–600) rebuilds both rings to that depth and discards the current
+history: 10 s ≈ 158 MB, 60 s ≈ 945 MB. Bare `revdepth` reports the current size. The ring
+is **inspect-only**: `rstep` shows you the prior state, it does not resume from there.
 
 ### The checkpoint ring — scrub & diff
 Separately, periodic **full-machine snapshots** (anchors) feed the scrub-filmstrip and
@@ -92,7 +95,7 @@ you care about across interrupts.
 | `sf` / `nf` | step into / over, stopping only in the focused flow |
 | `flow` | the interrupt/trap flow-frame stack |
 | `bt` | backtrace (stack scan + flow frames) |
-| `reset` | cold reset |
+| `reset [cold]` | warm reset — the RESET line, RAM and media kept; `reset cold` power-cycles |
 | `model` | which C64 this is — PAL, NTSC or PAL-N: the VIC-II, the frame (cycles × lines), the clock, the frame rate, the canvas — and every model this build knows, with what the ones that cannot run are missing |
 | `model <row>` | switch the running machine to another model (`c64-pal`, `c64-ntsc`, `c64-paln`) at the next frame boundary. Not a power cycle: the program keeps its state and the standard it detected at boot; `reset` or `power off`/`power on` afterwards for a clean start on the new model. The model survives resets and power cycles, and a snapshot or checkpoint restores the model it was taken on |
 
@@ -105,8 +108,9 @@ you care about across interrupts.
 | `df [-i] [a] [n]` | follow-disasm: walk control flow statically (`-i` asks at branches) |
 | `screen` | decode the 40×25 text screen (real screen pointer) |
 | `io [1\|addr]` | I/O per device: register hex (peek) + decoded state |
-| `iec` | the serial bus: each line's level and which device pulls it (C64, drive 8, each folder device) |
+| `iec` | the serial bus: each line's level and which device pulls it — the C64, every drive on the bus by its unit, each folder or host device — plus each end's port as its CPU reads it (`$DD00`; `$1800` on a 1541, `$4001` on a 1581) |
 | `folder [unit]` | a folder device on the bus: its protocol state, open channels and last status. It has no CPU, so it is not a `device` to select |
+| `pot [<1\|2> <x> <y> \| <1\|2> off]` | the POT lines (`$D419`/`$D41A`): which port CIA 1 selects, each port's value or open, what a read answers now, cycles to the next sample. With a port: set its x/y bytes (final, `$FF` = open), or clear it |
 | `bitmap <a> [w h] [mode]` | render a RAM range to a PNG (`hires`/`charset`/`sprite`) |
 | `bank [lens]` | show / set the sticky default lens for `m`/`d` |
 | `wr [lens] <a> <b..>` | write exactly these bytes from a |
@@ -150,7 +154,7 @@ obs cap_off when exec $4100 do trace off              # stop at $4100
 | `r` | registers (+ flow + IRQ/NMI vectors) |
 | `r a=$42 x=$10` | set registers (`a/x/y/sp/pc/fl`) |
 | `sidefx [on\|off]` | monitor-read side effects (default `off` = peek) |
-| `device [c64\|drive8]` | target the C64 or the 1541 CPU |
+| `device [c64\|drive<unit>]` | target the C64, or read-inspect the CPU of the drive at a unit (1541 or 1581) |
 
 ### State & trace
 | command | what it does |
@@ -161,13 +165,56 @@ obs cap_off when exec $4100 do trace off              # stop at $4100
 | `trace on\|off\|status\|mark` | the live trace gate |
 | `tracedb start\|stop\|status\|mark` | declarative trace |
 | `traceindex [path]` | build the queryable `.duckdb` index for a `.c64retrace` |
+| `tracering <s> <e> [path]` | build a `.c64retrace` after the fact from the always-on reverse ring, for a cycle window still in it |
+| `traprules <path>` / `traprules [clear]` | load / list / clear on-trap dump rules (JSON `{pc, label, dump:[[name,addr,len]], decode}`); printed when that PC is reached on a JAM or breakpoint |
+
+### Media & drives
+| command | what it does |
+|---|---|
+| `mount <path>` | put a `.d64`/`.g64`/`.d81`/`.crt`/`.prg` or a `.c64re` in the machine. The type comes from the file's content; a relative path resolves against `pwd`/`cd`. A cartridge power-cycles, a disk does not |
+| `eject [cart\|disk\|<unit>]` | take it out: `eject 9` is the disk in the drive at unit 9, bare `eject` whatever is in (cartridge first). Both write back to the host file first; a cartridge eject cold-resets the machine |
+| `drive [unit]` | live status of the drive at that unit (default 8): motor, track, LED, what is mounted, whether it is dirty |
+| `cart` | cartridge status: type, bank, read/write activity |
+| `drivepower [unit] [on\|off]` | switch that drive on or off (two powered drives at one unit are refused). Bare: power-on-reset the drive's 6502 only — the way out of a wedged fastloader |
+| `recent` | the media this daemon has had mounted lately |
+| `identify <path>` | what a file is, from its content: `c64re`/`crt`/`g64`/`d64`/`d81`/`prg`, and whether a PRG would autostart |
+
+### Machine
+| command | what it does |
+|---|---|
+| `run` | resume the machine (from a rewound point this cuts the anchors ahead) |
+| `pause` | stop the machine and the transport; prints the ring range |
+| `warp on\|off` | 8× pacing / real time at the model's frame rate |
+| `power on\|off` | power the machine on (full init) or off |
+| `rawframe on\|off` | stepping onto an anchor redraws its picture; `on` keeps the first, seamed frame so a one-frame event stays visible |
+| `turbo` | which machine this session claims to be (`c64`, `128`, `u64`) and the speed that is set |
+| `turbo mode c64\|128\|u64` | `c64`: `$D02F-$D03F` open bus. `128`: the VIC-IIe `$D02F`/`$D030` pair. `u64`: the speed register at `$D031`. Survives a reset |
+| `turbo on\|off` | set / clear the speed bit (`$D030` bit 0, or `$D031`) |
+| `turbo speed $NN` | the `$D031` value (u64). On `u64` the CPU runs at the clock it selects from the speed table; on `128` the bit is stored and the CPU stays at 1 MHz |
 
 ### Expansion port  (read-only — these report, they never change the device)
 | command | what it does |
 |---|---|
-| `reu` / `georam` | the attached device decoded: size, transfer type, trigger, pending |
+| `reu` | the REU: size, status, command, addresses, length, IRQ line |
+| `georam` | the GeoRAM: size, bank, window (either verb reports whichever device is attached) |
 | `uci` | the Ultimate Command Interface: state, pointers, lines |
-| `turbo` | which machine this session claims to be, and the speed that is set |
+
+### Marks & the rewind transport
+| command | what it does |
+|---|---|
+| `mark <name>` | name and pin the anchor you are standing on (at most 32) |
+| `marks` | list them: cycle, frame, how far back, window cost |
+| `unmark <name>` | drop the name and the pin |
+| `goto <name>` / `goto <frame>` / `goto c<cycle>` | jump to a mark, a frame, or the anchor at or before a cycle |
+| `play back\|fwd [speed]` | play through the anchors; every step is a real restore. `play fwd` at the head just runs |
+| `frame -N` / `frame +N` | step N anchors (stops at the ends) |
+| `rewind` | mode, position, window, anchors held, and the keys: F9 one back, F10 play back, F11 pause/play, F12 one forward |
+| `cadence` | capture rate, window, entry cap, anchors held |
+| `cadence <frames> [secs]` | set the capture rate and retune the cap (~98 KiB per anchor); 1–3000 frames, 1–600 s |
+| `window [seconds]` | how far back the checkpoint ring reaches (default 60 s, max 600) |
+
+Watching is free: replaying keeps the anchors. An intervention — a write, a key, a resumed
+run — cuts the future. A mark survives that cut.
 
 ### Analysis  (need a trace — `trace on` first)
 | command | what it does |

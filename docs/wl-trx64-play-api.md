@@ -72,7 +72,7 @@ All are JSON-RPC `method`s. `params` shown; omit `session_id` (single machine).
 | `session/state` | — | `{ c64Cycles, runState:"running"\|"paused", powered:bool, media:{cart,disk}, cpu:{pc,a,x,y,sp,flags}, vic:{…}, controlOwner, streamPump, model, videoStandard, chip, cyclesPerLine, linesPerFrame, cyclesPerFrame, cpuHz, frameRate, canvas:{width,height}, … }` — see §3.1 |
 | `session/models` | — | `{ models:[{ name, title, runs, missing, videoStandard, chip, cyclesPerLine, linesPerFrame, cyclesPerFrame, cpuHz, frameRate, … }], current }` — every C64 model, whether it runs here, and what a model that does not is missing |
 | `session/model` | `{ "name": "c64-ntsc" }` | switch the running machine to another model at the next frame boundary. Not a power cycle: the program keeps its RAM, CPU, CIA and SID state and the standard it detected at boot — a clean start on the new model is `session/reset` or a power cycle afterwards. Reply: `{ from, model, switched, switchedAt:{c64Cycles,rasterLine,rasterCycle}, kept:{cpu,ram,cia,sid}, … }` |
-| `media/mount` | `{ "path": "/play/x.crt" }` | mount `.crt`/`.d64`/`.g64`; a cart power-cycles + boots. Returns `{ detail:{ mapperType, name, … }, … }` |
+| `media/mount` | `{ "path": "/play/x.crt" }` | mount `.crt`/`.d64`/`.g64`/`.d81` (the type is read from the content; a `.d81` needs a 1581 at that unit); a cart power-cycles + boots. Returns `{ detail:{ mapperType, name, … }, … }` |
 | `session/key_down` | `{ "key": "<NAME>" }` | press one C64 key (held). `key` = PETSCII name (§5) |
 | `session/key_up` | `{ "key": "<NAME>" }` | release it |
 | `session/joystick_set` | `{ "port":2, "up":bool, "down":bool, "left":bool, "right":bool, "fire":bool }` | set port-2 joystick lines (omit = false) |
@@ -338,7 +338,7 @@ already has a play connection has a debugger for free.
 
 **Every reply also carries `spans` and `machine`.** `spans` says where the reply
 printed each address — `{line, start, end, addr, space, role, lens?, len?}`, `start`/`end`
-in UTF-16 units of that line, `space` `c64`|`drive8`, `role` `pc`|`target`|`operand`|`memory`
+in UTF-16 units of that line, `space` `c64`|`drive8`…`drive11`, `role` `pc`|`target`|`operand`|`memory`
 — so a consumer that wants names never parses a column. `machine` is the device and the
 banking state (`cpuPortDirection`, `cpuPortValue`, `exrom`, `game`, `cartBank`);
 `monitor/state` returns it without running a command. TRX64 itself holds no symbols.

@@ -6,7 +6,7 @@ window** (winit + cpal) to play and watch the live machine. No daemon, no WebSoc
 FFI — it links the runtime library and calls it directly. One machine, shared by the
 cockpit, the per-frame pump, and the window.
 
-It runs on macOS, Linux, and Windows, x86_64 and arm64.
+It runs on macOS (arm64), Linux and Windows (x86_64 and arm64).
 
 ---
 
@@ -29,6 +29,17 @@ cargo run -p trx64-cli --release -- mon "d c000"
 cargo run -p trx64-cli --release -- disasm game.prg
 cargo run -p trx64-cli --release -- disasm dump.bin --load-address '$c000' --count 32 --json
 ```
+
+The other subcommands each build a machine of their own in this process — no daemon, no
+shared session:
+
+| subcommand | what it does |
+|---|---|
+| `sandbox` | load bytes (`--load`, `--load-hex`, `--seed <.c64re>`), call a routine at `--entry` to its return or a `--sentinel`, harvest RAM (`--harvest`); `--batch` runs many |
+| `boot` | boot a disk or cart (`--disk`), type into it (`--type`), run `--cycles`, write a `.c64re` (`--dump`) |
+| `diff` | component diff of two `.c64re` snapshots (`--exclude`, `--component`, `--lane`, `--preset`) |
+| `convert-vsf` | a VICE `.vsf` snapshot into a `.c64re` |
+| `convert-c64re` | a `.c64re` into a `.vsf` VICE x64sc loads |
 
 `--rom-dir <dir>` overrides the ROM directory (KERNAL/BASIC/CHARGEN + 1541). Without it,
 these are tried in order — the same list, in the same order, as the daemon uses:
@@ -58,8 +69,8 @@ The binary is named **`trx64cli`** (no dash). Three ways to get it, all platform
 brew install jondalar/tap/trx64
 ```
 
-**Prebuilt** — [Releases](https://github.com/Jondalar/TRX64/releases), macOS / Linux /
-Windows, x86_64 and arm64. Unpack and put `trx64cli` on your `PATH`.
+**Prebuilt** — [Releases](https://github.com/Jondalar/TRX64/releases), macOS (arm64),
+Linux and Windows (x86_64 and arm64). Unpack and put `trx64cli` on your `PATH`.
 
 **From source** — `cargo install --path crates/trx64-cli` builds in release mode and drops
 it into `~/.cargo/bin` (`%USERPROFILE%\.cargo\bin\trx64cli.exe` on Windows), which rustup
@@ -78,7 +89,7 @@ The command line has three namespaces, picked by the first character:
 
 | You type | Goes to |
 |---|---|
-| a **bare line** (`d c000`, `r`, `bk e000`, `g`, `trace on`, `whowrote d020`) | the **monitor** — the full 123-verb VICE superset |
+| a **bare line** (`d c000`, `r`, `bk e000`, `g`, `trace on`, `whowrote d020`) | the **monitor** — the full VICE superset |
 | a **`/`-prefixed** line (`/run`, `/mount disk.d64`, `/reset`) | a **VM / machine command** |
 | a **`!`-prefixed** line (`!ls`, `!cd docs`, `!load "game.prg"`) | the **filesystem** — the monitor's file shell, re-prefixed |
 
@@ -100,7 +111,7 @@ filesystem verbs sit behind `!`, like a coding tool's shell escape.
 | `/run` | resume free-running |
 | `/run <prg>` | load + autostart a `.prg` |
 | `/pause` · `/step` | freeze / single-step one instruction |
-| `/mount <path>` · `/eject` (`/umount`) | insert a `.d64`/`.g64` (disk swaps live) or `.crt` (cold-boots) / eject the cart or unmount drive 8 |
+| `/mount <path>` · `/eject [cart\|disk\|<unit>]` (`/umount`) | insert a `.d64`/`.g64`/`.d81` (disk swaps live), a `.crt` (cold-boots), a `.prg` or a `.c64re` — the type is read from the file's content / eject the cart, the disk at unit 8, or the disk at `<unit>`; bare: whatever is in, cart first |
 | `/load <prg>` | load a `.prg` into RAM (no run) |
 | `/warp on\|off` | 8× / real-time pacing (the model's frame rate) |
 | `/joystick off\|port1\|port2` | route WASD+Space to the joystick (off = type) |
@@ -132,7 +143,7 @@ triage). Or run `help` (bare) in the cockpit for the live verb list.
 `/mount` and `/eject` behave like the real hardware — a disk swap and a cartridge
 change are not the same event:
 
-- **Disk mount** (`.d64`/`.g64`) swaps the medium only — **no reset, no
+- **Disk mount** (`.d64`/`.g64`/`.d81`) swaps the medium only — **no reset, no
   power-cycle**. The floppy state and the running program survive, exactly like sliding
   a new disk into a live 1541.
 - **CRT mount** (`.crt`) is a **power-cycle cold boot**: power off → insert → power on.
@@ -184,7 +195,7 @@ The panels refresh ~20 Hz from the live machine. The MACHINE panel shows RUNNING
 |---|---|
 | blue + bold | directories |
 | yellow | `.crt` (cartridge) |
-| cyan | `.d64` / `.g64` / `.p64` (disk image) |
+| cyan | `.d64` / `.g64` / `.d81` / `.p64` (disk image) |
 | green | `.prg` / `.bin` (program / raw) |
 | magenta | `.c64re` / `.c64retrace` / `.c64rering` (snapshot / trace / ring) |
 | gray | `.asm` / `.tass` / `.md` / `.json` (source / text) |
@@ -196,7 +207,8 @@ The panels refresh ~20 Hz from the live machine. The MACHINE panel shows RUNNING
 A native window showing the live C64, on the same machine as the cockpit — **play in the
 window, debug in the cockpit at the same time**.
 
-- **Video** — the VIC framebuffer (384×272), blitted ~50 Hz.
+- **Video** — the VIC framebuffer at the model's canvas (384×272 PAL, 384×247 NTSC), blitted
+  at the model's frame rate (~50 Hz PAL, ~60 Hz NTSC).
 - **Audio** — the runtime's persistent reSID engine, drained per frame into a ring and
   played via cpal (pre-roll + governor, underrun = silence; mirrors the SwiftUI app's
   AudioOutput).

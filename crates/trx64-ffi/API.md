@@ -29,14 +29,14 @@ Swift names are uniffi's camelCase rendering of the Rust snake_case below.
 
 | Method | Signature | Purpose |
 |--------|-----------|---------|
-| `createSession` | `(pal: Bool) throws -> SessionInfo` | Attach to the singleton session (the machine is built at construction; `create` always attaches). |
+| `createSession` | `(pal: Bool) throws -> SessionInfo` | Attach to the singleton session (the machine is built at construction; `create` always attaches). `pal` is ignored: the model is chosen with `session/model` through `call`. |
 | `state` | `() throws -> MachineState` | Full machine state: CPU regs, cycles, run-state, VIC, flow, vectors, SID. |
 | `reset` | `(cold: Bool) throws -> ResetResult` | `cold` = power-cycle (fresh DRAM); else warm (RAM preserved). Runs the KERNAL to READY. |
 | `screenshot` | `() throws -> Data` | PNG bytes of the current displayed frame (decoded from the handler's data URL). |
 
 ## Live A/V (pull)
 
-The native app renders video at ~50 Hz and feeds audio to AVAudioEngine by **pulling**
+The native app renders video at the model's frame rate (~50 Hz PAL, ~60 Hz NTSC) and feeds audio to AVAudioEngine by **pulling**
 A/V from the runtime in-process — at its OWN cadence (per video frame, per audio
 callback). A/V is **binary** and deliberately bypasses the JSON-RPC `dispatch` + event
 channel (JSON cannot carry a frame / PCM efficiently), so these methods reach the core
@@ -46,8 +46,8 @@ do not touch `dispatch` or any existing method. `Vec<u8>` / `Vec<i16>` map to Sw
 
 | Method | Signature | Purpose |
 |--------|-----------|---------|
-| `frameBuffer` | `() -> FrameBuffer` | The CURRENT displayed frame at FULL resolution as a palette + index image — the 384×272 VICE PAL canvas (the same `displayed` buffer `screenshot()` and the scrub thumbnails come from, here full-res + un-palettized). Pull once per video frame and blit. Non-throwing (a pure read). |
-| `audioDrain` | `() -> [Int16]` | Drain + return the SID PCM accumulated since the last `audioDrain()` — **mono `Int16`** at `audioSampleRate()` (44100 Hz). Draining EMPTIES the buffer, so repeated calls don't re-deliver. Pull in the AVAudioEngine source callback. The FIRST call installs the SID capture hook + spawns the audio render thread (which constructs reSID once + primes it) and returns empty (no cycles elapsed yet); thereafter each call returns the samples for exactly the cycles run since the previous drain. Rendering is a **continuous persistent-engine render** off a PCM ring (mirrors the daemon's streaming loop / C64RE Spec 768): the render thread holds ONE reSID engine for the whole session, fed by a SID write-ring (emu→render); `audioDrain()` just pops the PCM ring — no per-pull engine reconstruct, so the stream is continuous across drain boundaries (no clicks, no hum). Non-throwing. |
+| `frameBuffer` | `() -> FrameBuffer` | The CURRENT displayed frame at FULL resolution as a palette + index image — the model's canvas, 384×272 PAL or 384×247 NTSC (the same `displayed` buffer `screenshot()` and the scrub thumbnails come from, here full-res + un-palettized). Pull once per video frame and blit. Non-throwing (a pure read). |
+| `audioDrain` | `() -> [Int16]` | Drain + return the SID PCM accumulated since the last `audioDrain()` — **mono `Int16`** at `audioSampleRate()` (44100 Hz). Draining EMPTIES the buffer, so repeated calls don't re-deliver. Pull in the AVAudioEngine source callback. The FIRST call installs the SID capture hook + spawns the audio render thread (which constructs reSID once + primes it) and returns empty (no cycles elapsed yet); thereafter each call returns the samples for exactly the cycles run since the previous drain. Rendering is a **continuous persistent-engine render** off a PCM ring (as the daemon's streaming loop does): the render thread holds ONE reSID engine for the whole session, fed by a SID write-ring (emu→render); `audioDrain()` just pops the PCM ring — no per-pull engine reconstruct, so the stream is continuous across drain boundaries (no clicks, no hum). Non-throwing. |
 | `audioSampleRate` | `() -> UInt32` | The runtime's fixed SID sample rate (Hz) — **44100**. Fetch once when configuring the AVAudioEngine format. Every `audioDrain()` sample is mono at this rate. Non-throwing. |
 
 **Audio format**: mono, signed 16-bit PCM (`Int16`), 44100 Hz (reSID, single SID). To
@@ -65,7 +65,7 @@ feed AVAudioEngine, fill an `AVAudioPCMBuffer`'s `int16ChannelData` with the ret
 | `pause` | `() throws -> DebugState` | Pause (`stop.reason = "pause"`). |
 | `step` | `() throws -> MachineState` | Single-step one instruction; returns the new full state. |
 | `runCycles` | `(n: UInt64) throws -> RunResult` | Advance exactly `n` C64 cycles (may stop early on a breakpoint). |
-| `setPacing` | `(pacing: Pacing) throws -> DebugState` | Set pacing mode (`pal`/`warp`/`fixed-ratio`) + ratio. |
+| `setPacing` | `(pacing: Pacing) throws -> DebugState` | Set pacing mode (`realtime`/`warp`/`fixed-ratio`) + ratio. `realtime` runs at the model's frame rate; `pal` is accepted as its old name. |
 
 ## input
 
@@ -88,7 +88,7 @@ feed AVAudioEngine, fill an `AVAudioPCMBuffer`'s `int16ChannelData` with the ret
 
 | Method | Signature | Purpose |
 |--------|-----------|---------|
-| `mount` | `(path: String, slot: UInt8) throws -> MediaResult` | Mount a disk (.d64/.g64) or cartridge (.crt) from a host path. `slot` is not sent: a disk goes to the drive at unit 8 (position A as it comes up). |
+| `mount` | `(path: String, slot: UInt8) throws -> MediaResult` | Mount a disk (.d64/.g64, or .d81 when unit 8 is a 1581) or cartridge (.crt) from a host path. `slot` is not sent: a disk goes to the drive at unit 8 (position A as it comes up). |
 | `swap` | `(path: String) throws -> MediaResult` | Swap the disk in the drive at unit 8. |
 | `unmount` | `(slot: UInt8) throws -> UnmountResult` | Eject the disk from the drive at unit 8 (`slot` is not sent; never the cartridge). |
 | `mountAt` | `(path: String, unit: UInt8) throws -> MediaResult` | Mount a disk into the drive at `unit` (8-11): D64/G64 into a 1541, D81 into a 1581 (format read from the file); a medium that does not fit is refused, naming the drive's type. A `.crt` inserts the cartridge as `mount` does. |
@@ -207,7 +207,7 @@ part of the Swift surface.
 `c64Cycles: UInt64`, `pc: UInt32`, `mode: String` ("cold"|"soft")
 
 ### Pacing (input)
-`mode: String` ("pal"|"warp"|"fixed-ratio"), `ratio: Double`
+`mode: String` ("realtime"|"warp"|"fixed-ratio"; "pal" = "realtime"), `ratio: Double`
 
 ### DebugState
 `runState: String`, `pacing: PacingState`, `pc: UInt32`, `cycles: UInt64`,
@@ -302,7 +302,7 @@ reset), `unitJumpers: UInt32` (where the jumpers stand now), `type: String`
 `indices: String` (b64 indices)
 
 ### FrameBuffer (live A/V pull)
-`width: UInt32` (384), `height: UInt32` (272), `palette: Data` (RGB, 16×3 = 48 bytes),
+`width: UInt32` (384), `height: UInt32` (272 PAL, 247 NTSC), `palette: Data` (RGB, 16×3 = 48 bytes),
 `indices: Data` (`width*height` bytes, each 0..15 indexing `palette`).
 Full-resolution counterpart of `Thumbnail` — raw `Data`, NOT base64 (in-process pull,
 no JSON). `i = indices[p]` → RGB `palette[i*3 ..< i*3+3]`.

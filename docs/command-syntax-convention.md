@@ -37,7 +37,7 @@ That's it: `if line.starts_with('/') { vm_command(line[1..]) } else { monitor_ex
 | `/run <prg>` | load + autostart a `.prg` |
 | `/pause` | freeze the machine |
 | `/step` | single-step one instruction |
-| `/mount <path>` \| `/eject` | mount a `.d64`/`.g64`/`.crt` / unmount drive 8 |
+| `/mount <path>` \| `/eject [cart\|disk\|<unit>]` | mount a `.d64`/`.g64`/`.d81`/`.crt`/`.prg`/`.c64re` / eject the cart, the disk at unit 8, or the disk at `<unit>` |
 | `/load <prg>` | load a `.prg` into RAM (no run) |
 | `/warp on` \| `/warp off` | 8× / real-time PAL pacing |
 | `/window` | spawn the native emulator window (TUI only) |
