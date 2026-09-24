@@ -37,6 +37,9 @@
 //! `data/DRIVES`) with a blank D81, idle. A characterisation, not a gate: the B-on
 //! picture is judged against the B-off frame and printed, and where the two runs part
 //! the first divergence is printed too (`B-ON 1581:` lines); nothing fails on it.
+//! Spec 875 §12.12 — add `GATE_FDC=1` and B's 1581 has the gate's host controller
+//! (`SectorFdc`) in its socket serving the same blank D81; the pictures are written as
+//! `gate_<name>_trx64_b<unit>_1581_fdc.png`, for comparison with the 1581-idle run's.
 //!
 //! Spec 873 — `GATE_FOLDER=<unit>`: the same again with a folder device idle at that
 //! unit (a temp folder with one file in it) instead of drive B: the run writes
@@ -52,6 +55,8 @@
 
 #[path = "common/probe_listener.rs"]
 mod probe_listener;
+#[path = "common/sector_fdc.rs"]
+mod sector_fdc;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -301,6 +306,7 @@ fn run_game_full(
     let png = encode_png_rgba(w as u32, h as u32, &out_rgba);
     let png_path = match (drive_b, folder) {
         _ if probe.is_some() => format!("{TRACES}/gate_{name}_trx64_p{}.png", probe.unwrap()),
+        (Some(unit), _) if drive_b_is_1581() && gate_fdc() => format!("{TRACES}/gate_{name}_trx64_b{unit}_1581_fdc.png"),
         (Some(unit), _) if drive_b_is_1581() => format!("{TRACES}/gate_{name}_trx64_b{unit}_1581.png"),
         (Some(unit), _) => format!("{TRACES}/gate_{name}_trx64_b{unit}.png"),
         (None, Some(unit)) => format!("{TRACES}/gate_{name}_trx64_f{unit}.png"),
@@ -369,6 +375,14 @@ fn run_game_full(
         folder,
         probe,
     })
+}
+
+/// Spec 875 §12.12 — `GATE_FDC=1` with `GATE_DRIVE_B_TYPE=1581`: B's 1581 has the gate's
+/// host controller (`SectorFdc`, tests/common/sector_fdc.rs) in its socket, serving the
+/// same blank D81. The pictures go to `gate_<name>_trx64_b<unit>_1581_fdc.png`, to be
+/// compared with the 1581-idle run's.
+fn gate_fdc() -> bool {
+    std::env::var("GATE_FDC").as_deref() == Ok("1")
 }
 
 /// Spec 872 — `GATE_DRIVE_B_TYPE=1581`: position B is a 1581.
@@ -473,7 +487,13 @@ fn power_drive_b(m: &mut Machine, unit: u8) {
     if drive_b_is_1581() {
         m.set_drive_type(DrivePosition::B, trx64_core::iec::DriveType::Drive1581).expect("B off: a 1581");
         m.drive_b.set_rom_1581(&rom_1581().expect("GATE_DRIVE_B_TYPE=1581 needs the 1581 DOS")).unwrap();
-        m.drive_b.attach_disk(DiskImage { kind: DiskKind::D81, bytes: vec![0u8; 819_200], backing_path: None, read_only: false });
+        if gate_fdc() {
+            // Spec 875 §12.12 — the same blank D81, served by the gate's host controller.
+            let f = sector_fdc::SectorFdc::new("SectorFdc", vec![0u8; 819_200]);
+            m.attach_fdc_controller(DrivePosition::B, Box::new(f)).expect("B off: a controller fits");
+        } else {
+            m.drive_b.attach_disk(DiskImage { kind: DiskKind::D81, bytes: vec![0u8; 819_200], backing_path: None, read_only: false });
+        }
         m.set_drive_power(DrivePosition::B, true).expect("drive B on");
         return;
     }

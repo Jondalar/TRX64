@@ -1,6 +1,6 @@
 # Spec 875 — A controller of the host's own in the 1581
 
-**Status:** PROPOSED (2026-09-24)
+**Status:** BUILT on branch spec-875-host-fdc (not merged) — as built in §15
 **Repos:** TRX64. C64RE: no change.
 **Number:** 875 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`, row present).
 **Depends on:** Spec 872 (the 1581 board, its CIA glue, the WD1772 and the MFM surface),
@@ -235,8 +235,10 @@ pub trait FdcController: AsAny + Send {
     /// it is `clk` now. Port A stands released after it (`side0`, motor off).
     fn drive_reset(&mut self, clk: u64);
 
-    /// The drive's power switch. Off: no call follows until it is on again. On is
-    /// always followed by `drive_reset`.
+    /// The drive's power switch. A notification only: it resets nothing, and the
+    /// registers stand across an off (the U64's power bit is not part of `drv_reset`).
+    /// Off: no call follows until it is on again. On is always followed by
+    /// `drive_reset` — the drive's power-on reset, a separate event.
     fn power(&mut self, _on: bool) {}
 
     /// The drive clock is `clk` without time having passed for the controller: at
@@ -302,9 +304,9 @@ Decisions behind the shape:
     <name>; remove it before changing the type to 1541"`.
 - **The medium goes.** Attaching writes a mounted D81 back and ejects it, and returns it
   as `set_drive_type` returns an ejected medium (`drive.rs:710-748`): the caller persists
-  it. TRX64's WD1772 and its `Fdd` stay in the board, at their reset state, with no disk —
-  neither clocked nor on the bus, as the 1541 electronics stay in a position that holds a
-  1581 (872 §11).
+  it. TRX64's WD1772 and its `Fdd` stay in the board as a fresh chip (`Wd1770::new`, its
+  module names kept) with no disk — neither clocked nor on the bus, as the 1541
+  electronics stay in a position that holds a 1581 (872 §11).
 - **No media while fitted.** The position has no medium of TRX64's: the D81 is the host's.
   `Drive1541::mount` refuses: `"drive position A has <name>; its medium is the host's"`.
   `attach_disk_with_unreported_write` refuses the same way through its existing
@@ -377,8 +379,13 @@ system reset (`drive_registers.vhd:138`) — and its power bit only gates the mo
   `IecDevices` is (`iec_device.rs:160-181`): `clone_device()`, or a **vacancy** — the name
   kept, `uncovered = true`, and a socket with no chip: register reads return the open bus
   (`cpu_last_data`, U6 Y3 selecting nothing that drives D0-D7, the reasoning of 872 §10.4),
-  stores go nowhere, `board_in` = not ready, disk changed, protected. The cloned DOS then
-  answers `74,DRIVE NOT READY` if asked (872 §9.6). `Drive1581` keeps `#[derive(Clone)]`;
+  stores go nowhere, and nothing drives the mechanism lines: PA1, PA7 and PB6 read high
+  (the 8520's pull-ups) — `board_in` = not ready, **no** disk change, not protected. The
+  cloned DOS then answers `74,DRIVE NOT READY` when a job reaches the socket (its /RDY
+  check at `$CDBC`). *Corrected by the build:* this said "disk changed, protected". A
+  low PA7 sends the DOS into its STEP-IN / STEP-OUT recovery (`$CD83-$CD99`) before the
+  /RDY check, and the recovery's command stores wait at `$CBFA` for a BUSY the open bus
+  (`$60`) never shows — the clone's DOS hung instead of answering 74. `Drive1581` keeps `#[derive(Clone)]`;
   `Machine`'s hand-written `Clone` (`lib.rs:730`) needs no new line.
 - **`Machine::fdc_uncovered() -> Vec<String>`** names every vacancy and every controller a
   restore could not cover (§8), position by position. Cleared by a restore that covers
@@ -388,7 +395,10 @@ system reset (`drive_registers.vhd:138`) — and its power bit only gates the mo
   FdcController>>; 2]`) beside `drive_types`; `power_on` fits them back while the
   position is off — A is already switched off there for its type (`:204-207`) — before
   the disk re-attach (which then has nothing to attach) and before A/B come back on.
-  The controller sees `rebase`, then `power(true)` and `drive_reset(0)`.
+  The controller sees `rebase`, then `power(true)` and `drive_reset(0)`. *Added by the
+  build:* `take_fdc_controllers` sends `power(false)` first to a controller whose position
+  was powered — the C64's power cut takes the position's power with it (the session
+  builds a new machine), so the `power(true)` that follows has an off before it.
 
 ## §8 D6 — Checkpoints: hooks and the opt-out
 
@@ -415,6 +425,13 @@ taken without it and names it.**
   874 kept a mismatched host device attached and named it. A controller cannot be treated
   that way: the restored drive CPU is mid-conversation with the WD it was captured with,
   and a DOS polling a different chip is a machine that never existed.
+  The check runs before anything is overwritten (before the model switch of 863 D6), so
+  a refused restore leaves the machine as it was. `force_board_type` never replaces a
+  board that holds a controller, so `prepare_drive_types` (which the daemon runs before
+  a restore) cannot drop one either; the strict check then refuses by name.
+  *Added by the build:* after `rebase`, an uncovered controller hears `board_out` if the
+  port-A pins the restore put back differ from what it last heard; a covered one's own
+  state already holds them.
 - The blob reader learns that a `1581` blob may end after `CIA1581D0`; it then skips the
   WD/FDD read (`drive_snapshot.rs:1056`) and leaves `resync_iec_output` and the clocks as
   they are now.
@@ -493,12 +510,19 @@ directory. `crates/trx64-core/tests/fdc_controller_gate.rs`.
    arrives with `side0` true and false and with `motor_on` rising before the first READ
    SECTOR and falling after it, each at the drive cycle of the `STA $4000` that moved it
    (from the drive trace). No `board_out` is sent without a PA0/PA2 change.
+   *As run:* TRX64 has no per-instruction drive trace to read back, so the LOAD is
+   stepped one C64 instruction at a time and port A's pins are sampled from the CIA after
+   each step; every PA0/PA2 change must be answered by exactly one `board_out` inside
+   that step's window of drive cycles (at most one C64 instruction), carrying the new
+   pins. Every port-A store in the DOS is an `STA $4000` (plus one `STA $4002`, the DDR
+   at init: ROM scan).
 4. **/RDY, disk change, write protect honoured.**
    - `ready: false` held: `LOAD"$",8` ends with the error channel reading
      `74,DRIVE NOT READY` (the DOS's `$CDBC` PA1 check, 872 §10.3).
    - `disk_changed: true`, cleared by `SectorFdc` on a step pulse: the DOS's STEP-IN /
      STEP-OUT recovery (`$CD83-$CDA8`) runs and the listing follows; held set whatever
-     the steps: `74,DRIVE NOT READY`.
+     the steps: `74,DRIVE NOT READY`. (The DOS makes its first disk access — and so the
+     recovery — during its own start-up, before the first `LOAD`.)
    - `write_protected: true`: `SAVE"X",8` leaves the error channel at
      `26,WRITE PROTECT ON` and the D81 unchanged.
    - Each input as the CIA reads it, compared with `ports()` at the same instant.
@@ -538,7 +562,11 @@ directory. `crates/trx64-core/tests/fdc_controller_gate.rs`.
     1581 idle at 9 with `SectorFdc` fitted, against v0.9.0 on the same machine.
 12. **The seven games with a controller at 9** (`GATE_DRIVE_B_TYPE=1581 GATE_FDC=1`):
     expected byte-identical to the 1581-idle-at-9 pictures — no game touches unit 9's
-    disk. Any difference is recorded with its first divergence.
+    disk. Any difference is recorded with its first divergence. *As run, the expectation
+    was wrong:* the 1581 DOS reads its disk during its own start-up, and that access takes
+    TRX64's WD a spin-up of six index pulses and a head settle while `SectorFdc` serves it
+    48 cycles after the store — so drive 9 comes out of start-up at another time and
+    stands at another point of its idle loop when the games' loaders pull ATN (§15.1).
 
 ## §13 Scope — where this stops
 
@@ -554,27 +582,116 @@ directory. `crates/trx64-core/tests/fdc_controller_gate.rs`.
   inserted, sound) — the host drives TRX64's own switches for power, reset and jumpers
   through the existing API; a daemon verb or FFI binding; UE2's model itself.
 
-## §14 Open questions for UE2
+## §14 Questions for UE2 — settled by UE2, 2026-09-24
 
-1. **Where does the firmware serve relative to the drive clock?** If UE2's firmware runs
-   between `run` calls, BUSY is up for at least the rest of the slice and `$CBFA` sees it.
-   If UE2 serves synchronously inside `store` or `clock_to` (an in-process firmware
-   thread that answers at once), the model must keep BUSY up until the DOS has read it
-   (§3). Which is it?
-2. **Is `head()` available?** UE2's stepper has `cur_track` and the firmware's `side`;
-   TRX64 needs `(track, side)` for the monitor and the panel. Side as the head the 1581
-   reads (VICE's mapping, `side = PA0 ? 0 : 1`) — or does UE2 prefer the raw `side_0`
-   and TRX64 maps it?
-3. **The strict restore rule (§8).** A checkpoint and the live machine must agree on the
-   controller per position, or the restore is refused. Rewind within one run always
-   agrees. Is there a UE2 flow that restores a TRX64-WD checkpoint into a machine with
-   the model fitted (or the reverse)?
-4. **Power without reset.** `power(false)` is sent at power-off; the U64's `power` bit
-   only gates the motor and the CPU clock, and the WD is not reset by it. TRX64 always
-   resets at power-on (870). Is `power(true)` followed by `drive_reset` right for UE2's
-   model, or does it want the WD to keep its registers across a power-off like the FPGA
-   block does?
-5. **Hold as two resets.** TRX64 runs the reset sequence at the start of a hold and at its
-   release, and clocks nothing between (§6). The U64's `drv_reset` is a level. Two
-   notifications with no time between them are enough — or does UE2 want the level
-   (`drive_reset_held(bool)`)?
+UE2 has no objection to drive cycles as the time base, PB6 for write protect, fitting
+only while the drive is off, and refusing media operations while a controller is fitted.
+
+1. **Where the firmware serves** — settled by UE2, 2026-09-24. The model raises BUSY in
+   the same `store`, as the FPGA does (a command write sets BUSY and pushes the FIFO
+   entry, `wd177x.vhd:182-189`). The firmware serves the command at the next C64 sync,
+   about 1 ms later, never inside the drive's run. BUSY stays high until the sector is
+   served, so the BUSY contract (§3) holds.
+2. **`head()`** — settled by UE2, 2026-09-24. No head read-back toward the firmware,
+   confirmed: the firmware reads the side from `side0` and the track from UE2's own
+   stepper count. The same two give TRX64 its `head()`: track = the stepper count, side
+   = `side0 ? 0 : 1` (the mapping of §3, kept on TRX64's side of the doc).
+3. **The strict restore rule (§8)** — settled by UE2, 2026-09-24: accepted. UE2 does not
+   use checkpoints.
+4. **Power without reset** — settled by UE2, 2026-09-24. The FPGA WD keeps its registers
+   across a drive power-off: its reset is `drv_reset = drv_reset_i or iec_reset_o or
+   reset` (`drive_registers.vhd:138`, to `cpu_part_1581.vhd:329`); the power bit is not
+   part of it. UE2 resets its model only on `drive_reset`. **`power(on)` is a
+   notification only** — neither `power(false)` nor `power(true)` resets a controller.
+   The `drive_reset(0)` that follows `power(true)` is the drive's power-on reset (870:
+   TRX64's board always resets at power-on), delivered as the same call a RESET pulse
+   gives; it is not part of `power`.
+5. **Hold as two resets** — settled by UE2, 2026-09-24: two notifications are enough.
+   UE2 holds its model in reset between them.
+
+## §15 As built (2026-09-24, branch `spec-875-host-fdc`)
+
+**Code.**
+- `crates/trx64-core/src/fdc_controller.rs` (new): `FdcController`, `FdcBoardOut`,
+  `FdcBoardIn`, `DRIVE_HZ_1581` as §3, re-exported from the crate root; `VacantFdc`
+  (a clone's socket); `HostFdc` (the socket: box, name, position, last command byte,
+  last `board_out`, vacant, uncovered; `Clone` by hand).
+- `drive1581.rs`: crate-private `trait BoardFdc` (register read/store, `port_a`,
+  `pa_in`, `pb6`) with `BuiltIn<'a> { wd, read_only }` — 872's code moved behind it —
+  and `Host<'a> { slot }`; `Ports` and `Bus1581` generic over it; `run_cycles` matches
+  `host_fdc` once per slice and runs the loop (`run_slice`, `#[inline(always)]`) for that
+  instantiation, then `clock_to(core.clk)` for a host. The cold paths (reset, the CIA's
+  snapshot module) go through `enum AnyFdc`. `reset` → `drive_reset(0)`; `head()`,
+  `wd()`, `peek`, `ports()` read the socket; `host_power` notifies. `board_out` is sent
+  only when PA0/PA2 moved (the LEDs share the port).
+- `drive.rs`: power on/off notify (`set_power`, `power_on_reset` when powered);
+  `mount` / `attach_disk_with_unreported_write` refuse with a controller;
+  `force_board_type` never replaces a board that holds one; `fit_host_fdc` /
+  `unfit_host_fdc`; `host_fdc_name`.
+- `lib.rs`: `Machine::attach_fdc_controller`, `detach_fdc_controller`,
+  `fdc_controller_as(_mut)`, `fdc_uncovered`, `take_fdc_controllers`; the
+  `set_drive_type` refusal.
+- `drive_snapshot.rs`: the 1581 blob ends after `CIA1581D0` with a controller (write
+  and read). `c64re_snapshot.rs`: the `hostFdc` node; `check_host_fdc` before anything is
+  restored; `restore_host_fdc` after the drives.
+- `trx64-session`: `fdc_held` across `power_off` / `power_on`.
+- `trx64-monitor`: the `controller <name>` line in `drive` for a 1581 with one.
+
+**Tests.** `tests/common/sector_fdc.rs` (`SectorFdc`), `tests/common/d81_kit.rs` (872's
+D81 kit, copied so `drive1581_gate.rs` stays unchanged), `tests/fdc_controller_gate.rs`
+(14 tests + the cost characterisation), `trx64-session/tests/fdc_power_cycle.rs`,
+`seven_game_gate.rs` `GATE_FDC=1`.
+
+**Corrected by the build** (in the text above): the vacancy's lines (§7: all high, not
+"changed, protected" — the DOS hung at `$CBFA`); `power(false)` from
+`take_fdc_controllers` (§7); the restore check's placement, `force_board_type`, and the
+uncovered controller's `board_out` (§8); the WD left in the board is a fresh chip (§4);
+§12.3's evidence as run; §12.12's expectation. The trait is as specified.
+
+### §15.1 Acceptance, as run
+
+- **§12.2** — directory, LOAD across both sides, SAVE, format: listing, loaded bytes and
+  the D81 after SAVE and after format (160 WRITE TRACKs) byte-identical to the built-in
+  run. READY at C64 cycle, built-in / host: directory 4 619 437 / 4 619 427; LOAD
+  11 912 254 / 11 696 077; SAVE 18 477 892 / 17 770 243; format 100 411 556 / 79 593 991.
+- **§3 BUSY** — `serve_in_store` (type I finished inside the store): the DOS sits at
+  `$CBFA` after 600 frames, no status read ever saw BUSY; the 48-cycle controller lists.
+- **§12.3** — 3 `board_out` during the LOAD (motor on; side; motor off), each inside the
+  window of its pin change; motor on before the first READ SECTOR, off after the last;
+  `side0` both ways.
+- **§12.4** — not ready: `74,DRIVE NOT READY`; disk change cleared by a step: STEP-IN
+  then STEP-OUT served, listing follows; held: 74; write protect: `26,WRITE PROTECT ON`,
+  D81 unchanged; each input by a CPU read (`M-E` probe), a peek and `ports()` agree.
+- **§12.5** — `drive_reset(0)` at RESET, warm reset (connected; none cut), hold and
+  release, power-on after `power(true)`; `power(false)` alone at power-off, registers
+  kept; nothing while held, off or stopped (50 frames); no `clock_to` ever went back.
+- **§12.6** — every refusal names the position and the controller; attach over a written
+  D81 returns it as written.
+- **§12.7** — opt-out: no `WD1770`/`FDD` module, no `IMAGE0`, `hostFdc` node as
+  specified, `rebase` to the restored drive clock, named uncovered; hooks: covered, 500
+  frames lockstep (RAM, drive RAM, clocks, PCs, the 1581's modules, the controller's
+  state), LOAD completes; both mismatches and a name mismatch refused, the refused
+  machine untouched; no `hostFdc` key without a controller.
+- **§12.8** — clone: vacancy named uncovered, `LDA $6000` / `LDA $7FFF` read `$60` /
+  `$7F`, lines all high, `74` on a job; the original's controller untouched.
+- **§12.9** — session power cycle: same box, `power(false)`, `rebase`, `power(true)`,
+  `drive_reset(0)`, lists afterwards.
+- **§12.10** — against a v0.9.0 baseline (main `7d97f6e`, detached worktree, same target
+  dir, touched before each run): `drive1581_gate` 11 + 1 ignored, unchanged;
+  `cia_alarm_check_gate` (frozen digests), `drive_part_gate`, `second_drive_gate`,
+  `drive_disk_checkpoint_gate`, `iec_device_gate`, `folder_device_gate`, the daemon's
+  `monitor_golden` green; `.c64re` files written by the baseline (1581 mid-LOAD, mid-SAVE,
+  1541 + 1581 mid-copy) restored on this build: 500 frames, per-frame digest (RAM, drive
+  RAM, 1581 modules, clocks, PCs, bus) identical to the baseline's straight run; 7-game
+  gate `GATE_DRIVE_B=9`, `GATE_DRIVE_B=9 GATE_DRIVE_B_TYPE=1581`, `GATE_FOLDER=9`: 7/7
+  each, all 42 PNGs (default + variant, three runs) byte-identical to the baseline's.
+- **§12.11 cost** (scramble LOAD, 1500 frames, best of 3 / 5, two rounds, ms/frame):
+  872's characterisation — v0.9.0 B off 1.682 / 1.670, 1581 idle at 9 1.898 / 1.906;
+  this build 1.664 / 1.691, 1.885 / 1.915 (run-to-run noise). With `SectorFdc` idle at
+  9: 1.901 / 1.912 against 1.884 / 1.896 without it, +0.9 %.
+- **§12.12** — `GATE_DRIVE_B=9 GATE_DRIVE_B_TYPE=1581 GATE_FDC=1`: 7/7; five pictures
+  byte-identical to the 1581-idle run's; maniac (632 px, the box the idle folder at 9
+  gives, x 34..=317 y 35..=42) and polarbear (31 px inside its named box) differ. First
+  divergence of the two B-on runs: drive 9's start-up disk access (above); at the gate's
+  divergence point (C64 cycle 3 339 503) drive 9 stands at `$AC9B` with the controller
+  and at `$AC99` with TRX64's WD.

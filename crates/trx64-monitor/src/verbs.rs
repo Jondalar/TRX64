@@ -952,19 +952,23 @@ fn exec_owned(
                     let (t, side) = b.head();
                     let w = b.wd();
                     let p = b.ports();
+                    // Spec 875 §9 — a host's controller in the socket is named; without
+                    // one the output is what it always was.
+                    let controller = b.host_fdc().map(|h| format!("\n  controller {}", h.name())).unwrap_or_default();
                     return Ok(format!(
                         "1581 (drive {unit})\n  \
                          ADDR AC XR YR SP NV-BDIZC  clk\n\
                          .;{} {:02x} {:02x} {:02x} {:02x} {}  {}\n  \
                          track {} side {} (logical track {})  motor {}  led {}\n  \
-                         wd track {:02x} sector {:02x} data {:02x} status {:02x} cmd {:02x}{}",
+                         wd track {:02x} sector {:02x} data {:02x} status {:02x} cmd {:02x}{}{}",
                         addr_spans::mark(&format!("{:04x}", c.reg_pc), c.reg_pc, SpanSpace::Drive(unit), SpanRole::Pc, None, 1),
                         c.reg_a, c.reg_x, c.reg_y, c.reg_sp, flags_str, drv.drive_clk,
                         t, side, t as u32 + 1,
                         if p.motor_on { "on" } else { "off" },
                         if led { "on" } else { "off" },
                         w.track, w.sector, w.data, w.status, w.command,
-                        if w.busy { "  busy" } else { "" }
+                        if w.busy { "  busy" } else { "" },
+                        controller
                     ));
                 }
                 let halftrack = drv.rotation.current_half_track;
