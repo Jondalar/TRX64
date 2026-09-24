@@ -1562,7 +1562,9 @@ impl Drive1541 {
     /// Detach (eject) the disk from this drive. Flushes any pending dirty track
     /// back into `disk.bytes` first (VICE `drive_image_detach` →
     /// `drive_gcr_data_writeback`); the image leaves the drive with it, and the
-    /// caller that wants it in the host file persists before the eject.
+    /// caller that wants it in the host file persists before the eject. The 1541's
+    /// write-protect sensor goes dark for the moment the disk passes it
+    /// (`Rotation::eject`), which is how its DOS notices the removal.
     pub fn detach_disk(&mut self) {
         self.flush_disk_writeback();
         self.disk = None;
@@ -1570,7 +1572,7 @@ impl Drive1541 {
             b.detach();
             return;
         }
-        self.rotation.detach();
+        self.rotation.eject(self.drive_clk);
     }
 
     /// Bring `self.disk.bytes` (the image the daemon persists/hashes/snapshots) up
