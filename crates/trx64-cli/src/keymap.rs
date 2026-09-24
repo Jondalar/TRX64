@@ -37,11 +37,10 @@ pub fn map_special(code: KeyCode) -> Option<Vec<&'static str>> {
         Tab => r(&["RUN_STOP"]),
         Backquote => r(&["CTRL"]),
         Home => r(&["HOME"]),
-        ControlLeft | ControlRight => r(&["CTRL"]),
+        // The Commodore key — host Control, as VICE maps it; C64 CTRL is on ^ above.
+        ControlLeft | ControlRight => r(&["C_EQ"]),
         ShiftLeft => r(&["L_SHIFT"]),
         ShiftRight => r(&["R_SHIFT"]),
-        // The Commodore key — host Cmd/Super.
-        SuperLeft | SuperRight => r(&["C_EQ"]),
         // F2/F4/F6/F8 are SHIFT + F1/F3/F5/F7 on the C64.
         F1 => r(&["F1"]),
         F2 => r(&["L_SHIFT", "F1"]),
@@ -164,6 +163,11 @@ mod tests {
     fn special_keys_by_position() {
         assert_eq!(map_special(KeyCode::Enter), Some(vec!["RETURN"]));
         assert_eq!(map_special(KeyCode::Escape), Some(vec!["LARROW"]));
+        // Left edge as on the C64: ^ = CTRL, TAB = RUN/STOP, host Control = C=.
+        assert_eq!(map_special(KeyCode::Backquote), Some(vec!["CTRL"]));
+        assert_eq!(map_special(KeyCode::Tab), Some(vec!["RUN_STOP"]));
+        assert_eq!(map_special(KeyCode::ControlLeft), Some(vec!["C_EQ"]));
+        assert_eq!(map_special(KeyCode::SuperLeft), None);
         assert_eq!(map_special(KeyCode::F2), Some(vec!["L_SHIFT", "F1"]));
         assert_eq!(map_special(KeyCode::KeyA), None); // a letter → map_char
     }
