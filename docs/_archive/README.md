@@ -351,3 +351,76 @@ dropped 2026-08-11 (the drive must refuse what the workbench must read), the cla
 2026-09-19; `trx64-static` keeps only the decoder the runtime's monitor and `trx64cli disasm`
 use. Closed 2026-09-19. Docs: [spec-c64re-trx64-split-charter.md](spec-c64re-trx64-split-charter.md),
 [capability-cut-decisions.md](capability-cut-decisions.md).
+
+## A colour per pixel under turbo — 868
+
+Aleksi Eeben's UPic technique writes 384 values to `$D020` per raster line, one per VIC
+pixel, which a 64 MHz CPU can do; the VIC sampled the register once per PHI2 cycle.
+
+**Decision:** on the U64 profile with a turbo divider above 1, a colour store fills eight
+per-cycle slots from `turbo_phase`, applied where a token is resolved into a colour, so the
+6569's one-pixel latency rides the same pipeline and every C64/C128 stays byte-identical to
+VICE. It revised 851's turbo timing: the divider is adopted at the next PHI2 edge and a speed
+write restarts the sub-PHI2 phase. A residual of single-pixel anomalies, ~100× the hardware
+capture's rate and no longer at multiples of 8, is recorded open in §9 with no hypothesis left.
+Merged 2026-09-21. Spec: [868-a-colour-per-pixel-under-turbo.md](868-a-colour-per-pixel-under-turbo.md).
+
+## The drive as a part — 870
+
+**Decision:** the 1541 is a part a host operates like the U64's FPGA drive: power on/off with
+the IEC lines released when off; its own reset, a C64 reset reaching it only over a
+connectable reset line (default connected); stopped (powered, clock frozen, outputs kept);
+ROM from bytes, in force at power-on; unit 8-11 via the VIA1 jumper bits. Defaults
+byte-identical to before. The drive checkpoint became cycle-exact on restore and carries the
+disk as written; every path that could keep a write from the host file was closed. Merged
+2026-09-23 (v0.8.8). Spec: [870-the-drive-as-a-part.md](870-the-drive-as-a-part.md).
+
+## A second drive on the bus — 871
+
+**Decision:** position B beside A on the one IEC bus, off by default, addressed by unit on the
+wire and in the monitor; two powered drives at one unit are refused. With B on and idle,
+Green Beret, MOTM and Scramble differ, because every 1541 answers ATN in hardware, as in VICE;
+the seven-game gate compares pixels for the B-on run and names those three. B on costs ~10%
+frame time. Merged 2026-09-23 (v0.8.8). Spec: [871-a-second-drive-on-the-bus.md](871-a-second-drive-on-the-bus.md).
+
+## A 1581 drive — 872
+
+**Decision:** a 1581 as a drive type beside the 1541 in positions A/B: 6502 at 2 MHz, 8 KiB RAM,
+32 KiB ROM at power-on, 8520 CIA (FLAG and serial shift register ported from VICE; the C64's
+CIAs byte-identical), WD177x and a byte-level MFM surface ported from VICE, D81 lazy
+write-back. Drive type chosen per position, refused while powered. `.vsf` stays 1541-only.
+Merged 2026-09-23. Spec: [872-a-1581-drive.md](872-a-1581-drive.md).
+
+## A folder on the bus — 873
+
+**Decision:** a device kind on the line-level IEC bus with no drive CPU: serves a host folder
+(LOAD/SAVE/OPEN, command channel, directory), answers ATN like a 1541, refuses M-W/M-E and
+block commands. Writes go straight to the host folder; a checkpoint holds the device and the
+pointer, never the folder's contents. Ultimate timing and refusal codes by default. Fast
+protocols, REL and partitions out of scope. Merged 2026-09-23.
+Spec: [873-a-folder-on-the-bus.md](873-a-folder-on-the-bus.md).
+
+## A device of the host's own on the bus — 874
+
+**Decision:** a public `IecDevice` trait: a host plugs its own line-level device into a bus slot
+(4-11), caught up at every drive sync point, ATN edges at their cycle, running while the C64 is
+held or in reset; a device may opt out of checkpoints, and the checkpoint names it. The folder
+device became the first implementor, byte-identical. Built for UE2's U64 IEC processor. Merged
+2026-09-24. Spec: [874-a-host-device-on-the-bus.md](874-a-host-device-on-the-bus.md).
+
+## A controller of the host's own in the 1581 — 875
+
+**Decision:** `FdcController`: a host replaces a 1581's WD1772 (UE2: the U64 FPGA's wd177x, the
+firmware serving sectors from the open D81). Register window `$6000-$7FFF` at the drive cycle,
+side/motor out, ready, disk change and write protect in, drive reset and power notified.
+Fitted only with the position off; media operations refused while fitted; the checkpoint
+leaves out disk and WD and names that. TRX64's WD1772 stays the default. Merged 2026-09-24
+(v0.9.1). Spec: [875-a-host-controller-in-the-1581.md](875-a-host-controller-in-the-1581.md).
+
+## The POT lines — 876
+
+**Decision:** SID `$D419`/`$D41A` answer the port CIA1 PA6/PA7 selects (both: VICE's parallel
+rule; neither: `$FF`), latched on a 512-cycle grid from power-on; `set_pot`/`clear_pot` take the
+host's finished byte (paddles, 1351, extra fire buttons); the default is `$FF` instead of `$80`.
+Monitor `pot`, daemon `session/pot_set`/`pot_clear`. Merged 2026-09-24.
+Spec: [876-the-pot-lines.md](876-the-pot-lines.md).
