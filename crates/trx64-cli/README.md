@@ -202,8 +202,20 @@ window, debug in the cockpit at the same time**.
   AudioOutput).
 - **Keyboard** — **symbolic mapping**: printable keys map by the
   host-layout-resolved character (correct on QWERTZ etc. — no Y/Z swap, right
-  punctuation); special keys (RETURN, DEL, RUN/STOP, the left-edge keys, function keys)
-  map by physical position; the **arrow keys are the cursor keys**.
+  punctuation); special keys map by physical position, the left edge as on the C64:
+
+  | host key | C64 key |
+  |---|---|
+  | ESC | ← |
+  | `^` (below ESC) | CTRL |
+  | Tab | RUN/STOP |
+  | Control | C= (the Commodore key, as in VICE) |
+  | Shift left / right | SHIFT left / right |
+  | Return · Backspace · Home | RETURN · DEL · CLR/HOME |
+  | F1–F8 | F1–F8 (F2/F4/F6/F8 = SHIFT + F1/F3/F5/F7) |
+  | arrow keys | the cursor keys (up/left = SHIFT + down/right) |
+
+  Cmd is not mapped. RESTORE has no host key.
 - **Joystick** — off by default (so WASD/Space type). `/joystick port1|port2` routes
   **WASD = directions, Space = fire** to that port; `/joystick off` returns them to the
   keyboard.

@@ -168,6 +168,23 @@ on an explicit `session/run`. That is the mode for byte-exact oracle and tool da
 For embedding in the Apple universe, `trx64-ffi` exposes a typed uniffi library (Swift bindings) —
 [`crates/trx64-ffi/API.md`](crates/trx64-ffi/API.md).
 
+**Embedding in Rust.** `trx64-core` is a library: build a `Machine`, feed it ROMs, run it. Beyond
+media and input it has three places where a host plugs in its own hardware:
+
+- **Drives** — two positions on the bus, each a 1541 or a 1581 (`set_drive_type`, only while
+  that drive is off), with their own power, reset and unit 8-11. `attach_folder` puts a host
+  directory on the bus as a device of its own.
+- **`IecDevice`** — your own line-level device on the serial bus (`attach_iec_device`, slots
+  4-11). It is caught up to the exact cycle of every `$DD00` access, gets every ATN edge at its
+  cycle, and keeps running while the C64 is held or in reset. The folder device is built on it.
+- **`FdcController`** — your own disk controller in place of a 1581's WD1772
+  (`attach_fdc_controller`, with the drive off), for hosts that keep the disk image themselves
+  and serve it sector by sector. It sees the WD registers at the drive's cycle, side select and
+  motor, and drives ready, disk change and write protect.
+
+A device or controller may keep its state out of snapshots; a snapshot then names what it
+left out.
+
 **Formats:** `.c64re` machine snapshot, `.c64rering` reverse-debug buffers, `.c64retrace`
 trace log. VICE `.vsf` imports, `.reu` images load with `--reu-image`.
 
