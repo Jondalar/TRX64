@@ -13594,8 +13594,8 @@ fn folders_json(st: &State) -> Value {
     Value::Array(
         st.session
             .machine
-            .folders
-            .iter()
+            .folders()
+            .into_iter()
             .map(|f| json!({ "unit": f.unit, "path": f.root.to_string_lossy(), "read_only": f.read_only() }))
             .collect(),
     )
@@ -13603,11 +13603,11 @@ fn folders_json(st: &State) -> Value {
 
 /// Spec 873 — hand the folder devices' refusals to every client and keep the last few.
 fn drain_folder_events(st: &mut State) {
-    if st.session.machine.folders.is_empty() {
+    if st.session.machine.iec_devices.is_empty() {
         return;
     }
     let mut events = Vec::new();
-    for f in st.session.machine.folders.iter_mut() {
+    for f in st.session.machine.folders_mut() {
         events.extend(f.take_events());
     }
     for e in events {
@@ -24193,6 +24193,6 @@ mod batch1_tests {
         assert_eq!(state["folders"][0]["unit"], json!(10));
         assert_eq!(state["folders"][0]["read_only"], json!(true));
         let g = st.lock().unwrap();
-        assert_ne!(g.session.machine.iec.folder_units & (1 << 10), 0, "back on the bus");
+        assert_ne!(g.session.machine.iec.device_slots & (1 << 10), 0, "back on the bus");
     }
 }

@@ -440,9 +440,10 @@ impl Drive1581 {
         self.iecbus.cpu_bus = cpu_bus;
         self.iecbus.drv_port = drv_port;
         let own = number + 8;
-        let disk_slots = 8..(8 + crate::iec::NUM_DISK_UNITS);
+        // Spec 874 — every slot another device can stand in, 4-11 (`0xff` when empty).
+        let bus_slots = 4..(8 + crate::iec::NUM_DISK_UNITS);
         for (slot, (mine, theirs)) in self.iecbus.drv_bus.iter_mut().zip(drv_bus).enumerate() {
-            if disk_slots.contains(&slot) && slot != own {
+            if bus_slots.contains(&slot) && slot != own {
                 *mine = *theirs;
             }
         }

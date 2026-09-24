@@ -2040,11 +2040,19 @@ fn exec_owned(
             let lvl = |v: u8, bit: u8| if v & bit != 0 { "high" } else { "LOW " };
             let pull = |v: u8, bit: u8| if v & bit != 0 { "-" } else { "pulls" };
 
-            // Spec 873 — a column per folder device, when there is one: who is holding
-            // the line includes a device without a CPU.
-            let folders: Vec<(u8, u8)> = m.folders.iter().map(|f| (f.unit, m.iec.drv_bus(f.unit as usize))).collect();
-            let fhead: String = folders.iter().map(|(u, _)| format!("   folder {u}")).collect();
-            let fcol = |bit: u8| -> String { folders.iter().map(|&(_, b)| format!("   {:<8}", pull(b, bit))).collect::<String>().trim_end().to_string() };
+            // Spec 873/874 — a column per IEC device (a folder, a host's own), headed by
+            // its name, when there is one: who is holding the line includes a device
+            // without a CPU.
+            let devices: Vec<(String, u8)> = m.iec_devices.iter().map(|s| (s.dev.name(), m.iec.drv_bus(s.slot as usize))).collect();
+            let fhead: String = devices.iter().map(|(n, _)| format!("   {n}")).collect();
+            let fcol = |bit: u8| -> String {
+                devices
+                    .iter()
+                    .map(|(n, b)| format!("   {:<w$}", pull(*b, bit), w = n.chars().count().max(5)))
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            };
             let sep = |s: String| if s.is_empty() { s } else { format!("  {s}") };
             let mut out = vec![
                 "IEC BUS  (a released line is high; any device may pull it low)".to_string(),
@@ -2106,11 +2114,11 @@ fn exec_owned(
         // its view: protocol state, open channels, last status.
         "folder" => {
             let m = host.machine();
-            if m.folders.is_empty() {
+            if m.folders().is_empty() {
                 return Ok("no folder device on the bus".to_string());
             }
             let want = toks.get(1).and_then(|t| t.trim_start_matches('#').parse::<u8>().ok());
-            let picked: Vec<String> = m.folders.iter().filter(|f| want.is_none_or(|u| u == f.unit)).map(|f| f.describe()).collect();
+            let picked: Vec<String> = m.folders().into_iter().filter(|f| want.is_none_or(|u| u == f.unit)).map(|f| f.describe()).collect();
             if picked.is_empty() {
                 return Err(format!("no folder device at unit {}", want.unwrap_or(0)));
             }

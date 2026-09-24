@@ -264,10 +264,11 @@ pub struct IecCore {
     /// Spec 871 — the bus slot drive position B occupies. `new()` = `None`: B is off
     /// on every machine that does not switch it on.
     pub drive_slot_b: Option<usize>,
-    /// Spec 873 — the units (bit per unit) that carry a folder device. Such a slot is
-    /// `IECBUS_DEVICE_IECDEVICE`; the device writes its own `drv_bus` there
-    /// (`folder_device::folders_sync`). `0` on every machine without one.
-    pub folder_units: u16,
+    /// Spec 873/874 — the slots (bit per slot, 4-11) that carry an IEC device: a folder
+    /// or a host's device. Such a slot is `IECBUS_DEVICE_IECDEVICE`; the device writes
+    /// its own `drv_bus` there (`iec_device::iec_devices_sync`). `0` on every machine
+    /// without one.
+    pub device_slots: u16,
 }
 
 impl Default for IecCore {
@@ -300,7 +301,7 @@ impl IecCore {
             c64iec_active: 1,
             drive_slot: Some(8),
             drive_slot_b: None,
-            folder_units: 0,
+            device_slots: 0,
         };
         s.iecbus_init();
         // Power-on cpu_bus/cpu_port released (memset 0xff already set them); the
@@ -906,27 +907,28 @@ impl IecCore {
         }
     }
 
-    /// A drive or a folder device holds a slot — anything but Conf0.
+    /// A drive or an IEC device holds a slot — anything but Conf0.
     #[inline]
     fn anything_on_bus(&self) -> bool {
-        self.drive_slot.is_some() || self.drive_slot_b.is_some() || self.folder_units != 0
+        self.drive_slot.is_some() || self.drive_slot_b.is_some() || self.device_slots != 0
     }
 
-    /// Spec 873 — put the device map in step with the folder devices: `units` has a bit
-    /// per unit that carries one. A newly attached device's slot starts released
-    /// (`WRITE_CLK | WRITE_DATA`, VICE `serial_iec_device_init`); a detached one's is
-    /// released as a drive's is (`0xff`). With `units == 0` the map is the drives' alone,
-    /// byte for byte what it was.
-    pub fn set_folder_units(&mut self, units: u16, c64_pa_out: u8) {
-        if units == self.folder_units {
+    /// Spec 873/874 — put the device map in step with the IEC devices: `slots` has a
+    /// bit per slot (4-11) that carries one. A newly attached device's slot starts
+    /// released (`WRITE_CLK | WRITE_DATA`, VICE `serial_iec_device_init`) until the
+    /// machine writes the device's own pull; a detached one's is released as a drive's
+    /// is (`0xff`). With `slots == 0` the map is the drives' alone, byte for byte what it
+    /// was.
+    pub fn set_device_slots(&mut self, slots: u16, c64_pa_out: u8) {
+        if slots == self.device_slots {
             return;
         }
-        let added = units & !self.folder_units;
+        let added = slots & !self.device_slots;
         let was_on_bus = self.anything_on_bus();
-        self.folder_units = units;
+        self.device_slots = slots;
         let (a, b) = (self.drive_slot, self.drive_slot_b);
         self.adopt_drive_slots(a, b);
-        for s in 8..(8 + NUM_DISK_UNITS) {
+        for s in 4..(8 + NUM_DISK_UNITS) {
             if added & (1 << s) != 0 {
                 self.iecbus.drv_bus[s] = IECBUS_DEVICE_WRITE_CLK | IECBUS_DEVICE_WRITE_DATA;
             }
@@ -952,9 +954,11 @@ impl IecCore {
     /// IEC lines were captured with that map in force.
     pub fn adopt_drive_slots(&mut self, a: Option<usize>, b: Option<usize>) {
         let b = if b.is_some() && b == a { None } else { b };
-        let fu = self.folder_units;
-        for s in 8..(8 + NUM_DISK_UNITS) {
-            if Some(s) != a && Some(s) != b && fu & (1 << s) == 0 {
+        let ds = self.device_slots;
+        // Spec 874 — slots 4-7 too: a host's device may stand there. Without one they
+        // are NONE / `0xff` on every machine, so this changes nothing.
+        for s in 4..(8 + NUM_DISK_UNITS) {
+            if Some(s) != a && Some(s) != b && ds & (1 << s) == 0 {
                 self.iecbus_device[s] = IECBUS_DEVICE_NONE;
                 self.iecbus.drv_bus[s] = 0xff;
                 self.iecbus.drv_data[s] = 0xff;
@@ -963,11 +967,11 @@ impl IecCore {
         for s in [a, b].into_iter().flatten() {
             self.iecbus_device[s] = IECBUS_DEVICE_TRUEDRIVE;
         }
-        // Spec 873 — a folder device's slot is an IEC device (the machine refuses a
-        // drive at the same unit; were one there anyway, the device outranks it, as in
+        // Spec 873/874 — an IEC device's slot is `IECDEVICE` (the machine refuses a
+        // drive at the same slot; were one there anyway, the device outranks it, as in
         // VICE's `iecbus_device_index`).
-        for s in 8..(8 + NUM_DISK_UNITS) {
-            if self.folder_units & (1 << s) != 0 {
+        for s in 4..(8 + NUM_DISK_UNITS) {
+            if self.device_slots & (1 << s) != 0 {
                 self.iecbus_device[s] = IECBUS_DEVICE_IECDEVICE;
             }
         }

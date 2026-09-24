@@ -1539,23 +1539,58 @@ pub fn capture_runtime_checkpoint_with(
     // profile, line state, channels (host path + position + the unwritten chunk), the
     // command buffer, status, current directory, an open listing, boot file, read-only.
     // No file contents, whatever the folder's size. Omitted when none is attached.
-    if !m.folders.is_empty() {
-        tree["folders"] = serde_json::to_value(&m.folders).unwrap();
+    let folders = m.folders();
+    if !folders.is_empty() {
+        tree["folders"] = serde_json::to_value(&folders).unwrap();
+    }
+    // Spec 874 §8 — every other IEC device: slot, name, claimed units and its own state,
+    // `null` for one that opted out. Omitted without one, so every checkpoint of a
+    // machine without a host device is the one it was.
+    let others: Vec<serde_json::Value> = m
+        .iec_devices
+        .iter()
+        .filter(|s| !is_folder(s))
+        .map(|s| {
+            serde_json::json!({
+                "slot": s.slot,
+                "name": s.dev.name(),
+                "units": s.dev.units(),
+                "state": s.dev.checkpoint(),
+            })
+        })
+        .collect();
+    if !others.is_empty() {
+        tree["iecDevices"] = serde_json::Value::Array(others);
     }
     tree
+}
+
+fn is_folder(s: &crate::iec_device::SlottedDevice) -> bool {
+    s.dev.as_ref().as_any().is::<crate::folder_device::FolderDevice>()
 }
 
 /// Spec 873 §9 — put the folder devices back. Absent → none attached. Each device
 /// gets its host again — the live machine's source when it serves the same folder at
 /// the same unit, else the plain host folder at the root path — and re-opens its
-/// channels there: the host is whatever it is now.
+/// channels there: the host is whatever it is now. A host's device (Spec 874) is never
+/// removed for a folder: a restored folder whose unit such a device holds is refused.
 fn restore_folders(m: &mut Machine, node: Option<&serde_json::Value>) -> Result<(), String> {
     use crate::folder_device::{FolderDevice, FolderSource, HostFolder};
     let restored: Vec<FolderDevice> = match node {
         Some(v) if !v.is_null() => serde_json::from_value(v.clone()).map_err(|e| format!("restore folders: {e}"))?,
         _ => Vec::new(),
     };
-    let live = std::mem::take(&mut m.folders);
+    for f in &restored {
+        if let Some(s) = m.iec_devices.iter().find(|s| s.slot == f.unit && !is_folder(s)) {
+            return Err(format!("restore folders: unit {}: slot {} is held by {}", f.unit, s.slot, s.dev.name()));
+        }
+    }
+    let live: Vec<FolderDevice> = m
+        .iec_devices
+        .take_where(is_folder)
+        .into_iter()
+        .map(|s| *s.dev.into_any_box().downcast::<FolderDevice>().expect("a folder"))
+        .collect();
     let cpu_hz = m.timing().cpu_hz;
     for mut f in restored {
         let src: std::sync::Arc<dyn FolderSource> = match live.iter().find(|l| l.unit == f.unit && l.root == f.root).and_then(|l| l.source().cloned()) {
@@ -1566,10 +1601,46 @@ fn restore_folders(m: &mut Machine, node: Option<&serde_json::Value>) -> Result<
         };
         f.reattach(src);
         f.cpu_hz = cpu_hz;
-        m.folders.push(f);
+        let unit = f.unit;
+        m.iec_devices.insert(unit, Box::new(f));
     }
-    m.folders.sort_by_key(|f| f.unit);
     Ok(())
+}
+
+/// Spec 874 §8 — the host's devices. A restore never creates or removes one. A device
+/// the node lists at its slot under its name, with state, gets `restore(state)` (an
+/// `Err` fails the restore). Every other one — opted out (`state: null`), not in the
+/// node, a clone's vacancy — stays as it is live and is returned as uncovered, to be
+/// `rebase`d once the bus is back; a node entry with no live device is named too.
+fn restore_host_devices(m: &mut Machine, node: Option<&serde_json::Value>) -> Result<(Vec<u8>, Vec<String>), String> {
+    let entries: Vec<serde_json::Value> = node.and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let entry_at = |slot: u8| entries.iter().find(|e| e.get("slot").and_then(|v| v.as_u64()) == Some(slot as u64));
+    let mut rebase = Vec::new();
+    let mut names = Vec::new();
+    for s in m.iec_devices.iter_mut().filter(|s| !is_folder(s)) {
+        let name = s.dev.name();
+        let state = entry_at(s.slot)
+            .filter(|e| e.get("name").and_then(|v| v.as_str()) == Some(name.as_str()))
+            .and_then(|e| e.get("state"))
+            .filter(|st| !st.is_null());
+        match state {
+            Some(st) if !s.is_vacant() => s.dev.restore(st).map_err(|e| format!("restore iecDevices: slot {}: {e}", s.slot))?,
+            _ => {
+                rebase.push(s.slot);
+                names.push(name);
+            }
+        }
+    }
+    for e in &entries {
+        let slot = e.get("slot").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+        if m.iec_devices.get(slot).is_none() {
+            let name = e.get("name").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    Ok((rebase, names))
 }
 
 /// Spec 871 — position B's whole state: its part (`drivePart` shape), the drive core
@@ -1886,12 +1957,18 @@ pub fn restore_runtime_checkpoint(
     m.drive8.restore_part(&part)?;
     // Spec 871 — position B, then the device map for both.
     restore_drive_b(m, cp.get("driveB"))?;
-    // Spec 873 — the folder devices, then the device map for drives and folders.
+    // Spec 873 — the folder devices; Spec 874 — the host's devices; then the device
+    // map for drives and devices.
     restore_folders(m, cp.get("folders"))?;
-    let units = m.folders.iter().fold(0u16, |u, f| u | (1 << f.unit));
+    let host_node = cp.get("iecDevices");
+    let (rebase, uncovered) = restore_host_devices(m, host_node)?;
+    let units = m.iec_devices.slots();
     let (slot, slot_b) = crate::drive::pair_bus_slots(&m.drive8, &m.drive_b);
-    if m.iec.drive_slot != slot || m.iec.drive_slot_b != slot_b || m.iec.folder_units != units {
-        m.iec.folder_units = units;
+    // A node that lists a device, or a live host device, can leave the `iec` node's
+    // pull in a slot nobody stands in now: re-adopt then, which releases it.
+    let hosts = host_node.is_some_and(|v| !v.is_null()) || m.iec_devices.iter().any(|s| !is_folder(s));
+    if hosts || m.iec.drive_slot != slot || m.iec.drive_slot_b != slot_b || m.iec.device_slots != units {
+        m.iec.device_slots = units;
         m.iec.adopt_drive_slots(slot, slot_b);
         if slot.is_none() && slot_b.is_none() && units == 0 {
             // Conf0 reads the C64's own lines from `iec_fast_1541`, which no checkpoint
@@ -1900,6 +1977,21 @@ pub fn restore_runtime_checkpoint(
             m.iec.iecbus_cpu_write_conf0(!pa, 0);
         }
     }
+    // Spec 874 §8 — an uncovered device keeps its live state: it is told the restored
+    // clock and lines, and its live pull (not the one the checkpoint's `iec` node wrote)
+    // goes into its slot. One fold.
+    if !rebase.is_empty() {
+        let clk = m.c64_core.clk;
+        for &slot in &rebase {
+            let lines = crate::iec_device::lines_without(&m.iec, slot as usize);
+            if let Some(d) = m.iec_devices.get_mut(slot) {
+                d.rebase(clk, lines);
+                m.iec.iecbus.drv_bus[slot as usize] = d.outputs().slot_byte();
+            }
+        }
+        m.iec.iec_update_ports();
+    }
+    m.iec_devices.set_uncovered(uncovered);
 
     // Re-anchor the drive's C64-clock catch-up reference to the restored anchor
     // instant (= the restored C64 clk). `drive_c64_ref` is the monotonic C64 clock

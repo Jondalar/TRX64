@@ -42,6 +42,16 @@
 //! unit (a temp folder with one file in it) instead of drive B: the run writes
 //! `gate_<name>_trx64_f<unit>.png` and is judged by its picture against the no-folder
 //! frame, with its own named expectations (`FOLDER_EXPECTED`).
+//!
+//! Spec 874 — `GATE_PROBE=<slot>`: each game again with the gate's host device
+//! (`ProbeListener`, tests/common/probe_listener.rs) idle at that slot, no unit, attached
+//! through the public `IecDevice` trait. It writes `gate_<name>_trx64_p<slot>.png`. Maniac
+//! Mansion is judged (§12.11): its picture must equal the picture of the same game with
+//! an idle folder at 9 — the probe and the folder answer a held ATN alike. The other
+//! games are recorded against the no-device frame (`PROBE:` lines), not judged.
+
+#[path = "common/probe_listener.rs"]
+mod probe_listener;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -111,6 +121,8 @@ struct GateResult {
     drive_b: Option<u8>,
     /// Spec 873 — the unit an idle folder device sat at.
     folder: Option<u8>,
+    /// Spec 874 — the slot the gate's host device sat at.
+    probe: Option<u8>,
 }
 
 /// Run one game end-to-end and report behavioral state.
@@ -119,6 +131,17 @@ fn run_game(file: &str, kind: DiskKind, name: &str, drive_b: Option<u8>) -> Opti
 }
 
 fn run_game_with(file: &str, kind: DiskKind, name: &str, drive_b: Option<u8>, folder: Option<u8>) -> Option<GateResult> {
+    run_game_full(file, kind, name, drive_b, folder, None)
+}
+
+fn run_game_full(
+    file: &str,
+    kind: DiskKind,
+    name: &str,
+    drive_b: Option<u8>,
+    folder: Option<u8>,
+    probe: Option<u8>,
+) -> Option<GateResult> {
     if !roms_present() {
         eprintln!("skip {name}: ROMs absent");
         return None;
@@ -142,6 +165,12 @@ fn run_game_with(file: &str, kind: DiskKind, name: &str, drive_b: Option<u8>, fo
     }
     // Spec 873 — optionally an idle folder device, attached with the C64.
     let folder_dir = folder.map(|unit| attach_idle_folder(&mut m, unit, name));
+    // Spec 874 — optionally the gate's host device, idle at a slot, no unit.
+    if let Some(slot) = probe {
+        let mut p = probe_listener::ProbeListener::new("probe", None);
+        p.record = false;
+        m.attach_iec_device(slot, Box::new(p)).expect("attach the probe");
+    }
 
     // Boot to BASIC READY.
     m.run_for_full(2_500_000, &mut sink, |_, _, _, _, _, _, _| {});
@@ -271,11 +300,21 @@ fn run_game_with(file: &str, kind: DiskKind, name: &str, drive_b: Option<u8>, fo
     let out_rgba = best_rgba.unwrap_or(final_rgba);
     let png = encode_png_rgba(w as u32, h as u32, &out_rgba);
     let png_path = match (drive_b, folder) {
+        _ if probe.is_some() => format!("{TRACES}/gate_{name}_trx64_p{}.png", probe.unwrap()),
         (Some(unit), _) if drive_b_is_1581() => format!("{TRACES}/gate_{name}_trx64_b{unit}_1581.png"),
         (Some(unit), _) => format!("{TRACES}/gate_{name}_trx64_b{unit}.png"),
         (None, Some(unit)) => format!("{TRACES}/gate_{name}_trx64_f{unit}.png"),
         (None, None) => format!("{TRACES}/gate_{name}_trx64.png"),
     };
+    if let Some(slot) = probe {
+        let p = m.iec_device_as::<probe_listener::ProbeListener>(slot).expect("the probe");
+        eprintln!(
+            "  probe: slot {slot}, under ATN {}, pulls {:?}, bytes under ATN {}",
+            p.line.under_atn,
+            trx64_core::iec_device::IecDevice::outputs(p),
+            p.under_atn.len()
+        );
+    }
     if let Some(unit) = folder {
         let f = m.folder_mut(unit).expect("the folder device");
         let refused: Vec<String> = f.take_events().into_iter().map(|e| e.text).collect();
@@ -328,6 +367,7 @@ fn run_game_with(file: &str, kind: DiskKind, name: &str, drive_b: Option<u8>, fo
         width: w,
         drive_b,
         folder,
+        probe,
     })
 }
 
@@ -406,6 +446,19 @@ fn attach_idle_folder(m: &mut Machine, unit: u8, name: &str) -> std::path::PathB
     let src = std::sync::Arc::new(trx64_core::folder_device::HostFolder::new(&dir).unwrap());
     m.attach_folder(unit, src, Default::default()).expect("attach the folder");
     dir
+}
+
+/// Spec 874 — the slot in `GATE_PROBE`, or `None` when the variable is unset.
+fn probe_from_env() -> Option<u8> {
+    Some(std::env::var("GATE_PROBE").ok()?.parse().expect("GATE_PROBE = a slot number"))
+}
+
+/// Spec 874 §12.11 — the games whose picture with the probe is judged, and against
+/// what: Maniac Mansion's drive-8 fastloader holds ATN after `M-W` ×16 / `U3`; a device
+/// that answers every ATN keeps DATA pulled from the fall and breaks it, whatever its
+/// unit. The probe must give the picture the folder at 9 gives.
+fn probe_judged_against_folder(name: &str) -> bool {
+    name == "maniac"
 }
 
 /// Spec 871 — the unit in `GATE_DRIVE_B`, or `None` when the variable is unset.
@@ -563,6 +616,29 @@ fn gate_game(file: &str, kind: DiskKind, name: &str) {
             }
         }
     }
+    if let Some(slot) = probe_from_env() {
+        let Some(on) = run_game_full(file, kind.clone(), name, None, None, Some(slot)) else { return };
+        report(&on);
+        if probe_judged_against_folder(name) {
+            let Some(folder) = run_game_with(file, kind.clone(), name, None, Some(9)) else { return };
+            report(&folder);
+            let against_off = judge_against(BOn::Differs("a device holding DATA under a held ATN"), &off, &on);
+            let against_folder = judge_against(BOn::Identical, &folder, &on);
+            match (against_off, against_folder) {
+                (Ok(a), Ok(_)) => eprintln!("PROBE VERDICT: PASS {name}: {a}; byte-identical to the folder at 9"),
+                (a, f) => {
+                    let why = format!("against no device: {a:?}; against the folder at 9: {f:?}");
+                    eprintln!("PROBE VERDICT: FAIL {name}: {why}");
+                    panic!("probe gate, {name}: {why}");
+                }
+            }
+        } else {
+            let picture = match judge_against(BOn::Identical, &off, &on) {
+                Ok(s) | Err(s) => s,
+            };
+            eprintln!("PROBE: {name}: {picture}");
+        }
+    }
     let Some(unit) = drive_b_from_env() else { return };
     let Some(on) = run_game(file, kind.clone(), name, Some(unit)) else { return };
     report(&on);
@@ -605,6 +681,10 @@ fn report(r: &GateResult) {
     // The B-on run's reachability is printed, not counted: its verdict is the
     // picture comparison (`B-ON VERDICT`), and `VERDICT:` lines are what gate.sh counts.
     match (r.drive_b, r.folder) {
+        _ if r.probe.is_some() => {
+            eprintln!("\n========== {} ({:?}) — probe at slot {} ==========", r.name, r.kind, r.probe.unwrap());
+            eprintln!("  reachability (not the probe verdict): {verdict}");
+        }
         (None, Some(unit)) => {
             eprintln!("\n========== {} ({:?}) — folder at {unit} ==========", r.name, r.kind);
             eprintln!("  reachability (not the folder verdict): {verdict}");

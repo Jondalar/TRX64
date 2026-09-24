@@ -209,9 +209,10 @@ pub struct FullBus<'a> {
     /// Spec 871 — drive position B, on the same bus. Off by default: not clocked,
     /// not folded.
     pub drive_b: &'a mut crate::drive::Drive1541,
-    /// Spec 873 — the folder devices on the bus, advanced at every sync point after
-    /// the drives. Empty on a stock machine: one length test per sync point.
-    pub folders: &'a mut Vec<crate::folder_device::FolderDevice>,
+    /// Spec 873/874 — the IEC devices on the bus (folders, a host's own), advanced at
+    /// every sync point after the drives. Empty on a stock machine: one length test per
+    /// sync point.
+    pub iec_devices: &'a mut crate::iec_device::IecDevices,
     /// IEC wired-AND core (C64 CIA2 PA ↔ drive VIA1 PB), borrowed from the Machine.
     pub iec: &'a mut crate::iec::IecCore,
     /// Keyboard matrix (CIA1 PA column drive ↔ PB row read). Read on a $DC01
@@ -406,9 +407,10 @@ impl<'a> FullBus<'a> {
         // Spec 870: into the drive's own slot, and not at all while it is off or held.
         // Spec 871: both positions, each into its slot.
         crate::drive::pair_fold_into_iec(self.drive, self.drive_b, self.iec, self.cia2_pa_out);
-        // Spec 873 §4 — then the folder devices, against the lines as they now stand.
-        if !self.folders.is_empty() {
-            crate::folder_device::folders_sync(self.folders, self.iec, target);
+        // Spec 873 §4 / 874 §5 — then the IEC devices, against the lines as they now
+        // stand.
+        if !self.iec_devices.is_empty() {
+            crate::iec_device::iec_devices_sync(self.iec_devices, self.iec, target);
         }
     }
 
@@ -712,6 +714,7 @@ impl<'a> FullBus<'a> {
                         // per-type drv_bus[8] recompute → iec_update_ports. Returns the
                         // ATN edge(s) to deliver to the drive VIA1 (the inline VICE
                         // `viacore_signal(via1d1541, VIA_SIG_CA1, ...)`).
+                        let old_atn = self.iec.iec_old_atn;
                         let atn_edges = self.iec.iecbus_callback_write((!new_out) & 0xff, self.clk + 1);
                         // ATN-edge → drive VIA1 CA1: the C64 driving ATN raises the
                         // drive's attention IRQ (DOS $FE67 → $E85B). VICE
@@ -725,10 +728,15 @@ impl<'a> FullBus<'a> {
                             // 872: VIA1 CA1 for a 1541, the CIA's FLAG for a 1581.
                             crate::drive::pair_deliver_atn_edge(self.drive, self.drive_b, dnr, edge);
                         }
-                        // Spec 873 §4 — the folder devices see the new C64 lines at the
-                        // write cycle (VICE: at the C64's next access).
-                        if !self.folders.is_empty() {
-                            crate::folder_device::folders_sync(self.folders, self.iec, self.clk + 1);
+                        // Spec 873 §4 — the IEC devices see the new C64 lines at the
+                        // write cycle (VICE: at the C64's next access). Spec 874 §5 — an
+                        // ATN change reaches them first as an edge, at the same cycle.
+                        if !self.iec_devices.is_empty() {
+                            let atn = self.iec.iec_old_atn;
+                            if atn != old_atn {
+                                self.iec_devices.atn_edge(self.clk + 1, atn != 0);
+                            }
+                            crate::iec_device::iec_devices_sync(self.iec_devices, self.iec, self.clk + 1);
                         }
                     }
                 }
@@ -1257,7 +1265,7 @@ mod joystick_gate_tests {
             read_side_effects: Vec::new(),
             drive,
             drive_b,
-            folders: Box::leak(Box::default()),
+            iec_devices: Box::leak(Box::default()),
             iec,
             keyboard: kb,
             joystick1: joy1,

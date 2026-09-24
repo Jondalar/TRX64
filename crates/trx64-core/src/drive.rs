@@ -1372,8 +1372,9 @@ impl Drive1541 {
         self.via1_iecbus.drv_port = self.iec_drv_port;
         // Spec 871 — the other devices' pulls, so a `$1800` store re-folds against
         // the whole bus (VICE's one global `iecbus`), not against this drive alone.
+        // Spec 874 — slots 4-7 too, where a host's device may stand (`0xff` without).
         let own = self.unit as usize;
-        for slot in 8..(8 + crate::iec::NUM_DISK_UNITS) {
+        for slot in 4..(8 + crate::iec::NUM_DISK_UNITS) {
             if slot != own {
                 self.via1_iecbus.drv_bus[slot] = self.iec_drv_bus[slot];
             }
