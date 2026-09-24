@@ -713,6 +713,11 @@ impl Drive1541 {
         if t == self.board_type() {
             return None;
         }
+        // Spec 875 — a host's controller is taken out only by its host: a board with
+        // one is never replaced here (a restore that would need it refuses by name).
+        if self.host_fdc_name().is_some() {
+            return None;
+        }
         // Write-back first, into `disk.bytes`, whatever happens to the medium.
         self.sync_disk_bytes();
         let medium = self.disk.take();
@@ -792,9 +797,48 @@ impl Drive1541 {
         }
     }
 
+    /// Spec 875 §4 — the name of the host's controller fitted in this position's 1581
+    /// (or of a clone's vacancy), if any.
+    pub fn host_fdc_name(&self) -> Option<&str> {
+        self.board_1581.as_ref()?.host_fdc().map(|h| h.name())
+    }
+
+    /// Spec 875 §4 — no medium of TRX64's while a host's controller is fitted: the D81
+    /// is the host's.
+    fn refuse_medium_for_host(&self) -> Result<(), String> {
+        match self.board_1581.as_ref().and_then(|b| b.host_fdc()) {
+            Some(h) => Err(format!("drive position {} has {}; its medium is the host's", h.position, h.name())),
+            None => Ok(()),
+        }
+    }
+
+    /// Spec 875 §4 — fit a host's controller into this position's 1581. The caller
+    /// (`Machine::attach_fdc_controller`) has checked the refusals. A mounted D81 is
+    /// written back, ejected and returned.
+    pub(crate) fn fit_host_fdc(&mut self, dev: Box<dyn crate::fdc_controller::FdcController>, position: &'static str) -> Option<DiskImage> {
+        self.sync_disk_bytes();
+        let medium = self.disk.take();
+        self.disk_write_unreported = false;
+        let b = self.board_1581.as_mut().expect("a 1581 in the position");
+        b.detach();
+        b.fit_host_fdc(dev, position);
+        self.disk_synced_gen = b.image_gen();
+        medium
+    }
+
+    /// Spec 875 §4 — take the host's controller out; TRX64's WD1772 is back, no disk.
+    pub(crate) fn unfit_host_fdc(&mut self) -> Option<Box<dyn crate::fdc_controller::FdcController>> {
+        let b = self.board_1581.as_mut()?;
+        let dev = b.unfit_host_fdc()?;
+        self.disk = None;
+        self.disk_synced_gen = b.image_gen();
+        Some(dev)
+    }
+
     /// Mount `image` if it fits the board ([`Self::medium_fits`]); refused otherwise and
     /// nothing changes. What media verbs call.
     pub fn mount(&mut self, image: DiskImage) -> Result<(), String> {
+        self.refuse_medium_for_host()?;
         self.medium_fits(&image.kind)?;
         if image.kind == DiskKind::D81 && crate::fdd::d81_geometry(image.bytes.len()).is_none() {
             return Err(format!(
@@ -949,6 +993,11 @@ impl Drive1541 {
     /// own power-on (`boot_from_dir`) and the daemon's `session/drive_power` press run.
     pub fn power_on_reset(&mut self) {
         self.latch_rom();
+        if self.powered {
+            if let Some(b) = self.board_1581.as_mut() {
+                b.host_power(true);
+            }
+        }
         self.cold_reset();
     }
 
@@ -987,12 +1036,17 @@ impl Drive1541 {
             if let Some(b) = self.board_1581.as_mut() {
                 b.ram_mut().fill(0);
                 b.cpu_last_data = 0;
+                // Spec 875 §6 — `power(true)`, then the power-on reset's `drive_reset`.
+                b.host_power(true);
             }
             self.latch_rom();
             self.reset_keeping_disk();
         } else {
             self.sync_disk_bytes();
             self.powered = false;
+            if let Some(b) = self.board_1581.as_mut() {
+                b.host_power(false);
+            }
         }
     }
 
@@ -1469,7 +1523,7 @@ impl Drive1541 {
     /// `true`) — a reset keeping the disk, a C64 power cycle carrying it through the
     /// media registry. The next [`Self::flush_disk_writeback`] reports it.
     pub fn attach_disk_with_unreported_write(&mut self, image: DiskImage, unreported: bool) {
-        if let Err(e) = self.medium_fits(&image.kind) {
+        if let Err(e) = self.refuse_medium_for_host().and_then(|_| self.medium_fits(&image.kind)) {
             // A caller that can refuse goes through `mount`; this path has no answer to
             // give, so the medium does not go in.
             eprintln!("[drive] attach refused: {e}");

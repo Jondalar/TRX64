@@ -1562,7 +1562,95 @@ pub fn capture_runtime_checkpoint_with(
     if !others.is_empty() {
         tree["iecDevices"] = serde_json::Value::Array(others);
     }
+    // Spec 875 §8 — a host's controller in a 1581: position, name and its own state,
+    // `null` for one that opted out. The position's blob then ends after its CIA and
+    // carries no disk. Omitted without one, so every other checkpoint is the one it was.
+    let fdcs: Vec<serde_json::Value> = [crate::drive::DrivePosition::A, crate::drive::DrivePosition::B]
+        .into_iter()
+        .filter_map(|p| {
+            let h = m.drive(p).board_1581()?.host_fdc()?;
+            Some(serde_json::json!({
+                "position": p.name(),
+                "name": h.name(),
+                "state": h.dev.checkpoint(),
+            }))
+        })
+        .collect();
+    if !fdcs.is_empty() {
+        tree["hostFdc"] = serde_json::Value::Array(fdcs);
+    }
     tree
+}
+
+/// Spec 875 §8 — the `hostFdc` entry for `pos`, if the checkpoint has one.
+fn host_fdc_entry(cp: &serde_json::Value, pos: crate::drive::DrivePosition) -> Option<&serde_json::Value> {
+    cp.get("hostFdc")?
+        .as_array()?
+        .iter()
+        .find(|e| e.get("position").and_then(|v| v.as_str()) == Some(pos.name()))
+}
+
+/// Spec 875 §8 — the strict rule, checked before anything is overwritten: a restore
+/// never creates or removes a host's controller, and a position's checkpoint and the
+/// live machine must agree on it — the restored drive CPU is mid-conversation with the
+/// chip it was captured with.
+fn check_host_fdc(m: &Machine, cp: &serde_json::Value) -> Result<(), String> {
+    for pos in [crate::drive::DrivePosition::A, crate::drive::DrivePosition::B] {
+        let live = m.drive(pos).host_fdc_name();
+        match (host_fdc_entry(cp, pos), live) {
+            (Some(e), live) => {
+                let name = e.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                if live != Some(name) {
+                    return Err(format!(
+                        "restore: checkpoint has {name} in drive position {}; the machine has {}",
+                        pos.name(),
+                        live.unwrap_or("none")
+                    ));
+                }
+            }
+            (None, Some(live)) => {
+                return Err(format!(
+                    "restore: the machine has {live} in drive position {}; the checkpoint has TRX64's own WD1772 there",
+                    pos.name()
+                ));
+            }
+            (None, None) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Spec 875 §8 — each fitted controller after the drives are back: `restore(state)`, or
+/// for one that opted out (and a clone's vacancy) a `rebase` to the restored drive clock
+/// and its name among the uncovered. The port-A pins the board restored are what it
+/// last told the controller; an uncovered one hears them if they moved.
+fn restore_host_fdc(m: &mut Machine, cp: &serde_json::Value) -> Result<(), String> {
+    for pos in [crate::drive::DrivePosition::A, crate::drive::DrivePosition::B] {
+        let state = host_fdc_entry(cp, pos).and_then(|e| e.get("state")).filter(|s| !s.is_null()).cloned();
+        let d = m.drive_mut(pos);
+        let powered = d.powered();
+        let Some(b) = d.board_1581_mut() else { continue };
+        let clk = b.core.clk;
+        let pa = b.cia.pa_out();
+        let Some(h) = b.host_fdc.as_mut() else { continue };
+        let mut pins = crate::fdc_controller::FdcBoardOut::from_pa(pa);
+        pins.motor_on &= powered;
+        match state {
+            Some(st) if !h.vacant => {
+                h.dev.restore(&st).map_err(|e| format!("restore hostFdc: drive position {}: {e}", pos.name()))?;
+                h.uncovered = false;
+            }
+            _ => {
+                h.dev.rebase(clk);
+                h.uncovered = true;
+                if pins != h.last_out {
+                    h.dev.board_out(clk, pins);
+                }
+            }
+        }
+        h.last_out = pins;
+    }
+    Ok(())
 }
 
 fn is_folder(s: &crate::iec_device::SlottedDevice) -> bool {
@@ -1807,6 +1895,10 @@ pub fn restore_runtime_checkpoint(
         ));
     }
 
+    // Spec 875 §8 — a host's controller: the checkpoint and the machine agree, or
+    // nothing is touched.
+    check_host_fdc(m, cp)?;
+
     // Spec 863 D6 — the checkpoint says which C64 it was. Put the machine back on that row
     // BEFORE any state is loaded (the D5 transplant run backwards: rewinding across a model
     // switch makes the machine what it was). A row that cannot run here, or a raster
@@ -1957,6 +2049,8 @@ pub fn restore_runtime_checkpoint(
     m.drive8.restore_part(&part)?;
     // Spec 871 — position B, then the device map for both.
     restore_drive_b(m, cp.get("driveB"))?;
+    // Spec 875 — the host's controllers in the 1581s.
+    restore_host_fdc(m, cp)?;
     // Spec 873 — the folder devices; Spec 874 — the host's devices; then the device
     // map for drives and devices.
     restore_folders(m, cp.get("folders"))?;

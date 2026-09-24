@@ -29,6 +29,7 @@
 use crate::ciacore::{CiaBackend, CiaCore, CIA_DDRA, CIA_PRA, CIA_PRB};
 use crate::drive_6510core::{drive_6510core_execute, DriveCore6510, DriveCore6510Bus, IntStatus, IK_IRQ, IK_RESET};
 use crate::iec::IecbusT;
+use crate::fdc_controller::{FdcBoardOut, FdcController, HostFdc};
 use crate::wd177x::Wd1770;
 
 /// The 6502 hardware-reset sequence (drivecpu.c:165 `cpu_reset` → clk = 6).
@@ -47,25 +48,163 @@ pub struct FastSerialLog {
     pub bytes_out: u64,
 }
 
-/// The CIA's port hooks, over the board's parts (cia1581d.c).
-struct Ports<'a> {
+/// Spec 875 §5 — what sits behind the register window and on the glue lines: TRX64's
+/// own WD1772 and its mechanism ([`BuiltIn`]), or a host's controller ([`Host`]). The
+/// board's bus and port hooks are generic over it and `run_cycles` picks the
+/// instantiation once per slice, so the built-in path is monomorphised and tests for no
+/// controller anywhere.
+pub(crate) trait BoardFdc {
+    /// A CPU read of register `reg` (0-3) at drive cycle `clk`; `open_bus` is the last
+    /// byte on the drive's data bus.
+    fn read(&mut self, clk: u64, reg: u16, open_bus: u8) -> u8;
+    /// A CPU store into register `reg` at drive cycle `clk`.
+    fn store(&mut self, clk: u64, reg: u16, val: u8);
+    /// Port A's composed output changed (`store_ciapa`), at drive cycle `clk`.
+    fn port_a(&mut self, clk: u64, pa: u8);
+    /// PA1 and PA7 as the mechanism drives them (1 = high).
+    fn pa_in(&self) -> u8;
+    /// PB6 /WPS as the mechanism drives it (`0x40` = writable).
+    fn pb6(&self) -> u8;
+}
+
+/// TRX64's own WD1772 and its mechanism — the code of Spec 872, unchanged.
+pub(crate) struct BuiltIn<'a> {
     wd: &'a mut Wd1770,
+    /// `drive->read_only` — the medium's write-protect, for /WPS.
+    read_only: bool,
+}
+
+impl BoardFdc for BuiltIn<'_> {
+    #[inline]
+    fn read(&mut self, clk: u64, reg: u16, _open_bus: u8) -> u8 {
+        self.wd.read(clk, reg)
+    }
+    #[inline]
+    fn store(&mut self, clk: u64, reg: u16, val: u8) {
+        self.wd.store(clk, reg, val);
+    }
+    /// cia1581d.c:117-137 store_ciapa — PA0 to the head select, PA2 to the motor.
+    #[inline]
+    fn port_a(&mut self, _clk: u64, pa: u8) {
+        self.wd.fdd.select_head(if pa & 0x01 != 0 { 0 } else { 1 });
+        self.wd.fdd.set_motor(pa & 0x04 == 0);
+    }
+    /// /DISK CHANGE on PA7 (1 = not changed); /RDY on PA1 reads 0 (always ready, the
+    /// VICE default, 872 §10.3).
+    #[inline]
+    fn pa_in(&self) -> u8 {
+        if !self.wd.fdd.disk_change() {
+            0x80
+        } else {
+            0
+        }
+    }
+    #[inline]
+    fn pb6(&self) -> u8 {
+        if self.read_only {
+            0
+        } else {
+            0x40
+        }
+    }
+}
+
+/// A host's controller in the socket (Spec 875).
+pub(crate) struct Host<'a> {
+    slot: &'a mut HostFdc,
+}
+
+impl BoardFdc for Host<'_> {
+    #[inline]
+    fn read(&mut self, clk: u64, reg: u16, open_bus: u8) -> u8 {
+        if self.slot.vacant {
+            // A socket with no chip: Y3 selects nothing that drives D0-D7.
+            return open_bus;
+        }
+        self.slot.dev.read(clk, reg as u8)
+    }
+    #[inline]
+    fn store(&mut self, clk: u64, reg: u16, val: u8) {
+        if reg == 0 {
+            self.slot.last_cmd = val;
+        }
+        self.slot.dev.store(clk, reg as u8, val);
+    }
+    /// `board_out` only when PA0 or PA2 moved (the LEDs share the port).
+    #[inline]
+    fn port_a(&mut self, clk: u64, pa: u8) {
+        let out = FdcBoardOut::from_pa(pa);
+        if out != self.slot.last_out {
+            self.slot.last_out = out;
+            self.slot.dev.board_out(clk, out);
+        }
+    }
+    #[inline]
+    fn pa_in(&self) -> u8 {
+        self.slot.board_in().pa_bits()
+    }
+    #[inline]
+    fn pb6(&self) -> u8 {
+        self.slot.board_in().pb6()
+    }
+}
+
+/// Either, for the board's cold paths (reset, the CIA's snapshot module): one match per
+/// hook call.
+pub(crate) enum AnyFdc<'a> {
+    BuiltIn(BuiltIn<'a>),
+    Host(Host<'a>),
+}
+
+impl BoardFdc for AnyFdc<'_> {
+    fn read(&mut self, clk: u64, reg: u16, open_bus: u8) -> u8 {
+        match self {
+            AnyFdc::BuiltIn(f) => f.read(clk, reg, open_bus),
+            AnyFdc::Host(f) => f.read(clk, reg, open_bus),
+        }
+    }
+    fn store(&mut self, clk: u64, reg: u16, val: u8) {
+        match self {
+            AnyFdc::BuiltIn(f) => f.store(clk, reg, val),
+            AnyFdc::Host(f) => f.store(clk, reg, val),
+        }
+    }
+    fn port_a(&mut self, clk: u64, pa: u8) {
+        match self {
+            AnyFdc::BuiltIn(f) => f.port_a(clk, pa),
+            AnyFdc::Host(f) => f.port_a(clk, pa),
+        }
+    }
+    fn pa_in(&self) -> u8 {
+        match self {
+            AnyFdc::BuiltIn(f) => f.pa_in(),
+            AnyFdc::Host(f) => f.pa_in(),
+        }
+    }
+    fn pb6(&self) -> u8 {
+        match self {
+            AnyFdc::BuiltIn(f) => f.pb6(),
+            AnyFdc::Host(f) => f.pb6(),
+        }
+    }
+}
+
+/// The CIA's port hooks, over the board's parts (cia1581d.c).
+struct Ports<'a, F: BoardFdc> {
+    fdc: F,
     iecbus: &'a mut IecbusT,
     /// `cia1581p->number` — unit − 8.
     number: usize,
-    /// `drive->read_only` — the medium's write-protect, for /WPS.
-    read_only: bool,
     fast_dir: &'a mut bool,
     fast_log: &'a mut FastSerialLog,
     led: &'a mut bool,
     clk: u64,
 }
 
-impl CiaBackend for Ports<'_> {
+impl<F: BoardFdc> CiaBackend for Ports<'_, F> {
     /// cia1581d.c:117-137 store_ciapa.
-    fn store_pa(&mut self, _clk: u64, byte: u8) {
-        self.wd.fdd.select_head(if byte & 0x01 != 0 { 0 } else { 1 });
-        self.wd.fdd.set_motor(byte & 0x04 == 0);
+    fn store_pa(&mut self, clk: u64, byte: u8) {
+        self.fdc.port_a(clk, byte);
         *self.led = byte & 0x40 != 0;
     }
 
@@ -96,18 +235,15 @@ impl CiaBackend for Ports<'_> {
     }
 
     /// cia1581d.c:185-201 read_ciapa — jumpers on PA3-4, /DISK CHANGE on PA7 (1 = not
-    /// changed), /RDY on PA1 reading 0 (always ready, the VICE default, §10.3).
+    /// changed), /RDY on PA1 — both as the mechanism drives them.
     fn read_pa(&mut self, c: &[u8; 16]) -> u8 {
-        let mut tmp = (8 * self.number) as u8;
-        if !self.wd.fdd.disk_change() {
-            tmp |= 0x80;
-        }
+        let tmp = (8 * self.number) as u8 | self.fdc.pa_in();
         (tmp & !c[CIA_DDRA]) | (c[CIA_PRA] & c[CIA_DDRA])
     }
 
     /// cia1581d.c:203-223 read_ciapb.
     fn read_pb(&mut self, c: &[u8; 16]) -> u8 {
-        (((c[CIA_PRB] & 0x1a) | self.iecbus.drv_port) ^ 0x85) | if self.read_only { 0 } else { 0x40 }
+        (((c[CIA_PRB] & 0x1a) | self.iecbus.drv_port) ^ 0x85) | self.fdc.pb6()
     }
 
     /// cia1581d.c:233-240 store_sdr → iec_fast_drive_write: a stock C64 has no burst
@@ -127,14 +263,17 @@ impl CiaBackend for Ports<'_> {
     }
 }
 
-/// The port hooks over a `Drive1581`'s own fields (disjoint from its CIA).
+/// The port hooks over a `Drive1581`'s own fields (disjoint from its CIA), with
+/// whatever sits in the socket.
 macro_rules! ports_of {
     ($s:ident, $number:expr, $clk:expr) => {
         Ports {
-            wd: &mut $s.wd,
+            fdc: match $s.host_fdc.as_mut() {
+                Some(slot) => AnyFdc::Host(Host { slot }),
+                None => AnyFdc::BuiltIn(BuiltIn { wd: &mut $s.wd, read_only: $s.read_only }),
+            },
             iecbus: &mut $s.iecbus,
             number: $number,
-            read_only: $s.read_only,
             fast_dir: &mut $s.fast_dir,
             fast_log: &mut $s.fast_log,
             led: &mut $s.led,
@@ -144,16 +283,16 @@ macro_rules! ports_of {
 }
 
 /// The drive CPU's bus (memiec.c 1581 map).
-struct Bus1581<'a> {
+struct Bus1581<'a, F: BoardFdc> {
     ram: &'a mut [u8; 0x2000],
     rom: &'a [u8; 0x8000],
     cia: &'a mut CiaCore,
-    ports: Ports<'a>,
+    ports: Ports<'a, F>,
     clk_ptr: *mut u64,
     cpu_last_data: &'a mut u8,
 }
 
-impl Bus1581<'_> {
+impl<F: BoardFdc> Bus1581<'_, F> {
     #[inline]
     fn clk(&self) -> u64 {
         // SAFETY: `clk_ptr` points at `Drive1581.core.clk`, disjoint from every field
@@ -163,7 +302,7 @@ impl Bus1581<'_> {
     }
 }
 
-impl DriveCore6510Bus for Bus1581<'_> {
+impl<F: BoardFdc> DriveCore6510Bus for Bus1581<'_, F> {
     #[inline]
     fn read(&mut self, addr: u16) -> u8 {
         let v = match addr >> 13 {
@@ -177,7 +316,7 @@ impl DriveCore6510Bus for Bus1581<'_> {
             }
             3 => {
                 let clk = self.clk();
-                self.ports.wd.read(clk, addr & 3)
+                self.ports.fdc.read(clk, addr & 3, *self.cpu_last_data)
             }
             _ => self.rom[(addr & 0x7fff) as usize],
         };
@@ -198,7 +337,7 @@ impl DriveCore6510Bus for Bus1581<'_> {
             }
             3 => {
                 let clk = self.clk();
-                self.ports.wd.store(clk, addr & 3, val);
+                self.ports.fdc.store(clk, addr & 3, val);
             }
             _ => {} // $2000-$3FFF selects nothing; the ROM ignores a write.
         }
@@ -282,6 +421,31 @@ pub struct WdState {
     pub step: i32,
 }
 
+/// One slice of the drive CPU against the bus, up to `stop_clk` (drivecpu.c:393).
+#[inline(always)]
+fn run_slice<F: BoardFdc>(
+    core: &mut DriveCore6510,
+    int: &mut IntStatus,
+    reset_pending: &mut bool,
+    stop_clk: u64,
+    mut bus: Bus1581<'_, F>,
+) {
+    while *reset_pending || core.clk < stop_clk {
+        *reset_pending = false;
+        // The instruction boundary: alarms due now, then the IRQ line as the CIA
+        // drove it since the last boundary, in order (ciacore doc).
+        let clk = core.clk;
+        bus.process_alarms(clk);
+        for (level, rclk) in bus.cia.irq_events.drain(..) {
+            int.set_irq(0, level, rclk);
+        }
+        drive_6510core_execute(core, &mut bus, int);
+    }
+    for (level, rclk) in bus.cia.irq_events.drain(..) {
+        int.set_irq(0, level, rclk);
+    }
+}
+
 /// The 1581 board.
 #[derive(Clone)]
 pub struct Drive1581 {
@@ -308,6 +472,9 @@ pub struct Drive1581 {
     led: bool,
     /// `cia1581p->number` — unit − 8, as of the last reset or catch-up.
     number: usize,
+    /// Spec 875 — a host's controller in the WD's socket. `None`: TRX64's own WD1772
+    /// and its mechanism, the default.
+    pub(crate) host_fdc: Option<HostFdc>,
 }
 
 impl Drive1581 {
@@ -334,6 +501,7 @@ impl Drive1581 {
             fast_log: FastSerialLog::default(),
             led: false,
             number: mynumber as usize,
+            host_fdc: None,
         }
     }
 
@@ -395,6 +563,10 @@ impl Drive1581 {
         }
         self.cia.irq_events.clear();
         self.wd.reset(0);
+        // Spec 875 §6 — the funnel: every reset of the board reaches a host's controller.
+        if let Some(h) = self.host_fdc.as_mut() {
+            h.drive_reset(0);
+        }
     }
 
     /// The board's power-on: RAM zero (VICE `lib_calloc`), the ROM given since the last
@@ -447,40 +619,52 @@ impl Drive1581 {
                 *mine = *theirs;
             }
         }
-        let core = &mut self.core;
-        let int = &mut self.int;
-        let reset_pending = &mut self.reset_pending;
-        let clk_ptr: *mut u64 = &mut core.clk;
-        let mut bus = Bus1581 {
-            ram: &mut self.ram,
-            rom: &self.rom,
-            cia: &mut self.cia,
-            ports: Ports {
-                wd: &mut self.wd,
-                iecbus: &mut self.iecbus,
-                number,
-                read_only: self.read_only,
-                fast_dir: &mut self.fast_dir,
-                fast_log: &mut self.fast_log,
-                led: &mut self.led,
-                clk: 0,
-            },
-            clk_ptr,
-            cpu_last_data: &mut self.cpu_last_data,
-        };
-        while *reset_pending || core.clk < self.stop_clk {
-            *reset_pending = false;
-            // The instruction boundary: alarms due now, then the IRQ line as the CIA
-            // drove it since the last boundary, in order (ciacore doc).
-            let clk = core.clk;
-            bus.process_alarms(clk);
-            for (level, rclk) in bus.cia.irq_events.drain(..) {
-                int.set_irq(0, level, rclk);
+        let stop_clk = self.stop_clk;
+        let clk_ptr: *mut u64 = &mut self.core.clk;
+        // Spec 875 §5 — the socket is looked at once per slice; the loop below is
+        // monomorphised for what sits in it.
+        match self.host_fdc.as_mut() {
+            None => {
+                let bus = Bus1581 {
+                    ram: &mut self.ram,
+                    rom: &self.rom,
+                    cia: &mut self.cia,
+                    ports: Ports {
+                        fdc: BuiltIn { wd: &mut self.wd, read_only: self.read_only },
+                        iecbus: &mut self.iecbus,
+                        number,
+                        fast_dir: &mut self.fast_dir,
+                        fast_log: &mut self.fast_log,
+                        led: &mut self.led,
+                        clk: 0,
+                    },
+                    clk_ptr,
+                    cpu_last_data: &mut self.cpu_last_data,
+                };
+                run_slice(&mut self.core, &mut self.int, &mut self.reset_pending, stop_clk, bus);
             }
-            drive_6510core_execute(core, &mut bus, int);
-        }
-        for (level, rclk) in bus.cia.irq_events.drain(..) {
-            int.set_irq(0, level, rclk);
+            Some(slot) => {
+                let bus = Bus1581 {
+                    ram: &mut self.ram,
+                    rom: &self.rom,
+                    cia: &mut self.cia,
+                    ports: Ports {
+                        fdc: Host { slot: &mut *slot },
+                        iecbus: &mut self.iecbus,
+                        number,
+                        fast_dir: &mut self.fast_dir,
+                        fast_log: &mut self.fast_log,
+                        led: &mut self.led,
+                        clk: 0,
+                    },
+                    clk_ptr,
+                    cpu_last_data: &mut self.cpu_last_data,
+                };
+                run_slice(&mut self.core, &mut self.int, &mut self.reset_pending, stop_clk, bus);
+                // The end-of-slice catch-up: the controller's own clock (index, step
+                // timing, the firmware's time) follows the drive's.
+                slot.dev.clock_to(self.core.clk);
+            }
         }
         self.drive_clk = self.core.clk;
     }
@@ -543,6 +727,9 @@ impl Drive1581 {
 
     /// The head: physical track (0-83) and the side it reads (`fdd.head`).
     pub fn head(&self) -> (u8, u8) {
+        if let Some(h) = &self.host_fdc {
+            return h.dev.head();
+        }
         (self.wd.fdd.track as u8, self.wd.fdd.head as u8)
     }
 
@@ -553,6 +740,21 @@ impl Drive1581 {
 
     /// The WD's registers and microcode position.
     pub fn wd(&self) -> WdState {
+        if let Some(h) = &self.host_fdc {
+            // Spec 875 §5 — a host's registers as a read would return them; the
+            // microcode position is the controller's own business.
+            let status = self.peek(0x6000);
+            return WdState {
+                track: self.peek(0x6001),
+                sector: self.peek(0x6002),
+                data: self.peek(0x6003),
+                status,
+                command: h.last_cmd,
+                busy: status & crate::wd177x::WD_BSY != 0,
+                type_: 0,
+                step: -1,
+            };
+        }
         WdState {
             track: self.wd.track,
             sector: self.wd.sector,
@@ -571,12 +773,9 @@ impl Drive1581 {
         let c = &self.cia.c_cia;
         let pa_out = self.cia.pa_out();
         let pb_out = c[CIA_PRB] | !c[crate::ciacore::CIA_DDRB];
-        let mut tmp = (8 * number) as u8;
-        if !self.wd.fdd.disk_change() {
-            tmp |= 0x80;
-        }
+        let tmp = (8 * number) as u8 | self.pa_in();
         let pa = (tmp & !c[CIA_DDRA]) | (c[CIA_PRA] & c[CIA_DDRA]);
-        let pb = (((c[CIA_PRB] & 0x1a) | self.iecbus.drv_port) ^ 0x85) | if self.read_only { 0 } else { 0x40 };
+        let pb = (((c[CIA_PRB] & 0x1a) | self.iecbus.drv_port) ^ 0x85) | self.pb6();
         Ports1581 {
             pa_out,
             pb_out,
@@ -614,7 +813,11 @@ impl Drive1581 {
                 }
                 self.cia.peek(addr)
             }
-            3 => self.wd.peek(addr & 3),
+            3 => match &self.host_fdc {
+                None => self.wd.peek(addr & 3),
+                Some(h) if h.vacant => self.cpu_last_data,
+                Some(h) => h.dev.peek((addr & 3) as u8),
+            },
             _ => self.rom[(addr & 0x7fff) as usize],
         }
     }
@@ -624,16 +827,75 @@ impl Drive1581 {
         // with the jumpers the drive reads (bits 3-4 of the stored read are the unit).
         let c = &self.cia.c_cia;
         let number = self.number;
-        let mut tmp = (8 * number) as u8;
-        if !self.wd.fdd.disk_change() {
-            tmp |= 0x80;
-        }
+        let tmp = (8 * number) as u8 | self.pa_in();
         (tmp & !c[CIA_DDRA]) | (c[CIA_PRA] & c[CIA_DDRA])
     }
 
     fn ports_pb_read(&self) -> u8 {
         let c = &self.cia.c_cia;
-        (((c[CIA_PRB] & 0x1a) | self.iecbus.drv_port) ^ 0x85) | if self.read_only { 0 } else { 0x40 }
+        (((c[CIA_PRB] & 0x1a) | self.iecbus.drv_port) ^ 0x85) | self.pb6()
+    }
+
+    /// PA1 / PA7 as the mechanism drives them now (the port hooks' formula).
+    fn pa_in(&self) -> u8 {
+        match &self.host_fdc {
+            Some(h) => h.board_in().pa_bits(),
+            None if !self.wd.fdd.disk_change() => 0x80,
+            None => 0,
+        }
+    }
+
+    /// PB6 /WPS as the mechanism drives it now.
+    fn pb6(&self) -> u8 {
+        match &self.host_fdc {
+            Some(h) => h.board_in().pb6(),
+            None if self.read_only => 0,
+            None => 0x40,
+        }
+    }
+
+    // ── Spec 875 — the socket ───────────────────────────────────────────────
+
+    /// The host's controller in the socket, if one is fitted (or a clone's vacancy).
+    pub fn host_fdc(&self) -> Option<&HostFdc> {
+        self.host_fdc.as_ref()
+    }
+
+    /// The controller itself, mutable (a host reaches it by downcast between runs).
+    pub fn host_fdc_dev_mut(&mut self) -> Option<&mut (dyn FdcController + 'static)> {
+        self.host_fdc.as_mut().map(|h| h.dev.as_mut())
+    }
+
+    /// Fit `dev` into the socket (the drive is off; the medium has been taken out by
+    /// the caller). TRX64's WD1772 stays in the board, fresh, with no disk: neither
+    /// clocked nor on the bus while the controller is fitted. The controller is told
+    /// the drive clock (`rebase`).
+    pub(crate) fn fit_host_fdc(&mut self, mut dev: Box<dyn FdcController>, position: &'static str) {
+        let mut wd = Wd1770::new(0);
+        wd.myname = self.wd.myname.clone();
+        wd.fdd.myname = self.wd.fdd.myname.clone();
+        wd.fdd.number = self.wd.fdd.number;
+        self.wd = wd;
+        self.read_only = false;
+        dev.rebase(self.core.clk);
+        let mut h = HostFdc::new(dev, position);
+        h.last_out = FdcBoardOut { motor_on: false, ..FdcBoardOut::from_pa(self.cia.pa_out()) };
+        self.host_fdc = Some(h);
+    }
+
+    /// Take the controller out of the socket; TRX64's WD1772 is back on the bus.
+    pub(crate) fn unfit_host_fdc(&mut self) -> Option<Box<dyn FdcController>> {
+        self.host_fdc.take().map(|h| h.dev)
+    }
+
+    /// The drive's power switch reached the socket (a notification only).
+    pub(crate) fn host_power(&mut self, on: bool) {
+        if let Some(h) = self.host_fdc.as_mut() {
+            if !on {
+                h.last_out.motor_on = false;
+            }
+            h.dev.power(on);
+        }
     }
 
     /// Deduplicated drive-PC sample (the 1541's `sample_pc_change`).

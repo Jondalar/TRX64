@@ -27,6 +27,7 @@ pub mod drive1581;
 pub mod drive_6510core;
 pub mod drive_snapshot;
 pub mod expansion;
+pub mod fdc_controller;
 pub mod fdd;
 pub mod flash040;
 pub mod folder_device;
@@ -74,6 +75,7 @@ pub use crash_triage::{
 };
 pub use delta_ring::{CallerChain, DeltaEntry, DeltaRing, LoopOnset, WriteRec};
 pub use drive::Drive1541;
+pub use fdc_controller::{FdcBoardIn, FdcBoardOut, FdcController, DRIVE_HZ_1581};
 pub use expansion::{
     Access, AccessKind, ExpansionChain, ExpansionDevice, ExpansionRam, Hold, OwnedRam, PortLines,
     SnoopSet,
@@ -3271,9 +3273,110 @@ impl Machine {
                 crate::drive::board_name(t)
             ));
         }
+        if t != self.drive(pos).board_type() {
+            if let Some(name) = self.drive(pos).host_fdc_name() {
+                return Err(format!(
+                    "drive position {} has {name}; remove it before changing the type to {}",
+                    pos.name(),
+                    crate::drive::board_name(t)
+                ));
+            }
+        }
         let ejected = self.drive_mut(pos).set_board_type(t)?;
         self.sync_drive_slots();
         Ok(ejected)
+    }
+
+    // ── Spec 875 — a controller of the host's own in the 1581 ────────────────────────
+
+    /// Spec 875 D2 — fit a host's controller into the 1581 in position `pos`, in place
+    /// of TRX64's WD1772 and its mechanism. A controller is part of the board, so it
+    /// changes only with the drive off. Refused, by name: the position powered, the
+    /// position holding a 1541, a controller already fitted. A mounted D81 is written
+    /// back, ejected and returned — the caller persists it; the position has no medium
+    /// of TRX64's while the controller is fitted. The controller gets a `rebase` to the
+    /// drive clock; `power(true)` and `drive_reset` follow at the drive's power-on.
+    pub fn attach_fdc_controller(
+        &mut self,
+        pos: crate::drive::DrivePosition,
+        dev: Box<dyn crate::fdc_controller::FdcController>,
+    ) -> Result<Option<crate::drive::DiskImage>, String> {
+        let name = dev.name();
+        let d = self.drive(pos);
+        if d.powered() {
+            return Err(format!("drive position {} is powered; switch it off before fitting {name}", pos.name()));
+        }
+        if d.board_1581().is_none() {
+            return Err(format!(
+                "drive position {} holds a 1541; {name} fits a 1581 (set_drive_type first)",
+                pos.name()
+            ));
+        }
+        if let Some(other) = d.host_fdc_name() {
+            return Err(format!("drive position {} already has {other}", pos.name()));
+        }
+        Ok(self.drive_mut(pos).fit_host_fdc(dev, pos.name()))
+    }
+
+    /// Spec 875 D2 — take the controller out of position `pos` and hand it back (a
+    /// clone's vacancy comes back as a `VacantFdc`). Refused while the drive is powered.
+    /// TRX64's WD1772 is back on the bus at the drive's next power-on, with no disk.
+    pub fn detach_fdc_controller(
+        &mut self,
+        pos: crate::drive::DrivePosition,
+    ) -> Result<Box<dyn crate::fdc_controller::FdcController>, String> {
+        let d = self.drive(pos);
+        let Some(name) = d.host_fdc_name().map(str::to_string) else {
+            return Err(format!("drive position {} has no controller of the host's", pos.name()));
+        };
+        if d.powered() {
+            return Err(format!("drive position {} is powered; switch it off before removing {name}", pos.name()));
+        }
+        Ok(self.drive_mut(pos).unfit_host_fdc().expect("a controller is fitted"))
+    }
+
+    /// Spec 875 D8 — the controller in position `pos` as its own type, between runs.
+    pub fn fdc_controller_as<T: crate::fdc_controller::FdcController + 'static>(
+        &self,
+        pos: crate::drive::DrivePosition,
+    ) -> Option<&T> {
+        self.drive(pos).board_1581()?.host_fdc()?.dev.as_ref().as_any().downcast_ref::<T>()
+    }
+
+    /// Spec 875 D8 — the controller in position `pos` as its own type, mutable.
+    pub fn fdc_controller_as_mut<T: crate::fdc_controller::FdcController + 'static>(
+        &mut self,
+        pos: crate::drive::DrivePosition,
+    ) -> Option<&mut T> {
+        self.drive_mut(pos).board_1581_mut()?.host_fdc_dev_mut()?.as_any_mut().downcast_mut::<T>()
+    }
+
+    /// Spec 875 §7 — the controllers the last restore or clone did not cover, by name,
+    /// position A first: a clone's vacancy, an opted-out controller after a restore.
+    pub fn fdc_uncovered(&self) -> Vec<String> {
+        use crate::drive::DrivePosition::{A, B};
+        [A, B]
+            .into_iter()
+            .filter_map(|p| self.drive(p).board_1581()?.host_fdc().filter(|h| h.uncovered).map(|h| h.name.clone()))
+            .collect()
+    }
+
+    /// Spec 875 §7 — take both controllers out for a C64 power cycle (the session's
+    /// `power_off`). A position that was powered goes off with the machine: its
+    /// controller hears `power(false)` first. Fit them back with
+    /// [`Self::attach_fdc_controller`] while the positions are off.
+    pub fn take_fdc_controllers(&mut self) -> [Option<Box<dyn crate::fdc_controller::FdcController>>; 2] {
+        use crate::drive::DrivePosition::{A, B};
+        [A, B].map(|p| {
+            let d = self.drive_mut(p);
+            let powered = d.powered();
+            let b = d.board_1581_mut()?;
+            b.host_fdc.as_ref()?;
+            if powered {
+                b.host_power(false);
+            }
+            d.unfit_host_fdc()
+        })
     }
 
     /// Load all three standard C64 ROMs from `rom_dir` and perform a cold reset.

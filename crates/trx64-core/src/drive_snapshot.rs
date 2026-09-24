@@ -970,7 +970,13 @@ fn capture_1581(drive: &mut Drive1541) -> Vec<u8> {
     s.buf.truncate(s.pos);
     s.buf.extend_from_slice(&cia_bytes);
     s.pos = s.buf.len();
-    drive.board_1581().unwrap().wd.snapshot_write_module(&mut s);
+    // Spec 875 §8 — with a host's controller fitted the blob ends after the CIA: TRX64's
+    // WD and mechanism are not on the bus, and the controller's state is the host's
+    // (the checkpoint's `hostFdc` node).
+    let b = drive.board_1581().unwrap();
+    if b.host_fdc().is_none() {
+        b.wd.snapshot_write_module(&mut s);
+    }
     s.to_bytes()
 }
 
@@ -1053,7 +1059,11 @@ fn restore_1581(drive: &mut Drive1541, blob: &[u8]) -> Result<(), String> {
         b.int.global_pending_int = gpi;
     }
     b.snapshot_read_cia(&mut s)?;
-    b.wd.snapshot_read_module(&mut s)?;
+    // Spec 875 §8 — a blob written with a host's controller fitted ends after the CIA;
+    // the restore has checked that the live position has the same controller.
+    if b.host_fdc().is_none() {
+        b.wd.snapshot_read_module(&mut s)?;
+    }
     b.resync_iec_output();
     b.drive_clk = b.core.clk;
     b.snapshot_clear_pending_reset();
