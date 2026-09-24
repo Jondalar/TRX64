@@ -217,8 +217,10 @@ impl Sid6581 {
     /// returns the stored shadow byte (write-only on real HW; B-level round-trip).
     pub fn read(&self, reg: usize, regs: &[u8; 32]) -> u8 {
         match reg {
-            0x19 => 0x80, // POT X unconnected (VICE default per Spec 429)
-            0x1a => 0x80, // POT Y unconnected
+            // POT X/Y of a chip whose POT lines are open: the count saturates. Chip 0's
+            // lines are the control ports' and are answered by `FullBus` (Spec 876); every
+            // other chip reads this, as VICE's fastsid and reSID engines do.
+            0x19 | 0x1a => 0xff,
             SR_OSC3 => self.read_osc3(regs),
             SR_ENV3 => self.voices[2].adsr_value,
             0x1d | 0x1e | 0x1f => 0, // unused/open-bus

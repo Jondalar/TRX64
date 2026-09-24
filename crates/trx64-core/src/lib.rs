@@ -39,6 +39,7 @@ pub mod iec_device;
 pub mod keyboard;
 pub mod m93c86;
 pub mod model;
+pub mod pot;
 pub mod native_snapshot;
 pub mod recorder;
 pub mod rewind;
@@ -594,6 +595,9 @@ pub struct Machine {
     /// the core does not model (UE2's ARMSID configuration mode). Dropped on
     /// clone: a fork answers from the core.
     pub sid_host: crate::sid::SidHostAccess,
+    /// Spec 876 — the POT lines of both control ports and chip 0's latch. Private to the
+    /// crate because every change has to settle the latch first: `set_pot`/`clear_pot`.
+    pub(crate) pot: crate::pot::PotLines,
     /// CPU-port latches ($00 direction / $01 value). Power-on $2F / $37.
     pub port_dir: u8,
     pub port_data: u8,
@@ -757,6 +761,7 @@ impl Clone for Machine {
             sid_map: self.sid_map.clone(),
             sid_trace: self.sid_trace.clone(),
             sid_host: self.sid_host.clone(),
+            pot: self.pot.clone(),
             port_dir: self.port_dir.clone(),
             port_data: self.port_data.clone(),
             memconfig: self.memconfig.clone(),
@@ -944,6 +949,7 @@ impl Machine {
             sid_map: Vec::new(),
             sid_trace: crate::sid::SidTrace::default(),
             sid_host: crate::sid::SidHostAccess::default(),
+            pot: crate::pot::PotLines::default(),
             port_dir: 0x2f,
             port_data: 0x37,
             memconfig: full::build_memconfig_table()[0x1f],
@@ -1414,6 +1420,10 @@ impl Machine {
     /// drive resets the TS `resetCold` performs (ts:707-708, ts:719-726). RAM is
     /// untouched throughout.
     pub fn warm_reset(&mut self) {
+        // Spec 876 D5 — the reset replaces CIA1 and with it the POT selection: settle the
+        // latch under the old one first. The set values stay (a reset unplugs nothing).
+        let (now, sel) = (self.c64_core.clk, self.pot_select());
+        self.pot.settle(now, sel);
         // Banking restore ($00=$2F/$01=$37 + PLA) + cart reset + $FFFC vector fetch
         // + CPU/IEC/keyboard/SID re-init, RAM preserved (cold_reset does NOT fill).
         // = ts:692-694 (resetCpuPortKeepRam) + ts:699/701/730/719 path.
@@ -1592,6 +1602,12 @@ impl Machine {
                     self.io_shadow[(a as usize) - 0xd000] = *b & 0x0f;
                 }
                 0xdc00..=0xdcff => {
+                    // Spec 876 D3 — settle the POT latch before `$DC00`/`$DC02` move the mux.
+                    let reg = (a & 0xf) as usize;
+                    if reg == crate::cia::CIA_PRA || reg == crate::cia::CIA_DDRA {
+                        let (now, sel) = (self.c64_core.clk, self.pot_select());
+                        self.pot.settle(now, sel);
+                    }
                     let clk = self.cpu6510.clk;
                     let tab = self.cia_table.clone();
                     self.cia1.write(a, *b, clk, &tab);
@@ -1639,6 +1655,7 @@ impl Machine {
             sid_map: &self.sid_map,
             sid_trace: &mut self.sid_trace,
             sid_host: &mut self.sid_host,
+            pot: &mut self.pot,
             config: self.memconfig,
             memconfig_table: &self.memconfig_table,
             port_dir: self.port_dir,
@@ -1708,6 +1725,7 @@ impl Machine {
             sid_map: &self.sid_map,
             sid_trace: &mut self.sid_trace,
             sid_host: &mut self.sid_host,
+            pot: &mut self.pot,
             config: self.memconfig,
             memconfig_table: &self.memconfig_table,
             port_dir: self.port_dir,
@@ -2018,6 +2036,7 @@ impl Machine {
                 sid_map: &self.sid_map,
                 sid_trace: &mut self.sid_trace,
                 sid_host: &mut self.sid_host,
+                pot: &mut self.pot,
                 config: self.memconfig,
                 memconfig_table: &self.memconfig_table,
                 port_dir: self.port_dir,
@@ -2544,6 +2563,58 @@ impl Machine {
         })
     }
 
+    // ── Spec 876 — the POT lines ─────────────────────────────────────────────────────
+
+    /// The POT selection CIA1 drives now (bit 0 = port 1, bit 1 = port 2).
+    fn pot_select(&self) -> u8 {
+        crate::pot::select(self.cia1.pa_output())
+    }
+
+    /// The POT lines of control port `port` (1 or 2) now read `x` / `y`: the byte the
+    /// SID latches while only this port is selected. `$FF` = open. The byte is final;
+    /// TRX64 does no position mapping. Latched at the first 512-cycle boundary after
+    /// the machine's clock now.
+    pub fn set_pot(&mut self, port: u8, x: u8, y: u8) -> Result<(), String> {
+        let (clk, sel) = (self.c64_core.clk, self.pot_select());
+        self.pot.set(clk, sel, port, x, y)
+    }
+
+    /// Nothing on the POT lines of `port`: both read `$FF`.
+    pub fn clear_pot(&mut self, port: u8) -> Result<(), String> {
+        let (clk, sel) = (self.c64_core.clk, self.pot_select());
+        self.pot.clear(clk, sel, port)
+    }
+
+    /// What is set on `port` (None = cleared).
+    pub fn pot(&self, port: u8) -> Option<(u8, u8)> {
+        self.pot.get(port)
+    }
+
+    /// The POT lines, read-only: the latch, the boundary it reflects, the read counter.
+    pub fn pot_lines(&self) -> &crate::pot::PotLines {
+        &self.pot
+    }
+
+    /// What the CPU would read from chip 0's `$D419` (`axis` 0) / `$D41A` (`axis` 1)
+    /// now, without settling anything.
+    pub fn pot_peek(&self, axis: usize) -> u8 {
+        self.pot.peek(self.c64_core.clk, self.pot_select(), axis)
+    }
+
+    /// A side-effect-free SID register read: the host's peek first (855 D5), then chip 0's
+    /// POT latch (876), `$FF` on the POT registers of chips 1.., and the register shadow
+    /// for everything else.
+    fn sid_peek(&self, chip: u8, reg: usize) -> u8 {
+        if let Some(v) = self.sid_host.peek(chip, reg) {
+            return v;
+        }
+        match (chip, reg) {
+            (0, 0x19 | 0x1a) => self.pot_peek(reg - 0x19),
+            (_, 0x19 | 0x1a) if self.sid_chip_regs(chip).is_some() => 0xff,
+            _ => self.sid_chip_regs(chip).map(|r| r[reg]).unwrap_or(0xff),
+        }
+    }
+
     /// Side-effect-free banked read through the current PLA config (for
     /// session/state vectors). RAM / BASIC / KERNAL / CHARGEN / IO per memconfig;
     /// I/O reads use the register PEEK (no IRQ-latch clears), color RAM low
@@ -2644,10 +2715,7 @@ impl Machine {
                                 Some(hit) => hit,
                                 None => (0, (addr as usize - 0xd400) & 0x1f),
                             };
-                            match self.sid_host.peek(chip, reg) {
-                                Some(v) => v,
-                                None => self.sid_chip_regs(chip).map(|r| r[reg]).unwrap_or(0xff),
-                            }
+                            self.sid_peek(chip, reg)
                         }
                         0xd800..=0xdbff => (self.io_shadow[(addr as usize) - 0xd000] & 0x0f) | 0xf0,
                         0xdc00..=0xdcff => self.cia1_pin_peek(addr),
@@ -2720,10 +2788,7 @@ impl Machine {
                                 Some(hit) => hit,
                                 None => (0, (addr as usize - 0xd400) & 0x1f),
                             };
-                            match self.sid_host.peek(chip, reg) {
-                                Some(v) => v,
-                                None => self.sid_chip_regs(chip).map(|r| r[reg]).unwrap_or(0xff),
-                            }
+                            self.sid_peek(chip, reg)
                         }
                         0xd800..=0xdbff => (self.io_shadow[(addr as usize) - 0xd000] & 0x0f) | 0xf0,
                         0xdc00..=0xdcff => self.cia1_pin_peek(addr),
@@ -3781,6 +3846,7 @@ impl Machine {
                     sid_map: &self.sid_map,
                     sid_trace: &mut self.sid_trace,
                     sid_host: &mut self.sid_host,
+                    pot: &mut self.pot,
                     config: self.memconfig,
                     memconfig_table: &self.memconfig_table,
                     port_dir: self.port_dir,

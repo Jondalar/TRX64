@@ -183,6 +183,8 @@ pub struct FullBus<'a> {
     pub sid_trace: &'a mut crate::sid::SidTrace,
     /// Spec 855 D5 — the host's read/peek overrides, borrowed for this run.
     pub sid_host: &'a mut crate::sid::SidHostAccess,
+    /// Spec 876 — the POT lines and chip 0's `$D419`/`$D41A` latch, borrowed for this run.
+    pub pot: &'a mut crate::pot::PotLines,
     /// Live memconfig (selected by $00/$01 writes).
     pub config: MemConfig,
     pub memconfig_table: &'a [MemConfig; 32],
@@ -466,7 +468,8 @@ impl<'a> FullBus<'a> {
             }
             0xd400..=0xd7ff => {
                 // SID: 32-byte register mirror every $20.
-                // $D419/$D41A (POT X/Y) → 0x80 (unconnected default).
+                // $D419/$D41A (POT X/Y) → chip 0's POT latch (Spec 876); $FF on
+                // chips 1.., which have no POT lines.
                 // $D41B (OSC3) → voice-3 oscillator output MSB (live computed).
                 // $D41C (ENV3) → voice-3 envelope value (live computed).
                 // All other registers: write-only shadow byte (B-level round-trip).
@@ -682,7 +685,15 @@ impl<'a> FullBus<'a> {
                 self.sid_chip_write(chip, reg, value);
             }
             0xd800..=0xdbff => { /* color RAM: shadow already stored above */ }
-            0xdc00..=0xdcff => self.cia1.write(addr, value, self.clk, self.cia_table),
+            0xdc00..=0xdcff => {
+                // Spec 876 D3 — `$DC00`/`$DC02` move the POT mux: settle the latch under
+                // the selection that stood until now, before the write changes it.
+                let reg = (addr & 0xf) as usize;
+                if reg == crate::cia::CIA_PRA || reg == crate::cia::CIA_DDRA {
+                    self.pot.settle(self.clk, crate::pot::select(self.cia1.pa_output()));
+                }
+                self.cia1.write(addr, value, self.clk, self.cia_table)
+            }
             0xdd00..=0xddff => {
                 self.cia2.write(addr, value, self.clk, self.cia_table);
                 // CIA2 port-A output drives the IEC bus + VIC bank. A $DD00 (PRA)
@@ -803,6 +814,12 @@ impl<'a> FullBus<'a> {
             return v;
         }
         if chip == 0 {
+            // Spec 876 D4 — chip 0's POT registers are the latch of the control ports'
+            // POT lines, selected by CIA1 PA6/PA7.
+            if reg == 0x19 || reg == 0x1a {
+                let sel = crate::pot::select(self.cia1.pa_output());
+                return self.pot.read(self.clk, sel, reg - 0x19);
+            }
             return self.sid.read(reg, self.sid_regs);
         }
         match self.sid_extra.get(chip as usize - 1) {
@@ -1255,6 +1272,7 @@ mod joystick_gate_tests {
             sid_map: &[],
             sid_trace,
             sid_host,
+            pot: Box::leak(Box::default()),
             config: mct[0x1f],
             memconfig_table: mct,
             port_dir: 0x2f,

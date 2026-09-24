@@ -564,7 +564,7 @@ fn component_of(path: &str) -> String {
     if starts("keyboard") {
         return "input.keyboard".into();
     }
-    if starts("joystick1") || starts("joystick2") || starts("paddles") {
+    if starts("joystick1") || starts("joystick2") || starts("paddles") || starts("pot") {
         return "input".into();
     }
     let seg = p.split(|c| c == '.' || c == '[').next().unwrap_or(p);

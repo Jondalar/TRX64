@@ -128,6 +128,10 @@ struct GateResult {
     folder: Option<u8>,
     /// Spec 874 — the slot the gate's host device sat at.
     probe: Option<u8>,
+    /// Spec 876 §12.13 — the CPU's reads of `$D419`/`$D41A` on chip 0, and the values
+    /// they returned.
+    pot_reads: u64,
+    pot_seen: Vec<u8>,
 }
 
 /// Run one game end-to-end and report behavioral state.
@@ -374,6 +378,8 @@ fn run_game_full(
         drive_b,
         folder,
         probe,
+        pot_reads: m.pot_lines().reads,
+        pot_seen: m.pot_lines().seen_values(),
     })
 }
 
@@ -733,6 +739,8 @@ fn report(r: &GateResult) {
         r.distinct_colors, r.screen_nonblank
     );
     eprintln!("  png: {}", r.png_path);
+    let seen: Vec<String> = r.pot_seen.iter().map(|v| format!("${v:02X}")).collect();
+    eprintln!("  pot: reads={} values seen=[{}]", r.pot_reads, seen.join(" "));
     eprintln!("  top post-RUN C64 PCs:");
     for (pc, n) in &r.top_c64_pcs {
         eprintln!("    ${pc:04X}: {n}");
