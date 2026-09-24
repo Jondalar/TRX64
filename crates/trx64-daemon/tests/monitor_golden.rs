@@ -303,6 +303,12 @@ fn script() -> Vec<&'static str> {
         "map",
         "chis",
         "whowrote d020 3",
+        // Spec 876 — the POT lines: report, set, report, clear, a port that is not one
+        "pot",
+        "pot 1 12 34",
+        "pot",
+        "pot 1 off",
+        "pot 3 00 00",
         // Unknown verb, and an empty line
         "nosuchverb",
         "",

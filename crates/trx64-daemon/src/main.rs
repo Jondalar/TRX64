@@ -7180,6 +7180,39 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             Response::ok(id, json!({ "ok": true }))
         }
 
+        // Spec 876 — session/pot_set {port, x, y}: the POT lines of control port 1 or 2
+        // now carry these bytes (final: TRX64 maps nothing, $FF = open). The shape of
+        // joystick_set; latched by the SID at the next 512-cycle boundary.
+        "session/pot_set" => {
+            let byte = |k: &str| req.params.get(k).and_then(|v| v.as_u64()).filter(|v| *v <= 0xff).map(|v| v as u8);
+            let port = req.params.get("port").and_then(|v| v.as_u64()).unwrap_or(0);
+            let (Some(x), Some(y)) = (byte("x"), byte("y")) else {
+                return Response::err(id, -32602, "pot_set: x and y are bytes (0..=255)");
+            };
+            let mut st = state.lock().unwrap();
+            match st.session.machine.set_pot(port.min(255) as u8, x, y) {
+                Ok(()) => Response::ok(id, json!({ "ok": true })),
+                Err(e) => Response::err(id, -32602, &e),
+            }
+        }
+
+        // Spec 876 — session/pot_clear {port?}: nothing on that port's POT lines; absent
+        // means both.
+        "session/pot_clear" => {
+            let port = req.params.get("port").and_then(|v| v.as_u64());
+            let mut st = state.lock().unwrap();
+            let ports: Vec<u8> = match port {
+                Some(p) => vec![p.min(255) as u8],
+                None => vec![1, 2],
+            };
+            for p in ports {
+                if let Err(e) = st.session.machine.clear_pot(p) {
+                    return Response::err(id, -32602, &e);
+                }
+            }
+            Response::ok(id, json!({ "ok": true }))
+        }
+
         // session/input_status — UI inspector read of pressed keys + joystick bits
         // (ws-server.ts:1486). Reports the held-key set via pressed_keys() (Spec
         // 310, batch 2) + the LIVE joystick1/joystick2 state. Shape matches the TS
@@ -7202,10 +7235,16 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             };
             let joystick1 = joy_json(&st.session.machine.joystick1);
             let joystick2 = joy_json(&st.session.machine.joystick2);
+            // Spec 876 — what the host set on each port's POT lines, null = open.
+            let pot = |p: u8| match st.session.machine.pot(p) {
+                Some((x, y)) => json!([x, y]),
+                None => Value::Null,
+            };
             Response::ok(id, json!({
                 "pressed": Value::Array(pressed),
                 "joystick1": joystick1,
-                "joystick2": joystick2
+                "joystick2": joystick2,
+                "pots": [pot(1), pot(2)]
             }))
         }
 
@@ -14565,6 +14604,7 @@ fn input_journal_kind(method: &str) -> Option<&'static str> {
     match method {
         "session/type" | "session/key_down" | "session/key_up" | "session/release_keys" => Some("key"),
         "session/joystick_set" | "session/joystick_clear" => Some("joystick"),
+        "session/pot_set" | "session/pot_clear" => Some("pot"),
         "media/mount" | "media/swap" => Some("insert"),
         _ => None,
     }
@@ -14641,6 +14681,8 @@ fn is_operating_method(m: &str) -> bool {
             | "session/type"
             | "session/joystick_set"
             | "session/joystick_clear"
+            | "session/pot_set"
+            | "session/pot_clear"
             | "session/load_prg"
             | "session/reset"
             | "session/power"
@@ -20031,6 +20073,42 @@ mod batch1_tests {
         assert_eq!(dc01() & 0x10, 0, "and port 1 survives release_keys too");
         call(&st, "session/joystick_clear", json!({}));
         assert_ne!(dc01() & 0x10, 0, "joystick_clear with no port clears both");
+    }
+
+    /// Spec 876 — the POT lines over the wire: `pot_set`/`pot_clear` in the shape of the
+    /// joystick verbs, `input_status.pots`, and what a peek of `$D419` then shows.
+    #[test]
+    fn pot_set_and_clear_reach_d419_and_input_status() {
+        let st = make_state();
+        call(&st, "session/power", json!({ "op": "on" }));
+        for _ in 0..8 {
+            call(&st, "session/tick", json!({ "cycles": PAL_FRAME }));
+        }
+        assert_eq!(call(&st, "session/input_status", json!({}))["pots"], json!([null, null]));
+
+        assert_eq!(call(&st, "session/pot_set", json!({ "port": 1, "x": 0x12, "y": 0x34 })), json!({ "ok": true }));
+        call(&st, "session/pot_set", json!({ "port": 2, "x": 0x56, "y": 0x78 }));
+        assert_eq!(call(&st, "session/input_status", json!({}))["pots"], json!([[0x12, 0x34], [0x56, 0x78]]));
+
+        // Port 1 selected, then a frame: the latch has sampled it.
+        st.lock().unwrap().session.machine.poke_io(0xdc02, &[0xc0]);
+        st.lock().unwrap().session.machine.poke_io(0xdc00, &[0x40]);
+        st.lock().unwrap().session.machine.set_hold(Some(trx64_core::expansion::Hold::Cpu));
+        call(&st, "session/tick", json!({ "cycles": PAL_FRAME }));
+        let d419 = || st.lock().unwrap().session.machine.read_full(0xd419);
+        assert_eq!(d419(), 0x12);
+
+        let e = call_err(&st, "session/pot_set", json!({ "port": 3, "x": 1, "y": 1 }));
+        assert_eq!(e.message, "pot: control port 1 or 2, not 3");
+        let e = call_err(&st, "session/pot_set", json!({ "port": 1, "x": 256, "y": 1 }));
+        assert!(e.message.contains("bytes"), "{}", e.message);
+
+        call(&st, "session/pot_clear", json!({ "port": 1 }));
+        assert_eq!(call(&st, "session/input_status", json!({}))["pots"], json!([null, [0x56, 0x78]]));
+        call(&st, "session/tick", json!({ "cycles": PAL_FRAME }));
+        assert_eq!(d419(), 0xff, "a cleared port reads open");
+        call(&st, "session/pot_clear", json!({}));
+        assert_eq!(call(&st, "session/input_status", json!({}))["pots"], json!([null, null]), "no port clears both");
     }
 
     /// BUG-040 — the machine-state verbs exist in the DAEMON, so both front-ends have
