@@ -169,7 +169,7 @@ For embedding in the Apple universe, `trx64-ffi` exposes a typed uniffi library 
 [`crates/trx64-ffi/API.md`](crates/trx64-ffi/API.md).
 
 **Embedding in Rust.** `trx64-core` is a library: build a `Machine`, feed it ROMs, run it. Beyond
-media and input it has three places where a host plugs in its own hardware:
+media and input it has these places where a host plugs in its own hardware:
 
 - **Drives** — two positions on the bus, each a 1541 or a 1581 (`set_drive_type`, only while
   that drive is off), with their own power, reset and unit 8-11. `attach_folder` puts a host
@@ -181,6 +181,11 @@ media and input it has three places where a host plugs in its own hardware:
   (`attach_fdc_controller`, with the drive off), for hosts that keep the disk image themselves
   and serve it sector by sector. It sees the WD registers at the drive's cycle, side select and
   motor, and drives ready, disk change and write protect.
+
+- **Paddles, the 1351 mouse, extra fire buttons** — `set_pot(port, x, y)` / `clear_pot(port)`:
+  the byte the SID's POTX/POTY read for that control port. The SID answers the port CIA 1
+  selects (`$DC00` bits 6/7) and takes a new value every 512 cycles, as the chip does. Nothing
+  set reads `$FF`, an open line. Monitor `pot`; daemon `session/pot_set` / `session/pot_clear`.
 
 A device or controller may keep its state out of snapshots; a snapshot then names what it
 left out.

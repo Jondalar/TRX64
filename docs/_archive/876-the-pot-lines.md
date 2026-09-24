@@ -1,6 +1,6 @@
 # Spec 876 — The POT lines: paddles, mouse and extra fire buttons at `$D419`/`$D41A`
 
-**Status:** BUILT on branch spec-876-pot-lines (not merged) — as built in §15
+**Status:** MERGED 2026-09-24 (main) — as built in §15
 **Repos:** TRX64. C64RE: no change.
 **Number:** 876 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`, row present).
 **Depends on:** Spec 855 (several SIDs, `sid_chip_read`, the host read hook), Spec 851/856
