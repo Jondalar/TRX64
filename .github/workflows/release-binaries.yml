@@ -94,6 +94,21 @@ jobs:
             target: macos-arm64
             archive: tar.gz
             container: ''
+          # Intel Macs, CROSS-BUILT from the arm64 runner rather than taken from a
+          # `macos-13` entry. Spec 716 needs this target — C64RE's runtime installer maps
+          # darwin-x64 to it — and the reason for cross-building is the same one written
+          # against the Linux entry below: a runner label is not a floor to build on.
+          # GitHub is retiring macos-13, and an entry that disappears with it would take
+          # Intel Mac users with it. Apple's clang cross-compiles between the two arches by
+          # default, and cc-rs passes the target through, so reSID and the bundled DuckDB
+          # come along. It cannot be RUN here (an arm64 runner has no Rosetta by default),
+          # so its proof step is static — see `cross: true` below.
+          - os: macos-latest
+            target: macos-x86_64
+            archive: tar.gz
+            container: ''
+            rust_target: x86_64-apple-darwin
+            cross: true
           # Windows: MSVC toolchain, preinstalled. winit/cpal use Win32/WASAPI, also part
           # of the OS. `.zip` because that is what a Windows user expects to receive.
           - os: windows-latest
@@ -158,6 +173,7 @@ jobs:
             echo "no rustc on this image — installing via rustup"
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
               | sh -s -- -y --default-toolchain stable --profile minimal
+            . "$HOME/.cargo/env"
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
             export PATH="$HOME/.cargo/bin:$PATH"
           fi
@@ -203,19 +219,50 @@ jobs:
         # amalgamation that alone took ~31 of 36 minutes natively on the NAS. Measured
         # cold here: macOS ~16 min, Windows ~40 min. The cache step above cuts the repeat.
         run: |
+          set -eu
+          TARGET_ARG=""
+          if [ -n "${{ matrix.rust_target }}" ]; then
+            rustup target add "${{ matrix.rust_target }}"
+            TARGET_ARG="--target ${{ matrix.rust_target }}"
+          fi
           cargo build --release --config 'profile.release.strip="symbols"' \
-            -p trx64-cli -p trx64-daemon
+            $TARGET_ARG -p trx64-cli -p trx64-daemon
+
+      # Where cargo put them. A cross build writes to target/<triple>/release/, so this is
+      # the one place that answer is computed and every step below reads $BINDIR.
+      - name: Where the binaries are
+        id: bindir
+        run: |
+          set -eu
+          if [ -n "${{ matrix.rust_target }}" ]; then
+            echo "dir=target/${{ matrix.rust_target }}/release" >> $GITHUB_OUTPUT
+          else
+            echo "dir=target/release" >> $GITHUB_OUTPUT
+          fi
 
       - name: Prove the binaries are what they claim
+        env:
+          BINDIR: ${{ steps.bindir.outputs.dir }}
         run: |
           set -eu
           V="${{ steps.ver.outputs.version }}"
           EXT=""
           [ "${{ runner.os }}" = "Windows" ] && EXT=".exe"
           for b in trx64cli trx64-daemon; do
-            GOT=$(./target/release/$b$EXT --version | awk '{print $2}')
-            echo "$b reports $GOT (expected $V)"
-            [ "$GOT" = "$V" ] || { echo "::error::$b reports $GOT but the build says $V"; exit 1; }
+            if [ "${{ matrix.cross }}" = "true" ]; then
+              # A cross-built binary cannot be run here, so the claim it can still make is
+              # what it IS. Running it would need Rosetta, which an arm64 runner does not
+              # have by default; asking for it would trade a measured check for a slow
+              # unmeasured one. The version is not re-proved per target — the native
+              # entries of this same matrix, from this same source tree, already did.
+              file "./$BINDIR/$b$EXT"
+              file "./$BINDIR/$b$EXT" | grep -q 'x86_64' \
+                || { echo "::error::$b is not an x86_64 binary"; exit 1; }
+            else
+              GOT=$(./$BINDIR/$b$EXT --version | awk '{print $2}')
+              echo "$b reports $GOT (expected $V)"
+              [ "$GOT" = "$V" ] || { echo "::error::$b reports $GOT but the build says $V"; exit 1; }
+            fi
           done
 
       - name: What does it link against
@@ -227,20 +274,24 @@ jobs:
         # GLIBC_x.y symbol version the binary references IS its minimum glibc, and therefore
         # the oldest distro that can start it. Printing it means the floor is measured in
         # every run instead of assumed from the base image.
+        env:
+          BINDIR: ${{ steps.bindir.outputs.dir }}
         run: |
           if [ "${{ runner.os }}" = "Linux" ]; then
-            ldd ./target/release/trx64cli || true
+            ldd ./$BINDIR/trx64cli || true
             echo "--- highest GLIBC symbol version required (= the floor):"
-            objdump -T ./target/release/trx64cli \
+            objdump -T ./$BINDIR/trx64cli \
               | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -5
           elif [ "${{ runner.os }}" = "macOS" ]; then
-            otool -L ./target/release/trx64cli | head -20
+            otool -L ./$BINDIR/trx64cli | head -20
           else
-            dumpbin //DEPENDENTS ./target/release/trx64cli.exe 2>/dev/null | head -25 \
+            dumpbin //DEPENDENTS ./$BINDIR/trx64cli.exe 2>/dev/null | head -25 \
               || echo "(dumpbin unavailable outside the VS env — skipped, not a failure)"
           fi
 
       - name: Package
+        env:
+          BINDIR: ${{ steps.bindir.outputs.dir }}
         run: |
           set -eu
           V="${{ steps.ver.outputs.version }}"
@@ -254,11 +305,11 @@ jobs:
           # per archive kind — the two are not the same question.
           sha() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi; }
           if [ "${{ matrix.archive }}" = "zip" ]; then
-            cp target/release/trx64cli.exe target/release/trx64-daemon.exe dist/
+            cp $BINDIR/trx64cli.exe $BINDIR/trx64-daemon.exe dist/
             (cd dist && 7z a "$NAME.zip" trx64cli.exe trx64-daemon.exe >/dev/null)
             (cd dist && sha "$NAME.zip" > "$NAME.zip.sha256")
           else
-            cp target/release/trx64cli target/release/trx64-daemon dist/
+            cp $BINDIR/trx64cli $BINDIR/trx64-daemon dist/
             (cd dist && tar czf "$NAME.tar.gz" trx64cli trx64-daemon)
             (cd dist && sha "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
           fi
