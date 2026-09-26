@@ -1,7 +1,9 @@
 # Spec 809 — Marks and sandboxes: a fixed point, and N machines from it
 
-**Status:** PARTLY BUILT — marks (§3) and the sandbox capability (§4) shipped with all
-their gates. Open: copy-on-write media folders per run (§4) and multi-line assembly (§5).
+**Status:** PARTLY BUILT — REOPENED 2026-09-26. Marks (§3) shipped with their gates. The
+sandbox capability (§4) did **not**: it runs on the shared machine, and G7 was never a test
+— see §9. Open: §9 (isolation, G7, `nearestMark`), copy-on-write media folders per run (§4),
+multi-line assembly (§5).
 **Repos:** TRX64 only. The goals, the acceptance and the BDD layer are **810** in C64RE —
 this spec knows nothing about what "correct" means.
 **Number:** 809 (shared board `C64ReverseEngineeringMCP/specs/README.md`).
@@ -295,3 +297,35 @@ A refusal you read beats a degradation you discover.
 
 `marks` still prints the arithmetic (`18 marks · window 59.8s of 60.0`), so the cost is
 visible long before the cap is reached.
+
+## §9 Reopened 2026-09-26 — the sandbox is the live machine
+
+Found while writing C64RE's Spec 884 (ring marks in C64RE), by reading the code rather than
+this spec's status line.
+
+**What the code does.** `sandbox/run` / `sandbox/runMany` say in their own comment that
+*"the live machine is NEVER used for a sandbox run (doctrine rule 2)"*. They then build a
+`runtime/overlay_run` request and dispatch it against the same daemon state, and
+`overlay_run` restores with `restore_live_checkpoint(&mut st.session, …)` and ends with
+`st.session.running = false`. A sandbox run therefore restores, patches, runs and **pauses
+the machine the human is watching**. A `runMany` of four does it four times in a row. That
+is serial, not parallel, and nothing about it is isolated.
+
+**Why nobody saw it.** The sandbox tests assert that a run starts from a mark name, carries
+no verdict, and leaves the mark in place. None of them asserts what G7 says: that the live
+machine's cycle count and state are identical before and after. The comment was believed
+instead — the same failure G7b's own wording warns about (*"the flags said read-write and
+everyone believed the comment instead"*).
+
+**What is open, in this spec:**
+
+1. **D0 — sandbox runs on 787 scratch instances.** Restore the mark's anchor into a scratch
+   machine, patch, run the budget, and report the end state from there. The live session is
+   not locked for longer than it takes to read the anchor.
+2. **G7 becomes a test.** A `runMany` over N runs, then the live machine's cycle count, PC,
+   RAM digest and run state compared with before: identical, or red.
+3. **`transport/status` gains `nearestMark`** as §5b specifies. It was never built, and the
+   board row did not say so.
+
+C64RE's Spec 884 depends on item 1 for its iterate-from-a-mark door and on item 3 for the
+transport line in the workbench; its other doors do not wait for this.
