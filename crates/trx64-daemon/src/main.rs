@@ -513,6 +513,10 @@ pub struct State {
     /// sandbox end is a full checkpoint, and nothing here is evidence anyone promised to
     /// keep. The oldest falls out first.
     sandbox_ends: std::collections::VecDeque<(String, Value)>,
+    /// Spec 809 §4 — names this daemon's sandbox folders (`sandbox/<stamp>-r-0001`), so a
+    /// restarted daemon, which numbers its runs from 1 again, never writes into the
+    /// folder of a run from an earlier life.
+    sandbox_stamp: String,
     /// Spec 769.5a — the SEPARATE per-checkpoint thumbnail store (= the c64re
     /// `RuntimeController.checkpointThumbs` map, runtime-controller.ts:181). Keyed by
     /// checkpoint id, capped at [`MAX_THUMBS`]. Decoupled from the ring's
@@ -11837,7 +11841,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 return Response::err(id, -32602, "sandbox: no runs given");
             }
 
-            let (mut base, snapshot, anchor_id, first_seq, injected, io_injected) = {
+            let (mut base, snapshot, anchor_id, first_seq, injected, io_injected, cart_name, stamp) = {
                 let mut st = state.lock().unwrap();
                 let anchor = if from.is_empty() {
                     match st.checkpoint_ring.list().last() {
@@ -11858,13 +11862,31 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 };
                 let seq = st.sandbox_seq;
                 st.sandbox_seq += runs.len() as u64;
-                (st.session.machine.clone(), snap, anchor, seq, st.session.injected, st.session.io_injected)
+                let cart_name = st
+                    .session
+                    .cart_path
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                (
+                    st.session.machine.clone(),
+                    snap,
+                    anchor,
+                    seq,
+                    st.session.injected,
+                    st.session.io_injected,
+                    cart_name,
+                    st.sandbox_stamp.clone(),
+                )
             };
             if let Err(e) = restore_checkpoint_into(&mut base, &snapshot) {
                 return Response::err(id, -32001, format!("sandbox: {e}"));
             }
             let full = full_machine_gate_for(&base, injected, io_injected);
+            let media = sandbox_media_baseline(&mut base, &cart_name);
             let run_ids: Vec<String> = (0..runs.len()).map(|i| format!("r-{:04}", first_seq + i as u64 + 1)).collect();
+            let sandbox_root = std::path::PathBuf::from(project_knowledge::active_project_dir()).join("sandbox");
 
             // Fan-out: one clone per run, as many at once as the host has cores.
             let width = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).max(1);
@@ -11877,7 +11899,9 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                         .map(|&i| {
                             let mut m = base.clone();
                             let r = runs[i].clone();
-                            (i, sc.spawn(move || sandbox_one(&mut m, &r, full)))
+                            let folder = sandbox_root.join(format!("{stamp}-{}", run_ids[i]));
+                            let media = &media;
+                            (i, sc.spawn(move || sandbox_one(&mut m, &r, full, media, &folder)))
                         })
                         .collect();
                     for (i, h) in handles {
@@ -15697,25 +15721,107 @@ fn snapshot_by_id(st: &State, id: &str) -> Option<Value> {
         .or_else(|| st.sandbox_ends.iter().find(|(k, _)| k == id).map(|(_, v)| v.clone()))
 }
 
+/// Spec 809 §4 — what the media looked like when a sandbox run started: the disk as
+/// written and the cart's writable image, with the file names a run's copies take.
+struct SandboxMediaBaseline {
+    disk: Option<(Vec<u8>, String)>,
+    cart: Option<(Vec<u8>, String)>,
+}
+
+fn sandbox_media_baseline(machine: &mut trx64_core::Machine, cart_name: &str) -> SandboxMediaBaseline {
+    let disk = machine.drive8.disk_as_written().map(|d| {
+        let ext = d.kind.name();
+        let name = d
+            .backing_path
+            .as_ref()
+            .and_then(|p| p.rsplit(['/', '\\']).next())
+            .filter(|n| !n.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| format!("disk.{ext}"));
+        (d.bytes, name)
+    });
+    let clk = machine.clk;
+    let cart = machine.cartridge.as_mut().and_then(|c| {
+        if !c.persists_writable_state() {
+            return None;
+        }
+        c.crt_image(clk).map(|img| (img, if cart_name.is_empty() { "cart.crt".to_string() } else { cart_name.to_string() }))
+    });
+    SandboxMediaBaseline { disk, cart }
+}
+
+/// Spec 809 §4 — copy-on-write media for one sandbox run. A run that wrote to its disk or
+/// its cart gets its OWN copy in `folder`; a run that only read never makes the folder.
+/// The original image is never written: the clone's disk carries the original's path as
+/// metadata only, and nothing here or in the run persists to it.
+///
+/// The comparison is on the bytes, not on a dirty flag — the disk as written now against
+/// the disk as written at the anchor, the cart's image now against its image then —
+/// because a flag inherited from the live machine would put a copy in a folder for a run
+/// that never wrote.
+fn sandbox_cow_media(
+    machine: &mut trx64_core::Machine,
+    base: &SandboxMediaBaseline,
+    folder: &std::path::Path,
+) -> Result<Option<Value>, String> {
+    let mut files: Vec<Value> = vec![];
+    let mut write = |name: &str, bytes: &[u8]| -> Result<(), String> {
+        std::fs::create_dir_all(folder).map_err(|e| format!("sandbox: {}: {e}", folder.display()))?;
+        let path = folder.join(name);
+        std::fs::write(&path, bytes).map_err(|e| format!("sandbox: {}: {e}", path.display()))?;
+        files.push(json!(path.to_string_lossy()));
+        Ok(())
+    };
+    if let (Some((before, name)), Some(now)) = (&base.disk, machine.drive8.disk_as_written()) {
+        if now.bytes != *before {
+            write(name, &now.bytes)?;
+        }
+    }
+    let clk = machine.clk;
+    if let (Some((before, name)), Some(cart)) = (&base.cart, machine.cartridge.as_mut()) {
+        if let Some(now) = cart.crt_image(clk) {
+            if now != *before {
+                write(name, &now)?;
+            }
+        }
+    }
+    Ok(if files.is_empty() {
+        None
+    } else {
+        Some(json!({ "folder": folder.to_string_lossy(), "files": files }))
+    })
+}
+
 /// Spec 809 §9 — how many sandbox end states the daemon keeps for `component_diff`.
 const SANDBOX_ENDS_KEPT: usize = 32;
 
 /// One sandbox run on a scratch clone: patch, run the budget, observe, capture the end.
 /// Takes no lock and no session — it cannot touch the live machine, which is the point.
-fn sandbox_one(machine: &mut trx64_core::Machine, run: &Value, full_machine: bool) -> Result<(Value, Value), String> {
+fn sandbox_one(
+    machine: &mut trx64_core::Machine,
+    run: &Value,
+    full_machine: bool,
+    media: &SandboxMediaBaseline,
+    folder: &std::path::Path,
+) -> Result<(Value, Value), String> {
     let patches: Vec<Value> = run.get("patches").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     let cycles = run.get("cycles").and_then(|v| v.as_u64()).unwrap_or(0);
     let applied = apply_overlay_patches(machine, &patches, "sandbox/run")?;
     if cycles > 0 {
         run_machine_budget(machine, cycles, full_machine);
     }
-    let summary = json!({
+    let mut summary = json!({
         "cycles": cycles,
         "applied": applied,
         "reads": Value::Object(read_overlay_patches(machine, &patches)),
         "registers": machine_registers(machine),
         "ramDigest": ram_digest(machine),
     });
+    // The folder is part of the run's result: a caller that cares about a written disk
+    // fetches it from here. Absent when the run wrote nothing.
+    if let Some(m) = sandbox_cow_media(machine, media, folder)? {
+        summary["media"] = m;
+    }
     let end = capture_machine_checkpoint(machine);
     Ok((summary, end))
 }
@@ -17550,6 +17656,7 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         candidate_seq: 0,
         sandbox_seq: 0,
         sandbox_ends: std::collections::VecDeque::new(),
+        sandbox_stamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0).to_string(),
         checkpoint_thumbs: std::collections::HashMap::new(),
         checkpoint_thumb_order: std::collections::VecDeque::new(),
         mon: MonitorSession::new(),
@@ -18231,6 +18338,7 @@ mod batch1_tests {
         candidate_seq: 0,
         sandbox_seq: 0,
         sandbox_ends: std::collections::VecDeque::new(),
+        sandbox_stamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0).to_string(),
             checkpoint_thumbs: std::collections::HashMap::new(),
             checkpoint_thumb_order: std::collections::VecDeque::new(),
             mon: MonitorSession::new(),
@@ -21012,6 +21120,143 @@ mod batch1_tests {
         let at9 = call(&st, "transport/status", json!({}));
         assert_eq!(at9["nearestMark"]["name"], json!("late"));
         assert_eq!(at9["nearestMark"]["framesAway"], json!(2), "{at9}");
+    }
+
+    /// Spec 809 G7b — a sandbox that writes its disk writes a COPY, in its own folder, and
+    /// the original image is byte-identical afterwards. Asserted with a real write — a GCR
+    /// sector encoded onto the clone's track the way the drive's write path leaves it, the
+    /// same write the disk auto-persist test uses — not by reading a mount flag.
+    #[test]
+    fn g7b_a_sandbox_that_writes_its_disk_writes_a_copy_and_never_the_original() {
+        use trx64_core::drive::{DiskImage, DiskKind};
+        let dir = std::env::temp_dir().join(format!("trx64_809_g7b_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = dir.join("game.d64");
+        let blank = vec![0u8; 174848];
+        std::fs::write(&original, &blank).unwrap();
+
+        let st = make_state();
+        {
+            let mut g = st.lock().unwrap();
+            g.session.machine.drive8.attach_disk(DiskImage {
+                kind: DiskKind::D64,
+                bytes: blank.clone(),
+                backing_path: Some(original.to_string_lossy().to_string()),
+                read_only: false,
+            });
+        }
+        fill_anchors(&st, 3);
+
+        // The door's own sequence, on a clone: restore the anchor, take the baseline.
+        let (mut base, snap) = {
+            let g = st.lock().unwrap();
+            let id = g.checkpoint_ring.list().last().unwrap().id.clone();
+            (g.session.machine.clone(), g.checkpoint_ring.restore_snapshot(&id).unwrap())
+        };
+        restore_checkpoint_into(&mut base, &snap).unwrap();
+        let baseline = sandbox_media_baseline(&mut base, "");
+
+        // A run that only reads makes no folder.
+        let quiet = dir.join("sandbox").join("r-quiet");
+        let mut reader = base.clone();
+        assert!(sandbox_cow_media(&mut reader, &baseline, &quiet).unwrap().is_none());
+        assert!(!quiet.exists(), "a run that wrote nothing makes no folder");
+
+        // A run that writes a sector.
+        let sector: Vec<u8> = (0..256).map(|i| (0x40u16 + i as u16) as u8).collect();
+        let mut writer = base.clone();
+        {
+            let rot = &mut writer.drive8.rotation;
+            let ht = rot.current_half_track as usize;
+            let img = rot.image.as_mut().expect("image attached");
+            assert_eq!(
+                trx64_core::gcr::gcr_write_sector(&mut img.tracks[ht - 2], &sector, 0),
+                trx64_core::gcr::CBMDOS_FDC_ERR_OK
+            );
+            rot.write_one_bit_for_test(1);
+        }
+        let folder = dir.join("sandbox").join("r-writer");
+        let media = sandbox_cow_media(&mut writer, &baseline, &folder).unwrap().expect("the write is reported");
+        let copy = folder.join("game.d64");
+        assert_eq!(media["files"][0], json!(copy.to_string_lossy()), "{media}");
+
+        let orig_after = std::fs::read(&original).unwrap();
+        assert_eq!(orig_after, blank, "G7b: the ORIGINAL image is byte-identical");
+        let copied = std::fs::read(&copy).unwrap();
+        assert_ne!(copied, blank, "the run's copy diverges");
+        // Track 18 sector 0: 17 tracks of 21 sectors before it.
+        let t18s0 = 17 * 21 * 256;
+        assert_eq!(&copied[t18s0..t18s0 + 256], &sector[..], "and it holds the sector the run wrote");
+
+        // And the live machine's disk never saw it.
+        let live = st.lock().unwrap().session.machine.drive8.disk_as_written().unwrap().bytes;
+        assert_eq!(live, blank, "the live machine's disk is untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// G7b for the cartridge: a sandbox that programs flash writes a copy of the .crt in
+    /// its own folder; the original file and the live cart are untouched. The same
+    /// programming sequence the cart auto-persist test uses.
+    #[test]
+    fn g7b_a_sandbox_that_programs_flash_writes_a_copy_of_the_crt() {
+        let dir = std::env::temp_dir().join(format!("trx64_809_g7b_crt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let crt_path = dir.join("ef_writable.crt");
+        let mut bank0 = vec![0xffu8; 0x4000];
+        bank0[0x3ffc] = 0x00;
+        bank0[0x3ffd] = 0x80;
+        let crt = build_crt_for_test(32, 1, 0, "EF", &[(0, 0x8000, bank0)]);
+        std::fs::write(&crt_path, &crt).unwrap();
+
+        let st = make_state();
+        {
+            let mut g = st.lock().unwrap();
+            g.session.machine.attach_cart_from_bytes(&crt, "EF").expect("attach EF");
+            g.session.cart_path = crt_path.to_string_lossy().to_string();
+            g.session.machine.cold_reset();
+        }
+        fill_anchors(&st, 3);
+        let (mut base, snap) = {
+            let g = st.lock().unwrap();
+            let id = g.checkpoint_ring.list().last().unwrap().id.clone();
+            (g.session.machine.clone(), g.checkpoint_ring.restore_snapshot(&id).unwrap())
+        };
+        restore_checkpoint_into(&mut base, &snap).unwrap();
+        let baseline = sandbox_media_baseline(&mut base, "ef_writable.crt");
+        assert!(baseline.cart.is_some(), "a writable cart has a baseline image");
+
+        let mut writer = base.clone();
+        {
+            let bi = bi_for_test();
+            let clk = writer.clk;
+            let cart = writer.cartridge.as_mut().expect("cart on the clone");
+            cart.write(0x8555, 0xaa, &bi, clk);
+            cart.write(0x82aa, 0x55, &bi, clk);
+            cart.write(0x8555, 0xa0, &bi, clk);
+            cart.write(0x8100, 0x42, &bi, clk);
+        }
+        let folder = dir.join("sandbox").join("r-flash");
+        sandbox_cow_media(&mut writer, &baseline, &folder).unwrap().expect("the flash write is reported");
+        let copy = std::fs::read(folder.join("ef_writable.crt")).unwrap();
+        assert_eq!(copy[0x40 + 0x10 + 0x100], 0x42, "the copy holds the programmed byte");
+        assert_eq!(std::fs::read(&crt_path).unwrap(), crt, "the ORIGINAL .crt is byte-identical");
+        {
+            let g = st.lock().unwrap();
+            assert!(!g.session.machine.cartridge.as_ref().unwrap().is_writable_dirty(), "the live cart never saw it");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Through the door: a run that writes nothing reports no `media`, and no folder
+    /// appears under the project.
+    #[test]
+    fn a_sandbox_run_that_writes_nothing_reports_no_media() {
+        let st = make_state();
+        fill_anchors(&st, 3);
+        let r = call(&st, "sandbox/run", json!({ "patches": [{ "addr": 0x0400, "bytes": [1] }], "cycles": 0u64 }));
+        assert!(r.get("media").is_none(), "{r}");
     }
 
     /// G2 — parity. Every transport action reachable as a monitor verb is reachable over
