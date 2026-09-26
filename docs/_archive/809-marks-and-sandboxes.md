@@ -1,9 +1,9 @@
 # Spec 809 — Marks and sandboxes: a fixed point, and N machines from it
 
-**Status:** PARTLY BUILT — REOPENED 2026-09-26. Marks (§3) shipped with their gates. The
-sandbox capability (§4) did **not**: it runs on the shared machine, and G7 was never a test
-— see §9. Open: §9 (isolation, G7, `nearestMark`), copy-on-write media folders per run (§4),
-multi-line assembly (§5).
+**Status:** DONE 2026-09-26. Marks (§3), sandboxes (§4, now isolated — §9), copy-on-write
+media per run (§4), `nearestMark` (§5b) and the block assembler (§5) are built and gated.
+The sandbox half was first reported shipped while it ran on the live machine; §9 records
+how that was found and fixed.
 **Repos:** TRX64 only. The goals, the acceptance and the BDD layer are **810** in C64RE —
 this spec knows nothing about what "correct" means.
 **Number:** 809 (shared board `C64ReverseEngineeringMCP/specs/README.md`).
@@ -161,9 +161,14 @@ at least one label, and typing them through `a` one at a time is not a loop anyo
 twice.
 
 ```
-asm <<EOF ... EOF        assemble a block at a given origin
-asm-file <path>          the same from a file
+asm <addr> [<<TAG]       assemble a block at addr: lines are collected until `end` (or TAG),
+                         then assembled as one; sent as one command with newlines it is
+                         assembled at once
+asm-file <path> [addr]   the same from a file; the file's `*=` gives the address if none
 ```
+
+Both WRITE, like `a`, and only when the whole block assembled — a patch half in memory is
+worse than none. `asm/block` over RPC writes nothing.
 
 - Multi-line, labels, `.byte`/`.word`, `*=`/`.org`. Two passes: collect labels, then emit.
 - Documented NMOS set only, as today. The undocumented table stays out of the assemble
@@ -183,25 +188,33 @@ gate is how a client ends up composing messages again.
 ### RPC
 
 ```
-mark/set      { name }              -> Mark
-mark/list     {}                    -> { marks: [Mark], cap, used, windowCost }
-mark/drop     { name }              -> { dropped, marks: [Mark] }
+mark/set      { name }              -> { mark: Mark, used, cap, message }
+mark/list     {}                    -> { marks: [Mark], cap, used, windowSeconds, windowCostSeconds }
+mark/drop     { name }              -> { dropped, cycles, message }
 mark/goto     { name }              -> transport status (808)
 
 sandbox/run     { from, patches[], cycles }              -> Run
 sandbox/runMany { from, runs: [{patches[], cycles}] }    -> { runs: [Run] }
 
-asm/block     { origin, source }    -> { bytes, origin, labels, errors[] }
+asm/block     { origin, source }    -> { bytes, origin, labels, errors[{line,message}],
+                                         patch: {addr, bytes} | null, message }
+                                       (writes NOTHING — `patch` goes straight into sandbox/run)
 ```
 
 ```
 Mark  { name, anchorId, cycle, frame, secondsBack, message }
-Run   { id, from, instance, state: queued|running|done|failed,
-        cycles, endAnchorId, folder?, message }
+Run   { id, from, anchorId, instance, state: done|failed, cycles,
+        applied, reads, registers, ramDigest, endStateId, media?, message }
 ```
 
 `Run` carries no name and no verdict — an id, where it started, what it cost and where its
 end state is. Naming it, remembering it and judging it are 810's.
+
+*As built (§9):* the first shape had `endAnchorId`, and the first implementation filled it
+with the START anchor. `anchorId` is the start; `endStateId` (`sb-r-NNNN`) is the run's
+real end state, captured from its clone and kept — the last 32 — so `runtime/component_diff`
+compares two of them. `media` replaces `folder?`: present only when the run wrote, with the
+folder and each file in it. Run ids are numbered daemon-wide.
 
 Every reply carries `message`, a ready-to-print line. Not decoration: it is the rule that
 came out of 808, where the buffer range appeared on `/pause` and not on F11 because two
@@ -317,15 +330,33 @@ machine's cycle count and state are identical before and after. The comment was 
 instead — the same failure G7b's own wording warns about (*"the flags said read-write and
 everyone believed the comment instead"*).
 
-**What is open, in this spec:**
+**What was done** (branch `spec-809`):
 
-1. **D0 — sandbox runs on 787 scratch instances.** Restore the mark's anchor into a scratch
-   machine, patch, run the budget, and report the end state from there. The live session is
-   not locked for longer than it takes to read the anchor.
-2. **G7 becomes a test.** A `runMany` over N runs, then the live machine's cycle count, PC,
-   RAM digest and run state compared with before: identical, or red.
-3. **`transport/status` gains `nearestMark`** as §5b specifies. It was never built, and the
-   board row did not say so.
+1. **Sandbox runs are clones.** The shared state is touched twice — to take the anchor's
+   snapshot and a clone of the machine, and to file the results — and never while a run
+   executes. Each run restores into its own clone on its own thread, as many at once as
+   the host has cores. G7 is a test: live clock, PC, RAM digest and run state identical
+   after a three-run fan-out. It was run against the OLD handler first and went red.
+2. **`nearestMark`** rides `transport/status` and the transport line (`alpha +160`).
+3. **G5 was narrower than claimed** — `component_diff` and `pin` refused a mark name
+   while `overlay_run` took it. The ring resolves names at the one lookup every door
+   passes through (id first). `unpin` stays id-only: unpinning a mark by name would
+   release the pin G1 depends on.
+4. **Copy-on-write media** (§4) and **G7b** with real writes: a GCR sector onto the
+   clone's track, and an EasyFlash programming sequence. The copies diverge, the
+   originals and the live media stay byte-identical. Written is decided on the bytes,
+   not a dirty flag.
+5. **The block assembler** (§5), and **G6**: every documented opcode, disassembled by
+   `d`, assembled back as one block, gives the same bytes.
 
-C64RE's Spec 884 depends on item 1 for its iterate-from-a-mark door and on item 3 for the
-transport line in the workbench; its other doors do not wait for this.
+One smaller correction on the way: the monitor classified a line by its verb only, so
+the lines inside `a` mode and an `asm` block counted as observing. The verb that enters
+either mode already cuts the future, so nothing was wrong in practice; `classify_in` now
+classifies each line for what it does.
+
+**Found on the way, not fixed here** (outside 809, and outside the quality gate, which runs
+the core and daemon suites but not `trx64-ffi`): `audio_persistent_engine_continuity` in
+`crates/trx64-ffi/tests/smoke.rs` asserts that the process-wide reSID construct counter did
+not move while it drained, and the other tests in that binary construct reSID in parallel.
+Measured: 7 of 10 runs green in parallel, 10 of 10 with `--test-threads=1`. The assertion is
+right and the counter is shared; the test needs its own counter or a serial runner.

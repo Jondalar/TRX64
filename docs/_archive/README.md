@@ -424,3 +424,26 @@ rule; neither: `$FF`), latched on a 512-cycle grid from power-on; `set_pot`/`cle
 host's finished byte (paddles, 1351, extra fire buttons); the default is `$FF` instead of `$80`.
 Monitor `pot`, daemon `session/pot_set`/`pot_clear`. Merged 2026-09-24.
 Spec: [876-the-pot-lines.md](876-the-pot-lines.md).
+
+## Marks and sandboxes — 809
+
+A named point you can iterate FROM, and N isolated machines from it. Marks shipped first
+and held: a pinned, labelled anchor that survives PLAY cutting the future, capped at 32
+with a refusal rather than a silently shrinking window, carried by `ringdump`.
+
+The sandbox half was reported shipped and was not. `sandbox/run` dispatched `overlay_run`,
+which restores into the live session and pauses it — so every "sandbox" run rewound,
+patched and stopped the machine the human was watching, while the door's comment said the
+live machine was never used. G7 existed as a line in the spec and not as a test, so the
+comment was believed. Found by reading the code while writing C64RE's 884, reopened as
+§9, and built: runs restore into clones on their own threads, the lock is held only to
+take the snapshot and to file the results, and G7 is a test that was run against the old
+handler first and went red. The same reading found `endAnchorId` holding the START anchor,
+mark names accepted by two doors out of many, and `nearestMark` specified and never built.
+Then the rest: copy-on-write media per run, decided on the bytes and proved with real
+writes to a disk and to EasyFlash flash (G7b), and a two-pass block assembler over the
+existing one-line one, proved by round-tripping every documented opcode through `d` (G6).
+
+**Decision:** a capability is not shipped until the test that would catch its opposite
+exists. A comment that states an invariant is a claim; G7 was the test that turns it into
+a property, and until 2026-09-26 it was only a line in a spec.
