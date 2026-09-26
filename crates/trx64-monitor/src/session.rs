@@ -96,6 +96,13 @@ pub struct TrapRule {
 /// The filesystem cwd is NOT here (Spec 864 §10.1): it is shell state of a filesystem,
 /// and a host without one would be carrying a directory it cannot use. It lives with
 /// the host, beside the paths it resolves.
+/// An `asm` block being typed: where it goes, the line that ends it, what came so far.
+pub struct AsmBlockMode {
+    pub origin: u16,
+    pub end: String,
+    pub lines: Vec<String>,
+}
+
 pub struct MonitorState {
     pub bank_default: String,
     pub mem_cursor: Option<u16>,
@@ -110,6 +117,10 @@ pub struct MonitorState {
     /// `Some(addr)` the monitor is in VICE-style `a` assemble mode: EVERY line is an
     /// instruction assembled at the cursor (no verb dispatch); an empty line exits.
     pub asm_cursor: Option<u16>,
+    /// Spec 809 §5 — `asm <addr>` block mode: lines are COLLECTED, not assembled, until
+    /// the terminator, then the whole block goes through the two-pass assembler at once
+    /// (labels need the whole block; one line at a time is what `a` already does).
+    pub asm_block: Option<AsmBlockMode>,
     /// The `MonitorResult.prompt` for the LAST command (= the TS modal `prompt`
     /// field). Set per-command by `run_monitor` (cleared at entry); the `monitor/exec`
     /// handler forwards it on the reply so a modal `a`/`df -i` prompt reaches the wire
@@ -132,6 +143,7 @@ impl MonitorState {
             sidefx_on: false,
             device: "c64".to_string(),
             asm_cursor: None,
+            asm_block: None,
             pending_prompt: None,
         }
     }

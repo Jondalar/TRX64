@@ -385,6 +385,8 @@ pub fn monitor_help_text() -> String {
         "    wr [lens] <a> <b..>  write exactly these bytes from a",
         "    f <a> <b> <d..>  fill range a..b with repeating data",
         "    a <a> [instr]    assemble; `a c000` enters assemble mode (type lines, empty exits)",
+        "    asm <a> [<<TAG]  assemble a BLOCK at a: lines are collected until `end` (or TAG), then assembled as one — labels (`loop:`), `name = value`, `*`, `<`/`>`, `+`/`-`, `.byte`, `.word`, one `*=`/`.org` before the first byte. Not a build system: no includes, no macros.",
+        "    asm-file <path> [a]  the same, from a file (the file's `*=` gives the address if a is omitted)",
         "    t <a> <b> <dst>  move/copy a..b to dst (overlap-safe)",
         "    c <a> <b> <dst>  compare a..b vs dst (list diffs)",
         "    h <a> <b> <d..>  hunt for a byte pattern (xx = wildcard)",
@@ -592,6 +594,59 @@ pub fn assemble_at(
     Ok(format!("{:04x}  {:<11}  {}", addr, bytes_col, back))
 }
 
+/// Spec 809 §5 — assemble a whole block at `origin` and write it (`asm` / `asm-file`).
+/// Nothing is written unless the WHOLE block assembles: a patch half in memory is worse
+/// than none. The answer names the range, the size and the labels, so the next command
+/// can refer to what was just defined.
+pub fn assemble_block_at(
+    mon: &mut MonitorSession,
+    host: &mut dyn MonitorHost,
+    origin: u16,
+    source: &str,
+    who: &str,
+) -> Result<String, String> {
+    let b = assembler::assemble_block(source, origin);
+    if !b.errors.is_empty() {
+        let lines: Vec<String> = b.errors.iter().map(|(n, e)| format!("{who}: line {n}: {e}")).collect();
+        return Err(format!("{}\n{who}: nothing written", lines.join("\n")));
+    }
+    if b.bytes.is_empty() {
+        return Ok(format!("{who}: the block assembled to no bytes — nothing written"));
+    }
+    host.machine().poke(b.origin, &b.bytes);
+    host.on_machine_write("ram");
+    mon.state.disasm_cursor = Some(b.origin);
+    let last = b.origin.wrapping_add(b.bytes.len() as u16 - 1);
+    let mut out = format!("{who}: ${:04x}-${:04x}  {} bytes", b.origin, last, b.bytes.len());
+    if !b.labels.is_empty() {
+        let l: Vec<String> = b.labels.iter().map(|(k, v)| format!("{k}=${v:04x}")).collect();
+        out.push_str(&format!("\n{who}: labels  {}", l.join("  ")));
+    }
+    Ok(out)
+}
+
+/// Spec 809 §5 — where an `asm-file` block goes: the address given, or — with none — the
+/// file's own `*=`/`.org`, which the assembler then applies. Reading the file is the
+/// HOST's (a file verb resolves paths against the host's cwd, like `bload`); this is the
+/// part every host shares.
+pub fn asm_file_origin(source: &str, path: &str, origin_tok: Option<&String>) -> Result<u16, String> {
+    if let Some(t) = origin_tok {
+        return parse_hex(t)
+            .filter(|v| *v <= 0xffff)
+            .map(|v| v as u16)
+            .ok_or_else(|| "asm-file: usage: asm-file <path> [addr]".to_string());
+    }
+    let has_org = source.to_ascii_lowercase().lines().any(|l| {
+        let t = l.split(';').next().unwrap_or("").trim();
+        t.starts_with("*=") || t.starts_with("* =") || t.starts_with(".org")
+    });
+    if has_org {
+        Ok(0)
+    } else {
+        Err(format!("asm-file: no address — give one (`asm-file {path} c000`) or start the file with `*= $c000`"))
+    }
+}
+
 /// Parse a hex token (optional leading `$`).
 pub fn parse_hex(tok: &str) -> Option<u32> {
     let t = tok.strip_prefix('$').unwrap_or(tok);
@@ -766,6 +821,24 @@ pub fn uci_report(m: &trx64_core::Machine) -> String {
 ///
 /// It is named for what it measures. A host verb that changes a great deal of the
 /// HOST's world and none of the C64 declares `Observes`, and that is exactly true.
+/// [`classify`] for a session that may be in a MODE. The verb alone cannot say what a
+/// line does once the monitor is modal: in `a` mode `lda #1` is written to memory, and in
+/// an `asm` block the terminator writes the whole block, yet neither starts with a
+/// mutating verb. Today the verb that ENTERS the mode (`a`, `asm`) already cuts the
+/// future (Spec 808), and nothing can move the transport while a mode is open, so the
+/// verb-only answer did no harm — this is here so each line is classified for what it
+/// does, not for what the line before it did. The host asks this one.
+pub fn classify_in(state: &crate::session::MonitorState, command: &str) -> MachineEffect {
+    let cmd = command.trim();
+    if let Some(block) = &state.asm_block {
+        return if cmd.eq_ignore_ascii_case(&block.end) { MachineEffect::Mutates } else { MachineEffect::Observes };
+    }
+    if state.asm_cursor.is_some() && !cmd.is_empty() {
+        return MachineEffect::Mutates;
+    }
+    classify(command)
+}
+
 pub fn classify(command: &str) -> MachineEffect {
     let verb = command
         .trim()
@@ -779,8 +852,8 @@ pub fn classify(command: &str) -> MachineEffect {
     if verb == "reset" {
         return MachineEffect::Replaces;
     }
-    const MUTATORS: [&str; 11] = [
-        "wr", "a", "f", "c", "t", "r", "g", "x", "step", "n", "next",
+    const MUTATORS: [&str; 13] = [
+        "wr", "a", "asm", "asm-file", "f", "c", "t", "r", "g", "x", "step", "n", "next",
     ];
     // Spec 876 — `pot <port> …` changes what the C64 will read; bare `pot` only reports.
     if verb == "pot" && command.split_whitespace().nth(1).is_some() {
@@ -799,7 +872,8 @@ pub fn classify(command: &str) -> MachineEffect {
 /// The verbs this crate owns today. A line whose verb is not here falls through to the
 /// host's own dispatch — the honest shape while the move is half done, and the shape
 /// §6 keeps afterwards for a host's own verbs.
-const OWNED: [&str; 43] = [
+const OWNED: [&str; 44] = [
+    "asm",
     "r",
     "registers",
     "wr",
@@ -866,6 +940,19 @@ pub fn try_exec(
     // the prompt (friendlier than VICE, which silently drops out — intentional). This
     // runs BEFORE the empty-line no-op below because in mode an empty line is the
     // explicit exit, not a no-op.
+    // ---- Spec 809 §5 — `asm` block mode: collect until the terminator, then assemble the
+    // whole block. Runs first: inside a block every line is source, including one that
+    // happens to look like a verb.
+    if let Some(block) = mon.state.asm_block.as_mut() {
+        if cmd.eq_ignore_ascii_case(&block.end) {
+            let block = mon.state.asm_block.take().unwrap();
+            return Some(assemble_block_at(mon, host, block.origin, &block.lines.join("\n"), "asm"));
+        }
+        block.lines.push(command.to_string());
+        mon.state.pending_prompt = Some(format!("asm {}> ", block.end));
+        return Some(Ok(String::new()));
+    }
+
     if let Some(at) = mon.state.asm_cursor {
         if cmd.is_empty() {
             mon.state.asm_cursor = None;
@@ -1393,6 +1480,29 @@ fn exec_owned(
             assemble_at(mon, host, addr, &instr)
         }
 
+        // ---- Spec 809 §5 — asm <addr> [<<TAG]: a block, two passes. ----------------
+        // Typed at a prompt it enters block mode; sent as ONE command with newlines
+        // (monitor/exec over RPC) the body is the rest of the command.
+        "asm" => {
+            let mut body = cmd.lines();
+            let head: Vec<&str> = body.next().unwrap_or("").split_whitespace().collect();
+            let usage = "asm: usage: asm <addr> [<<TAG]  — then the source, then `end` (or TAG)";
+            let origin = parse_addr(head.get(1).map(|s| s.to_string()).as_ref()).ok_or(usage)?;
+            let end = head
+                .get(2)
+                .and_then(|t| t.strip_prefix("<<"))
+                .filter(|t| !t.is_empty())
+                .unwrap_or("end")
+                .to_string();
+            let rest: Vec<&str> = body.collect();
+            if rest.is_empty() {
+                mon.state.pending_prompt = Some(format!("asm {end}> "));
+                mon.state.asm_block = Some(crate::session::AsmBlockMode { origin, end, lines: vec![] });
+                return Ok(String::new());
+            }
+            let src: Vec<&str> = rest.into_iter().take_while(|l| !l.trim().eq_ignore_ascii_case(&end)).collect();
+            assemble_block_at(mon, host, origin, &src.join("\n"), "asm")
+        }
         // ---- t <start> <end> <dest> — move/copy (overlap-safe). --------------
         "t" | "move" => {
             let start = parse_addr(toks.get(1)).ok_or("t: usage: t <start> <end> <dest>")?;

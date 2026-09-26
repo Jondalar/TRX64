@@ -3036,7 +3036,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
         };
         trx64_monitor::MonitorHost::on_effect(
             &mut host,
-            trx64_monitor::verbs::classify(command),
+            trx64_monitor::verbs::classify_in(&mon.state, command),
         );
         if let Some(r) = trx64_monitor::verbs::try_exec(mon, &mut host, command) {
             return r;
@@ -5183,6 +5183,18 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             }
         }
         // bload "<file>" <addr> — raw binary load (no header).
+        // Spec 809 §5 — the file half of `asm`: read here, where every file verb resolves
+        // its path (fs cwd, else the project), then the library's block assembler writes it.
+        "asm-file" => {
+            let path = toks.get(1).ok_or("asm-file: usage: asm-file <path> [addr]")?.clone();
+            let full = resolve_fs_path_with_state(st, &path);
+            let bytes = std::fs::read(&full).map_err(|e| format!("asm-file: {full}: {e}"))?;
+            let source = String::from_utf8(bytes).map_err(|_| format!("asm-file: {path} is not text"))?;
+            let origin = trx64_monitor::verbs::asm_file_origin(&source, &path, toks.get(2))?;
+            let State { session, mon, transport, checkpoint_ring, audio_epoch, autocapture_frames_since, .. } = &mut *st;
+            let mut host = DaemonHost { session, transport, checkpoint_ring, audio_epoch, autocapture_frames_since };
+            trx64_monitor::verbs::assemble_block_at(mon, &mut host, origin, &source, "asm-file")
+        }
         "bload" => {
             let (file, rest) = parse_file_cmd();
             let addr = parse_addr(rest.first());
@@ -11958,6 +11970,31 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             }
         }
 
+        "asm/block" => {
+            // Spec 809 §5b — source in, bytes out, and NOTHING written: the answer is a
+            // patch, shaped exactly as `sandbox/run` takes one, so a caller assembles and
+            // fans out without the live machine ever seeing the bytes. The monitor's
+            // `asm` verb is the one that writes.
+            let Some(source) = req.params.get("source").and_then(|v| v.as_str()) else {
+                return Response::err(id, -32602, "asm/block: source required");
+            };
+            let origin = req.params.get("origin").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+            let b = trx64_monitor::assembler::assemble_block(source, origin);
+            let errors: Vec<Value> = b.errors.iter().map(|(n, e)| json!({ "line": n, "message": e })).collect();
+            let message = if errors.is_empty() {
+                format!("ASM ${:04x}  {} bytes  {} labels", b.origin, b.bytes.len(), b.labels.len())
+            } else {
+                format!("ASM {} error(s) — first: line {}: {}", errors.len(), b.errors[0].0, b.errors[0].1)
+            };
+            Response::ok(id, json!({
+                "origin": b.origin,
+                "bytes": b.bytes,
+                "labels": b.labels,
+                "errors": errors,
+                "patch": if b.errors.is_empty() { json!({ "addr": b.origin, "bytes": b.bytes }) } else { Value::Null },
+                "message": message,
+            }))
+        }
         "mark/set" => {
             let Some(name) = req.params.get("name").and_then(|v| v.as_str()) else {
                 return Response::err(id, -32602, "mark/set: name required");
@@ -21259,6 +21296,74 @@ mod batch1_tests {
         assert!(r.get("media").is_none(), "{r}");
     }
 
+    /// Spec 809 §5 — `asm` typed at the prompt: lines are collected, then assembled as ONE
+    /// block, so a backward label works; nothing is written until the terminator.
+    #[test]
+    fn asm_block_mode_collects_then_assembles_with_labels() {
+        let st = make_state();
+        let ram = |st: &SharedState, a: u16, n: usize| -> Vec<u8> {
+            let g = st.lock().unwrap();
+            (0..n).map(|i| g.session.machine.ram[a as usize + i]).collect()
+        };
+        mon(&st, "asm c000").expect("enter");
+        mon(&st, "loop: dex").expect("line");
+        mon(&st, "      bne loop").expect("line");
+        assert_eq!(ram(&st, 0xc000, 3), vec![0, 0, 0], "nothing is written before the terminator");
+        let out = mon(&st, "end").expect("assemble");
+        assert!(out.contains("$c000-$c002") && out.contains("loop=$c000"), "{out}");
+        assert_eq!(ram(&st, 0xc000, 3), vec![0xca, 0xd0, 0xfd]);
+
+        // One command with newlines — how monitor/exec sends it — and a custom terminator.
+        mon(&st, "asm c100 <<X\n lda #<data\n sta $fb\ndata: rts\nX").expect("one-shot");
+        assert_eq!(ram(&st, 0xc100, 5), vec![0xa9, 0x04, 0x85, 0xfb, 0x60]);
+
+        // A block with an error writes NOTHING, not the lines before the error.
+        let err = mon(&st, "asm c200\n lda #1\n lda nowhere\nend").unwrap_err();
+        assert!(err.contains("line 2") && err.contains("nothing written"), "{err}");
+        assert_eq!(ram(&st, 0xc200, 2), vec![0, 0]);
+
+        let help = mon(&st, "help").expect("help");
+        assert!(help.contains("asm <a>") && help.contains("asm-file <path>"), "the verbs are in the help");
+    }
+
+    #[test]
+    fn asm_file_takes_its_address_from_the_file() {
+        let dir = std::env::temp_dir().join(format!("trx64_809_asm_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("patch.s");
+        std::fs::write(&path, "*= $c300 ; the patch\n inc $d020\n rts\n").unwrap();
+        let st = make_state();
+        mon(&st, &format!("asm-file {}", path.display())).expect("asm-file");
+        let g = st.lock().unwrap();
+        assert_eq!(&g.session.machine.ram[0xc300..0xc304], &[0xee, 0x20, 0xd0, 0x60]);
+        drop(g);
+        std::fs::write(&path, " rts\n").unwrap();
+        let e = mon(&st, &format!("asm-file {}", path.display())).unwrap_err();
+        assert!(e.contains("no address"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `asm/block` answers bytes and a patch and writes nothing — and the patch is exactly
+    /// what `sandbox/run` takes, so source goes to N isolated machines without the live
+    /// one ever holding it.
+    #[test]
+    fn asm_block_rpc_writes_nothing_and_its_patch_feeds_a_sandbox() {
+        let st = make_state();
+        fill_anchors(&st, 3);
+        let before = st.lock().unwrap().session.machine.ram[0xc400];
+        let a = call(&st, "asm/block", json!({ "origin": 0xc400, "source": " lda #$2a\n sta $0400\n rts" }));
+        assert_eq!(a["bytes"], json!([0xa9, 0x2a, 0x8d, 0x00, 0x04, 0x60]), "{a}");
+        assert_eq!(st.lock().unwrap().session.machine.ram[0xc400], before, "asm/block writes nothing");
+        let mut patch = a["patch"].clone();
+        patch["read"] = json!(true);
+        let r = call(&st, "sandbox/run", json!({ "patches": [patch], "cycles": 0u64 }));
+        assert_eq!(r["reads"]["$c400"], json!(0xa9), "{r}");
+
+        let bad = call(&st, "asm/block", json!({ "origin": 0xc400, "source": " lda nowhere" }));
+        assert_eq!(bad["patch"], Value::Null);
+        assert_eq!(bad["errors"][0]["line"], json!(1), "{bad}");
+    }
+
     /// G2 — parity. Every transport action reachable as a monitor verb is reachable over
     /// RPC with the same status object back, so the C64RE ribbon renders from data
     /// instead of parsing the terminal line. This is the gate that keeps the two
@@ -22265,12 +22370,26 @@ mod batch1_tests {
             g.force_present_frame = false;
         }
         let hub = crate::streaming::StreamHub::new(Arc::clone(&st));
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let _sub = hub.subscribe(tx);
-        assert!(
-            st.lock().unwrap().force_present_frame,
-            "subscribing must request one present — a paused machine sends no frame on its own"
-        );
+        // Assert the OUTCOME the name promises — a frame reaches the client — not the
+        // request flag. `subscribe` sets the flag and starts the stream thread, which
+        // CONSUMES it the moment it presents; reading the flag afterwards raced that
+        // thread, and under a full workspace run it lost (flag already cleared, frame
+        // already sent) and went red on a machine that was doing the right thing.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut got_frame = false;
+        while std::time::Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(tokio_tungstenite::tungstenite::Message::Binary(_)) => {
+                    got_frame = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+        assert!(got_frame, "a client arriving while the machine is paused receives a frame — it sends none on its own");
     }
 
     #[test]
