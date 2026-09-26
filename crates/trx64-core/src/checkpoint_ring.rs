@@ -618,7 +618,8 @@ impl RuntimeCheckpointRing {
 
     /// runtime-checkpoint-ring.ts:301-306 — pin (exempt from eviction).
     pub fn pin(&mut self, id: &str) -> Option<RuntimeCheckpointRef> {
-        let e = self.entries.iter_mut().find(|x| x.r.id == id)?;
+        let i = self.index_of(id)?;
+        let e = &mut self.entries[i];
         e.r.pinned = true;
         Some(e.r.clone())
     }
@@ -655,7 +656,7 @@ impl RuntimeCheckpointRing {
     /// tree for `id` (for the caller to `restore_runtime_checkpoint`), with the
     /// pooled media slots REHYDRATED from the disk pool. None if `id` is unknown.
     pub fn restore_snapshot(&self, id: &str) -> Option<Value> {
-        let e = self.entries.iter().find(|x| x.r.id == id)?;
+        let e = &self.entries[self.index_of(id)?];
         // Spec 807 §4.2 — rebuild the tree from the stored bytes. This is the cold
         // path: capture runs 50×/s at cadence 1, restore runs when a human clicks.
         let mut payload: Value = serde_json::from_slice(&e.payload).ok()?;
@@ -676,7 +677,7 @@ impl RuntimeCheckpointRing {
 
     /// runtime-checkpoint-ring.ts:356-359 — payload-free ref for `id`.
     pub fn get(&self, id: &str) -> Option<RuntimeCheckpointRef> {
-        self.entries.iter().find(|x| x.r.id == id).map(|e| e.r.clone())
+        self.index_of(id).map(|i| self.entries[i].r.clone())
     }
 
     /// runtime-checkpoint-ring.ts:362-364 — payload-free refs, oldest first.
@@ -686,7 +687,20 @@ impl RuntimeCheckpointRing {
 
     /// runtime-checkpoint-ring.ts:366-368 — has(id).
     pub fn has(&self, id: &str) -> bool {
-        self.entries.iter().any(|x| x.r.id == id)
+        self.index_of(id).is_some()
+    }
+
+    /// Spec 809 G5 — a mark name IS an anchor id. Resolved here, at the one place every
+    /// door that restores, pins or looks up an anchor passes through, because resolving it
+    /// per door held in two doors and nowhere else: `component_diff` refused `alpha` while
+    /// `overlay_run` took it. The id wins over a label, so a name can never shadow an
+    /// anchor. `unpin` deliberately does not take a name — unpinning a mark by name would
+    /// release the one pin G1 depends on; a mark is released with `drop_mark`.
+    fn index_of(&self, id_or_name: &str) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|x| x.r.id == id_or_name)
+            .or_else(|| self.entries.iter().position(|x| x.r.label.as_deref() == Some(id_or_name)))
     }
 
     /// runtime-checkpoint-ring.ts:370-376 — clear (reset entries/free-slots/pool).

@@ -505,6 +505,14 @@ pub struct State {
     /// overlay patch-set + cached no-patch baseline result.
     candidates: std::collections::HashMap<String, candidate::Candidate>,
     candidate_seq: u64,
+    /// Spec 809 §9 — sandbox run ids are numbered daemon-wide, so two calls never hand
+    /// back the same `r-0001` for different runs.
+    sandbox_seq: u64,
+    /// Spec 809 §9 — the end states of the most recent sandbox runs, captured from their
+    /// scratch clones, so `runtime/component_diff` can compare two of them. Bounded: a
+    /// sandbox end is a full checkpoint, and nothing here is evidence anyone promised to
+    /// keep. The oldest falls out first.
+    sandbox_ends: std::collections::VecDeque<(String, Value)>,
     /// Spec 769.5a — the SEPARATE per-checkpoint thumbnail store (= the c64re
     /// `RuntimeController.checkpointThumbs` map, runtime-controller.ts:181). Keyed by
     /// checkpoint id, capped at [`MAX_THUMBS`]. Decoupled from the ring's
@@ -685,6 +693,17 @@ fn full_machine_gate(session: &Session) -> bool {
             || !session.injected
             || session.io_injected
             || vic_directed)
+}
+
+/// `full_machine_gate` for a machine that is not the session's — a sandbox clone restored
+/// from an anchor may carry different media than the live machine does right now, so the
+/// cart/disk half of the gate is read from the CLONE, and only the session-level latches
+/// (`injected`, `io_injected`) from the session, passed in because the clone is
+/// restored after the state lock is released. A sandbox run has no trace, so it is never
+/// `vic_directed`.
+fn full_machine_gate_for(machine: &trx64_core::Machine, injected: bool, io_injected: bool) -> bool {
+    machine.full_assembled
+        && (machine.cartridge.is_some() || machine.drive8.disk.is_some() || !injected || io_injected)
 }
 
 /// A passive observer that records whether a hardware IRQ/NMI was DISPATCHED during
@@ -1650,14 +1669,8 @@ fn run_cycle_budget(session: &mut Session, budget: u64) {
         )
     }) else {
         // No active trace: run untraced on the SAME path a traced run would pick.
-        session.machine.arm_head_trace(false); // Spec 784 — never accumulate untraced.
-        session.machine.arm_cart_reads(false); // Spec 785 C1 — same for the cart lane.
-        let mut obs = NullSink;
-        if full_machine {
-            session.machine.run_for_full(budget, &mut obs, |_, _, _, _, _, _, _| {});
-        } else {
-            session.machine.run_for(budget, &mut obs);
-        }
+        // Spec 784/785 — the helper disarms the head trace and the cart lane first.
+        run_machine_budget(&mut session.machine, budget, full_machine);
         return;
     };
     // First run after start: write the file header into the buffer.
@@ -8503,50 +8516,12 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             st.ctrl_frame += 1;
             st.ctrl_stop = None;
 
-            // Apply the RAM patches (the overlay). ws-server.ts:957-965 —
-            // s.c64Bus.ram[(addr + i) & 0xffff] = bytes[i] & 0xff.
-            let mut applied: Vec<Value> = vec![];
-            for p in &patches {
-                // Spec 795 — `space` selects RAM (default) or a cart bank (roml/romh).
-                let space = p.get("space").and_then(|v| v.as_str()).unwrap_or("ram");
-                let addr = (p.get("addr").and_then(|v| v.as_u64()).unwrap_or(0) & 0xffff) as usize;
-                let bytes: Vec<u8> = p
-                    .get("bytes")
-                    .and_then(|v| v.as_array())
-                    .map(|a| a.iter().map(|b| (b.as_u64().unwrap_or(0) & 0xff) as u8).collect())
-                    .unwrap_or_default();
-                if space == "ram" {
-                    for (i, &b) in bytes.iter().enumerate() {
-                        st.session.machine.ram[(addr + i) & 0xffff] = b;
-                    }
-                    applied.push(json!({ "space": "ram", "addr": addr as u64, "len": bytes.len() as u64 }));
-                } else {
-                    // Cart bank overlay (roml/romh + explicit bank). Ephemeral: rolled
-                    // back on the next anchor restore (792 cart restore reloads flash).
-                    let bank = p.get("bank").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
-                    match st.session.machine.cartridge.as_mut() {
-                        Some(cart) => {
-                            for (i, &b) in bytes.iter().enumerate() {
-                                if let Err(e) =
-                                    cart.overlay_bank_write(space, bank, ((addr + i) & 0xffff) as u16, b)
-                                {
-                                    return Response::err(id, -32001, format!("runtime/overlay_run: {e}"));
-                                }
-                            }
-                            applied.push(json!({
-                                "space": space, "bank": bank, "addr": addr as u64, "len": bytes.len() as u64
-                            }));
-                        }
-                        None => {
-                            return Response::err(
-                                id,
-                                -32001,
-                                "runtime/overlay_run: cart overlay requested but no cartridge attached",
-                            )
-                        }
-                    }
-                }
-            }
+            // Apply the patches (the overlay). ws-server.ts:957-965. Spec 795 — `space`
+            // selects RAM (default) or a cart bank; the same helper serves the sandbox.
+            let applied = match apply_overlay_patches(&mut st.session.machine, &patches, "runtime/overlay_run") {
+                Ok(a) => a,
+                Err(e) => return Response::err(id, -32001, e),
+            };
 
             // Run forward (bounded; optional breakpoint at until_pc). ws-server.ts:967-975.
             let mut hit_pc: Option<u16> = None;
@@ -8591,45 +8566,10 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 }
             }
 
-            // Observe: read-back of any patch addr flagged `read` (ws-server.ts:978-980).
-            let mut reads = serde_json::Map::new();
-            for p in &patches {
-                if p.get("read").and_then(|v| v.as_bool()).unwrap_or(false) {
-                    let space = p.get("space").and_then(|v| v.as_str()).unwrap_or("ram");
-                    let a = (p.get("addr").and_then(|v| v.as_u64()).unwrap_or(0) & 0xffff) as usize;
-                    if space == "ram" {
-                        let key = format!("${:04x}", a);
-                        reads.insert(key, json!(st.session.machine.ram[a] as u64));
-                    } else {
-                        // Cart bank read-back (proves the overlay / bank isolation).
-                        let bank = p.get("bank").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
-                        let key = format!("{space}:{bank}:${:04x}", a);
-                        let val = st
-                            .session
-                            .machine
-                            .cartridge
-                            .as_ref()
-                            .map(|c| c.overlay_bank_read(space, bank, a as u16));
-                        match val {
-                            Some(Ok(v)) => reads.insert(key, json!(v as u64)),
-                            Some(Err(e)) => reads.insert(key, json!(format!("err: {e}"))),
-                            None => reads.insert(key, json!("err: no cartridge")),
-                        };
-                    }
-                }
-            }
-
-            // Registers (ws-server.ts:982 — cpu.cycles == machine clock).
-            let c = &st.session.machine.cpu6510;
-            let registers = json!({
-                "pc": c.reg_pc as u64,
-                "a": c.reg_a as u64,
-                "x": c.reg_x as u64,
-                "y": c.reg_y as u64,
-                "sp": c.reg_sp as u64,
-                "flags": c.flags() as u64,
-                "cycles": st.session.machine.clk,
-            });
+            // Observe: read-back of any patch addr flagged `read` (ws-server.ts:978-980),
+            // and the registers (ws-server.ts:982 — cpu.cycles == machine clock).
+            let reads = read_overlay_patches(&st.session.machine, &patches);
+            let registers = machine_registers(&st.session.machine);
 
             Response::ok(id, json!({
                 "anchorId": chosen,
@@ -9058,23 +8998,23 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 req.params.get("exclude").unwrap_or(&Value::Null),
             );
             let st = state.lock().unwrap();
-            let snap_a = match st.checkpoint_ring.restore_snapshot(&id_a) {
+            let snap_a = match snapshot_by_id(&st, &id_a) {
                 Some(v) => v,
                 None => {
                     return Response::err(
                         id,
                         -32001,
-                        format!("runtime/component_diff: unknown checkpoint id {id_a}"),
+                        format!("runtime/component_diff: no anchor, mark or sandbox end named {id_a}"),
                     )
                 }
             };
-            let snap_b = match st.checkpoint_ring.restore_snapshot(&id_b) {
+            let snap_b = match snapshot_by_id(&st, &id_b) {
                 Some(v) => v,
                 None => {
                     return Response::err(
                         id,
                         -32001,
-                        format!("runtime/component_diff: unknown checkpoint id {id_b}"),
+                        format!("runtime/component_diff: no anchor, mark or sandbox end named {id_b}"),
                     )
                 }
             };
@@ -11875,12 +11815,16 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
         // The reply carries an id, where it started, what it cost and where its end state
         // is. No name, no verdict, no comparison.
         "sandbox/run" | "sandbox/runMany" => {
-            let from = req
-                .params
-                .get("from")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            // Spec 809 §4/§9 — restore a state into N isolated machines, put bytes in, run
+            // them, hand back the end states. The LIVE machine is not one of them.
+            //
+            // It used to be: this door dispatched `runtime/overlay_run`, which restores into
+            // `st.session` and pauses it, so every "sandbox" run rewound, patched and
+            // stopped the machine the human was watching, one after another. Its comment
+            // said the opposite, no test asked, and the board believed the comment. Now the
+            // shared state is touched exactly twice — to take the anchor's snapshot and a
+            // clone of the machine, and to file the results — and never for the run itself.
+            let from = req.params.get("from").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let runs: Vec<Value> = if req.method == "sandbox/runMany" {
                 req.params.get("runs").and_then(|v| v.as_array()).cloned().unwrap_or_default()
             } else {
@@ -11892,45 +11836,97 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             if runs.is_empty() {
                 return Response::err(id, -32602, "sandbox: no runs given");
             }
-            let mut out: Vec<Value> = Vec::with_capacity(runs.len());
-            for (i, r) in runs.iter().enumerate() {
-                let patches = r.get("patches").cloned().unwrap_or(json!([]));
-                let cycles = r.get("cycles").and_then(|v| v.as_u64()).unwrap_or(0);
-                // The live machine is NEVER used for a sandbox run (doctrine rule 2, and
-                // the only way a fan-out can be parallel at all). `runtime/overlay_run`
-                // already owns restore → patch → run → observe and is repeatable by
-                // construction; the fan-out is the composition it lacked.
-                let inner = Request {
-                    jsonrpc: req.jsonrpc.clone(),
-                    id: req.id.clone(),
-                    method: "runtime/overlay_run".into(),
-                    params: json!({
-                        "anchor_id": if from.is_empty() { Value::Null } else { json!(from) },
-                        "patches": patches,
-                        "run_cycles": cycles,
-                    }),
+
+            let (mut base, snapshot, anchor_id, first_seq, injected, io_injected) = {
+                let mut st = state.lock().unwrap();
+                let anchor = if from.is_empty() {
+                    match st.checkpoint_ring.list().last() {
+                        Some(r) => r.id.clone(),
+                        None => return Response::err(id, -32001, "sandbox: no anchors to start from"),
+                    }
+                } else {
+                    // A mark name or an anchor id (G5 — resolved by the ring).
+                    match st.checkpoint_ring.get(&from) {
+                        Some(r) => r.id.clone(),
+                        None => {
+                            return Response::err(id, -32001, format!("sandbox: no mark or anchor named `{from}`"))
+                        }
+                    }
                 };
-                let rr = dispatch(inner, state);
-                match rr.result {
-                    Some(v) => out.push(json!({
-                        "id": format!("r-{:04}", i + 1),
+                let Some(snap) = st.checkpoint_ring.restore_snapshot(&anchor) else {
+                    return Response::err(id, -32001, format!("sandbox: anchor {anchor} has no snapshot"));
+                };
+                let seq = st.sandbox_seq;
+                st.sandbox_seq += runs.len() as u64;
+                (st.session.machine.clone(), snap, anchor, seq, st.session.injected, st.session.io_injected)
+            };
+            if let Err(e) = restore_checkpoint_into(&mut base, &snapshot) {
+                return Response::err(id, -32001, format!("sandbox: {e}"));
+            }
+            let full = full_machine_gate_for(&base, injected, io_injected);
+            let run_ids: Vec<String> = (0..runs.len()).map(|i| format!("r-{:04}", first_seq + i as u64 + 1)).collect();
+
+            // Fan-out: one clone per run, as many at once as the host has cores.
+            let width = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).max(1);
+            let mut done: Vec<Option<Result<(Value, Value), String>>> = (0..runs.len()).map(|_| None).collect();
+            let jobs: Vec<usize> = (0..runs.len()).collect();
+            for chunk in jobs.chunks(width) {
+                std::thread::scope(|sc| {
+                    let handles: Vec<_> = chunk
+                        .iter()
+                        .map(|&i| {
+                            let mut m = base.clone();
+                            let r = runs[i].clone();
+                            (i, sc.spawn(move || sandbox_one(&mut m, &r, full)))
+                        })
+                        .collect();
+                    for (i, h) in handles {
+                        done[i] = Some(h.join().unwrap_or_else(|_| Err("sandbox: the run panicked".into())));
+                    }
+                });
+            }
+
+            let mut st = state.lock().unwrap();
+            let mut out: Vec<Value> = Vec::with_capacity(runs.len());
+            for (i, res) in done.into_iter().enumerate() {
+                let rid = &run_ids[i];
+                let origin = if from.is_empty() { "head" } else { from.as_str() };
+                match res.unwrap_or_else(|| Err("sandbox: the run never started".into())) {
+                    Ok((summary, end)) => {
+                        let end_id = format!("sb-{rid}");
+                        st.sandbox_ends.push_back((end_id.clone(), end));
+                        while st.sandbox_ends.len() > SANDBOX_ENDS_KEPT {
+                            st.sandbox_ends.pop_front();
+                        }
+                        let cycles = summary["cycles"].clone();
+                        let digest = summary["ramDigest"].as_str().unwrap_or("").to_string();
+                        let mut run = json!({
+                            "id": rid,
+                            "from": from,
+                            "anchorId": anchor_id,
+                            "instance": i + 1,
+                            "state": "done",
+                            "endStateId": end_id,
+                            "message": format!("run {rid} from {origin} \u{2014} done, {cycles} cycles, ram {}", &digest[..8.min(digest.len())]),
+                        });
+                        if let (Some(o), Some(sum)) = (run.as_object_mut(), summary.as_object()) {
+                            for (k, v) in sum {
+                                o.insert(k.clone(), v.clone());
+                            }
+                        }
+                        out.push(run);
+                    }
+                    Err(e) => out.push(json!({
+                        "id": rid,
                         "from": from,
-                        "instance": i + 1,
-                        "state": "done",
-                        "cycles": v.get("ranCycles").cloned().unwrap_or(json!(0)),
-                        "endAnchorId": v.get("anchorId").cloned().unwrap_or(Value::Null),
-                        "detail": v,
-                        "message": format!("run r-{:04} from {} \u{2014} done", i + 1, if from.is_empty() { "head" } else { &from }),
-                    })),
-                    None => out.push(json!({
-                        "id": format!("r-{:04}", i + 1),
-                        "from": from,
+                        "anchorId": anchor_id,
                         "instance": i + 1,
                         "state": "failed",
-                        "message": rr.error.map(|e| e.message).unwrap_or_else(|| "run failed".into()),
+                        "message": e,
                     })),
                 }
             }
+            drop(st);
             if req.method == "sandbox/run" {
                 Response::ok(id, out.into_iter().next().unwrap())
             } else {
@@ -15120,8 +15116,15 @@ fn now_ms() -> u64 {
 /// restore can re-attach it (matching snapshot/dump). Mirrors c64re `controller.captureCheckpoint`
 /// → `ring.capture(kernel.snapshot(), frame, cycles)`.
 fn capture_live_checkpoint(session: &mut Session) -> Value {
+    capture_machine_checkpoint(&mut session.machine)
+}
+
+/// Capture a ring-shaped checkpoint of ANY machine — the live one, or a sandbox's scratch
+/// clone whose end state has to be diffable against another (Spec 809 §9). Only the
+/// machine is read; nothing session-level rides a checkpoint.
+fn capture_machine_checkpoint(machine: &mut trx64_core::Machine) -> Value {
     // Disk path/format for the checkpoint `media` metadata (= snapshot/dump).
-    let (disk_path, disk_format) = match session.machine.drive8.get_attached_disk() {
+    let (disk_path, disk_format) = match machine.drive8.get_attached_disk() {
         Some(d) => (
             d.backing_path.clone().unwrap_or_default(),
             d.kind.name()
@@ -15131,9 +15134,9 @@ fn capture_live_checkpoint(session: &mut Session) -> Value {
     };
     // Drive blobs (drive1541 core + GCRIMAGE0 overlay), captured from the live drive.
     let drive1541_blob =
-        trx64_core::drive_snapshot::capture_drive1541(&mut session.machine.drive8);
+        trx64_core::drive_snapshot::capture_drive1541(&mut machine.drive8);
     let drive_disk_blob =
-        trx64_core::drive_snapshot::capture_drive_disk_image(&session.machine.drive8);
+        trx64_core::drive_snapshot::capture_drive_disk_image(&machine.drive8);
     // The attached disk rides the checkpoint tree so a ring restore re-establishes
     // the media without a sidecar file (snapshot/dump embeds it in the .c64re
     // mediaPayloads; the ring's pool dedups it across entries). It rides AS WRITTEN —
@@ -15141,12 +15144,12 @@ fn capture_live_checkpoint(session: &mut Session) -> Value {
     // in (`disk_as_written`, built on a copy: the live drive's dirty track stays
     // dirty). A restore then mounts a complete image, and a persist after it writes
     // the complete image, whatever was dirty at the capture.
-    let attached_disk_bytes = session.machine.drive8.disk_as_written().map(|d| d.bytes);
+    let attached_disk_bytes = machine.drive8.disk_as_written().map(|d| d.bytes);
     // formats-state-2 — full ring anchor carries the cart bytes + writable flash too
     // (c64re's non-omitMedia checkpoint, headless-machine-kernel.ts:988-989).
-    let (cart_bytes, cart_flash) = capture_cart_blobs(&mut session.machine);
+    let (cart_bytes, cart_flash) = capture_cart_blobs(machine);
     let mut cp = trx64_core::c64re_snapshot::capture_runtime_checkpoint(
-        &session.machine,
+        machine,
         &disk_path,
         &disk_format,
         Some(&drive1541_blob),
@@ -15658,6 +15661,144 @@ pub(crate) fn transport_truncate_on_intervention(st: &mut State) {
 /// Restore the live machine from a ring checkpoint Value (re-attaching the embedded
 /// drive8 disk first, then `restore_runtime_checkpoint`). Mirrors snapshot/undump.
 /// Returns Ok(()) on success. Leaves the session paused (a restore is a pause point).
+/// A checkpoint snapshot by anchor id, mark name (both via the ring) or sandbox end id
+/// (`sb-r-0001`). Spec 809 §9: an end state that cannot be compared is not a result.
+fn snapshot_by_id(st: &State, id: &str) -> Option<Value> {
+    st.checkpoint_ring
+        .restore_snapshot(id)
+        .or_else(|| st.sandbox_ends.iter().find(|(k, _)| k == id).map(|(_, v)| v.clone()))
+}
+
+/// Spec 809 §9 — how many sandbox end states the daemon keeps for `component_diff`.
+const SANDBOX_ENDS_KEPT: usize = 32;
+
+/// One sandbox run on a scratch clone: patch, run the budget, observe, capture the end.
+/// Takes no lock and no session — it cannot touch the live machine, which is the point.
+fn sandbox_one(machine: &mut trx64_core::Machine, run: &Value, full_machine: bool) -> Result<(Value, Value), String> {
+    let patches: Vec<Value> = run.get("patches").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let cycles = run.get("cycles").and_then(|v| v.as_u64()).unwrap_or(0);
+    let applied = apply_overlay_patches(machine, &patches, "sandbox/run")?;
+    if cycles > 0 {
+        run_machine_budget(machine, cycles, full_machine);
+    }
+    let summary = json!({
+        "cycles": cycles,
+        "applied": applied,
+        "reads": Value::Object(read_overlay_patches(machine, &patches)),
+        "registers": machine_registers(machine),
+        "ramDigest": ram_digest(machine),
+    });
+    let end = capture_machine_checkpoint(machine);
+    Ok((summary, end))
+}
+
+/// Spec 795/809 — apply an overlay's patches to ANY machine: RAM by default, or a cart
+/// bank (`space` = roml/romh, with `bank`). Shared by `runtime/overlay_run` (the live
+/// machine) and `sandbox/run` (a scratch clone) so the two cannot drift in what a patch
+/// means. `who` prefixes the error, so each door still names itself.
+fn apply_overlay_patches(
+    machine: &mut trx64_core::Machine,
+    patches: &[Value],
+    who: &str,
+) -> Result<Vec<Value>, String> {
+    let mut applied: Vec<Value> = vec![];
+    for p in patches {
+        let space = p.get("space").and_then(|v| v.as_str()).unwrap_or("ram");
+        let addr = (p.get("addr").and_then(|v| v.as_u64()).unwrap_or(0) & 0xffff) as usize;
+        let bytes: Vec<u8> = p
+            .get("bytes")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().map(|b| (b.as_u64().unwrap_or(0) & 0xff) as u8).collect())
+            .unwrap_or_default();
+        if space == "ram" {
+            for (i, &b) in bytes.iter().enumerate() {
+                machine.ram[(addr + i) & 0xffff] = b;
+            }
+            applied.push(json!({ "space": "ram", "addr": addr as u64, "len": bytes.len() as u64 }));
+        } else {
+            // Cart bank overlay (roml/romh + explicit bank). Ephemeral: rolled back on the
+            // next anchor restore (792 cart restore reloads flash).
+            let bank = p.get("bank").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+            let Some(cart) = machine.cartridge.as_mut() else {
+                return Err(format!("{who}: cart overlay requested but no cartridge attached"));
+            };
+            for (i, &b) in bytes.iter().enumerate() {
+                cart.overlay_bank_write(space, bank, ((addr + i) & 0xffff) as u16, b)
+                    .map_err(|e| format!("{who}: {e}"))?;
+            }
+            applied.push(json!({
+                "space": space, "bank": bank, "addr": addr as u64, "len": bytes.len() as u64
+            }));
+        }
+    }
+    Ok(applied)
+}
+
+/// Read back every patch flagged `read` — the observe half of restore → patch → run →
+/// observe. RAM by address, or `space:bank:$addr` for a cart bank.
+fn read_overlay_patches(machine: &trx64_core::Machine, patches: &[Value]) -> serde_json::Map<String, Value> {
+    let mut reads = serde_json::Map::new();
+    for p in patches {
+        if !p.get("read").and_then(|v| v.as_bool()).unwrap_or(false) {
+            continue;
+        }
+        let space = p.get("space").and_then(|v| v.as_str()).unwrap_or("ram");
+        let a = (p.get("addr").and_then(|v| v.as_u64()).unwrap_or(0) & 0xffff) as usize;
+        if space == "ram" {
+            reads.insert(format!("${:04x}", a), json!(machine.ram[a] as u64));
+        } else {
+            let bank = p.get("bank").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+            let key = format!("{space}:{bank}:${:04x}", a);
+            match machine.cartridge.as_ref().map(|c| c.overlay_bank_read(space, bank, a as u16)) {
+                Some(Ok(v)) => reads.insert(key, json!(v as u64)),
+                Some(Err(e)) => reads.insert(key, json!(format!("err: {e}"))),
+                None => reads.insert(key, json!("err: no cartridge")),
+            };
+        }
+    }
+    reads
+}
+
+/// The CPU registers and the machine clock of ANY machine, as the overlay door reports them.
+fn machine_registers(machine: &trx64_core::Machine) -> Value {
+    let c = &machine.cpu6510;
+    json!({
+        "pc": c.reg_pc as u64,
+        "a": c.reg_a as u64,
+        "x": c.reg_x as u64,
+        "y": c.reg_y as u64,
+        "sp": c.reg_sp as u64,
+        "flags": c.flags() as u64,
+        "cycles": machine.clk,
+    })
+}
+
+/// A stable digest of the 64 KiB of RAM (FNV-1a, 64-bit). Not cryptographic and not meant
+/// to be: it is how G7 says "the live machine's memory is what it was", and how two sandbox
+/// end states are told apart at a glance before anyone asks for the component diff.
+fn ram_digest(machine: &trx64_core::Machine) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in machine.ram.iter() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// Run a cycle budget on ANY machine, untraced, on the path the gate chose. The untraced
+/// branch of `run_cycle_budget`, without the session — a sandbox clone has no trace and no
+/// session to carry one.
+fn run_machine_budget(machine: &mut trx64_core::Machine, budget: u64, full_machine: bool) {
+    machine.arm_head_trace(false);
+    machine.arm_cart_reads(false);
+    let mut obs = NullSink;
+    if full_machine {
+        machine.run_for_full(budget, &mut obs, |_, _, _, _, _, _, _| {});
+    } else {
+        machine.run_for(budget, &mut obs);
+    }
+}
+
 fn restore_live_checkpoint(session: &mut Session, cp: &Value) -> Result<(), String> {
     restore_checkpoint_into(&mut session.machine, cp)?;
     session.running = false;
@@ -17379,6 +17520,8 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         recorder_frames_since: 0,
         candidates: std::collections::HashMap::new(),
         candidate_seq: 0,
+        sandbox_seq: 0,
+        sandbox_ends: std::collections::VecDeque::new(),
         checkpoint_thumbs: std::collections::HashMap::new(),
         checkpoint_thumb_order: std::collections::VecDeque::new(),
         mon: MonitorSession::new(),
@@ -18058,6 +18201,8 @@ mod batch1_tests {
             recorder_frames_since: 0,
         candidates: std::collections::HashMap::new(),
         candidate_seq: 0,
+        sandbox_seq: 0,
+        sandbox_ends: std::collections::VecDeque::new(),
             checkpoint_thumbs: std::collections::HashMap::new(),
             checkpoint_thumb_order: std::collections::VecDeque::new(),
             mon: MonitorSession::new(),
@@ -20711,6 +20856,106 @@ mod batch1_tests {
         for x in runs {
             assert_eq!(x["from"], json!("base"));
         }
+    }
+
+    /// Spec 809 G7 — the sandbox is NOT the live machine. This is the test that was
+    /// missing: the door's comment promised it, the board repeated it, and the code
+    /// restored, ran and paused `st.session` for every run. Red on that code.
+    #[test]
+    fn g7_a_sandbox_fan_out_leaves_the_live_machine_untouched() {
+        let st = make_state();
+        fill_anchors(&st, 10);
+        mon(&st, "goto 4").expect("goto");
+        mon(&st, "mark base").expect("mark");
+        // Move the live machine away from the mark, so a run that restored into it
+        // would visibly drag it back.
+        mon(&st, "goto 8").expect("goto");
+        let live = |st: &SharedState| {
+            let g = st.lock().unwrap();
+            (
+                g.session.machine.clk,
+                g.session.machine.cpu6510.reg_pc,
+                ram_digest(&g.session.machine),
+                g.session.running,
+            )
+        };
+        let before = live(&st);
+
+        let r = call(&st, "sandbox/runMany", json!({
+            "from": "base",
+            "runs": [
+                { "patches": [{ "addr": 0x0400, "bytes": [0x11], "read": true }], "cycles": 5000u64 },
+                { "patches": [{ "addr": 0x0400, "bytes": [0x22], "read": true }], "cycles": 5000u64 },
+                { "patches": [{ "addr": 0x0400, "bytes": [0x33], "read": true }], "cycles": 5000u64 },
+            ],
+        }));
+        let runs = r["runs"].as_array().expect("runs");
+        assert_eq!(runs.len(), 3, "{r}");
+        for x in runs {
+            assert_eq!(x["state"], json!("done"), "{x}");
+        }
+
+        assert_eq!(live(&st), before, "G7: the live machine's clock, PC, RAM and run state are what they were");
+        assert_eq!(st.lock().unwrap().checkpoint_ring.marks().len(), 1, "and the mark is still there");
+    }
+
+    /// Each run is its OWN machine: three patches, three different end states, and none
+    /// of them bleeds into another — which is only true if the clones are separate.
+    #[test]
+    fn sandbox_runs_are_isolated_from_each_other_and_their_ends_are_diffable() {
+        let st = make_state();
+        fill_anchors(&st, 10);
+        mon(&st, "goto 4").expect("goto");
+        mon(&st, "mark base").expect("mark");
+        let r = call(&st, "sandbox/runMany", json!({
+            "from": "base",
+            "runs": [
+                { "patches": [{ "addr": 0x0400, "bytes": [0x11], "read": true }], "cycles": 0u64 },
+                { "patches": [{ "addr": 0x0400, "bytes": [0x22], "read": true }], "cycles": 0u64 },
+                { "patches": [], "cycles": 0u64 },
+            ],
+        }));
+        let runs = r["runs"].as_array().expect("runs");
+        assert_eq!(runs[0]["reads"]["$0400"], json!(0x11), "{}", runs[0]);
+        assert_eq!(runs[1]["reads"]["$0400"], json!(0x22), "{}", runs[1]);
+        let digests: std::collections::HashSet<&str> =
+            runs.iter().map(|x| x["ramDigest"].as_str().unwrap()).collect();
+        assert_eq!(digests.len(), 3, "three machines, three memories");
+
+        // The unpatched run IS the mark: its end diffs identical against the anchor.
+        let same = call(&st, "runtime/component_diff", json!({ "idA": "base", "idB": runs[2]["endStateId"] }));
+        assert_eq!(same["verdict"]["identical"], json!(true), "{same}");
+        // Two patched ends differ, and they are compared by their sandbox ids.
+        let d = call(&st, "runtime/component_diff", json!({ "idA": runs[0]["endStateId"], "idB": runs[1]["endStateId"] }));
+        assert_eq!(d["verdict"]["identical"], json!(false), "{d}");
+    }
+
+    /// Run ids are the daemon's, not the call's: a second call does not hand back `r-0001`
+    /// again for a different run.
+    #[test]
+    fn sandbox_run_ids_never_repeat_across_calls() {
+        let st = make_state();
+        fill_anchors(&st, 4);
+        let a = call(&st, "sandbox/run", json!({ "patches": [], "cycles": 0u64 }));
+        let b = call(&st, "sandbox/run", json!({ "patches": [], "cycles": 0u64 }));
+        assert_ne!(a["id"], b["id"], "{a} / {b}");
+        assert_ne!(a["endStateId"], b["endStateId"]);
+    }
+
+    /// G5 — a name is an id at EVERY door, because the ring resolves it. `component_diff`
+    /// refused `alpha` while `overlay_run` took it; the per-door resolution held in two
+    /// doors only.
+    #[test]
+    fn g5_a_mark_name_works_where_an_anchor_id_is_taken() {
+        let st = make_state();
+        fill_anchors(&st, 6);
+        mon(&st, "goto 2").expect("goto");
+        mon(&st, "mark alpha").expect("mark");
+        let id = st.lock().unwrap().checkpoint_ring.mark_id("alpha").unwrap();
+        let d = call(&st, "runtime/component_diff", json!({ "idA": "alpha", "idB": id }));
+        assert_eq!(d["verdict"]["identical"], json!(true), "a mark and its anchor are the same state: {d}");
+        let pin = call(&st, "checkpoint/pin", json!({ "id": "alpha" }));
+        assert!(pin.get("error").is_none(), "{pin}");
     }
 
     /// G2 — parity. Every transport action reachable as a monitor verb is reachable over
