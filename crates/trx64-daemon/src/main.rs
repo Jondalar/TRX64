@@ -15225,7 +15225,35 @@ fn transport_status(st: &State) -> Value {
     // into a setting.
     v["shownFrame"] = json!(st.transport_shown_frame);
     v["rawFrame"] = json!(st.transport_raw_frame);
+    // Spec 809 §5b/§9 — while scrubbing, the useful question is "how far am I from a
+    // mark", not the absolute frame. Specified in §5b and never built.
+    let nearest = pos.as_ref().and_then(|p| nearest_mark(st, &ids, p.index));
+    if let Some((name, away)) = &nearest {
+        if let Some(line) = v["line"].as_str() {
+            let rendered = format!("{line}   \u{b7}   {name} {away:+}");
+            v["line"] = json!(rendered);
+        }
+    }
+    v["nearestMark"] = match nearest {
+        Some((name, away)) => json!({ "name": name, "framesAway": away }),
+        None => Value::Null,
+    };
     v
+}
+
+/// The mark closest to anchor `index`, and how far the cursor is from it in anchors:
+/// positive when the mark lies BEHIND the cursor (`alpha +160` — 160 frames past alpha),
+/// negative when it lies ahead. `None` with no marks. On a tie the earlier mark wins, so
+/// the answer does not flicker between two marks equally far away.
+fn nearest_mark(st: &State, ids: &[(String, u64, u64)], index: usize) -> Option<(String, i64)> {
+    st.checkpoint_ring
+        .marks()
+        .iter()
+        .filter_map(|m| {
+            let at = ids.iter().position(|(i, _, _)| *i == m.id)?;
+            Some((m.label.clone()?, index as i64 - at as i64))
+        })
+        .min_by_key(|(_, away)| away.unsigned_abs())
 }
 
 /// Place the machine on anchor `index`. The single point where the transport touches
@@ -20956,6 +20984,34 @@ mod batch1_tests {
         assert_eq!(d["verdict"]["identical"], json!(true), "a mark and its anchor are the same state: {d}");
         let pin = call(&st, "checkpoint/pin", json!({ "id": "alpha" }));
         assert!(pin.get("error").is_none(), "{pin}");
+    }
+
+    /// Spec 809 §5b/§9 — the transport says how far the cursor is from the nearest mark.
+    /// Specified in §5b, reported shipped, never built.
+    #[test]
+    fn transport_status_names_the_nearest_mark_and_the_distance() {
+        let st = make_state();
+        fill_anchors(&st, 10);
+        let none = call(&st, "transport/status", json!({}));
+        assert_eq!(none["nearestMark"], Value::Null, "no marks, no nearest: {none}");
+
+        mon(&st, "goto 2").expect("goto");
+        mon(&st, "mark early").expect("mark");
+        mon(&st, "goto 7").expect("goto");
+        mon(&st, "mark late").expect("mark");
+
+        // Three past `early`, two before `late`: `late` is nearer, and it lies AHEAD.
+        mon(&st, "goto 5").expect("goto");
+        let at5 = call(&st, "transport/status", json!({}));
+        assert_eq!(at5["nearestMark"]["name"], json!("late"), "{at5}");
+        assert_eq!(at5["nearestMark"]["framesAway"], json!(-2), "{at5}");
+        assert!(at5["line"].as_str().unwrap().contains("late -2"), "{}", at5["line"]);
+
+        // Past `late`: it lies behind, so the distance is positive.
+        mon(&st, "goto 9").expect("goto");
+        let at9 = call(&st, "transport/status", json!({}));
+        assert_eq!(at9["nearestMark"]["name"], json!("late"));
+        assert_eq!(at9["nearestMark"]["framesAway"], json!(2), "{at9}");
     }
 
     /// G2 — parity. Every transport action reachable as a monitor verb is reachable over
