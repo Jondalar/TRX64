@@ -91,5 +91,5 @@ One line per feature, as of 0.10.0. Details: [`README.md`](../README.md), monito
 ## Platforms
 
 - macOS, Linux and Windows, each x86_64 and arm64; `trx64cli` and `trx64-daemon` in each archive.
-- Homebrew tap `jondalar/tap/trx64`.
+- Homebrew tap `jondalar/trx64` (macOS and Linux, x86_64 and arm64).
 - C64 ROMs are not included (`trx64cli --rom-dir`, or `~/.trx64/roms` for both binaries).

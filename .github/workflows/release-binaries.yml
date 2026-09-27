@@ -116,11 +116,13 @@ jobs:
             archive: zip
             container: ''
           # Linux: built INSIDE rust:bookworm rather than on the runner image, because on
-          # Linux the build host decides who can run the result — a binary needs glibc at
-          # least as new as the one it was linked against. Bookworm pins that floor at 2.36
-          # (Debian 12, Ubuntu 22.04 and anything newer), where ubuntu-latest would raise it
-          # to whatever GitHub ships this month and quietly lock out older desktops. It also
-          # keeps the floor independent of GitHub retiring runner labels.
+          # Linux the build host decides who can run the result — a binary can only use
+          # glibc symbols its build host had. Bookworm (glibc 2.36) caps that; the floor
+          # the binary actually needs is its highest GLIBC_x.y symbol, printed by the
+          # "What does it link against" step: GLIBC_2.34 as of 0.10.0 (Ubuntu 22.04,
+          # Debian 12, RHEL 9 and newer). ubuntu-latest would raise the cap to whatever
+          # GitHub ships this month and quietly lock out older desktops. It also keeps the
+          # floor independent of GitHub retiring runner labels.
           - os: ubuntu-latest
             target: linux-x86_64
             archive: tar.gz
@@ -131,7 +133,7 @@ jobs:
           # linux-x86_64 tarball with FEX's "Invalid or Unsupported elf file … required on
           # AArch64 hosts" — an emulator we would then be measuring through.
           #
-          # `rust:bookworm` is multi-arch, so the Linux glibc floor stays 2.36 here too and
+          # `rust:bookworm` is multi-arch, so the glibc cap is the same here too and
           # the two apt packages are unchanged. GitHub's arm64 runners are free for public
           # repositories.
           - os: ubuntu-24.04-arm

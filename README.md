@@ -34,7 +34,7 @@ and `trx64-daemon`. C64 ROMs are not included: put your own in `~/.trx64/roms`, 
 `trx64cli` at them with `--rom-dir`.
 
 ```sh
-brew install jondalar/tap/trx64
+brew install jondalar/trx64/trx64
 ```
 
 From source: `cargo build --release`. Builds natively (for Windows it uses MSVC).

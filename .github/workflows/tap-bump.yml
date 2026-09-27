@@ -72,12 +72,14 @@ jobs:
             rm -rf sums && mkdir sums
             gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p '*.sha256' -D sums || true
             if [ -f sums/trx64-*-macos-arm64.tar.gz.sha256 ] \
-            && [ -f sums/trx64-*-linux-x86_64.tar.gz.sha256 ]; then
-              echo "got both checksums on attempt $attempt"; exit 0
+            && [ -f sums/trx64-*-macos-x86_64.tar.gz.sha256 ] \
+            && [ -f sums/trx64-*-linux-x86_64.tar.gz.sha256 ] \
+            && [ -f sums/trx64-*-linux-arm64.tar.gz.sha256 ]; then
+              echo "got all four checksums on attempt $attempt"; exit 0
             fi
             echo "assets not complete yet (attempt $attempt) — waiting"; sleep 20
           done
-          echo "::error::release $TAG has no macos-arm64 + linux-x86_64 checksums"
+          echo "::error::release $TAG lacks a macos-arm64/-x86_64 or linux-x86_64/-arm64 checksum"
           exit 1
 
       - name: Check out the tap
@@ -101,7 +103,7 @@ jobs:
           shas = {}
           for f in glob.glob("sums/*.sha256"):
               digest, name = open(f).read().split()[:2]
-              for target in ("macos-arm64", "linux-x86_64"):
+              for target in ("macos-arm64", "macos-x86_64", "linux-x86_64", "linux-arm64"):
                   if target in name:
                       shas[target] = (digest, name)
 
@@ -129,7 +131,7 @@ jobs:
                   current = None
               out.append(line)
 
-          if changed < 5:   # version + 2 urls + 2 shas
+          if changed < 9:   # version + 4 urls + 4 shas
               raise SystemExit(f"only {changed} lines rewritten — formula shape changed?")
           path.write_text("".join(out))
           print("".join(l for l in out if 'version "' in l or 'download/' in l or 'sha256 "' in l))
@@ -150,7 +152,7 @@ jobs:
           git add Formula/trx64.rb
           git commit -m "trx64 $VERSION
 
-          Version, URLs and both checksums taken from the release assets of
+          Version, URLs and every checksum taken from the release assets of
           Jondalar/TRX64 v$VERSION by the tap-bump workflow."
           git push
           echo "tap updated to $VERSION"

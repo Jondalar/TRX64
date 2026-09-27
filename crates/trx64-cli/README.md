@@ -66,7 +66,7 @@ on. `/pause` freezes it; `/run` resumes.
 The binary is named **`trx64cli`** (no dash). Three ways to get it, all platforms:
 
 ```bash
-brew install jondalar/tap/trx64
+brew install jondalar/trx64/trx64
 ```
 
 **Prebuilt** — [Releases](https://github.com/Jondalar/TRX64/releases), macOS,
