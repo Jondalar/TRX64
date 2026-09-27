@@ -678,11 +678,19 @@ pub fn run_sandbox(args: &SandboxArgs) -> Result<String, String> {
 /// sentinel/cap, and harvest. Split out of `run_sandbox` so the register/sentinel/
 /// write-map behaviour is testable without file I/O.
 fn execute_sandbox(m: &mut Machine, args: &SandboxArgs) -> SandboxOutcome {
-    // Seed zero-page bytes (depacker src/dst pointers etc.). $00/$01 are the CPU
-    // port — in stub mode $01 is set by the stub via --io, so a --zp $01 would be
-    // overwritten; in direct-entry the port is set below.
+    // Seed zero-page bytes (depacker src/dst pointers etc.).
     for (addr, val) in &args.zp {
         m.poke(*addr, &[*val]);
+    }
+    // $00/$01 are not RAM to the CPU: they are the 6510 port. A `--zp $00` / `--zp $01`
+    // seed is the caller naming the port's direction / data, so it goes to the port —
+    // and `--zp $01` wins over `--io`, which is only the default banking. Poking the
+    // RAM byte alone left the port at `--io`: a routine seeded with $01=$35 ran at $34,
+    // and its own `dec $01` went to $33 with the char ROM at $D000.
+    let io = args.zp.iter().rev().find(|(a, _)| *a == 0x0001).map_or(args.io, |&(_, v)| v);
+    if let Some(&(_, ddr)) = args.zp.iter().rev().find(|(a, _)| *a == 0x0000) {
+        m.port_dir = ddr;
+        m.ram[0x0000] = ddr;
     }
 
     let mut bp: HashSet<u16> = HashSet::new();
@@ -692,12 +700,12 @@ fn execute_sandbox(m: &mut Machine, args: &SandboxArgs) -> SandboxOutcome {
         // ── DIRECT-ENTRY: TS-faithful (sandbox-runner.ts runSandbox). ────────────
         // Banking without a stub: poke the CPU port AND recompute the live PLA
         // memconfig (a raw poke of $01 alone would not update the memconfig; this
-        // reproduces the stub's `sta $01` effect). port_dir stays at the boot $2f
-        // so all low-3 port bits are outputs = the value we write is what the PLA
-        // sees. --io $34 ⇒ loram=hiram=0 ⇒ RAM under $A000-$FFFF and $D000-$DFFF
-        // (all-RAM), matching the TS flat-64K shadow.
-        m.port_data = args.io;
-        m.ram[0x0001] = args.io;
+        // reproduces the stub's `sta $01` effect). The PLA sees the port through its
+        // direction register (boot $2f unless `--zp $00` set it). --io $34 ⇒
+        // loram=hiram=0 ⇒ RAM under $A000-$FFFF and $D000-$DFFF (all-RAM), matching
+        // the TS flat-64K shadow.
+        m.port_data = io;
+        m.ram[0x0001] = io;
         m.memconfig = m.memconfig_table[m.pla_index()];
 
         // Seed the registers the depacker ENTRY observes (TS: cpu.pc/a/x/y/sp set
@@ -729,7 +737,7 @@ fn execute_sandbox(m: &mut Machine, args: &SandboxArgs) -> SandboxOutcome {
         let ret = s.wrapping_add(8);
         let stub = [
             0x78, // sei
-            0xa9, args.io, // lda #io
+            0xa9, io, // lda #io
             0x85, 0x01, // sta $01
             0x20, (args.entry & 0xff) as u8, (args.entry >> 8) as u8, // jsr entry
             0x4c, (ret & 0xff) as u8, (ret >> 8) as u8, // jmp ret (self-loop)
@@ -1283,6 +1291,52 @@ mod tests {
         // against the seeded P ($25).
         assert_eq!(out.harvest[3] & 0xef, 0x25, "entry P (B bit from PHP masked)");
         assert_eq!(out.harvest[5], 0x80, "entry SP");
+    }
+
+    /// A `--zp $01` seed is the CPU port, not RAM: it overrides `--io`, in both entry
+    /// modes. The routine lowers the port by one and reads $D1C2 — RAM ($10) at $34,
+    /// the char ROM at $33. Seeded $35 must end at $34 and read RAM.
+    #[test]
+    fn zp_seed_of_01_sets_the_cpu_port() {
+        let Some(rom_dir) = rom_dir_or_skip() else { return };
+        for direct in [true, false] {
+            let mut m = booted(&rom_dir);
+            // c000: DEC $01 / LDA $01 / STA $4001 / LDA $D1C2 / STA $4000 / RTS
+            m.poke(0xc000, &[0xc6, 0x01, 0xa5, 0x01, 0x8d, 0x01, 0x40, 0xad, 0xc2, 0xd1, 0x8d, 0x00, 0x40, 0x60]);
+            m.poke(0xd1c2, &[0x10]);
+            let mut args = base_args(rom_dir.clone());
+            args.entry = 0xc000;
+            args.direct_entry = direct;
+            args.io = 0x34;
+            args.zp = vec![(0x0001, 0x35)];
+            args.harvests = vec![(0x4000, 2)];
+            let out = execute_sandbox(&mut m, &args);
+            assert!(out.ok, "direct={direct}");
+            assert_eq!(out.harvest[1], 0x34, "port after DEC from the seeded $35 (direct={direct})");
+            assert_eq!(out.harvest[0], 0x10, "$D1C2 is RAM at $34 (direct={direct})");
+        }
+    }
+
+    /// `--zp $00` sets the port's direction register: with bit 0 an input, the PLA
+    /// sees LORAM pulled high whatever the data bit says — $34 acts as $35, so $D020
+    /// reads the VIC (upper nibble $F) instead of the RAM byte beneath.
+    #[test]
+    fn zp_seed_of_00_sets_the_port_direction() {
+        let Some(rom_dir) = rom_dir_or_skip() else { return };
+        let mut m = booted(&rom_dir);
+        // c000: LDA $D020 / STA $4000 / RTS
+        m.poke(0xc000, &[0xad, 0x20, 0xd0, 0x8d, 0x00, 0x40, 0x60]);
+        m.poke(0xd020, &[0x00]);
+        let mut args = base_args(rom_dir);
+        args.entry = 0xc000;
+        args.direct_entry = true;
+        args.io = 0x34;
+        args.zp = vec![(0x0000, 0x2e)];
+        args.harvests = vec![(0x4000, 1)];
+        let out = execute_sandbox(&mut m, &args);
+        assert!(out.ok);
+        assert_eq!(m.port_dir, 0x2e);
+        assert_eq!(out.harvest[0] & 0xf0, 0xf0, "$D020 is the VIC, not RAM");
     }
 
     /// All-RAM ($34) depack: a routine writing to $E000 (under the KERNAL window) is
