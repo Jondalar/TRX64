@@ -28,7 +28,7 @@ works without the other.
 
 ## Install
 
-Binaries for macOS (arm64), Linux (x86_64, arm64) and Windows (x86_64, arm64):
+Binaries for macOS, Linux and Windows (x86_64, arm64):
 **[Releases](https://github.com/Jondalar/TRX64/releases)** — archives hold `trx64cli`
 and `trx64-daemon`. C64 ROMs are not included: put your own in `~/.trx64/roms`, or point
 `trx64cli` at them with `--rom-dir`.

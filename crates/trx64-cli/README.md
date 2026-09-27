@@ -6,7 +6,7 @@ window** (winit + cpal) to play and watch the live machine. No daemon, no WebSoc
 FFI — it links the runtime library and calls it directly. One machine, shared by the
 cockpit, the per-frame pump, and the window.
 
-It runs on macOS (arm64), Linux and Windows (x86_64 and arm64).
+It runs on macOS, Linux and Windows (x86_64 and arm64).
 
 ---
 
@@ -69,7 +69,7 @@ The binary is named **`trx64cli`** (no dash). Three ways to get it, all platform
 brew install jondalar/tap/trx64
 ```
 
-**Prebuilt** — [Releases](https://github.com/Jondalar/TRX64/releases), macOS (arm64),
+**Prebuilt** — [Releases](https://github.com/Jondalar/TRX64/releases), macOS,
 Linux and Windows (x86_64 and arm64). Unpack and put `trx64cli` on your `PATH`.
 
 **From source** — `cargo install --path crates/trx64-cli` builds in release mode and drops

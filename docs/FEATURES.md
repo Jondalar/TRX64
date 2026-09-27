@@ -1,6 +1,6 @@
 # Features
 
-One line per feature, as of 0.9.2. Details: [`README.md`](../README.md), monitor:
+One line per feature, as of 0.10.0. Details: [`README.md`](../README.md), monitor:
 [`MONITOR.md`](../MONITOR.md), Swift API: [`crates/trx64-ffi/API.md`](../crates/trx64-ffi/API.md).
 
 ## Machine
@@ -90,6 +90,6 @@ One line per feature, as of 0.9.2. Details: [`README.md`](../README.md), monitor
 
 ## Platforms
 
-- macOS arm64, Linux x86_64 and arm64, Windows x86_64 and arm64; `trx64cli` and `trx64-daemon` in each archive.
+- macOS, Linux and Windows, each x86_64 and arm64; `trx64cli` and `trx64-daemon` in each archive.
 - Homebrew tap `jondalar/tap/trx64`.
 - C64 ROMs are not included (`trx64cli --rom-dir`, or `~/.trx64/roms` for both binaries).
