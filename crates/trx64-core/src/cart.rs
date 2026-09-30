@@ -98,7 +98,6 @@ pub enum CrtLoadProfile {
 /// mappers never use it for banking).
 #[derive(Clone)]
 pub struct ParsedCartridgeImage {
-    pub path: String,
     pub name: String,
     pub mapper_type: MapperType,
     pub exrom: u8,
@@ -727,7 +726,6 @@ pub fn parse_crt(
         .ok_or(CrtError::UnknownHardware(hardware_type))?;
 
     Ok(ParsedCartridgeImage {
-        path: path.to_string(),
         name,
         mapper_type: inferred,
         exrom,
@@ -2595,7 +2593,6 @@ pub fn parse_bin(
     };
 
     Ok(ParsedCartridgeImage {
-        path: path.to_string(),
         name: display_name,
         mapper_type,
         exrom: geom.exrom,
@@ -3098,7 +3095,6 @@ pub fn load_self_config_from_bin(
     name: &str,
 ) -> Result<(ParsedCartridgeImage, Box<dyn CartMapper>), CrtError> {
     let image = ParsedCartridgeImage {
-        path: name.to_string(),
         name: name.to_string(),
         mapper_type: MapperType::SelfConfig,
         exrom: 0,
@@ -3124,7 +3120,6 @@ mod overlay795_tests {
             banks.insert(bank, b);
         }
         ParsedCartridgeImage {
-            path: String::new(),
             name: "test".into(),
             mapper_type,
             exrom: 0,
@@ -3210,7 +3205,6 @@ mod cart_read_set_785_tests {
             banks.insert(bank, b);
         }
         ParsedCartridgeImage {
-            path: String::new(),
             name: "test".into(),
             mapper_type,
             exrom: 0,

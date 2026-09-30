@@ -240,9 +240,6 @@ pub struct State {
     /// and the press lands somewhere else on the machine. The browser may say WHAT was
     /// pressed. It may never say WHEN.
     input_journal: Option<InputJournal>,
-    /// Queued PETSCII chars for session/type (stub, count tracked only).
-    #[allow(dead_code)]
-    type_buffer: Vec<u8>,
     /// Monotonic controller-state counter; increments on each debug/run|pause|continue.
     ctrl_frame: u64,
     /// Spec 786 audio fix — increments on each machine REBUILD (do_power_on /
@@ -4264,6 +4261,8 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 Some(p) => p.clone(),
                 None => return Err("ringdump: usage: ringdump <path.c64rering>".into()),
             };
+            // Like every monitor file verb: relative to `cd`/`pwd` (the project).
+            let path = resolve_fs_path_with_state(st, &path);
             match ringbuffer_dump_to_path(st, &path) {
                 Ok(info) => Ok(format!(
                     "ringdump: {} anchor(s), {} delta entr(ies), {} cpu-history → {}  ({} bytes, cycles {}–{})",
@@ -4284,6 +4283,8 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 Some(p) => p.clone(),
                 None => return Err("ringload: usage: ringload <path.c64rering>".into()),
             };
+            // Like every monitor file verb: relative to `cd`/`pwd` (the project).
+            let path = resolve_fs_path_with_state(st, &path);
             match ringbuffer_restore_from_path(st, &path) {
                 Ok(info) => Ok(format!(
                     "ringload: restored {} anchor(s), {} delta entr(ies), {} cpu-history from {}  (current={}, cycles {}–{})\n  now: scrub (`checkpoint/list`), `rstep`, `whowrote`, `chis`, `diff <idA> <idB>` all work on this buffer",
@@ -4914,8 +4915,8 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
         // (bare → the backing file; `savecrt "<p>"` → a re-packed copy at <p>). The help
         // advertised it but run_monitor had NO arm → `unknown command: savecrt`. Fix:
         // wire it to the EXISTING cart-persist capability (cartridge.crt_image(clk) →
-        // the bytes, cartridge_image.path → the backing file — the same path media/
-        // persist role:cartridge uses).
+        // the bytes, session.cart_path → the backing file — the same path media/
+        // persist role:cartridge, eject and auto-persist use).
         "savecrt" | "savecrtstate" => {
             if st.session.machine.cartridge.is_none() {
                 return Err("savecrt: no cartridge attached".into());
@@ -4941,6 +4942,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                     );
                 }
             }
+            let backing = st.session.cart_path.clone();
             let m = &mut st.session.machine;
             let clk = m.clk;
             // Re-pack the live state to a .crt image (None ⇒ this mapper can't).
@@ -4963,10 +4965,13 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 };
             }
             // Bare `savecrt` → update the mounted backing file.
-            let path = m.cartridge_image.as_ref().map(|i| i.path.clone()).unwrap_or_default();
-            if path.is_empty() {
+            if backing.is_empty() {
                 return Ok("savecrt: skipped — no backing file path".into());
             }
+            let path = match host_write_target(&backing) {
+                Ok(p) => p,
+                Err(e) => return Err(format!("savecrt: {e}")),
+            };
             match std::fs::write(&path, &img) {
                 Ok(()) => Ok(format!("savecrt: {} bytes -> {path}", img.len())),
                 Err(e) => Err(format!("savecrt: write error: {e}")),
@@ -5008,20 +5013,18 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             };
             let basename = std::path::Path::new(&p)
                 .file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| p.clone());
+            let old_backing = st.session.cart_path.clone();
             let m = &mut st.session.machine;
             // Old cart continuation (banking) + type, captured BEFORE the swap.
             let old_type = m.cartridge.as_ref().map(|c| c.mapper_type());
             let old_state = m.cartridge.as_ref().map(|c| c.get_state());
-            let old_name = m.cartridge_image.as_ref()
-                .map(|i| std::path::Path::new(&i.path).file_name()
-                    .map(|n| n.to_string_lossy().to_string()).unwrap_or_default())
-                .unwrap_or_default();
+            let old_name = std::path::Path::new(&old_backing).file_name()
+                .map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             // Persist a dirty old cart to its backing file first (eject semantics).
             let mut lines: Vec<String> = Vec::new();
             if m.cartridge.as_ref().map(|c| c.is_writable_dirty()).unwrap_or(false) {
                 let clk = m.clk;
-                let old_path = m.cartridge_image.as_ref().map(|i| i.path.clone()).unwrap_or_default();
-                if !old_path.is_empty() {
+                if let Ok(old_path) = host_write_target(&old_backing) {
                     if let Some(img) = m.cartridge.as_mut().and_then(|c| c.crt_image(clk)) {
                         if std::fs::write(&old_path, &img).is_ok() {
                             lines.push(format!("persisted old cart: {} bytes -> {old_path}", img.len()));
@@ -5054,8 +5057,8 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                     })
                 } else { None }
             } else { None };
-            // Track the new backing path so a later savecrt/auto-persist hits it.
-            if let Some(img) = m.cartridge_image.as_mut() { img.path = p.clone(); }
+            // Track the new backing path so a later savecrt/eject/auto-persist hits it.
+            st.session.cart_path = p.clone();
             // The wire vocabulary (`easyflash`, `normal_8k`), not the Rust enum's Debug
             // spelling (`EasyFlash`, `Normal8k`). `mapper_type_str` is the same table the
             // rest of the daemon reports types with, so a caller that round-trips a type
@@ -7099,13 +7102,9 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             // Read what is ACTUALLY in the machine (the parsed cart image / the attached
             // disk), not the session's bookkeeping strings — `cart_path` is only written on
             // undump, so a `media/mount` would have reported an empty machine.
-            // Prefer the session's full mounted path (set by media/mount + undump);
-            // `ParsedCartridgeImage.path` is only the file NAME, which cannot be stat'ed.
-            let cart_path = if !st.session.cart_path.is_empty() {
-                st.session.cart_path.clone()
-            } else {
-                machine.cartridge_image.as_ref().map(|i| i.path.clone()).unwrap_or_default()
-            };
+            // The session's cart_path is the one record of the cart's backing file
+            // (media/mount, media/ingress, swapcrt, undump all set it).
+            let cart_path = st.session.cart_path.clone();
             let disk_path = machine
                 .drive8
                 .get_attached_disk()
@@ -7372,10 +7371,17 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u16)
                 .unwrap_or_else(|| (bytes[0] as u16) | ((bytes[1] as u16) << 8));
+            let run_addr = match parse_run_param(&req.params) {
+                Ok(r) => r,
+                Err(e) => return Response::err(id, -32602, format!("session/load_prg: {e}")),
+            };
             let body = &bytes[2..];
             let mut st = state.lock().unwrap();
             st.session.machine.poke(load_address, body);
             st.session.machine.sync_after_monitor();
+            if let Some(pc) = run_addr {
+                start_loaded_at(&mut st, pc);
+            }
             // c64re loadPrgIntoRam (integrated-session.ts:885): endAddress is the
             // address of the LAST byte = (load + len - 1) & 0xFFFF.
             let end_address = load_address
@@ -7385,7 +7391,8 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 "loadAddress": load_address as u64,
                 "endAddress": end_address as u64,
                 "bytesLoaded": body.len() as u64,
-                "path": prg_path
+                "path": prg_path,
+                "run": run_addr
             }))
         }
 
@@ -8370,7 +8377,10 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
         "runtime/run_prg" => {
             let prg_path = req.params.get("prg_path").and_then(|v| v.as_str()).map(str::to_string);
             let bytes_b64 = req.params.get("bytes_b64").and_then(|v| v.as_str()).map(str::to_string);
-            let run_addr = req.params.get("run").and_then(|v| v.as_u64());
+            let run_addr = match parse_run_param(&req.params) {
+                Ok(r) => r,
+                Err(e) => return Response::err(id, -32602, format!("runtime/run_prg: {e}")),
+            };
 
             // Load the PRG bytes
             let prg_bytes: Vec<u8> = if let Some(b64) = bytes_b64 {
@@ -8400,55 +8410,23 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             let mut st = state.lock().unwrap();
             st.session.machine.poke(load_addr, body);
 
-            // Mirror TS ingress.ts loadPrgBytes: when loaded at the standard BASIC
-            // start ($0801), set VARTAB ($2D/$2E) = byte after the program so that
-            // a subsequent RUN can find the end of the BASIC program. This matches:
-            //   if (loadAddress === 0x0801) { ram[0x2d] = endAddress & 0xff;
-            //                                 ram[0x2e] = (endAddress >> 8) & 0xff; }
-            if load_addr == 0x0801 {
-                let end_addr = (load_addr as usize + body.len()) & 0xffff;
-                let vartab = [(end_addr & 0xff) as u8, ((end_addr >> 8) & 0xff) as u8];
-                st.session.machine.poke(0x002d, &vartab);
-            }
+            set_vartab_after(&mut st, load_addr, body.len());
 
-            // Mirror TS ws-server.ts runtime/run_prg autostart logic (line 782-788):
-            //   if entry != undefined        → pause; set PC = entry; continue
-            //   else if loadAddress == $0801 → ctrl.continue(); s.typeText("RUN\r")
-            //   else                         → pause; set PC = loadAddress; continue
+            // Loading into a booted machine keeps it the full machine: no `injected`
+            // latch here (it moved the run onto the CPU-only core, where no CIA scans
+            // the keyboard and a typed RUN never arrives — C64RE #29).
+            //   run given           → start there
+            //   loaded at $0801     → type RUN:
+            //   anything else       → start at the load address
             let action: String;
-            if let Some(entry) = run_addr {
-                // Explicit entry point: set PC and resume (mirrors TS pause→setPC→continue).
-                let pc = (entry & 0xffff) as u16;
-                st.session.machine.cpu6510.reg_pc = pc;
-                // The full-machine driver (run_for_full, used by the --stream loop AND
-                // session/run) executes from `c64_core`, NOT `cpu6510`; sync_after_monitor
-                // only mirrors cpu6510 → the snapshot, not into c64_core. So set the
-                // full-machine PC too (= the monitor `g` command, main.rs:1874-1875),
-                // else a run-from-entry keeps running the KERNAL at the old c64_core PC.
-                st.session.machine.c64_core.reg_pc = pc;
-                st.session.machine.sync_after_monitor();
-                st.session.injected = true;
-                st.session.running = true;
-                action = format!("g ${:04x}", pc);
+            if let Some(pc) = run_addr {
+                start_loaded_at(&mut st, pc);
+                action = format!("g ${pc:04x}");
             } else if load_addr == 0x0801 {
-                // BASIC program: resume the machine then type "RUN\r" so BASIC executes.
-                // Mirrors: ctrl.continue(); s.typeText("RUN\r"); action = "BASIC RUN"
-                st.session.running = true;
-                st.session.injected = true;
-                let now = st.session.machine.cpu6510.clk;
-                st.session.machine.keyboard.type_text(now, "RUN\r", 80_000, 80_000);
+                type_basic_run(&mut st);
                 action = "BASIC RUN".to_string();
             } else {
-                // Machine-code at non-BASIC load address: set PC to load address and resume.
-                // Mirrors: pause; set PC = loadAddress; continue; action = "g $XXXX (default = load address)"
-                st.session.machine.cpu6510.reg_pc = load_addr;
-                // Set the full-machine PC too (= monitor `g`, main.rs:1874-1875) — the
-                // run_for_full driver runs from c64_core, which sync_after_monitor does
-                // not touch (see the explicit-entry branch above for the full rationale).
-                st.session.machine.c64_core.reg_pc = load_addr;
-                st.session.machine.sync_after_monitor();
-                st.session.injected = true;
-                st.session.running = true;
+                start_loaded_at(&mut st, load_addr);
                 action = format!("g ${:04x} (default = load address)", load_addr);
             }
 
@@ -9386,7 +9364,12 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
         // contract requires; the cycle-budget run happens on the next debug/run.
         "media/ingress" => {
             let kind = req.params.get("kind").and_then(|v| v.as_str()).unwrap_or("disk").to_string();
-            let path = req.params.get("path").and_then(|v| v.as_str()).map(str::to_string);
+            // Resolved as media/mount resolves its path: the ingress path becomes the
+            // medium's backing file, which eject and persist later WRITE.
+            let path = req.params.get("path").and_then(|v| v.as_str()).map(|p| {
+                let st = state.lock().unwrap();
+                resolve_fs_path_with_state(&st, p)
+            });
             let bytes_b64 = req.params.get("bytes_b64").and_then(|v| v.as_str()).map(str::to_string);
             let name = req.params.get("name").and_then(|v| v.as_str()).map(str::to_string);
             let role = req.params.get("role").and_then(|v| v.as_str()).unwrap_or("drive8").to_string();
@@ -9578,10 +9561,13 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                         if prg_mode == "inject-run" {
                             let entry = prg_entry.unwrap_or(load_addr);
                             st.session.machine.cpu6510.reg_pc = entry;
+                            // The full-machine driver runs from c64_core; set it too.
+                            st.session.machine.c64_core.reg_pc = entry;
                             detail.insert("entry".to_string(), json!(entry as u64));
                         }
                         st.session.machine.sync_after_monitor();
-                        st.session.injected = true;
+                        // No `injected` latch for a PRG loaded into a booted machine
+                        // (C64RE #29): it would move bounded runs onto the CPU-only core.
                         None
                     }
                     "crt" => {
@@ -9805,15 +9791,25 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                     &format!("MOUNT {path_str} ({})", kind.as_str()),
                 ),
                 MediaKind::Prg { autostart } => {
+                    let run_addr = match parse_run_param(&req.params) {
+                        Ok(r) => r,
+                        Err(e) => return Response::err(id, -32602, format!("media/open: {e}")),
+                    };
                     let mut st = state.lock().unwrap();
                     let load = u16::from_le_bytes([bytes[0], bytes[1]]);
                     st.session.machine.poke(load, &bytes[2..]);
-                    st.session.injected = true;
-                    let msg = if autostart {
-                        // $0801 + a valid BASIC line: type RUN. This covers SYS-stub
+                    set_vartab_after(&mut st, load, bytes.len() - 2);
+                    // No `injected` latch: see runtime/run_prg (C64RE #29).
+                    let msg = if let Some(pc) = run_addr {
+                        start_loaded_at(&mut st, pc);
+                        format!(
+                            "LOAD {path_str} \u{2192} ${load:04X} ({} bytes) \u{2014} started at ${pc:04X}",
+                            bytes.len() - 2
+                        )
+                    } else if autostart {
+                        // $0801 + a valid BASIC line: type RUN:. This covers SYS-stub
                         // releases too — the stub IS how they are meant to start.
-                        st.type_buffer.extend_from_slice(b"RUN\r");
-                        st.session.running = true;
+                        type_basic_run(&mut st);
                         format!(
                             "LOAD {path_str} \u{2192} ${load:04X} ({} bytes), BASIC at $0801 \u{2014} RUN",
                             bytes.len() - 2
@@ -9826,7 +9822,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                     };
                     Response::ok(id, json!({
                         "kind": "prg", "path": path_str, "loadAddress": load,
-                        "autostart": autostart, "message": msg,
+                        "autostart": autostart, "run": run_addr, "message": msg,
                     }))
                 }
             }
@@ -10170,25 +10166,33 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 let mut st = state.lock().unwrap();
                 let session_id = st.session.id.clone();
                 // Collect path + crt bytes while holding the lock.
+                // The same gate as eject/auto-persist: only a cart whose writable state
+                // changed, on a mapper that persists it, rewrites its backing file.
+                // `session.cart_path` is the one record of that file; the parsed image
+                // carries no path (it used to carry the bare NAME, which fs::write then
+                // resolved against the process cwd — C64RE #30).
+                let backing = st.session.cart_path.clone();
                 let cart_result: Result<(String, Vec<u8>), String> = {
                     let m = &mut st.session.machine;
-                    let path = m
-                        .cartridge_image
-                        .as_ref()
-                        .map(|img| img.path.clone())
-                        .unwrap_or_default();
-                    if path.is_empty() {
-                        Err("no cartridge attached or no backing file path".to_string())
-                    } else {
-                        match m.cartridge.as_mut().and_then(|c| c.crt_image(m.clk)) {
-                            Some(bytes) => Ok((path, bytes)),
-                            None => Err("mapper cannot re-pack a .crt (read-only or unsupported)".to_string()),
+                    match m.cartridge.as_ref() {
+                        None => Err("no cartridge attached".to_string()),
+                        Some(_) if backing.is_empty() => Err("no backing file".to_string()),
+                        Some(c) if !c.persists_writable_state() => {
+                            Err("this mapper has no persistence port for writable state".to_string())
                         }
+                        Some(c) if !c.is_writable_dirty() => Err("clean".to_string()),
+                        Some(_) => match host_write_target(&backing) {
+                            Err(e) => Err(e),
+                            Ok(path) => match m.cartridge.as_mut().and_then(|c| c.crt_image(m.clk)) {
+                                Some(bytes) => Ok((path, bytes)),
+                                None => Err("mapper cannot re-pack a .crt".to_string()),
+                            },
+                        },
                     }
                 };
                 match cart_result {
                     Err(reason) => {
-                        return Response::ok(id, json!({ "written": false, "reason": reason }));
+                        return Response::ok(id, json!({ "written": false, "role": "cartridge", "reason": reason }));
                     }
                     Ok((path_clone, bytes_to_write)) => {
                         let notify = st.notify.clone();
@@ -10205,6 +10209,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                                 }));
                                 return Response::ok(id, json!({
                                     "written": true,
+                                    "role": "cartridge",
                                     "path": path_clone,
                                     "bytes": byte_count
                                 }));
@@ -10233,27 +10238,31 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             st.session.machine.drive_mut(pos).flush_disk_writeback();
             let result = match st.session.machine.drive(pos).get_attached_disk() {
                 None => {
-                    Ok(json!({ "written": false, "reason": "no backing path or not mounted" }))
+                    Ok(json!({ "written": false, "role": "disk", "reason": "no disk mounted" }))
                 }
                 Some(disk) => {
                     match &disk.backing_path {
                         None => {
-                            Ok(json!({ "written": false, "reason": "no backing path or not mounted" }))
+                            Ok(json!({ "written": false, "role": "disk", "reason": "no backing file" }))
                         }
                         Some(bp) => {
                             if disk.read_only {
-                                Ok(json!({ "written": false, "reason": "read-only or not dirty" }))
+                                Ok(json!({ "written": false, "role": "disk", "reason": "read-only" }))
                             } else {
                                 let bytes_to_write = disk.bytes.clone();
-                                let path_clone = bp.clone();
+                                let target = host_write_target(bp);
                                 drop(st);
-                                match std::fs::write(&path_clone, &bytes_to_write) {
+                                match target {
+                                    Err(e) => Err(format!("media/persist: {e}")),
+                                    Ok(path_clone) => match std::fs::write(&path_clone, &bytes_to_write) {
                                     Ok(()) => Ok(json!({
                                         "written": true,
+                                        "role": "disk",
                                         "path": path_clone,
                                         "bytes": bytes_to_write.len()
                                     })),
                                     Err(e) => Err(format!("media/persist: write error: {e}")),
+                                    },
                                 }
                             }
                         }
@@ -10330,6 +10339,10 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             let out_path = match req.params.get("out_path").and_then(|v| v.as_str()) {
                 Some(p) if !p.is_empty() => p.to_string(),
                 _ => return Response::err(id, -32602, "audio/export: out_path required"),
+            };
+            let out_path = match host_write_target(&out_path) {
+                Ok(p) => p,
+                Err(e) => return Response::err(id, -32602, format!("audio/export: {e}")),
             };
             let duration_sec = req.params.get("duration_sec").and_then(|v| v.as_f64());
             let duration_sec = match duration_sec {
@@ -10482,8 +10495,12 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 .params
                 .get("output")
                 .and_then(|v| v.as_str())
-                .map(PathBuf::from)
-                .unwrap_or_else(|| default_trace_output(&st.session.id));
+                .map(|o| host_write_target(o).map(PathBuf::from))
+                .transpose();
+            let output = match output {
+                Ok(o) => o.unwrap_or_else(|| default_trace_output(&st.session.id)),
+                Err(e) => return Response::err(id, -32602, format!("trace/start_domains: {e}")),
+            };
             let retrace = output.with_extension("c64retrace");
             let cycle_start = st.session.machine.clk;
             let run_id = format!("run_live-capture_{}", cycle_start);
@@ -10589,7 +10606,12 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 .params
                 .get("output_path")
                 .and_then(|v| v.as_str())
-                .map(PathBuf::from);
+                .map(|o| host_write_target(o).map(PathBuf::from))
+                .transpose();
+            let output_path = match output_path {
+                Ok(o) => o,
+                Err(e) => return Response::err(id, -32602, format!("ringbuffer/trace: {e}")),
+            };
             let mut st = state.lock().unwrap();
             match build_trace_from_ring(&mut st, cycle_start, cycle_end, output_path) {
                 Ok(out) => Response::ok(id, out),
@@ -12435,6 +12457,10 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 Some(p) if !p.is_empty() => p.to_string(),
                 _ => return Response::err(id, -32602, "recorder/dump: path required"),
             };
+            let path = match host_write_target(&path) {
+                Ok(p) => p,
+                Err(e) => return Response::err(id, -32602, format!("recorder/dump: {e}")),
+            };
             let st = state.lock().unwrap();
             let recorder = match &st.recorder {
                 Some(r) => r,
@@ -12524,6 +12550,10 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 Some(p) => p.to_string(),
                 None => return Response::err(id, -32602, "snapshot/dump: path required"),
             };
+            let path = match host_write_target(&path) {
+                Ok(p) => p,
+                Err(e) => return Response::err(id, -32602, format!("snapshot/dump: {e}")),
+            };
             let mut st = state.lock().unwrap();
             // No flush here: the embedded medium is the disk as written, built on a
             // copy (`gather_native_media_inputs`). Flushing the live drive would
@@ -12601,6 +12631,12 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 Some(p) => p.to_string(),
                 None => return Response::err(id, -32602, "snapshot/undump: path required"),
             };
+            // Resolved like every written path: undump writes its media sidecars next
+            // to the snapshot, so a raw relative path would put them in the process cwd.
+            let path = match host_write_target(&path) {
+                Ok(p) => p,
+                Err(e) => return Response::err(id, -32602, format!("snapshot/undump: {e}")),
+            };
             let mut st = state.lock().unwrap();
             // Shared core: power-cycle to fresh chips → re-attach media → restore
             // (audio/flush is broadcast inside power_cycle_for_restore). The undump is
@@ -12657,6 +12693,10 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 .and_then(|v| v.as_str())
                 .unwrap_or("/tmp/trx64.vsf")
                 .to_string();
+            let output_path = match host_write_target(&output_path) {
+                Ok(p) => p,
+                Err(e) => return Response::err(id, -32602, format!("vsf/save: {e}")),
+            };
             let mut st = state.lock().unwrap();
             let bytes = trx64_core::vsf::save_vsf(&mut st.session.machine);
             let bytes_written = bytes.len();
@@ -12720,6 +12760,10 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             let path = match req.params.get("path").and_then(|v| v.as_str()) {
                 Some(p) if !p.is_empty() => p.to_string(),
                 _ => return Response::err(id, -32602, "ringbuffer/dump: path required"),
+            };
+            let path = match host_write_target(&path) {
+                Ok(p) => p,
+                Err(e) => return Response::err(id, -32602, format!("ringbuffer/dump: {e}")),
             };
             let st = state.lock().unwrap();
             match ringbuffer_dump_to_path(&st, &path) {
@@ -13392,6 +13436,78 @@ pub(crate) fn detect_media_kind(bytes: &[u8], name: &str) -> Result<MediaKind, S
 /// absolute → unchanged; relative → joined to the session cwd (`cd`) or the project
 /// dir when unset. Lets `/mount foo.crt` after `cd out` read .../out/foo.crt instead
 /// of the daemon's process cwd (the cockpit `cd` sets `st.fs_cwd`).
+/// `run` on a PRG load (runtime/run_prg, media/open, session/load_prg): where to
+/// start after the load. A number, or hex text as `$0840`, `0x0840` or `0840`.
+fn parse_run_param(params: &Value) -> Result<Option<u16>, String> {
+    match params.get("run") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) if v.is_u64() => {
+            let n = v.as_u64().unwrap_or(0);
+            if n > 0xffff { Err(format!("run: ${n:x} is not a 16-bit address")) } else { Ok(Some(n as u16)) }
+        }
+        Some(Value::String(t)) => {
+            let h = t.trim();
+            let h = h.strip_prefix('$').or_else(|| h.strip_prefix("0x")).or_else(|| h.strip_prefix("0X")).unwrap_or(h);
+            u16::from_str_radix(h, 16).map(Some).map_err(|_| format!("run: `{t}` is not a hex address (e.g. 0840, $0840)"))
+        }
+        Some(other) => Err(format!("run: expected a number or hex text, got {other}")),
+    }
+}
+
+/// Start the loaded program at `pc`: the monitor's `g`. Both cores get the PC — the
+/// full-machine driver runs from `c64_core`, which `sync_after_monitor` does not touch.
+fn start_loaded_at(st: &mut State, pc: u16) {
+    st.session.machine.cpu6510.reg_pc = pc;
+    st.session.machine.c64_core.reg_pc = pc;
+    st.session.machine.sync_after_monitor();
+    st.session.running = true;
+}
+
+/// Start a BASIC program the way a user does: type `RUN:` + RETURN. The colon makes
+/// any text left to the right of the cursor on the logical line a following statement
+/// that RUN never reaches, instead of part of `RUN` (a ?SYNTAX ERROR) — as VICE does.
+fn type_basic_run(st: &mut State) {
+    let now = st.session.machine.cpu6510.clk;
+    st.session.machine.keyboard.type_text(now, "RUN:\r", 80_000, 80_000);
+    st.session.running = true;
+}
+
+/// VARTAB ($2D/$2E) = the byte after a program loaded at $0801, as the KERNAL LOAD
+/// leaves it, so RUN finds the end of the program.
+fn set_vartab_after(st: &mut State, load: u16, len: usize) {
+    if load == 0x0801 {
+        let end = (load as usize + len) & 0xffff;
+        st.session.machine.poke(0x002d, &[(end & 0xff) as u8, (end >> 8) as u8]);
+    }
+}
+
+/// The one door for a host file the daemon WRITES from a caller-supplied path.
+///
+/// An absolute path is used as given. A relative one is resolved against the bound
+/// project (`--project` / `project/set` / `C64RE_PROJECT_DIR`), made absolute; with
+/// no project bound it is refused. It is never handed to `fs::write` raw: the process
+/// cwd is wherever the daemon was spawned (C64RE starts it in its own repository), so a
+/// raw relative write lands in a directory nobody asked for (C64RE #30).
+fn host_write_target(raw: &str) -> Result<String, String> {
+    if raw.is_empty() {
+        return Err("empty path".into());
+    }
+    let p = std::path::Path::new(raw);
+    if p.is_absolute() {
+        return Ok(raw.to_string());
+    }
+    let project = project_knowledge::bound_project().ok_or_else(|| {
+        format!("relative path `{raw}` and no project bound — give an absolute path, or bind a project")
+    })?;
+    let base = std::path::Path::new(&project);
+    let base = if base.is_absolute() {
+        base.to_path_buf()
+    } else {
+        std::env::current_dir().map(|c| c.join(base)).unwrap_or_else(|_| base.to_path_buf())
+    };
+    Ok(base.join(p).to_string_lossy().to_string())
+}
+
 fn resolve_fs_path_with_state(st: &State, arg: &str) -> String {
     if arg.is_empty() || std::path::Path::new(arg).is_absolute() {
         return arg.to_string();
@@ -16462,9 +16578,6 @@ fn undump_native_snapshot(st: &mut State, path: &str) -> Result<UndumpResult, St
                     materialized_any = true;
                     let cps = cp.to_string_lossy().to_string();
                     st.session.cart_path = cps.clone();
-                    if let Some(img) = st.session.machine.cartridge_image.as_mut() {
-                        img.path = cps.clone();
-                    }
                     // Spec 793 — REPORT the cart as media as well. The materialize loop
                     // above only collects `drive8`, so a cart-only snapshot summarised as
                     // "media: none" even though an EF/MagicDesk cart WAS restored and
@@ -16570,9 +16683,6 @@ fn purge_materialized_media(st: &mut State) -> (usize, usize) {
     // cart stays functional; it just no longer claims a deleted file as its backing).
     if under(&st.session.cart_path) {
         st.session.cart_path.clear();
-        if let Some(img) = st.session.machine.cartridge_image.as_mut() {
-            img.path.clear();
-        }
     }
 
     let mut ndirs = 0usize;
@@ -17632,7 +17742,6 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         u64_speed_table: trx64_core::vic::U64SpeedTable::U64II,
         input_journal: None,
         session,
-        type_buffer: Vec::new(),
         ctrl_frame: 0, // incremented on each debug/run|pause|continue; first pause → 1
         machine_generation: 0,
         audio_hooked_generation: 0,
@@ -18314,8 +18423,7 @@ mod batch1_tests {
             input_journal: None,
             announced_model: trx64_core::model::default_model(),
             session: Session::new("integrated-1"),
-            type_buffer: Vec::new(),
-            ctrl_frame: 0,
+                ctrl_frame: 0,
             machine_generation: 0,
             audio_hooked_generation: 0,
             ctrl_stop: None,
@@ -24510,6 +24618,176 @@ mod batch1_tests {
     // ── Spec 863 — models: the list, the switch, identity through reset, power and rewind ──
 
     /// A ROM-booted, headless machine of the default model, warmed to READY.
+    // ── C64RE #30 — a written path is the mounted file, never the process cwd ────────
+
+    #[test]
+    fn host_write_target_keeps_absolute_and_never_passes_a_raw_relative_path() {
+        assert_eq!(host_write_target("/tmp/x.crt").unwrap(), "/tmp/x.crt");
+        assert!(host_write_target("").is_err());
+        match project_knowledge::bound_project() {
+            // No project bound: a relative path is refused, not written into the cwd.
+            None => assert!(host_write_target("x.crt").is_err()),
+            Some(p) => {
+                let got = host_write_target("x.crt").unwrap();
+                assert!(std::path::Path::new(&got).is_absolute(), "{got}");
+                assert!(got.ends_with("x.crt") && got.contains(p.trim_start_matches("./")), "{got}");
+            }
+        }
+    }
+
+    fn ef_cart_state(tag: &str) -> (SharedState, std::path::PathBuf, std::path::PathBuf, Vec<u8>) {
+        let dir = std::env::temp_dir().join(format!("trx64_c64re30_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let crt_path = dir.join("camp_de_save.crt");
+        let mut bank0 = vec![0xffu8; 0x4000];
+        bank0[0x3ffc] = 0x00;
+        bank0[0x3ffd] = 0x80;
+        let crt = build_crt_for_test(32, 1, 0, "EF", &[(0, 0x8000, bank0)]);
+        std::fs::write(&crt_path, &crt).unwrap();
+        let st = make_state();
+        {
+            let mut g = st.lock().unwrap();
+            g.session.machine.attach_cart_from_bytes(&crt, "camp_de_save.crt").expect("attach EF");
+            g.session.cart_path = crt_path.to_string_lossy().to_string();
+        }
+        (st, dir, crt_path, crt)
+    }
+
+    fn program_ef_byte(st: &SharedState, value: u8) {
+        let mut g = st.lock().unwrap();
+        let bi = bi_for_test();
+        let clk = g.session.machine.clk;
+        let cart = g.session.machine.cartridge.as_mut().expect("cart");
+        cart.write(0x8555, 0xaa, &bi, clk);
+        cart.write(0x82aa, 0x55, &bi, clk);
+        cart.write(0x8555, 0xa0, &bi, clk);
+        cart.write(0x8100, value, &bi, clk);
+    }
+
+    #[test]
+    fn media_persist_cartridge_writes_the_mounted_file_and_says_where() {
+        let (st, dir, crt_path, crt) = ef_cart_state("persist");
+        let cwd_stray = std::env::current_dir().unwrap().join("camp_de_save.crt");
+        let _ = std::fs::remove_file(&cwd_stray);
+
+        // Clean: nothing to persist, and it says so.
+        let r = call(&st, "media/persist", json!({ "role": "cartridge" }));
+        assert_eq!(r["written"], json!(false), "{r}");
+        assert_eq!(r["reason"], json!("clean"), "{r}");
+        assert_eq!(std::fs::read(&crt_path).unwrap(), crt, "a clean persist leaves the file alone");
+
+        program_ef_byte(&st, 0x42);
+        let r = call(&st, "media/persist", json!({ "role": "cartridge" }));
+        assert_eq!(r["written"], json!(true), "{r}");
+        assert_eq!(r["role"], json!("cartridge"), "{r}");
+        assert_eq!(r["path"], json!(crt_path.to_string_lossy()), "the reply names the absolute file: {r}");
+        let after = std::fs::read(&crt_path).unwrap();
+        assert_eq!(after[0x40 + 0x10 + 0x100], 0x42, "the MOUNTED file holds the programmed byte");
+        assert!(!cwd_stray.exists(), "nothing was written into the process cwd");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn swapcrt_moves_the_backing_file_to_the_new_cart() {
+        let (st, dir, crt_path, crt) = ef_cart_state("swap");
+        let new_path = dir.join("other.crt");
+        std::fs::write(&new_path, &crt).unwrap();
+        program_ef_byte(&st, 0x42); // dirty old cart: swapcrt persists it to ITS file
+        {
+            let mut g = st.lock().unwrap();
+            run_monitor(&mut g, &format!("swapcrt \"{}\"", new_path.display())).expect("swapcrt");
+            assert_eq!(g.session.cart_path, new_path.to_string_lossy(), "the session now points at the new cart");
+        }
+        assert_eq!(std::fs::read(&crt_path).unwrap()[0x40 + 0x10 + 0x100], 0x42, "the old cart's flash went to the OLD file");
+        program_ef_byte(&st, 0x24);
+        let r = call(&st, "media/persist", json!({ "role": "cartridge" }));
+        assert_eq!(r["path"], json!(new_path.to_string_lossy()), "{r}");
+        assert_eq!(std::fs::read(&new_path).unwrap()[0x40 + 0x10 + 0x100], 0x24, "the new cart's flash goes to the NEW file");
+        assert_eq!(std::fs::read(&crt_path).unwrap()[0x40 + 0x10 + 0x100], 0x42, "and never into the old one");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── C64RE #29 — a loaded PRG is started and hears the keyboard ─────────────────
+
+    #[test]
+    fn run_param_takes_a_number_or_hex_text() {
+        assert_eq!(parse_run_param(&json!({})).unwrap(), None);
+        assert_eq!(parse_run_param(&json!({ "run": 2112 })).unwrap(), Some(0x0840));
+        assert_eq!(parse_run_param(&json!({ "run": "0840" })).unwrap(), Some(0x0840));
+        assert_eq!(parse_run_param(&json!({ "run": "$0840" })).unwrap(), Some(0x0840));
+        assert_eq!(parse_run_param(&json!({ "run": "0x0840" })).unwrap(), Some(0x0840));
+        assert!(parse_run_param(&json!({ "run": "zz" })).is_err());
+        assert!(parse_run_param(&json!({ "run": 70000 })).is_err());
+    }
+
+    /// `10 SYS2061` and, at $080D, `LDA #$2A / STA $0400 / JMP *`.
+    fn sys_stub_prg(dir: &std::path::Path) -> std::path::PathBuf {
+        let mut prg = vec![0x01, 0x08];
+        prg.extend_from_slice(&[0x0b, 0x08, 0x0a, 0x00, 0x9e, b'2', b'0', b'6', b'1', 0x00, 0x00, 0x00]);
+        prg.extend_from_slice(&[0xa9, 0x2a, 0x8d, 0x00, 0x04, 0x4c, 0x12, 0x08]);
+        let p = dir.join("stub.prg");
+        std::fs::write(&p, &prg).unwrap();
+        p
+    }
+
+    fn bounded_frames(st: &SharedState, frames: usize) {
+        for _ in 0..frames {
+            call(st, "session/run", json!({ "cycles": 19_656 }));
+        }
+    }
+
+    /// The C64RE sandbox sequence: open a $0801 stub with no disk and no cart, pause,
+    /// clock bounded runs. Autostart types `RUN:` and the program runs. Before the fix
+    /// the load latched `injected`, the runs went to the CPU-only core, no CIA scanned the
+    /// keyboard and READY. stayed on screen.
+    #[test]
+    fn a_loaded_basic_stub_autostarts_under_bounded_runs() {
+        let Some(st) = booted_state() else { return };
+        let dir = std::env::temp_dir().join(format!("trx64_c64re29_auto_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prg = sys_stub_prg(&dir);
+        let r = call(&st, "media/open", json!({ "path": prg.to_string_lossy() }));
+        assert_eq!(r["autostart"], json!(true), "{r}");
+        call(&st, "debug/pause", json!({}));
+        bounded_frames(&st, 120);
+        let g = st.lock().unwrap();
+        assert_eq!(g.session.machine.ram[0x0400], 0x2a, "RUN: was typed and the stub ran");
+        drop(g);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn typed_text_reaches_a_machine_that_only_loaded_a_prg() {
+        let Some(st) = booted_state() else { return };
+        let dir = std::env::temp_dir().join(format!("trx64_c64re29_type_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prg = sys_stub_prg(&dir);
+        call(&st, "session/load_prg", json!({ "prg_path": prg.to_string_lossy() }));
+        call(&st, "debug/pause", json!({}));
+        call(&st, "session/type", json!({ "text": "SYS2061\r" }));
+        bounded_frames(&st, 120);
+        assert_eq!(st.lock().unwrap().session.machine.ram[0x0400], 0x2a, "the typed SYS reached BASIC");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn media_open_run_starts_at_the_given_address_without_the_keyboard() {
+        let Some(st) = booted_state() else { return };
+        let dir = std::env::temp_dir().join(format!("trx64_c64re29_run_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prg = sys_stub_prg(&dir);
+        let r = call(&st, "media/open", json!({ "path": prg.to_string_lossy(), "run": "080D" }));
+        assert_eq!(r["run"], json!(0x080d), "{r}");
+        call(&st, "debug/pause", json!({}));
+        bounded_frames(&st, 2);
+        assert_eq!(st.lock().unwrap().session.machine.ram[0x0400], 0x2a, "started at $080D directly");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn booted_state() -> Option<SharedState> {
         let roms = rom_dir();
         if !roms.join("kernal-901227-03.bin").exists() {

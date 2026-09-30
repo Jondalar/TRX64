@@ -910,7 +910,6 @@ fn roml_flash_image(bytes: &[u8], mapper_type: MapperType) -> ParsedCartridgeIma
         );
     }
     ParsedCartridgeImage {
-        path: COMMERCIAL_DIR.to_string(),
         name: "commercial".to_string(),
         mapper_type,
         exrom: 1,
