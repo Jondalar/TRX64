@@ -31,6 +31,8 @@ monitor (VICE-superset):
     wr [lens] <a> <b..>  write exactly these bytes from a
     f <a> <b> <d..>  fill range a..b with repeating data
     a <a> [instr]    assemble; `a c000` enters assemble mode (type lines, empty exits)
+    asm <a> [<<TAG]  assemble a BLOCK at a: lines are collected until `end` (or TAG), then assembled as one — labels (`loop:`), `name = value`, `*`, `<`/`>`, `+`/`-`, `.byte`, `.word`, one `*=`/`.org` before the first byte. Not a build system: no includes, no macros.
+    asm-file <path> [a]  the same, from a file (the file's `*=` gives the address if a is omitted)
     t <a> <b> <dst>  move/copy a..b to dst (overlap-safe)
     c <a> <b> <dst>  compare a..b vs dst (list diffs)
     h <a> <b> <d..>  hunt for a byte pattern (xx = wildcard)
