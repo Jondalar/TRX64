@@ -296,10 +296,9 @@ pub trait MonitorHost {
     /// This is not `on_effect` with extra words. `on_effect` says what one COMMAND did
     /// to the timeline and is fired once, before the verb runs, because Spec 808's
     /// truncation has to happen before a `g` starts appending anchors. This fires per
-    /// write, after it, and carries the lens, because the daemon's bus-selection gate
-    /// latches `injected` and `io_injected` SEPARATELY — an `io` write means the VIC
-    /// must be ticking, a `ram` write does not. One flag for both, or a notification
-    /// without the lens, would silently drop a booted machine onto the isolated core.
+    /// write, after it, and carries the lens. A write never decides which core runs the
+    /// machine: the daemon keeps the default no-op (only `session/create {exerciser}`
+    /// selects the isolated core — C64RE #29).
     fn on_machine_write(&mut self, _lens: &str) {}
 
     /// Replace the machine. **No default**, and that is a correction: the spec gave

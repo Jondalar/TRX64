@@ -643,24 +643,23 @@ impl Drop for AudioRenderThread {
 /// `debug/memory_access_map` — MUST read THIS so RUN and STEP/INSPECT see the SAME
 /// machine for the same scenario (no run-vs-step observer effect).
 ///
-/// `full_machine` reads SCENARIO state only (`full_assembled` + `injected`/`io_injected`
-/// + a `vic`-directed trace directive), NEVER a recording channel:
-///   * a real boot / `wr io` register-injection / a `vic`-directed program → full machine
-///     (the per-cycle VIC renderer must sweep the raster; the VIC steals CPU cycles via
-///     badline / sprite-DMA BA-low).
-///   * a plain-`wr`-injected CPU/CIA/SID ISA micro-exerciser → the isolated `cpu6510`
-///     core it is a unit test OF (the core the TS-recorded goldens for those exercisers
-///     match; the full machine's VERBATIM VICE core legitimately diverges from the TS
-///     oracle on jammed-CPU / indexed-RMW FETCH_OPCODE cycle counts).
+/// `full_machine` reads SCENARIO state only (`full_assembled` + `exerciser` + attached
+/// hardware + a `vic`-directed trace directive), NEVER a recording channel:
+///   * a booted machine → the full machine (the per-cycle VIC renderer sweeps the
+///     raster, the VIC steals CPU cycles, the CIAs scan the keyboard). Loading a PRG,
+///     typing, or poking bytes through the monitor does not change that.
+///   * a `session/create {exerciser: true}` scenario → the isolated `cpu6510` core it is
+///     a unit test OF (cycle-exact CPU/CIA/SID ISA exercisers built by `wr` + `r pc=`).
+///     This used to be inferred from a one-way `injected` latch that ANY monitor write,
+///     PRG load or `run_prg` set, so a booted C64 with no disk and no cart silently lost
+///     its CIAs and never heard the keyboard again (C64RE #29). Now only the scenario
+///     that says so gets it.
 ///
-/// `injected` alone is NOT that scenario. It is a one-way latch that any monitor
-/// `wr`/`a`/`r <reg>=` or a `session/load_prg` sets and nothing clears, so it cannot by
-/// itself distinguish "a machine BUILT by poking bytes" from "a real machine somebody
-/// poked once". ATTACHED HARDWARE is what makes that call: a cartridge or a mounted disk
-/// means a real C64, and neither exists on the isolated core. An exerciser has neither.
+/// Even an exerciser is kept on the full machine by ATTACHED HARDWARE: a cartridge or a
+/// mounted disk means a real C64, and neither exists on the isolated core.
 ///
 /// `vic_directed` reads the active trace's `vic`/`c64-vic` domain — but ONLY to ENGAGE
-/// the VIC (the moral equivalent of `io_injected`); the `vic` domain has NO recording
+/// the VIC ; the `vic` domain has NO recording
 /// producer, so it changes the BUS, never a recording filter. It is NOT a recording
 /// channel: the recording domains are `c64-cpu`/`memory`/`sid`/`drive8-cpu`, none of
 /// which flips this gate — hence enabling any RECORDING domain leaves execution
@@ -672,39 +671,23 @@ fn full_machine_gate(session: &Session) -> bool {
         .map(|t| TraceChannels::from_domains(&t.domains).vic)
         .unwrap_or(false);
     // A cartridge ONLY exists on the full literal-VIC machine (the isolated cpu6510
-    // ISA exerciser has no cart mapper). When a cart is attached, the run MUST use the
-    // full machine so a CPU store to the cart's IO1/IO2 register ($DE00-$DFFF) reaches
-    // the mapper (e.g. an EasyFlash live bank switch) — a `wr`-marked `injected` flag
-    // must NOT force the isolated core out from under an attached cart. (Audit
-    // ws-cart-live-mapping — 713 §7.1 live mapping.)
+    // ISA exerciser has no cart mapper), so a CPU store to IO1/IO2 must reach the mapper;
+    // a mounted disk needs the 1541 the isolated core does not have (measured
+    // 2026-08-12: driveCycles frozen at 0, the KERNAL wedged at $EEB2).
     let cart_attached = session.machine.cartridge.is_some();
-    // ...and the SAME argument for a mounted disk, which is how the cart escape hatch
-    // above was found the first time. `injected` is a one-way latch set by ANY monitor
-    // `wr`/`a`/`r <reg>=` and by session/load_prg — so a single poke on a booted,
-    // disk-mounted machine used to re-classify it as a bare ISA micro-exerciser and
-    // drop it onto the isolated `cpu6510` core: no VIC, no CIA, no SID and no 1541.
-    // Measured 2026-08-12 on a mounted G64: driveCycles frozen at 0 over 123M C64
-    // cycles, screen garbage, the KERNAL wedged in the IEC serial routine at $EEB2. An
-    // exerciser scenario has no media by construction, so this cannot pull a real
-    // scenario onto the full machine.
     let media_attached = session.machine.drive8.disk.is_some();
     session.machine.full_assembled
-        && (cart_attached
-            || media_attached
-            || !session.injected
-            || session.io_injected
-            || vic_directed)
+        && (cart_attached || media_attached || !session.exerciser || vic_directed)
 }
 
 /// `full_machine_gate` for a machine that is not the session's — a sandbox clone restored
 /// from an anchor may carry different media than the live machine does right now, so the
-/// cart/disk half of the gate is read from the CLONE, and only the session-level latches
-/// (`injected`, `io_injected`) from the session, passed in because the clone is
-/// restored after the state lock is released. A sandbox run has no trace, so it is never
-/// `vic_directed`.
-fn full_machine_gate_for(machine: &trx64_core::Machine, injected: bool, io_injected: bool) -> bool {
+/// cart/disk half of the gate is read from the CLONE, and only the session's `exerciser`
+/// marker from the session, passed in because the clone is restored after the state lock
+/// is released. A sandbox run has no trace, so it is never `vic_directed`.
+fn full_machine_gate_for(machine: &trx64_core::Machine, exerciser: bool) -> bool {
     machine.full_assembled
-        && (machine.cartridge.is_some() || machine.drive8.disk.is_some() || !injected || io_injected)
+        && (machine.cartridge.is_some() || machine.drive8.disk.is_some() || !exerciser)
 }
 
 /// A passive observer that records whether a hardware IRQ/NMI was DISPATCHED during
@@ -1496,10 +1479,10 @@ fn capture_all_def_json(domains: &[String]) -> Value {
 /// `c64Cycles` is byte-identical whichever is wired). Net: enabling/disabling any
 /// RECORDING domain leaves `c64Cycles` and the event timeline unchanged.
 ///
-/// `full_machine` (scenario nature, NOT a recording domain — `full_assembled` and
-/// `injected`/`io_injected`, never the recording channels): a real boot / `wr io`
-/// register-injection / a `vic`-directed program runs the full literal-VIC product
-/// machine. A plain-`wr`-injected CPU/CIA/SID micro-exerciser runs the isolated
+/// `full_machine` (scenario nature, NOT a recording domain — `full_assembled`, the
+/// `exerciser` marker and attached hardware, never the recording channels): a booted
+/// machine runs the full literal-VIC product machine. A `session/create {exerciser}`
+/// CPU/CIA/SID micro-exerciser runs the isolated
 /// `cpu6510` ISA core it is a unit test OF — that is the core the TS-recorded goldens
 /// for those exercisers match (the full machine's VERBATIM VICE core is a different,
 /// VICE-faithful core that legitimately diverges from the TS oracle on jammed-CPU /
@@ -1645,15 +1628,14 @@ fn power_cycle_for_restore(st: &mut State) {
 }
 
 fn run_cycle_budget(session: &mut Session, budget: u64) {
-    // Full literal-VIC machine when the ROMs are assembled AND the scenario engages
-    // the VIC: a real boot, a `wr io` register injection (render — the per-cycle VIC
-    // renderer sweeps the raster), or a `vic`-directed program. A plain-`wr`-injected
-    // CPU/CIA/SID ISA exerciser stays on the isolated `cpu6510` core.
+    // Full literal-VIC machine when the ROMs are assembled and the scenario is not a
+    // declared exerciser (or is one with media attached, or a `vic`-directed program).
+    // A `session/create {exerciser}` CPU/CIA/SID ISA exerciser stays on the isolated
+    // `cpu6510` core.
     //
     // `vic_directed` reads the trace domain — but ONLY to ENGAGE the VIC, never to pick
-    // a recording filter (the `vic` domain has no producer). It is the moral equivalent
-    // of `io_injected` (a scenario directive to wire the VIC), so the cycle timeline is
-    // the literal VIC's regardless. It does NOT make any RECORDING domain change
+    // a recording filter (the `vic` domain has no producer). It is a scenario directive
+    // to wire the VIC, so the cycle timeline is the literal VIC's regardless. It does NOT make any RECORDING domain change
     // execution: the recording domains are `c64-cpu`/`memory`/`sid`/`drive8-cpu`, and
     // none of them flips this gate. The SAME `full_machine_gate` decides the step/inspect
     // paths, so RUN and STEP see the same machine for the same scenario (Spec 723).
@@ -1784,13 +1766,11 @@ fn run_cycle_budget(session: &mut Session, budget: u64) {
 
 /// Step exactly one instruction (for stepInto / stepOver / until loops).
 fn step_one_instruction(session: &mut Session) {
-    // Full VIC-ticked machine when ROMs are assembled AND we are not on the
-    // chip-ISOLATED CPU-inject path. The per-cycle VIC renderer (vic_draw.rs) builds
-    // the displayed frame by SWEEPING the raster, so a render scenario that injected
-    // VIC registers via `wr io` (io_injected) MUST run the full machine to sweep —
-    // even though that is an injection. But the cycle-exact CPU/CIA-ISOLATED gates
-    // inject a program via plain `wr` (injected, NOT io_injected) and must stay on
-    // the CPU-only path so VIC badline steals don't perturb their cycle counts.
+    // Full VIC-ticked machine unless the session is a declared exerciser. The per-cycle
+    // VIC renderer (vic_draw.rs) builds the displayed frame by SWEEPING the raster, so
+    // a booted machine — pokes, `wr io` render scenarios and PRG loads included — runs
+    // the full machine. Only a `session/create {exerciser}` scenario stays on the
+    // CPU-only path, so VIC badline steals don't perturb its cycle counts.
     // Spec 723: SAME bus gate the run path (`run_cycle_budget`) uses — a `vic`-directed
     // scenario engages the full VIC when STEPPED, exactly as it does when RUN.
     let full_machine = full_machine_gate(session);
@@ -2263,9 +2243,9 @@ fn run_debug_control(id: Value, st: &mut State, frame: u64, _is_continue: bool) 
 /// can short-circuit its reply (signal the pump to PAUSE rather than keep pumping).
 pub(crate) fn check_and_handle_jam(st: &mut State) -> bool {
     // A KIL jams whichever CPU CORE the active run path drives. The full literal-VIC
-    // path (run_for_full — boot / cart / io-injected / vic-directed) jams `c64_core`
-    // (= VICE maincpu_jammed); the chip-ISOLATED ISA-exerciser path (run_for, a `wr`/
-    // run_prg-injected CPU — `session.injected` true, no cart/io/vic) jams the separate
+    // path (run_for_full — any booted machine) jams `c64_core` (= VICE maincpu_jammed);
+    // the chip-ISOLATED ISA-exerciser path (run_for, `session.exerciser` with no cart,
+    // disk or vic-directed trace) jams the separate
     // `cpu6510` interpreter (cpu.rs:1024). full_machine_gate decides the path per run, so
     // exactly ONE core advances — observe a jam on EITHER and report the jammed core's PC.
     let core_jammed = st.session.machine.c64_core.is_jammed;
@@ -2393,7 +2373,7 @@ pub(crate) fn stream_debug_gated_advance(st: &mut State, budget: u64) -> u32 {
         } else {
             // No trace: the historical plain full-machine advance. KEEP this as
             // `run_for_full` UNCONDITIONALLY (NOT run_cycle_budget's no-trace path,
-            // which routes an injected machine onto the cpu6510-isolated `run_for`) —
+            // which routes an exerciser onto the cpu6510-isolated `run_for`) —
             // the JAM auto-break below reads `c64_core.is_jammed`, which only the full
             // path drives. Byte-identical to the pre-trace stream path.
             let mut sink = NullSink;
@@ -2420,8 +2400,9 @@ pub(crate) fn stream_debug_gated_advance(st: &mut State, budget: u64) -> u32 {
         // gate read `session.injected`: one monitor `wr`/`a`/`r <reg>=` on a booted,
         // disk-mounted session re-classified it as a bare ISA micro-exerciser, so the
         // frame that armed an observer dropped onto the chipless isolated core while the
-        // unarmed frame before it ran the full machine. The gate now asks for ATTACHED
-        // HARDWARE instead, so a real session stays full-machine either way.
+        // unarmed frame before it ran the full machine. The gate now reads only the
+        // `exerciser` marker that `session/create` sets (and attached hardware), so a
+        // real session stays full-machine either way.
         //
         // The unarmed branch above still hardcodes `run_for_full` where this consults the
         // gate. They agree for every real session (assembled ROMs + media); they part only
@@ -2984,16 +2965,8 @@ impl trx64_monitor::MonitorHost for DaemonHost<'_> {
         }
     }
 
-    /// Spec 723's bus-selection gate reads these two latches, and it reads them
-    /// SEPARATELY: an `io` write means the VIC has to be ticking, a plain `ram` write
-    /// does not. That is why the lens comes with the notification.
-    fn on_machine_write(&mut self, lens: &str) {
-        if lens == "io" {
-            self.session.io_injected = true;
-        } else {
-            self.session.injected = true;
-        }
-    }
+    // `on_machine_write` keeps the trait's no-op: a monitor write no longer decides
+    // which core runs the machine (C64RE #29) — only `session/create {exerciser}` does.
 }
 
 /// The monitor as every in-process caller sees it: plain text. Observers, internal
@@ -6663,6 +6636,12 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             // oder umgekehrt immer nur bei neuem Frame"). A machine that is off becomes that
             // model at its next power-on. A row that cannot run is refused by name.
             // (`pal`, the old boolean, is still accepted and ignored.)
+            // `exerciser: true` declares an ISA/chip exerciser scenario (bytes poked + PC
+            // set, cycle-exact on the isolated core); `false` makes it a C64 again. It is
+            // the ONLY switch onto the isolated core — see full_machine_gate.
+            if let Some(ex) = req.params.get("exerciser").and_then(|v| v.as_bool()) {
+                st.session.exerciser = ex;
+            }
             let mut model_switch = Value::Null;
             if let Some(name) = req.params.get("model").and_then(|v| v.as_str()) {
                 match switch_session_model(&mut st, name, owner_from_source(&req.params), "session/create") {
@@ -8412,9 +8391,8 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
 
             set_vartab_after(&mut st, load_addr, body.len());
 
-            // Loading into a booted machine keeps it the full machine: no `injected`
-            // latch here (it moved the run onto the CPU-only core, where no CIA scans
-            // the keyboard and a typed RUN never arrives — C64RE #29).
+            // The machine stays the full machine: only `session/create {exerciser}`
+            // leaves it (C64RE #29).
             //   run given           → start there
             //   loaded at $0801     → type RUN:
             //   anything else       → start at the load address
@@ -9566,8 +9544,6 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                             detail.insert("entry".to_string(), json!(entry as u64));
                         }
                         st.session.machine.sync_after_monitor();
-                        // No `injected` latch for a PRG loaded into a booted machine
-                        // (C64RE #29): it would move bounded runs onto the CPU-only core.
                         None
                     }
                     "crt" => {
@@ -9799,7 +9775,6 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                     let load = u16::from_le_bytes([bytes[0], bytes[1]]);
                     st.session.machine.poke(load, &bytes[2..]);
                     set_vartab_after(&mut st, load, bytes.len() - 2);
-                    // No `injected` latch: see runtime/run_prg (C64RE #29).
                     let msg = if let Some(pc) = run_addr {
                         start_loaded_at(&mut st, pc);
                         format!(
@@ -11477,7 +11452,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             let session = &mut st.session;
             // Spec 723: SAME bus gate the run path (`run_cycle_budget`) uses — the
             // access map must reflect the machine the scenario RUNS on. On a `vic`-directed
-            // (or io-injected / booted) scenario this engages the full VIC, so the map
+            // (or booted) scenario this engages the full VIC, so the map
             // sees the VIC register + sweep accesses a FlatRam isolated run would miss.
             let full_machine = full_machine_gate(session);
 
@@ -11875,7 +11850,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 return Response::err(id, -32602, "sandbox: no runs given");
             }
 
-            let (mut base, snapshot, anchor_id, first_seq, injected, io_injected, cart_name, stamp) = {
+            let (mut base, snapshot, anchor_id, first_seq, exerciser, cart_name, stamp) = {
                 let mut st = state.lock().unwrap();
                 let anchor = if from.is_empty() {
                     match st.checkpoint_ring.list().last() {
@@ -11908,8 +11883,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                     snap,
                     anchor,
                     seq,
-                    st.session.injected,
-                    st.session.io_injected,
+                    st.session.exerciser,
                     cart_name,
                     st.sandbox_stamp.clone(),
                 )
@@ -11917,7 +11891,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             if let Err(e) = restore_checkpoint_into(&mut base, &snapshot) {
                 return Response::err(id, -32001, format!("sandbox: {e}"));
             }
-            let full = full_machine_gate_for(&base, injected, io_injected);
+            let full = full_machine_gate_for(&base, exerciser);
             let media = sandbox_media_baseline(&mut base, &cart_name);
             let run_ids: Vec<String> = (0..runs.len()).map(|i| format!("r-{:04}", first_seq + i as u64 + 1)).collect();
             let sandbox_root = std::path::PathBuf::from(project_knowledge::active_project_dir()).join("sandbox");
@@ -18352,7 +18326,7 @@ mod batch1_tests {
     //
     // Symptom: on a live disk session, arming a `do log` store observer turned the
     // picture to noise, killed the IRQs and wedged the KERNAL in the IEC serial routine
-    // at $EEB2. The observer was innocent — `session.injected` (a one-way latch that ANY
+    // at $EEB2. The observer was innocent — the then `session.injected` (a one-way latch that ANY
     // monitor `wr`/`a`/`r <reg>=` sets) made `full_machine_gate` re-classify a booted,
     // disk-mounted machine as a bare ISA micro-exerciser, and the ARMED stream branch
     // consulted that gate while the UNARMED branch right next to it hardcodes the full
@@ -18370,32 +18344,46 @@ mod batch1_tests {
     }
 
     #[test]
-    fn injected_alone_does_not_unmount_the_full_machine() {
+    fn only_a_declared_exerciser_leaves_the_full_machine() {
         let mut s = Session::new("gate-test");
-        // A machine with ROMs assembled and NOTHING poked is the full machine.
+        // A machine with ROMs assembled is the full machine, whatever was poked into it.
         s.machine.full_assembled = true;
         assert!(full_machine_gate(&s), "a plain assembled machine must be full");
 
-        // One monitor `wr` sets the latch. With no media that still means "an exerciser
-        // built by poking bytes" — the isolated core it is a unit test OF (Spec 723).
-        s.injected = true;
-        assert!(
-            !full_machine_gate(&s),
-            "a bare poked machine is still the ISA exerciser scenario"
-        );
+        // `session/create {exerciser: true}` is the one thing that asks for the isolated
+        // core — the ISA exerciser it is a unit test OF (Spec 723).
+        s.exerciser = true;
+        assert!(!full_machine_gate(&s), "a declared exerciser runs the isolated core");
 
-        // ...but a MOUNTED DISK says otherwise: that is a real C64 somebody poked once,
-        // and the isolated core has no 1541 at all. Same argument as the cart hatch.
+        // ...but a MOUNTED DISK says otherwise: the isolated core has no 1541 at all.
+        // Same argument as the cart hatch.
         s.machine.drive8.attach_disk(blank_d64());
         assert!(
             full_machine_gate(&s),
-            "a mounted disk must keep the machine on the full path after a `wr` — \
+            "a mounted disk must keep the machine on the full path — \
              this is the assertion that was missing when the live session died"
         );
-
-        // Ejecting drops it back to the exerciser reading.
         s.machine.drive8.detach_disk();
         assert!(!full_machine_gate(&s));
+    }
+
+    /// C64RE #29: a monitor write on a booted machine with no disk and no cart used to
+    /// latch it onto the isolated core — no CIA, no keyboard scan. It no longer does.
+    #[test]
+    fn a_monitor_write_keeps_a_booted_machine_whole() {
+        let st = make_state();
+        {
+            let mut g = st.lock().unwrap();
+            g.session.machine.full_assembled = true;
+            for cmd in ["wr 0400 01", "a c000 nop", "r a=42"] {
+                let _ = run_monitor(&mut g, cmd);
+                assert!(full_machine_gate(&g.session), "`{cmd}` must not change the core");
+            }
+        }
+        call(&st, "session/create", json!({ "exerciser": true }));
+        assert!(st.lock().unwrap().session.exerciser, "session/create {{exerciser}} marks it");
+        call(&st, "session/create", json!({ "exerciser": false }));
+        assert!(!st.lock().unwrap().session.exerciser, "and {{exerciser:false}} clears it");
     }
 
     #[test]

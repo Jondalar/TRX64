@@ -3,7 +3,7 @@
   "slice": "cpu",
   "trace": true,
   "steps": [
-    { "method": "session/create", "params": { "pal": true }, "capture": true, "label": "create" },
+    { "method": "session/create", "params": { "exerciser": true, "pal": true }, "capture": true, "label": "create" },
     { "method": "monitor/exec", "params": { "session_id": "$sessionId", "command": "wr 0800 78 F8 A9 09 69 01 A9 99 69 01 A9 50 E9 25 A9 00 E9 01 D8 A2 02 A9 AA 9D 00 06 FE 00 06 DE 00 06 A9 33 8D 10 06 0F 10 06 2F 10 06 4F 10 06 6F 10 06 CF 10 06 EF 10 06 4C 37 08" }, "capture": true, "label": "inject" },
     { "method": "monitor/exec", "params": { "session_id": "$sessionId", "command": "r pc=0800" }, "capture": true, "label": "setpc" },
     { "method": "trace/start_domains", "params": { "session_id": "$sessionId", "domains": ["c64-cpu", "memory"] }, "capture": true, "label": "trace-start" },

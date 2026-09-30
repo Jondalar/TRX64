@@ -26,19 +26,12 @@ pub struct Session {
     pub machine: Machine,
     /// Sessions boot PAUSED — no autonomous tick loop (idle-safe, Spec 744.3).
     pub running: bool,
-    /// True once a CPU-isolated `monitor/exec` inject (`wr` / `r pc=`) has run.
-    /// Distinguishes the CPU/chip-ISOLATED gates (which inject a program + set PC,
-    /// then run on FlatRam/CiaBus/VicBus) from the FULL-MACHINE boot scenarios
-    /// (session/create → session/run straight from the KERNAL reset vector, run
-    /// on the assembled FullBus). False at boot ⇒ full-machine run path.
-    pub injected: bool,
-    /// True once a `wr io` (I/O-lens) inject has run — i.e. a render scenario that
-    /// programmed the VIC/colour-RAM via `Machine::poke_io` and then runs a parked
-    /// frame to SWEEP the per-cycle renderer. Unlike `injected` (which routes the
-    /// run onto the chip-ISOLATED bus for cycle-exact CPU gates), an io-inject
-    /// still needs the FULL VIC-ticked machine so the per-cycle draw accumulates
-    /// the displayed frame. So: io_injected ⇒ keep the full-machine run path.
-    pub io_injected: bool,
+    /// An ISA/chip EXERCISER: a scenario that builds its program by poking bytes and
+    /// setting PC, and wants the cycle-exact CPU-isolated core (FlatRam/CiaBus/VicBus),
+    /// not a booted C64. Set ONLY by `session/create {exerciser: true}`; nothing else —
+    /// no monitor write, no PRG load — turns a booted machine into one. A mounted disk,
+    /// an inserted cart or a VIC-directed trace still keep the full machine.
+    pub exerciser: bool,
     /// Active trace: sibling `.c64retrace` path + accumulated meta. When set,
     /// session/run streams CpuStep/RAM_WRITE/IO_WRITE frames into a FrameSink and
     /// flushes to this path. `None` = no trace.
@@ -146,8 +139,7 @@ impl Session {
             id: id.into(),
             machine: Machine::new_with_model(model),
             running: false,
-            injected: false,
-            io_injected: false,
+            exerciser: false,
             trace: None,
             disk_path: String::new(),
             cart_path: String::new(),
@@ -253,8 +245,7 @@ impl Session {
         self.machine = machine;
         self.running = true;
         self.powered = true;
-        self.injected = false;
-        self.io_injected = false;
+        self.exerciser = false;
         Ok(())
     }
 

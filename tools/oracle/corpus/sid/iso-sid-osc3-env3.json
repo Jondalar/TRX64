@@ -3,7 +3,7 @@
   "slice": "sid",
   "trace": true,
   "steps": [
-    { "method": "session/create", "params": { "pal": true }, "capture": true, "label": "create" },
+    { "method": "session/create", "params": { "exerciser": true, "pal": true }, "capture": true, "label": "create" },
     {
       "method": "monitor/exec",
       "params": {

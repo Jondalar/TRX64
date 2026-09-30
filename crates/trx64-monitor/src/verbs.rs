@@ -299,8 +299,7 @@ pub fn monitor_read(mon: &MonitorState, m: &mut Machine, addr: u16, lens: &str) 
 
 /// A monitor write through the bank lens. The WRITE is the library's — it is the
 /// machine's own memory, and every host's machine is the same `trx64_core::Machine`.
-/// What a host makes of it is the host's: the daemon latches the flags its
-/// bus-selection gate reads, through [`MonitorHost::on_machine_write`].
+/// What a host makes of it is the host's, through [`MonitorHost::on_machine_write`].
 pub fn monitor_write(host: &mut dyn MonitorHost, addr: u16, bytes: &[u8], lens: &str) {
     match lens {
         "ram" => {

@@ -585,10 +585,10 @@ device: drive8
 $ r
 1541 (drive 8)
   ADDR AC XR YR SP NV-BDIZC  clk
-.;0000 00 00 00 00 nv-bdizc  0
+.;ff15 02 ff 00 00 nv-bdIzc  21
   track 18 (halftrack 36)  led off
    spans: 1
-     L2 2..6 $0000 drive8/pc/-
+     L2 2..6 $ff15 drive8/pc/-
    machine: drive8 port $2f/$37 exrom 1 game 1 bank -
 
 $ wr 0400 01
@@ -606,7 +606,7 @@ device: usage: device c64 | drive8
 $ io
 VIC-II:
   d000  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-  d010  00 00 00 00 00 00 c0 00 01 70 f0 00 00 00 00 00
+  d010  00 00 00 00 00 00 c0 00 01 71 f0 00 00 00 00 00
   d020  f0 f0 f0 f0 f0 f0 f0 f0 f0 f0 f0 f0 f0 f0 f0 ff
   d030  ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
 
@@ -624,7 +624,7 @@ CIA2:
 $ io 1
 VIC-II:
   d000  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-  d010  00 00 00 00 00 00 c0 00 01 70 f0 00 00 00 00 00
+  d010  00 00 00 00 00 00 c0 00 01 71 f0 00 00 00 00 00
   d020  f0 f0 f0 f0 f0 f0 f0 f0 f0 f0 f0 f0 f0 f0 f0 ff
   d030  ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
   No details available.
@@ -650,17 +650,74 @@ IEC BUS  (a released line is high; any device may pull it low)
   CLK    high    -       -
   DATA   high    -       -
 
-  cpu_bus=$ff  cpu_port=$ff  drv_bus[8]=$ff  drv_port=$85  drv_data[8]=$ff
+  cpu_bus=$ff  cpu_port=$c0  drv_bus[8]=$c0  drv_port=$85  drv_data[8]=$ff
   C64  $DD00 = $ff (DDR $00)   bit7 DATA in=1 bit6 CLK in=1 bit3 ATN out=0
   1541 $1800 = $1a (DDR $00)   bit7 ATN in=0 bit4 ATNA=1 bit3 CLK out=1 bit2 CLK in=0 bit1 DATA out=1 bit0 DATA in=0
    machine: c64 port $2f/$37 exrom 1 game 1 bank -
 
 $ map
-map: no trace store, and the delta ring is empty — run the machine first (or capture explicitly with `trace on` … `trace off`).
+(no capture running — built from the always-on delta ring, cycles 0–16)
+# trace_memory_map — cpu=c64
+
+⚠ COVERAGE = THIS RUN ONLY. A trace is ONE path. "untouched" ≠ "free":
+  untested paths (other levels, battles, utils/save) may use a hole. Reconcile
+  with the static module load-map / analysis-json before treating a hole as free.
+  This is runtime BEHAVIOUR, NOT identity grounding.
+
+totals: code=2p  written=1p  read-only=0p  untouched=253p  mutated=1p  provably-free=253p
+
+page map (each cell = one $XX00 page; C=code c=code+write W=write M=write+mutated R=read-only .=free #=static-owned-untouched):
+      0 1 2 3 4 5 6 7 8 9 A B C D E F
+$0x00 . M . . . . . . . . . . . . . .
+$1x00 . . . . . . . . . . . . . . . .
+$2x00 . . . . . . . . . . . . . . . .
+$3x00 . . . . . . . . . . . . . . . .
+$4x00 . . . . . . . . . . . . . . . .
+$5x00 . . . . . . . . . . . . . . . .
+$6x00 . . . . . . . . . . . . . . . .
+$7x00 . . . . . . . . . . . . . . . .
+$8x00 . . . . . . . . . . . . . . . .
+$9x00 . . . . . . . . . . . . . . . .
+$Ax00 . . . . . . . . . . . . . . . .
+$Bx00 . . . . . . . . . . . . . . . .
+$Cx00 . . . . . . . . . . . . . . . .
+$Dx00 . . . . . . . . . . . . . . . .
+$Ex00 . . . . . . . . . . . . . . . .
+$Fx00 . . . . . . . . . . . . C C . .
+
+regions:
+range	role	pages	writes	reads	mut	writerPCs	static
+$0000-$00FF	untouched	1	0	0	0	0	-
+$0100-$01FF	data-w-mut	1	2	0	2	1	-
+$0200-$FBFF	untouched	250	0	0	0	0	-
+$FC00-$FDFF	code	2	0	0	0	0	-
+$FE00-$FFFF	untouched	2	0	0	0	0	-
+
+free holes (provably free = untouched this run AND not static-occupied) — 3:
+  $0000-$00FF  1 page(s)  [EF-legal RAM]
+  $0200-$FBFF  250 page(s)
+  $FE00-$FFFF  2 page(s)
    machine: c64 port $2f/$37 exrom 1 game 1 bank -
 
 $ chis
-chis: no cpu history — the live ring is empty (run the machine) and no trace store exists (run `trace on`). `chis` reads the live cpuhistory ring first, then the captured trace.
+# cpuhistory (live ring) — last 4000 cycles, 7 instr
+c1          $fce2  a2 ff     LDX #$ff       a=00 x=ff y=00 sp=ff p=20
+c3          $fce4  78        SEI            a=00 x=ff y=00 sp=ff p=24
+c5          $fce5  9a        TXS            a=00 x=ff y=00 sp=ff p=24
+c7          $fce6  d8        CLD            a=00 x=ff y=00 sp=ff p=24
+c13         $fce7  20 02 fd  JSR $fd02      a=00 x=ff y=00 sp=fd p=24
+c15         $fd02  a2 05     LDX #$05       a=00 x=05 y=00 sp=fd p=24
+c19         $fd04  bd 0f fd  LDA $fd0f,x    a=30 x=05 y=00 sp=fd p=24
+   spans: 9
+     L1 12..17 $fce2 c64/pc/-
+     L2 12..17 $fce4 c64/pc/-
+     L3 12..17 $fce5 c64/pc/-
+     L4 12..17 $fce6 c64/pc/-
+     L5 12..17 $fce7 c64/pc/-
+     L5 33..38 $fd02 c64/target/-
+     L6 12..17 $fd02 c64/pc/-
+     L7 12..17 $fd04 c64/pc/-
+     L7 33..38 $fd0f c64/operand/-
    machine: c64 port $2f/$37 exrom 1 game 1 bank -
 
 $ whowrote d020 3
@@ -672,7 +729,7 @@ pot: selected both ports (parallel) (CIA1 port A out $ff: PA6=1 PA7=1)
   port 1: open
   port 2: open
   latch: $d419=$ff $d41a=$ff
-  next sample in 512 cycles
+  next sample in 506 cycles
   reads: 0
    machine: c64 port $2f/$37 exrom 1 game 1 bank -
 
@@ -681,7 +738,7 @@ pot: selected both ports (parallel) (CIA1 port A out $ff: PA6=1 PA7=1)
   port 1: x=$12 y=$34
   port 2: open
   latch: $d419=$ff $d41a=$ff
-  next sample in 512 cycles
+  next sample in 506 cycles
   reads: 0
    machine: c64 port $2f/$37 exrom 1 game 1 bank -
 
@@ -690,7 +747,7 @@ pot: selected both ports (parallel) (CIA1 port A out $ff: PA6=1 PA7=1)
   port 1: x=$12 y=$34
   port 2: open
   latch: $d419=$ff $d41a=$ff
-  next sample in 512 cycles
+  next sample in 506 cycles
   reads: 0
    machine: c64 port $2f/$37 exrom 1 game 1 bank -
 
@@ -699,7 +756,7 @@ pot: selected both ports (parallel) (CIA1 port A out $ff: PA6=1 PA7=1)
   port 1: open
   port 2: open
   latch: $d419=$ff $d41a=$ff
-  next sample in 512 cycles
+  next sample in 506 cycles
   reads: 0
    machine: c64 port $2f/$37 exrom 1 game 1 bank -
 
