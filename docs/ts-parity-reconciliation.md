@@ -48,7 +48,7 @@ Method-set: TS 90 / TRX64 87. All findings verified against source.
 | `vic/inspect/at`,`/region` + provenance | ❌ deferred | port vic-inspect engine (Spec 710/721) |
 | `runtime/snapshot_tree`,`promote_branch` | ❌ MISSING | time-travel branch tracker (Spec 769) — high effort |
 | `runtime/overlay_run` | ❌ MISSING | anchor→patch→run→read (Spec 769.8) — medium |
-| `runtime/run_prg` autostart | ⚠️ | only sets PC, no BASIC RUN | low |
+| `runtime/run_prg` autostart | ✅ | `run` → PC; $0801 → types `RUN:` + RETURN; else PC = load address. `media/open` and `session/load_prg` take the same `run` | — |
 | `media/ingress` full contract | ⚠️ | no checkpoint/dirty-guard/resume; **CRT path = -32601** (mount path works → MM loads) | port Spec 709.13 |
 | `trace/read` | ❌ STUB | 7 query ops; needs DuckDB | Phase 2 |
 | `scenario_save` durability | ⚠️ | in-memory vs file | low |

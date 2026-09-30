@@ -76,7 +76,7 @@ feed AVAudioEngine, fill an `AVAudioPCMBuffer`'s `int16ChannelData` with the ret
 | `typeText` | `(text: String) throws -> TypeResult` | Type a PETSCII string through the keyboard matrix. |
 | `joystick` | `(port: UInt8, state: JoystickState) throws` | Set a port's joystick (all-false → release). |
 | `loadPrg` | `(bytes: Data) throws -> LoadResult` | Load a PRG into RAM (honours its 2-byte load-address header). Does not run. |
-| `runPrg` | `(bytes: Data) throws -> RunPrgResult` | Load + autostart (BASIC `RUN` for $0801, else JMP to load address). |
+| `runPrg` | `(bytes: Data) throws -> RunPrgResult` | Load + autostart: a program at $0801 gets `RUN:` + RETURN typed (the colon keeps text left on the screen line from becoming a `?SYNTAX ERROR`), anything else starts at its load address. |
 
 ## monitor
 
