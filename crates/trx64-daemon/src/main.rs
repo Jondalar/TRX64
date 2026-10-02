@@ -1647,7 +1647,7 @@ fn run_cycle_budget(session: &mut Session, budget: u64) {
         // captures) and gates each channel for a registered-definition run.
         (
             TraceChannels::from_domains(&t.domains).mask_by_captures(&t.captures),
-            t.buf.is_empty(),
+            t.needs_header(),
             t.meta_json.clone(),
         )
     }) else {
@@ -1761,6 +1761,9 @@ fn run_cycle_budget(session: &mut Session, budget: u64) {
     if let Some(t) = session.trace.as_mut() {
         t.event_count += obs.event_count;
         t.buf.extend_from_slice(&obs.into_buf());
+        if let Err(e) = t.spill(false) {
+            eprintln!("[trx64] trace: cannot append to {}: {e}", t.retrace_path.display());
+        }
     }
 }
 
@@ -2367,7 +2370,7 @@ pub(crate) fn stream_debug_gated_advance(st: &mut State, budget: u64) -> u32 {
         // --stream free-run recorded NOTHING. `run_cycle_budget` is the SAME trace-
         // aware advance path the one-shot session/run uses — it attaches a real
         // TracingObserver with the trace's channels and appends the frame's events to
-        // session.trace.buf (flushed to .c64retrace at trace/run/stop).
+        // session.trace.buf, which spills to the .c64retrace as it grows.
         if st.session.trace.is_some() {
             run_cycle_budget(&mut st.session, budget);
         } else {
@@ -2557,7 +2560,7 @@ fn run_until_break(
         .map(|t| TraceChannels::from_domains(&t.domains).mask_by_captures(&t.captures));
     if trace_channels.is_some() {
         if let Some(t) = session.trace.as_mut() {
-            if t.buf.is_empty() {
+            if t.needs_header() {
                 let meta = t.meta_json.clone();
                 t.buf = FrameSink::with_header(&meta).buf;
             }
@@ -2614,6 +2617,9 @@ fn run_until_break(
                 if let Some(t) = session.trace.as_mut() {
                     t.event_count += tracing.event_count;
                     t.buf.extend_from_slice(&tracing.into_buf());
+                    if let Err(e) = t.spill(false) {
+                        eprintln!("[trx64] trace: cannot append to {}: {e}", t.retrace_path.display());
+                    }
                 }
                 s
             } else {
@@ -4360,6 +4366,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                         meta_json,
                         cycle_start,
                         buf: Vec::new(),
+                        spilled: 0,
                         run_id: run_id.clone(),
                         event_count: 0,
                         domains: domains.clone(),
@@ -5347,17 +5354,16 @@ fn finalize_trace(st: &mut State, background_index: bool) -> (Value, Value) {
         .unwrap_or(0);
     match st.session.trace.take() {
         None => (Value::Null, json!({ "active": false })),
-        Some(t) => {
-            let bytes = if t.buf.is_empty() {
-                FrameSink::with_header(&t.meta_json).buf
-            } else {
-                t.buf
-            };
-            if let Some(parent) = t.retrace_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+        Some(mut t) => {
+            // Whatever is still pending goes after what the run already spilled; a run
+            // that never recorded an event still gets a header-only file.
+            if t.needs_header() {
+                t.buf = FrameSink::with_header(&t.meta_json).buf;
             }
-            let bytes_written = bytes.len();
-            let _ = std::fs::write(&t.retrace_path, &bytes);
+            if let Err(e) = t.spill(true) {
+                eprintln!("[trx64] trace: cannot write {}: {e}", t.retrace_path.display());
+            }
+            let bytes_written = t.total_bytes() as usize;
             // T2.6 — mirror TS TraceRunController.lastStorePath / lastRunId set in stop().
             // The duckdb path is the sibling of the retrace path (strip .c64retrace → .duckdb).
             let duckdb_path = {
@@ -6695,6 +6701,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                     meta_json,
                     cycle_start,
                     buf: Vec::new(),
+                    spilled: 0,
                     run_id: run_id.clone(),
                     event_count: 0,
                     domains: domains.clone(),
@@ -10516,6 +10523,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 meta_json,
                 cycle_start,
                 buf: Vec::new(),
+                spilled: 0,
                 run_id: run_id.clone(),
                 event_count: 0,
                 domains: domains.clone(),
@@ -10717,6 +10725,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 meta_json,
                 cycle_start,
                 buf: Vec::new(),
+                spilled: 0,
                 run_id: run_id.clone(),
                 event_count: 0,
                 domains: domains.clone(),
@@ -10965,6 +10974,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                     "definitionId": t.definition_id,
                     "eventCount": t.event_count,
                     "bytesBuffered": t.buf.len() as u64,
+                    "bytesWritten": t.spilled,
                     "marks": t.marks.len() as u64,
                     "overflowed": false,
                     "capturing": true,
@@ -18138,6 +18148,36 @@ async fn main() {
 
     eprintln!("[trx64] project = {:?}", cli.project);
 
+    // Take the port FIRST, before any machine work. Several C64RE servers warm-start a
+    // daemon on the same port at once; the losers must do nothing and leave quietly so
+    // every client attaches to the winner. A port somebody else owns is that case, not
+    // a crash: one line, exit 0. Any other bind failure is a real error — exit 1 with
+    // the OS error, never a panic.
+    // Bind interface: --bind flag ?? TRX64_BIND env ?? 127.0.0.1 (localhost-only default).
+    let bind_host = cli
+        .bind
+        .clone()
+        .or_else(|| env::var("TRX64_BIND").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let addr: SocketAddr = match format!("{bind_host}:{}", cli.port).parse() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("[trx64] invalid --bind '{bind_host}': {e}");
+            std::process::exit(2);
+        }
+    };
+    let listener = match TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            eprintln!("[trx64] port {} already owned by another runtime — exiting cleanly", cli.port);
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("[trx64] cannot listen on {addr}: {e}");
+            std::process::exit(1);
+        }
+    };
+
     // Spec 863 — which C64 this is, before anything is built: every machine the session
     // makes is made on this row. The model file is checked here so a broken one is a clean
     // exit, and a row that needs a block this build lacks is refused by name.
@@ -18260,16 +18300,6 @@ async fn main() {
         None
     };
 
-    // Bind interface: --bind flag ?? TRX64_BIND env ?? 127.0.0.1 (localhost-only default).
-    let bind_host = cli
-        .bind
-        .clone()
-        .or_else(|| env::var("TRX64_BIND").ok().filter(|s| !s.is_empty()))
-        .unwrap_or_else(|| "127.0.0.1".to_string());
-    let addr: SocketAddr = format!("{bind_host}:{}", cli.port)
-        .parse()
-        .unwrap_or_else(|e| panic!("invalid --bind '{bind_host}': {e}"));
-    let listener = TcpListener::bind(addr).await.expect("failed to bind");
     eprintln!(
         "[trx64] TRX64 {} ({}) listening on ws://{addr}",
         env!("CARGO_PKG_VERSION"),
@@ -24773,6 +24803,36 @@ mod batch1_tests {
         call(&st, "debug/pause", json!({}));
         bounded_frames(&st, 2);
         assert_eq!(st.lock().unwrap().session.machine.ram[0x0400], 0x2a, "started at $080D directly");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `.c64retrace` is the authority, so it grows WHILE a trace records and the
+    /// daemon does not hold the run in memory until stop (it used to: hundreds of MB per
+    /// ten seconds of machine time, the file 0 bytes until trace/run/stop).
+    #[test]
+    fn a_recording_trace_grows_its_file_before_stop() {
+        let Some(st) = booted_state() else { return };
+        let dir = std::env::temp_dir().join(format!("trx64_trace_stream_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("t.duckdb");
+        let retrace = dir.join("t.c64retrace");
+        call(&st, "trace/start_domains", json!({ "domains": ["c64-cpu", "memory"], "output": out.to_string_lossy() }));
+        for _ in 0..60 {
+            call(&st, "session/run", json!({ "cycles": 19_656 }));
+        }
+        let mid = std::fs::metadata(&retrace).map(|m| m.len()).unwrap_or(0);
+        assert!(mid > 0, "the file grows while recording");
+        {
+            let g = st.lock().unwrap();
+            let t = g.session.trace.as_ref().unwrap();
+            assert_eq!(t.spilled, mid, "what is on disk is what was spilled");
+            assert!(t.buf.len() < trx64_session::TraceState::SPILL_BYTES, "only a bounded tail is held in memory");
+        }
+        let stop = call(&st, "trace/run/stop", json!({}));
+        let end = std::fs::metadata(&retrace).unwrap().len();
+        assert!(end >= mid, "stop appends the tail");
+        assert_eq!(stop["run"]["bytesWritten"], json!(end), "{stop}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

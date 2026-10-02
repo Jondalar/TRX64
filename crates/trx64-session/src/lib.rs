@@ -89,8 +89,15 @@ pub struct TraceState {
     pub meta_json: String,
     /// Cycle at which the trace started (= TS cycleStart).
     pub cycle_start: u64,
-    /// Accumulated frame buffer (header + events), flushed at trace/run/stop.
+    /// Frames not yet on disk (the header first, then events). It is appended to the
+    /// `.c64retrace` whenever it passes [`TraceState::SPILL_BYTES`] and once more at
+    /// stop, so the file — the authority — grows while recording and the daemon's
+    /// memory stays flat. (It used to hold the WHOLE run until stop: hundreds of MB per
+    /// ten seconds of machine time, all of it lost on a crash.)
     pub buf: Vec<u8>,
+    /// Bytes of this run already appended to `retrace_path`. 0 = the file has not been
+    /// started; the next spill creates (truncates) it.
+    pub spilled: u64,
     /// runId for status replies.
     pub run_id: String,
     pub event_count: u64,
@@ -125,6 +132,43 @@ pub struct TraceState {
     /// exactly the def's captures, so a def opening the `memory` domain but declaring
     /// only `cpu-row` DROPS mem rows (the 708.7 selection — not a silent no-op).
     pub captures: Vec<String>,
+}
+
+impl TraceState {
+    /// Spill threshold: pending frames are appended to the file once they pass this.
+    pub const SPILL_BYTES: usize = 4 << 20;
+
+    /// True before anything of this run exists — the header still has to be written.
+    pub fn needs_header(&self) -> bool {
+        self.spilled == 0 && self.buf.is_empty()
+    }
+
+    /// Bytes of the run so far, on disk and pending.
+    pub fn total_bytes(&self) -> u64 {
+        self.spilled + self.buf.len() as u64
+    }
+
+    /// Append the pending frames to the `.c64retrace` when they pass the threshold, or
+    /// always with `force` (stop). The first spill creates the file, truncating any
+    /// earlier run's; later ones append. On an error the frames stay pending.
+    pub fn spill(&mut self, force: bool) -> std::io::Result<()> {
+        use std::io::Write;
+        if self.buf.is_empty() || (!force && self.buf.len() < Self::SPILL_BYTES) {
+            return Ok(());
+        }
+        if let Some(parent) = self.retrace_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut f = if self.spilled == 0 {
+            std::fs::File::create(&self.retrace_path)?
+        } else {
+            std::fs::OpenOptions::new().append(true).open(&self.retrace_path)?
+        };
+        f.write_all(&self.buf)?;
+        self.spilled += self.buf.len() as u64;
+        self.buf.clear();
+        Ok(())
+    }
 }
 
 impl Session {
