@@ -1,5 +1,9 @@
 # Spec 791 — VSF → `.c64re` Converter (one-way import onramp)
 
+> **Since Spec 888 `cia.rs` is gone:** the C64's CIA 1 and CIA 2 run on `ciacore.rs` (VICE's
+> `core/ciacore.c`) with the `c64cia.rs` glue. References below to `cia.rs`, `Cia::…` and its line
+> numbers are to the file as it was when this spec was written.
+
 **Status:** BUILT (corrected 2026-08-12; was PROPOSED since 2026-07-15). Shipped:
 `vsf.rs`, `vsf_export.rs`, `convert_cmd.rs` (`trx64cli convert-vsf`),
 `convert_vsf_roundtrip.rs`, `vsf_parity_probe.rs`, and a fidelity report in both

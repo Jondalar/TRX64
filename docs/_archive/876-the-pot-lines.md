@@ -1,5 +1,9 @@
 # Spec 876 — The POT lines: paddles, mouse and extra fire buttons at `$D419`/`$D41A`
 
+> **Since Spec 888 `cia.rs` is gone:** the C64's CIA 1 and CIA 2 run on `ciacore.rs` (VICE's
+> `core/ciacore.c`) with the `c64cia.rs` glue. References below to `cia.rs`, `Cia::…` and its line
+> numbers are to the file as it was when this spec was written.
+
 **Status:** MERGED 2026-09-24 (main) — as built in §15
 **Repos:** TRX64. C64RE: no change.
 **Number:** 876 (registry: `../../C64ReverseEngineeringMCP/specs/README.md`, row present).

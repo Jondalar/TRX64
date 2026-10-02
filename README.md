@@ -82,8 +82,7 @@ Nothing that worked stops working in a patch.
   1 022 730 Hz, ~59.83 frames/s, a 384×247 picture whose bottom rows are raster lines 0–11.
   `model <row>` switches a running machine at the next frame; the program keeps its state and
   the standard it detected at boot. The C64C and first-revision rows are listed but need parts
-  TRX64 does not have yet (the 6526A CIA, the custom-IC glue, KERNAL rev1/rev2), and are refused
-  by name.
+  TRX64 does not have yet (the custom-IC glue, KERNAL rev1/rev2), and are refused by name.
 - **Shared sessions** — one machine, several clients, human and agent at once.
 - **Snapshots** — `.c64re` full machine, `.c64rering` the reverse-debug buffers.
 
@@ -220,7 +219,6 @@ the old behaviour back when something misbehaves.
 | `TRX64_CPUHISTORY` | on | The always-on reverse-debug rings: the last N instructions (`chis`) and the full-delta undo ring behind `reverse_step` / `who_wrote`. Off means both are inert — no recording, no reverse step, no ring dump. The per-frame checkpoint ring and its rewind transport are a different thing and stay. |
 | `TRX64_REVERSE_SECONDS` | `10` | How deep those rings reach, in seconds of a 1 MHz machine. At turbo the same ring covers that many seconds of CPU time, so at 64 MHz it is about a sixtieth of the wall time. |
 | `TRX64_TURBO_FASTPATH` | on | Above 1 MHz, instructions that neither advance the PHI2 clock nor touch anything but RAM run back to back inside one bus. No effect at 1 MHz. |
-| `TRX64_CIA_ALARM_CHECK` | on | Catch a CIA up only when one of its timer alarms is due, as VICE's core does, instead of on every instruction and every cycle. |
 | `TRX64_BIND` | `127.0.0.1` | The address the daemon binds. `0.0.0.0` in the container image. |
 
 ---

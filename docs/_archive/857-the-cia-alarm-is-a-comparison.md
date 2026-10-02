@@ -1,5 +1,9 @@
 # Spec 857 — The CIA alarm is a comparison, not an update
 
+> **Since Spec 888 `cia.rs` is gone:** the C64's CIA 1 and CIA 2 run on `ciacore.rs` (VICE's
+> `core/ciacore.c`) with the `c64cia.rs` glue. References below to `cia.rs`, `Cia::…` and its line
+> numbers are to the file as it was when this spec was written.
+
 **Status:** BUILT 2026-09-17, merged to `main` and released in 0.7.3 — D0–D4, full gate green. 1 MHz 10.53× → 13.33× and 64 MHz 0.97× → 1.22× real time here; on UE2's demo the process CPU per window fell from 76/85/69/97 % to 66/74/59/81 %. See §8.
 **Repo:** TRX64 (`trx64-core`).
 **Number:** 857 (registry: `../../../C64ReverseEngineeringMCP/specs/README.md`).

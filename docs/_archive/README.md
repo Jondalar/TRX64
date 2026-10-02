@@ -251,6 +251,9 @@ deliberately unbuilt on UE2's side. Spec: [855-more-than-one-sid.md](855-more-th
 
 ## The CIA alarm is a comparison, not an update — 857
 
+> Since Spec 888 the CIAs are VICE's ciacore (`ciacore.rs`), alarm-driven by construction; the
+> check-off path and its `TRX64_CIA_ALARM_CHECK` switch are gone, and `cia.rs` with them.
+
 UE2's profile after 856 left one item at the top: the CIA timer update, 12–16 % of the
 emulation thread, which 856 had barely moved. VICE's cycle-exact core checks alarms in every
 instruction prologue and every cycle by COMPARING against the next pending alarm; TRX64 has no

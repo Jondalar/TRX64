@@ -6,7 +6,8 @@ One line per feature, as of 0.12.0. Details: [`README.md`](../README.md), monito
 ## Machine
 
 - C64 models as rows of `crates/trx64-core/models.toml`: PAL 6569, NTSC 6567R8, PAL-N 6572 (`--model c64-pal|c64-ntsc|c64-paln`, `--video pal|ntsc`).
-- C64C and first-revision rows are listed and refused by name (6526A CIA, custom-IC glue, KERNAL rev1/rev2 missing).
+- C64C and first-revision rows are listed and refused by name (custom-IC glue, KERNAL rev1/rev2 missing).
+- CIA 1 and CIA 2 ported from VICE's CIA core: the 6526 of the C64 rows (the 6526A is there for the C64C rows), its interrupt delay line, shift register and time-of-day clock on the model's mains; the keyboard matrix as VICE solves it, ghost keys included.
 - `model <row>` / `session/model`: switch a running machine at the next frame boundary; snapshots and checkpoints record the model.
 - `--machine c64|u64|128` (daemon): `u64` is the Ultimate 64, Elite II and C64 Ultimate: speed register at `$D031`, CPU to 64 MHz (`--speed-table u64ii`, default) or 48 MHz (`u64`); 1 MHz for 2.06 s after a reset, as on the device.
 - `128`: the VIC-IIe `$D02F`/`$D030` pair with VICE's read-back masks, for turbo probes.

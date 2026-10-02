@@ -1,5 +1,9 @@
 # Spec 856 — Turbo pays per instruction
 
+> **Since Spec 888 `cia.rs` is gone:** the C64's CIA 1 and CIA 2 run on `ciacore.rs` (VICE's
+> `core/ciacore.c`) with the `c64cia.rs` glue. References below to `cia.rs`, `Cia::…` and its line
+> numbers are to the file as it was when this spec was written.
+
 **Status:** BUILT 2026-09-17 — D0 cleared (bound ≈ 1.6×), D1–D4 built; UltimateDemo2026 at 64 MHz now holds real time in UE2 (was 0.72–0.98×), 1 MHz unchanged. See §8.
 **Repo:** TRX64 (`trx64-core`). UE2 consumes the result and measures it; it builds nothing here.
 **Number:** 856 (registry: `../../../C64ReverseEngineeringMCP/specs/README.md`).
