@@ -39,6 +39,13 @@ brew install jondalar/trx64/trx64
 
 From source: `cargo build --release`. Builds natively (for Windows it uses MSVC).
 
+**Versions** (pre-1.0). A **minor** version breaks something that worked: a wire method or
+parameter removed or renamed, an answer a client reads changed in shape or meaning, a new
+wire protocol epoch (`trx64-runtime/N`), `.c64re` snapshot compatibility, or the daemon's
+command line changed incompatibly. A **patch** version adds and fixes: new methods, new
+optional parameters, new fields in an answer, new command-line flags, and every fix.
+Nothing that worked stops working in a patch.
+
 ---
 
 ## Capabilities
