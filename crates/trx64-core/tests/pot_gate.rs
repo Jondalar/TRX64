@@ -638,7 +638,7 @@ fn g12_a_warm_reset_keeps_the_set_values_and_selects_both() {
     assert_eq!(m.read_full(0xd419), 100, "port 1 before the reset");
     m.warm_reset();
     assert_eq!((m.pot(1), m.pot(2)), (Some((100, 30)), Some((100, 60))), "a reset unplugs nothing");
-    assert_eq!(m.cia1.pa_output() >> 6, 3, "DDRA=$00: both selected until IOINIT");
+    assert_eq!(m.cia1.pa_out() >> 6, 3, "DDRA=$00: both selected until IOINIT");
     m.set_hold(Some(Hold::Reset));
     m.run_for_full(600, &mut NullSink, |_, _, _, _, _, _, _| {});
     assert_eq!((m.read_full(0xd419), m.read_full(0xd41a)), (50, 20), "the next sample is the parallel reading");

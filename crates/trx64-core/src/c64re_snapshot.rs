@@ -11,28 +11,22 @@
 //! ADDITIVE READS of the existing TRX64 chip state (the VSF/ADR-076 state) —
 //! they never touch the cycle/opcode logic.
 //!
-//! Parity notes vs the c64re shapes (where TRX64's DISTILLED chips lack a
-//! VICE-internal field, the SAME derived placeholder the existing VSF `ser_cia`
-//! uses is emitted — the byte-exact gates are the guard; both runtimes resume
-//! from the register file + RAM + CPU + timer state which IS captured):
+//! Parity notes vs the c64re shapes (where a TRX64 chip lacks a VICE-internal field,
+//! a derived placeholder is emitted):
 //!   - cpu:           1:1 (pc/a/x/y/sp/flags/cycles + maincpu_ba_low_flags).
 //!   - ram/cpuPort*:  1:1.
-//!   - cia1/cia2:     register file + timers (state/latch/cnt/clk) + irqflags are
-//!                    1:1; the IFR delay-line pipeline, the SDR submodule, and the
-//!                    extended TOD fields are DISTILLED (emitted as the VICE-default
-//!                    placeholders — see CiaSnapshot). The ta/tb ALARM CLOCKS are not
-//!                    captured at all: they are a prediction derived from the timer
-//!                    state, so `restore_cia` re-predicts them (an older note here
-//!                    claimed they were 1:1 — CiaSnapshot has no such field).
+//!   - cia1/cia2:     the whole ciacore context (`CiaSnapshot` v3): registers, both
+//!                    timers, the IFR delay line, the SDR shifter, the BCD TOD and its
+//!                    mains counters, and the chip's alarm clocks — a restore is exact.
+//!                    A v2 record (the distilled CIA before Spec 888) is converted:
+//!                    registers + timers + TOD, with a note in `restore_notes`.
 //!   - sid:           regs[32] + voice state 1:1 (gateflip=0 at a boundary).
 //!   - iec:           1:1.
 //!   - cpuIntStatus:  TRX64's [u32;4] per-source model mapped to the c64re
 //!                    pendingInt/intNames arrays (canonical source names).
-//!   - alarmsMaincpu: [] — there is no VICE alarm CONTEXT here: interrupts are the
-//!                    distilled IntStatus. Since Spec 857 each CIA predicts and fires
-//!                    its own timer underflow alarm, but that prediction is derived
-//!                    state and is recomputed on restore, never serialized. The
-//!                    drive's VIA alarms ride the drive blob, exactly as
+//!   - alarmsMaincpu: [] — there is no shared VICE alarm CONTEXT here: each CIA keeps
+//!                    its own and stores its alarm clocks in its own node (`alarms`).
+//!                    The drive's VIA alarms ride the drive blob, exactly as
 //!                    runtime-checkpoint.ts documents.
 //!   - cpu.turboPhase: the CPU cycles counted below the current PHI2 cycle at turbo
 //!                    (Spec 851's divider). Written only when non-zero, so a 1 MHz
@@ -40,18 +34,15 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::cia::{
-    Cia, CIA_CRA, CIA_CRB, CIA_ICR, CIA_SDR, CIA_TAH, CIA_TAL, CIA_TBH, CIA_TBL, CIA_TOD_HR,
-    CIA_TOD_MIN, CIA_TOD_SEC, CIA_TOD_TEN, CLOCK_NEVER,
-};
+use crate::ciacore::{CiaAlarms, CiaCore, CIA_DDRA, CIA_DDRB, CIA_ICR, CIA_PRA, CIA_PRB, CLOCK_NEVER};
 use crate::native_snapshot::{ta_u8, ta_u8_decode};
 use crate::Machine;
 
 /// runtime-checkpoint.ts:27 — `RUNTIME_CHECKPOINT_SCHEMA_VERSION = 1`.
 pub const RUNTIME_CHECKPOINT_SCHEMA_VERSION: i64 = 1;
 
-/// CIA model 0 (CIA_MODEL_6526) — cia6526-vice.ts:169.
-const CIA_MODEL_6526: i64 = 0;
+/// `CiaSnapshot.v` of the whole ciacore context (Spec 888). 2 = the distilled CIA before.
+const CIA_SNAPSHOT_V: i64 = 3;
 
 // ── cpu (runtime-checkpoint.ts:29-36) ──────────────────────────────────────────
 
@@ -163,6 +154,21 @@ pub struct CiaSnapshot {
     pub read_offset: i64,
     pub last_read: i64,
     pub model: i64,
+    // ── v3: the rest of the ciacore context ──
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_offset: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power_freq: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticks_per_sec: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ta_alarmclk: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tb_alarmclk: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alarms: Option<CiaAlarms>,
 }
 
 // ── sid (sid.ts:167-177 — SidSnapshot) ─────────────────────────────────────────
@@ -365,135 +371,192 @@ fn alarmclk_from_json(v: i64) -> u64 {
 
 // ── per-chip capture ───────────────────────────────────────────────────────────
 
-/// Read a TRX64 `Cia` into the c64re `Cia6526ViceSnapshot` shape.
-///
-/// TRX64's `Cia` is DISTILLED relative to VICE's ciacore. The fields it carries
-/// (register file, timer state/latch/cnt/clk, irqflags, ta/tb alarm clk, the
-/// latched TOD) map 1:1; the VICE-internal pipeline fields it does NOT carry are
-/// emitted as the documented VICE-default placeholders (the SAME values the
-/// existing `vsf.rs::ser_cia` writes, where the byte-exact gates already pass):
-///   - ack_irqflags/new_irqflags/ifr_delay = 0 (no IFR delay-line in TRX64).
-///   - rdi/ifr_clock/read_clk = the chip clk.
-///   - SDR submodule (sr_bits/shifter/sdr_*/*_in_state) = 0.
-///   - old_pa/old_pb = 0xff (VICE bug #1143, cia6526-vice.ts:416-418).
-///   - tod power/tick counters = 0; todalarm = 0s.
-pub fn capture_cia(cia: &Cia) -> CiaSnapshot {
-    // Spec 857 D2: capture the timers as they stand at the CIA's clock, not at the last catch-up.
-    let cia = &cia.caught_up();
-    let clk = cia.clk as i64;
+/// A CIA's whole ciacore context, as it stands (v3). Nothing is caught up first: the
+/// chip's clocks and alarm clocks are stored as they are, so a restore continues
+/// exactly where this one would have.
+pub fn capture_cia(cia: &CiaCore) -> CiaSnapshot {
+    let i = |v: u64| v as i64;
+    let b = |v: bool| v as i64;
+    let ta = &cia.ta;
+    let tb = &cia.tb;
     CiaSnapshot {
-        v: 2,
-        c_cia: cia.regs.iter().map(|&b| b as i64).collect(),
+        v: CIA_SNAPSHOT_V,
+        c_cia: cia.c_cia.iter().map(|&x| x as i64).collect(),
         irqflags: cia.irqflags as i64,
-        ack_irqflags: 0,
-        new_irqflags: 0,
-        irq_enabled: cia.regs[CIA_ICR] as i64,
-        rdi: clk,
-        ifr_clock: clk,
-        ifr_delay: 0,
-        tat: cia.ta.is_running() as i64,
-        tbt: cia.tb.is_running() as i64,
-        ta_state: cia.ta.state as i64,
-        ta_latch: cia.ta.latch as i64,
-        ta_cnt: cia.ta.cnt as i64,
-        ta_clk: cia.ta.clk as i64,
-        tb_state: cia.tb.state as i64,
-        tb_latch: cia.tb.latch as i64,
-        tb_cnt: cia.tb.cnt as i64,
-        tb_clk: cia.tb.clk as i64,
-        sr_bits: 0,
-        sdr_valid: 0,
-        sdr_force_finish: 0,
-        shifter: 0,
-        sdr_delay: 0,
-        sp_in_state: 0,
-        cnt_in_state: 0,
-        cnt_out_state: 0,
-        todalarm: cia.tod_alarm.iter().map(|&b| b as i64).collect(),
-        todlatch: cia.tod_latch.iter().map(|&b| b as i64).collect(),
-        todlatched: cia.tod_latched as i64,
-        todstopped: cia.tod_stopped as i64,
-        todticks: cia.tod_clk as i64,
-        // `power_ticks` carries the mains frequency; it was unused before.
-        todclk: clk,
-        todtickcounter: cia.tod_tick_counter as i64,
-        power_tickcounter: 0,
-        power_ticks: cia.tod_power_freq as i64,
-        old_pa: 0xff,
-        old_pb: 0xff,
-        read_clk: clk,
-        read_offset: 0,
-        last_read: 0,
-        model: CIA_MODEL_6526,
-        // ta/tb alarm clk: TRX64 caches them on the Cia (ta_alarmclk/tb_alarmclk);
-        // the c64re snapshot folds them into the Ciat alarm via ta_clk/tb_clk on
-        // restore (the chip re-derives the alarm on the first register access). We
-        // do not emit a separate field (the c64re shape has none — it keeps the
-        // alarm clk private + re-arms via alarmsMaincpu, which TRX64 emits []).
+        ack_irqflags: cia.ack_irqflags as i64,
+        new_irqflags: cia.new_irqflags as i64,
+        irq_enabled: b(cia.irq_enabled),
+        rdi: i(cia.rdi),
+        ifr_clock: i(cia.ifr_clock),
+        ifr_delay: cia.ifr_delay as i64,
+        tat: cia.tat as i64,
+        tbt: cia.tbt as i64,
+        ta_state: ta.state as i64,
+        ta_latch: ta.latch as i64,
+        ta_cnt: ta.cnt as i64,
+        ta_clk: i(ta.clk),
+        tb_state: tb.state as i64,
+        tb_latch: tb.latch as i64,
+        tb_cnt: tb.cnt as i64,
+        tb_clk: i(tb.clk),
+        sr_bits: cia.sr_bits as i64,
+        sdr_valid: b(cia.sdr_valid),
+        sdr_force_finish: b(cia.sdr_force_finish),
+        shifter: cia.shifter as i64,
+        sdr_delay: cia.sdr_delay as i64,
+        sp_in_state: b(cia.sp_in_state),
+        cnt_in_state: b(cia.cnt_in_state),
+        cnt_out_state: b(cia.cnt_out_state),
+        todalarm: cia.todalarm.iter().map(|&x| x as i64).collect(),
+        todlatch: cia.todlatch.iter().map(|&x| x as i64).collect(),
+        todlatched: b(cia.todlatched),
+        todstopped: b(cia.todstopped),
+        todticks: i(cia.todticks),
+        todclk: i(cia.todclk),
+        todtickcounter: cia.todtickcounter as i64,
+        power_tickcounter: cia.power_tickcounter as i64,
+        power_ticks: i(cia.power_ticks),
+        old_pa: cia.old_pa as i64,
+        old_pb: cia.old_pb as i64,
+        read_clk: i(cia.clk),
+        read_offset: i(cia.read_offset),
+        last_read: cia.last_read as i64,
+        model: cia.model as i64,
+        write_offset: Some(i(cia.write_offset)),
+        power_freq: Some(cia.power_freq as i64),
+        ticks_per_sec: Some(cia.ticks_per_sec as i64),
+        ta_alarmclk: Some(alarmclk_to_json(cia.ta_alarmclk)),
+        tb_alarmclk: Some(alarmclk_to_json(cia.tb_alarmclk)),
+        enabled: Some(b(cia.enabled)),
+        alarms: Some(cia.alarm_clocks()),
     }
 }
 
-/// Restore a TRX64 `Cia` from the c64re `Cia6526ViceSnapshot` shape. Mirrors the
-/// VSF `load_cia` reconstruction (register file → timer latches/clk → alarm clk).
-pub fn restore_cia(cia: &mut Cia, s: &CiaSnapshot, tab: &[u16; crate::cia::CIAT_TABLEN]) {
-    for i in 0..16 {
-        cia.regs[i] = s.c_cia.get(i).copied().unwrap_or(0) as u8;
+/// Restore a CIA from its node. A v3 node is the whole context and comes back exactly.
+/// A v2 node — the distilled CIA before Spec 888 — had no IFR line, no SDR, no alarm
+/// context and stored the ICR mask where `irq_enabled` belongs; it is converted
+/// (registers, timers, interrupt flags and mask, TOD) onto a freshly reset chip of the
+/// machine's model, and `Some(note)` says so.
+pub fn restore_cia(cia: &mut CiaCore, s: &CiaSnapshot, name: &str) -> Option<String> {
+    let reg = |i: usize| s.c_cia.get(i).copied().unwrap_or(0) as u8;
+    let arr4 = |v: &Vec<i64>| {
+        let mut a = [0u8; 4];
+        for (k, x) in a.iter_mut().enumerate() {
+            *x = v.get(k).copied().unwrap_or(0) as u8;
+        }
+        a
+    };
+    if s.v < CIA_SNAPSHOT_V {
+        // The old record: rebuild on a reset chip (model, timing, write_offset stay).
+        let clk = s.read_clk.max(0) as u64;
+        cia.clk = clk;
+        cia.reset(&mut crate::ciacore::NoPorts);
+        cia.irq_events.clear();
+        for k in 0..16 {
+            cia.c_cia[k] = reg(k);
+        }
+        cia.old_pa = cia.c_cia[CIA_PRA] | !cia.c_cia[CIA_DDRA];
+        cia.old_pb = cia.c_cia[CIA_PRB] | !cia.c_cia[CIA_DDRB];
+        for (t, st, la, cn, ck) in [
+            (&mut cia.ta, s.ta_state, s.ta_latch, s.ta_cnt, s.ta_clk),
+            (&mut cia.tb, s.tb_state, s.tb_latch, s.tb_cnt, s.tb_clk),
+        ] {
+            t.state = st as u16;
+            t.latch = la as u16;
+            t.cnt = cn as u16;
+            t.clk = ck.max(0) as u64;
+        }
+        cia.tat = s.tat as u32 & 1;
+        cia.tbt = s.tbt as u32 & 1;
+        // The old chip's line was the level `irqflags & mask`; IR (bit 7) is that level.
+        let flags = (s.irqflags as u32) & 0x1f;
+        let up = flags & cia.c_cia[CIA_ICR] as u32 != 0;
+        cia.irqflags = flags | if up { crate::ciacore::CIA_IM_SET } else { 0 };
+        cia.irq_enabled = up;
+        cia.todalarm = arr4(&s.todalarm);
+        cia.todlatch = arr4(&s.todlatch);
+        cia.todlatched = s.todlatched != 0;
+        cia.todstopped = s.todstopped != 0;
+        cia.todtickcounter = s.todtickcounter as u8;
+        // v2 kept the next mains tick as a target clock in `todticks`, measured at `todclk`.
+        let period = cia.todticks.max(1);
+        let left = (s.todticks - s.todclk).clamp(1, period as i64) as u64;
+        cia.todclk = clk + left;
+        let mut alarms = cia.alarm_clocks();
+        alarms.tod = Some(cia.todclk);
+        let ta = cia.ta.predict_alarm();
+        let tb = cia.tb.predict_alarm();
+        cia.ta_alarmclk = ta;
+        cia.tb_alarmclk = tb;
+        alarms.ta = (ta != CLOCK_NEVER).then_some(ta);
+        alarms.tb = (tb != CLOCK_NEVER).then_some(tb);
+        cia.set_alarm_clocks(&alarms);
+        return Some(format!(
+            "{name}: converted from the pre-ciacore CIA record (v{}): registers, timers, interrupt \
+             flags and TOD restored; the IFR delay line and the serial register start empty",
+            s.v
+        ));
     }
-    cia.irqflags = s.irqflags as u8;
-    cia.regs[CIA_ICR] = s.irq_enabled as u8;
+    let u = |v: i64| v.max(0) as u64;
+    for k in 0..16 {
+        cia.c_cia[k] = reg(k);
+    }
+    cia.irqflags = s.irqflags as u32;
+    cia.ack_irqflags = s.ack_irqflags as u32;
+    cia.new_irqflags = s.new_irqflags as u32;
+    cia.irq_enabled = s.irq_enabled != 0;
+    cia.rdi = u(s.rdi);
+    cia.ifr_clock = u(s.ifr_clock);
+    cia.ifr_delay = s.ifr_delay as u32;
+    cia.tat = s.tat as u32;
+    cia.tbt = s.tbt as u32;
     cia.ta.state = s.ta_state as u16;
     cia.ta.latch = s.ta_latch as u16;
     cia.ta.cnt = s.ta_cnt as u16;
-    cia.ta.clk = s.ta_clk as u64;
+    cia.ta.clk = u(s.ta_clk);
     cia.tb.state = s.tb_state as u16;
     cia.tb.latch = s.tb_latch as u16;
     cia.tb.cnt = s.tb_cnt as u16;
-    cia.tb.clk = s.tb_clk as u64;
-    cia.clk = s.read_clk as u64;
-    for i in 0..4 {
-        cia.tod_latch[i] = s.todlatch.get(i).copied().unwrap_or(0) as u8;
+    cia.tb.clk = u(s.tb_clk);
+    cia.sr_bits = s.sr_bits as u32;
+    cia.sdr_valid = s.sdr_valid != 0;
+    cia.sdr_force_finish = s.sdr_force_finish != 0;
+    cia.shifter = s.shifter as u16;
+    cia.sdr_delay = s.sdr_delay as u32;
+    cia.sp_in_state = s.sp_in_state != 0;
+    cia.cnt_in_state = s.cnt_in_state != 0;
+    cia.cnt_out_state = s.cnt_out_state != 0;
+    cia.todalarm = arr4(&s.todalarm);
+    cia.todlatch = arr4(&s.todlatch);
+    cia.todlatched = s.todlatched != 0;
+    cia.todstopped = s.todstopped != 0;
+    cia.todticks = u(s.todticks);
+    cia.todclk = u(s.todclk);
+    cia.todtickcounter = s.todtickcounter as u8;
+    cia.power_tickcounter = s.power_tickcounter as u32;
+    cia.power_ticks = u(s.power_ticks);
+    cia.old_pa = s.old_pa as u8;
+    cia.old_pb = s.old_pb as u8;
+    cia.clk = u(s.read_clk);
+    cia.read_clk = u(s.read_clk);
+    cia.read_offset = u(s.read_offset);
+    cia.last_read = s.last_read as u8;
+    cia.model = s.model as u32;
+    if let Some(v) = s.write_offset {
+        cia.write_offset = u(v);
     }
-    cia.tod_latched = s.todlatched != 0;
-    for i in 0..4 {
-        cia.tod_alarm[i] = s.todalarm.get(i).copied().unwrap_or(0) as u8;
+    if let Some(v) = s.power_freq {
+        cia.power_freq = v as u32;
     }
-    cia.tod_stopped = s.todstopped != 0;
-    cia.tod_tick_counter = s.todtickcounter as u8;
-    // A pre-TOD dump wrote 0 here; a running clock needs a non-zero countdown or it
-    // would fire on the very next cycle.
-    // A pre-TOD dump wrote 0 there: keep the mains the model put on the chip (Spec 863 —
-    // the restore applied the snapshot's row before any chip state).
-    if s.power_ticks > 0 {
-        cia.tod_power_freq = s.power_ticks as u32;
+    if let Some(v) = s.ticks_per_sec {
+        cia.ticks_per_sec = v as u32;
     }
-    // A target clk, so it is re-based onto the restored clock rather than trusting an
-    // old absolute value from a dump written before TOD ran. The PHASE has to survive
-    // that re-basing, and until now it did not: this line recomputed a whole period,
-    // so a machine captured 2 000 cycles from its next tenth came back with a fresh
-    // 19 704 ahead of it. `snapshot_roundtrip_fidelity` measured the gap at ~17 300
-    // cycles on all three scenarios and had been red since the day TOD stopped being a
-    // countdown — unnoticed because that suite is not in the gate, which is now fixed.
-    //
-    // Capture writes the pair: `todticks` is the target and `todclk` is the clock it
-    // was measured against, so their difference is what was actually left to run.
-    // A pre-TOD dump has `todticks` 0 and still gets the full period.
-    let tod_period = cia.tod_period();
-    let remaining = (s.todticks - s.todclk).clamp(0, tod_period as i64) as u64;
-    cia.tod_clk = cia.clk.wrapping_add(if s.todticks > 0 && remaining > 0 {
-        remaining
-    } else {
-        tod_period
-    });
-    // Re-derive the cached alarm clk = the PREDICTED next-underflow clk (VICE
-    // ciat_set_alarm), NOT `ta.clk` (the timer's last-update clk). The old
-    // `= ta.clk` set the alarm to ~now, so the dispatch `while ta_alarmclk <= rclk`
-    // fired the timer IRQ immediately/early after every undump — desyncing any
-    // CIA-timer-driven raster multiplexer (IM3: the room re-render garbled within
-    // ~3 frames from a byte-faithful restore). Stopped timer → NEVER.
-    cia.ta_alarmclk = if cia.ta.is_running() { cia.ta.set_alarm(tab) } else { CLOCK_NEVER };
-    cia.tb_alarmclk = if cia.tb.is_running() { cia.tb.set_alarm(tab) } else { CLOCK_NEVER };
-    // Spec 857 D2: readers catch up to this clock; the timers were captured caught up to it.
-    cia.checked_clk = cia.ta.clk.max(cia.tb.clk);
+    cia.ta_alarmclk = s.ta_alarmclk.map(alarmclk_from_json).unwrap_or(CLOCK_NEVER);
+    cia.tb_alarmclk = s.tb_alarmclk.map(alarmclk_from_json).unwrap_or(CLOCK_NEVER);
+    cia.enabled = s.enabled.map(|v| v != 0).unwrap_or(true);
+    cia.set_alarm_clocks(&s.alarms.unwrap_or_default());
+    cia.irq_events.clear();
+    None
 }
 
 /// Read TRX64's SID (`sid` voice state + `sid_regs`) into the c64re `SidSnapshot`.
@@ -1064,28 +1127,6 @@ pub fn restore_vic_presentation(m: &mut Machine, p: &VicPresentationSnapshot) {
     m.vic.ba_low_flag = p.last_lit_ba_low != 0;
     m.vic.frame = p.lit_stable_frame_count.max(0) as u64;
     let _ = (ta_u32, ta_u32_decode); // used by the draw-cycle codec in vic.rs
-}
-
-// ── CIA register helper (re-export for the daemon load path) ────────────────────
-
-/// Recompute TRX64 timer latches from the restored register file. Used by the
-/// daemon restore so the CIA TAL/TAH/TBL/TBH bytes feed the live counters even
-/// when a cross-runtime dump only carried the register file.
-pub fn reseed_cia_timer_latches(cia: &mut Cia) {
-    let tal = cia.regs[CIA_TAL] as u16;
-    let tah = cia.regs[CIA_TAH] as u16;
-    let latch_a = tal | (tah << 8);
-    if latch_a != 0 {
-        cia.ta.latch = latch_a;
-    }
-    let tbl = cia.regs[CIA_TBL] as u16;
-    let tbh = cia.regs[CIA_TBH] as u16;
-    let latch_b = tbl | (tbh << 8);
-    if latch_b != 0 {
-        cia.tb.latch = latch_b;
-    }
-    // touch the TOD/SDR/CR consts so the import set stays meaningful + greppable
-    let _ = (CIA_TOD_TEN, CIA_TOD_SEC, CIA_TOD_MIN, CIA_TOD_HR, CIA_SDR, CIA_CRA, CIA_CRB);
 }
 
 // ── color-RAM helper ────────────────────────────────────────────────────────────
@@ -1947,20 +1988,21 @@ pub fn restore_runtime_checkpoint(
         restore_cpu(m, &cpu);
     }
 
-    // CIA1 / CIA2. Clone the shared transition-table Arc so restore_cia can
-    // recompute the alarm clks (set_alarm) without borrowing `m` twice.
-    let cia_tab = m.cia_table.clone();
+    // CIA1 / CIA2 — the whole ciacore context, or a converted v2 record (with a note).
+    m.restore_notes.clear();
     if let Some(c) = cp.get("cia1") {
         let s: CiaSnapshot =
             serde_json::from_value(c.clone()).map_err(|e| format!("restore cia1: {e}"))?;
-        restore_cia(&mut m.cia1, &s, &cia_tab);
-        reseed_cia_timer_latches(&mut m.cia1);
+        if let Some(note) = restore_cia(&mut m.cia1, &s, "cia1") {
+            m.restore_notes.push(note);
+        }
     }
     if let Some(c) = cp.get("cia2") {
         let s: CiaSnapshot =
             serde_json::from_value(c.clone()).map_err(|e| format!("restore cia2: {e}"))?;
-        restore_cia(&mut m.cia2, &s, &cia_tab);
-        reseed_cia_timer_latches(&mut m.cia2);
+        if let Some(note) = restore_cia(&mut m.cia2, &s, "cia2") {
+            m.restore_notes.push(note);
+        }
     }
 
     // SID.
@@ -2081,7 +2123,7 @@ pub fn restore_runtime_checkpoint(
         if slot.is_none() && slot_b.is_none() && units == 0 {
             // Conf0 reads the C64's own lines from `iec_fast_1541`, which no checkpoint
             // carries: seed it from the restored CIA2 port A, as a `$DD00` write would.
-            let pa = m.cia2.peek(0xdd00) | !m.cia2.peek(0xdd02);
+            let pa = m.cia2.pa_out();
             m.iec.iecbus_cpu_write_conf0(!pa, 0);
         }
     }
@@ -2246,9 +2288,9 @@ mod tests {
         m.ram[0xd800] = 0x03; // RAM under I/O ($D800, I/O out) — a DISTINCT store, captured by the 64K RAM blob
         m.port_dir = 0x2f;
         m.port_data = 0x17;
-        m.cia1.regs[CIA_TAL] = 0x11;
+        m.cia1.c_cia[crate::ciacore::CIA_SDR] = 0x11;
         m.cia1.irqflags = 0x81;
-        m.cia2.regs[0] = 0x3f;
+        m.cia2.c_cia[0] = 0x3f;
         m.sid_regs[0x18] = 0x0f;
         m.iec.iecbus.cpu_bus = 0x55;
         m.vic.regs[0x11] = 0x1b;
@@ -2263,7 +2305,7 @@ mod tests {
         assert_eq!(cp["atInstructionBoundary"], true);
         assert_eq!(cp["cpu"]["pc"], 0xc000);
         assert_eq!(cp["cpuPortValue"], 0x17);
-        assert_eq!(cp["cia1"]["v"], 2);
+        assert_eq!(cp["cia1"]["v"], 3);
         assert_eq!(cp["sid"]["v"], 2);
         assert_eq!(cp["iec"]["cpu_bus"], 0x55);
         assert_eq!(cp["vic"]["raster_line"], 100);
@@ -2287,9 +2329,9 @@ mod tests {
         assert_eq!(m2.io_shadow[0x0800] & 0x0f, 0x0e); // colour RAM (field)
         assert_eq!(m2.port_dir, 0x2f);
         assert_eq!(m2.port_data, 0x17);
-        assert_eq!(m2.cia1.regs[CIA_TAL], 0x11);
+        assert_eq!(m2.cia1.c_cia[crate::ciacore::CIA_SDR], 0x11);
         assert_eq!(m2.cia1.irqflags, 0x81);
-        assert_eq!(m2.cia2.regs[0], 0x3f);
+        assert_eq!(m2.cia2.c_cia[0], 0x3f);
         assert_eq!(m2.sid_regs[0x18], 0x0f);
         assert_eq!(m2.iec.iecbus.cpu_bus, 0x55);
         assert_eq!(m2.vic.regs[0x11], 0x1b);
@@ -2429,35 +2471,55 @@ mod tests {
     }
 
     #[test]
-    fn cia_roundtrip_register_and_timers() {
+    fn cia_roundtrip_is_the_whole_context() {
         let mut m = Machine::new();
-        m.cia1.regs[CIA_TAL] = 0x34;
-        m.cia1.regs[CIA_TAH] = 0x12;
-        m.cia1.ta.state = 0x55;
-        m.cia1.ta.latch = 0x1234;
-        m.cia1.ta.cnt = 0x0abc;
-        m.cia1.ta.clk = 9999;
-        m.cia1.irqflags = 0x83;
-        m.cia1.clk = 4242;
-
+        // Run a timer with its interrupt enabled, and stop mid-way through the IFR line.
+        m.write_full(0x0001, 0x35);
+        for (a, v) in [(0xdc0d, 0x7f), (0xdc0d, 0x81), (0xdc04, 0x40), (0xdc05, 0x00), (0xdc0e, 0x11)] {
+            m.write_full(a, v);
+        }
+        m.cia1.ifr_delay = 0x0110;
+        m.cia1.shifter = 0x1a5;
         let snap = capture_cia(&m.cia1);
-        assert_eq!(snap.v, 2);
-        assert_eq!(snap.c_cia.len(), 16);
-        assert_eq!(snap.ta_state, 0x55);
-        assert_eq!(snap.ta_latch, 0x1234);
-        assert_eq!(snap.read_clk, 4242);
-        assert_eq!(snap.old_pa, 0xff);
-        assert_eq!(snap.model, 0);
-
+        assert_eq!(snap.v, 3);
         let mut m2 = Machine::new();
-        let tab2 = m2.cia_table.clone();
-        restore_cia(&mut m2.cia1, &snap, &tab2);
-        assert_eq!(m2.cia1.regs[CIA_TAL], 0x34);
-        assert_eq!(m2.cia1.ta.state, 0x55);
-        assert_eq!(m2.cia1.ta.latch, 0x1234);
-        assert_eq!(m2.cia1.ta.cnt, 0x0abc);
-        assert_eq!(m2.cia1.irqflags, 0x83);
-        assert_eq!(m2.cia1.clk, 4242);
+        assert_eq!(restore_cia(&mut m2.cia1, &snap, "cia1"), None);
+        assert_eq!(serde_json::to_value(capture_cia(&m2.cia1)).unwrap(), serde_json::to_value(&snap).unwrap());
+        assert_eq!(m2.cia1.alarm_clocks(), m.cia1.alarm_clocks());
+        assert_eq!(m2.cia1.next_alarm_clk(), m.cia1.next_alarm_clk());
+    }
+
+    /// A v2 node (the distilled CIA) converts: registers, timers, the mask, the flags
+    /// and the line level, with a note.
+    #[test]
+    fn a_v2_cia_record_converts_with_a_note() {
+        let mut v2 = serde_json::to_value(capture_cia(&Machine::new().cia1)).unwrap();
+        let o = v2.as_object_mut().unwrap();
+        for k in ["write_offset", "power_freq", "ticks_per_sec", "ta_alarmclk", "tb_alarmclk", "enabled", "alarms"] {
+            o.remove(k);
+        }
+        o.insert("v".into(), 2.into());
+        let mut c = vec![0i64; 16];
+        c[CIA_ICR] = 0x01; // the mask, where v2 kept it
+        c[14] = 0x11;
+        o.insert("c_cia".into(), serde_json::json!(c));
+        o.insert("irqflags".into(), 1.into());
+        o.insert("irq_enabled".into(), 1.into());
+        o.insert("ta_state".into(), 0x0863.into());
+        o.insert("ta_latch".into(), 0x4000.into());
+        o.insert("ta_cnt".into(), 0x2000.into());
+        o.insert("ta_clk".into(), 500.into());
+        o.insert("read_clk".into(), 500.into());
+        let s: CiaSnapshot = serde_json::from_value(v2).unwrap();
+        let mut m = Machine::new();
+        let note = restore_cia(&mut m.cia1, &s, "cia1").expect("a note");
+        assert!(note.contains("converted"), "{note}");
+        assert_eq!(m.cia1.c_cia[CIA_ICR], 0x01);
+        assert_eq!(m.cia1.irqflags, 0x81, "TA and IR: the old level was up");
+        assert!(m.cia1.irq_enabled);
+        assert_eq!((m.cia1.ta.latch, m.cia1.ta.cnt, m.cia1.ta.clk), (0x4000, 0x2000, 500));
+        assert_eq!(m.cia1.ta_alarmclk, m.cia1.ta.predict_alarm());
+        assert!(m.cia1.alarm_clocks().ta.is_some(), "the running timer has its alarm back");
     }
 
     #[test]

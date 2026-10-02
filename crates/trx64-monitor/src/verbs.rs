@@ -489,7 +489,7 @@ pub fn monitor_help_text() -> String {
 
 /// Spec 876 — the `pot` report.
 fn pot_report(m: &trx64_core::Machine) -> String {
-    let pa = m.cia1.pa_output();
+    let pa = m.cia1.pa_out();
     let sel = trx64_core::pot::select(pa);
     let which = ["neither port", "port 1", "port 2", "both ports (parallel)"][sel as usize];
     let port = |p: u8| match m.pot(p) {

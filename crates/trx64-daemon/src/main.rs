@@ -16452,14 +16452,14 @@ fn switch_at_frame_boundary(
             && before.c64_core.status() == after.c64_core.status()
             && before.c64_core.clk == after.c64_core.clk,
         "ram": before.ram[..] == after.ram[..],
-        "cia": before.cia1.regs == after.cia1.regs && before.cia2.regs == after.cia2.regs
+        "cia": before.cia1.c_cia == after.cia1.c_cia && before.cia2.c_cia == after.cia2.c_cia
             && [&before.cia1, &before.cia2].iter().zip([&after.cia1, &after.cia2]).all(|(b, a)| {
                 b.ta.read_timer() == a.ta.read_timer()
                     && b.tb.read_timer() == a.tb.read_timer()
                     && b.ta.latch == a.ta.latch
                     && b.tb.latch == a.tb.latch
                     && b.irqflags == a.irqflags
-                    && b.tod_clk == a.tod_clk
+                    && b.todclk == a.todclk
             }),
         "sid": before.sid_regs == after.sid_regs,
     });
@@ -25008,7 +25008,7 @@ mod batch1_tests {
             assert_eq!(a.c64_core.status(), b.c64_core.status());
             assert_eq!(a.clk, b.clk, "no cycle ran in the switch");
             assert!(a.ram[..] == b.ram[..], "RAM");
-            assert_eq!((a.cia1.regs, a.cia2.regs), (b.cia1.regs, b.cia2.regs), "CIA registers");
+            assert_eq!((a.cia1.c_cia, a.cia2.c_cia), (b.cia1.c_cia, b.cia2.c_cia), "CIA registers");
             assert_eq!((a.cia1.ta.read_timer(), a.cia1.tb.read_timer()), (b.cia1.ta.read_timer(), b.cia1.tb.read_timer()));
             assert_eq!((a.cia2.ta.read_timer(), a.cia2.tb.read_timer()), (b.cia2.ta.read_timer(), b.cia2.tb.read_timer()));
             assert_eq!(a.sid_regs, b.sid_regs, "SID registers");
@@ -25016,7 +25016,7 @@ mod batch1_tests {
             assert_eq!(a.vic.regs, b.vic.regs, "VIC registers");
             assert_eq!(a.vic.raster_line, 0, "the VIC continues at line 0");
             assert_eq!((a.vic.cycles_per_line(), a.vic.screen_height()), (65, 263));
-            assert_eq!((a.cia1.tod_power_freq, a.drive8.sync_factor), (60, 64079));
+            assert_eq!((a.cia1.power_freq, a.drive8.sync_factor), (60, 64079));
         }
         // Every client was told.
         let pushed = drain_notifications(&mut hello);

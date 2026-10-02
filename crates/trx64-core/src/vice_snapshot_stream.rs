@@ -185,6 +185,14 @@ impl SnapshotT {
         self.write_dword(dw);
         m.size += 4;
     }
+    /// SMW_DB — `snapshot_module_write_double` (snapshot.c:424-432): the eight bytes of
+    /// a C `double` as they sit in memory (little-endian here, as on every VICE host).
+    pub fn smw_db(&mut self, m: &mut SnapshotModule, db: f64) {
+        for b in db.to_le_bytes() {
+            self.write_byte(b);
+        }
+        m.size += 8;
+    }
     /// SMW_CLOCK — qword (8 bytes LE) for VICE CLOCK fields.
     pub fn smw_clock(&mut self, m: &mut SnapshotModule, qw: u64) {
         self.write_qword(qw);

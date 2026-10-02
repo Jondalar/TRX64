@@ -24,7 +24,6 @@
 use crate::c64_6510core::{
     c64_6510core_execute, C64Core6510, C64Core6510Bus, IntStatus, OPERAND_BYTES,
 };
-use crate::cia::CIAT_TABLEN;
 use crate::cpu_history::CpuHistoryRing;
 use crate::delta_ring::DeltaRing;
 use crate::full::FullBus;
@@ -383,6 +382,10 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
         if stolen != 0 {
             self.fb.stalled = stolen;
             self.fb.stalled_on_bus = self.fb.vic.last_steal_on_bus;
+            // `maincpu_steal_cycles` (mainc64cpu.c:127-129): the alarms that fell due
+            // while the VIC held the bus run before the CPU's access.
+            let clk = self.fb.clk;
+            self.fb.process_cia_alarms(clk);
         }
         stolen as u64
     }
@@ -412,46 +415,20 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
         self.fb.clk = clk;
         self.fb.cia1.clk = clk;
         self.fb.cia2.clk = clk;
-        self.fb.cia1.tick(self.fb.cia_table);
-        self.fb.cia2.tick(self.fb.cia_table);
     }
 
-    /// PROCESS_ALARMS — advance the CIA timer state machines up to `clk` so any
-    /// underflow latches its ICR flag at the exact cycle (the interrupt-line
-    /// refresh in the run loop then samples them into IntStatus). The VIC raster
-    /// machinery already advanced via `vic_cycle`.
+    /// PROCESS_ALARMS / `interrupt_delay` (`mainc64cpu.c:97-101`): dispatch every CIA
+    /// alarm due at or before `clk` — one compare per chip when nothing is due.
     #[inline]
     fn process_alarms(&mut self, clk: u64) {
-        let table: &[u16; CIAT_TABLEN] = self.fb.cia_table;
-        self.fb.cia1.checked_clk = clk;
-        self.fb.cia2.checked_clk = clk;
-        // Spec 857 D3 — VICE compares against the next pending alarm here and dispatches only
-        // what is due (`6510dtvcore.c` prologue, `mainc64cpu.c:99`). Catching both timers up
-        // every time is its register-access path, and at 64 MHz it ran ~36 times per PHI2
-        // cycle. Nothing due means nothing a reader could see without catching up itself.
-        let check = self.fb.cia_alarm_check;
-        if !check || self.fb.cia1.alarm_due(clk) {
-            self.fb.cia1.update_to(clk, table);
-        }
-        if !check || self.fb.cia2.alarm_due(clk) {
-            self.fb.cia2.update_to(clk, table);
-        }
+        self.fb.process_cia_alarms(clk);
     }
 
-    /// PER-CYCLE line levels the SC core samples inside `clk_inc` to stamp the
-    /// CPU NMI/IRQ latches at the exact underflow / raster cycle (= VICE's CIA
-    /// alarm callback `my_set_int(rclk)` and VIC `maincpu_set_irq(rclk)`). CIA2's
-    /// interrupt output is wired to /NMI; CIA1 + the VIC feed the shared /IRQ.
-    /// The CIAs were advanced to `clk` by `process_alarms`/`interrupt_delay_alarms`
-    /// (via `update_to`) and the VIC ticked in `vic_cycle`, so these are pure
-    /// reads of the current latched line state.
+    /// The CIAs' `cia_set_int_clk` calls since the last replay, into IntStatus at their
+    /// own clocks: CIA1 on /IRQ, CIA2 on /NMI.
     #[inline]
-    fn cia2_nmi_line(&self) -> bool {
-        self.fb.cia2.irq_asserted()
-    }
-    #[inline]
-    fn cia1_irq_line(&self) -> bool {
-        self.fb.cia1.irq_asserted()
+    fn drain_cia_int(&mut self, int: &mut IntStatus) {
+        self.fb.drain_cia_int(int);
     }
     #[inline]
     fn vic_irq_line(&self) -> bool {

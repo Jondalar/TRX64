@@ -27,8 +27,8 @@
 //! c64re-own module byte counts (save path):
 //!   MAINCPU   11 bytes
 //!   C64MEM    65550 bytes
-//!   CIA1      48 bytes
-//!   CIA2      48 bytes
+//!   CIA1      77 bytes (VICE ciacore 2.5 module body, version 2.5)
+//!   CIA2      77 bytes
 //!   SID       32 bytes
 //!   DRIVECPU  0 bytes (drive blob deferred — Spec 704 §11 R3)
 //!   IECBUS    6 bytes
@@ -36,7 +36,7 @@
 //!   KEYBOARD  6 bytes
 
 use crate::cart::{CartState, FlashCartState};
-use crate::cia::CIA_ICR;
+use crate::ciacore::{CiaCore, CIA_DDRA, CIA_ICR, CIA_PRA};
 use crate::flash040::Flash040SnapState;
 use crate::Machine;
 
@@ -175,14 +175,23 @@ fn push_u32_le(buf: &mut Vec<u8>, v: u32) {
 /// Write a VSF module: null-terminated name, major, minor, 4-byte LE data length,
 /// then data bytes.
 fn write_module(buf: &mut Vec<u8>, name: &[u8], data: &[u8]) {
+    write_module_ver(buf, name, MOD_MAJOR, MOD_MINOR, data);
+}
+
+/// The same framing with the module's own version — the CIA modules carry VICE's
+/// ciacore layout and so its version (2.5).
+fn write_module_ver(buf: &mut Vec<u8>, name: &[u8], major: u8, minor: u8, data: &[u8]) {
     // Null-terminated module name.
     buf.extend_from_slice(name);
     buf.push(0u8);
-    buf.push(MOD_MAJOR);
-    buf.push(MOD_MINOR);
+    buf.push(major);
+    buf.push(minor);
     push_u32_le(buf, data.len() as u32);
     buf.extend_from_slice(data);
 }
+
+/// ciacore.c CIA_DUMP_VER_MAJOR / _MINOR.
+const CIA_DUMP_VER: (u8, u8) = (crate::ciacore::CIA_DUMP_VER_MAJOR, crate::ciacore::CIA_DUMP_VER_MINOR);
 
 // ── Module serializers ────────────────────────────────────────────────────────
 
@@ -225,80 +234,60 @@ fn ser_c64mem(machine: &Machine) -> Vec<u8> {
     data
 }
 
-/// CIA module (48 bytes) — 1:1 with c64re module-mapping.ts `serializeCia`.
-///
-/// Field order + offsets (module-mapping.ts lines 256-288):
-///   c_cia[16]        0..15
-///   irqflags         16
-///   ack_irqflags     17
-///   new_irqflags     18
-///   irq_enabled      19
-///   rdi[4 LE]        20..23
-///   ifr_clock[4 LE]  24..27
-///   ifr_delay        28
-///   tat              29
-///   tbt              30
-///   old_pa           31
-///   old_pb           32
-///   read_clk[4 LE]   33..36
-///   read_offset      37
-///   last_read        38
-///   write_offset     39
-///   model            40
-///   ta_alarmclk[4]   41..44
-///   tb_alarmclk[4]   45..48 (only 45..47 fit — the c64re TS `new Uint8Array(48)`
-///                            silently drops the 48th byte; we replicate that
-///                            exact truncation so the bytes round-trip 1:1.)
-///
-/// `old_pa`/`old_pb` = 0xff at reset (VICE bug #1143 — cia6526-vice.ts:416-418;
-/// the last byte sent to the port backend, which powers up all-high, NOT the
-/// register value). TRX64's `Cia` does not separately track the last port output,
-/// so we emit 0xff to match c64re; on load c64re re-derives it on the first port
-/// access, so it is non-load-bearing for resume.
-/// `model` = 0 (CIA_MODEL_6526, cia6526-vice.ts:169/364 default — the session's
-/// CIA1/CIA2 use the default model).
-fn ser_cia(cia: &crate::cia::Cia, clk: u64) -> Vec<u8> {
-    let mut data = Vec::with_capacity(48);
-    // c_cia[16] = register file
-    data.extend_from_slice(&cia.regs[0..16]);
-    // irqflags
-    data.push(cia.irqflags);
-    // ack_irqflags, new_irqflags
-    data.push(0u8);
-    data.push(0u8);
-    // irq_enabled = ICR mask byte (cia.regs[CIA_ICR])
-    data.push(cia.regs[CIA_ICR]);
-    // rdi (4 LE)
-    push_u32_le(&mut data, 0);
-    // ifr_clock = clk as u32
-    push_u32_le(&mut data, clk as u32);
-    // ifr_delay
-    data.push(0u8);
-    // tat = 1 if TA running
-    data.push(cia.ta.is_running() as u8);
-    // tbt = 1 if TB running
-    data.push(cia.tb.is_running() as u8);
-    // old_pa, old_pb = 0xff (VICE bug #1143; cia6526-vice.ts:416-418).
-    data.push(0xff);
-    data.push(0xff);
-    // read_clk = clk as u32
-    push_u32_le(&mut data, clk as u32);
-    // read_offset, last_read, write_offset
-    data.push(0u8);
-    data.push(0u8);
-    data.push(0u8); // write_offset = 0 (C64SC; cia6526-vice.ts:235)
-    // model = 0 (CIA_MODEL_6526).
-    data.push(0u8);
-    // ta_alarmclk = the cached next-underflow clk (CLOCK_NEVER=0xffff_ffff_ffff_ffff
-    // when stopped). Low 32 bits, matching c64re's `ta_alarmclk` u32 write.
-    push_u32_le(&mut data, cia.ta_alarmclk as u32);
-    // tb_alarmclk — its 4th byte (data[48]) is dropped: the c64re TS buffer is 48
-    // bytes, so writeU32LE at off 45 only stores indices 45..47. We push 4 bytes
-    // then truncate the Vec back to 48 to match byte-for-byte.
-    push_u32_le(&mut data, cia.tb_alarmclk as u32);
-    data.truncate(48);
-    debug_assert_eq!(data.len(), 48);
-    data
+/// The 22-byte VICE module header (16-byte padded name + major + minor + size dword).
+const VICE_MODULE_HEADER: usize = 22;
+
+/// A CIA module's body as VICE writes it: `ciacore_snapshot_write_module` (2.5 layout,
+/// 77 bytes). VICE writes from the live chip, and its settle (`cia_update_ta/tb` +
+/// `cia_ifr_current(CURRENT)`) moves that chip; here it runs on a copy, so a save does
+/// not change the machine it saves — the bytes are the same.
+pub(crate) fn cia_module_body(cia: &CiaCore) -> Vec<u8> {
+    let mut c = cia.clone();
+    let mut s = crate::vice_snapshot_stream::SnapshotT::create_in_memory();
+    c.snapshot_write_module(&mut crate::ciacore::NoPorts, &mut s);
+    s.to_bytes()[VICE_MODULE_HEADER..].to_vec()
+}
+
+/// Read a CIA module body in VICE's ciacore layout (`ciacore_snapshot_read_module`)
+/// into CIA1 or CIA2, and carry out what the C64 glue does on a restore: the
+/// interrupt pin (`cia_restore_int`), and for CIA2 `undump_ciapa` — the VIC bank (read
+/// from the port) and the serial bus (`iecbus_cpu_undump`).
+fn load_cia_vice_body(machine: &mut Machine, cia2: bool, major: u8, minor: u8, body: &[u8]) -> Result<(), String> {
+    let name = if cia2 { "CIA2" } else { "CIA1" };
+    let mut buf = Vec::with_capacity(VICE_MODULE_HEADER + body.len());
+    let mut nm = [0u8; 16];
+    nm[..name.len()].copy_from_slice(name.as_bytes());
+    buf.extend_from_slice(&nm);
+    buf.push(major);
+    buf.push(minor);
+    buf.extend_from_slice(&((VICE_MODULE_HEADER + body.len()) as u32).to_le_bytes());
+    buf.extend_from_slice(body);
+    let mut s = crate::vice_snapshot_stream::SnapshotT::open_in_memory(&buf);
+    let clk = machine.c64_core.clk;
+    let mut p = crate::c64cia::Cia2Ports::default();
+    let cia = if cia2 { &mut machine.cia2 } else { &mut machine.cia1 };
+    cia.clk = clk;
+    let irq = cia.snapshot_read_module(&mut p, &mut s)?;
+    cia.irq_events.clear();
+    let (src, nmi) = if cia2 {
+        (crate::c64_6510core::INT_SRC_CIA2, true)
+    } else {
+        (crate::c64_6510core::INT_SRC_CIA1, false)
+    };
+    // `cia_restore_int`: the source's line as the module recorded it. TRX64 reads no
+    // interrupt module from a VSF, so the line is put back with its clock as well.
+    if nmi {
+        machine.c64_int.set_nmi(src, irq, clk);
+    } else {
+        machine.c64_int.set_irq(src, irq, clk);
+    }
+    if cia2 {
+        if let Some(pa) = p.pa_undump {
+            machine.cia2_pa_out = pa;
+            machine.iec.iecbus_cpu_undump(pa ^ 0xff);
+        }
+    }
+    Ok(())
 }
 
 /// SID module (32 bytes).
@@ -412,9 +401,8 @@ pub fn save_vsf(machine: &mut Machine) -> Vec<u8> {
     write_module(&mut buf, b"MAINCPU", &ser_maincpu(machine));
     write_module(&mut buf, b"C64MEM", &ser_c64mem(machine));
 
-    let clk = machine.clk;
-    write_module(&mut buf, b"CIA1", &ser_cia(&machine.cia1, clk));
-    write_module(&mut buf, b"CIA2", &ser_cia(&machine.cia2, clk));
+    write_module_ver(&mut buf, b"CIA1", CIA_DUMP_VER.0, CIA_DUMP_VER.1, &cia_module_body(&machine.cia1));
+    write_module_ver(&mut buf, b"CIA2", CIA_DUMP_VER.0, CIA_DUMP_VER.1, &cia_module_body(&machine.cia2));
 
     write_module(&mut buf, b"SID", &ser_sid(machine));
     write_module(&mut buf, b"DRIVECPU", &drivecpu);
@@ -512,60 +500,45 @@ fn load_c64mem(machine: &mut Machine, data: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn load_cia(cia: &mut crate::cia::Cia, data: &[u8], name: &str) -> Result<(), String> {
+/// A CIA module of a c64re-own VSF. Version 2.x is VICE's ciacore layout (what
+/// `save_vsf` writes since Spec 888); version 1.0 is the 48-byte record the TS runtime
+/// and the distilled CIA wrote, converted — registers, the ICR mask and flags, the timer
+/// latches — onto a reset chip, with a note in `restore_notes`.
+fn load_cia(machine: &mut Machine, data: &[u8], name: &str, major: u8, minor: u8) -> Result<(), String> {
+    let cia2 = name == "CIA2";
+    if major == crate::ciacore::CIA_DUMP_VER_MAJOR {
+        return load_cia_vice_body(machine, cia2, major, minor, data);
+    }
     if data.len() < 48 {
         return Err(format!("{name}: expected 48 bytes, got {}", data.len()));
     }
-    // c_cia[16] = register file (offsets 0..15).
-    cia.regs[0..16].copy_from_slice(&data[0..16]);
-    // irqflags (offset 16).
-    cia.irqflags = data[16];
-    // irq_enabled (offset 19) → ICR mask.
-    cia.regs[CIA_ICR] = data[19];
-    // Restore timer A/B latches from the TAL/TAH/TBL/TBH registers.
-    let tal = cia.regs[crate::cia::CIA_TAL] as u16;
-    let tah = cia.regs[crate::cia::CIA_TAH] as u16;
-    cia.ta.latch = tal | (tah << 8);
-    cia.ta.cnt = cia.ta.latch;
-    let tbl = cia.regs[crate::cia::CIA_TBL] as u16;
-    let tbh = cia.regs[crate::cia::CIA_TBH] as u16;
-    cia.tb.latch = tbl | (tbh << 8);
-    cia.tb.cnt = cia.tb.latch;
-    // Restore CIA clock from read_clk (offsets 33..36).
-    if let Some(clk32) = read_u32_le(data, 33) {
-        cia.clk = clk32 as u64;
-        cia.ta.clk = clk32 as u64;
-        cia.tb.clk = clk32 as u64;
-    }
-    // Restore cached alarm clocks (offsets 41..44 = ta_alarmclk; 45..47 = the
-    // truncated tb_alarmclk — its top byte was dropped on save to match c64re's
-    // 48-byte buffer). 0xffff_ffff (CLOCK_NEVER low word) ⇒ map to the full u64
-    // CLOCK_NEVER so the alarm-dispatch cascade treats the timer as stopped.
-    if let Some(ta32) = read_u32_le(data, 41) {
-        cia.ta_alarmclk = widen_alarmclk(ta32);
-    }
-    // tb_alarmclk: only 3 bytes survive (45..47); reconstruct as if the 4th byte
-    // were the save-time truncation. We read the 3 available bytes and treat
-    // 0x00ff_ffff (= a stopped timer whose top byte was lost) as CLOCK_NEVER too.
-    let tb_lo24 = (data[45] as u32) | ((data[46] as u32) << 8) | ((data[47] as u32) << 16);
-    cia.tb_alarmclk = if tb_lo24 == 0x00ff_ffff {
-        crate::cia::CLOCK_NEVER
-    } else {
-        tb_lo24 as u64
-    };
+    let clk = machine.c64_core.clk;
+    let cia = if cia2 { &mut machine.cia2 } else { &mut machine.cia1 };
+    cia.clk = clk;
+    cia.reset(&mut crate::ciacore::NoPorts);
+    cia.irq_events.clear();
+    // c_cia[16] = register file (offsets 0..15); irq_enabled (offset 19) = the ICR mask.
+    cia.c_cia.copy_from_slice(&data[0..16]);
+    cia.c_cia[CIA_ICR] = data[19];
+    cia.old_pa = cia.c_cia[CIA_PRA] | !cia.c_cia[CIA_DDRA];
+    cia.old_pb = cia.c_cia[crate::ciacore::CIA_PRB] | !cia.c_cia[crate::ciacore::CIA_DDRB];
+    // The timer latches from the TAL/TAH/TBL/TBH register bytes, counters at the latch.
+    let la = cia.c_cia[crate::ciacore::CIA_TAL] as u16 | (cia.c_cia[crate::ciacore::CIA_TAH] as u16) << 8;
+    let lb = cia.c_cia[crate::ciacore::CIA_TBL] as u16 | (cia.c_cia[crate::ciacore::CIA_TBH] as u16) << 8;
+    cia.ta.latch = la;
+    cia.ta.cnt = la;
+    cia.tb.latch = lb;
+    cia.tb.cnt = lb;
+    // The flags (offset 16) and the line level they meant on the old chip.
+    let flags = data[16] as u32 & 0x1f;
+    let up = flags & cia.c_cia[CIA_ICR] as u32 != 0;
+    cia.irqflags = flags | if up { crate::ciacore::CIA_IM_SET } else { 0 };
+    cia.irq_enabled = up;
+    machine.restore_notes.push(format!(
+        "{name}: converted from the 48-byte pre-ciacore VSF record: registers, mask, flags and \
+         timer latches restored; timers stopped, the IFR delay line and the serial register empty"
+    ));
     Ok(())
-}
-
-/// Widen a 32-bit alarm clock read from a VSF CIA module to the engine's u64
-/// alarm clock. A value of 0xffff_ffff (= the low word of CLOCK_NEVER, written
-/// when the timer is stopped) maps to the full u64 CLOCK_NEVER.
-#[inline]
-fn widen_alarmclk(v32: u32) -> u64 {
-    if v32 == 0xffff_ffff {
-        crate::cia::CLOCK_NEVER
-    } else {
-        v32 as u64
-    }
 }
 
 fn load_sid(machine: &mut Machine, data: &[u8]) -> Result<(), String> {
@@ -723,6 +696,12 @@ fn vice_find_module(data: &[u8], name: &str) -> Option<ViceModule> {
         off += size;
     }
     None
+}
+
+/// The file offset of a module's 22-byte header in a real-VICE file.
+fn vice_find_module_offset(data: &[u8], name: &str) -> Option<usize> {
+    let m = vice_find_module(data, name)?;
+    Some(m.data_start - VICE_MOD_HEADER_LEN)
 }
 
 /// Detect a genuine VICE x64sc snapshot by HEADER STRUCTURE (Spec 791.4), not only
@@ -1098,62 +1077,19 @@ fn load_vice_vsf(machine: &mut Machine, data: &[u8]) -> Result<VsfLoadResult, St
         None => errors.push(("MAINCPU".into(), "missing".into())),
     }
 
-    // ── CIA1 / CIA2 v2.5 ──
-    // VICE order: PRA[0] PRB[1] DDRA[2] DDRB[3] TIMER_A[4..5] TIMER_B[6..7]
-    //   TOD_TEN[8] TOD_SEC[9] TOD_MIN[10] TOD_HR[11] SDR[12] ICR[13] CRA[14]
-    //   CRB[15] LATCH_A[16..17] LATCH_B[18..19] ...
-    let cia_tab = machine.cia_table.clone();
+    // ── CIA1 / CIA2 — VICE's own `ciacore_snapshot_read_module` ──
     for (name, want_cia2) in [("CIA1", false), ("CIA2", true)] {
-        match vice_find_module(data, name) {
-            Some(m) if m.data_len >= 20 => {
-                let d = &data[m.data_start..m.data_start + m.data_len];
-                let cia = if want_cia2 { &mut machine.cia2 } else { &mut machine.cia1 };
-                // Map the register file: the port + DDR + TOD + SDR + control bytes
-                // line up 1:1 with TRX64's register indices. The TAL/TAH/TBL/TBH
-                // register bytes hold the LATCH (VICE LATCH_A/B), not the live
-                // counter (VICE TIMER_A/B, which restores into the counter `cnt`).
-                cia.regs[crate::cia::CIA_PRA] = d[0];
-                cia.regs[crate::cia::CIA_PRB] = d[1];
-                cia.regs[crate::cia::CIA_DDRA] = d[2];
-                cia.regs[crate::cia::CIA_DDRB] = d[3];
-                let latch_a = (d[16] as u16) | ((d[17] as u16) << 8);
-                let latch_b = (d[18] as u16) | ((d[19] as u16) << 8);
-                cia.regs[crate::cia::CIA_TAL] = (latch_a & 0xff) as u8;
-                cia.regs[crate::cia::CIA_TAH] = (latch_a >> 8) as u8;
-                cia.regs[crate::cia::CIA_TBL] = (latch_b & 0xff) as u8;
-                cia.regs[crate::cia::CIA_TBH] = (latch_b >> 8) as u8;
-                cia.regs[crate::cia::CIA_TOD_TEN] = d[8];
-                cia.regs[crate::cia::CIA_TOD_SEC] = d[9];
-                cia.regs[crate::cia::CIA_TOD_MIN] = d[10];
-                cia.regs[crate::cia::CIA_TOD_HR] = d[11];
-                cia.regs[crate::cia::CIA_SDR] = d[12];
-                cia.regs[CIA_ICR] = d[13]; // ICR mask
-                cia.regs[crate::cia::CIA_CRA] = d[14];
-                cia.regs[crate::cia::CIA_CRB] = d[15];
-                // Live counter + latch.
-                let timer_a = (d[4] as u16) | ((d[5] as u16) << 8);
-                let timer_b = (d[6] as u16) | ((d[7] as u16) << 8);
-                cia.ta.latch = latch_a;
-                cia.ta.cnt = timer_a;
-                cia.tb.latch = latch_b;
-                cia.tb.cnt = timer_b;
-                // Align the chip + timer clocks with the restored CPU clk so timer
-                // state machines run from a consistent baseline.
-                let clk = machine.c64_core.clk;
-                cia.clk = clk;
-                cia.ta.clk = clk;
-                cia.tb.clk = clk;
-                // Re-arm the timer alarms from the restored CRA/CRB + cnt/latch. The
-                // register write above set the FILE but not the Ciat control state or
-                // the cached underflow-alarm clk (still CLOCK_NEVER from Machine::new),
-                // so a running timer would never fire again — the game's frame clock +
-                // raster-split IRQ stall (VSF resumed to a garbled bottom split / dead
-                // timer). VICE cia_snapshot_read_module does the same re-arm on load.
-                cia.restore_rearm_alarms(cia_tab.as_ref());
-                loaded.push(name.to_string());
+        let off = vice_find_module_offset(data, name);
+        match (vice_find_module(data, name), off) {
+            (Some(m), Some(hdr)) => {
+                let (major, minor) = (data[hdr + 16], data[hdr + 17]);
+                let body = &data[m.data_start..m.data_start + m.data_len];
+                match load_cia_vice_body(machine, want_cia2, major, minor, body) {
+                    Ok(()) => loaded.push(name.to_string()),
+                    Err(e) => errors.push((name.into(), e)),
+                }
             }
-            Some(m) => errors.push((name.into(), format!("too short: {}", m.data_len))),
-            None => ignored.push(name.to_string()),
+            _ => ignored.push(name.to_string()),
         }
     }
 
@@ -1362,8 +1298,8 @@ pub fn load_vsf(machine: &mut Machine, data: &[u8]) -> Result<VsfLoadResult, Str
             errors.push((mod_name.clone(), "truncated header".into()));
             break;
         }
-        let _major = data[cursor];
-        let _minor = data[cursor + 1];
+        let major = data[cursor];
+        let minor = data[cursor + 1];
         cursor += 2;
         let mod_len = match read_u32_le(data, cursor) {
             Some(v) => v as usize,
@@ -1384,8 +1320,7 @@ pub fn load_vsf(machine: &mut Machine, data: &[u8]) -> Result<VsfLoadResult, Str
         let result = match mod_name.as_str() {
             "MAINCPU" => load_maincpu(machine, mod_data),
             "C64MEM" => load_c64mem(machine, mod_data),
-            "CIA1" => load_cia(&mut machine.cia1, mod_data, "CIA1"),
-            "CIA2" => load_cia(&mut machine.cia2, mod_data, "CIA2"),
+            "CIA1" | "CIA2" => load_cia(machine, mod_data, &mod_name, major, minor),
             "SID" => load_sid(machine, mod_data),
             // DRIVECPU now carries the drive-core blob (= c64re drive1541.restore()).
             // An empty module (a legacy save / no live drive) is a no-op restore.
@@ -1612,7 +1547,7 @@ mod tests {
         let mut m = Machine::new();
         assert_eq!(ser_maincpu(&m).len(), 11, "MAINCPU");
         assert_eq!(ser_c64mem(&m).len(), 65550, "C64MEM");
-        assert_eq!(ser_cia(&m.cia1, 0).len(), 48, "CIA");
+        assert_eq!(cia_module_body(&m.cia1).len(), 77, "CIA (VICE ciacore 2.5: 61 bytes + two 8-byte doubles)");
         assert_eq!(ser_sid(&m).len(), 32, "SID");
         // Fork B (formats-state-1): DRIVECPU is no longer the empty stub — it embeds
         // the full drive-core blob (DRIVE8 + DRIVECPU0 + 1541VIA1D0 + VIA2D0), matching
@@ -1648,12 +1583,16 @@ mod tests {
     /// Append a real-VICE module (16-byte name, major, minor, 4-byte size that
     /// INCLUDES the 22-byte header, then `data`).
     fn push_vice_module(buf: &mut Vec<u8>, name: &str, data: &[u8]) {
+        push_vice_module_ver(buf, name, 1, 0, data);
+    }
+
+    fn push_vice_module_ver(buf: &mut Vec<u8>, name: &str, major: u8, minor: u8, data: &[u8]) {
         let mut nm = [0u8; VICE_MOD_NAME_LEN];
         let n = name.len().min(VICE_MOD_NAME_LEN);
         nm[..n].copy_from_slice(&name.as_bytes()[..n]);
         buf.extend_from_slice(&nm);
-        buf.push(1);
-        buf.push(0); // major/minor
+        buf.push(major);
+        buf.push(minor);
         push_u32_le(buf, (VICE_MOD_HEADER_LEN + data.len()) as u32);
         buf.extend_from_slice(data);
     }
@@ -1753,8 +1692,10 @@ mod tests {
         let mut vsf = vice_header();
         push_vice_module(&mut vsf, "MAINCPU", &vice_maincpu(50_000, 0xc000));
         push_vice_module(&mut vsf, "C64MEM", &vice_c64mem(0xc000));
-        push_vice_module(&mut vsf, "CIA1", &[0u8; 24]); // >= 20 bytes
-        push_vice_module(&mut vsf, "CIA2", &[0u8; 24]);
+        // CIA modules as VICE writes them: ciacore 2.5, 77 bytes.
+        let cia = cia_module_body(&Machine::new().cia1);
+        push_vice_module_ver(&mut vsf, "CIA1", 2, 5, &cia);
+        push_vice_module_ver(&mut vsf, "CIA2", 2, 5, &cia);
         // SID: num_sids/sound/engine/model + 32 regs (>= 36 bytes).
         push_vice_module(&mut vsf, "SID", &[0u8; 40]);
         // VIC-IISC: model[0] + 64 regs (>= 65 bytes) — the register head we restore.

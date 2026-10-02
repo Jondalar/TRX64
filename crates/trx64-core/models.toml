@@ -2,7 +2,7 @@
 #
 # A model is configuration, not code. Each row names the building blocks a machine is
 # made of; the engine holds only the blocks (the VIC-II cycle-table families, the two
-# colour-latency paths of the draw, reSID's 6581/8580, the 6526 CIA, the ROM set) and
+# colour-latency paths of the draw, reSID's 6581/8580, the 6526/6526A CIA, the ROM set) and
 # reads everything else from here. A row that names a block TRX64 does not have is
 # listed, but refused when chosen, with the block's name — never mapped to something
 # close. Adding a model is adding a row; if it needs a block that does not exist yet,

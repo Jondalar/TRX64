@@ -928,10 +928,13 @@ fn bench_turbo_scaling() {
     }
 }
 
-// ── Workload 8: the CIA alarm check (Spec 857 D0) ────────────────────────────────────────
+// ── Workload 8: the CIA alarm path (Spec 857 D0, Spec 888) ───────────────────────────────
 //
-// Check off against check on, alternated run by run in one binary — a hot-path change inside
-// the machine's ~2 % drift needs an alternating A/B, never a single run.
+// Since Spec 888 the C64's CIAs are VICE's ciacore, alarm-driven by construction: the
+// machine compares the clock against each chip's next alarm and dispatches what is due.
+// There is no second (catch-up-every-cycle) path to A/B against any more; this times the
+// one path on the two loads Spec 857 measured, so a before/after of a CIA change can be
+// read off one build each.
 //   - booted, 1 MHz: READY prompt with the KERNAL's CIA1 Timer A IRQ and cursor blink running;
 //   - RAM loop, 64 MHz: `INC $FB / BNE / INC $FC / JMP`, no IRQ armed.
 //
@@ -949,10 +952,9 @@ fn bench_cia_alarm_check() {
     let booted_budget = env_budget("TRX64_CIA857_BUDGET", 5_000_000);
     let turbo_frames = env_budget("TRX64_CIA857_FRAMES", 25);
 
-    let booted = |check: bool| -> f64 {
+    let booted = || -> f64 {
         let mut m = Machine::new();
         m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
-        m.cia_alarm_check = check;
         let mut sink = NullSink;
         m.run_for_full(3_000_000, &mut sink, |_, _, _, _, _, _, _| {});
         let t0 = Instant::now();
@@ -963,11 +965,10 @@ fn bench_cia_alarm_check() {
         }
         t0.elapsed().as_secs_f64()
     };
-    let turbo = |check: bool| -> f64 {
+    let turbo = || -> f64 {
         let mut m = Machine::new();
         m.set_machine_profile(SpeedProfile::U64);
         m.set_u64_turbo(0x00, 0x8f);
-        m.cia_alarm_check = check;
         m.poke(0xc000, &[0xe6, 0xfb, 0xd0, 0x02, 0xe6, 0xfc, 0x4c, 0x00, 0xc0]);
         m.write_full(0x0001, 0x37);
         m.c64_core.reg_pc = 0xc000;
@@ -980,30 +981,14 @@ fn bench_cia_alarm_check() {
         t0.elapsed().as_secs_f64()
     };
 
-    eprintln!("\n========== WORKLOAD 8 — CIA alarm check (Spec 857 D0), K = {k}, alternated ==========");
+    eprintln!("\n========== WORKLOAD 8 — CIA alarm path (Spec 857 D0 / 888), K = {k} ==========");
     for (label, run, emulated) in [
-        ("booted @1 MHz", &booted as &dyn Fn(bool) -> f64, booted_budget as f64 / PAL_HZ),
-        ("RAM loop @64 MHz", &turbo as &dyn Fn(bool) -> f64, (turbo_frames * FRAME) as f64 / PAL_HZ),
+        ("booted @1 MHz", &booted as &dyn Fn() -> f64, booted_budget as f64 / PAL_HZ),
+        ("RAM loop @64 MHz", &turbo as &dyn Fn() -> f64, (turbo_frames * FRAME) as f64 / PAL_HZ),
     ] {
-        let (mut off, mut on) = (Vec::new(), Vec::new());
-        for i in 0..k {
-            // Alternate which side goes first, so a warm-up or thermal trend hits both.
-            if i % 2 == 0 {
-                off.push(run(false));
-                on.push(run(true));
-            } else {
-                on.push(run(true));
-                off.push(run(false));
-            }
-        }
-        let wins = off.iter().zip(&on).filter(|(a, b)| b < a).count();
-        let (mo, mn) = (median(&mut off), median(&mut on));
-        eprintln!(
-            "  {label:<18} off {:>7.2}x  on {:>7.2}x  real time  ({:+.1} % wall; on faster in {wins}/{k} pairs)",
-            emulated / mo,
-            emulated / mn,
-            (mn - mo) / mo * 100.0
-        );
-        eprintln!("  RAW: cia857 load=\"{label}\" k={k} off_med_s={mo:.6} on_med_s={mn:.6} on_faster_pairs={wins}");
+        let mut v: Vec<f64> = (0..k).map(|_| run()).collect();
+        let med = median(&mut v);
+        eprintln!("  {label:<18} {:>7.2}x real time", emulated / med);
+        eprintln!("  RAW: cia857 load=\"{label}\" k={k} med_s={med:.6}");
     }
 }

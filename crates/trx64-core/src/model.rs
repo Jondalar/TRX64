@@ -387,9 +387,10 @@ fn parse(text: &str) -> Result<Registry, String> {
         }
 
         let mut missing = Vec::new();
-        match r.cia.as_str() {
-            "6526" => {}
-            other => missing.push(format!("{other} CIA")),
+        // Both parts VICE's `c64scmodel.c` table names exist (ciacore's CIA_MODEL_6526 /
+        // CIA_MODEL_6526A, c64cia.rs `model_of`).
+        if crate::c64cia::model_of(&r.cia).is_none() {
+            missing.push(format!("{} CIA", r.cia));
         }
         match r.sid.as_str() {
             "6581" | "8580" => {}
@@ -573,10 +574,11 @@ mod tests {
         let runs: Vec<&str> = models().iter().filter(|m| m.runs()).map(|m| m.name.as_str()).collect();
         assert_eq!(runs, ["c64-pal", "c64-ntsc", "c64-paln"]);
         let c64c = find("c64c-pal").unwrap();
-        assert!(c64c.missing.iter().any(|b| b == "6526A CIA"), "{:?}", c64c.missing);
-        assert!(c64c.missing.iter().any(|b| b == "custom-IC glue logic"));
+        // Spec 888 — the 6526A is ciacore's CIA_MODEL_6526A now; the glue keeps the row out.
+        assert!(!c64c.missing.iter().any(|b| b.contains("CIA")), "{:?}", c64c.missing);
+        assert_eq!(c64c.missing, ["custom-IC glue logic"]);
         let err = resolve("c64c-pal").unwrap_err();
-        assert!(err.contains("6526A"), "{err}");
+        assert!(err.contains("custom-IC glue logic"), "{err}");
         assert!(find("c64-old-pal").unwrap().missing.iter().any(|b| b.starts_with("KERNAL rev2")));
         assert!(find("c64-old-ntsc").unwrap().missing.iter().any(|b| b.starts_with("KERNAL rev1")));
         assert!(resolve("c128").unwrap_err().contains("unknown model"));

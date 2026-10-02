@@ -15,7 +15,7 @@ pub mod c64re_snapshot;
 pub mod cart;
 pub mod checkpoint_diff;
 pub mod checkpoint_ring;
-pub mod cia;
+pub mod c64cia;
 pub mod ciacore;
 pub mod user_dir;
 pub mod cpu;
@@ -68,7 +68,7 @@ pub mod vice_snapshot_stream;
 pub mod vsf;
 pub mod vsf_export;
 
-pub use cia::Cia;
+pub use ciacore::CiaCore;
 pub use cpu::{Bus, Cpu6510};
 pub use cpu_history::{CpuHistEntry, CpuHistoryRing};
 pub use crash_triage::{
@@ -415,17 +415,17 @@ impl<'a> VicBus<'a> {
 }
 
 /// CIA-isolated bus (ADR-012): routes $DC00-$DCFF (CIA1) + $DD00-$DDFF (CIA2) to
-/// the two 6526 chips, and flat 64K RAM everywhere else. The CIAs are CLOCK-DRIVEN:
-/// `clk` is advanced once per CPU master cycle by `Bus::tick` and used as the rclk
-/// for every CIA register access (READ_OFFSET = write_offset = 0 on C64SC, so a
-/// read/write at CPU cycle N runs the timer state machine forward to N). No PLA
-/// banking, no VIC/SID, no $00/$01 port — exactly the chip-isolation gate the
-/// CPU-isolated exerciser (SEI; program timers, count down, read $DCxx) needs.
+/// the two CIAs, and flat 64K RAM everywhere else. `clk` is advanced once per CPU
+/// master cycle by `Bus::tick` and is the CIAs' `*clk_ptr` for every register access
+/// (x64sc: READ_OFFSET = write_offset = 0, so an access at CPU cycle N runs the chip
+/// to N). Each tick dispatches the alarms due, as the CPU loop's `interrupt_delay`
+/// does. No PLA banking, no VIC/SID, no $00/$01 port, nothing on the ports and no
+/// interrupt wiring — the chip-isolation gate the CPU-isolated exerciser (SEI;
+/// program timers, count down, read $DCxx) needs.
 pub struct CiaBus<'a> {
     pub mem: &'a mut [u8; 0x10000],
-    pub cia1: &'a mut crate::cia::Cia,
-    pub cia2: &'a mut crate::cia::Cia,
-    pub table: &'a [u16; crate::cia::CIAT_TABLEN],
+    pub cia1: &'a mut ciacore::CiaCore,
+    pub cia2: &'a mut ciacore::CiaCore,
     /// Master clock shared with the CPU: equals the CPU's `self.clk` at each access
     /// because both advance one-per-cycle from the same start and `tick()` fires
     /// at the END of each CPU cycle (after the cycle's bus access).
@@ -436,9 +436,11 @@ impl<'a> Bus for CiaBus<'a> {
     #[inline]
     fn read(&mut self, addr: u16) -> u8 {
         if (0xdc00..0xdd00).contains(&addr) {
-            self.cia1.read(addr, self.clk, self.table)
+            self.cia1.clk = self.clk;
+            self.cia1.read(&mut ciacore::NoPorts, addr)
         } else if (0xdd00..0xde00).contains(&addr) {
-            self.cia2.read(addr, self.clk, self.table)
+            self.cia2.clk = self.clk;
+            self.cia2.read(&mut ciacore::NoPorts, addr)
         } else {
             self.mem[addr as usize]
         }
@@ -446,24 +448,27 @@ impl<'a> Bus for CiaBus<'a> {
     #[inline]
     fn write(&mut self, addr: u16, value: u8) {
         if (0xdc00..0xdd00).contains(&addr) {
-            self.cia1.write(addr, value, self.clk, self.table);
+            self.cia1.clk = self.clk;
+            self.cia1.store(&mut ciacore::NoPorts, addr, value);
         } else if (0xdd00..0xde00).contains(&addr) {
-            self.cia2.write(addr, value, self.clk, self.table);
+            self.cia2.clk = self.clk;
+            self.cia2.store(&mut ciacore::NoPorts, addr, value);
         } else {
             self.mem[addr as usize] = value;
         }
     }
-    /// One CIA master cycle per CPU master cycle. The CIAs' own `clk` is the bus
-    /// `clk`; both advance in lockstep with the CPU. We keep the per-chip prescaler
-    /// (TOD) advancing but the timer state machines run lazily on access (warp
-    /// counting), so this is O(1).
+    /// One CPU master cycle: the clock moves on and the alarms due run. The interrupt
+    /// pins are not wired here, so their changes are dropped.
     #[inline]
     fn tick(&mut self) {
         self.clk = self.clk.wrapping_add(1);
-        self.cia1.clk = self.clk;
-        self.cia2.clk = self.clk;
-        self.cia1.tick(self.table);
-        self.cia2.tick(self.table);
+        let clk = self.clk;
+        self.cia1.process_alarms(&mut ciacore::NoPorts, clk);
+        self.cia2.process_alarms(&mut ciacore::NoPorts, clk);
+        self.cia1.clk = clk;
+        self.cia2.clk = clk;
+        self.cia1.irq_events.clear();
+        self.cia2.irq_events.clear();
     }
 }
 
@@ -540,13 +545,13 @@ pub struct Machine {
     /// VIC-isolated run path (`run_for_vic*`). Raster/badline/BA advance off the
     /// CPU clock regardless of CPU execution (ADR-012 isolation gate).
     pub vic: VicII,
-    /// Cycle-exact CIA1 ($DC00-$DCFF). CLOCK-DRIVEN via the CIA-isolated run path
-    /// (`run_for_cia*`); timers advance lazily to the CPU clk on register access.
-    pub cia1: Cia,
-    /// Cycle-exact CIA2 ($DD00-$DDFF).
-    pub cia2: Cia,
-    /// Shared CIA timer transition table (Arc → cheap to clone with the Machine).
-    pub cia_table: cia::CiaTable,
+    /// CIA1 ($DC00-$DCFF) — VICE's ciacore with the `c64cia1.c` glue (c64cia.rs).
+    pub cia1: CiaCore,
+    /// CIA2 ($DD00-$DDFF) — VICE's ciacore with the `c64cia2.c` glue.
+    pub cia2: CiaCore,
+    /// What the last checkpoint restore had to convert rather than restore (an older
+    /// record of a chip). Empty after a restore of a current checkpoint.
+    pub restore_notes: Vec<String>,
     /// Drive position A (Spec 871): the machine's first 1541, on at unit 8 by
     /// default. The name is historical — since Spec 870 A can stand at unit 8-11, and
     /// since 871 it has a neighbour; `drive8` stays so every caller keeps working.
@@ -690,10 +695,6 @@ pub struct Machine {
     /// every instruction advances `clk`. Env kill-switch `TRX64_TURBO_FASTPATH=0`, read at
     /// `Machine::new`; the field can be flipped at any time.
     pub turbo_fast_path: bool,
-    /// Spec 857 D4 — check CIA alarms by comparison, as VICE does, instead of catching both
-    /// timers up to the clock in every instruction prologue and every cycle. Env kill-switch
-    /// `TRX64_CIA_ALARM_CHECK=0`, read at `Machine::new`; the field can be flipped at any time.
-    pub cia_alarm_check: bool,
     /// Spec 784 loader-lens — armed-on-command 1541 disk-mechanism head trace. OFF by
     /// default (does NOT run with the always-on CPU ring). When armed, a `(drv_clk,
     /// halftrack, sector)` sample is pushed whenever the sector under the head changes,
@@ -747,7 +748,7 @@ impl Clone for Machine {
             vic: self.vic.clone(),
             cia1: self.cia1.clone(),
             cia2: self.cia2.clone(),
-            cia_table: self.cia_table.clone(),
+            restore_notes: self.restore_notes.clone(),
             drive8: self.drive8.clone(),
             drive_b: self.drive_b.clone(),
             iec_devices: self.iec_devices.clone(),
@@ -785,7 +786,6 @@ impl Clone for Machine {
             cpu_history: self.cpu_history.clone(),
             delta_ring: self.delta_ring.clone(),
             turbo_fast_path: self.turbo_fast_path.clone(),
-            cia_alarm_check: self.cia_alarm_check.clone(),
             head_trace_armed: self.head_trace_armed.clone(),
             head_trace: self.head_trace.clone(),
             head_trace_last: self.head_trace_last.clone(),
@@ -934,9 +934,9 @@ impl Machine {
             c64_int: c64_6510core::IntStatus::new(),
             cpu: Cpu::default(),
             vic: VicII::new_for(model),
-            cia1: Cia::new_timed(t.cpu_hz, t.tod_hz),
-            cia2: Cia::new_timed(t.cpu_hz, t.tod_hz),
-            cia_table: cia::new_table(),
+            cia1: Self::power_on_cia(crate::c64cia::new_cia1, model),
+            cia2: Self::power_on_cia(crate::c64cia::new_cia2, model),
+            restore_notes: Vec::new(),
             drive8,
             drive_b,
             basic_rom: Box::new([0u8; 0x2000]),
@@ -977,10 +977,6 @@ impl Machine {
                 std::env::var("TRX64_TURBO_FASTPATH").map(|v| v.trim().to_ascii_lowercase()).as_deref(),
                 Ok("0") | Ok("off") | Ok("false") | Ok("no")
             ),
-            cia_alarm_check: !matches!(
-                std::env::var("TRX64_CIA_ALARM_CHECK").map(|v| v.trim().to_ascii_lowercase()).as_deref(),
-                Ok("0") | Ok("off") | Ok("false") | Ok("no")
-            ),
             head_trace_armed: false,
             head_trace: Vec::new(),
             head_trace_last: None,
@@ -990,6 +986,20 @@ impl Machine {
             cart_read_set: crate::cart::CartReadSet::default(),
             model,
         }
+    }
+
+    /// A CIA of `model`'s row at power-on: `cia*_setup_context` + `ciacore_init` on the
+    /// row's clock and mains, then the machine reset's `ciacore_reset` at clock 0.
+    fn power_on_cia(
+        new: fn(u32, u32, u32) -> CiaCore,
+        model: &'static crate::model::C64Model,
+    ) -> CiaCore {
+        let t = model.timing;
+        let mut c = new(crate::c64cia::model_of(&model.cia).unwrap_or(ciacore::CIA_MODEL_6526), t.cpu_hz, t.tod_hz);
+        c.clk = 0;
+        c.reset(&mut ciacore::NoPorts);
+        c.irq_events.clear();
+        c
     }
 
     /// Spec 863 — the row this machine is.
@@ -1043,6 +1053,10 @@ impl Machine {
         // `drive_set_machine_parameter` (c64.c:1344-1358).
         self.cia1.set_timing(t.cpu_hz, t.tod_hz);
         self.cia2.set_timing(t.cpu_hz, t.tod_hz);
+        // `CIA1Model` / `CIA2Model` follow the row (`c64model_set`, c64scmodel.c).
+        let cia_model = crate::c64cia::model_of(&model.cia).unwrap_or(ciacore::CIA_MODEL_6526);
+        self.cia1.set_model(cia_model);
+        self.cia2.set_model(cia_model);
         self.drive8.sync_factor = t.drive_sync_factor;
         self.drive_b.sync_factor = t.drive_sync_factor;
         // Spec 873 §6 / 874 §7 — the IEC devices' µs are cycles of this clock.
@@ -1433,11 +1447,15 @@ impl Machine {
         // (= the "no cursor / re-hijack after reset" recovery). Fresh power-on chips.
         // Spec 863 — fresh chips of the SAME model: the standard is identity, like the
         // profile below, and a reset does not change the crystal.
-        let t = self.model.timing;
-        self.cia1 = Cia::new_timed(t.cpu_hz, t.tod_hz);
-        self.cia2 = Cia::new_timed(t.cpu_hz, t.tod_hz);
-        self.cia1.clk = self.clk;
-        self.cia2.clk = self.clk;
+        // VICE `machine_specific_reset` → `ciacore_reset` on both: the chips keep their
+        // model and their mains (`sp_in_state` / `cnt_in_state` are not reset either).
+        let now = self.c64_core.clk;
+        self.cia1.clk = now;
+        self.cia2.clk = now;
+        self.cia1.reset(&mut ciacore::NoPorts);
+        self.cia2.reset(&mut ciacore::NoPorts);
+        self.cia1.irq_events.clear();
+        self.cia2.irq_events.clear();
         // Spec 815 — which machine this claims to be is IDENTITY, not chip state.
         // Pressing RESET on a C128 does not turn it into a C64, and a release that
         // re-probes after its own reset must get the same answer.
@@ -1601,22 +1619,10 @@ impl Machine {
                     // Colour RAM: only the low nibble is stored, in the I/O shadow.
                     self.io_shadow[(a as usize) - 0xd000] = *b & 0x0f;
                 }
-                0xdc00..=0xdcff => {
-                    // Spec 876 D3 — settle the POT latch before `$DC00`/`$DC02` move the mux.
-                    let reg = (a & 0xf) as usize;
-                    if reg == crate::cia::CIA_PRA || reg == crate::cia::CIA_DDRA {
-                        let (now, sel) = (self.c64_core.clk, self.pot_select());
-                        self.pot.settle(now, sel);
-                    }
-                    let clk = self.cpu6510.clk;
-                    let tab = self.cia_table.clone();
-                    self.cia1.write(a, *b, clk, &tab);
-                }
-                0xdd00..=0xddff => {
-                    let clk = self.cpu6510.clk;
-                    let tab = self.cia_table.clone();
-                    self.cia2.write(a, *b, clk, &tab);
-                }
+                // A host poke reaches the CIA through the same store the CPU makes — port
+                // hooks and all (the POT selection, the VIC bank, the serial bus) — so it
+                // goes through the bus's I/O dispatch rather than a second copy of it.
+                0xdc00..=0xddff => self.io_write_through_bus(a, *b),
                 0xd000..=0xdfff => self.io_shadow[(a as usize) - 0xd000] = *b,
                 _ => self.ram[a as usize] = *b,
             }
@@ -1637,7 +1643,19 @@ impl Machine {
     /// $00/$01 re-configure the PLA. The banking/port fields the write may change are
     /// persisted back exactly as `run_for_full_capped_dbg` does after an instruction.
     pub fn write_full(&mut self, addr: u16, val: u8) {
-        let table = self.cia_table.clone();
+        self.with_host_bus(|fb| fb.write(addr, val));
+    }
+
+    /// A host store into $DC00-$DDFF through the bus's own I/O dispatch, whatever the
+    /// banking: the CIA's port hooks run as for a CPU store.
+    fn io_write_through_bus(&mut self, addr: u16, val: u8) {
+        self.with_host_bus(|fb| fb.io_write(addr, val));
+    }
+
+    /// Run `f` over a host-side `FullBus` (a monitor access: never the cart read-set),
+    /// then persist the banking/port fields an access may change, as
+    /// `run_for_full_capped_dbg` does after an instruction.
+    fn with_host_bus<R>(&mut self, f: impl FnOnce(&mut full::FullBus) -> R) -> R {
         let port_active = self.port_active();
         let mut fb = full::FullBus {
             ram: &mut self.ram,
@@ -1648,7 +1666,6 @@ impl Machine {
             vic: &mut self.vic,
             cia1: &mut self.cia1,
             cia2: &mut self.cia2,
-            cia_table: &table,
             sid_regs: &mut self.sid_regs,
             sid: &mut self.sid,
             sid_extra: &mut self.sid_extra,
@@ -1689,13 +1706,16 @@ impl Machine {
             host_lines: self.expansion_host_lines,
             port_active,
             io_touched: false,
-            cia_alarm_check: self.cia_alarm_check,
         };
-        fb.write(addr, val);
+        let r = f(&mut fb);
         self.memconfig = fb.config;
         self.port_dir = fb.port_dir;
         self.port_data = fb.port_data;
         self.cia2_pa_out = fb.cia2_pa_out;
+        // A host access can move a CIA's interrupt pin (a $DC0D read or mask write):
+        // it reaches IntStatus now, at the clock the CIA drove it.
+        full::drain_cia_int(&mut self.cia1, &mut self.cia2, &mut self.c64_int);
+        r
     }
 
     /// The LIVE read — what the CPU would see, side effects and all.
@@ -1707,64 +1727,7 @@ impl Machine {
     ///
     /// Goes through `FullBus::read`, the same code the CPU executes.
     pub fn read_full_live(&mut self, addr: u16) -> u8 {
-        let table = self.cia_table.clone();
-        let port_active = self.port_active();
-        let mut fb = full::FullBus {
-            ram: &mut self.ram,
-            basic_rom: &self.basic_rom,
-            kernal_rom: &self.kernal_rom,
-            char_rom: &self.char_rom,
-            io: &mut self.io_shadow,
-            vic: &mut self.vic,
-            cia1: &mut self.cia1,
-            cia2: &mut self.cia2,
-            cia_table: &table,
-            sid_regs: &mut self.sid_regs,
-            sid: &mut self.sid,
-            sid_extra: &mut self.sid_extra,
-            sid_map: &self.sid_map,
-            sid_trace: &mut self.sid_trace,
-            sid_host: &mut self.sid_host,
-            pot: &mut self.pot,
-            config: self.memconfig,
-            memconfig_table: &self.memconfig_table,
-            port_dir: self.port_dir,
-            port_data: self.port_data,
-            clk: self.clk,
-            cia2_pa_out: self.cia2_pa_out,
-            side_effects: Vec::new(),
-            read_side_effects: Vec::new(),
-            drive: &mut self.drive8,
-            drive_b: &mut self.drive_b,
-            iec_devices: &mut self.iec_devices,
-            iec: &mut self.iec,
-            keyboard: &self.keyboard,
-            joystick1: self.joystick1,
-            joystick2: self.joystick2,
-            drive_c64_ref: self.drive_c64_ref,
-            cartridge: self.cartridge.as_mut(),
-            // Spec 785 C1 — a MONITOR access is not the title reading: never let it
-            // enter the cart read-set.
-            cart_reads: None,
-            cart_account_suspend: false,
-            port_profile: self.port_profile.as_mut(),
-            port_host: self.expansion.as_mut(),
-            snoop: self.expansion_snoop.as_deref(),
-            access_kind: crate::expansion::AccessKind::Host,
-            stalled: 0,
-            stalled_on_bus: 0,
-            device_stop: false,
-            host_lines: self.expansion_host_lines,
-            port_active,
-            io_touched: false,
-            cia_alarm_check: self.cia_alarm_check,
-        };
-        let v = fb.read(addr);
-        self.memconfig = fb.config;
-        self.port_dir = fb.port_dir;
-        self.port_data = fb.port_data;
-        self.cia2_pa_out = fb.cia2_pa_out;
-        v
+        self.with_host_bus(|fb| fb.read(addr))
     }
 
     // ── Spec 850 — the expansion port ───────────────────────────────────────────────
@@ -2018,7 +1981,6 @@ impl Machine {
             None => return,
         };
         {
-            let table = self.cia_table.clone();
             let port_active = self.port_active();
             let mut fb = full::FullBus {
                 ram: &mut self.ram,
@@ -2029,7 +1991,6 @@ impl Machine {
                 vic: &mut self.vic,
                 cia1: &mut self.cia1,
                 cia2: &mut self.cia2,
-                cia_table: &table,
                 sid_regs: &mut self.sid_regs,
                 sid: &mut self.sid,
                 sid_extra: &mut self.sid_extra,
@@ -2067,7 +2028,6 @@ impl Machine {
                 host_lines: self.expansion_host_lines,
                 port_active,
                 io_touched: false,
-                cia_alarm_check: self.cia_alarm_check,
             };
             // Same reason as `port_find_mut`: with a second device on the port the box
             // taken here is the chain, and a bare downcast would arm a transfer that then
@@ -2205,6 +2165,25 @@ impl Machine {
         answer.or(cart).unwrap_or(self.vic.last_read_phi1)
     }
 
+    /// The CIAs' alarms due at or before `clk`, outside an instruction (a held CPU):
+    /// what the CPU loop's `interrupt_delay` does every cycle.
+    fn process_cia_alarms(&mut self, clk: u64) {
+        if clk >= self.cia1.next_alarm_clk() {
+            let mut p = crate::c64cia::Cia1Ports {
+                kb: &self.keyboard,
+                now: clk,
+                joy1: self.joystick1,
+                joy2: self.joystick2,
+                pot: Some(&mut self.pot),
+            };
+            self.cia1.process_alarms(&mut p, clk);
+        }
+        if clk >= self.cia2.next_alarm_clk() {
+            self.cia2.process_alarms(&mut crate::c64cia::Cia2Ports::default(), clk);
+        }
+        full::drain_cia_int(&mut self.cia1, &mut self.cia2, &mut self.c64_int);
+    }
+
     /// Spec 850 D7 — advance `cycles` with the 6510 held, per cycle as the SC bus's
     /// `clk_inc` + `vic_cycle` do, the CPU registers untouched. `Cpu`: VIC, CIAs, SID and
     /// drive 8 run. `Reset`: the VIC alone; the drive's reference is moved along so the
@@ -2213,7 +2192,6 @@ impl Machine {
     /// Port reference: VICE holds the CPU for DMA by stealing cycles while the chips run
     /// (`mainc64cpu.c:122-125`) and services `IK_DMA` at the boundary (`6510core.c:523`).
     fn run_held(&mut self, hold: crate::expansion::Hold, cycles: u64) {
-        let table = self.cia_table.clone();
         let start = self.c64_core.clk;
         let end = start.wrapping_add(cycles);
         let chips = hold == crate::expansion::Hold::Cpu;
@@ -2234,18 +2212,11 @@ impl Machine {
             };
             self.vic.tick(&view);
             if chips {
-                self.cia1.clk = clk;
-                self.cia2.clk = clk;
-                self.cia1.tick(&table);
-                self.cia2.tick(&table);
+                self.process_cia_alarms(clk);
             }
         }
         let clk = self.c64_core.clk;
         if chips {
-            self.cia1.checked_clk = clk;
-            self.cia2.checked_clk = clk;
-            self.cia1.update_to(clk, &table);
-            self.cia2.update_to(clk, &table);
             self.sid.tick(clk.wrapping_sub(start), &self.sid_regs);
             self.catch_up_drives(clk);
         } else {
@@ -2567,7 +2538,7 @@ impl Machine {
 
     /// The POT selection CIA1 drives now (bit 0 = port 1, bit 1 = port 2).
     fn pot_select(&self) -> u8 {
-        crate::pot::select(self.cia1.pa_output())
+        crate::pot::select(self.cia1.pa_out())
     }
 
     /// The POT lines of control port `port` (1 or 2) now read `x` / `y`: the byte the
@@ -2620,51 +2591,35 @@ impl Machine {
     /// I/O reads use the register PEEK (no IRQ-latch clears), color RAM low
     /// nibble + $F0 open bus. Reads $00/$01 as the latched port.
     /// $DC00/$DC01 are PINS, not just latches — the keyboard matrix and the two
-    /// joysticks pull them low, and `cia1.peek` returns the latch alone. So a
-    /// side-effect-free read of $DC00 answered with whatever the KERNAL last wrote
-    /// while scanning, and showed neither a held key nor a joystick. Anyone
-    /// debugging input through the monitor was measuring nothing and could not tell.
-    ///
-    /// Neither register has a read side effect — that is $DC0D, the interrupt
-    /// latch, which still goes to `peek` untouched. So there is no reason for the
-    /// peek to answer differently than the CPU does, and it now calls the same
-    /// function the CPU read calls.
+    /// joysticks pull them low. The peek runs the CPU's own read (`read_ciapa` /
+    /// `read_ciapb`, c64cia.rs) on a copy of the chip, so the monitor sees a held key
+    /// or a joystick exactly as the CPU would, and nothing moves — not even $DC0D,
+    /// which answers the flags as they stand (VICE `ciacore_peek`).
     fn cia1_pin_peek(&self, addr: u16) -> u8 {
-        let pra = self.cia1.peek(0xdc00);
-        let ddra = self.cia1.peek(0xdc02);
-        let prb = self.cia1.peek(0xdc01);
-        let ddrb = self.cia1.peek(0xdc03);
-        match addr & 0xff0f {
-            0xdc00 => crate::keyboard::cia1_pa_pins(
-                &self.keyboard, self.clk, pra, ddra, prb, ddrb,
-                &self.joystick1, &self.joystick2,
-            ),
-            0xdc01 => crate::keyboard::cia1_pb_pins(
-                &self.keyboard, self.clk, pra, ddra, prb, ddrb, &self.joystick1,
-            ),
-            _ => self.cia1.peek(addr),
-        }
+        let mut p = crate::c64cia::Cia1Ports {
+            kb: &self.keyboard,
+            now: self.clk,
+            joy1: self.joystick1,
+            joy2: self.joystick2,
+            pot: None,
+        };
+        self.cia1.peek_with(&mut p, addr)
     }
 
-    /// $DD00 is PINS too. Bits 6 and 7 are the IEC CLK IN and DATA IN lines, and
-    /// `cia2.peek` returns only the latch — so a monitor read of $DD00 showed the
-    /// byte the CPU last WROTE and nothing about the bus. Debugging a serial stall
-    /// through it means reading a number that cannot answer the question: a KERNAL
-    /// loop spinning on DATA looked, from the monitor, like it was spinning on a
-    /// value that should have let it out.
+    /// $DD00 is PINS too. Bits 6 and 7 are the IEC CLK IN and DATA IN lines, so a
+    /// monitor read of $DD00 has to show the bus, not the byte the CPU last WROTE:
+    /// debugging a serial stall through the latch means reading a number that cannot
+    /// answer the question.
     ///
     /// The CPU's own read ([`full::FullBus::io_read`]) also flushes the drive
     /// forward and records an indirection access. A peek does neither — it reads
-    /// the bus as it stands. Bits 0-5 come from the latch exactly as the CPU sees
-    /// them.
+    /// the bus as it stands, through the same `read_ciapa` the CPU's read takes.
     fn cia2_pin_peek(&self, addr: u16) -> u8 {
-        if (addr & 0xff0f) != 0xdd00 {
-            return self.cia2.peek(addr);
+        let mut p = crate::c64cia::Cia2Ports::default();
+        if (addr & 0xf) as usize == ciacore::CIA_PRA {
+            p.iec_pins = self.iec.iecbus_callback_read(self.clk);
         }
-        let pins = self.iec.iecbus_callback_read(self.clk);
-        let pra = self.cia2.peek(0xdd00);
-        let ddra = self.cia2.peek(0xdd02);
-        (((pra | !ddra) & 0x3f) | pins) & 0xff
+        self.cia2.peek_with(&mut p, addr)
     }
 
     pub fn read_full(&self, addr: u16) -> u8 {
@@ -2819,14 +2774,6 @@ impl Machine {
         }
     }
 
-    /// Current VIC bank base from CIA2 port-A bits 0-1 (= computeVicBankBase):
-    /// PORT OF: `core/ciacore.c:810` + `c64/c64cia2.c:150-151`. The byte the CIA
-    /// puts on port A is `PRA | ~DDRA` — an INPUT pin contributes 1, because the
-    /// pin floats high on the pull-up, not 0. `store_ciapa` then takes `~byte & 3`.
-    /// Masking with `PRA & DDRA` instead reads an input bank bit as 0 and lands the
-    /// VIC 3 banks away: the KERNAL leaves `DDRA = $3F` so both forms agree, but a
-    /// fastloader that drives $DD00 itself (Spindle writes `DDRA = $3C`) leaves the
-    /// bank bits as inputs and every fetch goes to the wrong 16 KB.
     /// Spec 815 §4 — which machine this session claims to be. Survives a reset;
     /// only `Machine::new` clears it.
     pub fn set_speed_profile(&mut self, profile: crate::vic::SpeedProfile) {
@@ -2919,10 +2866,12 @@ impl Machine {
         }
     }
 
+    /// The VIC bank base from CIA2's port A: `vbank = ~byte & 3` of the composed output
+    /// `PRA | ~DDRA` (c64cia2.c `store_ciapa`, `old_pa`). An INPUT pin contributes 1 —
+    /// it floats high on the pull-up — so a fastloader that leaves the bank bits as
+    /// inputs (Spindle writes `DDRA = $3C`) still sees bank 0.
     pub fn vic_bank_base(&self) -> u16 {
-        let pra = self.cia2.peek(0xdd00);
-        let ddra = self.cia2.peek(0xdd02);
-        let bank = (((pra | !ddra) & 0x03) ^ 0x03) as u16;
+        let bank = ((self.cia2.pa_out() & 0x03) ^ 0x03) as u16;
         bank.wrapping_mul(0x4000)
     }
 
@@ -3735,12 +3684,7 @@ impl Machine {
     {
         let start = self.c64_core.clk;
         let mut executed: u64 = 0;
-        let table = self.cia_table.clone();
         let mut stop = RunStop::Completed;
-        // Seed CIA clocks from the live CPU clk so timer state machines run from
-        // the right rclk.
-        self.cia1.clk = self.c64_core.clk;
-        self.cia2.clk = self.c64_core.clk;
         // Spec 850 — devices and host lines only change between runs, so this holds for
         // the whole loop; on a stock machine every port step below is skipped.
         let port_active = self.port_active();
@@ -3791,28 +3735,15 @@ impl Machine {
             // own clock via the model's sync_factor.
             let c64_clk_before = self.c64_core.clk;
 
-            // Refresh cross-chip interrupt lines at the boundary into the verbatim
-            // core's IntStatus, per-source (= VICE: the CIA/VIC `set_int` has already
-            // stamped int_status by the time DO_INTERRUPT's interrupt_check_*_delay
-            // reads it). Advance both CIA timers to the current clk so any underflow
-            // latches its ICR flag, then route VIC∨CIA1 → IRQ (sources 0/1) and
-            // CIA2 → NMI (source 2), stamped at the boundary clk (= the old
-            // set_irq_line semantics, which stamped at self.clk; the SC core's
-            // set_irq/set_nmi re-stamp only on the nirq/nnmi 0→1 edge).
+            // Interrupt lines at the boundary. The CIAs' line changes go into IntStatus at
+            // the clocks they were made (VICE `cia_set_int_clk`); the CPU loop replays
+            // them every cycle, and this picks up what a host access between runs drove
+            // (a monitor poke of $DC0D). The VIC's level is restamped (the SC core's
+            // set_irq only acts on a 0→1 edge): it carries an acknowledge made inside
+            // the last PHI2 cycle (856 §3).
             let now = self.c64_core.clk;
-            self.cia1.checked_clk = now;
-            self.cia2.checked_clk = now;
-            // Spec 857 D3 — the same comparison as `process_alarms`. The restamp below stays
-            // unconditional: it carries an acknowledge made inside the last PHI2 cycle (856 §3).
-            if !self.cia_alarm_check || self.cia1.alarm_due(now) {
-                self.cia1.update_to(now, &table);
-            }
-            if !self.cia_alarm_check || self.cia2.alarm_due(now) {
-                self.cia2.update_to(now, &table);
-            }
+            full::drain_cia_int(&mut self.cia1, &mut self.cia2, &mut self.c64_int);
             self.c64_int.set_irq(c64_6510core::INT_SRC_VIC, self.vic.irq_line, now);
-            self.c64_int.set_irq(c64_6510core::INT_SRC_CIA1, self.cia1.irq_asserted(), now);
-            self.c64_int.set_nmi(c64_6510core::INT_SRC_CIA2, self.cia2.irq_asserted(), now);
             // Spec 850 D6 — the expansion port's lines on their own source; the per-cycle
             // sample inside `clk_inc` catches a change in the middle of an instruction.
             if port_active {
@@ -3839,7 +3770,6 @@ impl Machine {
                     vic: &mut self.vic,
                     cia1: &mut self.cia1,
                     cia2: &mut self.cia2,
-                    cia_table: &table,
                     sid_regs: &mut self.sid_regs,
                     sid: &mut self.sid,
                     sid_extra: &mut self.sid_extra,
@@ -3882,7 +3812,6 @@ impl Machine {
                     host_lines: self.expansion_host_lines,
                     port_active,
                     io_touched: false,
-                    cia_alarm_check: self.cia_alarm_check,
                 };
                 let mut bus = full_sc::FullScBus {
                     fb,
@@ -4089,16 +4018,12 @@ impl Machine {
     ) {
         let start = self.cpu6510.clk;
         let mut executed: u64 = 0;
-        let table = self.cia_table.clone();
-        // The CIAs share the CPU master clock: seed the bus clk from the live CPU
-        // clk so a read/write at CPU cycle N runs the timer to exactly N.
-        self.cia1.clk = self.cpu6510.clk;
-        self.cia2.clk = self.cpu6510.clk;
+        // The CIAs share the CPU master clock: the bus clk starts at the live CPU clk
+        // so a read/write at CPU cycle N runs the chip to exactly N.
         let mut bus = CiaBus {
             mem: &mut self.ram,
             cia1: &mut self.cia1,
             cia2: &mut self.cia2,
-            table: &table,
             clk: self.cpu6510.clk,
         };
         loop {
@@ -4202,14 +4127,10 @@ impl Machine {
         // the validated `c64-cpu` gate uses (run_for_cia): it reproduces the TS C64
         // cadence exactly. (The VIC bus is NOT used here — its isolated raster phase
         // badlines at lines the boot ROM does not, perturbing the catch-up clock.)
-        let table = self.cia_table.clone();
-        self.cia1.clk = self.cpu6510.clk;
-        self.cia2.clk = self.cpu6510.clk;
         let mut bus = CiaBus {
             mem: &mut self.ram,
             cia1: &mut self.cia1,
             cia2: &mut self.cia2,
-            table: &table,
             clk: self.cpu6510.clk,
         };
         loop {

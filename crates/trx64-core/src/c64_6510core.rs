@@ -531,25 +531,18 @@ pub trait C64Core6510Bus {
         self.process_alarms(clk);
     }
 
-    /// PER-CYCLE interrupt-line levels. VICE stamps `maincpu_set_nmi`/`set_irq`
-    /// at the EXACT rclk from inside the CIA/VIC alarm callbacks (the CIA's
-    /// underflow calls `my_set_int(rclk)`; the VIC's raster IRQ calls
-    /// `maincpu_set_irq(rclk)`). TRX64's CIA/VIC do not call the CPU back, so the
-    /// core samples these levels itself once per cycle inside `clk_inc` (AFTER
-    /// `interrupt_delay_alarms` has advanced the chips to `clk`) and calls
-    /// `set_nmi`/`set_irq` at `clk`. This delivers a mid-instruction line-low
-    /// (CIA ICR-read ack) and the subsequent line-high (next Timer-A underflow)
-    /// as DISTINCT edges — the edges a boundary-only sample swallowed. Default
-    /// `false`: an implementor with no CIA/VIC (test bus / drive) reports the
-    /// line released, so the per-cycle `set_*` calls are inert no-ops.
+    /// The CIAs' interrupt line. VICE's CIA calls `interrupt_set_irq`/`_nmi` with the
+    /// exact `rclk` from inside its accesses and alarm callbacks (`cia_set_int_clk`).
+    /// TRX64's CIA records those calls instead (ciacore.rs `irq_events`), and the core
+    /// replays them here — in `clk_inc` after the alarm dispatch, and after the
+    /// prologue's PROCESS_ALARMS — so IntStatus sees VICE's sequence before anything
+    /// consults it. Default no-op: a bus with no CIA.
     #[inline]
-    fn cia2_nmi_line(&self) -> bool {
-        false
-    }
-    #[inline]
-    fn cia1_irq_line(&self) -> bool {
-        false
-    }
+    fn drain_cia_int(&mut self, _int: &mut IntStatus) {}
+
+    /// PER-CYCLE VIC interrupt-line level: the VIC does not call the CPU back, so the
+    /// core samples it once per cycle inside `clk_inc` and stamps it at `clk`. Default
+    /// `false`: an implementor with no VIC (test bus / drive) reports the line released.
     #[inline]
     fn vic_irq_line(&self) -> bool {
         false
@@ -857,23 +850,13 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
         // interrupt_delay() — m64:97-110.
         let clk = self.core.clk;
         self.bus.interrupt_delay_alarms(clk);
-        // Per-cycle interrupt-line stamp — VICE parity for the CIA/VIC alarm
-        // callbacks that call maincpu_set_nmi/set_irq at the exact rclk. The
-        // alarm dispatch above advanced the CIAs (and the VIC ticked last cycle)
-        // so the ICR/raster line levels are current for `clk`; stamp them into
-        // IntStatus at `clk`. Ordered BEFORE the irq_clk/nmi_clk delay-cycle
-        // bumps so a fresh 0→1 edge stamped on THIS cycle (irq_clk/nmi_clk = clk)
-        // already counts toward its INTERRUPT_DELAY latency this cycle — the same
-        // order VICE uses (alarm dispatch, then the *_clk <= maincpu_clk bump).
-        // set_nmi/set_irq are idempotent per level (assert guarded by
-        // pending_int==0, deassert by pending_int!=0), so the per-cycle calls
-        // only mutate on a true edge and are otherwise near-free. The essential
-        // fix: this delivers the CIA2 /NMI line-low (ICR-read ack → nnmi 1→0)
-        // and the next Timer-A underflow line-high (fresh 0→1 edge → re-stamped
-        // nmi_clk + IK_NMI re-raised) even when both fall inside a single
-        // instruction, so an NMI-driven streaming depacker is never wedged.
-        self.int.set_nmi(INT_SRC_CIA2, self.bus.cia2_nmi_line(), clk);
-        self.int.set_irq(INT_SRC_CIA1, self.bus.cia1_irq_line(), clk);
+        // The interrupt lines, BEFORE the irq_clk/nmi_clk delay-cycle bumps — VICE's
+        // order (alarm dispatch, then the `*_clk <= maincpu_clk` bump). The CIAs' line
+        // changes since the last replay go in at the clocks the CIAs drove them, so an
+        // ICR-read release and the next underflow's assert inside one instruction are
+        // two edges, as VICE's `cia_set_int_clk` makes them. The VIC is sampled: it does
+        // not call back, and set_irq only acts on a true edge.
+        self.bus.drain_cia_int(self.int);
         self.int.set_irq(INT_SRC_VIC, self.bus.vic_irq_line(), clk);
         if self.bus.expansion_active() {
             self.int.set_irq(INT_SRC_EXPANSION, self.bus.expansion_irq_line(), clk);
@@ -1165,6 +1148,7 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
     fn process_alarms(&mut self) {
         let clk = self.core.clk;
         self.bus.process_alarms(clk);
+        self.bus.drain_cia_int(self.int);
     }
 
     #[inline]
@@ -3089,8 +3073,8 @@ mod tests {
     // re-raises it — two consecutive CPU cycles with NO instruction boundary
     // between them. A boundary-only sampler would only ever see the net-high level
     // and swallow the low→high edge, wedging the NMI after the first dispatch
-    // (exactly the TRX64 bug). The per-cycle stamp inside `clk_inc` sees both
-    // edges, so a fresh NMI is (re)generated on every handler pass.
+    // (exactly the TRX64 bug). The CIA records each line change with its clock and the
+    // core replays them in `clk_inc`, so a fresh NMI is (re)generated on every pass.
     // =========================================================================
 
     /// Flat-RAM bus with a CIA2 /NMI line whose level is driven by accesses to a
@@ -3099,14 +3083,16 @@ mod tests {
     /// dispatches via `on_interrupt`.
     struct NmiLineBus {
         ram: Box<[u8; 0x10000]>,
-        /// CIA2 interrupt-output level wired to the CPU /NMI line.
-        line: bool,
+        /// CIA2's interrupt-output changes `(level, clk)`, as `cia_set_int_clk` makes them.
+        events: Vec<(bool, u64)>,
+        /// The clock of the current cycle (from `vic_cycle`).
+        clk: u64,
         /// Number of times the CPU took the NMI vector ($FFFA).
         nmi_dispatches: u32,
     }
     impl NmiLineBus {
         fn new() -> Self {
-            NmiLineBus { ram: Box::new([0u8; 0x10000]), line: false, nmi_dispatches: 0 }
+            NmiLineBus { ram: Box::new([0u8; 0x10000]), events: Vec::new(), clk: 0, nmi_dispatches: 0 }
         }
     }
     const NMI_MAGIC: u16 = 0xd000;
@@ -3114,30 +3100,34 @@ mod tests {
         fn read_raw(&mut self, a: u16) -> u8 {
             // The RMW READ half = the handler's CIA ICR read → line released.
             if a == NMI_MAGIC {
-                self.line = false;
+                self.events.push((false, self.clk));
             }
             self.ram[a as usize]
         }
         fn write_raw(&mut self, a: u16, v: u8) {
             // The RMW WRITE half = the next Timer-A underflow → line re-asserted.
             if a == NMI_MAGIC {
-                self.line = true;
+                self.events.push((true, self.clk));
             }
             self.ram[a as usize] = v;
         }
         fn write_raw_dummy(&mut self, a: u16, v: u8) {
             if a == NMI_MAGIC {
-                self.line = true;
+                self.events.push((true, self.clk));
             }
             self.ram[a as usize] = v;
         }
         fn check_ba(&mut self, _loi: &mut u32, _ba_low: bool) -> u64 {
             0
         }
-        fn vic_cycle(&mut self, _clk: u64) {}
-        // The whole point: the SC core samples this every cycle inside clk_inc.
-        fn cia2_nmi_line(&self) -> bool {
-            self.line
+        fn vic_cycle(&mut self, clk: u64) {
+            self.clk = clk;
+        }
+        // The whole point: the SC core replays the line changes every cycle inside clk_inc.
+        fn drain_cia_int(&mut self, int: &mut IntStatus) {
+            for (level, clk) in self.events.drain(..) {
+                int.set_nmi(INT_SRC_CIA2, level, clk);
+            }
         }
         fn on_interrupt(&mut self, vector: u16, _clk: u64) {
             if vector == 0xfffa {
@@ -3177,7 +3167,7 @@ mod tests {
         core.reg_pc = 0xc000;
         core.reg_sp = 0xff;
         // CIA2 Timer A has already underflowed (line high) — the first NMI edge.
-        bus.line = true;
+        bus.events.push((true, 0));
 
         // Run a bounded number of instructions; each NMI pass is
         // NMI-entry + INC + INC + RTI + JMP ≈ 5 instructions.
@@ -3240,7 +3230,7 @@ mod tests {
 
         core.reg_pc = 0xc000;
         core.reg_sp = 0xff;
-        bus.line = true; // stays high forever — no ack, no new edge
+        bus.events.push((true, 0)); // stays high forever — no ack, no new edge
 
         for _ in 0..400 {
             c64_6510core_execute(&mut core, &mut bus, &mut int);

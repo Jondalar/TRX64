@@ -1,19 +1,22 @@
-//! Spec 857 D1 — the CIA alarm check may change the speed and nothing else.
+//! Spec 857 D1 / Spec 888 — the CIA alarm path, frozen.
 //!
-//! Two kinds of evidence, because one cannot do both jobs:
+//! Spec 857 compared a per-cycle catch-up of both timers against VICE's alarm check and
+//! required them equal. Since Spec 888 the C64's CIAs are VICE's ciacore, alarm-driven by
+//! construction — there is no second path left to compare. What stays:
 //!
-//!   - **Lockstep equality, check off against check on.** Same workload, two machines, stopped
-//!     every 7919 cycles (a prime, so the stops land between register accesses and not on
-//!     them) and compared on the instruction stream, every bus record, every interrupt, the
-//!     full runtime checkpoint and a `peek` of all 32 CIA registers.
-//!   - **Frozen digests of today's behaviour.** Equality alone cannot show that D2 left the old
-//!     path alone — D2 changes both sides at once. So the check-off digest of every workload
-//!     was recorded on the code before 857 touched the CIA, and it must not move.
+//!   - **Lockstep determinism.** Same workload, two machines, stopped every 7919 cycles (a
+//!     prime, so the stops land between register accesses and not on them) and compared on
+//!     the instruction stream, every bus record, every interrupt, the full runtime checkpoint
+//!     and a `peek` of all 32 CIA registers.
+//!   - **A checkpoint restored mid-count continues identically** to the machine that ran
+//!     straight through — the checkpoint carries the whole ciacore context.
+//!   - **Frozen digests of the behaviour.** Re-recorded for Spec 888 (the chip changed: the
+//!     IFR delay line, the old 6526's late interrupt, VICE's TOD), and they must not move.
 //!
-//! The workloads are the ones §2 of the spec says the per-cycle catch-up was hiding: Timer A
-//! continuous and one-shot, Timer B counting Timer A underflows at latches 0, 1 and 2, CIA2 on
-//! NMI, the TOD alarm, a checkpoint restored mid-count, and a booted machine — each at 1 and at
-//! 64 MHz, because at 64 MHz the prologue runs about eighteen times per PHI2 cycle.
+//! The workloads are Spec 857 §2's: Timer A continuous and one-shot, Timer B counting Timer A
+//! underflows at latches 0, 1 and 2, CIA2 on NMI, the TOD alarm, a checkpoint restored
+//! mid-count, and a booted machine — each at 1 and at 64 MHz, because at 64 MHz the prologue
+//! runs about eighteen times per PHI2 cycle.
 //!
 //! `CIA857_PRINT_GOLDEN=1` prints the digests instead of asserting them.
 
@@ -178,11 +181,10 @@ fn checkpoint(m: &Machine) -> serde_json::Value {
     capture_runtime_checkpoint(m, "", "d64", None, None, None, None)
 }
 
-fn machine(prefer: u8, check: bool) -> Machine {
+fn machine(prefer: u8) -> Machine {
     let mut m = Machine::new();
     m.set_machine_profile(SpeedProfile::U64);
     m.set_u64_turbo(0x00, prefer);
-    m.cia_alarm_check = check;
     m
 }
 
@@ -205,7 +207,7 @@ fn first_diff(a: &serde_json::Value, b: &serde_json::Value, path: &str) -> Optio
     }
 }
 
-/// Lockstep both machines and return the digest of the check-off side.
+/// Lockstep both machines and return the digest of the first.
 fn lockstep(label: &str, off: &mut Machine, on: &mut Machine, steps: u64) -> u64 {
     let mut digest = 0xcbf2_9ce4_8422_2325u64;
     for step in 0..steps {
@@ -227,61 +229,35 @@ fn lockstep(label: &str, off: &mut Machine, on: &mut Machine, steps: u64) -> u64
     digest
 }
 
-// ── frozen digests of the code before 857 touched the CIA ────────────────────────────────
+// ── frozen digests ──────────────────────────────────────────────────────────────────────
 
-/// Recorded with the D4 switch in place and reading nothing — the CIA code exactly as 857
-/// found it. The 64 MHz digests are recorded after `7ce542a`: this gate found that checkpoints
-/// did not carry the turbo phase (a defect since 851, the restore case diverged), and the fix
-/// adds `turboPhase` to every turbo checkpoint, which the digests hash. The 1 MHz digests are
-/// the same on both sides of that fix.
-///
-/// All re-recorded for Spec 843 D1, which fills `vicProvenance` in every checkpoint (it was
-/// a hardcoded `null`). With that one field set back to `null` the digests are exactly the
-/// ones recorded before — checked on the 843 branch before re-recording — so nothing the CIA
-/// does moved; only the checkpoint says more. The same gate found that a restored machine
-/// lost the record (restore did not read it back), fixed in `restore_vic_provenance`.
-/// **Every `@64` digest re-recorded for Spec 868 §9 (2026-09-21), and not one `@1` digest
-/// moved.** A `$D031` write is adopted at the next PHI2 EDGE instead of from the next
-/// instruction, so a turbo machine reaches its speed a cycle earlier and every observable
-/// stream at 64 MHz shifts with it; at 1 MHz there is no divider to adopt and the digests
-/// are bit-for-bit the ones recorded before. That split is the evidence the change is
-/// confined to turbo — it is the same shape as the 7-game screenshot gate, one level down.
-///
-/// The same change made this gate earn its keep for the third time: `restore_cascade@64`
-/// failed on EQUALITY, not on its digest, because a restored machine only learned its
-/// speed at the next instruction boundary and spent a PHI2 cycle at the wrong divider.
-/// `restore_runtime_checkpoint` puts the divider back in force immediately now.
-/// **`booted@64` re-recorded for BUG-061 (2026-09-23), and it alone.** After a reset the
-/// Ultimate holds its C64 at 1 MHz for 2.06 s, and this is the only workload that boots —
-/// so its machine now spends most of the 120-frame settle at 1 MHz and reaches the
-/// lockstep in a different state. Every other digest, including every `@64` one that does
-/// not reset, is bit-identical to the line above.
-/// **All re-recorded for Spec 870 (2026-09-23), the same shape as 843:** every checkpoint
-/// now carries a `drivePart` node (power / reset held / stopped / reset line / unit). With
-/// that node left out of the capture the digests are exactly the ones above — checked on
-/// the 870 branch before re-recording — so nothing the machine does moved; only the
-/// checkpoint says more.
+/// Re-recorded for Spec 888 (2026-10-02), every one of them: the C64's CIAs became VICE's
+/// ciacore. Each moved for the reasons the spec's D4 names — the old 6526 raises its line a
+/// cycle after the underflow (`CIA_IRQ_RAISE1`), the ICR read acknowledges through the IFR
+/// delay line, Timer A re-arms its alarm only while an interrupt is wanted and not pending
+/// (`ciacore_intta`), and TOD runs VICE's mains alarm (its reset leaves the hour at 1). The
+/// history of the previous digests (857, 7ce542a, 843, 868 §9, BUG-061, 870) is in git.
 const GOLDEN: &[(&str, u64)] = &[
-    ("ta_irq@1", 0xbdaafcb2fcbaf195),
-    ("ta_irq@64", 0x19b058bb08472f2a),
-    ("ta_irq_timer_read@1", 0xfe1ce3a13c12c6f9),
-    ("ta_irq_timer_read@64", 0xb5806e8c9b7ca450),
-    ("ta_oneshot@1", 0xd5e8879d5bfbb46c),
-    ("ta_oneshot@64", 0x65be57067a7b2960),
-    ("tb_cascade_l0@1", 0xb86af8cefc48d5a2),
-    ("tb_cascade_l0@64", 0xabc381025fc72895),
-    ("tb_cascade_l1@1", 0xe7dd196bf8df40f1),
-    ("tb_cascade_l1@64", 0x62b63599a2877cc9),
-    ("tb_cascade_l2@1", 0xf3a77c5ec5dd0909),
-    ("tb_cascade_l2@64", 0x02ad192f71f639f4),
-    ("cia2_nmi@1", 0x7b42694065545200),
-    ("cia2_nmi@64", 0xf5346d2384256781),
-    ("tod_alarm@1", 0x4003ff8347dafe09),
-    ("tod_alarm@64", 0x1ad682d43ad1efae),
-    ("restore_cascade@1/check=false", 0x18e2ed6fddf8494e),
-    ("restore_cascade@64/check=false", 0xcdf0496320b2a01f),
-    ("booted@1", 0x8ce514373f07b5d3),
-    ("booted@64", 0x8ad88d96a8122d4e),
+    ("ta_irq@1", 0xa246b6efb6558752),
+    ("ta_irq@64", 0xa6e3ac044229be32),
+    ("ta_irq_timer_read@1", 0x4b70672fac9eaa9d),
+    ("ta_irq_timer_read@64", 0x5412e41946147334),
+    ("ta_oneshot@1", 0x3b54bfe7e21b8689),
+    ("ta_oneshot@64", 0x70b482903465ea1b),
+    ("tb_cascade_l0@1", 0x98a9131c0bae633a),
+    ("tb_cascade_l0@64", 0x356cd62384980da1),
+    ("tb_cascade_l1@1", 0xf7adcbf78ead153a),
+    ("tb_cascade_l1@64", 0x967e0191941f78d9),
+    ("tb_cascade_l2@1", 0x5ed3218521a1dc17),
+    ("tb_cascade_l2@64", 0x590197231a6e0fc2),
+    ("cia2_nmi@1", 0x1a928b753aadd799),
+    ("cia2_nmi@64", 0x660935e7e17e6a03),
+    ("tod_alarm@1", 0xde2b5ecaf5b8347c),
+    ("tod_alarm@64", 0xe64cc286c880c13d),
+    ("restore_cascade@1", 0x3da6ee42bde8de72),
+    ("restore_cascade@64", 0x6a0ef7cec365a7ec),
+    ("booted@1", 0xfa6905d085cfff85),
+    ("booted@64", 0xb4ac71d7745bfa0f),
 ];
 
 fn golden(label: &str, digest: u64, printed: &mut Vec<String>) {
@@ -294,17 +270,18 @@ fn golden(label: &str, digest: u64, printed: &mut Vec<String>) {
 }
 
 #[test]
-fn the_alarm_check_changes_nothing_on_the_timer_workloads() {
+fn the_timer_workloads_are_deterministic_and_frozen() {
     let mut printed = Vec::new();
     for (name, setup, steps) in workloads() {
         for (speed, prefer) in [("1", MHZ_1), ("64", MHZ_64)] {
             let label = format!("{name}@{speed}");
-            let (mut off, mut on) = (machine(prefer, false), machine(prefer, true));
-            setup(&mut off);
-            setup(&mut on);
-            let d = lockstep(&label, &mut off, &mut on, steps);
+            let (mut a, mut b) = (machine(prefer), machine(prefer));
+            setup(&mut a);
+            setup(&mut b);
+            let d = lockstep(&label, &mut a, &mut b, steps);
             // Something must actually have happened, or equality proves nothing.
-            let taken = u64::from(off.read_full(0x0400)) + u64::from(off.read_full(0x0402));
+            let word = |m: &Machine, at: u16| u64::from(m.read_full(at)) | u64::from(m.read_full(at + 1)) << 8;
+            let taken = word(&a, 0x0400) + word(&a, 0x0402);
             assert!(taken > 0, "{label}: no interrupt handler ran — the workload tests nothing");
             golden(&label, d, &mut printed);
         }
@@ -319,25 +296,22 @@ fn a_checkpoint_restored_mid_count_continues_identically() {
     let mut printed = Vec::new();
     let (_, setup, _) = workloads().into_iter().find(|(n, _, _)| *n == "tb_cascade_l1").unwrap();
     for (speed, prefer) in [("1", MHZ_1), ("64", MHZ_64)] {
-        for check in [false, true] {
-            let label = format!("restore_cascade@{speed}/check={check}");
-            // One machine runs straight through; the other is captured half-way and rebuilt.
-            let mut straight = machine(prefer, check);
-            setup(&mut straight);
-            let mut first = machine(prefer, check);
-            setup(&mut first);
-            for _ in 0..25 {
-                straight.run_for_full(STEP, &mut NullSink, |_, _, _, _, _, _, _| {});
-                first.run_for_full(STEP, &mut NullSink, |_, _, _, _, _, _, _| {});
-            }
-            let cp = checkpoint(&first);
-            let mut rebuilt = machine(prefer, check);
-            restore_runtime_checkpoint(&mut rebuilt, &cp).expect("restore");
-            let d = lockstep(&label, &mut straight, &mut rebuilt, 35);
-            if !check {
-                golden(&label, d, &mut printed);
-            }
+        let label = format!("restore_cascade@{speed}");
+        // One machine runs straight through; the other is captured half-way and rebuilt.
+        let mut straight = machine(prefer);
+        setup(&mut straight);
+        let mut first = machine(prefer);
+        setup(&mut first);
+        for _ in 0..25 {
+            straight.run_for_full(STEP, &mut NullSink, |_, _, _, _, _, _, _| {});
+            first.run_for_full(STEP, &mut NullSink, |_, _, _, _, _, _, _| {});
         }
+        let cp = checkpoint(&first);
+        let mut rebuilt = machine(prefer);
+        restore_runtime_checkpoint(&mut rebuilt, &cp).expect("restore");
+        assert!(rebuilt.restore_notes.is_empty(), "{label}: {:?}", rebuilt.restore_notes);
+        let d = lockstep(&label, &mut straight, &mut rebuilt, 35);
+        golden(&label, d, &mut printed);
     }
     if !printed.is_empty() {
         eprintln!("GOLDEN (restore):\n{}", printed.join("\n"));
@@ -345,7 +319,7 @@ fn a_checkpoint_restored_mid_count_continues_identically() {
 }
 
 #[test]
-fn the_alarm_check_changes_nothing_on_a_booted_machine() {
+fn a_booted_machine_is_deterministic_and_frozen() {
     if !std::path::Path::new(ROM_DIR).join("kernal-901227-03.bin").exists() {
         eprintln!("skip: ROMs absent at {ROM_DIR}");
         return;
@@ -361,10 +335,10 @@ fn the_alarm_check_changes_nothing_on_a_booted_machine() {
             m.set_u64_turbo(0x00, prefer);
             m.run_for_full(120 * FRAME, &mut NullSink, |_, _, _, _, _, _, _| {});
         };
-        let (mut off, mut on) = (machine(prefer, false), machine(prefer, true));
-        boot(&mut off);
-        boot(&mut on);
-        let d = lockstep(&label, &mut off, &mut on, 60);
+        let (mut a, mut b) = (machine(prefer), machine(prefer));
+        boot(&mut a);
+        boot(&mut b);
+        let d = lockstep(&label, &mut a, &mut b, 60);
         golden(&label, d, &mut printed);
     }
     if !printed.is_empty() {

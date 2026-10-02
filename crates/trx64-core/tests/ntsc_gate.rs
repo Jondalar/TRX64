@@ -17,7 +17,7 @@
 //! daemon's.
 
 use std::path::Path;
-use trx64_core::cia::{Cia, CIAT_TABLEN, CIA_CRA_TODIN_50HZ, CIA_TOD_SEC, CIA_TOD_TEN};
+use trx64_core::ciacore::{NoPorts, CIA_CRA_TODIN_50HZ, CIA_MODEL_6526, CIA_TOD_SEC, CIA_TOD_TEN};
 use trx64_core::drive::{DiskImage, DiskKind};
 use trx64_core::model::{self, CycleFamily};
 use trx64_core::resid_audio::SidAudioEngine;
@@ -172,22 +172,19 @@ fn a_cold_boot_detects_the_standard_from_the_same_kernal() {
 
 // ── §6.5 — clocks ─────────────────────────────────────────────────────────────────────
 
-fn tab() -> Box<[u16; CIAT_TABLEN]> {
-    Box::new([0u16; CIAT_TABLEN])
-}
-
-/// A CIA on a model's clock with CRA bit 7 as given, its TOD started (writing tenths
-/// starts it); run `cycles` and read the TOD as tenths.
+/// A CIA1 on `ticks_per_sec` and `mains`, reset at clock 0: set CRA, write the tenths (which
+/// starts the clock), dispatch the alarms for `cycles` and read the TOD as tenths.
 fn tod_after(ticks_per_sec: u32, mains: u32, cra7: u8, cycles: u64) -> u32 {
-    let t = tab();
-    let mut cia = Cia::new_timed(ticks_per_sec, mains);
-    cia.write(0x0e, cra7, cia.clk, &t);
-    cia.write(0x08, 0, cia.clk, &t);
-    for _ in 0..cycles {
-        cia.tick(&t);
+    let mut cia = trx64_core::c64cia::new_cia1(CIA_MODEL_6526, ticks_per_sec, mains);
+    cia.clk = 0;
+    cia.reset(&mut NoPorts);
+    cia.store(&mut NoPorts, 0x0e, cra7);
+    cia.store(&mut NoPorts, 0x08, 0);
+    for clk in 1..=cycles {
+        cia.process_alarms(&mut NoPorts, clk);
     }
-    let ten = cia.regs[CIA_TOD_TEN] as u32;
-    let sec = cia.regs[CIA_TOD_SEC] as u32;
+    let ten = cia.c_cia[CIA_TOD_TEN] as u32;
+    let sec = cia.c_cia[CIA_TOD_SEC] as u32;
     (sec >> 4) * 100 + (sec & 0x0f) * 10 + (ten & 0x0f)
 }
 
@@ -198,8 +195,8 @@ fn tod_after(ticks_per_sec: u32, mains: u32, cra7: u8, cycles: u64) -> u32 {
 fn tod_counts_sixty_mains_ticks_a_second_on_ntsc() {
     let ntsc = model::resolve("c64-ntsc").unwrap();
     let m = Machine::new_with_model(ntsc);
-    assert_eq!((m.cia1.tod_power_freq, m.cia1.ticks_per_sec), (60, 1_022_730));
-    assert_eq!(m.cia1.tod_period() * 60, 1_022_700, "60 ticks fit one emulated second");
+    assert_eq!((m.cia1.power_freq, m.cia1.ticks_per_sec), (60, 1_022_730));
+    assert_eq!(m.cia1.todticks * 60, 1_022_700, "60 ticks of the base period fit one emulated second");
     let (hz, mains) = (ntsc.timing.cpu_hz, ntsc.timing.tod_hz);
     let second = hz as u64;
     assert_eq!(tod_after(hz, mains, 0, second), 10, "60 Hz divider on 60 Hz mains: one second");
@@ -358,16 +355,17 @@ fn ntsc_stolen_cycles_are_where_vices_table_puts_them() {
 // ── §6.8 — models are rows ────────────────────────────────────────────────────────────
 
 /// Acceptance 8 — `c64-paln` runs 65 × 312 at 1 023 440 Hz with a 50 Hz TOD, without a
-/// line of engine code written for it; `c64c-pal` is refused naming the 6526A.
+/// line of engine code written for it; `c64c-pal` is refused naming what it lacks — the
+/// custom-IC glue (its 6526A exists since Spec 888).
 #[test]
 fn paln_is_a_row_and_c64c_is_refused_by_name() {
     let p = model::resolve("c64-paln").unwrap();
     let m = Machine::new_with_model(p);
     assert_eq!((m.vic.cycles_per_line(), m.vic.screen_height()), (65, 312));
-    assert_eq!((m.timing().cpu_hz, m.cia1.tod_power_freq, m.timing().cycles_per_frame), (1_023_440, 50, 20_280));
+    assert_eq!((m.timing().cpu_hz, m.cia1.power_freq, m.timing().cycles_per_frame), (1_023_440, 50, 20_280));
     assert_eq!(m.drive8.sync_factor, (65536.0 * 1e6 / 1_023_440.0f64).floor() as u32);
     let err = model::resolve("c64c-pal").unwrap_err();
-    assert!(err.contains("6526A"), "{err}");
+    assert!(err.contains("custom-IC glue logic"), "{err}");
     if roms() {
         let m = booted("c64-paln");
         assert_eq!(m.ram[0x02a6], 1, "a 312-line frame reads as PAL to the KERNAL");

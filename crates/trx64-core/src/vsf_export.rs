@@ -7,7 +7,7 @@
 //! Modelled fields (regs, RAM, colour RAM, VIC state, CIA/SID regs, cart lines)
 //! come from our machine — which is a viciisc-faithful port, so they map 1:1.
 //! VICE-internal sub-structures we do NOT model (the interrupt controller, the
-//! `ciat` alarm blob, the VIC `draw_cycle` pipeline + the ~121 KB `raster_snapshot`
+//! VIC `draw_cycle` pipeline + the ~121 KB `raster_snapshot`
 //! draw-buffer) are emitted **zeroed at their exact byte size** — VICE re-derives
 //! them as it runs (a one-frame redraw). Module byte sizes are the ones a real
 //! x64sc VSF carries: MAINCPU 103, C64MEM 65555, CIA 77, SID 36, VIC-IISC 123415.
@@ -140,31 +140,10 @@ fn cart_lines(m: &Machine) -> (u8, u8) {
     }
 }
 
-fn cia(c: &crate::cia::Cia) -> Vec<u8> {
-    use crate::cia::*;
-    let mut w = W::new();
-    w.b(c.regs[CIA_PRA]);
-    w.b(c.regs[CIA_PRB]);
-    w.b(c.regs[CIA_DDRA]);
-    w.b(c.regs[CIA_DDRB]);
-    w.w(c.ta.cnt); // ciat_read_timer(ta)
-    w.w(c.tb.cnt); // ciat_read_timer(tb)
-    w.b(c.regs[CIA_TOD_TEN]);
-    w.b(c.regs[CIA_TOD_SEC]);
-    w.b(c.regs[CIA_TOD_MIN]);
-    w.b(c.regs[CIA_TOD_HR]);
-    w.b(c.regs[CIA_SDR]);
-    w.b(c.regs[CIA_ICR]); // ICR mask
-    w.b(c.regs[CIA_CRA]);
-    w.b(c.regs[CIA_CRB]);
-    w.w(c.ta.latch); // ciat_read_latch(ta)
-    w.w(c.tb.latch); // ciat_read_latch(tb)
-    w.b(c.irqflags); // ciacore_peek(ICR) — the latched IRQ flags
-    // tat/tbt/underflow composite, sr_bits, todalarm[4], rdi byte, tod flags,
-    // todlatch[4], todclk(CLOCK), ciat_save_snapshot(ta/tb), shifter — un-modelled
-    // internal timer/TOD blob; zero-filled to the exact x64sc CIA size (77).
-    w.pad_to(77);
-    w.buf
+/// CIA1 / CIA2: VICE's own `ciacore_snapshot_write_module` (2.5, 77 bytes), written
+/// from a copy of the chip (vsf.rs `cia_module_body`).
+fn cia(c: &crate::ciacore::CiaCore) -> Vec<u8> {
+    crate::vsf::cia_module_body(c)
 }
 
 fn sid(m: &Machine) -> Vec<u8> {
@@ -416,9 +395,10 @@ pub fn save_vice_vsf(m: &mut Machine) -> Vec<u8> {
     // KEYBOARD (the key-matrix latch) so VICE resumes with the same keys held.
     module(&mut out, "KEYBOARD", 0, 0, &keyboard(m));
 
-    // GLUE (VIC-II glue logic): type(discrete=0) + old_vbank (from CIA2 PA bits 0-1,
-    // active-low) + alarm(0). JOYPORT0/1: no joystick attached (0).
-    let vbank = (!m.cia2.regs[0]) & 3;
+    // GLUE (VIC-II glue logic): type(discrete=0) + old_vbank (`~byte & 3` of CIA2's
+    // composed port-A output, c64cia2.c `store_ciapa`) + alarm(0). JOYPORT0/1: no
+    // joystick attached (0).
+    let vbank = (!m.cia2.pa_out()) & 3;
     module(&mut out, "GLUE", 1, 0, &[0u8, vbank, 0u8]);
     module(&mut out, "JOYPORT0", 0, 0, &[0u8]);
     module(&mut out, "JOYPORT1", 0, 0, &[0u8]);

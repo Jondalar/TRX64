@@ -26,7 +26,7 @@
 //! (the OR form of the ATN acknowledge), and the machine reads `drv_data[unit]` back
 //! after the catch-up and folds it into the shared IEC core.
 
-use crate::ciacore::{CiaBackend, CiaCore, CIA_DDRA, CIA_PRA, CIA_PRB};
+use crate::ciacore::{CiaBackend, CiaCore, CiaPins, CIA_DDRA, CIA_PRA, CIA_PRB};
 use crate::drive_6510core::{drive_6510core_execute, DriveCore6510, DriveCore6510Bus, IntStatus, IK_IRQ, IK_RESET};
 use crate::iec::IecbusT;
 use crate::fdc_controller::{FdcBoardOut, FdcController, HostFdc};
@@ -203,15 +203,15 @@ struct Ports<'a, F: BoardFdc> {
 
 impl<F: BoardFdc> CiaBackend for Ports<'_, F> {
     /// cia1581d.c:117-137 store_ciapa.
-    fn store_pa(&mut self, clk: u64, byte: u8) {
+    fn store_pa(&mut self, clk: u64, byte: u8, _pins: &CiaPins) {
         self.fdc.port_a(clk, byte);
         *self.led = byte & 0x40 != 0;
     }
 
     /// cia1581d.c:139-183 store_ciapb — fold into the drive's `iecbus` with the 1581
     /// formula, and hand PB5 to the fast-serial direction.
-    fn store_pb(&mut self, _clk: u64, byte: u8, old_pb: u8) {
-        if byte != old_pb {
+    fn store_pb(&mut self, _clk: u64, byte: u8, pins: &CiaPins) {
+        if byte != pins.old_pb {
             let slot = self.number + 8;
             let drive_data = !byte;
             self.iecbus.drv_data[slot] = drive_data;
@@ -236,13 +236,15 @@ impl<F: BoardFdc> CiaBackend for Ports<'_, F> {
 
     /// cia1581d.c:185-201 read_ciapa — jumpers on PA3-4, /DISK CHANGE on PA7 (1 = not
     /// changed), /RDY on PA1 — both as the mechanism drives them.
-    fn read_pa(&mut self, c: &[u8; 16]) -> u8 {
+    fn read_pa(&mut self, pins: &CiaPins) -> u8 {
+        let c = &pins.c_cia;
         let tmp = (8 * self.number) as u8 | self.fdc.pa_in();
         (tmp & !c[CIA_DDRA]) | (c[CIA_PRA] & c[CIA_DDRA])
     }
 
     /// cia1581d.c:203-223 read_ciapb.
-    fn read_pb(&mut self, c: &[u8; 16]) -> u8 {
+    fn read_pb(&mut self, pins: &CiaPins) -> u8 {
+        let c = &pins.c_cia;
         (((c[CIA_PRB] & 0x1a) | self.iecbus.drv_port) ^ 0x85) | self.fdc.pb6()
     }
 
@@ -253,7 +255,7 @@ impl<F: BoardFdc> CiaBackend for Ports<'_, F> {
     }
 
     /// cia1581d.c:108-115 undump_ciapa.
-    fn undump_pa(&mut self, _rclk: u64, byte: u8) {
+    fn undump_pa(&mut self, _rclk: u64, byte: u8, _pins: &CiaPins) {
         *self.led = byte & 0x40 != 0;
     }
 
@@ -487,7 +489,7 @@ impl Drive1581 {
             ram: Box::new([0u8; 0x2000]),
             rom: Box::new([0u8; 0x8000]),
             rom_next: None,
-            cia: CiaCore::new(&format!("CIA1581D{mynumber}")),
+            cia: CiaCore::new_8520(&format!("CIA1581D{mynumber}")),
             wd: Wd1770::new(mynumber),
             iecbus: IecbusT::new_power_on(),
             cpu_last_data: 0,
@@ -555,7 +557,7 @@ impl Drive1581 {
         self.iecbus = IecbusT::new_power_on();
         self.fast_dir = false;
         let name = self.cia.myname.clone();
-        self.cia = CiaCore::new(&name);
+        self.cia = CiaCore::new_8520(&name);
         self.cia.clk = 0;
         {
             let mut p = ports_of!(self, number, 0);

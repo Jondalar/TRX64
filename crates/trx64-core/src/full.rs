@@ -1,7 +1,8 @@
 //! full.rs — the assembled full-C64 memory bus (FullBus).
 //!
 //! Composition (ADR-010/012/021): the cycle-exact CPU (cpu.rs), VIC-II (vic.rs),
-//! CIA1/CIA2 (cia.rs) and 1541 drive (drive.rs) — each byte-exact in isolation —
+//! CIA1/CIA2 (ciacore.rs + the c64cia.rs glue) and 1541 drive (drive.rs) — each
+//! byte-exact in isolation —
 //! wired into the real machine through a single `Bus` impl that reproduces the TS
 //! oracle's `HeadlessMemoryBus` (memory-bus.ts) + `integrated-session.ts` run loop:
 //!
@@ -16,12 +17,14 @@
 //!     power-on DRAM-fill (writes-through-ROM + the trace `old`/oldValue byte read
 //!     RAM underneath, never ROM — memory-bus.ts gotcha).
 //!   * VIC ticked per CPU master cycle (Bus::tick + BA-low stealing, vic.rs).
-//!   * Both CIAs share the CPU master clock; their timer state machines advance
-//!     lazily to `clk` on each register access (rclk = clk, C64SC offsets = 0).
-//!   * Cross-chip IRQ: CIA1 ∨ VIC → CPU IRQ line; CIA2 → CPU NMI line, sampled by
-//!     the CPU at the instruction boundary (cpu.rs interrupt pipeline).
+//!   * Both CIAs share the CPU master clock (`*clk_ptr`); their alarms are dispatched
+//!     by the CPU loop and on every register access (ciacore.rs; x64sc offsets 0).
+//!   * Cross-chip IRQ: CIA1 ∨ VIC → CPU IRQ line; CIA2 → CPU NMI line. The CIAs'
+//!     line changes are replayed into the CPU's interrupt status at their own clocks
+//!     (`drain_cia_int`).
 
-use crate::cia::{Cia, CIAT_TABLEN};
+use crate::c64cia::{Cia1Ports, Cia2Ports};
+use crate::ciacore::{CiaCore, CIA_PRA};
 use crate::cpu::Bus;
 use crate::sid::Sid6581;
 use crate::vic::VicII;
@@ -164,9 +167,8 @@ pub struct FullBus<'a> {
     /// IO register shadow ($D000-$DFFF) for open-bus reads of unclaimed regs.
     pub io: &'a mut [u8; 0x1000],
     pub vic: &'a mut VicII,
-    pub cia1: &'a mut Cia,
-    pub cia2: &'a mut Cia,
-    pub cia_table: &'a [u16; CIAT_TABLEN],
+    pub cia1: &'a mut CiaCore,
+    pub cia2: &'a mut CiaCore,
     /// 32-byte SID register shadow ($D400-$D41F) — write-only store for parity.
     /// Spec 855: this is CHIP 0, the one every existing path already names.
     pub sid_regs: &'a mut [u8; 32],
@@ -278,9 +280,6 @@ pub struct FullBus<'a> {
     /// boundary restamp. Conservative on purpose: a false positive costs one sync, a
     /// missed one storms every handler.
     pub io_touched: bool,
-    /// Spec 857 D4 — `Machine::cia_alarm_check` for this run: `process_alarms` compares
-    /// against the CIAs' predicted alarm clocks instead of catching them up every time.
-    pub cia_alarm_check: bool,
 }
 
 /// The ROMH the VIC fetches through under a REAL ultimax board, or `None` for every
@@ -489,77 +488,34 @@ impl<'a> FullBus<'a> {
                 (v & 0x0f) | 0xf0
             }
             0xdc00..=0xdcff => {
-                // CIA1 PA ($DC00) carries the keyboard COLUMN lines AND joystick
-                // port 2 (bits 0-4, active-low). VICE c64cia1.c:337 read_ciapa:
-                // byte = (val & (PRA|~DDRA)) & read_joyport_dig(JOY2), where
-                // `val` is the keyboard BACK-SCAN — the columns pulled low by the
-                // keys sitting on whichever rows port B is driving.
-                //
-                // That back-scan used to be assumed 0xff, on the grounds that the
-                // KERNAL never drives PB. The KERNAL does not; games do. A title we
-                // scans the matrix both ways in its IRQ — DDRB=$ff, PRB=$00, read
-                // $DC00 — and bails out the instant it reads $ff, so with the
-                // assumption baked in NO key ever reached the game. Measured on
-                // the live machine: its handler ran 477 times and queued nothing.
-                //
-                // `pb_out` is what port B is actually driving (= VICE `old_pb`),
-                // ANDed with joystick 1, which pulls the same lines low.
-                if (addr & 0xf) == crate::cia::CIA_PRA as u16 {
-                    crate::keyboard::cia1_pa_pins(
-                        self.keyboard,
-                        self.clk,
-                        self.cia1.peek(0xdc00),
-                        self.cia1.peek(0xdc02),
-                        self.cia1.peek(0xdc01),
-                        self.cia1.peek(0xdc03),
-                        &self.joystick1,
-                        &self.joystick2,
-                    )
-                }
-                // CIA1 PB ($DC01) carries the keyboard ROW lines AND joystick
-                // port 1 (bits 0-4, active-low). VICE c64cia1.c:425-431 read_ciapb:
-                // byte = (val & (PRB|~DDRB)) | (DDRB & PRB), then ANDed with
-                // joystick-port-1 (read_joyport_dig(JOY1)). `val` = keyboard row
-                // pull-down for the PA column drive (paOut = PRA|~DDRA). KERNAL
-                // programs DDRB=0 so the latch term collapses to `val`, but we
-                // compute the full formula + joy1 AND for fidelity (c64re
-                // cia1.ts:101-112).
-                else if (addr & 0xf) == crate::cia::CIA_PRB as u16 {
-                    crate::keyboard::cia1_pb_pins(
-                        self.keyboard,
-                        self.clk,
-                        self.cia1.peek(0xdc00),
-                        self.cia1.peek(0xdc02),
-                        self.cia1.peek(0xdc01),
-                        self.cia1.peek(0xdc03),
-                        &self.joystick1,
-                    )
-                } else {
-                    self.cia1.read(addr, self.clk, self.cia_table)
-                }
+                // c64cia1.c `cia1_read` → `ciacore_read`; port A/B are the keyboard and
+                // the joysticks (`read_ciapa` / `read_ciapb`, c64cia.rs).
+                let clk = self.clk;
+                self.cia1.clk = clk;
+                let mut p = Cia1Ports {
+                    kb: self.keyboard,
+                    now: clk,
+                    joy1: self.joystick1,
+                    joy2: self.joystick2,
+                    pot: Some(&mut *self.pot),
+                };
+                self.cia1.read(&mut p, addr)
             }
             0xdd00..=0xddff => {
-                // CIA2 register 0 = port A ($DD00) carries the IEC input lines on
-                // bits 6/7. VICE read_ciapa: value = ((PRA|~DDRA)&0x3f) |
-                // iecbus_callback_read(clk). The callback push-flushes the drive,
-                // re-folds the wired-AND bus, and returns the cached cpu_port —
-                // and (via iecReadPins → c64Read($DD00) → emitC64Access) emits an
-                // EXTRA bus-access read record of cpu_port BEFORE the CPU's own
-                // load record. We reproduce both: the indirection record (queued as
-                // a read side-effect) and the composed PA byte.
-                if (addr & 0xf) == crate::cia::CIA_PRA as u16 {
+                // c64cia2.c `cia2_read`. A port-A read takes the serial bus's CLK/DATA in
+                // through `iecbus_callback_read(maincpu_clk)`: push-flush the drives,
+                // re-fold the wired-AND bus and hand back the folded `cpu_port`. The TS
+                // trace contract records that sample as an extra bus read of $DD00 ahead
+                // of the CPU's own load record.
+                let mut p = Cia2Ports::default();
+                if (addr & 0xf) as usize == CIA_PRA {
                     self.iec_push_flush();
-                    // = iecbus_cpu_read_conf1(clk): returns the freshly-folded
-                    // cpu_port (the drive catch-up was done by iec_push_flush).
                     let pins = self.iec.iecbus_callback_read(self.clk);
-                    // iecReadPins indirection record (= emitC64Access read at $DD00).
                     self.read_side_effects.push((0xdd00, pins));
-                    let pra = self.cia2.peek(0xdd00);
-                    let ddra = self.cia2.peek(0xdd02);
-                    (((pra | !ddra) & 0x3f) | pins) & 0xff
-                } else {
-                    self.cia2.read(addr, self.clk, self.cia_table)
+                    p.iec_pins = pins;
                 }
+                self.cia2.clk = self.clk;
+                self.cia2.read(&mut p, addr)
             }
             // $DE00-$DFFF — cart IO1/IO2 (ts:407-410). The cart is consulted ONLY
             // when I/O is visible (guaranteed: io_read is reached only via the io
@@ -617,22 +573,17 @@ impl<'a> FullBus<'a> {
         }
     }
 
-    /// VIC bank base from CIA2 port-A bits 0-1 (= Machine::vic_bank_base):
-    /// PORT OF: `core/ciacore.c:810` + `c64/c64cia2.c:150-151`. The byte the CIA
-    /// puts on port A is `PRA | ~DDRA` — an INPUT pin contributes 1, because the
-    /// pin floats high on the pull-up, not 0. `store_ciapa` then takes `~byte & 3`.
-    /// Masking with `PRA & DDRA` instead reads an input bank bit as 0 and lands the
-    /// VIC 3 banks away: the KERNAL leaves `DDRA = $3F` so both forms agree, but a
-    /// fastloader that drives $DD00 itself (Spindle writes `DDRA = $3C`) leaves the
-    /// bank bits as inputs and every fetch goes to the wrong 16 KB.
+    /// VIC bank base from CIA2 port A. PORT OF: `c64/c64cia2.c` `store_ciapa` —
+    /// `vbank = ~byte & 3` of the composed output `PRA | ~DDRA` (`old_pa`), switched at
+    /// once by the discrete glue (`c64gluelogic.c`, type 0). An INPUT pin contributes 1:
+    /// it floats high on the pull-up. A fastloader that drives $DD00 itself (Spindle
+    /// writes `DDRA = $3C`) leaves the bank bits as inputs, and the bank is still 0.
     ///
     /// Used by the per-cycle VIC fetch view (tick/check_ba) + the static collision
     /// recompute.
     #[inline]
     pub(crate) fn vic_bank_base(&self) -> u16 {
-        let pra = self.cia2.peek(0xdd00);
-        let ddra = self.cia2.peek(0xdd02);
-        let bank = (((pra | !ddra) & 0x03) ^ 0x03) as u16;
+        let bank = ((self.cia2.pa_out() & 0x03) ^ 0x03) as u16;
         bank.wrapping_mul(0x4000)
     }
 
@@ -651,11 +602,7 @@ impl<'a> FullBus<'a> {
         for (i, c) in color_ram.iter_mut().enumerate() {
             *c = self.io[0x0800 + i] & 0x0f;
         }
-        // VIC bank base from CIA2 port-A bits 0-1 (= Machine::vic_bank_base).
-        let pra = self.cia2.peek(0xdd00);
-        let ddra = self.cia2.peek(0xdd02);
-        let bank = (((pra | !ddra) & 0x03) ^ 0x03) as u16;
-        let bank_base = bank.wrapping_mul(0x4000);
+        let bank_base = self.vic_bank_base();
 
         let inp = crate::render::RenderInput {
             regs: &self.vic.regs,
@@ -671,7 +618,7 @@ impl<'a> FullBus<'a> {
 
     /// I/O write dispatch ($D000-$DFFF, IO config).
     #[inline]
-    fn io_write(&mut self, addr: u16, value: u8) {
+    pub(crate) fn io_write(&mut self, addr: u16, value: u8) {
         self.io_touched = true;
         // Keep the open-bus shadow for unclaimed-register reads.
         self.io[(addr as usize) - 0xd000] = value;
@@ -686,24 +633,28 @@ impl<'a> FullBus<'a> {
             }
             0xd800..=0xdbff => { /* color RAM: shadow already stored above */ }
             0xdc00..=0xdcff => {
-                // Spec 876 D3 — `$DC00`/`$DC02` move the POT mux: settle the latch under
-                // the selection that stood until now, before the write changes it.
-                let reg = (addr & 0xf) as usize;
-                if reg == crate::cia::CIA_PRA || reg == crate::cia::CIA_DDRA {
-                    self.pot.settle(self.clk, crate::pot::select(self.cia1.pa_output()));
-                }
-                self.cia1.write(addr, value, self.clk, self.cia_table)
+                // c64cia1.c `cia1_store` → `ciacore_store`. A port-A change moves the POT
+                // selection (`store_ciapa`, Spec 876 D3).
+                let clk = self.clk;
+                self.cia1.clk = clk;
+                let mut p = Cia1Ports {
+                    kb: self.keyboard,
+                    now: clk,
+                    joy1: self.joystick1,
+                    joy2: self.joystick2,
+                    pot: Some(&mut *self.pot),
+                };
+                self.cia1.store(&mut p, addr, value)
             }
             0xdd00..=0xddff => {
-                self.cia2.write(addr, value, self.clk, self.cia_table);
-                // CIA2 port-A output drives the IEC bus + VIC bank. A $DD00 (PRA)
-                // or $DD02 (DDRA) write that changes the composed output re-pushes
-                // it to $DD00 (= TS iecWrite → c64Write($DD00, or)). The push is
+                self.cia2.clk = self.clk;
+                let mut p = Cia2Ports::default();
+                self.cia2.store(&mut p, addr, value);
+                // c64cia2.c `store_ciapa`: a changed port-A output drives the VIC bank
+                // (read from `pa_out` by `vic_bank_base`) and the serial bus. The push is
                 // recorded BEFORE the originating store's own trace record.
-                let reg = (addr & 0xf) as usize;
-                if reg == crate::cia::CIA_PRA || reg == crate::cia::CIA_DDRA {
-                    let new_out = self.cia2.pa_output();
-                    if new_out != self.cia2_pa_out {
+                if let Some(new_out) = p.pa_store {
+                    {
                         // The $DD00 IO shadow becomes the new output; `old` = prior
                         // shadow at $DD00 (the trace old byte for an IO write is
                         // omitted anyway — hasOld=0 for $D000-$DFFF — so 0 is fine).
@@ -798,6 +749,35 @@ impl<'a> FullBus<'a> {
         stolen
     }
 
+    /// The CIAs' part of x64sc's alarm dispatch (`interrupt_delay`,
+    /// `maincpu_steal_cycles`, `6510dtvcore.c` PROCESS_ALARMS): every CIA alarm due at
+    /// or before `clk`, each callback at its own clock. One compare per chip when
+    /// nothing is due.
+    #[inline]
+    pub fn process_cia_alarms(&mut self, clk: u64) {
+        if clk >= self.cia1.next_alarm_clk() {
+            let mut p = Cia1Ports {
+                kb: self.keyboard,
+                now: clk,
+                joy1: self.joystick1,
+                joy2: self.joystick2,
+                pot: Some(&mut *self.pot),
+            };
+            self.cia1.process_alarms(&mut p, clk);
+        }
+        if clk >= self.cia2.next_alarm_clk() {
+            self.cia2.process_alarms(&mut Cia2Ports::default(), clk);
+        }
+    }
+
+    /// Replay the CIAs' interrupt-line changes into the CPU's interrupt status:
+    /// `cia1` → `interrupt_set_irq`, `cia2` → `interrupt_set_nmi` (c64cia1.c / c64cia2.c
+    /// `cia_set_int_clk`), each at the clock the CIA drove it, in order.
+    #[inline]
+    pub fn drain_cia_int(&mut self, int: &mut crate::c64_6510core::IntStatus) {
+        drain_cia_int(self.cia1, self.cia2, int);
+    }
+
     // ── Spec 855 — one of several SIDs ──────────────────────────────────────────────
 
     /// Read register `reg` of `chip`. Chip 0 is the machine's own SID; anything
@@ -817,7 +797,7 @@ impl<'a> FullBus<'a> {
             // Spec 876 D4 — chip 0's POT registers are the latch of the control ports'
             // POT lines, selected by CIA1 PA6/PA7.
             if reg == 0x19 || reg == 0x1a {
-                let sel = crate::pot::select(self.cia1.pa_output());
+                let sel = crate::pot::select(self.cia1.pa_out());
                 return self.pot.read(self.clk, sel, reg - 0x19);
             }
             return self.sid.read(reg, self.sid_regs);
@@ -1196,8 +1176,8 @@ impl<'a> Bus for FullBus<'a> {
         self.clk = self.clk.wrapping_add(1);
         self.cia1.clk = self.clk;
         self.cia2.clk = self.clk;
-        self.cia1.tick(self.cia_table);
-        self.cia2.tick(self.cia_table);
+        let clk = self.clk;
+        self.process_cia_alarms(clk);
     }
 
     /// VICE check_ba(): stall the CPU read while VIC BA is low (badline / sprite
@@ -1224,12 +1204,32 @@ impl<'a> Bus for FullBus<'a> {
     }
 }
 
+/// [`FullBus::drain_cia_int`] over the two chips alone, for the machine's own paths.
+#[inline]
+pub fn drain_cia_int(cia1: &mut CiaCore, cia2: &mut CiaCore, int: &mut crate::c64_6510core::IntStatus) {
+    if !cia1.irq_events.is_empty() {
+        for (level, rclk) in cia1.irq_events.drain(..) {
+            int.set_irq(crate::c64_6510core::INT_SRC_CIA1, level, rclk);
+        }
+    }
+    if !cia2.irq_events.is_empty() {
+        for (level, rclk) in cia2.irq_events.drain(..) {
+            int.set_nmi(crate::c64_6510core::INT_SRC_CIA2, level, rclk);
+        }
+    }
+}
+
 #[cfg(test)]
 mod joystick_gate_tests {
     //! T1.7 gate — a game/test that reads CIA1 PA ($DC00) / PB ($DC01) must see
     //! the joystick bits (active-low). Mirrors c64re cia1.ts readPa/readPb.
     use super::*;
     use crate::keyboard::{JoystickState, KeyboardMatrix};
+
+    fn reset_cia(mut c: CiaCore) -> CiaCore {
+        c.reset(&mut crate::ciacore::NoPorts);
+        c
+    }
 
     fn make_bus<'a>(
         ram: &'a mut [u8; 0x10000],
@@ -1238,9 +1238,8 @@ mod joystick_gate_tests {
         chargen: &'a [u8; 0x1000],
         io: &'a mut [u8; 0x1000],
         vic: &'a mut VicII,
-        cia1: &'a mut Cia,
-        cia2: &'a mut Cia,
-        tab: &'a [u16; CIAT_TABLEN],
+        cia1: &'a mut CiaCore,
+        cia2: &'a mut CiaCore,
         sid_regs: &'a mut [u8; 32],
         sid: &'a mut Sid6581,
         sid_trace: &'a mut crate::sid::SidTrace,
@@ -1262,7 +1261,6 @@ mod joystick_gate_tests {
             vic,
             cia1,
             cia2,
-            cia_table: tab,
             sid_regs,
             sid,
             // Spec 855 — this helper is a chip-0 bus and has no callers in the
@@ -1302,7 +1300,6 @@ mod joystick_gate_tests {
             host_lines: crate::expansion::PortLines::default(),
             port_active: false,
             io_touched: false,
-            cia_alarm_check: false,
         }
     }
 
@@ -1316,9 +1313,8 @@ mod joystick_gate_tests {
         let chargen = [0u8; 0x1000];
         let mut io = [0u8; 0x1000];
         let mut vic = VicII::new();
-        let mut cia1 = Cia::new();
-        let mut cia2 = Cia::new();
-        let tab = crate::cia::new_table();
+        let mut cia1 = reset_cia(crate::c64cia::new_cia1(0, 985_248, 50));
+        let mut cia2 = reset_cia(crate::c64cia::new_cia2(0, 985_248, 50));
         let mut sid_regs = [0u8; 32];
         let mut sid = Sid6581::new();
         let mut sid_trace = crate::sid::SidTrace::default();
@@ -1333,7 +1329,7 @@ mod joystick_gate_tests {
         {
             let mut bus = make_bus(
                 &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
-                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut drive_b, &mut iec,
+                &mut cia2, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut drive_b, &mut iec,
                 &kb, JoystickState::default(), JoystickState::default(),
             );
             assert_eq!(bus.io_read(0xdc00), 0xff, "released joy2 → all PA bits high");
@@ -1343,7 +1339,7 @@ mod joystick_gate_tests {
             let joy2 = JoystickState { fire: true, ..Default::default() };
             let mut bus = make_bus(
                 &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
-                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut drive_b, &mut iec,
+                &mut cia2, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut drive_b, &mut iec,
                 &kb, JoystickState::default(), joy2,
             );
             assert_eq!(bus.io_read(0xdc00), 0xff & !(1 << 4), "joy2 fire → PA bit4 low");
@@ -1353,7 +1349,7 @@ mod joystick_gate_tests {
             let joy2 = JoystickState { up: true, left: true, ..Default::default() };
             let mut bus = make_bus(
                 &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
-                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut drive_b, &mut iec,
+                &mut cia2, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut drive_b, &mut iec,
                 &kb, JoystickState::default(), joy2,
             );
             assert_eq!(bus.io_read(0xdc00), 0xff & !0x05, "joy2 up+left → PA bits 0+2 low");
@@ -1382,9 +1378,8 @@ mod joystick_gate_tests {
         let chargen = [0u8; 0x1000];
         let mut io = [0u8; 0x1000];
         let mut vic = VicII::new();
-        let mut cia1 = Cia::new();
-        let mut cia2 = Cia::new();
-        let tab = crate::cia::new_table();
+        let mut cia1 = reset_cia(crate::c64cia::new_cia1(0, 985_248, 50));
+        let mut cia2 = reset_cia(crate::c64cia::new_cia2(0, 985_248, 50));
         let mut sid_regs = [0u8; 32];
         let mut sid = Sid6581::new();
         let mut sid_trace = crate::sid::SidTrace::default();
@@ -1399,7 +1394,7 @@ mod joystick_gate_tests {
 
         let mut bus = make_bus(
             &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
-            &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut drive_b, &mut iec,
+            &mut cia2, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut drive_b, &mut iec,
             &kb, JoystickState::default(), JoystickState::default(),
         );
 
@@ -1437,9 +1432,8 @@ mod joystick_gate_tests {
         let chargen = [0u8; 0x1000];
         let mut io = [0u8; 0x1000];
         let mut vic = VicII::new();
-        let mut cia1 = Cia::new();
-        let mut cia2 = Cia::new();
-        let tab = crate::cia::new_table();
+        let mut cia1 = reset_cia(crate::c64cia::new_cia1(0, 985_248, 50));
+        let mut cia2 = reset_cia(crate::c64cia::new_cia2(0, 985_248, 50));
         let mut sid_regs = [0u8; 32];
         let mut sid = Sid6581::new();
         let mut sid_trace = crate::sid::SidTrace::default();
@@ -1453,7 +1447,7 @@ mod joystick_gate_tests {
         {
             let mut bus = make_bus(
                 &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
-                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut drive_b, &mut iec,
+                &mut cia2, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut drive_b, &mut iec,
                 &kb, JoystickState::default(), JoystickState::default(),
             );
             assert_eq!(bus.io_read(0xdc01), 0xff, "released joy1 → all PB bits high");
@@ -1463,7 +1457,7 @@ mod joystick_gate_tests {
             let joy1 = JoystickState { right: true, ..Default::default() };
             let mut bus = make_bus(
                 &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
-                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut drive_b, &mut iec,
+                &mut cia2, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut drive_b, &mut iec,
                 &kb, joy1, JoystickState::default(),
             );
             assert_eq!(bus.io_read(0xdc01), 0xff & !(1 << 3), "joy1 right → PB bit3 low");
@@ -1473,7 +1467,7 @@ mod joystick_gate_tests {
             let joy1 = JoystickState { down: true, fire: true, ..Default::default() };
             let mut bus = make_bus(
                 &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
-                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut drive_b, &mut iec,
+                &mut cia2, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut drive_b, &mut iec,
                 &kb, joy1, JoystickState::default(),
             );
             assert_eq!(bus.io_read(0xdc01), 0xff & !0x12, "joy1 down+fire → PB bits 1+4 low");
