@@ -1,7 +1,7 @@
 //! Spec 887 — the idle clock behind `--idle-exit`.
 //!
-//! The daemon ends itself once it has been idle for `armed` seconds: no request, no
-//! connected client, no recording trace (the last two HOLD the clock at "now"), unless a
+//! The daemon ends itself once it has been idle for `armed` seconds: no request, no A/V
+//! stream subscriber, no recording trace (the last two HOLD the clock at "now"), unless a
 //! `daemon/keep_alive` pushed the deadline out or held it forever. [`IdleClock`] is pure —
 //! every method takes `now` — so the rules are tested without sleeping; the process-wide
 //! clock below is the one the daemon arms, touches and polls.
@@ -30,7 +30,7 @@ impl IdleClock {
         self.last_activity = now;
     }
 
-    /// Something that keeps the daemon in use (`"client"`, `"trace"`) is present, or not.
+    /// Something that keeps the daemon in use (`"subscriber"`, `"trace"`) is present, or not.
     /// While it is, the clock stays at `now`, so the window starts when it ends.
     pub fn hold(&mut self, what: Option<&'static str>, now: Instant) {
         self.holding = what;
@@ -177,7 +177,7 @@ mod tests {
     fn a_client_or_a_trace_holds_the_clock_and_the_window_starts_when_it_ends() {
         let t0 = Instant::now();
         let mut c = IdleClock::new(60, t0);
-        c.hold(Some("client"), t0 + s(10));
+        c.hold(Some("subscriber"), t0 + s(10));
         assert_eq!(c.deadline(), None);
         c.hold(Some("trace"), t0 + s(500));
         assert!(!c.expired(t0 + s(500)));
@@ -203,9 +203,9 @@ mod tests {
         let st = c.status(t0);
         assert!(st["deadlineMs"].as_u64().is_some(), "{st}");
         assert!(st["keptAliveUntilMs"].is_null());
-        c.hold(Some("client"), t0);
+        c.hold(Some("subscriber"), t0);
         let st = c.status(t0);
         assert!(st["deadlineMs"].is_null());
-        assert_eq!(st["holding"], "client");
+        assert_eq!(st["holding"], "subscriber");
     }
 }

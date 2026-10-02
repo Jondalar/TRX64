@@ -23,7 +23,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::{accept_async, tungstenite::Message};
+use tokio_tungstenite::{accept_hdr_async, tungstenite::Message};
 use trx64_core::drive::{DiskImage, DiskKind, DrivePosition};
 use trx64_core::{BusKind, NullSink, Observer};
 use trx64_session::{Session, TraceState};
@@ -17656,7 +17656,22 @@ async fn handle_connection(
     state: SharedState,
     hub: Option<Arc<streaming::StreamHub>>,
 ) {
-    let ws = match accept_async(stream).await {
+    // A client that only speaks RPC (C64RE's MCP keeps one such socket for its whole
+    // life) connects with `?av=0`: it gets no A/V push, does not start the pacing loop,
+    // and is not an A/V subscriber — so it does not hold the idle clock (Spec 887).
+    // Everyone else is subscribed on connect, as before.
+    let av_wanted = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let av_flag = Arc::clone(&av_wanted);
+    let read_query = move |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                           resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
+        let off = req
+            .uri()
+            .query()
+            .is_some_and(|q| q.split('&').any(|kv| kv == "av=0" || kv == "av=false"));
+        av_flag.store(!off, std::sync::atomic::Ordering::Relaxed);
+        Ok(resp)
+    };
+    let ws = match accept_hdr_async(stream, read_query).await {
         Ok(ws) => ws,
         Err(e) => {
             eprintln!("[trx64] WS handshake failed from {addr}: {e}");
@@ -17691,7 +17706,10 @@ async fn handle_connection(
     // guard unsubscribes (+ stops the loop if last). When streaming is OFF (the
     // oracle's command-driven daemons), the machine never auto-advances on connect,
     // so the byte-exact gates are unperturbed.
-    let _stream = hub.as_ref().map(|h| h.subscribe(out_tx.clone()));
+    let _stream = hub
+        .as_ref()
+        .filter(|_| av_wanted.load(std::sync::atomic::Ordering::Relaxed))
+        .map(|h| h.subscribe(out_tx.clone()));
 
     // Register this client's outbound channel with the (always-present) generic
     // notification hub so handler-driven server pushes (debug/breakpoint_hit,
@@ -18355,13 +18373,15 @@ async fn main() {
         RUNTIME_VERSION
     );
 
-    // Spec 887 — the idle watch. Once a second: a connected client or a recording trace
-    // holds the clock; with neither, and no request, for the whole window, persist the
-    // media as eject would and end with exit 0.
+    // Spec 887 — the idle watch. Once a second: an A/V stream subscriber or a recording
+    // trace holds the clock; with neither, and no request, for the whole window, persist
+    // the media as eject would and end with exit 0. A plain RPC connection (`?av=0`, or
+    // any connection on a --headless daemon) holds nothing: only what it sends counts.
     if cli.idle_exit > 0 {
         idle::arm(cli.idle_exit);
         eprintln!("[trx64] idle exit armed: {} s", cli.idle_exit);
         let state = Arc::clone(&state);
+        let av_hub = hub.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
@@ -18370,12 +18390,14 @@ async fn main() {
                     let st = state.lock().unwrap();
                     if st.session.trace.is_some() {
                         Some("trace")
-                    } else if st.notify.live() > 0 {
-                        Some("client")
                     } else {
                         None
                     }
                 };
+                // Outside the state lock: the hub takes it while subscribing.
+                let holding = holding.or_else(|| {
+                    av_hub.as_ref().filter(|h| h.live() > 0).map(|_| "subscriber")
+                });
                 idle::hold(holding);
                 if let Some(window) = idle::expired() {
                     let mut st = state.lock().unwrap();

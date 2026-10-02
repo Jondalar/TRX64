@@ -452,14 +452,17 @@ a property, and until 2026-09-26 it was only a line in a spec.
 
 C64RE starts the shared daemon detached so it survives an MCP reconnect, and nothing ever
 ended it: every closed or killed session left one running. `--idle-exit <s>` (off by
-default) ends the daemon once, for the whole window, no request arrived, no client was
-connected and no trace was recording; a connected client or a trace holds the clock at
-"now". Before exiting it persists the cartridge and both drives' disks exactly as eject
+default) ends the daemon once, for the whole window, no request arrived, no A/V stream
+subscriber was connected and no trace was recording; a subscriber or a trace holds the
+clock at "now". An RPC-only client connects with `?av=0` and holds nothing. Before exiting it persists the cartridge and both drives' disks exactly as eject
 does. `daemon/keep_alive {seconds | null}` holds it; `ping` and `session/state` carry
-`idleExit {armedSeconds, deadlineMs, keptAliveUntilMs, keptForever, holding}`.
+`idleExit {armedSeconds, deadlineMs, keptAliveUntilMs, keptForever, holding}` with
+`holding` = `"subscriber"` | `"trace"` | null.
 
-**Decision:** "no A/V subscriber" is read as "no connected client": every connection
-subscribes to the notification hub (and, streaming, to the A/V stream), so the one count
-covers both and also works headless. A daemon that ends itself must not lose a user's
+**Decision:** an open socket is not use. The first build counted every connection, and
+C64RE's MCP keeps one socket for its whole life, so any open Claude window would have held
+the daemon forever — the leftover 887 exists to remove. Only an A/V subscriber holds it;
+since streaming daemons subscribe every connection on connect, an RPC-only client says so
+with `?av=0` (and stops receiving frames it never used). A daemon that ends itself must not lose a user's
 write, so media persist first; the machine state itself is lost, which the owner accepted
 because the next tool call starts a fresh daemon.

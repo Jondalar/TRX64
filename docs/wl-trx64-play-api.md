@@ -33,6 +33,11 @@ There is **one live machine per container**. Every client connected to the
 same container drives/sees the SAME machine — the emulator is a single shared C64, not
 per-connection. `session_id` may be passed but is not required (single session).
 
+A streaming daemon subscribes every connection to the A/V push on connect (and its first
+subscriber starts the pacing loop). A client that only speaks JSON-RPC connects to
+`ws://host:port/?av=0`: no binary frames, no pacing loop started on its account, and it
+does not count as a viewer for `--idle-exit`.
+
 **No auth on the daemon WS** — see §7.
 
 ---
@@ -68,7 +73,7 @@ All are JSON-RPC `method`s. `params` shown; omit `session_id` (single machine).
 | method | params | returns / effect |
 |---|---|---|
 | `ping` | — | `{ runtime_version, version, project, idleExit }` — liveness (use for the container healthcheck); `idleExit` as in `daemon/keep_alive` |
-| `daemon/keep_alive` | `{ "seconds": number \| null }` | with `--idle-exit`: hold the daemon at least `seconds` from now, `null` = never end on idle; the request itself resets the idle window. Returns `{ armed, armedSeconds, deadlineMs \| null, keptAliveUntilMs \| null, keptForever, holding: "client"\|"trace"\|null }` (epoch ms; `deadlineMs` null = it will not end: off, kept forever, or held by a connected client or a recording trace). `session/state` carries the same `idleExit` |
+| `daemon/keep_alive` | `{ "seconds": number \| null }` | with `--idle-exit`: hold the daemon at least `seconds` from now, `null` = never end on idle; the request itself resets the idle window. Returns `{ armed, armedSeconds, deadlineMs \| null, keptAliveUntilMs \| null, keptForever, holding: "subscriber"\|"trace"\|null }` (epoch ms; `deadlineMs` null = it will not end: off, kept forever, or held by an A/V subscriber or a recording trace). A plain RPC connection holds nothing — only its requests reset the window. `session/state` carries the same `idleExit` |
 | `session/create` | `{ "model"?: "c64-pal"\|"c64-ntsc"\|…, "exerciser"?: bool }` | attaches/creates the one machine; returns session id + state. With a `model` other than the machine's, switches the machine to it at the next frame boundary (a machine that is off becomes that model at its next power-on). `exerciser: true` declares a CPU/chip exerciser — bytes poked, PC set, run cycle-exact on the CPU-isolated core without VIC, CIA keyboard scan or drive; `false` makes it a C64 again. Nothing else leaves the full machine: loading a PRG, typing or poking through the monitor never does, and a mounted disk or an inserted cartridge keeps even an exerciser on the full machine |
 | `session/state` | — | `{ c64Cycles, runState:"running"\|"paused", powered:bool, media:{cart,disk}, cpu:{pc,a,x,y,sp,flags}, vic:{…}, controlOwner, streamPump, model, videoStandard, chip, cyclesPerLine, linesPerFrame, cyclesPerFrame, cpuHz, frameRate, canvas:{width,height}, … }` — see §3.1 |
 | `session/models` | — | `{ models:[{ name, title, runs, missing, videoStandard, chip, cyclesPerLine, linesPerFrame, cyclesPerFrame, cpuHz, frameRate, … }], current }` — every C64 model, whether it runs here, and what a model that does not is missing |

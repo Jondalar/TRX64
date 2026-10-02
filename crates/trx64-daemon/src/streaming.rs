@@ -189,14 +189,6 @@ impl NotifyHub {
         let mut inner = self.inner.lock().unwrap();
         inner.subscribers.retain(|s| s.id != id);
     }
-
-    /// Connected clients right now (every connection subscribes here, streaming or not).
-    /// Spec 887 reads it: a connected client holds the idle clock.
-    pub fn live(&self) -> usize {
-        let mut inner = self.inner.lock().unwrap();
-        inner.subscribers.retain(|s| !s.out.is_closed());
-        inner.subscribers.len()
-    }
 }
 
 /// Per-connection notification subscription guard. Dropping it unsubscribes.
@@ -247,6 +239,14 @@ impl StreamHub {
     /// Register a client's outbound channel. Starts the loop if it's the first
     /// subscriber. Returns a [`StreamSub`] guard that unsubscribes on drop (and
     /// stops the loop when the last client leaves).
+    /// A/V subscribers right now. Spec 887: a subscriber holds the idle clock; an RPC-only
+    /// connection (`?av=0`) never subscribes.
+    pub fn live(&self) -> usize {
+        let mut inner = self.inner.lock().unwrap();
+        inner.subscribers.retain(|s| !s.out.is_closed());
+        inner.subscribers.len()
+    }
+
     pub fn subscribe(self: &Arc<Self>, out: UnboundedSender<Message>) -> StreamSub {
         let mut inner = self.inner.lock().unwrap();
         let id = inner.next_id;

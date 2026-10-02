@@ -141,7 +141,7 @@ trx64-daemon --georam 512                     # GeoRAM instead — the port hold
 trx64-daemon --machine u64 --speed-table u64  # the first Ultimate 64 (default: u64ii)
 trx64-daemon --model c64-ntsc                 # an NTSC C64 (--video ntsc is the same)
 trx64-daemon --headless                       # no A/V, no auto-run: command-driven only
-trx64-daemon --idle-exit 600                  # end after 10 min with no client, request or trace
+trx64-daemon --idle-exit 600                  # end after 10 min with no request, A/V viewer or trace
 ```
 
 JSON-RPC 2.0 over WebSocket. One machine per process, serving one project: `ping` names it,
