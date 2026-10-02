@@ -447,3 +447,19 @@ existing one-line one, proved by round-tripping every documented opcode through 
 **Decision:** a capability is not shipped until the test that would catch its opposite
 exists. A comment that states an invariant is a claim; G7 was the test that turns it into
 a property, and until 2026-09-26 it was only a line in a spec.
+
+## The daemon ends itself when nobody uses it — 887
+
+C64RE starts the shared daemon detached so it survives an MCP reconnect, and nothing ever
+ended it: every closed or killed session left one running. `--idle-exit <s>` (off by
+default) ends the daemon once, for the whole window, no request arrived, no client was
+connected and no trace was recording; a connected client or a trace holds the clock at
+"now". Before exiting it persists the cartridge and both drives' disks exactly as eject
+does. `daemon/keep_alive {seconds | null}` holds it; `ping` and `session/state` carry
+`idleExit {armedSeconds, deadlineMs, keptAliveUntilMs, keptForever, holding}`.
+
+**Decision:** "no A/V subscriber" is read as "no connected client": every connection
+subscribes to the notification hub (and, streaming, to the A/V stream), so the one count
+covers both and also works headless. A daemon that ends itself must not lose a user's
+write, so media persist first; the machine state itself is lost, which the owner accepted
+because the next tool call starts a fresh daemon.

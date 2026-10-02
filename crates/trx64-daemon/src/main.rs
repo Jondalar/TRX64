@@ -63,6 +63,7 @@ use trx64_monitor::verbs::{
     obs_do_desc, parse_hex, parse_trap_rules, quoted_first, reu_report, sc_to_ascii,
     uci_report, CfInfo, CfKind,
 };
+pub mod idle;
 pub mod project_knowledge;
 pub mod snapshot_diff;
 pub mod streaming;
@@ -136,6 +137,11 @@ struct Cli {
     /// filesystem on its own (VICE's own REUImageWrite is off by default too).
     #[arg(long, value_name = "FILE")]
     reu_image: Option<String>,
+
+    /// Spec 887 — end the daemon after this many seconds idle: no request, no connected
+    /// client, no recording trace. 0 (the default) = never. Media are persisted first.
+    #[arg(long, value_name = "SECONDS", default_value_t = 0)]
+    idle_exit: u64,
 }
 
 // ── JSON-RPC 2.0 wire types ───────────────────────────────────────────────────
@@ -6477,6 +6483,8 @@ fn monitor_text(req: &Request, text: &str) -> Response {
 }
 
 pub fn dispatch(req: Request, state: &SharedState) -> Response {
+    // Spec 887 — every request, `ping` included, is activity: the idle window restarts.
+    idle::touch();
     let r = dispatch_request(req, state);
     // Spec 863 — whatever the request did (a model switch, a rewind across one, an undump
     // or a VSF of another model), the session and every client learn the machine's model
@@ -6511,8 +6519,32 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                     "runtime_version": RUNTIME_VERSION,
                     "version": env!("CARGO_PKG_VERSION"),
                     "project": project_knowledge::bound_project(),
+                    "idleExit": idle::status(),
                 }),
             )
+        }
+
+        // Spec 887 D4 — hold the daemon for at least `seconds` from now; `null` = never
+        // exit on idle. The request itself is activity. Replies with the idle status and
+        // whether idle exit is armed at all (without `--idle-exit` there is nothing to hold).
+        "daemon/keep_alive" => {
+            let seconds = match req.params.get("seconds") {
+                None | Some(Value::Null) => None,
+                Some(v) => match v.as_f64() {
+                    Some(f) if f >= 0.0 && f.is_finite() => Some(f.ceil() as u64),
+                    _ => {
+                        return Response::err(
+                            id,
+                            -32602,
+                            "daemon/keep_alive: seconds must be a non-negative number or null",
+                        )
+                    }
+                },
+            };
+            let armed = idle::keep_alive(seconds);
+            let mut out = idle::status();
+            out["armed"] = json!(armed);
+            Response::ok(id, out)
         }
 
         // Spec 858 D3 — move this daemon to another project, in place.
@@ -7115,6 +7147,8 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             // Spec 873 — the folder devices on the bus.
             state_json["folders"] = folders_json(&st);
             state_json["folderEvents"] = Value::Array(st.folder_events.clone());
+            // Spec 887 D5 — when this daemon ends itself, if it will.
+            state_json["idleExit"] = idle::status();
             Response::ok(id, state_json)
         }
 
@@ -13536,6 +13570,21 @@ fn fs_longest_common_prefix<'a>(mut names: impl Iterator<Item = &'a str>) -> Str
 /// saves the `.crt` on detach; the read-only / non-writable / clean / no-path
 /// cases are skipped with a reason (no write). Returns the written path on a real
 /// write so the caller can stamp `detail["cartPersisted"]`.
+/// Spec 887 D3 — a daemon that ends itself keeps the user's writes: the cartridge and
+/// every drive's disk are persisted exactly as eject persists them (dirty and persisting
+/// only).
+fn persist_media_before_exit(st: &mut State) {
+    let cart_path = st.session.cart_path.clone();
+    if let Some(p) = persist_cart_for_eject(st, &cart_path) {
+        eprintln!("[trx64] persisted cartridge -> {p}");
+    }
+    for pos in [DrivePosition::A, DrivePosition::B] {
+        if let Some(p) = persist_outgoing_disk_at(st, pos) {
+            eprintln!("[trx64] persisted disk -> {p}");
+        }
+    }
+}
+
 fn persist_cart_for_eject(st: &mut State, backing_path: &str) -> Option<String> {
     if backing_path.is_empty() {
         return None;
@@ -18305,6 +18354,38 @@ async fn main() {
         env!("CARGO_PKG_VERSION"),
         RUNTIME_VERSION
     );
+
+    // Spec 887 — the idle watch. Once a second: a connected client or a recording trace
+    // holds the clock; with neither, and no request, for the whole window, persist the
+    // media as eject would and end with exit 0.
+    if cli.idle_exit > 0 {
+        idle::arm(cli.idle_exit);
+        eprintln!("[trx64] idle exit armed: {} s", cli.idle_exit);
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                tick.tick().await;
+                let holding = {
+                    let st = state.lock().unwrap();
+                    if st.session.trace.is_some() {
+                        Some("trace")
+                    } else if st.notify.live() > 0 {
+                        Some("client")
+                    } else {
+                        None
+                    }
+                };
+                idle::hold(holding);
+                if let Some(window) = idle::expired() {
+                    let mut st = state.lock().unwrap();
+                    persist_media_before_exit(&mut st);
+                    eprintln!("[trx64] idle for {window} s — exiting");
+                    std::process::exit(0);
+                }
+            }
+        });
+    }
 
     loop {
         match listener.accept().await {

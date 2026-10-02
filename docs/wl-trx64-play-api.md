@@ -67,7 +67,8 @@ All are JSON-RPC `method`s. `params` shown; omit `session_id` (single machine).
 
 | method | params | returns / effect |
 |---|---|---|
-| `ping` | — | `{}` — liveness (use for the container healthcheck) |
+| `ping` | — | `{ runtime_version, version, project, idleExit }` — liveness (use for the container healthcheck); `idleExit` as in `daemon/keep_alive` |
+| `daemon/keep_alive` | `{ "seconds": number \| null }` | with `--idle-exit`: hold the daemon at least `seconds` from now, `null` = never end on idle; the request itself resets the idle window. Returns `{ armed, armedSeconds, deadlineMs \| null, keptAliveUntilMs \| null, keptForever, holding: "client"\|"trace"\|null }` (epoch ms; `deadlineMs` null = it will not end: off, kept forever, or held by a connected client or a recording trace). `session/state` carries the same `idleExit` |
 | `session/create` | `{ "model"?: "c64-pal"\|"c64-ntsc"\|…, "exerciser"?: bool }` | attaches/creates the one machine; returns session id + state. With a `model` other than the machine's, switches the machine to it at the next frame boundary (a machine that is off becomes that model at its next power-on). `exerciser: true` declares a CPU/chip exerciser — bytes poked, PC set, run cycle-exact on the CPU-isolated core without VIC, CIA keyboard scan or drive; `false` makes it a C64 again. Nothing else leaves the full machine: loading a PRG, typing or poking through the monitor never does, and a mounted disk or an inserted cartridge keeps even an exerciser on the full machine |
 | `session/state` | — | `{ c64Cycles, runState:"running"\|"paused", powered:bool, media:{cart,disk}, cpu:{pc,a,x,y,sp,flags}, vic:{…}, controlOwner, streamPump, model, videoStandard, chip, cyclesPerLine, linesPerFrame, cyclesPerFrame, cpuHz, frameRate, canvas:{width,height}, … }` — see §3.1 |
 | `session/models` | — | `{ models:[{ name, title, runs, missing, videoStandard, chip, cyclesPerLine, linesPerFrame, cyclesPerFrame, cpuHz, frameRate, … }], current }` — every C64 model, whether it runs here, and what a model that does not is missing |
@@ -248,7 +249,7 @@ reach it by service name / static IP on the shared bridge, or a published port o
   (bad/missing params, e.g. `key required`, `path required`), `-32001` (state conflict,
   e.g. `session is running under the autonomous loop` — pause before a manual
   `session/run`), `-32601` (unknown method).
-- **Healthcheck:** open the WS and send `ping` → expect `{}`. (Or a bare TCP connect to
+- **Healthcheck:** open the WS and send `ping` → expect a `result` (it names the build, the project and the idle-exit state). (Or a bare TCP connect to
   the port for a liveness-only probe.)
 
 ---

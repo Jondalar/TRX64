@@ -80,7 +80,7 @@ One line per feature, as of 0.11.1. Details: [`README.md`](../README.md), monito
 
 ## Embedding
 
-- `trx64-daemon`: JSON-RPC 2.0 over WebSocket (`--port`, `--bind`), binary video and audio frames, `--headless` for command-driven use.
+- `trx64-daemon`: JSON-RPC 2.0 over WebSocket (`--port`, `--bind`), binary video and audio frames, `--headless` for command-driven use; `--idle-exit <s>` ends an unused daemon (no client, no request, no recording trace), persisting its media first, and `daemon/keep_alive` holds it.
 - `trx64cli`: terminal cockpit that links the runtime in-process; `mon "<cmd>"` for one-shot use.
 - Rust: `trx64-core::Machine`, `trx64-monitor` as a library.
 - `IecDevice`: a host's own device on the serial bus at slots 4-11 (`attach_iec_device`).

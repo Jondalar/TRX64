@@ -189,6 +189,14 @@ impl NotifyHub {
         let mut inner = self.inner.lock().unwrap();
         inner.subscribers.retain(|s| s.id != id);
     }
+
+    /// Connected clients right now (every connection subscribes here, streaming or not).
+    /// Spec 887 reads it: a connected client holds the idle clock.
+    pub fn live(&self) -> usize {
+        let mut inner = self.inner.lock().unwrap();
+        inner.subscribers.retain(|s| !s.out.is_closed());
+        inner.subscribers.len()
+    }
 }
 
 /// Per-connection notification subscription guard. Dropping it unsubscribes.
