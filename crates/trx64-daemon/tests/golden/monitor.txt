@@ -152,8 +152,8 @@ model: c64-pal (pal)  VIC-II 6569  63 × 312 = 19656 cycles/frame  985248 Hz  50
   * c64-pal       C64 PAL
     c64-ntsc      C64 NTSC
     c64-paln      C64 PAL-N (Drean)
-    c64c-pal      C64C PAL  — needs 6526A CIA, custom-IC glue logic
-    c64c-ntsc     C64C NTSC  — needs 6526A CIA, custom-IC glue logic
+    c64c-pal      C64C PAL  — needs custom-IC glue logic
+    c64c-ntsc     C64C NTSC  — needs custom-IC glue logic
     c64-old-pal   C64 old PAL  — needs 6569R1 light-pen IRQ mode, 6569R1 luminances, KERNAL rev2 (kernal-901227-02.bin) — not in the ROM set
     c64-old-ntsc  C64 old NTSC  — needs 6567R56A light-pen IRQ mode, 6567R56A luminances, KERNAL rev1 (kernal-901227-01.bin) — not in the ROM set
   `model <row>` switches at the next frame boundary (the program keeps its state).
@@ -615,10 +615,10 @@ SID:
   d410  00 00 00 00 00 00 00 00 00 ff ff 00 00 00 00 00
 
 CIA1:
-  dc00  ff ff 00 00 ff ff ff ff 00 00 00 00 00 00 00 00
+  dc00  ff ff 00 00 ff ff ff ff 00 00 00 01 00 00 00 00
 
 CIA2:
-  dd00  ff 00 00 00 ff ff ff ff 00 00 00 00 00 00 00 00
+  dd00  ff ff 00 00 ff ff ff ff 00 00 00 01 00 00 00 00
    machine: c64 port $2f/$37 exrom 1 game 1 bank -
 
 $ io 1
@@ -635,11 +635,11 @@ SID:
   No details available.
 
 CIA1:
-  dc00  ff ff 00 00 ff ff ff ff 00 00 00 00 00 00 00 00
+  dc00  ff ff 00 00 ff ff ff ff 00 00 00 01 00 00 00 00
   No details available.
 
 CIA2:
-  dd00  ff 00 00 00 ff ff ff ff 00 00 00 00 00 00 00 00
+  dd00  ff ff 00 00 ff ff ff ff 00 00 00 01 00 00 00 00
   No details available.
    machine: c64 port $2f/$37 exrom 1 game 1 bank -
 

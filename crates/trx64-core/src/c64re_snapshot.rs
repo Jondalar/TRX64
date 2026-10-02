@@ -2522,6 +2522,28 @@ mod tests {
         assert!(m.cia1.alarm_clocks().ta.is_some(), "the running timer has its alarm back");
     }
 
+    /// A whole checkpoint written before Spec 888 (both CIA nodes v2) restores, converted,
+    /// and says so in `restore_notes`; a current one leaves the notes empty.
+    #[test]
+    fn an_old_checkpoint_says_its_cias_were_converted() {
+        let m = Machine::new();
+        let mut cp = capture_runtime_checkpoint(&m, "", "", None, None, None, None);
+        let mut m2 = Machine::new();
+        restore_runtime_checkpoint(&mut m2, &cp).expect("restore");
+        assert!(m2.restore_notes.is_empty(), "{:?}", m2.restore_notes);
+        for k in ["cia1", "cia2"] {
+            let o = cp[k].as_object_mut().unwrap();
+            for f in ["write_offset", "power_freq", "ticks_per_sec", "ta_alarmclk", "tb_alarmclk", "enabled", "alarms"] {
+                o.remove(f);
+            }
+            o.insert("v".into(), 2.into());
+        }
+        restore_runtime_checkpoint(&mut m2, &cp).expect("restore v2");
+        assert_eq!(m2.restore_notes.len(), 2, "{:?}", m2.restore_notes);
+        assert!(m2.restore_notes[0].starts_with("cia1: converted"), "{:?}", m2.restore_notes);
+        assert!(m2.restore_notes[1].starts_with("cia2: converted"), "{:?}", m2.restore_notes);
+    }
+
     #[test]
     fn sid_roundtrip_regs_and_voices() {
         let mut m = Machine::new();

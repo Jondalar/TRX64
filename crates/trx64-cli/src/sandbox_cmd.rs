@@ -1581,7 +1581,7 @@ mod tests {
         assert_eq!(v["runs"][0]["result"]["model"], "c64-paln", "the command line's model");
         assert_eq!(v["runs"][1]["result"]["model"], "c64-ntsc", "the item's own");
         assert_eq!(v["runs"][2]["ok"], false);
-        assert!(v["runs"][2]["error"].as_str().unwrap().contains("6526A"), "{}", v["runs"][2]);
+        assert!(v["runs"][2]["error"].as_str().unwrap().contains("custom-IC glue logic"), "{}", v["runs"][2]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

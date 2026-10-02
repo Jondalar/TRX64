@@ -71,7 +71,7 @@ fn a_row_that_cannot_run_is_refused_at_startup_by_name() {
     let (exited, ok, lines) = start(&["--model", "c64c-pal"]);
     assert!(exited && !ok, "refused: {lines:?}");
     let text = lines.join("\n");
-    assert!(text.contains("6526A"), "names the block: {text}");
+    assert!(text.contains("custom-IC glue logic"), "names the block: {text}");
     assert!(!text.contains("listening"), "never listened: {text}");
 
     let (exited, ok, lines) = start(&["--model", "c64-secam"]);

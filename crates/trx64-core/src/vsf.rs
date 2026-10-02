@@ -1253,6 +1253,8 @@ fn load_vice_vsf(machine: &mut Machine, data: &[u8]) -> Result<VsfLoadResult, St
 /// real-VICE parser (`load_vice_vsf`). c64re-own snapshots fall through to the
 /// compact module-by-module parser.
 pub fn load_vsf(machine: &mut Machine, data: &[u8]) -> Result<VsfLoadResult, String> {
+    // What this load converts rather than restores is reported fresh.
+    machine.restore_notes.clear();
     // VICE detection (Spec 791.4): the 58-byte-header "VICE Version" fingerprint +
     // module structure, OR the fast-path "SIDEXTENDED" module name (c64re never
     // writes it). A c64re-own snapshot falls through to the compact parser below.
@@ -1540,6 +1542,48 @@ mod tests {
         let mut nop = crate::NullSink;
         m.run_for_full(100_000, &mut nop, |_, _, _, _, _, _, _| {});
         assert!(m.clk > start_clk, "machine clock must advance on resume");
+    }
+
+    /// The CIA modules of a c64re-own VSF are VICE's ciacore 2.5 bodies and load back
+    /// through `ciacore_snapshot_read_module`: registers, timers and TOD as saved.
+    #[test]
+    fn cia_modules_round_trip_in_vice_layout() {
+        let mut m = Machine::new();
+        m.write_full(0x0001, 0x35);
+        for (a, v) in [(0xdc04, 0x34), (0xdc05, 0x12), (0xdc0e, 0x11), (0xdd02, 0x3f), (0xdd00, 0x15), (0xdc0b, 0x08)] {
+            m.write_full(a, v);
+        }
+        let bytes = save_vsf(&mut m);
+        let mut m2 = Machine::new();
+        let r = load_vsf(&mut m2, &bytes).expect("load");
+        assert!(r.loaded_modules.iter().any(|n| n == "CIA1") && r.loaded_modules.iter().any(|n| n == "CIA2"), "{r:?}");
+        assert!(m2.restore_notes.is_empty(), "{:?}", m2.restore_notes);
+        assert_eq!(m2.cia1.c_cia[..4], m.cia1.c_cia[..4]);
+        assert_eq!(m2.cia2.c_cia[..4], m.cia2.c_cia[..4]);
+        assert_eq!(m2.cia1.ta.latch, 0x1234);
+        assert_eq!(m2.cia1.ta.state, m.cia1.ta.state);
+        assert_eq!(m2.cia1.c_cia[crate::ciacore::CIA_TOD_HR], 0x08);
+        assert_eq!(m2.cia2.pa_out(), m.cia2.pa_out(), "CIA2 port A undumped");
+        assert_eq!(m2.cia2_pa_out, m.cia2.pa_out(), "and pushed to the serial bus");
+    }
+
+    /// A 48-byte CIA record (the TS runtime's, version 1.0) converts with a note.
+    #[test]
+    fn an_old_cia_vsf_record_converts_with_a_note() {
+        let mut d = vec![0u8; 48];
+        d[0] = 0x07; // PRA
+        d[2] = 0x3f; // DDRA
+        d[4] = 0x34; // TAL register byte = latch lo
+        d[5] = 0x12;
+        d[16] = 0x01; // irqflags: TA
+        d[19] = 0x01; // irq_enabled = the ICR mask: TA
+        let mut m = Machine::new();
+        load_cia(&mut m, &d, "CIA2", 1, 0).expect("load");
+        assert_eq!(m.restore_notes.len(), 1);
+        assert!(m.restore_notes[0].starts_with("CIA2: converted"), "{:?}", m.restore_notes);
+        assert_eq!(m.cia2.ta.latch, 0x1234);
+        assert_eq!(m.cia2.irqflags, 0x81, "the old line level becomes IR");
+        assert_eq!(m.cia2.pa_out(), 0x07 | !0x3f);
     }
 
     #[test]

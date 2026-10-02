@@ -4889,6 +4889,9 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                         if let Some(w) = r.warning {
                             summary.push_str(&format!("\n  WARNING: {w}"));
                         }
+                        for n in &st.session.machine.restore_notes {
+                            summary.push_str(&format!("\n  NOTE: {n}"));
+                        }
                         Ok(summary)
                     }
                     Err(e) => Err(format!("undump: {e}")),
@@ -12677,7 +12680,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                             })
                         })
                         .collect();
-                    Response::ok(id, json!({
+                    let mut out = json!({
                         "path": path,
                         "cycle": r.cycle,
                         "pc": r.pc as u64,
@@ -12685,7 +12688,12 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                         "media": media_summary,
                         "breakpoints": breakpoints,
                         "paused": true
-                    }))
+                    });
+                    // What the restore converted rather than restored (an older chip record).
+                    if !st.session.machine.restore_notes.is_empty() {
+                        out["notes"] = json!(st.session.machine.restore_notes);
+                    }
+                    Response::ok(id, out)
                 }
                 Err(e) => Response::err(id, -32001, format!("snapshot/undump: {e}")),
             }
@@ -16262,7 +16270,7 @@ mod machine_model_tests {
             }
         }
         let e = model_from_machine_name("c64c-pal").unwrap_err();
-        assert!(e.contains("6526A"), "{e}");
+        assert!(e.contains("custom-IC glue logic"), "{e}");
         assert!(model_from_machine_name("c64-secam").unwrap_err().contains("unknown model"));
     }
 }
@@ -24968,10 +24976,11 @@ mod batch1_tests {
         assert_eq!(row("c64-ntsc")["cyclesPerFrame"], json!(17095));
         assert_eq!(row("c64-paln")["cpuHz"], json!(1_023_440));
         assert_eq!(row("c64c-pal")["runs"], json!(false));
-        assert!(row("c64c-pal")["missing"].as_array().unwrap().contains(&json!("6526A CIA")));
+        // Spec 888 — its 6526A exists; the custom-IC glue is what it lacks.
+        assert_eq!(row("c64c-pal")["missing"], json!(["custom-IC glue logic"]));
         // Choosing it is refused, by name, and changes nothing.
         let e = call_err(&st, "session/model", json!({ "name": "c64c-pal" }));
-        assert!(e.message.contains("6526A"), "{}", e.message);
+        assert!(e.message.contains("custom-IC glue logic"), "{}", e.message);
         let e = call_err(&st, "session/model", json!({ "name": "c64-secam" }));
         assert!(e.message.contains("unknown model"), "{}", e.message);
         assert_eq!(call(&st, "session/state", json!({}))["model"], json!("c64-pal"));
@@ -25098,7 +25107,7 @@ mod batch1_tests {
             assert!(g.session.machine.ram[..] == ram[..]);
         }
 
-        // A checkpoint claiming a C64C (8565, VICE model 1) is refused naming the 6526A.
+        // A checkpoint claiming a C64C (8565, VICE model 1) is refused naming what it lacks.
         let mut cp = {
             let g = st.lock().unwrap();
             trx64_core::c64re_snapshot::capture_runtime_checkpoint(&g.session.machine, "", "", None, None, None, None)
@@ -25109,7 +25118,7 @@ mod batch1_tests {
             let mut g = st.lock().unwrap();
             restore_live_checkpoint(&mut g.session, &cp).unwrap_err()
         };
-        assert!(e.contains("6526A"), "{e}");
+        assert!(e.contains("custom-IC glue logic"), "{e}");
         // A position the row does not have (cycle 64 on the 63-cycle PAL line) is refused.
         cp["vic"]["model"] = json!(0);
         cp["vic"]["raster_cycle"] = json!(63);
@@ -25155,7 +25164,7 @@ mod batch1_tests {
     fn the_monitor_model_verb_reports_and_switches() {
         let Some(st) = booted_state() else { return };
         let out = call(&st, "monitor/exec", json!({ "command": "model" }))["output"].as_str().unwrap().to_string();
-        assert!(out.contains("c64-pal") && out.contains("c64-ntsc") && out.contains("6526A"), "{out}");
+        assert!(out.contains("c64-pal") && out.contains("c64-ntsc") && out.contains("custom-IC glue"), "{out}");
         let out = call(&st, "monitor/exec", json!({ "command": "model c64-ntsc" }))["output"].as_str().unwrap().to_string();
         assert!(out.contains("c64-pal → c64-ntsc"), "{out}");
         assert_eq!(st.lock().unwrap().session.machine.model().name, "c64-ntsc");
