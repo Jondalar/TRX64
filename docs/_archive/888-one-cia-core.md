@@ -1,6 +1,6 @@
 # 888 — One CIA core: the C64's CIAs are VICE's ciacore
 
-**Status:** BUILT (branch `spec-888-one-cia-core`, not merged) — as built in §As built
+**Status:** MERGED, released in 0.12.1 — archived with its decision (`_archive/README.md`, 888); as built in §As built
 **Trigger:** TRX64 issue #3 — writing the ICR mask (`$DC0D = $7F`) releases a pending CIA 1
 IRQ and clears IR; a real 6526 and VICE keep both until `$DC0D` is READ. A crack intro that
 leaves its IRQ through `$EA81` without reading `$DC0D` runs in TRX64 and hangs on hardware.

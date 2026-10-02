@@ -469,3 +469,21 @@ since streaming daemons subscribe every connection on connect, an RPC-only clien
 with `?av=0` (and stops receiving frames it never used). A daemon that ends itself must not lose a user's
 write, so media persist first; the machine state itself is lost, which the owner accepted
 because the next tool call starts a fresh daemon.
+
+## One CIA core — 888
+
+TRX64 issue #3: writing the ICR mask (`$DC0D = $7F`) released a pending CIA 1 IRQ and cleared
+IR, where a 6526 and VICE keep both until `$DC0D` is read. The cause was not one line: the C64's
+CIAs ran `cia.rs`, grown in June 2026 increment by increment until a few iso exercisers matched
+the TS oracle, with the IRQ line a level test of flags AND mask. 872 had recorded that gap and
+planned ONE CIA (D1b: `cia.rs` grows from `core/ciacore.c`); the build ported `ciacore.c` 1:1 into a
+second file for the 1581 alone, and nobody noticed the deviation at merge. Now CIA 1 and CIA 2 run
+on `ciacore.rs` with `c64cia1.c` / `c64cia2.c` ported as `c64cia.rs`, the model per row (6526 on
+the C64, 6526A on the C64C), the interrupt line replayed from `cia_set_int_clk`, snapshots carrying
+the whole context (old records converted with a note), and `cia.rs` deleted.
+
+**Decision:** a spec's plan that the build quietly replaces with a second implementation is a
+defect of the merge, not a design choice — check the build against the spec's decisions before
+merging, and say so when it deviates. TOD takes the deterministic `#else` branch of VICE's
+`ciacore_inttod` rather than `TODRANDOM`: runs must replay identically for rewind and replay.
+
