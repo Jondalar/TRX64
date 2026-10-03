@@ -9,9 +9,11 @@ One line per feature, as of 0.12.1. Details: [`README.md`](../README.md), monito
 - C64C and first-revision rows are listed and refused by name (custom-IC glue, KERNAL rev1/rev2 missing).
 - CIA 1 and CIA 2 ported from VICE's CIA core: the 6526 of the C64 rows (the 6526A is there for the C64C rows), its interrupt delay line, shift register and time-of-day clock on the model's mains; the keyboard matrix as VICE solves it, ghost keys included.
 - `model <row>` / `session/model`: switch a running machine at the next frame boundary; snapshots and checkpoints record the model.
-- `--machine c64|u64|128` (daemon): `u64` is the Ultimate 64, Elite II and C64 Ultimate: speed register at `$D031`, CPU to 63× PHI2 — the menu's 64 MHz, as measured (`--speed-table u64ii`, default) or 48 MHz (`u64`, first generation, unmeasured); 1 MHz for 2.06 s after a reset, as on the device.
+- `--machine c64|u64|128` (daemon): `u64` is the Ultimate 64, Elite II and C64 Ultimate: speed register at `$D031`, CPU to 63× PHI2 — the menu's 64 MHz, as measured (`--speed-table u64ii`, default) or 48 MHz (`u64`, first generation, unmeasured); 1 MHz for 2^22 PHI2 cycles (4.26 s) after a reset, as on the device.
 - `$D031`: speed index in bits 0-3, bit 7 set = no badline stalls (at every speed, 1 MHz included). A program's write and a menu change (`Machine::set_u64_turbo`) set the same state; the later one wins. After a reset in "U64 Turbo Registers" mode `$D031` reads `$00` — 1 MHz with stalls — until one of them sets a speed; "Off" and "Manual" read `$FF` and run the menu speed.
 - Under turbo, IRQ and NMI are taken by the 6502's own rule at the turbo clock (two CPU cycles, then the end of the instruction); CIA timers, TOD and the raster stay on PHI2.
+- Turbo access costs as measured on a C64 Ultimate: RAM, ROM, VIC, SID and colour RAM at the turbo clock; CIA 1/2, IO1 and IO2 one PHI2 bus cycle each, a write issued earlier than a read to catch the same cycle.
+- `$D030`/`$D031` decode in every `$40` mirror; "TurboEnable Bit" mode (`$D030` loads the menu speed or 1 MHz); `$D07A`/`$D07B` switch to 1 MHz / the menu speed; `$D0BC` reads `$01` with SuperCPU Detect. Any change to the Ultimate's settings (`set_u64_turbo`, a model switch) re-applies the menu speed.
 - The turbo state rides in `.c64re` dumps and the checkpoint ring; an older `u64` dump restores as a reset leaves it, with a note.
 - `128`: the VIC-IIe `$D02F`/`$D030` pair with VICE's read-back masks, for turbo probes.
 - Power on/off, cold and warm reset (`/power`, `/reset cold|warm`, `session/power`, `session/reset`).
@@ -22,7 +24,7 @@ One line per feature, as of 0.12.1. Details: [`README.md`](../README.md), monito
 
 - VIC-II per cycle, ported from VICE x64sc; colodore palette.
 - Canvas 384×272 PAL, 384×247 NTSC; PNG screenshots (`session/screenshot`).
-- Colour registers (`$D020`-`$D02E`: border, background, multicolour, sprite colours) change per VIC pixel under U64 turbo.
+- Colour registers (`$D020`-`$D02E`: border, background, multicolour, sprite colours) change per VIC pixel under U64 turbo, sampled once per pixel on the grid measured on a C64 Ultimate.
 - Native window (`trx64cli --window`, `/window`), aspect-locked resizing.
 - `vic/inspect`, `vic/line_trace` (one raster line cycle by cycle, replayed in a clone), `vic/frame_map`.
 - `bitmap` renders a RAM range as hires, charset or sprites.

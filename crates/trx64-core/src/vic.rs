@@ -1248,23 +1248,22 @@ pub struct VicII {
     /// bit 7 "Badline Timing Enabled" — the badline stalls ON. "Off" writes `$80`. Set only
     /// by [`crate::Machine::set_u64_turbo`], which is the menu here.
     pub u64_speed_prefer: u8,
-    /// BUG-061 — PHI2 cycles left in the Ultimate's post-reset hold, during which the C64
-    /// runs at 1 MHz whatever speed is set. 0 = no hold.
+    /// PHI2 cycles left in the Ultimate's post-reset hold, during which the C64 runs at
+    /// 1 MHz whatever speed is set. 0 = no hold.
     ///
-    /// Measured on the owner's C64 Ultimate: after `machine:reset` the machine stays at
-    /// 1 MHz for 2.06 s — at 16 MHz and at 64 MHz alike, stable across runs — although
-    /// the firmware strobes the speed only 445 cycles after reset release. A strobe inside
-    /// the hold has no effect; when the hold ends, the last strobed speed applies. A speed
-    /// change WITHOUT a reset takes effect at once.
+    /// Measured on the owner's C64 Ultimate: after a REST `machine:reset` the machine stays
+    /// at 1 MHz for exactly 2^22 = 4,194,304 PHI2 cycles (4.257 s PAL) from the CPU's first
+    /// instruction — at 16 and 64 MHz alike, within 80 cycles over five runs. A `$D031`
+    /// write inside the hold is kept and applies when it ends; so does a menu change. A
+    /// speed change WITHOUT a reset takes effect at once. (The firmware's `run_prg` ends
+    /// the hold about 3.2 s after its call — a different path, the firmware's own, not
+    /// modelled. BUG-061's first figure, 2.06 s, matched neither.)
     ///
     /// It matters because the KERNAL decides PAL or NTSC by racing the CPU against the
     /// raster at `$FF5E`, about 1.5 s after reset — inside the hold. Without it a turbo C64
     /// wins that race from 16 MHz up and programs its jiffy clock for NTSC.
     ///
-    /// Armed by the machine's reset paths (the hold is counted in time, so its length
-    /// comes from the model's clock), counted down once per VIC cycle = once per PHI2.
-    /// Unmeasured: whether a program's own `$D031` write inside the hold is honoured.
-    /// Modelled as not — the hold is on the CPU, not on who asked.
+    /// Armed by the machine's reset paths, counted down once per VIC cycle = once per PHI2.
     pub u64_reset_hold: u32,
     pub u64_speed_table: U64SpeedTable,
 
@@ -1463,14 +1462,20 @@ pub struct SubCycleColour {
 impl SubCycleColour {
     /// Which of the cycle's eight pixels a store at this phase belongs to.
     ///
-    /// At a divider of 64 that is 8 CPU cycles per pixel, which is what UPic's unrolled
-    /// loop spends per pixel.
+    /// Measured on a C64 Ultimate at 63x (Q13): the VIC samples a colour register once per
+    /// pixel, one pixel per 7.875 CPU cycles, and a later store inside the same pixel wins.
+    /// After a CIA read — which completes at the PHI2 edge, so the store's phase is known —
+    /// stores whose write falls 6 cycles after it paint pixel 0, 8..14 cycles pixel 1, 15
+    /// pixel 2: the grid's boundaries sit at ~-0.9, 7.0 and 14.9 cycles, aligned to the
+    /// edge within a CPU cycle. That is `(8 * phase) / div` advanced by an eighth of a
+    /// pixel, which keeps the 7.875-cycle step and puts the boundaries at 6.9 and 14.8.
+    /// Phase 0 is the CPU cycle right after the edge.
     #[inline]
     pub fn pixel_for(phase: u32, div: u32) -> usize {
         if div <= 1 {
             return 0;
         }
-        ((phase * 8 / div) as usize).min(7)
+        (((64 * phase + div) / (8 * div)) as usize).min(7)
     }
 
     /// The value in force from `pixel` to the end of the cycle.
@@ -2871,8 +2876,15 @@ impl VicII {
             // every index, `$80` included (1 MHz without stalls). Stored in the form it
             // reads back. A menu change sets the same state (`Machine::set_u64_turbo`);
             // whichever came last applies.
+            // TurboEnable-bit mode, measured: `$D030 = 1` loads the menu speed into the
+            // turbo state (`$D031` then reads it, the machine runs it), `$D030 = 0` puts it
+            // back to `$00` — 1 MHz with stalls, as after a reset. In registers mode a write
+            // to `$D030` has no effect. Both decode in every `$40` mirror, as `$D031` does
+            // (measured at `$D070`/`$D0B0`/`$D0F0`; the VIC's own mirrors further up are
+            // unmeasured).
             0x30 if self.speed_profile == SpeedProfile::U64 && self.u64_regs_en & 0x04 != 0 => {
-                self.regs[0x30] = value | 0xfc;
+                self.regs[0x30] = value & 0x01;
+                self.regs[0x31] = if value & 0x01 != 0 { u64_menu_as_d031(self.u64_speed_prefer) } else { 0x00 };
             }
             0x31 if self.speed_profile == SpeedProfile::U64 && self.u64_regs_en & 0x01 != 0 => {
                 self.regs[0x31] = value & 0x8f;
@@ -3005,11 +3017,10 @@ impl VicII {
             0x30 if self.speed_profile == SpeedProfile::C128 => self.regs[0x30] | 0xfc,
             // The turbo registers read only with their enable bit; otherwise open bus,
             // as measured: "Off" and "Manual" read `$FF` at both, "U64 Turbo Registers"
-            // `$FF` at `$D030`. `$D031` reads the turbo state in its own form.
-            // TurboEnable-bit mode's `$D030` read-back (bit 0, VICE's VIC-IIe mask) is
-            // UNMEASURED.
+            // `$FF` at `$D030`. `$D031` reads the turbo state in its own form; `$D030` in
+            // TurboEnable-bit mode `$FE` with bit 0 as written (measured `$FE` / `$FF`).
             0x30 if self.speed_profile == SpeedProfile::U64 && self.u64_regs_en & 0x04 != 0 => {
-                self.regs[0x30] | 0xfc
+                0xfe | (self.regs[0x30] & 0x01)
             }
             0x31 if self.speed_profile == SpeedProfile::U64 && self.u64_regs_en & 0x01 != 0 => {
                 self.regs[0x31]
@@ -3019,10 +3030,10 @@ impl VicII {
     }
 
     /// The speed the Ultimate runs at: (speed index, badline stalls). With `$D031` enabled
-    /// it is the turbo state `$D031` holds — the last program write or menu change; in
-    /// TurboEnable-bit mode `$D030` bit 0 clear drops that to index 0 (UNMEASURED, kept as
-    /// built). "Off" and "Manual" run the menu's speed. Inside the post-reset hold, and on
-    /// anything but a U64, it is a 1 MHz 6510 with its stalls: (0, true).
+    /// ("U64 Turbo Registers" and "TurboEnable Bit") it is the turbo state `$D031` holds —
+    /// the last program write, `$D030`/`$D07A`/`$D07B` store or menu change. "Off" and
+    /// "Manual" run the menu's speed. Inside the post-reset hold, and on anything but a
+    /// U64, it is a 1 MHz 6510 with its stalls: (0, true).
     pub fn u64_speed(&self) -> (u8, bool) {
         if self.speed_profile != SpeedProfile::U64 {
             return (0, true);
@@ -3037,23 +3048,46 @@ impl VicII {
             return (p & 0x7f, p & 0x80 != 0);
         }
         let d = self.regs[0x31];
-        let index = if self.u64_regs_en & 0x04 != 0 && self.regs[0x30] & 0x01 == 0 { 0 } else { d & 0x0f };
-        (index, d & 0x80 == 0)
+        (d & 0x0f, d & 0x80 == 0)
     }
 
-    /// Spec 851 — SuperCPU detection at `$D0BC-$D0BF`, only with bit 1 of the enable word.
-    /// A SuperCPU reads `dosext << 7 | ramlink << 6` there (VICE `scpu64mem.c:671-676`);
-    /// neither exists here, so `$00` — not the `$FF` a plain C64's open bus gives.
+    /// The Ultimate's registers at full addresses, read. `$D0BC` (SuperCPU detection)
+    /// reads `$01` with "SuperCPU Detect" enabled — measured on a C64 Ultimate; disabled it
+    /// is the VIC's open `$FF`. `$D0BD-$D0BF` keep `$00` (VICE's SuperCPU, unmeasured on an
+    /// Ultimate). `$D07A`/`$D07B` read `$FF`, which the VIC's unused registers already do.
     pub fn u64_extra_read(&self, addr: u16) -> Option<u8> {
-        if self.speed_profile == SpeedProfile::U64
-            && self.u64_regs_en & 0x02 != 0
-            && (0xd0bc..=0xd0bf).contains(&addr)
-        {
-            Some(0x00)
-        } else {
-            None
+        if self.speed_profile != SpeedProfile::U64 || self.u64_regs_en & 0x02 == 0 {
+            return None;
+        }
+        match addr {
+            0xd0bc => Some(0x01),
+            0xd0bd..=0xd0bf => Some(0x00),
+            _ => None,
         }
     }
+
+    /// The Ultimate's registers at full addresses, written — SuperCPU's speed switches,
+    /// measured on a C64 Ultimate with `$D031` enabled (both register modes): a store to
+    /// `$D07A` sets the turbo state to `$00` (1 MHz), one to `$D07B` loads the MENU speed —
+    /// not a value the program wrote before. Returns whether the address was one of them;
+    /// the VIC behind them has nothing there.
+    pub fn u64_extra_write(&mut self, addr: u16) -> bool {
+        if self.speed_profile != SpeedProfile::U64 || self.u64_regs_en & 0x01 == 0 {
+            return false;
+        }
+        match addr {
+            0xd07a => {
+                self.regs[0x31] = 0x00;
+                true
+            }
+            0xd07b => {
+                self.regs[0x31] = u64_menu_as_d031(self.u64_speed_prefer);
+                true
+            }
+            _ => false,
+        }
+    }
+
 
     /// PORT OF: vicii-mem.c:520/537 — the read-to-clear collision reads (the
     /// side-effecting variant the live bus must use for $D01E/$D01F). For all

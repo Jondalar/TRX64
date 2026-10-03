@@ -624,7 +624,13 @@ impl<'a> FullBus<'a> {
         // Keep the open-bus shadow for unclaimed-register reads.
         self.io[(addr as usize) - 0xd000] = value;
         match addr {
-            0xd000..=0xd3ff => self.vic.write_reg(addr as u8, value),
+            0xd000..=0xd3ff => {
+                // The Ultimate's SuperCPU speed switches at `$D07A`/`$D07B` take the store
+                // before the VIC, which has nothing there.
+                if !self.vic.u64_extra_write(addr) {
+                    self.vic.write_reg(addr as u8, value)
+                }
+            }
             0xd400..=0xd7ff => {
                 let (chip, reg) = match crate::sid::resolve_sid(self.sid_map, addr) {
                     Some(hit) => hit,

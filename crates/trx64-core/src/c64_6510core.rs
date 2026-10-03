@@ -453,6 +453,15 @@ fn interrupt_check_irq_delay(cs: &mut IntStatus, _cpu_clk: u64) -> bool {
 // the bus trait so lib.rs implements them over its existing bus + VIC + CIAs.
 // =============================================================================
 
+/// [`C64Core6510Bus::turbo_access_kind`]: RAM / ROM.
+pub const TURBO_ACCESS_MEMORY: u8 = 0;
+/// [`C64Core6510Bus::turbo_access_kind`]: CIA 1, CIA 2, IO1, IO2 — one PHI2 bus cycle.
+pub const TURBO_ACCESS_BUS: u8 = 1;
+/// [`C64Core6510Bus::turbo_access_kind`]: VIC, colour RAM — inside the FPGA, fast.
+pub const TURBO_ACCESS_FAST: u8 = 2;
+/// [`C64Core6510Bus::turbo_access_kind`]: SID — fast, but a write costs what a read does.
+pub const TURBO_ACCESS_SID: u8 = 3;
+
 /// Bus + VIC + interrupt hook surface the C64 SC core executes against.
 ///
 /// lib.rs implements this over its existing C64 bus (RAM/ROM/IO via the
@@ -477,6 +486,17 @@ pub trait C64Core6510Bus {
     fn set_turbo_phase(&mut self, _phase: u32, _div: u32) {}
 
     fn read_raw(&mut self, addr: u16) -> u8;
+
+    /// What an access to `addr` costs a turbo CPU, as measured on a C64 Ultimate:
+    /// [`TURBO_ACCESS_MEMORY`] (RAM, ROM — the turbo clock), [`TURBO_ACCESS_BUS`] (CIA 1/2,
+    /// IO1, IO2 — a PHI2 bus cycle), [`TURBO_ACCESS_FAST`] (VIC, colour RAM — the turbo
+    /// clock, a read one extra CPU cycle at 63×) or [`TURBO_ACCESS_SID`] (as fast, a write
+    /// one extra cycle too). Asked only while the divider is above one. Default: memory,
+    /// which is every bus but the full machine's.
+    #[inline]
+    fn turbo_access_kind(&self, _addr: u16) -> u8 {
+        TURBO_ACCESS_MEMORY
+    }
     /// PORT OF: mainc64cpu.c:372-380 STORE (raw write tab). reu_dma($ff00) hook
     /// is folded into the implementor.
     fn write_raw(&mut self, addr: u16, value: u8);
@@ -942,10 +962,77 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
     }
 
     // -------------------------------------------------------------------------
+    // What an access costs a turbo CPU — measured on a C64 Ultimate (firmware 3.15,
+    // core 1.50), loops of 64 x `LDA abs` / `STA abs` timed in PHI2 ticks:
+    //   - RAM and ROM run at the turbo clock (0.065 PHI2 per `LDA abs` at 63x);
+    //   - CIA 1, CIA 2, IO1 and IO2 are bus cycles: exactly one PHI2 cycle per access back
+    //     to back. The access completes at a PHI2 edge (a fast store placed after a CIA
+    //     read sits at a fixed phase right after the edge, within a CPU cycle) and has to
+    //     be issued a lead before it: back to back at 63x, CPU work up to 62 cycles between
+    //     two reads is free and 64 costs a second PHI2 cycle (lead 1); for writes the line
+    //     is at 51/52 (lead 12, ~190 ns). The write's lead is scaled to the divider as a
+    //     time (3 cycles at 16x, where back-to-back writes measured one PHI2 each); the
+    //     read's is one cycle at every speed;
+    //   - VIC and colour RAM are fast: writes cost as RAM, a read one extra CPU cycle at
+    //     63x and none at 16x. SID the same, its writes included (0.0818 PHI2 per `STA` at
+    //     63x, against 0.0653 for a VIC or colour RAM `STA`).
+    // A write resumes at the same edge a read completes at: the measurement fixes the
+    // leads, not where inside the edge's cycle a write ends. Never runs at a divider of 1.
+    // -------------------------------------------------------------------------
+
+    /// Run CPU cycles that do nothing until the cycle right after the next PHI2 edge.
+    #[inline(never)]
+    fn turbo_idle_to_edge(&mut self) {
+        loop {
+            self.clk_inc();
+            if self.core.turbo_phase == 0 {
+                break;
+            }
+        }
+    }
+
+    /// Hold the CPU until its access to `a` may happen, at turbo. See above.
+    #[inline(never)]
+    fn turbo_access_wait(&mut self, a: u16, write: bool) {
+        match self.bus.turbo_access_kind(a) {
+            TURBO_ACCESS_BUS => {
+                let div = self.core.turbo_div;
+                let lead = if write { ((12 * div + 31) / 63).max(1) } else { 1 };
+                // Phase 0 is the cycle right after an edge: a whole PHI2 cycle to the next.
+                let to_edge = div - self.core.turbo_phase;
+                self.turbo_idle_to_edge();
+                if to_edge < lead {
+                    self.turbo_idle_to_edge();
+                }
+            }
+            // Measured +1 at 63x and +0 at 16x; the speeds between are unmeasured and take
+            // the 16x answer.
+            TURBO_ACCESS_FAST if !write && self.core.turbo_div >= 63 => self.clk_inc(),
+            TURBO_ACCESS_SID if self.core.turbo_div >= 63 => self.clk_inc(),
+            _ => {}
+        }
+    }
+
+    #[inline]
+    fn turbo_read(&mut self, a: u16) {
+        if self.core.turbo_div > 1 {
+            self.turbo_access_wait(a, false);
+        }
+    }
+
+    #[inline]
+    fn turbo_write(&mut self, a: u16) {
+        if self.core.turbo_div > 1 {
+            self.turbo_access_wait(a, true);
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // LOAD / STORE families (mainc64cpu.c:359-446). Each runs check_ba() first.
     // -------------------------------------------------------------------------
     #[inline]
     fn load(&mut self, a: u16) -> u8 {
+        self.turbo_read(a);
         self.check_ba();
         self.bus.read_raw(a)
     }
@@ -954,33 +1041,39 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
     /// tracing implementor tags it as a FETCH (not emitted as a data-bus record).
     #[inline]
     fn load_fetch(&mut self, a: u16) -> u8 {
+        self.turbo_read(a);
         self.check_ba();
         self.bus.read_raw_fetch(a)
     }
     #[inline]
     fn load_dummy(&mut self, a: u16) -> u8 {
+        self.turbo_read(a);
         self.check_ba();
         self.bus.read_raw_dummy(a)
     }
     /// LOAD_CHECK_BA_LOW (m64:400-405): check_ba_low=1; read; check_ba_low=0.
     #[inline]
     fn load_check_ba_low(&mut self, a: u16) -> u8 {
+        self.turbo_read(a);
         self.check_ba_low();
         self.bus.read_raw(a)
     }
     /// LOAD_CHECK_BA_LOW_DUMMY (m64:407-412).
     #[inline]
     fn load_check_ba_low_dummy(&mut self, a: u16) -> u8 {
+        self.turbo_read(a);
         self.check_ba_low();
         self.bus.read_raw_dummy(a)
     }
     #[inline]
     fn store(&mut self, a: u16, v: u8) {
         // STORE (m64:372-379): no check_ba on writes (write tab direct).
+        self.turbo_write(a);
         self.bus.write_raw(a, v);
     }
     #[inline]
     fn store_dummy(&mut self, a: u16, v: u8) {
+        self.turbo_write(a);
         self.bus.write_raw_dummy(a, v);
     }
     #[inline]

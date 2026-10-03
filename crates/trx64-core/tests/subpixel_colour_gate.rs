@@ -14,12 +14,22 @@ use trx64_core::vic::{SubCycleColour, VicII};
 use trx64_core::vic::{SpeedProfile, U64SpeedTable};
 use trx64_core::NullSink;
 
-/// §8.1 — the mapping from sub-cycle phase to pixel, with no slack in it.
+/// §8.1 — the mapping from sub-cycle phase to pixel.
+///
+/// Revised for turbo as measured, round 2 (D10): on a C64 Ultimate at 63x the pixel grid's
+/// boundaries sit at ~-0.9, 7.0 and 14.9 CPU cycles after the PHI2 edge — an eighth of a
+/// pixel ahead of `8 * phase / div`, which put the first at 7.9. So phase 7 at a divider
+/// of 64 is the second pixel now, where this test said "still inside the first".
 #[test]
 fn a_phase_names_the_pixel_it_belongs_to() {
-    // 64 MHz: 64 CPU cycles per PHI2 cycle, 8 per pixel. UPic spends exactly 8 per pixel.
+    // The measured case: 63 CPU cycles per PHI2 cycle, 7.875 per pixel.
+    let at63: Vec<usize> = [6u32, 8, 14, 15].iter().map(|&c| SubCycleColour::pixel_for(c, 63)).collect();
+    assert_eq!(at63, vec![0, 1, 1, 2], "a store 6 cycles after the edge paints pixel 0, 8-14 pixel 1, 15 pixel 2");
+    assert_eq!(SubCycleColour::pixel_for(62, 63), 7);
+    // 64 per PHI2, 8 per pixel.
     assert_eq!(SubCycleColour::pixel_for(0, 64), 0);
-    assert_eq!(SubCycleColour::pixel_for(7, 64), 0, "still inside the first pixel");
+    assert_eq!(SubCycleColour::pixel_for(6, 64), 0, "still inside the first pixel");
+    assert_eq!(SubCycleColour::pixel_for(7, 64), 1, "an eighth of a pixel early: the second");
     assert_eq!(SubCycleColour::pixel_for(8, 64), 1, "the ninth cycle is the second pixel");
     assert_eq!(SubCycleColour::pixel_for(56, 64), 7);
     assert_eq!(SubCycleColour::pixel_for(63, 64), 7, "the last phase is the last pixel");

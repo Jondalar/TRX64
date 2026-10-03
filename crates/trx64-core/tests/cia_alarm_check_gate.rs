@@ -251,27 +251,32 @@ fn lockstep(label: &str, off: &mut Machine, on: &mut Machine, steps: u64) -> u64
 /// interrupt delay is counted in CPU cycles at the turbo clock, with the lines sampled at
 /// every turbo cycle, so a turbo handler is entered earlier. Every `@1` digest is the one
 /// recorded for Spec 888, byte for byte.
+///
+/// The `@64` ten re-recorded again for round 2 (same day): D9 — a CIA access is a PHI2 bus
+/// cycle at turbo, and a VIC/SID/colour-RAM read one CPU cycle dearer at 63x; D15 — the
+/// post-reset hold is 2^22 PHI2 cycles, so `booted@64` settles 220 frames instead of 120.
+/// The `@1` ten still unchanged.
 const GOLDEN: &[(&str, u64)] = &[
     ("ta_irq@1", 0xa246b6efb6558752),
-    ("ta_irq@64", 0x83c67dc487307767),
+    ("ta_irq@64", 0x81e0d58e618eb79a),
     ("ta_irq_timer_read@1", 0x4b70672fac9eaa9d),
-    ("ta_irq_timer_read@64", 0x2d6de302ff73bda5),
+    ("ta_irq_timer_read@64", 0xc9eaf55087147df6),
     ("ta_oneshot@1", 0x3b54bfe7e21b8689),
-    ("ta_oneshot@64", 0x122735eae99918fe),
+    ("ta_oneshot@64", 0xcf91d47dd3c9203d),
     ("tb_cascade_l0@1", 0x98a9131c0bae633a),
-    ("tb_cascade_l0@64", 0x3f9e14292304a02e),
+    ("tb_cascade_l0@64", 0xd35cc2ac1049365b),
     ("tb_cascade_l1@1", 0xf7adcbf78ead153a),
-    ("tb_cascade_l1@64", 0x7778f24c56018f5d),
+    ("tb_cascade_l1@64", 0x056af2b67f4d5d2c),
     ("tb_cascade_l2@1", 0x5ed3218521a1dc17),
-    ("tb_cascade_l2@64", 0xc75d3f932cd05862),
+    ("tb_cascade_l2@64", 0xdfa6739b4c2ec0fd),
     ("cia2_nmi@1", 0x1a928b753aadd799),
-    ("cia2_nmi@64", 0x1026fc1be0534638),
+    ("cia2_nmi@64", 0x5b283234c3c0e275),
     ("tod_alarm@1", 0xde2b5ecaf5b8347c),
-    ("tod_alarm@64", 0x222e61f20fc01cf3),
+    ("tod_alarm@64", 0xa78c6fa0a0bae1d1),
     ("restore_cascade@1", 0x3da6ee42bde8de72),
-    ("restore_cascade@64", 0x32ce5b89ba147a53),
+    ("restore_cascade@64", 0xc602b602fe50fc24),
     ("booted@1", 0xfa6905d085cfff85),
-    ("booted@64", 0x8e134e547d8e9f30),
+    ("booted@64", 0x9683d292e57507e0),
 ];
 
 fn golden(label: &str, digest: u64, printed: &mut Vec<String>) {
@@ -343,11 +348,13 @@ fn a_booted_machine_is_deterministic_and_frozen() {
         let label = format!("booted@{speed}");
         let boot = |m: &mut Machine| {
             m.boot_from_dir(std::path::Path::new(ROM_DIR)).expect("boot ROMs");
-            // BUG-061 — after a reset the Ultimate holds its C64 at 1 MHz for 2.06 s; the
-            // 120-frame settle below outlasts it, so the `@64` workload is at 64 MHz by
-            // the time the lockstep starts.
+            // After a reset the Ultimate holds its C64 at 1 MHz for 2^22 PHI2 cycles (turbo
+            // as measured, D15) — 214 frames. `@64` settles 220 frames so its workload runs
+            // at 63x when the lockstep starts; `@1` keeps its 120 frames, and with them its
+            // Spec 888 digest.
             m.set_u64_turbo(0x00, prefer);
-            m.run_for_full(120 * FRAME, &mut NullSink, |_, _, _, _, _, _, _| {});
+            let settle = if prefer == MHZ_1 { 120 } else { 220 };
+            m.run_for_full(settle * FRAME, &mut NullSink, |_, _, _, _, _, _, _| {});
         };
         let (mut a, mut b) = (machine(prefer), machine(prefer));
         boot(&mut a);

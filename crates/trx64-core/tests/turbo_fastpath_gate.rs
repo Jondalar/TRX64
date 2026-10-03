@@ -290,7 +290,8 @@ fn the_fast_path_changes_nothing_on_a_booted_machine() {
     // KERNAL IRQ, cursor blink, keyboard scan and the drive: the ordinary machine, sped up.
     let setup = |m: &mut Machine| {
         m.boot_from_dir(std::path::Path::new(ROM_DIR)).expect("boot ROMs");
-        m.run_for_full(150 * FRAME, &mut NullSink, |_, _, _, _, _, _, _| {});
+        // Past the post-reset hold (2^22 PHI2 cycles), so the equality runs at turbo.
+        m.run_for_full(230 * FRAME, &mut NullSink, |_, _, _, _, _, _, _| {});
     };
     for prefer in [MHZ_16, MHZ_64, MHZ_64_NO_BADLINE] {
         same_with_and_without("booted", prefer, 40, &setup);

@@ -1,7 +1,8 @@
 ; turbomeas.prg - turbo reference measurements on a real Ultimate (T29).
 ; Driven over REST: write params + CMD into $C000.., poll SEQ, read results.
 ;
-;   CMD $C000: 1 = measure, 2 = IRQ latency, 3 = monitor (until CMD != 3)
+;   CMD $C000: 1 = measure, 2 = IRQ latency, 3 = monitor (until CMD != 3),
+;              5 = run the routine at $4000 between two CIA2 tick reads
 ;   Program clears CMD and increments SEQ ($C00F) when a command is done.
 ;
 ; Assemble: tools/64tass.sh -a -o turbomeas.prg turbomeas.asm
@@ -94,8 +95,11 @@ idle    lda CMD
         bne +
         jmp irqlat
 +       cmp #3
-        bne done
+        bne +
         jmp monitor
++       cmp #5
+        bne done
+        jmp timed
 done    lda #0
         sta CMD
         inc SEQ
@@ -215,6 +219,17 @@ rdtim   lda $dd07
         cmp R_T0,x
         bne rdtim
         rts
+
+; cmd 5: time a host-written routine at $4000 with CIA2 (PHI2 ticks)
+timed   jsr setd031
+        lda P_D011
+        sta $d011
+        ldx #0
+        jsr rdtim
+        jsr $4000
+        ldx #4
+        jsr rdtim
+        jmp done
 
 ; IRQ latency: CIA2 A phase-locked to the frame (period 19656), compare the
 ; timer seen when polling finds the line with the timer at IRQ entry.

@@ -159,12 +159,11 @@ fn the_ultimate_settings_survive_a_c64_reset() {
     assert_eq!(m.speed_profile(), SpeedProfile::U64);
     assert_eq!((m.vic.u64_regs_en, m.vic.u64_speed_prefer), (0x05, 0x83), "firmware settings kept");
     assert_eq!(m.vic.u64_speed_table, U64SpeedTable::U64);
-    // Revised for turbo as measured, row 6: this asserted 851's "the C64-side register is
-    // reset" through a written-flag that no longer exists. What `$D031` holds after a reset
-    // now depends on the mode. TurboEnable-bit mode is UNMEASURED and keeps what 851 built
-    // — the menu speed ($83 = index 3 with the stalls, which `$D031` reads as $03), the
-    // program's $05 gone. Registers mode resets to $00: `turbo_as_measured_gate`.
-    assert_eq!(m.read_full(0xd031), 0x03, "TurboEnable mode: the menu speed, not the program's write");
+    // Revised for turbo as measured, row 6 and round 2 (D12): this asserted 851's "the
+    // C64-side register is reset" through a written-flag that no longer exists. Measured in
+    // TurboEnable-bit mode: after a reset `$D030` reads `$FE` and `$D031` `$00`, 1 MHz, the
+    // program's $05 gone.
+    assert_eq!((m.read_full(0xd030), m.read_full(0xd031)), (0xfe, 0x00), "TurboEnable mode after a reset");
 }
 
 #[test]

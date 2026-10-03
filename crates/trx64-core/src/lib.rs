@@ -1035,7 +1035,14 @@ impl Machine {
                 model.name
             ));
         }
-        self.put_on_model(model)
+        let changed = !std::ptr::eq(self.model, model);
+        self.put_on_model(model)?;
+        // On an Ultimate the model is "System Mode", an item of the U64 Specific Settings,
+        // and changing any of them re-applies the menu speed.
+        if changed {
+            self.u64_settings_changed();
+        }
+        Ok(())
     }
 
     /// Put the machine on a row without asking where the VIC stands — for a restore, which
@@ -2223,7 +2230,7 @@ impl Machine {
         } else {
             self.drive_c64_ref = clk;
             // Spec 874 §6 — the IEC devices keep time through a reset hold (the U64
-            // holds the C64 2.06 s while its FPGA runs); the drives stand still (850 D7).
+            // holds its C64 in reset while its FPGA runs); the drives stand still (850 D7).
             if !self.iec_devices.is_empty() {
                 crate::iec_device::iec_devices_sync(&mut self.iec_devices, &mut self.iec, clk);
             }
@@ -2825,32 +2832,29 @@ impl Machine {
         self.vic.speed_profile
     }
 
-    /// BUG-061 — the Ultimate holds its C64 at 1 MHz for 2.06 s after a reset. Measured
-    /// on the owner's device, reset-anchored, the same at 16 and at 64 MHz and stable over
-    /// runs; the length is a TIME, so it is taken from this model's clock. Only the U64
+    /// The Ultimate holds its C64 at 1 MHz after a reset for exactly 2^22 = 4,194,304 PHI2
+    /// cycles (4.257 s on PAL). Measured on a C64 Ultimate from the CPU's first instruction
+    /// after a REST `machine:reset`, at 16 and at 64 MHz alike, within 80 cycles over five
+    /// runs; a count of PHI2 cycles, so the same count on every model (NTSC unmeasured).
+    /// BUG-061 first put it at 2.06 s, a figure that matches no reset path. Only the U64
     /// profile has it — a stock C64 has no turbo to hold back.
     fn arm_u64_reset_hold(&mut self) {
-        const HOLD_SECONDS: f64 = 2.06;
-        self.vic.u64_reset_hold = if self.vic.speed_profile == crate::vic::SpeedProfile::U64 {
-            (self.model.timing.cpu_hz as f64 * HOLD_SECONDS) as u32
-        } else {
-            0
-        };
+        const HOLD_PHI2: u32 = 1 << 22;
+        self.vic.u64_reset_hold =
+            if self.vic.speed_profile == crate::vic::SpeedProfile::U64 { HOLD_PHI2 } else { 0 };
     }
 
-    /// `$D031` after a C64 reset, by the menu's mode — measured on a C64 Ultimate:
-    /// - "U64 Turbo Registers": `$00`, i.e. 1 MHz WITH badline stalls, until a program
-    ///   writes `$D031` or the menu changes. The menu speed is not a power-on default.
-    /// - "Off" / "Manual": `$D031` is not enabled (reads `$FF`); the machine runs the
-    ///   menu speed once the post-reset hold is over.
-    /// - "TurboEnable Bit": UNMEASURED. Kept as built — the menu speed, switched by
-    ///   `$D030` bit 0, which the reset clears.
+    /// `$D030`/`$D031` after a C64 reset, by the menu's mode — measured on a C64 Ultimate:
+    /// - "U64 Turbo Registers": `$D031` reads `$00`, i.e. 1 MHz WITH badline stalls, until
+    ///   a program writes `$D031` or the menu changes. The menu speed is not a power-on
+    ///   default. `$D030` reads `$FF`.
+    /// - "TurboEnable Bit": `$D030` reads `$FE`, `$D031` `$00`, 1 MHz — until `$D030 = 1`
+    ///   loads the menu speed.
+    /// - "Off" / "Manual": neither is enabled (both read `$FF`); the machine runs the menu
+    ///   speed once the post-reset hold is over.
     fn reset_u64_turbo_state(&mut self) {
-        self.vic.regs[0x31] = if self.vic.u64_regs_en & 0x04 != 0 {
-            crate::vic::u64_menu_as_d031(self.vic.u64_speed_prefer)
-        } else {
-            0x00
-        };
+        self.vic.regs[0x30] = 0x00;
+        self.vic.regs[0x31] = 0x00;
     }
 
     /// The firmware's turbo settings as its menu writes them (`setCpuSpeed`,
@@ -2868,9 +2872,27 @@ impl Machine {
     pub fn set_u64_turbo(&mut self, regs_en: u8, speed_prefer: u8) {
         self.vic.u64_regs_en = regs_en;
         self.vic.u64_speed_prefer = speed_prefer;
-        if regs_en & 0x01 != 0 {
-            self.vic.regs[0x31] = crate::vic::u64_menu_as_d031(speed_prefer);
+        self.u64_settings_changed();
+    }
+
+    /// Any item of the firmware's "U64 Specific Settings" changed — measured on a C64
+    /// Ultimate, every config PUT in that category re-applies the menu speed, an unrelated
+    /// item too (toggling SuperCPU Detect turned `$D031` from a program's `$8C` back to the
+    /// menu's `$89`). Here that is [`Self::set_u64_turbo`] (Turbo Control, CPU Speed, Badline
+    /// Timing, SuperCPU Detect) and a model switch on the `u64` profile (System Mode); a host
+    /// that models more of the category calls this for the rest.
+    ///
+    /// In TurboEnable-bit mode with `$D030` bit 0 clear the turbo state stays `$00`: there
+    /// the menu speed is what `$D030 = 1` loads (the clear case is unmeasured).
+    pub fn u64_settings_changed(&mut self) {
+        let v = &mut self.vic;
+        if v.speed_profile != crate::vic::SpeedProfile::U64 || v.u64_regs_en & 0x01 == 0 {
+            return;
         }
+        if v.u64_regs_en & 0x04 != 0 && v.regs[0x30] & 0x01 == 0 {
+            return;
+        }
+        v.regs[0x31] = crate::vic::u64_menu_as_d031(v.u64_speed_prefer);
     }
 
     pub fn set_u64_speed_table(&mut self, table: crate::vic::U64SpeedTable) {
