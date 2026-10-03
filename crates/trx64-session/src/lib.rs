@@ -79,6 +79,10 @@ pub struct Session {
     /// blank — is built on it, so it survives a power cycle; a warm reset keeps the
     /// machine's own. Only a new session starts at the default.
     pub model: &'static trx64_core::model::C64Model,
+    /// Every ROM directory candidate, in order. The machine boots from the one given to
+    /// [`Self::boot`] / [`Self::power_on`]; the 1581 DOS is then looked up per file in
+    /// these as well (issue #4: it often sits in another directory than the KERNAL).
+    pub rom_dirs: Vec<std::path::PathBuf>,
 }
 
 /// Trace bookkeeping for an active `.c64retrace` capture.
@@ -197,6 +201,7 @@ impl Session {
             iec_devices_held: Default::default(),
             fdc_held: [None, None],
             model,
+            rom_dirs: Vec::new(),
         }
     }
 
@@ -206,6 +211,7 @@ impl Session {
     /// live). The run loop is started separately by the daemon/UI.
     pub fn boot(&mut self, rom_dir: &std::path::Path) -> Result<(), trx64_core::RomError> {
         self.machine.boot_from_dir(rom_dir)?;
+        self.machine.find_1581_dos(&self.rom_dirs);
         self.powered = true;
         Ok(())
     }
@@ -225,6 +231,7 @@ impl Session {
         }
         let mut machine = Machine::new_with_model(self.model);
         machine.boot_from_dir(rom_dir)?;
+        machine.find_1581_dos(&self.rom_dirs);
         // Re-insert the registered cartridge: transplant the live mapper +
         // image (flash preserved), then cold-reset so the machine re-vectors
         // $FFFC THROUGH the cart (boots INTO it, like a real insert + power-on).

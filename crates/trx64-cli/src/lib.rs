@@ -86,6 +86,20 @@ pub fn rom_dir_candidates() -> Vec<std::path::PathBuf> {
     candidates
 }
 
+/// Where the optional ROMs are looked up for a machine booted from `rom_dir`: that
+/// directory first, then every [`rom_dir_candidates`] entry. The 1581 DOS is an optional
+/// extra that often sits in another directory than the KERNAL (issue #4).
+pub fn rom_dirs_for(rom_dir: &Path) -> Vec<std::path::PathBuf> {
+    std::iter::once(rom_dir.to_path_buf()).chain(rom_dir_candidates()).collect()
+}
+
+/// Boot `m` from `rom_dir`, then find the 1581 DOS per file in every ROM directory.
+pub fn boot_machine(m: &mut trx64_core::Machine, rom_dir: &Path) -> Result<(), trx64_core::RomError> {
+    m.boot_from_dir(rom_dir)?;
+    m.find_1581_dos(&rom_dirs_for(rom_dir));
+    Ok(())
+}
+
 /// Explain a boot that failed for want of ROMs, and say what to do about it.
 ///
 /// This is the first thing a new user sees — `brew install trx64` then `trx64cli`
@@ -102,6 +116,8 @@ pub fn rom_missing_help(tried: &Path, err: &dyn std::fmt::Display) -> String {
            kernal-901227-03.bin   basic-901226-01.bin   chargen-901225-01.bin\n\
          Optional — without it the 1541 drive stays dead:\n  \
            dos1541-325302-01+901229-05.bin   (or the alias 1541.bin)\n\
+         Optional — a drive switched to a 1581 needs it; looked up in every directory below:\n  \
+           dos1581-318045-02.bin   (or 1581.bin / 1581.rom)\n\
          \n\
          Point trx64cli at them, either way:\n  \
            trx64cli --rom-dir /path/to/roms ...\n  \

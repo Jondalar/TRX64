@@ -427,7 +427,7 @@ fn main() {
             let read = trx64_core::native_snapshot::read_native_snapshot(&bytes)
                 .map_err(|e| format!("parse {input}: {e}"))?;
             let mut m = trx64_core::Machine::new();
-            m.boot_from_dir(&rom_dir)
+            trx64_cli::boot_machine(&mut m, &rom_dir)
                 .map_err(|e| format!("boot ROMs: {e:?}"))?;
             trx64_core::c64re_snapshot::restore_runtime_checkpoint(&mut m, &read.checkpoint)
                 .map_err(|e| format!("restore: {e}"))?;

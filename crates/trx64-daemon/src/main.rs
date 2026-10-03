@@ -894,30 +894,23 @@ fn rom_missing_report(roms: &std::path::Path, err: &dyn std::fmt::Display, in_co
     s.push_str(
         "[trx64]   TRX64 ships no ROMs (Commodore's property). Required: \
          kernal-901227-03.bin, basic-901226-01.bin, chargen-901225-01.bin; \
-         dos1541-325302-01+901229-05.bin (or 1541.bin) for the drive.\n",
+         dos1541-325302-01+901229-05.bin (or 1541.bin) for the drive; \
+         dos1581-318045-02.bin (or 1581.bin / 1581.rom) for a 1581, looked up in every \
+         ROM directory.\n",
     );
     s
 }
 
-fn rom_dir() -> PathBuf {
-    // Same seeding as the CLI: a self-contained folder (daemon + roms/ beside it) hands
-    // its ROMs to ~/.trx64/roms once, so a package-installed binary finds them later.
-    // Once, never overwriting, and it announces itself — see user_dir::seed_user_roms_from.
-    if let Ok(exe) = env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            if let Some(msg) = trx64_core::user_dir::seed_user_roms_from(&dir.join("roms")) {
-                eprintln!("[trx64] {msg}");
-            }
-        }
-    }
-    let has_kernal = |p: &std::path::Path| p.join("kernal-901227-03.bin").exists();
-    if let Ok(root) = env::var("C64RE_ROOT") {
-        let p = PathBuf::from(root).join("resources").join("roms");
-        if has_kernal(&p) {
-            return p;
-        }
-    }
+/// Every directory the daemon looks for ROMs in, in order: `$C64RE_ROOT/resources/roms`,
+/// `roms/` and `resources/roms/` beside the executable and up to three parents,
+/// `~/.trx64/roms`, `roms/` and `resources/roms/` in the working directory, the sibling
+/// C64RE checkout. The KERNAL set comes from the first that holds one ([`rom_dir`]); an
+/// optional extra — the 1581 DOS — from the first that holds it (issue #4).
+fn rom_candidates() -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(root) = env::var("C64RE_ROOT") {
+        candidates.push(PathBuf::from(root).join("resources").join("roms"));
+    }
     if let Ok(exe) = env::current_exe() {
         let mut dir = exe.parent().map(|p| p.to_path_buf());
         for _ in 0..4 {
@@ -945,9 +938,32 @@ fn rom_dir() -> PathBuf {
     // DEV_C64RE_ROOT — no author path in the sources, Spec 802 §5.5).
     candidates.push(PathBuf::from(DEV_C64RE_ROOT).join("resources").join("roms"));
     candidates
+}
+
+fn rom_dir() -> PathBuf {
+    // Same seeding as the CLI: a self-contained folder (daemon + roms/ beside it) hands
+    // its ROMs to ~/.trx64/roms once, so a package-installed binary finds them later.
+    // Once, never overwriting, and it announces itself — see user_dir::seed_user_roms_from.
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            if let Some(msg) = trx64_core::user_dir::seed_user_roms_from(&dir.join("roms")) {
+                eprintln!("[trx64] {msg}");
+            }
+        }
+    }
+    rom_candidates()
         .into_iter()
-        .find(|p| has_kernal(p))
+        .find(|p| p.join("kernal-901227-03.bin").exists())
         .unwrap_or_else(|| PathBuf::from("roms"))
+}
+
+/// Issue #4 — a drive position may only be a 1581 with a 1581 DOS to run. The refusal
+/// names the file and every directory searched.
+fn refuse_1581_without_dos(st: &State, pos: DrivePosition) -> Result<(), String> {
+    match st.session.machine.no_1581_dos(pos) {
+        Some(why) => Err(format!("drive position {} cannot be a 1581: {why}", pos.name())),
+        None => Ok(()),
+    }
 }
 
 // ── Project root for crash log ────────────────────────────────────────────────
@@ -7576,7 +7592,13 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 Ok(p) => p,
                 Err(e) => return Response::err(id, -32602, format!("session/drive_power: {e}")),
             };
-            match req.params.get("on").and_then(|v| v.as_bool()) {
+            let on = req.params.get("on").and_then(|v| v.as_bool());
+            if on != Some(false) && st.session.machine.drive(pos).board_type() == trx64_core::iec::DriveType::Drive1581 {
+                if let Err(e) = refuse_1581_without_dos(&st, pos) {
+                    return Response::err(id, -32602, format!("session/drive_power: {e}"));
+                }
+            }
+            match on {
                 Some(on) => {
                     if let Err(e) = st.session.machine.set_drive_power(pos, on) {
                         return Response::err(id, -32602, format!("session/drive_power: {e}"));
@@ -7699,6 +7721,11 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                     pos.name(),
                     trx64_core::drive::board_name(t)
                 ));
+            }
+            if t == trx64_core::iec::DriveType::Drive1581 {
+                if let Err(e) = refuse_1581_without_dos(&st, pos) {
+                    return Response::err(id, -32602, format!("session/drive_type: {e}"));
+                }
             }
             // The write-back lands in the host file before a medium that will not fit
             // leaves the drive.
@@ -17911,6 +17938,8 @@ pub fn create_embedded_state_with_model(
     model: &'static trx64_core::model::C64Model,
 ) -> Result<SharedState, trx64_core::RomError> {
     let mut session = Session::new_with_model("integrated-1", model);
+    // The given directory first (an explicit --rom-dir), then every candidate.
+    session.rom_dirs = std::iter::once(rom_dir.to_path_buf()).chain(rom_candidates()).collect();
     let boot = session.boot(rom_dir);
     let state = Arc::new(Mutex::new(build_state(session, false)));
     boot.map(|()| state)
@@ -18300,6 +18329,7 @@ async fn main() {
     eprintln!("[trx64] loading ROMs from {}", roms.display());
 
     let mut session = Session::new_with_model("integrated-1", model);
+    session.rom_dirs = rom_candidates();
     match session.boot(&roms) {
         Ok(()) => {
             eprintln!(
@@ -25635,6 +25665,44 @@ mod batch1_tests {
         let p = dir.join(name);
         std::fs::write(&p, bytes).unwrap();
         p
+    }
+
+    /// Issue #4 — no 1581 DOS in any ROM directory: `session/drive_type` to 1581 and
+    /// `session/drive_power` on a 1581 board are refused, naming the file and every
+    /// directory searched. A C64 set in a temp directory and nothing else.
+    #[test]
+    fn a_1581_without_a_dos_is_refused_naming_the_file_and_the_directories() {
+        let src = rom_dir();
+        if !src.join("kernal-901227-03.bin").exists() {
+            eprintln!("SKIP: issue #4 test: ROMs absent at {}", src.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("trx64-issue4-daemon-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ["kernal-901227-03.bin", "basic-901226-01.bin", "chargen-901225-01.bin"] {
+            std::fs::copy(src.join(f), dir.join(f)).unwrap();
+        }
+        let mut session = Session::new_with_model("issue4", trx64_core::model::default_model());
+        session.rom_dirs = vec![dir.clone()];
+        session.boot(&dir).expect("boot");
+        let st = Arc::new(Mutex::new(build_state(session, false)));
+        call(&st, "session/drive_power", json!({ "unit": 9, "on": false }));
+        let e = call_err(&st, "session/drive_type", json!({ "unit": 9, "type": "1581" }));
+        let want = format!(
+            "session/drive_type: drive position B cannot be a 1581: no 1581 DOS (dos1581-318045-02.bin, or 1581.bin / 1581.rom) in {}",
+            dir.display()
+        );
+        assert_eq!(e.message, want);
+        // A 1581 board that got there anyway (a library caller) does not power on.
+        st.lock().unwrap().session.machine.set_drive_type(DrivePosition::B, trx64_core::iec::DriveType::Drive1581).unwrap();
+        let e = call_err(&st, "session/drive_power", json!({ "unit": 9, "on": true }));
+        assert!(e.message.starts_with("session/drive_power: drive position B cannot be a 1581: no 1581 DOS (dos1581-318045-02.bin"), "{}", e.message);
+        let e = call_err(&st, "session/drive_power", json!({ "unit": 9 }));
+        assert!(e.message.contains("no 1581 DOS"), "the bare press too: {}", e.message);
+        assert!(!st.lock().unwrap().session.machine.drive_b.powered());
+        // The monitor verb reaches the same door.
+        let out = mon_exec(&st, "drivepower 9 on");
+        assert!(out.contains("no 1581 DOS"), "{out}");
     }
 
     #[test]

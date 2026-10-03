@@ -35,15 +35,29 @@ fn rom_1581() -> Option<Vec<u8>> {
     dirs.iter().find_map(|d| std::fs::read(d.join(DOS_1581)).ok())
 }
 
-fn roms_present() -> bool {
+/// Why this gate cannot run here, naming what is missing and where it was looked for.
+fn missing_roms() -> Option<String> {
     let d = Path::new(ROM_DIR);
-    d.join("kernal-901227-03.bin").exists() && d.join(DOS_1541).exists() && rom_1581().is_some()
+    let mut missing = Vec::new();
+    for f in ["kernal-901227-03.bin", DOS_1541] {
+        if !d.join(f).exists() {
+            missing.push(format!("{f} (in {ROM_DIR})"));
+        }
+    }
+    if rom_1581().is_none() {
+        missing.push(format!("{DOS_1581} (in $TRX64_1581_ROM_DIR, {ROM_DIR}, {VICE_DRIVES})"));
+    }
+    (!missing.is_empty()).then(|| missing.join(", "))
 }
 
+/// Skip a test that needs the ROMs, and say so where it is seen: straight to stderr, which
+/// the test harness does not capture — an `eprintln!` from a passing test is swallowed, and
+/// the gate then "passed" in 0.00 s with nothing said (issue #4).
 macro_rules! need_roms {
     () => {
-        if !roms_present() {
-            eprintln!("[skip] drive1581_gate: ROMs absent (C64 at {ROM_DIR}, 1581 DOS)");
+        if let Some(why) = missing_roms() {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "SKIP: {} — no {why}", module_path!());
             return;
         }
     };
