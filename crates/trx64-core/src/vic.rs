@@ -1129,12 +1129,16 @@ impl SpeedProfile {
     }
 }
 
-/// Spec 851 — the Ultimates differ in their CPU speed table only (`u64_config.cc:321-322`).
+/// The Ultimates differ in their CPU speed table (`u64_config.cc:321-322`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum U64SpeedTable {
-    /// The first Ultimate 64: 1 2 3 4 5 6 8 10 12 14 16 20 24 32 40 48 MHz.
+    /// The first Ultimate 64. Its menu reads 1 2 3 4 5 6 8 10 12 14 16 20 24 32 40 48 MHz.
+    /// UNMEASURED: the machine is taken to run as labelled.
     U64,
-    /// U64 Elite II and C64 Ultimate: 1 2 3 4 6 8 10 12 14 16 20 24 32 40 48 64 MHz.
+    /// U64 Elite II and C64 Ultimate. The menu reads 1 2 3 4 6 8 10 12 14 16 20 24 32 40 48
+    /// 64 MHz; measured on a C64 Ultimate (firmware 3.15, core 1.50) the machine runs every
+    /// index as labelled except the last two: 47 and 63 CPU cycles per PHI2 cycle, not 48
+    /// and 64, repeated over four loop sizes.
     #[default]
     U64II,
 }
@@ -1148,8 +1152,21 @@ impl U64SpeedTable {
         }
     }
 
-    /// MHz for a speed index, 1 MHz standing for one PHI2 cycle.
-    pub fn mhz(self, index: u8) -> u32 {
+    /// CPU cycles per PHI2 cycle at a speed index — the divider the CPU runs at. An index
+    /// past the table clamps to its top.
+    pub fn cycles_per_phi2(self, index: u8) -> u32 {
+        const U64: [u32; 16] = [1, 2, 3, 4, 5, 6, 8, 10, 12, 14, 16, 20, 24, 32, 40, 48];
+        const U64II: [u32; 16] = [1, 2, 3, 4, 6, 8, 10, 12, 14, 16, 20, 24, 32, 40, 47, 63];
+        let i = usize::from(index.min(15));
+        match self {
+            Self::U64 => U64[i],
+            Self::U64II => U64II[i],
+        }
+    }
+
+    /// What the firmware's menu calls a speed index, in MHz. Not what the machine runs:
+    /// see [`Self::cycles_per_phi2`].
+    pub fn menu_mhz(self, index: u8) -> u32 {
         const U64: [u32; 16] = [1, 2, 3, 4, 5, 6, 8, 10, 12, 14, 16, 20, 24, 32, 40, 48];
         const U64II: [u32; 16] = [1, 2, 3, 4, 6, 8, 10, 12, 14, 16, 20, 24, 32, 40, 48, 64];
         let i = usize::from(index.min(15));
@@ -1158,6 +1175,14 @@ impl U64SpeedTable {
             Self::U64II => U64II[i],
         }
     }
+}
+
+/// A menu speed (`C64_SPEED_PREFER`: index in bits 0-6, bit 7 "Badline Timing Enabled",
+/// `u64_config.cc:1657`) as `$D031` reads it: index in bits 0-3, bit 7 set when the badline
+/// stalls are OFF. Measured: 16 MHz with Badline Timing Enabled reads `$09`, Disabled `$89`.
+#[inline]
+pub fn u64_menu_as_d031(prefer: u8) -> u8 {
+    (prefer & 0x7f).min(15) | if prefer & 0x80 != 0 { 0x00 } else { 0x80 }
 }
 
 
@@ -1203,23 +1228,25 @@ pub struct VicII {
     /// that realigns the phase now that a speed change is adopted at the PHI2 edge.
     pub u64_d031_written_this_instruction: bool,
     pub turbo_div: u32,
-    /// Spec 868 — the border colour in force at each of the eight pixels this PHI2 cycle
-    /// draws. Armed only while a 64 MHz CPU is writing `$D020` more than once per cycle
-    /// (UPic paints a border picture that way); `None` everywhere else, and then the
-    /// colour resolve is exactly what it always was.
-    pub subcycle_colour: Option<SubCycleColour>,
+    /// Spec 868 — the colour in force at each of the eight pixels this PHI2 cycle draws,
+    /// per colour register `$D020`-`$D02E`. Armed only by a store from a U64 CPU in turbo
+    /// (UPic paints a border picture that way); empty everywhere else, and then the colour
+    /// resolve is exactly what it always was.
+    pub subcycle_colour: SubCycleColours,
     /// PORT OF: `vicii-mem.c:976` — `vicii.fastmode = value & 1`. STORED AND
     /// REPORTED ONLY. What a set speed bit does to the picture is Spec 815 §3 and
     /// is deliberately unbuilt: the one open question about it changes the
     /// implementation, and guessing would put behaviour here that exists nowhere
     /// else.
     pub fastmode: u8,
-    /// Spec 851 — the firmware's enable word `C64_TURBOREGS_EN` (`u64_config.cc:1631`): bit 0
-    /// the U64 turbo register `$D031`, bit 1 SuperCPU detection at `$D0BC`, bit 2 the
-    /// TurboEnable bit `$D030`. A firmware setting, so a C64 reset keeps it.
+    /// The firmware's enable word `C64_TURBOREGS_EN` (`u64_config.cc:1658`): bit 0 the U64
+    /// turbo register `$D031`, bit 1 SuperCPU detection at `$D0BC`, bit 2 the TurboEnable
+    /// bit `$D030`. Menu "Off" and "Manual" write `$00`, "U64 Turbo Registers" `$01`,
+    /// "TurboEnable Bit" `$05`. A firmware setting, so a C64 reset keeps it.
     pub u64_regs_en: u8,
-    /// Spec 851 — `C64_SPEED_PREFER` (`u64_config.cc:1630`): bits 0-6 speed index, bit 7
-    /// badline timing. `$80` is the menu's "Off".
+    /// The menu's speed, `C64_SPEED_PREFER` (`u64_config.cc:1657`): bits 0-6 speed index,
+    /// bit 7 "Badline Timing Enabled" — the badline stalls ON. "Off" writes `$80`. Set only
+    /// by [`crate::Machine::set_u64_turbo`], which is the menu here.
     pub u64_speed_prefer: u8,
     /// BUG-061 — PHI2 cycles left in the Ultimate's post-reset hold, during which the C64
     /// runs at 1 MHz whatever speed is set. 0 = no hold.
@@ -1239,9 +1266,6 @@ pub struct VicII {
     /// Unmeasured: whether a program's own `$D031` write inside the hold is honoured.
     /// Modelled as not — the hold is on the CPU, not on who asked.
     pub u64_reset_hold: u32,
-    /// Spec 851 — `$D031` has been written since the last reset; until then it reads, and
-    /// runs at, the preferred speed.
-    pub u64_d031_written: bool,
     pub u64_speed_table: U64SpeedTable,
 
     /// Cycle # within the current line (vicii.raster_cycle), 0..62 PAL.
@@ -1424,14 +1448,14 @@ impl Default for VicII {
 ///
 /// A 1 MHz 6510 cannot write a register twice in a cycle, so VICE keeps one latch and so
 /// did we. A 64 MHz U64 CPU can write it eight times, once per pixel the cycle draws, and
-/// the FPGA VIC samples the border colour at the pixel clock — which is what turns
+/// the FPGA VIC samples the colour registers at the pixel clock — which is what turns
 /// Aleksi Eeben's UPic into a 384-pixel-wide picture.
 ///
 /// A store at pixel `k` fills `slots[k..8]`: the register holds its value until something
 /// replaces it, so an unwritten slot is not "no colour", it is the previous one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SubCycleColour {
-    /// The register these slots stand for — `0x20` ($D020) today.
+    /// The register these slots stand for, `0x20`..=`0x2e` ($D020-$D02E).
     pub reg: u8,
     pub slots: [u8; 8],
 }
@@ -1439,8 +1463,8 @@ pub struct SubCycleColour {
 impl SubCycleColour {
     /// Which of the cycle's eight pixels a store at this phase belongs to.
     ///
-    /// At 64 MHz that is 64 CPU cycles per PHI2 cycle and 8 per pixel, which is exactly
-    /// what UPic's unrolled loop spends per pixel — the mapping has no slack in it.
+    /// At a divider of 64 that is 8 CPU cycles per pixel, which is what UPic's unrolled
+    /// loop spends per pixel.
     #[inline]
     pub fn pixel_for(phase: u32, div: u32) -> usize {
         if div <= 1 {
@@ -1454,6 +1478,41 @@ impl SubCycleColour {
     pub fn set_from(&mut self, pixel: usize, value: u8) {
         for slot in self.slots.iter_mut().skip(pixel) {
             *slot = value;
+        }
+    }
+}
+
+/// The per-pixel colour of every colour register written more than once in this PHI2
+/// cycle — border, background, multicolour and sprite colours, `$D020`-`$D02E`. Spec 868
+/// built it for `$D020`; they are all colour registers the draw resolves the same way, so
+/// a turbo store to any of them lands at the pixel it was made in.
+///
+/// `mask` bit `r - 0x20` says register `r` was written this cycle; `mask == 0` everywhere
+/// but a U64 in turbo, and then the colour resolve is exactly what it always was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct SubCycleColours {
+    pub mask: u16,
+    pub slots: [[u8; 8]; 15],
+}
+
+impl SubCycleColours {
+    /// The slots of register `reg` ($D020-$D02E as `0x20`..=`0x2e`), if it was written
+    /// this cycle.
+    #[inline]
+    pub fn get(&self, reg: u8) -> Option<SubCycleColour> {
+        let r = reg.wrapping_sub(0x20);
+        (r < 15 && self.mask & (1 << r) != 0).then(|| SubCycleColour { reg, slots: self.slots[r as usize] })
+    }
+
+    /// The value pixel `i` of this cycle takes for colour token `token`, if a turbo store
+    /// placed one; `None` = resolve from the register as always.
+    #[inline]
+    pub fn pixel(&self, token: usize, i: usize) -> Option<u8> {
+        let r = token.wrapping_sub(0x20);
+        if r < 15 && self.mask & (1 << r) != 0 {
+            Some(self.slots[r][i])
+        } else {
+            None
         }
     }
 }
@@ -1476,12 +1535,11 @@ impl VicII {
             turbo_phase: 0,
             u64_d031_written_this_instruction: false,
             turbo_div: 1,
-            subcycle_colour: None,
+            subcycle_colour: SubCycleColours::default(),
             fastmode: 0,
             u64_regs_en: 0x01,
             u64_speed_prefer: 0x80,
             u64_reset_hold: 0,
-            u64_d031_written: false,
             u64_speed_table: U64SpeedTable::U64II,
             raster_cycle: 0,
             cycle_flags: 0,
@@ -2807,16 +2865,17 @@ impl VicII {
                 self.regs[0x30] = value | 0xfc;
                 self.fastmode = value & 1;
             }
-            // Spec 851 — the U64's turbo registers, each only with its bit in the
-            // firmware's enable word. `$D031` is speed index | badline timing << 7: bit 7
-            // is not speed, so `$80` (1 MHz, badline timing) is not turbo — 815 read any
-            // non-zero value as engaged.
+            // The U64's turbo registers, each only with its bit in the firmware's enable
+            // word. `$D031` holds the turbo state (speed index, badline stalls): bits 0-3
+            // the index, bit 7 set = NO badline stalls — measured on a C64 Ultimate at
+            // every index, `$80` included (1 MHz without stalls). Stored in the form it
+            // reads back. A menu change sets the same state (`Machine::set_u64_turbo`);
+            // whichever came last applies.
             0x30 if self.speed_profile == SpeedProfile::U64 && self.u64_regs_en & 0x04 != 0 => {
                 self.regs[0x30] = value | 0xfc;
             }
             0x31 if self.speed_profile == SpeedProfile::U64 && self.u64_regs_en & 0x01 != 0 => {
-                self.regs[0x31] = value;
-                self.u64_d031_written = true;
+                self.regs[0x31] = value & 0x8f;
                 // Spec 868 §9 — the write reloads the divider's counter, so the
                 // sub-PHI2 phase restarts at this store.
                 self.u64_d031_written_this_instruction = true;
@@ -2857,19 +2916,24 @@ impl VicII {
     /// already stored in regs.
     #[inline]
     fn color_reg_store(&mut self, addr: u8, v4: u8) {
-        // Spec 868 — a CPU that can write this register more than once per PHI2 cycle
+        // Spec 868 — a CPU that can write a colour register more than once per PHI2 cycle
         // is saying something the single latch below cannot hold. Gated on the U64
         // profile AND a divider above one, so every C64 and C128 keeps VICE's model
-        // exactly: same code, same order, same bytes.
-        if addr == 0x20 && self.turbo_div > 1 && self.speed_profile == SpeedProfile::U64 {
+        // exactly: same code, same order, same bytes. Every colour register, `$D020` to
+        // `$D02E`: the draw resolves them all through the same token lookup.
+        if self.turbo_div > 1 && self.speed_profile == SpeedProfile::U64 {
+            let r = usize::from(addr - 0x20);
             let pixel = SubCycleColour::pixel_for(self.turbo_phase, self.turbo_div);
-            let slots = self.subcycle_colour.get_or_insert(SubCycleColour {
-                reg: addr,
+            let sc = &mut self.subcycle_colour;
+            if sc.mask & (1 << r) == 0 {
                 // Before the first store this cycle, every pixel still shows what the
                 // register already held.
-                slots: [self.cregs[addr as usize]; 8],
-            });
-            slots.set_from(pixel, v4);
+                sc.slots[r] = [self.cregs[addr as usize]; 8];
+                sc.mask |= 1 << r;
+            }
+            let mut one = SubCycleColour { reg: addr, slots: sc.slots[r] };
+            one.set_from(pixel, v4);
+            sc.slots[r] = one.slots;
         }
 
         self.last_color_reg = addr;
@@ -2939,32 +3003,26 @@ impl VicII {
             // machine has to be true for the probe to answer correctly.
             0x2f if self.speed_profile == SpeedProfile::C128 => self.regs[0x2f] | 0xf8,
             0x30 if self.speed_profile == SpeedProfile::C128 => self.regs[0x30] | 0xfc,
-            // The extended speed register: readable (so the type-2 probe resolves)
-            // while $D030 stays open bus, which is what that probe distinguishes on.
-            // Spec 851 — read-back is not documented anywhere open: `$D030` reads bit 0
-            // with VICE's VIC-IIe mask, `$D031` the whole byte. Assumptions, gated.
+            // The turbo registers read only with their enable bit; otherwise open bus,
+            // as measured: "Off" and "Manual" read `$FF` at both, "U64 Turbo Registers"
+            // `$FF` at `$D030`. `$D031` reads the turbo state in its own form.
+            // TurboEnable-bit mode's `$D030` read-back (bit 0, VICE's VIC-IIe mask) is
+            // UNMEASURED.
             0x30 if self.speed_profile == SpeedProfile::U64 && self.u64_regs_en & 0x04 != 0 => {
                 self.regs[0x30] | 0xfc
             }
             0x31 if self.speed_profile == SpeedProfile::U64 && self.u64_regs_en & 0x01 != 0 => {
-                self.u64_d031()
+                self.regs[0x31]
             }
             _ => 0xff,
         }
     }
 
-    /// Spec 851 — `$D031` as it reads: the last write, or the preferred speed before one.
-    pub fn u64_d031(&self) -> u8 {
-        if self.u64_d031_written {
-            self.regs[0x31]
-        } else {
-            self.u64_speed_prefer
-        }
-    }
-
-    /// Spec 851 D2 — the speed the Ultimate runs at: (speed index, badline timing).
-    /// `$D031` while its enable bit is set, else the preferred speed; in TurboEnable mode
-    /// `$D030` bit 0 switches between that and 1 MHz. A plain C64 is (0, true).
+    /// The speed the Ultimate runs at: (speed index, badline stalls). With `$D031` enabled
+    /// it is the turbo state `$D031` holds — the last program write or menu change; in
+    /// TurboEnable-bit mode `$D030` bit 0 clear drops that to index 0 (UNMEASURED, kept as
+    /// built). "Off" and "Manual" run the menu's speed. Inside the post-reset hold, and on
+    /// anything but a U64, it is a 1 MHz 6510 with its stalls: (0, true).
     pub fn u64_speed(&self) -> (u8, bool) {
         if self.speed_profile != SpeedProfile::U64 {
             return (0, true);
@@ -2974,9 +3032,13 @@ impl VicII {
         if self.u64_reset_hold > 0 {
             return (0, true);
         }
-        let base = if self.u64_regs_en & 0x01 != 0 { self.u64_d031() } else { self.u64_speed_prefer };
-        let v = if self.u64_regs_en & 0x04 != 0 && self.regs[0x30] & 0x01 == 0 { base & 0x80 } else { base };
-        (v & 0x7f, v & 0x80 != 0)
+        if self.u64_regs_en & 0x01 == 0 {
+            let p = self.u64_speed_prefer;
+            return (p & 0x7f, p & 0x80 != 0);
+        }
+        let d = self.regs[0x31];
+        let index = if self.u64_regs_en & 0x04 != 0 && self.regs[0x30] & 0x01 == 0 { 0 } else { d & 0x0f };
+        (index, d & 0x80 == 0)
     }
 
     /// Spec 851 — SuperCPU detection at `$D0BC-$D0BF`, only with bit 1 of the enable word.

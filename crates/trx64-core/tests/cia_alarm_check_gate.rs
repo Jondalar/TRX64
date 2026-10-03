@@ -224,7 +224,15 @@ fn lockstep(label: &str, off: &mut Machine, on: &mut Machine, steps: u64) -> u64
         fnv(&mut digest, so.0);
         fnv(&mut digest, so.1);
         fnv_bytes(&mut digest, &po);
-        fnv_bytes(&mut digest, serde_json::to_string(&co).unwrap().as_bytes());
+        // The `turbo` node (turbo as measured, row 6/D7) is left out of the digest: it is
+        // pinned by `turbo_as_measured_gate`, and keeping it out is what lets the `@1`
+        // digests below stay the ones recorded before it existed — the proof that 1 MHz
+        // did not move. It is still compared between the two machines above.
+        let mut co_digest = co.clone();
+        if let Some(o) = co_digest.as_object_mut() {
+            o.remove("turbo");
+        }
+        fnv_bytes(&mut digest, serde_json::to_string(&co_digest).unwrap().as_bytes());
     }
     digest
 }
@@ -237,27 +245,33 @@ fn lockstep(label: &str, off: &mut Machine, on: &mut Machine, steps: u64) -> u64
 /// delay line, Timer A re-arms its alarm only while an interrupt is wanted and not pending
 /// (`ciacore_intta`), and TOD runs VICE's mains alarm (its reset leaves the hour at 1). The
 /// history of the previous digests (857, 7ce542a, 843, 868 §9, BUG-061, 870) is in git.
+///
+/// The ten `@64` digests re-recorded for turbo as measured (2026-10-03), the `@1` ten NOT:
+/// row 2 — the menu's 64 MHz runs 63 CPU cycles per PHI2 cycle, not 64; row 4 — the
+/// interrupt delay is counted in CPU cycles at the turbo clock, with the lines sampled at
+/// every turbo cycle, so a turbo handler is entered earlier. Every `@1` digest is the one
+/// recorded for Spec 888, byte for byte.
 const GOLDEN: &[(&str, u64)] = &[
     ("ta_irq@1", 0xa246b6efb6558752),
-    ("ta_irq@64", 0xa6e3ac044229be32),
+    ("ta_irq@64", 0x83c67dc487307767),
     ("ta_irq_timer_read@1", 0x4b70672fac9eaa9d),
-    ("ta_irq_timer_read@64", 0x5412e41946147334),
+    ("ta_irq_timer_read@64", 0x2d6de302ff73bda5),
     ("ta_oneshot@1", 0x3b54bfe7e21b8689),
-    ("ta_oneshot@64", 0x70b482903465ea1b),
+    ("ta_oneshot@64", 0x122735eae99918fe),
     ("tb_cascade_l0@1", 0x98a9131c0bae633a),
-    ("tb_cascade_l0@64", 0x356cd62384980da1),
+    ("tb_cascade_l0@64", 0x3f9e14292304a02e),
     ("tb_cascade_l1@1", 0xf7adcbf78ead153a),
-    ("tb_cascade_l1@64", 0x967e0191941f78d9),
+    ("tb_cascade_l1@64", 0x7778f24c56018f5d),
     ("tb_cascade_l2@1", 0x5ed3218521a1dc17),
-    ("tb_cascade_l2@64", 0x590197231a6e0fc2),
+    ("tb_cascade_l2@64", 0xc75d3f932cd05862),
     ("cia2_nmi@1", 0x1a928b753aadd799),
-    ("cia2_nmi@64", 0x660935e7e17e6a03),
+    ("cia2_nmi@64", 0x1026fc1be0534638),
     ("tod_alarm@1", 0xde2b5ecaf5b8347c),
-    ("tod_alarm@64", 0xe64cc286c880c13d),
+    ("tod_alarm@64", 0x222e61f20fc01cf3),
     ("restore_cascade@1", 0x3da6ee42bde8de72),
-    ("restore_cascade@64", 0x6a0ef7cec365a7ec),
+    ("restore_cascade@64", 0x32ce5b89ba147a53),
     ("booted@1", 0xfa6905d085cfff85),
-    ("booted@64", 0xb4ac71d7745bfa0f),
+    ("booted@64", 0x8e134e547d8e9f30),
 ];
 
 fn golden(label: &str, digest: u64, printed: &mut Vec<String>) {

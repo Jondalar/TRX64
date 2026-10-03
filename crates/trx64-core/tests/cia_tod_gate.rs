@@ -2,10 +2,13 @@
 //!
 //! The first CIA port bumped a prescaler nothing read, so TOD stood still while its
 //! registers round-tripped and looked alive. Invisible on a stock C64, where little
-//! software reads TOD; fatal on the `u64` profile, where the timers and the raster are
-//! CPU-clocked and TOD is the only thing left carrying real time. Reported by the UE2
-//! session against five of Xander Mol's Ultimate projects — mandelbrot-upic sits in a TOD
-//! wait loop for ever with turbo on.
+//! software reads TOD; visible on the `u64` profile, where a program that times itself in
+//! TOD waits for ever. Reported by the UE2 session against five of Xander Mol's Ultimate
+//! projects — mandelbrot-upic sits in a TOD wait loop for ever with turbo on.
+//!
+//! The CIA timers and the raster are NOT CPU-clocked on an Ultimate: they count PHI2 at
+//! every speed, measured on a C64 Ultimate (985,250-985,950 CIA 2 ticks per TOD second at
+//! all 16 speed indices; 50.0-50.5 frames per second). This header said otherwise.
 //!
 //! The chip is VICE's `ciacore.c` (ciacore.rs): TOD ticks on its own mains alarm
 //! (`ciacore_inttod`), whose period `ticks_per_sec / power_freq` is corrected tick by tick

@@ -275,10 +275,11 @@ pub struct FullBus<'a> {
     pub port_active: bool,
     /// Spec 856 D2 — set by any access that is not a plain RAM or plain ROM read: IO while
     /// it is mapped, a cartridge window, the processor port, a snooped address. The turbo
-    /// fast path runs instructions back to back only while this stays clear, because an
-    /// IRQ acknowledge inside one PHI2 cycle reaches `IntStatus` through nothing but the
-    /// boundary restamp. Conservative on purpose: a false positive costs one sync, a
-    /// missed one storms every handler.
+    /// fast path runs instructions back to back only while this stays clear, because the
+    /// boundary block reads what such an access may have changed — a `$D031` speed, a DMA
+    /// arm, the banking, the port's lines. Conservative on purpose: a false positive costs
+    /// one sync. (An IRQ acknowledge no longer depends on it: the core samples the lines
+    /// at every turbo CPU cycle.)
     pub io_touched: bool,
 }
 

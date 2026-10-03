@@ -1,6 +1,6 @@
 # 890 — Turbo as measured on the C64 Ultimate
 
-**Status:** PROPOSED
+**Status:** BUILT (branch `spec-890-turbo-as-measured`, round 1: D1–D8) — see As built.
 **Source:** measurements on the owner's C64 Ultimate (firmware 3.15, FPGA 125, core 1.50, PAL),
 2026-10-03, by the 1541Ultimate_FW session: `/Users/alex/Development/TRX64-Ultimate/docs/turbo-measurements-gideon.md`
 (program and raw data in `tests/turbo-gideon/`). Where they contradict TRX64, the measurement wins.
@@ -80,3 +80,68 @@ Each measured fact has a test on the U64 profile:
 
 The first-generation U64 speed table; the per-access I/O stretch in turbo; TurboEnable-bit mode
 (`$D030`); `$D07A/B`, `$D0BC`, the `$D070/71` mirrors; why 14/15 give 47/63.
+
+## As built — round 1 (D1–D8), 2026-10-03
+
+**The gate runs the measurement program.** `turbomeas.prg` and its source are in
+`crates/trx64-core/tests/fixtures/turbomeas/`; `turbo_as_measured_gate` boots the U64 profile
+with ROMs, starts the program at `$0810` past the post-reset hold and drives the same mailbox
+`tm.py` drove, with the same arithmetic. A menu change is `Machine::set_u64_turbo`.
+
+- **D1.** `$D031` stores the turbo state in its read-back form (`index | (stalls ? 0 : $80)`,
+  bits 4-6 dropped); `u64_speed()` derives (index, stalls) from it; `u64_d031_written` is gone.
+  `check_ba` skips the BA stall whenever the stalls are off, at index 0 too. Measured here:
+  `$0F` 59.57 / `$8F` 63.00 with the display on (device 59.54 / 62.93), `$80` 1.00, `$00` 0.962
+  at k = 16 and 0.945 at k = 1. `u64_menu_as_d031` turns the menu byte (bit 7 = Badline Timing
+  Enabled) into `$D031`'s form.
+- **D2.** `U64SpeedTable::cycles_per_phi2` (U64-II: … 40, 47, 63) replaces `mhz`;
+  `menu_mhz` keeps the labels and the monitor's `turbo` report shows both. The first-generation
+  table is marked unmeasured.
+- **D3.** `cia_tod_gate`'s header corrected; nothing else.
+- **D4.** Below the divider `clk_inc` now runs `turbo_interrupt_cycle`: the CIA events, the
+  VIC line and the port lines are sampled and both delay counters advance per CPU cycle, so an
+  IRQ/NMI is taken at the first instruction end two CPU cycles after it fired. The NMI
+  hijack in `do_irqbrk` counts `nmi_delay_cycles` at turbo. I/O reads see the chip state of
+  the PHI2 cycle they fall in; no per-access stretch (open). The IRQPEND tail stays in PHI2
+  cycles: it is cleared at the next instruction prologue in either unit. 1 MHz never enters the
+  new path. **856 re-examined:** an acknowledge inside one PHI2 cycle no longer depends on the
+  boundary restamp; the fast path still ends a batch on I/O (the `$D031` read-back, DMA arm,
+  banking and port lines live in the boundary block), and `turbo_fastpath_gate` passes
+  unchanged.
+- **D5.** `set_u64_turbo` is the menu: with `$D031` enabled it sets the turbo state every time,
+  same value or not. Measured sequence reproduced: 8.03 `$85`, 32.00 `$8C`, 4.02 `$83`, 32.00
+  `$8C`, 30.29 `$0C` (device 8.0, 31.97, 4.0, 31.97, 30.2). TurboEnable mode follows the same
+  rule (unmeasured). `session/turbo` `speed`/`on`/`off` and the monitor verb are `$D031` writes,
+  not the menu; `on`/`off` now write `$03`/`$00` (4 / 1 MHz with stalls) so they keep meaning
+  what they meant.
+- **D6.** `reset_u64_turbo_state` after every reset: registers mode `$00`, TurboEnable mode the
+  menu speed (as built). Readbacks were already `$FF` where measured.
+- **D7.** A `turbo` node (`enable`, `menuIndex`, `menuStalls`, `d031`, `d030`, `resetHold`) on
+  the `u64` profile only; the hold rides too, or a rewind into a boot would lose it. Old `u64`
+  checkpoints restore with D6's registers-mode defaults and a `turbo:` restore note. The daemon's
+  undump now sets the profile claim BEFORE the restore — it used to set it after, which skipped
+  the restore's turbo divider for a `u64` dump undumped into a `c64` session.
+- **D8.** `SubCycleColours`: a slot set per colour register, `$D020`-`$D02E`, with a mask; the
+  resolve checks the mask (one compare when empty, as the old `Option` did).
+
+**Gates revised (item 9):** `u64_turbo_gate` — `d031_80_is_one_mhz_with_badline_timing_and_not_turbo`
+→ `d031_bit_7_removes_the_badline_stalls_and_is_not_speed` (row 1); speed tables and the
+index-14 raster IRQ (row 2); the reset test's written-flag (row 6). `pot_gate` g09 divider
+48 → 47 (row 2). `subpixel_colour_gate` `only_the_border_colour_is_sub_cycle_today` →
+`only_the_colour_registers_are_sub_cycle` (D8). `cia_alarm_check_gate`: the ten `@64` digests
+re-recorded (rows 2, 4); the `turbo` node is kept out of the digest so the ten `@1` digests are
+the Spec 888 ones byte for byte. `turbo_fastpath_gate`, `perf_bench` (divider 47/63 in the CPU
+MHz column), `u64_boot_speed_gate` (menu labels): comments/helpers only. `monitor_golden`
+unaffected.
+
+**Item 4, as it came out.** 64 MHz: 0 in every sample, stalls on or off (device: 0). 8 MHz:
+0 or −1, in one alignment all −1 on line `$FA` (device: 0, two −1 in 64). 16 MHz: 0 or −1
+(device: 0 or +1). 1 MHz `$00`: identical to the build before. The gate asserts "within one
+PHI2 cycle" at 8/16 and exactly 0 at 64; which path crosses the PHI2 edge first is what the
+per-access I/O cost decides, and that was unmeasured in this round.
+
+**Perf** (`bench_turbo_scaling`, rings off, median of 5, both builds alternated twice, rt-x):
+RAM loop 1 MHz 13.8–14.0 → 14.3–14.8 (noise: the 1 MHz path is unchanged); 64 MHz fast path 0.98 → 1.11 (part of it is 63 instead of 64
+CPU cycles per PHI2), no fast path 0.74 → 0.77; `LDA $D012` loop at 64 MHz fast path 0.95 →
+0.90, no fast path 0.78 → 0.72 — the per-CPU-cycle interrupt sample costs the I/O-heavy load
+about 6 %.

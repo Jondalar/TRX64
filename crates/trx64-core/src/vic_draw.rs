@@ -460,9 +460,10 @@ fn draw_colors_6569(v: &mut VicII, base: usize, i: usize) {
     // a wrong pixel every eight in a picture where it writes eight. Found by the UE2
     // session against real firmware — anomalous source columns at multiples of 8 only,
     // column 360 wrong in 462 of 462 drawn rows.
-    v.pixel_buffer[lookup_index] = match v.subcycle_colour {
-        Some(sc) if sc.reg as usize == token => sc.slots[i],
-        _ => v.cregs[token],
+    v.pixel_buffer[lookup_index] = if v.subcycle_colour.mask == 0 {
+        v.cregs[token]
+    } else {
+        v.subcycle_colour.pixel(token, i).unwrap_or(v.cregs[token])
     };
     if base + i < FB_W * FB_H {
         v.dbuf[base + i] = v.pixel_buffer[i];
@@ -483,9 +484,10 @@ fn draw_colors_8565(v: &mut VicII, base: usize, i: usize) {
         // branch above is untouched — it is about a register CHANGING mid-pixel, which is
         // a different statement.
         let token = v.pixel_buffer[lookup_index] as usize;
-        v.pixel_buffer[lookup_index] = match v.subcycle_colour {
-            Some(sc) if sc.reg as usize == token => sc.slots[lookup_index],
-            _ => v.cregs[token],
+        v.pixel_buffer[lookup_index] = if v.subcycle_colour.mask == 0 {
+            v.cregs[token]
+        } else {
+            v.subcycle_colour.pixel(token, lookup_index).unwrap_or(v.cregs[token])
         };
     }
     if base + i < FB_W * FB_H {
@@ -536,7 +538,7 @@ fn draw_colors8(v: &mut VicII) {
     // have just been laid down. `cregs` already holds the last value the CPU wrote, so
     // everything that reads the register outside this path — a monitor `io`, a snapshot,
     // the next cycle's first pixel — sees what it saw before.
-    v.subcycle_colour = None;
+    v.subcycle_colour.mask = 0;
 
     update_cregs(v);
 }
@@ -570,7 +572,7 @@ pub(crate) fn vicii_draw_cycle(v: &mut VicII) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vic::{SpeedProfile, SubCycleColour};
+    use crate::vic::SpeedProfile;
 
     /// Spec 868 — the proof that matters: eight values written inside one PHI2 cycle
     /// come out as eight different pixels in the frame buffer, which is what makes UPic
@@ -610,8 +612,8 @@ mod tests {
             vec![0x0f, 2, 3, 4, 5, 6, 7, 8],
             "each pixel takes the value in force when the VIC sampled it"
         );
-        assert!(
-            v.subcycle_colour.is_none(),
+        assert_eq!(
+            v.subcycle_colour.mask, 0,
             "the slots are scratch for one cycle and are cleared with it"
         );
     }
@@ -662,6 +664,48 @@ mod tests {
             (0..16).collect::<Vec<u8>>(),
             "sixteen stores, sixteen consecutive pixels, and no seam at the cycle boundary"
         );
+    }
+
+    /// Every colour register, not only the border: a store to `$D021`-`$D02E` inside a
+    /// turbo cycle lands at the pixel it was made in, on both chips' resolve paths, and a
+    /// register written in the same cycle as another keeps its own slots.
+    #[test]
+    fn every_colour_register_lands_at_its_pixel() {
+        for latency in [false, true] {
+            for reg in 0x21u8..=0x2e {
+                let mut v = VicII::new();
+                v.speed_profile = SpeedProfile::U64;
+                v.turbo_div = 64;
+                v.color_latency = latency;
+                v.dbuf_line = 0;
+                v.dbuf_offset = 0;
+                // The whole cycle shows this register: background, a multicolour, an ECM
+                // background, a sprite colour — the token is what the draw put there.
+                v.render_buffer.fill(reg);
+                v.pixel_buffer.fill(reg);
+                // A border store in the same cycle must not leak into this register's pixels.
+                v.turbo_phase = 0;
+                v.write_reg(0x20, 0x0f);
+                for pixel in 0..8u32 {
+                    v.turbo_phase = pixel * 8;
+                    v.write_reg(reg, (pixel as u8) + 1);
+                }
+                assert_eq!(v.subcycle_colour.get(reg).map(|s| s.slots), Some([1, 2, 3, 4, 5, 6, 7, 8]));
+                draw_colors8(&mut v);
+                if latency {
+                    // One pixel of pipeline: flush it with a cycle that writes nothing.
+                    draw_colors8(&mut v);
+                    let run: Vec<u8> = (1..9).map(|i| v.dbuf[i]).collect();
+                    assert_eq!(run, vec![1, 2, 3, 4, 5, 6, 7, 8], "${:04X}, 6569", 0xd000 + u16::from(reg));
+                } else {
+                    // Pixel 0 is the 8565's grey dot (the register it names was written
+                    // this cycle), as in the border test above; 1..7 are the stores.
+                    let row: Vec<u8> = (0..8).map(|i| v.dbuf[i]).collect();
+                    assert_eq!(&row[1..], &[2, 3, 4, 5, 6, 7, 8], "${:04X}, 8565", 0xd000 + u16::from(reg));
+                }
+                assert_eq!(v.subcycle_colour.mask, 0, "cleared with the cycle");
+            }
+        }
     }
 
     /// The same eight stores on a 1 MHz machine: one value for the whole cycle, which is

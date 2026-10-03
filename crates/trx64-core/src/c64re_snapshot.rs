@@ -31,6 +31,10 @@
 //!   - cpu.turboPhase: the CPU cycles counted below the current PHI2 cycle at turbo
 //!                    (Spec 851's divider). Written only when non-zero, so a 1 MHz
 //!                    checkpoint is unchanged and an older one restores as 0.
+//!   - turbo:         a `u64` machine's turbo state (enable word, menu index + stalls,
+//!                    `$D031`, `$D030`, the post-reset hold). Only on that profile; an
+//!                    older `u64` checkpoint restores as a reset leaves "U64 Turbo
+//!                    Registers" mode, with a note in `restore_notes`.
 
 use serde::{Deserialize, Serialize};
 
@@ -1578,6 +1582,12 @@ pub fn capture_runtime_checkpoint_with(
     if let Some(node) = m.pot.checkpoint() {
         tree["pot"] = node;
     }
+    // The Ultimate's turbo state: the firmware's enable word and menu speed, the turbo
+    // state `$D031` holds, `$D030`, and what is left of the post-reset hold. Only on the
+    // `u64` profile, so every checkpoint of any other machine is the one it was.
+    if let Some(node) = turbo_node(m) {
+        tree["turbo"] = node;
+    }
     // Spec 871 — drive position B. Omitted while B is as a machine is built (off, no
     // disk, stock part), so every checkpoint of a one-drive machine is the one it was.
     if let Some(node) = drive_b_node(m) {
@@ -1628,6 +1638,62 @@ pub fn capture_runtime_checkpoint_with(
         tree["hostFdc"] = serde_json::Value::Array(fdcs);
     }
     tree
+}
+
+/// The `turbo` node of a `u64` machine, `None` on any other profile.
+fn turbo_node(m: &Machine) -> Option<serde_json::Value> {
+    if m.vic.speed_profile != crate::vic::SpeedProfile::U64 {
+        return None;
+    }
+    let v = &m.vic;
+    Some(serde_json::json!({
+        "enable": v.u64_regs_en,
+        "menuIndex": v.u64_speed_prefer & 0x7f,
+        "menuStalls": v.u64_speed_prefer & 0x80 != 0,
+        "d031": v.regs[0x31],
+        "d030": v.regs[0x30],
+        "resetHold": v.u64_reset_hold,
+    }))
+}
+
+/// Put the turbo state back. A `u64` checkpoint without a `turbo` node (written before
+/// the node existed) gets what a reset leaves in "U64 Turbo Registers" mode — enable `$01`,
+/// menu 1 MHz with Badline Timing Enabled, `$D031 = $00` (1 MHz with badline stalls),
+/// `$D030 = $00`, no hold — and says so in `restore_notes`: its `$D031` byte meant
+/// something else then (bit 7 = badline timing ON), so it is not carried over.
+fn restore_turbo(m: &mut Machine, node: Option<&serde_json::Value>) -> Result<(), String> {
+    let byte = |n: &serde_json::Value, k: &str| -> Result<u8, String> {
+        n.get(k)
+            .and_then(|x| x.as_u64())
+            .filter(|&x| x <= 0xff)
+            .map(|x| x as u8)
+            .ok_or_else(|| format!("restore turbo: `{k}` must be a byte"))
+    };
+    match node {
+        Some(n) if !n.is_null() => {
+            let stalls = n.get("menuStalls").and_then(|x| x.as_bool()).unwrap_or(true);
+            m.vic.u64_regs_en = byte(n, "enable")?;
+            m.vic.u64_speed_prefer = (byte(n, "menuIndex")? & 0x7f) | if stalls { 0x80 } else { 0 };
+            m.vic.regs[0x31] = byte(n, "d031")? & 0x8f;
+            m.vic.regs[0x30] = byte(n, "d030")?;
+            m.vic.u64_reset_hold = n.get("resetHold").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+        }
+        _ if m.vic.speed_profile == crate::vic::SpeedProfile::U64 => {
+            m.vic.u64_regs_en = 0x01;
+            m.vic.u64_speed_prefer = 0x80;
+            m.vic.regs[0x31] = 0x00;
+            m.vic.regs[0x30] = 0x00;
+            m.vic.u64_reset_hold = 0;
+            m.restore_notes.push(
+                "turbo: no turbo state in this snapshot — restored as a reset leaves a C64 \
+                 Ultimate in U64 Turbo Registers mode: $D031 = $00 (1 MHz with badline \
+                 stalls), menu 1 MHz with Badline Timing Enabled"
+                    .to_string(),
+            );
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Spec 875 §8 — the `hostFdc` entry for `pos`, if the checkpoint has one.
@@ -2048,6 +2114,7 @@ pub fn restore_runtime_checkpoint(
         restore_vic_presentation(m, &s);
     }
     restore_vic_provenance(m, cp.get("vicProvenance"));
+    restore_turbo(m, cp.get("turbo"))?;
 
     // Spec 868 §9 — the turbo divider is adopted at a PHI2 EDGE now, not at the next
     // instruction boundary, so a restored machine that only learns its speed from
@@ -2060,11 +2127,11 @@ pub fn restore_runtime_checkpoint(
     // second time that gate has found the turbo state missing from a restore (the first
     // was `turbo_phase`, a defect since 851).
     if m.vic.speed_profile == crate::vic::SpeedProfile::U64 {
-        let (index, badline) = m.vic.u64_speed();
-        let div = m.vic.u64_speed_table.mhz(index);
+        let (index, stalls) = m.vic.u64_speed();
+        let div = m.vic.u64_speed_table.cycles_per_phi2(index);
         m.c64_core.turbo_div = div;
         m.c64_core.pending_turbo_div = div;
-        m.c64_core.turbo_badline = badline;
+        m.c64_core.turbo_badline = stalls;
     }
 
     // Sync the legacy shadow + machine clk (matches vsf load tail).

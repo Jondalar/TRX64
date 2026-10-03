@@ -6,14 +6,22 @@
 //! Two things can go wrong when instructions that do not advance `clk` stop paying for the
 //! boundary sync:
 //!
-//!   - an IRQ acknowledge that lands inside one PHI2 cycle never reaches `IntStatus` — below
-//!     the divider `clk_inc` returns early, so the boundary restamp is the only path it has
-//!     (§3). The handler returns to a line that is still high and takes the same IRQ again;
+//!   - an IRQ acknowledge that lands inside one PHI2 cycle never reaches `IntStatus`, the
+//!     handler returns to a line that is still high and takes the same IRQ again (§3);
 //!   - something the fast path skipped was not idempotent after all, and state drifts.
 //!
 //! The first is caught by counting handler entries against the events that caused them, the
 //! second by running every workload twice — fast path off and on — and demanding the same
 //! machine at every frame boundary. Exact equality, not a bound.
+//!
+//! Re-examined for turbo as measured (row 4): when this gate was written, the boundary
+//! restamp was the only path an acknowledge inside one PHI2 cycle had, because below the
+//! divider `clk_inc` returned without looking at the lines. A C64 Ultimate takes a raster
+//! IRQ within less than one PHI2 cycle, so the core now samples the lines and counts the
+//! interrupt delay at every turbo CPU cycle — the acknowledge reaches `IntStatus` in the
+//! next CPU cycle, fast path or not. The cases below are unchanged and still hold; what
+//! they guard is now that path, with the boundary restamp a second one. The fast path still
+//! ends a batch on any I/O access, for the rest of the boundary block.
 
 use trx64_core::c64re_snapshot::capture_runtime_checkpoint;
 use trx64_core::vic::SpeedProfile;
@@ -22,7 +30,8 @@ use trx64_core::{BusKind, Machine, NullSink, Observer};
 const ROM_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/resources/roms");
 /// PAL: 63 cycles × 312 lines.
 const FRAME: u64 = 19_656;
-/// `$D031` speed bytes on the U64-II table. Bit 7 = badline timing.
+/// Menu speed bytes (`set_u64_turbo` in "Manual" mode) on the U64-II table: the index, bit 7
+/// = Badline Timing Enabled. `MHZ_64` is index 15, which runs 63 CPU cycles per PHI2 cycle.
 const MHZ_1: u8 = 0x80;
 const MHZ_16: u8 = 0x89;
 const MHZ_64: u8 = 0x8f;

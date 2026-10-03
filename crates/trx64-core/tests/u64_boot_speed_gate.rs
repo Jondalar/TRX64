@@ -32,8 +32,8 @@ fn u64_pal() -> Machine {
 }
 
 fn speed_byte(mhz: u32) -> u8 {
-    let idx = (0..16u8).find(|&i| U64SpeedTable::U64II.mhz(i) == mhz).expect("in table");
-    0x80 | idx // bit 7 = badline timing on, as the menu writes it
+    let idx = (0..16u8).find(|&i| U64SpeedTable::U64II.menu_mhz(i) == mhz).expect("in table");
+    0x80 | idx // the menu's speed byte: bit 7 = Badline Timing Enabled
 }
 
 fn run(m: &mut Machine, cycles: u64) {

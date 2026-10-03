@@ -659,8 +659,10 @@ pub struct C64Core6510 {
     /// does not take hold until the cycle it was written in has finished, which is what
     /// lets UPic's resync pair cost nothing.
     pub pending_turbo_div: u32,
-    /// Spec 851 — badline timing: with it the CPU waits out a BA stall like a 6510; without
-    /// it a turbo CPU runs through.
+    /// The Ultimate's badline stalls: with them the CPU waits out a BA stall like a 6510;
+    /// without them it runs through — at every speed, 1 MHz included (`$D031 = $80`
+    /// measured 1.00 with the display on against 0.945 for `$00`). True on every machine
+    /// that is not a U64.
     pub turbo_badline: bool,
 }
 
@@ -828,8 +830,7 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
     #[inline]
     fn clk_inc(&mut self) {
         // Spec 851 D3 — `turbomaster_clk_inc`: below the divider this CPU cycle is not a
-        // PHI2 cycle — no alarms, no line samples, no clk, no VIC tick. The interrupt delay
-        // stays counted in PHI2 cycles, as in VICE's TurboMaster.
+        // PHI2 cycle — no alarms, no clk, no VIC tick.
         if self.core.turbo_div > 1 {
             self.core.turbo_phase += 1;
             if self.core.turbo_phase < self.core.turbo_div {
@@ -837,6 +838,7 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
                 // simply never passed on. A chip that can see finer than PHI2 (the VIC's
                 // colour registers) needs it at the moment of the store, not afterwards.
                 self.bus.set_turbo_phase(self.core.turbo_phase, self.core.turbo_div);
+                self.turbo_interrupt_cycle();
                 return;
             }
             self.core.turbo_phase = 0;
@@ -875,6 +877,38 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
         self.bus.vic_cycle(c);
     }
 
+    /// The interrupt half of a CPU cycle that is not a PHI2 cycle. Measured on a C64
+    /// Ultimate, a raster IRQ at 8, 16 and 64 MHz is taken within less than one PHI2
+    /// cycle of the raster event — badline stalls on or off — where a delay counted in
+    /// PHI2 cycles (VICE's TurboMaster, which 851 followed) shows two. So the 6502's own
+    /// rule runs at the turbo clock: the lines are sampled at every CPU cycle and the
+    /// delay counters advance per CPU cycle, so an IRQ or NMI is taken at the first
+    /// instruction end at least two CPU cycles after it fired.
+    ///
+    /// The lines can only change here through an access this cycle — an acknowledge
+    /// (`$DC0D` read, `$D019` write), an enable (`$D01A`), an expansion register — because
+    /// the VIC ticks and the CIA alarms fall on PHI2 edges, where `clk_inc` samples them as
+    /// it always did. Each sample is stamped with `clk`, the PHI2 cycle it falls in: an I/O
+    /// access is synchronised to PHI2 and sees that cycle's chip state.
+    ///
+    /// Never runs at a divider of 1: every CPU cycle is then a PHI2 edge.
+    #[inline]
+    fn turbo_interrupt_cycle(&mut self) {
+        let clk = self.core.clk;
+        self.bus.drain_cia_int(self.int);
+        self.int.set_irq(INT_SRC_VIC, self.bus.vic_irq_line(), clk);
+        if self.bus.expansion_active() {
+            self.int.set_irq(INT_SRC_EXPANSION, self.bus.expansion_irq_line(), clk);
+            self.int.set_nmi(INT_SRC_EXPANSION, self.bus.expansion_nmi_line(), clk);
+        }
+        if self.int.irq_clk <= clk {
+            self.int.irq_delay_cycles += 1;
+        }
+        if self.int.nmi_clk <= clk {
+            self.int.nmi_delay_cycles += 1;
+        }
+    }
+
     /// PORT OF: mainc64cpu.c:194-208 check_ba — steal VIC cycles if BA low. The
     /// implementor advances clk + ticks the VIC for each stolen cycle and
     /// applies the SH*/CLI ENABLES_IRQ steal-signal; it returns the count so we
@@ -883,8 +917,8 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
     /// LOAD_CHECK_BA_LOW context for SH*.
     #[inline]
     fn check_ba(&mut self) {
-        // Spec 851 — without badline timing a turbo CPU does not wait for the VIC.
-        if self.core.turbo_div > 1 && !self.core.turbo_badline {
+        // An Ultimate with the badline stalls off does not wait for the VIC, at any speed.
+        if !self.core.turbo_badline {
             return;
         }
         let mut loi = self.core.last_opcode_info;
@@ -897,7 +931,7 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
     /// by the SH* stores so maincpu_steal_cycles can set ENABLES_IRQ on a steal.
     #[inline]
     fn check_ba_low(&mut self) {
-        if self.core.turbo_div > 1 && !self.core.turbo_badline {
+        if !self.core.turbo_badline {
             return;
         }
         let mut loi = self.core.last_opcode_info;
@@ -2239,9 +2273,15 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
         self.clk_inc();
         // Process alarms up to this point to get nmi_clk updated.
         self.process_alarms();
-        if (self.int.global_pending_int & IK_NMI) != 0
-            && (self.core.clk >= self.int.nmi_clk + INTERRUPT_DELAY)
-        {
+        // An NMI that fired two cycles before the vector fetch takes the vector over. At
+        // turbo those are CPU cycles, counted by `nmi_delay_cycles` (see
+        // `turbo_interrupt_cycle`); at 1 MHz the clock comparison is VICE's, unchanged.
+        let nmi_due = if self.core.turbo_div > 1 {
+            self.int.nmi_delay_cycles >= INTERRUPT_DELAY
+        } else {
+            self.core.clk >= self.int.nmi_clk + INTERRUPT_DELAY
+        };
+        if (self.int.global_pending_int & IK_NMI) != 0 && nmi_due {
             handler_vector = 0xfffa;
             self.int.interrupt_ack_nmi();
         }

@@ -1460,14 +1460,15 @@ impl Machine {
         // Pressing RESET on a C128 does not turn it into a C64, and a release that
         // re-probes after its own reset must get the same answer.
         let profile = self.vic.speed_profile;
-        // Spec 851 — the Ultimate's turbo settings are the firmware's, not the C64's; the
-        // reset clears only the C64-side `$D030`/`$D031`.
+        // The Ultimate's turbo settings are the firmware's, not the C64's; the reset clears
+        // only the C64-side `$D030`/`$D031`, which then hold what the mode says.
         let (regs_en, prefer, table) = (self.vic.u64_regs_en, self.vic.u64_speed_prefer, self.vic.u64_speed_table);
         self.vic = VicII::new_for(self.model);
         self.vic.speed_profile = profile;
         self.vic.u64_regs_en = regs_en;
         self.vic.u64_speed_prefer = prefer;
         self.vic.u64_speed_table = table;
+        self.reset_u64_turbo_state();
         // The fresh VIC has no hold; the reset this IS has to arm it (BUG-061).
         self.arm_u64_reset_hold();
         // ts:707-708 + ts:773 — the C64's RESET reaches the 1541 over the IEC RESET
@@ -2784,11 +2785,12 @@ impl Machine {
         self.vic.regs[0x2f] = 0;
         self.vic.regs[0x30] = 0;
         self.vic.regs[0x31] = 0;
-        self.vic.u64_d031_written = false;
         if profile == crate::vic::SpeedProfile::U64 {
-            // Spec 851 D2 — as the menu's "U64 Turbo Registers" at 1 MHz, badline timing on.
+            // As the menu's "U64 Turbo Registers" at 1 MHz, Badline Timing Enabled, and
+            // `$D031` as a reset leaves it in that mode.
             self.vic.u64_regs_en = 0x01;
             self.vic.u64_speed_prefer = 0x80;
+            self.reset_u64_turbo_state();
         }
         self.c64_core.turbo_div = 1;
         self.c64_core.pending_turbo_div = 1;
@@ -2823,9 +2825,6 @@ impl Machine {
         self.vic.speed_profile
     }
 
-    /// Spec 851 — the firmware's turbo settings, as `setCpuSpeed` writes them
-    /// (`u64_config.cc:1634-1636`): the enable word and the preferred speed, applied on
-    /// its `C64_SPEED_UPDATE` strobe. Only meaningful on the `u64` profile.
     /// BUG-061 — the Ultimate holds its C64 at 1 MHz for 2.06 s after a reset. Measured
     /// on the owner's device, reset-anchored, the same at 16 and at 64 MHz and stable over
     /// runs; the length is a TIME, so it is taken from this model's clock. Only the U64
@@ -2839,26 +2838,55 @@ impl Machine {
         };
     }
 
+    /// `$D031` after a C64 reset, by the menu's mode — measured on a C64 Ultimate:
+    /// - "U64 Turbo Registers": `$00`, i.e. 1 MHz WITH badline stalls, until a program
+    ///   writes `$D031` or the menu changes. The menu speed is not a power-on default.
+    /// - "Off" / "Manual": `$D031` is not enabled (reads `$FF`); the machine runs the
+    ///   menu speed once the post-reset hold is over.
+    /// - "TurboEnable Bit": UNMEASURED. Kept as built — the menu speed, switched by
+    ///   `$D030` bit 0, which the reset clears.
+    fn reset_u64_turbo_state(&mut self) {
+        self.vic.regs[0x31] = if self.vic.u64_regs_en & 0x04 != 0 {
+            crate::vic::u64_menu_as_d031(self.vic.u64_speed_prefer)
+        } else {
+            0x00
+        };
+    }
+
+    /// The firmware's turbo settings as its menu writes them (`setCpuSpeed`,
+    /// `u64_config.cc:1630-1665`): the enable word and the menu speed
+    /// (`index | Badline Timing Enabled << 7`), applied on its `C64_SPEED_UPDATE` strobe.
+    /// This IS the menu here. Only meaningful on the `u64` profile.
+    ///
+    /// Last write wins: with `$D031` enabled, a menu set replaces the turbo state a
+    /// program wrote, and a later program write replaces it again — measured, and a set
+    /// applies even when its value equals the menu's current one. `$D031` then reads the
+    /// menu speed in its own form (16 MHz + Badline Timing Enabled reads `$09`).
+    ///
+    /// A set inside the post-reset hold is not lost: it stands and applies when the hold
+    /// ends (BUG-061).
     pub fn set_u64_turbo(&mut self, regs_en: u8, speed_prefer: u8) {
         self.vic.u64_regs_en = regs_en;
         self.vic.u64_speed_prefer = speed_prefer;
-        // A strobe inside the post-reset hold is not lost: the setting stands and applies
-        // when the hold ends (BUG-061 — the firmware strobes 445 cycles after release).
+        if regs_en & 0x01 != 0 {
+            self.vic.regs[0x31] = crate::vic::u64_menu_as_d031(speed_prefer);
+        }
     }
 
     pub fn set_u64_speed_table(&mut self, table: crate::vic::U64SpeedTable) {
         self.vic.u64_speed_table = table;
     }
 
-    /// Spec 851 — CPU cycles per PHI2 cycle right now (1 on anything but a turbo `u64`).
-    /// Callers that cap a run by instructions scale the cap by it.
+    /// CPU cycles per PHI2 cycle right now (1 on anything but a turbo `u64`). Callers that
+    /// cap a run by instructions scale the cap by it.
     pub fn turbo_divider(&self) -> u64 {
         let (index, _) = self.vic.u64_speed();
-        u64::from(self.vic.u64_speed_table.mhz(index))
+        u64::from(self.vic.u64_speed_table.cycles_per_phi2(index))
     }
 
     /// The speed bit as a release would see it: `$D030` bit 0 on the VIC-IIe; on the
-    /// Ultimate a speed index above 1 MHz (Spec 851 — bit 7 of `$D031` is badline timing).
+    /// Ultimate a speed index above 1 MHz (bit 7 of `$D031` is the badline stalls, not
+    /// speed).
     pub fn turbo_engaged(&self) -> bool {
         match self.vic.speed_profile {
             crate::vic::SpeedProfile::U64 => self.vic.u64_speed().0 != 0,
@@ -3656,8 +3684,8 @@ impl Machine {
         if self.vic.speed_profile != crate::vic::SpeedProfile::U64 {
             return;
         }
-        let (index, badline) = self.vic.u64_speed();
-        let div = self.vic.u64_speed_table.mhz(index);
+        let (index, stalls) = self.vic.u64_speed();
+        let div = self.vic.u64_speed_table.cycles_per_phi2(index);
         if self.vic.u64_d031_written_this_instruction {
             self.c64_core.turbo_phase = 0;
             self.vic.u64_d031_written_this_instruction = false;
@@ -3666,7 +3694,7 @@ impl Machine {
         // Assigning it here would put the speed change back on the instruction boundary,
         // which is the model this replaced.
         self.c64_core.pending_turbo_div = div;
-        self.c64_core.turbo_badline = badline;
+        self.c64_core.turbo_badline = stalls;
     }
 
     pub fn run_for_full_capped_dbg<O: Observer, F>(
@@ -3739,8 +3767,9 @@ impl Machine {
             // the clocks they were made (VICE `cia_set_int_clk`); the CPU loop replays
             // them every cycle, and this picks up what a host access between runs drove
             // (a monitor poke of $DC0D). The VIC's level is restamped (the SC core's
-            // set_irq only acts on a 0→1 edge): it carries an acknowledge made inside
-            // the last PHI2 cycle (856 §3).
+            // set_irq only acts on a 0→1 edge), which picks up a host write to $D019.
+            // An acknowledge made by the CPU inside a PHI2 cycle at turbo is already in:
+            // the core samples the lines at every turbo CPU cycle (`turbo_interrupt_cycle`).
             let now = self.c64_core.clk;
             full::drain_cia_int(&mut self.cia1, &mut self.cia2, &mut self.c64_int);
             self.c64_int.set_irq(c64_6510core::INT_SRC_VIC, self.vic.irq_line, now);
@@ -3837,9 +3866,12 @@ impl Machine {
                 // below runs once for all of it. At a divider of 1 every instruction moves
                 // `clk`, so this never iterates (`fast_path` is false there anyway).
                 //
-                // IO has to end the batch, not only a clock edge: an IRQ acknowledge inside
-                // one PHI2 cycle reaches `IntStatus` through nothing but the restamp at the
-                // top of this loop (Spec 856 §3).
+                // IO ends the batch, not only a clock edge. An IRQ acknowledge inside one
+                // PHI2 cycle no longer depends on it — the core samples the lines at every
+                // turbo CPU cycle — but the rest of the boundary block does: a `$D031`
+                // write is read by `sync_turbo_from_vic` at the top of the loop, a DMA arm
+                // runs below, and the port's lines are restamped there. Conservative on
+                // purpose; `turbo_fastpath_gate` holds the two paths equal.
                 if fast_path {
                     loop {
                         if self.c64_core.clk != c64_clk_before

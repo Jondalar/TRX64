@@ -315,7 +315,7 @@ fn g03_set_pot_between_runs_is_latched_at_the_first_boundary_after_it() {
     assert!(hit_boundary > 0, "the sweep met a set on a boundary cycle");
 }
 
-/// §12.9 — the same sweep at 48 MHz on the `u64` profile: the phase is moved by an idle run
+/// §12.9 — the same sweep at index 14 (the menu's 48 MHz, 47 CPU cycles per PHI2) on the `u64` profile: the phase is moved by an idle run
 /// of `s` PHI2 cycles first, and the rule is the 1 MHz one, in PHI2 cycles.
 fn turbo_sweep(fast_path: bool) -> Vec<Vec<(u64, u16, u8)>> {
     let mut logs = Vec::new();
@@ -338,15 +338,16 @@ fn turbo_sweep(fast_path: bool) -> Vec<Vec<(u64, u16, u8)>> {
         let reads0 = m.pot_lines().reads;
         let mut rec = Rec::default();
         m.run_for_full(2_000, &mut rec, |_, _, _, _, _, _, _| {});
-        assert_eq!(m.turbo_divider(), 48);
+        // Turbo as measured, row 2: index 14 runs 47 CPU cycles per PHI2 cycle (was 48).
+        assert_eq!(m.turbo_divider(), 47);
         let w = the_write(&rec);
         phases.insert(w & 511);
         assert!(rec.reads.iter().any(|r| r.0 >> 9 > w >> 9), "the reads ran past the next boundary");
-        judge_switch(&rec, w, "48 MHz");
+        judge_switch(&rec, w, "index 14");
         assert_eq!(m.pot_lines().reads - reads0, rec.reads.len() as u64, "every read counted once (fast path {fast_path})");
         logs.push(rec.reads);
     }
-    eprintln!("48 MHz sweep (fast path {fast_path}): the write fell on {} distinct phases", phases.len());
+    eprintln!("index 14 sweep (fast path {fast_path}): the write fell on {} distinct phases", phases.len());
     assert!(phases.len() >= 500, "the idle run moved the write across the window");
     logs
 }
