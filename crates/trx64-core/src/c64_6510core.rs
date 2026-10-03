@@ -423,14 +423,30 @@ fn interrupt_check_nmi_delay(cs: &IntStatus, _cpu_clk: u64) -> bool {
     cs.nmi_delay_cycles >= delay_cycles
 }
 
+/// The C64 Ultimate's IRQ line reaches a turbo CPU a quarter of a PHI2 cycle late, in CPU
+/// cycles of the divider (0 at 1 MHz, so VICE's rule there is untouched): Spec 890 D16.
+///
+/// Measured with `turbomeas.prg`'s raster-IRQ latency (device round 3, `irq.txt`): at 16x
+/// the handler's first CIA read lands 0 or +1 PHI2 cycles after a polling loop's — +1 in
+/// every sample on line `$35` with the badline stalls on — while 8x and 63x stay at 0.
+/// The 6502's two-cycle rule alone gives 0 or −1 at 16x (−1 in every sample on `$35`
+/// with the stalls on). An extra delay of `x/63` of a PHI2 cycle reproduces the device for
+/// `x` from 16 to 23 and for no other value — below, 16x keeps its −1; above, `$89` goes to
+/// +1 in every sample — and no fixed CPU-cycle count fits 8x and 16x together. A quarter
+/// PHI2 cycle (~254 ns) is inside that range.
+#[inline]
+fn turbo_irq_sync(div: u32) -> u64 {
+    u64::from(div / 4)
+}
+
 /// PORT OF: vice/src/mainc64cpu.c:690-710 interrupt_check_irq_delay.
 /// A taken-no-page-cross branch (DELAYS_INTERRUPT) bumps the threshold by one.
 /// If irq_delay_cycles >= threshold: take the IRQ UNLESS the last opcode
 /// ENABLES_IRQ (an I-clearing CLI/PLP), in which case defer one instruction by
 /// latching IK_IRQPEND. This MUTATES the int status.
 #[inline]
-fn interrupt_check_irq_delay(cs: &mut IntStatus, _cpu_clk: u64) -> bool {
-    let mut delay_cycles: u64 = INTERRUPT_DELAY;
+fn interrupt_check_irq_delay(cs: &mut IntStatus, _cpu_clk: u64, turbo_extra: u64) -> bool {
+    let mut delay_cycles: u64 = INTERRUPT_DELAY + turbo_extra;
     if opinfo_delays_interrupt(cs.last_opcode_info) != 0 {
         delay_cycles += 1;
     }
@@ -461,6 +477,59 @@ pub const TURBO_ACCESS_BUS: u8 = 1;
 pub const TURBO_ACCESS_FAST: u8 = 2;
 /// [`C64Core6510Bus::turbo_access_kind`]: SID — fast, but a write costs what a read does.
 pub const TURBO_ACCESS_SID: u8 = 3;
+/// [`C64Core6510Bus::turbo_access_kind`]: IO1 / IO2 (`$DE00-$DFFF`) — a bus cycle with a
+/// longer lead than a CIA's.
+pub const TURBO_ACCESS_IO12: u8 = 4;
+
+/// The C64 Ultimate's turbo clock as a grid of 64 slots per PHI2 cycle, slot 1 reserved —
+/// the model that reproduces both its speed table and its fast-I/O cost (Spec 890 D19).
+///
+/// The CPU's cycles begin at slots `round(i * 64 / n)` for the menu's `n` MHz. A cycle that
+/// would begin on the reserved slot does not happen, which is why the menu's 48 and 64 run
+/// 47 and 63 cycles per PHI2 cycle and every other index runs as labelled. A fast I/O read
+/// (VIC, SID, colour RAM, `$D031`) and a SID write take two usable slots: in a cycle with
+/// only one, they take the next cycle too. That is every cycle at 63x, one in 32 at 32x,
+/// none at 24x and below, and a pattern at 40x and 47x that the access's phase decides.
+///
+/// Returns bit `p` set for each turbo phase `p` (`0` = the cycle right after the PHI2 edge)
+/// whose cycle has fewer than two usable slots. Where the edge falls on the grid is the one
+/// fitted constant (`EDGE_SLOT`): the device's data fixes it only up to a family of
+/// equivalent placements, of which this is one.
+pub fn turbo_short_cycles(div: u32) -> u64 {
+    const SLOTS: u32 = 64;
+    const RESERVED: u32 = 1;
+    const EDGE_SLOT: u32 = 56;
+    if div <= 1 || div > 64 {
+        return 0;
+    }
+    // The menu label whose grid gives `div` cycles: itself, or one more when its grid
+    // loses the reserved slot (48 -> 47, 64 -> 63).
+    let starts = |n: u32| -> Vec<u32> {
+        let mut v: Vec<u32> = (0..n).map(|i| (2 * i * SLOTS + n) / (2 * n)).collect();
+        v.retain(|&s| s != RESERVED);
+        v
+    };
+    let mut e = starts(div);
+    if e.len() as u32 != div {
+        e = starts(div + 1);
+        if e.len() as u32 != div {
+            return 0; // a table this grid does not produce (the first-generation U64)
+        }
+    }
+    let n = e.len();
+    let usable = |i: usize| -> u32 {
+        let (a, b) = (e[i], if i + 1 == n { e[0] + SLOTS } else { e[i + 1] });
+        (a..b).filter(|&s| s % SLOTS != RESERVED).count() as u32
+    };
+    let p0 = (0..n).min_by_key(|&i| (e[i] + SLOTS - EDGE_SLOT) % SLOTS).unwrap_or(0);
+    let mut mask = 0u64;
+    for p in 0..n {
+        if usable((p0 + p) % n) < 2 {
+            mask |= 1 << p;
+        }
+    }
+    mask
+}
 
 /// Bus + VIC + interrupt hook surface the C64 SC core executes against.
 ///
@@ -489,9 +558,10 @@ pub trait C64Core6510Bus {
 
     /// What an access to `addr` costs a turbo CPU, as measured on a C64 Ultimate:
     /// [`TURBO_ACCESS_MEMORY`] (RAM, ROM — the turbo clock), [`TURBO_ACCESS_BUS`] (CIA 1/2,
-    /// IO1, IO2 — a PHI2 bus cycle), [`TURBO_ACCESS_FAST`] (VIC, colour RAM — the turbo
-    /// clock, a read one extra CPU cycle at 63×) or [`TURBO_ACCESS_SID`] (as fast, a write
-    /// one extra cycle too). Asked only while the divider is above one. Default: memory,
+    /// a PHI2 bus cycle), [`TURBO_ACCESS_IO12`] (IO1/IO2 — a bus cycle with a longer lead),
+    /// [`TURBO_ACCESS_FAST`] (VIC, colour RAM — the turbo clock; a read needs two usable
+    /// slots, see [`turbo_short_cycles`]) or [`TURBO_ACCESS_SID`] (as fast, its writes
+    /// too). Asked only while the divider is above one. Default: memory,
     /// which is every bus but the full machine's.
     #[inline]
     fn turbo_access_kind(&self, _addr: u16) -> u8 {
@@ -684,6 +754,9 @@ pub struct C64Core6510 {
     /// measured 1.00 with the display on against 0.945 for `$00`). True on every machine
     /// that is not a U64.
     pub turbo_badline: bool,
+    /// [`turbo_short_cycles`] for the divider in `turbo_short_for` — a cache, not state.
+    pub turbo_short: u64,
+    pub turbo_short_for: u32,
 }
 
 impl Default for C64Core6510 {
@@ -716,6 +789,8 @@ impl C64Core6510 {
             turbo_phase: 0,
             pending_turbo_div: 1,
             turbo_badline: true,
+            turbo_short: 0,
+            turbo_short_for: 0,
         }
     }
 
@@ -963,53 +1038,54 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
 
     // -------------------------------------------------------------------------
     // What an access costs a turbo CPU — measured on a C64 Ultimate (firmware 3.15,
-    // core 1.50), loops of 64 x `LDA abs` / `STA abs` timed in PHI2 ticks:
+    // core 1.50), loops of `LDA abs` / `STA abs` timed in PHI2 ticks:
     //   - RAM and ROM run at the turbo clock (0.065 PHI2 per `LDA abs` at 63x);
-    //   - CIA 1, CIA 2, IO1 and IO2 are bus cycles: exactly one PHI2 cycle per access back
-    //     to back. The access completes at a PHI2 edge (a fast store placed after a CIA
-    //     read sits at a fixed phase right after the edge, within a CPU cycle) and has to
-    //     be issued a lead before it: back to back at 63x, CPU work up to 62 cycles between
-    //     two reads is free and 64 costs a second PHI2 cycle (lead 1); for writes the line
-    //     is at 51/52 (lead 12, ~190 ns). The write's lead is scaled to the divider as a
-    //     time (3 cycles at 16x, where back-to-back writes measured one PHI2 each); the
-    //     read's is one cycle at every speed;
-    //   - VIC and colour RAM are fast: writes cost as RAM, a read one extra CPU cycle at
-    //     63x and none at 16x. SID the same, its writes included (0.0818 PHI2 per `STA` at
-    //     63x, against 0.0653 for a VIC or colour RAM `STA`).
+    //   - CIA 1/2 and IO1/IO2 are bus cycles: one PHI2 cycle per access back to back. The
+    //     access happens in the cycle right after a PHI2 edge (a fast store placed after a
+    //     CIA read sits at a fixed phase there, within a CPU cycle) and has to be issued at
+    //     least a lead before it. At 63x: CIA read 1 cycle, CIA write 12, IO1/IO2 read 30,
+    //     IO1/IO2 write 42 — IO1/IO2 about 30 cycles (~480 ns) earlier than a CIA, reads and
+    //     writes alike. The leads are times: at another divider `floor(lead63 * div / 63)`,
+    //     which is what the 16x and 32x measurements give (CIA 0 / 3, IO 7 / 10 at 16x);
+    //   - VIC, SID and colour RAM are fast: writes cost as RAM, except SID's; a read and a
+    //     SID write need two usable slots of the 64-slot grid (`turbo_short_cycles`).
     // A write resumes at the same edge a read completes at: the measurement fixes the
     // leads, not where inside the edge's cycle a write ends. Never runs at a divider of 1.
     // -------------------------------------------------------------------------
 
-    /// Run CPU cycles that do nothing until the cycle right after the next PHI2 edge.
-    #[inline(never)]
-    fn turbo_idle_to_edge(&mut self) {
-        loop {
-            self.clk_inc();
-            if self.core.turbo_phase == 0 {
-                break;
-            }
-        }
-    }
-
     /// Hold the CPU until its access to `a` may happen, at turbo. See above.
     #[inline(never)]
     fn turbo_access_wait(&mut self, a: u16, write: bool) {
-        match self.bus.turbo_access_kind(a) {
-            TURBO_ACCESS_BUS => {
+        let kind = self.bus.turbo_access_kind(a);
+        let lead63 = match (kind, write) {
+            (TURBO_ACCESS_BUS, false) => 1,
+            (TURBO_ACCESS_BUS, true) => 12,
+            (TURBO_ACCESS_IO12, false) => 30,
+            (TURBO_ACCESS_IO12, true) => 42,
+            (TURBO_ACCESS_FAST, false) | (TURBO_ACCESS_SID, _) => {
                 let div = self.core.turbo_div;
-                let lead = if write { ((12 * div + 31) / 63).max(1) } else { 1 };
-                // Phase 0 is the cycle right after an edge: a whole PHI2 cycle to the next.
-                let to_edge = div - self.core.turbo_phase;
-                self.turbo_idle_to_edge();
-                if to_edge < lead {
-                    self.turbo_idle_to_edge();
+                if self.core.turbo_short_for != div {
+                    self.core.turbo_short = turbo_short_cycles(div);
+                    self.core.turbo_short_for = div;
                 }
+                if self.core.turbo_short & (1 << self.core.turbo_phase) != 0 {
+                    self.clk_inc();
+                }
+                return;
             }
-            // Measured +1 at 63x and +0 at 16x; the speeds between are unmeasured and take
-            // the 16x answer.
-            TURBO_ACCESS_FAST if !write && self.core.turbo_div >= 63 => self.clk_inc(),
-            TURBO_ACCESS_SID if self.core.turbo_div >= 63 => self.clk_inc(),
-            _ => {}
+            _ => return,
+        };
+        let div = self.core.turbo_div;
+        let lead = lead63 * div / 63;
+        // Cycles to the next cycle in which a bus access can happen — this one, if it is
+        // the cycle right after an edge — and on to the next edge while the lead does not fit.
+        let p = self.core.turbo_phase;
+        let mut wait = if p == 0 { 0 } else { div - p };
+        while wait < lead {
+            wait += div;
+        }
+        for _ in 0..wait {
+            self.clk_inc();
         }
     }
 
@@ -2434,7 +2510,7 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
                 let irq_gate = (ik & (IK_IRQ | IK_IRQPEND)) != 0
                     && (!self.local_interrupt()
                         || opinfo_disables_irq(self.core.last_opcode_info) != 0);
-                let irq_now = irq_gate && interrupt_check_irq_delay(self.int, clk);
+                let irq_now = irq_gate && interrupt_check_irq_delay(self.int, clk, turbo_irq_sync(self.core.turbo_div));
                 if irq_now {
                     // Observability: fire BEFORE the ack + DO_IRQBRK entry,
                     // vector $FFFE (= cpu65xx-vice.ts:666

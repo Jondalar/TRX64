@@ -248,31 +248,38 @@ fn cia_timers_and_the_raster_count_phi2_at_every_index() {
 
 /// A raster IRQ at 8, 16 and 64 MHz is taken within less than one PHI2 cycle of the raster
 /// event, badline stalls on or off: the handler's first I/O read lands in the PHI2 cycle in
-/// which a polling loop's read after the line change lands. On the device: 0 at 64 MHz in
-/// every sample; 0 at 8 MHz (two samples of 64 at −1, line `$FA`); 0 or +1 at 16 MHz.
+/// which a polling loop's read after the line change lands, or the next. On the device
+/// (rounds 1 and 3, 64 samples): 0 at 64x; 0 at 8x (one ±1 in 64); at 16x 0 or +1 about
+/// half and half without the stalls (`$89`), and with them (`$09`) +1 in every sample on
+/// line `$35`, 12:52 on `$33`, 36:28 on `$FA`.
 ///
-/// TRX64 with the 6502's own rule at the turbo clock (D4) and the CIA read completing at a
-/// PHI2 edge (round 2, D9): 0 at 64 MHz, 0 at 16 MHz, 0 at 8 MHz with an occasional −1.
-/// Without D9's bus cycle (round 1) 8 and 16 MHz gave 0 or −1, all −1 on `$FA` in one
-/// alignment; with a delay counted in PHI2 cycles (851) 1-2 at every speed.
+/// TRX64 with the 6502's two-cycle rule at the turbo clock (D4), CIA reads completing at the
+/// PHI2 edge (D9) and the IRQ line a quarter PHI2 cycle late (D16): 0 at 8x and 63x; at 16x
+/// `$89` 0 and +1 in alternate samples on `$35` and `$33`, +1 on `$FA`; `$09` +1 on `$35` and
+/// `$FA`, 0 on `$33`. Every sample is inside the device's set; the device's mix within it
+/// is not asserted.
 #[test]
 fn a_raster_irq_at_turbo_is_taken_within_one_phi2_cycle() {
     let Some(mut m) = booted() else { return };
     start_tm(&mut m);
-    for d031 in [0x85u8, 0x89, 0x8f, 0x0f, 0x05] {
+    // `$05` (8x with the stalls) was not measured on the device; it is not asserted.
+    for d031 in [0x85u8, 0x89, 0x09, 0x8f, 0x0f] {
         for line in [0x35u8, 0x33, 0xfa] {
             let v = irq_latency(&mut m, d031, line);
             let h = histogram(&v);
             eprintln!("$D031 ${d031:02X} line ${line:02X}: {h:?}");
-            match d031 & 0x0f {
-                0x05 => {
-                    assert!(v.iter().all(|&x| x == 0 || x == -1), "${d031:02X} line ${line:02X}: {h:?}");
-                    assert!(h.get(&0).copied().unwrap_or(0) >= 28, "${d031:02X} line ${line:02X}: 0 is the rule: {h:?}");
-                }
-                0x09 => assert!(v.iter().all(|&x| x == 0 || x == 1), "${d031:02X} line ${line:02X}: 0 or +1: {h:?}"),
-                _ => assert!(v.iter().all(|&x| x == 0), "${d031:02X} line ${line:02X}: always 0 at 64 MHz: {h:?}"),
-            }
+            let want: &[i64] = match (d031, line) {
+                (0x09, 0x35) => &[1],
+                (0x89 | 0x09, _) => &[0, 1],
+                _ => &[0],
+            };
+            assert!(v.iter().all(|x| want.contains(x)), "${d031:02X} line ${line:02X}: {h:?}, the device {want:?}");
         }
+    }
+    // Without the stalls the 16x half-and-half shows on `$35` and `$33`.
+    for line in [0x35u8, 0x33] {
+        let h = histogram(&irq_latency(&mut m, 0x89, line));
+        assert!(h.len() == 2, "$89 line ${line:02X}: both 0 and +1 occur: {h:?}");
     }
 }
 
@@ -994,3 +1001,169 @@ fn d15_the_hold_is_2_to_the_22_phi2_cycles() {
     }
 }
 
+
+
+// ═════════════════════════════ Round 3 ═══════════════════════════════════════════════════
+//
+// The device check of this spec (2026-10-03, core 1.50, FPGA 125, FW 3.15, PAL), raw data
+// in TRX64-Ultimate `tests/turbo-gideon/data/verify890/`; `verify890.py` drives the same
+// `turbomeas.prg` and `tm2.py` routines these tests rebuild.
+
+/// D17 — `d12_13.txt`: TurboEnable-bit mode, `$D030 = 0`, then a menu change to CPU Speed
+/// 32: `$D030` reads `$FF`, `$D031` `$8C`, 32x — the menu change sets the enable bit;
+/// `$D030 = 1` afterwards changes nothing.
+#[test]
+fn d17_a_menu_change_sets_the_turboenable_bit() {
+    let Some(mut m) = booted() else { return };
+    m.set_u64_turbo(0x05, 0x09);
+    start_tm(&mut m);
+    assert_eq!(poke_read(&mut m, &[(0xd030, 0x00)], &[0xd030, 0xd031]), vec![0xfe, 0x00]);
+    assert!(close(x_now(&mut m, 1), 1.0, 0.005), "1x");
+    m.set_u64_turbo(0x05, 0x0c);
+    assert_eq!(poke_read(&mut m, &[], &[0xd030, 0xd031]), vec![0xff, 0x8c], "the menu set the enable bit");
+    assert!(close(x_now(&mut m, 32), 31.945, 0.004), "32x (device 31.945)");
+    assert_eq!(poke_read(&mut m, &[(0xd030, 0x01)], &[0xd030, 0xd031]), vec![0xff, 0x8c], "`$D030 = 1` changes nothing");
+}
+
+/// D18 — `io12.txt`: IO1/IO2 are bus cycles with a lead ~30 CPU cycles (~480 ns) longer than
+/// a CIA's, reads and writes alike. 63x, 32 per block, cycles per access 4 + 2·filler (+7
+/// on one access): IO1/IO2 read 1.000 up to 26, 1.031 at 28-32, 2.000 from 34; IO1 write
+/// 1.000 up to 14, 1.031 at 16-20, 2.000 from 22. 16x: IO read 1.031 at 4-8, 2.000 from
+/// 10; write 1.031 at 4-6, 2.000 from 8 (2.031 at 16). The rows below are the file's. Back to back (64 per block) 1.0001 at 63x and 32x,
+/// 1.0157 at 16x.
+#[test]
+fn d18_io1_and_io2_need_a_longer_lead_than_a_cia() {
+    let Some(mut m) = booted() else { return };
+    start_tm(&mut m);
+    // The device's rows, verbatim: (cycles per access, IO1 read, IO1 write, IO2 read).
+    let at63: [(usize, f64, f64, f64); 20] = [
+        (4, 1.0004, 1.0004, 1.0004), (6, 1.0004, 1.0004, 1.0004), (8, 1.0004, 1.0004, 1.0004),
+        (10, 1.0004, 1.0004, 1.0004), (12, 1.0004, 1.0004, 1.0004), (14, 1.0004, 1.0004, 1.0004),
+        (16, 1.0004, 1.0316, 1.0004), (18, 1.0004, 1.0316, 1.0004), (20, 1.0004, 1.0316, 1.0004),
+        (22, 1.0004, 2.0003, 1.0004), (24, 1.0004, 2.0003, 1.0004), (26, 1.0004, 2.0003, 1.0004),
+        (28, 1.0316, 2.0004, 1.0316), (30, 1.0316, 2.0004, 1.0316), (32, 1.0316, 2.0004, 1.0316),
+        (34, 2.0003, 2.0004, 2.0003), (36, 2.0003, 2.0004, 2.0003), (38, 2.0003, 2.0004, 2.0003),
+        (40, 2.0004, 2.0004, 2.0004), (42, 2.0004, 2.0004, 2.0004),
+    ];
+    let at16: [(usize, f64, f64, f64); 7] = [
+        (4, 1.0317, 1.0317, 1.0317), (6, 1.0317, 1.0318, 1.0317), (8, 1.0317, 2.0005, 1.0317),
+        (10, 2.0005, 2.0006, 2.0005), (12, 2.0006, 2.0009, 2.0006), (14, 2.0006, 2.0006, 2.0006),
+        (16, 2.0006, 2.0317, 2.0006),
+    ];
+    for (d031, rows) in [(0x8fu8, &at63[..]), (0x89, &at16[..])] {
+        for &(c, r1, w1, r2) in rows {
+            let f = (c - 4) / 2;
+            for (what, op, addr, want) in
+                [("IO1 read", LDA_ABS, 0xde00u16, r1), ("IO1 write", STA_ABS, 0xde00, w1), ("IO2 read", LDA_ABS, 0xdf00, r2)]
+            {
+                let x = phi2_per_access(&mut m, op, addr, 0, d031, 0x0b, 32, f);
+                assert!((x - want).abs() <= 0.003, "${d031:02X} {what}, {c} cycles per access: {x:.4}, the device {want}");
+            }
+        }
+    }
+    for (d031, want) in [(0x8fu8, 1.0001), (0x8c, 1.0002), (0x89, 1.0157)] {
+        for (op, addr) in [(LDA_ABS, 0xde00u16), (STA_ABS, 0xde00), (LDA_ABS, 0xdf00), (STA_ABS, 0xdf00)] {
+            let x = phi2_per_access(&mut m, op, addr, 0, d031, 0x0b, 64, 0);
+            assert!((x - want).abs() <= 0.0015, "${d031:02X} back to back ${addr:04X}: {x:.4}, the device {want}");
+        }
+    }
+}
+
+/// D19 — `fastread.txt`: the extra cost of a fast read (`LDA $D012`) and a SID write
+/// (`STA $D418`) over RAM, in CPU cycles: 0 at 2x-24x, 0.02 at 32x, 1.00-1.04 at 63x, and
+/// at 40x / 47x by NOPs between accesses 0.97 / 0.66 / 0.41 / 0.05 and 0.56 / 0.27 / 0.81 /
+/// 0.61. Colour-RAM writes: 0 at every index. TRX64's 64-slot grid gives all of it, except
+/// 40x at 2 and 3 NOPs (0.33 / 0.01, device 0.41 / 0.05).
+#[test]
+fn d19_a_fast_access_costs_a_fixed_time() {
+    let Some(mut m) = booted() else { return };
+    start_tm(&mut m);
+    let menu = [1u8, 2, 3, 4, 6, 8, 10, 12, 14, 16, 20, 24, 32, 40, 48, 64];
+    let mut extra = |m: &mut Machine, op: u8, addr: u16, idx: u8, f: usize| {
+        let div = MEASURED[idx as usize];
+        let ram = phi2_per_access(m, LDA_ABS, 0xc0f0, 0, 0x80 | idx, 0x0b, 64, f);
+        (phi2_per_access(m, op, addr, 0, 0x80 | idx, 0x0b, 64, f) - ram) * div
+    };
+    for idx in 1..16u8 {
+        let want = match idx { 12 => 0.02, 13 => 0.97, 14 => 0.56, 15 => 1.04, _ => 0.0 };
+        for (what, op, addr) in [("$D012 read", LDA_ABS, 0xd012u16), ("SID write", STA_ABS, 0xd418)] {
+            let e = extra(&mut m, op, addr, idx, 0);
+            assert!((e - want).abs() <= 0.05, "{what} at menu {}: {e:.2}, the device {want}", menu[idx as usize]);
+        }
+        let e = extra(&mut m, STA_ABS, 0xd800, idx, 0);
+        assert!(e.abs() <= 0.01, "a colour-RAM write costs nothing extra at menu {}: {e:.2}", menu[idx as usize]);
+    }
+    for (idx, by_filler, tol) in [
+        (12u8, [0.02, 0.02, 0.02, 0.02], 0.02),
+        (13, [0.97, 0.66, 0.41, 0.05], 0.09),
+        (14, [0.56, 0.27, 0.81, 0.61], 0.02),
+        (15, [1.04, 1.00, 1.00, 1.02], 0.05),
+    ] {
+        for (f, want) in by_filler.iter().enumerate() {
+            let e = extra(&mut m, LDA_ABS, 0xd012, idx, f);
+            eprintln!("menu {} filler {f}: {e:.2} (device {want})", menu[idx as usize]);
+            assert!((e - want).abs() <= tol, "menu {} filler {f}: {e:.2}, the device {want}", menu[idx as usize]);
+        }
+    }
+}
+
+/// D20 — `d13.txt`, `d12_13.txt`: `$D0BC` reads `$01` with SuperCPU Detect and `$FF`
+/// without, at `$D03C`, `$D07C`, `$D0FC` too; `$D0BD-$D0BF` and `$D0FD` read `$FF` either
+/// way. A store to `$D0FA` acts like `$D07A` (→ `$00`, 1x), `$D0FB` like `$D07B` (→ the menu,
+/// 16x); `$D03A`, `$D0BA`, `$D03B`, `$D0BB` do nothing.
+#[test]
+fn d20_the_supercpu_registers_decode_as_measured() {
+    let Some(mut m) = booted() else { return };
+    start_tm(&mut m);
+    let regs = [0xd0bc, 0xd0bd, 0xd0be, 0xd0bf, 0xd0fc, 0xd0fd, 0xd07c, 0xd03c];
+    m.set_u64_turbo(0x03, 0x09);
+    assert_eq!(poke_read(&mut m, &[], &regs), vec![0x01, 0xff, 0xff, 0xff, 0x01, 0xff, 0x01, 0x01], "Detect enabled");
+    m.set_u64_turbo(0x01, 0x09);
+    assert_eq!(poke_read(&mut m, &[], &regs), vec![0xff; 8], "Detect disabled");
+    for (addr, d031, x) in [
+        (0xd03au16, 0x85u8, 8.0),
+        (0xd0ba, 0x85, 8.0),
+        (0xd0fa, 0x00, 1.0),
+        (0xd03b, 0x85, 8.0),
+        (0xd0bb, 0x85, 8.0),
+        (0xd0fb, 0x89, 16.0),
+    ] {
+        let r = poke_read(&mut m, &[(0xd031, 0x85), (addr, 0x00)], &[0xd030, 0xd031]);
+        assert_eq!(r, vec![0xff, d031], "a store to ${addr:04X} after `$D031 = $85`");
+        assert!(close(x_now(&mut m, 16), x, 0.006), "${addr:04X}: {x}x");
+    }
+}
+
+/// D21 — badlines with the stalls on (round 2, `io_cost_filler.txt`, display on, `$D031 =
+/// $0F`): RAM read 0.0719, CIA 1 read 1.0611, `$D012` read 0.0897, `$D020` write 0.0686 PHI2
+/// per access. Each of those loops (4 × 256 × 64 accesses) runs for 0.03-0.22 of a frame, so
+/// the share of badlines it meets depends on where in the frame it ran — 0 in the border,
+/// up to 43 PHI2 in 504 inside the display — and the device's numbers do not separate a
+/// per-access-kind cost from that. Asserted: each device value lies inside what the same
+/// loop costs here, started at 24 places in the frame.
+#[test]
+fn d21_badline_costs_depend_on_where_in_the_frame_the_loop_ran() {
+    let Some(mut m) = booted() else { return };
+    start_tm(&mut m);
+    // (what, op, address, value, device with stalls, device with bit 7 = 1, both display on)
+    for (what, op, addr, v, device, free) in [
+        ("RAM read", LDA_ABS, 0xc0f0u16, 0u8, 0.0719, 0.0653),
+        ("CIA1 read", LDA_ABS, 0xdc00, 0, 1.0611, 1.0001),
+        ("$D012 read", LDA_ABS, 0xd012, 0, 0.0897, 0.0818),
+        ("$D020 write", STA_ABS, 0xd020, 0x0e, 0.0686, 0.0654),
+    ] {
+        let (code, n) = io_loop(op, addr, v, 64, 0, 4);
+        let base = timed(&mut m, &code, Some(0x8f), 0x1b) as f64 / n as f64;
+        let mut seen = Vec::new();
+        for k in 0..24u64 {
+            run(&mut m, k * FRAME / 24 + 1);
+            seen.push(timed(&mut m, &code, Some(0x0f), 0x1b) as f64 / n as f64 / base);
+        }
+        let (lo, hi) = seen.iter().fold((f64::MAX, f64::MIN), |(a, b), &x| (a.min(x), b.max(x)));
+        // Compared as the share the stalls add, each side against its own stall-free cost
+        // (they differ by D9's 0.0005 on a fast read).
+        let dev = device / free;
+        eprintln!("{what}: x{lo:.4}..x{hi:.4} here, the device x{dev:.4}");
+        assert!(lo - 1e-3 <= dev && dev <= hi + 1e-3, "{what}: the device's x{dev:.4} outside x{lo:.4}..x{hi:.4}");
+    }
+}

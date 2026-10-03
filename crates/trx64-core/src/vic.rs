@@ -3051,31 +3051,29 @@ impl VicII {
         (d & 0x0f, d & 0x80 == 0)
     }
 
-    /// The Ultimate's registers at full addresses, read. `$D0BC` (SuperCPU detection)
-    /// reads `$01` with "SuperCPU Detect" enabled — measured on a C64 Ultimate; disabled it
-    /// is the VIC's open `$FF`. `$D0BD-$D0BF` keep `$00` (VICE's SuperCPU, unmeasured on an
-    /// Ultimate). `$D07A`/`$D07B` read `$FF`, which the VIC's unused registers already do.
+    /// The Ultimate's registers at full addresses, read — decoded as measured on a C64
+    /// Ultimate in `$D000-$D0FF`: `$D0BC` (SuperCPU detection) reads `$01` with "SuperCPU
+    /// Detect" enabled, and so do its mirrors `$D03C`, `$D07C`, `$D0FC`; disabled, and at
+    /// `$D0BD-$D0BF`, the VIC's open `$FF`. `$D07A`/`$D07B` read `$FF`, which the VIC's
+    /// unused registers already do. Above `$D0FF` unmeasured: the VIC alone answers there.
     pub fn u64_extra_read(&self, addr: u16) -> Option<u8> {
         if self.speed_profile != SpeedProfile::U64 || self.u64_regs_en & 0x02 == 0 {
             return None;
         }
-        match addr {
-            0xd0bc => Some(0x01),
-            0xd0bd..=0xd0bf => Some(0x00),
-            _ => None,
-        }
+        (addr & 0xff3f == 0xd03c).then_some(0x01)
     }
 
     /// The Ultimate's registers at full addresses, written — SuperCPU's speed switches,
     /// measured on a C64 Ultimate with `$D031` enabled (both register modes): a store to
-    /// `$D07A` sets the turbo state to `$00` (1 MHz), one to `$D07B` loads the MENU speed —
-    /// not a value the program wrote before. Returns whether the address was one of them;
-    /// the VIC behind them has nothing there.
+    /// `$D07A` (or `$D0FA`) sets the turbo state to `$00` (1 MHz), one to `$D07B` (or
+    /// `$D0FB`) loads the MENU speed — not a value the program wrote before. `$D03A`,
+    /// `$D0BA`, `$D03B`, `$D0BB` do nothing. Returns whether the store was one of them; the
+    /// VIC behind them has nothing there.
     pub fn u64_extra_write(&mut self, addr: u16) -> bool {
         if self.speed_profile != SpeedProfile::U64 || self.u64_regs_en & 0x01 == 0 {
             return false;
         }
-        match addr {
+        match addr & 0xff7f {
             0xd07a => {
                 self.regs[0x31] = 0x00;
                 true
@@ -3087,7 +3085,6 @@ impl VicII {
             _ => false,
         }
     }
-
 
     /// PORT OF: vicii-mem.c:520/537 — the read-to-clear collision reads (the
     /// side-effecting variant the live bus must use for $D01E/$D01F). For all

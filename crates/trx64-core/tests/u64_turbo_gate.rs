@@ -70,7 +70,11 @@ fn the_enable_word_decides_which_registers_answer() {
     m.set_u64_turbo(0x02, 0x80); // SuperCPU detect only
     run_at(&mut m, 0xc000, 0x37, &[0xad, 0xbc, 0xd0, 0x8d, 0x00, 0x04], 2); // LDA $D0BC / STA $0400
     assert_ne!(m.read_full(0x0400), 0xff, "$D0BC answers the SuperCPU probe");
-    assert_eq!(m.read_full(0xd07c), 0xff, "but only at its own address, not a VIC mirror");
+    // Revised for turbo as measured, round 3 (D20): this said "only at its own address,
+    // not a VIC mirror". Measured on a C64 Ultimate, `$D0BC` is mirrored at `$D03C`, `$D07C`
+    // and `$D0FC`; `$D0BD` is not part of it.
+    assert_eq!(m.read_full(0xd07c), 0x01, "mirrored every $40 in $D000-$D0FF");
+    assert_eq!(m.read_full(0xd0bd), 0xff, "and $D0BD reads open bus");
 
     let mut plain = Machine::new();
     run_at(&mut plain, 0xc000, 0x37, &[0xad, 0xbc, 0xd0, 0x8d, 0x00, 0x04], 2);

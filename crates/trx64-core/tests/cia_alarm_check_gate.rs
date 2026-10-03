@@ -256,27 +256,30 @@ fn lockstep(label: &str, off: &mut Machine, on: &mut Machine, steps: u64) -> u64
 /// cycle at turbo, and a VIC/SID/colour-RAM read one CPU cycle dearer at 63x; D15 — the
 /// post-reset hold is 2^22 PHI2 cycles, so `booted@64` settles 220 frames instead of 120.
 /// The `@1` ten still unchanged.
+///
+/// Round 3 (D16, the IRQ line a quarter PHI2 cycle late at turbo): the nine IRQ-driven `@64`
+/// digests re-recorded; `cia2_nmi@64` (NMI, not delayed) and every `@1` unchanged.
 const GOLDEN: &[(&str, u64)] = &[
     ("ta_irq@1", 0xa246b6efb6558752),
-    ("ta_irq@64", 0x81e0d58e618eb79a),
+    ("ta_irq@64", 0x633f313ce333cb45),
     ("ta_irq_timer_read@1", 0x4b70672fac9eaa9d),
-    ("ta_irq_timer_read@64", 0xc9eaf55087147df6),
+    ("ta_irq_timer_read@64", 0xb65e679fed609885),
     ("ta_oneshot@1", 0x3b54bfe7e21b8689),
-    ("ta_oneshot@64", 0xcf91d47dd3c9203d),
+    ("ta_oneshot@64", 0x4dacdfaf6c022813),
     ("tb_cascade_l0@1", 0x98a9131c0bae633a),
-    ("tb_cascade_l0@64", 0xd35cc2ac1049365b),
+    ("tb_cascade_l0@64", 0x7944a192b13c0029),
     ("tb_cascade_l1@1", 0xf7adcbf78ead153a),
-    ("tb_cascade_l1@64", 0x056af2b67f4d5d2c),
+    ("tb_cascade_l1@64", 0xc1c50c012aea6266),
     ("tb_cascade_l2@1", 0x5ed3218521a1dc17),
-    ("tb_cascade_l2@64", 0xdfa6739b4c2ec0fd),
+    ("tb_cascade_l2@64", 0xb8c0bdc7afc74a01),
     ("cia2_nmi@1", 0x1a928b753aadd799),
     ("cia2_nmi@64", 0x5b283234c3c0e275),
     ("tod_alarm@1", 0xde2b5ecaf5b8347c),
-    ("tod_alarm@64", 0xa78c6fa0a0bae1d1),
+    ("tod_alarm@64", 0x7078fac06f303c8c),
     ("restore_cascade@1", 0x3da6ee42bde8de72),
-    ("restore_cascade@64", 0xc602b602fe50fc24),
+    ("restore_cascade@64", 0x636a6c9d7a36288e),
     ("booted@1", 0xfa6905d085cfff85),
-    ("booted@64", 0x9683d292e57507e0),
+    ("booted@64", 0x8d40cb7050cbc808),
 ];
 
 fn golden(label: &str, digest: u64, printed: &mut Vec<String>) {

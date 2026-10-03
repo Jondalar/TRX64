@@ -2882,15 +2882,15 @@ impl Machine {
     /// Timing, SuperCPU Detect) and a model switch on the `u64` profile (System Mode); a host
     /// that models more of the category calls this for the rest.
     ///
-    /// In TurboEnable-bit mode with `$D030` bit 0 clear the turbo state stays `$00`: there
-    /// the menu speed is what `$D030 = 1` loads (the clear case is unmeasured).
+    /// In TurboEnable-bit mode the change also sets the enable bit — measured: after
+    /// `$D030 = 0`, a menu change to 32 MHz read `$D030 = $FF`, `$D031 = $8C` and ran 32x.
     pub fn u64_settings_changed(&mut self) {
         let v = &mut self.vic;
         if v.speed_profile != crate::vic::SpeedProfile::U64 || v.u64_regs_en & 0x01 == 0 {
             return;
         }
-        if v.u64_regs_en & 0x04 != 0 && v.regs[0x30] & 0x01 == 0 {
-            return;
+        if v.u64_regs_en & 0x04 != 0 {
+            v.regs[0x30] = 0x01;
         }
         v.regs[0x31] = crate::vic::u64_menu_as_d031(v.u64_speed_prefer);
     }

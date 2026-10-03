@@ -1,6 +1,6 @@
 # 890 — Turbo as measured on the C64 Ultimate
 
-**Status:** BUILT (branch `spec-890-turbo-as-measured`, round 1: D1–D8, round 2: D9–D15) — see As built.
+**Status:** BUILT (branch `spec-890-turbo-as-measured`, round 1: D1–D8, round 2: D9–D15, round 3: D16–D21) — see As built.
 **Source:** measurements on the owner's C64 Ultimate (firmware 3.15, FPGA 125, core 1.50, PAL),
 2026-10-03, by the 1541Ultimate_FW session: `/Users/alex/Development/TRX64-Ultimate/docs/turbo-measurements-gideon.md`
 (program and raw data in `tests/turbo-gideon/`). Where they contradict TRX64, the measurement wins.
@@ -99,7 +99,8 @@ CIA/UCI not slowed; bit 7 = 0 — CIA read 1.061. TRX64: a bus-cycle access comp
 cycle right after a PHI2 edge and must be issued a lead before it — 1 cycle for a read, 12 for a
 write at 63× (scaled as a time, 3 at 16×); fast reads, and SID writes, cost one extra CPU cycle at
 63×. Unmeasured and taken from the nearest measurement: the extra cycle at 20–47× (none, as at
-16×); IO1/IO2 writes (as CIA writes); cartridge ROM (memory). Not pinned: UCI/IO1's longer lead at
+16× — superseded by D19); IO1/IO2 writes (as CIA writes — superseded by D18); cartridge ROM
+(memory). Not pinned: UCI/IO1's longer lead at
 16× (1.0157); where inside the edge's cycle a write resumes (only its lead is fixed).
 
 **D10 — a colour store paints the pixel it falls in** (Q13, `q13_pixels.txt`). The VIC samples
@@ -118,8 +119,8 @@ Replaces D6's "TurboEnable unmeasured".
 
 **D13 — `$D07A`, `$D07B`, `$D0BC`** (`leftovers.txt`, both register modes): a store to `$D07A`
 sets `$D031` to `$00` (1×); one to `$D07B` loads the MENU value, not the program's earlier one;
-both read `$FF`. `$D0BC` reads `$01` with SuperCPU Detect enabled, `$FF` disabled (it read `$00`
-here).
+both read `$FF`. `$D0BC` reads `$01` with SuperCPU Detect enabled, `$FF` disabled. (Before this
+decision TRX64 answered `$00` with Detect enabled; disabled it was already the VIC's `$FF`.)
 
 **D14 — any "U64 Specific Settings" change re-applies the menu speed** (`leftovers.txt`): toggling
 SuperCPU Detect turned `$D031` from a program's `$8C` back to the menu's `$89`.
@@ -130,6 +131,68 @@ Manual 64 → 4,194,166; registers mode with `$D031 = $89` at the first instruct
 the write is kept and applies at the hold's end; registers mode without a write stays at 1 MHz.
 Replaces BUG-061's 2.06 s. The firmware's `run_prg` ends the hold about 3.2 s after its call — a
 different path, the firmware's own, not modelled.
+
+## Round 3 — the device checks this spec (2026-10-03)
+
+**Source:** `/Users/alex/Development/TRX64-Ultimate/docs/turbo-measurements-gideon.md`, section
+"Round 3" (TRX64-Ultimate `d6e89ae`), raw data `tests/turbo-gideon/data/verify890/`, driver
+`verify890.py` over the same `turbomeas.prg` and `tm2.py` routines. Device: core 1.50, FPGA 125,
+FW 3.15, PAL. Passed on the device: D1, D2, D5, D8/D10, D11, D14, D15, and the NTSC hold (2^22
+PHI2, `ntsc_hold.txt`). The deviations:
+
+**D16 — the IRQ line reaches a turbo CPU a quarter PHI2 cycle late** (`irq.txt`). Raster-IRQ
+latency at 16×, 64 samples: `$89` 0/+1 33:31 (`$35`), 31:33 (`$33`), 32:32 (`$FA`); `$09` +1 in
+all 64 on `$35`, 12:52 on `$33`, 36:28 on `$FA`. `$85` 0 (one ±1 per line), `$8F` 0. TRX64 after
+round 2: `$89` 0 throughout, `$09` −1 on `$35` and `$FA`. A phase sweep (the CPU nudged 0–63
+cycles mid-wait) and a sweep of an extra recognition delay show: a fixed number of CPU cycles
+cannot fit 8× and 16× together; a fixed TIME of x/63 PHI2 reproduces every device outcome for
+x = 16…23 and for no other x (below: 16× keeps −1; above: `$89` goes to +1 everywhere). The
+16×/`$89` half-and-half comes out deterministically as alternate samples. Built as `div / 4` CPU
+cycles (a quarter PHI2, ~254 ns) added to the 6502's two-cycle IRQ rule at turbo; NMI unchanged
+(unmeasured).
+
+**D17 — a menu change sets the TurboEnable bit** (`d12_13.txt`): TurboEnable mode, `$D030 = 0`
+(`$FE`/`$00`, 1×), then menu CPU Speed 32 → `$D030 = $FF`, `$D031 = $8C`, 31.945×; `$D030 = 1`
+afterwards changes nothing. TRX64 left `$00`.
+
+**D18 — IO1/IO2 need a lead ~30 CPU cycles (~480 ns) longer than a CIA's** (`io12.txt`). At
+63×, 32 per block: IO1/IO2 read 1.000 up to 26 cycles per access, 1.031 at 28–32, 2.000 from 34;
+IO1 write 1.000 up to 14, 1.031 at 16–20, 2.000 from 22 (CIA: 54/64 and 44/52). At 16×: IO read
+1.031 at 4–8, 2.000 from 10; IO write 1.031 at 4–6, 2.000 from 8, 2.031 at 16. Back to back:
+1.0001 at 63× and 32×, 1.0157 at 16× (the loop's 7 cycles push one access in 64 past the lead).
+Leads at 63×: IO read 30, IO write 42 (CIA 1 and 12). **The data, against the coordinator's
+summary:** the 16× CIA read column shows the CIA read lead is 0 cycles at 16× (1.000 at 8, 1.031
+at 16, never 2.000 up to 16), so the leads scale as `floor(lead63 · div / 63)`, and an access
+issued in the cycle right after an edge goes at once; round 2's "1 cycle at every speed" for the
+read is withdrawn.
+
+**D19 — a fast access costs a fixed time, not a cycle** (`fastread.txt`). Extra over RAM, in CPU
+cycles, `LDA $D012` and `STA $D418` alike: 0 at 2×–24×, 0.02 at 32×, 0.97 at 40×, 0.56 at 47×,
+1.04 at 63×; by NOPs between accesses 0–3: 40× 0.97 / 0.66 / 0.41 / 0.05, 47× 0.56 / 0.27 /
+0.81 / 0.61, 63× 1.00–1.04, 32× 0.02. Colour-RAM writes 0 at every index. **Mechanism found in
+the data:** a grid of 64 slots per PHI2 cycle with one reserved slot. The CPU's cycles begin at
+`round(i · 64 / n)` for the menu's n MHz; a cycle that would begin on the reserved slot does not
+happen — which is exactly the speed table (n = 48 → 47, 64 → 63, every other index as labelled).
+A fast read or SID write needs two usable slots; in a cycle with one it takes the next cycle too.
+This reproduces 32× (0.02, all spacings), 47× (all four to ±0.01), 63×, ≤24× (0), and 40× at 0
+and 1 NOP; 40× at 2 and 3 NOPs gives 0.33 and 0.01 against the device's 0.41 and 0.05. Fitted:
+where the PHI2 edge falls on the grid (one constant; a family of equivalent placements fits).
+
+**D20 — `$D0BC` and the SuperCPU switches decode as measured** (`d13.txt`, `d12_13.txt`):
+`$D0BC` `$01`/`$FF` (Detect on/off), mirrored at `$D03C`, `$D07C`, `$D0FC`; `$D0BD`, `$D0BE`,
+`$D0BF`, `$D0FD` `$FF` either way (TRX64 gave `$00`). A store to `$D0FA` acts like `$D07A`
+(→ `$00`, 1×), `$D0FB` like `$D07B` (→ menu `$89`, 16×); `$D03A`, `$D0BA`, `$D03B`, `$D0BB` do
+nothing — the switches decode every `$80`, the detect register every `$40`.
+
+**D21 — badlines with the stalls on: not a per-access-kind cost** (round 2, `io_cost_filler.txt`:
+RAM read 0.0719, CIA 1 read 1.0611, `$D012` read 0.0897, `$D020` write 0.0686, against 0.0653 /
+1.0001 / 0.0818 / 0.0654 with bit 7 = 1). Each of these loops (4 × 256 × 64 accesses) lasts
+0.03–0.22 of a frame, so the badline share it meets depends on where in the frame it ran — none in
+the border, up to 43 PHI2 in 504 inside the display. The data does not separate a per-kind cost
+from that. TRX64's stall (the CPU waits out BA low on a read, as at 1 MHz) gives, for the same
+loops started at 24 places in the frame: RAM ×1.000–1.100, CIA ×1.053–1.063, `$D012` ×1.000–1.097,
+`$D020` write ×1.000–1.100 — each device value (×1.101, ×1.061, ×1.097, ×1.049) inside. Nothing
+changed in the stall model.
 
 ## As built — round 1 (D1–D8), 2026-10-03
 
@@ -226,7 +289,7 @@ routines byte for byte and run them under the new `turbomeas.prg` (command 5) an
   mode. A menu change with `$D030 = 0` leaves the state at `$00` (unmeasured).
 - **D13.** `VicII::u64_extra_write` (`$D07A`/`$D07B`, with `$D031` enabled) before the VIC;
   `u64_extra_read` gives `$D0BC = $01` with SuperCPU Detect, `$D0BD-$D0BF` stay `$00`
-  (unmeasured).
+  (unmeasured — measured in round 3 as `$FF`, D20).
 - **D14.** `Machine::u64_settings_changed` — `set_u64_turbo` calls it, and so does a model switch
   on the `u64` profile ("System Mode"); a host modelling more of the category calls it itself.
 - **D15.** `arm_u64_reset_hold` arms 2^22 PHI2 cycles on every model (NTSC unmeasured). The
@@ -248,3 +311,38 @@ settle 150 → 230 frames (D15); `turbo_as_measured_gate` item-1/6 boot settle p
 with the pre-890 build; this host was noisier than in round 1): RAM loop 1 MHz 13.7–14.1 → 12.5–14.4
 (noise); 64 MHz 0.89–0.93 → 0.95–1.06; `LDA $D012` loop at 64 MHz 0.89–0.95 → 0.81–0.90 — the
 per-cycle interrupt sample plus, now, an access-kind lookup on every I/O access.
+
+## As built — round 3 (D16–D21), 2026-10-03
+
+Tests in `turbo_as_measured_gate` (now 23): `a_raster_irq_at_turbo_is_taken_within_one_phi2_cycle`
+revised for D16, and `d17_*` … `d21_*`, all on `turbomeas.prg` and `tm2.py`'s routines with the
+`verify890` raw data.
+
+- **D16.** `turbo_irq_sync(div) = div / 4` cycles added to `interrupt_check_irq_delay`'s
+  threshold at turbo (0 at 1 MHz). Latency now: `$89` 0/+1 alternating (`$35`, `$33`), +1 (`$FA`);
+  `$09` +1 (`$35`, `$FA`), 0 (`$33`); `$85`, `$8F`, `$0F` 0. Every sample inside the device's set;
+  the device's mix inside it is not asserted. `$05` (never measured) is no longer asserted.
+- **D17.** `Machine::u64_settings_changed` sets `$D030` bit 0 in TurboEnable mode before loading
+  the menu speed.
+- **D18.** `TURBO_ACCESS_IO12` for `$DE00-$DFFF`; leads at 63× CIA 1/12, IO 30/42, scaled
+  `floor(lead · div / 63)`; an access in the cycle right after an edge goes without waiting when
+  its lead is 0. The `io12.txt` tables reproduce row for row (63× and 16×, all three columns),
+  back to back 1.0002 / 1.0002 / 1.0158. UCI at 16× now 1.0158 (device 1.0157).
+- **D19.** `turbo_short_cycles(div)` — the 64-slot grid — cached per divider on the core; a fast
+  read or SID access in a short cycle takes one more. Reproduced as stated in D19.
+- **D20.** `u64_extra_read`: `addr & $FF3F == $D03C` → `$01` with Detect; `u64_extra_write`:
+  `addr & $FF7F` = `$D07A`/`$D07B`. Measured range `$D000-$D0FF` only; above it the VIC answers.
+- **D21.** No code change; the test asserts the device values lie inside TRX64's range.
+
+**Gates revised in round 3:** `u64_turbo_gate` `the_enable_word_decides_which_registers_answer`
+— `$D07C` reads `$01`, not `$FF` (D20); `cia_alarm_check_gate` — the nine IRQ-driven `@64` digests
+re-recorded (D16), `cia2_nmi@64` and all ten `@1` unchanged; `turbo_as_measured_gate`'s round-2
+D9 and D16 tests as above. The 1 MHz IRQ histograms unchanged.
+
+**Perf** (`bench_turbo_scaling`, rings off, fast path, alternated twice against `ef907b3`): no
+change beyond noise — RAM 1 MHz 13.8–14.0 → 14.2–14.4, 64 MHz 1.04 → 1.06–1.08; `LDA $D012` 64 MHz
+0.90–0.92 → 0.91–0.92.
+
+**Open after round 3:** 40× at 2 and 3 NOPs (0.33/0.01 vs 0.41/0.05); where the PHI2 edge sits on
+the slot grid (fitted); NMI recognition at turbo (unmeasured, unchanged); the device's per-sample
+mix at 16× (TRX64 alternates deterministically); D20 above `$D0FF`; `run_prg`'s hold path.
