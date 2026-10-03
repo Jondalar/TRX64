@@ -2445,12 +2445,15 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
         // An NMI that fired two cycles before the vector fetch takes the vector over. At
         // turbo those are CPU cycles, counted by `nmi_delay_cycles` (see
         // `turbo_interrupt_cycle`); at 1 MHz the clock comparison is VICE's, unchanged.
-        let nmi_due = if self.core.turbo_div > 1 {
-            self.int.nmi_delay_cycles >= INTERRUPT_DELAY
-        } else {
-            self.core.clk >= self.int.nmi_clk + INTERRUPT_DELAY
+        // Only with an NMI pending: without one `nmi_clk` is CLOCK_MAX and the sum overflows.
+        let nmi_due = || {
+            if self.core.turbo_div > 1 {
+                self.int.nmi_delay_cycles >= INTERRUPT_DELAY
+            } else {
+                self.core.clk >= self.int.nmi_clk + INTERRUPT_DELAY
+            }
         };
-        if (self.int.global_pending_int & IK_NMI) != 0 && nmi_due {
+        if (self.int.global_pending_int & IK_NMI) != 0 && nmi_due() {
             handler_vector = 0xfffa;
             self.int.interrupt_ack_nmi();
         }

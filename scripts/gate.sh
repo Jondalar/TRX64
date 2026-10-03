@@ -97,6 +97,17 @@ else
   die_red "a trx64-daemon test FAILED" "$DLOG"
 fi
 
+# Everything above runs --release, where integer overflow wraps silently. Embedders
+# (UE2) build debug, where it panics: 0.12.2 shipped an IRQ/BRK path that added to
+# CLOCK_MAX and every debug build died on its first interrupt. One booted IRQ in a
+# debug build keeps that class out.
+OLOG=$(mktmp)
+if cargo test -p trx64-core --test irq_push_pc_probe >"$OLOG" 2>&1; then
+  green "debug interrupt path: no overflow"
+else
+  die_red "the debug-build interrupt path FAILED (overflow checks on)" "$OLOG"
+fi
+
 # ── [3/4] 7-game behavioral gate ─────────────────────────────────────────────
 printf '[3/4] 7-game behavioral gate (release, ~25s)\n'
 SNAP=$(mktmpd)
