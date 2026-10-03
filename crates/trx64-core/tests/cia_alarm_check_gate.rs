@@ -224,7 +224,15 @@ fn lockstep(label: &str, off: &mut Machine, on: &mut Machine, steps: u64) -> u64
         fnv(&mut digest, so.0);
         fnv(&mut digest, so.1);
         fnv_bytes(&mut digest, &po);
-        fnv_bytes(&mut digest, serde_json::to_string(&co).unwrap().as_bytes());
+        // The `turbo` node (turbo as measured, row 6/D7) is left out of the digest: it is
+        // pinned by `turbo_as_measured_gate`, and keeping it out is what lets the `@1`
+        // digests below stay the ones recorded before it existed — the proof that 1 MHz
+        // did not move. It is still compared between the two machines above.
+        let mut co_digest = co.clone();
+        if let Some(o) = co_digest.as_object_mut() {
+            o.remove("turbo");
+        }
+        fnv_bytes(&mut digest, serde_json::to_string(&co_digest).unwrap().as_bytes());
     }
     digest
 }
@@ -237,27 +245,41 @@ fn lockstep(label: &str, off: &mut Machine, on: &mut Machine, steps: u64) -> u64
 /// delay line, Timer A re-arms its alarm only while an interrupt is wanted and not pending
 /// (`ciacore_intta`), and TOD runs VICE's mains alarm (its reset leaves the hour at 1). The
 /// history of the previous digests (857, 7ce542a, 843, 868 §9, BUG-061, 870) is in git.
+///
+/// The ten `@64` digests re-recorded for turbo as measured (2026-10-03), the `@1` ten NOT:
+/// row 2 — the menu's 64 MHz runs 63 CPU cycles per PHI2 cycle, not 64; row 4 — the
+/// interrupt delay is counted in CPU cycles at the turbo clock, with the lines sampled at
+/// every turbo cycle, so a turbo handler is entered earlier. Every `@1` digest is the one
+/// recorded for Spec 888, byte for byte.
+///
+/// The `@64` ten re-recorded again for round 2 (same day): D9 — a CIA access is a PHI2 bus
+/// cycle at turbo, and a VIC/SID/colour-RAM read one CPU cycle dearer at 63x; D15 — the
+/// post-reset hold is 2^22 PHI2 cycles, so `booted@64` settles 220 frames instead of 120.
+/// The `@1` ten still unchanged.
+///
+/// Round 3 (D16, the IRQ line a quarter PHI2 cycle late at turbo): the nine IRQ-driven `@64`
+/// digests re-recorded; `cia2_nmi@64` (NMI, not delayed) and every `@1` unchanged.
 const GOLDEN: &[(&str, u64)] = &[
     ("ta_irq@1", 0xa246b6efb6558752),
-    ("ta_irq@64", 0xa6e3ac044229be32),
+    ("ta_irq@64", 0x633f313ce333cb45),
     ("ta_irq_timer_read@1", 0x4b70672fac9eaa9d),
-    ("ta_irq_timer_read@64", 0x5412e41946147334),
+    ("ta_irq_timer_read@64", 0xb65e679fed609885),
     ("ta_oneshot@1", 0x3b54bfe7e21b8689),
-    ("ta_oneshot@64", 0x70b482903465ea1b),
+    ("ta_oneshot@64", 0x4dacdfaf6c022813),
     ("tb_cascade_l0@1", 0x98a9131c0bae633a),
-    ("tb_cascade_l0@64", 0x356cd62384980da1),
+    ("tb_cascade_l0@64", 0x7944a192b13c0029),
     ("tb_cascade_l1@1", 0xf7adcbf78ead153a),
-    ("tb_cascade_l1@64", 0x967e0191941f78d9),
+    ("tb_cascade_l1@64", 0xc1c50c012aea6266),
     ("tb_cascade_l2@1", 0x5ed3218521a1dc17),
-    ("tb_cascade_l2@64", 0x590197231a6e0fc2),
+    ("tb_cascade_l2@64", 0xb8c0bdc7afc74a01),
     ("cia2_nmi@1", 0x1a928b753aadd799),
-    ("cia2_nmi@64", 0x660935e7e17e6a03),
+    ("cia2_nmi@64", 0x5b283234c3c0e275),
     ("tod_alarm@1", 0xde2b5ecaf5b8347c),
-    ("tod_alarm@64", 0xe64cc286c880c13d),
+    ("tod_alarm@64", 0x7078fac06f303c8c),
     ("restore_cascade@1", 0x3da6ee42bde8de72),
-    ("restore_cascade@64", 0x6a0ef7cec365a7ec),
+    ("restore_cascade@64", 0x636a6c9d7a36288e),
     ("booted@1", 0xfa6905d085cfff85),
-    ("booted@64", 0xb4ac71d7745bfa0f),
+    ("booted@64", 0x8d40cb7050cbc808),
 ];
 
 fn golden(label: &str, digest: u64, printed: &mut Vec<String>) {
@@ -329,11 +351,13 @@ fn a_booted_machine_is_deterministic_and_frozen() {
         let label = format!("booted@{speed}");
         let boot = |m: &mut Machine| {
             m.boot_from_dir(std::path::Path::new(ROM_DIR)).expect("boot ROMs");
-            // BUG-061 — after a reset the Ultimate holds its C64 at 1 MHz for 2.06 s; the
-            // 120-frame settle below outlasts it, so the `@64` workload is at 64 MHz by
-            // the time the lockstep starts.
+            // After a reset the Ultimate holds its C64 at 1 MHz for 2^22 PHI2 cycles (turbo
+            // as measured, D15) — 214 frames. `@64` settles 220 frames so its workload runs
+            // at 63x when the lockstep starts; `@1` keeps its 120 frames, and with them its
+            // Spec 888 digest.
             m.set_u64_turbo(0x00, prefer);
-            m.run_for_full(120 * FRAME, &mut NullSink, |_, _, _, _, _, _, _| {});
+            let settle = if prefer == MHZ_1 { 120 } else { 220 };
+            m.run_for_full(settle * FRAME, &mut NullSink, |_, _, _, _, _, _, _| {});
         };
         let (mut a, mut b) = (machine(prefer), machine(prefer));
         boot(&mut a);

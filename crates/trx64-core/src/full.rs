@@ -275,10 +275,11 @@ pub struct FullBus<'a> {
     pub port_active: bool,
     /// Spec 856 D2 — set by any access that is not a plain RAM or plain ROM read: IO while
     /// it is mapped, a cartridge window, the processor port, a snooped address. The turbo
-    /// fast path runs instructions back to back only while this stays clear, because an
-    /// IRQ acknowledge inside one PHI2 cycle reaches `IntStatus` through nothing but the
-    /// boundary restamp. Conservative on purpose: a false positive costs one sync, a
-    /// missed one storms every handler.
+    /// fast path runs instructions back to back only while this stays clear, because the
+    /// boundary block reads what such an access may have changed — a `$D031` speed, a DMA
+    /// arm, the banking, the port's lines. Conservative on purpose: a false positive costs
+    /// one sync. (An IRQ acknowledge no longer depends on it: the core samples the lines
+    /// at every turbo CPU cycle.)
     pub io_touched: bool,
 }
 
@@ -623,7 +624,13 @@ impl<'a> FullBus<'a> {
         // Keep the open-bus shadow for unclaimed-register reads.
         self.io[(addr as usize) - 0xd000] = value;
         match addr {
-            0xd000..=0xd3ff => self.vic.write_reg(addr as u8, value),
+            0xd000..=0xd3ff => {
+                // The Ultimate's SuperCPU speed switches at `$D07A`/`$D07B` take the store
+                // before the VIC, which has nothing there.
+                if !self.vic.u64_extra_write(addr) {
+                    self.vic.write_reg(addr as u8, value)
+                }
+            }
             0xd400..=0xd7ff => {
                 let (chip, reg) = match crate::sid::resolve_sid(self.sid_map, addr) {
                     Some(hit) => hit,

@@ -75,7 +75,10 @@ Nothing that worked stops working in a patch.
 - **Expansion port** — REU (1700/1764/1750, oversized to 16 MB), GeoRAM, and the Ultimate
   Command Interface. Devices, not cartridges: several at once, and a host can lend its own RAM.
 - **Machines** — `trx64-daemon --machine c64|u64|128`. `u64` is the Ultimate 64 / Elite II /
-  C64 Ultimate: the turbo registers, and a CPU that really runs — the firmware's own speed table, to 64 MHz.
+  C64 Ultimate: the turbo registers, and a CPU that really runs — at the speeds measured on a C64
+  Ultimate (the menu's 48 and 64 MHz run 47× and 63× PHI2), with `$D031` bit 7 turning the badline
+  stalls off, interrupts taken at the turbo clock, and I/O costing what it costs there (CIA and
+  IO1/IO2 one bus cycle each, VIC/SID/colour RAM fast).
 - **PAL and NTSC** — `--model c64-pal|c64-ntsc|c64-paln` (or `--video pal|ntsc`). A C64 model
   is a row of `crates/trx64-core/models.toml`: the VIC-II and its cycle table, the frame, the
   clock, the mains the TOD counts, the ROMs. NTSC is the 6567R8 — 65 cycles × 263 lines at

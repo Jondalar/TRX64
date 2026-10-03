@@ -199,6 +199,26 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
         self.fb.vic.turbo_div = div;
     }
 
+    /// CIA 1, CIA 2, IO1 and IO2 are bus cycles to a turbo CPU; the VIC, SID and colour
+    /// RAM are fast; everything else is memory. Only where I/O is mapped.
+    #[inline]
+    fn turbo_access_kind(&self, addr: u16) -> u8 {
+        use crate::c64_6510core::{
+            TURBO_ACCESS_BUS, TURBO_ACCESS_FAST, TURBO_ACCESS_IO12, TURBO_ACCESS_MEMORY, TURBO_ACCESS_SID,
+        };
+        if !(0xd000..=0xdfff).contains(&addr) || !self.fb.config.io {
+            TURBO_ACCESS_MEMORY
+        } else if addr >= 0xde00 {
+            TURBO_ACCESS_IO12
+        } else if addr >= 0xdc00 {
+            TURBO_ACCESS_BUS
+        } else if (0xd400..0xd800).contains(&addr) {
+            TURBO_ACCESS_SID
+        } else {
+            TURBO_ACCESS_FAST
+        }
+    }
+
     #[inline]
     fn read_raw(&mut self, addr: u16) -> u8 {
         self.sync_clk();

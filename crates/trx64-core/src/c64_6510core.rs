@@ -423,14 +423,30 @@ fn interrupt_check_nmi_delay(cs: &IntStatus, _cpu_clk: u64) -> bool {
     cs.nmi_delay_cycles >= delay_cycles
 }
 
+/// The C64 Ultimate's IRQ line reaches a turbo CPU a quarter of a PHI2 cycle late, in CPU
+/// cycles of the divider (0 at 1 MHz, so VICE's rule there is untouched): Spec 890 D16.
+///
+/// Measured with `turbomeas.prg`'s raster-IRQ latency (device round 3, `irq.txt`): at 16x
+/// the handler's first CIA read lands 0 or +1 PHI2 cycles after a polling loop's — +1 in
+/// every sample on line `$35` with the badline stalls on — while 8x and 63x stay at 0.
+/// The 6502's two-cycle rule alone gives 0 or −1 at 16x (−1 in every sample on `$35`
+/// with the stalls on). An extra delay of `x/63` of a PHI2 cycle reproduces the device for
+/// `x` from 16 to 23 and for no other value — below, 16x keeps its −1; above, `$89` goes to
+/// +1 in every sample — and no fixed CPU-cycle count fits 8x and 16x together. A quarter
+/// PHI2 cycle (~254 ns) is inside that range.
+#[inline]
+fn turbo_irq_sync(div: u32) -> u64 {
+    u64::from(div / 4)
+}
+
 /// PORT OF: vice/src/mainc64cpu.c:690-710 interrupt_check_irq_delay.
 /// A taken-no-page-cross branch (DELAYS_INTERRUPT) bumps the threshold by one.
 /// If irq_delay_cycles >= threshold: take the IRQ UNLESS the last opcode
 /// ENABLES_IRQ (an I-clearing CLI/PLP), in which case defer one instruction by
 /// latching IK_IRQPEND. This MUTATES the int status.
 #[inline]
-fn interrupt_check_irq_delay(cs: &mut IntStatus, _cpu_clk: u64) -> bool {
-    let mut delay_cycles: u64 = INTERRUPT_DELAY;
+fn interrupt_check_irq_delay(cs: &mut IntStatus, _cpu_clk: u64, turbo_extra: u64) -> bool {
+    let mut delay_cycles: u64 = INTERRUPT_DELAY + turbo_extra;
     if opinfo_delays_interrupt(cs.last_opcode_info) != 0 {
         delay_cycles += 1;
     }
@@ -452,6 +468,68 @@ fn interrupt_check_irq_delay(cs: &mut IntStatus, _cpu_clk: u64) -> bool {
 // interrupt_delay() + vicii_cycle() (c64cpusc.c:47-51). Those become methods on
 // the bus trait so lib.rs implements them over its existing bus + VIC + CIAs.
 // =============================================================================
+
+/// [`C64Core6510Bus::turbo_access_kind`]: RAM / ROM.
+pub const TURBO_ACCESS_MEMORY: u8 = 0;
+/// [`C64Core6510Bus::turbo_access_kind`]: CIA 1, CIA 2, IO1, IO2 — one PHI2 bus cycle.
+pub const TURBO_ACCESS_BUS: u8 = 1;
+/// [`C64Core6510Bus::turbo_access_kind`]: VIC, colour RAM — inside the FPGA, fast.
+pub const TURBO_ACCESS_FAST: u8 = 2;
+/// [`C64Core6510Bus::turbo_access_kind`]: SID — fast, but a write costs what a read does.
+pub const TURBO_ACCESS_SID: u8 = 3;
+/// [`C64Core6510Bus::turbo_access_kind`]: IO1 / IO2 (`$DE00-$DFFF`) — a bus cycle with a
+/// longer lead than a CIA's.
+pub const TURBO_ACCESS_IO12: u8 = 4;
+
+/// The C64 Ultimate's turbo clock as a grid of 64 slots per PHI2 cycle, slot 1 reserved —
+/// the model that reproduces both its speed table and its fast-I/O cost (Spec 890 D19).
+///
+/// The CPU's cycles begin at slots `round(i * 64 / n)` for the menu's `n` MHz. A cycle that
+/// would begin on the reserved slot does not happen, which is why the menu's 48 and 64 run
+/// 47 and 63 cycles per PHI2 cycle and every other index runs as labelled. A fast I/O read
+/// (VIC, SID, colour RAM, `$D031`) and a SID write take two usable slots: in a cycle with
+/// only one, they take the next cycle too. That is every cycle at 63x, one in 32 at 32x,
+/// none at 24x and below, and a pattern at 40x and 47x that the access's phase decides.
+///
+/// Returns bit `p` set for each turbo phase `p` (`0` = the cycle right after the PHI2 edge)
+/// whose cycle has fewer than two usable slots. Where the edge falls on the grid is the one
+/// fitted constant (`EDGE_SLOT`): the device's data fixes it only up to a family of
+/// equivalent placements, of which this is one.
+pub fn turbo_short_cycles(div: u32) -> u64 {
+    const SLOTS: u32 = 64;
+    const RESERVED: u32 = 1;
+    const EDGE_SLOT: u32 = 56;
+    if div <= 1 || div > 64 {
+        return 0;
+    }
+    // The menu label whose grid gives `div` cycles: itself, or one more when its grid
+    // loses the reserved slot (48 -> 47, 64 -> 63).
+    let starts = |n: u32| -> Vec<u32> {
+        let mut v: Vec<u32> = (0..n).map(|i| (2 * i * SLOTS + n) / (2 * n)).collect();
+        v.retain(|&s| s != RESERVED);
+        v
+    };
+    let mut e = starts(div);
+    if e.len() as u32 != div {
+        e = starts(div + 1);
+        if e.len() as u32 != div {
+            return 0; // a table this grid does not produce (the first-generation U64)
+        }
+    }
+    let n = e.len();
+    let usable = |i: usize| -> u32 {
+        let (a, b) = (e[i], if i + 1 == n { e[0] + SLOTS } else { e[i + 1] });
+        (a..b).filter(|&s| s % SLOTS != RESERVED).count() as u32
+    };
+    let p0 = (0..n).min_by_key(|&i| (e[i] + SLOTS - EDGE_SLOT) % SLOTS).unwrap_or(0);
+    let mut mask = 0u64;
+    for p in 0..n {
+        if usable((p0 + p) % n) < 2 {
+            mask |= 1 << p;
+        }
+    }
+    mask
+}
 
 /// Bus + VIC + interrupt hook surface the C64 SC core executes against.
 ///
@@ -477,6 +555,18 @@ pub trait C64Core6510Bus {
     fn set_turbo_phase(&mut self, _phase: u32, _div: u32) {}
 
     fn read_raw(&mut self, addr: u16) -> u8;
+
+    /// What an access to `addr` costs a turbo CPU, as measured on a C64 Ultimate:
+    /// [`TURBO_ACCESS_MEMORY`] (RAM, ROM — the turbo clock), [`TURBO_ACCESS_BUS`] (CIA 1/2,
+    /// a PHI2 bus cycle), [`TURBO_ACCESS_IO12`] (IO1/IO2 — a bus cycle with a longer lead),
+    /// [`TURBO_ACCESS_FAST`] (VIC, colour RAM — the turbo clock; a read needs two usable
+    /// slots, see [`turbo_short_cycles`]) or [`TURBO_ACCESS_SID`] (as fast, its writes
+    /// too). Asked only while the divider is above one. Default: memory,
+    /// which is every bus but the full machine's.
+    #[inline]
+    fn turbo_access_kind(&self, _addr: u16) -> u8 {
+        TURBO_ACCESS_MEMORY
+    }
     /// PORT OF: mainc64cpu.c:372-380 STORE (raw write tab). reu_dma($ff00) hook
     /// is folded into the implementor.
     fn write_raw(&mut self, addr: u16, value: u8);
@@ -659,9 +749,14 @@ pub struct C64Core6510 {
     /// does not take hold until the cycle it was written in has finished, which is what
     /// lets UPic's resync pair cost nothing.
     pub pending_turbo_div: u32,
-    /// Spec 851 — badline timing: with it the CPU waits out a BA stall like a 6510; without
-    /// it a turbo CPU runs through.
+    /// The Ultimate's badline stalls: with them the CPU waits out a BA stall like a 6510;
+    /// without them it runs through — at every speed, 1 MHz included (`$D031 = $80`
+    /// measured 1.00 with the display on against 0.945 for `$00`). True on every machine
+    /// that is not a U64.
     pub turbo_badline: bool,
+    /// [`turbo_short_cycles`] for the divider in `turbo_short_for` — a cache, not state.
+    pub turbo_short: u64,
+    pub turbo_short_for: u32,
 }
 
 impl Default for C64Core6510 {
@@ -694,6 +789,8 @@ impl C64Core6510 {
             turbo_phase: 0,
             pending_turbo_div: 1,
             turbo_badline: true,
+            turbo_short: 0,
+            turbo_short_for: 0,
         }
     }
 
@@ -828,8 +925,7 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
     #[inline]
     fn clk_inc(&mut self) {
         // Spec 851 D3 — `turbomaster_clk_inc`: below the divider this CPU cycle is not a
-        // PHI2 cycle — no alarms, no line samples, no clk, no VIC tick. The interrupt delay
-        // stays counted in PHI2 cycles, as in VICE's TurboMaster.
+        // PHI2 cycle — no alarms, no clk, no VIC tick.
         if self.core.turbo_div > 1 {
             self.core.turbo_phase += 1;
             if self.core.turbo_phase < self.core.turbo_div {
@@ -837,6 +933,7 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
                 // simply never passed on. A chip that can see finer than PHI2 (the VIC's
                 // colour registers) needs it at the moment of the store, not afterwards.
                 self.bus.set_turbo_phase(self.core.turbo_phase, self.core.turbo_div);
+                self.turbo_interrupt_cycle();
                 return;
             }
             self.core.turbo_phase = 0;
@@ -875,6 +972,38 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
         self.bus.vic_cycle(c);
     }
 
+    /// The interrupt half of a CPU cycle that is not a PHI2 cycle. Measured on a C64
+    /// Ultimate, a raster IRQ at 8, 16 and 64 MHz is taken within less than one PHI2
+    /// cycle of the raster event — badline stalls on or off — where a delay counted in
+    /// PHI2 cycles (VICE's TurboMaster, which 851 followed) shows two. So the 6502's own
+    /// rule runs at the turbo clock: the lines are sampled at every CPU cycle and the
+    /// delay counters advance per CPU cycle, so an IRQ or NMI is taken at the first
+    /// instruction end at least two CPU cycles after it fired.
+    ///
+    /// The lines can only change here through an access this cycle — an acknowledge
+    /// (`$DC0D` read, `$D019` write), an enable (`$D01A`), an expansion register — because
+    /// the VIC ticks and the CIA alarms fall on PHI2 edges, where `clk_inc` samples them as
+    /// it always did. Each sample is stamped with `clk`, the PHI2 cycle it falls in: an I/O
+    /// access is synchronised to PHI2 and sees that cycle's chip state.
+    ///
+    /// Never runs at a divider of 1: every CPU cycle is then a PHI2 edge.
+    #[inline]
+    fn turbo_interrupt_cycle(&mut self) {
+        let clk = self.core.clk;
+        self.bus.drain_cia_int(self.int);
+        self.int.set_irq(INT_SRC_VIC, self.bus.vic_irq_line(), clk);
+        if self.bus.expansion_active() {
+            self.int.set_irq(INT_SRC_EXPANSION, self.bus.expansion_irq_line(), clk);
+            self.int.set_nmi(INT_SRC_EXPANSION, self.bus.expansion_nmi_line(), clk);
+        }
+        if self.int.irq_clk <= clk {
+            self.int.irq_delay_cycles += 1;
+        }
+        if self.int.nmi_clk <= clk {
+            self.int.nmi_delay_cycles += 1;
+        }
+    }
+
     /// PORT OF: mainc64cpu.c:194-208 check_ba — steal VIC cycles if BA low. The
     /// implementor advances clk + ticks the VIC for each stolen cycle and
     /// applies the SH*/CLI ENABLES_IRQ steal-signal; it returns the count so we
@@ -883,8 +1012,8 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
     /// LOAD_CHECK_BA_LOW context for SH*.
     #[inline]
     fn check_ba(&mut self) {
-        // Spec 851 — without badline timing a turbo CPU does not wait for the VIC.
-        if self.core.turbo_div > 1 && !self.core.turbo_badline {
+        // An Ultimate with the badline stalls off does not wait for the VIC, at any speed.
+        if !self.core.turbo_badline {
             return;
         }
         let mut loi = self.core.last_opcode_info;
@@ -897,7 +1026,7 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
     /// by the SH* stores so maincpu_steal_cycles can set ENABLES_IRQ on a steal.
     #[inline]
     fn check_ba_low(&mut self) {
-        if self.core.turbo_div > 1 && !self.core.turbo_badline {
+        if !self.core.turbo_badline {
             return;
         }
         let mut loi = self.core.last_opcode_info;
@@ -908,10 +1037,78 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
     }
 
     // -------------------------------------------------------------------------
+    // What an access costs a turbo CPU — measured on a C64 Ultimate (firmware 3.15,
+    // core 1.50), loops of `LDA abs` / `STA abs` timed in PHI2 ticks:
+    //   - RAM and ROM run at the turbo clock (0.065 PHI2 per `LDA abs` at 63x);
+    //   - CIA 1/2 and IO1/IO2 are bus cycles: one PHI2 cycle per access back to back. The
+    //     access happens in the cycle right after a PHI2 edge (a fast store placed after a
+    //     CIA read sits at a fixed phase there, within a CPU cycle) and has to be issued at
+    //     least a lead before it. At 63x: CIA read 1 cycle, CIA write 12, IO1/IO2 read 30,
+    //     IO1/IO2 write 42 — IO1/IO2 about 30 cycles (~480 ns) earlier than a CIA, reads and
+    //     writes alike. The leads are times: at another divider `floor(lead63 * div / 63)`,
+    //     which is what the 16x and 32x measurements give (CIA 0 / 3, IO 7 / 10 at 16x);
+    //   - VIC, SID and colour RAM are fast: writes cost as RAM, except SID's; a read and a
+    //     SID write need two usable slots of the 64-slot grid (`turbo_short_cycles`).
+    // A write resumes at the same edge a read completes at: the measurement fixes the
+    // leads, not where inside the edge's cycle a write ends. Never runs at a divider of 1.
+    // -------------------------------------------------------------------------
+
+    /// Hold the CPU until its access to `a` may happen, at turbo. See above.
+    #[inline(never)]
+    fn turbo_access_wait(&mut self, a: u16, write: bool) {
+        let kind = self.bus.turbo_access_kind(a);
+        let lead63 = match (kind, write) {
+            (TURBO_ACCESS_BUS, false) => 1,
+            (TURBO_ACCESS_BUS, true) => 12,
+            (TURBO_ACCESS_IO12, false) => 30,
+            (TURBO_ACCESS_IO12, true) => 42,
+            (TURBO_ACCESS_FAST, false) | (TURBO_ACCESS_SID, _) => {
+                let div = self.core.turbo_div;
+                if self.core.turbo_short_for != div {
+                    self.core.turbo_short = turbo_short_cycles(div);
+                    self.core.turbo_short_for = div;
+                }
+                if self.core.turbo_short & (1 << self.core.turbo_phase) != 0 {
+                    self.clk_inc();
+                }
+                return;
+            }
+            _ => return,
+        };
+        let div = self.core.turbo_div;
+        let lead = lead63 * div / 63;
+        // Cycles to the next cycle in which a bus access can happen — this one, if it is
+        // the cycle right after an edge — and on to the next edge while the lead does not fit.
+        let p = self.core.turbo_phase;
+        let mut wait = if p == 0 { 0 } else { div - p };
+        while wait < lead {
+            wait += div;
+        }
+        for _ in 0..wait {
+            self.clk_inc();
+        }
+    }
+
+    #[inline]
+    fn turbo_read(&mut self, a: u16) {
+        if self.core.turbo_div > 1 {
+            self.turbo_access_wait(a, false);
+        }
+    }
+
+    #[inline]
+    fn turbo_write(&mut self, a: u16) {
+        if self.core.turbo_div > 1 {
+            self.turbo_access_wait(a, true);
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // LOAD / STORE families (mainc64cpu.c:359-446). Each runs check_ba() first.
     // -------------------------------------------------------------------------
     #[inline]
     fn load(&mut self, a: u16) -> u8 {
+        self.turbo_read(a);
         self.check_ba();
         self.bus.read_raw(a)
     }
@@ -920,33 +1117,39 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
     /// tracing implementor tags it as a FETCH (not emitted as a data-bus record).
     #[inline]
     fn load_fetch(&mut self, a: u16) -> u8 {
+        self.turbo_read(a);
         self.check_ba();
         self.bus.read_raw_fetch(a)
     }
     #[inline]
     fn load_dummy(&mut self, a: u16) -> u8 {
+        self.turbo_read(a);
         self.check_ba();
         self.bus.read_raw_dummy(a)
     }
     /// LOAD_CHECK_BA_LOW (m64:400-405): check_ba_low=1; read; check_ba_low=0.
     #[inline]
     fn load_check_ba_low(&mut self, a: u16) -> u8 {
+        self.turbo_read(a);
         self.check_ba_low();
         self.bus.read_raw(a)
     }
     /// LOAD_CHECK_BA_LOW_DUMMY (m64:407-412).
     #[inline]
     fn load_check_ba_low_dummy(&mut self, a: u16) -> u8 {
+        self.turbo_read(a);
         self.check_ba_low();
         self.bus.read_raw_dummy(a)
     }
     #[inline]
     fn store(&mut self, a: u16, v: u8) {
         // STORE (m64:372-379): no check_ba on writes (write tab direct).
+        self.turbo_write(a);
         self.bus.write_raw(a, v);
     }
     #[inline]
     fn store_dummy(&mut self, a: u16, v: u8) {
+        self.turbo_write(a);
         self.bus.write_raw_dummy(a, v);
     }
     #[inline]
@@ -2239,9 +2442,15 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
         self.clk_inc();
         // Process alarms up to this point to get nmi_clk updated.
         self.process_alarms();
-        if (self.int.global_pending_int & IK_NMI) != 0
-            && (self.core.clk >= self.int.nmi_clk + INTERRUPT_DELAY)
-        {
+        // An NMI that fired two cycles before the vector fetch takes the vector over. At
+        // turbo those are CPU cycles, counted by `nmi_delay_cycles` (see
+        // `turbo_interrupt_cycle`); at 1 MHz the clock comparison is VICE's, unchanged.
+        let nmi_due = if self.core.turbo_div > 1 {
+            self.int.nmi_delay_cycles >= INTERRUPT_DELAY
+        } else {
+            self.core.clk >= self.int.nmi_clk + INTERRUPT_DELAY
+        };
+        if (self.int.global_pending_int & IK_NMI) != 0 && nmi_due {
             handler_vector = 0xfffa;
             self.int.interrupt_ack_nmi();
         }
@@ -2301,7 +2510,7 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
                 let irq_gate = (ik & (IK_IRQ | IK_IRQPEND)) != 0
                     && (!self.local_interrupt()
                         || opinfo_disables_irq(self.core.last_opcode_info) != 0);
-                let irq_now = irq_gate && interrupt_check_irq_delay(self.int, clk);
+                let irq_now = irq_gate && interrupt_check_irq_delay(self.int, clk, turbo_irq_sync(self.core.turbo_div));
                 if irq_now {
                     // Observability: fire BEFORE the ack + DO_IRQBRK entry,
                     // vector $FFFE (= cpu65xx-vice.ts:666

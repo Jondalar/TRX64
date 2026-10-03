@@ -1,9 +1,11 @@
-//! BUG-061 — the Ultimate holds its C64 at 1 MHz for 2.06 s after a reset.
+//! BUG-061 — the Ultimate holds its C64 at 1 MHz after a reset.
 //!
 //! Measured on the owner's C64 Ultimate (firmware 3.15):
 //!
-//!   - after `machine:reset` the machine stays at 1 MHz for 2.06 s, at 16 MHz and at
-//!     64 MHz alike, stable over three runs each;
+//!   - after `machine:reset` the machine stays at 1 MHz for exactly 2^22 = 4,194,304 PHI2
+//!     cycles (4.257 s) from the CPU's first instruction, at 16 MHz and at 64 MHz alike,
+//!     within 80 cycles over five runs (turbo as measured, round 2; BUG-061 first measured
+//!     2.06 s from the host side, a figure no reset path matches);
 //!   - the firmware strobes the speed 445 cycles after reset release (`C64::reset()` →
 //!     `effectuate_settings()` → `setCpuSpeed`), so a strobe inside the hold has no
 //!     effect, and when the hold ends the last strobed speed applies;
@@ -23,6 +25,8 @@ const ROM_DIR: &str =
 const SECOND: u64 = 985_248;
 /// What the firmware does right after reset release.
 const STROBE_AFTER_RELEASE: u64 = 445;
+/// The post-reset hold, in PHI2 cycles.
+const HOLD: u64 = 1 << 22;
 
 fn u64_pal() -> Machine {
     let mut m = Machine::new();
@@ -32,8 +36,8 @@ fn u64_pal() -> Machine {
 }
 
 fn speed_byte(mhz: u32) -> u8 {
-    let idx = (0..16u8).find(|&i| U64SpeedTable::U64II.mhz(i) == mhz).expect("in table");
-    0x80 | idx // bit 7 = badline timing on, as the menu writes it
+    let idx = (0..16u8).find(|&i| U64SpeedTable::U64II.menu_mhz(i) == mhz).expect("in table");
+    0x80 | idx // the menu's speed byte: bit 7 = Badline Timing Enabled
 }
 
 fn run(m: &mut Machine, cycles: u64) {
@@ -63,7 +67,11 @@ fn a_strobe_right_after_reset_does_not_speed_the_c64_up() {
 fn when_the_hold_ends_the_last_strobe_applies_without_another() {
     let mut m = u64_pal();
     reset_like_the_firmware(&mut m, 64);
-    run(&mut m, SECOND * 2 + SECOND / 10); // 2.1 s: past the 2.06 s hold
+    // A run ends on an instruction boundary, a few cycles past its budget.
+    run(&mut m, HOLD - STROBE_AFTER_RELEASE - 100);
+    m.sync_turbo_from_vic();
+    assert_eq!(m.c64_core.pending_turbo_div, 1, "100 PHI2 cycles before the hold ends: still held");
+    run(&mut m, 200); // past the 2^22-cycle hold
     assert!(m.c64_core.turbo_div > 1, "the strobe made 445 cycles after release now applies");
 }
 
@@ -71,7 +79,7 @@ fn when_the_hold_ends_the_last_strobe_applies_without_another() {
 fn without_a_reset_a_strobe_applies_at_once() {
     let mut m = u64_pal();
     reset_like_the_firmware(&mut m, 1);
-    run(&mut m, SECOND * 3); // well past the hold, running at 1 MHz
+    run(&mut m, SECOND * 5); // well past the hold, running at 1 MHz
     m.set_u64_turbo(0x00, speed_byte(64));
     run(&mut m, 64);
     assert!(m.c64_core.turbo_div > 1, "a change while running is not held");

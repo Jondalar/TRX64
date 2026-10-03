@@ -14,12 +14,22 @@ use trx64_core::vic::{SubCycleColour, VicII};
 use trx64_core::vic::{SpeedProfile, U64SpeedTable};
 use trx64_core::NullSink;
 
-/// §8.1 — the mapping from sub-cycle phase to pixel, with no slack in it.
+/// §8.1 — the mapping from sub-cycle phase to pixel.
+///
+/// Revised for turbo as measured, round 2 (D10): on a C64 Ultimate at 63x the pixel grid's
+/// boundaries sit at ~-0.9, 7.0 and 14.9 CPU cycles after the PHI2 edge — an eighth of a
+/// pixel ahead of `8 * phase / div`, which put the first at 7.9. So phase 7 at a divider
+/// of 64 is the second pixel now, where this test said "still inside the first".
 #[test]
 fn a_phase_names_the_pixel_it_belongs_to() {
-    // 64 MHz: 64 CPU cycles per PHI2 cycle, 8 per pixel. UPic spends exactly 8 per pixel.
+    // The measured case: 63 CPU cycles per PHI2 cycle, 7.875 per pixel.
+    let at63: Vec<usize> = [6u32, 8, 14, 15].iter().map(|&c| SubCycleColour::pixel_for(c, 63)).collect();
+    assert_eq!(at63, vec![0, 1, 1, 2], "a store 6 cycles after the edge paints pixel 0, 8-14 pixel 1, 15 pixel 2");
+    assert_eq!(SubCycleColour::pixel_for(62, 63), 7);
+    // 64 per PHI2, 8 per pixel.
     assert_eq!(SubCycleColour::pixel_for(0, 64), 0);
-    assert_eq!(SubCycleColour::pixel_for(7, 64), 0, "still inside the first pixel");
+    assert_eq!(SubCycleColour::pixel_for(6, 64), 0, "still inside the first pixel");
+    assert_eq!(SubCycleColour::pixel_for(7, 64), 1, "an eighth of a pixel early: the second");
     assert_eq!(SubCycleColour::pixel_for(8, 64), 1, "the ninth cycle is the second pixel");
     assert_eq!(SubCycleColour::pixel_for(56, 64), 7);
     assert_eq!(SubCycleColour::pixel_for(63, 64), 7, "the last phase is the last pixel");
@@ -66,7 +76,7 @@ fn eight_stores_in_one_cycle_are_eight_pixels() {
         vic.write_reg(0x20, (pixel as u8) + 1);
     }
 
-    let sc = vic.subcycle_colour.expect("a turbo U64 writing $D020 arms the slots");
+    let sc = vic.subcycle_colour.get(0x20).expect("a turbo U64 writing $D020 arms the slots");
     assert_eq!(sc.reg, 0x20);
     assert_eq!(sc.slots, [1, 2, 3, 4, 5, 6, 7, 8]);
     assert_eq!(
@@ -88,7 +98,7 @@ fn a_one_mhz_machine_never_arms_it() {
     for v in 0..8u8 {
         vic.write_reg(0x20, v);
     }
-    assert!(vic.subcycle_colour.is_none(), "a 6510 cannot write twice in a cycle");
+    assert_eq!(vic.subcycle_colour.mask, 0, "a 6510 cannot write twice in a cycle");
     assert_eq!(vic.colour_register(0x20), 7);
 }
 
@@ -101,24 +111,28 @@ fn both_halves_of_the_gate_are_needed() {
     u64_at_1mhz.speed_profile = SpeedProfile::U64;
     u64_at_1mhz.turbo_div = 1;
     u64_at_1mhz.write_reg(0x20, 0x05);
-    assert!(u64_at_1mhz.subcycle_colour.is_none(), "a U64 not in turbo draws like a C64");
+    assert_eq!(u64_at_1mhz.subcycle_colour.mask, 0, "a U64 not in turbo draws like a C64");
 
     let mut c64_with_divider = VicII::new();
     c64_with_divider.speed_profile = SpeedProfile::C64;
     c64_with_divider.turbo_div = 64;
     c64_with_divider.write_reg(0x20, 0x05);
-    assert!(
-        c64_with_divider.subcycle_colour.is_none(),
+    assert_eq!(
+        c64_with_divider.subcycle_colour.mask, 0,
         "the profile decides, so a stray divider cannot reach the resolve"
     );
 }
 
-/// Only the colour registers. `$D011`/`$D016`/`$D018` change what the display logic DOES,
-/// and a sub-cycle write to one of those would need the whole draw sequence at sub-cycle
-/// granularity — a different and much larger machine. The boundary is in the code as a
-/// comment; this is it as a test.
+/// Only the colour registers — all of them, `$D020` to `$D02E`. `$D011`/`$D016`/`$D018`
+/// change what the display logic DOES, and a sub-cycle write to one of those would need
+/// the whole draw sequence at sub-cycle granularity — a different and much larger machine.
+///
+/// Revised for turbo as measured (decision D8): this test said "nothing but `$D020` arms
+/// the slots in this release", with `$D021` named "second, not never". Background,
+/// multicolour and sprite colours are resolved by the draw exactly as the border is, so
+/// they now get the same placement.
 #[test]
-fn only_the_border_colour_is_sub_cycle_today() {
+fn only_the_colour_registers_are_sub_cycle() {
     let mut vic = VicII::new();
     vic.speed_profile = SpeedProfile::U64;
     vic.turbo_div = 64;
@@ -127,14 +141,33 @@ fn only_the_border_colour_is_sub_cycle_today() {
     vic.write_reg(0x11, 0x1b); // display control
     vic.write_reg(0x16, 0x08);
     vic.write_reg(0x18, 0x14);
-    vic.write_reg(0x21, 0x06); // background — §6 says second, not never
-    assert!(
-        vic.subcycle_colour.is_none(),
-        "nothing but $D020 arms the slots in this release"
-    );
+    assert_eq!(vic.subcycle_colour.mask, 0, "the display logic's registers never arm the slots");
 
-    vic.write_reg(0x20, 0x02);
-    assert!(vic.subcycle_colour.is_some());
+    for reg in 0x20u8..=0x2e {
+        vic.write_reg(reg, reg & 0x0f);
+        let sc = vic.subcycle_colour.get(reg).expect("every colour register arms its own slots");
+        assert_eq!(sc.slots, [0, 0, 0, 0, reg & 0x0f, reg & 0x0f, reg & 0x0f, reg & 0x0f], "${:04X}", 0xd000 + u16::from(reg));
+    }
+    assert_eq!(vic.subcycle_colour.mask, 0x7fff, "fifteen registers, fifteen sets of slots");
+}
+
+/// Decision D8 — a colour store to each of `$D021`-`$D02E` in a turbo cycle lands at its
+/// pixel: eight stores in one PHI2 cycle are that register's eight pixels, and the
+/// register itself holds the last one.
+#[test]
+fn eight_stores_to_any_colour_register_are_eight_pixels() {
+    for reg in 0x21u8..=0x2e {
+        let mut vic = VicII::new();
+        vic.speed_profile = SpeedProfile::U64;
+        vic.turbo_div = 63; // index 15 as measured
+        for pixel in 0..8u32 {
+            vic.turbo_phase = pixel * 63 / 8 + 1;
+            vic.write_reg(reg, (pixel as u8) + 1);
+        }
+        let sc = vic.subcycle_colour.get(reg).expect("armed");
+        assert_eq!(sc.slots, [1, 2, 3, 4, 5, 6, 7, 8], "${:04X}", 0xd000 + u16::from(reg));
+        assert_eq!(vic.colour_register(reg), 8, "${:04X} holds the last write", 0xd000 + u16::from(reg));
+    }
 }
 
 // ── The resync ───────────────────────────────────────────────────────

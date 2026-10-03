@@ -187,10 +187,10 @@ obs cap_off when exec $4100 do trace off              # stop at $4100
 | `warp on\|off` | 8× pacing / real time at the model's frame rate |
 | `power on\|off` | power the machine on (full init) or off |
 | `rawframe on\|off` | stepping onto an anchor redraws its picture; `on` keeps the first, seamed frame so a one-frame event stays visible |
-| `turbo` | which machine this session claims to be (`c64`, `128`, `u64`) and the speed that is set |
+| `turbo` | which machine this session claims to be (`c64`, `128`, `u64`) and the speed that is set — on `u64` the index, the menu's MHz, what it runs (× PHI2) and whether the badline stalls are on |
 | `turbo mode c64\|128\|u64` | `c64`: `$D02F-$D03F` open bus. `128`: the VIC-IIe `$D02F`/`$D030` pair. `u64`: the speed register at `$D031`. Survives a reset |
-| `turbo on\|off` | set / clear the speed bit (`$D030` bit 0, or `$D031`) |
-| `turbo speed $NN` | the `$D031` value (u64). On `u64` the CPU runs at the clock it selects from the speed table; on `128` the bit is stored and the CPU stays at 1 MHz |
+| `turbo on\|off` | set / clear the speed bit (`$D030` bit 0, or on `u64` `$D031` = `$03` / `$00`: 4 MHz / 1 MHz, badline stalls on) |
+| `turbo speed $NN` | write `$NN` to `$D031` (u64), as a program would: bits 0-3 the speed index, bit 7 set = no badline stalls. On `128` the bit is stored and the CPU stays at 1 MHz |
 
 ### Expansion port  (read-only — these report, they never change the device)
 | command | what it does |

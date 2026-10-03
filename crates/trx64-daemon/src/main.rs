@@ -3886,10 +3886,19 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                         m.vic.read_reg(0x2f),
                         m.vic.read_reg(0x30),
                     )),
-                    SpeedProfile::U64 => out.push_str(&format!(
-                        "\n  $D031=${:02X}, $D030 open bus",
-                        m.vic.read_reg(0x31),
-                    )),
+                    SpeedProfile::U64 => {
+                        let (index, stalls) = m.vic.u64_speed();
+                        let table = m.vic.u64_speed_table;
+                        out.push_str(&format!(
+                            "\n  $D031=${:02X} $D030=${:02X}  index {index} (menu {} MHz, runs {}x PHI2), \
+                             badline stalls {}",
+                            m.vic.read_reg(0x31),
+                            m.vic.read_reg(0x30),
+                            table.menu_mhz(index),
+                            table.cycles_per_phi2(index),
+                            if stalls { "on" } else { "off" },
+                        ));
+                    }
                 }
                 if m.turbo_engaged() {
                     out.push_str(if p == SpeedProfile::U64 {
@@ -3933,9 +3942,10 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                             Ok(report(m))
                         }
                         SpeedProfile::U64 => {
-                            // Spec 851 — 4 MHz with badline timing: the speed bit now really
-                            // runs the CPU faster, so `on` picks one that stays real-time.
-                            let v = if on { 0x83 } else { 0x80 };
+                            // 4 MHz with the badline stalls (`$D031` bit 7 clear), `off` 1 MHz
+                            // with them — a C64's timing. The speed bit really runs the CPU
+                            // faster, so `on` picks one that stays real-time.
+                            let v = if on { 0x03 } else { 0x00 };
                             m.vic.write_reg(0x31, v);
                             Ok(report(m))
                         }
@@ -7894,7 +7904,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                         "session/turbo: this session claims to be a plain C64, where the speed \
                          register does not exist — set mode to 128 or u64 first"),
                     SpeedProfile::C128 => st.session.machine.vic.write_reg(0x30, u8::from(on)),
-                    SpeedProfile::U64 => st.session.machine.vic.write_reg(0x31, if on { 0x83 } else { 0x80 }),
+                    SpeedProfile::U64 => st.session.machine.vic.write_reg(0x31, if on { 0x03 } else { 0x00 }),
                 }
             }
             if let Some(sp) = req.params.get("speed").and_then(|v| v.as_u64()) {
@@ -16594,6 +16604,15 @@ fn undump_native_snapshot(st: &mut State, path: &str) -> Result<UndumpResult, St
         });
     }
 
+    // Spec 851 — the dump says which machine it was. The claim goes in BEFORE the
+    // restore, because the restore reads it: a `u64` puts back its turbo state and its
+    // divider, and an older `u64` dump without a turbo node is noted. Only the claim is
+    // set — the restored VIC registers stay as restored.
+    let dump_profile = machine_profile_from_model(&read.manifest.machine.model);
+    if let Some(p) = dump_profile {
+        st.speed_profile = p;
+        st.session.machine.vic.speed_profile = p;
+    }
     trx64_core::c64re_snapshot::restore_runtime_checkpoint(
         &mut st.session.machine,
         &read.checkpoint,
@@ -16653,13 +16672,9 @@ fn undump_native_snapshot(st: &mut State, path: &str) -> Result<UndumpResult, St
         }
     }
 
-    // Spec 851 — the dump says which machine it was. Only the claim is set: the restored
-    // VIC registers stay as restored.
-    if let Some(p) = machine_profile_from_model(&read.manifest.machine.model) {
-        st.speed_profile = p;
-        st.session.machine.vic.speed_profile = p;
-        // Spec 852 — a `u64` comes back with its UCI block, at power-on (D7): the block is
-        // not in the dump.
+    // Spec 852 — a `u64` comes back with its UCI block, at power-on (D7): the block is
+    // not in the dump.
+    if dump_profile.is_some() {
         st.session.machine.sync_profile_device();
     }
     let pc = st.session.machine.c64_core.reg_pc;

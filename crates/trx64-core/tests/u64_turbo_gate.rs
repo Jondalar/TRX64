@@ -35,15 +35,20 @@ fn loop_count(m: &mut Machine, cycles: u64) -> u32 {
     u32::from(m.read_full(0x00fb)) | (u32::from(m.read_full(0x00fc)) << 8)
 }
 
+/// Revised for turbo as measured, row 1: this was `d031_80_is_one_mhz_with_badline_timing_
+/// and_not_turbo` and pinned 851's reading — `$D031` bit 7 = badline timing ON, so `$80` was
+/// (0, stalls) and `$04` (4, no stalls). Measured on a C64 Ultimate it is the other way
+/// round: bit 7 = 1 REMOVES the stalls at every index, `$80` included (1 MHz, 1.00 with the
+/// display on, against 0.945 for `$00`). What stays: `$80` is not turbo — bit 7 is not speed.
 #[test]
-fn d031_80_is_one_mhz_with_badline_timing_and_not_turbo() {
+fn d031_bit_7_removes_the_badline_stalls_and_is_not_speed() {
     let mut m = u64_machine();
     run_at(&mut m, 0xc000, 0x37, &[0xa9, 0x80, 0x8d, 0x31, 0xd0], 2); // LDA #$80 / STA $D031
-    assert!(!m.turbo_engaged(), "$80 is speed index 0 with badline timing");
-    assert_eq!(m.vic.u64_speed(), (0, true));
+    assert!(!m.turbo_engaged(), "$80 is speed index 0");
+    assert_eq!(m.vic.u64_speed(), (0, false), "$80 is 1 MHz WITHOUT the badline stalls");
     run_at(&mut m, 0xc000, 0x37, &[0xa9, 0x04, 0x8d, 0x31, 0xd0], 2); // LDA #$04 / STA $D031
     assert!(m.turbo_engaged(), "$04 is speed index 4");
-    assert_eq!(m.vic.u64_speed(), (4, false));
+    assert_eq!(m.vic.u64_speed(), (4, true), "bit 7 clear keeps the stalls");
     assert_eq!(m.turbo_divider(), 6, "index 4 on the Elite II / C64 Ultimate table");
 }
 
@@ -65,7 +70,11 @@ fn the_enable_word_decides_which_registers_answer() {
     m.set_u64_turbo(0x02, 0x80); // SuperCPU detect only
     run_at(&mut m, 0xc000, 0x37, &[0xad, 0xbc, 0xd0, 0x8d, 0x00, 0x04], 2); // LDA $D0BC / STA $0400
     assert_ne!(m.read_full(0x0400), 0xff, "$D0BC answers the SuperCPU probe");
-    assert_eq!(m.read_full(0xd07c), 0xff, "but only at its own address, not a VIC mirror");
+    // Revised for turbo as measured, round 3 (D20): this said "only at its own address,
+    // not a VIC mirror". Measured on a C64 Ultimate, `$D0BC` is mirrored at `$D03C`, `$D07C`
+    // and `$D0FC`; `$D0BD` is not part of it.
+    assert_eq!(m.read_full(0xd07c), 0x01, "mirrored every $40 in $D000-$D0FF");
+    assert_eq!(m.read_full(0xd0bd), 0xff, "and $D0BD reads open bus");
 
     let mut plain = Machine::new();
     run_at(&mut plain, 0xc000, 0x37, &[0xad, 0xbc, 0xd0, 0x8d, 0x00, 0x04], 2);
@@ -121,10 +130,12 @@ fn time_is_phi2_time_at_every_speed() {
     assert!(slow_r.abs_diff(fast_r) <= 1, "the raster moved with PHI2: {slow_r} vs {fast_r}");
 }
 
+/// Revised for turbo as measured, row 2: index 14 is "48 MHz" in the menu and runs 47 CPU
+/// cycles per PHI2 cycle on a C64 Ultimate; the divider below said 48.
 #[test]
-fn a_raster_irq_is_taken_at_48_mhz() {
+fn a_raster_irq_is_taken_at_index_14() {
     let mut m = u64_machine();
-    m.set_u64_turbo(0x00, 0x8e); // 48 MHz on the Elite II / C64 Ultimate table
+    m.set_u64_turbo(0x00, 0x8e); // index 14: the menu's 48 MHz, 47 CPU cycles per PHI2
     // $C000: SEI / LDA #$00 / STA $FFFE / LDA #$C1 / STA $FFFF / LDA #$80 / STA $D012
     //        / LDA #$01 / STA $D01A / CLI / JMP $C014
     let main = [
@@ -139,7 +150,7 @@ fn a_raster_irq_is_taken_at_48_mhz() {
     m.run_for_full_capped(2 * FRAME, u64::MAX, &mut NullSink, |_, _, _, _, _, _, _| {});
     assert!(m.read_full(0x0400) >= 1, "the raster IRQ was taken");
     assert!((0xc015..=0xc017).contains(&m.c64_core.reg_pc), "and RTI came back to the loop");
-    assert_eq!(m.turbo_divider(), 48);
+    assert_eq!(m.turbo_divider(), 47);
 }
 
 #[test]
@@ -152,7 +163,11 @@ fn the_ultimate_settings_survive_a_c64_reset() {
     assert_eq!(m.speed_profile(), SpeedProfile::U64);
     assert_eq!((m.vic.u64_regs_en, m.vic.u64_speed_prefer), (0x05, 0x83), "firmware settings kept");
     assert_eq!(m.vic.u64_speed_table, U64SpeedTable::U64);
-    assert!(!m.vic.u64_d031_written, "the C64-side register is reset");
+    // Revised for turbo as measured, row 6 and round 2 (D12): this asserted 851's "the
+    // C64-side register is reset" through a written-flag that no longer exists. Measured in
+    // TurboEnable-bit mode: after a reset `$D030` reads `$FE` and `$D031` `$00`, 1 MHz, the
+    // program's $05 gone.
+    assert_eq!((m.read_full(0xd030), m.read_full(0xd031)), (0xfe, 0x00), "TurboEnable mode after a reset");
 }
 
 #[test]
@@ -170,13 +185,20 @@ fn the_profile_set_before_boot_answers_the_d031_probe() {
     assert_eq!(m.speed_profile(), SpeedProfile::U64, "boot kept the profile");
 }
 
+/// Revised for turbo as measured, row 2: the U64-II table was the menu's labels, and a C64
+/// Ultimate runs index 14 and 15 at 47 and 63 CPU cycles per PHI2 cycle, not 48 and 64.
+/// The labels stay what the menu shows. The first-generation table is unmeasured and
+/// unchanged.
 #[test]
-fn the_speed_tables_match_the_firmware() {
-    assert_eq!(U64SpeedTable::U64.mhz(4), 5);
-    assert_eq!(U64SpeedTable::U64II.mhz(4), 6);
-    assert_eq!(U64SpeedTable::U64.mhz(15), 48);
-    assert_eq!(U64SpeedTable::U64II.mhz(15), 64);
-    assert_eq!(U64SpeedTable::U64II.mhz(0x7f), 64, "a speed index past the table clamps");
+fn the_speed_tables_are_the_measured_ones() {
+    assert_eq!(U64SpeedTable::U64.cycles_per_phi2(4), 5);
+    assert_eq!(U64SpeedTable::U64II.cycles_per_phi2(4), 6);
+    assert_eq!(U64SpeedTable::U64.cycles_per_phi2(15), 48, "first generation: unmeasured, as labelled");
+    assert_eq!(U64SpeedTable::U64II.cycles_per_phi2(14), 47, "measured");
+    assert_eq!(U64SpeedTable::U64II.cycles_per_phi2(15), 63, "measured");
+    assert_eq!(U64SpeedTable::U64II.menu_mhz(14), 48, "the menu still says 48");
+    assert_eq!(U64SpeedTable::U64II.menu_mhz(15), 64, "and 64");
+    assert_eq!(U64SpeedTable::U64II.cycles_per_phi2(0x7f), 63, "a speed index past the table clamps");
 }
 
 // ── What a speed change costs ───────────────────────────────────

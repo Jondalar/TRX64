@@ -864,7 +864,9 @@ fn bench_checkpoint_restore_step() {
 //   - RAM: `INC $FB / BNE / INC $FC / JMP` — never touches IO, the best case for any
 //     boundary saving;
 //   - IO:  `LDA $D012 / STA $FB / JMP` — one VIC read per iteration, the worst case.
-// Each at 1 / 16 / 48 / 64 MHz (U64-II table, badline timing on), reverse rings on and off.
+// Each at menu 1 / 16 / 48 / 64 MHz (U64-II table, Badline Timing Enabled), reverse rings on
+// and off. Index 14 and 15 run 47 and 63 CPU cycles per PHI2 cycle, as measured on a C64
+// Ultimate; the CPU MHz column counts those.
 // Reported per configuration: the real-time multiple and the CPU MHz actually emulated.
 //
 //   cargo test -p trx64-core --release --test perf_bench bench_turbo_scaling -- --ignored --nocapture
@@ -877,8 +879,9 @@ fn bench_turbo_scaling() {
     const IO_LOOP: [u8; 8] = [0xad, 0x12, 0xd0, 0x85, 0xfb, 0x4c, 0x00, 0xc0];
     let frames = env_budget("TRX64_TURBO_FRAMES", 25);
     let k = env_budget("TRX64_TURBO_K", 5) as usize;
-    // (label, $D031 speed byte on the U64-II table, MHz) — bit 7 = badline timing.
-    let speeds: [(&str, u8, u64); 4] = [("1", 0x80, 1), ("16", 0x89, 16), ("48", 0x8e, 48), ("64", 0x8f, 64)];
+    // (menu label, menu speed byte on the U64-II table, CPU cycles per PHI2) — bit 7 =
+    // Badline Timing Enabled.
+    let speeds: [(&str, u8, u64); 4] = [("1", 0x80, 1), ("16", 0x89, 16), ("48", 0x8e, 47), ("64", 0x8f, 63)];
 
     let run_once = |code: &[u8], prefer: u8, rings: bool, fast: Option<bool>| -> f64 {
         let mut m = Machine::new();
