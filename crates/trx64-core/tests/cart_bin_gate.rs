@@ -220,7 +220,7 @@ fn resolve_cart_type_ids_and_mnemonics() {
     // Numeric VICE ids (positive + negative generics).
     assert_eq!(resolve_cart_type("32").unwrap(), CartType::Forced(MapperType::EasyFlash));
     assert_eq!(resolve_cart_type("86").unwrap(), CartType::Forced(MapperType::MegaByter));
-    assert_eq!(resolve_cart_type("61").unwrap(), CartType::Forced(MapperType::C64MegaCart));
+    assert_eq!(resolve_cart_type("88").unwrap(), CartType::Forced(MapperType::C64MegaCart));
     assert_eq!(resolve_cart_type("-2").unwrap(), CartType::Forced(MapperType::Normal16k));
     assert_eq!(resolve_cart_type("-3").unwrap(), CartType::Forced(MapperType::Normal8k));
     assert_eq!(resolve_cart_type("-6").unwrap(), CartType::Forced(MapperType::Ultimax));

@@ -59,7 +59,7 @@ pub enum MapperType {
     EasyFlashXl,
     Gmod2,     // CARTRIDGE_GMOD2 (hw 0x3c) — flash + M93C86 EEPROM
     MegaByter, // CARTRIDGE_MEGABYTER (hw 0x56) — MX29F800CB flash, ROML only
-    C64MegaCart, // CARTRIDGE_C64MEGACART (hw 61, martinpiper fork) — M29F160FT flash
+    C64MegaCart, // C64MegaCart (hw 88, shared unofficial id; martinpiper's fork uses 61 = MAX Basic) — M29F160FT flash
     /// CARTRIDGE_GMOD4 (hw 87) — 8 MiB SPI flash, dual banking contexts, three
     /// independently disableable ROM windows. The first cartridge here that is a
     /// *serial*-flash family (`spi_flash`), not a parallel one (`flash040`).
@@ -576,8 +576,10 @@ fn infer_mapper_type(
         // CARTRIDGE_GMOD4 — the number moved twice upstream (an older summary says
         // 83); the current patch defines 87, immediately after MegaByter.
         87 => Some(MapperType::Gmod4),
-        // C64MegaCart (martinpiper VICE fork): M29F160FT 2MB flash, GMOD2-derived.
-        61 => Some(MapperType::C64MegaCart), // CARTRIDGE_C64MEGACART
+        // C64MegaCart: M29F160FT 2MB flash, GMOD2-derived. Not in mainline VICE; 88 is
+        // the id TRX64, TRX_CRT_cli, C64RE and TRX64-Ultimate share (2026-10-03). The
+        // martinpiper fork's 61 is MAX Basic in mainline and is not read as this.
+        88 => Some(MapperType::C64MegaCart),
         // serial/SPI families not yet built (GMOD3 SPI-flash).
         62 => Some(MapperType::Unsupported), // gmod3
         _ => None,                           // ts:260-261
@@ -633,7 +635,7 @@ impl std::fmt::Display for CrtError {
             CrtError::UnknownCartType(s) => {
                 write!(
                     f,
-                    "Unknown cart type '{s}'. Valid: a VICE numeric id (5, 19, 32, 60, 85, 86, 61, -2, -3, -6, 0), the TRX64 id 232, \
+                    "Unknown cart type '{s}'. Valid: a VICE numeric id (5, 19, 32, 60, 85, 86, -2, -3, -6, 0), the shared ids 87 (GMod4) and 88 (C64MegaCart), the TRX64 id 232, \
                      or a mnemonic (ef/easyflash, efxl, gmod2, megabyter/mb, c64megacart/c64mc, magicdesk/md, md16, ocean, 8k, 16k, ultimax, crt/auto)."
                 )
             }
@@ -1360,8 +1362,8 @@ impl CartMapper for EasyFlashMapper {
         }
         false
     }
-    /// ts:1051 — reset: register_02 = 0 (memconfig[jumper<<3] = ULTIMAX so $FFFC
-    /// re-vectors INTO the cart). Bank + jumper + IO2 RAM + flash DATA preserved.
+    /// ts:1051 — reset: bank 0, register_02 = 0 (memconfig[jumper<<3] = ULTIMAX so
+    /// $FFFC re-vectors INTO the cart). Jumper, IO2 RAM and flash data are kept.
     fn reset(&mut self) {
         self.current_bank = 0;
         self.register02 = 0x00;
@@ -2651,7 +2653,7 @@ pub fn resolve_cart_type(s: &str) -> Result<CartType, CrtError> {
             85 => MapperType::MagicDesk16,
             86 => MapperType::MegaByter,
             87 => MapperType::Gmod4,
-            61 => MapperType::C64MegaCart, // martinpiper fork
+            88 => MapperType::C64MegaCart, // shared unofficial id
             _ => return Err(CrtError::UnknownCartType(s.to_string())),
         };
         return Ok(CartType::Forced(mt));

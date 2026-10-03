@@ -270,12 +270,20 @@ fn easyflash_gmod2_megabyter_build_writable_mappers() {
     assert_eq!(m3.mapper_type(), MapperType::MegaByter);
 }
 
-// ── C64MegaCart (hw 61, martinpiper fork — M29F160FT 2MB flash) ──────────────
+// ── C64MegaCart (hw 88, shared unofficial id — M29F160FT 2MB flash) ──────────────
+
+#[test]
+fn hw_61_is_max_basic_not_c64megacart() {
+    // 61 is MAX Basic in mainline VICE; C64MegaCart moved to the shared id 88.
+    let crt = build_crt(61, 1, 0, "MAXB", &[(0, 0x8000, vec![0u8; 0x2000])]);
+    let mt = parse_crt(&crt, "x", None).map(|i| i.mapper_type).ok();
+    assert_ne!(mt, Some(MapperType::C64MegaCart));
+}
 
 #[test]
 fn c64megacart_builds_writable_mapper() {
-    // hw=61 now builds the WRITABLE tier (was Unsupported).
-    let crt = build_crt(61, 1, 0, "C64MC", &[(0, 0x8000, vec![0u8; 0x2000])]);
+    // hw=88 builds the WRITABLE tier (was Unsupported).
+    let crt = build_crt(88, 1, 0, "C64MC", &[(0, 0x8000, vec![0u8; 0x2000])]);
     let img = parse_crt(&crt, "x", None).unwrap();
     assert_eq!(img.mapper_type, MapperType::C64MegaCart);
     let (_i, m) = load_cartridge_from_bytes(&crt, "C64MC", None).expect("C64MegaCart builds");
@@ -287,7 +295,7 @@ fn c64megacart_builds_writable_mapper() {
 #[test]
 fn c64megacart_control_lines() {
     // CONTROL ($DF00) bits 7/6 → EXROM/GAME (manual §2). Boot = 8K GAME.
-    let crt = build_crt(61, 1, 0, "C64MC", &[(0, 0x8000, vec![0xffu8; 0x2000])]);
+    let crt = build_crt(88, 1, 0, "C64MC", &[(0, 0x8000, vec![0xffu8; 0x2000])]);
     let (_i, mut m) = load_cartridge_from_bytes(&crt, "C64MC", None).unwrap();
     let eg = |l: CartLines| (l.exrom, l.game);
     // Boot: 8K GAME (EXROM low, GAME high).
@@ -313,7 +321,7 @@ fn c64megacart_control_lines() {
 #[test]
 fn c64megacart_bank_assembly_and_flash() {
     // Bank 0 = all $FF so a program (bits 1→0 only) is observable.
-    let crt = build_crt(61, 1, 0, "C64MC", &[(0, 0x8000, vec![0xffu8; 0x2000])]);
+    let crt = build_crt(88, 1, 0, "C64MC", &[(0, 0x8000, vec![0xffu8; 0x2000])]);
     let (_i, mut m) = load_cartridge_from_bytes(&crt, "C64MC", None).unwrap();
 
     // 14-bit bank: low byte via $DE00, high 6 bits via $DF00 (bits 5-0).
