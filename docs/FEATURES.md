@@ -43,7 +43,7 @@ One line per feature, as of 0.12.1. Details: [`README.md`](../README.md), monito
 ## Drives and IEC
 
 - 1541 with its own 6502, VIAs and GCR rotation ported from VICE; `.d64` 35-42 tracks with or without error bytes, `.g64`.
-- 1581 with a 2 MHz 6502, 8520 CIA and WD1772 with an MFM surface; `.d81` 80-83 tracks. The 1581 DOS ROM is not included.
+- 1581 with a 2 MHz 6502, 8520 CIA and WD1772 with an MFM surface; `.d81` 80-83 tracks. The 1581 DOS ROM is not included; it is looked up in every ROM directory, and a position cannot become a 1581, or power on as one, without it (the error names the file and the directories).
 - Two drive positions, A at unit 8 and B off at 9; each a 1541 or a 1581, type changed only while off (`session/drive_type`).
 - Per drive: power, reset pulse or held reset, stopped clock, unit jumpers 8-11 (`drivepower`, `session/drive_*`).
 - Disk writes go back to the host file (`.d64`, `.g64`, `.d81`); media type read from file content.

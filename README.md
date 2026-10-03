@@ -67,7 +67,9 @@ Nothing that worked stops working in a patch.
   Two drive positions, each a 1541 or a 1581, chosen with the drive switched off. Drive-side
   writes reach the host file. Ejecting a disk from a 1541 darkens its write-protect sensor
   first, so the DOS sees the disk change as it does on the drive. The 1581 DOS
-  (`dos1581-318045-02.bin`, or `1581.bin`) is not included; put it in the ROM directory.
+  (`dos1581-318045-02.bin`, or `1581.bin` / `1581.rom`) is not included; it is looked up in every ROM
+  directory, not only the one the KERNAL came from, and a drive cannot become a 1581 without it
+  (the refusal names the file and the directories searched).
 - **A folder on the bus** — a host directory as an IEC device at unit 8-11, beside the
   1541s, on the real serial lines (`device/folder_attach`). The stock KERNAL loads, saves
   and lists through it; memory commands are refused, so a program that still uploads

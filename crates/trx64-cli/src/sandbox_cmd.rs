@@ -474,7 +474,7 @@ pub fn run_sandbox(args: &SandboxArgs) -> Result<String, String> {
         None => trx64_core::model::default_model(),
     };
     let mut m = Machine::new_with_model(row);
-    m.boot_from_dir(&args.rom_dir)
+    crate::boot_machine(&mut m, &args.rom_dir)
         .map_err(|e| format!("boot ROMs from {}: {e:?}", args.rom_dir.display()))?;
     // Spec 815 — set BEFORE the seed is restored and before anything runs: a routine
     // that probes does it on its first pass, and a scratch machine has no second one.

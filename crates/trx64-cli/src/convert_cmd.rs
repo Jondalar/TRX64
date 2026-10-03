@@ -42,7 +42,7 @@ pub fn run_convert(
     // Fresh isolated machine (ROMs needed so the resumed state can execute against
     // KERNAL/BASIC/CHARGEN; the VSF's RAM image + port latches drive banking).
     let mut m = Machine::new();
-    m.boot_from_dir(rom_dir)
+    crate::boot_machine(&mut m, rom_dir)
         .map_err(|e| format!("boot ROMs from {}: {e:?}", rom_dir.display()))?;
 
     // Load the VSF with the fidelity report (Spec 791.3).

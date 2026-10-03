@@ -552,6 +552,10 @@ pub struct Machine {
     /// What the last checkpoint restore had to convert rather than restore (an older
     /// record of a chip). Empty after a restore of a current checkpoint.
     pub restore_notes: Vec<String>,
+    /// The directories searched for the 1581 DOS — the ROM directory the machine booted
+    /// from, then whatever [`Machine::find_1581_dos`] was given. Named by
+    /// [`Machine::no_1581_dos`] so a refusal says where it looked.
+    pub rom_1581_searched: Vec<std::path::PathBuf>,
     /// Drive position A (Spec 871): the machine's first 1541, on at unit 8 by
     /// default. The name is historical — since Spec 870 A can stand at unit 8-11, and
     /// since 871 it has a neighbour; `drive8` stays so every caller keeps working.
@@ -749,6 +753,7 @@ impl Clone for Machine {
             cia1: self.cia1.clone(),
             cia2: self.cia2.clone(),
             restore_notes: self.restore_notes.clone(),
+            rom_1581_searched: self.rom_1581_searched.clone(),
             drive8: self.drive8.clone(),
             drive_b: self.drive_b.clone(),
             iec_devices: self.iec_devices.clone(),
@@ -937,6 +942,7 @@ impl Machine {
             cia1: Self::power_on_cia(crate::c64cia::new_cia1, model),
             cia2: Self::power_on_cia(crate::c64cia::new_cia2, model),
             restore_notes: Vec::new(),
+            rom_1581_searched: Vec::new(),
             drive8,
             drive_b,
             basic_rom: Box::new([0u8; 0x2000]),
@@ -3393,6 +3399,46 @@ impl Machine {
         })
     }
 
+    /// Give each drive position that has no 1581 DOS yet the first one found in `dirs`,
+    /// in order, per file name ([`drive::DOS1581_FILES`]). The DOS is an optional extra
+    /// and often lives in another ROM directory than the KERNAL the machine booted from;
+    /// a 1581 board without it runs zeros and the C64 sees `?DEVICE NOT PRESENT` (issue
+    /// #4). The directories are remembered for [`Self::no_1581_dos`]. Returns whether
+    /// every position has a DOS now.
+    pub fn find_1581_dos(&mut self, dirs: &[std::path::PathBuf]) -> bool {
+        for d in dirs {
+            if !self.rom_1581_searched.contains(d) {
+                self.rom_1581_searched.push(d.clone());
+            }
+        }
+        for pos in [crate::drive::DrivePosition::A, crate::drive::DrivePosition::B] {
+            if self.drive(pos).has_rom_1581() {
+                continue;
+            }
+            for d in dirs {
+                if self.drive_mut(pos).load_rom_1581(d).is_ok() {
+                    break;
+                }
+            }
+        }
+        self.drive8.has_rom_1581() && self.drive_b.has_rom_1581()
+    }
+
+    /// Why position `pos` cannot be a 1581: no 1581 DOS was found for it. Names the file
+    /// and every directory searched. `None` when it has one.
+    pub fn no_1581_dos(&self, pos: crate::drive::DrivePosition) -> Option<String> {
+        if self.drive(pos).has_rom_1581() {
+            return None;
+        }
+        let [file, alias1, alias2] = crate::drive::DOS1581_FILES;
+        let dirs = if self.rom_1581_searched.is_empty() {
+            "no directory (none was searched)".to_string()
+        } else {
+            self.rom_1581_searched.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", ")
+        };
+        Some(format!("no 1581 DOS ({file}, or {alias1} / {alias2}) in {dirs}"))
+    }
+
     /// Load all three standard C64 ROMs from `rom_dir` and perform a cold reset.
     /// Also loads the 1541 DOS ROM for the drive8 emulator (non-fatal if absent).
     ///
@@ -3420,6 +3466,7 @@ impl Machine {
         // bundled; non-fatal like the 1541's). A position holds it for a 1581 board.
         let _ = self.drive8.load_rom_1581(rom_dir);
         let _ = self.drive_b.load_rom_1581(rom_dir);
+        self.rom_1581_searched = vec![rom_dir.to_path_buf()];
         // The machine's power-on is the drive's power-on too: the ROM comes into force.
         self.drive8.power_on_reset();
         // Spec 871 — position B gets the same DOS. Its ROM, too, comes into force at

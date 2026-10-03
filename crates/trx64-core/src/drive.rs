@@ -555,6 +555,10 @@ pub struct Drive1541 {
     rom_1581: Option<Box<[u8; 0x8000]>>,
 }
 
+/// The names a 1581 DOS file goes by, in the order they are tried: VICE's, then the
+/// Ultimate's two.
+pub const DOS1581_FILES: [&str; 3] = ["dos1581-318045-02.bin", "1581.bin", "1581.rom"];
+
 /// Build a powered-on VIA1 `ViaContext` (via1d1541.ts:805-943
 /// via1d1541_setup_context + via1d1541.ts:790-798 via1d1541_init). Seeds the
 /// calloc-zero struct, runs `viacore_setup_context` (power-on register latches,
@@ -774,10 +778,16 @@ impl Drive1541 {
     /// Load the 1581 DOS from `rom_dir`: `dos1581-318045-02.bin` (VICE's name), then
     /// the aliases `1581.bin` and `1581.rom` (Ultimate's). Not bundled (Commodore IP).
     pub fn load_rom_1581(&mut self, rom_dir: &std::path::Path) -> Result<(), RomError> {
-        let data = std::fs::read(rom_dir.join("dos1581-318045-02.bin"))
-            .or_else(|_| std::fs::read(rom_dir.join("1581.bin")))
-            .or_else(|_| std::fs::read(rom_dir.join("1581.rom")))?;
+        let [a, b, c] = DOS1581_FILES;
+        let data = std::fs::read(rom_dir.join(a))
+            .or_else(|_| std::fs::read(rom_dir.join(b)))
+            .or_else(|_| std::fs::read(rom_dir.join(c)))?;
         self.set_rom_1581(&data)
+    }
+
+    /// Whether this position has been given a 1581 DOS — what a 1581 board here runs.
+    pub fn has_rom_1581(&self) -> bool {
+        self.rom_1581.is_some()
     }
 
     /// Whether a medium of `kind` fits the board in this position (§5): a D81 goes into
