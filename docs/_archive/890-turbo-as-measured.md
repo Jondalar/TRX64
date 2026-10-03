@@ -1,6 +1,6 @@
 # 890 — Turbo as measured on the C64 Ultimate
 
-**Status:** BUILT (branch `spec-890-turbo-as-measured`, round 1: D1–D8, round 2: D9–D15, round 3: D16–D21) — see As built.
+**Status:** DONE — merged to main, shipped in TRX64 0.12.2 (rounds 1–3, D1–D21). Decision in `README.md` here.
 **Source:** measurements on the owner's C64 Ultimate (firmware 3.15, FPGA 125, core 1.50, PAL),
 2026-10-03, by the 1541Ultimate_FW session: `/Users/alex/Development/TRX64-Ultimate/docs/turbo-measurements-gideon.md`
 (program and raw data in `tests/turbo-gideon/`). Where they contradict TRX64, the measurement wins.

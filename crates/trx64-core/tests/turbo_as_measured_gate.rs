@@ -1079,7 +1079,7 @@ fn d19_a_fast_access_costs_a_fixed_time() {
     let Some(mut m) = booted() else { return };
     start_tm(&mut m);
     let menu = [1u8, 2, 3, 4, 6, 8, 10, 12, 14, 16, 20, 24, 32, 40, 48, 64];
-    let mut extra = |m: &mut Machine, op: u8, addr: u16, idx: u8, f: usize| {
+    let extra = |m: &mut Machine, op: u8, addr: u16, idx: u8, f: usize| {
         let div = MEASURED[idx as usize];
         let ram = phi2_per_access(m, LDA_ABS, 0xc0f0, 0, 0x80 | idx, 0x0b, 64, f);
         (phi2_per_access(m, op, addr, 0, 0x80 | idx, 0x0b, 64, f) - ram) * div

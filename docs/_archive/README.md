@@ -487,3 +487,19 @@ defect of the merge, not a design choice — check the build against the spec's 
 merging, and say so when it deviates. TOD takes the deterministic `#else` branch of VICE's
 `ciacore_inttod` rather than `TODRANDOM`: runs must replay identically for rewind and replay.
 
+
+## Turbo as measured — 890
+
+TRX64's U64 turbo was built from the menu labels and from VICE's TurboMaster: `$D031` bit 7 read
+as "badline timing on", the top speeds as 48/64, the interrupt delay counted in PHI2 cycles. The
+owner's C64 Ultimate (core 1.50) measured otherwise in three rounds: bit 7 removes the badline
+stalls, the top speeds are 47/63 CPU cycles per PHI2 (a 64-slot grid with one reserved slot),
+interrupts are taken in CPU cycles at the turbo clock, I/O is a PHI2 bus cycle that must be issued
+a lead ahead (IO1/IO2 ~480 ns more than a CIA), the menu and a program's `$D031` write share one
+state (last write wins), and the post-reset hold is 2^22 PHI2 cycles. The device's own
+measurement programs are the gate (`turbo_as_measured_gate`); 1 MHz stayed byte-identical.
+
+**Decision:** on the U64 profile the device is the reference, not VICE and not the menu text —
+where they disagree, the measurement wins. Two constants are fitted inside a measured range
+(the 16× IRQ delay, the PHI2 edge on the slot grid) and say so; what the data does not pin is
+listed as open in the spec, not guessed.
