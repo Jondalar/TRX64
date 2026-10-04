@@ -1,6 +1,6 @@
 # 892 — EasyFlash 3 as a cartridge
 
-**Status:** PROPOSED (2026-10-04) — scope set by the owner; decisions D9 and D10 open.
+**Status:** AGREED (2026-10-04) — building.
 **Source:** skoe's EF3 sources, as carried in github.com/FrankBuss/kerberos `1bc1352`,
 `skoe-easyflash/` (hg node fb0211c, CPLD 1.1.1):
 - `Hardware/ef3-vhdl/src/` — `ef3.vhdl`, `cart_easyflash.vhdl`, `cart_io2ram.vhdl`,
@@ -142,12 +142,15 @@ emulated chip.
 kill state it does not answer. Its power-on contents are not in the source, so it starts with
 the same pattern as TRX64's EasyFlash IO2 RAM.
 
-**D9 — Out-of-scope modes selected by a program (2, 4, 5, 6). OPEN.**
+**D9 — Out-of-scope modes selected by a program (2, 4, 5, 6): kill (owner, 2026-10-04).** The
+cart does what mode 7 does — a reset, then invisible until Menu or an external reset — and
+TRX64 says so: the daemon's cart status carries `ef3Mode` with `notEmulated: true`, and the log
+names it ("EF3 mode 4 (AR/RR/NP) is not emulated — the cartridge is off").
 
 **D10 — The menu in slot 0.** TRX64 runs whatever the image holds. A full EF3 image boots its
 menu from slot 0, bank 0, ROMH `$FFFC` (the trampoline at `$FF00` → bank 8). TRX64 has no menu
-of its own. **OPEN:** whether a type-90 image without a menu in slot 0 should be refused,
-warned about, or just run.
+of its own. An image without a menu in slot 0 just runs, as the hardware would: the reset
+vector comes from slot 0's flash, whatever is there.
 
 **D11 — State.** Checkpoints and `.c64re` carry:
 - the slot, bank, `$DE02`, the boot flag and the mode enables (EF, menu, kill);
@@ -164,7 +167,7 @@ in the CHIP layout above.
    from the menu runs that slot's EasyFlash program.
 2. `$DE01` switches slots at once; a read of `$DE01` returns the slot. `$DE08` reads `$49`.
 3. Every row of D2's table, including no-VIC, gives the lines and windows shown.
-4. `$DE0F`:
+4. `$DE0F` (mode 4 also shows `notEmulated` and leaves the cart off):
    - 0 resets into the selected slot;
    - 1 does not reset;
    - 7 makes the cart invisible until Menu;
@@ -179,8 +182,6 @@ in the CHIP layout above.
 
 ## Open
 
-- D9: what a program selecting mode 2, 4, 5 or 6 gets.
-- D10: a type-90 image without a menu in slot 0.
 - Whether the chip compares the high address bits in the unlock cycles. The EAPI issues them
   at slot 0 / bank 0, which satisfies both readings. TRX64 compares the low 12 bits, as
   `FLASH040_160` does (mask `$FFF`).
