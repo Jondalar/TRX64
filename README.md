@@ -61,8 +61,9 @@ Nothing that worked stops working in a patch.
   maps or data-flow taint
 - **Marks & sandboxes** — name a point, jump back to it, branch, discard.
 - **Cartridges** — generic 8K/16K/Ultimax, Ocean, Magic Desk, Magic Desk 16, EasyFlash,
-  GMod2, GMod4, MegaByter, C64MegaCart. Flash and EEPROM writes survive a reset and a
-  snapshot round trip. GMod3 images are recognised and refused.
+  EasyFlash 3, GMod2, GMod4, MegaByter, C64MegaCart. Flash and EEPROM writes survive a reset
+  and a snapshot round trip. The EasyFlash 3 has its eight slots, its mode register and its
+  three buttons (`cart button menu|reset|special`). GMod3 images are recognised and refused.
 - **Disks** — `.d64` / `.g64`, 35 to 42 tracks, in a 1541; `.d81`, 80 to 83 tracks, in a 1581.
   Two drive positions, each a 1541 or a 1581, chosen with the drive switched off. Drive-side
   writes reach the host file. Ejecting a disk from a 1541 darkens its write-protect sensor

@@ -6439,7 +6439,18 @@ fn monitor_forward(req: &Request, command: &str, state: &SharedState) -> Option<
             let unit = rest.first().and_then(|u| u.trim_start_matches("drive").parse::<u64>().ok()).unwrap_or(8);
             ("session/drive_status", json!({ "unit": unit }), format!("DRIVE {unit}"))
         }
-        "cart" => ("session/cart_status", json!({}), "CARTRIDGE".to_string()),
+        "cart" => match rest.first().map(|t| t.to_ascii_lowercase()).as_deref() {
+            // `cart button <name>` — the cartridge's buttons; the RPC is the authority.
+            Some("button") => match rest.get(1) {
+                Some(b) => ("cart/button", json!({ "button": b.to_ascii_lowercase() }), "CARTRIDGE BUTTON".to_string()),
+                None => return Some(monitor_text(req,
+                    "cart button <name> — press and release a button on the cartridge. \
+                     EasyFlash 3: menu (into the boot menu: slot 0, bank 0, EF mode, $DE0F back), \
+                     reset (restart the current slot, boot on), special (restart with boot off — \
+                     the C64 starts as if no cartridge ran). A cartridge without buttons refuses.")),
+            },
+            _ => ("session/cart_status", json!({}), "CARTRIDGE".to_string()),
+        },
         "drivepower" => {
             let unit = rest.iter().find_map(|u| u.trim_start_matches("drive").parse::<u64>().ok()).unwrap_or(8);
             let mut p = json!({ "unit": unit });
@@ -7571,6 +7582,49 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
         "session/cart_status" => {
             let mut st = state.lock().unwrap();
             Response::ok(id, cart_status_json(&mut st))
+        }
+
+        // cart/button {button} — press and release one of the cartridge's buttons (EasyFlash 3:
+        // menu | reset | special). The press and the reset it asks for are one call; the C64's
+        // own reset is the external reset and is `session/reset`. A cartridge without buttons
+        // refuses, naming itself.
+        "cart/button" => {
+            let button = match req.params.get("button").and_then(|v| v.as_str()) {
+                Some(b) => b.to_ascii_lowercase(),
+                None => return Response::err(id, -32602, "cart/button: `button` is required (menu | reset | special)".to_string()),
+            };
+            let mut st = state.lock().unwrap();
+            let name = match st.session.machine.cartridge.as_ref() {
+                None => return Response::err(id, -32000, "cart/button: no cartridge attached".to_string()),
+                Some(c) if c.buttons().is_empty() => {
+                    return Response::err(
+                        id,
+                        -32000,
+                        format!("cart/button: the {} cartridge has no buttons", mapper_type_str(c.mapper_type())),
+                    )
+                }
+                Some(c) => mapper_type_str(c.mapper_type()),
+            };
+            if !st.session.powered {
+                return Response::err(id, -32000, "cart/button: the machine is powered off".to_string());
+            }
+            match st.session.machine.cart_press_button(&button) {
+                Err(e) => Response::err(id, -32602, format!("cart/button: {e}")),
+                Ok(reset) => {
+                    if reset {
+                        // A reset restarts the machine: the queued audio and the held flow
+                        // frames are from before it (as `session/reset`).
+                        st.audio_epoch += 1;
+                        st.ctrl_stop = None;
+                        st.ctrl_frame += 1;
+                        st.mon.flow.reset();
+                        st.stream_broke_on_jam = false;
+                        st.notify.broadcast("audio/flush", json!({ "session_id": st.session.id }));
+                    }
+                    let pc = st.session.machine.cpu6510.reg_pc as u64;
+                    Response::ok(id, json!({ "button": button, "reset": reset, "cartType": name, "pc": pc }))
+                }
+            }
         }
 
         // session/drive_power — drive 8 cold re-init (ws-server.ts:1620). Single
@@ -13868,7 +13922,7 @@ fn cart_status_json(st: &mut State) -> Value {
     // it makes the CART label look stale/cached + wrong (e.g. "WASTELAND EF MENU POC"
     // for every wasteland cart). The mounted file path is the backend truth.
     let cart_path = st.session.cart_path.clone();
-    let (type_str, bank, mapped, gen) = match st.session.machine.cartridge.as_ref() {
+    let (type_str, bank, mapped, gen, ef3, buttons) = match st.session.machine.cartridge.as_ref() {
         None => return Value::Null,
         Some(cart) => {
             let lines = cart.get_lines();
@@ -13877,6 +13931,8 @@ fn cart_status_json(st: &mut State) -> Value {
                 cart.get_state().current_bank as u64,
                 lines.exrom == 0 || lines.game == 0,
                 cart.writable_generation(),
+                cart.ef3_status(),
+                cart.buttons(),
             )
         }
     };
@@ -13906,13 +13962,35 @@ fn cart_status_json(st: &mut State) -> Value {
     } else {
         "idle"
     };
-    json!({
+    let mut out = json!({
         "type": type_str,
         "bank": bank,
         "activity": activity,
         "booted": false,
         "sourceName": source_name
-    })
+    });
+    // Present only for a cartridge that has them, so every other cart's status is unchanged.
+    if !buttons.is_empty() {
+        out["buttons"] = json!(buttons);
+    }
+    if let Some(e) = ef3 {
+        out["slot"] = json!(e.slot);
+        // `notEmulated` is true when a program selected a mode this emulation does not have
+        // (KERNAL, AR/RR/NP, SS5, C128): the cartridge is off, and `notice` says so.
+        out["ef3Mode"] = json!({
+            "state": e.state,
+            "lastWrite": e.last_mode.map(|(n, _)| n),
+            "name": e.last_mode.map(|(_, name)| name),
+            "notEmulated": e.not_emulated,
+            "notice": e.notice,
+            "menuEnabled": e.menu_enabled,
+            "boot": e.boot,
+            "buttonsEnabled": e.buttons_enabled,
+            "led": e.led,
+            "noVicii": e.no_vicii,
+        });
+    }
+    out
 }
 
 /// THE single disk-media attach (Spec 742 / BUG-023, see the note above
@@ -23792,6 +23870,111 @@ mod batch1_tests {
             cartridge_game: None,
             phi1: 0xff,
         }
+    }
+
+    /// EasyFlash 3 at the daemon: the cart panel carries the slot, the buttons and `ef3Mode`
+    /// (with `notEmulated` after a program picks a mode this emulation does not have);
+    /// `cart/button` and the monitor's `cart button` press the same buttons; a cartridge
+    /// without buttons refuses by name; and `savecrt` writes the flash back as a type-90 CRT.
+    #[test]
+    fn ef3_status_buttons_and_savecrt() {
+        let dir = std::env::temp_dir().join(format!("trx64_ef3_daemon_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut romh = vec![0xffu8; 0x2000];
+        romh[0x1ffc] = 0x00;
+        romh[0x1ffd] = 0xe0;
+        let crt = build_crt_for_test(
+            90, 1, 0, "EF3",
+            &[(0, 0xa000, romh), (0, 0x8000, vec![0x11u8; 0x2000]), (3 * 64, 0x8000, vec![0x33u8; 0x2000])],
+        );
+        let crt_path = dir.join("ef3.crt");
+        std::fs::write(&crt_path, &crt).unwrap();
+
+        let st = make_state();
+        {
+            let mut g = st.lock().unwrap();
+            g.session.machine.attach_cart_from_bytes(&crt, "EF3").expect("attach EF3");
+            g.session.cart_path = crt_path.to_string_lossy().to_string();
+            g.session.powered = true;
+            g.session.machine.cold_reset();
+        }
+        let s = call(&st, "session/cart_status", json!({}));
+        assert_eq!(s["type"], json!("easyflash3"));
+        assert_eq!(s["buttons"], json!(["menu", "reset", "special"]));
+        assert_eq!(s["slot"], json!(0));
+        assert_eq!(s["ef3Mode"]["state"], json!("ef"));
+        assert_eq!(s["ef3Mode"]["notEmulated"], json!(false));
+
+        // a program selects AR/RR/NP mode: the cartridge is off, and the status says why
+        {
+            let mut g = st.lock().unwrap();
+            let bi = bi_for_test();
+            let clk = g.session.machine.clk;
+            g.session.machine.cartridge.as_mut().unwrap().write(0xde0f, 4, &bi, clk);
+        }
+        let s = call(&st, "session/cart_status", json!({}));
+        assert_eq!(s["ef3Mode"]["notEmulated"], json!(true));
+        assert_eq!(s["ef3Mode"]["lastWrite"], json!(4));
+        assert_eq!(s["ef3Mode"]["state"], json!("off"));
+        assert_eq!(
+            s["ef3Mode"]["notice"].as_str(),
+            Some("EF3 mode 4 (AR/RR/NP) is not emulated — the cartridge is off")
+        );
+
+        // the RPC: Menu brings it back
+        let r = call(&st, "cart/button", json!({ "button": "menu" }));
+        assert_eq!((r["reset"].as_bool(), r["cartType"].as_str()), (Some(true), Some("easyflash3")));
+        let s = call(&st, "session/cart_status", json!({}));
+        assert_eq!((s["ef3Mode"]["state"].as_str(), s["ef3Mode"]["notEmulated"].as_bool()), (Some("ef"), Some(false)));
+        // the monitor verb is the same press
+        let out = mon_exec(&st, "cart button special");
+        assert!(!out.contains("unknown"), "{out}");
+        assert_eq!(call(&st, "session/cart_status", json!({}))["ef3Mode"]["boot"], json!(false), "Special cleared the boot flag");
+        assert!(mon_exec(&st, "cart button").contains("press and release"), "bare `cart button` explains itself");
+        let e = call_err(&st, "cart/button", json!({ "button": "power" }));
+        assert!(e.message.contains("menu"), "{}", e.message);
+
+        // savecrt: program a byte into slot 3 (the driver's way: unlock at slot 0 / bank 0)
+        {
+            let mut g = st.lock().unwrap();
+            let bi = bi_for_test();
+            let clk = g.session.machine.clk;
+            g.session.machine.cartridge.as_mut().unwrap().press_button("menu").unwrap();
+            let c = g.session.machine.cartridge.as_mut().unwrap();
+            c.take_reset_request();
+            c.reset();
+            for (a, v) in [(0x8aaau16, 0xaau8), (0x8555, 0x55), (0x8aaa, 0xa0)] {
+                c.write(a, v, &bi, clk);
+            }
+            c.write(0xde01, 3, &bi, clk);
+            c.write(0x8001, 0x00, &bi, clk);
+            assert!(c.is_writable_dirty());
+        }
+        let copy = dir.join("copy.crt");
+        let out = mon(&st, &format!("savecrt \"{}\"", copy.display())).expect("savecrt");
+        assert!(out.contains("savecrt"), "{out}");
+        let saved = std::fs::read(&copy).unwrap();
+        let (img, mut m2) = trx64_core::cart::load_cartridge_from_bytes(&saved, "copy", None).expect("a type-90 CRT");
+        assert_eq!(img.mapper_type, trx64_core::cart::MapperType::EasyFlash3);
+        let bi = bi_for_test();
+        m2.write(0xde01, 3, &bi, 0);
+        assert_eq!(m2.read(0x8001, &bi, 100), Some(0x00), "the programmed byte is in the saved CRT, in slot 3");
+        assert_eq!(m2.read(0x8000, &bi, 100), Some(0x33), "and its neighbour is what the image had");
+
+        // a cartridge without buttons refuses, naming itself
+        let ef1 = build_crt_for_test(32, 1, 0, "EF", &[(0, 0x8000, vec![0u8; 0x2000])]);
+        let st1 = make_state();
+        {
+            let mut g = st1.lock().unwrap();
+            g.session.machine.attach_cart_from_bytes(&ef1, "EF").expect("attach EF");
+            g.session.powered = true;
+        }
+        let e = call_err(&st1, "cart/button", json!({ "button": "reset" }));
+        assert!(e.message.contains("easyflash") && e.message.contains("no buttons"), "{}", e.message);
+        let s = call(&st1, "session/cart_status", json!({}));
+        assert!(s.get("buttons").is_none() && s.get("ef3Mode").is_none(), "an EasyFlash 1 panel is unchanged");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ITEM 1 PROOF — cart auto-persist (.crt lazy writeback). Mount a writable

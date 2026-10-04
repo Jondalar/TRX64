@@ -890,6 +890,8 @@ fn parse_flash040ef(data: &[u8], nth: usize, clk: u64) -> Option<Flash040SnapSta
         dirty: false,
         erase_mask,
         erase_alarm_clk,
+        erase_mask_hi: [0u8; 16],
+        dq6: false,
     })
 }
 
@@ -971,6 +973,7 @@ fn load_c64cart_easyflash(machine: &mut Machine, data: &[u8]) -> Result<bool, St
                 flash_hi: hi_fsm,
                 eeprom: None,
                 spi: None,
+                ef3: None,
                 easyflash_jumper: jumper,
                 easyflash_ram: ram,
             }),

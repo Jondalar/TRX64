@@ -433,6 +433,7 @@ pub fn monitor_help_text() -> String {
         "    eject [cart|disk|<unit>]  take it out (`eject 9`: the disk in the drive at unit 9). Bare `eject` targets whatever is actually in (cartridge first, else the disk). Both persist to the host file FIRST — a disk eject leaves the drive turning, a cartridge eject cold-resets the machine (that is what pulling a cart does).",
         "    drive [unit]              live status of the drive at that unit (default 8): motor, track, LED, what is mounted, whether it is dirty",
         "    cart                      cartridge live status: type, bank, read/write activity — null when nothing is inserted",
+        "    cart button <menu|reset|special>  press and release a button on the cartridge (EasyFlash 3: menu = into the boot menu, slot 0 / bank 0; reset = restart the current slot; special = restart with boot off). The cartridge's own reset runs, RAM kept; the C64's reset is `reset`. A cartridge without buttons refuses by name.",
         "    drivepower [unit] [on|off]  on/off switches that drive's power (a second drive at one unit is refused). Bare: power-on-reset the drive 6502 ONLY (DOS re-runs power-on init). The C64 side is untouched. Every scrap of drive-side state goes: open channels, a fastloader's uploaded drivecode, a half-written sector. It is the way out of a wedged fastloader without power-cycling the machine someone is watching.",
         "    recent                    the media this daemon has had mounted lately (daemon state, not project history)",
         "  MACHINE (the same verbs on every front-end — the cockpit\'s `/` prefix is input sugar)",
@@ -670,6 +671,7 @@ pub fn mapper_type_str(t: trx64_core::cart::MapperType) -> &'static str {
         MegaByter => "megabyter",
         C64MegaCart => "c64megacart",
         Gmod4 => "gmod4",
+        EasyFlash3 => "easyflash3",
         // Spec 790 S2 — the self-configuring harness before it locks a concrete
         // family (post-lock it delegates `mapper_type()` and never returns this).
         SelfConfig => "self_config",

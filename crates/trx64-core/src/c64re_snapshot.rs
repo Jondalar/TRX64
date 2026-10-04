@@ -1213,6 +1213,13 @@ pub struct Flash040StateSnapshot {
     pub erase_mask: Vec<i64>, // 8 bytes
     #[serde(rename = "eraseAlarmClk")]
     pub erase_alarm_clk: i64,
+    /// Sectors 64.. of the erase mask — only a part with more than 64 sectors (the
+    /// EasyFlash 3's MX29LV640EB) has any, so the field is absent for every other chip.
+    #[serde(rename = "eraseMaskHi", default, skip_serializing_if = "Vec::is_empty")]
+    pub erase_mask_hi: Vec<i64>,
+    /// DQ6 toggle phase of a program in flight (absent when idle).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dq6: bool,
 }
 
 /// M93C86 serial-EEPROM continuation (= c64re `M93c86SnapState`, m93c86.ts:19-26) —
@@ -1263,6 +1270,80 @@ pub struct CartStateSnapshot {
     pub flash_hi_state: Option<Flash040StateSnapshot>,
     #[serde(rename = "eepromState", skip_serializing_if = "Option::is_none")]
     pub eeprom_state: Option<M93c86StateSnapshot>,
+    /// EasyFlash 3: what the CPLD holds beside the chip (`flashLoState` is the chip's
+    /// command state, `easyflashRam` the IO2 RAM). Absent for every other cartridge.
+    #[serde(rename = "ef3State", default, skip_serializing_if = "Option::is_none")]
+    pub ef3_state: Option<Ef3StateSnapshot>,
+}
+
+/// EasyFlash 3 CPLD state (`ef3::Ef3State`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Ef3StateSnapshot {
+    pub slot: i64,
+    pub bank: i64,
+    pub reg02: i64,
+    #[serde(rename = "ctrlGame")]
+    pub ctrl_game: bool,
+    #[serde(rename = "ctrlExrom")]
+    pub ctrl_exrom: bool,
+    #[serde(rename = "noVicii")]
+    pub no_vicii: bool,
+    pub led: bool,
+    pub boot: bool,
+    #[serde(rename = "enableEf")]
+    pub enable_ef: bool,
+    #[serde(rename = "enableMenu")]
+    pub enable_menu: bool,
+    #[serde(rename = "buttonsEnabled")]
+    pub buttons_enabled: bool,
+    #[serde(rename = "go64Pull")]
+    pub go64_pull: bool,
+    #[serde(rename = "resetRequest")]
+    pub reset_request: bool,
+    #[serde(rename = "lastMode")]
+    pub last_mode: i64,
+    #[serde(rename = "notEmulated")]
+    pub not_emulated: bool,
+}
+
+fn ef3_to_json(e: &crate::ef3::Ef3State) -> Ef3StateSnapshot {
+    Ef3StateSnapshot {
+        slot: e.slot as i64,
+        bank: e.bank as i64,
+        reg02: e.reg02 as i64,
+        ctrl_game: e.ctrl_game,
+        ctrl_exrom: e.ctrl_exrom,
+        no_vicii: e.no_vicii,
+        led: e.led,
+        boot: e.boot,
+        enable_ef: e.enable_ef,
+        enable_menu: e.enable_menu,
+        buttons_enabled: e.buttons_enabled,
+        go64_pull: e.go64_pull,
+        reset_request: e.reset_request,
+        last_mode: e.last_mode as i64,
+        not_emulated: e.not_emulated,
+    }
+}
+
+fn ef3_from_json(e: &Ef3StateSnapshot) -> crate::ef3::Ef3State {
+    crate::ef3::Ef3State {
+        slot: e.slot as u8,
+        bank: e.bank as u8,
+        reg02: e.reg02 as u8,
+        ctrl_game: e.ctrl_game,
+        ctrl_exrom: e.ctrl_exrom,
+        no_vicii: e.no_vicii,
+        led: e.led,
+        boot: e.boot,
+        enable_ef: e.enable_ef,
+        enable_menu: e.enable_menu,
+        buttons_enabled: e.buttons_enabled,
+        go64_pull: e.go64_pull,
+        reset_request: e.reset_request,
+        last_mode: e.last_mode as u8,
+        not_emulated: e.not_emulated,
+    }
 }
 
 fn flash_state_to_json(s: &Flash040SnapState) -> Flash040StateSnapshot {
@@ -1274,6 +1355,12 @@ fn flash_state_to_json(s: &Flash040SnapState) -> Flash040StateSnapshot {
         dirty: s.dirty,
         erase_mask: s.erase_mask.iter().map(|&b| b as i64).collect(),
         erase_alarm_clk: s.erase_alarm_clk,
+        erase_mask_hi: if s.erase_mask_hi.iter().any(|&b| b != 0) {
+            s.erase_mask_hi.iter().map(|&b| b as i64).collect()
+        } else {
+            Vec::new()
+        },
+        dq6: s.dq6,
     }
 }
 
@@ -1283,6 +1370,10 @@ fn flash_state_from_json(s: &Flash040StateSnapshot) -> Flash040SnapState {
     for (i, &b) in s.erase_mask.iter().enumerate().take(8) {
         mask[i] = b as u8;
     }
+    let mut mask_hi = [0u8; 16];
+    for (i, &b) in s.erase_mask_hi.iter().enumerate().take(16) {
+        mask_hi[i] = b as u8;
+    }
     Flash040SnapState {
         state: s.state as u8,
         base_state: s.base_state as u8,
@@ -1291,6 +1382,8 @@ fn flash_state_from_json(s: &Flash040StateSnapshot) -> Flash040SnapState {
         dirty: s.dirty,
         erase_mask: mask,
         erase_alarm_clk: s.erase_alarm_clk,
+        erase_mask_hi: mask_hi,
+        dq6: s.dq6,
     }
 }
 
@@ -1335,6 +1428,7 @@ fn eeprom_state_from_json(s: &M93c86StateSnapshot) -> M93c86SnapState {
 /// at clk 0, exactly like the VSF cart-state capture), so this is a pure read.
 pub fn capture_cart_state(cart: &dyn CartMapper) -> CartStateSnapshot {
     let st = cart.get_state();
+    let ef3 = st.flash.as_ref().and_then(|f| f.ef3.as_ref()).map(ef3_to_json);
     let (jumper, ram, lo, hi, eeprom) = match &st.flash {
         Some(f) => (
             Some(f.easyflash_jumper as i64),
@@ -1357,6 +1451,7 @@ pub fn capture_cart_state(cart: &dyn CartMapper) -> CartStateSnapshot {
         flash_lo_state: lo,
         flash_hi_state: hi,
         eeprom_state: eeprom,
+        ef3_state: ef3,
     }
 }
 
@@ -1370,13 +1465,15 @@ pub fn restore_cart_state(cart: &mut Box<dyn CartMapper>, s: &CartStateSnapshot)
         || s.flash_hi_state.is_some()
         || s.eeprom_state.is_some()
         || s.easyflash_ram.is_some()
-        || s.easyflash_jumper.is_some();
+        || s.easyflash_jumper.is_some()
+        || s.ef3_state.is_some();
     let flash = if has_flash {
         Some(FlashCartState {
             flash_lo: s.flash_lo_state.as_ref().map(flash_state_from_json),
             flash_hi: s.flash_hi_state.as_ref().map(flash_state_from_json),
             eeprom: s.eeprom_state.as_ref().map(eeprom_state_from_json),
             spi: None,
+            ef3: s.ef3_state.as_ref().map(ef3_from_json),
             easyflash_jumper: s.easyflash_jumper.unwrap_or(0) as u8,
             easyflash_ram: s
                 .easyflash_ram

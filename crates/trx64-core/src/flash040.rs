@@ -46,6 +46,15 @@ pub struct Flash040Type {
     pub erase_sector_timeout_cycles: u64,
     pub erase_sector_cycles: u64,
     pub erase_chip_cycles: u64,
+    /// Non-uniform sectors (bottom-boot parts): `boot_sector_count` sectors of
+    /// `boot_sector_size` bytes at the start of the array, then uniform
+    /// `sector_size` sectors. 0 = a uniform part (every type but the MX29LV640EB).
+    /// The boot sectors must fill whole `sector_size` sectors exactly.
+    pub boot_sector_size: u32,
+    pub boot_sector_count: u32,
+    /// PHI2 cycles a byte program stays busy (reads return DQ7 complement + DQ6
+    /// toggle meanwhile). 0 = the program completes at once, as the AMD rows model it.
+    pub program_cycles: u64,
 }
 
 /// ts:545-551 / vice:71-77 — AM29F040 (FLASH040_TYPE_NORMAL) — GMOD2.
@@ -65,6 +74,9 @@ pub const FLASH040_NORMAL: Flash040Type = Flash040Type {
     erase_sector_timeout_cycles: 80,
     erase_sector_cycles: 2_000_000,
     erase_chip_cycles: 14_000_000,
+    boot_sector_size: 0,
+    boot_sector_count: 0,
+    program_cycles: 0,
 };
 
 /// ts:553-559 / vice:78-84 — AM29F040B (FLASH040_TYPE_B) — EasyFlash.
@@ -84,6 +96,9 @@ pub const FLASH040B: Flash040Type = Flash040Type {
     erase_sector_timeout_cycles: 50,
     erase_sector_cycles: 1_000_000,
     erase_chip_cycles: 8_000_000,
+    boot_sector_size: 0,
+    boot_sector_count: 0,
+    program_cycles: 0,
 };
 
 /// EasyFlash XL (TRX64 cart type 232) — an AM29F040B widened to 2 MB per chip.
@@ -113,6 +128,9 @@ pub const FLASH040B_XL: Flash040Type = Flash040Type {
     erase_sector_timeout_cycles: 50,
     erase_sector_cycles: 1_000_000,
     erase_chip_cycles: 8_000_000,
+    boot_sector_size: 0,
+    boot_sector_count: 0,
+    program_cycles: 0,
 };
 
 /// ts:563-569 — M29F160FT (FLASH040_TYPE_160, martinpiper fork) — C64MegaCart.
@@ -133,6 +151,9 @@ pub const FLASH040_160: Flash040Type = Flash040Type {
     erase_sector_timeout_cycles: 50,
     erase_sector_cycles: 1_000_000,
     erase_chip_cycles: 8_000_000,
+    boot_sector_size: 0,
+    boot_sector_count: 0,
+    program_cycles: 0,
 };
 
 /// ts:574-580 — MX29F800CB (FLASH800_TYPE_CB) — MegaByter. The same AMD command
@@ -154,10 +175,56 @@ pub const FLASH800_CB: Flash040Type = Flash040Type {
     erase_sector_timeout_cycles: 40,
     erase_sector_cycles: 700_000,
     erase_chip_cycles: 8_000_000,
+    boot_sector_size: 0,
+    boot_sector_count: 0,
+    program_cycles: 0,
 };
 
-/// vice:flash040.h FLASH040_ERASE_MASK_SIZE.
-const FLASH040_ERASE_MASK_SIZE: usize = 8;
+/// MX29LV640EB (Macronix MX29LV640E T/B, bottom boot) — the EasyFlash 3's one 8 MB chip,
+/// byte mode. Values are from the Macronix datasheet MX29LV640E T/B, P/N PM1328 REV. 1.7
+/// (DEC. 27, 2011), https://www.macronix.com/Lists/Datasheet/Attachments/8514/
+/// MX29LV640E%20T-B,%203V,%2064Mb,%20v1.7.pdf — not from the EF3 sources:
+///   - commands (Table 3, byte mode): unlock `$AA`→`$AAA`, `$55`→`$555`, then the command
+///     at `$AAA` (autoselect `$90`, program `$A0`, erase `$80`+`$AA`/`$55`, sector `$30`,
+///     chip `$10`); autoselect byte mode reads `$C2` at X00 and `$CB` (bottom boot) at X02;
+///   - sectors (Block Structure): eight 8 KB boot sectors, then 127 × 64 KB;
+///   - "Erase and programming performance": byte program 9 us typ (300 us max), sector
+///     erase 0.5 s typ (2 s max; rev 1.7 changed this from 0.7 s), chip erase 45 s typ
+///     (65 s max). The typical values are used, at 1 MHz of PHI2 (1 us = 1 cycle);
+///   - sector-erase time-out 50 us ("SECTOR ERASE");
+///   - status (Automatic Programming / Chip Erase / Sector Erase tables): program in
+///     progress Q7#, Q6 toggling, Q5 = 0; erase in progress Q7 = 0, Q6 toggling, Q3 = 0
+///     during the time-out and 1 after. Q5 (exceed time limit) and Q2 are not modelled.
+/// The unlock addresses are compared on their low 12 bits, as `FLASH040_160` does; the
+/// datasheet table lists full addresses and whether the chip decodes the high ones in the
+/// unlock cycles is not stated (the EAPI issues them at slot 0 / bank 0, which satisfies
+/// both readings).
+pub const FLASH_MX29LV640EB: Flash040Type = Flash040Type {
+    manufacturer_id: 0xc2,
+    device_id: 0xcb,
+    device_id_addr: 2,
+    size: 0x80_0000,
+    sector_mask: 0x7f_0000,
+    sector_size: 0x1_0000,
+    sector_shift: 16,
+    magic1_addr: 0xaaa,
+    magic2_addr: 0x555,
+    magic1_mask: 0xfff,
+    magic2_mask: 0xfff,
+    status_toggle_bits: 0x40,
+    erase_sector_timeout_cycles: 50,
+    erase_sector_cycles: 500_000,
+    erase_chip_cycles: 45_000_000,
+    boot_sector_size: 0x2000,
+    boot_sector_count: 8,
+    program_cycles: 9,
+};
+
+/// vice:flash040.h FLASH040_ERASE_MASK_SIZE (8 bytes = 64 sectors, which is what VICE's
+/// parts have). The MX29LV640EB has 135 sectors, so the mask is 24 bytes here: the first
+/// 8 stay the VICE-shaped `erase_mask`, the rest ride in `erase_mask_hi` in a snapshot.
+const FLASH040_ERASE_MASK_SIZE: usize = 24;
+const FLASH040_ERASE_MASK_LEGACY: usize = 8;
 
 /// ts:582-592 — Flash040 state. Index order = VICE flash040_state_s enum (for
 /// snapshot serialization parity).
@@ -176,6 +243,8 @@ pub enum FlashState {
     SectorErase = 10,
     SectorEraseTimeout = 11,
     SectorEraseSuspend = 12,
+    /// A byte program in flight on a part with `program_cycles` (the MX29LV640EB).
+    ProgramBusy = 13,
 }
 
 impl FlashState {
@@ -194,6 +263,7 @@ impl FlashState {
             10 => FlashState::SectorErase,
             11 => FlashState::SectorEraseTimeout,
             12 => FlashState::SectorEraseSuspend,
+            13 => FlashState::ProgramBusy,
             _ => FlashState::Read,
         }
     }
@@ -209,8 +279,12 @@ pub struct Flash040SnapState {
     pub program_byte: u8,
     pub last_read: u8,
     pub dirty: bool,
-    pub erase_mask: [u8; FLASH040_ERASE_MASK_SIZE],
+    pub erase_mask: [u8; FLASH040_ERASE_MASK_LEGACY],
     pub erase_alarm_clk: i64,
+    /// Sectors 64..191 of the erase mask — only a part with more than 64 sectors uses them.
+    pub erase_mask_hi: [u8; FLASH040_ERASE_MASK_SIZE - FLASH040_ERASE_MASK_LEGACY],
+    /// DQ6 toggle phase of a program in flight.
+    pub dq6: bool,
 }
 
 /// ts:594-818 / vice:flash040core.c — the AMD Am29F0[14]0(B) flash chip.
@@ -230,6 +304,8 @@ pub struct Flash040 {
     erase_mask: [u8; FLASH040_ERASE_MASK_SIZE],
     /// Absolute maincpu_clk of the next erase step; -1 = unset (= alarm_unset).
     erase_alarm_clk: i64,
+    /// DQ6 toggle phase while a program is busy (flips on every status read).
+    dq6: bool,
 }
 
 impl Flash040 {
@@ -247,6 +323,7 @@ impl Flash040 {
             generation: 0,
             erase_mask: [0; FLASH040_ERASE_MASK_SIZE],
             erase_alarm_clk: -1,
+            dq6: false,
         }
     }
 
@@ -287,7 +364,13 @@ impl Flash040 {
         (addr & self.t.magic2_mask) == self.t.magic2_addr
     }
     fn sector_num(&self, addr: u32) -> u32 {
-        (addr & self.t.sector_mask) >> self.t.sector_shift
+        let boot_bytes = self.t.boot_sector_size * self.t.boot_sector_count;
+        if addr < boot_bytes {
+            return addr / self.t.boot_sector_size;
+        }
+        // Uniform sectors follow the boot sectors, which fill whole uniform sectors.
+        self.t.boot_sector_count + ((addr & self.t.sector_mask) >> self.t.sector_shift)
+            - (boot_bytes >> self.t.sector_shift)
     }
 
     /// ts:627-658 / vice:213-259 — erase_alarm_handler applied LAZILY for every
@@ -330,6 +413,9 @@ impl Flash040 {
                     self.erase_chip();
                     self.state = self.base_state;
                 }
+                FlashState::ProgramBusy => {
+                    self.state = self.base_state;
+                }
                 _ => {}
             }
         }
@@ -365,6 +451,7 @@ impl Flash040 {
                 }
             }
             FlashState::ByteProgramError => self.write_operation_status(clk),
+            FlashState::ProgramBusy => self.program_busy_status(),
             FlashState::SectorEraseSuspend
             | FlashState::ChipErase
             | FlashState::SectorErase
@@ -382,6 +469,12 @@ impl Flash040 {
             | (((clk & 2) as u32) << 5)
             | 0x20)
             & 0xff) as u8
+    }
+    /// MX29LV640E datasheet, "Automatic Programming" status table: in progress =
+    /// Q7# (complement of the programmed bit 7), Q6 toggling on each read, Q5 = 0.
+    fn program_busy_status(&mut self) -> u8 {
+        self.dq6 = !self.dq6;
+        ((self.program_byte ^ 0x80) & 0x80) | if self.dq6 { 0x40 } else { 0 }
     }
     /// ts:710-714 / vice:192-209 — DQ6 toggle (status_toggle_bits), DQ3 timer.
     fn erase_operation_status(&mut self) -> u8 {
@@ -433,11 +526,20 @@ impl Flash040 {
             }
             FlashState::ByteProgram => {
                 self.state = if self.program_byte_op(addr, b) {
-                    self.base_state
+                    if self.t.program_cycles > 0 {
+                        // Commands are ignored while the program runs; the status
+                        // reads below are what the driver polls.
+                        self.erase_alarm_clk = clk as i64 + self.t.program_cycles as i64;
+                        self.dq6 = false;
+                        FlashState::ProgramBusy
+                    } else {
+                        self.base_state
+                    }
                 } else {
                     FlashState::ByteProgramError
                 };
             }
+            FlashState::ProgramBusy => {}
             FlashState::EraseMagic1 => {
                 self.state = if self.magic1(addr) && b == 0xaa {
                     FlashState::EraseMagic2
@@ -516,8 +618,16 @@ impl Flash040 {
     }
     /// ts:788-793 / vice:152-162 — erase one sector to 0xFF.
     fn erase_sector(&mut self, sector: u32) {
-        let start = (sector * self.t.sector_size) as usize;
-        let end = (start + self.t.sector_size as usize).min(self.data.len());
+        let (start, size) = if sector < self.t.boot_sector_count {
+            ((sector * self.t.boot_sector_size) as usize, self.t.boot_sector_size as usize)
+        } else {
+            let first = self.t.boot_sector_size * self.t.boot_sector_count;
+            (
+                (first + (sector - self.t.boot_sector_count) * self.t.sector_size) as usize,
+                self.t.sector_size as usize,
+            )
+        };
+        let end = (start + size).min(self.data.len());
         if start < self.data.len() {
             self.data[start..end].fill(0xff);
         }
@@ -546,8 +656,25 @@ impl Flash040 {
             program_byte: self.program_byte,
             last_read: self.last_read,
             dirty: self.dirty,
-            erase_mask: self.erase_mask,
+            erase_mask: self.erase_mask[..FLASH040_ERASE_MASK_LEGACY].try_into().unwrap(),
             erase_alarm_clk: self.erase_alarm_clk,
+            erase_mask_hi: self.erase_mask[FLASH040_ERASE_MASK_LEGACY..].try_into().unwrap(),
+            dq6: self.dq6,
+        }
+    }
+    /// The same snapshot WITHOUT catching the erase alarm up: a pure read for status
+    /// and `get_state()`, which must not clone or mutate an 8 MB chip.
+    pub fn snapshot_state_ro(&self) -> Flash040SnapState {
+        Flash040SnapState {
+            state: self.state as u8,
+            base_state: self.base_state as u8,
+            program_byte: self.program_byte,
+            last_read: self.last_read,
+            dirty: self.dirty,
+            erase_mask: self.erase_mask[..FLASH040_ERASE_MASK_LEGACY].try_into().unwrap(),
+            erase_alarm_clk: self.erase_alarm_clk,
+            erase_mask_hi: self.erase_mask[FLASH040_ERASE_MASK_LEGACY..].try_into().unwrap(),
+            dq6: self.dq6,
         }
     }
     /// ts:809-817 — restore the command-FSM continuation.
@@ -557,8 +684,10 @@ impl Flash040 {
         self.program_byte = s.program_byte & 0xff;
         self.last_read = s.last_read & 0xff;
         self.dirty = s.dirty;
-        self.erase_mask = s.erase_mask;
+        self.erase_mask[..FLASH040_ERASE_MASK_LEGACY].copy_from_slice(&s.erase_mask);
+        self.erase_mask[FLASH040_ERASE_MASK_LEGACY..].copy_from_slice(&s.erase_mask_hi);
         self.erase_alarm_clk = s.erase_alarm_clk;
+        self.dq6 = s.dq6;
     }
 }
 

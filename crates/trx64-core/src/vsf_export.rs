@@ -373,8 +373,11 @@ pub fn save_vice_vsf(m: &mut Machine) -> Vec<u8> {
     let clk = m.c64_core.clk;
     let flash_img = m.cartridge.as_mut().and_then(|c| c.writable_image(clk));
     let state = m.cartridge.as_ref().map(|c| c.get_state());
+    // VICE has no EasyFlash 3 module, and the EF module below is a 1 MB EasyFlash: an 8 MB
+    // EF3 is left out rather than written as something it is not.
+    let is_ef3 = m.cartridge.as_ref().is_some_and(|c| c.mapper_type() == crate::cart::MapperType::EasyFlash3);
     if let (Some(st), Some(flash)) = (state.as_ref(), flash_img.as_ref()) {
-        if st.flash.is_some() {
+        if st.flash.is_some() && !is_ef3 {
             module(&mut out, "C64CART", 0, 1, &c64cart(st));
             module(&mut out, "CARTEF", 0, 0, &cartef(st, flash));
             let f = st.flash.as_ref().unwrap();

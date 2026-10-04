@@ -29,6 +29,7 @@ pub mod drive_snapshot;
 pub mod expansion;
 pub mod fdc_controller;
 pub mod fdd;
+pub mod ef3;
 pub mod flash040;
 pub mod folder_device;
 pub mod full;
@@ -1327,7 +1328,41 @@ impl Machine {
         self.memconfig = self.memconfig_table[self.pla_index()];
     }
 
+    /// A reset the cartridge generated (EasyFlash 3: a `$DE0F` write of 0/7, a button).
+    /// The reset generator holds the C64 in reset for 8 PHI2-low edges — the VIC runs
+    /// through them, nothing else does — and then the reset itself runs, RAM kept.
+    pub fn cart_generated_reset(&mut self) {
+        self.run_held(crate::expansion::Hold::Reset, 8);
+        self.warm_reset_by(true);
+    }
+
+    /// Press a button on the attached cartridge (`menu`, `reset`, `special` on an
+    /// EasyFlash 3) and run the reset it asks for. Returns whether a reset ran.
+    /// A cartridge without buttons — or none — refuses, naming itself.
+    pub fn cart_press_button(&mut self, button: &str) -> Result<bool, String> {
+        let cart = self.cartridge.as_mut().ok_or_else(|| "no cartridge attached".to_string())?;
+        if cart.buttons().is_empty() {
+            return Err(format!("the {:?} cartridge has no buttons", cart.mapper_type()));
+        }
+        if !cart.buttons().contains(&button) {
+            return Err(format!("unknown button '{button}' ({})", cart.buttons().join(", ")));
+        }
+        cart.press_button(button)?;
+        let reset = cart.take_reset_request();
+        if reset {
+            self.cart_generated_reset();
+        }
+        Ok(reset)
+    }
+
     pub fn cold_reset(&mut self) {
+        self.cold_reset_by(false);
+    }
+
+    /// `generated`: the RESET line was pulled by the cartridge itself (EasyFlash 3's
+    /// `$DE0F` and buttons), not by the C64's reset button or a power-up — the cartridge
+    /// tells the two apart (a generated reset keeps its mode, slot and bank).
+    fn cold_reset_by(&mut self, generated: bool) {
         self.arm_u64_reset_hold();
         // CPU-port power-on latches must be set BEFORE the memconfig/vector compute
         // so the banking is the boot config (set again below for clarity/order with
@@ -1339,7 +1374,11 @@ impl Machine {
         // mode/lines return to boot config so an ultimax cart re-vectors $FFFC from
         // its own ROMH (the machine reboots INTO the cart, like real hardware).
         if let Some(cart) = self.cartridge.as_mut() {
-            cart.reset();
+            if generated {
+                cart.reset_generated();
+            } else {
+                cart.reset();
+            }
         }
         // The port's /RESET line reaches whatever is out there — each device decides what
         // that means for it (`ExpansionDevice::reset`, default nothing). An REU takes it;
@@ -1358,6 +1397,16 @@ impl Machine {
         // lines (= memPlaConfigChanged, ts:854-871). No cart ⇒ idx (port|0x18),
         // byte-identical to the prior hard-coded no-cart index.
         self.memconfig = self.memconfig_table[self.pla_index()];
+        // A cartridge that holds GAME until the first ROMH access (EasyFlash 3, after a
+        // reset it generated) sees that access here, at the vector fetch, and lets go; the
+        // map the vector is read through is the released one. Where the cartridge's own
+        // lines keep Ultimax (the usual case) nothing changes.
+        if matches!(self.memconfig.bank_e, full::BankE::CartHiUltimax) {
+            if let Some(cart) = self.cartridge.as_mut() {
+                cart.reset_vector_fetched();
+            }
+            self.memconfig = self.memconfig_table[self.pla_index()];
+        }
         // Read the reset vector THROUGH the banked map: an ultimax cart maps its
         // ROMH over $E000-$FFFF, so $FFFC/$FFFD come from the cart, not RAM.
         let lo = self.banked_reset_vector_byte(0xFFFC) as u16;
@@ -1447,6 +1496,10 @@ impl Machine {
     /// drive resets the TS `resetCold` performs (ts:707-708, ts:719-726). RAM is
     /// untouched throughout.
     pub fn warm_reset(&mut self) {
+        self.warm_reset_by(false);
+    }
+
+    fn warm_reset_by(&mut self, generated: bool) {
         // Spec 876 D5 — the reset replaces CIA1 and with it the POT selection: settle the
         // latch under the old one first. The set values stay (a reset unplugs nothing).
         let (now, sel) = (self.c64_core.clk, self.pot_select());
@@ -1454,7 +1507,7 @@ impl Machine {
         // Banking restore ($00=$2F/$01=$37 + PLA) + cart reset + $FFFC vector fetch
         // + CPU/IEC/keyboard/SID re-init, RAM preserved (cold_reset does NOT fill).
         // = ts:692-694 (resetCpuPortKeepRam) + ts:699/701/730/719 path.
-        self.cold_reset();
+        self.cold_reset_by(generated);
         // ts:724-726 — cold-reset the C64 I/O chips so a 2nd+ reset does not leave
         // CIA timers / IRQ state or an active VIC raster-IRQ from the previous run
         // (= the "no cursor / re-hijack after reset" recovery). Fresh power-on chips.
@@ -3853,6 +3906,9 @@ impl Machine {
             // Spec 856 D3 — decided per boundary, because the speed above is.
             let fast_path = self.turbo_fast_path && self.c64_core.turbo_div > 1;
 
+            // Did this instruction touch the expansion port's address space or I/O? Only then
+            // can a cartridge have asked for a reset (EasyFlash 3's `$DE0F`).
+            let cart_touched: bool;
             // Run a whole instruction over the SC bus (the verbatim core threads the
             // VIC tick + BA steal + interrupt-delay counters into every access).
             {
@@ -3977,6 +4033,7 @@ impl Machine {
                 if port_active && bus.fb.device_stop {
                     stop = RunStop::Device;
                 }
+                cart_touched = bus.fb.io_touched;
                 // Persist bus-mutated banking/port state back to the Machine.
                 self.memconfig = bus.fb.config;
                 self.port_dir = bus.fb.port_dir;
@@ -4040,6 +4097,16 @@ impl Machine {
                         self.head_trace.push((drv_clk, ht, sec));
                         self.head_trace_last = Some((ht, sec));
                     }
+                }
+            }
+            // A reset the cartridge asked for during this instruction (EasyFlash 3: `$DE0F`
+            // = 0 or 7) runs now, after the drive and SID have caught up to its clock.
+            if cart_touched {
+                if self.cartridge.as_mut().is_some_and(|c| c.take_reset_request()) {
+                    if let Some(n) = self.cartridge.as_ref().and_then(|c| c.ef3_status()).and_then(|s| s.notice) {
+                        eprintln!("trx64: {n}");
+                    }
+                    self.cart_generated_reset();
                 }
             }
             executed += 1;

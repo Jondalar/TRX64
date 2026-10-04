@@ -1,6 +1,6 @@
 # 892 — EasyFlash 3 as a cartridge
 
-**Status:** AGREED (2026-10-04) — building.
+**Status:** BUILT (2026-10-04, on branch `spec-892-ef3`; not merged).
 **Source:** skoe's EF3 sources, as carried in github.com/FrankBuss/kerberos `1bc1352`,
 `skoe-easyflash/` (hg node fb0211c, CPLD 1.1.1):
 - `Hardware/ef3-vhdl/src/` — `ef3.vhdl`, `cart_easyflash.vhdl`, `cart_io2ram.vhdl`,
@@ -185,3 +185,88 @@ in the CHIP layout above.
 - Whether the chip compares the high address bits in the unlock cycles. The EAPI issues them
   at slot 0 / bank 0, which satisfies both readings. TRX64 compares the low 12 bits, as
   `FLASH040_160` does (mask `$FFF`).
+
+## As built
+
+One new module, `crates/trx64-core/src/ef3.rs` (`Ef3Mapper`), the `MapperType::EasyFlash3` row in
+`cart.rs`, a new chip row and four small extensions in `flash040.rs`, and the machine, daemon,
+monitor and FFI doors. The EasyFlash 1 mapper is untouched. File:line below are at the commit
+that closes this spec.
+
+**Type and image.** CRT type 90 and the mnemonics `ef3`/`easyflash3`: `cart.rs:616`, `:2709`,
+`:2718`; builder `:2068`; raw `.bin` geometry (512 banks of 16 KB, slot-major) `:2562`. CHIP
+packets are placed by the D6 formula in `Ef3Mapper::new` (`ef3.rs:151`, formula `:38`); a packet
+numbered past 511 is an error (`CrtError::BankOutOfRange`), not dropped.
+
+- **D1** — registers: `ef3.rs:284` (read), `:326` (write); `$DE08`..`$DE0A` answer in EF mode
+  only; no mirrors; peek shows the write-only registers (`:305`).
+- **D2** — lines `ef3.rs:272`; `ctrl_game` is registered at the `$DE02` write (`:339`) and at a
+  reset (`:196`), so the boot flag reaches GAME only there. No-VIC: `vic_romh` returns nothing
+  (`:458`); the CPU's lines are unchanged.
+- **D3** — `$DE0F`: `write_mode` `ef3.rs:205`; decoded only while `enable_menu`; 2/4/5/6 act as
+  mode 7 and set `not_emulated`.
+- **D4** — external reset `ef3.rs:381`; generated reset `:391` (keeps mode, slot, bank, boot
+  flag; clears `$DE02`; pulls GAME); the pull ends at the vector fetch (`:396`). Machine side:
+  `cart_generated_reset` (`lib.rs:1334`) holds the C64 for 8 PHI2 cycles with the VIC running,
+  then runs a warm reset that tells the cartridge the reset is its own (`cold_reset_by`
+  `lib.rs:1365`); the run loop picks up a request made by a CPU write after the instruction that
+  made it (`lib.rs:4104`).
+- **D5** — buttons: `press_button` `ef3.rs:410`; `Machine::cart_press_button` `lib.rs:1342`
+  (refuses by name); RPC `cart/button` `trx64-daemon/src/main.rs:7591`; monitor
+  `cart button <menu|reset|special>` (`main.rs:6445`, help in `trx64-monitor/src/verbs.rs`,
+  `MONITOR.md`, golden re-blessed); FFI `cart_button` (`trx64-ffi/src/lib.rs:422`).
+- **D6** — chip: `FLASH_MX29LV640EB` (`flash040.rs:202`), non-uniform sectors (`sector_num`
+  `:366`, `erase_sector` `:620`), a 24-byte erase mask, status polling during a program
+  (`ProgramBusy`, `:475`). Writes reach the chip only in EF mode with the lines at Ultimax
+  (`ef3.rs:367`).
+- **D7** — no EAPI replacement; the real driver runs (gate A6).
+- **D8** — IO2 RAM: one 256-byte RAM, answers in EF mode only (`ef3.rs:296`, `:353`).
+- **D9** — `notEmulated`/`ef3Mode` in `session/cart_status` (`main.rs:13980`) and the log line on
+  stderr (`lib.rs:4107`).
+- **D10** — nothing added: the image decides (gate A1 boots skoe's menu from slot 0).
+- **D11** — state: `Ef3State` rides `FlashCartState::ef3` (`cart.rs:173`) and the checkpoint's
+  `ef3State` (`c64re_snapshot.rs:1275`); the chip's command state is `flashLoState`; the flash is
+  the writable image (8 MB, chip order) like the other flash carts; `savecrt` writes a type-90 CRT
+  from the flash (`ef3.rs:531`). `get_state` does not clone the 8 MB chip.
+
+**Chip values (Macronix MX29LV640E T/B datasheet, PM1328 REV. 1.7, 2011-12-27).** Byte program 9 us
+typ (300 us max); sector erase 0.5 s typ (2 s max — rev 1.7 changed this from 0.7 s); chip erase 45 s
+typ (65 s max); sector-erase time-out 50 us; byte-mode commands `$AAA`/`$555`; autoselect `$C2` at
+X00 and `$CB` at X02 (bottom boot); eight 8 KB boot sectors then 127 × 64 KB. Typical values are
+used, 1 us = 1 PHI2 cycle. Status as the datasheet tables give it: program in progress Q7#, Q6
+toggling; erase in progress Q7 = 0, Q6 toggling, Q3 low during the time-out. Q5 (exceeded time limit)
+and Q2 are not modelled.
+
+**Where the spec left a choice, and what was chosen.**
+- *The first ROMH access after a generated reset.* `go_64` pulls GAME low until the first ROMH
+  access (D4). On the board the CPLD sees that access, lets GAME go and the PLA swaps ROMH for
+  the KERNAL inside the same bus cycle; the Special button (boot 0) and the kill state exist to
+  start the C64 as it is, so both vector bytes must come from the KERNAL, and a half-and-half
+  vector would crash. TRX64 takes the access at the vector fetch: the pull is visible in the lines
+  from the start of the reset, and the vector is read through the map the released lines give.
+  Where the cartridge's own lines are Ultimax (boot 1, every reset but Special and kill) that is
+  the same map, so "the reset vector is read in Ultimax" holds there.
+- *Reset and Special in the kill state* do nothing (`if enable = '1'` in `cart_easyflash.vhdl`);
+  the table's "mode unchanged" is the only row they have. Menu always acts.
+- *A cart-generated reset keeps the bank* (D4), so a program has to select bank 0 before `$DE0F` = 0
+  if it wants the slot's reset vector; skoe's menu does.
+- *`overlay_bank_write`* takes `slot*64 + bank` as the bank.
+- *VSF export* leaves an EF3 out: VICE has no such module and the EF module is a 1 MB EasyFlash.
+- *The 8 MB checkpoint blob* is the whole chip, as for GMod4 and the other flash carts.
+
+**Tests** (`crates/trx64-core/tests/ef3_gate.rs`, in `scripts/gate.sh`; `crates/trx64-daemon`
+`ef3_status_buttons_and_savecrt`): one per acceptance item.
+- A1 builds skoe's boot image from the local clone with his Makefile and local tools, boots it,
+  checks the screen text by decoding the bitmap with the menu's own glyph tables (slot 5's name
+  from the directory in slot 0, bank `$10`), starts slot 5 with its key, checks the Menu button and
+  the version screen (`1.1.1`, read from `$DE08`). Skips, loudly, without the clone, a tool, or the
+  ROMs. The third-party binaries of `EF3BootImage/images/` are not used; EasyProg is replaced by an
+  empty file of the right shape. Two toolchain workarounds are applied to the scratch copy only: the
+  stale prebuilt objects are removed and the linker configs get the `ONCE` segment cc65 2.18 wants.
+- A6 assembles skoe's `eapi-mx29640b.s` and a test program with acme and runs them: `EAPIInit`
+  gives `$CB`/`$C2`/8, a 64 KB sector in slot 5 (ROML and ROMH) and a boot block in slot 0 are
+  erased and programmed, read back by the program, and the whole chip is compared against a model of
+  exactly those edits. A program of 0 bits to 1 without an erase is an error the driver reports, as
+  on the chip.
+- A7: checkpoint through JSON and back, `crt_image` and reload, and a write into a slot the image had
+  no packets for.

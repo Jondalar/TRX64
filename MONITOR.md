@@ -175,6 +175,7 @@ obs cap_off when exec $4100 do trace off              # stop at $4100
 | `eject [cart\|disk\|<unit>]` | take it out: `eject 9` is the disk in the drive at unit 9, bare `eject` whatever is in (cartridge first). Both write back to the host file first; a cartridge eject cold-resets the machine |
 | `drive [unit]` | live status of the drive at that unit (default 8): motor, track, LED, what is mounted, whether it is dirty |
 | `cart` | cartridge status: type, bank, read/write activity |
+| `cart button <menu\|reset\|special>` | press and release a button on the cartridge. EasyFlash 3: `menu` goes to the boot menu (slot 0, bank 0, EasyFlash mode, the mode register back), `reset` restarts the current slot with boot on, `special` restarts it with boot off. The cartridge's own reset runs and RAM is kept; the C64's reset button is `reset`. A cartridge without buttons refuses, naming itself |
 | `drivepower [unit] [on\|off]` | switch that drive on or off (two powered drives at one unit are refused). Bare: power-on-reset the drive's 6502 only — the way out of a wedged fastloader |
 | `recent` | the media this daemon has had mounted lately |
 | `identify <path>` | what a file is, from its content: `c64re`/`crt`/`g64`/`d64`/`d81`/`prg`, and whether a PRG would autostart |
