@@ -503,3 +503,18 @@ measurement programs are the gate (`turbo_as_measured_gate`); 1 MHz stayed byte-
 where they disagree, the measurement wins. Two constants are fitted inside a measured range
 (the 16× IRQ delay, the PHI2 edge on the slot grid) and say so; what the data does not pin is
 listed as open in the spec, not guessed.
+
+## EasyFlash 3 — 892
+
+An EasyFlash 3 image (CRT type 90, shared with TRX64-Ultimate: 8 slots × 64 banks, slot-major
+CHIP packets) runs as skoe's CPLD 1.1.1 does it: `$DE01` slots, EF banking with `$DE02`'s no-VIC
+bit and a boot flag instead of a jumper, the once-writable `$DE0F`, the three buttons, and one
+MX29LV640EB with its 8 KB boot blocks, so the cartridge's own EAPI runs unchanged. The owner
+scoped out the KERNAL, freezer and C128 modes and USB; a program that selects one gets the kill
+state and a "not emulated" notice.
+
+**Decision:** a mode the emulator does not have takes the cartridge away rather than leaving
+it half-working — the program meets what a device without that mode would give it, and the
+status says why. The image's own EAPI is never swapped for EF3: the replacement exists for
+EasyFlash 1 drivers written against real-hardware timing, and the EF3 driver runs against the
+emulated chip as it is.

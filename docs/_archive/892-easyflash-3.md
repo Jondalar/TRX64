@@ -1,6 +1,6 @@
 # 892 — EasyFlash 3 as a cartridge
 
-**Status:** BUILT (2026-10-04, on branch `spec-892-ef3`; not merged).
+**Status:** DONE — merged to main 2026-10-04, ships with the next release. Decision in `README.md` here.
 **Source:** skoe's EF3 sources, as carried in github.com/FrankBuss/kerberos `1bc1352`,
 `skoe-easyflash/` (hg node fb0211c, CPLD 1.1.1):
 - `Hardware/ef3-vhdl/src/` — `ef3.vhdl`, `cart_easyflash.vhdl`, `cart_io2ram.vhdl`,
@@ -246,6 +246,7 @@ and Q2 are not modelled.
   from the start of the reset, and the vector is read through the map the released lines give.
   Where the cartridge's own lines are Ultimax (boot 1, every reset but Special and kill) that is
   the same map, so "the reset vector is read in Ultimax" holds there.
+  Confirmed by the owner, 2026-10-04.
 - *Reset and Special in the kill state* do nothing (`if enable = '1'` in `cart_easyflash.vhdl`);
   the table's "mode unchanged" is the only row they have. Menu always acts.
 - *A cart-generated reset keeps the bank* (D4), so a program has to select bank 0 before `$DE0F` = 0
