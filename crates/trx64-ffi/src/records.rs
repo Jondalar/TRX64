@@ -279,6 +279,50 @@ pub struct CartStatus {
     pub booted: bool,
     #[serde(default)]
     pub source_name: Option<String>,
+    /// The buttons this cartridge has ("menu", "reset", "special" on an EasyFlash 3);
+    /// empty for a cartridge without any.
+    #[serde(default)]
+    pub buttons: Vec<String>,
+    /// EasyFlash 3: the slot `$DE01` selects.
+    #[serde(default)]
+    pub slot: Option<u8>,
+    /// EasyFlash 3: the mode register's state. `None` for every other cartridge.
+    #[serde(default)]
+    pub ef3_mode: Option<Ef3Mode>,
+}
+
+/// EasyFlash 3 mode state (`session/cart_status` → `ef3Mode`).
+#[derive(Debug, Clone, uniffi::Record, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Ef3Mode {
+    /// "ef" while the EasyFlash mode answers, "off" when the cartridge is invisible.
+    pub state: String,
+    /// The last value `$DE0F` took and its name; `None` since the last reset to menu.
+    #[serde(default)]
+    pub last_write: Option<u8>,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// A program selected a mode this emulation does not have (KERNAL, AR/RR/NP, SS5,
+    /// C128): the cartridge is off, and `notice` says so.
+    pub not_emulated: bool,
+    #[serde(default)]
+    pub notice: Option<String>,
+    pub menu_enabled: bool,
+    pub boot: bool,
+    pub buttons_enabled: bool,
+    pub led: bool,
+    pub no_vicii: bool,
+}
+
+/// `cart/button {button}` result.
+#[derive(Debug, Clone, uniffi::Record, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CartButtonResult {
+    pub button: String,
+    /// The press asked for a reset and it ran.
+    pub reset: bool,
+    pub cart_type: String,
+    pub pc: u32,
 }
 
 // ── drives + folder devices (Specs 870–873) ─────────────────────────────────

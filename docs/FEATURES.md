@@ -37,9 +37,10 @@ One line per feature, as of 0.12.3. Details: [`README.md`](../README.md), monito
 
 ## Cartridges
 
-- 9 CRT hardware types: generic 8K/16K/Ultimax, Ocean, Magic Desk, Magic Desk 16, EasyFlash, GMod2, GMod4, MegaByter, C64MegaCart.
+- 10 CRT hardware types: generic 8K/16K/Ultimax, Ocean, Magic Desk, Magic Desk 16, EasyFlash, EasyFlash 3, GMod2, GMod4, MegaByter, C64MegaCart.
+- EasyFlash 3 (CRT type 90, mnemonic `ef3`): one 8 MB MX29LV640EB with eight slots of 64 banks, selected with `$DE01`; the cartridge lines and boot flag from `$DE02`; the 256-byte IO2 RAM; the version register at `$DE08`; the mode register at `$DE0F` for EasyFlash with and without a reset and for off. The three buttons — Menu, Reset, Special — are `cart button <menu|reset|special>` in the monitor, the `cart/button` call and `cartButton` in the Swift API; a cartridge without buttons refuses by name. The chip has its 8 KB boot blocks and its 64 KB sectors, answers the status polling of a program or erase in progress, and runs the EF3's own EAPI driver unchanged. KERNAL, AR/RR/NP, SS5 and C128 modes are not emulated: a program that selects one gets the cartridge switched off, and the cart status says so (`ef3Mode.notEmulated`). USB reads as no data, not ready.
 - Type 232: a 4 MB EasyFlash for development, TRX64 only. GMod3 is parsed and refused.
-- Flash writes (EasyFlash, GMod2, MegaByter, C64MegaCart, GMod4 SPI) and the GMod2 EEPROM survive reset and snapshots.
+- Flash writes (EasyFlash, EasyFlash 3, GMod2, MegaByter, C64MegaCart, GMod4 SPI) and the GMod2 EEPROM survive reset and snapshots.
 - `savecrt` writes the flash back to the `.crt`; `swapcrt` swaps the image with no reset. Mounting power-cycles, ejecting cold-resets.
 - Raw `.bin` images in the sandbox (`sandbox --cart --cart-type`).
 - REU 1700/1764/1750 and oversized up to 16 MB (`--reu`), GeoRAM (`--georam`), preload with `--reu-image`.

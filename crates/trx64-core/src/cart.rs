@@ -64,6 +64,9 @@ pub enum MapperType {
     /// independently disableable ROM windows. The first cartridge here that is a
     /// *serial*-flash family (`spi_flash`), not a parallel one (`flash040`).
     Gmod4,
+    /// CARTRIDGE_EASYFLASH3 (hw 90, shared id) — skoe's EasyFlash 3: one 8 MB MX29LV640EB,
+    /// eight slots of 64 banks, three buttons. See `ef3.rs`.
+    EasyFlash3,
     /// Spec 790 S2 — a raw `.bin` attached with `CartType::Auto` that the S1
     /// structural detect could not settle, now driven by the runtime
     /// self-configuring harness (`SelfConfigCartMapper`). This is the harness's
@@ -165,6 +168,9 @@ pub struct FlashCartState {
     pub spi: Option<crate::spi_flash::SpiFlashSnapState>,
     pub easyflash_jumper: u8,
     pub easyflash_ram: Vec<u8>, // 256 bytes IO2 RAM
+    /// EasyFlash 3: slot, `$DE02`, boot flag, mode enables — everything the CPLD holds
+    /// beside the flash and the IO2 RAM. The chip is `flash_lo`.
+    pub ef3: Option<crate::ef3::Ef3State>,
 }
 
 // ── Spec 785 C1 — the cartridge READ-SET ─────────────────────────────────────
@@ -459,6 +465,35 @@ pub trait CartMapper: Send {
         None
     }
 
+    // ── Reset line and buttons (EasyFlash 3) — defaults: none ───────────────────
+
+    /// A reset the cartridge itself asked for (EF3: a `$DE0F` write of 0/7, a button).
+    /// The machine polls this after an instruction that touched the cartridge, holds
+    /// the C64 in reset and runs it; taken once.
+    fn take_reset_request(&mut self) -> bool {
+        false
+    }
+    /// The RESET line when the cartridge itself pulled it — not the C64's own reset,
+    /// which is [`reset`](Self::reset). Defaults to the same thing.
+    fn reset_generated(&mut self) {
+        self.reset();
+    }
+    /// The CPU has fetched the reset vector. A cartridge that holds a line until then
+    /// (EF3's `go_64` pull on GAME) lets it go here.
+    fn reset_vector_fetched(&mut self) {}
+    /// The buttons this cartridge has, by name. Empty = none.
+    fn buttons(&self) -> &'static [&'static str] {
+        &[]
+    }
+    /// Press and release a button. The machine runs any reset the press asked for.
+    fn press_button(&mut self, _button: &str) -> Result<(), String> {
+        Err("this cartridge has no buttons".into())
+    }
+    /// EasyFlash 3's mode/slot status for the cart panel; `None` for every other cart.
+    fn ef3_status(&self) -> Option<crate::ef3::Ef3Status> {
+        None
+    }
+
     // ── Banked code overlay (Spec 795) ──────────────────────────────────────────
 
     /// Overlay one byte into a cart bank IMAGE for an EXPLICIT bank at a CPU-window
@@ -576,6 +611,9 @@ fn infer_mapper_type(
         // CARTRIDGE_GMOD4 — the number moved twice upstream (an older summary says
         // 83); the current patch defines 87, immediately after MegaByter.
         87 => Some(MapperType::Gmod4),
+        // EasyFlash 3 — shared with TRX64-Ultimate: 87 GMod4, 88 C64MegaCart, 89
+        // TwoMegabyter, 90 EasyFlash3.
+        90 => Some(MapperType::EasyFlash3),
         // C64MegaCart: M29F160FT 2MB flash, GMOD2-derived. Not in mainline VICE; 88 is
         // the id TRX64, TRX_CRT_cli, C64RE and TRX64-Ultimate share (2026-10-03). The
         // martinpiper fork's 61 is MAX Basic in mainline and is not read as this.
@@ -614,6 +652,9 @@ pub enum CrtError {
     /// $DF00 + the AMD flash command sequence, lock the type in-place) is the
     /// runtime self-configuring cart harness = Spec 790 S2, NOT this slice.
     BinTypeAmbiguous,
+    /// A CHIP packet names a bank the cartridge does not have (EasyFlash 3: `slot*64 +
+    /// bank` is 0..511). Never dropped silently.
+    BankOutOfRange { bank: u16, limit: u16 },
 }
 
 impl std::fmt::Display for CrtError {
@@ -635,9 +676,12 @@ impl std::fmt::Display for CrtError {
             CrtError::UnknownCartType(s) => {
                 write!(
                     f,
-                    "Unknown cart type '{s}'. Valid: a VICE numeric id (5, 19, 32, 60, 85, 86, -2, -3, -6, 0), the shared ids 87 (GMod4) and 88 (C64MegaCart), the TRX64 id 232, \
-                     or a mnemonic (ef/easyflash, efxl, gmod2, megabyter/mb, c64megacart/c64mc, magicdesk/md, md16, ocean, 8k, 16k, ultimax, crt/auto)."
+                    "Unknown cart type '{s}'. Valid: a VICE numeric id (5, 19, 32, 60, 85, 86, -2, -3, -6, 0), the shared ids 87 (GMod4), 88 (C64MegaCart) and 90 (EasyFlash 3), the TRX64 id 232, \
+                     or a mnemonic (ef/easyflash, ef3/easyflash3, efxl, gmod2, megabyter/mb, c64megacart/c64mc, magicdesk/md, md16, ocean, 8k, 16k, ultimax, crt/auto)."
                 )
+            }
+            CrtError::BankOutOfRange { bank, limit } => {
+                write!(f, "CHIP packet bank {bank} is outside this cartridge (banks 0..{}).", limit - 1)
             }
             CrtError::BinTypeAmbiguous => {
                 write!(
@@ -1386,6 +1430,7 @@ impl CartMapper for EasyFlashMapper {
                 flash_hi: Some(hi.snapshot_state(0)),
                 eeprom: None,
                 spi: None,
+                ef3: None,
                 easyflash_jumper: self.jumper,
                 easyflash_ram: self.io_ram.to_vec(),
             }),
@@ -1644,6 +1689,7 @@ impl CartMapper for Gmod2Mapper {
                 flash_hi: None,
                 eeprom: Some(self.eeprom.snapshot_state()),
                 spi: None,
+                ef3: None,
                 easyflash_jumper: 0,
                 easyflash_ram: Vec::new(),
             }),
@@ -1795,6 +1841,7 @@ impl CartMapper for MegabyterMapper {
                 flash_hi: None,
                 eeprom: None,
                 spi: None,
+                ef3: None,
                 easyflash_jumper: 0,
                 easyflash_ram: Vec::new(),
             }),
@@ -1958,6 +2005,7 @@ impl CartMapper for C64MegaCartMapper {
                 flash_hi: None,
                 eeprom: None,
                 spi: None,
+                ef3: None,
                 easyflash_jumper: 0,
                 easyflash_ram: Vec::new(),
             }),
@@ -2017,6 +2065,7 @@ pub fn mapper_from_image(
         MapperType::MegaByter => Ok(Box::new(MegabyterMapper::new(image))),
         MapperType::C64MegaCart => Ok(Box::new(C64MegaCartMapper::new(image))),
         MapperType::Gmod4 => Ok(Box::new(Gmod4Mapper::new(image))),
+        MapperType::EasyFlash3 => Ok(Box::new(crate::ef3::Ef3Mapper::new(image)?)),
         // The self-config harness is constructed directly (SelfConfigCartMapper::new
         // / load_self_config_from_bin), never from a parsed image, and locks a
         // concrete family at runtime — so it has no image-driven build here.
@@ -2508,6 +2557,9 @@ fn bin_geometry(mapper_type: MapperType) -> Result<BinGeometry, CrtError> {
         // $8000 and the high 8K at $A000, so a linear image is 1024 x 8K halves. The
         // cart asserts ULTIMAX permanently (see Gmod4Mapper::get_lines).
         MapperType::Gmod4 => BinGeometry { bank_unit: 0x2000, layout: Roml8k, exrom: 1, game: 0, max_banks: 1024 },
+        // EasyFlash 3: 8 MB = 512 banks of 16 KB, slot-major (`slot*64 + bank`), ROML half
+        // then ROMH half per bank, as a CRT's packets number them.
+        MapperType::EasyFlash3 => BinGeometry { bank_unit: 0x4000, layout: Roml16kRomhA000, exrom: 1, game: 0, max_banks: 512 },
         // The harness has no static geometry — it re-derives the concrete type's
         // geometry via `bin_geometry(concrete)` at lock time.
         MapperType::SelfConfig => return Err(CrtError::Unsupported(MapperType::SelfConfig)),
@@ -2654,6 +2706,7 @@ pub fn resolve_cart_type(s: &str) -> Result<CartType, CrtError> {
             86 => MapperType::MegaByter,
             87 => MapperType::Gmod4,
             88 => MapperType::C64MegaCart, // shared unofficial id
+            90 => MapperType::EasyFlash3,  // shared unofficial id
             _ => return Err(CrtError::UnknownCartType(s.to_string())),
         };
         return Ok(CartType::Forced(mt));
@@ -2662,6 +2715,7 @@ pub fn resolve_cart_type(s: &str) -> Result<CartType, CrtError> {
     let mt = match t.as_str() {
         "ef" | "easyflash" => MapperType::EasyFlash,
         "efxl" | "easyflashxl" => MapperType::EasyFlashXl,
+        "ef3" | "easyflash3" => MapperType::EasyFlash3,
         "gmod2" => MapperType::Gmod2,
         "megabyter" | "mb" => MapperType::MegaByter,
         "c64megacart" | "c64mc" => MapperType::C64MegaCart,

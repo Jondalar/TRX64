@@ -96,6 +96,7 @@ feed AVAudioEngine, fill an `AVAudioPCMBuffer`'s `int16ChannelData` with the ret
 | `unmountAt` | `(unit: UInt8) throws -> UnmountResult` | Eject the disk from the drive at `unit` (written back to its host file first). |
 | `recentMedia` | `() throws -> [MediaEntry]` | Recent-media list (newest-first, mount timestamps). |
 | `cartStatus` | `() throws -> CartStatus?` | Attached cartridge status, or `nil` when no cart. |
+| `cartButton` | `(button: String) throws -> CartButtonResult` | Press and release a button on the cartridge: `"menu"`, `"reset"` or `"special"` on an EasyFlash 3. A reset the press asks for runs inside the call. A cartridge without buttons is refused by name. (WS: `cart/button {button}`.) |
 
 ## drives
 
@@ -246,7 +247,15 @@ part of the Swift surface.
 
 ### CartStatus
 `type: String`, `bank: UInt32`, `activity: String` ("write"|"read"|"idle"),
-`booted: Bool`, `sourceName: String?`
+`booted: Bool`, `sourceName: String?`, `buttons: [String]` (empty without buttons),
+`slot: UInt8?` and `ef3Mode: Ef3Mode?` (EasyFlash 3 only)
+- **Ef3Mode** — `state: String` ("ef"|"off"), `lastWrite: UInt8?` (the last `$DE0F` value),
+  `name: String?`, `notEmulated: Bool` (a program selected KERNAL, AR/RR/NP, SS5 or C128 mode:
+  the cartridge is off), `notice: String?`, `menuEnabled: Bool`, `boot: Bool`,
+  `buttonsEnabled: Bool`, `led: Bool`, `noVicii: Bool`
+
+### CartButtonResult
+`button: String`, `reset: Bool`, `cartType: String`, `pc: UInt32`
 
 ### DriveStatus
 `position: String` ("A"|"B"), `device: UInt32` (the unit it answers to, as of its last
