@@ -147,6 +147,13 @@ pub trait Observer {
     /// would show), 0 for a store that lands in no RAM byte (chip, cart, open window) and
     /// for reads.
     fn on_bus(&mut self, kind: BusKind, addr: u16, value: u8, pc: u16, clk: u64, old: u8);
+    /// Fired right after `on_bus` for a real (non-dummy) CPU store that LANDED in an
+    /// I/O chip (`FullBus::wr_land == LAND_IO`): `addr` is in `$D000-$DFFF`, `value` is
+    /// what the CPU wrote. Never fired for stores that landed in RAM, the CPU port, a
+    /// cartridge or an open window. Default no-op, so other observers compile unchanged
+    /// and the hot path pays one compare plus an inlined empty call.
+    #[inline]
+    fn on_io_store(&mut self, _addr: u16, _value: u8, _pc: u16) {}
     fn on_interrupt(&mut self, vector: u16, clk: u64);
     /// Watchpoint-access hook. Fired ONLY when a per-address access-watch table is
     /// armed AND the watched address is hit on a real READ/WRITE (= the TS

@@ -4,8 +4,18 @@
 //! v1: the CLI already runs its own in-process machine, no daemon), load bytes,
 //! run the title's OWN routine to a sentinel, and harvest a RAM slice. The routine
 //! runs on the AUTHORITATIVE 6502 (`trx64-core`), not the TS `Cpu6502` shadow — so
-//! a depacker that touches banking/IO executes for real. The harvest reads the raw
-//! 64K `ram` field (ignores banking = the unpacked bytes as written).
+//! a depacker that touches banking/IO executes for real.
+//!
+//! The harvest is the raw 64K `ram` field (banking ignored = the unpacked bytes as
+//! written) with ONE overlay: a store the routine made to `$D000-$DFFF` while I/O was
+//! banked in lands in a chip, never in `ram`, so the RAM view would show it as `$00`.
+//! Those addresses return what the CPU wrote — the last value stored there, not a chip
+//! read-back (a read has side effects) — and colour RAM (`$D800-$DBFF`) keeps only its
+//! low nibble, as the hardware does. The core reports where each store landed
+//! (`Observer::on_io_store`, fed from `FullBus::wr_land == LAND_IO`). Addresses never
+//! stored to in I/O keep their raw-RAM byte, so RAM under I/O is untouched, and stores
+//! made with I/O banked out are plain RAM and need no overlay. Each harvest range lists
+//! the overlaid bytes as `ioWritten` runs in the JSON; `writtenRuns` is unchanged.
 //!
 //! Two entry mechanisms:
 //!
@@ -385,6 +395,10 @@ struct SandboxObs {
     /// One bit per 16-bit address; true = the routine wrote there. Scanned at the end
     /// into contiguous runs for the JSON write-map.
     written: Box<[bool]>,
+    /// `$D000-$DFFF` only: the last value the CPU stored to each address while the
+    /// store landed in I/O, and whether it ever did. Armed like `written`.
+    io_last: Box<[u8]>,
+    io_seen: Box<[bool]>,
 }
 
 impl SandboxObs {
@@ -396,7 +410,28 @@ impl SandboxObs {
             entry,
             armed: false,
             written: vec![false; 0x1_0000].into_boxed_slice(),
+            io_last: vec![0; 0x1000].into_boxed_slice(),
+            io_seen: vec![false; 0x1000].into_boxed_slice(),
         }
+    }
+
+    /// The harvest of `[addr, addr+len)` with the I/O overlay applied: the raw RAM
+    /// bytes, except where the routine stored into I/O space (value = what it wrote,
+    /// low nibble for colour RAM). Returns the bytes and the overlaid runs.
+    fn harvest(&self, ram: &[u8], addr: u16, len: usize) -> (Vec<u8>, Vec<(u16, u16)>) {
+        let start = addr as usize;
+        let end = (start + len).min(0x1_0000);
+        let mut bytes = ram[start..end].to_vec();
+        let mut hit: Vec<u16> = Vec::new();
+        for a in start.max(0xd000)..end.min(0xe000) {
+            let i = a - 0xd000;
+            if self.io_seen[i] {
+                bytes[a - start] =
+                    if (0xd800..0xdc00).contains(&a) { self.io_last[i] & 0x0f } else { self.io_last[i] };
+                hit.push(a as u16);
+            }
+        }
+        (bytes, contiguous_runs(&hit))
     }
 
     /// Sorted contiguous runs of the written address set.
@@ -436,6 +471,18 @@ impl Observer for SandboxObs {
             self.written[addr as usize] = true;
         }
     }
+    fn on_io_store(&mut self, addr: u16, value: u8, pc: u16) {
+        if pc == self.entry {
+            self.armed = true;
+        }
+        if self.armed {
+            let i = (addr as usize).wrapping_sub(0xd000);
+            if i < 0x1000 {
+                self.io_last[i] = value;
+                self.io_seen[i] = true;
+            }
+        }
+    }
     fn on_interrupt(&mut self, _vector: u16, _clk: u64) {}
 }
 
@@ -463,6 +510,9 @@ struct SandboxOutcome {
     harvest: Vec<u8>,
     /// ALL harvest ranges (`--harvest` repeatable): (addr, bytes).
     harvests: Vec<(u16, Vec<u8>)>,
+    /// Per harvest range (same order): the runs whose bytes are the CPU's I/O stores
+    /// rather than RAM.
+    harvest_io: Vec<Vec<(u16, u16)>>,
     /// Stream bytes consumed by `--stream-hook` fires (TS `SandboxRunResult.streamPos`).
     stream_pos: usize,
 }
@@ -617,12 +667,18 @@ pub fn run_sandbox(args: &SandboxArgs) -> Result<String, String> {
                 "addr": outcome.harvest_addr,
                 "len": outcome.harvest.len(),
                 "hex": hex(&outcome.harvest),
+                "ioWritten": outcome.harvest_io.first().cloned().unwrap_or_default(),
             },
             // ALL harvest ranges (--harvest repeatable).
+            // `ioWritten`: [[lo,hi],..] runs inside the range whose bytes are what the
+            // CPU stored into I/O space (not RAM); empty when none.
             "harvests": outcome
                 .harvests
                 .iter()
-                .map(|(addr, bytes)| json!({ "addr": addr, "len": bytes.len(), "hex": hex(bytes) }))
+                .zip(&outcome.harvest_io)
+                .map(|((addr, bytes), io)| {
+                    json!({ "addr": addr, "len": bytes.len(), "hex": hex(bytes), "ioWritten": io })
+                })
                 .collect::<Vec<_>>(),
         });
         serde_json::to_string(&out).map_err(|e| e.to_string())
@@ -656,8 +712,19 @@ pub fn run_sandbox(args: &SandboxArgs) -> Result<String, String> {
         } else {
             String::new()
         };
+        let io_note = if outcome.harvest_io.iter().any(|r| !r.is_empty()) {
+            let parts: Vec<String> = outcome
+                .harvest_io
+                .iter()
+                .flatten()
+                .map(|(lo, hi)| format!("${lo:04x}..${hi:04x}"))
+                .collect();
+            format!("  ioWritten=[{}] (CPU's I/O stores, not RAM)", parts.join(","))
+        } else {
+            String::new()
+        };
         Ok(format!(
-            "sandbox: stop={} pc=${:04x} cycles={} steps={} a=${:02x} x=${:02x} y=${:02x} sp=${:02x} p=${:02x}{span}{runs}{stream}  harvest ${:04x}..+{} = {}{harvests}",
+            "sandbox: stop={} pc=${:04x} cycles={} steps={} a=${:02x} x=${:02x} y=${:02x} sp=${:02x} p=${:02x}{span}{runs}{stream}  harvest ${:04x}..+{} = {}{harvests}{io_note}",
             outcome.stop_reason,
             outcome.pc,
             outcome.cycles,
@@ -874,17 +941,16 @@ fn execute_sandbox(m: &mut Machine, args: &SandboxArgs) -> SandboxOutcome {
     };
     let runs = obs.runs();
 
-    // Harvest every requested range (raw RAM slice = the unpacked bytes as written,
-    // ignoring banking). The first range is the back-compat single `harvest`.
-    let harvests: Vec<(u16, Vec<u8>)> = args
-        .harvests
-        .iter()
-        .map(|&(addr, len)| {
-            let start = addr as usize;
-            let end = (start + len).min(0x1_0000);
-            (addr, m.ram[start..end].to_vec())
-        })
-        .collect();
+    // Harvest every requested range: the raw RAM slice (banking ignored) with the
+    // routine's I/O stores overlaid (`SandboxObs::harvest`). The first range is the
+    // back-compat single `harvest`.
+    let mut harvests: Vec<(u16, Vec<u8>)> = Vec::new();
+    let mut harvest_io: Vec<Vec<(u16, u16)>> = Vec::new();
+    for &(addr, len) in &args.harvests {
+        let (bytes, io) = obs.harvest(&m.ram[..], addr, len);
+        harvests.push((addr, bytes));
+        harvest_io.push(io);
+    }
     let (harvest_addr, harvest) = harvests.first().cloned().unwrap_or((0, Vec::new()));
 
     SandboxOutcome {
@@ -903,6 +969,7 @@ fn execute_sandbox(m: &mut Machine, args: &SandboxArgs) -> SandboxOutcome {
         harvest_addr,
         harvest,
         harvests,
+        harvest_io,
         stream_pos,
     }
 }
@@ -1390,6 +1457,105 @@ mod tests {
         assert_eq!(out.final_a, 0xaa, "final A");
         assert_eq!(out.final_x, 0x10, "final X");
         assert_eq!(out.final_sp, 0xff, "SP after RTS popped the 2-byte sentinel");
+    }
+
+    /// Run a routine that stores into I/O space and return the outcome. `io` is the
+    /// `$01` seed; the routine stores `$0E`->$D020/$D021/$D018, `$0E`->$D800 and `$F5`->$D801,
+    /// then `$77`->$D400 (never harvested) and `$99`->$D000 under RAM.
+    fn io_store_run(rom_dir: PathBuf, io: u8, harvests: Vec<(u16, usize)>) -> SandboxOutcome {
+        let mut m = booted(&rom_dir);
+        let routine = [
+            0xa9, 0x0e, // LDA #$0e
+            0x8d, 0x20, 0xd0, // STA $d020
+            0x8d, 0x21, 0xd0, // STA $d021
+            0x8d, 0x18, 0xd0, // STA $d018
+            0x8d, 0x00, 0xd8, // STA $d800
+            0xa9, 0xf5, // LDA #$f5
+            0x8d, 0x01, 0xd8, // STA $d801
+            0xa9, 0x77, // LDA #$77
+            0x8d, 0x00, 0xd4, // STA $d400
+            0x60, // RTS
+        ];
+        m.poke(0xc000, &routine);
+        let mut args = base_args(rom_dir);
+        args.entry = 0xc000;
+        args.zp = vec![(0x0001, io)];
+        args.direct_entry = true;
+        args.harvests = harvests;
+        execute_sandbox(&mut m, &args)
+    }
+
+    #[test]
+    fn io_stores_are_harvested_as_the_cpu_wrote_them() {
+        let Some(rom_dir) = rom_dir_or_skip() else { return };
+        let out = io_store_run(rom_dir, 0x37, vec![(0xd018, 1), (0xd020, 2), (0xd800, 2)]);
+        assert_eq!(out.stop_reason, "sentinel_rts");
+        assert_eq!(out.harvests[0].1, vec![0x0e], "$D018");
+        assert_eq!(out.harvests[1].1, vec![0x0e, 0x0e], "$D020/$D021");
+        assert_eq!(out.harvests[2].1, vec![0x0e, 0x05], "$D800 and the low nibble of $D801");
+        assert_eq!(out.harvest_io[0], vec![(0xd018, 0xd018)]);
+        assert_eq!(out.harvest_io[1], vec![(0xd020, 0xd021)]);
+        assert_eq!(out.harvest_io[2], vec![(0xd800, 0xd801)]);
+        assert!(out.runs.contains(&(0xd800, 0xd801)), "writtenRuns still names them");
+    }
+
+    #[test]
+    fn io_off_stores_come_from_ram_with_no_overlay() {
+        let Some(rom_dir) = rom_dir_or_skip() else { return };
+        let out = io_store_run(rom_dir, 0x34, vec![(0xd018, 1), (0xd020, 2), (0xd800, 2)]);
+        assert_eq!(out.harvests[0].1, vec![0x0e]);
+        assert_eq!(out.harvests[1].1, vec![0x0e, 0x0e]);
+        assert_eq!(out.harvests[2].1, vec![0x0e, 0xf5], "RAM keeps the full byte");
+        assert!(out.harvest_io.iter().all(|r| r.is_empty()));
+    }
+
+    #[test]
+    fn an_io_store_outside_every_range_changes_no_harvest() {
+        let Some(rom_dir) = rom_dir_or_skip() else { return };
+        let mut m = booted(&rom_dir);
+        // $D400 is stored ($77) under $01=$37 but lies in no range; neighbours stay raw RAM.
+        let before_a = m.ram[0xd3fe..0xd402].to_vec();
+        let before_b = m.ram[0xd402..0xd404].to_vec();
+        m.poke(0xc000, &[0xa9, 0x77, 0x8d, 0x00, 0xd4, 0x60]);
+        let mut args = base_args(rom_dir);
+        args.entry = 0xc000;
+        args.zp = vec![(0x0001, 0x37)];
+        args.direct_entry = true;
+        args.harvests = vec![(0xd3fe, 2), (0xd401, 1), (0xd402, 2)];
+        let out = execute_sandbox(&mut m, &args);
+        assert_eq!(out.harvests[0].1, before_a[..2].to_vec());
+        assert_eq!(out.harvests[1].1, before_a[3..].to_vec());
+        assert_eq!(out.harvests[2].1, before_b);
+        assert!(out.harvest_io.iter().all(|r| r.is_empty()));
+        assert!(out.runs.contains(&(0xd400, 0xd400)), "the store is still in writtenRuns");
+    }
+
+    #[test]
+    fn a_range_over_all_of_io_space_keeps_raw_ram_for_the_rest() {
+        let Some(rom_dir) = rom_dir_or_skip() else { return };
+        let mut m = booted(&rom_dir);
+        m.ram[0xd021] = 0x00;
+        m.ram[0xd019] = 0xab; // RAM under I/O, never stored to in I/O
+        m.ram[0xd802] = 0xcd;
+        let routine = [
+            0xa9, 0x0e, 0x8d, 0x20, 0xd0, // LDA #$0e / STA $d020
+            0xa9, 0xf5, 0x8d, 0x01, 0xd8, // LDA #$f5 / STA $d801
+            0x60,
+        ];
+        m.poke(0xc000, &routine);
+        let mut args = base_args(rom_dir);
+        args.entry = 0xc000;
+        args.zp = vec![(0x0001, 0x37)];
+        args.direct_entry = true;
+        args.harvests = vec![(0xd000, 0x1000)];
+        let out = execute_sandbox(&mut m, &args);
+        let h = &out.harvests[0].1;
+        assert_eq!(h.len(), 0x1000);
+        assert_eq!(h[0x020], 0x0e);
+        assert_eq!(h[0x801], 0x05);
+        assert_eq!(h[0x019], 0xab, "RAM under I/O keeps its raw byte");
+        assert_eq!(h[0x802], 0xcd);
+        assert_eq!(out.harvest_io[0], vec![(0xd020, 0xd020), (0xd801, 0xd801)]);
     }
 
     /// The DEFAULT stub path is unchanged: no direct-entry/regs ⇒ `jsr entry` stub,

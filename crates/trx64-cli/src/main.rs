@@ -155,6 +155,9 @@ enum Command {
         #[arg(long)]
         batch: Option<String>,
         /// RAM range to harvest after the run: ADDR:LEN (LEN decimal or 0x-hex).
+        /// Bytes in $D000-$DFFF that the routine stored to while I/O was banked in are
+        /// the CPU's last written value (colour RAM $D800-$DBFF: low nibble), listed
+        /// per range as `ioWritten` runs in --json; all other bytes are raw RAM.
         /// Repeatable — the first is the primary range echoed in text + the
         /// back-compat `harvest` JSON field; all are returned in `harvests`.
         #[arg(long)]

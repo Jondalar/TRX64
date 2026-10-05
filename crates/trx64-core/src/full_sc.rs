@@ -280,6 +280,9 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
             self.obs.on_bus(BusKind::Write, a, v, pc, clk, o);
         }
         self.obs.on_bus(BusKind::Write, addr, value, pc, clk, old);
+        if land == crate::full::LAND_IO {
+            self.obs.on_io_store(addr, value, pc);
+        }
         // reverse-debug Phase 1b — feed the full-delta undo ring, keyed by where the
         // store LANDED: RAM -> the RAM byte it replaced; the $00/$01 port -> its pre-write
         // value; an I/O chip -> 0 (best-effort into the register shadows, chip counters
