@@ -142,8 +142,10 @@ pub trait Observer {
         clk: u64,
     );
     /// Fired on every bus access. `pc` = live CPU reg_pc at the access; `clk` =
-    /// CPU master clock at the access (= TS `BusEvent.cycle`). `old` = pre-write
-    /// byte at `addr` for WRITE events (Spec 753 mutation surface), else 0.
+    /// CPU master clock at the access (= TS `BusEvent.cycle`). `old` = the RAM byte a
+    /// WRITE replaced (Spec 753 mutation surface; the RAM beneath any ROM/cart that a read
+    /// would show), 0 for a store that lands in no RAM byte (chip, cart, open window) and
+    /// for reads.
     fn on_bus(&mut self, kind: BusKind, addr: u16, value: u8, pc: u16, clk: u64, old: u8);
     fn on_interrupt(&mut self, vector: u16, clk: u64);
     /// Watchpoint-access hook. Fired ONLY when a per-address access-watch table is
@@ -1763,6 +1765,8 @@ impl Machine {
             // enter the cart read-set.
             cart_reads: None,
             cart_account_suspend: false,
+            wr_land: crate::full::LAND_NONE,
+            wr_old: 0,
             port_profile: self.port_profile.as_mut(),
             port_host: self.expansion.as_mut(),
             snoop: self.expansion_snoop.as_deref(),
@@ -2084,6 +2088,8 @@ impl Machine {
                 cartridge: self.cartridge.as_mut(),
                 cart_reads: None,
                 cart_account_suspend: false,
+                wr_land: crate::full::LAND_NONE,
+                wr_old: 0,
                 port_profile: self.port_profile.as_mut(),
                 port_host: None,
                 snoop: self.expansion_snoop.as_deref(),
@@ -2328,6 +2334,10 @@ impl Machine {
                 self.memconfig = self.memconfig_table[self.pla_index()];
             }
             0x0002..=0xcfff => self.ram[addr as usize] = old,
+            // Only stores that LANDED are in the ring (RAM, the port, an I/O chip). With
+            // I/O off a $D000-$DFFF store landed in the RAM beneath; the PLA state now is
+            // the state at the store, because every later $00/$01 write was undone first.
+            0xd000..=0xdfff if !self.memconfig.io => self.ram[addr as usize] = old,
             0xd000..=0xdfff => {
                 // I/O window: write the byte back into the shadow/register file
                 // directly (no chip side effects). VIC/SID register files + the I/O
@@ -2355,8 +2365,8 @@ impl Machine {
                     _ => self.io_shadow[(addr as usize) - 0xd000] = old,
                 }
             }
-            // $E000-$FFFF stores land in RAM under the KERNAL (writes go to RAM even
-            // with KERNAL mapped — the forward store wrote `ram[addr]`).
+            // $E000-$FFFF: a recorded store landed in RAM (under the KERNAL or not); `old`
+            // is that RAM byte. Cart-consumed stores are not in the ring.
             0xe000..=0xffff => self.ram[addr as usize] = old,
         }
     }
@@ -3956,6 +3966,8 @@ impl Machine {
                         None
                     },
                     cart_account_suspend: false,
+                    wr_land: crate::full::LAND_NONE,
+                    wr_old: 0,
                     port_profile: self.port_profile.as_mut(),
                     port_host: self.expansion.as_mut(),
                     snoop: self.expansion_snoop.as_deref(),
