@@ -1,6 +1,6 @@
 # Features
 
-One line per feature, as of 0.12.4. Details: [`README.md`](../README.md), monitor:
+One line per feature, as of 0.12.5. Details: [`README.md`](../README.md), monitor:
 [`MONITOR.md`](../MONITOR.md), Swift API: [`crates/trx64-ffi/API.md`](../crates/trx64-ffi/API.md).
 
 ## Machine
