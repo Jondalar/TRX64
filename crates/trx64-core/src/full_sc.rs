@@ -249,28 +249,16 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
     /// STORE path (mainc64cpu.c:372-379) real write. Reuses [`FullBus`]'s banked
     /// write dispatch EXACTLY, then emits the `on_bus(Write)` record (+ any chip
     /// side-effect writes, e.g. the CIA2 PA → $DD00 IEC re-push, emitted BEFORE the
-    /// originating store's own record). The pre-write `old` byte is captured ONLY
-    /// for the side-effect-free RAM window ($0002..$D000) — the trace carries
-    /// `hasOld` only there (Spec 753); for the IO window we skip the pre-read
-    /// entirely (avoiding a spurious chip-register read side effect) since the
-    /// observer discards `old` for $D000-$DFFF.
+    /// originating store's own record). The pre-write `old` byte is the RAM byte the
+    /// store replaced, taken from the RAM array by the write dispatch (`FullBus::wr_old`,
+    /// no bus read); a store that lands elsewhere (chip, cart, open window) reports 0.
+    /// The trace carries `hasOld` only for $0002..$D000 (Spec 753), whatever the
+    /// observer is handed here.
     #[inline]
     fn write_raw(&mut self, addr: u16, value: u8) {
         self.sync_clk();
-        let old = if (0x0002..0xd000).contains(&addr) {
-            // Spec 785 C1 — this read is INSTRUMENTATION (the trace/undo pre-write
-            // byte), not a bus cycle the hardware performs. $8000-$BFFF is inside
-            // this window, so without the suspend every store to RAM under a
-            // banked-in cart ROM would fabricate a cart read in the read-set.
-            self.fb.cart_account_suspend = true;
-            let v = crate::cpu::Bus::read(&mut self.fb, addr);
-            self.fb.cart_account_suspend = false;
-            v
-        } else {
-            0
-        };
         // reverse-debug Phase 1b — pre-write value of the $00/$01 CPU port (the trace
-        // window above excludes it, but the undo log must restore it). Only read for the
+        // window excludes it, but the undo log must restore it). Only read for the
         // 2-byte port window — a rare write, so the branch is near-free on the hot path.
         let port_pre_old = if addr < 0x0002 {
             crate::cpu::Bus::read(&mut self.fb, addr)
@@ -278,6 +266,12 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
             0
         };
         crate::cpu::Bus::write(&mut self.fb, addr, value);
+        // The pre-write byte is what the store OVERWROTE: the RAM byte the dispatch
+        // replaced (read from the array inside `write`, no bus read, no cart read
+        // accounting, no chip side effect). A store a chip, the cart or an open window
+        // took replaced no RAM byte: 0.
+        let land = self.fb.wr_land;
+        let old = if land == crate::full::LAND_RAM { self.fb.wr_old } else { 0 };
         let pc = self.pc();
         let clk = self.clk();
         let mut se: Vec<(u16, u8, u8)> = Vec::new();
@@ -286,19 +280,21 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
             self.obs.on_bus(BusKind::Write, a, v, pc, clk, o);
         }
         self.obs.on_bus(BusKind::Write, addr, value, pc, clk, old);
-        // reverse-debug Phase 1b — feed the full-delta undo ring. The undo `old` covers
-        // the WHOLE side-effect-free CPU window $0000..$D000 (RAM + the $00/$01 CPU port
-        // — the port matters: a corrupted $01 unmaps the KERNAL, a crash cause we must be
-        // able to roll back). For $0002..$D000 we reuse the trace `old` (no extra read);
-        // for the $00/$01 port we read it back here (the trace records 0 there by its own
-        // contract, unchanged). The IO window ($D000-$DFFF) records the trace `old` (0) —
-        // reverse-step excludes chip internal counters, so the IO byte is best-effort. The
-        // side-effect writes (CIA→$DD00 IEC re-push etc.) are chip plumbing, NOT undone.
+        // reverse-debug Phase 1b — feed the full-delta undo ring, keyed by where the
+        // store LANDED: RAM -> the RAM byte it replaced; the $00/$01 port -> its pre-write
+        // value; an I/O chip -> 0 (best-effort into the register shadows, chip counters
+        // are out of scope; an I/O store writes no RAM beneath). A store the cartridge
+        // consumed (flash content undo is out of scope) or an open window dropped changed
+        // no RAM byte and is NOT recorded, so undo can never write a ROM/zero byte into
+        // RAM. The side-effect writes (CIA->$DD00 IEC re-push etc.) are chip plumbing,
+        // NOT undone.
         if let Some(dr) = self.delta_ring.as_deref_mut() {
-            // $00/$01 → the pre-write port value captured above (the trace `old` is 0
-            // there); $0002..$D000 → reuse the trace `old`; $D000+ → the trace `old` (0).
-            let undo_old = if addr < 0x0002 { port_pre_old } else { old };
-            dr.record_write(addr, undo_old, value);
+            match land {
+                crate::full::LAND_RAM => dr.record_write(addr, old, value),
+                crate::full::LAND_PORT => dr.record_write(addr, port_pre_old, value),
+                crate::full::LAND_IO => dr.record_write(addr, 0, value),
+                _ => {}
+            }
         }
         // Spec 754 §3.3e watchpoint gate (= cpu65xx-vice.ts:495 store):
         // `if (accessWatch && accessWatch[addr]) onObservedAccess("WRITE", ...)`.
@@ -359,18 +355,16 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
     #[inline]
     fn write_raw_dummy(&mut self, addr: u16, value: u8) {
         self.sync_clk();
-        let old = if (0x0002..0xd000).contains(&addr) {
-            // Spec 785 C1 — instrumentation read, not a bus cycle (see `write_raw`).
-            self.fb.cart_account_suspend = true;
-            let v = crate::cpu::Bus::read(&mut self.fb, addr);
-            self.fb.cart_account_suspend = false;
-            v
+        let port_pre_old = if addr < 0x0002 {
+            crate::cpu::Bus::read(&mut self.fb, addr)
         } else {
             0
         };
         self.fb.access_kind = crate::expansion::AccessKind::Dummy;
         crate::cpu::Bus::write(&mut self.fb, addr, value);
         self.fb.access_kind = crate::expansion::AccessKind::Cpu;
+        let land = self.fb.wr_land;
+        let old = if land == crate::full::LAND_RAM { self.fb.wr_old } else { 0 };
         let pc = self.pc();
         let clk = self.clk();
         self.obs.on_bus(BusKind::DummyWrite, addr, value, pc, clk, old);
@@ -379,7 +373,12 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
         // the dummy and the real write. The real `write_raw` records a second entry
         // (old→new); `who_wrote`'s intra-instruction "last write wins" picks the real one.
         if let Some(dr) = self.delta_ring.as_deref_mut() {
-            dr.record_write(addr, old, value);
+            match land {
+                crate::full::LAND_RAM => dr.record_write(addr, old, value),
+                crate::full::LAND_IO => dr.record_write(addr, 0, value),
+                crate::full::LAND_PORT => dr.record_write(addr, port_pre_old, value),
+                _ => {}
+            }
         }
     }
 

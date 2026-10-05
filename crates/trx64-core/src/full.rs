@@ -159,6 +159,17 @@ pub fn build_memconfig_table() -> [MemConfig; 32] {
 
 /// The assembled full-C64 bus, borrowing every subsystem from the `Machine`.
 /// One per run (built in `run_for_full*`), so the borrows are scoped to the loop.
+/// `FullBus::wr_land`: the store went nowhere (ultimax open window, or not yet written).
+pub const LAND_NONE: u8 = 0;
+/// The store replaced `ram[addr]`; `wr_old` holds the byte it replaced.
+pub const LAND_RAM: u8 = 1;
+/// The store went to the $00/$01 CPU port.
+pub const LAND_PORT: u8 = 2;
+/// The store went to an I/O chip ($D000-$DFFF with I/O on); RAM is untouched.
+pub const LAND_IO: u8 = 3;
+/// The cartridge consumed the store (flash / register); RAM is untouched.
+pub const LAND_CART: u8 = 4;
+
 pub struct FullBus<'a> {
     pub ram: &'a mut [u8; 0x10000],
     pub basic_rom: &'a [u8; 0x2000],
@@ -250,6 +261,12 @@ pub struct FullBus<'a> {
     /// cartridge never sees it and it must not be counted. A write to RAM under a
     /// banked-in cart ROM would otherwise fabricate one cart read per store.
     pub cart_account_suspend: bool,
+    /// Where the LAST `write` landed (`LAND_*`), and — for `LAND_RAM` — the RAM byte it
+    /// replaced (read straight from the array, no bus read, no side effect). The undo
+    /// ring and the trace `old` byte take both from here: what a store overwrites is
+    /// the RAM beneath, never the ROM/cart byte a CPU read would show above it.
+    pub wr_land: u8,
+    pub wr_old: u8,
     /// Spec 850 — the machine profile's own device on the expansion port (Spec 852's UCI
     /// block on the `u64` profile), or None.
     pub port_profile: Option<&'a mut Box<dyn crate::expansion::ExpansionDevice>>,
@@ -311,6 +328,16 @@ pub(crate) fn vic_romh_window<'c>(
 }
 
 impl<'a> FullBus<'a> {
+    /// A store that lands in RAM: remember the byte it replaces (straight from the
+    /// array — no bus read) and where it went, then write.
+    #[inline(always)]
+    fn ram_store(&mut self, addr: u16, value: u8) {
+        let a = addr as usize;
+        self.wr_old = self.ram[a];
+        self.wr_land = LAND_RAM;
+        self.ram[a] = value;
+    }
+
     /// Recompute the live memconfig from the $00/$01 latches + cartridge EXROM/GAME
     /// lines (= memory-bus.ts memPlaConfigChanged, ts:854-871, VERBATIM).
     #[inline]
@@ -1093,54 +1120,60 @@ impl<'a> Bus for FullBus<'a> {
                 self.port_snoop(addr, value);
             }
         }
+        self.wr_land = LAND_NONE;
         match addr {
             0x0000 => {
                 self.io_touched = true;
                 self.port_dir = value;
                 self.ram[0] = value;
+                self.wr_land = LAND_PORT;
                 self.pla_config_changed();
             }
             0x0001 => {
                 self.io_touched = true;
                 self.port_data = value;
                 self.ram[1] = value;
+                self.wr_land = LAND_PORT;
                 self.pla_config_changed();
             }
             0xd000..=0xdfff => {
                 if self.config.io {
+                    self.wr_land = LAND_IO;
                     self.io_write(addr, value);
                 } else {
                     // char-ROM / RAM config: write lands in RAM underneath.
-                    self.ram[addr as usize] = value;
+                    self.ram_store(addr, value);
                 }
             }
             // $8000-$9FFF — ts:597-606: bank8==CartLo ⇒ the cart may consume
             // (flash); read-only mappers return false ⇒ fall to RAM. ROM is
-            // read-only so the RAM byte beneath stays writable (the trace `old`
-            // byte reads this RAM, not the cart ROM).
+            // read-only so the RAM byte beneath stays writable: the store lands in
+            // RAM, and `wr_old` is that RAM byte (not the cart ROM byte a read shows).
             0x8000..=0x9fff => {
                 if matches!(self.config.bank8, Bank8::CartLo) && self.cart_write(addr, value) {
+                    self.wr_land = LAND_CART;
                     return;
                 }
-                self.ram[addr as usize] = value;
+                self.ram_store(addr, value);
             }
             // $A000-$BFFF — ts:610-619: bank_a==CartHi ⇒ cart may consume; the
             // non-cart-hi ultimax open window drops; otherwise RAM.
             0xa000..=0xbfff => {
                 if matches!(self.config.bank_a, BankA::CartHi) && self.cart_write(addr, value) {
+                    self.wr_land = LAND_CART;
                     return;
                 }
                 if !matches!(self.config.bank_a, BankA::CartHi) && self.config.ultimax {
                     return; // open_bus drop
                 }
-                self.ram[addr as usize] = value;
+                self.ram_store(addr, value);
             }
             // $C000-$CFFF — ts:621-626: ultimax open window drops; else RAM.
             0xc000..=0xcfff => {
                 if self.config.ultimax {
                     return; // open_bus drop
                 }
-                self.ram[addr as usize] = value;
+                self.ram_store(addr, value);
             }
             // $E000-$FFFF — ts:628-635: bank_e==CartHiUltimax ⇒ cart may consume
             // (flash); otherwise RAM.
@@ -1148,9 +1181,10 @@ impl<'a> Bus for FullBus<'a> {
                 if matches!(self.config.bank_e, BankE::CartHiUltimax)
                     && self.cart_write(addr, value)
                 {
+                    self.wr_land = LAND_CART;
                     return;
                 }
-                self.ram[addr as usize] = value;
+                self.ram_store(addr, value);
             }
             // $1000-$7FFF — ts:637-640: ultimax open window drops; else RAM.
             // $0000-$0FFF + everything else → RAM.
@@ -1158,7 +1192,7 @@ impl<'a> Bus for FullBus<'a> {
                 if self.config.ultimax && addr >= 0x1000 {
                     return; // open_bus drop
                 }
-                self.ram[addr as usize] = value;
+                self.ram_store(addr, value);
             }
         }
     }
@@ -1297,6 +1331,8 @@ mod joystick_gate_tests {
             cartridge: None,
             cart_reads: None,
             cart_account_suspend: false,
+            wr_land: crate::full::LAND_NONE,
+            wr_old: 0,
             port_profile: None,
             port_host: None,
             snoop: None,

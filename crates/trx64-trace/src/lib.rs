@@ -17,7 +17,8 @@
 //!     (0x32/0x33 are RESERVED in binary-format.ts for VIA_REG_WRITE / GCR_EVENT.)
 //!
 //! access/oldValue (Spec 753): WRITE records carry the pre-write value for RAM
-//! (addr in $0002..$D000); reads and I/O-window writes omit it (hasOld=0).
+//! (addr in $0002..$D000) — the RAM byte the store replaced, which under a banked-in
+//! ROM or cart is NOT the byte a CPU read shows; reads and I/O-window writes omit it (hasOld=0).
 
 use trx64_core::{BusKind, Observer};
 
