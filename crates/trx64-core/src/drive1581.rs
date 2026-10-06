@@ -34,9 +34,6 @@ use crate::wd177x::Wd1770;
 
 /// The 6502 hardware-reset sequence (drivecpu.c:165 `cpu_reset` → clk = 6).
 const DRIVE_RESET_CYCLES: u64 = 6;
-/// The C64-side reset origin the drive's catch-up clock observes (drive.rs
-/// `C64_RESET_DRIVE_OFFSET`).
-const C64_RESET_DRIVE_OFFSET: u64 = 1;
 /// drivesync.c:98-103 — a 1581's `clock_frequency`.
 pub const CLOCK_FREQUENCY_1581: u32 = 2;
 
@@ -589,12 +586,6 @@ impl Drive1581 {
             self.stop_clk = self.stop_clk.wrapping_add((self.sync_accum >> 16) as u64);
             self.sync_accum &= 0xffff;
         }
-    }
-
-    /// The first catch-up target after a reset gets the C64's reset-origin offset, as
-    /// the 1541's does (drive.rs `C64_RESET_DRIVE_OFFSET`).
-    pub(crate) fn seed_reset_offset(&mut self, sync_factor_1mhz: u32) {
-        self.advance_stop_clk(C64_RESET_DRIVE_OFFSET, sync_factor_1mhz * CLOCK_FREQUENCY_1581);
     }
 
     /// Advance by `n` C64 cycles: `sync_factor_1mhz` is the machine's ratio for a 1 MHz
