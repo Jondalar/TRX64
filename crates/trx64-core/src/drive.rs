@@ -614,19 +614,6 @@ const DEFAULT_SYNC_FACTOR: u32 = 66517;
 /// fetch (VICE drivecpu.c:165-184 `cpu_reset` → `drv->clk_ptr = 6`).
 const DRIVE_RESET_CYCLES: u64 = 6;
 
-/// C64 main-CPU reset-sequence cycles the drive's catch-up clock observes BEFORE the
-/// first traced C64 instruction.
-///
-/// In the TS oracle the drive catches up to `c64Cpu.cycles`, whose origin includes
-/// the cycles the C64's own power-on reset consumed reading the $FFFC/$FFFD vector
-/// (cpu65xx-vice.ts:531-538). TRX64's shared `Cpu6510::reset_to()` injects PC
-/// directly and starts `clk` at 0, so its main-clock origin sits one cycle earlier
-/// than TS's. The drive's catch-up targets are therefore uniformly 1 lower than the
-/// golden's. We must NOT shift `reset_to()` (it would move the byte-exact C64
-/// CPU/VIC/CIA gate cycle stamps), so the drive instead seeds its sync accumulator
-/// with this offset at cold reset — a drive-boot-local correction.
-const C64_RESET_DRIVE_OFFSET: u64 = 1;
-
 impl Drive1541 {
     pub fn new() -> Self {
         Self {
@@ -1197,7 +1184,6 @@ impl Drive1541 {
             // Spec 872 — the 1581's electronics: CPU, CIA, WD (iec.c:108-111). The
             // mechanism and the medium are not the electronics.
             b.reset(dnr);
-            b.seed_reset_offset(self.sync_factor);
             self.drive_clk = 0;
             self.last_sample_pc = None;
             self.iec_drv_port = 0x85;
@@ -1262,11 +1248,11 @@ impl Drive1541 {
             };
             viacore::viacore_reset(&mut self.via2, &mut backend);
         }
-        // Seed the sync accumulator with the C64 power-on reset cycles the drive's
-        // catch-up clock observes in TS (see C64_RESET_DRIVE_OFFSET). This shifts the
-        // whole drive_clk schedule into phase with the golden without touching the
-        // shared C64 reset path.
-        self.advance_stop_clk(C64_RESET_DRIVE_OFFSET);
+        // drivecpu_reset takes `stop_clk = 0` and `last_clk = maincpu_clk`, and nothing else:
+        // the drive's catch-up target starts at the C64 clock of the reset, no cycle ahead of
+        // it. (A one-cycle seed here made the drive see every C64 clock one cycle early,
+        // and the release of CLK at the end of a 'file not found' turnaround one cycle
+        // before the reference does: issue #6.)
         // The electronics' reset knows nothing of a disk: the rotation model starts
         // empty. A caller that keeps the medium across the reset re-attaches it (the
         // drive's own `reset` / `set_power` do; `Machine::boot_from_dir` has none yet).
