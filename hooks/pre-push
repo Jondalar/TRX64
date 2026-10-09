@@ -14,6 +14,10 @@
 #   2. Does it carry CODE? Pushing nine commits of Markdown used to spend a full
 #      clippy + release-test + 7-game run proving that documentation had not
 #      broken the emulator.
+#      A release bump is not code either: when Cargo.toml changes only its
+#      `version =` line and Cargo.lock only those same two version strings, the
+#      two files count as inert (owner, 2026-10-09 — two cold 5-10 minute gates
+#      per release, for a string).
 #
 # The code test is a whitelist of INERT files, not a blacklist of code. Anything
 # the list does not recognise runs the gate — a new file type, a Cargo.toml, a
@@ -79,8 +83,35 @@ CHANGED=$(
         git show --pretty=format: --name-only "$sha" 2>/dev/null
       done
     else
-      git diff --name-only "$remote_sha" "$local_sha" 2>/dev/null ||
-        printf 'UNKNOWN-RANGE\n'
+      names=$(git diff --name-only "$remote_sha" "$local_sha" 2>/dev/null) ||
+        names=UNKNOWN-RANGE
+      # A release bump changes the workspace version and nothing else: the
+      # `version =` line in Cargo.toml and the same two strings for the
+      # workspace's own crates in Cargo.lock. The code it versions passed this
+      # gate on its own push a minute earlier; compiling every crate again to
+      # prove a version string costs minutes of every core for nothing. Any
+      # other line in either file — a dependency, a feature, a profile — keeps
+      # the file as code.
+      old_v=; new_v=
+      vlines=$(git diff -U0 "$remote_sha" "$local_sha" -- Cargo.toml 2>/dev/null |
+        grep '^[+-]' | grep -v '^[+-][+-]')
+      if [ -n "$vlines" ] &&
+         [ "$(printf '%s\n' "$vlines" | wc -l | tr -d ' ')" = "2" ]; then
+        old_v=$(printf '%s\n' "$vlines" | sed -n 's/^-version = "\([0-9.]*\)"$/\1/p')
+        new_v=$(printf '%s\n' "$vlines" | sed -n 's/^+version = "\([0-9.]*\)"$/\1/p')
+      fi
+      for f in $names; do
+        if [ "$f" = "Cargo.toml" ] && [ -n "$old_v" ] && [ -n "$new_v" ]; then
+          printf 'VERSION-ONLY:Cargo.toml\n'
+        elif [ "$f" = "Cargo.lock" ] && [ -n "$old_v" ] && [ -n "$new_v" ] &&
+             ! git diff -U0 "$remote_sha" "$local_sha" -- Cargo.lock 2>/dev/null |
+               grep '^[+-]' | grep -v '^[+-][+-]' |
+               grep -v -x -e "-version = \"$old_v\"" -e "+version = \"$new_v\"" >/dev/null; then
+          printf 'VERSION-ONLY:Cargo.lock\n'
+        else
+          printf '%s\n' "$f"
+        fi
+      done
     fi
   done | sed '/^$/d' | sort -u
 )
@@ -98,7 +129,7 @@ for f in $CHANGED; do
     *.md|*.markdown|*.txt|\
     *.png|*.jpg|*.jpeg|*.gif|*.svg|*.webp|\
     LICENSE|LICENSE.*|THANKS.md|AUTHORS.txt|.gitignore|.gitattributes|\
-    BRANCH-DELETION|NOT-A-PROTECTED-BRANCH)
+    BRANCH-DELETION|NOT-A-PROTECTED-BRANCH|VERSION-ONLY:*)
       ;;
     *)
       NEEDS_GATE=1
@@ -121,7 +152,7 @@ if [ "${GATE_DRYRUN:-0}" = "1" ]; then
       *.md|*.markdown|*.txt|\
       *.png|*.jpg|*.jpeg|*.gif|*.svg|*.webp|\
       LICENSE|LICENSE.*|THANKS.md|AUTHORS.txt|.gitignore|.gitattributes|\
-      BRANCH-DELETION|NOT-A-PROTECTED-BRANCH) ;;
+      BRANCH-DELETION|NOT-A-PROTECTED-BRANCH|VERSION-ONLY:*) ;;
       *) printf '    %s\n' "$f" >&2 ;;
     esac
   done
