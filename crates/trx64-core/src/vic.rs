@@ -2776,12 +2776,12 @@ impl VicII {
 
     /// PORT OF: vicii-mem.c:482 vicii_poke — a store from the host (the monitor, a pasted
     /// register file), not a CPU cycle. A colour register goes straight to the draw
-    /// (`vicii_monitor_colreg_store`), the way every colour store used to: several of them
+    /// (`vicii_monitor_colreg_store`): several of them
     /// in a row all land, where the pending-write latch of a CPU store holds only the last.
     pub fn poke_reg(&mut self, offset: u8, value: u8) {
         self.write_reg(offset, value);
         let addr = offset & 0x3f;
-        if (0x20..=0x2e).contains(&addr) && !self.color_latency {
+        if (0x20..=0x2e).contains(&addr) {
             let v4 = value & 0x0f;
             self.cregs[addr as usize] = v4;
             self.draw_last_color_reg = addr;
@@ -2943,52 +2943,42 @@ impl VicII {
         self.regs[0x17] = value;
     }
 
-    /// PORT OF: vicii-mem.c:270 color_reg_store + vicii-draw-cycle.c:120
-    /// vicii_monitor_colreg_store. Latches the write for draw_colors8 (last_color
-    /// reg/value, used for the grey-dot + per-cycle resolution) AND eagerly updates
-    /// cregs[addr] so the COL_D02x token resolves to the live colour on the very
-    /// next drawn pixel. `addr` = the $D020-$D02E offset; `v4` = the 4-bit value
-    /// already stored in regs.
+    /// PORT OF: vicii-mem.c:270 color_reg_store. The write waits in `last_color_reg` /
+    /// `last_color_value`; `draw_colors8` takes it into its statics at the end of the NEXT
+    /// cycle's draw (`update_cregs`) and applies it to `cregs` at the start of the one after,
+    /// where the 8565 also puts its grey dot. Nothing else happens on a CPU store, on any
+    /// chip (a host store is [`poke_reg`](Self::poke_reg)). `addr` = the $D020-$D02E offset;
+    /// `v4` = the 4-bit value already stored in regs.
+    ///
+    /// Above divider 1 on the Ultimate (Spec 868) a CPU can write a colour register more
+    /// than once per PHI2 cycle, which the single latch cannot hold: the per-pixel slots
+    /// then carry the cycle's values and the draw resolves through them, as it does for the
+    /// latch at divider 1. VICE has no such machine; `cregs` follows through the same latch.
     #[inline]
     fn color_reg_store(&mut self, addr: u8, v4: u8) {
-        // Spec 868 — a CPU that can write a colour register more than once per PHI2 cycle
-        // is saying something the single latch below cannot hold. Gated on the U64
-        // profile AND a divider above one, so every C64 and C128 keeps VICE's model
-        // exactly: same code, same order, same bytes. Every colour register, `$D020` to
-        // `$D02E`: the draw resolves them all through the same token lookup.
-        let turbo = self.turbo_div > 1 && self.speed_profile == SpeedProfile::U64;
-        if turbo {
+        if self.turbo_div > 1 && self.speed_profile == SpeedProfile::U64 {
             let r = usize::from(addr - 0x20);
             let pixel = SubCycleColour::pixel_for(self.turbo_phase, self.turbo_div);
+            // What every pixel shows before the first store of this cycle: the register's
+            // value as the draw will have it — a write still waiting counts.
+            let held = if self.last_color_reg == addr {
+                self.last_color_value
+            } else if self.draw_last_color_reg == addr {
+                self.draw_last_color_value
+            } else {
+                self.cregs[addr as usize]
+            };
             let sc = &mut self.subcycle_colour;
             if sc.mask & (1 << r) == 0 {
-                // Before the first store this cycle, every pixel still shows what the
-                // register already held.
-                sc.slots[r] = [self.cregs[addr as usize]; 8];
+                sc.slots[r] = [held; 8];
                 sc.mask |= 1 << r;
             }
             let mut one = SubCycleColour { reg: addr, slots: sc.slots[r] };
             one.set_from(pixel, v4);
             sc.slots[r] = one.slots;
         }
-
         self.last_color_reg = addr;
         self.last_color_value = v4;
-        if !self.color_latency && !turbo {
-            // The 8565 / 8562: VICE's own `color_reg_store` (`vicii-mem.c:270`) and nothing
-            // more. The write waits in `vicii.last_color_reg`; `draw_colors8` takes it into
-            // its statics at the end of the NEXT cycle's draw and applies it, with the grey
-            // dot, in the one after — one dot, on the pixel the new colour first shows on.
-            // Pushing it into `cregs` and the statics here as well (below) would apply it a
-            // cycle early AND leave it pending for a second draw: two dots.
-            return;
-        }
-        // vicii_monitor_colreg_store: cregs[reg]=value + draw_last_color_reg/value. The 6569
-        // path and the turbo path keep it: a cycle earlier than VICE's `vicii_store`, which
-        // the 6569 gates and the turbo calibration (Spec 868) are built on.
-        self.cregs[addr as usize] = v4;
-        self.draw_last_color_reg = addr;
-        self.draw_last_color_value = v4;
     }
 
     /// The value a colour register currently holds ($D020-$D02E, by $D000-offset).

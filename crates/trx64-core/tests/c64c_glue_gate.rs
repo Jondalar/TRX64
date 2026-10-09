@@ -601,3 +601,31 @@ fn the_6569_has_no_grey_dot_on_a_sprite_either() {
 fn probe_for(name: &str, sprite_x: u16) -> Run {
     run_dot(name, 0xd025, 5, Some(sprite_x), false)
 }
+
+/// A colour store lands where VICE's draw puts it. The store waits in `last_color_reg`; the
+/// draw after the store's takes it up, and the one after that applies it (`draw_colors8`).
+/// On the 6569 `draw_colors_6569` resolves a pixel behind the token, so that draw's pixel 0 is
+/// still the old colour and the new one starts at pixel 1: draw-buffer x `(r + 1) * 8 + 1`.
+/// On the 8565 `draw_colors_8565` resolves in place: pixel 0 is the grey dot, the new colour
+/// starts at pixel 1 as well. So the two chips change colour at the same pixel, and the
+/// 8565 has the dot in front of it.
+#[test]
+fn a_colour_store_changes_the_colour_where_vice_puts_it_on_both_chips() {
+    for (pal, c) in [("c64-pal", "c64c-pal"), ("c64-ntsc", "c64c-ntsc")] {
+        let a = run_dot(pal, 0xd020, 1, None, true);
+        let b = run_dot(c, 0xd020, 1, None, true);
+        assert_eq!(a.raster_cycle, b.raster_cycle, "the same program stores in the same cycle");
+        let x0 = row(pal).window.x0();
+        let (_, y) = a.at;
+        let first_new = |r: &Run| (0..r.width).find(|&x| r.canvas[y * r.width + x] != 0).unwrap();
+        let want = dot_x(a.raster_cycle) + 1 - x0;
+        assert_eq!(first_new(&a), want, "{pal}: the 6569 draws the new colour from pixel 1 of the second draw");
+        assert_eq!(first_new(&b), want - 1, "{c}: the 8565's first changed pixel is the grey dot");
+        assert_eq!(b.canvas[y * b.width + want - 1], 15);
+        // Everything else is the same picture.
+        let mut undotted = b.canvas.clone();
+        undotted[y * b.width + want - 1] = 0;
+        assert!(undotted == a.canvas, "{pal} and {c} differ by more than the dot");
+        assert!((0..a.width).all(|x| x < want || a.canvas[y * a.width + x] == 1), "{pal}: the new colour holds to the end of the line");
+    }
+}

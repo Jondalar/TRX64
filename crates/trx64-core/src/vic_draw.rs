@@ -602,14 +602,12 @@ mod tests {
         draw_colors8(&mut v);
 
         let row: Vec<u8> = (0..8).map(|i| v.dbuf[i]).collect();
-        // Pixel 0 is the 8565's grey dot, not a miss: `draw_colors_8565` replaces the
-        // first pixel with $0f when the register it names was written in this very
-        // cycle, which is the chip's own behaviour and was here before Spec 868. Pixels
-        // 1..7 are the eight values arriving one per pixel — the thing that could not
-        // happen before.
+        // The eight values arrive one per pixel. No grey dot here: it belongs to the draw
+        // that applies the latch (`vicii_store` waits one draw), and these slots are what
+        // the first draw shows.
         assert_eq!(
             row,
-            vec![0x0f, 2, 3, 4, 5, 6, 7, 8],
+            vec![1, 2, 3, 4, 5, 6, 7, 8],
             "each pixel takes the value in force when the VIC sampled it"
         );
         assert_eq!(
@@ -724,10 +722,14 @@ mod tests {
         for value in 1..=8u8 {
             v.write_reg(0x20, value);
         }
-        draw_colors8(&mut v);
+        // The latch holds the last of them; the second draw applies it (`vicii_store`).
+        for cycle in 0..2 {
+            v.dbuf_offset = cycle * 8;
+            draw_colors8(&mut v);
+        }
 
         // The 6569 resolves a pixel behind: pixel 0 is the one before, 1..7 are one colour.
-        let row: Vec<u8> = (1..8).map(|i| v.dbuf[i]).collect();
+        let row: Vec<u8> = (9..16).map(|i| v.dbuf[i]).collect();
         assert_eq!(row, vec![8; 7], "one latch, one colour: a 6510 cannot say more than one thing per cycle");
     }
 
