@@ -145,8 +145,19 @@ jobs:
             archive: zip
             container: ''
     runs-on: ${{ matrix.os }}
-    # Empty string = run directly on the runner. Only the Linux entry sets an image.
-    container: ${{ matrix.container }}
+    # Empty image = run directly on the runner. Only the Linux entries set one.
+    #
+    # Pulled as a Docker Hub user, not anonymously: an anonymous pull counts against the
+    # runner's IP, and GitHub's runners share their IPs, so other people's workflows used up
+    # the quota and the 0.12.9 Linux jobs died in "Initialize containers" with
+    # `toomanyrequests`. The pull happens before the first step, so a `docker login` step
+    # would come too late — the credentials have to sit here. Secrets: DOCKERHUB_USERNAME
+    # and DOCKERHUB_TOKEN (a read-only public-repo token), set on this repository.
+    container:
+      image: ${{ matrix.container }}
+      credentials:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
