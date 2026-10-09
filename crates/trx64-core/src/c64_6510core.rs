@@ -728,6 +728,14 @@ pub struct C64Core6510 {
     /// opcode was fetched) because the bus asked to stop there. The next `run` skips its
     /// prologue once — the entry already happened — and fetches the handler's first opcode.
     pub entry_paused: bool,
+    /// Monitor single-step gate (one-shot, owned by the stepping caller, never persisted):
+    /// stop after ANY hardware IRQ/NMI entry, before the handler's first opcode — the
+    /// VICE `DO_INTERRUPT` step stop. Must be off outside a monitor step.
+    pub step_entry_stop: bool,
+    /// Monitor single-step gate (one-shot, never persisted): run the prologue (alarms +
+    /// the interrupt dispatch) and return BEFORE the opcode fetch whether or not an
+    /// interrupt was taken — the boundary check VICE does after the previous instruction.
+    pub step_prologue_only: bool,
     /// 0x80 if N set, else 0 (VICE flag_n cache). dtv:115.
     pub flag_n: u8,
     /// 0 iff Z set; non-zero iff Z clear (VICE flag_z cache). dtv:116.
@@ -789,6 +797,8 @@ impl C64Core6510 {
             reg_p: P_UNUSED & !(P_ZERO | P_SIGN),
             reg_pc: 0,
             entry_paused: false,
+            step_entry_stop: false,
+            step_prologue_only: false,
             flag_n: 0,
             flag_z: 1, // Z clear at power-on.
             clk: 6,
@@ -2707,6 +2717,9 @@ fn run<B: C64Core6510Bus>(ex: &mut Exec<B>) -> i32 {
         // --- Prologue (dtv:1734-1772) ---
         // Resuming after a debugger stop at the handler entry: the entry (and its alarms)
         // already ran at this clk; go straight to the handler's first opcode.
+        if ex.core.step_prologue_only && ex.core.entry_paused {
+            return ex.jam_result; // already past this boundary's interrupt check
+        }
         let resumed = std::mem::replace(&mut ex.core.entry_paused, false);
         if !resumed {
 
@@ -2739,12 +2752,15 @@ fn run<B: C64Core6510Bus>(ex: &mut Exec<B>) -> i32 {
                     ex.int.global_pending_int &= !IK_IRQPEND;
                 }
                 ex.process_alarms();
-                if entered && ex.bus.stop_at_entry(ex.core.reg_pc) {
+                if entered && (ex.core.step_entry_stop || ex.bus.stop_at_entry(ex.core.reg_pc)) {
                     ex.core.entry_paused = true;
                     return ex.jam_result;
                 }
             }
         }
+        }
+        if ex.core.step_prologue_only {
+            return ex.jam_result;
         }
 
         // --- FETCH (dtv:1792-1812 + c64cpusc.c:152-179) ---

@@ -680,7 +680,12 @@ pub fn execute_one<O: Observer>(
     // pairs the recorded writes with the pre-state header `begin` opened (a no-op when
     // the ring is disabled or `begin` never ran).
     if let Some(dr) = bus.delta_ring.as_deref_mut() {
-        dr.commit();
+        if core.step_prologue_only && core.clk == pre_clk {
+            // The monitor's boundary check took no interrupt: no cycle ran, nothing to undo.
+            dr.abort();
+        } else {
+            dr.commit();
+        }
     }
     result
 }

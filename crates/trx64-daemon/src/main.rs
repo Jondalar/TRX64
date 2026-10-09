@@ -697,16 +697,13 @@ fn full_machine_gate_for(machine: &trx64_core::Machine, exerciser: bool) -> bool
 }
 
 /// A passive observer that records whether a hardware IRQ/NMI was DISPATCHED during
-/// one instruction step (and which vector). The verbatim C64 core fires
+/// one core call (and which vector). The verbatim C64 core fires
 /// `Observer::on_interrupt(vector, clk)` at the TOP of the NMI ($FFFA) / IRQ ($FFFE)
-/// branch of `do_interrupt` (c64_6510core.rs:2174 / :2207) — a pure callback that
-/// does NOT alter CPU/clk/int state. This is the AUTHORITATIVE interrupt-entry
-/// signal on the full-machine path: unlike a stack-pointer-delta heuristic, it is
-/// exact even though TRX64's verbatim core (like VICE) FOLDS the 7-cycle interrupt
-/// entry AND the first handler opcode into the SAME instruction step (so the SP
-/// delta across the step is NOT a clean −3). All other Observer hooks are no-ops, so
-/// the VM runs byte-identically to the `NullSink` path (Spec 723 observer-effect: a
-/// passive tap, zero execution effect).
+/// branch of `do_interrupt` — a pure callback that does NOT alter CPU/clk/int state.
+/// This is the AUTHORITATIVE interrupt-entry signal on the full-machine path (BRK uses
+/// `do_irqbrk` and does not fire it). All other Observer hooks are no-ops, so the VM runs
+/// byte-identically to the `NullSink` path (Spec 723 observer-effect: a passive tap, zero
+/// execution effect).
 struct InterruptCaptureObserver {
     /// The vector of the LAST interrupt dispatched in the step (0xfffa NMI / 0xfffe
     /// IRQ), or None if none. At most one hardware entry per single step.
@@ -727,74 +724,255 @@ impl Observer for InterruptCaptureObserver {
     }
 }
 
-/// Advance exactly one instruction with the same machine-path selection as
-/// [`step_one_instruction`], but threading an [`InterruptCaptureObserver`] so the
-/// caller learns whether a hardware IRQ/NMI was dispatched in the step. Returns the
-/// captured vector (None / 0xfffa / 0xfffe). The observer is passive — the VM state
-/// is byte-identical to the `NullSink` path.
-fn step_one_capture_interrupt(session: &mut Session) -> Option<u16> {
+/// Run ONE core call under the monitor's step gates. `entry_stop` is always armed: an
+/// IRQ/NMI entry ends the call right after the 7-cycle entry, before the handler's first
+/// opcode (VICE `DO_INTERRUPT` + `monitor_check_icount`). `prologue_only` runs just the
+/// boundary (alarms + the interrupt dispatch) and returns before any opcode fetch — the
+/// check VICE makes between two instructions. Both gates are one-shots set around the call
+/// and cleared again, so nothing outside a step ever sees them. Returns the vector of the
+/// IRQ ($FFFE) / NMI ($FFFA) dispatched in the call, from the core's own `on_interrupt`.
+fn run_one_gated(session: &mut Session, prologue_only: bool) -> Option<u16> {
     // Spec 723: SAME bus gate the run path (`run_cycle_budget`) uses — STEP must see the
     // machine the scenario RUNS on (incl. the `vic`-directed full-machine engage).
     let full_machine = full_machine_gate(session);
     let mut obs = InterruptCaptureObserver::new();
     if full_machine {
+        session.machine.c64_core.step_entry_stop = true;
+        session.machine.c64_core.step_prologue_only = prologue_only;
         session.machine.run_for_full_capped(999_999, 1, &mut obs, |_, _, _, _, _, _, _| {});
-    } else {
+        session.machine.c64_core.step_entry_stop = false;
+        session.machine.c64_core.step_prologue_only = false;
+    } else if !prologue_only {
+        // The CPU-only exerciser path takes no hardware interrupts.
         session.machine.run_for_capped(999_999, 1, &mut obs);
     }
     obs.vector
 }
 
-/// Classify ONE single step like stepping.ts `stepOne` (78-103), then apply it to
-/// the FlowTracker (= the TS `this.apply(r)` calls in stepInto/stepOver/…). Captures
-/// the pre-step PC/SP/opcode, runs the step, and classifies the StepEventType.
-///
-/// PORT NOTE (why this is NOT a literal SP−3 test): the TS `Cpu65xxVice.runFor(1)`
-/// lands at the bare handler VECTOR with the first handler opcode NOT folded in
-/// (stepping.ts:19-20), so TS detects the entry by a clean SP−3. TRX64's verbatim
-/// full-machine core (VICE-faithful) FOLDS the 7-cycle entry + the first handler
-/// opcode into one step, so the SP delta is NOT −3 (e.g. entry −3 then the KERNAL's
-/// `$FF48 PHA` −1 ⇒ −4, landing at $FF49). The AUTHORITATIVE entry signal is the
-/// core's `on_interrupt(vector)` callback, captured passively by
-/// [`step_one_capture_interrupt`]. The OBSERVABLE FlowTracker behaviour is identical
-/// to TS: an interrupt pushes a frame, RTI pops it.
-///
-///   on_interrupt fired (vector 0xfffa) → int, flow=nmi
-///   on_interrupt fired (vector 0xfffe) → int, flow=irq
-///   op0==BRK ($00)                     → int, flow=brk  (BRK uses do_irqbrk, which
-///                                        does NOT fire on_interrupt — detect by op)
-///   op0==RTI ($40)                     → rti (pop the innermost frame)
-///   else                               → normal / jsr / rts (no flow-stack change)
-fn step_one_with_flow(session: &mut Session, flow: &mut FlowTracker) {
-    let pc0 = session.machine.cpu6510.reg_pc;
-    let op0 = session.machine.peek_lens(pc0, "cpu");
-    let int_vector = step_one_capture_interrupt(session);
-    let pc1 = session.machine.cpu6510.reg_pc;
-    let cycle_abs = session.machine.clk;
+/// How one step boundary feeds the FlowTracker.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FlowFeed {
+    /// Not at all (raw stepping: until, sd, the API verbs).
+    Off,
+    /// The executed opcode (rti pops, BRK pushes) AND an interrupt entry (pushes).
+    Full,
+    /// The executed opcode only: an interrupt entry is run through by the caller, and a
+    /// run-through is balanced, so it is not applied (stepping.ts stepOver).
+    OpOnly,
+}
 
-    let (is_int, is_rti, kind, entered_at_pc) = if let Some(vec) = int_vector {
-        // Hardware IRQ/NMI dispatched in this step. enteredAtPc = the handler entry
-        // (the value at the vector — the true handler start, before the folded first
-        // opcode advanced PC), nmi iff the vector was $FFFA.
-        let lo = session.machine.peek_lens(vec, "cpu") as u16;
-        let hi = session.machine.peek_lens(vec.wrapping_add(1), "cpu") as u16;
-        let handler = lo | (hi << 8);
-        let k = if vec == 0xfffa { FlowKind::Nmi } else { FlowKind::Irq };
-        (true, false, k, handler)
-    } else if op0 == 0x00 {
-        // BRK = software interrupt entry (do_irqbrk → $FFFE, no on_interrupt). The
-        // handler entry is the value at the IRQ/BRK vector $FFFE.
+/// What one step boundary did.
+struct Boundary {
+    /// Vector of an IRQ/NMI entered at this boundary.
+    vector: Option<u16>,
+    /// The entry came BEFORE the opcode: the opcode at the old PC did not run.
+    entry_first: bool,
+    /// The opcode's own cycle cost (0 when `entry_first`) — what `next`/`ret` report.
+    exec_cyc: u64,
+    /// Everything the boundary cost, entry included — what `step` reports.
+    total_cyc: u64,
+}
+
+fn flow_class_entry(session: &Session, vec: u16, pc_before: u16) -> StepClass {
+    // The entry is its own step: the machine now stands on the handler's first opcode.
+    let handler = session.machine.cpu6510.reg_pc;
+    let k = if vec == 0xfffa { FlowKind::Nmi } else { FlowKind::Irq };
+    StepClass { is_int: true, is_rti: false, flow: k, pc0: pc_before, pc1: handler, cycle_abs: session.machine.clk }
+}
+
+fn flow_class_op(session: &Session, pc0: u16, op0: u8, pc1: u16) -> StepClass {
+    let cycle_abs = session.machine.clk;
+    if op0 == 0x00 {
+        // BRK = software interrupt entry (do_irqbrk → $FFFE, no on_interrupt). It is an
+        // opcode, not VICE's DO_INTERRUPT: it executes in one step and lands on the handler.
         let lo = session.machine.peek_lens(0xfffe, "cpu") as u16;
         let hi = session.machine.peek_lens(0xffff, "cpu") as u16;
-        (true, false, FlowKind::Brk, lo | (hi << 8))
+        StepClass { is_int: true, is_rti: false, flow: FlowKind::Brk, pc0, pc1: lo | (hi << 8), cycle_abs }
     } else if op0 == 0x40 {
-        // RTI = interrupt return (pop).
-        (false, true, FlowKind::Main, pc1)
+        StepClass { is_int: false, is_rti: true, flow: FlowKind::Main, pc0, pc1, cycle_abs }
     } else {
-        // normal / jsr / rts — no interrupt-flow change.
-        (false, false, FlowKind::Main, pc1)
+        StepClass { is_int: false, is_rti: false, flow: FlowKind::Main, pc0, pc1, cycle_abs }
+    }
+}
+
+/// Take an interrupt that is due at the CURRENT boundary and stop on the handler's first
+/// opcode; nothing else runs. `None` when nothing was due.
+fn take_due_interrupt(session: &mut Session, flow: &mut FlowTracker, feed: FlowFeed) -> Option<u16> {
+    if !full_machine_gate(session) {
+        return None;
+    }
+    let pc_before = session.machine.cpu6510.reg_pc;
+    let vec = run_one_gated(session, true)?;
+    if feed == FlowFeed::Full {
+        flow.apply(&flow_class_entry(session, vec, pc_before));
+    }
+    Some(vec)
+}
+
+/// One monitor step, VICE-conform (`6510core.c` DO_INTERRUPT + `monitor_check_icount`):
+/// execute ONE instruction, then do the boundary check VICE does after it — when an IRQ/NMI
+/// is taken there the step ENDS right after the 7-cycle entry, on the handler's first
+/// opcode ($FF48 for the KERNAL IRQ, $FE43 NMI), SP-3, that opcode not yet executed.
+/// A step that starts with an interrupt already due ends at its entry instead (the opcode
+/// at the old PC has not run). `settle` is the after-the-instruction boundary check; the
+/// `until` scan skips it (its next step's own prologue takes the entry and stops there).
+fn step_boundary(session: &mut Session, flow: &mut FlowTracker, feed: FlowFeed, settle: bool) -> Boundary {
+    let pc0 = session.machine.cpu6510.reg_pc;
+    let op0 = session.machine.peek_lens(pc0, "cpu");
+    let clk0 = session.machine.clk;
+    let mut b = Boundary { vector: None, entry_first: false, exec_cyc: 0, total_cyc: 0 };
+    if let Some(vec) = run_one_gated(session, false) {
+        // Due at the start: the entry ended the step, the opcode did not run.
+        b.vector = Some(vec);
+        b.entry_first = true;
+        if feed == FlowFeed::Full {
+            flow.apply(&flow_class_entry(session, vec, pc0));
+        }
+    } else {
+        let pc_after = session.machine.cpu6510.reg_pc;
+        b.exec_cyc = session.machine.clk.wrapping_sub(clk0);
+        if feed != FlowFeed::Off {
+            flow.apply(&flow_class_op(session, pc0, op0, pc_after));
+        }
+        if settle {
+            if let Some(vec) = take_due_interrupt(session, flow, feed) {
+                b.vector = Some(vec);
+            }
+        }
+    }
+    b.total_cyc = session.machine.clk.wrapping_sub(clk0);
+    b
+}
+
+/// Step one instruction without touching the FlowTracker (until, sd, the API verbs).
+fn step_one_instruction_gated(session: &mut Session, settle: bool) -> Boundary {
+    let mut scratch = FlowTracker::new();
+    step_boundary(session, &mut scratch, FlowFeed::Off, settle)
+}
+
+/// Step one instruction into the FlowTracker (the monitor's `z`, `ret`, `sf`/`nf`).
+///
+/// PORT NOTE: an IRQ/NMI entry is its OWN step, as in VICE and in the old TS runtime
+/// (stepping.ts:19-20): the step ends right after the 7-cycle entry with PC on the handler
+/// start and SP-3, so the FlowTracker sees the clean SP-3 shape and `enteredAtPc` is the PC
+/// the machine now stands on. The core only stops there while the monitor's step gates are
+/// armed ([`run_one_gated`]); `run`/`continue` still fold the entry and the first opcode.
+/// The entry signal is the core's `on_interrupt(vector)` callback. BRK is an opcode: it
+/// runs in one step (VICE has no DO_INTERRUPT for it) and is classified by op.
+///
+///   interrupt entered ($FFFA / $FFFE) → int, flow=nmi / irq, its own step
+///   op0==BRK ($00)                    → int, flow=brk
+///   op0==RTI ($40)                    → rti (pop the innermost frame)
+///   else                              → normal / jsr / rts (no flow-stack change)
+fn step_one_with_flow(session: &mut Session, flow: &mut FlowTracker) -> Boundary {
+    step_boundary(session, flow, FlowFeed::Full, true)
+}
+
+/// VICE `monitor_check_icount` while stepping with `skip_jsrs` (monitor.c:2925): the run
+/// ends at the first boundary where `level == 0`. A JSR or an interrupt entry raises the
+/// level, an RTS or RTI lowers it (never below 0), so nested calls and nested interrupts
+/// balance. A breakpoint stops the run early at the boundary it sits on; `iter_cap` and the
+/// optional cycle budget end it as `Cap`. Precondition: the machine stands on a boundary
+/// whose interrupt check is done.
+fn run_through(
+    session: &mut Session,
+    flow: &mut FlowTracker,
+    feed: FlowFeed,
+    bp_set: &std::collections::HashSet<u16>,
+    mut level: i32,
+    iter_cap: u64,
+    cycle_budget: Option<u64>,
+) -> StopWhy {
+    let clk0 = session.machine.clk;
+    let mut iters: u64 = 0;
+    loop {
+        if level == 0 {
+            return StopWhy::Clean;
+        }
+        // No `iters > 0` guard: the first boundary is the callee's / the handler's entry
+        // point, which is exactly where people put breakpoints.
+        if bp_set.contains(&session.machine.cpu6510.reg_pc) {
+            return StopWhy::UserBp;
+        }
+        if iters >= iter_cap || cycle_budget.is_some_and(|c| session.machine.clk.wrapping_sub(clk0) >= c) {
+            return StopWhy::Cap;
+        }
+        let op = session.machine.peek_lens(session.machine.cpu6510.reg_pc, "cpu");
+        let b = step_boundary(session, flow, feed, true);
+        iters += 1;
+        if !b.entry_first {
+            match op {
+                0x20 => level += 1,
+                0x60 | 0x40 => level -= 1,
+                _ => {}
+            }
+            if level < 0 {
+                level = 0;
+            }
+        }
+        if b.vector.is_some() {
+            level += 1;
+        }
+    }
+}
+
+/// Step OVER one instruction like VICE `n` (monitor.c:2617, 2925, 2974): a JSR is run
+/// through to its RTS, and so is an interrupt taken during the step — it counts as a level
+/// like a JSR does, runs through its RTI, and the step ends back in the interrupted code.
+/// The instruction stepped over is the one at PC; an interrupt already due at the start is
+/// run through first. Returns (the stepped instruction's own cycles, why it stopped).
+fn step_over_one(
+    session: &mut Session,
+    flow: &mut FlowTracker,
+    bp_set: &std::collections::HashSet<u16>,
+    iter_cap: u64,
+    cycle_budget: Option<u64>,
+) -> (u64, StopWhy) {
+    if take_due_interrupt(session, flow, FlowFeed::OpOnly).is_some() {
+        let why = run_through(session, flow, FlowFeed::OpOnly, bp_set, 1, iter_cap, cycle_budget);
+        if why != StopWhy::Clean {
+            return (0, why);
+        }
+    }
+    let pc = session.machine.cpu6510.reg_pc;
+    let is_jsr = session.machine.peek_lens(pc, "cpu") == 0x20;
+    // A JSR's own flow classification is not applied (stepOver run-through), as before.
+    let feed = if is_jsr { FlowFeed::Off } else { FlowFeed::OpOnly };
+    let b = step_boundary(session, flow, feed, true);
+    let level = i32::from(is_jsr) + i32::from(b.vector.is_some());
+    let why = run_through(session, flow, FlowFeed::OpOnly, bp_set, level, iter_cap, cycle_budget);
+    (b.exec_cyc, why)
+}
+
+/// VICE `ret` (monitor.c:2635): run until the current frame returns. The level starts at 0
+/// on an RTS/RTI, 2 on a JSR, else 1; interrupts taken on the way run through like calls.
+/// The FlowTracker sees every step (stepping.ts runReturn). Returns (the last step's cycles,
+/// why it stopped).
+fn run_return(
+    session: &mut Session,
+    flow: &mut FlowTracker,
+    bp_set: &std::collections::HashSet<u16>,
+    iter_cap: u64,
+) -> (u64, StopWhy) {
+    // An interrupt already due at the start is run through first, so the frame being
+    // returned from is still the one at PC when the level is read.
+    if take_due_interrupt(session, flow, FlowFeed::Full).is_some() {
+        let why = run_through(session, flow, FlowFeed::Full, bp_set, 1, iter_cap, None);
+        if why != StopWhy::Clean {
+            return (0, why);
+        }
+    }
+    let pc = session.machine.cpu6510.reg_pc;
+    let op = session.machine.peek_lens(pc, "cpu");
+    let level0 = match op {
+        0x60 | 0x40 => 0,
+        0x20 => 2,
+        _ => 1,
     };
-    flow.apply(&StepClass { is_int, is_rti, flow: kind, pc0, pc1: entered_at_pc, cycle_abs });
+    let b = step_one_with_flow(session, flow);
+    let level = level0 + i32::from(b.vector.is_some());
+    let why = run_through(session, flow, FlowFeed::Full, bp_set, level, iter_cap, None);
+    (b.exec_cyc, why)
 }
 
 /// Spec 271 — one in-process batch (= c64re `BatchEntry`). Results are stored as a
@@ -3163,7 +3341,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                     order.push(pc);
                 }
                 *count.entry(pc).or_insert(0) += 1;
-                step_one_instruction(&mut st.session);
+                step_one_instruction_gated(&mut st.session, true);
             }
             let land = st.session.machine.cpu6510.reg_pc;
             // Restore the pre-sd machine state (non-destructive). On a restore error
@@ -3300,7 +3478,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 bps.insert(e.pc);
             }
             if bps.contains(&st.session.machine.cpu6510.reg_pc) {
-                step_one_instruction(&mut st.session);
+                step_one_instruction_gated(&mut st.session, false);
             }
             let start_clk = st.session.machine.clk;
             // TWO caps, because they count different things. The reference's 20M is an
@@ -3314,7 +3492,8 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             let mut executed: u64 = 0;
             let mut hit = false;
             while executed < CAP {
-                step_one_instruction(&mut st.session);
+                // An IRQ/NMI entry is a boundary of its own, so `until $FF48` can land on it.
+                step_one_instruction_gated(&mut st.session, false);
                 executed += 1;
                 let pc = st.session.machine.cpu6510.reg_pc;
                 if bps.contains(&pc) {
@@ -3349,20 +3528,20 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
 
         // ---- Stepping (§4.2/§4.3). z/step/si = step into; n/next/so = step over;
         // ret/return = run until current frame returns. 1:1 with stepping.ts
-        // stepInto/stepOver/runReturn. The reported cycle count is the LANDING
-        // instruction's OWN cycle cost (`r.cyc`), NOT the elapsed total — for
-        // `next`/`ret` that is the JSR's / the RTS-RTI's own cost (stepping.ts:197,
-        // 217, 242). TRX64 has no FlowTracker, so the `landLine` flow tag /
-        // stop-reason suffix (TS `[irq]` / `, hit user bp`) is dropped; the
-        // instruction landing line + `(tag, N cyc)` shape is matched. SP semantics:
-        // TRX64's stack-pop RTS/RTI raises SP above the entry level (sp1 > sp0).
+        // stepInto/stepOver/runReturn, and VICE-conform around hardware interrupts
+        // (monitor.c monitor_check_icount / monitor_check_icount_interrupt): `z` ends on
+        // an IRQ/NMI's first handler opcode (entry done, SP-3, opcode not run); `n` and
+        // `ret` count an interrupt as a level like a JSR, run it through its RTI and end
+        // back in the interrupted code. The reported cycle count is the stepped
+        // instruction's OWN cost for `next`/`ret` (the JSR's / the RTS-RTI's, stepping.ts:
+        // 197, 217, 242), the whole step for `step`. The landing line carries the flow tag
+        // (`[irq]`) and a stop-reason suffix (`, hit user bp`, `, CAP`).
         "z" | "step" | "si" => {
             st.session.running = false;
-            let clk0 = st.session.machine.clk;
-            // stepInto (stepping.ts:195-198): one instruction (may enter an IRQ/NMI),
-            // tracked into the FlowTracker so `flow` reflects the live interrupt frame.
-            step_one_with_flow(&mut st.session, &mut st.mon.flow);
-            let cyc = st.session.machine.clk.wrapping_sub(clk0); // r.cyc (single step)
+            // stepInto (stepping.ts:195-198): one instruction; an IRQ/NMI taken at its
+            // boundary ends the step on the handler entry. Tracked into the FlowTracker
+            // so `flow` reflects the live interrupt frame.
+            let cyc = step_one_with_flow(&mut st.session, &mut st.mon.flow).total_cyc;
             let pc = st.session.machine.cpu6510.reg_pc;
             st.mon.state.disasm_cursor = Some(pc);
             let (_, line) = addr_spans::disasm_line(|a| st.session.machine.peek_lens(a, "cpu"), pc, SpanSpace::C64);
@@ -3370,55 +3549,11 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
         }
         "n" | "next" | "so" => {
             st.session.running = false;
-            let start_pc = st.session.machine.cpu6510.reg_pc;
-            let init_sp = st.session.machine.cpu6510.reg_sp;
-            let opcode = st.session.machine.peek_lens(start_pc, "cpu");
-            let is_jsr = opcode == 0x20;
             let bp_set: std::collections::HashSet<u16> =
                 st.mon.breakpoints.entries.iter().map(|e| e.pc).collect();
-            // Execute the instruction at PC; `r_cyc` = ITS own cost (the value TS
-            // reports for `next`, even when it's a JSR — stepping.ts:217). Track the
-            // single instruction into the FlowTracker UNLESS it's a JSR: stepOver
-            // (stepping.ts:209-228) only apply()s for single instructions
-            // (normal/rts/rti — and an `int` is run-through, not applied here); a JSR
-            // body is run-through via runUntilReturn (balanced), so it is NOT applied.
-            let clk0 = st.session.machine.clk;
-            if is_jsr {
-                step_one_instruction(&mut st.session);
-            } else {
-                step_one_with_flow(&mut st.session, &mut st.mon.flow);
-            }
-            let r_cyc = st.session.machine.clk.wrapping_sub(clk0);
-            let mut why = StopWhy::Clean;
-            if is_jsr {
-                // runUntilReturn: run the subroutine body until it RTSes back (SP
-                // restored to the entry level → balanced) or a user bp trips.
-                let next_pc = start_pc.wrapping_add(3);
-                const CAP: u64 = 5_000_000;
-                let mut iters: u64 = 0;
-                loop {
-                    let pc = st.session.machine.cpu6510.reg_pc;
-                    let sp = st.session.machine.cpu6510.reg_sp;
-                    if (pc == next_pc && sp >= init_sp) || (sp > init_sp) {
-                        break;
-                    }
-                    // No `iters > 0` guard: the JSR has ALREADY executed before this
-                    // loop, so on the first pass `pc` is the callee's entry point — not
-                    // the instruction we just stepped off. Skipping the check there meant
-                    // a breakpoint on a subroutine's first instruction was stepped over
-                    // in silence, which is exactly where people put them.
-                    if bp_set.contains(&pc) {
-                        why = StopWhy::UserBp;
-                        break;
-                    }
-                    if iters >= CAP {
-                        why = StopWhy::Cap;
-                        break;
-                    }
-                    step_one_instruction(&mut st.session);
-                    iters += 1;
-                }
-            }
+            const CAP: u64 = 5_000_000;
+            let State { session, mon, .. } = &mut *st;
+            let (r_cyc, why) = step_over_one(session, &mut mon.flow, &bp_set, CAP, None);
             let pc = st.session.machine.cpu6510.reg_pc;
             st.mon.state.disasm_cursor = Some(pc);
             let (_, line) = addr_spans::disasm_line(|a| st.session.machine.peek_lens(a, "cpu"), pc, SpanSpace::C64);
@@ -3426,39 +3561,11 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
         }
         "ret" | "return" => {
             st.session.running = false;
-            let sp0 = st.session.machine.cpu6510.reg_sp;
             let bp_set: std::collections::HashSet<u16> =
                 st.mon.breakpoints.entries.iter().map(|e| e.pc).collect();
             const SKIP_CAP: u64 = 5_000_000;
-            let mut guard: u64 = 0;
-            let mut last_cyc: u64 = 0;
-            let mut why = StopWhy::Clean;
-            loop {
-                if guard >= SKIP_CAP {
-                    why = StopWhy::Cap;
-                    break;
-                }
-                // The op about to execute (so we can detect the RTS/RTI return).
-                let op_pc = st.session.machine.cpu6510.reg_pc;
-                let opcode = st.session.machine.peek_lens(op_pc, "cpu");
-                let is_ret = opcode == 0x60 || opcode == 0x40; // RTS / RTI
-                let clk0 = st.session.machine.clk;
-                // runReturn (stepping.ts:234-246) calls apply() on EVERY step, so the
-                // flow stack stays consistent across an interrupt taken mid-return.
-                step_one_with_flow(&mut st.session, &mut st.mon.flow);
-                last_cyc = st.session.machine.clk.wrapping_sub(clk0); // r.cyc
-                guard += 1;
-                let pc = st.session.machine.cpu6510.reg_pc;
-                if bp_set.contains(&pc) {
-                    why = StopWhy::UserBp;
-                    break;
-                }
-                // stepping.ts:241 — stop when the executed instr was RTS/RTI AND the
-                // resulting SP rose above the entry level (the current frame returned).
-                if is_ret && (st.session.machine.cpu6510.reg_sp as u16) > sp0 as u16 {
-                    break;
-                }
-            }
+            let State { session, mon, .. } = &mut *st;
+            let (last_cyc, why) = run_return(session, &mut mon.flow, &bp_set, SKIP_CAP);
             let pc = st.session.machine.cpu6510.reg_pc;
             st.mon.state.disasm_cursor = Some(pc);
             let (_, line) = addr_spans::disasm_line(|a| st.session.machine.peek_lens(a, "cpu"), pc, SpanSpace::C64);
@@ -3550,9 +3657,10 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 let sp0 = st.session.machine.cpu6510.reg_sp;
                 let was_jsr = st.session.machine.peek_lens(pc0, "cpu") == 0x20;
                 let clk0 = st.session.machine.clk;
-                step_one_with_flow(&mut st.session, &mut st.mon.flow);
+                let b = step_one_with_flow(&mut st.session, &mut st.mon.flow);
                 cyc = st.session.machine.clk.wrapping_sub(clk0);
-                if over && was_jsr {
+                // An interrupt entry that took the step means the JSR did not run yet.
+                if over && was_jsr && !b.entry_first {
                     // Run the callee out, exactly as `next` does, so a focus walk does
                     // not descend into every subroutine on the way.
                     let ret_pc = pc0.wrapping_add(3);
@@ -5891,8 +5999,10 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
         "stepInto" => {
             // TS AgentQueryApi.stepInto() returns void — WS omits result key entirely.
             let mut st = state.lock().unwrap();
-            step_one_instruction(&mut st.session);
-            drop(st);
+            // Same step as the monitor's `z`: an IRQ/NMI taken at the boundary ends the
+            // step on the handler's first opcode.
+            let st = &mut *st;
+            step_one_with_flow(&mut st.session, &mut st.mon.flow);
             Response::void(id)
         }
 
@@ -5901,47 +6011,19 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
             let _opts = args.first();
             let cycle_budget: u64 = 100_000;
             let mut st = state.lock().unwrap();
-
-            let start_pc = st.session.machine.cpu6510.reg_pc;
+            let st = &mut *st;
             let start_clk = st.session.machine.clk;
-            // Length of current instruction to find the "next" PC
-            let opcode = st.session.machine.read_full(start_pc);
-            let instr_bytes = instr_len(opcode) as u16;
-            let next_pc = start_pc.wrapping_add(instr_bytes);
-
-            // Track initial SP for stack watch
-            let initial_sp = st.session.machine.cpu6510.reg_sp;
-
-            let mut instructions_elapsed: u64 = 0;
-            #[allow(unused_assignments)]
-            let mut halt_reason = "next_pc";
-            #[allow(unused_assignments)]
-            let mut halted = true;
-
-            loop {
-                let current_clk = st.session.machine.clk;
-                if current_clk.wrapping_sub(start_clk) >= cycle_budget {
-                    halt_reason = "budget_exhausted";
-                    halted = false;
-                    break;
-                }
-                step_one_instruction(&mut st.session);
-                instructions_elapsed += 1;
-                let pc = st.session.machine.cpu6510.reg_pc;
-                let sp = st.session.machine.cpu6510.reg_sp;
-                if pc == next_pc {
-                    halt_reason = "next_pc";
-                    halted = true;
-                    break;
-                }
-                // Stack watch: if SP returns to initial level (RTS/RTI returned)
-                if sp == initial_sp && instructions_elapsed > 1 {
-                    halt_reason = "stack_watch";
-                    halted = true;
-                    break;
-                }
-            }
-
+            let bp_set: std::collections::HashSet<u16> =
+                st.mon.breakpoints.entries.iter().map(|e| e.pc).collect();
+            // The monitor's `n`: a JSR, and an IRQ/NMI taken during the step, are run
+            // through to their return (VICE level counting); the step ends in the code
+            // that was being stepped.
+            let (_, why) = step_over_one(&mut st.session, &mut st.mon.flow, &bp_set, u64::MAX, Some(cycle_budget));
+            let (halted, halt_reason) = match why {
+                StopWhy::Clean => (true, "next_pc"),
+                StopWhy::UserBp => (true, "breakpoint"),
+                StopWhy::Cap => (false, "budget_exhausted"),
+            };
             let final_pc = st.session.machine.cpu6510.reg_pc;
             let cycles_elapsed = st.session.machine.clk.wrapping_sub(start_clk);
             // TS _instrCount() == cpu.cycles (not a real instruction counter), so
@@ -6094,7 +6176,7 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
         }
 
         // stepOut(opts?): StepOutResult — run until the current subroutine returns
-        // (SP climbs back to entry+2 = RTS/RTI). agent-api.ts:240 → MonitorAPI.stepOut
+        // (the monitor's `ret`: VICE level counting, interrupts run through). agent-api.ts:240 → MonitorAPI.stepOut
         // (monitor.ts:312). Same {halted, cyclesElapsed, instructionsElapsed, finalPc}
         // shape; instructionsElapsed == cyclesElapsed (TS _instrCount == cpu.cycles).
         "stepOut" => {
@@ -6104,19 +6186,14 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
                 .and_then(|v| v.as_u64())
                 .unwrap_or(1_000_000);
             let mut st = state.lock().unwrap();
+            let st = &mut *st;
             let start_clk = st.session.machine.clk;
-            let entry_sp = st.session.machine.cpu6510.reg_sp;
-            let mut halted = false;
-            let mut steps: u64 = 0;
-            while steps < budget {
-                step_one_instruction(&mut st.session);
-                steps += 1;
-                // Stack returns: SP back to (or above) entry+2 means RTS/RTI fired.
-                if st.session.machine.cpu6510.reg_sp >= entry_sp.wrapping_add(2) {
-                    halted = true;
-                    break;
-                }
-            }
+            let bp_set: std::collections::HashSet<u16> =
+                st.mon.breakpoints.entries.iter().map(|e| e.pc).collect();
+            // The monitor's `ret`: the current frame returns; an IRQ/NMI taken on the way
+            // is run through to its RTI like a call (VICE level counting).
+            let (_, why) = run_return(&mut st.session, &mut st.mon.flow, &bp_set, budget);
+            let halted = why != StopWhy::Cap;
             let cycles_elapsed = st.session.machine.clk.wrapping_sub(start_clk);
             let final_pc = st.session.machine.cpu6510.reg_pc;
             Response::ok(id, json!({
@@ -8395,7 +8472,10 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             // T1.2 — Spec 767: read source param, update control_owner, broadcast on change.
             let owner = owner_from_source(&req.params);
             set_control_owner(&mut st, owner);
-            step_one_instruction(&mut st.session);
+            {
+                let State { session, mon, .. } = &mut *st;
+                step_one_with_flow(session, &mut mon.flow);
+            }
             st.session.running = false;
             // T2.2 — Spec 754 §3.3e: drain observer side-effects after the step,
             // matching the TS run-chunk drain (runtime-controller.ts:697-725).

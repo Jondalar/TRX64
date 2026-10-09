@@ -596,6 +596,14 @@ impl DeltaRing {
         self.cur.write_count = self.cur.write_count.saturating_add(1);
     }
 
+    /// Drop the in-flight entry unpublished: a core call that ran nothing (the monitor's
+    /// boundary-only check found no interrupt due) must not leave an empty instruction in
+    /// the ring for a reverse step to land on. A no-op when nothing is in flight.
+    #[inline]
+    pub fn abort(&mut self) {
+        self.in_flight = false;
+    }
+
     /// HOT PATH. Publish the in-flight instruction's header into the entry slab and
     /// advance `entry_head`. A no-op if `begin` was gated off / never called. One
     /// struct store + one counter bump.
