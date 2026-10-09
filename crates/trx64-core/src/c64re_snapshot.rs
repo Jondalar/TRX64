@@ -1679,6 +1679,12 @@ pub fn capture_runtime_checkpoint_with(
     if let Some(node) = m.pot.checkpoint() {
         tree["pot"] = node;
     }
+    // The custom-IC glue's pending alarm (c64gluelogic.c): the requested bank, the clock
+    // the alarm runs at and the bank the VIC has until then. Only while an alarm is
+    // pending, so every checkpoint without one is the one it was.
+    if let Some(node) = glue_node(m) {
+        tree["glue"] = node;
+    }
     // The Ultimate's turbo state: the firmware's enable word and menu speed, the turbo
     // state `$D031` holds, `$D030`, and what is left of the post-reset hold. Only on the
     // `u64` profile, so every checkpoint of any other machine is the one it was.
@@ -1735,6 +1741,34 @@ pub fn capture_runtime_checkpoint_with(
         tree["hostFdc"] = serde_json::Value::Array(fdcs);
     }
     tree
+}
+
+/// The `glue` node: `Some` only while the glue's alarm is pending (`glue.rs`).
+fn glue_node(m: &Machine) -> Option<serde_json::Value> {
+    let g = &m.vic.glue;
+    let alarm = g.alarm?;
+    Some(serde_json::json!({
+        "oldVbank": g.old_vbank,
+        "alarmClk": alarm,
+        "vbank": g.override_bank().unwrap_or(g.old_vbank),
+    }))
+}
+
+/// Put the glue back. Without a node (every checkpoint without a pending alarm, and every
+/// one written before the glue existed) nothing is pending and the requested bank is the
+/// one CIA2's port A names. The type is the row's, put on by `put_on_model`.
+fn restore_glue(m: &mut Machine, node: Option<&serde_json::Value>) {
+    let from_port = (!m.cia2.pa_out()) & 3;
+    let g = &mut m.vic.glue;
+    g.reset();
+    g.old_vbank = from_port;
+    let Some(n) = node.filter(|n| !n.is_null()) else { return };
+    let get = |k: &str| n.get(k).and_then(|v| v.as_u64());
+    if let Some(clk) = get("alarmClk") {
+        let vbank = get("vbank").unwrap_or(from_port as u64) as u8 & 3;
+        g.old_vbank = get("oldVbank").map(|b| b as u8 & 3).unwrap_or(from_port);
+        g.set_pending(clk, vbank);
+    }
 }
 
 /// The `turbo` node of a `u64` machine, `None` on any other profile.
@@ -2212,6 +2246,7 @@ pub fn restore_runtime_checkpoint(
     }
     restore_vic_provenance(m, cp.get("vicProvenance"));
     restore_turbo(m, cp.get("turbo"))?;
+    restore_glue(m, cp.get("glue"));
 
     // Spec 868 §9 — the turbo divider is adopted at a PHI2 EDGE now, not at the next
     // instruction boundary, so a restored machine that only learns its speed from

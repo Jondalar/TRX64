@@ -5,8 +5,8 @@ One line per feature, as of 0.12.7. Details: [`README.md`](../README.md), monito
 
 ## Machine
 
-- C64 models as rows of `crates/trx64-core/models.toml`: PAL 6569, NTSC 6567R8, PAL-N 6572 (`--model c64-pal|c64-ntsc|c64-paln`, `--video pal|ntsc`).
-- C64C and first-revision rows are listed and refused by name (custom-IC glue, KERNAL rev1/rev2 missing).
+- C64 models as rows of `crates/trx64-core/models.toml`: PAL 6569, NTSC 6567R8, PAL-N 6572, C64C PAL 8565 and C64C NTSC 8562 (`--model c64-pal|c64-ntsc|c64-paln|c64c-pal|c64c-ntsc`, `--video pal|ntsc`).
+- The C64C rows run: the 8565/8562 VIC-II with its grey dot (every write to `$D020`-`$D02E` puts one colour-15 pixel on the beam, a redundant write included; none on the 6569/6567) and the custom-IC glue logic (a `$DD00` bank switch such as bank 1 to 2 passes through bank 3 for one cycle; a bank-bit change through `DDRA` can hold the old bank a cycle). Its pending cycle rides checkpoints, `.c64re` dumps and VICE snapshots; the glue type is the model row's. First-revision rows are listed and refused by name (KERNAL rev1/rev2 missing).
 - CIA 1 and CIA 2 ported from VICE's CIA core: the 6526 of the C64 rows (the 6526A is there for the C64C rows), its interrupt delay line, shift register and time-of-day clock on the model's mains; the keyboard matrix as VICE solves it, ghost keys included.
 - `model <row>` / `session/model`: switch a running machine at the next frame boundary; snapshots and checkpoints record the model.
 - `--machine c64|u64|128` (daemon): `u64` is the Ultimate 64, Elite II and C64 Ultimate: speed register at `$D031`, CPU to 63× PHI2 — the menu's 64 MHz, as measured (`--speed-table u64ii`, default) or 48 MHz (`u64`, first generation, unmeasured); 1 MHz for 2^22 PHI2 cycles (4.26 s) after a reset, as on the device.

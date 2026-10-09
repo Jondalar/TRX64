@@ -270,6 +270,11 @@ impl C64Model {
             0
         }
     }
+    /// The glue type (`glue.rs`): 0 = discrete, 1 = custom IC. A row's `glue` is checked at
+    /// load, so every row that exists has one.
+    pub fn glue_kind(&self) -> u8 {
+        crate::glue::kind_of(&self.glue).unwrap_or(crate::glue::GLUE_DISCRETE)
+    }
     pub fn is_default(&self) -> bool {
         std::ptr::eq(self, default_model())
     }
@@ -396,10 +401,9 @@ fn parse(text: &str) -> Result<Registry, String> {
             "6581" | "8580" => {}
             other => missing.push(format!("{other} SID")),
         }
-        match r.glue.as_str() {
-            "discrete" => {}
-            "custom-ic" => missing.push("custom-IC glue logic".into()),
-            other => missing.push(format!("{other} glue logic")),
+        // Both boards VICE's table names exist (`glue.rs`: c64gluelogic.c types 0 and 1).
+        if crate::glue::kind_of(&r.glue).is_none() {
+            missing.push(format!("{} glue logic", r.glue));
         }
         if r.lightpen_irq != "new" {
             missing.push(format!("{} light-pen IRQ mode", r.vicii));
@@ -570,15 +574,17 @@ mod tests {
     }
 
     #[test]
-    fn the_three_rows_that_run_and_why_the_others_do_not() {
+    fn the_rows_that_run_and_why_the_others_do_not() {
         let runs: Vec<&str> = models().iter().filter(|m| m.runs()).map(|m| m.name.as_str()).collect();
-        assert_eq!(runs, ["c64-pal", "c64-ntsc", "c64-paln"]);
-        let c64c = find("c64c-pal").unwrap();
-        // Spec 888 — the 6526A is ciacore's CIA_MODEL_6526A now; the glue keeps the row out.
-        assert!(!c64c.missing.iter().any(|b| b.contains("CIA")), "{:?}", c64c.missing);
-        assert_eq!(c64c.missing, ["custom-IC glue logic"]);
-        let err = resolve("c64c-pal").unwrap_err();
-        assert!(err.contains("custom-IC glue logic"), "{err}");
+        assert_eq!(runs, ["c64-pal", "c64-ntsc", "c64-paln", "c64c-pal", "c64c-ntsc"]);
+        // The C64C rows run on the custom-IC glue (c64gluelogic.c type 1) and the 8565/8562.
+        for (name, vicii) in [("c64c-pal", "8565"), ("c64c-ntsc", "8562")] {
+            let c = find(name).unwrap();
+            assert!(c.missing.is_empty(), "{:?}", c.missing);
+            assert_eq!((c.glue_kind(), c.vicii.as_str(), c.color_latency), (1, vicii, false));
+            assert!(resolve(name).is_ok());
+        }
+        assert_eq!(find("c64-pal").unwrap().glue_kind(), 0);
         assert!(find("c64-old-pal").unwrap().missing.iter().any(|b| b.starts_with("KERNAL rev2")));
         assert!(find("c64-old-ntsc").unwrap().missing.iter().any(|b| b.starts_with("KERNAL rev1")));
         assert!(resolve("c128").unwrap_err().contains("unknown model"));

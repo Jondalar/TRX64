@@ -603,7 +603,8 @@ impl<'a> FullBus<'a> {
 
     /// VIC bank base from CIA2 port A. PORT OF: `c64/c64cia2.c` `store_ciapa` —
     /// `vbank = ~byte & 3` of the composed output `PRA | ~DDRA` (`old_pa`), switched at
-    /// once by the discrete glue (`c64gluelogic.c`, type 0). An INPUT pin contributes 1:
+    /// once by the discrete glue (`c64gluelogic.c`, type 0); the custom-IC glue (type 1)
+    /// holds another bank for a cycle while its alarm is pending (`glue.rs`). An INPUT pin contributes 1:
     /// it floats high on the pull-up. A fastloader that drives $DD00 itself (Spindle
     /// writes `DDRA = $3C`) leaves the bank bits as inputs, and the bank is still 0.
     ///
@@ -611,7 +612,10 @@ impl<'a> FullBus<'a> {
     /// recompute.
     #[inline]
     pub(crate) fn vic_bank_base(&self) -> u16 {
-        let bank = ((self.cia2.pa_out() & 0x03) ^ 0x03) as u16;
+        let bank = match self.vic.glue.override_bank() {
+            Some(b) => b as u16,
+            None => ((self.cia2.pa_out() & 0x03) ^ 0x03) as u16,
+        };
         bank.wrapping_mul(0x4000)
     }
 
@@ -655,7 +659,11 @@ impl<'a> FullBus<'a> {
                 // The Ultimate's SuperCPU speed switches at `$D07A`/`$D07B` take the store
                 // before the VIC, which has nothing there.
                 if !self.vic.u64_extra_write(addr) {
-                    self.vic.write_reg(addr as u8, value)
+                    if self.access_kind == crate::expansion::AccessKind::Host {
+                        self.vic.poke_reg(addr as u8, value)
+                    } else {
+                        self.vic.write_reg(addr as u8, value)
+                    }
                 }
             }
             0xd400..=0xd7ff => {
@@ -683,12 +691,22 @@ impl<'a> FullBus<'a> {
             0xdd00..=0xddff => {
                 self.cia2.clk = self.clk;
                 let mut p = Cia2Ports::default();
+                // c64cia2.c `cia2_store`: `pa_ddr_change` = this store is a DDRA write that
+                // changes the register (it goes to the glue with the bank change).
+                let ddr_change = (addr & 0xf) as usize == crate::ciacore::CIA_DDRA
+                    && self.cia2.c_cia[crate::ciacore::CIA_DDRA] != value;
                 self.cia2.store(&mut p, addr, value);
                 // c64cia2.c `store_ciapa`: a changed port-A output drives the VIC bank
                 // (read from `pa_out` by `vic_bank_base`) and the serial bus. The push is
                 // recorded BEFORE the originating store's own trace record.
                 if let Some(new_out) = p.pa_store {
                     {
+                        // c64cia2.c `store_ciapa`: `new_vbank = ~byte & 3`; a changed bank
+                        // goes through the glue logic (`c64_glue_set_vbank`).
+                        let new_vbank = (!new_out) & 3;
+                        if new_vbank != self.vic.glue.old_vbank {
+                            self.vic.glue.set_vbank(new_vbank, ddr_change, self.clk);
+                        }
                         // The $DD00 IO shadow becomes the new output; `old` = prior
                         // shadow at $DD00 (the trace old byte for an IO write is
                         // omitted anyway — hasOld=0 for $D000-$DFFF — so 0 is fine).
@@ -802,6 +820,8 @@ impl<'a> FullBus<'a> {
         if clk >= self.cia2.next_alarm_clk() {
             self.cia2.process_alarms(&mut Cia2Ports::default(), clk);
         }
+        // `glue_alarm_handler` (c64gluelogic.c) — on the same alarm context.
+        self.vic.glue.run_alarm(clk);
     }
 
     /// Replay the CIAs' interrupt-line changes into the CPU's interrupt status:

@@ -398,11 +398,10 @@ pub fn save_vice_vsf(m: &mut Machine) -> Vec<u8> {
     // KEYBOARD (the key-matrix latch) so VICE resumes with the same keys held.
     module(&mut out, "KEYBOARD", 0, 0, &keyboard(m));
 
-    // GLUE (VIC-II glue logic): type(discrete=0) + old_vbank (`~byte & 3` of CIA2's
-    // composed port-A output, c64cia2.c `store_ciapa`) + alarm(0). JOYPORT0/1: no
-    // joystick attached (0).
-    let vbank = (!m.cia2.pa_out()) & 3;
-    module(&mut out, "GLUE", 1, 0, &[0u8, vbank, 0u8]);
+    // C64GLUE 1.1 (c64_glue_snapshot_write_module): glue type, old vbank, alarm active.
+    // JOYPORT0/1: no joystick attached (0).
+    let g = &m.vic.glue;
+    module(&mut out, "C64GLUE", 1, 1, &[g.kind, g.old_vbank, g.alarm.is_some() as u8]);
     module(&mut out, "JOYPORT0", 0, 0, &[0u8]);
     module(&mut out, "JOYPORT1", 0, 0, &[0u8]);
 

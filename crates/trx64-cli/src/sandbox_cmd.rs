@@ -1740,14 +1740,14 @@ mod tests {
             }
             v
         };
-        let runs = serde_json::json!({ "runs": [item(None), item(Some("ntsc")), item(Some("c64c-pal"))] });
+        let runs = serde_json::json!({ "runs": [item(None), item(Some("ntsc")), item(Some("c64-old-pal"))] });
         std::fs::write(&spec, runs.to_string()).unwrap();
         let out = run_sandbox_batch(&rom_dir, spec.to_str().unwrap(), Some("c64-paln")).expect("batch");
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["runs"][0]["result"]["model"], "c64-paln", "the command line's model");
         assert_eq!(v["runs"][1]["result"]["model"], "c64-ntsc", "the item's own");
         assert_eq!(v["runs"][2]["ok"], false);
-        assert!(v["runs"][2]["error"].as_str().unwrap().contains("custom-IC glue logic"), "{}", v["runs"][2]);
+        assert!(v["runs"][2]["error"].as_str().unwrap().contains("KERNAL rev2"), "{}", v["runs"][2]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

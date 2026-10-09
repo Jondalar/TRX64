@@ -1435,6 +1435,9 @@ pub struct VicII {
     pub(crate) geom: LineGeometry,
     /// The row all of the above came from.
     model: &'static crate::model::C64Model,
+    /// The glue logic between CIA2 port A and the VIC bank (`c64gluelogic.c`); its type is
+    /// the model row's (`glue.rs`). VICE keeps `vbank_phi1/2` here too.
+    pub glue: crate::glue::GlueLogic,
 }
 
 impl Default for VicII {
@@ -1584,6 +1587,7 @@ impl VicII {
             vbuf: [0u8; 40],
             cbuf: [0u8; 40],
             color_latency: model.color_latency,
+            glue: crate::glue::GlueLogic::new(model.glue_kind()),
             // Draw-pipeline state (vicii_draw_cycle_init, vicii-draw-cycle.ts:736-755).
             gbuf_pipe0_reg: 0,
             cbuf_pipe0_reg: 0,
@@ -1664,6 +1668,9 @@ impl VicII {
         self.window = model.window;
         self.geom = LineGeometry::of(model.cycle_family);
         self.color_latency = model.color_latency;
+        // `c64model_set` writes the `GlueLogic` resource: the type follows the row. A pending
+        // alarm stays (`set_glue_type` only sets the type).
+        self.glue.kind = model.glue_kind();
         self.model = model;
         if changed {
             let cpl = self.cycles_per_line as usize;
@@ -2767,6 +2774,22 @@ impl VicII {
         self.raster_irq_line = new_line;
     }
 
+    /// PORT OF: vicii-mem.c:482 vicii_poke — a store from the host (the monitor, a pasted
+    /// register file), not a CPU cycle. A colour register goes straight to the draw
+    /// (`vicii_monitor_colreg_store`): several of them
+    /// in a row all land, where the pending-write latch of a CPU store holds only the last.
+    pub fn poke_reg(&mut self, offset: u8, value: u8) {
+        self.write_reg(offset, value);
+        let addr = offset & 0x3f;
+        if (0x20..=0x2e).contains(&addr) {
+            let v4 = value & 0x0f;
+            self.cregs[addr as usize] = v4;
+            self.draw_last_color_reg = addr;
+            self.draw_last_color_value = v4;
+            self.last_color_reg = 0xff; // applied now, not again in two cycles
+        }
+    }
+
     /// PORT OF: vicii-mem.c:334 vicii_store. `addr` is the $D000-offset (masked to
     /// 6 bits). Reproduces the register side effects timing depends on.
     pub fn write_reg(&mut self, offset: u8, value: u8) {
@@ -2920,40 +2943,42 @@ impl VicII {
         self.regs[0x17] = value;
     }
 
-    /// PORT OF: vicii-mem.c:270 color_reg_store + vicii-draw-cycle.c:120
-    /// vicii_monitor_colreg_store. Latches the write for draw_colors8 (last_color
-    /// reg/value, used for the grey-dot + per-cycle resolution) AND eagerly updates
-    /// cregs[addr] so the COL_D02x token resolves to the live colour on the very
-    /// next drawn pixel. `addr` = the $D020-$D02E offset; `v4` = the 4-bit value
-    /// already stored in regs.
+    /// PORT OF: vicii-mem.c:270 color_reg_store. The write waits in `last_color_reg` /
+    /// `last_color_value`; `draw_colors8` takes it into its statics at the end of the NEXT
+    /// cycle's draw (`update_cregs`) and applies it to `cregs` at the start of the one after,
+    /// where the 8565 also puts its grey dot. Nothing else happens on a CPU store, on any
+    /// chip (a host store is [`poke_reg`](Self::poke_reg)). `addr` = the $D020-$D02E offset;
+    /// `v4` = the 4-bit value already stored in regs.
+    ///
+    /// Above divider 1 on the Ultimate (Spec 868) a CPU can write a colour register more
+    /// than once per PHI2 cycle, which the single latch cannot hold: the per-pixel slots
+    /// then carry the cycle's values and the draw resolves through them, as it does for the
+    /// latch at divider 1. VICE has no such machine; `cregs` follows through the same latch.
     #[inline]
     fn color_reg_store(&mut self, addr: u8, v4: u8) {
-        // Spec 868 — a CPU that can write a colour register more than once per PHI2 cycle
-        // is saying something the single latch below cannot hold. Gated on the U64
-        // profile AND a divider above one, so every C64 and C128 keeps VICE's model
-        // exactly: same code, same order, same bytes. Every colour register, `$D020` to
-        // `$D02E`: the draw resolves them all through the same token lookup.
         if self.turbo_div > 1 && self.speed_profile == SpeedProfile::U64 {
             let r = usize::from(addr - 0x20);
             let pixel = SubCycleColour::pixel_for(self.turbo_phase, self.turbo_div);
+            // What every pixel shows before the first store of this cycle: the register's
+            // value as the draw will have it — a write still waiting counts.
+            let held = if self.last_color_reg == addr {
+                self.last_color_value
+            } else if self.draw_last_color_reg == addr {
+                self.draw_last_color_value
+            } else {
+                self.cregs[addr as usize]
+            };
             let sc = &mut self.subcycle_colour;
             if sc.mask & (1 << r) == 0 {
-                // Before the first store this cycle, every pixel still shows what the
-                // register already held.
-                sc.slots[r] = [self.cregs[addr as usize]; 8];
+                sc.slots[r] = [held; 8];
                 sc.mask |= 1 << r;
             }
             let mut one = SubCycleColour { reg: addr, slots: sc.slots[r] };
             one.set_from(pixel, v4);
             sc.slots[r] = one.slots;
         }
-
         self.last_color_reg = addr;
         self.last_color_value = v4;
-        // vicii_monitor_colreg_store: cregs[reg]=value + draw_last_color_reg/value.
-        self.cregs[addr as usize] = v4;
-        self.draw_last_color_reg = addr;
-        self.draw_last_color_value = v4;
     }
 
     /// The value a colour register currently holds ($D020-$D02E, by $D000-offset).
@@ -2963,7 +2988,12 @@ impl VicII {
     /// wrote, where the per-pixel slots (Spec 868) deliberately do NOT apply.
     #[inline]
     pub fn colour_register(&self, reg: u8) -> u8 {
-        self.cregs[(reg & 0x2f) as usize]
+        match reg & 0x2f {
+            // The register itself, which a write that has not reached the draw yet has
+            // already changed (`vicii.regs[]`, as `d020_store` sets it).
+            r @ 0x20..=0x2e => self.regs[r as usize] & 0x0f,
+            r => self.cregs[r as usize],
+        }
     }
 
     /// PORT OF: vicii-mem.c:492 read_raster_y.

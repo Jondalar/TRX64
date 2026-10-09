@@ -153,8 +153,8 @@ model: c64-pal (pal)  VIC-II 6569  63 × 312 = 19656 cycles/frame  985248 Hz  50
   * c64-pal       C64 PAL
     c64-ntsc      C64 NTSC
     c64-paln      C64 PAL-N (Drean)
-    c64c-pal      C64C PAL  — needs custom-IC glue logic
-    c64c-ntsc     C64C NTSC  — needs custom-IC glue logic
+    c64c-pal      C64C PAL
+    c64c-ntsc     C64C NTSC
     c64-old-pal   C64 old PAL  — needs 6569R1 light-pen IRQ mode, 6569R1 luminances, KERNAL rev2 (kernal-901227-02.bin) — not in the ROM set
     c64-old-ntsc  C64 old NTSC  — needs 6567R56A light-pen IRQ mode, 6567R56A luminances, KERNAL rev1 (kernal-901227-01.bin) — not in the ROM set
   `model <row>` switches at the next frame boundary (the program keeps its state).

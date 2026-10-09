@@ -57,6 +57,7 @@ pub mod spi_flash;
 pub mod tables;
 /// Spec 852 — the Ultimate Command Interface, the U64 profile's own device on the port.
 pub mod georam;
+pub mod glue;
 pub mod reu;
 pub mod uci;
 pub mod vic;
@@ -1448,6 +1449,8 @@ impl Machine {
         self.joystick1 = crate::keyboard::JoystickState::default();
         self.joystick2 = crate::keyboard::JoystickState::default();
         self.cia2_pa_out = 0xff;
+        // `do_reset_cia` (c64cia2.c): `c64_glue_reset()` — alarm off, bank 0.
+        self.vic.glue.reset();
         // Spec 870 — the fresh IEC core knows a drive at unit 8; tell it the ones that
         // are there (another unit, a second drive, or none while off / held). A no-op
         // on a stock machine.
@@ -1663,7 +1666,7 @@ impl Machine {
         for (i, b) in bytes.iter().enumerate() {
             let a = addr.wrapping_add(i as u16);
             match a {
-                0xd000..=0xd3ff => self.vic.write_reg(a as u8, *b),
+                0xd000..=0xd3ff => self.vic.poke_reg(a as u8, *b),
                 0xd400..=0xd7ff => {
                     let (chip, reg) = match crate::sid::resolve_sid(&self.sid_map, a) {
                         Some(hit) => hit,
@@ -2261,6 +2264,7 @@ impl Machine {
         if clk >= self.cia2.next_alarm_clk() {
             self.cia2.process_alarms(&mut crate::c64cia::Cia2Ports::default(), clk);
         }
+        self.vic.glue.run_alarm(clk);
         full::drain_cia_int(&mut self.cia1, &mut self.cia2, &mut self.c64_int);
     }
 
@@ -2351,7 +2355,7 @@ impl Machine {
                 // shadow mirror the storage `poke_io` uses; the colour-RAM nibble keeps
                 // its low-nibble convention. Chip internal counters are out of scope.
                 match addr {
-                    0xd000..=0xd3ff => self.vic.write_reg(addr as u8, old),
+                    0xd000..=0xd3ff => self.vic.poke_reg(addr as u8, old),
                     0xd400..=0xd7ff => {
                         // Spec 855 — undo the byte in the chip that took it. Putting
                         // a second chip's write back into chip 0's shadow would
@@ -2997,7 +3001,10 @@ impl Machine {
     /// it floats high on the pull-up — so a fastloader that leaves the bank bits as
     /// inputs (Spindle writes `DDRA = $3C`) still sees bank 0.
     pub fn vic_bank_base(&self) -> u16 {
-        let bank = ((self.cia2.pa_out() & 0x03) ^ 0x03) as u16;
+        let bank = match self.vic.glue.override_bank() {
+            Some(b) => b as u16,
+            None => ((self.cia2.pa_out() & 0x03) ^ 0x03) as u16,
+        };
         bank.wrapping_mul(0x4000)
     }
 
