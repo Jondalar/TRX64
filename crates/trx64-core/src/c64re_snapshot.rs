@@ -72,6 +72,12 @@ pub struct CpuSnapshot {
     /// older checkpoint reads as 0, which is what every restore used until now.
     #[serde(rename = "turboPhase", default, skip_serializing_if = "Option::is_none")]
     pub turbo_phase: Option<i64>,
+    /// The machine stopped right after an IRQ/NMI entry, before the handler's first opcode
+    /// (a debugger break on the vector target). A restore that drops it would run the
+    /// interrupt dispatch a second time before that opcode. Written only when true, so every
+    /// other checkpoint is byte-identical to before; an older one reads as false.
+    #[serde(rename = "entryPaused", default, skip_serializing_if = "Option::is_none")]
+    pub entry_paused: Option<bool>,
 }
 
 // ── iec (runtime-checkpoint.ts:53-61) ──────────────────────────────────────────
@@ -655,6 +661,7 @@ pub fn capture_cpu(m: &Machine) -> CpuSnapshot {
         so_line: None,
         jammed: None,
         turbo_phase: (c.turbo_phase != 0).then_some(i64::from(c.turbo_phase)),
+        entry_paused: c.entry_paused.then_some(true),
     }
 }
 
@@ -678,6 +685,7 @@ pub fn restore_cpu(m: &mut Machine, s: &CpuSnapshot) {
     core.set_status_composite(flags);
     core.clk = clk;
     core.turbo_phase = s.turbo_phase.unwrap_or(0) as u32;
+    core.entry_paused = s.entry_paused.unwrap_or(false);
 
     let cpu = &mut m.cpu6510;
     cpu.reg_pc = pc;

@@ -4006,6 +4006,8 @@ impl Machine {
                     fetched: false,
                     access_watch,
                     halt_requested: false,
+                    entry_break: breakpoints,
+                    entry_exec_watch: exec_watch,
                 };
                 full_sc::execute_one(&mut self.c64_core, &mut bus, &mut self.c64_int);
                 // Spec 856 D3 — the turbo fast path. Below the divider an instruction usually
