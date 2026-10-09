@@ -82,13 +82,16 @@ Nothing that worked stops working in a patch.
   Ultimate (the menu's 48 and 64 MHz run 47× and 63× PHI2), with `$D031` bit 7 turning the badline
   stalls off, interrupts taken at the turbo clock, and I/O costing what it costs there (CIA and
   IO1/IO2 one bus cycle each, VIC/SID/colour RAM fast).
-- **PAL and NTSC** — `--model c64-pal|c64-ntsc|c64-paln` (or `--video pal|ntsc`). A C64 model
+- **PAL, NTSC and the C64C** — `--model c64-pal|c64-ntsc|c64-paln|c64c-pal|c64c-ntsc` (or `--video pal|ntsc`). A C64 model
   is a row of `crates/trx64-core/models.toml`: the VIC-II and its cycle table, the frame, the
   clock, the mains the TOD counts, the ROMs. NTSC is the 6567R8 — 65 cycles × 263 lines at
   1 022 730 Hz, ~59.83 frames/s, a 384×247 picture whose bottom rows are raster lines 0–11.
   `model <row>` switches a running machine at the next frame; the program keeps its state and
-  the standard it detected at boot. The C64C and first-revision rows are listed but need parts
-  TRX64 does not have yet (the custom-IC glue, KERNAL rev1/rev2), and are refused by name.
+  the standard it detected at boot. The C64C rows (`c64c-pal` 8565, `c64c-ntsc` 8562) run on the
+  custom-IC glue logic: some VIC bank switches through `$DD00` take a cycle to settle, and every
+  write to a colour register (`$D020`-`$D02E`) leaves a light-grey dot on the beam, even when it
+  writes the value the register already holds. The first-revision rows need KERNAL rev1/rev2,
+  which TRX64 does not have; they are listed and refused by name.
 - **Shared sessions** — one machine, several clients, human and agent at once.
 - **Snapshots** — `.c64re` full machine, `.c64rering` the reverse-debug buffers.
 

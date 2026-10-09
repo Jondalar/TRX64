@@ -16351,7 +16351,14 @@ fn model_from_machine_name(name: &str) -> Result<&'static trx64_core::model::C64
     }
     match name.split_once('-') {
         Some((profile, rest)) if trx64_core::vic::SpeedProfile::parse(profile).is_some() => {
-            trx64_core::model::resolve(&format!("c64-{rest}"))
+            // `u64-ntsc` is the row `c64-ntsc`; a row that does not start with `c64-`
+            // keeps its whole name after the profile (`u64-c64c-pal` is the row `c64c-pal`).
+            let c64_row = format!("c64-{rest}");
+            if trx64_core::model::find(&c64_row).is_none() && trx64_core::model::find(rest).is_some() {
+                trx64_core::model::resolve(rest)
+            } else {
+                trx64_core::model::resolve(&c64_row)
+            }
         }
         _ => trx64_core::model::resolve(name),
     }
@@ -16376,7 +16383,7 @@ mod machine_model_tests {
     /// Spec 863 D6 — the row survives the name, all the way back.
     #[test]
     fn the_model_row_reads_back_from_the_machine_name() {
-        for row in ["c64-pal", "c64-ntsc", "c64-paln"] {
+        for row in ["c64-pal", "c64-ntsc", "c64-paln", "c64c-pal", "c64c-ntsc"] {
             let m = trx64_core::model::resolve(row).unwrap();
             for p in [SpeedProfile::C64, SpeedProfile::C128, SpeedProfile::U64] {
                 let name = machine_model_name(p, m);
@@ -16384,8 +16391,8 @@ mod machine_model_tests {
                 assert_eq!(machine_profile_from_model(&name), Some(p), "{name}");
             }
         }
-        let e = model_from_machine_name("c64c-pal").unwrap_err();
-        assert!(e.contains("custom-IC glue logic"), "{e}");
+        let e = model_from_machine_name("c64-old-pal").unwrap_err();
+        assert!(e.contains("KERNAL rev2"), "{e}");
         assert!(model_from_machine_name("c64-secam").unwrap_err().contains("unknown model"));
     }
 }
@@ -25203,12 +25210,17 @@ mod batch1_tests {
         assert_eq!(row("c64-pal")["runs"], json!(true));
         assert_eq!(row("c64-ntsc")["cyclesPerFrame"], json!(17095));
         assert_eq!(row("c64-paln")["cpuHz"], json!(1_023_440));
-        assert_eq!(row("c64c-pal")["runs"], json!(false));
-        // Spec 888 — its 6526A exists; the custom-IC glue is what it lacks.
-        assert_eq!(row("c64c-pal")["missing"], json!(["custom-IC glue logic"]));
-        // Choosing it is refused, by name, and changes nothing.
-        let e = call_err(&st, "session/model", json!({ "name": "c64c-pal" }));
-        assert!(e.message.contains("custom-IC glue logic"), "{}", e.message);
+        // Every row with a part TRX64 has runs: the C64C's 6526A, 8565/8562 and custom-IC
+        // glue are all built, so nothing is missing from it.
+        for c64c in ["c64c-pal", "c64c-ntsc"] {
+            assert_eq!(row(c64c)["runs"], json!(true));
+            assert_eq!(row(c64c)["missing"], json!([]));
+        }
+        assert_eq!(row("c64c-pal")["chip"], json!("8565"));
+        // A row that needs a KERNAL the ROM set lacks is refused, by name, and changes nothing.
+        assert_eq!(row("c64-old-pal")["runs"], json!(false));
+        let e = call_err(&st, "session/model", json!({ "name": "c64-old-pal" }));
+        assert!(e.message.contains("KERNAL rev2"), "{}", e.message);
         let e = call_err(&st, "session/model", json!({ "name": "c64-secam" }));
         assert!(e.message.contains("unknown model"), "{}", e.message);
         assert_eq!(call(&st, "session/state", json!({}))["model"], json!("c64-pal"));
@@ -25335,18 +25347,18 @@ mod batch1_tests {
             assert!(g.session.machine.ram[..] == ram[..]);
         }
 
-        // A checkpoint claiming a C64C (8565, VICE model 1) is refused naming what it lacks.
+        // A checkpoint claiming a 6569R1 (VICE model 2) is refused naming what it lacks.
         let mut cp = {
             let g = st.lock().unwrap();
             trx64_core::c64re_snapshot::capture_runtime_checkpoint(&g.session.machine, "", "", None, None, None, None)
         };
-        cp["vic"]["model"] = json!(1);
+        cp["vic"]["model"] = json!(2);
         let before_clk = st.lock().unwrap().session.machine.clk;
         let e = {
             let mut g = st.lock().unwrap();
             restore_live_checkpoint(&mut g.session, &cp).unwrap_err()
         };
-        assert!(e.contains("custom-IC glue logic"), "{e}");
+        assert!(e.contains("KERNAL rev2"), "{e}");
         // A position the row does not have (cycle 64 on the 63-cycle PAL line) is refused.
         cp["vic"]["model"] = json!(0);
         cp["vic"]["raster_cycle"] = json!(63);
@@ -25392,7 +25404,7 @@ mod batch1_tests {
     fn the_monitor_model_verb_reports_and_switches() {
         let Some(st) = booted_state() else { return };
         let out = call(&st, "monitor/exec", json!({ "command": "model" }))["output"].as_str().unwrap().to_string();
-        assert!(out.contains("c64-pal") && out.contains("c64-ntsc") && out.contains("custom-IC glue"), "{out}");
+        assert!(out.contains("c64-pal") && out.contains("c64-ntsc") && out.contains("c64c-pal"), "{out}");
         let out = call(&st, "monitor/exec", json!({ "command": "model c64-ntsc" }))["output"].as_str().unwrap().to_string();
         assert!(out.contains("c64-pal → c64-ntsc"), "{out}");
         assert_eq!(st.lock().unwrap().session.machine.model().name, "c64-ntsc");

@@ -284,6 +284,8 @@ fn load_cia_vice_body(machine: &mut Machine, cia2: bool, major: u8, minor: u8, b
     if cia2 {
         if let Some(pa) = p.pa_undump {
             machine.cia2_pa_out = pa;
+            // c64cia2.c `undump_ciapa`: `vbank = (byte ^ 3) & 3; c64_glue_undump(vbank)`.
+            machine.vic.glue.undump((pa ^ 3) & 3);
             machine.iec.iecbus_cpu_undump(pa ^ 0xff);
         }
     }
@@ -1096,6 +1098,22 @@ fn load_vice_vsf(machine: &mut Machine, data: &[u8]) -> Result<VsfLoadResult, St
         }
     }
 
+    // ── C64GLUE (c64_glue_snapshot_read_module): type, old vbank, alarm active. The type
+    // is the row's, not the file's; the alarm comes back one cycle out, as VICE sets it.
+    // A file without the module (or the pre-1.1 name "GLUE") has no pending alarm.
+    {
+        let clk = machine.c64_core.clk;
+        let body = vice_find_module(data, "C64GLUE").or_else(|| vice_find_module(data, "GLUE"));
+        match body {
+            Some(m) if m.data_len >= 3 => {
+                let d = &data[m.data_start..m.data_start + m.data_len];
+                machine.vic.glue.restore_vsf(d[1] & 3, d[2] != 0, clk);
+                loaded.push("C64GLUE".to_string());
+            }
+            _ => machine.vic.glue.alarm = None,
+        }
+    }
+
     // ── SID v1.5: num_sids[0] sound[1] engine[2] model[3] sid_registers[4..36] ──
     match vice_find_module(data, "SID") {
         Some(m) if m.data_len >= 4 + 32 => {
@@ -1227,7 +1245,7 @@ fn load_vice_vsf(machine: &mut Machine, data: &[u8]) -> Result<VsfLoadResult, St
     }
 
     // The remaining modules are not mapped into the Machine.
-    for n in ["FSDRIVE", "GLUE", "TAPEPORT", "DATASETTE", "SIDEXTENDED", "C64CART"] {
+    for n in ["FSDRIVE", "TAPEPORT", "DATASETTE", "SIDEXTENDED", "C64CART"] {
         if n == "C64CART" && ef_loaded {
             continue;
         }

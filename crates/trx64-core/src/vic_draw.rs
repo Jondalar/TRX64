@@ -715,7 +715,7 @@ mod tests {
         let mut v = VicII::new();
         v.speed_profile = SpeedProfile::C64;
         v.turbo_div = 1;
-        v.color_latency = false;
+        v.color_latency = true;
         v.dbuf_line = 0;
         v.dbuf_offset = 0;
         v.render_buffer.fill(COL_D020);
@@ -726,13 +726,32 @@ mod tests {
         }
         draw_colors8(&mut v);
 
-        let row: Vec<u8> = (0..8).map(|i| v.dbuf[i]).collect();
-        // Same grey dot at pixel 0, same reason; the other seven are ONE colour, because
-        // a 6510 cannot say more than one thing per cycle.
-        assert_eq!(
-            row,
-            vec![0x0f, 8, 8, 8, 8, 8, 8, 8],
-            "one latch, one colour, seven identical pixels behind the grey dot"
-        );
+        // The 6569 resolves a pixel behind: pixel 0 is the one before, 1..7 are one colour.
+        let row: Vec<u8> = (1..8).map(|i| v.dbuf[i]).collect();
+        assert_eq!(row, vec![8; 7], "one latch, one colour: a 6510 cannot say more than one thing per cycle");
+    }
+
+    /// The 8565 takes a store the way VICE's `vicii_store` does: the cycle drawn right after
+    /// it has not heard of it, the one after that applies it, with the grey dot on pixel 0
+    /// and the new colour behind it — and the dot comes once.
+    #[test]
+    fn the_8565_applies_a_store_in_the_second_draw_and_the_dot_comes_once() {
+        let mut v = VicII::new();
+        v.speed_profile = SpeedProfile::C64;
+        v.turbo_div = 1;
+        v.color_latency = false;
+        v.dbuf_line = 0;
+        v.render_buffer.fill(COL_D020);
+        v.pixel_buffer.fill(COL_D020);
+        v.write_reg(0x20, 5); // a store between two draws
+        let mut rows = Vec::new();
+        for cycle in 0..3 {
+            v.dbuf_offset = cycle * 8;
+            draw_colors8(&mut v);
+            rows.push((0..8).map(|i| v.dbuf[cycle * 8 + i]).collect::<Vec<u8>>());
+        }
+        assert_eq!(rows[0], vec![0; 8], "the next draw does not know the store yet");
+        assert_eq!(rows[1], vec![0x0f, 5, 5, 5, 5, 5, 5, 5], "the second applies it: the dot, then the colour");
+        assert_eq!(rows[2], vec![5; 8], "and the dot does not come again");
     }
 }

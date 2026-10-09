@@ -355,17 +355,17 @@ fn ntsc_stolen_cycles_are_where_vices_table_puts_them() {
 // ── §6.8 — models are rows ────────────────────────────────────────────────────────────
 
 /// Acceptance 8 — `c64-paln` runs 65 × 312 at 1 023 440 Hz with a 50 Hz TOD, without a
-/// line of engine code written for it; `c64c-pal` is refused naming what it lacks — the
-/// custom-IC glue (its 6526A exists since Spec 888).
+/// line of engine code written for it; a row that needs a KERNAL the ROM set lacks is
+/// refused naming it.
 #[test]
-fn paln_is_a_row_and_c64c_is_refused_by_name() {
+fn paln_is_a_row_and_an_unbuilt_row_is_refused_by_name() {
     let p = model::resolve("c64-paln").unwrap();
     let m = Machine::new_with_model(p);
     assert_eq!((m.vic.cycles_per_line(), m.vic.screen_height()), (65, 312));
     assert_eq!((m.timing().cpu_hz, m.cia1.power_freq, m.timing().cycles_per_frame), (1_023_440, 50, 20_280));
     assert_eq!(m.drive8.sync_factor, (65536.0 * 1e6 / 1_023_440.0f64).floor() as u32);
-    let err = model::resolve("c64c-pal").unwrap_err();
-    assert!(err.contains("custom-IC glue logic"), "{err}");
+    let err = model::resolve("c64-old-pal").unwrap_err();
+    assert!(err.contains("KERNAL rev2"), "{err}");
     if roms() {
         let m = booted("c64-paln");
         assert_eq!(m.ram[0x02a6], 1, "a 312-line frame reads as PAL to the KERNAL");

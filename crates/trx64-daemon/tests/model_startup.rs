@@ -65,18 +65,29 @@ fn start(args: &[&str]) -> (bool, bool, Vec<String>) {
     }
 }
 
-/// Acceptance 8 — `--model c64c-pal` is refused at startup, naming the missing block.
+/// Acceptance 8 — `--model c64-old-pal` is refused at startup, naming the missing block.
 #[test]
 fn a_row_that_cannot_run_is_refused_at_startup_by_name() {
-    let (exited, ok, lines) = start(&["--model", "c64c-pal"]);
+    let (exited, ok, lines) = start(&["--model", "c64-old-pal"]);
     assert!(exited && !ok, "refused: {lines:?}");
     let text = lines.join("\n");
-    assert!(text.contains("custom-IC glue logic"), "names the block: {text}");
+    assert!(text.contains("KERNAL rev2"), "names the block: {text}");
     assert!(!text.contains("listening"), "never listened: {text}");
 
     let (exited, ok, lines) = start(&["--model", "c64-secam"]);
     assert!(exited && !ok);
     assert!(lines.join("\n").contains("unknown model"), "{lines:?}");
+}
+
+/// The C64C rows (8565 / 8562 on the custom-IC glue) start a daemon.
+#[test]
+fn the_c64c_rows_start_the_daemon_on_them() {
+    for row in ["c64c-pal", "c64c-ntsc"] {
+        let (exited, _, lines) = start(&["--model", row]);
+        let text = lines.join("\n");
+        assert!(!exited, "{row} runs: {text}");
+        assert!(text.contains(&format!("model = {row}")), "{text}");
+    }
 }
 
 /// Acceptance 8 — `c64-paln` runs 65 × 312 at 1 023 440 Hz; `--video ntsc` is `c64-ntsc`.
