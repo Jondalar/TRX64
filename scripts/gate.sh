@@ -73,11 +73,11 @@ else
 fi
 
 # ── [2/4] rust gate tests (asserting, fast) ──────────────────────────────────
-printf '[2/4] rust gate tests (iso_vic + vic_collision + cart_mapper + ef3 + expansion_port + u64_turbo + turbo_as_measured + turbo_fastpath + cia_alarm_check + iso_cia + cia_icr_latch + uci + reu + cia_tod + vic_line_trace + ntsc + the daemon suite, release)\n'
+printf '[2/4] rust gate tests (iso_vic + vic_collision + cart_mapper + ef3 + expansion_port + u64_turbo + turbo_as_measured + turbo_fastpath + cia_alarm_check + iso_cia + cia_icr_latch + uci + reu + cia_tod + vic_line_trace + ntsc + bp_interrupt_entry + the daemon suite, release)\n'
 command -v cargo >/dev/null 2>&1 || die_red "cargo not on PATH — cannot run gate tests" ""
 TLOG=$(mktmp)
 if cargo test --release -p trx64-core \
-     --test iso_vic_gate --test vic_collision_gate --test cart_mapper_gate --test ef3_gate --test expansion_port_gate --test u64_turbo_gate --test turbo_as_measured_gate --test turbo_fastpath_gate --test cia_alarm_check_gate --test iso_cia_gate --test cia_icr_latch_gate --test uci_gate --test reu_gate --test cia_tod_gate --test sid_multi_gate \
+     --test iso_vic_gate --test vic_collision_gate --test cart_mapper_gate --test ef3_gate --test expansion_port_gate --test u64_turbo_gate --test turbo_as_measured_gate --test turbo_fastpath_gate --test cia_alarm_check_gate --test iso_cia_gate --test cia_icr_latch_gate --test uci_gate --test reu_gate --test cia_tod_gate --test sid_multi_gate --test bp_interrupt_entry_gate \
      --test snapshot_roundtrip_fidelity --test resid_oracle \
      --test vic_line_trace_gate --test ntsc_gate --lib \
      >"$TLOG" 2>&1; then

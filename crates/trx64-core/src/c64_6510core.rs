@@ -694,6 +694,14 @@ pub trait C64Core6510Bus {
     /// `Observer.on_interrupt` is the only producer (the daemon's full SC path).
     #[inline]
     fn on_interrupt(&mut self, _vector: u16, _clk: u64) {}
+
+    /// Debugger gate: after a hardware IRQ/NMI entry (7 cycles, PC = the vector target),
+    /// should the core return BEFORE fetching the handler's first opcode? True only when an
+    /// exec breakpoint / exec watch is armed on `pc`; the default (nothing armed) keeps the
+    /// entry and the first opcode in one step, cycle-identical.
+    fn stop_at_entry(&self, _pc: u16) -> bool {
+        false
+    }
 }
 
 // =============================================================================
@@ -716,6 +724,10 @@ pub struct C64Core6510 {
     /// dtv:68 / 117.
     pub reg_p: u8,
     pub reg_pc: u16,
+    /// Set when `run` returned right after an IRQ/NMI entry (before the handler's first
+    /// opcode was fetched) because the bus asked to stop there. The next `run` skips its
+    /// prologue once — the entry already happened — and fetches the handler's first opcode.
+    pub entry_paused: bool,
     /// 0x80 if N set, else 0 (VICE flag_n cache). dtv:115.
     pub flag_n: u8,
     /// 0 iff Z set; non-zero iff Z clear (VICE flag_z cache). dtv:116.
@@ -776,6 +788,7 @@ impl C64Core6510 {
             reg_sp: 0,
             reg_p: P_UNUSED & !(P_ZERO | P_SIGN),
             reg_pc: 0,
+            entry_paused: false,
             flag_n: 0,
             flag_z: 1, // Z clear at power-on.
             clk: 6,
@@ -2474,8 +2487,9 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
 
     // DO_INTERRUPT (dtv:354-457): the SC maincpu interrupt dispatch.
     #[allow(unused_assignments)]
-    fn do_interrupt(&mut self, int_kind: u32) {
+    fn do_interrupt(&mut self, int_kind: u32) -> bool {
         let mut ik = int_kind;
+        let mut entered = false;
         let mut addr: u16;
 
         if ik & (IK_IRQ | IK_IRQPEND | IK_NMI) != 0 {
@@ -2507,6 +2521,7 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
                 self.local_set_interrupt(true);
                 self.jump(addr);
                 self.set_last_opcode(0);
+                entered = true;
             } else {
                 // Evaluate the IRQ gate. The DISABLES_IRQ test reads
                 // last_opcode_info; the delay check mutates int — sequence them.
@@ -2527,6 +2542,7 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
                     self.local_set_break(false);
                     self.do_irqbrk();
                     self.set_last_opcode(0);
+                    entered = true;
                 }
             }
         }
@@ -2554,6 +2570,7 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
         if ik & IK_MONITOR != 0 {
             // Monitor not ported.
         }
+        entered
     }
 
     // -------------------------------------------------------------------------
@@ -2688,6 +2705,10 @@ pub fn c64_6510core_execute<B: C64Core6510Bus>(
 fn run<B: C64Core6510Bus>(ex: &mut Exec<B>) -> i32 {
     {
         // --- Prologue (dtv:1734-1772) ---
+        // Resuming after a debugger stop at the handler entry: the entry (and its alarms)
+        // already ran at this clk; go straight to the handler's first opcode.
+        let resumed = std::mem::replace(&mut ex.core.entry_paused, false);
+        if !resumed {
 
         // 1) alarm dispatch up to clk.
         ex.process_alarms();
@@ -2711,14 +2732,19 @@ fn run<B: C64Core6510Bus>(ex: &mut Exec<B>) -> i32 {
             }
             let pending_interrupt = ex.int.global_pending_int;
             if pending_interrupt != IK_NONE {
-                ex.do_interrupt(pending_interrupt);
+                let entered = ex.do_interrupt(pending_interrupt);
                 if (ex.int.global_pending_int & IK_IRQ) == 0
                     && (ex.int.global_pending_int & IK_IRQPEND) != 0
                 {
                     ex.int.global_pending_int &= !IK_IRQPEND;
                 }
                 ex.process_alarms();
+                if entered && ex.bus.stop_at_entry(ex.core.reg_pc) {
+                    ex.core.entry_paused = true;
+                    return ex.jam_result;
+                }
             }
+        }
         }
 
         // --- FETCH (dtv:1792-1812 + c64cpusc.c:152-179) ---

@@ -67,6 +67,11 @@ pub struct FullScBus<'a, 'o, 'w, 'h, O: Observer> {
     /// instruction boundary (= TS `obs.haltRequested`, integrated-session.ts:989).
     /// Never re-enters the CPU mid-instruction.
     pub halt_requested: bool,
+    /// Exec breakpoint set, so the core can stop right after an interrupt entry when the
+    /// handler's first instruction is armed (see `C64Core6510Bus::stop_at_entry`).
+    pub entry_break: Option<&'w std::collections::HashSet<u16>>,
+    /// Per-PC exec-watch table, same purpose as `entry_break`.
+    pub entry_exec_watch: Option<&'w [u8; 0x10000]>,
     /// Live `reg_pc` of the executing core (= the `pc` field of every bus record;
     /// `cpu.rs` passed `self.reg_pc`). Read-only raw pointer; the core invokes the
     /// bus synchronously and never holds a live `&mut` to `reg_pc` at the instant a
@@ -185,6 +190,11 @@ impl<'a, 'o, 'w, 'h, O: Observer> FullScBus<'a, 'o, 'w, 'h, O> {
 }
 
 impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O> {
+    fn stop_at_entry(&self, pc: u16) -> bool {
+        self.entry_break.is_some_and(|b| b.contains(&pc))
+            || self.entry_exec_watch.is_some_and(|w| w[pc as usize] != 0)
+    }
+
     /// LOAD path (mainc64cpu.c:359-363) real read. Reuses [`FullBus`]'s banked
     /// read dispatch EXACTLY, then emits the `on_bus(Read)` record (+ any chip
     /// side-effect reads, e.g. the $DD00 IEC `iecReadPins` indirection, emitted
