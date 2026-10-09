@@ -133,3 +133,55 @@ fn unarmed_runs_are_unchanged() {
     assert!(p == snap(&other), "an unrelated breakpoint must not change the machine");
     assert!(p == snap(&stepped), "stop-at-entry + step must land in the same state");
 }
+
+fn full_snap(m: &Machine) -> (u64, u16, [u8; 4], Vec<u8>) {
+    let c = &m.c64_core;
+    (m.clk, c.reg_pc, [c.reg_a, c.reg_x, c.reg_y, c.reg_sp], (0..=0xffffu32).map(|a| m.read_full(a as u16)).collect())
+}
+
+/// A checkpoint taken at the entry stop carries it: restoring and running N cycles lands in
+/// exactly the state of resuming the uninterrupted machine for the same N. Without the flag
+/// in the checkpoint the restore would run the interrupt dispatch again before the first opcode.
+fn checkpoint_at_entry(cia: u16, target: u16) {
+    use trx64_core::c64re_snapshot::{capture_runtime_checkpoint, restore_runtime_checkpoint};
+    let Some(mut m) = booted() else { return };
+    arm_timer(&mut m, cia);
+    let bps: HashSet<u16> = [target].into();
+    assert_eq!(run_to(&mut m, &bps, 4), RunStop::Breakpoint(target));
+    assert!(m.c64_core.entry_paused);
+    let cp = capture_runtime_checkpoint(&m, "", "d64", None, None, None, None);
+    assert_eq!(cp["cpu"]["entryPaused"], serde_json::json!(true), "the checkpoint records the entry stop");
+
+    let go = |m: &mut Machine| {
+        m.run_for_full_capped(999_999, 1, &mut NullSink, nop);
+        m.run_for_full(3 * FRAME, &mut NullSink, nop);
+    };
+    go(&mut m);
+    let reference = full_snap(&m);
+    assert!(!m.c64_core.entry_paused);
+
+    restore_runtime_checkpoint(&mut m, &cp).expect("restore");
+    assert!(m.c64_core.entry_paused, "restore brings the entry stop back");
+    assert_eq!(m.c64_core.reg_pc, target);
+    go(&mut m);
+    assert!(full_snap(&m) == reference, "restore at the entry stop must equal the uninterrupted run");
+
+    // An older checkpoint (no field) reads as not paused, and a restore clears a live flag.
+    let mut old = cp.clone();
+    old["cpu"].as_object_mut().unwrap().remove("entryPaused");
+    let mut m2 = booted().unwrap();
+    arm_timer(&mut m2, cia);
+    assert_eq!(run_to(&mut m2, &bps, 4), RunStop::Breakpoint(target));
+    restore_runtime_checkpoint(&mut m2, &old).expect("restore old");
+    assert!(!m2.c64_core.entry_paused);
+}
+
+#[test]
+fn irq_checkpoint_at_entry_restores_exactly() {
+    checkpoint_at_entry(0xdc00, 0xff48);
+}
+
+#[test]
+fn nmi_checkpoint_at_entry_restores_exactly() {
+    checkpoint_at_entry(0xdd00, 0xfe43);
+}
