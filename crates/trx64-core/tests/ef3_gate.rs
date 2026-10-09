@@ -793,11 +793,39 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Does `copy` hold every source file of `src`? The system temp directory is purged of files
+/// after a few days, which leaves a folder with holes in it. Build products (`obj`
+/// directories) are not sources: the build removes them itself.
+fn tree_has_sources(src: &Path, copy: &Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(src) else { return false };
+    for e in rd.flatten() {
+        let name = e.file_name();
+        if name == ".git" || name == "obj" {
+            continue;
+        }
+        let dst = copy.join(&name);
+        match e.file_type() {
+            Ok(t) if t.is_dir() => {
+                if !tree_has_sources(&e.path(), &dst) {
+                    return false;
+                }
+            }
+            Ok(_) => {
+                if !dst.exists() {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
 /// The scratch copy of the EF3 sources. The clone itself is never written to.
 fn scratch(src: &Path) -> Result<PathBuf, String> {
     let dir = std::env::temp_dir().join("trx64-ef3-gate-bootimage");
     let tree = dir.join("skoe-easyflash");
-    if !tree.join("EF3BootImage").exists() {
+    if !tree_has_sources(src, &tree) {
         let _ = std::fs::remove_dir_all(&dir);
         copy_tree(src, &tree)?;
     }
@@ -823,7 +851,8 @@ fn build_boot_image() -> Result<BootImage, String> {
     let src = ef3_src().ok_or("no EF3 source clone")?;
     let tree = scratch(&src)?;
     let boot = tree.join("EF3BootImage");
-    if !boot.join("ef3-menu.bin").exists() {
+    let built = ["ef3-menu.bin", "directory.bin", "efmenu/efmenu.bin.labels"].iter().all(|f| boot.join(f).exists());
+    if !built {
         for cfg in ["efmenu/src/ld2.cfg", "prgstart/src/ld.crt.cfg"] {
             let p = boot.join(cfg);
             let s = std::fs::read_to_string(&p).map_err(|e| e.to_string())?;
