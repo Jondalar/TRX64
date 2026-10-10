@@ -518,3 +518,17 @@ it half-working — the program meets what a device without that mode would give
 status says why. The image's own EAPI is never swapped for EF3: the replacement exists for
 EasyFlash 1 drivers written against real-hardware timing, and the EF3 driver runs against the
 emulated chip as it is.
+
+## Input at a cycle, and a probe over frames — 901
+
+Key and joystick input can be scheduled for an absolute cycle (`at_cycle` on
+`session/key_down|key_up|joystick_set|joystick_clear`); a CIA1 read answers from that schedule
+at its own cycle, so a press can land anywhere in a frame, also inside one run call.
+`session/frame_probe` samples addresses at a raster line once per frame over a window, in one
+call, as a change-only series or an assertion that stops at the first wrong frame, and stops at
+armed breakpoints and watchpoints like `session/run`.
+
+**Decision:** the daemon stays deterministic and takes the cycle from its caller — jitter,
+offsets and sweeps are the caller's (C64RE 899). The probe samples at the first instruction
+boundary at or after its target and reports where it actually sampled, instead of pretending
+to sub-instruction precision the core does not have.

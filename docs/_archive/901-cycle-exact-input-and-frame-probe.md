@@ -1,6 +1,6 @@
 # 901 — Cycle-exact input and a frame probe
 
-**Status:** BUILT on branch `spec-901` (TRX64 half; not merged). Tests: `spec901_*` in the daemon suite, `keyboard::tests` and `full::joystick_gate_tests` in core.
+**Status:** DONE — merged to main 2026-10-10 (TRX64 half; the C64RE half is 899). Tests: `spec901_*` in the daemon suite, `keyboard::tests` and `full::joystick_gate_tests` in core. Decision in `README.md` here.
 **Repo:** TRX64 (daemon + core). The C64RE half is 899.
 **Number:** 901 (board: `C64ReverseEngineeringMCP/specs/README.md`)
 **Origin:** C64RE issues #67 and #68 (mrr19121970, Mega Vault C64 port, 2026-10-10); owner split
