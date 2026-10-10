@@ -1,6 +1,6 @@
 # 902 (TRX64 half) — The daemon can be asked to end, and ends cleanly however it is asked
 
-**Status:** BUILT on branch spec-902-shutdown
+**Status:** DONE — merged to main 2026-10-10 (TRX64 half; C64RE half is C64RE 902). Tests: `tests/shutdown_902.rs`. Decision in `README.md` here.
 **Repo:** TRX64 (daemon). The C64RE half is `C64ReverseEngineeringMCP/specs/902-shut-down-means-down.md`.
 **Number:** 902 (board: `C64ReverseEngineeringMCP/specs/README.md`)
 **Origin:** C64RE 902 D6 (owner, 2026-10-10): Windows has no SIGTERM, a kill there is a hard

@@ -532,3 +532,14 @@ armed breakpoints and watchpoints like `session/run`.
 offsets and sweeps are the caller's (C64RE 899). The probe samples at the first instruction
 boundary at or after its target and reports where it actually sampled, instead of pretending
 to sub-instruction precision the core does not have.
+
+## The daemon ends cleanly however it is asked — 902
+
+`daemon/shutdown` ends the daemon on request: the reply (with the media it wrote back) reaches
+the caller, then the connection closes and the process exits 0. SIGTERM, SIGINT, the Windows
+console events and the idle exit run the same exit work, once: stop the run, end a recording
+trace, write back a dirty cartridge and disks. Before this a signal killed the daemon on the
+default action and lost any unsaved cartridge or disk write.
+
+**Decision:** one exit path for every way the daemon can be ended, so no way of stopping it is
+lossy. The request exists because Windows has no SIGTERM; C64RE asks first and kills only after.
