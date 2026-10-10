@@ -83,6 +83,17 @@ Params:
   **whole frame** crossed, exactly as `session/run` would for the same span — not once per sample.
   Rendering is not needed per frame and is not done per sample.
 - Scheduled input (D1) inside the window takes effect at its cycle as in any run.
+- **Breakpoints and watchpoints.** The probe advances through the same path as `session/run`
+  (`run_budget_honouring_breaks`): an armed exec breakpoint or watchpoint stops it, the machine
+  stays at the stop and `ctrl_stop` records it. The reply is `{stopped: "breakpoint" | "watchpoint"
+  | "device", frame, c64Cycles, line, cycle, pc, breakpoint: {pc, num, registers}, rows, samples,
+  changes, layout}` — `breakpoint` is the object `session/run` returns, `rows`/`samples` are what
+  was collected before the stop (series mode). With nothing armed, results are unchanged.
+- `lens` must be one of `cpu`, `ram`, `rom`, `io`, `cart`; anything else is -32602
+  (`session/read_memory` falls back to `cpu` silently; the probe does not).
+- "Whole frame crossed" is counted in emulated cycles from the call's start: a 10-frame probe
+  sampling at line 250 from line 0 crosses 9 whole frames and does the work 9 times, which is
+  what `session/run` does over the same span.
 
 **D3 — method names, for C64RE 899:** `session/key_down|key_up|joystick_set|joystick_clear`
 `{…, at_cycle?}`; `session/frame_probe {frames, line, cycle?, addresses, mode?, expect?}`. Both
@@ -95,6 +106,8 @@ listed in the daemon's method list / capability surface, wherever `session/read_
   `at_cycle` itself).
 - Scheduled input is not part of a checkpoint; a checkpoint restore drops the pending schedule.
 - `session/type` unchanged.
+- The input journal records `at_cycle` in an entry's detail, but the scenario replay path
+  ignores it: a replayed entry is applied at its issue cycle, not at `at_cycle`.
 - No release (owner's call).
 
 ## 4. Acceptance
@@ -120,3 +133,7 @@ Tests in the daemon suite (and core where the model lives), run in the gate:
    number of ring anchors as `session/run` over the same 10 frames.
 8. Refused while running; bad `line`/`cycle`/`len` → -32602.
 9. Full gate green.
+10. **Breakpoints and watchpoints.** An exec breakpoint inside the window stops the probe at that
+    pc, in that frame, with the rows collected so far; a watchpoint likewise (`stopped:
+    "watchpoint"`); `session/run` from the same checkpoint stops at the same pc and cycle; with
+    nothing armed the rows are the unarmed ones.

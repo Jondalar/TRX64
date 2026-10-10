@@ -1831,6 +1831,71 @@ fn power_cycle_for_restore(st: &mut State) {
     st.notify.broadcast("audio/flush", json!({ "session_id": st.session.id }));
 }
 
+/// How a budget run ended.
+enum BudgetRun {
+    Done,
+    /// An armed exec breakpoint or watchpoint (or an expansion-port device) stopped the run.
+    Halted {
+        /// `BreakRun::reason`: "breakpoint" (exec), "observer" (watchpoint), "device".
+        reason: &'static str,
+        pc: u16,
+        /// The numbered breakpoint at `pc` (0 when none matches, as `session/run` has always said).
+        num: u64,
+        registers: String,
+        cycles: u64,
+    },
+}
+
+/// `session/run`'s way of spending a cycle budget: with exec breakpoints or watchpoints armed
+/// it steps past a breakpoint the PC is sitting on and runs with the observer registry,
+/// stopping at the first hit (the machine stays there, `ctrl_stop` records it); with none
+/// armed it is the plain trace-aware budget advance. One path, so `session/frame_probe`
+/// stops exactly where a run would.
+fn run_budget_honouring_breaks(st: &mut State, cycles: u64) -> BudgetRun {
+    {
+        let MonitorSession { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } = &mut st.mon;
+        sync_observers(breakpoints, dsl_observers, dsl_disabled, reg);
+    }
+    if !observers_armed(&st.mon.observers) {
+        run_cycle_budget(&mut st.session, cycles);
+        return BudgetRun::Done;
+    }
+    // runtime-controller.ts:277 / ws-server.ts:855 — step PAST a bp the PC is
+    // sitting ON so the run doesn't immediately re-trip the same address.
+    {
+        let pc = st.session.machine.c64_core.reg_pc;
+        if st.mon.breakpoints.entries.iter().any(|e| e.enabled && e.pc == pc) {
+            step_one_instruction(&mut st.session);
+        }
+    }
+    let run = {
+        let State { session, mon, .. } = &mut *st;
+        let reg = &mut mon.observers;
+        let fm = full_machine_gate(session);
+        run_until_break(session, reg, cycles, fm)
+    };
+    {
+        let MonitorSession { breakpoints, observers: reg, .. } = &mut st.mon;
+        writeback_hits(breakpoints, reg);
+    }
+    let cycles_now = st.session.machine.clk;
+    if !run.halted {
+        return BudgetRun::Done;
+    }
+    // bpNumForAddr returns 0 (NOT null) when no numbered bp matches
+    // (runtime-controller.ts:238) — match the TS reply exactly.
+    let num = st
+        .mon.breakpoints
+        .entries
+        .iter()
+        .find(|e| e.pc == run.pc)
+        .map(|e| e.num)
+        .unwrap_or(0) as u64;
+    st.ctrl_stop = Some(CtrlStop { reason: "breakpoint", pc: run.pc, cycles: cycles_now });
+    let registers = register_dump(&st.session);
+    BudgetRun::Halted { reason: run.reason, pc: run.pc, num, registers, cycles: cycles_now }
+}
+
 fn run_cycle_budget(session: &mut Session, budget: u64) {
     // Full literal-VIC machine when the ROMs are assembled and the scenario is not a
     // declared exerciser (or is one with media attached, or a `vic`-directed program).
@@ -7016,74 +7081,20 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 .unwrap_or(19705);
 
             // audit ws-session-debug-3 — a manual (paused) session/run HONOURS exec
-            // breakpoints. TS (ws-server.ts:852-901): build the bp set, step PAST a bp
-            // it is sitting on, run the budget WITH the bp set, and on a hit return
-            // early with a breakpoint{pc,num,registers} object. When NONE are armed,
-            // fall through to the historical plain (trace-aware) budget advance so the
-            // no-debug + trace-firehose paths (formats-state-6, background-workers-
-            // async-5) are unchanged.
+            // breakpoints and watchpoints (`run_budget_honouring_breaks`, shared with
+            // `session/frame_probe`).
+            if let BudgetRun::Halted { pc, num, registers, cycles: cycles_now, .. } =
+                run_budget_honouring_breaks(&mut st, cycles)
             {
-                let MonitorSession { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } =
-            &mut st.mon;
-                sync_observers(breakpoints, dsl_observers, dsl_disabled, reg);
+                return Response::ok(id, json!({
+                    "c64Cycles": cycles_now,
+                    "breakpoint": {
+                        "pc": pc as u64,
+                        "num": num,
+                        "registers": registers,
+                    },
+                }));
             }
-            if observers_armed(&st.mon.observers) {
-                // runtime-controller.ts:277 / ws-server.ts:855 — step PAST a bp the PC is
-                // sitting ON so the run doesn't immediately re-trip the same address.
-                {
-                    let pc = st.session.machine.c64_core.reg_pc;
-                    if st.mon.breakpoints.entries.iter().any(|e| e.enabled && e.pc == pc) {
-                        step_one_instruction(&mut st.session);
-                    }
-                }
-                let run = {
-                    let State { session, mon, .. } = &mut *st;
-        let reg = &mut mon.observers;
-                    let fm = full_machine_gate(session);
-                    run_until_break(session, reg, cycles, fm)
-                };
-                {
-                    let MonitorSession { breakpoints, observers: reg, .. } = &mut st.mon;
-                    writeback_hits(breakpoints, reg);
-                }
-                let cycles_now = st.session.machine.clk;
-                if run.halted {
-                    // bpNumForAddr returns 0 (NOT null) when no numbered bp matches
-                    // (runtime-controller.ts:238) — match the TS reply exactly.
-                    let bp_num = st
-                        .mon.breakpoints
-                        .entries
-                        .iter()
-                        .find(|e| e.pc == run.pc)
-                        .map(|e| e.num)
-                        .unwrap_or(0);
-                    st.ctrl_stop = Some(CtrlStop { reason: "breakpoint", pc: run.pc, cycles: cycles_now });
-                    let registers = register_dump(&st.session);
-                    return Response::ok(id, json!({
-                        "c64Cycles": cycles_now,
-                        "breakpoint": {
-                            "pc": run.pc as u64,
-                            "num": bp_num as u64,
-                            "registers": registers,
-                        },
-                    }));
-                }
-                // Spec 764 — a KIL/JAM that fired DURING this armed run jams the CPU
-                // (PC frozen) without tripping a bp; observe it via the shared helper
-                // (freeze + debug/stopped reason="jam") and signal the caller so the
-                // CLI pump PAUSES instead of re-issuing session/run on the jammed CPU.
-                if check_and_handle_jam(&mut st) {
-                    let pc = jammed_pc(&st);
-                    return Response::ok(id, json!({
-                        "c64Cycles": st.session.machine.clk,
-                        "jam": { "pc": pc as u64 },
-                    }));
-                }
-                // Budget exhausted without a hit: report the advanced cycle count.
-                return Response::ok(id, json!({ "c64Cycles": cycles_now }));
-            }
-
-            run_cycle_budget(&mut st.session, cycles);
             // Spec 764 — the no-debug budget advance has no halt gate, so a jammed CPU
             // (KIL frozen at PC) would otherwise burn the WHOLE budget here and the CLI
             // pump would keep re-issuing session/run → the spin/hang. Observe the jam via
@@ -16802,11 +16813,25 @@ fn frame_probe(st: &mut State, p: &Value) -> Result<Value, (i64, String)> {
         };
         if delta > 0 {
             let before = st.session.machine.clk;
-            run_cycle_budget(&mut st.session, delta);
+            let ran = run_budget_honouring_breaks(st, delta);
             acc += st.session.machine.clk.saturating_sub(before);
             while acc >= cpf {
                 acc -= cpf;
                 frame_background_work(st, cpf);
+            }
+            if let BudgetRun::Halted { reason, pc, num, registers, cycles } = ran {
+                let at = frame_position(&st.session.machine);
+                let layout: Vec<Value> = ranges
+                    .iter()
+                    .map(|r| json!({ "addr": r.addr as u64, "len": r.len, "lens": r.lens }))
+                    .collect();
+                return Ok(json!({
+                    "stopped": if reason == "observer" { "watchpoint" } else { reason },
+                    "frame": frame, "c64Cycles": cycles,
+                    "line": (at / cpl + first_line) % lpf, "cycle": at % cpl, "pc": pc as u64,
+                    "breakpoint": { "pc": pc as u64, "num": num, "registers": registers },
+                    "rows": rows, "samples": samples, "changes": changes, "layout": layout,
+                }));
             }
             if check_and_handle_jam(st) {
                 let pc = jammed_pc(st);
@@ -27082,5 +27107,52 @@ mod batch1_tests {
         assert_eq!(s901_clk(&st), clk, "refused means not advanced");
         st.lock().unwrap().session.running = false;
         let _ = call(&st, "session/frame_probe", ok);
+    }
+
+    /// Armed breakpoints and watchpoints stop the probe exactly where `session/run` would.
+    #[test]
+    fn spec901_probe_stops_at_armed_breakpoints_and_watchpoints() {
+        let p = json!({ "frames": 100, "line": 250, "addresses": [{ "addr": 0xd029, "lens": "io" }] });
+        let hit = |st: &SharedState, cp: &Value, setup: &str| {
+            s901_restore(st, cp);
+            mon_exec(st, setup);
+            call(st, "session/frame_probe", p.clone())
+        };
+
+        // A breakpoint inside the window ($C090 runs only while $D029 is being set to 5).
+        let Some((st, cp, c)) = s901_probe_machine() else { return };
+        let r = hit(&st, &cp, "bk c090");
+        assert_eq!(r["stopped"], json!("breakpoint"), "{r}");
+        assert_eq!(r["pc"], json!(0xc090));
+        assert_eq!(r["breakpoint"]["pc"], json!(0xc090));
+        assert!(r["breakpoint"]["registers"].is_string());
+        assert_eq!(r["frame"], json!(39 - c), "the IRQ that sets 5 runs in the frame of the first 5");
+        assert_eq!(r["samples"], json!(39 - c), "rows so far: the samples taken before it");
+        assert_eq!(r["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(r["c64Cycles"], json!(s901_clk(&st)), "the machine stays at the stop");
+        assert_eq!(st.lock().unwrap().session.machine.c64_core.reg_pc, 0xc090);
+        assert_eq!(st.lock().unwrap().ctrl_stop.as_ref().map(|s| s.reason), Some("breakpoint"));
+        assert!(r["line"].as_u64().unwrap() < 250, "{r}");
+
+        // session/run stops at the same pc and cycle from the same checkpoint.
+        s901_restore(&st, &cp);
+        let run = call(&st, "session/run", json!({ "cycles": 60 * st.lock().unwrap().session.machine.timing().cycles_per_frame }));
+        assert_eq!(run["breakpoint"]["pc"], json!(0xc090));
+        assert_eq!(run["c64Cycles"], r["c64Cycles"]);
+
+        // A watchpoint.
+        let Some((st, cp, _)) = s901_probe_machine() else { return };
+        let r = hit(&st, &cp, "obs w when store d029 do break");
+        assert_eq!(r["stopped"], json!("watchpoint"), "{r}");
+        assert_eq!(r["frame"], json!(0));
+        assert_eq!(r["c64Cycles"], json!(s901_clk(&st)));
+
+        // Nothing armed: the results are the unarmed ones.
+        mon_exec(&st, "obs w del");
+        mon_exec(&st, "bk clear");
+        s901_restore(&st, &cp);
+        let ok = call(&st, "session/frame_probe", p.clone());
+        assert!(ok.get("stopped").is_none());
+        assert_eq!(ok["samples"], json!(100));
     }
 }
