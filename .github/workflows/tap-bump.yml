@@ -1,9 +1,21 @@
 # Keep the Homebrew tap pointing at the newest release, without anyone copying two
 # checksums by hand.
 #
-# Fires when a release is PUBLISHED. The release itself is still cut deliberately (a tag
-# plus `gh release create` with the artifacts from release-binaries) — this only carries
-# the result across to Jondalar/homebrew-trx64.
+# Fires when release-binaries COMPLETES (`workflow_run`), and does anything only if that
+# run succeeded. Its `publish` job has by then created and published the release with all
+# six archives and six .sha256 files, so there is nothing to wait for and no polling. (The
+# old `release: published` trigger is gone: a release made by a workflow with GITHUB_TOKEN
+# does not fire events for other workflows, and one made by hand raced its own uploads.)
+#
+# WHICH TAG: `workflow_run` does not expose the triggering run's inputs. `publish` therefore
+# uploads an artifact `release-tag` (tag.txt), and this job downloads it from the triggering
+# run with `gh run download` (run id + GITHUB_TOKEN, `actions: read`). That is exact: it is
+# the tag that run published, not a guess from head_sha or "latest release", which would be
+# wrong after a re-run or a later release. Runs with no such artifact (the nightly build,
+# or a dispatch without `version`) published nothing, so the job ends there with a notice.
+#
+# workflow_run only fires for workflow files on the DEFAULT branch, and uses the default
+# branch's copy of THIS file. Manual fallback: `workflow_dispatch` with a tag.
 #
 # It commits straight to the tap's main branch rather than opening a PR: a PR that nobody
 # merges leaves `brew install` handing out the previous version, which is a worse failure
@@ -23,8 +35,9 @@
 name: tap-bump
 
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: [release-binaries]
+    types: [completed]
   workflow_dispatch:
     inputs:
       tag:
@@ -35,22 +48,42 @@ defaults:
   run:
     shell: bash
 
+permissions:
+  contents: read
+  actions: read
+
 jobs:
   bump:
     runs-on: ubuntu-latest
+    # A manual dispatch always runs; a triggered run only after a green release-binaries.
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     steps:
       - name: Which release
         id: rel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
           set -eu
-          TAG="${{ inputs.tag }}"
-          [ -n "$TAG" ] || TAG="${{ github.event.release.tag_name }}"
+          TAG="${INPUT_TAG:-}"
+          if [ -z "$TAG" ]; then
+            rm -rf reltag && mkdir reltag
+            if ! gh run download "$RUN_ID" -R "$GITHUB_REPOSITORY" -n release-tag -D reltag 2>/dev/null; then
+              echo "::notice::run $RUN_ID published no release (no release-tag artifact) — tap untouched"
+              echo "skip=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            TAG=$(tr -d '[:space:]' < reltag/tag.txt)
+          fi
           [ -n "$TAG" ] || { echo "::error::no tag"; exit 1; }
+          echo "skip=false" >> $GITHUB_OUTPUT
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "version=${TAG#v}" >> $GITHUB_OUTPUT
           echo "publishing $TAG to the tap"
 
       - name: Require the tap token
+        if: steps.rel.outputs.skip != 'true'
         env:
           TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
         run: |
@@ -61,28 +94,24 @@ jobs:
           fi
 
       - name: Fetch the release checksums
+        if: steps.rel.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.rel.outputs.tag }}
         run: |
           set -eu
-          # `gh release create` uploads assets AFTER creating the release, so the published
-          # event can arrive before they exist. Retry rather than lose the race.
-          for attempt in 1 2 3 4 5 6; do
-            rm -rf sums && mkdir sums
-            gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p '*.sha256' -D sums || true
-            if [ -f sums/trx64-*-macos-arm64.tar.gz.sha256 ] \
-            && [ -f sums/trx64-*-macos-x86_64.tar.gz.sha256 ] \
-            && [ -f sums/trx64-*-linux-x86_64.tar.gz.sha256 ] \
-            && [ -f sums/trx64-*-linux-arm64.tar.gz.sha256 ]; then
-              echo "got all four checksums on attempt $attempt"; exit 0
-            fi
-            echo "assets not complete yet (attempt $attempt) — waiting"; sleep 20
+          # The release is complete by now (release-binaries publishes it only after all
+          # assets are uploaded), so this is a guard, not a wait: fail if anything is missing.
+          rm -rf sums && mkdir sums
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p '*.sha256' -D sums
+          for t in macos-arm64 macos-x86_64 linux-x86_64 linux-arm64; do
+            ls sums/trx64-*-$t.tar.gz.sha256 >/dev/null 2>&1 \
+              || { echo "::error::release $TAG lacks the $t checksum"; exit 1; }
           done
-          echo "::error::release $TAG lacks a macos-arm64/-x86_64 or linux-x86_64/-arm64 checksum"
-          exit 1
+          echo "got all four checksums"
 
       - name: Check out the tap
+        if: steps.rel.outputs.skip != 'true'
         uses: actions/checkout@v4
         with:
           repository: Jondalar/homebrew-trx64
@@ -90,6 +119,7 @@ jobs:
           path: tap
 
       - name: Rewrite the formula
+        if: steps.rel.outputs.skip != 'true'
         env:
           VERSION: ${{ steps.rel.outputs.version }}
         run: |
@@ -139,6 +169,7 @@ jobs:
           ruby -c tap/Formula/trx64.rb
 
       - name: Commit to the tap
+        if: steps.rel.outputs.skip != 'true'
         env:
           VERSION: ${{ steps.rel.outputs.version }}
         run: |

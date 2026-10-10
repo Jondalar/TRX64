@@ -22,6 +22,30 @@
 # arm64 followed for Windows and Linux once testing moved onto guests running on an Apple
 # Silicon host, where an x86_64 build does not run at all. macOS is arm64 already.
 #
+# TWO USES, ONE WORKFLOW:
+#   - Nightly (schedule) and a dispatch WITHOUT `version`: build all six targets and keep
+#     the archives as run artifacts for 14 days. Nothing is published.
+#   - A dispatch WITH `version` (the release): the same build, then the final `publish` job
+#     turns the six archives and their six .sha256 files into the GitHub release. Run it
+#     with the tag already pushed:
+#
+#       gh workflow run release-binaries.yml --ref main -f version=X \
+#          -f title="..." -f notes="$(cat notes.md)"
+#
+#     `publish` needs EVERY platform build green (a red platform means no release at all,
+#     never a release with a hole in it) and then, in order: checks that all 12 files are
+#     there, checks that tag vX exists and points at the dispatched commit, refuses if a
+#     release for vX already exists, creates the release as a DRAFT, uploads the 12 files,
+#     and only then publishes it (--latest). A release is therefore never visible half
+#     filled, which is what made the tap bump fail when it was assembled by hand. If the
+#     upload dies, the draft this run created is deleted again. The notes can be changed
+#     afterwards with `gh release edit vX --notes-file ...`.
+#
+#     Last, `publish` stores the tag in an artifact `release-tag`. tap-bump.yml follows this
+#     workflow via `workflow_run` and reads the tag from there. (Releases created with the
+#     built-in GITHUB_TOKEN do not fire `release: published` for other workflows, so the
+#     old trigger could not have worked from here anyway.)
+#
 # SHELL: `bash` everywhere, including Windows (git-bash ships on the runner). One set of
 # scripts beats maintaining a PowerShell twin of each step.
 
@@ -31,7 +55,13 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version label for the artifact (defaults to the workspace version)'
+        description: 'Release version X (tag vX must exist). Empty = build only, publish nothing'
+        required: false
+      title:
+        description: 'Release title (default: "TRX64 <version>")'
+        required: false
+      notes:
+        description: 'Release notes, markdown (default: empty; edit later with gh release edit)'
         required: false
   # Nightly, 03:00 CEST (cron is UTC). Nightly and not per-push because a cold build is
   # 16-40 minutes per platform and most pushes here cannot change a binary's behaviour
@@ -46,6 +76,10 @@ on:
   # activity, and re-enabling is a button in the Actions tab.
   schedule:
     - cron: '0 1 * * *'
+
+# Read-only by default; only `publish` is raised to write.
+permissions:
+  contents: read
 
 defaults:
   run:
@@ -340,3 +374,102 @@ jobs:
           # deliberately. Two weeks is long enough to grab yesterday's build and short
           # enough that the tab does not fill with 90 days of identical zips.
           retention-days: 14
+
+  # The release. Runs only for a dispatch that names a version, and only when every
+  # platform build above succeeded (plain `needs:` — a failed or skipped build skips this).
+  publish:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.version != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ inputs.version }}
+      TITLE: ${{ inputs.title }}
+      NOTES: ${{ inputs.notes }}
+    steps:
+      # Full history + tags: the tag check below needs to resolve vX to a commit.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: trx64-*
+          merge-multiple: true
+          path: dist
+
+      - name: All six archives and six checksums are here
+        run: |
+          set -eu
+          missing=""
+          for t in macos-arm64:tar.gz macos-x86_64:tar.gz linux-x86_64:tar.gz \
+                   linux-arm64:tar.gz windows-x86_64:zip windows-arm64:zip; do
+            f="dist/trx64-$VERSION-${t%%:*}.${t#*:}"
+            for x in "$f" "$f.sha256"; do
+              [ -f "$x" ] || missing="$missing $x"
+            done
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::missing build output:$missing"
+            ls -la dist
+            exit 1
+          fi
+          # Nothing else may ride along: 12 files, exactly.
+          n=$(find dist -type f | wc -l | tr -d ' ')
+          [ "$n" = "12" ] || { echo "::error::expected 12 files in dist, found $n"; ls -la dist; exit 1; }
+          ls -la dist
+
+      # What is checked: tag vX exists in this repository and its commit is the commit this
+      # run was dispatched on (github.sha = the head of --ref at dispatch time). A tag on
+      # another commit would publish binaries built from one tree under the name of another.
+      - name: The tag exists and points at the built commit
+        run: |
+          set -eu
+          TAG="v$VERSION"
+          git rev-parse -q --verify "refs/tags/$TAG" >/dev/null \
+            || { echo "::error::tag $TAG does not exist — push it before dispatching"; exit 1; }
+          TAGGED=$(git rev-parse "$TAG^{commit}")
+          if [ "$TAGGED" != "$GITHUB_SHA" ]; then
+            echo "::error::tag $TAG points at $TAGGED but this run built $GITHUB_SHA (--ref head moved, or the tag is on another commit)"
+            exit 1
+          fi
+          echo "$TAG -> $TAGGED, the built commit"
+
+      - name: No release for this tag yet
+        run: |
+          set -eu
+          TAG="v$VERSION"
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::a release (or draft) for $TAG already exists — refusing to overwrite. Delete it first if that is what you want: gh release delete $TAG"
+            exit 1
+          fi
+
+      - name: Draft, upload, publish
+        id: rel
+        run: |
+          set -eu
+          TAG="v$VERSION"
+          [ -n "$TITLE" ] || TITLE="TRX64 $VERSION"
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --draft \
+            --verify-tag --title "$TITLE" --notes "$NOTES"
+          echo "drafted=true" >> $GITHUB_OUTPUT
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" dist/*
+          gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --draft=false --latest
+          echo "published $TAG"
+
+      # Only the draft THIS run created, and only if it never got published.
+      - name: Remove the half-built draft
+        if: failure() && steps.rel.outputs.drafted == 'true'
+        run: gh release delete "v$VERSION" -R "$GITHUB_REPOSITORY" --yes || true
+
+      - name: Hand the tag to tap-bump
+        run: echo "v$VERSION" > tag.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-tag
+          path: tag.txt
+          if-no-files-found: error
+          retention-days: 7
