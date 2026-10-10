@@ -237,7 +237,9 @@ pub struct FullBus<'a> {
     /// folded into the $DC01 PB read. 1:1 with c64re `joystick1`.
     pub joystick1: crate::keyboard::JoystickState,
     /// Joystick port 2 (CIA1 PA bits 0-4, active-low), folded into the $DC00 PA
-    /// read. 1:1 with c64re `joystick2`. Copied by value (read-only this cycle).
+    /// read. 1:1 with c64re `joystick2`. Copied by value at the run entry: the BASE
+    /// state. The read itself asks the keyboard's schedule for the stick at its own
+    /// cycle (Spec 901), so a change queued inside the run lands at its cycle.
     pub joystick2: crate::keyboard::JoystickState,
     /// Monotonic C64-clock the drives have been advanced up to (push-flush
     /// reference). One for both positions: they are always caught up together.
@@ -1483,6 +1485,45 @@ mod joystick_gate_tests {
         bus.io_write(0xdc01, 0xff & !(1 << 0));
         bus.io_write(0xdc02, 0x00);
         assert_eq!(bus.io_read(0xdc00), 0xff, "a row with no key pressed pulls nothing");
+    }
+
+    /// Spec 901 — the bus answers a $DC00 read from the schedule at THE READ'S cycle, not
+    /// from a copy taken when the run began: a stick queued for cycle 100 is not there at
+    /// 99 and is there at 100, on the same bus, with the same copy in `joystick2`.
+    #[test]
+    fn dc00_read_follows_a_scheduled_joystick_at_the_read_cycle() {
+        let mut ram = [0u8; 0x10000];
+        let basic = [0u8; 0x2000];
+        let kernal = [0u8; 0x2000];
+        let chargen = [0u8; 0x1000];
+        let mut io = [0u8; 0x1000];
+        let mut vic = VicII::new();
+        let mut cia1 = reset_cia(crate::c64cia::new_cia1(0, 985_248, 50));
+        let mut cia2 = reset_cia(crate::c64cia::new_cia2(0, 985_248, 50));
+        let mut sid_regs = [0u8; 32];
+        let mut sid = Sid6581::new();
+        let mut sid_trace = crate::sid::SidTrace::default();
+        let mut sid_host = crate::sid::SidHostAccess::default();
+        let mct = build_memconfig_table();
+        let mut drive = crate::drive::Drive1541::new();
+        let mut drive_b = crate::drive::Drive1541::new_position_b();
+        let mut iec = crate::iec::IecCore::new();
+        let mut kb = KeyboardMatrix::new();
+        kb.schedule_joystick(100, 2, JoystickState { fire: true, ..Default::default() });
+        kb.schedule_joystick(200, 2, JoystickState::default());
+        let mut bus = make_bus(
+            &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
+            &mut cia2, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut drive_b, &mut iec,
+            &kb, JoystickState::default(), JoystickState::default(),
+        );
+        let mut read_at = |clk: u64| {
+            bus.clk = clk;
+            bus.io_read(0xdc00)
+        };
+        assert_eq!(read_at(99), 0xff, "one cycle before: released");
+        assert_eq!(read_at(100), 0xff & !(1 << 4), "at the cycle: fire");
+        assert_eq!(read_at(199), 0xff & !(1 << 4), "still held");
+        assert_eq!(read_at(200), 0xff, "released again at its cycle");
     }
 
     #[test]

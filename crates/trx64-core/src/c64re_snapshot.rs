@@ -2231,6 +2231,8 @@ pub fn restore_runtime_checkpoint(
 
     // Keyboard (input).
     m.keyboard.release_keys();
+    // Spec 901 — scheduled input is not part of a checkpoint: a restore drops the queue.
+    m.keyboard.clear_schedule();
     if let Some(keys) = cp
         .get("keyboard")
         .and_then(|k| k.get("livePressed"))

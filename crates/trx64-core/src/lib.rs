@@ -645,7 +645,9 @@ pub struct Machine {
     /// `joystick2` (integrated-session.ts:441-442). The FullBus reads them on a
     /// $DC00 (port 2) / $DC01 (port 1) access and ANDs the active-low mask into the
     /// post-DDR latch value (= VICE `read_joyport_dig`). Power-on / reset = all
-    /// released. `session/joystick_set|clear|release_keys` mutate these.
+    /// released. `session/joystick_set|clear` mutate these; they are the stick AS OF
+    /// THE LAST RPC. A change queued for a later cycle (Spec 901) lives in `keyboard`
+    /// and wins at any read whose cycle has reached it (`KeyboardMatrix::joystick_at`).
     pub joystick1: crate::keyboard::JoystickState,
     pub joystick2: crate::keyboard::JoystickState,
     /// Monotonic C64-clock reference the drives have been advanced up to — one for
@@ -1022,6 +1024,22 @@ impl Machine {
     /// Spec 863 — the row this machine is.
     pub fn model(&self) -> &'static crate::model::C64Model {
         self.model
+    }
+
+    /// Spec 901 — fold the input changes queued for a cycle the clock has reached into
+    /// the machine's held state: held keys in the keyboard, the sticks in `joystick1/2`.
+    /// Reads inside a run answer from the queue at their own cycle; this only keeps the
+    /// held state equal to "now" at an RPC boundary, so an immediate change made next
+    /// is applied over the right base.
+    pub fn sync_input(&mut self) {
+        let now = self.clk;
+        for (port, state) in self.keyboard.take_due(now) {
+            if port == 1 {
+                self.joystick1 = state;
+            } else {
+                self.joystick2 = state;
+            }
+        }
     }
 
     /// Spec 863 — how long a frame is and how fast the clock runs: the one answer.

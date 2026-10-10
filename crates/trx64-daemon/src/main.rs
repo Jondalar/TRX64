@@ -7330,28 +7330,60 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 fire: b("fire"),
             };
             let mut st = state.lock().unwrap();
-            if port == 1 {
-                st.session.machine.joystick1 = new_state;
-            } else {
-                st.session.machine.joystick2 = new_state;
+            st.session.machine.sync_input();
+            let at = match input_at_cycle(&req.params, st.session.machine.clk, "session/joystick_set") {
+                Ok(a) => a,
+                Err(e) => return Response::err(id, -32602, e),
+            };
+            let port_no: u8 = if port == 1 { 1 } else { 2 };
+            match at {
+                // Spec 901 — queued: a CIA1 read at a cycle >= `at_cycle` sees it.
+                Some(c) if c > st.session.machine.clk => {
+                    st.session.machine.keyboard.schedule_joystick(c, port_no, new_state);
+                }
+                _ => {
+                    if port == 1 {
+                        st.session.machine.joystick1 = new_state;
+                    } else {
+                        st.session.machine.joystick2 = new_state;
+                    }
+                }
             }
-            Response::ok(id, json!({ "ok": true }))
+            let mut out = json!({ "ok": true });
+            if let Some(c) = at {
+                out["scheduledAt"] = json!(c);
+            }
+            Response::ok(id, out)
         }
 
         // session/joystick_clear — clear one or both joysticks (ws-server.ts:1475).
         // `port` 1 → joystick1, 2 → joystick2, absent → both. Shape: TS
-        // `{ ok: true }`.
+        // `{ ok: true }`. Spec 901: `at_cycle` queues the clear for that cycle.
         "session/joystick_clear" => {
             let cleared = trx64_core::keyboard::JoystickState::default();
             let port = req.params.get("port").and_then(|v| v.as_u64());
             let mut st = state.lock().unwrap();
-            if port == Some(1) || port.is_none() {
-                st.session.machine.joystick1 = cleared;
+            st.session.machine.sync_input();
+            let at = match input_at_cycle(&req.params, st.session.machine.clk, "session/joystick_clear") {
+                Ok(a) => a,
+                Err(e) => return Response::err(id, -32602, e),
+            };
+            let later = at.filter(|c| *c > st.session.machine.clk);
+            for p in [1u8, 2u8] {
+                if port != Some(p as u64) && port.is_some() {
+                    continue;
+                }
+                match later {
+                    Some(c) => st.session.machine.keyboard.schedule_joystick(c, p, cleared),
+                    None if p == 1 => st.session.machine.joystick1 = cleared,
+                    None => st.session.machine.joystick2 = cleared,
+                }
             }
-            if port == Some(2) || port.is_none() {
-                st.session.machine.joystick2 = cleared;
+            let mut out = json!({ "ok": true });
+            if let Some(c) = at {
+                out["scheduledAt"] = json!(c);
             }
-            Response::ok(id, json!({ "ok": true }))
+            Response::ok(id, out)
         }
 
         // Spec 876 — session/pot_set {port, x, y}: the POT lines of control port 1 or 2
@@ -7392,7 +7424,11 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
         // 310, batch 2) + the LIVE joystick1/joystick2 state. Shape matches the TS
         // `{ pressed, joystick1, joystick2 }`.
         "session/input_status" => {
-            let st = state.lock().unwrap();
+            let mut st = state.lock().unwrap();
+            // Spec 901 — `pressed` and the sticks are the state NOW: changes queued for a
+            // cycle the clock has reached are folded in first; the rest are `scheduled`.
+            st.session.machine.sync_input();
+            let st = st;
             let pressed: Vec<Value> = st
                 .session
                 .machine
@@ -7418,7 +7454,8 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 "pressed": Value::Array(pressed),
                 "joystick1": joystick1,
                 "joystick2": joystick2,
-                "pots": [pot(1), pot(2)]
+                "pots": [pot(1), pot(2)],
+                "scheduled": scheduled_input_json(&st.session.machine),
             }))
         }
 
@@ -7438,7 +7475,18 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 None => return Response::err(id, -32602, "session/key_down: key required"),
             };
             let mut st = state.lock().unwrap();
-            st.session.machine.keyboard.key_down(&key);
+            st.session.machine.sync_input();
+            let at = match input_at_cycle(&req.params, st.session.machine.clk, "session/key_down") {
+                Ok(a) => a,
+                Err(e) => return Response::err(id, -32602, e),
+            };
+            match at {
+                // Spec 901 — queued: a CIA1 read at a cycle >= `at_cycle` sees it.
+                Some(c) if c > st.session.machine.clk => {
+                    st.session.machine.keyboard.schedule_key(c, &key, true);
+                }
+                _ => st.session.machine.keyboard.key_down(&key),
+            }
             let pressed: Vec<Value> = st
                 .session
                 .machine
@@ -7449,7 +7497,12 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 .collect();
             // GUARDRAIL #1 — warn (non-fatal) if injecting into a free-running core.
             let warning = free_run_input_warning(&st);
-            Response::ok(id, json!({ "ok": true, "pressed": pressed, "freeRunWarning": warning }))
+            let mut out = json!({ "ok": true, "pressed": pressed, "freeRunWarning": warning });
+            if let Some(c) = at {
+                out["scheduledAt"] = json!(c);
+                out["scheduled"] = scheduled_input_json(&st.session.machine);
+            }
+            Response::ok(id, out)
         }
 
         // session/key_up — release a single held key (ws-server.ts:1449).
@@ -7460,7 +7513,18 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 None => return Response::err(id, -32602, "session/key_up: key required"),
             };
             let mut st = state.lock().unwrap();
-            st.session.machine.keyboard.key_up(&key);
+            st.session.machine.sync_input();
+            let at = match input_at_cycle(&req.params, st.session.machine.clk, "session/key_up") {
+                Ok(a) => a,
+                Err(e) => return Response::err(id, -32602, e),
+            };
+            match at {
+                // Spec 901 — queued: a CIA1 read at a cycle >= `at_cycle` sees it.
+                Some(c) if c > st.session.machine.clk => {
+                    st.session.machine.keyboard.schedule_key(c, &key, false);
+                }
+                _ => st.session.machine.keyboard.key_up(&key),
+            }
             let pressed: Vec<Value> = st
                 .session
                 .machine
@@ -7471,7 +7535,12 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 .collect();
             // GUARDRAIL #1 — warn (non-fatal) if injecting into a free-running core.
             let warning = free_run_input_warning(&st);
-            Response::ok(id, json!({ "ok": true, "pressed": pressed, "freeRunWarning": warning }))
+            let mut out = json!({ "ok": true, "pressed": pressed, "freeRunWarning": warning });
+            if let Some(c) = at {
+                out["scheduledAt"] = json!(c);
+                out["scheduled"] = scheduled_input_json(&st.session.machine);
+            }
+            Response::ok(id, out)
         }
 
         // session/release_keys — release all held keys (ws-server.ts:1455).
@@ -8217,6 +8286,16 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 "rasterLine": st.session.machine.vic.raster_line as u64,
                 "rasterCycle": st.session.machine.vic.raster_cycle as u64,
             }))
+        }
+
+        // Spec 901 D2 — advance N frames and sample addresses once per frame, inside the
+        // daemon. Params and reply: `frame_probe`.
+        "session/frame_probe" => {
+            let mut st = state.lock().unwrap();
+            match frame_probe(&mut st, &req.params) {
+                Ok(v) => Response::ok(id, v),
+                Err((code, msg)) => Response::err(id, code, msg),
+            }
         }
 
         "runtime/render_screen" => {
@@ -15267,6 +15346,43 @@ fn input_journal_kind(method: &str) -> Option<&'static str> {
     }
 }
 
+/// Spec 901 D1 — the optional `at_cycle` of an input RPC: absolute `c64Cycles`. Absent is
+/// `None` (today's behaviour). A cycle behind the clock is refused, naming both.
+fn input_at_cycle(params: &Value, clk: u64, method: &str) -> Result<Option<u64>, String> {
+    let Some(v) = params.get("at_cycle") else { return Ok(None) };
+    if v.is_null() {
+        return Ok(None);
+    }
+    let Some(c) = v.as_u64() else {
+        return Err(format!("{method}: at_cycle must be a non-negative integer (absolute c64Cycles)"));
+    };
+    if c < clk {
+        return Err(format!("{method}: at_cycle {c} is in the past (clk is {clk})"));
+    }
+    Ok(Some(c))
+}
+
+/// Spec 901 — the queued input changes, for `session/input_status` and the scheduling replies.
+fn scheduled_input_json(m: &trx64_core::Machine) -> Value {
+    use trx64_core::keyboard::InputChange;
+    Value::Array(
+        m.keyboard
+            .pending()
+            .iter()
+            .map(|e| match &e.change {
+                InputChange::Key { key, down } => json!({
+                    "cycle": e.cycle, "kind": "key", "key": key, "down": down,
+                }),
+                InputChange::Joystick { port, state } => json!({
+                    "cycle": e.cycle, "kind": "joystick", "port": port,
+                    "up": state.up, "down": state.down, "left": state.left,
+                    "right": state.right, "fire": state.fire,
+                }),
+            })
+            .collect(),
+    )
+}
+
 /// Spec 814 §2 — record one input, if a journal is armed.
 ///
 /// Called from the SAME pre-dispatch hook that flips the control owner, so there is one
@@ -15335,6 +15451,7 @@ fn is_operating_method(m: &str) -> bool {
     matches!(
         m,
         "session/run"
+            | "session/frame_probe"
             | "session/type"
             | "session/joystick_set"
             | "session/joystick_clear"
@@ -16529,6 +16646,224 @@ pub(crate) fn sync_model_identity(st: &mut State) {
     apply_ring_rate(st);
     let hello = av_hello(st);
     st.notify.broadcast("av/hello", hello);
+}
+
+/// One range the probe samples: `[addr, addr+len)` read through `lens`.
+struct ProbeRange {
+    addr: u16,
+    len: usize,
+    lens: &'static str,
+}
+
+/// The per-whole-frame background work `session/run` does for its span (cart/disk
+/// write-back, the checkpoint ring, the recorder feed), once for one frame crossed.
+/// No render: the ring takes no thumbnail for the anchor, and nothing is drawn per sample.
+fn frame_background_work(st: &mut State, cycles_per_frame: u64) {
+    let now = now_ms();
+    stream_maybe_autopersist_cart(st, now);
+    stream_maybe_autopersist_disk(st, now);
+    let frame_no = st.ctrl_frame;
+    stream_maybe_autocapture(st, frame_no, cycles_per_frame, 0, 0, &[]);
+    stream_maybe_feed_recorder(st, frame_no);
+}
+
+/// Spec 901 D2 — `session/frame_probe`. Advances the paused machine `frames` frames and
+/// samples `addresses` once per frame, at the first instruction boundary at or after the
+/// raster position (`line`, `cycle`). Every reported position is the one the sample was
+/// taken at, read back from the VIC, not the one aimed at.
+fn frame_probe(st: &mut State, p: &Value) -> Result<Value, (i64, String)> {
+    use trx64_core::vic_line_trace::{frame_position, FrameGeometry};
+    let bad = |m: String| (-32602i64, format!("session/frame_probe: {m}"));
+    if st.session.running {
+        return Err((
+            -32001,
+            "session is running under the autonomous loop; use debug/pause before session/frame_probe".into(),
+        ));
+    }
+    if st.transport.holds_the_machine() {
+        return Err((-32001, "session/frame_probe: the transport holds the machine".into()));
+    }
+    let frames = match p.get("frames").and_then(|v| v.as_u64()) {
+        Some(f) if (1..=50_000).contains(&f) => f,
+        _ => return Err(bad("`frames` must be an integer in 1..=50000".into())),
+    };
+    let g = FrameGeometry::of(&st.session.machine);
+    let (cpl, lpf, cpf) = (g.cycles_per_line, g.lines_per_frame, g.cycles_per_frame());
+    let line = match p.get("line").and_then(|v| v.as_u64()) {
+        Some(l) if l < lpf => l,
+        _ => return Err(bad(format!("`line` must be an integer in 0..{lpf} for this model"))),
+    };
+    let cycle = match p.get("cycle") {
+        None | Some(Value::Null) => 0,
+        Some(v) => match v.as_u64() {
+            Some(c) if c < cpl => c,
+            _ => return Err(bad(format!("`cycle` must be an integer in 0..{cpl} for this model"))),
+        },
+    };
+    let Some(addrs) = p.get("addresses").and_then(|v| v.as_array()).filter(|a| !a.is_empty()) else {
+        return Err(bad("`addresses` must be a non-empty array of {addr, len?, lens?}".into()));
+    };
+    let mut ranges: Vec<ProbeRange> = Vec::with_capacity(addrs.len());
+    let mut total = 0usize;
+    for a in addrs {
+        let addr = match a.get("addr").and_then(|v| v.as_u64()) {
+            Some(x) if x <= 0xffff => x as u16,
+            _ => return Err(bad("each address needs `addr` in $0000..$FFFF".into())),
+        };
+        let len = match a.get("len") {
+            None | Some(Value::Null) => 1,
+            Some(v) => match v.as_u64() {
+                Some(l) if (1..=256).contains(&l) => l as usize,
+                _ => return Err(bad("`len` must be an integer in 1..=256".into())),
+            },
+        };
+        let lens = match a.get("lens") {
+            None | Some(Value::Null) => "cpu",
+            Some(v) => match v.as_str() {
+                Some("cpu") => "cpu",
+                Some("ram") => "ram",
+                Some("rom") => "rom",
+                Some("io") => "io",
+                Some("cart") => "cart",
+                _ => return Err(bad("`lens` must be one of cpu, ram, rom, io, cart".into())),
+            },
+        };
+        total += len;
+        if total > 256 {
+            return Err(bad(format!("{total} bytes per sample asked for, 256 is the cap")));
+        }
+        ranges.push(ProbeRange { addr, len, lens });
+    }
+    let assert_mode = match p.get("mode") {
+        None | Some(Value::Null) => false,
+        Some(v) => match v.as_str() {
+            Some("series") => false,
+            Some("assert") => true,
+            _ => return Err(bad("`mode` must be \"series\" or \"assert\"".into())),
+        },
+    };
+    // Each expectation is (offset into the flat sample, addr, value, mask).
+    let mut expect: Vec<(usize, u16, u8, u8)> = Vec::new();
+    if assert_mode {
+        let Some(list) = p.get("expect").and_then(|v| v.as_array()).filter(|a| !a.is_empty()) else {
+            return Err(bad("mode \"assert\" needs `expect`: [{addr, value, mask?}]".into()));
+        };
+        for e in list {
+            let addr = match e.get("addr").and_then(|v| v.as_u64()) {
+                Some(x) if x <= 0xffff => x as u16,
+                _ => return Err(bad("each expectation needs `addr` in $0000..$FFFF".into())),
+            };
+            let value = match e.get("value").and_then(|v| v.as_u64()) {
+                Some(x) if x <= 0xff => x as u8,
+                _ => return Err(bad("each expectation needs `value` in 0..=255".into())),
+            };
+            let mask = match e.get("mask") {
+                None | Some(Value::Null) => 0xff,
+                Some(v) => match v.as_u64() {
+                    Some(x) if x <= 0xff => x as u8,
+                    _ => return Err(bad("`mask` must be in 0..=255".into())),
+                },
+            };
+            let mut base = 0usize;
+            let mut at = None;
+            for r in &ranges {
+                let off = (addr as usize).wrapping_sub(r.addr as usize);
+                if off < r.len {
+                    at = Some(base + off);
+                    break;
+                }
+                base += r.len;
+            }
+            let Some(off) = at else {
+                return Err(bad(format!("expectation addr ${addr:04x} is not inside any of `addresses`")));
+            };
+            expect.push((off, addr, value, mask));
+        }
+    } else if p.get("expect").is_some_and(|v| !v.is_null()) {
+        return Err(bad("`expect` belongs to mode \"assert\"".into()));
+    }
+
+    let first_line = g.first_line;
+    let target = ((line + lpf - first_line) % lpf) * cpl + cycle;
+    let start_clk = st.session.machine.clk;
+    let mut acc = 0u64; // cycles since the last whole frame was settled
+    let mut rows: Vec<Value> = Vec::new();
+    let mut prev: Option<Vec<u8>> = None;
+    let mut changes = 0u64;
+    let mut samples = 0u64;
+    for frame in 0..frames {
+        let pos = frame_position(&st.session.machine);
+        // Frame 0 may sample right where the machine stands; every later frame is a
+        // whole frame away from the previous sample's raster position, never zero.
+        let delta = if frame == 0 {
+            (target + cpf - pos) % cpf
+        } else {
+            (target + cpf - pos - 1) % cpf + 1
+        };
+        if delta > 0 {
+            let before = st.session.machine.clk;
+            run_cycle_budget(&mut st.session, delta);
+            acc += st.session.machine.clk.saturating_sub(before);
+            while acc >= cpf {
+                acc -= cpf;
+                frame_background_work(st, cpf);
+            }
+            if check_and_handle_jam(st) {
+                let pc = jammed_pc(st);
+                return Err((-32003, format!(
+                    "session/frame_probe: the CPU jammed at ${pc:04x} in frame {frame} (c64Cycles {})",
+                    st.session.machine.clk
+                )));
+            }
+        }
+        let m = &st.session.machine;
+        let at = frame_position(m);
+        let (s_line, s_cycle) = ((at / cpl + first_line) % lpf, at % cpl);
+        let mut bytes: Vec<u8> = Vec::with_capacity(total);
+        for r in &ranges {
+            for i in 0..r.len {
+                bytes.push(m.peek_lens(r.addr.wrapping_add(i as u16), r.lens));
+            }
+        }
+        samples += 1;
+        if assert_mode {
+            let failed: Vec<&(usize, u16, u8, u8)> =
+                expect.iter().filter(|(off, _, v, mask)| bytes[*off] & mask != v & mask).collect();
+            if !failed.is_empty() {
+                let actual: Vec<Value> = expect
+                    .iter()
+                    .map(|(off, addr, v, mask)| json!({
+                        "addr": *addr as u64, "value": bytes[*off], "expected": v, "mask": mask,
+                        "ok": bytes[*off] & mask == v & mask,
+                    }))
+                    .collect();
+                return Ok(json!({
+                    "held": false, "frame": frame, "c64Cycles": m.clk,
+                    "line": s_line, "cycle": s_cycle, "actual": actual, "samples": samples,
+                }));
+            }
+        } else if prev.as_ref() != Some(&bytes) {
+            if prev.is_some() {
+                changes += 1;
+            }
+            rows.push(json!({
+                "frame": frame, "c64Cycles": m.clk, "line": s_line, "cycle": s_cycle, "bytes": bytes,
+            }));
+            prev = Some(bytes);
+        }
+    }
+    st.session.machine.sync_input();
+    let layout: Vec<Value> = ranges
+        .iter()
+        .map(|r| json!({ "addr": r.addr as u64, "len": r.len, "lens": r.lens }))
+        .collect();
+    if assert_mode {
+        return Ok(json!({ "held": true, "samples": samples, "c64Cycles": st.session.machine.clk }));
+    }
+    Ok(json!({
+        "rows": rows, "samples": samples, "changes": changes, "layout": layout,
+        "frames": frames, "startCycle": start_clk, "c64Cycles": st.session.machine.clk,
+    }))
 }
 
 /// Advance a PAUSED machine to the next raster wrap (line 0): the frame boundary. Watches
@@ -26249,5 +26584,503 @@ mod batch1_tests {
         assert_eq!(f[0]["profile"], json!("ultimate"));
         call(&st, "device/folder_detach", json!({ "unit": 10 }));
         assert_eq!(call(&st, "device/folders", json!({})), json!([]));
+    }
+
+    // ── Spec 901 — cycle-exact input and the frame probe ─────────────────────────────
+
+    /// Put `code` at `addr` and point the CPU at it, with the work bytes `$C0F0..$C0FF` zero.
+    fn s901_load(st: &SharedState, addr: u16, code: &[u8]) {
+        let mut g = st.lock().unwrap();
+        g.session.machine.poke(0xc0f0, &[0u8; 16]);
+        g.session.machine.poke(addr, code);
+        g.session.machine.c64_core.reg_pc = addr;
+    }
+
+    fn s901_clk(st: &SharedState) -> u64 {
+        st.lock().unwrap().session.machine.clk
+    }
+
+    fn s901_ram(st: &SharedState, a: u16) -> u8 {
+        st.lock().unwrap().session.machine.ram[a as usize]
+    }
+
+    /// The poll loop at `$C040`: counts the reads of `read` that return `$FF` in `$C0F0/F1`
+    /// and, at the first that does not, stores that value in `$C0F2` and parks.
+    fn s901_poll(init: &[u8], read: u16) -> Vec<u8> {
+        let mut c = init.to_vec();
+        assert!(c.len() <= 0x40, "init fits before the loop");
+        c.resize(0x40, 0xea);
+        c.extend_from_slice(&[
+            0xad, read as u8, (read >> 8) as u8, // lda read
+            0xc9, 0xff, // cmp #$ff
+            0xd0, 0x0d, // bne found
+            0xee, 0xf0, 0xc0, // inc $c0f0
+            0xd0, 0xf4, // bne loop
+            0xee, 0xf1, 0xc0, // inc $c0f1
+            0x4c, 0x40, 0xc0, // jmp loop
+            0xea, 0xea,
+            0x8d, 0xf2, 0xc0, // found: sta $c0f2
+            0x4c, 0x54, 0xc0, // jmp found
+        ]);
+        c
+    }
+
+    const S901_LOOP: u16 = 0xc040;
+
+    /// Index of the first read that saw something other than `$FF`; `None` if none did.
+    fn s901_first_seen(st: &SharedState) -> Option<u32> {
+        (s901_ram(st, 0xc0f2) != 0)
+            .then(|| s901_ram(st, 0xc0f0) as u32 + 256 * s901_ram(st, 0xc0f1) as u32)
+    }
+
+    /// The clock before each instruction fetch of the poll loop's read, stepping the
+    /// machine one instruction at a time from the checkpoint.
+    fn s901_read_starts(st: &SharedState, cp0: &Value, upto_cycles: u64) -> Vec<u64> {
+        let mut g = st.lock().unwrap();
+        restore_live_checkpoint(&mut g.session, cp0).unwrap();
+        let end = g.session.machine.clk + upto_cycles;
+        let mut out = Vec::new();
+        while g.session.machine.clk < end {
+            if g.session.machine.c64_core.reg_pc == S901_LOOP {
+                out.push(g.session.machine.clk);
+            }
+            step_one_instruction(&mut g.session);
+        }
+        out
+    }
+
+    /// Run one scenario from the checkpoint: queue `queue`, run `total` cycles in `calls`
+    /// session/run calls, and report the first read that saw the input.
+    fn s901_scenario(
+        st: &SharedState,
+        cp0: &Value,
+        total: u64,
+        calls: u64,
+        queue: &dyn Fn(u64),
+    ) -> Option<u32> {
+        {
+            let mut g = st.lock().unwrap();
+            restore_live_checkpoint(&mut g.session, cp0).unwrap();
+        }
+        queue(s901_clk(st));
+        for _ in 0..calls {
+            call(st, "session/run", json!({ "cycles": total / calls }));
+        }
+        s901_first_seen(st)
+    }
+
+    /// Everything D1 promises about WHERE a read lands, for one input kind: the first read
+    /// that sees it is the first at or after `at_cycle`, to the cycle; the same whether the
+    /// window is one run call or ten; and the cycle inside the read is the same for every
+    /// read, so it is the bus's, not an accident of where an instruction began.
+    fn s901_exact_against_the_stepper(st: &SharedState, cp0: &Value, queue: &dyn Fn(u64, u64)) {
+        const TOTAL: u64 = 30_000;
+        let starts = s901_read_starts(st, cp0, TOTAL);
+        assert!(starts.len() > 1200, "enough reads to scan: {}", starts.len());
+        let clk0 = starts[0];
+        let first_seen = |x: u64, calls: u64| s901_scenario(st, cp0, TOTAL, calls, &|clk| queue(x, clk));
+
+        // The offset inside the read instruction at which the bus sees the new state:
+        // measured around three reads, and the same at each.
+        let mut offsets = Vec::new();
+        for j in [3usize, 40, 600] {
+            let b = starts[j];
+            let mut k = None;
+            for t in 0..=6u64 {
+                let n = first_seen(b + t, 1).expect("seen") as usize;
+                if n == j {
+                    k = Some(t); // still seen by read j at b+t
+                } else {
+                    assert_eq!(n, j + 1, "a cycle later it lands on the next read, not further");
+                }
+            }
+            offsets.push(k.expect("read j sees an input queued for its own start"));
+        }
+        assert!(offsets.iter().all(|k| *k == offsets[0]), "one offset for every read: {offsets:?}");
+        let k = offsets[0];
+        assert!(k <= 3, "inside the 4-cycle read instruction: {k}");
+
+        // Exact for arbitrary cycles, in one run call and in ten.
+        for x in [clk0 + 1, clk0 + 1234, clk0 + 5000, clk0 + 9999, clk0 + 17_001] {
+            let want = starts.iter().position(|b| b + k >= x).expect("a read at or after X") as u32;
+            assert_eq!(first_seen(x, 1), Some(want), "one call, X={x}");
+            assert_eq!(first_seen(x, 10), Some(want), "ten calls, X={x}");
+        }
+        // No input queued: no read sees anything.
+        assert_eq!(s901_scenario(st, cp0, TOTAL, 1, &|_| {}), None);
+    }
+
+    #[test]
+    fn spec901_a_key_lands_on_the_read_cycle_in_one_run_or_ten() {
+        let Some(st) = booted_state() else { return };
+        call(&st, "debug/pause", json!({ "source": "test" }));
+        let init = [
+            0x78, // sei
+            0xa9, 0x0b, 0x8d, 0x11, 0xd0, // DEN off: no badline steals, a fixed read period
+            0xa9, 0x00, 0x8d, 0x03, 0xdc, // DDRB in
+            0xa9, 0xff, 0x8d, 0x02, 0xdc, // DDRA out
+            0xa9, 0xfd, 0x8d, 0x00, 0xdc, // column 1 low
+        ];
+        s901_load(&st, 0xc000, &s901_poll(&init, 0xdc01));
+        let cp0 = capture_live_checkpoint(&mut st.lock().unwrap().session);
+        s901_exact_against_the_stepper(&st, &cp0, &|x, _| {
+            call(&st, "session/key_down", json!({ "key": "A", "at_cycle": x }));
+        });
+    }
+
+    #[test]
+    fn spec901_a_joystick_lands_on_the_read_cycle_inside_one_run_call() {
+        let Some(st) = booted_state() else { return };
+        call(&st, "debug/pause", json!({ "source": "test" }));
+        let init = [
+            0x78, 0xa9, 0x0b, 0x8d, 0x11, 0xd0, // sei; DEN off
+            0xa9, 0x00, 0x8d, 0x02, 0xdc, // DDRA in: port 2 is read as the pins
+            0x8d, 0x03, 0xdc,
+        ];
+        s901_load(&st, 0xc000, &s901_poll(&init, 0xdc00));
+        let cp0 = capture_live_checkpoint(&mut st.lock().unwrap().session);
+        // The ten-call and one-call runs both cross X INSIDE a call (X is thousands of
+        // cycles past the call's start), which the copy taken at run entry could not do.
+        s901_exact_against_the_stepper(&st, &cp0, &|x, _| {
+            call(&st, "session/joystick_set", json!({ "port": 2, "fire": true, "at_cycle": x }));
+        });
+        // Port 1 reads on $DC01: the same schedule on the other port.
+        let init1 = [0x78, 0xa9, 0x0b, 0x8d, 0x11, 0xd0, 0xa9, 0x00, 0x8d, 0x03, 0xdc, 0x8d, 0x02, 0xdc];
+        {
+            let mut g = st.lock().unwrap();
+            restore_live_checkpoint(&mut g.session, &cp0).unwrap();
+        }
+        s901_load(&st, 0xc000, &s901_poll(&init1, 0xdc01));
+        let cp1 = capture_live_checkpoint(&mut st.lock().unwrap().session);
+        let seen = s901_scenario(&st, &cp1, 20_000, 1, &|clk| {
+            call(&st, "session/joystick_set", json!({ "port": 1, "right": true, "at_cycle": clk + 7000 }));
+        });
+        assert!(seen.is_some_and(|n| n > 100), "port 1 saw its stick at the queued cycle: {seen:?}");
+        assert_eq!(s901_ram(&st, 0xc0f2), 0xff & !(1 << 3));
+    }
+
+    #[test]
+    fn spec901_past_refused_now_applies_and_absent_is_unchanged() {
+        let st = make_state();
+        call(&st, "session/run", json!({ "cycles": 5000 }));
+        let clk = s901_clk(&st);
+        for (m, p) in [
+            ("session/key_down", json!({ "key": "A", "at_cycle": clk - 1 })),
+            ("session/key_up", json!({ "key": "A", "at_cycle": clk - 1 })),
+            ("session/joystick_set", json!({ "port": 2, "fire": true, "at_cycle": clk - 1 })),
+            ("session/joystick_clear", json!({ "at_cycle": clk - 1 })),
+        ] {
+            let e = call_err(&st, m, p);
+            assert_eq!(e.code, -32602, "{m}");
+            assert!(e.message.contains(&format!("{}", clk - 1)) && e.message.contains(&format!("{clk}")), "names both: {}", e.message);
+        }
+        assert_eq!(call_err(&st, "session/key_down", json!({ "key": "A", "at_cycle": "soon" })).code, -32602);
+        let inp = call(&st, "session/input_status", json!({}));
+        assert_eq!(inp["pressed"], json!([]), "a refused call changed nothing");
+        assert_eq!(inp["scheduled"], json!([]));
+
+        // at_cycle == clk applies now.
+        let d = call(&st, "session/key_down", json!({ "key": "A", "at_cycle": clk }));
+        assert_eq!(d["pressed"], json!(["A"]));
+        assert_eq!(d["scheduledAt"], json!(clk));
+        call(&st, "session/joystick_set", json!({ "port": 2, "fire": true, "at_cycle": clk }));
+        let inp = call(&st, "session/input_status", json!({}));
+        assert_eq!(inp["joystick2"]["fire"], json!(true));
+        assert_eq!(inp["scheduled"], json!([]), "nothing waits");
+
+        // Absent at_cycle: today's reply, no new fields on the key/joystick replies.
+        call(&st, "session/release_keys", json!({}));
+        let d = call(&st, "session/key_down", json!({ "key": "B" }));
+        assert!(d.get("scheduledAt").is_none() && d.get("scheduled").is_none(), "{d}");
+        assert_eq!(call(&st, "session/joystick_clear", json!({ "port": 2 })), json!({ "ok": true }));
+
+        // A later cycle waits: `pressed` is the state NOW, `scheduled` lists it.
+        let later = clk + 100_000;
+        let q = call(&st, "session/key_down", json!({ "key": "Z", "at_cycle": later }));
+        assert_eq!(q["scheduledAt"], json!(later));
+        assert_eq!(q["pressed"], json!(["B"]));
+        call(&st, "session/joystick_set", json!({ "port": 1, "up": true, "at_cycle": later + 1 }));
+        let inp = call(&st, "session/input_status", json!({}));
+        assert_eq!(inp["pressed"], json!(["B"]));
+        assert_eq!(inp["joystick1"]["up"], json!(false));
+        assert_eq!(inp["scheduled"][0], json!({ "cycle": later, "kind": "key", "key": "Z", "down": true }));
+        assert_eq!(inp["scheduled"][1]["kind"], json!("joystick"));
+        assert_eq!(inp["scheduled"][1]["port"], json!(1));
+        assert_eq!(inp["scheduled"][1]["up"], json!(true));
+
+        // Once the clock has passed them they are the state now.
+        call(&st, "session/run", json!({ "cycles": 120_000 }));
+        let inp = call(&st, "session/input_status", json!({}));
+        assert_eq!(inp["pressed"], json!(["B", "Z"]));
+        assert_eq!(inp["joystick1"]["up"], json!(true));
+        assert_eq!(inp["scheduled"], json!([]));
+
+        // release_keys drops queued keys with the held set, and a reset drops the rest.
+        let clk = s901_clk(&st);
+        call(&st, "session/key_down", json!({ "key": "Q", "at_cycle": clk + 50_000 }));
+        call(&st, "session/joystick_set", json!({ "port": 2, "left": true, "at_cycle": clk + 50_000 }));
+        call(&st, "session/release_keys", json!({}));
+        let inp = call(&st, "session/input_status", json!({}));
+        assert_eq!(inp["scheduled"].as_array().unwrap().len(), 1, "only the stick is left: {inp}");
+        st.lock().unwrap().session.machine.cold_reset();
+        let inp = call(&st, "session/input_status", json!({}));
+        assert_eq!(inp["scheduled"], json!([]), "a reset drops the queue");
+        // A checkpoint restore drops it too.
+        let cp = capture_live_checkpoint(&mut st.lock().unwrap().session);
+        let clk = s901_clk(&st);
+        call(&st, "session/key_down", json!({ "key": "Q", "at_cycle": clk + 50_000 }));
+        call(&st, "session/joystick_set", json!({ "port": 2, "left": true, "at_cycle": clk + 50_000 }));
+        restore_live_checkpoint(&mut st.lock().unwrap().session, &cp).unwrap();
+        assert_eq!(call(&st, "session/input_status", json!({}))["scheduled"], json!([]));
+    }
+
+    /// #67 — a read-modify-write of $D011 puts the raster's bit 8 into the IRQ compare, so
+    /// what the press does depends on the line the beam is on when it lands.
+    #[test]
+    fn spec901_the_d011_read_modify_write_depends_on_where_the_beam_is() {
+        let Some(st) = booted_state() else { return };
+        call(&st, "debug/pause", json!({ "source": "test" }));
+        let mut code = vec![
+            0x78, // sei
+            0xa9, 0x7f, 0x8d, 0x0d, 0xdc, 0x8d, 0x0d, 0xdd, // CIA IRQs off
+            0xad, 0x0d, 0xdc, 0xad, 0x0d, 0xdd,
+            0xa9, 0x80, 0x8d, 0x14, 0x03, 0xa9, 0xc0, 0x8d, 0x15, 0x03, // $0314 -> $C080
+            0xa9, 0x0b, 0x8d, 0x11, 0xd0, // DEN off
+            0xa9, 0x48, 0x8d, 0x12, 0xd0, // IRQ line $48
+            0xa9, 0xff, 0x8d, 0x19, 0xd0,
+            0xa9, 0x01, 0x8d, 0x1a, 0xd0,
+            0xa9, 0x00, 0x8d, 0xf8, 0xc0,
+            0x8d, 0x03, 0xdc, 0xa9, 0xff, 0x8d, 0x02, 0xdc, 0xa9, 0xfd, 0x8d, 0x00, 0xdc,
+            0x58, // cli
+            0xad, 0x01, 0xdc, 0xc9, 0xff, 0xf0, 0xf9, // wait for the key
+            0xad, 0x11, 0xd0, 0x09, 0x10, 0x8d, 0x11, 0xd0, // lda $d011 / ora #$10 / sta $d011
+            0x4c, 0x00, 0x00, // jmp * (patched below)
+        ];
+        let jmp_at = code.len() - 3;
+        code[jmp_at + 1] = (0xc000 + jmp_at) as u8;
+        code[jmp_at + 2] = ((0xc000 + jmp_at) >> 8) as u8;
+        s901_load(&st, 0xc000, &code);
+        s901_load_extra(&st, 0xc080, &[
+            0xee, 0xf8, 0xc0, 0xa9, 0xff, 0x8d, 0x19, 0xd0, 0x4c, 0x81, 0xea,
+        ]);
+        call(&st, "session/run", json!({ "cycles": 4000 }));
+        let cp0 = capture_live_checkpoint(&mut st.lock().unwrap().session);
+        let (cpf, cpl) = {
+            let g = st.lock().unwrap();
+            let t = g.session.machine.timing();
+            (t.cycles_per_frame, t.cycles_per_line as u64)
+        };
+        let outcome = |line: u64| -> (u16, u32) {
+            {
+                let mut g = st.lock().unwrap();
+                restore_live_checkpoint(&mut g.session, &cp0).unwrap();
+            }
+            let (clk, pos) = {
+                let g = st.lock().unwrap();
+                (g.session.machine.clk, trx64_core::vic_line_trace::frame_position(&g.session.machine))
+            };
+            // The next time the beam is on `line`, two frames on.
+            let x = clk + 2 * cpf + (line * cpl + cpf - pos) % cpf;
+            call(&st, "session/key_down", json!({ "key": "A", "at_cycle": x }));
+            call(&st, "session/run", json!({ "cycles": x - clk + 3000 }));
+            let irq_line = st.lock().unwrap().session.machine.vic.raster_irq_line;
+            let before = s901_ram(&st, 0xc0f8);
+            call(&st, "session/run", json!({ "cycles": 4 * cpf }));
+            (irq_line, s901_ram(&st, 0xc0f8).wrapping_sub(before) as u32)
+        };
+        let (above, irqs_above) = outcome(100);
+        let (below, irqs_below) = outcome(270);
+        assert_eq!(above, 0x48, "beam above line 256: the compare line is untouched");
+        assert!(irqs_above >= 4, "and the IRQ keeps firing: {irqs_above}");
+        assert_eq!(below, 0x48 + 256, "beam below line 256: line + 256");
+        assert_eq!(irqs_below, 0, "and there is no IRQ at line $48 any more");
+    }
+
+    fn s901_load_extra(st: &SharedState, addr: u16, code: &[u8]) {
+        st.lock().unwrap().session.machine.poke(addr, code);
+    }
+
+    /// The probe target: $D029 is set to 5 for three of the IRQ counter's values.
+    fn s901_probe_machine() -> Option<(SharedState, Value, u64)> {
+        let st = booted_state()?;
+        call(&st, "debug/pause", json!({ "source": "test" }));
+        s901_load(&st, 0xc000, &[
+            0x78, 0xa9, 0x7f, 0x8d, 0x0d, 0xdc, 0x8d, 0x0d, 0xdd, 0xad, 0x0d, 0xdc, 0xad, 0x0d, 0xdd,
+            0xa9, 0x80, 0x8d, 0x14, 0x03, 0xa9, 0xc0, 0x8d, 0x15, 0x03,
+            0xa9, 0x0b, 0x8d, 0x11, 0xd0, 0xa9, 0x48, 0x8d, 0x12, 0xd0, 0xa9, 0xff, 0x8d, 0x19, 0xd0,
+            0xa9, 0x01, 0x8d, 0x1a, 0xd0, 0xa9, 0x00, 0x8d, 0xf0, 0xc0, 0x8d, 0x29, 0xd0,
+            0x58, 0x4c, 0x36, 0xc0,
+        ]);
+        s901_load_extra(&st, 0xc080, &[
+            0xee, 0xf0, 0xc0, 0xa2, 0x00, 0xad, 0xf0, 0xc0, 0xc9, 0x28, 0x90, 0x06, 0xc9, 0x2b, 0xb0, 0x02,
+            0xa2, 0x05, 0x8e, 0x29, 0xd0, 0xa9, 0xff, 0x8d, 0x19, 0xd0, 0x4c, 0x81, 0xea,
+        ]);
+        call(&st, "session/run", json!({ "cycles": 3000 }));
+        call(&st, "session/advance_to_frame", json!({}));
+        let c = s901_ram(&st, 0xc0f0) as u64;
+        let cp = capture_live_checkpoint(&mut st.lock().unwrap().session);
+        Some((st, cp, c))
+    }
+
+    fn s901_restore(st: &SharedState, cp: &Value) {
+        restore_live_checkpoint(&mut st.lock().unwrap().session, cp).unwrap();
+    }
+
+    #[test]
+    fn spec901_probe_series_returns_only_the_change_frames_and_is_repeatable() {
+        let Some((st, cp, c)) = s901_probe_machine() else { return };
+        let p = json!({ "frames": 100, "line": 250, "addresses": [{ "addr": 0xd029, "lens": "io" }] });
+        let a = call(&st, "session/frame_probe", p.clone());
+        let cpf = st.lock().unwrap().session.machine.timing().cycles_per_frame;
+        let rows = a["rows"].as_array().unwrap();
+        let frames: Vec<u64> = rows.iter().map(|r| r["frame"].as_u64().unwrap()).collect();
+        // The IRQ at line $48 has counted c + f + 1 by the sample of frame f at line 250.
+        assert_eq!(frames, vec![0, 39 - c, 42 - c], "first sample + the two edges only: {a}");
+        let vals: Vec<u64> = rows.iter().map(|r| r["bytes"][0].as_u64().unwrap() & 0x0f).collect();
+        assert_eq!(vals, vec![0, 5, 0]);
+        assert_eq!((a["samples"].clone(), a["changes"].clone()), (json!(100), json!(2)));
+        for r in rows {
+            assert_eq!(r["line"], json!(250));
+            assert!(r["cycle"].as_u64().unwrap() < 12, "first boundary at or after the cycle: {r}");
+        }
+        let f0 = rows[0]["frame"].as_u64().unwrap();
+        let cyc0 = rows[0]["c64Cycles"].as_u64().unwrap();
+        let cyc1 = rows[1]["c64Cycles"].as_u64().unwrap();
+        let df = rows[1]["frame"].as_u64().unwrap() - f0;
+        assert!(cyc1 - cyc0 >= df * cpf - 16 && cyc1 - cyc0 <= df * cpf + 16, "a frame apart per frame");
+        assert_eq!(a["c64Cycles"], json!(s901_clk(&st)), "the machine ends at the last sample");
+
+        // The same checkpoint, the same rows.
+        s901_restore(&st, &cp);
+        let b = call(&st, "session/frame_probe", p.clone());
+        assert_eq!(a, b);
+
+        // `cycle` moves the sample point inside the line; `len` reads a range.
+        s901_restore(&st, &cp);
+        let c2 = call(&st, "session/frame_probe", json!({
+            "frames": 2, "line": 100, "cycle": 30,
+            "addresses": [{ "addr": 0xc0f0, "len": 2, "lens": "ram" }],
+        }));
+        let r0 = &c2["rows"][0];
+        assert_eq!(r0["line"], json!(100));
+        assert!((30..42).contains(&r0["cycle"].as_u64().unwrap()), "{r0}");
+        assert_eq!(r0["bytes"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn spec901_probe_assert_stops_at_the_first_wrong_frame() {
+        let Some((st, cp, c)) = s901_probe_machine() else { return };
+        let bad = call(&st, "session/frame_probe", json!({
+            "frames": 100, "line": 250, "mode": "assert",
+            "addresses": [{ "addr": 0xd029, "lens": "io" }],
+            "expect": [{ "addr": 0xd029, "value": 0, "mask": 0x0f }],
+        }));
+        assert_eq!(bad["held"], json!(false));
+        assert_eq!(bad["frame"], json!(39 - c));
+        assert_eq!(bad["line"], json!(250));
+        assert_eq!(bad["actual"][0]["value"].as_u64().unwrap() & 0x0f, 5);
+        assert_eq!(bad["c64Cycles"], json!(s901_clk(&st)), "the machine stays at the failing sample");
+
+        s901_restore(&st, &cp);
+        let ok = call(&st, "session/frame_probe", json!({
+            "frames": 30, "line": 250, "mode": "assert",
+            "addresses": [{ "addr": 0xd029, "lens": "io" }],
+            "expect": [{ "addr": 0xd029, "value": 0, "mask": 0x0f }],
+        }));
+        assert_eq!(ok["held"], json!(true));
+        assert_eq!(ok["samples"], json!(30));
+
+        // An expectation outside the sampled ranges is a mistake, not a pass.
+        let e = call_err(&st, "session/frame_probe", json!({
+            "frames": 1, "line": 1, "mode": "assert",
+            "addresses": [{ "addr": 0xd029 }], "expect": [{ "addr": 0xd02a, "value": 0 }],
+        }));
+        assert_eq!(e.code, -32602);
+    }
+
+    /// The per-frame background work of a probe is a run's: one ring anchor per whole frame
+    /// crossed, and none per sample.
+    #[test]
+    fn spec901_probe_feeds_the_ring_like_a_run_over_the_same_span() {
+        let Some((st, cp, _)) = s901_probe_machine() else { return };
+        let cpf = st.lock().unwrap().session.machine.timing().cycles_per_frame;
+        let reset_ring = |st: &SharedState| {
+            let mut g = st.lock().unwrap();
+            g.checkpoint_cadence_frames = 1;
+            g.autocapture_cycles_since = 0;
+            g.checkpoint_ring.set_max_entries(200);
+            g.checkpoint_ring.clear();
+        };
+        let anchors = |st: &SharedState| st.lock().unwrap().checkpoint_ring.list().len();
+
+        s901_restore(&st, &cp);
+        let start = s901_clk(&st);
+        reset_ring(&st);
+        call(&st, "session/frame_probe", json!({
+            "frames": 10, "line": 250, "addresses": [{ "addr": 0xd029, "lens": "io" }],
+        }));
+        let by_probe = anchors(&st);
+        let span = s901_clk(&st) - start;
+        assert_eq!(by_probe as u64, span / cpf, "one per whole frame crossed ({span} cycles)");
+        assert!(by_probe >= 9);
+
+        // session/run over the same span, a frame per call.
+        s901_restore(&st, &cp);
+        reset_ring(&st);
+        let mut left = span;
+        while left > 0 {
+            let n = left.min(cpf);
+            call(&st, "session/run", json!({ "cycles": n }));
+            left -= n;
+        }
+        assert_eq!(anchors(&st), by_probe, "session/run adds the same number");
+    }
+
+    #[test]
+    fn spec901_probe_refuses_while_running_and_bad_params() {
+        let st = make_state();
+        let ok = json!({ "frames": 1, "line": 10, "addresses": [{ "addr": 0x0400 }] });
+        let (cpl, lpf) = {
+            let g = st.lock().unwrap();
+            let t = g.session.machine.timing();
+            (t.cycles_per_line as u64, t.lines_per_frame as u64)
+        };
+        let with = |k: &str, v: Value| {
+            let mut p = ok.clone();
+            p[k] = v;
+            p
+        };
+        for (what, p) in [
+            ("frames 0", with("frames", json!(0))),
+            ("frames 50001", with("frames", json!(50_001))),
+            ("line out of range", with("line", json!(lpf))),
+            ("no line", json!({ "frames": 1, "addresses": [{ "addr": 0 }] })),
+            ("cycle out of range", with("cycle", json!(cpl))),
+            ("len 0", with("addresses", json!([{ "addr": 0x0400, "len": 0 }]))),
+            ("len 257", with("addresses", json!([{ "addr": 0x0400, "len": 257 }]))),
+            ("total 257", with("addresses", json!([{ "addr": 0, "len": 200 }, { "addr": 0x400, "len": 57 }]))),
+            ("addr", with("addresses", json!([{ "addr": 0x10000 }]))),
+            ("no addresses", with("addresses", json!([]))),
+            ("lens", with("addresses", json!([{ "addr": 0, "lens": "nope" }]))),
+            ("mode", with("mode", json!("watch"))),
+            ("assert without expect", with("mode", json!("assert"))),
+        ] {
+            let e = call_err(&st, "session/frame_probe", p);
+            assert_eq!(e.code, -32602, "{what}: {}", e.message);
+        }
+        // Valid at the limits.
+        let r = call(&st, "session/frame_probe", json!({
+            "frames": 1, "line": lpf - 1, "cycle": cpl - 1,
+            "addresses": [{ "addr": 0x0400, "len": 256 }],
+        }));
+        assert_eq!(r["samples"], json!(1));
+
+        let clk = s901_clk(&st);
+        st.lock().unwrap().session.running = true;
+        let e = call_err(&st, "session/frame_probe", ok.clone());
+        assert_eq!(e.code, -32001);
+        assert_eq!(s901_clk(&st), clk, "refused means not advanced");
+        st.lock().unwrap().session.running = false;
+        let _ = call(&st, "session/frame_probe", ok);
     }
 }

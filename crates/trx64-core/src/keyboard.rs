@@ -91,6 +91,23 @@ fn lookup_char(ch: char) -> Option<(String, bool)> {
     None
 }
 
+/// Spec 901 — one input change queued for an absolute cycle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScheduledInput {
+    /// The absolute `c64Cycles` at which the change takes effect: a CIA1 read at a cycle
+    /// `>= cycle` sees it, one before does not.
+    pub cycle: u64,
+    pub change: InputChange,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InputChange {
+    /// The key joins (`down`) or leaves the held set.
+    Key { key: String, down: bool },
+    /// The whole state of one control port (1 or 2) is replaced.
+    Joystick { port: u8, state: JoystickState },
+}
+
 #[derive(Clone, Debug)]
 struct KeyEvent {
     key: String,
@@ -119,6 +136,12 @@ pub struct KeyboardMatrix {
     /// reports. Insertion order preserved (mirrors JS `Set` iteration order)
     /// so `pressed_keys()` is deterministic.
     live_pressed: Vec<String>,
+    /// Spec 901 — input changes queued for an absolute cycle, in cycle order (equal cycles
+    /// keep the order they were queued in). Answered at the READ'S cycle, never copied at
+    /// a run entry: [`for_each_active_key`] and [`joystick_at`] both fold the entries due
+    /// at `now` over the held state. Entries are folded into the held state only at an
+    /// RPC boundary ([`take_due`]), when the clock is known to have passed them.
+    sched: Vec<ScheduledInput>,
 }
 
 impl KeyboardMatrix {
@@ -126,7 +149,74 @@ impl KeyboardMatrix {
         Self {
             events: Vec::new(),
             live_pressed: Vec::new(),
+            sched: Vec::new(),
         }
+    }
+
+    /// Spec 901 — queue a key press (`down`) or release for the absolute cycle `cycle`.
+    pub fn schedule_key(&mut self, cycle: u64, key: &str, down: bool) {
+        self.push_sched(ScheduledInput { cycle, change: InputChange::Key { key: key.to_string(), down } });
+    }
+
+    /// Spec 901 — queue the whole state of control port `port` (1 or 2) for `cycle`.
+    pub fn schedule_joystick(&mut self, cycle: u64, port: u8, state: JoystickState) {
+        self.push_sched(ScheduledInput { cycle, change: InputChange::Joystick { port, state } });
+    }
+
+    fn push_sched(&mut self, s: ScheduledInput) {
+        // After the last entry that is not later than it: sorted by cycle, stable.
+        let at = self.sched.partition_point(|e| e.cycle <= s.cycle);
+        self.sched.insert(at, s);
+    }
+
+    /// The queued, not yet folded changes, in cycle order.
+    pub fn pending(&self) -> &[ScheduledInput] {
+        &self.sched
+    }
+
+    /// Drop every queued change (reset, release, checkpoint restore).
+    pub fn clear_schedule(&mut self) {
+        self.sched.clear();
+    }
+
+    /// Spec 901 — fold every change due at `now` (cycle `<= now`) into the held state and
+    /// remove it from the queue. Key changes land in the held set here; the joystick
+    /// states come back as `(port, state)` in order, for the machine to take as its
+    /// current sticks. Called at an RPC boundary, where the clock is exact and nothing
+    /// is mid-instruction, before anything reads or changes the held state.
+    pub fn take_due(&mut self, now: u64) -> Vec<(u8, JoystickState)> {
+        let due = self.sched.partition_point(|e| e.cycle <= now);
+        let mut joys = Vec::new();
+        for e in self.sched.drain(..due).collect::<Vec<_>>() {
+            match e.change {
+                InputChange::Key { key, down } => {
+                    if down {
+                        self.key_down(&key);
+                    } else {
+                        self.key_up(&key);
+                    }
+                }
+                InputChange::Joystick { port, state } => joys.push((port, state)),
+            }
+        }
+        joys
+    }
+
+    /// Spec 901 — the state of control port `port` at cycle `now`: the last queued state
+    /// with `cycle <= now`, else `base` (the sticks as the machine holds them).
+    pub fn joystick_at(&self, now: u64, port: u8, base: &JoystickState) -> JoystickState {
+        let mut out = *base;
+        for e in &self.sched {
+            if e.cycle > now {
+                break;
+            }
+            if let InputChange::Joystick { port: p, state } = &e.change {
+                if *p == port {
+                    out = *state;
+                }
+            }
+        }
+        out
     }
 
     /// Queue a text string as a sequence of timed key presses starting at
@@ -160,6 +250,7 @@ impl KeyboardMatrix {
     pub fn clear(&mut self) {
         self.events.clear();
         self.live_pressed.clear();
+        self.sched.clear();
     }
 
     /// Spec 310 — mark a key as held (browser keydown). 1:1 with the TS
@@ -183,6 +274,9 @@ impl KeyboardMatrix {
     /// (keyboard.ts:106). Does NOT touch the timed-event queue.
     pub fn release_keys(&mut self) {
         self.live_pressed.clear();
+        // Spec 901 — a key press queued for a later cycle goes with the held set. The
+        // queued joystick states stay: releasing keys never touched the sticks (BUG-049).
+        self.sched.retain(|e| !matches!(e.change, InputChange::Key { .. }));
     }
 
     /// Spec 310 — the held-key set as a list of c64re key ids. 1:1 with
@@ -262,7 +356,28 @@ impl KeyboardMatrix {
                 f(col, row);
             }
         }
-        // Spec 310 — held keys (browser passthrough), no cycle gating.
+        // Spec 310 — held keys (browser passthrough). Spec 901: with key changes queued
+        // for a cycle at or before `now`, the held set is the one those changes make.
+        if self.sched.iter().take_while(|e| e.cycle <= now).any(|e| matches!(e.change, InputChange::Key { .. })) {
+            let mut held: Vec<&str> = self.live_pressed.iter().map(String::as_str).collect();
+            for e in self.sched.iter().take_while(|e| e.cycle <= now) {
+                if let InputChange::Key { key, down } = &e.change {
+                    if *down {
+                        if !held.contains(&key.as_str()) {
+                            held.push(key);
+                        }
+                    } else {
+                        held.retain(|k| *k != key.as_str());
+                    }
+                }
+            }
+            for key in held {
+                if let Some((col, row)) = key_matrix(key) {
+                    f(col, row);
+                }
+            }
+            return;
+        }
         for key in &self.live_pressed {
             if let Some((col, row)) = key_matrix(key) {
                 f(col, row);
@@ -514,5 +629,83 @@ mod tests {
         assert_eq!(joystick_active_low_mask(&fire), 0xff & !(1 << 4));
         let all = JoystickState { up: true, down: true, left: true, right: true, fire: true };
         assert_eq!(joystick_active_low_mask(&all), 0xff & !0x1f);
+    }
+
+    // ── Spec 901 — input scheduled for an absolute cycle ──────────────────────
+
+    /// A key queued for cycle X is seen by a read AT X and not by one a cycle before; and
+    /// the same answer comes back however many times the clock is asked in between.
+    #[test]
+    fn a_scheduled_key_is_seen_from_its_cycle_and_not_before() {
+        let mut kb = KeyboardMatrix::new();
+        kb.schedule_key(1000, "A", true); // col 1, row 2
+        let pa_col1 = 0xff & !(1 << 1);
+        assert_eq!(kb.read_rows_for_pa(999, pa_col1), 0xff, "one cycle early: nothing");
+        assert_eq!(kb.read_rows_for_pa(1000, pa_col1), 0xff & !(1 << 2), "at the cycle: seen");
+        assert_eq!(kb.read_rows_for_pa(5000, pa_col1), 0xff & !(1 << 2), "and after");
+        // The back-scan reads the same switches.
+        assert_eq!(kb.read_columns_for_pb(999, !(1 << 2)), 0xff);
+        assert_eq!(kb.read_columns_for_pb(1000, !(1 << 2)), 0xff & !(1 << 1));
+        // A queued release ends a held key at its cycle, not before.
+        kb.key_down("SPACE");
+        kb.schedule_key(2000, "SPACE", false); // col 7, row 4
+        let pa_col7 = 0xff & !(1 << 7);
+        assert_eq!(kb.read_rows_for_pa(1999, pa_col7), 0xff & !(1 << 4));
+        assert_eq!(kb.read_rows_for_pa(2000, pa_col7), 0xff);
+    }
+
+    /// Folding at an RPC boundary changes nothing a read can tell: before and after
+    /// `take_due`, every cycle answers the same.
+    #[test]
+    fn folding_the_due_changes_keeps_every_answer() {
+        let mut kb = KeyboardMatrix::new();
+        kb.schedule_key(100, "A", true);
+        kb.schedule_key(300, "A", false);
+        kb.schedule_joystick(200, 2, JoystickState { fire: true, ..Default::default() });
+        let pa_col1 = 0xff & !(1 << 1);
+        let probe = |kb: &KeyboardMatrix| -> Vec<(u8, bool)> {
+            (0..400u64)
+                .step_by(7)
+                .map(|c| (kb.read_rows_for_pa(c, pa_col1), kb.joystick_at(c, 2, &JoystickState::default()).fire))
+                .collect()
+        };
+        let before = probe(&kb);
+        let joys = kb.take_due(250);
+        assert_eq!(joys, vec![(2, JoystickState { fire: true, ..Default::default() })]);
+        assert_eq!(kb.pending().len(), 1, "only the release at 300 is still queued");
+        // The joystick base moves to the machine; mirror what Machine::sync_input does.
+        let fire_base = JoystickState { fire: true, ..Default::default() };
+        let after: Vec<(u8, bool)> = (0..400u64)
+            .step_by(7)
+            .map(|c| {
+                let fire = if c >= 250 { kb.joystick_at(c, 2, &fire_base).fire } else { before_fire(c) };
+                (kb.read_rows_for_pa(c, pa_col1), fire)
+            })
+            .collect();
+        // Cycles >= 250 (the fold point) must answer exactly as before.
+        for (i, c) in (0..400u64).step_by(7).enumerate() {
+            if c >= 250 {
+                assert_eq!(before[i], after[i], "cycle {c}");
+            }
+        }
+        fn before_fire(c: u64) -> bool {
+            c >= 200
+        }
+    }
+
+    #[test]
+    fn same_cycle_changes_apply_in_the_order_queued_and_release_keys_drops_the_queue() {
+        let mut kb = KeyboardMatrix::new();
+        kb.schedule_key(50, "A", true);
+        kb.schedule_key(50, "A", false);
+        kb.schedule_key(60, "Z", true);
+        let pa_col1 = 0xff & !(1 << 1);
+        assert_eq!(kb.read_rows_for_pa(55, pa_col1), 0xff, "down then up at the same cycle: up");
+        kb.schedule_joystick(70, 1, JoystickState { up: true, ..Default::default() });
+        kb.release_keys();
+        assert_eq!(kb.read_rows_for_pa(100, pa_col1), 0xff, "queued presses went with the held set");
+        assert_eq!(kb.pending().len(), 1, "a queued joystick state is not a key");
+        kb.clear();
+        assert!(kb.pending().is_empty(), "a reset drops everything");
     }
 }

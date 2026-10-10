@@ -134,8 +134,10 @@ const C64KEYBOARD_ACTIVE: bool = true;
 /// c64cia1.c:286-339 `read_ciapa`.
 pub fn cia1_read_pa(p: &CiaPins, kb: &KeyboardMatrix, now: u64, joy1: &JoystickState, joy2: &JoystickState) -> u8 {
     let mx = Matrix::at(kb, now);
-    let joy1 = joystick_active_low_mask(joy1);
-    let joy2 = joystick_active_low_mask(joy2);
+    // Spec 901 — the stick as it stands at THIS read's cycle: a change scheduled for a
+    // cycle at or before `now` is already in, one after it is not.
+    let joy1 = joystick_active_low_mask(&kb.joystick_at(now, 1, joy1));
+    let joy2 = joystick_active_low_mask(&kb.joystick_at(now, 2, joy2));
     let mut val: u8 = 0xff;
     // loop over columns, pull down all bits connected to a column which is output and
     // active.
@@ -189,8 +191,10 @@ fn ciapb_forcelow(mx: &Matrix, row: usize, mask: u8) -> bool {
 /// c64cia1.c:360-428 `read_ciapb`.
 pub fn cia1_read_pb(p: &CiaPins, kb: &KeyboardMatrix, now: u64, joy1: &JoystickState, joy2: &JoystickState) -> u8 {
     let mx = Matrix::at(kb, now);
-    let joy1 = joystick_active_low_mask(joy1);
-    let joy2 = joystick_active_low_mask(joy2);
+    // Spec 901 — the stick as it stands at THIS read's cycle: a change scheduled for a
+    // cycle at or before `now` is already in, one after it is not.
+    let joy1 = joystick_active_low_mask(&kb.joystick_at(now, 1, joy1));
+    let joy2 = joystick_active_low_mask(&kb.joystick_at(now, 2, joy2));
     let mut val: u8 = 0xff;
     // loop over rows, pull down all bits connected to a row which is output and active.
     let mut val_outhi = p.c_cia[CIA_DDRB] & p.c_cia[CIA_PRB];
