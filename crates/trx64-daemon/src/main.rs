@@ -6733,6 +6733,15 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             Response::ok(id, out)
         }
 
+        // Spec 902 D1 — end the daemon cleanly. The exit work runs here (stop the run, end a
+        // recording trace, persist the media); the reply is the one `handle_connection`
+        // flushes to the caller's socket BEFORE it ends the process (it recognises the
+        // method). Embedded (FFI) hosts get the exit work and the reply, and keep running.
+        "daemon/shutdown" => match shutdown_now(state, "request") {
+            Ok((out, _)) => Response::ok(id, out),
+            Err(e) => Response::err(id, -32001, format!("daemon/shutdown: {e}")),
+        },
+
         // Spec 858 D3 — move this daemon to another project, in place.
         //
         // The daemon is shared, and the machine in it belongs to whoever started it for
@@ -13849,15 +13858,108 @@ fn fs_longest_common_prefix<'a>(mut names: impl Iterator<Item = &'a str>) -> Str
 /// Spec 887 D3 — a daemon that ends itself keeps the user's writes: the cartridge and
 /// every drive's disk are persisted exactly as eject persists them (dirty and persisting
 /// only).
-fn persist_media_before_exit(st: &mut State) {
+fn persist_media_before_exit(st: &mut State) -> (Option<String>, Vec<String>) {
     let cart_path = st.session.cart_path.clone();
-    if let Some(p) = persist_cart_for_eject(st, &cart_path) {
+    let cart = persist_cart_for_eject(st, &cart_path);
+    if let Some(p) = &cart {
         eprintln!("[trx64] persisted cartridge -> {p}");
     }
+    let mut disks = Vec::new();
     for pos in [DrivePosition::A, DrivePosition::B] {
         if let Some(p) = persist_outgoing_disk_at(st, pos) {
             eprintln!("[trx64] persisted disk -> {p}");
+            disks.push(p);
         }
+    }
+    (cart, disks)
+}
+
+/// Spec 902 D3 — THE exit work, one function for its three callers (the `daemon/shutdown`
+/// request, SIGTERM/SIGINT and the console events on Windows, the idle watch): stop the
+/// autonomous run, end a recording trace the way `trace/run/stop` does (its `.c64retrace`
+/// is the authority and is complete on disk; no background index is started because the
+/// process ends right after), persist the media as eject does, log one line naming
+/// `reason`. Runs ONCE: a later caller gets `None` and must not exit on its own account
+/// before the first caller has finished (see [`await_shutdown_finished`]).
+static SHUTDOWN_WORK: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None);
+
+fn shutdown_now(state: &SharedState, reason: &str) -> Result<(Value, bool), String> {
+    // The guard is held for the whole exit work, so a second caller waits for it and then
+    // sees the finished result instead of running it again.
+    let mut done = SHUTDOWN_WORK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(v) = done.as_ref() {
+        return Ok((v.clone(), false));
+    }
+    let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+    st.session.running = false;
+    let (run, _status) = finalize_trace(&mut st, false);
+    let trace = if run.is_null() { Value::Null } else { json!(st.last_trace_path) };
+    let (cart, disks) = persist_media_before_exit(&mut st);
+    drop(st);
+    eprintln!("[trx64] shutting down ({reason})");
+    let out = json!({
+        "ok": true,
+        "persisted": { "cartridge": cart, "disks": disks },
+        "trace": trace,
+        "exitCode": 0,
+    });
+    *done = Some(out.clone());
+    Ok((out, true))
+}
+
+/// A signal that lost the race to a shutdown request: the request's connection ends the
+/// process once its reply is flushed; give it a moment, then end anyway.
+async fn await_shutdown_finished() -> ! {
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    std::process::exit(0);
+}
+
+/// Spec 902 D2 — SIGTERM and SIGINT (unix); Ctrl-C, Ctrl-Break and console close (windows).
+fn spawn_signal_watch(state: SharedState) {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let (Ok(mut term), Ok(mut int)) =
+            (signal(SignalKind::terminate()), signal(SignalKind::interrupt()))
+        else {
+            eprintln!("[trx64] cannot install SIGTERM/SIGINT handlers");
+            return;
+        };
+        tokio::spawn(async move {
+            let reason = tokio::select! {
+                _ = term.recv() => "SIGTERM",
+                _ = int.recv() => "SIGINT",
+            };
+            exit_after_work(state, reason.to_string()).await;
+        });
+    }
+    #[cfg(windows)]
+    {
+        let (Ok(mut c), Ok(mut b), Ok(mut cl)) = (
+            tokio::signal::windows::ctrl_c(),
+            tokio::signal::windows::ctrl_break(),
+            tokio::signal::windows::ctrl_close(),
+        ) else {
+            eprintln!("[trx64] cannot install console handlers");
+            return;
+        };
+        tokio::spawn(async move {
+            let reason = tokio::select! {
+                _ = c.recv() => "Ctrl-C",
+                _ = b.recv() => "Ctrl-Break",
+                _ = cl.recv() => "console close",
+            };
+            exit_after_work(state, reason.to_string()).await;
+        });
+    }
+}
+
+async fn exit_after_work(state: SharedState, reason: String) {
+    // The exit work takes blocking locks and writes files: off the async executor.
+    let first = tokio::task::spawn_blocking(move || shutdown_now(&state, &reason)).await;
+    match first {
+        Ok(Ok((_, true))) | Ok(Err(_)) | Err(_) => std::process::exit(0),
+        Ok(Ok((_, false))) => await_shutdown_finished().await,
     }
 }
 
@@ -18273,9 +18375,14 @@ async fn handle_connection(
     let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
 
     // Writer task: pump the channel to the socket.
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
+            let closing = matches!(msg, Message::Close(_));
             if tx.send(msg).await.is_err() {
+                break;
+            }
+            // Spec 902 — a Close ends the stream: everything before it has been flushed.
+            if closing {
                 break;
             }
         }
@@ -18322,8 +18429,12 @@ async fn handle_connection(
             _ => continue,
         };
 
+        let mut shutting_down = false;
         let response = match serde_json::from_str::<Request>(&text) {
-            Ok(req) => dispatch(req, &state),
+            Ok(req) => {
+                shutting_down = req.method == "daemon/shutdown";
+                dispatch(req, &state)
+            }
             Err(e) => Response::err(
                 Value::Null,
                 -32700,
@@ -18337,6 +18448,15 @@ async fn handle_connection(
 
         if out_tx.send(Message::Text(out.into())).is_err() {
             break;
+        }
+
+        // Spec 902 D1 — the reply is queued; now make sure it is on the socket, then end
+        // the process: the caller sees the reply, then the connection close.
+        if shutting_down && response.error.is_none() {
+            let _ = out_tx.send(Message::Close(None));
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut writer).await;
+            eprintln!("[trx64] reply flushed to {addr}; exiting");
+            std::process::exit(0);
         }
     }
 
@@ -18963,6 +19083,8 @@ async fn main() {
     // trace holds the clock; with neither, and no request, for the whole window, persist
     // the media as eject would and end with exit 0. A plain RPC connection (`?av=0`, or
     // any connection on a --headless daemon) holds nothing: only what it sends counts.
+    spawn_signal_watch(Arc::clone(&state));
+
     if cli.idle_exit > 0 {
         idle::arm(cli.idle_exit);
         eprintln!("[trx64] idle exit armed: {} s", cli.idle_exit);
@@ -18986,10 +19108,8 @@ async fn main() {
                 });
                 idle::hold(holding);
                 if let Some(window) = idle::expired() {
-                    let mut st = state.lock().unwrap();
-                    persist_media_before_exit(&mut st);
                     eprintln!("[trx64] idle for {window} s — exiting");
-                    std::process::exit(0);
+                    exit_after_work(Arc::clone(&state), format!("idle {window} s")).await;
                 }
             }
         });
