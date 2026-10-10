@@ -349,6 +349,10 @@ pub struct State {
     /// reports sid.streaming truthfully (live audio = streaming_enabled && running),
     /// mirroring TS `audioStreams.has(session_id)`. Was hardcoded false → SID light OFF.
     streaming_enabled: bool,
+    /// The A/V hub exists (`streaming_enabled`) but has no subscriber, so its pump thread is
+    /// not running and nothing advances a `debug/run`. Set by the hub when the last client
+    /// leaves (and at construction); cleared when the first one arrives.
+    pump_idle: bool,
     /// Spec 863 — the model the clients were last told about (`av/hello`). A request that
     /// leaves the machine on another row — a switch, a rewind across one, an undump or a
     /// VSF of another model — is caught against this once it returns.
@@ -7197,10 +7201,13 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             // SEED the border colour on (re)connect (it otherwise only learns the owner
             // from the one-shot `debug/control` broadcast, missed on a late attach).
             state_json["controlOwner"] = json!(st.control_owner);
-            // Spec 767 slice 2 — whether the stream pump is running (--stream): a bounded
-            // run can only stream live via the pump, so a caller uses the capped streaming
-            // run when this is true and the blocking session/run when it's false (headless).
-            state_json["streamPump"] = json!(st.streaming_enabled);
+            // Spec 767 slice 2 — whether the stream pump is RUNNING: a bounded run can only
+            // stream live via the pump, so a caller uses the capped streaming run when this
+            // is true and the blocking session/run when it's false. The pump thread lives
+            // only while an A/V client is subscribed — a daemon started with the hub but with
+            // nobody watching (no UI tab; the MCP socket is `?av=0`) has no pump, and a
+            // `debug/run` there would be accepted and never advance.
+            state_json["streamPump"] = json!(st.streaming_enabled && !st.pump_idle);
             // ── powered + mounted media ─────────────────────────────────────────────
             // A consumer showing a SHARED machine must be able to ask "what is in it?"
             // WITHOUT mounting something to find out — mounting a cart power-cycles, so
@@ -18035,6 +18042,7 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         batches: std::collections::HashMap::new(),
         notify: streaming::NotifyHub::new(),
         streaming_enabled: streaming_on,
+        pump_idle: false,
         pacing_mode: "realtime".to_string(),
         pacing_ratio: 1.0,
         control_owner: "human".to_string(),
@@ -18789,6 +18797,7 @@ mod batch1_tests {
             batches: std::collections::HashMap::new(),
             notify: streaming::NotifyHub::new(),
             streaming_enabled: false,
+            pump_idle: false,
             cart_led_gen: 0,
             cart_led_last_write_at: None,
             pacing_mode: "realtime".to_string(),
@@ -22837,6 +22846,24 @@ mod batch1_tests {
             }
         }
         assert!(got_frame, "a client arriving while the machine is paused receives a frame — it sends none on its own");
+    }
+
+    #[test]
+    fn stream_pump_is_reported_only_while_an_av_client_is_subscribed() {
+        // C64RE #63 — a daemon with the A/V hub but nobody subscribed (no UI tab; the MCP
+        // socket is `?av=0`) has no pump thread. It used to report streamPump=true anyway, so
+        // the caller sent a capped `debug/run`, which was accepted (runState "running") and
+        // never advanced a cycle.
+        let st = make_state();
+        st.lock().unwrap().streaming_enabled = true;
+        let hub = crate::streaming::StreamHub::new(Arc::clone(&st));
+        let pump = |st: &SharedState| call(st, "session/state", json!({}))["streamPump"].as_bool();
+        assert_eq!(pump(&st), Some(false), "hub without a subscriber: no pump");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let sub = hub.subscribe(tx);
+        assert_eq!(pump(&st), Some(true), "a subscriber starts the pump");
+        drop(sub);
+        assert_eq!(pump(&st), Some(false), "the last subscriber leaving stops it");
     }
 
     #[test]

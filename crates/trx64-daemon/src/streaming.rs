@@ -225,6 +225,8 @@ struct HubInner {
 
 impl StreamHub {
     pub fn new(state: SharedState) -> Arc<Self> {
+        // No subscriber yet, so no pump thread: the state must not claim one.
+        state.lock().unwrap().pump_idle = true;
         Arc::new(Self {
             inner: Mutex::new(HubInner {
                 subscribers: Vec::new(),
@@ -254,7 +256,8 @@ impl StreamHub {
         // Spec 863 — the A/V hello: say what the frames that follow are (model, standard,
         // chip, frame, clock, canvas) before the first one arrives.
         {
-            let st = self.state.lock().unwrap();
+            let mut st = self.state.lock().unwrap();
+            st.pump_idle = false;
             let hello = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "av/hello",
@@ -303,10 +306,12 @@ impl StreamHub {
     fn unsubscribe(&self, id: u64) {
         // Take the loop thread to join OUTSIDE the lock (the loop also locks `inner`
         // via broadcast → joining under the lock would deadlock).
+        let mut idle = false;
         let to_join = {
             let mut inner = self.inner.lock().unwrap();
             inner.subscribers.retain(|s| s.id != id);
             if inner.subscribers.is_empty() {
+                idle = true;
                 if let Some(stop) = inner.stop.take() {
                     stop.store(true, Ordering::SeqCst);
                 }
@@ -315,6 +320,9 @@ impl StreamHub {
                 None
             }
         };
+        if idle {
+            self.state.lock().unwrap().pump_idle = true;
+        }
         if let Some(j) = to_join {
             let _ = j.join();
         }
