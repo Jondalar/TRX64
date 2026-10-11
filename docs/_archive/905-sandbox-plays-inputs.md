@@ -1,6 +1,6 @@
 # Spec 905 (TRX64 half) — A sandbox run plays inputs, and nothing patches the shared machine any more
 
-**Status:** BUILT on branch spec-905 (2026-10-11) — not merged, not released.
+**Status:** DONE — merged to main 2026-10-11 (TRX64 half; the C64RE half is C64RE 905). Not released yet: removes RPCs, so it ships as a minor (0.13.0). Tests: `spec905_*` in the daemon suite. Decision in `README.md` here.
 **Repo:** TRX64 (daemon + core scenario player). The C64RE half — anchors, the candidate as
 project memory, the parallel loop, `verify_build`, the workbench — is
 `C64ReverseEngineeringMCP/specs/905-from-an-anchor-to-the-build.md`.

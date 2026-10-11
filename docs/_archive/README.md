@@ -543,3 +543,16 @@ default action and lost any unsaved cartridge or disk write.
 
 **Decision:** one exit path for every way the daemon can be ended, so no way of stopping it is
 lossy. The request exists because Windows has no SIGTERM; C64RE asks first and kills only after.
+
+## A sandbox run plays inputs; the candidate RPCs are gone — 905
+
+`sandbox/run` and each run of `sandbox/runMany` take `inputs` — the scenario input list
+(keyboard, joysticks, model), cycles counted from the run's anchor — and play them in the clone
+inside the run's budget. The scenario player has one target over a bare machine; the live
+session's target delegates to it, so an input means the same live and in a sandbox. The
+`runtime/candidate_*` RPCs are removed and refused by name: they restored an anchor into the
+shared machine, patched it there and left it patched.
+
+**Decision:** trying variants never moves the shared machine. Patches + inputs + anchor run in
+sandboxes, many at once; what a candidate *was* is meaning and memory and lives in C64RE.
+Removing the RPCs is breaking, so the release that carries this is a minor.
