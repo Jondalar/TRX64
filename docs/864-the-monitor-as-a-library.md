@@ -32,7 +32,7 @@ implementation, two hosts.
 `run_monitor_marked` is `main.rs:3736-7490` — about 3750 lines — plus the helpers it
 closes over. It reads a narrow slice of the daemon's `State`: the session, `mon`,
 `breakpoints`, `flow`, `observers` + `dsl_observers`, `checkpoint_ring`, `trap_rules`,
-`transport`. The other sixty-odd `State` fields — streaming, recorder, candidates, media
+`transport`. The other sixty-odd `State` fields — streaming, recorder, media
 events, the audio thread, pacing, batches — barely appear. That is the shape of a library
 that has never been extracted, not the shape of something entangled with a daemon.
 
@@ -71,7 +71,7 @@ whole:
 
 Nothing in that list reaches above core today, which is why this is an extraction and not
 a redesign. The daemon keeps: the WS-RPC transport, traceindex, media, streaming,
-recorder, pacing, candidates, the checkpoint ring, and its own host impl.
+recorder, pacing, the checkpoint ring, and its own host impl.
 
 ## §3 D2 — The host trait
 

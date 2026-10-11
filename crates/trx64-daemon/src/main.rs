@@ -38,7 +38,6 @@ pub use trx64_monitor::addr_spans;
 /// reach it by this path.
 #[allow(unused_imports)]
 pub use trx64_monitor::assembler;
-pub mod candidate;
 /// Spec 864 — the observer registry lives in `trx64-monitor` now. It was always a
 /// `trx64-core` observer and nothing in it reached above core; the daemon keeps the
 /// short path it has used since Spec 754 so no call site had to be rewritten to say
@@ -507,11 +506,6 @@ pub struct State {
     /// This counter drives the per-frame feed (separate from `autocapture_frames_since`
     /// because the ring auto-capture is warp-skipped while the recorder is not).
     recorder_frames_since: u64,
-    /// Spec 796 — the live candidate store (session-lifetime). Keyed by candidate id
-    /// (`cand-<seq>`). Each candidate = baseline anchor + bound scenario + accumulating
-    /// overlay patch-set + cached no-patch baseline result.
-    candidates: std::collections::HashMap<String, candidate::Candidate>,
-    candidate_seq: u64,
     /// Spec 809 §9 — sandbox run ids are numbered daemon-wide, so two calls never hand
     /// back the same `r-0001` for different runs.
     sandbox_seq: u64,
@@ -6828,7 +6822,6 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             //    streaming — is not project state and stays.
             st.recent_media.clear();
             st.scenarios.clear();
-            st.candidates.clear();
             st.media_events.clear();
             st.batches.clear();
             st.checkpoint_thumbs.clear();
@@ -8874,139 +8867,15 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             }))
         }
 
-        // ── runtime/candidate_* (Spec 796) ────────────────────────────────────
-        // A candidate = baseline anchor + bound scenario + accumulating overlay
-        // patch-set + cached no-patch baseline. create/patch/run(auto-eval)/remove/
-        // list/delete/export. Runs on the live shared session (like overlay_run).
-        "runtime/candidate_create" => {
-            let anchor = match req
-                .params
-                .get("anchor")
-                .or_else(|| req.params.get("baseline_anchor"))
-                .and_then(|v| v.as_str())
-            {
-                Some(s) if !s.is_empty() => s.to_string(),
-                _ => return Response::err(id, -32602, "runtime/candidate_create: anchor required"),
-            };
-            // Scenario = {inputs, cycleBudget}; strip any startSnapshot — the anchor
-            // IS the start (a run restores it then plays these inputs post-patch).
-            let mut scenario = req.params.get("scenario").cloned().unwrap_or_else(|| json!({}));
-            if let Some(obj) = scenario.as_object_mut() {
-                obj.remove("startSnapshot");
-            }
-            let mut st = state.lock().unwrap();
-            let snapshot = match st.checkpoint_ring.restore_snapshot(&anchor) {
-                Some(s) => s,
-                None => {
-                    return Response::err(id, -32001, format!("runtime/candidate_create: unknown anchor {anchor}"))
-                }
-            };
-            if let Err(e) = restore_live_checkpoint(&mut st.session, &snapshot) {
-                return Response::err(id, -32001, format!("runtime/candidate_create: {e}"));
-            }
-            st.session.running = false;
-            st.ctrl_frame += 1;
-            st.ctrl_stop = None;
-            // Baseline = the NO-PATCH scenario run from the anchor.
-            if let Err(e) = run_scenario(&mut st, &scenario) {
-                return Response::err(id, -32001, format!("runtime/candidate_create: baseline run: {e}"));
-            }
-            let baseline_result = capture_live_checkpoint(&mut st.session);
-            st.candidate_seq += 1;
-            let cand_id = format!("cand-{}", st.candidate_seq);
-            let cand = candidate::Candidate::new(cand_id.clone(), anchor, scenario, baseline_result);
-            let out = cand.to_json();
-            st.candidates.insert(cand_id, cand);
-            Response::ok(id, out)
-        }
-
-        "runtime/candidate_patch" => {
-            let cand_id = match req.params.get("id").and_then(|v| v.as_str()) {
-                Some(s) => s.to_string(),
-                None => return Response::err(id, -32602, "runtime/candidate_patch: id required"),
-            };
-            let space = req.params.get("space").and_then(|v| v.as_str()).unwrap_or("ram").to_string();
-            let bank = req.params.get("bank").and_then(|v| v.as_u64()).map(|b| b as u16);
-            let addr = (req.params.get("addr").and_then(|v| v.as_u64()).unwrap_or(0) & 0xffff) as u16;
-            let source = req.params.get("source").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let bytes: Vec<u8> = req
-                .params
-                .get("bytes")
-                .and_then(|v| v.as_array())
-                .map(|a| a.iter().map(|b| (b.as_u64().unwrap_or(0) & 0xff) as u8).collect())
-                .unwrap_or_default();
-            let mut st = state.lock().unwrap();
-            let Some(c) = st.candidates.get_mut(&cand_id) else {
-                return Response::err(id, -32001, format!("runtime/candidate_patch: unknown candidate {cand_id}"));
-            };
-            c.add_or_replace_patch(candidate::Patch { space, bank, addr, source, bytes });
-            Response::ok(id, c.to_json())
-        }
-
-        "runtime/candidate_run" => {
-            let cand_id = match req.params.get("id").and_then(|v| v.as_str()) {
-                Some(s) => s.to_string(),
-                None => return Response::err(id, -32602, "runtime/candidate_run: id required"),
-            };
-            let mut st = state.lock().unwrap();
-            match run_candidate(&mut st, &cand_id) {
-                Ok(v) => Response::ok(id, v),
-                Err(e) => Response::err(id, -32001, format!("runtime/candidate_run: {e}")),
-            }
-        }
-
-        "runtime/candidate_remove_patch" => {
-            let cand_id = match req.params.get("id").and_then(|v| v.as_str()) {
-                Some(s) => s.to_string(),
-                None => return Response::err(id, -32602, "runtime/candidate_remove_patch: id required"),
-            };
-            let space = req.params.get("space").and_then(|v| v.as_str()).unwrap_or("ram").to_string();
-            let bank = req.params.get("bank").and_then(|v| v.as_u64()).map(|b| b as u16);
-            let addr = (req.params.get("addr").and_then(|v| v.as_u64()).unwrap_or(0) & 0xffff) as u16;
-            let mut st = state.lock().unwrap();
-            let Some(c) = st.candidates.get_mut(&cand_id) else {
-                return Response::err(id, -32001, format!("runtime/candidate_remove_patch: unknown candidate {cand_id}"));
-            };
-            let removed = c.remove_patch(&space, bank, addr);
-            let mut out = c.to_json();
-            out["removed"] = json!(removed);
-            Response::ok(id, out)
-        }
-
-        "runtime/candidate_list" => {
-            let st = state.lock().unwrap();
-            if let Some(cand_id) = req.params.get("id").and_then(|v| v.as_str()) {
-                match st.candidates.get(cand_id) {
-                    Some(c) => Response::ok(id, c.to_json()),
-                    None => Response::err(id, -32001, format!("runtime/candidate_list: unknown candidate {cand_id}")),
-                }
-            } else {
-                let list: Vec<Value> = st.candidates.values().map(|c| c.to_json()).collect();
-                Response::ok(id, json!({ "candidates": list }))
-            }
-        }
-
-        "runtime/candidate_delete" => {
-            let cand_id = match req.params.get("id").and_then(|v| v.as_str()) {
-                Some(s) => s.to_string(),
-                None => return Response::err(id, -32602, "runtime/candidate_delete: id required"),
-            };
-            let mut st = state.lock().unwrap();
-            let existed = st.candidates.remove(&cand_id).is_some();
-            Response::ok(id, json!({ "id": cand_id, "deleted": existed }))
-        }
-
-        "runtime/candidate_export" => {
-            let cand_id = match req.params.get("id").and_then(|v| v.as_str()) {
-                Some(s) => s.to_string(),
-                None => return Response::err(id, -32602, "runtime/candidate_export: id required"),
-            };
-            let st = state.lock().unwrap();
-            match st.candidates.get(&cand_id) {
-                Some(c) => Response::ok(id, c.export_json()),
-                None => Response::err(id, -32001, format!("runtime/candidate_export: unknown candidate {cand_id}")),
-            }
-        }
+        // ── runtime/candidate_* — REMOVED (Spec 905) ──────────────────────────
+        // A candidate restored its anchor into the LIVE session, patched it there and
+        // left the shared machine in the end state. A sandbox run does the same from the
+        // same anchor on a machine of its own: patches and inputs in one call.
+        m if m.starts_with("runtime/candidate_") => Response::err(
+            id,
+            -32601,
+            format!("Method not found: {m} \u{2014} removed \u{2014} use sandbox/runMany with patches + inputs"),
+        ),
 
         // ── runtime/snapshot_tree ────────────────────────────────────────────
         // Spec 268 / 769 — time-travel branch tree. 1:1 with ws-server.ts:1891-1909:
@@ -9318,8 +9187,8 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
         // ── runtime/find_cheat_candidates (Spec 798) ──────────────────────────
         // Snapshot-diff → decrementer: RAM addresses that DECREASED between two
         // anchors (candidate life/health/ammo counters), ranked smallest-delta
-        // first. The finder half of the cheat loop; the verify half creates a 796
-        // candidate that freezes the address + runs the scenario. READ-ONLY.
+        // first. The finder half of the cheat loop; the verify half is a `sandbox/runMany`
+        // run whose patch freezes the address, with the scenario's inputs. READ-ONLY.
         "runtime/find_cheat_candidates" => {
             let before = match req
                 .params
@@ -12168,6 +12037,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 vec![json!({
                     "patches": req.params.get("patches").cloned().unwrap_or(json!([])),
                     "cycles": req.params.get("cycles").cloned().unwrap_or(json!(0)),
+                    "inputs": req.params.get("inputs").cloned().unwrap_or(json!([])),
                 })]
             };
             if runs.is_empty() {
@@ -14887,41 +14757,100 @@ fn store_checkpoint_thumb(st: &mut State, id: String, thumb: CheckpointThumb) {
     }
 }
 
-/// The scenario-player replay target over the live `Machine`. `type` drives the
-/// keyboard matrix and `set_joystick1/2` drives the live CIA1 joystick model
-/// (port 1 = PB, port 2 = PA); paddle/restore are still no-ops. `run_for`
-/// advances the machine `cycleBudget` cycles (composite macros).
+/// Spec 905 D1 — the scenario-player target over a bare `Machine`: what an input MEANS,
+/// once, for every host. `type` queues the keyboard, `set_joystick1/2` set the machine's
+/// sticks (port 1 = CIA1 PB, port 2 = PA), `run_for` runs the machine on the path the
+/// gate chose, and a `model` input is the frame-boundary transplant. Paddle/restore are
+/// no-ops. The live session's target delegates its input methods here; a sandbox run
+/// plays its inputs over it directly.
+struct MachineTarget<'a> {
+    machine: &'a mut trx64_core::Machine,
+    /// The path `run_for` takes (`full_machine_gate` / `full_machine_gate_for`).
+    full_machine: bool,
+    /// Spec 863 — every model switch performed: `{ cycle, rasterLine, from, name }`.
+    switches: Vec<Value>,
+}
+
+impl<'a> trx64_core::scenario_player::ScenarioTarget for MachineTarget<'a> {
+    fn type_text(&mut self, text: &str) {
+        // scenario-player.ts:75 — typeText(text, 80_000, 80_000). Queue relative to
+        // the current machine clock so the KERNAL scans the key as it runs.
+        let now = self.machine.cpu6510.clk;
+        self.machine.keyboard.type_text(now, text, 80_000, 80_000);
+    }
+    fn set_joystick1(&mut self, state: trx64_core::scenario_player::JoystickState) {
+        // Bring the held state up to "now" first, as `session/joystick_set` does, so a
+        // change queued earlier cannot land over this one.
+        self.machine.sync_input();
+        self.machine.joystick1 = state;
+    }
+    fn set_joystick2(&mut self, state: trx64_core::scenario_player::JoystickState) {
+        self.machine.sync_input();
+        self.machine.joystick2 = state;
+    }
+    fn set_paddle(&mut self, _idx: u8, _value: i64) {}
+    fn trigger_restore_nmi(&mut self) {}
+    fn run_for(&mut self, cycles: u64) {
+        run_machine_budget(self.machine, cycles, self.full_machine);
+    }
+    /// Spec 863 / 905 D3 — the transplant a live `session/model` performs, at the cycle the
+    /// recording performed it (the player fires it there; the machine is at a frame
+    /// boundary by construction, so the advance is zero). The machine is advanced to the
+    /// boundary on this target's own run path.
+    fn switch_model(&mut self, name: &str) -> Result<u64, String> {
+        let row = trx64_core::model::resolve(name)?;
+        let from = self.machine.model();
+        if !std::ptr::eq(from, row) {
+            let full = self.full_machine;
+            let t = switch_machine_at_frame_boundary(self.machine, row, |m| run_machine_budget(m, 1, full))?;
+            self.switches.push(json!({
+                "cycle": t["switchedAt"]["c64Cycles"],
+                "rasterLine": t["switchedAt"]["rasterLine"],
+                "from": from.name,
+                "name": row.name,
+            }));
+        }
+        Ok(row.timing.cycles_per_frame)
+    }
+}
+
+/// The scenario-player replay target over the live SESSION. Every input method is
+/// `MachineTarget`'s (one meaning for an input); only what needs the session stays here:
+/// `run_for` goes through `run_cycle_budget` (traces, observers) and the model switch
+/// through `switch_at_frame_boundary` (it also moves `session.model`).
 struct MachineScenarioTarget<'a> {
     session: &'a mut Session,
     /// Spec 863 — every model switch the replay performed: `{ cycle, from, name }`.
     switches: Vec<Value>,
 }
 
+impl<'a> MachineScenarioTarget<'a> {
+    /// The input half of the session, as a machine target. Its `full_machine` is never
+    /// consulted: the methods taken through it are the input ones.
+    fn inputs(&mut self) -> MachineTarget<'_> {
+        MachineTarget { machine: &mut self.session.machine, full_machine: false, switches: Vec::new() }
+    }
+}
+
 impl<'a> trx64_core::scenario_player::ScenarioTarget for MachineScenarioTarget<'a> {
     fn type_text(&mut self, text: &str) {
-        // scenario-player.ts:75 — typeText(text, 80_000, 80_000). Queue relative to
-        // the current machine clock so the KERNAL scans the key as it runs.
-        let now = self.session.machine.cpu6510.clk;
-        self.session.machine.keyboard.type_text(now, text, 80_000, 80_000);
+        self.inputs().type_text(text);
     }
     fn set_joystick1(&mut self, state: trx64_core::scenario_player::JoystickState) {
-        // scenario-player.ts:78 — session.setJoystick1(state). The scenario
-        // `JoystickState` is now the canonical `keyboard::JoystickState` (re-export),
-        // so it drops straight into the live machine's port 1 (CIA1 PB).
-        self.session.machine.joystick1 = state;
+        self.inputs().set_joystick1(state);
     }
     fn set_joystick2(&mut self, state: trx64_core::scenario_player::JoystickState) {
-        // scenario-player.ts:81 — session.setJoystick2(state) → port 2 (CIA1 PA).
-        self.session.machine.joystick2 = state;
+        self.inputs().set_joystick2(state);
     }
-    fn set_paddle(&mut self, _idx: u8, _value: i64) {}
-    fn trigger_restore_nmi(&mut self) {}
+    fn set_paddle(&mut self, idx: u8, value: i64) {
+        self.inputs().set_paddle(idx, value);
+    }
+    fn trigger_restore_nmi(&mut self) {
+        self.inputs().trigger_restore_nmi();
+    }
     fn run_for(&mut self, cycles: u64) {
         run_cycle_budget(self.session, cycles);
     }
-    /// Spec 863 — the transplant a live `session/model` performs, at the cycle the
-    /// recording performed it (the player fires it there; the machine is at a frame
-    /// boundary by construction, so the advance is zero).
     fn switch_model(&mut self, name: &str) -> Result<u64, String> {
         let row = trx64_core::model::resolve(name)?;
         let from = self.session.machine.model();
@@ -14936,6 +14865,52 @@ impl<'a> trx64_core::scenario_player::ScenarioTarget for MachineScenarioTarget<'
         }
         Ok(row.timing.cycles_per_frame)
     }
+}
+
+/// Spec 905 — the one replay loop, for every host: fire the inputs that are due as of the
+/// target's clock, run to the next due input (or `end_clk`), repeat. `clock` reads the
+/// target's cycle counter. The live scenario and a sandbox run both play through it, so
+/// "an input at cycle N" cannot mean two things (scenario.ts:123-146).
+fn play_scenario<T: trx64_core::scenario_player::ScenarioTarget>(
+    target: &mut T,
+    player: &mut trx64_core::scenario_player::ScenarioPlayer,
+    clock: impl Fn(&T) -> u64,
+    end_clk: u64,
+) -> Result<(), String> {
+    loop {
+        let now = clock(target);
+        // Fire any due inputs as of `now`.
+        player.tick(target, now);
+        if let Some(why) = player.failure() {
+            return Err(format!("the replay stopped at cycle {now}: {why}"));
+        }
+        if now >= end_clk {
+            break;
+        }
+        // Run up to the next due input (or the budget end), whichever is sooner.
+        let next_due = player.next_due_cycle().unwrap_or(end_clk).max(now);
+        let run_until = next_due.min(end_clk);
+        let to_run = run_until.saturating_sub(now);
+        if to_run == 0 {
+            // A due input at `now` was just fired; if none remain, finish the budget.
+            if player.remaining() == 0 {
+                let rest = end_clk.saturating_sub(now);
+                if rest == 0 {
+                    break;
+                }
+                target.run_for(rest);
+            }
+            continue;
+        }
+        target.run_for(to_run);
+    }
+    // Fire any inputs that landed exactly at the end.
+    let final_now = clock(target);
+    player.tick(target, final_now);
+    if let Some(why) = player.failure() {
+        return Err(format!("the replay stopped at cycle {final_now}: {why}"));
+    }
+    Ok(())
 }
 
 /// Translate a `Scenario.inputs` array (scenario.ts ScenarioInputEvent:
@@ -15334,39 +15309,7 @@ fn run_scenario(st: &mut State, scenario: &Value) -> Result<Value, String> {
         session: &mut st.session,
         switches: Vec::new(),
     };
-    loop {
-        let now = target.session.machine.cpu6510.clk;
-        // Fire any due inputs as of `now`.
-        player.tick(&mut target, now);
-        if let Some(why) = player.failure() {
-            return Err(format!("the replay stopped at cycle {now}: {why}"));
-        }
-        if now >= end_clk {
-            break;
-        }
-        // Run up to the next due input (or the budget end), whichever is sooner.
-        let next_due = player.next_due_cycle().unwrap_or(end_clk).max(now);
-        let run_until = next_due.min(end_clk);
-        let to_run = run_until.saturating_sub(now);
-        if to_run == 0 {
-            // A due input at `now` was just fired; if none remain, finish the budget.
-            if player.remaining() == 0 {
-                let rest = end_clk.saturating_sub(now);
-                if rest == 0 {
-                    break;
-                }
-                run_cycle_budget(target.session, rest);
-            }
-            continue;
-        }
-        run_cycle_budget(target.session, to_run);
-    }
-    // Fire any inputs that landed exactly at the end.
-    let final_now = target.session.machine.cpu6510.clk;
-    player.tick(&mut target, final_now);
-    if let Some(why) = player.failure() {
-        return Err(format!("the replay stopped at cycle {final_now}: {why}"));
-    }
+    play_scenario(&mut target, &mut player, |t| t.session.machine.cpu6510.clk, end_clk)?;
 
     let switches = std::mem::take(&mut target.switches);
 
@@ -16432,9 +16375,41 @@ fn sandbox_one(
 ) -> Result<(Value, Value), String> {
     let patches: Vec<Value> = run.get("patches").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     let cycles = run.get("cycles").and_then(|v| v.as_u64()).unwrap_or(0);
+    let inputs_given = run.get("inputs").is_some_and(|v| v.is_array());
+    let inputs: Vec<Value> = run.get("inputs").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     let applied = apply_overlay_patches(machine, &patches, "sandbox/run")?;
-    if cycles > 0 {
-        run_machine_budget(machine, cycles, full_machine);
+    // Spec 905 D2 — the inputs play AFTER the patches, over the run's own budget; an input
+    // at or past `cycles` is never reached and is reported, not played.
+    let start_clk = machine.cpu6510.clk;
+    let mut played = 0usize;
+    let mut skipped: Vec<Value> = Vec::new();
+    let mut switches: Vec<Value> = Vec::new();
+    if inputs.is_empty() {
+        if cycles > 0 {
+            run_machine_budget(machine, cycles, full_machine);
+        }
+    } else {
+        let mut reached: Vec<Value> = Vec::new();
+        for ev in &inputs {
+            // `atCycle` is relative to the run's start (the anchor); absent means 0.
+            let rel = ev.get("atCycle").and_then(|v| v.as_u64()).unwrap_or(0);
+            if rel >= cycles {
+                skipped.push(ev.clone());
+            } else {
+                let mut e = ev.clone();
+                e["atCycle"] = json!(start_clk.saturating_add(rel));
+                reached.push(e);
+            }
+        }
+        let steps = scenario_steps_from_inputs(&reached);
+        let n_steps = steps.len();
+        // The sandbox's own run (D2) has no `at_frame` steps: every step is a cycle.
+        let mut player = trx64_core::scenario_player::ScenarioPlayer::new(steps, machine.timing().cycles_per_frame);
+        let mut target = MachineTarget { machine, full_machine, switches: Vec::new() };
+        play_scenario(&mut target, &mut player, |t| t.machine.cpu6510.clk, start_clk.saturating_add(cycles))
+            .map_err(|e| format!("sandbox/run: inputs: {e}"))?;
+        played = n_steps - player.remaining();
+        switches = std::mem::take(&mut target.switches);
     }
     let mut summary = json!({
         "cycles": cycles,
@@ -16443,6 +16418,14 @@ fn sandbox_one(
         "registers": machine_registers(machine),
         "ramDigest": ram_digest(machine),
     });
+    if inputs_given {
+        summary["inputsPlayed"] = json!(played);
+        summary["inputsSkipped"] = Value::Array(skipped);
+    }
+    if !switches.is_empty() {
+        summary["modelSwitches"] = Value::Array(switches);
+        summary["model"] = json!(machine.model().name);
+    }
     // The folder is part of the run's result: a caller that cares about a written disk
     // fetches it from here. Absent when the run wrote nothing.
     if let Some(m) = sandbox_cow_media(machine, media, folder)? {
@@ -16997,15 +16980,44 @@ fn frame_probe(st: &mut State, p: &Value) -> Result<Value, (i64, String)> {
 /// the wrap rather than aiming at a cycle number: a single-cycle budget still completes the
 /// instruction in flight, so `raster_cycle` can step over any exact value, a wrap cannot.
 fn advance_to_frame_boundary(session: &mut Session) -> Result<(), String> {
-    let start = session.machine.clk;
-    // Two frames of slack: at most one to reach the wrap, plus room for a long
-    // instruction straddling it.
-    let cap = 2 * session.machine.timing().cycles_per_frame + 128;
-    let mut prev_line = session.machine.vic.raster_line;
-    let mut landed = prev_line == 0;
-    while !landed && session.machine.clk.saturating_sub(start) < cap {
+    let (clk, line, cap) = {
+        let m = &session.machine;
+        (m.clk, m.vic.raster_line, 2 * m.timing().cycles_per_frame + 128)
+    };
+    advance_to_boundary_by(clk, line, cap, || {
         run_cycle_budget(session, 1);
-        let line = session.machine.vic.raster_line;
+        (session.machine.clk, session.machine.vic.raster_line)
+    })
+}
+
+/// Spec 905 D3 — the same advance on a bare machine (a sandbox run has no session): one
+/// cycle at a time through `step`, which runs the machine one cycle.
+fn advance_machine_to_frame_boundary(
+    machine: &mut trx64_core::Machine,
+    mut step: impl FnMut(&mut trx64_core::Machine),
+) -> Result<(), String> {
+    let (clk, line, cap) = (machine.clk, machine.vic.raster_line, 2 * machine.timing().cycles_per_frame + 128);
+    advance_to_boundary_by(clk, line, cap, || {
+        step(machine);
+        (machine.clk, machine.vic.raster_line)
+    })
+}
+
+/// The loop both advances share: run one cycle at a time until the raster wraps to line
+/// 0. `step` runs one cycle and returns the machine's new `(clk, raster line)`. Two frames
+/// of slack: at most one to reach the wrap, plus room for a long instruction straddling it.
+fn advance_to_boundary_by(
+    start: u64,
+    start_line: u16,
+    cap: u64,
+    mut step: impl FnMut() -> (u64, u16),
+) -> Result<(), String> {
+    let mut prev_line = start_line;
+    let mut landed = prev_line == 0;
+    let mut clk = start;
+    while !landed && clk.saturating_sub(start) < cap {
+        let (c, line) = step();
+        clk = c;
         landed = line == 0 && prev_line != 0;
         prev_line = line;
     }
@@ -17119,9 +17131,31 @@ fn switch_at_frame_boundary(
     row: &'static trx64_core::model::C64Model,
 ) -> Result<Value, String> {
     advance_to_frame_boundary(session)?;
-    let before = session.machine.clone();
-    session.machine.switch_model(row)?;
-    let after = &session.machine;
+    let out = transplant_machine(&mut session.machine, row)?;
+    session.model = row;
+    Ok(out)
+}
+
+/// Spec 905 D3 — the same switch on a bare machine: advance to the frame boundary through
+/// `step` (one cycle of the caller's run path), then the transplant. `switch_at_frame_boundary`
+/// and a sandbox run's `model` input both end in `transplant_machine`.
+fn switch_machine_at_frame_boundary(
+    machine: &mut trx64_core::Machine,
+    row: &'static trx64_core::model::C64Model,
+    step: impl FnMut(&mut trx64_core::Machine),
+) -> Result<Value, String> {
+    advance_machine_to_frame_boundary(machine, step)?;
+    transplant_machine(machine, row)
+}
+
+/// Carry the machine, already at the frame boundary, onto `row`, and say what was kept.
+fn transplant_machine(
+    machine: &mut trx64_core::Machine,
+    row: &'static trx64_core::model::C64Model,
+) -> Result<Value, String> {
+    let before = machine.clone();
+    machine.switch_model(row)?;
+    let after = &*machine;
     let kept = json!({
         "cpu": before.c64_core.reg_pc == after.c64_core.reg_pc
             && before.c64_core.reg_a == after.c64_core.reg_a
@@ -17147,7 +17181,6 @@ fn switch_at_frame_boundary(
         "rasterLine": after.vic.raster_line,
         "rasterCycle": after.vic.raster_cycle + 1,
     });
-    session.model = row;
     Ok(json!({ "switchedAt": switched_at, "kept": kept }))
 }
 
@@ -17435,86 +17468,6 @@ fn purge_materialized_media(st: &mut State) -> (usize, usize) {
 //
 // No new diff logic — `snapshot_diff::diff_snapshots` is the compute; this wraps it
 // with by-ID anchor resolution + the typed-record reshape.
-/// Spec 796 — apply one candidate patch to the live machine (RAM or a cart bank,
-/// reusing the 795 overlay primitives).
-fn apply_candidate_patch(machine: &mut trx64_core::Machine, p: &candidate::Patch) -> Result<(), String> {
-    if p.space == "ram" {
-        for (i, &b) in p.bytes.iter().enumerate() {
-            machine.ram[(p.addr as usize + i) & 0xffff] = b;
-        }
-        Ok(())
-    } else {
-        let bank = p.bank.unwrap_or(0);
-        let cart = machine
-            .cartridge
-            .as_mut()
-            .ok_or("candidate patch targets a cart bank but no cartridge is attached")?;
-        for (i, &b) in p.bytes.iter().enumerate() {
-            cart.overlay_bank_write(&p.space, bank, ((p.addr as usize + i) & 0xffff) as u16, b)?;
-        }
-        Ok(())
-    }
-}
-
-/// Spec 796 — run a candidate: restore its baseline anchor, apply ALL its patches
-/// (795 overlay, RAM + cart), play its bound scenario (231, deterministic from the
-/// post-patch state), capture the end checkpoint, and auto-diff (794) against the
-/// cached no-patch baseline. Returns { registers, verdict, ranCycles }. Ephemeral —
-/// the baseline anchor is untouched, so the next run reproduces this one.
-fn run_candidate(st: &mut State, cand_id: &str) -> Result<Value, String> {
-    // Clone the candidate's inputs out so the &mut State borrow is free for the
-    // restore/run/diff below; the verdict is written back at the end.
-    let cand = st
-        .candidates
-        .get(cand_id)
-        .ok_or_else(|| format!("unknown candidate {cand_id}"))?
-        .clone();
-
-    // (1) Restore the baseline anchor into the live session (a control discontinuity).
-    let snapshot = st
-        .checkpoint_ring
-        .restore_snapshot(&cand.baseline_anchor)
-        .ok_or_else(|| format!("candidate {cand_id}: unknown baseline anchor {}", cand.baseline_anchor))?;
-    restore_live_checkpoint(&mut st.session, &snapshot)?;
-    st.session.running = false;
-    st.ctrl_frame += 1;
-    st.ctrl_stop = None;
-
-    // (2) Apply all patches (RAM + cart).
-    for p in &cand.patches {
-        apply_candidate_patch(&mut st.session.machine, p)?;
-    }
-
-    // (3) Play the bound scenario (no startSnapshot → from the post-patch anchor).
-    let start_clk = st.session.machine.cpu6510.clk;
-    run_scenario(st, &cand.scenario)?;
-    let ran = st.session.machine.cpu6510.clk.saturating_sub(start_clk);
-
-    // (4) Capture the end + auto-diff vs the cached baseline result.
-    let end = capture_live_checkpoint(&mut st.session);
-    let diff = trx64_core::checkpoint_diff::diff_checkpoints(
-        &cand.baseline_result,
-        &end,
-        &trx64_core::checkpoint_diff::ExcludeMask::default(),
-    );
-    if let Some(c) = st.candidates.get_mut(cand_id) {
-        c.last_verdict = Some(diff.get("verdict").cloned().unwrap_or(Value::Null));
-    }
-
-    let c = &st.session.machine.cpu6510;
-    Ok(json!({
-        "id": cand_id,
-        "ranCycles": ran,
-        "registers": {
-            "pc": c.reg_pc as u64, "a": c.reg_a as u64, "x": c.reg_x as u64,
-            "y": c.reg_y as u64, "sp": c.reg_sp as u64, "flags": c.flags() as u64,
-            "cycles": st.session.machine.clk,
-        },
-        "verdict": diff.get("verdict").cloned().unwrap_or(Value::Null),
-        "diff": diff,
-    }))
-}
-
 /// Build a Spec 794 ExcludeMask from monitor `cdiff` trailing tokens: `eq` (or
 /// `preset`) = equivalence preset, `c:NAME` component, `l:NAME` lane,
 /// `r:SPACE:FROM-TO` address range.
@@ -18552,8 +18505,6 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         transport_shown_frame: "second",
         audio_epoch: 0,
         recorder_frames_since: 0,
-        candidates: std::collections::HashMap::new(),
-        candidate_seq: 0,
         sandbox_seq: 0,
         sandbox_ends: std::collections::VecDeque::new(),
         sandbox_stamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0).to_string(),
@@ -19307,8 +19258,6 @@ mod batch1_tests {
         transport_shown_frame: "second",
             audio_epoch: 0,
             recorder_frames_since: 0,
-        candidates: std::collections::HashMap::new(),
-        candidate_seq: 0,
         sandbox_seq: 0,
         sandbox_ends: std::collections::VecDeque::new(),
         sandbox_stamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0).to_string(),
@@ -25510,60 +25459,254 @@ mod batch1_tests {
         assert!(typed["freeRunWarning"].as_str().is_some(), "type also warns when free-running");
     }
 
-    // Spec 796 — candidate lifecycle over the full WS path (create → patch → run →
-    // auto-eval → remove → export), on a blank machine with a 0-cycle scenario so the
-    // diff reflects ONLY the overlay (no execution) — deterministic, ROM-free.
+    // ── Spec 905 — a sandbox run plays inputs; the candidate RPCs are gone ──────────────
+
+    /// A FULL machine (CIAs, VIC, banking) built on synthetic ROM files, so the test needs no
+    /// Commodore ROM: the KERNAL image is a loop at $E000 that logs $DC00 into $C100..
+    /// (256 reads, one per ~14-cycle iteration) and the reset vector points at it. Captured
+    /// as an anchor straight after the cold reset. Returns the anchor id.
+    fn spec905_logger_anchor(st: &SharedState) -> String {
+        let dir = std::env::temp_dir().join(format!("trx64_spec905_{}_{:?}", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // LDX #0 ; L: LDA $DC00 ; STA $C100,X ; INX ; JMP L
+        let prog = [0xa2, 0x00, 0xad, 0x00, 0xdc, 0x9d, 0x00, 0xc1, 0xe8, 0x4c, 0x02, 0xe0];
+        let mut kernal = vec![0xeau8; 0x2000];
+        kernal[..prog.len()].copy_from_slice(&prog);
+        for v in [0x1ffa, 0x1ffc, 0x1ffe] {
+            kernal[v] = 0x00;
+            kernal[v + 1] = 0xe0;
+        }
+        let m = trx64_core::model::default_model();
+        std::fs::write(dir.join(&m.kernal), &kernal).unwrap();
+        std::fs::write(dir.join(&m.basic), vec![0xeau8; 0x2000]).unwrap();
+        std::fs::write(dir.join(&m.chargen), vec![0u8; 0x1000]).unwrap();
+        {
+            let mut g = st.lock().unwrap();
+            g.session.machine.boot_from_dir(&dir).expect("boot synthetic ROMs");
+            assert!(g.session.machine.full_assembled);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let cp = call(st, "checkpoint/capture", json!({}));
+        cp["ref"]["id"].as_str().expect("checkpoint id").to_string()
+    }
+
+    /// `read` patches over `$lo..$lo+n`, to get a RAM range back in a run's summary.
+    fn spec905_reads(lo: u64, n: u64) -> Vec<Value> {
+        (0..n).map(|i| json!({ "addr": lo + i, "bytes": [], "read": true })).collect()
+    }
+
+    fn spec905_read_log(run: &Value, lo: u64, n: u64) -> Vec<u64> {
+        (0..n).map(|i| run["reads"][format!("${:04x}", lo + i)].as_u64().expect("read")).collect()
+    }
+
+    fn spec905_live(st: &SharedState) -> (u64, Value, bool, String) {
+        let g = st.lock().unwrap();
+        (g.session.machine.clk, machine_registers(&g.session.machine), g.session.running, ram_digest(&g.session.machine))
+    }
+
+    /// S1 — a joystick press lands at its cycle in a sandbox run; the no-input run is the
+    /// plain run; the live session does not move.
     #[test]
-    fn candidate_lifecycle_run_and_autoeval() {
-        let state = make_state();
-        let cp = call(&state, "checkpoint/capture", json!({}));
-        let anchor = cp["ref"]["id"].as_str().expect("checkpoint id").to_string();
+    fn spec905_sandbox_inputs_joystick_at_its_cycle_and_live_untouched() {
+        let st = make_state();
+        let anchor = spec905_logger_anchor(&st);
+        // The live machine moves on past the anchor, so a run that touched it would show.
+        {
+            let mut g = st.lock().unwrap();
+            let mut sink = trx64_core::NullSink;
+            g.session.machine.run_for_full(777, &mut sink, |_, _, _, _, _, _, _| {});
+        }
+        let before = spec905_live(&st);
+        let (n, c) = (1000u64, 3000u64);
+        let reads = spec905_reads(0xc100, 200);
+        let fire = json!([{ "atCycle": n, "kind": "joystick2", "payload": { "fire": true } }]);
+        let r = call(&st, "sandbox/runMany", json!({
+            "from": anchor,
+            "runs": [
+                { "patches": reads, "cycles": c, "inputs": fire },
+                { "patches": reads, "cycles": c, "inputs": [] },
+                { "patches": reads, "cycles": c },
+                { "patches": reads, "cycles": c, "inputs": [{ "atCycle": c, "kind": "joystick2", "payload": { "fire": true } }] },
+            ],
+        }));
+        assert_eq!(spec905_live(&st), before, "S1: the live clock, registers, run state and RAM are what they were");
+        let runs = r["runs"].as_array().expect("runs");
+        for x in runs {
+            assert_eq!(x["state"], json!("done"), "{x}");
+        }
+        let (with, without, plain, late) = (&runs[0], &runs[1], &runs[2], &runs[3]);
+        assert_eq!(with["inputsPlayed"], json!(1));
+        assert_eq!(without["inputsPlayed"], json!(0));
+        assert!(plain.get("inputsPlayed").is_none(), "absent inputs → today's summary");
+        assert_eq!(late["inputsPlayed"], json!(0), "an input at `cycles` is not reached");
+        assert_eq!(late["inputsSkipped"].as_array().unwrap().len(), 1, "and it is reported");
 
-        let created = call(
-            &state,
-            "runtime/candidate_create",
-            json!({ "anchor": anchor, "scenario": { "inputs": [], "cycleBudget": 0 } }),
+        let (lw, lo, lp) = (
+            spec905_read_log(with, 0xc100, 200),
+            spec905_read_log(without, 0xc100, 200),
+            spec905_read_log(plain, 0xc100, 200),
         );
-        let cid = created["id"].as_str().expect("candidate id").to_string();
+        assert_eq!(lo, lp, "S1: the no-input run is the plain run");
+        assert_eq!(without["ramDigest"], plain["ramDigest"]);
+        assert_eq!(without["registers"], plain["registers"]);
+        assert!(lo.iter().all(|&b| b == 0xff), "nothing pressed → $DC00 reads $FF: {:x?} {}", &lo[..20], without["registers"]);
+        let first = lw.iter().zip(&lo).position(|(a, b)| a != b).expect("the press shows in the log");
+        // ~14 cycles per read: read `first` happened at about 14·first (+ the 2-cycle LDX).
+        let t = 2 + 14 * first as u64;
+        assert!((n - 28..=n + 28).contains(&t), "first differing read at ~cycle {t}, the press was at {n}");
+        assert!(lw[..first].iter().all(|&b| b == 0xff));
+        assert!(lw[first..].iter().all(|&b| b == 0xef), "joystick 2 fire = PA4 low from then on");
+        assert_ne!(with["ramDigest"], without["ramDigest"]);
+    }
 
-        // (a) no patch → identical vs its own baseline.
-        let r0 = call(&state, "runtime/candidate_run", json!({ "id": cid }));
-        assert_eq!(r0["verdict"]["identical"], json!(true), "no-patch run must be identical");
+    /// S2 — an input means the same live and in a sandbox: the live session replays the
+    /// same list through the scenario player and ends in the same RAM and registers.
+    #[test]
+    fn spec905_scenario_target_live_equals_sandbox() {
+        let st = make_state();
+        let anchor = spec905_logger_anchor(&st);
+        let (n1, n2, c) = (700u64, 1500u64, 4000u64);
+        let rel = json!([
+            { "atCycle": n1, "kind": "joystick2", "payload": { "fire": true } },
+            { "atCycle": n2, "kind": "joystick2", "payload": { "up": true } },
+        ]);
+        let sb = call(&st, "sandbox/run", json!({ "from": anchor, "cycles": c, "inputs": rel }));
+        assert_eq!(sb["state"], json!("done"), "{sb}");
+        assert_eq!(sb["inputsPlayed"], json!(2));
 
-        // (b) a RAM patch → the run differs, and names `ram`.
-        call(
-            &state,
-            "runtime/candidate_patch",
-            json!({ "id": cid, "space": "ram", "addr": 0xcf00, "bytes": [0x5a], "source": "lda #$5a" }),
-        );
-        let r1 = call(&state, "runtime/candidate_run", json!({ "id": cid }));
-        assert_eq!(r1["verdict"]["identical"], json!(false), "ram patch must differ");
-        assert!(r1["verdict"]["differing"].as_array().unwrap().iter().any(|c| c == "ram"));
+        // The live side: restore the anchor into the session, then play the same list. A
+        // scenario's `atCycle` is the machine's clock, so shift by the anchor's clock.
+        let mut g = st.lock().unwrap();
+        let snapshot = g.checkpoint_ring.restore_snapshot(&anchor).expect("anchor");
+        restore_live_checkpoint(&mut g.session, &snapshot).expect("restore");
+        let start = g.session.machine.cpu6510.clk;
+        let abs = json!([
+            { "atCycle": start + n1, "kind": "joystick2", "payload": { "fire": true } },
+            { "atCycle": start + n2, "kind": "joystick2", "payload": { "up": true } },
+        ]);
+        run_scenario(&mut g, &json!({ "inputs": abs, "cycleBudget": c })).expect("live replay");
+        assert_eq!(ram_digest(&g.session.machine), sb["ramDigest"].as_str().unwrap(), "S2: same RAM");
+        assert_eq!(machine_registers(&g.session.machine), sb["registers"], "S2: same registers");
+    }
 
-        // (c) deterministic — a second run reproduces the verdict.
-        let r2 = call(&state, "runtime/candidate_run", json!({ "id": cid }));
-        assert_eq!(r1["verdict"], r2["verdict"], "candidate runs must be deterministic");
+    fn spec905_rom_dir() -> Option<std::path::PathBuf> {
+        let d = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/resources/roms"));
+        d.join("kernal-901227-03.bin").exists().then_some(d)
+    }
 
-        // (d) remove the patch → back to identical.
-        call(
-            &state,
-            "runtime/candidate_remove_patch",
-            json!({ "id": cid, "space": "ram", "addr": 0xcf00 }),
-        );
-        let r3 = call(&state, "runtime/candidate_run", json!({ "id": cid }));
-        assert_eq!(r3["verdict"]["identical"], json!(true), "after remove, identical again");
+    /// A ROM-booted state at the BASIC prompt, captured as an anchor.
+    fn spec905_basic_prompt(st: &SharedState, rom_dir: &std::path::Path) -> String {
+        {
+            let mut g = st.lock().unwrap();
+            g.session.machine.boot_from_dir(rom_dir).expect("boot ROMs");
+            let mut sink = trx64_core::NullSink;
+            g.session.machine.run_for_full(3_000_000, &mut sink, |_, _, _, _, _, _, _| {});
+        }
+        let cp = call(st, "checkpoint/capture", json!({}));
+        cp["ref"]["id"].as_str().expect("checkpoint id").to_string()
+    }
 
-        // (e) export before removing carried the source; re-add + export the seed.
-        call(
-            &state,
-            "runtime/candidate_patch",
-            json!({ "id": cid, "space": "roml", "bank": 2, "addr": 0x8000, "bytes": [0xea], "source": "nop" }),
-        );
-        let ex = call(&state, "runtime/candidate_export", json!({ "id": cid }));
-        let ps = ex["patches"].as_array().unwrap();
-        assert_eq!(ps.len(), 1);
-        assert_eq!(ps[0]["space"], json!("roml"));
-        assert_eq!(ps[0]["source"], json!("nop"));
+    /// S3 — keys typed in a sandbox run reach its screen RAM; the live machine shows nothing.
+    #[test]
+    fn spec905_sandbox_keyboard_input() {
+        let Some(rom_dir) = spec905_rom_dir() else {
+            eprintln!("SKIP spec905_sandbox_keyboard_input: ROMs absent");
+            return;
+        };
+        let st = make_state();
+        let anchor = spec905_basic_prompt(&st, &rom_dir);
+        let before = spec905_live(&st);
+        let r = call(&st, "sandbox/run", json!({
+            "from": anchor,
+            "cycles": 3_000_000u64,
+            "patches": spec905_reads(0x0400, 1000),
+            "inputs": [{ "atCycle": 0, "kind": "keyboard", "payload": "PRINT 1\r" }],
+        }));
+        assert_eq!(r["state"], json!("done"), "{r}");
+        assert_eq!(r["inputsPlayed"], json!(1));
+        let screen = spec905_read_log(&r, 0x0400, 1000);
+        // Screen codes of `PRINT 1` — typed, echoed, executed (the answer ` 1` follows).
+        let typed = [0x10u64, 0x12, 0x09, 0x0e, 0x14, 0x20, 0x31];
+        let at = screen.windows(typed.len()).position(|w| w == typed).expect("`PRINT 1` is on the run's screen");
+        let answer_row = (at / 40 + 1) * 40;
+        assert_eq!(&screen[answer_row..answer_row + 2], &[0x20, 0x31], "and its answer, ` 1`, on the next row");
+        // The live machine: not moved, and no typing on its screen.
+        assert_eq!(spec905_live(&st), before);
+        let live_screen: Vec<u64> = st.lock().unwrap().session.machine.ram[0x0400..0x0400 + 1000].iter().map(|&b| b as u64).collect();
+        assert!(live_screen.windows(typed.len()).all(|w| w != typed), "the live screen shows nothing typed");
+    }
+
+    /// D3 — a `model` input switches the run's own machine at the frame boundary, and only it.
+    #[test]
+    fn spec905_sandbox_model_switch() {
+        let Some(rom_dir) = spec905_rom_dir() else {
+            eprintln!("SKIP spec905_sandbox_model_switch: ROMs absent");
+            return;
+        };
+        let st = make_state();
+        let anchor = spec905_basic_prompt(&st, &rom_dir);
+        let before = spec905_live(&st);
+        let live_model = st.lock().unwrap().session.machine.model().name.clone();
+        let r = call(&st, "sandbox/run", json!({
+            "from": anchor,
+            "cycles": 100_000u64,
+            "inputs": [{ "atCycle": 5000, "kind": "model", "payload": "c64-ntsc" }],
+        }));
+        assert_eq!(r["state"], json!("done"), "{r}");
+        assert_eq!(r["inputsPlayed"], json!(1));
+        assert_eq!(r["model"], json!("c64-ntsc"));
+        assert_eq!(r["modelSwitches"].as_array().unwrap().len(), 1);
+        assert_eq!(spec905_live(&st), before);
+        assert_eq!(st.lock().unwrap().session.machine.model().name, live_model, "the live machine stays on its model");
+    }
+
+    /// The frame numbers a probe reports are the machine's, whatever sandbox runs with
+    /// inputs happened around it (the scenario target and the run paths were refactored in
+    /// 905; the 899 sweep saw the glitch at frame 42 instead of 43 on an intermediate build).
+    #[test]
+    fn spec905_frame_numbers_are_pinned_around_sandbox_inputs() {
+        let Some((st, cp, c)) = s901_probe_machine() else {
+            eprintln!("SKIP spec905_frame_numbers_are_pinned_around_sandbox_inputs: ROMs absent");
+            return;
+        };
+        let p = json!({ "frames": 100, "line": 250, "addresses": [{ "addr": 0xd029, "lens": "io" }] });
+        let frames = |v: &Value| -> Vec<u64> { v["rows"].as_array().unwrap().iter().map(|r| r["frame"].as_u64().unwrap()).collect() };
+        let a = call(&st, "session/frame_probe", p.clone());
+        assert_eq!(frames(&a), vec![0, 39 - c, 42 - c]);
+        let cycles_a: Vec<u64> = a["rows"].as_array().unwrap().iter().map(|r| r["c64Cycles"].as_u64().unwrap()).collect();
+
+        s901_restore(&st, &cp);
+        let anchor = call(&st, "checkpoint/capture", json!({}))["ref"]["id"].as_str().unwrap().to_string();
+        let r = call(&st, "sandbox/runMany", json!({ "from": anchor, "runs": [
+            { "cycles": 200_000u64, "inputs": [{ "atCycle": 1000, "kind": "joystick2", "payload": { "fire": true } }] },
+            { "cycles": 200_000u64, "inputs": [] },
+        ]}));
+        assert!(r["runs"].as_array().unwrap().iter().all(|x| x["state"] == json!("done")), "{r}");
+        s901_restore(&st, &cp);
+        let b = call(&st, "session/frame_probe", p);
+        assert_eq!(frames(&b), vec![0, 39 - c, 42 - c]);
+        let cycles_b: Vec<u64> = b["rows"].as_array().unwrap().iter().map(|r| r["c64Cycles"].as_u64().unwrap()).collect();
+        assert_eq!(cycles_a, cycles_b);
+    }
+
+    /// S4 — every `runtime/candidate_*` is refused by name, and nothing moves.
+    #[test]
+    fn spec905_candidate_rpcs_refused() {
+        let st = make_state();
+        let before = spec905_live(&st);
+        for m in [
+            "runtime/candidate_create", "runtime/candidate_patch", "runtime/candidate_run",
+            "runtime/candidate_remove_patch", "runtime/candidate_list", "runtime/candidate_delete",
+            "runtime/candidate_export",
+        ] {
+            let e = call_err(&st, m, json!({ "id": "cand-1", "anchor": "x" }));
+            assert_eq!(e.code, -32601, "{m}");
+            assert!(e.message.contains(m), "names the method: {}", e.message);
+            assert!(e.message.contains("removed"), "{}", e.message);
+            assert!(e.message.contains("sandbox/runMany with patches + inputs"), "{}", e.message);
+        }
+        assert_eq!(spec905_live(&st), before, "S4: the shared machine did not move");
     }
 
     // ── Spec 863 — models: the list, the switch, identity through reset, power and rewind ──

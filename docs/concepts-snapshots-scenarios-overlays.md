@@ -198,9 +198,10 @@ VSF ⇄ `.c64re` import+export incl. drive+keyboard (791).
 **DESIGNED, NOT BUILT — the gap-closing backlog:**
 
 1. ~~**776 — recorded intervention branch + outcome-diff**~~ — **SUPERSEDED 2026-08-12.**
-   Its subject, the active experiment loop, is the CANDIDATE (796): baseline anchor +
-   accumulating patch-set + bound replay, with the no-patch run cached as the reference
-   and a 794 diff after every run. Do not build a second branch object; see §6.
+   Its subject, the active experiment loop, was the CANDIDATE (796) — since removed
+   (905): a variant is now one run of `sandbox/runMany` (anchor + patches + inputs) on a
+   machine of its own, and the project, not the daemon, remembers it. Do not build a
+   second branch object; see §6.
 2. ~~**762 — snapshot-diff cheat finder**~~ — subsumed by **798**.
 3. **766 §10 firehose convergence** — fold the trace onto the *same* shared-memory
    firehose as the ring (one producer, many consumers), reconciling lossy-recorder vs.
@@ -252,10 +253,10 @@ Do not reintroduce it.
 
 | Word | Is | Lives in |
 |---|---|---|
-| **candidate** | a baseline anchor + an accumulating patch-set + a bound replay, with the no-patch run cached as its reference | `State.candidates` (796), 7 MCP tools |
+| **candidate** | ~~a baseline anchor + an accumulating patch-set + a bound replay~~ — removed (905); the daemon has no candidate store, the `runtime/candidate_*` RPCs are refused by name | a `sandbox/runMany` run: anchor + `patches` + `inputs` |
 | **branch** | ~~a second name for the same object~~ | — |
 
-**Decided here: a candidate is the branch.** 810 planned to own "the branch — its
+**Decided here (historical — the candidate store has since been removed, 905): a candidate is the branch.** 810 planned to own "the branch — its
 name, its patch-set, which scenario it serves, whether it won", and three of those
 four already exist as a candidate. Building a second object beside it would give the
 repo two things with one job, which is the trap 810 §4b was itself written about.
