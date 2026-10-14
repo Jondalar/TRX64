@@ -243,6 +243,29 @@ pub struct Rotation {
     /// explicit snapshot serializer (`drive_snapshot.rs`) never touches it, so it has
     /// no snapshot-parity impact.
     pub gcr_read_count: u64,
+
+    /// Spec 907 — bumped whenever the GCR bits of ANY track can have changed (a
+    /// head write, an attach, a detach, a snapshot restore). Keys
+    /// [`Rotation::block_region_at_head`]'s per-half-track block list, so a stale
+    /// list is never consulted. Not VICE state, never snapshotted.
+    track_gen: u64,
+    /// Spec 907 — the block list of ONE half-track: `(data_start_bit, sector, is_data)`
+    /// per sync whose block decodes as a header (0x08) or data block (0x07), in bit
+    /// order. See [`Rotation::block_region_at_head`].
+    region_cache: BlockRegionCache,
+}
+
+/// Cached block list of the half-track the head is on (Spec 907).
+#[derive(Clone, Default)]
+struct BlockRegionCache {
+    valid: bool,
+    half_track: u32,
+    gen: u64,
+    size: usize,
+    /// `(bit position where the block's data begins — the bit after its sync,
+    /// sector, is_data)`, ascending by bit position. A data block carries the
+    /// sector of the header that precedes it on the track.
+    blocks: Vec<(i64, u8, bool)>,
 }
 
 impl Default for Rotation {
@@ -315,6 +338,8 @@ impl Rotation {
             dirty_half_track: 0,
             writeback_gen: 0,
             gcr_read_count: 0,
+            track_gen: 0,
+            region_cache: BlockRegionCache::default(),
         }
     }
 
@@ -387,6 +412,7 @@ impl Rotation {
             return;
         }
         self.gcr_dirty_track = 1;
+        self.track_gen = self.track_gen.wrapping_add(1);
         // Record WHICH half-track was dirtied so the flush
         // (`drive_gcr_data_writeback`) serializes the right one. VICE keeps this
         // implicit via `current_half_track`; we snapshot it here because a write
@@ -545,6 +571,85 @@ impl Rotation {
         }
         // ts:78 — return -1.
         -1
+    }
+
+    /// Spec 907 — drop the cached block list. Call after anything that rewrites
+    /// `image.tracks` behind the rotation's back (a snapshot restore).
+    pub fn invalidate_block_regions(&mut self) {
+        self.track_gen = self.track_gen.wrapping_add(1);
+    }
+
+    /// Spec 907 — the block the head is IN (not the one it is approaching, which is
+    /// what [`sector_under_head`] reports): the last header or data sync at or before
+    /// the head's bit position, wrapping around the track. Returns
+    /// `(sector, in_data)`: `sector` is the one whose header the head last passed,
+    /// `in_data` is true once the head is past that sector's data sync (block id
+    /// 0x07). `None` = no header on this half-track (unformatted, empty, no image).
+    ///
+    /// The block list of the half-track is built once and cached; it is rebuilt only
+    /// when the half-track, the image's `track_gen` or the track size differs, so a
+    /// per-drive-instruction call is a binary search.
+    ///
+    /// [`sector_under_head`]: Rotation::sector_under_head
+    pub fn block_region_at_head(&mut self) -> Option<(u8, bool)> {
+        use crate::gcr::{gcr_decode_block, gcr_find_sync};
+        let idx = (self.current_half_track as usize).wrapping_sub(2);
+        let size = match self.image.as_ref().and_then(|img| img.tracks.get(idx)) {
+            Some(t) if !t.data.is_empty() && t.size != 0 => t.size,
+            _ => return None,
+        };
+        let c = &self.region_cache;
+        if !(c.valid && c.half_track == self.current_half_track && c.gen == self.track_gen && c.size == size) {
+            let raw = &self.image.as_ref().unwrap().tracks[idx];
+            let bits = (size as i64) * 8;
+            // (pos, header sector or None for a data block)
+            let mut found: Vec<(i64, Option<u8>)> = Vec::new();
+            let mut pos: i64 = 0;
+            while pos < bits {
+                let q = gcr_find_sync(raw, pos, bits - pos);
+                if q < pos {
+                    break;
+                }
+                let mut blk = [0u8; 4];
+                gcr_decode_block(raw, q, &mut blk, 1);
+                match blk[0] {
+                    0x08 => found.push((q, Some(blk[2]))),
+                    0x07 => found.push((q, None)),
+                    _ => {}
+                }
+                pos = q + 1;
+            }
+            // A data block belongs to the header before it, cyclically.
+            let mut blocks = Vec::with_capacity(found.len());
+            if let Some(last_hdr) = found.iter().rev().find_map(|f| f.1) {
+                let mut cur = last_hdr;
+                for (q, h) in found {
+                    match h {
+                        Some(sec) => {
+                            cur = sec;
+                            blocks.push((q, sec, false));
+                        }
+                        None => blocks.push((q, cur, true)),
+                    }
+                }
+            }
+            self.region_cache = BlockRegionCache {
+                valid: true,
+                half_track: self.current_half_track,
+                gen: self.track_gen,
+                size,
+                blocks,
+            };
+        }
+        let blocks = &self.region_cache.blocks;
+        if blocks.is_empty() {
+            return None;
+        }
+        let bits = (size as i64) * 8;
+        let h = ((self.gcr_head_offset as i64 % bits) + bits) % bits;
+        let n = blocks.partition_point(|b| b.0 <= h);
+        let b = if n == 0 { blocks[blocks.len() - 1] } else { blocks[n - 1] };
+        Some((b.1, b.2))
     }
 
     /// PORT OF: rotation.ts:482-665 (rotation.c:339-570 rotation_1541_gcr).
@@ -1141,6 +1246,7 @@ impl Rotation {
         writeback: Option<(Vec<u8>, WritebackKind, bool)>,
     ) {
         self.image = Some(image);
+        self.track_gen = self.track_gen.wrapping_add(1);
         self.gcr_image_loaded = 1;
         // VICE `drive_image_attach` (driveimage.c:222) decides HERE which of the
         // two rotation engines this medium runs on, and it re-decides on every
@@ -1234,6 +1340,7 @@ impl Rotation {
     pub fn detach(&mut self) {
         self.drive_gcr_data_writeback();
         self.image = None;
+        self.track_gen = self.track_gen.wrapping_add(1);
         self.gcr_image_loaded = 0;
         self.gcr_current_track_size = 0;
         self.gcr_head_offset = 0;

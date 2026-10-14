@@ -93,18 +93,20 @@ fn armed_head_trace_populates_during_real_load() {
     let reads = m.drain_block_reads();
     eprintln!("block-read (read-set) records during LOAD: {}", reads.len());
     assert!(!reads.is_empty(), "the read-set lane must record blocks the drive physically read");
-    for (clk, ht, sec, bytes) in &reads {
-        assert!((2..=84).contains(ht), "read-set halftrack {ht} in range (clk {clk})");
-        assert!(*sec <= 20, "read-set sector {sec} valid (0..20) — a gap (0xff) is never a read source");
-        assert!(*bytes > 0, "a read-set record always attributes >0 GCR bytes");
+    for r in &reads {
+        assert!((2..=84).contains(&r.half_track), "read-set halftrack {} in range (clk {})", r.half_track, r.drv_clk);
+        assert!(r.sector <= 20, "read-set sector {} valid (0..20) on a formatted track", r.sector);
+        assert!(r.header_bytes as u32 + r.data_bytes as u32 > 0, "a read-set record always attributes >0 GCR bytes");
     }
     // The directory lives on T18 — at least one block read there.
-    let read_t18 = reads.iter().filter(|(_, ht, _, _)| *ht == 36).count();
+    let read_t18 = reads.iter().filter(|r| r.half_track == 36).count();
     eprintln!("read-set records at T18 (ht36): {read_t18}");
     assert!(read_t18 > 0, "the read-set must record a block physically read at the directory track T18");
 
     // A second run WITHOUT arming must NOT accumulate (armed-on-command contract).
     m.arm_head_trace(false);
+    // Disarming closes the bucket still open; that one record is the armed run's.
+    let _ = m.drain_block_reads();
     inject_keys(&mut m, b"\r");
     m.run_for_full(1_000_000, &mut sink, |_, _, _, _, _, _, _| {});
     assert!(m.drain_head_trace().is_empty(), "disarmed → no head samples accumulate");

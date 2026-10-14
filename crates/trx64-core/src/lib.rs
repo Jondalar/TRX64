@@ -112,6 +112,22 @@ pub use vic::VicII;
 ///
 /// These are the values AT the access: `pc`/`clk` as the bus records them, and the
 /// registers as the executing core holds them at that instant.
+/// Spec 907 — one closed read-set bucket: the bytes the 1541 latched while the head
+/// was in one physical (half-track, sector), split into the header block's part and
+/// the data block's part. `drv_clk` is the drive's own clock and restarts at 0 on a
+/// drive cold reset; `c64_clk` is the C64 master clock at the same moment and is the
+/// one comparable with C64-side events. `sector` 0xff = the half-track has no header
+/// (all bytes are then counted as data).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BlockReadRecord {
+    pub drv_clk: u64,
+    pub c64_clk: u64,
+    pub half_track: u8,
+    pub sector: u8,
+    pub header_bytes: u16,
+    pub data_bytes: u16,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AccessCtx {
     pub pc: u16,
@@ -719,17 +735,22 @@ pub struct Machine {
     pub head_trace_armed: bool,
     pub head_trace: Vec<(u64, u8, u8)>,
     head_trace_last: Option<(u8, u8)>,
-    /// Spec 784 loader-lens READ-SET lane. Armed together with `head_trace`. On each
-    /// sector-under-head change, if the drive latched GCR bytes off the sector it is
-    /// LEAVING (`rotation.gcr_read_count` advanced since we entered it), a
-    /// `(drv_clk, halftrack, sector, bytes)` tuple is pushed — the ground truth of
-    /// which physical block the loader actually READ (not merely rotated past). The
-    /// daemon drains it → BLOCK_READ (0x35). Distinct from `head_trace` (every
-    /// transition) — this keeps ONLY the consumed sectors.
-    pub block_reads: Vec<(u64, u8, u8, u16)>,
-    /// `rotation.gcr_read_count` snapshot at the moment the head entered the CURRENT
-    /// sector. `gcr_read_count - sector_entry_read_count` = bytes read off it so far.
+    /// Spec 784/907 loader-lens READ-SET lane. Armed together with `head_trace`.
+    /// While armed, every sampled drive step computes the block the head is IN
+    /// ([`rotation::Rotation::block_region_at_head`]) and adds the GCR bytes the drive
+    /// latched since the previous sample to the open per-(half-track, sector) bucket,
+    /// as header bytes or data bytes. When (half-track, sector) changes the bucket is
+    /// closed into this list; [`Machine::flush_block_read`] closes the open one. The
+    /// daemon drains it → BLOCK_READ2 (0x37).
+    pub block_reads: Vec<BlockReadRecord>,
+    /// `rotation.gcr_read_count` at the previous sample; the delta to now is what
+    /// the current sample credits.
     sector_entry_read_count: u64,
+    /// The (half-track, sector) region of the previous sample (0xff = no header).
+    block_read_key: Option<(u8, u8)>,
+    /// The bucket collecting bytes for `block_read_key`; opened by the first latched
+    /// byte, so its clocks are those of that byte's sample.
+    block_read_open: Option<BlockReadRecord>,
     /// Spec 785 C1 — armed-on-command CARTRIDGE read-set (the bank analogue of the
     /// 1541 `block_reads` lane). OFF by default and never fed by the always-on
     /// rings: while armed, the bus hands `cart_read_set` to `FullBus`, which counts
@@ -808,6 +829,8 @@ impl Clone for Machine {
             head_trace: self.head_trace.clone(),
             head_trace_last: self.head_trace_last.clone(),
             block_reads: self.block_reads.clone(),
+            block_read_key: self.block_read_key,
+            block_read_open: self.block_read_open.clone(),
             sector_entry_read_count: self.sector_entry_read_count.clone(),
             cart_read_armed: self.cart_read_armed.clone(),
             cart_read_set: self.cart_read_set.clone(),
@@ -1000,6 +1023,8 @@ impl Machine {
             head_trace: Vec::new(),
             head_trace_last: None,
             block_reads: Vec::new(),
+            block_read_key: None,
+            block_read_open: None,
             sector_entry_read_count: 0,
             cart_read_armed: false,
             cart_read_set: crate::cart::CartReadSet::default(),
@@ -3730,18 +3755,33 @@ impl Machine {
     /// identical to [`run_for_capped`].
     ///
     /// `on_drive_step`: deduplicated drive-PC sample (for the drive8-cpu domain).
-    /// Spec 784 — arm/disarm the loader-lens head trace. Arming clears the buffer.
-    /// OFF by default; only the daemon's `drive-mechanism`-armed run turns it on.
+    /// Spec 784 — arm/disarm the loader-lens head trace. OFF by default; only the
+    /// daemon's `drive-mechanism`-armed run turns it on. Spec 907: only a
+    /// false→true transition clears the buffers and re-baselines, so a trace armed
+    /// at every `session/run` keeps a block read that spans two runs in ONE bucket.
+    /// A true→false transition closes the open bucket into `block_reads` first.
     pub fn arm_head_trace(&mut self, on: bool) {
-        self.head_trace_armed = on;
-        if on {
+        if on && !self.head_trace_armed {
             self.head_trace.clear();
             self.head_trace_last = None;
-            // Spec 784 read-set lane: clear + re-baseline the per-sector byte counter
-            // to the free-running drive count (only deltas are used, so any prior
-            // value is a valid baseline).
             self.block_reads.clear();
+            self.block_read_key = None;
+            self.block_read_open = None;
             self.sector_entry_read_count = self.drive8.rotation.gcr_read_count;
+        } else if !on && self.head_trace_armed {
+            self.flush_block_read();
+        }
+        self.head_trace_armed = on;
+    }
+
+    /// Spec 907 — close the open read-set bucket into `block_reads`. Called at trace
+    /// stop (the daemon's finalize) and on disarm, so a read still in progress is
+    /// reported with the bytes it has so far instead of being dropped.
+    pub fn flush_block_read(&mut self) {
+        if let Some(b) = self.block_read_open.take() {
+            if b.header_bytes as u32 + b.data_bytes as u32 > 0 {
+                self.block_reads.push(b);
+            }
         }
     }
 
@@ -3751,11 +3791,41 @@ impl Machine {
         std::mem::take(&mut self.head_trace)
     }
 
-    /// Spec 784 — take the accumulated `(drv_clk, halftrack, sector, bytes)` read-set
-    /// records (one per sector the drive latched ≥1 GCR byte off). The ORDERED list of
-    /// physical blocks the loader actually READ.
-    pub fn drain_block_reads(&mut self) -> Vec<(u64, u8, u8, u16)> {
+    /// Spec 784/907 — take the closed read-set buckets, in the order they were
+    /// opened: the physical blocks the loader actually READ, with header and data
+    /// bytes apart. The open bucket stays open (see [`Machine::flush_block_read`]).
+    pub fn drain_block_reads(&mut self) -> Vec<BlockReadRecord> {
         std::mem::take(&mut self.block_reads)
+    }
+
+    /// Spec 907 — one sampled drive step of the read-set lane.
+    fn sample_block_read(&mut self, drv_clk: u64) {
+        let ht = self.drive8.rotation.current_half_track as u8;
+        let region = self.drive8.rotation.block_region_at_head();
+        let (sec, in_data) = match region {
+            Some((s, d)) => (s, d),
+            None => (0xff, true),
+        };
+        let now = self.drive8.rotation.gcr_read_count;
+        let delta = now.wrapping_sub(self.sector_entry_read_count).min(0xffff) as u16;
+        self.sector_entry_read_count = now;
+        if self.block_read_key != Some((ht, sec)) {
+            self.flush_block_read();
+            self.block_read_key = Some((ht, sec));
+        }
+        if delta > 0 {
+            let c64_clk = self.c64_core.clk;
+            let b = self.block_read_open.get_or_insert(BlockReadRecord {
+                drv_clk,
+                c64_clk,
+                half_track: ht,
+                sector: sec,
+                header_bytes: 0,
+                data_bytes: 0,
+            });
+            let f = if in_data { &mut b.data_bytes } else { &mut b.header_bytes };
+            *f = f.saturating_add(delta);
+        }
     }
 
     /// Spec 785 C1 — arm/disarm the CARTRIDGE read-set. Arming clears it. OFF by
@@ -4123,26 +4193,11 @@ impl Machine {
                     let s = self.drive8.rotation.sector_under_head();
                     let sec = if s < 0 { 0xff } else { s as u8 };
                     if self.head_trace_last != Some((ht, sec)) {
-                        // READ-SET lane: the sector we are LEAVING was physically READ
-                        // iff the drive latched GCR bytes off it while over it. Attribute
-                        // those bytes to the OLD (halftrack, sector), then re-baseline for
-                        // the new sector. A rotation gap (0xff) is never a read source.
-                        let now = self.drive8.rotation.gcr_read_count;
-                        if let Some((old_ht, old_sec)) = self.head_trace_last {
-                            let bytes = now.wrapping_sub(self.sector_entry_read_count);
-                            if old_sec != 0xff && bytes > 0 {
-                                self.block_reads.push((
-                                    drv_clk,
-                                    old_ht,
-                                    old_sec,
-                                    bytes.min(0xffff) as u16,
-                                ));
-                            }
-                        }
-                        self.sector_entry_read_count = now;
                         self.head_trace.push((drv_clk, ht, sec));
                         self.head_trace_last = Some((ht, sec));
                     }
+                    // Spec 907 — read-set lane, credited to the block the head is IN.
+                    self.sample_block_read(drv_clk);
                 }
             }
             // A reset the cartridge asked for during this instruction (EasyFlash 3: `$DE0F`

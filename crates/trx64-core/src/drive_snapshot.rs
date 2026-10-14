@@ -785,6 +785,7 @@ pub fn restore_drive_disk_image(drive: &mut Drive1541, blob: &[u8]) -> Result<()
             t.size = 0;
         }
     }
+    drive.rotation.invalidate_block_regions();
     // Which rotation engine runs: a D64 starts on the simple one and switches to the
     // GCR circuit for good at its first write (rotation.c:1098); a G64 runs the
     // circuit from the attach. VICE's drive_snapshot_read_gcrimage_module sets 1
