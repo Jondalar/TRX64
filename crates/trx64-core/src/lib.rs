@@ -112,6 +112,17 @@ pub use vic::VicII;
 ///
 /// These are the values AT the access: `pc`/`clk` as the bus records them, and the
 /// registers as the executing core holds them at that instant.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AccessCtx {
+    pub pc: u16,
+    pub clk: u64,
+    pub a: u8,
+    pub x: u8,
+    pub y: u8,
+    pub sp: u8,
+    pub p: u8,
+}
+
 /// Spec 907 — one closed read-set bucket: the bytes the 1541 latched while the head
 /// was in one physical (half-track, sector), split into the header block's part and
 /// the data block's part. `drv_clk` is the drive's own clock and restarts at 0 on a
@@ -126,17 +137,6 @@ pub struct BlockReadRecord {
     pub sector: u8,
     pub header_bytes: u16,
     pub data_bytes: u16,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct AccessCtx {
-    pub pc: u16,
-    pub clk: u64,
-    pub a: u8,
-    pub x: u8,
-    pub y: u8,
-    pub sp: u8,
-    pub p: u8,
 }
 
 /// - `ProbeSet` (Phase 2) — mutation-search verdicts, no firehose.

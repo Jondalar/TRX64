@@ -606,8 +606,23 @@ impl Rotation {
             let mut found: Vec<(i64, Option<u8>)> = Vec::new();
             let mut pos: i64 = 0;
             while pos < bits {
-                let q = gcr_find_sync(raw, pos, bits - pos);
+                // Search past the track end (the scan wraps to bit 0) so a sync that
+                // straddles the index is found once, at the bit after it.
+                let q = gcr_find_sync(raw, pos, bits - pos + 16);
+                if q < 0 {
+                    break;
+                }
                 if q < pos {
+                    if found.first().is_some_and(|f| f.0 == q) {
+                        break;
+                    }
+                    let mut blk = [0u8; 4];
+                    gcr_decode_block(raw, q, &mut blk, 1);
+                    match blk[0] {
+                        0x08 => found.insert(0, (q, Some(blk[2]))),
+                        0x07 => found.insert(0, (q, None)),
+                        _ => {}
+                    }
                     break;
                 }
                 let mut blk = [0u8; 4];
@@ -1457,6 +1472,57 @@ mod tests {
 
     fn blank_image() -> GcrImage {
         GcrImage::from_d64(&vec![0u8; 683 * 256])
+    }
+
+    /// Spec 907 — the head over header N's bits reports N (header part), over data N's
+    /// bits N (data part); never the sector ahead.
+    #[test]
+    fn block_region_is_the_block_the_head_is_in() {
+        let mut r = Rotation::new();
+        r.attach(blank_image(), 0);
+        let idx = (r.current_half_track as usize) - 2;
+        let raw = r.image.as_ref().unwrap().tracks[idx].clone();
+        let bits = (raw.size as i64) * 8;
+        let h0 = crate::gcr::gcr_find_sync(&raw, 0, bits);
+        let d0 = crate::gcr::gcr_find_sync(&raw, h0, bits);
+        let h1 = crate::gcr::gcr_find_sync(&raw, d0, bits);
+        let mut hdr = [0u8; 4];
+        crate::gcr::gcr_decode_block(&raw, h0, &mut hdr, 1);
+        let n = hdr[2];
+        r.gcr_head_offset = (h0 + 40) as u32;
+        assert_eq!(r.block_region_at_head(), Some((n, false)));
+        r.gcr_head_offset = (d0 + 40) as u32;
+        assert_eq!(r.block_region_at_head(), Some((n, true)));
+        r.gcr_head_offset = (h1 - 20) as u32;
+        assert_eq!(r.block_region_at_head(), Some((n, true)), "still in data N just before header N+1");
+    }
+
+    /// Spec 907 — a sync that straddles the track's index (its ones split between the
+    /// end and the start of the track) still starts a block.
+    #[test]
+    fn block_region_finds_a_sync_across_the_index() {
+        let mut r = Rotation::new();
+        r.attach(blank_image(), 0);
+        let idx = (r.current_half_track as usize) - 2;
+        let (h0, n) = {
+            let raw = &r.image.as_ref().unwrap().tracks[idx];
+            let bits = (raw.size as i64) * 8;
+            let h0 = crate::gcr::gcr_find_sync(raw, 0, bits);
+            let mut hdr = [0u8; 4];
+            crate::gcr::gcr_decode_block(raw, h0, &mut hdr, 1);
+            (h0, hdr[2])
+        };
+        assert!(h0 >= 16 && h0 % 8 == 0, "first header sync ends on a byte boundary");
+        // Rotate the track so only one byte of that sync's ones stays at the start.
+        let k = (h0 / 8 - 1) as usize;
+        {
+            let t = &mut r.image.as_mut().unwrap().tracks[idx];
+            t.data[..t.size].rotate_left(k);
+        }
+        r.invalidate_block_regions();
+        let start = 8i64; // the header block now begins one byte into the track
+        r.gcr_head_offset = (start + 40) as u32;
+        assert_eq!(r.block_region_at_head(), Some((n, false)));
     }
 
     #[test]

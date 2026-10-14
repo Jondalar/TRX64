@@ -556,3 +556,14 @@ shared machine, patched it there and left it patched.
 **Decision:** trying variants never moves the shared machine. Patches + inputs + anchor run in
 sandboxes, many at once; what a candidate *was* is meaning and memory and lives in C64RE.
 Removing the RPCs is breaking, so the release that carries this is a minor.
+
+## A block read is filed under its own sector — 907
+
+The 1541 read-set credits the bytes a loader latches to the sector whose header the head last
+passed — not the one ahead — with header and data bytes apart, and nothing is lost across
+`session/run` calls or at trace stop. The new record BLOCK_READ2 (0x37) carries the C64 clock
+next to the drive clock; 0x35 still decodes.
+
+**Decision:** the C64 clock goes into the record rather than an offset, because the drive and
+the C64 run at different rates and a drive reset restarts the drive clock. A custom loader that
+reads one block after a standard header is now credited to that block's sector.
