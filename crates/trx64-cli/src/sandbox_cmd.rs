@@ -15,7 +15,9 @@
 //! (`Observer::on_io_store`, fed from `FullBus::wr_land == LAND_IO`). Addresses never
 //! stored to in I/O keep their raw-RAM byte, so RAM under I/O is untouched, and stores
 //! made with I/O banked out are plain RAM and need no overlay. Each harvest range lists
-//! the overlaid bytes as `ioWritten` runs in the JSON; `writtenRuns` is unchanged.
+//! the overlaid bytes as `ioWritten` runs in the JSON; `writtenRuns` is unchanged. When
+//! a range has `ioWritten` runs it also carries `ramHex`: the same range with NO overlay,
+//! i.e. what RAM actually holds there, for a caller that wants the RAM image.
 //!
 //! Two entry mechanisms:
 //!
@@ -399,6 +401,11 @@ struct SandboxObs {
     /// store landed in I/O, and whether it ever did. Armed like `written`.
     io_last: Box<[u8]>,
     io_seen: Box<[bool]>,
+    /// Bus writes per address vs. stores that landed in I/O: a surplus of bus writes means
+    /// at least one store hit RAM (an I/O store is also a bus write, so it cannot be told
+    /// apart from `written` alone). Armed like `written`.
+    bus_writes: Box<[u32]>,
+    io_stores: Box<[u32]>,
 }
 
 impl SandboxObs {
@@ -412,6 +419,8 @@ impl SandboxObs {
             written: vec![false; 0x1_0000].into_boxed_slice(),
             io_last: vec![0; 0x1000].into_boxed_slice(),
             io_seen: vec![false; 0x1000].into_boxed_slice(),
+            bus_writes: vec![0; 0x1_0000].into_boxed_slice(),
+            io_stores: vec![0; 0x1000].into_boxed_slice(),
         }
     }
 
@@ -432,6 +441,20 @@ impl SandboxObs {
             }
         }
         (bytes, contiguous_runs(&hit))
+    }
+
+    /// Sorted contiguous runs of the addresses the routine stored to in RAM — `runs()` minus
+    /// the addresses it only ever stored to in I/O space.
+    fn ram_runs(&self) -> Vec<(u16, u16)> {
+        let addrs: Vec<u16> = (0..0x1_0000usize)
+            .filter(|&a| {
+                self.written[a]
+                    && (!(0xd000..0xe000).contains(&a)
+                        || self.bus_writes[a] > self.io_stores[a - 0xd000])
+            })
+            .map(|a| a as u16)
+            .collect();
+        contiguous_runs(&addrs)
     }
 
     /// Sorted contiguous runs of the written address set.
@@ -469,6 +492,7 @@ impl Observer for SandboxObs {
             self.write_lo = Some(self.write_lo.map_or(addr, |lo| lo.min(addr)));
             self.write_hi = Some(self.write_hi.map_or(addr, |hi| hi.max(addr)));
             self.written[addr as usize] = true;
+            self.bus_writes[addr as usize] += 1;
         }
     }
     fn on_io_store(&mut self, addr: u16, value: u8, pc: u16) {
@@ -480,6 +504,7 @@ impl Observer for SandboxObs {
             if i < 0x1000 {
                 self.io_last[i] = value;
                 self.io_seen[i] = true;
+                self.io_stores[i] += 1;
             }
         }
     }
@@ -500,6 +525,8 @@ struct SandboxOutcome {
     steps: u64,
     written_span: Option<(u16, u16)>,
     runs: Vec<(u16, u16)>,
+    /// `runs` without the addresses that were only ever stored to in I/O space.
+    ram_runs: Vec<(u16, u16)>,
     final_a: u8,
     final_x: u8,
     final_y: u8,
@@ -513,6 +540,10 @@ struct SandboxOutcome {
     /// Per harvest range (same order): the runs whose bytes are the CPU's I/O stores
     /// rather than RAM.
     harvest_io: Vec<Vec<(u16, u16)>>,
+    /// Per harvest range (same order): the RAM bytes of the range WITHOUT the I/O overlay —
+    /// what RAM actually holds under `$D000-$DFFF`. `None` when no store landed in I/O
+    /// there (the overlaid bytes then equal raw RAM, so nothing is repeated).
+    harvest_ram: Vec<Option<Vec<u8>>>,
     /// Stream bytes consumed by `--stream-hook` fires (TS `SandboxRunResult.streamPos`).
     stream_pos: usize,
 }
@@ -651,6 +682,15 @@ pub fn run_sandbox(args: &SandboxArgs) -> Result<String, String> {
                 .iter()
                 .map(|(lo, hi)| json!({ "lo": lo, "hi": hi }))
                 .collect::<Vec<_>>(),
+            // The same write-map without the addresses the routine stored to ONLY in I/O
+            // space ($D000-$DFFF with I/O banked in): the RAM the routine wrote. An address
+            // stored to both ways stays in. A reader that wants the RAM image takes these runs
+            // and each harvest's `ramHex`.
+            "ramWrittenRuns": outcome
+                .ram_runs
+                .iter()
+                .map(|(lo, hi)| json!({ "lo": lo, "hi": hi }))
+                .collect::<Vec<_>>(),
             // Registers at stop (TS SandboxRunResult.finalState).
             "finalRegs": {
                 "a": outcome.final_a,
@@ -668,16 +708,21 @@ pub fn run_sandbox(args: &SandboxArgs) -> Result<String, String> {
                 "len": outcome.harvest.len(),
                 "hex": hex(&outcome.harvest),
                 "ioWritten": outcome.harvest_io.first().cloned().unwrap_or_default(),
+                "ramHex": outcome.harvest_ram.first().and_then(|r| r.as_ref()).map(|b| hex(b)),
             },
             // ALL harvest ranges (--harvest repeatable).
             // `ioWritten`: [[lo,hi],..] runs inside the range whose bytes are what the
-            // CPU stored into I/O space (not RAM); empty when none.
+            // CPU stored into I/O space (not RAM); empty when none. `ramHex`: the same
+            // range as RAM holds it, without that overlay — present only when `ioWritten`
+            // is non-empty, null otherwise.
             "harvests": outcome
                 .harvests
                 .iter()
                 .zip(&outcome.harvest_io)
-                .map(|((addr, bytes), io)| {
-                    json!({ "addr": addr, "len": bytes.len(), "hex": hex(bytes), "ioWritten": io })
+                .zip(&outcome.harvest_ram)
+                .map(|(((addr, bytes), io), ram)| {
+                    json!({ "addr": addr, "len": bytes.len(), "hex": hex(bytes), "ioWritten": io,
+                            "ramHex": ram.as_ref().map(|b| hex(b)) })
                 })
                 .collect::<Vec<_>>(),
         });
@@ -940,14 +985,19 @@ fn execute_sandbox(m: &mut Machine, args: &SandboxArgs) -> SandboxOutcome {
         _ => None,
     };
     let runs = obs.runs();
+    let ram_runs = obs.ram_runs();
 
     // Harvest every requested range: the raw RAM slice (banking ignored) with the
     // routine's I/O stores overlaid (`SandboxObs::harvest`). The first range is the
     // back-compat single `harvest`.
     let mut harvests: Vec<(u16, Vec<u8>)> = Vec::new();
     let mut harvest_io: Vec<Vec<(u16, u16)>> = Vec::new();
+    let mut harvest_ram: Vec<Option<Vec<u8>>> = Vec::new();
     for &(addr, len) in &args.harvests {
         let (bytes, io) = obs.harvest(&m.ram[..], addr, len);
+        let start = addr as usize;
+        let end = (start + len).min(0x1_0000);
+        harvest_ram.push(if io.is_empty() { None } else { Some(m.ram[start..end].to_vec()) });
         harvests.push((addr, bytes));
         harvest_io.push(io);
     }
@@ -961,6 +1011,7 @@ fn execute_sandbox(m: &mut Machine, args: &SandboxArgs) -> SandboxOutcome {
         steps,
         written_span,
         runs,
+        ram_runs,
         final_a: m.c64_core.reg_a,
         final_x: m.c64_core.reg_x,
         final_y: m.c64_core.reg_y,
@@ -970,6 +1021,7 @@ fn execute_sandbox(m: &mut Machine, args: &SandboxArgs) -> SandboxOutcome {
         harvest,
         harvests,
         harvest_io,
+        harvest_ram,
         stream_pos,
     }
 }
@@ -1535,6 +1587,7 @@ mod tests {
         let Some(rom_dir) = rom_dir_or_skip() else { return };
         let mut m = booted(&rom_dir);
         m.ram[0xd021] = 0x00;
+        m.ram[0xd020] = 0x06; // RAM under I/O that the routine then hides behind an I/O store
         m.ram[0xd019] = 0xab; // RAM under I/O, never stored to in I/O
         m.ram[0xd802] = 0xcd;
         let routine = [
@@ -1556,6 +1609,46 @@ mod tests {
         assert_eq!(h[0x019], 0xab, "RAM under I/O keeps its raw byte");
         assert_eq!(h[0x802], 0xcd);
         assert_eq!(out.harvest_io[0], vec![(0xd020, 0xd020), (0xd801, 0xd801)]);
+        assert!(
+            !out.ram_runs.iter().any(|&(lo, hi)| lo <= 0xd020 && 0xd020 <= hi),
+            "an address stored to only in I/O is not a RAM run"
+        );
+        // The un-overlaid RAM image is carried alongside: RAM under the I/O stores is intact.
+        let ram = out.harvest_ram[0].as_ref().expect("ioWritten non-empty => raw RAM carried");
+        assert_eq!(ram[0x020], 0x06, "RAM under $D020 is what RAM held, not the I/O store");
+        assert_eq!(ram[0x801], 0x00, "RAM under $D801 is untouched by the I/O store");
+        assert_eq!(ram[0x019], 0xab);
+    }
+
+    /// A store to RAM with I/O banked out, then an I/O store to the same address: the RAM
+    /// image keeps the RAM value, the address is in `ramWrittenRuns`, and the harvest
+    /// overlay still shows the I/O value.
+    #[test]
+    fn ram_store_then_io_store_keeps_the_ram_byte_in_the_ram_image() {
+        let Some(rom_dir) = rom_dir_or_skip() else { return };
+        let mut m = booted(&rom_dir);
+        let routine = [
+            0xa9, 0x34, 0x85, 0x01, // LDA #$34 / STA $01   (all RAM)
+            0xa9, 0x06, 0x8d, 0x20, 0xd0, // LDA #$06 / STA $d020 (RAM)
+            0xa9, 0x37, 0x85, 0x01, // LDA #$37 / STA $01   (I/O in)
+            0xa9, 0x0e, 0x8d, 0x20, 0xd0, // LDA #$0e / STA $d020 (I/O)
+            0x8d, 0x21, 0xd0, // STA $d021 (I/O only)
+            0x60,
+        ];
+        m.poke(0xc000, &routine);
+        let mut args = base_args(rom_dir);
+        args.entry = 0xc000;
+        args.zp = vec![(0x0001, 0x37)];
+        args.direct_entry = true;
+        args.harvests = vec![(0xd000, 0x1000)];
+        let out = execute_sandbox(&mut m, &args);
+        assert_eq!(out.harvests[0].1[0x020], 0x0e, "the overlay shows the CPU's I/O store");
+        let ram = out.harvest_ram[0].as_ref().expect("raw RAM carried");
+        assert_eq!(ram[0x020], 0x06, "the RAM image keeps the value stored to RAM");
+        let in_ram = |a: u16| out.ram_runs.iter().any(|&(lo, hi)| lo <= a && a <= hi);
+        assert!(in_ram(0xd020), "$D020 was stored to in RAM too");
+        assert!(!in_ram(0xd021), "$D021 was only ever stored to in I/O");
+        assert!(out.runs.iter().any(|&(lo, hi)| lo <= 0xd021 && 0xd021 <= hi), "writtenRuns is unchanged");
     }
 
     /// The DEFAULT stub path is unchanged: no direct-entry/regs ⇒ `jsr entry` stub,
