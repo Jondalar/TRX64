@@ -263,7 +263,7 @@ impl Session {
         for (pos, dev) in [(trx64_core::drive::DrivePosition::A, fdc_a), (trx64_core::drive::DrivePosition::B, fdc_b)] {
             if let Some(dev) = dev {
                 if let Err(e) = machine.attach_fdc_controller(pos, dev) {
-                    eprintln!("[session] power_on: {e}");
+                    trx64_core::elog!("[session] power_on: {e}");
                 }
             }
         }

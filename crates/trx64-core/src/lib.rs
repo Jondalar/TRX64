@@ -7,6 +7,18 @@
 //! Hot-path rule: the core takes a generic `O: Observer` (monomorphized, zero-cost
 //! when unused). It NEVER calls back into another process per event.
 
+/// A log line on stderr that never takes the process down. `eprintln!` panics when the
+/// write fails — a closed pipe (EPIPE) after the launcher that read stderr went away —
+/// and a daemon's panic hook that logs the same way then aborts. A lost log line is not
+/// worth the machine: the write error is dropped.
+#[macro_export]
+macro_rules! elog {
+    ($($arg:tt)*) => {{
+        use ::std::io::Write as _;
+        let _ = ::std::writeln!(::std::io::stderr(), $($arg)*);
+    }};
+}
+
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -4205,7 +4217,7 @@ impl Machine {
             if cart_touched {
                 if self.cartridge.as_mut().is_some_and(|c| c.take_reset_request()) {
                     if let Some(n) = self.cartridge.as_ref().and_then(|c| c.ef3_status()).and_then(|s| s.notice) {
-                        eprintln!("trx64: {n}");
+                        crate::elog!("trx64: {n}");
                     }
                     self.cart_generated_reset();
                 }

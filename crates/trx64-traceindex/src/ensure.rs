@@ -153,7 +153,11 @@ pub fn start_background_index(
             Ok(res) => j.settle(JobState::Done(res)),
             Err(e) => {
                 let msg = e.to_string();
-                eprintln!("[trace] background index failed for {}: {msg}", duckdb.display());
+                // A closed stderr must not panic the indexer thread (EPIPE): drop the error.
+                let _ = std::io::Write::write_fmt(
+                    &mut std::io::stderr(),
+                    format_args!("[trace] background index failed for {}: {msg}\n", duckdb.display()),
+                );
                 j.settle(JobState::Failed(msg));
             }
         });

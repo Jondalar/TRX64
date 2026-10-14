@@ -1123,7 +1123,7 @@ fn rom_dir() -> PathBuf {
     if let Ok(exe) = env::current_exe() {
         if let Some(dir) = exe.parent() {
             if let Some(msg) = trx64_core::user_dir::seed_user_roms_from(&dir.join("roms")) {
-                eprintln!("[trx64] {msg}");
+                trx64_core::elog!("[trx64] {msg}");
             }
         }
     }
@@ -1705,7 +1705,7 @@ fn do_power_on(st: &mut State) {
     let roms = rom_dir();
     if let Err(e) = st.session.power_on(&roms) {
         // Don't SWALLOW a ROM-load failure into a dead machine (PC=$0000) — surface it.
-        eprintln!(
+        trx64_core::elog!(
             "[trx64] power_on FAILED (roms at {}): {e:?} — machine left WITHOUT ROMs",
             roms.display()
         );
@@ -1810,7 +1810,7 @@ fn power_cycle_for_restore(st: &mut State) {
     st.session.power_off();
     let roms = rom_dir();
     if let Err(e) = st.session.power_on(&roms) {
-        eprintln!(
+        trx64_core::elog!(
             "[trx64] power_on FAILED (roms at {}): {e:?} — machine left WITHOUT ROMs",
             roms.display()
         );
@@ -2027,7 +2027,7 @@ fn run_cycle_budget(session: &mut Session, budget: u64) {
         t.event_count += obs.event_count;
         t.buf.extend_from_slice(&obs.into_buf());
         if let Err(e) = t.spill(false) {
-            eprintln!("[trx64] trace: cannot append to {}: {e}", t.retrace_path.display());
+            trx64_core::elog!("[trx64] trace: cannot append to {}: {e}", t.retrace_path.display());
         }
     }
 }
@@ -2883,7 +2883,7 @@ fn run_until_break(
                     t.event_count += tracing.event_count;
                     t.buf.extend_from_slice(&tracing.into_buf());
                     if let Err(e) = t.spill(false) {
-                        eprintln!("[trx64] trace: cannot append to {}: {e}", t.retrace_path.display());
+                        trx64_core::elog!("[trx64] trace: cannot append to {}: {e}", t.retrace_path.display());
                     }
                 }
                 s
@@ -5591,7 +5591,7 @@ fn finalize_trace(st: &mut State, background_index: bool) -> (Value, Value) {
                 t.buf = FrameSink::with_header(&t.meta_json).buf;
             }
             if let Err(e) = t.spill(true) {
-                eprintln!("[trx64] trace: cannot write {}: {e}", t.retrace_path.display());
+                trx64_core::elog!("[trx64] trace: cannot write {}: {e}", t.retrace_path.display());
             }
             let bytes_written = t.total_bytes() as usize;
             // T2.6 — mirror TS TraceRunController.lastStorePath / lastRunId set in stop().
@@ -13075,7 +13075,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             let mut file_path_opt = None;
             if let Some(scen_dir) = scenarios_dir() {
                 if let Err(e) = fs::create_dir_all(&scen_dir) {
-                    eprintln!("Failed to create scenarios dir: {}", e);
+                    trx64_core::elog!("Failed to create scenarios dir: {}", e);
                 } else {
                     let file_path = scen_dir.join(format!("{}.json", sid));
                     match fs::write(
@@ -13083,7 +13083,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                         serde_json::to_string_pretty(&saved).unwrap_or_default()
                     ) {
                         Ok(_) => file_path_opt = Some(file_path.to_string_lossy().to_string()),
-                        Err(e) => eprintln!("Failed to write scenario file: {}", e),
+                        Err(e) => trx64_core::elog!("Failed to write scenario file: {}", e),
                     }
                 }
             }
@@ -13756,12 +13756,12 @@ fn persist_media_before_exit(st: &mut State) -> (Option<String>, Vec<String>) {
     let cart_path = st.session.cart_path.clone();
     let cart = persist_cart_for_eject(st, &cart_path);
     if let Some(p) = &cart {
-        eprintln!("[trx64] persisted cartridge -> {p}");
+        trx64_core::elog!("[trx64] persisted cartridge -> {p}");
     }
     let mut disks = Vec::new();
     for pos in [DrivePosition::A, DrivePosition::B] {
         if let Some(p) = persist_outgoing_disk_at(st, pos) {
-            eprintln!("[trx64] persisted disk -> {p}");
+            trx64_core::elog!("[trx64] persisted disk -> {p}");
             disks.push(p);
         }
     }
@@ -13790,7 +13790,7 @@ fn shutdown_now(state: &SharedState, reason: &str) -> Result<(Value, bool), Stri
     let trace = if run.is_null() { Value::Null } else { json!(st.last_trace_path) };
     let (cart, disks) = persist_media_before_exit(&mut st);
     drop(st);
-    eprintln!("[trx64] shutting down ({reason})");
+    trx64_core::elog!("[trx64] shutting down ({reason})");
     let out = json!({
         "ok": true,
         "persisted": { "cartridge": cart, "disks": disks },
@@ -13816,7 +13816,7 @@ fn spawn_signal_watch(state: SharedState) {
         let (Ok(mut term), Ok(mut int)) =
             (signal(SignalKind::terminate()), signal(SignalKind::interrupt()))
         else {
-            eprintln!("[trx64] cannot install SIGTERM/SIGINT handlers");
+            trx64_core::elog!("[trx64] cannot install SIGTERM/SIGINT handlers");
             return;
         };
         tokio::spawn(async move {
@@ -13834,7 +13834,7 @@ fn spawn_signal_watch(state: SharedState) {
             tokio::signal::windows::ctrl_break(),
             tokio::signal::windows::ctrl_close(),
         ) else {
-            eprintln!("[trx64] cannot install console handlers");
+            trx64_core::elog!("[trx64] cannot install console handlers");
             return;
         };
         tokio::spawn(async move {
@@ -18335,12 +18335,12 @@ async fn handle_connection(
     let ws = match accept_hdr_async(stream, read_query).await {
         Ok(ws) => ws,
         Err(e) => {
-            eprintln!("[trx64] WS handshake failed from {addr}: {e}");
+            trx64_core::elog!("[trx64] WS handshake failed from {addr}: {e}");
             return;
         }
     };
 
-    eprintln!("[trx64] client connected: {addr}");
+    trx64_core::elog!("[trx64] client connected: {addr}");
     let (mut tx, mut rx) = ws.split();
 
     // All outbound messages (JSON-RPC responses AND the live A/V binary push) funnel
@@ -18391,7 +18391,7 @@ async fn handle_connection(
         let msg = match msg {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("[trx64] recv error from {addr}: {e}");
+                trx64_core::elog!("[trx64] recv error from {addr}: {e}");
                 break;
             }
         };
@@ -18432,7 +18432,7 @@ async fn handle_connection(
         if shutting_down && response.error.is_none() {
             let _ = out_tx.send(Message::Close(None));
             let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut writer).await;
-            eprintln!("[trx64] reply flushed to {addr}; exiting");
+            trx64_core::elog!("[trx64] reply flushed to {addr}; exiting");
             std::process::exit(0);
         }
     }
@@ -18443,7 +18443,7 @@ async fn handle_connection(
     drop(out_tx);
     writer.abort();
 
-    eprintln!("[trx64] client disconnected: {addr}");
+    trx64_core::elog!("[trx64] client disconnected: {addr}");
 }
 
 // ── Embeddable construction (shared by the daemon `main` AND the FFI lib) ──────
@@ -18883,7 +18883,7 @@ async fn main() {
         let p = crash_log_path.clone();
         std::panic::set_hook(Box::new(move |info| {
             let msg = format!("[trx64] PANIC: {info}\n");
-            eprintln!("{}", msg);
+            trx64_core::elog!("{}", msg);
             if let Some(parent) = p.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -18893,7 +18893,7 @@ async fn main() {
 
     let cli = Cli::parse();
 
-    eprintln!("[trx64] project = {:?}", cli.project);
+    trx64_core::elog!("[trx64] project = {:?}", cli.project);
 
     // Take the port FIRST, before any machine work. Several C64RE servers warm-start a
     // daemon on the same port at once; the losers must do nothing and leave quietly so
@@ -18909,18 +18909,18 @@ async fn main() {
     let addr: SocketAddr = match format!("{bind_host}:{}", cli.port).parse() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("[trx64] invalid --bind '{bind_host}': {e}");
+            trx64_core::elog!("[trx64] invalid --bind '{bind_host}': {e}");
             std::process::exit(2);
         }
     };
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            eprintln!("[trx64] port {} already owned by another runtime — exiting cleanly", cli.port);
+            trx64_core::elog!("[trx64] port {} already owned by another runtime — exiting cleanly", cli.port);
             std::process::exit(0);
         }
         Err(e) => {
-            eprintln!("[trx64] cannot listen on {addr}: {e}");
+            trx64_core::elog!("[trx64] cannot listen on {addr}: {e}");
             std::process::exit(1);
         }
     };
@@ -18929,19 +18929,19 @@ async fn main() {
     // makes is made on this row. The model file is checked here so a broken one is a clean
     // exit, and a row that needs a block this build lacks is refused by name.
     if let Err(e) = trx64_core::model::check() {
-        eprintln!("[trx64] {e}");
+        trx64_core::elog!("[trx64] {e}");
         std::process::exit(2);
     }
     let model_name = cli.video.as_deref().unwrap_or(&cli.model);
     let model = match trx64_core::model::resolve(model_name) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("[trx64] --model: {e}");
+            trx64_core::elog!("[trx64] --model: {e}");
             std::process::exit(2);
         }
     };
     if !model.is_default() {
-        eprintln!(
+        trx64_core::elog!(
             "[trx64] model = {} ({}, VIC-II {}, {} × {} at {} Hz)",
             model.name,
             model.video.name(),
@@ -18954,13 +18954,13 @@ async fn main() {
 
     // Boot the singleton session.
     let roms = rom_dir();
-    eprintln!("[trx64] loading ROMs from {}", roms.display());
+    trx64_core::elog!("[trx64] loading ROMs from {}", roms.display());
 
     let mut session = Session::new_with_model("integrated-1", model);
     session.rom_dirs = rom_candidates();
     match session.boot(&roms) {
         Ok(()) => {
-            eprintln!(
+            trx64_core::elog!(
                 "[trx64] boot ok — reset pc = 0x{:04X} ({})",
                 session.machine.cpu.pc,
                 session.machine.cpu.pc
@@ -18968,7 +18968,7 @@ async fn main() {
         }
         Err(e) => {
             // `/.dockerenv` is the cheap, long-standing marker for "this is a container".
-            eprint!("{}", rom_missing_report(&roms, &e, std::path::Path::new("/.dockerenv").exists()));
+            trx64_core::elog!("{}", rom_missing_report(&roms, &e, std::path::Path::new("/.dockerenv").exists()).trim_end());
         }
     }
 
@@ -18979,11 +18979,11 @@ async fn main() {
     let streaming_on = !cli.headless;
     // Spec 851 D1 — the machine is set before any client can make it run.
     let Some(machine_profile) = trx64_core::vic::SpeedProfile::parse(&cli.machine) else {
-        eprintln!("[trx64] --machine: unknown '{}' (c64 | u64 | 128)", cli.machine);
+        trx64_core::elog!("[trx64] --machine: unknown '{}' (c64 | u64 | 128)", cli.machine);
         std::process::exit(2);
     };
     let Some(speed_table) = trx64_core::vic::U64SpeedTable::parse(&cli.speed_table) else {
-        eprintln!("[trx64] --speed-table: unknown '{}' (u64ii | u64)", cli.speed_table);
+        trx64_core::elog!("[trx64] --speed-table: unknown '{}' (u64ii | u64)", cli.speed_table);
         std::process::exit(2);
     };
     let state: SharedState = Arc::new(Mutex::new(build_state(session, streaming_on)));
@@ -18994,33 +18994,33 @@ async fn main() {
         // profile does: a program probes for it in its boot stub, inside the warm-up.
         if let Some(kb) = cli.reu {
             if !st.session.machine.attach_reu(kb) {
-                eprintln!("[trx64] --reu: {kb} KiB is not an REU size (128 | 256 | 512 | 1024..16384)");
+                trx64_core::elog!("[trx64] --reu: {kb} KiB is not an REU size (128 | 256 | 512 | 1024..16384)");
                 std::process::exit(2);
             }
-            eprintln!("[trx64] REU attached: {kb} KiB");
+            trx64_core::elog!("[trx64] REU attached: {kb} KiB");
         }
         if let Some(kb) = cli.georam {
             if cli.reu.is_some() {
-                eprintln!("[trx64] --georam and --reu: the port holds one device, not both");
+                trx64_core::elog!("[trx64] --georam and --reu: the port holds one device, not both");
                 std::process::exit(2);
             }
             if !st.session.machine.attach_georam(kb) {
-                eprintln!("[trx64] --georam: {kb} KiB is not a whole number of 16 KiB banks");
+                trx64_core::elog!("[trx64] --georam: {kb} KiB is not a whole number of 16 KiB banks");
                 std::process::exit(2);
             }
-            eprintln!("[trx64] GeoRAM attached: {kb} KiB");
+            trx64_core::elog!("[trx64] GeoRAM attached: {kb} KiB");
         }
         if let Some(path) = cli.reu_image.as_deref() {
             match std::fs::read(path) {
                 Ok(bytes) => match st.session.machine.load_expansion_image(&bytes) {
-                    Ok(n) => eprintln!("[trx64] expansion image: {n} bytes from {path}"),
+                    Ok(n) => trx64_core::elog!("[trx64] expansion image: {n} bytes from {path}"),
                     Err(e) => {
-                        eprintln!("[trx64] --reu-image: {e} (use --reu or --georam first)");
+                        trx64_core::elog!("[trx64] --reu-image: {e} (use --reu or --georam first)");
                         std::process::exit(2);
                     }
                 },
                 Err(e) => {
-                    eprintln!("[trx64] --reu-image: cannot read {path}: {e}");
+                    trx64_core::elog!("[trx64] --reu-image: cannot read {path}: {e}");
                     std::process::exit(2);
                 }
             }
@@ -19030,7 +19030,7 @@ async fn main() {
         st.session.machine.set_u64_speed_table(speed_table);
     }
     if machine_profile != trx64_core::vic::SpeedProfile::C64 {
-        eprintln!("[trx64] machine = {}", machine_profile.name());
+        trx64_core::elog!("[trx64] machine = {}", machine_profile.name());
     }
 
     // The singleton live A/V stream hub (ADR-073): one pacing loop drives the singleton
@@ -19038,17 +19038,17 @@ async fn main() {
     // BY DEFAULT (the C64's work is always visible); only `--headless` skips it → None, so a
     // silent deterministic machine never auto-runs on connect (byte-exact oracle stays clean).
     let hub: Option<Arc<streaming::StreamHub>> = if streaming_on {
-        eprintln!(
+        trx64_core::elog!(
             "[trx64] live A/V push ON (default): clients auto-subscribed at ~{:.2} fps (--headless to disable)",
             model.timing.frame_rate
         );
         Some(streaming::StreamHub::new(Arc::clone(&state)))
     } else {
-        eprintln!("[trx64] --headless: silent deterministic machine (no A/V push, no auto-run)");
+        trx64_core::elog!("[trx64] --headless: silent deterministic machine (no A/V push, no auto-run)");
         None
     };
 
-    eprintln!(
+    trx64_core::elog!(
         "[trx64] TRX64 {} ({}) listening on ws://{addr}",
         env!("CARGO_PKG_VERSION"),
         RUNTIME_VERSION
@@ -19062,7 +19062,7 @@ async fn main() {
 
     if cli.idle_exit > 0 {
         idle::arm(cli.idle_exit);
-        eprintln!("[trx64] idle exit armed: {} s", cli.idle_exit);
+        trx64_core::elog!("[trx64] idle exit armed: {} s", cli.idle_exit);
         let state = Arc::clone(&state);
         let av_hub = hub.clone();
         tokio::spawn(async move {
@@ -19083,7 +19083,7 @@ async fn main() {
                 });
                 idle::hold(holding);
                 if let Some(window) = idle::expired() {
-                    eprintln!("[trx64] idle for {window} s — exiting");
+                    trx64_core::elog!("[trx64] idle for {window} s — exiting");
                     exit_after_work(Arc::clone(&state), format!("idle {window} s")).await;
                 }
             }
@@ -19100,7 +19100,7 @@ async fn main() {
                 });
             }
             Err(e) => {
-                eprintln!("[trx64] accept error: {e}");
+                trx64_core::elog!("[trx64] accept error: {e}");
             }
         }
     }
@@ -20330,7 +20330,7 @@ mod batch1_tests {
             "/../../../C64ReverseEngineeringMCP/resources/roms"
         ));
         if !rom_dir.join("kernal-901227-03.bin").exists() {
-            eprintln!("skip line_trace: ROMs absent");
+            trx64_core::elog!("skip line_trace: ROMs absent");
             return;
         }
         let st = make_state();
@@ -20398,7 +20398,7 @@ mod batch1_tests {
             "/../../../C64ReverseEngineeringMCP/resources/roms"
         ));
         if !rom_dir.join("kernal-901227-03.bin").exists() {
-            eprintln!("skip stepping_back_changes_what_is_on_the_screen: ROMs absent");
+            trx64_core::elog!("skip stepping_back_changes_what_is_on_the_screen: ROMs absent");
             return;
         }
         let st = make_state();
@@ -23389,7 +23389,7 @@ mod batch1_tests {
         // =false (CPU-only path, no sweep), so it can't regenerate a framebuffer.
         let roms = rom_dir();
         if !roms.join("kernal-901227-03.bin").exists() {
-            eprintln!("[skip] render-fb test: ROMs absent at {}", roms.display());
+            trx64_core::elog!("[skip] render-fb test: ROMs absent at {}", roms.display());
             return;
         }
         let st = make_state();
@@ -25635,7 +25635,7 @@ mod batch1_tests {
     #[test]
     fn spec905_sandbox_keyboard_input() {
         let Some(rom_dir) = spec905_rom_dir() else {
-            eprintln!("SKIP spec905_sandbox_keyboard_input: ROMs absent");
+            trx64_core::elog!("SKIP spec905_sandbox_keyboard_input: ROMs absent");
             return;
         };
         let st = make_state();
@@ -25665,7 +25665,7 @@ mod batch1_tests {
     #[test]
     fn spec905_sandbox_model_switch() {
         let Some(rom_dir) = spec905_rom_dir() else {
-            eprintln!("SKIP spec905_sandbox_model_switch: ROMs absent");
+            trx64_core::elog!("SKIP spec905_sandbox_model_switch: ROMs absent");
             return;
         };
         let st = make_state();
@@ -25691,7 +25691,7 @@ mod batch1_tests {
     #[test]
     fn spec905_frame_numbers_are_pinned_around_sandbox_inputs() {
         let Some((st, cp, c)) = s901_probe_machine() else {
-            eprintln!("SKIP spec905_frame_numbers_are_pinned_around_sandbox_inputs: ROMs absent");
+            trx64_core::elog!("SKIP spec905_frame_numbers_are_pinned_around_sandbox_inputs: ROMs absent");
             return;
         };
         let p = json!({ "frames": 100, "line": 250, "addresses": [{ "addr": 0xd029, "lens": "io" }] });
@@ -25939,7 +25939,7 @@ mod batch1_tests {
     fn booted_state() -> Option<SharedState> {
         let roms = rom_dir();
         if !roms.join("kernal-901227-03.bin").exists() {
-            eprintln!("[skip] 863 test: ROMs absent at {}", roms.display());
+            trx64_core::elog!("[skip] 863 test: ROMs absent at {}", roms.display());
             return None;
         }
         let st = make_state();
@@ -26623,7 +26623,7 @@ mod batch1_tests {
     fn a_1581_without_a_dos_is_refused_naming_the_file_and_the_directories() {
         let src = rom_dir();
         if !src.join("kernal-901227-03.bin").exists() {
-            eprintln!("SKIP: issue #4 test: ROMs absent at {}", src.display());
+            trx64_core::elog!("SKIP: issue #4 test: ROMs absent at {}", src.display());
             return;
         }
         let dir = std::env::temp_dir().join(format!("trx64-issue4-daemon-{}", std::process::id()));
@@ -26704,7 +26704,7 @@ mod batch1_tests {
     fn the_monitor_and_the_status_show_a_1581() {
         let Some(st) = booted_state() else { return };
         let Some(rom) = rom_1581() else {
-            eprintln!("[skip] 872 monitor test: no 1581 DOS");
+            trx64_core::elog!("[skip] 872 monitor test: no 1581 DOS");
             return;
         };
         call(&st, "session/drive_type", json!({ "unit": 9, "type": "1581" }));

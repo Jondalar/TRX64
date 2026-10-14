@@ -1522,7 +1522,7 @@ impl Drive1541 {
         if let Err(e) = self.refuse_medium_for_host().and_then(|_| self.medium_fits(&image.kind)) {
             // A caller that can refuse goes through `mount`; this path has no answer to
             // give, so the medium does not go in.
-            eprintln!("[drive] attach refused: {e}");
+            crate::elog!("[drive] attach refused: {e}");
             return;
         }
         if let Some(b) = self.board_1581.as_mut() {
