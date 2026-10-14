@@ -14,6 +14,8 @@
 //!   DRIVE_HEAD (0x34):      op(1) cycle(f64) halftrack(u8) sector(u8) — 11 bytes (Spec 784)
 //!   CART_READ (0x36):       op(1) cycle(f64) bank(u16) slot(u8) off_lo(u16) off_hi(u16)
 //!       bytes(u32)                                                        — 20 bytes (Spec 785)
+//!   BLOCK_READ2 (0x37):     op(1) drv_clk f64(8) c64_clk f64(8) halftrack(u8) sector(u8)
+//!       header_bytes(u16) data_bytes(u16)                                 — 23 bytes (Spec 907)
 //!     (0x32/0x33 are RESERVED in binary-format.ts for VIA_REG_WRITE / GCR_EVENT.)
 //!
 //! access/oldValue (Spec 753): WRITE records carry the pre-write value for RAM
@@ -54,6 +56,12 @@ pub enum TraceOp {
     /// the mapper's own read: independent of whether the C64 kept the bytes.
     /// Emitted only when the `cart-read` channel is armed.
     CartRead = 0x36,
+    /// Spec 907 READ-SET v2 (op 0x37): replaces 0x35 for new captures. One record per
+    /// (half-track, sector) bucket, credited to the block the head was IN, with the
+    /// header-block bytes and the data-block bytes apart, and BOTH clocks: the drive's
+    /// own (restarts at 0 on a drive cold reset) and the C64 master clock (comparable
+    /// with every C64-side event). 0x35 stays decodable for old captures.
+    BlockRead2 = 0x37,
 }
 
 pub const MAGIC: &[u8; 8] = b"C64RETR1";
@@ -156,7 +164,31 @@ impl FrameSink {
         self.buf.push(sector);
     }
 
-    /// Encode a BLOCK_READ (0x35) record: the 1541 read-set — the drive latched
+    /// Encode a BLOCK_READ2 (0x37) record: the 1541 read-set of one (halftrack, sector)
+    /// bucket (Spec 907). Layout: op(1) drv_clk f64(8) c64_clk f64(8) halftrack(u8)
+    /// sector(u8) header_bytes u16 LE data_bytes u16 LE = 23 bytes. `sector` 0xff = the
+    /// half-track has no header (every byte is then a data byte). Emitted ONLY when the
+    /// `drive-mechanism` channel is armed.
+    #[inline]
+    pub fn write_block_read2(
+        &mut self,
+        drv_clk: u64,
+        c64_clk: u64,
+        halftrack: u8,
+        sector: u8,
+        header_bytes: u16,
+        data_bytes: u16,
+    ) {
+        self.buf.push(TraceOp::BlockRead2 as u8);
+        self.buf.extend_from_slice(&(drv_clk as f64).to_le_bytes());
+        self.buf.extend_from_slice(&(c64_clk as f64).to_le_bytes());
+        self.buf.push(halftrack);
+        self.buf.push(sector);
+        self.buf.extend_from_slice(&header_bytes.to_le_bytes());
+        self.buf.extend_from_slice(&data_bytes.to_le_bytes());
+    }
+
+    /// Encode a BLOCK_READ (0x35) record (superseded by 0x37 for new captures): the 1541 read-set — the drive latched
     /// `bytes` GCR data bytes off physical (halftrack, sector) before the head moved
     /// on. Loader-agnostic ground truth of which block the loader actually READ
     /// (Spec 784). Layout: op(1) cycle(f64) halftrack(u8) sector(u8) bytes(u16 LE) =
@@ -426,9 +458,28 @@ impl TracingObserver {
         self.event_count += 1;
     }
 
-    /// Emit a BLOCK_READ record (0x35) — gated on the `drive-mechanism` channel.
-    /// Called from the drive-sampled run loop when the head leaves a sector the drive
-    /// latched GCR bytes off (Spec 784 read-set).
+    /// Emit a BLOCK_READ2 record (0x37) — gated on the `drive-mechanism` channel.
+    /// Called with each closed read-set bucket (Spec 907).
+    #[inline]
+    pub fn emit_block_read2(
+        &mut self,
+        halftrack: u8,
+        sector: u8,
+        header_bytes: u16,
+        data_bytes: u16,
+        drv_clk: u64,
+        c64_clk: u64,
+    ) {
+        if !self.channels.drive_mechanism {
+            return;
+        }
+        self.sink.write_block_read2(drv_clk, c64_clk, halftrack, sector, header_bytes, data_bytes);
+        self.event_count += 1;
+    }
+
+    /// Emit a legacy BLOCK_READ record (0x35) — gated on the `drive-mechanism`
+    /// channel. The daemon no longer calls it (0x37 replaced it); kept for tools that
+    /// still write the old record.
     #[inline]
     pub fn emit_block_read(&mut self, halftrack: u8, sector: u8, bytes: u16, drv_clk: u64) {
         if !self.channels.drive_mechanism {
@@ -585,6 +636,44 @@ mod tests {
         let mut c = [0u8; 8];
         c.copy_from_slice(&sink.buf[1..9]);
         assert_eq!(f64::from_le_bytes(c), 0x0102_0304_0506_0708u64 as f64);
+    }
+
+    // BLOCK_READ2 (0x37) byte layout: op(1) + drv_clk f64(8) + c64_clk f64(8) + ht(1) +
+    // sec(1) + header_bytes u16(2) + data_bytes u16(2) = 23.
+    #[test]
+    fn write_block_read2_byte_layout() {
+        let mut sink = FrameSink::events_only();
+        sink.write_block_read2(1000, 2000, 70, 17, 0x000a, 0x0145);
+        assert_eq!(sink.buf.len(), 23, "23-byte record");
+        assert_eq!(sink.buf[0], 0x37, "op 0x37");
+        let f = |r: std::ops::Range<usize>| {
+            let mut c = [0u8; 8];
+            c.copy_from_slice(&sink.buf[r]);
+            f64::from_le_bytes(c)
+        };
+        assert_eq!(f(1..9), 1000.0, "drv_clk");
+        assert_eq!(f(9..17), 2000.0, "c64_clk");
+        assert_eq!(sink.buf[17], 70, "halftrack");
+        assert_eq!(sink.buf[18], 17, "sector");
+        assert_eq!(u16::from_le_bytes([sink.buf[19], sink.buf[20]]), 0x000a, "header_bytes");
+        assert_eq!(u16::from_le_bytes([sink.buf[21], sink.buf[22]]), 0x0145, "data_bytes");
+    }
+
+    #[test]
+    fn emit_block_read2_gated_by_channel() {
+        let mut off = TracingObserver::with_channels(
+            FrameSink::events_only(),
+            TraceChannels::from_domains(&["c64-cpu"]),
+        );
+        off.emit_block_read2(70, 17, 10, 325, 1, 2);
+        assert_eq!(off.into_buf().len(), 0);
+        let mut on = TracingObserver::with_channels(
+            FrameSink::events_only(),
+            TraceChannels::from_domains(&["drive-mechanism"]),
+        );
+        on.emit_block_read2(70, 17, 10, 325, 1, 2);
+        assert_eq!(on.event_count, 1);
+        assert_eq!(on.into_buf().len(), 23);
     }
 
     // Spec 785 C1 — the "cart-read" domain arms ONLY the cart channel, and is not

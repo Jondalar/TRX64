@@ -57,6 +57,7 @@ pub const OP_GCR_EVENT: u8 = 0x33;
 pub const OP_DRIVE_HEAD: u8 = 0x34;
 pub const OP_BLOCK_READ: u8 = 0x35;
 pub const OP_CART_READ: u8 = 0x36;
+pub const OP_BLOCK_READ2: u8 = 0x37;
 pub const OP_MEDIA_WRITE: u8 = 0x40;
 
 /// IEC line bit assignment (`IEC_BIT`, binary-format.ts:384). 9 meaningful bits.
@@ -89,6 +90,8 @@ pub fn payload_size(op: u8, version: u16) -> Option<usize> {
         OP_BLOCK_READ => 12,
         // Spec 785 C1: cycle(8) + bank(2) + slot(1) + off_lo(2) + off_hi(2) + bytes(4).
         OP_CART_READ => 19,
+        // Spec 907: drv_clk(8) + c64_clk(8) + ht(1) + sec(1) + header_bytes(2) + data_bytes(2).
+        OP_BLOCK_READ2 => 22,
         // 0x01 MARK is handled separately (u16-prefixed label);
         // 0x40 MEDIA_WRITE is variable with NO length prefix ⇒ unskippable.
         _ => return None,
@@ -322,7 +325,8 @@ pub fn decode_file_header(buf: &[u8]) -> Result<ParsedHeader> {
 pub struct DecodedEvent {
     pub op: u8,
     /// The EMITTING side's clock: C64 master clock for 0x01/0x10/0x11/0x12/
-    /// 0x20/0x22/0x23/0x36, the DRIVE clock for 0x30/0x31/0x34/0x35. The two lanes
+    /// 0x20/0x22/0x23/0x36, the DRIVE clock for 0x30/0x31/0x34/0x35/0x37 (0x37
+    /// also carries the C64 clock, in `c64_clk`). The two lanes
     /// are different time bases — the stream is NOT globally cycle-monotonic.
     /// (0x36 CART_READ is C64-side: the cartridge is a bus hook on the main CPU,
     /// not a clocked device with a domain of its own.)
@@ -357,6 +361,11 @@ pub struct DecodedEvent {
     pub slot: Option<u8>,
     pub off_lo: Option<u16>,
     pub off_hi: Option<u16>,
+    /// Spec 907 (0x37 only): the C64 master clock when the bucket opened — the one
+    /// comparable with C64-side events — and the header-block / data-block byte split.
+    pub c64_clk: Option<f64>,
+    pub header_bytes: Option<u16>,
+    pub data_bytes: Option<u16>,
     pub label: Option<String>,
 }
 
@@ -479,6 +488,17 @@ pub fn decode_event(buf: &[u8], off: usize, version: u16) -> Result<Step> {
             ev.halftrack = Some(buf[o]);
             ev.sector = Some(buf[o + 1]);
             ev.bytes = Some(u16le(buf, o + 2) as u32);
+        }
+        OP_BLOCK_READ2 => {
+            // `cycle` (decoded above) is the drive clock; the C64 clock follows it.
+            ev.c64_clk = Some(f64::from_le_bytes([
+                buf[o], buf[o + 1], buf[o + 2], buf[o + 3], buf[o + 4], buf[o + 5], buf[o + 6], buf[o + 7],
+            ]));
+            ev.halftrack = Some(buf[o + 8]);
+            ev.sector = Some(buf[o + 9]);
+            ev.header_bytes = Some(u16le(buf, o + 10));
+            ev.data_bytes = Some(u16le(buf, o + 12));
+            ev.bytes = Some(u16le(buf, o + 10) as u32 + u16le(buf, o + 12) as u32);
         }
         OP_CART_READ => {
             ev.bank = Some(u16le(buf, o));
@@ -807,6 +827,15 @@ mod tests {
             self.buf.push(sector);
             self.buf.extend_from_slice(&bytes.to_le_bytes());
         }
+        pub fn block_read2(&mut self, drv: u64, c64: u64, ht: u8, sector: u8, hdr: u16, data: u16) {
+            self.buf.push(OP_BLOCK_READ2);
+            self.cyc(drv);
+            self.cyc(c64);
+            self.buf.push(ht);
+            self.buf.push(sector);
+            self.buf.extend_from_slice(&hdr.to_le_bytes());
+            self.buf.extend_from_slice(&data.to_le_bytes());
+        }
         #[allow(clippy::too_many_arguments)]
         pub fn cart_read(
             &mut self,
@@ -1017,6 +1046,7 @@ mod tests {
             (OP_GCR_EVENT, 13, 13),
             (OP_DRIVE_HEAD, 11, 11),
             (OP_BLOCK_READ, 13, 13),
+            (OP_BLOCK_READ2, 23, 23),
         ] {
             assert_eq!(payload_size(op, 2).unwrap() + 1, want_v2, "op {op:#x} @v2");
             assert_eq!(payload_size(op, 1).unwrap() + 1, want_v1, "op {op:#x} @v1");
@@ -1048,6 +1078,31 @@ mod tests {
         assert_eq!(evs[0].halftrack, Some(70));
         assert_eq!(evs[0].sector, Some(17));
         assert_eq!(evs[0].bytes, Some(0x0154));
+    }
+
+    /// Spec 907 — BLOCK_READ2 (0x37) decodes both clocks and the header/data split,
+    /// and its 23-byte width keeps a following record aligned; the old 0x35 record
+    /// still decodes next to it.
+    #[test]
+    fn block_read2_fields_width_and_legacy_0x35() {
+        let mut f = Fixture::new(META, 2);
+        f.block_read2(1234, 987_654, 70, 17, 10, 325);
+        f.block_read(1300, 70, 18, 0x0154);
+        f.cpu(OP_CPU_STEP, 5001, 0xc000, [1, 2, 3, 4, 5, 6, 7, 8]);
+        let evs = decode_event_stream(&f.buf, 16 + META.len(), 2).unwrap();
+        assert_eq!(evs.len(), 3, "both read-set widths left the next record aligned");
+        assert_eq!(evs[0].op, OP_BLOCK_READ2);
+        assert_eq!(evs[0].clock(), 1234);
+        assert_eq!(evs[0].c64_clk, Some(987_654.0));
+        assert_eq!(evs[0].halftrack, Some(70));
+        assert_eq!(evs[0].sector, Some(17));
+        assert_eq!(evs[0].header_bytes, Some(10));
+        assert_eq!(evs[0].data_bytes, Some(325));
+        assert_eq!(evs[0].bytes, Some(335));
+        assert_eq!(evs[1].op, OP_BLOCK_READ);
+        assert_eq!(evs[1].sector, Some(18));
+        assert_eq!(evs[1].bytes, Some(0x0154));
+        assert_eq!(evs[2].pc, Some(0xc000));
     }
 
     /// Spec 785 C1 — CART_READ (0x36) decodes its six fields, and its 20-byte

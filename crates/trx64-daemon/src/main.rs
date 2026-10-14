@@ -1971,13 +1971,15 @@ fn run_cycle_budget(session: &mut Session, budget: u64) {
                 }
             }
             // Spec 784 — drain this segment's armed head samples → DRIVE_HEAD (0x34)
-            // (every transition) + the read-set → BLOCK_READ (0x35) (consumed sectors).
+            // (every transition) + the read-set → BLOCK_READ2 (0x37) (one record per closed
+            // (half-track, sector) bucket; the bucket still open stays open across runs and is
+            // flushed by `finalize_trace`).
             if drive_mechanism_active {
                 for (drv_clk, ht, sec) in session.machine.drain_head_trace() {
                     obs.emit_drive_head(ht, sec, drv_clk);
                 }
-                for (drv_clk, ht, sec, bytes) in session.machine.drain_block_reads() {
-                    obs.emit_block_read(ht, sec, bytes, drv_clk);
+                for r in session.machine.drain_block_reads() {
+                    obs.emit_block_read2(r.half_track, r.sector, r.header_bytes, r.data_bytes, r.drv_clk, r.c64_clk);
                 }
             }
             // Spec 785 C1 — drain this segment's cart read-set → CART_READ (0x36).
@@ -5561,6 +5563,28 @@ fn finalize_trace(st: &mut State, background_index: bool) -> (Value, Value) {
     match st.session.trace.take() {
         None => (Value::Null, json!({ "active": false })),
         Some(mut t) => {
+            // Spec 907 — a read-set bucket still open when the trace stops (the loader
+            // is mid-sector) becomes its record now, before the file is closed.
+            if st.session.machine.head_trace_armed {
+                st.session.machine.flush_block_read();
+                let reads = st.session.machine.drain_block_reads();
+                // Disarm: the next trace's first run must start from a clean transition.
+                st.session.machine.arm_head_trace(false);
+                if !reads.is_empty() {
+                    let channels = TraceChannels::from_domains(&t.domains).mask_by_captures(&t.captures);
+                    let mut obs = TracingObserver::with_channels(FrameSink::events_only(), channels);
+                    for r in reads {
+                        obs.emit_block_read2(r.half_track, r.sector, r.header_bytes, r.data_bytes, r.drv_clk, r.c64_clk);
+                    }
+                    if obs.event_count > 0 {
+                        if t.needs_header() {
+                            t.buf = FrameSink::with_header(&t.meta_json).buf;
+                        }
+                        t.event_count += obs.event_count;
+                        t.buf.extend_from_slice(&obs.into_buf());
+                    }
+                }
+            }
             // Whatever is still pending goes after what the run already spilled; a run
             // that never recorded an event still gets a header-only file.
             if t.needs_header() {
