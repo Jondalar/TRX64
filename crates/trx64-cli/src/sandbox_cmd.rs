@@ -406,6 +406,12 @@ struct SandboxObs {
     /// apart from `written` alone). Armed like `written`.
     bus_writes: Box<[u32]>,
     io_stores: Box<[u32]>,
+    /// The previous Write record (addr, clk). A chip side-effect write (the CIA2 port-A
+    /// re-push to `$DD00` after a store to `$DD00/$DD02`) is reported at the SAME clk as
+    /// the store that caused it, just before it; two CPU stores never share a cycle. Such
+    /// a record lands in no RAM byte and gets no `on_io_store`, so it is taken back out
+    /// of `bus_writes`.
+    last_write: Option<(u16, u64)>,
 }
 
 impl SandboxObs {
@@ -421,6 +427,7 @@ impl SandboxObs {
             io_seen: vec![false; 0x1000].into_boxed_slice(),
             bus_writes: vec![0; 0x1_0000].into_boxed_slice(),
             io_stores: vec![0; 0x1000].into_boxed_slice(),
+            last_write: None,
         }
     }
 
@@ -484,7 +491,7 @@ impl Observer for SandboxObs {
     ) {
         self.steps += 1;
     }
-    fn on_bus(&mut self, kind: BusKind, addr: u16, _value: u8, pc: u16, _clk: u64, _old: u8) {
+    fn on_bus(&mut self, kind: BusKind, addr: u16, _value: u8, pc: u16, clk: u64, _old: u8) {
         if pc == self.entry {
             self.armed = true;
         }
@@ -492,7 +499,15 @@ impl Observer for SandboxObs {
             self.write_lo = Some(self.write_lo.map_or(addr, |lo| lo.min(addr)));
             self.write_hi = Some(self.write_hi.map_or(addr, |hi| hi.max(addr)));
             self.written[addr as usize] = true;
-            self.bus_writes[addr as usize] += 1;
+            if let Some((prev, prev_clk)) = self.last_write {
+                if prev_clk == clk {
+                    let n = &mut self.bus_writes[prev as usize];
+                    *n = n.saturating_sub(1);
+                }
+            }
+            self.last_write = Some((addr, clk));
+            let n = &mut self.bus_writes[addr as usize];
+            *n = n.saturating_add(1);
         }
     }
     fn on_io_store(&mut self, addr: u16, value: u8, pc: u16) {
@@ -504,7 +519,7 @@ impl Observer for SandboxObs {
             if i < 0x1000 {
                 self.io_last[i] = value;
                 self.io_seen[i] = true;
-                self.io_stores[i] += 1;
+                self.io_stores[i] = self.io_stores[i].saturating_add(1);
             }
         }
     }
@@ -1649,6 +1664,30 @@ mod tests {
         assert!(in_ram(0xd020), "$D020 was stored to in RAM too");
         assert!(!in_ram(0xd021), "$D021 was only ever stored to in I/O");
         assert!(out.runs.iter().any(|&(lo, hi)| lo <= 0xd021 && 0xd021 <= hi), "writtenRuns is unchanged");
+    }
+
+    /// A store to CIA2 that changes the port-A output also reports the `$DD00` re-push as
+    /// a bus write at the same cycle. Neither lands in RAM, so `$DD00` and `$DD02` stay
+    /// out of `ramWrittenRuns`.
+    #[test]
+    fn cia2_port_repush_is_not_a_ram_store() {
+        let Some(rom_dir) = rom_dir_or_skip() else { return };
+        let mut m = booted(&rom_dir);
+        let routine = [
+            0xa9, 0x94, 0x8d, 0x00, 0xdd, // LDA #$94 / STA $dd00 (VIC bank change)
+            0xa9, 0x3c, 0x8d, 0x02, 0xdd, // LDA #$3c / STA $dd02 (DDR change)
+            0x60,
+        ];
+        m.poke(0xc000, &routine);
+        let mut args = base_args(rom_dir);
+        args.entry = 0xc000;
+        args.zp = vec![(0x0001, 0x37)];
+        args.direct_entry = true;
+        let out = execute_sandbox(&mut m, &args);
+        let in_ram = |a: u16| out.ram_runs.iter().any(|&(lo, hi)| lo <= a && a <= hi);
+        assert!(!in_ram(0xdd00), "the port-A re-push is not a RAM store");
+        assert!(!in_ram(0xdd02), "a DDR store in I/O is not a RAM store");
+        assert!(out.runs.iter().any(|&(lo, hi)| lo <= 0xdd00 && 0xdd00 <= hi), "writtenRuns is unchanged");
     }
 
     /// The DEFAULT stub path is unchanged: no direct-entry/regs ⇒ `jsr entry` stub,
