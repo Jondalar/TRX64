@@ -162,7 +162,7 @@ fn machine_with_program(sector: u8, cold_reset_drive_first: bool) -> (Machine, u
     m.drive8.drive_ram_write(0x0501, 1);
     run(&mut m, 10);
     let ht = m.drive8.rotation.current_half_track as u8;
-    assert!(ht % 2 == 0 && m.drive8.rotation.image.as_ref().unwrap().tracks[ht as usize - 2].size > 0, "head on a full track with data (ht {ht})");
+    assert!(ht.is_multiple_of(2) && m.drive8.rotation.image.as_ref().unwrap().tracks[ht as usize - 2].size > 0, "head on a full track with data (ht {ht})");
     assert_eq!(mark(&m), 0, "the program has not reached the data block yet");
     (m, ht)
 }
