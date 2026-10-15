@@ -1,6 +1,6 @@
 # Features
 
-One line per feature, as of 0.13.1. Details: [`README.md`](../README.md), monitor:
+One line per feature, as of 0.13.2. Details: [`README.md`](../README.md), monitor:
 [`MONITOR.md`](../MONITOR.md), Swift API: [`crates/trx64-ffi/API.md`](../crates/trx64-ffi/API.md).
 
 ## Machine
@@ -79,8 +79,8 @@ One line per feature, as of 0.13.1. Details: [`README.md`](../README.md), monito
 - Monitor based on VICE, same verbs in the cockpit, over WebSocket and through the FFI (`monitor/exec`).
 - Bank lens `cpu|ram|rom|io|cart` on `m`/`d`; `device drive<unit>` reads a drive CPU.
 - Breakpoints (`bk`), observers on exec, load or store with conditions and actions (`obs`).
-- Step into, over, until, return; flow focus on main, IRQ, NMI or BRK (`focus`, `sf`, `nf`, `flow`, `bt`); JAM auto-break with `triage`, `traprules`.
-- Traces of CPU, drive CPU, IEC, VIC, memory, drive mechanism and cartridge reads to `.c64retrace`, indexed into DuckDB (`trace`, `tracedb`, `traceindex`); the drive's block reads carry both clocks and the header/data split, credited to the sector under the head.
+- Step into, over, until, return (until and step over end at the caller's cycle budget and report cycles and instructions); flow focus on main, IRQ, NMI or BRK (`focus`, `sf`, `nf`, `flow`, `bt`); JAM auto-break with `triage`, `traprules`.
+- Traces of CPU, drive CPU, IEC, VIC, memory, drive mechanism and cartridge reads to `.c64retrace`, indexed into DuckDB (`trace`, `tracedb`, `traceindex`); stack pulls are data reads like any other; the drive's block reads carry both clocks and the header/data split, credited to the sector under the head.
 - `tracering` builds a trace after the fact from the reverse ring; `map`, `taint`, `swimlane` analyse a trace.
 - Bus and device reports: `iec`, `io`, `drive`, `cart`, `folder`, `pot`, `reu`, `georam`, `uci`, `turbo`.
 - `trx64cli disasm`: static disassembly of a PRG or raw image, no ROMs.
