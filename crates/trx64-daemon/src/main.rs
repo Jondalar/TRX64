@@ -1873,7 +1873,7 @@ fn run_budget_honouring_breaks(st: &mut State, cycles: u64) -> BudgetRun {
     {
         let pc = st.session.machine.c64_core.reg_pc;
         if st.mon.breakpoints.entries.iter().any(|e| e.enabled && e.pc == pc) {
-            step_one_instruction(&mut st.session);
+            step_past_observed(st);
         }
     }
     let run = {
@@ -2369,7 +2369,7 @@ fn run_debug_control(id: Value, st: &mut State, frame: u64, _is_continue: bool) 
     {
         let pc = st.session.machine.c64_core.reg_pc;
         if st.mon.breakpoints.entries.iter().any(|e| e.enabled && e.pc == pc) {
-            step_one_instruction(&mut st.session);
+            step_past_observed(st);
         }
     }
 
@@ -2675,7 +2675,7 @@ pub(crate) fn stream_debug_gated_advance(st: &mut State, budget: u64) -> u32 {
         {
             let pc = st.session.machine.c64_core.reg_pc;
             if st.mon.breakpoints.entries.iter().any(|e| e.enabled && e.pc == pc) {
-                step_one_instruction(&mut st.session);
+                step_past_observed(st);
             }
         }
         // ── Armed: bp/observer-gated segment run, self-halting at the first hit. ──
@@ -2794,6 +2794,74 @@ pub(crate) fn stream_debug_gated_advance(st: &mut State, budget: u64) -> u32 {
     st.session.machine.c64_core.clk.wrapping_sub(clk_before) as u32
 }
 
+/// Issue #9 — step the one instruction a resume steps PAST (the breakpoint / exec
+/// observer the PC stands on) with the load/store observers armed, so a store or load of
+/// that instruction is counted and logged like any other. [`step_one_instruction`] runs
+/// it over a NullSink with no access-watch gate. A `do break` requested by this one
+/// instruction does not stop the resume (the run that follows starts with a clear halt
+/// flag), exactly as before; its hit and its log line are kept.
+fn step_past_observed(st: &mut State) {
+    let State { session, mon, .. } = &mut *st;
+    let reg = &mut mon.observers;
+    if !full_machine_gate(session) || !reg.access_armed() {
+        step_one_instruction(session);
+        return;
+    }
+    reg.set_env(observers::CpuSnapshot::from_machine(&session.machine));
+    let aw = reg.access_watch_owned();
+    let _ = run_full_segment(session, reg, 999_999, 1, None, aw.as_deref(), None);
+}
+
+/// One full-machine segment of [`run_until_break`]: the registry drives the core gates
+/// (`bp_ref` exec breakpoints, `aw_ref` load/store watch), tee'd with a per-segment
+/// `TracingObserver` while a trace is active so the firehose keeps recording.
+#[allow(clippy::too_many_arguments)]
+fn run_full_segment(
+    session: &mut Session,
+    reg: &mut observers::ObserverRegistry,
+    seg_budget: u64,
+    max_instr: u64,
+    bp_ref: Option<&std::collections::HashSet<u16>>,
+    aw_ref: Option<&[u8; 0x10000]>,
+    trace_channels: Option<TraceChannels>,
+) -> trx64_core::RunStop {
+    if let Some(ch) = trace_channels {
+        // Trace-aware: tee the registry with a per-segment TracingObserver, then
+        // append this segment's events to the trace buffer.
+        let mut tracing = TracingObserver::with_channels(FrameSink::events_only(), ch);
+        let s = {
+            let mut tee = trx64_core::TeeObserver::new(&mut *reg, &mut tracing);
+            session.machine.run_for_full_capped_dbg(
+                seg_budget,
+                max_instr,
+                bp_ref,
+                None,
+                aw_ref,
+                &mut tee,
+                |_, _, _, _, _, _, _| {},
+            )
+        };
+        if let Some(t) = session.trace.as_mut() {
+            t.event_count += tracing.event_count;
+            t.buf.extend_from_slice(&tracing.into_buf());
+            if let Err(e) = t.spill(false) {
+                trx64_core::elog!("[trx64] trace: cannot append to {}: {e}", t.retrace_path.display());
+            }
+        }
+        s
+    } else {
+        session.machine.run_for_full_capped_dbg(
+            seg_budget,
+            max_instr,
+            bp_ref,
+            None,
+            aw_ref,
+            reg,
+            |_, _, _, _, _, _, _| {},
+        )
+    }
+}
+
 /// SEGMENT-RUN the machine with the registry driving the core's debug gates,
 /// self-halting at the first REAL breakpoint/watchpoint (cond true + not ignored).
 ///
@@ -2881,41 +2949,7 @@ fn run_until_break(
         let bp_ref = bp_set.as_ref();
 
         let stop = if full_machine {
-            if let Some(ch) = trace_channels {
-                // Trace-aware: tee the registry with a per-segment TracingObserver, then
-                // append this segment's events to the trace buffer.
-                let mut tracing = TracingObserver::with_channels(FrameSink::events_only(), ch);
-                let s = {
-                    let mut tee = trx64_core::TeeObserver::new(&mut *reg, &mut tracing);
-                    session.machine.run_for_full_capped_dbg(
-                        seg_budget,
-                        max_instr,
-                        bp_ref,
-                        None,
-                        aw_ref,
-                        &mut tee,
-                        |_, _, _, _, _, _, _| {},
-                    )
-                };
-                if let Some(t) = session.trace.as_mut() {
-                    t.event_count += tracing.event_count;
-                    t.buf.extend_from_slice(&tracing.into_buf());
-                    if let Err(e) = t.spill(false) {
-                        trx64_core::elog!("[trx64] trace: cannot append to {}: {e}", t.retrace_path.display());
-                    }
-                }
-                s
-            } else {
-                session.machine.run_for_full_capped_dbg(
-                    seg_budget,
-                    max_instr,
-                    bp_ref,
-                    None,
-                    aw_ref,
-                    reg,
-                    |_, _, _, _, _, _, _| {},
-                )
-            }
+            run_full_segment(session, reg, seg_budget, max_instr, bp_ref, aw_ref, trace_channels)
         } else {
             // CPU-isolated path (no full machine). The dbg entry point lives on the
             // full SC path only; for the isolated path we step + check the bp set
@@ -2927,6 +2961,14 @@ fn run_until_break(
             trx64_core::RunStop::Breakpoint(pc) => {
                 // Core halted AT pc, before executing it. Apply the cond/ignore gate.
                 reg.set_env(observers::CpuSnapshot::from_machine(&session.machine));
+                // Issue #9 — the bytes a `do log $addr` prints, peeked side-effect free
+                // (`read_full`: the CPU's banked view, I/O registers without a read
+                // strobe) at this boundary, before the instruction at `pc` runs.
+                let addrs = reg.exec_log_addrs(pc);
+                if !addrs.is_empty() {
+                    let peeks = addrs.iter().map(|&a| (a, session.machine.read_full(a))).collect();
+                    reg.set_exec_peeks(peeks);
+                }
                 let real = reg.on_exec(pc);
                 if real {
                     let which = reg.last_halt.as_ref().map(|h| h.name.clone());
@@ -2940,7 +2982,28 @@ fn run_until_break(
                 }
                 // Cond false or ignored: step one instruction PAST the bp PC so the
                 // boundary check doesn't re-trip on the same PC, then resume.
-                step_one_instruction(session);
+                //
+                // Issue #9 — the step runs with the SAME access-watch gate and trace tee
+                // as a segment (only the bp set is left out, or it would re-trip here).
+                // It used to be a plain `step_one_instruction` over a NullSink, so a
+                // load/store observer never saw the access of an instruction that an exec
+                // observer (`obs .. when exec .. do log`) sits on: `STA $D030` under an
+                // exec log was invisible to `obs .. when store d030`.
+                if full_machine {
+                    let s = run_full_segment(session, reg, 999_999, 1, None, aw_ref, trace_channels);
+                    if matches!(s, trx64_core::RunStop::Observer) {
+                        let which = reg.last_halt.as_ref().map(|h| h.name.clone());
+                        return BreakRun {
+                            halted: true,
+                            reason: "observer",
+                            which,
+                            pc: session.machine.c64_core.reg_pc,
+                            cycles_elapsed: session.machine.clk.wrapping_sub(start_clk),
+                        };
+                    }
+                } else {
+                    step_one_instruction(session);
+                }
             }
             trx64_core::RunStop::Observer => {
                 // A watchpoint requested the halt during the last instruction.
@@ -3535,7 +3598,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             // observer half of this check explicitly.
             let on_exec_obs = st.mon.observers.exec_active && st.mon.observers.exec_watch[gpc as usize] != 0;
             if on_exec_obs || st.mon.breakpoints.entries.iter().any(|e| e.pc == gpc) {
-                step_one_instruction(&mut st.session);
+                step_past_observed(st);
             }
             st.session.running = true;
             st.ctrl_stop = None;
@@ -27533,5 +27596,108 @@ mod batch1_tests {
         let ok = call(&st, "session/frame_probe", p.clone());
         assert!(ok.get("stopped").is_none());
         assert_eq!(ok["samples"], json!(100));
+    }
+
+    /// Issue #9 — a store observer fires on every CPU write to the speed registers on
+    /// every speed profile: `$D030` (+ `$D02F`) on `128`, `$D030`/`$D031` on `u64`, and
+    /// `$D030` (open bus) on `c64`, with the value written — also when an exec observer
+    /// sits on the storing instructions (the case that lost them: the run steps past an
+    /// exec hit, and that step ran without the access-watch gate).
+    fn issue9_store_log(profile: &str, regs: &[u16], exec_obs: bool) -> Option<(Vec<String>, String)> {
+        let st = booted_state()?;
+        call(&st, "debug/pause", json!({ "source": "test" }));
+        // SEI; per reg: LDA #v / STA reg for v in FE 00 01 00; then JMP *.
+        let mut code = vec![0x78];
+        for &r in regs {
+            for v in [0xFEu8, 0x00, 0x01, 0x00] {
+                code.extend_from_slice(&[0xA9, v, 0x8D, r as u8, (r >> 8) as u8]);
+            }
+        }
+        let spin = 0xC000u16 + code.len() as u16;
+        code.extend_from_slice(&[0x4C, spin as u8, (spin >> 8) as u8]);
+        {
+            let mut g = st.lock().unwrap();
+            g.session.machine.poke(0xC000, &code);
+            g.session.machine.c64_core.reg_pc = 0xC000;
+        }
+        mon_exec(&st, &format!("turbo mode {profile}"));
+        for &r in regs {
+            mon_exec(&st, &format!("obs t{r:04x} when store {r:04x} do log a"));
+        }
+        if exec_obs {
+            mon_exec(&st, &format!("obs x when exec c000..{:04x} do log a", spin - 1));
+        }
+        call(&st, "session/run", json!({ "cycles": 3000 }));
+        let log = mon_exec(&st, "obs log");
+        let lines = log
+            .lines()
+            .filter_map(|l| {
+                let i = l.find("store $")?;
+                Some(l[i..i + 15].to_string())
+            })
+            .collect();
+        Some((lines, mon_exec(&st, "obs")))
+    }
+
+    #[test]
+    fn issue9_store_observer_fires_on_speed_registers_on_every_profile() {
+        let want = |regs: &[u16]| -> Vec<String> {
+            regs.iter()
+                .flat_map(|&r| [0xFEu8, 0x00, 0x01, 0x00].map(|v| format!("store ${r:04X}=${v:02X}")))
+                .collect()
+        };
+        for exec_obs in [false, true] {
+            for (profile, regs) in [
+                ("c64", &[0xD030u16][..]),
+                ("128", &[0xD02F, 0xD030][..]),
+                ("u64", &[0xD030, 0xD031][..]),
+            ] {
+                let Some((got, list)) = issue9_store_log(profile, regs, exec_obs) else { return };
+                assert_eq!(got, want(regs), "profile {profile}, exec observer {exec_obs}: obs list {list}");
+            }
+        }
+    }
+    /// Issue #9 — resuming from a breakpoint that stands ON a store steps that store past
+    /// the breakpoint; the store observer still sees it.
+    #[test]
+    fn issue9_store_observer_sees_the_store_a_resume_steps_past() {
+        let Some(st) = booted_state() else { return };
+        call(&st, "debug/pause", json!({ "source": "test" }));
+        // $C000: SEI; LDA #$FE; STA $D030 ($C003); LDA #$00; STA $D030; JMP *.
+        let code = [0x78, 0xA9, 0xFE, 0x8D, 0x30, 0xD0, 0xA9, 0x00, 0x8D, 0x30, 0xD0, 0x4C, 0x0B, 0xC0];
+        {
+            let mut g = st.lock().unwrap();
+            g.session.machine.poke(0xC000, &code);
+            g.session.machine.c64_core.reg_pc = 0xC000;
+        }
+        mon_exec(&st, "obs t1 when store d030 do log a");
+        mon_exec(&st, "bk c003");
+        let r = call(&st, "session/run", json!({ "cycles": 3000 }));
+        assert_eq!(r["breakpoint"]["pc"], json!(0xC003), "{r}");
+        call(&st, "session/run", json!({ "cycles": 3000 }));
+        let log = mon_exec(&st, "obs log");
+        let got: Vec<&str> = log.lines().filter_map(|l| l.find("store $").map(|i| &l[i..i + 15])).collect();
+        assert_eq!(got, ["store $D030=$FE", "store $D030=$00"], "{log}");
+    }
+    /// Issue #9 (criterion 4) — `do log $addr` of an exec observer prints the byte, I/O
+    /// registers included (side-effect free), instead of `??`.
+    #[test]
+    fn issue9_exec_log_prints_memory_and_io_bytes() {
+        let Some(st) = booted_state() else { return };
+        call(&st, "debug/pause", json!({ "source": "test" }));
+        // $C000: SEI; LDA #$80; CMP $D012 ($C003); BNE $C003; STA $D030 ($C008); JMP *.
+        let code = [0x78, 0xA9, 0x80, 0xCD, 0x12, 0xD0, 0xD0, 0xFB, 0x8D, 0x30, 0xD0, 0x4C, 0x0B, 0xC0];
+        {
+            let mut g = st.lock().unwrap();
+            g.session.machine.poke(0xC000, &code);
+            g.session.machine.poke(0xC100, &[0x34, 0x12]);
+            g.session.machine.c64_core.reg_pc = 0xC000;
+        }
+        mon_exec(&st, "obs t3 when exec c008 do log a $d012 $c100 $c100:w");
+        call(&st, "session/run", json!({ "cycles": 25000 }));
+        let log = mon_exec(&st, "obs log");
+        let line = log.lines().find(|l| l.contains("exec $C008")).unwrap_or_else(|| panic!("{log}"));
+        assert!(line.contains("$C100=34 $C100=1234"), "{line}");
+        assert!(line.contains("$D012=80") || line.contains("$D012=81"), "{line}");
     }
 }
