@@ -2061,6 +2061,23 @@ struct BreakRun {
     which: Option<String>,
     pc: u16,
     cycles_elapsed: u64,
+    /// Instructions the 6510 retired during the run (issue #89: not the cycle count).
+    instructions: u64,
+}
+
+/// Counts retired 6510 instructions; tee'd next to the observer registry in
+/// [`run_until_break`] so `until` can report a real `instructionsElapsed`.
+struct InstrCounter(u64);
+
+impl trx64_core::Observer for InstrCounter {
+    #[inline(always)]
+    fn on_instruction(&mut self, _: u16, _: u8, _: u8, _: u8, _: u8, _: u8, _: u8, _: u8, _: u8, _: u64) {
+        self.0 += 1;
+    }
+    #[inline(always)]
+    fn on_bus(&mut self, _: trx64_core::BusKind, _: u16, _: u8, _: u16, _: u64, _: u8) {}
+    #[inline(always)]
+    fn on_interrupt(&mut self, _: u16, _: u64) {}
 }
 
 /// The VICE-style register dump line used by the monitor + the breakpoint_hit
@@ -2801,6 +2818,7 @@ fn run_until_break(
 ) -> BreakRun {
     let start_clk = session.machine.clk;
     reg.clear_halt();
+    let mut counter = InstrCounter(0);
 
     let bp_set = reg.exec_breakpoint_set();
     // An access observer with a condition needs an exact per-instruction env
@@ -2841,6 +2859,7 @@ fn run_until_break(
                 which: None,
                 pc: session.machine.c64_core.reg_pc,
                 cycles_elapsed: elapsed,
+                instructions: counter.0,
             };
         }
         let seg_budget = (cycle_budget - elapsed).min(if seg_cap == u64::MAX {
@@ -2869,13 +2888,14 @@ fn run_until_break(
                 let mut tracing = TracingObserver::with_channels(FrameSink::events_only(), ch);
                 let s = {
                     let mut tee = trx64_core::TeeObserver::new(&mut *reg, &mut tracing);
+                    let mut counted = trx64_core::TeeObserver::new(&mut tee, &mut counter);
                     session.machine.run_for_full_capped_dbg(
                         seg_budget,
                         max_instr,
                         bp_ref,
                         None,
                         aw_ref,
-                        &mut tee,
+                        &mut counted,
                         |_, _, _, _, _, _, _| {},
                     )
                 };
@@ -2888,13 +2908,14 @@ fn run_until_break(
                 }
                 s
             } else {
+                let mut counted = trx64_core::TeeObserver::new(&mut *reg, &mut counter);
                 session.machine.run_for_full_capped_dbg(
                     seg_budget,
                     max_instr,
                     bp_ref,
                     None,
                     aw_ref,
-                    reg,
+                    &mut counted,
                     |_, _, _, _, _, _, _| {},
                 )
             }
@@ -2902,7 +2923,9 @@ fn run_until_break(
             // CPU-isolated path (no full machine). The dbg entry point lives on the
             // full SC path only; for the isolated path we step + check the bp set
             // manually so isolated gates still get exec breakpoints.
-            run_isolated_segment(&mut session.machine, bp_ref, max_instr, seg_budget)
+            let (stop, n) = run_isolated_segment(&mut session.machine, bp_ref, max_instr, seg_budget);
+            counter.0 += n;
+            stop
         };
 
         match stop {
@@ -2918,6 +2941,7 @@ fn run_until_break(
                         which,
                         pc,
                         cycles_elapsed: session.machine.clk.wrapping_sub(start_clk),
+                        instructions: counter.0,
                     };
                 }
                 // Cond false or ignored: step one instruction PAST the bp PC so the
@@ -2934,6 +2958,7 @@ fn run_until_break(
                     which,
                     pc,
                     cycles_elapsed: session.machine.clk.wrapping_sub(start_clk),
+                    instructions: counter.0,
                 };
             }
             trx64_core::RunStop::Device => {
@@ -2945,6 +2970,7 @@ fn run_until_break(
                     which: None,
                     pc,
                     cycles_elapsed: session.machine.clk.wrapping_sub(start_clk),
+                    instructions: counter.0,
                 };
             }
             trx64_core::RunStop::CycleBudget | trx64_core::RunStop::Completed => {
@@ -2957,6 +2983,7 @@ fn run_until_break(
                         which: None,
                         pc: session.machine.c64_core.reg_pc,
                         cycles_elapsed: 0,
+                        instructions: counter.0,
                     };
                 }
             }
@@ -2978,18 +3005,18 @@ fn run_isolated_segment(
     bp_set: Option<&std::collections::HashSet<u16>>,
     max_instr: u64,
     cycle_budget: u64,
-) -> trx64_core::RunStop {
+) -> (trx64_core::RunStop, u64) {
     let mut obs = NullSink;
     let mut executed = 0u64;
     let start = machine.cpu6510.clk;
     loop {
         if executed >= max_instr || machine.cpu6510.clk.wrapping_sub(start) >= cycle_budget {
-            return trx64_core::RunStop::CycleBudget;
+            return (trx64_core::RunStop::CycleBudget, executed);
         }
         let pc = machine.cpu6510.reg_pc;
         if let Some(bps) = bp_set {
             if bps.contains(&pc) {
-                return trx64_core::RunStop::Breakpoint(pc);
+                return (trx64_core::RunStop::Breakpoint(pc), executed);
             }
         }
         machine.run_for_capped(999_999, 1, &mut obs);
@@ -6126,7 +6153,13 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
 
         "until" => {
             let target_addr = args.first().and_then(|v| v.as_u64()).unwrap_or(0) as u16;
-            let cycle_budget: u64 = 10_000_000;
+            // Issue #89 — honour the caller's cycle budget: `until(addr, { budget })`
+            // (the AgentQueryApi shape c64-re's runtime_until sends) or a bare number.
+            // 10 000 000 cycles only when none is given.
+            let cycle_budget: u64 = args
+                .get(1)
+                .and_then(|o| o.get("budget").and_then(|v| v.as_u64()).or_else(|| o.as_u64()))
+                .unwrap_or(10_000_000);
             let mut st = state.lock().unwrap();
             let start_clk = st.session.machine.clk;
 
@@ -6169,12 +6202,13 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
             let final_pc = st.session.machine.c64_core.reg_pc;
             let cycles_elapsed = run.cycles_elapsed;
             let _ = start_clk;
-            // TS _instrCount() == cpu.cycles, so instructionsElapsed == cyclesElapsed.
+            // Issue #89 — retired instructions, counted during the run (it used to
+            // repeat the cycle count, after the TS `_instrCount() == cpu.cycles`).
             Response::ok(id, json!({
                 "halted": halted,
                 "budgetExhausted": budget_exhausted,
                 "cyclesElapsed": cycles_elapsed,
-                "instructionsElapsed": cycles_elapsed,
+                "instructionsElapsed": run.instructions,
                 "finalPc": final_pc as u64
             }))
         }
@@ -19208,7 +19242,7 @@ mod batch1_tests {
         let mut m = trx64_core::Machine::new();
         let budget = 5_000u64;
         let start = m.cpu6510.clk;
-        let stop = run_isolated_segment(&mut m, None, u64::MAX, budget);
+        let (stop, _) = run_isolated_segment(&mut m, None, u64::MAX, budget);
         let ran = m.cpu6510.clk.wrapping_sub(start);
         assert!(matches!(stop, trx64_core::RunStop::CycleBudget));
         assert!(ran >= budget, "must actually run the budget, ran {ran}");
