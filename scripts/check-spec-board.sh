@@ -23,15 +23,15 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-BOARD="docs/README.md"
+BOARD="docs/internal/README.md"
 fails=0
 note() { printf '  %s\n' "$1"; }
 fail() { printf '  FAIL  %s\n' "$1"; fails=$((fails + 1)); }
 
 [ -f "$BOARD" ] || { echo "  FAIL  no $BOARD — the board IS the check's subject"; exit 1; }
 
-specs=$(ls docs/[0-9]*.md 2>/dev/null | xargs -n1 basename 2>/dev/null | sort)
-[ -n "$specs" ] || { echo "  no numbered specs under docs/ — nothing to check"; exit 0; }
+specs=$(ls docs/internal/[0-9]*.md 2>/dev/null | xargs -n1 basename 2>/dev/null | sort)
+[ -n "$specs" ] || { echo "  no numbered specs under docs/internal/ — nothing to check"; exit 0; }
 
 count=0
 for f in $specs; do
@@ -45,7 +45,7 @@ for f in $specs; do
   fi
 
   # 3: the spec says what it is.
-  status_line=$(grep -m1 -E '^\*\*Status:?\*\*' "docs/$f" || true)
+  status_line=$(grep -m1 -E '^\*\*Status:?\*\*' "docs/internal/$f" || true)
   if [ -z "$status_line" ]; then
     fail "$f carries no \`**Status:**\` line"
     continue
@@ -83,7 +83,7 @@ done
 
 # Every board row must point at a real file.
 while read -r link; do
-  [ -f "docs/$link" ] || fail "the board links $link, which does not exist"
+  [ -f "docs/internal/$link" ] || fail "the board links $link, which does not exist"
 done < <(grep -oE '\(([0-9]+-[a-z0-9-]+\.md)\)' "$BOARD" | tr -d '()' | sort -u)
 
 note "$count spec(s) checked against $BOARD"

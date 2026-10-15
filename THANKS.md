@@ -10,7 +10,7 @@ an existing, proven design line by line.
 The vast majority of TRX64's emulation cores are a **direct, source-faithful
 port of [VICE](https://vice-emu.sourceforge.io/), the Versatile Commodore
 Emulator** — one C file → one Rust file, one C function → one Rust function,
-same names, same structure (see `crates/trx64-core/**` and the Spec-612 port
+same names, same structure (see `crates/trx64-core/**` and the port
 doctrine). In particular:
 
 - the cycle-exact **VIC-II** is a port of VICE's `viciisc/` (single-cycle) core,
@@ -37,7 +37,7 @@ contract, the test corpus, and the shared vision.
 
 ## vicspector, Linus Åkesson, Christian Bauer — the VIC-II, cycle by cycle
 
-The per-cycle record behind `vic/line_trace` and `vic/frame_map` (Specs 859/860) is drawn in
+The per-cycle record behind `vic/line_trace` and `vic/frame_map` is drawn in
 C64RE in the layout of [vicspector](https://github.com/elysium64/vicspector) by elysium64 (MIT),
 an interactive map of one VIC-II raster line. The raster techniques the frame map names — FLI,
 FLD, linecrunch, DMA delay (VSP), open borders, sprite crunch and stretch — are rules over what

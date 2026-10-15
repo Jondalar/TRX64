@@ -6,7 +6,7 @@ which is which. What survives the move is the DECISION — the thing that would 
 be re-derived from an argument nobody remembers having.
 
 Numbers are shared with C64RE; the registry is
-[`../../../C64ReverseEngineeringMCP/specs/README.md`](../../../C64ReverseEngineeringMCP/specs/README.md).
+[`../../../../C64ReverseEngineeringMCP/specs/README.md`](../../../../C64ReverseEngineeringMCP/specs/README.md).
 
 ---
 

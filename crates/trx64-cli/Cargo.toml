@@ -5,7 +5,7 @@ version.workspace = true
 license.workspace = true
 description = "Cross-platform CLI cockpit + on-demand emulator window for the TRX64 runtime (in-process)."
 
-# Spec: docs/spec-trx64-cli.md — a first-party cross-platform frontend that links
+# Spec: docs/internal/spec-trx64-cli.md — a first-party cross-platform frontend that links
 # `trx64-daemon` (the [lib] target) and drives the machine IN-PROCESS via `dispatch`
 # + the A/V-pull helpers. No daemon, no WS, no FFI. ratatui TUI cockpit + a
 # winit/cpal native emulator window, both on the SAME Arc<Mutex<State>> machine.

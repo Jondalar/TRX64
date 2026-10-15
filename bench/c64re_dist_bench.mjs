@@ -6,7 +6,7 @@
 //   node bench/c64re_dist_bench.mjs [pure|disk]
 //
 // Pairs with crates/trx64-core/tests/perf_bench.rs (the Rust side). See
-// docs/perf-compare.md for the methodology + the tsx-vs-dist caveat.
+// docs/internal/perf-compare.md for the methodology + the tsx-vs-dist caveat.
 
 import { startIntegratedSession } from "/Users/alex/Development/C64/Tools/C64ReverseEngineeringMCP/dist/runtime/headless/integrated-session-manager.js";
 

@@ -24,7 +24,7 @@ name = "trx64-traceindex"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
-description = "TRX64 native trace read: .c64retrace streaming reader + DuckDB index builder + query layer (Spec 802)."
+description = "TRX64 native trace read: .c64retrace streaming reader + DuckDB index builder + query layer."
 
 [dependencies]
 # The writer — single source of truth for the opcode values + format constants.

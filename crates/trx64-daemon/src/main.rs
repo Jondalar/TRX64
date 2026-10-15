@@ -85,9 +85,9 @@ struct Cli {
 
     /// Interface to bind. Default `127.0.0.1` (localhost only — the safe product/UI
     /// default). Set `0.0.0.0` to accept connections from OTHER hosts/containers, e.g. the
-    /// containerized sidecar (Spec 799) where the web app in a sibling container drives the
+    /// containerized sidecar where the web app in a sibling container drives the
     /// daemon over the bridge network. The daemon WS has NO auth, so only bind `0.0.0.0`
-    /// where the network is trusted / a reverse-proxy provides auth (Spec 799 §5.4).
+    /// where the network is trusted / a reverse-proxy provides auth.
     /// Also settable via the `TRX64_BIND` env var (the flag wins).
     #[arg(long)]
     bind: Option<String>,
@@ -99,46 +99,46 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     headless: bool,
 
-    /// Spec 851 — which machine this is, applied before anything runs: `c64` (default),
+    /// Which machine this is, applied before anything runs: `c64` (default),
     /// `u64` (also `c64u`, `ue2`: U64, Elite II and C64 Ultimate — turbo registers and a
     /// faster CPU), or `128` (the VIC-IIe probe profile).
     #[arg(long, default_value = "c64")]
     machine: String,
 
-    /// Spec 851 — the Ultimate's CPU speed table: `u64ii` (Elite II / C64 Ultimate,
+    /// The Ultimate's CPU speed table: `u64ii` (Elite II / C64 Ultimate,
     /// default) or `u64` (the first Ultimate 64).
     #[arg(long, default_value = "u64ii")]
     speed_table: String,
 
-    /// Spec 863 — which C64 this is, applied before any cycle runs: a `models.toml` row
+    /// Which C64 this is, applied before any cycle runs: a `models.toml` row
     /// (`c64-pal` default, `c64-ntsc`, `c64-paln`, …). A row that needs a building block
     /// this build lacks is refused at startup with the block's name.
     #[arg(long, default_value = "c64-pal")]
     model: String,
 
-    /// Spec 863 — shorthand for the two base rows: `pal` (= c64-pal) or `ntsc`
+    /// Shorthand for the two base rows: `pal` (= c64-pal) or `ntsc`
     /// (= c64-ntsc). Overrides `--model`.
     #[arg(long, value_parser = ["pal", "ntsc"])]
     video: Option<String>,
 
-    /// Spec 853 — attach a 17xx REU of this many KiB before anything runs: 128 (1700),
+    /// Attach a 17xx REU of this many KiB before anything runs: 128 (1700),
     /// 256 (1764), 512 (1750), or an oversized 1024..16384 with the wraparound bug a
     /// real 1750XL has. A CORE device, so this works on `c64` as well as `u64`.
     #[arg(long)]
     reu: Option<u32>,
 
-    /// Spec 853 — attach a GeoRAM of this many KiB instead (a whole number of 16 KiB
+    /// Attach a GeoRAM of this many KiB instead (a whole number of 16 KiB
     /// banks). The port holds one device, so this and `--reu` are alternatives.
     #[arg(long)]
     georam: Option<u32>,
 
-    /// Spec 853 D9 — preload the expansion RAM from a file. Read once at startup and
+    /// Preload the expansion RAM from a file. Read once at startup and
     /// NEVER written back: an REU is DRAM, not flash, and nothing here writes to the
     /// filesystem on its own (VICE's own REUImageWrite is off by default too).
     #[arg(long, value_name = "FILE")]
     reu_image: Option<String>,
 
-    /// Spec 887 — end the daemon after this many seconds idle: no request, no connected
+    /// End the daemon after this many seconds idle: no request, no connected
     /// client, no recording trace. 0 (the default) = never. Media are persisted first.
     #[arg(long, value_name = "SECONDS", default_value_t = 0)]
     idle_exit: u64,
@@ -3220,7 +3220,7 @@ fn reu_status_json(m: &trx64_core::Machine) -> Value {
             "ramUncoveredByLastRestore": m.expansion_ram_uncovered(),
         });
     }
-    json!({ "present": false, "note": "nothing on the expansion port (Spec 853)" })
+    json!({ "present": false, "note": "nothing on the expansion port" })
 }
 
 
@@ -3230,7 +3230,7 @@ fn uci_status_json(m: &trx64_core::Machine) -> Value {
         return json!({
             "machine": m.speed_profile().name(),
             "present": false,
-            "note": "the UCI block is part of the u64 profile (Spec 852)",
+            "note": "the UCI block is part of the u64 profile",
         });
     };
     json!({

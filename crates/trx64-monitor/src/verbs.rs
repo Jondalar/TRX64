@@ -723,7 +723,7 @@ pub fn reu_report(m: &trx64_core::Machine) -> String {
         ));
         if m.expansion_ram_uncovered() {
             out.push_str(
-                "  NOTE the last restore did NOT cover the REU RAM (Spec 853 D7): the ring\n                 \x20      carries the registers, never the 16 MB. The C64 is restored, this is not.\n",
+                "  NOTE the last restore did NOT cover the REU RAM: the ring\n                 \x20      carries the registers, never the 16 MB. The C64 is restored, this is not.\n",
             );
         }
         return out;
@@ -737,12 +737,12 @@ pub fn reu_report(m: &trx64_core::Machine) -> String {
             g.bank as u32 * 16384 + g.window as u32 * 256
         );
         if m.expansion_ram_uncovered() {
-            out.push_str("  NOTE the last restore did NOT cover the GeoRAM RAM (Spec 853 D7).\n");
+            out.push_str("  NOTE the last restore did NOT cover the GeoRAM RAM.\n");
         }
         return out;
     }
     "reu: nothing on the expansion port. Start the daemon with --reu 512 (or --georam 512); \
-     an empty port reads the open bus, not RAM (Spec 840)."
+     an empty port reads the open bus, not RAM."
         .to_string()
 }
 
@@ -750,8 +750,8 @@ pub fn reu_report(m: &trx64_core::Machine) -> String {
 pub fn uci_report(m: &trx64_core::Machine) -> String {
     let Some(s) = m.uci_status() else {
         return format!(
-            "uci: machine={} — no command interface: the UCI block is part of the u64 profile \
-             (Spec 852). `turbo mode u64`, or start the daemon with --machine u64.",
+            "uci: machine={} — no command interface: the UCI block is part of the u64 profile. \
+             `turbo mode u64`, or start the daemon with --machine u64.",
             m.speed_profile().name()
         );
     };

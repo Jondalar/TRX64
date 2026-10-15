@@ -5,7 +5,7 @@
 //! key-injection / rendering all EXCLUDED from the timed region. It is the Rust
 //! half of the cross-core comparison; the TS half lives in
 //! `bench/c64re_bench.ts` and runs the IDENTICAL workload on the c64re
-//! IntegratedSession. See `docs/perf-compare.md` for the methodology + results.
+//! IntegratedSession. See `docs/internal/perf-compare.md` for the methodology + results.
 //!
 //! These tests are `#[ignore]` so a normal `cargo test` never runs them. They
 //! ONLY produce a defensible number when built `--release` (debug is ~10x slower
@@ -34,7 +34,7 @@ const PAL_HZ: f64 = 985_248.444;
 /// to amortize cache effects. Override with TRX64_PURE_BUDGET to run the SAME
 /// reduced budget the TS bench uses (the TS core is ~200x slower, so the
 /// cross-core ratio is computed on a smaller identical budget — see
-/// docs/perf-compare.md).
+/// docs/internal/perf-compare.md).
 const PURE_BUDGET_DEFAULT: u64 = 100_000_000;
 const DISK_BUDGET_DEFAULT: u64 = 35_000_000;
 

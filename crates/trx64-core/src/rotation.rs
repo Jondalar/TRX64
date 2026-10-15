@@ -906,19 +906,19 @@ impl Rotation {
     /// P64 OoS stub — panics with the spec marker (never silent).
     #[allow(dead_code)]
     fn rotation_p64_get_delta(&mut self) -> u32 {
-        panic!("PORT-STUB: P64 not implemented per Spec 612 OoS (§10 PAL first, NTSC/P64 deferred)");
+        panic!("P64 disk images are not supported yet (PAL first; P64 is deferred)");
     }
 
     /// PORT OF: rotation.ts:721-725 (rotation.c:635-942 rotation_1541_p64).
     #[allow(dead_code)]
     fn rotation_1541_p64(&mut self, _ref_cycles: u64) {
-        panic!("PORT-STUB: P64 not implemented per Spec 612 OoS (§10 PAL first, NTSC/P64 deferred)");
+        panic!("P64 disk images are not supported yet (PAL first; P64 is deferred)");
     }
 
     /// PORT OF: rotation.ts:730-734 (rotation.c:944-983 rotation_1541_p64_cycle).
     #[allow(dead_code)]
     fn rotation_1541_p64_cycle(&mut self) {
-        panic!("PORT-STUB: P64 not implemented per Spec 612 OoS (§10 PAL first, NTSC/P64 deferred)");
+        panic!("P64 disk images are not supported yet (PAL first; P64 is deferred)");
     }
 
     /// PORT OF: rotation.ts:741-864 (rotation.c:989-1100 rotation_1541_simple).
@@ -1052,9 +1052,9 @@ impl Rotation {
 
         if self.complicated_image_loaded != 0 {
             if self.p64_image_loaded != 0 {
-                // P64 OoS stub — Spec 612 §10.
+                // P64 is out of scope for the port: stub, never silent.
                 panic!(
-                    "PORT-STUB: P64 not implemented per Spec 612 OoS (§10 PAL first, NTSC/P64 deferred)"
+                    "P64 disk images are not supported yet (PAL first; P64 is deferred)"
                 );
             }
             self.rotation_1541_gcr_cycle(clk);
@@ -1269,7 +1269,7 @@ impl Rotation {
         //
         //   complicated_image_loaded = (P64 || G64 || G71)
         //
-        // `docs/vice-1541-arch.md:231` writes that rule down and it was never
+        // `docs/internal/vice-1541-arch.md:231` writes that rule down and it was never
         // implemented: the flag was only ever SET (by a write, or a snapshot
         // restore) and never cleared, so it stayed at its power-on 0. Measured
         // across the 7-game gate, five of the seven titles — every G64 — ran on

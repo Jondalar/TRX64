@@ -10,7 +10,7 @@
 //!                                  2.5 µs flux filter, and random flux reversals
 //!                                  18 µs after the last real one
 //!
-//! `docs/vice-1541-arch.md:231` writes that rule down, and our attach does not
+//! `docs/internal/vice-1541-arch.md:231` writes that rule down, and our attach does not
 //! implement it. This probe reports, per gate title, which engine the machine is
 //! actually on — before the boot, after the mount, and after the LOAD.
 //!

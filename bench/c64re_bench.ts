@@ -26,7 +26,7 @@
  * shot (its runtime is "already optimized" via JIT), we run one full untimed
  * WARMUP iteration per workload before the K timed runs, so the hot paths are
  * JIT-compiled by the time we start the clock. This is documented as a
- * methodology choice in docs/perf-compare.md.
+ * methodology choice in docs/internal/perf-compare.md.
  */
 
 import { performance } from "node:perf_hooks";
@@ -46,7 +46,7 @@ const PAL_HZ = 985_248.444;
  *  than the Rust core, so for a tractable cross-core ratio both benches are run
  *  with a SMALLER identical budget via these env overrides (the MHz rate is
  *  budget-independent in steady state; the smaller budget just keeps the TS run
- *  to minutes instead of hours). See docs/perf-compare.md. */
+ *  to minutes instead of hours). See docs/internal/perf-compare.md. */
 const PURE_BUDGET = Number(process.env.C64RE_PURE_BUDGET ?? 100_000_000);
 const DISK_BUDGET = Number(process.env.C64RE_DISK_BUDGET ?? 35_000_000);
 const K_RUNS = Number(process.env.C64RE_K_RUNS ?? 7);

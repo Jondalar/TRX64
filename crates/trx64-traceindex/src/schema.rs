@@ -27,9 +27,26 @@ use duckdb::Connection;
 /// Value written into `meta.schema_version` by the Shape-A writer.
 pub const SHAPE_A_SCHEMA_VERSION: &str = "2";
 /// Value written into `meta.schema_version` by the indexer (Shape B).
-pub const SCHEMA_VERSION_726: &str = "spec-708-streaming";
+pub const SCHEMA_VERSION_726: &str = "trace-run-streaming";
 /// Value written into `meta.writer_version` by the indexer (Shape B).
-pub const WRITER_VERSION_726: &str = "spec-726.2c";
+pub const WRITER_VERSION_726: &str = "trace-indexer-2c";
+/// What stores written before the rename carry in `meta.schema_version`. They stay
+/// valid forever: nothing may reject a store for holding this value.
+pub const LEGACY_SCHEMA_VERSION_726: &str = "spec-708-streaming";
+/// What stores written before the rename carry in `meta.writer_version`.
+pub const LEGACY_WRITER_VERSION_726: &str = "spec-726.2c";
+
+/// True for every `meta.schema_version` a Shape-B store may carry: the current value
+/// and the one older stores hold. The shape itself is detected from the tables
+/// ([`store_shape`]); this is the check for anything that wants to compare the value.
+pub fn is_known_schema_version_726(v: &str) -> bool {
+    v == SCHEMA_VERSION_726 || v == LEGACY_SCHEMA_VERSION_726
+}
+
+/// True for every `meta.writer_version` a Shape-B store may carry.
+pub fn is_known_writer_version_726(v: &str) -> bool {
+    v == WRITER_VERSION_726 || v == LEGACY_WRITER_VERSION_726
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // §A — Shape A DDL (9 tables), verbatim. REFERENCE ONLY: no native writer.
@@ -206,7 +223,7 @@ CREATE OR REPLACE VIEW rollups AS
 /// They matter only when HEALING an old store.
 const COMPAT_BACKFILL_DDL: &str = r#"
 INSERT OR REPLACE INTO meta(key, value)
-  SELECT 'schema_version', 'spec-708-streaming'
+  SELECT 'schema_version', 'trace-run-streaming'
   WHERE NOT EXISTS (SELECT 1 FROM meta WHERE key='schema_version');
 INSERT OR REPLACE INTO meta(key, value)
   SELECT 'source', 'trace_event'
@@ -338,7 +355,7 @@ pub fn ensure_spec726_compat_layer(conn: &Connection) -> Result<()> {
         return Ok(());
     }
     conn.execute_batch(COMPAT_VIEWS_DDL)
-        .map_err(|e| TraceReadError::duck("install spec-726 compat views", e))?;
+        .map_err(|e| TraceReadError::duck("install trace compat views", e))?;
     conn.execute_batch(COMPAT_BACKFILL_DDL)
         .map_err(|e| TraceReadError::duck("backfill meta", e))?;
     Ok(())
@@ -355,4 +372,36 @@ pub fn has_compat_views(conn: &Connection) -> bool {
         |r| r.get(0),
     );
     matches!(n, Ok(5))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn both_schema_and_writer_values_are_accepted() {
+        assert!(is_known_schema_version_726("trace-run-streaming"));
+        assert!(is_known_schema_version_726("spec-708-streaming"));
+        assert!(!is_known_schema_version_726("2"));
+        assert!(is_known_writer_version_726(WRITER_VERSION_726));
+        assert!(is_known_writer_version_726("spec-726.2c"));
+    }
+
+    #[test]
+    fn healing_an_old_store_keeps_its_values_and_reads_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_trace_run_store(&conn).unwrap();
+        conn.execute_batch(
+            "UPDATE meta SET value='spec-708-streaming' WHERE key='schema_version'; \
+             INSERT OR REPLACE INTO meta VALUES ('writer_version','spec-726.2c');",
+        )
+        .unwrap();
+        ensure_spec726_compat_layer(&conn).unwrap();
+        let v: String = conn
+            .query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, LEGACY_SCHEMA_VERSION_726);
+        assert!(is_known_schema_version_726(&v));
+        assert_eq!(store_shape(&conn), StoreShape::Spec726);
+    }
 }

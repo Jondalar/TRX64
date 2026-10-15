@@ -1,2 +1,6 @@
-# pattern | reason   -- pattern is a substring of "where" (file:line / --help path) or of the offending text.
-crates/trx64-cli/src/tui.rs:1032 | " D8 " is the drive-8 label in the TUI media line, not a decision id
+# pattern | reason
+# A pattern is a substring of the "where" (file:line, or "--help: <command>") or of the offending
+# text. "where :: text" requires both. Every entry needs a reason after the bar.
+crates/trx64-cli/src/tui.rs:1032 | " D8 " is the drive-8 label on the TUI media line, not a decision id
+crates/trx64-traceindex/src/schema.rs :: spec-708-streaming | the value older trace stores hold in meta.schema_version; readers must keep accepting it, so it has to be spelled out once
+crates/trx64-traceindex/src/schema.rs :: spec-726.2c | the value older trace stores hold in meta.writer_version; same reason

@@ -25,7 +25,7 @@
 //   tsx src/integration.ts                 # full corpus + WS surface + xruntime snap
 //   tsx src/integration.ts --quick         # gate-7 + 2 broad, shorter budgets
 //   tsx src/integration.ts --only scramble # one corpus item by name substring
-//   tsx src/integration.ts --report docs/integration-report.md  # write scorecard
+//   tsx src/integration.ts --report docs/internal/integration-report.md  # write scorecard
 //
 // Exit 0 = all axes parity (or documented-criterion) PASS; 1 = a real divergence.
 

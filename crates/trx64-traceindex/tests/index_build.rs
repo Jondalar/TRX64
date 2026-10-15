@@ -283,8 +283,9 @@ fn full_fixture_builds_the_complete_shape_b_store() {
                 )
             })
             .collect();
-    assert_eq!(m["schema_version"], "spec-708-streaming");
-    assert_eq!(m["writer_version"], "spec-726.2c");
+    assert_eq!(m["schema_version"], "trace-run-streaming");
+    assert_eq!(m["writer_version"], "trace-indexer-2c");
+    assert!(trx64_traceindex::schema::is_known_schema_version_726(&m["schema_version"]));
     assert_eq!(m["source"], "trace_event");
     assert_eq!(m["run_id"], "run_live-capture_test1");
     assert_eq!(m["def_id"], "live-capture");

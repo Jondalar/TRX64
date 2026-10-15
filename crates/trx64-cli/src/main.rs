@@ -1,7 +1,7 @@
 //! trx64-cli — a cross-platform CLI cockpit + on-demand emulator window that drives
 //! the TRX64 runtime IN-PROCESS.
 //!
-//! Spec: `docs/spec-trx64-cli.md`. This binary links `trx64-daemon` (the `[lib]`
+//! Spec: `docs/internal/spec-trx64-cli.md`. This binary links `trx64-daemon` (the `[lib]`
 //! target) and calls `dispatch()` + the A/V-pull helpers directly — no daemon, no
 //! WebSocket, no FFI. One machine per process (`Arc<Mutex<State>>`), shared by:
 //!   - the ratatui TUI cockpit (a worker thread),
@@ -99,7 +99,7 @@ enum Command {
         json: bool,
     },
 
-    /// One-shot real-core execution sandbox (Spec 787 v1 + 788): boot a fresh
+    /// One-shot real-core execution sandbox: boot a fresh
     /// machine (this process = one throwaway scratch instance), load bytes, run the
     /// title's OWN routine to a sentinel, harvest a RAM slice. Runs on the
     /// AUTHORITATIVE 6502 — not the TS shadow — so a banking/IO depacker executes
@@ -117,14 +117,14 @@ enum Command {
         /// the cart already running in its banked state).
         #[arg(long)]
         cart: Option<String>,
-        /// Spec 790 — cart type for a raw `.bin` `--cart`: a VICE id (32, 86, …) or a shared id (87, 88)
+        /// Cart type for a raw `.bin` `--cart`: a VICE id (32, 86, …) or a shared id (87, 88)
         /// or mnemonic (ef/easyflash, gmod2, megabyter/mb, c64megacart/c64mc,
         /// magicdesk/md, md16, ocean, 8k, 16k, ultimax). REQUIRED for a raw `.bin`
         /// unless its type auto-detects structurally; an OPTIONAL header override for
         /// a `.crt`. Omit (or `auto`/`crt`) to auto-detect.
         #[arg(long = "cart-type")]
         cart_type: Option<String>,
-        /// Spec 815/851 — which machine this is (`c64` | `128` | `u64`), so a routine
+        /// Which machine this is (`c64` | `128` | `u64`), so a routine
         /// that PROBES for a turbo machine can be exercised here instead of only through
         /// a full boot. `--machine` is the same flag.
         #[arg(long, visible_alias = "machine")]
@@ -143,7 +143,7 @@ enum Command {
         /// Entry PC of the routine to call (hex). Required unless `--batch` is given.
         #[arg(long, value_parser = trx64_cli::disasm_cmd::parse_addr)]
         entry: Option<u16>,
-        /// Spec 805 — run N sandbox runs in THIS process instead of one, from a JSON
+        /// Run N sandbox runs in THIS process instead of one, from a JSON
         /// spec: an array (or `{"runs":[…]}`) whose items carry the SAME fields the
         /// single-run flags take (`entry`, `load`, `harvest`, `zp`, `seed`, …, camelCase
         /// for the two-word ones: `loadHex`, `cartType`, `stubAddr`, `cycCap`, `instrCap`,
@@ -221,7 +221,7 @@ enum Command {
         json: bool,
     },
 
-    /// Convert a VICE (or c64re-own) `.vsf` snapshot into a `.c64re` (Spec 791.2):
+    /// Convert a VICE (or c64re-own) `.vsf` snapshot into a `.c64re`:
     /// load the VSF into a fresh machine (isolated process, no daemon), dump a
     /// `.c64re` the runtime already reads (`sandbox --seed` / `undump`). Prints a
     /// fidelity report (loaded/coarse/absent + `faithful|partial|inspection-only`),
@@ -242,8 +242,8 @@ enum Command {
         render: Option<String>,
     },
 
-    /// Convert a `.c64re` snapshot into a VICE-x64sc-loadable `.vsf` (Spec 791.5,
-    /// the return trip): load the `.c64re` into an isolated machine, emit a `.vsf`
+    /// Convert a `.c64re` snapshot into a VICE-x64sc-loadable `.vsf` (the
+    /// return trip): load the `.c64re` into an isolated machine, emit a `.vsf`
     /// with VICE-exact module layouts (MAINCPU/C64MEM/CIA1/CIA2/SID/VIC-IISC). The
     /// un-modelled VIC draw-buffer is zeroed (VICE re-derives). E.g.
     ///   trx64cli convert-c64re wl.c64re wl.vsf
@@ -254,7 +254,7 @@ enum Command {
         output: String,
     },
 
-    /// Whitebox component-diff of two `.c64re` snapshots (Spec 794): a per-component
+    /// Whitebox component-diff of two `.c64re` snapshots: a per-component
     /// equivalence verdict (cpu/ram/colorram/cia/vic/sid/drive incl. Floppy RAM) with
     /// a caller exclusion mask. Reads the two checkpoints only — no machine, no
     /// daemon. The scoring step of the sandbox fan-out. E.g.
@@ -319,21 +319,21 @@ enum Command {
         #[arg(long)]
         trace: Option<String>,
         /// Comma-separated trace domains for --trace (default `cart-read`). The
-        /// armed-only lanes are `cart-read` (Spec 785 CART_READ 0x36) and
-        /// `drive-mechanism` (Spec 784 DRIVE_HEAD/BLOCK_READ); `c64-cpu` / `memory`
+        /// armed-only lanes are `cart-read` (CART_READ 0x36) and
+        /// `drive-mechanism` (DRIVE_HEAD/BLOCK_READ); `c64-cpu` / `memory`
         /// are the firehose, and on a full boot they are enormous.
         #[arg(long, default_value = "cart-read")]
         trace_domains: String,
-        /// Spec 815 — which machine this claims to be, for a release that PROBES
+        /// Which machine this claims to be, for a release that PROBES
         /// before taking a turbo code path: `c64` (default), `128` (the VIC-IIe
         /// $D02F/$D030 pair), `u64` (an extended $D031). On a plain C64 those reads
         /// are $FF, the probe fails, and the whole turbo half of the release is
-        /// never reached. `--machine` is the same flag (Spec 851).
+        /// never reached. `--machine` is the same flag.
         #[arg(long, default_value = "c64", visible_alias = "machine")]
         turbo: String,
         /// Set the speed bit right after mounting, as the release would. Needs
-        /// --turbo 128 or u64. On u64 the CPU really runs faster (Spec 851, 4 MHz);
-        /// on 128 the bit is stored only (Spec 815 §3).
+        /// --turbo 128 or u64. On u64 the CPU really runs faster (4 MHz);
+        /// on 128 the bit is stored only.
         #[arg(long, default_value_t = false)]
         turbo_on: bool,
     },

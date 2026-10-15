@@ -134,7 +134,7 @@ not valid single-disk parity datapoints and are excluded from the gate.
 ```
 cd tools/oracle
 node_modules/.bin/tsx src/integration.ts --only scramble \
-  --report ../../docs/integration-report.md     # live c64re vs TRX64
+  --report ../../docs/internal/integration-report.md     # live c64re vs TRX64
 node_modules/.bin/tsx src/integration.ts --only scramble --self   # fast self-test
 ```
 

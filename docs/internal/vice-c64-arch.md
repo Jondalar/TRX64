@@ -1352,7 +1352,7 @@ drive CPU is fast-forwarded to `maincpu_clk` first. There is **no
 per-N-cycle batch**. A clone must replicate this lazy-sync pattern:
 the drive sees `clk` jumps of varying size (1 cycle to thousands)
 between calls, and the rotation accumulator must absorb the delta
-verbatim. See `docs/vice-iec-arc42.md` §6 for the sequence diagrams.
+verbatim. See `docs/internal/vice-iec-arc42.md` §6 for the sequence diagrams.
 
 ---
 

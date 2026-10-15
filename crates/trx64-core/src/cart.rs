@@ -503,13 +503,13 @@ pub trait CartMapper: Send {
     /// restored (Spec 792 cart restore reloads the original flash). Default:
     /// unsupported (read-only mappers / non-flash families).
     fn overlay_bank_write(&mut self, _space: &str, _bank: u16, _addr: u16, _byte: u8) -> Result<(), String> {
-        Err("banked overlay (Spec 795) not implemented for this mapper".into())
+        Err("banked overlay write not implemented for this mapper".into())
     }
 
     /// Read one byte back from a cart bank IMAGE (side-effect-free), for the overlay
     /// read-back / bank-isolation check. Default: unsupported.
     fn overlay_bank_read(&self, _space: &str, _bank: u16, _addr: u16) -> Result<u8, String> {
-        Err("banked overlay read (Spec 795) not implemented for this mapper".into())
+        Err("banked overlay read not implemented for this mapper".into())
     }
 }
 
@@ -686,9 +686,8 @@ impl std::fmt::Display for CrtError {
             CrtError::BinTypeAmbiguous => {
                 write!(
                     f,
-                    "Raw .bin cartridge type could not be structurally auto-detected (Spec 790 S1). \
-                     Pass an explicit --cart-type <id|mnemonic> (e.g. megabyter, c64megacart, ef, magicdesk). \
-                     Automatic resolution of ambiguous flash carts is the runtime self-configuring harness (Spec 790 S2)."
+                    "Raw .bin cartridge type could not be structurally auto-detected. \
+                     Pass an explicit --cart-type <id|mnemonic> (e.g. megabyter, c64megacart, ef, magicdesk)."
                 )
             }
         }

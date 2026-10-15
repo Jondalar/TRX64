@@ -10,9 +10,10 @@ commit messages and in test names. They may NOT appear in:
      binaries are run recursively);
   2. string literals of non-test code in crates/*/src (RPC answers, errors, notes,
      monitor output, panics) -- comments and #[cfg(test)] modules are stripped;
-  3. doc FILE NAMES and doc CONTENTS outside docs/internal/ (README.md, MONITOR.md,
+  3. package `description =` lines in Cargo.toml (published metadata);
+  4. doc FILE NAMES and doc CONTENTS outside docs/internal/ (README.md, MONITOR.md,
      THANKS.md, CHECKLIST.md, docs/*.md);
-  4. the values the trace store writes (covered by 2: they are string literals).
+  5. the values the trace store writes (covered by 2: they are string literals).
 
 Exceptions live in scripts/public-surface-allow.txt, one reason per entry.
 
@@ -28,6 +29,7 @@ ID = re.compile(
     r"(?i:\bspecs?[ -]?\d)"          # Spec 853, spec-708, Specs 85x
     r"|\bBUG-?\d"                     # BUG-061
     r"|\bOQ\d|\bUX\d"                 # OQ4, UX1
+    r"|/\d{3}-[a-z][\w.-]*\.md"        # a numbered spec file name used as a path
     r"|§"                             # section signs
     r"|(?<![\$\w])[DS][1-9]\b"        # decision / slice ids D7, S1 (not $D2)
     r"|(?:issue|PR) ?#\d+|(?<![&\w])#[1-9]\d{1,3}\b"  # issue numbers used as names
@@ -52,7 +54,11 @@ def load_allow():
 ALLOW = load_allow()
 def allowed(where, text):
     for pat, _ in ALLOW:
-        if pat in where or pat in text:
+        if "::" in pat:
+            w, t = [x.strip() for x in pat.split("::", 1)]
+            if w in where and t in text:
+                return True
+        elif pat in where or pat in text:
             return True
     return False
 
@@ -171,7 +177,8 @@ def scan_sources():
                     hit("%s:%d" % (rel, line), s.replace("\\n", " ").replace("\n", " "))
 
 # ---- 3. docs: file names + contents ---------------------------------------
-USER_DOCS = ["README.md", "MONITOR.md", "THANKS.md", "CHECKLIST.md"]
+USER_DOCS = ["README.md", "MONITOR.md", "THANKS.md", "CHECKLIST.md",
+             "crates/trx64-cli/README.md", "crates/trx64-ffi/API.md"]
 def scan_docs():
     files = subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard"],
                            capture_output=True, text=True).stdout.split("\n")
@@ -181,6 +188,10 @@ def scan_docs():
         if f.startswith("docs/") and not f.startswith("docs/internal/"):
             if FILE_ID.match(os.path.basename(f)) or ID.search(f):
                 hit("file name: " + f, f)
+        if f.endswith("Cargo.toml"):
+            for no, ln in enumerate(open(f, encoding="utf-8"), 1):
+                if ln.startswith("description") and ID.search(ln):
+                    hit("%s:%d" % (f, no), ln)
         user = f in USER_DOCS or (f.startswith("docs/") and not f.startswith("docs/internal/") and f.endswith(".md"))
         if user:
             for no, ln in enumerate(open(f, encoding="utf-8"), 1):

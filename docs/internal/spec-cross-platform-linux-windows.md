@@ -71,7 +71,7 @@ cargo zigbuild --release -p trx64-daemon --target x86_64-pc-windows-gnu
    path-handling for `\` vs `/` + temp-dir assumptions.
 3. **WS bind** on Windows (firewall prompt on first `127.0.0.1` listen) — cosmetic.
 4. **The trace-read sidecar** shells to Node — fine on Linux/Windows if Node present;
-   the native Rust DuckDB reader (`docs/spec-trace-read-duckdb-native.md`) removes
+   the native Rust DuckDB reader (`docs/internal/spec-trace-read-duckdb-native.md`) removes
    that dependency for a truly standalone Win/Linux daemon.
 
 ## Acceptance

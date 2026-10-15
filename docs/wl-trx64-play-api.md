@@ -9,11 +9,11 @@ frozen and documented for consumers; **the daemon does not change for this.**
 - **Consumer:** any front-end. **The recommended path is to embed the shipped
   `<trx64-player>` web component (`web/trx64-player.js`)** — it already implements this
   whole contract (frame decode, key map, audio, reconnect). An embedder writes one tag;
-  it never re-implements §4/§5. See §9. This doc specifies the wire protocol underneath it
+  it never re-implements sections 4 and 5. See section 9. This doc specifies the wire protocol underneath it
   for anyone who must build a client from scratch (non-JS, custom UI).
-- **Scope of this doc:** the methods + frame formats the play loop needs (§1-§9), plus the
+- **Scope of this doc:** the methods + frame formats the play loop needs (sections 1 to 9), plus the
   **monitor** — the daemon's full VICE-superset debugger, reachable over the SAME socket
-  and documented in §10. A pure viewer can ignore §10; anything that wants to inspect,
+  and documented in section 10. A pure viewer can ignore section 10; anything that wants to inspect,
   break or step the running machine needs nothing beyond it.
 
 ---
@@ -27,7 +27,7 @@ frozen and documented for consumers; **the daemon does not change for this.**
   `{"jsonrpc":"2.0","id":<n>,"result":…}` or `{… ,"error":{"code","message"}}`.
   Server-initiated **notifications** (no `id`) also arrive as text, e.g.
   `{"method":"debug/running", …}`.
-- **A/V = BINARY frames** (§4). Every binary WS message is one video or audio frame.
+- **A/V = BINARY frames** (section 4). Every binary WS message is one video or audio frame.
 
 There is **one live machine per container**. Every client connected to the
 same container drives/sees the SAME machine — the emulator is a single shared C64, not
@@ -38,7 +38,7 @@ subscriber starts the pacing loop). A client that only speaks JSON-RPC connects 
 `ws://host:port/?av=0`: no binary frames, no pacing loop started on its account, and it
 does not count as a viewer for `--idle-exit`.
 
-**No auth on the daemon WS** — see §7.
+**No auth on the daemon WS** — see section 7.
 
 ---
 
@@ -76,11 +76,11 @@ All are JSON-RPC `method`s. `params` shown; omit `session_id` (single machine).
 | `daemon/keep_alive` | `{ "seconds": number \| null }` | with `--idle-exit`: hold the daemon at least `seconds` from now, `null` = never end on idle; the request itself resets the idle window. Returns `{ armed, armedSeconds, deadlineMs \| null, keptAliveUntilMs \| null, keptForever, holding: "subscriber"\|"trace"\|null }` (epoch ms; `deadlineMs` null = it will not end: off, kept forever, or held by an A/V subscriber or a recording trace). A plain RPC connection holds nothing — only its requests reset the window. `session/state` carries the same `idleExit` |
 | `daemon/shutdown` | — (params ignored) | end the daemon cleanly: stops the run, ends a recording trace like `trace/run/stop` (its `.c64retrace` complete on disk), persists a dirty cartridge and both drives' disks as eject does, replies `{ ok: true, persisted: { cartridge: path \| null, disks: [path…] }, trace: path \| null, exitCode: 0 }`, flushes the reply to the caller's socket, then exits 0 (the caller sees the reply, then the connection close). SIGTERM and SIGINT (on Windows Ctrl-C, Ctrl-Break, console close) and the idle exit run the same exit work once |
 | `session/create` | `{ "model"?: "c64-pal"\|"c64-ntsc"\|…, "exerciser"?: bool }` | attaches/creates the one machine; returns session id + state. With a `model` other than the machine's, switches the machine to it at the next frame boundary (a machine that is off becomes that model at its next power-on). `exerciser: true` declares a CPU/chip exerciser — bytes poked, PC set, run cycle-exact on the CPU-isolated core without VIC, CIA keyboard scan or drive; `false` makes it a C64 again. Nothing else leaves the full machine: loading a PRG, typing or poking through the monitor never does, and a mounted disk or an inserted cartridge keeps even an exerciser on the full machine |
-| `session/state` | — | `{ c64Cycles, runState:"running"\|"paused", powered:bool, media:{cart,disk}, cpu:{pc,a,x,y,sp,flags}, vic:{…}, controlOwner, streamPump (true only while an A/V client keeps the stream pump running), model, videoStandard, chip, cyclesPerLine, linesPerFrame, cyclesPerFrame, cpuHz, frameRate, canvas:{width,height}, … }` — see §3.1 |
+| `session/state` | — | `{ c64Cycles, runState:"running"\|"paused", powered:bool, media:{cart,disk}, cpu:{pc,a,x,y,sp,flags}, vic:{…}, controlOwner, streamPump (true only while an A/V client keeps the stream pump running), model, videoStandard, chip, cyclesPerLine, linesPerFrame, cyclesPerFrame, cpuHz, frameRate, canvas:{width,height}, … }` — see section 3.1 |
 | `session/models` | — | `{ models:[{ name, title, runs, missing, videoStandard, chip, cyclesPerLine, linesPerFrame, cyclesPerFrame, cpuHz, frameRate, … }], current }` — every C64 model, whether it runs here, and what a model that does not is missing |
 | `session/model` | `{ "name": "c64-ntsc" }` | switch the running machine to another model at the next frame boundary. Not a power cycle: the program keeps its RAM, CPU, CIA and SID state and the standard it detected at boot — a clean start on the new model is `session/reset` or a power cycle afterwards. Reply: `{ from, model, switched, switchedAt:{c64Cycles,rasterLine,rasterCycle}, kept:{cpu,ram,cia,sid}, … }` |
 | `media/mount` | `{ "path": "/play/x.crt" }` | mount `.crt`/`.d64`/`.g64`/`.d81` (the type is read from the content; a `.d81` needs a 1581 at that unit); a cart power-cycles + boots. Returns `{ detail:{ mapperType, name, … }, … }` |
-| `session/key_down` | `{ "key": "<NAME>" }` | press one C64 key (held). `key` = PETSCII name (§5) |
+| `session/key_down` | `{ "key": "<NAME>" }` | press one C64 key (held). `key` = PETSCII name (section 5) |
 | `session/key_up` | `{ "key": "<NAME>" }` | release it |
 | `session/joystick_set` | `{ "port":2, "up":bool, "down":bool, "left":bool, "right":bool, "fire":bool }` | set port-2 joystick lines (omit = false) |
 | `session/joystick_clear` | `{ "port":2 }` | release all lines |
@@ -90,7 +90,7 @@ All are JSON-RPC `method`s. `params` shown; omit `session_id` (single machine).
 | `session/power` | `{ "op":"off"\|"on" }` | the general switch. **off** stops the machine entirely (use it around a build that replaces the mounted file); **on** boots it back with whatever is registered |
 | `session/set_pacing` | `{ "mode":"realtime"\|"warp"\|"fixed-ratio", "ratio":num }` | how fast the machine runs. `realtime` = the model's own frame rate (~50.12/s PAL, ~59.83/s NTSC; `pal` is accepted as its old name), **`warp`** = as fast as the host allows (measured ~8× on a Mac; less on a NAS, where realtime already costs ~40 % of a core). Reported back in `session/state.pacing` |
 | `session/reset` | `{ "mode":"soft"\|"cold" }` | **soft** = hardware RESET line (RAM + media preserved). **cold** = full power-cycle. Default when `mode` is omitted: **cold** |
-| `snapshot/dump` | `{ "path":"/dumps/x.c64re" }` | write a full state snapshot (RAM + cart + flash + framebuffer). Written BY THE DAEMON, so the path must be writable **inside the container** — see §6.1 |
+| `snapshot/dump` | `{ "path":"/dumps/x.c64re" }` | write a full state snapshot (RAM + cart + flash + framebuffer). Written BY THE DAEMON, so the path must be writable **inside the container** — see section 6.1 |
 | `snapshot/undump` | `{ "path":"…" }` | restore one (power-cycles) |
 
 **These mutate a SHARED machine.** One power-off / reset / mount stops the game for
@@ -190,7 +190,7 @@ Joystick: WASD/arrows → `session/joystick_set {port:2, …}`; the C64 games re
   can never starve the web app.
 - **One machine, shared.** Everyone attached sees and drives the SAME C64 — that is the
   design, not a limit: one person plays while another watches. It also means every mutating
-  call (§3) hits everybody. Scale-out = more containers.
+  call (section 3) hits everybody. Scale-out = more containers.
 - **The time-machine runs too.** In streaming mode (the container default) the checkpoint ring
   and the recorder feed automatically — that is what makes scrub/rewind possible, and it is
   already inside the ~150 MiB measured above. Tunable via env if a memory cap is tight:
@@ -263,15 +263,15 @@ reach it by service name / static IP on the shared bridge, or a published port o
 ## 9. Consuming it — embed the shipped `<trx64-player>` web component
 
 TRX64 ships the browser client alongside the daemon: **`web/trx64-player.js`**, a
-self-contained, framework-free custom element. It owns the frame decode (§4), the PETSCII
-key map (§5), audio, focus/input handling, and auto-reconnect — so a consumer never
+self-contained, framework-free custom element. It owns the frame decode (section 4), the PETSCII
+key map (section 5), audio, focus/input handling, and auto-reconnect — so a consumer never
 re-implements the protocol. This is deliberate: the frame format lives with TRX64, who
 defines it, and the editor stays untouched. An embedder writes **one tag**:
 
 ```html
 <script type="module" src="/trx64-player.js"></script>
 
-<!-- ws through your auth proxy (§7); image = container-side path in /play -->
+<!-- ws through your auth proxy (section 7); image = container-side path in /play -->
 <trx64-player ws="wss://editor.example/ws/play" image="/play/wl.crt" audio></trx64-player>
 ```
 
@@ -308,19 +308,19 @@ that wants its own bar can ignore these and drive the RPCs through `call()`.
 guessing: `trx64-connected` `{state}`, `trx64-state` `{state}`, `trx64-runstate` `{runState}`.
 
 The editor's Play tab is then just: serve `trx64-player.js`, proxy `/ws/play` to the
-daemon with auth (§7), drop the tag into the Play panel. No decode code, no key tables.
+daemon with auth (section 7), drop the tag into the Play panel. No decode code, no key tables.
 
 `web/demo.html` is a zero-dependency harness that boots a cart with only this component —
 the exact shape an editor embeds.
 
-**Building a client from scratch (non-JS / custom UI):** §4 (byte-exact frames) + §5
+**Building a client from scratch (non-JS / custom UI):** section 4 (byte-exact frames) + section 5
 (key names) are the full wire spec; `web/trx64-player.js` is the reference implementation
 to read. The Play loop is: connect WS → `session/create` → `media/mount` → blit BIN_VIC
-frames onto a canvas of the frame's own `w`×`h` (384×272 PAL, 384×247 NTSC) → forward keys as §5 names.
+frames onto a canvas of the frame's own `w`×`h` (384×272 PAL, 384×247 NTSC) → forward keys as section 5 names.
 
 ---
 
-Cross-links: the packaging + sidecar-architecture spec (`../../C64ReverseEngineeringMCP/specs/799-trx64-docker.md`), `docker/Dockerfile` (the image), `web/trx64-player.js` (the shipped client) + `web/demo.html` (embed harness).
+Cross-links: `docker/Dockerfile` (the image), `web/trx64-player.js` (the shipped client) + `web/demo.html` (embed harness).
 
 ---
 
@@ -378,7 +378,7 @@ let it run.
 ### 10.2 On a shared machine
 
 The monitor mutates. `bk` + `g` stops the machine for **everyone** attached, `z` steps it
-under them, and `undump` replaces the world. That is the same warning as §3's power/reset
+under them, and `undump` replaces the world. That is the same warning as section 3's power/reset
 group, and it applies with more force here because a breakpoint fires later, when whoever
 set it may no longer be looking.
 

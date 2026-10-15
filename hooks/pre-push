@@ -139,6 +139,16 @@ for f in $CHANGED; do
 done
 
 if [ "$NEEDS_GATE" = "0" ]; then
+  # A docs-only push skips the full gate, but the public-surface rule is about docs too:
+  # no internal ids in user docs or doc file names. The check without the --help walk
+  # needs no build and takes a moment.
+  if [ "${GATE_DRYRUN:-0}" != "1" ] && command -v python3 >/dev/null 2>&1 &&
+     [ "$CHANGED" != "BRANCH-DELETION" ] && [ "$CHANGED" != "NOT-A-PROTECTED-BRANCH" ]; then
+    if ! python3 "$REPO_ROOT/scripts/check-public-surface.py" --no-help >&2; then
+      printf '\n=== push blocked — internal references on the public surface ===\n\n' >&2
+      exit 1
+    fi
+  fi
   COUNT=$(printf '%s\n' "$CHANGED" | wc -l | tr -d ' ')
   printf '\n=== quality gate skipped — %s file(s), no code on a protected branch ===\n\n' "$COUNT" >&2
   [ "${GATE_DRYRUN:-0}" = "1" ] && printf '%s\n' "$CHANGED" >&2
