@@ -2943,6 +2943,14 @@ fn run_until_break(
             trx64_core::RunStop::Breakpoint(pc) => {
                 // Core halted AT pc, before executing it. Apply the cond/ignore gate.
                 reg.set_env(observers::CpuSnapshot::from_machine(&session.machine));
+                // Issue #9 — the bytes a `do log $addr` prints, peeked side-effect free
+                // (`read_full`: the CPU's banked view, I/O registers without a read
+                // strobe) at this boundary, before the instruction at `pc` runs.
+                let addrs = reg.exec_log_addrs(pc);
+                if !addrs.is_empty() {
+                    let peeks = addrs.iter().map(|&a| (a, session.machine.read_full(a))).collect();
+                    reg.set_exec_peeks(peeks);
+                }
                 let real = reg.on_exec(pc);
                 if real {
                     let which = reg.last_halt.as_ref().map(|h| h.name.clone());
@@ -27578,5 +27586,26 @@ mod batch1_tests {
         let log = mon_exec(&st, "obs log");
         let got: Vec<&str> = log.lines().filter_map(|l| l.find("store $").map(|i| &l[i..i + 15])).collect();
         assert_eq!(got, ["store $D030=$FE", "store $D030=$00"], "{log}");
+    }
+    /// Issue #9 (criterion 4) — `do log $addr` of an exec observer prints the byte, I/O
+    /// registers included (side-effect free), instead of `??`.
+    #[test]
+    fn issue9_exec_log_prints_memory_and_io_bytes() {
+        let Some(st) = booted_state() else { return };
+        call(&st, "debug/pause", json!({ "source": "test" }));
+        // $C000: SEI; LDA #$80; CMP $D012 ($C003); BNE $C003; STA $D030 ($C008); JMP *.
+        let code = [0x78, 0xA9, 0x80, 0xCD, 0x12, 0xD0, 0xD0, 0xFB, 0x8D, 0x30, 0xD0, 0x4C, 0x0B, 0xC0];
+        {
+            let mut g = st.lock().unwrap();
+            g.session.machine.poke(0xC000, &code);
+            g.session.machine.poke(0xC100, &[0x34, 0x12]);
+            g.session.machine.c64_core.reg_pc = 0xC000;
+        }
+        mon_exec(&st, "obs t3 when exec c008 do log a $d012 $c100 $c100:w");
+        call(&st, "session/run", json!({ "cycles": 25000 }));
+        let log = mon_exec(&st, "obs log");
+        let line = log.lines().find(|l| l.contains("exec $C008")).unwrap_or_else(|| panic!("{log}"));
+        assert!(line.contains("$C100=34 $C100=1234"), "{line}");
+        assert!(line.contains("$D012=80") || line.contains("$D012=81"), "{line}");
     }
 }

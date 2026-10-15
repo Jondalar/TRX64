@@ -487,6 +487,12 @@ pub struct ObserverRegistry {
     /// at each `on_access` hit (Rust can't reach back into the Machine from the
     /// trait method, so the daemon pushes it in via [`Self::set_env`]).
     env: CpuSnapshot,
+    /// Issue #9 — the bytes a `do log $addr` of an EXEC observer prints: peeked by the
+    /// daemon (side-effect free, `Machine::read_full`) at the boundary just before
+    /// [`Self::on_exec`], see [`Self::exec_log_addrs`]. Cleared by `on_exec`. A load /
+    /// store observer fires inside the instruction, where the registry cannot reach the
+    /// machine; its memory fields stay `??`.
+    exec_peeks: Vec<(u16, u8)>,
 }
 
 impl Default for ObserverRegistry {
@@ -511,6 +517,7 @@ impl ObserverRegistry {
             pending_trace: Vec::new(),
             observers: Vec::new(),
             env: CpuSnapshot::default(),
+            exec_peeks: Vec::new(),
         }
     }
 
@@ -699,6 +706,46 @@ impl ObserverRegistry {
     /// true if a break-action matched → the caller halts with PC AT `pc`. The
     /// env must be set (via [`set_env`]) to the at-`pc` CPU state first.
     pub fn on_exec(&mut self, pc: u16) -> bool {
+        let halt = self.on_exec_inner(pc);
+        self.exec_peeks.clear();
+        halt
+    }
+
+    /// Issue #9 — the addresses the `do log` memory fields of the enabled exec observers
+    /// at `pc` print (a `:w` field needs two). The caller peeks them (side-effect free)
+    /// and hands them in with [`Self::set_exec_peeks`] before [`Self::on_exec`].
+    pub fn exec_log_addrs(&self, pc: u16) -> Vec<u16> {
+        let mut out = Vec::new();
+        for o in &self.observers {
+            if !o.enabled || o.trigger != ObsTrigger::Exec || pc < o.lo || pc > o.hi {
+                continue;
+            }
+            if o.action != ObsAction::Log {
+                continue;
+            }
+            for ex in o.log_exprs.iter().flatten() {
+                if let LogExpr::Mem { addr, word } = ex {
+                    out.push(*addr);
+                    if *word {
+                        out.push(addr.wrapping_add(1));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Issue #9 — the peeked bytes for [`Self::exec_log_addrs`], valid for the next
+    /// [`Self::on_exec`] only.
+    pub fn set_exec_peeks(&mut self, peeks: Vec<(u16, u8)>) {
+        self.exec_peeks = peeks;
+    }
+
+    fn exec_peek(&self, addr: u16) -> Option<u8> {
+        self.exec_peeks.iter().find(|(a, _)| *a == addr).map(|(_, v)| *v)
+    }
+
+    fn on_exec_inner(&mut self, pc: u16) -> bool {
         let mut halt = false;
         // Index by position to satisfy the borrow checker (matches/fire borrow &self).
         for idx in 0..self.observers.len() {
@@ -916,11 +963,18 @@ impl ObserverRegistry {
                 LogExpr::Reg(RegName::Sp) => format!("sp={:02X}", rsp),
                 LogExpr::Reg(RegName::Fl) => format!("fl={:02X}", rfl),
                 LogExpr::Mem { addr, word } => {
-                    // Mem peeks resolved by the daemon are not available inside the
-                    // registry; the daemon-rendered path is used for live logs. Here
-                    // we emit the address placeholder to keep the format stable.
+                    // Issue #9 — an exec observer prints the bytes the daemon peeked at
+                    // the boundary (`set_exec_peeks`). A load/store observer (`cx` set)
+                    // fires inside the instruction, where no peek is available: the
+                    // placeholder keeps the format stable.
+                    let peek = |a: u16| if cx.is_none() { self.exec_peek(a) } else { None };
                     if *word {
+                        if let (Some(lo), Some(hi)) = (peek(*addr), peek(addr.wrapping_add(1))) {
+                            return format!("${}={:02X}{:02X}", hx_addr(*addr), hi, lo);
+                        }
                         format!("${}=????", hx_addr(*addr))
+                    } else if let Some(v) = peek(*addr) {
+                        format!("${}={:02X}", hx_addr(*addr), v)
                     } else {
                         format!("${}=??", hx_addr(*addr))
                     }

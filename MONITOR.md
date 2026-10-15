@@ -134,7 +134,7 @@ you care about across interrupts.
 **`do <action>`** — one of:
 
 - `break` — halt the run on hit (default).
-- `log [fields]` — append a log line (non-halting). Fields: `a x y sp pc fl` or `$addr[:w]` (`:w` = 16-bit). E.g. `do log $fd $fe $ff a x y`.
+- `log [fields]` — append a log line (non-halting). Fields: `a x y sp pc fl` or `$addr[:w]` (`:w` = 16-bit). E.g. `do log $fd $fe $ff a x y`. An `exec` observer prints each `$addr` as the CPU would read it just before the instruction runs, peeked without side effects (I/O registers included: `obs r when exec 08c3 do log a $d012` shows the raster line at the `STA` at `$08C3`). A `load`/`store` observer fires inside the instruction, where no peek is taken: its `$addr` fields print `??` — log the raster line at a store with an `exec` observer on the storing instruction.
 - `mark ["label"]` — drop a trace bookmark on hit (default label = the observer name).
 - `cmd "<monitor command>"` — run any monitor command on each hit.
 - `trace [domains]\|off` — start / stop a scoped trace capture (**bracket model**). Domains: `c64-cpu drive8-cpu iec vic memory drive-mechanism cart-read` (default `c64-cpu memory`); `do trace off` stops. The last two are the armed-only READ-SET lanes — `drive-mechanism` records which physical block the 1541 latched bytes off (the sector whose header the head last passed, header and data bytes apart, with the C64 clock beside the drive clock), `cart-read` which cartridge bank served which reads. Neither runs unless its domain is named.
