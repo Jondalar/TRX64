@@ -734,6 +734,7 @@ fn run_one_gated(session: &mut Session, prologue_only: bool) -> Option<u16> {
     // machine the scenario RUNS on (incl. the `vic`-directed full-machine engage).
     let full_machine = full_machine_gate(session);
     let mut obs = InterruptCaptureObserver::new();
+    let retired = session.machine.instructions_retired;
     if full_machine {
         session.machine.c64_core.step_entry_stop = true;
         session.machine.c64_core.step_prologue_only = prologue_only;
@@ -743,6 +744,11 @@ fn run_one_gated(session: &mut Session, prologue_only: bool) -> Option<u16> {
     } else if !prologue_only {
         // The CPU-only exerciser path takes no hardware interrupts.
         session.machine.run_for_capped(999_999, 1, &mut obs);
+    }
+    // The run loop counted the call. A prologue alone, or an entry that ended the call,
+    // ran no opcode: take it back.
+    if prologue_only || obs.vector.is_some() {
+        session.machine.instructions_retired = retired;
     }
     obs.vector
 }
@@ -6094,12 +6100,16 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
         }
 
         "stepOver" => {
-            // opts is optional first arg (or second depending on spec); args[0] is opts
-            let _opts = args.first();
-            let cycle_budget: u64 = 100_000;
+            // stepOver(opts?): args[0] = { budget } in CYCLES, default 100_000.
+            let cycle_budget: u64 = args
+                .first()
+                .and_then(|o| o.get("budget"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(100_000);
             let mut st = state.lock().unwrap();
             let st = &mut *st;
             let start_clk = st.session.machine.clk;
+            let start_instr = st.session.machine.instructions_retired;
             let bp_set: std::collections::HashSet<u16> =
                 st.mon.breakpoints.entries.iter().map(|e| e.pc).collect();
             // The monitor's `n`: a JSR, and an IRQ/NMI taken during the step, are run
@@ -6113,22 +6123,28 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
             };
             let final_pc = st.session.machine.cpu6510.reg_pc;
             let cycles_elapsed = st.session.machine.clk.wrapping_sub(start_clk);
-            // TS _instrCount() == cpu.cycles (not a real instruction counter), so
-            // instructionsElapsed == cyclesElapsed in all TS-generated goldens.
+            let instructions_elapsed = st.session.machine.instructions_retired.wrapping_sub(start_instr);
             Response::ok(id, json!({
                 "halted": halted,
                 "haltReason": halt_reason,
                 "cyclesElapsed": cycles_elapsed,
-                "instructionsElapsed": cycles_elapsed,
+                "instructionsElapsed": instructions_elapsed,
                 "finalPc": final_pc as u64
             }))
         }
 
         "until" => {
+            // until(addr, opts?): args[1] = { budget } in CYCLES, default 10_000_000. The run
+            // stops at the target PC or at the first instruction boundary at or past the
+            // budget, so it can end up to one instruction (and its stolen cycles) over.
             let target_addr = args.first().and_then(|v| v.as_u64()).unwrap_or(0) as u16;
-            let cycle_budget: u64 = 10_000_000;
+            let cycle_budget: u64 = args
+                .get(1)
+                .and_then(|o| o.get("budget"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(10_000_000);
             let mut st = state.lock().unwrap();
-            let start_clk = st.session.machine.clk;
+            let start_instr = st.session.machine.instructions_retired;
 
             // `until <addr>` runs until the target PC OR any armed breakpoint trips
             // (consults the bp SET, not just the single target — Spec 754 + VICE
@@ -6168,13 +6184,12 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
             let budget_exhausted = !run.halted;
             let final_pc = st.session.machine.c64_core.reg_pc;
             let cycles_elapsed = run.cycles_elapsed;
-            let _ = start_clk;
-            // TS _instrCount() == cpu.cycles, so instructionsElapsed == cyclesElapsed.
+            let instructions_elapsed = st.session.machine.instructions_retired.wrapping_sub(start_instr);
             Response::ok(id, json!({
                 "halted": halted,
                 "budgetExhausted": budget_exhausted,
                 "cyclesElapsed": cycles_elapsed,
-                "instructionsElapsed": cycles_elapsed,
+                "instructionsElapsed": instructions_elapsed,
                 "finalPc": final_pc as u64
             }))
         }
@@ -6265,7 +6280,7 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
         // stepOut(opts?): StepOutResult — run until the current subroutine returns
         // (the monitor's `ret`: VICE level counting, interrupts run through). agent-api.ts:240 → MonitorAPI.stepOut
         // (monitor.ts:312). Same {halted, cyclesElapsed, instructionsElapsed, finalPc}
-        // shape; instructionsElapsed == cyclesElapsed (TS _instrCount == cpu.cycles).
+        // shape. args[0] = { budget }: an iteration cap, default 1_000_000.
         "stepOut" => {
             let budget: u64 = args
                 .first()
@@ -6275,6 +6290,7 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
             let mut st = state.lock().unwrap();
             let st = &mut *st;
             let start_clk = st.session.machine.clk;
+            let start_instr = st.session.machine.instructions_retired;
             let bp_set: std::collections::HashSet<u16> =
                 st.mon.breakpoints.entries.iter().map(|e| e.pc).collect();
             // The monitor's `ret`: the current frame returns; an IRQ/NMI taken on the way
@@ -6283,10 +6299,11 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
             let halted = why != StopWhy::Cap;
             let cycles_elapsed = st.session.machine.clk.wrapping_sub(start_clk);
             let final_pc = st.session.machine.cpu6510.reg_pc;
+            let instructions_elapsed = st.session.machine.instructions_retired.wrapping_sub(start_instr);
             Response::ok(id, json!({
                 "halted": halted,
                 "cyclesElapsed": cycles_elapsed,
-                "instructionsElapsed": cycles_elapsed,
+                "instructionsElapsed": instructions_elapsed,
                 "finalPc": final_pc as u64
             }))
         }

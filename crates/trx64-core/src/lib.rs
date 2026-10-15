@@ -740,6 +740,12 @@ pub struct Machine {
     /// every instruction advances `clk`. Env kill-switch `TRX64_TURBO_FASTPATH=0`, read at
     /// `Machine::new`; the field can be flipped at any time.
     pub turbo_fast_path: bool,
+    /// C64 instructions executed since the machine was built: one per pass of a run loop.
+    /// A pass under the step gates that runs no opcode (`step_prologue_only`, or an entry
+    /// that `step_entry_stop` ended) counts too; the caller that set the gate takes it
+    /// back. Not part of a snapshot: a reader takes the difference across the run it
+    /// measures.
+    pub instructions_retired: u64,
     /// Spec 784 loader-lens — armed-on-command 1541 disk-mechanism head trace. OFF by
     /// default (does NOT run with the always-on CPU ring). When armed, a `(drv_clk,
     /// halftrack, sector)` sample is pushed whenever the sector under the head changes,
@@ -837,6 +843,7 @@ impl Clone for Machine {
             cpu_history: self.cpu_history.clone(),
             delta_ring: self.delta_ring.clone(),
             turbo_fast_path: self.turbo_fast_path.clone(),
+            instructions_retired: self.instructions_retired,
             head_trace_armed: self.head_trace_armed.clone(),
             head_trace: self.head_trace.clone(),
             head_trace_last: self.head_trace_last.clone(),
@@ -1027,6 +1034,7 @@ impl Machine {
             uci_c64_reset: false,
             cpu_history: crate::cpu_history::CpuHistoryRing::new(),
             delta_ring: crate::delta_ring::DeltaRing::new(),
+            instructions_retired: 0,
             turbo_fast_path: !matches!(
                 std::env::var("TRX64_TURBO_FASTPATH").map(|v| v.trim().to_ascii_lowercase()).as_deref(),
                 Ok("0") | Ok("off") | Ok("false") | Ok("no")
@@ -3752,6 +3760,7 @@ impl Machine {
                 }
             }
             executed += 1;
+            self.instructions_retired += 1;
         }
         drop(bus);
         self.sync_snapshot();
@@ -4144,6 +4153,7 @@ impl Machine {
                             break;
                         }
                         executed += 1;
+                        self.instructions_retired += 1;
                         // A fresh bus starts each instruction pre-fetch: the prologue's
                         // interrupt accesses carry the live PC, not the last opcode's.
                         bus.fetched = false;
@@ -4223,6 +4233,7 @@ impl Machine {
                 }
             }
             executed += 1;
+            self.instructions_retired += 1;
             // A watchpoint that hit during this instruction halts NOW, at the
             // boundary AFTER the post-instruction drive/SID sync (= TS
             // integrated-session.ts:989-992: haltRequested honored after
@@ -4274,6 +4285,7 @@ impl Machine {
                 }
             }
             executed += 1;
+            self.instructions_retired += 1;
         }
         drop(bus);
         self.sync_snapshot();
@@ -4321,6 +4333,7 @@ impl Machine {
                 }
             }
             executed += 1;
+            self.instructions_retired += 1;
         }
         drop(bus);
         self.sync_snapshot();
@@ -4373,6 +4386,7 @@ impl Machine {
             let instruction_cycles = self.cpu6510.clk.wrapping_sub(clk_before);
             bus.sid.tick(instruction_cycles, bus.sid_regs);
             executed += 1;
+            self.instructions_retired += 1;
         }
         drop(bus);
         self.sync_snapshot();
@@ -4437,6 +4451,7 @@ impl Machine {
                 on_drive_step(pc, a, x, y, sp, p, drv_clk);
             }
             executed += 1;
+            self.instructions_retired += 1;
         }
         drop(bus);
         self.sync_snapshot();
