@@ -1859,7 +1859,7 @@ fn run_budget_honouring_breaks(st: &mut State, cycles: u64) -> BudgetRun {
     {
         let pc = st.session.machine.c64_core.reg_pc;
         if st.mon.breakpoints.entries.iter().any(|e| e.enabled && e.pc == pc) {
-            step_one_instruction(&mut st.session);
+            step_past_observed(st);
         }
     }
     let run = {
@@ -2353,7 +2353,7 @@ fn run_debug_control(id: Value, st: &mut State, frame: u64, _is_continue: bool) 
     {
         let pc = st.session.machine.c64_core.reg_pc;
         if st.mon.breakpoints.entries.iter().any(|e| e.enabled && e.pc == pc) {
-            step_one_instruction(&mut st.session);
+            step_past_observed(st);
         }
     }
 
@@ -2659,7 +2659,7 @@ pub(crate) fn stream_debug_gated_advance(st: &mut State, budget: u64) -> u32 {
         {
             let pc = st.session.machine.c64_core.reg_pc;
             if st.mon.breakpoints.entries.iter().any(|e| e.enabled && e.pc == pc) {
-                step_one_instruction(&mut st.session);
+                step_past_observed(st);
             }
         }
         // ── Armed: bp/observer-gated segment run, self-halting at the first hit. ──
@@ -2776,6 +2776,24 @@ pub(crate) fn stream_debug_gated_advance(st: &mut State, budget: u64) -> u32 {
     drain_and_broadcast_observer_log(st);
 
     st.session.machine.c64_core.clk.wrapping_sub(clk_before) as u32
+}
+
+/// Issue #9 — step the one instruction a resume steps PAST (the breakpoint / exec
+/// observer the PC stands on) with the load/store observers armed, so a store or load of
+/// that instruction is counted and logged like any other. [`step_one_instruction`] runs
+/// it over a NullSink with no access-watch gate. A `do break` requested by this one
+/// instruction does not stop the resume (the run that follows starts with a clear halt
+/// flag), exactly as before; its hit and its log line are kept.
+fn step_past_observed(st: &mut State) {
+    let State { session, mon, .. } = &mut *st;
+    let reg = &mut mon.observers;
+    if !full_machine_gate(session) || !reg.access_armed() {
+        step_one_instruction(session);
+        return;
+    }
+    reg.set_env(observers::CpuSnapshot::from_machine(&session.machine));
+    let aw = reg.access_watch_owned();
+    let _ = run_full_segment(session, reg, 999_999, 1, None, aw.as_deref(), None);
 }
 
 /// One full-machine segment of [`run_until_break`]: the registry drives the core gates
@@ -3554,7 +3572,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             // observer half of this check explicitly.
             let on_exec_obs = st.mon.observers.exec_active && st.mon.observers.exec_watch[gpc as usize] != 0;
             if on_exec_obs || st.mon.breakpoints.entries.iter().any(|e| e.pc == gpc) {
-                step_one_instruction(&mut st.session);
+                step_past_observed(st);
             }
             st.session.running = true;
             st.ctrl_stop = None;
@@ -27538,5 +27556,27 @@ mod batch1_tests {
                 assert_eq!(got, want(regs), "profile {profile}, exec observer {exec_obs}: obs list {list}");
             }
         }
+    }
+    /// Issue #9 — resuming from a breakpoint that stands ON a store steps that store past
+    /// the breakpoint; the store observer still sees it.
+    #[test]
+    fn issue9_store_observer_sees_the_store_a_resume_steps_past() {
+        let Some(st) = booted_state() else { return };
+        call(&st, "debug/pause", json!({ "source": "test" }));
+        // $C000: SEI; LDA #$FE; STA $D030 ($C003); LDA #$00; STA $D030; JMP *.
+        let code = [0x78, 0xA9, 0xFE, 0x8D, 0x30, 0xD0, 0xA9, 0x00, 0x8D, 0x30, 0xD0, 0x4C, 0x0B, 0xC0];
+        {
+            let mut g = st.lock().unwrap();
+            g.session.machine.poke(0xC000, &code);
+            g.session.machine.c64_core.reg_pc = 0xC000;
+        }
+        mon_exec(&st, "obs t1 when store d030 do log a");
+        mon_exec(&st, "bk c003");
+        let r = call(&st, "session/run", json!({ "cycles": 3000 }));
+        assert_eq!(r["breakpoint"]["pc"], json!(0xC003), "{r}");
+        call(&st, "session/run", json!({ "cycles": 3000 }));
+        let log = mon_exec(&st, "obs log");
+        let got: Vec<&str> = log.lines().filter_map(|l| l.find("store $").map(|i| &l[i..i + 15])).collect();
+        assert_eq!(got, ["store $D030=$FE", "store $D030=$00"], "{log}");
     }
 }
