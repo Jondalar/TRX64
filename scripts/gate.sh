@@ -108,6 +108,20 @@ else
   die_red "the debug-build interrupt path FAILED (overflow checks on)" "$OLOG"
 fi
 
+# No internal references where a user or an LLM can see them: --help of both
+# binaries, string literals in non-test code, doc file names and doc contents outside
+# docs/internal/. Allow-list with one reason per entry: scripts/public-surface-allow.txt.
+PLOG=$(mktmp)
+if command -v python3 >/dev/null 2>&1; then
+  if python3 scripts/check-public-surface.py >"$PLOG" 2>&1; then
+    green "public surface: $(tail -1 "$PLOG")"
+  else
+    die_red "internal references on the public surface" "$PLOG"
+  fi
+else
+  skip "python3 not on PATH — public-surface check NOT run"
+fi
+
 # ── [3/4] 7-game behavioral gate ─────────────────────────────────────────────
 printf '[3/4] 7-game behavioral gate (release, ~25s)\n'
 SNAP=$(mktmpd)

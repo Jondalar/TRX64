@@ -1,0 +1,2 @@
+# pattern | reason   -- pattern is a substring of "where" (file:line / --help path) or of the offending text.
+crates/trx64-cli/src/tui.rs:1032 | " D8 " is the drive-8 label in the TUI media line, not a decision id
