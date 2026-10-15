@@ -1,6 +1,6 @@
 # Features
 
-One line per feature, as of 0.13.0. Details: [`README.md`](../README.md), monitor:
+One line per feature, as of 0.13.1. Details: [`README.md`](../README.md), monitor:
 [`MONITOR.md`](../MONITOR.md), Swift API: [`crates/trx64-ffi/API.md`](../crates/trx64-ffi/API.md).
 
 ## Machine
@@ -72,7 +72,7 @@ One line per feature, as of 0.13.0. Details: [`README.md`](../README.md), monito
 - Checkpoint ring of full machine states, 60 s default (`cadence`, `window`); rewind transport (`play back|fwd`, `frame ±N`, `goto`, F9-F12).
 - Marks: named, pinned points that survive cutting the future (`mark`, `marks`, `goto <name>`).
 - Always-on reverse ring, 10 s default (`rstep`, `whowrote`, `chis`, `revdepth`); `ringdump`/`ringload` carry it with its marks as a `.c64rering`.
-- Checkpoint diffs (`diff`, `trx64cli diff`), sandbox runs (`sandbox/run`, `sandbox/runMany` — patches plus timed inputs, each run on a machine of its own; `trx64cli sandbox`), overlays (`runtime/overlay_run`), scenarios (`runtime/scenario_*`, `batch/*`).
+- Checkpoint diffs (`diff`, `trx64cli diff`), sandbox runs (`sandbox/run`, `sandbox/runMany` — patches plus timed inputs, each run on a machine of its own, with the RAM it wrote next to its I/O; `trx64cli sandbox`), overlays (`runtime/overlay_run`), scenarios (`runtime/scenario_*`, `batch/*`).
 
 ## Debugging
 
@@ -80,7 +80,7 @@ One line per feature, as of 0.13.0. Details: [`README.md`](../README.md), monito
 - Bank lens `cpu|ram|rom|io|cart` on `m`/`d`; `device drive<unit>` reads a drive CPU.
 - Breakpoints (`bk`), observers on exec, load or store with conditions and actions (`obs`).
 - Step into, over, until, return; flow focus on main, IRQ, NMI or BRK (`focus`, `sf`, `nf`, `flow`, `bt`); JAM auto-break with `triage`, `traprules`.
-- Traces of CPU, drive CPU, IEC, VIC, memory, drive mechanism and cartridge reads to `.c64retrace`, indexed into DuckDB (`trace`, `tracedb`, `traceindex`).
+- Traces of CPU, drive CPU, IEC, VIC, memory, drive mechanism and cartridge reads to `.c64retrace`, indexed into DuckDB (`trace`, `tracedb`, `traceindex`); the drive's block reads carry both clocks and the header/data split, credited to the sector under the head.
 - `tracering` builds a trace after the fact from the reverse ring; `map`, `taint`, `swimlane` analyse a trace.
 - Bus and device reports: `iec`, `io`, `drive`, `cart`, `folder`, `pot`, `reu`, `georam`, `uci`, `turbo`.
 - `trx64cli disasm`: static disassembly of a PRG or raw image, no ROMs.
