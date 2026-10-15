@@ -259,27 +259,31 @@ fn lockstep(label: &str, off: &mut Machine, on: &mut Machine, steps: u64) -> u64
 ///
 /// Round 3 (D16, the IRQ line a quarter PHI2 cycle late at turbo): the nine IRQ-driven `@64`
 /// digests re-recorded; `cia2_nmi@64` (NMI, not delayed) and every `@1` unchanged.
+/// #77 (2026-10-15): all twenty re-recorded. A stack PULL is a real read now (VICE
+/// mem_read_check_ba), so the RTI/RTS/PLA pulls enter the bus-record stream as Read instead
+/// of DummyRead. With every $01xx read left out of the digest, old and new code give the
+/// same twenty values: the machine did not move, only the record kind of the pulls.
 const GOLDEN: &[(&str, u64)] = &[
-    ("ta_irq@1", 0xa246b6efb6558752),
-    ("ta_irq@64", 0x633f313ce333cb45),
-    ("ta_irq_timer_read@1", 0x4b70672fac9eaa9d),
-    ("ta_irq_timer_read@64", 0xb65e679fed609885),
-    ("ta_oneshot@1", 0x3b54bfe7e21b8689),
-    ("ta_oneshot@64", 0x4dacdfaf6c022813),
-    ("tb_cascade_l0@1", 0x98a9131c0bae633a),
-    ("tb_cascade_l0@64", 0x7944a192b13c0029),
-    ("tb_cascade_l1@1", 0xf7adcbf78ead153a),
-    ("tb_cascade_l1@64", 0xc1c50c012aea6266),
-    ("tb_cascade_l2@1", 0x5ed3218521a1dc17),
-    ("tb_cascade_l2@64", 0xb8c0bdc7afc74a01),
-    ("cia2_nmi@1", 0x1a928b753aadd799),
-    ("cia2_nmi@64", 0x5b283234c3c0e275),
-    ("tod_alarm@1", 0xde2b5ecaf5b8347c),
-    ("tod_alarm@64", 0x7078fac06f303c8c),
-    ("restore_cascade@1", 0x3da6ee42bde8de72),
-    ("restore_cascade@64", 0x636a6c9d7a36288e),
-    ("booted@1", 0xfa6905d085cfff85),
-    ("booted@64", 0x8d40cb7050cbc808),
+    ("booted@1", 0xc9c1ffbafe76da09),
+    ("booted@64", 0x3b3f1fc8427c095c),
+    ("restore_cascade@1", 0x31a3cc4e2e8ba73e),
+    ("restore_cascade@64", 0x6574b8267767eeca),
+    ("ta_irq@1", 0x64e984707cb7dee8),
+    ("ta_irq@64", 0xa89f2b28e7c7cb4f),
+    ("ta_irq_timer_read@1", 0xd6a66daeba5015f7),
+    ("ta_irq_timer_read@64", 0x5f91054b9e90ca13),
+    ("ta_oneshot@1", 0x38c6dd2e4a20e99b),
+    ("ta_oneshot@64", 0xf4fc238bd70bb97d),
+    ("tb_cascade_l0@1", 0x1fc65c4c37c8f260),
+    ("tb_cascade_l0@64", 0x9c9f44716d5efd99),
+    ("tb_cascade_l1@1", 0x01aeb9d460b04b4c),
+    ("tb_cascade_l1@64", 0xb1e12015bcc08a7a),
+    ("tb_cascade_l2@1", 0xcd0cc83daab855a3),
+    ("tb_cascade_l2@64", 0xba97560a3238a1db),
+    ("cia2_nmi@1", 0x7da1d2c990b9bf71),
+    ("cia2_nmi@64", 0xe5d4438cded26cdd),
+    ("tod_alarm@1", 0x11e4c9a763a82782),
+    ("tod_alarm@64", 0x0074b0a2bc3c7af6),
 ];
 
 fn golden(label: &str, digest: u64, printed: &mut Vec<String>) {

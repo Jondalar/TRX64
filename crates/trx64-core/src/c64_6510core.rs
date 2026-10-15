@@ -1204,12 +1204,9 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
     fn pull(&mut self) -> u8 {
         self.core.reg_sp = self.core.reg_sp.wrapping_add(1);
         self.check_ba();
-        // Stack PULL is a real read whose VALUE is used, but it is NOT emitted as a
-        // data-bus record in the trace contract (cpu.rs popped the stack via a bare
-        // `load` with no on_bus emit). The dummy variant does the real read for the
-        // value and tags it DummyRead (filtered out of the trace). The stack is
-        // always RAM ($0100-$01FF), so dummy vs real has no side-effect difference.
-        self.bus.read_raw_dummy(0x100u16.wrapping_add(self.core.reg_sp as u16))
+        // PULL = mem_read_check_ba (m64:441): a real data read, so it reaches the
+        // trace as one. Only STACK_PEEK below is the dummy read.
+        self.bus.read_raw(0x100u16.wrapping_add(self.core.reg_sp as u16))
     }
     #[inline]
     fn stack_peek(&mut self) -> u8 {
@@ -3207,6 +3204,35 @@ mod tests {
         step(&mut core, &mut bus, &mut int);
         assert_eq!(core.reg_x, 0x43, "INX incremented X");
         assert_eq!(core.clk - clk2, 2, "INX took 2 cycles");
+    }
+
+    /// PULL is a real read (m64:441 mem_read_check_ba), STACK_PEEK the dummy one
+    /// (m64:445). A stack copy loop (PLA / STA) is invisible to a trace otherwise.
+    #[test]
+    fn stack_pull_is_a_real_read_and_the_peek_a_dummy() {
+        let mut core = C64Core6510::new();
+        let mut bus = RamBus::new();
+        let mut int = IntStatus::new();
+
+        // 68  PLA   with SP = $fd, $01fe = $5a.
+        bus.ram[0x1000] = 0x68;
+        bus.ram[0x01fe] = 0x5a;
+        core.reg_pc = 0x1000;
+        core.reg_sp = 0xfd;
+        step(&mut core, &mut bus, &mut int);
+        assert_eq!(core.reg_a, 0x5a);
+        assert!(bus.trace.contains(&('r', 0x01fd, 0)), "peek is a dummy: {:?}", bus.trace);
+        assert!(bus.trace.contains(&('R', 0x01fe, 0x5a)), "pull is real: {:?}", bus.trace);
+        assert!(!bus.trace.contains(&('r', 0x01fe, 0x5a)), "pull not dummy: {:?}", bus.trace);
+
+        // 60  RTS   pulls lo then hi, both real: $01ff = $34, $0100 (wrapped) = $12.
+        bus.ram[0x1001] = 0x60;
+        bus.ram[0x01ff] = 0x34;
+        bus.ram[0x0100] = 0x12;
+        step(&mut core, &mut bus, &mut int);
+        assert_eq!(core.reg_pc, 0x1235);
+        let pulls: Vec<_> = bus.trace.iter().filter(|t| t.0 == 'R' && t.1 & 0xff00 == 0x0100).collect();
+        assert_eq!(pulls, vec![&('R', 0x01ff, 0x34), &('R', 0x0100, 0x12)], "{:?}", bus.trace);
     }
 
     /// SHX $nnnn,Y ($9e) — the illegal opcode the audit flagged. Proves the
