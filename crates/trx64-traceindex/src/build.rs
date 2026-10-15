@@ -12,6 +12,7 @@
 
 use crate::decode::{self, ParsedHeader};
 use crate::error::{Result, TraceReadError};
+use crate::media;
 use crate::rows::event_to_row;
 use crate::schema;
 use duckdb::{params, Connection};
@@ -30,18 +31,15 @@ pub struct IndexOverrides {
     pub stop_checkpoint_id: Option<String>,
     pub branch_id: Option<String>,
     pub overhead_ms: Option<f64>,
-    /// Spec 802 R2 **J-3**: TRX64 defines `TraceOp::Mark = 0x01` but has no
-    /// `write_mark` — marks live only in `TraceState.marks` and the stop
-    /// descriptor, so a TRX64-captured `.c64retrace` contains ZERO 0x01 records
-    /// and `trace_mark` comes out empty (⇒ the `anchors` view is empty ⇒
-    /// `listAnchors`/`findAnchor` return nothing).
+    /// Spec 802 R2 **J-3**: a user's marks live only in `TraceState.marks` and
+    /// the stop descriptor, never in the `.c64retrace`; without these
+    /// `trace_mark` comes out empty (⇒ the `anchors` view is empty ⇒
+    /// `listAnchors`/`findAnchor` return nothing). The only 0x01 records TRX64
+    /// writes are the `media/1` records (Spec 909), and those go to
+    /// `trace_media`, not here.
     ///
-    /// Passing them here is fix (a): the zero-format-change route, matching the
-    /// TS `runOverrides` mechanism. When non-empty these REPLACE the marks
-    /// decoded from the file. Fix (b) — also encoding 0x01 frames in
-    /// `FrameSink` so the file is self-describing — is an additive use of an
-    /// already-defined opcode and is still an open decision; nothing here
-    /// blocks it.
+    /// Passing them here matches the TS `runOverrides` mechanism. When
+    /// non-empty these REPLACE the marks decoded from the file.
     pub marks: Option<Vec<(u64, String)>>,
 }
 
@@ -143,6 +141,8 @@ fn build_into(
     let mut event_count: u64 = 0;
     let mut since_flush: u64 = 0;
     let mut marks: Vec<(u64, String)> = Vec::new();
+    let mut media_rows: Vec<media::MediaRow> =
+        media::rows_from_header(header.meta.media.as_ref(), trunc_u64(header.meta.cycle_start));
     let mut channels: Vec<&'static str> = Vec::new();
     // Append failures are parked here — the streaming closure cannot return one.
     let mut append_err: Option<TraceReadError> = None;
@@ -152,8 +152,13 @@ fn build_into(
             return;
         }
         if ev.op == decode::OP_MARK {
-            // MARK consumes NO seq and produces no trace_event row.
-            marks.push((ev.clock(), ev.label.clone().unwrap_or_default()));
+            // MARK consumes NO seq and produces no trace_event row. A media record
+            // (Spec 909) is a row of `trace_media`, not a mark.
+            let label = ev.label.clone().unwrap_or_default();
+            match media::row_from_mark(ev.clock(), &label) {
+                Some(row) => media_rows.push(row),
+                None => marks.push((ev.clock(), label)),
+            }
             return;
         }
         let this_seq = seq;
@@ -213,6 +218,7 @@ fn build_into(
     }
     let mark_count = marks.len() as u64;
     write_trace_run_header(&conn, &header, &summary, event_count, &marks, overrides)?;
+    write_trace_media(&conn, &run_id, &media_rows)?;
 
     // Fold the WAL into the .duckdb BEFORE closing, so a SEPARATE process
     // reading the file sees the rows. Skipping this reproduces the historical
@@ -228,6 +234,33 @@ fn build_into(
         channels: channels.len(),
         output_path: duckdb_path.display().to_string(),
     })
+}
+
+/// Spec 909 — the `trace_media` rows: the header's start state, then the records.
+fn write_trace_media(conn: &Connection, run_id: &str, rows: &[media::MediaRow]) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = conn
+        .prepare("INSERT INTO trace_media VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+        .map_err(|e| TraceReadError::duck_build("prepare trace_media insert", e))?;
+    for r in rows {
+        stmt.execute(params![
+            run_id,
+            r.cycle,
+            r.slot.as_deref(),
+            r.action.as_str(),
+            r.sha256.as_deref(),
+            r.format.as_deref(),
+            r.source_name.as_deref(),
+            r.hw_type,
+            r.mapper_type.as_deref(),
+            r.banks,
+            r.crt_name.as_deref(),
+        ])
+        .map_err(|e| TraceReadError::duck_build("insert trace_media", e))?;
+    }
+    Ok(())
 }
 
 /// Write the single `trace_run` row, the `trace_mark` rows and the 8 `meta`

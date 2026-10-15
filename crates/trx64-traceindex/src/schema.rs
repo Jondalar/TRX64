@@ -1,9 +1,10 @@
 //! DuckDB index schema — the DDL, the compat layer, and store-shape detection.
 //!
-//! **NO SCHEMA CHANGE.** Every statement below is verbatim from the reference
-//! implementation (`trace-run-store.ts` for Shape B, `duckdb-store.ts` for
-//! Shape A). Existing stores keep working; a store built by this crate is
-//! indistinguishable from a TS-built one apart from the two wall-clock
+//! Every statement below is verbatim from the reference implementation
+//! (`trace-run-store.ts` for Shape B, `duckdb-store.ts` for Shape A), with one
+//! addition: Shape B's `trace_media` table (Spec 909, which media a capture ran
+//! on — see [`crate::media`]). Existing stores keep working; a store built by this
+//! crate differs from a TS-built one in that table and the two wall-clock
 //! timestamp columns.
 //!
 //! # Two store shapes
@@ -11,7 +12,7 @@
 //! | | Shape A — "Spec-217 native store" | Shape B — "Spec-726 index store" |
 //! |---|---|---|
 //! | who writes it | the dev / VICE-capture producer (TS only, no TRX64 counterpart) | **this crate's indexer** |
-//! | base tables | 9, incl. real `anchors` / `rollups` | 4: `trace_run`, `trace_event`, `trace_mark`, `meta` |
+//! | base tables | 9, incl. real `anchors` / `rollups` | 5: `trace_run`, `trace_event`, `trace_mark`, `trace_media`, `meta` |
 //! | `anchors` / `rollups` | base tables filled post-hoc | **VIEWs** (`anchors` over `trace_mark`, `rollups` permanently empty) |
 //! | detected by | absence of `trace_event` | presence of `trace_event` |
 //!
@@ -87,7 +88,7 @@ CREATE TABLE IF NOT EXISTS trace_bookmarks (
 // §B — Shape B DDL: what the native indexer PRODUCES.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The three base tables `openTraceRunStore` creates, in order.
+/// The base tables: the three `openTraceRunStore` creates, in order, then `trace_media`.
 pub const SHAPE_B_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS trace_run (
   run_id TEXT PRIMARY KEY, def_id TEXT, def_version INTEGER, def_json TEXT, name TEXT,
@@ -98,6 +99,9 @@ CREATE TABLE IF NOT EXISTS trace_event (
   run_id TEXT, seq UBIGINT, cycle UBIGINT, channel TEXT,
   trigger_kind TEXT, capture_kind TEXT, data_json TEXT);
 CREATE TABLE IF NOT EXISTS trace_mark (run_id TEXT, cycle UBIGINT, label TEXT);
+CREATE TABLE IF NOT EXISTS trace_media (
+  run_id TEXT, cycle UBIGINT, slot TEXT, action TEXT, sha256 TEXT, format TEXT,
+  source_name TEXT, hw_type INTEGER, mapper_type TEXT, banks INTEGER, crt_name TEXT);
 "#;
 
 /// The compat layer: `meta` + 5 views. `CREATE OR REPLACE VIEW` throughout, so

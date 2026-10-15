@@ -104,8 +104,9 @@ pub fn payload_size(op: u8, version: u16) -> Option<usize> {
 
 /// The `meta_json` object in the file header.
 ///
-/// `media_sha` / `media_name` / `start_checkpoint_id` are OPTIONAL — TRX64 never
-/// writes them. Unknown extra keys are ignored (forward-compat), and `def_json`
+/// `media_sha` / `media_name` / `start_checkpoint_id` / `media` are OPTIONAL: TRX64
+/// writes the media ones since Spec 909 (drive 8's, and every slot's), never
+/// `start_checkpoint_id`. Unknown extra keys are ignored (forward-compat), and `def_json`
 /// is deliberately typed as a plain `String`: it is a JSON document
 /// double-encoded into a string, and one daemon path writes it EMPTY (see
 /// [`ParsedHeader::definition`]).
@@ -133,6 +134,10 @@ pub struct TraceFileMeta {
     pub media_name: Option<String>,
     #[serde(default)]
     pub start_checkpoint_id: Option<String>,
+    /// Spec 909 — the media in the machine at trace start (`{"v":1, cart, drives}`),
+    /// kept as JSON; [`crate::media`] reads it.
+    #[serde(default)]
+    pub media: Option<serde_json::Value>,
 }
 
 // The on-disk keys are camelCase (`runId`, `defJson`, `cycleStart`, …) because
@@ -165,6 +170,8 @@ impl TraceFileMeta {
             media_name: Option<String>,
             #[serde(default)]
             start_checkpoint_id: Option<String>,
+            #[serde(default)]
+            media: Option<serde_json::Value>,
         }
         let w: Wire = serde_json::from_str(raw)
             .map_err(|e| TraceReadError::BadMeta(e.to_string()))?;
@@ -180,6 +187,7 @@ impl TraceFileMeta {
             media_sha: w.media_sha.filter(|s| !s.is_empty()),
             media_name: w.media_name.filter(|s| !s.is_empty()),
             start_checkpoint_id: w.start_checkpoint_id.filter(|s| !s.is_empty()),
+            media: w.media.filter(|m| m.is_object()),
         })
     }
 }

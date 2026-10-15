@@ -6,6 +6,9 @@
 //!
 //! On-disk layout (little-endian), authoritative per binary-format.ts:
 //!   FileHeader := MAGIC(8) version(u16) flags(u16) metaLen(u32) metaJson(metaLen)
+//!   MARK (0x01):            op(1) cycle(f64) len(u16) label(len ≤ 200)
+//!       TRX64 writes one kind: the media record (`media/1 …`, Spec 909), a medium
+//!       going in or out while the trace runs. Every reader skips a MARK by its length.
 //!   CPU_STEP (0x10):        op(1) cycle(f64) pc(u16) opcode(u8) a x y sp p b1 b2  = 19 bytes
 //!   RAM/IO_WRITE (0x11/0x12): op(1) cycle(f64) addr(u16) value(u8) pc(u16)
 //!       access(u8, bit0=r/w, bit7=hasOld) oldValue(u8)                            = 16 bytes
@@ -66,6 +69,9 @@ pub enum TraceOp {
 
 pub const MAGIC: &[u8; 8] = b"C64RETR1";
 pub const FORMAT_VERSION: u16 = 2;
+
+/// Longest MARK label in bytes (= the TS `encodeMark` cap).
+pub const MARK_LABEL_MAX: usize = 200;
 
 pub const ACCESS_READ: u8 = 0;
 pub const ACCESS_WRITE: u8 = 1;
@@ -156,6 +162,21 @@ impl FrameSink {
     /// ground truth for the SOURCE of decoded bytes (Spec 784 landing-map). Layout:
     /// op(1) cycle(f64) halftrack(u8) sector(u8, 0xff = between sectors) = 11 bytes.
     /// Emitted ONLY when the `drive-mechanism` channel is armed (never in parity traces).
+    /// Encode a MARK (0x01): op(1) cycle(f64) len(u16) label(len). The label is cut
+    /// at [`MARK_LABEL_MAX`] bytes, on a character boundary — the TS encoder caps it
+    /// at 200 and its streaming reader sizes its window by that cap.
+    pub fn write_mark(&mut self, cycle: u64, label: &str) {
+        let mut end = label.len().min(MARK_LABEL_MAX);
+        while !label.is_char_boundary(end) {
+            end -= 1;
+        }
+        let bytes = &label.as_bytes()[..end];
+        self.buf.push(TraceOp::Mark as u8);
+        self.buf.extend_from_slice(&(cycle as f64).to_le_bytes());
+        self.buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+        self.buf.extend_from_slice(bytes);
+    }
+
     #[inline]
     pub fn write_drive_head(&mut self, cycle: u64, halftrack: u8, sector: u8) {
         self.buf.push(TraceOp::DriveHead as u8);

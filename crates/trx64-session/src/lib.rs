@@ -136,6 +136,21 @@ pub struct TraceState {
     /// exactly the def's captures, so a def opening the `memory` domain but declaring
     /// only `cpu-row` DROPS mem rows (the 708.7 selection — not a silent no-op).
     pub captures: Vec<String>,
+    /// Spec 909 — what was in each media slot the last time the trace looked
+    /// (`cart`, `drive8`, `drive9`, …). A slot whose medium changed since gets a
+    /// `media/1` MARK record at the cycle it was seen.
+    pub media_seen: Vec<MediaSeen>,
+}
+
+/// Spec 909 — one medium as a running trace last saw it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MediaSeen {
+    /// `cart`, or `drive<unit>`.
+    pub slot: String,
+    /// Which image this is: its byte buffer's address and length and its host path.
+    /// The bytes of a disk change as the drive writes; this key does not.
+    pub key: (usize, usize, Option<String>),
+    pub sha256: String,
 }
 
 impl TraceState {

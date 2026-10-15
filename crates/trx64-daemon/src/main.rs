@@ -63,6 +63,7 @@ use trx64_monitor::verbs::{
     uci_report, CfInfo, CfKind,
 };
 pub mod idle;
+mod media_identity;
 pub mod project_knowledge;
 pub mod snapshot_diff;
 pub mod streaming;
@@ -1773,6 +1774,13 @@ fn do_power_off(st: &mut State) {
     // and deliberately do NOT end a trace — the CPU/C64-state trace is indifferent to
     // run/pause and the machine stays alive across a soft close. No-op when no trace
     // is active (finalize_trace's take() → None).
+    // Spec 909 — the trace's last records say what went out and that the power did:
+    // a cartridge swap is a power cycle, so a capture ends at it, never spans it.
+    trace_media_poll(&mut st.session);
+    let clk = st.session.machine.clk;
+    if let Some(t) = st.session.trace.as_mut() {
+        trace_write_marks(t, clk, &[media_identity::POWER_OFF_LABEL.to_string()]);
+    }
     let _ = finalize_trace(st, true);
     st.session.power_off();
     st.machine_generation += 1; // Spec 786 audio fix — signal the streaming loop to re-hook the fresh SID.
@@ -1931,6 +1939,8 @@ fn run_cycle_budget(session: &mut Session, budget: u64) {
             t.buf = FrameSink::with_header(&meta_json).buf;
         }
     }
+    // Spec 909 — a medium that went in or out since the last run.
+    trace_media_poll(session);
     // The `drive8-cpu` domain is the only one whose RECORDING needs an out-of-band
     // sink call (the deduplicated drive-PC sample comes back via `on_drive_step`, not
     // the main observer stream). This gates RECORDING, never the path.
@@ -2836,6 +2846,8 @@ fn run_until_break(
                 t.buf = FrameSink::with_header(&meta).buf;
             }
         }
+        // Spec 909 — a medium that went in or out since the last run.
+        trace_media_poll(session);
     }
 
     loop {
@@ -4568,6 +4580,9 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                     }))
                     .unwrap_or_default();
                     let (media_sha, media_name) = drive8_media_identity(&st.session.machine.drive8);
+                    // Spec 909 — every medium in the machine, by hash, into the header.
+                    let (meta_json, media_seen) =
+                        media_identity::stamp_meta(&meta_json, &st.session, &media_sha, &media_name);
                     let start_wall_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis())
@@ -4589,6 +4604,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                         media_name,
                         // monitor `trace on` = captureAll (keep every domain-implied row).
                         captures: Vec::new(),
+                        media_seen,
                     });
                     st.last_run_id = Some(run_id.clone());
                     Ok(format!(
@@ -5558,6 +5574,31 @@ fn build_trace_from_ring(
 /// Flush the active trace to its `.c64retrace` path; returns (run, status) JSON.
 /// T2.6 — also updates `state.last_trace_path` and `state.last_run_id` (= TS
 /// `TraceRunController.lastStorePath`/`lastRunId`, set in `stop()`).
+/// Spec 909 — write a `media/1` record for each medium that went in or out since the
+/// trace last looked. Media change only between runs (a media RPC holds the machine), so
+/// no cycle ran between the change and this look: the record's cycle is the change's.
+fn trace_media_poll(session: &mut Session) {
+    let Some(before) = session.trace.as_ref().map(|t| t.media_seen.clone()) else { return };
+    let Some((labels, now)) = media_identity::changes(session, &before) else { return };
+    let clk = session.machine.clk;
+    if let Some(t) = session.trace.as_mut() {
+        trace_write_marks(t, clk, &labels);
+        t.media_seen = now;
+    }
+}
+
+/// Append MARK records to a running trace, its header first if nothing is written yet.
+fn trace_write_marks(t: &mut TraceState, clk: u64, labels: &[String]) {
+    if t.needs_header() {
+        t.buf = FrameSink::with_header(&t.meta_json).buf;
+    }
+    let mut sink = FrameSink::events_only();
+    for l in labels {
+        sink.write_mark(clk, l);
+    }
+    t.buf.extend_from_slice(&sink.buf);
+}
+
 fn finalize_trace(st: &mut State, background_index: bool) -> (Value, Value) {
     // Capture cycleEnd from the LIVE machine before taking the trace (= TS run.cycleEnd
     // = controller.session.c64Cpu.cycles at stop, trace-run.ts:453).
@@ -5566,6 +5607,8 @@ fn finalize_trace(st: &mut State, background_index: bool) -> (Value, Value) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
+    // Spec 909 — a medium that went in or out after the last run is still this trace's.
+    trace_media_poll(&mut st.session);
     match st.session.trace.take() {
         None => (Value::Null, json!({ "active": false })),
         Some(mut t) => {
@@ -5631,8 +5674,9 @@ fn finalize_trace(st: &mut State, background_index: bool) -> (Value, Value) {
             // failure is also logged to stderr by the builder thread itself.
             if background_index {
                 let retrace = trx64_traceindex::retrace_path_for(std::path::Path::new(&duckdb_path));
-                // Spec 802 R2 J-3 — ENABLED 2026-08-12. TRX64 writes no 0x01 Mark records,
-                // so scanning the file yields none and `trace_mark` (and the `anchors`
+                // Spec 802 R2 J-3 — ENABLED 2026-08-12. A user's marks are not in the file
+                // (its only 0x01 records are the Spec 909 media records, which index into
+                // `trace_media`), so scanning it yields none and `trace_mark` (and the `anchors`
                 // view) came out empty while `run.marks` correctly showed them: the tool
                 // reported `marks: 1` against a store holding 0. `IndexOverrides.marks` is
                 // the zero-format-change fix and `t.marks` is right here.
@@ -6953,6 +6997,9 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 }))
                 .unwrap_or_default();
                 let (media_sha, media_name) = drive8_media_identity(&st.session.machine.drive8);
+                // Spec 909 — every medium in the machine, by hash, into the header.
+                let (meta_json, media_seen) =
+                    media_identity::stamp_meta(&meta_json, &st.session, &media_sha, &media_name);
                 let start_wall_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis())
@@ -6975,6 +7022,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                     media_name,
                     // session/create-with-trace = captureAll (keep every domain-implied row).
                     captures: Vec::new(),
+                    media_seen,
                 });
                 st.last_run_id = Some(run_id.clone());
                 // TS startSessionTrace returns { runId, outputPath, domains }.
@@ -7312,7 +7360,22 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             if let (Some(obj), Some(n)) = (cart_json.as_object_mut(), cart_name) {
                 obj.insert("name".to_string(), json!(n));
             }
-            state_json["media"] = json!({ "cart": cart_json, "disk": media_entry(&disk_path) });
+            // Spec 909 — which image is in, by hash, and what its CRT header says.
+            let ids = media_identity::identities(&st.session);
+            if let (Some(obj), Some(id)) = (cart_json.as_object_mut(), ids.iter().find(|i| i.slot == "cart")) {
+                if let Value::Object(fields) = id.to_json() {
+                    for (k, v) in fields {
+                        if k != "sourceName" {
+                            obj.insert(k, v);
+                        }
+                    }
+                }
+            }
+            let mut disk_json = media_entry(&disk_path);
+            if let (Some(obj), Some(id)) = (disk_json.as_object_mut(), media_identity::disk_identity(&machine.drive8)) {
+                obj.insert("sha256".to_string(), json!(id.sha256));
+            }
+            state_json["media"] = json!({ "cart": cart_json, "disk": disk_json });
             // `media` says what is INSERTED (a path, a size, an mtime). `device`
             // says what those devices are DOING right now — the LED, the head, the
             // bank. Two different questions, and a panel needs the second one.
@@ -10738,6 +10801,9 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             }))
             .unwrap_or_default();
             let (media_sha, media_name) = drive8_media_identity(&st.session.machine.drive8);
+            // Spec 909 — every medium in the machine, by hash, into the header.
+            let (meta_json, media_seen) =
+                media_identity::stamp_meta(&meta_json, &st.session, &media_sha, &media_name);
             let start_wall_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis())
@@ -10760,6 +10826,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 media_name: media_name.clone(),
                 // captureAll trace — empty captures means "keep every domain-implied row".
                 captures: Vec::new(),
+                media_seen,
             });
             // T2.6 — mirror TS start(): lastRunId set on trace start, survives stop().
             st.last_run_id = Some(run_id.clone());
@@ -10940,6 +11007,9 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             }))
             .unwrap_or_default();
             let (media_sha, media_name) = drive8_media_identity(&st.session.machine.drive8);
+            // Spec 909 — every medium in the machine, by hash, into the header.
+            let (meta_json, media_seen) =
+                media_identity::stamp_meta(&meta_json, &st.session, &media_sha, &media_name);
             let start_wall_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis())
@@ -10964,6 +11034,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 media_name: media_name.clone(),
                 // Spec 708.7 — gate the recorded rows by the def's declared captures.
                 captures,
+                media_seen,
             });
             // T2.6 — mirror TS start(): lastRunId set on trace start, survives stop().
             st.last_run_id = Some(run_id.clone());
@@ -14260,6 +14331,8 @@ fn insert_disk_media_at(
     // media/recent overlays it ahead of the dir scan.
     add_recent_media(st, path, format);
     let persisted = mount_disk_media_at(st, pos, image, path)?;
+    // Spec 909 — the disk's identity is the file as read here.
+    media_identity::note_mounted_disk(&st.session.machine, unit, sha256);
     let after_id = capture_media_checkpoint(st);
     if let Some(ref b) = before_id { st.checkpoint_ring.pin(b); }
     if let Some(ref a) = after_id { st.checkpoint_ring.pin(a); }
@@ -14375,7 +14448,9 @@ fn drive_disk_json(st: &State, pos: DrivePosition) -> Value {
                 .clone()
                 .filter(|p| !p.is_empty())
                 .unwrap_or_else(|| if pos == DrivePosition::A { st.session.disk_path.clone() } else { String::new() });
-            json!({ "path": path, "format": disk.kind.name() })
+            // Spec 909 — which image, by hash.
+            let sha256 = media_identity::disk_identity(st.session.machine.drive(pos)).map(|i| i.sha256);
+            json!({ "path": path, "format": disk.kind.name(), "sha256": sha256 })
         }
     }
 }

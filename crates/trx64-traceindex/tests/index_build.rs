@@ -328,6 +328,7 @@ fn full_fixture_builds_the_complete_shape_b_store() {
         "trace_run",
         "trace_event",
         "trace_mark",
+        "trace_media",
         "meta",
         "instructions",
         "bus_events",
@@ -337,7 +338,7 @@ fn full_fixture_builds_the_complete_shape_b_store() {
     ] {
         assert!(tables.contains(&want.to_string()), "missing {want} in {tables:?}");
     }
-    assert_eq!(tables.len(), 9, "exactly 4 tables + 5 views: {tables:?}");
+    assert_eq!(tables.len(), 10, "exactly 5 tables + 5 views: {tables:?}");
 
     assert_eq!(
         count(&conn, "SELECT count(*) FROM instructions"),

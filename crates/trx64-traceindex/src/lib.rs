@@ -11,18 +11,21 @@
 //! pass-through back into the very repo that was asking it the question. It
 //! worked on exactly one machine, never on Windows, and never in the container.
 //!
-//! ## No format change
+//! ## Format
 //!
-//! The `.c64retrace` binary format and the DuckDB index schema are untouched.
-//! Existing stores keep working, existing traces stay readable, and a store
-//! built here is indistinguishable from a TS-built one apart from the two
-//! wall-clock timestamp columns (`trace_run.created_at`, `meta.captured_at`).
+//! The `.c64retrace` binary format is the TS one; existing stores keep working
+//! and existing traces stay readable. Two additions, both invisible to an older
+//! reader: the header's `media` object and the `media/1` MARK records (Spec 909),
+//! indexed into the `trace_media` table ([`media`]). Apart from that table, a store
+//! built here differs from a TS-built one only in the two wall-clock timestamp
+//! columns (`trace_run.created_at`, `meta.captured_at`).
 //!
 //! ## Layout
 //!
 //! | module | role | status |
 //! |---|---|---|
 //! | [`error`] | shared `TraceReadError` / `Result`; error TEXT is contract | done |
+//! | [`media`] | Spec 909 — header `media` + `media/1` MARKs → `trace_media` rows | done |
 //! | [`decode`] | `.c64retrace` streaming frame parser (header + windowed decode) | done |
 //! | [`rows`] | frame → `trace_event` row projection (`data_json`, `seq`, channels) | done |
 //! | [`schema`] | Shape A + Shape B DDL, compat-view install/heal, shape detection | done |
@@ -80,6 +83,7 @@ pub mod conn;
 pub mod decode;
 pub mod ensure;
 pub mod error;
+pub mod media;
 pub mod rows;
 pub mod schema;
 
