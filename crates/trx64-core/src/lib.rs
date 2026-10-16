@@ -4213,7 +4213,7 @@ impl Machine {
                 // changes; never runs with the always-on ring.
                 if self.head_trace_armed {
                     let ht = self.drive8.rotation.current_half_track as u8;
-                    let s = self.drive8.rotation.sector_under_head();
+                    let s = self.drive8.rotation.sector_under_head_cached();
                     let sec = if s < 0 { 0xff } else { s as u8 };
                     if self.head_trace_last != Some((ht, sec)) {
                         self.head_trace.push((drv_clk, ht, sec));

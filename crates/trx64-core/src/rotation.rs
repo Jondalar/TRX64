@@ -253,6 +253,43 @@ pub struct Rotation {
     /// per sync whose block decodes as a header (0x08) or data block (0x07), in bit
     /// order. See [`Rotation::block_region_at_head`].
     region_cache: BlockRegionCache,
+    /// The sync marks of the half-track under the head and the header sector each one
+    /// leads to; keys [`Rotation::sector_under_head_cached`]. Not VICE state, never
+    /// snapshotted.
+    sector_cache: SectorCache,
+}
+
+/// Every sync mark of one half-track, and what the header scan starting at each answers.
+#[derive(Clone, Default)]
+struct SectorCache {
+    valid: bool,
+    half_track: u32,
+    gen: u64,
+    size: usize,
+    /// Bit positions `q` where `gcr_find_sync` can stop: bit `q` is 0 and the 10 bits
+    /// before it (cyclic) are 1. Ascending.
+    syncs: Vec<i64>,
+    /// `chain[j]` = what `sector_under_head` returns when its first sync is `syncs[j]`.
+    chain: Vec<i32>,
+}
+
+/// Index of the sync `gcr_find_sync(raw, p, bits)` returns: the first one at cyclic
+/// distance 10..bits-1 from `p` (the scan starts with an empty shift register, so a
+/// sync needs its 10 ones inside the scanned window).
+fn next_sync_index(syncs: &[i64], bits: i64, p: i64) -> Option<usize> {
+    let i = syncs.partition_point(|&q| q < p + 10);
+    if i < syncs.len() {
+        return Some(i);
+    }
+    for (j, &q) in syncs.iter().enumerate() {
+        if q >= p {
+            return None;
+        }
+        if q - p + bits >= 10 {
+            return Some(j);
+        }
+    }
+    None
 }
 
 /// Cached block list of the half-track the head is on (Spec 907).
@@ -340,6 +377,7 @@ impl Rotation {
             gcr_read_count: 0,
             track_gen: 0,
             region_cache: BlockRegionCache::default(),
+            sector_cache: SectorCache::default(),
         }
     }
 
@@ -571,6 +609,75 @@ impl Rotation {
         }
         // ts:78 — return -1.
         -1
+    }
+
+    /// [`sector_under_head`] with the work done once per half-track: the sync marks and
+    /// the header each leads to are found when the half-track, its image generation
+    /// (any head write, attach, detach, restore) or its size differs from the cached
+    /// one, and every call after that is a binary search. Returns exactly what
+    /// [`sector_under_head`] returns at the same head position.
+    ///
+    /// [`sector_under_head`]: Rotation::sector_under_head
+    pub fn sector_under_head_cached(&mut self) -> i32 {
+        use crate::gcr::gcr_decode_block;
+        let idx = (self.current_half_track as usize).wrapping_sub(2);
+        let size = match self.image.as_ref().and_then(|img| img.tracks.get(idx)) {
+            Some(t) if !t.data.is_empty() && t.size != 0 => t.size,
+            _ => return -1,
+        };
+        let c = &self.sector_cache;
+        if !(c.valid && c.half_track == self.current_half_track && c.gen == self.track_gen && c.size == size) {
+            let raw = &self.image.as_ref().unwrap().tracks[idx];
+            let bits = (size as i64) * 8;
+            let bit = |i: i64| (raw.data.get((i >> 3) as usize).copied().unwrap_or(0) >> (7 - (i & 7))) & 1;
+            let mut run = 0u32;
+            let mut i = bits - 1;
+            while i >= 0 && run < 10 && bit(i) == 1 {
+                run += 1;
+                i -= 1;
+            }
+            let mut syncs = Vec::new();
+            for i in 0..bits {
+                if bit(i) == 1 {
+                    run = (run + 1).min(10);
+                } else {
+                    if run >= 10 {
+                        syncs.push(i);
+                    }
+                    run = 0;
+                }
+            }
+            let chain = (0..syncs.len())
+                .map(|j| {
+                    let first = syncs[j];
+                    let mut at = j;
+                    let mut header = [0u8; 4];
+                    for step in 0..64 {
+                        let q = syncs[at];
+                        if step > 0 && q == first {
+                            return -1;
+                        }
+                        gcr_decode_block(raw, q, &mut header, 1);
+                        if header[0] == 0x08 {
+                            return header[2] as i32;
+                        }
+                        match next_sync_index(&syncs, bits, q) {
+                            Some(n) => at = n,
+                            None => return -1,
+                        }
+                    }
+                    -1
+                })
+                .collect();
+            self.sector_cache = SectorCache { valid: true, half_track: self.current_half_track, gen: self.track_gen, size, syncs, chain };
+        }
+        let c = &self.sector_cache;
+        let bits = (size as i64) * 8;
+        let p = ((self.gcr_head_offset as i64 % bits) + bits) % bits;
+        match next_sync_index(&c.syncs, bits, p) {
+            Some(j) => c.chain[j],
+            None => -1,
+        }
     }
 
     /// Spec 907 — drop the cached block list. Call after anything that rewrites
