@@ -20,8 +20,7 @@
 //!
 //! What this verdict does NOT check: the picture. PASS needs game code live or
 //! >= 8 colours on screen; nothing compares the frame with a reference, so a game
-//! that reaches its code with a corrupt or wrong picture passes. `scripts/gate.sh`
-//! diffs the PNGs against the previous run's, and only as a note.
+//! that reaches its code with a corrupt or wrong picture passes.
 //!
 //! Spec 871 — `GATE_DRIVE_B=<unit>`: each game runs twice, B off and then drive
 //! position B powered at that unit with a blank disk in it, idle, switched on with
@@ -705,7 +704,7 @@ fn report(r: &GateResult) {
         "FAIL (stuck, blank screen — load never reached game)"
     };
     // The B-on run's reachability is printed, not counted: its verdict is the
-    // picture comparison (`B-ON VERDICT`), and `VERDICT:` lines are what gate.sh counts.
+    // picture comparison (`B-ON VERDICT`), and only the `VERDICT:` lines count.
     match (r.drive_b, r.folder) {
         _ if r.probe.is_some() => {
             eprintln!("\n========== {} ({:?}) — probe at slot {} ==========", r.name, r.kind, r.probe.unwrap());

@@ -10,8 +10,8 @@
 # Exit: 0 = all blocking points GREEN. 1 = a point RED. 2 = environment error.
 #
 # Env knobs:
-#   E2E787_SKIP_BASELINE=1   skip point #7 (scripts/gate.sh is heavy: release
-#                            build + 7-game behavioural gate). Reported as SKIP,
+#   E2E787_SKIP_BASELINE=1   skip point #7 (the 7-game run is heavy: release
+#                            build + seven games). Reported as SKIP,
 #                            NOT a false green.
 #   C64RE_ROOT=              C64RE checkout (for the TS single-path probe + ROMs).
 # ─────────────────────────────────────────────────────────────────────────────
@@ -147,18 +147,14 @@ else
 fi
 
 # ── #7 Runtime product proof baseline stays green ────────────────────────────
-say "[#7] runtime product proof baseline (scripts/gate.sh)"
+say "[#7] runtime product proof baseline (7-game run)"
 if [ "${E2E787_SKIP_BASELINE:-0}" = 1 ]; then
-  record 7 SKIP "baseline_opt-out_(E2E787_SKIP_BASELINE=1);_run_scripts/gate.sh_separately"
-elif [ -x "$REPO_ROOT/scripts/gate.sh" ]; then
-  if "$REPO_ROOT/scripts/gate.sh" >"$TMPD/gate.log" 2>&1 && grep -q "GATE GREEN" "$TMPD/gate.log"; then
-    record 7 GREEN "scripts/gate.sh_GREEN_(unit_gates_+_7-game)"
-  else
-    record 7 RED "scripts/gate.sh_not_green_(see_log)"
-    tail -25 "$TMPD/gate.log"
-  fi
+  record 7 SKIP "baseline_opt-out_(E2E787_SKIP_BASELINE=1)"
+elif cargo test --release -p trx64-core --test seven_game_gate -- --ignored --nocapture >"$TMPD/seven.log" 2>&1; then
+  record 7 GREEN "seven_game_gate_GREEN"
 else
-  record 7 SKIP "scripts/gate.sh_absent"
+  record 7 RED "seven_game_gate_not_green_(see_log)"
+  tail -25 "$TMPD/seven.log"
 fi
 
 # ── Summary table ────────────────────────────────────────────────────────────

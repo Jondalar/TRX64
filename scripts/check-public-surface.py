@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Public-surface gate: no internal references where a user or an LLM can see them.
+"""Public-surface check: no internal references where a user or an LLM can see them.
 
 Owner rule: "No internal references on the public surface. File names ARE public
 surface." Internal references are spec numbers, decision/section ids, internal bug

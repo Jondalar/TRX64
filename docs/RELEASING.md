@@ -6,9 +6,9 @@ archives, publishes the GitHub release and then bumps the Homebrew tap.
 1. Bump `version` in `Cargo.toml` and the "as of" line in `docs/FEATURES.md`.
 2. `cargo build` (refreshes `Cargo.lock`).
 3. Commit: `release: X`.
-4. `git push origin main` (the pre-push gate skips a version-only change).
+4. `git push origin main`.
 5. Tag and push the tag: `git tag vX && git push origin vX`.
-6. Push the Gitea mirror: `GATE_SKIP=1 git push gitea main vX`.
+6. Push the Gitea mirror: `git push gitea main vX`.
 7. Write the notes to `notes.md`, then dispatch:
 
    ```sh

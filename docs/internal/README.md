@@ -44,10 +44,10 @@ as a backlog, and a reader has no way to tell which is which. `_archive/README.m
 carries what was DECIDED rather than the plans themselves; that is the part that would
 otherwise be re-derived from an argument nobody remembers having.
 
-**The gate is the pre-push hook, and it is the only thing running the tests.** There is
-no cloud CI (783). `hooks/pre-push` → `scripts/gate.sh`, bypassable for one push with
-`GATE_SKIP=1`, which is a decision to make on purpose and not a habit.
+**There is no gate.** No pre-push hook, no CI test run (owner, 2026-10-16: "ALLE gates raus").
+Tests are `cargo test` run by hand for what a change touches; the 7-game run is
+`cargo test --release -p trx64-core --test seven_game_gate -- --ignored --nocapture`.
 
 **This folder is the only place spec numbers, decision ids and bug ids may appear in documentation.**
 User docs (`README.md`, `MONITOR.md`, `docs/*.md`), `--help`, RPC answers and monitor output carry none;
-`scripts/check-public-surface.py` (run by the gate and by docs-only pushes) fails on them.
+`scripts/check-public-surface.py` (run by hand) fails on them.
