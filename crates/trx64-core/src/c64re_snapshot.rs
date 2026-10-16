@@ -659,7 +659,9 @@ pub fn capture_cpu(m: &Machine) -> CpuSnapshot {
         cycles: c.clk as i64,
         maincpu_ba_low_flags: Some(m.vic.ba_low_flag as i64),
         so_line: None,
-        jammed: None,
+        // A machine captured jammed restores jammed; written only then, so every other
+        // checkpoint is byte-identical to before (and an older one reads as not jammed).
+        jammed: (c.is_jammed || m.cpu6510.is_jammed()).then_some(true),
         turbo_phase: (c.turbo_phase != 0).then_some(i64::from(c.turbo_phase)),
         entry_paused: c.entry_paused.then_some(true),
     }
@@ -686,6 +688,10 @@ pub fn restore_cpu(m: &mut Machine, s: &CpuSnapshot) {
     core.clk = clk;
     core.turbo_phase = s.turbo_phase.unwrap_or(0) as u32;
     core.entry_paused = s.entry_paused.unwrap_or(false);
+    // The jam is CPU state like the registers: a restore from a jammed machine onto a
+    // checkpoint taken before the JAM must run again, not keep reporting the old jam.
+    let jammed = s.jammed.unwrap_or(false);
+    core.is_jammed = jammed;
 
     let cpu = &mut m.cpu6510;
     cpu.reg_pc = pc;
@@ -697,6 +703,7 @@ pub fn restore_cpu(m: &mut Machine, s: &CpuSnapshot) {
     cpu.flag_n = flags & 0x80;
     cpu.flag_z = if flags & 0x02 != 0 { 0 } else { 1 };
     cpu.clk = clk;
+    cpu.set_jammed(jammed);
 
     if let Some(ba) = s.maincpu_ba_low_flags {
         m.vic.ba_low_flag = ba != 0;
@@ -2799,6 +2806,27 @@ mod tests {
         assert_eq!(m2.c64_core.reg_a, 0x42);
         assert_eq!(m2.cpu6510.reg_pc, 0xc123, "cpu6510 mirror");
         assert_eq!(m2.c64_core.clk, 555_000);
+    }
+
+    #[test]
+    fn the_jam_is_restored_as_cpu_state() {
+        // Taken before the JAM: a restore from a jammed machine runs again.
+        let clean = capture_cpu(&Machine::new());
+        assert_eq!(clean.jammed, None, "not written for a running CPU");
+        let mut m = Machine::new();
+        m.c64_core.is_jammed = true;
+        m.cpu6510.set_jammed(true);
+        restore_cpu(&mut m, &clean);
+        assert!(!m.c64_core.is_jammed && !m.cpu6510.is_jammed());
+
+        // Taken jammed: the restore is jammed again, on both cores.
+        let mut j = Machine::new();
+        j.c64_core.is_jammed = true;
+        let snap = capture_cpu(&j);
+        assert_eq!(snap.jammed, Some(true));
+        let mut m2 = Machine::new();
+        restore_cpu(&mut m2, &snap);
+        assert!(m2.c64_core.is_jammed && m2.cpu6510.is_jammed());
     }
 
     #[test]

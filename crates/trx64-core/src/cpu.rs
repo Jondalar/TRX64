@@ -234,6 +234,10 @@ impl Cpu6510 {
     pub fn is_jammed(&self) -> bool {
         self.jammed
     }
+    /// Set by a checkpoint restore, which carries the jam as CPU state.
+    pub fn set_jammed(&mut self, jammed: bool) {
+        self.jammed = jammed;
+    }
 
     // -------- bus primitives --------
     #[inline]
