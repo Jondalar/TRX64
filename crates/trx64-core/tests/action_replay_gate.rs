@@ -783,3 +783,20 @@ fn s4_a_press_around_an_irq_entry_never_breaks_the_program() {
         press_and_check(&base, k, "irq");
     }
 }
+
+/// A banked overlay patch lands in the stored bank, shows in every window that serves
+/// that bank, leaves the other banks alone, and is refused past bank 3.
+#[test]
+fn an_overlay_patch_lands_in_its_bank_image() {
+    let mut m = mapper();
+    let orig = tag(2, 0x345);
+    m.overlay_bank_write("roml", 2, 0x8345, orig ^ 0xff).expect("roml bank 2");
+    assert_eq!(m.overlay_bank_read("roml", 2, 0x8345), Ok(orig ^ 0xff));
+    assert_eq!(m.overlay_bank_read("romh", 2, 0xa345), Ok(orig ^ 0xff), "ROMH serves the same bank");
+    assert_eq!(rd(&mut m, 0x8345), Some(tag(0, 0x345)), "bank 0 is mapped and untouched");
+    assert!(wr(&mut m, 0xde00, 0x11));
+    assert_eq!(rd(&mut m, 0x8345), Some(orig ^ 0xff), "live once bank 2 is mapped");
+    assert_eq!(rd(&mut m, 0xa345), Some(orig ^ 0xff));
+    assert!(m.overlay_bank_write("roml", 4, 0x8000, 0).unwrap_err().contains("bank 4"));
+    assert!(m.overlay_bank_write("roml", 0, 0xa000, 0).is_err(), "outside the ROML window");
+}

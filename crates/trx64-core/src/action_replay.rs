@@ -201,7 +201,29 @@ impl ActionReplayMapper {
     }
 }
 
+impl ActionReplayMapper {
+    /// The ROM offset an overlay patch lands on. ROML and ROMH serve the SAME 32 KiB
+    /// (`roml_byte` / `romh_byte`), so every window addresses bank `bank` of it.
+    fn overlay_offset(space: &str, bank: u16, addr: u16) -> Result<usize, String> {
+        crate::cart::cart_overlay_target(space, addr)?;
+        if bank > 3 {
+            return Err(format!("overlay bank {bank} is not in the image (Action Replay has banks 0..3)"));
+        }
+        Ok(bank as usize * 0x2000 + (addr as usize & 0x1fff))
+    }
+}
+
 impl CartMapper for ActionReplayMapper {
+    fn overlay_bank_write(&mut self, space: &str, bank: u16, addr: u16, byte: u8) -> Result<(), String> {
+        let off = Self::overlay_offset(space, bank, addr)?;
+        let mut rom = self.rom.to_vec();
+        rom[off] = byte;
+        self.rom = rom.into();
+        Ok(())
+    }
+    fn overlay_bank_read(&self, space: &str, bank: u16, addr: u16) -> Result<u8, String> {
+        Ok(self.rom[Self::overlay_offset(space, bank, addr)?])
+    }
     fn mapper_type(&self) -> MapperType {
         MapperType::ActionReplay
     }
