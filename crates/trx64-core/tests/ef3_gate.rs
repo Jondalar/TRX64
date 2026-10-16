@@ -105,6 +105,7 @@ fn bi() -> BankInfo {
         cartridge_exrom: None,
         cartridge_game: None,
         phi1: 0xff,
+        ram_under: 0,
     }
 }
 

@@ -5319,6 +5319,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                     let ctrl = os.control_register;
                     if let Some(c) = m.cartridge.as_mut() {
                         c.set_state(trx64_core::cart::CartState {
+                            freezer: None,
                             current_bank: bank, control_register: ctrl, flash: None,
                         });
                     }
@@ -6730,12 +6731,23 @@ fn monitor_forward(req: &Request, command: &str, state: &SharedState) -> Option<
         "cart" => match rest.first().map(|t| t.to_ascii_lowercase()).as_deref() {
             // `cart button <name>` — the cartridge's buttons; the RPC is the authority.
             Some("button") => match rest.get(1) {
-                Some(b) => ("cart/button", json!({ "button": b.to_ascii_lowercase() }), "CARTRIDGE BUTTON".to_string()),
+                Some(b) => {
+                    let mut p = json!({ "button": b.to_ascii_lowercase() });
+                    if let Some(c) = rest.get(2) {
+                        match c.trim_start_matches('c').parse::<u64>() {
+                            Ok(c) => p["cycle"] = json!(c),
+                            Err(_) => return Some(monitor_text(req, "cart button <name> [cycle] — the cycle is a decimal machine cycle")),
+                        }
+                    }
+                    ("cart/button", p, "CARTRIDGE BUTTON".to_string())
+                }
                 None => return Some(monitor_text(req,
-                    "cart button <name> — press and release a button on the cartridge. \
+                    "cart button <name> [cycle] — press and release a button on the cartridge. \
                      EasyFlash 3: menu (into the boot menu: slot 0, bank 0, EF mode, $DE0F back), \
                      reset (restart the current slot, boot on), special (restart with boot off — \
-                     the C64 starts as if no cartridge ran). A cartridge without buttons refuses.")),
+                     the C64 starts as if no cartridge ran). Action Replay: freeze (stop the running \
+                     program on the cycle of the press, or on [cycle], and enter the freezer menu). \
+                     A cartridge without buttons refuses.")),
             },
             _ => ("session/cart_status", json!({}), "CARTRIDGE".to_string()),
         },
@@ -7917,14 +7929,23 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             Response::ok(id, cart_status_json(&mut st))
         }
 
-        // cart/button {button} — press and release one of the cartridge's buttons (EasyFlash 3:
-        // menu | reset | special). The press and the reset it asks for are one call; the C64's
-        // own reset is the external reset and is `session/reset`. A cartridge without buttons
-        // refuses, naming itself.
+        // cart/button {button, cycle?} — press and release one of the cartridge's buttons
+        // (EasyFlash 3: menu | reset | special; Action Replay: freeze). The press and the
+        // reset it asks for are one call; the C64's own reset is the external reset and is
+        // `session/reset`. `cycle` is the machine cycle the press happens on (default: the
+        // cycle the machine stands at; a later one is held until the clock gets there).
+        // A cartridge without buttons refuses, naming itself.
         "cart/button" => {
             let button = match req.params.get("button").and_then(|v| v.as_str()) {
                 Some(b) => b.to_ascii_lowercase(),
-                None => return Response::err(id, -32602, "cart/button: `button` is required (menu | reset | special)".to_string()),
+                None => return Response::err(id, -32602, "cart/button: `button` is required (menu | reset | special | freeze)".to_string()),
+            };
+            let at = match req.params.get("cycle") {
+                None | Some(Value::Null) => None,
+                Some(v) => match v.as_u64() {
+                    Some(c) => Some(c),
+                    None => return Response::err(id, -32602, "cart/button: `cycle` must be a non-negative integer".to_string()),
+                },
             };
             let mut st = state.lock().unwrap();
             let name = match st.session.machine.cartridge.as_ref() {
@@ -7941,7 +7962,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             if !st.session.powered {
                 return Response::err(id, -32000, "cart/button: the machine is powered off".to_string());
             }
-            match st.session.machine.cart_press_button(&button) {
+            match st.session.machine.cart_press_button_at(&button, at) {
                 Err(e) => Response::err(id, -32602, format!("cart/button: {e}")),
                 Ok(reset) => {
                     if reset {
@@ -7955,7 +7976,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                         st.notify.broadcast("audio/flush", json!({ "session_id": st.session.id }));
                     }
                     let pc = st.session.machine.cpu6510.reg_pc as u64;
-                    Response::ok(id, json!({ "button": button, "reset": reset, "cartType": name, "pc": pc }))
+                    Response::ok(id, json!({ "button": button, "reset": reset, "cartType": name, "pc": pc, "cycle": at.unwrap_or(st.session.machine.c64_core.clk) }))
                 }
             }
         }
@@ -14242,17 +14263,19 @@ fn cart_status_json(st: &mut State) -> Value {
     // it makes the CART label look stale/cached + wrong (e.g. "WASTELAND EF MENU POC"
     // for every wasteland cart). The mounted file path is the backend truth.
     let cart_path = st.session.cart_path.clone();
-    let (type_str, bank, mapped, gen, ef3, buttons) = match st.session.machine.cartridge.as_ref() {
+    let (type_str, bank, mapped, gen, ef3, buttons, freezer) = match st.session.machine.cartridge.as_ref() {
         None => return Value::Null,
         Some(cart) => {
             let lines = cart.get_lines();
+            let state = cart.get_state();
             (
                 mapper_type_str(cart.mapper_type()),
-                cart.get_state().current_bank as u64,
+                state.current_bank as u64,
                 lines.exrom == 0 || lines.game == 0,
                 cart.writable_generation(),
                 cart.ef3_status(),
                 cart.buttons(),
+                state.freezer,
             )
         }
     };
@@ -14292,6 +14315,21 @@ fn cart_status_json(st: &mut State) -> Value {
     // Present only for a cartridge that has them, so every other cart's status is unchanged.
     if !buttons.is_empty() {
         out["buttons"] = json!(buttons);
+    }
+    // A freezer cartridge: whether it answers at $DE00, the register, the configuration it is
+    // in (0 = 8K game, 1 = 16K game, 2 = off, 3 = ultimax), RAM in place of ROM, /NMI held,
+    // and a press that has not reached its cycle yet.
+    if let Some(f) = freezer {
+        out["freezer"] = json!({
+            "active": f.active,
+            "register": f.regvalue,
+            "mode": f.mode,
+            "ram": f.export_ram,
+            "nmi": f.nmi,
+            "frozen": f.mode == 3 && f.export_ram,
+            "pendingFreezeAt": f.freeze_at,
+            "pendingEntryAt": f.nmi_at,
+        });
     }
     if let Some(e) = ef3 {
         out["slot"] = json!(e.slot);
@@ -24589,6 +24627,7 @@ mod batch1_tests {
             cartridge_exrom: None,
             cartridge_game: None,
             phi1: 0xff,
+            ram_under: 0,
         }
     }
 

@@ -254,6 +254,11 @@ impl Session {
         if let Some(cart) = self.inserted_cart.take() {
             self.cart_path = cart.path.clone();
             machine.cartridge = Some(cart.mapper);
+            // The physical cartridge survives the power cut; whatever it holds in RAM
+            // does not (an Action Replay's 8 KiB come back as the chips power up).
+            if let Some(c) = machine.cartridge.as_mut() {
+                c.power_up();
+            }
             machine.cartridge_image = Some(cart.image);
             machine.cold_reset();
         }

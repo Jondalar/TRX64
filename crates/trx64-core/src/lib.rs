@@ -22,6 +22,7 @@ macro_rules! elog {
 use std::collections::HashSet;
 use std::path::Path;
 
+pub mod action_replay;
 pub mod c64_6510core;
 pub mod c64re_snapshot;
 pub mod cart;
@@ -1294,6 +1295,7 @@ impl Machine {
                     cartridge_exrom: Some(cart.get_lines().exrom),
                     cartridge_game: Some(cart.get_lines().game),
                     phi1: 0xff,
+                    ram_under: 0,
                 };
                 // peek (side-effect-free): a reset-vector fetch must NOT advance
                 // the flash command FSM (the flash is in READ state at reset, so
@@ -1329,6 +1331,7 @@ impl Machine {
             cartridge_exrom: Some(lines.exrom),
             cartridge_game: Some(lines.game),
             phi1: 0xff,
+            ram_under: self.ram[addr as usize],
         };
         cart.peek(addr, &bi)
     }
@@ -1411,9 +1414,23 @@ impl Machine {
     }
 
     /// Press a button on the attached cartridge (`menu`, `reset`, `special` on an
-    /// EasyFlash 3) and run the reset it asks for. Returns whether a reset ran.
+    /// EasyFlash 3; `freeze` on an Action Replay) and run the reset it asks for. Returns whether a reset ran.
     /// A cartridge without buttons — or none — refuses, naming itself.
     pub fn cart_press_button(&mut self, button: &str) -> Result<bool, String> {
+        self.cart_press_button_at(button, None)
+    }
+
+    /// [`cart_press_button`](Self::cart_press_button) with the machine cycle the press
+    /// happens on. `None` is now (the cycle the machine stands at); a later cycle is held
+    /// by the cartridge until the clock reaches it, mid-run included. A press in the past
+    /// is refused — it would not be the cycle the caller named.
+    pub fn cart_press_button_at(&mut self, button: &str, at: Option<u64>) -> Result<bool, String> {
+        let now = self.c64_core.clk;
+        if let Some(at) = at {
+            if at < now {
+                return Err(format!("cycle {at} is in the past (the machine is at {now})"));
+            }
+        }
         let cart = self.cartridge.as_mut().ok_or_else(|| "no cartridge attached".to_string())?;
         if cart.buttons().is_empty() {
             return Err(format!("the {:?} cartridge has no buttons", cart.mapper_type()));
@@ -1421,7 +1438,7 @@ impl Machine {
         if !cart.buttons().contains(&button) {
             return Err(format!("unknown button '{button}' ({})", cart.buttons().join(", ")));
         }
-        cart.press_button(button)?;
+        cart.press_button_at(button, at.unwrap_or(now))?;
         let reset = cart.take_reset_request();
         if reset {
             self.cart_generated_reset();
@@ -2267,6 +2284,10 @@ impl Machine {
     /// The port's lines now: the host's own, ORed with both devices'.
     pub fn expansion_lines(&self) -> crate::expansion::PortLines {
         let mut lines = self.expansion_host_lines;
+        // A freezer cartridge's NMI is on the same source as the devices' lines.
+        if let Some(c) = self.cartridge.as_ref() {
+            lines.nmi |= c.nmi_line();
+        }
         if let Some(dev) = self.port_profile.as_ref() {
             lines = lines.or(dev.lines());
         }
@@ -2283,6 +2304,7 @@ impl Machine {
     fn port_active(&self) -> bool {
         self.port_profile.is_some()
             || self.expansion.is_some()
+            || self.cartridge.as_ref().is_some_and(|c| c.is_freezer())
             || self.expansion_host_lines != crate::expansion::PortLines::default()
             || self.c64_int.pending_int[c64_6510core::INT_SRC_EXPANSION] != 0
     }

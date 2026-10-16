@@ -454,6 +454,9 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
     #[inline]
     fn process_alarms(&mut self, clk: u64) {
         self.fb.process_cia_alarms(clk);
+        if self.fb.port_active {
+            self.fb.process_cart_alarms(clk);
+        }
     }
 
     /// The CIAs' `cia_set_int_clk` calls since the last replay, into IntStatus at their

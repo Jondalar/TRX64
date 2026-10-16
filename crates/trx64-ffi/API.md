@@ -96,7 +96,7 @@ feed AVAudioEngine, fill an `AVAudioPCMBuffer`'s `int16ChannelData` with the ret
 | `unmountAt` | `(unit: UInt8) throws -> UnmountResult` | Eject the disk from the drive at `unit` (written back to its host file first). |
 | `recentMedia` | `() throws -> [MediaEntry]` | Recent-media list (newest-first, mount timestamps). |
 | `cartStatus` | `() throws -> CartStatus?` | Attached cartridge status, or `nil` when no cart. |
-| `cartButton` | `(button: String) throws -> CartButtonResult` | Press and release a button on the cartridge: `"menu"`, `"reset"` or `"special"` on an EasyFlash 3. A reset the press asks for runs inside the call. A cartridge without buttons is refused by name. (WS: `cart/button {button}`.) |
+| `cartButton` | `(button: String) throws -> CartButtonResult` | Press and release a button on the cartridge: `"menu"`, `"reset"` or `"special"` on an EasyFlash 3, `"freeze"` on an Action Replay. A reset the press asks for runs inside the call. A cartridge without buttons is refused by name. (WS: `cart/button {button}`.) |
 
 ## drives
 

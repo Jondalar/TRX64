@@ -470,6 +470,7 @@ impl CartMapper for Ef3Mapper {
 
     fn get_state(&self) -> CartState {
         CartState {
+            freezer: None,
             current_bank: self.s.bank as u16,
             control_register: Some(self.s.reg02),
             flash: Some(FlashCartState {

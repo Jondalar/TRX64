@@ -1289,6 +1289,57 @@ pub struct CartStateSnapshot {
     /// command state, `easyflashRam` the IO2 RAM). Absent for every other cartridge.
     #[serde(rename = "ef3State", default, skip_serializing_if = "Option::is_none")]
     pub ef3_state: Option<Ef3StateSnapshot>,
+    /// A freezer cartridge (Action Replay): registers, lines, /NMI, the pending freeze and
+    /// the cartridge RAM. Absent for every other cartridge, and in a checkpoint that
+    /// predates it — which then restores the bank and register only.
+    #[serde(rename = "freezerState", default, skip_serializing_if = "Option::is_none")]
+    pub freezer_state: Option<FreezerStateSnapshot>,
+}
+
+/// A freezer cartridge's continuation (`cart::FreezerCartState`). The RAM is a `$ta`
+/// byte node, not a list of numbers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FreezerStateSnapshot {
+    pub active: bool,
+    pub regvalue: i64,
+    pub mode: i64,
+    pub bank: i64,
+    #[serde(rename = "exportRam")]
+    pub export_ram: bool,
+    pub nmi: bool,
+    #[serde(rename = "freezeAt", default, skip_serializing_if = "Option::is_none")]
+    pub freeze_at: Option<u64>,
+    #[serde(rename = "nmiAt", default, skip_serializing_if = "Option::is_none")]
+    pub nmi_at: Option<u64>,
+    pub ram: serde_json::Value,
+}
+
+fn freezer_to_json(f: &crate::cart::FreezerCartState) -> FreezerStateSnapshot {
+    FreezerStateSnapshot {
+        active: f.active,
+        regvalue: f.regvalue as i64,
+        mode: f.mode as i64,
+        bank: f.bank as i64,
+        export_ram: f.export_ram,
+        nmi: f.nmi,
+        freeze_at: f.freeze_at,
+        nmi_at: f.nmi_at,
+        ram: ta_u8(&f.ram),
+    }
+}
+
+fn freezer_from_json(f: &FreezerStateSnapshot) -> crate::cart::FreezerCartState {
+    crate::cart::FreezerCartState {
+        active: f.active,
+        regvalue: f.regvalue as u8,
+        mode: f.mode as u8,
+        bank: f.bank as u8,
+        export_ram: f.export_ram,
+        nmi: f.nmi,
+        freeze_at: f.freeze_at,
+        nmi_at: f.nmi_at,
+        ram: ta_u8_decode(&f.ram).unwrap_or_default(),
+    }
 }
 
 /// EasyFlash 3 CPLD state (`ef3::Ef3State`).
@@ -1467,6 +1518,7 @@ pub fn capture_cart_state(cart: &dyn CartMapper) -> CartStateSnapshot {
         flash_hi_state: hi,
         eeprom_state: eeprom,
         ef3_state: ef3,
+        freezer_state: st.freezer.as_ref().map(freezer_to_json),
     }
 }
 
@@ -1500,6 +1552,7 @@ pub fn restore_cart_state(cart: &mut Box<dyn CartMapper>, s: &CartStateSnapshot)
         None
     };
     cart.set_state(CartState {
+        freezer: s.freezer_state.as_ref().map(freezer_from_json),
         current_bank: s.current_bank as u16,
         control_register: s.control_register.map(|v| v as u8),
         flash,
@@ -2383,7 +2436,16 @@ pub fn restore_runtime_checkpoint(
     // empty-name fallback (parse_crt name handling).
     match cp.get("cartBytes").and_then(ta_u8_decode) {
         Some(cart_bytes) if !cart_bytes.is_empty() => {
-            m.attach_cart_from_bytes(&cart_bytes, "snapshot.crt")
+            // A raw `.bin` carries no type in-band. A freezer cartridge's continuation does
+            // name one: the bytes are an Action Replay's and only that reads them right.
+            let freezer_bin = !crate::cart::is_crt(&cart_bytes)
+                && cp.get("cartState").is_some_and(|cs| cs.get("freezerState").is_some_and(|f| !f.is_null()));
+            let ty = if freezer_bin {
+                crate::cart::CartType::Forced(crate::cart::MapperType::ActionReplay)
+            } else {
+                crate::cart::CartType::Auto
+            };
+            m.attach_cart_typed(&cart_bytes, "snapshot.crt", ty)
                 .map_err(|e| format!("restore cart: {e:?}"))?;
             // Overlay the mutable writable image (flash low+high) when captured. This
             // restores the flash DATA array (Spec 714.5); the flash COMMAND-FSM +
@@ -3093,6 +3155,7 @@ mod tests {
             cartridge_exrom: None,
             cartridge_game: None,
             phi1: 0xff,
+            ram_under: 0,
         };
 
         let crt = ef_crt();

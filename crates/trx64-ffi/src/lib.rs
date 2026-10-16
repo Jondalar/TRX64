@@ -417,7 +417,7 @@ impl Runtime {
     }
 
     /// Press and release one of the cartridge's buttons — "menu", "reset" or "special" on
-    /// an EasyFlash 3. A reset the press asks for runs inside the call. A cartridge
+    /// an EasyFlash 3, "freeze" on an Action Replay. A reset the press asks for runs inside the call. A cartridge
     /// without buttons (or none) is refused by the daemon, naming itself.
     pub fn cart_button(&self, button: String) -> Result<CartButtonResult, Trx64Error> {
         let v = self.rpc("cart/button", json!({ "button": button }))?;

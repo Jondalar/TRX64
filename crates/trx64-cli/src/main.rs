@@ -117,8 +117,8 @@ enum Command {
         /// the cart already running in its banked state).
         #[arg(long)]
         cart: Option<String>,
-        /// Cart type for a raw `.bin` `--cart`: a VICE id (32, 86, …) or a shared id (87, 88)
-        /// or mnemonic (ef/easyflash, gmod2, megabyter/mb, c64megacart/c64mc,
+        /// Cart type for a raw `.bin` `--cart`: a VICE id (1, 32, 86, …) or a shared id (87, 88)
+        /// or mnemonic (ar/action-replay, ef/easyflash, gmod2, megabyter/mb, c64megacart/c64mc,
         /// magicdesk/md, md16, ocean, 8k, 16k, ultimax). REQUIRED for a raw `.bin`
         /// unless its type auto-detects structurally; an OPTIONAL header override for
         /// a `.crt`. Omit (or `auto`/`crt`) to auto-detect.

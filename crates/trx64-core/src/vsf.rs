@@ -968,6 +968,7 @@ fn load_c64cart_easyflash(machine: &mut Machine, data: &[u8]) -> Result<bool, St
         img.extend_from_slice(romh);
         cart.set_writable_image(&img); // byte-exact flash (wins over EAPI-replacement)
         cart.set_state(CartState {
+            freezer: None,
             current_bank: register_00 as u16,
             control_register: Some(register_02),
             flash: Some(FlashCartState {
@@ -1875,6 +1876,7 @@ mod tests {
             cartridge_exrom: Some(1),
             cartridge_game: Some(1),
             phi1: 0xff,
+            ram_under: 0,
         }
     }
 

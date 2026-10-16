@@ -1,6 +1,6 @@
 # Spec 913 — An Action Replay V5 or V6 boots, freezes a running program and returns to it
 
-**Status:** PROPOSED (2026-10-16), all questions decided — ready to build.
+**Status:** PARTLY BUILT (2026-10-16): the cartridge, the freeze machinery, the state and the synthetic tests are built; the corpus tests (S2, S4, S5 on the real images) are not yet.
 **Repo:** TRX64 (a cartridge capability). C64RE gains nothing beyond what it already reads (the cart's type name in session state and the trace header).
 **Number:** 913 (registry: C64RE `specs/README.md`).
 **Origin:** owner, 2026-10-16, after an analysis of VICE's freezer cartridges: "Es wäre schon hilfreich Action Replay zu können .. lass uns das als single Spec einbauen und dann nur das erstmal". Retro Replay and Final Cartridge III are out (§4).

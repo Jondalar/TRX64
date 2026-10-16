@@ -64,6 +64,7 @@ fn bi(port: u8) -> BankInfo {
         cartridge_exrom: Some(1),
         cartridge_game: Some(0),
         phi1: 0xff,
+        ram_under: 0,
     }
 }
 const CFG7: u8 = 0x07;

@@ -379,10 +379,11 @@ impl<'a> FullBus<'a> {
             cartridge_attached: self.cartridge.is_some(),
             cartridge_exrom: lines.map(|l| l.exrom),
             cartridge_game: lines.map(|l| l.game),
-            // GMOD2's IO1 read mixes the EEPROM DO bit with open-bus low bits; the
-            // stock C64 float bus is 0xFF here (= open_bus()). Read-only mappers
-            // ignore phi1.
-            phi1: 0xff,
+            // `vicii_read_phi1()`: the VIC's last phi1 fetch, the byte a cartridge
+            // reads off the floating bus (GMOD2's IO1 read, an Action Replay's IO1
+            // read that rewrites its register with it).
+            phi1: self.vic.last_read_phi1,
+            ram_under: 0,
         }
     }
 
@@ -803,6 +804,18 @@ impl<'a> FullBus<'a> {
         stolen
     }
 
+    /// The cartridge's freeze alarms due at or before `clk` (`c64cart.c`
+    /// `cart_freeze_alarm_triggered` / `cart_nmi_alarm_triggered`). A cartridge freeze
+    /// that ran changed the cartridge's lines, so the PLA follows.
+    #[inline]
+    pub fn process_cart_alarms(&mut self, clk: u64) {
+        if let Some(c) = self.cartridge.as_mut() {
+            if c.run_alarms(clk) {
+                self.pla_config_changed();
+            }
+        }
+    }
+
     /// The CIAs' part of x64sc's alarm dispatch (`interrupt_delay`,
     /// `maincpu_steal_cycles`, `6510dtvcore.c` PROCESS_ALARMS): every CIA alarm due at
     /// or before `clk`, each callback at its own clock. One compare per chip when
@@ -903,6 +916,11 @@ impl<'a> FullBus<'a> {
     #[inline]
     fn port_read(&mut self, addr: u16) -> u8 {
         let cart = self.cart_read(addr);
+        // A read with a side effect on the cartridge (an Action Replay's IO1 read
+        // rewrites its register) can move EXROM/GAME: the PLA follows, as after a write.
+        if self.cartridge.as_mut().is_some_and(|c| c.take_config_changed()) {
+            self.pla_config_changed();
+        }
         if self.port_profile.is_none() && self.port_host.is_none() {
             return cart.unwrap_or(self.vic.last_read_phi1);
         }
@@ -956,6 +974,10 @@ impl<'a> FullBus<'a> {
     #[inline]
     pub fn port_lines(&self) -> crate::expansion::PortLines {
         let mut lines = self.host_lines;
+        // A freezer cartridge's NMI joins the expansion source.
+        if let Some(c) = self.cartridge.as_ref() {
+            lines.nmi |= c.nmi_line();
+        }
         if let Some(d) = self.port_profile.as_ref() {
             lines = lines.or(d.lines());
         }
@@ -996,7 +1018,10 @@ impl<'a> FullBus<'a> {
     #[inline]
     fn cart_read(&mut self, addr: u16) -> Option<u8> {
         self.io_touched = true;
-        let bi = self.get_bank_info();
+        let mut bi = self.get_bank_info();
+        // The C64 RAM under the address, for a cartridge whose ROML read ORs it in
+        // (`mem_read_without_ultimax`): the non-ultimax map is RAM at $8000-$9FFF.
+        bi.ram_under = self.ram[addr as usize];
         let clk = self.clk;
         let served = match self.cartridge.as_mut() {
             Some(c) => c.read(addr, &bi, clk),
@@ -1014,7 +1039,10 @@ impl<'a> FullBus<'a> {
             if let Some(slot) = crate::cart::CartSlot::for_address(addr) {
                 if let (Some(rs), Some(c)) = (self.cart_reads.as_deref_mut(), self.cartridge.as_ref())
                 {
-                    rs.on_read(slot, c.active_bank(addr), addr & 0x1fff, clk);
+                    // A byte served out of the cartridge's own RAM is not ROM payload.
+                    if c.read_is_rom(addr) {
+                        rs.on_read(slot, c.active_bank(addr), addr & 0x1fff, clk);
+                    }
                 }
             }
         }
@@ -1175,6 +1203,11 @@ impl<'a> Bus for FullBus<'a> {
                 if matches!(self.config.bank8, Bank8::CartLo) && self.cart_write(addr, value) {
                     self.wr_land = LAND_CART;
                     return;
+                }
+                // A cartridge with RAM behind ROML takes the store as well as the C64's
+                // RAM (VICE `roml_no_ultimax_store` / `raml_no_ultimax_store`).
+                if let Some(c) = self.cartridge.as_mut() {
+                    c.write_under_roml(addr, value);
                 }
                 self.ram_store(addr, value);
             }

@@ -67,6 +67,9 @@ pub enum MapperType {
     /// CARTRIDGE_EASYFLASH3 (hw 90, shared id) — skoe's EasyFlash 3: one 8 MB MX29LV640EB,
     /// eight slots of 64 banks, three buttons. See `ef3.rs`.
     EasyFlash3,
+    /// CARTRIDGE_ACTION_REPLAY (hw 1) — Action Replay 4.2 / V5 / V6: 32 KiB ROM in four
+    /// 8 KiB banks, 8 KiB RAM, a freeze button. See `action_replay.rs`.
+    ActionReplay,
     /// Spec 790 S2 — a raw `.bin` attached with `CartType::Auto` that the S1
     /// structural detect could not settle, now driven by the runtime
     /// self-configuring harness (`SelfConfigCartMapper`). This is the harness's
@@ -132,6 +135,11 @@ pub struct BankInfo {
     /// vicii_read_phi1()). GMOD2's IO1 read mixes the EEPROM DO bit (bit 7) with
     /// open-bus low bits; the read-only mappers ignore this. No-cart bus → 0xFF.
     pub phi1: u8,
+    /// The C64's own RAM byte at the address being read — the byte VICE's
+    /// `mem_read_without_ultimax()` returns, for a cartridge whose ROML read ORs
+    /// its own RAM into it (an Action Replay in mode $22). Filled by the bus for a
+    /// cartridge read and for a peek; 0 elsewhere.
+    pub ram_under: u8,
 }
 
 /// ts:34-37 — HeadlessCartridgeLines: the EXROM/GAME expansion-port lines (each a
@@ -154,6 +162,75 @@ pub struct CartState {
     /// NOT here (it rides in the separate writable image) — only the command-FSM
     /// continuation + EEPROM serial state + the EasyFlash jumper/IO2-RAM.
     pub flash: Option<FlashCartState>,
+    /// A freezer cartridge's registers, lines, pending freeze and RAM.
+    pub freezer: Option<FreezerCartState>,
+}
+
+/// A freezer cartridge's continuation (Action Replay): everything the cartridge holds
+/// beside its ROM. The 8 KiB cartridge RAM is volatile and rides here, never in the
+/// writable image — it is not flash and must not be persisted into the `.crt`.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+pub struct FreezerCartState {
+    /// The cartridge answers at `$DE00-$DFFF` (cleared by the kill bit, set by a freeze).
+    pub active: bool,
+    /// The last `$DE00` value (VICE `regvalue`).
+    pub regvalue: u8,
+    /// The configuration in force, VICE's `mode_phi2 & 3`: bit 0 = GAME asserted,
+    /// bit 1 = EXROM released (0 = 8K, 1 = 16K, 2 = off, 3 = ultimax).
+    pub mode: u8,
+    pub bank: u8,
+    /// RAM instead of ROM at ROML and IO2 (`export_ram`).
+    pub export_ram: bool,
+    /// The cartridge holds /NMI.
+    pub nmi: bool,
+    /// A freeze button press waiting for its cycle.
+    pub freeze_at: Option<u64>,
+    /// The cartridge's freeze waiting for its cycle (three after the NMI).
+    pub nmi_at: Option<u64>,
+    pub ram: Vec<u8>,
+}
+
+/// The freeze button's two alarms, `c64cart.c`'s `cartridge_freeze_alarm` and
+/// `cartridge_nmi_alarm`: the press, and the cartridge's own freeze three cycles after
+/// the NMI went out. Held by the freezer cartridge itself, so a checkpoint carries a
+/// pending freeze without the machine knowing about it.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct FreezeSched {
+    pub freeze_at: Option<u64>,
+    pub nmi_at: Option<u64>,
+}
+
+/// What came due.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FreezeStep {
+    /// The press: if the cartridge allows a freeze, assert NMI and arm the freeze.
+    Press,
+    /// The cartridge's own freeze, three cycles after the NMI.
+    Freeze,
+}
+
+impl FreezeSched {
+    /// The earliest alarm due at or before `clk`, taken off the schedule; `None` when
+    /// nothing is due. Alarms fire in time order, the NMI alarm first on a tie.
+    pub fn take_due(&mut self, clk: u64) -> Option<FreezeStep> {
+        let nmi = self.nmi_at.filter(|&t| t <= clk);
+        let press = self.freeze_at.filter(|&t| t <= clk);
+        match (nmi, press) {
+            (Some(n), Some(p)) if p < n => {
+                self.freeze_at = None;
+                Some(FreezeStep::Press)
+            }
+            (Some(_), _) => {
+                self.nmi_at = None;
+                Some(FreezeStep::Freeze)
+            }
+            (None, Some(_)) => {
+                self.freeze_at = None;
+                Some(FreezeStep::Press)
+            }
+            (None, None) => None,
+        }
+    }
 }
 
 /// The writable mapper continuation (small; the flash array itself is the
@@ -494,6 +571,83 @@ pub trait CartMapper: Send {
         None
     }
 
+    // ── Freezer cartridges (Spec 913) — defaults: not one ───────────────────────
+
+    /// The cartridge is a freezer: it has a freeze button and may drive /NMI, so the
+    /// machine keeps the expansion port's per-cycle work on for it.
+    fn is_freezer(&self) -> bool {
+        false
+    }
+    /// The cartridge holds /NMI (`maincpu_set_nmi(cartridge_int_num, IK_NMI)` while
+    /// it is up). Sampled every cycle onto the expansion NMI source.
+    fn nmi_line(&self) -> bool {
+        false
+    }
+    /// Raise or release the cartridge's /NMI.
+    fn drive_nmi(&mut self, _on: bool) {}
+    /// `cart_freeze_allowed()` for this cartridge.
+    fn freeze_allowed(&self) -> bool {
+        false
+    }
+    /// The cartridge's own freeze (`XXX_freeze()`): what it does to its lines and
+    /// registers three cycles after the NMI. The machine re-runs the PLA after it.
+    fn freeze(&mut self) {}
+    /// The freeze button's alarms, if this is a freezer.
+    fn freeze_sched(&mut self) -> Option<&mut FreezeSched> {
+        None
+    }
+    /// Dispatch the freeze alarms due at or before `clk` — a port of
+    /// `cart_freeze_alarm_triggered` and `cart_nmi_alarm_triggered`
+    /// (`c64cart.c`). Returns whether the cartridge's lines changed, so the caller
+    /// re-runs the PLA.
+    fn run_alarms(&mut self, clk: u64) -> bool {
+        let mut changed = false;
+        loop {
+            let step = match self.freeze_sched() {
+                Some(s) => s.take_due(clk),
+                None => return changed,
+            };
+            match step {
+                None => return changed,
+                Some(FreezeStep::Press) => {
+                    if self.freeze_allowed() {
+                        self.drive_nmi(true);
+                        if let Some(s) = self.freeze_sched() {
+                            s.nmi_at = Some(clk + 3);
+                        }
+                    }
+                }
+                Some(FreezeStep::Freeze) => {
+                    self.freeze();
+                    changed = true;
+                }
+            }
+        }
+    }
+    /// A read with a side effect on the cartridge's configuration (an Action Replay's
+    /// IO1 read) sets this; the bus re-runs the PLA once and the flag is taken.
+    fn take_config_changed(&mut self) -> bool {
+        false
+    }
+    /// A store the C64 makes into ROML with the cartridge's RAM behind it, in a
+    /// configuration where the store also lands in C64 RAM (8K / 16K game;
+    /// `roml_no_ultimax_store` / `raml_no_ultimax_store`). The C64 RAM store follows.
+    fn write_under_roml(&mut self, _addr: u16, _value: u8) {}
+    /// Whether a read this cartridge just served at `addr` came out of its ROM image.
+    /// The read-set lane counts ROM payload only; a cartridge serving RAM at a ROM
+    /// window says so here.
+    fn read_is_rom(&self, _addr: u16) -> bool {
+        true
+    }
+    /// The cartridge's power has been cut and restored: volatile contents are back to
+    /// their power-up state. The physical cartridge survives a power cycle of the C64
+    /// (flash does); its RAM does not.
+    fn power_up(&mut self) {}
+    /// [`press_button`](Self::press_button) on a given machine cycle.
+    fn press_button_at(&mut self, button: &str, _clk: u64) -> Result<(), String> {
+        self.press_button(button)
+    }
+
     // ── Banked code overlay (Spec 795) ──────────────────────────────────────────
 
     /// Overlay one byte into a cart bank IMAGE for an EXPLICIT bank at a CPU-window
@@ -599,6 +753,7 @@ fn infer_mapper_type(
                 None
             }
         }
+        1 => Some(MapperType::ActionReplay), // CARTRIDGE_ACTION_REPLAY (4.2 / V5 / V6)
         5 => Some(MapperType::Ocean),       // ts:244-245
         19 => Some(MapperType::MagicDesk),  // ts:246-247 CARTRIDGE_MAGIC_DESK
         85 => Some(MapperType::MagicDesk16), // ts:248-249 CARTRIDGE_MAGIC_DESK_16
@@ -656,6 +811,9 @@ pub enum CrtError {
     /// A CHIP packet names a bank the cartridge does not have (EasyFlash 3: `slot*64 +
     /// bank` is 0..511). Never dropped silently.
     BankOutOfRange { bank: u16, limit: u16 },
+    /// The image does not have the chips this cartridge type is made of (an Action Replay
+    /// is four 8 KiB banks at `$8000`).
+    BadLayout(String),
 }
 
 impl std::fmt::Display for CrtError {
@@ -677,13 +835,14 @@ impl std::fmt::Display for CrtError {
             CrtError::UnknownCartType(s) => {
                 write!(
                     f,
-                    "Unknown cart type '{s}'. Valid: a VICE numeric id (5, 19, 32, 60, 85, 86, -2, -3, -6, 0), the shared ids 87 (GMod4), 88 (C64MegaCart) and 90 (EasyFlash 3), the TRX64 id 232, \
-                     or a mnemonic (ef/easyflash, ef3/easyflash3, efxl, gmod2, megabyter/mb, c64megacart/c64mc, magicdesk/md, md16, ocean, 8k, 16k, ultimax, crt/auto)."
+                    "Unknown cart type '{s}'. Valid: a VICE numeric id (1, 5, 19, 32, 60, 85, 86, -2, -3, -6, 0), the shared ids 87 (GMod4), 88 (C64MegaCart) and 90 (EasyFlash 3), the TRX64 id 232, \
+                     or a mnemonic (ar/action-replay, ef/easyflash, ef3/easyflash3, efxl, gmod2, megabyter/mb, c64megacart/c64mc, magicdesk/md, md16, ocean, 8k, 16k, ultimax, crt/auto)."
                 )
             }
             CrtError::BankOutOfRange { bank, limit } => {
                 write!(f, "CHIP packet bank {bank} is outside this cartridge (banks 0..{}).", limit - 1)
             }
+            CrtError::BadLayout(why) => write!(f, "{why}"),
             CrtError::BinTypeAmbiguous => {
                 write!(
                     f,
@@ -953,7 +1112,7 @@ impl CartMapper for NormalMapper {
         self.base.current_bank
     }
     fn get_state(&self) -> CartState {
-        CartState { current_bank: self.base.current_bank, control_register: None, flash: None }
+        CartState { current_bank: self.base.current_bank, control_register: None, flash: None, freezer: None }
     }
     fn set_state(&mut self, state: CartState) {
         self.base.current_bank = state.current_bank & 0xff;
@@ -1033,7 +1192,7 @@ impl CartMapper for MagicDeskMapper {
         self.base.current_bank
     }
     fn get_state(&self) -> CartState {
-        CartState { current_bank: self.base.current_bank, control_register: Some(self.regval), flash: None }
+        CartState { current_bank: self.base.current_bank, control_register: Some(self.regval), flash: None, freezer: None }
     }
     fn set_state(&mut self, state: CartState) {
         self.base.current_bank = state.current_bank & 0xff;
@@ -1111,7 +1270,7 @@ impl CartMapper for MagicDesk16Mapper {
         self.base.current_bank
     }
     fn get_state(&self) -> CartState {
-        CartState { current_bank: self.base.current_bank, control_register: Some(self.regval), flash: None }
+        CartState { current_bank: self.base.current_bank, control_register: Some(self.regval), flash: None, freezer: None }
     }
     fn set_state(&mut self, state: CartState) {
         self.base.current_bank = state.current_bank & 0xff;
@@ -1228,7 +1387,7 @@ impl CartMapper for OceanMapper {
         self.base.current_bank
     }
     fn get_state(&self) -> CartState {
-        CartState { current_bank: self.base.current_bank, control_register: Some(self.regval), flash: None }
+        CartState { current_bank: self.base.current_bank, control_register: Some(self.regval), flash: None, freezer: None }
     }
     fn set_state(&mut self, state: CartState) {
         self.base.current_bank = state.current_bank & 0xff;
@@ -1481,6 +1640,7 @@ impl CartMapper for EasyFlashMapper {
         let mut lo = self.lo_flash.clone();
         let mut hi = self.hi_flash.clone();
         CartState {
+            freezer: None,
             current_bank: self.current_bank,
             control_register: Some(self.register02),
             flash: Some(FlashCartState {
@@ -1749,6 +1909,7 @@ impl CartMapper for Gmod2Mapper {
     fn get_state(&self) -> CartState {
         let mut flash = self.flash.clone();
         CartState {
+            freezer: None,
             current_bank: self.current_bank,
             control_register: Some(self.register),
             flash: Some(FlashCartState {
@@ -1910,6 +2071,7 @@ impl CartMapper for MegabyterMapper {
     fn get_state(&self) -> CartState {
         let mut flash = self.flash.clone();
         CartState {
+            freezer: None,
             current_bank: self.register00 as u16,
             control_register: Some(self.register02),
             flash: Some(FlashCartState {
@@ -2079,6 +2241,7 @@ impl CartMapper for C64MegaCartMapper {
     fn get_state(&self) -> CartState {
         let mut flash = self.flash.clone();
         CartState {
+            freezer: None,
             current_bank: self.bank,
             control_register: Some(match self.mode {
                 C64MegaCartMode::Game8k => 0x00,
@@ -2151,6 +2314,7 @@ pub fn mapper_from_image(
         MapperType::C64MegaCart => Ok(Box::new(C64MegaCartMapper::new(image))),
         MapperType::Gmod4 => Ok(Box::new(Gmod4Mapper::new(image))),
         MapperType::EasyFlash3 => Ok(Box::new(crate::ef3::Ef3Mapper::new(image)?)),
+        MapperType::ActionReplay => Ok(Box::new(crate::action_replay::ActionReplayMapper::new(image)?)),
         // The self-config harness is constructed directly (SelfConfigCartMapper::new
         // / load_self_config_from_bin), never from a parsed image, and locks a
         // concrete family at runtime — so it has no image-driven build here.
@@ -2532,6 +2696,7 @@ impl CartMapper for Gmod4Mapper {
 
     fn get_state(&self) -> CartState {
         CartState {
+            freezer: None,
             current_bank: self.bank_8000() as u16,
             control_register: Some(
                 (self.bitbang as u8)
@@ -2671,6 +2836,8 @@ fn bin_geometry(mapper_type: MapperType) -> Result<BinGeometry, CrtError> {
         // EasyFlash 3: 8 MB = 512 banks of 16 KB, slot-major (`slot*64 + bank`), ROML half
         // then ROMH half per bank, as a CRT's packets number them.
         MapperType::EasyFlash3 => BinGeometry { bank_unit: 0x4000, layout: Roml16kRomhA000, exrom: 1, game: 0, max_banks: 512 },
+        // Action Replay: 32 KiB, four 8 KiB banks at $8000 (parse_bin insists on all four).
+        MapperType::ActionReplay => BinGeometry { bank_unit: 0x2000, layout: Roml8k, exrom: 0, game: 1, max_banks: 4 },
         // The harness has no static geometry — it re-derives the concrete type's
         // geometry via `bin_geometry(concrete)` at lock time.
         MapperType::SelfConfig => return Err(CrtError::Unsupported(MapperType::SelfConfig)),
@@ -2713,6 +2880,11 @@ pub fn parse_bin(
         });
     }
     let k = slice.len() / geom.bank_unit;
+    // An Action Replay is exactly 32 KiB (VICE loads `0x8000` bytes): a shorter image is
+    // another cartridge, not an Action Replay with banks missing.
+    if mapper_type == MapperType::ActionReplay && k != 4 {
+        return Err(CrtError::BadBinSize { len: data.len(), bank_unit: geom.bank_unit, max_banks: geom.max_banks });
+    }
     if k < 1 || k > geom.max_banks {
         return Err(CrtError::BadBinSize {
             len: data.len(),
@@ -2809,6 +2981,7 @@ pub fn resolve_cart_type(s: &str) -> Result<CartType, CrtError> {
             -3 => MapperType::Normal8k,   // CARTRIDGE_GENERIC_8KB
             -2 => MapperType::Normal16k,  // CARTRIDGE_GENERIC_16KB
             -6 => MapperType::Ultimax,    // CARTRIDGE_ULTIMAX
+            1 => MapperType::ActionReplay,
             5 => MapperType::Ocean,
             19 => MapperType::MagicDesk,
             32 => MapperType::EasyFlash,
@@ -2833,6 +3006,7 @@ pub fn resolve_cart_type(s: &str) -> Result<CartType, CrtError> {
         "magicdesk" | "md" => MapperType::MagicDesk,
         "md16" | "magicdesk16" => MapperType::MagicDesk16,
         "ocean" => MapperType::Ocean,
+        "ar" | "actionreplay" | "action-replay" | "action_replay" => MapperType::ActionReplay,
         "8k" | "generic8k" => MapperType::Normal8k,
         "16k" | "generic16k" => MapperType::Normal16k,
         "ultimax" => MapperType::Ultimax,
@@ -3229,7 +3403,7 @@ impl CartMapper for SelfConfigCartMapper {
     fn get_state(&self) -> CartState {
         match &self.resolved {
             Some(m) => m.get_state(),
-            None => CartState { current_bank: self.bank_low, control_register: None, flash: None },
+            None => CartState { current_bank: self.bank_low, control_register: None, flash: None, freezer: None },
         }
     }
 
@@ -3356,6 +3530,7 @@ mod overlay795_tests {
             cartridge_exrom: Some(0),
             cartridge_game: Some(1),
             phi1: 0xff,
+            ram_under: 0,
         }
     }
 
@@ -3517,6 +3692,7 @@ mod cart_read_set_785_tests {
             cartridge_exrom: Some(0),
             cartridge_game: Some(0),
             phi1: 0xff,
+            ram_under: 0,
         };
 
         // EasyFlash: ONE $DE00 register, both windows.
