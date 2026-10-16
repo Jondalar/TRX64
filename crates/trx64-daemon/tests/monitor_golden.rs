@@ -354,8 +354,10 @@ fn the_monitor_prints_what_it_printed_before_the_extraction() {
         return;
     }
 
+    // The transcript is built with LF; a checkout with core.autocrlf (the Git for Windows
+    // default) hands the committed LF file over with CRLF, which is no change in the output.
     let expected = match std::fs::read_to_string(&golden) {
-        Ok(s) => s,
+        Ok(s) => s.replace("\r\n", "\n"),
         Err(_) => panic!(
             "no golden transcript at {} — produce it with TRX64_GOLDEN_BLESS=1 BEFORE moving any code",
             golden.display()
