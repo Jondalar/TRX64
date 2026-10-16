@@ -92,8 +92,10 @@ pub fn note_mounted_disk(m: &Machine, unit: u8, sha256: &str) {
     }
 }
 
-fn basename(p: &str) -> String {
-    p.rsplit('/').next().unwrap_or("").to_string()
+/// The file name of a host path. On Windows a path carries `\` (and may carry `/`) between its
+/// parts; elsewhere only `/` separates, so a `\` stays part of the name there.
+pub(crate) fn basename(p: &str) -> String {
+    p.rsplit(|c| c == '/' || (cfg!(windows) && c == '\\')).next().unwrap_or("").to_string()
 }
 
 /// Every medium in the session's machine: the cartridge, then each drive with a disk.
@@ -247,4 +249,22 @@ pub fn changes(session: &Session, before: &[MediaSeen]) -> Option<(Vec<String>, 
 /// The record written when the machine is switched off with a trace running: the
 /// trace ends there, with what was in the machine still named by the records before.
 pub const POWER_OFF_LABEL: &str = "media/1 power off";
+
+#[cfg(test)]
+mod basename_tests {
+    use super::basename;
+
+    #[test]
+    fn basename_is_the_last_part_of_a_host_path() {
+        assert_eq!(basename("/x/y/a.d64"), "a.d64");
+        assert_eq!(basename("a.d64"), "a.d64");
+        if cfg!(windows) {
+            assert_eq!(basename(r"C:\x\y\a.d64"), "a.d64");
+            assert_eq!(basename(r"\\?\C:\x\a.d64"), "a.d64");
+            assert_eq!(basename(r"C:\x/y\a.d64"), "a.d64");
+        } else {
+            assert_eq!(basename(r"x\a.d64"), r"x\a.d64");
+        }
+    }
+}
 

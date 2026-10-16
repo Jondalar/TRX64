@@ -9438,7 +9438,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 Ok(other) => return Response::err(id, -32602, format!("{V}: {} is not a disk image", other.as_str())),
                 Err(e) => return Response::err(id, -32602, format!("{V}: {e}")),
             };
-            let disk_name = path_str.rsplit('/').next().unwrap_or("disk").to_string();
+            let disk_name = media_identity::basename(&path_str);
             let sha256 = sha256_hex(&bytes);
             let image = DiskImage {
                 kind: disk_kind_from_format(format_str),
@@ -13363,8 +13363,7 @@ fn gather_snapshot_media(session: &Session) -> Vec<Value> {
         let source_name = disk
             .backing_path
             .as_ref()
-            .and_then(|p| p.rsplit('/').next())
-            .map(String::from);
+            .map(|p| media_identity::basename(p));
         out.push(json!({
             "role": "drive8",
             "format": format,
@@ -13403,8 +13402,7 @@ fn gather_native_media_inputs(
         let source_name = disk
             .backing_path
             .as_ref()
-            .and_then(|p| p.rsplit('/').next())
-            .map(String::from);
+            .map(|p| media_identity::basename(p));
         out.push(NativeSnapshotMediaInput {
             role: "drive8".to_string(),
             format: format.to_string(),
@@ -13505,8 +13503,7 @@ fn gather_recorder_media_inputs(
                 .and_then(|mm| mm.get("diskPath"))
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
-                .and_then(|p| p.rsplit('/').next())
-                .map(String::from);
+                .map(|p| media_identity::basename(p));
             out.push(NativeSnapshotMediaInput {
                 role: "drive8".to_string(),
                 format,
@@ -14041,8 +14038,7 @@ fn drive8_media_identity(drive: &trx64_core::drive::Drive1541) -> (String, Strin
             sha256_hex(&disk.bytes),
             disk.backing_path
                 .as_ref()
-                .and_then(|p| p.rsplit('/').next())
-                .map(String::from)
+                .map(|p| media_identity::basename(p))
                 .unwrap_or_default(),
         ),
         None => (String::new(), String::new()),
