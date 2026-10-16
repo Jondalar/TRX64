@@ -159,6 +159,7 @@ mod tests {
             cartridge_exrom: Some(0),
             cartridge_game: Some(1),
             phi1: 0xff,
+            ram_under: 0,
         }
     }
 
