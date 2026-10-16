@@ -190,13 +190,16 @@ pub struct FreezerCartState {
     pub ram: Vec<u8>,
 }
 
-/// The freeze button's two alarms, `c64cart.c`'s `cartridge_freeze_alarm` and
-/// `cartridge_nmi_alarm`: the press, and the cartridge's own freeze three cycles after
-/// the NMI went out. Held by the freezer cartridge itself, so a checkpoint carries a
-/// pending freeze without the machine knowing about it.
+/// The freeze button's schedule: the press (`c64cart.c`'s `cartridge_freeze_alarm`), and
+/// the freeze that waits for the CPU to take the NMI. Deliberately not VICE's alarm three
+/// cycles after the NMI (`c64cart.c:1369-1372`): that switches the map under whatever
+/// instruction is in flight; this switches it when the CPU is at the NMI vector fetch.
+/// Held by the freezer cartridge itself, so a checkpoint carries a pending freeze without
+/// the machine knowing about it.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct FreezeSched {
     pub freeze_at: Option<u64>,
+    /// The cycle the cartridge pulled NMI; its freeze waits for the vector fetch.
     pub nmi_at: Option<u64>,
 }
 
@@ -205,30 +208,17 @@ pub struct FreezeSched {
 pub enum FreezeStep {
     /// The press: if the cartridge allows a freeze, assert NMI and arm the freeze.
     Press,
-    /// The cartridge's own freeze, three cycles after the NMI.
-    Freeze,
 }
 
 impl FreezeSched {
-    /// The earliest alarm due at or before `clk`, taken off the schedule; `None` when
-    /// nothing is due. Alarms fire in time order, the NMI alarm first on a tie.
+    /// The press, if it is due at or before `clk`, taken off the schedule.
     pub fn take_due(&mut self, clk: u64) -> Option<FreezeStep> {
-        let nmi = self.nmi_at.filter(|&t| t <= clk);
-        let press = self.freeze_at.filter(|&t| t <= clk);
-        match (nmi, press) {
-            (Some(n), Some(p)) if p < n => {
+        match self.freeze_at {
+            Some(t) if t <= clk => {
                 self.freeze_at = None;
                 Some(FreezeStep::Press)
             }
-            (Some(_), _) => {
-                self.nmi_at = None;
-                Some(FreezeStep::Freeze)
-            }
-            (None, Some(_)) => {
-                self.freeze_at = None;
-                Some(FreezeStep::Press)
-            }
-            (None, None) => None,
+            _ => None,
         }
     }
 }
@@ -590,39 +580,40 @@ pub trait CartMapper: Send {
         false
     }
     /// The cartridge's own freeze (`XXX_freeze()`): what it does to its lines and
-    /// registers three cycles after the NMI. The machine re-runs the PLA after it.
+    /// registers when the CPU takes the NMI (at its vector fetch). The machine re-runs the PLA after it.
     fn freeze(&mut self) {}
     /// The freeze button's alarms, if this is a freezer.
     fn freeze_sched(&mut self) -> Option<&mut FreezeSched> {
         None
     }
-    /// Dispatch the freeze alarms due at or before `clk` — a port of
-    /// `cart_freeze_alarm_triggered` and `cart_nmi_alarm_triggered`
-    /// (`c64cart.c`). Returns whether the cartridge's lines changed, so the caller
-    /// re-runs the PLA.
+    /// Dispatch the press if it is due at or before `clk` — `cart_freeze_alarm_triggered`
+    /// (`c64cart.c`): if a freeze is allowed, NMI goes up and the cartridge's freeze waits
+    /// for the CPU to take it ([`nmi_vector_fetch`](Self::nmi_vector_fetch)). VICE runs the
+    /// freeze three cycles after the NMI instead; that lands in the middle of whatever
+    /// instruction is executing and corrupts it (owner decision 2026-10-16). Returns whether
+    /// the cartridge's lines changed.
     fn run_alarms(&mut self, clk: u64) -> bool {
-        let mut changed = false;
-        loop {
-            let step = match self.freeze_sched() {
-                Some(s) => s.take_due(clk),
-                None => return changed,
-            };
-            match step {
-                None => return changed,
-                Some(FreezeStep::Press) => {
-                    if self.freeze_allowed() {
-                        self.drive_nmi(true);
-                        if let Some(s) = self.freeze_sched() {
-                            s.nmi_at = Some(clk + 3);
-                        }
-                    }
-                }
-                Some(FreezeStep::Freeze) => {
-                    self.freeze();
-                    changed = true;
-                }
+        let step = match self.freeze_sched() {
+            Some(s) => s.take_due(clk),
+            None => return false,
+        };
+        if step == Some(FreezeStep::Press) && self.freeze_allowed() {
+            self.drive_nmi(true);
+            if let Some(s) = self.freeze_sched() {
+                s.nmi_at = Some(clk);
             }
         }
+        false
+    }
+    /// The CPU is at the `$FFFA` fetch of an NMI sequence (after its three pushes). A
+    /// cartridge that pulled NMI for a freeze runs its own freeze now. Returns whether
+    /// its lines changed.
+    fn nmi_vector_fetch(&mut self) -> bool {
+        let armed = self.freeze_sched().is_some_and(|s| s.nmi_at.take().is_some());
+        if armed {
+            self.freeze();
+        }
+        armed
     }
     /// A read with a side effect on the cartridge's configuration (an Action Replay's
     /// IO1 read) sets this; the bus re-runs the PLA once and the flag is taken.

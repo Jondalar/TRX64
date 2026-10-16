@@ -578,7 +578,7 @@ the press (VICE's random delay of up to a frame is dropped, so a press is a repr
 point), and switches itself three cycles after the NMI. The cartridge's state, RAM
 included, rides the checkpoint and the `.c64re` dump.
 
-**Decision:** VICE's sequence is kept even where it is rough — the switch to ultimax lands
-mid-instruction, and a press that catches a ROM-reading instruction in flight breaks it
-(about 3 % of presses on a BASIC loop). The board switches on the NMI vector fetch; changing
-to that is the owner's call, not a side effect of a port.
+**Decision:** the cartridge's switch to ultimax follows the CPU, not the clock: VICE switches
+three cycles after the NMI, mid-instruction, which broke about 3 % of presses on a BASIC loop;
+here it happens at the NMI's vector fetch, after the stack pushes (owner, 2026-10-16). A
+deliberate deviation from VICE, recorded in the spec.

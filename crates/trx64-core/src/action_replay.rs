@@ -21,7 +21,7 @@
 //! original and reads C64 RAM OR cartridge RAM at ROML.
 //!
 //! The freeze: the button's press, `cart_freeze_allowed()` (always for this cartridge), /NMI
-//! asserted, and three cycles later the cartridge's own `freeze()` — ultimax with RAM at
+//! asserted, and when the CPU takes it (after the pushes, at the `$FFFA` fetch) the cartridge's own `freeze()` — ultimax with RAM at
 //! ROML, bank 0, `active` set — so the NMI vector at `$FFFA` comes out of the ROM. /NMI is
 //! released by a register write with bit 6.
 

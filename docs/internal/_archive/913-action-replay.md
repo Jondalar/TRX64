@@ -108,7 +108,7 @@ mehr"). A port of VICE's `actionreplay.c`, function by function, into
 
 **D2 Freeze machinery** (shared, built once, reused by any later freezer): `CartMapper` gains
 `nmi_line()`, `freeze()` and `freeze_allowed()`; a scheduled freeze event (NMI asserted, the
-cartridge's `freeze()` 3 cycles later, then the PLA) ported from `c64cart.c` /
+cartridge's `freeze()` at the NMI vector fetch, then the PLA) ported from `c64cart.c` /
 `c64carthooks.c`; the cartridge's NMI joins the expansion NMI source; a read with a side effect
 re-runs the PLA; the cartridge sees the real phi1 byte.
 
@@ -123,7 +123,7 @@ the checkpoint (RAM as bytes, not `Vec<i64>`); the read-set lane excludes cartri
 - **Q1 Freeze delay — decided 2026-10-16 (owner: "Taktgenauer freeze").** The freeze takes
   effect at the cycle the button is pressed: no random delay. VICE's random 1..one-frame delay
   (`c64cart.c:1393`) would break P6; a later freeze is a later press. The rest of the sequence
-  stays VICE's: NMI asserted, the cartridge's `freeze()` 3 cycles later (`c64cart.c:1369-1372`).
+  stays VICE's: NMI asserted, then the cartridge's `freeze()` — but see §5: it runs at the CPU's NMI vector fetch, not 3 cycles later (`c64cart.c:1369-1372`).
 - **Q2 Scope — decided 2026-10-16:** V5 and V6 only (D1). VICE's release of the NMI comes from
   the freeze-ack bit, as in `actionreplay.c:131-160`; the never-released NMI of MK3/MK4 does not
   arise.
@@ -138,7 +138,7 @@ the checkpoint (RAM as bytes, not `Vec<i64>`); the read-set lane excludes cartri
 
 ## §5 Decisions taken while building
 
-- **VICE's sequence is ported as it is, including its mid-instruction switch.** The cartridge goes to ultimax three cycles after it pulls NMI, and the CPU takes the NMI only at an instruction boundary, so an instruction that is in flight on that cycle runs its remaining bus cycles in the new map. `JSR CHRGET` in a BASIC loop (operands in BASIC ROM, which is open bus under ultimax) is the case that shows: measured on V5 PAL over 62 press cycles one BASIC loop passes, 2 broke the BASIC program (a `?SYNTAX ERROR` or a stalled counter), both with the press landing on that `JSR`. The real board does not do this (it switches on the NMI vector fetch); VICE does, and Q2 asked for VICE. A later press is a later press, so the same cycle is the same result. Not changed here; the alternative (switch at the vector fetch) is a decision for the owner.
+- **Deliberate deviation from VICE: the switch to ultimax happens when the CPU takes the NMI, not three cycles after the cartridge pulls it** (VICE: `c64cart.c:1369-1372`; owner decision 2026-10-16). The three-cycle switch lands under whatever instruction is in flight, and an instruction that still has ROM operands to fetch (a `JSR CHRGET` into BASIC, which is open bus under ultimax) is corrupted: on V5 PAL, 2 of 62 presses on a BASIC loop broke the program. Now the cartridge pulls NMI on the cycle of the press and its freeze waits for a hook in the CPU core (`nmi_vector_fetch`, in `c64_6510core.rs`) that runs after the three stack pushes (PCH, PCL, P) and before the `$FFFA` fetch. It is called from the plain NMI sequence and from the IRQ/BRK sequence when an NMI took its vector over (`do_irqbrk`, after the late vector choice), so the switch always follows the vector actually fetched; an IRQ that wins leaves the NMI pending and the switch waits for the NMI that takes it. The pending state (`nmiAt`) is part of the cartridge, so a checkpoint and a `.c64re` carry it. Measured after the change: 0 broken of 62 presses on a BASIC loop and 0 of 62 on a loop that keeps calling a KERNAL routine (CPU at `$E000+`), real V5 PAL image; a synthetic ROM with `JSR $FFE4`/`LDA $A123`/`EOR $E456` survives a press on each of 200 consecutive cycles and on every cycle from before an IRQ entry to after its vector fetch.
 - **The ultimax open windows read the VIC's phi1 byte** (`ultimax_1000_7fff_read` and the siblings return `vicii_read_phi1()`), not `$FF`. This is not Action-Replay-specific and applies to every ultimax cartridge.
 - **The cartridge RAM is not flash.** It rides `CartState.freezer` and the checkpoint's `freezerState` (a byte node), is re-patterned on a power cycle of the C64 (the cartridge object survives one, its RAM does not) and is kept across a reset. Power-up pattern: VICE's `ramparam` (start `$FF`, inverted every two bytes from offset 1, the pattern inverted every `$100`).
 - **The freeze alarms live in the cartridge**, not in the machine: a pending press and a pending freeze are part of the mapper's state, so a clone, a checkpoint or a `.c64re` carries them with no machine-side field. The machine only dispatches them (`run_alarms`) from the same per-cycle alarm point as the CIAs, and only when the cartridge says it is a freezer.

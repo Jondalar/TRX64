@@ -481,6 +481,12 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
     fn expansion_active(&self) -> bool {
         self.fb.port_active
     }
+    #[inline]
+    fn nmi_vector_fetch(&mut self) {
+        if self.fb.port_active {
+            self.fb.cart_nmi_vector_fetch();
+        }
+    }
 
     /// cpu_reset (mainc64cpu.c:631-651) — invoked on the IK_RESET dispatch. The
     /// C64 reset vector ($FFFC/$FFFD) is read by DO_INTERRUPT itself (through

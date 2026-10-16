@@ -816,6 +816,17 @@ impl<'a> FullBus<'a> {
         }
     }
 
+    /// The CPU is at the `$FFFA` fetch of an NMI sequence: a freezer cartridge whose NMI is up
+    /// switches here, and the PLA follows.
+    #[inline]
+    pub fn cart_nmi_vector_fetch(&mut self) {
+        if let Some(c) = self.cartridge.as_mut() {
+            if c.nmi_vector_fetch() {
+                self.pla_config_changed();
+            }
+        }
+    }
+
     /// The CIAs' part of x64sc's alarm dispatch (`interrupt_delay`,
     /// `maincpu_steal_cycles`, `6510dtvcore.c` PROCESS_ALARMS): every CIA alarm due at
     /// or before `clk`, each callback at its own clock. One compare per chip when

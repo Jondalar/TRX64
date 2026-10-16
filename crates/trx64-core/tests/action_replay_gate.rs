@@ -495,7 +495,8 @@ fn s4_synthetic_freeze_enters_the_handler_and_returns() {
     m.run_for_full_capped(2, 1, &mut NullSink, |_, _, _, _, _, _, _| {});
     let f = frozen_state(&m);
     assert!(f.nmi, "NMI asserted");
-    assert_eq!((f.freeze_at, f.nmi_at), (None, Some(at + 3)), "three cycles to the cartridge's own freeze");
+    assert_eq!((f.freeze_at, f.nmi_at), (None, Some(at)), "NMI up on the cycle of the press; the freeze waits for the CPU to take it");
+    assert_eq!(f.mode, 0, "and the map has not moved under the instruction in flight");
 
     // run on: the handler ran once, the program carries on from where it was frozen
     run(&mut m, 2_000);
@@ -578,7 +579,8 @@ fn s4_freeze_revives_a_killed_cartridge() {
     c.press_button_at("freeze", 100).unwrap();
     assert!(!c.run_alarms(100), "the press arms the NMI first");
     assert!(c.nmi_line());
-    assert!(c.run_alarms(103), "the cartridge's freeze three cycles later changed its lines");
+    assert!(!c.run_alarms(110), "and nothing else happens with the clock");
+    assert!(c.nmi_vector_fetch(), "the cartridge freezes when the CPU is at the vector fetch");
     let f = frozen_state(&m);
     assert_eq!((f.active, f.mode, f.export_ram, f.bank), (true, 3, true, 0));
 }
@@ -588,7 +590,7 @@ fn s4_register_write_with_bit_6_releases_nmi() {
     let mut m = mapper();
     m.press_button_at("freeze", 10).unwrap();
     m.run_alarms(10);
-    m.run_alarms(13);
+    m.nmi_vector_fetch();
     assert!(m.nmi_line());
     wr(&mut m, 0xde00, 0x23); // no release bit: still held
     assert!(m.nmi_line());
@@ -700,4 +702,84 @@ fn the_read_set_does_not_count_cartridge_ram_as_rom() {
     wr(&mut m, 0xde00, 0x00);
     wr(&mut m, 0xde00, 0x22);
     assert!(!m.read_is_rom(0x9000), "mode $22 is RAM too");
+}
+
+// ── a press never breaks the instruction in flight ───────────────────────────────
+
+/// Like [`freezer_rom`], with a loop whose instructions read ROM at their operands:
+/// `JSR $FFE4` (KERNAL code at $E000+), `LDA $A123` (BASIC ROM), `EOR $E456` (KERNAL ROM),
+/// `STA $0336`, `INC $0334`. IRQs are on (CLI), so the KERNAL's IRQ runs in the same loop.
+fn rom_reading_rom() -> [Vec<u8>; 4] {
+    let mut banks = freezer_rom();
+    let b = &mut banks[0];
+    let code: &[u8] = &[
+        0x58, // CLI                      ($8018)
+        0x20, 0xe4, 0xff, // loop: JSR $FFE4    ($8019)
+        0xad, 0x23, 0xa1, // LDA $A123
+        0x4d, 0x56, 0xe4, // EOR $E456
+        0x8d, 0x36, 0x03, // STA $0336
+        0xee, 0x34, 0x03, // INC $0334
+        0x4c, 0x19, 0x80, // JMP loop
+    ];
+    b[0x18..0x18 + code.len()].copy_from_slice(code);
+    banks
+}
+
+fn boot_loop() -> Option<Machine> {
+    let mut m = boot(&ar_crt(&rom_reading_rom()))?;
+    run(&mut m, 2_000_000);
+    assert_ne!(m.read_full(0x0334), 0, "the loop runs");
+    Some(m)
+}
+
+/// Press `k` cycles into the clone of `base` and run on: the program must survive it.
+fn press_and_check(base: &Machine, k: u64, what: &str) {
+    let mut m = base.clone();
+    let expect = m.read_full(0xa123) ^ m.read_full(0xe456);
+    run(&mut m, k);
+    m.cart_press_button("freeze").unwrap();
+    run(&mut m, 4_000);
+    assert_eq!(m.read_full(0x0335), 1, "{what} +{k}: the handler ran, from the cartridge's vector");
+    let f = frozen_state(&m);
+    assert_eq!((f.mode, f.nmi, f.nmi_at), (0, false, None), "{what} +{k}: and the cartridge is back to an 8K game");
+    let c = m.read_full(0x0334);
+    assert_eq!(m.read_full(0x0336), expect, "{what} +{k}: the instruction read the ROM it names");
+    run(&mut m, 4_000);
+    assert_ne!(m.read_full(0x0334), c, "{what} +{k}: the loop runs on");
+    assert!(!m.c64_core.is_jammed, "{what} +{k}: no JAM");
+}
+
+#[test]
+fn s4_a_press_on_every_cycle_of_a_window_never_breaks_the_instruction_in_flight() {
+    let Some(base) = boot_loop() else { skip!("no C64 ROMs") };
+    // 3 passes of the loop (~55 cycles each, plus the KERNAL's GETIN): every cycle
+    for k in 0..200 {
+        press_and_check(&base, k, "loop");
+    }
+}
+
+#[test]
+fn s4_a_press_around_an_irq_entry_never_breaks_the_program() {
+    let Some(mut m) = boot_loop() else { skip!("no C64 ROMs") };
+    // find the next IRQ entry ($FF48 is the KERNAL's IRQ vector target), then take a state
+    // some 80 cycles before it (the run is deterministic: the same IRQ comes again)
+    let mut probe = m.clone();
+    let mut irq_at = None;
+    for _ in 0..40_000 {
+        probe.run_for_full_capped(1, 1, &mut NullSink, |_, _, _, _, _, _, _| {});
+        if (0xff48..0xff50).contains(&probe.c64_core.reg_pc) {
+            irq_at = Some(probe.c64_core.clk);
+            break;
+        }
+    }
+    let irq_at = irq_at.expect("an IRQ comes");
+    let ahead = irq_at - m.c64_core.clk - 80;
+    run(&mut m, ahead);
+    let base = m;
+    let span = irq_at - base.c64_core.clk;
+    assert!(span >= 60, "a state far enough ahead of the IRQ: {span}");
+    // presses from before the IRQ sequence starts to after its vector fetch
+    for k in 0..span + 12 {
+        press_and_check(&base, k, "irq");
+    }
 }

@@ -654,6 +654,12 @@ pub trait C64Core6510Bus {
     fn expansion_active(&self) -> bool {
         false
     }
+    /// The CPU has pushed PCH, PCL and P of an NMI sequence and is about to fetch the vector
+    /// at `$FFFA` — whichever sequence it is (a plain NMI, or an IRQ/BRK one that an NMI took
+    /// the vector over). A freezer cartridge switches its map here, so the vector comes out
+    /// of its ROM and the interrupted instruction has run against the normal map.
+    #[inline]
+    fn nmi_vector_fetch(&mut self) {}
 
     /// PORT OF: mainc64cpu.c:778 ROM_TRAP_HANDLER() = traps_handler(). Returns 0
     /// if handled in place, a replacement opcode (>0, <0xffffffff) to replay, or
@@ -2478,6 +2484,9 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
             self.int.interrupt_ack_nmi();
         }
         self.local_set_interrupt(true);
+        if handler_vector == 0xfffa {
+            self.bus.nmi_vector_fetch();
+        }
         let mut addr = self.load(handler_vector) as u16;
         self.clk_inc();
         addr |= (self.load(handler_vector.wrapping_add(1)) as u16) << 8;
@@ -2521,6 +2530,7 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
                 let st = self.local_status();
                 self.push(st);
                 self.clk_inc();
+                self.bus.nmi_vector_fetch();
                 addr = self.load(0xfffa) as u16;
                 self.clk_inc();
                 addr |= (self.load(0xfffb) as u16) << 8;
