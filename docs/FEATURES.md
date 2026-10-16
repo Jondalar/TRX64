@@ -72,7 +72,7 @@ One line per feature, as of 0.13.3. Details: [`README.md`](../README.md), monito
 - Checkpoint ring of full machine states, 60 s default (`cadence`, `window`); rewind transport (`play back|fwd`, `frame ±N`, `goto`, F9-F12).
 - Marks: named, pinned points that survive cutting the future (`mark`, `marks`, `goto <name>`).
 - Always-on reverse ring, 10 s default (`rstep`, `whowrote`, `chis`, `revdepth`); `ringdump`/`ringload` carry it with its marks as a `.c64rering`.
-- Checkpoint diffs (`diff`, `trx64cli diff`), sandbox runs (`sandbox/run`, `sandbox/runMany` — patches plus timed inputs, each run on a machine of its own, with the RAM it wrote next to its I/O; `trx64cli sandbox`), overlays (`runtime/overlay_run`), scenarios (`runtime/scenario_*`, `batch/*`).
+- Checkpoint diffs (`diff`, `trx64cli diff`), sandbox runs (`sandbox/run`, `sandbox/runMany` — patches plus timed inputs, each run on a machine of its own, with the RAM it wrote next to its I/O; `trx64cli sandbox`), overlays (`runtime/overlay_run` — RAM patches, or a byte in any bank of any banked cartridge, flash or ROM, without programming the flash; the next anchor restore takes the patch back), scenarios (`runtime/scenario_*`, `batch/*`).
 
 ## Debugging
 

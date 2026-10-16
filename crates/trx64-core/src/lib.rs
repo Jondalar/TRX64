@@ -25,6 +25,7 @@ use std::path::Path;
 pub mod c64_6510core;
 pub mod c64re_snapshot;
 pub mod cart;
+mod cart_overlay;
 pub mod checkpoint_diff;
 pub mod checkpoint_ring;
 pub mod c64cia;

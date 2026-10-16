@@ -162,6 +162,11 @@ impl SpiFlash {
     pub fn image(&self) -> &[u8] {
         &self.data
     }
+    /// Overlay one byte of the stored image: a what-if patch that is neither a program
+    /// nor an erase, so it leaves the command FSM and the dirty flag alone.
+    pub fn overlay_poke(&mut self, offset: usize, byte: u8) {
+        self.data[offset] = byte;
+    }
     pub fn flash_type(&self) -> SpiFlashType {
         self.flash_type
     }

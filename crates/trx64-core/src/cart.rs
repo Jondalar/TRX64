@@ -498,10 +498,11 @@ pub trait CartMapper: Send {
 
     /// Overlay one byte into a cart bank IMAGE for an EXPLICIT bank at a CPU-window
     /// address (`space` = "roml" $8000-$9FFF / "romh" $A000-$BFFF or $E000-$FFFF).
-    /// This is a WHAT-IF patch of the flash array, bypassing the flash command FSM —
-    /// NOT a program/erase sequence. Ephemeral: rolled back when the anchor is
-    /// restored (Spec 792 cart restore reloads the original flash). Default:
-    /// unsupported (read-only mappers / non-flash families).
+    /// This is a WHAT-IF patch of the stored bank image, bypassing any flash command
+    /// FSM and every dirty/persist flag — NOT a program/erase sequence. Ephemeral:
+    /// a checkpoint restore re-attaches the cartridge from its original bytes (then
+    /// lays the anchor's flash image over it), so the patch does not survive it.
+    /// Default: unsupported (a mapper that does not implement it).
     fn overlay_bank_write(&mut self, _space: &str, _bank: u16, _addr: u16, _byte: u8) -> Result<(), String> {
         Err("banked overlay write not implemented for this mapper".into())
     }
@@ -515,7 +516,7 @@ pub trait CartMapper: Send {
 
 /// Spec 795 — resolve a cart overlay `(space, addr)` to `(use_hi_flash, window_base)`.
 /// roml → the lo flash at $8000; romh → the hi flash at $A000 (16k) or $E000 (ultimax).
-fn cart_overlay_target(space: &str, addr: u16) -> Result<(bool, u16), String> {
+pub(crate) fn cart_overlay_target(space: &str, addr: u16) -> Result<(bool, u16), String> {
     match space {
         "roml" => {
             if (0x8000..=0x9fff).contains(&addr) {
@@ -856,6 +857,15 @@ impl Base {
         }
     }
 
+    /// The windows this family serves (for the banked overlay).
+    fn served(&self) -> crate::cart_overlay::Served {
+        crate::cart_overlay::Served {
+            roml: self.roml_visible,
+            romh_a000: self.romh_a000_visible,
+            romh_e000: self.romh_e000_visible,
+        }
+    }
+
     /// ts:356-371 — read: pure array index over the current bank's windows, gated
     /// by the visibility predicates.
     fn read(&self, address: u16) -> Option<u8> {
@@ -900,6 +910,14 @@ impl NormalMapper {
 }
 
 impl CartMapper for NormalMapper {
+    fn overlay_bank_write(&mut self, space: &str, bank: u16, addr: u16, byte: u8) -> Result<(), String> {
+        let served = self.base.served();
+        crate::cart_overlay::banked_write(&mut self.base.banks, served, space, bank, addr, byte)
+    }
+    fn overlay_bank_read(&self, space: &str, bank: u16, addr: u16) -> Result<u8, String> {
+        let served = self.base.served();
+        crate::cart_overlay::banked_read(&self.base.banks, served, space, bank, addr)
+    }
     fn mapper_type(&self) -> MapperType {
         self.base.mapper_type
     }
@@ -970,6 +988,14 @@ impl MagicDeskMapper {
 }
 
 impl CartMapper for MagicDeskMapper {
+    fn overlay_bank_write(&mut self, space: &str, bank: u16, addr: u16, byte: u8) -> Result<(), String> {
+        let served = self.base.served();
+        crate::cart_overlay::banked_write(&mut self.base.banks, served, space, bank, addr, byte)
+    }
+    fn overlay_bank_read(&self, space: &str, bank: u16, addr: u16) -> Result<u8, String> {
+        let served = self.base.served();
+        crate::cart_overlay::banked_read(&self.base.banks, served, space, bank, addr)
+    }
     fn mapper_type(&self) -> MapperType {
         self.base.mapper_type
     }
@@ -1041,6 +1067,14 @@ impl MagicDesk16Mapper {
 }
 
 impl CartMapper for MagicDesk16Mapper {
+    fn overlay_bank_write(&mut self, space: &str, bank: u16, addr: u16, byte: u8) -> Result<(), String> {
+        let served = self.base.served();
+        crate::cart_overlay::banked_write(&mut self.base.banks, served, space, bank, addr, byte)
+    }
+    fn overlay_bank_read(&self, space: &str, bank: u16, addr: u16) -> Result<u8, String> {
+        let served = self.base.served();
+        crate::cart_overlay::banked_read(&self.base.banks, served, space, bank, addr)
+    }
     fn mapper_type(&self) -> MapperType {
         self.base.mapper_type
     }
@@ -1111,6 +1145,19 @@ impl OceanMapper {
         }
     }
 
+    /// The windows the Ocean read path serves: ROML always, the $A000 mirror only in
+    /// the 16K config (the overlay maps that mirror onto the ROML image).
+    fn overlay_served(&self) -> crate::cart_overlay::Served {
+        crate::cart_overlay::Served { roml: true, romh_a000: false, romh_e000: false }
+    }
+    fn overlay_alias<'a>(&self, space: &'a str, addr: u16) -> (&'a str, u16) {
+        if space == "romh" && !self.is_8k && (0xa000..=0xbfff).contains(&addr) {
+            ("roml", addr - 0x2000)
+        } else {
+            (space, addr)
+        }
+    }
+
     /// ts:502-509 — own read: ROML at $8000-$9FFF; the 16K mirror reads the SAME
     /// 8K ROML bank at $A000-$BFFF (ocean.c romh_read). Ignores the Base
     /// visibility predicates (verbatim — the TS OceanMapper overrides read()).
@@ -1128,6 +1175,18 @@ impl OceanMapper {
 }
 
 impl CartMapper for OceanMapper {
+    /// The stored image is the ROML bank; in the 16 KB config `romh $A000-$BFFF` is
+    /// that same bank mirrored, so it addresses the ROML image. The 8 KB (512 KB)
+    /// config has no ROMH.
+    fn overlay_bank_write(&mut self, space: &str, bank: u16, addr: u16, byte: u8) -> Result<(), String> {
+        let (space, addr) = self.overlay_alias(space, addr);
+        let served = self.overlay_served();
+        crate::cart_overlay::banked_write(&mut self.base.banks, served, space, bank, addr, byte)
+    }
+    fn overlay_bank_read(&self, space: &str, bank: u16, addr: u16) -> Result<u8, String> {
+        let (space, addr) = self.overlay_alias(space, addr);
+        crate::cart_overlay::banked_read(&self.base.banks, self.overlay_served(), space, bank, addr)
+    }
     fn mapper_type(&self) -> MapperType {
         self.base.mapper_type
     }
@@ -1600,6 +1659,15 @@ impl Gmod2Mapper {
 }
 
 impl CartMapper for Gmod2Mapper {
+    fn overlay_bank_write(&mut self, space: &str, bank: u16, addr: u16, byte: u8) -> Result<(), String> {
+        let off = crate::cart_overlay::flat_offset(self.flash.data.len(), false, space, bank, addr)?;
+        self.flash.data[off] = byte;
+        Ok(())
+    }
+    fn overlay_bank_read(&self, space: &str, bank: u16, addr: u16) -> Result<u8, String> {
+        let off = crate::cart_overlay::flat_offset(self.flash.data.len(), false, space, bank, addr)?;
+        Ok(self.flash.data[off])
+    }
     fn mapper_type(&self) -> MapperType {
         MapperType::Gmod2
     }
@@ -1774,6 +1842,15 @@ impl MegabyterMapper {
 }
 
 impl CartMapper for MegabyterMapper {
+    fn overlay_bank_write(&mut self, space: &str, bank: u16, addr: u16, byte: u8) -> Result<(), String> {
+        let off = crate::cart_overlay::flat_offset(self.flash.data.len(), false, space, bank, addr)?;
+        self.flash.data[off] = byte;
+        Ok(())
+    }
+    fn overlay_bank_read(&self, space: &str, bank: u16, addr: u16) -> Result<u8, String> {
+        let off = crate::cart_overlay::flat_offset(self.flash.data.len(), false, space, bank, addr)?;
+        Ok(self.flash.data[off])
+    }
     fn mapper_type(&self) -> MapperType {
         MapperType::MegaByter
     }
@@ -1925,6 +2002,15 @@ impl C64MegaCartMapper {
 }
 
 impl CartMapper for C64MegaCartMapper {
+    fn overlay_bank_write(&mut self, space: &str, bank: u16, addr: u16, byte: u8) -> Result<(), String> {
+        let off = crate::cart_overlay::flat_offset(self.flash.data.len(), true, space, bank, addr)?;
+        self.flash.data[off] = byte;
+        Ok(())
+    }
+    fn overlay_bank_read(&self, space: &str, bank: u16, addr: u16) -> Result<u8, String> {
+        let off = crate::cart_overlay::flat_offset(self.flash.data.len(), true, space, bank, addr)?;
+        Ok(self.flash.data[off])
+    }
     /// One flash serves both windows here, so the VIC sees what a $E000 read would.
     fn vic_romh(&self) -> Option<&[u8]> {
         let off = self.flash_offset(0xe000) as usize;
@@ -2176,6 +2262,20 @@ impl Gmod4Mapper {
         (!bank_info.cpu_port_direction | bank_info.cpu_port_value) & 0x07
     }
 
+    /// Index into the 8 MiB image for an overlay `(space, bank, addr)`.
+    fn overlay_offset(&self, space: &str, bank: u16, addr: u16) -> Result<usize, String> {
+        let (_, base) = cart_overlay_target(space, addr)?;
+        let half = if base == 0x8000 { 0 } else { 0x2000 };
+        let off = ((bank as usize) << 14) + half + (addr & 0x1fff) as usize;
+        let len = self.flash.image().len();
+        if off >= len {
+            return Err(format!(
+                "overlay bank {bank} {space} ${addr:04X} → offset ${off:X} exceeds the image (${len:X})"
+            ));
+        }
+        Ok(off)
+    }
+
     fn bank_8000(&self) -> u32 {
         if self.context == 0 { self.rom8000_bank_a as u32 } else { self.rom8000_bank_b as u32 }
     }
@@ -2288,6 +2388,18 @@ impl Gmod4Mapper {
 }
 
 impl CartMapper for Gmod4Mapper {
+    /// `bank` is the 16 KiB bank number (0..511; 256 and up is the A22 half). `roml`
+    /// is the even 8 KiB half, `romh` the odd half — at `$A000` for the bank's own
+    /// window, at `$E000` the half the cart pins to bank 0 (live only while bank 0).
+    fn overlay_bank_write(&mut self, space: &str, bank: u16, addr: u16, byte: u8) -> Result<(), String> {
+        let off = self.overlay_offset(space, bank, addr)?;
+        self.flash.overlay_poke(off, byte);
+        Ok(())
+    }
+    fn overlay_bank_read(&self, space: &str, bank: u16, addr: u16) -> Result<u8, String> {
+        let off = self.overlay_offset(space, bank, addr)?;
+        Ok(self.flash.image()[off])
+    }
     fn mapper_type(&self) -> MapperType {
         MapperType::Gmod4
     }
@@ -2951,6 +3063,20 @@ impl SelfConfigCartMapper {
 }
 
 impl CartMapper for SelfConfigCartMapper {
+    /// Delegates to the locked family. Until a register write locks one, the image is
+    /// not yet interpreted as banks, so there is nothing to address.
+    fn overlay_bank_write(&mut self, space: &str, bank: u16, addr: u16, byte: u8) -> Result<(), String> {
+        match self.resolved.as_mut() {
+            Some(m) => m.overlay_bank_write(space, bank, addr, byte),
+            None => Err(SELFCONFIG_OVERLAY_UNLOCKED.into()),
+        }
+    }
+    fn overlay_bank_read(&self, space: &str, bank: u16, addr: u16) -> Result<u8, String> {
+        match self.resolved.as_ref() {
+            Some(m) => m.overlay_bank_read(space, bank, addr),
+            None => Err(SELFCONFIG_OVERLAY_UNLOCKED.into()),
+        }
+    }
     fn mapper_type(&self) -> MapperType {
         self.resolved_type.unwrap_or(MapperType::SelfConfig)
     }
@@ -3141,6 +3267,9 @@ impl CartMapper for SelfConfigCartMapper {
     }
 }
 
+const SELFCONFIG_OVERLAY_UNLOCKED: &str =
+    "banked overlay refused: the self-configuring cartridge has not locked a mapper family yet";
+
 /// Spec 790 S2 — build the self-configuring harness for a raw `.bin` whose type S1
 /// could not settle. Returns a `SelfConfig`-typed image record (raw bytes + name,
 /// 8K-game boot lines) alongside the harness. The concrete type is resolved at
@@ -3207,10 +3336,12 @@ mod overlay795_tests {
     }
 
     #[test]
-    fn readonly_mapper_overlay_errors_by_default() {
+    fn normal_mapper_overlay_is_a_banked_image_patch() {
         let img = image(MapperType::Normal8k, &[(0, 0x00)]);
         let mut nm = NormalMapper::new(&img);
-        assert!(nm.overlay_bank_write("roml", 0, 0x8000, 1).is_err());
+        nm.overlay_bank_write("roml", 0, 0x8000, 1).unwrap();
+        assert_eq!(nm.overlay_bank_read("roml", 0, 0x8000).unwrap(), 1);
+        assert!(nm.overlay_bank_write("roml", 1, 0x8000, 1).is_err());
     }
 
     fn dummy_bank_info() -> BankInfo {
