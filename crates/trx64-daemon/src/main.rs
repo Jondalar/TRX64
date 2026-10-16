@@ -23842,9 +23842,11 @@ mod batch1_tests {
     fn recorder_dump_errors_on_unknown_seq_and_missing_params() {
         let st = make_state();
         call(&st, "recorder/start", json!({}));
-        // Unknown seq (evicted / never existed) → -32001.
+        // Unknown seq (evicted / never existed) → -32001. The path is absolute on this platform
+        // (`/tmp/...` is not on Windows: it would be refused as relative first, with -32602).
+        let dump_to = std::env::temp_dir().join("x.c64re");
         assert_eq!(
-            call_err(&st, "recorder/dump", json!({ "seq": 9999, "path": "/tmp/x.c64re" })).code,
+            call_err(&st, "recorder/dump", json!({ "seq": 9999, "path": dump_to.to_str().unwrap() })).code,
             -32001
         );
         // Missing params → -32602.
@@ -25895,7 +25897,9 @@ mod batch1_tests {
 
     #[test]
     fn host_write_target_keeps_absolute_and_never_passes_a_raw_relative_path() {
-        assert_eq!(host_write_target("/tmp/x.crt").unwrap(), "/tmp/x.crt");
+        // An absolute path of this platform: `/tmp/x.crt` has no drive on Windows, so it is not absolute there.
+        let abs = std::env::temp_dir().join("x.crt").to_string_lossy().to_string();
+        assert_eq!(host_write_target(&abs).unwrap(), abs);
         assert!(host_write_target("").is_err());
         match project_knowledge::bound_project() {
             // No project bound: a relative path is refused, not written into the cwd.
