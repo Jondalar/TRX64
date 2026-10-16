@@ -10202,7 +10202,22 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             // BUG-041 — ask the FILE, not the filename. `ends_with(".crt")` is a question
             // about a name: a renamed cart, a `.bin` that is really a CRT, or a `.d64`
             // written by a tool that chose another suffix all answered wrong.
-            let kind = match detect_media_kind(&bytes, &path_str) {
+            // `cart_type` names the cartridge: a raw `.bin` has no type in-band, and a `.crt`
+            // can be read as another type than its header says. A VICE id or a mnemonic.
+            let cart_type = match req.params.get("cart_type").and_then(|v| v.as_str()) {
+                None => None,
+                Some(s) => match trx64_core::cart::resolve_cart_type(s) {
+                    Ok(t) => Some(t),
+                    Err(e) => return Response::err(id, -32602, format!("media/mount: {e}")),
+                },
+            };
+            let named_bin = cart_type.is_some() && !trx64_core::cart::is_crt(&bytes);
+            let kind = if named_bin {
+                Ok(MediaKind::Cartridge)
+            } else {
+                detect_media_kind(&bytes, &path_str)
+            };
+            let kind = match kind {
                 Ok(k) => k,
                 Err(e) => return Response::err(id, -32602, format!("media/mount: {e}")),
             };
@@ -10229,7 +10244,8 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 // Spec 786 — CRT insert = power_off → register cart → power_on.
                 // Validate the CRT up front so a bad file leaves the running
                 // machine untouched.
-                let mapper_type = match trx64_core::cart::load_cartridge_from_bytes(&bytes, &crt_name, None) {
+                let ty = cart_type.unwrap_or(trx64_core::cart::CartType::Auto);
+                let mapper_type = match trx64_core::cart::load_cartridge_typed(&bytes, &crt_name, ty) {
                     Ok((image, _mapper)) => image.mapper_type,
                     Err(e) => return Response::err(id, -32602, format!("media/mount: bad CRT: {e}")),
                 };
@@ -10241,7 +10257,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 // timeline and are dropped by the power-off, so none are captured/
                 // pinned for a cart. The disk (if any) is preserved via the registry.
                 do_power_off(&mut st);
-                if let Err(e) = st.session.set_inserted_cart(&bytes, &crt_name, &path_str) {
+                if let Err(e) = st.session.set_inserted_cart_typed(&bytes, &crt_name, &path_str, ty) {
                     do_power_on(&mut st); // recover cartless
                     return Response::err(id, -32602, format!("media/mount: bad CRT: {e}"));
                 }

@@ -2958,6 +2958,23 @@ pub fn load_cartridge_from_bin(
     Ok((image, mapper))
 }
 
+/// Parse a cartridge image of either container with the type the caller named: a `.crt`
+/// (the named type overrides the header's) or a raw `.bin` (the type is the only thing that
+/// says what it is). `Auto` on a raw `.bin` is [`CrtError::BinTypeAmbiguous`] — the caller
+/// has no structural detect to fall back on here.
+pub fn load_cartridge_typed(
+    data: &[u8],
+    name: &str,
+    ty: CartType,
+) -> Result<(ParsedCartridgeImage, Box<dyn CartMapper>), CrtError> {
+    match (is_crt(data), ty) {
+        (true, CartType::Forced(t)) => load_cartridge_from_bytes(data, name, Some(t)),
+        (true, CartType::Auto) => load_cartridge_from_bytes(data, name, None),
+        (false, CartType::Forced(t)) => load_cartridge_from_bin(data, name, t),
+        (false, CartType::Auto) => Err(CrtError::BinTypeAmbiguous),
+    }
+}
+
 /// §790.2 — resolve a `--cart-type` / `cart_type` string (a VICE numeric id OR a
 /// mnemonic, case-insensitive) into a `CartType`. `crt`/`auto`/`0` (the
 /// `CARTRIDGE_CRT` sentinel) → `CartType::Auto`; every concrete name/id →

@@ -1002,11 +1002,11 @@ impl<'a> FullBus<'a> {
         ((!self.port_dir | self.port_data) & 0x02) != 0
     }
 
-    /// ts:105 — openBusProvider default `() => 0xff`. The VIC float-bus value the
-    /// ultimax open windows read. (No phi1 source wired in this read-only tier.)
+    /// The floating bus the ultimax open windows read: the VIC's last phi1 fetch
+    /// (`ultimax_1000_7fff_read` and its siblings return `vicii_read_phi1()`).
     #[inline]
     fn open_bus(&self) -> u8 {
-        0xff
+        self.vic.last_read_phi1
     }
 
     /// Consult the attached cartridge mapper's read window (ts:

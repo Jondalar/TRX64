@@ -1,6 +1,6 @@
 # Spec 913 — An Action Replay V5 or V6 boots, freezes a running program and returns to it
 
-**Status:** PARTLY BUILT (2026-10-16): the cartridge, the freeze machinery, the state and the synthetic tests are built; the corpus tests (S2, S4, S5 on the real images) are not yet.
+**Status:** DONE (2026-10-16) — built on branch `spec-913-action-replay`; every scenario S1-S7 runs green. Decision in `README.md` here.
 **Repo:** TRX64 (a cartridge capability). C64RE gains nothing beyond what it already reads (the cart's type name in session state and the trace header).
 **Number:** 913 (registry: C64RE `specs/README.md`).
 **Origin:** owner, 2026-10-16, after an analysis of VICE's freezer cartridges: "Es wäre schon hilfreich Action Replay zu können .. lass uns das als single Spec einbauen und dann nur das erstmal". Retro Replay and Final Cartridge III are out (§4).
@@ -138,4 +138,14 @@ the checkpoint (RAM as bytes, not `Vec<i64>`); the read-set lane excludes cartri
 
 ## §5 Decisions taken while building
 
-—
+- **VICE's sequence is ported as it is, including its mid-instruction switch.** The cartridge goes to ultimax three cycles after it pulls NMI, and the CPU takes the NMI only at an instruction boundary, so an instruction that is in flight on that cycle runs its remaining bus cycles in the new map. `JSR CHRGET` in a BASIC loop (operands in BASIC ROM, which is open bus under ultimax) is the case that shows: measured on V5 PAL over 62 press cycles one BASIC loop passes, 2 broke the BASIC program (a `?SYNTAX ERROR` or a stalled counter), both with the press landing on that `JSR`. The real board does not do this (it switches on the NMI vector fetch); VICE does, and Q2 asked for VICE. A later press is a later press, so the same cycle is the same result. Not changed here; the alternative (switch at the vector fetch) is a decision for the owner.
+- **The ultimax open windows read the VIC's phi1 byte** (`ultimax_1000_7fff_read` and the siblings return `vicii_read_phi1()`), not `$FF`. This is not Action-Replay-specific and applies to every ultimax cartridge.
+- **The cartridge RAM is not flash.** It rides `CartState.freezer` and the checkpoint's `freezerState` (a byte node), is re-patterned on a power cycle of the C64 (the cartridge object survives one, its RAM does not) and is kept across a reset. Power-up pattern: VICE's `ramparam` (start `$FF`, inverted every two bytes from offset 1, the pattern inverted every `$100`).
+- **The freeze alarms live in the cartridge**, not in the machine: a pending press and a pending freeze are part of the mapper's state, so a clone, a checkpoint or a `.c64re` carries them with no machine-side field. The machine only dispatches them (`run_alarms`) from the same per-cycle alarm point as the CIAs, and only when the cartridge says it is a freezer.
+- **`cart/button` takes an optional `cycle`** (monitor: `cart button freeze [cycle]`): the press happens on that machine cycle, held until the clock gets there, in a run or between runs; a cycle in the past is refused. Without it, the press is on the cycle the machine stands at.
+- **`media/mount` takes `cart_type`** so a raw `.bin` can be mounted in the daemon (it had no door: a 32 KiB file read as a PRG). A `.c64re` of a `.bin`-mounted Action Replay restores as one (the dump names the type through its freezer part).
+- **`.bin` must be exactly 32 KiB**; a `.crt` must hold four 8 KiB chips at `$8000` (VICE refuses anything else).
+- **The freeze's RAM store.** In 8K and 16K game a store to ROML lands in the cartridge RAM (if on) and in C64 RAM (`roml_no_ultimax_store` / `raml_no_ultimax_store`); under ultimax only the cartridge RAM takes it.
+- **Menu key.** Every V5/V6 image's freezer menu says `F1 - BACKUP  F3 - RESTART  F7 - SCREEN`; F3 returns to the program, and leaves the cartridge killed (register `$06`, mode off) as the original does.
+- **Not done:** the VICE `.vsf` export carries no `CARTAR` module (the VSF cartridge part is EasyFlash-only); an Action Replay in a `.vsf` is left out. Out of scope per §4.
+

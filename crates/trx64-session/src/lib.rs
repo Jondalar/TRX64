@@ -375,7 +375,19 @@ impl Session {
         name: &str,
         path: &str,
     ) -> Result<trx64_core::cart::MapperType, trx64_core::cart::CrtError> {
-        let (image, mapper) = trx64_core::cart::load_cartridge_from_bytes(bytes, name, None)?;
+        self.set_inserted_cart_typed(bytes, name, path, trx64_core::cart::CartType::Auto)
+    }
+
+    /// [`set_inserted_cart`](Self::set_inserted_cart) with the cartridge type named: a raw
+    /// `.bin` carries none in-band, and a `.crt` can be read as another type than its header says.
+    pub fn set_inserted_cart_typed(
+        &mut self,
+        bytes: &[u8],
+        name: &str,
+        path: &str,
+        ty: trx64_core::cart::CartType,
+    ) -> Result<trx64_core::cart::MapperType, trx64_core::cart::CrtError> {
+        let (image, mapper) = trx64_core::cart::load_cartridge_typed(bytes, name, ty)?;
         let mt = image.mapper_type;
         self.inserted_cart = Some(InsertedCart { image, mapper, path: path.to_string() });
         Ok(mt)

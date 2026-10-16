@@ -567,3 +567,18 @@ next to the drive clock; 0x35 still decodes.
 **Decision:** the C64 clock goes into the record rather than an offset, because the drive and
 the C64 run at different rates and a drive reset restarts the drive clock. A custom loader that
 reads one block after a standard header is now credited to that block's sector.
+
+---
+
+## Action Replay V5/V6 — 913
+
+CRT type 1 (and a 32 KiB `.bin`) is a port of VICE's `actionreplay.c`, with the freeze as
+shared machinery: a cartridge can hold NMI, has a button that takes effect on the cycle of
+the press (VICE's random delay of up to a frame is dropped, so a press is a reproducible
+point), and switches itself three cycles after the NMI. The cartridge's state, RAM
+included, rides the checkpoint and the `.c64re` dump.
+
+**Decision:** VICE's sequence is kept even where it is rough — the switch to ultimax lands
+mid-instruction, and a press that catches a ROM-reading instruction in flight breaks it
+(about 3 % of presses on a BASIC loop). The board switches on the NMI vector fetch; changing
+to that is the owner's call, not a side effect of a port.
