@@ -3,31 +3,28 @@
 **Status:** PARTLY BUILT — §5.1 (SPI flash) and §5.2 (GMod4 mapper) shipped 2026-08-09;
 AGR (§6) and the vendor-question follow-ups (§5.4) remain open.
 
-**GMod3 sample availability (2026-08-11): there is none.** Not in the user's hands, not in any archive we have looked at. That puts GMod3 in the same position as AGR — writing the first implementation AND the first test, with hardware as the only oracle. Worth weighing before starting: the SPI core it needs is already built and paid for by GMod4.
+**GMod3 is out (owner, 2026-10-16).** It never got past a prototype; there is no cartridge to
+emulate and none will be built. CRT type 62 is an unknown type like any other.
 
 By contrast MegaByter and C64MegaCart now HAVE real samples (1 MB raw `.bin`, the same title in both mappers), which answered the register question by diff: `$de00` carries the bank in both; the second register is `$de02` for MegaByter and `$df00` for C64MegaCart. See C64RE spec 785 §3.1.
 **Repo:** TRX64 (cartridge emulation). C64RE is unaffected — new mappers need no meaning-layer
 change.
 **Number:** 803 (shared board `C64ReverseEngineeringMCP/specs/README.md`).
 **Framing:** not "add GMod4" but **the large-cartridge tier as a whole** — because the carts that
-matter now (GMod3, GMod4, MegaByter, C64MegaCart) share one missing primitive, one design
+matter now (GMod4, MegaByter, C64MegaCart) share one missing primitive, one design
 question in our trait, and one shift in where truth comes from.
 
 ---
 
 ## 1. The landscape
 
-| | GMod2 | MegaByter | C64MegaCart | GMod3 | GMod4 | AGR |
-|---|---|---|---|---|---|---|
-| **VICE** (+ the upstream patch) | ✅ | ✅ | 2 MB fork | ✅ | patch, unmerged | ❌ bit stored, unused |
-| **Ultimate-64** | ✅ (2018) | ✅ (`large-cart`, 2026-07) | ❌ | ❌ `CART_NOT_IMPL` | ❌ absent | ❌ |
-| **TRX64** (us) | ✅ | ✅ | ✅ 2 MB | ⏳ unblocked | ✅ **built** | ❌ deliberate |
+| | GMod2 | MegaByter | C64MegaCart | GMod4 | AGR |
+|---|---|---|---|---|---|
+| **VICE** (+ the upstream patch) | ✅ | ✅ | 2 MB fork | patch, unmerged | ❌ bit stored, unused |
+| **Ultimate-64** | ✅ (2018) | ✅ (`large-cart`, 2026-07) | ❌ | ❌ absent | ❌ |
+| **TRX64** (us) | ✅ | ✅ | ✅ 2 MB | ✅ **built** | ❌ deliberate |
 
-Two things fall out of this table:
-
-**We are not behind — we are level.** On GMod3, the Ultimate-64's `c64_crt.cc` literally carries
-`{ 62, 0xFF, CART_NOT_IMPL, "GMod3" }`, the same standstill as our `62 => Unsupported`, for the
-same reason: **SPI flash**. Nobody's second implementation exists to copy from.
+One thing falls out of this table:
 
 **For GMod4 there is exactly one implementation in the world** (an unmerged VICE patch), and
 **for AGR there is none at all.**
@@ -38,8 +35,8 @@ Our cartridge tier models *parallel* flash (`Flash040`: `$AAA/$555` unlock seque
 polling, erase alarms). The whole blocked set needs *serial* flash instead — command, address and
 data clocked bit-by-bit over CS/CLK/DI/DO lines exposed in a control register.
 
-**One SPI-flash device model unblocks both GMod3 and GMod4.** That is not a guess: the patch
-adds `src/core/spi-flash.c` as a **generic core** and moves `gmod3.c` onto it in the same diff.
+**One SPI-flash device model unblocks GMod4.** The patch adds `src/core/spi-flash.c` as a
+**generic core**, not as part of a mapper.
 
 We are not starting from nothing — GMod2's **M93C86 EEPROM** is already a serial device here,
 driven by CS/CLK/data bits with the read returning a data bit in bit 7. The *shape* is modelled;
@@ -57,8 +54,7 @@ IRQ/NMI vectors); a disabled area pulls nothing. That is not expressible as one 
 
 This is a **trait-shape** decision, not a mapper detail, and it should be settled before anyone
 writes a GMod4 mapper. VICE's `c64cartmem.c` is in the patch, so the upstream answer is probably
-there. Note we already have a hint of this problem: `cart.rs:99` mentions a read-path-dependent
-memconfig for GMod3.
+there.
 
 ## 4. Where truth comes from now
 
@@ -94,7 +90,7 @@ erase raises them), and the output phase — the device shifts DO on the RISING 
 the vendor's `spi_read_byte` samples after the FALLING one, so the host reads the bit
 placed by the PREVIOUS edge and the first data bit of a read appears during the last clock
 of the *address* phase. Our first test made exactly that mistake; the vendor's assembler
-settled it, not our reasoning. GMod3 needs no further primitive work.
+settled it, not our reasoning.
 
 Original scope:
 
@@ -102,7 +98,6 @@ Port an **SPI-flash device model** (reference: `src/core/spi-flash.c` in the pat
 added). Must answer JEDEC/ID commands, support read (`$03`), page program (`$02`), write-enable
 (`$06`), block erase (`$D8`), status (`$05`), and the reset pair (`$66`/`$99`).
 
-Retires our `62 => Unsupported` (GMod3) as a side effect.
 
 ### 5.2 GMod4 — **BUILT (except AGR)**
 
@@ -110,7 +105,7 @@ Retires our `62 => Unsupported` (GMod3) as a side effect.
 `$9F` JEDEC identify driven through the cartridge registers into the flash). The one
 change outside the mapper: `CartMapper::fake_ultimax()` (default false) plus the two bus
 fallbacks it gates — our bus showed open bus at `$C000`/`$E000` for a declined window,
-correct for a real ultimax cart and wrong for this one. GMod3 will need the same.
+correct for a real ultimax cart and wrong for this one.
 
 **Addendum, 2026-09-21 — the other half of ultimax was missing, and only the VIC could see
 it.** `fake_ultimax()` fixed what the CPU reads through a declined window. Nothing fixed

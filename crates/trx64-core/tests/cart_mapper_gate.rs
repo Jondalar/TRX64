@@ -245,14 +245,6 @@ fn ultimax_maps_romh_e000_not_a000() {
     assert_eq!(m.read(0xfffd, &bi(), 0), Some(0xf0));
 }
 
-#[test]
-fn unsupported_serial_families_error() {
-    // hw=62 (GMOD3, SPI flash) still yields no mapper in this tier.
-    let crt = build_crt(62, 1, 0, "G3", &[(0, 0x8000, vec![0u8; 0x2000])]);
-    let img = parse_crt(&crt, "x", None).unwrap();
-    assert_eq!(img.mapper_type, MapperType::Unsupported);
-    assert!(load_cartridge_from_bytes(&crt, "G3", None).is_err());
-}
 
 #[test]
 fn easyflash_gmod2_megabyter_build_writable_mappers() {

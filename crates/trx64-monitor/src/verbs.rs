@@ -676,7 +676,6 @@ pub fn mapper_type_str(t: trx64_core::cart::MapperType) -> &'static str {
         // Spec 790 S2 — the self-configuring harness before it locks a concrete
         // family (post-lock it delegates `mapper_type()` and never returns this).
         SelfConfig => "self_config",
-        Unsupported => "cartridge",
     }
 }
 

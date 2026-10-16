@@ -1,16 +1,14 @@
-//! spi_flash.rs — serial (SPI) flash device, as used by the GMod3 / GMod4 cartridges.
+//! spi_flash.rs — serial (SPI) flash device, as used by the GMod4 cartridge.
 //!
 //! Port of VICE's `src/core/spi-flash.c` (trunk) **plus** the extensions in the GMod4
 //! patch: the `flash_types[]` identity table, the `$90` READ_ID command, and the ESMT
-//! quirk of repeating the ID bytes. Reference wikis: <http://wiki.icomp.de/wiki/GMod3>,
-//! <http://wiki.icomp.de/wiki/GMod4>.
+//! quirk of repeating the ID bytes. Reference: <http://wiki.icomp.de/wiki/GMod4>.
 //!
 //! WHY THIS EXISTS: our other cartridges use `Flash040`, which models a *parallel* flash
 //! (`$AAA/$555` unlock sequences, DQ status polling, erase alarms). An SPI flash is a
 //! different device class entirely — the host bit-bangs CS / CLK / DI and reads DO, one
 //! bit per clock edge, and command + address + data all arrive through that one wire.
-//! GMod3 and GMod4 both need it, which is why this is its own module rather than part of
-//! either mapper.
+//! It is its own module, not part of the GMod4 mapper, because it is a device of its own.
 //!
 //! DIFFERENCE FROM THE C: VICE keeps this state in file-level statics, so one process has
 //! exactly one SPI flash. Here it is a plain struct owned by the mapper — same behaviour,
@@ -24,13 +22,13 @@
 /// for readability here; unlike the C we key off the enum, not an index.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SpiFlashType {
-    /// EN25QH16A (ESMT) — GMod3, 2 MiB.
+    /// EN25QH16A (ESMT), 2 MiB.
     En25qh16a,
-    /// EN25QH32A (ESMT) — GMod3, 4 MiB.
+    /// EN25QH32A (ESMT), 4 MiB.
     En25qh32a,
-    /// EN25QH64A (ESMT) — GMod3 + GMod4, 8 MiB.
+    /// EN25QH64A (ESMT) — GMod4, 8 MiB.
     En25qh64a,
-    /// EN25QH128A (ESMT) — GMod3 + GMod4, 16 MiB.
+    /// EN25QH128A (ESMT) — GMod4, 16 MiB.
     En25qh128a,
     /// W25Q64CV (Winbond) — GMod4, 8 MiB.
     W25q64cv,

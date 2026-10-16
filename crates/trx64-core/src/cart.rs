@@ -78,9 +78,6 @@ pub enum MapperType {
     /// real cartridge hardware family — it carries no `.bin` geometry and is never
     /// built by `mapper_from_image` (the harness is constructed directly).
     SelfConfig,
-    /// A CRT hardware-type that maps to a serial/SPI family not yet built
-    /// (GMOD3 SPI-flash). Parsed but produces no mapper.
-    Unsupported,
 }
 
 /// ts:14-18 — CrtBank. Per-bank ROM windows; any may be absent.
@@ -116,10 +113,10 @@ pub struct ParsedCartridgeImage {
 }
 
 /// ts:11-22 (types.ts) — HeadlessBankInfo. The banking-context struct passed into
-/// every read/write/peek. Only `cpu_port_direction`/`cpu_port_value` are consumed
-/// by a read path (GMOD3 fake-ultimax memconfig); the read-only mappers ignore
-/// `bank_info` for read decisions (PLA-gated before the mapper is called) — the
-/// visibility predicates are constant. Carried for 1:1 fidelity.
+/// every read/write/peek. GMod4 reads `cpu_port_direction`/`cpu_port_value` (its
+/// fake-ultimax memconfig); Action Replay and C64MegaCart read `phi1`, Action Replay
+/// `ram_under`. The read-only mappers ignore `bank_info` for read decisions (PLA-gated
+/// before the mapper is called).
 #[derive(Clone, Copy)]
 pub struct BankInfo {
     pub cpu_port_direction: u8,
@@ -230,7 +227,7 @@ pub struct FlashCartState {
     pub flash_lo: Option<crate::flash040::Flash040SnapState>,
     pub flash_hi: Option<crate::flash040::Flash040SnapState>,
     pub eeprom: Option<crate::m93c86::M93c86SnapState>,
-    /// GMod4 (and later GMod3): the serial-flash command FSM. The image itself rides
+    /// GMod4: the serial-flash command FSM. The image itself rides
     /// in the separate writable image, as with the parallel-flash families.
     pub spi: Option<crate::spi_flash::SpiFlashSnapState>,
     pub easyflash_jumper: u8,
@@ -511,8 +508,8 @@ pub trait CartMapper: Send {
     /// the media-ingress dirty guard / checkpoint chokepoint). Read-only mappers
     /// and families without a writable port return `false` (default) and stay
     /// reject-on-dirty. (= the TS `persistsWritableState?(): boolean`,
-    /// cartridge.ts:67; the writable families EasyFlash/Megabyter/Gmod2/Gmod3/
-    /// C64MegaCart all return true.)
+    /// cartridge.ts:67; the writable families EasyFlash/Megabyter/Gmod2/
+    /// C64MegaCart and EasyFlash 3 return true.)
     fn persists_writable_state(&self) -> bool {
         false
     }
@@ -765,9 +762,7 @@ fn infer_mapper_type(
         // the id TRX64, TRX_CRT_cli, C64RE and TRX64-Ultimate share (2026-10-03). The
         // martinpiper fork's 61 is MAX Basic in mainline and is not read as this.
         88 => Some(MapperType::C64MegaCart),
-        // serial/SPI families not yet built (GMOD3 SPI-flash).
-        62 => Some(MapperType::Unsupported), // gmod3
-        _ => None,                           // ts:260-261
+        _ => None, // ts:260-261
     }
 }
 
@@ -2286,8 +2281,7 @@ impl CartMapper for C64MegaCartMapper {
 
 /// ts:120-154 — mapperFromImage: build the concrete mapper for a parsed image.
 /// The read-only families build their banked mapper; the writable flash families
-/// (EasyFlash, GMOD2, MegaByter, C64MegaCart) build their flash + EEPROM mapper;
-/// the remaining serial/SPI families (GMOD3) yield `Err`.
+/// (EasyFlash, GMOD2, MegaByter, C64MegaCart) build their flash + EEPROM mapper.
 pub fn mapper_from_image(
     image: &ParsedCartridgeImage,
 ) -> Result<Box<dyn CartMapper>, CrtError> {
@@ -2310,7 +2304,6 @@ pub fn mapper_from_image(
         // / load_self_config_from_bin), never from a parsed image, and locks a
         // concrete family at runtime — so it has no image-driven build here.
         MapperType::SelfConfig => Err(CrtError::Unsupported(MapperType::SelfConfig)),
-        MapperType::Unsupported => Err(CrtError::Unsupported(MapperType::Unsupported)),
     }
 }
 
@@ -2832,7 +2825,6 @@ fn bin_geometry(mapper_type: MapperType) -> Result<BinGeometry, CrtError> {
         // The harness has no static geometry — it re-derives the concrete type's
         // geometry via `bin_geometry(concrete)` at lock time.
         MapperType::SelfConfig => return Err(CrtError::Unsupported(MapperType::SelfConfig)),
-        MapperType::Unsupported => return Err(CrtError::Unsupported(MapperType::Unsupported)),
     };
     Ok(g)
 }

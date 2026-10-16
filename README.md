@@ -64,7 +64,7 @@ Nothing that worked stops working in a patch.
   EasyFlash, EasyFlash 3, GMod2, GMod4, MegaByter, C64MegaCart. Flash and EEPROM writes survive a reset
   and a snapshot round trip. The EasyFlash 3 has its eight slots, its mode register and its
   three buttons (`cart button menu|reset|special`). The Action Replay freezes a running program
-  and returns to it (`cart button freeze`). GMod3 images are recognised and refused.
+  and returns to it (`cart button freeze`).
 - **Disks** — `.d64` / `.g64`, 35 to 42 tracks, in a 1541; `.d81`, 80 to 83 tracks, in a 1581.
   Two drive positions, each a 1541 or a 1581, chosen with the drive switched off. Drive-side
   writes reach the host file. Ejecting a disk from a 1541 darkens its write-protect sensor

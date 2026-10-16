@@ -307,8 +307,8 @@ pub struct FullBus<'a> {
 /// `ultimax_romh_phi1_ptr`).
 ///
 /// Three conditions, and all three are load-bearing. The board must actually be in
-/// ultimax (GAME=0, EXROM=1). The cart must not be a FAKE-ultimax one — GMod3 and GMod4
-/// hold the lines permanently and resolve their own windows, so the VIC reads the
+/// ultimax (GAME=0, EXROM=1). The cart must not be a FAKE-ultimax one — GMod4
+/// holds the lines permanently and resolve their own windows, so the VIC reads the
 /// ordinary map there exactly as the CPU does (VICE's `mem_read_without_ultimax`). And
 /// the mapper must drive $E000 at all: the families whose ultimax mode exists only to
 /// open a flash programming window answer `None`, and the fetch falls back — VICE's
@@ -999,7 +999,7 @@ impl<'a> FullBus<'a> {
     }
 
     /// True when the attached cartridge holds ULTIMAX permanently but resolves the
-    /// windows itself (GMod4 and, later, GMod3). Such a cart declines the windows it does
+    /// windows itself (GMod4). Such a cart declines the windows it does
     /// not drive, and those must then read the NON-ultimax map rather than open bus.
     #[inline]
     fn cart_fake_ultimax(&self) -> bool {
