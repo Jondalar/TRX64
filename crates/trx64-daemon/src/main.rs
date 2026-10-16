@@ -24220,8 +24220,8 @@ mod batch1_tests {
         assert_eq!((again["changed"].clone(), again["same"].clone()), (json!(false), json!(true)), "same project is a no-op");
 
         let in_a = recent_paths(&st);
-        assert!(in_a.iter().any(|p| p.ends_with("/alpha.d64")), "the picker sees the project it serves: {in_a:?}");
-        assert!(!in_a.iter().any(|p| p.ends_with("/beta.d64")), "and nothing of another: {in_a:?}");
+        assert!(in_a.iter().any(|p| std::path::Path::new(p).ends_with("alpha.d64")), "the picker sees the project it serves: {in_a:?}");
+        assert!(!in_a.iter().any(|p| std::path::Path::new(p).ends_with("beta.d64")), "and nothing of another: {in_a:?}");
 
         // A mounted disk, and a dry run that must say so and change nothing.
         call(&st, "media/mount", json!({ "path": a.join("alpha.d64").to_str().unwrap() }));
@@ -24248,8 +24248,8 @@ mod batch1_tests {
             assert!(s.session.powered, "the machine comes back up");
         }
         let in_b = recent_paths(&st);
-        assert!(in_b.iter().any(|p| p.ends_with("/beta.d64")), "the picker follows the move: {in_b:?}");
-        assert!(!in_b.iter().any(|p| p.ends_with("/alpha.d64")), "the old project's media are gone, recents included: {in_b:?}");
+        assert!(in_b.iter().any(|p| std::path::Path::new(p).ends_with("beta.d64")), "the picker follows the move: {in_b:?}");
+        assert!(!in_b.iter().any(|p| std::path::Path::new(p).ends_with("alpha.d64")), "the old project's media are gone, recents included: {in_b:?}");
         let roots = call(&st, "media/list_paths", json!({}));
         let project_root = roots.as_array().unwrap().iter().find(|r| r["label"] == json!("project")).unwrap();
         assert_eq!(project_root["path"], json!(b_s), "the browser's project root follows too");
