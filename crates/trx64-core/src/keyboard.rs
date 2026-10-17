@@ -46,6 +46,9 @@ fn key_matrix(key: &str) -> Option<(u8, u8)> {
     Some(c)
 }
 
+/// The c64re key id of RESTORE: not in the matrix, it pulls /NMI.
+pub const RESTORE_KEY: &str = "RESTORE";
+
 /// Shifted PETSCII characters → their unshifted base key (the key is pressed
 /// together with L_SHIFT). Mirrors the TS `SHIFTED_CHARS`.
 fn shifted_base(ch: char) -> Option<&'static str> {
@@ -277,6 +280,22 @@ impl KeyboardMatrix {
         // Spec 901 — a key press queued for a later cycle goes with the held set. The
         // queued joystick states stay: releasing keys never touched the sticks (BUG-049).
         self.sched.retain(|e| !matches!(e.change, InputChange::Key { .. }));
+    }
+
+    /// Whether RESTORE is down at cycle `now`: held, or pressed by a change queued for a
+    /// cycle at or before `now`. RESTORE is not in the matrix: it drives the /NMI line,
+    /// which the core samples every cycle (VICE: key down asserts the keyboard's NMI
+    /// source, key up releases it, so a held key is one edge).
+    pub fn restore_down_at(&self, now: u64) -> bool {
+        let mut down = self.live_pressed.iter().any(|k| k == RESTORE_KEY);
+        for e in self.sched.iter().take_while(|e| e.cycle <= now) {
+            if let InputChange::Key { key, down: d } = &e.change {
+                if key == RESTORE_KEY {
+                    down = *d;
+                }
+            }
+        }
+        down
     }
 
     /// Spec 310 — the held-key set as a list of c64re key ids. 1:1 with
