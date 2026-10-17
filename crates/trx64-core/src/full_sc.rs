@@ -482,6 +482,10 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
         self.fb.port_active
     }
     #[inline]
+    fn restore_nmi_line(&self, clk: u64) -> bool {
+        self.fb.keyboard.restore_down_at(clk)
+    }
+    #[inline]
     fn nmi_vector_fetch(&mut self) {
         if self.fb.port_active {
             self.fb.cart_nmi_vector_fetch();
