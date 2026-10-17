@@ -150,8 +150,8 @@ pub const INT_SRC_VIC: usize = 0;
 pub const INT_SRC_CIA1: usize = 1;
 /// CIA2 timer/TOD/FLAG NMI source index (int_num).
 pub const INT_SRC_CIA2: usize = 2;
-/// RESTORE-key NMI source index (int_num). Driven by the keyboard's held RESTORE key
-/// (`C64Core6510Bus::restore_nmi_line`), sampled every cycle.
+/// RESTORE-key NMI source index (int_num). Pulsed by a RESTORE press
+/// (`C64Core6510Bus::restore_nmi_press`).
 pub const INT_SRC_RESTORE: usize = 3;
 /// Spec 850 D6 — the expansion port's IRQ and NMI (int_num). One source carries both,
 /// as VICE allocates one per device (`c64cart.c:1424` "Cartridge", `reu.c:579` "REU"):
@@ -647,10 +647,11 @@ pub trait C64Core6510Bus {
     fn expansion_nmi_line(&self) -> bool {
         false
     }
-    /// The RESTORE key's /NMI line at `clk`, sampled per cycle like the expansion port's.
-    /// Default `false`: a bus with no keyboard.
+    /// True once per RESTORE press, at the cycle it lands: the keyboard's NMI source is
+    /// pulsed (set then cleared at once, as VICE `c64keyboard_restore_key`). Default
+    /// `false`: a bus with no keyboard.
     #[inline]
-    fn restore_nmi_line(&self, _clk: u64) -> bool {
+    fn restore_nmi_press(&self, _clk: u64) -> bool {
         false
     }
     /// Whether the port has anything to report this run. False on a stock machine, and
@@ -994,7 +995,10 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
             self.int.set_irq(INT_SRC_EXPANSION, self.bus.expansion_irq_line(), clk);
             self.int.set_nmi(INT_SRC_EXPANSION, self.bus.expansion_nmi_line(), clk);
         }
-        self.int.set_nmi(INT_SRC_RESTORE, self.bus.restore_nmi_line(clk), clk);
+        if self.bus.restore_nmi_press(clk) {
+            self.int.set_nmi(INT_SRC_RESTORE, true, clk);
+            self.int.set_nmi(INT_SRC_RESTORE, false, clk);
+        }
         if self.int.irq_clk <= self.core.clk {
             self.int.irq_delay_cycles += 1;
         }
@@ -1032,7 +1036,10 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
             self.int.set_irq(INT_SRC_EXPANSION, self.bus.expansion_irq_line(), clk);
             self.int.set_nmi(INT_SRC_EXPANSION, self.bus.expansion_nmi_line(), clk);
         }
-        self.int.set_nmi(INT_SRC_RESTORE, self.bus.restore_nmi_line(clk), clk);
+        if self.bus.restore_nmi_press(clk) {
+            self.int.set_nmi(INT_SRC_RESTORE, true, clk);
+            self.int.set_nmi(INT_SRC_RESTORE, false, clk);
+        }
         if self.int.irq_clk <= clk {
             self.int.irq_delay_cycles += 1;
         }

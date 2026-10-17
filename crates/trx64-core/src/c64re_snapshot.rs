@@ -2302,6 +2302,8 @@ pub fn restore_runtime_checkpoint(
             m.keyboard.key_down(k);
         }
     }
+    // A RESTORE held at capture is not a fresh press now.
+    m.keyboard.sync_restore_level(0);
 
     // Literal VIC + presentation.
     if let Some(c) = cp.get("vic") {

@@ -145,6 +145,8 @@ pub struct KeyboardMatrix {
     /// at `now` over the held state. Entries are folded into the held state only at an
     /// RPC boundary ([`take_due`]), when the clock is known to have passed them.
     sched: Vec<ScheduledInput>,
+    /// The RESTORE level the core last saw; see [`restore_press_edge`].
+    restore_level: std::cell::Cell<bool>,
 }
 
 impl KeyboardMatrix {
@@ -153,6 +155,7 @@ impl KeyboardMatrix {
             events: Vec::new(),
             live_pressed: Vec::new(),
             sched: Vec::new(),
+            restore_level: std::cell::Cell::new(false),
         }
     }
 
@@ -254,6 +257,7 @@ impl KeyboardMatrix {
         self.events.clear();
         self.live_pressed.clear();
         self.sched.clear();
+        self.restore_level.set(false);
     }
 
     /// Spec 310 — mark a key as held (browser keydown). 1:1 with the TS
@@ -283,10 +287,8 @@ impl KeyboardMatrix {
     }
 
     /// Whether RESTORE is down at cycle `now`: held, or pressed by a change queued for a
-    /// cycle at or before `now`. RESTORE is not in the matrix: it drives the /NMI line,
-    /// which the core samples every cycle (VICE: key down asserts the keyboard's NMI
-    /// source, key up releases it, so a held key is one edge).
-    pub fn restore_down_at(&self, now: u64) -> bool {
+    /// cycle at or before `now`.
+    fn restore_down_at(&self, now: u64) -> bool {
         let mut down = self.live_pressed.iter().any(|k| k == RESTORE_KEY);
         for e in self.sched.iter().take_while(|e| e.cycle <= now) {
             if let InputChange::Key { key, down: d } = &e.change {
@@ -296,6 +298,32 @@ impl KeyboardMatrix {
             }
         }
         down
+    }
+
+    /// RESTORE is not in the matrix: a press is ONE pulse on the keyboard's NMI source and
+    /// a release does nothing. True exactly once per press, at the cycle the press becomes
+    /// visible: the first sample where RESTORE is down after one where it was up.
+    ///
+    /// PORT OF: vice/src/c64/c64keyboard.c:52-62 `c64keyboard_restore_key` (`set_nmi(1)`
+    /// then `set_nmi(0)` at once on a press, release ignored). DEVIATION, deliberate: VICE
+    /// delays the press by a random alarm within the frame (vice/src/keyboard.c:938-990
+    /// `restore_alarm_triggered`); here the press lands at its exact queued cycle, so a
+    /// scenario is deterministic.
+    #[inline]
+    pub fn restore_press_edge(&self, now: u64) -> bool {
+        if !self.restore_level.get() && self.live_pressed.is_empty() && self.sched.is_empty() {
+            return false;
+        }
+        let down = self.restore_down_at(now);
+        let was = self.restore_level.replace(down);
+        down && !was
+    }
+
+    /// Adopt the current RESTORE level as already seen, so a key that is HELD when state is
+    /// loaded (checkpoint restore) does not read as a fresh press.
+    pub fn sync_restore_level(&mut self, now: u64) {
+        let down = self.restore_down_at(now);
+        self.restore_level.set(down);
     }
 
     /// Spec 310 — the held-key set as a list of c64re key ids. 1:1 with
