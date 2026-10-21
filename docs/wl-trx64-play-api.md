@@ -33,10 +33,10 @@ There is **one live machine per container**. Every client connected to the
 same container drives/sees the SAME machine — the emulator is a single shared C64, not
 per-connection. `session_id` may be passed but is not required (single session).
 
-A streaming daemon subscribes every connection to the A/V push on connect (and its first
-subscriber starts the pacing loop). A client that only speaks JSON-RPC connects to
-`ws://host:port/?av=0`: no binary frames, no pacing loop started on its account, and it
-does not count as a viewer for `--idle-exit`.
+The daemon subscribes every connection to the A/V push on connect. The machine runs whether
+or not anyone is subscribed: the run loop starts with the daemon and advances it, and the push
+is one more consumer of that loop. A client that only speaks JSON-RPC connects to
+`ws://host:port/?av=0`: no binary frames, and it does not count as a viewer for `--idle-exit`.
 
 **No auth on the daemon WS** — see section 7.
 
@@ -76,7 +76,7 @@ All are JSON-RPC `method`s. `params` shown; omit `session_id` (single machine).
 | `daemon/keep_alive` | `{ "seconds": number \| null }` | with `--idle-exit`: hold the daemon at least `seconds` from now, `null` = never end on idle; the request itself resets the idle window. Returns `{ armed, armedSeconds, deadlineMs \| null, keptAliveUntilMs \| null, keptForever, holding: "subscriber"\|"trace"\|null }` (epoch ms; `deadlineMs` null = it will not end: off, kept forever, or held by an A/V subscriber or a recording trace). A plain RPC connection holds nothing — only its requests reset the window. `session/state` carries the same `idleExit` |
 | `daemon/shutdown` | — (params ignored) | end the daemon cleanly: stops the run, ends a recording trace like `trace/run/stop` (its `.c64retrace` complete on disk), persists a dirty cartridge and both drives' disks as eject does, replies `{ ok: true, persisted: { cartridge: path \| null, disks: [path…] }, trace: path \| null, exitCode: 0 }`, flushes the reply to the caller's socket, then exits 0 (the caller sees the reply, then the connection close). SIGTERM and SIGINT (on Windows Ctrl-C, Ctrl-Break, console close) and the idle exit run the same exit work once |
 | `session/create` | `{ "model"?: "c64-pal"\|"c64-ntsc"\|…, "exerciser"?: bool }` | attaches/creates the one machine; returns session id + state. With a `model` other than the machine's, switches the machine to it at the next frame boundary (a machine that is off becomes that model at its next power-on). `exerciser: true` declares a CPU/chip exerciser — bytes poked, PC set, run cycle-exact on the CPU-isolated core without VIC, CIA keyboard scan or drive; `false` makes it a C64 again. Nothing else leaves the full machine: loading a PRG, typing or poking through the monitor never does, and a mounted disk or an inserted cartridge keeps even an exerciser on the full machine |
-| `session/state` | — | `{ c64Cycles, runState:"running"\|"paused", powered:bool, media:{cart,disk}, cpu:{pc,a,x,y,sp,flags}, vic:{…}, controlOwner, streamPump (true only while an A/V client keeps the stream pump running), model, videoStandard, chip, cyclesPerLine, linesPerFrame, cyclesPerFrame, cpuHz, frameRate, canvas:{width,height}, … }` — see section 3.1 |
+| `session/state` | — | `{ c64Cycles, runState:"running"\|"paused", powered:bool, media:{cart,disk}, cpu:{pc,a,x,y,sp,flags}, vic:{…}, controlOwner, sid:{regs,streaming (an A/V client is subscribed and the machine runs)}, model, videoStandard, chip, cyclesPerLine, linesPerFrame, cyclesPerFrame, cpuHz, frameRate, canvas:{width,height}, … }` — see section 3.1 |
 | `session/models` | — | `{ models:[{ name, title, runs, missing, videoStandard, chip, cyclesPerLine, linesPerFrame, cyclesPerFrame, cpuHz, frameRate, … }], current }` — every C64 model, whether it runs here, and what a model that does not is missing |
 | `session/model` | `{ "name": "c64-ntsc" }` | switch the running machine to another model at the next frame boundary. Not a power cycle: the program keeps its RAM, CPU, CIA and SID state and the standard it detected at boot — a clean start on the new model is `session/reset` or a power cycle afterwards. Reply: `{ from, model, switched, switchedAt:{c64Cycles,rasterLine,rasterCycle}, kept:{cpu,ram,cia,sid}, … }` |
 | `media/mount` | `{ "path": "/play/x.crt" }` | mount `.crt`/`.d64`/`.g64`/`.d81` (the type is read from the content; a `.d81` needs a 1581 at that unit); a cart power-cycles + boots. Returns `{ detail:{ mapperType, name, … }, … }` |
@@ -86,7 +86,7 @@ All are JSON-RPC `method`s. `params` shown; omit `session_id` (single machine).
 | `session/joystick_clear` | `{ "port":2 }` | release all lines |
 | `session/screenshot` | — | `{ dataUrl:"data:image/png;base64,…" }` — one PNG at the model's canvas (384×272 PAL, 384×247 NTSC). For a thumbnail; the live view uses BIN_VIC, not this |
 | `session/close` | — | soft-close (machine + media stay; a later create re-attaches) |
-| `debug/pause` / `debug/run` | — | freeze / resume. NOTE: a manual `session/run` is refused while the machine free-runs (`-32001`) — pause first |
+| `debug/pause` / `debug/run` | `{ cycles?, pace?, wait? }` | freeze / resume. `debug/run` is the one bounded run: `cycles` pauses the machine on exactly that cycle, `pace:"warp"` runs it as fast as possible for the run, `wait:true` returns when it has stopped (`stop: {reason, pc, cycles}`). `session/run { cycles }` is the same run under its old name (as fast as possible), and works while the machine free-runs |
 | `session/power` | `{ "op":"off"\|"on" }` | the general switch. **off** stops the machine entirely (use it around a build that replaces the mounted file); **on** boots it back with whatever is registered |
 | `session/set_pacing` | `{ "mode":"realtime"\|"warp"\|"fixed-ratio", "ratio":num }` | how fast the machine runs. `realtime` = the model's own frame rate (~50.12/s PAL, ~59.83/s NTSC; `pal` is accepted as its old name), **`warp`** = as fast as the host allows (measured ~8× on a Mac; less on a NAS, where realtime already costs ~40 % of a core). Reported back in `session/state.pacing` |
 | `session/reset` | `{ "mode":"soft"\|"cold" }` | **soft** = hardware RESET line (RAM + media preserved). **cold** = full power-cycle. Default when `mode` is omitted: **cold** |

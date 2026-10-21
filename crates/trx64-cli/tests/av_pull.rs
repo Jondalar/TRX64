@@ -22,8 +22,9 @@ fn engine_or_skip() -> Option<Engine> {
 fn frame_buffer_is_full_canvas_with_content() {
     let Some(engine) = engine_or_skip() else { return };
     engine.exec_line("/power on");
-    // Run ~30 frames so the READY screen is fully drawn.
-    for _ in 0..30 {
+    // `/power on` runs nothing (Spec 910 D8): the machine stands at the reset vector. Pump
+    // ~250 frames (~4.9 M cycles) so the boot reaches READY and the screen is fully drawn.
+    for _ in 0..250 {
         engine.pump_frame(19_656);
     }
 

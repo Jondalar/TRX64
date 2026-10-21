@@ -33,8 +33,10 @@ pub use daemon::{
     pull_audio_drain, pull_frame_buffer, AudioDrainData, FrameBufferData, AUDIO_SAMPLE_RATE,
 };
 
-// The event-broadcast hub (subscribe a forwarder channel → typed events).
+// The event-broadcast hub (subscribe a forwarder channel → typed events) and the run loop
+// (Spec 910 D6: the one thing that advances a daemon's machine; an embedded host has none).
 pub use daemon::streaming;
+pub use daemon::streaming::{start_run_loop, RunLoopGuard, StreamHub};
 
 /// Process-wide reSID construction count (see `trx64_core::resid_ffi`). Re-exported so
 /// the FFI audio-path tests can ASSERT the persistent-engine contract — the
@@ -57,13 +59,12 @@ pub fn resid_construct_count() -> u64 {
 pub use daemon::transport;
 
 pub(crate) use daemon::{
-    maybe_autopause_capped_run, set_control_owner, stream_debug_gated_advance,
-    stream_maybe_autocapture, stream_maybe_autopersist_cart, stream_maybe_autopersist_disk,
-    stream_maybe_feed_recorder,
+    loop_iteration, release_idle_control_owner, stream_maybe_autopersist_cart,
+    stream_maybe_autopersist_disk,
     // Spec 863 — the A/V hello the stream sends a client on subscribe.
     av_hello,
-    // Spec 863 — the stream loop catches a model change the transport made.
+    // Spec 863 — the run loop catches a model change the transport made.
     sync_model_identity,
-    // Spec 808 — the rewind transport's per-frame tick, called by the stream loop.
+    // Spec 808 — the rewind transport's per-frame tick, called by the run loop.
     transport_tick,
 };

@@ -13,16 +13,9 @@ fn free_port() -> u16 {
 }
 
 fn start(port: u16, idle: u64) -> Child {
-    start_with(port, idle, true)
-}
-
-fn start_with(port: u16, idle: u64, headless: bool) -> Child {
     let dir = std::env::temp_dir().join(format!("trx64_887_{port}"));
     let _ = std::fs::create_dir_all(&dir);
-    let mut args = vec!["--port".to_string(), port.to_string(), "--idle-exit".to_string(), idle.to_string()];
-    if headless {
-        args.push("--headless".into());
-    }
+    let args = vec!["--port".to_string(), port.to_string(), "--idle-exit".to_string(), idle.to_string()];
     Command::new(env!("CARGO_BIN_EXE_trx64-daemon"))
         .args(&args)
         .current_dir(&dir)
@@ -45,7 +38,8 @@ fn wait_exit(child: &mut Child, limit: Duration) -> Option<i32> {
 }
 
 async fn connect(port: u16) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
-    connect_url(format!("ws://127.0.0.1:{port}")).await
+    // An RPC-only connection (`?av=0`): it subscribes to no A/V stream, so it holds nothing.
+    connect_url(format!("ws://127.0.0.1:{port}/?av=0")).await
 }
 
 async fn connect_url(url: String) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
@@ -120,9 +114,9 @@ async fn a_silent_rpc_connection_does_not_hold_it_and_keep_alive_does() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_av_subscriber_holds_it_an_av0_connection_does_not() {
     let port = free_port();
-    let mut child = start_with(port, 2, false);
-    let mut viewer = connect(port).await;
-    let mut rpc_only = connect_url(format!("ws://127.0.0.1:{port}/?av=0")).await;
+    let mut child = start(port, 2);
+    let mut viewer = connect_url(format!("ws://127.0.0.1:{port}")).await;
+    let mut rpc_only = connect(port).await;
     tokio::time::sleep(Duration::from_secs(4)).await;
     assert!(child.try_wait().unwrap().is_none(), "an A/V subscriber holds the daemon");
     let st = rpc(&mut rpc_only, "session/state", serde_json::json!({})).await;

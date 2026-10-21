@@ -31,7 +31,7 @@ Swift names are uniffi's camelCase rendering of the Rust snake_case below.
 |--------|-----------|---------|
 | `createSession` | `(pal: Bool) throws -> SessionInfo` | Attach to the singleton session (the machine is built at construction; `create` always attaches). `pal` is ignored: the model is chosen with `session/model` through `call`. |
 | `state` | `() throws -> MachineState` | Full machine state: CPU regs, cycles, run-state, VIC, flow, vectors, SID. |
-| `reset` | `(cold: Bool) throws -> ResetResult` | `cold` = power-cycle (fresh DRAM); else warm (RAM preserved). Runs the KERNAL to READY. |
+| `reset` | `(cold: Bool) throws -> ResetResult` | `cold` = power-cycle (fresh DRAM); else warm (RAM preserved). Runs nothing: the machine stands at the reset vector, running, and the reply says where. |
 | `screenshot` | `() throws -> Data` | PNG bytes of the current displayed frame (decoded from the handler's data URL). |
 
 ## Live A/V (pull)

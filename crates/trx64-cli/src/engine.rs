@@ -10,13 +10,12 @@
 //! verb is forwarded verbatim to `monitor/exec` (the VICE-superset monitor).
 //!
 //! RUN-STATE MODEL (important — mirrors the FFI "embedded host drives the loop"
-//! contract). TRX64 has no autonomous pacing loop: `debug/run` only flips the
-//! controller `running` flag, and `session/run` REFUSES while `running==true` (so two
-//! clocks can't double-advance). The host (us) owns the per-frame loop. So the
-//! Engine keeps its OWN `running` flag (`AtomicBool`); the pump thread, while that
-//! flag is set, advances the machine one frame at a time via `session/run`
-//! (which honours breakpoints + JAM) WITHOUT flipping the controller flag — exactly
-//! the FFI pattern. `pause` clears the flag.
+//! contract). An embedded machine has no run-loop thread (Spec 910): the host's clock
+//! calls the same advance the daemon's loop uses, through `session/tick` (the host hands
+//! over the real time that passed), and the daemon-side `running` flag decides whether the
+//! machine moves. The pump thread below ticks; `pause` clears the flag in the daemon.
+//! `session/run` and `debug/run { wait: true }` are bounded runs and work whether or not
+//! the machine is running.
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::Arc;

@@ -43,7 +43,7 @@ impl Drop for Daemon {
 fn start(port: u16, dir: &Path) -> Daemon {
     Daemon(
         Command::new(env!("CARGO_BIN_EXE_trx64-daemon"))
-            .args(["--port", &port.to_string(), "--headless"])
+            .args(["--port", &port.to_string()])
             .current_dir(dir)
             .stdout(Stdio::null())
             .stderr(Stdio::null())

@@ -271,8 +271,10 @@ impl Runtime {
 
     // ── run / step ─────────────────────────────────────────────────────────────
 
-    /// Resume free-running (an embedded host drives the per-frame loop itself; this
-    /// flips run-state so the controller behaves as running). Returns debug state.
+    /// Resume free-running. An embedded runtime has no run-loop thread (that is the
+    /// daemon's): this flips run-state so the controller behaves as running, and the
+    /// host's own clock advances the machine (`run_cycles`, or the host's pump). Returns
+    /// debug state.
     pub fn run(&self) -> Result<DebugState, Trx64Error> {
         let v = self.rpc("debug/run", json!({ "source": "ffi" }))?;
         decode(v)
@@ -293,7 +295,10 @@ impl Runtime {
         decode(v)
     }
 
-    /// Advance exactly `n` C64 cycles (may stop early on a breakpoint).
+    /// Run `n` C64 cycles — `debug/run { cycles: n, wait: true }` under its old name
+    /// (`session/run`) — and pause on the first instruction boundary at or past them (or
+    /// earlier, on a breakpoint, watchpoint or JAM). Works whether or not the machine is
+    /// running.
     pub fn run_cycles(&self, n: u64) -> Result<RunResult, Trx64Error> {
         let v = self.rpc("session/run", json!({ "cycles": n }))?;
         decode(v)

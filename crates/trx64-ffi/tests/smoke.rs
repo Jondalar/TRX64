@@ -13,6 +13,10 @@ use std::sync::Arc;
 
 use trx64_ffi::{EventListener, JoystickState, Pacing, Runtime, RuntimeEvent};
 
+/// The reSID construction counter is process-wide, so the tests that build an audio engine
+/// (and the one that asserts the count does not move) take turns.
+static AUDIO: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn rom_dir() -> std::path::PathBuf {
     let root = std::env::var("C64RE_ROOT")
         .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP").to_string());
@@ -117,6 +121,7 @@ fn typed_in_process_path() {
 /// running and DRAINS (an immediate re-drain returns fewer/zero samples).
 #[test]
 fn live_av_pull_api() {
+    let _turn = AUDIO.lock().unwrap_or_else(|e| e.into_inner());
     let roms = rom_dir();
     if !roms.join("kernal-901227-03.bin").exists() {
         eprintln!("[smoke] ROMs not found at {} — skipping", roms.display());
@@ -125,11 +130,12 @@ fn live_av_pull_api() {
 
     let rt = Runtime::new(roms.to_string_lossy().to_string()).expect("Runtime::new");
     rt.create_session(true).expect("create_session");
-    // Boot to the READY screen: `reset(cold:)` runs the KERNAL to READY (the 5 M-cycle
-    // run-to-READY the daemon's session/reset does), so the VIC has swept full
-    // `displayed` frames showing the light-blue border/background + READY text — a real
-    // multi-colour frame, not the power-on black.
-    rt.reset(true).expect("cold reset to READY");
+    // Boot to the READY screen: `reset(cold:)` leaves the machine at the reset vector and
+    // runs nothing (Spec 910 D8), so the host runs the boot itself — 5 M cycles — and the VIC
+    // has swept full `displayed` frames showing the light-blue border/background + READY
+    // text — a real multi-colour frame, not the power-on black.
+    rt.reset(true).expect("cold reset");
+    rt.run_cycles(5_000_000).expect("run the boot to READY");
 
     // ── frameBuffer(): full-res palette + index image ──
     let fb = rt.frame_buffer();
@@ -167,13 +173,9 @@ fn live_av_pull_api() {
     // First drain installs the capture hook + primes reSID → no cycles yet → empty.
     let primed = rt.audio_drain();
     eprintln!("[smoke] audioDrain #1 (prime): {} samples", primed.len());
-    // The daemon refuses a manual `session/run` while the session free-runs under the
-    // autonomous loop — stepping cycles by hand beside the self-run would double-advance
-    // the CPU. These tests drive exact cycle windows, so they must own the clock. Pause
-    // HERE, not at create_session: `reset` runs the KERNAL to READY and leaves the loop
-    // running again, so an earlier pause is undone. (The guard is newer than the tests;
-    // this is the adjustment it always required.)
-    rt.pause().expect("pause the autonomous loop before driving cycles manually");
+    // These tests drive exact cycle windows, so they own the clock: pause the machine (a
+    // bounded run leaves it paused already; the explicit pause keeps the intent plain).
+    rt.pause().expect("pause before driving cycles manually");
     // Run a frame so SID cycles elapse, then drain → non-empty PCM for that window.
     rt.run_cycles(19_656).expect("run_cycles frame");
     let first = rt.audio_drain();
@@ -205,6 +207,7 @@ fn live_av_pull_api() {
 ///       drains.
 #[test]
 fn audio_persistent_engine_continuity() {
+    let _turn = AUDIO.lock().unwrap_or_else(|e| e.into_inner());
     let roms = rom_dir();
     if !roms.join("kernal-901227-03.bin").exists() {
         eprintln!("[smoke] ROMs not found at {} — skipping", roms.display());
@@ -213,7 +216,8 @@ fn audio_persistent_engine_continuity() {
 
     let rt = Runtime::new(roms.to_string_lossy().to_string()).expect("Runtime::new");
     rt.create_session(true).expect("create_session");
-    rt.reset(true).expect("cold reset to READY");
+    rt.reset(true).expect("cold reset");
+    rt.run_cycles(5_000_000).expect("run the boot to READY");
 
     const PAL_CYCLES_PER_FRAME: u64 = 19_656; // ~50 Hz PAL frame (matches streaming.rs)
     const FRAMES: u64 = 50; // ~1 s of real-time-equivalent emulation
@@ -233,13 +237,9 @@ fn audio_persistent_engine_continuity() {
     // Keeping the chunks lets us distinguish a SEAM delta (last sample of window N →
     // first sample of window N+1) from an INTRA-window delta — the whole point of the
     // continuity check (a per-drain reconstruct injects an outlier at the seams only).
-    // The daemon refuses a manual `session/run` while the session free-runs under the
-    // autonomous loop — stepping cycles by hand beside the self-run would double-advance
-    // the CPU. These tests drive exact cycle windows, so they must own the clock. Pause
-    // HERE, not at create_session: `reset` runs the KERNAL to READY and leaves the loop
-    // running again, so an earlier pause is undone. (The guard is newer than the tests;
-    // this is the adjustment it always required.)
-    rt.pause().expect("pause the autonomous loop before driving cycles manually");
+    // These tests drive exact cycle windows, so they own the clock: pause the machine (a
+    // bounded run leaves it paused already; the explicit pause keeps the intent plain).
+    rt.pause().expect("pause before driving cycles manually");
     let mut chunks: Vec<Vec<i16>> = Vec::new();
     let mut stream: Vec<i16> = Vec::new();
     for f in 0..FRAMES {

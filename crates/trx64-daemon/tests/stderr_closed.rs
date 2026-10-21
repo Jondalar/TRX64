@@ -17,7 +17,7 @@ fn a_closed_stderr_does_not_take_the_daemon_down() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_trx64-daemon"))
-        .args(["--port", &port.to_string(), "--headless"])
+        .args(["--port", &port.to_string()])
         .current_dir(&dir)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
