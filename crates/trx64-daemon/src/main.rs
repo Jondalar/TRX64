@@ -65,6 +65,7 @@ use trx64_monitor::verbs::{
 pub mod idle;
 mod media_identity;
 pub mod project_knowledge;
+pub mod scratch;
 pub mod snapshot_diff;
 pub mod streaming;
 /// Spec 808 — the rewind transport (play the machine backwards).
@@ -91,13 +92,6 @@ struct Cli {
     /// Also settable via the `TRX64_BIND` env var (the flag wins).
     #[arg(long)]
     bind: Option<String>,
-
-    /// Opt OUT of the live A/V push + the connect-time auto-run: a silent, deterministic,
-    /// command-driven machine that only advances on an explicit session/run (NO pacing
-    /// loop, NO frames, NO auto-run on connect). For the byte-exact oracle / conformance
-    /// and headless tool daemons. The product/UI daemon omits this → streams by default.
-    #[arg(long, default_value_t = false)]
-    headless: bool,
 
     /// Which machine this is, applied before anything runs: `c64` (default),
     /// `u64` (also `c64u`, `ue2`: U64, Elite II and C64 Ultimate — turbo registers and a
@@ -142,6 +136,16 @@ struct Cli {
     /// client, no recording trace. 0 (the default) = never. Media are persisted first.
     #[arg(long, value_name = "SECONDS", default_value_t = 0)]
     idle_exit: u64,
+
+    /// Never write a medium back into the file it was handed (Spec 910 D1). Every disk,
+    /// cartridge or folder the daemon is given by a path, by any method and at any time, is
+    /// opened from a copy in DIR, and every write goes only into that copy; the machine sees
+    /// its own writes, the caller's file is never opened for writing. The directory is
+    /// created if missing and left in place when the daemon ends (the caller owns it).
+    /// `session/state` reports `noWriteback` and `scratchDir`. Without the option the daemon
+    /// writes back as before (the shared machine).
+    #[arg(long, value_name = "DIR")]
+    scratch: Option<String>,
 }
 
 // ── JSON-RPC 2.0 wire types ───────────────────────────────────────────────────
@@ -230,9 +234,9 @@ pub struct State {
     /// Spec 815 — which machine this SESSION claims to be. It lives here, not on
     /// the chip, because it survives a power-cycle: power-cycling a C128 gives you
     /// a C128. The first cut kept it on the VIC, so a mount (which power-cycles)
-    /// silently dropped it — and a cartridge probes in its boot stub, during the
-    /// very warm-up that power-on runs. The flag looked set and the detection had
-    /// already failed.
+    /// silently dropped it — and a cartridge probes in its boot stub, which a power-on
+    /// reaches within the first frames it runs. The flag looked set and the detection
+    /// had already failed.
     speed_profile: trx64_core::vic::SpeedProfile,
     /// Spec 851 — the Ultimate's speed table, kept beside the profile for the same reason:
     /// a power-cycle builds a fresh machine.
@@ -343,23 +347,45 @@ pub struct State {
     /// server notification (debug/breakpoint_hit, audio/flush, batch/progress) to
     /// every connected client. Each connection registers its outbound channel; the
     /// hub fans a `{jsonrpc,method,params}` notification (no id) to all. Always
-    /// present (unlike the `--stream`-gated A/V `StreamHub`).
+    /// present (unlike the A/V `StreamHub`, which holds only subscribers).
     notify: Arc<streaming::NotifyHub>,
-    /// Spec 771.2 (T1.1) — whether the --stream A/V hub is enabled, so session/state
-    /// reports sid.streaming truthfully (live audio = streaming_enabled && running),
-    /// mirroring TS `audioStreams.has(session_id)`. Was hardcoded false → SID light OFF.
-    streaming_enabled: bool,
-    /// The A/V hub exists (`streaming_enabled`) but has no subscriber, so its pump thread is
-    /// not running and nothing advances a `debug/run`. Set by the hub when the last client
-    /// leaves (and at construction); cleared when the first one arrives.
-    pump_idle: bool,
+    /// How many A/V clients are subscribed right now (the hub keeps it current). The
+    /// frames and audio go out only while it is above zero; nothing else depends on it:
+    /// the machine advances whether anybody watches or not. `session/state` reports
+    /// `sid.streaming` from it.
+    av_subscribers: usize,
+    /// A run-loop thread is advancing this machine ([`start_run_loop`]). An embedded host
+    /// (the FFI, the in-process CLI) has none: its own clock calls the same advance
+    /// ([`advance_frames`]) through `session/tick`, and a request that waits for a stop
+    /// advances the machine itself while it waits.
+    loop_thread: bool,
+    /// Woken by the run loop after each iteration, so a request parked on a stop
+    /// ([`park_until_stopped`]) gives the State lock back to the loop while it waits.
+    loop_cv: Arc<std::sync::Condvar>,
+    /// Counts every stop the advance made on its own account: a breakpoint or watchpoint
+    /// hit, a JAM, the cap of a bounded run. [`advance_frames`] compares it before and
+    /// after a step to know the run ended, whether or not `running` was set.
+    halt_seq: u64,
+    /// The `stop` object the last breakpoint / watchpoint hit pushed in `debug/stopped`
+    /// ({reason "breakpoint"|"observer", pc, cycles, breakpointId?, breakpoint?}), for a reply
+    /// that wants the hit and not just `ctrl_stop`'s coarser reason.
+    last_halt_stop: Option<Value>,
+    /// Set around a run whose frames are not points on the timeline (the re-simulation a
+    /// paused restore does to redraw the picture): the advance then takes no anchor and feeds
+    /// no recorder for the frames it crosses.
+    frame_work_off: bool,
+    /// The bus-access tracker of a `debug/memory_access_map` in progress. While it is set the
+    /// advance tees it onto the bus beside the registry and the trace, so the map is measured
+    /// by an ordinary run with the breakpoints live.
+    access_probe: Option<MemoryAccessObserver>,
     /// Spec 863 — the model the clients were last told about (`av/hello`). A request that
     /// leaves the machine on another row — a switch, a rewind across one, an undump or a
     /// VSF of another model — is caught against this once it returns.
     announced_model: &'static trx64_core::model::C64Model,
     /// T1.3 — current pacing mode (RuntimeController.pacing.mode). One of "realtime"
-    /// (Spec 863; "pal" is accepted as its old name), "warp", "fixed-ratio". Stored here because TRX64 has no autonomous pacing
-    /// loop; session/set_pacing sets it and debug/state reads it back exactly as the
+    /// (Spec 863; "pal" is accepted as its old name), "warp", "fixed-ratio". session/set_pacing sets it, the
+    /// run loop paces by it ("warp" = eight frames per iteration; a bounded run asking for
+    /// "warp" has no pace to keep at all), and debug/state reads it back exactly as the
     /// TS RuntimeController does (build_debug_state mirrors c.state()).
     pacing_mode: String,
     /// T1.3 — current pacing ratio (RuntimeController.pacing.ratio). Positive f64;
@@ -373,15 +399,15 @@ pub struct State {
     /// setControlOwner, runtime-controller.ts:338). Signal only; never gates access.
     control_owner: String,
     /// Spec 767 (live-view) — wall-clock of the last LLM-source OPERATING command.
-    /// The stream pump reverts `control_owner` "llm"→"human" after an idle gap (and
-    /// only while NOT running) so the border returns to human-owned when the LLM stops
-    /// driving. `None` until the first LLM operating command.
+    /// The run loop reverts `control_owner` "llm"→"human" after an idle gap so the border
+    /// returns to human-owned when the LLM stops driving. `None` until the first LLM
+    /// operating command.
     last_llm_activity: Option<std::time::Instant>,
-    /// Spec 767 slice 2 (live-view) — when set, the stream pump auto-pauses the free-run
-    /// once `machine.clk` reaches this cap: a BOUNDED run that still streams every rendered
-    /// frame through the pump (the machine renders → the frames go out), instead of the
-    /// blocking synchronous `session/run` that froze the picture. Cleared on auto-pause or
-    /// any explicit pause.
+    /// The cap of a bounded run (Spec 910 D7): when set, the advance clamps each step to the
+    /// cycles left and pauses the machine on the first instruction boundary at or past this
+    /// `machine.clk`. The run is the loop's, so every rendered frame still streams to a
+    /// subscribed client. Cleared when the run stops (cap, breakpoint, JAM), on any explicit
+    /// pause and on a power cycle.
     run_cap_clk: Option<u64>,
     /// Spec 767 slice 2 — `pacing_mode` to restore when a capped run auto-pauses, so a
     /// warp LLM run does not leave the shared (human) session stuck in warp. None = leave.
@@ -405,8 +431,9 @@ pub struct State {
     cart_led_last_write_at: Option<std::time::Instant>,
     /// Spec 714.5 / Spec 705.B — the per-frame BACKGROUND-LOOP layer the c64re
     /// RuntimeController runs that has no WS method (runtime-controller.ts). TRX64's
-    /// `stream_loop` is the SOLE per-frame machine driver under --stream, so it
-    /// hosts these three behaviors (gated on `running`, like the advance/audio gate).
+    /// run loop (`streaming.rs` `run_loop`) is the daemon's only machine driver, so it
+    /// hosts these behaviors: the cart / disk write-back every iteration, the checkpoint
+    /// anchor and the recorder feed once per frame of machine time inside the advance.
     ///
     /// BUG-040 cart auto-persist (= maybeAutoPersistCart, runtime-controller.ts:493).
     /// The mapper's monotonic writableGeneration() distinguishes "still being
@@ -426,7 +453,7 @@ pub struct State {
     /// (fsimage_dxx.ts:428 hostFlush, BUG-023 — VICE's fd IS the file). TRX64's
     /// write-through only mirrors the dirty track into `disk.bytes` (in-memory); the
     /// host file is reached only on media/persist|eject. To give the user the
-    /// lazily-updated host disk file, the stream loop flushes + writes the backing
+    /// lazily-updated host disk file, the run loop flushes + writes the backing
     /// file when a dirty track has been settled for the debounce window. `disk_ap_*`
     /// track the same settle/done gen as the cart, derived from a content hash of
     /// the (flushed) disk bytes (TRX64 has no diskWriteGeneration facade).
@@ -455,7 +482,7 @@ pub struct State {
     autocapture_cycles_since: u64,
     // Spec 808 rebuild — THE run intent used to live here, as `play_intent`, beside
     // `session.running`. Two fields for one fact: `session/tick` and the transport read
-    // one, `debug/run` and the --stream loop the other, and `session/state` reported
+    // one, `debug/run` and the run loop the other, and `session/state` reported
     // their OR. Pause cleared one flag and the machine kept pumping cycles through the
     // other, which is exactly the bug 808 set out to kill when it removed the CLI's
     // private `running: AtomicBool`. Removing the client's copy and keeping a second one
@@ -503,10 +530,10 @@ pub struct State {
     /// controller.ts:846-852) — there the recorder rides the SAME cadence as the ring
     /// auto-capture, inside tick(), so a free-running machine grows recorder anchors
     /// over time. TRX64 previously fed the recorder ONLY on an explicit recorder/
-    /// capture, so a --stream free-run left the recorder frozen at 1 (or 0) anchors.
-    /// This counter drives the per-frame feed (separate from `autocapture_frames_since`
-    /// because the ring auto-capture is warp-skipped while the recorder is not).
-    recorder_frames_since: u64,
+    /// capture, so a free-run left the recorder frozen at 1 (or 0) anchors.
+    /// This counter drives the per-frame feed, in cycles (separate from
+    /// `autocapture_cycles_since`: the recorder is not the live-scrub filmstrip).
+    recorder_cycles_since: u64,
     /// Spec 809 §9 — sandbox run ids are numbered daemon-wide, so two calls never hand
     /// back the same `r-0001` for different runs.
     sandbox_seq: u64,
@@ -522,7 +549,7 @@ pub struct State {
     /// Spec 769.5a — the SEPARATE per-checkpoint thumbnail store (= the c64re
     /// `RuntimeController.checkpointThumbs` map, runtime-controller.ts:181). Keyed by
     /// checkpoint id, capped at [`MAX_THUMBS`]. Decoupled from the ring's
-    /// framebuffer-OMITTED (BUG-049) auto-capture anchor: when the stream loop
+    /// framebuffer-OMITTED (BUG-049) auto-capture anchor: when the run loop
     /// auto-captures, it downscales the live frame it JUST rendered for the video
     /// broadcast and stores it here under the SAME id the ring assigned. The scrub
     /// filmstrip (`checkpoint/thumbnails`) then intersects `ring.list()` with this
@@ -547,7 +574,7 @@ pub struct State {
     fs_cwd: Option<String>,
     /// Spec 764 — JAM (KIL) auto-break edge for the per-frame stream driver (=
     /// runtime-controller.ts:793 `brokeOnJam`). A jammed CPU keeps cycling clk with
-    /// PC frozen, so the free-run advance never aborts on it; the stream loop detects
+    /// PC frozen, so the free-run advance never aborts on it; the run loop detects
     /// the jammed state and drops into the monitor ONCE per episode. Re-armed when the
     /// jam clears (or on a fresh run()).
     stream_broke_on_jam: bool,
@@ -555,13 +582,13 @@ pub struct State {
     /// even though paused" request, set by `checkpoint/restore`. The TS controller's
     /// restore ALWAYS presentFrame()s on restore (runtime-controller.ts:606-613, "no
     /// client-grab dependency"), so a paused scrub refreshes the canvas to the
-    /// rolled-back picture immediately. TRX64's stream loop sends nothing while
-    /// paused (frozen picture), so a paused restore would leave the pre-scrub frame on
-    /// screen. The restore handler sets this; the stream loop's paused branch consumes
-    /// it ONCE — pushing exactly one BIN_VIC + `session/frame_available` — then clears
-    /// it (no continuous push, the machine stays frozen). When no --stream hub exists,
-    /// the restore handler still broadcasts `session/frame_available` directly, so a
-    /// command-driven daemon signals the refresh too.
+    /// rolled-back picture immediately. The run loop pushes nothing while paused (frozen
+    /// picture), so a paused restore would leave the pre-scrub frame on screen. The
+    /// restore handler sets this; the run loop's paused branch consumes it ONCE — pushing
+    /// exactly one BIN_VIC to the subscribed clients — then clears it (no continuous push,
+    /// the machine stays frozen). The restore handler also broadcasts
+    /// `session/frame_available` directly, so a client without the A/V stream learns of
+    /// the refresh too.
     force_present_frame: bool,
     /// Live A/V PULL-API (FFI / native app, ADR-073 §pull) — the persistent SID
     /// audio renderer for [`pull_audio_drain`]. `None` until the first `audioDrain()`
@@ -569,8 +596,8 @@ pub struct State {
     /// itself is `!Send` (it holds the process-global reSID `MutexGuard`), so it lives
     /// on a DEDICATED render thread — constructed ONCE, never reconstructed, never
     /// crossing threads. `State` keeps only the `Send` handles (write-capture buffer,
-    /// write-ring sender, PCM ring, thread join + stop). This MIRRORS the `--stream`
-    /// loop (`streaming.rs` `stream_loop`) and C64RE's Spec 768 reSID worker:
+    /// write-ring sender, PCM ring, thread join + stop). This MIRRORS the run
+    /// loop's A/V consumer (`streaming.rs` `run_loop`) and C64RE's Spec 768 reSID worker:
     /// write-ring (emu→render) → persistent engine → PCM-ring (render→main). Off by
     /// default → zero cost until the app starts pulling audio. Joined on `State` drop.
     audio_render: Option<AudioRenderThread>,
@@ -580,7 +607,7 @@ pub struct State {
 /// thread ([`pull_audio_drain`]). The `!Send` reSID `SidAudioEngine` is owned BY the
 /// render thread (constructed once, thread-confined → persistent, never
 /// reconstructed); `State` holds only these `Send` channels + lifecycle handles.
-/// Mirrors `streaming.rs` `stream_loop` (persistent engine on its own thread) and
+/// Mirrors `streaming.rs` `run_loop` (persistent engine on its own thread) and
 /// C64RE Spec 768 (persistent engine on a worker, fed by a write-ring, producing a
 /// PCM ring).
 struct AudioRenderThread {
@@ -1704,10 +1731,13 @@ fn capture_all_def_json(domains: &[String]) -> Value {
 /// transition implies: fresh full init (fresh VIC/CIA — the ONLY way to clear
 /// stale chip state, `cold_reset` can't), drop the checkpoint ring (the old
 /// timeline is defunct), clear the control-stop + re-arm the JAM edge, reset
-/// the flow tracker + monitor cursors, warm the boot to a stable screen, and
-/// flush the audio timeline. `Session::power_on` itself is a no-op if already
-/// powered, so a caller that forgot an intervening `do_power_off` can't build a
-/// second machine.
+/// the flow tracker + monitor cursors, and flush the audio timeline.
+/// `Session::power_on` itself is a no-op if already powered, so a caller that
+/// forgot an intervening `do_power_off` can't build a second machine.
+///
+/// Powering on does NOT run the machine (Spec 910 D8). It leaves a fresh machine at the
+/// reset vector, cycle 0, RUNNING: the run loop carries it from there, every cycle of it
+/// under the breakpoints, and the reply of the door says where the machine stands now.
 fn do_power_on(st: &mut State) {
     let roms = rom_dir();
     if let Err(e) = st.session.power_on(&roms) {
@@ -1718,15 +1748,17 @@ fn do_power_on(st: &mut State) {
         );
     }
     // Spec 815 — the fresh machine inherits the session's claim. Power-cycling a
-    // C128 does not hand you a C64, and a cartridge probes during the warm-up below.
+    // C128 does not hand you a C64, and a cartridge probes in its boot stub.
     st.session.machine.set_speed_profile(st.speed_profile);
     st.session.machine.set_u64_speed_table(st.u64_speed_table);
-    st.machine_generation += 1; // Spec 786 audio fix — signal the streaming loop to re-hook the fresh SID.
+    st.machine_generation += 1; // Spec 786 audio fix — signal the run loop to re-hook the fresh SID.
+    // The clock starts again at 0: the cap of a bounded run was a cycle of the machine that went.
+    end_bounded_run(st);
     // The audio epoch belongs HERE, not at the call sites. It was bumped by the
     // `session/power` RPC and NOT by the monitor `power` verb — same function, two
     // callers, one of them incomplete — so powering on from the monitor left every
-    // client following a stale epoch and the SID hook was never reinstalled. A
-    // client cannot be expected to know which door it came through.
+    // client following a stale epoch and the SID hook was never reinstalled. A client
+    // cannot be expected to know which door it came through.
     st.audio_epoch = st.audio_epoch.wrapping_add(1);
     st.checkpoint_ring.clear();
     st.ctrl_stop = None;
@@ -1735,35 +1767,33 @@ fn do_power_on(st: &mut State) {
     st.stream_broke_on_jam = false;
     st.mon.state.disasm_cursor = None;
     st.mon.state.mem_cursor = None;
-    if st.streaming_enabled {
-        // Spec 767 — LIVE A/V hub: STREAM the boot from cycle 0 so the user sees the WHOLE
-        // intro (VICE-parity). The synchronous 5M warm-boot (the `else` below) runs the cart
-        // cold-start + the first ~1s of the intro INVISIBLY, so the UI "renders ~1s too late".
-        // Instead leave the machine fresh + RUNNING and let the stream pump render from the
-        // first frame; the pump re-hooks the fresh SID (machine_generation bumped above) BEFORE
-        // its first advance, so audio is up from frame 1. Present the initial frame at once.
-        st.session.running = true;
-        st.force_present_frame = true;
-    } else {
-        // Headless (no hub) — warm the boot so tool ops (session/run) see a post-KERNAL
-        // machine (parity with the old cold-reset 5M run). Runs on the freshly-built RUNNING
-        // machine; a command-driven daemon never streams, so there is nothing to miss.
-        run_cycle_budget(&mut st.session, 5_000_000);
-    }
+    // A viewer sees the boot from cycle 0: present the initial frame at once.
+    st.force_present_frame = true;
     st.notify.broadcast("audio/flush", json!({ "session_id": st.session.id }));
     // Spec 808 — powering on RUNS the machine, and a fresh machine has no past: the
     // ring's anchors describe one that no longer exists. Both belong to the
-    // TRANSITION, not to whichever door was used. The comment at the session/power
-    // RPC already said the CLI must not set its own flag "because a second front-end
-    // would never have learned it" — and then the same seam was left between that
-    // RPC and the monitor verb, so `power on` from the monitor left the machine
-    // stopped with a stale timeline.
+    // TRANSITION, not to whichever door was used.
     st.session.running = true;
     transport_discard_timeline(st, "power on");
 }
 
+/// What a warm reset (the HW RESET line, RAM and media kept) leaves behind besides the
+/// machine itself: a control discontinuity — the last stop and the held FlowTracker frames
+/// are stale, a bounded run's cap named a cycle of the timeline that ended, and the monitor's
+/// cursors point at code that may be gone. Shared by the monitor's `reset` and `session/reset`
+/// so the two doors cannot leave the machine in different states.
+fn reset_housekeeping(st: &mut State) {
+    end_bounded_run(st);
+    st.ctrl_stop = None;
+    st.ctrl_frame += 1;
+    st.mon.flow.reset();
+    st.stream_broke_on_jam = false;
+    st.mon.state.disasm_cursor = None;
+    st.mon.state.mem_cursor = None;
+}
+
 /// Spec 786 — power the machine OFF (dead, no live state) + the same
-/// housekeeping minus the boot warm-up (a powered-off machine runs nothing).
+/// housekeeping (a powered-off machine runs nothing).
 fn do_power_off(st: &mut State) {
     // See do_power_on: the epoch belongs to the transition, not to the caller.
     st.audio_epoch = st.audio_epoch.wrapping_add(1);
@@ -1783,7 +1813,8 @@ fn do_power_off(st: &mut State) {
     }
     let _ = finalize_trace(st, true);
     st.session.power_off();
-    st.machine_generation += 1; // Spec 786 audio fix — signal the streaming loop to re-hook the fresh SID.
+    st.machine_generation += 1; // Spec 786 audio fix — signal the run loop to re-hook the fresh SID.
+    end_bounded_run(st);
     st.checkpoint_ring.clear();
     st.ctrl_stop = None;
     st.ctrl_frame += 1;
@@ -1809,9 +1840,8 @@ fn do_power_off(st: &mut State) {
 /// - does NOT clear the checkpoint ring — a restore navigates a timeline, it does
 ///   not end one (decision 2026-07-15: ring/scrub restore stays the fast field
 ///   path, so the ring must survive an undump);
-/// - does NOT run the 5M warm boot — the caller overwrites CPU+RAM+chips from the
-///   snapshot immediately after, so a warm-up (which would also run a cart's
-///   cold-boot intro) is pure waste.
+/// - does NOT run the machine — the caller overwrites CPU+RAM+chips from the
+///   snapshot immediately after.
 ///
 /// The registered cart/disk are transplanted through the cycle by
 /// `Session::power_off`/`power_on`; the subsequent `restore_runtime_checkpoint` is
@@ -1839,69 +1869,201 @@ fn power_cycle_for_restore(st: &mut State) {
     st.notify.broadcast("audio/flush", json!({ "session_id": st.session.id }));
 }
 
-/// How a budget run ended.
-enum BudgetRun {
-    Done,
-    /// An armed exec breakpoint or watchpoint (or an expansion-port device) stopped the run.
-    Halted {
-        /// `BreakRun::reason`: "breakpoint" (exec), "observer" (watchpoint), "device".
-        reason: &'static str,
-        pc: u16,
-        /// The numbered breakpoint at `pc` (0 when none matches, as `session/run` has always said).
-        num: u64,
-        registers: String,
-        cycles: u64,
-    },
+// ── The one run model (Spec 910 P5–P7) ──────────────────────────────────────────────
+//
+// A daemon's machine free-runs. It is advanced in ONE place, [`advance_frames`], by
+// whoever clocks it: the run-loop thread ([`streaming::start_run_loop`]) on a daemon, the
+// host's own pump (`session/tick`) on an embedded machine, or a request that waits for a
+// stop and advances the machine itself while it waits (an embedded state has no thread; a
+// handler that only has `&mut State` cannot give the lock back). A run may be given a stop
+// — after N cycles (`run_cap_clk`), at a breakpoint, at a watchpoint, at a JAM — and it
+// stops on that exact cycle or instruction, because the advance is clamped to the cycles
+// left. There is no second way to move the machine: no mode where it only moves when a
+// request pushes cycles.
+
+/// Advance the machine by `budget` cycles, in steps that never cross the next frame
+/// boundary and never pass the cap of a bounded run, and stop early on any stop.
+///
+/// This is the loop body. Each step is [`stream_debug_gated_advance`] (breakpoints,
+/// watchpoints, JAM, the trace firehose, the observer drain and the stop push). When a step
+/// crosses a frame boundary of MACHINE time (`clk / cycles_per_frame`) the per-frame work
+/// runs once — the checkpoint anchor and the recorder feed. Because the grid is machine
+/// time and a step ends on the first instruction boundary at or past its target, the anchors,
+/// the recorder and the stop cycle are the same however a client chunks its calls: one run
+/// of 200 frames, 200 runs of one, or seven uneven ones.
+///
+/// Returns the cycles advanced. Nothing here reads `running`: a paused machine advanced
+/// through a request (a monitor `until`, a re-sim for a picture) obeys the same stops.
+pub(crate) fn advance_frames(st: &mut State, budget: u64) -> u64 {
+    let start = st.session.machine.clk;
+    let seq0 = st.halt_seq;
+    loop {
+        let clk = st.session.machine.clk;
+        let spent = clk.wrapping_sub(start);
+        if spent >= budget {
+            break;
+        }
+        let cpf = st.session.machine.timing().cycles_per_frame.max(1);
+        let mut step = (budget - spent).min(cpf - clk % cpf);
+        if let Some(cap) = st.run_cap_clk {
+            step = step.min(cap.saturating_sub(clk));
+        }
+        if step > 0 {
+            stream_debug_gated_advance(st, step);
+            if st.session.machine.clk / cpf > clk / cpf && !st.frame_work_off {
+                stream_maybe_autocapture(st, st.session.machine.clk / cpf, cpf);
+                stream_maybe_feed_recorder(st, cpf);
+            }
+        }
+        maybe_autopause_capped_run(st);
+        if st.halt_seq != seq0 {
+            break;
+        }
+        if step == 0 {
+            // No cap to reach and no cycle left in a frame cannot both hold; do not spin.
+            break;
+        }
+    }
+    if st.halt_seq != seq0 {
+        end_bounded_run(st);
+    }
+    if !st.loop_thread {
+        // No thread keeps the wall-clock housekeeping going for an embedded machine, so the
+        // advance does it (cart / disk write-back debounce on the wall clock).
+        let now = now_ms();
+        stream_maybe_autopersist_cart(st, now);
+        stream_maybe_autopersist_disk(st, now);
+    }
+    st.session.machine.clk.wrapping_sub(start)
 }
 
-/// `session/run`'s way of spending a cycle budget: with exec breakpoints or watchpoints armed
-/// it steps past a breakpoint the PC is sitting on and runs with the observer registry,
-/// stopping at the first hit (the machine stays there, `ctrl_stop` records it); with none
-/// armed it is the plain trace-aware budget advance. One path, so `session/frame_probe`
-/// stops exactly where a run would.
-fn run_budget_honouring_breaks(st: &mut State, cycles: u64) -> BudgetRun {
+/// One iteration of the advance, as every host takes it: the transport owns the frame while
+/// it is rewound, otherwise the machine advances one frame (eight in warp). Returns the
+/// cycles advanced.
+pub(crate) fn loop_iteration(st: &mut State, warp: bool) -> u64 {
+    sync_model_identity(st);
+    let cpf = st.session.machine.timing().cycles_per_frame;
+    let budget = if warp { cpf * 8 } else { cpf };
+    if transport_tick(st, budget) {
+        0
+    } else {
+        advance_frames(st, budget)
+    }
+}
+
+/// The host's clock asks for `budget` cycles of a running machine (`session/tick`): the same
+/// advance, in frames, with the warp factor of the session — the host hands over real time
+/// and the machine runs it.
+fn loop_budget_run(st: &mut State, budget: u64) -> u64 {
+    sync_model_identity(st);
+    advance_frames(st, budget)
+}
+
+/// The bounded run is over — it hit a stop other than its own cap, or its cap. Drop the cap
+/// and give the pace back to the session that was in it before the run asked for another.
+fn end_bounded_run(st: &mut State) {
+    st.run_cap_clk = None;
+    if let Some(prev) = st.run_cap_restore_pace.take() {
+        st.pacing_mode = prev;
+    }
+}
+
+/// Start the machine running from where it stands, as a person pressing Go: a breakpoint or
+/// exec observer the PC is parked on is stepped past (else the run would stop at once on the
+/// address it halted at), the last stop is cleared, and the JAM edge is re-armed.
+///
+/// Doors that restart the machine from the reset vector (power on, reset) do NOT use this:
+/// a breakpoint on the very first instruction must stop it there.
+fn resume_running(st: &mut State) {
     {
         let MonitorSession { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } = &mut st.mon;
         sync_observers(breakpoints, dsl_observers, dsl_disabled, reg);
     }
-    if !observers_armed(&st.mon.observers) {
-        run_cycle_budget(&mut st.session, cycles);
-        return BudgetRun::Done;
+    let pc = st.session.machine.c64_core.reg_pc;
+    let on_exec_obs = st.mon.observers.exec_active && st.mon.observers.exec_watch[pc as usize] != 0;
+    if on_exec_obs || st.mon.breakpoints.entries.iter().any(|e| e.enabled && e.pc == pc) {
+        step_past_observed(st);
     }
-    // runtime-controller.ts:277 / ws-server.ts:855 — step PAST a bp the PC is
-    // sitting ON so the run doesn't immediately re-trip the same address.
-    {
-        let pc = st.session.machine.c64_core.reg_pc;
-        if st.mon.breakpoints.entries.iter().any(|e| e.enabled && e.pc == pc) {
-            step_past_observed(st);
+    st.session.running = true;
+    st.ctrl_stop = None;
+    st.stream_broke_on_jam = false;
+}
+
+/// The one bounded run (D7): start running, with `cycles` as a cap that pauses the machine
+/// on exactly that cycle, and `pace` (`"warp"` = as fast as possible) for the length of the
+/// run only. No `cycles` is an uncapped free-run. The run is the loop's: this returns at
+/// once, and the stop arrives as the `debug/paused` / `debug/stopped` push — or the caller
+/// parks on it with [`park_until_stopped`].
+fn start_run(st: &mut State, cycles: Option<u64>, pace: Option<&str>) {
+    // A run still carrying the pace of an earlier one gives it back before the next asks.
+    end_bounded_run(st);
+    resume_running(st);
+    if let Some(cyc) = cycles {
+        st.run_cap_clk = Some(st.session.machine.clk.saturating_add(cyc));
+        if let Some(pace) = pace {
+            let pace = canonical_pacing(pace).unwrap_or(pace);
+            if pace != st.pacing_mode {
+                st.run_cap_restore_pace = Some(st.pacing_mode.clone());
+                st.pacing_mode = pace.to_string();
+            }
         }
     }
-    let run = {
-        let State { session, mon, .. } = &mut *st;
-        let reg = &mut mon.observers;
-        let fm = full_machine_gate(session);
-        run_until_break(session, reg, cycles, fm)
-    };
+    st.ctrl_frame += 1;
+    let pacing_snap = json!({ "mode": st.pacing_mode, "ratio": st.pacing_ratio });
+    st.notify.broadcast("debug/running", json!({
+        "session_id": st.session.id,
+        "pacing": pacing_snap,
+    }));
+}
+
+/// Park the caller until the machine is no longer running, giving the State lock back to the
+/// run loop while it waits. An embedded state has no loop thread, so the parked caller
+/// advances the machine itself, with the same [`loop_iteration`] and at full speed.
+fn park_until_stopped(mut st: std::sync::MutexGuard<'_, State>) -> std::sync::MutexGuard<'_, State> {
+    let cv = Arc::clone(&st.loop_cv);
+    loop {
+        if !st.session.running {
+            return st;
+        }
+        if !st.loop_thread {
+            let warp = st.pacing_mode == "warp";
+            if loop_iteration(&mut st, warp) == 0 && st.session.running && st.transport.holds_the_machine() {
+                // The transport owns the frame; this run will not move until it lets go.
+                return st;
+            }
+            continue;
+        }
+        st = cv.wait_timeout(st, std::time::Duration::from_millis(20)).unwrap().0;
+    }
+}
+
+/// Run `cycles` of the machine from where it stands, from inside a handler that holds the
+/// lock and cannot give it back (a monitor verb, a re-sim): the advance itself, at full
+/// speed, honouring every stop. The machine's `running` flag is left as it was, except that
+/// a stop pauses it. Returns the cycles advanced.
+fn run_inline(st: &mut State, cycles: u64) -> u64 {
     {
-        let MonitorSession { breakpoints, observers: reg, .. } = &mut st.mon;
-        writeback_hits(breakpoints, reg);
+        let MonitorSession { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } = &mut st.mon;
+        sync_observers(breakpoints, dsl_observers, dsl_disabled, reg);
     }
-    let cycles_now = st.session.machine.clk;
-    if !run.halted {
-        return BudgetRun::Done;
+    advance_frames(st, cycles)
+}
+
+/// The stop a finished run left, as `session/run` has always reported it: the cycle, plus
+/// the breakpoint (`pc`, its number or 0, the register dump) or the JAM that stopped it.
+fn legacy_run_reply(st: &State) -> Value {
+    let cycles = st.session.machine.clk;
+    match &st.ctrl_stop {
+        Some(s) if s.reason == "breakpoint" => {
+            let num = st.mon.breakpoints.entries.iter().find(|e| e.pc == s.pc).map(|e| e.num).unwrap_or(0) as u64;
+            json!({
+                "c64Cycles": cycles,
+                "breakpoint": { "pc": s.pc as u64, "num": num, "registers": register_dump(&st.session) },
+            })
+        }
+        Some(s) if s.reason == "jam" => json!({ "c64Cycles": cycles, "jam": { "pc": s.pc as u64 } }),
+        _ => json!({ "c64Cycles": cycles }),
     }
-    // bpNumForAddr returns 0 (NOT null) when no numbered bp matches
-    // (runtime-controller.ts:238) — match the TS reply exactly.
-    let num = st
-        .mon.breakpoints
-        .entries
-        .iter()
-        .find(|e| e.pc == run.pc)
-        .map(|e| e.num)
-        .unwrap_or(0) as u64;
-    st.ctrl_stop = Some(CtrlStop { reason: "breakpoint", pc: run.pc, cycles: cycles_now });
-    let registers = register_dump(&st.session);
-    BudgetRun::Halted { reason: run.reason, pc: run.pc, num, registers, cycles: cycles_now }
 }
 
 fn run_cycle_budget(session: &mut Session, budget: u64) {
@@ -2076,7 +2238,6 @@ struct BreakRun {
     /// The observer name that fired (for breakpointId resolution).
     which: Option<String>,
     pc: u16,
-    cycles_elapsed: u64,
 }
 
 /// The VICE-style register dump line used by the monitor + the breakpoint_hit
@@ -2176,17 +2337,16 @@ fn triage_to_json(chain: &trx64_core::crash_triage::TriageChain) -> Value {
 }
 
 
-/// TRX64 feature-request — GUARDRAIL #1 (key-injection vs free-running core). When the
-/// machine is being advanced by the --stream background loop (`running &&
-/// streaming_enabled`), a request/response key-injection (session/key_down · key_up ·
-/// type) races the autonomous advance — keys queued relative to the current clock can be
-/// scanned past before the KERNAL reads them, so inputs are silently LOST. This was the
-/// big time-sink in the field session. Returns a NON-FATAL warning string to attach to
-/// the reply (the op still runs), or `None` when the core is paused (inputs land cleanly).
+/// TRX64 feature-request — GUARDRAIL #1 (key-injection vs free-running core). While the
+/// machine runs, the run loop advances it on its own, so a request/response key-injection
+/// (session/key_down · key_up · type) races the advance — keys queued relative to the
+/// current clock can be scanned past before the KERNAL reads them, so inputs are silently
+/// LOST. Returns a NON-FATAL warning string to attach to the reply (the op still runs), or
+/// `None` when the machine is paused (inputs land cleanly).
 fn free_run_input_warning(st: &State) -> Option<String> {
-    if st.session.running && st.streaming_enabled {
+    if st.session.running {
         Some(
-            "the machine is FREE-RUNNING (stream loop advancing) — injected key events \
+            "the machine is FREE-RUNNING (the run loop is advancing it) — injected key events \
              race the autonomous advance and may be LOST. Pause (debug/pause) before \
              key injection, or drive input via a scenario."
                 .to_string(),
@@ -2214,9 +2374,9 @@ fn maybe_emit_trap_rule(st: &State, pc: u16) -> Option<String> {
     Some(emit)
 }
 
-/// Default cycle budget for a synchronous breakpoint-gated run (the daemon is
-/// request/response; a real autonomous loop would be unbounded, so we cap at a
-/// generous ~10 frames of PAL cycles — enough to reach any boot-time bp).
+/// How long `debug/continue` waits for a stop before it answers `running`: 10 M cycles
+/// (~10 s of PAL), enough to reach any boot-time breakpoint. The machine is not stopped at
+/// the end of it — the run goes on; only the wait is over.
 const DEBUG_RUN_BUDGET: u64 = 10_000_000;
 
 /// T2.2 — Spec 754 §3.3e: drain observer side-effects accumulated during a run
@@ -2330,175 +2490,56 @@ fn drain_and_broadcast_observer_log(st: &mut State) {
     }
 }
 
-/// Drive `debug/run` / `debug/continue`. When breakpoints/watchpoints are armed,
-/// SEGMENT-RUN the machine until one trips (or the budget exhausts) and return the
-/// real stop info. When none are armed, preserve the historical immediate
-/// `running` return (no advance) so the zero-cost / no-debug contract is unchanged.
-fn run_debug_control(id: Value, st: &mut State, frame: u64, _is_continue: bool) -> Response {
+/// Finish `debug/continue`. The run itself is the loop's: when breakpoints/watchpoints are
+/// armed, wait for the machine to stop at one (or to have run [`DEBUG_RUN_BUDGET`] cycles, which
+/// is no stop — the machine runs on and the reply says `running`), parked on the run loop with
+/// the State lock handed back to it. When none are armed there is nothing to wait for and the
+/// reply is the immediate `running`, the machine unchanged.
+fn run_debug_control(id: Value, mut st: std::sync::MutexGuard<'_, State>, frame: u64) -> Response {
     {
         let MonitorSession { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } =
             &mut st.mon;
         sync_observers(breakpoints, dsl_observers, dsl_disabled, reg);
     }
-
-    if !observers_armed(&st.mon.observers) {
-        // No debug gate: historical behavior — report running, machine unchanged.
-        let bps = st.mon.breakpoints.list_vice_json();
-        let pc = st.session.machine.c64_core.reg_pc as u64;
-        let cycles = st.session.machine.clk;
-        let (pacing_mode, pacing_ratio, control_owner) =
-            (st.pacing_mode.clone(), st.pacing_ratio, st.control_owner.clone());
-        return Response::ok(id, json!({
-            "runState": "running",
-            "pacing": { "mode": pacing_mode, "ratio": pacing_ratio },
-            "pc": pc,
-            "cycles": cycles,
-            "frame": frame,
-            "breakpoints": bps,
-            "stop": null,
-            "controlOwner": control_owner
-        }));
-    }
-
-    // runtime-controller.ts:277 stepPastCurrentBreakpoint — if the PC currently sits ON
-    // an enabled exec breakpoint, advance one instruction first so a run/continue does
-    // not immediately re-trip the same address. TS calls this on BOTH run() and
-    // continue() (run() unconditionally) — so it is PC-based, not continue-only.
-    // (Without this, `bk <pc>` at the current PC made every debug/run halt instantly =
-    // a perma-pause from the user's perspective.)
-    {
-        let pc = st.session.machine.c64_core.reg_pc;
-        if st.mon.breakpoints.entries.iter().any(|e| e.enabled && e.pc == pc) {
-            step_past_observed(st);
+    if observers_armed(&st.mon.observers) {
+        let target = st.session.machine.clk.saturating_add(DEBUG_RUN_BUDGET);
+        let cv = Arc::clone(&st.loop_cv);
+        while st.session.running && st.session.machine.clk < target {
+            if st.loop_thread {
+                st = cv.wait_timeout(st, std::time::Duration::from_millis(20)).unwrap().0;
+            } else {
+                let warp = st.pacing_mode == "warp";
+                loop_iteration(&mut st, warp);
+            }
         }
+        // T2.2 — Spec 754 §3.3e: drain observer side-effects accumulated this run.
+        drain_and_broadcast_observer_log(&mut st);
     }
-
-    // Split the borrow of `st` so the registry can be passed as the core observer
-    // while the session runs; scope it so the fields free up afterward.
-    let run = {
-        let State { session, mon, .. } = &mut *st;
-        let reg = &mut mon.observers;
-        let fm = full_machine_gate(session);
-        run_until_break(session, reg, DEBUG_RUN_BUDGET, fm)
-    };
-    {
-        let MonitorSession { breakpoints, observers: reg, .. } = &mut st.mon;
-        writeback_hits(breakpoints, reg);
-    }
-
-    // T2.2 — Spec 754 §3.3e: drain observer side-effects accumulated this chunk
-    // (runtime-controller.ts:697-725). Done on every path (halt + budget-exhausted)
-    // so nothing is lost, matching the TS tick() drain which runs before the halt check.
-    drain_and_broadcast_observer_log(st);
-
     let bps = st.mon.breakpoints.list_vice_json();
     let cycles = st.session.machine.clk;
-    if run.halted {
-        st.session.running = false;
-        // Resolve a numeric breakpointId from the numbered bp store by PC, if any.
-        let bp_num = st
-            .mon.breakpoints
-            .entries
-            .iter()
-            .find(|e| e.pc == run.pc)
-            .map(|e| e.num);
-        st.ctrl_stop = Some(CtrlStop { reason: "breakpoint", pc: run.pc, cycles });
-        let mut stop = json!({
-            "reason": run.reason,
-            "pc": run.pc as u64,
-            "cycles": cycles,
-        });
-        if let Some(n) = bp_num {
-            stop["breakpointId"] = json!(n as u64);
-        }
-        if let Some(name) = &run.which {
-            stop["breakpoint"] = json!(name);
-        }
-        // Server-PUSH the halt notification (runtime-controller.ts:755-784). An exec
-        // breakpoint emits `debug/breakpoint_hit` with { session_id, pc, num, cycles,
-        // registers }; a load/store watchpoint emits `debug/observer_hit` with
-        // { session_id, pc, cycles, observer, message, registers }. The push reaches
-        // every connected client (the request reply below is the same halt, but only
-        // the caller sees that — a passive client learns of the halt only via this).
-        let registers = register_dump(&st.session);
-        if run.reason == "observer" {
-            st.notify.broadcast("debug/observer_hit", json!({
-                "session_id": st.session.id,
-                "pc": run.pc as u64,
-                "cycles": cycles,
-                "observer": run.which.clone(),
-                "message": Value::Null,
-                "registers": registers.clone(),
-            }));
-        } else {
-            st.notify.broadcast("debug/breakpoint_hit", json!({
-                "session_id": st.session.id,
-                "pc": run.pc as u64,
-                // bpNumForAddr (runtime-controller.ts:238) returns 0 (NOT null) when
-                // no numbered breakpoint matches the halt address — match that.
-                "num": bp_num.unwrap_or(0) as u64,
-                "cycles": cycles,
-                "registers": registers.clone(),
-            }));
-            // TRX64 feature-request #4 — if a project on-trap rule covers this halt PC,
-            // auto-emit its decoded diagnostic into the observer-log stream.
-            maybe_emit_trap_rule(st, run.pc);
-        }
-        // Spec 771.2 — runtime-controller.ts:768/782 ALSO server-PUSHes debug/stopped
-        // alongside the specific hit, so a passive UI freezes the run-state on any halt.
-        st.notify.broadcast("debug/stopped", json!({
-            "session_id": st.session.id,
-            "stop": stop.clone(),
-            "registers": registers,
-        }));
-        let (pacing_mode, pacing_ratio, control_owner) =
-            (st.pacing_mode.clone(), st.pacing_ratio, st.control_owner.clone());
-        Response::ok(id, json!({
-            "runState": "paused",
-            "pacing": { "mode": pacing_mode, "ratio": pacing_ratio },
-            "pc": run.pc as u64,
-            "cycles": cycles,
-            "frame": frame,
-            "breakpoints": bps,
-            "stop": stop,
-            "controlOwner": control_owner
-        }))
-    } else {
-        // Spec 764 — a KIL/JAM during this run jams the CPU (PC frozen) without a bp
-        // hit; observe it via the shared helper (freeze + debug/stopped reason="jam")
-        // so a synchronous continue halts here instead of looping the advance. Same
-        // jam-halt path every other driver uses.
-        if check_and_handle_jam(st) {
-            let pc = jammed_pc(st);
-            let cycles = st.session.machine.clk;
-            let (pacing_mode, pacing_ratio, control_owner) =
-                (st.pacing_mode.clone(), st.pacing_ratio, st.control_owner.clone());
-            return Response::ok(id, json!({
-                "runState": "paused",
-                "pacing": { "mode": pacing_mode, "ratio": pacing_ratio },
-                "pc": pc as u64,
-                "cycles": cycles,
-                "frame": frame,
-                "breakpoints": bps,
-                "stop": { "reason": "jam", "pc": pc as u64, "cycles": cycles },
-                "controlOwner": control_owner
-            }));
-        }
-        // Budget exhausted without a hit: the machine advanced; report running.
-        let pc = st.session.machine.c64_core.reg_pc as u64;
-        let (pacing_mode, pacing_ratio, control_owner) =
-            (st.pacing_mode.clone(), st.pacing_ratio, st.control_owner.clone());
-        Response::ok(id, json!({
-            "runState": "running",
-            "pacing": { "mode": pacing_mode, "ratio": pacing_ratio },
-            "pc": pc,
-            "cycles": cycles,
-            "frame": frame,
-            "breakpoints": bps,
-            "stop": null,
-            "controlOwner": control_owner
-        }))
-    }
+    let (pacing_mode, pacing_ratio, control_owner) =
+        (st.pacing_mode.clone(), st.pacing_ratio, st.control_owner.clone());
+    let run_state = if st.session.running { "running" } else { "paused" };
+    // The stop is what ended the run: the hit's own record (reason "breakpoint" or
+    // "observer", the numbered breakpoint, the observer's name) when a hit stopped it.
+    let stop = match &st.ctrl_stop {
+        Some(s) if !st.session.running => match &st.last_halt_stop {
+            Some(h) if h["pc"] == json!(s.pc as u64) && h["cycles"] == json!(s.cycles) => h.clone(),
+            _ => json!({ "reason": s.reason, "pc": s.pc as u64, "cycles": s.cycles }),
+        },
+        _ => Value::Null,
+    };
+    let pc = st.session.machine.c64_core.reg_pc as u64;
+    Response::ok(id, json!({
+        "runState": run_state,
+        "pacing": { "mode": pacing_mode, "ratio": pacing_ratio },
+        "pc": pc,
+        "cycles": cycles,
+        "frame": frame,
+        "breakpoints": bps,
+        "stop": stop,
+        "controlOwner": control_owner
+    }))
 }
 
 /// Spec 764 — the SINGLE JAM (KIL) halt-on-jam implementation every run driver calls
@@ -2509,9 +2550,9 @@ fn run_debug_control(id: Value, st: &mut State, frame: u64, _is_continue: bool) 
 /// TS reference cleanly HALTS instead (runtime-controller.ts:791-807): runState→paused,
 /// PC frozen at the KIL, debug/stopped reason="jam" (the UI red border).
 ///
-/// This helper generalizes the `--stream` jam-halt (previously inline in
+/// This helper generalizes the run loop's jam-halt (previously inline in
 /// [`stream_debug_gated_advance`]) so EVERY run driver — `session/run`, `debug/run`
-/// (+ `debug/continue`), the monitor `g`/go path, AND the stream loop — observes the
+/// (+ `debug/continue`), the monitor `g`/go path, AND the run loop — observes the
 /// jam and halts identically: there is ONE jam-halt implementation, not two.
 ///
 /// Behavior (1:1 with the prior inline stream block):
@@ -2540,9 +2581,10 @@ pub(crate) fn check_and_handle_jam(st: &mut State) -> bool {
         return false;
     }
     // A jammed CPU makes no progress: FREEZE so a free-run driver stops re-advancing
-    // (the stream loop gates on `running`; the pump clears its host run flag on the
+    // (the run loop gates on `running`; the pump clears its host run flag on the
     // jam signal) and the picture freezes on the last frame, 1:1 with TS runState→paused.
     st.session.running = false;
+    st.halt_seq += 1;
     if !st.stream_broke_on_jam {
         st.stream_broke_on_jam = true;
         // The PC frozen at the KIL is on the core that actually ran (and jammed).
@@ -2608,32 +2650,29 @@ fn jammed_pc(st: &State) -> u16 {
     }
 }
 
-/// Advance the machine by `budget` cycles for ONE stream-loop frame, but BREAKPOINT /
-/// OBSERVER / JAM-aware — the per-frame mirror of the TS controller `tick()`
-/// (runtime-controller.ts:670-806). Under `--stream` the stream loop is the SOLE
-/// machine driver; a breakpoint set on a free-RUNNING machine never halted because
-/// the loop advanced with a bare `run_for_full` (no gates). This helper LIFTS the
-/// bp/observer/JAM-halt + broadcast behavior out of the one-shot [`run_debug_control`]
-/// into the per-frame path:
+/// One step of the advance ([`advance_frames`] calls it with at most a frame of cycles):
+/// advance the machine by `budget` cycles, BREAKPOINT / OBSERVER / JAM-aware.
 ///
-/// * No breakpoints/watchpoints armed → plain full-machine advance (byte-identical
-///   to the historical `run_for_full`; the gates monomorphize away). This is the
-///   common case, so the no-debug stream is unchanged.
-/// * Armed → [`run_until_break`] self-halts at the first REAL hit; on a hit we set
-///   the session NOT running (freeze the picture), set the stop reason, server-PUSH
-///   `debug/breakpoint_hit`/`debug/observer_hit` AND `debug/stopped` (payload shapes
-///   1:1 with runtime-controller.ts:767/782 and the one-shot above), and drain
-///   observer side-effects — exactly as the one-shot does.
-/// * JAM (Spec 764) — a jammed CPU keeps cycling clk with PC frozen, so neither path
-///   aborts on it; detect it AFTER the advance, halt (running=false) and drop into
-///   the monitor ONCE per episode via `debug/stopped` (reason "jam"), re-arming the
-///   edge when the jam clears (runtime-controller.ts:791-807).
+/// * No breakpoints/watchpoints armed → plain advance, on the path the session's bus gate
+///   chose (the full machine for every booted session; the isolated core only for a declared
+///   exerciser), with the trace firehose fed when a trace is active.
+/// * Armed → [`run_until_break`] self-halts at the first REAL hit; on a hit we set the
+///   session NOT running (the loop stops advancing, the picture freezes), set the stop reason,
+///   server-PUSH `debug/breakpoint_hit`/`debug/observer_hit` AND `debug/stopped`, and drain
+///   observer side-effects.
+/// * JAM (Spec 764) — a jammed CPU keeps cycling clk with PC frozen, so neither path aborts
+///   on it; detect it AFTER the advance, halt (running=false) and drop into the monitor ONCE
+///   per episode via `debug/stopped` (reason "jam").
 ///
-/// Returns the number of C64 cycles actually advanced this frame, so the caller can
-/// drive audio over exactly the window that ran (a halt may stop mid-frame).
+/// Every stop bumps `halt_seq`, so the caller knows the run ended even on a machine whose
+/// `running` flag it never set. A breakpoint the PC is parked on is the business of whoever
+/// starts the run ([`resume_running`]), not of a step: a step that ends on a breakpoint
+/// address halts there, because the core checks the breakpoint before the budget.
+///
+/// Returns the number of C64 cycles actually advanced, so the caller can drive audio over
+/// exactly the window that ran (a halt may stop mid-frame).
 pub(crate) fn stream_debug_gated_advance(st: &mut State, budget: u64) -> u32 {
-    // Re-sync the observer registry from the bp surfaces (preserving live counts),
-    // exactly like the one-shot run_debug_control entry.
+    // Re-sync the observer registry from the bp surfaces (preserving live counts).
     {
         let MonitorSession { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } =
             &mut st.mon;
@@ -2642,24 +2681,20 @@ pub(crate) fn stream_debug_gated_advance(st: &mut State, budget: u64) -> u32 {
 
     let clk_before = st.session.machine.c64_core.clk;
 
-    if !observers_armed(&st.mon.observers) {
-        // ── No debug gate. When a trace is ACTIVE, the free-run advance must FEED the
-        // firehose every frame (audit background-workers-async-5): the c64re tick()
-        // drains traceRun once per completed frame so its worker writes the
-        // .c64retrace authority (runtime-controller.ts:869-874). TRX64's stream loop
-        // previously advanced with a bare NullSink, so a trace started during a
-        // --stream free-run recorded NOTHING. `run_cycle_budget` is the SAME trace-
-        // aware advance path the one-shot session/run uses — it attaches a real
-        // TracingObserver with the trace's channels and appends the frame's events to
-        // session.trace.buf, which spills to the .c64retrace as it grows.
-        if st.session.trace.is_some() {
+    let probing = st.access_probe.is_some();
+    if probing && !full_machine_gate(&st.session) {
+        // A declared exerciser on the isolated core: the access map watches that bus itself.
+        let State { session, access_probe, .. } = &mut *st;
+        if let Some(p) = access_probe.as_mut() {
+            session.machine.run_for(budget, p);
+        }
+    } else if !observers_armed(&st.mon.observers) && !probing {
+        // No debug gate. A trace in progress is fed every step through `run_cycle_budget`
+        // (it attaches a TracingObserver with the trace's channels and appends the events to
+        // `session.trace.buf`, which spills to the .c64retrace as it grows).
+        if st.session.trace.is_some() || !full_machine_gate(&st.session) {
             run_cycle_budget(&mut st.session, budget);
         } else {
-            // No trace: the historical plain full-machine advance. KEEP this as
-            // `run_for_full` UNCONDITIONALLY (NOT run_cycle_budget's no-trace path,
-            // which routes an exerciser onto the cpu6510-isolated `run_for`) —
-            // the JAM auto-break below reads `c64_core.is_jammed`, which only the full
-            // path drives. Byte-identical to the pre-trace stream path.
             let mut sink = NullSink;
             st.session
                 .machine
@@ -2668,36 +2703,14 @@ pub(crate) fn stream_debug_gated_advance(st: &mut State, budget: u64) -> u32 {
         // Spec 873 — a folder device's refusals reach the clients on the free run too.
         drain_folder_events(st);
     } else {
-        // runtime-controller.ts:277 stepPastCurrentBreakpoint — if the PC currently
-        // sits ON an enabled exec breakpoint (e.g. we just halted there and the user
-        // resumed by leaving it running), advance one instruction first so this
-        // frame's advance does not immediately re-trip the same address.
-        {
-            let pc = st.session.machine.c64_core.reg_pc;
-            if st.mon.breakpoints.entries.iter().any(|e| e.enabled && e.pc == pc) {
-                step_past_observed(st);
-            }
-        }
         // ── Armed: bp/observer-gated segment run, self-halting at the first hit. ──
         // The bus choice is [`full_machine_gate`], as on every other advance path — and
-        // arming a breakpoint or an observer must not change it. It used to, because the
-        // gate read `session.injected`: one monitor `wr`/`a`/`r <reg>=` on a booted,
-        // disk-mounted session re-classified it as a bare ISA micro-exerciser, so the
-        // frame that armed an observer dropped onto the chipless isolated core while the
-        // unarmed frame before it ran the full machine. The gate now reads only the
-        // `exerciser` marker that `session/create` sets (and attached hardware), so a
-        // real session stays full-machine either way.
-        //
-        // The unarmed branch above still hardcodes `run_for_full` where this consults the
-        // gate. They agree for every real session (assembled ROMs + media); they part only
-        // on a ROM-less or media-less exerciser, where the unarmed branch is the odd one
-        // out — it needs the full path for the Spec 764 JAM detector (`c64_core.is_jammed`
-        // is only driven there).
+        // arming a breakpoint or an observer must not change it.
         let run = {
-            let State { session, mon, .. } = &mut *st;
-        let reg = &mut mon.observers;
+            let State { session, mon, access_probe, .. } = &mut *st;
+            let reg = &mut mon.observers;
             let fm = full_machine_gate(session);
-            run_until_break(session, reg, budget, fm)
+            run_until_break(session, reg, budget, fm, access_probe)
         };
         {
             let MonitorSession { breakpoints, observers: reg, .. } = &mut st.mon;
@@ -2708,10 +2721,11 @@ pub(crate) fn stream_debug_gated_advance(st: &mut State, budget: u64) -> u32 {
         drain_and_broadcast_observer_log(st);
 
         if run.halted {
-            // FREEZE: the stream loop gates the advance on `running`, so clearing it
-            // freezes the picture on the last presented frame (and silences audio),
-            // 1:1 with the TS tick setting runState→paused.
+            // FREEZE: the loop gates the advance on `running`, so clearing it freezes the
+            // picture on the last presented frame (and silences audio), 1:1 with the TS tick
+            // setting runState→paused.
             st.session.running = false;
+            st.halt_seq += 1;
             let cycles = st.session.machine.clk;
             st.ctrl_stop = Some(CtrlStop { reason: "breakpoint", pc: run.pc, cycles });
             let bp_num = st
@@ -2731,6 +2745,7 @@ pub(crate) fn stream_debug_gated_advance(st: &mut State, budget: u64) -> u32 {
             if let Some(name) = &run.which {
                 stop["breakpoint"] = json!(name);
             }
+            st.last_halt_stop = Some(stop.clone());
             let registers = register_dump(&st.session);
             // The specific hit (exec → breakpoint_hit, watchpoint → observer_hit),
             // payload 1:1 with runtime-controller.ts:760-781 + the one-shot above.
@@ -2809,12 +2824,13 @@ fn step_past_observed(st: &mut State) {
     }
     reg.set_env(observers::CpuSnapshot::from_machine(&session.machine));
     let aw = reg.access_watch_owned();
-    let _ = run_full_segment(session, reg, 999_999, 1, None, aw.as_deref(), None);
+    let _ = run_full_segment(session, reg, 999_999, 1, None, aw.as_deref(), None, &mut None);
 }
 
 /// One full-machine segment of [`run_until_break`]: the registry drives the core gates
 /// (`bp_ref` exec breakpoints, `aw_ref` load/store watch), tee'd with a per-segment
-/// `TracingObserver` while a trace is active so the firehose keeps recording.
+/// `TracingObserver` while a trace is active so the firehose keeps recording, and with the
+/// bus-access tracker of a running `debug/memory_access_map` (`probe`).
 #[allow(clippy::too_many_arguments)]
 fn run_full_segment(
     session: &mut Session,
@@ -2824,22 +2840,31 @@ fn run_full_segment(
     bp_ref: Option<&std::collections::HashSet<u16>>,
     aw_ref: Option<&[u8; 0x10000]>,
     trace_channels: Option<TraceChannels>,
+    probe: &mut Option<MemoryAccessObserver>,
 ) -> trx64_core::RunStop {
-    if let Some(ch) = trace_channels {
-        // Trace-aware: tee the registry with a per-segment TracingObserver, then
-        // append this segment's events to the trace buffer.
-        let mut tracing = TracingObserver::with_channels(FrameSink::events_only(), ch);
-        let s = {
-            let mut tee = trx64_core::TeeObserver::new(&mut *reg, &mut tracing);
+    macro_rules! go {
+        ($obs:expr) => {
             session.machine.run_for_full_capped_dbg(
                 seg_budget,
                 max_instr,
                 bp_ref,
                 None,
                 aw_ref,
-                &mut tee,
+                $obs,
                 |_, _, _, _, _, _, _| {},
             )
+        };
+    }
+    if let Some(ch) = trace_channels {
+        // Trace-aware: tee the registry with a per-segment TracingObserver, then
+        // append this segment's events to the trace buffer.
+        let mut tracing = TracingObserver::with_channels(FrameSink::events_only(), ch);
+        let s = {
+            let mut tee = trx64_core::TeeObserver::new(&mut *reg, &mut tracing);
+            match probe.as_mut() {
+                Some(p) => go!(&mut trx64_core::TeeObserver::new(&mut tee, p)),
+                None => go!(&mut tee),
+            }
         };
         if let Some(t) = session.trace.as_mut() {
             t.event_count += tracing.event_count;
@@ -2850,15 +2875,10 @@ fn run_full_segment(
         }
         s
     } else {
-        session.machine.run_for_full_capped_dbg(
-            seg_budget,
-            max_instr,
-            bp_ref,
-            None,
-            aw_ref,
-            reg,
-            |_, _, _, _, _, _, _| {},
-        )
+        match probe.as_mut() {
+            Some(p) => go!(&mut trx64_core::TeeObserver::new(&mut *reg, p)),
+            None => go!(reg),
+        }
     }
 }
 
@@ -2873,7 +2893,7 @@ fn run_full_segment(
 /// `access_watch` table; the registry's `on_access` sets `halt_requested`, honored
 /// at the next boundary (RunStop::Observer).
 /// `full_machine` is passed IN, not re-derived, because the callers do not all agree:
-/// the stream loop advances the product machine UNCONDITIONALLY (see
+/// the run loop advances the product machine UNCONDITIONALLY (see
 /// [`stream_debug_gated_advance`]), while the one-shot/scenario callers follow
 /// [`full_machine_gate`]. Deriving it here made the armed stream frame pick a different
 /// machine than the unarmed one right next to it — the observers-wreck-everything bug.
@@ -2882,6 +2902,7 @@ fn run_until_break(
     reg: &mut observers::ObserverRegistry,
     cycle_budget: u64,
     full_machine: bool,
+    probe: &mut Option<MemoryAccessObserver>,
 ) -> BreakRun {
     let start_clk = session.machine.clk;
     reg.clear_halt();
@@ -2926,7 +2947,6 @@ fn run_until_break(
                 reason: "budget",
                 which: None,
                 pc: session.machine.c64_core.reg_pc,
-                cycles_elapsed: elapsed,
             };
         }
         let seg_budget = (cycle_budget - elapsed).min(if seg_cap == u64::MAX {
@@ -2949,7 +2969,7 @@ fn run_until_break(
         let bp_ref = bp_set.as_ref();
 
         let stop = if full_machine {
-            run_full_segment(session, reg, seg_budget, max_instr, bp_ref, aw_ref, trace_channels)
+            run_full_segment(session, reg, seg_budget, max_instr, bp_ref, aw_ref, trace_channels, probe)
         } else {
             // CPU-isolated path (no full machine). The dbg entry point lives on the
             // full SC path only; for the isolated path we step + check the bp set
@@ -2977,7 +2997,6 @@ fn run_until_break(
                         reason: "breakpoint",
                         which,
                         pc,
-                        cycles_elapsed: session.machine.clk.wrapping_sub(start_clk),
                     };
                 }
                 // Cond false or ignored: step one instruction PAST the bp PC so the
@@ -2990,7 +3009,7 @@ fn run_until_break(
                 // observer (`obs .. when exec .. do log`) sits on: `STA $D030` under an
                 // exec log was invisible to `obs .. when store d030`.
                 if full_machine {
-                    let s = run_full_segment(session, reg, 999_999, 1, None, aw_ref, trace_channels);
+                    let s = run_full_segment(session, reg, 999_999, 1, None, aw_ref, trace_channels, probe);
                     if matches!(s, trx64_core::RunStop::Observer) {
                         let which = reg.last_halt.as_ref().map(|h| h.name.clone());
                         return BreakRun {
@@ -2998,7 +3017,6 @@ fn run_until_break(
                             reason: "observer",
                             which,
                             pc: session.machine.c64_core.reg_pc,
-                            cycles_elapsed: session.machine.clk.wrapping_sub(start_clk),
                         };
                     }
                 } else {
@@ -3014,7 +3032,6 @@ fn run_until_break(
                     reason: "observer",
                     which,
                     pc,
-                    cycles_elapsed: session.machine.clk.wrapping_sub(start_clk),
                 };
             }
             trx64_core::RunStop::Device => {
@@ -3025,7 +3042,6 @@ fn run_until_break(
                     reason: "device",
                     which: None,
                     pc,
-                    cycles_elapsed: session.machine.clk.wrapping_sub(start_clk),
                 };
             }
             trx64_core::RunStop::CycleBudget | trx64_core::RunStop::Completed => {
@@ -3037,7 +3053,6 @@ fn run_until_break(
                         reason: "budget",
                         which: None,
                         pc: session.machine.c64_core.reg_pc,
-                        cycles_elapsed: 0,
                     };
                 }
             }
@@ -3565,7 +3580,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             let (width, height, rgba, bytes) = monitor_bitmap_decode(&read, addr, w, h, &mode);
             let png = rgba_to_png(width, height, &rgba);
             let file = resolve_fs_path(&format!("bitmap_{addr:04x}_{mode}_{w}x{h}.png"));
-            if let Err(e) = std::fs::write(&file, &png) {
+            if let Err(e) = write_output(&file, &png) {
                 return Err(format!("bitmap: {e}"));
             }
             Ok(format!(
@@ -3574,11 +3589,10 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
         }
 
         // ---- Go / resume (§3.1). g [addr] / x ; enters the run-loop. ---------
-        // TRX64 daemon is request/response with no autonomous loop. `g` mirrors
-        // the TS BUG-036 contract shape: set PC (if given), step past a parked
-        // breakpoint, mark running, and report ".C:PC (running — Pause to halt)".
-        // The actual advance happens on the next debug/run (the run-loop), exactly
-        // like TS where `ctrl.continue()` flips run-state and the tick loop runs.
+        // `g` mirrors the TS BUG-036 contract shape: set PC (if given), step past a
+        // parked breakpoint, mark running, and report ".C:PC (running — Pause to halt)".
+        // The advance is the run loop's, exactly like TS where `ctrl.continue()` flips
+        // run-state and the tick loop runs.
         "g" | "x" => {
             if op == "g" {
                 if let Some(addr) = parse_addr(toks.get(1)) {
@@ -3604,8 +3618,8 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             st.ctrl_stop = None;
             // Spec 764 — `g`/`x` is a fresh run intent: re-arm the JAM edge so a
             // still-jammed machine asked to go re-broadcasts debug/stopped reason=jam
-            // (the shared helper observes it on the next advance — stream loop under
-            // --stream, or the CLI pump's session/run).
+            // (the shared helper observes it on the next advance — the run loop, or the
+            // CLI pump's session/tick).
             st.stream_broke_on_jam = false;
             Ok(format!(
                 "continuing at .C:{:04x} (running — Pause to halt)",
@@ -4698,16 +4712,9 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                     // warm = HW RESET line: $FCE2 via $FFFC, RAM + media preserved.
                     st.session.warm_reset();
                     st.session.machine.keyboard.clear();
-                    run_cycle_budget(&mut st.session, 5_000_000);
-                    st.ctrl_stop = None;
-                    st.ctrl_frame += 1;
-                    st.mon.flow.reset();
-                    st.stream_broke_on_jam = false;
-                    st.mon.state.disasm_cursor = None;
-                    st.mon.state.mem_cursor = None;
-                    // A real machine reset boots and RUNS; leaving it frozen at the
-                    // reset vector was the cockpit's job to undo, and the cockpit is a
-                    // pipe now.
+                    reset_housekeeping(st);
+                    // A real machine reset boots and RUNS: the machine stands at the reset
+                    // vector, running, and the run loop carries it from there (Spec 910 D8).
                     st.session.running = true;
                     Ok(format!(
                         "RESET (warm) \u{2014} $FCE2 @ PC=${:04X}, running.",
@@ -5108,7 +5115,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 if let Some(parent) = std::path::Path::new(&path).parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                match std::fs::write(&path, &bytes) {
+                match write_output(&path, &bytes) {
                     Ok(()) => {
                         // formatDumpSummary (= snapshot-persistence.ts:271-281).
                         let media = if media_summary.is_empty() {
@@ -5232,7 +5239,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 if let Some(parent) = std::path::Path::new(&target).parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                return match std::fs::write(&target, &img) {
+                return match write_output(&target, &img) {
                     Ok(()) => Ok(format!("savecrt: {} bytes -> {target}", img.len())),
                     Err(e) => Err(format!("savecrt: write error: {e}")),
                 };
@@ -5245,8 +5252,8 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 Ok(p) => p,
                 Err(e) => return Err(format!("savecrt: {e}")),
             };
-            match std::fs::write(&path, &img) {
-                Ok(()) => Ok(format!("savecrt: {} bytes -> {path}", img.len())),
+            match write_medium(&path, &img) {
+                Ok(written) => Ok(format!("savecrt: {} bytes -> {written}", img.len())),
                 Err(e) => Err(format!("savecrt: write error: {e}")),
             }
         }
@@ -5276,7 +5283,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 Some(f) => f,
                 None => return Err("swapcrt: usage: swapcrt \"<new.crt>\"".into()),
             };
-            let p = resolve_fs_path(&f);
+            let p = scratch::open_medium(&resolve_fs_path(&f)).map_err(|e| format!("swapcrt: {e}"))?;
             if !std::path::Path::new(&p).exists() {
                 return Err(format!("swapcrt: no such file: {p}"));
             }
@@ -5299,8 +5306,8 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 let clk = m.clk;
                 if let Ok(old_path) = host_write_target(&old_backing) {
                     if let Some(img) = m.cartridge.as_mut().and_then(|c| c.crt_image(clk)) {
-                        if std::fs::write(&old_path, &img).is_ok() {
-                            lines.push(format!("persisted old cart: {} bytes -> {old_path}", img.len()));
+                        if let Ok(written) = write_medium(&old_path, &img) {
+                            lines.push(format!("persisted old cart: {} bytes -> {written}", img.len()));
                         }
                     }
                 }
@@ -5450,7 +5457,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             let mut bytes: Vec<u8> = vec![(a1 & 0xff) as u8, ((a1 >> 8) & 0xff) as u8];
             for a in a1..=a2 { bytes.push(st.session.machine.ram[a as usize]); }
             let target = resolve_fs_path(&f);
-            match std::fs::write(&target, &bytes) {
+            match write_output(&target, &bytes) {
                 Ok(()) => {
                     let bn = std::path::Path::new(&f).file_name()
                         .map(|n| n.to_string_lossy().to_string()).unwrap_or(f.clone());
@@ -5510,7 +5517,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             let mut bytes: Vec<u8> = Vec::new();
             for a in a1..=a2 { bytes.push(st.session.machine.ram[a as usize]); }
             let target = resolve_fs_path(&f);
-            match std::fs::write(&target, &bytes) {
+            match write_output(&target, &bytes) {
                 Ok(()) => {
                     let bn = std::path::Path::new(&f).file_name()
                         .map(|n| n.to_string_lossy().to_string()).unwrap_or(f.clone());
@@ -5602,7 +5609,7 @@ fn build_trace_from_ring(
     // Remove any stale sibling .duckdb so the reader rebuilds the index from THIS fresh
     // .c64retrace (the indexer only builds when the .duckdb is absent).
     let _ = std::fs::remove_file(&duckdb_path);
-    std::fs::write(&retrace_path, &bytes)
+    write_output(&retrace_path, &bytes)
         .map_err(|e| format!("write {}: {e}", retrace_path.display()))?;
 
     // Point the CURRENT trace store at this dump so the monitor reads it immediately.
@@ -6253,45 +6260,31 @@ fn dispatch_api_call(id: Value, params: &Value, state: &SharedState, full: bool)
                 .unwrap_or(10_000_000);
             let mut st = state.lock().unwrap();
             let start_instr = st.session.machine.instructions_retired;
+            let start_clk = st.session.machine.clk;
 
-            // `until <addr>` runs until the target PC OR any armed breakpoint trips
-            // (consults the bp SET, not just the single target — Spec 754 + VICE
-            // `until`). Mirror the standing bp surface into the registry, then add
-            // the ephemeral target as a temporary exec observer, drive the segment
-            // run, and remove the ephemeral after.
-            {
-                let MonitorSession { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } =
-            &mut st.mon;
-                sync_observers(breakpoints, dsl_observers, dsl_disabled, reg);
-            }
-            let _ = st.mon.observers.add(observers::ObsSpec {
-                name: "__until__".to_string(),
-                trigger: observers::ObsTrigger::Exec,
-                lo: target_addr,
-                hi: target_addr,
-                cond_src: None,
-                action: observers::ObsAction::Break,
-                log_exprs: None,
-                cmd_src: None,
-                mark_label: None,
-                trace_scope: None,
+            // `until <addr>` runs until the target PC OR any armed breakpoint trips (the run
+            // consults the whole bp surface, not just the single target — Spec 754 + VICE
+            // `until`): the ephemeral target is a temporary exec breakpoint of that surface,
+            // removed after. The run is an ordinary run through the one advance.
+            st.mon.breakpoints.api_entries.retain(|e| e.id != "__until__");
+            st.mon.breakpoints.api_entries.push(ApiBpEntry {
+                id: "__until__".to_string(),
+                pc: target_addr,
+                action: "halt".to_string(),
+                enabled: true,
+                hit_limit: None,
+                ignore_count: 0,
+                hit_count: 0,
             });
-            let run = {
-                let State { session, mon, .. } = &mut *st;
-        let reg = &mut mon.observers;
-                let fm = full_machine_gate(session);
-                run_until_break(session, reg, cycle_budget, fm)
-            };
-            {
-                let MonitorSession { breakpoints, observers: reg, .. } = &mut st.mon;
-                writeback_hits(breakpoints, reg);
-            }
-            st.mon.observers.remove("__until__");
+            let seq0 = st.halt_seq;
+            run_inline(&mut st, cycle_budget);
+            st.mon.breakpoints.api_entries.retain(|e| e.id != "__until__");
 
-            let halted = run.halted;
-            let budget_exhausted = !run.halted;
+            let halted = st.halt_seq != seq0
+                && st.ctrl_stop.as_ref().is_some_and(|c| c.reason == "breakpoint");
+            let budget_exhausted = !halted;
             let final_pc = st.session.machine.c64_core.reg_pc;
-            let cycles_elapsed = run.cycles_elapsed;
+            let cycles_elapsed = st.session.machine.clk.wrapping_sub(start_clk);
             let instructions_elapsed = st.session.machine.instructions_retired.wrapping_sub(start_instr);
             Response::ok(id, json!({
                 "halted": halted,
@@ -7175,105 +7168,28 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             }))
         }
 
+        // session/run — the name the blocking run has always had, kept for one release: it is
+        // `debug/run {cycles, wait: true}`. The machine runs `cycles` (default 19705) through
+        // the one run loop, stops on that exact cycle, or earlier at a breakpoint,
+        // watchpoint or JAM, and the call returns when it has stopped with the reply it has
+        // always had (`c64Cycles`, plus `breakpoint` or `jam`). The legacy name keeps the pace
+        // it always ran at — as fast as possible — unless the call names another; `debug/run`
+        // itself defaults to real time.
         "session/run" => {
             let mut st = state.lock().unwrap();
-            // audit ws-session-debug-2 — session/run is a MANUAL/HEADLESS primitive
-            // only; the autonomous loop owns the clock under debug/run. TS throws when
-            // runState==='running' so the two clocks can't double-advance the CPU
-            // (ws-server.ts:842-848). TRX64's `running` flag is the equivalent runState.
-            if st.session.running {
-                return Response::err(
-                    id, -32001,
-                    "session is running under the autonomous loop; use debug/pause before manual session/run",
-                );
-            }
-            let cycles_budget_hint = req
-                .params
-                .get("cycles")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(st.session.machine.timing().cycles_per_frame);
+            let cycles = req.params.get("cycles").and_then(|v| v.as_u64()).unwrap_or(19705);
             // Spec 808 — ONE rule, both clocks: while the transport holds the machine,
-            // nothing else advances it. The daemon's stream loop honours this in
-            // streaming.rs; the in-process CLI cockpit pumps through session/run
-            // instead, so the same check has to live here or `play back` would set a
-            // flag nobody ticks and a running pump would advance ON TOP of a restore.
-            // Ticking here means the transport steps at whatever rate its host pumps,
-            // which is the same 50/s in both.
-            if transport_tick(&mut st, cycles_budget_hint) {
+            // nothing else advances it.
+            if st.transport.holds_the_machine() {
+                let hint = st.session.machine.timing().cycles_per_frame;
+                transport_tick(&mut st, hint);
                 let v = transport_status(&st);
-                return Response::ok(
-                    id,
-                    json!({
-                        "c64Cycles": 0,
-                        "transport": v,
-                    }),
-                );
+                return Response::ok(id, json!({ "c64Cycles": 0, "transport": v }));
             }
-            // Spec 808 — and the SAME reasoning for the per-frame background work: the
-            // daemon's stream loop calls `stream_maybe_autocapture`, but the in-process
-            // CLI cockpit pumps here instead, so under `trx64cli` the checkpoint ring
-            // never filled at all and every transport verb answered "the ring is empty".
-            // Whoever pumps the machine also feeds the ring; there is no third place
-            // that could.
-            // BUG-044 — the per-frame background work runs AFTER the advance and is
-            // skipped when another caller is waiting, so a busy pump cannot starve the
-            // cockpit's input. At cadence 1 this block is a full checkpoint 50 times a
-            // second; before Spec 808 it was twice. A missed capture is one anchor in a
-            // 3000-anchor ring; a missed keystroke is a cockpit that looks broken.
-            {
-                // The daemon's stream loop hosts the per-frame background work
-                // (streaming.rs ~397): cart write-back, disk write-back, the checkpoint
-                // ring, the recorder feed. The in-process `trx64cli` cockpit does NOT
-                // run that loop — it pumps here — so under the CLI NONE of it happened:
-                // the ring stayed empty (every transport verb said so), and a game that
-                // saved to its cart or disk never reached the host file. Same root
-                // cause, three symptoms, found in one session.
-                //
-                // Whoever pumps the machine owns the frame, and the frame includes this
-                // work. Both hosts now call the same four helpers; there is no third
-                // place a future host could forget.
-                let now = now_ms();
-                stream_maybe_autopersist_cart(&mut st, now);
-                stream_maybe_autopersist_disk(&mut st, now);
-                let frame_no = st.ctrl_frame;
-                let (w, h, indices) = st.session.machine.render_canvas_indices();
-                stream_maybe_autocapture(&mut st, frame_no, cycles_budget_hint, w, h, &indices);
-                stream_maybe_feed_recorder(&mut st, frame_no);
-            }
-            let cycles = req
-                .params
-                .get("cycles")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(19705);
-
-            // audit ws-session-debug-3 — a manual (paused) session/run HONOURS exec
-            // breakpoints and watchpoints (`run_budget_honouring_breaks`, shared with
-            // `session/frame_probe`).
-            if let BudgetRun::Halted { pc, num, registers, cycles: cycles_now, .. } =
-                run_budget_honouring_breaks(&mut st, cycles)
-            {
-                return Response::ok(id, json!({
-                    "c64Cycles": cycles_now,
-                    "breakpoint": {
-                        "pc": pc as u64,
-                        "num": num,
-                        "registers": registers,
-                    },
-                }));
-            }
-            // Spec 764 — the no-debug budget advance has no halt gate, so a jammed CPU
-            // (KIL frozen at PC) would otherwise burn the WHOLE budget here and the CLI
-            // pump would keep re-issuing session/run → the spin/hang. Observe the jam via
-            // the shared helper (freeze + debug/stopped reason="jam") and signal it so the
-            // pump halts. The PC stays frozen at the KIL.
-            if check_and_handle_jam(&mut st) {
-                let pc = jammed_pc(&st);
-                return Response::ok(id, json!({
-                    "c64Cycles": st.session.machine.clk,
-                    "jam": { "pc": pc as u64 },
-                }));
-            }
-            Response::ok(id, json!({ "c64Cycles": st.session.machine.clk }))
+            let pace = req.params.get("pace").and_then(|v| v.as_str()).unwrap_or("warp");
+            start_run(&mut st, Some(cycles), Some(pace));
+            let st = park_until_stopped(st);
+            Response::ok(id, legacy_run_reply(&st))
         }
 
         "session/state" => {
@@ -7302,8 +7218,8 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             // that had been paused through the other one.
             let run_state = if st.session.running { "running" } else { "paused" };
             let stop_reason = st.ctrl_stop.as_ref().map(|s| s.reason);
-            // Spec 771.2 (T1.1) — live audio is streaming when the hub is on AND running.
-            let streaming = st.streaming_enabled && st.session.running;
+            // Live audio is streaming when an A/V client is subscribed AND the machine runs.
+            let streaming = st.av_subscribers > 0 && st.session.running;
             let machine = &st.session.machine;
             let cpu = &machine.cpu;
             let v = |off: u8| machine.vic.read_reg(off);
@@ -7378,13 +7294,6 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             // SEED the border colour on (re)connect (it otherwise only learns the owner
             // from the one-shot `debug/control` broadcast, missed on a late attach).
             state_json["controlOwner"] = json!(st.control_owner);
-            // Spec 767 slice 2 — whether the stream pump is RUNNING: a bounded run can only
-            // stream live via the pump, so a caller uses the capped streaming run when this
-            // is true and the blocking session/run when it's false. The pump thread lives
-            // only while an A/V client is subscribed — a daemon started with the hub but with
-            // nobody watching (no UI tab; the MCP socket is `?av=0`) has no pump, and a
-            // `debug/run` there would be accepted and never advance.
-            state_json["streamPump"] = json!(st.streaming_enabled && !st.pump_idle);
             // ── powered + mounted media ─────────────────────────────────────────────
             // A consumer showing a SHARED machine must be able to ask "what is in it?"
             // WITHOUT mounting something to find out — mounting a cart power-cycles, so
@@ -7465,6 +7374,12 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             state_json["folderEvents"] = Value::Array(st.folder_events.clone());
             // Spec 887 D5 — when this daemon ends itself, if it will.
             state_json["idleExit"] = idle::status();
+            // Spec 910 D1 — whether this daemon writes media back, and where its copies are.
+            if let (Some(obj), Some(sc)) = (state_json.as_object_mut(), scratch::status().as_object()) {
+                for (k, v) in sc {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
             Response::ok(id, state_json)
         }
 
@@ -7807,8 +7722,9 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
         // path re-inits CPU + I/O chips + drive and restores $00/$01 banking so the
         // $FFFC vector reads $FCE2 and the KERNAL reset runs clean — recovering even
         // from a running/JAMmed game; RAM is preserved. The cold path additionally
-        // fills power-on DRAM + power-cycles the drive. Both run the KERNAL to READY
-        // (5M cycles, matching the TS runFor). Returns { c64Cycles, pc, mode }.
+        // fills power-on DRAM + power-cycles the drive. Neither runs the machine
+        // (Spec 910 D8): both leave it at the reset vector, running, and answer with
+        // where it stands. Returns { c64Cycles, pc, mode }.
         // Spec 786 — reset composes the power primitives:
         //   soft → warm_reset ($FCE2, RAM + media preserved, I/O chips reset)
         //   cold → power_off → power_on (fresh full init; inserted media kept)
@@ -7823,17 +7739,13 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 // VIC/CIA/CPU/IEC reset. No-op if powered off.
                 st.session.warm_reset();
                 st.session.machine.keyboard.clear();
-                run_cycle_budget(&mut st.session, 5_000_000);
-                // A reset is a control + audio-timeline discontinuity; the held
-                // FlowTracker frames are stale.
-                st.ctrl_stop = None;
-                st.ctrl_frame += 1;
-                st.mon.flow.reset();
-                st.stream_broke_on_jam = false;
+                reset_housekeeping(&mut st);
                 st.notify.broadcast("audio/flush", json!({ "session_id": st.session.id }));
+                // Same running state as the monitor's `reset` and as a cold reset.
+                st.session.running = true;
             } else {
                 // Cold reset = the power-cycle composition. do_power_* carry the
-                // ring drop, boot warm-up, flow/monitor reset + audio flush.
+                // ring drop, flow/monitor reset + audio flush.
                 do_power_off(&mut st);
                 do_power_on(&mut st);
             }
@@ -7877,8 +7789,8 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
         // "realtime", and "pal" (what it used to be called) is still accepted.
         // Calls ctrl.setPacing(mode, ratio): stores mode unconditionally; stores ratio
         // only if it is truthy AND > 0 (mirrors runtime-controller.ts:329-331).
-        // TRX64 has no autonomous pacing loop (no resetPaceEpoch), so we only update
-        // the stored fields in State. Returns build_debug_state (= c.state() shape).
+        // Only the stored fields change; the run loop reads them on its next iteration.
+        // Returns build_debug_state (= c.state() shape).
         "session/set_pacing" => {
             let mode = match req.params.get("mode").and_then(|v| v.as_str()) {
                 Some(m) => m.to_string(),
@@ -8193,6 +8105,10 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 boot: req.params.get("boot").and_then(|v| v.as_str()).map(String::from),
                 profile,
             };
+            let path = &match scratch::open_folder(path) {
+                Ok(p) => p,
+                Err(e) => return Response::err(id, -32603, format!("device/folder_attach: {e}")),
+            };
             let src = match trx64_core::folder_device::HostFolder::new(path) {
                 Ok(s) => s,
                 Err(e) => return Response::err(id, -32602, format!("device/folder_attach: {path}: {e}")),
@@ -8478,7 +8394,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 );
             }
             let start = st.session.machine.clk;
-            if let Err(e) = advance_to_frame_boundary(&mut st.session) {
+            if let Err(e) = advance_to_frame_boundary(&mut st) {
                 return Response::err(id, -32003, format!("session/advance_to_frame: {e}"));
             }
             Response::ok(id, json!({
@@ -8636,64 +8552,40 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
 
         // ── debug/* ──────────────────────────────────────────────────────────
 
+        // debug/run {cycles?, pace?, wait?} — THE run (Spec 910 D7). The machine free-runs;
+        // `cycles` gives the run a stop after that many cycles (it pauses on exactly that
+        // cycle, however the run is chunked), `pace: "warp"` runs it as fast as possible for
+        // the length of the run and the prior pace comes back at the stop. Breakpoints,
+        // watchpoints and a JAM stop it as they stop the free run. The reply is the
+        // controller state — `runState` "running" at once, or, with `wait: true`, the call
+        // returns when the run has stopped, with the stop in `stop` ({reason, pc, cycles}).
+        // Without `wait` the stop is PUSHED (`debug/paused` for the cap,
+        // `debug/breakpoint_hit` + `debug/stopped` for a hit).
         "debug/run" => {
-            // audit ws-session-debug-1 — debug/run is ASYNC-SCHEDULED, never blocking.
-            // TS (runtime-controller.ts:262-284 + ws-server.ts:985-991): run() flips
-            // runState→running, pushes debug/running, schedules the loop, and returns
-            // ctrl.state() IMMEDIATELY. A later breakpoint halt is PUSHED via debug/
-            // stopped from the loop — the reply is NEVER the halt. The pre-fix TRX64
-            // called run_debug_control here, which ran an INLINE synchronous
-            // run_until_break (up to DEBUG_RUN_BUDGET=10M cyc) whenever a bp/observer
-            // was armed, so debug/run BLOCKED until the bp hit and could even reply
-            // "paused". The (P0-A) bp/observer/JAM-aware stream loop
-            // (stream_debug_gated_advance) is now the SOLE halt driver: it self-halts at
-            // the first hit + server-PUSHes debug/breakpoint_hit|observer_hit +
-            // debug/stopped, exactly as TS's tick does. So we just transition to running
-            // and return the running state — no inline run.
             let mut st = state.lock().unwrap();
             // T1.2 — Spec 767: read source param, update control_owner, broadcast on change.
             let owner = owner_from_source(&req.params);
             set_control_owner(&mut st, owner);
-            st.session.running = true;
-            st.ctrl_stop = None;
-            // Spec 767 slice 2 (live-view) — optional cycle cap: a BOUNDED run that still
-            // streams every rendered frame through the pump (the machine renders → frames
-            // go out), auto-pausing at the cap. Optional `pace` (e.g. "warp") runs it fast;
-            // the prior pace is restored on auto-pause so the human's session is undisturbed.
-            // No `cycles` → an uncapped free-run (clears any stale cap).
-            match req.params.get("cycles").and_then(|v| v.as_u64()) {
-                Some(cyc) => {
-                    st.run_cap_clk = Some(st.session.machine.clk.saturating_add(cyc));
-                    if let Some(pace) = req.params.get("pace").and_then(|v| v.as_str()) {
-                        let pace = canonical_pacing(pace).unwrap_or(pace);
-                        if pace != st.pacing_mode {
-                            st.run_cap_restore_pace = Some(st.pacing_mode.clone());
-                            st.pacing_mode = pace.to_string();
-                        }
+            let wait = req.params.get("wait").and_then(|v| v.as_bool()).unwrap_or(false);
+            if wait && st.transport.holds_the_machine() {
+                return Response::err(id, -32001, "debug/run: the rewind transport holds the machine; hand it back (play to the head) first");
+            }
+            let cycles = req.params.get("cycles").and_then(|v| v.as_u64());
+            let pace = req.params.get("pace").and_then(|v| v.as_str());
+            start_run(&mut st, cycles, pace);
+            if wait {
+                st = park_until_stopped(st);
+                // The reply of a waited run is the stop. A breakpoint or watchpoint hit
+                // carries its own record (reason "breakpoint" | "observer", the numbered
+                // breakpoint, the observer's name), as the `debug/stopped` push does.
+                let mut state_json = build_debug_state(&st);
+                if let (Some(s), Some(h)) = (&st.ctrl_stop, &st.last_halt_stop) {
+                    if !st.session.running && h["pc"] == json!(s.pc as u64) && h["cycles"] == json!(s.cycles) {
+                        state_json["stop"] = h.clone();
                     }
                 }
-                None => {
-                    st.run_cap_clk = None;
-                    st.run_cap_restore_pace = None;
-                }
+                return Response::ok(id, state_json);
             }
-            // Spec 764 — a fresh run() re-arms the JAM edge (runtime-controller.ts:793
-            // brokeOnJam reset on run), so a still-jammed machine asked to run again
-            // re-broadcasts debug/stopped reason=jam (the shared helper observes it on
-            // the next advance).
-            st.stream_broke_on_jam = false;
-            st.ctrl_frame += 1;
-            // Spec 771.2 — runtime-controller.ts:282 run() server-PUSHes debug/running
-            // at the run transition. Without it the UI never leaves the paused/frozen
-            // display (and its keyboard handler, gated on runState==="running", never
-            // attaches → "can't type").
-            let pacing_snap = json!({ "mode": st.pacing_mode, "ratio": st.pacing_ratio });
-            st.notify.broadcast("debug/running", json!({
-                "session_id": st.session.id,
-                "pacing": pacing_snap,
-            }));
-            // Return ctrl.state() immediately (= TS run() → ctrl.state(), runState
-            // "running"). build_debug_state reads the live State (now running).
             Response::ok(id, build_debug_state(&st))
         }
 
@@ -8703,6 +8595,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             let owner = owner_from_source(&req.params);
             set_control_owner(&mut st, owner);
             st.session.running = false;
+            end_bounded_run(&mut st);
             st.ctrl_frame += 1;
             let frame = st.ctrl_frame;
             let bps = st.mon.breakpoints.list_vice_json();
@@ -8730,18 +8623,18 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             }))
         }
 
+        // debug/continue — run from where the machine stands, to the next stop or for at
+        // most DEBUG_RUN_BUDGET cycles, and reply with how it ended (Spec 910 D7: a run with a
+        // stop, waited for — no run of its own). With nothing armed there is no stop to wait
+        // for, and the reply is the immediate `running`.
         "debug/continue" => {
             let mut st = state.lock().unwrap();
             // T1.2 — Spec 767: read source param, update control_owner, broadcast on change.
             let owner = owner_from_source(&req.params);
             set_control_owner(&mut st, owner);
-            st.session.running = true;
-            st.ctrl_stop = None;
-            // Spec 764 — continue() === run(): re-arm the JAM edge so a still-jammed
-            // machine asked to continue re-broadcasts debug/stopped reason=jam.
-            st.stream_broke_on_jam = false;
-            // Spec 771.2 — continue() === run() in runtime-controller.ts:287, so it
-            // server-PUSHes debug/running too.
+            // A continue from a breakpoint STEPS PAST the current PC first (else the
+            // boundary check re-trips the same bp immediately); continue() === run().
+            resume_running(&mut st);
             let pacing_snap = json!({ "mode": st.pacing_mode, "ratio": st.pacing_ratio });
             st.notify.broadcast("debug/running", json!({
                 "session_id": st.session.id,
@@ -8749,9 +8642,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             }));
             // TS: continue does not increment frame (stays at pause frame).
             let frame = st.ctrl_frame;
-            // A continue from a breakpoint must STEP PAST the current PC first
-            // (else the boundary check re-trips the same bp immediately).
-            run_debug_control(id, &mut st, frame, true)
+            run_debug_control(id, st, frame)
         }
 
         "debug/step" => {
@@ -8793,8 +8684,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
 
         // debug/state — the RuntimeController.state() snapshot (runtime-controller.ts
         // :344). Read-only: reports the CURRENT run/pause state, pacing, pc/cycles,
-        // controller frame, breakpoints, and last stop. TRX64 has no pacing loop, so
-        // pacing is the constant PAL pacing the TS reports for an unpaced session.
+        // controller frame, breakpoints, and last stop.
         "debug/state" => {
             let st = state.lock().unwrap();
             Response::ok(id, build_debug_state(&st))
@@ -8998,45 +8888,35 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             };
 
             // Run forward (bounded; optional breakpoint at until_pc). ws-server.ts:967-975.
+            // A run through the one advance (Spec 910 D8): the standing breakpoints and
+            // watchpoints are live, so it stops where any run stops. `ranCycles` stays the
+            // cycles asked for, as it always was.
             let mut hit_pc: Option<u16> = None;
             if run_cycles > 0 {
                 if let Some(target) = until_pc {
-                    // Mirror the standing bp surface, add the ephemeral until_pc
-                    // exec observer, run, then remove it — same pattern as `until`.
-                    {
-                        let MonitorSession { breakpoints, dsl_observers, dsl_disabled, observers: reg, .. } =
-            &mut st.mon;
-                        sync_observers(breakpoints, dsl_observers, dsl_disabled, reg);
-                    }
-                    let _ = st.mon.observers.add(observers::ObsSpec {
-                        name: "__overlay_until__".to_string(),
-                        trigger: observers::ObsTrigger::Exec,
-                        lo: target,
-                        hi: target,
-                        cond_src: None,
-                        action: observers::ObsAction::Break,
-                        log_exprs: None,
-                        cmd_src: None,
-                        mark_label: None,
-                        trace_scope: None,
+                    // The ephemeral until_pc is a temporary exec breakpoint of the standing
+                    // surface — same pattern as `until`.
+                    st.mon.breakpoints.api_entries.retain(|e| e.id != "__overlay_until__");
+                    st.mon.breakpoints.api_entries.push(ApiBpEntry {
+                        id: "__overlay_until__".to_string(),
+                        pc: target,
+                        action: "halt".to_string(),
+                        enabled: true,
+                        hit_limit: None,
+                        ignore_count: 0,
+                        hit_count: 0,
                     });
-                    let run = {
-                        let State { session, mon, .. } = &mut *st;
-        let reg = &mut mon.observers;
-                        let fm = full_machine_gate(session);
-                        run_until_break(session, reg, run_cycles, fm)
-                    };
-                    {
-                        let MonitorSession { breakpoints, observers: reg, .. } = &mut st.mon;
-                        writeback_hits(breakpoints, reg);
-                    }
-                    st.mon.observers.remove("__overlay_until__");
+                    let seq0 = st.halt_seq;
+                    run_inline(&mut st, run_cycles);
+                    st.mon.breakpoints.api_entries.retain(|e| e.id != "__overlay_until__");
                     // r.aborted === "breakpoint" → hitPc = r.lastPc.
-                    if run.halted && run.reason == "breakpoint" {
-                        hit_pc = Some(run.pc);
+                    if st.halt_seq != seq0 {
+                        if let Some(h) = st.last_halt_stop.as_ref().filter(|h| h["reason"] == "breakpoint") {
+                            hit_pc = h["pc"].as_u64().map(|v| v as u16);
+                        }
                     }
                 } else {
-                    run_cycle_budget(&mut st.session, run_cycles);
+                    run_inline(&mut st, run_cycles);
                 }
             }
 
@@ -9426,11 +9306,11 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
         //      `confirm_hold_cycles` and released as long before the next one;
         //   5. run `post_cycles`;
         //   6. read the screen again (screenAfter) and compare.
-        // The machine is advanced by the stream loop's own advance
-        // (`stream_debug_gated_advance`) with the state lock held for the whole call,
-        // so the paced loop waits and then carries on (it re-bases its clock after a
-        // stall instead of catching up). Breakpoints, observers and a JAM stop it as
-        // they stop the free run; the reply then says which step it stopped in.
+        // The machine is advanced by the run loop's own advance (`run_inline` →
+        // `advance_frames`) with the state lock held for the whole call, so the paced loop
+        // waits and then carries on (it re-bases its clock after a stall instead of
+        // catching up). Breakpoints, observers and a JAM stop it as they stop the free run;
+        // the reply then says which step it stopped in.
         "runtime/swap_disk_and_continue" => {
             const V: &str = "runtime/swap_disk_and_continue";
             let Some(path_in) = req.params.get("path").and_then(|v| v.as_str()) else {
@@ -9447,7 +9327,10 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 Ok(u) => u,
                 Err(e) => return Response::err(id, -32602, format!("{V}: {e}")),
             };
-            let path_str = { let st = state.lock().unwrap(); resolve_fs_path_with_state(&st, path_in) };
+            let path_str = match { let st = state.lock().unwrap(); medium_path(&st, path_in) } {
+                Ok(p) => p,
+                Err(e) => return Response::err(id, -32603, format!("{V}: {e}")),
+            };
             let bytes = match std::fs::read(&path_str) {
                 Ok(b) => b,
                 Err(e) => return Response::err(id, -32602, format!("{V}: file read {path_str}: {e}")),
@@ -9492,7 +9375,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             // One step of running: the cycles it really ran, and why it stopped early.
             fn run_step(st: &mut State, step: &'static str, cycles: u64) -> (u64, Option<Value>) {
                 let before = st.session.machine.clk;
-                let _ = stream_debug_gated_advance(st, cycles);
+                run_inline(st, cycles);
                 let ran = st.session.machine.clk.wrapping_sub(before);
                 let m = &st.session.machine;
                 let stop = if m.c64_core.is_jammed || m.cpu6510.is_jammed() {
@@ -9715,17 +9598,23 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
         // c64re `ingestMedia` (media/ingress.ts:91-301): drive9 + .c64re + dirty-
         // media guards, then a deterministic boundary (conditional pause →
         // checkpoint-before → apply → checkpoint-after → pin → event → conditional
-        // resume). TRX64 has no autonomous tick loop, so "pause"/"resume" set the
-        // `running` flag (+ broadcast debug/paused|running) exactly as the wire
-        // contract requires; the cycle-budget run happens on the next debug/run.
+        // resume). "pause"/"resume" set the `running` flag (+ broadcast
+        // debug/paused|running) exactly as the wire contract requires; the run loop
+        // carries the machine on from there.
         "media/ingress" => {
             let kind = req.params.get("kind").and_then(|v| v.as_str()).unwrap_or("disk").to_string();
             // Resolved as media/mount resolves its path: the ingress path becomes the
             // medium's backing file, which eject and persist later WRITE.
-            let path = req.params.get("path").and_then(|v| v.as_str()).map(|p| {
-                let st = state.lock().unwrap();
-                resolve_fs_path_with_state(&st, p)
-            });
+            let path = match req.params.get("path").and_then(|v| v.as_str()) {
+                None => None,
+                Some(p) => {
+                    let st = state.lock().unwrap();
+                    match medium_path(&st, p) {
+                        Ok(p) => Some(p),
+                        Err(e) => return Response::err(id, -32603, format!("media/ingress: {e}")),
+                    }
+                }
+            };
             let bytes_b64 = req.params.get("bytes_b64").and_then(|v| v.as_str()).map(str::to_string);
             let name = req.params.get("name").and_then(|v| v.as_str()).map(str::to_string);
             let role = req.params.get("role").and_then(|v| v.as_str()).unwrap_or("drive8").to_string();
@@ -10123,7 +10012,10 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             let Some(path_in) = req.params.get("path").and_then(|v| v.as_str()) else {
                 return Response::err(id, -32602, "media/open: missing path");
             };
-            let path_str = { let st = state.lock().unwrap(); resolve_fs_path_with_state(&st, path_in) };
+            let path_str = match { let st = state.lock().unwrap(); medium_path(&st, path_in) } {
+                Ok(p) => p,
+                Err(e) => return Response::err(id, -32603, format!("media/open: {e}")),
+            };
             let bytes = match std::fs::read(&path_str) {
                 Ok(b) => b,
                 Err(e) => return Response::err(id, -32602, format!("media/open: {path_str}: {e}")),
@@ -10188,7 +10080,10 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             };
             // Resolve relative to the cockpit `cd` cwd (BUG: `/mount foo.crt` after `cd out`
             // read foo.crt relative to the process cwd → "No such file"; now reads .../out/foo.crt).
-            let path_str = { let st = state.lock().unwrap(); resolve_fs_path_with_state(&st, &path_str) };
+            let path_str = match { let st = state.lock().unwrap(); medium_path(&st, &path_str) } {
+                Ok(p) => p,
+                Err(e) => return Response::err(id, -32603, format!("media/mount: {e}")),
+            };
 
             let bytes = match std::fs::read(&path_str) {
                 Ok(b) => b,
@@ -10363,7 +10258,10 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 None => return Response::err(id, -32602, "media/swap: missing path"),
             };
             // Resolve relative to the cockpit `cd` cwd (same as media/mount).
-            let path_str = { let st = state.lock().unwrap(); resolve_fs_path_with_state(&st, &path_str) };
+            let path_str = match { let st = state.lock().unwrap(); medium_path(&st, &path_str) } {
+                Ok(p) => p,
+                Err(e) => return Response::err(id, -32603, format!("media/swap: {e}")),
+            };
 
             let bytes = match std::fs::read(&path_str) {
                 Ok(b) => b,
@@ -10566,8 +10464,8 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                     Ok((path_clone, bytes_to_write)) => {
                         let notify = st.notify.clone();
                         drop(st);
-                        match std::fs::write(&path_clone, &bytes_to_write) {
-                            Ok(()) => {
+                        match write_medium(&path_clone, &bytes_to_write) {
+                            Ok(path_clone) => {
                                 let byte_count = bytes_to_write.len();
                                 // 1:1 with runtime-controller.ts:513-515 broadcast.
                                 notify.broadcast("media/cart_persisted", json!({
@@ -10623,8 +10521,8 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                                 drop(st);
                                 match target {
                                     Err(e) => Err(format!("media/persist: {e}")),
-                                    Ok(path_clone) => match std::fs::write(&path_clone, &bytes_to_write) {
-                                    Ok(()) => Ok(json!({
+                                    Ok(path_clone) => match write_medium(&path_clone, &bytes_to_write) {
+                                    Ok(path_clone) => Ok(json!({
                                         "written": true,
                                         "role": "disk",
                                         "path": path_clone,
@@ -10722,7 +10620,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 ),
             };
             let mut st = state.lock().unwrap();
-            match export_session_audio(&mut st.session, &out_path, duration_sec) {
+            match export_session_audio(&mut st, &out_path, duration_sec) {
                 Ok(v) => Response::ok(id, v),
                 Err(e) => Response::err(id, -32001, format!("audio/export: {e}")),
             }
@@ -11854,19 +11752,13 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 .unwrap_or(256);
 
             let mut st = state.lock().unwrap();
-            let session = &mut st.session;
-            // Spec 723: SAME bus gate the run path (`run_cycle_budget`) uses — the
-            // access map must reflect the machine the scenario RUNS on. On a `vic`-directed
-            // (or booted) scenario this engages the full VIC, so the map
-            // sees the VIC register + sweep accesses a FlatRam isolated run would miss.
-            let full_machine = full_machine_gate(session);
-
-            let mut obs = MemoryAccessObserver::new();
-            if full_machine {
-                session.machine.run_for_full(cyc, &mut obs, |_, _, _, _, _, _, _| {});
-            } else {
-                session.machine.run_for(cyc, &mut obs);
-            }
+            // The run is one run through the one advance (Spec 910 D8), breakpoints live, with
+            // the access tracker watching the bus. The bus choice is the session's gate: on a
+            // booted (or `vic`-directed) scenario it is the full machine, so the map sees the
+            // VIC register + sweep accesses a FlatRam isolated run would miss.
+            st.access_probe = Some(MemoryAccessObserver::new());
+            run_inline(&mut st, cyc);
+            let obs = st.access_probe.take().unwrap_or_else(MemoryAccessObserver::new);
             let result = obs.into_result(cyc, &want_classes, min_bytes);
             Response::ok(id, result)
         }
@@ -11979,16 +11871,22 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                     "audioEpoch": st.audio_epoch,
                 }));
             }
-            {
-                let now = now_ms();
-                stream_maybe_autopersist_cart(&mut st, now);
-                stream_maybe_autopersist_disk(&mut st, now);
-                let frame_no = st.ctrl_frame;
-                let (w, h, indices) = st.session.machine.render_canvas_indices();
-                stream_maybe_autocapture(&mut st, frame_no, budget, w, h, &indices);
-                stream_maybe_feed_recorder(&mut st, frame_no);
+            // The host's clock hands over the cycles of real time that passed; the machine
+            // runs them through the one advance (anchors, recorder, observers, stops all
+            // happen inside it). A daemon whose run loop is already advancing the machine
+            // keeps the tick from advancing it twice: the tick then waits for the loop to
+            // have run those cycles, and reports what it ran.
+            let before = st.session.machine.clk;
+            if st.loop_thread {
+                let target = before.saturating_add(budget);
+                let cv = Arc::clone(&st.loop_cv);
+                while st.session.running && st.session.machine.clk < target {
+                    st = cv.wait_timeout(st, std::time::Duration::from_millis(20)).unwrap().0;
+                }
+            } else {
+                loop_budget_run(&mut st, budget);
             }
-            let advanced = stream_debug_gated_advance(&mut st, budget);
+            let advanced = st.session.machine.clk.wrapping_sub(before);
             st.ctrl_frame = st.ctrl_frame.wrapping_add(1);
             // A breakpoint or JAM stops the machine — and it stops it HERE, so every
             // client learns about it from the same reply instead of inferring it.
@@ -12009,8 +11907,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
         // client's private run flag.
         "session/play" => {
             let mut st = state.lock().unwrap();
-            st.session.running = true;
-            st.ctrl_stop = None;
+            resume_running(&mut st);
             st.audio_epoch = st.audio_epoch.wrapping_add(1);
             // Spec 808 decision 4, REVERSED by the owner 2026-08-13: PLAY means the
             // EMULATION runs from here, not a replay of the anchors ahead.
@@ -12035,6 +11932,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
         "session/pause" => {
             let mut st = state.lock().unwrap();
             st.session.running = false;
+            end_bounded_run(&mut st);
             st.transport.playing = None;
             st.audio_epoch = st.audio_epoch.wrapping_add(1);
             let pc = st.session.machine.c64_core.reg_pc;
@@ -12636,8 +12534,12 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             // `runFor(PAL_CYCLES_PER_FRAME)`). The ~1-frame advance is invisible in a
             // paused preview; the exact-state path (runtime_rewind) passes no render.
             if render {
+                // A picture, not a point on the timeline: the frame is re-simulated for the
+                // framebuffer, so the advance takes no anchor for it.
                 let frame = st.session.machine.timing().cycles_per_frame;
-                run_cycle_budget(&mut st.session, frame);
+                st.frame_work_off = true;
+                run_inline(&mut st, frame);
+                st.frame_work_off = false;
             }
             let restored = st.checkpoint_ring.get(&cp_id).map(|r| r.to_json());
             // Run-state resolution (runtime-controller.ts:541-552/588):
@@ -12676,8 +12578,8 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             // dependency"). TS's presentFrame pushes the BINARY VIC frame only (ws-server
             // .ts:474-503 pushFrame; the JSON `session/frame_available` is emitted ONLY in
             // the running loop's maybePresentFrame, NOT on restore — so we must NOT emit it
-            // here either, to stay 1:1). Under --stream the paused loop is silent, so we
-            // request a one-shot present: the paused stream branch consumes the flag once
+            // here either, to stay 1:1). The paused run loop is silent, so we
+            // request a one-shot present: its paused branch consumes the flag once
             // and pushes exactly one BIN_VIC. A running restore (then=run) gets its frame
             // from the resumed loop's next tick; the flag is harmlessly consumed-or-ignored.
             st.force_present_frame = true;
@@ -12890,7 +12792,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             if let Some(parent) = std::path::Path::new(&path).parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            match std::fs::write(&path, &bytes) {
+            match write_output(&path, &bytes) {
                 Ok(()) => Response::ok(id, json!({
                     "path": path,
                     "cycle": cycle as u64,
@@ -12992,7 +12894,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             if let Some(parent) = std::path::Path::new(&path).parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            match std::fs::write(&path, &bytes) {
+            match write_output(&path, &bytes) {
                 Ok(()) => Response::ok(id, json!({
                     "path": path,
                     "cycle": cycle as u64,
@@ -13092,7 +12994,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             //   is NOT, so we still return it for shape parity — it is a path string the
             //   oracle compares; both daemons get the SAME output_path param, so it is
             //   byte-equal anyway). `bytes` = on-disk file size.
-            match std::fs::write(&output_path, &bytes) {
+            match write_output(&output_path, &bytes) {
                 Ok(()) => Response::ok(id, json!({
                     "savedPath": output_path,
                     "bytes": bytes_written
@@ -13890,6 +13792,32 @@ fn host_write_target(raw: &str) -> Result<String, String> {
     Ok(base.join(p).to_string_lossy().to_string())
 }
 
+/// Spec 910 D1 — THE function a path that names a medium goes through before the daemon
+/// reads it: resolved like every path, then (under `--scratch`) opened from its copy.
+/// `tests/no_writeback.rs` fails when a path-taking door reads a medium any other way.
+fn medium_path(st: &State, arg: &str) -> Result<String, String> {
+    scratch::open_medium(&resolve_fs_path_with_state(st, arg))
+}
+
+/// Spec 910 D1 — THE function every write of a medium's backing file goes through. Under
+/// `--scratch` the bytes land in the scratch dir whatever path the medium carries. Returns the
+/// path actually written.
+fn write_medium(path: &str, bytes: &[u8]) -> std::io::Result<String> {
+    let target = scratch::sink(path);
+    std::fs::write(&target, bytes)?;
+    Ok(target)
+}
+
+/// Spec 910 D1 — THE function every other file the daemon writes at a caller's request
+/// (a dump, a save, an export) goes through: a file the daemon was handed as a medium is
+/// refused under `--scratch`.
+fn write_output(path: impl AsRef<std::path::Path>, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let path = path.as_ref();
+    scratch::refuse_original(&path.to_string_lossy())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
+    std::fs::write(path, bytes)
+}
+
 fn resolve_fs_path_with_state(st: &State, arg: &str) -> String {
     if arg.is_empty() || std::path::Path::new(arg).is_absolute() {
         return arg.to_string();
@@ -14053,8 +13981,8 @@ fn persist_cart_for_eject(st: &mut State, backing_path: &str) -> Option<String> 
         return None;
     }
     let img = cart.crt_image(clk)?;
-    match std::fs::write(backing_path, &img) {
-        Ok(()) => Some(backing_path.to_string()),
+    match write_medium(backing_path, &img) {
+        Ok(written) => Some(written),
         Err(_) => None,
     }
 }
@@ -14112,8 +14040,8 @@ fn persist_outgoing_disk_at(st: &mut State, pos: DrivePosition) -> Option<String
         _ => return None, // uploaded bytes with no host file → RAM-only, nothing to write
     };
     let bytes = disk.bytes.clone();
-    match std::fs::write(&backing_path, &bytes) {
-        Ok(()) => Some(backing_path),
+    match write_medium(&backing_path, &bytes) {
+        Ok(written) => Some(written),
         Err(_) => None,
     }
 }
@@ -14620,15 +14548,16 @@ fn capture_media_checkpoint(st: &mut State) -> Option<String> {
     st.checkpoint_ring.capture(cp, frame, cycles).ok().map(|r| r.id)
 }
 
-// ── stream_loop BACKGROUND-LOOP layer (the c64re RuntimeController per-frame
+// ── run_loop BACKGROUND-LOOP layer (the c64re RuntimeController per-frame
 //    behaviors with no WS method) ─────────────────────────────────────────────
 //
-// TRX64's `stream_loop` (streaming.rs) is the SOLE per-frame machine driver under
-// --stream. The c64re RuntimeController runs, every frame / on a setInterval,
+// TRX64's `run_loop` (streaming.rs) drives a daemon's machine; an embedded host calls
+// the same advance. The c64re RuntimeController runs, every frame / on a setInterval,
 // several behaviors that have NO WS method (runtime-controller.ts). Three were
-// missing here; these helpers port them. They run on the stream thread INSIDE the
+// missing here; these helpers port them. They run on the run-loop thread INSIDE the
 // per-frame lock window (gen/hash checks are cheap; the actual persist/capture is
-// throttled/debounced), and the stream loop only calls them while `running`.
+// throttled/debounced): the persist hooks every iteration, the anchor and recorder feed
+// once per frame of machine time inside the advance.
 
 /// BUG-040 cart auto-persist debounce (was stream-loop FRAMES, ~50 fps PAL). The TS
 /// debounce is CART_AUTOPERSIST_DEBOUNCE_MS = 5_000 (runtime-controller.ts:100) —
@@ -14700,7 +14629,7 @@ fn checkpoint_ring_max_entries() -> u64 {
 /// persist-in-place). WALL-CLOCK ms debounce (`now_ms`), NOT a frame count, so it
 /// fires regardless of run-state (audit ws-media-3 / background-workers-async-10):
 /// the TS persist is an independent 1 s setInterval that fires while paused/jammed/
-/// bp-stopped, so a dirty-then-pause STILL reaches the host file. The stream loop
+/// bp-stopped, so a dirty-then-pause STILL reaches the host file. The run loop
 /// therefore calls this EVERY iteration (running OR paused), not only `if running`.
 /// Broadcasts media/cart_persisted {auto:true}. Disable with C64RE_CART_AUTOPERSIST=0.
 pub(crate) fn stream_maybe_autopersist_cart(st: &mut State, now_ms: u64) {
@@ -14852,8 +14781,8 @@ fn autopersist_disk_at(st: &mut State, pos: DrivePosition, ap: &mut DiskAutoPers
         Some(d) => d.bytes.clone(),
         None => return,
     };
-    match std::fs::write(&backing_path, &bytes) {
-        Ok(()) => {
+    match write_medium(&backing_path, &bytes) {
+        Ok(backing_path) => {
             ap.done_hash = Some(hash);
             ap.pending = false; // settled + written; re-armed on the next drive write
             let session_id = st.session.id.clone();
@@ -14868,29 +14797,21 @@ fn autopersist_disk_at(st: &mut State, pos: DrivePosition, ap: &mut DiskAutoPers
     }
 }
 
-/// ITEM 3 — auto-capture every CHECKPOINT_CAPTURE_EVERY_FRAMES frames (filmstrip).
-/// Called once per RUNNING stream-loop frame. = CHECKPOINT_AUTOCAPTURE
-/// (runtime-controller.ts:88/157). Captures a RENDER-ANCHOR (framebuffer OMITTED,
-/// BUG-049) into the checkpoint ring so the UI filmstrip/scrub has a populated
-/// ring. SKIPS while a mounted medium is dirty + non-persistable (Spec 709.13).
-/// Isolated: a capture failure NEVER kills the loop (the ring returns Err on a
-/// gap, never panics). Disable with C64RE_CHECKPOINT_AUTOCAPTURE=0.
-pub(crate) fn stream_maybe_autocapture(st: &mut State, frame: u64, elapsed_cycles: u64, canvas_w: usize, canvas_h: usize, canvas_indices: &[u8]) {
+/// Auto-capture a checkpoint anchor every `checkpoint_cadence_frames` frames of MACHINE time
+/// (the filmstrip / scrub ring, = CHECKPOINT_AUTOCAPTURE, runtime-controller.ts:88/157).
+/// Called by [`advance_frames`] once per frame boundary the machine crosses, with `frame` the
+/// machine's frame index and `elapsed_cycles` one frame — nothing else calls it, so the
+/// ring holds the same anchors however a client chunks its runs (Spec 910 D9). Captures a
+/// RENDER-ANCHOR (framebuffer OMITTED, BUG-049) plus a downscaled thumbnail of the live
+/// canvas, rendered here only when a capture is due. SKIPS while a mounted medium is dirty
+/// + non-persistable (Spec 709.13). Isolated: a capture failure NEVER stops the advance
+/// (the ring returns Err on a gap, never panics). Disable with C64RE_CHECKPOINT_AUTOCAPTURE=0.
+pub(crate) fn stream_maybe_autocapture(st: &mut State, frame: u64, elapsed_cycles: u64) {
     if std::env::var("C64RE_CHECKPOINT_AUTOCAPTURE").as_deref() == Ok("0") {
         return;
     }
-    // Spec 808 — count EMULATED CYCLES, not calls.
-    //
-    // This used to add 1 per call, which is right only if the caller calls once per
-    // frame. The daemon's stream loop does; the in-process CLI cockpit pumps every 5 ms
-    // — 200 calls a second — so at cadence 1 it captured 200 anchors a second instead of
-    // 50, and a 500-anchor ring covered TWO AND A HALF SECONDS instead of ten. The
-    // symptom was "I only get about 2 seconds back", and it was not the playback speed:
-    // the recording itself was four times too dense.
-    //
-    // Cycles are the honest unit. One frame is the model's frame (19 656 PAL, 17 095 NTSC)
-    // however often anyone calls, and a caller that hands over a whole frame's worth still
-    // captures once.
+    // Spec 808 — count EMULATED CYCLES, not calls. One frame is the model's frame (19 656
+    // PAL, 17 095 NTSC) however often anyone calls.
     st.autocapture_cycles_since = st
         .autocapture_cycles_since
         .wrapping_add(elapsed_cycles.max(1));
@@ -14905,39 +14826,30 @@ pub(crate) fn stream_maybe_autocapture(st: &mut State, frame: u64, elapsed_cycle
         return;
     }
     let cycles = st.session.machine.c64_core.clk;
-    // Render-anchor: the framebuffer-omitted core payload (runtime-controller.ts:
-    // 839/847 omitFramebuffer + omitMedia is the recorder anchor; the ring's
-    // auto-capture in TS uses the render-anchor — capture_recorder_anchor_payload
-    // is TRX64's lighter omit-framebuffer variant). A capture Err is a ring gap,
-    // swallowed — the loop continues.
+    // Render-anchor: the framebuffer-omitted core payload. A capture Err is a ring gap,
+    // swallowed — the advance continues.
     let cp = capture_recorder_anchor_payload(&mut st.session);
-    // Spec 769.5a — store a downscaled thumbnail of the JUST-RENDERED live frame
-    // keyed by the ring's assigned id, in the SEPARATE thumb store (= c64re
-    // captureThumb at the auto-capture point, runtime-controller.ts:840). The anchor
-    // itself stays framebuffer-omitted (BUG-049); the filmstrip reads the picture
-    // from this store, so every auto-anchor — not just framebuffer-present ones —
-    // gets a thumbnail. Cheap; inside the existing per-frame lock window.
+    // Spec 769.5a — store a downscaled thumbnail of the live frame keyed by the ring's
+    // assigned id, in the SEPARATE thumb store (= c64re captureThumb at the auto-capture
+    // point). The anchor itself stays framebuffer-omitted (BUG-049); the filmstrip reads the
+    // picture from this store, so every auto-anchor gets a thumbnail.
     if let Ok(r) = st.checkpoint_ring.capture(cp, frame, cycles) {
-        if let Some(thumb) = make_thumb_from_canvas(canvas_w, canvas_h, canvas_indices) {
+        let (w, h, indices) = st.session.machine.render_canvas_indices();
+        if let Some(thumb) = make_thumb_from_canvas(w, h, &indices) {
             store_checkpoint_thumb(st, r.id, thumb);
         }
     }
 }
 
-/// ITEM 4 (audit background-workers-async-0 + ws-checkpoint-scrub-7) — feed the
-/// active recorder every CHECKPOINT_CAPTURE_EVERY_FRAMES RUNNING stream-loop frames.
-/// = the c64re tick() recorder feed (runtime-controller.ts:846-852): inside the
-/// per-second auto-capture cadence, `if (this.recorder) this.recorder.captureAnchor
-/// (a.payload, …, omitMedia)`. So a FREE-RUNNING machine grows recorder anchors over
-/// time without any explicit recorder/capture. TRX64 previously fed the recorder
-/// ONLY on an explicit recorder/capture (main.rs recorder/capture handler), so a
-/// --stream free-run left the recorder anchor count frozen at 1 (or 0) — the
-/// divergence this closes. Reuses `capture_anchor_now` (= capture_recorder_anchor
-/// _payload + the gen-gated medium stream), so the on-disk anchor shape is identical
-/// to an explicit recorder/capture. No-op (zero cost) when no recorder is active.
-/// Isolated: capture_anchor_now never panics (the recorder store evicts, never
-/// throws). Disable with C64RE_RECORDER_AUTOFEED=0.
-pub(crate) fn stream_maybe_feed_recorder(st: &mut State, _frame: u64) {
+/// Feed the active recorder one CORE-ONLY anchor per `checkpoint_capture_every_frames()`
+/// frames of machine time (= the c64re tick() recorder feed, runtime-controller.ts:846-852),
+/// so a free-running machine grows recorder anchors without any explicit recorder/capture.
+/// Counts CYCLES, not calls ([`advance_frames`] hands over one frame per boundary crossed),
+/// so the recorder is fed the same however a client chunks its runs. Reuses
+/// `capture_anchor_now` (= capture_recorder_anchor_payload + the gen-gated medium stream),
+/// so the on-disk anchor shape is identical to an explicit recorder/capture. No-op (zero
+/// cost) when no recorder is active. Disable with C64RE_RECORDER_AUTOFEED=0.
+pub(crate) fn stream_maybe_feed_recorder(st: &mut State, elapsed_cycles: u64) {
     // Zero-cost gate: nothing to feed when the recorder is inactive.
     if st.recorder.is_none() {
         return;
@@ -14945,15 +14857,12 @@ pub(crate) fn stream_maybe_feed_recorder(st: &mut State, _frame: u64) {
     if std::env::var("C64RE_RECORDER_AUTOFEED").as_deref() == Ok("0") {
         return;
     }
-    st.recorder_frames_since = st.recorder_frames_since.wrapping_add(1);
-    if st.recorder_frames_since < checkpoint_capture_every_frames() {
+    st.recorder_cycles_since = st.recorder_cycles_since.wrapping_add(elapsed_cycles.max(1));
+    let per_feed = st.session.machine.timing().cycles_per_frame * checkpoint_capture_every_frames().max(1);
+    if st.recorder_cycles_since < per_feed {
         return;
     }
-    st.recorder_frames_since = 0;
-    // One CORE-ONLY (omitFramebuffer + gen-gated omitMedia) anchor — the same path
-    // an explicit recorder/capture takes (runtime-controller.ts:847 snapshot{shallow,
-    // omitFramebuffer, omitMedia}). The seq is discarded here (the cadence drives it,
-    // not a caller).
+    st.recorder_cycles_since = 0;
     let _ = capture_anchor_now(st);
 }
 
@@ -15043,12 +14952,12 @@ impl<'a> trx64_core::scenario_player::ScenarioTarget for MachineTarget<'a> {
     }
 }
 
-/// The scenario-player replay target over the live SESSION. Every input method is
+/// The scenario-player replay target over the live STATE. Every input method is
 /// `MachineTarget`'s (one meaning for an input); only what needs the session stays here:
-/// `run_for` goes through `run_cycle_budget` (traces, observers) and the model switch
-/// through `switch_at_frame_boundary` (it also moves `session.model`).
+/// `run_for` is a run through the one advance (`run_inline`: traces, observers, breakpoints)
+/// and the model switch goes through `switch_at_frame_boundary` (it also moves `session.model`).
 struct MachineScenarioTarget<'a> {
-    session: &'a mut Session,
+    st: &'a mut State,
     /// Spec 863 — every model switch the replay performed: `{ cycle, from, name }`.
     switches: Vec<Value>,
 }
@@ -15057,7 +14966,7 @@ impl<'a> MachineScenarioTarget<'a> {
     /// The input half of the session, as a machine target. Its `full_machine` is never
     /// consulted: the methods taken through it are the input ones.
     fn inputs(&mut self) -> MachineTarget<'_> {
-        MachineTarget { machine: &mut self.session.machine, full_machine: false, switches: Vec::new() }
+        MachineTarget { machine: &mut self.st.session.machine, full_machine: false, switches: Vec::new() }
     }
 }
 
@@ -15078,13 +14987,13 @@ impl<'a> trx64_core::scenario_player::ScenarioTarget for MachineScenarioTarget<'
         self.inputs().trigger_restore_nmi();
     }
     fn run_for(&mut self, cycles: u64) {
-        run_cycle_budget(self.session, cycles);
+        run_inline(self.st, cycles);
     }
     fn switch_model(&mut self, name: &str) -> Result<u64, String> {
         let row = trx64_core::model::resolve(name)?;
-        let from = self.session.machine.model();
+        let from = self.st.session.machine.model();
         if !std::ptr::eq(from, row) {
-            let t = switch_at_frame_boundary(self.session, row)?;
+            let t = switch_at_frame_boundary(self.st, row)?;
             self.switches.push(json!({
                 "cycle": t["switchedAt"]["c64Cycles"],
                 "rasterLine": t["switchedAt"]["rasterLine"],
@@ -15128,10 +15037,19 @@ fn play_scenario<T: trx64_core::scenario_player::ScenarioTarget>(
                     break;
                 }
                 target.run_for(rest);
+                if clock(target) <= now {
+                    break; // stopped — see below
+                }
             }
             continue;
         }
         target.run_for(to_run);
+        // A run that moved the clock not at all was stopped (a breakpoint or a JAM on the live
+        // machine, which obeys them): the replay ends where the machine stands, and the caller
+        // reads the stop from the machine. A bare machine always moves.
+        if clock(target) <= now {
+            break;
+        }
     }
     // Fire any inputs that landed exactly at the end.
     let final_now = clock(target);
@@ -15332,35 +15250,35 @@ fn scan_recent_media(recent: &[RecentMedia]) -> Vec<Value> {
 // ── Spec 263 — one-shot audio export ─────────────────────────────────────────
 // audio/export driver (= exportSessionAudio, audio/export.ts): run the session for
 // `duration_sec` seconds of the machine's clock, harvesting reSID PCM into a stereo WAV. Drives the
-// SAME SidAudioEngine the live stream uses (streaming.rs): install the additive
+// SAME SidAudioEngine the live stream uses (streaming.rs), through the one advance (`run_inline`): install the additive
 // $D4xx write-trace hook, run the machine in ~1024-sample slices, record the writes
 // then a frame boundary per slice, flush, and finally export_wav. Returns the c64re
 // ExportResult shape (`out_path, duration_sec, sample_rate, samples, bytes`).
 fn export_session_audio(
-    session: &mut Session,
+    st: &mut State,
     out_path: &str,
     duration_sec: f64,
 ) -> Result<Value, String> {
     use trx64_core::resid_audio::{SidAudioEngine, WavFormat};
     use trx64_core::resid_ffi::ResidConfig;
 
-    let cycles_per_sec = session.machine.timing().cpu_hz as f64;
+    let cycles_per_sec = st.session.machine.timing().cpu_hz as f64;
     let sample_rate: u32 = 44100;
 
-    let mut engine = SidAudioEngine::new(ResidConfig::for_model(session.machine.model()));
+    let mut engine = SidAudioEngine::new(ResidConfig::for_model(st.session.machine.model()));
     // The Send write-trace hook captures only (addr,value) bytes (the engine stays
     // on this thread). Drained into the engine per slice, exactly like streaming.rs.
     let writes: Arc<Mutex<Vec<(u8, u8)>>> = Arc::new(Mutex::new(Vec::new()));
     {
         let w = Arc::clone(&writes);
-        session
+        st.session
             .machine
             .set_sid_write_trace(Some(Box::new(move |_chip, reg, value, _clk| {
                 w.lock().unwrap().push((reg, value));
             })));
         // Prime reSID with the current SID register file (live state, not power-on).
         for reg in 0u8..=0x18 {
-            let v = session.machine.read_full(0xD400 + reg as u16);
+            let v = st.session.machine.read_full(0xD400 + reg as u16);
             engine.record_write(reg, v);
         }
     }
@@ -15376,9 +15294,9 @@ fn export_session_audio(
     let mut consumed: u64 = 0;
     while consumed < total_cycles {
         let want = slice_cycles.min(total_cycles - consumed);
-        let clk_before = session.machine.cpu6510.clk;
-        run_cycle_budget(session, want);
-        let d_cycles = session.machine.cpu6510.clk.wrapping_sub(clk_before) as u32;
+        let clk_before = st.session.machine.cpu6510.clk;
+        run_inline(st, want);
+        let d_cycles = st.session.machine.cpu6510.clk.wrapping_sub(clk_before) as u32;
         // Drain this slice's SID writes (CPU order) → engine, close the boundary.
         {
             let mut pending = writes.lock().unwrap();
@@ -15392,11 +15310,14 @@ fn export_session_audio(
         consumed += want;
     }
 
-    // Restore the byte-exact (None) write-trace path.
-    session.machine.set_sid_write_trace(None);
+    // Give the SID back the way the run loop keeps it: this export replaced the hook the
+    // loop had on it (while an A/V client listens), so drop ours and bump the generation —
+    // the loop re-attaches its own on its next iteration.
+    st.session.machine.set_sid_write_trace(None);
+    st.machine_generation += 1;
 
     let wav = engine.export_wav(WavFormat { sample_rate, channels: 2 });
-    std::fs::write(out_path, &wav).map_err(|e| format!("write {out_path}: {e}"))?;
+    write_output(out_path, &wav).map_err(|e| format!("write {out_path}: {e}"))?;
 
     let pcm_samples = engine.pcm().len() as u64; // mono frames (= L=R stereo frames)
     Ok(json!({
@@ -15502,7 +15423,7 @@ fn run_scenario(st: &mut State, scenario: &Value) -> Result<Value, String> {
                         st.session.machine.drive8.attach_disk(DiskImage {
                             kind,
                             bytes: bytes.clone(),
-                            backing_path: rm.reference.source_name.clone(),
+                            backing_path: rm.reference.source_name.clone().filter(|_| !scratch::active()),
                             read_only: false,
                         });
                     }
@@ -15535,10 +15456,10 @@ fn run_scenario(st: &mut State, scenario: &Value) -> Result<Value, String> {
     let end_clk = start_clk.saturating_add(cycle_budget);
 
     let mut target = MachineScenarioTarget {
-        session: &mut st.session,
+        st: &mut *st,
         switches: Vec::new(),
     };
-    play_scenario(&mut target, &mut player, |t| t.session.machine.cpu6510.clk, end_clk)?;
+    play_scenario(&mut target, &mut player, |t| t.st.session.machine.cpu6510.clk, end_clk)?;
 
     let switches = std::mem::take(&mut target.switches);
 
@@ -15548,7 +15469,7 @@ fn run_scenario(st: &mut State, scenario: &Value) -> Result<Value, String> {
     let ram_hash = sha256_hex(&st.session.machine.ram[..]);
     let cycles_ran = end_clk_actual.saturating_sub(start_clk);
 
-    Ok(json!({
+    let mut out = json!({
         "ramHash": ram_hash,
         "cyclesRan": cycles_ran,
         "startCycle": start_clk,
@@ -15558,7 +15479,15 @@ fn run_scenario(st: &mut State, scenario: &Value) -> Result<Value, String> {
         // Spec 863 — where the replay switched models, and what it ended on.
         "modelSwitches": switches,
         "model": st.session.machine.model().name,
-    }))
+    });
+    // The live machine obeys its breakpoints, watchpoints and a JAM: a replay they stopped
+    // ended where they stopped it, and says so.
+    if end_clk_actual < end_clk {
+        if let Some(s) = st.ctrl_stop.as_ref() {
+            out["stopped"] = json!({ "reason": s.reason, "pc": s.pc as u64, "cycles": s.cycles });
+        }
+    }
+    Ok(out)
 }
 
 /// T1.2 — Spec 767 `setControlOwner`: set `State.control_owner` and broadcast
@@ -15777,12 +15706,12 @@ fn note_operating_owner_for(req: &Request, state: &SharedState) {
     }
 }
 
-/// Spec 767 slice 2 (live-view) — called by the stream pump on every advanced frame. While
-/// a capped LLM run streams, keep the owner-idle timer fresh (so the idle-release does not
-/// fire MID-run), and auto-pause once the cap clk is reached: freeze at the cap, restore the
-/// pre-warp pace (so the shared human session is not left in warp), and broadcast
-/// debug/paused (reason "budget") so the UI grabs the final frame and the waiting caller
-/// sees the stop. No-op when no cap is set. Mirrors the jam-halt helper shape.
+/// The cap of a bounded run, checked after every step the advance makes. While a capped LLM
+/// run advances, keep the owner-idle timer fresh (so the idle-release does not fire MID-run);
+/// once the machine's clock has reached the cap, pause on that cycle, give the pace back
+/// (so the shared human session is not left in warp), and push `debug/paused` (reason
+/// "budget") so the UI grabs the final frame and a caller that did not wait sees the stop.
+/// No-op when no cap is set.
 pub(crate) fn maybe_autopause_capped_run(st: &mut State) {
     let cap = match st.run_cap_clk {
         Some(c) => c,
@@ -15791,12 +15720,10 @@ pub(crate) fn maybe_autopause_capped_run(st: &mut State) {
     if st.control_owner == "llm" {
         st.last_llm_activity = Some(std::time::Instant::now());
     }
-    if st.session.machine.c64_core.clk >= cap {
+    if st.session.machine.clk >= cap {
         st.session.running = false;
-        st.run_cap_clk = None;
-        if let Some(prev) = st.run_cap_restore_pace.take() {
-            st.pacing_mode = prev;
-        }
+        st.halt_seq += 1;
+        end_bounded_run(st);
         let cycles = st.session.machine.clk;
         let pc = st.session.machine.c64_core.reg_pc;
         st.ctrl_stop = Some(CtrlStop { reason: "budget", pc, cycles });
@@ -15809,6 +15736,37 @@ pub(crate) fn maybe_autopause_capped_run(st: &mut State) {
                 "cycles": cycles,
             }),
         );
+    }
+}
+
+/// Spec 767 (live-view) — control-owner idle release. Revert `control_owner` "llm"→"human"
+/// once the LLM goes idle (no operating command for the idle window), so the green border
+/// returns to human-owned when the LLM stops driving. Not gated on `running`: a free-running
+/// machine would never release a `!running` gate. If the LLM left the machine paused by a
+/// capped run (a "budget" stop — NOT a human pause / breakpoint / jam), resume the free-run
+/// so the shared machine KEEPS RUNNING. The run loop calls this every iteration.
+pub(crate) fn release_idle_control_owner(st: &mut State) {
+    if st.control_owner != "llm" {
+        return;
+    }
+    let Some(t) = st.last_llm_activity else { return };
+    if t.elapsed() < std::time::Duration::from_millis(3000) {
+        return;
+    }
+    set_control_owner(st, "human");
+    st.last_llm_activity = None;
+    // Only when somebody is WATCHING (an A/V client is attached): that is the shared machine
+    // the human sees. A machine nobody watches stays where its bounded run stopped it, so a
+    // caller that inspects it after a pause finds it still.
+    let capped_pause = st.av_subscribers > 0
+        && !st.session.running
+        && st.ctrl_stop.as_ref().map(|s| s.reason) == Some("budget");
+    if capped_pause {
+        st.session.running = true;
+        st.ctrl_stop = None;
+        let sid = st.session.id.clone();
+        let pacing = json!({ "mode": st.pacing_mode, "ratio": st.pacing_ratio });
+        st.notify.broadcast("debug/running", json!({ "session_id": sid, "pacing": pacing }));
     }
 }
 
@@ -16156,7 +16114,7 @@ fn transport_move_to(st: &mut State, index: usize) -> Result<Value, String> {
         st.transport_shown_frame = if want_first { "first" } else { "second" };
     }
 
-    // At the head the transport lets go: the stream loop owns the machine again and new
+    // At the head the transport lets go: the run loop owns the machine again and new
     // anchors are recorded. Anywhere else it holds on, and the mode says REPLAY — the
     // anchors ahead are still intact and can be played forward.
     st.transport.cursor = if at_head { None } else { Some(id) };
@@ -16183,18 +16141,10 @@ fn transport_step(st: &mut State, delta: i64) -> Result<Value, String> {
     // to see.
     let at_head = st.transport.cursor.is_none();
     if delta > 0 && at_head {
-        let frame_no = st.ctrl_frame;
-        {
-            let (w, h, indices) = st.session.machine.render_canvas_indices();
-            let frame = st.session.machine.timing().cycles_per_frame;
-            stream_maybe_autocapture(st, frame_no, frame, w, h, &indices);
-        }
-        let mut sink = trx64_core::NullSink;
-        st.session.machine.run_for_full(
-            st.session.machine.timing().cycles_per_frame * delta as u64,
-            &mut sink,
-            |_, _, _, _, _, _, _| {},
-        );
+        // A run of `delta` frames through the one advance: stops where a run stops, and the
+        // advance takes the anchor of the frames it crosses.
+        let frame = st.session.machine.timing().cycles_per_frame;
+        run_inline(st, frame * delta as u64);
         st.ctrl_frame = st.ctrl_frame.wrapping_add(delta as u64);
         st.transport.mode = transport::TransportMode::StepFwd;
         let mut out = transport_status(st);
@@ -16403,7 +16353,7 @@ fn transport_pause(st: &mut State) -> Value {
     out
 }
 
-/// One transport tick, called by the stream loop per frame while playing. Returns true
+/// One transport tick, called by the run loop per frame while playing. Returns true
 /// when the transport consumed the frame (so the loop must NOT advance emulation).
 pub(crate) fn transport_tick(st: &mut State, budget_cycles: u64) -> bool {
     let Some(dir) = st.transport.playing else {
@@ -16566,7 +16516,7 @@ fn sandbox_cow_media(
     let mut write = |name: &str, bytes: &[u8]| -> Result<(), String> {
         std::fs::create_dir_all(folder).map_err(|e| format!("sandbox: {}: {e}", folder.display()))?;
         let path = folder.join(name);
-        std::fs::write(&path, bytes).map_err(|e| format!("sandbox: {}: {e}", path.display()))?;
+        write_output(&path, bytes).map_err(|e| format!("sandbox: {}: {e}", path.display()))?;
         files.push(json!(path.to_string_lossy()));
         Ok(())
     };
@@ -16980,18 +16930,6 @@ struct ProbeRange {
     lens: &'static str,
 }
 
-/// The per-whole-frame background work `session/run` does for its span (cart/disk
-/// write-back, the checkpoint ring, the recorder feed), once for one frame crossed.
-/// No render: the ring takes no thumbnail for the anchor, and nothing is drawn per sample.
-fn frame_background_work(st: &mut State, cycles_per_frame: u64) {
-    let now = now_ms();
-    stream_maybe_autopersist_cart(st, now);
-    stream_maybe_autopersist_disk(st, now);
-    let frame_no = st.ctrl_frame;
-    stream_maybe_autocapture(st, frame_no, cycles_per_frame, 0, 0, &[]);
-    stream_maybe_feed_recorder(st, frame_no);
-}
-
 /// Spec 901 D2 — `session/frame_probe`. Advances the paused machine `frames` frames and
 /// samples `addresses` once per frame, at the first instruction boundary at or after the
 /// raster position (`line`, `cycle`). Every reported position is the one the sample was
@@ -17111,7 +17049,6 @@ fn frame_probe(st: &mut State, p: &Value) -> Result<Value, (i64, String)> {
     let first_line = g.first_line;
     let target = ((line + lpf - first_line) % lpf) * cpl + cycle;
     let start_clk = st.session.machine.clk;
-    let mut acc = 0u64; // cycles since the last whole frame was settled
     let mut rows: Vec<Value> = Vec::new();
     let mut prev: Option<Vec<u8>> = None;
     let mut changes = 0u64;
@@ -17126,33 +17063,36 @@ fn frame_probe(st: &mut State, p: &Value) -> Result<Value, (i64, String)> {
             (target + cpf - pos - 1) % cpf + 1
         };
         if delta > 0 {
-            let before = st.session.machine.clk;
-            let ran = run_budget_honouring_breaks(st, delta);
-            acc += st.session.machine.clk.saturating_sub(before);
-            while acc >= cpf {
-                acc -= cpf;
-                frame_background_work(st, cpf);
-            }
-            if let BudgetRun::Halted { reason, pc, num, registers, cycles } = ran {
+            // A run of `delta` cycles through the one advance: it stops where a run stops
+            // (breakpoint, watchpoint, JAM), and the frames it crosses get their per-frame
+            // work from the advance itself, once per frame of machine time.
+            let seq0 = st.halt_seq;
+            run_inline(st, delta);
+            if st.halt_seq != seq0 {
+                if let Some(pc) = st.ctrl_stop.as_ref().filter(|c| c.reason == "jam").map(|c| c.pc) {
+                    return Err((-32003, format!(
+                        "session/frame_probe: the CPU jammed at ${pc:04x} in frame {frame} (c64Cycles {})",
+                        st.session.machine.clk
+                    )));
+                }
+                let cycles = st.session.machine.clk;
+                let hit = st.last_halt_stop.clone().unwrap_or(Value::Null);
+                let reason = hit["reason"].as_str().unwrap_or("breakpoint").to_string();
+                let pc = hit["pc"].as_u64().unwrap_or(st.session.machine.c64_core.reg_pc as u64);
+                let num = st.mon.breakpoints.entries.iter().find(|e| e.pc as u64 == pc).map(|e| e.num).unwrap_or(0) as u64;
+                let registers = register_dump(&st.session);
                 let at = frame_position(&st.session.machine);
                 let layout: Vec<Value> = ranges
                     .iter()
                     .map(|r| json!({ "addr": r.addr as u64, "len": r.len, "lens": r.lens }))
                     .collect();
                 return Ok(json!({
-                    "stopped": if reason == "observer" { "watchpoint" } else { reason },
+                    "stopped": if reason == "observer" { "watchpoint" } else { reason.as_str() },
                     "frame": frame, "c64Cycles": cycles,
-                    "line": (at / cpl + first_line) % lpf, "cycle": at % cpl, "pc": pc as u64,
-                    "breakpoint": { "pc": pc as u64, "num": num, "registers": registers },
+                    "line": (at / cpl + first_line) % lpf, "cycle": at % cpl, "pc": pc,
+                    "breakpoint": { "pc": pc, "num": num, "registers": registers },
                     "rows": rows, "samples": samples, "changes": changes, "layout": layout,
                 }));
-            }
-            if check_and_handle_jam(st) {
-                let pc = jammed_pc(st);
-                return Err((-32003, format!(
-                    "session/frame_probe: the CPU jammed at ${pc:04x} in frame {frame} (c64Cycles {})",
-                    st.session.machine.clk
-                )));
             }
         }
         let m = &st.session.machine;
@@ -17208,15 +17148,29 @@ fn frame_probe(st: &mut State, p: &Value) -> Result<Value, (i64, String)> {
 /// Advance a PAUSED machine to the next raster wrap (line 0): the frame boundary. Watches
 /// the wrap rather than aiming at a cycle number: a single-cycle budget still completes the
 /// instruction in flight, so `raster_cycle` can step over any exact value, a wrap cannot.
-fn advance_to_frame_boundary(session: &mut Session) -> Result<(), String> {
+/// Each cycle is a one-cycle run of the one advance ([`run_inline`]), so a breakpoint or a
+/// JAM on the way stops it where it would stop any run, and the call says so.
+fn advance_to_frame_boundary(st: &mut State) -> Result<(), String> {
+    let seq0 = st.halt_seq;
     let (clk, line, cap) = {
-        let m = &session.machine;
+        let m = &st.session.machine;
         (m.clk, m.vic.raster_line, 2 * m.timing().cycles_per_frame + 128)
     };
-    advance_to_boundary_by(clk, line, cap, || {
-        run_cycle_budget(session, 1);
-        (session.machine.clk, session.machine.vic.raster_line)
-    })
+    let mut stopped = false;
+    let r = advance_to_boundary_by(clk, line, cap, || {
+        if !stopped {
+            run_inline(st, 1);
+            stopped = st.halt_seq != seq0;
+        }
+        (st.session.machine.clk, st.session.machine.vic.raster_line)
+    });
+    match r {
+        Err(_) if stopped => {
+            let pc = st.session.machine.c64_core.reg_pc;
+            Err(format!("stopped at ${pc:04x} before the raster wrapped"))
+        }
+        other => other,
+    }
 }
 
 /// Spec 905 D3 — the same advance on a bare machine (a sandbox run has no session): one
@@ -17246,9 +17200,14 @@ fn advance_to_boundary_by(
     let mut clk = start;
     while !landed && clk.saturating_sub(start) < cap {
         let (c, line) = step();
+        // A step that moved nothing was stopped (a breakpoint on the way): stuck, not slow.
+        let stuck = c == clk;
         clk = c;
         landed = line == 0 && prev_line != 0;
         prev_line = line;
+        if stuck {
+            break;
+        }
     }
     if !landed {
         return Err(format!(
@@ -17317,7 +17276,7 @@ pub(crate) fn switch_session_model(
     transport_truncate_on_intervention(st);
     let was_running = st.session.running;
     st.session.running = false;
-    let transplant = switch_at_frame_boundary(&mut st.session, row);
+    let transplant = switch_at_frame_boundary(st, row);
     st.session.running = was_running;
     let t = transplant?;
     out["switched"] = json!(true);
@@ -17356,12 +17315,12 @@ fn note_model_switch(
 /// the switch a live request does: advance to the frame boundary (raster line 0), carry the
 /// machine onto `row`, and say what was kept. The caller pauses and resumes.
 fn switch_at_frame_boundary(
-    session: &mut Session,
+    st: &mut State,
     row: &'static trx64_core::model::C64Model,
 ) -> Result<Value, String> {
-    advance_to_frame_boundary(session)?;
-    let out = transplant_machine(&mut session.machine, row)?;
-    session.model = row;
+    advance_to_frame_boundary(st)?;
+    let out = transplant_machine(&mut st.session.machine, row)?;
+    st.session.model = row;
     Ok(out)
 }
 
@@ -17459,16 +17418,21 @@ fn undump_native_snapshot(st: &mut State, path: &str) -> Result<UndumpResult, St
     // attach into a real, picker-visible mount whose writes persist to a file the user
     // owns (and can abräumen). The dir is tagged in `materialized_media` so
     // `undump_media_purge` can later kill ONLY what undump created.
+    //
+    // Spec 910 D1: under `--scratch` the sidecar is a fresh directory in the scratch dir, not
+    // a folder beside the snapshot the caller owns.
     let media_dir = {
         let p = std::path::Path::new(path);
         let stem = p
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "snapshot".to_string());
-        p.parent()
-            .map(|d| d.to_path_buf())
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(format!("{stem}_media"))
+        scratch::media_dir(
+            p.parent()
+                .map(|d| d.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(format!("{stem}_media")),
+        )
     };
     let mut materialized_any = false;
 
@@ -17501,14 +17465,17 @@ fn undump_native_snapshot(st: &mut State, path: &str) -> Result<UndumpResult, St
             .unwrap_or_else(|| format!("drive8.{}", rm.reference.format));
         let backing = match std::fs::create_dir_all(&media_dir).and_then(|_| {
             let fp = media_dir.join(&fname);
-            std::fs::write(&fp, &bytes).map(|_| fp)
+            write_medium(&fp.to_string_lossy(), &bytes).map(|_| fp)
         }) {
             Ok(fp) => {
                 materialized_any = true;
                 Some(fp.to_string_lossy().to_string())
             }
             // Materialization is best-effort: on a write failure fall back to the
-            // in-memory attach (never break the undump over a filesystem hiccup).
+            // in-memory attach (never break the undump over a filesystem hiccup). The
+            // dump's `source_name` is the file the disk once came from: under `--scratch`
+            // it is not a backing file to write to.
+            Err(_) if scratch::active() => None,
             Err(_) => rm.reference.source_name.clone(),
         };
         st.session.machine.drive8.attach_disk(DiskImage {
@@ -17557,7 +17524,7 @@ fn undump_native_snapshot(st: &mut State, path: &str) -> Result<UndumpResult, St
                 .unwrap_or_else(|| "cart.crt".to_string());
             if std::fs::create_dir_all(&media_dir).is_ok() {
                 let cp = media_dir.join(&cname);
-                if std::fs::write(&cp, &cart_bytes).is_ok() {
+                if write_medium(&cp.to_string_lossy(), &cart_bytes).is_ok() {
                     materialized_any = true;
                     let cps = cp.to_string_lossy().to_string();
                     st.session.cart_path = cps.clone();
@@ -17604,7 +17571,7 @@ fn undump_native_snapshot(st: &mut State, path: &str) -> Result<UndumpResult, St
     let cycle = st.session.machine.c64_core.clk;
     st.session.running = false;
     st.mon.state.disasm_cursor = Some(pc); // bare `d` follows the restored PC
-    // Refresh the paused canvas to the RESTORED frame. The `--stream` paused loop is
+    // Refresh the paused canvas to the RESTORED frame. The paused run loop is
     // otherwise silent (it only advances a running machine), so without this the UI
     // keeps showing the pre-undump picture — a restore that "looks borked / not 1:1".
     // Mirrors `checkpoint/restore` (main.rs ~10546): request a one-shot present; the
@@ -18008,7 +17975,7 @@ fn ringbuffer_dump_to_path(st: &State, path: &str) -> Result<Value, String> {
     if let Some(parent) = std::path::Path::new(path).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    std::fs::write(path, &bytes).map_err(|e| format!("write {path}: {e}"))?;
+    write_output(path, &bytes).map_err(|e| format!("write {path}: {e}"))?;
     let info = dump.info(bytes.len() as u64);
     Ok(ring_dump_info_to_json(&info))
 }
@@ -18432,14 +18399,14 @@ struct CheckpointThumb {
 }
 
 /// Spec 769.5a — downscale the JUST-RENDERED live canvas (the per-frame 384×272
-/// 4-bit `indices` the stream loop built for the video broadcast) into a thumbnail.
+/// 4-bit `indices` the run loop built for the video broadcast) into a thumbnail.
 /// The TRX64 mirror of `makeCheckpointThumbnail` (inspect/checkpoint-thumbnail.ts:30):
 /// same nearest-neighbour 1/factor downscale, same `{ width, height, palette(48 RGB),
 /// indices(w*h) }` shape. c64re grabs the thumbnail from the live frame at capture
 /// time (its literal-port VIC is per-cycle stateful → no pure snapshot→frame fn) and
 /// stores it in a SEPARATE map keyed by the checkpoint id — decoupled from the
 /// ring's (framebuffer-omitted, BUG-049) auto-capture anchor. This builds the same
-/// thumbnail from the live canvas the stream loop already has in hand, so the
+/// thumbnail from the live canvas the run loop already has in hand, so the
 /// framebuffer-omitted auto-anchors still get a real picture. Returns None if the
 /// canvas is empty.
 fn make_thumb_from_canvas(w: usize, h: usize, indices: &[u8]) -> Option<CheckpointThumb> {
@@ -18523,8 +18490,8 @@ async fn handle_connection(
     hub: Option<Arc<streaming::StreamHub>>,
 ) {
     // A client that only speaks RPC (C64RE's MCP keeps one such socket for its whole
-    // life) connects with `?av=0`: it gets no A/V push, does not start the pacing loop,
-    // and is not an A/V subscriber — so it does not hold the idle clock (Spec 887).
+    // life) connects with `?av=0`: it gets no A/V push and is not an A/V subscriber — so it
+    // does not hold the idle clock (Spec 887). The machine runs either way (Spec 910 D6).
     // Everyone else is subscribed on connect, as before.
     let av_wanted = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let av_flag = Arc::clone(&av_wanted);
@@ -18570,13 +18537,10 @@ async fn handle_connection(
         }
     });
 
-    // Subscribe this client to the SINGLETON live A/V stream IFF the daemon was
-    // launched with --stream (the hub starts the one streaming loop on the first
-    // subscriber, stops it when the last leaves). ws-av-tap is read-only, so it
-    // receives the push purely by connecting. Held until disconnect; dropping the
-    // guard unsubscribes (+ stops the loop if last). When streaming is OFF (the
-    // oracle's command-driven daemons), the machine never auto-advances on connect,
-    // so the byte-exact gates are unperturbed.
+    // Subscribe this client to the live A/V stream (the run loop pushes each presented
+    // frame to the subscribers; it advances the machine whether there are any or not).
+    // ws-av-tap is read-only, so it receives the push purely by connecting. Held until
+    // disconnect; dropping the guard unsubscribes.
     let _stream = hub
         .as_ref()
         .filter(|_| av_wanted.load(std::sync::atomic::Ordering::Relaxed))
@@ -18585,8 +18549,7 @@ async fn handle_connection(
     // Register this client's outbound channel with the (always-present) generic
     // notification hub so handler-driven server pushes (debug/breakpoint_hit,
     // audio/flush, batch/progress) reach it. The guard unsubscribes on disconnect.
-    // (Unlike the A/V `StreamHub`, this exists with or without --stream, so the
-    // notifications work for the oracle's command-driven daemons too.)
+    // (Unlike the A/V `StreamHub`, every connection registers here, `?av=0` ones too.)
     let _notify = {
         let notify = state.lock().unwrap().notify.clone();
         notify.subscribe(out_tx.clone())
@@ -18615,7 +18578,17 @@ async fn handle_connection(
         let response = match serde_json::from_str::<Request>(&text) {
             Ok(req) => {
                 shutting_down = req.method == "daemon/shutdown";
-                dispatch(req, &state)
+                // A request that parks on a stop (`debug/run {wait}`, `session/run`,
+                // `debug/continue`, `session/tick`) holds this worker for as long as the run
+                // lasts; tell the runtime, so the other connections keep their workers.
+                if matches!(
+                    req.method.as_str(),
+                    "debug/run" | "session/run" | "debug/continue" | "session/tick"
+                ) {
+                    tokio::task::block_in_place(|| dispatch(req, &state))
+                } else {
+                    dispatch(req, &state)
+                }
             }
             Err(e) => Response::err(
                 Value::Null,
@@ -18658,16 +18631,18 @@ async fn handle_connection(
 // drift between the embedded path and the socket path). This is a pure EXTRACTION
 // of the initializer that previously sat inline in `main()` — no behaviour change.
 
-/// Build the singleton [`State`] from an already-booted [`Session`]. `streaming_on`
-/// only stamps `streaming_enabled` (the FFI has no `--stream` A/V hub; it consumes
-/// `NotifyHub` events directly), so it is `false` for an FFI embed.
-pub fn build_state(mut session: Session, streaming_on: bool) -> State {
-    // Requirement (10-day standing): daemon up ⟹ C64 runs. A STREAMING (UI) daemon
-    // starts the machine in the RUNNING state so the pacing loop advances it
-    // immediately once the UI attaches — the user/LLM pauses ONLY via an explicit
-    // Freeze (debug/pause). A non-streaming (oracle / byte-exact) daemon stays paused
-    // (Session::new default) for deterministic, manually-driven runs.
-    if streaming_on {
+/// Build the singleton [`State`] from an already-booted [`Session`]. `run_from_start` is
+/// the one thing that differs between a daemon and an embedded host:
+///
+/// * the daemon passes `true` (daemon up ⟹ C64 runs): the machine starts RUNNING and the
+///   run loop ([`streaming::start_run_loop`]) carries it from the first cycle, whether a
+///   client is attached or not — the user/LLM pauses ONLY via an explicit debug/pause.
+/// * an embedded host (the FFI, the in-process CLI) passes `false`: there is no run loop
+///   thread, the host's own clock advances the machine (`session/tick`, or a request that
+///   waits for a stop), through the SAME advance the loop uses, and it starts the machine
+///   when it wants it (`debug/run`, `session/play`). It consumes `NotifyHub` events directly.
+pub fn build_state(mut session: Session, run_from_start: bool) -> State {
+    if run_from_start {
         session.running = true;
     }
     let model = session.model;
@@ -18703,8 +18678,13 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         materialized_media: Vec::new(),
         batches: std::collections::HashMap::new(),
         notify: streaming::NotifyHub::new(),
-        streaming_enabled: streaming_on,
-        pump_idle: false,
+        av_subscribers: 0,
+        loop_thread: false,
+        loop_cv: Arc::new(std::sync::Condvar::new()),
+        halt_seq: 0,
+        last_halt_stop: None,
+        frame_work_off: false,
+        access_probe: None,
         pacing_mode: "realtime".to_string(),
         pacing_ratio: 1.0,
         control_owner: "human".to_string(),
@@ -18733,7 +18713,7 @@ pub fn build_state(mut session: Session, streaming_on: bool) -> State {
         transport_raw_frame: false,
         transport_shown_frame: "second",
         audio_epoch: 0,
-        recorder_frames_since: 0,
+        recorder_cycles_since: 0,
         sandbox_seq: 0,
         sandbox_ends: std::collections::VecDeque::new(),
         sandbox_stamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0).to_string(),
@@ -18800,7 +18780,7 @@ pub fn notify_hub(state: &SharedState) -> Arc<streaming::NotifyHub> {
 // SAME `&SharedState` lock every handler uses — they do NOT touch `dispatch` or any
 // existing method. The app pulls at its own cadence (per video frame, per audio
 // callback). Mirrors what `session/screenshot` (frame) and the `streaming.rs`
-// stream loop (audio) already do internally, but returns raw `Send` bytes instead of
+// run loop (audio) already do internally, but returns raw `Send` bytes instead of
 // a base64/PNG JSON envelope.
 
 /// The current displayed frame as a full-resolution palette + index image — the
@@ -18853,7 +18833,7 @@ pub const AUDIO_SAMPLE_RATE: u32 = 44_100;
 
 /// Drain + return the SID PCM accumulated since the last drain (empties on read).
 ///
-/// PERSISTENT-ENGINE render thread (mirrors the `--stream` loop / C64RE Spec 768):
+/// PERSISTENT-ENGINE render thread (mirrors the run loop / C64RE Spec 768):
 ///
 /// First call: install the additive SID `set_sid_write_trace` hook (capturing
 /// $D4xx writes into a shared buffer) + spawn the render thread. The render thread
@@ -18894,7 +18874,7 @@ pub fn pull_audio_drain(state: &SharedState) -> AudioDrainData {
         }
         st.audio_hooked_generation = st.machine_generation;
         // Snapshot the live SID register file so the render thread primes reSID from the
-        // live state (frequencies/PW/control already set), exactly like the stream loop.
+        // live state (frequencies/PW/control already set), exactly like the run loop.
         let mut prime: Vec<(u8, u8)> = Vec::with_capacity(0x19);
         for reg in 0u8..=0x18 {
             let v = st.session.machine.read_full(0xD400 + reg as u16);
@@ -18950,7 +18930,7 @@ pub fn pull_audio_drain(state: &SharedState) -> AudioDrainData {
                             engine.set_clock_freq(clock_hz as f64);
                             // Drain THIS window: replay writes (CPU order) → boundary →
                             // flush → PCM, on the PERSISTENT engine. Identical to the
-                            // stream loop's per-frame sequence.
+                            // run loop's per-frame sequence.
                             for (addr, value) in &window_writes {
                                 engine.record_write(*addr, *value);
                             }
@@ -19100,6 +19080,15 @@ async fn main() {
 
     trx64_core::elog!("[trx64] project = {:?}", cli.project);
 
+    // Spec 910 D1 — before any request can hand the daemon a medium.
+    if let Some(dir) = cli.scratch.as_deref() {
+        if let Err(e) = scratch::enable(dir) {
+            trx64_core::elog!("[trx64] --scratch: {e}");
+            std::process::exit(2);
+        }
+        trx64_core::elog!("[trx64] --scratch {dir}: media are opened from copies there and never written back");
+    }
+
     // Take the port FIRST, before any machine work. Several C64RE servers warm-start a
     // daemon on the same port at once; the losers must do nothing and leave quietly so
     // every client attaches to the winner. A port somebody else owns is that case, not
@@ -19177,11 +19166,6 @@ async fn main() {
         }
     }
 
-    // Spec 767 — presentation is how the daemon WORKS: whenever the C64 advances, the frames
-    // are visible to any connected client. There is NO `--stream` flag — the A/V hub + the
-    // connect-time auto-run are always on. `--headless` is the sole opt-out (byte-exact oracle
-    // / conformance / tool daemons that want a silent, deterministic, no-auto-run machine).
-    let streaming_on = !cli.headless;
     // Spec 851 D1 — the machine is set before any client can make it run.
     let Some(machine_profile) = trx64_core::vic::SpeedProfile::parse(&cli.machine) else {
         trx64_core::elog!("[trx64] --machine: unknown '{}' (c64 | u64 | 128)", cli.machine);
@@ -19191,12 +19175,12 @@ async fn main() {
         trx64_core::elog!("[trx64] --speed-table: unknown '{}' (u64ii | u64)", cli.speed_table);
         std::process::exit(2);
     };
-    let state: SharedState = Arc::new(Mutex::new(build_state(session, streaming_on)));
+    let state: SharedState = Arc::new(Mutex::new(build_state(session, true)));
     {
         let mut st = state.lock().unwrap();
         st.speed_profile = machine_profile;
         // Spec 853 — the port device goes on before power-on, for the same reason 851's
-        // profile does: a program probes for it in its boot stub, inside the warm-up.
+        // profile does: a program probes for it in its boot stub, in the first frames it runs.
         if let Some(kb) = cli.reu {
             if !st.session.machine.attach_reu(kb) {
                 trx64_core::elog!("[trx64] --reu: {kb} KiB is not an REU size (128 | 256 | 512 | 1024..16384)");
@@ -19238,20 +19222,16 @@ async fn main() {
         trx64_core::elog!("[trx64] machine = {}", machine_profile.name());
     }
 
-    // The singleton live A/V stream hub (ADR-073): one pacing loop drives the singleton
-    // machine and broadcasts BIN_VIC/BIN_AUDIO to all connected clients. Spec 767 — created
-    // BY DEFAULT (the C64's work is always visible); only `--headless` skips it → None, so a
-    // silent deterministic machine never auto-runs on connect (byte-exact oracle stays clean).
-    let hub: Option<Arc<streaming::StreamHub>> = if streaming_on {
-        trx64_core::elog!(
-            "[trx64] live A/V push ON (default): clients auto-subscribed at ~{:.2} fps (--headless to disable)",
-            model.timing.frame_rate
-        );
-        Some(streaming::StreamHub::new(Arc::clone(&state)))
-    } else {
-        trx64_core::elog!("[trx64] --headless: silent deterministic machine (no A/V push, no auto-run)");
-        None
-    };
+    // Spec 910 D6 — one daemon, one way to run. The machine free-runs from startup, with or
+    // without a client: the run loop is gated only on `running` and the pace. The A/V stream
+    // hub (ADR-073) is a consumer of that loop — frames and audio go out to the clients that
+    // subscribe (`?av=0` connections never do), and the loop pushes nothing while nobody does.
+    let hub: Option<Arc<streaming::StreamHub>> = Some(streaming::StreamHub::new(Arc::clone(&state)));
+    let _run_loop = streaming::start_run_loop(&state, hub.clone());
+    trx64_core::elog!(
+        "[trx64] machine running at ~{:.2} fps; A/V push to subscribed clients",
+        model.timing.frame_rate
+    );
 
     trx64_core::elog!(
         "[trx64] TRX64 {} ({}) listening on ws://{addr}",
@@ -19261,8 +19241,8 @@ async fn main() {
 
     // Spec 887 — the idle watch. Once a second: an A/V stream subscriber or a recording
     // trace holds the clock; with neither, and no request, for the whole window, persist
-    // the media as eject would and end with exit 0. A plain RPC connection (`?av=0`, or
-    // any connection on a --headless daemon) holds nothing: only what it sends counts.
+    // the media as eject would and end with exit 0. A plain RPC connection (`?av=0`)
+    // holds nothing: only what it sends counts.
     spawn_signal_watch(Arc::clone(&state));
 
     if cli.idle_exit > 0 {
@@ -19456,8 +19436,13 @@ mod batch1_tests {
             materialized_media: Vec::new(),
             batches: std::collections::HashMap::new(),
             notify: streaming::NotifyHub::new(),
-            streaming_enabled: false,
-            pump_idle: false,
+            av_subscribers: 0,
+            loop_thread: false,
+            loop_cv: Arc::new(std::sync::Condvar::new()),
+            halt_seq: 0,
+            last_halt_stop: None,
+            frame_work_off: false,
+            access_probe: None,
             cart_led_gen: 0,
             cart_led_last_write_at: None,
             pacing_mode: "realtime".to_string(),
@@ -19486,7 +19471,7 @@ mod batch1_tests {
         transport_raw_frame: false,
         transport_shown_frame: "second",
             audio_epoch: 0,
-            recorder_frames_since: 0,
+            recorder_cycles_since: 0,
         sandbox_seq: 0,
         sandbox_ends: std::collections::VecDeque::new(),
         sandbox_stamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0).to_string(),
@@ -20444,7 +20429,7 @@ mod batch1_tests {
     }
 
     /// The in-process CLI cockpit pumps the machine through `session/run`, not through
-    /// the daemon's stream loop. So the transport has to be honoured there too, or
+    /// the daemon's run loop. So the transport has to be honoured there too, or
     /// `play back` in `trx64cli` would set a flag nobody ticks — and a running pump
     /// would advance the machine ON TOP of a restore, which is exactly the divergence
     /// only an intervention is allowed to cause. Found by smoke-testing the built
@@ -20497,13 +20482,14 @@ mod batch1_tests {
         // the clock does not move. The contract under test is the handover.)
     }
 
-    /// The pump path must do the SAME per-frame work as the stream loop. Three bugs in
-    /// one session came from it not doing so: the checkpoint ring stayed empty under
-    /// `trx64cli` (so every transport verb answered "no anchors"), and a cart or disk
-    /// the game wrote never reached the host file. The daemon's stream loop had all
-    /// four helpers; the CLI cockpit pumps through `session/run` and had none.
+    /// A host that pumps the machine itself must get the SAME per-frame work as the daemon's
+    /// run loop. Three bugs in one session came from the pump not doing so: the checkpoint
+    /// ring stayed empty under `trx64cli` (so every transport verb answered "no anchors"),
+    /// and a cart or disk the game wrote never reached the host file. Since Spec 910 D9 the
+    /// work lives in the advance itself, which the run loop and every pump call, so a pump
+    /// cannot forget it; this pins that for `session/run`.
     #[test]
-    fn the_pump_path_does_the_same_per_frame_work_as_the_stream_loop() {
+    fn the_pump_path_does_the_same_per_frame_work_as_the_run_loop() {
         let st = make_state();
         // One anchor per pumped frame, so a handful of pumps must fill the ring.
         mon(&st, "cadence 1").expect("cadence 1");
@@ -20520,7 +20506,7 @@ mod batch1_tests {
              the in-process cockpit."
         );
 
-        // And the transport works off what the pump captured, with no stream loop in
+        // And the transport works off what the pump captured, with no run loop in
         // sight — which is the whole point of the parity requirement.
         let out = mon(&st, "frame -2").expect("step back");
         assert!(out.contains("STEP"), "{out}");
@@ -20688,7 +20674,7 @@ mod batch1_tests {
     /// The recording DENSITY must follow emulated time, not the caller's call rate.
     ///
     /// This is the bug behind "I only get about two seconds back". The auto-capture
-    /// counted CALLS: right for the daemon's stream loop (one call per frame), wrong for
+    /// counted CALLS: right for the daemon's run loop (one call per frame), wrong for
     /// the CLI cockpit, which pumps every 5 ms. At cadence 1 that recorded 200 anchors a
     /// second instead of 50, so a 500-anchor ring covered 2.5 seconds — and playing it
     /// back at a real 50/s then looked four times too slow, which was the other half of
@@ -20703,7 +20689,7 @@ mod batch1_tests {
         }
         let dense = st.lock().unwrap().checkpoint_ring.list().len();
 
-        // The same second delivered as 50 whole frames, like the stream loop does.
+        // The same second delivered as 50 whole frames, like the run loop does.
         let st2 = make_state();
         for _ in 0..50 {
             call(&st2, "session/run", json!({ "cycles": PAL_FRAME }));
@@ -20895,7 +20881,7 @@ mod batch1_tests {
     /// `session.running`, set and cleared by different verbs:
     ///
     ///   * `session/tick` and the transport advanced on `play_intent`
-    ///   * `debug/run` / `debug/continue` and the --stream loop on `session.running`
+    ///   * `debug/run` / `debug/continue` and the run loop on `session.running`
     ///   * `session/state` reported the OR of the two
     ///
     /// So a machine started through one and paused through the other kept pumping
@@ -21102,12 +21088,12 @@ mod batch1_tests {
 
     /// F10 — `play back` from a PAUSED machine took no step at all.
     ///
-    /// `play back` sets a DIRECTION and leaves the stepping to the stream pump, and the
-    /// pump only ticked the transport inside its `if running` branch. So the one state
+    /// `play back` sets a DIRECTION and leaves the stepping to the run loop, and the
+    /// loop only ticked the transport inside its `if running` branch. So the one state
     /// you press F10 in — paused, wanting to see what just happened — was the one state
     /// nothing moved in. The key set a flag and the picture never changed.
     ///
-    /// The pump now ticks the transport while paused too. This gates the tick itself:
+    /// The loop now ticks the transport while paused too. This gates the tick itself:
     /// a paused machine with a direction set MOVES.
     #[test]
     fn play_back_steps_a_paused_machine() {
@@ -22531,7 +22517,7 @@ mod batch1_tests {
         }
     }
 
-    /// The transport must hand the machine BACK at the head, or the stream loop would
+    /// The transport must hand the machine BACK at the head, or the run loop would
     /// never advance again and the emulator would look frozen with no error anywhere.
     #[test]
     fn reaching_the_head_releases_the_machine() {
@@ -22542,7 +22528,7 @@ mod batch1_tests {
         mon(&st, "frame +3").expect("fwd to head");
         assert!(
             !st.lock().unwrap().transport.holds_the_machine(),
-            "at the head the stream loop must own the machine again"
+            "at the head the run loop must own the machine again"
         );
     }
 
@@ -23451,7 +23437,7 @@ mod batch1_tests {
         // Audit ws-checkpoint-scrub-1 (oracle-BLOCKED — TS pushes a BINARY frame on
         // restore that the text ws-client cannot read; no JSON proxy). DIRECT
         // verification: a restore sets `force_present_frame` so the (otherwise silent)
-        // paused stream loop pushes ONE fresh BIN_VIC — the TRX64 mirror of TS's
+        // paused run loop pushes ONE fresh BIN_VIC — the TRX64 mirror of TS's
         // unconditional presentFrame() on restore (runtime-controller.ts:606-613, "no
         // client-grab dependency"). Holds for a paused restore (where TS's gap bit).
         let st = make_state();
@@ -23484,11 +23470,13 @@ mod batch1_tests {
             g.force_present_frame = false;
         }
         let hub = crate::streaming::StreamHub::new(Arc::clone(&st));
+        // The daemon's run loop is there from startup; a hub on its own pushes nothing.
+        let _run_loop = crate::streaming::start_run_loop(&st, Some(Arc::clone(&hub)));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let _sub = hub.subscribe(tx);
         // Assert the OUTCOME the name promises — a frame reaches the client — not the
-        // request flag. `subscribe` sets the flag and starts the stream thread, which
-        // CONSUMES it the moment it presents; reading the flag afterwards raced that
+        // request flag. `subscribe` sets the flag and the run loop CONSUMES it the
+        // moment it presents; reading the flag afterwards raced that
         // thread, and under a full workspace run it lost (flag already cleared, frame
         // already sent) and went red on a machine that was doing the right thing.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -23507,27 +23495,31 @@ mod batch1_tests {
     }
 
     #[test]
-    fn stream_pump_is_reported_only_while_an_av_client_is_subscribed() {
-        // C64RE #63 — a daemon with the A/V hub but nobody subscribed (no UI tab; the MCP
-        // socket is `?av=0`) has no pump thread. It used to report streamPump=true anyway, so
-        // the caller sent a capped `debug/run`, which was accepted (runState "running") and
-        // never advanced a cycle.
+    fn sid_streaming_is_reported_only_while_an_av_client_is_subscribed_and_the_machine_runs() {
+        // Spec 910 D6 — the run loop is there from startup whether or not anybody watches, so
+        // there is no "pump" to report any more (C64RE #63 asked whether one existed). What
+        // remains true is `sid.streaming`: live audio goes out only while an A/V client is
+        // subscribed AND the machine runs.
         let st = make_state();
-        st.lock().unwrap().streaming_enabled = true;
+        st.lock().unwrap().session.running = true;
         let hub = crate::streaming::StreamHub::new(Arc::clone(&st));
-        let pump = |st: &SharedState| call(st, "session/state", json!({}))["streamPump"].as_bool();
-        assert_eq!(pump(&st), Some(false), "hub without a subscriber: no pump");
+        let streaming = |st: &SharedState| call(st, "session/state", json!({}))["sid"]["streaming"].as_bool();
+        assert_eq!(streaming(&st), Some(false), "running, but nobody subscribed: no audio goes out");
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let sub = hub.subscribe(tx);
-        assert_eq!(pump(&st), Some(true), "a subscriber starts the pump");
+        assert_eq!(streaming(&st), Some(true), "a subscriber on a running machine streams");
+        st.lock().unwrap().session.running = false;
+        assert_eq!(streaming(&st), Some(false), "paused: nothing streams");
+        st.lock().unwrap().session.running = true;
         drop(sub);
-        assert_eq!(pump(&st), Some(false), "the last subscriber leaving stops it");
+        assert_eq!(streaming(&st), Some(false), "the last subscriber leaving ends the stream");
+        assert!(call(&st, "session/state", json!({})).get("streamPump").is_none(), "streamPump is gone");
     }
 
     #[test]
     fn snapshot_undump_requests_one_shot_frame_present() {
         // Regression (2026-07-15): a `.c64re` undump on a PAUSED machine must refresh the
-        // canvas to the RESTORED frame. The `--stream` paused loop only advances a
+        // canvas to the RESTORED frame. The paused run loop only advances a
         // running machine, so without a one-shot present the UI keeps the pre-undump
         // picture and the restore "looks borked / not 1:1" — the field report. The
         // framebuffer itself is captured/restored faithfully (vicPresentation); this
@@ -23921,8 +23913,9 @@ mod batch1_tests {
         // awaits a worker thread that is non-functional under tsx-from-src), so the
         // free-run anchor-GROWTH behaviour can't be compared cross-runtime there. This
         // test verifies the TRX64 behaviour DIRECTLY: with the recorder active, the
-        // stream loop's per-frame feed (`stream_maybe_feed_recorder`) captures a fresh
-        // anchor every `checkpoint_capture_every_frames()` frames — so the anchor count
+        // advance's per-frame feed (`stream_maybe_feed_recorder`, handed one frame of cycles
+        // per frame boundary crossed) captures a fresh anchor every
+        // `checkpoint_capture_every_frames()` frames — so the anchor count
         // GROWS over a free-run (was flat before the feed wiring), exactly the signal
         // the WS case would assert if the TS worker resolved.
         let st = make_state();
@@ -23936,8 +23929,8 @@ mod batch1_tests {
         // add exactly one anchor (the feed fires on frames_since == cadence).
         {
             let mut g = st.lock().unwrap();
-            for f in 0..(cadence * 3) {
-                stream_maybe_feed_recorder(&mut g, f as u64);
+            for _ in 0..(cadence * 3) {
+                stream_maybe_feed_recorder(&mut g, PAL_FRAME);
             }
         }
         let after = count(&st);
@@ -23946,8 +23939,8 @@ mod batch1_tests {
         let mid = count(&st);
         {
             let mut g = st.lock().unwrap();
-            for f in 0..(cadence.saturating_sub(1)) {
-                stream_maybe_feed_recorder(&mut g, f as u64);
+            for _ in 0..(cadence.saturating_sub(1)) {
+                stream_maybe_feed_recorder(&mut g, PAL_FRAME);
             }
         }
         assert_eq!(count(&st), mid, "a sub-cadence burst adds no anchor");
@@ -24402,11 +24395,11 @@ mod batch1_tests {
         // BEHAVIORAL: audit ws-session-debug-1 — debug/run is ASYNC-SCHEDULED. It
         // replies `running` IMMEDIATELY (= TS controller.run() → ctrl.state(), never
         // blocking) and does NOT run inline; the (P0-A) bp/observer/JAM-aware driver
-        // (`stream_debug_gated_advance`, the SOLE --stream machine driver) self-halts at
+        // (`stream_debug_gated_advance`, the run loop's advance) self-halts at
         // the first hit and server-PUSHes `debug/breakpoint_hit` at the halt PC with the
         // c64re shape { session_id, pc, num, cycles, registers }. This test drives that
-        // production driver directly (no stream loop runs in-process) after the async
-        // debug/run, exactly mirroring the --stream loop.
+        // production driver directly (no run loop runs in-process) after the async
+        // debug/run, exactly mirroring the run loop.
         let st = make_state();
         let mut rx = probe_notifications(&st);
         // Poke a runnable program at $C000: NOP; NOP; NOP; … (EA), so a numbered
@@ -24427,7 +24420,7 @@ mod batch1_tests {
         let run = call(&st, "debug/run", json!({}));
         assert_eq!(run["runState"], json!("running"), "debug/run replies running (async)");
         assert!(run["stop"].is_null(), "no halt inline — the driver halts later");
-        // Drive the production --stream per-frame driver until the bp trips (running
+        // Drive the production per-frame driver until the bp trips (running
         // gate is set by debug/run). One PAL frame is far more than the 3 NOPs need.
         {
             let mut g = st.lock().unwrap();
@@ -24592,9 +24585,9 @@ mod batch1_tests {
         out
     }
 
-    // ── BACKGROUND-LOOP layer proofs (the 3 stream_loop per-frame hooks) ──────
+    // ── BACKGROUND-LOOP layer proofs (the 3 run_loop per-frame hooks) ──────
     //
-    // These exercise the actual `stream_maybe_*` helpers the stream loop calls
+    // These exercise the actual `stream_maybe_*` helpers the run loop calls
     // each running frame (no live WS server / ROMs needed — `make_state()` is a
     // blank machine and the helpers operate on `State`). Each proves the
     // observable side effect the c64re RuntimeController produces with NO WS
@@ -24829,7 +24822,7 @@ mod batch1_tests {
     /// independent 1 s setInterval that fires regardless of run-state
     /// (runtime-controller.ts:219-226), so a flash delta then pause/JAM/bp before the
     /// debounce STILL reaches the host .crt. TRX64 previously drove the persist ONLY
-    /// from the stream loop's `if running` block on a FRAME counter (frame_seq advances
+    /// from the run loop's `if running` block on a FRAME counter (frame_seq advances
     /// only while running), so a dirty-then-pause never persisted. This test mounts a
     /// writable EasyFlash, drives a real byte-program (dirty), sets running=FALSE
     /// (paused), then ticks the WALL-CLOCK persist cadence past the debounce and
@@ -24865,13 +24858,13 @@ mod batch1_tests {
             cart.write(0x8100, 0x42, &bi, clk);
             assert!(cart.is_writable_dirty(), "dirty after program");
             // THE KEY PRECONDITION: the machine is PAUSED (running=false). The TS
-            // setInterval persist fires anyway; the TRX64 stream loop now calls the
+            // setInterval persist fires anyway; the TRX64 run loop now calls the
             // persist hooks EVERY iteration regardless of run-state, so the host file
             // must still update. (The pre-fix `if running` path never ran here.)
             st.session.running = false;
         }
 
-        // Drive the wall-clock persist cadence (the same call the stream loop now makes
+        // Drive the wall-clock persist cadence (the same call the run loop now makes
         // every iteration regardless of run-state). The machine stays PAUSED throughout.
         {
             let mut st = state.lock().unwrap();
@@ -25459,16 +25452,18 @@ mod batch1_tests {
     fn item3_autocapture_fills_ring_at_cadence_without_explicit_capture() {
         let state = make_state();
         // A synthetic non-uniform live canvas (384×272 4-bit), so the downscaled
-        // thumbnail is a real picture (>1 distinct index), like the live stream loop
-        // passes its just-rendered frame.
+        // thumbnail is a real picture (>1 distinct index): the capture renders the machine's
+        // displayed frame itself, so the frame is drawn into the machine.
         let (cw, ch) = (384usize, 272usize);
-        let canvas: Vec<u8> = (0..cw * ch).map(|i| (i % 16) as u8).collect();
+        for (i, b) in state.lock().unwrap().session.machine.vic.displayed.iter_mut().enumerate() {
+            *b = (i % 16) as u8;
+        }
         // Run enough frames for ~6 capture windows (~3 s @ 50 fps, cadence 25).
         let windows = 6u64;
         let total = checkpoint_capture_every_frames() * windows + 2;
         for frame in 0..total {
             let mut st = state.lock().unwrap();
-            stream_maybe_autocapture(&mut st, frame, PAL_FRAME, cw, ch, &canvas);
+            stream_maybe_autocapture(&mut st, frame, PAL_FRAME);
         }
         let st = state.lock().unwrap();
         let n = st.checkpoint_ring.list().len();
@@ -25513,12 +25508,13 @@ mod batch1_tests {
     #[test]
     fn thumbnails_count_matches_ring_for_omit_framebuffer_autoanchors() {
         let state = make_state();
-        let (cw, ch) = (384usize, 272usize);
-        let canvas: Vec<u8> = (0..cw * ch).map(|i| (i % 16) as u8).collect();
+        for (i, b) in state.lock().unwrap().session.machine.vic.displayed.iter_mut().enumerate() {
+            *b = (i % 16) as u8;
+        }
         let total = checkpoint_capture_every_frames() * 5 + 2;
         for frame in 0..total {
             let mut st = state.lock().unwrap();
-            stream_maybe_autocapture(&mut st, frame, PAL_FRAME, cw, ch, &canvas);
+            stream_maybe_autocapture(&mut st, frame, PAL_FRAME);
         }
         let list = call(&state, "checkpoint/list", json!({}));
         let ring_n = list["checkpoints"].as_array().unwrap().len();
@@ -25665,19 +25661,18 @@ mod batch1_tests {
 
     #[test]
     fn guardrail_warns_on_key_injection_into_free_running_core() {
-        // GUARDRAIL #1: session/key_down into a FREE-RUNNING core (running &&
-        // streaming) attaches a non-fatal freeRunWarning; a paused core does NOT.
+        // GUARDRAIL #1: session/key_down into a FREE-RUNNING core (running) attaches a
+        // non-fatal freeRunWarning; a paused core does NOT.
         let state = make_state();
 
         // Paused (default) → no warning.
         let paused = call(&state, "session/key_down", json!({ "key": "A" }));
         assert!(paused["freeRunWarning"].is_null(), "paused core: no warning");
 
-        // Mark the machine free-running (stream loop advancing).
+        // Mark the machine free-running (run loop advancing).
         {
             let mut st = state.lock().unwrap();
             st.session.running = true;
-            st.streaming_enabled = true;
         }
         let running = call(&state, "session/key_down", json!({ "key": "B" }));
         let warn = running["freeRunWarning"].as_str().expect("free-run warning attached");

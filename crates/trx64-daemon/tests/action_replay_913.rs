@@ -1,4 +1,4 @@
-//! Action Replay V5 / V6 through the real daemon binary, headless, on free ports.
+//! Action Replay V5 / V6 through the real daemon binary, on free ports.
 //!
 //! S7 is hermetic (a synthetic cartridge with an NMI handler, over two fresh daemons).
 //! S1, S2, S4 and S5 run on the real images in `~/Development/C64/Tools/Cartridges/
@@ -50,7 +50,7 @@ fn start(port: u16) -> Daemon {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_trx64-daemon"))
-        .args(["--port", &port.to_string(), "--headless"])
+        .args(["--port", &port.to_string()])
         .current_dir(&dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -156,6 +156,24 @@ async fn run(ws: &mut Ws, n: u64) -> J {
     rpc(ws, "session/run", serde_json::json!({ "cycles": n })).await
 }
 
+/// Mount and bring the machine to where the door used to leave it. A mount (a power cycle)
+/// runs nothing (Spec 910 D8): the machine stands on its first instruction, running, and the
+/// run loop takes it from there. So the first instruction is made a stop — the same cycle 0 on
+/// every fresh daemon — and the boot the door used to run before it answered, 5M cycles, is
+/// the test's own `session/run`.
+async fn mount_and_warm(ws: &mut Ws, params: J) -> J {
+    rpc(ws, "monitor/exec", serde_json::json!({ "command": "obs first when exec 0000..ffff do break" })).await;
+    let r = rpc(ws, "media/mount", params).await;
+    let until = Instant::now() + Duration::from_secs(10);
+    while rpc(ws, "debug/state", serde_json::json!({})).await["runState"] != "paused" {
+        assert!(Instant::now() < until, "the machine did not stop on its first instruction");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    rpc(ws, "monitor/exec", serde_json::json!({ "command": "obs first del" })).await;
+    run(ws, 5_000_000).await;
+    r
+}
+
 /// Hold `key` for `hold` cycles and let go.
 async fn tap(ws: &mut Ws, key: &str) {
     rpc(ws, "session/key_down", serde_json::json!({ "key": key })).await;
@@ -203,8 +221,7 @@ async fn counter(ws: &mut Ws) -> u32 {
 /// Mount `path`, leave the cartridge's start-up screen with F3 (NORMAL RESET), put the counter
 /// program in and RUN it.
 async fn boot_counter(ws: &mut Ws, d: &Daemon, path: &Path) {
-    rpc(ws, "media/mount", serde_json::json!({ "path": path.to_string_lossy() })).await;
-    rpc(ws, "debug/pause", serde_json::json!({})).await;
+    mount_and_warm(ws, serde_json::json!({ "path": path.to_string_lossy() })).await;
     tap(ws, "F3").await;
     run(ws, 2_000_000).await;
     let prg = d.1.join("counter.prg");
@@ -248,9 +265,8 @@ async fn s1_s2_each_image_mounts_as_crt_and_bin_and_boots_to_its_own_screen() {
             let p = copy_to(&d, &src, &format!("{stem}.{ext}"));
             let mut params = serde_json::json!({ "path": p.to_string_lossy() });
             params.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-            let r = rpc(&mut ws, "media/mount", params).await;
+            let r = mount_and_warm(&mut ws, params).await;
             assert_eq!(r["mapperType"], "action-replay", "{stem}.{ext}: {r}");
-            rpc(&mut ws, "debug/pause", serde_json::json!({})).await;
             run(&mut ws, 3_000_000).await;
 
             // session/state names the cartridge by family, banks and sha256
@@ -512,8 +528,7 @@ async fn synthetic_run() -> (J, Vec<u8>, J, Vec<String>) {
     let mut ws = connect(port).await;
     let p = d.1.join("synth.crt");
     std::fs::write(&p, synthetic_ar()).unwrap();
-    rpc(&mut ws, "media/mount", serde_json::json!({ "path": p.to_string_lossy() })).await;
-    rpc(&mut ws, "debug/pause", serde_json::json!({})).await;
+    mount_and_warm(&mut ws, serde_json::json!({ "path": p.to_string_lossy() })).await;
     run(&mut ws, 1_000_000).await;
     assert_ne!(ram(&mut ws, 0x0334, 1).await[0], 0, "the cartridge's program runs");
     assert_eq!(ram(&mut ws, 0x0335, 1).await[0], 0);
@@ -559,8 +574,7 @@ async fn s6_the_monitor_and_state_reads_leave_the_register_and_the_map_alone() {
     let mut ws = connect(port).await;
     let p = d.1.join("synth.crt");
     std::fs::write(&p, synthetic_ar()).unwrap();
-    rpc(&mut ws, "media/mount", serde_json::json!({ "path": p.to_string_lossy() })).await;
-    rpc(&mut ws, "debug/pause", serde_json::json!({})).await;
+    mount_and_warm(&mut ws, serde_json::json!({ "path": p.to_string_lossy() })).await;
     // a register value a stray read could change: RAM on, 16K game, bank 2
     rpc(&mut ws, "monitor/exec", serde_json::json!({ "command": "wr cpu de00 31" })).await;
     let before = cart(&mut ws).await;

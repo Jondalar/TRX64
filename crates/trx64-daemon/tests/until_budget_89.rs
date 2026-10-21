@@ -1,7 +1,7 @@
 //! C64RE #89 — `api/call until` honours the caller's cycle budget (`args[1].budget`), stops
 //! at the first instruction boundary at or past it, and `instructionsElapsed` counts
 //! instructions, not cycles. `stepOver` reads its budget from `args[0].budget`. The real
-//! binary, headless, on a free port, warmed to the BASIC prompt.
+//! binary, on a free port, warmed to the BASIC prompt.
 
 use futures_util::{SinkExt, StreamExt};
 use std::process::{Child, Command, Stdio};
@@ -28,7 +28,7 @@ fn start(port: u16) -> Daemon {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_trx64-daemon"))
-        .args(["--port", &port.to_string(), "--headless"])
+        .args(["--port", &port.to_string()])
         .current_dir(&dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())

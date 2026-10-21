@@ -10,7 +10,7 @@ fn a_port_already_owned_is_a_clean_exit_before_any_boot() {
     let owner = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = owner.local_addr().unwrap().port().to_string();
     let out = Command::new(env!("CARGO_BIN_EXE_trx64-daemon"))
-        .args(["--headless", "--port", &port])
+        .args(["--port", &port])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()

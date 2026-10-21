@@ -60,9 +60,9 @@ pub fn run_boot(
     let mut log: Vec<String> = Vec::new();
 
     // Spec 815 — BEFORE the mount. A cartridge probes for a turbo machine in its
-    // boot stub, and `media/mount` power-cycles + warms the boot by five million
-    // cycles: by the time the mount returns, the stub has already asked and been
-    // told "plain C64". The claim is the session's and survives the power-cycle, so
+    // boot stub, and `media/mount` power-cycles, and the machine starts running the moment
+    // it returns: the stub asks in its first frames and must be told
+    // "plain C64". The claim is the session's and survives the power-cycle, so
     // setting it first is both possible and the only order that works.
     if !turbo.eq_ignore_ascii_case("c64") || turbo_on {
         let t = engine.rpc("session/turbo", json!({ "mode": turbo }))?;
@@ -73,8 +73,8 @@ pub fn run_boot(
     let m = engine.rpc("media/mount", json!({ "path": disk }))?;
     log.push(format!("mount {disk}: {}", compact(&m)));
 
-    // Force the controller paused so session/run may drive cycles directly (it
-    // refuses while running, and a mount can flip it on).
+    // Pause the controller: a mount leaves the machine running (at the reset vector,
+    // cycle 0), and the warm-up below is a bounded run of its own.
     let _ = engine.rpc("debug/pause", json!({ "source": "cli-boot" }));
 
     // The speed BIT, unlike the claim, is a register — and a power-cycle clears a

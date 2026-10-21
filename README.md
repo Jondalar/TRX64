@@ -151,14 +151,23 @@ Superset based on VICE. Full reference: **[MONITOR.md](MONITOR.md)**;
 ## Daemon & API
 
 ```sh
-trx64-daemon --project <dir> --port 4312      # A/V streams by default
+trx64-daemon --project <dir> --port 4312      # the machine runs; A/V goes to subscribed clients
 trx64-daemon --machine u64 --reu 512          # an Ultimate with a 512 KiB REU
 trx64-daemon --georam 512                     # GeoRAM instead — the port holds one device
 trx64-daemon --machine u64 --speed-table u64  # the first Ultimate 64 (default: u64ii)
 trx64-daemon --model c64-ntsc                 # an NTSC C64 (--video ntsc is the same)
-trx64-daemon --headless                       # no A/V, no auto-run: command-driven only
 trx64-daemon --idle-exit 600                  # end after 10 min with no request, A/V viewer or trace
+trx64-daemon --scratch /tmp/run1              # never write a disk, cartridge or folder back: work on copies in that dir
 ```
+
+`--scratch <dir>` is for a machine that is only there to try something: every medium it is
+handed by a path, by any method and at any time (mount, swap, ingress, the monitor's `mount` and
+`swapcrt`, a folder device, a snapshot's embedded disk), is opened from a copy in `<dir>`, and
+every write — a `SAVE` to a disk, an EasyFlash flash write, eject, `media/persist`, the exit
+work — goes into that copy. The machine reads its own writes back; the file you named is never
+opened for writing. `session/state` reports `noWriteback` and `scratchDir`. The directory is
+yours and is left in place when the daemon ends. Without the option the daemon writes back as
+before.
 
 JSON-RPC 2.0 over WebSocket. One machine per process, serving one project: `ping` names it,
 and `project/set` moves the daemon to another one in place — media written back and ejected,
@@ -181,9 +190,19 @@ checkpoints record the model, and restoring one puts the machine back on it.
 A typical flow: `session/create` → `debug/run` → `monitor/exec` / `trace/*` / `vic/inspect`
 → `checkpoint/*` to scrub → `snapshot/dump` to persist.
 
-The per-frame driver — video, breakpoints, JAM auto-break, recorder — is on by default.
-`--headless` opts out: no A/V push, no auto-run on connect, and the machine advances only
-on an explicit `session/run`. That is the mode for byte-exact oracle and tool daemons.
+**One way to run.** Every daemon free-runs from startup, with or without a client: one run
+loop advances the machine, gated only on `running` and the pace, and does the per-frame work
+(checkpoint anchors, recorder, observers, breakpoints, JAM stop) once per frame of machine
+time, however a client chunks its calls. The A/V push is one more consumer of that loop —
+frames and audio go out to the clients that subscribe, nothing more. A run may be given a stop:
+`debug/run { "cycles": N, "pace": "warp", "wait": true }` stops on exactly the cycle N cycles
+on (or at a breakpoint or watchpoint, or a JAM), and with `wait` the call returns when it has;
+without `wait` the stop is pushed (`debug/paused`, `debug/breakpoint_hit`). `session/run
+{ "cycles": N }` is the old name for the same run, as fast as possible. Power on, the resets, a
+cartridge insert or eject, and a model or project switch run nothing: they leave the machine
+at the reset vector (cycle 0 after a power cycle), running, so a breakpoint on `$FCE2` or on a
+cartridge's cold start stops it there. There is no second kind of daemon: a sandbox is this
+daemon, started for a purpose.
 
 For embedding in the Apple universe, `trx64-ffi` exposes a typed uniffi library (Swift bindings):
 both drive positions, 1541 or 1581, D81 media and folder devices included —

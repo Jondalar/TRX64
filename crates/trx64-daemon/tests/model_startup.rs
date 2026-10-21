@@ -21,7 +21,7 @@ fn free_port() -> u16 {
 fn start(args: &[&str]) -> (bool, bool, Vec<String>) {
     let port = free_port().to_string();
     let mut child = Command::new(env!("CARGO_BIN_EXE_trx64-daemon"))
-        .args(["--headless", "--port", &port])
+        .args(["--port", &port])
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

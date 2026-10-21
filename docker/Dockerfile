@@ -80,9 +80,8 @@ VOLUME ["/play", "/state", "/opt/trx64/resources/roms"]
 USER trx64
 WORKDIR /state
 
-# Emulator VIEW = the DEFAULT streaming daemon (A/V push + auto-run on connect). NOT
-# --headless (that disables the frames the browser canvas needs — Spec 799 §3/§4.2 said
-# --headless from the pre-Spec-767 era when --stream was opt-in; it is now the default).
+# Emulator VIEW = the daemon as it is: the machine runs from startup, and every connection
+# that does not say `?av=0` gets the A/V push. There is no mode flag to choose.
 # Sessions are created over WS (session/create), not via a start flag.
 # Bind 0.0.0.0 (TRX64_BIND) so the sibling web-app container can reach the daemon over the
 # bridge — the local-127.0.0.1 default would only be reachable from inside this container.

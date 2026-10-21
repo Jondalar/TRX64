@@ -28,8 +28,9 @@ fn engine_or_skip() -> Option<Engine> {
 
 /// Run the machine far enough that the rings hold a useful window.
 fn warm(engine: &Engine) {
+    // A power-on runs nothing (Spec 910 D8): the boot is a run of its own.
     engine.exec_line("/power on");
-    engine.exec_line("z 200000");
+    engine.rpc("session/run", serde_json::json!({ "cycles": 1_000_000 })).expect("run the boot");
 }
 
 #[test]

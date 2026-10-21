@@ -23,11 +23,13 @@
 //!   BIN_AUDIO = 0x02 payload: raw s16le STEREO PCM at 44100 Hz. reSID is MONO →
 //!     each sample is duplicated into both channels (L,R) inline, little-endian.
 //!
-//! TRIGGER: c64re relies on the browser sending `debug/run` + `audio/start`; the
-//! tap sends nothing. So THIS daemon auto-starts the stream when the first client
-//! connects (the daemon IS the producer). The streaming loop owns the machine for
-//! its lifetime and paces to real time — the model's frame rate (50.12 fps PAL, 59.83
-//! NTSC), read every frame so a model switch changes the pace (Spec 863).
+//! TRIGGER: the daemon's run loop (Spec 910 D6) advances the machine from startup, whether or
+//! not anybody is connected; THIS module's hub is the list of A/V subscribers, and the loop
+//! pushes each presented frame to them. A client subscribes by connecting (the tap sends
+//! NO commands; `?av=0` opts out), so the push needs no trigger of its own. The loop paces
+//! to real time — the model's frame rate (50.12 fps PAL, 59.83 NTSC), read every frame so a
+//! model switch changes the pace (Spec 863) — and runs as fast as possible only for a bounded
+//! run that asked for `pace: "warp"`.
 //!
 //!   AV_HELLO (JSON notification `av/hello`): sent to a client when it subscribes and to
 //!     every client when the machine's model changes — the model, the video standard,
@@ -35,13 +37,11 @@
 //!     have.
 //!
 //! THREADING: `SidAudioEngine` owns a reSID engine through a raw pointer and is
-//! therefore `!Send`, so the streaming loop runs on a dedicated OS thread (not a
-//! tokio task) that owns the engine locally. (Before Spec 855 it was `!Send` for
-//! a different reason — it held the process-wide reSID `MutexGuard`, back when
-//! the shim had one global SID. The guard is gone; the thread rule is not.) The SID `write_trace` hook captures
-//! only a `Send` `(addr,value)` byte buffer; the loop drains it per frame into the
-//! engine (verbatim the `scramble_av_record.rs` harness pattern). Built binary
-//! messages are handed to the async WS writer via a tokio mpsc channel.
+//! therefore `!Send`, so the run loop runs on a dedicated OS thread (not a tokio task) that
+//! owns the engine locally, for as long as at least one A/V client is subscribed. The SID
+//! `write_trace` hook captures only a `Send` `(addr,value)` byte buffer; the loop drains it
+//! per frame into the engine (verbatim the `scramble_av_record.rs` harness pattern). Built
+//! binary messages are handed to the async WS writer via a tokio mpsc channel.
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -128,8 +128,8 @@ struct Subscriber {
 // batch/progress (per-scenario during a batch run) — by calling `this.broadcast`,
 // which fans a JSON-RPC NOTIFICATION (no `id`) out to ALL connected clients.
 //
-// The `NotifyHub` is the TRX64 mirror of that fan-out. UNLIKE [`StreamHub`] (gated
-// on `--stream`), it ALWAYS exists: it lives in the shared `State` so any handler
+// The `NotifyHub` is the TRX64 mirror of that fan-out. UNLIKE [`StreamHub`] (A/V
+// subscribers only), every connection is on it, `?av=0` ones too, and it ALWAYS exists: it lives in the shared `State` so any handler
 // can reach it, and every connection registers its `out_tx` (the same mpsc→writer
 // channel that already carries responses + the BIN A/V frames, ADR-073). The
 // notification rides that channel as a `Message::Text` carrying the c64re envelope
@@ -203,13 +203,11 @@ impl Drop for NotifySub {
     }
 }
 
-/// The SINGLETON broadcaster. There is exactly ONE streaming loop driving the
-/// (singleton) machine, regardless of how many clients connect — matching c64re's
-/// model (one pacing loop, `broadcastFrame`/`broadcastAudioWire` to all clients).
-/// Each connection [`subscribe`](StreamHub::subscribe)s its outbound channel; the
-/// loop pushes every BIN_VIC/BIN_AUDIO to all live subscribers, pruning closed
-/// ones. The loop starts lazily on the FIRST subscriber and STOPS (releasing the
-/// machine + clearing the SID hook) when the LAST one leaves.
+/// The A/V subscriber list of the daemon. Every connection that wants the picture and the
+/// sound [`subscribe`](StreamHub::subscribe)s its outbound channel; the run loop pushes
+/// each presented frame's BIN_VIC/BIN_AUDIO to all of them, pruning closed ones. The hub
+/// owns no thread and starts nothing: the machine advances in the run loop whether or not
+/// anybody is subscribed, and the push is one more consumer of that loop (Spec 910 D6).
 pub struct StreamHub {
     inner: Mutex<HubInner>,
     state: SharedState,
@@ -218,29 +216,16 @@ pub struct StreamHub {
 struct HubInner {
     subscribers: Vec<Subscriber>,
     next_id: u64,
-    /// The running loop's stop flag (Some while a loop thread is alive).
-    stop: Option<Arc<AtomicBool>>,
-    join: Option<std::thread::JoinHandle<()>>,
 }
 
 impl StreamHub {
     pub fn new(state: SharedState) -> Arc<Self> {
-        // No subscriber yet, so no pump thread: the state must not claim one.
-        state.lock().unwrap().pump_idle = true;
         Arc::new(Self {
-            inner: Mutex::new(HubInner {
-                subscribers: Vec::new(),
-                next_id: 1,
-                stop: None,
-                join: None,
-            }),
+            inner: Mutex::new(HubInner { subscribers: Vec::new(), next_id: 1 }),
             state,
         })
     }
 
-    /// Register a client's outbound channel. Starts the loop if it's the first
-    /// subscriber. Returns a [`StreamSub`] guard that unsubscribes on drop (and
-    /// stops the loop when the last client leaves).
     /// A/V subscribers right now. Spec 887: a subscriber holds the idle clock; an RPC-only
     /// connection (`?av=0`) never subscribes.
     pub fn live(&self) -> usize {
@@ -249,6 +234,8 @@ impl StreamHub {
         inner.subscribers.len()
     }
 
+    /// Register a client's outbound channel. Returns a [`StreamSub`] guard that
+    /// unsubscribes on drop.
     pub fn subscribe(self: &Arc<Self>, out: UnboundedSender<Message>) -> StreamSub {
         let mut inner = self.inner.lock().unwrap();
         let id = inner.next_id;
@@ -257,41 +244,24 @@ impl StreamHub {
         // chip, frame, clock, canvas) before the first one arrives.
         {
             let mut st = self.state.lock().unwrap();
-            st.pump_idle = false;
             let hello = serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "av/hello",
                 "params": crate::av_hello(&st),
             });
             let _ = out.send(Message::Text(hello.to_string()));
+            // Spec 837 — a new client gets a picture even if the machine is paused.
+            //
+            // A running machine pushes a frame every presented frame, a PAUSED one pushes
+            // nothing at all: a client arriving during a pause — a page reload, an `undump`,
+            // which deliberately leaves the session paused — would never receive a first
+            // frame and sit on "No frame yet" while every other reading says the machine is
+            // healthy. A paused machine HAS a picture; it just is not changing. So ask for
+            // exactly one present, on arrival.
+            st.force_present_frame = true;
+            st.av_subscribers = inner.subscribers.len() + 1;
         }
         inner.subscribers.push(Subscriber { id, out });
-        // Spec 837 — a new client gets a picture even if the machine is paused.
-        //
-        // The render + broadcast below sits inside `if running`, so a PAUSED
-        // machine pushes nothing at all: a client arriving during a pause — a
-        // page reload, or this loop restarting because the last client had left
-        // — never receives a first frame and sits on "No frame yet" forever
-        // while every other reading says the machine is healthy. An `undump` is
-        // the common way in, because it deliberately leaves the session paused
-        // (its own test asserts exactly that).
-        //
-        // A paused machine HAS a picture; it just is not changing. So reuse the
-        // one-shot the restore path already established rather than inventing a
-        // second concept: ask for exactly one present, here, on arrival.
-        self.state.lock().unwrap().force_present_frame = true;
-        // First subscriber → start the loop.
-        if inner.stop.is_none() {
-            let stop = Arc::new(AtomicBool::new(false));
-            let hub = Arc::clone(self);
-            let stop_thread = Arc::clone(&stop);
-            let join = std::thread::Builder::new()
-                .name("trx64-av-stream".into())
-                .spawn(move || stream_loop(hub, stop_thread))
-                .expect("spawn av-stream thread");
-            inner.stop = Some(stop);
-            inner.join = Some(join);
-        }
         StreamSub { hub: Arc::clone(self), id }
     }
 
@@ -304,33 +274,16 @@ impl StreamHub {
     }
 
     fn unsubscribe(&self, id: u64) {
-        // Take the loop thread to join OUTSIDE the lock (the loop also locks `inner`
-        // via broadcast → joining under the lock would deadlock).
-        let mut idle = false;
-        let to_join = {
+        let left = {
             let mut inner = self.inner.lock().unwrap();
             inner.subscribers.retain(|s| s.id != id);
-            if inner.subscribers.is_empty() {
-                idle = true;
-                if let Some(stop) = inner.stop.take() {
-                    stop.store(true, Ordering::SeqCst);
-                }
-                inner.join.take()
-            } else {
-                None
-            }
+            inner.subscribers.len()
         };
-        if idle {
-            self.state.lock().unwrap().pump_idle = true;
-        }
-        if let Some(j) = to_join {
-            let _ = j.join();
-        }
+        self.state.lock().unwrap().av_subscribers = left;
     }
 }
 
-/// Per-connection subscription guard. Dropping it unsubscribes; the last drop
-/// stops the singleton loop.
+/// Per-connection subscription guard. Dropping it unsubscribes.
 pub struct StreamSub {
     hub: Arc<StreamHub>,
     id: u64,
@@ -342,66 +295,113 @@ impl Drop for StreamSub {
     }
 }
 
-/// The streaming loop body. Runs on a dedicated OS thread (owns the reSID engine).
-/// Pushes each frame's BIN_VIC + BIN_AUDIO to ALL of the hub's subscribers.
-fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
-    let state = hub.state.clone();
-    // ── reSID audio engine (owned on this thread; !Send) + the Send write hook ──
-    // Spec 863 D3 — reSID samples at the model's clock with its SID.
-    let mut engine = {
-        let st = state.lock().unwrap();
-        SidAudioEngine::new(ResidConfig::for_model(st.session.machine.model()))
+/// The run loop's handle. Dropping it stops the loop and hands the machine back to a host
+/// that clocks it itself.
+pub struct RunLoopGuard {
+    stop: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+    state: SharedState,
+}
+
+impl Drop for RunLoopGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+        self.state.lock().unwrap().loop_thread = false;
+    }
+}
+
+/// Start the daemon's run loop (Spec 910 D6): the one thing that advances a daemon's
+/// machine. It runs from startup, on every daemon, whether a client is attached or not, and
+/// is gated only on `running` and the pace. The A/V push (`hub`) is a consumer of it: frames
+/// and audio go out only while a client is subscribed, and the loop owns the reSID engine
+/// (`!Send`) for exactly that long.
+pub fn start_run_loop(state: &SharedState, hub: Option<Arc<StreamHub>>) -> RunLoopGuard {
+    let stop = Arc::new(AtomicBool::new(false));
+    state.lock().unwrap().loop_thread = true;
+    let join = {
+        let state = Arc::clone(state);
+        let stop = Arc::clone(&stop);
+        std::thread::Builder::new()
+            .name("trx64-run-loop".into())
+            .spawn(move || run_loop(state, hub, stop))
+            .expect("spawn run-loop thread")
     };
-    let writes: Arc<Mutex<Vec<(u8, u8)>>> = Arc::new(Mutex::new(Vec::new()));
-    // Track the machine-rebuild generation (bumped by do_power_on / do_power_off).
-    // Spec 786 rebuilds the machine (Machine::new() → a fresh SID with NO write-trace
-    // hook) on every power-cycle, so the hook + reSID prime below is RE-RUN in the loop
-    // whenever this changes — else audio goes permanently silent after the first
-    // power-cycle (e.g. an EF CRT insert = off→on). Seeded at the initial install.
-    let mut last_machine_generation = {
-        // Install the additive SID write-trace hook so EVERY $D4xx write (in CPU
-        // order) is captured for reSID. The hook must be Send → it captures only
-        // the Arc<Mutex<Vec>> byte buffer (the engine itself stays on this thread).
-        let w = Arc::clone(&writes);
+    RunLoopGuard { stop, join: Some(join), state: Arc::clone(state) }
+}
+
+/// What the loop holds while at least one A/V client is subscribed: the reSID engine, the
+/// buffer the SID write hook fills, and the sequence numbers of the stream.
+struct AvOut {
+    engine: SidAudioEngine,
+    writes: Arc<Mutex<Vec<(u8, u8)>>>,
+    /// The machine-rebuild generation the hook was installed for. A power cycle builds a
+    /// fresh SID with no write-trace hook, so the hook and the reSID prime are redone when
+    /// `machine_generation` moves (Spec 786) — else audio goes silent for good.
+    generation: u64,
+    frame_seq: u32,
+    audio_seq: u32,
+    /// The master clock of the last frame presented. A paused machine can still MOVE — the
+    /// rewind transport steps it, a monitor `z`/`n` advances it — and comparing the clock
+    /// is what tells "the machine moved" from "the machine is frozen".
+    last_present_clk: u64,
+}
+
+impl AvOut {
+    fn install(state: &SharedState) -> Self {
         let mut st = state.lock().unwrap();
+        // Spec 863 D3 — reSID samples at the model's clock with its SID.
+        let mut engine = SidAudioEngine::new(ResidConfig::for_model(st.session.machine.model()));
+        let writes: Arc<Mutex<Vec<(u8, u8)>>> = Arc::new(Mutex::new(Vec::new()));
+        Self::hook(&mut st, &mut engine, &writes);
+        let generation = st.machine_generation;
+        let last_present_clk = st.session.machine.clk;
+        AvOut { engine, writes, generation, frame_seq: 0, audio_seq: 0, last_present_clk }
+    }
+
+    /// Install the additive SID write-trace hook so EVERY $D4xx write (in CPU order) is
+    /// captured for reSID, and prime the engine with the live register file so the stream
+    /// starts from the live state, not from power-on silence.
+    fn hook(st: &mut crate::State, engine: &mut SidAudioEngine, writes: &Arc<Mutex<Vec<(u8, u8)>>>) {
+        let w = Arc::clone(writes);
         st.session.machine.set_sid_write_trace(Some(Box::new(move |_chip, reg, value, _clk| {
             w.lock().unwrap().push((reg, value));
         })));
-        // Prime reSID with the CURRENT SID register file so the stream starts from
-        // the live state (frequencies/PW/control already set), not power-on silence.
         for reg in 0u8..=0x18 {
             let v = st.session.machine.read_full(0xD400 + reg as u16);
             engine.record_write(reg, v);
         }
-        st.machine_generation
-    };
-    engine.record_boundary(0); // apply the priming writes, emit nothing
-    engine.flush();
-    let _ = engine.take_pcm(); // discard priming silence
+        engine.record_boundary(0); // apply the priming writes, emit nothing
+        engine.flush();
+        let _ = engine.take_pcm(); // discard priming silence
+    }
 
+    fn remove(self, state: &SharedState) {
+        // Restore the byte-exact (None) write-trace path.
+        state.lock().unwrap().session.machine.set_sid_write_trace(None);
+    }
+}
+
+/// The run loop body. Runs on a dedicated OS thread (it owns the reSID engine while an A/V
+/// client is subscribed). Per iteration, under the State lock: the wall-clock housekeeping,
+/// then — if the machine is running — one frame of advance (eight in warp) through
+/// [`crate::loop_iteration`], the one function every host advances the machine through.
+/// The lock is released before the frame is pushed and before the pacing sleep, so other
+/// requests, and a request parked on a stop, interleave between frames.
+fn run_loop(state: SharedState, hub: Option<Arc<StreamHub>>, stop: Arc<AtomicBool>) {
+    let mut av: Option<AvOut> = None;
     let mut timing = state.lock().unwrap().session.machine.timing();
     let mut period = frame_period(&timing);
-    let mut frame_seq: u32 = 0;
-    let mut audio_seq: u32 = 0;
-    // The master clock of the LAST frame this loop presented. A paused machine can
-    // still MOVE — the rewind transport steps it (F9/F12), replays it (F10), a monitor
-    // `z`/`n` advances it — and nothing was pushing a frame for any of that, so the
-    // browser kept showing the picture from the moment of the pause and every one of
-    // those keys looked dead. The terminal front-end never noticed because it renders
-    // from its own poll. Comparing the clock is what tells "the machine moved" from
-    // "the machine is frozen", and only a move costs a render.
-    let mut last_present_clk: u64 = 0;
-    // Epoch-anchored pacing: schedule each frame at an absolute target time so the
-    // pace doesn't drift (matches c64re's accumulated-target sleep). If we fall
-    // far behind (>100 ms), re-base the epoch instead of spinning to catch up.
+    // Epoch-anchored pacing: schedule each frame at an absolute target time so the pace
+    // doesn't drift. If we fall far behind (>100 ms), re-base the epoch instead of spinning
+    // to catch up.
     let mut epoch = Instant::now();
     let mut frames_since_epoch: u32 = 0;
-    // audit ws-media-3 / background-workers-async-10 — a WALL-CLOCK reference for the
-    // media auto-persist cadence. The TS persist runs on an independent 1 s setInterval
-    // with a Date.now() debounce that fires regardless of run-state, so a flash/disk
-    // delta then pause/JAM/bp STILL reaches the host file. TRX64's frame counter only
-    // advances while running, so the persist hooks now debounce on this monotonic
-    // wall-clock instead — and run EVERY loop iteration, not only `if running`.
+    // A WALL-CLOCK reference for the media auto-persist cadence: a flash/disk delta then
+    // pause/JAM/bp must STILL reach the host file, so the persist hooks debounce on this
+    // monotonic clock and run every iteration, not only while running.
     let persist_epoch = Instant::now();
 
     loop {
@@ -409,16 +409,21 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
             break;
         }
 
-        // Spec 771.2 — gate the machine ADVANCE + A/V push on the controller's
-        // run-state. When paused/powered-off (running=false) the TS controller's tick
-        // stops: the picture freezes on the last presented frame and audio goes silent.
-        // TRX64's stream loop is the SOLE machine driver under --stream, so it MUST
-        // honor `running` too — otherwise pause never freezes, power-off shows live
-        // garbage, and a reset glitches under the continuous run.
-        // Spec 771.2 (T1.3 wire) — honor the controller pacing mode: "warp" advances
-        // 8× cycles per presented frame (fast-forward at 50fps video), else real-time.
-        let (running, warp) = {
+        // The A/V consumer exists exactly while a client is subscribed. Asked of the hub
+        // before the State lock is taken: the hub takes that lock itself while subscribing.
+        let live = hub.as_ref().map(|h| h.live()).unwrap_or(0);
+        if live > 0 && av.is_none() {
+            av = Some(AvOut::install(&state));
+        } else if live == 0 {
+            if let Some(a) = av.take() {
+                a.remove(&state);
+            }
+        }
+
+        let unthrottled: bool;
+        let (vic_msg, audio_msg) = {
             let mut st = state.lock().unwrap();
+            st.av_subscribers = live;
             // Spec 863 — a model switch (or a restore across one) moved the clock and the
             // frame: re-sample reSID at the new clock, and pace to the new frame from here.
             // The transport restores anchors from this loop, outside any request: a step
@@ -431,276 +436,157 @@ fn stream_loop(hub: Arc<StreamHub>, stop: Arc<AtomicBool>) {
                 period = frame_period(&timing);
                 epoch = Instant::now();
                 frames_since_epoch = 0;
-                engine.set_clock_freq(timing.cpu_hz as f64);
-            }
-            // Spec 786 audio fix — a power-cycle (cold reset / cart insert-eject /
-            // /power) rebuilds the machine into a fresh SID with no write-trace hook.
-            // Detect via machine_generation and RE-ATTACH the capture hook + re-prime
-            // reSID from the new SID register file, so audio survives the rebuild
-            // instead of going permanently silent.
-            if st.machine_generation != last_machine_generation {
-                last_machine_generation = st.machine_generation;
-                let w = Arc::clone(&writes);
-                st.session.machine.set_sid_write_trace(Some(Box::new(
-                    move |_chip, reg, value, _clk| {
-                        w.lock().unwrap().push((reg, value));
-                    },
-                )));
-                for reg in 0u8..=0x18 {
-                    let v = st.session.machine.read_full(0xD400 + reg as u16);
-                    engine.record_write(reg, v);
+                if let Some(a) = av.as_mut() {
+                    a.engine.set_clock_freq(timing.cpu_hz as f64);
                 }
             }
-            (st.session.running, st.pacing_mode == "warp")
-        };
+            // Spec 786 audio fix — a power-cycle rebuilds the machine into a fresh SID with
+            // no write-trace hook: re-attach it and re-prime reSID, or audio dies.
+            if let Some(a) = av.as_mut() {
+                if st.machine_generation != a.generation {
+                    a.generation = st.machine_generation;
+                    let AvOut { engine, writes, .. } = a;
+                    AvOut::hook(&mut st, engine, writes);
+                }
+            }
 
-        // ── MEDIA AUTO-PERSIST (audit ws-media-3 / background-workers-async-10) ──
-        // Run the cart + disk auto-persist hooks EVERY iteration, REGARDLESS of
-        // run-state, on the wall-clock cadence — 1:1 with the TS independent
-        // setInterval (runtime-controller.ts:219-226) that fires while paused/jammed/
-        // bp-stopped. A flash/disk delta written just before a pause must STILL reach
-        // the host file after the debounce. The loop sleeps one frame per iteration
-        // even when paused, so this polls at ~50 Hz; the gen/hash checks are cheap and
-        // the actual host write is debounced (wall-clock ms), so this is a no-op for a
-        // clean medium. (Previously these ran inside `if running` on a frame counter,
-        // so a dirty-then-pause never persisted.)
-        {
+            // Media auto-persist, every iteration regardless of run-state.
             let now_ms = persist_epoch.elapsed().as_millis() as u64;
-            let mut st = state.lock().unwrap();
             crate::stream_maybe_autopersist_cart(&mut st, now_ms);
             crate::stream_maybe_autopersist_disk(&mut st, now_ms);
-        }
+            crate::release_idle_control_owner(&mut st);
 
-        // ── Spec 767 (live-view) — control-owner idle release ──────────────────────
-        // Revert control_owner "llm"→"human" once the LLM goes idle (no operating
-        // command for the idle window), so the green border returns to human-owned when
-        // the LLM stops driving. NOTE: not gated on `running` — under --stream the human
-        // session free-runs (running=true) the whole time, so a `!running` gate would
-        // never release. While the LLM drives its OWN bounded free-run, that path keeps
-        // `last_llm_activity` fresh each frame (Slice 2), so this only fires on real idle.
-        // Runs every loop iteration regardless of run-state (like the media-persist block).
-        {
-            let mut st = state.lock().unwrap();
-            if st.control_owner == "llm" {
-                if let Some(t) = st.last_llm_activity {
-                    if t.elapsed() >= Duration::from_millis(3000) {
-                        crate::set_control_owner(&mut st, "human");
-                        st.last_llm_activity = None;
-                        // Spec 767 — return the shared machine to the human's default: if the
-                        // LLM left it paused by a capped run (a "budget" stop — NOT a human
-                        // pause / breakpoint / jam), resume the free-run so the UI KEEPS
-                        // RUNNING. The pump advances + streams again on the next iteration.
-                        let capped_pause = !st.session.running
-                            && st.ctrl_stop.as_ref().map(|s| s.reason) == Some("budget");
-                        if capped_pause {
-                            st.session.running = true;
-                            st.ctrl_stop = None;
-                            let sid = st.session.id.clone();
-                            let pacing = serde_json::json!({ "mode": st.pacing_mode, "ratio": st.pacing_ratio });
-                            st.notify.broadcast(
-                                "debug/running",
-                                serde_json::json!({ "session_id": sid, "pacing": pacing }),
-                            );
-                        }
-                    }
+            let running = st.session.running;
+            let warp = st.pacing_mode == "warp";
+            // A bounded run asked for as fast as possible has no pace to keep.
+            unthrottled = running && warp && st.run_cap_clk.is_some();
+            let out = if running {
+                // ── One iteration of the one advance: the transport owns the frame while it
+                // is rewound; otherwise the machine advances, frame-aligned, with the
+                // per-frame work (anchor, recorder, observers, stop check, stop push) done
+                // inside, once per frame of machine time (Spec 910 D9).
+                let d_cycles = crate::loop_iteration(&mut st, warp);
+                match av.as_mut() {
+                    Some(a) => Some(a.present_running(&mut st, d_cycles, warp)),
+                    None => None,
                 }
-            }
-        }
-
-        if running {
-        // ── Run one frame + render + drain this frame's SID writes ──
-        // Lock the shared State only for this window; release before sleeping so
-        // other JSON-RPC requests (and disk mounts) interleave between frames.
-        let (vic_msg, audio_msg) = {
-            let mut st = state.lock().unwrap();
-
-            // BREAKPOINT / OBSERVER / JAM-aware per-frame advance (audit
-            // ws-session-debug-0). The stream loop is the SOLE machine driver under
-            // --stream, so the free-run advance must gate breakpoints/observers/JAM
-            // every frame exactly like the TS controller tick (runtime-controller.ts:
-            // 670-806) — a bare `run_for_full` never halts, so a bp set on the live
-            // machine never stopped it. `stream_debug_gated_advance` does the gated
-            // advance and, on a halt, sets `running=false` (freezes the picture) +
-            // server-PUSHes debug/breakpoint_hit|observer_hit + debug/stopped, then
-            // returns the cycles ACTUALLY advanced (a halt may stop mid-frame, so
-            // audio runs over exactly that window). When no bp/observer is armed it
-            // is the historical plain advance (byte-identical).
-            let frame = timing.cycles_per_frame;
-            let budget = if warp { frame * 8 } else { frame };
-            // Spec 808 — the rewind transport owns the frame while it is rewound. When
-            // it does, emulation must NOT advance: the transport is placing the machine
-            // on an anchor itself (a real restore, 177 us), and advancing on top of that
-            // would be the divergence decision 4 says only an INTERVENTION may cause.
-            let d_cycles = if crate::transport_tick(&mut st, budget) {
-                0
             } else {
-                crate::stream_debug_gated_advance(&mut st, budget)
-            };
-            // Spec 767 slice 2 (live-view) — a capped LLM run auto-pauses here once the cap
-            // clk is reached (this just-rendered frame is the last one streamed), and keeps
-            // the owner-idle timer fresh while it runs. No-op when no cap is set.
-            crate::maybe_autopause_capped_run(&mut st);
-            let cpu_cycle = st.session.machine.c64_core.clk as u32;
-
-            // Audio: drain this frame's writes (CPU order) into the engine, close
-            // the frame boundary, flush → reSID PCM for exactly this window.
-            {
-                let mut pending = writes.lock().unwrap();
-                for &(addr, value) in pending.iter() {
-                    engine.record_write(addr, value);
-                }
-                pending.clear();
-            }
-            engine.record_boundary(d_cycles);
-            engine.flush();
-            let mono = engine.take_pcm();
-
-            // Video: crop the per-cycle displayed buffer → the model's canvas, 4-bit indices.
-            let (w, h, indices) = st.session.machine.render_canvas_indices();
-
-            // ── BACKGROUND-LOOP layer (the c64re RuntimeController per-frame
-            // behaviors with no WS method — runtime-controller.ts). The stream loop
-            // is the SOLE per-frame driver under --stream, so it hosts them here, in
-            // the per-frame lock window. The gen/hash checks are CHEAP; only the
-            // actual capture costs, and that is throttled by FRAME COUNT (`frame_seq`,
-            // which advances only while running). A hook panic must never kill the
-            // stream — but the helpers are total (Err is swallowed inside), so no
-            // extra catch is needed.
-            //   ITEM 3 — auto-capture every N frames (filmstrip), Spec 705.B.
-            //   ITEM 4 — recorder auto-feed (below).
-            // The cart/disk auto-persist (ITEMs 1+2) now run ABOVE this block, every
-            // loop iteration regardless of run-state (audit ws-media-3 — a dirty-then-
-            // pause must still persist), so they are NOT repeated here.
-            // Skip the autocapture during WARP (8× fast-forward would flood the ring
-            // and isn't the live-scrub use case).
-            let frame_no = frame_seq as u64;
-            if !warp {
-                // Spec 769.5a — pass the JUST-RENDERED live canvas so the auto-capture
-                // can store a downscaled thumbnail keyed by the new checkpoint id
-                // (the ring anchor itself stays framebuffer-omitted, BUG-049).
-                crate::stream_maybe_autocapture(&mut st, frame_no, budget, w, h, &indices);
-            }
-            //   ITEM 4 — recorder auto-feed (audit background-workers-async-0 +
-            //   ws-checkpoint-scrub-7). The c64re tick() feeds the active recorder one
-            //   omitMedia anchor at the SAME per-second cadence as the ring auto-capture
-            //   (runtime-controller.ts:846-852), so a free-running machine grows recorder
-            //   anchors over time. Runs in BOTH warp + PAL (unlike the warp-skipped ring
-            //   auto-capture) — the recorder is not the live-scrub filmstrip; it is the
-            //   off-thread scrub history, fed regardless of pace. No-op unless a recorder
-            //   is active (recorder/start).
-            crate::stream_maybe_feed_recorder(&mut st, frame_no);
-
-            // audit streaming-av-5 — push the lightweight JSON `session/frame_available`
-            // notification on every PRESENTED frame, alongside the binary VIC frame, for
-            // metadata-only consumers (= TS runtime-controller.ts maybePresentFrame →
-            // broadcast("session/frame_available", {session_id, frame, c64Cycles}), 1:1
-            // per presented frame since PAL_PRESENT_DIVISOR=1). c64Cycles is the full
-            // master clock (TS `c64Cpu.cycles`), NOT the truncated u32 in the binary frame.
-            st.notify.broadcast(
-                "session/frame_available",
-                serde_json::json!({
-                    "session_id": st.session.id,
-                    "frame": frame_seq as u64,
-                    "c64Cycles": st.session.machine.clk,
-                }),
-            );
-
-            // Keep the paused-present baseline current while running, so the first
-            // frame after a pause is not presented twice.
-            last_present_clk = st.session.machine.clk;
-
-            // Drop the lock before building the (larger) wire buffers + sleeping.
-            drop(st);
-
-            let vic = build_vic_frame(frame_seq, cpu_cycle, &indices, w as u16, h as u16);
-            // Warp: skip audio (8× PCM would garble; TS mutes in warp too).
-            let audio = if warp || mono.is_empty() {
-                None
-            } else {
-                Some(build_audio_msg(audio_seq, &mono))
-            };
-            (vic, audio)
-        };
-
-        // ── Broadcast BIN_VIC then BIN_AUDIO to all live subscribers. When the
-        // last client leaves, `unsubscribe` flips `stop` and we exit at the top. ──
-        hub.broadcast(Message::Binary(vic_msg.into()));
-        frame_seq = frame_seq.wrapping_add(1);
-        if let Some(audio) = audio_msg {
-            hub.broadcast(Message::Binary(audio.into()));
-            audio_seq = audio_seq.wrapping_add(1);
-        }
-        } else {
-            // Paused/off advances nothing (frozen picture, silent) — EXCEPT a
-            // one-shot present requested by `checkpoint/restore` (audit
-            // ws-checkpoint-scrub-1). The TS controller ALWAYS presentFrame()s on a
-            // restore so the paused canvas refreshes to the rolled-back picture with
-            // "no client-grab dependency" (runtime-controller.ts:606-613). The paused
-            // loop is otherwise silent, so the restore handler sets `force_present_frame`
-            // and we consume it ONCE here: render the (already-restored) live frame,
-            // push exactly one BIN_VIC (binary only — TS pushFrame on restore emits no
-            // JSON), then clear the flag (no continuous push — the machine stays frozen).
-            //
-            // And a paused machine is not a MOTIONLESS one. The rewind transport moves
-            // it while the emulation stands still: F9/F12 step it one anchor, F10
-            // replays it backwards, `goto` places it. That advance happened inside a
-            // JSON-RPC handler, this loop was the only thing that pushes pictures, and
-            // it was pushing none — so the browser kept the frame from the moment of the
-            // pause and the transport keys looked broken. They were not; nobody was
-            // presenting the result. Two things follow, both here:
-            //
-            //   1. `play back` sets a DIRECTION and leaves the stepping to the pump.
-            //      The pump only ticked the transport in the running branch, so a
-            //      backwards replay from a paused machine never took a single step.
-            //   2. A present is owed whenever the machine MOVED — which the master
-            //      clock answers exactly, and cheaply. `force_present_frame` stays for
-            //      the case a move cannot be seen in the clock (a restore to the same
-            //      cycle, a memory write from the monitor).
-            let vic_msg = {
-                let mut st = state.lock().unwrap();
-                // (1) — the transport paces itself against the wall clock, so calling it
-                // once per loop iteration is the same cadence it gets while running.
+                // A paused machine advances nothing — except that the rewind transport moves
+                // it while the emulation stands still: `play back` sets a DIRECTION and
+                // leaves the stepping to this loop.
                 if st.transport.playing.is_some() {
                     crate::transport_tick(&mut st, timing.cycles_per_frame);
                 }
-                // (2)
-                let clk = st.session.machine.clk;
-                if !paused_present_due(st.force_present_frame, clk, last_present_clk) {
-                    None
-                } else {
-                    st.force_present_frame = false;
-                    last_present_clk = clk;
-                    let cpu_cycle = st.session.machine.c64_core.clk as u32;
-                    let (w, h, indices) = st.session.machine.render_canvas_indices();
-                    // Binary VIC frame ONLY — 1:1 with TS pushFrame on restore (no JSON
-                    // session/frame_available, which TS emits only in the running loop).
-                    Some(build_vic_frame(frame_seq, cpu_cycle, &indices, w as u16, h as u16))
+                match av.as_mut() {
+                    Some(a) => a.present_paused(&mut st).map(|v| (v, None)),
+                    None => None,
                 }
             };
-            if let Some(vic) = vic_msg {
-                hub.broadcast(Message::Binary(vic.into()));
-                frame_seq = frame_seq.wrapping_add(1);
-            }
-        } // end `if running` — paused/off advances nothing (frozen picture, silent)
+            st.loop_cv.notify_all();
+            out
+        }
+        .map_or((None, None), |(v, a)| (Some(v), a));
 
-        // ── Pace to real-time: sleep to the absolute target for this frame. ──
+        // ── Broadcast BIN_VIC then BIN_AUDIO to all live subscribers. ──
+        if let (Some(h), Some(vic)) = (hub.as_ref(), vic_msg) {
+            h.broadcast(Message::Binary(vic.into()));
+            if let Some(audio) = audio_msg {
+                h.broadcast(Message::Binary(audio.into()));
+            }
+        }
+
+        // ── Pace: sleep to the absolute target for this frame. ──
+        if unthrottled {
+            std::thread::sleep(Duration::from_micros(100));
+            epoch = Instant::now();
+            frames_since_epoch = 0;
+            continue;
+        }
         frames_since_epoch = frames_since_epoch.wrapping_add(1);
         let target = epoch + period * frames_since_epoch;
         let now = Instant::now();
         if let Some(sleep) = target.checked_duration_since(now) {
             std::thread::sleep(sleep);
         } else if now.duration_since(target) > Duration::from_millis(100) {
-            // Fell far behind (e.g. a heavy frame or a long disk mount): re-base
-            // the epoch so we don't fast-forward to "catch up".
+            // Fell far behind (a heavy frame, a long disk mount, a run that held the lock):
+            // re-base the epoch so we don't fast-forward to "catch up".
             epoch = Instant::now();
             frames_since_epoch = 0;
         }
     }
 
     // ── Teardown: clear the SID hook so the byte-exact (None) path is restored. ──
-    let teardown = state.lock();
-    if let Ok(mut st) = teardown {
-        st.session.machine.set_sid_write_trace(None);
+    if let Some(a) = av.take() {
+        a.remove(&state);
+    }
+}
+
+impl AvOut {
+    /// The frame a running iteration presents: the reSID PCM for exactly the window that ran
+    /// (a halt may stop mid-frame), the canvas, and the metadata notification.
+    fn present_running(
+        &mut self,
+        st: &mut crate::State,
+        d_cycles: u64,
+        warp: bool,
+    ) -> (Message, Option<Message>) {
+        // Audio: drain this window's writes (CPU order) into the engine, close the frame
+        // boundary, flush → reSID PCM for exactly this window.
+        {
+            let mut pending = self.writes.lock().unwrap();
+            for &(addr, value) in pending.iter() {
+                self.engine.record_write(addr, value);
+            }
+            pending.clear();
+        }
+        self.engine.record_boundary(d_cycles as u32);
+        self.engine.flush();
+        let mono = self.engine.take_pcm();
+
+        // Video: crop the per-cycle displayed buffer → the model's canvas, 4-bit indices.
+        let cpu_cycle = st.session.machine.c64_core.clk as u32;
+        let (w, h, indices) = st.session.machine.render_canvas_indices();
+
+        // The lightweight JSON `session/frame_available` notification on every PRESENTED
+        // frame, alongside the binary VIC frame, for metadata-only consumers.
+        st.notify.broadcast(
+            "session/frame_available",
+            serde_json::json!({
+                "session_id": st.session.id,
+                "frame": self.frame_seq as u64,
+                "c64Cycles": st.session.machine.clk,
+            }),
+        );
+        self.last_present_clk = st.session.machine.clk;
+
+        let vic = build_vic_frame(self.frame_seq, cpu_cycle, &indices, w as u16, h as u16);
+        self.frame_seq = self.frame_seq.wrapping_add(1);
+        // Warp: skip audio (8× PCM would garble).
+        let audio = if warp || mono.is_empty() {
+            None
+        } else {
+            let m = build_audio_msg(self.audio_seq, &mono);
+            self.audio_seq = self.audio_seq.wrapping_add(1);
+            Some(Message::Binary(m.into()))
+        };
+        (Message::Binary(vic.into()), audio)
+    }
+
+    /// A PAUSED machine owes the clients a picture when it moved or when a handler asked
+    /// for one (a `checkpoint/restore` to the same cycle, a monitor write): one BIN_VIC, no
+    /// JSON — the machine stays frozen.
+    fn present_paused(&mut self, st: &mut crate::State) -> Option<Message> {
+        let clk = st.session.machine.clk;
+        if !paused_present_due(st.force_present_frame, clk, self.last_present_clk) {
+            return None;
+        }
+        st.force_present_frame = false;
+        self.last_present_clk = clk;
+        let cpu_cycle = st.session.machine.c64_core.clk as u32;
+        let (w, h, indices) = st.session.machine.render_canvas_indices();
+        let vic = build_vic_frame(self.frame_seq, cpu_cycle, &indices, w as u16, h as u16);
+        self.frame_seq = self.frame_seq.wrapping_add(1);
+        Some(Message::Binary(vic.into()))
     }
 }
 

@@ -2,7 +2,7 @@
 //! `session/state`, in a trace header, and as `media/1` records while a trace runs. A disk
 //! swap is recorded inside the capture; a cartridge swap is a power cycle, so the capture
 //! ends there with the cartridge going out and the power going off, and the next capture
-//! names the new cartridge. The real binary, headless, on a free port.
+//! names the new cartridge. The real binary, on a free port.
 
 use futures_util::{SinkExt, StreamExt};
 use sha2::Digest;
@@ -31,7 +31,7 @@ fn start(port: u16) -> Daemon {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_trx64-daemon"))
-        .args(["--port", &port.to_string(), "--headless"])
+        .args(["--port", &port.to_string()])
         .current_dir(&dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())

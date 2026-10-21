@@ -24,7 +24,8 @@ pub struct InsertedCart {
 pub struct Session {
     pub id: String,
     pub machine: Machine,
-    /// Sessions boot PAUSED — no autonomous tick loop (idle-safe, Spec 744.3).
+    /// A bare session boots PAUSED (idle-safe, Spec 744.3); the daemon starts it running
+    /// (`build_state`) and its run loop advances it (Spec 910 D6).
     pub running: bool,
     /// An ISA/chip EXERCISER: a scenario that builds its program by poking bytes and
     /// setting PC, and wants the cycle-exact CPU-isolated core (FlatRam/CiaBus/VicBus),
