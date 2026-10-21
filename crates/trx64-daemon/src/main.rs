@@ -65,6 +65,7 @@ use trx64_monitor::verbs::{
 pub mod idle;
 mod media_identity;
 pub mod project_knowledge;
+pub mod scratch;
 pub mod snapshot_diff;
 pub mod streaming;
 /// Spec 808 — the rewind transport (play the machine backwards).
@@ -135,6 +136,16 @@ struct Cli {
     /// client, no recording trace. 0 (the default) = never. Media are persisted first.
     #[arg(long, value_name = "SECONDS", default_value_t = 0)]
     idle_exit: u64,
+
+    /// Never write a medium back into the file it was handed (Spec 910 D1). Every disk,
+    /// cartridge or folder the daemon is given by a path, by any method and at any time, is
+    /// opened from a copy in DIR, and every write goes only into that copy; the machine sees
+    /// its own writes, the caller's file is never opened for writing. The directory is
+    /// created if missing and left in place when the daemon ends (the caller owns it).
+    /// `session/state` reports `noWriteback` and `scratchDir`. Without the option the daemon
+    /// writes back as before (the shared machine).
+    #[arg(long, value_name = "DIR")]
+    scratch: Option<String>,
 }
 
 // ── JSON-RPC 2.0 wire types ───────────────────────────────────────────────────
@@ -3569,7 +3580,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             let (width, height, rgba, bytes) = monitor_bitmap_decode(&read, addr, w, h, &mode);
             let png = rgba_to_png(width, height, &rgba);
             let file = resolve_fs_path(&format!("bitmap_{addr:04x}_{mode}_{w}x{h}.png"));
-            if let Err(e) = std::fs::write(&file, &png) {
+            if let Err(e) = write_output(&file, &png) {
                 return Err(format!("bitmap: {e}"));
             }
             Ok(format!(
@@ -5104,7 +5115,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 if let Some(parent) = std::path::Path::new(&path).parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                match std::fs::write(&path, &bytes) {
+                match write_output(&path, &bytes) {
                     Ok(()) => {
                         // formatDumpSummary (= snapshot-persistence.ts:271-281).
                         let media = if media_summary.is_empty() {
@@ -5228,7 +5239,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 if let Some(parent) = std::path::Path::new(&target).parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                return match std::fs::write(&target, &img) {
+                return match write_output(&target, &img) {
                     Ok(()) => Ok(format!("savecrt: {} bytes -> {target}", img.len())),
                     Err(e) => Err(format!("savecrt: write error: {e}")),
                 };
@@ -5241,8 +5252,8 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 Ok(p) => p,
                 Err(e) => return Err(format!("savecrt: {e}")),
             };
-            match std::fs::write(&path, &img) {
-                Ok(()) => Ok(format!("savecrt: {} bytes -> {path}", img.len())),
+            match write_medium(&path, &img) {
+                Ok(written) => Ok(format!("savecrt: {} bytes -> {written}", img.len())),
                 Err(e) => Err(format!("savecrt: write error: {e}")),
             }
         }
@@ -5272,7 +5283,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 Some(f) => f,
                 None => return Err("swapcrt: usage: swapcrt \"<new.crt>\"".into()),
             };
-            let p = resolve_fs_path(&f);
+            let p = scratch::open_medium(&resolve_fs_path(&f)).map_err(|e| format!("swapcrt: {e}"))?;
             if !std::path::Path::new(&p).exists() {
                 return Err(format!("swapcrt: no such file: {p}"));
             }
@@ -5295,8 +5306,8 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                 let clk = m.clk;
                 if let Ok(old_path) = host_write_target(&old_backing) {
                     if let Some(img) = m.cartridge.as_mut().and_then(|c| c.crt_image(clk)) {
-                        if std::fs::write(&old_path, &img).is_ok() {
-                            lines.push(format!("persisted old cart: {} bytes -> {old_path}", img.len()));
+                        if let Ok(written) = write_medium(&old_path, &img) {
+                            lines.push(format!("persisted old cart: {} bytes -> {written}", img.len()));
                         }
                     }
                 }
@@ -5446,7 +5457,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             let mut bytes: Vec<u8> = vec![(a1 & 0xff) as u8, ((a1 >> 8) & 0xff) as u8];
             for a in a1..=a2 { bytes.push(st.session.machine.ram[a as usize]); }
             let target = resolve_fs_path(&f);
-            match std::fs::write(&target, &bytes) {
+            match write_output(&target, &bytes) {
                 Ok(()) => {
                     let bn = std::path::Path::new(&f).file_name()
                         .map(|n| n.to_string_lossy().to_string()).unwrap_or(f.clone());
@@ -5506,7 +5517,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
             let mut bytes: Vec<u8> = Vec::new();
             for a in a1..=a2 { bytes.push(st.session.machine.ram[a as usize]); }
             let target = resolve_fs_path(&f);
-            match std::fs::write(&target, &bytes) {
+            match write_output(&target, &bytes) {
                 Ok(()) => {
                     let bn = std::path::Path::new(&f).file_name()
                         .map(|n| n.to_string_lossy().to_string()).unwrap_or(f.clone());
@@ -5598,7 +5609,7 @@ fn build_trace_from_ring(
     // Remove any stale sibling .duckdb so the reader rebuilds the index from THIS fresh
     // .c64retrace (the indexer only builds when the .duckdb is absent).
     let _ = std::fs::remove_file(&duckdb_path);
-    std::fs::write(&retrace_path, &bytes)
+    write_output(&retrace_path, &bytes)
         .map_err(|e| format!("write {}: {e}", retrace_path.display()))?;
 
     // Point the CURRENT trace store at this dump so the monitor reads it immediately.
@@ -7363,6 +7374,12 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             state_json["folderEvents"] = Value::Array(st.folder_events.clone());
             // Spec 887 D5 — when this daemon ends itself, if it will.
             state_json["idleExit"] = idle::status();
+            // Spec 910 D1 — whether this daemon writes media back, and where its copies are.
+            if let (Some(obj), Some(sc)) = (state_json.as_object_mut(), scratch::status().as_object()) {
+                for (k, v) in sc {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
             Response::ok(id, state_json)
         }
 
@@ -8087,6 +8104,10 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 read_only: req.params.get("read_only").or_else(|| req.params.get("readOnly")).and_then(|v| v.as_bool()).unwrap_or(false),
                 boot: req.params.get("boot").and_then(|v| v.as_str()).map(String::from),
                 profile,
+            };
+            let path = &match scratch::open_folder(path) {
+                Ok(p) => p,
+                Err(e) => return Response::err(id, -32603, format!("device/folder_attach: {e}")),
             };
             let src = match trx64_core::folder_device::HostFolder::new(path) {
                 Ok(s) => s,
@@ -9306,7 +9327,10 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 Ok(u) => u,
                 Err(e) => return Response::err(id, -32602, format!("{V}: {e}")),
             };
-            let path_str = { let st = state.lock().unwrap(); resolve_fs_path_with_state(&st, path_in) };
+            let path_str = match { let st = state.lock().unwrap(); medium_path(&st, path_in) } {
+                Ok(p) => p,
+                Err(e) => return Response::err(id, -32603, format!("{V}: {e}")),
+            };
             let bytes = match std::fs::read(&path_str) {
                 Ok(b) => b,
                 Err(e) => return Response::err(id, -32602, format!("{V}: file read {path_str}: {e}")),
@@ -9581,10 +9605,16 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             let kind = req.params.get("kind").and_then(|v| v.as_str()).unwrap_or("disk").to_string();
             // Resolved as media/mount resolves its path: the ingress path becomes the
             // medium's backing file, which eject and persist later WRITE.
-            let path = req.params.get("path").and_then(|v| v.as_str()).map(|p| {
-                let st = state.lock().unwrap();
-                resolve_fs_path_with_state(&st, p)
-            });
+            let path = match req.params.get("path").and_then(|v| v.as_str()) {
+                None => None,
+                Some(p) => {
+                    let st = state.lock().unwrap();
+                    match medium_path(&st, p) {
+                        Ok(p) => Some(p),
+                        Err(e) => return Response::err(id, -32603, format!("media/ingress: {e}")),
+                    }
+                }
+            };
             let bytes_b64 = req.params.get("bytes_b64").and_then(|v| v.as_str()).map(str::to_string);
             let name = req.params.get("name").and_then(|v| v.as_str()).map(str::to_string);
             let role = req.params.get("role").and_then(|v| v.as_str()).unwrap_or("drive8").to_string();
@@ -9982,7 +10012,10 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             let Some(path_in) = req.params.get("path").and_then(|v| v.as_str()) else {
                 return Response::err(id, -32602, "media/open: missing path");
             };
-            let path_str = { let st = state.lock().unwrap(); resolve_fs_path_with_state(&st, path_in) };
+            let path_str = match { let st = state.lock().unwrap(); medium_path(&st, path_in) } {
+                Ok(p) => p,
+                Err(e) => return Response::err(id, -32603, format!("media/open: {e}")),
+            };
             let bytes = match std::fs::read(&path_str) {
                 Ok(b) => b,
                 Err(e) => return Response::err(id, -32602, format!("media/open: {path_str}: {e}")),
@@ -10047,7 +10080,10 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             };
             // Resolve relative to the cockpit `cd` cwd (BUG: `/mount foo.crt` after `cd out`
             // read foo.crt relative to the process cwd → "No such file"; now reads .../out/foo.crt).
-            let path_str = { let st = state.lock().unwrap(); resolve_fs_path_with_state(&st, &path_str) };
+            let path_str = match { let st = state.lock().unwrap(); medium_path(&st, &path_str) } {
+                Ok(p) => p,
+                Err(e) => return Response::err(id, -32603, format!("media/mount: {e}")),
+            };
 
             let bytes = match std::fs::read(&path_str) {
                 Ok(b) => b,
@@ -10222,7 +10258,10 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                 None => return Response::err(id, -32602, "media/swap: missing path"),
             };
             // Resolve relative to the cockpit `cd` cwd (same as media/mount).
-            let path_str = { let st = state.lock().unwrap(); resolve_fs_path_with_state(&st, &path_str) };
+            let path_str = match { let st = state.lock().unwrap(); medium_path(&st, &path_str) } {
+                Ok(p) => p,
+                Err(e) => return Response::err(id, -32603, format!("media/swap: {e}")),
+            };
 
             let bytes = match std::fs::read(&path_str) {
                 Ok(b) => b,
@@ -10425,8 +10464,8 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                     Ok((path_clone, bytes_to_write)) => {
                         let notify = st.notify.clone();
                         drop(st);
-                        match std::fs::write(&path_clone, &bytes_to_write) {
-                            Ok(()) => {
+                        match write_medium(&path_clone, &bytes_to_write) {
+                            Ok(path_clone) => {
                                 let byte_count = bytes_to_write.len();
                                 // 1:1 with runtime-controller.ts:513-515 broadcast.
                                 notify.broadcast("media/cart_persisted", json!({
@@ -10482,8 +10521,8 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                                 drop(st);
                                 match target {
                                     Err(e) => Err(format!("media/persist: {e}")),
-                                    Ok(path_clone) => match std::fs::write(&path_clone, &bytes_to_write) {
-                                    Ok(()) => Ok(json!({
+                                    Ok(path_clone) => match write_medium(&path_clone, &bytes_to_write) {
+                                    Ok(path_clone) => Ok(json!({
                                         "written": true,
                                         "role": "disk",
                                         "path": path_clone,
@@ -12753,7 +12792,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             if let Some(parent) = std::path::Path::new(&path).parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            match std::fs::write(&path, &bytes) {
+            match write_output(&path, &bytes) {
                 Ok(()) => Response::ok(id, json!({
                     "path": path,
                     "cycle": cycle as u64,
@@ -12855,7 +12894,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             if let Some(parent) = std::path::Path::new(&path).parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            match std::fs::write(&path, &bytes) {
+            match write_output(&path, &bytes) {
                 Ok(()) => Response::ok(id, json!({
                     "path": path,
                     "cycle": cycle as u64,
@@ -12955,7 +12994,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             //   is NOT, so we still return it for shape parity — it is a path string the
             //   oracle compares; both daemons get the SAME output_path param, so it is
             //   byte-equal anyway). `bytes` = on-disk file size.
-            match std::fs::write(&output_path, &bytes) {
+            match write_output(&output_path, &bytes) {
                 Ok(()) => Response::ok(id, json!({
                     "savedPath": output_path,
                     "bytes": bytes_written
@@ -13753,6 +13792,32 @@ fn host_write_target(raw: &str) -> Result<String, String> {
     Ok(base.join(p).to_string_lossy().to_string())
 }
 
+/// Spec 910 D1 — THE function a path that names a medium goes through before the daemon
+/// reads it: resolved like every path, then (under `--scratch`) opened from its copy.
+/// `tests/no_writeback.rs` fails when a path-taking door reads a medium any other way.
+fn medium_path(st: &State, arg: &str) -> Result<String, String> {
+    scratch::open_medium(&resolve_fs_path_with_state(st, arg))
+}
+
+/// Spec 910 D1 — THE function every write of a medium's backing file goes through. Under
+/// `--scratch` the bytes land in the scratch dir whatever path the medium carries. Returns the
+/// path actually written.
+fn write_medium(path: &str, bytes: &[u8]) -> std::io::Result<String> {
+    let target = scratch::sink(path);
+    std::fs::write(&target, bytes)?;
+    Ok(target)
+}
+
+/// Spec 910 D1 — THE function every other file the daemon writes at a caller's request
+/// (a dump, a save, an export) goes through: a file the daemon was handed as a medium is
+/// refused under `--scratch`.
+fn write_output(path: impl AsRef<std::path::Path>, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let path = path.as_ref();
+    scratch::refuse_original(&path.to_string_lossy())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
+    std::fs::write(path, bytes)
+}
+
 fn resolve_fs_path_with_state(st: &State, arg: &str) -> String {
     if arg.is_empty() || std::path::Path::new(arg).is_absolute() {
         return arg.to_string();
@@ -13916,8 +13981,8 @@ fn persist_cart_for_eject(st: &mut State, backing_path: &str) -> Option<String> 
         return None;
     }
     let img = cart.crt_image(clk)?;
-    match std::fs::write(backing_path, &img) {
-        Ok(()) => Some(backing_path.to_string()),
+    match write_medium(backing_path, &img) {
+        Ok(written) => Some(written),
         Err(_) => None,
     }
 }
@@ -13975,8 +14040,8 @@ fn persist_outgoing_disk_at(st: &mut State, pos: DrivePosition) -> Option<String
         _ => return None, // uploaded bytes with no host file → RAM-only, nothing to write
     };
     let bytes = disk.bytes.clone();
-    match std::fs::write(&backing_path, &bytes) {
-        Ok(()) => Some(backing_path),
+    match write_medium(&backing_path, &bytes) {
+        Ok(written) => Some(written),
         Err(_) => None,
     }
 }
@@ -14716,8 +14781,8 @@ fn autopersist_disk_at(st: &mut State, pos: DrivePosition, ap: &mut DiskAutoPers
         Some(d) => d.bytes.clone(),
         None => return,
     };
-    match std::fs::write(&backing_path, &bytes) {
-        Ok(()) => {
+    match write_medium(&backing_path, &bytes) {
+        Ok(backing_path) => {
             ap.done_hash = Some(hash);
             ap.pending = false; // settled + written; re-armed on the next drive write
             let session_id = st.session.id.clone();
@@ -15252,7 +15317,7 @@ fn export_session_audio(
     st.machine_generation += 1;
 
     let wav = engine.export_wav(WavFormat { sample_rate, channels: 2 });
-    std::fs::write(out_path, &wav).map_err(|e| format!("write {out_path}: {e}"))?;
+    write_output(out_path, &wav).map_err(|e| format!("write {out_path}: {e}"))?;
 
     let pcm_samples = engine.pcm().len() as u64; // mono frames (= L=R stereo frames)
     Ok(json!({
@@ -15358,7 +15423,7 @@ fn run_scenario(st: &mut State, scenario: &Value) -> Result<Value, String> {
                         st.session.machine.drive8.attach_disk(DiskImage {
                             kind,
                             bytes: bytes.clone(),
-                            backing_path: rm.reference.source_name.clone(),
+                            backing_path: rm.reference.source_name.clone().filter(|_| !scratch::active()),
                             read_only: false,
                         });
                     }
@@ -16451,7 +16516,7 @@ fn sandbox_cow_media(
     let mut write = |name: &str, bytes: &[u8]| -> Result<(), String> {
         std::fs::create_dir_all(folder).map_err(|e| format!("sandbox: {}: {e}", folder.display()))?;
         let path = folder.join(name);
-        std::fs::write(&path, bytes).map_err(|e| format!("sandbox: {}: {e}", path.display()))?;
+        write_output(&path, bytes).map_err(|e| format!("sandbox: {}: {e}", path.display()))?;
         files.push(json!(path.to_string_lossy()));
         Ok(())
     };
@@ -17353,16 +17418,21 @@ fn undump_native_snapshot(st: &mut State, path: &str) -> Result<UndumpResult, St
     // attach into a real, picker-visible mount whose writes persist to a file the user
     // owns (and can abräumen). The dir is tagged in `materialized_media` so
     // `undump_media_purge` can later kill ONLY what undump created.
+    //
+    // Spec 910 D1: under `--scratch` the sidecar is a fresh directory in the scratch dir, not
+    // a folder beside the snapshot the caller owns.
     let media_dir = {
         let p = std::path::Path::new(path);
         let stem = p
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "snapshot".to_string());
-        p.parent()
-            .map(|d| d.to_path_buf())
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(format!("{stem}_media"))
+        scratch::media_dir(
+            p.parent()
+                .map(|d| d.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(format!("{stem}_media")),
+        )
     };
     let mut materialized_any = false;
 
@@ -17395,14 +17465,17 @@ fn undump_native_snapshot(st: &mut State, path: &str) -> Result<UndumpResult, St
             .unwrap_or_else(|| format!("drive8.{}", rm.reference.format));
         let backing = match std::fs::create_dir_all(&media_dir).and_then(|_| {
             let fp = media_dir.join(&fname);
-            std::fs::write(&fp, &bytes).map(|_| fp)
+            write_medium(&fp.to_string_lossy(), &bytes).map(|_| fp)
         }) {
             Ok(fp) => {
                 materialized_any = true;
                 Some(fp.to_string_lossy().to_string())
             }
             // Materialization is best-effort: on a write failure fall back to the
-            // in-memory attach (never break the undump over a filesystem hiccup).
+            // in-memory attach (never break the undump over a filesystem hiccup). The
+            // dump's `source_name` is the file the disk once came from: under `--scratch`
+            // it is not a backing file to write to.
+            Err(_) if scratch::active() => None,
             Err(_) => rm.reference.source_name.clone(),
         };
         st.session.machine.drive8.attach_disk(DiskImage {
@@ -17451,7 +17524,7 @@ fn undump_native_snapshot(st: &mut State, path: &str) -> Result<UndumpResult, St
                 .unwrap_or_else(|| "cart.crt".to_string());
             if std::fs::create_dir_all(&media_dir).is_ok() {
                 let cp = media_dir.join(&cname);
-                if std::fs::write(&cp, &cart_bytes).is_ok() {
+                if write_medium(&cp.to_string_lossy(), &cart_bytes).is_ok() {
                     materialized_any = true;
                     let cps = cp.to_string_lossy().to_string();
                     st.session.cart_path = cps.clone();
@@ -17902,7 +17975,7 @@ fn ringbuffer_dump_to_path(st: &State, path: &str) -> Result<Value, String> {
     if let Some(parent) = std::path::Path::new(path).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    std::fs::write(path, &bytes).map_err(|e| format!("write {path}: {e}"))?;
+    write_output(path, &bytes).map_err(|e| format!("write {path}: {e}"))?;
     let info = dump.info(bytes.len() as u64);
     Ok(ring_dump_info_to_json(&info))
 }
@@ -19006,6 +19079,15 @@ async fn main() {
     let cli = Cli::parse();
 
     trx64_core::elog!("[trx64] project = {:?}", cli.project);
+
+    // Spec 910 D1 — before any request can hand the daemon a medium.
+    if let Some(dir) = cli.scratch.as_deref() {
+        if let Err(e) = scratch::enable(dir) {
+            trx64_core::elog!("[trx64] --scratch: {e}");
+            std::process::exit(2);
+        }
+        trx64_core::elog!("[trx64] --scratch {dir}: media are opened from copies there and never written back");
+    }
 
     // Take the port FIRST, before any machine work. Several C64RE servers warm-start a
     // daemon on the same port at once; the losers must do nothing and leave quietly so

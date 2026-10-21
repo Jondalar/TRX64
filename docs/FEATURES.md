@@ -88,7 +88,7 @@ One line per feature, as of 0.14.1. Details: [`README.md`](../README.md), monito
 
 ## Embedding
 
-- `trx64-daemon`: JSON-RPC 2.0 over WebSocket (`--port`, `--bind`), binary video and audio frames to subscribed clients; the machine free-runs from startup whether or not anyone is attached, and `debug/run {cycles, pace, wait}` is the one bounded run; `--idle-exit <s>` ends an unused daemon (no request, no A/V subscriber, no recording trace), persisting its media first, and `daemon/keep_alive` holds it; `daemon/shutdown`, SIGTERM and SIGINT end it cleanly the same way (media persisted, a recording trace finished, exit 0).
+- `trx64-daemon`: JSON-RPC 2.0 over WebSocket (`--port`, `--bind`), binary video and audio frames to subscribed clients; the machine free-runs from startup whether or not anyone is attached, and `debug/run {cycles, pace, wait}` is the one bounded run; `--idle-exit <s>` ends an unused daemon (no request, no A/V subscriber, no recording trace), persisting its media first, and `daemon/keep_alive` holds it; `--scratch <dir>` makes it never write a medium back — every disk, cartridge or folder it is handed by a path, through any method, is opened from a copy in that directory and only the copy is written (`session/state.noWriteback`, `scratchDir`); `daemon/shutdown`, SIGTERM and SIGINT end it cleanly the same way (media persisted, a recording trace finished, exit 0).
 - `trx64cli`: terminal cockpit that links the runtime in-process; `mon "<cmd>"` for one-shot use.
 - Rust: `trx64-core::Machine`, `trx64-monitor` as a library.
 - `IecDevice`: a host's own device on the serial bus at slots 4-11 (`attach_iec_device`).
