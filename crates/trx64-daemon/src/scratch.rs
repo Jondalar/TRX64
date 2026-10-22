@@ -87,6 +87,16 @@ impl Scratch {
         Ok(Self { dir, inner: Mutex::new(Inner::default()) })
     }
 
+    /// Every medium handed in, as {original, copy}, in the order the copies were made.
+    pub fn copies_json(&self) -> Vec<Value> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut v: Vec<(&PathBuf, &PathBuf)> = inner.copies.iter().collect();
+        v.sort_by(|a, b| a.1.cmp(b.1));
+        v.into_iter()
+            .map(|(o, c)| json!({ "original": o.to_string_lossy(), "copy": c.to_string_lossy() }))
+            .collect()
+    }
+
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -237,9 +247,13 @@ pub fn media_dir(wanted: PathBuf) -> PathBuf {
 
 /// What `session/state` reports.
 pub fn status() -> Value {
+    // `scratchCopies`: every medium the daemon was handed, as {original, copy}. The daemon reports a mounted medium by the
+    // copy's name (`001-name`); this is how a client finds the identity of what it handed in.
+    let media: Vec<Value> = get().map(|s| s.copies_json()).unwrap_or_default();
     json!({
         "noWriteback": active(),
         "scratchDir": get().map(|s| s.dir().to_string_lossy().to_string()),
+        "scratchCopies": media,
     })
 }
 
@@ -272,6 +286,12 @@ mod tests {
         // The copy opens as itself.
         assert_eq!(s.open_medium(&c1).unwrap(), c1);
         assert_eq!(std::fs::read(&src).unwrap(), b"original");
+        // The identity of what was handed in survives the copy: the copy's name carries a prefix, the list names the original.
+        let list = s.copies_json();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["copy"], c1.as_str());
+        assert_eq!(Path::new(list[0]["original"].as_str().unwrap()).file_name().unwrap(), "a.d64");
+        assert!(Path::new(&c1).file_name().unwrap().to_string_lossy().ends_with("-a.d64"));
         let _ = std::fs::remove_dir_all(&d);
     }
 
