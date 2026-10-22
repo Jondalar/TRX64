@@ -360,6 +360,13 @@ pub fn displayed_frame_start(m: &Machine) -> u64 {
     current_start.wrapping_sub(back)
 }
 
+/// The anchor to replay a frame from: the latest one STRICTLY before `start_clk`. The cycle
+/// that arrives at `start_clk` is the frame's first (line 0 cycle 1), so an anchor standing
+/// on it has already run that cycle and cannot record it.
+pub fn replay_anchor<K>(start_clk: u64, anchors: impl IntoIterator<Item = (K, u64)>) -> Option<K> {
+    anchors.into_iter().filter(|(_, clk)| *clk < start_clk).max_by_key(|(_, clk)| *clk).map(|(k, _)| k)
+}
+
 /// Record the frame starting at `start_clk`. `m` is a SCRATCH machine standing at or before
 /// `start_clk` (restored from an anchor); it is run forward and left past the frame.
 ///
@@ -373,8 +380,10 @@ pub fn record_frame(
 ) -> Result<LineTraceFrame, String> {
     const LEAD: u64 = 300;
     let anchor_clk = m.c64_core.clk;
-    if anchor_clk > start_clk {
-        return Err(format!("the replay starts at cycle {anchor_clk}, after the frame (cycle {start_clk})"));
+    // The machine must stand BEFORE the frame: the cycle that arrives at `start_clk` is the
+    // frame's first (line 0 cycle 1), and a machine already there has run it unrecorded.
+    if anchor_clk >= start_clk {
+        return Err(format!("the replay starts at cycle {anchor_clk}, not before the frame (cycle {start_clk})"));
     }
     let mut null = crate::NullSink;
     let gap = start_clk - anchor_clk;
