@@ -15868,7 +15868,7 @@ fn line_trace_record(
         .filter(|fb| fb.len() >= trx64_core::render::FB_W * trx64_core::render::FB_H);
     let displayed_start = lt::displayed_frame_start(&scratch);
     let next_start = lt::next_frame_start(&scratch);
-    let best = anchor.iter().filter(|r| r.cycles <= displayed_start).max_by_key(|r| r.cycles).map(|r| r.id.clone());
+    let best = lt::replay_anchor(displayed_start, anchor.iter().map(|r| (r.id.clone(), r.cycles)));
     let anchor_cp = match &best {
         Some(aid) => state.lock().unwrap().checkpoint_ring.restore_snapshot(aid),
         None => None,

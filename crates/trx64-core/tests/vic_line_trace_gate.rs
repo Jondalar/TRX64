@@ -160,6 +160,29 @@ fn a_replay_from_earlier_reproduces_the_picture_on_screen() {
     assert!(wrong.is_ok());
 }
 
+/// A free-running machine's ring holds an anchor exactly on a frame boundary. A machine
+/// standing on the frame's first clk has already run cycle 1 of line 0 and cannot record it,
+/// so it is refused; from before the frame the whole frame records, starting at cycle 1.
+#[test]
+fn the_replay_anchor_is_strictly_before_the_frame() {
+    let ring = [("a", 100u64), ("b", 200), ("c", 300)];
+    assert_eq!(vic_line_trace::replay_anchor(300, ring), Some("b"), "the anchor ON the start is not usable");
+    assert_eq!(vic_line_trace::replay_anchor(301, ring), Some("c"));
+    assert_eq!(vic_line_trace::replay_anchor(100, ring), None);
+}
+
+#[test]
+fn a_replay_must_start_before_the_frame_not_on_it() {
+    let Some(m) = booted() else { return };
+    let start = m.c64_core.clk;
+    let on_it = vic_line_trace::record_frame(&mut m.clone(), start, FrameWhich::Displayed, None);
+    assert!(on_it.is_err(), "an anchor on the frame's first clk cannot record its first cycle");
+    let start = next_frame_start(&m);
+    let f = vic_line_trace::record_frame(&mut m.clone(), start, FrameWhich::Displayed, None).expect("record");
+    assert_eq!((f.cycles[0].line, f.cycles[0].cycle), (0, 1));
+    assert_eq!(f.cycles.len(), CYCLES_PER_FRAME as usize);
+}
+
 // ── Spec 860 — the frame map ─────────────────────────────────────────────────────────
 
 /// A raster split in a loop, with interrupts off: at line $80 the charset flips to $1800,
