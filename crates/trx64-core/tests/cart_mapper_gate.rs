@@ -392,6 +392,56 @@ fn machine_memconfig_magicdesk_8k_boot_config() {
 }
 
 #[test]
+fn machine_easyflash_16k_maps_romh_with_hiram_alone() {
+    // TRX64 #21. 16K mode (EXROM=0, GAME=0) against VICE c64meminit.c configs
+    // 0x18-0x1f: ROMH answers at $A000 whenever HIRAM is set, ROML at $8000 only
+    // with LORAM and HIRAM, and LORAM alone maps RAM (no char ROM) at $D000.
+    use trx64_core::Machine;
+    let mut m = Machine::new();
+    let crt = build_crt(32, 0, 0, "EF", &[
+        (0, 0x8000, vec![0x11; 0x2000]),
+        (0, 0xa000, vec![0x22; 0x2000]),
+        (1, 0x8000, vec![0x33; 0x2000]),
+        (1, 0xa000, vec![0x44; 0x2000]),
+    ]);
+    let (_, ty) = m.attach_cart_from_bytes(&crt, "EF").expect("attach");
+    assert_eq!(ty, MapperType::EasyFlash);
+    m.write_full(0x0000, 0x2f);
+    m.write_full(0x0001, 0x37);
+    m.write_full(0xde00, 1); // bank 1
+    m.write_full(0xde02, 0x87); // 16K mode, LED on (the issue's value)
+    let lines = m.cartridge.as_ref().expect("cart").get_lines();
+    assert_eq!((lines.exrom, lines.game), (0, 0), "$DE02=$87 is 16K mode");
+    m.ram[0x8000] = 0xa1;
+    m.ram[0xa000] = 0xa2;
+    m.ram[0xd000] = 0xa3;
+    for p in 0u8..8 {
+        let (loram, hiram, charen) = (p & 1 != 0, p & 2 != 0, p & 4 != 0);
+        m.write_full(0x0001, 0x30 | p);
+        let want_8000 = if loram && hiram { 0x33 } else { 0xa1 };
+        let want_a000 = if hiram { 0x44 } else { 0xa2 };
+        assert_eq!(m.read_full(0x8000), want_8000, "$01=${:02x}: $8000", 0x30 | p);
+        assert_eq!(m.read_full(0xa000), want_a000, "$01=${:02x}: $A000", 0x30 | p);
+        let cfg = m.memconfig;
+        assert_eq!(cfg.char_rom, hiram && !charen, "$01=${:02x}: char ROM", 0x30 | p);
+        assert_eq!(cfg.io, (loram || hiram) && charen, "$01=${:02x}: I/O", 0x30 | p);
+        assert_eq!(cfg.kernal, hiram, "$01=${:02x}: KERNAL", 0x30 | p);
+        if !cfg.char_rom && !cfg.io {
+            assert_eq!(m.read_full(0xd000), 0xa3, "$01=${:02x}: RAM at $D000", 0x30 | p);
+        }
+        // The cart lens shows the cartridge's bytes whatever $01 banks in.
+        assert_eq!(m.peek_lens(0x8000, "cart"), 0x33, "$01=${:02x}: cart lens $8000", 0x30 | p);
+        assert_eq!(m.peek_lens(0xa000, "cart"), 0x44, "$01=${:02x}: cart lens $A000", 0x30 | p);
+    }
+    // The CPU fetches through the same table: LDA $A000 under $01=$36 loads ROMH.
+    m.write_full(0x0001, 0x36);
+    m.poke(0x0400, &[0xad, 0x00, 0xa0, 0x8d, 0x00, 0x03, 0x4c, 0x06, 0x04]);
+    m.c64_core.reg_pc = 0x0400;
+    m.run_for_full_capped(64 * 64, 64, &mut trx64_core::NullSink, |_, _, _, _, _, _, _| {});
+    assert_eq!(m.read_full(0x0300), 0x44, "LDA $A000 with $01=$36 read ROMH");
+}
+
+#[test]
 fn cart_resident_divergence_guardrail() {
     // GUARDRAIL #2 (undump vs mounted cart): cart_resident_divergence flags when the
     // resident RAM under the cart window differs from the cart's flash/ROM, and clears

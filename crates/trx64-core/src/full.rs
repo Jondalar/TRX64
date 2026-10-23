@@ -6,9 +6,9 @@
 //! wired into the real machine through a single `Bus` impl that reproduces the TS
 //! oracle's `HeadlessMemoryBus` (memory-bus.ts) + `integrated-session.ts` run loop:
 //!
-//!   * PLA banking via the $00/$01 CPU port (LORAM/HIRAM/CHAREN; GAME/EXROM=1, no
-//!     cart). 32-entry memconfig table (= buildMemConfigTable), selected each
-//!     $00/$01 write. RAM $0000-$9FFF, BASIC $A000-$BFFF, IO/char $D000-$DFFF,
+//!   * PLA banking via the $00/$01 CPU port (LORAM/HIRAM/CHAREN) and the cartridge's
+//!     GAME/EXROM lines. 32-entry memconfig table (`build_memconfig_table`),
+//!     selected each $00/$01 write and each line change. RAM $0000-$9FFF, BASIC $A000-$BFFF, IO/char $D000-$DFFF,
 //!     KERNAL $E000-$FFFF — per the live config.
 //!   * IO routing: VIC $D000-$D3FF, SID $D400-$D7FF (register shadow), colorRAM
 //!     $D800-$DBFF (low nibble + $F0 open-bus high nibble), CIA1 $DC00-$DCFF,
@@ -78,12 +78,11 @@ pub struct MemConfig {
     pub ultimax: bool,
 }
 
-/// Build the 32-entry memconfig table exactly like memory-bus.ts
-/// `buildMemConfigTable` (ts:987-1019). Index = LORAM|HIRAM<<1|CHAREN<<2|
-/// EXROM<<3|GAME<<4. The cart windows (cart_lo / cart_hi / cart_hi_ultimax) are
-/// set per ultimax / 16K-cart rules; the booleans are derived so the no-cart path
-/// (EXROM=GAME=1 ⇒ idx 0x18-0x1f, never ultimax, never cart) is byte-identical to
-/// the prior table.
+/// Build the 32-entry memconfig table, the PLA as VICE's c64meminit.c maps it.
+/// Index = LORAM|HIRAM<<1|CHAREN<<2|EXROM<<3|GAME<<4. The cart windows (cart_lo /
+/// cart_hi / cart_hi_ultimax) are set per ultimax / 16K-cart rules; the no-cart
+/// path (EXROM=GAME=1 ⇒ idx 0x18-0x1f, never ultimax, never cart) is the stock
+/// table.
 pub fn build_memconfig_table() -> [MemConfig; 32] {
     let mut table = [MemConfig {
         bank8: Bank8::Ram,
@@ -115,10 +114,12 @@ pub fn build_memconfig_table() -> [MemConfig; 32] {
             Bank8::Ram
         };
 
-        // ts:1002-1005 — bankA.
+        // bankA. In 16K mode ROMH answers at $A000 whenever HIRAM is set, LORAM
+        // or not (VICE c64meminit.c configs 0x1a/0x1b/0x1e/0x1f; the PLA's ROMH
+        // term has no LORAM input).
         let bank_a = if ultimax {
             BankA::Ram // unmapped in Ultimax
-        } else if loram && hiram && !exrom && !game {
+        } else if hiram && !exrom && !game {
             BankA::CartHi // 16K cart
         } else if loram && hiram {
             BankA::Basic
@@ -132,7 +133,9 @@ pub fn build_memconfig_table() -> [MemConfig; 32] {
         } else {
             (loram || hiram) && charen
         };
-        let char_rom = !ultimax && (loram || hiram) && !charen;
+        // Char ROM: with HIRAM, or with LORAM alone only while GAME is high. In
+        // 16K mode LORAM alone maps RAM at $D000 (VICE config 0x19).
+        let char_rom = !ultimax && !charen && (hiram || (loram && game));
 
         // ts:1011-1012 — bankE.
         let bank_e = if ultimax {
