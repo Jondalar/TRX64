@@ -2934,13 +2934,16 @@ impl Machine {
                     self.ram[addr as usize]
                 }
             }
-            // cart: the mapper's side-effect-free peek, then the port's devices (Spec
-            // 850 D3), then the open bus — never the write-through shadow.
+            // cart: what the cartridge drives at `addr` in its current bank and mode,
+            // whatever the CPU port banks in. $DE00-$DFFF: the mapper's side-effect-free
+            // peek, then the port's devices (Spec 850 D3), then the open bus — never the
+            // write-through shadow. Elsewhere the mapper's peek (ROML/ROMH), and RAM
+            // where the cartridge claims nothing.
             "cart" => {
                 if (0xde00..=0xdfff).contains(&addr) {
                     self.port_peek(addr)
                 } else {
-                    self.ram[addr as usize]
+                    self.cart_peek_byte(addr).unwrap_or(self.ram[addr as usize])
                 }
             }
             // cpu (and any unknown) → the live PLA-banked side-effect-free read.
