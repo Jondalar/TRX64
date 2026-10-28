@@ -526,9 +526,9 @@ impl CartMapper for Ef3Mapper {
     /// The live flash as a type-90 CRT in the CHIP layout: slot-major, `slot*64 + bank`,
     /// 8 KB per packet, ROML at `$8000`, ROMH at `$A000` (or `$E000` where the image loaded
     /// it there). An erased 8 KB half is not written; a loader fills what is missing with
-    /// `$FF`, as erased flash is. Unlike the EasyFlash's repack this is built from the flash,
-    /// not patched into the old packets, so a slot written from scratch (EasyProg onto a slot
-    /// the image had no packets for) is saved too.
+    /// `$FF`, as erased flash is. Built from the flash, not patched into the old packets, so a
+    /// slot written from scratch (EasyProg onto a slot the image had no packets for) is saved
+    /// too.
     fn crt_image(&mut self, clk: u64) -> Option<Vec<u8>> {
         let header = &self.header;
         let e000 = &self.romh_e000;

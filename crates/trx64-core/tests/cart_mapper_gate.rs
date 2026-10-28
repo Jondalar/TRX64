@@ -777,6 +777,84 @@ fn easyflash_writeback_persists_across_image_roundtrip() {
     assert_eq!(m2.read(0x8042, &bi(), 0), Some(0x37)); // persisted after load
 }
 
+/// Program one byte through the AMD byte-program sequence. `base` is $8000 (ROML)
+/// or $E000 (ROMH, ultimax); the cart must be in ultimax with `bank` selected.
+fn ef_program_byte(m: &mut Box<dyn trx64_core::cart::CartMapper>, base: u16, off: u16, val: u8, clk: u64) {
+    assert!(m.write(base | 0x555, 0xaa, &bi(), clk));
+    assert!(m.write(base | 0x2aa, 0x55, &bi(), clk));
+    assert!(m.write(base | 0x555, 0xa0, &bi(), clk));
+    assert!(m.write(base + off, val, &bi(), clk));
+}
+
+/// Walk the CHIP packets of a CRT: (bank, load, size, data offset).
+fn crt_chips(crt: &[u8]) -> Vec<(u16, u16, usize, usize)> {
+    let mut v = Vec::new();
+    let mut o = u32::from_be_bytes(crt[0x10..0x14].try_into().unwrap()) as usize;
+    while o + 0x10 <= crt.len() && &crt[o..o + 4] == b"CHIP" {
+        let len = u32::from_be_bytes(crt[o + 4..o + 8].try_into().unwrap()) as usize;
+        let bank = u16::from_be_bytes(crt[o + 10..o + 12].try_into().unwrap());
+        let load = u16::from_be_bytes(crt[o + 12..o + 14].try_into().unwrap());
+        let size = u16::from_be_bytes(crt[o + 14..o + 16].try_into().unwrap()) as usize;
+        v.push((bank, load, size, o + 16));
+        o += len;
+    }
+    v
+}
+
+/// Issue #23: flash programmed at runtime in a bank (or a ROMH half) the input CRT
+/// has no CHIP packet for must come out in the re-packed CRT as a new CHIP packet.
+#[test]
+fn easyflash_crt_image_keeps_writes_to_banks_without_a_packet() {
+    // Bank 0: one 16K packet (both halves). Bank 1: ROML packet only (no ROMH).
+    let mut b0 = vec![0xffu8; 0x4000];
+    b0[0x3ffc] = 0x00;
+    b0[0x3ffd] = 0x80;
+    let crt = build_easyflash_crt(&[(0, 0x8000, b0), (1, 0x8000, vec![0xffu8; 0x2000])]);
+
+    // Unwritten: byte-identical to the input.
+    let (_i, mut m) = load_cartridge_from_bytes(&crt, "EF", None).unwrap();
+    assert_eq!(m.crt_image(0).unwrap(), crt, "an unwritten CRT is returned as is");
+
+    // Written only inside existing packets: same size, only those bytes differ.
+    ef_program_byte(&mut m, 0x8000, 0x100, 0x42, 10);
+    ef_program_byte(&mut m, 0xe000, 0x10, 0x43, 20);
+    let patched = m.crt_image(30).unwrap();
+    let mut expect = crt.clone();
+    expect[0x40 + 0x10 + 0x100] = 0x42; // bank 0 packet, ROML offset $100
+    expect[0x40 + 0x10 + 0x2000 + 0x10] = 0x43; // bank 0 packet, ROMH offset $10
+    assert_eq!(patched, expect);
+
+    // Now bank 5 ROML (no packet) and bank 1 ROMH (no ROMH packet).
+    assert!(m.write(0xde00, 5, &bi(), 40));
+    for (i, v) in [0xeeu8, 0x01, 0x02, 0x03].into_iter().enumerate() {
+        ef_program_byte(&mut m, 0x8000, 0x100 + i as u16, v, 50 + i as u64 * 10);
+    }
+    assert!(m.write(0xde00, 1, &bi(), 100));
+    ef_program_byte(&mut m, 0xe000, 0x20, 0x77, 110);
+    let out = m.crt_image(200).unwrap();
+    assert_eq!(out.len(), expect.len() + 2 * 0x2010);
+
+    let chips = crt_chips(&out);
+    let n = chips.len();
+    // appended: bank 1 ROMH ($A000) first, then bank 5 ROML ($8000)
+    let (b, l, sz, d) = chips[n - 2];
+    assert_eq!((b, l, sz), (1, 0xa000, 0x2000));
+    assert_eq!(out[d + 0x20], 0x77);
+    let (b, l, sz, d) = chips[n - 1];
+    assert_eq!((b, l, sz), (5, 0x8000, 0x2000));
+    assert_eq!(&out[d + 0x100..d + 0x104], &[0xee, 0x01, 0x02, 0x03]);
+    // Everything before the appended packets is the patch-only result plus bank 1's write.
+    assert_eq!(&out[..expect.len()], &expect[..]);
+
+    // Remount the produced image: the writes read back.
+    let (_i2, mut m2) = load_cartridge_from_bytes(&out, "EF", None).unwrap();
+    assert!(m2.write(0xde00, 5, &bi(), 0));
+    assert_eq!(m2.read(0x8100, &bi(), 0), Some(0xee));
+    assert_eq!(m2.read(0x8103, &bi(), 0), Some(0x03));
+    assert!(m2.write(0xde00, 1, &bi(), 0));
+    assert_eq!(m2.read(0xe020, &bi(), 0), Some(0x77));
+}
+
 // ── BEHAVIORAL: a real EasyFlash CRT boots into the cart (ROM-gated) ──────────
 
 const EF_SAMPLE: &str =
