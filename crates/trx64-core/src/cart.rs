@@ -1686,8 +1686,12 @@ impl CartMapper for EasyFlashMapper {
             self.hi_flash.load_data(&bytes[lo_len..]);
         }
     }
-    /// ts:933-964 — re-pack the live flash into the original .crt structure
-    /// (header / CHIP packets / load addresses preserved, only data changes).
+    /// Re-pack the live flash into the original .crt: header, existing CHIP
+    /// packets and their load addresses are kept and only their data is patched.
+    /// A 8 KB half (ROML or ROMH of a bank) that no existing packet covers and
+    /// that is not all $FF (programmed at runtime) is appended as a new flash
+    /// CHIP packet, ordered by bank, ROML before ROMH, so no programmed half is
+    /// lost.
     fn crt_image(&mut self, clk: u64) -> Option<Vec<u8>> {
         let orig = &self.image.raw_bytes;
         if orig.len() < 0x40 {
@@ -1698,6 +1702,9 @@ impl CartMapper for EasyFlashMapper {
         let hi = self.hi_flash.get_data(clk).to_vec();
         let header_len = read_u32_be(&out, 0x10) as usize;
         let mut offset = header_len;
+        let banks = lo.len().max(hi.len()) >> 13;
+        let mut covered_lo = vec![false; banks];
+        let mut covered_hi = vec![false; banks];
         while offset + 0x10 <= out.len() {
             if out.get(offset..offset + 4) != Some(b"CHIP") {
                 break;
@@ -1709,6 +1716,14 @@ impl CartMapper for EasyFlashMapper {
             let data_off = offset + 16;
             let bank_off = bank << 13;
             let first = size.min(0x2000);
+            if bank < banks {
+                if load_address == 0x8000 {
+                    covered_lo[bank] = true;
+                    covered_hi[bank] |= size > 0x2000;
+                } else {
+                    covered_hi[bank] = true;
+                }
+            }
             let src = if load_address == 0x8000 { &lo } else { &hi };
             if bank_off + first <= src.len() && data_off + first <= out.len() {
                 out[data_off..data_off + first]
@@ -1723,6 +1738,26 @@ impl CartMapper for EasyFlashMapper {
                 }
             }
             offset += packet_len;
+        }
+        // Halves programmed at runtime that the input had no packet for.
+        for bank in 0..banks {
+            for (covered, flash, load) in [
+                (&covered_lo, &lo, 0x8000u16),
+                (&covered_hi, &hi, 0xa000u16),
+            ] {
+                let off = bank << 13;
+                let Some(half) = flash.get(off..off + 0x2000) else { continue };
+                if covered[bank] || half.iter().all(|&x| x == 0xff) {
+                    continue;
+                }
+                out.extend_from_slice(b"CHIP");
+                out.extend_from_slice(&(0x10u32 + 0x2000).to_be_bytes());
+                out.extend_from_slice(&2u16.to_be_bytes()); // chip type: flash
+                out.extend_from_slice(&(bank as u16).to_be_bytes());
+                out.extend_from_slice(&load.to_be_bytes());
+                out.extend_from_slice(&0x2000u16.to_be_bytes());
+                out.extend_from_slice(half);
+            }
         }
         Some(out)
     }
