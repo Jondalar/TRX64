@@ -61,7 +61,7 @@ Nothing that worked stops working in a patch.
   maps or data-flow taint
 - **Marks & sandboxes** — name a point, jump back to it, branch, discard.
 - **Cartridges** — generic 8K/16K/Ultimax, Ocean, Magic Desk, Magic Desk 16, Action Replay V5/V6,
-  EasyFlash, EasyFlash 3, GMod2, GMod4, MegaByter, C64MegaCart. Flash and EEPROM writes survive a reset
+  EasyFlash, EasyFlash 3, GMod2, GMod4, MegaByter, TwoMegabyter, C64MegaCart. Flash and EEPROM writes survive a reset
   and a snapshot round trip. The EasyFlash 3 has its eight slots, its mode register and its
   three buttons (`cart button menu|reset|special`). The Action Replay freezes a running program
   and returns to it (`cart button freeze`).

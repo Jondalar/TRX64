@@ -292,6 +292,32 @@ mod tests {
         }, 128);
     }
 
+    /// TwoMegabyter serves both halves of a 16 KiB bank: ROML, and ROMH at $A000 and
+    /// at $E000 (the same image). Bank = $DE00.
+    #[test]
+    fn twomegabyter_both_halves_and_the_ultimax_romh_alias() {
+        let banks: &[Bank] = &[(0, Some(0), Some(0x80), None), (100, Some(100), Some(0xe4), None)];
+        let sel = |m: &mut Box<dyn CartMapper>, b: u16| {
+            m.write(0xde00, b as u8, &bi(), 0);
+        };
+        let mut m = mk(MapperType::TwoMegabyter, banks);
+        let (dirty, gen) = (m.is_writable_dirty(), m.writable_generation());
+        m.overlay_bank_write("roml", 100, 0x9f00, 0xab).unwrap();
+        m.overlay_bank_write("romh", 100, 0xa123, 0xcd).unwrap();
+        assert_eq!(m.overlay_bank_read("roml", 100, 0x9f00).unwrap(), 0xab);
+        assert_eq!(m.overlay_bank_read("romh", 100, 0xa123).unwrap(), 0xcd);
+        assert_eq!(m.overlay_bank_read("romh", 100, 0xe123).unwrap(), 0xcd, "$E000 is the same ROMH image");
+        assert_eq!(m.overlay_bank_read("roml", 0, 0x9f00).unwrap(), 0x00, "bank 0 untouched");
+        assert_eq!(live(&mut m, 0x9f00), Some(0x00));
+        sel(&mut m, 100);
+        assert_eq!(live(&mut m, 0x9f00), Some(0xab), "live ROML after the bank switch");
+        assert_eq!(live(&mut m, 0xa123), Some(0xcd), "live ROMH after the bank switch");
+        assert_eq!(live(&mut m, 0x9eff), Some(100), "neighbour byte is the bank fill");
+        assert_eq!(live(&mut m, 0xa124), Some(0xe4));
+        assert_eq!((m.is_writable_dirty(), m.writable_generation()), (dirty, gen), "not a program");
+        common_refusals(&mut m, 128);
+    }
+
     #[test]
     fn c64megacart_including_the_ultimax_romh_alias() {
         let sel = |m: &mut Box<dyn CartMapper>, b: u16| {
