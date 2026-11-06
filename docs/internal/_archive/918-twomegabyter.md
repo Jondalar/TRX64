@@ -1,6 +1,6 @@
 # 918 — Protovision TwoMegabyter as a cartridge
 
-**Status:** PROPOSED (2026-11-06, owner: "Spec und bauen").
+**Status:** DONE — merged to main 2026-11-06 (`99319bd`), C64RE half on master (`f50c7c1a`); ships with the next release.
 
 ## Why
 
@@ -123,6 +123,28 @@ never PTV's.
 - **S8 By hand, on the owner's machine, not in the repo.** Assemble PTV's examples and the
   highscore demo with ca65 locally. Run them on TRX64. Erase, write and read back must agree.
   The result goes into this file. The PTV sources stay outside the repo.
+
+## As built
+
+- `TwoMegabyterMapper` in `cart.rs`, flash profile `FLASH_MX29F016` in `flash040.rs`; mnemonics
+  `89`, `twomegabyter`, `tmb`. A CHIP packet for a bank above 127 is refused (`BankOutOfRange`),
+  not dropped.
+- Programming a byte that asks for a 0->1 bit leaves the AND of old and new in the cell and the chip
+  in its DQ7 error state until a `$F0` reset, as `Flash040` does for every AMD part here.
+- C64RE also got a type 89 row in `CART_TYPE_PROFILES` (`view-builders.ts`), so the bank view
+  covers it like 86-88.
+- Tests: `tests/cart_twomegabyter_gate.rs` (S1-S7, 17 tests), plus cases in `cart_bin_gate`,
+  `cart_overlay_rollback` and `cart_overlay.rs`; C64RE `e2e-908-io-names` 63/63.
+
+**S8 (2026-11-06, by hand).** The TRX64-Ultimate test cartridge (`tests/cart/twomegabyter/build.sh`
+there: Protovision's boot block, flash API and highscore demo, assembled with ca65 from the local
+zip, plus bank markers in banks 0-123), built in a scratch directory and booted with
+`trx64cli boot` twice, each time in a fresh process:
+
+- bank errors 0 (markers of all 124 banks read through `$DE00`), mode errors 0 (`$DE02` = 2, 3,
+  1, 0), save errors 0, green border;
+- the save counter read 1 on the first run and 2 on the second: the highscore demo erased and
+  wrote sector 31, and the write-back added the CRT packet for bank 124 (2033664 -> 2041872 bytes).
 
 ## Out
 

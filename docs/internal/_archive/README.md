@@ -582,3 +582,18 @@ included, rides the checkpoint and the `.c64re` dump.
 three cycles after the NMI, mid-instruction, which broke about 3 % of presses on a BASIC loop;
 here it happens at the NMI's vector fetch, after the stack pushes (owner, 2026-10-16). A
 deliberate deviation from VICE, recorded in the spec.
+
+## Protovision TwoMegabyter — 918
+
+A TwoMegabyter image (CRT type 89, shared with TRX64-Ultimate, TRX_CRT_cli and C64RE: 2 MiB
+MX29F016, 128 × 16 KiB banks over ROML and ROMH) runs as Protovision's flash API 1.0.0 uses it:
+`$DE00` bank, `$DE02` mode (bit 0 EXROM, bit 1 GAME: 16K, Ultimax, 8K, off), A1 decoding,
+flash written through ROML and through ROMH at `$E000` in Ultimax, written banks persisted even
+without a CHIP packet. Built so a TwoMegabyter game built by us can be looked at before one
+exists, and so the U64 emulator and the firmware's trex_crt app can build on it.
+
+**Decision:** Protovision's code has no licence, so it never enters this repo; behaviour is
+re-implemented and the tests use our own 6502. Mode 2 = 8K, write-only registers and A1
+decoding are taken from the shared descriptor, not observed; one place changes if hardware says
+otherwise.
+
