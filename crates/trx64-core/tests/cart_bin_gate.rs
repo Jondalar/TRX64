@@ -111,6 +111,28 @@ fn parse_bin_16k_banks_split_lo_hi() {
     }
 }
 
+#[test]
+fn parse_bin_twomegabyter_16k_banks_split_lo_hi_and_bank_by_de00() {
+    // 3 banks of 16K: ROML[0]=$10+N, ROMH@A000[0]=$20+N.
+    let mut bin = vec![0xffu8; 3 * 0x4000];
+    for n in 0..3usize {
+        bin[n * 0x4000] = 0x10 + n as u8;
+        bin[n * 0x4000 + 0x2000] = 0x20 + n as u8;
+    }
+    let img = parse_bin(&bin, "tmb.bin", "tmb", MapperType::TwoMegabyter).expect("parse_bin");
+    assert_eq!(img.mapper_type, MapperType::TwoMegabyter);
+    assert_eq!(img.banks.len(), 3);
+    let mut m = mapper_from_image(&img).expect("mapper");
+    for n in 0..3u8 {
+        m.write(0xde00, n, &bi(), 0);
+        assert_eq!(m.read(0x8000, &bi(), 0), Some(0x10 + n));
+        assert_eq!(m.read(0xa000, &bi(), 0), Some(0x20 + n));
+    }
+    // 129 banks do not fit the 2 MiB part.
+    let too_big = vec![0u8; 129 * 0x4000];
+    assert!(parse_bin(&too_big, "x.bin", "x", MapperType::TwoMegabyter).is_err());
+}
+
 // ── 790.6: a .bin and the equivalent full .crt build byte-identical flash ──────
 
 #[test]
@@ -222,6 +244,7 @@ fn resolve_cart_type_ids_and_mnemonics() {
     assert_eq!(resolve_cart_type("32").unwrap(), CartType::Forced(MapperType::EasyFlash));
     assert_eq!(resolve_cart_type("86").unwrap(), CartType::Forced(MapperType::MegaByter));
     assert_eq!(resolve_cart_type("88").unwrap(), CartType::Forced(MapperType::C64MegaCart));
+    assert_eq!(resolve_cart_type("89").unwrap(), CartType::Forced(MapperType::TwoMegabyter));
     assert_eq!(resolve_cart_type("-2").unwrap(), CartType::Forced(MapperType::Normal16k));
     assert_eq!(resolve_cart_type("-3").unwrap(), CartType::Forced(MapperType::Normal8k));
     assert_eq!(resolve_cart_type("-6").unwrap(), CartType::Forced(MapperType::Ultimax));
@@ -230,6 +253,8 @@ fn resolve_cart_type_ids_and_mnemonics() {
     assert_eq!(resolve_cart_type("ef").unwrap(), CartType::Forced(MapperType::EasyFlash));
     assert_eq!(resolve_cart_type("MB").unwrap(), CartType::Forced(MapperType::MegaByter));
     assert_eq!(resolve_cart_type("c64mc").unwrap(), CartType::Forced(MapperType::C64MegaCart));
+    assert_eq!(resolve_cart_type("tmb").unwrap(), CartType::Forced(MapperType::TwoMegabyter));
+    assert_eq!(resolve_cart_type("twomegabyter").unwrap(), CartType::Forced(MapperType::TwoMegabyter));
     assert_eq!(resolve_cart_type("md").unwrap(), CartType::Forced(MapperType::MagicDesk));
     assert_eq!(resolve_cart_type("md16").unwrap(), CartType::Forced(MapperType::MagicDesk16));
     assert_eq!(resolve_cart_type("ocean").unwrap(), CartType::Forced(MapperType::Ocean));

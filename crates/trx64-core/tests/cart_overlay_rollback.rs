@@ -73,6 +73,8 @@ fn a_restore_drops_the_overlay_in_every_banked_family() {
     rolls_back("easyflash", MapperType::EasyFlash, crt(32, 1, 0, &[l8(0), l8(5)]), "roml", 5, 0x9f00);
     rolls_back("gmod2", MapperType::Gmod2, crt(60, 0, 1, &[l8(0), l8(5)]), "roml", 5, 0x9f00);
     rolls_back("megabyter", MapperType::MegaByter, crt(86, 0, 1, &[l8(0), l8(100)]), "roml", 100, 0x9f00);
+    rolls_back("twomegabyter", MapperType::TwoMegabyter, crt(89, 0, 0, &[l8(0), l8(100)]), "roml", 100, 0x9f00);
+    rolls_back("twomegabyter-romh", MapperType::TwoMegabyter, crt(89, 0, 0, &[l8(0), (100, 0xa000, 0x2000)]), "romh", 100, 0xa123);
     rolls_back("c64megacart", MapperType::C64MegaCart, crt(88, 0, 1, &[l8(0), l8(200)]), "roml", 200, 0x9f00);
     rolls_back("gmod4", MapperType::Gmod4, crt(87, 1, 0, &[l8(0), l8(1), l8(6), l8(7)]), "romh", 3, 0xa123);
 }

@@ -13576,7 +13576,7 @@ fn push_media_event(st: &mut State, event: Value) {
 /// delta since attach AND its mapper does NOT faithfully capture/restore that
 /// state — v1 cannot snapshot it, so a media intervention would mint a
 /// non-restorable checkpoint/branch. A persisting family (EasyFlash/GMOD2/
-/// Megabyter) is captured, not rejected. Read-only mappers are never dirty →
+/// Megabyter/TwoMegabyter) is captured, not rejected. Read-only mappers are never dirty →
 /// None. ONLY the cartridge is consulted (the disk has its own write-through /
 /// .c64re embed path), exactly like the TS guard.
 fn non_persistable_dirty_media(st: &State) -> Option<String> {

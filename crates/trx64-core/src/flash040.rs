@@ -28,7 +28,7 @@
 
 /// ts:537-543 / vice:51-67 — flash_types_s row. One of these parametrizes the
 /// core so EasyFlash (TYPE_B), GMOD2 (TYPE_NORMAL), C64MegaCart (TYPE_160) and
-/// MegaByter (MX29F800CB) share one faithful implementation.
+/// MegaByter (MX29F800CB) and TwoMegabyter (MX29F016) share one faithful implementation.
 #[derive(Clone, Copy)]
 pub struct Flash040Type {
     pub manufacturer_id: u8,
@@ -115,6 +115,32 @@ pub const FLASH040B: Flash040Type = Flash040Type {
 pub const FLASH040B_XL: Flash040Type = Flash040Type {
     manufacturer_id: 0x01,
     device_id: 0xa4,
+    device_id_addr: 1,
+    size: 0x200000,
+    sector_mask: 0x1f0000,
+    sector_size: 0x10000,
+    sector_shift: 16,
+    magic1_addr: 0x555,
+    magic2_addr: 0x2aa,
+    magic1_mask: 0x7ff,
+    magic2_mask: 0x7ff,
+    status_toggle_bits: 0x40,
+    erase_sector_timeout_cycles: 50,
+    erase_sector_cycles: 1_000_000,
+    erase_chip_cycles: 8_000_000,
+    boot_sector_size: 0,
+    boot_sector_count: 0,
+    program_cycles: 0,
+};
+
+/// MX29F016 (Macronix, 2 MiB, uniform 32 x 64 KiB sectors) — the Protovision
+/// TwoMegabyter. Manufacturer $C2, device $AD. Unlock cycles $555/$2AA compared on
+/// their low 11 bits, so the bank in the upper address bits does not matter. The AMD
+/// command state machine is the same as every other row here; program completes at
+/// once.
+pub const FLASH_MX29F016: Flash040Type = Flash040Type {
+    manufacturer_id: 0xc2,
+    device_id: 0xad,
     device_id_addr: 1,
     size: 0x200000,
     sector_mask: 0x1f0000,

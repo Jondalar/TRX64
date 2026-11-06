@@ -669,6 +669,7 @@ pub fn mapper_type_str(t: trx64_core::cart::MapperType) -> &'static str {
         EasyFlashXl => "easyflash_xl",
         Gmod2 => "gmod2",
         MegaByter => "megabyter",
+        TwoMegabyter => "twomegabyter",
         C64MegaCart => "c64megacart",
         Gmod4 => "gmod4",
         EasyFlash3 => "easyflash3",
