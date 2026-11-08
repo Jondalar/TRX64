@@ -527,11 +527,9 @@ fn read_board(lay: &Layout, bytes: &[u8]) -> Result<ReadNativeSnapshotResult, St
         m.c64_int.set_nmi(INT_SRC_CIA2, n.nmi_cia2, cycles);
         m.c64_int.set_irq(INT_SRC_VIC, n.irq_vic, cycles);
     }
-    let t = model.timing;
-    let frame = t.cycles_per_frame.max(1) as u64;
-    let pos = cycles % frame;
-    let (line, cycle) = ((pos / t.cycles_per_line as u64) as i64, (pos % t.cycles_per_line as u64) as i64);
-
+    // a snap is on line 0 and the stop is at pix_x[9:3] == the cycle: pix_x is the VIC's raster_x
+    // and cycle_num is raster_x[9:3], 0 based like TRX64's raster_cycle, so x >> 3 is the cycle
+    let (line, cycle) = (0i64, (b.x >> 3) as i64);
     let mut cp = crate::c64re_snapshot::capture_runtime_checkpoint(&m, "", "", None, None, None, None);
     // cpu
     for (k, v) in n.cpu.as_object().into_iter().flatten() {
@@ -564,7 +562,7 @@ fn read_board(lay: &Layout, bytes: &[u8]) -> Result<ReadNativeSnapshotResult, St
             "CIA1 (registers, timers, TOD, interrupt flags; no IFR delay line, no serial shifter)",
             "CIA2 (registers, timers, TOD, interrupt flags; no IFR delay line, no serial shifter)",
             "VIC-II registers",
-            "VIC-II raster position (the cycle count modulo the frame; the file has no line)",
+            "VIC-II raster position (line 0, the cycle from x: a snap is on line 0)",
             "CPU interrupt state (from the chips' interrupt flags)",
         ]
         .map(String::from),

@@ -359,9 +359,13 @@ fn s5_a_disk_stands_alone() {
 /// with sprite 0 at x=0x58, and an EasyFlash at bank 3.
 fn board_block(cart: bool) -> Vec<u8> {
     let mut w = [0u32; 58];
-    w[1] = 0x11 | (0x22 << 8) | (0x33 << 16) | (0xF0 << 24); // a x y sp
-    w[2] = 0x0C12 | (0x24 << 16); // pc, p
-    w[3] = 0x2F | (0x37 << 8) | (0x37 << 16); // port dir, value, as read
+    // the CPU's hidden words 27-33, the ones the loader reads: a x y sp, p pcl pch adl, $00 and $01
+    w[27] = 0x11 | (0x22 << 8) | (0x33 << 16) | (0xF0 << 24);
+    w[28] = 0x24 | (0x12 << 8) | (0x0C << 16);
+    w[31] = (0x2F << 16) | (0x37 << 24);
+    w[1] = w[27];
+    w[2] = 0x0C12 | (0x24 << 16);
+    w[3] = 0x2F | (0x37 << 8) | (0x37 << 16);
     w[4] = 0x58; // $D000: sprite 0 x
     // CIA1's hidden words start at word 34: timer A latch, timer A count, CRA, the ICR mask
     let h = 34;
@@ -427,11 +431,12 @@ fn s6_a_synthetic_board_file_loads_what_it_holds_and_reports_the_rest() {
     assert_eq!((cp["cpu"]["pc"].as_i64(), cp["cpu"]["a"].as_i64(), cp["cpu"]["x"].as_i64(), cp["cpu"]["y"].as_i64(), cp["cpu"]["sp"].as_i64()), (Some(0x0C12), Some(0x11), Some(0x22), Some(0x33), Some(0xF0)));
     assert_eq!(cp["cpu"]["flags"], 0x24);
     assert_eq!(cp["cpu"]["cycles"], 1265u64 * 19656 + 1);
+    assert_eq!((cp["cpuPortDirection"].as_i64(), cp["cpuPortValue"].as_i64()), (Some(0x2F), Some(0x37)));
     assert_eq!(ta_u8_decode(&cp["ram"]).unwrap()[0x3000], 0x99);
     assert_eq!(ta_u8_decode(&cp["ram"]).unwrap()[0xD800], 0x07, "RAM under the I/O stays RAM");
     assert_eq!(cp["vic"]["color_ram"][5], 0x0E);
     assert_eq!(cp["vic"]["regs"][0], 0x58);
-    assert_eq!((cp["vic"]["raster_line"].as_i64(), cp["vic"]["raster_cycle"].as_i64()), (Some(0), Some(1)), "the cycle count modulo the frame");
+    assert_eq!((cp["vic"]["raster_line"].as_i64(), cp["vic"]["raster_cycle"].as_i64()), (Some(0), Some(14)), "a snap is on line 0, x = 119 is cycle 14");
     assert_eq!(cp["cia1"]["ta_latch"], 0x1234);
     assert_eq!(cp["cia1"]["c_cia"][14], 0, "register image");
     assert_eq!(cp["cartState"]["currentBank"], 3);
@@ -660,4 +665,71 @@ fn a_toy_checkpoint_loses_nothing() {
     let cp = json!({ "schemaVersion": 1, "cpu": { "pc": 0xabcd, "cycles": 123456 }, "ram": ta_u8(&[1, 2, 3, 4, 0xff]) });
     let bytes = write_native_snapshot(args(cp.clone()));
     assert_eq!(read_native_snapshot(&bytes).unwrap().checkpoint, cp);
+}
+
+/// The bit `lo` of the CPU's hidden words (BLOCK words 27-33) and the cartridge-present bit.
+fn block_bit(block: &[u8], lo: usize) -> u32 {
+    let w27 = 27 * 4;
+    ((block[w27 + lo / 8] >> (lo % 8)) & 1) as u32
+}
+
+fn block_byte(block: &[u8], lo: usize) -> u8 {
+    (0..8).fold(0, |a, i| a | (block_bit(block, lo + i) as u8) << i)
+}
+
+#[test]
+fn the_block_has_what_the_loader_reads() {
+    let mut m = machine_with(&ef_crt());
+    m.c64_core.reg_pc = 0x1234;
+    m.c64_core.reg_a = 0x11;
+    m.port_dir = 0x2F;
+    m.port_data = 0x37;
+    m.vic.raster_cycle = 20;
+    let cp = capture(&mut m);
+    let bytes = write_native_snapshot(args(cp));
+    let lay = c64re_v2::layout(&bytes).unwrap();
+    let blk = section(&bytes, &lay, SEC_BLOCK).unwrap();
+    assert_eq!(block_bit(blk, 112), 1, "rwn is 1: the bus is reading");
+    assert_eq!(block_bit(blk, 206), 1, "rdy is 1");
+    assert_eq!(block_bit(blk, 102) | block_bit(blk, 103) | block_bit(blk, 104) | block_bit(blk, 105) | block_bit(blk, 106), 0, "state 0 is the opcode fetch");
+    assert_eq!(block_byte(blk, 144), 0x2F, "$00");
+    assert_eq!(block_byte(blk, 152), 0x37, "$01");
+    assert_eq!(block_byte(blk, 0), 0x11, "a");
+    assert_eq!((block_byte(blk, 40), block_byte(blk, 48)), (0x34, 0x12), "pc");
+    let w0 = u32::from_le_bytes(blk[0..4].try_into().unwrap());
+    assert_eq!(w0 & 0x08, 0x08, "glue b3: a cartridge is present, or replay_cart() writes no bank register");
+    let w26 = u32::from_le_bytes(blk[26 * 4..26 * 4 + 4].try_into().unwrap());
+    assert_eq!(w26 & 0xFFFF, 0, "{{reg1, reg0}} of an EasyFlash at bank 0");
+    let x = u16::from_le_bytes(blk[232..234].try_into().unwrap());
+    assert_eq!(x, 8 * 20 + 7, "x = 8 * cycle + 7");
+    // no cartridge: no cartridge bit
+    let mut bare = Machine::new();
+    let bytes = write_native_snapshot(args(capture(&mut bare)));
+    let lay = c64re_v2::layout(&bytes).unwrap();
+    let blk = section(&bytes, &lay, SEC_BLOCK).unwrap();
+    assert_eq!(u32::from_le_bytes(blk[0..4].try_into().unwrap()) & 0x08, 0);
+    // the snap position is clamped to a cycle a snap can be at: 12..62
+    for (cycle, want) in [(3u16, 12u16), (62, 62), (63, 62)] {
+        let mut m = Machine::new();
+        m.vic.raster_cycle = cycle;
+        let cp = capture(&mut m);
+        let b = write_native_snapshot(args(cp));
+        let lay = c64re_v2::layout(&b).unwrap();
+        let blk = section(&b, &lay, SEC_BLOCK).unwrap();
+        assert_eq!(u16::from_le_bytes(blk[232..234].try_into().unwrap()), 8 * want + 7, "cycle {cycle}");
+    }
+}
+
+#[test]
+fn the_io2_ram_is_at_offset_0_of_the_cartridge_ram() {
+    let mut m = machine_with(&ef_crt());
+    let clk = m.c64_core.clk;
+    m.cartridge.as_mut().unwrap().write(0xdf20, 0x5A, &bi(), clk); // IO2 RAM, $DF20
+    let cp = capture(&mut m);
+    let bytes = write_native_snapshot(args(cp.clone()));
+    let lay = c64re_v2::layout(&bytes).unwrap();
+    let cram = section(&bytes, &lay, SEC_CARTRAM).unwrap();
+    assert_eq!(cram[0x20], 0x5A, "IO2 starts at 0");
+    assert!(cram[0x100..].iter().all(|&b| b == 0), "IO1 at $100 holds nothing of this");
+    assert_eq!(read_native_snapshot(&bytes).unwrap().checkpoint["cartState"]["easyflashRam"], cp["cartState"]["easyflashRam"]);
 }

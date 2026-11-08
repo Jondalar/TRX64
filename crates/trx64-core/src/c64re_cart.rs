@@ -20,8 +20,9 @@ use crate::native_snapshot::{ta_u8, ta_u8_decode};
 pub const SLOT: usize = 0x4000;
 /// The 93C86 of a GMod2.
 pub const EEPROM_BYTES: usize = 2048;
-/// Where the EasyFlash IO2 RAM (`$DF00-$DFFF`) sits in the board's 64 KiB cartridge RAM window.
-pub const IO2_RAM_AT: usize = 0x1F00;
+/// Where the EasyFlash IO2 RAM (`$DF00-$DFFF`) sits in the board's 64 KiB cartridge RAM window
+/// (`c64_cartridge.v`: IO2 at 0, IO1 at $100). Only the EasyFlash family has it.
+pub const IO2_RAM_AT: usize = 0;
 pub const IO2_RAM_BYTES: usize = 256;
 /// The board's cartridge RAM window.
 pub const CART_RAM_BYTES: usize = 65536;

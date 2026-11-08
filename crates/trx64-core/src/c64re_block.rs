@@ -2,10 +2,12 @@
 //!
 //! 58 words of the board's state bus. The bit positions are the board's
 //! (`trx_c64re_nodes.cc`, read off the gateware); this file maps a TRX64 checkpoint into them
-//! and back. Going in (a TRX64 dump) every field the firmware's own `trx_c64re_from_nodes`
-//! fills is filled, and every word the emulator has no source for is zero — [`ZEROED`] names
-//! them. Going out (a board file) is what the firmware's `write_checkpoint` does: the node
-//! values the board's words hold, nothing invented.
+//! and back. Going in (a TRX64 dump) every field the loader reads is filled (the firmware's
+//! `trx_c64re_from_nodes` fields, the CPU's rwn, rdy and interrupt lines, `$00`/`$01`) and every
+//! bit the emulator has no source for is zero — [`ZEROED`] names them. Going out (a board file)
+//! is what the firmware's `write_checkpoint` does: the node values the board's words hold,
+//! nothing invented. The loader reads words 0, 4-15, 26 and 27-57 only; words 1-3 and 16-25 are
+//! register images and are filled too.
 
 use serde_json::{json, Value};
 
@@ -35,6 +37,11 @@ const CH_S: usize = 24;
 const CH_P: usize = 32;
 const CH_PCL: usize = 40;
 const CH_PCH: usize = 48;
+const CH_RWN: usize = 112;
+const CH_PIN: usize = 138;
+const CH_RDY: usize = 206;
+const CH_IRQ: usize = 207;
+const CH_NMI: usize = 208;
 const CH_PDIR: usize = 144;
 const CH_POUT: usize = 152;
 // chips 3 and 4 words 8-19
@@ -57,12 +64,11 @@ const CI_CRB: usize = 327;
 
 /// What a TRX64 dump leaves zero in the BLOCK because the emulator has no source for it.
 pub const ZEROED: &[&str] = &[
-    "glue word 0 except the cartridge bit",
-    "cpu sequencer (state, bus muxes, dreg, ireg, din, the interrupt-sampling flops)",
-    "cpu pending nmi/irq flops",
-    "vic registers $2F",
+    "glue word 0 b0-b2 (halted, game, exrom)",
+    "cpu address and data registers (adl, adh, dreg, ireg, hreg, din_r, pfloat)",
+    "cpu sequencer (state 0 = opcode fetch, bus muxes, interrupt-sampling and vector flops, fall6/fall7)",
+    "vic register $2F",
     "cia edge detectors, timer prescalers, serial shifter, interrupt-delay flops, tod counter",
-    "cia2 and cia1 register image word 4",
 ];
 
 pub struct Block {
@@ -205,6 +211,14 @@ pub fn block_from_checkpoint(cp: &Value, cart: Option<(u8, u8)>) -> Result<Block
     let mut w = [0u32; BLOCK_WORDS];
     {
         let h = &mut w[W_CPUH..];
+        // an opcode-fetch snap: the bus is reading (rwn 1), the CPU is ready, the port pins
+        // are all high (nothing pulls them down)
+        set_bits(h, CH_RWN, 1, 1);
+        set_bits(h, CH_RDY, 1, 1);
+        set_bits(h, CH_PIN, 6, 0x3F);
+        let ints = cp.get("cpuIntStatus").unwrap_or(&Value::Null);
+        set_bits(h, CH_IRQ, 1, (num(ints, "nirq").unwrap_or(0) > 0) as u32);
+        set_bits(h, CH_NMI, 1, (num(ints, "nnmi").unwrap_or(0) > 0) as u32);
         set_bits(h, CH_A, 8, a);
         set_bits(h, CH_X, 8, xr);
         set_bits(h, CH_Y, 8, yr);
@@ -238,6 +252,10 @@ pub fn block_from_checkpoint(cp: &Value, cart: Option<(u8, u8)>) -> Result<Block
     for r in 0..=0x2Eusize {
         set_byte(&mut w, W_VIC, r, regs.get(r).copied().unwrap_or(0));
     }
+    // the read images of $D011 bit 7 and $D012 are the raster line, and a snap is on line 0;
+    // TRX64's registers hold the compare, which the board does not carry
+    set_byte(&mut w, W_VIC, 0x11, regs.get(0x11).copied().unwrap_or(0) & 0x7F);
+    set_byte(&mut w, W_VIC, 0x12, 0);
     let irq = num(vic, "irq_status").unwrap_or(0) as u32 & 0x0F;
     set_byte(&mut w, W_VIC, 0x19, (irq | if irq != 0 { 0x80 } else { 0 }) as u8);
     set_byte(&mut w, W_VIC, 0x1E, num(vic, "sprite_sprite_collisions").unwrap_or(0) as u8);
@@ -246,10 +264,12 @@ pub fn block_from_checkpoint(cp: &Value, cart: Option<(u8, u8)>) -> Result<Block
         w[W_CART] = r0 as u32 | (r1 as u32) << 8;
         w[W_GLUE] |= GLUE_CART;
     }
-    let cycle = num(vic, "raster_cycle").unwrap_or(0).max(0) as u32;
+    // the snap position: a snap is on line 0 and the stop is at pix_x[9:3] == cycle. The board
+    // writes 8 * cycle + 7; 12 is the first cycle a snap can be at and PAL has no cycle 63.
+    let cycle = (num(vic, "raster_cycle").unwrap_or(0).max(0) as u32).clamp(12, 62);
     Ok(Block {
         w,
-        x: (cycle * 8).clamp(96, 504) as u16,
+        x: (cycle * 8 + 7) as u16,
         turbo: cp.get("turbo").filter(|t| !t.is_null()).and_then(turbo_pack),
     })
 }
@@ -342,14 +362,13 @@ pub struct BoardNodes {
 
 pub fn nodes_from_block(b: &Block, cycles: u64) -> BoardNodes {
     let w = &b.w;
-    let r1 = w[W_CPU + 1];
+    // the CPU's hidden words are what the loader reads, so they are what is taken
+    let h = &w[W_CPUH..];
     let cpu = json!({
-        "pc": r1 & 0xFFFF, "a": w[W_CPU] & 0xFF, "x": (w[W_CPU] >> 8) & 0xFF,
-        "y": (w[W_CPU] >> 16) & 0xFF, "sp": (w[W_CPU] >> 24) & 0xFF,
-        "flags": (r1 >> 16) & 0xFF, "cycles": cycles,
+        "pc": bits(h, CH_PCL, 8) | bits(h, CH_PCH, 8) << 8, "a": bits(h, CH_A, 8), "x": bits(h, CH_X, 8),
+        "y": bits(h, CH_Y, 8), "sp": bits(h, CH_S, 8), "flags": bits(h, CH_P, 8), "cycles": cycles,
     });
-    let r2 = w[W_CPU + 2];
-    let port = Some((r2 as u8, (r2 >> 8) as u8));
+    let port = Some((bits(h, CH_PDIR, 8) as u8, bits(h, CH_POUT, 8) as u8));
     let vic_regs: Vec<u8> = (0..=0x2Fusize).map(|r| wbyte(w, W_VIC, r)).collect();
     let irq_vic = wbyte(w, W_VIC, 0x19) & 0x80 != 0;
     BoardNodes {
