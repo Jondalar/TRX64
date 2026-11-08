@@ -197,6 +197,11 @@ fn num(v: &Value, path: &[&str]) -> Option<i64> {
 
 // ── drive A for the board ───────────────────────────────────────────────────────────────────
 
+/// The image drive A holds, as `machineState.drive` names it; `None` with no disk in.
+fn drive_image(cp: &Value) -> Option<&str> {
+    cp.get("media").and_then(|m| m.get("diskPath")).and_then(|p| p.as_str()).filter(|p| !p.is_empty())
+}
+
 /// Drive A as the board's `TrxDriveState` (2092 bytes): `regs`, a x y sp p, pc, VIA1 and VIA2 as
 /// read, the cycle count and the 2 KiB of RAM. Out of the `drive1541` blob; `None` when drive A
 /// is a 1581, is off, or has no state.
@@ -310,7 +315,7 @@ fn header_json(
         }
         h.push_str("},");
     }
-    if let Some(img) = cp.get("media").and_then(|m| m.get("diskPath")).and_then(|p| p.as_str()).filter(|p| !p.is_empty()) {
+    if let Some(img) = drive_image(cp) {
         h.push_str(&format!("\"drive\":{{\"image\":{},\"mode\":\"rw\"}},", jstr(img)));
     }
     let reu = cp.get("expansion").filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("reu"));
@@ -380,8 +385,12 @@ pub fn write(args: &WriteNativeSnapshotArgs) -> Vec<u8> {
         cart_node = Some(p.node());
         cartx::strip(&mut cp, p);
     }
-    if let Some(d) = drive_section(&header_cp) {
-        secs.push((SEC_DRIVE, d));
+    // Section 6 goes with `machineState.drive`: the board applies it to the drive it mounted, and
+    // with no image named it would land in whatever drive is running there.
+    if drive_image(&header_cp).is_some() {
+        if let Some(d) = drive_section(&header_cp) {
+            secs.push((SEC_DRIVE, d));
+        }
     }
 
     let mut doc = build_doc(args, &cp, &created);

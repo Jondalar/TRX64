@@ -46,7 +46,7 @@ by the digest.
 | 3 | COLOR | 1024 | low nibbles |
 | 4 | CARTRAM | 65536 | only with a cartridge on |
 | 5 | CARTROM | the medium | cartridge contents **at the freeze**, once |
-| 6 | DRIVE | `sizeof(TrxDriveState)`, 2092 | drive A RAM and registers, not its image |
+| 6 | DRIVE | `sizeof(TrxDriveState)`, 2092 | drive A RAM and registers, not its image; TRX64 writes it only with `machineState.drive` |
 | 7 | EEPROM | 2048 | GMod2's 93C86 |
 
 An unknown id is skipped by its length. A section that does not apply is not in the table.

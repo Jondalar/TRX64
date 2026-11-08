@@ -201,14 +201,13 @@ fn s2_new_files_are_format_2_and_well_formed() {
         o += pad4(*len);
     }
     assert_eq!(o, bytes.len(), "no bytes after the last section");
-    assert_eq!(ids, vec![SEC_BLOCK, SEC_RAM, SEC_COLOR, SEC_CARTRAM, SEC_CARTROM, SEC_DRIVE, SEC_TRX64], "in order");
+    assert_eq!(ids, vec![SEC_BLOCK, SEC_RAM, SEC_COLOR, SEC_CARTRAM, SEC_CARTROM, SEC_TRX64], "in order, no section 6 without a disk in the drive");
     let len_of = |id: u8| table.iter().find(|t| t.0 == id).unwrap().1;
     assert_eq!(len_of(SEC_BLOCK), 240);
     assert_eq!(len_of(SEC_RAM), 65536);
     assert_eq!(len_of(SEC_COLOR), 1024);
     assert_eq!(len_of(SEC_CARTRAM), 65536);
     assert_eq!(len_of(SEC_CARTROM), 1 << 20, "an EasyFlash is its whole 1 MiB chip");
-    assert_eq!(len_of(SEC_DRIVE), 2092);
     // D13
     assert_eq!(header["kind"], "c64re");
     assert_eq!(header["version"], 2);
@@ -340,6 +339,7 @@ fn s5_a_disk_stands_alone() {
     let bytes = write_native_snapshot(a);
     // the path is in the header as on the board
     let lay = c64re_v2::layout(&bytes).unwrap();
+    assert_eq!(section(&bytes, &lay, SEC_DRIVE).expect("section 6 goes with the disk").len(), 2092);
     assert_eq!(lay.header["machineState"]["drive"]["image"], "/nonexistent/s5.d64");
     assert_eq!(lay.header["machineState"]["drive"]["mode"], "rw");
     // the image does not exist; the file alone brings the drive back
