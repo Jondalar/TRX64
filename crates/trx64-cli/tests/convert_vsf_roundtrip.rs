@@ -82,6 +82,7 @@ fn convert_vsf_roundtrip_resumes() {
 
     // Machine B: load the produced .c64re back.
     let snap = std::fs::read(&out).expect("read .c64re");
+    assert_eq!(snap[8], 2, "convert-vsf writes format 2");
     let read = read_native_snapshot(&snap).expect("read native snapshot");
     let mut b = Machine::new();
     b.boot_from_dir(&rom_dir).expect("boot B");

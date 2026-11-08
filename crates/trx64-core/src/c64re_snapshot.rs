@@ -5,9 +5,10 @@
 //! + the kernel `capture()`/`restore()` field mapping
 //!   (headless-machine-kernel.ts:946-1084).
 //!
-//! Every serde struct here serializes to the EXACT JSON shape (field names,
-//! nesting, types) the c64re kernel writes, so a live c64re daemon can
-//! `snapshot/undump` a TRX64 `.c64re` dump and vice-versa. The serializers are
+//! Every serde struct here serializes to the JSON shape (field names, nesting,
+//! types) the c64re kernel wrote. That is the shape of the checkpoint; the file
+//! around it is `native_snapshot.rs` (format 1, the c64re kernel's own) and
+//! `c64re_v2.rs` (format 2, Spec 919, which TRX64 writes). The serializers are
 //! ADDITIVE READS of the existing TRX64 chip state (the VSF/ADR-076 state) —
 //! they never touch the cycle/opcode logic.
 //!

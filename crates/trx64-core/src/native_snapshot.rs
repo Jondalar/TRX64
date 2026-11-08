@@ -2,22 +2,28 @@
 //!
 //! 1:1 PORT of the c64re TS
 //!   C64ReverseEngineeringMCP/src/runtime/headless/kernel/native-snapshot.ts
-//! (Spec 707). This is the FRAMING + the `$ta` typed-array JSON codec, NOT the
-//! checkpoint payload (that is `c64re_snapshot.rs`). The two together produce a
-//! byte-identical `.c64re` file to the one the c64re daemon writes, so a live
-//! c64re daemon can `snapshot/undump` a TRX64 dump and vice-versa.
+//! (Spec 707), plus format 2 (Spec 919). This is the FRAMING + the `$ta` typed-array JSON
+//! codec, NOT the checkpoint payload (that is `c64re_snapshot.rs`).
 //!
-//! Container layout (native-snapshot.ts §3):
+//! Two formats share the 41-byte head, told apart at byte 8:
 //!   bytes  0..7   MAGIC  "C64RESNP" (ascii)
-//!   byte   8      formatVersion (u8 = 1)
-//!   bytes  9..40  sha256(gzBody) (32 bytes) — integrity over the payload
-//!   bytes 41..    gzBody = gzip(JSON.stringify(doc))
+//!   byte   8      formatVersion (u8)
+//!   bytes  9..40  sha256 of everything from byte 41 to the end
 //!
-//! doc = { manifest, checkpoint, mediaPayloads }:
+//! Format 1 (the c64re TS writer, native-snapshot.ts §3) — `gzip(JSON.stringify(doc))`:
+//!   doc = { manifest, checkpoint, mediaPayloads }:
 //!   - manifest:  NativeSnapshotManifest (ts: native-snapshot.ts:46-54).
 //!   - checkpoint: the RuntimeCheckpoint payload, typed arrays encoded by the
 //!                 tagged base64 `$ta` codec (ts: native-snapshot.ts:101-136).
 //!   - mediaPayloads: { [ref]: base64 } embedded media bytes.
+//!   It is read as it always was. [`write_native_snapshot_v1`] writes it and exists only so a
+//!   test can make one; nothing else writes format 1 any more.
+//!
+//! Format 2 (Spec 919, the board's `U8-c64re-v2-state-and-medium.md`) is a binary section
+//! table — the chip block, RAM, colour RAM, cartridge RAM, the cartridge once, drive A, the
+//! EEPROM — plus one TRX64-only section (id 128) that holds the rest of the checkpoint,
+//! gzipped, so a TRX64 file restores exactly. [`write_native_snapshot`] writes it and
+//! [`read_native_snapshot`] reads either; both live in `c64re_v2.rs`.
 //!
 //! NOTE on the `$ta` codec: in the TS the RuntimeCheckpoint object carries LIVE
 //! `Uint8Array`s (RAM, framebuffers, drive blob, sprite buffers). `encodeValue`
@@ -40,8 +46,10 @@ use std::io::{Read, Write};
 
 /// native-snapshot.ts:31 — `export const NATIVE_SNAPSHOT_MAGIC = "C64RESNP";`.
 pub const NATIVE_SNAPSHOT_MAGIC: &[u8; 8] = b"C64RESNP";
-/// native-snapshot.ts:32 — `NATIVE_SNAPSHOT_FORMAT_VERSION = 1`.
-pub const NATIVE_SNAPSHOT_FORMAT_VERSION: u8 = 1;
+/// The format [`write_native_snapshot`] writes: 2 (Spec 919). native-snapshot.ts:32 had 1.
+pub const NATIVE_SNAPSHOT_FORMAT_VERSION: u8 = 2;
+/// The gzipped-JSON format of native-snapshot.ts, which is still read.
+pub const NATIVE_SNAPSHOT_FORMAT_VERSION_V1: u8 = 1;
 /// native-snapshot.ts:33 — `const HEADER_LEN = 8 + 1 + 32;`.
 const HEADER_LEN: usize = 8 + 1 + 32;
 
@@ -107,6 +115,9 @@ pub struct NativeSnapshotMediaInput {
 pub struct ResolvedMedia {
     pub reference: SnapshotMediaRef,
     pub bytes: Option<Vec<u8>>,
+    /// The image goes in write-protected (a board file whose drive was mounted read-only).
+    /// Never set by a file TRX64 wrote.
+    pub read_only: bool,
 }
 
 /// Result of `read_native_snapshot` — ts: native-snapshot.ts:74-79
@@ -119,6 +130,11 @@ pub struct ReadNativeSnapshotResult {
     pub checkpoint: Value,
     pub schema_version: i64,
     pub media: Vec<ResolvedMedia>,
+    /// Spec 919 D12 — set when the file was written by another machine (the board) and the
+    /// checkpoint is a fresh machine's with the file's values written in: what came in
+    /// exactly, what only approximately, what the file does not hold. `None` for a file TRX64
+    /// wrote, which comes back whole.
+    pub report: Option<crate::vsf::VsfLoadReport>,
 }
 
 /// Args for `write_native_snapshot` — ts: native-snapshot.ts:66-72.
@@ -138,7 +154,7 @@ pub struct WriteNativeSnapshotArgs {
 
 // ── helpers (ts: native-snapshot.ts:91-99) ─────────────────────────────────────
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut s = String::with_capacity(64);
     for b in digest.iter() {
@@ -147,30 +163,30 @@ fn sha256_hex(bytes: &[u8]) -> String {
     s
 }
 
-fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+pub(crate) fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
     let digest = Sha256::digest(bytes);
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest);
     out
 }
 
-fn b64(bytes: &[u8]) -> String {
+pub(crate) fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-fn unb64(s: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn unb64(s: &str) -> Result<Vec<u8>, String> {
     base64::engine::general_purpose::STANDARD
         .decode(s.as_bytes())
         .map_err(|e| format!("native-snapshot: bad base64: {e}"))
 }
 
-fn gzip(data: &[u8]) -> Vec<u8> {
+pub(crate) fn gzip(data: &[u8]) -> Vec<u8> {
     let mut enc = GzEncoder::new(Vec::new(), Compression::default());
     enc.write_all(data).expect("gzip write");
     enc.finish().expect("gzip finish")
 }
 
-fn gunzip(data: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn gunzip(data: &[u8]) -> Result<Vec<u8>, String> {
     let mut dec = GzDecoder::new(data);
     let mut out = Vec::new();
     dec.read_to_end(&mut out)
@@ -274,9 +290,9 @@ pub fn decode_value(v: &Value) -> Value {
 
 // ── writer (ts: native-snapshot.ts:140-182) ────────────────────────────────────
 
-/// ts: native-snapshot.ts:140-182 — `writeNativeSnapshot`. Builds the manifest +
-/// media payloads, gzips `JSON.stringify(doc)`, prepends magic/version/sha256.
-pub fn write_native_snapshot(args: WriteNativeSnapshotArgs) -> Vec<u8> {
+/// The document of both formats: `{ manifest, checkpoint, mediaPayloads }` — ts:140-182.
+/// `checkpoint` is what goes in under that key (format 2 hands in the reduced one).
+pub(crate) fn build_doc(args: &WriteNativeSnapshotArgs, checkpoint: &Value, created_at: &str) -> Value {
     let mut media_payloads = Map::new();
     let mut media_refs: Vec<SnapshotMediaRef> = Vec::with_capacity(args.media.len());
     for (i, m) in args.media.iter().enumerate() {
@@ -304,7 +320,7 @@ pub fn write_native_snapshot(args: WriteNativeSnapshotArgs) -> Vec<u8> {
     let manifest = NativeSnapshotManifest {
         kind: "c64re-runtime-snapshot".to_string(),
         version: args.schema_version,
-        created_at: utc_now_iso(),
+        created_at: created_at.to_string(),
         machine: ManifestMachine {
             model: args.machine_model.clone(),
             runtime_version: args.runtime_version.clone(),
@@ -320,29 +336,59 @@ pub fn write_native_snapshot(args: WriteNativeSnapshotArgs) -> Vec<u8> {
     };
 
     // doc = { manifest, checkpoint: encodeValue(payload), mediaPayloads }.
-    let doc = json!({
+    json!({
         "manifest": serde_json::to_value(&manifest).expect("manifest serialize"),
-        "checkpoint": encode_value(&args.checkpoint),
+        "checkpoint": encode_value(checkpoint),
         "mediaPayloads": Value::Object(media_payloads),
-    });
+    })
+}
 
+/// The ISO-8601 Zulu time `createdAt` carries.
+pub(crate) fn now_iso() -> String {
+    utc_now_iso()
+}
+
+/// Format 1 — ts: native-snapshot.ts:140-182 `writeNativeSnapshot`. Builds the manifest +
+/// media payloads, gzips `JSON.stringify(doc)`, prepends magic/version/sha256.
+///
+/// Nothing but a test calls this: every file TRX64 writes is format 2
+/// ([`write_native_snapshot`]). It stays so the reader's format 1 path can be tested against
+/// a file made by the writer that made them.
+pub fn write_native_snapshot_v1(args: WriteNativeSnapshotArgs) -> Vec<u8> {
+    let doc = build_doc(&args, &args.checkpoint, &utc_now_iso());
     let json_bytes = serde_json::to_vec(&doc).expect("doc serialize");
     let gz_body = gzip(&json_bytes);
     let digest = sha256_bytes(&gz_body);
 
     let mut out = Vec::with_capacity(HEADER_LEN + gz_body.len());
     out.extend_from_slice(NATIVE_SNAPSHOT_MAGIC);
-    out.push(NATIVE_SNAPSHOT_FORMAT_VERSION);
+    out.push(NATIVE_SNAPSHOT_FORMAT_VERSION_V1);
     out.extend_from_slice(&digest);
     out.extend_from_slice(&gz_body);
     out
 }
 
+/// Writes a `.c64re`: format 2 (Spec 919). The arguments are format 1's, so no caller moved.
+pub fn write_native_snapshot(args: WriteNativeSnapshotArgs) -> Vec<u8> {
+    crate::c64re_v2::write(&args)
+}
+
 // ── reader (ts: native-snapshot.ts:186-234) ────────────────────────────────────
 
-/// ts: native-snapshot.ts:186-234 — `readNativeSnapshot`. Validates magic +
-/// format version + sha256 integrity, then decodes the doc + media payloads.
+/// Reads a `.c64re` of either format and returns the checkpoint, the manifest and the media
+/// — ts: native-snapshot.ts:186-234 `readNativeSnapshot`, validating magic + format + sha256.
 pub fn read_native_snapshot(bytes: &[u8]) -> Result<ReadNativeSnapshotResult, String> {
+    read_native_snapshot_in(bytes, None)
+}
+
+/// [`read_native_snapshot`] for a file read from disk: `base_dir` is the folder it was read
+/// from. A file the board wrote names its disk image and its `.crt` by the board's paths
+/// (`/SD/...`); they are looked for as named, and then by name in `base_dir`. A file TRX64 wrote
+/// carries its media and never looks.
+pub fn read_native_snapshot_in(
+    bytes: &[u8],
+    base_dir: Option<&std::path::Path>,
+) -> Result<ReadNativeSnapshotResult, String> {
     if bytes.len() < HEADER_LEN {
         return Err("native-snapshot: file too small / not a .c64re container".to_string());
     }
@@ -352,26 +398,29 @@ pub fn read_native_snapshot(bytes: &[u8]) -> Result<ReadNativeSnapshotResult, St
             "native-snapshot: bad magic \"{magic}\" (expected C64RESNP)"
         ));
     }
-    let format_version = bytes[8];
-    if format_version != NATIVE_SNAPSHOT_FORMAT_VERSION {
-        return Err(format!(
-            "native-snapshot: incompatible format version {format_version} (this build writes/reads {NATIVE_SNAPSHOT_FORMAT_VERSION})"
-        ));
+    match bytes[8] {
+        NATIVE_SNAPSHOT_FORMAT_VERSION_V1 => read_v1(bytes),
+        NATIVE_SNAPSHOT_FORMAT_VERSION => crate::c64re_v2::read(bytes, base_dir),
+        v => Err(format!(
+            "native-snapshot: incompatible format version {v} (this build reads {NATIVE_SNAPSHOT_FORMAT_VERSION_V1} and {NATIVE_SNAPSHOT_FORMAT_VERSION})"
+        )),
     }
-    let stored_digest = &bytes[9..41];
-    let gz_body = &bytes[HEADER_LEN..];
-    let actual_digest = sha256_bytes(gz_body);
-    if stored_digest != actual_digest {
+}
+
+/// The check both formats' digests share: sha256 of everything behind the 41-byte head.
+pub(crate) fn check_digest(bytes: &[u8]) -> Result<(), String> {
+    if bytes[9..41] != sha256_bytes(&bytes[HEADER_LEN..]) {
         return Err(
             "native-snapshot: integrity check failed (sha256 mismatch — file corrupt or tampered)"
                 .to_string(),
         );
     }
+    Ok(())
+}
 
-    let doc_bytes = gunzip(gz_body)?;
-    let doc: Value =
-        serde_json::from_slice(&doc_bytes).map_err(|e| format!("native-snapshot: bad doc JSON: {e}"))?;
-
+/// The manifest, the checkpoint and the resolved media out of a `{ manifest, checkpoint,
+/// mediaPayloads }` document — both formats keep one.
+pub(crate) fn read_doc(doc: &Value) -> Result<ReadNativeSnapshotResult, String> {
     let manifest_val = doc
         .get("manifest")
         .ok_or("native-snapshot: doc missing manifest")?;
@@ -401,6 +450,7 @@ pub fn read_native_snapshot(bytes: &[u8]) -> Result<ReadNativeSnapshotResult, St
             None => media.push(ResolvedMedia {
                 reference: reference.clone(),
                 bytes: None,
+                read_only: false,
             }),
             Some(key) => {
                 let enc = media_payloads
@@ -420,6 +470,7 @@ pub fn read_native_snapshot(bytes: &[u8]) -> Result<ReadNativeSnapshotResult, St
                 media.push(ResolvedMedia {
                     reference: reference.clone(),
                     bytes: Some(mbytes),
+                    read_only: false,
                 });
             }
         }
@@ -430,7 +481,16 @@ pub fn read_native_snapshot(bytes: &[u8]) -> Result<ReadNativeSnapshotResult, St
         checkpoint,
         schema_version: manifest.version,
         media,
+        report: None,
     })
+}
+
+fn read_v1(bytes: &[u8]) -> Result<ReadNativeSnapshotResult, String> {
+    check_digest(bytes)?;
+    let doc_bytes = gunzip(&bytes[HEADER_LEN..])?;
+    let doc: Value =
+        serde_json::from_slice(&doc_bytes).map_err(|e| format!("native-snapshot: bad doc JSON: {e}"))?;
+    read_doc(&doc)
 }
 
 /// sha256 hex of arbitrary bytes — ts: native-snapshot.ts:237-239 `snapshotSha256`.

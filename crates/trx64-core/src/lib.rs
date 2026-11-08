@@ -24,7 +24,10 @@ use std::path::Path;
 
 pub mod action_replay;
 pub mod c64_6510core;
+pub mod c64re_block;
+pub mod c64re_cart;
 pub mod c64re_snapshot;
+pub mod c64re_v2;
 pub mod cart;
 mod cart_overlay;
 pub mod checkpoint_diff;

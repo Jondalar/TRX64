@@ -69,7 +69,7 @@ One line per feature, as of 0.14.5. Details: [`README.md`](../README.md), monito
 
 ## Time machine
 
-- `.c64re` full machine snapshots with media embedded (`dump`, `undump`, `snapshot/*`).
+- `.c64re` full machine snapshots (`dump`, `undump`, `snapshot/*`) in the C64 Ultimate's format: its chip block, RAM, colour RAM, the cartridge once as it stands at the freeze (flash the game has written included), drive A and the GMod2 EEPROM, plus a TRX64 section with the rest (SID, VIC internals, both drives with their disks, the REU, the folder devices), so a TRX64 file comes back exactly, a disk or a flash cartridge stands in the file with no outside path, and a CRT write-back keeps its packet layout. The files the C64 Ultimate writes load too, into a fresh machine: CPU, CIAs, VIC registers, RAM, cartridge and flash come in, the SID starts silent, a disk image or `.crt` the file names is looked for as named and then by name beside the file (a disk is mounted write-protected when the file says so, never written back), drive A's RAM, 6502 registers and VIAs come in over the image, and the answer carries a report of what came in, what only roughly and what the board's file does not hold (the SID, the VIC's internals, the drive head position). Files of the earlier format (gzipped JSON) still load.
 - VICE `.vsf` in and out (`trx64cli convert-vsf`, `convert-c64re`, `vsf/load`, `vsf/save`).
 - Checkpoint ring of full machine states, 60 s default (`cadence`, `window`); rewind transport (`play back|fwd`, `frame ±N`, `goto`, F9-F12).
 - Marks: named, pinned points that survive cutting the future (`mark`, `marks`, `goto <name>`).
