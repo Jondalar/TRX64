@@ -69,7 +69,7 @@ fidelity rules fall out and recur everywhere:
 
 | Layer | What it is | Specs |
 |---|---|---|
-| **`.c64re`** | The durable **currency**: `MAGIC C64RESNP` + sha256 + gzipped JSON `{manifest, checkpoint, mediaPayloads}`, media **embedded** (self-contained, portable). Deliberately too slow for any hot path — disk-persistence only. `dump`/`undump`; undump leaves the machine **paused**. NOT VSF internally. | 707 |
+| **`.c64re`** | The durable **currency**: `MAGIC C64RESNP` + format byte (2) + sha256 of the body + the C64 Ultimate's section table (chip block, RAM, colour RAM, cartridge RAM, the cartridge once, drive A, EEPROM) + one TRX64 section (id 128, gzipped JSON `{manifest, checkpoint, mediaPayloads, trx64}` with what the other sections hold taken out), media **embedded** (self-contained, portable). A file the board wrote has no section 128 and loads into a fresh machine with a report of what came in. Format 1 (gzipped JSON, byte 8 = 1) is read, no longer written. Deliberately too slow for any hot path — disk-persistence only. `dump`/`undump`; undump leaves the machine **paused**. NOT VSF internally. | 707 / 919 |
 | **Ring** | Always-on bounded in-memory window, auto-captured ~every 0.5 s (25 PAL frames) at an instruction boundary. **Zero-alloc slab** (one flat `ArrayBuffer` → V8 never scans it → killed the BUG-049 audio "kratzen"). Sized for the **UI scrub filmstrip** (~10 s), NOT deep history. | 705.B / 765 / 772 |
 | **Recorder + firehose** | The **timeline** (a stream, not points): off-thread SAB anchors (~3–4 min) + the CPU_STEP firehose `.c64retrace` = the **authority**, DuckDB = a rebuildable **index**. Fire-and-forget memcpy on the tick loop; all heavy work in a worker; slow worker drops oldest (benign gap, never backpressure). No pin — durability is an **explicit dump-from-anchor to `.c64re`**. | 766 / 726.B |
 | **Scrub / rewind** | The *use*, not new storage: pause → scrub back over anchors → run on (floppy-atomic); filmstrip for the human, API-seek for the LLM. | 761 / 769 |
@@ -162,7 +162,7 @@ Two forms, conceptually distinct:
 ## 4. How it all composes — the through-line
 
 ```
-.c64re (currency: one machine, portable, sha256+gz)          ← 707
+.c64re (currency: one machine, portable, sha256+sections)    ← 707 / 919
    └ the SAME RuntimeCheckpoint object (705.A) also fills →
 RING (in-mem, ~0.5s, zero-alloc slab, ~10s UI scrub)         ← 705.B / 765 / 772
 RECORDER (off-thread SAB anchors) + .c64retrace → DuckDB      ← 766 / 726.B / 746  ┐ TIMELINE
@@ -232,7 +232,7 @@ spec that needs a different word has to change this table first.
 | **checkpoint** | one full machine state captured by the always-on ring, at the ring's cadence | `checkpoint_ring.rs` (805.B/765/807) |
 | **anchor** | the ID of a checkpoint, as used to name a point to return to | `anchor_id` / `cp_<n>_<n>` throughout the transport |
 | **mark** | an anchor a human NAMED and pinned, so it survives PLAY cutting the future | `mark/set\|list\|drop\|goto` (809) |
-| **snapshot** | a `.c64re` FILE — a checkpoint written out, media embedded, portable | `native_snapshot.rs` (707) |
+| **snapshot** | a `.c64re` FILE — a checkpoint written out, media embedded, portable | `native_snapshot.rs` (707), `c64re_v2.rs` (919) |
 
 Not synonyms. A checkpoint is in memory and expires; a mark is a checkpoint with a
 name and a reservation; a snapshot is a file you can send someone. "Anchor" is the

@@ -587,6 +587,16 @@ pub fn run_sandbox(args: &SandboxArgs) -> Result<String, String> {
     if let Some(seed) = &args.seed {
         let bytes = std::fs::read(seed).map_err(|e| format!("read seed {seed}: {e}"))?;
         let read = read_native_snapshot(&bytes).map_err(|e| format!("seed {seed}: {e}"))?;
+        if let Some(rep) = &read.report {
+            // a file the board wrote (Spec 919 D12): say what came in and what did not
+            eprintln!(
+                "seed {seed}: written by another machine, fidelity={} loaded=[{}] coarse=[{}] absent=[{}]",
+                rep.fidelity.as_str(),
+                rep.loaded.join(", "),
+                rep.coarse.join(", "),
+                rep.absent.join(", ")
+            );
+        }
         for rm in &read.media {
             if rm.reference.role != "drive8" {
                 continue;

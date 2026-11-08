@@ -5107,7 +5107,7 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                         media: media_inputs,
                         runtime_version: RUNTIME_VERSION.to_string(),
                         machine_model: machine_name.clone(),
-                        provenance: None,
+                        provenance: dump_provenance(&st.session),
                         pc,
                         cycle,
                     },
@@ -5182,6 +5182,16 @@ fn run_monitor_marked(st: &mut State, command: &str) -> Result<String, String> {
                         }
                         for n in &st.session.machine.restore_notes {
                             summary.push_str(&format!("\n  NOTE: {n}"));
+                        }
+                        if let Some(rep) = &r.report {
+                            summary.push_str(&format!(
+                                "\n  board file: fidelity={} (source {})\n    loaded=[{}]\n    coarse=[{}]\n    absent=[{}]",
+                                rep.fidelity.as_str(),
+                                rep.source,
+                                rep.loaded.join(", "),
+                                rep.coarse.join(", "),
+                                rep.absent.join(", ")
+                            ));
                         }
                         Ok(summary)
                     }
@@ -12810,23 +12820,15 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             Response::err(id, -32001, format!("NOT_IMPLEMENTED: {m}: deferred"))
         }
 
-        // ── Spec 707 — native snapshot dump/undump ───────────────────────────
-        // c64re writes a `.c64re` container (checkpoint ring + embedded media +
-        // sha-integrity). TRX64 has neither the ring nor that codec, so the FILE
-        // BYTES are TRX64's own vsf (a dump→undump round-trips WITHIN TRX64). The
-        // WIRE SHAPE matches c64re's DumpResult/UndumpResult 1:1 (snapshot-
-        // persistence.ts) — the file format is an implementation detail behind the
-        // identical JSON contract. `media[]` is gathered from the live attached
-        // disk/cart exactly like c64re's gatherMedia (role/format/sourceName/
-        // sha256/bytes). NOTE: a .c64re written by c64re is NOT readable here and
-        // vice-versa (different container) — cross-runtime snapshot exchange is a
-        // later batch (needs the native-snapshot codec primitive).
-        // ── Spec 707 / ADR-077 — native `.c64re` snapshot dump/undump ─────────
-        // The FILE is now the real c64re `.c64re` container (magic "C64RESNP" +
-        // sha256(gzip(doc)), doc = { manifest, checkpoint:<RuntimeCheckpoint>,
-        // mediaPayloads }). A live c64re daemon can `snapshot/undump` a TRX64 dump
-        // and TRX64 can undump a c64re dump (the checkpoint shape is 1:1). The WS
-        // response shape stays identical to c64re's DumpResult/UndumpResult.
+        // ── Spec 707 / 919 — native `.c64re` snapshot dump/undump ─────────────
+        // The FILE is the `.c64re` container, format 2 (Spec 919): magic "C64RESNP", the
+        // sha256 of the body, then the board's sections (chip block, RAM, colour RAM,
+        // cartridge RAM, the cartridge once, drive A, EEPROM) and one TRX64 section with
+        // the rest of the checkpoint, gzipped. A format 1 file (gzipped JSON) still reads,
+        // and so does a file the board wrote (it comes back as a fresh machine's checkpoint
+        // with the file's values written in, plus a `report`). The response shape is c64re's
+        // DumpResult/UndumpResult (snapshot-persistence.ts); `media[]` is gathered from the
+        // live attached disk/cart like c64re's gatherMedia (role/format/sourceName/sha256/bytes).
         "snapshot/dump" => {
             let path = match req.params.get("path").and_then(|v| v.as_str()) {
                 Some(p) => p.to_string(),
@@ -12877,6 +12879,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
             let media_summary = gather_snapshot_media(&st.session);
             let breakpoints = st.mon.breakpoints.entries.len() as u64;
             let model_name = machine_model_name(st.session.machine.speed_profile(), st.session.machine.model());
+            let provenance = dump_provenance(&st.session);
             drop(st);
 
             let bytes = trx64_core::native_snapshot::write_native_snapshot(
@@ -12886,7 +12889,7 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                     media: media_inputs,
                     runtime_version: RUNTIME_VERSION.to_string(),
                     machine_model: model_name.to_string(),
-                    provenance: None,
+                    provenance,
                     pc,
                     cycle,
                 },
@@ -12953,6 +12956,10 @@ fn dispatch_request(req: Request, state: &SharedState) -> Response {
                     // What the restore converted rather than restored (an older chip record).
                     if !st.session.machine.restore_notes.is_empty() {
                         out["notes"] = json!(st.session.machine.restore_notes);
+                    }
+                    // Spec 919 D12 — a file the board wrote: what came in, what only roughly.
+                    if let Some(rep) = &r.report {
+                        out["report"] = load_report_json(rep);
                     }
                     Response::ok(id, out)
                 }
@@ -16784,6 +16791,30 @@ struct UndumpResult {
     media: Vec<UndumpMedia>,
     /// Non-fatal resident-vs-cart divergence warning, if any.
     warning: Option<String>,
+    /// Spec 919 D12 — set for a file another machine (the board) wrote: what came in, what
+    /// only roughly, what the file does not hold. `None` for a file TRX64 wrote.
+    report: Option<trx64_core::vsf::VsfLoadReport>,
+}
+
+/// The report of a board file as the wire carries it: the shape `convert-vsf --json` prints.
+fn load_report_json(r: &trx64_core::vsf::VsfLoadReport) -> Value {
+    json!({
+        "source": r.source,
+        "fidelity": r.fidelity.as_str(),
+        "loaded": r.loaded,
+        "coarse": r.coarse,
+        "absent": r.absent,
+    })
+}
+
+/// What a dump records beside the checkpoint: the `.crt` path the cartridge was mounted from, which
+/// the checkpoint does not carry and the header of a format 2 file names as its source.
+fn dump_provenance(session: &Session) -> Option<Value> {
+    let p = session.cart_path.trim();
+    if p.is_empty() || session.machine.cartridge.is_none() {
+        return None;
+    }
+    Some(json!({ "cartSource": p }))
 }
 
 /// The SINGLE user-facing `.c64re` cold undump — shared by the monitor `undump`
@@ -17597,6 +17628,7 @@ fn undump_native_snapshot(st: &mut State, path: &str) -> Result<UndumpResult, St
         machine_model: read.manifest.machine.model.clone(),
         media,
         warning,
+        report: read.report.clone(),
     })
 }
 
@@ -19857,7 +19889,10 @@ mod batch1_tests {
         // The on-disk file is a real `.c64re` container (magic "C64RESNP").
         let raw = std::fs::read(&snap).unwrap();
         assert_eq!(&raw[0..8], b"C64RESNP", "snapshot file is a .c64re container");
-        assert_eq!(raw[8], 1, "format version 1");
+        assert_eq!(raw[8], 2, "format version 2 (Spec 919)");
+        let lay = trx64_core::c64re_v2::layout(&raw).expect("a well-formed format 2 container");
+        assert_eq!(lay.header["writer"], json!("trx64"));
+        assert!(lay.sections.iter().any(|s| s.id == trx64_core::c64re_v2::SEC_TRX64));
     }
 
     #[test]
@@ -23569,6 +23604,66 @@ mod batch1_tests {
 
         let _ = std::fs::remove_file(&d64);
         let _ = std::fs::remove_file(&snap);
+    }
+
+    #[test]
+    fn snapshot_with_a_disk_stands_alone_and_names_its_image() {
+        // Spec 919 D4/S5 — the disk is in the file, its path is in the header as on the
+        // board; with the image gone the undump still brings the drive back.
+        let st = make_state();
+        let dir = std::env::temp_dir().join(format!("trx64_919_alone_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d64 = dir.join("alone.d64");
+        let mut bytes = vec![0u8; 174_848];
+        bytes[0x1234] = 0x77;
+        std::fs::write(&d64, &bytes).unwrap();
+        call(&st, "media/mount", json!({ "path": d64.to_str().unwrap() }));
+        let snap = dir.join("alone.c64re");
+        call(&st, "snapshot/dump", json!({ "path": snap.to_str().unwrap() }));
+        let raw = std::fs::read(&snap).unwrap();
+        let lay = trx64_core::c64re_v2::layout(&raw).expect("format 2");
+        assert_eq!(lay.header["machineState"]["drive"]["image"], json!(d64.to_str().unwrap()));
+        std::fs::remove_file(&d64).unwrap();
+        // a fresh machine state: nothing mounted, the image gone
+        let st2 = make_state();
+        let u = call(&st2, "snapshot/undump", json!({ "path": snap.to_str().unwrap() }));
+        assert!(u.get("report").is_none(), "a TRX64 file comes back whole: no report");
+        let g = st2.lock().unwrap();
+        let disk = g.session.machine.drive8.get_attached_disk().expect("the drive has its disk");
+        assert_eq!(disk.bytes[0x1234], 0x77, "the file alone carried the image");
+        drop(g);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_with_a_cartridge_names_the_crt_it_came_from() {
+        // Spec 919 D13 — `source` is the .crt the cartridge was mounted from.
+        let st = make_state();
+        let dir = std::env::temp_dir().join(format!("trx64_919_cart_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut crt = Vec::new();
+        crt.extend_from_slice(b"C64 CARTRIDGE   ");
+        crt.extend_from_slice(&0x40u32.to_be_bytes());
+        crt.extend_from_slice(&0x0100u16.to_be_bytes());
+        crt.extend_from_slice(&19u16.to_be_bytes()); // Magic Desk
+        crt.extend_from_slice(&[0, 1, 0, 0, 0, 0, 0, 0]);
+        crt.extend_from_slice(&[0u8; 32]);
+        crt.extend_from_slice(b"CHIP");
+        crt.extend_from_slice(&(0x10u32 + 0x2000).to_be_bytes());
+        crt.extend_from_slice(&[0, 0, 0, 0, 0x80, 0x00, 0x20, 0x00]);
+        crt.extend_from_slice(&[0xEA; 0x2000]);
+        let path = dir.join("md.crt");
+        std::fs::write(&path, &crt).unwrap();
+        call(&st, "media/mount", json!({ "path": path.to_str().unwrap() }));
+        let snap = dir.join("md.c64re");
+        call(&st, "snapshot/dump", json!({ "path": snap.to_str().unwrap() }));
+        let lay = trx64_core::c64re_v2::layout(&std::fs::read(&snap).unwrap()).unwrap();
+        assert_eq!(lay.header["source"], json!(path.to_str().unwrap()));
+        assert_eq!(lay.header["machineState"]["cartridge"]["source"], json!(path.to_str().unwrap()));
+        assert_eq!(lay.header["cartridgeType"], json!(0x28), "Magic Desk is the firmware's 0x28");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
