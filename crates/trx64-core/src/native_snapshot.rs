@@ -115,6 +115,9 @@ pub struct NativeSnapshotMediaInput {
 pub struct ResolvedMedia {
     pub reference: SnapshotMediaRef,
     pub bytes: Option<Vec<u8>>,
+    /// The image goes in write-protected (a board file whose drive was mounted read-only).
+    /// Never set by a file TRX64 wrote.
+    pub read_only: bool,
 }
 
 /// Result of `read_native_snapshot` — ts: native-snapshot.ts:74-79
@@ -375,6 +378,17 @@ pub fn write_native_snapshot(args: WriteNativeSnapshotArgs) -> Vec<u8> {
 /// Reads a `.c64re` of either format and returns the checkpoint, the manifest and the media
 /// — ts: native-snapshot.ts:186-234 `readNativeSnapshot`, validating magic + format + sha256.
 pub fn read_native_snapshot(bytes: &[u8]) -> Result<ReadNativeSnapshotResult, String> {
+    read_native_snapshot_in(bytes, None)
+}
+
+/// [`read_native_snapshot`] for a file read from disk: `base_dir` is the folder it was read
+/// from. A file the board wrote names its disk image and its `.crt` by the board's paths
+/// (`/SD/...`); they are looked for as named, and then by name in `base_dir`. A file TRX64 wrote
+/// carries its media and never looks.
+pub fn read_native_snapshot_in(
+    bytes: &[u8],
+    base_dir: Option<&std::path::Path>,
+) -> Result<ReadNativeSnapshotResult, String> {
     if bytes.len() < HEADER_LEN {
         return Err("native-snapshot: file too small / not a .c64re container".to_string());
     }
@@ -386,7 +400,7 @@ pub fn read_native_snapshot(bytes: &[u8]) -> Result<ReadNativeSnapshotResult, St
     }
     match bytes[8] {
         NATIVE_SNAPSHOT_FORMAT_VERSION_V1 => read_v1(bytes),
-        NATIVE_SNAPSHOT_FORMAT_VERSION => crate::c64re_v2::read(bytes),
+        NATIVE_SNAPSHOT_FORMAT_VERSION => crate::c64re_v2::read(bytes, base_dir),
         v => Err(format!(
             "native-snapshot: incompatible format version {v} (this build reads {NATIVE_SNAPSHOT_FORMAT_VERSION_V1} and {NATIVE_SNAPSHOT_FORMAT_VERSION})"
         )),
@@ -436,6 +450,7 @@ pub(crate) fn read_doc(doc: &Value) -> Result<ReadNativeSnapshotResult, String> 
             None => media.push(ResolvedMedia {
                 reference: reference.clone(),
                 bytes: None,
+                read_only: false,
             }),
             Some(key) => {
                 let enc = media_payloads
@@ -455,6 +470,7 @@ pub(crate) fn read_doc(doc: &Value) -> Result<ReadNativeSnapshotResult, String> 
                 media.push(ResolvedMedia {
                     reference: reference.clone(),
                     bytes: Some(mbytes),
+                    read_only: false,
                 });
             }
         }

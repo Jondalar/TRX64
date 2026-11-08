@@ -733,3 +733,94 @@ fn the_io2_ram_is_at_offset_0_of_the_cartridge_ram() {
     assert!(cram[0x100..].iter().all(|&b| b == 0), "IO1 at $100 holds nothing of this");
     assert_eq!(read_native_snapshot(&bytes).unwrap().checkpoint["cartState"]["easyflashRam"], cp["cartState"]["easyflashRam"]);
 }
+
+// ── a board file finds its disk and its cartridge beside it ─────────────────────────────────
+
+fn temp_dir(tag: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("trx64-919-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// Section 6 as the board writes it: regs, a x y sp p, pc, VIA1, VIA2, cycles, 2 KiB of RAM.
+fn drive_section() -> Vec<u8> {
+    let mut s = vec![0u8; 2092];
+    s[0] = 1;
+    s[1..6].copy_from_slice(&[0x11, 0x22, 0x33, 0xEE, 0x24]);
+    s[6..8].copy_from_slice(&0xEBE7u16.to_le_bytes());
+    s[8 + 2] = 0x1A; // VIA1 DDRB
+    s[24 + 0] = 0x04; // VIA2 PB: motor on
+    s[24 + 2] = 0xEF;
+    s[40..44].copy_from_slice(&1_000_000u32.to_le_bytes());
+    for (i, b) in s[44..].iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(5).wrapping_add(1);
+    }
+    s
+}
+
+#[test]
+fn s8_positive_a_disk_beside_the_file_is_mounted_and_drive_a_comes_back() {
+    let dir = temp_dir("beside");
+    let mut d64 = vec![0u8; 174848];
+    d64[0x16500] = 0x42;
+    let img = dir.join("x.d64");
+    std::fs::write(&img, &d64).unwrap();
+    let before = Sha256::digest(&d64);
+    let file = rewrite(&board_file(None, Some("/SD/x.d64")), |h, secs| {
+        h["machineState"]["drive"]["mode"] = json!("ro");
+        secs.iter_mut().find(|s| s.0 == SEC_DRIVE).unwrap().1 = drive_section();
+    });
+    std::fs::write(dir.join("board.c64re"), &file).unwrap();
+
+    // without a folder the board's path is not there
+    let r0 = read_native_snapshot(&file).unwrap();
+    assert!(r0.media.is_empty());
+    assert!(r0.report.unwrap().absent.iter().any(|a| a.contains("/SD/x.d64") && a.contains("x.d64 beside") && a.contains("empty")));
+
+    // with the folder it is found by name
+    let r = c64re_native_in(&file, &dir);
+    assert_eq!(r.media.len(), 1, "the image was found beside the file");
+    assert_eq!(r.media[0].bytes.as_deref(), Some(&d64[..]));
+    assert!(r.media[0].read_only, "mode ro: write-protected as the file says");
+    let rep = r.report.as_ref().unwrap();
+    assert!(rep.loaded.iter().any(|l| l.contains("DRIVE8 image") && l.contains("x.d64")), "{rep:?}");
+    assert!(rep.coarse.iter().any(|c| c.contains("DRIVE8 RAM") && c.contains("VIA")), "{rep:?}");
+    assert!(rep.absent.iter().any(|a| a.contains("DRIVE8 mechanics") && a.contains("head position")), "{rep:?}");
+    assert!(!rep.absent.iter().any(|a| a.contains("DRIVE8 mechanics") && a.contains("RAM")), "the parts that came in are not absent: {rep:?}");
+
+    // the image first, the state after
+    let mut m = Machine::new();
+    m.drive8.attach_disk(DiskImage { kind: DiskKind::D64, bytes: r.media[0].bytes.clone().unwrap(), backing_path: None, read_only: r.media[0].read_only });
+    restore_runtime_checkpoint(&mut m, &r.checkpoint).expect("restore");
+    assert!(m.drive8.get_attached_disk().is_some());
+    assert_eq!((m.drive8.core.reg_a, m.drive8.core.reg_x, m.drive8.core.reg_y, m.drive8.core.reg_sp, m.drive8.core.reg_pc), (0x11, 0x22, 0x33, 0xEE, 0xEBE7));
+    assert_eq!(m.drive8.ram()[0x10], (0x10u8).wrapping_mul(5).wrapping_add(1), "drive RAM");
+    assert_eq!(m.drive8.ram()[0x7FF], (0x7FFu32 as u8).wrapping_mul(5).wrapping_add(1));
+    // the original is not touched
+    assert_eq!(Sha256::digest(std::fs::read(&img).unwrap()), before);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+fn c64re_native_in(file: &[u8], dir: &std::path::Path) -> trx64_core::native_snapshot::ReadNativeSnapshotResult {
+    trx64_core::native_snapshot::read_native_snapshot_in(file, Some(dir)).expect("read")
+}
+
+#[test]
+fn a_cartridge_beside_the_file_gives_its_packets() {
+    // the board's section 5 of a cartridge, and the .crt it came from beside the file
+    let crt = ef_crt();
+    let mut m = machine_with(&crt);
+    let bytes = write_native_snapshot(args(capture(&mut m)));
+    let lay = c64re_v2::layout(&bytes).unwrap();
+    let flat = section(&bytes, &lay, SEC_CARTROM).unwrap().to_vec();
+    let dir = temp_dir("crt");
+    std::fs::write(dir.join("nothing.crt"), &crt).unwrap();
+    let file = board_file(Some((&flat, 17)), None); // source: /SD/C64/nothing.crt
+    let r = c64re_native_in(&file, &dir);
+    assert!(r.report.as_ref().unwrap().loaded.iter().any(|l| l.contains("packets from the .crt")));
+    assert_eq!(r.checkpoint["cartBytes"], ta_u8(&crt), "the original packet layout, from the file beside");
+    let r2 = read_native_snapshot(&file).unwrap();
+    assert_ne!(r2.checkpoint["cartBytes"], ta_u8(&crt), "without it the packets are laid out from the contents");
+    std::fs::remove_dir_all(&dir).ok();
+}

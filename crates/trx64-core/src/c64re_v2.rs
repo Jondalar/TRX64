@@ -421,12 +421,12 @@ pub fn write(args: &WriteNativeSnapshotArgs) -> Vec<u8> {
 
 // ── the reader ──────────────────────────────────────────────────────────────────────────────
 
-pub fn read(bytes: &[u8]) -> Result<ReadNativeSnapshotResult, String> {
+pub fn read(bytes: &[u8], base_dir: Option<&std::path::Path>) -> Result<ReadNativeSnapshotResult, String> {
     let lay = layout(bytes)?;
     let sec = |id: u8| lay.find(id).map(|s| &bytes[s.off..s.off + s.len]);
     match sec(SEC_TRX64) {
         Some(gz) => read_trx64(&lay, bytes, gz),
-        None => read_board(&lay, bytes),
+        None => read_board(&lay, bytes, base_dir),
     }
 }
 
@@ -494,9 +494,72 @@ fn set(v: &mut Value, path: &[&str], x: Value) {
     cur[path[path.len() - 1]] = x;
 }
 
+/// A file named by the board's path: as it stands, and then by name beside the file loaded.
+fn find_file(named: &str, base_dir: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    let p = std::path::Path::new(named);
+    if p.is_file() {
+        return Some(p.to_path_buf());
+    }
+    let beside = base_dir?.join(basename(named));
+    beside.is_file().then_some(beside)
+}
+
+/// Drive A out of section 6 as a `drive1541` blob: the 2 KiB RAM, the 6502 registers, and VIA1
+/// and VIA2 written back the way the board's own load writes them (bus writes: the counters
+/// reloaded from what was read, the latches, the control registers, the interrupt enables).
+/// Built on a scratch drive without a disk, so the writes rotate nothing; the machine mounts
+/// the image first and restores this over it. What a VIA2 `PRB` write does to the head is put
+/// back: the file does not know the track.
+fn drive_blob_from_section(sec: &[u8]) -> Result<(Vec<u8>, bool), String> {
+    use crate::viacore::{viacore_store, ViaBackend, ViaContext};
+    if sec.len() != DRIVE_BYTES {
+        return Err(format!("section DRIVE is {} bytes, not {DRIVE_BYTES}", sec.len()));
+    }
+    let mut d = crate::drive::Drive1541::new();
+    let cycles = u32::from_le_bytes([sec[40], sec[41], sec[42], sec[43]]) as u64;
+    // the VIA's store works with the cycle before the current one, which a drive at cycle 0 has not got
+    d.core.clk = cycles.max(100);
+    d.snapshot_sync_drive_clk();
+    d.snapshot_ram_mut().copy_from_slice(&sec[44..44 + 0x800]);
+    d.snapshot_clear_pending_reset();
+    let half_track = d.rotation.current_half_track;
+    if sec[0] != 0 {
+        d.core.reg_a = sec[1];
+        d.core.reg_x = sec[2];
+        d.core.reg_y = sec[3];
+        d.core.reg_sp = sec[4];
+        d.core.set_status_composite(sec[5]);
+        d.core.reg_pc = u16::from_le_bytes([sec[6], sec[7]]);
+        fn load<B: ViaBackend>(ctx: &mut ViaContext, be: &mut B, v: &[u8]) {
+            let mut w = |a: u16, b: u8| viacore_store(ctx, be, a, b);
+            w(0xA, v[0xA]); // SR
+            w(0xB, v[0xB]); // ACR
+            w(0xC, v[0xC]); // PCR
+            w(0x2, v[0x2]); // DDRB
+            w(0x3, v[0x3]); // DDRA
+            w(0x0, v[0x0]); // PRB
+            w(0x1, v[0x1]); // PRA
+            w(0x6, v[0x4]); // T1 latch low: the counter's low byte, then the counter loads
+            w(0x7, v[0x5]);
+            w(0x5, v[0x5]); // T1CH: the counter loads from the latch and runs
+            w(0x6, v[0x6]); // the latches as they were
+            w(0x7, v[0x7]);
+            w(0x8, v[0x8]); // T2 latch low
+            w(0x9, v[0x9]); // T2CH: the counter loads and runs
+            w(0xE, 0x7F);
+            w(0xE, 0x80 | (v[0xE] & 0x7F));
+        }
+        let (v1, v2) = (sec[8..24].to_vec(), sec[24..40].to_vec());
+        d.snapshot_via1(|ctx, be| load(ctx, be, &v1));
+        d.snapshot_via2(|ctx, be| load(ctx, be, &v2));
+        d.rotation.set_half_track(half_track);
+    }
+    Ok((crate::drive_snapshot::capture_drive1541(&mut d), sec[0] != 0))
+}
+
 /// A file the board wrote, D5 and D12: a fresh machine's checkpoint with the file's values
 /// written in, and the report of what came in.
-fn read_board(lay: &Layout, bytes: &[u8]) -> Result<ReadNativeSnapshotResult, String> {
+fn read_board(lay: &Layout, bytes: &[u8], base_dir: Option<&std::path::Path>) -> Result<ReadNativeSnapshotResult, String> {
     let sec = |id: u8| lay.find(id).map(|s| &bytes[s.off..s.off + s.len]);
     let h = &lay.header;
     let machine = h.get("machine").and_then(|m| m.as_str()).unwrap_or("c64-pal").to_string();
@@ -592,6 +655,7 @@ fn read_board(lay: &Layout, bytes: &[u8]) -> Result<ReadNativeSnapshotResult, St
                 .and_then(|c| c.get("source"))
                 .or_else(|| h.get("source"))
                 .and_then(|s| s.as_str())
+                .and_then(|p| find_file(p, base_dir))
                 .and_then(|p| std::fs::read(p).ok())
                 .filter(|d| crate::cart::is_crt(d));
             let regs = blk::board_cart_regs(&b).unwrap_or((0, 0));
@@ -613,13 +677,18 @@ fn read_board(lay: &Layout, bytes: &[u8]) -> Result<ReadNativeSnapshotResult, St
         (None, _) => {}
     }
 
-    // the disk
+    // the disk, and then drive A's state over it (U9: the image first, the state after)
     let mut media: Vec<ResolvedMedia> = Vec::new();
-    if let Some(img) = ms.and_then(|s| s.get("drive")).and_then(|d| d.get("image")).and_then(|i| i.as_str()).filter(|i| !i.is_empty()) {
-        match std::fs::read(img) {
-            Ok(data) => {
+    let drive = ms.and_then(|s| s.get("drive"));
+    let image = drive.and_then(|d| d.get("image")).and_then(|i| i.as_str()).filter(|i| !i.is_empty());
+    let mut disk_missing = false;
+    if let Some(img) = image {
+        match find_file(img, base_dir).and_then(|p| std::fs::read(&p).ok().map(|d| (p, d))) {
+            Some((found, data)) => {
                 let format = image_format(img);
-                cp["media"] = json!({ "diskPath": img, "imageFormat": format });
+                let found_s = found.to_string_lossy().to_string();
+                cp["media"] = json!({ "diskPath": found_s, "imageFormat": format });
+                let ro = drive.and_then(|d| d.get("mode")).and_then(|m| m.as_str()) == Some("ro");
                 media.push(ResolvedMedia {
                     reference: SnapshotMediaRef {
                         role: "drive8".into(),
@@ -630,19 +699,37 @@ fn read_board(lay: &Layout, bytes: &[u8]) -> Result<ReadNativeSnapshotResult, St
                         writable_delta_ref: None,
                     },
                     bytes: Some(data),
+                    read_only: ro,
                 });
-                loaded.push(format!("DRIVE8 image {img}"));
+                loaded.push(format!("DRIVE8 image {found_s}{}", if ro { " (read-only, as the file says)" } else { "" }));
             }
-            Err(_) => absent.push(format!("DRIVE8 image {img}: not found on this machine, the drive is left empty")),
+            None => {
+                disk_missing = true;
+                absent.push(format!(
+                    "DRIVE8 image {img}: looked for it as named and as {} beside the file, not found; the drive is left empty",
+                    basename(img)
+                ));
+            }
         }
+    }
+    match sec(SEC_DRIVE) {
+        Some(d) if !disk_missing => match drive_blob_from_section(d) {
+            Ok((blob, regs)) => {
+                cp["drive1541"] = ta_u8(&blob);
+                coarse.push(if regs {
+                    "DRIVE8 RAM, 6502 registers, VIA1 and VIA2 (counters reloaded from the read values, no interrupt flags; motor and speed zone from VIA2 PB)".to_string()
+                } else {
+                    "DRIVE8 RAM (the board could not read the registers of its drive)".to_string()
+                });
+                absent.push("DRIVE8 mechanics (head position (half-track), GCR byte position, rotation phase: the file does not hold them, the head starts on track 18)".to_string());
+            }
+            Err(e) => absent.push(format!("DRIVE8 state (section 6): {e}")),
+        },
+        Some(_) => absent.push("DRIVE8 state (section 6) not loaded: its image was not found".to_string()),
+        None => absent.push("DRIVE8 (the file holds no drive)".to_string()),
     }
     absent.push("SID (starts silent until the program writes it)".to_string());
     absent.push("VIC-II internals (sprite DMA, bad lines, pixel pipeline, write-only latches)".to_string());
-    absent.push(if sec(SEC_DRIVE).is_some() {
-        "DRIVE8 mechanics and state (the file's drive RAM and registers are not loaded; no head, no GCR)".to_string()
-    } else {
-        "DRIVE8 mechanics (the file holds no drive)".to_string()
-    });
     absent.push("IEC bus lines (start released)".to_string());
 
     let created = h.get("createdAt").and_then(|c| c.as_str()).map(String::from).unwrap_or_else(now_iso);
@@ -666,4 +753,71 @@ fn read_board(lay: &Layout, bytes: &[u8]) -> Result<ReadNativeSnapshotResult, St
         media,
         report: Some(VsfLoadReport { loaded, coarse, absent, fidelity: Fidelity::Partial, source: "c64re-v2" }),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn section() -> Vec<u8> {
+        let mut s = vec![0u8; DRIVE_BYTES];
+        s[0] = 1;
+        s[1..6].copy_from_slice(&[0x11, 0x22, 0x33, 0xEE, 0x24]); // a x y sp p
+        s[6..8].copy_from_slice(&0xEBE7u16.to_le_bytes());
+        // VIA1 as read: DDRB $1A, ACR $40 (T1 free-run), PCR $0E, T1 counter $1000, latch $4E20, IER $C2
+        s[8 + 2] = 0x1A;
+        s[8 + 0xB] = 0x40;
+        s[8 + 0xC] = 0x0E;
+        s[8 + 4] = 0x00;
+        s[8 + 5] = 0x10;
+        s[8 + 6] = 0x20;
+        s[8 + 7] = 0x4E;
+        s[8 + 0xE] = 0xC2;
+        // VIA2: motor on (PB2), zone 1 (PB5), DDRB $EF
+        s[24 + 2] = 0xEF;
+        s[24] = 0x04 | 0x20;
+        s[40..44].copy_from_slice(&5_000_000u32.to_le_bytes());
+        for (i, b) in s[44..].iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(3);
+        }
+        s
+    }
+
+    #[test]
+    fn drive_a_comes_back_from_section_6() {
+        let (blob, regs) = drive_blob_from_section(&section()).expect("blob");
+        assert!(regs);
+        let mut d = crate::drive::Drive1541::new();
+        crate::drive_snapshot::restore_drive1541(&mut d, &blob).expect("restore");
+        assert_eq!((d.core.reg_a, d.core.reg_x, d.core.reg_y, d.core.reg_sp, d.core.reg_pc), (0x11, 0x22, 0x33, 0xEE, 0xEBE7));
+        assert_eq!(d.core.status(), 0x24);
+        assert_eq!(d.ram()[0x123], (0x123u32 as u8).wrapping_mul(3));
+        assert_eq!(d.core.clk, 5_000_000);
+        let mut via1 = [0u8; 16];
+        d.snapshot_via1(|ctx, _| {
+            for i in 0..16 {
+                via1[i] = crate::viacore::viacore_peek_no_hooks(ctx, i as u16);
+            }
+        });
+        assert_eq!(via1[2], 0x1A, "DDRB");
+        assert_eq!(via1[0xB], 0x40, "ACR");
+        assert_eq!((via1[6], via1[7]), (0x20, 0x4E), "T1 latch");
+        assert_eq!(via1[0xE], 0xC2, "IER as read");
+        let t1 = via1[4] as i32 | (via1[5] as i32) << 8;
+        assert!((0x0FF0..=0x1000).contains(&t1), "T1 counter reloaded from what was read: {t1:#x}");
+        assert!(d.rotation.byte_ready_active & crate::rotation::BRA_MOTOR_ON != 0, "motor on from VIA2 PB");
+        assert_eq!(d.rotation.current_half_track, 36, "the file does not know the track");
+    }
+
+    #[test]
+    fn an_all_zero_drive_section_loads() {
+        let mut s = vec![0u8; DRIVE_BYTES];
+        s[0] = 1;
+        drive_blob_from_section(&s).expect("blob");
+    }
+
+    #[test]
+    fn a_short_section_is_refused_by_name() {
+        assert!(drive_blob_from_section(&[0u8; 100]).unwrap_err().contains("DRIVE"));
+    }
 }

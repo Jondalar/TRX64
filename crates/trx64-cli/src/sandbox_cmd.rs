@@ -47,7 +47,7 @@ use std::path::{Path, PathBuf};
 use serde_json::json;
 use trx64_core::c64re_snapshot::restore_runtime_checkpoint;
 use trx64_core::drive::{DiskImage, DiskKind};
-use trx64_core::native_snapshot::read_native_snapshot;
+use trx64_core::native_snapshot::read_native_snapshot_in;
 use trx64_core::{BusKind, Machine, Observer, RunStop};
 
 use crate::disasm_cmd::parse_addr;
@@ -586,7 +586,8 @@ pub fn run_sandbox(args: &SandboxArgs) -> Result<String, String> {
     // re-attach drive8 media FIRST, then restore_runtime_checkpoint.
     if let Some(seed) = &args.seed {
         let bytes = std::fs::read(seed).map_err(|e| format!("read seed {seed}: {e}"))?;
-        let read = read_native_snapshot(&bytes).map_err(|e| format!("seed {seed}: {e}"))?;
+        let read = read_native_snapshot_in(&bytes, std::path::Path::new(seed).parent())
+            .map_err(|e| format!("seed {seed}: {e}"))?;
         if let Some(rep) = &read.report {
             // a file the board wrote (Spec 919 D12): say what came in and what did not
             eprintln!(
@@ -607,7 +608,7 @@ pub fn run_sandbox(args: &SandboxArgs) -> Result<String, String> {
                 kind,
                 bytes: mbytes,
                 backing_path: rm.reference.source_name.clone(),
-                read_only: false,
+                read_only: rm.read_only,
             });
         }
         restore_runtime_checkpoint(&mut m, &read.checkpoint)

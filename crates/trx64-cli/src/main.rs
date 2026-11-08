@@ -427,7 +427,7 @@ fn main() {
     if let Some(Command::ConvertC64re { input, output }) = &cli.cmd {
         let run = || -> Result<String, String> {
             let bytes = std::fs::read(input).map_err(|e| format!("read {input}: {e}"))?;
-            let read = trx64_core::native_snapshot::read_native_snapshot(&bytes)
+            let read = trx64_core::native_snapshot::read_native_snapshot_in(&bytes, std::path::Path::new(input).parent())
                 .map_err(|e| format!("parse {input}: {e}"))?;
             let mut m = trx64_core::Machine::new();
             trx64_cli::boot_machine(&mut m, &rom_dir)

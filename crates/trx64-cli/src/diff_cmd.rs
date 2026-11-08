@@ -9,12 +9,12 @@
 use serde_json::json;
 
 use trx64_core::checkpoint_diff::{diff_checkpoints, format_component_diff, ExcludeMask};
-use trx64_core::native_snapshot::read_native_snapshot;
+use trx64_core::native_snapshot::read_native_snapshot_in;
 
 /// Read a `.c64re` file and return its `checkpoint` JSON tree.
 fn read_checkpoint(path: &str) -> Result<serde_json::Value, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
-    let read = read_native_snapshot(&bytes).map_err(|e| format!("parse {path}: {e}"))?;
+    let read = read_native_snapshot_in(&bytes, std::path::Path::new(path).parent()).map_err(|e| format!("parse {path}: {e}"))?;
     Ok(read.checkpoint)
 }
 

@@ -15417,7 +15417,7 @@ fn run_scenario(st: &mut State, scenario: &Value) -> Result<Value, String> {
             if !path.is_empty() {
                 let file_bytes = std::fs::read(path)
                     .map_err(|e| format!("cannot read startSnapshot {path}: {e}"))?;
-                let read = trx64_core::native_snapshot::read_native_snapshot(&file_bytes)?;
+                let read = trx64_core::native_snapshot::read_native_snapshot_in(&file_bytes, std::path::Path::new(path).parent())?;
                 // Re-attach embedded drive8 media, then restore the checkpoint. The
                 // board types first (Spec 872): a D81 goes only into a 1581.
                 trx64_core::c64re_snapshot::prepare_drive_types(&mut st.session.machine, &read.checkpoint);
@@ -15431,7 +15431,7 @@ fn run_scenario(st: &mut State, scenario: &Value) -> Result<Value, String> {
                             kind,
                             bytes: bytes.clone(),
                             backing_path: rm.reference.source_name.clone().filter(|_| !scratch::active()),
-                            read_only: false,
+                            read_only: rm.read_only,
                         });
                     }
                 }
@@ -17433,7 +17433,9 @@ fn model_report(st: &State) -> String {
 fn undump_native_snapshot(st: &mut State, path: &str) -> Result<UndumpResult, String> {
     let file_bytes =
         std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
-    let read = trx64_core::native_snapshot::read_native_snapshot(&file_bytes)?;
+    // Spec 919 — a board file names its disk and its .crt by the board's paths: they are also
+    // looked for by name beside the file.
+    let read = trx64_core::native_snapshot::read_native_snapshot_in(&file_bytes, std::path::Path::new(path).parent())?;
 
     // Spec 863 D6 — the dump says which C64 it was. A row that cannot run here is refused
     // by name BEFORE anything is torn down; otherwise the fresh machine below is built on it.
@@ -17513,7 +17515,7 @@ fn undump_native_snapshot(st: &mut State, path: &str) -> Result<UndumpResult, St
             kind,
             bytes,
             backing_path: backing.clone(),
-            read_only: false,
+            read_only: rm.read_only,
         });
         media.push(UndumpMedia {
             role: rm.reference.role.clone(),
@@ -23633,6 +23635,79 @@ mod batch1_tests {
         let disk = g.session.machine.drive8.get_attached_disk().expect("the drive has its disk");
         assert_eq!(disk.bytes[0x1234], 0x77, "the file alone carried the image");
         drop(g);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_of_the_board_finds_its_disk_beside_the_file_and_never_writes_it() {
+        // Spec 919 D5 — a board file names /SD/x.d64; x.d64 beside the file is mounted
+        // write-protected (the file says "ro"), drive A's RAM and registers come after the
+        // image, and the original is not written, however long the machine runs.
+        use sha2::Digest;
+        let st = make_state();
+        let dir = std::env::temp_dir().join(format!("trx64_919_board_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d64 = dir.join("x.d64");
+        std::fs::write(&d64, vec![0u8; 174_848]).unwrap();
+        let before = sha2::Sha256::digest(std::fs::read(&d64).unwrap());
+        // a TRX64 dump, turned into the board's shape: no section 128, the board's drive section
+        let dump = dir.join("own.c64re");
+        call(&st, "snapshot/dump", json!({ "path": dump.to_str().unwrap() }));
+        let raw = std::fs::read(&dump).unwrap();
+        let lay = trx64_core::c64re_v2::layout(&raw).unwrap();
+        let mut header = lay.header.clone();
+        header["machineState"]["drive"] = json!({ "image": "/SD/x.d64", "mode": "ro" });
+        let mut secs: Vec<(u8, Vec<u8>)> = lay
+            .sections
+            .iter()
+            .filter(|s| s.id != trx64_core::c64re_v2::SEC_TRX64)
+            .map(|s| (s.id, raw[s.off..s.off + s.len].to_vec()))
+            .collect();
+        let mut drive = vec![0u8; 2092];
+        drive[0] = 1;
+        drive[1] = 0x5A;
+        drive[6..8].copy_from_slice(&0xC123u16.to_le_bytes());
+        drive[44 + 0x40] = 0x99;
+        secs.retain(|s| s.0 != trx64_core::c64re_v2::SEC_DRIVE);
+        secs.push((trx64_core::c64re_v2::SEC_DRIVE, drive));
+        secs.sort_by_key(|s| s.0);
+        let pad = |n: usize| (4 - (n & 3)) & 3;
+        let h = serde_json::to_vec(&header).unwrap();
+        let mut body = Vec::new();
+        body.extend_from_slice(&(h.len() as u32).to_le_bytes());
+        body.extend_from_slice(&h);
+        body.resize(body.len() + pad(h.len()), 0);
+        body.extend_from_slice(&(secs.len() as u16).to_le_bytes());
+        body.extend_from_slice(&[0, 0]);
+        for (id, d) in &secs {
+            body.extend_from_slice(&[*id, 0, 0, 0]);
+            body.extend_from_slice(&(d.len() as u32).to_le_bytes());
+        }
+        for (_, d) in &secs {
+            body.extend_from_slice(d);
+            body.resize(body.len() + pad(d.len()), 0);
+        }
+        let mut file = b"C64RESNP".to_vec();
+        file.push(2);
+        file.extend_from_slice(&sha2::Sha256::digest(&body));
+        file.extend_from_slice(&body);
+        let board = dir.join("board.c64re");
+        std::fs::write(&board, &file).unwrap();
+
+        let st2 = make_state();
+        let u = call(&st2, "snapshot/undump", json!({ "path": board.to_str().unwrap() }));
+        assert!(u["report"]["loaded"].as_array().unwrap().iter().any(|l| l.as_str().unwrap().contains("DRIVE8 image")), "{u}");
+        {
+            let g = st2.lock().unwrap();
+            let disk = g.session.machine.drive8.get_attached_disk().expect("the disk beside the file is mounted");
+            assert!(disk.read_only, "mode ro");
+            assert_eq!(g.session.machine.drive8.core.reg_a, 0x5A);
+            assert_eq!(g.session.machine.drive8.core.reg_pc, 0xC123);
+            assert_eq!(g.session.machine.drive8.ram()[0x40], 0x99);
+        }
+        st2.lock().unwrap().session.machine.drive8.flush_disk_writeback();
+        assert_eq!(sha2::Sha256::digest(std::fs::read(&d64).unwrap()), before, "the original image is not written");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
