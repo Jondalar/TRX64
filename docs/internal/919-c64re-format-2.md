@@ -1,6 +1,6 @@
 # 919 — `.c64re` format 2: TRX64 writes what the board writes
 
-**Status:** PROPOSED (2026-11-08), refined with the owner, ready to build.
+**Status:** PARTLY BUILT, merged to main 2026-11-08 (`3ca5eb9`). Open: S12, a TRX64 file loaded on the board.
 
 ## Why
 
@@ -117,6 +117,13 @@ carry that.
   `blockWords: 58`, `createdAt`, `frame`, `cycles`, `pc`, `cartridgeType`, `source`, `mediumBytes`,
   `machineState` as the board's; `bitstreamId`, `caps`, `caps2` are 0.
 
+- **D14 — A medium the file names (owner, 2026-11-08).** Looked for as named, then by basename beside
+  the loaded `.c64re`, in that one folder. Same rule on the board (`resolve_beside`, U9 D3c).
+- **D15 — Drive A of a board file (owner, 2026-11-08).** Image found: mounted, then section 6 applied
+  (RAM, 6502 registers, VIAs). Not in the file and absent from the report's restored parts: head
+  position, GCR byte position, rotation phase, VIA interrupt flags. Motor and speed zone come from
+  VIA2 PB (coarse).
+
 ## Scenarios (each a test, red without the change, unless marked by hand)
 
 - **S1 Format 1 still loads.** A file written by the fixture restores as before.
@@ -140,6 +147,23 @@ carry that.
   rendered, section 5 equals the flat CRT. It stays out of the repo.
 - **S11 By hand.** A file TRX64 writes passes the firmware's `tools/c64re_read.py` with exit 0.
 - **S12 By hand, on the board.** A TRX64 file loads on the board. The owner or TRX64U-FW runs it.
+
+## As built
+
+- `c64re_v2.rs` (container, writer, reader, board file), `c64re_block.rs` (BLOCK both ways),
+  `c64re_cart.rs` (type table, flat layout, CRT skeleton). `read_native_snapshot_in` takes the folder
+  for D14.
+- Snap position: `x = 8*cycle + 7`, cycle 12..62; the board's line is always 0, so a board file
+  comes back at line 0, cycle `x>>3`. A TRX64 file taken on another line restores on the board at
+  line 0 of that cycle: an approximation only the board can judge (S12).
+- BLOCK words TRX64 has no source for are zero and listed in `trx64.blockZeroed`; `rwn`, `rdy`,
+  `$00`/`$01`, GLUE present and CIA registers are real.
+- Cartridge RAM: IO2 at offset 0 of CARTRAM, EasyFlash family only. Other cart RAM stays in section 128.
+- A CRT that does not rebuild byte-exact from the flat layout writes no section 5.
+- Size: Wasteland format 1 1 491 787 B, format 2 1 678 637 B; the board needs the medium raw.
+- Verified: `c64re_format2` 17/17, `--lib` 405, the snapshot gates; S10 (Wasteland board file runs, line
+  0 cycle 14), S11 (`c64re_read.py` exit 0). `no_writeback` `s5_*_ends_by_idle_exit` are red on
+  main before this change as well.
 
 ## Out
 
