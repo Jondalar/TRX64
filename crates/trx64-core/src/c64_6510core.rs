@@ -554,6 +554,13 @@ pub trait C64Core6510Bus {
     #[inline]
     fn set_turbo_phase(&mut self, _phase: u32, _div: u32) {}
 
+    /// Spec 920 — the VIC accesses of the PHI2 cycle just ticked that a turbo CPU without
+    /// the badline stalls loses a turbo cycle to each of. Default none.
+    #[inline]
+    fn vic_turbo_slots(&self) -> u32 {
+        0
+    }
+
     fn read_raw(&mut self, addr: u16) -> u8;
 
     /// What an access to `addr` costs a turbo CPU, as measured on a C64 Ultimate:
@@ -783,9 +790,10 @@ pub struct C64Core6510 {
     /// lets UPic's resync pair cost nothing.
     pub pending_turbo_div: u32,
     /// The Ultimate's badline stalls: with them the CPU waits out a BA stall like a 6510;
-    /// without them it runs through — at every speed, 1 MHz included (`$D031 = $80`
-    /// measured 1.00 with the display on against 0.945 for `$00`). True on every machine
-    /// that is not a U64.
+    /// without them it does not wait — at every speed, 1 MHz included (`$D031 = $80`
+    /// measured 1.00 with the display on against 0.945 for `$00`). It still loses one turbo
+    /// cycle per VIC access at the two grids with no free slot (Spec 920, `clk_inc`).
+    /// True on every machine that is not a U64.
     pub turbo_badline: bool,
     /// [`turbo_short_cycles`] for the divider in `turbo_short_for` — a cache, not state.
     pub turbo_short: u64,
@@ -1010,6 +1018,15 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
         // ba_low &= ~VICII; ba_low |= vicii_cycle() — the per-cycle VIC tick.
         let c = self.core.clk;
         self.bus.vic_cycle(c);
+        // Spec 920 — without the stalls the Ultimate does not wait for the VIC, but at the
+        // two fastest grids (47, 63: no free slot) each VIC access of this PHI2 cycle costs
+        // the CPU one turbo cycle. The `turbo_badline` test comes first: every machine that
+        // is not a U64 with the stalls off stops there.
+        if !self.core.turbo_badline && (self.core.turbo_div == 47 || self.core.turbo_div == 63) {
+            for _ in 0..self.bus.vic_turbo_slots() {
+                self.clk_inc();
+            }
+        }
     }
 
     /// The interrupt half of a CPU cycle that is not a PHI2 cycle. Measured on a C64
@@ -1056,7 +1073,8 @@ impl<'a, B: C64Core6510Bus> Exec<'a, B> {
     /// LOAD_CHECK_BA_LOW context for SH*.
     #[inline]
     fn check_ba(&mut self) {
-        // An Ultimate with the badline stalls off does not wait for the VIC, at any speed.
+        // An Ultimate with the badline stalls off does not wait for the VIC, at any speed (what
+        // it does lose to the VIC at 47 and 63 is charged in `clk_inc`).
         if !self.core.turbo_badline {
             return;
         }

@@ -2287,6 +2287,21 @@ impl VicII {
         ba_low
     }
 
+    /// Spec 920 — how many of the bus accesses of the cycle `tick` has just entered the
+    /// VIC takes for itself and a turbo CPU therefore loses a slot to: the c-access of a
+    /// badline (Φ2), and for a sprite whose DMA is on its pointer / data accesses (the
+    /// cycle of `p` + `s0`, and of `s1` + `s2`: two each). The g-, refresh and idle
+    /// accesses cost nothing. Read after the tick, only when the CPU is a turbo CPU
+    /// without the badline stalls; nothing on the 1 MHz path calls it.
+    #[inline]
+    pub fn turbo_bus_slots(&self) -> u32 {
+        let f = self.cycle_flags;
+        if cycle_is_sprite_ptr_dma0(f) || cycle_is_sprite_dma1_dma2(f) {
+            return if self.sprite_dma & (1 << cycle_get_sprite_num(f)) != 0 { 2 } else { 0 };
+        }
+        u32::from(self.bad_line && cycle_may_fetch_c(f))
+    }
+
     // =========================================================================
     // SECTION — Spec 859 recorder hooks. Cold: reached only while a scratch replay
     // records. They read the chip; they change nothing it computes.
