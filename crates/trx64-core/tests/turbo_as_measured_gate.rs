@@ -200,7 +200,11 @@ fn a_ram_loop_runs_the_measured_ratio_at_every_index() {
 
 // ── 2. bit 7 of `$D031` ──────────────────────────────────────────────────────────────────
 
-/// Bit 7 = 1 removes the badline stalls, bit 7 = 0 keeps them — at every index, 0 included.
+/// Bit 7 = 1 removes the badline stalls (the CPU no longer waits for the VIC), bit 7 = 0
+/// keeps them — at every index, 0 included. Bit 7 = 1 is not entirely free at 47x and 63x:
+/// each VIC access still costs a turbo cycle there (the gate for that is
+/// `without_the_stalls_a_vic_access_costs_a_turbo_cycle_at_the_two_fastest_grids`); the
+/// 0.1 % that is on the display-on loop here.
 /// The device: `$0F` 59.54 against `$8F` 62.93 with the display on (5.43 % lost, at 1, 16
 /// and 64 MHz alike), 63.01 for both with it off; `$80` runs 1.00 and `$00` 0.945.
 #[test]
@@ -217,7 +221,7 @@ fn bit_7_set_removes_the_badline_stalls_at_every_index() {
         let loss = 1.0 - on_stalls / on_free;
         eprintln!("index {i:2}: display on {on_stalls:.3} / {on_free:.3} (loss {:.2} %), off {off_stalls:.3} / {off_free:.3}", loss * 100.0);
         assert!((0.050..=0.058).contains(&loss), "index {i}: bit 7 = 0 loses the badlines, ~5.4 %: {:.2} %", loss * 100.0);
-        assert!(close(on_free, MEASURED[i as usize], 0.004), "index {i}: bit 7 = 1 loses nothing to the display");
+        assert!(close(on_free, MEASURED[i as usize], 0.004), "index {i}: bit 7 = 1 loses (almost) nothing to the display");
         assert!(close(off_stalls, off_free, 0.003), "index {i}: with the display off the bit changes nothing");
     }
     assert!(close(x(&mut m, 0x80, 0x1b), 1.00, 0.005), "`$80` is 1 MHz WITHOUT the stalls");
@@ -1161,9 +1165,118 @@ fn d21_badline_costs_depend_on_where_in_the_frame_the_loop_ran() {
         }
         let (lo, hi) = seen.iter().fold((f64::MAX, f64::MIN), |(a, b), &x| (a.min(x), b.max(x)));
         // Compared as the share the stalls add, each side against its own stall-free cost
-        // (they differ by D9's 0.0005 on a fast read).
+        // (they differ by D9's 0.0005 on a fast read). The stall-free base at `$8F` now carries
+        // the VIC's own accesses (Spec 920), a share that depends on where in the frame the
+        // base loop ran: it lowers every ratio by up to 0.002, hence the 3e-3 (it was 1e-3,
+        // against a RAM-read maximum of x1.1004 before and x1.0994 after, device x1.1011).
         let dev = device / free;
         eprintln!("{what}: x{lo:.4}..x{hi:.4} here, the device x{dev:.4}");
-        assert!(lo - 1e-3 <= dev && dev <= hi + 1e-3, "{what}: the device's x{dev:.4} outside x{lo:.4}..x{hi:.4}");
+        assert!(lo - 3e-3 <= dev && dev <= hi + 3e-3, "{what}: the device's x{dev:.4} outside x{lo:.4}..x{hi:.4}");
+    }
+}
+
+// ── 9. the VIC's own accesses at turbo, without the stalls ───────────────────────────────
+
+/// Fixed-work loops timed in CIA 2 ticks (timer A, with timer B counting its underflows:
+/// 32 bits of PHI2), own program at `$C800`. `body` is the 3-byte access, repeated four
+/// times per iteration. Returns the elapsed PHI2 ticks.
+fn timed_loop(m: &mut Machine, d031: u8, d011: u8, sprites: u8, body: [u8; 3]) -> u64 {
+    let div = [(0x8c, 32u64), (0x8d, 40), (0x8e, 47), (0x8f, 63)].iter().find(|(d, _)| *d == d031).unwrap().1;
+    // About 10 frames of work (250 badlines): one unit of the outer count is 65,536
+    // iterations of 24 cycles.
+    let outer = (div / 8).max(1) as u8;
+    let mut p: Vec<u8> = vec![
+        0x78, // sei
+        0xa2, 0x0f, 0xa9, 0x64, 0x9d, 0x00, 0xd0, 0xca, 0x10, 0xfa, // sprite x/y regs = 100
+        0xa2, 0x00, // ldx #0
+        0xa9, sprites, 0x8d, 0x15, 0xd0, // $D015
+        0xa9, d011, 0x8d, 0x11, 0xd0, // $D011
+        0xa9, d031, 0x8d, 0x31, 0xd0, // $D031
+        // Past line $F0 and on to line $20, so the display's DEN latch (line $30) has seen the
+        // new `$D011` and the timed window starts on a frame's first lines.
+        0xad, 0x12, 0xd0, 0xc9, 0xf0, 0xd0, 0xf9, 0xad, 0x12, 0xd0, 0xc9, 0x20, 0xd0, 0xf9,
+        0xa9, 0xff, 0x8d, 0x04, 0xdd, 0x8d, 0x05, 0xdd, 0x8d, 0x06, 0xdd, 0x8d, 0x07, 0xdd,
+        0xa9, 0x10, 0x8d, 0x0e, 0xdd, 0xa9, 0x50, 0x8d, 0x0f, 0xdd, // force-load A and B
+        0xa9, 0x41, 0x8d, 0x0f, 0xdd, 0xa9, 0x01, 0x8d, 0x0e, 0xdd, // start B (counts A), A
+        0xa9, 0x00, 0x85, 0xfb, 0x85, 0xfc, 0xa9, outer, 0x85, 0xfd,
+    ];
+    let l = 0xc800u16 + p.len() as u16;
+    for _ in 0..4 {
+        p.extend_from_slice(&body);
+    }
+    // dec $fb / bne L; dec $fc / bne L; dec $fd / bne L
+    for z in [0xfbu8, 0xfc, 0xfd] {
+        let here = 0xc800u16 + p.len() as u16 + 4;
+        p.extend_from_slice(&[0xc6, z, 0xd0, (l as i32 - here as i32) as i8 as u8]);
+    }
+    p.extend_from_slice(&[0xa9, 0x00, 0x8d, 0x0e, 0xdd, 0x8d, 0x0f, 0xdd, 0xa9, 0xa5, 0x8d, 0xff, 0xc8]);
+    let here = 0xc800u16 + p.len() as u16;
+    p.extend_from_slice(&[0x4c, here as u8, (here >> 8) as u8]);
+    m.poke(0xc8ff - 1, &[0, 0]); // marker byte at $C8FF cleared (the program is far shorter)
+    m.poke(0xc800, &p);
+    m.c64_core.reg_pc = 0xc800;
+    for _ in 0..400 {
+        run(m, FRAME);
+        if rd(m, 0xc8ff) == 0xa5 {
+            let b = u64::from(rd(m, 0xdd06)) | u64::from(rd(m, 0xdd07)) << 8;
+            let a = u64::from(rd(m, 0xdd04)) | u64::from(rd(m, 0xdd05)) << 8;
+            return (0xffff - b) * 65_536 + (0xffff - a);
+        }
+    }
+    panic!("timed loop did not finish");
+}
+
+const BODY_RAM: [u8; 3] = [0xad, 0x00, 0xc9]; // lda $C900
+const BODY_D021: [u8; 3] = [0x8d, 0x21, 0xd0]; // sta $D021
+const BODY_ROM: [u8; 3] = [0xbd, 0x00, 0xe0]; // lda $E000,x
+
+/// CPU cycles lost per badline: the same work with the display off (`$D011 = $0B`, no
+/// badlines) against on (`$1B`), 25 badlines a frame.
+fn loss_per_badline(d031: u8, body: [u8; 3]) -> Option<f64> {
+    let mut m = booted()?;
+    let div = [(0x8c, 32.0), (0x8d, 40.0), (0x8e, 47.0), (0x8f, 63.0)].iter().find(|(d, _)| *d == d031).unwrap().1;
+    let off = timed_loop(&mut m, d031, 0x0b, 0, body) as f64;
+    let mut m = booted()?;
+    let on = timed_loop(&mut m, d031, 0x1b, 0, body) as f64;
+    Some((on - off) * div / (on / FRAME as f64 * 25.0))
+}
+
+/// CPU cycles lost per sprite per sprite line: 8 sprites, 21 lines, display off.
+fn loss_per_sprite_line(d031: u8) -> Option<f64> {
+    let mut m = booted()?;
+    let div = [(0x8c, 32.0), (0x8d, 40.0), (0x8e, 47.0), (0x8f, 63.0)].iter().find(|(d, _)| *d == d031).unwrap().1;
+    let off = timed_loop(&mut m, d031, 0x0b, 0x00, BODY_RAM) as f64;
+    let mut m = booted()?;
+    let on = timed_loop(&mut m, d031, 0x0b, 0xff, BODY_RAM) as f64;
+    Some((on - off) * div / (on / FRAME as f64 * 8.0 * 21.0))
+}
+
+/// With the stalls off the CPU does not wait for the VIC, but at the two fastest grids (47x
+/// and 63x: the 64-slot grid has no free slot) each VIC access still costs it a turbo
+/// cycle: the 40 c-accesses of a badline, and four per displayed sprite and sprite line (one
+/// p, three s). On the C64 Ultimate (firmware 3.15, core 1.50), RAM / `STA $D021` / ROM
+/// loops: 39.4 / 39.6 / 39.3 cycles per badline at `$8E`, 38.9 / 39.3 / 38.9 at `$8F`; 4.0
+/// and 3.9 per sprite line; and 0 (within 0.5) at `$8C` and `$8D`.
+#[test]
+fn without_the_stalls_a_vic_access_costs_a_turbo_cycle_at_the_two_fastest_grids() {
+    for (name, body) in [("RAM", BODY_RAM), ("D021", BODY_D021), ("ROM", BODY_ROM)] {
+        for d031 in [0x8cu8, 0x8d, 0x8e, 0x8f] {
+            let Some(l) = loss_per_badline(d031, body) else { return };
+            eprintln!("{name} ${d031:02X}: {l:.2} cycles lost per badline");
+            if d031 >= 0x8e {
+                assert!((38.0..=41.0).contains(&l), "{name} ${d031:02X}: {l:.2} per badline, the device loses 39");
+            } else {
+                assert!(l.abs() <= 1.0, "{name} ${d031:02X}: {l:.2} per badline, the device loses none");
+            }
+        }
+    }
+    for d031 in [0x8cu8, 0x8d, 0x8e, 0x8f] {
+        let Some(l) = loss_per_sprite_line(d031) else { return };
+        eprintln!("${d031:02X}: {l:.2} cycles lost per sprite per sprite line");
+        if d031 >= 0x8e {
+            assert!((3.5..=4.5).contains(&l), "${d031:02X}: {l:.2} per sprite line, the device loses 4");
+        } else {
+            assert!(l.abs() <= 0.5, "${d031:02X}: {l:.2} per sprite line, the device loses none");
+        }
     }
 }

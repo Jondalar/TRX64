@@ -209,6 +209,11 @@ impl<'a, 'o, 'w, 'h, O: Observer> C64Core6510Bus for FullScBus<'a, 'o, 'w, 'h, O
         self.fb.vic.turbo_div = div;
     }
 
+    #[inline]
+    fn vic_turbo_slots(&self) -> u32 {
+        self.fb.vic.turbo_bus_slots()
+    }
+
     /// CIA 1, CIA 2, IO1 and IO2 are bus cycles to a turbo CPU; the VIC, SID and colour
     /// RAM are fast; everything else is memory. Only where I/O is mapped.
     #[inline]
