@@ -1,6 +1,6 @@
 # 920 — Turbo without the stalls: the VIC's own accesses still cost a turbo cycle
 
-**Status:** BUILT on branch `spec/920-turbo-vic-slots`, not merged. Open: the position of the loss inside the line is checked only by a picture (see Not measured), and one border-colour difference in that picture is not understood.
+**Status:** BUILT, merged to main 2026-11-09. Open: the position of the loss inside the line is checked only by a picture (see Not measured), and one border-colour difference in that picture is not understood.
 
 ## Why
 
